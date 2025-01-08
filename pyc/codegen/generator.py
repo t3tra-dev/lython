@@ -9,7 +9,7 @@ class IRGenerator(BaseVisitor):
     def __init__(self):
         self.builder = IRBuilder()
         self.module_visitor = ModuleVisitor(self.builder)
-        self.expr_visitor = ExpressionVisitor(self.builder)
+        self.expr_visitor = ExprVisitor(self.builder)
 
     def visit_Module(self, node: ast.Module) -> None:
         self.module_visitor.visit(node)
