@@ -1,14 +1,16 @@
 import ast
 
 from .ir.builder import IRBuilder
-from .visitors import ExprVisitor, ModuleVisitor
+from .visitors import ModVisitor, ExprVisitor
 from .visitors.base import BaseVisitor
+
+__all__ = ["IRGenerator"]
 
 
 class IRGenerator(BaseVisitor):
     def __init__(self):
         self.builder = IRBuilder()
-        self.module_visitor = ModuleVisitor(self.builder)
+        self.module_visitor = ModVisitor(self.builder)
         self.expr_visitor = ExprVisitor(self.builder)
 
     def visit_Module(self, node: ast.Module) -> None:

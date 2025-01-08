@@ -1,4 +1,4 @@
-@.str.0 = private unnamed_addr constant [14 x i8] c"Hello, World!\00", align 1
+@.str.0 = private unnamed_addr constant [14 x i8] c"Hello, world!\00", align 1
 declare i32 @puts(i8* nocapture readonly) local_unnamed_addr
 
 define i32 @main(i32 %argc, i8** %argv) {

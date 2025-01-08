@@ -1,10 +1,11 @@
 from .base import BaseVisitor
-from .expr import ExprVisitor, BinOpVisitor
-from .mod import ModuleVisitor
+from .expr import ExprVisitor
+from .mod import ModVisitor
+from .stmt import StmtVisitor
 
 __all__ = [
     "BaseVisitor",
     "ExprVisitor",
-    "BinOpVisitor",
-    "ModuleVisitor",
+    "ModVisitor",
+    "StmtVisitor",
 ]
