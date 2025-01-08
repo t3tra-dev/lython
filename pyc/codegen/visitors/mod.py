@@ -2,13 +2,13 @@ import ast
 
 from ..ir import IRBuilder
 from .base import BaseVisitor
-from .expr import ExpressionVisitor
+from .expr import ExprVisitor
 
 
 class ModuleVisitor(BaseVisitor):
     def __init__(self, builder: IRBuilder):
         self.builder = builder
-        self.expr_visitor = ExpressionVisitor(builder)
+        self.expr_visitor = ExprVisitor(builder)
 
     def visit_Module(self, node: ast.Module) -> None:
         """モジュールの処理"""

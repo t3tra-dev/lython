@@ -1,7 +1,7 @@
 import ast
 
 from .ir.builder import IRBuilder
-from .visitors import ExpressionVisitor, ModuleVisitor
+from .visitors import ExprVisitor, ModuleVisitor
 from .visitors.base import BaseVisitor
 
 
