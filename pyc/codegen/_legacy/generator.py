@@ -75,4 +75,4 @@ class IRGenerator:
             else:
                 raise NotImplementedError("Only simple string printing is supported")
         else:
-            raise NotImplementedError(f"Function {node.func.id} not implemented")
+            raise NotImplementedError(f"Function {node.func.id} not implemented")  # type: ignore
