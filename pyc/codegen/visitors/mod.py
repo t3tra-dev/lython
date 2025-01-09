@@ -17,8 +17,6 @@ class ModVisitor(BaseVisitor):
 
     def visit_Module(self, node: ast.Module) -> None:
         """モジュールの処理"""
-        # 外部関数の宣言
-        self.builder.emit("declare i32 @puts(i8* nocapture readonly) local_unnamed_addr")
 
         # main関数の開始
         self.builder.emit("\ndefine i32 @main(i32 %argc, i8** %argv) {")
