@@ -32,12 +32,24 @@ class IRBuilder:
         ])
 
     def add_global_string(self, value: str) -> str:
-        value = value + "\\00"
+        """文字列定数をグローバル変数として追加"""
+        # NULL終端文字を追加
+        value = value + "\00"
         identifier = f"@.str.{self.string_counter}"
-        length = len(value)
-        escaped_value = value.replace('"', '\\"')
+
+        # バイト列にエンコード
+        encoded_value = value.encode('utf-8')
+        encoded_length = len(encoded_value)
+
+        # バイト列を16進数表現に変換
+        escaped_value = ""
+        for b in encoded_value:
+            escaped_value += f"\\{format(b, '02x')}"
+
+        # グローバル文字列定数を生成
         self.global_strings[identifier] = (
-            f'{identifier} = private unnamed_addr constant [{length - 2} x i8] c"{escaped_value}", align 1'
+            f'{identifier} = private unnamed_addr constant [{encoded_length} x i8] '
+            f'c"{escaped_value}", align 1'
         )
         self.string_counter += 1
         return identifier

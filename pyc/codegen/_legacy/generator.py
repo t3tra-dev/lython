@@ -13,13 +13,26 @@ class IRGenerator:
     def add_global_string(self, value: str) -> str:
         """文字列定数をグローバル変数として追加"""
         # NULL終端文字を追加
-        value = value + "\\00"
+        value = value + "\00"
         identifier = f"@.str.{self.string_counter}"
-        length = len(value)
-        # エスケープ処理
-        escaped_value = value.replace('"', '\\"')
+
+        # バイト列にエンコード
+        encoded_value = value.encode('utf-8')
+        encoded_length = len(encoded_value)
+
+        escaped_value = ""
+        for b in encoded_value:
+            if b < 32 or b > 126:  # 制御文字または非ASCII文字
+                escaped_value += f"\\{format(b, '02x')}"
+            elif b in (34, 92):    # ダブルクォートとバックスラッシュ
+                escaped_value += f"\\{chr(b)}"
+            else:                  # 通常の印字可能ASCII文字
+                escaped_value += chr(b)
+
+        # グローバル文字列定数を生成
         self.global_strings[identifier] = (
-            f'{identifier} = private unnamed_addr constant [{length - 2} x i8] c"{escaped_value}", align 1'
+            f'{identifier} = private unnamed_addr constant [{encoded_length} x i8] '
+            f'c"{escaped_value}", align 1'
         )
         self.string_counter += 1
         return identifier
@@ -69,8 +82,9 @@ class IRGenerator:
             if len(node.args) == 1 and isinstance(node.args[0], ast.Constant):
                 string_val = node.args[0].value
                 str_ptr = self.add_global_string(string_val)
+                encoded_length = len((string_val + "\00").encode('utf-8'))
                 self.output.append(
-                    f"  %puts = call i32 @puts(i8* getelementptr inbounds ([{len(string_val) + 1} x i8], [{len(string_val) + 1} x i8]* {str_ptr}, i64 0, i64 0))"
+                    f"  %puts = call i32 @puts(i8* getelementptr inbounds ([{encoded_length} x i8], [{encoded_length} x i8]* {str_ptr}, i64 0, i64 0))"
                 )
             else:
                 raise NotImplementedError("Only simple string printing is supported")

@@ -22,6 +22,16 @@ Lloh1:
 	blr	x8
 	ldr	x0, [x0, #24]
 	bl	_puts
+Lloh2:
+	adrp	x0, l_.str.1@PAGE
+Lloh3:
+	add	x0, x0, l_.str.1@PAGEOFF
+	bl	_PyString_FromString
+	ldr	x8, [x0, #16]
+	ldr	x8, [x8, #152]
+	blr	x8
+	ldr	x0, [x0, #24]
+	bl	_puts
 	mov	w0, #1                          ; =0x1
 	bl	_PyInt_FromLong
 	mov	x19, x0
@@ -34,22 +44,26 @@ Lloh1:
 	ldr	x8, [x8, #48]
 	blr	x8
 	cbnz	x0, LBB0_2
-; %bb.1:                                ; %fallback.7
+; %bb.1:                                ; %fallback.10
 	ldr	x8, [x20, #16]
 	mov	x0, x20
 	mov	x1, x19
 	ldr	x8, [x8, #88]
 	blr	x8
-LBB0_2:                                 ; %end.7
+LBB0_2:                                 ; %end.10
 	ldp	x29, x30, [sp, #16]             ; 16-byte Folded Reload
 	mov	w0, wzr
 	ldp	x20, x19, [sp], #32             ; 16-byte Folded Reload
 	ret
+	.loh AdrpAdd	Lloh2, Lloh3
 	.loh AdrpAdd	Lloh0, Lloh1
 	.cfi_endproc
                                         ; -- End function
 	.section	__TEXT,__cstring,cstring_literals
 l_.str.0:                               ; @.str.0
 	.asciz	"Hello, world!"
+
+l_.str.1:                               ; @.str.1
+	.asciz	"multibite character: \343\201\202\343\201\204\343\201\206\343\201\210\343\201\212, \360\237\220\215"
 
 .subsections_via_symbols
