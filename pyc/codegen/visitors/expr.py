@@ -64,7 +64,7 @@ class ExprVisitor(BaseVisitor):
             else:
                 raise NotImplementedError("Only single argument printing is supported")
         else:
-            raise NotImplementedError(f"Function {node.func.id} not supported")
+            raise NotImplementedError(f"Function {node.func.id} not supported")  # type: ignore
 
     def _get_operand(self, node: ast.AST) -> str:
         """オペランドの取得"""
