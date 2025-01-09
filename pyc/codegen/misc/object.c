@@ -269,6 +269,5 @@ PyObject* PyString_FromString(const char* str) {
     strcpy(obj->value, str);
     obj->length = len;
     return (PyObject*)obj;
-    return NULL;
 }
 

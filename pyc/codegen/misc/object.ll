@@ -1,5 +1,5 @@
-; ModuleID = 'pyc/codegen/misc/object.c'
-source_filename = "pyc/codegen/misc/object.c"
+; ModuleID = 'object.c'
+source_filename = "object.c"
 target datalayout = "e-m:o-i64:64-i128:128-n32:64-S128-Fn32"
 target triple = "arm64-apple-macosx15.0.0"
 
