@@ -38,27 +38,46 @@ entry:
   %str.6 = load ptr, ptr %strptr.5
   %puts.6 = call i32 @puts(ptr noundef %str.6)
   %6 = call ptr @PyInt_FromLong(i64 noundef 1)
-  %7 = call ptr @PyInt_FromLong(i64 noundef 1)
+  ; __str__メソッドの取得と呼び出し
+  %mt.8 = getelementptr inbounds %struct.PyObject, ptr %6, i32 0, i32 2
+  %mt_ptr.8 = load ptr, ptr %mt.8
+  %strmethod.8 = getelementptr inbounds %struct.PyMethodTable, ptr %mt_ptr.8, i32 0, i32 19
+  %strmethod_ptr.8 = load ptr, ptr %strmethod.8
+  %str.7 = call ptr %strmethod_ptr.8(ptr noundef %6)
+  %strptr.8 = getelementptr inbounds %struct.PyStringObject, ptr %str.7, i32 0, i32 1
+  %str.9 = load ptr, ptr %strptr.8
+  %puts.9 = call i32 @puts(ptr noundef %str.9)
+  %9 = call ptr @PyInt_FromLong(i64 noundef 1)
+  %10 = call ptr @PyInt_FromLong(i64 noundef 2)
   ; 左オペランドのメソッドテーブルを取得
-    %mt.9 = getelementptr inbounds %struct.PyObject, ptr %6, i32 0, i32 2
-    %mt_ptr.9 = load ptr, ptr %mt.9
+    %mt.12 = getelementptr inbounds %struct.PyObject, ptr %9, i32 0, i32 2
+    %mt_ptr.12 = load ptr, ptr %mt.12
     ; __add__メソッドのポインタを取得
-    %method.9 = getelementptr inbounds %struct.PyMethodTable, ptr %mt_ptr.9, i32 0, i32 6
-    %8 = load ptr, ptr %method.9
-  %9 = call ptr %8(ptr noundef %6, ptr noundef %7)
-  %isnull.11 = icmp eq ptr %9, null
-    br i1 %isnull.11, label %fallback.10, label %end.10
+    %method.12 = getelementptr inbounds %struct.PyMethodTable, ptr %mt_ptr.12, i32 0, i32 6
+    %11 = load ptr, ptr %method.12
+  %12 = call ptr %11(ptr noundef %9, ptr noundef %10)
+  %isnull.14 = icmp eq ptr %12, null
+    br i1 %isnull.14, label %fallback.13, label %end.13
 
-    fallback.10:
+    fallback.13:
     ; 右オペランドの__radd__を呼び出す
-    %rmt.11 = getelementptr inbounds %struct.PyObject, ptr %7, i32 0, i32 2
-    %rmt_ptr.11 = load ptr, ptr %rmt.11
-    %rmethod.11 = getelementptr inbounds %struct.PyMethodTable, ptr %rmt_ptr.11, i32 0, i32 11
-    %rmethod_ptr.11 = load ptr, ptr %rmethod.11
-    %rresult.11 = call ptr %rmethod_ptr.11(ptr noundef %7, ptr noundef %6)
-    br label %end.10
+    %rmt.14 = getelementptr inbounds %struct.PyObject, ptr %10, i32 0, i32 2
+    %rmt_ptr.14 = load ptr, ptr %rmt.14
+    %rmethod.14 = getelementptr inbounds %struct.PyMethodTable, ptr %rmt_ptr.14, i32 0, i32 11
+    %rmethod_ptr.14 = load ptr, ptr %rmethod.14
+    %rresult.14 = call ptr %rmethod_ptr.14(ptr noundef %10, ptr noundef %9)
+    br label %end.13
 
-    end.10:
-    %final.11 = phi ptr [ %9, %entry ], [ %rresult.11, %fallback.10 ]
+    end.13:
+    %final.14 = phi ptr [ %12, %entry ], [ %rresult.14, %fallback.13 ]
+  ; __str__メソッドの取得と呼び出し
+  %mt.15 = getelementptr inbounds %struct.PyObject, ptr %final.14, i32 0, i32 2
+  %mt_ptr.15 = load ptr, ptr %mt.15
+  %strmethod.15 = getelementptr inbounds %struct.PyMethodTable, ptr %mt_ptr.15, i32 0, i32 19
+  %strmethod_ptr.15 = load ptr, ptr %strmethod.15
+  %str.14 = call ptr %strmethod_ptr.15(ptr noundef %final.14)
+  %strptr.15 = getelementptr inbounds %struct.PyStringObject, ptr %str.14, i32 0, i32 1
+  %str.16 = load ptr, ptr %strptr.15
+  %puts.16 = call i32 @puts(ptr noundef %str.16)
   ret i32 0
 }

@@ -34,8 +34,15 @@ Lloh3:
 	bl	_puts
 	mov	w0, #1                          ; =0x1
 	bl	_PyInt_FromLong
-	mov	x19, x0
+	ldr	x8, [x0, #16]
+	ldr	x8, [x8, #152]
+	blr	x8
+	ldr	x0, [x0, #24]
+	bl	_puts
 	mov	w0, #1                          ; =0x1
+	bl	_PyInt_FromLong
+	mov	x19, x0
+	mov	w0, #2                          ; =0x2
 	bl	_PyInt_FromLong
 	ldr	x8, [x19, #16]
 	mov	x20, x0
@@ -44,13 +51,18 @@ Lloh3:
 	ldr	x8, [x8, #48]
 	blr	x8
 	cbnz	x0, LBB0_2
-; %bb.1:                                ; %fallback.10
+; %bb.1:                                ; %fallback.13
 	ldr	x8, [x20, #16]
 	mov	x0, x20
 	mov	x1, x19
 	ldr	x8, [x8, #88]
 	blr	x8
-LBB0_2:                                 ; %end.10
+LBB0_2:                                 ; %end.13
+	ldr	x8, [x0, #16]
+	ldr	x8, [x8, #152]
+	blr	x8
+	ldr	x0, [x0, #24]
+	bl	_puts
 	ldp	x29, x30, [sp, #16]             ; 16-byte Folded Reload
 	mov	w0, wzr
 	ldp	x20, x19, [sp], #32             ; 16-byte Folded Reload
