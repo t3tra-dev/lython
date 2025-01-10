@@ -16,53 +16,25 @@ Lloh0:
 	adrp	x0, l_.str.0@PAGE
 Lloh1:
 	add	x0, x0, l_.str.0@PAGEOFF
-	bl	_PyString_FromString
-	ldr	x8, [x0, #16]
-	ldr	x8, [x8, #152]
-	blr	x8
-	ldr	x0, [x0, #24]
-	bl	_puts
+	bl	_print
 Lloh2:
 	adrp	x0, l_.str.1@PAGE
 Lloh3:
 	add	x0, x0, l_.str.1@PAGEOFF
-	bl	_PyString_FromString
-	ldr	x8, [x0, #16]
-	ldr	x8, [x8, #152]
-	blr	x8
-	ldr	x0, [x0, #24]
-	bl	_puts
+	bl	_print
 	mov	w0, #1                          ; =0x1
 	bl	_PyInt_FromLong
-	ldr	x8, [x0, #16]
-	ldr	x8, [x8, #152]
-	blr	x8
-	ldr	x0, [x0, #24]
-	bl	_puts
+	bl	_print
 	mov	w0, #1                          ; =0x1
 	bl	_PyInt_FromLong
 	mov	x19, x0
 	mov	w0, #2                          ; =0x2
 	bl	_PyInt_FromLong
-	ldr	x8, [x19, #16]
-	mov	x20, x0
-	mov	x0, x19
-	mov	x1, x20
-	ldr	x8, [x8, #48]
-	blr	x8
-	cbnz	x0, LBB0_2
-; %bb.1:                                ; %fallback.13
-	ldr	x8, [x20, #16]
-	mov	x0, x20
-	mov	x1, x19
-	ldr	x8, [x8, #88]
-	blr	x8
-LBB0_2:                                 ; %end.13
-	ldr	x8, [x0, #16]
-	ldr	x8, [x8, #152]
-	blr	x8
-	ldr	x0, [x0, #24]
-	bl	_puts
+	ldr	x8, [x19]
+	ldr	x9, [x0]
+	add	x0, x8, x9
+	bl	_PyInt_FromLong
+	bl	_print
 	ldp	x29, x30, [sp, #16]             ; 16-byte Folded Reload
 	mov	w0, wzr
 	ldp	x20, x19, [sp], #32             ; 16-byte Folded Reload
@@ -78,4 +50,13 @@ l_.str.0:                               ; @.str.0
 l_.str.1:                               ; @.str.1
 	.asciz	"multibite character: \343\201\202\343\201\204\343\201\206\343\201\210\343\201\212, \360\237\220\215"
 
+	.section	__DATA,__data
+	.globl	_Py_True                        ; @Py_True
+_Py_True:
+	.byte	1                               ; 0x1
+
+	.globl	_Py_False                       ; @Py_False
+.zerofill __DATA,__common,_Py_False,1,0
+	.globl	_Py_None                        ; @Py_None
+.zerofill __DATA,__common,_Py_None,8,3
 .subsections_via_symbols

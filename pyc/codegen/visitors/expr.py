@@ -1,150 +1,147 @@
 from __future__ import annotations
 
 import ast
+from typing import TYPE_CHECKING, Any
 
 from ..ir import IRBuilder
-from .base import BaseVisitor
+
+if TYPE_CHECKING:
+    from .mod import ModVisitor  # noqa
 
 __all__ = ["ExprVisitor"]
 
 
-class ExprVisitor(BaseVisitor):
+class ExprVisitor(ast.NodeVisitor):
     def __init__(self, builder: IRBuilder):
         self.builder = builder
-        self.counter = 0
+        self.temp_counter = 0
 
-        # 演算子とメソッド名のマッピング
-        self.op_method_map = {
-            ast.Add: "__add__",
-            ast.Sub: "__sub__",
-            ast.Mult: "__mul__",
-            ast.Div: "__div__",
-        }
+    def get_temp_name(self) -> str:
+        name = f"%t{self.temp_counter}"
+        self.temp_counter += 1
+        return name
 
     def visit_Constant(self, node: ast.Constant) -> str:
-        """定数の処理"""
-        result = f"%{self.counter}"
-        self.counter += 1
-
-        if isinstance(node.value, int):
-            # PyInt_FromLongの呼び出し
-            self.builder.emit(f"  {result} = call ptr @PyInt_FromLong(i64 noundef {node.value})")
-        elif isinstance(node.value, str):
-            # 文字列定数の生成
-            str_const = self.builder.add_global_string(node.value)
-            # PyString_FromStringの呼び出し
-            self.builder.emit(f"  {result} = call ptr @PyString_FromString(ptr noundef {str_const})")
+        if isinstance(node.value, str):
+            # 文字列定数の処理
+            global_name = self.builder.add_global_string(node.value)
+            # getelementptr命令を使用して文字列へのポインタを取得
+            temp_name = self.get_temp_name()
+            self.builder.emit(
+                f"  {temp_name} = getelementptr [{len(node.value) + 1} x i8], "
+                f"ptr {global_name}, i64 0, i64 0"
+            )
+            return temp_name
+        elif isinstance(node.value, int):
+            # 整数定数の処理
+            temp_name = self.get_temp_name()
+            self.builder.emit(f"  {temp_name} = call ptr @PyInt_FromLong(i64 {node.value})")
+            return temp_name
+        elif node.value is None:
+            # Noneの処理
+            return "null"
         else:
-            raise NotImplementedError(f"Constant type {type(node.value)} not supported")
-
-        return result
+            raise NotImplementedError(f"Constant type not supported: {type(node.value)}")
 
     def visit_BinOp(self, node: ast.BinOp) -> str:
-        """二項演算の処理"""
-        # オペランドの処理
-        left = self.visit(node.left)
-        right = self.visit(node.right)
+        # 左辺と右辺の値を取得
+        left_ptr = self.visit(node.left)
+        right_ptr = self.visit(node.right)
 
-        # 対応するメソッド名を取得
-        method_name = self.op_method_map.get(type(node.op))  # type: ignore
-        if method_name is None:
-            raise NotImplementedError(f"Operator {type(node.op).__name__} not supported")
+        # PyIntオブジェクトから整数値を取り出す
+        left_val = self.get_temp_name()
+        right_val = self.get_temp_name()
+        self.builder.emit(f"  {left_val} = load i64, ptr {left_ptr}")
+        self.builder.emit(f"  {right_val} = load i64, ptr {right_ptr}")
 
-        # メソッドテーブルからメソッドポインタを取得
-        method_ptr = f"%{self.counter}"
-        self.counter += 1
-        self.builder.emit(f"""  ; 左オペランドのメソッドテーブルを取得
-    %mt.{self.counter} = getelementptr inbounds %struct.PyObject, ptr {left}, i32 0, i32 2
-    %mt_ptr.{self.counter} = load ptr, ptr %mt.{self.counter}
-    ; {method_name}メソッドのポインタを取得
-    %method.{self.counter} = getelementptr inbounds %struct.PyMethodTable, ptr %mt_ptr.{self.counter}, i32 0, i32 {self.get_method_offset(method_name)}
-    {method_ptr} = load ptr, ptr %method.{self.counter}""")
+        # 計算結果を格納する一時変数
+        temp_name = self.get_temp_name()
+        # PyIntオブジェクトを格納する一時変数
+        result_name = self.get_temp_name()
 
-        # メソッド呼び出し
-        result = f"%{self.counter}"
-        self.counter += 1
-        self.builder.emit(f"  {result} = call ptr {method_ptr}(ptr noundef {left}, ptr noundef {right})")
-
-        # 結果がNULLの場合は__r{method_name}__を試す
-        fallback_label = f"fallback.{self.counter}"
-        end_label = f"end.{self.counter}"
-        self.counter += 1
-
-        self.builder.emit(f"""  %isnull.{self.counter} = icmp eq ptr {result}, null
-    br i1 %isnull.{self.counter}, label %{fallback_label}, label %{end_label}
-
-    {fallback_label}:
-    ; 右オペランドの__r{method_name[2:]}を呼び出す
-    %rmt.{self.counter} = getelementptr inbounds %struct.PyObject, ptr {right}, i32 0, i32 2
-    %rmt_ptr.{self.counter} = load ptr, ptr %rmt.{self.counter}
-    %rmethod.{self.counter} = getelementptr inbounds %struct.PyMethodTable, ptr %rmt_ptr.{self.counter}, i32 0, i32 {self.get_method_offset('__r' + method_name[2:])}
-    %rmethod_ptr.{self.counter} = load ptr, ptr %rmethod.{self.counter}
-    %rresult.{self.counter} = call ptr %rmethod_ptr.{self.counter}(ptr noundef {right}, ptr noundef {left})
-    br label %{end_label}
-
-    {end_label}:
-    %final.{self.counter} = phi ptr [ {result}, %entry ], [ %rresult.{self.counter}, %{fallback_label} ]""")
-
-        return f"%final.{self.counter}"
-
-    def visit_Call(self, node: ast.Call) -> None:
-        """関数呼び出しの処理"""
-        if isinstance(node.func, ast.Name) and node.func.id == "print":
-            if len(node.args) == 1:
-                # 引数の評価
-                arg = self.visit(node.args[0])
-
-                # 引数の__str__メソッドを呼び出す
-                str_result = f"%str.{self.counter}"
-                self.counter += 1
-                self.builder.emit(f"""  ; __str__メソッドの取得と呼び出し
-  %mt.{self.counter} = getelementptr inbounds %struct.PyObject, ptr {arg}, i32 0, i32 2
-  %mt_ptr.{self.counter} = load ptr, ptr %mt.{self.counter}
-  %strmethod.{self.counter} = getelementptr inbounds %struct.PyMethodTable, ptr %mt_ptr.{self.counter}, i32 0, i32 {self.get_method_offset('__str__')}
-  %strmethod_ptr.{self.counter} = load ptr, ptr %strmethod.{self.counter}
-  {str_result} = call ptr %strmethod_ptr.{self.counter}(ptr noundef {arg})""")
-
-                # 文字列オブジェクトから実際の文字列を取得
-                str_ptr = f"%strptr.{self.counter}"
-                self.counter += 1
-                self.builder.emit(f"""  {str_ptr} = getelementptr inbounds %struct.PyStringObject, ptr {str_result}, i32 0, i32 1
-  %str.{self.counter} = load ptr, ptr {str_ptr}""")
-
-                # putsの呼び出し
-                self.builder.emit(f"  %puts.{self.counter} = call i32 @puts(ptr noundef %str.{self.counter})")
-            else:
-                raise NotImplementedError("Only single argument printing is supported")
+        if isinstance(node.op, ast.Add):
+            # 加算
+            self.builder.emit(f"  {temp_name} = add i64 {left_val}, {right_val}")
+            self.builder.emit(f"  {result_name} = call ptr @PyInt_FromLong(i64 {temp_name})")
+        elif isinstance(node.op, ast.Sub):
+            # 減算
+            self.builder.emit(f"  {temp_name} = sub i64 {left_val}, {right_val}")
+            self.builder.emit(f"  {result_name} = call ptr @PyInt_FromLong(i64 {temp_name})")
+        elif isinstance(node.op, ast.Mult):
+            # 乗算
+            self.builder.emit(f"  {temp_name} = mul i64 {left_val}, {right_val}")
+            self.builder.emit(f"  {result_name} = call ptr @PyInt_FromLong(i64 {temp_name})")
+        elif isinstance(node.op, ast.Div):
+            # 除算（整数除算）
+            self.builder.emit(f"  {temp_name} = sdiv i64 {left_val}, {right_val}")
+            self.builder.emit(f"  {result_name} = call ptr @PyInt_FromLong(i64 {temp_name})")
+        elif isinstance(node.op, ast.Mod):
+            # 剰余
+            self.builder.emit(f"  {temp_name} = srem i64 {left_val}, {right_val}")
+            self.builder.emit(f"  {result_name} = call ptr @PyInt_FromLong(i64 {temp_name})")
+        elif isinstance(node.op, ast.Pow):
+            # べき乗(難しいので実装は後回し)
+            raise NotImplementedError("Power operation not supported")
+        elif isinstance(node.op, ast.LShift):
+            # 左シフト
+            self.builder.emit(f"  {temp_name} = shl i64 {left_val}, {right_val}")
+            self.builder.emit(f"  {result_name} = call ptr @PyInt_FromLong(i64 {temp_name})")
+        elif isinstance(node.op, ast.RShift):
+            # 右シフト
+            self.builder.emit(f"  {temp_name} = ashr i64 {left_val}, {right_val}")
+            self.builder.emit(f"  {result_name} = call ptr @PyInt_FromLong(i64 {temp_name})")
+        elif isinstance(node.op, ast.BitOr):
+            # ビット論理和
+            self.builder.emit(f"  {temp_name} = or i64 {left_val}, {right_val}")
+            self.builder.emit(f"  {result_name} = call ptr @PyInt_FromLong(i64 {temp_name})")
+        elif isinstance(node.op, ast.BitXor):
+            # ビット排他的論理和
+            self.builder.emit(f"  {temp_name} = xor i64 {left_val}, {right_val}")
+            self.builder.emit(f"  {result_name} = call ptr @PyInt_FromLong(i64 {temp_name})")
+        elif isinstance(node.op, ast.BitAnd):
+            # ビット論理積
+            self.builder.emit(f"  {temp_name} = and i64 {left_val}, {right_val}")
+            self.builder.emit(f"  {result_name} = call ptr @PyInt_FromLong(i64 {temp_name})")
+        elif isinstance(node.op, ast.FloorDiv):
+            # 切り捨て除算
+            self.builder.emit(f"  {temp_name} = sdiv i64 {left_val}, {right_val}")
+            self.builder.emit(f"  {result_name} = call ptr @PyInt_FromLong(i64 {temp_name})")
         else:
-            raise NotImplementedError(f"Function {node.func.id} not supported")  # type: ignore
+            raise NotImplementedError(f"Binary operation not supported: {type(node.op)}")
 
-    def get_method_offset(self, method_name: str) -> int:
-        """メソッドテーブル内のオフセットを取得"""
-        # メソッドテーブル内の順序に基づいてインデックスを返す
-        method_offsets = {
-            "__eq__": 0,
-            "__ne__": 1,
-            "__lt__": 2,
-            "__le__": 3,
-            "__gt__": 4,
-            "__ge__": 5,
-            "__add__": 6,
-            "__sub__": 7,
-            "__mul__": 8,
-            "__div__": 9,
-            "__mod__": 10,
-            "__radd__": 11,
-            "__rsub__": 12,
-            "__rmul__": 13,
-            "__rdiv__": 14,
-            "__rmod__": 15,
-            "__neg__": 16,
-            "__pos__": 17,
-            "__abs__": 18,
-            "__str__": 19,
-            "__repr__": 20,
-            "__int__": 21,
-            "__float__": 22,
-            "__bool__": 23,
-            # ... 他のメソッドも追加
-        }
-        return method_offsets.get(method_name, -1)
+        return result_name
+
+    def visit_Call(self, node: ast.Call) -> str:
+        if isinstance(node.func, ast.Name):
+            if node.func.id == "print":
+                # print関数の呼び出しを生成
+                if not node.args:
+                    raise ValueError("print function requires at least one argument")
+                arg = self.visit(node.args[0])
+                # i32 @puts(i8* %str)
+                temp_name = self.get_temp_name()
+                self.builder.emit(f"  {temp_name} = call i32 @print(ptr {arg})")
+                return temp_name
+            elif node.func.id == "int":
+                # int関数の呼び出しを生成
+                if not node.args:
+                    raise ValueError("int function requires at least one argument")
+                arg = self.visit(node.args[0])
+                temp_name = self.get_temp_name()
+                self.builder.emit(f"  {temp_name} = call ptr @PyInt_FromLong(i64 {arg})")
+                return temp_name
+            elif node.func.id == "str":
+                # str関数の呼び出しを生成
+                if not node.args:
+                    raise ValueError("str function requires at least one argument")
+                arg = self.visit(node.args[0])
+                temp_name = self.get_temp_name()
+                self.builder.emit(f"  {temp_name} = call ptr @PyString_FromString(ptr {arg})")
+                return temp_name
+            else:
+                raise NotImplementedError(f"Function not supported: {node.func.id}")
+        else:
+            raise NotImplementedError(f"Unsupported function call: {type(node.func)}")
+
+    def generic_visit(self, node: ast.AST) -> Any:
+        raise NotImplementedError(f"Unsupported expression: {type(node)}")
