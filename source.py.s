@@ -5,13 +5,10 @@
 _main:                                  ; @main
 	.cfi_startproc
 ; %bb.0:                                ; %entry
-	stp	x20, x19, [sp, #-32]!           ; 16-byte Folded Spill
-	stp	x29, x30, [sp, #16]             ; 16-byte Folded Spill
-	.cfi_def_cfa_offset 32
+	stp	x29, x30, [sp, #-16]!           ; 16-byte Folded Spill
+	.cfi_def_cfa_offset 16
 	.cfi_offset w30, -8
 	.cfi_offset w29, -16
-	.cfi_offset w19, -24
-	.cfi_offset w20, -32
 Lloh0:
 	adrp	x0, l_.str.0@PAGE
 Lloh1:
@@ -22,22 +19,8 @@ Lloh2:
 Lloh3:
 	add	x0, x0, l_.str.1@PAGEOFF
 	bl	_print
-	mov	w0, #1                          ; =0x1
-	bl	_PyInt_FromLong
-	bl	_print
-	mov	w0, #1                          ; =0x1
-	bl	_PyInt_FromLong
-	mov	x19, x0
-	mov	w0, #2                          ; =0x2
-	bl	_PyInt_FromLong
-	ldr	x8, [x19]
-	ldr	x9, [x0]
-	add	x0, x8, x9
-	bl	_PyInt_FromLong
-	bl	_print
-	ldp	x29, x30, [sp, #16]             ; 16-byte Folded Reload
 	mov	w0, wzr
-	ldp	x20, x19, [sp], #32             ; 16-byte Folded Reload
+	ldp	x29, x30, [sp], #16             ; 16-byte Folded Reload
 	ret
 	.loh AdrpAdd	Lloh2, Lloh3
 	.loh AdrpAdd	Lloh0, Lloh1

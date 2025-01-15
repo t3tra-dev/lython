@@ -19,14 +19,8 @@ class IRGenerator(BaseVisitor):
         # 外部関数の宣言
         self.builder.add_external_functions([
             "; 外部関数の宣言",
-            "declare ptr @PyInt_FromLong(i64 noundef)",
-            "declare ptr @PyString_FromString(ptr noundef)",
-            "declare i32 @puts(ptr nocapture readonly) local_unnamed_addr",
-            "declare void @raise_exception(ptr noundef)",
-            "declare ptr @PyObject_New(ptr noundef)",
-            "declare ptr @PyBaseException_New(ptr noundef, ptr noundef, ptr noundef)",
-            "declare ptr @baseexception_str(ptr noundef)",
             "declare i32 @print(ptr noundef)",
+            "declare i32 @puts(ptr nocapture readonly) local_unnamed_addr",
             ""
         ])
 

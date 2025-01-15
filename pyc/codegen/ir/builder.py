@@ -32,12 +32,14 @@ class IRBuilder:
 
         # バイト列にエンコード
         encoded_value = value.encode('utf-8')
-        encoded_length = len(encoded_value)
 
         # バイト列を16進数表現に変換
         escaped_value = ""
         for b in encoded_value:
             escaped_value += f"\\{format(b, '02x')}"
+
+        # エンコードされたバイト列の長さを計算
+        encoded_length = len(encoded_value)
 
         self.global_strings[identifier] = (
             f'{identifier} = private unnamed_addr constant [{encoded_length} x i8] '

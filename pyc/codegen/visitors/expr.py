@@ -28,7 +28,7 @@ class ExprVisitor(ast.NodeVisitor):
             # getelementptr命令を使用して文字列へのポインタを取得
             temp_name = self.get_temp_name()
             self.builder.emit(
-                f"  {temp_name} = getelementptr [{len(node.value) + 1} x i8], "
+                f"  {temp_name} = getelementptr [{len(node.value.encode('utf-8')) + 1} x i8], "
                 f"ptr {global_name}, i64 0, i64 0"
             )
             return temp_name
@@ -48,11 +48,17 @@ class ExprVisitor(ast.NodeVisitor):
         left_ptr = self.visit(node.left)
         right_ptr = self.visit(node.right)
 
-        # PyIntオブジェクトから整数値を取り出す
+        # PyIntObjectのvalueフィールドへのポインタを取得
+        left_val_ptr = self.get_temp_name()
+        right_val_ptr = self.get_temp_name()
+        self.builder.emit(f"  {left_val_ptr} = getelementptr %struct.PyIntObject, ptr {left_ptr}, i32 0, i32 1")
+        self.builder.emit(f"  {right_val_ptr} = getelementptr %struct.PyIntObject, ptr {right_ptr}, i32 0, i32 1")
+
+        # valueフィールドの値をロード
         left_val = self.get_temp_name()
         right_val = self.get_temp_name()
-        self.builder.emit(f"  {left_val} = load i64, ptr {left_ptr}")
-        self.builder.emit(f"  {right_val} = load i64, ptr {right_ptr}")
+        self.builder.emit(f"  {left_val} = load i64, ptr {left_val_ptr}")
+        self.builder.emit(f"  {right_val} = load i64, ptr {right_val_ptr}")
 
         # 計算結果を格納する一時変数
         temp_name = self.get_temp_name()
@@ -112,36 +118,19 @@ class ExprVisitor(ast.NodeVisitor):
         return result_name
 
     def visit_Call(self, node: ast.Call) -> str:
-        if isinstance(node.func, ast.Name):
-            if node.func.id == "print":
-                # print関数の呼び出しを生成
-                if not node.args:
-                    raise ValueError("print function requires at least one argument")
-                arg = self.visit(node.args[0])
-                # i32 @puts(i8* %str)
-                temp_name = self.get_temp_name()
-                self.builder.emit(f"  {temp_name} = call i32 @print(ptr {arg})")
-                return temp_name
-            elif node.func.id == "int":
-                # int関数の呼び出しを生成
-                if not node.args:
-                    raise ValueError("int function requires at least one argument")
-                arg = self.visit(node.args[0])
-                temp_name = self.get_temp_name()
-                self.builder.emit(f"  {temp_name} = call ptr @PyInt_FromLong(i64 {arg})")
-                return temp_name
-            elif node.func.id == "str":
-                # str関数の呼び出しを生成
-                if not node.args:
-                    raise ValueError("str function requires at least one argument")
-                arg = self.visit(node.args[0])
-                temp_name = self.get_temp_name()
-                self.builder.emit(f"  {temp_name} = call ptr @PyString_FromString(ptr {arg})")
-                return temp_name
-            else:
-                raise NotImplementedError(f"Function not supported: {node.func.id}")
+        if isinstance(node.func, ast.Name) and node.func.id == "print":
+            if not node.args:
+                raise ValueError("print function requires at least one argument")
+            # 文字列リテラルのみをサポート
+            arg = node.args[0]
+            if not isinstance(arg, ast.Constant) or not isinstance(arg.value, str):
+                raise ValueError("print function only supports string literals")
+            arg_ptr = self.visit(arg)
+            temp_name = self.get_temp_name()
+            self.builder.emit(f"  {temp_name} = call i32 @print(ptr {arg_ptr})")
+            return temp_name
         else:
-            raise NotImplementedError(f"Unsupported function call: {type(node.func)}")
+            raise NotImplementedError(f"Function not supported: {node.func.id}")  # type: ignore
 
     def generic_visit(self, node: ast.AST) -> Any:
         raise NotImplementedError(f"Unsupported expression: {type(node)}")
