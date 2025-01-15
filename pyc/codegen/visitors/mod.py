@@ -17,14 +17,19 @@ class ModVisitor(BaseVisitor):
 
     def visit_Module(self, node: ast.Module) -> None:
         """モジュールの処理"""
+        # 関数定義を先に処理
+        for stmt in node.body:
+            if isinstance(stmt, ast.FunctionDef):
+                self.stmt_visitor.visit(stmt)
 
         # main関数の開始
         self.builder.emit("\ndefine i32 @main(i32 %argc, i8** %argv) {")
         self.builder.emit("entry:")
 
-        # 本体の処理
+        # 関数定義以外の文を処理
         for stmt in node.body:
-            self.stmt_visitor.visit(stmt)
+            if not isinstance(stmt, ast.FunctionDef):
+                self.stmt_visitor.visit(stmt)
 
         # 関数の終了
         self.builder.emit("  ret i32 0")

@@ -1,5 +1,5 @@
 #include "exceptions.h"
-#include "../stdtypes/string.h"
+#include "../stdtypes/str.h"
 #include "../stdtypes/baseexception.h"
 #include <stdio.h>
 #include <stdlib.h>

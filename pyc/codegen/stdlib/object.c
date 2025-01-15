@@ -1,5 +1,5 @@
 #include "object.h"
-#include "stdtypes/string.h"
+#include "stdtypes/str.h"
 
 // メソッドの実装
 int default_eq(PyObject* self, PyObject* other) {

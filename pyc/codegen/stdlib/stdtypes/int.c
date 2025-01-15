@@ -1,4 +1,5 @@
 #include "int.h"
+#include "str.h"
 #include "baseexception.h"
 #include <stdlib.h>
 
@@ -7,6 +8,24 @@ PyObject* int_add(PyObject* a, PyObject* b) {
     PyIntObject* int_a = (PyIntObject*)a;
     PyIntObject* int_b = (PyIntObject*)b;
     return PyInt_FromLong(int_a->value + int_b->value);
+}
+
+// int型の__repr__メソッド
+PyObject* int_repr(PyObject* self) {
+    PyIntObject* int_obj = (PyIntObject*)self;
+    char buf[32];  // 十分な大きさのバッファ
+    
+    // フォーマット文字列を修正し、必ずNULL終端されるようにする
+    snprintf(buf, sizeof(buf), "%ld", int_obj->value);
+    
+    // 新しい文字列オブジェクトを作成して返す
+    PyObject* str_obj = PyString_FromString(buf);
+    if (str_obj == NULL) {
+        // エラー処理
+        return NULL;
+    }
+    
+    return str_obj;
 }
 
 // int型用のメソッドテーブル
@@ -27,7 +46,8 @@ PyMethodTable int_method_table = {
     .abs = NULL,
     .iter = NULL,
     .next = NULL,
-    .str = default_str,
+    .str = int_repr,
+    .repr = int_repr,
     .dealloc = default_dealloc
 };
 

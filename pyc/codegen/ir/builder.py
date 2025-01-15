@@ -7,6 +7,8 @@ class IRBuilder:
     def __init__(self):
         self.global_strings: Dict[str, str] = {}
         self.string_counter: int = 0
+        self.label_counter: int = 0
+        self.temp_counter: int = 0
         self.output: List[str] = []
         self.external_functions: List[str] = []
         self.struct_definitions: List[str] = []
@@ -31,7 +33,7 @@ class IRBuilder:
         identifier = f"@.str.{self.string_counter}"
 
         # バイト列にエンコード
-        encoded_value = value.encode('utf-8')
+        encoded_value = value.encode("utf-8")
 
         # バイト列を16進数表現に変換
         escaped_value = ""
@@ -42,7 +44,7 @@ class IRBuilder:
         encoded_length = len(encoded_value)
 
         self.global_strings[identifier] = (
-            f'{identifier} = private unnamed_addr constant [{encoded_length} x i8] '
+            f"{identifier} = private unnamed_addr constant [{encoded_length} x i8] "
             f'c"{escaped_value}", align 1'
         )
         self.string_counter += 1
@@ -55,16 +57,35 @@ class IRBuilder:
     def get_output(self) -> str:
         """生成されたLLVM IRを文字列として返す"""
         return "\n".join(
-            list(self.global_strings.values()) +  # noqa
-            self.constants +  # noqa
-            self.external_functions +  # noqa
-            self.struct_definitions +  # noqa
-            self.output
+            list(self.global_strings.values())  # noqa
+            + self.constants  # noqa
+            + self.external_functions  # noqa
+            + self.struct_definitions  # noqa
+            + self.output  # noqa
         )
 
-    def define_function(self, name: str, return_type: str, arg_types: List[str], arg_names: List[str], body: List[str]) -> None:
+    def define_function(
+        self,
+        name: str,
+        return_type: str,
+        arg_types: List[str],
+        arg_names: List[str],
+        body: List[str],
+    ) -> None:
         """関数定義を追加"""
         args = ", ".join(f"{t} %{n}" for t, n in zip(arg_types, arg_names))
         self.output.append(f"define {return_type} @{name}({args}) {{")
         self.output.extend(body)
         self.output.append("}")
+
+    def get_label_counter(self) -> int:
+        """一意なラベル番号を取得"""
+        counter = self.label_counter
+        self.label_counter += 1
+        return counter
+
+    def get_temp_name(self) -> str:
+        """一時変数の名前を生成"""
+        name = f"%t{self.temp_counter}"
+        self.temp_counter += 1
+        return name
