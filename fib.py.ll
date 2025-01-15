@@ -81,7 +81,7 @@ if.end.5:
 
 define i32 @main(i32 %argc, i8** %argv) {
 entry:
-  %t34 = call ptr @PyInt_FromLong(i64 30)
+  %t34 = call ptr @PyInt_FromLong(i64 35)
   %t35 = call ptr @fib(ptr %t34)
   %t36 = call ptr @str(ptr %t35)
   %t37 = call i32 @print_object(ptr %t36)

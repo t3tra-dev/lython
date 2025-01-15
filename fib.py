@@ -4,4 +4,4 @@ def fib(n: int) -> int:
     return fib(n - 1) + fib(n - 2)
 
 
-print(str(fib(30)))
+print(str(fib(35)))

@@ -87,7 +87,7 @@ _main:                                  ; @main
 	.cfi_def_cfa_offset 16
 	.cfi_offset w30, -8
 	.cfi_offset w29, -16
-	mov	w0, #30                         ; =0x1e
+	mov	w0, #35                         ; =0x23
 	bl	_PyInt_FromLong
 	bl	_fib
 	bl	_str
