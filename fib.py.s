@@ -21,13 +21,19 @@ _fib:                                   ; @fib
 	ldr	x8, [x19, #24]
 	ldr	x9, [x0, #24]
 	cmp	x8, x9
-	cset	w8, le
-	and	w0, w8, #0x1
+	b.gt	LBB0_2
+; %bb.1:                                ; %cmp.true.0
+	mov	x0, #1                          ; =0x1
 	bl	_PyInt_FromLong
+	b	LBB0_3
+LBB0_2:                                 ; %cmp.false.1
+	mov	x0, xzr
+	bl	_PyInt_FromLong
+LBB0_3:                                 ; %cmp.end.2
 	ldr	x8, [x0, #24]
 	and	w8, w8, #0x1
-	tbz	w8, #0, LBB0_2
-; %bb.1:                                ; %if.then.0
+	tbz	w8, #0, LBB0_5
+; %bb.4:                                ; %if.then.3
 	mov	x0, x19
 	.cfi_def_cfa wsp, 32
 	ldp	x29, x30, [sp, #16]             ; 16-byte Folded Reload
@@ -38,10 +44,10 @@ _fib:                                   ; @fib
 	.cfi_restore w19
 	.cfi_restore w20
 	ret
-LBB0_2:                                 ; %if.else.1
+LBB0_5:                                 ; %if.else.4
 	.cfi_restore_state
-	b	LBB0_3
-LBB0_3:                                 ; %if.end.2
+	b	LBB0_6
+LBB0_6:                                 ; %if.end.5
 	mov	x0, #1                          ; =0x1
 	bl	_PyInt_FromLong
 	ldr	x8, [x19, #24]
@@ -81,18 +87,6 @@ _main:                                  ; @main
 	.cfi_def_cfa_offset 16
 	.cfi_offset w30, -8
 	.cfi_offset w29, -16
-Lloh0:
-	adrp	x0, l_.str.0@PAGE
-Lloh1:
-	add	x0, x0, l_.str.0@PAGEOFF
-	bl	_PyString_FromString
-	bl	_print_object
-Lloh2:
-	adrp	x0, l_.str.1@PAGE
-Lloh3:
-	add	x0, x0, l_.str.1@PAGEOFF
-	bl	_PyString_FromString
-	bl	_print_object
 	mov	w0, #30                         ; =0x1e
 	bl	_PyInt_FromLong
 	bl	_fib
@@ -101,17 +95,8 @@ Lloh3:
 	mov	w0, wzr
 	ldp	x29, x30, [sp], #16             ; 16-byte Folded Reload
 	ret
-	.loh AdrpAdd	Lloh2, Lloh3
-	.loh AdrpAdd	Lloh0, Lloh1
 	.cfi_endproc
                                         ; -- End function
-	.section	__TEXT,__cstring,cstring_literals
-l_.str.0:                               ; @.str.0
-	.asciz	"Hello, world!"
-
-l_.str.1:                               ; @.str.1
-	.asciz	"multibite character: \343\201\202\343\201\204\343\201\206\343\201\210\343\201\212, \360\237\220\215"
-
 	.section	__DATA,__data
 	.globl	_Py_True                        ; @Py_True
 _Py_True:

@@ -211,7 +211,7 @@ class ExprVisitor(ast.NodeVisitor):
         self.builder.emit(f"  {left_val} = load i64, ptr {left_val_ptr}")
         self.builder.emit(f"  {right_val} = load i64, ptr {right_val_ptr}")
 
-        # 比較結果を格納する一時変数
+        # 比較結果を格納する一時変数（i1型）
         result = self.get_temp_name()
 
         # 比較演算子に応じた処理
@@ -231,15 +231,32 @@ class ExprVisitor(ast.NodeVisitor):
         else:
             raise NotImplementedError(f"Comparison operator not supported: {type(op)}")
 
-        # i1をi64に変換
-        result_i64 = self.builder.get_temp_name()
-        self.builder.emit(f"  {result_i64} = zext i1 {result} to i64")
+        # 条件分岐用のラベルを生成
+        true_label = f"cmp.true.{self.builder.get_label_counter()}"
+        false_label = f"cmp.false.{self.builder.get_label_counter()}"
+        end_label = f"cmp.end.{self.builder.get_label_counter()}"
 
-        # PyIntオブジェクトを作成
-        final_result = self.builder.get_temp_name()
-        self.builder.emit(f"  {final_result} = call ptr @PyInt_FromLong(i64 {result_i64})")
+        # 条件分岐を生成
+        self.builder.emit(f"  br i1 {result}, label %{true_label}, label %{false_label}")
 
-        return final_result
+        # true の場合
+        self.builder.emit(f"{true_label}:")
+        true_result = self.get_temp_name()
+        self.builder.emit(f"  {true_result} = call ptr @PyInt_FromLong(i64 1)")
+        self.builder.emit(f"  br label %{end_label}")
+
+        # false の場合
+        self.builder.emit(f"{false_label}:")
+        false_result = self.get_temp_name()
+        self.builder.emit(f"  {false_result} = call ptr @PyInt_FromLong(i64 0)")
+        self.builder.emit(f"  br label %{end_label}")
+
+        # 終了ラベル
+        self.builder.emit(f"{end_label}:")
+        result_ptr = self.get_temp_name()
+        self.builder.emit(f"  {result_ptr} = phi ptr [ {true_result}, %{true_label} ], [ {false_result}, %{false_label} ]")
+
+        return result_ptr
 
     def visit_Name(self, node: ast.Name) -> str:
         """変数名の処理"""

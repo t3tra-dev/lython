@@ -80,7 +80,7 @@ entry:
   %t34 = call i32 @print_object(ptr %t33)
   %t35 = call ptr @PyString_FromString(ptr @.str.1)
   %t36 = call i32 @print_object(ptr %t35)
-  %t37 = call ptr @PyInt_FromLong(i64 10)
+  %t37 = call ptr @PyInt_FromLong(i64 30)
   %t38 = call ptr @fib(ptr %t37)
   %t39 = call ptr @str(ptr %t38)
   %t40 = call i32 @print_object(ptr %t39)
