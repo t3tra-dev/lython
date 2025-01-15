@@ -24,11 +24,10 @@ class ExprVisitor(ast.NodeVisitor):
         if isinstance(node.value, str):
             # 文字列定数の処理
             global_name = self.builder.add_global_string(node.value)
-            # getelementptr命令を使用して文字列へのポインタを取得
             temp_name = self.get_temp_name()
+            # 文字列ポインタを取得
             self.builder.emit(
-                f"  {temp_name} = getelementptr [{len(node.value.encode('utf-8')) + 1} x i8], "
-                f"ptr {global_name}, i64 0, i64 0"
+                f"  {temp_name} = call ptr @PyString_FromString(ptr {global_name})"
             )
             return temp_name
         elif isinstance(node.value, int):
@@ -40,7 +39,7 @@ class ExprVisitor(ast.NodeVisitor):
             return temp_name
         elif node.value is None:
             # Noneの処理
-            return "null"
+            return "@Py_None"
         else:
             raise NotImplementedError(
                 f"Constant type not supported: {type(node.value)}"

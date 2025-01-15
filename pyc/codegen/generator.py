@@ -25,6 +25,7 @@ class IRGenerator(BaseVisitor):
                 "declare i32 @puts(ptr nocapture readonly) local_unnamed_addr",
                 "declare ptr @PyInt_FromLong(i64)",
                 "declare ptr @str(ptr noundef)",
+                "declare ptr @PyString_FromString(ptr noundef)",  # この行を追加
                 "",
             ]
         )

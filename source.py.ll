@@ -13,6 +13,7 @@ declare i32 @print_object(ptr noundef)
 declare i32 @puts(ptr nocapture readonly) local_unnamed_addr
 declare ptr @PyInt_FromLong(i64)
 declare ptr @str(ptr noundef)
+declare ptr @PyString_FromString(ptr noundef)
 
 ; 構造体定義
 %struct.PyObject = type { ptr, i64, ptr }
@@ -75,9 +76,9 @@ if.end.2:
 
 define i32 @main(i32 %argc, i8** %argv) {
 entry:
-  %t33 = getelementptr [14 x i8], ptr @.str.0, i64 0, i64 0
+  %t33 = call ptr @PyString_FromString(ptr @.str.0)
   %t34 = call i32 @print_object(ptr %t33)
-  %t35 = getelementptr [43 x i8], ptr @.str.1, i64 0, i64 0
+  %t35 = call ptr @PyString_FromString(ptr @.str.1)
   %t36 = call i32 @print_object(ptr %t35)
   %t37 = call ptr @PyInt_FromLong(i64 10)
   %t38 = call ptr @fib(ptr %t37)

@@ -85,11 +85,13 @@ Lloh0:
 	adrp	x0, l_.str.0@PAGE
 Lloh1:
 	add	x0, x0, l_.str.0@PAGEOFF
+	bl	_PyString_FromString
 	bl	_print_object
 Lloh2:
 	adrp	x0, l_.str.1@PAGE
 Lloh3:
 	add	x0, x0, l_.str.1@PAGEOFF
+	bl	_PyString_FromString
 	bl	_print_object
 	mov	w0, #10                         ; =0xa
 	bl	_PyInt_FromLong
