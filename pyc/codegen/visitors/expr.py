@@ -67,85 +67,54 @@ class ExprVisitor(ast.NodeVisitor):
         self.builder.emit(f"  {right_val} = load i64, ptr {right_val_ptr}")
 
         # 計算結果を格納する一時変数
-        temp_name = self.get_temp_name()
-        # PyIntオブジェクトを格納する一時変数
-        result_name = self.get_temp_name()
+        result_val = self.get_temp_name()
 
         if isinstance(node.op, ast.Add):
             # 加算
-            self.builder.emit(f"  {temp_name} = add i64 {left_val}, {right_val}")
-            self.builder.emit(
-                f"  {result_name} = call ptr @PyInt_FromLong(i64 {temp_name})"
-            )
+            self.builder.emit(f"  {result_val} = add i64 {left_val}, {right_val}")
         elif isinstance(node.op, ast.Sub):
             # 減算
-            self.builder.emit(f"  {temp_name} = sub i64 {left_val}, {right_val}")
-            self.builder.emit(
-                f"  {result_name} = call ptr @PyInt_FromLong(i64 {temp_name})"
-            )
+            self.builder.emit(f"  {result_val} = sub i64 {left_val}, {right_val}")
         elif isinstance(node.op, ast.Mult):
             # 乗算
-            self.builder.emit(f"  {temp_name} = mul i64 {left_val}, {right_val}")
-            self.builder.emit(
-                f"  {result_name} = call ptr @PyInt_FromLong(i64 {temp_name})"
-            )
+            self.builder.emit(f"  {result_val} = mul i64 {left_val}, {right_val}")
         elif isinstance(node.op, ast.Div):
-            # 除算（整数除算）
-            self.builder.emit(f"  {temp_name} = sdiv i64 {left_val}, {right_val}")
-            self.builder.emit(
-                f"  {result_name} = call ptr @PyInt_FromLong(i64 {temp_name})"
-            )
+            # 除算
+            self.builder.emit(f"  {result_val} = sdiv i64 {left_val}, {right_val}")
         elif isinstance(node.op, ast.Mod):
             # 剰余
-            self.builder.emit(f"  {temp_name} = srem i64 {left_val}, {right_val}")
-            self.builder.emit(
-                f"  {result_name} = call ptr @PyInt_FromLong(i64 {temp_name})"
-            )
+            self.builder.emit(f"  {result_val} = srem i64 {left_val}, {right_val}")
         elif isinstance(node.op, ast.Pow):
-            # べき乗(難しいので実装は後回し)
-            raise NotImplementedError("Power operation not supported")
+            # 冪乗(難しいので後回し)
+            raise NotImplementedError("Power operator not supported")
         elif isinstance(node.op, ast.LShift):
             # 左シフト
-            self.builder.emit(f"  {temp_name} = shl i64 {left_val}, {right_val}")
-            self.builder.emit(
-                f"  {result_name} = call ptr @PyInt_FromLong(i64 {temp_name})"
-            )
+            self.builder.emit(f"  {result_val} = shl i64 {left_val}, {right_val}")
         elif isinstance(node.op, ast.RShift):
             # 右シフト
-            self.builder.emit(f"  {temp_name} = ashr i64 {left_val}, {right_val}")
-            self.builder.emit(
-                f"  {result_name} = call ptr @PyInt_FromLong(i64 {temp_name})"
-            )
+            self.builder.emit(f"  {result_val} = ashr i64 {left_val}, {right_val}")
         elif isinstance(node.op, ast.BitOr):
             # ビット論理和
-            self.builder.emit(f"  {temp_name} = or i64 {left_val}, {right_val}")
-            self.builder.emit(
-                f"  {result_name} = call ptr @PyInt_FromLong(i64 {temp_name})"
-            )
+            self.builder.emit(f"  {result_val} = or i64 {left_val}, {right_val}")
         elif isinstance(node.op, ast.BitXor):
             # ビット排他的論理和
-            self.builder.emit(f"  {temp_name} = xor i64 {left_val}, {right_val}")
-            self.builder.emit(
-                f"  {result_name} = call ptr @PyInt_FromLong(i64 {temp_name})"
-            )
+            self.builder.emit(f"  {result_val} = xor i64 {left_val}, {right_val}")
         elif isinstance(node.op, ast.BitAnd):
             # ビット論理積
-            self.builder.emit(f"  {temp_name} = and i64 {left_val}, {right_val}")
-            self.builder.emit(
-                f"  {result_name} = call ptr @PyInt_FromLong(i64 {temp_name})"
-            )
+            self.builder.emit(f"  {result_val} = and i64 {left_val}, {right_val}")
         elif isinstance(node.op, ast.FloorDiv):
             # 切り捨て除算
-            self.builder.emit(f"  {temp_name} = sdiv i64 {left_val}, {right_val}")
-            self.builder.emit(
-                f"  {result_name} = call ptr @PyInt_FromLong(i64 {temp_name})"
-            )
+            self.builder.emit(f"  {result_val} = sdiv i64 {left_val}, {right_val}")
         else:
             raise NotImplementedError(
                 f"Binary operation not supported: {type(node.op)}"
             )
 
-        return result_name
+        # 最後に一度だけPyIntObjectを生成
+        result_ptr = self.get_temp_name()
+        self.builder.emit(f"  {result_ptr} = call ptr @PyInt_FromLong(i64 {result_val})")
+
+        return result_ptr
 
     def visit_Call(self, node: ast.Call) -> str:
         if isinstance(node.func, ast.Name):
