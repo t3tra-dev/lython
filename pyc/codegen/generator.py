@@ -1,7 +1,7 @@
 import ast
 
 from .ir.builder import IRBuilder
-from .visitors import ModVisitor, ExprVisitor
+from .visitors import ExprVisitor, ModVisitor
 from .visitors.base import BaseVisitor
 
 __all__ = ["IRGenerator"]

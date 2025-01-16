@@ -1,7 +1,8 @@
 import subprocess
 import time
-from typing import List, Tuple
 from dataclasses import dataclass
+from typing import List, Tuple
+
 from rich.console import Console
 from rich.table import Table
 
