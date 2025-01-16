@@ -1,5 +1,6 @@
 # executable binaries
 main
+fib
 
 
 # --- Python.gitignore ---
