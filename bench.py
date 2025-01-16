@@ -41,11 +41,11 @@ def run_benchmarks() -> List[BenchmarkResult]:
 
 def display_results(results: List[BenchmarkResult]):
     console = Console()
-    table = Table(title="🚀 ベンチマーク結果")
+    table = Table(title="🚀 Benchmark Results")
 
-    table.add_column("実行環境", style="cyan")
-    table.add_column("実行時間", style="green")
-    table.add_column("出力", style="yellow")
+    table.add_column("runtime", style="cyan")
+    table.add_column("time", style="green")
+    table.add_column("result", style="yellow")
 
     sorted_results = sorted(results, key=lambda x: x.execution_time)
     fastest_time = sorted_results[0].execution_time
