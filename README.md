@@ -49,6 +49,10 @@ A transpiler that converts Python code to LLVM IR and compiles it to machine cod
 
     Fibonacci数列を例にしたサンプルコード（Python原本・生成したLLVM IR・アセンブリ）。
 
+  - `fib.c`, `fib.c.ll`
+
+    Fibonacci数列を例にしたサンプルコード（C原本・生成したLLVM IR）。
+
   - `helloworld.ll`
 
     “Hello, world!”のLLVM IRサンプル。
