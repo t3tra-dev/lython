@@ -12,50 +12,42 @@ class IRGenerator(BaseVisitor):
         self.builder = IRBuilder()
         self.module_visitor = ModVisitor(self.builder)
         self.expr_visitor = ExprVisitor(self.builder)
-        self.setup_stdlib()
+        self.setup_runtime()
 
-    def setup_stdlib(self):
-        """stdlibのセットアップ"""
-        # 外部関数の宣言
-        self.builder.add_external_functions(
-            [
-                "; 外部関数の宣言",
-                "declare i32 @print(ptr noundef)",
-                "declare i32 @print_object(ptr noundef)",
-                "declare i32 @puts(ptr nocapture readonly) local_unnamed_addr",
-                "declare ptr @PyInt_FromLong(i64)",
-                "declare ptr @str(ptr noundef)",
-                "declare ptr @PyString_FromString(ptr noundef)",  # この行を追加
-                "",
-            ]
-        )
+    def setup_runtime(self):
+        """
+        静的型ランタイム用の外部宣言を追加する
+        malloc, free, printf, print_i32, print_string, create_string など
+        """
+        # とりあえず最低限の宣言を追加
+        self.builder.add_external_functions([
+            "; ========== External runtime declarations ========== ",
+            "declare ptr @malloc(i64)",    # メモリ管理用
+            "declare void @free(ptr)",
 
-        # 構造体定義
-        self.builder.add_struct_definitions(
-            [
-                "; 構造体定義",
-                "%struct.PyObject = type { ptr, i64, ptr }",
-                "",
-                "%struct.PyMethodTable = type { ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr }",
-                "",
-                "%struct.PyStringObject = type { %struct.PyObject, ptr, i64 }",
-                "",
-                "%struct.PyIntObject = type { %struct.PyObject, i64 }",
-                "",
-                "%struct.PyBaseExceptionObject = type { %struct.PyObject, ptr }",
-                "",
-            ]
-        )
+            # 文字列出力: puts(char*)
+            "declare i32 @puts(ptr)",
 
-        # 定数の定義
-        self.builder.add_constant("; 定数の定義")
-        self.builder.add_constant("@Py_True = global i1 true, align 1")
-        self.builder.add_constant("@Py_False = global i1 false, align 1")
-        self.builder.add_constant("@Py_None = global ptr null, align 8")
-        self.builder.add_constant("")
+            # 整数出力: printf("%d", i32)
+            "declare void @print_i32(i32)",
 
-        self.builder.add_constant("")
-        self.builder.add_constant("attributes #0 = { noinline nounwind optnone uwtable \"frame-pointer\"=\"all\" \"min-legal-vector-width\"=\"0\" \"no-trapping-math\"=\"true\" \"stack-protector-buffer-size\"=\"8\" }")
+            # 文字列オブジェクト (構造体String*) を受け取って表示
+            "declare void @print_string(ptr)",
+
+            # 文字列生成: String* create_string(i8*)
+            "declare ptr @create_string(ptr)",
+
+            "",
+        ])
+
+        # 必要なら String 構造体の定義をIR上で書く (i64 length, i8* data)
+        self.builder.add_struct_definitions([
+            "%struct.String = type { i64, ptr } ; // length + data pointer",
+            "",
+        ])
+
+        # attributesとか
+        self.builder.add_constant('attributes #0 = { noinline nounwind optnone uwtable "frame-pointer"="all" }')
 
     def visit_Module(self, node: ast.Module) -> None:
         self.module_visitor.visit(node)

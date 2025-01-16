@@ -11,109 +11,165 @@ __all__ = ["StmtVisitor"]
 
 
 class StmtVisitor(BaseVisitor):
+    """
+    文(stmt)ノードを訪問しIRを生成する
+    静的型付けとして扱うためFunctionDefなどは引数型/戻り値型を注釈から参照し
+    IR上のシグネチャを決定する(のが理想だが、ここでは最低限の実装に留める)
+    """
+
     def __init__(self, builder: IRBuilder):
         self.builder = builder
         self.expr_visitor = ExprVisitor(builder)
 
+    # ---------------------------
+    # visit_FunctionDef
+    # ---------------------------
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        """関数定義の処理"""
-        # 関数名を取得
+        """
+        関数定義:
+          def hoge(n: int) -> int:
+              ...
+        などを受け取り、静的型のIRを生成する
+        """
         func_name = node.name
 
-        # 引数の処理
+        # 引数の型注釈読み取り (最低限)
         arg_types = []
         arg_names = []
         for arg in node.args.args:
-            arg_types.append("ptr")  # すべての引数をPyObject*として扱う
+            # ここではすべて i32 と仮定
+            # TODO: annotation を見て分岐
+            arg_types.append("i32")
             arg_names.append(arg.arg)
 
-        # 関数本体の開始
-        self.builder.emit("")  # 空行を追加
-        self.builder.emit("; Function definition")
-        self.builder.emit(
-            f"define dso_local ptr @{func_name}({', '.join(f'ptr noundef %{name}' for name in arg_names)}) #0 {{"
-        )
+        # TODO: 戻り値型も annotation を見て i32 or ptr などにする
+        # 一旦 i32 と仮定
+        return_type = "i32"
+
+        # IR出力
+        self.builder.emit("")
+        self.builder.emit(f"; Function definition: {func_name}")
+
+        # 引数部
+        joined_args = ", ".join(f"{t} %{name}" for t, name in zip(arg_types, arg_names))
+        self.builder.emit(f"define {return_type} @{func_name}({joined_args}) #0 {{")
         self.builder.emit("entry:")
-        self.builder.emit("  ; Function body")
 
-        # 関数本体の処理
-        has_return = False
-        for stmt in node.body:
-            if isinstance(stmt, ast.Return):
-                has_return = True
-            self.visit(stmt)
+        # ステートメント群を処理
+        self.visit_function_body(node.body, return_type)
 
-        # 明示的なreturnがない場合のみNoneを返す
-        if not has_return:
-            self.builder.emit("  ret ptr @Py_None")
         self.builder.emit("}")
 
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        raise NotImplementedError("Async function definition not supported")
+    def visit_function_body(self, stmts: list[ast.stmt], return_type: str) -> None:
+        """
+        関数本体のステートメントを順に訪問し
+        最後にreturnがなければデフォルトの返却を生成する
+        """
+        has_return = False
+        for s in stmts:
+            if isinstance(s, ast.Return):
+                has_return = True
+            self.visit(s)
 
-    def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        raise NotImplementedError("Class definition not supported")
+        if not has_return:
+            if return_type == "i32":
+                # return 0
+                self.builder.emit("  ret i32 0")
+            elif return_type == "ptr":
+                # return null
+                self.builder.emit("  ret ptr null")
+            else:
+                self.builder.emit("  ret void")
 
+    # ---------------------------
+    # visit_Return
+    # ---------------------------
     def visit_Return(self, node: ast.Return) -> None:
-        """return文の処理"""
+        """
+        return文を処理
+        戻り値が無ければデフォルト値
+        """
         if node.value is None:
-            # return Noneの場合
-            self.builder.emit("  ret ptr @Py_None")
+            # i32の場合 0を返す と仮定
+            self.builder.emit("  ret i32 0")
         else:
-            # 戻り値の評価
-            value_ptr = self.expr_visitor.visit(node.value)
-            self.builder.emit(f"  ret ptr {value_ptr}")
+            val = self.expr_visitor.visit(node.value)
+            # 一旦 i32 と仮定
+            self.builder.emit(f"  ret i32 {val}")
 
-    def visit_Delete(self, node: ast.Delete) -> None:
-        raise NotImplementedError("Delete statement not supported")
-
-    def visit_Assign(self, node: ast.Assign) -> None:
-        raise NotImplementedError("Assignment not supported")
-
-    def visit_Expr(self, node: ast.Expr) -> Any:
-        """式文の処理"""
-        return self.expr_visitor.visit(node.value)
-
-    # 他のstmt関連のvisitメソッドも同様に実装
-
+    # ---------------------------
+    # visit_If
+    # ---------------------------
     def visit_If(self, node: ast.If) -> None:
-        """if文の処理"""
-        # 条件式の評価結果を取得
-        cond_ptr = self.expr_visitor.visit(node.test)
+        """
+        if文:
+          if test:
+              ...
+          else:
+              ...
+        静的に i32(0以外) をtrueとみなすなど
+        """
+        cond_val = self.expr_visitor.visit(node.test)  # i32 0/1
+        # i32 -> i1
+        tmp_bool = self.builder.get_temp_name()
+        self.builder.emit(f"  {tmp_bool} = icmp ne i32 {cond_val}, 0")
 
-        # 一意なラベル名を生成
         then_label = f"if.then.{self.builder.get_label_counter()}"
         else_label = f"if.else.{self.builder.get_label_counter()}"
         end_label = f"if.end.{self.builder.get_label_counter()}"
 
-        # PyIntObjectのvalueフィールドへのポインタを取得
-        cond_val_ptr = self.builder.get_temp_name()
-        self.builder.emit(
-            f"  {cond_val_ptr} = getelementptr %struct.PyIntObject, ptr {cond_ptr}, i32 0, i32 1"
-        )
+        # 分岐
+        self.builder.emit(f"  br i1 {tmp_bool}, label %{then_label}, label %{else_label}")
 
-        # 条件値をロード
-        cond_val = self.builder.get_temp_name()
-        self.builder.emit(f"  {cond_val} = load i64, ptr {cond_val_ptr}")
-
-        # i64をi1に変換
-        cond_bool = self.builder.get_temp_name()
-        self.builder.emit(f"  {cond_bool} = trunc i64 {cond_val} to i1")
-
-        # 条件分岐
-        self.builder.emit(f"  br i1 {cond_bool}, label %{then_label}, label %{else_label}")
-
-        # then部分の処理
+        # then
         self.builder.emit(f"{then_label}:")
-        for stmt in node.body:
-            self.visit(stmt)
+        for s in node.body:
+            self.visit(s)
         self.builder.emit(f"  br label %{end_label}")
 
-        # else部分の処理
+        # else
         self.builder.emit(f"{else_label}:")
-        for stmt in node.orelse:
-            self.visit(stmt)
+        for s in node.orelse:
+            self.visit(s)
         self.builder.emit(f"  br label %{end_label}")
 
-        # 終了ラベル
+        # end
         self.builder.emit(f"{end_label}:")
+
+    # ---------------------------
+    # その他stmt
+    # ---------------------------
+    def visit_Expr(self, node: ast.Expr) -> Any:
+        """
+        式文
+        戻り値は破棄してよいので、一応計算はするが特に変数には入れない
+        """
+        _ = self.expr_visitor.visit(node.value)
+        # discard
+        return None
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        raise NotImplementedError("Class definition not supported in static mode")
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        raise NotImplementedError("Assignment not supported in static mode")
+
+    def visit_Delete(self, node: ast.Delete) -> None:
+        raise NotImplementedError("Delete statement not supported in static mode")
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        raise NotImplementedError("Async function definition not supported")
+
+    def visit_For(self, node: ast.For) -> None:
+        raise NotImplementedError("For statement not implemented")
+
+    def visit_While(self, node: ast.While) -> None:
+        raise NotImplementedError("While statement not implemented")
+
+    def visit_Try(self, node: ast.Try) -> None:
+        raise NotImplementedError("Try statement not implemented")
+
+    # など他のstmtも未実装の場合は同様に NotImplementedError
+
+    def generic_visit(self, node: ast.AST) -> None:
+        return super().generic_visit(node)

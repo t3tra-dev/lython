@@ -1,241 +1,205 @@
 from __future__ import annotations
 
 import ast
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from ..ir import IRBuilder
-
-if TYPE_CHECKING:
-    from .mod import ModVisitor  # noqa
+from .base import BaseVisitor
 
 __all__ = ["ExprVisitor"]
 
 
-class ExprVisitor(ast.NodeVisitor):
+class ExprVisitor(BaseVisitor, ast.NodeVisitor):
+    """
+    式(expr)ノードの訪問を担当するクラス
+    静的型付き言語として扱う想定のため
+    - int は i32 (or i64)
+    - str は string用の構造体ポインタ (IR上ではptr %struct.String*など)
+    などにマッピングする
+    """
+
     def __init__(self, builder: IRBuilder):
         self.builder = builder
-        self.temp_counter = builder.temp_counter
+        # BaseVisitorには__init__が無いので super() は省略
 
     def get_temp_name(self) -> str:
-        name = self.builder.get_temp_name()
-        return name
+        return self.builder.get_temp_name()
 
+    # ---------------------------
+    # visit_Constant
+    # ---------------------------
     def visit_Constant(self, node: ast.Constant) -> str:
-        if isinstance(node.value, str):
-            # 文字列定数の処理
-            global_name = self.builder.add_global_string(node.value)
-            temp_name = self.get_temp_name()
-            # 文字列ポインタを取得
-            self.builder.emit(
-                f"  {temp_name} = call ptr @PyString_FromString(ptr {global_name})"
-            )
-            return temp_name
-        elif isinstance(node.value, int):
-            # 整数定数の処理
-            temp_name = self.get_temp_name()
-            self.builder.emit(
-                f"  {temp_name} = call ptr @PyInt_FromLong(i64 {node.value})"
-            )
-            return temp_name
-        elif node.value is None:
-            # Noneの処理
-            return "@Py_None"
+        """
+        静的型に基づき、int/str等をネイティブ表現の即値や
+        create_string() 呼び出しなどに変換する
+        """
+        val = node.value
+
+        if isinstance(val, int):
+            # i32 (または i64) 即値を作る
+            tmp = self.get_temp_name()
+            # IR上で i32 %tmp = <constant> 的に表現したいので
+            # ここではシンプルに "add i32 0, val" を生成
+            self.builder.emit(f"  {tmp} = add i32 0, {val}")
+            return tmp
+
+        elif isinstance(val, str):
+            # 文字列リテラルをグローバルに置き、 create_string(ptr) を呼ぶ想定
+            gname = self.builder.add_global_string(val)
+            tmp = self.get_temp_name()
+            self.builder.emit(f"  {tmp} = call ptr @create_string(ptr {gname})")
+            return tmp
+
+        elif val is None:
+            # None相当は静的型上廃止してもよいが null ポインタを返す
+            return "null"
+
         else:
-            raise NotImplementedError(
-                f"Constant type not supported: {type(node.value)}"
-            )
+            raise NotImplementedError(f"Unsupported constant type: {type(val)}")
 
+    # ---------------------------
+    # visit_BinOp
+    # ---------------------------
     def visit_BinOp(self, node: ast.BinOp) -> str:
-        # 左辺と右辺の値を取得
-        left_ptr = self.visit(node.left)
-        right_ptr = self.visit(node.right)
+        """
+        2項演算
+        int同士の場合は i32 同士の演算を想定
+        str同士の + などは未対応としてエラーにするなど
+        """
+        left_val = self.visit(node.left)
+        right_val = self.visit(node.right)
 
-        # PyIntObjectのvalueフィールドへのポインタを取得
-        left_val_ptr = self.get_temp_name()
-        right_val_ptr = self.get_temp_name()
-        self.builder.emit(
-            f"  {left_val_ptr} = getelementptr %struct.PyIntObject, ptr {left_ptr}, i32 0, i32 1"
-        )
-        self.builder.emit(
-            f"  {right_val_ptr} = getelementptr %struct.PyIntObject, ptr {right_ptr}, i32 0, i32 1"
-        )
-
-        # valueフィールドの値をロード
-        left_val = self.get_temp_name()
-        right_val = self.get_temp_name()
-        self.builder.emit(f"  {left_val} = load i64, ptr {left_val_ptr}")
-        self.builder.emit(f"  {right_val} = load i64, ptr {right_val_ptr}")
-
-        # 計算結果を格納する一時変数
-        result_val = self.get_temp_name()
+        # ここでは int (i32) 同士の演算を前提とする
+        result_name = self.get_temp_name()
 
         if isinstance(node.op, ast.Add):
-            # 加算
-            self.builder.emit(f"  {result_val} = add i64 {left_val}, {right_val}")
+            self.builder.emit(f"  {result_name} = add i32 {left_val}, {right_val}")
         elif isinstance(node.op, ast.Sub):
-            # 減算
-            self.builder.emit(f"  {result_val} = sub i64 {left_val}, {right_val}")
+            self.builder.emit(f"  {result_name} = sub i32 {left_val}, {right_val}")
         elif isinstance(node.op, ast.Mult):
-            # 乗算
-            self.builder.emit(f"  {result_val} = mul i64 {left_val}, {right_val}")
+            self.builder.emit(f"  {result_name} = mul i32 {left_val}, {right_val}")
         elif isinstance(node.op, ast.Div):
-            # 除算
-            self.builder.emit(f"  {result_val} = sdiv i64 {left_val}, {right_val}")
+            # i32 の算術除算 (sdiv)
+            self.builder.emit(f"  {result_name} = sdiv i32 {left_val}, {right_val}")
         elif isinstance(node.op, ast.Mod):
-            # 剰余
-            self.builder.emit(f"  {result_val} = srem i64 {left_val}, {right_val}")
-        elif isinstance(node.op, ast.Pow):
-            # 冪乗(難しいので後回し)
-            raise NotImplementedError("Power operator not supported")
-        elif isinstance(node.op, ast.LShift):
-            # 左シフト
-            self.builder.emit(f"  {result_val} = shl i64 {left_val}, {right_val}")
-        elif isinstance(node.op, ast.RShift):
-            # 右シフト
-            self.builder.emit(f"  {result_val} = ashr i64 {left_val}, {right_val}")
-        elif isinstance(node.op, ast.BitOr):
-            # ビット論理和
-            self.builder.emit(f"  {result_val} = or i64 {left_val}, {right_val}")
-        elif isinstance(node.op, ast.BitXor):
-            # ビット排他的論理和
-            self.builder.emit(f"  {result_val} = xor i64 {left_val}, {right_val}")
-        elif isinstance(node.op, ast.BitAnd):
-            # ビット論理積
-            self.builder.emit(f"  {result_val} = and i64 {left_val}, {right_val}")
-        elif isinstance(node.op, ast.FloorDiv):
-            # 切り捨て除算
-            self.builder.emit(f"  {result_val} = sdiv i64 {left_val}, {right_val}")
+            self.builder.emit(f"  {result_name} = srem i32 {left_val}, {right_val}")
         else:
-            raise NotImplementedError(
-                f"Binary operation not supported: {type(node.op)}"
-            )
+            raise NotImplementedError(f"BinOp {type(node.op)} not supported (static)")
 
-        # 最後に一度だけPyIntObjectを生成
-        result_ptr = self.get_temp_name()
-        self.builder.emit(f"  {result_ptr} = call ptr @PyInt_FromLong(i64 {result_val})")
+        return result_name
 
-        return result_ptr
-
+    # ---------------------------
+    # visit_Call
+    # ---------------------------
     def visit_Call(self, node: ast.Call) -> str:
-        if isinstance(node.func, ast.Name):
-            if node.func.id == "print":
-                if len(node.args) != 1:
-                    raise NotImplementedError("print with multiple arguments not supported")
-                arg_ptr = self.visit(node.args[0])
-                temp_name = self.get_temp_name()
-                self.builder.emit(f"  {temp_name} = call i32 @print_object(ptr {arg_ptr})")
-                return temp_name
-            elif node.func.id == "str":
-                # str関数の呼び出し
-                if len(node.args) != 1:
-                    raise NotImplementedError("str with multiple arguments not supported")
-                arg_ptr = self.visit(node.args[0])
-                temp_name = self.get_temp_name()
-                self.builder.emit(f"  {temp_name} = call ptr @str(ptr {arg_ptr})")
-                return temp_name
-            else:
-                # ユーザー定義関数の呼び出し
-                func_name = node.func.id
-                args = []
-                for arg in node.args:
-                    arg_ptr = self.visit(arg)
-                    args.append(f"ptr {arg_ptr}")
+        """
+        関数呼び出し。
+        例:
+            - print(...) は特別扱いし、intなら print_i32(...)、
+              stringなら print_string(...) を呼ぶなど。
+            - ユーザ関数はシグネチャが i32->i32 かなどを型注釈から推論し、呼び出す。
+        """
+        if not isinstance(node.func, ast.Name):
+            raise NotImplementedError("Only simple function calls supported (static)")
 
-                result = self.get_temp_name()
-                self.builder.emit(
-                    f"  {result} = call ptr @{func_name}({', '.join(args)})"
-                )
-                return result
+        func_name = node.func.id
+
+        # ここでは例として:
+        #   print(x) -> if x is i32 => call void @print_i32(i32 x)
+        #               if x is ptr => call void @print_string(ptr x)
+        #   それ以外 => ユーザ定義関数として対応
+        if func_name == "print":
+            if len(node.args) != 1:
+                raise NotImplementedError("print(...) with multiple args not supported")
+
+            arg_val = self.visit(node.args[0])  # i32 か ptr か
+            # ここでは "print_i32" と "print_string" を、型判別なしでとりあえず呼べる前提
+            # TODO: "どの型か" をASTか型推論で判別するようにする
+            # 例: i32として扱うなら:
+            tmp = self.get_temp_name()
+            # IRに: call void @print_i32(i32 <arg_val>)
+            self.builder.emit(f"  call void @print_i32(i32 {arg_val})")
+            # とりあえず i32用のprintだけ呼ぶ
+            # 戻り値はvoidだが、一応 tmp = add i32 0, 0 みたいにでっち上げる
+            self.builder.emit(f"  {tmp} = add i32 0, 0")
+            return tmp
+
         else:
-            raise NotImplementedError("Only named functions are supported")
+            # ユーザー定義関数呼び出し
+            # ここで引数をgatherしてIR化
+            arg_vals = []
+            for a in node.args:
+                arg_vals.append(self.visit(a))  # i32 or ptr
 
-    def generic_visit(self, node: ast.AST) -> Any:
-        raise NotImplementedError(f"Unsupported expression: {type(node)}")
+            # シンプルに全部 i32 と仮定して call i32 @func_name(i32, i32, ...)
+            # あるいは全部 ptr と仮定するなど。実際には型注釈が要る
+            joined_args = ", ".join(f"i32 {v}" for v in arg_vals)
+            ret_var = self.get_temp_name()
+            # 戻り値を i32 として扱う想定
+            self.builder.emit(f"  {ret_var} = call i32 @{func_name}({joined_args})")
+            return ret_var
 
+    # ---------------------------
+    # visit_Compare
+    # ---------------------------
     def visit_Compare(self, node: ast.Compare) -> str:
-        """比較演算の処理"""
-        # 左辺の値を取得
-        left_ptr = self.visit(node.left)
-
-        # 現時点では単一の比較演算子のみをサポート
+        """
+        比較演算: i32同士の比較を想定して icmp.
+        結果は i1 だが、boolをi32(0 or 1)に変換して返すなど。
+        """
         if len(node.ops) != 1 or len(node.comparators) != 1:
-            raise NotImplementedError("Multiple comparisons not supported")
+            raise NotImplementedError("Only single compare op is supported (static)")
 
-        # 右辺の値を取得
-        right_ptr = self.visit(node.comparators[0])
-
-        # PyIntObjectのvalueフィールドへのポインタを取得
-        left_val_ptr = self.get_temp_name()
-        right_val_ptr = self.get_temp_name()
-        self.builder.emit(
-            f"  {left_val_ptr} = getelementptr %struct.PyIntObject, ptr {left_ptr}, i32 0, i32 1"
-        )
-        self.builder.emit(
-            f"  {right_val_ptr} = getelementptr %struct.PyIntObject, ptr {right_ptr}, i32 0, i32 1"
-        )
-
-        # valueフィールドの値をロード
-        left_val = self.get_temp_name()
-        right_val = self.get_temp_name()
-        self.builder.emit(f"  {left_val} = load i64, ptr {left_val_ptr}")
-        self.builder.emit(f"  {right_val} = load i64, ptr {right_val_ptr}")
-
-        # 比較結果を格納する一時変数（i1型）
-        result = self.get_temp_name()
-
-        # 比較演算子に応じた処理
+        left_val = self.visit(node.left)
+        right_val = self.visit(node.comparators[0])
         op = node.ops[0]
+
+        tmp_bool = self.get_temp_name()  # i1
         if isinstance(op, ast.LtE):
-            self.builder.emit(f"  {result} = icmp sle i64 {left_val}, {right_val}")
+            self.builder.emit(f"  {tmp_bool} = icmp sle i32 {left_val}, {right_val}")
         elif isinstance(op, ast.Lt):
-            self.builder.emit(f"  {result} = icmp slt i64 {left_val}, {right_val}")
+            self.builder.emit(f"  {tmp_bool} = icmp slt i32 {left_val}, {right_val}")
         elif isinstance(op, ast.GtE):
-            self.builder.emit(f"  {result} = icmp sge i64 {left_val}, {right_val}")
+            self.builder.emit(f"  {tmp_bool} = icmp sge i32 {left_val}, {right_val}")
         elif isinstance(op, ast.Gt):
-            self.builder.emit(f"  {result} = icmp sgt i64 {left_val}, {right_val}")
+            self.builder.emit(f"  {tmp_bool} = icmp sgt i32 {left_val}, {right_val}")
         elif isinstance(op, ast.Eq):
-            self.builder.emit(f"  {result} = icmp eq i64 {left_val}, {right_val}")
+            self.builder.emit(f"  {tmp_bool} = icmp eq i32 {left_val}, {right_val}")
         elif isinstance(op, ast.NotEq):
-            self.builder.emit(f"  {result} = icmp ne i64 {left_val}, {right_val}")
+            self.builder.emit(f"  {tmp_bool} = icmp ne i32 {left_val}, {right_val}")
         else:
-            raise NotImplementedError(f"Comparison operator not supported: {type(op)}")
+            raise NotImplementedError(f"Comparison op {type(op)} not supported")
 
-        # 条件分岐用のラベルを生成
-        true_label = f"cmp.true.{self.builder.get_label_counter()}"
-        false_label = f"cmp.false.{self.builder.get_label_counter()}"
-        end_label = f"cmp.end.{self.builder.get_label_counter()}"
+        # i1 -> i32 へ拡張 (true=1, false=0)
+        ret = self.get_temp_name()
+        self.builder.emit(f"  {ret} = zext i1 {tmp_bool} to i32")
+        return ret
 
-        # 条件分岐を生成
-        self.builder.emit(f"  br i1 {result}, label %{true_label}, label %{false_label}")
-
-        # true の場合
-        self.builder.emit(f"{true_label}:")
-        true_result = self.get_temp_name()
-        self.builder.emit(f"  {true_result} = call ptr @PyInt_FromLong(i64 1)")
-        self.builder.emit(f"  br label %{end_label}")
-
-        # false の場合
-        self.builder.emit(f"{false_label}:")
-        false_result = self.get_temp_name()
-        self.builder.emit(f"  {false_result} = call ptr @PyInt_FromLong(i64 0)")
-        self.builder.emit(f"  br label %{end_label}")
-
-        # 終了ラベル
-        self.builder.emit(f"{end_label}:")
-        result_ptr = self.get_temp_name()
-        self.builder.emit(f"  {result_ptr} = phi ptr [ {true_result}, %{true_label} ], [ {false_result}, %{false_label} ]")
-
-        return result_ptr
-
+    # ---------------------------
+    # visit_Name
+    # ---------------------------
     def visit_Name(self, node: ast.Name) -> str:
-        """変数名の処理"""
-        # 現時点では変数のスコープは考慮せず、単純に変数名を返す
-        if node.id == "None":
-            return "@Py_None"
-        elif node.id == "True":
-            return "@Py_True"
+        """
+        変数参照。
+        今回は「静的型言語化」するにあたり、None/True/Falseなどを扱わない or
+        それぞれ i32 0 / i32 1 などとして扱う例。
+        """
+        if node.id == "True":
+            tmp = self.get_temp_name()
+            self.builder.emit(f"  {tmp} = add i32 0, 1")
+            return tmp
         elif node.id == "False":
-            return "@Py_False"
+            tmp = self.get_temp_name()
+            self.builder.emit(f"  {tmp} = add i32 0, 0")
+            return tmp
+        elif node.id == "None":
+            return "null"
         else:
-            # ローカル変数として扱う
+            # 変数: e.g. i32 %foo
             return f"%{node.id}"
+
+    # ------------------------------------------------
+    # あと ast.NodeVisitorで要求されるgeneric_visit等
+    # ------------------------------------------------
+    def generic_visit(self, node: ast.AST) -> Any:
+        return super().generic_visit(node)

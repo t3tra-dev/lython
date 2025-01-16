@@ -15,26 +15,13 @@ _fib:                                   ; @fib
 	.cfi_offset w19, -24
 	.cfi_offset w20, -32
 	.cfi_remember_state
-	mov	x19, x0
-	mov	x0, #1                          ; =0x1
-	bl	_PyInt_FromLong
-	ldr	x8, [x19, #24]
-	ldr	x9, [x0, #24]
-	cmp	x8, x9
-	b.gt	LBB0_2
-; %bb.1:                                ; %cmp.true.0
-	mov	x0, #1                          ; =0x1
-	bl	_PyInt_FromLong
-	b	LBB0_3
-LBB0_2:                                 ; %cmp.false.1
-	mov	x0, xzr
-	bl	_PyInt_FromLong
-LBB0_3:                                 ; %cmp.end.2
-	ldr	x8, [x0, #24]
+	mov	w8, wzr
+	add	w8, w8, #1
+	cmp	w0, w8
+	cset	w8, le
 	and	w8, w8, #0x1
-	tbz	w8, #0, LBB0_5
-; %bb.4:                                ; %if.then.3
-	mov	x0, x19
+	cbz	w8, LBB0_2
+; %bb.1:                                ; %if.then.0
 	.cfi_def_cfa wsp, 32
 	ldp	x29, x30, [sp, #16]             ; 16-byte Folded Reload
 	ldp	x20, x19, [sp], #32             ; 16-byte Folded Reload
@@ -44,29 +31,22 @@ LBB0_3:                                 ; %cmp.end.2
 	.cfi_restore w19
 	.cfi_restore w20
 	ret
-LBB0_5:                                 ; %if.else.4
+LBB0_2:                                 ; %if.else.1
 	.cfi_restore_state
-	b	LBB0_6
-LBB0_6:                                 ; %if.end.5
-	mov	x0, #1                          ; =0x1
-	bl	_PyInt_FromLong
-	ldr	x8, [x19, #24]
-	ldr	x9, [x0, #24]
-	sub	x0, x8, x9
-	bl	_PyInt_FromLong
+	b	LBB0_3
+LBB0_3:                                 ; %if.end.2
+	mov	w8, wzr
+	add	w8, w8, #1
+	sub	w8, w0, w8
+	mov	w20, w0
+	mov	w0, w8
 	bl	_fib
-	mov	x20, x0
-	mov	x0, #2                          ; =0x2
-	bl	_PyInt_FromLong
-	ldr	x8, [x19, #24]
-	ldr	x9, [x0, #24]
-	sub	x0, x8, x9
-	bl	_PyInt_FromLong
+	mov	w19, w0
+	mov	w8, wzr
+	add	w8, w8, #2
+	sub	w0, w20, w8
 	bl	_fib
-	ldr	x8, [x20, #24]
-	ldr	x9, [x0, #24]
-	add	x0, x8, x9
-	bl	_PyInt_FromLong
+	add	w0, w19, w0
 	.cfi_def_cfa wsp, 32
 	ldp	x29, x30, [sp, #16]             ; 16-byte Folded Reload
 	ldp	x20, x19, [sp], #32             ; 16-byte Folded Reload
@@ -88,22 +68,11 @@ _main:                                  ; @main
 	.cfi_offset w30, -8
 	.cfi_offset w29, -16
 	mov	w0, #35                         ; =0x23
-	bl	_PyInt_FromLong
 	bl	_fib
-	bl	_str
-	bl	_print_object
+	bl	_print_i32
 	mov	w0, wzr
 	ldp	x29, x30, [sp], #16             ; 16-byte Folded Reload
 	ret
 	.cfi_endproc
                                         ; -- End function
-	.section	__DATA,__data
-	.globl	_Py_True                        ; @Py_True
-_Py_True:
-	.byte	1                               ; 0x1
-
-	.globl	_Py_False                       ; @Py_False
-.zerofill __DATA,__common,_Py_False,1,0
-	.globl	_Py_None                        ; @Py_None
-.zerofill __DATA,__common,_Py_None,8,3
 .subsections_via_symbols
