@@ -1,5 +1,6 @@
 # executable binaries
 main
+cfib
 fib
 
 

@@ -10,4 +10,5 @@ dependencies = []
 dev = [
     "black>=24.10.0",
     "isort>=5.13.2",
+    "rich>=13.9.4",
 ]
