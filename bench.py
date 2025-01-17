@@ -15,10 +15,22 @@ class BenchmarkResult:
 
 
 def run_command(command: str) -> Tuple[str, float]:
-    start_time = time.time()
-    result = subprocess.run(command.split(), capture_output=True, text=True)
-    end_time = time.time()
-    return result.stdout.strip(), end_time - start_time
+    # ウォームアップ
+    subprocess.run(command.split(), capture_output=True, text=True)
+
+    # 複数回実行して平均を取る
+    iterations = 5
+    times = []
+
+    for _ in range(iterations):
+        start_time = time.perf_counter()
+        result = subprocess.run(command.split(), capture_output=True, text=True)
+        end_time = time.perf_counter()
+        times.append(end_time - start_time)
+
+    # 平均実行時間を計算
+    avg_time = sum(times) / len(times)
+    return result.stdout.strip(), avg_time
 
 
 def run_benchmarks() -> List[BenchmarkResult]:
