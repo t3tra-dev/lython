@@ -14,6 +14,16 @@ class BenchmarkResult:
     output: str
 
 
+def setup() -> None:
+    # コンパイル
+    subprocess.run("clang ./benchmark/cfib.c -o cfib".split())
+
+    subprocess.run("clang ./benchmark/llfib.ll -o llfib".split())
+
+    subprocess.run("python -m pyc --emit-llvm ./benchmark/pyfib.py".split())
+    subprocess.run("clang ./benchmark/pyfib.py.ll runtime.o -o pyfib".split())
+
+
 def run_command(command: str) -> Tuple[str, float]:
     # ウォームアップ
     subprocess.run(command.split(), capture_output=True, text=True)
@@ -35,14 +45,14 @@ def run_command(command: str) -> Tuple[str, float]:
 
 def run_benchmarks() -> List[BenchmarkResult]:
     commands = {
-        "Node.js": "node fib.js",
-        "Bun": "bun fib.js",
-        "Deno": "deno run fib.js",
+        "Node.js": "node ./benchmark/jsfib.js",
+        "Bun": "bun ./benchmark/jsfib.js",
+        "Deno": "deno run ./benchmark/jsfib.js",
         "C": "./cfib",
         "LLVM": "./llfib",
-        "Python(pyc)": "./fib",
-        "Python": "python fib.py",
-        "Python(no GIL)": "python3.13t -X gil=1 fib.py"
+        "Python(pyc)": "./pyfib",
+        "Python": "python ./benchmark/pyfib.py",
+        "Python(no GIL)": "python3.13t -X gil=1 ./benchmark/pyfib.py"
     }
 
     results = []
@@ -73,5 +83,6 @@ def display_results(results: List[BenchmarkResult]):
 
 
 if __name__ == "__main__":
+    setup()
     results = run_benchmarks()
     display_results(results)
