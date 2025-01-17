@@ -24,19 +24,14 @@ class IRGenerator(BaseVisitor):
             "; ========== External runtime declarations ========== ",
             "declare ptr @malloc(i64)",    # メモリ管理用
             "declare void @free(ptr)",
-
-            # 文字列出力: puts(char*)
-            "declare i32 @puts(ptr)",
-
-            # 整数出力: printf("%d", i32)
-            "declare void @print_i32(i32)",
-
-            # 文字列オブジェクト (構造体String*) を受け取って表示
-            "declare void @print_string(ptr)",
-
+            # print (String*) -> void
+            "declare void @print(ptr)",
+            "",
+            "declare ptr @int2str(i32)",   # int => string
+            "declare ptr @str2str(ptr)",  # string => string
+            "",
             # 文字列生成: String* create_string(i8*)
             "declare ptr @create_string(ptr)",
-
             "",
         ])
 

@@ -30,25 +30,20 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
     # ---------------------------
     def visit_Constant(self, node: ast.Constant) -> str:
         """
-        静的型に基づき、int/str等をネイティブ表現の即値や
-        create_string() 呼び出しなどに変換する
+        静的型に基づき、int/str等をネイティブ表現の即値に変換する
         """
         val = node.value
 
-        if isinstance(val, int):
-            # i32 (または i64) 即値を作る
-            tmp = self.get_temp_name()
-            # IR上で i32 %tmp = <constant> 的に表現したいので
-            # ここではシンプルに "add i32 0, val" を生成
-            self.builder.emit(f"  {tmp} = add i32 0, {val}")
-            return tmp
-
-        elif isinstance(val, str):
-            # 文字列リテラルをグローバルに置き、 create_string(ptr) を呼ぶ想定
-            gname = self.builder.add_global_string(val)
+        # 文字列型の生成
+        if isinstance(val, str):
+            gname = self.builder.add_global_string(node.value)
             tmp = self.get_temp_name()
             self.builder.emit(f"  {tmp} = call ptr @create_string(ptr {gname})")
             return tmp
+
+        # 整数型の生成
+        if isinstance(val, int):
+            return str(val)  # LLVM IRでは整数リテラルはそのまま使用可能
 
         elif val is None:
             # None相当は静的型上廃止してもよいが null ポインタを返す
@@ -94,35 +89,49 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
     def visit_Call(self, node: ast.Call) -> str:
         """
         関数呼び出し。
-        例:
-            - print(...) は特別扱いし、intなら print_i32(...)、
-              stringなら print_string(...) を呼ぶなど。
-            - ユーザ関数はシグネチャが i32->i32 かなどを型注釈から推論し、呼び出す。
         """
         if not isinstance(node.func, ast.Name):
             raise NotImplementedError("Only simple function calls supported (static)")
 
         func_name = node.func.id
 
-        # ここでは例として:
-        #   print(x) -> if x is i32 => call void @print_i32(i32 x)
-        #               if x is ptr => call void @print_string(ptr x)
-        #   それ以外 => ユーザ定義関数として対応
         if func_name == "print":
+            # 引数は1個のみ、かつ文字列型を想定
             if len(node.args) != 1:
-                raise NotImplementedError("print(...) with multiple args not supported")
+                raise NotImplementedError("print() with multiple or zero args not supported")
 
-            arg_val = self.visit(node.args[0])  # i32 か ptr か
-            # ここでは "print_i32" と "print_string" を、型判別なしでとりあえず呼べる前提
-            # TODO: "どの型か" をASTか型推論で判別するようにする
-            # 例: i32として扱うなら:
+            arg_val = self.visit(node.args[0])  # 文字列型(ptr)を期待
+            # ここで arg_val は %struct.String* (IR上ではptr) のはず
+            # 'print' 関数を呼び出す (declare void @print(ptr))
+            self.builder.emit(f"  call void @print(ptr {arg_val})")
+
+            # returnはNone(式としてはvoid)
             tmp = self.get_temp_name()
-            # IRに: call void @print_i32(i32 <arg_val>)
-            self.builder.emit(f"  call void @print_i32(i32 {arg_val})")
-            # とりあえず i32用のprintだけ呼ぶ
-            # 戻り値はvoidだが、一応 tmp = add i32 0, 0 みたいにでっち上げる
-            self.builder.emit(f"  {tmp} = add i32 0, 0")
+            self.builder.emit(f"  {tmp} = add i32 0, 0 ; discard return")
             return tmp
+
+        elif func_name == "str":
+            # `str()` への呼び出し
+            if len(node.args) != 1:
+                raise NotImplementedError("str() with multiple/zero args not supported")
+
+            arg_val = self.visit(node.args[0])  # i32 or ptr
+            # ここで "型情報" をどう取得するかは、本来型推論が必要。
+            # 簡易的に、i32なら int2str、ptrなら str2str という判定を行う例:
+            # (i32かptrかどうか？ => 簡易的には変数名の先頭とか、あるいはvisitor内で管理している type map による)
+            # ここでは仮に "もし変数名が '%' で始まればi32" みたいな雑判定をしてみる(本当は厳密化が必要)
+
+            # ダミーの判定例:
+            if arg_val.startswith("%"):
+                # i32 だと仮定
+                tmp = self.builder.get_temp_name()
+                self.builder.emit(f"  {tmp} = call ptr @int2str(i32 {arg_val})")
+                return tmp
+            else:
+                # string(ptr)
+                tmp = self.builder.get_temp_name()
+                self.builder.emit(f"  {tmp} = call ptr @str2str(ptr {arg_val})")
+                return tmp
 
         else:
             # ユーザー定義関数呼び出し
