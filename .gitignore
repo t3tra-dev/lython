@@ -1,7 +1,7 @@
 # executable binaries
 main
-cfib
-llfib
+cfib_*
+llfib_*
 pyfib
 
 

@@ -15,10 +15,14 @@ class BenchmarkResult:
 
 
 def setup() -> None:
-    # コンパイル
-    subprocess.run("clang ./benchmark/cfib.c -o cfib".split())
+    # C言語の各最適化レベルでコンパイル
+    optimization_levels = ["O0", "O1", "O2", "O3"]
+    for opt in optimization_levels:
+        subprocess.run(f"clang ./benchmark/cfib.c -o cfib_{opt} -{opt}".split())
 
-    subprocess.run("clang ./benchmark/llfib.ll -o llfib".split())
+    # LLVMの各最適化レベルでコンパイル
+    for opt in optimization_levels:
+        subprocess.run(f"clang ./benchmark/llfib.ll -o llfib_{opt} -{opt}".split())
 
     subprocess.run("python -m pyc --emit-llvm ./benchmark/pyfib.py".split())
     subprocess.run("clang ./benchmark/pyfib.py.ll runtime.o -o pyfib".split())
@@ -48,8 +52,14 @@ def run_benchmarks() -> List[BenchmarkResult]:
         "Node.js": "node ./benchmark/jsfib.js",
         "Bun": "bun ./benchmark/jsfib.js",
         "Deno": "deno run ./benchmark/jsfib.js",
-        "C": "./cfib",
-        "LLVM": "./llfib",
+        "C(O0)": "./cfib_O0",
+        "C(O1)": "./cfib_O1",
+        "C(O2)": "./cfib_O2",
+        "C(O3)": "./cfib_O3",
+        "LLVM(O0)": "./llfib_O0",
+        "LLVM(O1)": "./llfib_O1",
+        "LLVM(O2)": "./llfib_O2",
+        "LLVM(O3)": "./llfib_O3",
         "Python(pyc)": "./pyfib",
         "Python": "python ./benchmark/pyfib.py",
         "Python(no GIL)": "python3.13t -X gil=1 ./benchmark/pyfib.py"
