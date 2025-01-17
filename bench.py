@@ -27,9 +27,10 @@ def run_benchmarks() -> List[BenchmarkResult]:
         "Bun": "bun fib.js",
         "Deno": "deno run fib.js",
         "C": "./cfib",
+        "LLVM": "./llfib",
         "Python(pyc)": "./fib",
         "Python": "python fib.py",
-        "Python(no GIL)": "python3.13t fib.py"
+        "Python(no GIL)": "python3.13t -X gil=1 fib.py"
     }
 
     results = []
