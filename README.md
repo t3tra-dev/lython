@@ -1,6 +1,5 @@
 > Note: Please do not send pull requests to this repository.
 
-
 # pyc - Python to LLVM IR transpiler & compiler
 
 ```
@@ -8,14 +7,8 @@
 ┏━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━┓
 ┃ runtime        ┃ time              ┃ result  ┃
 ┡━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━┩
-│ LLVM(O1)       │ 15.47ms (x1.00)   │ 9227465 │
-│ C(O1)          │ 15.74ms (x1.02)   │ 9227465 │
-│ C(O3)          │ 17.77ms (x1.15)   │ 9227465 │
-│ LLVM(O3)       │ 17.99ms (x1.16)   │ 9227465 │
-│ C(O2)          │ 19.24ms (x1.24)   │ 9227465 │
-│ LLVM(O2)       │ 21.65ms (x1.40)   │ 9227465 │
-│ LLVM(O0)       │ 25.20ms (x1.63)   │ 9227465 │
-│ C(O0)          │ 36.26ms (x2.34)   │ 9227465 │
+│ LLVM           │ 25.20ms (x1.63)   │ 9227465 │
+│ C              │ 36.26ms (x2.34)   │ 9227465 │
 │ Python(pyc)    │ 44.66ms (x2.89)   │ 9227465 │
 │ Bun            │ 55.38ms (x3.58)   │ 9227465 │
 │ Deno           │ 81.69ms (x5.28)   │ 9227465 │
@@ -25,87 +18,164 @@
 └────────────────┴───────────────────┴─────────┘
 ```
 
-## プロジェクト概要
+**pyc** は、Python コードを LLVM IR に変換 (トランスパイル) し、さらに機械語へコンパイルすることを目指した実験的プロジェクトです。  
+CPython とは異なる形で静的型付けのように扱いながらPythonソースを解析し、`clang` などのツールチェーンを利用してネイティブバイナリを生成することを目標としています。
 
-- **pyc**
-
-  PythonコードをLLVM IRに変換し、最終的にマシンコードへコンパイルするためのメイン機能を提供するモジュールです。以下のサブディレクトリ・ファイルに分かれています:
-
-  - `pyc/__init__.py`
-
-    プロジェクトのバージョン情報やトップレベル関数(`get_codegen`, `get_compiler`)を定義しています。
-
-  - `pyc/__main__.py`
-
-    CLIエントリポイント。コマンドライン引数（`--emit-llvm`, `--compile`, `--dump-ast`など）を解析し、対応する処理を呼び出します。
-
-  - `pyc/codegen/`
-
-    LLVM IR 生成を担うサブモジュール。`generator.py`や`dump_ast.py`などを通じて、Python AST から LLVM IR を生成します。
-
-    - `ir/`
-
-      IRを構築するための`IRBuilder`を定義し、文字列や定数などをグローバルに保持しながらLLVM IRを組み立てる仕組みを提供します。
-
-    - `stdlib/`
-
-      独自に実装したCコードなどが含まれ、`print`, `str`, `int` オブジェクトなどの標準的なPython的機能をLLVM IRで扱えるようにしています。
-
-    - `visitors/`
-
-      ASTノードを走査するためのクラス群。各構文要素（式、文、パターンなど）に応じた処理を振り分け、IR生成の実装を分割しています。
-
-  - `pyc/compiler/`
-
-    `ll2bin.py`や`ll2s.py`といったコンパイル補助スクリプトを提供し、生成された`.ll`(LLVM IR)をアセンブリやバイナリへ変換する機能をまとめています。
-
-- **トップレベルのファイル構成**
-
-  - `.gitignore`, `.python-version`, `.vscode/settings.json`
-
-    開発環境・バージョン管理に関わる設定ファイルです。
-
-  - `fib.py`, `fib.py.ll`, `fib.py.s`
-
-    Fibonacci数列を例にしたサンプルコード（Python原本・生成したLLVM IR・アセンブリ）。
-
-  - `fib.c`, `fib.c.ll`
-
-    Fibonacci数列を例にしたサンプルコード（C原本・生成したLLVM IR）。
-
-  - `helloworld.ll`
-
-    “Hello, world!”のLLVM IRサンプル。
-
-  - `sample.c`, `sample.ll`
-
-    Cで書いたサンプルと、そのLLVM IR。
-
-  - `source.py`, `source.py.ll`, `source.py.s`
-
-    “Hello, world!”やFibonacciを含む実装のサンプルコード（Python原本・生成したLLVM IR・アセンブリ）。
-
-  - `pyproject.toml`, `uv.lock`
-
-    Poetryや依存管理の設定ファイル。`uv.lock`はバイナリ再現性を高めるためのロックファイルとして扱われています。
+## Features
+- Python AST をトラバースし、LLVM IR を生成
+- 生成された IR をさらに `clang` や `llc` などでコンパイルして実行ファイル化を目指す
+- Python によるソースコード解析部分は静的型に近い形で扱う実験的実装
+- ランタイム (`runtime/`) として最低限のメモリ管理・`print` 関数などを C 実装で提供
 
 ---
 
-### 主な処理の流れ
+## Directory Structures
 
-1. **AST生成**
+```text
+├── .gitignore
+├── .python-version        # Python のバージョン指定 (3.12)
+├── .vscode
+│   └── settings.json      # VSCode 用設定ファイル
+├── bench.py               # ベンチマーク用スクリプト
+├── benchmark/             # ベンチマークで使用するコード群 (C/JS/LLVM IR/Pythonなど)
+│   ├── cfib.c
+│   ├── jsfib.js
+│   ├── llfib.ll
+│   ├── pyfib.py
+│   └── pyfib.py.ll
+├── helloworld.ll          # サンプルの "Hello, world!" LLVM IR
+├── pyc/
+│   ├── __init__.py
+│   ├── __main__.py        # `python -m pyc` で呼ばれるエントリーポイント
+│   ├── codegen/           # Python→LLVM IR 変換ロジック
+│   │   ├── ir/            # LLVM IR を構築するためのビルダー等
+│   │   └── visitors/      # 各種 AST ノードへの Visitor 実装
+│   └── compiler/          # 生成された LLVM IR をバイナリに変換するロジック (ll2bin など)
+├── pyproject.toml         # Python プロジェクト管理用 (PEP 621)
+├── runtime/
+│   ├── runtime.c
+│   └── runtime.h          # C 言語で実装したランタイム (メモリ管理やprint関数など)
+├── sample.c               # C のサンプルコード
+├── sample.ll              # 上記 C コードを LLVM IR 化した例
+├── source.py              # Python のサンプルコード
+├── source.py.ll           # source.py を LLVM IR 化した例
+├── source.py.s            # さらにアセンブリまで生成した例
+└── uv.lock                # uv による依存関係のロックファイル
+```
 
-   `pyc/codegen/codegen.py`内でPythonのソースファイルを読み込み、`ast.parse`によりASTを構築します。
+---
 
-2. **LLVM IR生成**
+## インストール
 
-   生成したASTを`pyc/codegen/generator.py`の`IRGenerator`や`visitors/`配下のクラスに渡し、各構文要素に応じて`IRBuilder`がLLVM IRを組み立てます。  
-   結果として、`.ll`ファイルが出力されます。
+### 環境構築
 
-3. **コンパイル**
+このリポジトリでは [uv](https://docs.astral.sh/uv) というパッケージ管理ツールを使用しています。  
+Python 3.12 以上が必要です (`.python-version` で 3.12 を指定しています)。
 
-   `pyc/compiler/ll2bin.py`や`ll2s.py`などにより、LLVM IR（`.ll`ファイル）をアセンブリ（`.s`ファイル）やネイティブバイナリへ変換します。環境によっては`llc`や`clang`を使用します。
+1. **uv のインストール**  
+   Unix:
+   ```bash
+   curl -LsSf https://astral.sh/uv/install.sh | sh
+   ```
+   Windows:
+   ```bash
+   powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+   ```
 
-4. **stdlibのサポート**
+2. **依存関係の同期**  
+   ```bash
+   uv sync
+   ```
+   `uv.lock` の内容に従って各種パッケージ (black, isort, rich など) をインストールします。
 
-   `pyc/codegen/stdlib/`以下では、Pythonオブジェクトに相当する`PyInt`, `PyString`, `PyObject`などのC実装が含まれます。算術演算や文字列処理、例外ハンドリング、`print`などのPython的な機能をLLVM IRレベルで再現するための仕組みとなっています。
+3. **コンパイラツールチェーン**  
+   LLVM/Clang がインストールされている必要があります。  
+   `clang --version` や `llc --version` が使用できる状態にしてください (環境に応じてインストール)。
+
+---
+
+## 使用方法
+
+### LLVM IR の生成
+
+```bash
+python -m pyc --emit-llvm <python_file>
+```
+
+例: `source.py` を LLVM IR 化して `source.py.ll` を出力する:
+```bash
+python -m pyc --emit-llvm source.py
+```
+実行後、同じフォルダに `source.py.ll` が生成されます。
+
+### バイナリへのコンパイル
+
+```bash
+python -m pyc --compile <python_file>
+```
+
+例: `source.py` を機械語バイナリにコンパイルする:
+```bash
+python -m pyc --compile source.py
+```
+実行後、(現状は実験的ですが) `source.py.out` が生成される想定です。
+
+### AST のダンプ
+
+```bash
+python -m pyc --dump-ast <python_file>
+```
+Python の AST (抽象構文木) を文字列としてダンプします。  
+内部的には `ast.dump()` 相当の機能を使用しています。
+
+---
+
+## ベンチマーク
+
+`bench.py` を使うと、以下のような言語/コンパイルパターンでフィボナッチ (n=35) の実行時間を比較できます:
+
+- Node.js / Bun / Deno (JavaScript)
+- C (clang) with -O0, -O1, -O2, -O3
+- LLVM IR (clang) with -O0, -O1, -O2, -O3
+- Python (pyc で LLVM IR 化したバイナリ)
+- Python (CPython), Python(no GIL) (3.13 スレッドフリー版など)
+
+#### 使い方
+
+```bash
+python bench.py
+```
+
+スクリプトの冒頭 `setup()` 関数で C や LLVM IR のコンパイルを行い、その後各エグゼを繰り返し呼び出して平均実行時間を比較します。  
+結果はターミナルに表形式で表示されます (内部で `rich` を使用)。
+
+---
+
+## ランタイム
+
+`runtime/` ディレクトリ以下に、C 言語で実装された最小限のランタイムが含まれています。
+
+- `runtime.c` / `runtime.h`
+  - `create_string`, `free_string`, `int2str`, `str2str`, `print` などの関数を提供
+  - LLVM IR 上で `declare` してコールすることで、Python の組み込み風の機能を実装
+
+このランタイムをリンクして最終的なバイナリを生成することにより、`print("Hello")` などが動作します。
+
+---
+
+## 今後の予定 / 注意点
+
+- **型推論の強化**: 現在は非常に簡易的に int/str などを仮定しているのみ。関数呼び出しにおける引数・戻り値の型チェックなどは未実装に近いです。
+- **制御構文の拡張**: `if` 以外の制御構文 (`while`, `for`, `try` など) はまだ多くが未実装。
+- **クラス・例外対応**: クラス定義や例外処理など、Python の主要機能のほとんどは未対応。
+- **最適化パス**: 生成した LLVM IR をどのように最適化するかは今後の課題です。
+- **Windows など他プラットフォーム対応**: 開発環境は Unix 系 (Linux, macOS) を想定しています。Windows での動作確認は限定的です。
+
+本プロジェクトはあくまで実験的段階のため、上記のように不完全な部分や将来的に大きな変更が入る可能性があります。
+
+---
+
+## ライセンス
+
+本リポジトリのソースコードは、特記がない限り [MIT License](https://opensource.org/licenses/MIT) で配布されています。  
+詳細はソースコード内の記述（`pyc/__init__.py` など）をご参照ください。
