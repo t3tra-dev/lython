@@ -14,6 +14,12 @@ class ModVisitor(BaseVisitor):
     """
     モジュール(ソースファイル全体)を訪問するクラス
     Python の ast.Module に対応
+
+    ```asdl
+    mod = Module(stmt* body, type_ignore* type_ignores)
+        | Interactive(stmt* body)
+        | Expression(expr body)
+        | FunctionType(expr* argtypes, expr returns)
     """
 
     def __init__(self, builder: IRBuilder):
