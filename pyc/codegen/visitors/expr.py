@@ -12,15 +12,15 @@ __all__ = ["ExprVisitor"]
 class ExprVisitor(BaseVisitor, ast.NodeVisitor):
     """
     式(expr)ノードの訪問を担当するクラス
-    静的型付き言語として扱う想定のため
-    - int は i32 (or i64)
+    静的型付き言語として扱う想定
+    - int は i32
+    - bool は i1
     - str は string用の構造体ポインタ (IR上ではptr %struct.String*など)
     などにマッピングする
     """
 
     def __init__(self, builder: IRBuilder):
         self.builder = builder
-        # BaseVisitorには__init__が無いので super() は省略
 
     def get_temp_name(self) -> str:
         return self.builder.get_temp_name()
