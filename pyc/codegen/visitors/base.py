@@ -1,5 +1,7 @@
 import ast
-from typing import Any
+from typing import Any, Dict
+
+from ..ir import IRBuilder
 
 __all__ = ["BaseVisitor", "TypedValue"]
 
@@ -18,15 +20,70 @@ class TypedValue:
 class BaseVisitor:
     """
     ベースとなるVisitorクラス
-    すべてのノードタイプに対して visit_* メソッドをディスパッチする
+
     同時に、簡易的なシンボルテーブルを持ち、
       - 変数名 -> 型
     のマッピングを扱う。
+    すべてのASTノードに対して visit_<NodeType>() メソッドをディスパッチする
+    また、専用のサブビジター (AliasVisitor, ArgVisitor, etc. など) が存在する場合は、
+    self.subvisitors に登録されている対応するVisitorへ転送。
     """
 
-    def __init__(self):
-        # 変数名 -> 型名 (str) の簡易マッピング
-        self.symbol_table = {}
+    def __init__(self, builder: IRBuilder):
+        self.builder = builder
+
+        # 簡易的なシンボルテーブル（変数名 -> 型など）
+        self.symbol_table: Dict[str, str] = {}
+        # サブビジターの辞書。各キーは ASTノードのクラス名
+        self.subvisitors: Dict[str, BaseVisitor] = {}
+
+    def _init_subvisitors(self):
+        from .alias import AliasVisitor
+        from .arg import ArgVisitor
+        from .arguments import ArgumentsVisitor
+        from .boolop import BoolOpVisitor
+        from .cmpop import CmpOpVisitor
+        from .comprehension import ComprehensionVisitor
+        from .excepthandler import ExceptHandlerVisitor
+        from .expr_context import ExprContextVisitor
+        from .expr import ExprVisitor
+        from .keyword import KeywordVisitor
+        from .match_case import MatchCaseVisitor
+        from .mod import ModVisitor
+        from .operator import OperatorVisitor
+        from .pattern import PatternVisitor
+        from .stmt import StmtVisitor
+        from .type_ignore import TypeIgnoreVisitor
+        from .type_param import TypeParamVisitor
+        from .unaryop import UnaryOpVisitor
+        from .withitem import WithitemVisitor
+
+        self.subvisitors = {
+            "alias": AliasVisitor(self.builder),
+            "arg": ArgVisitor(self.builder),
+            "arguments": ArgumentsVisitor(self.builder),
+            "boolop": BoolOpVisitor(self.builder),
+            "cmpop": CmpOpVisitor(self.builder),
+            "comprehension": ComprehensionVisitor(self.builder),
+            "exceptHandler": ExceptHandlerVisitor(self.builder),
+            "expr_context": ExprContextVisitor(self.builder),
+            "expr": ExprVisitor(self.builder),
+            "keyword": KeywordVisitor(self.builder),
+            "match_case": MatchCaseVisitor(self.builder),
+            "mod": ModVisitor(self.builder),
+            "operator": OperatorVisitor(self.builder),
+            "pattern": PatternVisitor(self.builder),
+            "stmt": StmtVisitor(self.builder),
+            "type_ignore": TypeIgnoreVisitor(self.builder),
+            "type_param": TypeParamVisitor(self.builder),
+            "unaryop": UnaryOpVisitor(self.builder),
+            "withitem": WithitemVisitor(self.builder),
+        }
+
+    def get_subvisitor(self, name: str) -> Any:
+        if not self.subvisitors:
+            self._init_subvisitors()
+        return self.subvisitors[name]
 
     def set_symbol_type(self, name: str, t: str):
         self.symbol_table[name] = t
@@ -35,13 +92,13 @@ class BaseVisitor:
         return self.symbol_table.get(name, "i32")  # デフォルトをi32にしておく
 
     def visit(self, node: ast.AST) -> Any:
-        method = f"visit_{node.__class__.__name__}"
-        visitor = getattr(self, method, self.generic_visit)
-        return visitor(node)
+        method_name = f"visit_{type(node).__name__}"
+        method = getattr(self, method_name, self.generic_visit)
+        return method(node)
 
     def generic_visit(self, node: ast.AST) -> None:
         """
         各ノードに対応する visit_* が未定義の場合、ここにフォールバック
         未実装の構文要素があればエラーを出す
         """
-        raise NotImplementedError(f"Node type {type(node).__name__} not implemented")
+        raise NotImplementedError(f"Node type {type(node).__name__} not implemented by {self.__class__.__name__}")

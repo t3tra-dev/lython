@@ -5,6 +5,10 @@ from typing import Any
 
 from ..ir import IRBuilder
 from .base import BaseVisitor
+from .boolop import BoolOpVisitor
+from .cmpop import CmpOpVisitor
+from .keyword import KeywordVisitor
+from .operator import OperatorVisitor
 
 __all__ = ["ExprVisitor"]
 
@@ -60,195 +64,207 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
     """
 
     def __init__(self, builder: IRBuilder):
-        self.builder = builder
+        super().__init__(builder)
 
     def get_temp_name(self) -> str:
+        """IR上の一時変数名を生成する"""
         return self.builder.get_temp_name()
 
-    # ---------------------------
-    # visit_Constant
-    # ---------------------------
-    def visit_Constant(self, node: ast.Constant) -> str:
+    def visit_BoolOp(self, node: ast.BoolOp) -> str:
         """
-        静的型に基づき、int/str等をネイティブ表現の即値に変換する
+        ```asdl
+        BoolOp(boolop op, expr* values)
         """
-        val = node.value
+        # boolop 自体(And/Or)は "boolop" ビジターに転送
+        boolop_visitor: BoolOpVisitor = self.get_subvisitor("boolop")
+        # まず boolop を処理
+        op_repr = boolop_visitor.visit(node.op)
+        # node.values は [expr, expr, ...]
+        # ここでは例として2項 (Pythonは多項And/Orだが簡略化)
+        if len(node.values) != 2:
+            raise NotImplementedError("Multi-value BoolOp not fully supported")
 
-        # 文字列型の生成
-        if isinstance(val, str):
-            gname = self.builder.add_global_string(node.value)
-            tmp = self.get_temp_name()
-            self.builder.emit(f"  {tmp} = call ptr @create_string(ptr {gname})")
-            return tmp
+        left_val = self.visit(node.values[0])
+        right_val = self.visit(node.values[1])
 
-        # 整数型の生成
-        if isinstance(val, int):
-            return str(val)  # LLVM IRでは整数リテラルはそのまま使用可能
-
-        elif val is None:
-            # None相当は静的型上廃止してもよいが null ポインタを返す
-            return "null"
-
+        # (仮) i32として 0, 1 で計算し AND or OR する
+        temp = self.get_temp_name()
+        if op_repr == "And":
+            self.builder.emit(f"  {temp} = and i32 {left_val}, {right_val}")
+        elif op_repr == "Or":
+            self.builder.emit(f"  {temp} = or i32 {left_val}, {right_val}")
         else:
-            raise NotImplementedError(f"Unsupported constant type: {type(val)}")
+            raise NotImplementedError(f"Unsupported BoolOp: {op_repr}")
 
-    # ---------------------------
-    # visit_BinOp
-    # ---------------------------
+        return temp
+
     def visit_BinOp(self, node: ast.BinOp) -> str:
         """
-        2項演算
-        int同士の場合は i32 同士の演算を想定
-        str同士の + などは未対応としてエラーにするなど
+        ```asdl
+        BinOp(expr left, operator op, expr right)
         """
         left_val = self.visit(node.left)
         right_val = self.visit(node.right)
 
-        # ここでは int (i32) 同士の演算を前提とする
+        # operator ノード (Add, Sub, etc.) を "operator" ビジターに転送
+        operator_visitor: OperatorVisitor = self.get_subvisitor("operator")
+        op_str = operator_visitor.visit(node.op)
+        # ここでは example: "Add", "Sub", ...
+
         result_name = self.get_temp_name()
 
-        if isinstance(node.op, ast.Add):
+        if op_str == "Add":
             self.builder.emit(f"  {result_name} = add i32 {left_val}, {right_val}")
-        elif isinstance(node.op, ast.Sub):
+        elif op_str == "Sub":
             self.builder.emit(f"  {result_name} = sub i32 {left_val}, {right_val}")
-        elif isinstance(node.op, ast.Mult):
+        elif op_str == "Mult":
             self.builder.emit(f"  {result_name} = mul i32 {left_val}, {right_val}")
-        elif isinstance(node.op, ast.Div):
-            # i32 の算術除算 (sdiv)
+        elif op_str == "Div":
             self.builder.emit(f"  {result_name} = sdiv i32 {left_val}, {right_val}")
-        elif isinstance(node.op, ast.Mod):
+        elif op_str == "Mod":
             self.builder.emit(f"  {result_name} = srem i32 {left_val}, {right_val}")
         else:
-            raise NotImplementedError(f"BinOp {type(node.op)} not supported (static)")
+            raise NotImplementedError(f"BinOp {op_str} not supported")
 
         return result_name
 
-    # ---------------------------
-    # visit_Call
-    # ---------------------------
+    def visit_Compare(self, node: ast.Compare) -> str:
+        """
+        ```asdl
+        Compare(expr left, cmpop* ops, expr* comparators)
+        """
+        # cmpopは "cmpop" ビジターに転送
+        cmpop_visitor: CmpOpVisitor = self.get_subvisitor("cmpop")
+
+        if len(node.ops) != 1 or len(node.comparators) != 1:
+            raise NotImplementedError("Multi-compare chain not supported")
+
+        left_val = self.visit(node.left)
+        op_str = cmpop_visitor.visit(node.ops[0])
+        right_val = self.visit(node.comparators[0])
+
+        tmp_bool = self.get_temp_name()  # i1
+
+        # 例: eq, ne, lt, etc.
+        if op_str == "LtE":
+            self.builder.emit(f"  {tmp_bool} = icmp sle i32 {left_val}, {right_val}")
+        elif op_str == "Lt":
+            self.builder.emit(f"  {tmp_bool} = icmp slt i32 {left_val}, {right_val}")
+        elif op_str == "GtE":
+            self.builder.emit(f"  {tmp_bool} = icmp sge i32 {left_val}, {right_val}")
+        elif op_str == "Gt":
+            self.builder.emit(f"  {tmp_bool} = icmp sgt i32 {left_val}, {right_val}")
+        elif op_str == "Eq":
+            self.builder.emit(f"  {tmp_bool} = icmp eq i32 {left_val}, {right_val}")
+        elif op_str == "NotEq":
+            self.builder.emit(f"  {tmp_bool} = icmp ne i32 {left_val}, {right_val}")
+        else:
+            raise NotImplementedError(f"Comparison op {op_str} not supported")
+
+        # i1 -> i32 に zext
+        ret = self.get_temp_name()
+        self.builder.emit(f"  {ret} = zext i1 {tmp_bool} to i32")
+        return ret
+
     def visit_Call(self, node: ast.Call) -> str:
         """
-        関数呼び出し。
+        ```asdl
+        Call(expr func, expr* args, keyword* keywords)
         """
+        # 引数: node.args
+        # キーワード: node.keywords -> "keyword"ビジターに転送する
+        # 仮で func が単なる Name の場合の処理を継承
         if not isinstance(node.func, ast.Name):
             raise NotImplementedError("Only simple function calls supported (static)")
 
         func_name = node.func.id
 
+        # キーワード引数 (例: print(x, sep=' ') など) は "keyword"ビジターへ
+        if node.keywords:
+            keyword_visitor: KeywordVisitor = self.get_subvisitor("keyword")
+            for kw in node.keywords:
+                # 仮
+                keyword_visitor.visit(kw)
+
+        # 従来の "print" や "str" などの実装を流用
+        return self.sample_call_implementation(func_name, node)
+
+    def sample_call_implementation(self, func_name: str, node: ast.Call) -> str:
+        """
+        従来の実装の中身を切り出した補助メソッド。
+        """
         if func_name == "print":
-            # 引数は1個のみ、かつ文字列型を想定
             if len(node.args) != 1:
                 raise NotImplementedError("print() with multiple or zero args not supported")
-
-            arg_val = self.visit(node.args[0])  # 文字列型(ptr)を期待
-            # ここで arg_val は %struct.String* (IR上ではptr) のはず
-            # 'print' 関数を呼び出す (declare void @print(ptr))
+            arg_val = self.visit(node.args[0])
             self.builder.emit(f"  call void @print(ptr {arg_val})")
-
-            # returnはNone(式としてはvoid)
             tmp = self.get_temp_name()
             self.builder.emit(f"  {tmp} = add i32 0, 0 ; discard return")
             return tmp
 
         elif func_name == "str":
-            # `str()` への呼び出し
             if len(node.args) != 1:
                 raise NotImplementedError("str() with multiple/zero args not supported")
-
-            arg_val = self.visit(node.args[0])  # i32 or ptr
-            # ここで "型情報" をどう取得するかは、本来型推論が必要。
-            # 簡易的に、i32なら int2str、ptrなら str2str という判定を行う例:
-            # (i32かptrかどうか？ => 簡易的には変数名の先頭とか、あるいはvisitor内で管理している type map による)
-            # ここでは仮に "もし変数名が '%' で始まればi32" みたいな雑判定をしてみる(本当は厳密化が必要)
-
-            # ダミーの判定例:
+            arg_val = self.visit(node.args[0])
+            # TODO: 型情報で判断するべき
             if arg_val.startswith("%"):
-                # i32 だと仮定
-                tmp = self.builder.get_temp_name()
+                tmp = self.get_temp_name()
                 self.builder.emit(f"  {tmp} = call ptr @int2str(i32 {arg_val})")
                 return tmp
             else:
-                # string(ptr)
-                tmp = self.builder.get_temp_name()
+                tmp = self.get_temp_name()
                 self.builder.emit(f"  {tmp} = call ptr @str2str(ptr {arg_val})")
                 return tmp
 
         else:
-            # ユーザー定義関数呼び出し
-            # ここで引数をgatherしてIR化
+            # ユーザー定義関数
             arg_vals = []
             for a in node.args:
-                arg_vals.append(self.visit(a))  # i32 or ptr
-
-            # シンプルに全部 i32 と仮定して call i32 @func_name(i32, i32, ...)
-            # あるいは全部 ptr と仮定するなど。実際には型注釈が要る
+                arg_vals.append(self.visit(a))
             joined_args = ", ".join(f"i32 {v}" for v in arg_vals)
             ret_var = self.get_temp_name()
-            # 戻り値を i32 として扱う想定
             self.builder.emit(f"  {ret_var} = call i32 @{func_name}({joined_args})")
             return ret_var
 
-    # ---------------------------
-    # visit_Compare
-    # ---------------------------
-    def visit_Compare(self, node: ast.Compare) -> str:
+    def visit_Constant(self, node: ast.Constant) -> str:
         """
-        比較演算: i32同士の比較を想定して icmp.
-        結果は i1 だが、boolをi32(0 or 1)に変換して返すなど。
+        静的型に基づき、int/str等をネイティブ表現の即値に変換する
+        ```asdl
+        Constant(constant value, string? kind)
         """
-        if len(node.ops) != 1 or len(node.comparators) != 1:
-            raise NotImplementedError("Only single compare op is supported (static)")
-
-        left_val = self.visit(node.left)
-        right_val = self.visit(node.comparators[0])
-        op = node.ops[0]
-
-        tmp_bool = self.get_temp_name()  # i1
-        if isinstance(op, ast.LtE):
-            self.builder.emit(f"  {tmp_bool} = icmp sle i32 {left_val}, {right_val}")
-        elif isinstance(op, ast.Lt):
-            self.builder.emit(f"  {tmp_bool} = icmp slt i32 {left_val}, {right_val}")
-        elif isinstance(op, ast.GtE):
-            self.builder.emit(f"  {tmp_bool} = icmp sge i32 {left_val}, {right_val}")
-        elif isinstance(op, ast.Gt):
-            self.builder.emit(f"  {tmp_bool} = icmp sgt i32 {left_val}, {right_val}")
-        elif isinstance(op, ast.Eq):
-            self.builder.emit(f"  {tmp_bool} = icmp eq i32 {left_val}, {right_val}")
-        elif isinstance(op, ast.NotEq):
-            self.builder.emit(f"  {tmp_bool} = icmp ne i32 {left_val}, {right_val}")
+        val = node.value
+        if isinstance(val, str):
+            gname = self.builder.add_global_string(val)
+            tmp = self.get_temp_name()
+            self.builder.emit(f"  {tmp} = call ptr @create_string(ptr {gname})")
+            return tmp
+        elif isinstance(val, int):
+            return str(val)
+        elif val is None:
+            return "null"
         else:
-            raise NotImplementedError(f"Comparison op {type(op)} not supported")
+            raise NotImplementedError(f"Unsupported constant type: {type(val)}")
 
-        # i1 -> i32 へ拡張 (true=1, false=0)
-        ret = self.get_temp_name()
-        self.builder.emit(f"  {ret} = zext i1 {tmp_bool} to i32")
-        return ret
-
-    # ---------------------------
-    # visit_Name
-    # ---------------------------
     def visit_Name(self, node: ast.Name) -> str:
         """
         変数参照。
-        今回は「静的型言語化」するにあたり、None/True/Falseなどを扱わない or
-        それぞれ i32 0 / i32 1 などとして扱う例。
+        ```asdl
+        Name(identifier id, expr_context ctx)
         """
+        # True, False, None など簡略対応
         if node.id == "True":
-            tmp = self.get_temp_name()
-            self.builder.emit(f"  {tmp} = add i32 0, 1")
-            return tmp
+            t = self.get_temp_name()
+            self.builder.emit(f"  {t} = add i32 0, 1")
+            return t
         elif node.id == "False":
-            tmp = self.get_temp_name()
-            self.builder.emit(f"  {tmp} = add i32 0, 0")
-            return tmp
+            t = self.get_temp_name()
+            self.builder.emit(f"  {t} = add i32 0, 0")
+            return t
         elif node.id == "None":
             return "null"
         else:
-            # 変数: e.g. i32 %foo
+            # 変数: i32 %foo など
             return f"%{node.id}"
 
-    # ------------------------------------------------
-    # あと ast.NodeVisitorで要求されるgeneric_visit等
-    # ------------------------------------------------
     def generic_visit(self, node: ast.AST) -> Any:
         return super().generic_visit(node)
