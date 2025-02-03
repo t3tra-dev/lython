@@ -103,68 +103,30 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
         ```asdl
         BinOp(expr left, operator op, expr right)
         """
+        # 左右オペランドを再帰処理
         left_val = self.visit(node.left)
         right_val = self.visit(node.right)
+        # operator は "operator" ビジターに転送
+        op_visitor: OperatorVisitor = self.get_subvisitor("operator")
 
-        # operator ノード (Add, Sub, etc.) を "operator" ビジターに転送
-        operator_visitor: OperatorVisitor = self.get_subvisitor("operator")
-        op_str = operator_visitor.visit(node.op)
-        # ここでは example: "Add", "Sub", ...
-
-        result_name = self.get_temp_name()
-
-        if op_str == "Add":
-            self.builder.emit(f"  {result_name} = add i32 {left_val}, {right_val}")
-        elif op_str == "Sub":
-            self.builder.emit(f"  {result_name} = sub i32 {left_val}, {right_val}")
-        elif op_str == "Mult":
-            self.builder.emit(f"  {result_name} = mul i32 {left_val}, {right_val}")
-        elif op_str == "Div":
-            self.builder.emit(f"  {result_name} = sdiv i32 {left_val}, {right_val}")
-        elif op_str == "Mod":
-            self.builder.emit(f"  {result_name} = srem i32 {left_val}, {right_val}")
-        else:
-            raise NotImplementedError(f"BinOp {op_str} not supported")
-
-        return result_name
+        result = op_visitor.generate_op(node.op, left_val, right_val)
+        return result
 
     def visit_Compare(self, node: ast.Compare) -> str:
         """
         ```asdl
         Compare(expr left, cmpop* ops, expr* comparators)
         """
-        # cmpopは "cmpop" ビジターに転送
-        cmpop_visitor: CmpOpVisitor = self.get_subvisitor("cmpop")
-
         if len(node.ops) != 1 or len(node.comparators) != 1:
-            raise NotImplementedError("Multi-compare chain not supported")
+            raise NotImplementedError("Only single compare op is supported")
 
         left_val = self.visit(node.left)
-        op_str = cmpop_visitor.visit(node.ops[0])
         right_val = self.visit(node.comparators[0])
+        # cmpop は "cmpop" ビジターに転送
+        cmpop_visitor: CmpOpVisitor = self.get_subvisitor("cmpop")
 
-        tmp_bool = self.get_temp_name()  # i1
-
-        # 例: eq, ne, lt, etc.
-        if op_str == "LtE":
-            self.builder.emit(f"  {tmp_bool} = icmp sle i32 {left_val}, {right_val}")
-        elif op_str == "Lt":
-            self.builder.emit(f"  {tmp_bool} = icmp slt i32 {left_val}, {right_val}")
-        elif op_str == "GtE":
-            self.builder.emit(f"  {tmp_bool} = icmp sge i32 {left_val}, {right_val}")
-        elif op_str == "Gt":
-            self.builder.emit(f"  {tmp_bool} = icmp sgt i32 {left_val}, {right_val}")
-        elif op_str == "Eq":
-            self.builder.emit(f"  {tmp_bool} = icmp eq i32 {left_val}, {right_val}")
-        elif op_str == "NotEq":
-            self.builder.emit(f"  {tmp_bool} = icmp ne i32 {left_val}, {right_val}")
-        else:
-            raise NotImplementedError(f"Comparison op {op_str} not supported")
-
-        # i1 -> i32 に zext
-        ret = self.get_temp_name()
-        self.builder.emit(f"  {ret} = zext i1 {tmp_bool} to i32")
-        return ret
+        result = cmpop_visitor.generate_cmpop(node.ops[0], left_val, right_val)
+        return result
 
     def visit_Call(self, node: ast.Call) -> str:
         """
