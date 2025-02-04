@@ -1,0 +1,25 @@
+name: Update Social Preview
+
+on:
+  workflow_dispatch:
+
+jobs:
+  update-preview:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Download image
+        run: |
+          curl -o social-preview.png "https://socialify.git.ci/${{ github.repository }}/image?description=1&font=Source+Code+Pro&forks=1&issues=1&language=1&name=1&owner=1&pattern=Plus&pulls=1&stargazers=1&theme=Dark"
+
+      - name: Update social preview
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"name":"social-preview.png"}' \
+            "https://api.github.com/repos/${{ github.repository }}/social_preview"
