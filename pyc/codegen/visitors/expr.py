@@ -209,7 +209,7 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
 
     def visit_Name(self, node: ast.Name) -> str:
         """
-        変数参照。
+        変数参照
         ```asdl
         Name(identifier id, expr_context ctx)
         """
@@ -227,6 +227,37 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
         else:
             # 変数: i32 %foo など
             return f"%{node.id}"
+
+    def visit_List(self, node: ast.List) -> str:
+        """
+        リストリテラル
+        ```asdl
+        List(expr* elts, expr_context ctx)
+        """
+        # 新しいリストの作成（初期容量はリテラル中の要素数か 8）
+        num = max(len(node.elts), 8)
+        temp_list = self.get_temp_name()
+        self.builder.emit(f"  {temp_list} = call ptr @PyList_New(i32 {num})")
+        for elt in node.elts:
+            elt_val = self.visit(elt)
+            self.builder.emit(f"  call i32 @PyList_Append(ptr {temp_list}, ptr {elt_val})")
+        return temp_list
+
+    def visit_Dict(self, node: ast.Dict) -> str:
+        """
+        辞書リテラル
+        ```asdl
+        Dict(expr* keys, expr* values)
+        """
+        num = max(len(node.keys), 8)
+        temp_dict = self.get_temp_name()
+        self.builder.emit(f"  {temp_dict} = call ptr @PyDict_New(i32 {num})")
+        for key_node, val_node in zip(node.keys, node.values):
+            assert key_node is not None and val_node is not None
+            key_val = self.visit(key_node)
+            val_val = self.visit(val_node)
+            self.builder.emit(f"  call i32 @PyDict_SetItem(ptr {temp_dict}, ptr {key_val}, ptr {val_val})")
+        return temp_dict
 
     def generic_visit(self, node: ast.AST) -> Any:
         return super().generic_visit(node)
