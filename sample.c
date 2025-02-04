@@ -1,10 +1,13 @@
 #include <stdio.h>
 
-int main(int argc, char **argv)
+int main(void)
 {
-    printf("%d\n", 1 + 1);
-    printf("%d\n", 1 - 1);
-    printf("%d\n", 1 * 1);
-    printf("%d\n", 1 / 1);
+    int array[] = { 42, 79, 13, 75, 19 };
+    int i;
+
+    for (i = 0; i < 5; i++) {
+        printf("array[%d] = %d\n", i, array[i]);
+    }
+
     return 0;
 }
