@@ -4,7 +4,7 @@ import ast
 from typing import Any
 
 from ..ir import IRBuilder
-from .base import BaseVisitor
+from .base import BaseVisitor, TypedValue
 from .boolop import BoolOpVisitor
 from .cmpop import CmpOpVisitor
 from .keyword import KeywordVisitor
@@ -98,21 +98,25 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
 
         return temp
 
-    def visit_BinOp(self, node: ast.BinOp) -> str:
+    def visit_BinOp(self, node: ast.BinOp) -> TypedValue:
         """
         ```asdl
         BinOp(expr left, operator op, expr right)
         """
         # 左右オペランドを再帰処理
-        left_val = self.visit(node.left)
-        right_val = self.visit(node.right)
-        # operator は "operator" ビジターに転送
+        left_typed = self.visit(node.left)    # => TypedValue
+        right_typed = self.visit(node.right)  # => TypedValue
+
+        # i32 同士の演算でない場合は未対応 (あるいは PyInt 同士の加算にする等)
+        if left_typed.type_ != "i32" or right_typed.type_ != "i32":
+            # 将来的にはPyIntなどの演算にも対応できるが、ここではエラーに
+            raise TypeError("BinOp: both operands must be i32 for now")
+
         op_visitor: OperatorVisitor = self.get_subvisitor("operator")
+        result_typed = op_visitor.generate_op(node.op, left_typed, right_typed)
+        return result_typed
 
-        result = op_visitor.generate_op(node.op, left_val, right_val)
-        return result
-
-    def visit_Compare(self, node: ast.Compare) -> str:
+    def visit_Compare(self, node: ast.Compare) -> TypedValue:
         """
         ```asdl
         Compare(expr left, cmpop* ops, expr* comparators)
@@ -120,15 +124,21 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
         if len(node.ops) != 1 or len(node.comparators) != 1:
             raise NotImplementedError("Only single compare op is supported")
 
-        left_val = self.visit(node.left)
-        right_val = self.visit(node.comparators[0])
+        left_typed = self.visit(node.left)  # => TypedValue
+        right_typed = self.visit(node.comparators[0])  # => TypedValue
+
         # cmpop は "cmpop" ビジターに転送
         cmpop_visitor: CmpOpVisitor = self.get_subvisitor("cmpop")
 
-        result = cmpop_visitor.generate_cmpop(node.ops[0], left_val, right_val)
-        return result
+        result_val = cmpop_visitor.generate_cmpop(
+            node.ops[0],
+            left_typed.llvm_value,
+            right_typed.llvm_value
+        )
 
-    def visit_Call(self, node: ast.Call) -> str:
+        return TypedValue(result_val, "i32")
+
+    def visit_Call(self, node: ast.Call) -> TypedValue:
         """
         ```asdl
         Call(expr func, expr* args, keyword* keywords)
@@ -151,44 +161,82 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
         # 従来の "print" や "str" などの実装を流用
         return self.sample_call_implementation(func_name, node)
 
-    def sample_call_implementation(self, func_name: str, node: ast.Call) -> str:
+    def sample_call_implementation(self, func_name: str, node: ast.Call) -> TypedValue:
         """
         従来の実装の中身を切り出した補助メソッド。
         """
         if func_name == "print":
             if len(node.args) != 1:
                 raise NotImplementedError("print() with multiple or zero args not supported")
-            arg_val = self.visit(node.args[0])
-            self.builder.emit(f"  call void @print(ptr {arg_val})")
+            arg_typed = self.visit(node.args[0])      # => TypedValue
+            if arg_typed.type_ != "ptr":
+                raise TypeError("print() argument must be ptr (e.g. String*)")
+
+            # ここで llvm_value を使う
+            self.builder.emit(f"  call void @print(ptr {arg_typed.llvm_value})")
+
+            # 関数呼び出し後、i32 0 相当を戻り値にする例
             tmp = self.get_temp_name()
             self.builder.emit(f"  {tmp} = add i32 0, 0 ; discard return")
-            return tmp
+            return TypedValue(tmp, "i32")
 
         elif func_name == "str":
             if len(node.args) != 1:
                 raise NotImplementedError("str() with multiple/zero args not supported")
-            arg_val = self.visit(node.args[0])
-            # TODO: 型情報で判断するべき
-            if arg_val.startswith("%"):
+
+            arg_val: TypedValue = self.visit(node.args[0])
+
+            # int (i32) を文字列に変換
+            if arg_val.type_ == "i32":
                 tmp = self.get_temp_name()
-                self.builder.emit(f"  {tmp} = call ptr @int2str(i32 {arg_val})")
-                return tmp
+                self.builder.emit(f"  {tmp} = call ptr @int2str(i32 {arg_val.llvm_value})")
+                return TypedValue(tmp, "ptr")  # 文字列ポインタを返す
+
+            # すでに文字列（ptr）なら、そのままコピーする
+            elif arg_val.type_ == "ptr":
+                tmp = self.get_temp_name()
+                self.builder.emit(f"  {tmp} = call ptr @str2str(ptr {arg_val.llvm_value})")
+                return TypedValue(tmp, "ptr")  # 文字列ポインタを返す
+
             else:
-                tmp = self.get_temp_name()
-                self.builder.emit(f"  {tmp} = call ptr @str2str(ptr {arg_val})")
-                return tmp
+                raise TypeError(f"str() does not support type '{arg_val.type_}'")
 
         else:
             # ユーザー定義関数
-            arg_vals = []
-            for a in node.args:
-                arg_vals.append(self.visit(a))
-            joined_args = ", ".join(f"i32 {v}" for v in arg_vals)
-            ret_var = self.get_temp_name()
-            self.builder.emit(f"  {ret_var} = call i32 @{func_name}({joined_args})")
-            return ret_var
+            # シグネチャを取得
+            sig = self.get_function_signature(func_name)  # -> (arg_types: [str], return_type: str
+            if sig is None:
+                raise NameError(f"Unknown function: '{func_name}' not found in signatures")
 
-    def visit_Constant(self, node: ast.Constant) -> str:
+            arg_types, return_type = sig
+
+            # 引数の個数をチェック
+            if len(node.args) != len(arg_types):
+                raise TypeError(f"Function '{func_name}' expects {len(arg_types)} args, got {len(node.args)}")
+
+            # 引数を visit して TypedValue のリストを得る
+            arg_typedvals = [self.visit(a) for a in node.args]
+
+            # 各引数の型をシグネチャと照合し、IR用文字列を組み立て
+            ir_arg_list = []
+            for expected_t, actual_val in zip(arg_types, arg_typedvals):
+                if actual_val.type_ != expected_t:
+                    raise TypeError(
+                        f"Call to '{func_name}': arg type mismatch. "
+                        f"Expected {expected_t}, got {actual_val.type_}"
+                    )
+                ir_arg_list.append(f"{expected_t} {actual_val.llvm_value}")
+
+            joined_args = ", ".join(ir_arg_list)
+
+            # call命令を出力
+            ret_var = self.get_temp_name()
+            self.builder.emit(f"  {ret_var} = call {return_type} @{func_name}({joined_args})")
+
+            # 戻り値を TypedValue で返す
+            return TypedValue(ret_var, return_type)
+
+    def visit_Constant(self, node: ast.Constant) -> TypedValue:
         """
         静的型に基づき、int/str等をネイティブ表現の即値に変換する
         ```asdl
@@ -196,54 +244,73 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
         """
         val = node.value
         if isinstance(val, str):
+            # 文字列 -> ptr(String*)
             gname = self.builder.add_global_string(val)
-            tmp = self.get_temp_name()
+            tmp = self.builder.get_temp_name()
             self.builder.emit(f"  {tmp} = call ptr @create_string(ptr {gname})")
-            return tmp
+            return TypedValue(tmp, "ptr")
+
         elif isinstance(val, int):
-            return str(val)
+            # int -> PyInt_FromI32 -> ptr(PyInt*)
+            # tmp = self.builder.get_temp_name()
+            # self.builder.emit(f"  {tmp} = call ptr @PyInt_FromI32(i32 {val})")
+            # return TypedValue(tmp, "ptr")
+            return TypedValue(str(val), "i32")
+
         elif val is None:
-            return "null"
+            return TypedValue("null", "ptr")
+
         else:
             raise NotImplementedError(f"Unsupported constant type: {type(val)}")
 
-    def visit_Name(self, node: ast.Name) -> str:
+    def visit_Name(self, node: ast.Name) -> TypedValue:
         """
         変数参照
         ```asdl
         Name(identifier id, expr_context ctx)
         """
-        # True, False, None など簡略対応
+        # True, False, None など特別対応
         if node.id == "True":
             t = self.get_temp_name()
             self.builder.emit(f"  {t} = add i32 0, 1")
-            return t
+            return TypedValue(t, "i32")
+
         elif node.id == "False":
             t = self.get_temp_name()
             self.builder.emit(f"  {t} = add i32 0, 0")
-            return t
-        elif node.id == "None":
-            return "null"
-        else:
-            # 変数: i32 %foo など
-            return f"%{node.id}"
+            return TypedValue(t, "i32")
 
-    def visit_List(self, node: ast.List) -> str:
+        elif node.id == "None":
+            return TypedValue("null", "ptr")
+
+        else:
+            # 変数ならシンボルテーブルから型を取得
+            var_type = self.get_symbol_type(node.id)
+            if var_type is None:
+                raise NameError(f"Use of variable '{node.id}' before assignment")
+
+            # 変数をレジスタ名として返す
+            # ただし実際には store/load が必要だが、ここではレジスタ運用(単純化)
+            return TypedValue(f"%{node.id}", var_type)
+
+    def visit_List(self, node: ast.List) -> TypedValue:
         """
         リストリテラル
         ```asdl
         List(expr* elts, expr_context ctx)
         """
-        # 新しいリストの作成（初期容量はリテラル中の要素数か 8）
         num = max(len(node.elts), 8)
         temp_list = self.get_temp_name()
         self.builder.emit(f"  {temp_list} = call ptr @PyList_New(i32 {num})")
-        for elt in node.elts:
-            elt_val = self.visit(elt)
-            self.builder.emit(f"  call i32 @PyList_Append(ptr {temp_list}, ptr {elt_val})")
-        return temp_list
 
-    def visit_Dict(self, node: ast.Dict) -> str:
+        for elt in node.elts:
+            elt_typed = self.visit(elt)  # -> TypedValue
+            # リストには ptr で格納する
+            self.builder.emit(f"  call i32 @PyList_Append(ptr {temp_list}, ptr {elt_typed.llvm_value})")
+
+        return TypedValue(temp_list, "ptr")
+
+    def visit_Dict(self, node: ast.Dict) -> TypedValue:
         """
         辞書リテラル
         ```asdl
@@ -252,12 +319,13 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
         num = max(len(node.keys), 8)
         temp_dict = self.get_temp_name()
         self.builder.emit(f"  {temp_dict} = call ptr @PyDict_New(i32 {num})")
-        for key_node, val_node in zip(node.keys, node.values):
-            assert key_node is not None and val_node is not None
-            key_val = self.visit(key_node)
-            val_val = self.visit(val_node)
-            self.builder.emit(f"  call i32 @PyDict_SetItem(ptr {temp_dict}, ptr {key_val}, ptr {val_val})")
-        return temp_dict
+
+        for k_node, v_node in zip(node.keys, node.values):
+            k_typed = self.visit(k_node)
+            v_typed = self.visit(v_node)
+            self.builder.emit(f"  call i32 @PyDict_SetItem(ptr {temp_dict}, ptr {k_typed.llvm_value}, ptr {v_typed.llvm_value})")
+
+        return TypedValue(temp_dict, "ptr")
 
     def generic_visit(self, node: ast.AST) -> Any:
         return super().generic_visit(node)

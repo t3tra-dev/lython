@@ -4,7 +4,7 @@ import ast
 from typing import Any
 
 from ..ir import IRBuilder
-from .base import BaseVisitor
+from .base import BaseVisitor, TypedValue
 
 __all__ = ["OperatorVisitor"]
 
@@ -23,30 +23,37 @@ class OperatorVisitor(BaseVisitor):
     def __init__(self, builder: IRBuilder):
         super().__init__(builder)
 
-    def generate_op(self, op_node: ast.AST, left_val: str, right_val: str) -> str:
+    def generate_op(self, op_node: ast.AST, left: TypedValue, right: TypedValue) -> TypedValue:
         """
           - op_node: ast.Add / ast.Sub / ...
           - left_val, right_val: 左右オペランドのLLVM値 (str)
         ここで "add i32" 等のIRを生成し、結果変数を返す。
         """
-        op_name = self.visit(op_node)  # 例: "Add", "Sub", ...
+        op_name = self.visit(op_node)  # "Add" / "Sub" / etc.
         result_name = self.builder.get_temp_name()
 
+        # ここでは left/right ともに i32 前提
+        assert left.type_ == "i32" and right.type_ == "i32", \
+            f"Operator {op_name} expects i32, got {left.type_} and {right.type_}"
+
+        lv = left.llvm_value
+        rv = right.llvm_value
+
         if op_name == "Add":
-            self.builder.emit(f"  {result_name} = add i32 {left_val}, {right_val}")
+            self.builder.emit(f"  {result_name} = add i32 {lv}, {rv}")
         elif op_name == "Sub":
-            self.builder.emit(f"  {result_name} = sub i32 {left_val}, {right_val}")
+            self.builder.emit(f"  {result_name} = sub i32 {lv}, {rv}")
         elif op_name == "Mult":
-            self.builder.emit(f"  {result_name} = mul i32 {left_val}, {right_val}")
+            self.builder.emit(f"  {result_name} = mul i32 {lv}, {rv}")
         elif op_name == "Div":
-            self.builder.emit(f"  {result_name} = sdiv i32 {left_val}, {right_val}")
+            self.builder.emit(f"  {result_name} = sdiv i32 {lv}, {rv}")
         elif op_name == "Mod":
-            self.builder.emit(f"  {result_name} = srem i32 {left_val}, {right_val}")
+            self.builder.emit(f"  {result_name} = srem i32 {lv}, {rv}")
         else:
             # TODO: 他演算子 (Pow, LShift, etc.) の処理を追加
             raise NotImplementedError(f"Operator '{op_name}' not supported yet")
 
-        return result_name
+        return TypedValue(result_name, "i32")
 
     def visit_Add(self, node: ast.Add) -> str:
         return "Add"

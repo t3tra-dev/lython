@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import ast
-from typing import Any
+from typing import Any, List
 
 from ..ir import IRBuilder
-from .base import BaseVisitor
+from .base import BaseVisitor, TypedValue
 from .expr import ExprVisitor
 
 __all__ = ["StmtVisitor"]
@@ -67,12 +67,14 @@ class StmtVisitor(BaseVisitor):
     """
 
     def __init__(self, builder: IRBuilder):
-        self.builder = builder
+        super().__init__(builder)
         self.expr_visitor = ExprVisitor(builder)
+        self.current_return_type = "i32"
 
-    # ---------------------------
-    # visit_FunctionDef
-    # ---------------------------
+        # ExprVisitorとシンボルテーブルを共有
+        self.expr_visitor.symbol_table = self.symbol_table
+        self.expr_visitor.function_signatures = self.function_signatures
+
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         """
         関数定義:
@@ -82,38 +84,62 @@ class StmtVisitor(BaseVisitor):
         """
         func_name = node.name
 
-        # 引数の型注釈読み取り (最低限)
+        # 引数の型を解析
         arg_types = []
-        arg_names = []
-        for arg in node.args.args:
-            # ここではすべて i32 と仮定
-            # TODO: annotation を見て分岐
-            arg_types.append("i32")
-            arg_names.append(arg.arg)
 
-        # TODO: 戻り値型も annotation を見て i32 or ptr などにする
-        # 一旦 i32 と仮定
-        return_type = "i32"
+        for arg in node.args.args:
+            arg_type = "i32"  # デフォルト値
+
+            if arg.annotation:
+                if isinstance(arg.annotation, ast.Name):
+                    if arg.annotation.id == "int":
+                        arg_type = "i32"
+                    elif arg.annotation.id == "str":
+                        arg_type = "ptr"
+                    else:
+                        raise NotImplementedError(f"Unsupported annotation: {arg.annotation.id}")
+                else:
+                    raise NotImplementedError("Complex annotations not supported")
+
+            # シンボルテーブルに引数を登録
+            self.set_symbol_type(arg.arg, arg_type)
+            arg_types.append(arg_type)
+
+        # 戻り値型を解析
+        if node.returns is not None and isinstance(node.returns, ast.Name):
+            if node.returns.id == "int":
+                return_type = "i32"
+            elif node.returns.id == "str":
+                return_type = "ptr"
+            else:
+                raise NotImplementedError(f"Unsupported return annotation: {node.returns.id}")
+        else:
+            # fallback
+            return_type = "i32"  # or raise error
+
+        # この関数のシグネチャを登録
+        self.set_function_signature(func_name, arg_types, return_type)
+
+        # 現在の関数の戻り値型を更新
+        self.current_return_type = return_type
 
         # IR出力
         self.builder.emit("")
         self.builder.emit(f"; Function definition: {func_name}")
 
-        # 引数部
-        joined_args = ", ".join(f"{t} %{name}" for t, name in zip(arg_types, arg_names))
+        # LLVM IR の仮引数部
+        joined_args = ", ".join(
+            f"{t} %{arg.arg}" for t, arg in zip(arg_types, node.args.args)
+        )
         self.builder.emit(f"define {return_type} @{func_name}({joined_args}) #0 {{")
         self.builder.emit("entry:")
 
-        # ステートメント群を処理
+        # 関数ボディの visit
         self.visit_function_body(node.body, return_type)
 
         self.builder.emit("}")
 
-    def visit_function_body(self, stmts: list[ast.stmt], return_type: str) -> None:
-        """
-        関数本体のステートメントを順に訪問し
-        最後にreturnがなければデフォルトの返却を生成する
-        """
+    def visit_function_body(self, stmts: List[ast.stmt], return_type: str) -> None:
         has_return = False
         for s in stmts:
             if isinstance(s, ast.Return):
@@ -122,33 +148,28 @@ class StmtVisitor(BaseVisitor):
 
         if not has_return:
             if return_type == "i32":
-                # return 0
                 self.builder.emit("  ret i32 0")
             elif return_type == "ptr":
-                # return null
                 self.builder.emit("  ret ptr null")
             else:
                 self.builder.emit("  ret void")
 
-    # ---------------------------
-    # visit_Return
-    # ---------------------------
     def visit_Return(self, node: ast.Return) -> None:
-        """
-        return文を処理
-        戻り値が無ければデフォルト値
-        """
         if node.value is None:
-            # i32の場合 0を返す と仮定
-            self.builder.emit("  ret i32 0")
+            # デフォルトの戻り値
+            if self.current_return_type == "i32":
+                self.builder.emit("  ret i32 0")
+            elif self.current_return_type == "ptr":
+                self.builder.emit("  ret ptr null")
+            else:
+                self.builder.emit("  ret void")
         else:
-            val = self.expr_visitor.visit(node.value)
-            # 一旦 i32 と仮定
-            self.builder.emit(f"  ret i32 {val}")
+            val_tv = self.expr_visitor.visit(node.value)  # => TypedValue
+            # 型チェック
+            if val_tv.type_ != self.current_return_type:
+                raise TypeError(f"Return type mismatch, expected {self.current_return_type}, got {val_tv.type_}")
+            self.builder.emit(f"  ret {val_tv.type_} {val_tv.llvm_value}")
 
-    # ---------------------------
-    # visit_If
-    # ---------------------------
     def visit_If(self, node: ast.If) -> None:
         """
         if文:
@@ -158,7 +179,9 @@ class StmtVisitor(BaseVisitor):
               ...
         静的に i32(0以外) をtrueとみなすなど
         """
-        cond_val = self.expr_visitor.visit(node.test)  # i32 0/1
+        cond_typed: TypedValue = self.expr_visitor.visit(node.test)
+        cond_val = cond_typed.llvm_value
+
         # i32 -> i1
         tmp_bool = self.builder.get_temp_name()
         self.builder.emit(f"  {tmp_bool} = icmp ne i32 {cond_val}, 0")
@@ -185,9 +208,6 @@ class StmtVisitor(BaseVisitor):
         # end
         self.builder.emit(f"{end_label}:")
 
-    # ---------------------------
-    # その他stmt
-    # ---------------------------
     def visit_Expr(self, node: ast.Expr) -> Any:
         """
         式文
@@ -198,13 +218,46 @@ class StmtVisitor(BaseVisitor):
         return None
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        raise NotImplementedError("Class definition not supported in static mode")
+        raise NotImplementedError("Class definition not supported")
 
     def visit_Assign(self, node: ast.Assign) -> None:
-        raise NotImplementedError("Assignment not supported in static mode")
+        if len(node.targets) != 1:
+            raise NotImplementedError("Multi-target assignment not supported")
+        target = node.targets[0]
+        if not isinstance(target, ast.Name):
+            raise NotImplementedError("Only assignment to a variable (Name) is supported")
+
+        # 右辺を評価
+        rhs_typed = self.expr_visitor.visit(node.value)  # -> TypedValue
+        rhs_type = rhs_typed.type_
+
+        var_name = f"%{target.id}"
+
+        # 既にシンボルテーブルに型情報があるかどうか
+        existing_type = self.get_symbol_type(target.id)
+        if existing_type is None:
+            # 初回代入 -> シンボルテーブルに登録
+            self.set_symbol_type(target.id, rhs_type)
+            existing_type = rhs_type
+        else:
+            # 型が合わない場合はエラー
+            if existing_type != rhs_type:
+                raise TypeError(f"Type mismatch: variable '{target.id}' is {existing_type}, but RHS is {rhs_type}")
+
+        # ここで "代入" 相当の LLVM IR を生成
+        if existing_type == "i32":
+            # i32 の場合 → add i32 0, ...
+            self.builder.emit(f"  {var_name} = add i32 0, {rhs_typed.llvm_value} ; assignment to {target.id}")
+        elif existing_type == "ptr":
+            # ptr の場合 → bitcast (もしくは単純に =)
+            # LLVM IRでは「%var = bitcast ptr %rhs to ptr」が実質的に無意味
+            # SSA 上「新レジスタを作る」ためにダミーのno-opを発行する:
+            self.builder.emit(f"  {var_name} = bitcast ptr {rhs_typed.llvm_value} to ptr ; assignment to {target.id}")
+        else:
+            raise NotImplementedError(f"Unsupported type for assignment: {existing_type}")
 
     def visit_Delete(self, node: ast.Delete) -> None:
-        raise NotImplementedError("Delete statement not supported in static mode")
+        raise NotImplementedError("Delete statement not supported")
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         raise NotImplementedError("Async function definition not supported")

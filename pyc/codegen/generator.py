@@ -22,8 +22,6 @@ class IRGenerator(BaseVisitor):
         # とりあえず最低限の宣言を追加
         self.builder.add_external_functions([
             "; ========== External runtime declarations ========== ",
-            "declare ptr @malloc(i64)",    # メモリ管理用
-            "declare void @free(ptr)",
             # print (String*) -> void
             "declare void @print(ptr)",
             "",
@@ -33,6 +31,15 @@ class IRGenerator(BaseVisitor):
             # 文字列生成: String* create_string(i8*)
             "declare ptr @create_string(ptr)",
             "",
+            # PyInt_FromI32
+            "declare ptr @PyInt_FromI32(i32)",
+            # PyInt_AsI32 が必要なら
+            "declare i32 @PyInt_AsI32(ptr)",
+            # 辞書とリスト
+            "declare ptr @PyDict_New(i32)",
+            "declare i32 @PyDict_SetItem(ptr, ptr, ptr)",
+            "declare ptr @PyList_New(i32)",
+            "declare i32 @PyList_Append(ptr, ptr)",
         ])
 
         # 必要なら String 構造体の定義をIR上で書く (i64 length, i8* data)
