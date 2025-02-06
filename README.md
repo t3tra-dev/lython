@@ -7,14 +7,20 @@
 ┏━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━┓
 ┃ runtime        ┃ time              ┃ result  ┃
 ┡━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━┩
-│ LLVM           │ 25.20ms (x1.63)   │ 9227465 │
-│ C              │ 36.26ms (x2.34)   │ 9227465 │
-│ Python(pyc)    │ 44.66ms (x2.89)   │ 9227465 │
-│ Bun            │ 55.38ms (x3.58)   │ 9227465 │
-│ Deno           │ 81.69ms (x5.28)   │ 9227465 │
-│ Node.js        │ 98.11ms (x6.34)   │ 9227465 │
-│ Python         │ 640.84ms (x41.41) │ 9227465 │
-│ Python(no GIL) │ 928.87ms (x60.02) │ 9227465 │
+│ LLVM(O1)       │ 15.73ms (x1.00)   │ 9227465 │
+│ C(O1)          │ 16.44ms (x1.04)   │ 9227465 │
+│ C(O3)          │ 17.28ms (x1.10)   │ 9227465 │
+│ LLVM(O3)       │ 17.45ms (x1.11)   │ 9227465 │
+│ C(O2)          │ 17.98ms (x1.14)   │ 9227465 │
+│ LLVM(O2)       │ 20.57ms (x1.31)   │ 9227465 │
+│ Python(pyc)    │ 23.18ms (x1.47)   │ 9227465 │
+│ LLVM(O0)       │ 25.01ms (x1.59)   │ 9227465 │
+│ C(O0)          │ 37.69ms (x2.40)   │ 9227465 │
+│ Bun            │ 51.22ms (x3.26)   │ 9227465 │
+│ Deno           │ 76.07ms (x4.84)   │ 9227465 │
+│ Node.js        │ 93.85ms (x5.97)   │ 9227465 │
+│ Python         │ 608.68ms (x38.70) │ 9227465 │
+│ Python(no GIL) │ 890.44ms (x56.61) │ 9227465 │
 └────────────────┴───────────────────┴─────────┘
 ```
 
@@ -33,34 +39,38 @@ CPython とは異なる形で静的型付けのように扱いながらPythonソ
 
 ```text
 ├── .gitignore
-├── .python-version        # Python のバージョン指定 (3.12)
-├── .vscode
-│   └── settings.json      # VSCode 用設定ファイル
-├── bench.py               # ベンチマーク用スクリプト
-├── benchmark/             # ベンチマークで使用するコード群 (C/JS/LLVM IR/Pythonなど)
+├── .python-version            # Python のバージョン指定 (3.12)
+├── .vscode                    # VSCode 用設定ファイル
+│   ├── settings.json
+│   └── c_cpp_properties.json
+├── bench.py                   # ベンチマーク用スクリプト
+├── benchmark/                 # ベンチマークで使用するコード群 (C/JS/LLVM IR/Pythonなど)
 │   ├── cfib.c
 │   ├── jsfib.js
 │   ├── llfib.ll
-│   ├── pyfib.py
-│   └── pyfib.py.ll
-├── helloworld.ll          # サンプルの "Hello, world!" LLVM IR
+│   └── pyfib.py
+├── helloworld.ll              # サンプルの "Hello, world!" LLVM IR
 ├── pyc/
 │   ├── __init__.py
-│   ├── __main__.py        # `python -m pyc` で呼ばれるエントリーポイント
-│   ├── codegen/           # Python→LLVM IR 変換ロジック
-│   │   ├── ir/            # LLVM IR を構築するためのビルダー等
-│   │   └── visitors/      # 各種 AST ノードへの Visitor 実装
-│   └── compiler/          # 生成された LLVM IR をバイナリに変換するロジック (ll2bin など)
-├── pyproject.toml         # Python プロジェクト管理用 (PEP 621)
-├── runtime/
-│   ├── runtime.c
-│   └── runtime.h          # C 言語で実装したランタイム (メモリ管理やprint関数など)
-├── sample.c               # C のサンプルコード
-├── sample.ll              # 上記 C コードを LLVM IR 化した例
-├── source.py              # Python のサンプルコード
-├── source.py.ll           # source.py を LLVM IR 化した例
-├── source.py.s            # さらにアセンブリまで生成した例
-└── uv.lock                # uv による依存関係のロックファイル
+│   ├── __main__.py            # `python -m pyc` で呼ばれるエントリーポイント
+│   ├── codegen/               # Python -> LLVM IR 変換ロジック
+│   │   ├── ir/                # LLVM IR を構築するためのビルダー等
+│   │   └── visitors/          # 各種 AST ノードへの Visitor 実装
+│   └── compiler/              # 生成された LLVM IR をバイナリに変換するロジック (ll2bin など)
+├── pyproject.toml             # Python プロジェクト管理用 (PEP 621)
+├── runtime/                   # C で実装したランタイム
+│   └── builtin/               # ビルトインの関数や型
+│       ├── functions.c
+│       ├── functions.h
+│       ├── types.c
+│       └── types.h
+├── Makefile                   # ランタイムのビルド用
+├── sample.c                   # C のサンプルコード
+├── sample.ll                  # 上記 C コードを LLVM IR 化した例
+├── source.py                  # Python のサンプルコード
+├── source.py.ll               # source.py を LLVM IR 化した例
+├── source.py.s                # さらにアセンブリまで生成した例
+└── uv.lock                    # uv による依存関係のロックファイル
 ```
 
 ---
@@ -92,6 +102,13 @@ Python 3.12 以上が必要です (`.python-version` で 3.12 を指定してい
    LLVM/Clang がインストールされている必要があります。  
    `clang --version` や `llc --version` が使用できる状態にしてください (環境に応じてインストール)。
 
+4. **ランタイムのビルド**
+   ```bash
+   make
+   ```
+   Makefileに基づき `runtime.o` を生成します。
+   `make clean` でキャッシュやライブラリバイナリを消去できます。
+
 ---
 
 ## 使用方法
@@ -99,7 +116,7 @@ Python 3.12 以上が必要です (`.python-version` で 3.12 を指定してい
 ### LLVM IR の生成
 
 ```bash
-python -m pyc --emit-llvm <python_file>
+python -m pyc --emit-llvm <input-path>
 ```
 
 例: `source.py` を LLVM IR 化して `source.py.ll` を出力する:
@@ -111,19 +128,19 @@ python -m pyc --emit-llvm source.py
 ### バイナリへのコンパイル
 
 ```bash
-python -m pyc --compile <python_file>
+python -m pyc --compile <input-path> <output-path>
 ```
 
 例: `source.py` を機械語バイナリにコンパイルする:
 ```bash
-python -m pyc --compile source.py
+python -m pyc --compile source.py main
 ```
-実行後、(現状は実験的ですが) `source.py.out` が生成される想定です。
+実行後、 `main` が生成される想定です。
 
 ### AST のダンプ
 
 ```bash
-python -m pyc --dump-ast <python_file>
+python -m pyc --dump-ast <input-path>
 ```
 Python の AST (抽象構文木) を文字列としてダンプします。  
 内部的には `ast.dump()` 相当の機能を使用しています。
