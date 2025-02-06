@@ -9,16 +9,27 @@ compiler = get_compiler()
 
 
 def main():
-    parser = ArgumentParser(
-        description="pyc - Python to LLVM IR transpiler & compiler\n"
-        "A transpiler that converts Python code to LLVM IR and compiles it to machine code."
-    )
+    parser = ArgumentParser()
 
-    parser.add_argument("--emit-llvm", help="Emit LLVM IR code", type=str)
     parser.add_argument(
-        "--compile", help="Compile Python code to machine code", type=str
+        "--emit-llvm",
+        help="Emit LLVM IR code",
+        metavar="<input-path>",
+        type=str
     )
-    parser.add_argument("--dump-ast", help="Dump the AST of the Python code", type=str)
+    parser.add_argument(
+        "--compile",
+        help="Compile Python code to machine code.",
+        nargs=2,
+        metavar=('<input-path>', '<output-path>'),
+        type=str
+    )
+    parser.add_argument(
+        "--dump-ast",
+        help="Dump the AST of the Python code",
+        metavar="<input-path>",
+        type=str
+    )
 
     args = parser.parse_args()
 
@@ -27,7 +38,13 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    input_file = args.emit_llvm or args.compile or args.dump_ast
+    if args.emit_llvm:
+        input_file = args.emit_llvm
+    elif args.compile:
+        input_file = args.compile[0]
+    elif args.dump_ast:
+        input_file = args.dump_ast
+
     if not os.path.exists(input_file):
         print(f"Error: File '{input_file}' does not exist.")
         parser.print_help()
@@ -39,9 +56,10 @@ def main():
         print(f"Generated LLVM IR code at {args.emit_llvm}.ll")
 
     elif args.compile:
-        print("Compiling Python code to machine code...")
-        compiler.ll2bin.compile(args.compile)
-        print(f"Compiled Python code to machine code at {args.compile}.out")
+        input_file, output_file = args.compile
+        print(f"Compiling {input_file} to machine code...")
+        compiler.ll2bin.compile(input_file, output_file)
+        print(f"Compiled Python code to machine code at {output_file}")
 
     elif args.dump_ast:
         print("The AST of the Python code is:")

@@ -1,5 +1,5 @@
 import ast
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..ir import IRBuilder
 
@@ -34,6 +34,8 @@ class BaseVisitor:
 
         # 簡易的なシンボルテーブル（変数名 -> 型など）
         self.symbol_table: Dict[str, str] = {}
+        # 関数の引数と戻り値の型情報
+        self.function_signatures: Dict[str, Tuple[List[str], str]] = {}
         # サブビジターの辞書。各キーは ASTノードのクラス名
         self.subvisitors: Dict[str, BaseVisitor] = {}
 
@@ -88,10 +90,18 @@ class BaseVisitor:
     def set_symbol_type(self, name: str, t: str):
         self.symbol_table[name] = t
 
-    def get_symbol_type(self, name: str) -> str:
-        return self.symbol_table.get(name, "i32")  # デフォルトをi32にしておく
+    def get_symbol_type(self, name: str) -> str | None:
+        return self.symbol_table.get(name)
 
-    def visit(self, node: ast.AST) -> Any:
+    def set_function_signature(self, name: str, arg_types: List[str], return_type: str):
+        self.function_signatures[name] = (arg_types, return_type)
+
+    def get_function_signature(self, name: str) -> Optional[Tuple[List[str], str]]:
+        return self.function_signatures.get(name)
+
+    def visit(self, node: ast.AST | None) -> Any:
+        if node is None:
+            return None
         method_name = f"visit_{type(node).__name__}"
         method = getattr(self, method_name, self.generic_visit)
         return method(node)

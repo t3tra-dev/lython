@@ -1,7 +1,5 @@
 attributes #0 = { noinline nounwind optnone uwtable "frame-pointer"="all" }
 ; ========== External runtime declarations ========== 
-declare ptr @malloc(i64)
-declare void @free(ptr)
 declare void @print(ptr)
 
 declare ptr @int2str(i32)
@@ -9,6 +7,12 @@ declare ptr @str2str(ptr)
 
 declare ptr @create_string(ptr)
 
+declare ptr @PyInt_FromI32(i32)
+declare i32 @PyInt_AsI32(ptr)
+declare ptr @PyDict_New(i32)
+declare i32 @PyDict_SetItem(ptr, ptr, ptr)
+declare ptr @PyList_New(i32)
+declare i32 @PyList_Append(ptr, ptr)
 %struct.String = type { i64, ptr } ; // length + data pointer
 
 

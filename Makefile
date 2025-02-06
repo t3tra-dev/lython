@@ -1,5 +1,6 @@
 CC = clang
-CFLAGS = -Wall -Wextra -I runtime/builtin
+CFLAGS = -Wall -Wextra -O2 -I runtime/builtin $(shell pkg-config --cflags bdw-gc)
+LDFLAGS = $(shell pkg-config --libs bdw-gc)
 RUNTIME_DIR = runtime/builtin
 
 # ビルドターゲット
@@ -18,6 +19,7 @@ $(RUNTIME_DIR)/types.o: $(RUNTIME_DIR)/types.c $(RUNTIME_DIR)/types.h
 
 # クリーンアップ
 clean:
+	find . -name '__pycache__' -type d -exec rm -r {} +
 	rm -f runtime.o
 	rm -f $(RUNTIME_DIR)/*.o
 

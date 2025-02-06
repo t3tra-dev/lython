@@ -1,3 +1,7 @@
 {
-    "python.analysis.typeCheckingMode": "basic"
+    "python.analysis.typeCheckingMode": "basic",
+    "files.associations": {
+        "types.h": "c",
+        "gc.h": "c"
+    }
 }
