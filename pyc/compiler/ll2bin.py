@@ -14,6 +14,7 @@ def compile(input_path: str, output_path: str):
 
     subprocess.run([
         "clang",
+        "-O2",
         f"{input_path}.ll",
         "runtime.o",
         "-o", output_path,
