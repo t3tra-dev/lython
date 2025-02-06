@@ -172,11 +172,14 @@ python bench.py
 
 `runtime/` ディレクトリ以下に、C 言語で実装された最小限のランタイムが含まれています。
 
-- `runtime.c` / `runtime.h`
-  - `create_string`, `free_string`, `int2str`, `str2str`, `print` などの関数を提供
+- `builtin/functions.c` / `builtin/functions.h`
+  - `PyInt_FromI32`, `PyList_New`, `int2str`, `print` などの関数を提供
   - LLVM IR 上で `declare` してコールすることで、Python の組み込み風の機能を実装
+- `builtin/types.c` / `builtin/types.h`
+  - `String`, `PyInt`, `PyList` などの型を提供
+  - `builtin/functions.c` から操作される擬似的に再現された Python 固有の型を提供
 
-このランタイムをリンクして最終的なバイナリを生成することにより、`print("Hello")` などが動作します。
+このランタイムをリンクして最終的なバイナリを生成することにより、`print("Hello, world!")` などが動作します。
 
 ---
 
