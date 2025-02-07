@@ -8,6 +8,7 @@ class ComprehensionVisitor(BaseVisitor):
     """
     ```asdl
     comprehension = (expr target, expr iter, expr* ifs, int is_async)
+    ```
     """
     def __init__(self, builder: IRBuilder):
         super().__init__(builder)
