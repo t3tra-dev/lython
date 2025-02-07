@@ -54,33 +54,83 @@ class CmpOpVisitor(BaseVisitor):
         return ret_val
 
     def visit_Eq(self, node: ast.Eq) -> str:
+        """
+        ```asdl
+        Eq
+        ```
+        """
         return "Eq"
 
     def visit_NotEq(self, node: ast.NotEq) -> str:
+        """
+        ```asdl
+        NotEq
+        ```
+        """
         return "NotEq"
 
     def visit_Lt(self, node: ast.Lt) -> str:
+        """
+        ```asdl
+        Lt
+        ```
+        """
         return "Lt"
 
     def visit_LtE(self, node: ast.LtE) -> str:
+        """
+        ```asdl
+        LtE
+        ```
+        """
         return "LtE"
 
     def visit_Gt(self, node: ast.Gt) -> str:
+        """
+        ```asdl
+        Gt
+        ```
+        """
         return "Gt"
 
     def visit_GtE(self, node: ast.GtE) -> str:
+        """
+        ```asdl
+        GtE
+        ```
+        """
         return "GtE"
 
     def visit_Is(self, node: ast.Is) -> str:
+        """
+        ```asdl
+        Is
+        ```
+        """
         return "Is"
 
     def visit_IsNot(self, node: ast.IsNot) -> str:
+        """
+        ```asdl
+        IsNot
+        ```
+        """
         return "IsNot"
 
     def visit_In(self, node: ast.In) -> str:
+        """
+        ```asdl
+        In
+        ```
+        """
         return "In"
 
     def visit_NotIn(self, node: ast.NotIn) -> str:
+        """
+        ```asdl
+        NotIn
+        ```
+        """
         return "NotIn"
 
     def generic_visit(self, node: ast.AST) -> Any:
