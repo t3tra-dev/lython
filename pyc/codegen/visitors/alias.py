@@ -1,3 +1,6 @@
+import ast
+
+from pyc.codegen.ir.builder import IRBuilder
 from .base import BaseVisitor
 
 
@@ -7,5 +10,19 @@ class AliasVisitor(BaseVisitor):
     -- import name with optional 'as' alias.
     alias = (identifier name, identifier? asname)
              attributes (int lineno, int col_offset, int? end_lineno, int? end_col_offset)
+    ```
     """
-    pass
+    def __init__(self, builder: IRBuilder):
+        super().__init__(builder)
+
+    def visit_alias(self, node: ast.alias) -> None:
+        """
+        ```asdl
+        -- import name with optional 'as' alias.
+        alias = (
+            identifier name,
+            identifier? asname
+        )
+        ```
+        """
+        raise NotImplementedError("alias not implemeted")
