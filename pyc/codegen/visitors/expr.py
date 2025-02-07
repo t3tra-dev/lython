@@ -61,6 +61,7 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
 
           -- col_offset is the byte offset in the utf8 string the parser uses
           attributes (int lineno, int col_offset, int? end_lineno, int? end_col_offset)
+    ```
     """
 
     def __init__(self, builder: IRBuilder):
@@ -72,8 +73,11 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
 
     def visit_BoolOp(self, node: ast.BoolOp) -> str:
         """
+        ブールの論理演算を処理する
+
         ```asdl
         BoolOp(boolop op, expr* values)
+        ```
         """
         # boolop 自体(And/Or)は "boolop" ビジターに転送
         boolop_visitor: BoolOpVisitor = self.get_subvisitor("boolop")
@@ -98,10 +102,23 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
 
         return temp
 
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        """
+        名前付き式を処理する
+
+        ```asdl
+        NamedExpr(expr target, expr value)
+        ```
+        """
+        raise NotImplementedError("Named expression not implemented")
+
     def visit_BinOp(self, node: ast.BinOp) -> TypedValue:
         """
+        二項演算を処理する
+
         ```asdl
         BinOp(expr left, operator op, expr right)
+        ```
         """
         # 左右オペランドを再帰処理
         left_typed = self.visit(node.left)    # => TypedValue
@@ -116,10 +133,142 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
         result_typed = op_visitor.generate_op(node.op, left_typed, right_typed)
         return result_typed
 
+    def visit_UnaryOp(self, node: ast.UnaryOp) -> None:
+        """
+        単項演算を処理する
+
+        ```asdl
+        UnaryOp(unaryop op, expr operand)
+        ```
+        """
+        raise NotImplementedError("Unary operation not implemented")
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        """
+        ラムダ式を処理する
+
+        ```asdl
+        Lambda(arguments args, expr body)
+        ```
+        """
+        raise NotImplementedError("Lambda expression not implemented")
+
+    def visit_IfExp(self, node: ast.IfExp) -> None:
+        """
+        条件式を処理する
+
+        ```asdl
+        IfExp(expr test, expr body, expr orelse)
+        ```
+        """
+        raise NotImplementedError("If expression not implemented")
+
+    def visit_Dict(self, node: ast.Dict) -> TypedValue:
+        """
+        辞書リテラル
+
+        ```asdl
+        Dict(expr* keys, expr* values)
+        ```
+        """
+        num = max(len(node.keys), 8)
+        temp_dict = self.get_temp_name()
+        self.builder.emit(f"  {temp_dict} = call ptr @PyDict_New(i32 {num})")
+
+        for k_node, v_node in zip(node.keys, node.values):
+            k_typed = self.visit(k_node)
+            v_typed = self.visit(v_node)
+            self.builder.emit(f"  call i32 @PyDict_SetItem(ptr {temp_dict}, ptr {k_typed.llvm_value}, ptr {v_typed.llvm_value})")
+
+        return TypedValue(temp_dict, "ptr")
+
+    def visit_Set(self, node: ast.Set) -> None:
+        """
+        集合リテラル
+
+        ```asdl
+        Set(expr* elts)
+        ```
+        """
+        raise NotImplementedError("Set literal not implemented")
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:
+        """
+        リスト内包表記を処理する
+
+        ```asdl
+        ListComp(expr elt, comprehension* generators)
+        ```
+        """
+        raise NotImplementedError("List comprehension not implemented")
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:
+        """
+        集合内包表記を処理する
+
+        ```asdl
+        SetComp(expr elt, comprehension* generators)
+        ```
+        """
+        raise NotImplementedError("Set comprehension not implemented")
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        """
+        辞書内包表記を処理する
+
+        ```asdl
+        DictComp(expr key, expr value, comprehension* generators)
+        ```
+        """
+        raise NotImplementedError("Dict comprehension not implemented")
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+        """
+        ジェネレータ式を処理する
+
+        ```asdl
+        GeneratorExp(expr elt, comprehension* generators)
+        ```
+        """
+        raise NotImplementedError("Generator expression not implemented")
+
+    def visit_Await(self, node: ast.Await) -> None:
+        """
+        await式を処理する
+
+        ```asdl
+        Await(expr value)
+        ```
+        """
+        raise NotImplementedError("Await expression not implemented")
+
+    def visit_Yield(self, node: ast.Yield) -> None:
+        """
+        yield式を処理する
+
+        ```asdl
+        Yield(expr? value)
+        ```
+        """
+        raise NotImplementedError("Yield expression not implemented")
+
+    def visit_YieldFrom(self, node: ast.YieldFrom) -> None:
+        """
+        yield from式を処理する
+
+        ```asdl
+        YieldFrom(expr value)
+        ```
+        """
+        raise NotImplementedError("YieldFrom expression not implemented")
+
     def visit_Compare(self, node: ast.Compare) -> TypedValue:
         """
+        比較演算を処理する
+
         ```asdl
         Compare(expr left, cmpop* ops, expr* comparators)
+        ```
         """
         if len(node.ops) != 1 or len(node.comparators) != 1:
             raise NotImplementedError("Only single compare op is supported")
@@ -140,8 +289,11 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> TypedValue:
         """
+        関数の呼び出しを処理する
+
         ```asdl
         Call(expr func, expr* args, keyword* keywords)
+        ```
         """
         # 引数: node.args
         # キーワード: node.keywords -> "keyword"ビジターに転送する
@@ -236,11 +388,32 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
             # 戻り値を TypedValue で返す
             return TypedValue(ret_var, return_type)
 
+    def visit_FormattedValue(self, node: ast.FormattedValue) -> None:
+        """
+        フォーマット済み値を処理する
+
+        ```asdl
+        FormattedValue(expr value, int? conversion, expr? format_spec)
+        ```
+        """
+        raise NotImplementedError("Formatted value not implemented")
+
+    def visit_JoinedStr(self, node: ast.JoinedStr) -> None:
+        """
+        f文字列を処理する
+
+        ```asdl
+        JoinedStr(expr* values)
+        ```
+        """
+        raise NotImplementedError("Joined string not implemented")
+
     def visit_Constant(self, node: ast.Constant) -> TypedValue:
         """
         静的型に基づき、int/str等をネイティブ表現の即値に変換する
         ```asdl
         Constant(constant value, string? kind)
+        ```
         """
         val = node.value
         if isinstance(val, str):
@@ -263,11 +436,42 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
         else:
             raise NotImplementedError(f"Unsupported constant type: {type(val)}")
 
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        """
+        属性アクセスを処理する
+
+        ```asdl
+        Attribute(expr value, identifier attr, expr_context ctx)
+        ```
+        """
+        raise NotImplementedError("Attribute access not implemented")
+
+    def visit_Subscript(self, node: ast.Subscript) -> None:
+        """
+        添字アクセスを処理する
+
+        ```asdl
+        Subscript(expr value, expr slice, expr_context ctx)
+        ```
+        """
+        raise NotImplementedError("Subscript access not implemented")
+
+    def visit_Starred(self, node: ast.Starred) -> None:
+        """
+        a, b* = it のようなスター式を処理する
+
+        ```asdl
+        Starred(expr value, expr_context ctx)
+        ```
+        """
+        raise NotImplementedError("Starred expression not implemented")
+
     def visit_Name(self, node: ast.Name) -> TypedValue:
         """
         変数参照
         ```asdl
         Name(identifier id, expr_context ctx)
+        ```
         """
         # True, False, None など特別対応
         if node.id == "True":
@@ -298,6 +502,7 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
         リストリテラル
         ```asdl
         List(expr* elts, expr_context ctx)
+        ```
         """
         num = max(len(node.elts), 8)
         temp_list = self.get_temp_name()
@@ -310,22 +515,23 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
 
         return TypedValue(temp_list, "ptr")
 
-    def visit_Dict(self, node: ast.Dict) -> TypedValue:
+    def visit_Tuple(self, node: ast.Tuple) -> None:
         """
-        辞書リテラル
+        タプルリテラル
         ```asdl
-        Dict(expr* keys, expr* values)
+        Tuple(expr* elts, expr_context ctx)
+        ```
         """
-        num = max(len(node.keys), 8)
-        temp_dict = self.get_temp_name()
-        self.builder.emit(f"  {temp_dict} = call ptr @PyDict_New(i32 {num})")
+        raise NotImplementedError("Tuple literal not implemented")
 
-        for k_node, v_node in zip(node.keys, node.values):
-            k_typed = self.visit(k_node)
-            v_typed = self.visit(v_node)
-            self.builder.emit(f"  call i32 @PyDict_SetItem(ptr {temp_dict}, ptr {k_typed.llvm_value}, ptr {v_typed.llvm_value})")
-
-        return TypedValue(temp_dict, "ptr")
+    def visit_Slice(self, node: ast.Slice) -> None:
+        """
+        スライス式
+        ```asdl
+        Slice(expr? lower, expr? upper, expr? step)
+        ```
+        """
+        raise NotImplementedError("Slice expression not implemented")
 
     def generic_visit(self, node: ast.AST) -> Any:
         return super().generic_visit(node)
