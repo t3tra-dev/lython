@@ -27,11 +27,12 @@ class ModVisitor(BaseVisitor):
 
     def visit_Module(self, node: ast.Module) -> None:
         """
-        ```asdl
-        Module(stmt* body, type_ignore* type_ignores)
-
         ファイル冒頭で、関数定義を先に処理
         main関数を生成し関数定義以外のトップレベル文を順次呼び出す
+
+        ```asdl
+        Module(stmt* body, type_ignore* type_ignores)
+        ```
         """
         stmt_visitor: StmtVisitor = self.get_subvisitor("stmt")
 
@@ -57,6 +58,7 @@ class ModVisitor(BaseVisitor):
         """
         ```asdl
         Interactive(stmt* body)
+        ```
         """
         raise NotImplementedError("Interactive mode not supported (static)")
 
@@ -64,6 +66,7 @@ class ModVisitor(BaseVisitor):
         """
         ```asdl
         Expression(expr body)
+        ```
         """
         raise NotImplementedError("Expression mode not supported")
 
@@ -71,6 +74,7 @@ class ModVisitor(BaseVisitor):
         """
         ```asdl
         FunctionType(expr* argtypes, expr returns)
+        ```
         """
         raise NotImplementedError("Function type not supported in this static compiler")
 
