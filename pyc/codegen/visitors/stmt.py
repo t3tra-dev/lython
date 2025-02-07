@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import ast
-from typing import Any, List
+from typing import Any
 
 from ..ir import IRBuilder
 from .base import BaseVisitor, TypedValue
@@ -81,6 +81,11 @@ class StmtVisitor(BaseVisitor):
           def hoge(n: int) -> int:
               ...
         などを受け取り、静的型のIRを生成する
+
+        ```asdl
+        FunctionDef(identifier name, arguments args,
+                       stmt* body, expr* decorator_list, expr? returns,
+                       string? type_comment, type_param* type_params)
         """
         func_name = node.name
 
@@ -134,14 +139,9 @@ class StmtVisitor(BaseVisitor):
         self.builder.emit(f"define {return_type} @{func_name}({joined_args}) #0 {{")
         self.builder.emit("entry:")
 
-        # 関数ボディの visit
-        self.visit_function_body(node.body, return_type)
-
-        self.builder.emit("}")
-
-    def visit_function_body(self, stmts: List[ast.stmt], return_type: str) -> None:
+        # 関数ボディの処理
         has_return = False
-        for s in stmts:
+        for s in node.body:
             if isinstance(s, ast.Return):
                 has_return = True
             self.visit(s)
@@ -153,6 +153,8 @@ class StmtVisitor(BaseVisitor):
                 self.builder.emit("  ret ptr null")
             else:
                 self.builder.emit("  ret void")
+
+        self.builder.emit("}")
 
     def visit_Return(self, node: ast.Return) -> None:
         if node.value is None:
