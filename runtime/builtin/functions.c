@@ -160,8 +160,8 @@ void* PyDict_GetItem(PyDict *dict, void *key) {
 // printの実装
 void print(String* s) {
     if (!s) {
-        printf("(null)\n");
+        puts("(null)");
         return;
     }
-    printf("%s\n", s->data);
+    puts(s->data);
 }
