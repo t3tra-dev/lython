@@ -26,4 +26,4 @@ jobs:
 
       - run: nix develop -c echo test
       - run: nix develop -c uv sync --all-extras
-      - run: nix develop -c python bench.py
+      - run: nix develop -c uv run python bench.py
