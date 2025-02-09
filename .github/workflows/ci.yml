@@ -25,5 +25,6 @@ jobs:
           restore-prefixes-first-match: nix-${{ runner.os }}-
 
       - run: nix develop -c echo test
+      - run: nix develop -c make
       - run: nix develop -c uv sync --all-extras
       - run: nix develop -c uv run python bench.py
