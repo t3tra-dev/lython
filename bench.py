@@ -80,13 +80,15 @@ def display_results(results: List[BenchmarkResult]):
     table.add_column("time", style="green")
     table.add_column("result", style="yellow")
 
+    pyc_time = next((result.execution_time for result in results if result.name == "Python(pyc)"), None)
+
     sorted_results = sorted(results, key=lambda x: x.execution_time)
-    fastest_time = sorted_results[0].execution_time
 
     for result in sorted_results:
-        relative_speed = f"(x{result.execution_time / fastest_time:.2f})"
+        # "Python(pyc)"を基準に相対速度を計算
+        relative_speed = f"(x{result.execution_time / pyc_time:.2f})"  # type: ignore
         time_str = f"{result.execution_time * 1000:.2f}ms {relative_speed}"
-        table.add_row(result.name, time_str, result.output)
+        table.add_row(result.name, time_str, f"{result.output} ")
 
     console.print(table)
 
