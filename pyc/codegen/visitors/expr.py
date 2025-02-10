@@ -5,8 +5,6 @@ from typing import Any
 
 from ..ir import IRBuilder
 from .base import BaseVisitor, TypedValue
-from .boolop import BoolOpVisitor
-from .cmpop import CmpOpVisitor
 from .keyword import KeywordVisitor
 from .operator import OperatorVisitor
 
@@ -79,28 +77,9 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
         BoolOp(boolop op, expr* values)
         ```
         """
-        # boolop 自体(And/Or)は "boolop" ビジターに転送
+        from .boolop import BoolOpVisitor
         boolop_visitor: BoolOpVisitor = self.get_subvisitor("boolop")
-        # まず boolop を処理
-        op_repr = boolop_visitor.visit(node.op)
-        # node.values は [expr, expr, ...]
-        # ここでは例として2項 (Pythonは多項And/Orだが簡略化)
-        if len(node.values) != 2:
-            raise NotImplementedError("Multi-value BoolOp not fully supported")
-
-        left_val = self.visit(node.values[0])
-        right_val = self.visit(node.values[1])
-
-        # (仮) i32として 0, 1 で計算し AND or OR する
-        temp = self.get_temp_name()
-        if op_repr == "And":
-            self.builder.emit(f"  {temp} = and i32 {left_val}, {right_val}")
-        elif op_repr == "Or":
-            self.builder.emit(f"  {temp} = or i32 {left_val}, {right_val}")
-        else:
-            raise NotImplementedError(f"Unsupported BoolOp: {op_repr}")
-
-        return temp
+        return boolop_visitor.visit(node, self)
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         """
@@ -155,7 +134,7 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
 
     def visit_IfExp(self, node: ast.IfExp) -> None:
         """
-        条件式を処理する
+        三項演算子を処理する
 
         ```asdl
         IfExp(expr test, expr body, expr orelse)
@@ -270,22 +249,9 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
         Compare(expr left, cmpop* ops, expr* comparators)
         ```
         """
-        if len(node.ops) != 1 or len(node.comparators) != 1:
-            raise NotImplementedError("Only single compare op is supported")
-
-        left_typed = self.visit(node.left)  # => TypedValue
-        right_typed = self.visit(node.comparators[0])  # => TypedValue
-
-        # cmpop は "cmpop" ビジターに転送
+        from .cmpop import CmpOpVisitor
         cmpop_visitor: CmpOpVisitor = self.get_subvisitor("cmpop")
-
-        result_val = cmpop_visitor.generate_cmpop(
-            node.ops[0],
-            left_typed.llvm_value,
-            right_typed.llvm_value
-        )
-
-        return TypedValue(result_val, "i32")
+        return cmpop_visitor.visit(node, self)
 
     def visit_Call(self, node: ast.Call) -> TypedValue:
         """
