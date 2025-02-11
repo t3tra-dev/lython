@@ -24,6 +24,7 @@ PyInt* PyInt_FromI32(int value) {
     obj->value = value;
     return obj;
 }
+
 int PyInt_AsI32(PyInt* obj) {
     if (!obj) return 0; // 仮
     return obj->value;
@@ -43,8 +44,12 @@ String* str2str(String* s) {
 
 /* 仮のハッシュ関数（実際は各オブジェクトの hash 関数に委ねる） */
 unsigned int hash_object(void *key) {
-    // とりあえずポインタ値をそのままハッシュに
-    return (unsigned int)((uintptr_t)key);
+    String *str = (String*)key;
+    unsigned int hash = 5381;
+    for (size_t i = 0; i < str->length; i++) {
+        hash = ((hash << 5) + hash) + str->data[i];  // hash * 33 + c
+    }
+    return hash;
 }
 
 /* 新しいリストを作成．初期容量を指定（0 なら既定値） */
@@ -126,7 +131,6 @@ static int PyDict_Resize(PyDict *dict, int new_capacity) {
     return 0;
 }
 
-/* PyDict_SetItem */
 int PyDict_SetItem(PyDict *dict, void *key, void *value) {
     if (dict->size * 2 >= dict->capacity) {
         if (PyDict_Resize(dict, dict->capacity * 2) < 0)
@@ -135,7 +139,10 @@ int PyDict_SetItem(PyDict *dict, void *key, void *value) {
     unsigned int h = hash_object(key);
     int i = h % dict->capacity;
     while (dict->keys[i] != NULL) {
-        if (dict->keys[i] == key) {
+        String *key1 = (String*)dict->keys[i];
+        String *key2 = (String*)key;
+        if (key1->length == key2->length && 
+            strcmp(key1->data, key2->data) == 0) {
             dict->values[i] = value;
             return 0;
         }
@@ -148,11 +155,22 @@ int PyDict_SetItem(PyDict *dict, void *key, void *value) {
 }
 
 void* PyDict_GetItem(PyDict *dict, void *key) {
+    // キーが文字列リテラルの場合は一時的なString*を作成
+    String *temp_key = NULL;
+    if (((uintptr_t)key & 1) == 0) {  // ポインタがString*でない場合
+        temp_key = create_string((const char*)key);
+        key = temp_key;
+    }
+    
     unsigned int h = hash_object(key);
     int i = h % dict->capacity;
     while (dict->keys[i] != NULL) {
-        if (dict->keys[i] == key)
+        String *key1 = (String*)dict->keys[i];
+        String *key2 = (String*)key;
+        if (key1->length == key2->length && 
+            strcmp(key1->data, key2->data) == 0) {
             return dict->values[i];
+        }
         i = (i + 1) % dict->capacity;
     }
     return NULL;
