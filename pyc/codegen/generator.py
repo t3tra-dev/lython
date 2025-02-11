@@ -38,8 +38,10 @@ class IRGenerator(BaseVisitor):
             # 辞書とリスト
             "declare ptr @PyDict_New(i32)",
             "declare i32 @PyDict_SetItem(ptr, ptr, ptr)",
+            "declare ptr @PyDict_GetItem(ptr, ptr)",
             "declare ptr @PyList_New(i32)",
             "declare i32 @PyList_Append(ptr, ptr)",
+            "declare ptr @PyList_GetItem(ptr, i32)",
         ])
 
         # 必要なら String 構造体の定義をIR上で書く (i64 length, i8* data)
