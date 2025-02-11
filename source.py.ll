@@ -5,6 +5,7 @@
 @.str.4 = private unnamed_addr constant [5 x i8] c"\6b\65\79\31\00", align 1
 @.str.5 = private unnamed_addr constant [5 x i8] c"\6b\65\79\32\00", align 1
 @.str.6 = private unnamed_addr constant [5 x i8] c"\6b\65\79\33\00", align 1
+@.str.7 = private unnamed_addr constant [5 x i8] c"\6b\65\79\31\00", align 1
 attributes #0 = { noinline nounwind optnone uwtable "frame-pointer"="all" }
 ; ========== External runtime declarations ========== 
 declare void @print(ptr)
@@ -18,8 +19,10 @@ declare ptr @PyInt_FromI32(i32)
 declare i32 @PyInt_AsI32(ptr)
 declare ptr @PyDict_New(i32)
 declare i32 @PyDict_SetItem(ptr, ptr, ptr)
+declare ptr @PyDict_GetItem(ptr, ptr)
 declare ptr @PyList_New(i32)
 declare i32 @PyList_Append(ptr, ptr)
+declare ptr @PyList_GetItem(ptr, i32)
 %struct.String = type { i64, ptr } ; // length + data pointer
 
 
@@ -44,14 +47,22 @@ entry:
   %listvar = bitcast ptr %t2 to ptr ; assignment to listvar
   %t9 = call ptr @PyDict_New(i32 8)
   %t10 = call ptr @create_string(ptr @.str.4)
-  %t11 = call ptr @PyInt_FromI32(i32 1)
-  call i32 @PyDict_SetItem(ptr %t9, ptr %t10, ptr %t11)
-  %t12 = call ptr @create_string(ptr @.str.5)
-  %t13 = call ptr @PyInt_FromI32(i32 2)
-  call i32 @PyDict_SetItem(ptr %t9, ptr %t12, ptr %t13)
-  %t14 = call ptr @create_string(ptr @.str.6)
-  %t15 = call ptr @PyInt_FromI32(i32 3)
-  call i32 @PyDict_SetItem(ptr %t9, ptr %t14, ptr %t15)
+  %t12 = call ptr @PyInt_FromI32(i32 1)
+  call i32 @PyDict_SetItem(ptr %t9, ptr %t10, ptr %t12)
+  %t13 = call ptr @create_string(ptr @.str.5)
+  %t15 = call ptr @PyInt_FromI32(i32 2)
+  call i32 @PyDict_SetItem(ptr %t9, ptr %t13, ptr %t15)
+  %t16 = call ptr @create_string(ptr @.str.6)
+  %t18 = call ptr @PyInt_FromI32(i32 3)
+  call i32 @PyDict_SetItem(ptr %t9, ptr %t16, ptr %t18)
   %dictvar = bitcast ptr %t9 to ptr ; assignment to dictvar
+  %t19 = call ptr @PyList_GetItem(ptr %listvar, i32 3)
+  call void @print(ptr %t19)
+  %t20 = add i32 0, 0 ; discard return
+  %t21 = call ptr @PyDict_GetItem(ptr %dictvar, ptr @.str.7)
+  %t23 = call i32 @PyInt_AsI32(ptr %t21)
+  %t22 = call ptr @int2str(i32 %t23)
+  call void @print(ptr %t22)
+  %t24 = add i32 0, 0 ; discard return
   ret i32 0
 }
