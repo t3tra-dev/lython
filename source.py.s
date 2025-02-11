@@ -5,13 +5,16 @@
 _main:                                  ; @main
 	.cfi_startproc
 ; %bb.0:                                ; %entry
-	stp	x20, x19, [sp, #-32]!           ; 16-byte Folded Spill
-	stp	x29, x30, [sp, #16]             ; 16-byte Folded Spill
-	.cfi_def_cfa_offset 32
+	stp	x22, x21, [sp, #-48]!           ; 16-byte Folded Spill
+	stp	x20, x19, [sp, #16]             ; 16-byte Folded Spill
+	stp	x29, x30, [sp, #32]             ; 16-byte Folded Spill
+	.cfi_def_cfa_offset 48
 	.cfi_offset w30, -8
 	.cfi_offset w29, -16
 	.cfi_offset w19, -24
 	.cfi_offset w20, -32
+	.cfi_offset w21, -40
+	.cfi_offset w22, -48
 Lloh0:
 	adrp	x0, l_.str.0@PAGE
 Lloh1:
@@ -62,47 +65,62 @@ Lloh7:
 	bl	_PyList_Append
 	mov	w0, #8                          ; =0x8
 	bl	_PyDict_New
-	mov	x19, x0
+	mov	x20, x0
 Lloh8:
 	adrp	x0, l_.str.4@PAGE
 Lloh9:
 	add	x0, x0, l_.str.4@PAGEOFF
 	bl	_create_string
-	mov	x20, x0
+	mov	x21, x0
 	mov	w0, #1                          ; =0x1
 	bl	_PyInt_FromI32
 	mov	x2, x0
-	mov	x0, x19
-	mov	x1, x20
+	mov	x0, x20
+	mov	x1, x21
 	bl	_PyDict_SetItem
 Lloh10:
 	adrp	x0, l_.str.5@PAGE
 Lloh11:
 	add	x0, x0, l_.str.5@PAGEOFF
 	bl	_create_string
-	mov	x20, x0
+	mov	x21, x0
 	mov	w0, #2                          ; =0x2
 	bl	_PyInt_FromI32
 	mov	x2, x0
-	mov	x0, x19
-	mov	x1, x20
+	mov	x0, x20
+	mov	x1, x21
 	bl	_PyDict_SetItem
 Lloh12:
 	adrp	x0, l_.str.6@PAGE
 Lloh13:
 	add	x0, x0, l_.str.6@PAGEOFF
 	bl	_create_string
-	mov	x20, x0
+	mov	x21, x0
 	mov	w0, #3                          ; =0x3
 	bl	_PyInt_FromI32
 	mov	x2, x0
-	mov	x0, x19
-	mov	x1, x20
+	mov	x0, x20
+	mov	x1, x21
 	bl	_PyDict_SetItem
-	ldp	x29, x30, [sp, #16]             ; 16-byte Folded Reload
+	mov	x0, x19
+	mov	w1, #3                          ; =0x3
+	bl	_PyList_GetItem
+	bl	_print
+Lloh14:
+	adrp	x1, l_.str.7@PAGE
+Lloh15:
+	add	x1, x1, l_.str.7@PAGEOFF
+	mov	x0, x20
+	bl	_PyDict_GetItem
+	bl	_PyInt_AsI32
+	bl	_int2str
+	bl	_print
+	ldp	x29, x30, [sp, #32]             ; 16-byte Folded Reload
 	mov	w0, wzr
-	ldp	x20, x19, [sp], #32             ; 16-byte Folded Reload
+	ldp	x20, x19, [sp, #16]             ; 16-byte Folded Reload
+	ldp	x22, x21, [sp], #48             ; 16-byte Folded Reload
 	ret
+	.loh AdrpAdd	Lloh14, Lloh15
 	.loh AdrpAdd	Lloh12, Lloh13
 	.loh AdrpAdd	Lloh10, Lloh11
 	.loh AdrpAdd	Lloh8, Lloh9
@@ -133,5 +151,8 @@ l_.str.5:                               ; @.str.5
 
 l_.str.6:                               ; @.str.6
 	.asciz	"key3"
+
+l_.str.7:                               ; @.str.7
+	.asciz	"key1"
 
 .subsections_via_symbols

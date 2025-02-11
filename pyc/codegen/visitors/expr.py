@@ -157,7 +157,28 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
         for k_node, v_node in zip(node.keys, node.values):
             k_typed = self.visit(k_node)
             v_typed = self.visit(v_node)
-            self.builder.emit(f"  call i32 @PyDict_SetItem(ptr {temp_dict}, ptr {k_typed.llvm_value}, ptr {v_typed.llvm_value})")
+
+            # キーと値の型変換処理
+            key_ptr = self.get_temp_name()
+            val_ptr = self.get_temp_name()
+
+            # キーの型変換
+            if k_typed.type_ == "i32":
+                self.builder.emit(f"  {key_ptr} = call ptr @PyInt_FromI32(i32 {k_typed.llvm_value})")
+            elif k_typed.type_ == "ptr":
+                key_ptr = k_typed.llvm_value
+            else:
+                raise TypeError(f"Unsupported key type for dict: {k_typed.type_}")
+
+            # 値の型変換
+            if v_typed.type_ == "i32":
+                self.builder.emit(f"  {val_ptr} = call ptr @PyInt_FromI32(i32 {v_typed.llvm_value})")
+            elif v_typed.type_ == "ptr":
+                val_ptr = v_typed.llvm_value
+            else:
+                raise TypeError(f"Unsupported value type for dict: {v_typed.type_}")
+
+            self.builder.emit(f"  call i32 @PyDict_SetItem(ptr {temp_dict}, ptr {key_ptr}, ptr {val_ptr})")
 
         return TypedValue(temp_dict, "ptr")
 
@@ -310,11 +331,15 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
                 self.builder.emit(f"  {tmp} = call ptr @int2str(i32 {arg_val.llvm_value})")
                 return TypedValue(tmp, "ptr")  # 文字列ポインタを返す
 
-            # すでに文字列（ptr）なら、そのままコピーする
+            # PyInt型（ポインタ）の場合
             elif arg_val.type_ == "ptr":
                 tmp = self.get_temp_name()
-                self.builder.emit(f"  {tmp} = call ptr @str2str(ptr {arg_val.llvm_value})")
-                return TypedValue(tmp, "ptr")  # 文字列ポインタを返す
+                # まずPyInt_AsI32でアンボックス化
+                tmp2 = self.get_temp_name()
+                self.builder.emit(f"  {tmp2} = call i32 @PyInt_AsI32(ptr {arg_val.llvm_value})")
+                # 次にint2strで文字列に変換
+                self.builder.emit(f"  {tmp} = call ptr @int2str(i32 {tmp2})")
+                return TypedValue(tmp, "ptr")
 
             else:
                 raise TypeError(f"str() does not support type '{arg_val.type_}'")
@@ -412,7 +437,7 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
         """
         raise NotImplementedError("Attribute access not implemented")
 
-    def visit_Subscript(self, node: ast.Subscript) -> None:
+    def visit_Subscript(self, node: ast.Subscript) -> TypedValue:
         """
         添字アクセスを処理する
 
@@ -420,7 +445,34 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
         Subscript(expr value, expr slice, expr_context ctx)
         ```
         """
-        raise NotImplementedError("Subscript access not implemented")
+        # まず基底のオブジェクトの評価
+        base_val = self.visit(node.value)
+        # ここでは slice は Constant であると仮定
+        if not isinstance(node.slice, ast.Constant):
+            raise NotImplementedError("Subscript with non-constant index is not supported")
+
+        const_node = node.slice
+        # 定数が整数ならリストアクセス
+        if isinstance(const_node.value, int):
+            temp = self.get_temp_name()
+            # ランタイム関数 PyList_GetItem は (PyList*, int) を受け取り，
+            # 指定インデックスの値 (PyObject*) を返すと想定
+            self.builder.emit(f"  {temp} = call ptr @PyList_GetItem(ptr {base_val.llvm_value}, i32 {const_node.value})")
+            return TypedValue(temp, "ptr")
+
+        # 定数が文字列なら辞書アクセス
+        elif isinstance(const_node.value, str):
+            # 定数文字列をグローバル定数として登録
+            key_const = self.builder.add_global_string(const_node.value)
+            temp = self.get_temp_name()
+            # ランタイム関数 PyDict_GetItem は (PyDict*, PyObject*) を受け取り，
+            # キーに対応する値 (PyObject*) を返すと想定
+            self.builder.emit(f"  {temp} = call ptr @PyDict_GetItem(ptr {base_val.llvm_value}, ptr {key_const})")
+            # 戻り値はPyInt*型なので、ptrとして返す
+            return TypedValue(temp, "ptr")
+
+        else:
+            raise NotImplementedError("Subscript index constant must be int or str")
 
     def visit_Starred(self, node: ast.Starred) -> None:
         """
@@ -476,8 +528,16 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
 
         for elt in node.elts:
             elt_typed = self.visit(elt)  # -> TypedValue
-            # リストには ptr で格納する
-            self.builder.emit(f"  call i32 @PyList_Append(ptr {temp_list}, ptr {elt_typed.llvm_value})")
+            if elt_typed.type_ == "i32":
+                # i32の場合は、PyInt_FromI32でポインタに変換
+                temp = self.get_temp_name()
+                self.builder.emit(f"  {temp} = call ptr @PyInt_FromI32(i32 {elt_typed.llvm_value})")
+                self.builder.emit(f"  call i32 @PyList_Append(ptr {temp_list}, ptr {temp})")
+            elif elt_typed.type_ == "ptr":
+                # すでにポインタの場合は直接追加
+                self.builder.emit(f"  call i32 @PyList_Append(ptr {temp_list}, ptr {elt_typed.llvm_value})")
+            else:
+                raise TypeError(f"Unsupported type for list element: {elt_typed.type_}")
 
         return TypedValue(temp_list, "ptr")
 
