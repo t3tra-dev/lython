@@ -42,6 +42,9 @@ class IRGenerator(BaseVisitor):
             "declare ptr @PyList_New(i32)",
             "declare i32 @PyList_Append(ptr, ptr)",
             "declare ptr @PyList_GetItem(ptr, i32)",
+
+            # Boehm GCの初期化に使う
+            "declare void @GC_init()",
         ])
 
         # 必要なら String 構造体の定義をIR上で書く (i64 length, i8* data)
