@@ -11,8 +11,11 @@ declare ptr @PyInt_FromI32(i32)
 declare i32 @PyInt_AsI32(ptr)
 declare ptr @PyDict_New(i32)
 declare i32 @PyDict_SetItem(ptr, ptr, ptr)
+declare ptr @PyDict_GetItem(ptr, ptr)
 declare ptr @PyList_New(i32)
 declare i32 @PyList_Append(ptr, ptr)
+declare ptr @PyList_GetItem(ptr, i32)
+declare void @GC_init()
 %struct.String = type { i64, ptr } ; // length + data pointer
 
 
@@ -39,6 +42,7 @@ if.end.2:
 
 define i32 @main(i32 %argc, i8** %argv) {
 entry:
+  call void @GC_init()
   %t8 = call i32 @fib(i32 35)
   %t9 = call ptr @int2str(i32 %t8)
   call void @print(ptr %t9)

@@ -45,6 +45,9 @@ class ModVisitor(BaseVisitor):
         self.builder.emit("\ndefine i32 @main(i32 %argc, i8** %argv) {")
         self.builder.emit("entry:")
 
+        # Boehm GCの初期化
+        self.builder.emit("  call void @GC_init()")
+
         # 関数定義以外のステートメントを処理
         for stmt in node.body:
             if not isinstance(stmt, ast.FunctionDef):

@@ -23,11 +23,13 @@ declare ptr @PyDict_GetItem(ptr, ptr)
 declare ptr @PyList_New(i32)
 declare i32 @PyList_Append(ptr, ptr)
 declare ptr @PyList_GetItem(ptr, i32)
+declare void @GC_init()
 %struct.String = type { i64, ptr } ; // length + data pointer
 
 
 define i32 @main(i32 %argc, i8** %argv) {
 entry:
+  call void @GC_init()
   %t0 = call ptr @create_string(ptr @.str.0)
   call void @print(ptr %t0)
   %t1 = add i32 0, 0 ; discard return
