@@ -40,7 +40,7 @@ CPython とは異なる形で静的型付けのように扱いながらPythonソ
 ```text
 ├── .gitignore
 ├── .python-version            # Python のバージョン指定 (3.12)
-├── .vscode                    # VSCode 用設定ファイル
+├── .vscode/                   # VSCode 用設定ファイル
 │   ├── settings.json
 │   └── c_cpp_properties.json
 ├── bench.py                   # ベンチマーク用スクリプト
@@ -64,9 +64,8 @@ CPython とは異なる形で静的型付けのように扱いながらPythonソ
 │       ├── functions.h
 │       ├── types.c
 │       └── types.h
+├── samples/                   # 他言語から生成したIRのサンプル
 ├── Makefile                   # ランタイムのビルド用
-├── sample.c                   # C のサンプルコード
-├── sample.ll                  # 上記 C コードを LLVM IR 化した例
 ├── source.py                  # Python のサンプルコード
 ├── source.py.ll               # source.py を LLVM IR 化した例
 ├── source.py.s                # さらにアセンブリまで生成した例
