@@ -1,8 +1,7 @@
 import ast
 
-from pyc.codegen.ir.builder import IRBuilder
-
 from .base import BaseVisitor
+from ...codegen.ir.builder import IRBuilder
 
 
 class TypeParamVisitor(BaseVisitor):

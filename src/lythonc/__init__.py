@@ -1,15 +1,13 @@
 """
-pyc: Python to LLVM IR transpiler & compiler
+lythonc: Python compiler toolchain that can be AOT compiled using LLVM as a foundation
 ~~~~~~~~~~~~~~~~~~~
-
-A transpiler that converts Python code to LLVM IR and compiles it to machine code.
 
 :copyright: (c) 2024-present t3tra
 :license: MIT, see LICENSE for more details.
 
 """
 
-__title__ = "pyc"
+__title__ = "lythonc"
 __author__ = "t3tra"
 __license__ = "MIT"
 __copyright__ = "Copyright 2024-present t3tra"
@@ -19,21 +17,6 @@ __path__ = __import__("pkgutil").extend_path(__path__, __name__)
 
 import logging
 from typing import Literal, NamedTuple
-
-
-def get_codegen():
-    from . import codegen  # noqa
-
-    return codegen
-
-
-def get_compiler():
-    from . import compiler  # noqa
-
-    return compiler
-
-
-__all__ = ["get_codegen", "get_compiler"]
 
 
 class VersionInfo(NamedTuple):
