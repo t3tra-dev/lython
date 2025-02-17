@@ -74,7 +74,7 @@ dev = [
 dev = [
     { name = "black", specifier = ">=24.10.0" },
     { name = "isort", specifier = ">=5.13.2" },
-    { name = "lython" },
+    { name = "lython", editable = "." },
     { name = "rich", specifier = ">=13.9.4" },
 ]
 
