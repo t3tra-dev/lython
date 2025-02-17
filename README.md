@@ -1,4 +1,3 @@
-> [!NOTE]
 > Please do not send pull requests to this repository.
 
 # Lython - Python compiler toolchain based on LLVM
