@@ -116,31 +116,24 @@ Python 3.12 以上が必要です (`.python-version` で 3.12 を指定してい
 ### 1. LLVM IR の生成
 
 ```bash
-python -m lythonc --emit-llvm <input-path>
+python -m lythonc -emit-llvm <input-path>
 ```
 - 例:  
   ```bash
-  python -m lythonc --emit-llvm source.py
+  python -m lythonc -emit-llvm source.py
   ```
   実行後、`source.py.ll` が同一ディレクトリに生成されます。
 
 ### 2. バイナリへのコンパイル
 
 ```bash
-python -m lythonc --compile <input-path> <output-path>
+python -m lythonc <input-path> -o <output-path>
 ```
 - 例:  
   ```bash
-  python -m lythonc --compile source.py main
+  python -m lythonc source.py -o main
   ```
   実行後、 `main` バイナリが生成されます。
-
-### 3. AST のダンプ
-
-```bash
-python -m lythonc --dump-ast <input-path>
-```
-- Python の AST (抽象構文木) を文字列としてダンプします。内部的に `ast.dump()` を利用しています。
 
 ---
 
