@@ -1,6 +1,10 @@
-> Note: Please do not send pull requests to this repository.
+> [!NOTE]
+> Please do not send pull requests to this repository.
 
-# pyc - Python to LLVM IR transpiler & compiler
+# Lython - Python compiler toolchain based on LLVM
+
+> [!TIP]
+> Searching for **pyc**? You are in the right repo. **pyc** has been renamed to **Lython**.
 
 ```
               🚀 Benchmark Results              
@@ -13,7 +17,7 @@
 │ C(O3)          │ 17.30ms (x0.76)   │ 9227465  │
 │ C(O2)          │ 17.88ms (x0.79)   │ 9227465  │
 │ LLVM(O2)       │ 20.32ms (x0.90)   │ 9227465  │
-│ Python(pyc)    │ 22.68ms (x1.00)   │ 9227465  │
+│ Lython         │ 22.68ms (x1.00)   │ 9227465  │
 │ LLVM(O0)       │ 23.15ms (x1.02)   │ 9227465  │
 │ C(O0)          │ 33.34ms (x1.47)   │ 9227465  │
 │ Bun            │ 54.52ms (x2.40)   │ 9227465  │
@@ -24,14 +28,14 @@
 └────────────────┴───────────────────┴──────────┘
 ```
 
-**pyc** は、Python コードを LLVM IR に変換 (トランスパイル) し、さらに機械語へコンパイルすることを目指した実験的プロジェクトです。  
-CPython とは異なる形で静的型付けのように扱いながらPythonソースを解析し、`clang` などのツールチェーンを利用してネイティブバイナリを生成することを目標としています。
+**Lython** は、Python コードを LLVM IR に変換 (トランスパイル) し、機械語へコンパイルすることを目指した実験的プロジェクトです。 
+LLVM を基盤にしつつ、CPython とは異なる形で静的型付けのように扱いながら Python ソースを解析し、`clang` などのツールチェーンでネイティブバイナリを生成することをゴールとしています。
 
 ## Features
-- Python AST をトラバースし、LLVM IR を生成
-- 生成された IR をさらに `clang` や `llc` などでコンパイルして実行ファイル化を目指す
-- Python によるソースコード解析部分は静的型に近い形で扱う実験的実装
-- ランタイム (`runtime/`) として最低限のメモリ管理・`print` 関数などを C 実装で提供
+- **Python AST のトラバース**: Python の抽象構文木を解析して LLVM IR を生成
+- **ツールチェーン活用**: 生成した IR をさらに `clang` や `llc` などでコンパイルし、実行ファイル化を狙う
+- **実験的な静的型解析**: Python によるソースコード解析部分を簡易的に静的型チェック風に処理
+- **ランタイム (`runtime/`) の自前実装**: メモリ管理 (Boehm GC) や `print` 関数などを最低限 C 言語で提供
 
 ---
 
@@ -50,16 +54,17 @@ CPython とは異なる形で静的型付けのように扱いながらPythonソ
 │   ├── llfib.ll
 │   └── pyfib.py
 ├── helloworld.ll              # サンプルの "Hello, world!" LLVM IR
-├── pyc/
-│   ├── __init__.py
-│   ├── __main__.py            # `python -m pyc` で呼ばれるエントリーポイント
-│   ├── codegen/               # Python -> LLVM IR 変換ロジック
-│   │   ├── ir/                # LLVM IR を構築するためのビルダー等
-│   │   └── visitors/          # 各種 AST ノードへの Visitor 実装
-│   └── compiler/              # 生成された LLVM IR をバイナリに変換するロジック (ll2bin など)
+├── src                        # メインソース
+│   └── lython
+│       ├── __init__.py
+│       ├── __main__.py        # CLIのエントリポイント
+│       ├── codegen
+│       │   ├── ir/            # LLVM IR を構築するためのビルダー等
+│       │   └── visitors/      # 各種 AST ノードへの Visitor 実装
+│       └── compiler/          # 生成された LLVM IR をバイナリに変換するロジック (ll2bin など)
 ├── pyproject.toml             # Python プロジェクト管理用 (PEP 621)
-├── runtime/                   # C で実装したランタイム
-│   └── builtin/               # ビルトインの関数や型
+├── runtime/                   # C で実装したランタイム (Boehm GC)
+│   └── builtin/
 │       ├── functions.c
 │       ├── functions.h
 │       ├── types.c
@@ -81,80 +86,73 @@ CPython とは異なる形で静的型付けのように扱いながらPythonソ
 このリポジトリでは [uv](https://docs.astral.sh/uv) というパッケージ管理ツールを使用しています。  
 Python 3.12 以上が必要です (`.python-version` で 3.12 を指定しています)。
 
-1. **uv のインストール**  
-   Unix:
-   ```bash
-   curl -LsSf https://astral.sh/uv/install.sh | sh
-   ```
-   Windows:
-   ```bash
-   powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
-   ```
-
-2. **依存関係の同期**  
+1. **uv のインストール**
+   - **Unix (Linux/macOS)**:
+     ```bash
+     curl -LsSf https://astral.sh/uv/install.sh | sh
+     ```
+   - **Windows**:
+     ```powershell
+     powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+     ```
+2. **依存関係の同期**
    ```bash
    uv sync
    ```
-   `uv.lock` の内容に従って各種パッケージ (black, isort, rich など) をインストールします。
-
+   これにより `uv.lock` の内容に従い、black, isort, rich などをまとめてインストールします。
 3. **コンパイラツールチェーン**  
-   LLVM/Clang がインストールされている必要があります。  
-   `clang --version` や `llc --version` が使用できる状態にしてください (環境に応じてインストール)。
-
-4. **ランタイムのビルド**
-   ```bash
-   make
-   ```
-   Makefileに基づき `runtime.o` を生成します。
-   `make clean` でキャッシュやライブラリバイナリを消去できます。
+   - LLVM/Clang が必要です。`clang --version` や `llc --version` が使用できる状態にしておきましょう。
+4. **ランタイムのビルド**  
+   - ルートディレクトリにある `Makefile` を使い、`runtime.o` を生成します:
+     ```bash
+     make
+     ```
+   - `make clean` でキャッシュやバイナリを削除可能です。
 
 ---
 
 ## 使用方法
 
-### LLVM IR の生成
+### 1. LLVM IR の生成
 
 ```bash
-python -m pyc --emit-llvm <input-path>
+python -m lythonc --emit-llvm <input-path>
 ```
+- 例:  
+  ```bash
+  python -m lythonc --emit-llvm source.py
+  ```
+  実行後、`source.py.ll` が同一ディレクトリに生成されます。
 
-例: `source.py` を LLVM IR 化して `source.py.ll` を出力する:
-```bash
-python -m pyc --emit-llvm source.py
-```
-実行後、同じフォルダに `source.py.ll` が生成されます。
-
-### バイナリへのコンパイル
-
-```bash
-python -m pyc --compile <input-path> <output-path>
-```
-
-例: `source.py` を機械語バイナリにコンパイルする:
-```bash
-python -m pyc --compile source.py main
-```
-実行後、 `main` が生成される想定です。
-
-### AST のダンプ
+### 2. バイナリへのコンパイル
 
 ```bash
-python -m pyc --dump-ast <input-path>
+python -m lythonc --compile <input-path> <output-path>
 ```
-Python の AST (抽象構文木) を文字列としてダンプします。  
-内部的には `ast.dump()` 相当の機能を使用しています。
+- 例:  
+  ```bash
+  python -m lythonc --compile source.py main
+  ```
+  実行後、 `main` バイナリが生成されます。
+
+### 3. AST のダンプ
+
+```bash
+python -m lythonc --dump-ast <input-path>
+```
+- Python の AST (抽象構文木) を文字列としてダンプします。内部的に `ast.dump()` を利用しています。
 
 ---
 
 ## ベンチマーク
 
-`bench.py` を使うと、以下のような言語/コンパイルパターンでフィボナッチ (n=35) の実行時間を比較できます:
+`bench.py` を使うと、以下のような言語/ランタイム/コンパイルパターンでフィボナッチ (n=35) の実行時間を比較できます:
 
 - Node.js / Bun / Deno (JavaScript)
 - C (clang) with -O0, -O1, -O2, -O3
 - LLVM IR (clang) with -O0, -O1, -O2, -O3
-- Python (pyc で LLVM IR 化したバイナリ)
-- Python (CPython), Python(no GIL) (3.13 スレッドフリー版など)
+- **Lython**
+- Python (CPython), Python(no GIL)
 
 #### 使い方
 
@@ -162,39 +160,39 @@ Python の AST (抽象構文木) を文字列としてダンプします。
 python bench.py
 ```
 
-スクリプトの冒頭 `setup()` 関数で C や LLVM IR のコンパイルを行い、その後各エグゼを繰り返し呼び出して平均実行時間を比較します。  
-結果はターミナルに表形式で表示されます (内部で `rich` を使用)。
+- スクリプト内の `setup()` 関数で事前に C や LLVM IR のコンパイルを行い、その後それぞれ実行して平均実行時間を測定します。  
+- 結果はターミナル上に表形式（`rich`）で出力されます。
 
 ---
 
 ## ランタイム
 
-`runtime/` ディレクトリ以下に、C 言語で実装された最小限のランタイムが含まれています。
+`runtime/` ディレクトリ配下に C言語で実装した最小限のランタイム（Boehm GC 使用）が置かれています。
 
-- `builtin/functions.c` / `builtin/functions.h`
-  - `PyInt_FromI32`, `PyList_New`, `int2str`, `print` などの関数を提供
-  - LLVM IR 上で `declare` してコールすることで、Python の組み込み風の機能を実装
-- `builtin/types.c` / `builtin/types.h`
-  - `String`, `PyInt`, `PyList` などの型を提供
-  - `builtin/functions.c` から操作される擬似的に再現された Python 固有の型を提供
+- `builtin/functions.c / .h`  
+  - `PyInt_FromI32`, `PyList_New`, `int2str`, `print` などを提供  
+  - LLVM IR から `declare` 呼び出しすることで、Python 組み込み風の関数を実装
+- `builtin/types.c / .h`  
+  - `String`, `PyInt`, `PyList` などの型を定義  
+  - 動的メモリ管理は Boehm GC に任せ、Python 的なオブジェクトを簡易的に再現
 
-このランタイムをリンクして最終的なバイナリを生成することにより、`print("Hello, world!")` などが動作します。
+これらのランタイムをリンクすることで、`print("Hello, world!")` やリスト操作などの処理が可能になります。
 
 ---
 
 ## 今後の予定 / 注意点
 
-- **型推論の強化**: 現在は非常に簡易的に int/str などを仮定しているのみ。関数呼び出しにおける引数・戻り値の型チェックなどは未実装に近いです。
-- **制御構文の拡張**: `if` 以外の制御構文 (`while`, `for`, `try` など) はまだ多くが未実装。
-- **クラス・例外対応**: クラス定義や例外処理など、Python の主要機能のほとんどは未対応。
-- **最適化パス**: 生成した LLVM IR をどのように最適化するかは今後の課題です。
-- **Windows など他プラットフォーム対応**: 開発環境は Unix 系 (Linux, macOS) を想定しています。Windows での動作確認は限定的です。
+- **型推論の強化**: まだ `int` / `str` など一部型にしか対応していない
+- **制御構文の拡張**: `while`, `for`, `try` やクラス定義は未実装
+- **最適化パス**: ほぼ `clang -O2` などに丸投げ。将来的に LLVM の最適化パスをカスタムする可能性あり
+- **Windows 等のサポート**: 開発は主に Unix 系 (Linux, macOS) を想定。Windows での検証は限定的です
 
-本プロジェクトはあくまで実験的段階のため、上記のように不完全な部分や将来的に大きな変更が入る可能性があります。
+本プロジェクトは実験的段階のため、今後仕様変更が入る場合があります。  
+興味を持っていただけた方は、連載ブログ記事やサンプルを参考に、ぜひ試してみてください！
 
 ---
 
 ## ライセンス
 
 本リポジトリのソースコードは、特記がない限り [MIT License](https://opensource.org/licenses/MIT) で配布されています。  
-詳細はソースコード内の記述（`pyc/__init__.py` など）をご参照ください。
+詳細はソースコード内の記述（`lython/__init__.py` など）をご参照ください。

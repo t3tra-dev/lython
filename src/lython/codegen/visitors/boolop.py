@@ -1,8 +1,8 @@
 import ast
 
-from pyc.codegen.ir.builder import IRBuilder
 from .base import BaseVisitor
 from .expr import ExprVisitor
+from ...codegen.ir.builder import IRBuilder
 
 
 class BoolOpVisitor(BaseVisitor):

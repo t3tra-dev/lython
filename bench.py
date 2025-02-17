@@ -24,7 +24,7 @@ def setup() -> None:
     for opt in optimization_levels:
         subprocess.run(f"clang ./benchmark/llfib.ll -o llfib_{opt} -{opt}".split())
 
-    subprocess.run("python -m pyc --compile ./benchmark/pyfib.py pyfib".split())
+    subprocess.run("python -m lythonc --compile ./benchmark/pyfib.py pyfib".split())
 
 
 def run_command(command: str) -> Tuple[str, float]:
@@ -80,13 +80,13 @@ def display_results(results: List[BenchmarkResult]):
     table.add_column("time", style="green")
     table.add_column("result", style="yellow")
 
-    pyc_time = next((result.execution_time for result in results if result.name == "Python(pyc)"), None)
+    lython_time = next((result.execution_time for result in results if result.name == "Lython"), None)
 
     sorted_results = sorted(results, key=lambda x: x.execution_time)
 
     for result in sorted_results:
         # "Python(pyc)"を基準に相対速度を計算
-        relative_speed = f"(x{result.execution_time / pyc_time:.2f})"  # type: ignore
+        relative_speed = f"(x{result.execution_time / lython_time:.2f})"  # type: ignore
         time_str = f"{result.execution_time * 1000:.2f}ms {relative_speed}"
         table.add_row(result.name, time_str, f"{result.output} ")
 

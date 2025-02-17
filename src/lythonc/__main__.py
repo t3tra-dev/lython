@@ -2,7 +2,7 @@ import os
 import sys
 from argparse import ArgumentParser
 
-from . import get_codegen, get_compiler
+from lython import get_codegen, get_compiler
 
 codegen = get_codegen()
 compiler = get_compiler()
