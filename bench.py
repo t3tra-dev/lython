@@ -59,7 +59,7 @@ def run_benchmarks() -> List[BenchmarkResult]:
         "LLVM(O1)": "./llfib_O1",
         "LLVM(O2)": "./llfib_O2",
         "LLVM(O3)": "./llfib_O3",
-        "Python(pyc)": "./pyfib",
+        "Lython": "./pyfib",
         "Python": "python ./benchmark/pyfib.py",
         "Python(no GIL)": "python3.13t -X gil=1 ./benchmark/pyfib.py"
     }
