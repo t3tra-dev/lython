@@ -24,7 +24,7 @@ def setup() -> None:
     for opt in optimization_levels:
         subprocess.run(f"clang ./benchmark/llfib.ll -o llfib_{opt} -{opt}".split())
 
-    subprocess.run("python -m lythonc --compile ./benchmark/pyfib.py pyfib".split())
+    subprocess.run("python -m lythonc ./benchmark/pyfib.py -o pyfib".split())
 
 
 def run_command(command: str) -> Tuple[str, float]:
