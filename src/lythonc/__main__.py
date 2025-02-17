@@ -12,60 +12,45 @@ def main():
     parser = ArgumentParser()
 
     parser.add_argument(
-        "--emit-llvm",
+        "-emit-llvm",
         help="Emit LLVM IR code",
-        metavar="<input-path>",
+        action='store_true'
+    )
+    parser.add_argument(
+        "-o",
+        help="Output file path",
+        metavar="<output-path>",
         type=str
     )
     parser.add_argument(
-        "--compile",
-        help="Compile Python code to machine code.",
-        nargs=2,
-        metavar=('<input-path>', '<output-path>'),
-        type=str
-    )
-    parser.add_argument(
-        "--dump-ast",
-        help="Dump the AST of the Python code",
+        "input_file",
+        help="Input Python file",
         metavar="<input-path>",
         type=str
     )
 
     args = parser.parse_args()
 
-    if not args.emit_llvm and not args.compile and not args.dump_ast:
+    if not args.emit_llvm and not args.o:
         print("Error: No option provided")
         parser.print_help()
         sys.exit(1)
 
-    if args.emit_llvm:
-        input_file = args.emit_llvm
-    elif args.compile:
-        input_file = args.compile[0]
-    elif args.dump_ast:
-        input_file = args.dump_ast
-
-    if not os.path.exists(input_file):
-        print(f"Error: File '{input_file}' does not exist.")
+    if not os.path.exists(args.input_file):
+        print(f"Error: File '{args.input_file}' does not exist.")
         parser.print_help()
         sys.exit(1)
 
     if args.emit_llvm:
         print("Generate LLVM IR...")
-        codegen.generate_llvm(args.emit_llvm)
-        print(f"Generated LLVM IR code at {args.emit_llvm}.ll")
+        codegen.generate_llvm(args.input_file)
+        print(f"Generated LLVM IR code at {args.input_file}.ll")
 
-    elif args.compile:
-        input_file, output_file = args.compile
-        print(f"Compiling {input_file} to machine code...")
-        compiler.ll2bin.compile(input_file, output_file)
+    elif args.o:
+        output_file = args.o
+        print(f"Compiling {args.input_file} to machine code...")
+        compiler.ll2bin.compile(args.input_file, output_file)
         print(f"Compiled Python code to machine code at {output_file}")
-
-    elif args.dump_ast:
-        print("The AST of the Python code is:")
-        with open(args.dump_ast) as f:
-            code = f.read()
-        print(codegen.dump_ast(code))
 
     else:
         print("Error: Invalid option provided.")
