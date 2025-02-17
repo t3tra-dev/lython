@@ -55,13 +55,14 @@ LLVM を基盤にしつつ、CPython とは異なる形で静的型付けのよ�
 │   └── pyfib.py
 ├── helloworld.ll              # サンプルの "Hello, world!" LLVM IR
 ├── src                        # メインソース
-│   └── lython
-│       ├── __init__.py
-│       ├── __main__.py        # CLIのエントリポイント
-│       ├── codegen
-│       │   ├── ir/            # LLVM IR を構築するためのビルダー等
-│       │   └── visitors/      # 各種 AST ノードへの Visitor 実装
-│       └── compiler/          # 生成された LLVM IR をバイナリに変換するロジック (ll2bin など)
+│   ├── lython
+│   │   ├── __init__.py
+│   │   ├── codegen
+│   │   │   ├── ir/            # LLVM IR を構築するためのビルダー等
+│   │   │   └── visitors/      # 各種 AST ノードへの Visitor 実装
+│   │   └── compiler/          # 生成された LLVM IR をバイナリに変換するロジック (ll2bin など)
+│   └── lythonc
+│       └── __main__.py        # CLIのエントリポイント
 ├── pyproject.toml             # Python プロジェクト管理用 (PEP 621)
 ├── runtime/                   # C で実装したランタイム (Boehm GC)
 │   └── builtin/
