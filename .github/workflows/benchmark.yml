@@ -16,9 +16,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-
       - name: "Set up Python"
         uses: actions/setup-python@v5
         with:
@@ -32,6 +29,8 @@ jobs:
           sudo bash -c "$(wget -O - https://apt.llvm.org/llvm.sh)"
           wget https://github.com/sharkdp/hyperfine/releases/download/v1.19.0/hyperfine_1.19.0_amd64.deb
           sudo dpkg -i hyperfine_1.19.0_amd64.deb
+          sudo curl -LsSf https://astral.sh/uv/install.sh | sh
+          uv sync
 
       - name: Build
         run: |
