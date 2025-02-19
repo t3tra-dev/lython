@@ -10,7 +10,7 @@ on:
 
 jobs:
   benchmark:
-    name: benchmark
+    name: Benchmark
     runs-on: ubuntu-latest
 
     steps:
