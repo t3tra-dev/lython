@@ -1,0 +1,45 @@
+name: Benchmark
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+  workflow_dispatch:
+
+jobs:
+  benchmark:
+    name: python
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: "Set up Python"
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: "pyproject.toml"
+
+      - name: Install hyperfine
+        run: |
+          wget https://github.com/sharkdp/hyperfine/releases/download/v1.19.0/hyperfine_1.19.0_amd64.deb
+          sudo dpkg -i hyperfine_1.19.0_amd64.deb
+
+      - name: Build
+        run: |
+          make clean && make
+          opt_levels=("O0" "O1" "O2" "O3")
+          for opt in "${opt_levels[@]}"; do
+              clang ./benchmark/cfib.c -o cfib_"$opt" -"$opt"
+          done
+          for opt in "${opt_levels[@]}"; do
+              clang ./benchmark/llfib.ll -o llfib_"$opt" -"$opt"
+          done
+          source .venv/bin/activate && python -m lythonc ./benchmark/pyfib.py -o pyfib
+      
+      - name: "Run Benchmarks"
+        run: hyperfine -w 30 -r 5 --sort command './pyfib' './cfib_O0' './cfib_O1' './cfib_O2' './cfib_O3' './llfib_O0' './llfib_O1' './llfib_O2' './llfib_O3'
