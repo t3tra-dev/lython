@@ -17,8 +17,8 @@ public:
 int main() {
     Person person1;
 
-    std::cout << person1.name << std::endl;
-    std::cout << person1.age() << std::endl;
+    puts(person1.name.c_str());
+    printf("%d\n", person1.age());
     person1.printName();
 
     return 0;
