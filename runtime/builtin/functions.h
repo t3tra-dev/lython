@@ -1,32 +1,25 @@
-#ifndef FUNCTIONS_H
-#define FUNCTIONS_H
+#ifndef LYTHON_FUNCTIONS_H
+#define LYTHON_FUNCTIONS_H
 
 #include <stddef.h>
-#include "types.h"
+#include "../builtin/objects/object.h"
+#include "../builtin/objects/unicodeobject.h"
+#include "../builtin/objects/intobject.h"
 
-// 文字列操作
-String* create_string(const char* src);
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-String* int2str(int value);
-String* str2str(String* s);
+/* 基本的な出力関数 */
+void print(PyObject *obj);
 
-// PyInt 生成/取得
-PyInt* PyInt_FromI32(int value);
-int PyInt_AsI32(PyInt* obj);
+/* 変換関数 */
+PyObject* int2str(int value);
+PyObject* str2str(PyObject *str);
+PyObject* create_string(const char *str);
 
-unsigned int hash_object(void *key);
+#ifdef __cplusplus
+}
+#endif
 
-// リスト操作
-PyList* PyList_New(int capacity);
-int PyList_Append(PyList *list, void *item);
-void* PyList_GetItem(PyList *list, int index);
-
-// 辞書操作
-PyDict* PyDict_New(int capacity);
-int PyDict_SetItem(PyDict *dict, void *key, void *value);
-void* PyDict_GetItem(PyDict *dict, void *key);
-
-// 出力関数
-void print(String* s);
-
-#endif // FUNCTIONS_H
+#endif /* LYTHON_FUNCTIONS_H */

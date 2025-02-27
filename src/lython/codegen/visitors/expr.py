@@ -5,7 +5,6 @@ from typing import Any
 
 from ..ir import IRBuilder
 from .base import BaseVisitor, TypedValue
-from .keyword import KeywordVisitor
 from .operator import OperatorVisitor
 
 __all__ = ["ExprVisitor"]
@@ -14,11 +13,12 @@ __all__ = ["ExprVisitor"]
 class ExprVisitor(BaseVisitor, ast.NodeVisitor):
     """
     式(expr)ノードの訪問を担当するクラス
-    静的型付き言語として扱う想定
-    - int は i32
-    - bool は i1
-    - str は string用の構造体ポインタ (IR上ではptr %struct.String*など)
-    などにマッピングする
+    以下のようなオブジェクト型に対応する
+    - int => PyInt (PyObject派生)
+    - bool => PyBool (PyObject派生)
+    - str => PyUnicodeObject (PyObject派生)
+    - list => PyListObject (PyObject派生)
+    - dict => PyDictObject (PyObject派生)
 
     ```asdl
           -- BoolOp() can use left & right?
@@ -69,7 +69,7 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
         """IR上の一時変数名を生成する"""
         return self.builder.get_temp_name()
 
-    def visit_BoolOp(self, node: ast.BoolOp) -> str:
+    def visit_BoolOp(self, node: ast.BoolOp) -> TypedValue:
         """
         ブールの論理演算を処理する
 
@@ -103,14 +103,9 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
         left_typed = self.visit(node.left)    # => TypedValue
         right_typed = self.visit(node.right)  # => TypedValue
 
-        # i32 同士の演算でない場合は未対応 (あるいは PyInt 同士の加算にする等)
-        if left_typed.type_ != "i32" or right_typed.type_ != "i32":
-            # 将来的にはPyIntなどの演算にも対応できるが、ここではエラーに
-            raise TypeError("BinOp: both operands must be i32 for now")
-
+        # OperatorVisitorに処理を委譲
         op_visitor: OperatorVisitor = self.get_subvisitor("operator")
-        result_typed = op_visitor.generate_op(node.op, left_typed, right_typed)
-        return result_typed
+        return op_visitor.generate_op(node.op, left_typed, right_typed)
 
     def visit_UnaryOp(self, node: ast.UnaryOp) -> None:
         """
@@ -144,43 +139,31 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
 
     def visit_Dict(self, node: ast.Dict) -> TypedValue:
         """
-        辞書リテラル
+        辞書リテラルを処理する。
+        PyDictObject*を生成し、キーと値のペアを追加する。
 
         ```asdl
         Dict(expr* keys, expr* values)
         ```
         """
-        num = max(len(node.keys), 8)
+        # 新しい辞書を作成
         temp_dict = self.get_temp_name()
-        self.builder.emit(f"  {temp_dict} = call ptr @PyDict_New(i32 {num})")
+        self.builder.emit(f"  {temp_dict} = call ptr @PyDict_New()")
 
+        # 各キーと値のペアを追加
         for k_node, v_node in zip(node.keys, node.values):
+            # キーと値を評価
             k_typed = self.visit(k_node)
             v_typed = self.visit(v_node)
 
-            # キーと値の型変換処理
-            key_ptr = self.get_temp_name()
-            val_ptr = self.get_temp_name()
+            # オブジェクトとして扱う
+            k_obj = self.ensure_object(k_typed)
+            v_obj = self.ensure_object(v_typed)
 
-            # キーの型変換
-            if k_typed.type_ == "i32":
-                self.builder.emit(f"  {key_ptr} = call ptr @PyInt_FromI32(i32 {k_typed.llvm_value})")
-            elif k_typed.type_ == "ptr":
-                key_ptr = k_typed.llvm_value
-            else:
-                raise TypeError(f"Unsupported key type for dict: {k_typed.type_}")
+            # 辞書に追加（参照カウントは自動で増加）
+            self.builder.emit(f"  call i32 @PyDict_SetItem(ptr {temp_dict}, ptr {k_obj.llvm_value}, ptr {v_obj.llvm_value})")
 
-            # 値の型変換
-            if v_typed.type_ == "i32":
-                self.builder.emit(f"  {val_ptr} = call ptr @PyInt_FromI32(i32 {v_typed.llvm_value})")
-            elif v_typed.type_ == "ptr":
-                val_ptr = v_typed.llvm_value
-            else:
-                raise TypeError(f"Unsupported value type for dict: {v_typed.type_}")
-
-            self.builder.emit(f"  call i32 @PyDict_SetItem(ptr {temp_dict}, ptr {key_ptr}, ptr {val_ptr})")
-
-        return TypedValue(temp_dict, "ptr")
+        return TypedValue.create_object(temp_dict, "dict")
 
     def visit_Set(self, node: ast.Set) -> None:
         """
@@ -276,108 +259,115 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> TypedValue:
         """
-        関数の呼び出しを処理する
+        関数呼び出しを処理する。
 
         ```asdl
         Call(expr func, expr* args, keyword* keywords)
         ```
         """
-        # 引数: node.args
-        # キーワード: node.keywords -> "keyword"ビジターに転送する
-        # 仮で func が単なる Name の場合の処理を継承
-        if not isinstance(node.func, ast.Name):
-            raise NotImplementedError("Only simple function calls supported (static)")
+        # 基本の関数呼び出し処理（print, strなど）
+        if isinstance(node.func, ast.Name):
+            func_name = node.func.id
 
-        func_name = node.func.id
+            # print関数の処理
+            if func_name == "print":
+                if len(node.args) != 1:
+                    raise NotImplementedError("Multiple/zero arguments for print() are not supported")
 
-        # キーワード引数 (例: print(x, sep=' ') など) は "keyword"ビジターへ
-        if node.keywords:
-            keyword_visitor: KeywordVisitor = self.get_subvisitor("keyword")
-            for kw in node.keywords:
-                # 仮
-                keyword_visitor.visit(kw)
+                # 引数を処理
+                arg_typed = self.visit(node.args[0])
 
-        # 従来の "print" や "str" などの実装を流用
-        return self.sample_call_implementation(func_name, node)
+                # 文字列化
+                str_value = self.get_temp_name()
 
-    def sample_call_implementation(self, func_name: str, node: ast.Call) -> TypedValue:
-        """
-        従来の実装の中身を切り出した補助メソッド。
-        """
-        if func_name == "print":
-            if len(node.args) != 1:
-                raise NotImplementedError("print() with multiple or zero args not supported")
-            arg_typed = self.visit(node.args[0])      # => TypedValue
-            if arg_typed.type_ != "ptr":
-                raise TypeError("print() argument must be ptr (e.g. String*)")
+                # すでに文字列型ならそのまま使用
+                if arg_typed.python_type == "str":
+                    str_value = arg_typed.llvm_value
+                else:
+                    # オブジェクトを文字列化（PyObject_Str を使用）
+                    obj_value = self.ensure_object(arg_typed)
+                    self.builder.emit(f"  {str_value} = call ptr @PyObject_Str(ptr {obj_value.llvm_value})")
 
-            # ここで llvm_value を使う
-            self.builder.emit(f"  call void @print(ptr {arg_typed.llvm_value})")
+                # print関数を呼び出し
+                self.builder.emit(f"  call void @print(ptr {str_value})")
 
-            # 関数呼び出し後、i32 0 相当を戻り値にする例
-            tmp = self.get_temp_name()
-            self.builder.emit(f"  {tmp} = add i32 0, 0 ; discard return")
-            return TypedValue(tmp, "i32")
-
-        elif func_name == "str":
-            if len(node.args) != 1:
-                raise NotImplementedError("str() with multiple/zero args not supported")
-
-            arg_val: TypedValue = self.visit(node.args[0])
-
-            # int (i32) を文字列に変換
-            if arg_val.type_ == "i32":
+                # 戻り値はNone
                 tmp = self.get_temp_name()
-                self.builder.emit(f"  {tmp} = call ptr @int2str(i32 {arg_val.llvm_value})")
-                return TypedValue(tmp, "ptr")  # 文字列ポインタを返す
+                self.builder.emit(f"  {tmp} = load ptr, ptr @Py_None")
+                self.builder.emit(f"  call void @Py_INCREF(ptr {tmp})")
+                return TypedValue.create_object(tmp, "None")
 
-            # PyInt型（ポインタ）の場合
-            elif arg_val.type_ == "ptr":
+            # str関数の処理
+            elif func_name == "str":
+                if len(node.args) != 1:
+                    raise NotImplementedError("Multiple/zero arguments for str() are not supported")
+
+                # 引数を処理
+                arg_typed = self.visit(node.args[0])
+
+                # オブジェクトに変換
+                obj_value = self.ensure_object(arg_typed)
+
+                # オブジェクトを文字列化
                 tmp = self.get_temp_name()
-                # まずPyInt_AsI32でアンボックス化
-                tmp2 = self.get_temp_name()
-                self.builder.emit(f"  {tmp2} = call i32 @PyInt_AsI32(ptr {arg_val.llvm_value})")
-                # 次にint2strで文字列に変換
-                self.builder.emit(f"  {tmp} = call ptr @int2str(i32 {tmp2})")
-                return TypedValue(tmp, "ptr")
+                self.builder.emit(f"  {tmp} = call ptr @PyObject_Str(ptr {obj_value.llvm_value})")
+                return TypedValue.create_object(tmp, "str")
 
+            # その他のユーザー定義関数
             else:
-                raise TypeError(f"str() does not support type '{arg_val.type_}'")
+                # 関数シグネチャを取得
+                sig = self.get_function_signature(func_name)
+                if sig is None:
+                    raise NameError(f"Function '{func_name}' not found")
 
+                arg_types, return_type, arg_python_types, return_python_type = sig
+
+                # 引数の数をチェック
+                if len(node.args) != len(arg_types):
+                    raise TypeError(f"Function '{func_name}' expects {len(arg_types)} arguments, but {len(node.args)} were given")
+
+                # 引数を処理
+                processed_args = []
+
+                for i, (arg_node, expected_type, expected_py_type) in enumerate(zip(node.args, arg_types, arg_python_types)):
+                    # 引数を評価
+                    arg_typed = self.visit(arg_node)
+
+                    # 型を調整
+                    if expected_type == "ptr" and expected_py_type != "object":
+                        # オブジェクト型が期待される場合
+                        arg_value = self.ensure_object(arg_typed)
+                    elif arg_typed.type_ != expected_type:
+                        # プリミティブ型が期待される場合
+                        if arg_typed.is_object:
+                            arg_value = self.get_unboxed_value(arg_typed, expected_type)
+                        else:
+                            # 型変換が必要な場合
+                            tmp = self.get_temp_name()
+                            self.builder.emit(f"  {tmp} = bitcast {arg_typed.type_} {arg_typed.llvm_value} to {expected_type}")
+                            arg_value = TypedValue.create_primitive(tmp, expected_type, arg_typed.python_type)
+                    else:
+                        # 型が一致する場合
+                        arg_value = arg_typed
+
+                    processed_args.append(arg_value)
+
+                # 引数リストを構築
+                arg_list = ", ".join(f"{arg.type_} {arg.llvm_value}" for arg in processed_args)
+
+                # 関数呼び出し
+                result = self.get_temp_name()
+                self.builder.emit(f"  {result} = call {return_type} @{func_name}({arg_list})")
+
+                # 戻り値の型を設定
+                if return_type == "ptr" and return_python_type != "object":
+                    return TypedValue.create_object(result, return_python_type)
+                else:
+                    return TypedValue.create_primitive(result, return_type, return_python_type)
+
+        # メソッド呼び出しなど、その他の関数呼び出し形式
         else:
-            # ユーザー定義関数
-            # シグネチャを取得
-            sig = self.get_function_signature(func_name)  # -> (arg_types: [str], return_type: str
-            if sig is None:
-                raise NameError(f"Unknown function: '{func_name}' not found in signatures")
-
-            arg_types, return_type = sig
-
-            # 引数の個数をチェック
-            if len(node.args) != len(arg_types):
-                raise TypeError(f"Function '{func_name}' expects {len(arg_types)} args, got {len(node.args)}")
-
-            # 引数を visit して TypedValue のリストを得る
-            arg_typedvals = [self.visit(a) for a in node.args]
-
-            # 各引数の型をシグネチャと照合し、IR用文字列を組み立て
-            ir_arg_list = []
-            for expected_t, actual_val in zip(arg_types, arg_typedvals):
-                if actual_val.type_ != expected_t:
-                    raise TypeError(
-                        f"Call to '{func_name}': arg type mismatch. "
-                        f"Expected {expected_t}, got {actual_val.type_}"
-                    )
-                ir_arg_list.append(f"{expected_t} {actual_val.llvm_value}")
-
-            joined_args = ", ".join(ir_arg_list)
-
-            # call命令を出力
-            ret_var = self.get_temp_name()
-            self.builder.emit(f"  {ret_var} = call {return_type} @{func_name}({joined_args})")
-
-            # 戻り値を TypedValue で返す
-            return TypedValue(ret_var, return_type)
+            raise NotImplementedError("Complex function calls are not supported")
 
     def visit_FormattedValue(self, node: ast.FormattedValue) -> None:
         """
@@ -401,28 +391,47 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
 
     def visit_Constant(self, node: ast.Constant) -> TypedValue:
         """
-        静的型に基づき、int/str等をネイティブ表現の即値に変換する
+        定数値を処理する。
+        Pythonオブジェクトとして適切に生成する。
+
         ```asdl
         Constant(constant value, string? kind)
         ```
         """
         val = node.value
+
         if isinstance(val, str):
-            # 文字列 -> ptr(String*)
+            # 文字列 -> PyUnicodeObject*
             gname = self.builder.add_global_string(val)
-            tmp = self.builder.get_temp_name()
-            self.builder.emit(f"  {tmp} = call ptr @create_string(ptr {gname})")
-            return TypedValue(tmp, "ptr")
+            tmp = self.get_temp_name()
+            self.builder.emit(f"  {tmp} = call ptr @PyUnicode_FromString(ptr {gname})")
+            return TypedValue.create_object(tmp, "str")
 
         elif isinstance(val, int):
-            # int -> PyInt_FromI32 -> ptr(PyInt*)
-            # tmp = self.builder.get_temp_name()
-            # self.builder.emit(f"  {tmp} = call ptr @PyInt_FromI32(i32 {val})")
-            # return TypedValue(tmp, "ptr")
-            return TypedValue(str(val), "i32")
+            # 整数 -> PyInt*
+            tmp = self.get_temp_name()
+            self.builder.emit(f"  {tmp} = call ptr @PyInt_FromI32(i32 {val})")
+            return TypedValue.create_object(tmp, "int")
+
+        elif isinstance(val, bool):
+            # 真偽値 -> Py_True/Py_False
+            if val:
+                tmp = self.get_temp_name()
+                self.builder.emit(f"  {tmp} = load ptr, ptr @Py_True")
+                self.builder.emit(f"  call void @Py_INCREF(ptr {tmp})")
+                return TypedValue.create_object(tmp, "bool")
+            else:
+                tmp = self.get_temp_name()
+                self.builder.emit(f"  {tmp} = load ptr, ptr @Py_False")
+                self.builder.emit(f"  call void @Py_INCREF(ptr {tmp})")
+                return TypedValue.create_object(tmp, "bool")
 
         elif val is None:
-            return TypedValue("null", "ptr")
+            # None -> Py_None
+            tmp = self.get_temp_name()
+            self.builder.emit(f"  {tmp} = load ptr, ptr @Py_None")
+            self.builder.emit(f"  call void @Py_INCREF(ptr {tmp})")
+            return TypedValue.create_object(tmp, "None")
 
         else:
             raise NotImplementedError(f"Unsupported constant type: {type(val)}")
@@ -447,32 +456,52 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
         """
         # まず基底のオブジェクトの評価
         base_val = self.visit(node.value)
-        # ここでは slice は Constant であると仮定
-        if not isinstance(node.slice, ast.Constant):
-            raise NotImplementedError("Subscript with non-constant index is not supported")
 
-        const_node = node.slice
-        # 定数が整数ならリストアクセス
-        if isinstance(const_node.value, int):
-            temp = self.get_temp_name()
-            # ランタイム関数 PyList_GetItem は (PyList*, int) を受け取り，
-            # 指定インデックスの値 (PyObject*) を返すと想定
-            self.builder.emit(f"  {temp} = call ptr @PyList_GetItem(ptr {base_val.llvm_value}, i32 {const_node.value})")
-            return TypedValue(temp, "ptr")
+        # オブジェクトを確保
+        base_obj = self.ensure_object(base_val)
 
-        # 定数が文字列なら辞書アクセス
-        elif isinstance(const_node.value, str):
-            # 定数文字列をグローバル定数として登録
-            key_const = self.builder.add_global_string(const_node.value)
-            temp = self.get_temp_name()
-            # ランタイム関数 PyDict_GetItem は (PyDict*, PyObject*) を受け取り，
-            # キーに対応する値 (PyObject*) を返すと想定
-            self.builder.emit(f"  {temp} = call ptr @PyDict_GetItem(ptr {base_val.llvm_value}, ptr {key_const})")
-            # 戻り値はPyInt*型なので、ptrとして返す
-            return TypedValue(temp, "ptr")
+        # スライスの評価
+        if isinstance(node.slice, ast.Constant):
+            # 定数インデックス
+            const_val = node.slice.value
 
+            if isinstance(const_val, int):
+                # 整数インデックス -> リストアクセス
+                idx_val = str(const_val)  # 直接数値を使用
+                temp = self.builder.get_temp_name()
+                self.builder.emit(f"  {temp} = call ptr @PyList_GetItem(ptr {base_obj.llvm_value}, i64 {idx_val})")
+
+                # 参照カウント増加（PyList_GetItemは借用参照を返す）
+                self.builder.emit(f"  call void @Py_INCREF(ptr {temp})")
+
+                return TypedValue.create_object(temp, "object")
+
+            elif isinstance(const_val, str):
+                # 文字列キー → 辞書アクセス
+                key_gname = self.builder.add_global_string(const_val)
+                key_obj = self.builder.get_temp_name()
+                self.builder.emit(f"  {key_obj} = call ptr @PyUnicode_FromString(ptr {key_gname})")
+
+                # 辞書から取得
+                temp = self.builder.get_temp_name()
+                self.builder.emit(f"  {temp} = call ptr @PyDict_GetItem(ptr {base_obj.llvm_value}, ptr {key_obj})")
+
+                # キーオブジェクトを解放
+                self.builder.emit(f"  call void @Py_DECREF(ptr {key_obj})")
+
+                # NULLチェック（簡略化）
+                self.builder.emit("  ; キーが存在するかチェック")
+
+                # 参照カウント増加（借用参照を自前で管理）
+                self.builder.emit(f"  call void @Py_INCREF(ptr {temp})")
+
+                return TypedValue.create_object(temp, "object")
+            else:
+                # その他の定数型はサポート外
+                raise TypeError(f"Subscript index of type {type(const_val).__name__} is not supported")
         else:
-            raise NotImplementedError("Subscript index constant must be int or str")
+            # 複雑なスライス式はサポート外
+            raise NotImplementedError("Complex slice expressions are not supported")
 
     def visit_Starred(self, node: ast.Starred) -> None:
         """
@@ -491,55 +520,73 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
         Name(identifier id, expr_context ctx)
         ```
         """
-        # True, False, None など特別対応
+        # True, False, None をオブジェクトとして扱う
         if node.id == "True":
-            t = self.get_temp_name()
-            self.builder.emit(f"  {t} = add i32 0, 1")
-            return TypedValue(t, "i32")
+            tmp = self.builder.get_temp_name()
+            self.builder.emit(f"  {tmp} = load ptr, ptr @Py_True")
+            self.builder.emit(f"  call void @Py_INCREF(ptr {tmp})")
+            return TypedValue.create_object(tmp, "bool")
 
         elif node.id == "False":
-            t = self.get_temp_name()
-            self.builder.emit(f"  {t} = add i32 0, 0")
-            return TypedValue(t, "i32")
+            tmp = self.builder.get_temp_name()
+            self.builder.emit(f"  {tmp} = load ptr, ptr @Py_False")
+            self.builder.emit(f"  call void @Py_INCREF(ptr {tmp})")
+            return TypedValue.create_object(tmp, "bool")
 
         elif node.id == "None":
-            return TypedValue("null", "ptr")
+            tmp = self.builder.get_temp_name()
+            self.builder.emit(f"  {tmp} = load ptr, ptr @Py_None")
+            self.builder.emit(f"  call void @Py_INCREF(ptr {tmp})")
+            return TypedValue.create_object(tmp, "None")
 
         else:
             # 変数ならシンボルテーブルから型を取得
-            var_type = self.get_symbol_type(node.id)
-            if var_type is None:
+            var_type_info = self.get_symbol_type(node.id)
+            if var_type_info is None:
                 raise NameError(f"Use of variable '{node.id}' before assignment")
 
-            # 変数をレジスタ名として返す
-            # ただし実際には store/load が必要だが、ここではレジスタ運用(単純化)
-            return TypedValue(f"%{node.id}", var_type)
+            # 型情報を展開
+            llvm_type, python_type, is_object = var_type_info
+
+            # 変数値を返す
+            var_value = f"%{node.id}"
+
+            # オブジェクトならば参照カウントを増やす
+            if is_object:
+                self.builder.emit(f"  call void @Py_INCREF(ptr {var_value})")
+                return TypedValue.create_object(var_value, python_type)
+            else:
+                return TypedValue.create_primitive(var_value, llvm_type, python_type)
 
     def visit_List(self, node: ast.List) -> TypedValue:
         """
-        リストリテラル
+        リストリテラルを処理する。
+        PyListObject*を生成し、要素を追加する。
+
         ```asdl
         List(expr* elts, expr_context ctx)
         ```
         """
-        num = max(len(node.elts), 8)
+        # 新しいリストを作成
+        size = len(node.elts)
         temp_list = self.get_temp_name()
-        self.builder.emit(f"  {temp_list} = call ptr @PyList_New(i32 {num})")
+        self.builder.emit(f"  {temp_list} = call ptr @PyList_New(i64 {size})")
 
-        for elt in node.elts:
-            elt_typed = self.visit(elt)  # -> TypedValue
-            if elt_typed.type_ == "i32":
-                # i32の場合は、PyInt_FromI32でポインタに変換
-                temp = self.get_temp_name()
-                self.builder.emit(f"  {temp} = call ptr @PyInt_FromI32(i32 {elt_typed.llvm_value})")
-                self.builder.emit(f"  call i32 @PyList_Append(ptr {temp_list}, ptr {temp})")
-            elif elt_typed.type_ == "ptr":
-                # すでにポインタの場合は直接追加
-                self.builder.emit(f"  call i32 @PyList_Append(ptr {temp_list}, ptr {elt_typed.llvm_value})")
-            else:
-                raise TypeError(f"Unsupported type for list element: {elt_typed.type_}")
+        # 各要素を追加
+        for i, elt in enumerate(node.elts):
+            # 要素を評価
+            elt_typed = self.visit(elt)
 
-        return TypedValue(temp_list, "ptr")
+            # すべての要素をオブジェクトとして扱う
+            elt_obj = self.ensure_object(elt_typed)
+
+            # 参照カウントを増やす（PyList_SetItemは参照を盗まないので）
+            self.builder.emit(f"  call void @Py_INCREF(ptr {elt_obj.llvm_value})")
+
+            # リストに追加
+            self.builder.emit(f"  call i32 @PyList_SetItem(ptr {temp_list}, i64 {i}, ptr {elt_obj.llvm_value})")
+
+        return TypedValue.create_object(temp_list, "list")
 
     def visit_Tuple(self, node: ast.Tuple) -> None:
         """
