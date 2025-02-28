@@ -6,24 +6,24 @@
 > Searching for **pyc**? You are in the right repo. **pyc** has been renamed to **Lython**.
 
 ```
-              🚀 Benchmark Results              
+              🚀 Benchmark Results               
 ┏━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━┓
 ┃ runtime        ┃ time              ┃ result   ┃
 ┡━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━┩
-│ LLVM(O1)       │ 15.71ms (x0.69)   │ 9227465  │
-│ C(O1)          │ 16.37ms (x0.72)   │ 9227465  │
-│ LLVM(O3)       │ 17.17ms (x0.76)   │ 9227465  │
-│ C(O3)          │ 17.30ms (x0.76)   │ 9227465  │
-│ C(O2)          │ 17.88ms (x0.79)   │ 9227465  │
-│ LLVM(O2)       │ 20.32ms (x0.90)   │ 9227465  │
-│ Lython         │ 22.68ms (x1.00)   │ 9227465  │
-│ LLVM(O0)       │ 23.15ms (x1.02)   │ 9227465  │
-│ C(O0)          │ 33.34ms (x1.47)   │ 9227465  │
-│ Bun            │ 54.52ms (x2.40)   │ 9227465  │
-│ Deno           │ 80.33ms (x3.54)   │ 9227465  │
-│ Node.js        │ 94.68ms (x4.17)   │ 9227465  │
-│ Python         │ 611.73ms (x26.97) │ 9227465  │
-│ Python(no GIL) │ 884.05ms (x38.97) │ 9227465  │
+│ LLVM(O1)       │ 15.64ms (x0.58)   │ 9227465  │
+│ C(O1)          │ 15.89ms (x0.59)   │ 9227465  │
+│ LLVM(O3)       │ 18.00ms (x0.67)   │ 9227465  │
+│ C(O2)          │ 18.31ms (x0.68)   │ 9227465  │
+│ C(O3)          │ 18.51ms (x0.69)   │ 9227465  │
+│ LLVM(O2)       │ 20.59ms (x0.77)   │ 9227465  │
+│ LLVM(O0)       │ 24.35ms (x0.91)   │ 9227465  │
+│ Lython         │ 26.75ms (x1.00)   │ 9227465  │
+│ C(O0)          │ 33.93ms (x1.27)   │ 9227465  │
+│ Bun            │ 52.09ms (x1.95)   │ 9227465  │
+│ Deno           │ 75.02ms (x2.80)   │ 9227465  │
+│ Node.js        │ 93.08ms (x3.48)   │ 9227465  │
+│ Python         │ 623.53ms (x23.31) │ 9227465  │
+│ Python(no GIL) │ 887.40ms (x33.18) │ 9227465  │
 └────────────────┴───────────────────┴──────────┘
 ```
 
@@ -34,7 +34,8 @@ LLVM を基盤にしつつ、CPython とは異なる形で静的型付けのよ�
 - **Python AST のトラバース**: Python の抽象構文木を解析して LLVM IR を生成
 - **ツールチェーン活用**: 生成した IR をさらに `clang` や `llc` などでコンパイルし、実行ファイル化を狙う
 - **実験的な静的型解析**: Python によるソースコード解析部分を簡易的に静的型チェック風に処理
-- **ランタイム (`runtime/`) の自前実装**: メモリ管理 (Boehm GC) や `print` 関数などを最低限 C 言語で提供
+- **CPython互換オブジェクトシステム**: CPythonのオブジェクトシステムに準拠したランタイム実装
+- **参照カウント方式のメモリ管理**: Boehm GCを基盤としつつ、CPython互換の参照カウント方式を実装
 
 ---
 
@@ -63,12 +64,12 @@ LLVM を基盤にしつつ、CPython とは異なる形で静的型付けのよ�
 │   └── lythonc
 │       └── __main__.py        # CLIのエントリポイント
 ├── pyproject.toml             # Python プロジェクト管理用 (PEP 621)
-├── runtime/                   # C で実装したランタイム (Boehm GC)
+├── runtime/                   # CPython互換のランタイム実装
 │   └── builtin/
-│       ├── functions.c
+│       ├── functions.c        # 基本的な組み込み関数の実装
 │       ├── functions.h
-│       ├── types.c
-│       └── types.h
+│       ├── macro_exports.c    # マクロのエクスポート
+│       └── objects/           # オブジェクトシステムの実装
 ├── samples/                   # 他言語から生成したIRのサンプル
 ├── Makefile                   # ランタイムのビルド用
 ├── source.py                  # Python のサンプルコード
@@ -160,16 +161,19 @@ python bench.py
 
 ## ランタイム
 
-`runtime/` ディレクトリ配下に C言語で実装した最小限のランタイム（Boehm GC 使用）が置かれています。
+`runtime/` ディレクトリ配下に C言語で実装したCPython互換のオブジェクトシステムが置かれています。
 
-- `builtin/functions.c / .h`  
-  - `PyInt_FromI32`, `PyList_New`, `int2str`, `print` などを提供  
-  - LLVM IR から `declare` 呼び出しすることで、Python 組み込み風の関数を実装
-- `builtin/types.c / .h`  
-  - `String`, `PyInt`, `PyList` などの型を定義  
-  - 動的メモリ管理は Boehm GC に任せ、Python 的なオブジェクトを簡易的に再現
+### オブジェクトシステム
 
-これらのランタイムをリンクすることで、`print("Hello, world!")` やリスト操作などの処理が可能になります。
+- **基本設計**: CPythonのオブジェクトシステムに準拠した設計
+- **参照カウント方式**: Boehm GCを基盤としつつ、`Py_INCREF`/`Py_DECREF`による参照カウント管理
+- **型オブジェクト**: `PyTypeObject`を中心とした型システムの実装
+
+### 組み込み関数
+
+- `runtime/builtin/functions.c` で基本的な組み込み関数を実装
+- `print` などの基本的な関数をサポート
+- LLVM IRからこれらの関数を呼び出すことで、Python風の動作を実現
 
 ---
 

@@ -12,9 +12,8 @@ __all__ = ["StmtVisitor"]
 
 class StmtVisitor(BaseVisitor):
     """
-    文(stmt)ノードを訪問しIRを生成する
-    静的型付けとして扱うためFunctionDefなどは引数型/戻り値型を注釈から参照し
-    IR上のシグネチャを決定する(のが理想だが、ここでは最低限の実装に留める)
+    文(stmt)ノードを訪問しIRを生成するクラス
+    オブジェクトシステムと連携して、Python オブジェクトの操作を行う
 
     ```asdl
     stmt = FunctionDef(identifier name, arguments args,
@@ -71,6 +70,8 @@ class StmtVisitor(BaseVisitor):
         super().__init__(builder)
         self.expr_visitor = ExprVisitor(builder)
         self.current_return_type = "i32"
+        self.current_return_python_type = "int"
+        self.current_function_is_object_return = False
 
         # ExprVisitorとシンボルテーブルを共有
         self.expr_visitor.symbol_table = self.symbol_table
@@ -79,72 +80,82 @@ class StmtVisitor(BaseVisitor):
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         """
         関数定義:
-          def hoge(n: int) -> int:
-              ...
+        def hoge(n: int) -> int:
+            ...
         などを受け取り、静的型のIRを生成する
-
-        ```asdl
-        FunctionDef(
-            identifier name,
-            arguments args,
-            stmt* body,
-            expr* decorator_list,
-            expr? returns,
-            string? type_comment,
-            type_param* type_params
-        )
-        ```
         """
         func_name = node.name
 
         # 引数の型を解析
+        arg_names = []
         arg_types = []
+        arg_python_types = []
 
         for arg in node.args.args:
-            arg_type = "i32"  # デフォルト値
+            llvm_type = "ptr"  # デフォルトはオブジェクト型
+            python_type = "object"
+            is_object = True
 
             if arg.annotation:
                 if isinstance(arg.annotation, ast.Name):
-                    if arg.annotation.id == "int":
-                        arg_type = "i32"
-                    elif arg.annotation.id == "str":
-                        arg_type = "ptr"
+                    python_type = arg.annotation.id
+                    if python_type == "int":
+                        llvm_type = "i32"
+                        is_object = False
+                    elif python_type == "str":
+                        llvm_type = "ptr"
+                        is_object = True
+                    elif python_type == "bool":
+                        llvm_type = "i1"
+                        is_object = False
+                    elif python_type in self.builder.known_python_types:
+                        llvm_type = "ptr"
+                        is_object = True
                     else:
-                        raise NotImplementedError(f"Unsupported annotation: {arg.annotation.id}")
+                        llvm_type = "ptr"
+                        is_object = True
                 else:
-                    raise NotImplementedError("Complex annotations not supported")
+                    raise NotImplementedError(f"Complex type annotations are not supported: {arg.annotation}")
 
-            # シンボルテーブルに引数を登録
-            self.set_symbol_type(arg.arg, arg_type)
-            arg_types.append(arg_type)
+            # 引数はポインタではなく値として登録
+            self.set_symbol_type(arg.arg, llvm_type, python_type, is_object)
+            arg_types.append(llvm_type)
+            arg_python_types.append(python_type)
+            arg_names.append(arg.arg)
 
         # 戻り値型を解析
+        return_llvm_type = "ptr"  # デフォルトはオブジェクト型
+        return_python_type = "object"
+        is_object_return = True
+
         if node.returns is not None and isinstance(node.returns, ast.Name):
-            if node.returns.id == "int":
-                return_type = "i32"
-            elif node.returns.id == "str":
-                return_type = "ptr"
-            else:
-                raise NotImplementedError(f"Unsupported return annotation: {node.returns.id}")
-        else:
-            # fallback
-            return_type = "i32"  # or raise error
+            return_python_type = node.returns.id
+            # ビルダーの型レジストリを使用
+            return_llvm_type = self.builder.get_python_type_llvm(return_python_type)
+            is_object_return = return_llvm_type == "ptr" and return_python_type != "None"
+        elif node.returns is None:
+            # 戻り値型が指定されていない場合はNoneを返す
+            return_llvm_type = "ptr"
+            return_python_type = "None"
+            is_object_return = True
 
         # この関数のシグネチャを登録
-        self.set_function_signature(func_name, arg_types, return_type)
+        self.set_function_signature(
+            func_name, arg_types, return_llvm_type, arg_python_types, return_python_type
+        )
 
         # 現在の関数の戻り値型を更新
-        self.current_return_type = return_type
+        self.current_return_type = return_llvm_type
+        self.current_return_python_type = return_python_type
+        self.current_function_is_object_return = is_object_return
 
         # IR出力
         self.builder.emit("")
         self.builder.emit(f"; Function definition: {func_name}")
 
         # LLVM IR の仮引数部
-        joined_args = ", ".join(
-            f"{t} %{arg.arg}" for t, arg in zip(arg_types, node.args.args)
-        )
-        self.builder.emit(f"define {return_type} @{func_name}({joined_args}) #0 {{")
+        joined_args = ", ".join(f"{t} %{arg_name}" for t, arg_name in zip(arg_types, arg_names))
+        self.builder.emit(f"define {return_llvm_type} @{func_name}({joined_args}) #0 {{")
         self.builder.emit("entry:")
 
         # 関数ボディの処理
@@ -154,11 +165,22 @@ class StmtVisitor(BaseVisitor):
                 has_return = True
             self.visit(s)
 
+        # 明示的なreturnがない場合、デフォルト値を返す
         if not has_return:
-            if return_type == "i32":
+            if return_llvm_type == "i32":
                 self.builder.emit("  ret i32 0")
-            elif return_type == "ptr":
-                self.builder.emit("  ret ptr null")
+            elif return_llvm_type == "i1":
+                self.builder.emit("  ret i1 false")
+            elif return_llvm_type == "ptr":
+                if return_python_type == "None":
+                    # None を返す
+                    tmp = self.builder.get_temp_name()
+                    self.builder.emit(f"  {tmp} = load ptr, ptr @Py_None")
+                    self.builder.emit(f"  call void @Py_INCREF(ptr {tmp})")
+                    self.builder.emit(f"  ret ptr {tmp}")
+                else:
+                    # 未定義の場合は NULL を返す
+                    self.builder.emit("  ret ptr null")
             else:
                 self.builder.emit("  ret void")
 
@@ -211,16 +233,38 @@ class StmtVisitor(BaseVisitor):
             # デフォルトの戻り値
             if self.current_return_type == "i32":
                 self.builder.emit("  ret i32 0")
+            elif self.current_return_type == "i1":
+                self.builder.emit("  ret i1 false")
             elif self.current_return_type == "ptr":
-                self.builder.emit("  ret ptr null")
+                if self.current_return_python_type == "None":
+                    # None を返す
+                    tmp = self.builder.get_temp_name()
+                    self.builder.emit(f"  {tmp} = load ptr, ptr @Py_None")
+                    self.builder.emit(f"  call void @Py_INCREF(ptr {tmp})")
+                    self.builder.emit(f"  ret ptr {tmp}")
+                else:
+                    # 未定義の場合は NULL を返す
+                    self.builder.emit("  ret ptr null")
             else:
                 self.builder.emit("  ret void")
         else:
-            val_tv = self.expr_visitor.visit(node.value)  # => TypedValue
-            # 型チェック
-            if val_tv.type_ != self.current_return_type:
-                raise TypeError(f"Return type mismatch, expected {self.current_return_type}, got {val_tv.type_}")
-            self.builder.emit(f"  ret {val_tv.type_} {val_tv.llvm_value}")
+            # 式を評価して戻り値を取得
+            val_typed = self.expr_visitor.visit(node.value)
+
+            # 戻り値の型変換が必要な場合
+            if val_typed.type_ != self.current_return_type:
+                if self.current_function_is_object_return and not val_typed.is_object:
+                    # プリミティブ型をオブジェクト型に変換（ボクシング）
+                    val_typed = self.get_boxed_value(val_typed)
+                elif not self.current_function_is_object_return and val_typed.is_object:
+                    # オブジェクト型をプリミティブ型に変換（アンボクシング）
+                    val_typed = self.get_unboxed_value(val_typed, self.current_return_type)
+                else:
+                    # 型変換が必要な場合は警告
+                    self.builder.emit(f"  ; Warning: Return type mismatch, expected {self.current_return_type}, got {val_typed.type_}")
+
+            # 戻り値を返す
+            self.builder.emit(f"  ret {val_typed.type_} {val_typed.llvm_value}")
 
     def visit_Delete(self, node: ast.Delete) -> None:
         """
@@ -241,39 +285,67 @@ class StmtVisitor(BaseVisitor):
         ```
         """
         if len(node.targets) != 1:
-            raise NotImplementedError("Multi-target assignment not supported")
+            raise NotImplementedError("Assignment to multiple targets is not supported")
+
         target = node.targets[0]
         if not isinstance(target, ast.Name):
-            raise NotImplementedError("Only assignment to a variable (Name) is supported")
+            raise NotImplementedError("Assignment to non-name targets is not supported")
 
         # 右辺を評価
-        rhs_typed = self.expr_visitor.visit(node.value)  # -> TypedValue
-        rhs_type = rhs_typed.type_
+        rhs_typed = self.expr_visitor.visit(node.value)
+        var_name = target.id
 
-        var_name = f"%{target.id}"
+        # 既存の型情報を取得
+        existing_type_info = self.get_symbol_type(var_name)
 
-        # 既にシンボルテーブルに型情報があるかどうか
-        existing_type = self.get_symbol_type(target.id)
-        if existing_type is None:
-            # 初回代入 -> シンボルテーブルに登録
-            self.set_symbol_type(target.id, rhs_type)
-            existing_type = rhs_type
+        if existing_type_info is None:
+            # 初回代入の場合
+            llvm_type = rhs_typed.type_
+            python_type = rhs_typed.python_type
+            is_object = rhs_typed.is_object
+
+            # シンボルテーブルに登録
+            self.set_symbol_type(var_name, llvm_type, python_type, is_object)
+
+            # 代入操作
+            self.builder.emit(f"  %{var_name} = alloca {llvm_type}")
+            self.builder.emit(f"  store {llvm_type} {rhs_typed.llvm_value}, ptr %{var_name}")
+
+            # オブジェクトの場合は参照カウント増加
+            if is_object:
+                self.builder.emit(f"  call void @Py_INCREF(ptr {rhs_typed.llvm_value})")
+
         else:
-            # 型が合わない場合はエラー
-            if existing_type != rhs_type:
-                raise TypeError(f"Type mismatch: variable '{target.id}' is {existing_type}, but RHS is {rhs_type}")
+            # 再代入の場合
+            llvm_type, python_type, is_object = existing_type_info
 
-        # ここで "代入" 相当の LLVM IR を生成
-        if existing_type == "i32":
-            # i32 の場合 -> add i32 0, ...
-            self.builder.emit(f"  {var_name} = add i32 0, {rhs_typed.llvm_value} ; assignment to {target.id}")
-        elif existing_type == "ptr":
-            # ptr の場合 -> bitcast (もしくは単純に =)
-            # LLVM IRでは「%var = bitcast ptr %rhs to ptr」が実質的に無意味
-            # SSA 上「新レジスタを作る」ためにダミーのno-opを発行する:
-            self.builder.emit(f"  {var_name} = bitcast ptr {rhs_typed.llvm_value} to ptr ; assignment to {target.id}")
-        else:
-            raise NotImplementedError(f"Unsupported type for assignment: {existing_type}")
+            # 型変換が必要な場合
+            if rhs_typed.type_ != llvm_type:
+                if is_object and not rhs_typed.is_object:
+                    # プリミティブ型をオブジェクト型に変換（ボクシング）
+                    rhs_typed = self.get_boxed_value(rhs_typed)
+                elif not is_object and rhs_typed.is_object:
+                    # オブジェクト型をプリミティブ型に変換（アンボクシング）
+                    rhs_typed = self.get_unboxed_value(rhs_typed, llvm_type)
+                else:
+                    # その他の型変換
+                    tmp = self.builder.get_temp_name()
+                    self.builder.emit(f"  {tmp} = bitcast {rhs_typed.type_} {rhs_typed.llvm_value} to {llvm_type}")
+                    rhs_typed = TypedValue(tmp, llvm_type, python_type, is_object)
+
+            # オブジェクトの場合は古い値の参照カウント減少
+            if is_object:
+                old_val = self.builder.get_temp_name()
+                # 修正: ptr* ではなく ptr を使用
+                self.builder.emit(f"  {old_val} = load {llvm_type}, ptr %{var_name}")
+                self.builder.emit(f"  call void @Py_DECREF(ptr {old_val})")
+
+            # 新しい値を格納
+            self.builder.emit(f"  store {llvm_type} {rhs_typed.llvm_value}, ptr %{var_name}")
+
+            # オブジェクトの場合は新しい値の参照カウント増加
+            if is_object:
+                self.builder.emit(f"  call void @Py_INCREF(ptr {rhs_typed.llvm_value})")
 
     def visit_TypeAlias(self, node: ast.TypeAlias) -> None:
         """
@@ -370,40 +442,60 @@ class StmtVisitor(BaseVisitor):
               ...
           else:
               ...
-        静的に i32(0以外) をtrueとみなすなど
 
         ```asdl
         If(expr test, stmt* body, stmt* orelse)
         ```
         """
-        cond_typed: TypedValue = self.expr_visitor.visit(node.test)
-        cond_val = cond_typed.llvm_value
+        # 条件を評価
+        cond_typed = self.expr_visitor.visit(node.test)
 
-        # i32 -> i1
-        tmp_bool = self.builder.get_temp_name()
-        self.builder.emit(f"  {tmp_bool} = icmp ne i32 {cond_val}, 0")
+        # 条件がすでにi1型（ブール値）でない場合は変換
+        if cond_typed.type_ != "i1":
+            if cond_typed.type_ == "i32":
+                # 整数を真偽値に変換
+                tmp = self.builder.get_temp_name()
+                self.builder.emit(f"  {tmp} = icmp ne i32 {cond_typed.llvm_value}, 0")
+                cond_typed = TypedValue(tmp, "i1", "bool", False)
+            elif cond_typed.is_object:
+                # オブジェクトを真偽値に変換
+                tmp = self.builder.get_temp_name()
+                self.builder.emit(f"  {tmp} = call i32 @PyObject_IsTrue(ptr {cond_typed.llvm_value})")
+                bool_tmp = self.builder.get_temp_name()
+                self.builder.emit(f"  {bool_tmp} = icmp ne i32 {tmp}, 0")
+                cond_typed = TypedValue(bool_tmp, "i1", "bool", False)
 
+        # 分岐ラベルを生成
         then_label = f"if.then.{self.builder.get_label_counter()}"
         else_label = f"if.else.{self.builder.get_label_counter()}"
         end_label = f"if.end.{self.builder.get_label_counter()}"
 
-        # 分岐
-        self.builder.emit(f"  br i1 {tmp_bool}, label %{then_label}, label %{else_label}")
+        # 分岐命令
+        self.builder.emit(f"  br i1 {cond_typed.llvm_value}, label %{then_label}, label %{else_label}")
 
-        # then
+        # Then節
         self.builder.emit(f"{then_label}:")
-        for s in node.body:
-            self.visit(s)
-        self.builder.emit(f"  br label %{end_label}")
+        has_then_return = False
+        for stmt in node.body:
+            if isinstance(stmt, ast.Return):
+                has_then_return = True
+            self.visit(stmt)
+        if not has_then_return:
+            self.builder.emit(f"  br label %{end_label}")
 
-        # else
+        # Else節
         self.builder.emit(f"{else_label}:")
-        for s in node.orelse:
-            self.visit(s)
-        self.builder.emit(f"  br label %{end_label}")
+        has_else_return = False
+        for stmt in node.orelse:
+            if isinstance(stmt, ast.Return):
+                has_else_return = True
+            self.visit(stmt)
+        if not has_else_return:
+            self.builder.emit(f"  br label %{end_label}")
 
-        # end
-        self.builder.emit(f"{end_label}:")
+        # 終了ラベル
+        if not (has_then_return and has_else_return):  # 両方のパスでreturnがある場合は不要
+            self.builder.emit(f"{end_label}:")
 
     def visit_With(self, node: ast.With) -> None:
         """
@@ -534,9 +626,12 @@ class StmtVisitor(BaseVisitor):
         Expr(expr value)
         ```
         """
-        _ = self.expr_visitor.visit(node.value)
-        # discard
-        return None
+        # 式を評価し、戻り値を破棄
+        typed_val = self.expr_visitor.visit(node.value)
+
+        # オブジェクトの場合は参照カウント減少（評価結果が一時的に増加するため）
+        if typed_val.is_object:
+            self.builder.emit(f"  call void @Py_DECREF(ptr {typed_val.llvm_value})")
 
     def visit_Pass(self, node: ast.Pass) -> None:
         """

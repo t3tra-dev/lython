@@ -20,6 +20,7 @@ class ModVisitor(BaseVisitor):
         | Interactive(stmt* body)
         | Expression(expr body)
         | FunctionType(expr* argtypes, expr returns)
+    ```
     """
 
     def __init__(self, builder: IRBuilder):
@@ -45,8 +46,9 @@ class ModVisitor(BaseVisitor):
         self.builder.emit("\ndefine i32 @main(i32 %argc, i8** %argv) {")
         self.builder.emit("entry:")
 
-        # Boehm GCの初期化
+        # Boehm GCとオブジェクトシステムの初期化
         self.builder.emit("  call void @GC_init()")
+        self.builder.emit("  call void @PyObject_InitSystem()")
 
         # 関数定義以外のステートメントを処理
         for stmt in node.body:
