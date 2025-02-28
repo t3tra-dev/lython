@@ -11,5 +11,5 @@ person1 = Person("Alice")
 
 
 print(person1.name)
-print(person1.age)
+print(str(person1.age))
 person1.print_name()
