@@ -34,7 +34,8 @@ LLVM を基盤にしつつ、CPython とは異なる形で静的型付けのよ�
 - **Python AST のトラバース**: Python の抽象構文木を解析して LLVM IR を生成
 - **ツールチェーン活用**: 生成した IR をさらに `clang` や `llc` などでコンパイルし、実行ファイル化を狙う
 - **実験的な静的型解析**: Python によるソースコード解析部分を簡易的に静的型チェック風に処理
-- **ランタイム (`runtime/`) の自前実装**: メモリ管理 (Boehm GC) や `print` 関数などを最低限 C 言語で提供
+- **CPython互換オブジェクトシステム**: CPythonのオブジェクトシステムに準拠したランタイム実装
+- **参照カウント方式のメモリ管理**: Boehm GCを基盤としつつ、CPython互換の参照カウント方式を実装
 
 ---
 
@@ -63,12 +64,12 @@ LLVM を基盤にしつつ、CPython とは異なる形で静的型付けのよ�
 │   └── lythonc
 │       └── __main__.py        # CLIのエントリポイント
 ├── pyproject.toml             # Python プロジェクト管理用 (PEP 621)
-├── runtime/                   # C で実装したランタイム (Boehm GC)
+├── runtime/                   # CPython互換のランタイム実装
 │   └── builtin/
-│       ├── functions.c
+│       ├── functions.c        # 基本的な組み込み関数の実装
 │       ├── functions.h
-│       ├── types.c
-│       └── types.h
+│       ├── macro_exports.c    # マクロのエクスポート
+│       └── objects/           # オブジェクトシステムの実装
 ├── samples/                   # 他言語から生成したIRのサンプル
 ├── Makefile                   # ランタイムのビルド用
 ├── source.py                  # Python のサンプルコード
@@ -160,16 +161,19 @@ python bench.py
 
 ## ランタイム
 
-`runtime/` ディレクトリ配下に C言語で実装した最小限のランタイム（Boehm GC 使用）が置かれています。
+`runtime/` ディレクトリ配下に C言語で実装したCPython互換のオブジェクトシステムが置かれています。
 
-- `builtin/functions.c / .h`  
-  - `PyInt_FromI32`, `PyList_New`, `int2str`, `print` などを提供  
-  - LLVM IR から `declare` 呼び出しすることで、Python 組み込み風の関数を実装
-- `builtin/types.c / .h`  
-  - `String`, `PyInt`, `PyList` などの型を定義  
-  - 動的メモリ管理は Boehm GC に任せ、Python 的なオブジェクトを簡易的に再現
+### オブジェクトシステム
 
-これらのランタイムをリンクすることで、`print("Hello, world!")` やリスト操作などの処理が可能になります。
+- **基本設計**: CPythonのオブジェクトシステムに準拠した設計
+- **参照カウント方式**: Boehm GCを基盤としつつ、`Py_INCREF`/`Py_DECREF`による参照カウント管理
+- **型オブジェクト**: `PyTypeObject`を中心とした型システムの実装
+
+### 組み込み関数
+
+- `runtime/builtin/functions.c` で基本的な組み込み関数を実装
+- `print` などの基本的な関数をサポート
+- LLVM IRからこれらの関数を呼び出すことで、Python風の動作を実現
 
 ---
 
