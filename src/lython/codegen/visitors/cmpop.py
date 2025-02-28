@@ -70,6 +70,24 @@ class CmpOpVisitor(BaseVisitor):
         """プリミティブ型同士の比較"""
         tmp_bool = self.builder.get_temp_name()
 
+        # 整数型の場合は直接比較で最適化
+        if left.type_ == "i32" and right.type_ == "i32":
+            if op_type == ast.Eq:
+                self.builder.emit(f"  {tmp_bool} = icmp eq i32 {left.llvm_value}, {right.llvm_value}")
+            elif op_type == ast.NotEq:
+                self.builder.emit(f"  {tmp_bool} = icmp ne i32 {left.llvm_value}, {right.llvm_value}")
+            elif op_type == ast.Lt:
+                self.builder.emit(f"  {tmp_bool} = icmp slt i32 {left.llvm_value}, {right.llvm_value}")
+            elif op_type == ast.LtE:
+                self.builder.emit(f"  {tmp_bool} = icmp sle i32 {left.llvm_value}, {right.llvm_value}")
+            elif op_type == ast.Gt:
+                self.builder.emit(f"  {tmp_bool} = icmp sgt i32 {left.llvm_value}, {right.llvm_value}")
+            elif op_type == ast.GtE:
+                self.builder.emit(f"  {tmp_bool} = icmp sge i32 {left.llvm_value}, {right.llvm_value}")
+
+            # i1を返す（直接使用可能なブール値）
+            return TypedValue.create_primitive(tmp_bool, "i1", "bool")
+
         if op_type == ast.Eq:
             self.builder.emit(f"  {tmp_bool} = icmp eq {left.type_} {left.llvm_value}, {right.llvm_value}")
         elif op_type == ast.NotEq:

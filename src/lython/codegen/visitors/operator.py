@@ -46,60 +46,34 @@ class OperatorVisitor(BaseVisitor):
         - op_node: ast.Add / ast.Sub などの演算子ノード
         - left, right: 左右のオペランド
         """
-        # 両方ともプリミティブ型の場合は直接計算
+        # 両方ともプリミティブ型の場合は直接計算（特にint型）
         if (
-            not left.is_object
-            and not right.is_object  # noqa
-            and left.type_ == right.type_ # noqa
-            and left.type_ in ("i32", "i1")  # noqa
+            not left.is_object and not right.is_object
+            and left.python_type == "int" and right.python_type == "int"  # noqa
         ):
-            return self._generate_primitive_op(op_node, left, right)
+            return self._generate_direct_primitive_op(op_node, left, right)
 
-        # オブジェクト演算の場合はメソッド呼び出し
+        # 他のケースではオブジェクト演算
         return self._generate_object_op(op_node, left, right)
 
-    def _generate_primitive_op(self, op_node: ast.AST, left: TypedValue, right: TypedValue) -> TypedValue:
-        """プリミティブ型同士の演算"""
-        op_name = self.visit(op_node)  # "Add" / "Sub" / etc.
-        result_name = self.builder.get_temp_name()
+    def _generate_direct_primitive_op(self, op_node: ast.AST, left: TypedValue, right: TypedValue) -> TypedValue:
+        """整数型の二項演算を直接LLVM命令で実装"""
+        result = self.builder.get_temp_name()
 
-        # ここでは left/right ともに i32 前提
-        assert left.type_ == "i32" and right.type_ == "i32", \
-            f"Operator {op_name} expects i32, got {left.type_} and {right.type_}"
-
-        # ここでは left/right ともに i32 前提
-        assert left.type_ == "i32" and right.type_ == "i32", \
-            f"Operator {op_name} expects i32, got {left.type_} and {right.type_}"
-
-        lv = left.llvm_value
-        rv = right.llvm_value
-
-        if op_name == "Add":
-            self.builder.emit(f"  {result_name} = add {left.type_} {lv}, {rv}")
-        elif op_name == "Sub":
-            self.builder.emit(f"  {result_name} = sub {left.type_} {lv}, {rv}")
-        elif op_name == "Mult":
-            self.builder.emit(f"  {result_name} = mul {left.type_} {lv}, {rv}")
-        elif op_name == "Div":
-            self.builder.emit(f"  {result_name} = sdiv {left.type_} {lv}, {rv}")
-        elif op_name == "Mod":
-            self.builder.emit(f"  {result_name} = srem {left.type_} {lv}, {rv}")
-        elif op_name == "BitOr":
-            self.builder.emit(f"  {result_name} = or {left.type_} {lv}, {rv}")
-        elif op_name == "BitXor":
-            self.builder.emit(f"  {result_name} = xor {left.type_} {lv}, {rv}")
-        elif op_name == "BitAnd":
-            self.builder.emit(f"  {result_name} = and {left.type_} {lv}, {rv}")
-        elif op_name == "LShift":
-            self.builder.emit(f"  {result_name} = shl {left.type_} {lv}, {rv}")
-        elif op_name == "RShift":
-            self.builder.emit(f"  {result_name} = ashr {left.type_} {lv}, {rv}")
-        elif op_name == "FloorDiv":
-            self.builder.emit(f"  {result_name} = sdiv {left.type_} {lv}, {rv}")
+        if isinstance(op_node, ast.Add):
+            self.builder.emit(f"  {result} = add i32 {left.llvm_value}, {right.llvm_value}")
+        elif isinstance(op_node, ast.Sub):
+            self.builder.emit(f"  {result} = sub i32 {left.llvm_value}, {right.llvm_value}")
+        elif isinstance(op_node, ast.Mult):
+            self.builder.emit(f"  {result} = mul i32 {left.llvm_value}, {right.llvm_value}")
+        elif isinstance(op_node, ast.Div) or isinstance(op_node, ast.FloorDiv):
+            self.builder.emit(f"  {result} = sdiv i32 {left.llvm_value}, {right.llvm_value}")
+        elif isinstance(op_node, ast.Mod):
+            self.builder.emit(f"  {result} = srem i32 {left.llvm_value}, {right.llvm_value}")
         else:
-            raise NotImplementedError(f"Unknown cmpop '{op_name}'")
+            raise NotImplementedError(f"Unsupported primitive operation: {type(op_node).__name__}")
 
-        return TypedValue.create_primitive(result_name, left.type_, left.python_type)
+        return TypedValue.create_primitive(result, "i32", "int")
 
     def _generate_object_op(self, op_node: ast.AST, left: TypedValue, right: TypedValue) -> TypedValue:
         """オブジェクト同士の演算 (PyNumber_* メソッドを使用)"""

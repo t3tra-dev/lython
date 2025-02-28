@@ -76,6 +76,9 @@ class BaseVisitor:
         # サブビジターの辞書。各キーは ASTノードのクラス名
         self.subvisitors: Dict[str, BaseVisitor] = {}
 
+        # 現在の関数のパラメータを追跡
+        self.current_function_params = set()
+
     def _init_subvisitors(self):
         from .alias import AliasVisitor
         from .arg import ArgVisitor
@@ -163,8 +166,9 @@ class BaseVisitor:
             temp = self.builder.get_temp_name()
             self.builder.emit(f"  {temp} = call ptr @PyBool_FromLong(i32 {typed_value.llvm_value})")
             return TypedValue.create_object(temp, "bool")
+        # 他の型も必要に応じて追加
 
-        # その他のプリミティブ型（未実装）
+        # 未サポートのプリミティブ型
         return typed_value
 
     def get_unboxed_value(self, typed_value: TypedValue, target_type: str) -> TypedValue:
@@ -184,9 +188,23 @@ class BaseVisitor:
             bool_temp = self.builder.get_temp_name()
             self.builder.emit(f"  {bool_temp} = icmp ne i32 {temp}, 0")
             return TypedValue.create_primitive(bool_temp, "i1", "bool")
+        # 他の型も必要に応じて追加
 
-        # その他のオブジェクト型（未実装）
+        # 未サポートのオブジェクト型
         return typed_value
+
+    # 関数パラメータ管理メソッドを追加
+    def add_function_parameter(self, param_name: str):
+        """現在の関数のパラメータとして名前を登録"""
+        self.current_function_params.add(param_name)
+
+    def clear_function_parameters(self):
+        """関数パラメータリストをクリア"""
+        self.current_function_params.clear()
+
+    def is_function_parameter(self, name: str) -> bool:
+        """指定された名前が現在の関数のパラメータかどうかを返す"""
+        return name in self.current_function_params
 
     def ensure_object(self, typed_value: TypedValue) -> TypedValue:
         """値がオブジェクトであることを保証(必要に応じてボックス化)"""

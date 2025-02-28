@@ -246,13 +246,39 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
         raise NotImplementedError("YieldFrom expression not implemented")
 
     def visit_Compare(self, node: ast.Compare) -> TypedValue:
-        """
-        比較演算を処理する
+        """比較演算の処理"""
+        if len(node.ops) != 1 or len(node.comparators) != 1:
+            raise NotImplementedError("Only single compare op is supported")
 
-        ```asdl
-        Compare(expr left, cmpop* ops, expr* comparators)
-        ```
-        """
+        # 左右のオペランドを評価
+        left_typed = self.visit(node.left)
+        right_typed = self.visit(node.comparators[0])
+        op = node.ops[0]
+
+        # プリミティブ型の直接比較 (特に整数の場合)
+        if not left_typed.is_object and not right_typed.is_object:
+            if left_typed.type_ == "i32" and right_typed.type_ == "i32":
+                result = self.builder.get_temp_name()
+
+                # 整数の比較は直接LLVM比較命令を使用
+                if isinstance(op, ast.Eq):
+                    self.builder.emit(f"  {result} = icmp eq i32 {left_typed.llvm_value}, {right_typed.llvm_value}")
+                elif isinstance(op, ast.NotEq):
+                    self.builder.emit(f"  {result} = icmp ne i32 {left_typed.llvm_value}, {right_typed.llvm_value}")
+                elif isinstance(op, ast.Lt):
+                    self.builder.emit(f"  {result} = icmp slt i32 {left_typed.llvm_value}, {right_typed.llvm_value}")
+                elif isinstance(op, ast.LtE):
+                    self.builder.emit(f"  {result} = icmp sle i32 {left_typed.llvm_value}, {right_typed.llvm_value}")
+                elif isinstance(op, ast.Gt):
+                    self.builder.emit(f"  {result} = icmp sgt i32 {left_typed.llvm_value}, {right_typed.llvm_value}")
+                elif isinstance(op, ast.GtE):
+                    self.builder.emit(f"  {result} = icmp sge i32 {left_typed.llvm_value}, {right_typed.llvm_value}")
+                else:
+                    raise NotImplementedError(f"Comparison operator {type(op).__name__} not implemented for primitive types")
+
+                return TypedValue.create_primitive(result, "i1", "bool")
+
+        # それ以外はサブビジターに委譲
         from .cmpop import CmpOpVisitor
         cmpop_visitor: CmpOpVisitor = self.get_subvisitor("cmpop")
         return cmpop_visitor.visit(node, self)
@@ -400,18 +426,16 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
         """
         val = node.value
 
+        if isinstance(val, int):
+            # 整数値は直接LLVMの整数定数として扱う（オブジェクト変換なし）
+            return TypedValue.create_primitive(str(val), "i32", "int")
+
         if isinstance(val, str):
             # 文字列 -> PyUnicodeObject*
             gname = self.builder.add_global_string(val)
             tmp = self.get_temp_name()
             self.builder.emit(f"  {tmp} = call ptr @PyUnicode_FromString(ptr {gname})")
             return TypedValue.create_object(tmp, "str")
-
-        elif isinstance(val, int):
-            # 整数 -> PyInt*
-            tmp = self.get_temp_name()
-            self.builder.emit(f"  {tmp} = call ptr @PyInt_FromI32(i32 {val})")
-            return TypedValue.create_object(tmp, "int")
 
         elif isinstance(val, bool):
             # 真偽値 -> Py_True/Py_False
@@ -540,7 +564,7 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
             return TypedValue.create_object(tmp, "None")
 
         else:
-            # 変数ならシンボルテーブルから型を取得
+            # 変数の型情報を取得
             var_type_info = self.get_symbol_type(node.id)
             if var_type_info is None:
                 raise NameError(f"Use of variable '{node.id}' before assignment")
@@ -548,19 +572,7 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
             # 型情報を展開
             llvm_type, python_type, is_object = var_type_info
 
-            # 変数名のメモリからロードした値を使用
-            var_name = f"%{node.id}"
-            tmp = self.builder.get_temp_name()
-
-            # 変数の値をロード
-            self.builder.emit(f"  {tmp} = load {llvm_type}, ptr {var_name}")
-
-            # オブジェクトならば参照カウントを増やす
-            if is_object:
-                self.builder.emit(f"  call void @Py_INCREF(ptr {tmp})")
-                return TypedValue.create_object(tmp, python_type)
-            else:
-                return TypedValue.create_primitive(tmp, llvm_type, python_type)
+            return TypedValue.create_primitive(f"%{node.id}", llvm_type, python_type)
 
     def visit_List(self, node: ast.List) -> TypedValue:
         """
