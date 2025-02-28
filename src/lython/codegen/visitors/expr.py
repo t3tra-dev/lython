@@ -548,15 +548,19 @@ class ExprVisitor(BaseVisitor, ast.NodeVisitor):
             # 型情報を展開
             llvm_type, python_type, is_object = var_type_info
 
-            # 変数値を返す
-            var_value = f"%{node.id}"
+            # 変数名のメモリからロードした値を使用
+            var_name = f"%{node.id}"
+            tmp = self.builder.get_temp_name()
+
+            # 変数の値をロード
+            self.builder.emit(f"  {tmp} = load {llvm_type}, ptr {var_name}")
 
             # オブジェクトならば参照カウントを増やす
             if is_object:
-                self.builder.emit(f"  call void @Py_INCREF(ptr {var_value})")
-                return TypedValue.create_object(var_value, python_type)
+                self.builder.emit(f"  call void @Py_INCREF(ptr {tmp})")
+                return TypedValue.create_object(tmp, python_type)
             else:
-                return TypedValue.create_primitive(var_value, llvm_type, python_type)
+                return TypedValue.create_primitive(tmp, llvm_type, python_type)
 
     def visit_List(self, node: ast.List) -> TypedValue:
         """

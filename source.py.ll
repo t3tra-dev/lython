@@ -172,24 +172,26 @@ entry:
   %dictvar = alloca ptr
   store ptr %t10, ptr %dictvar
   call void @Py_INCREF(ptr %t10)
-  call void @Py_INCREF(ptr %listvar)
-  %t17 = call ptr @PyList_GetItem(ptr %listvar, i64 3)
+  %t17 = load ptr, ptr %listvar
   call void @Py_INCREF(ptr %t17)
-  %t18 = call ptr @PyObject_Str(ptr %t17)
-  call void @print(ptr %t18)
-  %t19 = load ptr, ptr @Py_None
-  call void @Py_INCREF(ptr %t19)
-  call void @Py_DECREF(ptr %t19)
-  call void @Py_INCREF(ptr %dictvar)
-  %t20 = call ptr @PyUnicode_FromString(ptr @.str.7)
-  %t21 = call ptr @PyDict_GetItem(ptr %dictvar, ptr %t20)
+  %t18 = call ptr @PyList_GetItem(ptr %t17, i64 3)
+  call void @Py_INCREF(ptr %t18)
+  %t19 = call ptr @PyObject_Str(ptr %t18)
+  call void @print(ptr %t19)
+  %t20 = load ptr, ptr @Py_None
+  call void @Py_INCREF(ptr %t20)
   call void @Py_DECREF(ptr %t20)
-  ; キーが存在するかチェック
+  %t21 = load ptr, ptr %dictvar
   call void @Py_INCREF(ptr %t21)
-  %t22 = call ptr @PyObject_Str(ptr %t21)
-  call void @print(ptr %t22)
-  %t24 = load ptr, ptr @Py_None
-  call void @Py_INCREF(ptr %t24)
-  call void @Py_DECREF(ptr %t24)
+  %t22 = call ptr @PyUnicode_FromString(ptr @.str.7)
+  %t23 = call ptr @PyDict_GetItem(ptr %t21, ptr %t22)
+  call void @Py_DECREF(ptr %t22)
+  ; キーが存在するかチェック
+  call void @Py_INCREF(ptr %t23)
+  %t24 = call ptr @PyObject_Str(ptr %t23)
+  call void @print(ptr %t24)
+  %t26 = load ptr, ptr @Py_None
+  call void @Py_INCREF(ptr %t26)
+  call void @Py_DECREF(ptr %t26)
   ret i32 0
 }
