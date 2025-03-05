@@ -31,8 +31,6 @@ typedef long Py_ssize_t;
 /* Py_hash_t型の定義 (ハッシュ値用) */
 typedef Py_ssize_t Py_hash_t;
 
-
-
 /* 基本的なPyObjectの構造体 - すべてのオブジェクトの基底 */
 typedef struct _object {
     Py_ssize_t ob_refcnt;       /* 参照カウント (GCサポート用) */
@@ -93,10 +91,29 @@ typedef PyObject *(*ternaryfunc)(PyObject *, PyObject *, PyObject *);
 typedef PyObject *(*getiterfunc)(PyObject *);
 typedef PyObject *(*iternextfunc)(PyObject *);
 
-/* バッファプロトコルのインターフェース */
+/* デストラクタ関数 */
+typedef void (*destructor)(PyObject *);
+
+/* GCサポート用関数 */
+typedef int (*visitproc)(PyObject *, void *);
+typedef int (*traverseproc)(PyObject *, visitproc, void *);
+
+/* インスタンス生成関数 */
+typedef PyObject *(*newfunc)(PyTypeObject *, PyObject *, PyObject *);
+
+/* 初期化関数 */
+typedef int (*initproc)(PyObject *, PyObject *, PyObject *);
+
+/* 属性ゲッター関数 (新スタイル) */
+typedef PyObject *(*getattrofunc)(PyObject *, PyObject *);
+
+/* 属性セッター関数 (新スタイル) */
+typedef int (*setattrofunc)(PyObject *, PyObject *, PyObject *);
+
+/* バッファプロトコル構造体 */
 typedef struct {
-    /* バッファプロトコル関連の定義 (必要に応じて追加) */
-    int dummy;  /* プレースホルダ */
+    /* バッファプロトコル関連 */
+    int dummy;
 } PyBufferProcs;
 
 /* 数値プロトコルの構造体 */
@@ -137,7 +154,7 @@ struct _typeobject {
     Py_ssize_t tp_itemsize;                /* 可変長オブジェクトの追加アイテムサイズ */
     
     /* オブジェクトのメモリ管理 */
-    void (*tp_dealloc)(PyObject *);        /* デストラクタ */
+    destructor tp_dealloc;                 /* デストラクタ */
     void *tp_print;                        /* 廃止されたが互換性のために残す */
     
     /* オブジェクトの標準的な操作 */
@@ -154,26 +171,47 @@ struct _typeobject {
     hashfunc tp_hash;                      /* __hash__ */
     ternaryfunc tp_call;                   /* __call__ */
     reprfunc tp_str;                       /* __str__ */
-    getiterfunc tp_iter;                   /* __iter__ */
-    iternextfunc tp_iternext;              /* __next__ */
+    getattrofunc tp_getattro;              /* __getattribute__ */
+    setattrofunc tp_setattro;              /* __setattr__ */
     
-    /* リッチ比較 */
-    richcmpfunc tp_richcompare;            /* __eq__, __lt__ など */
+    /* バッファプロトコル (廃止) */
+    PyBufferProcs *tp_as_buffer;
+
+    /* フラグ */
+    long tp_flags;
     
-    /* 属性管理 */
-    PyObject *tp_dict;                     /* 属性辞書 */
-    
-    /* サブクラス化サポート */
-    PyObject *tp_base;                     /* 基底クラス */
-    PyObject *tp_bases;                    /* 基底クラスのタプル */
-    
-    /* 初期化、割り当て */
-    PyObject *(*tp_new)(PyTypeObject *, PyObject *, PyObject *);  /* __new__ */
-    int (*tp_init)(PyObject *, PyObject *, PyObject *);           /* __init__ */
+    /* ドキュメント文字列 */
+    const char *tp_doc;
     
     /* GCサポート */
-    int (*tp_traverse)(PyObject *, int (*visit)(PyObject *, void *), void *);
-    int (*tp_clear)(PyObject *);
+    traverseproc tp_traverse;
+    
+    /* その他のメンバー */
+    void *tp_clear;
+    richcmpfunc tp_richcompare;            /* 比較関数 */
+    
+    /* 弱参照サポート */
+    Py_ssize_t tp_weaklistoffset;
+    
+    /* イテレータサポート */
+    getiterfunc tp_iter;
+    iternextfunc tp_iternext;
+    
+    /* 属性アクセス */
+    struct PyMethodDef *tp_methods;
+    struct PyMemberDef *tp_members;
+    struct PyGetSetDef *tp_getset;
+    
+    /* 継承サポート */
+    PyObject *tp_base;
+    PyObject *tp_dict;
+    PyObject *tp_bases;
+    
+    /* 動的生成サポート */
+    newfunc tp_new;
+    initproc tp_init;
+    
+    /* その他のメンバー（必要に応じて） */
 };
 
 /* 参照カウント操作 - 関数としてエクスポート */
@@ -197,6 +235,8 @@ int PyObject_IsTrue(PyObject *obj);
 PyObject* PyObject_GetAttrString(PyObject *obj, const char *name);
 int PyObject_SetAttrString(PyObject *obj, const char *name, PyObject *value);
 int PyObject_HasAttrString(PyObject *obj, const char *name);
+PyObject* PyObject_Call(PyObject *callable, PyObject *args, PyObject *kwargs);
+void PyObject_ClearWeakRefs(PyObject *obj);
 
 /* 型関連の関数 */
 int PyType_IsSubtype(PyTypeObject *a, PyTypeObject *b);
@@ -227,6 +267,101 @@ enum {
     Py_GT = 4,
     Py_GE = 5
 };
+
+/* ガベージコレクション関連の型 */
+typedef int (*visitproc)(PyObject *, void *);
+typedef int (*traverseproc)(PyObject *, visitproc, void *);
+typedef void (*destructor)(PyObject *);
+
+/* NotImplemented 定数 */
+extern PyObject _Py_NotImplementedStruct;
+extern PyObject *Py_NotImplemented;
+#define Py_NotImplemented (&_Py_NotImplementedStruct)
+
+/* True/False 返却用の便利なマクロ */
+#define Py_RETURN_TRUE return Py_NewRef(Py_True)
+#define Py_RETURN_FALSE return Py_NewRef(Py_False)
+#define Py_RETURN_NONE return Py_NewRef(Py_None)
+#define Py_RETURN_NOTIMPLEMENTED return Py_NewRef(Py_NotImplemented)
+
+/* メモリ確保関連マクロ */
+#define Py_VISIT(o) do { if (o) { if (visit((PyObject *)(o), arg)) return 1; } } while(0)
+
+/* 参照カウント関数 */
+#define Py_NewRef(obj) _Py_NewRef((PyObject *)(obj))
+#define Py_XNewRef(obj) _Py_XNewRef((PyObject *)(obj))
+
+static inline PyObject* _Py_NewRef(PyObject *obj) {
+    Py_INCREF(obj);
+    return obj;
+}
+
+static inline PyObject* _Py_XNewRef(PyObject *obj) {
+    Py_XINCREF(obj);
+    return obj;
+}
+
+/* ゲッター・セッター関数型 */
+typedef PyObject *(*getattrofunc)(PyObject *, PyObject *);
+typedef int (*setattrofunc)(PyObject *, PyObject *, PyObject *);
+
+/* 追加の関数型 */
+typedef PyObject *(*getattrfunc)(PyObject *, char *);
+typedef int (*setattrfunc)(PyObject *, char *, PyObject *);
+
+/* デストラクタ関数 */
+typedef void (*destructor)(PyObject *);
+
+/* ゲッター関数 (非推奨) */
+typedef PyObject *(*getattrfunc)(PyObject *, char *);
+
+/* セッター関数 (非推奨) */
+typedef int (*setattrfunc)(PyObject *, char *, PyObject *);
+
+/* 属性ゲッター関数 (新スタイル) */
+typedef PyObject *(*getattrofunc)(PyObject *, PyObject *);
+
+/* 属性セッター関数 (新スタイル) */
+typedef int (*setattrofunc)(PyObject *, PyObject *, PyObject *);
+
+/* 表示関数 */
+typedef PyObject *(*reprfunc)(PyObject *);
+
+/* ハッシュ関数 */
+typedef Py_hash_t (*hashfunc)(PyObject *);
+
+/* 長さ取得関数 */
+typedef Py_ssize_t (*lenfunc)(PyObject *);
+
+/* 呼び出し関数 */
+typedef PyObject *(*ternaryfunc)(PyObject *, PyObject *, PyObject *);
+
+/* 二項演算子関数 */
+typedef PyObject *(*binaryfunc)(PyObject *, PyObject *);
+
+/* 単項演算子関数 */
+typedef PyObject *(*unaryfunc)(PyObject *);
+
+/* 比較関数 */
+typedef PyObject *(*richcmpfunc)(PyObject *, PyObject *, int);
+
+/* イテレータ関数 */
+typedef PyObject *(*getiterfunc)(PyObject *);
+typedef PyObject *(*iternextfunc)(PyObject *);
+
+/* GCサポート用関数 */
+typedef int (*visitproc)(PyObject *, void *);
+typedef int (*traverseproc)(PyObject *, visitproc, void *);
+
+/* インスタンス生成関数 */
+typedef PyObject *(*newfunc)(PyTypeObject *, PyObject *, PyObject *);
+
+/* 初期化関数 */
+typedef int (*initproc)(PyObject *, PyObject *, PyObject *);
+
+/* 便利なマクロ */
+#define PyObject_HEAD_INIT(type) { 1, type }
+#define Py_VISIT(o) do { if (o) { if (visit((PyObject *)(o), arg)) return 1; } } while(0)
 
 #ifdef __cplusplus
 }

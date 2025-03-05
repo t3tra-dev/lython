@@ -9,10 +9,15 @@
 #include <gc.h>
 #include "object.h"
 #include "booleanobject.h"
+#include "classobject.h"
+#include "exceptions.h"
+#include "functionobject.h"
 #include "intobject.h"
 #include "unicodeobject.h"
 #include "listobject.h"
 #include "dictobject.h"
+#include "methodobject.h"
+#include "weakrefobject.h"
 
 /* 型オブジェクトの前方宣言 */
 static PyTypeObject PyBaseObject_Type;
@@ -409,6 +414,21 @@ void PyObject_InitSystem(void) {
     _PyUnicode_Init();
     _PyList_Init();
     _PyDict_Init();
+
+    /* クラスオブジェクトの初期化 */
+    _PyClass_Init();
+
+    /* 例外オブジェクトの初期化 */
+    _PyExc_Init();
+
+    /* 関数オブジェクトの初期化 */
+    _PyFunction_Init();
+
+    /* クラスメソッドオブジェクトの初期化 */
+    _PyMethod_Init();
+
+    /* 弱参照の初期化 */
+    _PyWeakref_Init();
     
     /* その他の初期化処理... */
 }
@@ -454,3 +474,17 @@ PyObject* PyObject_NewVar(PyTypeObject *type, Py_ssize_t size) {
     
     return obj;
 }
+
+/* NotImplemented シングルトン */
+PyObject _Py_NotImplementedStruct = {
+    1,                          /* ob_refcnt - 不変なので常に1 */
+    &PyType_Type                /* ob_type - 型はPyType_Type */
+};
+
+/* NotImplemented グローバルポインタ - LLVM IR向け */
+PyObject *_Py_NotImplemented = &_Py_NotImplementedStruct;
+
+/* LLVM IR用のエイリアス - マクロを一時的に無効化 */
+#undef Py_NotImplemented
+PyObject *Py_NotImplemented = &_Py_NotImplementedStruct;
+#define Py_NotImplemented (&_Py_NotImplementedStruct)
