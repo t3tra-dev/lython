@@ -12,4 +12,4 @@
 ## ライセンス
 
 本リポジトリのソースコードは、特記がない限り [MIT License](https://opensource.org/licenses/MIT) で配布されています。  
-詳細はソースコード内の記述（`lython/__init__.py` など）をご参照ください。
+詳細はソースコード内の記述 (`lython/__init__.py` など) をご参照ください。
