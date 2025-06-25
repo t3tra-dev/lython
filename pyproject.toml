@@ -9,8 +9,10 @@ dependencies = []
 [dependency-groups]
 dev = [
     "black>=24.10.0",
+    "flake8>=7.3.0",
     "isort>=5.13.2",
     "lython",
+    "mypy>=1.16.1",
 ]
 
 [build-system]

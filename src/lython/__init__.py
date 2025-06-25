@@ -31,7 +31,7 @@ class VersionInfo(NamedTuple):
 
 
 version_info: VersionInfo = VersionInfo(
-    major=0, minor=0, micro=1, releaselevel="final", serial=0
+    major=0, minor=1, micro=0, releaselevel="alpha", serial=0
 )
 
 logging.getLogger(__name__).addHandler(logging.NullHandler())
