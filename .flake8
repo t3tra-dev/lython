@@ -1,0 +1,2 @@
+[flake8]
+exclude = .git,__pycache__,build,dist,.eggs,.tox,.venv,*.egg-info,*.egg,lowering_sample/**,

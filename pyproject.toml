@@ -25,3 +25,6 @@ sources = ["src"]
 
 [tool.uv.sources]
 lython = { workspace = true }
+
+[tool.mypy]
+files = "src/lython"
