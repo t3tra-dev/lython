@@ -26,7 +26,7 @@
 | フェーズ                                | 期間 (月) | 主成果物                                        | 主要課題                  |
 | --------------------------------------- | --------- | ----------------------------------------------- | ------------------------- |
 | **Phase 0 – Kick-off**                  | 0‑1       | Monorepo, CI/CD, clang‑format, docs 雛形        | 開発ワークフロー確立      |
-| **Phase 1 – TypedAST Core**             | 1‑4       | パーサ／型推論エンジン, 1 万行テスト            | typing PEP604, ユニオン型 |
+| **Phase 1 – TypedAST Core**             | 1‑4       | パーサ/型推論エンジン, 1 万行テスト             | typing PEP604, ユニオン型 |
 | **Phase 2 – Type System v1**            | 3‑6       | PyObject/Native 型統合 API, `native` デコレータ | 暗黙/明示変換ルール策定   |
 | **Phase 3 – Python Dialect**            | 4‑8       | MLIR Python Dialect v0.1, IR printer/parser     | Dialect 定義 & TableGen   |
 | **Phase 4 – High‑Level Passes**         | 7‑10      | 型検証 Pass, scf/linalg 変換                    | SSA 変換 & DomTree        |
