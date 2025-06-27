@@ -13,6 +13,7 @@ dev = [
     "isort>=5.13.2",
     "lython",
     "mypy>=1.16.1",
+    "pytest>=8.4.1",
 ]
 
 [build-system]
@@ -23,8 +24,8 @@ build-backend = "hatchling.build"
 only-include = ["src"]
 sources = ["src"]
 
-[tool.uv.sources]
-lython = { workspace = true }
-
 [tool.mypy]
 files = "src/lython"
+
+[tool.uv.sources]
+lython = { workspace = true }
