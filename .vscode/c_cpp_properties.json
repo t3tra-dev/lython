@@ -4,7 +4,7 @@
             "name": "Mac",
             "includePath": [
                 "${workspaceFolder}/**",
-                "/opt/homebrew/lib/"
+                "${workspaceFolder}/build/src/dialects"
             ],
             "defines": [],
             "compilerPath": "/opt/homebrew/bin/clang",
