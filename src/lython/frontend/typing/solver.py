@@ -53,6 +53,7 @@ class TypeConstraint:
 def _make_constraint_list() -> List["TypeConstraint"]:
     return []
 
+
 @dataclass
 class TypeVariable:
     """型変数"""
@@ -72,6 +73,7 @@ class TypeVariable:
 
 def _make_symbol_dict() -> Dict[str, Type]:
     return {}
+
 
 @dataclass
 class SymbolTable:
