@@ -2,5 +2,9 @@
     "python.analysis.typeCheckingMode": "standard",
     "python.analysis.extraPaths": [
         "${workspaceFolder}/src"
-    ]
+    ],
+    "files.associations": {
+        "*.inc": "cpp",
+        "locale": "cpp"
+    }
 }

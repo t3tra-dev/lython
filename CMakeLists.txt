@@ -12,6 +12,9 @@ set(LLVM_ENABLE_ASSERTIONS ON CACHE BOOL "")
 set(LLVM_ENABLE_RTTI ON CACHE BOOL "")
 set(LLVM_ENABLE_BINDINGS_PYTHON OFF CACHE BOOL "")
 set(MLIR_ENABLE_BINDINGS_PYTHON OFF CACHE BOOL "")
+set(LLVM_BUILD_TOOLS ON CACHE BOOL "")
+set(MLIR_BUILD_TOOLS ON CACHE BOOL "")
+set(LLVM_ENABLE_ABI_BREAKING_CHECKS OFF CACHE BOOL "")
 
 message(STATUS "Building LLVM/MLIR 18 from submodule")
 
@@ -20,3 +23,23 @@ add_subdirectory(third_party/llvm-project/llvm)
 
 # Dialectライブラリ
 add_subdirectory(src/dialects)
+
+# Python Dialect用 mlir-opt
+add_executable(python-mlir-opt python_mlir_opt.cpp)
+target_link_libraries(python-mlir-opt
+    PRIVATE
+    MLIRPythonDialect
+    MLIROptLib
+    MLIRParser
+    MLIRIR
+    MLIRPass
+    MLIRSupport
+    LLVMSupport
+)
+target_include_directories(python-mlir-opt PRIVATE 
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_BINARY_DIR}/src/dialects
+    ${LLVM_INCLUDE_DIRS}
+    ${MLIR_INCLUDE_DIRS}
+)
+add_dependencies(python-mlir-opt MLIRPythonDialect)
