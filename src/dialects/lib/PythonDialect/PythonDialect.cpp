@@ -14,18 +14,13 @@ using namespace mlir::python;
 #include "PythonDialect.cpp.inc"
 
 void PythonDialect::initialize() {
-  // まず基本型のみ登録 (パラメータなし)
-  addTypes<
-    PythonI32Type,
-    PythonI64Type,
-    PythonF32Type,
-    PythonF64Type,
-    PythonBoolType
-  >();
+    // まず基本型のみ登録 (パラメータなし)
+    addTypes<PythonI32Type, PythonI64Type, PythonF32Type, PythonF64Type,
+             PythonBoolType>();
 
-  // 操作の登録
-  addOperations<
+    // 操作の登録
+    addOperations<
 #define GET_OP_LIST
 #include "PythonOps.cpp.inc"
-  >();
+        >();
 }

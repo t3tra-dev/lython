@@ -7,8 +7,8 @@
 #ifndef LYTHON_PYTHON_TYPES_H
 #define LYTHON_PYTHON_TYPES_H
 
-#include "mlir/IR/Types.h"
 #include "mlir/IR/TypeSupport.h"
+#include "mlir/IR/Types.h"
 
 //===----------------------------------------------------------------------===//
 // Python Types

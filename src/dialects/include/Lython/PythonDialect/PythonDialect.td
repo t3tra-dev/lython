@@ -10,16 +10,16 @@ include "mlir/IR/OpBase.td"
 //===----------------------------------------------------------------------===//
 
 def PythonDialect : Dialect {
-  let name = "py";
-  let summary = "Python Dialect for Lython";
-  let cppNamespace = "::mlir::python";
+    let name = "py";
+    let summary = "Python Dialect for Lython";
+    let cppNamespace = "::mlir::python";
 }
 
 //===----------------------------------------------------------------------===//
 // Base Python Operation Definition
 //===----------------------------------------------------------------------===//
 
-class PythonOp<string mnemonic, list<Trait> traits = []> :
-    Op<PythonDialect, mnemonic, traits>;
+class PythonOp<string mnemonic, list<Trait> traits = []>
+    : Op<PythonDialect, mnemonic, traits>;
 
 #endif // PYTHON_DIALECT

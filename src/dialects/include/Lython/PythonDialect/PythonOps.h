@@ -22,25 +22,23 @@
 
 // BytecodeOpInterface compatibility layer for MLIR 18
 namespace mlir {
-  struct BytecodeOpInterface {
-    template <typename ConcreteOp>
-    struct Trait {};
-  };
-  struct SymbolOpInterface {
-    template <typename ConcreteOp>
-    struct Trait {};
-  };
-  
-  // Minimal compatibility stubs
-  struct DialectBytecodeReader {
-    LogicalResult readAttribute(Attribute&) { return success(); }
-    LogicalResult readOptionalAttribute(Attribute&) { return success(); }
-  };
-  struct DialectBytecodeWriter {
-    void writeAttribute(const Attribute&) {}
-    void writeOptionalAttribute(const Attribute&) {}
-  };
-}
+struct BytecodeOpInterface {
+    template <typename ConcreteOp> struct Trait {};
+};
+struct SymbolOpInterface {
+    template <typename ConcreteOp> struct Trait {};
+};
+
+// Minimal compatibility stubs
+struct DialectBytecodeReader {
+    LogicalResult readAttribute(Attribute &) { return success(); }
+    LogicalResult readOptionalAttribute(Attribute &) { return success(); }
+};
+struct DialectBytecodeWriter {
+    void writeAttribute(const Attribute &) {}
+    void writeOptionalAttribute(const Attribute &) {}
+};
+} // namespace mlir
 
 #define GET_OP_CLASSES
 #include "PythonOps.h.inc"
