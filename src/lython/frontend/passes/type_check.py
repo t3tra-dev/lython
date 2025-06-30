@@ -70,7 +70,7 @@ class TypeCheckContext:
 class TypeCheckPass(TypedASTVisitor):
     """型チェックを実行するパス"""
 
-    def __init__(self, error_reporter: Optional[ErrorReporter] = None):
+    def __init__(self, error_reporter: Optional[ErrorReporter] = None) -> None:
         self.reporter = error_reporter or ErrorReporter()
         self.context = TypeCheckContext(SymbolTable())
         self.inference_engine = TypeInferenceEngine()
@@ -96,7 +96,7 @@ class TypeCheckPass(TypedASTVisitor):
 
         return module
 
-    def _register_builtin_functions(self):
+    def _register_builtin_functions(self) -> None:
         """組み込み関数の型をシンボルテーブルに登録"""
         # print関数
         print_type = FunctionType([AnyType()], PyObjectType.none())
@@ -128,13 +128,13 @@ class TypeCheckPass(TypedASTVisitor):
             "isinstance", FunctionType([AnyType(), AnyType()], PyObjectType.bool())
         )
 
-    def visit_module(self, node: TypedModule):
+    def visit_module(self, node: TypedModule) -> TypedModule:
         """モジュール全体の型チェック"""
         for stmt in node.body:
             self.visit(stmt)
         return node
 
-    def visit_function_def(self, node: TypedFunctionDef):
+    def visit_function_def(self, node: TypedFunctionDef) -> TypedFunctionDef:
         """関数定義の型チェック"""
         # 前のコンテキストを保存
         old_function = self.context.current_function
@@ -180,7 +180,7 @@ class TypeCheckPass(TypedASTVisitor):
 
         return node
 
-    def visit_class_def(self, node: TypedClassDef):
+    def visit_class_def(self, node: TypedClassDef) -> TypedClassDef:
         """クラス定義の型チェック"""
         # 新しいスコープを作成
         old_table = self.context.symbol_table
@@ -195,7 +195,7 @@ class TypeCheckPass(TypedASTVisitor):
 
         return node
 
-    def visit_assign(self, node: TypedAssign):
+    def visit_assign(self, node: TypedAssign) -> TypedAssign:
         """代入文の型チェック"""
         # 右辺の型チェック
         self.visit(node.value)
@@ -208,7 +208,7 @@ class TypeCheckPass(TypedASTVisitor):
 
         return node
 
-    def visit_ann_assign(self, node: TypedAnnAssign):
+    def visit_ann_assign(self, node: TypedAnnAssign) -> TypedAnnAssign:
         """型注釈付き代入の型チェック"""
         # 型注釈の型を取得
         annotation_type = self._convert_type_annotation(node.annotation)
@@ -228,7 +228,7 @@ class TypeCheckPass(TypedASTVisitor):
 
         return node
 
-    def visit_aug_assign(self, node: TypedAugAssign):
+    def visit_aug_assign(self, node: TypedAugAssign) -> TypedAugAssign:
         """拡張代入の型チェック"""
         # 左辺と右辺の型チェック
         self.visit(node.target)
@@ -247,7 +247,7 @@ class TypeCheckPass(TypedASTVisitor):
 
         return node
 
-    def visit_return(self, node: TypedReturn):
+    def visit_return(self, node: TypedReturn) -> TypedReturn:
         """return文の型チェック"""
         if not self.context.current_function:
             self.reporter.add_error(
@@ -273,7 +273,7 @@ class TypeCheckPass(TypedASTVisitor):
 
         return node
 
-    def visit_if(self, node: TypedIf):
+    def visit_if(self, node: TypedIf) -> TypedIf:
         """if文の型チェック"""
         # 条件式の型チェック
         self.visit(node.test)
@@ -296,7 +296,7 @@ class TypeCheckPass(TypedASTVisitor):
 
         return node
 
-    def visit_while(self, node: TypedWhile):
+    def visit_while(self, node: TypedWhile) -> TypedWhile:
         """while文の型チェック"""
         # 条件式の型チェック
         self.visit(node.test)
@@ -318,7 +318,7 @@ class TypeCheckPass(TypedASTVisitor):
 
         return node
 
-    def visit_for(self, node: TypedFor):
+    def visit_for(self, node: TypedFor) -> TypedFor:
         """for文の型チェック"""
         # イテラブルの型チェック
         self.visit(node.iter)
@@ -345,7 +345,7 @@ class TypeCheckPass(TypedASTVisitor):
 
         return node
 
-    def visit_binop(self, node: TypedBinOp):
+    def visit_binop(self, node: TypedBinOp) -> TypedBinOp:
         """二項演算の型チェック"""
         self.visit(node.left)
         self.visit(node.right)
@@ -372,7 +372,7 @@ class TypeCheckPass(TypedASTVisitor):
 
         return node
 
-    def visit_unaryop(self, node: TypedUnaryOp):
+    def visit_unaryop(self, node: TypedUnaryOp) -> TypedUnaryOp:
         """単項演算の型チェック"""
         self.visit(node.operand)
         operand_type = self._get_type_from_node(node.operand)
@@ -385,14 +385,14 @@ class TypeCheckPass(TypedASTVisitor):
 
         return node
 
-    def visit_call(self, node: TypedCall):
+    def visit_call(self, node: TypedCall) -> TypedCall:
         """関数呼び出しの型チェック"""
         # 関数オブジェクトの型チェック
         self.visit(node.func)
         func_type = self._get_type_from_node(node.func)
 
         # 引数の型チェック
-        arg_types = []
+        arg_types: List[Type] = []
         for arg in node.args:
             self.visit(arg)
             arg_types.append(self._get_type_from_node(arg))
@@ -414,7 +414,7 @@ class TypeCheckPass(TypedASTVisitor):
 
         return node
 
-    def visit_attribute(self, node: TypedAttribute):
+    def visit_attribute(self, node: TypedAttribute) -> TypedAttribute:
         """属性参照の型チェック"""
         self.visit(node.value)
         obj_type = self._get_type_from_node(node.value)
@@ -431,7 +431,7 @@ class TypeCheckPass(TypedASTVisitor):
 
         return node
 
-    def visit_subscript(self, node: TypedSubscript):
+    def visit_subscript(self, node: TypedSubscript) -> TypedSubscript:
         """添字参照の型チェック"""
         self.visit(node.value)
         self.visit(node.slice)
@@ -451,7 +451,7 @@ class TypeCheckPass(TypedASTVisitor):
 
         return node
 
-    def visit_name(self, node: TypedName):
+    def visit_name(self, node: TypedName) -> TypedName:
         """変数参照の型チェック"""
         var_type = self.context.symbol_table.lookup(node.id)
         if var_type is None:
@@ -463,7 +463,7 @@ class TypeCheckPass(TypedASTVisitor):
 
         return node
 
-    def visit_constant(self, node: TypedConstant):
+    def visit_constant(self, node: TypedConstant) -> TypedConstant:
         """定数の型チェック"""
         const_type = self._infer_constant_type(node.value)
 
@@ -474,7 +474,7 @@ class TypeCheckPass(TypedASTVisitor):
 
     # ヘルパーメソッド
 
-    def _check_function_arguments(self, node: TypedFunctionDef):
+    def _check_function_arguments(self, node: TypedFunctionDef) -> None:
         """関数引数の型チェック"""
         for arg in node.args.args:
             if arg.annotation:
@@ -494,7 +494,7 @@ class TypeCheckPass(TypedASTVisitor):
                 # 型注釈がない場合はAny型
                 self.context.symbol_table.define(arg.arg, AnyType())
 
-    def _check_return_statements(self, node: TypedFunctionDef):
+    def _check_return_statements(self, node: TypedFunctionDef) -> None:
         """return文の戻り値型チェック"""
         # この実装は簡略化されています
         # 実際には、関数内のすべてのreturn文を収集して型をチェックする必要があります
@@ -502,7 +502,7 @@ class TypeCheckPass(TypedASTVisitor):
 
     def _check_assignment_compatibility(
         self, target: TypedExpr, value_type: Type, span: Span
-    ):
+    ) -> None:
         """代入の互換性チェック"""
         if isinstance(target, TypedName):
             # 変数への代入
@@ -518,7 +518,7 @@ class TypeCheckPass(TypedASTVisitor):
 
     def _check_function_call(
         self, node: TypedCall, func_type: FunctionType, arg_types: List[Type]
-    ):
+    ) -> None:
         """関数呼び出しの型チェック"""
         # 引数の数をチェック
         if len(arg_types) != len(func_type.param_types):
@@ -536,7 +536,7 @@ class TypeCheckPass(TypedASTVisitor):
         ):
             if not self._is_assignable(arg_type, param_type):
                 self.reporter.add_type_error(
-                    param_type, arg_type, node.args[i].span, f"argument {i+1}"
+                    param_type, arg_type, node.args[i].span, f"argument {i + 1}"
                 )
 
     def _convert_type_annotation(self, annotation: TypedExpr) -> Type:
@@ -699,7 +699,7 @@ class TypeCheckPass(TypedASTVisitor):
 
     def _get_op_symbol(self, op: ast.operator) -> str:
         """演算子のシンボル文字列を取得"""
-        op_symbols = {
+        op_symbols: dict[type, str] = {
             ast.Add: "+",
             ast.Sub: "-",
             ast.Mult: "*",

@@ -34,7 +34,7 @@ class DiagnosticMessage:
     span: Span
     code: Optional[str] = None  # エラーコード (E001, W002 など)
     help_text: Optional[str] = None  # 修正のヒント
-    related_spans: List[Span] = field(default_factory=list)  # 関連する位置情報
+    related_spans: List[Span] = field(default_factory=lambda: [])  # 関連する位置情報
 
     def __str__(self) -> str:
         level_str = self.level.value
@@ -69,7 +69,7 @@ class ErrorReporter:
         self.error_count = 0
         self.warning_count = 0
 
-    def load_source_lines(self, source_content: str):
+    def load_source_lines(self, source_content: str) -> None:
         """ソースコードの内容を読み込み"""
         lines = source_content.split("\n")
         self.source_lines = {i + 1: line for i, line in enumerate(lines)}
@@ -218,7 +218,7 @@ class ErrorReporter:
         if self.error_count == 0 and self.warning_count == 0:
             return "No errors or warnings"
 
-        parts = []
+        parts: List[str] = []
         if self.error_count > 0:
             parts.append(
                 f"{self.error_count} error{'s' if self.error_count > 1 else ''}"
@@ -353,7 +353,7 @@ class ErrorReporter:
 
     def to_json(self) -> List[Dict[str, Any]]:
         """診断情報をJSON形式で出力（IDE統合用）"""
-        result = []
+        result: List[Dict[str, Any]] = []
         for diagnostic in self.diagnostics:
             result.append(
                 {

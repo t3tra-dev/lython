@@ -79,6 +79,10 @@ class Type(ABC):
         """未知の型かどうか"""
         return self.kind == TypeKind.UNKNOWN
 
+    def is_numeric(self) -> bool:
+        """数値型かどうか（デフォルトはFalse、サブクラスでオーバーライド）"""
+        return False
+
 
 @dataclass
 class PrimitiveType(Type):
@@ -240,6 +244,10 @@ class PyObjectType(Type):
         if self.name in subtype_relations:
             return other.name in subtype_relations[self.name]
         return False
+
+    def is_numeric(self) -> bool:
+        """数値型かどうか"""
+        return self.name in ["int", "float", "bool"]
 
     # 標準的なPyObject型のファクトリメソッド
     @classmethod

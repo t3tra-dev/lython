@@ -13,6 +13,7 @@ dev = [
     "isort>=5.13.2",
     "lython",
     "mypy>=1.16.1",
+    "pyright>=1.1.402",
     "pytest>=8.4.1",
 ]
 
@@ -26,6 +27,14 @@ sources = ["src"]
 
 [tool.mypy]
 files = "src/lython"
+
+[tool.pyright]
+include = ["src"]
+exclude = [
+    "**/__pycache__",
+]
+ignore = ["third_party/"]
+typeCheckingMode = "strict"
 
 [tool.uv.sources]
 lython = { workspace = true }

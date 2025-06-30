@@ -10,7 +10,10 @@ from __future__ import annotations
 import ast
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, List, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from typing import Any as VisitorReturn
 
 
 @dataclass
@@ -93,13 +96,13 @@ class TypedNode(ABC):
     ty: Ty  # 推論結果
     span: Span  # ソースコード位置情報
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         # nodeからspanが作成されていない場合は自動生成
-        if not hasattr(self, "span") or self.span is None:
+        if not hasattr(self, "span"):
             self.span = Span.from_ast_node(self.node)
 
     @abstractmethod
-    def accept(self, visitor: "TypedASTVisitor"):
+    def accept(self, visitor: "TypedASTVisitor") -> "VisitorReturn":
         """Visitorパターンの実装"""
         pass
 
@@ -120,7 +123,7 @@ class TypedConstant(TypedExpr):
 
     value: Any
 
-    def accept(self, visitor: "TypedASTVisitor"):
+    def accept(self, visitor: "TypedASTVisitor") -> "VisitorReturn":
         return visitor.visit_constant(self)
 
 
@@ -131,7 +134,7 @@ class TypedName(TypedExpr):
     id: str
     ctx: ast.expr_context
 
-    def accept(self, visitor: "TypedASTVisitor"):
+    def accept(self, visitor: "TypedASTVisitor") -> "VisitorReturn":
         return visitor.visit_name(self)
 
 
@@ -143,7 +146,7 @@ class TypedBinOp(TypedExpr):
     left: TypedExpr
     right: TypedExpr
 
-    def accept(self, visitor: "TypedASTVisitor"):
+    def accept(self, visitor: "TypedASTVisitor") -> "VisitorReturn":
         return visitor.visit_binop(self)
 
 
@@ -154,7 +157,7 @@ class TypedUnaryOp(TypedExpr):
     op: ast.unaryop
     operand: TypedExpr
 
-    def accept(self, visitor: "TypedASTVisitor"):
+    def accept(self, visitor: "TypedASTVisitor") -> "VisitorReturn":
         return visitor.visit_unaryop(self)
 
 
@@ -166,7 +169,7 @@ class TypedCall(TypedExpr):
     args: List[TypedExpr]
     keywords: List["TypedKeyword"]
 
-    def accept(self, visitor: "TypedASTVisitor"):
+    def accept(self, visitor: "TypedASTVisitor") -> "VisitorReturn":
         return visitor.visit_call(self)
 
 
@@ -178,7 +181,7 @@ class TypedAttribute(TypedExpr):
     attr: str
     ctx: ast.expr_context
 
-    def accept(self, visitor: "TypedASTVisitor"):
+    def accept(self, visitor: "TypedASTVisitor") -> "VisitorReturn":
         return visitor.visit_attribute(self)
 
 
@@ -190,7 +193,7 @@ class TypedSubscript(TypedExpr):
     slice: TypedExpr
     ctx: ast.expr_context
 
-    def accept(self, visitor: "TypedASTVisitor"):
+    def accept(self, visitor: "TypedASTVisitor") -> "VisitorReturn":
         return visitor.visit_subscript(self)
 
 
@@ -201,7 +204,7 @@ class TypedList(TypedExpr):
     elts: List[TypedExpr]
     ctx: ast.expr_context
 
-    def accept(self, visitor: "TypedASTVisitor"):
+    def accept(self, visitor: "TypedASTVisitor") -> "VisitorReturn":
         return visitor.visit_list(self)
 
 
@@ -212,7 +215,7 @@ class TypedTuple(TypedExpr):
     elts: List[TypedExpr]
     ctx: ast.expr_context
 
-    def accept(self, visitor: "TypedASTVisitor"):
+    def accept(self, visitor: "TypedASTVisitor") -> "VisitorReturn":
         return visitor.visit_tuple(self)
 
 
@@ -223,7 +226,7 @@ class TypedDict(TypedExpr):
     keys: List[Optional[TypedExpr]]
     values: List[TypedExpr]
 
-    def accept(self, visitor: "TypedASTVisitor"):
+    def accept(self, visitor: "TypedASTVisitor") -> "VisitorReturn":
         return visitor.visit_dict(self)
 
 
@@ -245,7 +248,7 @@ class TypedAssign(TypedStmt):
     value: TypedExpr
     type_comment: Optional[str] = None
 
-    def accept(self, visitor: "TypedASTVisitor"):
+    def accept(self, visitor: "TypedASTVisitor") -> "VisitorReturn":
         return visitor.visit_assign(self)
 
 
@@ -258,7 +261,7 @@ class TypedAnnAssign(TypedStmt):
     value: Optional[TypedExpr]
     simple: int  # 1 if simple target name, 0 otherwise
 
-    def accept(self, visitor: "TypedASTVisitor"):
+    def accept(self, visitor: "TypedASTVisitor") -> "VisitorReturn":
         return visitor.visit_ann_assign(self)
 
 
@@ -270,7 +273,7 @@ class TypedAugAssign(TypedStmt):
     op: ast.operator
     value: TypedExpr
 
-    def accept(self, visitor: "TypedASTVisitor"):
+    def accept(self, visitor: "TypedASTVisitor") -> "VisitorReturn":
         return visitor.visit_aug_assign(self)
 
 
@@ -280,7 +283,7 @@ class TypedExprStmt(TypedStmt):
 
     value: TypedExpr
 
-    def accept(self, visitor: "TypedASTVisitor"):
+    def accept(self, visitor: "TypedASTVisitor") -> "VisitorReturn":
         return visitor.visit_expr_stmt(self)
 
 
@@ -290,7 +293,7 @@ class TypedReturn(TypedStmt):
 
     value: Optional[TypedExpr]
 
-    def accept(self, visitor: "TypedASTVisitor"):
+    def accept(self, visitor: "TypedASTVisitor") -> "VisitorReturn":
         return visitor.visit_return(self)
 
 
@@ -302,7 +305,7 @@ class TypedIf(TypedStmt):
     body: List[TypedStmt]
     orelse: List[TypedStmt]
 
-    def accept(self, visitor: "TypedASTVisitor"):
+    def accept(self, visitor: "TypedASTVisitor") -> "VisitorReturn":
         return visitor.visit_if(self)
 
 
@@ -314,7 +317,7 @@ class TypedWhile(TypedStmt):
     body: List[TypedStmt]
     orelse: List[TypedStmt]
 
-    def accept(self, visitor: "TypedASTVisitor"):
+    def accept(self, visitor: "TypedASTVisitor") -> "VisitorReturn":
         return visitor.visit_while(self)
 
 
@@ -328,7 +331,7 @@ class TypedFor(TypedStmt):
     orelse: List[TypedStmt]
     type_comment: Optional[str] = None
 
-    def accept(self, visitor: "TypedASTVisitor"):
+    def accept(self, visitor: "TypedASTVisitor") -> "VisitorReturn":
         return visitor.visit_for(self)
 
 
@@ -344,7 +347,7 @@ class TypedFunctionDef(TypedStmt):
     type_comment: Optional[str] = None
     is_native: bool = False  # @native デコレータが付いているか
 
-    def accept(self, visitor: "TypedASTVisitor"):
+    def accept(self, visitor: "TypedASTVisitor") -> "VisitorReturn":
         return visitor.visit_function_def(self)
 
 
@@ -358,7 +361,7 @@ class TypedClassDef(TypedStmt):
     body: List[TypedStmt]
     decorator_list: List[TypedExpr]
 
-    def accept(self, visitor: "TypedASTVisitor"):
+    def accept(self, visitor: "TypedASTVisitor") -> "VisitorReturn":
         return visitor.visit_class_def(self)
 
 
@@ -403,7 +406,7 @@ class TypedModule(TypedNode):
     body: List[TypedStmt]
     type_ignores: Optional[List[str]] = None
 
-    def accept(self, visitor: "TypedASTVisitor"):
+    def accept(self, visitor: "TypedASTVisitor") -> "VisitorReturn":
         return visitor.visit_module(self)
 
 
@@ -413,75 +416,75 @@ class TypedModule(TypedNode):
 class TypedASTVisitor(ABC):
     """TypedAST を走査するための Visitor パターン基底クラス"""
 
-    def visit(self, node: TypedNode):
+    def visit(self, node: TypedNode) -> "VisitorReturn":
         """ノードを訪問する"""
         return node.accept(self)
 
-    def generic_visit(self, node: TypedNode):
+    def generic_visit(self, node: TypedNode) -> "VisitorReturn":
         """デフォルトの訪問処理"""
-        pass
+        return None
 
     # 式ノード用のメソッド
-    def visit_constant(self, node: TypedConstant):
+    def visit_constant(self, node: TypedConstant) -> "VisitorReturn":
         return self.generic_visit(node)
 
-    def visit_name(self, node: TypedName):
+    def visit_name(self, node: TypedName) -> "VisitorReturn":
         return self.generic_visit(node)
 
-    def visit_binop(self, node: TypedBinOp):
+    def visit_binop(self, node: TypedBinOp) -> "VisitorReturn":
         return self.generic_visit(node)
 
-    def visit_unaryop(self, node: TypedUnaryOp):
+    def visit_unaryop(self, node: TypedUnaryOp) -> "VisitorReturn":
         return self.generic_visit(node)
 
-    def visit_call(self, node: TypedCall):
+    def visit_call(self, node: TypedCall) -> "VisitorReturn":
         return self.generic_visit(node)
 
-    def visit_attribute(self, node: TypedAttribute):
+    def visit_attribute(self, node: TypedAttribute) -> "VisitorReturn":
         return self.generic_visit(node)
 
-    def visit_subscript(self, node: TypedSubscript):
+    def visit_subscript(self, node: TypedSubscript) -> "VisitorReturn":
         return self.generic_visit(node)
 
-    def visit_list(self, node: TypedList):
+    def visit_list(self, node: TypedList) -> "VisitorReturn":
         return self.generic_visit(node)
 
-    def visit_tuple(self, node: TypedTuple):
+    def visit_tuple(self, node: TypedTuple) -> "VisitorReturn":
         return self.generic_visit(node)
 
-    def visit_dict(self, node: TypedDict):
+    def visit_dict(self, node: TypedDict) -> "VisitorReturn":
         return self.generic_visit(node)
 
     # 文ノード用のメソッド
-    def visit_assign(self, node: TypedAssign):
+    def visit_assign(self, node: TypedAssign) -> "VisitorReturn":
         return self.generic_visit(node)
 
-    def visit_ann_assign(self, node: TypedAnnAssign):
+    def visit_ann_assign(self, node: TypedAnnAssign) -> "VisitorReturn":
         return self.generic_visit(node)
 
-    def visit_aug_assign(self, node: TypedAugAssign):
+    def visit_aug_assign(self, node: TypedAugAssign) -> "VisitorReturn":
         return self.generic_visit(node)
 
-    def visit_expr_stmt(self, node: TypedExprStmt):
+    def visit_expr_stmt(self, node: TypedExprStmt) -> "VisitorReturn":
         return self.generic_visit(node)
 
-    def visit_return(self, node: TypedReturn):
+    def visit_return(self, node: TypedReturn) -> "VisitorReturn":
         return self.generic_visit(node)
 
-    def visit_if(self, node: TypedIf):
+    def visit_if(self, node: TypedIf) -> "VisitorReturn":
         return self.generic_visit(node)
 
-    def visit_while(self, node: TypedWhile):
+    def visit_while(self, node: TypedWhile) -> "VisitorReturn":
         return self.generic_visit(node)
 
-    def visit_for(self, node: TypedFor):
+    def visit_for(self, node: TypedFor) -> "VisitorReturn":
         return self.generic_visit(node)
 
-    def visit_function_def(self, node: TypedFunctionDef):
+    def visit_function_def(self, node: TypedFunctionDef) -> "VisitorReturn":
         return self.generic_visit(node)
 
-    def visit_class_def(self, node: TypedClassDef):
+    def visit_class_def(self, node: TypedClassDef) -> "VisitorReturn":
         return self.generic_visit(node)
 
-    def visit_module(self, node: TypedModule):
+    def visit_module(self, node: TypedModule) -> "VisitorReturn":
         return self.generic_visit(node)

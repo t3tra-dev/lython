@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from ..ast_nodes import (
     Span,
@@ -50,12 +50,15 @@ class TypeConstraint:
         return f"{self.left} ~ {self.right} ({self.reason} at {self.span})"
 
 
+def _make_constraint_list() -> List["TypeConstraint"]:
+    return []
+
 @dataclass
 class TypeVariable:
     """型変数"""
 
     name: str
-    constraints: List[TypeConstraint] = field(default_factory=list)
+    constraints: List["TypeConstraint"] = field(default_factory=_make_constraint_list)
     resolved_type: Optional[Type] = None
 
     def __str__(self) -> str:
@@ -67,12 +70,15 @@ class TypeVariable:
         return self.resolved_type is not None
 
 
+def _make_symbol_dict() -> Dict[str, Type]:
+    return {}
+
 @dataclass
 class SymbolTable:
     """シンボルテーブル - 変数名と型の対応を管理"""
 
-    symbols: Dict[str, Type] = field(default_factory=dict)
-    parent: Optional[SymbolTable] = None
+    symbols: Dict[str, Type] = field(default_factory=_make_symbol_dict)
+    parent: Optional["SymbolTable"] = None
     is_native_scope: bool = False  # @native関数内かどうか
 
     def lookup(self, name: str) -> Optional[Type]:
@@ -104,7 +110,7 @@ class SymbolTable:
 class ConstraintSolver:
     """型制約ソルバー - Hindley-Milner風の単一化アルゴリズム"""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.constraints: List[TypeConstraint] = []
         self.type_variables: Dict[str, TypeVariable] = {}
         self.next_var_id = 0
@@ -117,7 +123,7 @@ class ConstraintSolver:
         self.type_variables[var_name] = var
         return var
 
-    def add_constraint(self, left: Type, right: Type, span: Span, reason: str):
+    def add_constraint(self, left: Type, right: Type, span: Span, reason: str) -> None:
         """制約を追加"""
         constraint = TypeConstraint(left, right, span, reason)
         self.constraints.append(constraint)
@@ -227,7 +233,7 @@ class ConstraintSolver:
 
     def _unify_unions(self, t1: Type, t2: Type) -> Type:
         """Union型の単一化"""
-        types = set()
+        types: Set[Type] = set()
 
         if isinstance(t1, UnionType):
             types.update(t1.types)
@@ -247,7 +253,7 @@ class ConstraintSolver:
             return None
 
         # パラメータ型の単一化（反変性）
-        unified_params = []
+        unified_params: List[Type] = []
         for p1, p2 in zip(t1.param_types, t2.param_types):
             unified = self.unify(p1, p2)
             if unified is None:
@@ -270,7 +276,7 @@ class ConstraintSolver:
         if len(t1.element_types) != len(t2.element_types):
             return None
 
-        unified_elements = []
+        unified_elements: List[Type] = []
         for e1, e2 in zip(t1.element_types, t2.element_types):
             unified = self.unify(e1, e2)
             if unified is None:
@@ -287,7 +293,7 @@ class ConstraintSolver:
         if len(t1.type_args) != len(t2.type_args):
             return None
 
-        unified_args = []
+        unified_args: List[Type] = []
         for a1, a2 in zip(t1.type_args, t2.type_args):
             unified = self.unify(a1, a2)
             if unified is None:
@@ -309,7 +315,7 @@ class ConstraintSolver:
                     changed = True
 
         # 型変数の解決結果を返す
-        result = {}
+        result: Dict[str, Type] = {}
         for var_name, var in self.type_variables.items():
             if var.resolved_type:
                 result[var_name] = var.resolved_type
@@ -322,7 +328,7 @@ class ConstraintSolver:
 class TypeInferenceEngine:
     """型推論の主要エンジン"""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.solver = ConstraintSolver()
         self.symbol_table = SymbolTable()
         self.current_function: Optional[TypedFunctionDef] = None
@@ -339,7 +345,7 @@ class TypeInferenceEngine:
         # 3. 型の適用フェーズ: 解決された型をASTに適用
         return self._apply_types(module, resolved_types)
 
-    def _collect_constraints(self, node: Any):
+    def _collect_constraints(self, node: Any) -> None:
         """型制約を収集"""
         if isinstance(node, TypedModule):
             for stmt in node.body:
@@ -368,7 +374,7 @@ class TypeInferenceEngine:
 
         # 他のノード型についても同様に処理
 
-    def _collect_function_constraints(self, node: TypedFunctionDef):
+    def _collect_function_constraints(self, node: TypedFunctionDef) -> None:
         """関数定義の型制約を収集"""
         # @nativeデコレータの検出
         is_native = self._is_native_function(node)
@@ -382,7 +388,7 @@ class TypeInferenceEngine:
 
         try:
             # 引数の型を登録
-            param_types = []
+            param_types: List[Type] = []
             for arg in node.args.args:
                 if arg.annotation:
                     arg_type = self._infer_type_annotation(arg.annotation)
@@ -425,7 +431,7 @@ class TypeInferenceEngine:
             self.symbol_table = old_table
             self.current_function = old_function
 
-    def _collect_assign_constraints(self, node: TypedAssign):
+    def _collect_assign_constraints(self, node: TypedAssign) -> None:
         """代入文の型制約を収集"""
         # 右辺の型推論
         self._collect_constraints(node.value)
@@ -452,7 +458,7 @@ class TypeInferenceEngine:
                     self.symbol_table.define(target.id, value_type)
                     target.ty = Ty(str(value_type), value_type.get_llvm_type())
 
-    def _collect_ann_assign_constraints(self, node: TypedAnnAssign):
+    def _collect_ann_assign_constraints(self, node: TypedAnnAssign) -> None:
         """型注釈付き代入の型制約を収集"""
         # 型注釈から型を取得
         annotation_type = self._infer_type_annotation(node.annotation)
@@ -473,7 +479,7 @@ class TypeInferenceEngine:
             self.symbol_table.define(node.target.id, annotation_type)
             node.target.ty = Ty(str(annotation_type), annotation_type.get_llvm_type())
 
-    def _collect_binop_constraints(self, node: TypedBinOp):
+    def _collect_binop_constraints(self, node: TypedBinOp) -> None:
         """二項演算の型制約を収集"""
         self._collect_constraints(node.left)
         self._collect_constraints(node.right)
@@ -485,7 +491,7 @@ class TypeInferenceEngine:
         result_type = self._infer_binop_type(node.op, left_type, right_type, node.span)
         node.ty = Ty(str(result_type), result_type.get_llvm_type())
 
-    def _collect_call_constraints(self, node: TypedCall):
+    def _collect_call_constraints(self, node: TypedCall) -> None:
         """関数呼び出しの型制約を収集"""
         self._collect_constraints(node.func)
 
@@ -520,12 +526,12 @@ class TypeInferenceEngine:
             self.errors.append(f"呼び出し不可能な型: {func_type} at {node.span}")
             node.ty = Ty("Any", "%pyobj*")
 
-    def _collect_constant_constraints(self, node: TypedConstant):
+    def _collect_constant_constraints(self, node: TypedConstant) -> None:
         """定数の型制約を収集"""
         const_type = self._infer_constant_type(node.value)
         node.ty = Ty(str(const_type), const_type.get_llvm_type())
 
-    def _collect_name_constraints(self, node: TypedName):
+    def _collect_name_constraints(self, node: TypedName) -> None:
         """変数参照の型制約を収集"""
         var_type = self.symbol_table.lookup(node.id)
         if var_type:
