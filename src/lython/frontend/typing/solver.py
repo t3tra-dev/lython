@@ -392,7 +392,7 @@ class TypeInferenceEngine:
                 else:
                     if is_native:
                         self.errors.append(
-                            f"@native関数の引数 {arg.arg} に型注釈が必要です at {node.span}"
+                            f"Argument {arg.arg} of @native function requires a type annotation at {node.span}"
                         )
                     arg_type = UnknownType()
                     # arg.ty = arg_type  # Type assignment
@@ -405,7 +405,7 @@ class TypeInferenceEngine:
             else:
                 if is_native:
                     self.errors.append(
-                        f"@native関数 {node.name} に戻り値の型注釈が必要です at "
+                        f"@native function {node.name} requires a return type annotation at "
                         f"{node.span}"
                     )
                 return_type = UnknownType()
@@ -444,8 +444,8 @@ class TypeInferenceEngine:
                         target.ty = Ty(str(unified), unified.get_llvm_type())
                     else:
                         self.errors.append(
-                            f"型不一致: {target.id} には {existing_type} が期待されますが "
-                            f"{value_type} が代入されました at {node.span}"
+                            f"Type mismatch: {target.id} is expected to be {existing_type}, "
+                            f"but {value_type} was assigned at {node.span}"
                         )
                 else:
                     # 新しい変数の定義
@@ -464,8 +464,8 @@ class TypeInferenceEngine:
 
             if not value_type.is_assignable_to(annotation_type):
                 self.errors.append(
-                    f"型不一致: {annotation_type} が期待されますが "
-                    f"{value_type} が代入されました at {node.span}"
+                    f"Type mismatch: Expected {annotation_type}, but got "
+                    f"{value_type} at {node.span}"
                 )
 
         # 変数をシンボルテーブルに登録
@@ -498,8 +498,8 @@ class TypeInferenceEngine:
             # 引数の数と型をチェック
             if len(node.args) != len(func_type.param_types):
                 self.errors.append(
-                    f"引数の数が不正: {len(func_type.param_types)}個期待されますが"
-                    f"{len(node.args)}個提供されました at {node.span}"
+                    f"Invalid number of arguments: Expected {len(func_type.param_types)}, "
+                    f"but got {len(node.args)} at {node.span}"
                 )
             else:
                 for i, (arg, expected_type) in enumerate(
@@ -508,8 +508,8 @@ class TypeInferenceEngine:
                     arg_type = self._get_expression_type(arg)
                     if not arg_type.is_assignable_to(expected_type):
                         self.errors.append(
-                            f"引数{i+1}の型不一致: {expected_type} が期待されますが "
-                            f"{arg_type} が提供されました at {node.span}"
+                            f"Type mismatch for argument {i + 1}: Expected {expected_type}, "
+                            f"but got {arg_type} at {node.span}"
                         )
 
             node.ty = Ty(
@@ -531,7 +531,7 @@ class TypeInferenceEngine:
         if var_type:
             node.ty = Ty(str(var_type), var_type.get_llvm_type())
         else:
-            self.errors.append(f"未定義の変数: {node.id} at {node.span}")
+            self.errors.append(f"Undefined variable: {node.id} at {node.span}")
             node.ty = Ty("Any", "%pyobj*")
 
     def _is_native_function(self, node: TypedFunctionDef) -> bool:
