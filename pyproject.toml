@@ -23,7 +23,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 only-include = ["src"]
-sources = ["src"]
 
 [tool.mypy]
 files = "src/lython"
