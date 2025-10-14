@@ -230,3 +230,5 @@ Mkfile.old
 dkms.conf
 
 # --- End of C.gitignore ---
+
+src/lython/mlir

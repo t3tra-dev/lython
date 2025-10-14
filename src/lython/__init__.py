@@ -18,7 +18,9 @@ __path__ = __import__("pkgutil").extend_path(__path__, __name__)
 import logging
 from typing import Literal, NamedTuple
 
-__all__: list[str] = []
+from . import mlir
+
+__all__: list[str] = ["mlir"]
 
 
 class VersionInfo(NamedTuple):
