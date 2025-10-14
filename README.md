@@ -9,6 +9,20 @@
 
 ---
 
+セットアップ
+
+```bash
+git clone https://github.com/t3tra-dev/lython.git
+cd lython
+uv sync
+source ./venv/bin/activate
+./build.sh
+./vendor_mlir.sh
+uv build
+```
+
+---
+
 ## ライセンス
 
 本リポジトリのソースコードは、特記がない限り [MIT License](https://opensource.org/licenses/MIT) で配布されています。  
