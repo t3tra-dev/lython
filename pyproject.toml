@@ -22,7 +22,7 @@ build-backend = "hatchling.build"
 
 [tool.pyright]
 include = ["src/lython"]
-exclude = ["**/__pycache__"]
+exclude = ["**/__pycache__", "**/*.pyi"]
 ignore = ["third_party/", "src/lython/mlir/"]
 typeCheckingMode = "strict"
 

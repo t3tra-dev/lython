@@ -22,7 +22,45 @@ else
   (cd "$BUILD_MLIR" && tar cf - .) | (cd "$SRC_MLIR" && tar xpf -)
 fi
 
-# パッケージとして認識されるよう保険で __init__.py を作成
-[[ -f "$SRC_MLIR/__init__.py" ]] || : > "$SRC_MLIR/__init__.py"
+# パッケージとして認識されるように __init__.py を作成
+cat > "$SRC_MLIR/__init__.py" << 'EOF'
+from __future__ import annotations
+
+import sys as _sys
+from importlib import import_module as _import_module
+
+from . import _mlir_libs
+from . import dialects
+from . import execution_engine
+from . import ir
+from . import passmanager
+from . import rewrite
+
+_sys.modules.setdefault("mlir", _sys.modules[__name__])
+
+_sys.modules.setdefault("mlir._mlir_libs", _mlir_libs)
+_sys.modules.setdefault("mlir.dialects", dialects)
+_sys.modules.setdefault("mlir.execution_engine", execution_engine)
+_sys.modules.setdefault("mlir.ir", ir)
+_sys.modules.setdefault("mlir.passmanager", passmanager)
+_sys.modules.setdefault("mlir.rewrite", rewrite)
+
+try:
+    _mlir_pkg = _import_module("._mlir_libs._mlir", __name__)
+    _sys.modules.setdefault("mlir._mlir_libs._mlir", _mlir_pkg)
+except Exception:
+    pass
+
+__all__ = [
+    "ir",
+    "execution_engine",
+    "passmanager",
+    "rewrite",
+    "dialects",
+    "_mlir_libs",
+]
+
+del _sys, _import_module
+EOF
 
 echo "Done."
