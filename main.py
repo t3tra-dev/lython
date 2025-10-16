@@ -1,8 +1,6 @@
 from lython.mlir import ir
 from lython.mlir.dialects import arith, func
 
-print(f"mlir.ir: {ir}")
-
 ctx = ir.Context()
 i32 = ir.IntegerType.get_signless(32, ctx)
 i32_zero = ir.IntegerAttr.get(i32, 0)
