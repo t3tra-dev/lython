@@ -14,10 +14,10 @@ class TypeIgnoreVisitor(BaseVisitor):
     def __init__(self, ctx: ir.Context):
         super().__init__(ctx)
 
-    def visit_type_ignore(self, node: ast.type_ignore) -> None:
+    def visit_TypeIgnore(self, node: ast.TypeIgnore) -> None:
         """
         ```asdl
         type_ignore = TypeIgnore(int lineno, string tag)
         ```
         """
-        raise NotImplementedError("type_ignore not implemented")
+        raise NotImplementedError("TypeIgnore not implemented")

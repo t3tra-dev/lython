@@ -14,7 +14,7 @@ class TypeParamVisitor(BaseVisitor):
     def __init__(self, ctx: ir.Context):
         super().__init__(ctx)
 
-    def visit_tyoe_param(self, node: ast.type_param) -> None:
+    def visit_type_param(self, node: ast.type_param) -> None:
         """
         ```asdl
         type_param = TypeVar(identifier name, expr? bound, expr? default_value)

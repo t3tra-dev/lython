@@ -8,6 +8,7 @@ class UnaryOpVisitor(BaseVisitor):
     """
     ```asdl
     unaryop = Invert | Not | UAdd | USub
+    ```
     """
 
     def __init__(self, ctx: ir.Context):
@@ -35,7 +36,7 @@ class UnaryOpVisitor(BaseVisitor):
         UAdd
         ```
         """
-        raise NotImplementedError("UAdd unaryop not implemted")
+        raise NotImplementedError("UAdd unaryop not implemented")
 
     def visit_USub(self, node: ast.USub) -> None:
         """
@@ -43,4 +44,4 @@ class UnaryOpVisitor(BaseVisitor):
         USub
         ```
         """
-        raise NotImplementedError("USub unaryop not implemted")
+        raise NotImplementedError("USub unaryop not implemented")

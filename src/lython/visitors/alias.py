@@ -26,4 +26,4 @@ class AliasVisitor(BaseVisitor):
         )
         ```
         """
-        raise NotImplementedError("alias not implemeted")
+        raise NotImplementedError("alias not implemented")

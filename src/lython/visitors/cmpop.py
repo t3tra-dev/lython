@@ -22,9 +22,6 @@ class CmpOpVisitor(BaseVisitor):
     def __init__(self, ctx: ir.Context):
         super().__init__(ctx)
 
-    def visit_Compare(self, node: ast.Compare) -> ir.Value:
-        raise NotImplementedError("Compare node handling not implemented")
-
     def visit_Eq(self, left: ir.Value, right: ir.Value) -> ir.Value:
         """
         ```asdl

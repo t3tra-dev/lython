@@ -5,8 +5,6 @@ from typing import NoReturn
 
 from ..mlir import ir
 
-ctx = ir.Context()
-
 __all__ = ["BaseVisitor"]
 
 
