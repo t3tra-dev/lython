@@ -26,5 +26,16 @@ exclude = ["**/__pycache__", "**/*.pyi"]
 ignore = ["third_party/", "src/lython/mlir/"]
 typeCheckingMode = "strict"
 
+[tool.black]
+extend-exclude = """
+^/third_party/*
+|^/src/lython/mlir/*
+"""
+
+[tool.isort]
+profile = "black"
+line_length = 88
+extend_skip_glob = ["third_party/*", "src/lython/mlir/*"]
+
 [tool.uv.sources]
 lython = { workspace = true }
