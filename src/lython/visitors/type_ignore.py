@@ -1,0 +1,23 @@
+import ast
+
+from ..mlir import ir
+from ._base import BaseVisitor
+
+
+class TypeIgnoreVisitor(BaseVisitor):
+    """
+    ```asdl
+    type_ignore = TypeIgnore(int lineno, string tag)
+    ```
+    """
+
+    def __init__(self, ctx: ir.Context) -> None:
+        super().__init__(ctx)
+
+    def visit_TypeIgnore(self, node: ast.TypeIgnore) -> None:
+        """
+        ```asdl
+        type_ignore = TypeIgnore(int lineno, string tag)
+        ```
+        """
+        raise NotImplementedError("TypeIgnore not implemented")
