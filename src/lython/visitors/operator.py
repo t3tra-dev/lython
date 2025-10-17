@@ -19,7 +19,7 @@ class OperatorVisitor(BaseVisitor):
     ```
     """
 
-    def __init__(self, ctx: ir.Context):
+    def __init__(self, ctx: ir.Context) -> None:
         super().__init__(ctx)
 
     def visit_Add(self, node: ast.Add) -> None:

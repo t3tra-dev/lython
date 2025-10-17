@@ -12,7 +12,7 @@ class ArgumentsVisitor(BaseVisitor):
     ```
     """
 
-    def __init__(self, ctx: ir.Context):
+    def __init__(self, ctx: ir.Context) -> None:
         super().__init__(ctx)
 
     def visit_arguments(self, node: ast.arguments) -> None:

@@ -5,7 +5,7 @@ __all__ = ["Parser"]
 
 
 class Parser(BaseVisitor):
-    def __init__(self, ctx: ir.Context):
+    def __init__(self, ctx: ir.Context) -> None:
         super().__init__(ctx)
 
         from .visitors.mod import ModVisitor

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-from typing import Any
 
 from ..mlir import ir
 from ._base import BaseVisitor
@@ -19,10 +18,10 @@ class CmpOpVisitor(BaseVisitor):
     ```
     """
 
-    def __init__(self, ctx: ir.Context):
+    def __init__(self, ctx: ir.Context) -> None:
         super().__init__(ctx)
 
-    def visit_Eq(self, left: ir.Value, right: ir.Value) -> ir.Value:
+    def visit_Eq(self, node: ast.Eq) -> None:
         """
         ```asdl
         Eq
@@ -30,7 +29,7 @@ class CmpOpVisitor(BaseVisitor):
         """
         raise NotImplementedError("'==' operator not supported")
 
-    def visit_NotEq(self, left: ir.Value, right: ir.Value) -> ir.Value:
+    def visit_NotEq(self, node: ast.NotEq) -> None:
         """
         ```asdl
         NotEq
@@ -38,7 +37,7 @@ class CmpOpVisitor(BaseVisitor):
         """
         raise NotImplementedError("'!=' operator not supported")
 
-    def visit_Lt(self, left: ir.Value, right: ir.Value) -> ir.Value:
+    def visit_Lt(self, node: ast.Lt) -> None:
         """
         ```asdl
         Lt
@@ -46,7 +45,7 @@ class CmpOpVisitor(BaseVisitor):
         """
         raise NotImplementedError("'<' operator not supported")
 
-    def visit_LtE(self, left: ir.Value, right: ir.Value) -> ir.Value:
+    def visit_LtE(self, node: ast.LtE) -> None:
         """
         ```asdl
         LtE
@@ -54,7 +53,7 @@ class CmpOpVisitor(BaseVisitor):
         """
         raise NotImplementedError("'<=' operator not supported")
 
-    def visit_Gt(self, left: ir.Value, right: ir.Value) -> ir.Value:
+    def visit_Gt(self, node: ast.Gt) -> None:
         """
         ```asdl
         Gt
@@ -62,7 +61,7 @@ class CmpOpVisitor(BaseVisitor):
         """
         raise NotImplementedError("'>' operator not supported")
 
-    def visit_GtE(self, left: ir.Value, right: ir.Value) -> ir.Value:
+    def visit_GtE(self, node: ast.GtE) -> None:
         """
         ```asdl
         GtE
@@ -70,7 +69,7 @@ class CmpOpVisitor(BaseVisitor):
         """
         raise NotImplementedError("'>=' operator not supported")
 
-    def visit_Is(self, node: ast.Is) -> ir.Value:
+    def visit_Is(self, node: ast.Is) -> None:
         """
         ```asdl
         Is
@@ -78,7 +77,7 @@ class CmpOpVisitor(BaseVisitor):
         """
         raise NotImplementedError("'is' operator not supported")
 
-    def visit_IsNot(self, node: ast.IsNot) -> ir.Value:
+    def visit_IsNot(self, node: ast.IsNot) -> None:
         """
         ```asdl
         IsNot
@@ -86,7 +85,7 @@ class CmpOpVisitor(BaseVisitor):
         """
         raise NotImplementedError("'is not' operator not supported")
 
-    def visit_In(self, node: ast.In) -> ir.Value:
+    def visit_In(self, node: ast.In) -> None:
         """
         ```asdl
         In
@@ -94,13 +93,10 @@ class CmpOpVisitor(BaseVisitor):
         """
         raise NotImplementedError("'in' operator not supported")
 
-    def visit_NotIn(self, node: ast.NotIn) -> ir.Value:
+    def visit_NotIn(self, node: ast.NotIn) -> None:
         """
         ```asdl
         NotIn
         ```
         """
         raise NotImplementedError("'not in' operator not supported")
-
-    def generic_visit(self, node: ast.AST) -> Any:
-        raise NotImplementedError(f"Unknown cmpop: {type(node).__name__}")

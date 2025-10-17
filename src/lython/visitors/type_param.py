@@ -11,7 +11,7 @@ class TypeParamVisitor(BaseVisitor):
     ```
     """
 
-    def __init__(self, ctx: ir.Context):
+    def __init__(self, ctx: ir.Context) -> None:
         super().__init__(ctx)
 
     def visit_type_param(self, node: ast.type_param) -> None:

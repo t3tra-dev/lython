@@ -17,13 +17,13 @@ class BaseVisitor:
     self.subvisitors に登録されている対応するVisitorへ転送。
     """
 
-    def __init__(self, ctx: ir.Context):
+    def __init__(self, ctx: ir.Context) -> None:
         self.ctx = ctx
         self.subvisitors: dict[str, BaseVisitor] = {}
         for v in self.subvisitors.values():
             v.subvisitors = self.subvisitors
 
-    def visit(self, node: ast.AST) -> ir.Value:
+    def visit(self, node: ast.AST) -> None:
         method_name = f"visit_{type(node).__name__}"
 
         # 1) このビジター自身が実装していれば呼び出し

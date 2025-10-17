@@ -16,17 +16,17 @@ class BoolOpVisitor(BaseVisitor):
     ```
     """
 
-    def __init__(self, ctx: ir.Context):
+    def __init__(self, ctx: ir.Context) -> None:
         super().__init__(ctx)
 
-    def visit_BoolOp(self, node: ast.BoolOp) -> ir.Value:
+    def visit_BoolOp(self, node: ast.BoolOp) -> None:
         """
         論理演算子を処理する。
         短絡評価を適切に実装する。
         """
         raise NotImplementedError(f"Unsupported boolop: {type(node.op).__name__}")
 
-    def visit_And(self, node: ast.And) -> ir.Value:
+    def visit_And(self, node: ast.And) -> None:
         """
         AND演算子 (論理積) を処理する。
         短絡評価: 左辺が偽なら右辺は評価しない。
@@ -37,7 +37,7 @@ class BoolOpVisitor(BaseVisitor):
         """
         raise NotImplementedError("And not implemented")
 
-    def visit_Or(self, node: ast.Or) -> ir.Value:
+    def visit_Or(self, node: ast.Or) -> None:
         """
         OR演算子 (論理和) を処理する。
         短絡評価: 左辺が真なら右辺は評価しない。

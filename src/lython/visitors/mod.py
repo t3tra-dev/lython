@@ -22,7 +22,7 @@ class ModVisitor(BaseVisitor):
     ```
     """
 
-    def __init__(self, ctx: ir.Context):
+    def __init__(self, ctx: ir.Context) -> None:
         super().__init__(ctx)
 
     def visit_Module(self, node: ast.Module) -> None:
