@@ -4,16 +4,21 @@
             "name": "Mac",
             "includePath": [
                 "${workspaceFolder}/**",
-                "${workspaceFolder}/build/src/dialects/**",
-                "${workspaceFolder}/src/dialects/include/**",
-                "${workspaceFolder}/third_party/llvm-project/mlir/include/**"
+                "${workspaceFolder}/src/**",
+                "${workspaceFolder}/src/lython/dialects/**",
+                "${workspaceFolder}/build/src/lython/dialects/**",
+                "${workspaceFolder}/third_party/llvm-project/llvm/include/**",
+                "${workspaceFolder}/third_party/llvm-project/mlir/include/**",
+                "${workspaceFolder}/third_party/llvm-project/build/include/**",
+                "${workspaceFolder}/third_party/llvm-project/build/tools/mlir/include/**",
+                "/opt/homebrew/include/**"
             ],
-            "defines": [],
-            "compilerPath": "/opt/homebrew/bin/clang",
+            "compilerPath": "/opt/homebrew/bin/clang++",
             "cStandard": "c17",
             "cppStandard": "c++17",
             "intelliSenseMode": "macos-clang-arm64",
-            "configurationProvider": "ms-vscode.cmake-tools"
+            "configurationProvider": "ms-vscode.cmake-tools",
+            "compileCommands": "${workspaceFolder}/build/compile_commands.json"
         }
     ],
     "version": 4
