@@ -21,11 +21,11 @@ add_custom_command(
   VERBATIM
 )
 
-# デバッグ: 生成されたファイルの確認
+# Debug output: confirm generated file locations
 message(STATUS "Generated files will be placed in: ${CMAKE_CURRENT_BINARY_DIR}")
 message(STATUS "Python bindings will be placed in: ${PYTHON_BINDINGS_OUTPUT_DIR}")
 
-# インクルードディレクトリを設定
+# Configure include directories
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 include_directories(${CMAKE_CURRENT_BINARY_DIR})
 

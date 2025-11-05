@@ -54,7 +54,8 @@ LogicalResult ClassOp::verify() {
 
   Block &block = body.front();
   llvm::StringSet<> methodNames;
-  ClassType classType = ClassType::get(getContext(), getSymName());
+  ClassType classType =
+      ClassType::get(getContext(), getSymNameAttr().getValue());
 
   for (Operation &op : block) {
     FuncOp method = dyn_cast<FuncOp>(&op);
@@ -84,7 +85,7 @@ LogicalResult ClassOp::verify() {
     if (selfType != classType && !isPyObjectType(selfType))
       return method.emitOpError(
                  "first positional parameter must be of type !py.class<")
-             << getSymName() << "> or !py.object";
+             << getSymNameAttr().getValue() << "> or !py.object";
   }
 
   return success();
@@ -329,8 +330,9 @@ LogicalResult CallOp::verify() {
       return emitOpError("kwargs mapping must use !py.str keys");
     if (!isSubtypeOf(dictTy.getValueType(), ObjectType::get(getContext())))
       return emitOpError("kwargs mapping must use !py.object values");
-  } else if (dictTy && !getKwargs().getDefiningOp<DictEmptyOp>()) {
-    return emitOpError("callee does not accept keyword arguments");
+  } else if (!kwargsIsNone) {
+    return emitOpError(
+        "callee does not accept keyword arguments; use !py.none");
   }
 
   mlir::ArrayRef<mlir::Type> resultTypes = signature.getResultTypes();
@@ -785,8 +787,10 @@ LogicalResult CallVectorOp::verify() {
       if (auto strAttr = dyn_cast<StringAttr>(attr))
         expectedNames.push_back(strAttr.getValue());
     }
-    llvm::SmallSet<StringRef, 8> providedSet(providedKwNames.begin(),
-                                             providedKwNames.end());
+    llvm::SmallSet<StringRef, 8> providedSet;
+    for (StringRef providedName : providedKwNames)
+      if (!providedSet.insert(providedName).second)
+        return emitOpError("duplicate keyword '") << providedName << "'";
     for (StringRef expected : expectedNames)
       if (!providedSet.contains(expected))
         return emitOpError("missing keyword argument '") << expected << "'";

@@ -199,8 +199,7 @@ bool isCallableType(Type type) {
 bool isPyType(Type type) {
   return llvm::TypeSwitch<Type, bool>(type)
       .Case<IntType, FloatType, BoolType, StrType, ObjectType, NoneType,
-            TupleType, DictType, ClassType, FuncType, PrimFuncType>(
-          [](auto) { return true; })
+            TupleType, DictType, ClassType, FuncType>([](auto) { return true; })
       .Default([](Type) { return false; });
 }
 
