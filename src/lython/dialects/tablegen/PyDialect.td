@@ -377,7 +377,9 @@ def Py_CastToPrimOp : Py_Op<"cast.to_prim", [Pure]> {
   let description = [{
     Converts a Python object type to the corresponding primitive MLIR type.
     This is an explicit unboxing operation with no implicit conversions.
-    Runtime checks may be inserted at lowering to ensure type safety.
+    Runtime checks may be inserted at lowering to ensure type safety. The
+    mandatory `mode` attribute selects the conversion policy and must be
+    one of "exact", "truncate", or "saturate" (see verifier).
 
     Example:
       %i32_val = py.cast.to_prim %py_int : !py.int -> i32
@@ -392,7 +394,7 @@ def Py_CastToPrimOp : Py_Op<"cast.to_prim", [Pure]> {
 
   let results = (outs AnyType:$result);
 
-  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
+  let assemblyFormat = "$input `mode` `=` $mode attr-dict `:` type($input) `->` type($result)";
   let hasVerifier = 1;
   let hasCustomAssemblyFormat = 0;
 
