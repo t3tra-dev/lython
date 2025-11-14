@@ -37,7 +37,8 @@ class ModVisitor(BaseVisitor):
         ```
         """
         with ir.Location.unknown(self.ctx):
-            _ = ir.Module.create()
+            module = ir.Module.create()
+        self._set_module(module)
 
         for stmt in node.body:
             self.visit(stmt)

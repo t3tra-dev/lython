@@ -392,7 +392,11 @@ class StmtVisitor(BaseVisitor):
         Expr(expr value)
         ```
         """
-        raise NotImplementedError("Expression statement not implemented")
+        expr_visitor = self.subvisitors.get("Expr")
+        if expr_visitor is None:
+            raise NotImplementedError("Expression visitor not available")
+        expr_visitor.visit(node.value)
+        return None
 
     def visit_Pass(self, node: ast.Pass) -> None:
         """
