@@ -395,6 +395,7 @@ class StmtVisitor(BaseVisitor):
         expr_visitor = self.subvisitors.get("Expr")
         if expr_visitor is None:
             raise NotImplementedError("Expression visitor not available")
+        expr_visitor.current_block = self.current_block
         expr_visitor.visit(node.value)
         return None
 

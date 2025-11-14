@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import ast
-from typing import Any
-
 from ..mlir import ir
 from ._base import BaseVisitor
 from lython.mlir.dialects import _lython_ops_gen as py_ops
@@ -71,9 +69,9 @@ class ExprVisitor(BaseVisitor):
         super().__init__(ctx, subvisitors=subvisitors)
 
     def _set_insertion_point(self):
-        if self.module is None:
-            raise RuntimeError("IR module has not been initialized")
-        return ir.InsertionPoint(self.module.body)
+        if self.current_block is None:
+            raise RuntimeError("Insertion block is not set")
+        return ir.InsertionPoint(self.current_block)
 
     def _ensure_object(self, value: ir.Value) -> ir.Value:
         object_type = self.get_py_type("!py.object")
@@ -81,13 +79,6 @@ class ExprVisitor(BaseVisitor):
             return value
         with ir.Location.unknown(self.ctx), self._set_insertion_point():
             return py_ops.UpcastOp(object_type, value).result
-
-    def _require_value(self, node: ast.AST, result: Any) -> ir.Value:
-        if not isinstance(result, ir.Value):
-            raise TypeError(
-                f"Visitor for {type(node).__name__} must return an MLIR value"
-            )
-        return result
 
     def visit_BoolOp(self, node: ast.BoolOp) -> None:
         """
@@ -252,17 +243,18 @@ class ExprVisitor(BaseVisitor):
         Call(expr func, expr* args, keyword* keywords)
         ```
         """
-        callee = self._require_value(node.func, self.visit(node.func))
+        callee = self.require_value(node.func, self.visit(node.func))
         args = [
-            self._ensure_object(self._require_value(arg, self.visit(arg)))
+            self._ensure_object(self.require_value(arg, self.visit(arg)))
             for arg in node.args
         ]
 
-        with ir.Location.unknown(self.ctx), self._set_insertion_point():
+        loc = ir.Location.file("<module>", node.lineno, node.col_offset + 1, self.ctx)
+        with loc, self._set_insertion_point():
             if args:
-                posargs = py_ops.TupleCreateOp(
-                    self.get_py_type("!py.tuple<!py.object>"), args
-                ).result
+                element_specs = ", ".join("!py.object" for _ in args)
+                tuple_type = self.get_py_type(f"!py.tuple<{element_specs}>")
+                posargs = py_ops.TupleCreateOp(tuple_type, args).result
             else:
                 posargs = py_ops.TupleEmptyOp(self.get_py_type("!py.tuple<>")).result
             empty_tuple = self.get_py_type("!py.tuple<>")
@@ -350,7 +342,7 @@ class ExprVisitor(BaseVisitor):
         """
         if node.id == "print":
             func_type = self.get_py_type(
-                "!py.func<!py.funcsig<[!py.object] -> [!py.none]>>"
+                "!py.func<!py.funcsig<[], vararg = !py.tuple<!py.object> -> [!py.none]>>"
             )
             symbol = ir.FlatSymbolRefAttr.get("__builtin_print", self.ctx)
             with ir.Location.unknown(self.ctx), self._set_insertion_point():
