@@ -22,8 +22,13 @@ class ModVisitor(BaseVisitor):
     ```
     """
 
-    def __init__(self, ctx: ir.Context) -> None:
-        super().__init__(ctx)
+    def __init__(
+        self,
+        ctx: ir.Context,
+        *,
+        subvisitors: dict[str, BaseVisitor],
+    ) -> None:
+        super().__init__(ctx, subvisitors=subvisitors)
 
     def visit_Module(self, node: ast.Module) -> None:
         """
@@ -31,6 +36,9 @@ class ModVisitor(BaseVisitor):
         Module(stmt* body, type_ignore* type_ignores)
         ```
         """
+        with ir.Location.unknown(self.ctx):
+            _ = ir.Module.create()
+
         for stmt in node.body:
             self.visit(stmt)
         return None

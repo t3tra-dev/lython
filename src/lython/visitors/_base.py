@@ -17,11 +17,27 @@ class BaseVisitor:
     self.subvisitors に登録されている対応するVisitorへ転送。
     """
 
-    def __init__(self, ctx: ir.Context) -> None:
+    def __init__(
+        self,
+        ctx: ir.Context,
+        *,
+        subvisitors: dict[str, "BaseVisitor"] | None = None,
+    ) -> None:
         self.ctx = ctx
-        self.subvisitors: dict[str, BaseVisitor] = {}
-        for v in self.subvisitors.values():
-            v.subvisitors = self.subvisitors
+        self.module: ir.Module | None = None
+
+        if subvisitors is None:
+            subvisitors = {}
+            self.subvisitors = subvisitors
+            from .mod import ModVisitor
+            from .stmt import StmtVisitor
+
+            subvisitors["Module"] = ModVisitor(ctx, subvisitors=subvisitors)
+            subvisitors["Stmt"] = StmtVisitor(ctx, subvisitors=subvisitors)
+            for visitor in subvisitors.values():
+                visitor.subvisitors = subvisitors
+        else:
+            self.subvisitors = subvisitors
 
     def visit(self, node: ast.AST) -> None:
         method_name = f"visit_{type(node).__name__}"

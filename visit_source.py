@@ -1,20 +1,13 @@
 import ast
-import inspect
 
 from lython.mlir import ir
-from lython.parser import Parser
+from lython.visitors._base import BaseVisitor as Parser
 
-
-def fib(n: int) -> int:
-    if n <= 1:
-        return n
-    return fib(n - 1) + fib(n - 2)
-
-
-source = inspect.getsource(fib)
+source = 'print("Hello, world!")\n'
 tree = ast.parse(source)
 print(ast.dump(tree, indent=4))
 
 ctx = ir.Context()
 parser = Parser(ctx)
 parser.visit(tree)
+print(parser.module)
