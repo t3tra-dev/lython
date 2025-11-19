@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import ast
 
+from lython.mlir.dialects import _lython_ops_gen as py_ops
+
 from ..mlir import ir
 from ._base import BaseVisitor
 
@@ -60,8 +62,25 @@ class ExprVisitor(BaseVisitor):
     ```
     """
 
-    def __init__(self, ctx: ir.Context) -> None:
-        super().__init__(ctx)
+    def __init__(
+        self,
+        ctx: ir.Context,
+        *,
+        subvisitors: dict[str, BaseVisitor],
+    ) -> None:
+        super().__init__(ctx, subvisitors=subvisitors)
+
+    def _set_insertion_point(self):
+        if self.current_block is None:
+            raise RuntimeError("Insertion block is not set")
+        return ir.InsertionPoint(self.current_block)
+
+    def _ensure_object(self, value: ir.Value) -> ir.Value:
+        object_type = self.get_py_type("!py.object")
+        if value.type == object_type:
+            return value
+        with ir.Location.unknown(self.ctx), self._set_insertion_point():
+            return py_ops.UpcastOp(object_type, value).result
 
     def visit_BoolOp(self, node: ast.BoolOp) -> None:
         """
@@ -218,7 +237,7 @@ class ExprVisitor(BaseVisitor):
         """比較演算の処理"""
         raise NotImplementedError("Compare expression not implemented")
 
-    def visit_Call(self, node: ast.Call) -> None:
+    def visit_Call(self, node: ast.Call) -> ir.Value:
         """
         関数呼び出しを処理する。
 
@@ -226,7 +245,27 @@ class ExprVisitor(BaseVisitor):
         Call(expr func, expr* args, keyword* keywords)
         ```
         """
-        raise NotImplementedError("Function call not implemented")
+        callee = self.require_value(node.func, self.visit(node.func))
+        args = [
+            self._ensure_object(self.require_value(arg, self.visit(arg)))
+            for arg in node.args
+        ]
+
+        loc = ir.Location.file("<module>", node.lineno, node.col_offset + 1, self.ctx)
+        with loc, self._set_insertion_point():
+            if args:
+                element_specs = ", ".join("!py.object" for _ in args)
+                tuple_type = self.get_py_type(f"!py.tuple<{element_specs}>")
+                posargs = py_ops.TupleCreateOp(tuple_type, args).result
+            else:
+                posargs = py_ops.TupleEmptyOp(self.get_py_type("!py.tuple<>")).result
+            empty_tuple = self.get_py_type("!py.tuple<>")
+            kwnames = py_ops.TupleEmptyOp(empty_tuple).result
+            kwvalues = py_ops.TupleEmptyOp(empty_tuple).result
+            result = py_ops.CallVectorOp(
+                [self.get_py_type("!py.none")], callee, posargs, kwnames, kwvalues
+            ).results_[0]
+        return result
 
     def visit_FormattedValue(self, node: ast.FormattedValue) -> None:
         """
@@ -248,7 +287,7 @@ class ExprVisitor(BaseVisitor):
         """
         raise NotImplementedError("Joined string not implemented")
 
-    def visit_Constant(self, node: ast.Constant) -> None:
+    def visit_Constant(self, node: ast.Constant) -> ir.Value:
         """
         定数値を処理する。
         Pythonオブジェクトとして適切に生成する。
@@ -257,6 +296,13 @@ class ExprVisitor(BaseVisitor):
         Constant(constant value, string? kind)
         ```
         """
+        if isinstance(node.value, str):
+            with ir.Location.unknown(self.ctx), self._set_insertion_point():
+                attr = ir.StringAttr.get(node.value, self.ctx)
+                str_value = py_ops.StrConstantOp(
+                    self.get_py_type("!py.str"), attr
+                ).result
+            return self._ensure_object(str_value)
         raise NotImplementedError("Constant value not implemented")
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
@@ -289,13 +335,20 @@ class ExprVisitor(BaseVisitor):
         """
         raise NotImplementedError("Starred expression not implemented")
 
-    def visit_Name(self, node: ast.Name) -> None:
+    def visit_Name(self, node: ast.Name) -> ir.Value:
         """
         変数参照
         ```asdl
         Name(identifier id, expr_context ctx)
         ```
         """
+        if node.id == "print":
+            func_type = self.get_py_type(
+                "!py.func<!py.funcsig<[], vararg = !py.tuple<!py.object> -> [!py.none]>>"
+            )
+            symbol = ir.FlatSymbolRefAttr.get("__builtin_print", self.ctx)
+            with ir.Location.unknown(self.ctx), self._set_insertion_point():
+                return py_ops.FuncObjectOp(func_type, symbol).result
         raise NotImplementedError("Variable reference not implemented")
 
     def visit_List(self, node: ast.List) -> None:

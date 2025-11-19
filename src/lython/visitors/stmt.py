@@ -65,8 +65,13 @@ class StmtVisitor(BaseVisitor):
     ```
     """
 
-    def __init__(self, ctx: ir.Context) -> None:
-        super().__init__(ctx)
+    def __init__(
+        self,
+        ctx: ir.Context,
+        *,
+        subvisitors: dict[str, BaseVisitor],
+    ) -> None:
+        super().__init__(ctx, subvisitors=subvisitors)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         """
@@ -387,7 +392,12 @@ class StmtVisitor(BaseVisitor):
         Expr(expr value)
         ```
         """
-        raise NotImplementedError("Expression statement not implemented")
+        expr_visitor = self.subvisitors.get("Expr")
+        if expr_visitor is None:
+            raise NotImplementedError("Expression visitor not available")
+        expr_visitor.current_block = self.current_block
+        expr_visitor.visit(node.value)
+        return None
 
     def visit_Pass(self, node: ast.Pass) -> None:
         """

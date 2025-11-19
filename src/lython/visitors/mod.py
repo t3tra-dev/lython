@@ -4,6 +4,8 @@ import ast
 from typing import Any
 
 from ..mlir import ir
+from ..mlir.dialects import _lython_ops_gen as py_ops
+from ..mlir.dialects import arith as arith_ops
 from ._base import BaseVisitor
 
 __all__ = ["ModVisitor"]
@@ -22,8 +24,13 @@ class ModVisitor(BaseVisitor):
     ```
     """
 
-    def __init__(self, ctx: ir.Context) -> None:
-        super().__init__(ctx)
+    def __init__(
+        self,
+        ctx: ir.Context,
+        *,
+        subvisitors: dict[str, BaseVisitor],
+    ) -> None:
+        super().__init__(ctx, subvisitors=subvisitors)
 
     def visit_Module(self, node: ast.Module) -> None:
         """
@@ -31,8 +38,42 @@ class ModVisitor(BaseVisitor):
         Module(stmt* body, type_ignore* type_ignores)
         ```
         """
+        with ir.Location.file("<module>", 1, 1, self.ctx):
+            module = ir.Module.create()
+        self._set_module(module)
+
+        with ir.InsertionPoint(module.body), ir.Location.unknown(self.ctx):
+            builtin_sig = self.get_py_type(
+                "!py.funcsig<[], vararg = !py.tuple<!py.object> -> [!py.none]>"
+            )
+            builtin = py_ops.FuncOp(
+                "__builtin_print",
+                ir.TypeAttr.get(builtin_sig),
+                has_vararg=True,
+            )
+            builtin_block = builtin.body.blocks.append(
+                self.get_py_type("!py.tuple<!py.object>")
+            )
+            with ir.InsertionPoint(builtin_block), ir.Location.unknown(self.ctx):
+                none_value = py_ops.NoneOp(self.get_py_type("!py.none")).result
+                py_ops.ReturnOp([none_value])
+
+            main_sig = self.get_py_type("!py.funcsig<[] -> [i32]>")
+            main = py_ops.FuncOp(
+                "main",
+                ir.TypeAttr.get(main_sig),
+            )
+            main_block = main.body.blocks.append()
+
+        self._set_insertion_block(main_block)
+
         for stmt in node.body:
             self.visit(stmt)
+
+        with ir.InsertionPoint(main_block), ir.Location.unknown(self.ctx):
+            i32 = ir.IntegerType.get_signless(32)
+            zero = arith_ops.ConstantOp(i32, ir.IntegerAttr.get(i32, 0)).result
+            py_ops.ReturnOp([zero])
         return None
 
     def visit_Interactive(self, node: ast.Interactive) -> Any:

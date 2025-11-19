@@ -22,8 +22,13 @@ class PatternVisitor(BaseVisitor):
              attributes (int lineno, int col_offset, int end_lineno, int end_col_offset)
     """
 
-    def __init__(self, ctx: ir.Context) -> None:
-        super().__init__(ctx)
+    def __init__(
+        self,
+        ctx: ir.Context,
+        *,
+        subvisitors: dict[str, BaseVisitor],
+    ) -> None:
+        super().__init__(ctx, subvisitors=subvisitors)
 
     def visit_MatchValue(self, node: ast.MatchValue) -> None:
         """

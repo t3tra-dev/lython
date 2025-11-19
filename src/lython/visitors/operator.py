@@ -19,8 +19,13 @@ class OperatorVisitor(BaseVisitor):
     ```
     """
 
-    def __init__(self, ctx: ir.Context) -> None:
-        super().__init__(ctx)
+    def __init__(
+        self,
+        ctx: ir.Context,
+        *,
+        subvisitors: dict[str, BaseVisitor],
+    ) -> None:
+        super().__init__(ctx, subvisitors=subvisitors)
 
     def visit_Add(self, node: ast.Add) -> None:
         """

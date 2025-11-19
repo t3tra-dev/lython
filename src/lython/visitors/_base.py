@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import ast
-from typing import NoReturn
+from typing import Any, NoReturn
 
 from ..mlir import ir
 
@@ -17,13 +17,36 @@ class BaseVisitor:
     self.subvisitors に登録されている対応するVisitorへ転送。
     """
 
-    def __init__(self, ctx: ir.Context) -> None:
+    def __init__(
+        self,
+        ctx: ir.Context,
+        *,
+        subvisitors: dict[str, "BaseVisitor"] | None = None,
+    ) -> None:
+        self.module: ir.Module
         self.ctx = ctx
-        self.subvisitors: dict[str, BaseVisitor] = {}
-        for v in self.subvisitors.values():
-            v.subvisitors = self.subvisitors
+        self.ctx.allow_unregistered_dialects = True
+        self._type_cache: dict[str, ir.Type] = {}
+        self.current_block: ir.Block | None = None
 
-    def visit(self, node: ast.AST) -> None:
+        if subvisitors is not None:
+            self.subvisitors = subvisitors
+            return
+
+        subvisitors = {}
+        self.subvisitors = subvisitors
+
+        from .expr import ExprVisitor
+        from .mod import ModVisitor
+        from .stmt import StmtVisitor
+
+        subvisitors["Module"] = ModVisitor(ctx, subvisitors=subvisitors)
+        subvisitors["Stmt"] = StmtVisitor(ctx, subvisitors=subvisitors)
+        subvisitors["Expr"] = ExprVisitor(ctx, subvisitors=subvisitors)
+        for visitor in subvisitors.values():
+            visitor.subvisitors = subvisitors
+
+    def visit(self, node: ast.AST) -> Any:
         method_name = f"visit_{type(node).__name__}"
 
         # 1) このビジター自身が実装していれば呼び出し
@@ -35,7 +58,10 @@ class BaseVisitor:
         name = type(node).__name__
         visitor = self.subvisitors.get(name)
         if visitor is not None and visitor is not self:
-            return visitor.visit(node)
+            result = visitor.visit(node)
+            if isinstance(node, ast.mod):
+                self.module = getattr(visitor, "module")
+            return result
 
         # 3) カテゴリ委譲
         if isinstance(node, ast.stmt):
@@ -44,6 +70,12 @@ class BaseVisitor:
                 return v.visit(node)
         if isinstance(node, ast.mod):
             v = self.subvisitors.get("Module")
+            if v is not None and v is not self:
+                result = v.visit(node)
+                self.module = getattr(v, "module")
+                return result
+        if isinstance(node, ast.expr):
+            v = self.subvisitors.get("Expr")
             if v is not None and v is not self:
                 return v.visit(node)
 
@@ -57,4 +89,28 @@ class BaseVisitor:
         """
         raise NotImplementedError(
             f"Node type {type(node).__name__} not implemented by {self.__class__.__name__}"
+        )
+
+    def _set_module(self, module: ir.Module) -> None:
+        self.module = module
+        for visitor in self.subvisitors.values():
+            visitor.module = module
+
+    def _set_insertion_block(self, block: ir.Block | None) -> None:
+        self.current_block = block
+        for visitor in self.subvisitors.values():
+            visitor.current_block = block
+
+    def get_py_type(self, type_spec: str) -> ir.Type:
+        cached = self._type_cache.get(type_spec)
+        if cached is None:
+            cached = ir.Type.parse(type_spec, self.ctx)
+            self._type_cache[type_spec] = cached
+        return cached
+
+    def require_value(self, node: ast.AST, result: Any) -> ir.Value:
+        if isinstance(result, ir.Value):
+            return result
+        raise TypeError(
+            f"Visitor for {type(node).__name__} must return an MLIR value, got {type(result)!r}"
         )
