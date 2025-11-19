@@ -25,10 +25,8 @@ add_custom_command(
 message(STATUS "Generated files will be placed in: ${CMAKE_CURRENT_BINARY_DIR}")
 message(STATUS "Python bindings will be placed in: ${PYTHON_BINDINGS_OUTPUT_DIR}")
 
-# Configure include directories
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 include_directories(${CMAKE_CURRENT_BINARY_DIR})
-
 
 add_library(PyDialect STATIC
   cpp/PyDialect.cpp
@@ -48,6 +46,9 @@ target_include_directories(PyDialect PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${CMAKE_CURRENT_BINARY_DIR}
 )
+
+# MLIRのダイアレクト実装ではRTTIを有効化
+target_compile_options(PyDialect PRIVATE -frtti)
 
 add_custom_target(PyDialectPythonBindings ALL
   DEPENDS ${PYTHON_BINDINGS_OUTPUT_DIR}/_lython_ops_gen.py

@@ -36,9 +36,9 @@ class BaseVisitor:
         subvisitors = {}
         self.subvisitors = subvisitors
 
+        from .expr import ExprVisitor
         from .mod import ModVisitor
         from .stmt import StmtVisitor
-        from .expr import ExprVisitor
 
         subvisitors["Module"] = ModVisitor(ctx, subvisitors=subvisitors)
         subvisitors["Stmt"] = StmtVisitor(ctx, subvisitors=subvisitors)

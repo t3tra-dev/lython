@@ -67,7 +67,7 @@ mlir::LLVM::CallOp RuntimeAPI::call(mlir::Location loc, llvm::StringRef name,
 
 mlir::Value RuntimeAPI::getStringLiteral(mlir::Location loc,
                                          mlir::StringAttr literal) {
-  llvm::SmallString<32> symbolName("__py_str_");
+  llvm::SmallString<32> symbolName("__ly_str_");
   auto hashValue = static_cast<uint64_t>(llvm::hash_value(literal.getValue()));
   symbolName += llvm::formatv("{0:X}", hashValue).str();
 

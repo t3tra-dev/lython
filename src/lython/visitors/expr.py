@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import ast
+
+from lython.mlir.dialects import _lython_ops_gen as py_ops
+
 from ..mlir import ir
 from ._base import BaseVisitor
-from lython.mlir.dialects import _lython_ops_gen as py_ops
 
 __all__ = ["ExprVisitor"]
 

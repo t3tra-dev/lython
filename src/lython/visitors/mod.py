@@ -4,8 +4,9 @@ import ast
 from typing import Any
 
 from ..mlir import ir
+from ..mlir.dialects import _lython_ops_gen as py_ops
+from ..mlir.dialects import arith as arith_ops
 from ._base import BaseVisitor
-from lython.mlir.dialects import _lython_ops_gen as py_ops
 
 __all__ = ["ModVisitor"]
 
@@ -57,9 +58,9 @@ class ModVisitor(BaseVisitor):
                 none_value = py_ops.NoneOp(self.get_py_type("!py.none")).result
                 py_ops.ReturnOp([none_value])
 
-            main_sig = self.get_py_type("!py.funcsig<[] -> [!py.none]>")
+            main_sig = self.get_py_type("!py.funcsig<[] -> [i32]>")
             main = py_ops.FuncOp(
-                "__main__",
+                "main",
                 ir.TypeAttr.get(main_sig),
             )
             main_block = main.body.blocks.append()
@@ -70,8 +71,9 @@ class ModVisitor(BaseVisitor):
             self.visit(stmt)
 
         with ir.InsertionPoint(main_block), ir.Location.unknown(self.ctx):
-            none_value = py_ops.NoneOp(self.get_py_type("!py.none")).result
-            py_ops.ReturnOp([none_value])
+            i32 = ir.IntegerType.get_signless(32)
+            zero = arith_ops.ConstantOp(i32, ir.IntegerAttr.get(i32, 0)).result
+            py_ops.ReturnOp([zero])
         return None
 
     def visit_Interactive(self, node: ast.Interactive) -> Any:

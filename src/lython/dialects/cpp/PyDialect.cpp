@@ -243,3 +243,8 @@ void PyDialect::printType(Type type, DialectAsmPrinter &printer) const {
 } // namespace py
 
 #include "PyDialect.cpp.inc"
+
+// ODSが生成したOpクラスの定義本体を取り込む
+#define GET_OP_CLASSES
+#include "PyOps.cpp.inc"
+#undef GET_OP_CLASSES

@@ -12,16 +12,15 @@
 namespace py {
 
 struct RuntimeSymbols {
-  static constexpr llvm::StringLiteral kStrFromUtf8{"__py_str_from_utf8"};
-  static constexpr llvm::StringLiteral kTupleNew{"__py_tuple_new"};
-  static constexpr llvm::StringLiteral kTupleSetItem{"__py_tuple_setitem"};
-  static constexpr llvm::StringLiteral kGetNone{"__py_get_none"};
-  static constexpr llvm::StringLiteral kGetBuiltinPrint{
-      "__py_get_builtin_print"};
-  static constexpr llvm::StringLiteral kCallVectorcall{"__py_call_vectorcall"};
-  static constexpr llvm::StringLiteral kCall{"__py_call"};
-  static constexpr llvm::StringLiteral kDictNew{"__py_dict_new"};
-  static constexpr llvm::StringLiteral kDictInsert{"__py_dict_insert"};
+  static constexpr llvm::StringLiteral kStrFromUtf8{"LyUnicode_FromUTF8"};
+  static constexpr llvm::StringLiteral kTupleNew{"LyTuple_New"};
+  static constexpr llvm::StringLiteral kTupleSetItem{"LyTuple_SetItem"};
+  static constexpr llvm::StringLiteral kGetNone{"Ly_GetNone"};
+  static constexpr llvm::StringLiteral kGetBuiltinPrint{"Ly_GetBuiltinPrint"};
+  static constexpr llvm::StringLiteral kCallVectorcall{"Ly_CallVectorcall"};
+  static constexpr llvm::StringLiteral kCall{"Ly_Call"};
+  static constexpr llvm::StringLiteral kDictNew{"LyDict_New"};
+  static constexpr llvm::StringLiteral kDictInsert{"LyDict_Insert"};
 };
 
 class PyLLVMTypeConverter : public mlir::LLVMTypeConverter {

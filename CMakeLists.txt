@@ -33,3 +33,4 @@ include_directories(SYSTEM ${MLIR_INCLUDE_DIRS})
 add_definitions(${LLVM_DEFINITIONS})
 
 add_subdirectory(src)
+add_subdirectory(tools)
