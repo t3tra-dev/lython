@@ -76,8 +76,6 @@ void LyTuple_Dealloc(LyObject *object) {
   for (Ly_ssize_t i = 0; i < size; ++i) {
     Ly_DecRef(tuple->ob_item[i]);
   }
-  // Note: Memory is managed by arena allocator, not freed here.
-  // The arena will reclaim all memory when it is destroyed.
 }
 
 LyUnicodeObject *LyTuple_Repr(LyObject *object) {

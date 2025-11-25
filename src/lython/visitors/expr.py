@@ -100,7 +100,7 @@ class ExprVisitor(BaseVisitor):
         try:
             func_info = self.lookup_function(node.id)
         except NameError as exc:
-            raise NotImplementedError(
+            raise NameError(
                 f"Variable reference '{node.id}' not implemented"
             ) from exc
         with self._loc(node), self.insertion_point():

@@ -26,4 +26,3 @@ target_include_directories(PyDialectInitializer
 )
 
 add_dependencies(PyDialectInitializer PyDialect)
-add_dependencies(PyDialectPythonBindings PyDialectInitializer)
