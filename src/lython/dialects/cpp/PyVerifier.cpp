@@ -157,8 +157,6 @@ LogicalResult FuncOp::verify() {
   Region &body = getBody();
   if (body.empty())
     return emitOpError("must have a body region");
-  if (!body.hasOneBlock())
-    return emitOpError("body must contain a single block");
 
   Block &entry = body.front();
   unsigned expectedArgs = positionalTypes.size() + kwonlyTypes.size();
@@ -195,19 +193,23 @@ LogicalResult FuncOp::verify() {
           "**kwargs slot must use the type declared in signature");
   }
 
-  Operation *terminator = entry.getTerminator();
-  auto ret = dyn_cast<ReturnOp>(terminator);
-  if (!ret)
-    return emitOpError("must terminate with py.return");
-
+  bool foundReturn = false;
   auto expectedResults = signature.getResultTypes();
-  if (ret.getNumOperands() != expectedResults.size())
-    return ret.emitOpError("result count mismatch with function signature");
+  for (Block &block : body) {
+    auto ret = dyn_cast<ReturnOp>(block.getTerminator());
+    if (!ret)
+      continue;
+    foundReturn = true;
+    if (ret.getNumOperands() != expectedResults.size())
+      return ret.emitOpError("result count mismatch with function signature");
+    for (auto [value, expected] : llvm::zip(ret.getOperands(), expectedResults))
+      if (value.getType() != expected)
+        return ret.emitOpError(
+            "return operand type does not match function result type");
+  }
 
-  for (auto [value, expected] : llvm::zip(ret.getOperands(), expectedResults))
-    if (value.getType() != expected)
-      return ret.emitOpError(
-          "return operand type does not match function result type");
+  if (!foundReturn)
+    return emitOpError("body must contain at least one py.return");
 
   return success();
 }
@@ -278,9 +280,6 @@ LogicalResult CallOp::verify() {
 
   mlir::ArrayRef<mlir::Type> positionalTypes = signature.getPositionalTypes();
   if (!signature.hasVararg()) {
-    if (homogeneous && !tupleElems.empty())
-      return emitOpError(
-          "posargs must enumerate positional arguments for non-vararg callee");
     if (tupleElems.size() != positionalTypes.size())
       return emitOpError(
           "posargs length mismatch with callee positional parameters");
@@ -481,6 +480,25 @@ LogicalResult CastToPrimOp::verify() {
          << inputType << " to " << resultType;
 }
 
+LogicalResult CastIdentityOp::verify() {
+  Type inputType = getInput().getType();
+  Type resultType = getResult().getType();
+
+  bool inputIsPy = isPyType(inputType);
+  bool resultIsPy = isPyType(resultType);
+  if (!inputIsPy && !resultIsPy)
+    return emitOpError("at least one of input or result must be a !py.* type");
+
+  if (inputType == resultType)
+    return success();
+
+  if (inputIsPy && resultIsPy)
+    return emitOpError(
+        "when both sides are !py.* types the element types must match");
+
+  return success();
+}
+
 LogicalResult UpcastOp::verify() {
   Type inputType = getInput().getType();
   Type resultType = getResult().getType();
@@ -679,9 +697,6 @@ LogicalResult CallVectorOp::verify() {
 
   auto positionalTypes = signature.getPositionalTypes();
   if (!signature.hasVararg()) {
-    if (homogeneous && !posElems.empty())
-      return emitOpError(
-          "posargs must enumerate positional arguments for non-vararg callee");
     if (posElems.size() != positionalTypes.size())
       return emitOpError(
           "posargs length mismatch with callee positional parameters");
@@ -824,6 +839,20 @@ LogicalResult NumAddOp::verify() {
   if (!isPyIntType(lhsType) && !isPyFloatType(lhsType))
     return emitOpError("operands must be !py.int or !py.float");
 
+  return success();
+}
+
+LogicalResult FloatConstantOp::verify() { return success(); }
+
+LogicalResult NumLeOp::verify() {
+  Type lhsType = getLhs().getType();
+  Type rhsType = getRhs().getType();
+  if (lhsType != rhsType)
+    return emitOpError("operand types must match");
+  if (!isPyIntType(lhsType) && !isPyFloatType(lhsType))
+    return emitOpError("operands must be !py.int or !py.float");
+  if (!isPyBoolType(getResult().getType()))
+    return emitOpError("result must be !py.bool");
   return success();
 }
 

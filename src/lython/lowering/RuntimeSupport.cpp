@@ -101,4 +101,9 @@ mlir::Value RuntimeAPI::getI64Constant(mlir::Location loc, std::int64_t value) {
       loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(value));
 }
 
+mlir::Value RuntimeAPI::getF64Constant(mlir::Location loc, double value) {
+  return rewriter.create<mlir::LLVM::ConstantOp>(
+      loc, rewriter.getF64Type(), rewriter.getF64FloatAttr(value));
+}
+
 } // namespace py

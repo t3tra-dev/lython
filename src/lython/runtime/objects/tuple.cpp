@@ -1,8 +1,10 @@
 #include "objects/tuple.h"
+#include "objects/unicode.h"
 
 #include <cstddef>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -64,4 +66,34 @@ void LyTuple_SetItem(LyTupleObject *tuple, std::size_t index, LyObject *value) {
   tuple->ob_item[index] = value;
   Ly_IncRef(value);
 }
+}
+
+void LyTuple_Dealloc(LyObject *object) {
+  if (!object)
+    return;
+  auto *tuple = reinterpret_cast<LyTupleObject *>(object);
+  Ly_ssize_t size = tuple->ob_base.ob_size;
+  for (Ly_ssize_t i = 0; i < size; ++i) {
+    Ly_DecRef(tuple->ob_item[i]);
+  }
+  // Note: Memory is managed by arena allocator, not freed here.
+  // The arena will reclaim all memory when it is destroyed.
+}
+
+LyUnicodeObject *LyTuple_Repr(LyObject *object) {
+  auto *tuple = reinterpret_cast<LyTupleObject *>(object);
+  std::string text = "(";
+  Ly_ssize_t size = tuple->ob_base.ob_size;
+  for (Ly_ssize_t i = 0; i < size; ++i) {
+    LyUnicodeObject *itemRepr = LyObject_Repr(tuple->ob_item[i]);
+    if (itemRepr) {
+      text.append(itemRepr->utf8_data,
+                  static_cast<std::size_t>(itemRepr->utf8_length));
+      Ly_DecRef(reinterpret_cast<LyObject *>(itemRepr));
+    }
+    if (i + 1 < size)
+      text += ", ";
+  }
+  text += ")";
+  return LyUnicode_FromUTF8(text.c_str(), text.size());
 }

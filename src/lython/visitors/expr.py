@@ -70,18 +70,6 @@ class ExprVisitor(BaseVisitor):
     ) -> None:
         super().__init__(ctx, subvisitors=subvisitors)
 
-    def _set_insertion_point(self):
-        if self.current_block is None:
-            raise RuntimeError("Insertion block is not set")
-        return ir.InsertionPoint(self.current_block)
-
-    def _ensure_object(self, value: ir.Value) -> ir.Value:
-        object_type = self.get_py_type("!py.object")
-        if value.type == object_type:
-            return value
-        with ir.Location.unknown(self.ctx), self._set_insertion_point():
-            return py_ops.UpcastOp(object_type, value).result
-
     def visit_BoolOp(self, node: ast.BoolOp) -> None:
         """
         ブールの論理演算を処理する
@@ -102,6 +90,23 @@ class ExprVisitor(BaseVisitor):
         """
         raise NotImplementedError("Named expression not implemented")
 
+    def visit_Name(self, node: ast.Name) -> ir.Value:
+        if isinstance(node.ctx, ast.Store):
+            raise NotImplementedError("Store context handled elsewhere")
+        try:
+            return self.lookup_symbol(node.id)
+        except NameError:
+            pass
+        try:
+            func_info = self.lookup_function(node.id)
+        except NameError as exc:
+            raise NotImplementedError(
+                f"Variable reference '{node.id}' not implemented"
+            ) from exc
+        with self._loc(node), self.insertion_point():
+            symbol = ir.FlatSymbolRefAttr.get(func_info.symbol, self.ctx)
+            return py_ops.FuncObjectOp(func_info.func_type, symbol).result
+
     def visit_BinOp(self, node: ast.BinOp) -> None:
         """
         二項演算を処理する
@@ -110,7 +115,14 @@ class ExprVisitor(BaseVisitor):
         BinOp(expr left, operator op, expr right)
         ```
         """
-        raise NotImplementedError("Binary operation not implemented")
+        lhs = self.require_value(node.left, self.visit(node.left))
+        rhs = self.require_value(node.right, self.visit(node.right))
+        with self._loc(node), self.insertion_point():
+            if isinstance(node.op, ast.Add):
+                return py_ops.NumAddOp(lhs, rhs).result
+            if isinstance(node.op, ast.Sub):
+                return py_ops.NumSubOp(lhs, rhs).result
+        raise NotImplementedError("Unsupported binary operation")
 
     def visit_UnaryOp(self, node: ast.UnaryOp) -> None:
         """
@@ -173,6 +185,25 @@ class ExprVisitor(BaseVisitor):
         """
         raise NotImplementedError("List comprehension not implemented")
 
+    def visit_Constant(self, node: ast.Constant) -> ir.Value:
+        with self._loc(node), self.insertion_point():
+            if node.value is None:
+                return py_ops.NoneOp(self.get_py_type("!py.none")).result
+            if isinstance(node.value, bool):
+                result_type = self.get_py_type("!py.bool")
+                return py_ops.IntConstantOp(result_type, int(node.value)).result
+            if isinstance(node.value, int):
+                result_type = self.get_py_type("!py.int")
+                return py_ops.IntConstantOp(result_type, node.value).result
+            if isinstance(node.value, float):
+                result_type = self.get_py_type("!py.float")
+                return py_ops.FloatConstantOp(result_type, node.value).result
+            if isinstance(node.value, str):
+                result_type = self.get_py_type("!py.str")
+                attr = ir.StringAttr.get(node.value, self.ctx)
+                return py_ops.StrConstantOp(result_type, attr).result
+        raise NotImplementedError(f"Unsupported constant {node.value!r}")
+
     def visit_SetComp(self, node: ast.SetComp) -> None:
         """
         集合内包表記を処理する
@@ -202,6 +233,17 @@ class ExprVisitor(BaseVisitor):
         ```
         """
         raise NotImplementedError("Generator expression not implemented")
+
+    def visit_Compare(self, node: ast.Compare) -> ir.Value:
+        if len(node.ops) != 1 or len(node.comparators) != 1:
+            raise NotImplementedError("Only single comparison supported")
+        lhs = self.require_value(node.left, self.visit(node.left))
+        rhs = self.require_value(node.comparators[0], self.visit(node.comparators[0]))
+        if not isinstance(node.ops[0], ast.LtE):
+            raise NotImplementedError("Only <= comparison supported")
+        bool_type = self.get_py_type("!py.bool")
+        with self._loc(node), self.insertion_point():
+            return py_ops.NumLeOp(bool_type, lhs, rhs).result
 
     def visit_Await(self, node: ast.Await) -> None:
         """
@@ -233,10 +275,6 @@ class ExprVisitor(BaseVisitor):
         """
         raise NotImplementedError("YieldFrom expression not implemented")
 
-    def visit_Compare(self, node: ast.Compare) -> None:
-        """比較演算の処理"""
-        raise NotImplementedError("Compare expression not implemented")
-
     def visit_Call(self, node: ast.Call) -> ir.Value:
         """
         関数呼び出しを処理する。
@@ -245,27 +283,37 @@ class ExprVisitor(BaseVisitor):
         Call(expr func, expr* args, keyword* keywords)
         ```
         """
+        if node.keywords:
+            raise NotImplementedError("Keyword arguments not supported yet")
         callee = self.require_value(node.func, self.visit(node.func))
-        args = [
-            self._ensure_object(self.require_value(arg, self.visit(arg)))
-            for arg in node.args
-        ]
+        arg_values = [self.require_value(arg, self.visit(arg)) for arg in node.args]
 
-        loc = ir.Location.file("<module>", node.lineno, node.col_offset + 1, self.ctx)
-        with loc, self._set_insertion_point():
-            if args:
-                element_specs = ", ".join("!py.object" for _ in args)
-                tuple_type = self.get_py_type(f"!py.tuple<{element_specs}>")
-                posargs = py_ops.TupleCreateOp(tuple_type, args).result
+        loc = self._loc(node)
+        with loc, self.insertion_point():
+            if isinstance(node.func, ast.Name):
+                func_info = self.lookup_function(node.func.id)
+                result_types = list(func_info.result_types)
+                if not func_info.has_vararg:
+                    if len(arg_values) != len(func_info.arg_types):
+                        raise NotImplementedError(
+                            f"Function '{node.func.id}' expects {len(func_info.arg_types)} "
+                            f"arguments, got {len(arg_values)}"
+                        )
+                    posargs = self.build_tuple(arg_values, loc=loc)
+                else:
+                    object_args = [
+                        self.ensure_object(value, loc=loc) for value in arg_values
+                    ]
+                    posargs = self.build_tuple(object_args, loc=loc)
             else:
-                posargs = py_ops.TupleEmptyOp(self.get_py_type("!py.tuple<>")).result
-            empty_tuple = self.get_py_type("!py.tuple<>")
-            kwnames = py_ops.TupleEmptyOp(empty_tuple).result
-            kwvalues = py_ops.TupleEmptyOp(empty_tuple).result
-            result = py_ops.CallVectorOp(
-                [self.get_py_type("!py.none")], callee, posargs, kwnames, kwvalues
-            ).results_[0]
-        return result
+                raise NotImplementedError("Only direct function calls are supported")
+            empty_tuple_type = self.get_py_type("!py.tuple<>")
+            kwnames = py_ops.TupleEmptyOp(empty_tuple_type).result
+            kwvalues = py_ops.TupleEmptyOp(empty_tuple_type).result
+            if len(result_types) != 1:
+                raise NotImplementedError("Only single-result functions supported")
+            call = py_ops.CallVectorOp(result_types, callee, posargs, kwnames, kwvalues)
+            return call.results_[0]
 
     def visit_FormattedValue(self, node: ast.FormattedValue) -> None:
         """
@@ -286,24 +334,6 @@ class ExprVisitor(BaseVisitor):
         ```
         """
         raise NotImplementedError("Joined string not implemented")
-
-    def visit_Constant(self, node: ast.Constant) -> ir.Value:
-        """
-        定数値を処理する。
-        Pythonオブジェクトとして適切に生成する。
-
-        ```asdl
-        Constant(constant value, string? kind)
-        ```
-        """
-        if isinstance(node.value, str):
-            with ir.Location.unknown(self.ctx), self._set_insertion_point():
-                attr = ir.StringAttr.get(node.value, self.ctx)
-                str_value = py_ops.StrConstantOp(
-                    self.get_py_type("!py.str"), attr
-                ).result
-            return self._ensure_object(str_value)
-        raise NotImplementedError("Constant value not implemented")
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
         """
@@ -334,22 +364,6 @@ class ExprVisitor(BaseVisitor):
         ```
         """
         raise NotImplementedError("Starred expression not implemented")
-
-    def visit_Name(self, node: ast.Name) -> ir.Value:
-        """
-        変数参照
-        ```asdl
-        Name(identifier id, expr_context ctx)
-        ```
-        """
-        if node.id == "print":
-            func_type = self.get_py_type(
-                "!py.func<!py.funcsig<[], vararg = !py.tuple<!py.object> -> [!py.none]>>"
-            )
-            symbol = ir.FlatSymbolRefAttr.get("__builtin_print", self.ctx)
-            with ir.Location.unknown(self.ctx), self._set_insertion_point():
-                return py_ops.FuncObjectOp(func_type, symbol).result
-        raise NotImplementedError("Variable reference not implemented")
 
     def visit_List(self, node: ast.List) -> None:
         """

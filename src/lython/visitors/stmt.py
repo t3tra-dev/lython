@@ -3,6 +3,9 @@ from __future__ import annotations
 import ast
 from typing import Any
 
+from lython.mlir.dialects import _lython_ops_gen as py_ops
+from lython.mlir.dialects import cf as cf_ops
+
 from ..mlir import ir
 from ._base import BaseVisitor
 
@@ -92,7 +95,59 @@ class StmtVisitor(BaseVisitor):
         )
         ```
         """
-        raise NotImplementedError("Function definition not supported")
+        arg_type_specs = [
+            self.annotation_to_py_type(arg.annotation) for arg in node.args.args
+        ]
+        result_type_spec = self.annotation_to_py_type(node.returns)
+        result_ir_type = self.get_py_type(result_type_spec)
+        funcsig = self.build_funcsig(arg_type_specs, [result_type_spec])
+        py_func_sig = self.get_py_type(funcsig)
+        py_func_type = self.get_py_type(f"!py.func<{funcsig}>")
+        arg_name_attrs = [
+            ir.StringAttr.get(arg.arg, self.ctx) for arg in node.args.args
+        ]
+        arg_names_attr = (
+            ir.ArrayAttr.get(arg_name_attrs, context=self.ctx)
+            if arg_name_attrs
+            else None
+        )
+        loc = self._loc(node)
+        with loc, ir.InsertionPoint(self.module.body):
+            func = py_ops.FuncOp(
+                node.name,
+                ir.TypeAttr.get(py_func_sig),
+                arg_names=arg_names_attr,
+            )
+        entry_arg_types = [self.get_py_type(spec) for spec in arg_type_specs]
+        self.register_function(
+            node.name,
+            py_func_type,
+            entry_arg_types,
+            [result_ir_type],
+        )
+        with loc:
+            if entry_arg_types:
+                entry_block = func.body.blocks.append(*entry_arg_types)
+            else:
+                entry_block = func.body.blocks.append()
+        prev_block = self.current_block
+        self._set_insertion_block(entry_block)
+        self.push_scope()
+        for arg, value in zip(node.args.args, entry_block.arguments):
+            self.define_symbol(arg.arg, value)
+        for stmt in node.body:
+            self.visit(stmt)
+        active_block = self.current_block or entry_block
+        if not self._block_terminated(active_block):
+            if result_type_spec != "!py.none":
+                raise NotImplementedError(
+                    f"Function '{node.name}' must explicitly return {result_type_spec}"
+                )
+            with ir.Location.unknown(self.ctx), ir.InsertionPoint(active_block):
+                none_val = py_ops.NoneOp(self.get_py_type("!py.none")).result
+                py_ops.ReturnOp([none_val])
+        self.pop_scope()
+        self._set_insertion_block(prev_block)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         """
@@ -137,7 +192,12 @@ class StmtVisitor(BaseVisitor):
         Return(expr? value)
         ```
         """
-        raise NotImplementedError("Return statement not supported")
+        with self._loc(node), self.insertion_point():
+            if node.value is None:
+                value = py_ops.NoneOp(self.get_py_type("!py.none")).result
+            else:
+                value = self.require_value(node.value, self.visit(node.value))
+            py_ops.ReturnOp([value])
 
     def visit_Delete(self, node: ast.Delete) -> None:
         """
@@ -157,7 +217,10 @@ class StmtVisitor(BaseVisitor):
         Assign(expr* targets, expr value, string? type_comment)
         ```
         """
-        raise NotImplementedError("Assignment statement not supported")
+        if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+            raise NotImplementedError("Only simple assignments supported")
+        value = self.require_value(node.value, self.visit(node.value))
+        self.define_symbol(node.targets[0].id, value)
 
     def visit_TypeAlias(self, node: ast.TypeAlias) -> None:
         """
@@ -261,7 +324,34 @@ class StmtVisitor(BaseVisitor):
         If(expr test, stmt* body, stmt* orelse)
         ```
         """
-        raise NotImplementedError("If statement not implemented")
+        cond_obj = self.require_value(node.test, self.visit(node.test))
+        i1 = ir.IntegerType.get_signless(1, context=self.ctx)
+        with self._loc(node), self.insertion_point():
+            cond = py_ops.CastToPrimOp(
+                i1, cond_obj, ir.StringAttr.get("exact", self.ctx)
+            ).result
+        assert self.current_block is not None
+        parent_region = self.current_block.region
+        true_block = parent_region.blocks.append()
+        false_block = parent_region.blocks.append()
+        merge_block = parent_region.blocks.append()
+        with self._loc(node), self.insertion_point():
+            cf_ops.CondBranchOp(cond, [], [], true_block, false_block)
+
+        def handle_branch(block: ir.Block, statements: list[ast.stmt]) -> None:
+            self._set_insertion_block(block)
+            self.push_scope()
+            for stmt in statements:
+                self.visit(stmt)
+            if not self._block_terminated(block):
+                with self._loc(node), ir.InsertionPoint(block):
+                    cf_ops.BranchOp([], merge_block)
+            self.pop_scope()
+
+        handle_branch(true_block, node.body)
+        handle_branch(false_block, node.orelse or [])
+
+        self._set_insertion_block(merge_block)
 
     def visit_With(self, node: ast.With) -> None:
         """

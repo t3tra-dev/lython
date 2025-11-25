@@ -24,4 +24,5 @@ struct LyFunctionObject {
   LyVectorcallFunc vectorcall;
 };
 
+void LyFunction_Dealloc(LyObject *object);
 LyVectorcallFunc LyFunction_LoadVectorcall(LyObject *callable);

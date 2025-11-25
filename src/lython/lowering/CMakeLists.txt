@@ -5,6 +5,8 @@ add_library(LythonRuntimeLowering STATIC
     PyTupleLowering.cpp
     PyDictLowering.cpp
     PyCallLowering.cpp
+    PyRefCountLowering.cpp
+    RefCountInsertionPass.cpp
 )
 
 target_include_directories(LythonRuntimeLowering
