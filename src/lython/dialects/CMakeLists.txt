@@ -55,3 +55,5 @@ add_custom_target(PyDialectPythonBindings ALL
 )
 
 add_dependencies(PyDialectPythonBindings PyDialect)
+
+add_subdirectory(binding)

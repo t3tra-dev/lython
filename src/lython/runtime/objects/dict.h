@@ -21,3 +21,6 @@ extern "C" {
 LyObject *LyDict_New();
 LyObject *LyDict_Insert(LyObject *dict, LyObject *key, LyObject *value);
 }
+
+void LyDict_Dealloc(LyObject *object);
+LyUnicodeObject *LyDict_Repr(LyObject *object);

@@ -17,6 +17,7 @@
 #include "mlir/Transforms/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/ExecutionEngine/ExecutionEngine.h"
@@ -58,9 +59,10 @@
 
 using namespace mlir;
 
-// Forward declare our custom lowering pass factory
+// Forward declare our custom lowering pass factories
 namespace py {
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createRuntimeLoweringPass();
+std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createRefCountInsertionPass();
 }
 
 namespace {
@@ -109,6 +111,8 @@ void unsetEnvVar(llvm::StringRef name) {
 
 LogicalResult runPipeline(ModuleOp module, MLIRContext &context) {
   PassManager pm(&context);
+  // Insert reference counting operations using Affine SSA (Linear Type) logic
+  pm.addPass(py::createRefCountInsertionPass());
   pm.addPass(py::createRuntimeLoweringPass());
   pm.addPass(mlir::createConvertSCFToCFPass());
   pm.addPass(mlir::createArithToLLVMConversionPass());
@@ -139,6 +143,12 @@ void registerRuntimeSymbols(ExecutionEngine &engine) {
     add("Ly_GetBuiltinPrint", &Ly_GetBuiltinPrint);
     add("Ly_CallVectorcall", &Ly_CallVectorcall);
     add("Ly_Call", &Ly_Call);
+    add("LyLong_FromI64", &LyLong_FromI64);
+    add("LyFloat_FromDouble", &LyFloat_FromDouble);
+    add("LyNumber_Add", &LyNumber_Add);
+    add("LyNumber_Sub", &LyNumber_Sub);
+    add("LyNumber_Le", &LyNumber_Le);
+    add("LyBool_AsBool", &LyBool_AsBool);
     return symbolMap;
   });
 }
@@ -198,12 +208,38 @@ std::optional<std::string> findSourceRoot(StringRef buildRoot) {
 
 LogicalResult generateMlirFromPython(StringRef pythonFile, StringRef sourceRoot,
                                      std::string &mlirBuffer) {
-  auto pythonExe = llvm::sys::findProgramByName("python3");
+  auto findProjectPython = [&](llvm::StringRef executable) -> std::optional<std::string> {
+    llvm::SmallString<256> candidate(sourceRoot);
+    llvm::sys::path::append(candidate, ".venv");
+#if defined(_WIN32)
+    llvm::sys::path::append(candidate, "Scripts");
+#else
+    llvm::sys::path::append(candidate, "bin");
+#endif
+    llvm::SmallString<256> binary(candidate);
+    llvm::sys::path::append(binary, executable);
+    if (llvm::sys::fs::exists(binary))
+      return std::string(binary.str());
+    return std::nullopt;
+  };
+
+  std::optional<std::string> pythonExe;
+#if defined(_WIN32)
+  pythonExe = findProjectPython("python.exe");
+#else
+  pythonExe = findProjectPython("python3");
   if (!pythonExe)
-    pythonExe = llvm::sys::findProgramByName("python");
+    pythonExe = findProjectPython("python");
+#endif
   if (!pythonExe) {
-    llvm::errs() << "error: could not find python3/python executable\n";
-    return failure();
+    auto sysPython = llvm::sys::findProgramByName("python3");
+    if (!sysPython)
+      sysPython = llvm::sys::findProgramByName("python");
+    if (!sysPython) {
+      llvm::errs() << "error: could not find python3/python executable\n";
+      return failure();
+    }
+    pythonExe = *sysPython;
   }
 
   llvm::SmallString<256> scriptPath;
@@ -342,6 +378,7 @@ LogicalResult linkExecutable(StringRef objectPath, StringRef runtimeLib,
   argStorage.push_back(clangProgram);
   argStorage.emplace_back(objectPath.str());
   argStorage.emplace_back(runtimeLib.str());
+  argStorage.emplace_back("-O2");
   argStorage.emplace_back("-o");
   argStorage.emplace_back(outputPath.str());
 
@@ -467,7 +504,8 @@ int main(int argc, char **argv) {
 
   DialectRegistry registry;
   registry.insert<py::PyDialect, func::FuncDialect, arith::ArithDialect,
-                  scf::SCFDialect, LLVM::LLVMDialect>();
+                  scf::SCFDialect, mlir::cf::ControlFlowDialect,
+                  LLVM::LLVMDialect>();
   mlir::registerConvertFuncToLLVMInterface(registry);
   mlir::registerAllToLLVMIRTranslations(registry);
 

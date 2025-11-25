@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 import ast
-from typing import Any, NoReturn
+from typing import Any, NamedTuple, NoReturn
 
 from ..mlir import ir
+from ..mlir.dialects import _lython_ops_gen as py_ops
 
 __all__ = ["BaseVisitor"]
+
+
+class FunctionInfo(NamedTuple):
+    symbol: str
+    func_type: ir.Type
+    arg_types: tuple[ir.Type, ...]
+    result_types: tuple[ir.Type, ...]
+    has_vararg: bool
 
 
 class BaseVisitor:
@@ -28,6 +37,9 @@ class BaseVisitor:
         self.ctx.allow_unregistered_dialects = True
         self._type_cache: dict[str, ir.Type] = {}
         self.current_block: ir.Block | None = None
+        self._scope_stack: list[dict[str, ir.Value]] = []
+        self._module_name: str = "__main__"
+        self._functions: dict[str, FunctionInfo] = {}
 
         if subvisitors is not None:
             self.subvisitors = subvisitors
@@ -45,6 +57,10 @@ class BaseVisitor:
         subvisitors["Expr"] = ExprVisitor(ctx, subvisitors=subvisitors)
         for visitor in subvisitors.values():
             visitor.subvisitors = subvisitors
+            visitor._type_cache = self._type_cache
+            visitor._scope_stack = self._scope_stack
+            visitor._module_name = self._module_name
+            visitor._functions = self._functions
 
     def visit(self, node: ast.AST) -> Any:
         method_name = f"visit_{type(node).__name__}"
@@ -96,6 +112,11 @@ class BaseVisitor:
         for visitor in self.subvisitors.values():
             visitor.module = module
 
+    def _set_module_name(self, name: str) -> None:
+        self._module_name = name
+        for visitor in self.subvisitors.values():
+            visitor._module_name = name
+
     def _set_insertion_block(self, block: ir.Block | None) -> None:
         self.current_block = block
         for visitor in self.subvisitors.values():
@@ -114,3 +135,125 @@ class BaseVisitor:
         raise TypeError(
             f"Visitor for {type(node).__name__} must return an MLIR value, got {type(result)!r}"
         )
+
+    def _loc(self, node: ast.AST) -> ir.Location:
+        lineno = getattr(node, "lineno", None)
+        col = getattr(node, "col_offset", None)
+        if lineno is None or col is None:
+            return ir.Location.unknown(self.ctx)
+        return ir.Location.file(self._module_name, int(lineno), int(col) + 1, self.ctx)
+
+    def insertion_point(self) -> ir.InsertionPoint:
+        if self.current_block is None:
+            raise RuntimeError("Insertion block is not set")
+        return ir.InsertionPoint(self.current_block)
+
+    def build_tuple(
+        self, values: list[ir.Value], *, loc: ir.Location | None = None
+    ) -> ir.Value:
+        location = loc or ir.Location.unknown(self.ctx)
+        if not values:
+            tuple_type = self.get_py_type("!py.tuple<>")
+            with location, self.insertion_point():
+                return py_ops.TupleEmptyOp(tuple_type).result
+        spec = ", ".join(str(value.type) for value in values)
+        tuple_type = self.get_py_type(f"!py.tuple<{spec}>")
+        with location, self.insertion_point():
+            return py_ops.TupleCreateOp(tuple_type, values).result
+
+    def ensure_object(
+        self, value: ir.Value, *, loc: ir.Location | None = None
+    ) -> ir.Value:
+        object_type = self.get_py_type("!py.object")
+        if value.type == object_type:
+            return value
+        location = loc or ir.Location.unknown(self.ctx)
+        with location, self.insertion_point():
+            return py_ops.UpcastOp(object_type, value).result
+
+    def annotation_to_py_type(self, annotation: ast.expr | None) -> str:
+        if annotation is None:
+            return "!py.object"
+        if isinstance(annotation, ast.Constant) and annotation.value is None:
+            return "!py.none"
+        if isinstance(annotation, ast.Name):
+            mapping = {
+                "int": "!py.int",
+                "float": "!py.float",
+                "bool": "!py.bool",
+                "str": "!py.str",
+                "None": "!py.none",
+            }
+            if annotation.id in mapping:
+                return mapping[annotation.id]
+        raise NotImplementedError(f"Unsupported annotation {ast.dump(annotation)}")
+
+    def build_funcsig(self, arg_types: list[str], result_types: list[str]) -> str:
+        args = ", ".join(arg_types)
+        rets = ", ".join(result_types)
+        arg_part = f"[{args}]" if args else "[]"
+        ret_part = f"[{rets}]" if rets else "[]"
+        return f"!py.funcsig<{arg_part} -> {ret_part}>"
+
+    # --- Scope management -------------------------------------------------
+    def push_scope(self) -> None:
+        self._scope_stack.append({})
+        for visitor in self.subvisitors.values():
+            visitor._scope_stack = self._scope_stack
+
+    def pop_scope(self) -> dict[str, ir.Value]:
+        if not self._scope_stack:
+            raise RuntimeError("Scope stack underflow")
+        scope = self._scope_stack.pop()
+        for visitor in self.subvisitors.values():
+            visitor._scope_stack = self._scope_stack
+        return scope
+
+    def current_scope(self) -> dict[str, ir.Value]:
+        if not self._scope_stack:
+            raise RuntimeError("Scope stack is empty")
+        return self._scope_stack[-1]
+
+    def define_symbol(self, name: str, value: ir.Value) -> None:
+        self.current_scope()[name] = value
+
+    def lookup_symbol(self, name: str) -> ir.Value:
+        for scope in reversed(self._scope_stack):
+            if name in scope:
+                return scope[name]
+        raise NameError(f"Undefined symbol '{name}'")
+
+    def register_function(
+        self,
+        name: str,
+        func_type: ir.Type,
+        arg_types: list[ir.Type],
+        result_types: list[ir.Type],
+        *,
+        symbol: str | None = None,
+        has_vararg: bool = False,
+    ) -> None:
+        info = FunctionInfo(
+            symbol or name,
+            func_type,
+            tuple(arg_types),
+            tuple(result_types),
+            has_vararg,
+        )
+        self._functions[name] = info
+
+    def lookup_function(self, name: str) -> FunctionInfo:
+        if name not in self._functions:
+            raise NameError(f"Unknown function '{name}'")
+        return self._functions[name]
+
+    def _block_terminated(self, block: ir.Block) -> bool:
+        ops = list(block.operations)
+        if not ops:
+            return False
+        terminators = {
+            "py.return",
+            "cf.br",
+            "cf.cond_br",
+        }
+        return ops[-1].operation.name in terminators

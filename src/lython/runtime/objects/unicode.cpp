@@ -28,3 +28,17 @@ LyUnicodeObject *LyUnicode_FromUTF8(const char *data, std::size_t len) {
   return unicode;
 }
 }
+
+void LyUnicode_Dealloc(LyObject *object) {
+  if (!object)
+    return;
+  auto *unicode = reinterpret_cast<LyUnicodeObject *>(object);
+  delete[] unicode->utf8_data;
+  ::operator delete(unicode);
+}
+
+LyUnicodeObject *LyUnicode_Repr(LyObject *object) {
+  auto *unicode = reinterpret_cast<LyUnicodeObject *>(object);
+  return LyUnicode_FromUTF8(unicode->utf8_data,
+                            static_cast<std::size_t>(unicode->utf8_length));
+}

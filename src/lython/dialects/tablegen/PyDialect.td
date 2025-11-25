@@ -69,7 +69,7 @@ def Py_FuncOp : Py_Op<"func", [
     OptionalAttr<UnitAttr>:$specialize
   );
 
-  let regions = (region SizedRegion<1>:$body);
+  let regions = (region AnyRegion:$body);
 
   let hasVerifier = 1;
   let hasCustomAssemblyFormat = 0;
@@ -344,6 +344,31 @@ def Py_StrConstantOp : Py_Op<"str.constant", [Pure]> {
   let hasVerifier = 1;
 }
 
+def Py_IntConstantOp : Py_Op<"int.constant", [Pure]> {
+  let summary = "Create a Python integer literal";
+  let description = [{
+    Produces a `!py.int` SSA value from a compile-time integer attribute.
+  }];
+
+  let arguments = (ins I64Attr:$value);
+  let results = (outs Py_IntType:$result);
+
+  let assemblyFormat = "$value attr-dict `:` type($result)";
+}
+
+def Py_FloatConstantOp : Py_Op<"float.constant", [Pure]> {
+  let summary = "Create a Python float literal";
+  let description = [{
+    Produces a `!py.float` SSA value from a compile-time floating-point attribute.
+  }];
+
+  let arguments = (ins F64Attr:$value);
+  let results = (outs Py_FloatType:$result);
+
+  let assemblyFormat = "$value attr-dict `:` type($result)";
+  let hasVerifier = 1;
+}
+
 //===----------------------------------------------------------------------===//
 // Type casting operations
 //===----------------------------------------------------------------------===//
@@ -400,6 +425,27 @@ def Py_CastToPrimOp : Py_Op<"cast.to_prim", [Pure]> {
 
 }
 
+def Py_CastIdentityOp : Py_Op<"cast.identity", [Pure]> {
+  let summary = "Explicit identity cast used during lowering";
+  let description = [{
+    Serves as an explicit annotation that two SSA values share the same
+    in-memory representation even when their types differ. This is mainly
+    produced by the lowering pipeline to bridge !py.* types and their lowered
+    pointer representation. At least one of the operand or result types must be
+    a !py.* type.
+
+    Example:
+      %llvm = py.cast.identity %py_val : !py.int -> !llvm.ptr
+      %py = py.cast.identity %llvm_val : !llvm.ptr -> !py.int
+  }];
+
+  let arguments = (ins AnyType:$input);
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
+  let hasVerifier = 1;
+}
+
 def Py_UpcastOp : Py_Op<"upcast", [Pure]> {
   let summary = "Explicitly widen a Python value to !py.object";
   let description = [{
@@ -440,6 +486,77 @@ def Py_NumAddOp : Py_Op<"num.add", [Pure, SameOperandsAndResultType]> {
   let results = (outs AnyType:$result);
 
   let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict `->` type($result)";
-
   let hasVerifier = 1;
+}
+
+def Py_NumSubOp : Py_Op<"num.sub", [Pure, SameOperandsAndResultType]> {
+  let summary = "Python numeric subtraction";
+  let description = [{
+    Performs subtraction on Python numeric types (!py.int, !py.float).
+    Both operands must have the same type, and the result has the same type.
+  }];
+
+  let arguments = (ins
+    AnyType:$lhs,
+    AnyType:$rhs
+  );
+
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict `->` type($result)";
+}
+
+def Py_NumLeOp : Py_Op<"num.le", [Pure]> {
+  let summary = "Python numeric <= comparison";
+  let description = [{
+    Compares two numeric values and returns a `!py.bool` object.
+  }];
+
+  let arguments = (ins
+    AnyType:$lhs,
+    AnyType:$rhs
+  );
+
+  let results = (outs Py_BoolType:$result);
+
+  let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict `->` type($result)";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// Reference counting operations
+//===----------------------------------------------------------------------===//
+
+def Py_IncRefOp : Py_Op<"incref", []> {
+  let summary = "Increment reference count of a Python object";
+  let description = [{
+    Increments the reference count of a Python object. This operation has
+    side effects and cannot be eliminated by dead code elimination.
+
+    The operation accepts NULL pointers safely - NULL inputs are ignored
+    at runtime.
+
+    Example:
+      py.incref %obj : !py.object
+  }];
+
+  let arguments = (ins AnyType:$object);
+  let assemblyFormat = "$object `:` type($object) attr-dict";
+}
+
+def Py_DecRefOp : Py_Op<"decref", []> {
+  let summary = "Decrement reference count of a Python object";
+  let description = [{
+    Decrements the reference count of a Python object. When the reference
+    count reaches zero, the object is deallocated.
+
+    The operation accepts NULL pointers safely - NULL inputs are ignored
+    at runtime.
+
+    Example:
+      py.decref %obj : !py.object
+  }];
+
+  let arguments = (ins AnyType:$object);
+  let assemblyFormat = "$object `:` type($object) attr-dict";
 }

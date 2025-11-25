@@ -38,13 +38,19 @@ class ModVisitor(BaseVisitor):
         Module(stmt* body, type_ignore* type_ignores)
         ```
         """
+        module_name = getattr(node, "lython_module_name", "__main__")
         with ir.Location.file("<module>", 1, 1, self.ctx):
             module = ir.Module.create()
         self._set_module(module)
+        self._set_module_name(module_name)
 
+        self.push_scope()
         with ir.InsertionPoint(module.body), ir.Location.unknown(self.ctx):
             builtin_sig = self.get_py_type(
                 "!py.funcsig<[], vararg = !py.tuple<!py.object> -> [!py.none]>"
+            )
+            builtin_func_type = self.get_py_type(
+                "!py.func<!py.funcsig<[], vararg = !py.tuple<!py.object> -> [!py.none]>>"
             )
             builtin = py_ops.FuncOp(
                 "__builtin_print",
@@ -57,6 +63,14 @@ class ModVisitor(BaseVisitor):
             with ir.InsertionPoint(builtin_block), ir.Location.unknown(self.ctx):
                 none_value = py_ops.NoneOp(self.get_py_type("!py.none")).result
                 py_ops.ReturnOp([none_value])
+            self.register_function(
+                "print",
+                builtin_func_type,
+                [],
+                [self.get_py_type("!py.none")],
+                symbol="__builtin_print",
+                has_vararg=True,
+            )
 
             main_sig = self.get_py_type("!py.funcsig<[] -> [i32]>")
             main = py_ops.FuncOp(
@@ -74,6 +88,7 @@ class ModVisitor(BaseVisitor):
             i32 = ir.IntegerType.get_signless(32)
             zero = arith_ops.ConstantOp(i32, ir.IntegerAttr.get(i32, 0)).result
             py_ops.ReturnOp([zero])
+        self.pop_scope()
         return None
 
     def visit_Interactive(self, node: ast.Interactive) -> Any:
