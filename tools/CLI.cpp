@@ -244,7 +244,7 @@ LogicalResult generateMlirFromPython(StringRef pythonFile, StringRef sourceRoot,
 
   llvm::SmallString<256> scriptPath;
   if (auto ec =
-          llvm::sys::fs::createTemporaryFile("lython_frontend", ".py", scriptPath)) {
+          llvm::sys::fs::createTemporaryFile("lython_frontend", "py", scriptPath)) {
     llvm::errs() << "error: failed to create temporary frontend script: "
                  << ec.message() << "\n";
     return failure();
