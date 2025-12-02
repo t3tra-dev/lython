@@ -10,6 +10,7 @@ struct LyTupleObject {
 extern "C" {
 
 LyTupleObject *LyTuple_New(std::size_t size);
+LyTupleObject *Ly_GetEmptyTuple();
 void LyTuple_SetItem(LyTupleObject *tuple, std::size_t index, LyObject *value);
 }
 

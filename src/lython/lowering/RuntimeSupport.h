@@ -19,6 +19,7 @@ struct RuntimeSymbols {
   static constexpr llvm::StringLiteral kFloatFromDouble{"LyFloat_FromDouble"};
   static constexpr llvm::StringLiteral kTupleNew{"LyTuple_New"};
   static constexpr llvm::StringLiteral kTupleSetItem{"LyTuple_SetItem"};
+  static constexpr llvm::StringLiteral kGetEmptyTuple{"Ly_GetEmptyTuple"};
   static constexpr llvm::StringLiteral kGetNone{"Ly_GetNone"};
   static constexpr llvm::StringLiteral kGetBuiltinPrint{"Ly_GetBuiltinPrint"};
   static constexpr llvm::StringLiteral kCallVectorcall{"Ly_CallVectorcall"};

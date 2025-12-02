@@ -566,6 +566,142 @@ struct RuntimeLoweringPass
     };
     cseStringCreation();
 
+    // Optimization: Replace LyTuple_New(0) with Ly_GetEmptyTuple()
+    // This uses a pre-allocated immortal empty tuple singleton
+    auto replaceEmptyTupleNew = [&]() {
+      SmallVector<LLVM::CallOp> toReplace;
+      module.walk([&](LLVM::CallOp callOp) {
+        auto callee = callOp.getCallee();
+        if (!callee || *callee != "LyTuple_New")
+          return;
+        // Check if argument is constant 0
+        if (callOp.getNumOperands() != 1)
+          return;
+        auto sizeConst = callOp.getOperand(0).getDefiningOp<LLVM::ConstantOp>();
+        if (!sizeConst)
+          return;
+        auto sizeAttr = llvm::dyn_cast<IntegerAttr>(sizeConst.getValue());
+        if (!sizeAttr || sizeAttr.getInt() != 0)
+          return;
+        toReplace.push_back(callOp);
+      });
+
+      for (auto callOp : toReplace) {
+        OpBuilder builder(callOp);
+        // Get or create Ly_GetEmptyTuple function declaration
+        auto emptyTupleFunc =
+            module.lookupSymbol<LLVM::LLVMFuncOp>("Ly_GetEmptyTuple");
+        if (!emptyTupleFunc) {
+          OpBuilder moduleBuilder(module.getBodyRegion());
+          auto ptrType = LLVM::LLVMPointerType::get(ctx);
+          auto funcType = LLVM::LLVMFunctionType::get(ptrType, {});
+          emptyTupleFunc = moduleBuilder.create<LLVM::LLVMFuncOp>(
+              module.getLoc(), "Ly_GetEmptyTuple", funcType);
+        }
+        auto newCall = builder.create<LLVM::CallOp>(
+            callOp.getLoc(), emptyTupleFunc, ValueRange{});
+        callOp.getResult().replaceAllUsesWith(newCall.getResult());
+        callOp->erase();
+      }
+    };
+    replaceEmptyTupleNew();
+
+    // Optimization: CSE for singleton getter calls (Ly_GetBuiltinPrint,
+    // Ly_GetNone, Ly_GetEmptyTuple) These return borrowed references to
+    // singletons, so no decref needed
+    auto cseSingletonGetters = [&]() {
+      module.walk([&](func::FuncOp func) {
+        if (func.isExternal())
+          return;
+
+        // Cache for each singleton getter function
+        llvm::StringMap<LLVM::CallOp> singletonCache;
+        SmallVector<LLVM::CallOp> toErase;
+
+        func.walk([&](LLVM::CallOp callOp) {
+          auto callee = callOp.getCallee();
+          if (!callee)
+            return;
+          // Singleton getters that we want to CSE
+          if (*callee != "Ly_GetBuiltinPrint" && *callee != "Ly_GetNone" &&
+              *callee != "Ly_GetEmptyTuple")
+            return;
+
+          StringRef funcName = *callee;
+          auto it = singletonCache.find(funcName);
+          if (it != singletonCache.end()) {
+            // Replace with cached result
+            callOp.getResult().replaceAllUsesWith(it->second.getResult());
+            toErase.push_back(callOp);
+          } else {
+            singletonCache[funcName] = callOp;
+          }
+        });
+
+        for (auto op : toErase)
+          op->erase();
+      });
+    };
+    cseSingletonGetters();
+
+    // CSE for LLVM constants within each function
+    auto cseConstants = [&]() {
+      module.walk([&](func::FuncOp func) {
+        if (func.isExternal())
+          return;
+        // Map from (type, value) -> first constant op
+        llvm::DenseMap<std::pair<Type, Attribute>, LLVM::ConstantOp>
+            constantCache;
+        SmallVector<LLVM::ConstantOp> toErase;
+
+        func.walk([&](LLVM::ConstantOp constOp) {
+          auto key = std::make_pair(constOp.getType(), constOp.getValue());
+          auto it = constantCache.find(key);
+          if (it != constantCache.end()) {
+            constOp.getResult().replaceAllUsesWith(it->second.getResult());
+            toErase.push_back(constOp);
+          } else {
+            constantCache[key] = constOp;
+          }
+        });
+
+        for (auto op : toErase)
+          op->erase();
+      });
+    };
+    cseConstants();
+
+    // Dead code elimination for unused LLVM operations after CSE
+    // This cleans up addressof, GEP, and constants that were only used by CSE'd
+    // calls
+    auto eliminateDeadCode = [&]() {
+      bool changed = true;
+      while (changed) {
+        changed = false;
+        SmallVector<Operation *> toErase;
+        module.walk([&](Operation *op) {
+          // Only consider operations with no side effects
+          if (!isa<LLVM::AddressOfOp, LLVM::GEPOp, LLVM::ConstantOp>(op))
+            return;
+          // Check if all results are unused
+          bool allUnused = true;
+          for (Value result : op->getResults()) {
+            if (!result.use_empty()) {
+              allUnused = false;
+              break;
+            }
+          }
+          if (allUnused)
+            toErase.push_back(op);
+        });
+        for (Operation *op : toErase) {
+          op->erase();
+          changed = true;
+        }
+      }
+    };
+    eliminateDeadCode();
+
     if (llvm::sys::Process::GetEnv("LYTHON_DUMP_LOWERING_IR")) {
       llvm::errs() << "[After string CSE]\n";
       module.dump();

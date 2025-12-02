@@ -1,6 +1,7 @@
 #include "objects/tuple.h"
 #include "objects/unicode.h"
 
+#include <climits>
 #include <cstddef>
 #include <cstring>
 #include <memory>
@@ -53,9 +54,21 @@ LyTupleObject *allocateTuple(std::size_t size) {
 
 } // namespace
 
+// Singleton empty tuple (immortal - refcount max value)
+static LyTupleObject *emptyTuple = nullptr;
+
 extern "C" {
 
 LyTupleObject *LyTuple_New(std::size_t size) { return allocateTuple(size); }
+
+LyTupleObject *Ly_GetEmptyTuple() {
+  if (!emptyTuple) {
+    emptyTuple = allocateTuple(0);
+    // Make immortal by setting max refcount
+    emptyTuple->ob_base.ob_base.ob_refcnt = PTRDIFF_MAX;
+  }
+  return emptyTuple;
+}
 
 void LyTuple_SetItem(LyTupleObject *tuple, std::size_t index, LyObject *value) {
   if (!tuple)
