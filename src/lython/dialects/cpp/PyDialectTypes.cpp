@@ -190,9 +190,6 @@ bool isPyFuncType(Type type) { return mlir::isa<FuncType>(type); }
 bool isPyPrimFuncType(Type type) { return mlir::isa<PrimFuncType>(type); }
 
 bool isCallableType(Type type) {
-  // v2: Callable = !py.func or !py.class (with __call__ method)
-  // TODO(v2): Add runtime check for __call__ method in !py.class
-  // For now, accept all !py.func and !py.class
   return mlir::isa<FuncType>(type) || mlir::isa<ClassType>(type);
 }
 
