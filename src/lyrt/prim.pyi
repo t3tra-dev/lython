@@ -1,43 +1,45 @@
 from __future__ import annotations
 
-from abc import ABC
+from typing import Generic, TypeVar
 
-__all__ = ["prim", "i1", "i8"]
+__all__ = [
+    "prim",
+    "i1",
+    "i8",
+    "i16",
+    "i32",
+    "i64",
+    "i128",
+    "i256",
+    "f16",
+    "f32",
+    "f64",
+    "f128",
+    "f256",
+]
 
-class prim(ABC):
-    pass
+PrimT = TypeVar("PrimT", bound=prim)
 
-class i1(prim):
-    def __eq__(self, other: i1) -> i1:  # type: ignore
-        pass
+class prim(Generic[PrimT]):
+    def __add__(self: PrimT, other: PrimT) -> PrimT: ...
+    def __sub__(self: PrimT, other: PrimT) -> PrimT: ...
+    def __mul__(self: PrimT, other: PrimT) -> PrimT: ...
+    def __lt__(self: PrimT, other: PrimT) -> i1: ...
+    def __le__(self: PrimT, other: PrimT) -> i1: ...
+    def __eq__(self: PrimT, other: PrimT) -> i1: ...
+    def __ne__(self: PrimT, other: PrimT) -> i1: ...
+    def __gt__(self: PrimT, other: PrimT) -> i1: ...
+    def __ge__(self: PrimT, other: PrimT) -> i1: ...
 
-    def __ne__(self, other: i1) -> i1:  # type: ignore
-        pass
-
-class i8(prim):
-    def __add__(self, other: i8) -> i8:
-        pass
-
-    def __sub__(self, other: i8) -> i8:
-        pass
-
-    def __mul__(self, other: i8) -> i8:
-        pass
-
-    def __lt__(self, other: i8) -> i1:
-        pass
-
-    def __le__(self, other: i8) -> i1:
-        pass
-
-    def __eq__(self, other: i8) -> i1:  # type: ignore
-        pass
-
-    def __ne__(self, other: i8) -> i1:  # type: ignore
-        pass
-
-    def __gt__(self, other: i8) -> i1:
-        pass
-
-    def __ge__(self, other: i8) -> i1:
-        pass
+class i1(prim[i1]): ...
+class i8(prim[i8]): ...
+class i16(prim[i16]): ...
+class i32(prim[i32]): ...
+class i64(prim[i64]): ...
+class i128(prim[i128]): ...
+class i256(prim[i256]): ...
+class f16(prim[f16]): ...
+class f32(prim[f32]): ...
+class f64(prim[f64]): ...
+class f128(prim[f128]): ...
+class f256(prim[f256]): ...
