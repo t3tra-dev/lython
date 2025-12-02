@@ -20,6 +20,7 @@ extern "C" {
 
 LyObject *LyDict_New();
 LyObject *LyDict_Insert(LyObject *dict, LyObject *key, LyObject *value);
+LyObject *LyDict_GetItem(LyObject *dict, LyObject *key);
 }
 
 void LyDict_Dealloc(LyObject *object);

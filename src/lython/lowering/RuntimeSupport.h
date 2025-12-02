@@ -15,6 +15,7 @@ namespace py {
 struct RuntimeSymbols {
   static constexpr llvm::StringLiteral kStrFromUtf8{"LyUnicode_FromUTF8"};
   static constexpr llvm::StringLiteral kLongFromI64{"LyLong_FromI64"};
+  static constexpr llvm::StringLiteral kLongFromString{"LyLong_FromString"};
   static constexpr llvm::StringLiteral kFloatFromDouble{"LyFloat_FromDouble"};
   static constexpr llvm::StringLiteral kTupleNew{"LyTuple_New"};
   static constexpr llvm::StringLiteral kTupleSetItem{"LyTuple_SetItem"};
@@ -36,6 +37,9 @@ struct RuntimeSymbols {
   static constexpr llvm::StringLiteral kBoolAsBool{"LyBool_AsBool"};
   static constexpr llvm::StringLiteral kIncRef{"Ly_IncRef"};
   static constexpr llvm::StringLiteral kDecRef{"Ly_DecRef"};
+  // Object attribute operations
+  static constexpr llvm::StringLiteral kDictGetItem{"LyDict_GetItem"};
+  static constexpr llvm::StringLiteral kStrFromUtf8Len{"LyUnicode_FromUTF8Len"};
 };
 
 class PyLLVMTypeConverter : public mlir::LLVMTypeConverter {

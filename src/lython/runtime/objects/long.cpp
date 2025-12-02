@@ -130,7 +130,8 @@ LyLongObject *LyLong_New(Ly_ssize_t ndigits) {
 
   // Fall back to malloc if freelist is empty or larger allocation needed
   if (!obj) {
-    std::size_t size = offsetof(LyLongObject, ob_digit) + alloc_digits * sizeof(digit);
+    std::size_t size =
+        offsetof(LyLongObject, ob_digit) + alloc_digits * sizeof(digit);
     obj = static_cast<LyLongObject *>(std::malloc(size));
     if (!obj) {
       return nullptr;
@@ -178,8 +179,7 @@ LyLongObject *LyLong_GetSmallInt(sdigit value) {
   if (!smallIntCacheInitialized) {
     LyLong_InitSmallIntCache();
   }
-  return reinterpret_cast<LyLongObject *>(
-      &smallIntCache[value - kSmallIntMin]);
+  return reinterpret_cast<LyLongObject *>(&smallIntCache[value - kSmallIntMin]);
 }
 
 bool LyLong_IsSmallInt(const LyLongObject *obj) {
@@ -188,8 +188,7 @@ bool LyLong_IsSmallInt(const LyLongObject *obj) {
   }
   // Check if pointer falls within the cache array
   const auto *ptr = reinterpret_cast<const SmallIntStorage *>(obj);
-  return ptr >= &smallIntCache[0] &&
-         ptr < &smallIntCache[kSmallIntCacheSize];
+  return ptr >= &smallIntCache[0] && ptr < &smallIntCache[kSmallIntCacheSize];
 }
 
 bool LyLong_IsCompact(const LyLongObject *obj) {
@@ -212,8 +211,8 @@ LyLongObject *LyLong_FromSTwoDigits(stwodigits value) {
       return nullptr;
     }
     int sign = value < 0 ? -1 : 1;
-    digit abs_val = value < 0 ? static_cast<digit>(-value)
-                              : static_cast<digit>(value);
+    digit abs_val =
+        value < 0 ? static_cast<digit>(-value) : static_cast<digit>(value);
     LyLong_SetSignAndDigitCount(obj, sign, 1);
     obj->ob_digit[0] = abs_val;
     return obj;
@@ -244,6 +243,167 @@ LyLongObject *LyLong_FromSTwoDigits(stwodigits value) {
 
 LyLongObject *LyLong_FromI64(std::int64_t value) {
   return LyLong_FromSTwoDigits(static_cast<stwodigits>(value));
+}
+
+// CPython-compatible string to long conversion
+// Based on long_from_non_binary_base() from CPython's longobject.c
+LyLongObject *LyLong_FromString(const char *str, std::size_t len) {
+  if (!str || len == 0) {
+    return LyLong_GetSmallInt(0);
+  }
+
+  const char *p = str;
+  const char *end = str + len;
+  int sign = 1;
+
+  // Skip leading whitespace
+  while (p < end && (*p == ' ' || *p == '\t' || *p == '\n')) {
+    ++p;
+  }
+
+  // Parse sign
+  if (p < end && *p == '-') {
+    sign = -1;
+    ++p;
+  } else if (p < end && *p == '+') {
+    ++p;
+  }
+
+  // Skip leading zeros (but keep at least one digit for "0")
+  const char *start = p;
+  while (p < end && *p == '0') {
+    ++p;
+  }
+
+  // Count digits (excluding underscores)
+  Ly_ssize_t digits = 0;
+  for (const char *q = p; q < end; ++q) {
+    if (*q >= '0' && *q <= '9') {
+      ++digits;
+    } else if (*q == '_') {
+      // Allow underscores (Python 3.6+)
+    } else {
+      break; // Stop at first non-digit
+    }
+  }
+
+  if (digits == 0) {
+    // Either "0" or empty
+    if (p > start) {
+      return LyLong_GetSmallInt(0); // Was all zeros
+    }
+    return LyLong_GetSmallInt(0); // Invalid or empty
+  }
+
+  // CPython's convwidth/convmultmax for base 10 with 30-bit digits
+  // convwidth = 9 (process 9 decimal digits at a time)
+  // convmultmax = 10^9 = 1000000000
+  constexpr int convwidth = 9;
+  constexpr twodigits convmultmax = 1000000000ULL;
+  // log(10) / log(2^30) ≈ 0.11073093649624542
+  constexpr double log_base_BASE_10 = 0.11073093649624542;
+
+  // Pre-allocate result with estimated size
+  Ly_ssize_t size_z = static_cast<Ly_ssize_t>(
+      static_cast<double>(digits) * log_base_BASE_10 + 1.0);
+  if (size_z < 1)
+    size_z = 1;
+
+  LyLongObject *z = LyLong_New(size_z);
+  if (!z) {
+    return nullptr;
+  }
+  LyLong_SetSignAndDigitCount(z, 0, 0); // Start with zero
+
+  // Process digits in chunks of convwidth
+  while (p < end) {
+    // Skip underscores
+    if (*p == '_') {
+      ++p;
+      continue;
+    }
+
+    // Grab up to convwidth digits
+    twodigits c = 0;
+    int i = 0;
+    for (; i < convwidth && p < end; ++p) {
+      if (*p == '_') {
+        continue;
+      }
+      if (*p < '0' || *p > '9') {
+        break;
+      }
+      c = c * 10 + static_cast<twodigits>(*p - '0');
+      ++i;
+    }
+
+    if (i == 0) {
+      break; // No more digits
+    }
+
+    // Calculate actual multiplier if we got fewer than convwidth digits
+    twodigits convmult = convmultmax;
+    if (i != convwidth) {
+      convmult = 1;
+      for (int j = 0; j < i; ++j) {
+        convmult *= 10;
+      }
+    }
+
+    // Multiply z by convmult and add c
+    Ly_ssize_t ndigits = z->digitCount();
+    twodigits carry = c;
+    for (Ly_ssize_t j = 0; j < ndigits; ++j) {
+      carry += static_cast<twodigits>(z->ob_digit[j]) * convmult;
+      z->ob_digit[j] = static_cast<digit>(carry & kDigitMask);
+      carry >>= kDigitBits;
+    }
+
+    // Handle carry
+    while (carry > 0) {
+      if (ndigits < size_z) {
+        z->ob_digit[ndigits] = static_cast<digit>(carry & kDigitMask);
+        ++ndigits;
+        carry >>= kDigitBits;
+      } else {
+        // Need to reallocate (rare)
+        LyLongObject *newz = LyLong_New(size_z + 1);
+        if (!newz) {
+          // Free old z and return error
+          LyLong_Dealloc(reinterpret_cast<LyObject *>(z));
+          return nullptr;
+        }
+        std::memcpy(newz->ob_digit, z->ob_digit,
+                    static_cast<std::size_t>(size_z) * sizeof(digit));
+        LyLong_Dealloc(reinterpret_cast<LyObject *>(z));
+        z = newz;
+        ++size_z;
+        z->ob_digit[ndigits] = static_cast<digit>(carry & kDigitMask);
+        ++ndigits;
+        carry >>= kDigitBits;
+      }
+    }
+    LyLong_SetSignAndDigitCount(z, ndigits > 0 ? 1 : 0, ndigits);
+  }
+
+  // Set final sign
+  if (z->digitCount() == 0) {
+    LyLong_Dealloc(reinterpret_cast<LyObject *>(z));
+    return LyLong_GetSmallInt(0);
+  }
+
+  LyLong_SetSignAndDigitCount(z, sign, z->digitCount());
+
+  // Check if result fits in small int cache
+  if (z->isCompact()) {
+    stwodigits val = medium_value(z);
+    if (IS_SMALL_INT(val)) {
+      LyLong_Dealloc(reinterpret_cast<LyObject *>(z));
+      return LyLong_GetSmallInt(static_cast<sdigit>(val));
+    }
+  }
+
+  return z;
 }
 
 // Compare magnitudes of two LyLongObjects (ignoring sign)
@@ -435,8 +595,10 @@ int LyLong_Compare(const LyLongObject *lhs, const LyLongObject *rhs) {
   if (LyLong_BothAreCompact(lhs, rhs)) {
     stwodigits lval = medium_value(lhs);
     stwodigits rval = medium_value(rhs);
-    if (lval < rval) return -1;
-    if (lval > rval) return 1;
+    if (lval < rval)
+      return -1;
+    if (lval > rval)
+      return 1;
     return 0;
   }
 
@@ -449,7 +611,8 @@ int LyLong_Compare(const LyLongObject *lhs, const LyLongObject *rhs) {
 
   // Same sign: compare magnitudes
   int cmp = compareMagnitude(lhs, rhs);
-  if (cmp == 0) return 0;
+  if (cmp == 0)
+    return 0;
   // If negative, reverse comparison
   return lsign < 0 ? -cmp : cmp;
 }

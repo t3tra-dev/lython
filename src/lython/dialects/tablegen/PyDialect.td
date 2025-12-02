@@ -78,7 +78,8 @@ def Py_FuncOp : Py_Op<"func", [
 def Py_ClassOp : Py_Op<"class", [
     Symbol,
     SymbolTable,
-    IsolatedFromAbove
+    IsolatedFromAbove,
+    NoTerminator
   ]> {
   let summary = "Python class definition";
   let description = [{
@@ -348,9 +349,14 @@ def Py_IntConstantOp : Py_Op<"int.constant", [Pure]> {
   let summary = "Create a Python integer literal";
   let description = [{
     Produces a `!py.int` SSA value from a compile-time integer attribute.
+    The value is stored as a decimal string to support arbitrary precision.
+
+    Example:
+      %0 = py.int.constant "42" : !py.int
+      %1 = py.int.constant "-12345678901234567890" : !py.int
   }];
 
-  let arguments = (ins I64Attr:$value);
+  let arguments = (ins StrAttr:$value);
   let results = (outs Py_IntType:$result);
 
   let assemblyFormat = "$value attr-dict `:` type($result)";
@@ -521,6 +527,70 @@ def Py_NumLeOp : Py_Op<"num.le", [Pure]> {
 
   let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict `->` type($result)";
   let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// Class instantiation
+//===----------------------------------------------------------------------===//
+
+def Py_ClassNewOp : Py_Op<"class.new", [Pure]> {
+  let summary = "Create a new instance of a class";
+  let description = [{
+    Allocates and initializes a new instance of the specified class.
+    Note: This does NOT call __init__ - that must be done separately.
+
+    Example:
+      %instance = py.class.new @MyClass : !py.class<"MyClass">
+  }];
+
+  let arguments = (ins
+    FlatSymbolRefAttr:$class_name
+  );
+
+  let results = (outs Py_ClassType:$result);
+
+  let assemblyFormat = "$class_name attr-dict `:` type($result)";
+}
+
+//===----------------------------------------------------------------------===//
+// Attribute access operations
+//===----------------------------------------------------------------------===//
+
+def Py_AttrGetOp : Py_Op<"attr.get", [Pure]> {
+  let summary = "Get an attribute from a Python object";
+  let description = [{
+    Retrieves an attribute by name from a Python object.
+
+    Example:
+      %val = py.attr.get %obj["value"] : !py.class<"Foo"> -> !py.int
+  }];
+
+  let arguments = (ins
+    AnyType:$object,
+    StrAttr:$name
+  );
+
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat = "$object `[` $name `]` attr-dict `:` type($object) `->` type($result)";
+}
+
+def Py_AttrSetOp : Py_Op<"attr.set", []> {
+  let summary = "Set an attribute on a Python object";
+  let description = [{
+    Sets an attribute by name on a Python object.
+
+    Example:
+      py.attr.set %obj["value"] = %val : !py.class<"Foo">, !py.int
+  }];
+
+  let arguments = (ins
+    AnyType:$object,
+    StrAttr:$name,
+    AnyType:$value
+  );
+
+  let assemblyFormat = "$object `[` $name `]` `=` $value attr-dict `:` type($object) `,` type($value)";
 }
 
 //===----------------------------------------------------------------------===//

@@ -17,6 +17,23 @@ class FunctionInfo(NamedTuple):
     has_vararg: bool
 
 
+class MethodInfo(NamedTuple):
+    """Information about a class method."""
+
+    name: str
+    arg_types: tuple[ir.Type, ...]  # Including self
+    result_types: tuple[ir.Type, ...]
+
+
+class ClassInfo(NamedTuple):
+    """Information about a class definition."""
+
+    name: str
+    class_type: ir.Type
+    methods: dict[str, MethodInfo]
+    attributes: dict[str, ir.Type]  # Instance attribute name -> type
+
+
 class BaseVisitor:
     """
     ベースとなるVisitorクラス
@@ -40,6 +57,7 @@ class BaseVisitor:
         self._scope_stack: list[dict[str, ir.Value]] = []
         self._module_name: str = "__main__"
         self._functions: dict[str, FunctionInfo] = {}
+        self._classes: dict[str, ClassInfo] = {}
 
         if subvisitors is not None:
             self.subvisitors = subvisitors
@@ -61,6 +79,7 @@ class BaseVisitor:
             visitor._scope_stack = self._scope_stack
             visitor._module_name = self._module_name
             visitor._functions = self._functions
+            visitor._classes = self._classes
 
     def visit(self, node: ast.AST) -> Any:
         method_name = f"visit_{type(node).__name__}"
@@ -246,6 +265,47 @@ class BaseVisitor:
         if name not in self._functions:
             raise NameError(f"Unknown function '{name}'")
         return self._functions[name]
+
+    def register_class(
+        self,
+        name: str,
+        class_type: ir.Type,
+        methods: dict[str, MethodInfo],
+        attributes: dict[str, ir.Type] | None = None,
+    ) -> None:
+        info = ClassInfo(name, class_type, methods, attributes or {})
+        self._classes[name] = info
+
+    def lookup_class(self, name: str) -> ClassInfo | None:
+        return self._classes.get(name)
+
+    def get_attribute_type(self, obj_type: ir.Type, attr_name: str) -> ir.Type:
+        """
+        オブジェクト型と属性名から属性の型を推論する。
+
+        クラス処理中は _pending_attributes を、それ以外は登録済みの ClassInfo を参照する。
+        型が不明な場合は !py.object を返す。
+        """
+        obj_type_str = str(obj_type)
+
+        # Extract class name from type like !py.class<"Counter">
+        if not (obj_type_str.startswith('!py.class<"') and obj_type_str.endswith('">')):
+            return self.get_py_type("!py.object")
+
+        class_name = obj_type_str[len('!py.class<"') : -len('">')]  # noqa
+
+        # First check _pending_attributes (during class processing)
+        stmt_visitor = self.subvisitors.get("Stmt") or self
+        pending_attrs = getattr(stmt_visitor, "_pending_attributes", None)
+        if pending_attrs is not None and attr_name in pending_attrs:
+            return pending_attrs[attr_name]
+
+        # Fall back to registered class info
+        class_info = self.lookup_class(class_name)
+        if class_info is not None and attr_name in class_info.attributes:
+            return class_info.attributes[attr_name]
+
+        return self.get_py_type("!py.object")
 
     def _block_terminated(self, block: ir.Block) -> bool:
         ops = list(block.operations)

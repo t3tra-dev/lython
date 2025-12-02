@@ -5,8 +5,10 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Process.h"
 #include "llvm/Support/raw_ostream.h"
+#include <cstdlib>
 #include <string>
 
 #include "PyDialect.h.inc"
@@ -363,15 +365,15 @@ struct RuntimeLoweringPass
         if (func.isExternal())
           return;
         Block &entryBlock = func.getBody().front();
-        llvm::DenseMap<int64_t, IntConstantOp> constantMap;
+        llvm::StringMap<IntConstantOp> constantMap;
 
         // First pass: collect all IntConstantOp
         SmallVector<IntConstantOp> allConstants;
         func.walk([&](IntConstantOp op) { allConstants.push_back(op); });
 
-        // Second pass: CSE and hoist
+        // Second pass: CSE and hoist (using string value as key)
         for (IntConstantOp op : allConstants) {
-          int64_t value = op.getValue();
+          llvm::StringRef value = op.getValue();
           auto it = constantMap.find(value);
           if (it != constantMap.end()) {
             // Replace with existing constant
@@ -395,9 +397,13 @@ struct RuntimeLoweringPass
       module.walk([&](DecRefOp decref) {
         Value obj = decref.getObject();
         if (auto intConst = obj.getDefiningOp<IntConstantOp>()) {
-          int64_t value = intConst.getValue();
-          // Small int cache range: -5 to 256 (immortal objects)
-          if (value >= -5 && value <= 256) {
+          llvm::StringRef valueStr = intConst.getValue();
+          // Parse the string to check if it's in small int range
+          char *end;
+          long long value = std::strtoll(valueStr.data(), &end, 10);
+          // Only apply optimization if parsing succeeded and value is in range
+          if (end == valueStr.data() + valueStr.size() && value >= -5 &&
+              value <= 256) {
             toErase.push_back(decref);
           }
         }
@@ -458,11 +464,11 @@ struct RuntimeLoweringPass
         ConversionTarget target(*ctx);
         target.addLegalDialect<LLVM::LLVMDialect, func::FuncDialect>();
         target.addLegalOp<ModuleOp>();
-        target.addIllegalOp<StrConstantOp, IntConstantOp, FloatConstantOp,
-                            TupleEmptyOp, TupleCreateOp, DictEmptyOp,
-                            DictInsertOp, NoneOp, FuncObjectOp, NumAddOp,
-                            NumSubOp, NumLeOp, CastToPrimOp, CastIdentityOp,
-                            UpcastOp, IncRefOp, DecRefOp>();
+        target.addIllegalOp<
+            StrConstantOp, IntConstantOp, FloatConstantOp, TupleEmptyOp,
+            TupleCreateOp, DictEmptyOp, DictInsertOp, NoneOp, FuncObjectOp,
+            NumAddOp, NumSubOp, NumLeOp, CastToPrimOp, CastIdentityOp, UpcastOp,
+            IncRefOp, DecRefOp, ClassNewOp, AttrGetOp, AttrSetOp, ClassOp>();
 
         ScopedDiagnosticHandler diagHandler(ctx, materializationFilter);
         auto conversionResult =
@@ -483,6 +489,86 @@ struct RuntimeLoweringPass
     if (failed(runValueConversion())) {
       signalPassFailure();
       return;
+    }
+
+    // Optimization: CSE for LyUnicode_FromUTF8 calls within each function
+    // This reduces redundant string key creation for attribute access
+    // After CSE, we add decref at function end for the cached strings
+    auto cseStringCreation = [&]() {
+      module.walk([&](func::FuncOp func) {
+        if (func.isExternal())
+          return;
+
+        // Map from (string_global_symbol, length) -> first call result
+        llvm::DenseMap<std::pair<StringRef, int64_t>, LLVM::CallOp> stringCache;
+        SmallVector<LLVM::CallOp> toErase;
+        SmallVector<LLVM::CallOp> cachedStrings;
+
+        func.walk([&](LLVM::CallOp callOp) {
+          auto callee = callOp.getCallee();
+          if (!callee || *callee != "LyUnicode_FromUTF8")
+            return;
+
+          // Get the string global and length arguments
+          if (callOp.getNumOperands() != 2)
+            return;
+
+          // First operand should be a GEP pointing to a global string
+          auto gepOp = callOp.getOperand(0).getDefiningOp<LLVM::GEPOp>();
+          if (!gepOp)
+            return;
+          auto addrOp = gepOp.getBase().getDefiningOp<LLVM::AddressOfOp>();
+          if (!addrOp)
+            return;
+          StringRef globalName = addrOp.getGlobalName();
+
+          // Second operand should be a constant length
+          auto lenConst =
+              callOp.getOperand(1).getDefiningOp<LLVM::ConstantOp>();
+          if (!lenConst)
+            return;
+          auto lenAttr = llvm::dyn_cast<IntegerAttr>(lenConst.getValue());
+          if (!lenAttr)
+            return;
+          int64_t len = lenAttr.getInt();
+
+          auto key = std::make_pair(globalName, len);
+          auto it = stringCache.find(key);
+          if (it != stringCache.end()) {
+            // Replace with cached result
+            callOp.getResult().replaceAllUsesWith(it->second.getResult());
+            toErase.push_back(callOp);
+          } else {
+            stringCache[key] = callOp;
+            cachedStrings.push_back(callOp);
+          }
+        });
+
+        for (auto op : toErase)
+          op->erase();
+
+        // Add decref for cached strings before each return
+        if (!cachedStrings.empty()) {
+          func.walk([&](func::ReturnOp returnOp) {
+            OpBuilder builder(returnOp);
+            auto decrefFunc =
+                module.lookupSymbol<LLVM::LLVMFuncOp>("Ly_DecRef");
+            if (decrefFunc) {
+              for (auto cachedCall : cachedStrings) {
+                builder.create<LLVM::CallOp>(
+                    returnOp.getLoc(), decrefFunc,
+                    ValueRange{cachedCall.getResult()});
+              }
+            }
+          });
+        }
+      });
+    };
+    cseStringCreation();
+
+    if (llvm::sys::Process::GetEnv("LYTHON_DUMP_LOWERING_IR")) {
+      llvm::errs() << "[After string CSE]\n";
+      module.dump();
     }
 
     replaceUnrealizedCastsWithIdentity(module);

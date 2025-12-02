@@ -2,6 +2,7 @@
 #include "objects/unicode.h"
 
 #include <algorithm>
+#include <cstring>
 #include <string>
 
 LyDictObject *LyDict_Cast(LyObject *object) {
@@ -19,25 +20,59 @@ LyObject *LyDict_New() {
   return reinterpret_cast<LyObject *>(dict);
 }
 
+// Compare two objects for equality (supports string comparison)
+static bool LyObject_Equal(LyObject *a, LyObject *b) {
+  if (a == b)
+    return true;
+  // String comparison
+  if (a && b && a->ob_type == &LyUnicode_Type() &&
+      b->ob_type == &LyUnicode_Type()) {
+    auto *strA = reinterpret_cast<LyUnicodeObject *>(a);
+    auto *strB = reinterpret_cast<LyUnicodeObject *>(b);
+    if (strA->utf8_length != strB->utf8_length)
+      return false;
+    return std::memcmp(strA->utf8_data, strB->utf8_data,
+                       static_cast<std::size_t>(strA->utf8_length)) == 0;
+  }
+  return false;
+}
+
 LyObject *LyDict_Insert(LyObject *dictObject, LyObject *key, LyObject *value) {
   LyDictObject *dict = LyDict_Cast(dictObject);
   if (!dict)
     return nullptr;
 
-  auto it =
-      std::find_if(dict->entries.begin(), dict->entries.end(),
-                   [&](const LyDictEntry &entry) { return entry.key == key; });
+  auto it = std::find_if(
+      dict->entries.begin(), dict->entries.end(),
+      [&](const LyDictEntry &entry) { return LyObject_Equal(entry.key, key); });
 
   if (it == dict->entries.end()) {
     dict->entries.push_back({key, value});
     Ly_IncRef(key);
     Ly_IncRef(value);
   } else {
+    Ly_DecRef(it->value);
     it->value = value;
     Ly_IncRef(value);
   }
 
   return dictObject;
+}
+
+LyObject *LyDict_GetItem(LyObject *dictObject, LyObject *key) {
+  LyDictObject *dict = LyDict_Cast(dictObject);
+  if (!dict)
+    return nullptr;
+
+  auto it = std::find_if(
+      dict->entries.begin(), dict->entries.end(),
+      [&](const LyDictEntry &entry) { return LyObject_Equal(entry.key, key); });
+
+  if (it == dict->entries.end())
+    return nullptr;
+
+  Ly_IncRef(it->value);
+  return it->value;
 }
 }
 

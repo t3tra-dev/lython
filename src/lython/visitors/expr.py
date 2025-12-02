@@ -5,7 +5,7 @@ import ast
 from lython.mlir.dialects import _lython_ops_gen as py_ops
 
 from ..mlir import ir
-from ._base import BaseVisitor
+from ._base import BaseVisitor, ClassInfo
 
 __all__ = ["ExprVisitor"]
 
@@ -189,10 +189,11 @@ class ExprVisitor(BaseVisitor):
                 return py_ops.NoneOp(self.get_py_type("!py.none")).result
             if isinstance(node.value, bool):
                 result_type = self.get_py_type("!py.bool")
-                return py_ops.IntConstantOp(result_type, int(node.value)).result
+                return py_ops.IntConstantOp(result_type, str(int(node.value))).result
             if isinstance(node.value, int):
                 result_type = self.get_py_type("!py.int")
-                return py_ops.IntConstantOp(result_type, node.value).result
+                # Convert to string for arbitrary precision support
+                return py_ops.IntConstantOp(result_type, str(node.value)).result
             if isinstance(node.value, float):
                 result_type = self.get_py_type("!py.float")
                 return py_ops.FloatConstantOp(result_type, node.value).result
@@ -283,10 +284,23 @@ class ExprVisitor(BaseVisitor):
         """
         if node.keywords:
             raise NotImplementedError("Keyword arguments not supported yet")
+
+        loc = self._loc(node)
+
+        # Check if this is a class instantiation
+        if isinstance(node.func, ast.Name):
+            class_info = self.lookup_class(node.func.id)
+            if class_info is not None:
+                return self._handle_class_instantiation(node, class_info, loc)
+
+        # Handle method call early to avoid generating dead py.attr.get
+        if isinstance(node.func, ast.Attribute):
+            return self._handle_method_call(node, loc)
+
+        # Otherwise it's a regular function call
         callee = self.require_value(node.func, self.visit(node.func))
         arg_values = [self.require_value(arg, self.visit(arg)) for arg in node.args]
 
-        loc = self._loc(node)
         with loc, self.insertion_point():
             if isinstance(node.func, ast.Name):
                 func_info = self.lookup_function(node.func.id)
@@ -313,6 +327,103 @@ class ExprVisitor(BaseVisitor):
             call = py_ops.CallVectorOp(result_types, callee, posargs, kwnames, kwvalues)
             return call.results_[0]
 
+    def _handle_class_instantiation(
+        self, node: ast.Call, class_info: ClassInfo, loc: ir.Location
+    ) -> ir.Value:
+        """Handle class instantiation: ClassName(args)"""
+
+        arg_values = [self.require_value(arg, self.visit(arg)) for arg in node.args]
+
+        with loc, self.insertion_point():
+            # Create new instance
+            instance = py_ops.ClassNewOp(class_info.class_type, class_info.name).result
+
+            # Call __init__ if it exists
+            if "__init__" in class_info.methods:
+                init_info = class_info.methods["__init__"]
+                # __init__ args are (self, *args) - self is already the instance
+                init_args = [instance] + arg_values
+                posargs = self.build_tuple(init_args, loc=loc)
+                empty_tuple_type = self.get_py_type("!py.tuple<>")
+                kwnames = py_ops.TupleEmptyOp(empty_tuple_type).result
+                kwvalues = py_ops.TupleEmptyOp(empty_tuple_type).result
+
+                # Get __init__ function reference
+                init_funcsig = self.build_funcsig(
+                    [str(t) for t in init_info.arg_types],
+                    [str(t) for t in init_info.result_types],
+                )
+                init_func_type = self.get_py_type(f"!py.func<{init_funcsig}>")
+                init_func = py_ops.FuncObjectOp(
+                    init_func_type, f"{class_info.name}.__init__"
+                ).result
+
+                # Call __init__ (result is None, we ignore it)
+                py_ops.CallVectorOp(
+                    list(init_info.result_types),
+                    init_func,
+                    posargs,
+                    kwnames,
+                    kwvalues,
+                )
+
+            return instance
+
+    def _handle_method_call(self, node: ast.Call, loc: ir.Location) -> ir.Value:
+        """Handle method call: obj.method(args)"""
+        assert isinstance(node.func, ast.Attribute)
+
+        obj = self.require_value(node.func.value, self.visit(node.func.value))
+        method_name = node.func.attr
+        arg_values = [self.require_value(arg, self.visit(arg)) for arg in node.args]
+
+        # For now, we need to determine the class from the object type
+        # This is a simplified implementation
+        obj_type = obj.type
+        obj_type_str = str(obj_type)
+
+        # Extract class name from type like !py.class<"Counter">
+        if obj_type_str.startswith('!py.class<"') and obj_type_str.endswith('">'):
+            class_name = obj_type_str[len('!py.class<"') : -len('">')]  # noqa
+        else:
+            raise NotImplementedError(
+                f"Method calls only supported on class instances, got {obj_type_str}"
+            )
+
+        class_info = self.lookup_class(class_name)
+        if class_info is None:
+            raise NameError(f"Unknown class '{class_name}'")
+
+        if method_name not in class_info.methods:
+            raise AttributeError(f"Class '{class_name}' has no method '{method_name}'")
+
+        method_info = class_info.methods[method_name]
+
+        with loc, self.insertion_point():
+            # Build args tuple with self as first argument
+            method_args = [obj] + arg_values
+            posargs = self.build_tuple(method_args, loc=loc)
+            empty_tuple_type = self.get_py_type("!py.tuple<>")
+            kwnames = py_ops.TupleEmptyOp(empty_tuple_type).result
+            kwvalues = py_ops.TupleEmptyOp(empty_tuple_type).result
+
+            # Get method function reference
+            method_funcsig = self.build_funcsig(
+                [str(t) for t in method_info.arg_types],
+                [str(t) for t in method_info.result_types],
+            )
+            method_func_type = self.get_py_type(f"!py.func<{method_funcsig}>")
+            method_func = py_ops.FuncObjectOp(
+                method_func_type, f"{class_name}.{method_name}"
+            ).result
+
+            # Call the method
+            result_types = list(method_info.result_types)
+            call = py_ops.CallVectorOp(
+                result_types, method_func, posargs, kwnames, kwvalues
+            )
+            return call.results_[0]
+
     def visit_FormattedValue(self, node: ast.FormattedValue) -> None:
         """
         フォーマット済み値を処理する
@@ -333,7 +444,7 @@ class ExprVisitor(BaseVisitor):
         """
         raise NotImplementedError("Joined string not implemented")
 
-    def visit_Attribute(self, node: ast.Attribute) -> None:
+    def visit_Attribute(self, node: ast.Attribute) -> ir.Value | None:
         """
         属性アクセスを処理する
 
@@ -341,7 +452,11 @@ class ExprVisitor(BaseVisitor):
         Attribute(expr value, identifier attr, expr_context ctx)
         ```
         """
-        raise NotImplementedError("Attribute access not implemented")
+        obj = self.require_value(node.value, self.visit(node.value))
+        result_type = self.get_attribute_type(obj.type, node.attr)
+
+        with self._loc(node), self.insertion_point():
+            return py_ops.AttrGetOp(result_type, obj, node.attr).result
 
     def visit_Subscript(self, node: ast.Subscript) -> None:
         """

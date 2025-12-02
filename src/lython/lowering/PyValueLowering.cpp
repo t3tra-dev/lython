@@ -1,5 +1,8 @@
 #include "RuntimeSupport.h"
 
+#include <cerrno>
+#include <cstdlib>
+
 #define GET_OP_CLASSES
 #include "PyOps.h.inc"
 #undef GET_OP_CLASSES
@@ -75,9 +78,35 @@ struct IntConstantLowering : public OpConversionPattern<IntConstantOp> {
     Type resultType = typeConverter->convertType(op.getResult().getType());
     if (!resultType)
       return failure();
-    Value value = runtime.getI64Constant(op.getLoc(), op.getValue());
-    auto call = runtime.call(op.getLoc(), RuntimeSymbols::kLongFromI64,
-                             resultType, ValueRange{value});
+
+    // Integer value is stored as decimal string to support arbitrary precision
+    StringRef valueStr = op.getValue();
+
+    // Hybrid approach: try to parse as int64_t for fast path
+    // Max int64_t is 19 digits, so only try for shorter strings
+    if (valueStr.size() <= 19) {
+      char *end;
+      errno = 0;
+      long long parsed = std::strtoll(valueStr.data(), &end, 10);
+      // Check if parsing succeeded: entire string consumed, no overflow
+      if (end == valueStr.data() + valueStr.size() && errno != ERANGE) {
+        // Use fast LyLong_FromI64 path
+        Value value =
+            runtime.getI64Constant(op.getLoc(), static_cast<int64_t>(parsed));
+        auto call = runtime.call(op.getLoc(), RuntimeSymbols::kLongFromI64,
+                                 resultType, ValueRange{value});
+        rewriter.replaceOp(op, call.getResults());
+        return success();
+      }
+    }
+
+    // Fall back to string-based creation for arbitrary precision
+    Value dataPtr = runtime.getStringLiteral(
+        op.getLoc(), StringAttr::get(rewriter.getContext(), valueStr));
+    Value length = runtime.getI64Constant(
+        op.getLoc(), static_cast<int64_t>(valueStr.size()));
+    auto call = runtime.call(op.getLoc(), RuntimeSymbols::kLongFromString,
+                             resultType, ValueRange{dataPtr, length});
     rewriter.replaceOp(op, call.getResults());
     return success();
   }
@@ -156,10 +185,10 @@ struct NumAddLowering : public OpConversionPattern<NumAddOp> {
       return failure();
 
     // Use type-specialized function for int operands
-    llvm::StringRef symbol = isPyIntType(op.getLhs().getType()) &&
-                                     isPyIntType(op.getRhs().getType())
-                                 ? RuntimeSymbols::kLongAdd
-                                 : RuntimeSymbols::kNumberAdd;
+    llvm::StringRef symbol =
+        isPyIntType(op.getLhs().getType()) && isPyIntType(op.getRhs().getType())
+            ? RuntimeSymbols::kLongAdd
+            : RuntimeSymbols::kNumberAdd;
     auto call =
         runtime.call(op.getLoc(), symbol, resultType, adaptor.getOperands());
     rewriter.replaceOp(op, call.getResults());
@@ -186,10 +215,10 @@ struct NumSubLowering : public OpConversionPattern<NumSubOp> {
       return failure();
 
     // Use type-specialized function for int operands
-    llvm::StringRef symbol = isPyIntType(op.getLhs().getType()) &&
-                                     isPyIntType(op.getRhs().getType())
-                                 ? RuntimeSymbols::kLongSub
-                                 : RuntimeSymbols::kNumberSub;
+    llvm::StringRef symbol =
+        isPyIntType(op.getLhs().getType()) && isPyIntType(op.getRhs().getType())
+            ? RuntimeSymbols::kLongSub
+            : RuntimeSymbols::kNumberSub;
     auto call =
         runtime.call(op.getLoc(), symbol, resultType, adaptor.getOperands());
     rewriter.replaceOp(op, call.getResults());
@@ -261,6 +290,117 @@ struct CastToPrimLowering : public OpConversionPattern<CastToPrimOp> {
   }
 };
 
+// For now, class instances are represented as dictionaries.
+// ClassNewOp creates a new empty dictionary as instance storage.
+struct ClassNewLowering : public OpConversionPattern<ClassNewOp> {
+  ClassNewLowering(PyLLVMTypeConverter &converter, MLIRContext *ctx)
+      : OpConversionPattern<ClassNewOp>(converter, ctx) {}
+
+  LogicalResult
+  matchAndRewrite(ClassNewOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    ModuleOp module = op->getParentOfType<ModuleOp>();
+    if (!module)
+      return failure();
+    auto *typeConverter =
+        static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
+    RuntimeAPI runtime(module, rewriter, *typeConverter);
+    Type resultType = typeConverter->convertType(op.getResult().getType());
+    if (!resultType)
+      return failure();
+    auto call = runtime.call(op.getLoc(), RuntimeSymbols::kDictNew, resultType,
+                             ValueRange{});
+    rewriter.replaceOp(op, call.getResults());
+    return success();
+  }
+};
+
+// AttrGetOp lowers to dict lookup
+struct AttrGetLowering : public OpConversionPattern<AttrGetOp> {
+  AttrGetLowering(PyLLVMTypeConverter &converter, MLIRContext *ctx)
+      : OpConversionPattern<AttrGetOp>(converter, ctx) {}
+
+  LogicalResult
+  matchAndRewrite(AttrGetOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    ModuleOp module = op->getParentOfType<ModuleOp>();
+    if (!module)
+      return failure();
+    auto *typeConverter =
+        static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
+    RuntimeAPI runtime(module, rewriter, *typeConverter);
+    Type resultType = typeConverter->convertType(op.getResult().getType());
+    if (!resultType)
+      return failure();
+
+    // Create string key for attribute name
+    StringRef attrName = op.getNameAttr().getValue();
+    Value namePtr = runtime.getStringLiteral(
+        op.getLoc(), StringAttr::get(rewriter.getContext(), attrName));
+    Value nameLen = runtime.getI64Constant(
+        op.getLoc(), static_cast<int64_t>(attrName.size()));
+    auto keyCall = runtime.call(op.getLoc(), RuntimeSymbols::kStrFromUtf8,
+                                typeConverter->getPyObjectPtrType(),
+                                ValueRange{namePtr, nameLen});
+
+    // Lookup in dict
+    auto getCall =
+        runtime.call(op.getLoc(), RuntimeSymbols::kDictGetItem, resultType,
+                     ValueRange{adaptor.getObject(), keyCall.getResult()});
+    rewriter.replaceOp(op, getCall.getResults());
+    return success();
+  }
+};
+
+// AttrSetOp lowers to dict insert
+struct AttrSetLowering : public OpConversionPattern<AttrSetOp> {
+  AttrSetLowering(PyLLVMTypeConverter &converter, MLIRContext *ctx)
+      : OpConversionPattern<AttrSetOp>(converter, ctx) {}
+
+  LogicalResult
+  matchAndRewrite(AttrSetOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    ModuleOp module = op->getParentOfType<ModuleOp>();
+    if (!module)
+      return failure();
+    auto *typeConverter =
+        static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
+    RuntimeAPI runtime(module, rewriter, *typeConverter);
+
+    // Create string key for attribute name
+    StringRef attrName = op.getNameAttr().getValue();
+    Value namePtr = runtime.getStringLiteral(
+        op.getLoc(), StringAttr::get(rewriter.getContext(), attrName));
+    Value nameLen = runtime.getI64Constant(
+        op.getLoc(), static_cast<int64_t>(attrName.size()));
+    auto keyCall = runtime.call(op.getLoc(), RuntimeSymbols::kStrFromUtf8,
+                                typeConverter->getPyObjectPtrType(),
+                                ValueRange{namePtr, nameLen});
+
+    // Insert into dict
+    runtime.call(op.getLoc(), RuntimeSymbols::kDictInsert,
+                 typeConverter->getPyObjectPtrType(),
+                 ValueRange{adaptor.getObject(), keyCall.getResult(),
+                            adaptor.getValue()});
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+// ClassOp is just a container - erase it and keep its methods at module scope
+struct ClassOpLowering : public OpConversionPattern<ClassOp> {
+  ClassOpLowering(PyLLVMTypeConverter &converter, MLIRContext *ctx)
+      : OpConversionPattern<ClassOp>(converter, ctx) {}
+
+  LogicalResult
+  matchAndRewrite(ClassOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    // Just erase the class op - methods are already at module scope
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 } // namespace
 
 void populatePyValueLoweringPatterns(PyLLVMTypeConverter &typeConverter,
@@ -268,7 +408,9 @@ void populatePyValueLoweringPatterns(PyLLVMTypeConverter &typeConverter,
   auto *ctx = patterns.getContext();
   patterns.add<StrConstantLowering, NoneLowering, IntConstantLowering,
                FloatConstantLowering, NumAddLowering, NumSubLowering,
-               NumLeLowering, CastToPrimLowering>(typeConverter, ctx);
+               NumLeLowering, CastToPrimLowering, ClassNewLowering,
+               AttrGetLowering, AttrSetLowering, ClassOpLowering>(typeConverter,
+                                                                  ctx);
 }
 
 } // namespace py
