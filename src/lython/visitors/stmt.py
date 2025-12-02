@@ -7,7 +7,7 @@ from lython.mlir.dialects import _lython_ops_gen as py_ops
 from lython.mlir.dialects import cf as cf_ops
 
 from ..mlir import ir
-from ._base import BaseVisitor
+from ._base import BaseVisitor, MethodInfo
 
 __all__ = ["StmtVisitor"]
 
@@ -182,7 +182,154 @@ class StmtVisitor(BaseVisitor):
         )
         ```
         """
-        raise NotImplementedError("Class definition not supported")
+        if node.bases:
+            raise NotImplementedError("Class inheritance not yet supported")
+        if node.decorator_list:
+            raise NotImplementedError("Class decorators not yet supported")
+
+        class_name = node.name
+        loc = self._loc(node)
+
+        # Create py.class operation
+        with loc, ir.InsertionPoint(self.module.body):
+            class_op = py_ops.ClassOp(class_name)
+
+        # Create a block in the class body for methods
+        class_body_block = class_op.body.blocks.append()
+
+        # Register the class type (class name must be quoted in type syntax)
+        class_type = self.get_py_type(f'!py.class<"{class_name}">')
+
+        # Process class body - only method definitions for now
+        prev_block = self.current_block
+        self._set_insertion_block(class_body_block)
+        self.push_scope()
+
+        # Set current class context for method processing
+        prev_class = getattr(self, "_current_class", None)
+        self._current_class = class_name
+
+        # Track instance attributes and their types during class processing
+        prev_pending_attrs = getattr(self, "_pending_attributes", None)
+        self._pending_attributes: dict[str, ir.Type] = {}
+
+        # Collect method info
+        methods: dict[str, MethodInfo] = {}
+
+        for stmt in node.body:
+            if isinstance(stmt, ast.FunctionDef):
+                method_info = self._visit_method_def(stmt, class_name, class_type)
+                if method_info is not None:
+                    methods[stmt.name] = method_info
+            elif isinstance(stmt, ast.Pass):
+                pass  # Ignore pass statements
+            else:
+                raise NotImplementedError(
+                    f"Class body can only contain method definitions, got {type(stmt).__name__}"
+                )
+
+        # Capture collected attributes
+        attributes = self._pending_attributes
+        self._pending_attributes = prev_pending_attrs  # type: ignore
+        self._current_class = prev_class
+        self.pop_scope()
+        self._set_insertion_block(prev_block)
+
+        # Register the class with methods and attributes
+        self.register_class(class_name, class_type, methods, attributes)
+
+    def _visit_method_def(
+        self, node: ast.FunctionDef, class_name: str, class_type: ir.Type
+    ) -> "MethodInfo | None":
+        """
+        クラス内のメソッド定義を処理する
+        Returns MethodInfo for the method.
+
+        Methods are created at module scope with qualified names (e.g., Counter.__init__)
+        to allow FuncObjectOp to reference them using flat symbol references.
+        """
+        from ._base import MethodInfo
+
+        # First argument should be 'self'
+        if not node.args.args:
+            raise ValueError(f"Method '{node.name}' must have 'self' parameter")
+
+        self_arg = node.args.args[0]
+        if self_arg.arg != "self":
+            raise ValueError(
+                f"First parameter of method '{node.name}' must be 'self', got '{self_arg.arg}'"
+            )
+
+        # Build argument types - self is the class type
+        arg_type_specs: list[str] = [f'!py.class<"{class_name}">']
+        for arg in node.args.args[1:]:
+            arg_type_specs.append(self.annotation_to_py_type(arg.annotation))
+
+        result_type_spec = self.annotation_to_py_type(node.returns)
+        result_ir_type = self.get_py_type(result_type_spec)
+        funcsig = self.build_funcsig(arg_type_specs, [result_type_spec])
+        py_func_sig = self.get_py_type(funcsig)
+
+        arg_name_attrs = [
+            ir.StringAttr.get(arg.arg, self.ctx) for arg in node.args.args
+        ]
+        arg_names_attr = (
+            ir.ArrayAttr.get(arg_name_attrs, context=self.ctx)
+            if arg_name_attrs
+            else None
+        )
+
+        # Qualified method name at module scope (e.g., Counter.__init__)
+        qualified_name = f"{class_name}.{node.name}"
+
+        loc = self._loc(node)
+        # Methods are created at module scope for flat symbol reference
+        with loc, ir.InsertionPoint(self.module.body):
+            func = py_ops.FuncOp(
+                qualified_name,
+                ir.TypeAttr.get(py_func_sig),
+                arg_names=arg_names_attr,
+            )
+
+        entry_arg_types = [self.get_py_type(spec) for spec in arg_type_specs]
+        with loc:
+            if entry_arg_types:
+                entry_block = func.body.blocks.append(*entry_arg_types)
+            else:
+                entry_block = func.body.blocks.append()
+
+        prev_block = self.current_block
+        self._set_insertion_block(entry_block)
+        self.push_scope()
+
+        # Register arguments in scope
+        for arg, value in zip(node.args.args, entry_block.arguments):
+            self.define_symbol(arg.arg, value)
+
+        # Process method body
+        for stmt in node.body:
+            self.visit(stmt)
+
+        # Handle implicit return
+        active_block = self.current_block or entry_block
+        if not self._block_terminated(active_block):
+            if result_type_spec != "!py.none":
+                raise NotImplementedError(
+                    f"Method '{node.name}' must explicitly return {result_type_spec}"
+                )
+            with ir.Location.unknown(self.ctx), ir.InsertionPoint(active_block):
+                none_val = py_ops.NoneOp(self.get_py_type("!py.none")).result
+                py_ops.ReturnOp([none_val])
+
+        self.pop_scope()
+        self._set_insertion_block(prev_block)
+
+        # Return method info
+        return MethodInfo(
+            name=node.name,
+            arg_types=tuple(entry_arg_types),
+            result_types=(result_ir_type,),
+        )
 
     def visit_Return(self, node: ast.Return) -> None:
         """
@@ -217,10 +364,33 @@ class StmtVisitor(BaseVisitor):
         Assign(expr* targets, expr value, string? type_comment)
         ```
         """
-        if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
-            raise NotImplementedError("Only simple assignments supported")
+        if len(node.targets) != 1:
+            raise NotImplementedError("Multiple assignment targets not supported")
+
+        target = node.targets[0]
         value = self.require_value(node.value, self.visit(node.value))
-        self.define_symbol(node.targets[0].id, value)
+
+        if isinstance(target, ast.Name):
+            # Simple assignment: x = value
+            self.define_symbol(target.id, value)
+        elif isinstance(target, ast.Attribute):
+            # Attribute assignment: obj.attr = value
+            obj = self.require_value(target.value, self.visit(target.value))
+            with self._loc(node), self.insertion_point():
+                py_ops.AttrSetOp(obj, target.attr, value)
+
+            # Track attribute type if this is a self.attr assignment in a class
+            pending_attrs = getattr(self, "_pending_attributes", None)
+            if (
+                pending_attrs is not None
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "self"
+            ):
+                pending_attrs[target.attr] = value.type
+        else:
+            raise NotImplementedError(
+                f"Assignment target type {type(target).__name__} not supported"
+            )
 
     def visit_TypeAlias(self, node: ast.TypeAlias) -> None:
         """
@@ -246,7 +416,39 @@ class StmtVisitor(BaseVisitor):
             expr value
         )
         """
-        raise NotImplementedError("Augmented assignment statement not implemented")
+        rhs = self.require_value(node.value, self.visit(node.value))
+        loc = self._loc(node)
+
+        if isinstance(node.target, ast.Name):
+            # Simple augmented assignment: x += value
+            current = self.lookup_symbol(node.target.id)
+            with loc, self.insertion_point():
+                result = self._apply_binop(node.op, current, rhs)
+            self.define_symbol(node.target.id, result)
+
+        elif isinstance(node.target, ast.Attribute):
+            # Attribute augmented assignment: obj.attr += value
+            obj = self.require_value(node.target.value, self.visit(node.target.value))
+            attr_type = self.get_attribute_type(obj.type, node.target.attr)
+
+            with loc, self.insertion_point():
+                current = py_ops.AttrGetOp(attr_type, obj, node.target.attr).result
+                result = self._apply_binop(node.op, current, rhs)
+                py_ops.AttrSetOp(obj, node.target.attr, result)
+
+        else:
+            raise NotImplementedError(
+                f"Augmented assignment target type {type(node.target).__name__} not supported"
+            )
+
+    def _apply_binop(self, op: ast.operator, lhs: ir.Value, rhs: ir.Value) -> ir.Value:
+        """二項演算子を適用し、結果を返す"""
+        if isinstance(op, ast.Add):
+            return py_ops.NumAddOp(lhs, rhs).result
+        elif isinstance(op, ast.Sub):
+            return py_ops.NumSubOp(lhs, rhs).result
+        else:
+            raise NotImplementedError(f"Operator {type(op).__name__} not supported")
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
         """

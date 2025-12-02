@@ -2,8 +2,8 @@
 
 #include "objects/object.h"
 
-#include <cstdint>
 #include <cstddef>
+#include <cstdint>
 
 // 30-bit digit (same as CPython)
 using digit = std::uint32_t;
@@ -34,8 +34,8 @@ struct LyLongObject {
   Ly_ssize_t ob_refcnt;
   LyTypeObject *ob_type;
   // Long-specific fields
-  uintptr_t lv_tag;      // sign + digit count encoded
-  digit ob_digit[];      // Flexible array member - digits stored inline
+  uintptr_t lv_tag; // sign + digit count encoded
+  digit ob_digit[]; // Flexible array member - digits stored inline
 
   // Get number of digits
   Ly_ssize_t digitCount() const {
@@ -66,7 +66,7 @@ struct LyLongObject {
 
 // Check if two LyLongObjects are both compact
 inline bool LyLong_BothAreCompact(const LyLongObject *a,
-                                   const LyLongObject *b) {
+                                  const LyLongObject *b) {
   return (a->lv_tag | b->lv_tag) < (2u << kNonSizeBits);
 }
 
@@ -117,7 +117,7 @@ LyLongObject *LyLong_New(Ly_ssize_t ndigits);
 
 // Set sign and digit count
 inline void LyLong_SetSignAndDigitCount(LyLongObject *op, int sign,
-                                         Ly_ssize_t size) {
+                                        Ly_ssize_t size) {
   op->lv_tag = tagFromSignAndSize(sign, size);
 }
 
@@ -125,6 +125,7 @@ extern "C" {
 
 LyLongObject *LyLong_FromI64(std::int64_t value);
 LyLongObject *LyLong_FromSTwoDigits(stwodigits value);
+LyLongObject *LyLong_FromString(const char *str, std::size_t len);
 LyLongObject *LyLong_Add_Slow(const LyLongObject *lhs, const LyLongObject *rhs);
 LyLongObject *LyLong_Sub_Slow(const LyLongObject *lhs, const LyLongObject *rhs);
 int LyLong_Compare(const LyLongObject *lhs, const LyLongObject *rhs);
@@ -137,10 +138,9 @@ LyLongObject *LyLong_Add(const LyLongObject *a, const LyLongObject *b);
 LyLongObject *LyLong_Sub(const LyLongObject *a, const LyLongObject *b);
 }
 
-
 // Inline fast-path for compact integer comparison (<=)
-__attribute__((always_inline))
-inline int LyLong_Compare_Inline(const LyLongObject *a, const LyLongObject *b) {
+__attribute__((always_inline)) inline int
+LyLong_Compare_Inline(const LyLongObject *a, const LyLongObject *b) {
   if (LyLong_BothAreCompact(a, b)) {
     stwodigits va = medium_value(a);
     stwodigits vb = medium_value(b);

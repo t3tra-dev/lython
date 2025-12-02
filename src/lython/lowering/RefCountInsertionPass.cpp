@@ -161,7 +161,21 @@ private:
     Liveness liveness(func);
     llvm::DenseSet<Value> processedRoots;
 
+    // Skip function entry block arguments - they are borrowed references
+    // and should not be decremented by the callee. The caller owns them.
+    Block &entryBlock = func.getBody().front();
+    for (BlockArgument arg : entryBlock.getArguments()) {
+      if (needsRefCount(arg.getType())) {
+        Value root = aliases.getRoot(arg);
+        processedRoots.insert(root);
+      }
+    }
+
     for (Block &block : func.getBody()) {
+      // Skip entry block args since they're borrowed refs (handled above)
+      if (&block == &entryBlock)
+        continue;
+
       for (BlockArgument arg : block.getArguments()) {
         if (!needsRefCount(arg.getType()))
           continue;
