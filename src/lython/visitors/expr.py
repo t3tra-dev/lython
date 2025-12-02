@@ -3,9 +3,11 @@ from __future__ import annotations
 import ast
 
 from lython.mlir.dialects import _lython_ops_gen as py_ops
+from lython.mlir.dialects import arith as arith_ops
+from lython.mlir.dialects import func as func_ops
 
 from ..mlir import ir
-from ._base import BaseVisitor, ClassInfo
+from ._base import PRIMITIVE_TYPE_MAP, BaseVisitor, ClassInfo, FunctionInfo
 
 __all__ = ["ExprVisitor"]
 
@@ -93,6 +95,21 @@ class ExprVisitor(BaseVisitor):
     def visit_Name(self, node: ast.Name) -> ir.Value:
         if isinstance(node.ctx, ast.Store):
             raise NotImplementedError("Store context handled elsewhere")
+
+        # In native mode, check if this is a primitive constant that needs
+        # to be recreated locally (due to region isolation)
+        if self._in_native_func:
+            prim_const = self.get_prim_constant(node.id)
+            if prim_const is not None:
+                mlir_type, value = prim_const
+                with self._loc(node), self.insertion_point():
+                    # Recreate the constant locally in this function's region
+                    if isinstance(value, int):
+                        attr = ir.IntegerAttr.get(mlir_type, value)
+                    else:
+                        attr = ir.FloatAttr.get(mlir_type, value)
+                    return arith_ops.ConstantOp(mlir_type, attr).result
+
         try:
             return self.lookup_symbol(node.id)
         except NameError:
@@ -105,7 +122,7 @@ class ExprVisitor(BaseVisitor):
             symbol = ir.FlatSymbolRefAttr.get(func_info.symbol, self.ctx)
             return py_ops.FuncObjectOp(func_info.func_type, symbol).result
 
-    def visit_BinOp(self, node: ast.BinOp) -> None:
+    def visit_BinOp(self, node: ast.BinOp) -> ir.Value:
         """
         二項演算を処理する
 
@@ -115,12 +132,56 @@ class ExprVisitor(BaseVisitor):
         """
         lhs = self.require_value(node.left, self.visit(node.left))
         rhs = self.require_value(node.right, self.visit(node.right))
+
+        # In native mode, use arith.* operations
+        if self._in_native_func:
+            return self._handle_primitive_binop(node.op, lhs, rhs, self._loc(node))
+
+        # In object mode, use py.num.* operations
         with self._loc(node), self.insertion_point():
             if isinstance(node.op, ast.Add):
                 return py_ops.NumAddOp(lhs, rhs).result
             if isinstance(node.op, ast.Sub):
                 return py_ops.NumSubOp(lhs, rhs).result
         raise NotImplementedError("Unsupported binary operation")
+
+    def _handle_primitive_binop(
+        self, op: ast.operator, lhs: ir.Value, rhs: ir.Value, loc: ir.Location
+    ) -> ir.Value:
+        """Handle binary operation on primitive types using arith dialect."""
+        lhs_type = lhs.type
+        is_float = str(lhs_type).startswith("f")
+
+        with loc, self.insertion_point():
+            if isinstance(op, ast.Add):
+                if is_float:
+                    return arith_ops.AddFOp(lhs, rhs).result
+                else:
+                    return arith_ops.AddIOp(lhs, rhs).result
+            elif isinstance(op, ast.Sub):
+                if is_float:
+                    return arith_ops.SubFOp(lhs, rhs).result
+                else:
+                    return arith_ops.SubIOp(lhs, rhs).result
+            elif isinstance(op, ast.Mult):
+                if is_float:
+                    return arith_ops.MulFOp(lhs, rhs).result
+                else:
+                    return arith_ops.MulIOp(lhs, rhs).result
+            elif isinstance(op, ast.FloorDiv):
+                if is_float:
+                    raise NotImplementedError("Floor division on floats not supported")
+                else:
+                    return arith_ops.DivSIOp(lhs, rhs).result
+            elif isinstance(op, ast.Mod):
+                if is_float:
+                    return arith_ops.RemFOp(lhs, rhs).result
+                else:
+                    return arith_ops.RemSIOp(lhs, rhs).result
+            else:
+                raise NotImplementedError(
+                    f"Unsupported primitive binary operation: {type(op).__name__}"
+                )
 
     def visit_UnaryOp(self, node: ast.UnaryOp) -> None:
         """
@@ -238,11 +299,66 @@ class ExprVisitor(BaseVisitor):
             raise NotImplementedError("Only single comparison supported")
         lhs = self.require_value(node.left, self.visit(node.left))
         rhs = self.require_value(node.comparators[0], self.visit(node.comparators[0]))
-        if not isinstance(node.ops[0], ast.LtE):
-            raise NotImplementedError("Only <= comparison supported")
+        op = node.ops[0]
+
+        # In native mode, use arith.cmpi
+        if self._in_native_func:
+            return self._handle_primitive_compare(op, lhs, rhs, self._loc(node))
+
+        # In object mode, use py.num.le
+        if not isinstance(op, ast.LtE):
+            raise NotImplementedError("Only <= comparison supported in object mode")
         bool_type = self.get_py_type("!py.bool")
         with self._loc(node), self.insertion_point():
             return py_ops.NumLeOp(bool_type, lhs, rhs).result
+
+    def _handle_primitive_compare(
+        self, op: ast.cmpop, lhs: ir.Value, rhs: ir.Value, loc: ir.Location
+    ) -> ir.Value:
+        """Handle comparison on primitive types using arith.cmpi."""
+        lhs_type = lhs.type
+        is_float = str(lhs_type).startswith("f")
+
+        # Map Python comparison operators to arith predicates
+        # For integers (signed): slt, sle, sgt, sge, eq, ne
+        # For floats: olt, ole, ogt, oge, oeq, one (ordered)
+        with loc, self.insertion_point():
+            if is_float:
+                if isinstance(op, ast.Lt):
+                    pred = arith_ops.CmpFPredicate.OLT
+                elif isinstance(op, ast.LtE):
+                    pred = arith_ops.CmpFPredicate.OLE
+                elif isinstance(op, ast.Gt):
+                    pred = arith_ops.CmpFPredicate.OGT
+                elif isinstance(op, ast.GtE):
+                    pred = arith_ops.CmpFPredicate.OGE
+                elif isinstance(op, ast.Eq):
+                    pred = arith_ops.CmpFPredicate.OEQ
+                elif isinstance(op, ast.NotEq):
+                    pred = arith_ops.CmpFPredicate.ONE
+                else:
+                    raise NotImplementedError(
+                        f"Unsupported float comparison: {type(op).__name__}"
+                    )
+                return arith_ops.CmpFOp(pred, lhs, rhs).result
+            else:
+                if isinstance(op, ast.Lt):
+                    pred = arith_ops.CmpIPredicate.slt
+                elif isinstance(op, ast.LtE):
+                    pred = arith_ops.CmpIPredicate.sle
+                elif isinstance(op, ast.Gt):
+                    pred = arith_ops.CmpIPredicate.sgt
+                elif isinstance(op, ast.GtE):
+                    pred = arith_ops.CmpIPredicate.sge
+                elif isinstance(op, ast.Eq):
+                    pred = arith_ops.CmpIPredicate.eq
+                elif isinstance(op, ast.NotEq):
+                    pred = arith_ops.CmpIPredicate.ne
+                else:
+                    raise NotImplementedError(
+                        f"Unsupported integer comparison: {type(op).__name__}"
+                    )
+                return arith_ops.CmpIOp(pred, lhs, rhs).result
 
     def visit_Await(self, node: ast.Await) -> None:
         """
@@ -282,10 +398,18 @@ class ExprVisitor(BaseVisitor):
         Call(expr func, expr* args, keyword* keywords)
         ```
         """
+        loc = self._loc(node)
+
+        # Handle lyrt builtin calls: to_prim, from_prim
+        if isinstance(node.func, ast.Name):
+            func_name = node.func.id
+            if func_name == "to_prim" and "to_prim" in self._lyrt_builtins:
+                return self._handle_to_prim(node, loc)
+            if func_name == "from_prim" and "from_prim" in self._lyrt_builtins:
+                return self._handle_from_prim(node, loc)
+
         if node.keywords:
             raise NotImplementedError("Keyword arguments not supported yet")
-
-        loc = self._loc(node)
 
         # Check if this is a class instantiation
         if isinstance(node.func, ast.Name):
@@ -296,6 +420,17 @@ class ExprVisitor(BaseVisitor):
         # Handle method call early to avoid generating dead py.attr.get
         if isinstance(node.func, ast.Attribute):
             return self._handle_method_call(node, loc)
+
+        # Check if this is a native function call
+        if isinstance(node.func, ast.Name):
+            func_name = node.func.id
+            try:
+                func_info = self.lookup_function(func_name)
+                # Check if it's a native function (FunctionType instead of py.func type)
+                if isinstance(func_info.func_type, ir.FunctionType):
+                    return self._handle_native_call(node, func_info, loc)
+            except NameError:
+                pass  # Not a registered function, continue with regular handling
 
         # Otherwise it's a regular function call
         callee = self.require_value(node.func, self.visit(node.func))
@@ -326,6 +461,25 @@ class ExprVisitor(BaseVisitor):
                 raise NotImplementedError("Only single-result functions supported")
             call = py_ops.CallVectorOp(result_types, callee, posargs, kwnames, kwvalues)
             return call.results_[0]
+
+    def _handle_native_call(
+        self, node: ast.Call, func_info: FunctionInfo, loc: ir.Location
+    ) -> ir.Value:
+        """Handle call to a @native function using func.call."""
+
+        arg_values = [self.require_value(arg, self.visit(arg)) for arg in node.args]
+
+        if len(arg_values) != len(func_info.arg_types):
+            raise ValueError(
+                f"Native function '{func_info.symbol}' expects {len(func_info.arg_types)} "
+                f"arguments, got {len(arg_values)}"
+            )
+
+        result_types = list(func_info.result_types)
+
+        with loc, self.insertion_point():
+            call = func_ops.CallOp(result_types, func_info.symbol, arg_values)
+            return call.results[0]
 
     def _handle_class_instantiation(
         self, node: ast.Call, class_info: ClassInfo, loc: ir.Location
@@ -423,6 +577,93 @@ class ExprVisitor(BaseVisitor):
                 result_types, method_func, posargs, kwnames, kwvalues
             )
             return call.results_[0]
+
+    def _handle_to_prim(self, node: ast.Call, loc: ir.Location) -> ir.Value:
+        """
+        Handle to_prim(value, prim_type) call.
+
+        Converts a Python value to a primitive type.
+        At module level with constant values, this generates arith.constant.
+        """
+        if len(node.args) != 2:
+            raise ValueError("to_prim() requires exactly 2 arguments: value and type")
+
+        value_node = node.args[0]
+        type_node = node.args[1]
+
+        # Get the target primitive type
+        if not isinstance(type_node, ast.Name):
+            raise ValueError("to_prim() second argument must be a primitive type name")
+
+        type_name = type_node.id
+        if type_name in self._prim_types:
+            # Aliased import - get the real type name
+            type_name = self._prim_types[type_name]
+
+        if type_name not in PRIMITIVE_TYPE_MAP:
+            raise ValueError(f"to_prim() unknown primitive type: {type_name}")
+
+        prim_type = self.get_primitive_type(type_name)
+
+        # Handle constant values (compile-time conversion)
+        if isinstance(value_node, ast.Constant):
+            value = value_node.value
+            kind, bits = PRIMITIVE_TYPE_MAP[type_name]
+
+            with loc, self.insertion_point():
+                if kind == "int" and isinstance(value, int):
+                    attr = ir.IntegerAttr.get(prim_type, value)
+                    result = arith_ops.ConstantOp(prim_type, attr).result
+                    # Store the constant value for cross-region access
+                    # (will be associated with variable name in visit_Assign)
+                    self._pending_prim_const = (prim_type, value)
+                    return result
+                elif kind == "float" and isinstance(value, (int, float)):
+                    attr = ir.FloatAttr.get(prim_type, float(value))
+                    result = arith_ops.ConstantOp(prim_type, attr).result
+                    self._pending_prim_const = (prim_type, float(value))
+                    return result
+                else:
+                    raise ValueError(
+                        f"Cannot convert {type(value).__name__} to {type_name}"
+                    )
+
+        # For non-constant values, generate py.cast.to_prim
+        py_value = self.require_value(value_node, self.visit(value_node))
+        with loc, self.insertion_point():
+            return py_ops.CastToPrimOp(
+                prim_type, py_value, ir.StringAttr.get("exact", self.ctx)
+            ).result
+
+    def _handle_from_prim(self, node: ast.Call, loc: ir.Location) -> ir.Value:
+        """
+        Handle from_prim(prim_value) call.
+
+        Converts a primitive value back to a Python object.
+        Generates py.cast.from_prim operation.
+        """
+        if len(node.args) != 1:
+            raise ValueError("from_prim() requires exactly 1 argument")
+
+        prim_value = self.require_value(node.args[0], self.visit(node.args[0]))
+
+        # Determine the result Python type based on primitive type
+        prim_type = prim_value.type
+        prim_type_str = str(prim_type)
+
+        if prim_type_str.startswith("i"):
+            # Integer type -> !py.int
+            result_type = self.get_py_type("!py.int")
+        elif prim_type_str.startswith("f"):
+            # Float type -> !py.float
+            result_type = self.get_py_type("!py.float")
+        else:
+            raise ValueError(
+                f"Cannot convert primitive type {prim_type_str} to Python object"
+            )
+
+        with loc, self.insertion_point():
+            return py_ops.CastFromPrimOp(result_type, prim_value).result
 
     def visit_FormattedValue(self, node: ast.FormattedValue) -> None:
         """

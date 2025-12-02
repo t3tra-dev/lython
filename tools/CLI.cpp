@@ -61,13 +61,14 @@ using namespace mlir;
 
 // Forward declare our custom lowering pass factories
 namespace py {
-std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createRuntimeLoweringPass();
-std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createRefCountInsertionPass();
+  std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createRuntimeLoweringPass();
+  std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createRefCountInsertionPass();
+  std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createNativeVerificationPass();
 }
 
 namespace {
 
-constexpr llvm::StringLiteral kPythonFrontendScript = R"PY(
+  constexpr llvm::StringLiteral kPythonFrontendScript = R"PY(
 import ast
 import sys
 from lython.mlir import ir
@@ -93,374 +94,380 @@ if __name__ == "__main__":
     main()
 )PY";
 
-void setEnvVar(llvm::StringRef name, llvm::StringRef value) {
+  void setEnvVar(llvm::StringRef name, llvm::StringRef value) {
 #if defined(_WIN32)
-  _putenv_s(name.str().c_str(), value.str().c_str());
+    _putenv_s(name.str().c_str(), value.str().c_str());
 #else
-  setenv(name.str().c_str(), value.str().c_str(), 1);
+    setenv(name.str().c_str(), value.str().c_str(), 1);
 #endif
-}
+  }
 
-void unsetEnvVar(llvm::StringRef name) {
+  void unsetEnvVar(llvm::StringRef name) {
 #if defined(_WIN32)
-  _putenv_s(name.str().c_str(), "");
+    _putenv_s(name.str().c_str(), "");
 #else
-  unsetenv(name.str().c_str());
+    unsetenv(name.str().c_str());
 #endif
-}
+  }
 
-LogicalResult runPipeline(ModuleOp module, MLIRContext &context) {
-  PassManager pm(&context);
-  // Insert reference counting operations using Affine SSA (Linear Type) logic
-  pm.addPass(py::createRefCountInsertionPass());
-  pm.addPass(py::createRuntimeLoweringPass());
-  pm.addPass(mlir::createConvertSCFToCFPass());
-  pm.addPass(mlir::createArithToLLVMConversionPass());
-  pm.addPass(mlir::createConvertControlFlowToLLVMPass());
-  pm.addPass(mlir::createConvertToLLVMPass());
-  pm.addPass(mlir::createReconcileUnrealizedCastsPass());
-  pm.addNestedPass<mlir::func::FuncOp>(mlir::createReconcileUnrealizedCastsPass());
-  pm.addPass(mlir::createCanonicalizerPass());
-  return pm.run(module);
-}
+  LogicalResult runPipeline(ModuleOp module, MLIRContext& context) {
+    PassManager pm(&context);
+    // Verify @native functions before any transformations
+    // This enforces the modal logic separation (Primitive World vs Object World)
+    pm.addPass(py::createNativeVerificationPass());
+    // Insert reference counting operations using Affine SSA (Linear Type) logic
+    pm.addPass(py::createRefCountInsertionPass());
+    // Early canonicalization and CSE for arith/func ops
+    pm.addPass(mlir::createCanonicalizerPass());
+    pm.addPass(mlir::createCSEPass());
+    pm.addPass(py::createRuntimeLoweringPass());
+    pm.addPass(mlir::createConvertSCFToCFPass());
+    pm.addPass(mlir::createArithToLLVMConversionPass());
+    pm.addPass(mlir::createConvertControlFlowToLLVMPass());
+    pm.addPass(mlir::createConvertToLLVMPass());
+    pm.addPass(mlir::createReconcileUnrealizedCastsPass());
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::createReconcileUnrealizedCastsPass());
+    pm.addPass(mlir::createCanonicalizerPass());
+    return pm.run(module);
+  }
 
-void registerRuntimeSymbols(ExecutionEngine &engine) {
-  engine.registerSymbols([](llvm::orc::MangleAndInterner interner) {
-    llvm::orc::SymbolMap symbolMap;
-    auto add = [&](llvm::StringRef name, auto *ptr) {
-      symbolMap[interner(name)] = {
-          llvm::orc::ExecutorAddr::fromPtr(ptr),
-          llvm::JITSymbolFlags::Exported};
-    };
-    add("Ly_IncRef", &Ly_IncRef);
-    add("Ly_DecRef", &Ly_DecRef);
-    add("LyUnicode_FromUTF8", &LyUnicode_FromUTF8);
-    add("LyTuple_New", &LyTuple_New);
-    add("LyTuple_SetItem", &LyTuple_SetItem);
-    add("LyDict_New", &LyDict_New);
-    add("LyDict_Insert", &LyDict_Insert);
-    add("Ly_GetNone", &Ly_GetNone);
-    add("Ly_GetBuiltinPrint", &Ly_GetBuiltinPrint);
-    add("Ly_CallVectorcall", &Ly_CallVectorcall);
-    add("Ly_Call", &Ly_Call);
-    add("LyLong_FromI64", &LyLong_FromI64);
-    add("LyFloat_FromDouble", &LyFloat_FromDouble);
-    add("LyNumber_Add", &LyNumber_Add);
-    add("LyNumber_Sub", &LyNumber_Sub);
-    add("LyNumber_Le", &LyNumber_Le);
-    add("LyBool_AsBool", &LyBool_AsBool);
-    return symbolMap;
-  });
-}
+  void registerRuntimeSymbols(ExecutionEngine& engine) {
+    engine.registerSymbols([](llvm::orc::MangleAndInterner interner) {
+      llvm::orc::SymbolMap symbolMap;
+      auto add = [&](llvm::StringRef name, auto* ptr) {
+        symbolMap[interner(name)] = {
+            llvm::orc::ExecutorAddr::fromPtr(ptr),
+            llvm::JITSymbolFlags::Exported };
+        };
+      add("Ly_IncRef", &Ly_IncRef);
+      add("Ly_DecRef", &Ly_DecRef);
+      add("LyUnicode_FromUTF8", &LyUnicode_FromUTF8);
+      add("LyTuple_New", &LyTuple_New);
+      add("LyTuple_SetItem", &LyTuple_SetItem);
+      add("LyDict_New", &LyDict_New);
+      add("LyDict_Insert", &LyDict_Insert);
+      add("Ly_GetNone", &Ly_GetNone);
+      add("Ly_GetBuiltinPrint", &Ly_GetBuiltinPrint);
+      add("Ly_CallVectorcall", &Ly_CallVectorcall);
+      add("Ly_Call", &Ly_Call);
+      add("LyLong_FromI64", &LyLong_FromI64);
+      add("LyFloat_FromDouble", &LyFloat_FromDouble);
+      add("LyNumber_Add", &LyNumber_Add);
+      add("LyNumber_Sub", &LyNumber_Sub);
+      add("LyNumber_Le", &LyNumber_Le);
+      add("LyBool_AsBool", &LyBool_AsBool);
+      return symbolMap;
+      });
+  }
 
-OwningOpRef<ModuleOp> parseModuleFromBuffer(StringRef buffer,
-                                            MLIRContext &context) {
-  auto module = parseSourceString<ModuleOp>(buffer, &context);
-  if (!module)
-    llvm::errs() << "error: failed to parse MLIR source\n";
-  return module;
-}
+  OwningOpRef<ModuleOp> parseModuleFromBuffer(StringRef buffer,
+    MLIRContext& context) {
+    auto module = parseSourceString<ModuleOp>(buffer, &context);
+    if (!module)
+      llvm::errs() << "error: failed to parse MLIR source\n";
+    return module;
+  }
 
-std::optional<std::string> findBuildRoot(StringRef argv0) {
-  llvm::SmallString<256> exePath(argv0);
-  if (auto ec = llvm::sys::fs::real_path(exePath, exePath)) {
-    llvm::errs() << "error: unable to resolve executable path: " << ec.message()
-                 << "\n";
+  std::optional<std::string> findBuildRoot(StringRef argv0) {
+    llvm::SmallString<256> exePath(argv0);
+    if (auto ec = llvm::sys::fs::real_path(exePath, exePath)) {
+      llvm::errs() << "error: unable to resolve executable path: " << ec.message()
+        << "\n";
+      return std::nullopt;
+    }
+    llvm::sys::path::remove_filename(exePath);
+
+    llvm::SmallString<256> current(exePath);
+    while (!current.empty()) {
+      llvm::SmallString<256> cachePath(current);
+      llvm::sys::path::append(cachePath, "CMakeCache.txt");
+      if (llvm::sys::fs::exists(cachePath))
+        return std::string(current.str());
+      if (!llvm::sys::path::has_parent_path(current))
+        break;
+      llvm::sys::path::remove_filename(current);
+    }
     return std::nullopt;
   }
-  llvm::sys::path::remove_filename(exePath);
 
-  llvm::SmallString<256> current(exePath);
-  while (!current.empty()) {
-    llvm::SmallString<256> cachePath(current);
+  std::optional<std::string> findSourceRoot(StringRef buildRoot) {
+    llvm::SmallString<256> cachePath(buildRoot);
     llvm::sys::path::append(cachePath, "CMakeCache.txt");
-    if (llvm::sys::fs::exists(cachePath))
-      return std::string(current.str());
-    if (!llvm::sys::path::has_parent_path(current))
-      break;
-    llvm::sys::path::remove_filename(current);
+    auto bufferOrErr = llvm::MemoryBuffer::getFile(cachePath);
+    if (!bufferOrErr)
+      return std::nullopt;
+
+    llvm::StringRef content = bufferOrErr->get()->getBuffer();
+    llvm::StringRef key = "CMAKE_HOME_DIRECTORY:";
+    size_t pos = content.find(key);
+    if (pos == llvm::StringRef::npos)
+      return std::nullopt;
+    llvm::StringRef line = content.substr(pos);
+    line = line.substr(0, line.find('\n'));
+    size_t eq = line.find('=');
+    if (eq == llvm::StringRef::npos)
+      return std::nullopt;
+    llvm::StringRef value = line.substr(eq + 1).trim();
+    if (value.empty())
+      return std::nullopt;
+    return value.str();
   }
-  return std::nullopt;
-}
 
-std::optional<std::string> findSourceRoot(StringRef buildRoot) {
-  llvm::SmallString<256> cachePath(buildRoot);
-  llvm::sys::path::append(cachePath, "CMakeCache.txt");
-  auto bufferOrErr = llvm::MemoryBuffer::getFile(cachePath);
-  if (!bufferOrErr)
-    return std::nullopt;
-
-  llvm::StringRef content = bufferOrErr->get()->getBuffer();
-  llvm::StringRef key = "CMAKE_HOME_DIRECTORY:";
-  size_t pos = content.find(key);
-  if (pos == llvm::StringRef::npos)
-    return std::nullopt;
-  llvm::StringRef line = content.substr(pos);
-  line = line.substr(0, line.find('\n'));
-  size_t eq = line.find('=');
-  if (eq == llvm::StringRef::npos)
-    return std::nullopt;
-  llvm::StringRef value = line.substr(eq + 1).trim();
-  if (value.empty())
-    return std::nullopt;
-  return value.str();
-}
-
-LogicalResult generateMlirFromPython(StringRef pythonFile, StringRef sourceRoot,
-                                     std::string &mlirBuffer) {
-  auto findProjectPython = [&](llvm::StringRef executable) -> std::optional<std::string> {
-    llvm::SmallString<256> candidate(sourceRoot);
-    llvm::sys::path::append(candidate, ".venv");
+  LogicalResult generateMlirFromPython(StringRef pythonFile, StringRef sourceRoot,
+    std::string& mlirBuffer) {
+    auto findProjectPython = [&](llvm::StringRef executable) -> std::optional<std::string> {
+      llvm::SmallString<256> candidate(sourceRoot);
+      llvm::sys::path::append(candidate, ".venv");
 #if defined(_WIN32)
-    llvm::sys::path::append(candidate, "Scripts");
+      llvm::sys::path::append(candidate, "Scripts");
 #else
-    llvm::sys::path::append(candidate, "bin");
+      llvm::sys::path::append(candidate, "bin");
 #endif
-    llvm::SmallString<256> binary(candidate);
-    llvm::sys::path::append(binary, executable);
-    if (llvm::sys::fs::exists(binary))
-      return std::string(binary.str());
-    return std::nullopt;
-  };
+      llvm::SmallString<256> binary(candidate);
+      llvm::sys::path::append(binary, executable);
+      if (llvm::sys::fs::exists(binary))
+        return std::string(binary.str());
+      return std::nullopt;
+      };
 
-  std::optional<std::string> pythonExe;
+    std::optional<std::string> pythonExe;
 #if defined(_WIN32)
-  pythonExe = findProjectPython("python.exe");
+    pythonExe = findProjectPython("python.exe");
 #else
-  pythonExe = findProjectPython("python3");
-  if (!pythonExe)
-    pythonExe = findProjectPython("python");
+    pythonExe = findProjectPython("python3");
+    if (!pythonExe)
+      pythonExe = findProjectPython("python");
 #endif
-  if (!pythonExe) {
-    auto sysPython = llvm::sys::findProgramByName("python3");
-    if (!sysPython)
-      sysPython = llvm::sys::findProgramByName("python");
-    if (!sysPython) {
-      llvm::errs() << "error: could not find python3/python executable\n";
+    if (!pythonExe) {
+      auto sysPython = llvm::sys::findProgramByName("python3");
+      if (!sysPython)
+        sysPython = llvm::sys::findProgramByName("python");
+      if (!sysPython) {
+        llvm::errs() << "error: could not find python3/python executable\n";
+        return failure();
+      }
+      pythonExe = *sysPython;
+    }
+
+    llvm::SmallString<256> scriptPath;
+    if (auto ec =
+      llvm::sys::fs::createTemporaryFile("lython_frontend", "py", scriptPath)) {
+      llvm::errs() << "error: failed to create temporary frontend script: "
+        << ec.message() << "\n";
       return failure();
     }
-    pythonExe = *sysPython;
-  }
-
-  llvm::SmallString<256> scriptPath;
-  if (auto ec =
-          llvm::sys::fs::createTemporaryFile("lython_frontend", "py", scriptPath)) {
-    llvm::errs() << "error: failed to create temporary frontend script: "
-                 << ec.message() << "\n";
-    return failure();
-  }
-  llvm::FileRemover scriptCleanup(scriptPath);
-  {
-    std::error_code ec;
-    llvm::raw_fd_ostream scriptFile(scriptPath, ec, llvm::sys::fs::OF_Text);
-    if (ec) {
-      llvm::errs() << "error: failed to open temporary frontend script: "
-                   << ec.message() << "\n";
-      return failure();
+    llvm::FileRemover scriptCleanup(scriptPath);
+    {
+      std::error_code ec;
+      llvm::raw_fd_ostream scriptFile(scriptPath, ec, llvm::sys::fs::OF_Text);
+      if (ec) {
+        llvm::errs() << "error: failed to open temporary frontend script: "
+          << ec.message() << "\n";
+        return failure();
+      }
+      scriptFile << kPythonFrontendScript.str();
     }
-    scriptFile << kPythonFrontendScript.str();
-  }
 
-  auto existingPyPath = llvm::sys::Process::GetEnv("PYTHONPATH");
-  llvm::SmallString<256> newPyPath(sourceRoot);
-  llvm::sys::path::append(newPyPath, "src");
-  if (existingPyPath && !existingPyPath->empty()) {
-    newPyPath += llvm::sys::path::get_separator();
-    newPyPath += *existingPyPath;
-  }
-  setEnvVar("PYTHONPATH", newPyPath);
+    auto existingPyPath = llvm::sys::Process::GetEnv("PYTHONPATH");
+    llvm::SmallString<256> newPyPath(sourceRoot);
+    llvm::sys::path::append(newPyPath, "src");
+    if (existingPyPath && !existingPyPath->empty()) {
+      newPyPath += llvm::sys::path::get_separator();
+      newPyPath += *existingPyPath;
+    }
+    setEnvVar("PYTHONPATH", newPyPath);
 
-  std::string command;
-  {
-    llvm::raw_string_ostream os(command);
-    llvm::sys::printArg(os, *pythonExe, /*Quote=*/true);
-    os << ' ';
-    llvm::sys::printArg(os, scriptPath.str(), /*Quote=*/true);
-    os << ' ';
-    llvm::sys::printArg(os, pythonFile, /*Quote=*/true);
-  }
+    std::string command;
+    {
+      llvm::raw_string_ostream os(command);
+      llvm::sys::printArg(os, *pythonExe, /*Quote=*/true);
+      os << ' ';
+      llvm::sys::printArg(os, scriptPath.str(), /*Quote=*/true);
+      os << ' ';
+      llvm::sys::printArg(os, pythonFile, /*Quote=*/true);
+    }
 
 #if defined(_WIN32)
-  FILE *pipe = _popen(command.c_str(), "rb");
+    FILE* pipe = _popen(command.c_str(), "rb");
 #else
-  FILE *pipe = popen(command.c_str(), "r");
+    FILE* pipe = popen(command.c_str(), "r");
 #endif
-  if (!pipe) {
-    llvm::errs() << "error: failed to invoke python frontend\n";
+    if (!pipe) {
+      llvm::errs() << "error: failed to invoke python frontend\n";
+      if (existingPyPath)
+        setEnvVar("PYTHONPATH", *existingPyPath);
+      else
+        unsetEnvVar("PYTHONPATH");
+      return failure();
+    }
+
+    mlirBuffer.clear();
+    char buffer[4096];
+    while (fgets(buffer, sizeof(buffer), pipe))
+      mlirBuffer.append(buffer);
+
+#if defined(_WIN32)
+    int result = _pclose(pipe);
+#else
+    int result = pclose(pipe);
+#endif
+
     if (existingPyPath)
       setEnvVar("PYTHONPATH", *existingPyPath);
     else
       unsetEnvVar("PYTHONPATH");
-    return failure();
+
+    if (result != 0) {
+      llvm::errs() << "error: python frontend failed for '" << pythonFile << "'\n";
+      return failure();
+    }
+    return success();
   }
 
-  mlirBuffer.clear();
-  char buffer[4096];
-  while (fgets(buffer, sizeof(buffer), pipe))
-    mlirBuffer.append(buffer);
-
-#if defined(_WIN32)
-  int result = _pclose(pipe);
-#else
-  int result = pclose(pipe);
-#endif
-
-  if (existingPyPath)
-    setEnvVar("PYTHONPATH", *existingPyPath);
-  else
-    unsetEnvVar("PYTHONPATH");
-
-  if (result != 0) {
-    llvm::errs() << "error: python frontend failed for '" << pythonFile << "'\n";
-    return failure();
-  }
-  return success();
-}
-
-LogicalResult dumpLLVMIR(llvm::Module &llvmModule, StringRef outputPath) {
-  std::error_code ec;
-  llvm::raw_fd_ostream out(outputPath, ec, llvm::sys::fs::OF_None);
-  if (ec) {
-    llvm::errs() << "Failed to open output file: " << ec.message() << "\n";
-    return failure();
-  }
-  llvmModule.print(out, nullptr);
-  return success();
-}
-
-LogicalResult emitObjectFile(llvm::Module &llvmModule, StringRef objectPath) {
-  auto targetTriple = llvmModule.getTargetTriple();
-  if (targetTriple.empty())
-    targetTriple = llvm::sys::getDefaultTargetTriple();
-
-  std::string error;
-  const llvm::Target *target = llvm::TargetRegistry::lookupTarget(targetTriple, error);
-  if (!target) {
-    llvm::errs() << "Failed to lookup target: " << error << "\n";
-    return failure();
+  LogicalResult dumpLLVMIR(llvm::Module& llvmModule, StringRef outputPath) {
+    std::error_code ec;
+    llvm::raw_fd_ostream out(outputPath, ec, llvm::sys::fs::OF_None);
+    if (ec) {
+      llvm::errs() << "Failed to open output file: " << ec.message() << "\n";
+      return failure();
+    }
+    llvmModule.print(out, nullptr);
+    return success();
   }
 
-  llvm::TargetOptions opt;
-  auto targetMachine = std::unique_ptr<llvm::TargetMachine>(
+  LogicalResult emitObjectFile(llvm::Module& llvmModule, StringRef objectPath) {
+    auto targetTriple = llvmModule.getTargetTriple();
+    if (targetTriple.empty())
+      targetTriple = llvm::sys::getDefaultTargetTriple();
+
+    std::string error;
+    const llvm::Target* target = llvm::TargetRegistry::lookupTarget(targetTriple, error);
+    if (!target) {
+      llvm::errs() << "Failed to lookup target: " << error << "\n";
+      return failure();
+    }
+
+    llvm::TargetOptions opt;
+    auto targetMachine = std::unique_ptr<llvm::TargetMachine>(
       target->createTargetMachine(targetTriple, "generic", "", opt, std::nullopt));
-  llvmModule.setTargetTriple(targetTriple);
-  llvmModule.setDataLayout(targetMachine->createDataLayout());
+    llvmModule.setTargetTriple(targetTriple);
+    llvmModule.setDataLayout(targetMachine->createDataLayout());
 
-  std::error_code ec;
-  llvm::raw_fd_ostream dest(objectPath, ec, llvm::sys::fs::OF_None);
-  if (ec) {
-    llvm::errs() << "Failed to open object file: " << ec.message() << "\n";
-    return failure();
+    std::error_code ec;
+    llvm::raw_fd_ostream dest(objectPath, ec, llvm::sys::fs::OF_None);
+    if (ec) {
+      llvm::errs() << "Failed to open object file: " << ec.message() << "\n";
+      return failure();
+    }
+
+    llvm::legacy::PassManager pass;
+    if (targetMachine->addPassesToEmitFile(pass, dest, nullptr,
+      llvm::CodeGenFileType::ObjectFile)) {
+      llvm::errs() << "Target machine cannot emit object file\n";
+      return failure();
+    }
+    pass.run(llvmModule);
+    return success();
   }
 
-  llvm::legacy::PassManager pass;
-  if (targetMachine->addPassesToEmitFile(pass, dest, nullptr,
-                                         llvm::CodeGenFileType::ObjectFile)) {
-    llvm::errs() << "Target machine cannot emit object file\n";
-    return failure();
+  LogicalResult linkExecutable(StringRef objectPath, StringRef runtimeLib,
+    StringRef outputPath) {
+    auto clangExe = llvm::sys::findProgramByName("clang++");
+    if (!clangExe)
+      clangExe = llvm::sys::findProgramByName("clang");
+    if (!clangExe) {
+      llvm::errs() << "error: clang++/clang executable not found in PATH\n";
+      return failure();
+    }
+
+    std::string clangProgram = *clangExe;
+    std::vector<std::string> argStorage;
+    argStorage.push_back(clangProgram);
+    argStorage.emplace_back(objectPath.str());
+    argStorage.emplace_back(runtimeLib.str());
+    argStorage.emplace_back("-O2");
+    argStorage.emplace_back("-o");
+    argStorage.emplace_back(outputPath.str());
+
+    llvm::SmallVector<llvm::StringRef, 8> args;
+    for (const auto& arg : argStorage)
+      args.push_back(arg);
+
+    std::string errorMessage;
+    bool executionFailed = false;
+    int result = llvm::sys::ExecuteAndWait(clangProgram, args, std::nullopt,
+      std::nullopt, 0, 0, &errorMessage,
+      &executionFailed);
+    if (result != 0 || executionFailed) {
+      if (!errorMessage.empty())
+        llvm::errs() << errorMessage << "\n";
+      llvm::errs() << "error: linking failed\n";
+      return failure();
+    }
+    return success();
   }
-  pass.run(llvmModule);
-  return success();
-}
 
-LogicalResult linkExecutable(StringRef objectPath, StringRef runtimeLib,
-                             StringRef outputPath) {
-  auto clangExe = llvm::sys::findProgramByName("clang++");
-  if (!clangExe)
-    clangExe = llvm::sys::findProgramByName("clang");
-  if (!clangExe) {
-    llvm::errs() << "error: clang++/clang executable not found in PATH\n";
-    return failure();
+  LogicalResult buildExecutable(llvm::Module& llvmModule, StringRef runtimeLib,
+    StringRef outputPath) {
+    llvm::SmallString<256> objectPath;
+    if (auto ec = llvm::sys::fs::createTemporaryFile("lython", ".o", objectPath)) {
+      llvm::errs() << "error: failed to create temporary object file: "
+        << ec.message() << "\n";
+      return failure();
+    }
+    llvm::FileRemover objCleanup(objectPath);
+    if (failed(emitObjectFile(llvmModule, objectPath)))
+      return failure();
+    if (failed(linkExecutable(objectPath, runtimeLib, outputPath)))
+      return failure();
+    return success();
   }
 
-  std::string clangProgram = *clangExe;
-  std::vector<std::string> argStorage;
-  argStorage.push_back(clangProgram);
-  argStorage.emplace_back(objectPath.str());
-  argStorage.emplace_back(runtimeLib.str());
-  argStorage.emplace_back("-O2");
-  argStorage.emplace_back("-o");
-  argStorage.emplace_back(outputPath.str());
+  LogicalResult runJIT(ModuleOp module) {
+    llvm::InitializeNativeTarget();
+    llvm::InitializeNativeTargetAsmPrinter();
 
-  llvm::SmallVector<llvm::StringRef, 8> args;
-  for (const auto &arg : argStorage)
-    args.push_back(arg);
-
-  std::string errorMessage;
-  bool executionFailed = false;
-  int result = llvm::sys::ExecuteAndWait(clangProgram, args, std::nullopt,
-                                         std::nullopt, 0, 0, &errorMessage,
-                                         &executionFailed);
-  if (result != 0 || executionFailed) {
-    if (!errorMessage.empty())
-      llvm::errs() << errorMessage << "\n";
-    llvm::errs() << "error: linking failed\n";
-    return failure();
+    llvm::Expected<std::unique_ptr<mlir::ExecutionEngine>> maybeEngine = mlir::ExecutionEngine::create(module);
+    if (!maybeEngine) {
+      llvm::errs() << "Failed to create ExecutionEngine\n";
+      return failure();
+    }
+    auto engine = std::move(maybeEngine.get());
+    registerRuntimeSymbols(*engine);
+    int32_t exitCode = 0;
+    if (auto err = engine->invoke("main", ExecutionEngine::result(exitCode))) {
+      llvm::errs() << "JIT session error: " << err << "\n";
+      llvm::errs() << "ExecutionEngine invocation failed\n";
+      return failure();
+    }
+    return success();
   }
-  return success();
-}
-
-LogicalResult buildExecutable(llvm::Module &llvmModule, StringRef runtimeLib,
-                              StringRef outputPath) {
-  llvm::SmallString<256> objectPath;
-  if (auto ec = llvm::sys::fs::createTemporaryFile("lython", ".o", objectPath)) {
-    llvm::errs() << "error: failed to create temporary object file: "
-                 << ec.message() << "\n";
-    return failure();
-  }
-  llvm::FileRemover objCleanup(objectPath);
-  if (failed(emitObjectFile(llvmModule, objectPath)))
-    return failure();
-  if (failed(linkExecutable(objectPath, runtimeLib, outputPath)))
-    return failure();
-  return success();
-}
-
-LogicalResult runJIT(ModuleOp module) {
-  llvm::InitializeNativeTarget();
-  llvm::InitializeNativeTargetAsmPrinter();
-
-  llvm::Expected<std::unique_ptr<mlir::ExecutionEngine>> maybeEngine = mlir::ExecutionEngine::create(module);
-  if (!maybeEngine) {
-    llvm::errs() << "Failed to create ExecutionEngine\n";
-    return failure();
-  }
-  auto engine = std::move(maybeEngine.get());
-  registerRuntimeSymbols(*engine);
-  int32_t exitCode = 0;
-  if (auto err = engine->invoke("main", ExecutionEngine::result(exitCode))) {
-    llvm::errs() << "JIT session error: " << err << "\n";
-    llvm::errs() << "ExecutionEngine invocation failed\n";
-    return failure();
-  }
-  return success();
-}
 
 } // namespace
 
 static llvm::cl::OptionCategory LythonCategory("lython options");
 static llvm::cl::opt<std::string>
-    InputFilename(llvm::cl::Positional, llvm::cl::desc("<input file>"),
-                  llvm::cl::cat(LythonCategory));
+InputFilename(llvm::cl::Positional, llvm::cl::desc("<input file>"),
+  llvm::cl::cat(LythonCategory));
 static llvm::cl::opt<std::string>
-    OutputFilename("o", llvm::cl::desc("Output file (default: a.out)"),
-                   llvm::cl::value_desc("filename"), llvm::cl::init("a.out"),
-                   llvm::cl::cat(LythonCategory));
+OutputFilename("o", llvm::cl::desc("Output file (default: a.out)"),
+  llvm::cl::value_desc("filename"), llvm::cl::init("a.out"),
+  llvm::cl::cat(LythonCategory));
 static llvm::cl::opt<bool>
-    EmitLLVMOnly("emit-llvm",
-                 llvm::cl::desc("Stop after emitting LLVM IR to the output file"),
-                 llvm::cl::init(false), llvm::cl::cat(LythonCategory));
+EmitLLVMOnly("emit-llvm",
+  llvm::cl::desc("Stop after emitting LLVM IR to the output file"),
+  llvm::cl::init(false), llvm::cl::cat(LythonCategory));
 static llvm::cl::SubCommand JitCommand("jit", "JIT execute an input file");
 static llvm::cl::opt<std::string>
-    JitInputFilename(llvm::cl::Positional, llvm::cl::desc("<input file>"),
-                     llvm::cl::Required, llvm::cl::sub(JitCommand));
+JitInputFilename(llvm::cl::Positional, llvm::cl::desc("<input file>"),
+  llvm::cl::Required, llvm::cl::sub(JitCommand));
 
-int main(int argc, char **argv) {
-  llvm::cl::SetVersionPrinter([](llvm::raw_ostream &os) {
+int main(int argc, char** argv) {
+  llvm::cl::SetVersionPrinter([](llvm::raw_ostream& os) {
     os << "Lython CLI based on MLIR\n";
-  });
+    });
   llvm::cl::ParseCommandLineOptions(
-      argc, argv, "Lython compiler driver (clang-style)\n");
+    argc, argv, "Lython compiler driver (clang-style)\n");
 
   const bool jitMode = static_cast<bool>(JitCommand);
   std::string inputPath;
@@ -468,7 +475,8 @@ int main(int argc, char **argv) {
 
   if (jitMode) {
     inputPath = JitInputFilename;
-  } else {
+  }
+  else {
     if (InputFilename.empty()) {
       llvm::errs() << "error: no input files\n";
       llvm::cl::PrintHelpMessage();
@@ -485,10 +493,10 @@ int main(int argc, char **argv) {
 
   llvm::SmallString<256> runtimeLibPath(*buildRoot);
   llvm::sys::path::append(runtimeLibPath, "src", "lython", "runtime",
-                          "libLythonRuntime.a");
+    "libLythonRuntime.a");
   if (!llvm::sys::fs::exists(runtimeLibPath)) {
     llvm::errs() << "error: runtime library not found at '"
-                 << runtimeLibPath << "'\n";
+      << runtimeLibPath << "'\n";
     return 1;
   }
 
@@ -504,8 +512,8 @@ int main(int argc, char **argv) {
 
   DialectRegistry registry;
   registry.insert<py::PyDialect, func::FuncDialect, arith::ArithDialect,
-                  scf::SCFDialect, mlir::cf::ControlFlowDialect,
-                  LLVM::LLVMDialect>();
+    scf::SCFDialect, mlir::cf::ControlFlowDialect,
+    LLVM::LLVMDialect>();
   mlir::registerConvertFuncToLLVMInterface(registry);
   mlir::registerAllToLLVMIRTranslations(registry);
 
@@ -516,7 +524,8 @@ int main(int argc, char **argv) {
   if (isPythonInput) {
     if (failed(generateMlirFromPython(inputPath, *sourceRoot, mlirSource)))
       return 1;
-  } else {
+  }
+  else {
     auto file = mlir::openInputFile(inputPath);
     if (!file) {
       llvm::errs() << "error: could not open input file '" << inputPath << "'\n";

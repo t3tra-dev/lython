@@ -428,19 +428,23 @@ LogicalResult CastFromPrimOp::verify() {
   if (!isPyType(resultType))
     return emitOpError("result must be a !py.* type");
 
-  auto checkConversion = [&](Type prim, Type pyType) -> bool {
-    return inputType == prim && resultType == pyType;
-  };
-
   mlir::MLIRContext *ctx = getContext();
-  if (checkConversion(::mlir::IntegerType::get(ctx, 32), IntType::get(ctx)))
-    return success();
-  if (checkConversion(::mlir::IntegerType::get(ctx, 64), IntType::get(ctx)))
-    return success();
-  if (checkConversion(::mlir::Float64Type::get(ctx), FloatType::get(ctx)))
-    return success();
-  if (checkConversion(::mlir::IntegerType::get(ctx, 1), BoolType::get(ctx)))
-    return success();
+
+  // Allow any integer type to !py.int conversion
+  if (auto intType = llvm::dyn_cast<::mlir::IntegerType>(inputType)) {
+    if (resultType == IntType::get(ctx))
+      return success();
+    // i1 -> !py.bool is also allowed
+    if (intType.getWidth() == 1 && resultType == BoolType::get(ctx))
+      return success();
+  }
+
+  // Allow float types to !py.float conversion
+  if (llvm::isa<::mlir::Float16Type, ::mlir::Float32Type, ::mlir::Float64Type>(
+          inputType)) {
+    if (resultType == FloatType::get(ctx))
+      return success();
+  }
 
   return emitOpError("unsupported type conversion from ")
          << inputType << " to " << resultType;
