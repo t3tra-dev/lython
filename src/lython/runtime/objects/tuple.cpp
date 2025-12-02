@@ -1,7 +1,6 @@
 #include "objects/tuple.h"
 #include "objects/unicode.h"
 
-#include <climits>
 #include <cstddef>
 #include <cstring>
 #include <memory>

@@ -4,10 +4,12 @@ import ast
 from typing import Any
 
 from lython.mlir.dialects import _lython_ops_gen as py_ops
+from lython.mlir.dialects import arith as arith_ops
 from lython.mlir.dialects import cf as cf_ops
+from lython.mlir.dialects import func as func_ops
 
 from ..mlir import ir
-from ._base import BaseVisitor, MethodInfo
+from ._base import PRIMITIVE_TYPE_MAP, BaseVisitor, MethodInfo  # noqa: F401
 
 __all__ = ["StmtVisitor"]
 
@@ -76,6 +78,28 @@ class StmtVisitor(BaseVisitor):
     ) -> None:
         super().__init__(ctx, subvisitors=subvisitors)
 
+    def _get_native_decorator(
+        self, decorators: list[ast.expr]
+    ) -> dict[str, Any] | None:
+        """
+        Check if function has @native decorator and extract its arguments.
+        Returns dict with gc mode or None if not a native function.
+        """
+        for dec in decorators:
+            # @native(gc="none") is ast.Call
+            if isinstance(dec, ast.Call) and isinstance(dec.func, ast.Name):
+                if dec.func.id == "native" and "native" in self._lyrt_builtins:
+                    result: dict[str, Any] = {"gc": "none"}  # default
+                    for kw in dec.keywords:
+                        if kw.arg == "gc" and isinstance(kw.value, ast.Constant):
+                            result["gc"] = kw.value.value
+                    return result
+            # @native without parens is ast.Name
+            if isinstance(dec, ast.Name) and dec.id == "native":
+                if "native" in self._lyrt_builtins:
+                    return {"gc": "none"}
+        return None
+
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         """
         関数定義:
@@ -95,6 +119,12 @@ class StmtVisitor(BaseVisitor):
         )
         ```
         """
+        # Check for @native decorator
+        native_info = self._get_native_decorator(node.decorator_list)
+        if native_info is not None:
+            return self._visit_native_function_def(node, native_info)
+
+        # Regular Python function
         arg_type_specs = [
             self.annotation_to_py_type(arg.annotation) for arg in node.args.args
         ]
@@ -148,6 +178,106 @@ class StmtVisitor(BaseVisitor):
                 py_ops.ReturnOp([none_val])
         self.pop_scope()
         self._set_insertion_block(prev_block)
+
+    def _visit_native_function_def(
+        self, node: ast.FunctionDef, native_info: dict[str, Any]
+    ) -> None:
+        """
+        Generate func.func for @native decorated functions.
+
+        Native functions operate in the Primitive World:
+        - Use MLIR primitive types (i8, i32, f64, etc.)
+        - Generate arith.* operations instead of py.num.*
+        - No GC involvement
+        """
+        # Get primitive types for arguments
+        arg_types: list[ir.Type] = []
+        for arg in node.args.args:
+            prim_type = self.annotation_to_primitive_type(arg.annotation)
+            if prim_type is None:
+                raise ValueError(
+                    f"@native function '{node.name}' argument '{arg.arg}' "
+                    f"must have a primitive type annotation"
+                )
+            arg_types.append(prim_type)
+
+        # Get primitive return type
+        result_type = self.annotation_to_primitive_type(node.returns)
+        if result_type is None:
+            raise ValueError(
+                f"@native function '{node.name}' must have a primitive return type annotation"
+            )
+        result_types = [result_type]
+
+        loc = self._loc(node)
+
+        # Create func.func operation with 'native' attribute
+        # This attribute marks functions operating in the Primitive World (𝒫)
+        # and enables static verification that no py.* types are used inside
+        func_type = ir.FunctionType.get(arg_types, result_types, context=self.ctx)
+        with loc, ir.InsertionPoint(self.module.body):
+            func = func_ops.FuncOp(node.name, func_type)
+            func.attributes["native"] = ir.UnitAttr.get(self.ctx)
+
+        # Register the function with primitive types
+        # Note: We use a special marker to indicate this is a native function
+        self._register_native_function(node.name, arg_types, result_types)
+
+        # Create entry block
+        with loc:
+            if arg_types:
+                entry_block = func.body.blocks.append(*arg_types)
+            else:
+                entry_block = func.body.blocks.append()
+
+        prev_block = self.current_block
+        self._set_insertion_block(entry_block)
+        self.push_scope()
+
+        # Enter native mode
+        self._set_in_native_func(True)
+
+        # Register arguments in scope
+        for arg, value in zip(node.args.args, entry_block.arguments):
+            self.define_symbol(arg.arg, value)
+
+        # Process function body
+        for stmt in node.body:
+            self.visit(stmt)
+
+        # Check for missing return
+        active_block = self.current_block or entry_block
+        if not self._block_terminated(active_block):
+            raise NotImplementedError(
+                f"@native function '{node.name}' must explicitly return"
+            )
+
+        # Exit native mode
+        self._set_in_native_func(False)
+
+        self.pop_scope()
+        self._set_insertion_block(prev_block)
+
+    def _register_native_function(
+        self,
+        name: str,
+        arg_types: list[ir.Type],
+        result_types: list[ir.Type],
+    ) -> None:
+        """Register a native function in the function table."""
+        from ._base import FunctionInfo
+
+        # Create a fake py.func type for compatibility
+        # Native functions are identified by their types being primitives
+        func_type = ir.FunctionType.get(arg_types, result_types, context=self.ctx)
+        info = FunctionInfo(
+            symbol=name,
+            func_type=func_type,
+            arg_types=tuple(arg_types),
+            result_types=tuple(result_types),
+            has_vararg=False,
+        )
+        self._functions[name] = info
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         """
@@ -341,10 +471,17 @@ class StmtVisitor(BaseVisitor):
         """
         with self._loc(node), self.insertion_point():
             if node.value is None:
+                if self._in_native_func:
+                    raise ValueError("@native function cannot return None implicitly")
                 value = py_ops.NoneOp(self.get_py_type("!py.none")).result
             else:
                 value = self.require_value(node.value, self.visit(node.value))
-            py_ops.ReturnOp([value])
+
+            # Use func.return for native functions, py.return for Python functions
+            if self._in_native_func:
+                func_ops.ReturnOp([value])
+            else:
+                py_ops.ReturnOp([value])
 
     def visit_Delete(self, node: ast.Delete) -> None:
         """
@@ -368,11 +505,26 @@ class StmtVisitor(BaseVisitor):
             raise NotImplementedError("Multiple assignment targets not supported")
 
         target = node.targets[0]
+
+        # Clear any pending primitive constant from previous assignment
+        expr_visitor = self.subvisitors.get("Expr")
+        if expr_visitor:
+            expr_visitor._pending_prim_const = None
+
         value = self.require_value(node.value, self.visit(node.value))
 
         if isinstance(target, ast.Name):
             # Simple assignment: x = value
             self.define_symbol(target.id, value)
+
+            # Check if this was a to_prim() call with a constant value
+            # If so, register the constant for cross-region access in @native functions
+            if expr_visitor:
+                pending = getattr(expr_visitor, "_pending_prim_const", None)
+                if pending is not None:
+                    mlir_type, const_value = pending
+                    self.register_prim_constant(target.id, mlir_type, const_value)
+                    expr_visitor._pending_prim_const = None
         elif isinstance(target, ast.Attribute):
             # Attribute assignment: obj.attr = value
             obj = self.require_value(target.value, self.visit(target.value))
@@ -526,12 +678,19 @@ class StmtVisitor(BaseVisitor):
         If(expr test, stmt* body, stmt* orelse)
         ```
         """
-        cond_obj = self.require_value(node.test, self.visit(node.test))
+        cond_value = self.require_value(node.test, self.visit(node.test))
         i1 = ir.IntegerType.get_signless(1, context=self.ctx)
-        with self._loc(node), self.insertion_point():
-            cond = py_ops.CastToPrimOp(
-                i1, cond_obj, ir.StringAttr.get("exact", self.ctx)
-            ).result
+
+        # In native mode, the condition should already be i1 (from arith.cmpi)
+        # In object mode, we need to cast from !py.bool to i1
+        if self._in_native_func:
+            cond = cond_value  # Already i1 from primitive comparison
+        else:
+            with self._loc(node), self.insertion_point():
+                cond = py_ops.CastToPrimOp(
+                    i1, cond_value, ir.StringAttr.get("exact", self.ctx)
+                ).result
+
         assert self.current_block is not None
         parent_region = self.current_block.region
         true_block = parent_region.blocks.append()
@@ -652,8 +811,38 @@ class StmtVisitor(BaseVisitor):
         ```asdl
         ImportFrom(identifier? module, alias* names, int? level)
         ```
+
+        Handles:
+        - from lyrt import native, to_prim, from_prim
+        - from lyrt.prim import i8, i16, ...
         """
-        raise NotImplementedError("Import from statement not implemented")
+        from ._base import PRIMITIVE_TYPE_MAP
+
+        module = node.module
+
+        if module == "lyrt":
+            # Handle lyrt builtins: native, to_prim, from_prim
+            for alias in node.names:
+                name = alias.name
+                if name in ("native", "to_prim", "from_prim"):
+                    self._lyrt_builtins.add(name)
+                else:
+                    raise NotImplementedError(f"Unknown lyrt import: {name}")
+            return
+
+        if module == "lyrt.prim":
+            # Handle primitive type imports: i8, i16, i32, ...
+            for alias in node.names:
+                name = alias.name
+                if name in PRIMITIVE_TYPE_MAP:
+                    # Store the imported name (may be aliased)
+                    local_name = alias.asname or name
+                    self._prim_types[local_name] = name
+                else:
+                    raise NotImplementedError(f"Unknown lyrt.prim type: {name}")
+            return
+
+        raise NotImplementedError(f"Import from '{module}' not implemented")
 
     def visit_Global(self, node: ast.Global) -> None:
         """

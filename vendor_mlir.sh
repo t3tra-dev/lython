@@ -51,6 +51,17 @@ try:
 except Exception:
     pass
 
+# Import and alias individual dialect modules to ensure consistent registration
+# This prevents "Dialect namespace already registered" errors when importing
+# from both lython.mlir.dialects and mlir.dialects paths
+from .dialects import func as _func_module
+from .dialects import arith as _arith_module
+from .dialects import cf as _cf_module
+
+_sys.modules.setdefault("mlir.dialects.func", _func_module)
+_sys.modules.setdefault("mlir.dialects.arith", _arith_module)
+_sys.modules.setdefault("mlir.dialects.cf", _cf_module)
+
 __all__ = [
     "ir",
     "execution_engine",

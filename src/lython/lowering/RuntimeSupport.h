@@ -71,6 +71,8 @@ private:
   mlir::Type pyObjectPtrType;
 };
 
+// Pattern population functions
+
 void populatePyValueLoweringPatterns(PyLLVMTypeConverter &typeConverter,
                                      mlir::RewritePatternSet &patterns);
 void populatePyTupleLoweringPatterns(PyLLVMTypeConverter &typeConverter,
@@ -81,9 +83,30 @@ void populatePyCallLoweringPatterns(PyLLVMTypeConverter &typeConverter,
                                     mlir::RewritePatternSet &patterns);
 void populatePyRefCountLoweringPatterns(PyLLVMTypeConverter &typeConverter,
                                         mlir::RewritePatternSet &patterns);
+void populatePyFuncLoweringPatterns(PyLLVMTypeConverter &typeConverter,
+                                    mlir::RewritePatternSet &patterns);
+
+/// Optimization functions
+
+/// Runs pre-lowering optimizations on Py dialect ops.
+/// Call this after call conversion and before value conversion.
+void runPreLoweringOptimizations(mlir::ModuleOp module);
+
+/// Runs post-lowering optimizations on LLVM dialect ops.
+/// Call this after value conversion completes.
+void runPostLoweringOptimizations(mlir::ModuleOp module);
+
+/// Creates a pass that applies all Py-specific optimizations.
+std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createPyOptimizationPass();
 
 /// Creates a pass that automatically inserts py.incref/py.decref operations.
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createRefCountInsertionPass();
+
+/// Creates a pass that verifies @native functions do not use py.* types.
+/// This enforces the modal logic separation between Primitive World and Object
+/// World.
+std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
+createNativeVerificationPass();
 
 } // namespace py

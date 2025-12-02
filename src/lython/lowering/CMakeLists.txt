@@ -1,6 +1,9 @@
 add_library(LythonRuntimeLowering STATIC
     RuntimeSupport.cpp
     RuntimeLoweringPass.cpp
+    NativeVerificationPass.cpp
+    PyFuncLowering.cpp
+    PyOptimizationPass.cpp
     PyValueLowering.cpp
     PyTupleLowering.cpp
     PyDictLowering.cpp

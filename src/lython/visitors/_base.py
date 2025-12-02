@@ -9,6 +9,25 @@ from ..mlir.dialects import _lython_ops_gen as py_ops
 __all__ = ["BaseVisitor"]
 
 
+# Mapping from lyrt.prim type names to MLIR type constructors
+PRIMITIVE_TYPE_MAP: dict[str, tuple[str, int]] = {
+    # Integer types: (kind, bits)
+    "i1": ("int", 1),
+    "i8": ("int", 8),
+    "i16": ("int", 16),
+    "i32": ("int", 32),
+    "i64": ("int", 64),
+    "i128": ("int", 128),
+    "i256": ("int", 256),
+    # Float types
+    "f16": ("float", 16),
+    "f32": ("float", 32),
+    "f64": ("float", 64),
+    "f128": ("float", 128),
+    "f256": ("float", 256),
+}
+
+
 class FunctionInfo(NamedTuple):
     symbol: str
     func_type: ir.Type
@@ -58,6 +77,16 @@ class BaseVisitor:
         self._module_name: str = "__main__"
         self._functions: dict[str, FunctionInfo] = {}
         self._classes: dict[str, ClassInfo] = {}
+        # Primitive world support
+        self._in_native_func: bool = False  # True when inside @native function
+        self._prim_types: dict[str, str] = {}  # Imported primitive types: name -> kind
+        self._lyrt_builtins: set[str] = (
+            set()
+        )  # Imported lyrt builtins (native, to_prim, from_prim)
+        # Track primitive constants for cross-region access: name -> (mlir_type, python_value)
+        self._prim_constants: dict[str, tuple[ir.Type, int | float]] = {}
+        # Temporary storage for primitive constant info during assignment
+        self._pending_prim_const: tuple[ir.Type, int | float] | None = None
 
         if subvisitors is not None:
             self.subvisitors = subvisitors
@@ -80,6 +109,10 @@ class BaseVisitor:
             visitor._module_name = self._module_name
             visitor._functions = self._functions
             visitor._classes = self._classes
+            visitor._prim_types = self._prim_types
+            visitor._lyrt_builtins = self._lyrt_builtins
+            visitor._prim_constants = self._prim_constants
+            # Note: _pending_prim_const is not shared - each visitor has its own
 
     def visit(self, node: ast.AST) -> Any:
         method_name = f"visit_{type(node).__name__}"
@@ -313,7 +346,61 @@ class BaseVisitor:
             return False
         terminators = {
             "py.return",
+            "func.return",
             "cf.br",
             "cf.cond_br",
         }
         return ops[-1].operation.name in terminators
+
+    # --- Primitive world support -------------------------------------------
+    def get_primitive_type(self, type_name: str) -> ir.Type:
+        """Get MLIR primitive type from a lyrt.prim type name."""
+        if type_name not in PRIMITIVE_TYPE_MAP:
+            raise ValueError(f"Unknown primitive type: {type_name}")
+        kind, bits = PRIMITIVE_TYPE_MAP[type_name]
+        if kind == "int":
+            return ir.IntegerType.get_signless(bits, context=self.ctx)
+        elif kind == "float":
+            if bits == 16:
+                return ir.F16Type.get(context=self.ctx)
+            elif bits == 32:
+                return ir.F32Type.get(context=self.ctx)
+            elif bits == 64:
+                return ir.F64Type.get(context=self.ctx)
+            else:
+                raise ValueError(f"Unsupported float bit width: {bits}")
+        raise ValueError(f"Unknown primitive kind: {kind}")
+
+    def is_primitive_type(self, type_name: str) -> bool:
+        """Check if a type name refers to a primitive type."""
+        return type_name in self._prim_types or type_name in PRIMITIVE_TYPE_MAP
+
+    def _set_in_native_func(self, value: bool) -> None:
+        """Set native function mode across all subvisitors."""
+        self._in_native_func = value
+        for visitor in self.subvisitors.values():
+            visitor._in_native_func = value
+
+    def annotation_to_primitive_type(
+        self, annotation: ast.expr | None
+    ) -> ir.Type | None:
+        """Convert a type annotation to a primitive MLIR type, or None if not primitive."""
+        if annotation is None:
+            return None
+        if isinstance(annotation, ast.Name):
+            name = annotation.id
+            if name in self._prim_types:
+                return self.get_primitive_type(name)
+            if name in PRIMITIVE_TYPE_MAP:
+                return self.get_primitive_type(name)
+        return None
+
+    def register_prim_constant(
+        self, name: str, mlir_type: ir.Type, value: int | float
+    ) -> None:
+        """Register a primitive constant for cross-region access."""
+        self._prim_constants[name] = (mlir_type, value)
+
+    def get_prim_constant(self, name: str) -> tuple[ir.Type, int | float] | None:
+        """Get a registered primitive constant, or None if not found."""
+        return self._prim_constants.get(name)

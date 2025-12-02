@@ -290,6 +290,72 @@ struct CastToPrimLowering : public OpConversionPattern<CastToPrimOp> {
   }
 };
 
+struct CastFromPrimLowering : public OpConversionPattern<CastFromPrimOp> {
+  CastFromPrimLowering(PyLLVMTypeConverter &converter, MLIRContext *ctx)
+      : OpConversionPattern<CastFromPrimOp>(converter, ctx) {}
+
+  LogicalResult
+  matchAndRewrite(CastFromPrimOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    ModuleOp module = op->getParentOfType<ModuleOp>();
+    if (!module)
+      return failure();
+    auto *typeConverter =
+        static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
+    RuntimeAPI runtime(module, rewriter, *typeConverter);
+    Type resultType = typeConverter->convertType(op.getResult().getType());
+    if (!resultType)
+      return failure();
+
+    Value input = adaptor.getInput();
+    Type inputType = input.getType();
+
+    // Handle integer types -> !py.int
+    if (auto intType = llvm::dyn_cast<IntegerType>(inputType)) {
+      unsigned width = intType.getWidth();
+      Value i64Val;
+
+      if (width < 64) {
+        // Sign-extend to i64
+        auto i64Type = rewriter.getI64Type();
+        i64Val = rewriter.create<LLVM::SExtOp>(op.getLoc(), i64Type, input);
+      } else if (width == 64) {
+        i64Val = input;
+      } else {
+        return rewriter.notifyMatchFailure(
+            op, "integer width > 64 not supported for from_prim");
+      }
+
+      auto call = runtime.call(op.getLoc(), RuntimeSymbols::kLongFromI64,
+                               resultType, ValueRange{i64Val});
+      rewriter.replaceOp(op, call.getResults());
+      return success();
+    }
+
+    // Handle float types -> !py.float
+    if (llvm::isa<Float32Type>(inputType)) {
+      // Extend f32 to f64
+      auto f64Type = rewriter.getF64Type();
+      Value f64Val =
+          rewriter.create<LLVM::FPExtOp>(op.getLoc(), f64Type, input);
+      auto call = runtime.call(op.getLoc(), RuntimeSymbols::kFloatFromDouble,
+                               resultType, ValueRange{f64Val});
+      rewriter.replaceOp(op, call.getResults());
+      return success();
+    }
+
+    if (llvm::isa<Float64Type>(inputType)) {
+      auto call = runtime.call(op.getLoc(), RuntimeSymbols::kFloatFromDouble,
+                               resultType, ValueRange{input});
+      rewriter.replaceOp(op, call.getResults());
+      return success();
+    }
+
+    return rewriter.notifyMatchFailure(op,
+                                       "unsupported input type for from_prim");
+  }
+};
+
 // For now, class instances are represented as dictionaries.
 // ClassNewOp creates a new empty dictionary as instance storage.
 struct ClassNewLowering : public OpConversionPattern<ClassNewOp> {
@@ -406,11 +472,12 @@ struct ClassOpLowering : public OpConversionPattern<ClassOp> {
 void populatePyValueLoweringPatterns(PyLLVMTypeConverter &typeConverter,
                                      RewritePatternSet &patterns) {
   auto *ctx = patterns.getContext();
-  patterns.add<StrConstantLowering, NoneLowering, IntConstantLowering,
-               FloatConstantLowering, NumAddLowering, NumSubLowering,
-               NumLeLowering, CastToPrimLowering, ClassNewLowering,
-               AttrGetLowering, AttrSetLowering, ClassOpLowering>(typeConverter,
-                                                                  ctx);
+  patterns
+      .add<StrConstantLowering, NoneLowering, IntConstantLowering,
+           FloatConstantLowering, NumAddLowering, NumSubLowering, NumLeLowering,
+           CastToPrimLowering, CastFromPrimLowering, ClassNewLowering,
+           AttrGetLowering, AttrSetLowering, ClassOpLowering>(typeConverter,
+                                                              ctx);
 }
 
 } // namespace py

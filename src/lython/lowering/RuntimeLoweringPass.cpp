@@ -1,15 +1,29 @@
+// This file implements the main RuntimeLoweringPass which orchestrates the
+// complete lowering pipeline from Py dialect to LLVM dialect. It coordinates
+// the various conversion phases:
+//   1. Function conversion (py.func -> func.func)
+//   2. Function object conversion (py.func_object -> references)
+//   3. Call conversion (py.call_vector -> runtime calls or direct calls)
+//   4. Value conversion (py.* ops -> LLVM ops via runtime calls)
+//
+// Individual lowering patterns are implemented in separate files:
+//   - PyFuncLowering.cpp: Function and calling convention patterns
+//   - PyCallLowering.cpp: Call operation patterns
+//   - PyValueLowering.cpp: Value creation patterns
+//   - PyTupleLowering.cpp: Tuple operation patterns
+//   - PyDictLowering.cpp: Dictionary operation patterns
+//   - PyRefCountLowering.cpp: Reference counting patterns
+//
+// Optimizations are implemented in PyOptimizationPass.cpp.
+
 #include "RuntimeSupport.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Process.h"
 #include "llvm/Support/raw_ostream.h"
-#include <cstdlib>
-#include <string>
 
 #include "PyDialect.h.inc"
 
@@ -22,47 +36,13 @@ using namespace mlir;
 namespace py {
 namespace {
 
-static LogicalResult translateFunctionSignature(
-    FuncSignatureType sig, const PyLLVMTypeConverter &typeConverter,
-    SmallVectorImpl<Type> &pyInputs, SmallVectorImpl<Type> &convertedInputs,
-    SmallVectorImpl<Type> &convertedResults, Operation *emitOnError) {
-  pyInputs.clear();
-  convertedInputs.clear();
-  convertedResults.clear();
+// Utility functions
 
-  auto appendConverted = [&](Type ty,
-                             SmallVectorImpl<Type> &storage) -> LogicalResult {
-    Type converted = typeConverter.convertType(ty);
-    if (!converted) {
-      emitOnError->emitError("failed to convert type ") << ty;
-      return failure();
-    }
-    storage.push_back(converted);
-    return success();
-  };
-
-  auto positional = sig.getPositionalTypes();
-  pyInputs.append(positional.begin(), positional.end());
-  auto kwonly = sig.getKwOnlyTypes();
-  pyInputs.append(kwonly.begin(), kwonly.end());
-  if (sig.hasVararg())
-    pyInputs.push_back(sig.getVarargType());
-  if (sig.hasKwarg())
-    pyInputs.push_back(sig.getKwargType());
-
-  for (Type ty : pyInputs)
-    if (failed(appendConverted(ty, convertedInputs)))
-      return failure();
-
-  for (Type result : sig.getResultTypes())
-    if (failed(appendConverted(result, convertedResults)))
-      return failure();
-
-  return success();
-}
-
+/// Replaces UnrealizedConversionCastOp involving py.* types with
+/// CastIdentityOp. Returns true if any replacements were made.
 static bool replaceUnrealizedCastsWithIdentity(Operation *container) {
   SmallVector<UnrealizedConversionCastOp> pending;
+
   container->walk([&](UnrealizedConversionCastOp cast) {
     if (cast->getNumOperands() != 1 || cast->getNumResults() != 1)
       return;
@@ -81,8 +61,11 @@ static bool replaceUnrealizedCastsWithIdentity(Operation *container) {
     cast->getResult(0).replaceAllUsesWith(identity.getResult());
     cast->erase();
   }
+
   return !pending.empty();
 }
+
+// Type cast lowering patterns
 
 struct UnrealizedCastLowering
     : public OpConversionPattern<UnrealizedConversionCastOp> {
@@ -94,17 +77,52 @@ struct UnrealizedCastLowering
                   ConversionPatternRewriter &rewriter) const override {
     if (op->getNumOperands() != 1 || op->getNumResults() != 1)
       return rewriter.notifyMatchFailure(op, "expected single operand");
+
     Type inputType = op.getOperandTypes().front();
     Type resultType = op.getResultTypes().front();
     if (!isPyType(inputType) && !isPyType(resultType))
       return rewriter.notifyMatchFailure(
           op, "unrelated to py.* types, keep default handling");
+
     auto identity = rewriter.create<CastIdentityOp>(
         op.getLoc(), resultType, adaptor.getOperands().front());
     rewriter.replaceOp(op, identity.getResult());
     return success();
   }
 };
+
+/// py.upcast forwards the operand since all py.* types share the same
+/// runtime representation (PyObject*).
+struct UpcastLowering : public OpConversionPattern<UpcastOp> {
+  UpcastLowering(PyLLVMTypeConverter &converter, MLIRContext *ctx)
+      : OpConversionPattern<UpcastOp>(converter, ctx) {}
+
+  LogicalResult
+  matchAndRewrite(UpcastOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (adaptor.getOperands().empty())
+      return failure();
+    rewriter.replaceOp(op, adaptor.getOperands().front());
+    return success();
+  }
+};
+
+struct CastIdentityLowering : public OpConversionPattern<CastIdentityOp> {
+  CastIdentityLowering(PyLLVMTypeConverter &converter, MLIRContext *ctx)
+      : OpConversionPattern<CastIdentityOp>(converter, ctx) {}
+
+  LogicalResult
+  matchAndRewrite(CastIdentityOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (adaptor.getInput())
+      rewriter.replaceOp(op, adaptor.getInput());
+    else
+      rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+// RuntimeLoweringPass: Main pipeline orchestration
 
 struct RuntimeLoweringPass
     : public PassWrapper<RuntimeLoweringPass, OperationPass<ModuleOp>> {
@@ -118,6 +136,9 @@ struct RuntimeLoweringPass
     ModuleOp module = getOperation();
     MLIRContext *ctx = module.getContext();
     PyLLVMTypeConverter typeConverter(ctx);
+    bool dumpLowering = static_cast<bool>(
+        llvm::sys::Process::GetEnv("LYTHON_DUMP_LOWERING_IR"));
+
     auto materializationFilter = [&](Diagnostic &diag) -> LogicalResult {
       std::string message;
       llvm::raw_string_ostream os(message);
@@ -128,90 +149,23 @@ struct RuntimeLoweringPass
       return failure();
     };
 
-    // py.func / py.return を func.func / func.return に下げる
-    struct FuncOpLowering : public OpConversionPattern<FuncOp> {
-      FuncOpLowering(PyLLVMTypeConverter &converter, MLIRContext *ctx)
-          : OpConversionPattern<FuncOp>(converter, ctx) {}
-
-      LogicalResult
-      matchAndRewrite(FuncOp op, OpAdaptor adaptor,
-                      ConversionPatternRewriter &rewriter) const override {
-        auto nameAttr = op->getAttrOfType<StringAttr>("sym_name");
-        if (!nameAttr)
-          return rewriter.notifyMatchFailure(op, "missing sym_name");
-        if (nameAttr.getValue() == "__builtin_print") {
-          rewriter.eraseOp(op);
-          return success();
-        }
-        auto sigAttr = op->getAttrOfType<TypeAttr>("function_type");
-        if (!sigAttr)
-          return rewriter.notifyMatchFailure(op, "missing function_type attr");
-        auto sig = dyn_cast<FuncSignatureType>(sigAttr.getValue());
-        if (!sig)
-          return rewriter.notifyMatchFailure(op, "expected FuncSignatureType");
-
-        auto *tc = static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
-        SmallVector<Type, 8> pyInputTypes;
-        SmallVector<Type, 8> llvmInputTypes;
-        SmallVector<Type, 4> llvmResultTypes;
-        if (failed(translateFunctionSignature(
-                sig, *tc, pyInputTypes, llvmInputTypes, llvmResultTypes, op)))
-          return failure();
-
-        auto funcType =
-            FunctionType::get(getContext(), llvmInputTypes, llvmResultTypes);
-        auto newFunc = rewriter.create<func::FuncOp>(
-            op.getLoc(), nameAttr.getValue(), funcType);
-        newFunc->setAttr("llvm.emit_c_interface", rewriter.getUnitAttr());
-
-        if (op.getBody().empty())
-          op.getBody().emplaceBlock();
-
-        rewriter.inlineRegionBefore(op.getBody(), newFunc.getBody(),
-                                    newFunc.getBody().end());
-        auto &entry = newFunc.getBody().front();
-        TypeConverter::SignatureConversion conversion(pyInputTypes.size());
-        for (auto [idx, ty] : llvm::enumerate(llvmInputTypes)) {
-          SmallVector<Type, 1> packed{ty};
-          conversion.addInputs(idx, packed);
-        }
-        auto *convertedEntry =
-            rewriter.applySignatureConversion(&entry, conversion);
-        if (!convertedEntry)
-          return failure();
-
-        rewriter.eraseOp(op);
-        return success();
-      }
-    };
-
-    struct ReturnLowering : public OpConversionPattern<ReturnOp> {
-      ReturnLowering(PyLLVMTypeConverter &converter, MLIRContext *ctx)
-          : OpConversionPattern<ReturnOp>(converter, ctx) {}
-
-      LogicalResult
-      matchAndRewrite(ReturnOp op, OpAdaptor adaptor,
-                      ConversionPatternRewriter &rewriter) const override {
-        rewriter.replaceOpWithNewOp<func::ReturnOp>(op, adaptor.getOperands());
-        return success();
-      }
-    };
+    // Phase 1: Function conversion (py.func/py.return -> func.func/func.return)
 
     auto runFuncConversion = [&]() -> LogicalResult {
       while (true) {
-        RewritePatternSet funcPatterns(ctx);
-        funcPatterns
-            .add<FuncOpLowering, ReturnLowering, UnrealizedCastLowering>(
-                typeConverter, ctx);
-        ConversionTarget funcTarget(*ctx);
-        funcTarget.addLegalDialect<py::PyDialect>();
-        funcTarget.addLegalOp<ModuleOp>();
-        funcTarget.markUnknownOpDynamicallyLegal(
-            [](Operation *) { return true; });
-        funcTarget.addIllegalOp<FuncOp, ReturnOp>();
+        RewritePatternSet patterns(ctx);
+        populatePyFuncLoweringPatterns(typeConverter, patterns);
+        patterns.add<UnrealizedCastLowering>(typeConverter, ctx);
+
+        ConversionTarget target(*ctx);
+        target.addLegalDialect<py::PyDialect>();
+        target.addLegalOp<ModuleOp>();
+        target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
+        target.addIllegalOp<FuncOp, ReturnOp>();
+
         ScopedDiagnosticHandler diagHandler(ctx, materializationFilter);
         auto result =
-            applyPartialConversion(module, funcTarget, std::move(funcPatterns));
+            applyPartialConversion(module, target, std::move(patterns));
         if (succeeded(result))
           return success();
         if (!replaceUnrealizedCastsWithIdentity(module))
@@ -224,68 +178,29 @@ struct RuntimeLoweringPass
       return;
     }
     replaceUnrealizedCastsWithIdentity(module);
-    if (llvm::sys::Process::GetEnv("LYTHON_DUMP_LOWERING_IR")) {
+
+    if (dumpLowering) {
       llvm::errs() << "[After func conversion]\n";
       module.dump();
     }
 
-    struct FuncObjectLowering : public OpConversionPattern<FuncObjectOp> {
-      FuncObjectLowering(PyLLVMTypeConverter &converter, MLIRContext *ctx)
-          : OpConversionPattern<FuncObjectOp>(converter, ctx) {}
-
-      LogicalResult
-      matchAndRewrite(FuncObjectOp op, OpAdaptor adaptor,
-                      ConversionPatternRewriter &rewriter) const override {
-        static llvm::StringMap<llvm::StringLiteral> builtinTable = {
-            {"__builtin_print", RuntimeSymbols::kGetBuiltinPrint},
-            {"print", RuntimeSymbols::kGetBuiltinPrint},
-        };
-
-        ModuleOp module = op->getParentOfType<ModuleOp>();
-        if (!module)
-          return failure();
-
-        StringRef symbol = op.getTargetAttr().getValue();
-        if (auto it = builtinTable.find(symbol); it != builtinTable.end()) {
-          auto *converter =
-              static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
-          RuntimeAPI runtime(module, rewriter, *converter);
-          Type resultType = converter->convertType(op.getResult().getType());
-          auto call =
-              runtime.call(op.getLoc(), it->second, resultType, ValueRange{});
-          rewriter.replaceOp(op, call.getResults());
-          return success();
-        }
-
-        auto func = module.lookupSymbol<func::FuncOp>(symbol);
-        if (!func)
-          return rewriter.notifyMatchFailure(
-              op, "unknown function reference '" + symbol + "'");
-
-        auto constOp = rewriter.create<func::ConstantOp>(
-            op.getLoc(), func.getFunctionType(),
-            SymbolRefAttr::get(rewriter.getContext(), symbol));
-        auto identity = rewriter.create<CastIdentityOp>(
-            op.getLoc(), op.getResult().getType(), constOp.getResult());
-        rewriter.replaceOp(op, identity.getResult());
-        return success();
-      }
-    };
+    // Phase 2: Function object conversion (py.func_object -> references)
 
     auto runFuncObjectConversion = [&]() -> LogicalResult {
       while (true) {
-        RewritePatternSet funcObjectPatterns(ctx);
-        funcObjectPatterns.add<FuncObjectLowering, UnrealizedCastLowering>(
-            typeConverter, ctx);
-        ConversionTarget funcObjectTarget(*ctx);
-        funcObjectTarget.addLegalDialect<py::PyDialect>();
-        funcObjectTarget.addLegalOp<ModuleOp>();
-        funcObjectTarget.markUnknownOpDynamicallyLegal(
-            [](Operation *) { return true; });
-        funcObjectTarget.addIllegalOp<FuncObjectOp>();
+        RewritePatternSet patterns(ctx);
+        populatePyFuncLoweringPatterns(typeConverter, patterns);
+        patterns.add<UnrealizedCastLowering>(typeConverter, ctx);
+
+        ConversionTarget target(*ctx);
+        target.addLegalDialect<py::PyDialect>();
+        target.addLegalOp<ModuleOp>();
+        target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
+        target.addIllegalOp<FuncObjectOp>();
+
         ScopedDiagnosticHandler diagHandler(ctx, materializationFilter);
-        auto result = applyPartialConversion(module, funcObjectTarget,
-                                             std::move(funcObjectPatterns));
+        auto result =
+            applyPartialConversion(module, target, std::move(patterns));
         if (succeeded(result))
           return success();
         if (!replaceUnrealizedCastsWithIdentity(module))
@@ -298,25 +213,29 @@ struct RuntimeLoweringPass
       return;
     }
     replaceUnrealizedCastsWithIdentity(module);
-    if (llvm::sys::Process::GetEnv("LYTHON_DUMP_LOWERING_IR")) {
+
+    if (dumpLowering) {
       llvm::errs() << "[After func object conversion]\n";
       module.dump();
     }
 
+    // Phase 3: Call conversion (py.call_vector/py.call -> calls)
+
     auto runCallConversion = [&]() -> LogicalResult {
       while (true) {
-        RewritePatternSet callPatterns(ctx);
-        populatePyCallLoweringPatterns(typeConverter, callPatterns);
-        callPatterns.add<UnrealizedCastLowering>(typeConverter, ctx);
-        ConversionTarget callTarget(*ctx);
-        callTarget.addLegalDialect<py::PyDialect>();
-        callTarget.addLegalOp<ModuleOp>();
-        callTarget.markUnknownOpDynamicallyLegal(
-            [](Operation *) { return true; });
-        callTarget.addIllegalOp<CallVectorOp, CallOp>();
+        RewritePatternSet patterns(ctx);
+        populatePyCallLoweringPatterns(typeConverter, patterns);
+        patterns.add<UnrealizedCastLowering>(typeConverter, ctx);
+
+        ConversionTarget target(*ctx);
+        target.addLegalDialect<py::PyDialect>();
+        target.addLegalOp<ModuleOp>();
+        target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
+        target.addIllegalOp<CallVectorOp, CallOp>();
+
         ScopedDiagnosticHandler diagHandler(ctx, materializationFilter);
         auto result =
-            applyPartialConversion(module, callTarget, std::move(callPatterns));
+            applyPartialConversion(module, target, std::move(patterns));
         if (succeeded(result))
           return success();
         if (!replaceUnrealizedCastsWithIdentity(module))
@@ -330,127 +249,17 @@ struct RuntimeLoweringPass
     }
     replaceUnrealizedCastsWithIdentity(module);
 
-    // Clean up dead tuple operations whose only users are DecRefOps
-    auto cleanupDeadTuples = [&]() {
-      SmallVector<Operation *> toErase;
-      module.walk([&](Operation *tupleOp) {
-        if (!isa<TupleCreateOp, TupleEmptyOp>(tupleOp))
-          return;
-        Value result = tupleOp->getResult(0);
-        SmallVector<Operation *> decrefsToErase;
-        bool canErase = true;
-        for (Operation *user : result.getUsers()) {
-          if (auto decref = dyn_cast<DecRefOp>(user)) {
-            decrefsToErase.push_back(decref);
-          } else {
-            canErase = false;
-            break;
-          }
-        }
-        if (canErase && !decrefsToErase.empty()) {
-          for (Operation *decref : decrefsToErase)
-            toErase.push_back(decref);
-          toErase.push_back(tupleOp);
-        }
-      });
-      for (Operation *op : toErase)
-        op->erase();
-      return !toErase.empty();
-    };
-    cleanupDeadTuples();
+    // Apply pre-lowering optimizations
+    runPreLoweringOptimizations(module);
 
-    // Optimization 1: Hoist integer constants to entry block (CSE)
-    auto hoistIntConstants = [&]() {
-      module.walk([&](func::FuncOp func) {
-        if (func.isExternal())
-          return;
-        Block &entryBlock = func.getBody().front();
-        llvm::StringMap<IntConstantOp> constantMap;
-
-        // First pass: collect all IntConstantOp
-        SmallVector<IntConstantOp> allConstants;
-        func.walk([&](IntConstantOp op) { allConstants.push_back(op); });
-
-        // Second pass: CSE and hoist (using string value as key)
-        for (IntConstantOp op : allConstants) {
-          llvm::StringRef value = op.getValue();
-          auto it = constantMap.find(value);
-          if (it != constantMap.end()) {
-            // Replace with existing constant
-            op.getResult().replaceAllUsesWith(it->second.getResult());
-            op->erase();
-          } else {
-            // Move to entry block if not already there
-            if (op->getBlock() != &entryBlock) {
-              op->moveBefore(&entryBlock, entryBlock.begin());
-            }
-            constantMap[value] = op;
-          }
-        }
-      });
-    };
-    hoistIntConstants();
-
-    // Optimization 2: Remove decref for small integer constants (-5 to 256)
-    auto removeSmallIntDecrefs = [&]() {
-      SmallVector<DecRefOp> toErase;
-      module.walk([&](DecRefOp decref) {
-        Value obj = decref.getObject();
-        if (auto intConst = obj.getDefiningOp<IntConstantOp>()) {
-          llvm::StringRef valueStr = intConst.getValue();
-          // Parse the string to check if it's in small int range
-          char *end;
-          long long value = std::strtoll(valueStr.data(), &end, 10);
-          // Only apply optimization if parsing succeeded and value is in range
-          if (end == valueStr.data() + valueStr.size() && value >= -5 &&
-              value <= 256) {
-            toErase.push_back(decref);
-          }
-        }
-      });
-      for (auto op : toErase)
-        op->erase();
-    };
-    removeSmallIntDecrefs();
-
-    if (llvm::sys::Process::GetEnv("LYTHON_DUMP_LOWERING_IR")) {
+    if (dumpLowering) {
       llvm::errs() << "[After call conversion]\n";
       module.dump();
     }
 
-    // py.upcast は実体が同一表現（PyObject*）なので単純に転送
-    struct UpcastLowering : public OpConversionPattern<UpcastOp> {
-      UpcastLowering(PyLLVMTypeConverter &converter, MLIRContext *ctx)
-          : OpConversionPattern<UpcastOp>(converter, ctx) {}
-
-      LogicalResult
-      matchAndRewrite(UpcastOp op, OpAdaptor adaptor,
-                      ConversionPatternRewriter &rewriter) const override {
-        if (adaptor.getOperands().empty())
-          return failure();
-        rewriter.replaceOp(op, adaptor.getOperands().front());
-        return success();
-      }
-    };
-
-    struct CastIdentityLowering : public OpConversionPattern<CastIdentityOp> {
-      CastIdentityLowering(PyLLVMTypeConverter &converter, MLIRContext *ctx)
-          : OpConversionPattern<CastIdentityOp>(converter, ctx) {}
-
-      LogicalResult
-      matchAndRewrite(CastIdentityOp op, OpAdaptor adaptor,
-                      ConversionPatternRewriter &rewriter) const override {
-        if (adaptor.getInput())
-          rewriter.replaceOp(op, adaptor.getInput());
-        else
-          rewriter.eraseOp(op);
-        return success();
-      }
-    };
+    // Phase 4: Value conversion (py.* ops -> LLVM ops)
 
     auto runValueConversion = [&]() -> LogicalResult {
-      bool dumpLowering = static_cast<bool>(
-          llvm::sys::Process::GetEnv("LYTHON_DUMP_LOWERING_IR"));
       while (true) {
         RewritePatternSet patterns(ctx);
         populatePyValueLoweringPatterns(typeConverter, patterns);
@@ -471,16 +280,20 @@ struct RuntimeLoweringPass
             IncRefOp, DecRefOp, ClassNewOp, AttrGetOp, AttrSetOp, ClassOp>();
 
         ScopedDiagnosticHandler diagHandler(ctx, materializationFilter);
-        auto conversionResult =
+        auto result =
             applyPartialConversion(module, target, std::move(patterns));
+
         if (dumpLowering) {
           llvm::errs() << "[After final conversion attempt]\n";
           module.dump();
         }
-        if (succeeded(conversionResult))
+
+        if (succeeded(result))
           return success();
+
         if (dumpLowering)
           llvm::errs() << "[Final conversion failure]\n";
+
         if (!replaceUnrealizedCastsWithIdentity(module))
           return failure();
       }
@@ -491,221 +304,15 @@ struct RuntimeLoweringPass
       return;
     }
 
-    // Optimization: CSE for LyUnicode_FromUTF8 calls within each function
-    // This reduces redundant string key creation for attribute access
-    // After CSE, we add decref at function end for the cached strings
-    auto cseStringCreation = [&]() {
-      module.walk([&](func::FuncOp func) {
-        if (func.isExternal())
-          return;
+    // Apply post-lowering optimizations
+    runPostLoweringOptimizations(module);
 
-        // Map from (string_global_symbol, length) -> first call result
-        llvm::DenseMap<std::pair<StringRef, int64_t>, LLVM::CallOp> stringCache;
-        SmallVector<LLVM::CallOp> toErase;
-        SmallVector<LLVM::CallOp> cachedStrings;
-
-        func.walk([&](LLVM::CallOp callOp) {
-          auto callee = callOp.getCallee();
-          if (!callee || *callee != "LyUnicode_FromUTF8")
-            return;
-
-          // Get the string global and length arguments
-          if (callOp.getNumOperands() != 2)
-            return;
-
-          // First operand should be a GEP pointing to a global string
-          auto gepOp = callOp.getOperand(0).getDefiningOp<LLVM::GEPOp>();
-          if (!gepOp)
-            return;
-          auto addrOp = gepOp.getBase().getDefiningOp<LLVM::AddressOfOp>();
-          if (!addrOp)
-            return;
-          StringRef globalName = addrOp.getGlobalName();
-
-          // Second operand should be a constant length
-          auto lenConst =
-              callOp.getOperand(1).getDefiningOp<LLVM::ConstantOp>();
-          if (!lenConst)
-            return;
-          auto lenAttr = llvm::dyn_cast<IntegerAttr>(lenConst.getValue());
-          if (!lenAttr)
-            return;
-          int64_t len = lenAttr.getInt();
-
-          auto key = std::make_pair(globalName, len);
-          auto it = stringCache.find(key);
-          if (it != stringCache.end()) {
-            // Replace with cached result
-            callOp.getResult().replaceAllUsesWith(it->second.getResult());
-            toErase.push_back(callOp);
-          } else {
-            stringCache[key] = callOp;
-            cachedStrings.push_back(callOp);
-          }
-        });
-
-        for (auto op : toErase)
-          op->erase();
-
-        // Add decref for cached strings before each return
-        if (!cachedStrings.empty()) {
-          func.walk([&](func::ReturnOp returnOp) {
-            OpBuilder builder(returnOp);
-            auto decrefFunc =
-                module.lookupSymbol<LLVM::LLVMFuncOp>("Ly_DecRef");
-            if (decrefFunc) {
-              for (auto cachedCall : cachedStrings) {
-                builder.create<LLVM::CallOp>(
-                    returnOp.getLoc(), decrefFunc,
-                    ValueRange{cachedCall.getResult()});
-              }
-            }
-          });
-        }
-      });
-    };
-    cseStringCreation();
-
-    // Optimization: Replace LyTuple_New(0) with Ly_GetEmptyTuple()
-    // This uses a pre-allocated immortal empty tuple singleton
-    auto replaceEmptyTupleNew = [&]() {
-      SmallVector<LLVM::CallOp> toReplace;
-      module.walk([&](LLVM::CallOp callOp) {
-        auto callee = callOp.getCallee();
-        if (!callee || *callee != "LyTuple_New")
-          return;
-        // Check if argument is constant 0
-        if (callOp.getNumOperands() != 1)
-          return;
-        auto sizeConst = callOp.getOperand(0).getDefiningOp<LLVM::ConstantOp>();
-        if (!sizeConst)
-          return;
-        auto sizeAttr = llvm::dyn_cast<IntegerAttr>(sizeConst.getValue());
-        if (!sizeAttr || sizeAttr.getInt() != 0)
-          return;
-        toReplace.push_back(callOp);
-      });
-
-      for (auto callOp : toReplace) {
-        OpBuilder builder(callOp);
-        // Get or create Ly_GetEmptyTuple function declaration
-        auto emptyTupleFunc =
-            module.lookupSymbol<LLVM::LLVMFuncOp>("Ly_GetEmptyTuple");
-        if (!emptyTupleFunc) {
-          OpBuilder moduleBuilder(module.getBodyRegion());
-          auto ptrType = LLVM::LLVMPointerType::get(ctx);
-          auto funcType = LLVM::LLVMFunctionType::get(ptrType, {});
-          emptyTupleFunc = moduleBuilder.create<LLVM::LLVMFuncOp>(
-              module.getLoc(), "Ly_GetEmptyTuple", funcType);
-        }
-        auto newCall = builder.create<LLVM::CallOp>(
-            callOp.getLoc(), emptyTupleFunc, ValueRange{});
-        callOp.getResult().replaceAllUsesWith(newCall.getResult());
-        callOp->erase();
-      }
-    };
-    replaceEmptyTupleNew();
-
-    // Optimization: CSE for singleton getter calls (Ly_GetBuiltinPrint,
-    // Ly_GetNone, Ly_GetEmptyTuple) These return borrowed references to
-    // singletons, so no decref needed
-    auto cseSingletonGetters = [&]() {
-      module.walk([&](func::FuncOp func) {
-        if (func.isExternal())
-          return;
-
-        // Cache for each singleton getter function
-        llvm::StringMap<LLVM::CallOp> singletonCache;
-        SmallVector<LLVM::CallOp> toErase;
-
-        func.walk([&](LLVM::CallOp callOp) {
-          auto callee = callOp.getCallee();
-          if (!callee)
-            return;
-          // Singleton getters that we want to CSE
-          if (*callee != "Ly_GetBuiltinPrint" && *callee != "Ly_GetNone" &&
-              *callee != "Ly_GetEmptyTuple")
-            return;
-
-          StringRef funcName = *callee;
-          auto it = singletonCache.find(funcName);
-          if (it != singletonCache.end()) {
-            // Replace with cached result
-            callOp.getResult().replaceAllUsesWith(it->second.getResult());
-            toErase.push_back(callOp);
-          } else {
-            singletonCache[funcName] = callOp;
-          }
-        });
-
-        for (auto op : toErase)
-          op->erase();
-      });
-    };
-    cseSingletonGetters();
-
-    // CSE for LLVM constants within each function
-    auto cseConstants = [&]() {
-      module.walk([&](func::FuncOp func) {
-        if (func.isExternal())
-          return;
-        // Map from (type, value) -> first constant op
-        llvm::DenseMap<std::pair<Type, Attribute>, LLVM::ConstantOp>
-            constantCache;
-        SmallVector<LLVM::ConstantOp> toErase;
-
-        func.walk([&](LLVM::ConstantOp constOp) {
-          auto key = std::make_pair(constOp.getType(), constOp.getValue());
-          auto it = constantCache.find(key);
-          if (it != constantCache.end()) {
-            constOp.getResult().replaceAllUsesWith(it->second.getResult());
-            toErase.push_back(constOp);
-          } else {
-            constantCache[key] = constOp;
-          }
-        });
-
-        for (auto op : toErase)
-          op->erase();
-      });
-    };
-    cseConstants();
-
-    // Dead code elimination for unused LLVM operations after CSE
-    // This cleans up addressof, GEP, and constants that were only used by CSE'd
-    // calls
-    auto eliminateDeadCode = [&]() {
-      bool changed = true;
-      while (changed) {
-        changed = false;
-        SmallVector<Operation *> toErase;
-        module.walk([&](Operation *op) {
-          // Only consider operations with no side effects
-          if (!isa<LLVM::AddressOfOp, LLVM::GEPOp, LLVM::ConstantOp>(op))
-            return;
-          // Check if all results are unused
-          bool allUnused = true;
-          for (Value result : op->getResults()) {
-            if (!result.use_empty()) {
-              allUnused = false;
-              break;
-            }
-          }
-          if (allUnused)
-            toErase.push_back(op);
-        });
-        for (Operation *op : toErase) {
-          op->erase();
-          changed = true;
-        }
-      }
-    };
-    eliminateDeadCode();
-
-    if (llvm::sys::Process::GetEnv("LYTHON_DUMP_LOWERING_IR")) {
-      llvm::errs() << "[After string CSE]\n";
+    if (dumpLowering) {
+      llvm::errs() << "[After optimizations]\n";
       module.dump();
     }
+
+    // Phase 5: Cleanup remaining casts
 
     replaceUnrealizedCastsWithIdentity(module);
     RewritePatternSet cleanupPatterns(ctx);

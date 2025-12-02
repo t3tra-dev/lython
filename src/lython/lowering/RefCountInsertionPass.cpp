@@ -34,6 +34,9 @@ static bool isImmortal(Operation *op) {
   // TODO: Handle dynamically created closures differently
   if (isa<FuncObjectOp>(op))
     return true;
+  // Empty tuple is an immortal singleton (Ly_GetEmptyTuple)
+  if (isa<TupleEmptyOp>(op))
+    return true;
   return false;
 }
 

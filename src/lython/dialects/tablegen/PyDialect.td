@@ -556,7 +556,10 @@ def Py_ClassNewOp : Py_Op<"class.new", [Pure]> {
 // Attribute access operations
 //===----------------------------------------------------------------------===//
 
-def Py_AttrGetOp : Py_Op<"attr.get", [Pure]> {
+// Note: AttrGetOp is NOT marked Pure because it reads from mutable memory.
+// CSE must not merge multiple attr.get operations on the same object,
+// as the value may have been modified by attr.set between reads.
+def Py_AttrGetOp : Py_Op<"attr.get", []> {
   let summary = "Get an attribute from a Python object";
   let description = [{
     Retrieves an attribute by name from a Python object.
