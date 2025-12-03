@@ -1,3 +1,4 @@
+from lyrt import from_prim
 from lyrt.prim import f32, Vector, Matrix, Tensor
 
 v = Vector[f32, 4].zeros()
@@ -5,6 +6,10 @@ v = Vector[f32, 4].zeros()
 m = Matrix[f32, 3, 4].zeros()
 
 t = Tensor[f32, 2, 3, 4].zeros()
+
+print(from_prim(v))
+print(from_prim(m))
+print(from_prim(t))
 
 v2 = Vector[f32, 4]([0.3, -1.2, 4.5, 2.1])
 
@@ -26,3 +31,7 @@ t2 = Tensor[f32, 2, 3, 4]([
         [6.1, 3.3, -1.7, 9.9],
     ],
 ])
+
+print(from_prim(v2))
+print(from_prim(m2))
+print(from_prim(t2))
