@@ -1,6 +1,5 @@
-from lyrt import native, from_prim
+from lyrt import from_prim, native
 from lyrt.prim import Int
-
 
 p1 = Int[32](1)
 p2 = Int[32](2)

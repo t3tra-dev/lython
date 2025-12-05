@@ -602,7 +602,9 @@ class ExprVisitor(BaseVisitor):
 
         # Get the bit width from the subscript
         assert isinstance(node.func, ast.Subscript)
-        if not isinstance(node.func.slice, ast.Constant) or not isinstance(node.func.slice.value, int):
+        if not isinstance(node.func.slice, ast.Constant) or not isinstance(
+            node.func.slice.value, int
+        ):
             raise ValueError(f"{base_type} requires an integer bit width")
         bits = node.func.slice.value
 

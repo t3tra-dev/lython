@@ -359,7 +359,9 @@ class BaseVisitor:
             return ir.IntegerType.get_signless(bits, context=self.ctx)
         elif base_type == "Float":
             if bits not in FLOAT_VALID_BITS:
-                raise ValueError(f"Float bit width must be one of {sorted(FLOAT_VALID_BITS)}, got {bits}")
+                raise ValueError(
+                    f"Float bit width must be one of {sorted(FLOAT_VALID_BITS)}, got {bits}"
+                )
             if bits == 16:
                 return ir.F16Type.get(context=self.ctx)
             elif bits == 32:
@@ -400,11 +402,15 @@ class BaseVisitor:
 
                 if base_type in PRIMITIVE_BASE_TYPES:
                     # Get the bit width from the slice
-                    if isinstance(annotation.slice, ast.Constant) and isinstance(annotation.slice.value, int):
+                    if isinstance(annotation.slice, ast.Constant) and isinstance(
+                        annotation.slice.value, int
+                    ):
                         bits = annotation.slice.value
                         return self.get_primitive_type_from_spec(base_type, bits)
                     else:
-                        raise ValueError(f"Primitive type {base_type} requires an integer bit width")
+                        raise ValueError(
+                            f"Primitive type {base_type} requires an integer bit width"
+                        )
 
         return None
 
