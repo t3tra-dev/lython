@@ -9,23 +9,16 @@ from ..mlir.dialects import _lython_ops_gen as py_ops
 __all__ = ["BaseVisitor"]
 
 
-# Mapping from lyrt.prim type names to MLIR type constructors
-PRIMITIVE_TYPE_MAP: dict[str, tuple[str, int]] = {
-    # Integer types: (kind, bits)
-    "i1": ("int", 1),
-    "i8": ("int", 8),
-    "i16": ("int", 16),
-    "i32": ("int", 32),
-    "i64": ("int", 64),
-    "i128": ("int", 128),
-    "i256": ("int", 256),
-    # Float types
-    "f16": ("float", 16),
-    "f32": ("float", 32),
-    "f64": ("float", 64),
-    "f128": ("float", 128),
-    "f256": ("float", 256),
-}
+# Base primitive type names (lyrt.prim)
+# Int[N] supports 1-8388608 bits (LLVM limit)
+# Float[N] supports 16, 32, 64, 128 bits only
+PRIMITIVE_BASE_TYPES: set[str] = {"Int", "Float"}
+
+# Valid bit widths for Float type
+FLOAT_VALID_BITS: set[int] = {16, 32, 64, 128}
+
+# LLVM maximum integer bit width
+INT_MAX_BITS: int = 8388608
 
 
 class FunctionInfo(NamedTuple):
@@ -353,27 +346,33 @@ class BaseVisitor:
         return ops[-1].operation.name in terminators
 
     # --- Primitive world support -------------------------------------------
-    def get_primitive_type(self, type_name: str) -> ir.Type:
-        """Get MLIR primitive type from a lyrt.prim type name."""
-        if type_name not in PRIMITIVE_TYPE_MAP:
-            raise ValueError(f"Unknown primitive type: {type_name}")
-        kind, bits = PRIMITIVE_TYPE_MAP[type_name]
-        if kind == "int":
+    def get_primitive_type_from_spec(self, base_type: str, bits: int) -> ir.Type:
+        """Get MLIR primitive type from base type name and bit width.
+
+        Args:
+            base_type: "Int" or "Float"
+            bits: bit width (1-8388608 for Int, 16/32/64/128 for Float)
+        """
+        if base_type == "Int":
+            if not (1 <= bits <= INT_MAX_BITS):
+                raise ValueError(f"Int bit width must be 1-{INT_MAX_BITS}, got {bits}")
             return ir.IntegerType.get_signless(bits, context=self.ctx)
-        elif kind == "float":
+        elif base_type == "Float":
+            if bits not in FLOAT_VALID_BITS:
+                raise ValueError(f"Float bit width must be one of {sorted(FLOAT_VALID_BITS)}, got {bits}")
             if bits == 16:
                 return ir.F16Type.get(context=self.ctx)
             elif bits == 32:
                 return ir.F32Type.get(context=self.ctx)
             elif bits == 64:
                 return ir.F64Type.get(context=self.ctx)
-            else:
-                raise ValueError(f"Unsupported float bit width: {bits}")
-        raise ValueError(f"Unknown primitive kind: {kind}")
+            elif bits == 128:
+                return ir.Type.parse("f128", self.ctx)
+        raise ValueError(f"Unknown primitive base type: {base_type}")
 
-    def is_primitive_type(self, type_name: str) -> bool:
-        """Check if a type name refers to a primitive type."""
-        return type_name in self._prim_types or type_name in PRIMITIVE_TYPE_MAP
+    def is_primitive_base_type(self, type_name: str) -> bool:
+        """Check if a type name refers to a primitive base type (Int or Float)."""
+        return type_name in self._prim_types or type_name in PRIMITIVE_BASE_TYPES
 
     def _set_in_native_func(self, value: bool) -> None:
         """Set native function mode across all subvisitors."""
@@ -384,15 +383,29 @@ class BaseVisitor:
     def annotation_to_primitive_type(
         self, annotation: ast.expr | None
     ) -> ir.Type | None:
-        """Convert a type annotation to a primitive MLIR type, or None if not primitive."""
+        """Convert a type annotation to a primitive MLIR type, or None if not primitive.
+
+        Handles Int[N] and Float[N] subscript syntax.
+        """
         if annotation is None:
             return None
-        if isinstance(annotation, ast.Name):
-            name = annotation.id
-            if name in self._prim_types:
-                return self.get_primitive_type(name)
-            if name in PRIMITIVE_TYPE_MAP:
-                return self.get_primitive_type(name)
+
+        # Handle Int[32], Float[64], etc.
+        if isinstance(annotation, ast.Subscript):
+            if isinstance(annotation.value, ast.Name):
+                base_type = annotation.value.id
+                # Check if it's an aliased import
+                if base_type in self._prim_types:
+                    base_type = self._prim_types[base_type]
+
+                if base_type in PRIMITIVE_BASE_TYPES:
+                    # Get the bit width from the slice
+                    if isinstance(annotation.slice, ast.Constant) and isinstance(annotation.slice.value, int):
+                        bits = annotation.slice.value
+                        return self.get_primitive_type_from_spec(base_type, bits)
+                    else:
+                        raise ValueError(f"Primitive type {base_type} requires an integer bit width")
+
         return None
 
     def register_prim_constant(

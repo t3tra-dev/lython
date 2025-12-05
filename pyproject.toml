@@ -24,7 +24,7 @@ build-backend = "hatchling.build"
 include = ["src/lython"]
 exclude = ["**/__pycache__", "**/*.pyi"]
 ignore = ["third_party/", "src/lython/mlir/"]
-typeCheckingMode = "basic"
+typeCheckingMode = "strict"
 
 [tool.black]
 extend-exclude = """

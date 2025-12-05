@@ -1,13 +1,14 @@
-from lyrt import from_prim, native, to_prim
-from lyrt.prim import i32  # pyright: ignore[reportMissingModuleSource]
+from lyrt import native, from_prim
+from lyrt.prim import Int
 
-p1 = to_prim(1, i32)
-p2 = to_prim(2, i32)
-p35 = to_prim(35, i32)
+
+p1 = Int[32](1)
+p2 = Int[32](2)
+p35 = Int[32](35)
 
 
 @native(gc="none")
-def fib(n: i32) -> i32:
+def fib(n: Int[32]) -> Int[32]:
     if n <= p1:
         return n
     return fib(n - p1) + fib(n - p2)

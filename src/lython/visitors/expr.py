@@ -7,7 +7,7 @@ from lython.mlir.dialects import arith as arith_ops
 from lython.mlir.dialects import func as func_ops
 
 from ..mlir import ir
-from ._base import PRIMITIVE_TYPE_MAP, BaseVisitor, ClassInfo, FunctionInfo
+from ._base import PRIMITIVE_BASE_TYPES, BaseVisitor, ClassInfo, FunctionInfo
 
 __all__ = ["ExprVisitor"]
 
@@ -400,11 +400,19 @@ class ExprVisitor(BaseVisitor):
         """
         loc = self._loc(node)
 
-        # Handle lyrt builtin calls: to_prim, from_prim
+        # Handle primitive type constructor: Int[32](value), Float[64](value)
+        if isinstance(node.func, ast.Subscript):
+            if isinstance(node.func.value, ast.Name):
+                base_type = node.func.value.id
+                # Check if it's an aliased import
+                if base_type in self._prim_types:
+                    base_type = self._prim_types[base_type]
+                if base_type in PRIMITIVE_BASE_TYPES:
+                    return self._handle_prim_constructor(node, base_type, loc)
+
+        # Handle lyrt builtin calls: from_prim
         if isinstance(node.func, ast.Name):
             func_name = node.func.id
-            if func_name == "to_prim" and "to_prim" in self._lyrt_builtins:
-                return self._handle_to_prim(node, loc)
             if func_name == "from_prim" and "from_prim" in self._lyrt_builtins:
                 return self._handle_from_prim(node, loc)
 
@@ -578,54 +586,51 @@ class ExprVisitor(BaseVisitor):
             )
             return call.results_[0]
 
-    def _handle_to_prim(self, node: ast.Call, loc: ir.Location) -> ir.Value:
+    def _handle_prim_constructor(
+        self, node: ast.Call, base_type: str, loc: ir.Location
+    ) -> ir.Value:
         """
-        Handle to_prim(value, prim_type) call.
+        Handle Int[N](value) or Float[N](value) constructor.
 
-        Converts a Python value to a primitive type.
-        At module level with constant values, this generates arith.constant.
+        Args:
+            node: The Call AST node
+            base_type: "Int" or "Float"
+            loc: Source location
         """
-        if len(node.args) != 2:
-            raise ValueError("to_prim() requires exactly 2 arguments: value and type")
+        if len(node.args) != 1:
+            raise ValueError(f"{base_type}[N]() requires exactly 1 argument")
+
+        # Get the bit width from the subscript
+        assert isinstance(node.func, ast.Subscript)
+        if not isinstance(node.func.slice, ast.Constant) or not isinstance(node.func.slice.value, int):
+            raise ValueError(f"{base_type} requires an integer bit width")
+        bits = node.func.slice.value
+
+        # Get the MLIR type
+        prim_type = self.get_primitive_type_from_spec(base_type, bits)
 
         value_node = node.args[0]
-        type_node = node.args[1]
-
-        # Get the target primitive type
-        if not isinstance(type_node, ast.Name):
-            raise ValueError("to_prim() second argument must be a primitive type name")
-
-        type_name = type_node.id
-        if type_name in self._prim_types:
-            # Aliased import - get the real type name
-            type_name = self._prim_types[type_name]
-
-        if type_name not in PRIMITIVE_TYPE_MAP:
-            raise ValueError(f"to_prim() unknown primitive type: {type_name}")
-
-        prim_type = self.get_primitive_type(type_name)
 
         # Handle constant values (compile-time conversion)
         if isinstance(value_node, ast.Constant):
             value = value_node.value
-            kind, bits = PRIMITIVE_TYPE_MAP[type_name]
 
             with loc, self.insertion_point():
-                if kind == "int" and isinstance(value, int):
+                if base_type == "Int" and isinstance(value, int):
                     attr = ir.IntegerAttr.get(prim_type, value)
                     result = arith_ops.ConstantOp(prim_type, attr).result
                     # Store the constant value for cross-region access
                     # (will be associated with variable name in visit_Assign)
                     self._pending_prim_const = (prim_type, value)
                     return result
-                elif kind == "float" and isinstance(value, (int, float)):
+                elif base_type == "Float" and isinstance(value, (int, float)):
                     attr = ir.FloatAttr.get(prim_type, float(value))
                     result = arith_ops.ConstantOp(prim_type, attr).result
                     self._pending_prim_const = (prim_type, float(value))
                     return result
                 else:
                     raise ValueError(
-                        f"Cannot convert {type(value).__name__} to {type_name}"
+                        f"Cannot convert {type(value).__name__} to {base_type}[{bits}]"
                     )
 
         # For non-constant values, generate py.cast.to_prim

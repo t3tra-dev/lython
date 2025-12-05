@@ -4,12 +4,11 @@ import ast
 from typing import Any
 
 from lython.mlir.dialects import _lython_ops_gen as py_ops
-from lython.mlir.dialects import arith as arith_ops
 from lython.mlir.dialects import cf as cf_ops
 from lython.mlir.dialects import func as func_ops
 
 from ..mlir import ir
-from ._base import PRIMITIVE_TYPE_MAP, BaseVisitor, MethodInfo  # noqa: F401
+from ._base import PRIMITIVE_BASE_TYPES, BaseVisitor, MethodInfo
 
 __all__ = ["StmtVisitor"]
 
@@ -137,7 +136,7 @@ class StmtVisitor(BaseVisitor):
             ir.StringAttr.get(arg.arg, self.ctx) for arg in node.args.args
         ]
         arg_names_attr = (
-            ir.ArrayAttr.get(arg_name_attrs, context=self.ctx)
+            ir.ArrayAttr.get(arg_name_attrs, context=self.ctx)  # pyright: ignore[reportUnknownMemberType]
             if arg_name_attrs
             else None
         )
@@ -404,7 +403,7 @@ class StmtVisitor(BaseVisitor):
             ir.StringAttr.get(arg.arg, self.ctx) for arg in node.args.args
         ]
         arg_names_attr = (
-            ir.ArrayAttr.get(arg_name_attrs, context=self.ctx)
+            ir.ArrayAttr.get(arg_name_attrs, context=self.ctx)  # pyright: ignore[reportUnknownMemberType]
             if arg_name_attrs
             else None
         )
@@ -693,9 +692,9 @@ class StmtVisitor(BaseVisitor):
 
         assert self.current_block is not None
         parent_region = self.current_block.region
-        true_block = parent_region.blocks.append()
-        false_block = parent_region.blocks.append()
-        merge_block = parent_region.blocks.append()
+        true_block = parent_region.blocks.append()  # pyright: ignore[reportUnknownMemberType]
+        false_block = parent_region.blocks.append()  # pyright: ignore[reportUnknownMemberType]
+        merge_block = parent_region.blocks.append()  # pyright: ignore[reportUnknownMemberType]
         with self._loc(node), self.insertion_point():
             cf_ops.CondBranchOp(cond, [], [], true_block, false_block)
 
@@ -813,28 +812,27 @@ class StmtVisitor(BaseVisitor):
         ```
 
         Handles:
-        - from lyrt import native, to_prim, from_prim
-        - from lyrt.prim import i8, i16, ...
+        - from lyrt import native, from_prim
+        - from lyrt.prim import Int, Float, Vector, Matrix, Tensor
         """
-        from ._base import PRIMITIVE_TYPE_MAP
-
         module = node.module
 
         if module == "lyrt":
-            # Handle lyrt builtins: native, to_prim, from_prim
+            # Handle lyrt builtins: native, from_prim
             for alias in node.names:
                 name = alias.name
-                if name in ("native", "to_prim", "from_prim"):
+                if name in ("native", "from_prim"):
                     self._lyrt_builtins.add(name)
                 else:
                     raise NotImplementedError(f"Unknown lyrt import: {name}")
             return
 
         if module == "lyrt.prim":
-            # Handle primitive type imports: i8, i16, i32, ...
+            # Handle primitive type imports: Int, Float, Vector, Matrix, Tensor
+            valid_types = PRIMITIVE_BASE_TYPES | {"Vector", "Matrix", "Tensor"}
             for alias in node.names:
                 name = alias.name
-                if name in PRIMITIVE_TYPE_MAP:
+                if name in valid_types:
                     # Store the imported name (may be aliased)
                     local_name = alias.asname or name
                     self._prim_types[local_name] = name
