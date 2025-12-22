@@ -38,6 +38,7 @@ jobs:
       - name: Build
         run: |
           ./build_mlir.sh
+          ./vendor_mlir.sh
           ./build.sh
 
       - name: Hello
