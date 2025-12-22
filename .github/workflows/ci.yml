@@ -26,13 +26,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang
-          sudo apt-get install -y libgc-dev cmake ninja-build
+          sudo apt-get install -y libgc-dev cmake ninja-build pybind11-dev
           sudo bash -c "$(wget -O - https://apt.llvm.org/llvm.sh)"
           wget https://github.com/sharkdp/hyperfine/releases/download/v1.20.0/hyperfine_1.20.0_amd64.deb
           sudo dpkg -i hyperfine_1.20.0_amd64.deb
           sudo curl -LsSf https://astral.sh/uv/install.sh | sh
           uv sync
           uv pip install -U nanobind
+          uv pip install -U pybind11
 
       - name: Build
         run: |
