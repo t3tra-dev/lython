@@ -111,24 +111,82 @@ if __name__ == "__main__":
   }
 
   LogicalResult runPipeline(ModuleOp module, MLIRContext& context) {
-    PassManager pm(&context);
-    // Verify @native functions before any transformations
-    // This enforces the modal logic separation (Primitive World vs Object World)
-    pm.addPass(py::createNativeVerificationPass());
-    // Insert reference counting operations using Affine SSA (Linear Type) logic
-    pm.addPass(py::createRefCountInsertionPass());
-    // Early canonicalization and CSE for arith/func ops
-    pm.addPass(mlir::createCanonicalizerPass());
-    pm.addPass(mlir::createCSEPass());
-    pm.addPass(py::createRuntimeLoweringPass());
-    pm.addPass(mlir::createConvertSCFToCFPass());
-    pm.addPass(mlir::createArithToLLVMConversionPass());
-    pm.addPass(mlir::createConvertControlFlowToLLVMPass());
-    pm.addPass(mlir::createConvertToLLVMPass());
-    pm.addPass(mlir::createReconcileUnrealizedCastsPass());
-    pm.addNestedPass<mlir::func::FuncOp>(mlir::createReconcileUnrealizedCastsPass());
-    pm.addPass(mlir::createCanonicalizerPass());
-    return pm.run(module);
+    bool dumpIR = static_cast<bool>(
+        llvm::sys::Process::GetEnv("LYTHON_DUMP_LOWERING_IR"));
+
+    if (dumpIR) {
+      llvm::errs() << "=== [Frontend Output (before any passes)] ===\n";
+      module.dump();
+    }
+
+    // Phase 1: Native verification
+    {
+      PassManager pm(&context);
+      pm.addPass(py::createNativeVerificationPass());
+      if (failed(pm.run(module)))
+        return failure();
+    }
+
+    if (dumpIR) {
+      llvm::errs() << "\n=== [After NativeVerificationPass] ===\n";
+      module.dump();
+    }
+
+    // Phase 2: Reference counting insertion
+    {
+      PassManager pm(&context);
+      pm.addPass(py::createRefCountInsertionPass());
+      if (failed(pm.run(module)))
+        return failure();
+    }
+
+    if (dumpIR) {
+      llvm::errs() << "\n=== [After RefCountInsertionPass] ===\n";
+      module.dump();
+    }
+
+    // Phase 3: Early canonicalization and CSE
+    {
+      PassManager pm(&context);
+      pm.addPass(mlir::createCanonicalizerPass());
+      pm.addPass(mlir::createCSEPass());
+      if (failed(pm.run(module)))
+        return failure();
+    }
+
+    if (dumpIR) {
+      llvm::errs() << "\n=== [After Canonicalizer + CSE] ===\n";
+      module.dump();
+    }
+
+    // Phase 4: Runtime lowering (Py dialect -> func/LLVM)
+    {
+      PassManager pm(&context);
+      pm.addPass(py::createRuntimeLoweringPass());
+      if (failed(pm.run(module)))
+        return failure();
+    }
+
+    // Phase 5: Final lowering to LLVM
+    {
+      PassManager pm(&context);
+      pm.addPass(mlir::createConvertSCFToCFPass());
+      pm.addPass(mlir::createArithToLLVMConversionPass());
+      pm.addPass(mlir::createConvertControlFlowToLLVMPass());
+      pm.addPass(mlir::createConvertToLLVMPass());
+      pm.addPass(mlir::createReconcileUnrealizedCastsPass());
+      pm.addNestedPass<mlir::func::FuncOp>(mlir::createReconcileUnrealizedCastsPass());
+      pm.addPass(mlir::createCanonicalizerPass());
+      if (failed(pm.run(module)))
+        return failure();
+    }
+
+    if (dumpIR) {
+      llvm::errs() << "\n=== [Final LLVM IR] ===\n";
+      module.dump();
+    }
+
+    return success();
   }
 
   void registerRuntimeSymbols(ExecutionEngine& engine) {
