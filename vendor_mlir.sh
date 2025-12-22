@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR=$(pwd)
+ROOT_DIR=$(cd "$(dirname "$0")" && pwd)
 
 SRC_MLIR="$ROOT_DIR/src/lython/mlir"
 BUILD_MLIR="$ROOT_DIR/third_party/llvm-project/build/tools/mlir/python_packages/mlir_core/mlir"
 
 if [[ ! -d "$BUILD_MLIR" ]]; then
   echo "error: MLIR build artifacts not found: $BUILD_MLIR"
-  echo "hint: run ./build.sh first"
+  echo "hint: run ./build_mlir.sh first, then:"
+  echo "  cd third_party/llvm-project/build && cmake --build . --target MLIRPythonModules"
   exit 1
 fi
 
