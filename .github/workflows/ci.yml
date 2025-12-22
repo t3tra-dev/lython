@@ -17,18 +17,19 @@ jobs:
       - name: "Set up Python"
         uses: actions/setup-python@v5
         with:
-          python-version-file: "pyproject.toml"
+          python-version: "3.12"
 
       - name: Install Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y clang
-          sudo apt-get install -y libgc-dev cmake
+          sudo apt-get install -y libgc-dev cmake ninja-build
           sudo bash -c "$(wget -O - https://apt.llvm.org/llvm.sh)"
           wget https://github.com/sharkdp/hyperfine/releases/download/v1.20.0/hyperfine_1.20.0_amd64.deb
           sudo dpkg -i hyperfine_1.20.0_amd64.deb
           sudo curl -LsSf https://astral.sh/uv/install.sh | sh
           uv sync
+          ./.venv/bin/python -m pip install -U nanobind
 
       - name: Build
         run: |
@@ -43,5 +44,5 @@ jobs:
       - name: Benchmarks
         run: |
           ./build/bin/lyc examples/fib.py -o fib_aot
-          ./build/bin/lyc exmaples/fib_prim.py -o fib_prim_aot
+          ./build/bin/lyc examples/fib_prim.py -o fib_prim_aot
           hyperfine -w 1 -r 5 "python3 examples/fib.py" "./build/bin/lyc jit examples/fib.py" "./fib_aot" "./fib_prim_aot"
