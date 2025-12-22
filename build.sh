@@ -15,8 +15,22 @@ if [[ ! -f "$MLIR_BUILD_DIR/python_packages/mlir_core/mlir/_mlir_libs/_mlir.so" 
     echo "  cd $MLIR_BUILD_DIR && cmake --build . --target MLIRPythonModules"
 fi
 
-BUILD_DIR="$ROOT_DIR/build"
+BUILD_DIR=${BUILD_DIR:-"$ROOT_DIR/build"}
 mkdir -p "$BUILD_DIR"
+
+CMAKE_GENERATOR_NAME=""
+if [[ -f "$BUILD_DIR/CMakeCache.txt" ]]; then
+    CMAKE_GENERATOR_NAME=$(grep -E '^CMAKE_GENERATOR:INTERNAL=' "$BUILD_DIR/CMakeCache.txt" | sed -E 's/^CMAKE_GENERATOR:INTERNAL=//')
+fi
+
+if [[ -z "$CMAKE_GENERATOR_NAME" ]]; then
+    if command -v ninja >/dev/null 2>&1; then
+        CMAKE_GENERATOR_NAME="Ninja"
+    else
+        CMAKE_GENERATOR_NAME="Unix Makefiles"
+    fi
+fi
+
 cd "$BUILD_DIR"
 
 PYTHON_BIN=${PYTHON_BIN:-"$(command -v python3)"}
@@ -26,9 +40,10 @@ fi
 
 echo "Using Python: $PYTHON_BIN"
 echo "Using MLIR from: $MLIR_BUILD_DIR"
+echo "Using CMake generator: $CMAKE_GENERATOR_NAME"
 
 echo "Configuring Lython with CMake..."
-cmake -G Ninja "$ROOT_DIR" \
+cmake -G "$CMAKE_GENERATOR_NAME" "$ROOT_DIR" \
     -DCMAKE_BUILD_TYPE=Release \
     -DMLIR_DIR="$MLIR_BUILD_DIR/lib/cmake/mlir" \
     -DLLVM_DIR="$MLIR_BUILD_DIR/lib/cmake/llvm" \

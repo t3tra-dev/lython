@@ -12,10 +12,11 @@
 セットアップ
 
 ```bash
-git clone https://github.com/t3tra-dev/lython.git
+git clone --recurse-submodules https://github.com/t3tra-dev/lython.git
 cd lython
 uv sync
-source ./venv/bin/activate
+source ./.venv/bin/activate
+./build_mlir.sh
 ./build.sh
 ./vendor_mlir.sh
 uv build
