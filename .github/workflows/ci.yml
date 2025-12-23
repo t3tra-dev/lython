@@ -49,7 +49,8 @@ jobs:
 
       - name: Build Lython
         run: |
-          uv run cmake -B build -S .
+          export pybind11_DIR=$(python -c "import pybind11; print(pybind11.get_cmake_dir())")
+          uv run cmake -B build -S . -Dpybind11_DIR=$pybind11_DIR
           uv run cmake --build build
 
       - name: Test
