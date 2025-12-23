@@ -28,11 +28,11 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang cmake ninja-build pybind11-dev
+          sudo apt-get install -y clang cmake ninja-build
           wget https://github.com/sharkdp/hyperfine/releases/download/v1.20.0/hyperfine_1.20.0_amd64.deb
           sudo dpkg -i hyperfine_1.20.0_amd64.deb
+          pip install nanobind pybind11
           uv sync
-          uv pip install nanobind pybind11
 
       - name: Cache LLVM/MLIR build
         id: cache-llvm
