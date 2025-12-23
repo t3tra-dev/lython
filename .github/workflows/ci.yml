@@ -39,7 +39,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: third_party/llvm-project/build
-          key: llvm-mlir-${{ runner.os }}-${{ hashFiles('third_party/llvm-project/llvm/CMakeLists.txt') }}
+          key: llvm-mlir-v2-${{ runner.os }}-${{ hashFiles('third_party/CMakeLists.txt', 'third_party/llvm-project/llvm/CMakeLists.txt') }}
 
       - name: Build LLVM/MLIR
         if: steps.cache-llvm.outputs.cache-hit != 'true'
