@@ -1,7 +1,12 @@
 set(PYBIND11_FINDPYTHON OFF)
+set(PYTHON_EXECUTABLE ${Python3_EXECUTABLE})
+set(PYTHON_INCLUDE_DIRS ${Python3_INCLUDE_DIRS})
+set(PYTHON_LIBRARIES ${Python3_LIBRARIES})
+set(PYBIND11_PYTHON_VERSION ${Python3_VERSION})
+
 find_package(pybind11 CONFIG REQUIRED)
 
-message(STATUS "Building PyDialectInitializer for Python ${Python3_VERSION}")
+message(STATUS "Building PyDialectInitializer for Python ${Python3_VERSION} (${Python3_EXECUTABLE})")
 
 pybind11_add_module(PyDialectInitializer MODULE
   PyDialectPythonBindings.cpp
