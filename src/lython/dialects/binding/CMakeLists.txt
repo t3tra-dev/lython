@@ -19,12 +19,17 @@ set_target_properties(PyDialectInitializer
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/src/lython/mlir/_mlir_libs"
 )
 
+set(MLIR_PYTHON_CAPI_LIB "${CMAKE_SOURCE_DIR}/src/lython/mlir/_mlir_libs")
+
 target_link_libraries(PyDialectInitializer
   PRIVATE
     PyDialect
-    MLIRIR
-    MLIRSupport
-    MLIRFuncDialect
+    "${MLIR_PYTHON_CAPI_LIB}/libMLIRPythonCAPI${CMAKE_SHARED_LIBRARY_SUFFIX}"
+)
+
+set_target_properties(PyDialectInitializer PROPERTIES
+    BUILD_RPATH "${MLIR_PYTHON_CAPI_LIB}"
+    INSTALL_RPATH "${MLIR_PYTHON_CAPI_LIB}"
 )
 
 target_include_directories(PyDialectInitializer

@@ -47,6 +47,13 @@ jobs:
           cmake -B third_party/build -S third_party
           cmake --build third_party/build
 
+      - name: Vendor MLIR Python modules
+        run: |
+          cmake \
+            -DSRC_DIR=third_party/llvm-project/build/tools/mlir/python_packages/mlir_core/mlir \
+            -DDEST_DIR=src/lython/mlir \
+            -P third_party/cmake/vendor_mlir.cmake
+
       - name: Build Lython
         run: |
           export pybind11_DIR=$(python -c "import pybind11; print(pybind11.get_cmake_dir())")
