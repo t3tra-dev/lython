@@ -1,30 +1,30 @@
-#!/usr/bin/env bash
-set -euo pipefail
+# cmake -P vendor_mlir.cmake -DSRC_DIR=... -DDEST_DIR=...
 
-ROOT_DIR=$(cd "$(dirname "$0")" && pwd)
+cmake_minimum_required(VERSION 3.20)
 
-SRC_MLIR="$ROOT_DIR/src/lython/mlir"
-BUILD_MLIR="$ROOT_DIR/third_party/llvm-project/build/tools/mlir/python_packages/mlir_core/mlir"
+if(NOT DEFINED SRC_DIR)
+    message(FATAL_ERROR "SRC_DIR must be defined")
+endif()
 
-if [[ ! -d "$BUILD_MLIR" ]]; then
-  echo "error: MLIR build artifacts not found: $BUILD_MLIR"
-  echo "hint: run ./build_mlir.sh first, then:"
-  echo "  cd third_party/llvm-project/build && cmake --build . --target MLIRPythonModules"
-  exit 1
-fi
+if(NOT DEFINED DEST_DIR)
+    message(FATAL_ERROR "DEST_DIR must be defined")
+endif()
 
-echo "Sync MLIR -> $SRC_MLIR"
-rm -rf "$SRC_MLIR"
-# rsync があれば高速・属性維持、なければ cp -a
-if command -v rsync >/dev/null 2>&1; then
-  rsync -a --delete "$BUILD_MLIR/" "$SRC_MLIR/"
-else
-  mkdir -p "$SRC_MLIR"
-  (cd "$BUILD_MLIR" && tar cf - .) | (cd "$SRC_MLIR" && tar xpf -)
-fi
+if(NOT EXISTS "${SRC_DIR}")
+    message(FATAL_ERROR "Source directory does not exist: ${SRC_DIR}")
+endif()
 
-# パッケージとして認識されるように __init__.py を作成
-cat > "$SRC_MLIR/__init__.py" << 'EOF'
+message(STATUS "Vendoring MLIR Python modules")
+message(STATUS "  Source: ${SRC_DIR}")
+message(STATUS "  Destination: ${DEST_DIR}")
+
+if(EXISTS "${DEST_DIR}")
+    file(REMOVE_RECURSE "${DEST_DIR}")
+endif()
+
+file(COPY "${SRC_DIR}/" DESTINATION "${DEST_DIR}")
+
+set(INIT_PY_CONTENT [=[
 from __future__ import annotations
 
 import sys as _sys
@@ -73,6 +73,8 @@ __all__ = [
 ]
 
 del _sys, _import_module
-EOF
+]=])
 
-echo "Done."
+file(WRITE "${DEST_DIR}/__init__.py" "${INIT_PY_CONTENT}")
+
+message(STATUS "Vendoring complete")

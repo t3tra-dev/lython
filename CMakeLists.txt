@@ -10,8 +10,20 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-set(MLIR_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llvm-project/build/lib/cmake/mlir")
-set(LLVM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llvm-project/build/lib/cmake/llvm")
+find_package(Python3 3.12 EXACT REQUIRED COMPONENTS Interpreter Development)
+message(STATUS "Python3_EXECUTABLE: ${Python3_EXECUTABLE}")
+message(STATUS "Python3_VERSION: ${Python3_VERSION}")
+
+if(NOT Python3_VERSION_MAJOR EQUAL 3 OR NOT Python3_VERSION_MINOR EQUAL 12)
+    message(FATAL_ERROR "Python 3.12 is required, but found ${Python3_VERSION}")
+endif()
+
+set(LLVM_PROJECT_BUILD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llvm-project/build")
+set(MLIR_DIR "${LLVM_PROJECT_BUILD_DIR}/lib/cmake/mlir")
+set(LLVM_DIR "${LLVM_PROJECT_BUILD_DIR}/lib/cmake/llvm")
+
+set(LLVM_TABLEGEN_EXE "${LLVM_PROJECT_BUILD_DIR}/bin/llvm-tblgen" CACHE FILEPATH "llvm-tblgen executable")
+set(MLIR_TABLEGEN_EXE "${LLVM_PROJECT_BUILD_DIR}/bin/mlir-tblgen" CACHE FILEPATH "mlir-tblgen executable")
 
 find_package(MLIR REQUIRED CONFIG)
 find_package(LLVM REQUIRED CONFIG)

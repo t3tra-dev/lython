@@ -17,32 +17,42 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
-      - name: "Set up Python"
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang
-          sudo apt-get install -y libgc-dev cmake ninja-build pybind11-dev
-          sudo bash -c "$(wget -O - https://apt.llvm.org/llvm.sh)"
+          sudo apt-get install -y clang cmake ninja-build pybind11-dev
           wget https://github.com/sharkdp/hyperfine/releases/download/v1.20.0/hyperfine_1.20.0_amd64.deb
           sudo dpkg -i hyperfine_1.20.0_amd64.deb
-          sudo curl -LsSf https://astral.sh/uv/install.sh | sh
           uv sync
-          uv pip install -U nanobind
-          uv pip install -U pybind11
+          uv pip install nanobind pybind11
 
-      - name: Build
+      - name: Cache LLVM/MLIR build
+        id: cache-llvm
+        uses: actions/cache@v4
+        with:
+          path: third_party/llvm-project/build
+          key: llvm-mlir-${{ runner.os }}-${{ hashFiles('third_party/llvm-project/llvm/CMakeLists.txt') }}
+
+      - name: Build LLVM/MLIR
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
         run: |
-          ./build_mlir.sh
-          ./vendor_mlir.sh
-          ./build.sh
-          cmake --build build
+          uv run cmake -B third_party/llvm-project/build -S third_party
+          uv run cmake --build third_party/llvm-project/build
 
-      - name: Hello
+      - name: Build Lython
+        run: |
+          uv run cmake -B build -S .
+          uv run cmake --build build
+
+      - name: Test
         run: |
           ./build/bin/lyc jit examples/hello.py
           ./build/bin/lyc jit examples/oop.py

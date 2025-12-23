@@ -50,7 +50,11 @@ install(TARGETS lyc
 )
 
 target_compile_options(lyc PRIVATE -frtti)
-target_link_options(lyc PRIVATE "-Wl,-no_warn_duplicate_libraries")
+if(APPLE)
+    target_link_options(lyc PRIVATE "-Wl,-no_warn_duplicate_libraries")
+elseif(UNIX)
+    target_link_options(lyc PRIVATE "-Wl,--no_warn_duplicate_libraries")
+endif()
 
 # ビルド成果物の出力先を build/bin に統一
 set_target_properties(lyc PROPERTIES

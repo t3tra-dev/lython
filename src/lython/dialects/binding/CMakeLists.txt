@@ -1,5 +1,7 @@
-set(PYBIND11_FINDPYTHON ON)
+set(PYBIND11_FINDPYTHON OFF)
 find_package(pybind11 CONFIG REQUIRED)
+
+message(STATUS "Building PyDialectInitializer for Python ${Python3_VERSION}")
 
 pybind11_add_module(PyDialectInitializer MODULE
   PyDialectPythonBindings.cpp
