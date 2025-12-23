@@ -17,6 +17,9 @@ set_target_properties(PyDialectInitializer
 target_link_libraries(PyDialectInitializer
   PRIVATE
     PyDialect
+    MLIRIR
+    MLIRSupport
+    MLIRFuncDialect
 )
 
 target_include_directories(PyDialectInitializer

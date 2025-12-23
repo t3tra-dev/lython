@@ -19,7 +19,32 @@ execute_process(
     RESULT_VARIABLE NANOBIND_RESULT
     ERROR_QUIET
 )
-if(NOT NANOBIND_RESULT EQUAL 0)
+execute_process(
+    COMMAND ${Python3_EXECUTABLE} -c "import nanobind; print(nanobind.include_dir(), end='')"
+    OUTPUT_VARIABLE NANOBIND_INCLUDE_DIR
+    RESULT_VARIABLE NANOBIND_INCLUDE_RESULT
+    ERROR_QUIET
+)
+
+if(NOT NANOBIND_RESULT EQUAL 0 OR NOT NANOBIND_INCLUDE_RESULT EQUAL 0)
+    execute_process(
+        COMMAND brew --prefix nanobind
+        OUTPUT_VARIABLE NANOBIND_BREW_PREFIX
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE NANOBIND_BREW_RESULT
+        ERROR_QUIET
+    )
+    if(NANOBIND_BREW_RESULT EQUAL 0 AND EXISTS "${NANOBIND_BREW_PREFIX}")
+        if(NOT NANOBIND_CMAKE_DIR OR NOT EXISTS "${NANOBIND_CMAKE_DIR}")
+            set(NANOBIND_CMAKE_DIR "${NANOBIND_BREW_PREFIX}/share/nanobind/cmake")
+        endif()
+        if(NOT NANOBIND_INCLUDE_DIR OR NOT EXISTS "${NANOBIND_INCLUDE_DIR}")
+            set(NANOBIND_INCLUDE_DIR "${NANOBIND_BREW_PREFIX}/include")
+        endif()
+    endif()
+endif()
+
+if(NOT NANOBIND_CMAKE_DIR OR NOT EXISTS "${NANOBIND_CMAKE_DIR}")
     find_path(NANOBIND_CMAKE_DIR
         NAMES nanobind-config.cmake
         PATHS
@@ -31,14 +56,7 @@ if(NOT NANOBIND_RESULT EQUAL 0)
             /usr/lib/cmake/nanobind
     )
 endif()
-
-execute_process(
-    COMMAND ${Python3_EXECUTABLE} -c "import nanobind; print(nanobind.include_dir(), end='')"
-    OUTPUT_VARIABLE NANOBIND_INCLUDE_DIR
-    RESULT_VARIABLE NANOBIND_INCLUDE_RESULT
-    ERROR_QUIET
-)
-if(NOT NANOBIND_INCLUDE_RESULT EQUAL 0)
+if(NOT NANOBIND_INCLUDE_DIR OR NOT EXISTS "${NANOBIND_INCLUDE_DIR}")
     find_path(NANOBIND_INCLUDE_DIR
         NAMES nanobind/nanobind.h
         PATHS
@@ -66,7 +84,22 @@ execute_process(
     RESULT_VARIABLE PYBIND11_RESULT
     ERROR_QUIET
 )
+
 if(NOT PYBIND11_RESULT EQUAL 0)
+    execute_process(
+        COMMAND brew --prefix pybind11
+        OUTPUT_VARIABLE PYBIND11_BREW_PREFIX
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE PYBIND11_BREW_RESULT
+        ERROR_QUIET
+    )
+    if(PYBIND11_BREW_RESULT EQUAL 0 AND EXISTS "${PYBIND11_BREW_PREFIX}")
+        set(PYBIND11_DIR "${PYBIND11_BREW_PREFIX}/share/cmake/pybind11")
+    endif()
+endif()
+
+# それでも見つからない場合、システムパスを検索
+if(NOT PYBIND11_DIR OR NOT EXISTS "${PYBIND11_DIR}")
     find_path(PYBIND11_DIR
         NAMES pybind11Config.cmake
         PATHS
@@ -78,6 +111,7 @@ if(NOT PYBIND11_RESULT EQUAL 0)
             /usr/lib/cmake/pybind11
     )
 endif()
+
 if(PYBIND11_DIR)
     message(STATUS "pybind11 dir: ${PYBIND11_DIR}")
 else()
