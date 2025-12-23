@@ -39,13 +39,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: third_party/llvm-project/build
-          key: llvm-mlir-v2-${{ runner.os }}-${{ hashFiles('third_party/CMakeLists.txt', 'third_party/llvm-project/llvm/CMakeLists.txt') }}
+          key: llvm-mlir-${{ runner.os }}-${{ hashFiles('third_party/CMakeLists.txt', 'third_party/llvm-project/llvm/CMakeLists.txt') }}
 
       - name: Build LLVM/MLIR
         if: steps.cache-llvm.outputs.cache-hit != 'true'
         run: |
-          uv run cmake -B third_party/llvm-project/build -S third_party
-          uv run cmake --build third_party/llvm-project/build
+          cmake -B third_party/build -S third_party
+          cmake --build third_party/build
 
       - name: Build Lython
         run: |

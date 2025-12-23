@@ -28,8 +28,8 @@ cd lython
 uv sync
 
 # LLVM/MLIR (初回のみ、時間がかかります)
-uv run cmake -B third_party/llvm-project/build -S third_party
-uv run cmake --build third_party/llvm-project/build
+uv run cmake -B third_party/build -S third_party
+uv run cmake --build third_party/build
 
 # Lython 本体
 uv run cmake -B build -S .
