@@ -144,6 +144,7 @@ if __name__ == "__main__":
       add("LyUnicode_FromUTF8", &LyUnicode_FromUTF8);
       add("LyTuple_New", &LyTuple_New);
       add("LyTuple_SetItem", &LyTuple_SetItem);
+      add("Ly_GetEmptyTuple", &Ly_GetEmptyTuple);
       add("LyDict_New", &LyDict_New);
       add("LyDict_Insert", &LyDict_Insert);
       add("Ly_GetNone", &Ly_GetNone);
