@@ -147,11 +147,13 @@ if __name__ == "__main__":
       add("Ly_GetEmptyTuple", &Ly_GetEmptyTuple);
       add("LyDict_New", &LyDict_New);
       add("LyDict_Insert", &LyDict_Insert);
+      add("LyDict_GetItem", &LyDict_GetItem);
       add("Ly_GetNone", &Ly_GetNone);
       add("Ly_GetBuiltinPrint", &Ly_GetBuiltinPrint);
       add("Ly_CallVectorcall", &Ly_CallVectorcall);
       add("Ly_Call", &Ly_Call);
       add("LyLong_FromI64", &LyLong_FromI64);
+      add("LyLong_Add", &LyLong_Add);
       add("LyFloat_FromDouble", &LyFloat_FromDouble);
       add("LyNumber_Add", &LyNumber_Add);
       add("LyNumber_Sub", &LyNumber_Sub);

@@ -2,6 +2,7 @@
 
 #include <cstdint>
 
+#include "objects/dict.h"
 #include "objects/float.h"
 #include "objects/function.h"
 #include "objects/long.h"
