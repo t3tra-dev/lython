@@ -154,7 +154,12 @@ if __name__ == "__main__":
       add("Ly_Call", &Ly_Call);
       add("LyLong_FromI64", &LyLong_FromI64);
       add("LyLong_Add", &LyLong_Add);
+      add("LyLong_Sub", &LyLong_Sub);
       add("LyFloat_FromDouble", &LyFloat_FromDouble);
+      add("LyFloat_Add", &LyFloat_Add);
+      add("LyFloat_Sub", &LyFloat_Sub);
+      add("LyBool_FromBool", &LyBool_FromBool);
+      add("LyObject_Repr", &LyObject_Repr);
       add("LyNumber_Add", &LyNumber_Add);
       add("LyNumber_Sub", &LyNumber_Sub);
       add("LyNumber_Le", &LyNumber_Le);
