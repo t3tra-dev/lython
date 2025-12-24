@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+  workflow_dispatch:
+
+jobs:
+  ci:
+    name: CI
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build
+          wget https://github.com/sharkdp/hyperfine/releases/download/v1.20.0/hyperfine_1.20.0_amd64.deb
+          sudo dpkg -i hyperfine_1.20.0_amd64.deb
+          pip install nanobind pybind11
+          uv sync
+
+      - name: Cache LLVM/MLIR build
+        id: cache-llvm
+        uses: actions/cache@v4
+        with:
+          path: third_party/llvm-project/build
+          key: llvm-mlir-${{ runner.os }}-${{ hashFiles('third_party/CMakeLists.txt', 'third_party/llvm-project/llvm/CMakeLists.txt') }}
+
+      - name: Build LLVM/MLIR
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        run: |
+          cmake -B third_party/build -S third_party
+          cmake --build third_party/build
+
+      - name: Vendor MLIR Python modules
+        run: |
+          cmake \
+            -DSRC_DIR=third_party/llvm-project/build/tools/mlir/python_packages/mlir_core/mlir \
+            -DDEST_DIR=src/lython/mlir \
+            -P third_party/cmake/vendor_mlir.cmake
+
+      - name: Build Lython
+        run: |
+          export pybind11_DIR=$(python -c "import pybind11; print(pybind11.get_cmake_dir())")
+          uv run cmake -B build -S . -Dpybind11_DIR=$pybind11_DIR
+          uv run cmake --build build
+
+      - name: Test
+        run: |
+          ./build/bin/lyc jit examples/hello.py
+          ./build/bin/lyc jit examples/oop.py
+
+      - name: Benchmarks
+        run: |
+          ./build/bin/lyc examples/fib.py -o fib_aot
+          ./build/bin/lyc examples/fib_prim.py -o fib_prim_aot
+          hyperfine -w 1 -r 5 "python3 examples/fib.py" "./build/bin/lyc jit examples/fib.py" "./fib_aot" "./fib_prim_aot"

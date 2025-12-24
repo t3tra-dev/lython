@@ -9,17 +9,38 @@
 
 ---
 
-セットアップ
+## セットアップ
+
+### 必要なもの
+
+- Python 3.12
+- CMake 3.20+
+- Ninja
+- C++17 対応コンパイラ
+- uv (Python パッケージマネージャ)
+- nanobind, pybind11
+
+### ビルド手順
 
 ```bash
 git clone --recurse-submodules https://github.com/t3tra-dev/lython.git
 cd lython
 uv sync
-source ./.venv/bin/activate
-./build_mlir.sh
-./build.sh
-./vendor_mlir.sh
-uv build
+
+# LLVM/MLIR (初回のみ、時間がかかります)
+uv run cmake -B third_party/build -S third_party
+uv run cmake --build third_party/build
+
+# Lython 本体
+uv run cmake -B build -S .
+uv run cmake --build build
+```
+
+### 実行
+
+```bash
+./build/bin/lyc jit examples/hello.py
+./build/bin/lyc jit examples/fib.py
 ```
 
 ---
