@@ -136,7 +136,9 @@ class StmtVisitor(BaseVisitor):
             ir.StringAttr.get(arg.arg, self.ctx) for arg in node.args.args
         ]
         arg_names_attr = (
-            ir.ArrayAttr.get(arg_name_attrs, context=self.ctx)  # pyright: ignore[reportUnknownMemberType]
+            ir.ArrayAttr.get(
+                arg_name_attrs, context=self.ctx
+            )  # pyright: ignore[reportUnknownMemberType]
             if arg_name_attrs
             else None
         )
@@ -403,7 +405,9 @@ class StmtVisitor(BaseVisitor):
             ir.StringAttr.get(arg.arg, self.ctx) for arg in node.args.args
         ]
         arg_names_attr = (
-            ir.ArrayAttr.get(arg_name_attrs, context=self.ctx)  # pyright: ignore[reportUnknownMemberType]
+            ir.ArrayAttr.get(
+                arg_name_attrs, context=self.ctx
+            )  # pyright: ignore[reportUnknownMemberType]
             if arg_name_attrs
             else None
         )
@@ -692,9 +696,15 @@ class StmtVisitor(BaseVisitor):
 
         assert self.current_block is not None
         parent_region = self.current_block.region
-        true_block = parent_region.blocks.append()  # pyright: ignore[reportUnknownMemberType]
-        false_block = parent_region.blocks.append()  # pyright: ignore[reportUnknownMemberType]
-        merge_block = parent_region.blocks.append()  # pyright: ignore[reportUnknownMemberType]
+        true_block = (
+            parent_region.blocks.append()
+        )  # pyright: ignore[reportUnknownMemberType]
+        false_block = (
+            parent_region.blocks.append()
+        )  # pyright: ignore[reportUnknownMemberType]
+        merge_block = (
+            parent_region.blocks.append()
+        )  # pyright: ignore[reportUnknownMemberType]
         with self._loc(node), self.insertion_point():
             cf_ops.CondBranchOp(cond, [], [], true_block, false_block)
 
