@@ -646,15 +646,11 @@ LyObject *LyNumber_Add(LyObject *lhs, LyObject *rhs) {
     return reinterpret_cast<LyObject *>(result);
   }
 
-  // float + any or any + float
-  if (lhs->ob_type == floatType || rhs->ob_type == floatType) {
-    double left = (lhs->ob_type == floatType)
-                      ? reinterpret_cast<LyFloatObject *>(lhs)->value
-                      : LyLong_AsDouble(reinterpret_cast<LyLongObject *>(lhs));
-    double right = (rhs->ob_type == floatType)
-                       ? reinterpret_cast<LyFloatObject *>(rhs)->value
-                       : LyLong_AsDouble(reinterpret_cast<LyLongObject *>(rhs));
-    return reinterpret_cast<LyObject *>(LyFloat_FromDouble(left + right));
+  // float + float
+  if (lhs->ob_type == floatType && rhs->ob_type == floatType) {
+    auto *result = LyFloat_Add(reinterpret_cast<LyFloatObject *>(lhs),
+                               reinterpret_cast<LyFloatObject *>(rhs));
+    return reinterpret_cast<LyObject *>(result);
   }
 
   return nullptr;
@@ -675,15 +671,36 @@ LyObject *LyNumber_Sub(LyObject *lhs, LyObject *rhs) {
     return reinterpret_cast<LyObject *>(result);
   }
 
-  // float - any or any - float
-  if (lhs->ob_type == floatType || rhs->ob_type == floatType) {
-    double left = (lhs->ob_type == floatType)
-                      ? reinterpret_cast<LyFloatObject *>(lhs)->value
-                      : LyLong_AsDouble(reinterpret_cast<LyLongObject *>(lhs));
-    double right = (rhs->ob_type == floatType)
-                       ? reinterpret_cast<LyFloatObject *>(rhs)->value
-                       : LyLong_AsDouble(reinterpret_cast<LyLongObject *>(rhs));
-    return reinterpret_cast<LyObject *>(LyFloat_FromDouble(left - right));
+  // float - float
+  if (lhs->ob_type == floatType && rhs->ob_type == floatType) {
+    auto *result = LyFloat_Sub(reinterpret_cast<LyFloatObject *>(lhs),
+                               reinterpret_cast<LyFloatObject *>(rhs));
+    return reinterpret_cast<LyObject *>(result);
+  }
+
+  return nullptr;
+}
+
+LyObject *LyNumber_Lt(LyObject *lhs, LyObject *rhs) {
+  if (!lhs || !rhs) {
+    return nullptr;
+  }
+
+  auto *longType = &LyLong_Type();
+  auto *floatType = &LyFloat_Type();
+
+  // int < int
+  if (lhs->ob_type == longType && rhs->ob_type == longType) {
+    int cmp = LyLong_Compare(reinterpret_cast<LyLongObject *>(lhs),
+                             reinterpret_cast<LyLongObject *>(rhs));
+    return reinterpret_cast<LyObject *>(LyBool_FromBool(cmp < 0));
+  }
+
+  // float < float
+  if (lhs->ob_type == floatType && rhs->ob_type == floatType) {
+    double left = reinterpret_cast<LyFloatObject *>(lhs)->value;
+    double right = reinterpret_cast<LyFloatObject *>(rhs)->value;
+    return reinterpret_cast<LyObject *>(LyBool_FromBool(left < right));
   }
 
   return nullptr;
@@ -704,15 +721,111 @@ LyObject *LyNumber_Le(LyObject *lhs, LyObject *rhs) {
     return reinterpret_cast<LyObject *>(LyBool_FromBool(cmp <= 0));
   }
 
-  // float <= any or any <= float
-  if (lhs->ob_type == floatType || rhs->ob_type == floatType) {
-    double left = (lhs->ob_type == floatType)
-                      ? reinterpret_cast<LyFloatObject *>(lhs)->value
-                      : LyLong_AsDouble(reinterpret_cast<LyLongObject *>(lhs));
-    double right = (rhs->ob_type == floatType)
-                       ? reinterpret_cast<LyFloatObject *>(rhs)->value
-                       : LyLong_AsDouble(reinterpret_cast<LyLongObject *>(rhs));
+  // float <= float
+  if (lhs->ob_type == floatType && rhs->ob_type == floatType) {
+    double left = reinterpret_cast<LyFloatObject *>(lhs)->value;
+    double right = reinterpret_cast<LyFloatObject *>(rhs)->value;
     return reinterpret_cast<LyObject *>(LyBool_FromBool(left <= right));
+  }
+
+  return nullptr;
+}
+
+LyObject *LyNumber_Gt(LyObject *lhs, LyObject *rhs) {
+  if (!lhs || !rhs) {
+    return nullptr;
+  }
+
+  auto *longType = &LyLong_Type();
+  auto *floatType = &LyFloat_Type();
+
+  // int > int
+  if (lhs->ob_type == longType && rhs->ob_type == longType) {
+    int cmp = LyLong_Compare(reinterpret_cast<LyLongObject *>(lhs),
+                             reinterpret_cast<LyLongObject *>(rhs));
+    return reinterpret_cast<LyObject *>(LyBool_FromBool(cmp > 0));
+  }
+
+  // float > float
+  if (lhs->ob_type == floatType && rhs->ob_type == floatType) {
+    double left = reinterpret_cast<LyFloatObject *>(lhs)->value;
+    double right = reinterpret_cast<LyFloatObject *>(rhs)->value;
+    return reinterpret_cast<LyObject *>(LyBool_FromBool(left > right));
+  }
+
+  return nullptr;
+}
+
+LyObject *LyNumber_Ge(LyObject *lhs, LyObject *rhs) {
+  if (!lhs || !rhs) {
+    return nullptr;
+  }
+
+  auto *longType = &LyLong_Type();
+  auto *floatType = &LyFloat_Type();
+
+  // int >= int
+  if (lhs->ob_type == longType && rhs->ob_type == longType) {
+    int cmp = LyLong_Compare(reinterpret_cast<LyLongObject *>(lhs),
+                             reinterpret_cast<LyLongObject *>(rhs));
+    return reinterpret_cast<LyObject *>(LyBool_FromBool(cmp >= 0));
+  }
+
+  // float >= float
+  if (lhs->ob_type == floatType && rhs->ob_type == floatType) {
+    double left = reinterpret_cast<LyFloatObject *>(lhs)->value;
+    double right = reinterpret_cast<LyFloatObject *>(rhs)->value;
+    return reinterpret_cast<LyObject *>(LyBool_FromBool(left >= right));
+  }
+
+  return nullptr;
+}
+
+LyObject *LyNumber_Eq(LyObject *lhs, LyObject *rhs) {
+  if (!lhs || !rhs) {
+    return nullptr;
+  }
+
+  auto *longType = &LyLong_Type();
+  auto *floatType = &LyFloat_Type();
+
+  // int == int
+  if (lhs->ob_type == longType && rhs->ob_type == longType) {
+    int cmp = LyLong_Compare(reinterpret_cast<LyLongObject *>(lhs),
+                             reinterpret_cast<LyLongObject *>(rhs));
+    return reinterpret_cast<LyObject *>(LyBool_FromBool(cmp == 0));
+  }
+
+  // float == float
+  if (lhs->ob_type == floatType && rhs->ob_type == floatType) {
+    double left = reinterpret_cast<LyFloatObject *>(lhs)->value;
+    double right = reinterpret_cast<LyFloatObject *>(rhs)->value;
+    return reinterpret_cast<LyObject *>(LyBool_FromBool(left == right));
+  }
+
+  return nullptr;
+}
+
+LyObject *LyNumber_Ne(LyObject *lhs, LyObject *rhs) {
+  if (!lhs || !rhs) {
+    return nullptr;
+  }
+
+  auto *longType = &LyLong_Type();
+  auto *floatType = &LyFloat_Type();
+
+  // int != int
+  if (lhs->ob_type == longType && rhs->ob_type == longType) {
+    int cmp = LyLong_Compare(reinterpret_cast<LyLongObject *>(lhs),
+                             reinterpret_cast<LyLongObject *>(rhs));
+    return reinterpret_cast<LyObject *>(LyBool_FromBool(cmp != 0));
+  }
+
+  // float != float
+  if (lhs->ob_type == floatType && rhs->ob_type == floatType) {
+    double left = reinterpret_cast<LyFloatObject *>(lhs)->value;
+    double right = reinterpret_cast<LyFloatObject *>(rhs)->value;
+    return reinterpret_cast<LyObject *>(LyBool_FromBool(left != right));
   }
 
   return nullptr;

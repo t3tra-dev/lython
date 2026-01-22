@@ -276,8 +276,9 @@ struct RuntimeLoweringPass
         target.addIllegalOp<
             StrConstantOp, IntConstantOp, FloatConstantOp, TupleEmptyOp,
             TupleCreateOp, DictEmptyOp, DictInsertOp, NoneOp, FuncObjectOp,
-            NumAddOp, NumSubOp, NumLeOp, CastToPrimOp, CastIdentityOp, UpcastOp,
-            IncRefOp, DecRefOp, ClassNewOp, AttrGetOp, AttrSetOp, ClassOp>();
+            NumAddOp, NumSubOp, NumLtOp, NumLeOp, NumGtOp, NumGeOp, NumEqOp,
+            NumNeOp, CastToPrimOp, CastIdentityOp, UpcastOp, IncRefOp,
+            DecRefOp, ClassNewOp, AttrGetOp, AttrSetOp, ClassOp>();
 
         ScopedDiagnosticHandler diagHandler(ctx, materializationFilter);
         auto result =

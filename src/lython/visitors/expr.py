@@ -305,12 +305,24 @@ class ExprVisitor(BaseVisitor):
         if self._in_native_func:
             return self._handle_primitive_compare(op, lhs, rhs, self._loc(node))
 
-        # In object mode, use py.num.le
-        if not isinstance(op, ast.LtE):
-            raise NotImplementedError("Only <= comparison supported in object mode")
+        # In object mode, use py.num.* comparisons
         bool_type = self.get_py_type("!py.bool")
         with self._loc(node), self.insertion_point():
-            return py_ops.NumLeOp(bool_type, lhs, rhs).result
+            if isinstance(op, ast.LtE):
+                return py_ops.NumLeOp(bool_type, lhs, rhs).result
+            if isinstance(op, ast.Gt):
+                return py_ops.NumGtOp(bool_type, lhs, rhs).result
+            if isinstance(op, ast.Lt):
+                return py_ops.NumLtOp(bool_type, lhs, rhs).result
+            if isinstance(op, ast.GtE):
+                return py_ops.NumGeOp(bool_type, lhs, rhs).result
+            if isinstance(op, ast.Eq):
+                return py_ops.NumEqOp(bool_type, lhs, rhs).result
+            if isinstance(op, ast.NotEq):
+                return py_ops.NumNeOp(bool_type, lhs, rhs).result
+        raise NotImplementedError(
+            "Only <, <=, >, >=, ==, != comparisons supported in object mode"
+        )
 
     def _handle_primitive_compare(
         self, op: ast.cmpop, lhs: ir.Value, rhs: ir.Value, loc: ir.Location

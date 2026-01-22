@@ -529,6 +529,91 @@ def Py_NumLeOp : Py_Op<"num.le", [Pure]> {
   let hasVerifier = 1;
 }
 
+def Py_NumLtOp : Py_Op<"num.lt", [Pure]> {
+  let summary = "Python numeric < comparison";
+  let description = [{
+    Compares two numeric values and returns a `!py.bool` object.
+  }];
+
+  let arguments = (ins
+    AnyType:$lhs,
+    AnyType:$rhs
+  );
+
+  let results = (outs Py_BoolType:$result);
+
+  let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict `->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_NumGtOp : Py_Op<"num.gt", [Pure]> {
+  let summary = "Python numeric > comparison";
+  let description = [{
+    Compares two numeric values and returns a `!py.bool` object.
+  }];
+
+  let arguments = (ins
+    AnyType:$lhs,
+    AnyType:$rhs
+  );
+
+  let results = (outs Py_BoolType:$result);
+
+  let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict `->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_NumGeOp : Py_Op<"num.ge", [Pure]> {
+  let summary = "Python numeric >= comparison";
+  let description = [{
+    Compares two numeric values and returns a `!py.bool` object.
+  }];
+
+  let arguments = (ins
+    AnyType:$lhs,
+    AnyType:$rhs
+  );
+
+  let results = (outs Py_BoolType:$result);
+
+  let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict `->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_NumEqOp : Py_Op<"num.eq", [Pure]> {
+  let summary = "Python numeric == comparison";
+  let description = [{
+    Compares two numeric values and returns a `!py.bool` object.
+  }];
+
+  let arguments = (ins
+    AnyType:$lhs,
+    AnyType:$rhs
+  );
+
+  let results = (outs Py_BoolType:$result);
+
+  let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict `->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_NumNeOp : Py_Op<"num.ne", [Pure]> {
+  let summary = "Python numeric != comparison";
+  let description = [{
+    Compares two numeric values and returns a `!py.bool` object.
+  }];
+
+  let arguments = (ins
+    AnyType:$lhs,
+    AnyType:$rhs
+  );
+
+  let results = (outs Py_BoolType:$result);
+
+  let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict `->` type($result)";
+  let hasVerifier = 1;
+}
+
 //===----------------------------------------------------------------------===//
 // Class instantiation
 //===----------------------------------------------------------------------===//
