@@ -135,6 +135,17 @@ bool cleanupDeadTuples(ModuleOp module) {
   return !toErase.empty();
 }
 
+/// Remove unused TupleEmptyOps.
+void removeUnusedTupleEmpties(ModuleOp module) {
+  SmallVector<TupleEmptyOp> toErase;
+  module.walk([&](TupleEmptyOp op) {
+    if (op.getResult().use_empty())
+      toErase.push_back(op);
+  });
+  for (auto op : toErase)
+    op->erase();
+}
+
 /// Hoist integer constants to entry block and perform CSE.
 void hoistIntConstants(ModuleOp module) {
   module.walk([&](func::FuncOp func) {
@@ -391,21 +402,63 @@ void eliminateBoolBoxingUnboxing(ModuleOp module) {
       }
     }
 
-    // Only optimize if the pattern matches exactly:
+    // Only optimize if the pattern matches:
     // - One LyBool_AsBool call
-    // - One Ly_DecRef call
+    // - Optional Ly_DecRef call (bool singletons are immortal)
     // - No other users
-    if (!asBoolCall || !decRefCall || hasOtherUsers)
+    if (!asBoolCall || hasOtherUsers)
       continue;
 
     // Replace uses of the AsBool result with the original i1 value
     asBoolCall.getResult().replaceAllUsesWith(i1Value);
 
     // Erase the operations (in reverse order of dependencies)
-    decRefCall->erase();
+    if (decRefCall)
+      decRefCall->erase();
     asBoolCall->erase();
     fromBoolCall->erase();
   }
+}
+
+/// CSE for LyLong_FromI64 for small integers (-5 to 256).
+/// Small integers are immortal, so sharing is safe.
+void cseSmallIntFromI64(ModuleOp module) {
+  module.walk([&](func::FuncOp func) {
+    if (func.isExternal())
+      return;
+
+    llvm::DenseMap<int64_t, LLVM::CallOp> cache;
+    SmallVector<LLVM::CallOp> toErase;
+
+    func.walk([&](LLVM::CallOp callOp) {
+      auto callee = callOp.getCallee();
+      if (!callee || *callee != "LyLong_FromI64")
+        return;
+      if (callOp.getNumOperands() != 1)
+        return;
+      auto constOp =
+          callOp.getOperand(0).getDefiningOp<LLVM::ConstantOp>();
+      if (!constOp)
+        return;
+      auto intAttr = llvm::dyn_cast<IntegerAttr>(constOp.getValue());
+      if (!intAttr)
+        return;
+      int64_t value = intAttr.getInt();
+      if (value < -5 || value > 256)
+        return;
+
+      auto it = cache.find(value);
+      if (it != cache.end()) {
+        callOp.getResult().replaceAllUsesWith(it->second.getResult());
+        toErase.push_back(callOp);
+      } else {
+        cache[value] = callOp;
+      }
+    });
+
+    for (auto op : toErase)
+      op->erase();
+  });
 }
 
 /// CSE for LLVM constants within each function.
@@ -495,6 +548,7 @@ std::unique_ptr<OperationPass<ModuleOp>> createPyOptimizationPass() {
 
 void runPreLoweringOptimizations(ModuleOp module) {
   cleanupDeadTuples(module);
+  removeUnusedTupleEmpties(module);
   hoistIntConstants(module);
   removeSmallIntDecrefs(module);
 }
@@ -504,6 +558,7 @@ void runPostLoweringOptimizations(ModuleOp module) {
   replaceEmptyTupleNew(module);
   cseSingletonGetters(module);
   eliminateBoolBoxingUnboxing(module);
+  cseSmallIntFromI64(module);
   cseConstants(module);
   eliminateDeadCode(module);
 }

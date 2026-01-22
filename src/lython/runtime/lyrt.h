@@ -28,7 +28,12 @@ LyLongObject *LyLong_FromI64(std::int64_t value);
 LyFloatObject *LyFloat_FromDouble(double value);
 LyObject *LyNumber_Add(LyObject *lhs, LyObject *rhs);
 LyObject *LyNumber_Sub(LyObject *lhs, LyObject *rhs);
+LyObject *LyNumber_Lt(LyObject *lhs, LyObject *rhs);
 LyObject *LyNumber_Le(LyObject *lhs, LyObject *rhs);
+LyObject *LyNumber_Gt(LyObject *lhs, LyObject *rhs);
+LyObject *LyNumber_Ge(LyObject *lhs, LyObject *rhs);
+LyObject *LyNumber_Eq(LyObject *lhs, LyObject *rhs);
+LyObject *LyNumber_Ne(LyObject *lhs, LyObject *rhs);
 bool LyBool_AsBool(LyObject *object);
 
 LyObject *Ly_CallVectorcall(LyObject *callable, LyTupleObject *posargs,

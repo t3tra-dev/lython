@@ -132,7 +132,12 @@ int LyLong_Compare(const LyLongObject *lhs, const LyLongObject *rhs);
 double LyLong_AsDouble(const LyLongObject *value);
 LyObject *LyNumber_Add(LyObject *lhs, LyObject *rhs);
 LyObject *LyNumber_Sub(LyObject *lhs, LyObject *rhs);
+LyObject *LyNumber_Lt(LyObject *lhs, LyObject *rhs);
 LyObject *LyNumber_Le(LyObject *lhs, LyObject *rhs);
+LyObject *LyNumber_Gt(LyObject *lhs, LyObject *rhs);
+LyObject *LyNumber_Ge(LyObject *lhs, LyObject *rhs);
+LyObject *LyNumber_Eq(LyObject *lhs, LyObject *rhs);
+LyObject *LyNumber_Ne(LyObject *lhs, LyObject *rhs);
 // Exported wrappers for JIT/AOT linking (also available as inline in header)
 LyLongObject *LyLong_Add(const LyLongObject *a, const LyLongObject *b);
 LyLongObject *LyLong_Sub(const LyLongObject *a, const LyLongObject *b);

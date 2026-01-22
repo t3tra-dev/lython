@@ -136,9 +136,9 @@ class StmtVisitor(BaseVisitor):
             ir.StringAttr.get(arg.arg, self.ctx) for arg in node.args.args
         ]
         arg_names_attr = (
-            ir.ArrayAttr.get(
+            ir.ArrayAttr.get(  # pyright: ignore[reportUnknownMemberType]
                 arg_name_attrs, context=self.ctx
-            )  # pyright: ignore[reportUnknownMemberType]
+            )
             if arg_name_attrs
             else None
         )
@@ -405,9 +405,9 @@ class StmtVisitor(BaseVisitor):
             ir.StringAttr.get(arg.arg, self.ctx) for arg in node.args.args
         ]
         arg_names_attr = (
-            ir.ArrayAttr.get(
+            ir.ArrayAttr.get(  # pyright: ignore[reportUnknownMemberType]
                 arg_name_attrs, context=self.ctx
-            )  # pyright: ignore[reportUnknownMemberType]
+            )
             if arg_name_attrs
             else None
         )
@@ -697,29 +697,39 @@ class StmtVisitor(BaseVisitor):
         assert self.current_block is not None
         parent_region = self.current_block.region
         true_block = (
-            parent_region.blocks.append()
-        )  # pyright: ignore[reportUnknownMemberType]
+            parent_region.blocks.append()  # pyright: ignore[reportUnknownMemberType]
+        )
         false_block = (
-            parent_region.blocks.append()
-        )  # pyright: ignore[reportUnknownMemberType]
-        merge_block = (
-            parent_region.blocks.append()
-        )  # pyright: ignore[reportUnknownMemberType]
+            parent_region.blocks.append()  # pyright: ignore[reportUnknownMemberType]
+        )
         with self._loc(node), self.insertion_point():
             cf_ops.CondBranchOp(cond, [], [], true_block, false_block)
 
-        def handle_branch(block: ir.Block, statements: list[ast.stmt]) -> None:
+        def handle_branch(block: ir.Block, statements: list[ast.stmt]) -> bool:
             self._set_insertion_block(block)
             self.push_scope()
             for stmt in statements:
                 self.visit(stmt)
-            if not self._block_terminated(block):
-                with self._loc(node), ir.InsertionPoint(block):
-                    cf_ops.BranchOp([], merge_block)
+            terminated = self._block_terminated(block)
             self.pop_scope()
+            return terminated
 
-        handle_branch(true_block, node.body)
-        handle_branch(false_block, node.orelse or [])
+        true_terminated = handle_branch(true_block, node.body)
+        false_terminated = handle_branch(false_block, node.orelse or [])
+
+        if true_terminated and false_terminated:
+            self._set_insertion_block(None)
+            return
+
+        merge_block = (
+            parent_region.blocks.append()  # pyright: ignore[reportUnknownMemberType]
+        )
+        if not true_terminated:
+            with self._loc(node), ir.InsertionPoint(true_block):
+                cf_ops.BranchOp([], merge_block)
+        if not false_terminated:
+            with self._loc(node), ir.InsertionPoint(false_block):
+                cf_ops.BranchOp([], merge_block)
 
         self._set_insertion_block(merge_block)
 

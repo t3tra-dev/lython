@@ -29,7 +29,12 @@ struct RuntimeSymbols {
   // Generic numeric operations (with type dispatch)
   static constexpr llvm::StringLiteral kNumberAdd{"LyNumber_Add"};
   static constexpr llvm::StringLiteral kNumberSub{"LyNumber_Sub"};
+  static constexpr llvm::StringLiteral kNumberLt{"LyNumber_Lt"};
   static constexpr llvm::StringLiteral kNumberLe{"LyNumber_Le"};
+  static constexpr llvm::StringLiteral kNumberGt{"LyNumber_Gt"};
+  static constexpr llvm::StringLiteral kNumberGe{"LyNumber_Ge"};
+  static constexpr llvm::StringLiteral kNumberEq{"LyNumber_Eq"};
+  static constexpr llvm::StringLiteral kNumberNe{"LyNumber_Ne"};
   // Type-specialized integer operations (inlinable fast paths)
   static constexpr llvm::StringLiteral kLongAdd{"LyLong_Add"};
   static constexpr llvm::StringLiteral kLongSub{"LyLong_Sub"};

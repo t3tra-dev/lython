@@ -268,6 +268,215 @@ struct NumLeLowering : public OpConversionPattern<NumLeOp> {
   }
 };
 
+// Type-specialized lowering for NumLtOp
+struct NumLtLowering : public OpConversionPattern<NumLtOp> {
+  NumLtLowering(PyLLVMTypeConverter &converter, MLIRContext *ctx)
+      : OpConversionPattern<NumLtOp>(converter, ctx) {}
+
+  LogicalResult
+  matchAndRewrite(NumLtOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    ModuleOp module = op->getParentOfType<ModuleOp>();
+    if (!module)
+      return failure();
+    auto *typeConverter =
+        static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
+    RuntimeAPI runtime(module, rewriter, *typeConverter);
+    Type resultType = typeConverter->convertType(op.getResult().getType());
+    if (!resultType)
+      return failure();
+
+    // For int operands, use LyLong_Compare + LyBool_FromBool
+    if (isPyIntType(op.getLhs().getType()) &&
+        isPyIntType(op.getRhs().getType())) {
+      // LyLong_Compare returns int: -1 (less), 0 (equal), 1 (greater)
+      auto cmpCall = runtime.call(op.getLoc(), RuntimeSymbols::kLongCompare,
+                                  rewriter.getI32Type(), adaptor.getOperands());
+      // For <: compare result < 0
+      Value zero = rewriter.create<LLVM::ConstantOp>(
+          op.getLoc(), rewriter.getI32Type(), rewriter.getI32IntegerAttr(0));
+      Value ltZero = rewriter.create<LLVM::ICmpOp>(
+          op.getLoc(), LLVM::ICmpPredicate::slt, cmpCall.getResult(), zero);
+      // Convert i1 to LyBool
+      auto boolCall = runtime.call(op.getLoc(), RuntimeSymbols::kBoolFromBool,
+                                   resultType, ValueRange{ltZero});
+      rewriter.replaceOp(op, boolCall.getResults());
+    } else {
+      auto call = runtime.call(op.getLoc(), RuntimeSymbols::kNumberLt,
+                               resultType, adaptor.getOperands());
+      rewriter.replaceOp(op, call.getResults());
+    }
+    return success();
+  }
+};
+
+// Type-specialized lowering for NumGtOp
+struct NumGtLowering : public OpConversionPattern<NumGtOp> {
+  NumGtLowering(PyLLVMTypeConverter &converter, MLIRContext *ctx)
+      : OpConversionPattern<NumGtOp>(converter, ctx) {}
+
+  LogicalResult
+  matchAndRewrite(NumGtOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    ModuleOp module = op->getParentOfType<ModuleOp>();
+    if (!module)
+      return failure();
+    auto *typeConverter =
+        static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
+    RuntimeAPI runtime(module, rewriter, *typeConverter);
+    Type resultType = typeConverter->convertType(op.getResult().getType());
+    if (!resultType)
+      return failure();
+
+    // For int operands, use LyLong_Compare + LyBool_FromBool
+    if (isPyIntType(op.getLhs().getType()) &&
+        isPyIntType(op.getRhs().getType())) {
+      // LyLong_Compare returns int: -1 (less), 0 (equal), 1 (greater)
+      auto cmpCall = runtime.call(op.getLoc(), RuntimeSymbols::kLongCompare,
+                                  rewriter.getI32Type(), adaptor.getOperands());
+      // For >: compare result > 0
+      Value zero = rewriter.create<LLVM::ConstantOp>(
+          op.getLoc(), rewriter.getI32Type(), rewriter.getI32IntegerAttr(0));
+      Value gtZero = rewriter.create<LLVM::ICmpOp>(
+          op.getLoc(), LLVM::ICmpPredicate::sgt, cmpCall.getResult(), zero);
+      // Convert i1 to LyBool
+      auto boolCall = runtime.call(op.getLoc(), RuntimeSymbols::kBoolFromBool,
+                                   resultType, ValueRange{gtZero});
+      rewriter.replaceOp(op, boolCall.getResults());
+    } else {
+      auto call = runtime.call(op.getLoc(), RuntimeSymbols::kNumberGt,
+                               resultType, adaptor.getOperands());
+      rewriter.replaceOp(op, call.getResults());
+    }
+    return success();
+  }
+};
+
+// Type-specialized lowering for NumGeOp
+struct NumGeLowering : public OpConversionPattern<NumGeOp> {
+  NumGeLowering(PyLLVMTypeConverter &converter, MLIRContext *ctx)
+      : OpConversionPattern<NumGeOp>(converter, ctx) {}
+
+  LogicalResult
+  matchAndRewrite(NumGeOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    ModuleOp module = op->getParentOfType<ModuleOp>();
+    if (!module)
+      return failure();
+    auto *typeConverter =
+        static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
+    RuntimeAPI runtime(module, rewriter, *typeConverter);
+    Type resultType = typeConverter->convertType(op.getResult().getType());
+    if (!resultType)
+      return failure();
+
+    // For int operands, use LyLong_Compare + LyBool_FromBool
+    if (isPyIntType(op.getLhs().getType()) &&
+        isPyIntType(op.getRhs().getType())) {
+      // LyLong_Compare returns int: -1 (less), 0 (equal), 1 (greater)
+      auto cmpCall = runtime.call(op.getLoc(), RuntimeSymbols::kLongCompare,
+                                  rewriter.getI32Type(), adaptor.getOperands());
+      // For >=: compare result >= 0
+      Value zero = rewriter.create<LLVM::ConstantOp>(
+          op.getLoc(), rewriter.getI32Type(), rewriter.getI32IntegerAttr(0));
+      Value geZero = rewriter.create<LLVM::ICmpOp>(
+          op.getLoc(), LLVM::ICmpPredicate::sge, cmpCall.getResult(), zero);
+      // Convert i1 to LyBool
+      auto boolCall = runtime.call(op.getLoc(), RuntimeSymbols::kBoolFromBool,
+                                   resultType, ValueRange{geZero});
+      rewriter.replaceOp(op, boolCall.getResults());
+    } else {
+      auto call = runtime.call(op.getLoc(), RuntimeSymbols::kNumberGe,
+                               resultType, adaptor.getOperands());
+      rewriter.replaceOp(op, call.getResults());
+    }
+    return success();
+  }
+};
+
+// Type-specialized lowering for NumEqOp
+struct NumEqLowering : public OpConversionPattern<NumEqOp> {
+  NumEqLowering(PyLLVMTypeConverter &converter, MLIRContext *ctx)
+      : OpConversionPattern<NumEqOp>(converter, ctx) {}
+
+  LogicalResult
+  matchAndRewrite(NumEqOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    ModuleOp module = op->getParentOfType<ModuleOp>();
+    if (!module)
+      return failure();
+    auto *typeConverter =
+        static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
+    RuntimeAPI runtime(module, rewriter, *typeConverter);
+    Type resultType = typeConverter->convertType(op.getResult().getType());
+    if (!resultType)
+      return failure();
+
+    // For int operands, use LyLong_Compare + LyBool_FromBool
+    if (isPyIntType(op.getLhs().getType()) &&
+        isPyIntType(op.getRhs().getType())) {
+      // LyLong_Compare returns int: -1 (less), 0 (equal), 1 (greater)
+      auto cmpCall = runtime.call(op.getLoc(), RuntimeSymbols::kLongCompare,
+                                  rewriter.getI32Type(), adaptor.getOperands());
+      // For ==: compare result == 0
+      Value zero = rewriter.create<LLVM::ConstantOp>(
+          op.getLoc(), rewriter.getI32Type(), rewriter.getI32IntegerAttr(0));
+      Value eqZero = rewriter.create<LLVM::ICmpOp>(
+          op.getLoc(), LLVM::ICmpPredicate::eq, cmpCall.getResult(), zero);
+      // Convert i1 to LyBool
+      auto boolCall = runtime.call(op.getLoc(), RuntimeSymbols::kBoolFromBool,
+                                   resultType, ValueRange{eqZero});
+      rewriter.replaceOp(op, boolCall.getResults());
+    } else {
+      auto call = runtime.call(op.getLoc(), RuntimeSymbols::kNumberEq,
+                               resultType, adaptor.getOperands());
+      rewriter.replaceOp(op, call.getResults());
+    }
+    return success();
+  }
+};
+
+// Type-specialized lowering for NumNeOp
+struct NumNeLowering : public OpConversionPattern<NumNeOp> {
+  NumNeLowering(PyLLVMTypeConverter &converter, MLIRContext *ctx)
+      : OpConversionPattern<NumNeOp>(converter, ctx) {}
+
+  LogicalResult
+  matchAndRewrite(NumNeOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    ModuleOp module = op->getParentOfType<ModuleOp>();
+    if (!module)
+      return failure();
+    auto *typeConverter =
+        static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
+    RuntimeAPI runtime(module, rewriter, *typeConverter);
+    Type resultType = typeConverter->convertType(op.getResult().getType());
+    if (!resultType)
+      return failure();
+
+    // For int operands, use LyLong_Compare + LyBool_FromBool
+    if (isPyIntType(op.getLhs().getType()) &&
+        isPyIntType(op.getRhs().getType())) {
+      // LyLong_Compare returns int: -1 (less), 0 (equal), 1 (greater)
+      auto cmpCall = runtime.call(op.getLoc(), RuntimeSymbols::kLongCompare,
+                                  rewriter.getI32Type(), adaptor.getOperands());
+      // For !=: compare result != 0
+      Value zero = rewriter.create<LLVM::ConstantOp>(
+          op.getLoc(), rewriter.getI32Type(), rewriter.getI32IntegerAttr(0));
+      Value neZero = rewriter.create<LLVM::ICmpOp>(
+          op.getLoc(), LLVM::ICmpPredicate::ne, cmpCall.getResult(), zero);
+      // Convert i1 to LyBool
+      auto boolCall = runtime.call(op.getLoc(), RuntimeSymbols::kBoolFromBool,
+                                   resultType, ValueRange{neZero});
+      rewriter.replaceOp(op, boolCall.getResults());
+    } else {
+      auto call = runtime.call(op.getLoc(), RuntimeSymbols::kNumberNe,
+                               resultType, adaptor.getOperands());
+      rewriter.replaceOp(op, call.getResults());
+    }
+    return success();
+  }
+};
 struct CastToPrimLowering : public OpConversionPattern<CastToPrimOp> {
   CastToPrimLowering(PyLLVMTypeConverter &converter, MLIRContext *ctx)
       : OpConversionPattern<CastToPrimOp>(converter, ctx) {}
@@ -474,10 +683,11 @@ void populatePyValueLoweringPatterns(PyLLVMTypeConverter &typeConverter,
   auto *ctx = patterns.getContext();
   patterns
       .add<StrConstantLowering, NoneLowering, IntConstantLowering,
-           FloatConstantLowering, NumAddLowering, NumSubLowering, NumLeLowering,
-           CastToPrimLowering, CastFromPrimLowering, ClassNewLowering,
-           AttrGetLowering, AttrSetLowering, ClassOpLowering>(typeConverter,
-                                                              ctx);
+           FloatConstantLowering, NumAddLowering, NumSubLowering, NumLtLowering,
+           NumLeLowering, NumGtLowering, NumGeLowering, NumEqLowering,
+           NumNeLowering, CastToPrimLowering, CastFromPrimLowering,
+           ClassNewLowering, AttrGetLowering, AttrSetLowering, ClassOpLowering>(
+          typeConverter, ctx);
 }
 
 } // namespace py
