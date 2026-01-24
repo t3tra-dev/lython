@@ -29,16 +29,22 @@ target_link_libraries(lyc
     # Dialects
     MLIRFuncDialect
     MLIRArithDialect
+    MLIRBufferizationDialect
     MLIRSCFDialect
+    MLIRTensorDialect
+    MLIRLinalgDialect
     MLIRLLVMDialect
     # Conversions / Translations
     MLIRArithToLLVM
+    MLIRLinalgToStandard
     MLIRSCFToControlFlow
     MLIRControlFlowToLLVM
     MLIRMemRefToLLVM
     MLIRFuncToLLVM
     MLIRReconcileUnrealizedCasts
     MLIRConvertToLLVMPass
+    MLIRBufferizationTransforms
+    MLIRLinalgTransforms
     MLIRTargetLLVMIRExport
     MLIRToLLVMIRTranslationRegistration
     MLIRBuiltinToLLVMIRTranslation

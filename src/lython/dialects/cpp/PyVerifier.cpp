@@ -446,6 +446,12 @@ LogicalResult CastFromPrimOp::verify() {
       return success();
   }
 
+  // Allow ranked tensor types to !py.str conversion (repr carrier)
+  if (llvm::isa<::mlir::RankedTensorType>(inputType)) {
+    if (resultType == StrType::get(ctx))
+      return success();
+  }
+
   return emitOpError("unsupported type conversion from ")
          << inputType << " to " << resultType;
 }

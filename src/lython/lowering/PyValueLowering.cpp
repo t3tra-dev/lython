@@ -1,5 +1,14 @@
 #include "RuntimeSupport.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/StringExtras.h"
+#include "llvm/Support/raw_ostream.h"
+
 #include <cerrno>
 #include <cstdlib>
 
@@ -11,6 +20,89 @@ using namespace mlir;
 
 namespace py {
 namespace {
+
+static bool formatPrimitiveAttr(Attribute attr, std::string &out) {
+  if (auto intAttr = llvm::dyn_cast<IntegerAttr>(attr)) {
+    out = llvm::toString(intAttr.getValue(), 10, true);
+    return true;
+  }
+  if (auto floatAttr = llvm::dyn_cast<FloatAttr>(attr)) {
+    llvm::SmallString<16> buffer;
+    floatAttr.getValue().toString(buffer);
+    out = buffer.str().str();
+    return true;
+  }
+  return false;
+}
+
+static bool collectTensorLiteralElements(Value input,
+                                         SmallVector<std::string> &flat) {
+  if (auto fromElems =
+          llvm::dyn_cast_or_null<tensor::FromElementsOp>(
+              input.getDefiningOp())) {
+    for (Value element : fromElems.getElements()) {
+      auto constOp = element.getDefiningOp<arith::ConstantOp>();
+      if (!constOp)
+        return false;
+      std::string valueStr;
+      if (!formatPrimitiveAttr(constOp.getValue(), valueStr))
+        return false;
+      flat.push_back(valueStr);
+    }
+    return true;
+  }
+
+  if (auto constOp = input.getDefiningOp<arith::ConstantOp>()) {
+    if (auto dense =
+            llvm::dyn_cast<DenseElementsAttr>(constOp.getValue())) {
+      for (auto val : dense.getValues<Attribute>()) {
+        std::string valueStr;
+        if (!formatPrimitiveAttr(val, valueStr))
+          return false;
+        flat.push_back(valueStr);
+      }
+      return true;
+    }
+  }
+
+  return false;
+}
+
+static func::FuncOp getOrInsertTensorReprFunc(ModuleOp module, StringRef name,
+                                              Type memrefType,
+                                              Type resultType) {
+  if (auto fn = module.lookupSymbol<func::FuncOp>(name))
+    return fn;
+
+  OpBuilder builder(module.getContext());
+  builder.setInsertionPointToStart(module.getBody());
+  auto funcType = FunctionType::get(module.getContext(), {memrefType},
+                                    {resultType});
+  auto func = builder.create<func::FuncOp>(module.getLoc(), name, funcType);
+  func->setAttr("llvm.emit_c_interface", builder.getUnitAttr());
+  func.setVisibility(SymbolTable::Visibility::Private);
+  return func;
+}
+
+static std::string formatTensorLiteral(ArrayRef<int64_t> shape,
+                                       ArrayRef<std::string> flat,
+                                       size_t &index) {
+  if (shape.empty()) {
+    if (index >= flat.size())
+      return "<invalid>";
+    return flat[index++];
+  }
+
+  std::string result = "[";
+  for (int64_t i = 0; i < shape.front(); ++i) {
+    if (i > 0)
+      result.append(", ");
+    result.append(
+        formatTensorLiteral(shape.drop_front(), flat, index));
+  }
+  result.push_back(']');
+  return result;
+}
 
 struct StrConstantLowering : public OpConversionPattern<StrConstantOp> {
   StrConstantLowering(PyLLVMTypeConverter &converter, MLIRContext *ctx)
@@ -557,6 +649,72 @@ struct CastFromPrimLowering : public OpConversionPattern<CastFromPrimOp> {
       auto call = runtime.call(op.getLoc(), RuntimeSymbols::kFloatFromDouble,
                                resultType, ValueRange{input});
       rewriter.replaceOp(op, call.getResults());
+      return success();
+    }
+
+    if (auto tensorType = llvm::dyn_cast<RankedTensorType>(inputType)) {
+      if (!tensorType.hasStaticShape())
+        return rewriter.notifyMatchFailure(
+            op, "from_prim for tensor requires static shape");
+
+      SmallVector<std::string> flat;
+      if (!collectTensorLiteralElements(input, flat)) {
+        auto elemType = tensorType.getElementType();
+        auto floatType = llvm::dyn_cast<mlir::FloatType>(elemType);
+        if (!floatType)
+          return rewriter.notifyMatchFailure(
+              op, "from_prim for tensor requires float element type");
+
+        unsigned width = floatType.getWidth();
+        StringRef funcName;
+        if (width == 16) {
+          funcName = "LyTensorF16_Repr";
+        } else if (width == 32) {
+          funcName = "LyTensorF32_Repr";
+        } else if (width == 64) {
+          funcName = "LyTensorF64_Repr";
+        } else if (width == 128) {
+          funcName = "LyTensorF128_Repr";
+        } else {
+          return rewriter.notifyMatchFailure(
+              op, "unsupported float width for tensor repr");
+        }
+
+        auto memrefType = MemRefType::get(tensorType.getShape(), elemType);
+        Value memref =
+            rewriter.create<bufferization::ToMemrefOp>(op.getLoc(), memrefType,
+                                                       input);
+        auto unrankedType = UnrankedMemRefType::get(elemType, 0);
+        Value unranked =
+            rewriter.create<memref::CastOp>(op.getLoc(), unrankedType, memref);
+
+        auto func = getOrInsertTensorReprFunc(module, funcName, unrankedType,
+                                              resultType);
+        auto call = rewriter.create<func::CallOp>(op.getLoc(), func,
+                                                  ValueRange{unranked});
+        rewriter.replaceOp(op, call.getResults());
+        return success();
+      }
+
+      size_t index = 0;
+      std::string text =
+          formatTensorLiteral(tensorType.getShape(), flat, index);
+
+      Value dataPtr = runtime.getStringLiteral(
+          op.getLoc(), StringAttr::get(rewriter.getContext(), text));
+      Value length = runtime.getI64Constant(
+          op.getLoc(), static_cast<int64_t>(text.size()));
+      auto call = runtime.call(op.getLoc(), RuntimeSymbols::kStrFromUtf8,
+                               resultType, ValueRange{dataPtr, length});
+      rewriter.replaceOp(op, call.getResults());
+
+      if (Operation *def = input.getDefiningOp()) {
+        if (input.use_empty() &&
+            (llvm::isa<tensor::FromElementsOp>(def) ||
+             llvm::isa<arith::ConstantOp>(def))) {
+          rewriter.eraseOp(def);
+        }
+      }
       return success();
     }
 

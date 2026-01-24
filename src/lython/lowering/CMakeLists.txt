@@ -1,6 +1,7 @@
 add_library(LythonRuntimeLowering STATIC
     RuntimeSupport.cpp
     RuntimeLoweringPass.cpp
+    LinalgLoweringPass.cpp
     NativeVerificationPass.cpp
     PyFuncLowering.cpp
     PyOptimizationPass.cpp
@@ -23,7 +24,14 @@ target_link_libraries(LythonRuntimeLowering
     PRIVATE
     PyDialect
     MLIRIR
+    MLIRArithDialect
+    MLIRControlFlowDialect
     MLIRFuncDialect
     MLIRLLVMDialect
+    MLIRLinalgDialect
+    MLIRLinalgToStandard
+    MLIRMemRefDialect
+    MLIRSCFDialect
     MLIRSupport
+    MLIRTensorDialect
 )

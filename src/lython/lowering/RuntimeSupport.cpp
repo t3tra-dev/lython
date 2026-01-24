@@ -11,6 +11,13 @@ PyLLVMTypeConverter::PyLLVMTypeConverter(mlir::MLIRContext *ctx)
   pyObjectPtrType = mlir::LLVM::LLVMPointerType::get(ctx);
 
   addConversion([&](mlir::Type type) -> std::optional<mlir::Type> {
+    if (mlir::isa<mlir::IntegerType, mlir::FloatType,
+                  mlir::RankedTensorType>(type))
+      return type;
+    return std::nullopt;
+  });
+
+  addConversion([&](mlir::Type type) -> std::optional<mlir::Type> {
     if (isPyType(type) || mlir::isa<FuncType>(type) ||
         mlir::isa<TupleType>(type) || mlir::isa<ClassType>(type) ||
         mlir::isa<DictType>(type) || mlir::isa<ObjectType>(type))
