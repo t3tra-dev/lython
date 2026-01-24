@@ -4,9 +4,19 @@
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
 #include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/Bufferization/Transforms/Passes.h"
+#include "mlir/Dialect/Bufferization/Transforms/OneShotAnalysis.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/MLIRContext.h"
+#include "mlir/Dialect/Arith/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Bufferization/Transforms/FuncBufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/ControlFlow/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Linalg/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+#include "mlir/Dialect/SCF/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
@@ -18,8 +28,12 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/ExecutionEngine/ExecutionEngine.h"
 #include "mlir/Conversion/ConvertToLLVM/ToLLVMPass.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
@@ -64,6 +78,7 @@ namespace py {
   std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createRuntimeLoweringPass();
   std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createRefCountInsertionPass();
   std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createNativeVerificationPass();
+  std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createLinalgLoweringPass();
 }
 
 namespace {
@@ -121,6 +136,8 @@ if __name__ == "__main__":
 
     // Phase 1: Native verification
     {
+      if (dumpIR)
+        llvm::errs() << "[Pipeline] NativeVerificationPass\n";
       PassManager pm(&context);
       pm.addPass(py::createNativeVerificationPass());
       if (failed(pm.run(module)))
@@ -134,6 +151,8 @@ if __name__ == "__main__":
 
     // Phase 2: Reference counting insertion
     {
+      if (dumpIR)
+        llvm::errs() << "[Pipeline] RefCountInsertionPass\n";
       PassManager pm(&context);
       pm.addPass(py::createRefCountInsertionPass());
       if (failed(pm.run(module)))
@@ -147,6 +166,8 @@ if __name__ == "__main__":
 
     // Phase 3: Early canonicalization and CSE
     {
+      if (dumpIR)
+        llvm::errs() << "[Pipeline] Canonicalizer + CSE\n";
       PassManager pm(&context);
       pm.addPass(mlir::createCanonicalizerPass());
       pm.addPass(mlir::createCSEPass());
@@ -161,14 +182,41 @@ if __name__ == "__main__":
 
     // Phase 4: Runtime lowering (Py dialect -> func/LLVM)
     {
+      if (dumpIR)
+        llvm::errs() << "[Pipeline] RuntimeLoweringPass\n";
       PassManager pm(&context);
       pm.addPass(py::createRuntimeLoweringPass());
       if (failed(pm.run(module)))
         return failure();
     }
 
-    // Phase 5: Final lowering to LLVM
+    // Phase 5: Bufferization (tensor -> memref)
     {
+      if (dumpIR)
+        llvm::errs() << "[Pipeline] OneShotBufferize + BufferDeallocation\n";
+      PassManager pm(&context);
+      bufferization::OneShotBufferizationOptions options;
+      options.allowUnknownOps = true;
+      pm.addPass(bufferization::createOneShotBufferizePass(options));
+      // Deallocation is handled later; avoid failing on unmatched allocations.
+      if (failed(pm.run(module)))
+        return failure();
+    }
+
+    // Phase 6: Lower linalg to loops
+    {
+      if (dumpIR)
+        llvm::errs() << "[Pipeline] ConvertLinalgToLoops\n";
+      PassManager pm(&context);
+      pm.addPass(mlir::createConvertLinalgToLoopsPass());
+      if (failed(pm.run(module)))
+        return failure();
+    }
+
+    // Phase 7: Final lowering to LLVM
+    {
+      if (dumpIR)
+        llvm::errs() << "[Pipeline] ConvertToLLVM\n";
       PassManager pm(&context);
       pm.addPass(mlir::createConvertSCFToCFPass());
       pm.addPass(mlir::createArithToLLVMConversionPass());
@@ -208,6 +256,14 @@ if __name__ == "__main__":
       add("LyDict_GetItem", &LyDict_GetItem);
       add("Ly_GetNone", &Ly_GetNone);
       add("Ly_GetBuiltinPrint", &Ly_GetBuiltinPrint);
+      add("LyTensorF16_Repr", &LyTensorF16_Repr);
+      add("LyTensorF32_Repr", &LyTensorF32_Repr);
+      add("LyTensorF64_Repr", &LyTensorF64_Repr);
+      add("LyTensorF128_Repr", &LyTensorF128_Repr);
+      add("_mlir_ciface_LyTensorF16_Repr", &_mlir_ciface_LyTensorF16_Repr);
+      add("_mlir_ciface_LyTensorF32_Repr", &_mlir_ciface_LyTensorF32_Repr);
+      add("_mlir_ciface_LyTensorF64_Repr", &_mlir_ciface_LyTensorF64_Repr);
+      add("_mlir_ciface_LyTensorF128_Repr", &_mlir_ciface_LyTensorF128_Repr);
       add("Ly_CallVectorcall", &Ly_CallVectorcall);
       add("Ly_Call", &Ly_Call);
       add("LyLong_FromI64", &LyLong_FromI64);
@@ -581,8 +637,16 @@ int main(int argc, char** argv) {
   DialectRegistry registry;
   registry.insert<py::PyDialect, func::FuncDialect, arith::ArithDialect,
     scf::SCFDialect, mlir::cf::ControlFlowDialect,
-    LLVM::LLVMDialect>();
+    tensor::TensorDialect, linalg::LinalgDialect,
+    memref::MemRefDialect,
+    bufferization::BufferizationDialect, LLVM::LLVMDialect>();
+  arith::registerBufferizableOpInterfaceExternalModels(registry);
+  bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(
+      registry);
+  linalg::registerBufferizableOpInterfaceExternalModels(registry);
+  tensor::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::registerConvertFuncToLLVMInterface(registry);
+  mlir::registerConvertMemRefToLLVMInterface(registry);
   mlir::registerAllToLLVMIRTranslations(registry);
 
   MLIRContext context;

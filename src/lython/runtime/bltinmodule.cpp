@@ -3,8 +3,16 @@
 #include "objects/function.h"
 #include "objects/unicode.h"
 
+#include "mlir/ExecutionEngine/CRunnerUtils.h"
+
+#include <cmath>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
+#include <limits>
+#include <sstream>
+#include <string>
+#include <vector>
 
 extern "C" LyObject *builtin_print_impl(LyObject *module,
                                         LyObject *const *objects,
@@ -21,6 +29,51 @@ void emitRepr(LyObject *object) {
   if (repr->utf8_data)
     std::cout.write(repr->utf8_data, repr->utf8_length);
   Ly_DecRef(reinterpret_cast<LyObject *>(repr));
+}
+
+float halfToFloat(std::uint16_t value) {
+  std::uint16_t sign = (value >> 15) & 0x1;
+  std::uint16_t exp = (value >> 10) & 0x1F;
+  std::uint16_t mant = value & 0x3FF;
+
+  if (exp == 0) {
+    if (mant == 0)
+      return sign ? -0.0f : 0.0f;
+    float m = static_cast<float>(mant) / 1024.0f;
+    float val = std::ldexp(m, -14);
+    return sign ? -val : val;
+  }
+  if (exp == 31) {
+    if (mant == 0)
+      return sign ? -INFINITY : INFINITY;
+    return std::numeric_limits<float>::quiet_NaN();
+  }
+
+  float m = 1.0f + static_cast<float>(mant) / 1024.0f;
+  float val = std::ldexp(m, static_cast<int>(exp) - 15);
+  return sign ? -val : val;
+}
+
+template <typename T, typename Convert>
+void appendTensorDynamic(std::string &out, const DynamicMemRefType<T> &memref,
+                         int64_t dim, int64_t offset, Convert convert) {
+  if (dim == memref.rank) {
+    std::ostringstream stream;
+    stream.setf(std::ios::fmtflags(0), std::ios::floatfield);
+    stream << std::setprecision(8) << static_cast<long double>(
+        convert(memref.data[offset]));
+    out += stream.str();
+    return;
+  }
+
+  out.push_back('[');
+  for (int64_t i = 0; i < memref.sizes[dim]; ++i) {
+    if (i != 0)
+      out.append(", ");
+    appendTensorDynamic(out, memref, dim + 1,
+                        offset + i * memref.strides[dim], convert);
+  }
+  out.push_back(']');
 }
 
 LyObject *builtin_print_vectorcall(LyObject *callable, LyObject *const *args,
@@ -43,6 +96,62 @@ LyObject *builtin_print_impl(LyObject *, LyObject *const *objects,
   }
   std::cout << std::endl;
   return Ly_GetNone();
+}
+
+LyUnicodeObject *LyTensorF16_Repr(UnrankedMemRefType<std::uint16_t> *memref) {
+  DynamicMemRefType<std::uint16_t> dyn(*memref);
+  std::string out;
+  out.reserve(64);
+  appendTensorDynamic(out, dyn, 0, dyn.offset,
+                      [](std::uint16_t v) { return halfToFloat(v); });
+  return LyUnicode_FromUTF8(out.c_str(), out.size());
+}
+
+LyUnicodeObject *LyTensorF32_Repr(UnrankedMemRefType<float> *memref) {
+  DynamicMemRefType<float> dyn(*memref);
+  std::string out;
+  out.reserve(64);
+  appendTensorDynamic(out, dyn, 0, dyn.offset,
+                      [](float v) { return v; });
+  return LyUnicode_FromUTF8(out.c_str(), out.size());
+}
+
+LyUnicodeObject *LyTensorF64_Repr(UnrankedMemRefType<double> *memref) {
+  DynamicMemRefType<double> dyn(*memref);
+  std::string out;
+  out.reserve(64);
+  appendTensorDynamic(out, dyn, 0, dyn.offset,
+                      [](double v) { return v; });
+  return LyUnicode_FromUTF8(out.c_str(), out.size());
+}
+
+LyUnicodeObject *LyTensorF128_Repr(UnrankedMemRefType<long double> *memref) {
+  DynamicMemRefType<long double> dyn(*memref);
+  std::string out;
+  out.reserve(64);
+  appendTensorDynamic(out, dyn, 0, dyn.offset,
+                      [](long double v) { return v; });
+  return LyUnicode_FromUTF8(out.c_str(), out.size());
+}
+
+LyUnicodeObject *_mlir_ciface_LyTensorF16_Repr(
+    UnrankedMemRefType<std::uint16_t> *memref) {
+  return LyTensorF16_Repr(memref);
+}
+
+LyUnicodeObject *_mlir_ciface_LyTensorF32_Repr(
+    UnrankedMemRefType<float> *memref) {
+  return LyTensorF32_Repr(memref);
+}
+
+LyUnicodeObject *_mlir_ciface_LyTensorF64_Repr(
+    UnrankedMemRefType<double> *memref) {
+  return LyTensorF64_Repr(memref);
+}
+
+LyUnicodeObject *_mlir_ciface_LyTensorF128_Repr(
+    UnrankedMemRefType<long double> *memref) {
+  return LyTensorF128_Repr(memref);
 }
 
 LyFunctionObject *Ly_GetBuiltinPrint() {

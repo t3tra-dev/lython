@@ -11,8 +11,10 @@
 #include "objects/tuple.h"
 #include "objects/unicode.h"
 
-extern "C" {
+template <typename T>
+struct UnrankedMemRefType;
 
+extern "C" {
 LyUnicodeObject *LyUnicode_FromUTF8(const char *data, std::size_t len);
 
 LyTupleObject *LyTuple_New(std::size_t size);
@@ -23,6 +25,18 @@ LyObject *LyDict_Insert(LyObject *dict, LyObject *key, LyObject *value);
 
 LyObject *Ly_GetNone();
 LyFunctionObject *Ly_GetBuiltinPrint();
+LyUnicodeObject *LyTensorF16_Repr(UnrankedMemRefType<std::uint16_t> *memref);
+LyUnicodeObject *LyTensorF32_Repr(UnrankedMemRefType<float> *memref);
+LyUnicodeObject *LyTensorF64_Repr(UnrankedMemRefType<double> *memref);
+LyUnicodeObject *LyTensorF128_Repr(UnrankedMemRefType<long double> *memref);
+LyUnicodeObject *_mlir_ciface_LyTensorF16_Repr(
+    UnrankedMemRefType<std::uint16_t> *memref);
+LyUnicodeObject *_mlir_ciface_LyTensorF32_Repr(
+    UnrankedMemRefType<float> *memref);
+LyUnicodeObject *_mlir_ciface_LyTensorF64_Repr(
+    UnrankedMemRefType<double> *memref);
+LyUnicodeObject *_mlir_ciface_LyTensorF128_Repr(
+    UnrankedMemRefType<long double> *memref);
 
 LyLongObject *LyLong_FromI64(std::int64_t value);
 LyFloatObject *LyFloat_FromDouble(double value);

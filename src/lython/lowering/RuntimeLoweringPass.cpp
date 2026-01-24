@@ -18,7 +18,12 @@
 
 #include "RuntimeSupport.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -135,6 +140,8 @@ struct RuntimeLoweringPass
   void runOnOperation() override {
     ModuleOp module = getOperation();
     MLIRContext *ctx = module.getContext();
+    ctx->loadDialect<bufferization::BufferizationDialect,
+                     memref::MemRefDialect>();
     PyLLVMTypeConverter typeConverter(ctx);
     bool dumpLowering = static_cast<bool>(
         llvm::sys::Process::GetEnv("LYTHON_DUMP_LOWERING_IR"));
@@ -271,14 +278,17 @@ struct RuntimeLoweringPass
                 typeConverter, ctx);
 
         ConversionTarget target(*ctx);
-        target.addLegalDialect<LLVM::LLVMDialect, func::FuncDialect>();
+        target.addLegalDialect<LLVM::LLVMDialect, func::FuncDialect,
+                               arith::ArithDialect, tensor::TensorDialect,
+                               linalg::LinalgDialect, memref::MemRefDialect,
+                               bufferization::BufferizationDialect>();
         target.addLegalOp<ModuleOp>();
         target.addIllegalOp<
             StrConstantOp, IntConstantOp, FloatConstantOp, TupleEmptyOp,
             TupleCreateOp, DictEmptyOp, DictInsertOp, NoneOp, FuncObjectOp,
             NumAddOp, NumSubOp, NumLtOp, NumLeOp, NumGtOp, NumGeOp, NumEqOp,
-            NumNeOp, CastToPrimOp, CastIdentityOp, UpcastOp, IncRefOp,
-            DecRefOp, ClassNewOp, AttrGetOp, AttrSetOp, ClassOp>();
+            NumNeOp, CastToPrimOp, CastFromPrimOp, CastIdentityOp, UpcastOp,
+            IncRefOp, DecRefOp, ClassNewOp, AttrGetOp, AttrSetOp, ClassOp>();
 
         ScopedDiagnosticHandler diagHandler(ctx, materializationFilter);
         auto result =

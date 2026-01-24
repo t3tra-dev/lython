@@ -2,9 +2,19 @@ from typing import Callable, Literal, TypeVar
 
 from . import prim
 
-__all__ = ["prim", "native", "to_prim", "from_prim"]
+__all__ = ["prim", "native", "to_prim", "from_prim", "alloc", "dealloc"]
 
 T = TypeVar("T")
+AllocT = TypeVar(
+    "AllocT",
+    bound=(
+        prim.Prim[prim.Int]
+        | prim.Prim[prim.Float]
+        | prim.Vector
+        | prim.Matrix
+        | prim.Tensor
+    ),
+)
 PrimT = TypeVar("PrimT", bound=prim.Prim[prim.Int] | prim.Prim[prim.Float])
 PrimFunc = TypeVar(
     "PrimFunc",
@@ -25,3 +35,13 @@ def from_prim(
         | prim.Tensor
     ),
 ) -> object: ...
+def alloc(value: AllocT) -> AllocT: ...
+def dealloc(
+    value: (
+        prim.Prim[prim.Int]
+        | prim.Prim[prim.Float]
+        | prim.Vector
+        | prim.Matrix
+        | prim.Tensor
+    ),
+) -> None: ...

@@ -14,6 +14,8 @@ add_library(LythonRuntime STATIC
 target_include_directories(LythonRuntime
     PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/third_party/llvm-project/llvm/include
+    ${CMAKE_SOURCE_DIR}/third_party/llvm-project/mlir/include
 )
 
 # Optimize runtime for performance

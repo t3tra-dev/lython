@@ -5,6 +5,7 @@ import ast
 from lython.mlir.dialects import _lython_ops_gen as py_ops
 from lython.mlir.dialects import arith as arith_ops
 from lython.mlir.dialects import func as func_ops
+from lython.mlir.dialects import tensor as tensor_ops
 
 from ..mlir import ir
 from ._base import PRIMITIVE_BASE_TYPES, BaseVisitor, ClassInfo, FunctionInfo
@@ -133,8 +134,10 @@ class ExprVisitor(BaseVisitor):
         lhs = self.require_value(node.left, self.visit(node.left))
         rhs = self.require_value(node.right, self.visit(node.right))
 
-        # In native mode, use arith.* operations
-        if self._in_native_func:
+        # In native mode or for primitive types, use arith.* operations
+        if self._in_native_func or (
+            not self.is_py_type(lhs.type) and not self.is_py_type(rhs.type)
+        ):
             return self._handle_primitive_binop(node.op, lhs, rhs, self._loc(node))
 
         # In object mode, use py.num.* operations
@@ -150,34 +153,85 @@ class ExprVisitor(BaseVisitor):
     ) -> ir.Value:
         """Handle binary operation on primitive types using arith dialect."""
         lhs_type = lhs.type
-        is_float = str(lhs_type).startswith("f")
+        is_float = self.is_primitive_float_type(lhs_type)
+        is_int = self.is_primitive_int_type(lhs_type)
 
         with loc, self.insertion_point():
             if isinstance(op, ast.Add):
                 if is_float:
                     return arith_ops.AddFOp(lhs, rhs).result
-                else:
+                if is_int:
                     return arith_ops.AddIOp(lhs, rhs).result
+                raise NotImplementedError("Unsupported primitive add type")
             elif isinstance(op, ast.Sub):
                 if is_float:
                     return arith_ops.SubFOp(lhs, rhs).result
-                else:
+                if is_int:
                     return arith_ops.SubIOp(lhs, rhs).result
+                raise NotImplementedError("Unsupported primitive sub type")
             elif isinstance(op, ast.Mult):
                 if is_float:
                     return arith_ops.MulFOp(lhs, rhs).result
-                else:
+                if is_int:
                     return arith_ops.MulIOp(lhs, rhs).result
+                raise NotImplementedError("Unsupported primitive mul type")
             elif isinstance(op, ast.FloorDiv):
                 if is_float:
                     raise NotImplementedError("Floor division on floats not supported")
-                else:
+                if is_int:
                     return arith_ops.DivSIOp(lhs, rhs).result
+                raise NotImplementedError("Unsupported primitive div type")
+            elif isinstance(op, ast.Div):
+                if is_float:
+                    if isinstance(lhs_type, ir.ShapedType):
+                        raise NotImplementedError(
+                            "Division is not supported for vector/matrix/tensor types"
+                        )
+                    return arith_ops.DivFOp(lhs, rhs).result
+                if is_int:
+                    if isinstance(lhs_type, ir.ShapedType):
+                        raise NotImplementedError(
+                            "Division is not supported for vector/matrix/tensor types"
+                        )
+                    return arith_ops.DivSIOp(lhs, rhs).result
+                raise NotImplementedError("Unsupported primitive div type")
+            elif isinstance(op, ast.MatMult):
+                if not isinstance(lhs_type, ir.RankedTensorType) or not isinstance(
+                    rhs.type, ir.RankedTensorType
+                ):
+                    raise NotImplementedError("Matrix multiplication requires tensors")
+                if not self.is_primitive_float_type(lhs_type):
+                    raise NotImplementedError(
+                        "Matrix multiplication supports float tensors only"
+                    )
+                if lhs_type.rank != 2 or rhs.type.rank != 2:
+                    raise NotImplementedError(
+                        "Matrix multiplication supports rank-2 tensors"
+                    )
+
+                lhs_shape = list(lhs_type.shape)
+                rhs_shape = list(rhs.type.shape)
+                if (
+                    ir.ShapedType.get_dynamic_size() in lhs_shape
+                    or ir.ShapedType.get_dynamic_size() in rhs_shape
+                ):
+                    raise NotImplementedError("Dynamic shapes are not supported yet")
+                if lhs_shape[1] != rhs_shape[0]:
+                    raise ValueError("Matrix multiplication shape mismatch")
+
+                elem_type = lhs_type.element_type
+                zero = self._build_primitive_scalar(0.0, elem_type, loc)
+                init = tensor_ops.EmptyOp(
+                    [lhs_shape[0], rhs_shape[1]], elem_type
+                ).result
+                filled = self._build_linalg_fill(zero, init, elem_type, loc)
+                return self._build_linalg_matmul(lhs, rhs, filled, elem_type, loc)
             elif isinstance(op, ast.Mod):
                 if is_float:
                     return arith_ops.RemFOp(lhs, rhs).result
-                else:
+                if is_int:
                     return arith_ops.RemSIOp(lhs, rhs).result
+                raise NotImplementedError("Unsupported primitive rem type")
             else:
                 raise NotImplementedError(
                     f"Unsupported primitive binary operation: {type(op).__name__}"
@@ -329,7 +383,9 @@ class ExprVisitor(BaseVisitor):
     ) -> ir.Value:
         """Handle comparison on primitive types using arith.cmpi."""
         lhs_type = lhs.type
-        is_float = str(lhs_type).startswith("f")
+        if isinstance(lhs_type, ir.ShapedType):
+            raise NotImplementedError("Tensor comparisons are not supported yet")
+        is_float = self.is_primitive_float_type(lhs_type)
 
         # Map Python comparison operators to arith predicates
         # For integers (signed): slt, sle, sgt, sge, eq, ne
@@ -402,7 +458,7 @@ class ExprVisitor(BaseVisitor):
         """
         raise NotImplementedError("YieldFrom expression not implemented")
 
-    def visit_Call(self, node: ast.Call) -> ir.Value:
+    def visit_Call(self, node: ast.Call) -> ir.Value | None:
         """
         関数呼び出しを処理する。
 
@@ -421,12 +477,46 @@ class ExprVisitor(BaseVisitor):
                     base_type = self._prim_types[base_type]
                 if base_type in PRIMITIVE_BASE_TYPES:
                     return self._handle_prim_constructor(node, base_type, loc)
+                if base_type in ("Vector", "Matrix", "Tensor"):
+                    if len(node.args) != 1:
+                        raise ValueError(f"{base_type} constructor requires 1 argument")
+                    return self.build_primitive_tensor_constructor(
+                        base_type, node.func.slice, node.args[0], loc
+                    )
 
-        # Handle lyrt builtin calls: from_prim
+        # Handle Vector/Matrix/Tensor class methods: zeros/ones
+        if isinstance(node.func, ast.Attribute) and node.func.attr in ("zeros", "ones"):
+            target = node.func.value
+            if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+                base_type = target.value.id
+                if base_type in self._prim_types:
+                    base_type = self._prim_types[base_type]
+                if base_type in ("Vector", "Matrix", "Tensor"):
+                    if node.keywords:
+                        raise ValueError(
+                            f"{base_type}.{node.func.attr} does not accept keywords"
+                        )
+                    if node.args:
+                        raise ValueError(
+                            f"{base_type}.{node.func.attr} does not accept arguments"
+                        )
+                    fill_value = 0.0 if node.func.attr == "zeros" else 1.0
+                    return self.build_primitive_tensor_fill(
+                        base_type, target.slice, fill_value, loc
+                    )
+
+        # Handle lyrt builtin calls: to_prim/from_prim/alloc/dealloc
         if isinstance(node.func, ast.Name):
             func_name = node.func.id
+            if func_name == "to_prim" and "to_prim" in self._lyrt_builtins:
+                return self._handle_to_prim_call(node, loc)
             if func_name == "from_prim" and "from_prim" in self._lyrt_builtins:
                 return self._handle_from_prim(node, loc)
+            if func_name == "alloc" and "alloc" in self._lyrt_builtins:
+                return self._handle_alloc_call(node, loc)
+            if func_name == "dealloc" and "dealloc" in self._lyrt_builtins:
+                self._handle_dealloc_call(node, loc)
+                return None
 
         if node.keywords:
             raise NotImplementedError("Keyword arguments not supported yet")
@@ -661,6 +751,7 @@ class ExprVisitor(BaseVisitor):
         Converts a primitive value back to a Python object.
         Generates py.cast.from_prim operation.
         """
+        self._ensure_not_in_native("from_prim", loc)
         if len(node.args) != 1:
             raise ValueError("from_prim() requires exactly 1 argument")
 
@@ -676,6 +767,9 @@ class ExprVisitor(BaseVisitor):
         elif prim_type_str.startswith("f"):
             # Float type -> !py.float
             result_type = self.get_py_type("!py.float")
+        elif isinstance(prim_type, ir.RankedTensorType):
+            # Tensor type -> !py.str (repr carrier)
+            result_type = self.get_py_type("!py.str")
         else:
             raise ValueError(
                 f"Cannot convert primitive type {prim_type_str} to Python object"

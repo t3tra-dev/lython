@@ -236,7 +236,7 @@ class StmtVisitor(BaseVisitor):
         self.push_scope()
 
         # Enter native mode
-        self._set_in_native_func(True)
+        self._enter_native_context(native_info.get("gc", "none"))
 
         # Register arguments in scope
         for arg, value in zip(node.args.args, entry_block.arguments):
@@ -253,8 +253,8 @@ class StmtVisitor(BaseVisitor):
                 f"@native function '{node.name}' must explicitly return"
             )
 
-        # Exit native mode
-        self._set_in_native_func(False)
+        # Exit native mode (includes allocation checks)
+        self._exit_native_context(loc)
 
         self.pop_scope()
         self._set_insertion_block(prev_block)
@@ -518,6 +518,7 @@ class StmtVisitor(BaseVisitor):
 
         if isinstance(target, ast.Name):
             # Simple assignment: x = value
+            self._check_prim_overwrite(target.id, self._loc(node))
             self.define_symbol(target.id, value)
 
             # Check if this was a to_prim() call with a constant value
@@ -832,7 +833,7 @@ class StmtVisitor(BaseVisitor):
         ```
 
         Handles:
-        - from lyrt import native, from_prim
+        - from lyrt import native, to_prim, from_prim, alloc, dealloc
         - from lyrt.prim import Int, Float, Vector, Matrix, Tensor
         """
         module = node.module
@@ -841,7 +842,7 @@ class StmtVisitor(BaseVisitor):
             # Handle lyrt builtins: native, from_prim
             for alias in node.names:
                 name = alias.name
-                if name in ("native", "from_prim"):
+                if name in ("native", "to_prim", "from_prim", "alloc", "dealloc"):
                     self._lyrt_builtins.add(name)
                 else:
                     raise NotImplementedError(f"Unknown lyrt import: {name}")
