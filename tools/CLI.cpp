@@ -561,6 +561,9 @@ if __name__ == "__main__":
     argStorage.emplace_back(objectPath.str());
     argStorage.emplace_back(runtimeLib.str());
     argStorage.emplace_back("-O2");
+#if defined(__linux__)
+    argStorage.emplace_back("-no-pie");
+#endif
     argStorage.emplace_back("-o");
     argStorage.emplace_back(outputPath.str());
 
