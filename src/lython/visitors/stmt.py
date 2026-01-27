@@ -3,11 +3,10 @@ from __future__ import annotations
 import ast
 from typing import Any
 
-from lython.mlir.dialects import _lython_ops_gen as py_ops
-from lython.mlir.dialects import cf as cf_ops
-from lython.mlir.dialects import func as func_ops
-
 from ..mlir import ir
+from ..mlir.dialects import _lython_ops_gen as py_ops
+from ..mlir.dialects import cf as cf_ops
+from ..mlir.dialects import func as func_ops
 from ._base import PRIMITIVE_BASE_TYPES, BaseVisitor, MethodInfo
 
 __all__ = ["StmtVisitor"]
@@ -148,6 +147,7 @@ class StmtVisitor(BaseVisitor):
                 node.name,
                 ir.TypeAttr.get(py_func_sig),
                 arg_names=arg_names_attr,
+                nothrow=True,
             )
         entry_arg_types = [self.get_py_type(spec) for spec in arg_type_specs]
         self.register_function(
@@ -155,6 +155,7 @@ class StmtVisitor(BaseVisitor):
             py_func_type,
             entry_arg_types,
             [result_ir_type],
+            maythrow=False,
         )
         with loc:
             if entry_arg_types:
@@ -164,6 +165,7 @@ class StmtVisitor(BaseVisitor):
         prev_block = self.current_block
         self._set_insertion_block(entry_block)
         self.push_scope()
+        self._enter_py_function(node.name)
         for arg, value in zip(node.args.args, entry_block.arguments):
             self.define_symbol(arg.arg, value)
         for stmt in node.body:
@@ -177,6 +179,15 @@ class StmtVisitor(BaseVisitor):
             with ir.Location.unknown(self.ctx), ir.InsertionPoint(active_block):
                 none_val = py_ops.NoneOp(self.get_py_type("!py.none")).result
                 py_ops.ReturnOp([none_val])
+        maythrow = self._exit_py_function()
+        self._set_func_effect(func, maythrow)
+        self.register_function(
+            node.name,
+            py_func_type,
+            entry_arg_types,
+            [result_ir_type],
+            maythrow=maythrow,
+        )
         self.pop_scope()
         self._set_insertion_block(prev_block)
 
@@ -277,6 +288,7 @@ class StmtVisitor(BaseVisitor):
             arg_types=tuple(arg_types),
             result_types=tuple(result_types),
             has_vararg=False,
+            maythrow=False,
         )
         self._functions[name] = info
 
@@ -422,6 +434,7 @@ class StmtVisitor(BaseVisitor):
                 qualified_name,
                 ir.TypeAttr.get(py_func_sig),
                 arg_names=arg_names_attr,
+                nothrow=True,
             )
 
         entry_arg_types = [self.get_py_type(spec) for spec in arg_type_specs]
@@ -434,6 +447,7 @@ class StmtVisitor(BaseVisitor):
         prev_block = self.current_block
         self._set_insertion_block(entry_block)
         self.push_scope()
+        self._enter_py_function(qualified_name)
 
         # Register arguments in scope
         for arg, value in zip(node.args.args, entry_block.arguments):
@@ -454,6 +468,9 @@ class StmtVisitor(BaseVisitor):
                 none_val = py_ops.NoneOp(self.get_py_type("!py.none")).result
                 py_ops.ReturnOp([none_val])
 
+        maythrow = self._exit_py_function()
+        self._set_func_effect(func, maythrow)
+
         self.pop_scope()
         self._set_insertion_block(prev_block)
 
@@ -462,6 +479,7 @@ class StmtVisitor(BaseVisitor):
             name=node.name,
             arg_types=tuple(entry_arg_types),
             result_types=(result_ir_type,),
+            maythrow=maythrow,
         )
 
     def visit_Return(self, node: ast.Return) -> None:
@@ -485,6 +503,7 @@ class StmtVisitor(BaseVisitor):
                 func_ops.ReturnOp([value])
             else:
                 py_ops.ReturnOp([value])
+        self._advance_block_after_terminator()
 
     def visit_Delete(self, node: ast.Delete) -> None:
         """
@@ -772,7 +791,52 @@ class StmtVisitor(BaseVisitor):
         Raise(expr? exc, expr? cause)
         ```
         """
-        raise NotImplementedError("Raise statement not implemented")
+        if self._in_native_func:
+            raise NotImplementedError("raise in @native is not supported")
+
+        with self._loc(node), self.insertion_point():
+            self._note_maythrow()
+            if node.exc is None:
+                py_ops.RaiseCurrentOp()
+                self._advance_block_after_terminator()
+                return
+
+            if node.cause is not None:
+                raise NotImplementedError("raise ... from ... is not supported")
+
+            if isinstance(node.exc, ast.Constant) and isinstance(node.exc.value, str):
+                exc_value = self.build_exception_value(
+                    message=node.exc.value, loc=self._loc(node)
+                )
+                py_ops.RaiseOp(exc_value)
+                self._advance_block_after_terminator()
+                return
+
+            if isinstance(node.exc, ast.Call):
+                if (
+                    isinstance(node.exc.func, ast.Name)
+                    and node.exc.func.id == "Exception"
+                ):
+                    if len(node.exc.args) != 1 or not isinstance(
+                        node.exc.args[0], ast.Constant
+                    ):
+                        raise NotImplementedError(
+                            "Exception(...) requires a single string literal"
+                        )
+                    if not isinstance(node.exc.args[0].value, str):
+                        raise NotImplementedError(
+                            "Exception(...) requires a string literal"
+                        )
+                    exc_value = self.build_exception_value(
+                        message=node.exc.args[0].value, loc=self._loc(node)
+                    )
+                    py_ops.RaiseOp(exc_value)
+                    self._advance_block_after_terminator()
+                    return
+
+            raise NotImplementedError(
+                "raise requires a string literal or bare raise (for now)"
+            )
 
     def visit_Try(self, node: ast.Try) -> None:
         """
@@ -897,6 +961,7 @@ class StmtVisitor(BaseVisitor):
             raise NotImplementedError("Expression visitor not available")
         expr_visitor.current_block = self.current_block
         expr_visitor.visit(node.value)
+        self.current_block = expr_visitor.current_block
         return None
 
     def visit_Pass(self, node: ast.Pass) -> None:

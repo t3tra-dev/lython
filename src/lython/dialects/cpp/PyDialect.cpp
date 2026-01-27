@@ -24,8 +24,8 @@ namespace py {
 
 void PyDialect::initialize() {
   addTypes<IntType, FloatType, BoolType, StrType, ObjectType, NoneType,
-           TupleType, DictType, ClassType, FuncSignatureType, FuncType,
-           PrimFuncType>();
+           TupleType, DictType, ClassType, ExceptionType, TracebackType,
+           LocationType, FuncSignatureType, FuncType, PrimFuncType>();
 
   addOperations<
 #define GET_OP_LIST
@@ -99,6 +99,12 @@ Type PyDialect::parseType(DialectAsmParser &parser) const {
       return Type();
     return ClassType::get(ctx, classNameAttr.getValue());
   }
+  if (keyword == "exception")
+    return ExceptionType::get(ctx);
+  if (keyword == "traceback")
+    return TracebackType::get(ctx);
+  if (keyword == "location")
+    return LocationType::get(ctx);
   if (keyword == "func") {
     if (parser.parseLess())
       return Type();
@@ -214,6 +220,9 @@ void PyDialect::printType(Type type, DialectAsmPrinter &printer) const {
       .Case<ClassType>([&](ClassType classTy) {
         printer << "class<\"" << classTy.getClassName() << "\">";
       })
+      .Case<ExceptionType>([&](ExceptionType) { printer << "exception"; })
+      .Case<TracebackType>([&](TracebackType) { printer << "traceback"; })
+      .Case<LocationType>([&](LocationType) { printer << "location"; })
       .Case<FuncSignatureType>([&](FuncSignatureType sigTy) {
         printer << "funcsig<";
         printTypeList(sigTy.getPositionalTypes());

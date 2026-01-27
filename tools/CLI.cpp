@@ -35,10 +35,18 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/ExecutionEngine/ExecutionEngine.h"
+#include "llvm/ExecutionEngine/Orc/CompileUtils.h"
+#include "llvm/ExecutionEngine/Orc/ExecutionUtils.h"
+#include "llvm/ExecutionEngine/Orc/LLJIT.h"
+#include "llvm/ExecutionEngine/Orc/Mangling.h"
+#include "llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h"
+#include "llvm/ExecutionEngine/ObjectCache.h"
 #include "mlir/Conversion/ConvertToLLVM/ToLLVMPass.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
+#include "llvm/Support/Error.h"
 
 #include "llvm/ExecutionEngine/JITSymbol.h"
+#include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/LegacyPassManager.h"
@@ -52,6 +60,7 @@
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Process.h"
 #include "llvm/Support/Program.h"
+#include "llvm/Support/Signals.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
@@ -82,9 +91,38 @@ namespace py {
 }
 
 namespace {
+class FileObjectCache final : public llvm::ObjectCache {
+public:
+  explicit FileObjectCache(std::string outputPath)
+      : outputPath(std::move(outputPath)) {}
+
+  void notifyObjectCompiled(const llvm::Module *M,
+                            llvm::MemoryBufferRef ObjBuffer) override {
+    (void)M;
+    std::error_code ec;
+    llvm::raw_fd_ostream os(outputPath, ec, llvm::sys::fs::OF_None);
+    if (ec) {
+      llvm::errs() << "error: failed to write JIT object to " << outputPath
+                   << ": " << ec.message() << "\n";
+      return;
+    }
+    os.write(ObjBuffer.getBufferStart(), ObjBuffer.getBufferSize());
+    os.flush();
+  }
+
+  std::unique_ptr<llvm::MemoryBuffer>
+  getObject(const llvm::Module *M) override {
+    (void)M;
+    return nullptr;
+  }
+
+private:
+  std::string outputPath;
+};
 
   constexpr llvm::StringLiteral kPythonFrontendScript = R"PY(
 import ast
+import os
 import sys
 from lython.mlir import ir
 from lython.visitors._base import BaseVisitor
@@ -96,13 +134,16 @@ def main():
     with open(input_path, "r", encoding="utf-8") as source_file:
         source = source_file.read()
     tree = ast.parse(source, filename=input_path)
+    abs_path = os.path.abspath(input_path)
+    tree.lython_module_name = abs_path
     ctx = ir.Context()
     parser = BaseVisitor(ctx)
+    parser._set_module_name(abs_path)
     parser.visit(tree)
     module = parser.module
     if not module.operation.verify():
         raise SystemExit("Generated module failed verification")
-    sys.stdout.write(str(module))
+    module.operation.print(file=sys.stdout, enable_debug_info=True)
     sys.stdout.flush()
 
 if __name__ == "__main__":
@@ -237,51 +278,61 @@ if __name__ == "__main__":
     return success();
   }
 
-  void registerRuntimeSymbols(ExecutionEngine& engine) {
-    engine.registerSymbols([](llvm::orc::MangleAndInterner interner) {
-      llvm::orc::SymbolMap symbolMap;
-      auto add = [&](llvm::StringRef name, auto* ptr) {
-        symbolMap[interner(name)] = {
-            llvm::orc::ExecutorAddr::fromPtr(ptr),
-            llvm::JITSymbolFlags::Exported };
-        };
-      add("Ly_IncRef", &Ly_IncRef);
-      add("Ly_DecRef", &Ly_DecRef);
-      add("LyUnicode_FromUTF8", &LyUnicode_FromUTF8);
-      add("LyTuple_New", &LyTuple_New);
-      add("LyTuple_SetItem", &LyTuple_SetItem);
-      add("Ly_GetEmptyTuple", &Ly_GetEmptyTuple);
-      add("LyDict_New", &LyDict_New);
-      add("LyDict_Insert", &LyDict_Insert);
-      add("LyDict_GetItem", &LyDict_GetItem);
-      add("Ly_GetNone", &Ly_GetNone);
-      add("Ly_GetBuiltinPrint", &Ly_GetBuiltinPrint);
-      add("LyTensorF16_Repr", &LyTensorF16_Repr);
-      add("LyTensorF32_Repr", &LyTensorF32_Repr);
-      add("LyTensorF64_Repr", &LyTensorF64_Repr);
-      add("LyTensorF128_Repr", &LyTensorF128_Repr);
-      add("_mlir_ciface_LyTensorF16_Repr", &_mlir_ciface_LyTensorF16_Repr);
-      add("_mlir_ciface_LyTensorF32_Repr", &_mlir_ciface_LyTensorF32_Repr);
-      add("_mlir_ciface_LyTensorF64_Repr", &_mlir_ciface_LyTensorF64_Repr);
-      add("_mlir_ciface_LyTensorF128_Repr", &_mlir_ciface_LyTensorF128_Repr);
-      add("Ly_CallVectorcall", &Ly_CallVectorcall);
-      add("Ly_Call", &Ly_Call);
-      add("LyLong_FromI64", &LyLong_FromI64);
-      add("LyLong_FromString", &LyLong_FromString);
-      add("LyLong_Add", &LyLong_Add);
-      add("LyLong_Sub", &LyLong_Sub);
-      add("LyLong_Compare", &LyLong_Compare);
-      add("LyFloat_FromDouble", &LyFloat_FromDouble);
-      add("LyFloat_Add", &LyFloat_Add);
-      add("LyFloat_Sub", &LyFloat_Sub);
-      add("LyBool_FromBool", &LyBool_FromBool);
-      add("LyObject_Repr", &LyObject_Repr);
-      add("LyNumber_Add", &LyNumber_Add);
-      add("LyNumber_Sub", &LyNumber_Sub);
-      add("LyNumber_Le", &LyNumber_Le);
-      add("LyBool_AsBool", &LyBool_AsBool);
-      return symbolMap;
-      });
+  llvm::orc::SymbolMap buildRuntimeSymbolMap(
+      llvm::orc::MangleAndInterner interner) {
+    llvm::orc::SymbolMap symbolMap;
+    auto add = [&](llvm::StringRef name, auto* ptr) {
+      symbolMap[interner(name)] = { llvm::orc::ExecutorAddr::fromPtr(ptr),
+                                    llvm::JITSymbolFlags::Exported };
+    };
+    add("Ly_IncRef", &Ly_IncRef);
+    add("Ly_DecRef", &Ly_DecRef);
+    add("LyUnicode_FromUTF8", &LyUnicode_FromUTF8);
+    add("LyTuple_New", &LyTuple_New);
+    add("LyTuple_SetItem", &LyTuple_SetItem);
+    add("Ly_GetEmptyTuple", &Ly_GetEmptyTuple);
+    add("LyDict_New", &LyDict_New);
+    add("LyDict_Insert", &LyDict_Insert);
+    add("LyDict_GetItem", &LyDict_GetItem);
+    add("Ly_GetNone", &Ly_GetNone);
+    add("Ly_GetBuiltinPrint", &Ly_GetBuiltinPrint);
+    add("LyTensorF16_Repr", &LyTensorF16_Repr);
+    add("LyTensorF32_Repr", &LyTensorF32_Repr);
+    add("LyTensorF64_Repr", &LyTensorF64_Repr);
+    add("LyTensorF128_Repr", &LyTensorF128_Repr);
+    add("_mlir_ciface_LyTensorF16_Repr", &_mlir_ciface_LyTensorF16_Repr);
+    add("_mlir_ciface_LyTensorF32_Repr", &_mlir_ciface_LyTensorF32_Repr);
+    add("_mlir_ciface_LyTensorF64_Repr", &_mlir_ciface_LyTensorF64_Repr);
+    add("_mlir_ciface_LyTensorF128_Repr", &_mlir_ciface_LyTensorF128_Repr);
+    add("Ly_CallVectorcall", &Ly_CallVectorcall);
+    add("Ly_CallVectorcall_Invoke", &Ly_CallVectorcall_Invoke);
+    add("Ly_Call", &Ly_Call);
+    add("LyLong_FromI64", &LyLong_FromI64);
+    add("LyLong_FromString", &LyLong_FromString);
+    add("LyLong_Add", &LyLong_Add);
+    add("LyLong_Sub", &LyLong_Sub);
+    add("LyLong_Compare", &LyLong_Compare);
+    add("LyFloat_FromDouble", &LyFloat_FromDouble);
+    add("LyFloat_Add", &LyFloat_Add);
+    add("LyFloat_Sub", &LyFloat_Sub);
+    add("LyBool_FromBool", &LyBool_FromBool);
+    add("LyObject_Repr", &LyObject_Repr);
+    add("LyException_New", &LyException_New);
+    add("LyException_SetCurrent", &LyException_SetCurrent);
+    add("LyException_GetCurrent", &LyException_GetCurrent);
+    add("LyException_Clear", &LyException_Clear);
+    add("LyEH_Throw", &LyEH_Throw);
+    add("LyEH_Capture", &LyEH_Capture);
+    add("LyEH_ReportUnhandled", &LyEH_ReportUnhandled);
+    add("LyTraceback_Push", &LyTraceback_Push);
+    add("LyTraceback_Pop", &LyTraceback_Pop);
+    add("LyTraceback_Clear", &LyTraceback_Clear);
+    add("LyTraceback_Print", &LyTraceback_Print);
+    add("LyNumber_Add", &LyNumber_Add);
+    add("LyNumber_Sub", &LyNumber_Sub);
+    add("LyNumber_Le", &LyNumber_Le);
+    add("LyBool_AsBool", &LyBool_AsBool);
+    return symbolMap;
   }
 
   OwningOpRef<ModuleOp> parseModuleFromBuffer(StringRef buffer,
@@ -551,20 +602,136 @@ if __name__ == "__main__":
     llvm::InitializeNativeTarget();
     llvm::InitializeNativeTargetAsmPrinter();
 
-    llvm::Expected<std::unique_ptr<mlir::ExecutionEngine>> maybeEngine = mlir::ExecutionEngine::create(module);
-    if (!maybeEngine) {
-      llvm::errs() << "Failed to create ExecutionEngine\n";
+    auto tmBuilderOrErr = llvm::orc::JITTargetMachineBuilder::detectHost();
+    if (!tmBuilderOrErr) {
+      llvm::errs() << "Failed to create JITTargetMachineBuilder: "
+                   << llvm::toString(tmBuilderOrErr.takeError()) << "\n";
       return failure();
     }
-    auto engine = std::move(maybeEngine.get());
-    registerRuntimeSymbols(*engine);
-    int32_t exitCode = 0;
-    if (auto err = engine->invoke("main", ExecutionEngine::result(exitCode))) {
-      llvm::errs() << "JIT session error: " << err << "\n";
-      llvm::errs() << "ExecutionEngine invocation failed\n";
+    auto tmBuilder = std::move(*tmBuilderOrErr);
+    auto options = tmBuilder.getOptions();
+    options.ExceptionModel = llvm::ExceptionHandling::DwarfCFI;
+    options.MCOptions.EmitCompactUnwindNonCanonical = true;
+    options.ForceDwarfFrameSection = true;
+    options.MCOptions.EmitDwarfUnwind = llvm::EmitDwarfUnwindType::Always;
+    tmBuilder.setOptions(options);
+
+    std::unique_ptr<FileObjectCache> objectCache;
+    if (const char *dumpEnv = std::getenv("LYTHON_DUMP_JIT_OBJECT")) {
+      std::string dumpPath = dumpEnv;
+      if (dumpPath.empty() || dumpPath == "1")
+        dumpPath = "/tmp/lython_jit.o";
+      objectCache = std::make_unique<FileObjectCache>(std::move(dumpPath));
+    }
+
+    auto compileFunctionCreator =
+        [&](llvm::orc::JITTargetMachineBuilder jtmb)
+            -> llvm::Expected<
+                std::unique_ptr<llvm::orc::IRCompileLayer::IRCompiler>> {
+      auto tmOrErr = jtmb.createTargetMachine();
+      if (!tmOrErr)
+        return tmOrErr.takeError();
+      return std::make_unique<llvm::orc::TMOwningSimpleCompiler>(
+          std::move(*tmOrErr), objectCache.get());
+    };
+
+    auto objectLayerCreator =
+        [](llvm::orc::ExecutionSession &session,
+           const llvm::Triple &tt)
+        -> std::unique_ptr<llvm::orc::ObjectLayer> {
+      auto layer = std::make_unique<llvm::orc::ObjectLinkingLayer>(session);
+      if (tt.isOSBinFormatCOFF()) {
+        layer->setOverrideObjectFlagsWithResponsibilityFlags(true);
+        layer->setAutoClaimResponsibilityForObjectSymbols(true);
+      }
+      return layer;
+    };
+
+    llvm::orc::LLJITBuilder builder;
+    builder.setJITTargetMachineBuilder(std::move(tmBuilder))
+        .setCompileFunctionCreator(compileFunctionCreator)
+        .setObjectLinkingLayerCreator(objectLayerCreator)
+        .setPrePlatformSetup([](llvm::orc::LLJIT &jit) -> llvm::Error {
+              auto psjd = jit.getProcessSymbolsJITDylib();
+              if (!psjd)
+                return llvm::make_error<llvm::StringError>(
+                    "Native platforms require a process symbols JITDylib",
+                    llvm::inconvertibleErrorCode());
+              auto dlGen =
+                  llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
+                      jit.getDataLayout().getGlobalPrefix());
+              if (dlGen)
+                psjd->addGenerator(std::move(*dlGen));
+#if defined(__APPLE__)
+              const char *libcppCandidates[] = {
+                  "/usr/lib/libc++.1.dylib",
+                  "libc++.1.dylib",
+                  "/usr/lib/libc++abi.dylib",
+                  "libc++abi.dylib",
+              };
+              for (const char *lib : libcppCandidates) {
+                if (auto gen =
+                        llvm::orc::DynamicLibrarySearchGenerator::Load(
+                            lib, jit.getDataLayout().getGlobalPrefix())) {
+                  psjd->addGenerator(std::move(*gen));
+                } else {
+                  llvm::consumeError(gen.takeError());
+                }
+              }
+#endif
+              return llvm::Error::success();
+            });
+    auto jitExpected = builder.create();
+    if (!jitExpected) {
+      llvm::errs() << "Failed to create LLJIT\n";
       return failure();
     }
-    return success();
+    auto jit = std::move(*jitExpected);
+
+    auto llvmContext = std::make_unique<llvm::LLVMContext>();
+    auto llvmModule = mlir::translateModuleToLLVMIR(module, *llvmContext);
+    if (!llvmModule) {
+      llvm::errs() << "Failed to translate to LLVM IR\n";
+      return failure();
+    }
+    for (auto &func : *llvmModule) {
+      if (!func.isDeclaration())
+        func.setUWTableKind(llvm::UWTableKind::Async);
+    }
+
+    llvmModule->setDataLayout(jit->getDataLayout());
+    llvmModule->setTargetTriple(jit->getTargetTriple().getTriple());
+
+    auto &jd = jit->getMainJITDylib();
+    auto dlGen =
+        llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
+            jit->getDataLayout().getGlobalPrefix());
+    if (dlGen)
+      jd.addGenerator(std::move(*dlGen));
+    llvm::orc::MangleAndInterner interner(jd.getExecutionSession(),
+                                          jit->getDataLayout());
+    auto symbolMap = buildRuntimeSymbolMap(interner);
+    cantFail(jd.define(absoluteSymbols(std::move(symbolMap))));
+
+    auto tsm = llvm::orc::ThreadSafeModule(std::move(llvmModule),
+                                           std::move(llvmContext));
+    if (auto err = jit->addIRModule(std::move(tsm))) {
+      llvm::errs() << "JIT add module error: " << err << "\n";
+      return failure();
+    }
+    if (auto err = jit->initialize(jd)) {
+      llvm::errs() << "JIT initialize error: " << err << "\n";
+      return failure();
+    }
+
+    auto sym = jit->lookup("_mlir_ciface_main");
+    if (!sym) {
+      llvm::errs() << "JIT lookup failed: " << sym.takeError() << "\n";
+      return failure();
+    }
+    auto *entry = sym->toPtr<int32_t (*)()>();
+    int32_t exitCode = entry();
+    return exitCode == 0 ? success() : failure();
   }
 
 } // namespace
@@ -587,6 +754,9 @@ JitInputFilename(llvm::cl::Positional, llvm::cl::desc("<input file>"),
   llvm::cl::Required, llvm::cl::sub(JitCommand));
 
 int main(int argc, char** argv) {
+  if (std::getenv("LYTHON_DEBUG_SIGNALS")) {
+    llvm::sys::PrintStackTraceOnErrorSignal(argv[0]);
+  }
   llvm::cl::SetVersionPrinter([](llvm::raw_ostream& os) {
     os << "Lython CLI based on MLIR\n";
     });

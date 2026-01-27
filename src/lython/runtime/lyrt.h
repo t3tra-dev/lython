@@ -4,12 +4,14 @@
 
 #include "objects/bool.h"
 #include "objects/dict.h"
+#include "objects/exception.h"
 #include "objects/float.h"
 #include "objects/function.h"
 #include "objects/long.h"
 #include "objects/object.h"
 #include "objects/tuple.h"
 #include "objects/unicode.h"
+#include "traceback.h"
 
 template <typename T>
 struct UnrankedMemRefType;
@@ -53,5 +55,16 @@ bool LyBool_AsBool(LyObject *object);
 LyObject *Ly_CallVectorcall(LyObject *callable, LyTupleObject *posargs,
                             LyTupleObject *kwnames, LyTupleObject *kwvalues);
 LyObject *Ly_Call(LyObject *callable, LyTupleObject *posargs, LyObject *kwargs);
+struct LyCallResult {
+  LyObject *result;
+  LyObject *exception;
+};
+LyCallResult Ly_CallVectorcall_EH(LyObject *callable, LyTupleObject *posargs,
+                                  LyTupleObject *kwnames,
+                                  LyTupleObject *kwvalues);
+LyObject *Ly_CallVectorcall_Invoke(LyObject *callable, LyTupleObject *posargs,
+                                   LyTupleObject *kwnames,
+                                   LyTupleObject *kwvalues);
+void LyEH_Throw(LyObject *exception);
 
 } // extern "C"

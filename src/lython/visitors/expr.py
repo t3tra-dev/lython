@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import ast
 
-from lython.mlir.dialects import _lython_ops_gen as py_ops
-from lython.mlir.dialects import arith as arith_ops
-from lython.mlir.dialects import func as func_ops
-from lython.mlir.dialects import tensor as tensor_ops
-
 from ..mlir import ir
+from ..mlir.dialects import _lython_ops_gen as py_ops
+from ..mlir.dialects import arith as arith_ops
+from ..mlir.dialects import func as func_ops
+from ..mlir.dialects import tensor as tensor_ops
 from ._base import PRIMITIVE_BASE_TYPES, BaseVisitor, ClassInfo, FunctionInfo
 
 __all__ = ["ExprVisitor"]
@@ -546,29 +545,72 @@ class ExprVisitor(BaseVisitor):
         callee = self.require_value(node.func, self.visit(node.func))
         arg_values = [self.require_value(arg, self.visit(arg)) for arg in node.args]
 
+        if isinstance(node.func, ast.Name):
+            func_info = self.lookup_function(node.func.id)
+            result_types = list(func_info.result_types)
+            if func_info.maythrow:
+                if result_types != [self.get_py_type("!py.none")]:
+                    self._note_maythrow()
+                    raise NotImplementedError(
+                        "py.invoke for value-returning calls is not implemented yet"
+                    )
+        else:
+            raise NotImplementedError("Only direct function calls are supported")
+
+        normal_block = None
+
         with loc, self.insertion_point():
-            if isinstance(node.func, ast.Name):
-                func_info = self.lookup_function(node.func.id)
-                result_types = list(func_info.result_types)
-                if not func_info.has_vararg:
-                    if len(arg_values) != len(func_info.arg_types):
-                        raise NotImplementedError(
-                            f"Function '{node.func.id}' expects {len(func_info.arg_types)} "
-                            f"arguments, got {len(arg_values)}"
-                        )
-                    posargs = self.build_tuple(arg_values, loc=loc)
-                else:
-                    object_args = [
-                        self.ensure_object(value, loc=loc) for value in arg_values
-                    ]
-                    posargs = self.build_tuple(object_args, loc=loc)
+            if not func_info.has_vararg:
+                if len(arg_values) != len(func_info.arg_types):
+                    raise NotImplementedError(
+                        f"Function '{node.func.id}' expects {len(func_info.arg_types)} "
+                        f"arguments, got {len(arg_values)}"
+                    )
+                posargs = self.build_tuple(arg_values, loc=loc)
             else:
-                raise NotImplementedError("Only direct function calls are supported")
+                object_args = [
+                    self.ensure_object(value, loc=loc) for value in arg_values
+                ]
+                posargs = self.build_tuple(object_args, loc=loc)
             empty_tuple_type = self.get_py_type("!py.tuple<>")
             kwnames = py_ops.TupleEmptyOp(empty_tuple_type).result
             kwvalues = py_ops.TupleEmptyOp(empty_tuple_type).result
-            if len(result_types) != 1:
-                raise NotImplementedError("Only single-result functions supported")
+
+            if func_info.maythrow:
+                parent_region = self.current_block.region  # type: ignore[union-attr]
+                normal_block = parent_region.blocks.append()  # type: ignore[reportUnknownMemberType]
+                unwind_block = parent_region.blocks.append(  # type: ignore[reportUnknownMemberType]
+                    self.get_py_type("!py.exception")
+                )
+                exc_null = py_ops.ExceptionNullOp(
+                    self.get_py_type("!py.exception")
+                ).result
+                py_ops.InvokeOp(
+                    callee,
+                    posargs,
+                    kwnames,
+                    kwvalues,
+                    [],
+                    [exc_null],
+                    normal_block,
+                    unwind_block,
+                )
+                with ir.InsertionPoint(unwind_block), loc:
+                    py_ops.RaiseCurrentOp()
+
+        if func_info.maythrow:
+            if normal_block is None:
+                raise RuntimeError(
+                    "Internal error: normal_block was not created for maythrow call"
+                )
+            self._set_insertion_block(normal_block)
+            with loc, self.insertion_point():
+                none_val = py_ops.NoneOp(self.get_py_type("!py.none")).result
+            return none_val
+
+        if len(result_types) != 1:
+            raise NotImplementedError("Only single-result functions supported")
+        with loc, self.insertion_point():
             call = py_ops.CallVectorOp(result_types, callee, posargs, kwnames, kwvalues)
             return call.results_[0]
 

@@ -58,10 +58,14 @@ except Exception:
 from .dialects import func as _func_module
 from .dialects import arith as _arith_module
 from .dialects import cf as _cf_module
+from .dialects import linalg as _linalg_module
+from .dialects import tensor as _tensor_module
 
 _sys.modules.setdefault("mlir.dialects.func", _func_module)
 _sys.modules.setdefault("mlir.dialects.arith", _arith_module)
 _sys.modules.setdefault("mlir.dialects.cf", _cf_module)
+_sys.modules.setdefault("mlir.dialects.linalg", _linalg_module)
+_sys.modules.setdefault("mlir.dialects.tensor", _tensor_module)
 
 __all__ = [
     "ir",

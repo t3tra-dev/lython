@@ -113,6 +113,18 @@ ClassType ClassType::get(MLIRContext *ctx, ::llvm::StringRef className) {
   return getImpl()->className;
 }
 
+ExceptionType ExceptionType::get(MLIRContext *ctx) {
+  return Base::get(ctx, TypeKind::Exception);
+}
+
+TracebackType TracebackType::get(MLIRContext *ctx) {
+  return Base::get(ctx, TypeKind::Traceback);
+}
+
+LocationType LocationType::get(MLIRContext *ctx) {
+  return Base::get(ctx, TypeKind::Location);
+}
+
 FuncSignatureType FuncSignatureType::get(MLIRContext *ctx,
                                          ArrayRef<Type> positional,
                                          ArrayRef<Type> kwonly, Type varargType,
@@ -183,6 +195,12 @@ bool isPyDictType(Type type) { return mlir::isa<DictType>(type); }
 
 bool isPyClassType(Type type) { return mlir::isa<ClassType>(type); }
 
+bool isPyExceptionType(Type type) { return mlir::isa<ExceptionType>(type); }
+
+bool isPyTracebackType(Type type) { return mlir::isa<TracebackType>(type); }
+
+bool isPyLocationType(Type type) { return mlir::isa<LocationType>(type); }
+
 bool isPyFuncSigType(Type type) { return mlir::isa<FuncSignatureType>(type); }
 
 bool isPyFuncType(Type type) { return mlir::isa<FuncType>(type); }
@@ -196,7 +214,8 @@ bool isCallableType(Type type) {
 bool isPyType(Type type) {
   return llvm::TypeSwitch<Type, bool>(type)
       .Case<IntType, FloatType, BoolType, StrType, ObjectType, NoneType,
-            TupleType, DictType, ClassType, FuncType>([](auto) { return true; })
+            TupleType, DictType, ClassType, ExceptionType, TracebackType,
+            LocationType, FuncType>([](auto) { return true; })
       .Default([](Type) { return false; });
 }
 

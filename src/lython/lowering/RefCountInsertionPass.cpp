@@ -66,6 +66,9 @@ static bool doesConsumeOperand(Operation *op, Value operand) {
   if (isa<ReturnOp>(op))
     return true;
 
+  if (isa<RaiseOp>(op))
+    return true;
+
   if (isa<TupleCreateOp>(op))
     return true;
 

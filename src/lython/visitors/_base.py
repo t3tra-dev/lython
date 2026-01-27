@@ -34,6 +34,7 @@ class FunctionInfo(NamedTuple):
     arg_types: tuple[ir.Type, ...]
     result_types: tuple[ir.Type, ...]
     has_vararg: bool
+    maythrow: bool
 
 
 class MethodInfo(NamedTuple):
@@ -42,6 +43,7 @@ class MethodInfo(NamedTuple):
     name: str
     arg_types: tuple[ir.Type, ...]  # Including self
     result_types: tuple[ir.Type, ...]
+    maythrow: bool
 
 
 class ClassInfo(NamedTuple):
@@ -77,6 +79,8 @@ class BaseVisitor:
         self._module_name: str = "__main__"
         self._functions: dict[str, FunctionInfo] = {}
         self._classes: dict[str, ClassInfo] = {}
+        self._function_effect_stack: list[bool] = []
+        self._function_name_stack: list[str] = []
         # Primitive world support
         self._in_native_func: bool = False  # True when inside @native function
         self._native_gc_mode: str | None = None
@@ -115,6 +119,8 @@ class BaseVisitor:
             visitor._module_name = self._module_name
             visitor._functions = self._functions
             visitor._classes = self._classes
+            visitor._function_effect_stack = self._function_effect_stack
+            visitor._function_name_stack = self._function_name_stack
             visitor._prim_types = self._prim_types
             visitor._lyrt_builtins = self._lyrt_builtins
             visitor._native_gc_mode = self._native_gc_mode
@@ -192,6 +198,16 @@ class BaseVisitor:
         self.current_block = block
         for visitor in self.subvisitors.values():
             visitor.current_block = block
+
+    def _set_func_effect(self, func: Any, maythrow: bool) -> None:
+        if "nothrow" in func.attributes:
+            del func.attributes["nothrow"]
+        if "maythrow" in func.attributes:
+            del func.attributes["maythrow"]
+        if maythrow:
+            func.attributes["maythrow"] = ir.UnitAttr.get(self.ctx)
+        else:
+            func.attributes["nothrow"] = ir.UnitAttr.get(self.ctx)
 
     def get_py_type(self, type_spec: str) -> ir.Type:
         cached = self._type_cache.get(type_spec)
@@ -309,6 +325,7 @@ class BaseVisitor:
         *,
         symbol: str | None = None,
         has_vararg: bool = False,
+        maythrow: bool = False,
     ) -> None:
         info = FunctionInfo(
             symbol or name,
@@ -316,6 +333,7 @@ class BaseVisitor:
             tuple(arg_types),
             tuple(result_types),
             has_vararg,
+            maythrow,
         )
         self._functions[name] = info
 
@@ -323,6 +341,28 @@ class BaseVisitor:
         if name not in self._functions:
             raise NameError(f"Unknown function '{name}'")
         return self._functions[name]
+
+    def _enter_py_function(self, name: str) -> None:
+        self._function_effect_stack.append(False)
+        self._function_name_stack.append(name)
+        for visitor in self.subvisitors.values():
+            visitor._function_effect_stack = self._function_effect_stack
+            visitor._function_name_stack = self._function_name_stack
+
+    def _exit_py_function(self) -> bool:
+        if not self._function_effect_stack or not self._function_name_stack:
+            raise RuntimeError("Function effect stack underflow")
+        maythrow = self._function_effect_stack.pop()
+        self._function_name_stack.pop()
+        for visitor in self.subvisitors.values():
+            visitor._function_effect_stack = self._function_effect_stack
+            visitor._function_name_stack = self._function_name_stack
+        return maythrow
+
+    def _note_maythrow(self) -> None:
+        if not self._function_effect_stack:
+            return
+        self._function_effect_stack[-1] = True
 
     def register_class(
         self,
@@ -371,11 +411,37 @@ class BaseVisitor:
             return False
         terminators = {
             "py.return",
+            "py.raise",
+            "py.raise.current",
+            "py.invoke",
             "func.return",
             "cf.br",
             "cf.cond_br",
         }
         return ops[-1].operation.name in terminators
+
+    def _advance_block_after_terminator(self) -> None:
+        """Move insertion to a fresh block if the current block is terminated."""
+        block = self.current_block
+        if block is None:
+            return
+        ops = list(block.operations)
+        if not ops:
+            return
+        terminators = {
+            "py.return",
+            "py.raise",
+            "py.raise.current",
+            "py.invoke",
+            "func.return",
+            "cf.br",
+            "cf.cond_br",
+        }
+        if ops[-1].operation.name not in terminators:
+            return
+        # Do not create an unreachable empty block. Callers should
+        # explicitly set a new insertion block when control can continue.
+        self._set_insertion_block(None)
 
     # --- Primitive world support -------------------------------------------
     def get_primitive_type_from_spec(self, base_type: str, bits: int) -> ir.Type:
@@ -663,6 +729,40 @@ class BaseVisitor:
                 for _ in range(total)
             ]
             return tensor_ops.FromElementsOp(tensor_type, elements).result
+
+    def build_exception_value(
+        self,
+        *,
+        message: str | None,
+        loc: ir.Location,
+        exc_type_name: str = "Exception",
+    ) -> ir.Value:
+        exc_type = self.get_py_type(f'!py.class<"{exc_type_name}">')
+        empty_tuple = self.get_py_type("!py.tuple<>")
+        extras_dict = self.get_py_type("!py.dict<!py.str, !py.object>")
+        with loc, self.insertion_point():
+            exc_type_val = py_ops.ClassNewOp(exc_type, exc_type_name).result
+            msg = py_ops.StrConstantOp(
+                self.get_py_type("!py.str"),
+                ir.StringAttr.get(message or "", self.ctx),
+            ).result
+            args = py_ops.TupleEmptyOp(empty_tuple).result
+            cause = py_ops.ExceptionNullOp(self.get_py_type("!py.exception")).result
+            context = py_ops.ExceptionNullOp(self.get_py_type("!py.exception")).result
+            tb = py_ops.TracebackNullOp(self.get_py_type("!py.traceback")).result
+            location = py_ops.LocationCurrentOp(self.get_py_type("!py.location")).result
+            extras = py_ops.DictEmptyOp(extras_dict).result
+            return py_ops.ExceptionNewOp(
+                self.get_py_type("!py.exception"),
+                exc_type_val,
+                msg,
+                args,
+                cause,
+                context,
+                tb,
+                location,
+                extras,
+            ).result
 
     def _set_in_native_func(self, value: bool) -> None:
         """Set native function mode across all subvisitors."""

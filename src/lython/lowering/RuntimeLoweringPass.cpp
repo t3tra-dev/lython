@@ -20,10 +20,13 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -134,7 +137,8 @@ struct RuntimeLoweringPass
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RuntimeLoweringPass)
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<LLVM::LLVMDialect, func::FuncDialect>();
+    registry.insert<LLVM::LLVMDialect, func::FuncDialect,
+                    cf::ControlFlowDialect>();
   }
 
   void runOnOperation() override {
@@ -238,7 +242,7 @@ struct RuntimeLoweringPass
         target.addLegalDialect<py::PyDialect>();
         target.addLegalOp<ModuleOp>();
         target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
-        target.addIllegalOp<CallVectorOp, CallOp>();
+        target.addIllegalOp<CallVectorOp, CallOp, InvokeOp>();
 
         ScopedDiagnosticHandler diagHandler(ctx, materializationFilter);
         auto result =
@@ -288,7 +292,10 @@ struct RuntimeLoweringPass
             TupleCreateOp, DictEmptyOp, DictInsertOp, NoneOp, FuncObjectOp,
             NumAddOp, NumSubOp, NumLtOp, NumLeOp, NumGtOp, NumGeOp, NumEqOp,
             NumNeOp, CastToPrimOp, CastFromPrimOp, CastIdentityOp, UpcastOp,
-            IncRefOp, DecRefOp, ClassNewOp, AttrGetOp, AttrSetOp, ClassOp>();
+            IncRefOp, DecRefOp, ClassNewOp, AttrGetOp, AttrSetOp, ClassOp,
+            ExceptionNullOp, TracebackNullOp, LocationCurrentOp,
+            ExceptionNewOp, RaiseOp, RaiseCurrentOp, TryOp, TryYieldOp,
+            ExceptYieldOp, FinallyYieldOp, ExceptMatchOp>();
 
         ScopedDiagnosticHandler diagHandler(ctx, materializationFilter);
         auto result =
@@ -318,6 +325,50 @@ struct RuntimeLoweringPass
     // Apply post-lowering optimizations
     runPostLoweringOptimizations(module);
 
+    // Normalize invoke unwind block arguments to LLVM pointer types.
+    {
+      auto pyObject = LLVM::LLVMPointerType::get(ctx);
+      module.walk([&](LLVM::InvokeOp invoke) {
+        Block *unwind = invoke.getUnwindDest();
+        if (!unwind)
+          return;
+        for (BlockArgument arg : llvm::make_early_inc_range(
+                 unwind->getArguments())) {
+          if (!isPyType(arg.getType()))
+            continue;
+          arg.setType(pyObject);
+          for (auto &use :
+               llvm::make_early_inc_range(arg.getUses())) {
+            auto *owner = use.getOwner();
+            auto cast = dyn_cast<UnrealizedConversionCastOp>(owner);
+            if (!cast)
+              continue;
+            if (cast->getNumOperands() != 1 || cast->getNumResults() != 1)
+              continue;
+            if (cast.getResult(0).getType() != pyObject)
+              continue;
+            cast.getResult(0).replaceAllUsesWith(arg);
+            cast.erase();
+          }
+        }
+      });
+    }
+
+    // Some passes may drop llvm.personality; restore it for landingpads.
+    auto ensurePersonalityForLandingpads = [&]() {
+      auto personality =
+          FlatSymbolRefAttr::get(ctx, "__gxx_personality_v0");
+      module.walk([&](func::FuncOp func) {
+        if (func->hasAttr("llvm.personality"))
+          return;
+        bool hasLandingpad = false;
+        func.walk([&](LLVM::LandingpadOp) { hasLandingpad = true; });
+        if (hasLandingpad)
+          func->setAttr("llvm.personality", personality);
+      });
+    };
+    ensurePersonalityForLandingpads();
+
     if (dumpLowering) {
       llvm::errs() << "[After optimizations]\n";
       module.dump();
@@ -333,6 +384,200 @@ struct RuntimeLoweringPass
                                      config))) {
       signalPassFailure();
       return;
+    }
+
+    // Phase 6: Convert func.func to llvm.func before final EH materialization.
+    {
+      if (dumpLowering) {
+        llvm::errs() << "[Before func-to-llvm conversion]\n";
+        module.dump();
+      }
+      RewritePatternSet patterns(ctx);
+      populateFuncToLLVMConversionPatterns(typeConverter, patterns);
+      ConversionTarget target(*ctx);
+      target.addLegalDialect<LLVM::LLVMDialect>();
+      target.addIllegalDialect<func::FuncDialect>();
+      target.addLegalOp<ModuleOp>();
+      target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
+      if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
+        signalPassFailure();
+        return;
+      }
+      if (dumpLowering) {
+        llvm::errs() << "[After func-to-llvm conversion]\n";
+        module.dump();
+      }
+    }
+
+    // Finalize unwind blocks with landingpad in LLVM world.
+    {
+      auto pyObject = LLVM::LLVMPointerType::get(ctx);
+      auto getOrCreatePersonality = [&]() {
+        StringRef name = "__gxx_personality_v0";
+        if (auto fn = module.lookupSymbol<LLVM::LLVMFuncOp>(name))
+          return fn;
+        OpBuilder builder(module.getBody(), module.getBody()->begin());
+        auto fnType =
+            LLVM::LLVMFunctionType::get(builder.getI32Type(), {}, true);
+        return builder.create<LLVM::LLVMFuncOp>(module.getLoc(), name, fnType);
+      };
+      auto getOrCreateRuntimeFunc = [&](StringRef name, Type resultType,
+                                        ArrayRef<Type> argTypes) {
+        if (auto fn = module.lookupSymbol<LLVM::LLVMFuncOp>(name))
+          return fn;
+        OpBuilder builder(module.getBody(), module.getBody()->begin());
+        auto fnType =
+            LLVM::LLVMFunctionType::get(resultType, argTypes, false);
+        return builder.create<LLVM::LLVMFuncOp>(module.getLoc(), name, fnType);
+      };
+      auto emitRuntimeCall = [&](OpBuilder &builder, Location loc,
+                                 StringRef name, Type resultType,
+                                 ValueRange operands) {
+        SmallVector<Type> argTypes;
+        argTypes.reserve(operands.size());
+        for (Value operand : operands)
+          argTypes.push_back(operand.getType());
+        Type actualResult =
+            resultType ? resultType : LLVM::LLVMVoidType::get(ctx);
+        auto callee = getOrCreateRuntimeFunc(name, actualResult, argTypes);
+        auto symbol = SymbolRefAttr::get(ctx, callee.getName());
+        SmallVector<Type> results;
+        if (!isa<LLVM::LLVMVoidType>(actualResult))
+          results.push_back(actualResult);
+        return builder.create<LLVM::CallOp>(loc, results, symbol, operands);
+      };
+
+      auto personality = getOrCreatePersonality();
+      auto personalityRef = FlatSymbolRefAttr::get(ctx, personality.getName());
+
+      module.walk([&](LLVM::InvokeOp invoke) {
+        auto func = invoke->getParentOfType<LLVM::LLVMFuncOp>();
+        if (func && !func->hasAttr("personality"))
+          func->setAttr("personality", personalityRef);
+
+        Block *unwind = invoke.getUnwindDest();
+        if (!unwind)
+          return;
+        unwind->clear();
+        OpBuilder builder(ctx);
+        builder.setInsertionPointToStart(unwind);
+        auto lpType = LLVM::LLVMStructType::getLiteral(
+            ctx, ArrayRef<Type>{pyObject, builder.getI32Type()});
+        auto lp = builder.create<LLVM::LandingpadOp>(
+            invoke.getLoc(), lpType, builder.getUnitAttr(), ValueRange{});
+        Value raw = builder.create<LLVM::ExtractValueOp>(
+            invoke.getLoc(), pyObject, lp.getRes(),
+            builder.getDenseI64ArrayAttr({0}));
+        emitRuntimeCall(builder, invoke.getLoc(), RuntimeSymbols::kEHCapture,
+                        pyObject, ValueRange{raw});
+        builder.create<LLVM::ResumeOp>(invoke.getLoc(), lp.getRes());
+      });
+      if (dumpLowering) {
+        llvm::errs() << "[After EH finalize]\n";
+        module.dump();
+      }
+    }
+
+    // Insert a top-level exception handler wrapper for `main`.
+    {
+      auto mainFunc = module.lookupSymbol<LLVM::LLVMFuncOp>("main");
+      if (mainFunc) {
+        auto fnType = mainFunc.getFunctionType();
+        if (fnType.getNumParams() == 0 &&
+            !isa<LLVM::LLVMVoidType>(fnType.getReturnType())) {
+          StringRef implName = "__lython_main";
+          if (!module.lookupSymbol<LLVM::LLVMFuncOp>(implName)) {
+            mainFunc.setName(implName);
+
+            auto getOrCreateRuntimeFunc = [&](StringRef name, Type resultType,
+                                              ArrayRef<Type> argTypes) {
+              if (auto fn = module.lookupSymbol<LLVM::LLVMFuncOp>(name))
+                return fn;
+              OpBuilder builder(module.getBody(), module.getBody()->begin());
+              auto fnType =
+                  LLVM::LLVMFunctionType::get(resultType, argTypes, false);
+              return builder.create<LLVM::LLVMFuncOp>(module.getLoc(), name,
+                                                      fnType);
+            };
+            auto emitRuntimeCall = [&](OpBuilder &builder, Location loc,
+                                       StringRef name, Type resultType,
+                                       ValueRange operands) {
+              SmallVector<Type> argTypes;
+              argTypes.reserve(operands.size());
+              for (Value operand : operands)
+                argTypes.push_back(operand.getType());
+              Type actualResult =
+                  resultType ? resultType : LLVM::LLVMVoidType::get(ctx);
+              auto callee =
+                  getOrCreateRuntimeFunc(name, actualResult, argTypes);
+              auto symbol = SymbolRefAttr::get(ctx, callee.getName());
+              SmallVector<Type> results;
+              if (!isa<LLVM::LLVMVoidType>(actualResult))
+                results.push_back(actualResult);
+              return builder.create<LLVM::CallOp>(loc, results, symbol,
+                                                  operands);
+            };
+
+            auto getOrCreatePersonality = [&]() {
+              StringRef name = "__gxx_personality_v0";
+              if (auto fn = module.lookupSymbol<LLVM::LLVMFuncOp>(name))
+                return fn;
+              OpBuilder builder(module.getBody(), module.getBody()->begin());
+              auto fnType =
+                  LLVM::LLVMFunctionType::get(builder.getI32Type(), {}, true);
+              return builder.create<LLVM::LLVMFuncOp>(module.getLoc(), name,
+                                                      fnType);
+            };
+
+            OpBuilder builder(ctx);
+            builder.setInsertionPointToEnd(module.getBody());
+            auto wrapper =
+                builder.create<LLVM::LLVMFuncOp>(module.getLoc(), "main",
+                                                 fnType);
+
+            auto personality = getOrCreatePersonality();
+            auto personalityRef =
+                FlatSymbolRefAttr::get(ctx, personality.getName());
+            wrapper->setAttr("personality", personalityRef);
+
+            Block *entry = wrapper.addEntryBlock(builder);
+            Block *normal = builder.createBlock(&wrapper.getBody());
+            Block *unwind = builder.createBlock(&wrapper.getBody());
+
+            builder.setInsertionPointToStart(entry);
+            auto ptrType = LLVM::LLVMPointerType::get(ctx);
+            Value catchAll = builder.create<LLVM::ZeroOp>(module.getLoc(),
+                                                          ptrType);
+            auto invoke = builder.create<LLVM::InvokeOp>(
+                module.getLoc(), fnType.getReturnType(),
+                FlatSymbolRefAttr::get(ctx, implName), ValueRange{}, normal,
+                ValueRange{}, unwind, ValueRange{});
+
+            builder.setInsertionPointToStart(normal);
+            builder.create<LLVM::ReturnOp>(module.getLoc(),
+                                           invoke.getResult());
+
+            builder.setInsertionPointToStart(unwind);
+            auto i32Type = builder.getI32Type();
+            auto lpType = LLVM::LLVMStructType::getLiteral(
+                ctx, ArrayRef<Type>{ptrType, i32Type});
+            auto lp = builder.create<LLVM::LandingpadOp>(
+                module.getLoc(), lpType, builder.getUnitAttr(),
+                ValueRange{catchAll});
+            Value raw = builder.create<LLVM::ExtractValueOp>(
+                module.getLoc(), ptrType, lp.getRes(),
+                builder.getDenseI64ArrayAttr({0}));
+            auto captured = emitRuntimeCall(
+                builder, module.getLoc(), RuntimeSymbols::kEHCapture, ptrType,
+                ValueRange{raw});
+            auto reported = emitRuntimeCall(
+                builder, module.getLoc(), RuntimeSymbols::kEHReportUnhandled,
+                i32Type, ValueRange{captured.getResult()});
+            builder.create<LLVM::ReturnOp>(module.getLoc(),
+                                           reported.getResult());
+          }
+        }
+      }
     }
   }
 };

@@ -21,6 +21,9 @@ enum class TypeKind : unsigned {
   Tuple,
   Dict,
   Class, // User-defined class type
+  Exception,
+  Traceback,
+  Location,
   FuncSig,
   Func,
   PrimFunc
@@ -261,6 +264,45 @@ public:
   ::llvm::StringRef getClassName() const;
 };
 
+class ExceptionType
+    : public mlir::Type::TypeBase<ExceptionType, mlir::Type,
+                                  detail::SimpleTypeStorage> {
+public:
+  using Base::Base;
+  static constexpr ::llvm::StringLiteral name{"py.exception"};
+
+  static ExceptionType get(mlir::MLIRContext *ctx);
+  static bool kindof(unsigned kind) {
+    return kind == static_cast<unsigned>(TypeKind::Exception);
+  }
+};
+
+class TracebackType
+    : public mlir::Type::TypeBase<TracebackType, mlir::Type,
+                                  detail::SimpleTypeStorage> {
+public:
+  using Base::Base;
+  static constexpr ::llvm::StringLiteral name{"py.traceback"};
+
+  static TracebackType get(mlir::MLIRContext *ctx);
+  static bool kindof(unsigned kind) {
+    return kind == static_cast<unsigned>(TypeKind::Traceback);
+  }
+};
+
+class LocationType
+    : public mlir::Type::TypeBase<LocationType, mlir::Type,
+                                  detail::SimpleTypeStorage> {
+public:
+  using Base::Base;
+  static constexpr ::llvm::StringLiteral name{"py.location"};
+
+  static LocationType get(mlir::MLIRContext *ctx);
+  static bool kindof(unsigned kind) {
+    return kind == static_cast<unsigned>(TypeKind::Location);
+  }
+};
+
 class FuncSignatureType
     : public mlir::Type::TypeBase<FuncSignatureType, mlir::Type,
                                   detail::FuncSignatureStorage> {
@@ -323,6 +365,9 @@ bool isPyNoneType(mlir::Type type);
 bool isPyTupleType(mlir::Type type);
 bool isPyDictType(mlir::Type type);
 bool isPyClassType(mlir::Type type);
+bool isPyExceptionType(mlir::Type type);
+bool isPyTracebackType(mlir::Type type);
+bool isPyLocationType(mlir::Type type);
 bool isPyFuncSigType(mlir::Type type);
 bool isPyFuncType(mlir::Type type);
 bool isPyPrimFuncType(mlir::Type type);
