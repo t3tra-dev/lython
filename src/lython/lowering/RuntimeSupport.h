@@ -23,7 +23,22 @@ struct RuntimeSymbols {
   static constexpr llvm::StringLiteral kGetNone{"Ly_GetNone"};
   static constexpr llvm::StringLiteral kGetBuiltinPrint{"Ly_GetBuiltinPrint"};
   static constexpr llvm::StringLiteral kCallVectorcall{"Ly_CallVectorcall"};
+  static constexpr llvm::StringLiteral kCallVectorcallEH{"Ly_CallVectorcall_EH"};
+  static constexpr llvm::StringLiteral kCallVectorcallInvoke{
+      "Ly_CallVectorcall_Invoke"};
   static constexpr llvm::StringLiteral kCall{"Ly_Call"};
+  static constexpr llvm::StringLiteral kExceptionNew{"LyException_New"};
+  static constexpr llvm::StringLiteral kExceptionSetCurrent{
+      "LyException_SetCurrent"};
+  static constexpr llvm::StringLiteral kExceptionGetCurrent{
+      "LyException_GetCurrent"};
+  static constexpr llvm::StringLiteral kExceptionClear{"LyException_Clear"};
+  static constexpr llvm::StringLiteral kEHThrow{"LyEH_Throw"};
+  static constexpr llvm::StringLiteral kEHCapture{"LyEH_Capture"};
+  static constexpr llvm::StringLiteral kEHReportUnhandled{
+      "LyEH_ReportUnhandled"};
+  static constexpr llvm::StringLiteral kTracebackPush{"LyTraceback_Push"};
+  static constexpr llvm::StringLiteral kTracebackPop{"LyTraceback_Pop"};
   static constexpr llvm::StringLiteral kDictNew{"LyDict_New"};
   static constexpr llvm::StringLiteral kDictInsert{"LyDict_Insert"};
   // Generic numeric operations (with type dispatch)

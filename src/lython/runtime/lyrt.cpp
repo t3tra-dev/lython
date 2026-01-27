@@ -61,4 +61,47 @@ LyObject *Ly_Call(LyObject *callable, LyTupleObject *posargs,
 
   return Ly_CallVectorcall(callable, posargs, kwnames, kwvalues);
 }
+
+LyCallResult Ly_CallVectorcall_EH(LyObject *callable, LyTupleObject *posargs,
+                                  LyTupleObject *kwnames,
+                                  LyTupleObject *kwvalues) {
+  LyCallResult result{};
+  result.result = Ly_CallVectorcall(callable, posargs, kwnames, kwvalues);
+  if (result.result) {
+    result.exception = nullptr;
+    return result;
+  }
+
+  LyObject *current = LyException_GetCurrent();
+  if (!current) {
+    auto *msg = LyUnicode_FromUTF8("call failed", 11);
+    auto *exc = LyException_New(nullptr, msg, nullptr, nullptr, nullptr, nullptr,
+                                nullptr, nullptr);
+    current = reinterpret_cast<LyObject *>(exc);
+    LyException_SetCurrent(current);
+  }
+
+  result.exception = current;
+  LyException_Clear();
+  return result;
+}
+
+LyObject *Ly_CallVectorcall_Invoke(LyObject *callable, LyTupleObject *posargs,
+                                   LyTupleObject *kwnames,
+                                   LyTupleObject *kwvalues) {
+  LyObject *result = Ly_CallVectorcall(callable, posargs, kwnames, kwvalues);
+  if (result)
+    return result;
+
+  LyObject *current = LyException_GetCurrent();
+  if (!current) {
+    auto *msg = LyUnicode_FromUTF8("call failed", 11);
+    auto *exc = LyException_New(nullptr, msg, nullptr, nullptr, nullptr, nullptr,
+                                nullptr, nullptr);
+    current = reinterpret_cast<LyObject *>(exc);
+    LyException_SetCurrent(current);
+  }
+  LyEH_Throw(current);
+  return nullptr;
+}
 }

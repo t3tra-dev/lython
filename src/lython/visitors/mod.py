@@ -46,6 +46,9 @@ class ModVisitor(BaseVisitor):
 
         self.push_scope()
         with ir.InsertionPoint(module.body), ir.Location.unknown(self.ctx):
+            exc_class = py_ops.ClassOp("Exception")
+            exc_class.body.blocks.append()
+
             builtin_sig = self.get_py_type(
                 "!py.funcsig<[], vararg = !py.tuple<!py.object> -> [!py.none]>"
             )
@@ -56,6 +59,7 @@ class ModVisitor(BaseVisitor):
                 "__builtin_print",
                 ir.TypeAttr.get(builtin_sig),
                 has_vararg=True,
+                nothrow=True,
             )
             builtin_block = builtin.body.blocks.append(
                 self.get_py_type("!py.tuple<!py.object>")
@@ -76,18 +80,24 @@ class ModVisitor(BaseVisitor):
             main = py_ops.FuncOp(
                 "main",
                 ir.TypeAttr.get(main_sig),
+                nothrow=True,
             )
             main_block = main.body.blocks.append()
 
         self._set_insertion_block(main_block)
+        self._enter_py_function("main")
 
         for stmt in node.body:
             self.visit(stmt)
 
-        with ir.InsertionPoint(main_block), ir.Location.unknown(self.ctx):
-            i32 = ir.IntegerType.get_signless(32)
-            zero = arith_ops.ConstantOp(i32, ir.IntegerAttr.get(i32, 0)).result
-            py_ops.ReturnOp([zero])
+        active_block = self.current_block or main_block
+        if not self._block_terminated(active_block):
+            with ir.InsertionPoint(active_block), ir.Location.unknown(self.ctx):
+                i32 = ir.IntegerType.get_signless(32)
+                zero = arith_ops.ConstantOp(i32, ir.IntegerAttr.get(i32, 0)).result
+                py_ops.ReturnOp([zero])
+        maythrow = self._exit_py_function()
+        self._set_func_effect(main, maythrow)
         self.pop_scope()
         return None
 

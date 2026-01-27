@@ -29,6 +29,9 @@ def Py_NoneType    : Type<CPred<"::py::isPyNoneType($_self)">,    "py.none">;
 def Py_TupleType   : Type<CPred<"::py::isPyTupleType($_self)">,   "py.tuple">;
 def Py_DictType    : Type<CPred<"::py::isPyDictType($_self)">,    "py.dict">;
 def Py_ClassType   : Type<CPred<"::py::isPyClassType($_self)">,   "py.class">;
+def Py_ExceptionType : Type<CPred<"::py::isPyExceptionType($_self)">, "py.exception">;
+def Py_TracebackType : Type<CPred<"::py::isPyTracebackType($_self)">, "py.traceback">;
+def Py_LocationType  : Type<CPred<"::py::isPyLocationType($_self)">,  "py.location">;
 def Py_FuncType    : Type<CPred<"::py::isPyFuncType($_self)">,    "py.func">;
 def Py_FuncSigType : Type<CPred<"::py::isPyFuncSigType($_self)">, "py.funcsig">;
 def Py_PrimFuncType: Type<CPred<"::py::isPyPrimFuncType($_self)">,"py.prim.func">;
@@ -66,7 +69,9 @@ def Py_FuncOp : Py_Op<"func", [
     OptionalAttr<UnitAttr>:$has_kwargs,
     OptionalAttr<ArrayAttr>:$arg_names,
     OptionalAttr<ArrayAttr>:$kwonly_names,
-    OptionalAttr<UnitAttr>:$specialize
+    OptionalAttr<UnitAttr>:$specialize,
+    OptionalAttr<UnitAttr>:$maythrow,
+    OptionalAttr<UnitAttr>:$nothrow
   );
 
   let regions = (region AnyRegion:$body);
@@ -146,6 +151,112 @@ def Py_CallVectorOp : Py_Op<"call.vector"> {
     "$kwnames `:` type($kwnames) `,` $kwvalues `:` type($kwvalues) `)` "
     "attr-dict `:` type($results)";
 
+  let hasVerifier = 1;
+}
+
+def Py_InvokeOp : Py_Op<"invoke", [
+    Terminator,
+    AttrSizedOperandSegments
+  ]> {
+  let summary = "Invoke a Python callable with EH successors";
+  let description = [{
+    EH-aware call equivalent to `py.call.vector`. On success, control
+    transfers to the normal destination. On exception, control transfers
+    to the unwind destination.
+  }];
+
+  let arguments = (ins
+    Py_CallableType:$callable,
+    Py_TupleType:$posargs,
+    Py_TupleType:$kwnames,
+    Py_TupleType:$kwvalues,
+    Variadic<AnyType>:$normalDestOperands,
+    Variadic<AnyType>:$unwindDestOperands
+  );
+
+  let successors = (successor AnySuccessor:$normalDest,
+                               AnySuccessor:$unwindDest);
+
+  let hasVerifier = 1;
+}
+
+def Py_TryOp : Py_Op<"try"> {
+  let summary = "Try/Except/Finally structured control flow";
+
+  let results = (outs Variadic<AnyType>:$results);
+  let regions = (region AnyRegion:$try_region,
+                        AnyRegion:$except_region,
+                        AnyRegion:$finally_region);
+
+  let hasVerifier = 1;
+}
+
+def Py_TryYieldOp : Py_Op<"try.yield", [Terminator]> {
+  let arguments = (ins Variadic<AnyType>:$operands);
+  let assemblyFormat = "($operands^ `:` type($operands))? attr-dict";
+}
+
+def Py_ExceptYieldOp : Py_Op<"except.yield", [Terminator]> {
+  let arguments = (ins Variadic<AnyType>:$operands);
+  let assemblyFormat = "($operands^ `:` type($operands))? attr-dict";
+}
+
+def Py_FinallyYieldOp : Py_Op<"finally.yield", [Terminator]> {
+  let assemblyFormat = "attr-dict";
+  let hasVerifier = 1;
+}
+
+def Py_RaiseOp : Py_Op<"raise", [Terminator]> {
+  let arguments = (ins Py_ExceptionType:$exception);
+  let assemblyFormat = "$exception `:` type($exception) attr-dict";
+  let hasVerifier = 1;
+}
+
+def Py_RaiseCurrentOp : Py_Op<"raise.current", [Terminator]> {
+  let assemblyFormat = "attr-dict";
+  let hasVerifier = 1;
+}
+
+def Py_ExceptionNewOp : Py_Op<"exception.new"> {
+  let summary = "Create a py.exception with SSA payload";
+
+  let arguments = (ins
+    Py_ClassType:$type,
+    Py_StrType:$message,
+    Py_TupleType:$args,
+    Py_ExceptionType:$cause,
+    Py_ExceptionType:$context,
+    Py_TracebackType:$traceback,
+    Py_LocationType:$location,
+    Py_DictType:$extras
+  );
+
+  let results = (outs Py_ExceptionType:$result);
+  let hasVerifier = 1;
+}
+
+def Py_ExceptionNullOp : Py_Op<"exception.null", [Pure]> {
+  let summary = "Create a null py.exception value";
+  let results = (outs Py_ExceptionType:$result);
+  let assemblyFormat = "attr-dict `:` type($result)";
+}
+
+def Py_TracebackNullOp : Py_Op<"traceback.null", [Pure]> {
+  let summary = "Create a null py.traceback value";
+  let results = (outs Py_TracebackType:$result);
+  let assemblyFormat = "attr-dict `:` type($result)";
+}
+
+def Py_LocationCurrentOp : Py_Op<"location.current", [Pure]> {
+  let summary = "Materialize the current source location payload";
+  let results = (outs Py_LocationType:$result);
+  let assemblyFormat = "attr-dict `:` type($result)";
+}
+
+def Py_ExceptMatchOp : Py_Op<"except.match", [Pure]> {
+  let arguments = (ins Py_ExceptionType:$exception, Py_ClassType:$type);
+  let results = (outs I1:$result);
+  let assemblyFormat = "$exception `,` $type `:` type($exception) `,` type($type) attr-dict";
   let hasVerifier = 1;
 }
 

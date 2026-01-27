@@ -1,6 +1,7 @@
 add_library(LythonRuntime STATIC
     lyrt.cpp
     bltinmodule.cpp
+    traceback.cpp
     objects/object.cpp
     objects/unicode.cpp
     objects/tuple.cpp
@@ -9,6 +10,7 @@ add_library(LythonRuntime STATIC
     objects/long.cpp
     objects/float.cpp
     objects/bool.cpp
+    objects/exception.cpp
 )
 
 target_include_directories(LythonRuntime

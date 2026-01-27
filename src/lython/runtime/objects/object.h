@@ -11,6 +11,7 @@ struct LyDictObject;
 struct LyLongObject;
 struct LyFloatObject;
 struct LyBoolObject;
+struct LyExceptionObject;
 
 using LyReprFunc = LyUnicodeObject *(*)(LyObject *);
 using LyDeallocFunc = void (*)(LyObject *);
@@ -45,6 +46,7 @@ LyTypeObject &LyNone_Type();
 LyTypeObject &LyDict_Type();
 LyTypeObject &LyLong_Type();
 LyTypeObject &LyFloat_Type();
+LyTypeObject &LyException_Type();
 
 extern "C" {
 
