@@ -549,8 +549,8 @@ class ExprVisitor(BaseVisitor):
             func_info = self.lookup_function(node.func.id)
             result_types = list(func_info.result_types)
             if func_info.maythrow:
+                self._note_maythrow()
                 if result_types != [self.get_py_type("!py.none")]:
-                    self._note_maythrow()
                     raise NotImplementedError(
                         "py.invoke for value-returning calls is not implemented yet"
                     )
@@ -647,6 +647,8 @@ class ExprVisitor(BaseVisitor):
             # Call __init__ if it exists
             if "__init__" in class_info.methods:
                 init_info = class_info.methods["__init__"]
+                if init_info.maythrow:
+                    self._note_maythrow()
                 # __init__ args are (self, *args) - self is already the instance
                 init_args = [instance] + arg_values
                 posargs = self.build_tuple(init_args, loc=loc)
@@ -704,6 +706,8 @@ class ExprVisitor(BaseVisitor):
             raise AttributeError(f"Class '{class_name}' has no method '{method_name}'")
 
         method_info = class_info.methods[method_name]
+        if method_info.maythrow:
+            self._note_maythrow()
 
         with loc, self.insertion_point():
             # Build args tuple with self as first argument
