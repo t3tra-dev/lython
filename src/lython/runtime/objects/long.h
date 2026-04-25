@@ -124,6 +124,7 @@ inline void LyLong_SetSignAndDigitCount(LyLongObject *op, int sign,
 extern "C" {
 
 LyLongObject *LyLong_FromI64(std::int64_t value);
+std::int64_t LyLong_AsI64(LyObject *object);
 LyLongObject *LyLong_FromSTwoDigits(stwodigits value);
 LyLongObject *LyLong_FromString(const char *str, std::size_t len);
 LyLongObject *LyLong_Add_Slow(const LyLongObject *lhs, const LyLongObject *rhs);

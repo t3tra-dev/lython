@@ -9,6 +9,7 @@ struct LyFloatObject : LyObject {
 extern "C" {
 
 LyFloatObject *LyFloat_FromDouble(double value);
+double LyFloat_AsDouble(LyObject *object);
 LyFloatObject *LyFloat_Add(const LyFloatObject *lhs, const LyFloatObject *rhs);
 LyFloatObject *LyFloat_Sub(const LyFloatObject *lhs, const LyFloatObject *rhs);
 }

@@ -8,7 +8,7 @@ LogicalResult CallOp::verify() {
   Type callableType = getCallable().getType();
 
   if (!isCallableType(callableType))
-    return emitOpError("callable operand must be !py.func or !py.class");
+    return emitOpError("callable operand must be !py.func");
 
   FailureOr<ThrowEffect> effectOr =
       resolveCallableThrowEffect(getOperation(), getCallable());
@@ -21,51 +21,6 @@ LogicalResult CallOp::verify() {
   FuncSignatureType signature;
   if (FuncType funcTy = dyn_cast<FuncType>(callableType)) {
     signature = funcTy.getSignature();
-  } else if (ClassType classTy = dyn_cast<ClassType>(callableType)) {
-    ClassOp classOp = lookupClassSymbol(getOperation(), classTy);
-    if (!classOp)
-      return emitOpError("unable to resolve class '")
-             << classTy.getClassName() << "'";
-    FuncOp callMethod = lookupMethodByName(classOp, "__call__");
-    if (!callMethod) {
-      emitOpError("class '")
-          << classTy.getClassName() << "' does not define a '__call__' method";
-      return failure();
-    }
-    mlir::TypeAttr fnTypeAttr = callMethod.getFunctionTypeAttr();
-    if (!fnTypeAttr) {
-      callMethod.emitOpError("requires 'function_type' attribute");
-      return failure();
-    }
-    FuncSignatureType methodSig =
-        dyn_cast<FuncSignatureType>(fnTypeAttr.getValue());
-    if (!methodSig) {
-      callMethod.emitOpError("'function_type' must be a FuncSignatureType");
-      return failure();
-    }
-
-    mlir::ArrayRef<mlir::Type> positionalTypes = methodSig.getPositionalTypes();
-    if (positionalTypes.empty()) {
-      callMethod.emitOpError(
-          "__call__ must declare a positional 'self' parameter");
-      return failure();
-    }
-
-    Type selfType = positionalTypes.front();
-    if (selfType != classTy && !isPyObjectType(selfType)) {
-      callMethod.emitOpError(
-          "first positional parameter must be of type !py.class<")
-          << classOp.getSymName() << "> or !py.object";
-      return failure();
-    }
-
-    signature = FuncSignatureType::get(
-        methodSig.getContext(),
-        ArrayRef<Type>(positionalTypes.begin() + 1, positionalTypes.end()),
-        methodSig.getKwOnlyTypes(),
-        methodSig.hasVararg() ? methodSig.getVarargType() : Type(),
-        methodSig.hasKwarg() ? methodSig.getKwargType() : Type(),
-        methodSig.getResultTypes());
   } else {
     return emitOpError("unexpected callable type");
   }
@@ -77,8 +32,11 @@ LogicalResult CallOp::verify() {
   bool homogeneous = tupleElems.size() == 1;
 
   mlir::ArrayRef<mlir::Type> positionalTypes = signature.getPositionalTypes();
+  unsigned minPositionalCount =
+      getMinimumPositionalCountForCallable(signature, getCallable());
   if (!signature.hasVararg()) {
-    if (tupleElems.size() != positionalTypes.size())
+    if (tupleElems.size() < minPositionalCount ||
+        tupleElems.size() > positionalTypes.size())
       return emitOpError(
           "posargs length mismatch with callee positional parameters");
     for (auto [elemType, expected] : llvm::zip(tupleElems, positionalTypes))
@@ -143,10 +101,10 @@ LogicalResult CallOp::verify() {
 }
 
 LogicalResult CallVectorOp::verify() {
+  ArrayAttr expectedArgNamesAttr;
   ArrayAttr expectedKwNamesAttr;
-  FailureOr<FuncSignatureType> signatureOr =
-      resolveCallableSignature(getOperation(), getCallable(),
-                               expectedKwNamesAttr);
+  FailureOr<FuncSignatureType> signatureOr = resolveCallableSignature(
+      getOperation(), getCallable(), expectedArgNamesAttr, expectedKwNamesAttr);
   if (failed(signatureOr))
     return failure();
   FuncSignatureType signature = *signatureOr;
@@ -159,9 +117,9 @@ LogicalResult CallVectorOp::verify() {
   if (effect == ThrowEffect::MayThrow)
     return emitOpError("maythrow callee must be invoked with py.invoke");
 
-  if (failed(verifyVectorCallOperands(getOperation(), signature, getPosargs(),
-                                      getKwnames(), getKwvalues(),
-                                      expectedKwNamesAttr)))
+  if (failed(verifyVectorCallOperands(
+          getOperation(), signature, getCallable(), getPosargs(), getKwnames(),
+          getKwvalues(), expectedArgNamesAttr, expectedKwNamesAttr)))
     return failure();
 
   auto resultTypes = signature.getResultTypes();
@@ -176,10 +134,10 @@ LogicalResult CallVectorOp::verify() {
 }
 
 LogicalResult InvokeOp::verify() {
+  ArrayAttr expectedArgNamesAttr;
   ArrayAttr expectedKwNamesAttr;
-  FailureOr<FuncSignatureType> signatureOr =
-      resolveCallableSignature(getOperation(), getCallable(),
-                               expectedKwNamesAttr);
+  FailureOr<FuncSignatureType> signatureOr = resolveCallableSignature(
+      getOperation(), getCallable(), expectedArgNamesAttr, expectedKwNamesAttr);
   if (failed(signatureOr))
     return failure();
   FuncSignatureType signature = *signatureOr;
@@ -192,15 +150,14 @@ LogicalResult InvokeOp::verify() {
   if (effect == ThrowEffect::NoThrow)
     return emitOpError("nothrow callee must be invoked with py.call");
 
-  if (failed(verifyVectorCallOperands(getOperation(), signature, getPosargs(),
-                                      getKwnames(), getKwvalues(),
-                                      expectedKwNamesAttr)))
+  if (failed(verifyVectorCallOperands(
+          getOperation(), signature, getCallable(), getPosargs(), getKwnames(),
+          getKwvalues(), expectedArgNamesAttr, expectedKwNamesAttr)))
     return failure();
 
   auto resultTypes = signature.getResultTypes();
-  bool allNone = llvm::all_of(resultTypes, [](Type type) {
-    return isPyNoneType(type);
-  });
+  bool allNone =
+      llvm::all_of(resultTypes, [](Type type) { return isPyNoneType(type); });
   if (getNormalDestOperands().empty() && allNone) {
     // Allow dropping !py.none results for statement invokes.
   } else {
@@ -253,7 +210,8 @@ LogicalResult NativeCallOp::verify() {
 
   if (fnType.getNumResults() != getNumResults())
     return emitOpError("result count mismatch with callee signature");
-  for (auto [result, expected] : llvm::zip(getResultTypes(), fnType.getResults())) {
+  for (auto [result, expected] :
+       llvm::zip(getResultTypes(), fnType.getResults())) {
     if (result != expected)
       return emitOpError("result types must match callee return types");
     if (isPyType(expected))

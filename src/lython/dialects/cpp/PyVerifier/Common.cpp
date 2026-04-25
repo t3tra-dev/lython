@@ -28,6 +28,40 @@ FuncOp lookupMethodByName(ClassOp classOp, StringRef methodName) {
   return nullptr;
 }
 
+FailureOr<Type> lookupClassFieldType(Operation *from, ClassType classType,
+                                     StringRef fieldName) {
+  ClassOp classOp = lookupClassSymbol(from, classType);
+  if (!classOp) {
+    from->emitOpError("unable to resolve class '")
+        << classType.getClassName() << "'";
+    return failure();
+  }
+
+  ArrayAttr fieldNames = classOp.getFieldNamesAttr();
+  ArrayAttr fieldTypes = classOp.getFieldTypesAttr();
+  if (!fieldNames || !fieldTypes) {
+    from->emitOpError("class '") << classType.getClassName()
+                                 << "' does not define a static field schema";
+    return failure();
+  }
+
+  for (auto [nameAttr, typeAttr] : llvm::zip(fieldNames, fieldTypes)) {
+    auto stringAttr = dyn_cast<StringAttr>(nameAttr);
+    auto mlirTypeAttr = dyn_cast<TypeAttr>(typeAttr);
+    if (!stringAttr || !mlirTypeAttr) {
+      from->emitOpError("class '")
+          << classType.getClassName() << "' has malformed field schema";
+      return failure();
+    }
+    if (stringAttr.getValue() == fieldName)
+      return mlirTypeAttr.getValue();
+  }
+
+  from->emitOpError("class '")
+      << classType.getClassName() << "' has no field '" << fieldName << "'";
+  return failure();
+}
+
 static ThrowEffect getEffectFromFuncOp(FuncOp funcOp) {
   if (funcOp->getAttr("nothrow"))
     return ThrowEffect::NoThrow;
@@ -36,78 +70,95 @@ static ThrowEffect getEffectFromFuncOp(FuncOp funcOp) {
   return ThrowEffect::MayThrow;
 }
 
+static Value stripIdentityCasts(Value value);
+
+static FuncOp lookupReturnedCallableFuncFromValue(Operation *op,
+                                                  Value callable) {
+  if (auto identity = callable.getDefiningOp<CastIdentityOp>()) {
+    if (auto symbolAttr = identity->getAttrOfType<SymbolRefAttr>(
+            "lython.returned_callable_symbol")) {
+      Operation *symbol = SymbolTable::lookupNearestSymbolFrom(op, symbolAttr);
+      return dyn_cast_or_null<FuncOp>(symbol);
+    }
+    return lookupReturnedCallableFuncFromValue(op, identity.getInput());
+  }
+  if (auto callVector = callable.getDefiningOp<CallVectorOp>()) {
+    if (auto symbolAttr = callVector->getAttrOfType<SymbolRefAttr>(
+            "lython.returned_callable_symbol")) {
+      Operation *symbol = SymbolTable::lookupNearestSymbolFrom(op, symbolAttr);
+      return dyn_cast_or_null<FuncOp>(symbol);
+    }
+  }
+  if (auto call = callable.getDefiningOp<CallOp>()) {
+    if (auto symbolAttr = call->getAttrOfType<SymbolRefAttr>(
+            "lython.returned_callable_symbol")) {
+      Operation *symbol = SymbolTable::lookupNearestSymbolFrom(op, symbolAttr);
+      return dyn_cast_or_null<FuncOp>(symbol);
+    }
+  }
+  return nullptr;
+}
+
+static IntegerAttr getReturnedCallableDefaultsCountAttr(Value callable) {
+  if (auto identity = callable.getDefiningOp<CastIdentityOp>()) {
+    if (auto attr = identity->getAttrOfType<IntegerAttr>(
+            "lython.returned_callable_defaults_count"))
+      return attr;
+    return getReturnedCallableDefaultsCountAttr(identity.getInput());
+  }
+  if (auto callVector = callable.getDefiningOp<CallVectorOp>())
+    return callVector->getAttrOfType<IntegerAttr>(
+        "lython.returned_callable_defaults_count");
+  if (auto call = callable.getDefiningOp<CallOp>())
+    return call->getAttrOfType<IntegerAttr>(
+        "lython.returned_callable_defaults_count");
+  return {};
+}
+
+static ArrayAttr getReturnedCallableKwdefaultNamesAttr(Value callable) {
+  if (auto identity = callable.getDefiningOp<CastIdentityOp>()) {
+    if (auto attr = identity->getAttrOfType<ArrayAttr>(
+            "lython.returned_callable_kwdefault_names"))
+      return attr;
+    return getReturnedCallableKwdefaultNamesAttr(identity.getInput());
+  }
+  if (auto callVector = callable.getDefiningOp<CallVectorOp>())
+    return callVector->getAttrOfType<ArrayAttr>(
+        "lython.returned_callable_kwdefault_names");
+  if (auto call = callable.getDefiningOp<CallOp>())
+    return call->getAttrOfType<ArrayAttr>(
+        "lython.returned_callable_kwdefault_names");
+  return {};
+}
+
 FailureOr<FuncSignatureType>
 resolveCallableSignature(Operation *op, Value callable,
+                         ArrayAttr &expectedArgNamesAttr,
                          ArrayAttr &expectedKwNamesAttr) {
   Type callableType = callable.getType();
   if (auto funcTy = dyn_cast<FuncType>(callableType)) {
-    if (auto funcObject = callable.getDefiningOp<FuncObjectOp>()) {
-      Operation *symbol = SymbolTable::lookupNearestSymbolFrom(
-          op, funcObject.getTargetAttr());
-      if (auto funcOp = dyn_cast_or_null<FuncOp>(symbol))
+    Value strippedCallable = stripIdentityCasts(callable);
+    if (auto funcObject = strippedCallable.getDefiningOp<FuncObjectOp>()) {
+      Operation *symbol =
+          SymbolTable::lookupNearestSymbolFrom(op, funcObject.getTargetAttr());
+      if (auto funcOp = dyn_cast_or_null<FuncOp>(symbol)) {
+        expectedArgNamesAttr = funcOp.getArgNamesAttr();
         expectedKwNamesAttr = funcOp.getKwonlyNamesAttr();
-    } else if (auto makeFunc = callable.getDefiningOp<MakeFunctionOp>()) {
-      Operation *symbol = SymbolTable::lookupNearestSymbolFrom(
-          op, makeFunc.getTargetAttr());
-      if (auto funcOp = dyn_cast_or_null<FuncOp>(symbol))
+      }
+    } else if (auto makeFunc =
+                   strippedCallable.getDefiningOp<MakeFunctionOp>()) {
+      Operation *symbol =
+          SymbolTable::lookupNearestSymbolFrom(op, makeFunc.getTargetAttr());
+      if (auto funcOp = dyn_cast_or_null<FuncOp>(symbol)) {
+        expectedArgNamesAttr = funcOp.getArgNamesAttr();
         expectedKwNamesAttr = funcOp.getKwonlyNamesAttr();
+      }
+    } else if (auto funcOp =
+                   lookupReturnedCallableFuncFromValue(op, callable)) {
+      expectedArgNamesAttr = funcOp.getArgNamesAttr();
+      expectedKwNamesAttr = funcOp.getKwonlyNamesAttr();
     }
     return funcTy.getSignature();
-  }
-
-  if (auto classTy = dyn_cast<ClassType>(callableType)) {
-    ClassOp classOp = lookupClassSymbol(op, classTy);
-    if (!classOp) {
-      op->emitOpError("unable to resolve class '")
-          << classTy.getClassName() << "'";
-      return failure();
-    }
-
-    FuncOp callMethod = lookupMethodByName(classOp, "__call__");
-    if (!callMethod) {
-      op->emitOpError("class '")
-          << classTy.getClassName() << "' does not define a '__call__' method";
-      return failure();
-    }
-
-    auto fnTypeAttr = callMethod.getFunctionTypeAttr();
-    if (!fnTypeAttr) {
-      callMethod.emitOpError("requires 'function_type' attribute");
-      return failure();
-    }
-    auto methodSig = dyn_cast<FuncSignatureType>(fnTypeAttr.getValue());
-    if (!methodSig) {
-      callMethod.emitOpError("'function_type' must be a FuncSignatureType");
-      return failure();
-    }
-
-    auto positionalTypes = methodSig.getPositionalTypes();
-    if (positionalTypes.empty()) {
-      callMethod.emitOpError(
-          "__call__ must declare a positional 'self' parameter");
-      return failure();
-    }
-
-    Type selfType = positionalTypes.front();
-    if (selfType != classTy && !isPyObjectType(selfType)) {
-      callMethod.emitOpError(
-          "first positional parameter must be of type !py.class<")
-          << classOp.getSymName() << "> or !py.object";
-      return failure();
-    }
-
-    llvm::SmallVector<Type> callPositional(positionalTypes.begin() + 1,
-                                           positionalTypes.end());
-    llvm::SmallVector<Type> callKwOnly(methodSig.getKwOnlyTypes().begin(),
-                                       methodSig.getKwOnlyTypes().end());
-    Type callVararg =
-        methodSig.hasVararg() ? methodSig.getVarargType() : Type();
-    Type callKwarg = methodSig.hasKwarg() ? methodSig.getKwargType() : Type();
-
-    expectedKwNamesAttr = callMethod.getKwonlyNamesAttr();
-    return FuncSignatureType::get(methodSig.getContext(), callPositional,
-                                  callKwOnly, callVararg, callKwarg,
-                                  methodSig.getResultTypes());
   }
 
   op->emitOpError("unexpected callable type");
@@ -118,36 +169,23 @@ FailureOr<ThrowEffect> resolveCallableThrowEffect(Operation *op,
                                                   Value callable) {
   Type callableType = callable.getType();
   if (auto funcTy = dyn_cast<FuncType>(callableType)) {
-    if (auto funcObject = callable.getDefiningOp<FuncObjectOp>()) {
-      Operation *symbol = SymbolTable::lookupNearestSymbolFrom(
-          op, funcObject.getTargetAttr());
+    Value strippedCallable = stripIdentityCasts(callable);
+    if (auto funcObject = strippedCallable.getDefiningOp<FuncObjectOp>()) {
+      Operation *symbol =
+          SymbolTable::lookupNearestSymbolFrom(op, funcObject.getTargetAttr());
       if (auto funcOp = dyn_cast_or_null<FuncOp>(symbol))
         return getEffectFromFuncOp(funcOp);
-    } else if (auto makeFunc = callable.getDefiningOp<MakeFunctionOp>()) {
-      Operation *symbol = SymbolTable::lookupNearestSymbolFrom(
-          op, makeFunc.getTargetAttr());
+    } else if (auto makeFunc =
+                   strippedCallable.getDefiningOp<MakeFunctionOp>()) {
+      Operation *symbol =
+          SymbolTable::lookupNearestSymbolFrom(op, makeFunc.getTargetAttr());
       if (auto funcOp = dyn_cast_or_null<FuncOp>(symbol))
         return getEffectFromFuncOp(funcOp);
+    } else if (auto funcOp =
+                   lookupReturnedCallableFuncFromValue(op, callable)) {
+      return getEffectFromFuncOp(funcOp);
     }
     return ThrowEffect::MayThrow;
-  }
-
-  if (auto classTy = dyn_cast<ClassType>(callableType)) {
-    ClassOp classOp = lookupClassSymbol(op, classTy);
-    if (!classOp) {
-      op->emitOpError("unable to resolve class '")
-          << classTy.getClassName() << "'";
-      return failure();
-    }
-
-    FuncOp callMethod = lookupMethodByName(classOp, "__call__");
-    if (!callMethod) {
-      op->emitOpError("class '")
-          << classTy.getClassName() << "' does not define a '__call__' method";
-      return failure();
-    }
-
-    return getEffectFromFuncOp(callMethod);
   }
 
   op->emitOpError("unexpected callable type");
@@ -162,9 +200,88 @@ FailureOr<TupleType> requireTuple(Operation *op, Value operand,
   return failure();
 }
 
-LogicalResult verifyVectorCallOperands(Operation *op, FuncSignatureType signature,
-                                       Value posargs, Value kwnames,
-                                       Value kwvalues,
+unsigned getMinimumPositionalCountForCallable(FuncSignatureType signature,
+                                              Value callable) {
+  unsigned positionalCount = signature.getPositionalTypes().size();
+  if (auto defaultsAttr = getReturnedCallableDefaultsCountAttr(callable)) {
+    unsigned defaultsCount =
+        static_cast<unsigned>(defaultsAttr.getValue().getZExtValue());
+    if (defaultsCount > positionalCount)
+      return 0;
+    return positionalCount - defaultsCount;
+  }
+  auto makeFunc = stripIdentityCasts(callable).getDefiningOp<MakeFunctionOp>();
+  if (!makeFunc)
+    return positionalCount;
+  Value defaults = makeFunc.getDefaults();
+  if (!defaults)
+    return positionalCount;
+  auto defaultsTy = dyn_cast<TupleType>(defaults.getType());
+  if (!defaultsTy)
+    return positionalCount;
+  unsigned defaultsCount = defaultsTy.getElementTypes().size();
+  if (defaultsCount > positionalCount)
+    return 0;
+  return positionalCount - defaultsCount;
+}
+
+static Value stripIdentityCasts(Value value) {
+  while (auto identity = value.getDefiningOp<CastIdentityOp>())
+    value = identity.getInput();
+  return value;
+}
+
+static bool collectStaticDictStringKeys(Value dictValue,
+                                        SmallVectorImpl<StringRef> &keys) {
+  SmallVector<StringRef> reversed;
+  Value current = stripIdentityCasts(dictValue);
+  while (auto insert = current.getDefiningOp<DictInsertOp>()) {
+    Value key = stripIdentityCasts(insert.getKey());
+    auto strConst = key.getDefiningOp<StrConstantOp>();
+    if (!strConst)
+      return false;
+    reversed.push_back(strConst.getValueAttr().getValue());
+    current = stripIdentityCasts(insert.getDict());
+  }
+
+  if (!current.getDefiningOp<DictEmptyOp>())
+    return false;
+
+  keys.assign(reversed.rbegin(), reversed.rend());
+  return true;
+}
+
+static void collectDefaultedKeywordNames(Value callable,
+                                         llvm::StringSet<> &names) {
+  if (auto attr = getReturnedCallableKwdefaultNamesAttr(callable)) {
+    for (Attribute entry : attr) {
+      if (auto strAttr = dyn_cast<StringAttr>(entry))
+        names.insert(strAttr.getValue());
+    }
+  }
+  auto makeFunc = stripIdentityCasts(callable).getDefiningOp<MakeFunctionOp>();
+  if (!makeFunc || !makeFunc.getKwdefaults())
+    return;
+
+  SmallVector<StringRef> keyStorage;
+  if (!collectStaticDictStringKeys(makeFunc.getKwdefaults(), keyStorage))
+    return;
+  for (StringRef key : keyStorage)
+    names.insert(key);
+}
+
+static bool callableHasKwdefaults(Value callable) {
+  if (auto attr = getReturnedCallableKwdefaultNamesAttr(callable))
+    return !attr.empty();
+  auto makeFunc = stripIdentityCasts(callable).getDefiningOp<MakeFunctionOp>();
+  return makeFunc && static_cast<bool>(makeFunc.getKwdefaults());
+}
+
+LogicalResult verifyVectorCallOperands(Operation *op,
+                                       FuncSignatureType signature,
+                                       Value callable, Value posargs,
+                                       Value kwnames, Value kwvalues,
+                                       ArrayAttr expectedArgNamesAttr,
                                        ArrayAttr expectedKwNamesAttr) {
   auto posTupleOr = requireTuple(op, posargs, "posargs");
   if (failed(posTupleOr))
@@ -174,8 +291,10 @@ LogicalResult verifyVectorCallOperands(Operation *op, FuncSignatureType signatur
   bool homogeneous = posElems.size() == 1;
 
   auto positionalTypes = signature.getPositionalTypes();
+  unsigned minPositionalCount =
+      getMinimumPositionalCountForCallable(signature, callable);
   if (!signature.hasVararg()) {
-    if (posElems.size() != positionalTypes.size())
+    if (posElems.size() > positionalTypes.size())
       return op->emitOpError(
           "posargs length mismatch with callee positional parameters");
     for (auto [elemType, expected] : llvm::zip(posElems, positionalTypes))
@@ -234,12 +353,11 @@ LogicalResult verifyVectorCallOperands(Operation *op, FuncSignatureType signatur
         "kwnames and kwvalues must describe the same number of entries");
 
   auto kwonlyTypes = signature.getKwOnlyTypes();
-  bool kwargsRequired = signature.hasKwarg() || !kwonlyTypes.empty();
+  bool keywordsAccepted =
+      signature.hasKwarg() || !kwonlyTypes.empty() ||
+      (expectedArgNamesAttr && !expectedArgNamesAttr.empty());
   bool namesEmpty = nameElems.empty();
-  if (kwargsRequired && namesEmpty)
-    return op->emitOpError(
-        "callee expects keyword arguments but none were provided");
-  if (!kwargsRequired && !namesEmpty)
+  if (!keywordsAccepted && !namesEmpty)
     return op->emitOpError("callee does not accept keyword arguments");
 
   auto collectTupleValues = [&](Value tupleValue,
@@ -267,30 +385,77 @@ LogicalResult verifyVectorCallOperands(Operation *op, FuncSignatureType signatur
     }
   }
 
-  if (!kwargsRequired && !nameValues.empty())
+  if (!keywordsAccepted && !nameValues.empty())
     return op->emitOpError("callee does not accept keyword arguments");
-  if (kwargsRequired && nameValues.empty() && nameElems.empty())
-    return op->emitOpError(
-        "callee expects keyword arguments but none were provided");
+  llvm::StringSet<> defaultedKeywordNames;
+  collectDefaultedKeywordNames(callable, defaultedKeywordNames);
+  bool hasCallableKwdefaults = callableHasKwdefaults(callable);
 
-  if (expectedKwNamesAttr && hasLiteralNames) {
-    llvm::SmallVector<StringRef> expectedNames;
-    for (Attribute attr : expectedKwNamesAttr) {
-      if (auto strAttr = dyn_cast<StringAttr>(attr))
-        expectedNames.push_back(strAttr.getValue());
+  if (hasLiteralNames) {
+    llvm::SmallVector<StringRef> positionalNames;
+    llvm::StringMap<unsigned> positionalNameToIndex;
+    if (expectedArgNamesAttr) {
+      positionalNames.reserve(expectedArgNamesAttr.size());
+      for (auto [index, attr] : llvm::enumerate(expectedArgNamesAttr)) {
+        auto strAttr = dyn_cast<StringAttr>(attr);
+        if (!strAttr)
+          continue;
+        positionalNames.push_back(strAttr.getValue());
+        positionalNameToIndex[strAttr.getValue()] = index;
+      }
     }
+
+    llvm::SmallVector<StringRef> kwonlyNames;
+    llvm::StringMap<unsigned> kwonlyNameToIndex;
+    if (expectedKwNamesAttr) {
+      kwonlyNames.reserve(expectedKwNamesAttr.size());
+      for (auto [index, attr] : llvm::enumerate(expectedKwNamesAttr)) {
+        auto strAttr = dyn_cast<StringAttr>(attr);
+        if (!strAttr)
+          continue;
+        kwonlyNames.push_back(strAttr.getValue());
+        kwonlyNameToIndex[strAttr.getValue()] = index;
+      }
+    }
+
     llvm::SmallSet<StringRef, 8> providedSet;
     for (StringRef providedName : providedKwNames)
       if (!providedSet.insert(providedName).second)
         return op->emitOpError("duplicate keyword '") << providedName << "'";
-    for (StringRef expected : expectedNames)
-      if (!providedSet.contains(expected))
-        return op->emitOpError("missing keyword argument '") << expected
-                                                             << "'";
+
     if (!signature.hasKwarg()) {
-      if (providedKwNames.size() != expectedNames.size())
-        return op->emitOpError("unexpected keyword argument provided");
+      for (StringRef providedName : providedKwNames)
+        if (!positionalNameToIndex.count(providedName) &&
+            !kwonlyNameToIndex.count(providedName))
+          return op->emitOpError("unexpected keyword argument '")
+                 << providedName << "'";
     }
+
+    for (auto [index, name] : llvm::enumerate(positionalNames)) {
+      if (index < posElems.size())
+        continue;
+      if (providedSet.contains(name))
+        continue;
+      if (index < minPositionalCount)
+        return op->emitOpError("missing required argument '") << name << "'";
+    }
+
+    for (StringRef expected : kwonlyNames) {
+      if (defaultedKeywordNames.contains(expected))
+        continue;
+      if (providedSet.contains(expected))
+        continue;
+      if (hasCallableKwdefaults && namesEmpty)
+        continue;
+      return op->emitOpError("missing keyword argument '") << expected << "'";
+    }
+  } else if (!kwonlyTypes.empty() && namesEmpty && !hasCallableKwdefaults &&
+             defaultedKeywordNames.size() < kwonlyTypes.size()) {
+    return op->emitOpError(
+        "callee expects keyword arguments but none were provided");
+  } else if (!signature.hasVararg() && posElems.size() < minPositionalCount) {
+    return op->emitOpError(
+        "posargs length mismatch with callee positional parameters");
   }
 
   return success();

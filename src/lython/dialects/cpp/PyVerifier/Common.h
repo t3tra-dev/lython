@@ -26,24 +26,28 @@ enum class ThrowEffect {
 
 ClassOp lookupClassSymbol(mlir::Operation *from, ClassType classType);
 FuncOp lookupMethodByName(ClassOp classOp, mlir::StringRef methodName);
+mlir::FailureOr<mlir::Type> lookupClassFieldType(mlir::Operation *from,
+                                                 ClassType classType,
+                                                 mlir::StringRef fieldName);
 
 mlir::FailureOr<FuncSignatureType>
 resolveCallableSignature(mlir::Operation *op, mlir::Value callable,
+                         mlir::ArrayAttr &expectedArgNamesAttr,
                          mlir::ArrayAttr &expectedKwNamesAttr);
 
-mlir::FailureOr<ThrowEffect>
-resolveCallableThrowEffect(mlir::Operation *op, mlir::Value callable);
+mlir::FailureOr<ThrowEffect> resolveCallableThrowEffect(mlir::Operation *op,
+                                                        mlir::Value callable);
 
-mlir::FailureOr<TupleType> requireTuple(mlir::Operation *op,
-                                        mlir::Value operand,
-                                        mlir::StringRef what);
+mlir::FailureOr<TupleType>
+requireTuple(mlir::Operation *op, mlir::Value operand, mlir::StringRef what);
 
-mlir::LogicalResult verifyVectorCallOperands(mlir::Operation *op,
-                                             FuncSignatureType signature,
-                                             mlir::Value posargs,
-                                             mlir::Value kwnames,
-                                             mlir::Value kwvalues,
-                                             mlir::ArrayAttr expectedKwNamesAttr);
+unsigned getMinimumPositionalCountForCallable(FuncSignatureType signature,
+                                              mlir::Value callable);
+
+mlir::LogicalResult verifyVectorCallOperands(
+    mlir::Operation *op, FuncSignatureType signature, mlir::Value callable,
+    mlir::Value posargs, mlir::Value kwnames, mlir::Value kwvalues,
+    mlir::ArrayAttr expectedArgNamesAttr, mlir::ArrayAttr expectedKwNamesAttr);
 
 } // namespace py
 

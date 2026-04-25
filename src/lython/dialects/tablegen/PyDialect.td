@@ -28,6 +28,7 @@ def Py_ObjectType  : Type<CPred<"::py::isPyObjectType($_self)">,  "py.object">;
 def Py_NoneType    : Type<CPred<"::py::isPyNoneType($_self)">,    "py.none">;
 def Py_TupleType   : Type<CPred<"::py::isPyTupleType($_self)">,   "py.tuple">;
 def Py_DictType    : Type<CPred<"::py::isPyDictType($_self)">,    "py.dict">;
+def Py_ListType    : Type<CPred<"::py::isPyListType($_self)">,    "py.list">;
 def Py_ClassType   : Type<CPred<"::py::isPyClassType($_self)">,   "py.class">;
 def Py_ExceptionType : Type<CPred<"::py::isPyExceptionType($_self)">, "py.exception">;
 def Py_TracebackType : Type<CPred<"::py::isPyTracebackType($_self)">, "py.traceback">;
@@ -69,6 +70,7 @@ def Py_FuncOp : Py_Op<"func", [
     OptionalAttr<UnitAttr>:$has_kwargs,
     OptionalAttr<ArrayAttr>:$arg_names,
     OptionalAttr<ArrayAttr>:$kwonly_names,
+    OptionalAttr<ArrayAttr>:$closure_types,
     OptionalAttr<UnitAttr>:$specialize,
     OptionalAttr<UnitAttr>:$maythrow,
     OptionalAttr<UnitAttr>:$nothrow
@@ -88,12 +90,14 @@ def Py_ClassOp : Py_Op<"class", [
   ]> {
   let summary = "Python class definition";
   let description = [{
-    Defines a Python-visible class and stores its methods. Methods are declared
-    as nested `py.func` symbols within the class body.
+    Defines a statically resolved class. The class symbol owns the nominal
+    class type and optional fixed field schema metadata.
   }];
 
   let arguments = (ins
-    SymbolNameAttr:$sym_name
+    SymbolNameAttr:$sym_name,
+    OptionalAttr<StrArrayAttr>:$field_names,
+    OptionalAttr<TypeArrayAttr>:$field_types
   );
 
   let regions = (region SizedRegion<1>:$body);
@@ -102,12 +106,9 @@ def Py_ClassOp : Py_Op<"class", [
 }
 
 def Py_CallOp : Py_Op<"call"> {
-  let summary = "Invoke a Python callable (function or class with __call__)";
+  let summary = "Invoke a Python function";
   let description = [{
-    Calls a Python-level callable. In v2, this accepts:
-    - !py.func: Python function objects
-    - !py.class: User-defined classes with __call__ method
-
+    Calls a Python-level function.
     Positional arguments are packed into a `!py.tuple` while keyword
     arguments are carried in a `!py.dict` or `!py.none`.
   }];
@@ -280,7 +281,7 @@ def Py_NativeCallOp : Py_Op<"native_call"> {
   let hasVerifier = 1;
 }
 
-def Py_MakeFunctionOp : Py_Op<"make_function", [Pure, AttrSizedOperandSegments]> {
+def Py_MakeFunctionOp : Py_Op<"make_function", [AttrSizedOperandSegments]> {
   let summary = "Materialize a !py.func value from a py.func symbol";
   let description = [{
     Produces a `!py.func` SSA value corresponding to the referenced `py.func`
@@ -352,10 +353,10 @@ def Py_MakeNativeOp : Py_Op<"make_native", [Pure]> {
 }
 
 //===----------------------------------------------------------------------===//
-// Tuple and Dict construction
+// Tuple / Dict / List construction
 //===----------------------------------------------------------------------===//
 
-def Py_TupleCreateOp : Py_Op<"tuple.create", [Pure]> {
+def Py_TupleCreateOp : Py_Op<"tuple.create", []> {
   let summary = "Create a Python tuple from elements";
   let description = [{
     Constructs a `!py.tuple` value from a variadic list of elements.
@@ -390,7 +391,7 @@ def Py_TupleEmptyOp : Py_Op<"tuple.empty", [Pure]> {
   let hasVerifier = 1;
 }
 
-def Py_DictEmptyOp : Py_Op<"dict.empty", [Pure]> {
+def Py_DictEmptyOp : Py_Op<"dict.empty", []> {
   let summary = "Create an empty Python dictionary";
   let description = [{
     Creates an empty `!py.dict<K, V>` value with the specified key and value types.
@@ -427,6 +428,84 @@ def Py_DictInsertOp : Py_Op<"dict.insert"> {
   let hasVerifier = 1;
 }
 
+def Py_DictGetOp : Py_Op<"dict.get", []> {
+  let summary = "Get a value from a typed Python dictionary";
+  let description = [{
+    Loads the value associated with a key from a typed dictionary.
+  }];
+
+  let arguments = (ins
+    Py_DictType:$dict,
+    AnyType:$key
+  );
+
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat = "$dict `:` type($dict) `[` $key `:` type($key) `]` attr-dict `->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_ListNewOp : Py_Op<"list.new", []> {
+  let summary = "Create an empty typed Python list";
+  let description = [{
+    Creates an empty `!py.list<T>` value. The element type is carried by the
+    result type and remains available for static verification and lowering.
+  }];
+
+  let results = (outs Py_ListType:$result);
+
+  let assemblyFormat = "attr-dict `:` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_ListAppendOp : Py_Op<"list.append"> {
+  let summary = "Append an element to a typed Python list";
+  let description = [{
+    Appends an element whose type matches the list element type.
+  }];
+
+  let arguments = (ins
+    Py_ListType:$list,
+    AnyType:$value
+  );
+
+  let assemblyFormat = "$list `:` type($list) `,` $value `:` type($value) attr-dict";
+  let hasVerifier = 1;
+}
+
+def Py_ListRemoveOp : Py_Op<"list.remove"> {
+  let summary = "Remove the first equal element from a typed Python list";
+  let description = [{
+    Removes the first element equal to the provided value. Equality is resolved
+    statically at lowering time from the list element type.
+  }];
+
+  let arguments = (ins
+    Py_ListType:$list,
+    AnyType:$value
+  );
+
+  let assemblyFormat = "$list `:` type($list) `,` $value `:` type($value) attr-dict";
+  let hasVerifier = 1;
+}
+
+def Py_ListGetOp : Py_Op<"list.get", []> {
+  let summary = "Get an element from a typed Python list";
+  let description = [{
+    Loads the element at the specified index from a typed list.
+  }];
+
+  let arguments = (ins
+    Py_ListType:$list,
+    AnyType:$index
+  );
+
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat = "$list `:` type($list) `[` $index `:` type($index) `]` attr-dict `->` type($result)";
+  let hasVerifier = 1;
+}
+
 def Py_NoneOp : Py_Op<"none", [Pure]> {
   let summary = "Produce the Python None singleton";
   let description = [{
@@ -443,7 +522,7 @@ def Py_NoneOp : Py_Op<"none", [Pure]> {
   let assemblyFormat = "attr-dict `:` type($result)";
 }
 
-def Py_StrConstantOp : Py_Op<"str.constant", [Pure]> {
+def Py_StrConstantOp : Py_Op<"str.constant", []> {
   let summary = "Create a Python string literal";
   let description = [{
     Produces a `!py.str` SSA value from a compile-time string attribute.
@@ -456,7 +535,7 @@ def Py_StrConstantOp : Py_Op<"str.constant", [Pure]> {
   let hasVerifier = 1;
 }
 
-def Py_IntConstantOp : Py_Op<"int.constant", [Pure]> {
+def Py_IntConstantOp : Py_Op<"int.constant", []> {
   let summary = "Create a Python integer literal";
   let description = [{
     Produces a `!py.int` SSA value from a compile-time integer attribute.
@@ -473,7 +552,7 @@ def Py_IntConstantOp : Py_Op<"int.constant", [Pure]> {
   let assemblyFormat = "$value attr-dict `:` type($result)";
 }
 
-def Py_FloatConstantOp : Py_Op<"float.constant", [Pure]> {
+def Py_FloatConstantOp : Py_Op<"float.constant", []> {
   let summary = "Create a Python float literal";
   let description = [{
     Produces a `!py.float` SSA value from a compile-time floating-point attribute.
@@ -490,7 +569,7 @@ def Py_FloatConstantOp : Py_Op<"float.constant", [Pure]> {
 // Type casting operations
 //===----------------------------------------------------------------------===//
 
-def Py_CastFromPrimOp : Py_Op<"cast.from_prim", [Pure]> {
+def Py_CastFromPrimOp : Py_Op<"cast.from_prim", []> {
   let summary = "Explicitly box a primitive value to a Python object";
   let description = [{
     Converts a primitive MLIR type (e.g., i32, f64, i1) to the corresponding
@@ -585,7 +664,7 @@ def Py_UpcastOp : Py_Op<"upcast", [Pure]> {
 // Arithmetic operations
 //===----------------------------------------------------------------------===//
 
-def Py_NumAddOp : Py_Op<"num.add", [Pure, SameOperandsAndResultType]> {
+def Py_NumAddOp : Py_Op<"num.add", [SameOperandsAndResultType]> {
   let summary = "Python numeric addition";
   let description = [{
     Performs addition on Python numeric types (!py.int, !py.float).
@@ -606,7 +685,7 @@ def Py_NumAddOp : Py_Op<"num.add", [Pure, SameOperandsAndResultType]> {
   let hasVerifier = 1;
 }
 
-def Py_NumSubOp : Py_Op<"num.sub", [Pure, SameOperandsAndResultType]> {
+def Py_NumSubOp : Py_Op<"num.sub", [SameOperandsAndResultType]> {
   let summary = "Python numeric subtraction";
   let description = [{
     Performs subtraction on Python numeric types (!py.int, !py.float).
@@ -729,11 +808,11 @@ def Py_NumNeOp : Py_Op<"num.ne", [Pure]> {
 // Class instantiation
 //===----------------------------------------------------------------------===//
 
-def Py_ClassNewOp : Py_Op<"class.new", [Pure]> {
+def Py_ClassNewOp : Py_Op<"class.new", []> {
   let summary = "Create a new instance of a class";
   let description = [{
-    Allocates and initializes a new instance of the specified class.
-    Note: This does NOT call __init__ - that must be done separately.
+    Creates a fresh instance storage for the specified statically resolved
+    class. This does NOT call __init__ - that must be done separately.
 
     Example:
       %instance = py.class.new @MyClass : !py.class<"MyClass">
@@ -746,19 +825,53 @@ def Py_ClassNewOp : Py_Op<"class.new", [Pure]> {
   let results = (outs Py_ClassType:$result);
 
   let assemblyFormat = "$class_name attr-dict `:` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_ClassPromoteOp : Py_Op<"class.promote", []> {
+  let summary = "Promote a static class value to managed storage";
+  let description = [{
+    Ensures that a statically typed class instance has managed lifetime and can
+    safely escape into containers. Local stack-backed instances are copied into
+    managed storage, while already-managed instances are retained and forwarded.
+  }];
+
+  let arguments = (ins
+    Py_ClassType:$input
+  );
+
+  let results = (outs Py_ClassType:$result);
+
+  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_PublishOp : Py_Op<"publish", []> {
+  let summary = "Publish a local value into shared ownership world";
+  let description = [{
+    Internal-only ownership boundary marker. The input and result keep the same
+    logical type, but lowering may materialize runtime promotion for values that
+    need a shared representation.
+  }];
+
+  let arguments = (ins
+    AnyType:$input
+  );
+
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
 // Attribute access operations
 //===----------------------------------------------------------------------===//
 
-// Note: AttrGetOp is NOT marked Pure because it reads from mutable memory.
-// CSE must not merge multiple attr.get operations on the same object,
-// as the value may have been modified by attr.set between reads.
 def Py_AttrGetOp : Py_Op<"attr.get", []> {
-  let summary = "Get an attribute from a Python object";
+  let summary = "Get a statically declared field from a class instance";
   let description = [{
-    Retrieves an attribute by name from a Python object.
+    Retrieves a statically declared field by name from a class instance.
 
     Example:
       %val = py.attr.get %obj["value"] : !py.class<"Foo"> -> !py.int
@@ -772,12 +885,13 @@ def Py_AttrGetOp : Py_Op<"attr.get", []> {
   let results = (outs AnyType:$result);
 
   let assemblyFormat = "$object `[` $name `]` attr-dict `:` type($object) `->` type($result)";
+  let hasVerifier = 1;
 }
 
 def Py_AttrSetOp : Py_Op<"attr.set", []> {
-  let summary = "Set an attribute on a Python object";
+  let summary = "Set a statically declared field on a class instance";
   let description = [{
-    Sets an attribute by name on a Python object.
+    Sets a statically declared field by name on a class instance.
 
     Example:
       py.attr.set %obj["value"] = %val : !py.class<"Foo">, !py.int
@@ -790,6 +904,7 @@ def Py_AttrSetOp : Py_Op<"attr.set", []> {
   );
 
   let assemblyFormat = "$object `[` $name `]` `=` $value attr-dict `:` type($object) `,` type($value)";
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//

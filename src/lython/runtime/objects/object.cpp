@@ -1,10 +1,8 @@
 #include "objects/object.h"
 #include "objects/bool.h"
-#include "objects/dict.h"
 #include "objects/float.h"
 #include "objects/function.h"
 #include "objects/long.h"
-#include "objects/tuple.h"
 #include "objects/unicode.h"
 
 #include <cstdio>
@@ -29,6 +27,43 @@ LyTypeObject makeType(const char *name, Ly_ssize_t basicsize,
   return type;
 }
 
+inline Ly_ssize_t atomicLoadRefCount(const Ly_ssize_t *ptr) {
+  return __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
+}
+
+inline void atomicIncRefCount(Ly_ssize_t *ptr) {
+  __atomic_add_fetch(ptr, 1, __ATOMIC_RELAXED);
+}
+
+inline bool atomicTryDecRefCount(Ly_ssize_t *ptr, Ly_ssize_t &previous) {
+  previous = atomicLoadRefCount(ptr);
+  while (previous > 0) {
+    Ly_ssize_t desired = previous - 1;
+    if (__atomic_compare_exchange_n(ptr, &previous, desired,
+                                    /*weak=*/false, __ATOMIC_ACQ_REL,
+                                    __ATOMIC_ACQUIRE)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool isImmortalObject(LyObject *object) {
+  if (!object)
+    return false;
+  if (LyObject_HasImmortalRefcount(object))
+    return true;
+  if (object == Ly_GetNone())
+    return true;
+  if (object->ob_type == &LyBool_Type())
+    return true;
+  if (object->ob_type == &LyLong_Type() &&
+      LyLong_IsSmallInt(reinterpret_cast<LyLongObject *>(object))) {
+    return true;
+  }
+  return false;
+}
+
 } // namespace
 
 LyTypeObject &LyUnicode_Type() {
@@ -44,13 +79,6 @@ LyTypeObject &LyBool_Type() {
   return type;
 }
 
-LyTypeObject &LyTuple_Type() {
-  static LyTypeObject type =
-      makeType("tuple", sizeof(LyTupleObject), sizeof(LyObject *), 0,
-               &LyTuple_Dealloc, &LyTuple_Repr);
-  return type;
-}
-
 LyTypeObject &LyFunction_Type() {
   static LyTypeObject type =
       makeType("function", sizeof(LyFunctionObject), 0,
@@ -63,12 +91,6 @@ LyTypeObject &LyNone_Type() {
   // None is singleton, no deallocation needed
   static LyTypeObject type =
       makeType("NoneType", sizeof(LyObject), 0, 0, nullptr, nullptr);
-  return type;
-}
-
-LyTypeObject &LyDict_Type() {
-  static LyTypeObject type = makeType("dict", sizeof(LyDictObject), 0, 0,
-                                      &LyDict_Dealloc, &LyDict_Repr);
   return type;
 }
 
@@ -99,15 +121,20 @@ LyObject *Ly_GetNone() {
 void Ly_IncRef(LyObject *object) {
   if (!object)
     return;
-  ++object->ob_refcnt;
+  if (isImmortalObject(object))
+    return;
+  atomicIncRefCount(&object->ob_refcnt);
 }
 
 void Ly_DecRef(LyObject *object) {
   if (!object)
     return;
-  if (object->ob_refcnt <= 0)
+  if (isImmortalObject(object))
     return;
-  if (--object->ob_refcnt == 0) {
+  Ly_ssize_t previous = 0;
+  if (!atomicTryDecRefCount(&object->ob_refcnt, previous))
+    return;
+  if (previous == 1) {
     LyTypeObject *type = object->ob_type;
     if (type && type->tp_dealloc)
       type->tp_dealloc(object);
@@ -150,4 +177,45 @@ LyUnicodeObject *LyObject_Repr(LyObject *object) {
   }
   return result;
 }
+
+bool LyObject_EqBool(LyObject *lhs, LyObject *rhs) {
+  if (lhs == rhs)
+    return true;
+  if (!lhs || !rhs)
+    return false;
+
+  if (lhs->ob_type == &LyUnicode_Type() && rhs->ob_type == &LyUnicode_Type()) {
+    auto *left = reinterpret_cast<LyUnicodeObject *>(lhs);
+    auto *right = reinterpret_cast<LyUnicodeObject *>(rhs);
+    if (left->utf8_length != right->utf8_length)
+      return false;
+    return std::memcmp(left->utf8_data, right->utf8_data,
+                       static_cast<std::size_t>(left->utf8_length)) == 0;
+  }
+
+  if (lhs->ob_type == &LyLong_Type() && rhs->ob_type == &LyLong_Type()) {
+    return LyLong_AsI64(lhs) == LyLong_AsI64(rhs);
+  }
+
+  if (lhs->ob_type == &LyFloat_Type() && rhs->ob_type == &LyFloat_Type()) {
+    return LyFloat_AsDouble(lhs) == LyFloat_AsDouble(rhs);
+  }
+
+  if (lhs->ob_type == &LyBool_Type() && rhs->ob_type == &LyBool_Type()) {
+    return LyBool_AsBool(lhs) == LyBool_AsBool(rhs);
+  }
+
+  return false;
+}
+
+LyUnicodeObject *LyClass_ReprNamed(const char *name, const void *object) {
+  char buffer[160];
+  const char *className = name ? name : "class";
+  std::snprintf(buffer, sizeof(buffer), "<%s object at %p>", className, object);
+  return LyUnicode_FromUTF8(buffer, std::strlen(buffer));
+}
+
+void *LyMem_Alloc(std::size_t size) { return ::operator new(size); }
+
+void LyMem_Free(void *ptr) { ::operator delete(ptr); }
 }

@@ -28,6 +28,11 @@ DictTypeStorage *DictTypeStorage::construct(TypeStorageAllocator &allocator,
       DictTypeStorage(key.first, key.second);
 }
 
+ListTypeStorage *ListTypeStorage::construct(TypeStorageAllocator &allocator,
+                                            const KeyTy &key) {
+  return new (allocator.allocate<ListTypeStorage>()) ListTypeStorage(key);
+}
+
 ClassTypeStorage *ClassTypeStorage::construct(TypeStorageAllocator &allocator,
                                               const KeyTy &key) {
   return new (allocator.allocate<ClassTypeStorage>())
@@ -104,6 +109,12 @@ DictType DictType::get(MLIRContext *ctx, Type keyType, Type valueType) {
 Type DictType::getKeyType() const { return getImpl()->keyType; }
 
 Type DictType::getValueType() const { return getImpl()->valueType; }
+
+ListType ListType::get(MLIRContext *ctx, Type elementType) {
+  return Base::get(ctx, elementType);
+}
+
+Type ListType::getElementType() const { return getImpl()->elementType; }
 
 ClassType ClassType::get(MLIRContext *ctx, ::llvm::StringRef className) {
   return Base::get(ctx, className);
@@ -193,6 +204,8 @@ bool isPyTupleType(Type type) { return mlir::isa<TupleType>(type); }
 
 bool isPyDictType(Type type) { return mlir::isa<DictType>(type); }
 
+bool isPyListType(Type type) { return mlir::isa<ListType>(type); }
+
 bool isPyClassType(Type type) { return mlir::isa<ClassType>(type); }
 
 bool isPyExceptionType(Type type) { return mlir::isa<ExceptionType>(type); }
@@ -207,15 +220,13 @@ bool isPyFuncType(Type type) { return mlir::isa<FuncType>(type); }
 
 bool isPyPrimFuncType(Type type) { return mlir::isa<PrimFuncType>(type); }
 
-bool isCallableType(Type type) {
-  return mlir::isa<FuncType>(type) || mlir::isa<ClassType>(type);
-}
+bool isCallableType(Type type) { return mlir::isa<FuncType>(type); }
 
 bool isPyType(Type type) {
   return llvm::TypeSwitch<Type, bool>(type)
       .Case<IntType, FloatType, BoolType, StrType, ObjectType, NoneType,
-            TupleType, DictType, ClassType, ExceptionType, TracebackType,
-            LocationType, FuncType>([](auto) { return true; })
+            TupleType, DictType, ListType, ClassType, ExceptionType,
+            TracebackType, LocationType, FuncType>([](auto) { return true; })
       .Default([](Type) { return false; });
 }
 
@@ -228,9 +239,9 @@ bool isSubtypeOf(Type subtype, Type supertype) {
   if (subtype == supertype)
     return true;
 
-  // Top type: T <: !py.object for all T
+  // Top type: object-world T <: !py.object
   if (mlir::isa<ObjectType>(supertype))
-    return isPyType(subtype);
+    return isPyType(subtype) && !mlir::isa<ClassType>(subtype);
 
   // Tuple covariance: !py.tuple<S> <: !py.tuple<T> if S <: T
   auto subtypeTuple = mlir::dyn_cast<TupleType>(subtype);
@@ -254,6 +265,13 @@ bool isSubtypeOf(Type subtype, Type supertype) {
     return isSubtypeOf(subtypeDict.getKeyType(), supertypeDict.getKeyType()) &&
            isSubtypeOf(subtypeDict.getValueType(),
                        supertypeDict.getValueType());
+  }
+
+  auto subtypeList = mlir::dyn_cast<ListType>(subtype);
+  auto supertypeList = mlir::dyn_cast<ListType>(supertype);
+  if (subtypeList && supertypeList) {
+    return isSubtypeOf(subtypeList.getElementType(),
+                       supertypeList.getElementType());
   }
 
   // No other subtype relations in v2.1

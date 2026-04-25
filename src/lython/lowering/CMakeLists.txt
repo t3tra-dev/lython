@@ -1,16 +1,28 @@
 add_library(LythonRuntimeLowering STATIC
-    RuntimeSupport.cpp
-    RuntimeLoweringPass.cpp
-    LinalgLoweringPass.cpp
-    NativeVerificationPass.cpp
-    PyFuncLowering.cpp
-    PyOptimizationPass.cpp
-    PyValueLowering.cpp
-    PyTupleLowering.cpp
-    PyDictLowering.cpp
-    PyCallLowering.cpp
-    PyRefCountLowering.cpp
-    RefCountInsertionPass.cpp
+    Common/RuntimeSupport.cpp
+    Common/TypedSlotUtils.cpp
+    Passes/RuntimeLowering.cpp
+    Passes/LinalgLowering.cpp
+    Passes/NativeVerification.cpp
+    PyFunc/Lowering.cpp
+    Optimizer/Utils.cpp
+    Optimizer/Class.cpp
+    Optimizer/Container.cpp
+    Optimizer/Scalar.cpp
+    Optimizer/RefCount.cpp
+    Optimizer/Orchestration.cpp
+    Optimizer/Pipeline.cpp
+    PyValue/base.cpp
+    PyValue/class.cpp
+    PyValue/list.cpp
+    PyValue/number.cpp
+    PyValue/tuple.cpp
+    PyValue/dict.cpp
+    PyCall/Utils.cpp
+    PyCall/direct.cpp
+    PyCall/invoke.cpp
+    PyRefCount/Lowering.cpp
+    Passes/RefCountInsertion.cpp
 )
 
 target_include_directories(LythonRuntimeLowering
@@ -32,6 +44,7 @@ target_link_libraries(LythonRuntimeLowering
     MLIRLinalgToStandard
     MLIRMemRefDialect
     MLIRSCFDialect
+    MLIRSCFToControlFlow
     MLIRSupport
     MLIRTensorDialect
 )

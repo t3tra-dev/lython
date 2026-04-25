@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -21,7 +23,7 @@ struct SmallIntStorage {
   digit ob_digit[1];
 };
 static SmallIntStorage smallIntCache[kSmallIntCacheSize];
-static bool smallIntCacheInitialized = false;
+static std::once_flag smallIntCacheInitOnce;
 
 // Freelist for single-digit integers (most common allocation)
 // Use a union to store next pointer in the freed object
@@ -33,8 +35,8 @@ struct FreelistNode {
 };
 
 constexpr std::size_t kFreelistMaxSize = 4096;
-static FreelistNode *singleDigitFreelist = nullptr;
-static std::size_t singleDigitFreelistSize = 0;
+static thread_local FreelistNode *singleDigitFreelist = nullptr;
+static thread_local std::size_t singleDigitFreelistSize = 0;
 
 // Pop from single-digit freelist (returns nullptr if empty)
 static LyLongObject *freelistPop() {
@@ -146,44 +148,39 @@ LyLongObject *LyLong_New(Ly_ssize_t ndigits) {
 }
 
 void LyLong_InitSmallIntCache() {
-  if (smallIntCacheInitialized) {
-    return;
-  }
+  std::call_once(smallIntCacheInitOnce, [] {
+    for (std::int64_t i = kSmallIntMin; i <= kSmallIntMax; ++i) {
+      std::size_t idx = static_cast<std::size_t>(i - kSmallIntMin);
+      SmallIntStorage &storage = smallIntCache[idx];
 
-  for (std::int64_t i = kSmallIntMin; i <= kSmallIntMax; ++i) {
-    std::size_t idx = static_cast<std::size_t>(i - kSmallIntMin);
-    SmallIntStorage &storage = smallIntCache[idx];
+      // Immortal object - refcount is ignored by generic helpers.
+      storage.ob_refcnt = 1000000;
+      storage.ob_type = &LyLong_Type();
 
-    // Immortal object - very high refcount
-    storage.ob_refcnt = 1000000;
-    storage.ob_type = &LyLong_Type();
-
-    if (i == 0) {
-      // Zero: sign tag = 1 (zero), 0 digits
-      storage.lv_tag = tagFromSignAndSize(0, 0);
-      storage.ob_digit[0] = 0;
-    } else if (i > 0) {
-      // Positive: sign tag = 0 (positive), 1 digit
-      storage.lv_tag = tagFromSignAndSize(1, 1);
-      storage.ob_digit[0] = static_cast<digit>(i);
-    } else {
-      // Negative: sign tag = 2 (negative), 1 digit
-      storage.lv_tag = tagFromSignAndSize(-1, 1);
-      storage.ob_digit[0] = static_cast<digit>(-i);
+      if (i == 0) {
+        // Zero: sign tag = 1 (zero), 0 digits
+        storage.lv_tag = tagFromSignAndSize(0, 0);
+        storage.ob_digit[0] = 0;
+      } else if (i > 0) {
+        // Positive: sign tag = 0 (positive), 1 digit
+        storage.lv_tag = tagFromSignAndSize(1, 1);
+        storage.ob_digit[0] = static_cast<digit>(i);
+      } else {
+        // Negative: sign tag = 2 (negative), 1 digit
+        storage.lv_tag = tagFromSignAndSize(-1, 1);
+        storage.ob_digit[0] = static_cast<digit>(-i);
+      }
     }
-  }
-  smallIntCacheInitialized = true;
+  });
 }
 
 LyLongObject *LyLong_GetSmallInt(sdigit value) {
-  if (!smallIntCacheInitialized) {
-    LyLong_InitSmallIntCache();
-  }
+  LyLong_InitSmallIntCache();
   return reinterpret_cast<LyLongObject *>(&smallIntCache[value - kSmallIntMin]);
 }
 
 bool LyLong_IsSmallInt(const LyLongObject *obj) {
-  if (!obj || !smallIntCacheInitialized) {
+  if (!obj) {
     return false;
   }
   // Check if pointer falls within the cache array
@@ -243,6 +240,39 @@ LyLongObject *LyLong_FromSTwoDigits(stwodigits value) {
 
 LyLongObject *LyLong_FromI64(std::int64_t value) {
   return LyLong_FromSTwoDigits(static_cast<stwodigits>(value));
+}
+
+std::int64_t LyLong_AsI64(LyObject *object) {
+  if (!object || object->ob_type != &LyLong_Type())
+    return 0;
+
+  auto *value = reinterpret_cast<LyLongObject *>(object);
+  if (value->digitCount() == 0)
+    return 0;
+  if (value->isCompact())
+    return static_cast<std::int64_t>(medium_value(value));
+
+  unsigned __int128 magnitude = 0;
+  for (Ly_ssize_t i = value->digitCount(); i > 0; --i) {
+    magnitude <<= kDigitBits;
+    magnitude |= static_cast<unsigned __int128>(value->ob_digit[i - 1]);
+  }
+
+  constexpr unsigned __int128 kPositiveLimit =
+      static_cast<unsigned __int128>(std::numeric_limits<std::int64_t>::max());
+  constexpr unsigned __int128 kNegativeLimit = kPositiveLimit + 1u;
+
+  if (value->isNegative()) {
+    if (magnitude > kNegativeLimit)
+      std::abort();
+    if (magnitude == kNegativeLimit)
+      return std::numeric_limits<std::int64_t>::min();
+    return -static_cast<std::int64_t>(magnitude);
+  }
+
+  if (magnitude > kPositiveLimit)
+    std::abort();
+  return static_cast<std::int64_t>(magnitude);
 }
 
 // CPython-compatible string to long conversion

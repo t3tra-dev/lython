@@ -100,6 +100,8 @@ LogicalResult UpcastOp::verify() {
 
   if (!isPyType(inputType))
     return emitOpError("input must be a !py.* type");
+  if (isa<ClassType>(inputType))
+    return emitOpError("static class instances cannot be upcast to !py.object");
   if (!isPyObjectType(resultType))
     return emitOpError("result must be of type !py.object");
 

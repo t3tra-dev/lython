@@ -20,6 +20,7 @@ enum class TypeKind : unsigned {
   None,
   Tuple,
   Dict,
+  List,
   Class, // User-defined class type
   Exception,
   Traceback,
@@ -75,6 +76,19 @@ struct DictTypeStorage : public mlir::TypeStorage {
 
   mlir::Type keyType;
   mlir::Type valueType;
+};
+
+struct ListTypeStorage : public mlir::TypeStorage {
+  using KeyTy = mlir::Type;
+
+  explicit ListTypeStorage(mlir::Type element) : elementType(element) {}
+
+  bool operator==(const KeyTy &key) const { return key == elementType; }
+
+  static ListTypeStorage *construct(mlir::TypeStorageAllocator &allocator,
+                                    const KeyTy &key);
+
+  mlir::Type elementType;
 };
 
 struct ClassTypeStorage : public mlir::TypeStorage {
@@ -264,9 +278,22 @@ public:
   ::llvm::StringRef getClassName() const;
 };
 
-class ExceptionType
-    : public mlir::Type::TypeBase<ExceptionType, mlir::Type,
-                                  detail::SimpleTypeStorage> {
+class ListType : public mlir::Type::TypeBase<ListType, mlir::Type,
+                                             detail::ListTypeStorage> {
+public:
+  using Base::Base;
+  static constexpr ::llvm::StringLiteral name{"py.list"};
+
+  static ListType get(mlir::MLIRContext *ctx, mlir::Type elementType);
+  static bool kindof(unsigned kind) {
+    return kind == static_cast<unsigned>(TypeKind::List);
+  }
+
+  mlir::Type getElementType() const;
+};
+
+class ExceptionType : public mlir::Type::TypeBase<ExceptionType, mlir::Type,
+                                                  detail::SimpleTypeStorage> {
 public:
   using Base::Base;
   static constexpr ::llvm::StringLiteral name{"py.exception"};
@@ -277,9 +304,8 @@ public:
   }
 };
 
-class TracebackType
-    : public mlir::Type::TypeBase<TracebackType, mlir::Type,
-                                  detail::SimpleTypeStorage> {
+class TracebackType : public mlir::Type::TypeBase<TracebackType, mlir::Type,
+                                                  detail::SimpleTypeStorage> {
 public:
   using Base::Base;
   static constexpr ::llvm::StringLiteral name{"py.traceback"};
@@ -290,9 +316,8 @@ public:
   }
 };
 
-class LocationType
-    : public mlir::Type::TypeBase<LocationType, mlir::Type,
-                                  detail::SimpleTypeStorage> {
+class LocationType : public mlir::Type::TypeBase<LocationType, mlir::Type,
+                                                 detail::SimpleTypeStorage> {
 public:
   using Base::Base;
   static constexpr ::llvm::StringLiteral name{"py.location"};
@@ -364,6 +389,7 @@ bool isPyObjectType(mlir::Type type);
 bool isPyNoneType(mlir::Type type);
 bool isPyTupleType(mlir::Type type);
 bool isPyDictType(mlir::Type type);
+bool isPyListType(mlir::Type type);
 bool isPyClassType(mlir::Type type);
 bool isPyExceptionType(mlir::Type type);
 bool isPyTracebackType(mlir::Type type);
