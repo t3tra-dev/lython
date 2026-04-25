@@ -92,8 +92,9 @@ void LyTraceback_Print(LyObject *exception) {
   const char *typeName = exc->ob_type ? exc->ob_type->tp_name : "Exception";
   auto *excObj = reinterpret_cast<LyExceptionObject *>(exc);
   const char *msg =
-      excObj->message ? LyUnicode_AsUTF8(reinterpret_cast<LyObject *>(excObj->message))
-                      : "";
+      excObj->message
+          ? LyUnicode_AsUTF8(reinterpret_cast<LyObject *>(excObj->message))
+          : "";
   if (msg && msg[0])
     std::fprintf(stderr, "%s: %s\n", typeName, msg);
   else

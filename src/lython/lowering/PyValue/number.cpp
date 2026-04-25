@@ -1,20 +1,17 @@
-#include "RuntimeSupport.h"
+#include "Common/RuntimeSupport.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
-#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
-#include "mlir/IR/Location.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
-#include "llvm/Support/raw_ostream.h"
 
-#include <cstdint>
 #include <cerrno>
 #include <cstdlib>
+#include <string>
 
 #define GET_OP_CLASSES
 #include "PyOps.h.inc"
@@ -24,42 +21,6 @@ using namespace mlir;
 
 namespace py {
 namespace {
-
-static void getLocInfo(Location loc, MLIRContext *ctx, StringAttr &fileAttr,
-                       std::int64_t &line, std::int64_t &col) {
-  if (auto fileLoc = llvm::dyn_cast<FileLineColLoc>(loc)) {
-    fileAttr = fileLoc.getFilename();
-    line = static_cast<std::int64_t>(fileLoc.getLine());
-    col = static_cast<std::int64_t>(fileLoc.getColumn());
-    return;
-  }
-  if (auto nameLoc = llvm::dyn_cast<NameLoc>(loc)) {
-    getLocInfo(nameLoc.getChildLoc(), ctx, fileAttr, line, col);
-    return;
-  }
-  if (auto fused = llvm::dyn_cast<FusedLoc>(loc)) {
-    for (auto subloc : fused.getLocations()) {
-      if (auto subfile = llvm::dyn_cast<FileLineColLoc>(subloc)) {
-        fileAttr = subfile.getFilename();
-        line = static_cast<std::int64_t>(subfile.getLine());
-        col = static_cast<std::int64_t>(subfile.getColumn());
-        return;
-      }
-    }
-  }
-  fileAttr = StringAttr::get(ctx, "<unknown>");
-  line = 0;
-  col = 0;
-}
-
-static StringAttr getFuncNameAttr(func::FuncOp func, MLIRContext *ctx) {
-  if (!func)
-    return StringAttr::get(ctx, "<unknown>");
-  StringRef name = func.getName();
-  if (name == "main")
-    return StringAttr::get(ctx, "<module>");
-  return StringAttr::get(ctx, name);
-}
 
 static bool formatPrimitiveAttr(Attribute attr, std::string &out) {
   if (auto intAttr = llvm::dyn_cast<IntegerAttr>(attr)) {
@@ -77,9 +38,8 @@ static bool formatPrimitiveAttr(Attribute attr, std::string &out) {
 
 static bool collectTensorLiteralElements(Value input,
                                          SmallVector<std::string> &flat) {
-  if (auto fromElems =
-          llvm::dyn_cast_or_null<tensor::FromElementsOp>(
-              input.getDefiningOp())) {
+  if (auto fromElems = llvm::dyn_cast_or_null<tensor::FromElementsOp>(
+          input.getDefiningOp())) {
     for (Value element : fromElems.getElements()) {
       auto constOp = element.getDefiningOp<arith::ConstantOp>();
       if (!constOp)
@@ -93,8 +53,7 @@ static bool collectTensorLiteralElements(Value input,
   }
 
   if (auto constOp = input.getDefiningOp<arith::ConstantOp>()) {
-    if (auto dense =
-            llvm::dyn_cast<DenseElementsAttr>(constOp.getValue())) {
+    if (auto dense = llvm::dyn_cast<DenseElementsAttr>(constOp.getValue())) {
       for (auto val : dense.getValues<Attribute>()) {
         std::string valueStr;
         if (!formatPrimitiveAttr(val, valueStr))
@@ -116,8 +75,8 @@ static func::FuncOp getOrInsertTensorReprFunc(ModuleOp module, StringRef name,
 
   OpBuilder builder(module.getContext());
   builder.setInsertionPointToStart(module.getBody());
-  auto funcType = FunctionType::get(module.getContext(), {memrefType},
-                                    {resultType});
+  auto funcType =
+      FunctionType::get(module.getContext(), {memrefType}, {resultType});
   auto func = builder.create<func::FuncOp>(module.getLoc(), name, funcType);
   func->setAttr("llvm.emit_c_interface", builder.getUnitAttr());
   func.setVisibility(SymbolTable::Visibility::Private);
@@ -137,8 +96,7 @@ static std::string formatTensorLiteral(ArrayRef<int64_t> shape,
   for (int64_t i = 0; i < shape.front(); ++i) {
     if (i > 0)
       result.append(", ");
-    result.append(
-        formatTensorLiteral(shape.drop_front(), flat, index));
+    result.append(formatTensorLiteral(shape.drop_front(), flat, index));
   }
   result.push_back(']');
   return result;
@@ -166,7 +124,7 @@ struct StrConstantLowering : public OpConversionPattern<StrConstantOp> {
     Value length = runtime.getI64Constant(op.getLoc(),
                                           op.getValueAttr().getValue().size());
 
-    auto call = runtime.call(op.getLoc(), RuntimeSymbols::kStrFromUtf8,
+    auto call = runtime.call(op.getLoc(), RuntimeSymbols::kStrInternStaticUtf8,
                              resultType, ValueRange{dataPtr, length});
     rewriter.replaceOp(op, call.getResults());
     return success();
@@ -317,10 +275,15 @@ struct NumAddLowering : public OpConversionPattern<NumAddOp> {
       return failure();
 
     // Use type-specialized function for int operands
-    llvm::StringRef symbol =
-        isPyIntType(op.getLhs().getType()) && isPyIntType(op.getRhs().getType())
-            ? RuntimeSymbols::kLongAdd
-            : RuntimeSymbols::kNumberAdd;
+    llvm::StringRef symbol;
+    if (isPyIntType(op.getLhs().getType()) &&
+        isPyIntType(op.getRhs().getType()))
+      symbol = RuntimeSymbols::kLongAdd;
+    else if (isPyStrType(op.getLhs().getType()) &&
+             isPyStrType(op.getRhs().getType()))
+      symbol = RuntimeSymbols::kUnicodeConcat;
+    else
+      symbol = RuntimeSymbols::kNumberAdd;
     auto call =
         runtime.call(op.getLoc(), symbol, resultType, adaptor.getOperands());
     rewriter.replaceOp(op, call.getResults());
@@ -616,18 +579,48 @@ struct CastToPrimLowering : public OpConversionPattern<CastToPrimOp> {
   LogicalResult
   matchAndRewrite(CastToPrimOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (op.getResult().getType() != rewriter.getI1Type())
-      return rewriter.notifyMatchFailure(op, "only bool casts supported");
     ModuleOp module = op->getParentOfType<ModuleOp>();
     if (!module)
       return failure();
     auto *typeConverter =
         static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
     RuntimeAPI runtime(module, rewriter, *typeConverter);
-    auto call = runtime.call(op.getLoc(), RuntimeSymbols::kBoolAsBool,
-                             rewriter.getI1Type(), adaptor.getInput());
-    rewriter.replaceOp(op, call.getResults());
-    return success();
+    Type resultType = op.getResult().getType();
+    Type inputType = op.getInput().getType();
+
+    if (inputType == BoolType::get(rewriter.getContext()) &&
+        resultType == rewriter.getI1Type()) {
+      auto call = runtime.call(op.getLoc(), RuntimeSymbols::kBoolAsBool,
+                               rewriter.getI1Type(), adaptor.getInput());
+      rewriter.replaceOp(op, call.getResults());
+      return success();
+    }
+
+    if (inputType == IntType::get(rewriter.getContext())) {
+      Value asI64 = runtime
+                        .call(op.getLoc(), RuntimeSymbols::kLongAsI64,
+                              rewriter.getI64Type(), adaptor.getInput())
+                        .getResult();
+      if (resultType == rewriter.getI64Type()) {
+        rewriter.replaceOp(op, asI64);
+        return success();
+      }
+      if (resultType == rewriter.getI32Type()) {
+        rewriter.replaceOpWithNewOp<LLVM::TruncOp>(op, resultType, asI64);
+        return success();
+      }
+    }
+
+    if (inputType == FloatType::get(rewriter.getContext()) &&
+        resultType == rewriter.getF64Type()) {
+      auto call = runtime.call(op.getLoc(), RuntimeSymbols::kFloatAsDouble,
+                               rewriter.getF64Type(), adaptor.getInput());
+      rewriter.replaceOp(op, call.getResults());
+      return success();
+    }
+
+    return rewriter.notifyMatchFailure(op,
+                                       "unsupported cast.to_prim conversion");
   }
 };
 
@@ -650,6 +643,15 @@ struct CastFromPrimLowering : public OpConversionPattern<CastFromPrimOp> {
 
     Value input = adaptor.getInput();
     Type inputType = input.getType();
+    Type pyResultType = op.getResult().getType();
+
+    if (inputType == rewriter.getI1Type() &&
+        pyResultType == BoolType::get(rewriter.getContext())) {
+      auto call = runtime.call(op.getLoc(), RuntimeSymbols::kBoolFromBool,
+                               resultType, ValueRange{input});
+      rewriter.replaceOp(op, call.getResults());
+      return success();
+    }
 
     // Handle integer types -> !py.int
     if (auto intType = llvm::dyn_cast<IntegerType>(inputType)) {
@@ -721,9 +723,8 @@ struct CastFromPrimLowering : public OpConversionPattern<CastFromPrimOp> {
         }
 
         auto memrefType = MemRefType::get(tensorType.getShape(), elemType);
-        Value memref =
-            rewriter.create<bufferization::ToMemrefOp>(op.getLoc(), memrefType,
-                                                       input);
+        Value memref = rewriter.create<bufferization::ToMemrefOp>(
+            op.getLoc(), memrefType, input);
         auto unrankedType = UnrankedMemRefType::get(elemType, 0);
         Value unranked =
             rewriter.create<memref::CastOp>(op.getLoc(), unrankedType, memref);
@@ -742,16 +743,15 @@ struct CastFromPrimLowering : public OpConversionPattern<CastFromPrimOp> {
 
       Value dataPtr = runtime.getStringLiteral(
           op.getLoc(), StringAttr::get(rewriter.getContext(), text));
-      Value length = runtime.getI64Constant(
-          op.getLoc(), static_cast<int64_t>(text.size()));
+      Value length = runtime.getI64Constant(op.getLoc(),
+                                            static_cast<int64_t>(text.size()));
       auto call = runtime.call(op.getLoc(), RuntimeSymbols::kStrFromUtf8,
                                resultType, ValueRange{dataPtr, length});
       rewriter.replaceOp(op, call.getResults());
 
       if (Operation *def = input.getDefiningOp()) {
-        if (input.use_empty() &&
-            (llvm::isa<tensor::FromElementsOp>(def) ||
-             llvm::isa<arith::ConstantOp>(def))) {
+        if (input.use_empty() && (llvm::isa<tensor::FromElementsOp>(def) ||
+                                  llvm::isa<arith::ConstantOp>(def))) {
           rewriter.eraseOp(def);
         }
       }
@@ -763,378 +763,16 @@ struct CastFromPrimLowering : public OpConversionPattern<CastFromPrimOp> {
   }
 };
 
-// For now, class instances are represented as dictionaries.
-// ClassNewOp creates a new empty dictionary as instance storage.
-struct ClassNewLowering : public OpConversionPattern<ClassNewOp> {
-  ClassNewLowering(PyLLVMTypeConverter &converter, MLIRContext *ctx)
-      : OpConversionPattern<ClassNewOp>(converter, ctx) {}
-
-  LogicalResult
-  matchAndRewrite(ClassNewOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    ModuleOp module = op->getParentOfType<ModuleOp>();
-    if (!module)
-      return failure();
-    auto *typeConverter =
-        static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
-    RuntimeAPI runtime(module, rewriter, *typeConverter);
-    Type resultType = typeConverter->convertType(op.getResult().getType());
-    if (!resultType)
-      return failure();
-    auto call = runtime.call(op.getLoc(), RuntimeSymbols::kDictNew, resultType,
-                             ValueRange{});
-    rewriter.replaceOp(op, call.getResults());
-    return success();
-  }
-};
-
-// AttrGetOp lowers to dict lookup
-struct AttrGetLowering : public OpConversionPattern<AttrGetOp> {
-  AttrGetLowering(PyLLVMTypeConverter &converter, MLIRContext *ctx)
-      : OpConversionPattern<AttrGetOp>(converter, ctx) {}
-
-  LogicalResult
-  matchAndRewrite(AttrGetOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    ModuleOp module = op->getParentOfType<ModuleOp>();
-    if (!module)
-      return failure();
-    auto *typeConverter =
-        static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
-    RuntimeAPI runtime(module, rewriter, *typeConverter);
-    Type resultType = typeConverter->convertType(op.getResult().getType());
-    if (!resultType)
-      return failure();
-
-    // Create string key for attribute name
-    StringRef attrName = op.getNameAttr().getValue();
-    Value namePtr = runtime.getStringLiteral(
-        op.getLoc(), StringAttr::get(rewriter.getContext(), attrName));
-    Value nameLen = runtime.getI64Constant(
-        op.getLoc(), static_cast<int64_t>(attrName.size()));
-    auto keyCall = runtime.call(op.getLoc(), RuntimeSymbols::kStrFromUtf8,
-                                typeConverter->getPyObjectPtrType(),
-                                ValueRange{namePtr, nameLen});
-
-    // Lookup in dict
-    auto getCall =
-        runtime.call(op.getLoc(), RuntimeSymbols::kDictGetItem, resultType,
-                     ValueRange{adaptor.getObject(), keyCall.getResult()});
-    rewriter.replaceOp(op, getCall.getResults());
-    return success();
-  }
-};
-
-// AttrSetOp lowers to dict insert
-struct AttrSetLowering : public OpConversionPattern<AttrSetOp> {
-  AttrSetLowering(PyLLVMTypeConverter &converter, MLIRContext *ctx)
-      : OpConversionPattern<AttrSetOp>(converter, ctx) {}
-
-  LogicalResult
-  matchAndRewrite(AttrSetOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    ModuleOp module = op->getParentOfType<ModuleOp>();
-    if (!module)
-      return failure();
-    auto *typeConverter =
-        static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
-    RuntimeAPI runtime(module, rewriter, *typeConverter);
-
-    // Create string key for attribute name
-    StringRef attrName = op.getNameAttr().getValue();
-    Value namePtr = runtime.getStringLiteral(
-        op.getLoc(), StringAttr::get(rewriter.getContext(), attrName));
-    Value nameLen = runtime.getI64Constant(
-        op.getLoc(), static_cast<int64_t>(attrName.size()));
-    auto keyCall = runtime.call(op.getLoc(), RuntimeSymbols::kStrFromUtf8,
-                                typeConverter->getPyObjectPtrType(),
-                                ValueRange{namePtr, nameLen});
-
-    // Insert into dict
-    runtime.call(op.getLoc(), RuntimeSymbols::kDictInsert,
-                 typeConverter->getPyObjectPtrType(),
-                 ValueRange{adaptor.getObject(), keyCall.getResult(),
-                            adaptor.getValue()});
-    rewriter.eraseOp(op);
-    return success();
-  }
-};
-
-// ClassOp is just a container - erase it and keep its methods at module scope
-struct ClassOpLowering : public OpConversionPattern<ClassOp> {
-  ClassOpLowering(PyLLVMTypeConverter &converter, MLIRContext *ctx)
-      : OpConversionPattern<ClassOp>(converter, ctx) {}
-
-  LogicalResult
-  matchAndRewrite(ClassOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    // Just erase the class op - methods are already at module scope
-    rewriter.eraseOp(op);
-    return success();
-  }
-};
-
-struct ExceptionNullLowering : public OpConversionPattern<ExceptionNullOp> {
-  ExceptionNullLowering(PyLLVMTypeConverter &converter, MLIRContext *ctx)
-      : OpConversionPattern<ExceptionNullOp>(converter, ctx) {}
-
-  LogicalResult
-  matchAndRewrite(ExceptionNullOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    auto *typeConverter =
-        static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
-    Type resultType = typeConverter->convertType(op.getResult().getType());
-    rewriter.replaceOpWithNewOp<LLVM::ZeroOp>(op, resultType);
-    return success();
-  }
-};
-
-struct TracebackNullLowering : public OpConversionPattern<TracebackNullOp> {
-  TracebackNullLowering(PyLLVMTypeConverter &converter, MLIRContext *ctx)
-      : OpConversionPattern<TracebackNullOp>(converter, ctx) {}
-
-  LogicalResult
-  matchAndRewrite(TracebackNullOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    auto *typeConverter =
-        static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
-    Type resultType = typeConverter->convertType(op.getResult().getType());
-    rewriter.replaceOpWithNewOp<LLVM::ZeroOp>(op, resultType);
-    return success();
-  }
-};
-
-struct LocationCurrentLowering : public OpConversionPattern<LocationCurrentOp> {
-  LocationCurrentLowering(PyLLVMTypeConverter &converter, MLIRContext *ctx)
-      : OpConversionPattern<LocationCurrentOp>(converter, ctx) {}
-
-  LogicalResult
-  matchAndRewrite(LocationCurrentOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    auto *typeConverter =
-        static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
-    Type resultType = typeConverter->convertType(op.getResult().getType());
-    rewriter.replaceOpWithNewOp<LLVM::ZeroOp>(op, resultType);
-    return success();
-  }
-};
-
-struct ExceptionNewLowering : public OpConversionPattern<ExceptionNewOp> {
-  ExceptionNewLowering(PyLLVMTypeConverter &converter, MLIRContext *ctx)
-      : OpConversionPattern<ExceptionNewOp>(converter, ctx) {}
-
-  LogicalResult
-  matchAndRewrite(ExceptionNewOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    ModuleOp module = op->getParentOfType<ModuleOp>();
-    if (!module)
-      return failure();
-    auto *typeConverter =
-        static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
-    RuntimeAPI runtime(module, rewriter, *typeConverter);
-    Type resultType = typeConverter->convertType(op.getResult().getType());
-    auto call = runtime.call(
-        op.getLoc(), RuntimeSymbols::kExceptionNew, resultType,
-        ValueRange{adaptor.getType(), adaptor.getMessage(), adaptor.getArgs(),
-                   adaptor.getCause(), adaptor.getContext(),
-                   adaptor.getTraceback(), adaptor.getLocation(),
-                   adaptor.getExtras()});
-    rewriter.replaceOp(op, call.getResults());
-    return success();
-  }
-};
-
-struct TryLowering : public OpConversionPattern<TryOp> {
-  TryLowering(PyLLVMTypeConverter &converter, MLIRContext *ctx)
-      : OpConversionPattern<TryOp>(converter, ctx) {}
-
-  LogicalResult
-  matchAndRewrite(TryOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    if (op.getTryRegion().empty())
-      return rewriter.notifyMatchFailure(op, "empty try region");
-
-    bool hasExcept = !op.getExceptRegion().empty();
-    bool hasFinally = !op.getFinallyRegion().empty();
-
-    if (!hasExcept)
-      return rewriter.notifyMatchFailure(
-          op, "try lowering requires except region");
-
-    if (hasFinally && op.getNumResults() > 0)
-      return rewriter.notifyMatchFailure(
-          op, "finally with results is not supported yet");
-
-    Region *parent = op->getParentRegion();
-    Block *parentBlock = op->getBlock();
-    auto insertIt = std::next(parent->begin(), std::distance(parent->begin(),
-                                                            Region::iterator(
-                                                                parentBlock)));
-    Block *mergeBlock = rewriter.createBlock(parent, insertIt);
-    for (Type resultType : op.getResultTypes())
-      mergeBlock->addArgument(resultType, op.getLoc());
-
-    Block *tryEntry = &op.getTryRegion().front();
-    Block *exceptEntry = &op.getExceptRegion().front();
-    Block *finallyEntry = hasFinally ? &op.getFinallyRegion().front() : nullptr;
-
-    SmallVector<Block *> tryBlocks;
-    SmallVector<Block *> exceptBlocks;
-    SmallVector<Block *> finallyBlocks;
-    for (Block &block : op.getTryRegion())
-      tryBlocks.push_back(&block);
-    for (Block &block : op.getExceptRegion())
-      exceptBlocks.push_back(&block);
-    if (hasFinally)
-      for (Block &block : op.getFinallyRegion())
-        finallyBlocks.push_back(&block);
-
-    // Move operations after py.try into merge block.
-    for (auto it = std::next(op->getIterator()); it != parentBlock->end();) {
-      Operation *move = &*it++;
-      move->moveBefore(mergeBlock, mergeBlock->end());
-    }
-
-    // Inline regions into parent before merge block.
-    rewriter.inlineRegionBefore(op.getTryRegion(), *parent, mergeBlock->getIterator());
-    rewriter.inlineRegionBefore(op.getExceptRegion(), *parent, mergeBlock->getIterator());
-    if (hasFinally)
-      rewriter.inlineRegionBefore(op.getFinallyRegion(), *parent,
-                                  mergeBlock->getIterator());
-
-    // Redirect invokes inside try region to except entry.
-    for (Block *block : tryBlocks) {
-      for (auto invoke : block->getOps<InvokeOp>()) {
-        OpBuilder builder(invoke);
-        auto excNull = builder.create<ExceptionNullOp>(
-            invoke.getLoc(), ExceptionType::get(op.getContext()));
-        invoke.getUnwindDestOperandsMutable().assign(excNull.getResult());
-        invoke->setSuccessor(exceptEntry, 1);
-      }
-    }
-
-    // Replace yields with branches.
-    for (Block *block : tryBlocks) {
-      if (auto yield = dyn_cast<TryYieldOp>(block->getTerminator())) {
-        if (hasFinally) {
-          rewriter.setInsertionPoint(yield);
-          rewriter.replaceOpWithNewOp<cf::BranchOp>(yield, finallyEntry,
-                                                    ValueRange{});
-        } else {
-          rewriter.setInsertionPoint(yield);
-          rewriter.replaceOpWithNewOp<cf::BranchOp>(yield, mergeBlock,
-                                                    yield.getOperands());
-        }
-      }
-    }
-    for (Block *block : exceptBlocks) {
-      if (auto yield = dyn_cast<ExceptYieldOp>(block->getTerminator())) {
-        if (hasFinally) {
-          rewriter.setInsertionPoint(yield);
-          rewriter.replaceOpWithNewOp<cf::BranchOp>(yield, finallyEntry,
-                                                    ValueRange{});
-        } else {
-          rewriter.setInsertionPoint(yield);
-          rewriter.replaceOpWithNewOp<cf::BranchOp>(yield, mergeBlock,
-                                                    yield.getOperands());
-        }
-      }
-    }
-    for (Block *block : finallyBlocks) {
-      if (auto yield = dyn_cast<FinallyYieldOp>(block->getTerminator())) {
-        rewriter.setInsertionPoint(yield);
-        rewriter.replaceOpWithNewOp<cf::BranchOp>(yield, mergeBlock,
-                                                  ValueRange{});
-      }
-    }
-
-    // Connect parent block to try entry.
-    rewriter.setInsertionPointToEnd(parentBlock);
-    rewriter.create<cf::BranchOp>(op.getLoc(), tryEntry);
-
-    for (auto [res, arg] : llvm::zip(op.getResults(), mergeBlock->getArguments()))
-      res.replaceAllUsesWith(arg);
-
-    rewriter.eraseOp(op);
-    return success();
-  }
-};
-
-struct RaiseLowering : public OpConversionPattern<RaiseOp> {
-  RaiseLowering(PyLLVMTypeConverter &converter, MLIRContext *ctx)
-      : OpConversionPattern<RaiseOp>(converter, ctx) {}
-
-  LogicalResult
-  matchAndRewrite(RaiseOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    ModuleOp module = op->getParentOfType<ModuleOp>();
-    if (!module)
-      return failure();
-    auto *typeConverter =
-        static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
-    RuntimeAPI runtime(module, rewriter, *typeConverter);
-    StringAttr fileAttr;
-    std::int64_t line = 0;
-    std::int64_t col = 0;
-    getLocInfo(op.getLoc(), op.getContext(), fileAttr, line, col);
-    StringAttr funcAttr =
-        getFuncNameAttr(op->getParentOfType<func::FuncOp>(), op.getContext());
-    Value filePtr = runtime.getStringLiteral(op.getLoc(), fileAttr);
-    Value funcPtr = runtime.getStringLiteral(op.getLoc(), funcAttr);
-    Value lineConst = rewriter.create<LLVM::ConstantOp>(
-        op.getLoc(), rewriter.getI32Type(),
-        rewriter.getI32IntegerAttr(static_cast<int32_t>(line)));
-    Value colConst = rewriter.create<LLVM::ConstantOp>(
-        op.getLoc(), rewriter.getI32Type(),
-        rewriter.getI32IntegerAttr(static_cast<int32_t>(col)));
-    runtime.call(op.getLoc(), RuntimeSymbols::kTracebackPush, Type(),
-                 ValueRange{filePtr, funcPtr, lineConst, colConst});
-    runtime.call(op.getLoc(), RuntimeSymbols::kEHThrow, Type(),
-                 ValueRange{adaptor.getException()});
-    rewriter.create<LLVM::UnreachableOp>(op.getLoc());
-    rewriter.eraseOp(op);
-    return success();
-  }
-};
-
-struct RaiseCurrentLowering : public OpConversionPattern<RaiseCurrentOp> {
-  RaiseCurrentLowering(PyLLVMTypeConverter &converter, MLIRContext *ctx)
-      : OpConversionPattern<RaiseCurrentOp>(converter, ctx) {}
-
-  LogicalResult
-  matchAndRewrite(RaiseCurrentOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    ModuleOp module = op->getParentOfType<ModuleOp>();
-    if (!module)
-      return failure();
-    auto *typeConverter =
-        static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
-    RuntimeAPI runtime(module, rewriter, *typeConverter);
-    Type pyObject = runtime.getPyObjectPtrType();
-    auto current = runtime.call(op.getLoc(), RuntimeSymbols::kExceptionGetCurrent,
-                                pyObject, ValueRange{});
-    runtime.call(op.getLoc(), RuntimeSymbols::kEHThrow, Type(),
-                 current.getResults());
-    rewriter.create<LLVM::UnreachableOp>(op.getLoc());
-    rewriter.eraseOp(op);
-    return success();
-  }
-};
-
 } // namespace
 
-void populatePyValueLoweringPatterns(PyLLVMTypeConverter &typeConverter,
-                                     RewritePatternSet &patterns) {
+void populatePyNumberValueLoweringPatterns(PyLLVMTypeConverter &typeConverter,
+                                           RewritePatternSet &patterns) {
   auto *ctx = patterns.getContext();
   patterns
       .add<StrConstantLowering, NoneLowering, IntConstantLowering,
            FloatConstantLowering, NumAddLowering, NumSubLowering, NumLtLowering,
            NumLeLowering, NumGtLowering, NumGeLowering, NumEqLowering,
-           NumNeLowering, CastToPrimLowering, CastFromPrimLowering,
-           ClassNewLowering, AttrGetLowering, AttrSetLowering, ClassOpLowering,
-           ExceptionNullLowering, TracebackNullLowering,
-           LocationCurrentLowering, ExceptionNewLowering, TryLowering,
-           RaiseLowering, RaiseCurrentLowering>(
+           NumNeLowering, CastToPrimLowering, CastFromPrimLowering>(
           typeConverter, ctx);
 }
 

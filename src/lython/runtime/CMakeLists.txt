@@ -1,11 +1,8 @@
 add_library(LythonRuntime STATIC
-    lyrt.cpp
     bltinmodule.cpp
     traceback.cpp
     objects/object.cpp
     objects/unicode.cpp
-    objects/tuple.cpp
-    objects/dict.cpp
     objects/function.cpp
     objects/long.cpp
     objects/float.cpp

@@ -17,6 +17,8 @@ const char *LyUnicode_AsUTF8(LyObject *object);
 extern "C" {
 
 LyUnicodeObject *LyUnicode_FromUTF8(const char *data, std::size_t len);
+LyUnicodeObject *LyUnicode_InternStaticUTF8(const char *data, std::size_t len);
+LyUnicodeObject *LyUnicode_Concat(LyObject *lhs, LyObject *rhs);
 }
 
 void LyUnicode_Dealloc(LyObject *object);

@@ -1,9 +1,7 @@
 #include "objects/exception.h"
 
-#include "objects/tuple.h"
-
-#include <cxxabi.h>
 #include <csetjmp>
+#include <cxxabi.h>
 #include <new>
 
 namespace {
@@ -42,7 +40,7 @@ void LyException_Dealloc(LyObject *object) {
 extern "C" {
 
 LyExceptionObject *LyException_New(LyObject *type, LyUnicodeObject *message,
-                                   LyTupleObject *args, LyObject *cause,
+                                   LyObject *args, LyObject *cause,
                                    LyObject *context, LyObject *traceback,
                                    LyObject *location, LyObject *extras) {
   (void)type;
@@ -103,9 +101,7 @@ LyObject *LyEH_Capture(void *exc) {
   return current;
 }
 
-void LyEH_SetJump(void *env) {
-  g_jump_env = reinterpret_cast<jmp_buf *>(env);
-}
+void LyEH_SetJump(void *env) { g_jump_env = reinterpret_cast<jmp_buf *>(env); }
 
 void LyEH_ClearJump() { g_jump_env = nullptr; }
 }

@@ -24,8 +24,9 @@ namespace py {
 
 void PyDialect::initialize() {
   addTypes<IntType, FloatType, BoolType, StrType, ObjectType, NoneType,
-           TupleType, DictType, ClassType, ExceptionType, TracebackType,
-           LocationType, FuncSignatureType, FuncType, PrimFuncType>();
+           TupleType, DictType, ListType, ClassType, ExceptionType,
+           TracebackType, LocationType, FuncSignatureType, FuncType,
+           PrimFuncType>();
 
   addOperations<
 #define GET_OP_LIST
@@ -90,6 +91,14 @@ Type PyDialect::parseType(DialectAsmParser &parser) const {
         parser.parseType(valueType) || parser.parseGreater())
       return Type();
     return DictType::get(ctx, keyType, valueType);
+  }
+  if (keyword == "list") {
+    if (parser.parseLess())
+      return Type();
+    Type elementType;
+    if (parser.parseType(elementType) || parser.parseGreater())
+      return Type();
+    return ListType::get(ctx, elementType);
   }
   if (keyword == "class") {
     if (parser.parseLess())
@@ -216,6 +225,9 @@ void PyDialect::printType(Type type, DialectAsmPrinter &printer) const {
       .Case<DictType>([&](DictType dictTy) {
         printer << "dict<" << dictTy.getKeyType() << ", "
                 << dictTy.getValueType() << ">";
+      })
+      .Case<ListType>([&](ListType listTy) {
+        printer << "list<" << listTy.getElementType() << ">";
       })
       .Case<ClassType>([&](ClassType classTy) {
         printer << "class<\"" << classTy.getClassName() << "\">";

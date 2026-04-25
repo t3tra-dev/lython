@@ -24,6 +24,12 @@ LyFloatObject *LyFloat_FromDouble(double value) {
   return obj;
 }
 
+double LyFloat_AsDouble(LyObject *object) {
+  if (!object || object->ob_type != &LyFloat_Type())
+    return 0.0;
+  return reinterpret_cast<LyFloatObject *>(object)->value;
+}
+
 LyFloatObject *LyFloat_Add(const LyFloatObject *lhs, const LyFloatObject *rhs) {
   return LyFloat_FromDouble(lhs->value + rhs->value);
 }

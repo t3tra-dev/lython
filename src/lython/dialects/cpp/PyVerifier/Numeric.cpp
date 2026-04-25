@@ -14,8 +14,8 @@ LogicalResult NumAddOp::verify() {
   if (lhsType != resultType)
     return emitOpError("result type must match operand types");
 
-  if (!isPyIntType(lhsType) && !isPyFloatType(lhsType))
-    return emitOpError("operands must be !py.int or !py.float");
+  if (!isPyIntType(lhsType) && !isPyFloatType(lhsType) && !isPyStrType(lhsType))
+    return emitOpError("operands must be !py.int, !py.float, or !py.str");
 
   return success();
 }

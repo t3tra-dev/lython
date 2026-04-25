@@ -86,6 +86,7 @@ class ModVisitor(BaseVisitor):
 
         self._set_insertion_block(main_block)
         self._enter_py_function("main")
+        self.push_return_type(ir.IntegerType.get_signless(32, context=self.ctx))
 
         for stmt in node.body:
             self.visit(stmt)
@@ -93,10 +94,11 @@ class ModVisitor(BaseVisitor):
         active_block = self.current_block or main_block
         if not self._block_terminated(active_block):
             with ir.InsertionPoint(active_block), ir.Location.unknown(self.ctx):
-                i32 = ir.IntegerType.get_signless(32)
+                i32 = ir.IntegerType.get_signless(32, context=self.ctx)
                 zero = arith_ops.ConstantOp(i32, ir.IntegerAttr.get(i32, 0)).result
                 py_ops.ReturnOp([zero])
-        maythrow = self._exit_py_function()
+        maythrow, _, _ = self._exit_py_function()
+        self.pop_return_type()
         self._set_func_effect(main, maythrow)
         self.pop_scope()
         return None

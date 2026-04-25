@@ -13,8 +13,8 @@ LogicalResult TryOp::verify() {
   if (getTryRegion().empty())
     return emitOpError("try region must not be empty");
 
-  auto requireYieldTypesMatch = [&](Region &region, StringRef kind)
-      -> LogicalResult {
+  auto requireYieldTypesMatch = [&](Region &region,
+                                    StringRef kind) -> LogicalResult {
     if (region.empty())
       return success();
     auto *term = region.front().getTerminator();

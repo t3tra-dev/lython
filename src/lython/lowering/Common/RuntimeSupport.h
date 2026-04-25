@@ -14,19 +14,17 @@ namespace py {
 
 struct RuntimeSymbols {
   static constexpr llvm::StringLiteral kStrFromUtf8{"LyUnicode_FromUTF8"};
+  static constexpr llvm::StringLiteral kStrInternStaticUtf8{
+      "LyUnicode_InternStaticUTF8"};
+  static constexpr llvm::StringLiteral kUnicodeConcat{"LyUnicode_Concat"};
   static constexpr llvm::StringLiteral kLongFromI64{"LyLong_FromI64"};
+  static constexpr llvm::StringLiteral kLongAsI64{"LyLong_AsI64"};
   static constexpr llvm::StringLiteral kLongFromString{"LyLong_FromString"};
   static constexpr llvm::StringLiteral kFloatFromDouble{"LyFloat_FromDouble"};
-  static constexpr llvm::StringLiteral kTupleNew{"LyTuple_New"};
-  static constexpr llvm::StringLiteral kTupleSetItem{"LyTuple_SetItem"};
-  static constexpr llvm::StringLiteral kGetEmptyTuple{"Ly_GetEmptyTuple"};
+  static constexpr llvm::StringLiteral kFloatAsDouble{"LyFloat_AsDouble"};
   static constexpr llvm::StringLiteral kGetNone{"Ly_GetNone"};
   static constexpr llvm::StringLiteral kGetBuiltinPrint{"Ly_GetBuiltinPrint"};
-  static constexpr llvm::StringLiteral kCallVectorcall{"Ly_CallVectorcall"};
-  static constexpr llvm::StringLiteral kCallVectorcallEH{"Ly_CallVectorcall_EH"};
-  static constexpr llvm::StringLiteral kCallVectorcallInvoke{
-      "Ly_CallVectorcall_Invoke"};
-  static constexpr llvm::StringLiteral kCall{"Ly_Call"};
+  static constexpr llvm::StringLiteral kBuiltinPrintImpl{"builtin_print_impl"};
   static constexpr llvm::StringLiteral kExceptionNew{"LyException_New"};
   static constexpr llvm::StringLiteral kExceptionSetCurrent{
       "LyException_SetCurrent"};
@@ -39,8 +37,6 @@ struct RuntimeSymbols {
       "LyEH_ReportUnhandled"};
   static constexpr llvm::StringLiteral kTracebackPush{"LyTraceback_Push"};
   static constexpr llvm::StringLiteral kTracebackPop{"LyTraceback_Pop"};
-  static constexpr llvm::StringLiteral kDictNew{"LyDict_New"};
-  static constexpr llvm::StringLiteral kDictInsert{"LyDict_Insert"};
   // Generic numeric operations (with type dispatch)
   static constexpr llvm::StringLiteral kNumberAdd{"LyNumber_Add"};
   static constexpr llvm::StringLiteral kNumberSub{"LyNumber_Sub"};
@@ -58,8 +54,11 @@ struct RuntimeSymbols {
   static constexpr llvm::StringLiteral kBoolAsBool{"LyBool_AsBool"};
   static constexpr llvm::StringLiteral kIncRef{"Ly_IncRef"};
   static constexpr llvm::StringLiteral kDecRef{"Ly_DecRef"};
-  // Object attribute operations
-  static constexpr llvm::StringLiteral kDictGetItem{"LyDict_GetItem"};
+  static constexpr llvm::StringLiteral kObjectRepr{"LyObject_Repr"};
+  static constexpr llvm::StringLiteral kObjectEqBool{"LyObject_EqBool"};
+  static constexpr llvm::StringLiteral kClassReprNamed{"LyClass_ReprNamed"};
+  static constexpr llvm::StringLiteral kMemAlloc{"LyMem_Alloc"};
+  static constexpr llvm::StringLiteral kMemFree{"LyMem_Free"};
   static constexpr llvm::StringLiteral kStrFromUtf8Len{"LyUnicode_FromUTF8Len"};
 };
 
@@ -95,10 +94,16 @@ private:
 
 void populatePyValueLoweringPatterns(PyLLVMTypeConverter &typeConverter,
                                      mlir::RewritePatternSet &patterns);
-void populatePyTupleLoweringPatterns(PyLLVMTypeConverter &typeConverter,
-                                     mlir::RewritePatternSet &patterns);
-void populatePyDictLoweringPatterns(PyLLVMTypeConverter &typeConverter,
-                                    mlir::RewritePatternSet &patterns);
+void populatePyListValueLoweringPatterns(PyLLVMTypeConverter &typeConverter,
+                                         mlir::RewritePatternSet &patterns);
+void populatePyNumberValueLoweringPatterns(PyLLVMTypeConverter &typeConverter,
+                                           mlir::RewritePatternSet &patterns);
+void populatePyClassValueLoweringPatterns(PyLLVMTypeConverter &typeConverter,
+                                          mlir::RewritePatternSet &patterns);
+void populatePyTupleValueLoweringPatterns(PyLLVMTypeConverter &typeConverter,
+                                          mlir::RewritePatternSet &patterns);
+void populatePyDictValueLoweringPatterns(PyLLVMTypeConverter &typeConverter,
+                                         mlir::RewritePatternSet &patterns);
 void populatePyCallLoweringPatterns(PyLLVMTypeConverter &typeConverter,
                                     mlir::RewritePatternSet &patterns);
 void populatePyRefCountLoweringPatterns(PyLLVMTypeConverter &typeConverter,
@@ -107,6 +112,11 @@ void populatePyFuncLoweringPatterns(PyLLVMTypeConverter &typeConverter,
                                     mlir::RewritePatternSet &patterns);
 
 /// Optimization functions
+
+/// Runs early publication preparation on Py dialect ops before refcount
+/// insertion. This inserts explicit py.publish boundaries and computes
+/// publication summary attributes on py.func symbols.
+void runEarlyPublicationPreparation(mlir::ModuleOp module);
 
 /// Runs pre-lowering optimizations on Py dialect ops.
 /// Call this after call conversion and before value conversion.
@@ -118,6 +128,11 @@ void runPostLoweringOptimizations(mlir::ModuleOp module);
 
 /// Creates a pass that applies all Py-specific optimizations.
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createPyOptimizationPass();
+
+/// Creates a pass that prepares explicit publication boundaries before
+/// refcount insertion and runtime lowering.
+std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
+createPublicationPreparationPass();
 
 /// Creates a pass that automatically inserts py.incref/py.decref operations.
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>

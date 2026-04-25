@@ -1,4 +1,4 @@
-#include "RuntimeSupport.h"
+#include "Common/RuntimeSupport.h"
 
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "llvm/ADT/SmallVector.h"
@@ -6,18 +6,27 @@
 
 namespace py {
 
+static bool isPyRuntimeBridgeType(mlir::Type type) {
+  return isPyType(type) || mlir::isa<FuncType>(type) ||
+         mlir::isa<TupleType>(type) || mlir::isa<ListType>(type) ||
+         mlir::isa<ClassType>(type) || mlir::isa<DictType>(type) ||
+         mlir::isa<ObjectType>(type);
+}
+
 PyLLVMTypeConverter::PyLLVMTypeConverter(mlir::MLIRContext *ctx)
     : mlir::LLVMTypeConverter(ctx) {
   pyObjectPtrType = mlir::LLVM::LLVMPointerType::get(ctx);
 
-  addConversion([&](mlir::Type type) -> std::optional<mlir::Type> {
-    if (mlir::isa<mlir::IntegerType, mlir::FloatType,
-                  mlir::RankedTensorType>(type))
+  addConversion([](mlir::Type type) -> std::optional<mlir::Type> {
+    if (mlir::isa<mlir::IntegerType, mlir::FloatType, mlir::RankedTensorType>(
+            type))
       return type;
     return std::nullopt;
   });
 
-  addConversion([&](mlir::Type type) -> std::optional<mlir::Type> {
+  addConversion([this](mlir::Type type) -> std::optional<mlir::Type> {
+    if (mlir::isa<ListType, DictType, TupleType>(type))
+      return std::nullopt;
     if (isPyType(type) || mlir::isa<FuncType>(type) ||
         mlir::isa<TupleType>(type) || mlir::isa<ClassType>(type) ||
         mlir::isa<DictType>(type) || mlir::isa<ObjectType>(type))
@@ -26,6 +35,48 @@ PyLLVMTypeConverter::PyLLVMTypeConverter(mlir::MLIRContext *ctx)
       return pyObjectPtrType;
     return std::nullopt;
   });
+
+  addConversion([ctx](ListType listType) -> std::optional<mlir::Type> {
+    mlir::Type elementType = listType.getElementType();
+    if (mlir::isa<IntType, BoolType, FloatType, ClassType>(elementType))
+      return mlir::MemRefType::get({mlir::ShapedType::kDynamic},
+                                   mlir::IntegerType::get(ctx, 64));
+    return std::nullopt;
+  });
+
+  addConversion([ctx](TupleType tupleType) -> std::optional<mlir::Type> {
+    (void)tupleType;
+    return mlir::MemRefType::get({mlir::ShapedType::kDynamic},
+                                 mlir::IntegerType::get(ctx, 64));
+  });
+
+  addConversion([ctx](DictType dictType) -> std::optional<mlir::Type> {
+    auto isSlotType = [](mlir::Type type) {
+      return mlir::isa<IntType, BoolType, FloatType, StrType, ObjectType,
+                       ClassType>(type);
+    };
+    if (isSlotType(dictType.getKeyType()) &&
+        isSlotType(dictType.getValueType()))
+      return mlir::MemRefType::get({mlir::ShapedType::kDynamic},
+                                   mlir::IntegerType::get(ctx, 64));
+    return std::nullopt;
+  });
+
+  auto materializeBridge = [](mlir::OpBuilder &builder, mlir::Type resultType,
+                              mlir::ValueRange inputs,
+                              mlir::Location loc) -> mlir::Value {
+    if (inputs.size() != 1)
+      return {};
+    mlir::Type inputType = inputs.front().getType();
+    if (!isPyRuntimeBridgeType(resultType) && !isPyRuntimeBridgeType(inputType))
+      return {};
+    return builder
+        .create<mlir::UnrealizedConversionCastOp>(loc, resultType, inputs)
+        .getResult(0);
+  };
+
+  addSourceMaterialization(materializeBridge);
+  addTargetMaterialization(materializeBridge);
 }
 
 RuntimeAPI::RuntimeAPI(mlir::ModuleOp module,

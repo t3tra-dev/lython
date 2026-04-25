@@ -1,4 +1,4 @@
-#include "RuntimeSupport.h"
+#include "Common/RuntimeSupport.h"
 
 #include "mlir/Analysis/Liveness.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
@@ -34,7 +34,7 @@ static bool isImmortal(Operation *op) {
   // TODO: Handle dynamically created closures differently
   if (isa<FuncObjectOp>(op))
     return true;
-  // Empty tuple is an immortal singleton (Ly_GetEmptyTuple)
+  // Empty tuple is compiler-owned memref metadata.
   if (isa<TupleEmptyOp>(op))
     return true;
   return false;
@@ -53,7 +53,8 @@ static bool createsNewRef(Operation *op) {
 
   if (isa<TupleCreateOp, TupleEmptyOp, DictEmptyOp, DictInsertOp, StrConstantOp,
           IntConstantOp, FloatConstantOp, NumAddOp, NumSubOp, NumLeOp,
-          MakeFunctionOp, CastFromPrimOp>(op))
+          MakeFunctionOp, CastFromPrimOp, ClassNewOp, ClassPromoteOp, PublishOp,
+          ListNewOp, ListGetOp, AttrGetOp>(op))
     return true;
 
   if (isa<CallOp, CallVectorOp, NativeCallOp>(op))
@@ -73,6 +74,32 @@ static bool doesConsumeOperand(Operation *op, Value operand) {
     return true;
 
   return false;
+}
+
+static LogicalResult insertDecRefOnSuccessorEdge(OpBuilder &builder,
+                                                 Value value,
+                                                 Operation *terminator,
+                                                 unsigned successorIndex) {
+  Block *source = terminator->getBlock();
+  Block *successor = terminator->getSuccessor(successorIndex);
+
+  if (successor->getUniquePredecessor() == source) {
+    builder.setInsertionPointToStart(successor);
+    builder.create<DecRefOp>(value.getLoc(), value);
+    return success();
+  }
+
+  Block *refCountBlock = new Block();
+  for (BlockArgument arg : successor->getArguments())
+    refCountBlock->addArgument(arg.getType(), arg.getLoc());
+  refCountBlock->insertBefore(successor);
+
+  builder.setInsertionPointToStart(refCountBlock);
+  builder.create<DecRefOp>(value.getLoc(), value);
+  builder.create<cf::BranchOp>(value.getLoc(), successor,
+                               refCountBlock->getArguments());
+  terminator->setSuccessor(refCountBlock, successorIndex);
+  return success();
 }
 
 class AliasAnalysis {
@@ -289,8 +316,16 @@ private:
         // Last use + Consume = Move Semantics (no action needed)
       } else {
         // Last use + Borrow = Need to drop after use
-        builder.setInsertionPointAfter(lastUser);
-        builder.create<DecRefOp>(root.getLoc(), usedAlias);
+        if (lastUser->getNumSuccessors() == 0) {
+          builder.setInsertionPointAfter(lastUser);
+          builder.create<DecRefOp>(root.getLoc(), usedAlias);
+        } else {
+          for (unsigned i = 0; i < lastUser->getNumSuccessors(); ++i) {
+            if (failed(insertDecRefOnSuccessorEdge(builder, usedAlias, lastUser,
+                                                   i)))
+              return failure();
+          }
+        }
       }
     }
 
@@ -388,21 +423,11 @@ private:
       Operation *terminator = block->getTerminator();
 
       for (Block *successor : noLiveSuccessors) {
-        if (successor->getUniquePredecessor() == block) {
-          builder.setInsertionPointToStart(successor);
-          builder.create<DecRefOp>(root.getLoc(), root);
-        } else {
-          Block *refCountBlock = new Block();
-          refCountBlock->insertBefore(successor);
-
-          builder.setInsertionPointToStart(refCountBlock);
-          builder.create<DecRefOp>(root.getLoc(), root);
-          builder.create<cf::BranchOp>(root.getLoc(), successor);
-
-          for (unsigned i = 0; i < terminator->getNumSuccessors(); ++i) {
-            if (terminator->getSuccessor(i) == successor)
-              terminator->setSuccessor(refCountBlock, i);
-          }
+        for (unsigned i = 0; i < terminator->getNumSuccessors(); ++i) {
+          if (terminator->getSuccessor(i) != successor)
+            continue;
+          if (failed(insertDecRefOnSuccessorEdge(builder, root, terminator, i)))
+            return failure();
         }
       }
     }

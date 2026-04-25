@@ -8,7 +8,7 @@
 //   - py.* types belong to the Object World (with GC)
 //   - Mixing worlds violates the modal separation principle
 
-#include "RuntimeSupport.h"
+#include "Common/RuntimeSupport.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Pass/Pass.h"

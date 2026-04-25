@@ -13,8 +13,8 @@ struct LyTracebackFrame {
 };
 
 extern "C" {
-void LyTraceback_Push(const char *filename, const char *funcname, std::int32_t line,
-                      std::int32_t col);
+void LyTraceback_Push(const char *filename, const char *funcname,
+                      std::int32_t line, std::int32_t col);
 void LyTraceback_Pop();
 void LyTraceback_Clear();
 void LyTraceback_Print(LyObject *exception);

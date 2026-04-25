@@ -1,13 +1,17 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <mutex>
 
 using Ly_ssize_t = std::ptrdiff_t;
+using LyMutex = std::mutex;
+inline constexpr Ly_ssize_t kLyImmortalRefcount =
+    std::numeric_limits<Ly_ssize_t>::max();
 
 struct LyObject;
 struct LyUnicodeObject;
-struct LyTupleObject;
-struct LyDictObject;
 struct LyLongObject;
 struct LyFloatObject;
 struct LyBoolObject;
@@ -38,12 +42,17 @@ struct LyTypeObject {
   LyReprFunc tp_repr;
 };
 
+inline bool LyObject_HasImmortalRefcount(const LyObject *object) {
+  if (!object)
+    return false;
+  Ly_ssize_t refcount = __atomic_load_n(&object->ob_refcnt, __ATOMIC_ACQUIRE);
+  return refcount == kLyImmortalRefcount;
+}
+
 LyTypeObject &LyUnicode_Type();
 LyTypeObject &LyBool_Type();
-LyTypeObject &LyTuple_Type();
 LyTypeObject &LyFunction_Type();
 LyTypeObject &LyNone_Type();
-LyTypeObject &LyDict_Type();
 LyTypeObject &LyLong_Type();
 LyTypeObject &LyFloat_Type();
 LyTypeObject &LyException_Type();
@@ -54,4 +63,8 @@ LyObject *Ly_GetNone();
 void Ly_IncRef(LyObject *object);
 void Ly_DecRef(LyObject *object);
 LyUnicodeObject *LyObject_Repr(LyObject *object);
+bool LyObject_EqBool(LyObject *lhs, LyObject *rhs);
+LyUnicodeObject *LyClass_ReprNamed(const char *name, const void *object);
+void *LyMem_Alloc(std::size_t size);
+void LyMem_Free(void *ptr);
 }

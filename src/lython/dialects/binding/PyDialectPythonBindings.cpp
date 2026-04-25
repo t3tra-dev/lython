@@ -47,5 +47,6 @@ void ensurePyDialectLoaded(const py11::object &contextObj) {
 PYBIND11_MODULE(_site_initialize_0, m) {
   m.doc() = "Initialization hooks for the Lython py dialect.";
   m.def("register_dialects", &registerPyDialect, py11::arg("registry"));
-  m.def("context_init_hook", &ensurePyDialectLoaded, py11::arg("context") = py11::none());
+  m.def("context_init_hook", &ensurePyDialectLoaded,
+        py11::arg("context") = py11::none());
 }

@@ -12,7 +12,7 @@ LyTypeObject &LyException_Type();
 
 extern "C" {
 LyExceptionObject *LyException_New(LyObject *type, LyUnicodeObject *message,
-                                   LyTupleObject *args, LyObject *cause,
+                                   LyObject *args, LyObject *cause,
                                    LyObject *context, LyObject *traceback,
                                    LyObject *location, LyObject *extras);
 void LyException_SetCurrent(LyObject *exception);
