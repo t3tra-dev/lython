@@ -322,6 +322,7 @@ buildRuntimeSymbolMap(llvm::orc::MangleAndInterner interner) {
   add("Ly_IncRef", &Ly_IncRef);
   add("Ly_DecRef", &Ly_DecRef);
   add("LyUnicode_FromUTF8", &LyUnicode_FromUTF8);
+  add("LyUnicode_InternStaticUTF8", &LyUnicode_InternStaticUTF8);
   add("LyUnicode_Concat", &LyUnicode_Concat);
   add("Ly_GetNone", &Ly_GetNone);
   add("Ly_GetBuiltinPrint", &Ly_GetBuiltinPrint);

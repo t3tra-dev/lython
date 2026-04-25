@@ -59,7 +59,6 @@ struct RuntimeSymbols {
   static constexpr llvm::StringLiteral kClassReprNamed{"LyClass_ReprNamed"};
   static constexpr llvm::StringLiteral kMemAlloc{"LyMem_Alloc"};
   static constexpr llvm::StringLiteral kMemFree{"LyMem_Free"};
-  static constexpr llvm::StringLiteral kStrFromUtf8Len{"LyUnicode_FromUTF8Len"};
 };
 
 class PyLLVMTypeConverter : public mlir::LLVMTypeConverter {
