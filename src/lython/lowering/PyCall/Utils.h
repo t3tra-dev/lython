@@ -39,6 +39,7 @@ void eraseNoneResultUsers(CallVectorOp op,
 void materializeLogicalResults(mlir::Location loc, mlir::TypeRange logicalTypes,
                                mlir::ValueRange loweredResults,
                                llvm::SmallVectorImpl<mlir::Value> &results,
+                               const PyLLVMTypeConverter &typeConverter,
                                mlir::ConversionPatternRewriter &rewriter);
 
 void materializeInvokeNormalResult(InvokeOp op, mlir::Value loweredResult,

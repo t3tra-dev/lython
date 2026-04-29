@@ -75,22 +75,76 @@ struct CallVectorLowering : public OpConversionPattern<CallVectorOp> {
     }
 
     SmallVector<Value> logicalResults;
+    auto *converter =
+        static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
     materializeLogicalResults(op.getLoc(), op.getResultTypes(),
-                              call.getResults(), logicalResults, rewriter);
+                              call.getResults(), logicalResults, *converter,
+                              rewriter);
     rewriter.replaceOp(op, logicalResults);
     return success();
   }
 
-  LogicalResult lowerViaRuntime(CallVectorOp op, OpAdaptor adaptor,
+  LogicalResult lowerViaRuntime(CallVectorOp op,
                                 ConversionPatternRewriter &rewriter) const {
-    (void)adaptor;
     return rewriter.notifyMatchFailure(
         op, "dynamic vectorcall runtime fallback is disabled");
   }
 
   LogicalResult
-  matchAndRewrite(CallVectorOp op, OpAdaptor adaptor,
+  appendFlattenedCallOperands(Location loc, ValueRange elements,
+                              FunctionType funcType, unsigned directInputCount,
+                              SmallVectorImpl<Value> &operands,
+                              ConversionPatternRewriter &rewriter) const {
+    auto *converter =
+        static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
+    unsigned expectedIndex = 0;
+    for (Value element : elements) {
+      SmallVector<Value> remapped;
+      SmallVector<Type> convertedElementTypes;
+      if (failed(converter->convertType(element.getType(),
+                                        convertedElementTypes)) ||
+          convertedElementTypes.empty())
+        return failure();
+
+      bool needsMaterializedExpansion = false;
+      if (succeeded(
+              rewriter.getRemappedValues(ValueRange{element}, remapped))) {
+        needsMaterializedExpansion =
+            remapped.size() != convertedElementTypes.size();
+      } else {
+        needsMaterializedExpansion = true;
+      }
+      if (!needsMaterializedExpansion) {
+        for (auto [value, type] : llvm::zip(remapped, convertedElementTypes)) {
+          if (value.getType() == element.getType() && value.getType() != type) {
+            needsMaterializedExpansion = true;
+            break;
+          }
+        }
+      }
+      if (needsMaterializedExpansion) {
+        remapped = converter->materializeTargetConversion(
+            rewriter, loc, TypeRange(convertedElementTypes),
+            ValueRange{element}, element.getType());
+        if (remapped.empty())
+          return failure();
+      }
+      if (expectedIndex + remapped.size() > directInputCount)
+        return failure();
+      for (Value operand : remapped) {
+        Type expected = funcType.getInput(expectedIndex++);
+        if (operand.getType() != expected)
+          operand = rewriter.create<CastIdentityOp>(loc, expected, operand);
+        operands.push_back(operand);
+      }
+    }
+    return success(expectedIndex == directInputCount);
+  }
+
+  LogicalResult
+  matchAndRewrite(CallVectorOp op, OneToNOpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    (void)adaptor;
     ModuleOp module = op->getParentOfType<ModuleOp>();
     if (!module)
       return failure();
@@ -106,7 +160,7 @@ struct CallVectorLowering : public OpConversionPattern<CallVectorOp> {
     Operation *producer = callable.getDefiningOp();
     auto constOp = dyn_cast_or_null<func::ConstantOp>(producer);
     if (!constOp)
-      return lowerViaRuntime(op, adaptor, rewriter);
+      return lowerViaRuntime(op, rewriter);
 
     SymbolRefAttr symbolRef = constOp.getValueAttr();
     StringRef symbolName = symbolRef.getLeafReference().empty()
@@ -114,7 +168,7 @@ struct CallVectorLowering : public OpConversionPattern<CallVectorOp> {
                                : symbolRef.getLeafReference().getValue();
     auto func = module.lookupSymbol<func::FuncOp>(symbolName);
     if (!func)
-      return lowerViaRuntime(op, adaptor, rewriter);
+      return lowerViaRuntime(op, rewriter);
 
     if (canUseVoidHelper(op, func)) {
       auto posargsOp = op.getPosargs().getDefiningOp();
@@ -125,16 +179,10 @@ struct CallVectorLowering : public OpConversionPattern<CallVectorOp> {
         if (!helperFunc)
           return rewriter.notifyMatchFailure(op, "missing void helper");
         auto helperType = helperFunc.getFunctionType();
-        if (tupleCreate.getElements().size() != helperType.getNumInputs())
-          return lowerViaRuntime(op, adaptor, rewriter);
-        for (auto [idx, element] : llvm::enumerate(tupleCreate.getElements())) {
-          Type expected = helperType.getInput(idx);
-          Value operand = element;
-          if (operand.getType() != expected)
-            operand =
-                rewriter.create<CastIdentityOp>(op.getLoc(), expected, operand);
-          helperOperands.push_back(operand);
-        }
+        if (failed(appendFlattenedCallOperands(
+                op.getLoc(), tupleCreate.getElements(), helperType,
+                helperType.getNumInputs(), helperOperands, rewriter)))
+          return lowerViaRuntime(op, rewriter);
         rewriter.create<func::CallOp>(op.getLoc(), helperFunc, helperOperands);
       } else if (isa<TupleEmptyOp>(posargsOp)) {
         auto helperFunc =
@@ -144,10 +192,10 @@ struct CallVectorLowering : public OpConversionPattern<CallVectorOp> {
           return rewriter.notifyMatchFailure(op, "missing void helper");
         auto helperType = helperFunc.getFunctionType();
         if (helperType.getNumInputs() != 0)
-          return lowerViaRuntime(op, adaptor, rewriter);
+          return lowerViaRuntime(op, rewriter);
         rewriter.create<func::CallOp>(op.getLoc(), helperFunc, helperOperands);
       } else {
-        return lowerViaRuntime(op, adaptor, rewriter);
+        return lowerViaRuntime(op, rewriter);
       }
       eraseNoneResultUsers(op, rewriter);
       rewriter.eraseOp(op);
@@ -158,7 +206,7 @@ struct CallVectorLowering : public OpConversionPattern<CallVectorOp> {
 
     if (!isa<TupleEmptyOp>(op.getKwnames().getDefiningOp()) ||
         !isa<TupleEmptyOp>(op.getKwvalues().getDefiningOp()))
-      return lowerViaRuntime(op, adaptor, rewriter);
+      return lowerViaRuntime(op, rewriter);
 
     auto posargsOp = op.getPosargs().getDefiningOp();
     if (auto tupleCreate = dyn_cast_or_null<TupleCreateOp>(posargsOp)) {
@@ -175,21 +223,15 @@ struct CallVectorLowering : public OpConversionPattern<CallVectorOp> {
     unsigned directInputCount =
         funcType.getNumInputs() - (hiddenClassReturnOutArg ? 1u : 0u);
     if (auto tupleCreate = dyn_cast_or_null<TupleCreateOp>(posargsOp)) {
-      if (tupleCreate.getElements().size() != directInputCount)
-        return lowerViaRuntime(op, adaptor, rewriter);
-      for (auto [idx, element] : llvm::enumerate(tupleCreate.getElements())) {
-        Type expected = funcType.getInput(idx);
-        Value operand = element;
-        if (operand.getType() != expected)
-          operand =
-              rewriter.create<CastIdentityOp>(op.getLoc(), expected, operand);
-        callOperands.push_back(operand);
-      }
+      if (failed(appendFlattenedCallOperands(
+              op.getLoc(), tupleCreate.getElements(), funcType,
+              directInputCount, callOperands, rewriter)))
+        return lowerViaRuntime(op, rewriter);
     } else if (isa<TupleEmptyOp>(posargsOp)) {
       if (directInputCount != 0)
-        return lowerViaRuntime(op, adaptor, rewriter);
+        return lowerViaRuntime(op, rewriter);
     } else {
-      return lowerViaRuntime(op, adaptor, rewriter);
+      return lowerViaRuntime(op, rewriter);
     }
 
     Value classReturnSlot;
@@ -216,7 +258,8 @@ struct CallVectorLowering : public OpConversionPattern<CallVectorOp> {
     } else {
       SmallVector<Value> logicalResults;
       materializeLogicalResults(op.getLoc(), op.getResultTypes(),
-                                call.getResults(), logicalResults, rewriter);
+                                call.getResults(), logicalResults, *converter,
+                                rewriter);
       rewriter.replaceOp(op, logicalResults);
     }
 
@@ -231,7 +274,7 @@ struct CallOpLowering : public OpConversionPattern<CallOp> {
       : OpConversionPattern<CallOp>(converter, ctx) {}
 
   LogicalResult
-  matchAndRewrite(CallOp op, OpAdaptor adaptor,
+  matchAndRewrite(CallOp op, OneToNOpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     (void)adaptor;
     return rewriter.notifyMatchFailure(

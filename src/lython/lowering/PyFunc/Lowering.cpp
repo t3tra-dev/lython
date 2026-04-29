@@ -24,6 +24,9 @@ using namespace mlir;
 
 namespace py {
 ClassOp lookupClassSymbol(Operation *from, ClassType classType);
+FailureOr<LLVM::LLVMStructType>
+getStaticClassObjectType(Operation *from, ClassType classType,
+                         const PyLLVMTypeConverter &typeConverter);
 
 namespace {
 
@@ -37,12 +40,12 @@ LogicalResult translateFunctionSignature(
 
   auto appendConverted = [&](Type ty,
                              SmallVectorImpl<Type> &storage) -> LogicalResult {
-    Type converted = typeConverter.convertType(ty);
-    if (!converted) {
+    SmallVector<Type, 4> converted;
+    if (failed(typeConverter.convertType(ty, converted)) || converted.empty()) {
       emitOnError->emitError("failed to convert type ") << ty;
       return failure();
     }
-    storage.push_back(converted);
+    storage.append(converted.begin(), converted.end());
     return success();
   };
 
@@ -74,13 +77,13 @@ static LogicalResult appendClosureInputTypes(
     return success();
 
   auto appendConverted = [&](Type ty) -> LogicalResult {
-    Type converted = typeConverter.convertType(ty);
-    if (!converted) {
+    SmallVector<Type, 4> converted;
+    if (failed(typeConverter.convertType(ty, converted)) || converted.empty()) {
       emitOnError->emitError("failed to convert closure type ") << ty;
       return failure();
     }
     pyInputs.push_back(ty);
-    convertedInputs.push_back(converted);
+    convertedInputs.append(converted.begin(), converted.end());
     return success();
   };
 
@@ -96,61 +99,6 @@ static LogicalResult appendClosureInputTypes(
   }
 
   return success();
-}
-
-static FailureOr<LLVM::LLVMStructType>
-getStaticClassObjectType(Operation *from, ClassType classType,
-                         const PyLLVMTypeConverter &typeConverter) {
-  ClassOp classOp = lookupClassSymbol(from, classType);
-  if (!classOp) {
-    from->emitError("unable to resolve class '")
-        << classType.getClassName() << "'";
-    return failure();
-  }
-
-  ArrayAttr fieldNamesAttr = classOp.getFieldNamesAttr();
-  ArrayAttr fieldTypesAttr = classOp.getFieldTypesAttr();
-  if (!fieldNamesAttr && !fieldTypesAttr) {
-    auto emptyStorage =
-        LLVM::LLVMStructType::getLiteral(from->getContext(), ArrayRef<Type>{});
-    return LLVM::LLVMStructType::getLiteral(
-        from->getContext(),
-        ArrayRef<Type>{emptyStorage, IntegerType::get(from->getContext(), 1),
-                       IntegerType::get(from->getContext(), 32),
-                       IntegerType::get(from->getContext(), 64)});
-  }
-  if (!fieldNamesAttr || !fieldTypesAttr ||
-      fieldNamesAttr.size() != fieldTypesAttr.size()) {
-    from->emitError("class '")
-        << classType.getClassName() << "' has malformed static field schema";
-    return failure();
-  }
-
-  SmallVector<Type, 8> loweredFieldTypes;
-  for (Attribute typeAttr : fieldTypesAttr) {
-    auto mlirTypeAttr = dyn_cast<TypeAttr>(typeAttr);
-    if (!mlirTypeAttr) {
-      from->emitError("class '")
-          << classType.getClassName() << "' has malformed static field schema";
-      return failure();
-    }
-    Type lowered = typeConverter.convertType(mlirTypeAttr.getValue());
-    if (!lowered) {
-      from->emitError("failed to convert field type ")
-          << mlirTypeAttr.getValue() << " in class '"
-          << classType.getClassName() << "'";
-      return failure();
-    }
-    loweredFieldTypes.push_back(lowered);
-  }
-
-  auto storageType =
-      LLVM::LLVMStructType::getLiteral(from->getContext(), loweredFieldTypes);
-  return LLVM::LLVMStructType::getLiteral(
-      from->getContext(),
-      ArrayRef<Type>{storageType, IntegerType::get(from->getContext(), 1),
-                     IntegerType::get(from->getContext(), 32),
-                     IntegerType::get(from->getContext(), 64)});
 }
 
 static bool shouldLowerViaVoidHelper(FuncOp op, FuncSignatureType sig) {
@@ -178,6 +126,10 @@ static void copyPyFuncAttrs(FuncOp from, func::FuncOp to) {
     to->setAttr("lython.captures_published", attr);
   if (auto attr = from->getAttr("lython.returns_published"))
     to->setAttr("lython.returns_published", attr);
+  if (auto attr = from->getAttr("lython.readonly_args"))
+    to->setAttr("lython.readonly_args", attr);
+  if (auto attr = from->getAttr("lython.mutable_args"))
+    to->setAttr("lython.mutable_args", attr);
   if (auto attr = from->getAttr("kwonly_names"))
     to->setAttr("kwonly_names", attr);
   if (auto attr = from->getAttr("closure_types"))
@@ -247,6 +199,10 @@ static void copySpecializedHelperAttrs(func::FuncOp from, func::FuncOp to) {
     to->setAttr("lython.captures_published", attr);
   if (auto attr = from->getAttr("lython.returns_published"))
     to->setAttr("lython.returns_published", attr);
+  if (auto attr = from->getAttr("lython.readonly_args"))
+    to->setAttr("lython.readonly_args", attr);
+  if (auto attr = from->getAttr("lython.mutable_args"))
+    to->setAttr("lython.mutable_args", attr);
   if (auto attr = from->getAttr("lython.local_self_arg0"))
     to->setAttr("lython.local_self_arg0", attr);
   if (auto attr = from->getAttr("lython.zero_initialized_self"))
@@ -702,12 +658,10 @@ struct FuncOpLowering : public OpConversionPattern<FuncOp> {
             bool preserveClassReturnOutArg) -> LogicalResult {
       auto &entry = func.getBody().front();
       TypeConverter::SignatureConversion conversion(entry.getNumArguments());
-      for (auto [idx, ty] : llvm::enumerate(llvmInputTypes)) {
-        SmallVector<Type, 1> packed{ty};
-        conversion.addInputs(idx, packed);
-      }
+      if (failed(tc->convertSignatureArgs(TypeRange(pyInputTypes), conversion)))
+        return failure();
       if (preserveClassReturnOutArg) {
-        unsigned outArgIndex = static_cast<unsigned>(llvmInputTypes.size());
+        unsigned outArgIndex = static_cast<unsigned>(pyInputTypes.size());
         if (entry.getNumArguments() <= outArgIndex)
           return failure();
         SmallVector<Type, 1> packed{entry.getArgument(outArgIndex).getType()};
@@ -793,9 +747,15 @@ struct ReturnLowering : public OpConversionPattern<ReturnOp> {
       : OpConversionPattern<ReturnOp>(converter, ctx) {}
 
   LogicalResult
-  matchAndRewrite(ReturnOp op, OpAdaptor adaptor,
+  matchAndRewrite(ReturnOp op, OneToNOpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto parentFunc = op->getParentOfType<func::FuncOp>();
+    auto flattenOperands = [&]() {
+      SmallVector<Value> flattened;
+      for (ValueRange group : adaptor.getOperands())
+        flattened.append(group.begin(), group.end());
+      return flattened;
+    };
     auto stripForwardedValue = [](Value value) -> Value {
       while (true) {
         if (auto identity = value.getDefiningOp<CastIdentityOp>()) {
@@ -814,7 +774,8 @@ struct ReturnLowering : public OpConversionPattern<ReturnOp> {
       }
     };
     if (parentFunc && parentFunc->getAttr("lython.class_return_outarg")) {
-      if (adaptor.getOperands().size() != 1)
+      SmallVector<Value> operands = flattenOperands();
+      if (operands.size() != 1)
         return rewriter.notifyMatchFailure(
             op, "class return helper expects exactly one return operand");
       auto classType = dyn_cast<ClassType>(op.getOperands().front().getType());
@@ -842,8 +803,7 @@ struct ReturnLowering : public OpConversionPattern<ReturnOp> {
           SymbolRefAttr::get(rewriter.getContext(), copyHelper.getName());
       SmallVector<Value> copyOperands;
       copyOperands.push_back(outArg);
-      copyOperands.append(adaptor.getOperands().begin(),
-                          adaptor.getOperands().end());
+      copyOperands.append(operands.begin(), operands.end());
       rewriter.create<LLVM::CallOp>(op.getLoc(), TypeRange{}, copyRef,
                                     copyOperands);
       rewriter.replaceOpWithNewOp<func::ReturnOp>(op);
@@ -851,7 +811,7 @@ struct ReturnLowering : public OpConversionPattern<ReturnOp> {
     }
     if (parentFunc && parentFunc.getFunctionType().getNumResults() == 0) {
       NoneOp noneOp = nullptr;
-      ValueRange operands = adaptor.getOperands();
+      SmallVector<Value> operands = flattenOperands();
       if (!operands.empty())
         noneOp = operands.front().getDefiningOp<NoneOp>();
       rewriter.replaceOpWithNewOp<func::ReturnOp>(op);
@@ -866,7 +826,8 @@ struct ReturnLowering : public OpConversionPattern<ReturnOp> {
       if (blockArg && blockArg.getOwner() == &parentFunc.getBody().front())
         rewriter.create<IncRefOp>(op.getLoc(), original);
     }
-    rewriter.replaceOpWithNewOp<func::ReturnOp>(op, adaptor.getOperands());
+    SmallVector<Value> operands = flattenOperands();
+    rewriter.replaceOpWithNewOp<func::ReturnOp>(op, operands);
     return success();
   }
 };
@@ -924,8 +885,9 @@ struct MakeFunctionLowering : public OpConversionPattern<MakeFunctionOp> {
       : OpConversionPattern<MakeFunctionOp>(converter, ctx) {}
 
   LogicalResult
-  matchAndRewrite(MakeFunctionOp op, OpAdaptor adaptor,
+  matchAndRewrite(MakeFunctionOp op, OneToNOpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    (void)adaptor;
     rewriter.setInsertionPoint(op);
     ModuleOp module = op->getParentOfType<ModuleOp>();
     if (!module)
@@ -942,13 +904,6 @@ struct MakeFunctionLowering : public OpConversionPattern<MakeFunctionOp> {
     auto targetFunc = module.lookupSymbol<func::FuncOp>(targetName);
     if (!targetFunc)
       return rewriter.notifyMatchFailure(op, "unknown lowered func target");
-
-    if (op.getDefaults() || op.getKwdefaults() || op.getClosure() ||
-        op.getAnnotations() || op.getModule()) {
-      return rewriter.notifyMatchFailure(
-          op, "py.make_function metadata must be statically resolved before "
-              "lowering; runtime tuple fallback is disabled");
-    }
 
     auto constOp = rewriter.create<func::ConstantOp>(
         op.getLoc(), targetFunc.getFunctionType(),

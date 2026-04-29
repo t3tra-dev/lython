@@ -11,15 +11,14 @@ struct InvokeLowering : public OpConversionPattern<InvokeOp> {
   InvokeLowering(PyLLVMTypeConverter &converter, MLIRContext *ctx)
       : OpConversionPattern<InvokeOp>(converter, ctx) {}
 
-  LogicalResult lowerViaRuntime(InvokeOp op, OpAdaptor adaptor,
+  LogicalResult lowerViaRuntime(InvokeOp op,
                                 ConversionPatternRewriter &rewriter) const {
-    (void)adaptor;
     return rewriter.notifyMatchFailure(
         op, "dynamic invoke runtime fallback is disabled");
   }
 
   LogicalResult
-  matchAndRewrite(InvokeOp op, OpAdaptor adaptor,
+  matchAndRewrite(InvokeOp op, OneToNOpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     ModuleOp module = op->getParentOfType<ModuleOp>();
     if (!module)
@@ -35,7 +34,7 @@ struct InvokeLowering : public OpConversionPattern<InvokeOp> {
     Operation *producer = callable.getDefiningOp();
     auto constOp = dyn_cast_or_null<func::ConstantOp>(producer);
     if (!constOp)
-      return lowerViaRuntime(op, adaptor, rewriter);
+      return lowerViaRuntime(op, rewriter);
 
     SymbolRefAttr symbolRef = constOp.getValueAttr();
     StringRef symbolName = symbolRef.getLeafReference().empty()
@@ -43,7 +42,7 @@ struct InvokeLowering : public OpConversionPattern<InvokeOp> {
                                : symbolRef.getLeafReference().getValue();
     auto func = module.lookupSymbol<func::FuncOp>(symbolName);
     if (!func)
-      return lowerViaRuntime(op, adaptor, rewriter);
+      return lowerViaRuntime(op, rewriter);
 
     auto unwrapCast = [](Value v) -> Value {
       if (auto id = v.getDefiningOp<CastIdentityOp>())
@@ -54,7 +53,7 @@ struct InvokeLowering : public OpConversionPattern<InvokeOp> {
     auto kwnamesOp = unwrapCast(op.getKwnames()).getDefiningOp();
     auto kwvaluesOp = unwrapCast(op.getKwvalues()).getDefiningOp();
     if (!isa<TupleEmptyOp>(kwnamesOp) || !isa<TupleEmptyOp>(kwvaluesOp))
-      return lowerViaRuntime(op, adaptor, rewriter);
+      return lowerViaRuntime(op, rewriter);
 
     SmallVector<Value> callOperands;
     auto funcType = func.getFunctionType();
@@ -76,7 +75,7 @@ struct InvokeLowering : public OpConversionPattern<InvokeOp> {
       directInputCount =
           funcType.getNumInputs() - (hiddenClassReturnOutArg ? 1u : 0u);
       if (tupleCreate.getElements().size() != directInputCount)
-        return lowerViaRuntime(op, adaptor, rewriter);
+        return lowerViaRuntime(op, rewriter);
       for (auto [idx, element] : llvm::enumerate(tupleCreate.getElements())) {
         Type expected = funcType.getInput(idx);
         Value operand = element;
@@ -97,19 +96,20 @@ struct InvokeLowering : public OpConversionPattern<InvokeOp> {
       directInputCount =
           funcType.getNumInputs() - (hiddenClassReturnOutArg ? 1u : 0u);
       if (directInputCount != 0)
-        return lowerViaRuntime(op, adaptor, rewriter);
+        return lowerViaRuntime(op, rewriter);
     } else {
-      return lowerViaRuntime(op, adaptor, rewriter);
+      return lowerViaRuntime(op, rewriter);
     }
 
     Block *normalDest = op.getNormalDest();
     Block *finalNormalDest = normalDest;
     Value hiddenClassReturnSeed = nullptr;
     if (hiddenClassReturnOutArg) {
-      if (adaptor.getNormalDestOperands().size() != 1)
+      if (adaptor.getNormalDestOperands().size() != 1 ||
+          adaptor.getNormalDestOperands().front().size() != 1)
         return rewriter.notifyMatchFailure(
             op, "class-return invoke expects a single normal destination seed");
-      hiddenClassReturnSeed = adaptor.getNormalDestOperands().front();
+      hiddenClassReturnSeed = adaptor.getNormalDestOperands().front().front();
       callOperands.push_back(hiddenClassReturnSeed);
       eraseInvokeNormalSeedDrops(op, op.getNormalDestOperands().front(),
                                  rewriter);
@@ -117,14 +117,19 @@ struct InvokeLowering : public OpConversionPattern<InvokeOp> {
 
     SmallVector<Type> results;
     for (Type res : funcType.getResults())
-      results.push_back(converter->convertType(res));
+      if (failed(converter->convertType(res, results)))
+        return failure();
 
     Block *unwind = op.getUnwindDest();
     emitTracebackPush(op.getLoc(), op->getParentOfType<func::FuncOp>(), runtime,
                       rewriter);
 
-    SmallVector<Value> normalOperands(adaptor.getNormalDestOperands().begin(),
-                                      adaptor.getNormalDestOperands().end());
+    SmallVector<Value> normalOperands;
+    for (ValueRange values : adaptor.getNormalDestOperands())
+      normalOperands.append(values.begin(), values.end());
+    SmallVector<Value> unwindOperands;
+    for (ValueRange values : adaptor.getUnwindDestOperands())
+      unwindOperands.append(values.begin(), values.end());
     if (!op.getNormalDestOperands().empty() && finalNormalDest &&
         finalNormalDest->getNumArguments() == 1) {
       Type bridgeArgType = hiddenClassReturnOutArg
@@ -144,7 +149,7 @@ struct InvokeLowering : public OpConversionPattern<InvokeOp> {
     auto invoke = rewriter.create<LLVM::InvokeOp>(
         op.getLoc(), results,
         FlatSymbolRefAttr::get(op.getContext(), func.getName()), callOperands,
-        normalDest, normalOperands, unwind, adaptor.getUnwindDestOperands());
+        normalDest, normalOperands, unwind, unwindOperands);
 
     if (!op.getNormalDestOperands().empty()) {
       if (normalDest != finalNormalDest) {
@@ -153,8 +158,7 @@ struct InvokeLowering : public OpConversionPattern<InvokeOp> {
         finalizeInvokeNormalBridge(normalDest, finalNormalDest, forwarded,
                                    op.getLoc(), rewriter);
       } else if (hiddenClassReturnOutArg) {
-        materializeInvokeNormalResult(
-            op, adaptor.getNormalDestOperands().front(), rewriter);
+        materializeInvokeNormalResult(op, hiddenClassReturnSeed, rewriter);
       } else if (!results.empty()) {
         materializeInvokeNormalResult(op, invoke.getResult(), rewriter);
       }

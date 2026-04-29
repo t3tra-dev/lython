@@ -8,10 +8,20 @@ static bool isSupportedStaticFieldType(Type type) {
   if (isa<IntType, FloatType, BoolType, StrType, NoneType, IntegerType,
           mlir::FloatType>(type))
     return true;
-  if (auto listType = dyn_cast<ListType>(type)) {
-    Type elementType = listType.getElementType();
+  auto isSupportedContainerElement = [](Type elementType) {
     return isa<ClassType, IntType, FloatType, BoolType, StrType, NoneType,
                ObjectType>(elementType);
+  };
+  if (auto listType = dyn_cast<ListType>(type)) {
+    return isSupportedContainerElement(listType.getElementType());
+  }
+  if (auto dictType = dyn_cast<DictType>(type)) {
+    return isSupportedContainerElement(dictType.getKeyType()) &&
+           isSupportedContainerElement(dictType.getValueType());
+  }
+  if (auto tupleType = dyn_cast<TupleType>(type)) {
+    return llvm::all_of(tupleType.getElementTypes(),
+                        isSupportedContainerElement);
   }
   return false;
 }
@@ -47,7 +57,8 @@ static LogicalResult verifyClassFieldSchema(ClassOp op) {
       return op.emitOpError("unsupported static field type ")
              << typeAttr.getValue()
              << "; supported field types are !py.int, !py.float, !py.bool, "
-                "!py.none, integers, and floats";
+                "!py.str, !py.none, integers, floats, typed lists, and typed "
+                "dicts/tuples";
   }
 
   return success();

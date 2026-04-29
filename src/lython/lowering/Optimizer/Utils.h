@@ -41,7 +41,9 @@ mlir::ArrayAttr buildSortedIndexArrayAttr(mlir::MLIRContext *ctx,
 bool updateFuncPublicationSummaryAttrs(
     FuncOp func, const llvm::DenseSet<int> &publishesArgs,
     const llvm::DenseSet<int> &capturesPublished,
-    const llvm::DenseSet<int> &returnsPublished);
+    const llvm::DenseSet<int> &returnsPublished,
+    const llvm::DenseSet<int> &readonlyArgs,
+    const llvm::DenseSet<int> &mutableArgs);
 bool isDefinitelyLocalStaticClassValue(mlir::Value value);
 bool isDefinitelyFreshStaticClassValue(mlir::Value value);
 bool isDefinitelyPublishedStaticClassValue(mlir::Value value);
@@ -102,6 +104,7 @@ void insertPublishesAtPublicationBoundaries(mlir::ModuleOp module);
 
 bool cleanupDeadTuples(mlir::ModuleOp module);
 void removeUnusedTupleEmpties(mlir::ModuleOp module);
+void applyStaticMakeFunctionDefaults(mlir::ModuleOp module);
 bool cleanupRedundantClassIncrefsAfterDirectCalls(mlir::ModuleOp module);
 void rewriteDirectFuncCallsToPreferredHelpers(mlir::ModuleOp module);
 void eliminateRedundantClassPublishes(mlir::ModuleOp module);

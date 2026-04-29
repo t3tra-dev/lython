@@ -22,6 +22,7 @@ void runClassLayoutPreLoweringOptimizations(ModuleOp module) {
 }
 
 void runCallPreLoweringOptimizations(ModuleOp module) {
+  applyStaticMakeFunctionDefaults(module);
   cleanupRedundantClassIncrefsAfterDirectCalls(module);
   rewriteDirectFuncCallsToPreferredHelpers(module);
 }

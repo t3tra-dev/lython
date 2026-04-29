@@ -20,24 +20,32 @@ struct TupleEmptyLowering : public OpConversionPattern<TupleEmptyOp> {
       : OpConversionPattern<TupleEmptyOp>(converter, ctx) {}
 
   LogicalResult
-  matchAndRewrite(TupleEmptyOp op, OpAdaptor adaptor,
+  matchAndRewrite(TupleEmptyOp op, OneToNOpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    (void)adaptor;
     auto *typeConverter =
         static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
-    Type resultType = typeConverter->convertType(op.getResult().getType());
-    auto memrefType = dyn_cast_or_null<MemRefType>(resultType);
-    if (!memrefType)
+    SmallVector<Type, 2> resultTypes;
+    if (failed(typeConverter->convertType(op.getResult().getType(),
+                                          resultTypes)) ||
+        resultTypes.size() != 2)
       return failure();
-    auto tuple = rewriter.create<memref::AllocaOp>(
-        op.getLoc(), memrefType,
-        ValueRange{createIndexConstant(op.getLoc(), rewriter,
-                                       kTypedTupleHeaderSlots)});
+    auto headerType = dyn_cast<MemRefType>(resultTypes[0]);
+    auto itemsType = dyn_cast<MemRefType>(resultTypes[1]);
+    if (!headerType || !itemsType)
+      return failure();
+    auto header = rewriter.create<memref::AllocaOp>(op.getLoc(), headerType);
+    auto items = rewriter.create<memref::AllocaOp>(
+        op.getLoc(), itemsType,
+        ValueRange{createIndexConstant(op.getLoc(), rewriter, 0)});
     for (int64_t slot = 0; slot < kTypedTupleHeaderSlots; ++slot) {
       rewriter.create<memref::StoreOp>(
-          op.getLoc(), createI64Constant(op.getLoc(), rewriter, 0), tuple,
+          op.getLoc(), createI64Constant(op.getLoc(), rewriter, 0), header,
           createIndexConstant(op.getLoc(), rewriter, slot));
     }
-    rewriter.replaceOp(op, tuple.getResult());
+    rewriter.replaceOpWithMultiple(
+        op, ArrayRef<ValueRange>{
+                ValueRange{header.getResult(), items.getResult()}});
     return success();
   }
 };
@@ -47,7 +55,7 @@ struct TupleCreateLowering : public OpConversionPattern<TupleCreateOp> {
       : OpConversionPattern<TupleCreateOp>(converter, ctx) {}
 
   LogicalResult
-  matchAndRewrite(TupleCreateOp op, OpAdaptor adaptor,
+  matchAndRewrite(TupleCreateOp op, OneToNOpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     ModuleOp module = op->getParentOfType<ModuleOp>();
     if (!module)
@@ -55,46 +63,51 @@ struct TupleCreateLowering : public OpConversionPattern<TupleCreateOp> {
     auto *typeConverter =
         static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
 
-    Type resultType = typeConverter->convertType(op.getResult().getType());
     auto tupleType = dyn_cast<TupleType>(op.getResult().getType());
     if (!tupleType)
       return failure();
-    auto memrefType = dyn_cast_or_null<MemRefType>(resultType);
-    if (!memrefType)
+    SmallVector<Type, 2> resultTypes;
+    if (failed(typeConverter->convertType(op.getResult().getType(),
+                                          resultTypes)) ||
+        resultTypes.size() != 2)
+      return failure();
+    auto headerType = dyn_cast<MemRefType>(resultTypes[0]);
+    auto itemsType = dyn_cast<MemRefType>(resultTypes[1]);
+    if (!headerType || !itemsType)
       return failure();
     Value allocSize = createIndexConstant(
-        op.getLoc(), rewriter,
-        kTypedTupleHeaderSlots +
-            static_cast<int64_t>(adaptor.getElements().size()));
-    auto tuple = rewriter.create<memref::AllocaOp>(op.getLoc(), memrefType,
+        op.getLoc(), rewriter, static_cast<int64_t>(op.getElements().size()));
+    auto header = rewriter.create<memref::AllocaOp>(op.getLoc(), headerType);
+    auto items = rewriter.create<memref::AllocaOp>(op.getLoc(), itemsType,
                                                    ValueRange{allocSize});
     rewriter.create<memref::StoreOp>(
         op.getLoc(),
         createI64Constant(op.getLoc(), rewriter,
-                          static_cast<int64_t>(adaptor.getElements().size())),
-        tuple, createIndexConstant(op.getLoc(), rewriter, 0));
+                          static_cast<int64_t>(op.getElements().size())),
+        header, createIndexConstant(op.getLoc(), rewriter, 0));
     rewriter.create<memref::StoreOp>(
-        op.getLoc(), createI64Constant(op.getLoc(), rewriter, 0), tuple,
+        op.getLoc(), createI64Constant(op.getLoc(), rewriter, 0), header,
         createIndexConstant(op.getLoc(), rewriter, 1));
     rewriter.create<memref::StoreOp>(
-        op.getLoc(), createI64Constant(op.getLoc(), rewriter, 0), tuple,
+        op.getLoc(), createI64Constant(op.getLoc(), rewriter, 0), header,
         createIndexConstant(op.getLoc(), rewriter, 2));
 
     auto elementTypes = tupleType.getElementTypes();
     for (auto [index, element] : llvm::enumerate(adaptor.getElements())) {
-      FailureOr<Value> stored =
-          packTypedSlot(op.getLoc(), element, elementTypes[index], module,
-                        rewriter, *typeConverter);
-      if (failed(stored))
+      Value stored = materializeTypedContainerStorageValue(
+          op.getLoc(), element.front(), elementTypes[index], module, rewriter,
+          *typeConverter);
+      if (!stored)
         return failure();
       rewriter.create<memref::StoreOp>(
-          op.getLoc(), *stored, tuple,
+          op.getLoc(), stored, items,
           createIndexConstant(op.getLoc(), rewriter,
-                              kTypedTupleHeaderSlots +
-                                  static_cast<int64_t>(index)));
+                              static_cast<int64_t>(index)));
     }
 
-    rewriter.replaceOp(op, tuple.getResult());
+    rewriter.replaceOpWithMultiple(
+        op, ArrayRef<ValueRange>{
+                ValueRange{header.getResult(), items.getResult()}});
     return success();
   }
 };

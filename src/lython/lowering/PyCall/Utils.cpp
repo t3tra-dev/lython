@@ -304,6 +304,16 @@ getStaticClassObjectType(Operation *from, ClassType classType,
   }
 
   SmallVector<Type, 8> loweredFieldTypes;
+  auto getMemRefDescriptorType = [&](MemRefType memrefType) -> Type {
+    if (memrefType.getRank() != 1)
+      return Type();
+    auto ptrType = LLVM::LLVMPointerType::get(from->getContext());
+    auto i64Type = IntegerType::get(from->getContext(), 64);
+    auto sizesType = LLVM::LLVMArrayType::get(i64Type, 1);
+    return LLVM::LLVMStructType::getLiteral(
+        from->getContext(),
+        ArrayRef<Type>{ptrType, ptrType, i64Type, sizesType, sizesType});
+  };
   for (Attribute typeAttr : fieldTypesAttr) {
     auto mlirTypeAttr = dyn_cast<TypeAttr>(typeAttr);
     if (!mlirTypeAttr) {
@@ -311,14 +321,49 @@ getStaticClassObjectType(Operation *from, ClassType classType,
           << classType.getClassName() << "' has malformed static field schema";
       return failure();
     }
-    Type lowered = typeConverter.convertType(mlirTypeAttr.getValue());
-    if (!lowered) {
+    SmallVector<Type, 4> convertedTypes;
+    if (failed(typeConverter.convertType(mlirTypeAttr.getValue(),
+                                         convertedTypes)) ||
+        convertedTypes.empty()) {
       from->emitError("failed to convert field type ")
           << mlirTypeAttr.getValue() << " in class '"
           << classType.getClassName() << "'";
       return failure();
     }
-    loweredFieldTypes.push_back(lowered);
+    if (convertedTypes.size() == 1) {
+      Type lowered = convertedTypes.front();
+      if (auto memrefType = dyn_cast<MemRefType>(lowered))
+        lowered = getMemRefDescriptorType(memrefType);
+      if (!lowered) {
+        from->emitError("failed to convert field type ")
+            << mlirTypeAttr.getValue() << " in class '"
+            << classType.getClassName() << "'";
+        return failure();
+      }
+      loweredFieldTypes.push_back(lowered);
+      continue;
+    }
+
+    SmallVector<Type, 4> descriptorTypes;
+    for (Type converted : convertedTypes) {
+      auto memrefType = dyn_cast<MemRefType>(converted);
+      if (!memrefType) {
+        from->emitError("failed to convert field type ")
+            << mlirTypeAttr.getValue() << " in class '"
+            << classType.getClassName() << "'";
+        return failure();
+      }
+      Type descriptorType = getMemRefDescriptorType(memrefType);
+      if (!descriptorType) {
+        from->emitError("failed to convert field type ")
+            << mlirTypeAttr.getValue() << " in class '"
+            << classType.getClassName() << "'";
+        return failure();
+      }
+      descriptorTypes.push_back(descriptorType);
+    }
+    loweredFieldTypes.push_back(
+        LLVM::LLVMStructType::getLiteral(from->getContext(), descriptorTypes));
   }
 
   auto storageType =
@@ -391,16 +436,35 @@ void eraseNoneResultUsers(CallVectorOp op,
 void materializeLogicalResults(Location loc, TypeRange logicalTypes,
                                ValueRange loweredResults,
                                SmallVectorImpl<Value> &results,
+                               const PyLLVMTypeConverter &typeConverter,
                                ConversionPatternRewriter &rewriter) {
   results.clear();
   results.reserve(logicalTypes.size());
-  for (auto [logicalType, lowered] : llvm::zip(logicalTypes, loweredResults)) {
-    if (lowered.getType() == logicalType) {
-      results.push_back(lowered);
+  unsigned loweredIndex = 0;
+  for (Type logicalType : logicalTypes) {
+    SmallVector<Type, 4> convertedTypes;
+    if (failed(typeConverter.convertType(logicalType, convertedTypes)) ||
+        convertedTypes.empty() ||
+        loweredIndex + convertedTypes.size() > loweredResults.size())
+      return;
+
+    ValueRange loweredGroup =
+        loweredResults.slice(loweredIndex, convertedTypes.size());
+    loweredIndex += convertedTypes.size();
+    if (loweredGroup.size() == 1 &&
+        loweredGroup.front().getType() == logicalType) {
+      results.push_back(loweredGroup.front());
       continue;
     }
-    auto cast = rewriter.create<CastIdentityOp>(loc, logicalType, lowered);
-    results.push_back(cast.getResult());
+    if (loweredGroup.size() == 1) {
+      auto cast = rewriter.create<CastIdentityOp>(loc, logicalType,
+                                                  loweredGroup.front());
+      results.push_back(cast.getResult());
+      continue;
+    }
+    auto cast = rewriter.create<UnrealizedConversionCastOp>(
+        loc, TypeRange{logicalType}, loweredGroup);
+    results.push_back(cast.getResult(0));
   }
 }
 

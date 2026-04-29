@@ -5,6 +5,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/FormatVariadic.h"
 
@@ -50,8 +51,7 @@ struct StaticClassLayout {
 static Type getStaticFieldStorageType(Type logicalType,
                                       const PyLLVMTypeConverter &typeConverter,
                                       MLIRContext *ctx) {
-  Type converted = typeConverter.convertType(logicalType);
-  if (auto memrefType = dyn_cast_or_null<MemRefType>(converted)) {
+  auto getMemRefDescriptorType = [&](MemRefType memrefType) -> Type {
     if (memrefType.getRank() != 1)
       return Type();
     auto ptrType = LLVM::LLVMPointerType::get(ctx);
@@ -59,8 +59,31 @@ static Type getStaticFieldStorageType(Type logicalType,
     auto sizesType = LLVM::LLVMArrayType::get(i64Type, 1);
     return LLVM::LLVMStructType::getLiteral(
         ctx, ArrayRef<Type>{ptrType, ptrType, i64Type, sizesType, sizesType});
+  };
+
+  SmallVector<Type, 4> convertedTypes;
+  if (failed(typeConverter.convertType(logicalType, convertedTypes)) ||
+      convertedTypes.empty())
+    return Type();
+
+  if (convertedTypes.size() == 1) {
+    if (auto memrefType = dyn_cast<MemRefType>(convertedTypes.front()))
+      return getMemRefDescriptorType(memrefType);
+    return convertedTypes.front();
   }
-  return converted;
+
+  SmallVector<Type, 4> descriptorTypes;
+  descriptorTypes.reserve(convertedTypes.size());
+  for (Type converted : convertedTypes) {
+    auto memrefType = dyn_cast<MemRefType>(converted);
+    if (!memrefType)
+      return Type();
+    Type descriptorType = getMemRefDescriptorType(memrefType);
+    if (!descriptorType)
+      return Type();
+    descriptorTypes.push_back(descriptorType);
+  }
+  return LLVM::LLVMStructType::getLiteral(ctx, descriptorTypes);
 }
 
 static bool needsStaticFieldRefCount(Type logicalType, Type storageType,
@@ -280,6 +303,124 @@ static void emitRuntimeVoidCall(Location loc, ModuleOp module,
                   LLVM::LLVMVoidType::get(builder.getContext()), args);
 }
 
+static void copyMemRefPrefix(Location loc, Value source, Value target,
+                             Value count, OpBuilder &builder) {
+  Value lower = createIndexConstant(loc, builder, 0);
+  Value step = createIndexConstant(loc, builder, 1);
+  auto loop = builder.create<scf::ForOp>(loc, lower, count, step);
+  {
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(loop.getBody());
+    Value iv = loop.getInductionVar();
+    Value value = builder.create<memref::LoadOp>(loc, source, iv);
+    builder.create<memref::StoreOp>(loc, value, target, iv);
+  }
+}
+
+static Value loadI64HeaderSlot(Location loc, Value header, int64_t slot,
+                               OpBuilder &builder) {
+  return builder.create<memref::LoadOp>(
+      loc, header, createIndexConstant(loc, builder, slot));
+}
+
+static void storeI64HeaderSlot(Location loc, Value header, int64_t slot,
+                               int64_t value, OpBuilder &builder) {
+  builder.create<memref::StoreOp>(loc, createI64Constant(loc, builder, value),
+                                  header,
+                                  createIndexConstant(loc, builder, slot));
+}
+
+static Value staticMemRefSize(Location loc, MemRefType type,
+                              OpBuilder &builder) {
+  if (type.getRank() != 1 || ShapedType::isDynamic(type.getShape()[0]))
+    return {};
+  return createIndexConstant(loc, builder, type.getShape()[0]);
+}
+
+static FailureOr<SmallVector<Value>>
+promoteListDescriptor(Location loc, ValueRange input,
+                      ConversionPatternRewriter &rewriter) {
+  if (input.size() != 2)
+    return failure();
+  auto headerType = dyn_cast<MemRefType>(input[0].getType());
+  auto itemsType = dyn_cast<MemRefType>(input[1].getType());
+  if (!headerType || !itemsType)
+    return failure();
+  Value headerSize = staticMemRefSize(loc, headerType, rewriter);
+  if (!headerSize)
+    return failure();
+  Value managedHeader = rewriter.create<memref::AllocOp>(loc, headerType);
+  Value size = loadI64HeaderSlot(loc, input[0], 0, rewriter);
+  Value capacity = loadI64HeaderSlot(loc, input[0], 1, rewriter);
+  Value sizeIndex =
+      rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), size);
+  Value capacityIndex = rewriter.create<arith::IndexCastOp>(
+      loc, rewriter.getIndexType(), capacity);
+  Value managedItems = rewriter.create<memref::AllocOp>(
+      loc, itemsType, ValueRange{capacityIndex});
+  copyMemRefPrefix(loc, input[0], managedHeader, headerSize, rewriter);
+  copyMemRefPrefix(loc, input[1], managedItems, sizeIndex, rewriter);
+  storeI64HeaderSlot(loc, managedHeader, 3, 1, rewriter);
+  return SmallVector<Value>{managedHeader, managedItems};
+}
+
+static FailureOr<SmallVector<Value>>
+promoteTupleDescriptor(Location loc, ValueRange input,
+                       ConversionPatternRewriter &rewriter) {
+  if (input.size() != 2)
+    return failure();
+  auto headerType = dyn_cast<MemRefType>(input[0].getType());
+  auto itemsType = dyn_cast<MemRefType>(input[1].getType());
+  if (!headerType || !itemsType)
+    return failure();
+  Value headerSize = staticMemRefSize(loc, headerType, rewriter);
+  if (!headerSize)
+    return failure();
+  Value managedHeader = rewriter.create<memref::AllocOp>(loc, headerType);
+  Value size = loadI64HeaderSlot(loc, input[0], 0, rewriter);
+  Value sizeIndex =
+      rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), size);
+  Value managedItems =
+      rewriter.create<memref::AllocOp>(loc, itemsType, ValueRange{sizeIndex});
+  copyMemRefPrefix(loc, input[0], managedHeader, headerSize, rewriter);
+  copyMemRefPrefix(loc, input[1], managedItems, sizeIndex, rewriter);
+  storeI64HeaderSlot(loc, managedHeader, 2, 1, rewriter);
+  return SmallVector<Value>{managedHeader, managedItems};
+}
+
+static FailureOr<SmallVector<Value>>
+promoteDictDescriptor(Location loc, ValueRange input,
+                      ConversionPatternRewriter &rewriter) {
+  if (input.size() != 4)
+    return failure();
+  auto headerType = dyn_cast<MemRefType>(input[0].getType());
+  auto keysType = dyn_cast<MemRefType>(input[1].getType());
+  auto valuesType = dyn_cast<MemRefType>(input[2].getType());
+  auto statesType = dyn_cast<MemRefType>(input[3].getType());
+  if (!headerType || !keysType || !valuesType || !statesType)
+    return failure();
+  Value headerSize = staticMemRefSize(loc, headerType, rewriter);
+  if (!headerSize)
+    return failure();
+  Value managedHeader = rewriter.create<memref::AllocOp>(loc, headerType);
+  Value capacity = loadI64HeaderSlot(loc, input[0], 1, rewriter);
+  Value capacityIndex = rewriter.create<arith::IndexCastOp>(
+      loc, rewriter.getIndexType(), capacity);
+  Value managedKeys = rewriter.create<memref::AllocOp>(
+      loc, keysType, ValueRange{capacityIndex});
+  Value managedValues = rewriter.create<memref::AllocOp>(
+      loc, valuesType, ValueRange{capacityIndex});
+  Value managedStates = rewriter.create<memref::AllocOp>(
+      loc, statesType, ValueRange{capacityIndex});
+  copyMemRefPrefix(loc, input[0], managedHeader, headerSize, rewriter);
+  copyMemRefPrefix(loc, input[1], managedKeys, capacityIndex, rewriter);
+  copyMemRefPrefix(loc, input[2], managedValues, capacityIndex, rewriter);
+  copyMemRefPrefix(loc, input[3], managedStates, capacityIndex, rewriter);
+  storeI64HeaderSlot(loc, managedHeader, 4, 1, rewriter);
+  return SmallVector<Value>{managedHeader, managedKeys, managedValues,
+                            managedStates};
+}
+
 // Atomic lowering policy:
 // - Prefer memref.atomic_rmw for memref-backed storage when acq_rel RMW is the
 //   intended semantics. This keeps buffer-like storage in higher-level MLIR.
@@ -401,15 +542,28 @@ emitStaticListFieldClassElementRefcount(Location loc, Value descriptor,
                                     voidType, {ptrType});
   auto helperRef = SymbolRefAttr::get(module.getContext(), helper.getName());
 
-  Value data = builder.create<LLVM::ExtractValueOp>(
-      loc, ptrType, descriptor, builder.getDenseI64ArrayAttr({1}));
-  Value size = builder.create<LLVM::LoadOp>(loc, i64Type, data);
+  Value headerDescriptor = descriptor;
+  Value itemsDescriptor = descriptor;
+  if (auto structType = dyn_cast<LLVM::LLVMStructType>(descriptor.getType())) {
+    if (!structType.isOpaque() && structType.getBody().size() == 2) {
+      headerDescriptor = builder.create<LLVM::ExtractValueOp>(
+          loc, structType.getBody()[0], descriptor,
+          builder.getDenseI64ArrayAttr({0}));
+      itemsDescriptor = builder.create<LLVM::ExtractValueOp>(
+          loc, structType.getBody()[1], descriptor,
+          builder.getDenseI64ArrayAttr({1}));
+    }
+  }
+
+  Value headerData = builder.create<LLVM::ExtractValueOp>(
+      loc, ptrType, headerDescriptor, builder.getDenseI64ArrayAttr({1}));
+  Value itemData = builder.create<LLVM::ExtractValueOp>(
+      loc, ptrType, itemsDescriptor, builder.getDenseI64ArrayAttr({1}));
+  Value size = builder.create<LLVM::LoadOp>(loc, i64Type, headerData);
   Value zero = builder.create<LLVM::ConstantOp>(loc, i64Type,
                                                 builder.getI64IntegerAttr(0));
   Value one = builder.create<LLVM::ConstantOp>(loc, i64Type,
                                                builder.getI64IntegerAttr(1));
-  Value header = builder.create<LLVM::ConstantOp>(loc, i64Type,
-                                                  builder.getI64IntegerAttr(4));
 
   Block *currentBlock = builder.getInsertionBlock();
   Block *condBlock = builder.createBlock(parent);
@@ -426,9 +580,8 @@ emitStaticListFieldClassElementRefcount(Location loc, Value descriptor,
   builder.create<LLVM::CondBrOp>(loc, inBounds, bodyBlock, afterBlock);
 
   builder.setInsertionPointToStart(bodyBlock);
-  Value itemOffset = builder.create<LLVM::AddOp>(loc, iv, header);
-  Value itemPtr = builder.create<LLVM::GEPOp>(
-      loc, ptrType, i64Type, data, ArrayRef<LLVM::GEPArg>{itemOffset});
+  Value itemPtr = builder.create<LLVM::GEPOp>(loc, ptrType, i64Type, itemData,
+                                              ArrayRef<LLVM::GEPArg>{iv});
   Value slot = builder.create<LLVM::LoadOp>(loc, i64Type, itemPtr);
   Value object = builder.create<LLVM::IntToPtrOp>(loc, ptrType, slot);
   builder.create<LLVM::CallOp>(loc, TypeRange{}, helperRef, ValueRange{object});
@@ -477,20 +630,31 @@ static void emitStaticDictFieldClassElementRefcount(
   auto *parent = builder.getInsertionBlock()->getParent();
   auto ptrType = LLVM::LLVMPointerType::get(builder.getContext());
   auto i64Type = builder.getI64Type();
-  Value data = builder.create<LLVM::ExtractValueOp>(
-      loc, ptrType, descriptor, builder.getDenseI64ArrayAttr({1}));
+  auto extractMemRefDataPtr = [&](Value memrefDescriptor) -> Value {
+    return builder.create<LLVM::ExtractValueOp>(
+        loc, ptrType, memrefDescriptor, builder.getDenseI64ArrayAttr({1}));
+  };
+  Value keysDescriptor = builder.create<LLVM::ExtractValueOp>(
+      loc, cast<LLVM::LLVMStructType>(descriptor.getType()).getBody()[1],
+      descriptor, builder.getDenseI64ArrayAttr({1}));
+  Value valuesDescriptor = builder.create<LLVM::ExtractValueOp>(
+      loc, cast<LLVM::LLVMStructType>(descriptor.getType()).getBody()[2],
+      descriptor, builder.getDenseI64ArrayAttr({2}));
+  Value statesDescriptor = builder.create<LLVM::ExtractValueOp>(
+      loc, cast<LLVM::LLVMStructType>(descriptor.getType()).getBody()[3],
+      descriptor, builder.getDenseI64ArrayAttr({3}));
+  Value keysData = extractMemRefDataPtr(keysDescriptor);
+  Value valuesData = extractMemRefDataPtr(valuesDescriptor);
+  Value statesData = extractMemRefDataPtr(statesDescriptor);
+  auto i8Type = builder.getI8Type();
+  Value occupiedState = builder.create<LLVM::ConstantOp>(
+      loc, i8Type, builder.getIntegerAttr(i8Type, 1));
   Value zero = builder.create<LLVM::ConstantOp>(loc, i64Type,
                                                 builder.getI64IntegerAttr(0));
   Value one = builder.create<LLVM::ConstantOp>(loc, i64Type,
                                                builder.getI64IntegerAttr(1));
   Value capacity = builder.create<LLVM::ConstantOp>(
       loc, i64Type, builder.getI64IntegerAttr(64));
-  Value keyBase = builder.create<LLVM::ConstantOp>(
-      loc, i64Type, builder.getI64IntegerAttr(5));
-  Value valueBase = builder.create<LLVM::ConstantOp>(
-      loc, i64Type, builder.getI64IntegerAttr(69));
-  Value stateBase = builder.create<LLVM::ConstantOp>(
-      loc, i64Type, builder.getI64IntegerAttr(133));
 
   Block *currentBlock = builder.getInsertionBlock();
   Block *condBlock = builder.createBlock(parent);
@@ -509,27 +673,24 @@ static void emitStaticDictFieldClassElementRefcount(
   builder.create<LLVM::CondBrOp>(loc, inBounds, bodyBlock, afterBlock);
 
   builder.setInsertionPointToStart(bodyBlock);
-  Value stateOffset = builder.create<LLVM::AddOp>(loc, stateBase, iv);
-  Value statePtr = builder.create<LLVM::GEPOp>(
-      loc, ptrType, i64Type, data, ArrayRef<LLVM::GEPArg>{stateOffset});
-  Value state = builder.create<LLVM::LoadOp>(loc, i64Type, statePtr);
-  Value occupied =
-      builder.create<LLVM::ICmpOp>(loc, LLVM::ICmpPredicate::eq, state, one);
+  Value statePtr = builder.create<LLVM::GEPOp>(loc, ptrType, i8Type, statesData,
+                                               ArrayRef<LLVM::GEPArg>{iv});
+  Value state = builder.create<LLVM::LoadOp>(loc, i8Type, statePtr);
+  Value occupied = builder.create<LLVM::ICmpOp>(loc, LLVM::ICmpPredicate::eq,
+                                                state, occupiedState);
   builder.create<LLVM::CondBrOp>(loc, occupied, occupiedBlock, nextBlock);
 
   builder.setInsertionPointToStart(occupiedBlock);
   if (keyClassType) {
-    Value keyOffset = builder.create<LLVM::AddOp>(loc, keyBase, iv);
-    Value keyPtr = builder.create<LLVM::GEPOp>(
-        loc, ptrType, i64Type, data, ArrayRef<LLVM::GEPArg>{keyOffset});
+    Value keyPtr = builder.create<LLVM::GEPOp>(loc, ptrType, i64Type, keysData,
+                                               ArrayRef<LLVM::GEPArg>{iv});
     Value keySlot = builder.create<LLVM::LoadOp>(loc, i64Type, keyPtr);
     emitClassSlotRefcountFromI64(loc, keySlot, keyClassType, module, builder,
                                  suffix);
   }
   if (valueClassType) {
-    Value valueOffset = builder.create<LLVM::AddOp>(loc, valueBase, iv);
     Value valuePtr = builder.create<LLVM::GEPOp>(
-        loc, ptrType, i64Type, data, ArrayRef<LLVM::GEPArg>{valueOffset});
+        loc, ptrType, i64Type, valuesData, ArrayRef<LLVM::GEPArg>{iv});
     Value valueSlot = builder.create<LLVM::LoadOp>(loc, i64Type, valuePtr);
     emitClassSlotRefcountFromI64(loc, valueSlot, valueClassType, module,
                                  builder, suffix);
@@ -845,6 +1006,174 @@ static LLVM::LLVMFuncOp getOrCreateStaticClassEqHelper(Location loc,
   return fn;
 }
 
+static int64_t getLLVMStorageElementBytes(Type elementType) {
+  if (isa<IntegerType>(elementType))
+    return std::max<int64_t>(1, cast<IntegerType>(elementType).getWidth() / 8);
+  if (isa<mlir::FloatType>(elementType))
+    return std::max<int64_t>(1,
+                             cast<mlir::FloatType>(elementType).getWidth() / 8);
+  return 0;
+}
+
+static Value cloneLLVMRank1MemRefDescriptor(Location loc, Value descriptor,
+                                            MemRefType memrefType,
+                                            FlatSymbolRefAttr allocRef,
+                                            OpBuilder &builder) {
+  auto descriptorType = cast<LLVM::LLVMStructType>(descriptor.getType());
+  Type elementType = memrefType.getElementType();
+  int64_t elementBytes = getLLVMStorageElementBytes(elementType);
+  if (elementBytes <= 0)
+    return descriptor;
+
+  auto ptrType = LLVM::LLVMPointerType::get(builder.getContext());
+  auto i64Type = builder.getI64Type();
+  Value oldData = builder.create<LLVM::ExtractValueOp>(
+      loc, ptrType, descriptor, builder.getDenseI64ArrayAttr({1}));
+  Value size = builder.create<LLVM::ExtractValueOp>(
+      loc, i64Type, descriptor, builder.getDenseI64ArrayAttr({3, 0}));
+  Value bytesPerElement = builder.create<LLVM::ConstantOp>(
+      loc, i64Type, builder.getI64IntegerAttr(elementBytes));
+  Value byteSize = builder.create<LLVM::MulOp>(loc, size, bytesPerElement);
+  auto allocCall = builder.create<LLVM::CallOp>(loc, TypeRange{ptrType},
+                                                allocRef, ValueRange{byteSize});
+  Value newData = allocCall.getResult();
+
+  Value zero = builder.create<LLVM::ConstantOp>(loc, i64Type,
+                                                builder.getI64IntegerAttr(0));
+  Value one = builder.create<LLVM::ConstantOp>(loc, i64Type,
+                                               builder.getI64IntegerAttr(1));
+  Value cloned = builder.create<LLVM::UndefOp>(loc, descriptorType);
+  cloned = builder.create<LLVM::InsertValueOp>(
+      loc, descriptorType, cloned, newData, builder.getDenseI64ArrayAttr({0}));
+  cloned = builder.create<LLVM::InsertValueOp>(
+      loc, descriptorType, cloned, newData, builder.getDenseI64ArrayAttr({1}));
+  cloned = builder.create<LLVM::InsertValueOp>(
+      loc, descriptorType, cloned, zero, builder.getDenseI64ArrayAttr({2}));
+  cloned = builder.create<LLVM::InsertValueOp>(
+      loc, descriptorType, cloned, size, builder.getDenseI64ArrayAttr({3, 0}));
+  cloned = builder.create<LLVM::InsertValueOp>(
+      loc, descriptorType, cloned, one, builder.getDenseI64ArrayAttr({4, 0}));
+
+  auto *parent = builder.getInsertionBlock()->getParent();
+  Block *currentBlock = builder.getInsertionBlock();
+  Block *condBlock = builder.createBlock(parent);
+  condBlock->addArgument(i64Type, loc);
+  Block *bodyBlock = builder.createBlock(parent);
+  Block *afterBlock = builder.createBlock(parent);
+  builder.setInsertionPointToEnd(currentBlock);
+  builder.create<LLVM::BrOp>(loc, ValueRange{zero}, condBlock);
+
+  builder.setInsertionPointToStart(condBlock);
+  Value iv = condBlock->getArgument(0);
+  Value inBounds =
+      builder.create<LLVM::ICmpOp>(loc, LLVM::ICmpPredicate::slt, iv, size);
+  builder.create<LLVM::CondBrOp>(loc, inBounds, bodyBlock, afterBlock);
+
+  builder.setInsertionPointToStart(bodyBlock);
+  Value srcPtr = builder.create<LLVM::GEPOp>(loc, ptrType, elementType, oldData,
+                                             ArrayRef<LLVM::GEPArg>{iv});
+  Value dstPtr = builder.create<LLVM::GEPOp>(loc, ptrType, elementType, newData,
+                                             ArrayRef<LLVM::GEPArg>{iv});
+  Value item = builder.create<LLVM::LoadOp>(loc, elementType, srcPtr);
+  builder.create<LLVM::StoreOp>(loc, item, dstPtr);
+  Value next = builder.create<LLVM::AddOp>(loc, iv, one);
+  builder.create<LLVM::BrOp>(loc, ValueRange{next}, condBlock);
+
+  builder.setInsertionPointToStart(afterBlock);
+  return cloned;
+}
+
+static void setClonedContainerOwnershipMarker(Location loc,
+                                              Value headerDescriptor,
+                                              int64_t markerSlot,
+                                              OpBuilder &builder) {
+  auto ptrType = LLVM::LLVMPointerType::get(builder.getContext());
+  auto i64Type = builder.getI64Type();
+  Value data = builder.create<LLVM::ExtractValueOp>(
+      loc, ptrType, headerDescriptor, builder.getDenseI64ArrayAttr({1}));
+  Value slot = builder.create<LLVM::ConstantOp>(
+      loc, i64Type, builder.getI64IntegerAttr(markerSlot));
+  Value ptr = builder.create<LLVM::GEPOp>(loc, ptrType, i64Type, data,
+                                          ArrayRef<LLVM::GEPArg>{slot});
+  Value one = builder.create<LLVM::ConstantOp>(loc, i64Type,
+                                               builder.getI64IntegerAttr(1));
+  builder.create<LLVM::StoreOp>(loc, one, ptr);
+}
+
+static Value cloneStaticContainerFieldStorage(Location loc, Value storageValue,
+                                              Type logicalType,
+                                              FlatSymbolRefAttr allocRef,
+                                              OpBuilder &builder) {
+  SmallVector<Type, 4> convertedTypes;
+  auto appendDescriptor = [&](unsigned index, MemRefType memrefType,
+                              Value &result) {
+    auto storageStruct = cast<LLVM::LLVMStructType>(result.getType());
+    Type partType = storageStruct.getBody()[index];
+    Value descriptor = builder.create<LLVM::ExtractValueOp>(
+        loc, partType, result, builder.getDenseI64ArrayAttr({index}));
+    Value cloned = cloneLLVMRank1MemRefDescriptor(loc, descriptor, memrefType,
+                                                  allocRef, builder);
+    result = builder.create<LLVM::InsertValueOp>(
+        loc, storageStruct, result, cloned,
+        builder.getDenseI64ArrayAttr({index}));
+    return cloned;
+  };
+
+  Value result = storageValue;
+  if (auto listType = dyn_cast<ListType>(logicalType)) {
+    auto headerType = getListHeaderMemRefType(builder.getContext());
+    auto itemsType =
+        getListItemsMemRefType(listType.getElementType(), builder.getContext());
+    if (!itemsType)
+      return storageValue;
+    Value header = appendDescriptor(0, headerType, result);
+    appendDescriptor(1, itemsType, result);
+    setClonedContainerOwnershipMarker(loc, header, 3, builder);
+    return result;
+  }
+  if (auto tupleType = dyn_cast<TupleType>(logicalType)) {
+    Value header = appendDescriptor(
+        0, getTupleHeaderMemRefType(builder.getContext()), result);
+    appendDescriptor(
+        1, getTupleItemsMemRefType(tupleType, builder.getContext()), result);
+    setClonedContainerOwnershipMarker(loc, header, 2, builder);
+    return result;
+  }
+  if (auto dictType = dyn_cast<DictType>(logicalType)) {
+    auto keysType = getDictKeysMemRefType(dictType, builder.getContext());
+    auto valuesType = getDictValuesMemRefType(dictType, builder.getContext());
+    if (!keysType || !valuesType)
+      return storageValue;
+    Value header = appendDescriptor(
+        0, getDictHeaderMemRefType(builder.getContext()), result);
+    appendDescriptor(1, keysType, result);
+    appendDescriptor(2, valuesType, result);
+    appendDescriptor(3, getDictStatesMemRefType(builder.getContext()), result);
+    setClonedContainerOwnershipMarker(loc, header, 4, builder);
+    return result;
+  }
+  return storageValue;
+}
+
+static void deepCloneStaticContainerFields(Location loc, Value object,
+                                           const StaticClassLayout &layout,
+                                           FlatSymbolRefAttr allocRef,
+                                           OpBuilder &builder) {
+  auto ptrType = LLVM::LLVMPointerType::get(builder.getContext());
+  for (auto [index, field] : llvm::enumerate(layout.fields)) {
+    if (!isa<ListType, TupleType, DictType>(field.logicalType))
+      continue;
+    Value fieldPtr = builder.create<LLVM::GEPOp>(
+        loc, ptrType, layout.storageType, object,
+        ArrayRef<LLVM::GEPArg>{0, static_cast<int32_t>(index)});
+    Value fieldValue =
+        builder.create<LLVM::LoadOp>(loc, field.storageType, fieldPtr);
+    Value cloned = cloneStaticContainerFieldStorage(
+        loc, fieldValue, field.logicalType, allocRef, builder);
+    builder.create<LLVM::StoreOp>(loc, cloned, fieldPtr);
+  }
+}
+
 static LLVM::LLVMFuncOp getOrCreateStaticClassPromoteHelper(
     Location loc, ModuleOp module, ClassType classType,
     const StaticClassLayout &layout, OpBuilder &builder,
@@ -864,7 +1193,8 @@ static LLVM::LLVMFuncOp getOrCreateStaticClassPromoteHelper(
       SymbolRefAttr::get(module.getContext(), retainHelper.getName());
   auto allocFn = getOrInsertLLVMFunc(
       loc, module, builder, RuntimeSymbols::kMemAlloc, ptrType, {i64Type});
-  auto allocRef = SymbolRefAttr::get(module.getContext(), allocFn.getName());
+  auto allocRef =
+      FlatSymbolRefAttr::get(module.getContext(), allocFn.getName());
 
   Block *entry = fn.addEntryBlock(builder);
   OpBuilder::InsertionGuard guard(builder);
@@ -903,6 +1233,7 @@ static LLVM::LLVMFuncOp getOrCreateStaticClassPromoteHelper(
   Value storageValue =
       builder.create<LLVM::LoadOp>(loc, layout.storageType, object);
   builder.create<LLVM::StoreOp>(loc, storageValue, managedObject);
+  deepCloneStaticContainerFields(loc, managedObject, layout, allocRef, builder);
   Value newManagedPtr =
       getStaticClassManagedFlagPtr(loc, managedObject, layout, builder);
   Value trueValue = builder.create<LLVM::ConstantOp>(loc, builder.getI1Type(),
@@ -1233,6 +1564,32 @@ boxStaticFieldValue(Location loc, Value storageValue, Type logicalType,
   return storageValue;
 }
 
+static FailureOr<SmallVector<Value>>
+boxStaticFieldValues(Location loc, Value storageValue, Type logicalType,
+                     ModuleOp module, ConversionPatternRewriter &rewriter,
+                     const PyLLVMTypeConverter &typeConverter,
+                     bool borrowExistingRef = false) {
+  SmallVector<Type, 4> convertedTypes;
+  if (failed(typeConverter.convertType(logicalType, convertedTypes)) ||
+      convertedTypes.empty())
+    return failure();
+  if (convertedTypes.size() > 1) {
+    SmallVector<Value> values = typeConverter.materializeTargetConversion(
+        rewriter, loc, TypeRange(convertedTypes), ValueRange{storageValue},
+        logicalType);
+    if (values.empty())
+      return failure();
+    return values;
+  }
+
+  FailureOr<Value> boxed =
+      boxStaticFieldValue(loc, storageValue, logicalType, module, rewriter,
+                          typeConverter, borrowExistingRef);
+  if (failed(boxed))
+    return failure();
+  return SmallVector<Value>{*boxed};
+}
+
 static bool isBorrowOnlyAttrGetUser(Operation *user) {
   return isa<NumAddOp, NumSubOp, NumLeOp, NumLtOp, NumGtOp, NumGeOp, NumEqOp,
              NumNeOp, ListAppendOp, ListRemoveOp, ListGetOp>(user);
@@ -1299,6 +1656,22 @@ unboxStaticFieldValue(Location loc, Value boxedValue, Type logicalType,
   return boxedValue;
 }
 
+static FailureOr<Value>
+unboxStaticFieldValue(Location loc, ValueRange boxedValues, Type logicalType,
+                      Type storageType, ModuleOp module,
+                      ConversionPatternRewriter &rewriter,
+                      const PyLLVMTypeConverter &typeConverter) {
+  if (boxedValues.size() > 1) {
+    return rewriter
+        .create<UnrealizedConversionCastOp>(loc, storageType, boxedValues)
+        .getResult(0);
+  }
+  if (boxedValues.empty())
+    return failure();
+  return unboxStaticFieldValue(loc, boxedValues.front(), logicalType,
+                               storageType, module, rewriter, typeConverter);
+}
+
 // Static class instances lower to function-local stack slots.
 struct ClassNewLowering : public OpConversionPattern<ClassNewOp> {
   ClassNewLowering(PyLLVMTypeConverter &converter, MLIRContext *ctx)
@@ -1361,7 +1734,7 @@ struct PublishLowering : public OpConversionPattern<PublishOp> {
       : OpConversionPattern<PublishOp>(converter, ctx) {}
 
   LogicalResult
-  matchAndRewrite(PublishOp op, OpAdaptor adaptor,
+  matchAndRewrite(PublishOp op, OneToNOpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     rewriter.setInsertionPoint(op);
     ModuleOp module = op->getParentOfType<ModuleOp>();
@@ -1369,26 +1742,47 @@ struct PublishLowering : public OpConversionPattern<PublishOp> {
       return failure();
 
     if (auto classType = dyn_cast<ClassType>(op.getResult().getType())) {
+      if (adaptor.getInput().size() != 1)
+        return failure();
       auto ptrType = LLVM::LLVMPointerType::get(rewriter.getContext());
       std::string helperName = getClassHelperName(classType, "promote");
       auto helper = getOrInsertLLVMFunc(op.getLoc(), module, rewriter,
                                         helperName, ptrType, {ptrType});
       auto helperRef =
           SymbolRefAttr::get(module.getContext(), helper.getName());
-      auto call = rewriter.create<LLVM::CallOp>(op.getLoc(), TypeRange{ptrType},
-                                                helperRef,
-                                                ValueRange{adaptor.getInput()});
+      auto call = rewriter.create<LLVM::CallOp>(
+          op.getLoc(), TypeRange{ptrType}, helperRef,
+          ValueRange{adaptor.getInput().front()});
       rewriter.replaceOp(op, call.getResults());
       return success();
     }
 
+    FailureOr<SmallVector<Value>> promoted = failure();
+    Type resultType = op.getResult().getType();
+    if (isa<ListType>(resultType)) {
+      promoted =
+          promoteListDescriptor(op.getLoc(), adaptor.getInput(), rewriter);
+    } else if (isa<TupleType>(resultType)) {
+      promoted =
+          promoteTupleDescriptor(op.getLoc(), adaptor.getInput(), rewriter);
+    } else if (isa<DictType>(resultType)) {
+      promoted =
+          promoteDictDescriptor(op.getLoc(), adaptor.getInput(), rewriter);
+    }
+    if (succeeded(promoted)) {
+      rewriter.replaceOpWithMultiple(op, ArrayRef<ValueRange>{*promoted});
+      return success();
+    }
+
+    if (adaptor.getInput().size() != 1)
+      return failure();
     auto *typeConverter =
         static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
     RuntimeAPI runtime(module, rewriter, *typeConverter);
     runtime.call(op.getLoc(), RuntimeSymbols::kIncRef, /*resultType=*/nullptr,
-                 adaptor.getInput());
+                 ValueRange{adaptor.getInput().front()});
 
-    rewriter.replaceOp(op, adaptor.getInput());
+    rewriter.replaceOp(op, adaptor.getInput().front());
     return success();
   }
 };
@@ -1399,7 +1793,7 @@ struct AttrGetLowering : public OpConversionPattern<AttrGetOp> {
       : OpConversionPattern<AttrGetOp>(converter, ctx) {}
 
   LogicalResult
-  matchAndRewrite(AttrGetOp op, OpAdaptor adaptor,
+  matchAndRewrite(AttrGetOp op, OneToNOpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     ModuleOp module = op->getParentOfType<ModuleOp>();
     if (!module)
@@ -1431,18 +1825,20 @@ struct AttrGetLowering : public OpConversionPattern<AttrGetOp> {
 
       auto ptrType = LLVM::LLVMPointerType::get(rewriter.getContext());
       Value fieldPtr = rewriter.create<LLVM::GEPOp>(
-          op.getLoc(), ptrType, layoutOr->storageType, adaptor.getObject(),
+          op.getLoc(), ptrType, layoutOr->storageType,
+          adaptor.getObject().front(),
           ArrayRef<LLVM::GEPArg>{0, static_cast<int32_t>(fieldOr->first)});
       Value loaded = rewriter.create<LLVM::LoadOp>(
           op.getLoc(), fieldOr->second.storageType, fieldPtr);
-      FailureOr<Value> boxed = boxStaticFieldValue(
+      FailureOr<SmallVector<Value>> boxed = boxStaticFieldValues(
           op.getLoc(), loaded, fieldOr->second.logicalType, module, rewriter,
           *typeConverter, static_cast<bool>(borrowedDrop));
       if (failed(boxed))
         return failure();
       if (borrowedDrop)
         rewriter.eraseOp(borrowedDrop);
-      rewriter.replaceOp(op, *boxed);
+      SmallVector<ValueRange, 1> replacements{ValueRange(*boxed)};
+      rewriter.replaceOpWithMultiple(op, replacements);
       return success();
     }
 
@@ -1454,13 +1850,14 @@ struct AttrGetLowering : public OpConversionPattern<AttrGetOp> {
         op.getLoc(), rewriter.getI1Type(), rewriter.getBoolAttr(false));
     auto call = rewriter.create<LLVM::CallOp>(
         op.getLoc(), TypeRange{fieldOr->second.storageType}, helperRef,
-        ValueRange{adaptor.getObject(), borrowLocal});
-    FailureOr<Value> boxed = boxStaticFieldValue(
+        ValueRange{adaptor.getObject().front(), borrowLocal});
+    FailureOr<SmallVector<Value>> boxed = boxStaticFieldValues(
         op.getLoc(), call.getResult(), fieldOr->second.logicalType, module,
         rewriter, *typeConverter, /*borrowExistingRef=*/true);
     if (failed(boxed))
       return failure();
-    rewriter.replaceOp(op, *boxed);
+    SmallVector<ValueRange, 1> replacements{ValueRange(*boxed)};
+    rewriter.replaceOpWithMultiple(op, replacements);
     return success();
   }
 };
@@ -1471,7 +1868,7 @@ struct AttrSetLowering : public OpConversionPattern<AttrSetOp> {
       : OpConversionPattern<AttrSetOp>(converter, ctx) {}
 
   LogicalResult
-  matchAndRewrite(AttrSetOp op, OpAdaptor adaptor,
+  matchAndRewrite(AttrSetOp op, OneToNOpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     ModuleOp module = op->getParentOfType<ModuleOp>();
     if (!module)
@@ -1504,7 +1901,8 @@ struct AttrSetLowering : public OpConversionPattern<AttrSetOp> {
     if (knownLocal) {
       auto ptrType = LLVM::LLVMPointerType::get(rewriter.getContext());
       Value fieldPtr = rewriter.create<LLVM::GEPOp>(
-          op.getLoc(), ptrType, layoutOr->storageType, adaptor.getObject(),
+          op.getLoc(), ptrType, layoutOr->storageType,
+          adaptor.getObject().front(),
           ArrayRef<LLVM::GEPArg>{0, static_cast<int32_t>(fieldOr->first)});
       Value oldValue;
       if (needsStaticFieldRefCount(fieldOr->second.logicalType,
@@ -1539,9 +1937,10 @@ struct AttrSetLowering : public OpConversionPattern<AttrSetOp> {
     Value skipOldDrop = rewriter.create<LLVM::ConstantOp>(
         op.getLoc(), rewriter.getI1Type(),
         rewriter.getBoolAttr(skipOldValueLoad));
-    rewriter.create<LLVM::CallOp>(
-        op.getLoc(), TypeRange{}, helperRef,
-        ValueRange{adaptor.getObject(), *unboxed, retainNewValue, skipOldDrop});
+    rewriter.create<LLVM::CallOp>(op.getLoc(), TypeRange{}, helperRef,
+                                  ValueRange{adaptor.getObject().front(),
+                                             *unboxed, retainNewValue,
+                                             skipOldDrop});
     rewriter.eraseOp(op);
     return success();
   }
