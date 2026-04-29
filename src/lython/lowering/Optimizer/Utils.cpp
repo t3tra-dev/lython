@@ -246,7 +246,7 @@ Value stripTransparentPublicationOps(Value value) {
 }
 
 bool isPublicationSummaryResultType(Type type) {
-  return isa<ListType, DictType, ObjectType, ClassType>(type);
+  return isa<ListType, DictType, TupleType, ObjectType, ClassType>(type);
 }
 
 bool arrayAttrContainsIndex(ArrayAttr attr, unsigned index) {
@@ -309,7 +309,9 @@ ArrayAttr buildSortedIndexArrayAttr(MLIRContext *ctx,
 bool updateFuncPublicationSummaryAttrs(
     FuncOp func, const llvm::DenseSet<int> &publishesArgs,
     const llvm::DenseSet<int> &capturesPublished,
-    const llvm::DenseSet<int> &returnsPublished) {
+    const llvm::DenseSet<int> &returnsPublished,
+    const llvm::DenseSet<int> &readonlyArgs,
+    const llvm::DenseSet<int> &mutableArgs) {
   bool changed = false;
   auto clearOrSetArrayAttr = [&](StringRef name,
                                  const llvm::DenseSet<int> &indices) {
@@ -331,10 +333,195 @@ bool updateFuncPublicationSummaryAttrs(
   clearOrSetArrayAttr("lython.publishes_args", publishesArgs);
   clearOrSetArrayAttr("lython.captures_published", capturesPublished);
   clearOrSetArrayAttr("lython.returns_published", returnsPublished);
+  clearOrSetArrayAttr("lython.readonly_args", readonlyArgs);
+  clearOrSetArrayAttr("lython.mutable_args", mutableArgs);
   return changed;
 }
 
 bool isDefinitelyPublishedStaticClassValue(Value value);
+
+static TupleCreateOp getStaticTupleCreate(Value value) {
+  value = stripIdentityCasts(value);
+  return dyn_cast_or_null<TupleCreateOp>(value.getDefiningOp());
+}
+
+static Value stripStaticMetadataValue(Value value) {
+  while (true) {
+    value = stripTransparentPublicationOps(value);
+    if (auto upcast = value.getDefiningOp<UpcastOp>()) {
+      value = upcast.getInput();
+      continue;
+    }
+    return value;
+  }
+}
+
+static bool collectStaticDictStringValues(Value dictValue,
+                                          llvm::StringMap<Value> &values) {
+  SmallVector<std::pair<StringRef, Value>, 8> reversed;
+  Value current = stripTransparentPublicationOps(dictValue);
+  while (auto insert = current.getDefiningOp<DictInsertOp>()) {
+    Value key = stripIdentityCasts(insert.getKey());
+    auto strConst = key.getDefiningOp<StrConstantOp>();
+    if (!strConst)
+      return false;
+    reversed.push_back({strConst.getValueAttr().getValue(),
+                        stripStaticMetadataValue(insert.getValue())});
+    current = stripTransparentPublicationOps(insert.getDict());
+  }
+  if (!current.getDefiningOp<DictEmptyOp>())
+    return false;
+  for (auto [key, value] : llvm::reverse(reversed))
+    values[key] = value;
+  return true;
+}
+
+static bool collectStaticKeywordArgumentValues(Value namesValue,
+                                               Value valuesValue,
+                                               llvm::StringMap<Value> &values) {
+  namesValue = stripIdentityCasts(namesValue);
+  valuesValue = stripIdentityCasts(valuesValue);
+  if (isa_and_nonnull<TupleEmptyOp>(namesValue.getDefiningOp()) &&
+      isa_and_nonnull<TupleEmptyOp>(valuesValue.getDefiningOp()))
+    return true;
+
+  auto names = namesValue.getDefiningOp<TupleCreateOp>();
+  auto args = valuesValue.getDefiningOp<TupleCreateOp>();
+  if (!names || !args ||
+      names.getElements().size() != args.getElements().size())
+    return false;
+
+  for (auto [name, value] :
+       llvm::zip(names.getElements(), args.getElements())) {
+    name = stripIdentityCasts(name);
+    auto strConst = name.getDefiningOp<StrConstantOp>();
+    if (!strConst)
+      return false;
+    values[strConst.getValueAttr().getValue()] =
+        stripStaticMetadataValue(value);
+  }
+  return true;
+}
+
+void applyStaticMakeFunctionDefaults(ModuleOp module) {
+  SmallVector<CallVectorOp> calls;
+  module.walk([&](CallVectorOp op) { calls.push_back(op); });
+
+  for (CallVectorOp call : calls) {
+    Value callable = stripIdentityCasts(call.getCallable());
+    auto makeFunc = callable.getDefiningOp<MakeFunctionOp>();
+    if (!makeFunc || (!makeFunc.getDefaults() && !makeFunc.getKwdefaults() &&
+                      !makeFunc.getClosure()))
+      continue;
+
+    auto funcType = dyn_cast<FuncType>(makeFunc.getResult().getType());
+    if (!funcType)
+      continue;
+    auto signature = funcType.getSignature();
+    if (signature.hasVararg())
+      continue;
+    ArrayRef<Type> positionalTypes = signature.getPositionalTypes();
+    unsigned positionalCount = static_cast<unsigned>(positionalTypes.size());
+    ArrayRef<Type> kwonlyTypes = signature.getKwOnlyTypes();
+    unsigned kwonlyCount = static_cast<unsigned>(kwonlyTypes.size());
+
+    TupleCreateOp posargs = getStaticTupleCreate(call.getPosargs());
+    if (!posargs)
+      continue;
+    unsigned providedCount =
+        static_cast<unsigned>(posargs.getElements().size());
+    if (providedCount > positionalCount)
+      continue;
+
+    SmallVector<Value, 8> elements;
+    elements.append(posargs.getElements().begin(), posargs.getElements().end());
+    if (providedCount < positionalCount) {
+      TupleCreateOp defaults = getStaticTupleCreate(makeFunc.getDefaults());
+      if (!defaults)
+        continue;
+      unsigned defaultsCount =
+          static_cast<unsigned>(defaults.getElements().size());
+      if (providedCount + defaultsCount < positionalCount)
+        continue;
+
+      unsigned firstDefaultIndex = positionalCount - defaultsCount;
+      if (providedCount < firstDefaultIndex)
+        continue;
+      for (unsigned index = providedCount; index < positionalCount; ++index)
+        elements.push_back(defaults.getElements()[index - firstDefaultIndex]);
+    }
+
+    if (kwonlyCount > 0) {
+      ArrayAttr kwonlyNames = nullptr;
+      if (Operation *symbol = SymbolTable::lookupNearestSymbolFrom(
+              call, makeFunc.getTargetAttr()))
+        if (auto targetFunc = dyn_cast<FuncOp>(symbol))
+          kwonlyNames = targetFunc.getKwonlyNamesAttr();
+      if (!kwonlyNames || kwonlyNames.size() != kwonlyCount)
+        continue;
+      llvm::StringMap<Value> kwdefaultValues;
+      if (!makeFunc.getKwdefaults() ||
+          !collectStaticDictStringValues(makeFunc.getKwdefaults(),
+                                         kwdefaultValues))
+        continue;
+      llvm::StringMap<Value> explicitKwValues;
+      if (!collectStaticKeywordArgumentValues(
+              call.getKwnames(), call.getKwvalues(), explicitKwValues))
+        continue;
+      bool missingDefault = false;
+      for (Attribute attr : kwonlyNames) {
+        auto nameAttr = dyn_cast<StringAttr>(attr);
+        if (!nameAttr) {
+          missingDefault = true;
+          break;
+        }
+        auto explicitIt = explicitKwValues.find(nameAttr.getValue());
+        if (explicitIt != explicitKwValues.end()) {
+          elements.push_back(explicitIt->second);
+          continue;
+        }
+        auto defaultIt = kwdefaultValues.find(nameAttr.getValue());
+        if (defaultIt == kwdefaultValues.end()) {
+          missingDefault = true;
+          break;
+        }
+        elements.push_back(defaultIt->second);
+      }
+      if (missingDefault)
+        continue;
+    }
+
+    if (Value closureValue = makeFunc.getClosure()) {
+      TupleCreateOp closure = getStaticTupleCreate(closureValue);
+      if (!closure)
+        continue;
+      elements.append(closure.getElements().begin(),
+                      closure.getElements().end());
+    }
+
+    if (elements.size() == posargs.getElements().size())
+      continue;
+
+    SmallVector<Type, 8> elementTypes;
+    elementTypes.reserve(elements.size());
+    for (Value element : elements)
+      elementTypes.push_back(element.getType());
+
+    OpBuilder builder(call);
+    auto newTuple = builder.create<TupleCreateOp>(
+        call.getLoc(), TupleType::get(module.getContext(), elementTypes),
+        elements);
+    auto funcObject = builder.create<FuncObjectOp>(
+        call.getLoc(), makeFunc.getResult().getType(),
+        makeFunc.getTargetAttr());
+    auto emptyKwTuple = builder.create<TupleEmptyOp>(
+        call.getLoc(), TupleType::get(module.getContext(), {}));
+    call.getPosargsMutable().assign(newTuple.getResult());
+    call.getCallableMutable().assign(funcObject.getResult());
+    call.getKwnamesMutable().assign(emptyKwTuple.getResult());
+    call.getKwvaluesMutable().assign(emptyKwTuple.getResult());
+  }
+}
 
 static bool insertPublishBeforeOperand(Operation *owner,
                                        unsigned operandIndex) {
@@ -621,8 +808,14 @@ void computeLocalPublicationSummaries(ModuleOp module) {
       llvm::DenseSet<int> publishesArgs;
       llvm::DenseSet<int> capturesPublished;
       llvm::DenseSet<int> returnsPublished;
+      llvm::DenseSet<int> readonlyArgs;
+      llvm::DenseSet<int> mutableArgs;
 
       func.walk([&](ListAppendOp op) {
+        int listArgIndex = getEntryArgumentIndex(func, op.getList());
+        if (listArgIndex >= 0)
+          mutableArgs.insert(listArgIndex);
+
         int argIndex = getEntryArgumentIndex(func, op.getValue());
         if (argIndex < 0)
           return;
@@ -630,7 +823,23 @@ void computeLocalPublicationSummaries(ModuleOp module) {
         capturesPublished.insert(argIndex);
       });
 
+      func.walk([&](ListRemoveOp op) {
+        int argIndex = getEntryArgumentIndex(func, op.getList());
+        if (argIndex >= 0)
+          mutableArgs.insert(argIndex);
+      });
+
+      func.walk([&](ListGetOp op) {
+        int argIndex = getEntryArgumentIndex(func, op.getList());
+        if (argIndex >= 0)
+          readonlyArgs.insert(argIndex);
+      });
+
       func.walk([&](DictInsertOp op) {
+        int dictArgIndex = getEntryArgumentIndex(func, op.getDict());
+        if (dictArgIndex >= 0)
+          mutableArgs.insert(dictArgIndex);
+
         for (Value operand : {op.getKey(), op.getValue()}) {
           int argIndex = getEntryArgumentIndex(func, operand);
           if (argIndex < 0)
@@ -638,6 +847,12 @@ void computeLocalPublicationSummaries(ModuleOp module) {
           publishesArgs.insert(argIndex);
           capturesPublished.insert(argIndex);
         }
+      });
+
+      func.walk([&](DictGetOp op) {
+        int argIndex = getEntryArgumentIndex(func, op.getDict());
+        if (argIndex >= 0)
+          readonlyArgs.insert(argIndex);
       });
 
       func.walk([&](AttrSetOp op) {
@@ -702,7 +917,7 @@ void computeLocalPublicationSummaries(ModuleOp module) {
         if (operandByIndex.empty())
           return;
 
-        auto recordIndices = [&](ArrayAttr indices, bool capture) {
+        auto recordPublicationIndices = [&](ArrayAttr indices, bool capture) {
           if (!indices)
             return;
           for (Attribute element : indices) {
@@ -724,11 +939,38 @@ void computeLocalPublicationSummaries(ModuleOp module) {
           }
         };
 
-        recordIndices(callee->getAttrOfType<ArrayAttr>("lython.publishes_args"),
-                      /*capture=*/false);
-        recordIndices(
+        auto recordAccessIndices = [&](ArrayAttr indices,
+                                       llvm::DenseSet<int> &target) {
+          if (!indices)
+            return;
+          for (Attribute element : indices) {
+            auto intAttr = dyn_cast<IntegerAttr>(element);
+            if (!intAttr)
+              continue;
+            int64_t formalIndex = intAttr.getInt();
+            if (formalIndex < 0)
+              continue;
+            auto it = operandByIndex.find(static_cast<unsigned>(formalIndex));
+            if (it == operandByIndex.end())
+              continue;
+            int argIndex = getEntryArgumentIndex(func, it->second);
+            if (argIndex >= 0)
+              target.insert(argIndex);
+          }
+        };
+
+        recordPublicationIndices(
+            callee->getAttrOfType<ArrayAttr>("lython.publishes_args"),
+            /*capture=*/false);
+        recordPublicationIndices(
             callee->getAttrOfType<ArrayAttr>("lython.captures_published"),
             /*capture=*/true);
+        recordAccessIndices(
+            callee->getAttrOfType<ArrayAttr>("lython.readonly_args"),
+            readonlyArgs);
+        recordAccessIndices(
+            callee->getAttrOfType<ArrayAttr>("lython.mutable_args"),
+            mutableArgs);
       };
 
       func.walk([&](CallVectorOp op) {
@@ -757,8 +999,12 @@ void computeLocalPublicationSummaries(ModuleOp module) {
         }
       });
 
+      for (int argIndex : mutableArgs)
+        readonlyArgs.erase(argIndex);
+
       changed |= updateFuncPublicationSummaryAttrs(
-          func, publishesArgs, capturesPublished, returnsPublished);
+          func, publishesArgs, capturesPublished, returnsPublished,
+          readonlyArgs, mutableArgs);
     });
   } while (changed);
 }

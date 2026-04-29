@@ -1,5 +1,7 @@
 #include "Common/RuntimeSupport.h"
 
+#include "Common/LoweringUtils.h"
+
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/FormatVariadic.h"
@@ -36,47 +38,75 @@ PyLLVMTypeConverter::PyLLVMTypeConverter(mlir::MLIRContext *ctx)
     return std::nullopt;
   });
 
-  addConversion([ctx](ListType listType) -> std::optional<mlir::Type> {
-    mlir::Type elementType = listType.getElementType();
-    if (mlir::isa<IntType, BoolType, FloatType, ClassType>(elementType))
-      return mlir::MemRefType::get({mlir::ShapedType::kDynamic},
-                                   mlir::IntegerType::get(ctx, 64));
-    return std::nullopt;
-  });
+  addConversion(
+      [ctx](ListType listType, mlir::SmallVectorImpl<mlir::Type> &results)
+          -> std::optional<mlir::LogicalResult> {
+        auto itemsType = getListItemsMemRefType(listType.getElementType(), ctx);
+        if (!itemsType)
+          return std::nullopt;
+        results.push_back(getListHeaderMemRefType(ctx));
+        results.push_back(itemsType);
+        return mlir::success();
+      });
 
-  addConversion([ctx](TupleType tupleType) -> std::optional<mlir::Type> {
-    (void)tupleType;
-    return mlir::MemRefType::get({mlir::ShapedType::kDynamic},
-                                 mlir::IntegerType::get(ctx, 64));
-  });
+  addConversion(
+      [ctx](TupleType tupleType, mlir::SmallVectorImpl<mlir::Type> &results)
+          -> std::optional<mlir::LogicalResult> {
+        results.push_back(getTupleHeaderMemRefType(ctx));
+        results.push_back(getTupleItemsMemRefType(tupleType, ctx));
+        return mlir::success();
+      });
 
-  addConversion([ctx](DictType dictType) -> std::optional<mlir::Type> {
-    auto isSlotType = [](mlir::Type type) {
-      return mlir::isa<IntType, BoolType, FloatType, StrType, ObjectType,
-                       ClassType>(type);
-    };
-    if (isSlotType(dictType.getKeyType()) &&
-        isSlotType(dictType.getValueType()))
-      return mlir::MemRefType::get({mlir::ShapedType::kDynamic},
-                                   mlir::IntegerType::get(ctx, 64));
-    return std::nullopt;
-  });
+  addConversion(
+      [ctx](DictType dictType, mlir::SmallVectorImpl<mlir::Type> &results)
+          -> std::optional<mlir::LogicalResult> {
+        if (isTypedContainerSlotSupported(dictType.getKeyType()) &&
+            isTypedContainerSlotSupported(dictType.getValueType())) {
+          results.push_back(getDictHeaderMemRefType(ctx));
+          results.push_back(getDictKeysMemRefType(dictType, ctx));
+          results.push_back(getDictValuesMemRefType(dictType, ctx));
+          results.push_back(getDictStatesMemRefType(ctx));
+          return mlir::success();
+        }
+        return std::nullopt;
+      });
 
   auto materializeBridge = [](mlir::OpBuilder &builder, mlir::Type resultType,
                               mlir::ValueRange inputs,
                               mlir::Location loc) -> mlir::Value {
-    if (inputs.size() != 1)
+    if (inputs.empty())
       return {};
     mlir::Type inputType = inputs.front().getType();
-    if (!isPyRuntimeBridgeType(resultType) && !isPyRuntimeBridgeType(inputType))
+    bool inputIsPyBridge =
+        isPyRuntimeBridgeType(inputType) ||
+        llvm::all_of(inputs, [](mlir::Value input) {
+          return mlir::isa<mlir::MemRefType>(input.getType());
+        });
+    if (!isPyRuntimeBridgeType(resultType) && !inputIsPyBridge)
       return {};
     return builder
         .create<mlir::UnrealizedConversionCastOp>(loc, resultType, inputs)
         .getResult(0);
   };
 
+  auto materializeTargetBridge =
+      [](mlir::OpBuilder &builder, mlir::TypeRange resultTypes,
+         mlir::ValueRange inputs, mlir::Location loc,
+         mlir::Type originalType) -> mlir::SmallVector<mlir::Value> {
+    if (inputs.size() != 1 || resultTypes.empty())
+      return {};
+    if (!isPyRuntimeBridgeType(originalType))
+      return {};
+    auto cast = builder.create<mlir::UnrealizedConversionCastOp>(
+        loc, resultTypes, inputs);
+    mlir::SmallVector<mlir::Value> results;
+    results.append(cast.getResults().begin(), cast.getResults().end());
+    return results;
+  };
+
   addSourceMaterialization(materializeBridge);
   addTargetMaterialization(materializeBridge);
+  addTargetMaterialization(materializeTargetBridge);
 }
 
 RuntimeAPI::RuntimeAPI(mlir::ModuleOp module,

@@ -49,6 +49,20 @@ _mlir_ciface_LyListF64Bits_Repr(UnrankedMemRefType<std::int64_t> *memref);
 LyUnicodeObject *
 _mlir_ciface_LyListPtr_Repr(UnrankedMemRefType<std::int64_t> *memref,
                             LyUnicodeObject *(*repr_item)(void *));
+LyUnicodeObject *LyTupleI64_Repr(UnrankedMemRefType<std::int64_t> *memref);
+LyUnicodeObject *LyTupleBool_Repr(UnrankedMemRefType<std::int64_t> *memref);
+LyUnicodeObject *LyTupleF64Bits_Repr(UnrankedMemRefType<std::int64_t> *memref);
+LyUnicodeObject *LyTuplePtr_Repr(UnrankedMemRefType<std::int64_t> *memref,
+                                 LyUnicodeObject *(*repr_item)(void *));
+LyUnicodeObject *
+_mlir_ciface_LyTupleI64_Repr(UnrankedMemRefType<std::int64_t> *memref);
+LyUnicodeObject *
+_mlir_ciface_LyTupleBool_Repr(UnrankedMemRefType<std::int64_t> *memref);
+LyUnicodeObject *
+_mlir_ciface_LyTupleF64Bits_Repr(UnrankedMemRefType<std::int64_t> *memref);
+LyUnicodeObject *
+_mlir_ciface_LyTuplePtr_Repr(UnrankedMemRefType<std::int64_t> *memref,
+                             LyUnicodeObject *(*repr_item)(void *));
 
 LyLongObject *LyLong_FromI64(std::int64_t value);
 std::int64_t LyLong_AsI64(LyObject *object);

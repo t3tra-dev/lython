@@ -18,31 +18,34 @@ namespace {
 
 enum class TypedContainerStorage {
   Unsupported,
-  MemRefI64Slots,
+  PackedI64BootstrapSlots,
 };
 
 static TypedContainerStorage classifyTypedListStorage(ListType listType) {
   if (!listType)
     return TypedContainerStorage::Unsupported;
-  if (isMemRefSlotCompatibleScalarType(listType.getElementType()))
-    return TypedContainerStorage::MemRefI64Slots;
+  if (usesPackedI64BootstrapSlot(listType.getElementType()))
+    return TypedContainerStorage::PackedI64BootstrapSlots;
   return TypedContainerStorage::Unsupported;
 }
 
 static bool shouldUseMemRefListStorage(ListType listType) {
   return classifyTypedListStorage(listType) ==
-         TypedContainerStorage::MemRefI64Slots;
+         TypedContainerStorage::PackedI64BootstrapSlots;
 }
 
-static constexpr int64_t kTypedListHeaderSlots = 4;
 static constexpr int64_t kTypedListDefaultCapacity = 64;
+static constexpr int64_t kTypedListSizeSlot = 0;
+static constexpr int64_t kTypedListLockSlot = 2;
+static constexpr int64_t kTypedListRefcountSlot = 3;
 
 struct ListNewLowering : public OpConversionPattern<ListNewOp> {
   using OpConversionPattern<ListNewOp>::OpConversionPattern;
 
   LogicalResult
-  matchAndRewrite(ListNewOp op, OpAdaptor adaptor,
+  matchAndRewrite(ListNewOp op, OneToNOpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    (void)adaptor;
     ModuleOp module = op->getParentOfType<ModuleOp>();
     if (!module)
       return failure();
@@ -53,19 +56,22 @@ struct ListNewLowering : public OpConversionPattern<ListNewOp> {
     if (!listType)
       return failure();
 
-    Type resultType = typeConverter->convertType(op.getResult().getType());
-    if (!resultType)
+    SmallVector<Type, 2> resultTypes;
+    if (failed(typeConverter->convertType(op.getResult().getType(),
+                                          resultTypes)) ||
+        resultTypes.size() != 2)
       return failure();
 
     if (shouldUseMemRefListStorage(listType)) {
-      auto memrefType = dyn_cast<MemRefType>(resultType);
-      if (!memrefType)
+      auto headerType = dyn_cast<MemRefType>(resultTypes[0]);
+      auto itemsType = dyn_cast<MemRefType>(resultTypes[1]);
+      if (!headerType || !itemsType)
         return failure();
-      Value allocSize = createIndexConstant(op.getLoc(), rewriter,
-                                            kTypedListHeaderSlots +
-                                                kTypedListDefaultCapacity);
-      auto list = rewriter.create<memref::AllocaOp>(op.getLoc(), memrefType,
-                                                    ValueRange{allocSize});
+      auto header = rewriter.create<memref::AllocaOp>(op.getLoc(), headerType);
+      Value allocSize =
+          createIndexConstant(op.getLoc(), rewriter, kTypedListDefaultCapacity);
+      auto items = rewriter.create<memref::AllocaOp>(op.getLoc(), itemsType,
+                                                     ValueRange{allocSize});
       Value zeroIndex = createIndexConstant(op.getLoc(), rewriter, 0);
       Value oneIndex = createIndexConstant(op.getLoc(), rewriter, 1);
       Value twoIndex = createIndexConstant(op.getLoc(), rewriter, 2);
@@ -73,11 +79,13 @@ struct ListNewLowering : public OpConversionPattern<ListNewOp> {
       Value zero = createI64Constant(op.getLoc(), rewriter, 0);
       Value capacity =
           createI64Constant(op.getLoc(), rewriter, kTypedListDefaultCapacity);
-      rewriter.create<memref::StoreOp>(op.getLoc(), zero, list, zeroIndex);
-      rewriter.create<memref::StoreOp>(op.getLoc(), capacity, list, oneIndex);
-      rewriter.create<memref::StoreOp>(op.getLoc(), zero, list, twoIndex);
-      rewriter.create<memref::StoreOp>(op.getLoc(), zero, list, threeIndex);
-      rewriter.replaceOp(op, list.getResult());
+      rewriter.create<memref::StoreOp>(op.getLoc(), zero, header, zeroIndex);
+      rewriter.create<memref::StoreOp>(op.getLoc(), capacity, header, oneIndex);
+      rewriter.create<memref::StoreOp>(op.getLoc(), zero, header, twoIndex);
+      rewriter.create<memref::StoreOp>(op.getLoc(), zero, header, threeIndex);
+      rewriter.replaceOpWithMultiple(
+          op, ArrayRef<ValueRange>{
+                  ValueRange{header.getResult(), items.getResult()}});
       return success();
     }
     return rewriter.notifyMatchFailure(
@@ -112,40 +120,66 @@ struct ListAppendLowering : public OpConversionPattern<ListAppendOp> {
   using OpConversionPattern<ListAppendOp>::OpConversionPattern;
 
   LogicalResult
-  matchAndRewrite(ListAppendOp op, OpAdaptor adaptor,
+  matchAndRewrite(ListAppendOp op, OneToNOpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     ModuleOp module = op->getParentOfType<ModuleOp>();
     if (!module)
       return failure();
     auto listType = dyn_cast<ListType>(op.getList().getType());
     if (listType && shouldUseMemRefListStorage(listType)) {
+      ValueRange list = adaptor.getList();
+      if (list.size() != 2)
+        return failure();
       auto *typeConverter =
           static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
-      FailureOr<Value> stored = packTypedSlot(op.getLoc(), adaptor.getValue(),
-                                              listType.getElementType(), module,
-                                              rewriter, *typeConverter);
-      if (failed(stored))
+      Value stored = materializeTypedContainerStorageValue(
+          op.getLoc(), adaptor.getValue().front(), listType.getElementType(),
+          module, rewriter, *typeConverter);
+      if (!stored)
         return failure();
       bool consumeValue =
           static_cast<bool>(op->getAttr("lython.consume_value"));
       if (!consumeValue)
         if (auto classType = dyn_cast<ClassType>(listType.getElementType()))
-          emitClassSlotRefcount(op.getLoc(), *stored, classType, module,
+          emitClassSlotRefcount(op.getLoc(), stored, classType, module,
                                 rewriter, "incref");
-      Value sizeIndex = createIndexConstant(op.getLoc(), rewriter, 0);
-      Value sizeValue = rewriter.create<memref::LoadOp>(
-          op.getLoc(), adaptor.getList(), sizeIndex);
-      Value sizeAsIndex = rewriter.create<arith::IndexCastOp>(
-          op.getLoc(), rewriter.getIndexType(), sizeValue);
-      Value itemIndex = rewriter.create<arith::AddIOp>(
-          op.getLoc(), sizeAsIndex,
-          createIndexConstant(op.getLoc(), rewriter, kTypedListHeaderSlots));
-      rewriter.create<memref::StoreOp>(op.getLoc(), *stored, adaptor.getList(),
-                                       itemIndex);
-      Value nextSize = rewriter.create<arith::AddIOp>(
-          op.getLoc(), sizeValue, createI64Constant(op.getLoc(), rewriter, 1));
-      rewriter.create<memref::StoreOp>(op.getLoc(), nextSize, adaptor.getList(),
-                                       sizeIndex);
+      auto emitAppendBody = [&]() {
+        Value sizeIndex =
+            createIndexConstant(op.getLoc(), rewriter, kTypedListSizeSlot);
+        Value sizeValue =
+            rewriter.create<memref::LoadOp>(op.getLoc(), list[0], sizeIndex);
+        Value sizeAsIndex = rewriter.create<arith::IndexCastOp>(
+            op.getLoc(), rewriter.getIndexType(), sizeValue);
+        rewriter.create<memref::StoreOp>(op.getLoc(), stored, list[1],
+                                         sizeAsIndex);
+        Value nextSize = rewriter.create<arith::AddIOp>(
+            op.getLoc(), sizeValue,
+            createI64Constant(op.getLoc(), rewriter, 1));
+        rewriter.create<memref::StoreOp>(op.getLoc(), nextSize, list[0],
+                                         sizeIndex);
+      };
+      if (isMutableContainerArgument(op, op.getList())) {
+        Value isManaged = emitManagedContainerPredicate(
+            op.getLoc(), list[0], kTypedListRefcountSlot, rewriter);
+        auto ifOp = rewriter.create<scf::IfOp>(op.getLoc(), isManaged,
+                                               /*withElseRegion=*/true);
+        {
+          OpBuilder::InsertionGuard guard(rewriter);
+          rewriter.setInsertionPointToStart(ifOp.thenBlock());
+          emitManagedContainerLockAcquire(op.getLoc(), list[0],
+                                          kTypedListLockSlot, rewriter);
+          emitAppendBody();
+          emitManagedContainerLockRelease(op.getLoc(), list[0],
+                                          kTypedListLockSlot, rewriter);
+        }
+        {
+          OpBuilder::InsertionGuard guard(rewriter);
+          rewriter.setInsertionPointToStart(ifOp.elseBlock());
+          emitAppendBody();
+        }
+      } else {
+        emitAppendBody();
+      }
       rewriter.eraseOp(op);
       return success();
     }
@@ -158,102 +192,118 @@ struct ListRemoveLowering : public OpConversionPattern<ListRemoveOp> {
   using OpConversionPattern<ListRemoveOp>::OpConversionPattern;
 
   LogicalResult
-  matchAndRewrite(ListRemoveOp op, OpAdaptor adaptor,
+  matchAndRewrite(ListRemoveOp op, OneToNOpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     ModuleOp module = op->getParentOfType<ModuleOp>();
     if (!module)
       return failure();
     auto listType = dyn_cast<ListType>(op.getList().getType());
     if (listType && shouldUseMemRefListStorage(listType)) {
+      ValueRange list = adaptor.getList();
+      if (list.size() != 2)
+        return failure();
       auto *typeConverter =
           static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
-      FailureOr<Value> target = packTypedSlot(op.getLoc(), adaptor.getValue(),
-                                              listType.getElementType(), module,
-                                              rewriter, *typeConverter);
-      if (failed(target))
+      Value target = materializeTypedContainerStorageValue(
+          op.getLoc(), adaptor.getValue().front(), listType.getElementType(),
+          module, rewriter, *typeConverter);
+      if (!target)
         return failure();
 
-      Value sizeIndex = createIndexConstant(op.getLoc(), rewriter, 0);
-      Value sizeValue = rewriter.create<memref::LoadOp>(
-          op.getLoc(), adaptor.getList(), sizeIndex);
-      Value sizeAsIndex = rewriter.create<arith::IndexCastOp>(
-          op.getLoc(), rewriter.getIndexType(), sizeValue);
-      Value lower = createIndexConstant(op.getLoc(), rewriter, 0);
-      Value step = createIndexConstant(op.getLoc(), rewriter, 1);
-      Value foundInit = rewriter.create<arith::ConstantIntOp>(
-          op.getLoc(), false, rewriter.getI1Type());
+      auto emitRemoveBody = [&]() {
+        Value sizeIndex =
+            createIndexConstant(op.getLoc(), rewriter, kTypedListSizeSlot);
+        Value sizeValue =
+            rewriter.create<memref::LoadOp>(op.getLoc(), list[0], sizeIndex);
+        Value sizeAsIndex = rewriter.create<arith::IndexCastOp>(
+            op.getLoc(), rewriter.getIndexType(), sizeValue);
+        Value lower = createIndexConstant(op.getLoc(), rewriter, 0);
+        Value step = createIndexConstant(op.getLoc(), rewriter, 1);
+        Value foundInit = rewriter.create<arith::ConstantIntOp>(
+            op.getLoc(), false, rewriter.getI1Type());
 
-      auto findLoop = rewriter.create<scf::ForOp>(
-          op.getLoc(), lower, sizeAsIndex, step, ValueRange{foundInit, lower});
-      {
-        OpBuilder::InsertionGuard guard(rewriter);
-        rewriter.setInsertionPointToStart(findLoop.getBody());
-        Value iv = findLoop.getInductionVar();
-        Value found = findLoop.getRegionIterArgs()[0];
-        Value foundIndex = findLoop.getRegionIterArgs()[1];
-        Value itemIndex = rewriter.create<arith::AddIOp>(
-            op.getLoc(),
-            createIndexConstant(op.getLoc(), rewriter, kTypedListHeaderSlots),
-            iv);
-        Value item = rewriter.create<memref::LoadOp>(
-            op.getLoc(), adaptor.getList(), itemIndex);
-        Value same = rewriter.create<arith::CmpIOp>(
-            op.getLoc(), arith::CmpIPredicate::eq, item, *target);
-        Value notFound = rewriter.create<arith::XOrIOp>(
-            op.getLoc(), found,
-            rewriter.create<arith::ConstantIntOp>(op.getLoc(), true,
-                                                  rewriter.getI1Type()));
-        Value match =
-            rewriter.create<arith::AndIOp>(op.getLoc(), notFound, same);
-        Value nextFound =
-            rewriter.create<arith::OrIOp>(op.getLoc(), found, match);
-        Value nextIndex = rewriter.create<arith::SelectOp>(op.getLoc(), match,
-                                                           iv, foundIndex);
-        rewriter.create<scf::YieldOp>(op.getLoc(),
-                                      ValueRange{nextFound, nextIndex});
-      }
-
-      auto ifOp = rewriter.create<scf::IfOp>(op.getLoc(), findLoop.getResult(0),
-                                             /*withElseRegion=*/false);
-      {
-        OpBuilder::InsertionGuard guard(rewriter);
-        rewriter.setInsertionPointToStart(ifOp.thenBlock());
-        if (auto classType = dyn_cast<ClassType>(listType.getElementType())) {
-          Value removedIndex = rewriter.create<arith::AddIOp>(
-              op.getLoc(),
-              createIndexConstant(op.getLoc(), rewriter, kTypedListHeaderSlots),
-              findLoop.getResult(1));
-          Value removed = rewriter.create<memref::LoadOp>(
-              op.getLoc(), adaptor.getList(), removedIndex);
-          emitClassSlotRefcount(op.getLoc(), removed, classType, module,
-                                rewriter, "decref");
-        }
-        Value shiftLower = rewriter.create<arith::AddIOp>(
-            op.getLoc(), findLoop.getResult(1), step);
-        auto shiftLoop = rewriter.create<scf::ForOp>(op.getLoc(), shiftLower,
-                                                     sizeAsIndex, step);
+        auto findLoop =
+            rewriter.create<scf::ForOp>(op.getLoc(), lower, sizeAsIndex, step,
+                                        ValueRange{foundInit, lower});
         {
-          OpBuilder::InsertionGuard shiftGuard(rewriter);
-          rewriter.setInsertionPointToStart(shiftLoop.getBody());
-          Value iv = shiftLoop.getInductionVar();
-          Value srcIndex = rewriter.create<arith::AddIOp>(
-              op.getLoc(),
-              createIndexConstant(op.getLoc(), rewriter, kTypedListHeaderSlots),
-              iv);
-          Value dstIndex = rewriter.create<arith::AddIOp>(
-              op.getLoc(),
-              createIndexConstant(op.getLoc(), rewriter, kTypedListHeaderSlots),
-              rewriter.create<arith::SubIOp>(op.getLoc(), iv, step));
-          Value item = rewriter.create<memref::LoadOp>(
-              op.getLoc(), adaptor.getList(), srcIndex);
-          rewriter.create<memref::StoreOp>(op.getLoc(), item, adaptor.getList(),
-                                           dstIndex);
+          OpBuilder::InsertionGuard guard(rewriter);
+          rewriter.setInsertionPointToStart(findLoop.getBody());
+          Value iv = findLoop.getInductionVar();
+          Value found = findLoop.getRegionIterArgs()[0];
+          Value foundIndex = findLoop.getRegionIterArgs()[1];
+          Value item =
+              rewriter.create<memref::LoadOp>(op.getLoc(), list[1], iv);
+          Value same = rewriter.create<arith::CmpIOp>(
+              op.getLoc(), arith::CmpIPredicate::eq, item, target);
+          Value notFound = rewriter.create<arith::XOrIOp>(
+              op.getLoc(), found,
+              rewriter.create<arith::ConstantIntOp>(op.getLoc(), true,
+                                                    rewriter.getI1Type()));
+          Value match =
+              rewriter.create<arith::AndIOp>(op.getLoc(), notFound, same);
+          Value nextFound =
+              rewriter.create<arith::OrIOp>(op.getLoc(), found, match);
+          Value nextIndex = rewriter.create<arith::SelectOp>(op.getLoc(), match,
+                                                             iv, foundIndex);
+          rewriter.create<scf::YieldOp>(op.getLoc(),
+                                        ValueRange{nextFound, nextIndex});
         }
-        Value nextSize = rewriter.create<arith::SubIOp>(
-            op.getLoc(), sizeValue,
-            createI64Constant(op.getLoc(), rewriter, 1));
-        rewriter.create<memref::StoreOp>(op.getLoc(), nextSize,
-                                         adaptor.getList(), sizeIndex);
+
+        auto ifOp =
+            rewriter.create<scf::IfOp>(op.getLoc(), findLoop.getResult(0),
+                                       /*withElseRegion=*/false);
+        {
+          OpBuilder::InsertionGuard guard(rewriter);
+          rewriter.setInsertionPointToStart(ifOp.thenBlock());
+          if (auto classType = dyn_cast<ClassType>(listType.getElementType())) {
+            Value removed = rewriter.create<memref::LoadOp>(
+                op.getLoc(), list[1], findLoop.getResult(1));
+            emitClassSlotRefcount(op.getLoc(), removed, classType, module,
+                                  rewriter, "decref");
+          }
+          Value shiftLower = rewriter.create<arith::AddIOp>(
+              op.getLoc(), findLoop.getResult(1), step);
+          auto shiftLoop = rewriter.create<scf::ForOp>(op.getLoc(), shiftLower,
+                                                       sizeAsIndex, step);
+          {
+            OpBuilder::InsertionGuard shiftGuard(rewriter);
+            rewriter.setInsertionPointToStart(shiftLoop.getBody());
+            Value iv = shiftLoop.getInductionVar();
+            Value dstIndex =
+                rewriter.create<arith::SubIOp>(op.getLoc(), iv, step);
+            Value item =
+                rewriter.create<memref::LoadOp>(op.getLoc(), list[1], iv);
+            rewriter.create<memref::StoreOp>(op.getLoc(), item, list[1],
+                                             dstIndex);
+          }
+          Value nextSize = rewriter.create<arith::SubIOp>(
+              op.getLoc(), sizeValue,
+              createI64Constant(op.getLoc(), rewriter, 1));
+          rewriter.create<memref::StoreOp>(op.getLoc(), nextSize, list[0],
+                                           sizeIndex);
+        }
+      };
+      if (isMutableContainerArgument(op, op.getList())) {
+        Value isManaged = emitManagedContainerPredicate(
+            op.getLoc(), list[0], kTypedListRefcountSlot, rewriter);
+        auto ifOp = rewriter.create<scf::IfOp>(op.getLoc(), isManaged,
+                                               /*withElseRegion=*/true);
+        {
+          OpBuilder::InsertionGuard guard(rewriter);
+          rewriter.setInsertionPointToStart(ifOp.thenBlock());
+          emitManagedContainerLockAcquire(op.getLoc(), list[0],
+                                          kTypedListLockSlot, rewriter);
+          emitRemoveBody();
+          emitManagedContainerLockRelease(op.getLoc(), list[0],
+                                          kTypedListLockSlot, rewriter);
+        }
+        {
+          OpBuilder::InsertionGuard guard(rewriter);
+          rewriter.setInsertionPointToStart(ifOp.elseBlock());
+          emitRemoveBody();
+        }
+      } else {
+        emitRemoveBody();
       }
       rewriter.eraseOp(op);
       return success();
@@ -267,7 +317,7 @@ struct ListGetLowering : public OpConversionPattern<ListGetOp> {
   using OpConversionPattern<ListGetOp>::OpConversionPattern;
 
   LogicalResult
-  matchAndRewrite(ListGetOp op, OpAdaptor adaptor,
+  matchAndRewrite(ListGetOp op, OneToNOpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     ModuleOp module = op->getParentOfType<ModuleOp>();
     if (!module)
@@ -276,24 +326,24 @@ struct ListGetLowering : public OpConversionPattern<ListGetOp> {
         static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
     auto listType = dyn_cast<ListType>(op.getList().getType());
     if (listType && shouldUseMemRefListStorage(listType)) {
-      Value index = normalizeListIndex(op.getLoc(), adaptor.getIndex(),
+      ValueRange list = adaptor.getList();
+      if (list.size() != 2)
+        return failure();
+      Value index = normalizeListIndex(op.getLoc(), adaptor.getIndex().front(),
                                        op.getIndex().getType(), module,
                                        rewriter, *typeConverter);
       if (!index)
         return failure();
       Value indexAsIndex = rewriter.create<arith::IndexCastOp>(
           op.getLoc(), rewriter.getIndexType(), index);
-      Value itemIndex = rewriter.create<arith::AddIOp>(
-          op.getLoc(), indexAsIndex,
-          createIndexConstant(op.getLoc(), rewriter, kTypedListHeaderSlots));
-      Value loaded = rewriter.create<memref::LoadOp>(
-          op.getLoc(), adaptor.getList(), itemIndex);
+      Value loaded =
+          rewriter.create<memref::LoadOp>(op.getLoc(), list[1], indexAsIndex);
       if (auto classType = dyn_cast<ClassType>(listType.getElementType()))
         emitClassSlotRefcount(op.getLoc(), loaded, classType, module, rewriter,
                               "incref");
-      FailureOr<Value> boxed =
-          boxTypedSlot(op.getLoc(), loaded, listType.getElementType(), module,
-                       rewriter, *typeConverter);
+      FailureOr<Value> boxed = boxTypedContainerStorageValue(
+          op.getLoc(), loaded, listType.getElementType(), module, rewriter,
+          *typeConverter);
       if (failed(boxed))
         return failure();
       rewriter.replaceOp(op, *boxed);

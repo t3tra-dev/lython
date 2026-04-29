@@ -76,6 +76,16 @@ void appendTensorDynamic(std::string &out, const DynamicMemRefType<T> &memref,
   out.push_back(']');
 }
 
+std::string formatPythonFloat(double value) {
+  std::ostringstream stream;
+  stream.setf(std::ios::fmtflags(0), std::ios::floatfield);
+  stream << std::setprecision(12) << value;
+  std::string result = stream.str();
+  if (std::isfinite(value) && result.find_first_of(".eE") == std::string::npos)
+    result.append(".0");
+  return result;
+}
+
 template <typename Format>
 LyUnicodeObject *reprPackedListI64(UnrankedMemRefType<std::int64_t> *memref,
                                    Format format) {
@@ -95,6 +105,30 @@ LyUnicodeObject *reprPackedListI64(UnrankedMemRefType<std::int64_t> *memref,
     format(out, loadSlot(4 + i));
   }
   out.push_back(']');
+  return LyUnicode_FromUTF8(out.c_str(), out.size());
+}
+
+template <typename Format>
+LyUnicodeObject *reprPackedTupleI64(UnrankedMemRefType<std::int64_t> *memref,
+                                    Format format) {
+  DynamicMemRefType<std::int64_t> dyn(*memref);
+  auto loadSlot = [&](std::int64_t slot) -> std::int64_t {
+    return dyn.data[dyn.offset + slot * dyn.strides[0]];
+  };
+
+  std::int64_t size = loadSlot(0);
+  std::string out;
+  out.reserve(2 +
+              static_cast<std::size_t>(std::max<std::int64_t>(size, 0)) * 4);
+  out.push_back('(');
+  for (std::int64_t i = 0; i < size; ++i) {
+    if (i != 0)
+      out.append(", ");
+    format(out, loadSlot(3 + i));
+  }
+  if (size == 1)
+    out.push_back(',');
+  out.push_back(')');
   return LyUnicode_FromUTF8(out.c_str(), out.size());
 }
 
@@ -189,16 +223,46 @@ LyUnicodeObject *LyListF64Bits_Repr(UnrankedMemRefType<std::int64_t> *memref) {
   return reprPackedListI64(memref, [](std::string &out, std::int64_t bits) {
     double value;
     std::memcpy(&value, &bits, sizeof(value));
-    std::ostringstream stream;
-    stream.setf(std::ios::fmtflags(0), std::ios::floatfield);
-    stream << std::setprecision(12) << value;
-    out.append(stream.str());
+    out.append(formatPythonFloat(value));
   });
 }
 
 LyUnicodeObject *LyListPtr_Repr(UnrankedMemRefType<std::int64_t> *memref,
                                 LyUnicodeObject *(*repr_item)(void *)) {
   return reprPackedListI64(memref, [&](std::string &out, std::int64_t bits) {
+    auto *object = reinterpret_cast<void *>(static_cast<std::uintptr_t>(bits));
+    LyUnicodeObject *repr = repr_item ? repr_item(object) : nullptr;
+    if (!repr)
+      return;
+    if (repr->utf8_data)
+      out.append(repr->utf8_data, repr->utf8_length);
+    Ly_DecRef(reinterpret_cast<LyObject *>(repr));
+  });
+}
+
+LyUnicodeObject *LyTupleI64_Repr(UnrankedMemRefType<std::int64_t> *memref) {
+  return reprPackedTupleI64(memref, [](std::string &out, std::int64_t value) {
+    out.append(std::to_string(value));
+  });
+}
+
+LyUnicodeObject *LyTupleBool_Repr(UnrankedMemRefType<std::int64_t> *memref) {
+  return reprPackedTupleI64(memref, [](std::string &out, std::int64_t value) {
+    out.append(value ? "True" : "False");
+  });
+}
+
+LyUnicodeObject *LyTupleF64Bits_Repr(UnrankedMemRefType<std::int64_t> *memref) {
+  return reprPackedTupleI64(memref, [](std::string &out, std::int64_t bits) {
+    double value;
+    std::memcpy(&value, &bits, sizeof(value));
+    out.append(formatPythonFloat(value));
+  });
+}
+
+LyUnicodeObject *LyTuplePtr_Repr(UnrankedMemRefType<std::int64_t> *memref,
+                                 LyUnicodeObject *(*repr_item)(void *)) {
+  return reprPackedTupleI64(memref, [&](std::string &out, std::int64_t bits) {
     auto *object = reinterpret_cast<void *>(static_cast<std::uintptr_t>(bits));
     LyUnicodeObject *repr = repr_item ? repr_item(object) : nullptr;
     if (!repr)
@@ -228,6 +292,27 @@ LyUnicodeObject *
 _mlir_ciface_LyListPtr_Repr(UnrankedMemRefType<std::int64_t> *memref,
                             LyUnicodeObject *(*repr_item)(void *)) {
   return LyListPtr_Repr(memref, repr_item);
+}
+
+LyUnicodeObject *
+_mlir_ciface_LyTupleI64_Repr(UnrankedMemRefType<std::int64_t> *memref) {
+  return LyTupleI64_Repr(memref);
+}
+
+LyUnicodeObject *
+_mlir_ciface_LyTupleBool_Repr(UnrankedMemRefType<std::int64_t> *memref) {
+  return LyTupleBool_Repr(memref);
+}
+
+LyUnicodeObject *
+_mlir_ciface_LyTupleF64Bits_Repr(UnrankedMemRefType<std::int64_t> *memref) {
+  return LyTupleF64Bits_Repr(memref);
+}
+
+LyUnicodeObject *
+_mlir_ciface_LyTuplePtr_Repr(UnrankedMemRefType<std::int64_t> *memref,
+                             LyUnicodeObject *(*repr_item)(void *)) {
+  return LyTuplePtr_Repr(memref, repr_item);
 }
 
 LyFunctionObject *Ly_GetBuiltinPrint() {

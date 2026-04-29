@@ -17,18 +17,34 @@ namespace {
 
 enum class TypedDictStorage {
   Unsupported,
-  MemRefSlots,
+  TypedMemRefs,
 };
 
-static constexpr int64_t kTypedDictHeaderSlots = 5;
 static constexpr int64_t kTypedDictDefaultCapacity = 64;
+static constexpr int64_t kTypedDictSizeSlot = 0;
+static constexpr int64_t kTypedDictLockSlot = 3;
+static constexpr int64_t kTypedDictRefcountSlot = 4;
 
 static Value createProbeSlot(Location loc, OpBuilder &builder, Value keySlot,
                              Value probeIndex) {
+  Value keyBits = keySlot;
+  if (keyBits.getType() == builder.getF64Type())
+    keyBits =
+        builder.create<arith::BitcastOp>(loc, builder.getI64Type(), keyBits);
+  if (auto intType = dyn_cast<IntegerType>(keyBits.getType())) {
+    if (intType.getWidth() < 64)
+      keyBits =
+          builder.create<arith::ExtUIOp>(loc, builder.getI64Type(), keyBits);
+    else if (intType.getWidth() > 64)
+      keyBits =
+          builder.create<arith::TruncIOp>(loc, builder.getI64Type(), keyBits);
+  }
+  if (keyBits.getType() != builder.getI64Type())
+    return {};
   Value probeI64 =
       builder.create<arith::IndexCastOp>(loc, builder.getI64Type(), probeIndex);
   Value capacity = createI64Constant(loc, builder, kTypedDictDefaultCapacity);
-  Value mixed = builder.create<arith::AddIOp>(loc, keySlot, probeI64);
+  Value mixed = builder.create<arith::AddIOp>(loc, keyBits, probeI64);
   Value slotI64 = builder.create<arith::RemUIOp>(loc, mixed, capacity);
   return builder.create<arith::IndexCastOp>(loc, builder.getIndexType(),
                                             slotI64);
@@ -37,10 +53,33 @@ static Value createProbeSlot(Location loc, OpBuilder &builder, Value keySlot,
 static TypedDictStorage classifyTypedDictStorage(DictType dictType) {
   if (!dictType)
     return TypedDictStorage::Unsupported;
-  if (!isMemRefSlotCompatibleScalarType(dictType.getKeyType()) ||
-      !isMemRefSlotCompatibleScalarType(dictType.getValueType()))
+  if (!isTypedContainerSlotSupported(dictType.getKeyType()) ||
+      !isTypedContainerSlotSupported(dictType.getValueType()))
     return TypedDictStorage::Unsupported;
-  return TypedDictStorage::MemRefSlots;
+  return TypedDictStorage::TypedMemRefs;
+}
+
+static Value compareDictStorageEqual(Location loc, Value lhs, Value rhs,
+                                     OpBuilder &builder) {
+  if (lhs.getType() != rhs.getType())
+    return {};
+  if (isa<FloatType>(lhs.getType()))
+    return builder.create<arith::CmpFOp>(loc, arith::CmpFPredicate::OEQ, lhs,
+                                         rhs);
+  if (isa<IntegerType>(lhs.getType()))
+    return builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, lhs,
+                                         rhs);
+  return {};
+}
+
+static Value createStorageZero(Location loc, Type storageType,
+                               OpBuilder &builder) {
+  if (auto intType = dyn_cast<IntegerType>(storageType))
+    return builder.create<arith::ConstantIntOp>(loc, 0, intType);
+  if (storageType == builder.getF64Type())
+    return builder.create<arith::ConstantFloatOp>(loc, llvm::APFloat(0.0),
+                                                  builder.getF64Type());
+  return {};
 }
 
 struct DictEmptyLowering : public OpConversionPattern<DictEmptyOp> {
@@ -48,8 +87,9 @@ struct DictEmptyLowering : public OpConversionPattern<DictEmptyOp> {
       : OpConversionPattern<DictEmptyOp>(converter, ctx) {}
 
   LogicalResult
-  matchAndRewrite(DictEmptyOp op, OpAdaptor adaptor,
+  matchAndRewrite(DictEmptyOp op, OneToNOpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    (void)adaptor;
     rewriter.setInsertionPoint(op);
     ModuleOp module = op->getParentOfType<ModuleOp>();
     if (!module)
@@ -57,35 +97,51 @@ struct DictEmptyLowering : public OpConversionPattern<DictEmptyOp> {
     auto *converter =
         static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
     if (auto dictType = dyn_cast<DictType>(op.getResult().getType())) {
-      if (classifyTypedDictStorage(dictType) == TypedDictStorage::MemRefSlots) {
-        Type resultType = converter->convertType(op.getResult().getType());
-        auto memrefType = dyn_cast_or_null<MemRefType>(resultType);
-        if (!memrefType)
+      if (classifyTypedDictStorage(dictType) ==
+          TypedDictStorage::TypedMemRefs) {
+        SmallVector<Type, 4> resultTypes;
+        if (failed(converter->convertType(op.getResult().getType(),
+                                          resultTypes)) ||
+            resultTypes.size() != 4)
           return failure();
-        Value allocSize = createIndexConstant(
-            op.getLoc(), rewriter,
-            kTypedDictHeaderSlots + kTypedDictDefaultCapacity * 3);
-        auto dict = rewriter.create<memref::AllocaOp>(op.getLoc(), memrefType,
-                                                      ValueRange{allocSize});
+        auto headerType = dyn_cast<MemRefType>(resultTypes[0]);
+        auto keysType = dyn_cast<MemRefType>(resultTypes[1]);
+        auto valuesType = dyn_cast<MemRefType>(resultTypes[2]);
+        auto statesType = dyn_cast<MemRefType>(resultTypes[3]);
+        if (!headerType || !keysType || !valuesType || !statesType)
+          return failure();
+
+        auto header =
+            rewriter.create<memref::AllocaOp>(op.getLoc(), headerType);
+        Value capacityIndex = createIndexConstant(op.getLoc(), rewriter,
+                                                  kTypedDictDefaultCapacity);
+        auto keys = rewriter.create<memref::AllocaOp>(
+            op.getLoc(), keysType, ValueRange{capacityIndex});
+        auto values = rewriter.create<memref::AllocaOp>(
+            op.getLoc(), valuesType, ValueRange{capacityIndex});
+        auto states = rewriter.create<memref::AllocaOp>(
+            op.getLoc(), statesType, ValueRange{capacityIndex});
+
         Value zero = createI64Constant(op.getLoc(), rewriter, 0);
         Value capacity =
             createI64Constant(op.getLoc(), rewriter, kTypedDictDefaultCapacity);
-        for (int64_t slot = 0; slot < kTypedDictHeaderSlots; ++slot) {
+        for (int64_t slot = 0; slot < 5; ++slot) {
           Value value = slot == 1 ? capacity : zero;
           rewriter.create<memref::StoreOp>(
-              op.getLoc(), value, dict,
+              op.getLoc(), value, header,
               createIndexConstant(op.getLoc(), rewriter, slot));
         }
-        Value stateBase = createIndexConstant(
-            op.getLoc(), rewriter,
-            kTypedDictHeaderSlots + kTypedDictDefaultCapacity * 2);
+        Value zeroState = rewriter.create<arith::ConstantIntOp>(
+            op.getLoc(), 0, rewriter.getI8Type());
         for (int64_t slot = 0; slot < kTypedDictDefaultCapacity; ++slot) {
-          Value stateIndex = rewriter.create<arith::AddIOp>(
-              op.getLoc(), stateBase,
+          rewriter.create<memref::StoreOp>(
+              op.getLoc(), zeroState, states,
               createIndexConstant(op.getLoc(), rewriter, slot));
-          rewriter.create<memref::StoreOp>(op.getLoc(), zero, dict, stateIndex);
         }
-        rewriter.replaceOp(op, dict.getResult());
+        rewriter.replaceOpWithMultiple(
+            op, ArrayRef<ValueRange>{
+                    ValueRange{header.getResult(), keys.getResult(),
+                               values.getResult(), states.getResult()}});
         return success();
       }
     }
@@ -99,7 +155,7 @@ struct DictInsertLowering : public OpConversionPattern<DictInsertOp> {
       : OpConversionPattern<DictInsertOp>(converter, ctx) {}
 
   LogicalResult
-  matchAndRewrite(DictInsertOp op, OpAdaptor adaptor,
+  matchAndRewrite(DictInsertOp op, OneToNOpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     rewriter.setInsertionPoint(op);
     ModuleOp module = op->getParentOfType<ModuleOp>();
@@ -108,15 +164,34 @@ struct DictInsertLowering : public OpConversionPattern<DictInsertOp> {
     auto *converter =
         static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
     if (auto dictType = dyn_cast<DictType>(op.getResult().getType())) {
-      if (classifyTypedDictStorage(dictType) == TypedDictStorage::MemRefSlots) {
-        FailureOr<Value> key =
-            packTypedSlot(op.getLoc(), adaptor.getKey(), dictType.getKeyType(),
-                          module, rewriter, *converter);
-        FailureOr<Value> value = packTypedSlot(op.getLoc(), adaptor.getValue(),
-                                               dictType.getValueType(), module,
-                                               rewriter, *converter);
-        if (failed(key) || failed(value))
+      if (classifyTypedDictStorage(dictType) ==
+          TypedDictStorage::TypedMemRefs) {
+        ValueRange dict = adaptor.getDict();
+        if (dict.size() != 4 || adaptor.getKey().empty() ||
+            adaptor.getValue().empty())
           return failure();
+        Value key = materializeTypedContainerStorageValue(
+            op.getLoc(), adaptor.getKey().front(), dictType.getKeyType(),
+            module, rewriter, *converter);
+        Value value = materializeTypedContainerStorageValue(
+            op.getLoc(), adaptor.getValue().front(), dictType.getValueType(),
+            module, rewriter, *converter);
+        if (!key || !value)
+          return failure();
+
+        Value locked;
+        if (isMutableContainerArgument(op, op.getDict())) {
+          locked = emitManagedContainerPredicate(
+              op.getLoc(), dict[0], kTypedDictRefcountSlot, rewriter);
+          auto lockIf = rewriter.create<scf::IfOp>(op.getLoc(), locked,
+                                                   /*withElseRegion=*/false);
+          {
+            OpBuilder::InsertionGuard guard(rewriter);
+            rewriter.setInsertionPointToStart(lockIf.thenBlock());
+            emitManagedContainerLockAcquire(op.getLoc(), dict[0],
+                                            kTypedDictLockSlot, rewriter);
+          }
+        }
 
         Value lower = createIndexConstant(op.getLoc(), rewriter, 0);
         Value upper = createIndexConstant(op.getLoc(), rewriter,
@@ -127,15 +202,6 @@ struct DictInsertLowering : public OpConversionPattern<DictInsertOp> {
         Value insertedNewInit = rewriter.create<arith::ConstantIntOp>(
             op.getLoc(), false, rewriter.getI1Type());
 
-        Value keyBase =
-            createIndexConstant(op.getLoc(), rewriter, kTypedDictHeaderSlots);
-        Value valueBase = createIndexConstant(op.getLoc(), rewriter,
-                                              kTypedDictHeaderSlots +
-                                                  kTypedDictDefaultCapacity);
-        Value stateBase = createIndexConstant(
-            op.getLoc(), rewriter,
-            kTypedDictHeaderSlots + kTypedDictDefaultCapacity * 2);
-
         auto loop =
             rewriter.create<scf::ForOp>(op.getLoc(), lower, upper, step,
                                         ValueRange{doneInit, insertedNewInit});
@@ -145,25 +211,21 @@ struct DictInsertLowering : public OpConversionPattern<DictInsertOp> {
           Value iv = loop.getInductionVar();
           Value done = loop.getRegionIterArgs()[0];
           Value insertedNew = loop.getRegionIterArgs()[1];
-          Value probeSlot = createProbeSlot(op.getLoc(), rewriter, *key, iv);
-          Value keyIndex =
-              rewriter.create<arith::AddIOp>(op.getLoc(), keyBase, probeSlot);
-          Value valueIndex =
-              rewriter.create<arith::AddIOp>(op.getLoc(), valueBase, probeSlot);
-          Value stateIndex =
-              rewriter.create<arith::AddIOp>(op.getLoc(), stateBase, probeSlot);
-          Value state = rewriter.create<memref::LoadOp>(
-              op.getLoc(), adaptor.getDict(), stateIndex);
-          Value keyAt = rewriter.create<memref::LoadOp>(
-              op.getLoc(), adaptor.getDict(), keyIndex);
+          Value probeSlot = createProbeSlot(op.getLoc(), rewriter, key, iv);
+          Value state =
+              rewriter.create<memref::LoadOp>(op.getLoc(), dict[3], probeSlot);
+          Value keyAt =
+              rewriter.create<memref::LoadOp>(op.getLoc(), dict[1], probeSlot);
+          Value zeroState = rewriter.create<arith::ConstantIntOp>(
+              op.getLoc(), 0, rewriter.getI8Type());
+          Value occupiedState = rewriter.create<arith::ConstantIntOp>(
+              op.getLoc(), 1, rewriter.getI8Type());
           Value empty = rewriter.create<arith::CmpIOp>(
-              op.getLoc(), arith::CmpIPredicate::eq, state,
-              createI64Constant(op.getLoc(), rewriter, 0));
+              op.getLoc(), arith::CmpIPredicate::eq, state, zeroState);
           Value occupied = rewriter.create<arith::CmpIOp>(
-              op.getLoc(), arith::CmpIPredicate::eq, state,
-              createI64Constant(op.getLoc(), rewriter, 1));
-          Value sameKey = rewriter.create<arith::CmpIOp>(
-              op.getLoc(), arith::CmpIPredicate::eq, keyAt, *key);
+              op.getLoc(), arith::CmpIPredicate::eq, state, occupiedState);
+          Value sameKey =
+              compareDictStorageEqual(op.getLoc(), keyAt, key, rewriter);
           Value updateExisting =
               rewriter.create<arith::AndIOp>(op.getLoc(), occupied, sameKey);
           Value writable =
@@ -180,13 +242,36 @@ struct DictInsertLowering : public OpConversionPattern<DictInsertOp> {
           {
             OpBuilder::InsertionGuard ifGuard(rewriter);
             rewriter.setInsertionPointToStart(ifOp.thenBlock());
-            rewriter.create<memref::StoreOp>(op.getLoc(), *key,
-                                             adaptor.getDict(), keyIndex);
-            rewriter.create<memref::StoreOp>(op.getLoc(), *value,
-                                             adaptor.getDict(), valueIndex);
-            rewriter.create<memref::StoreOp>(
-                op.getLoc(), createI64Constant(op.getLoc(), rewriter, 1),
-                adaptor.getDict(), stateIndex);
+            if (auto keyClassType =
+                    dyn_cast<ClassType>(dictType.getKeyType())) {
+              auto retainKey =
+                  rewriter.create<scf::IfOp>(op.getLoc(), empty,
+                                             /*withElseRegion=*/false);
+              OpBuilder::InsertionGuard retainGuard(rewriter);
+              rewriter.setInsertionPointToStart(retainKey.thenBlock());
+              emitClassSlotRefcount(op.getLoc(), key, keyClassType, module,
+                                    rewriter, "incref");
+            }
+            if (auto valueClassType =
+                    dyn_cast<ClassType>(dictType.getValueType())) {
+              emitClassSlotRefcount(op.getLoc(), value, valueClassType, module,
+                                    rewriter, "incref");
+              auto releaseOld =
+                  rewriter.create<scf::IfOp>(op.getLoc(), updateExisting,
+                                             /*withElseRegion=*/false);
+              OpBuilder::InsertionGuard releaseGuard(rewriter);
+              rewriter.setInsertionPointToStart(releaseOld.thenBlock());
+              Value oldValue = rewriter.create<memref::LoadOp>(
+                  op.getLoc(), dict[2], probeSlot);
+              emitClassSlotRefcount(op.getLoc(), oldValue, valueClassType,
+                                    module, rewriter, "decref");
+            }
+            rewriter.create<memref::StoreOp>(op.getLoc(), key, dict[1],
+                                             probeSlot);
+            rewriter.create<memref::StoreOp>(op.getLoc(), value, dict[2],
+                                             probeSlot);
+            rewriter.create<memref::StoreOp>(op.getLoc(), occupiedState,
+                                             dict[3], probeSlot);
           }
 
           Value nextDone =
@@ -199,17 +284,30 @@ struct DictInsertLowering : public OpConversionPattern<DictInsertOp> {
                                         ValueRange{nextDone, nextInsertedNew});
         }
 
-        Value sizeIndex = createIndexConstant(op.getLoc(), rewriter, 0);
-        Value size = rewriter.create<memref::LoadOp>(
-            op.getLoc(), adaptor.getDict(), sizeIndex);
+        Value sizeIndex =
+            createIndexConstant(op.getLoc(), rewriter, kTypedDictSizeSlot);
+        Value size =
+            rewriter.create<memref::LoadOp>(op.getLoc(), dict[0], sizeIndex);
         Value one = createI64Constant(op.getLoc(), rewriter, 1);
         Value incremented =
             rewriter.create<arith::AddIOp>(op.getLoc(), size, one);
         Value nextSize = rewriter.create<arith::SelectOp>(
             op.getLoc(), loop.getResult(1), incremented, size);
-        rewriter.create<memref::StoreOp>(op.getLoc(), nextSize,
-                                         adaptor.getDict(), sizeIndex);
-        rewriter.replaceOp(op, adaptor.getDict());
+        rewriter.create<memref::StoreOp>(op.getLoc(), nextSize, dict[0],
+                                         sizeIndex);
+        if (locked) {
+          auto unlockIf = rewriter.create<scf::IfOp>(op.getLoc(), locked,
+                                                     /*withElseRegion=*/false);
+          {
+            OpBuilder::InsertionGuard guard(rewriter);
+            rewriter.setInsertionPointToStart(unlockIf.thenBlock());
+            emitManagedContainerLockRelease(op.getLoc(), dict[0],
+                                            kTypedDictLockSlot, rewriter);
+          }
+        }
+        rewriter.replaceOpWithMultiple(
+            op, ArrayRef<ValueRange>{
+                    ValueRange{dict[0], dict[1], dict[2], dict[3]}});
         return success();
       }
     }
@@ -223,7 +321,7 @@ struct DictGetLowering : public OpConversionPattern<DictGetOp> {
       : OpConversionPattern<DictGetOp>(converter, ctx) {}
 
   LogicalResult
-  matchAndRewrite(DictGetOp op, OpAdaptor adaptor,
+  matchAndRewrite(DictGetOp op, OneToNOpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     rewriter.setInsertionPoint(op);
     ModuleOp module = op->getParentOfType<ModuleOp>();
@@ -233,13 +331,16 @@ struct DictGetLowering : public OpConversionPattern<DictGetOp> {
         static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
     auto dictType = dyn_cast<DictType>(op.getDict().getType());
     if (!dictType ||
-        classifyTypedDictStorage(dictType) != TypedDictStorage::MemRefSlots)
+        classifyTypedDictStorage(dictType) != TypedDictStorage::TypedMemRefs)
       return failure();
 
-    FailureOr<Value> key =
-        packTypedSlot(op.getLoc(), adaptor.getKey(), dictType.getKeyType(),
-                      module, rewriter, *converter);
-    if (failed(key))
+    ValueRange dict = adaptor.getDict();
+    if (dict.size() != 4 || adaptor.getKey().empty())
+      return failure();
+    Value key = materializeTypedContainerStorageValue(
+        op.getLoc(), adaptor.getKey().front(), dictType.getKeyType(), module,
+        rewriter, *converter);
+    if (!key)
       return failure();
 
     Value lower = createIndexConstant(op.getLoc(), rewriter, 0);
@@ -248,7 +349,14 @@ struct DictGetLowering : public OpConversionPattern<DictGetOp> {
     Value step = createIndexConstant(op.getLoc(), rewriter, 1);
     Value foundInit = rewriter.create<arith::ConstantIntOp>(
         op.getLoc(), false, rewriter.getI1Type());
-    Value resultInit = createI64Constant(op.getLoc(), rewriter, 0);
+    Type valueStorageType = getTypedContainerElementStorageType(
+        dictType.getValueType(), rewriter.getContext());
+    Value resultInit =
+        valueStorageType
+            ? createStorageZero(op.getLoc(), valueStorageType, rewriter)
+            : Value{};
+    if (!resultInit)
+      return failure();
 
     auto loop = rewriter.create<scf::ForOp>(op.getLoc(), lower, upper, step,
                                             ValueRange{foundInit, resultInit});
@@ -259,32 +367,19 @@ struct DictGetLowering : public OpConversionPattern<DictGetOp> {
       Value currentFound = loop.getRegionIterArgs()[0];
       Value currentResult = loop.getRegionIterArgs()[1];
 
-      Value keyBase =
-          createIndexConstant(op.getLoc(), rewriter, kTypedDictHeaderSlots);
-      Value valueBase = createIndexConstant(op.getLoc(), rewriter,
-                                            kTypedDictHeaderSlots +
-                                                kTypedDictDefaultCapacity);
-      Value stateBase = createIndexConstant(op.getLoc(), rewriter,
-                                            kTypedDictHeaderSlots +
-                                                kTypedDictDefaultCapacity * 2);
-      Value probeSlot = createProbeSlot(op.getLoc(), rewriter, *key, iv);
-      Value keyIndex =
-          rewriter.create<arith::AddIOp>(op.getLoc(), keyBase, probeSlot);
-      Value valueIndex =
-          rewriter.create<arith::AddIOp>(op.getLoc(), valueBase, probeSlot);
-      Value stateIndex =
-          rewriter.create<arith::AddIOp>(op.getLoc(), stateBase, probeSlot);
-      Value state = rewriter.create<memref::LoadOp>(
-          op.getLoc(), adaptor.getDict(), stateIndex);
-      Value keyAt = rewriter.create<memref::LoadOp>(
-          op.getLoc(), adaptor.getDict(), keyIndex);
-      Value valueAt = rewriter.create<memref::LoadOp>(
-          op.getLoc(), adaptor.getDict(), valueIndex);
+      Value probeSlot = createProbeSlot(op.getLoc(), rewriter, key, iv);
+      Value state =
+          rewriter.create<memref::LoadOp>(op.getLoc(), dict[3], probeSlot);
+      Value keyAt =
+          rewriter.create<memref::LoadOp>(op.getLoc(), dict[1], probeSlot);
+      Value valueAt =
+          rewriter.create<memref::LoadOp>(op.getLoc(), dict[2], probeSlot);
+      Value occupiedState = rewriter.create<arith::ConstantIntOp>(
+          op.getLoc(), 1, rewriter.getI8Type());
       Value occupied = rewriter.create<arith::CmpIOp>(
-          op.getLoc(), arith::CmpIPredicate::eq, state,
-          createI64Constant(op.getLoc(), rewriter, 1));
-      Value sameKey = rewriter.create<arith::CmpIOp>(
-          op.getLoc(), arith::CmpIPredicate::eq, keyAt, *key);
+          op.getLoc(), arith::CmpIPredicate::eq, state, occupiedState);
+      Value sameKey =
+          compareDictStorageEqual(op.getLoc(), keyAt, key, rewriter);
       Value match =
           rewriter.create<arith::AndIOp>(op.getLoc(), occupied, sameKey);
       Value nextFound =
@@ -295,9 +390,9 @@ struct DictGetLowering : public OpConversionPattern<DictGetOp> {
                                     ValueRange{nextFound, nextResult});
     }
 
-    FailureOr<Value> boxed =
-        boxTypedSlot(op.getLoc(), loop.getResult(1), dictType.getValueType(),
-                     module, rewriter, *converter);
+    FailureOr<Value> boxed = boxTypedContainerStorageValue(
+        op.getLoc(), loop.getResult(1), dictType.getValueType(), module,
+        rewriter, *converter);
     if (failed(boxed))
       return failure();
     rewriter.replaceOp(op, *boxed);
