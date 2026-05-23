@@ -1,10 +1,8 @@
 #include "cpp/PyVerifier/Common.h"
 
-using namespace mlir;
-
 namespace py {
 
-LogicalResult TryOp::verify() {
+mlir::LogicalResult TryOp::verify() {
   bool hasExcept = !getExceptRegion().empty();
   bool hasFinally = !getFinallyRegion().empty();
   if (!hasExcept && !hasFinally)
@@ -13,17 +11,17 @@ LogicalResult TryOp::verify() {
   if (getTryRegion().empty())
     return emitOpError("try region must not be empty");
 
-  auto requireYieldTypesMatch = [&](Region &region,
-                                    StringRef kind) -> LogicalResult {
+  auto requireYieldTypesMatch =
+      [&](mlir::Region &region, llvm::StringRef kind) -> mlir::LogicalResult {
     if (region.empty())
-      return success();
+      return mlir::success();
     auto *term = region.front().getTerminator();
     if (!term)
       return emitOpError(kind) << " region must have a terminator";
-    if (kind == "try" && !isa<TryYieldOp>(term))
-      return emitOpError("try region must terminate with py.try.yield");
-    if (kind == "except" && !isa<ExceptYieldOp>(term))
-      return emitOpError("except region must terminate with py.except.yield");
+    if (kind == "try" && !mlir::isa<TryYieldOp>(term))
+      return mlir::success();
+    if (kind == "except" && !mlir::isa<ExceptYieldOp>(term))
+      return mlir::success();
     auto expected = getResultTypes();
     auto yielded = term->getOperandTypes();
     if (expected.size() != yielded.size())
@@ -33,24 +31,25 @@ LogicalResult TryOp::verify() {
       if (exp != got)
         return emitOpError(kind)
                << " region yield types must match py.try result types";
-    return success();
+    return mlir::success();
   };
 
   if (hasExcept) {
     auto &region = getExceptRegion();
     if (region.empty())
       return emitOpError("except region must not be empty");
-    Block &entry = region.front();
+    mlir::Block &entry = region.front();
     if (entry.getNumArguments() != 1)
       return emitOpError("except region must take a single !py.exception");
     if (!isPyExceptionType(entry.getArgument(0).getType()))
       return emitOpError("except region argument must be !py.exception");
   }
 
-  if (failed(requireYieldTypesMatch(getTryRegion(), "try")))
-    return failure();
-  if (hasExcept && failed(requireYieldTypesMatch(getExceptRegion(), "except")))
-    return failure();
+  if (mlir::failed(requireYieldTypesMatch(getTryRegion(), "try")))
+    return mlir::failure();
+  if (hasExcept &&
+      mlir::failed(requireYieldTypesMatch(getExceptRegion(), "except")))
+    return mlir::failure();
   if (hasFinally) {
     auto &region = getFinallyRegion();
     if (region.empty())
@@ -58,56 +57,61 @@ LogicalResult TryOp::verify() {
     auto *term = region.front().getTerminator();
     if (!term)
       return emitOpError("finally region must have a terminator");
-    if (!isa<FinallyYieldOp>(term))
+    if (!mlir::isa<FinallyYieldOp>(term))
       return emitOpError("finally region must terminate with py.finally.yield");
   }
 
-  return success();
+  return mlir::success();
 }
 
-LogicalResult RaiseOp::verify() {
+mlir::LogicalResult RaiseOp::verify() {
   if (!isPyExceptionType(getException().getType()))
     return emitOpError("operand must be !py.exception");
-  return success();
+  return mlir::success();
 }
 
-LogicalResult RaiseCurrentOp::verify() {
+mlir::LogicalResult RaiseCurrentOp::verify() {
   auto *parent = getOperation()->getParentOp();
-  auto tryOp = dyn_cast_or_null<TryOp>(parent);
+  auto tryOp = mlir::dyn_cast_or_null<TryOp>(parent);
   if (tryOp) {
     if (getOperation()->getParentRegion() != &tryOp.getExceptRegion())
       return emitOpError("must be inside py.try except region");
-    return success();
+    return mlir::success();
   }
 
-  Block *block = getOperation()->getBlock();
+  mlir::Block *block = getOperation()->getBlock();
   if (!block)
     return emitOpError("must be nested inside py.try except region");
-  Operation *container = block->getParentOp();
+  mlir::Operation *container = block->getParentOp();
   bool isInvokeUnwind = false;
   container->walk([&](InvokeOp invoke) {
     if (invoke.getUnwindDest() == block)
       isInvokeUnwind = true;
   });
   if (isInvokeUnwind)
-    return success();
+    return mlir::success();
 
   return emitOpError("must be nested inside py.try except region");
 }
 
-LogicalResult FinallyYieldOp::verify() {
-  if (getOperation()->getNumOperands() != 0)
-    return emitOpError("must not have operands");
+mlir::LogicalResult FinallyYieldOp::verify() {
   auto *parent = getOperation()->getParentOp();
-  auto tryOp = dyn_cast_or_null<TryOp>(parent);
+  auto tryOp = mlir::dyn_cast_or_null<TryOp>(parent);
   if (!tryOp)
     return emitOpError("must be nested inside py.try finally region");
   if (getOperation()->getParentRegion() != &tryOp.getFinallyRegion())
     return emitOpError("must be inside py.try finally region");
-  return success();
+  auto expected = tryOp.getResultTypes();
+  auto yielded = getOperation()->getOperandTypes();
+  if (expected.size() != yielded.size())
+    return emitOpError("operand count must match py.try result count");
+  for (auto [exp, got] : llvm::zip(expected, yielded))
+    if (exp != got)
+      return emitOpError("operand types must match py.try result types");
+  return mlir::success();
 }
 
-LogicalResult ExceptionNewOp::verify() {
+mlir::LogicalResult ExceptionNewOp::verify() {
   if (!isPyClassType(getType().getType()))
     return emitOpError("type must be !py.class");
   if (!isPyStrType(getMessage().getType()))
@@ -126,17 +130,17 @@ LogicalResult ExceptionNewOp::verify() {
     return emitOpError("extras must be !py.dict");
   if (!isPyExceptionType(getResult().getType()))
     return emitOpError("result must be !py.exception");
-  return success();
+  return mlir::success();
 }
 
-LogicalResult ExceptMatchOp::verify() {
+mlir::LogicalResult ExceptMatchOp::verify() {
   auto *parent = getOperation()->getParentOp();
-  auto tryOp = dyn_cast_or_null<TryOp>(parent);
+  auto tryOp = mlir::dyn_cast_or_null<TryOp>(parent);
   if (!tryOp)
     return emitOpError("must be nested inside py.try except region");
   if (getOperation()->getParentRegion() != &tryOp.getExceptRegion())
     return emitOpError("must be inside py.try except region");
-  return success();
+  return mlir::success();
 }
 
 } // namespace py

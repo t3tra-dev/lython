@@ -154,7 +154,7 @@ void LyLong_InitSmallIntCache() {
       SmallIntStorage &storage = smallIntCache[idx];
 
       // Immortal object - refcount is ignored by generic helpers.
-      storage.ob_refcnt = 1000000;
+      storage.ob_refcnt = kLyImmortalRefcount;
       storage.ob_type = &LyLong_Type();
 
       if (i == 0) {

@@ -19,55 +19,83 @@
 
 namespace py::optimizer {
 
-bool isCallTo(mlir::LLVM::CallOp callOp, llvm::StringRef calleeName);
-mlir::LLVM::CallOp getOptionalDecRefUser(mlir::Value value);
-void eraseCallAndOptionalDecRefUsers(mlir::LLVM::CallOp callOp);
-mlir::LLVM::LLVMFuncOp getOrCreateRuntimeFunc(mlir::ModuleOp module,
-                                              mlir::StringRef name,
-                                              mlir::Type resultType,
-                                              mlir::ValueRange operands);
-mlir::Value materializeI64FromLong(mlir::ModuleOp module,
-                                   mlir::OpBuilder &builder, mlir::Location loc,
-                                   mlir::Value boxedLong);
-mlir::Value stripIdentityCasts(mlir::Value value);
-mlir::Value stripTransparentPublicationOps(mlir::Value value);
-bool isPublicationSummaryResultType(mlir::Type type);
-bool arrayAttrContainsIndex(mlir::ArrayAttr attr, unsigned index);
-FuncOp resolveDirectPyFuncSymbol(mlir::Operation *from, mlir::Value callable);
-bool funcResultIsPublished(mlir::Operation *funcLike, unsigned resultIndex);
-int getEntryArgumentIndex(FuncOp func, mlir::Value value);
-mlir::ArrayAttr buildSortedIndexArrayAttr(mlir::MLIRContext *ctx,
-                                          const llvm::DenseSet<int> &indices);
-bool updateFuncPublicationSummaryAttrs(
-    FuncOp func, const llvm::DenseSet<int> &publishesArgs,
-    const llvm::DenseSet<int> &capturesPublished,
-    const llvm::DenseSet<int> &returnsPublished,
-    const llvm::DenseSet<int> &readonlyArgs,
-    const llvm::DenseSet<int> &mutableArgs);
-bool isDefinitelyLocalStaticClassValue(mlir::Value value);
-bool isDefinitelyFreshStaticClassValue(mlir::Value value);
-bool isDefinitelyPublishedStaticClassValue(mlir::Value value);
-mlir::func::FuncOp resolveLocalSelfHelper(mlir::func::FuncOp callee,
-                                          mlir::ModuleOp module);
-mlir::func::FuncOp resolveFreshInitHelper(mlir::func::FuncOp callee,
-                                          mlir::ModuleOp module);
-std::string getPublishedBorrowHelperAttrName(unsigned argIndex);
-mlir::func::FuncOp resolvePublishedBorrowHelper(mlir::func::FuncOp callee,
-                                                unsigned argIndex,
-                                                mlir::ModuleOp module);
-mlir::func::FuncOp resolvePreferredDirectCallTarget(mlir::func::FuncOp callee,
-                                                    mlir::func::CallOp call,
-                                                    mlir::ModuleOp module);
+namespace runtime {
+
+struct Call {
+  static bool is(mlir::LLVM::CallOp op, llvm::StringRef callee);
+  static mlir::LLVM::CallOp optionalReleaseUser(mlir::Value value);
+  static void eraseWithOptionalRelease(mlir::LLVM::CallOp op);
+};
+
+struct Func {
+  static mlir::LLVM::LLVMFuncOp getOrCreate(mlir::ModuleOp module,
+                                            mlir::StringRef name,
+                                            mlir::Type resultType,
+                                            mlir::ValueRange operands);
+};
+
+struct Long {
+  static mlir::Value asI64(mlir::ModuleOp module, mlir::OpBuilder &builder,
+                           mlir::Location loc, mlir::Value boxed);
+};
+
+} // namespace runtime
+
+namespace value {
+
+mlir::Value stripCasts(mlir::Value value);
+mlir::Value stripPublications(mlir::Value value);
+
+} // namespace value
+
+namespace attr {
+
+bool containsIndex(mlir::ArrayAttr attr, unsigned index);
+mlir::ArrayAttr indexArray(mlir::MLIRContext *ctx,
+                           const llvm::DenseSet<int> &indices);
+
+} // namespace attr
+
+namespace publication {
+
+bool tracks(mlir::Type type);
+bool result(mlir::Operation *funcLike, unsigned resultIndex);
+int entryArg(FuncOp func, mlir::Value value);
+bool update(FuncOp func, const llvm::DenseSet<int> &publishesArgs,
+            const llvm::DenseSet<int> &capturesPublished,
+            const llvm::DenseSet<int> &returnsPublished,
+            const llvm::DenseSet<int> &readonlyArgs,
+            const llvm::DenseSet<int> &mutableArgs);
+void compute(mlir::ModuleOp module);
+void insertBoundaries(mlir::ModuleOp module);
+void prepare(mlir::ModuleOp module);
+
+} // namespace publication
+
+namespace call {
+
+FuncOp pyFunc(mlir::Operation *from, mlir::Value callable);
+mlir::func::FuncOp localSelfHelper(mlir::func::FuncOp callee,
+                                   mlir::ModuleOp module);
+mlir::func::FuncOp freshInitHelper(mlir::func::FuncOp callee,
+                                   mlir::ModuleOp module);
+std::string publishedBorrowAttr(unsigned argIndex);
+mlir::func::FuncOp publishedBorrowHelper(mlir::func::FuncOp callee,
+                                         unsigned argIndex,
+                                         mlir::ModuleOp module);
+mlir::func::FuncOp preferredTarget(mlir::func::FuncOp callee,
+                                   mlir::func::CallOp call,
+                                   mlir::ModuleOp module);
 
 template <typename CallbackT>
 void forEachDirectPositionalOperand(CallVectorOp op, CallbackT &&callback) {
-  auto kwnames = stripIdentityCasts(op.getKwnames());
-  auto kwvalues = stripIdentityCasts(op.getKwvalues());
+  auto kwnames = value::stripCasts(op.getKwnames());
+  auto kwvalues = value::stripCasts(op.getKwvalues());
   if (!mlir::isa_and_nonnull<TupleEmptyOp>(kwnames.getDefiningOp()) ||
       !mlir::isa_and_nonnull<TupleEmptyOp>(kwvalues.getDefiningOp()))
     return;
 
-  mlir::Value posargs = stripIdentityCasts(op.getPosargs());
+  mlir::Value posargs = value::stripCasts(op.getPosargs());
   if (auto tupleCreate = posargs.getDefiningOp<TupleCreateOp>())
     for (auto [idx, operand] : llvm::enumerate(tupleCreate.getOperands()))
       callback(static_cast<unsigned>(idx), operand);
@@ -75,11 +103,11 @@ void forEachDirectPositionalOperand(CallVectorOp op, CallbackT &&callback) {
 
 template <typename CallbackT>
 void forEachDirectPositionalOperand(CallOp op, CallbackT &&callback) {
-  mlir::Value kwargs = stripIdentityCasts(op.getKwargs());
+  mlir::Value kwargs = value::stripCasts(op.getKwargs());
   if (!mlir::isa_and_nonnull<NoneOp>(kwargs.getDefiningOp()))
     return;
 
-  mlir::Value posargs = stripIdentityCasts(op.getPosargs());
+  mlir::Value posargs = value::stripCasts(op.getPosargs());
   if (auto tupleCreate = posargs.getDefiningOp<TupleCreateOp>())
     for (auto [idx, operand] : llvm::enumerate(tupleCreate.getOperands()))
       callback(static_cast<unsigned>(idx), operand);
@@ -87,53 +115,91 @@ void forEachDirectPositionalOperand(CallOp op, CallbackT &&callback) {
 
 template <typename CallbackT>
 void forEachDirectPositionalOperand(InvokeOp op, CallbackT &&callback) {
-  auto kwnames = stripIdentityCasts(op.getKwnames());
-  auto kwvalues = stripIdentityCasts(op.getKwvalues());
+  auto kwnames = value::stripCasts(op.getKwnames());
+  auto kwvalues = value::stripCasts(op.getKwvalues());
   if (!mlir::isa_and_nonnull<TupleEmptyOp>(kwnames.getDefiningOp()) ||
       !mlir::isa_and_nonnull<TupleEmptyOp>(kwvalues.getDefiningOp()))
     return;
 
-  mlir::Value posargs = stripIdentityCasts(op.getPosargs());
+  mlir::Value posargs = value::stripCasts(op.getPosargs());
   if (auto tupleCreate = posargs.getDefiningOp<TupleCreateOp>())
     for (auto [idx, operand] : llvm::enumerate(tupleCreate.getOperands()))
       callback(static_cast<unsigned>(idx), operand);
 }
 
-void computeLocalPublicationSummaries(mlir::ModuleOp module);
-void insertPublishesAtPublicationBoundaries(mlir::ModuleOp module);
+void staticDefaults(mlir::ModuleOp module);
+bool cleanupClassIncrefs(mlir::ModuleOp module);
+void rewritePreferred(mlir::ModuleOp module);
 
-bool cleanupDeadTuples(mlir::ModuleOp module);
-void removeUnusedTupleEmpties(mlir::ModuleOp module);
-void applyStaticMakeFunctionDefaults(mlir::ModuleOp module);
-bool cleanupRedundantClassIncrefsAfterDirectCalls(mlir::ModuleOp module);
-void rewriteDirectFuncCallsToPreferredHelpers(mlir::ModuleOp module);
-void eliminateRedundantClassPublishes(mlir::ModuleOp module);
-void markKnownLocalStaticClassAccesses(mlir::ModuleOp module);
-void markConsumedAttrSetValues(mlir::ModuleOp module);
-void markConsumedListAppendValues(mlir::ModuleOp module);
-void markZeroInitializedSelfFirstStores(mlir::ModuleOp module);
-void removeUnusedNoneOps(mlir::ModuleOp module);
-void removeNoneDecrefs(mlir::ModuleOp module);
-void hoistIntConstants(mlir::ModuleOp module);
-void removeSmallIntDecrefs(mlir::ModuleOp module);
-void cseStringCreation(mlir::ModuleOp module);
-void cseSingletonGetters(mlir::ModuleOp module);
-void eliminateBoolBoxingUnboxing(mlir::ModuleOp module);
-void eliminateLongArithmeticRoundTrips(mlir::ModuleOp module);
-void eliminateLongBoxingUnboxing(mlir::ModuleOp module);
-void cseSmallIntFromI64(mlir::ModuleOp module);
+} // namespace call
+
+namespace class_state {
+
+bool local(mlir::Value value);
+bool fresh(mlir::Value value);
+bool published(mlir::Value value);
+void eliminatePublishes(mlir::ModuleOp module);
+void proveLocalAccess(mlir::ModuleOp module);
+void markFirstStores(mlir::ModuleOp module);
+
+} // namespace class_state
+
+namespace container {
+
+bool cleanupDead(mlir::ModuleOp module);
+void removeEmptyTuples(mlir::ModuleOp module);
+
+} // namespace container
+
+namespace consume {
+
+void attrSetValues(mlir::ModuleOp module);
+void listAppendValues(mlir::ModuleOp module);
+
+} // namespace consume
+
+namespace scalar {
+
+void removeUnusedNone(mlir::ModuleOp module);
+void dropNoneDecrefs(mlir::ModuleOp module);
+void hoistInts(mlir::ModuleOp module);
+void dropSmallIntDecrefs(mlir::ModuleOp module);
+void cseSingletons(mlir::ModuleOp module);
+void elideBoolBoxing(mlir::ModuleOp module);
+void elideLongArithRoundTrips(mlir::ModuleOp module);
+void elideLongBoxing(mlir::ModuleOp module);
+void cseSmallInts(mlir::ModuleOp module);
 void cseConstants(mlir::ModuleOp module);
-void eliminateDeadCode(mlir::ModuleOp module);
-void repairMissingDirectArgReturnIncRefs(mlir::ModuleOp module);
-void removeDuplicateDecRefs(mlir::ModuleOp module);
-void sinkClassDecrefsPastBorrowedAttrUses(mlir::ModuleOp module);
-void markFinalLocalClassDecrefs(mlir::ModuleOp module);
+void dce(mlir::ModuleOp module);
 
-void runClassLayoutPreLoweringOptimizations(mlir::ModuleOp module);
-void runCallPreLoweringOptimizations(mlir::ModuleOp module);
-void runContainerPreLoweringOptimizations(mlir::ModuleOp module);
-void runScalarPreLoweringOptimizations(mlir::ModuleOp module);
-void runScalarPostLoweringOptimizations(mlir::ModuleOp module);
-void runRefcountPostLoweringOptimizations(mlir::ModuleOp module);
+} // namespace scalar
+
+namespace refcount {
+
+void sinkClassDecrefs(mlir::ModuleOp module);
+void markFinalLocal(mlir::ModuleOp module);
+
+} // namespace refcount
+
+namespace zero_cost {
+
+void rewriteLocalAccess(mlir::ModuleOp module);
+
+} // namespace zero_cost
+
+namespace pipeline {
+
+void classLayoutPre(mlir::ModuleOp module);
+void callPre(mlir::ModuleOp module);
+void containerPre(mlir::ModuleOp module);
+void scalarPre(mlir::ModuleOp module);
+void scalarPost(mlir::ModuleOp module);
+void refcountPost(mlir::ModuleOp module);
+void zeroCostProofPre(mlir::ModuleOp module);
+void zeroCostRewritePre(mlir::ModuleOp module);
+void preLowering(mlir::ModuleOp module);
+void postLowering(mlir::ModuleOp module);
+
+} // namespace pipeline
 
 } // namespace py::optimizer

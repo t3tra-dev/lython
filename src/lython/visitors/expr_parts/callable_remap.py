@@ -1,13 +1,20 @@
-# pyright: reportAttributeAccessIssue=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownVariableType=false
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+from ...frontend.symbols import FunctionInfo
 from ...mlir import ir
 from ...mlir.dialects import _lython_ops_gen as py_ops
 from ...mlir.dialects import arith as arith_ops
-from .._base import FunctionInfo
+from ..mlir_access import op_attributes, op_name, op_operands
+
+if TYPE_CHECKING:
+    from ..contracts import VisitorRuntime
+else:
+    VisitorRuntime = object
 
 
-class ExprCallableRemapMixin:
+class ExprCallableRemapMixin(VisitorRuntime):
     def _remap_summary_value_to_callsite(
         self,
         value: ir.Value,
@@ -62,11 +69,11 @@ class ExprCallableRemapMixin:
             cache[cache_key] = value
             return value
 
-        op_name = str(getattr(op, "name", ""))
-        operands = list(getattr(op, "operands", ()))
-        attributes = getattr(op, "attributes", {})
+        name = op_name(op)
+        operands = op_operands(op)
+        attributes = op_attributes(op)
 
-        if op_name in {"py.cast.identity", "py.publish"}:
+        if name == "py.publish":
             if not operands:
                 cache[cache_key] = None
                 return None
@@ -85,19 +92,19 @@ class ExprCallableRemapMixin:
 
         with loc, self.insertion_point():
             result: ir.Value | None
-            if op_name == "arith.constant":
+            if name == "arith.constant":
                 result = arith_ops.ConstantOp(value.type, attributes["value"]).result
-            elif op_name == "py.str.constant":
+            elif name == "py.str.constant":
                 result = py_ops.StrConstantOp(value.type, attributes["value"]).result
-            elif op_name == "py.int.constant":
+            elif name == "py.int.constant":
                 result = py_ops.IntConstantOp(value.type, attributes["value"]).result
-            elif op_name == "py.float.constant":
+            elif name == "py.float.constant":
                 result = py_ops.FloatConstantOp(value.type, attributes["value"]).result
-            elif op_name == "py.none":
+            elif name == "py.none":
                 result = py_ops.NoneOp(value.type).result
-            elif op_name == "py.tuple.empty":
+            elif name == "py.tuple.empty":
                 result = py_ops.TupleEmptyOp(value.type).result
-            elif op_name == "py.tuple.create":
+            elif name == "py.tuple.create":
                 remapped_elements = [
                     self._remap_summary_value_to_callsite(
                         operand,
@@ -115,9 +122,9 @@ class ExprCallableRemapMixin:
                     result = None
                 else:
                     result = py_ops.TupleCreateOp(value.type, remapped_elements).result
-            elif op_name == "py.dict.empty":
+            elif name == "py.dict.empty":
                 result = py_ops.DictEmptyOp(value.type).result
-            elif op_name == "py.dict.insert":
+            elif name == "py.dict.insert":
                 remapped_operands = [
                     self._remap_summary_value_to_callsite(
                         operand,
@@ -134,13 +141,13 @@ class ExprCallableRemapMixin:
                 if any(operand is None for operand in remapped_operands):
                     result = None
                 else:
-                    result = py_ops.DictInsertOp(
-                        value.type,
+                    py_ops.DictInsertOp(
                         remapped_operands[0],
                         remapped_operands[1],
                         remapped_operands[2],
-                    ).result
-            elif op_name == "py.upcast":
+                    )
+                    result = remapped_operands[0]
+            elif name == "py.upcast":
                 if not operands:
                     result = None
                 else:
@@ -159,7 +166,7 @@ class ExprCallableRemapMixin:
                         if remapped is not None
                         else None
                     )
-            elif op_name == "py.attr.get":
+            elif name == "py.attr.get":
                 if not operands:
                     result = None
                 else:
@@ -180,7 +187,7 @@ class ExprCallableRemapMixin:
                         if remapped_object is not None
                         else None
                     )
-            elif op_name == "py.list.get":
+            elif name == "py.list.get":
                 remapped_list = self._remap_summary_value_to_callsite(
                     operands[0],
                     summary_info=summary_info,
@@ -207,9 +214,9 @@ class ExprCallableRemapMixin:
                     result = py_ops.ListGetOp(
                         value.type, remapped_list, remapped_index
                     ).result
-            elif op_name == "py.func.object":
+            elif name == "py.func.object":
                 result = py_ops.FuncObjectOp(value.type, attributes["target"]).result
-            elif op_name == "py.make_function":
+            elif name == "py.make_function":
                 (
                     defaults_operand,
                     kwdefaults_operand,
@@ -241,7 +248,7 @@ class ExprCallableRemapMixin:
                     annotations=remap_optional(annotations_operand),
                     module=remap_optional(module_operand),
                 ).result
-            elif op_name == "py.cast.to_prim":
+            elif name == "py.cast.to_prim":
                 if not operands:
                     result = None
                 else:
@@ -262,7 +269,7 @@ class ExprCallableRemapMixin:
                         if remapped_input is not None
                         else None
                     )
-            elif op_name == "py.cast.from_prim":
+            elif name == "py.cast.from_prim":
                 if not operands:
                     result = None
                 else:
@@ -281,7 +288,23 @@ class ExprCallableRemapMixin:
                         if remapped_input is not None
                         else None
                     )
-            elif op_name == "py.num.add":
+            elif name == "py.repr":
+                remapped_input = self._remap_summary_value_to_callsite(
+                    operands[0],
+                    summary_info=summary_info,
+                    positional_param_names=positional_param_names,
+                    kwonly_names=kwonly_names,
+                    positional_arg_values=positional_arg_values,
+                    keyword_arg_values=keyword_arg_values,
+                    loc=loc,
+                    cache=cache,
+                )
+                result = (
+                    py_ops.ReprOp(value.type, remapped_input).result
+                    if remapped_input is not None
+                    else None
+                )
+            elif name == "py.add":
                 remapped_lhs = self._remap_summary_value_to_callsite(
                     operands[0],
                     summary_info=summary_info,
@@ -305,8 +328,8 @@ class ExprCallableRemapMixin:
                 if remapped_lhs is None or remapped_rhs is None:
                     result = None
                 else:
-                    result = py_ops.NumAddOp(remapped_lhs, remapped_rhs).result
-            elif op_name == "py.num.sub":
+                    result = py_ops.AddOp(value.type, remapped_lhs, remapped_rhs).result
+            elif name == "py.sub":
                 remapped_lhs = self._remap_summary_value_to_callsite(
                     operands[0],
                     summary_info=summary_info,
@@ -330,14 +353,14 @@ class ExprCallableRemapMixin:
                 if remapped_lhs is None or remapped_rhs is None:
                     result = None
                 else:
-                    result = py_ops.NumSubOp(remapped_lhs, remapped_rhs).result
-            elif op_name in {
-                "py.num.eq",
-                "py.num.ne",
-                "py.num.lt",
-                "py.num.le",
-                "py.num.gt",
-                "py.num.ge",
+                    result = py_ops.SubOp(value.type, remapped_lhs, remapped_rhs).result
+            elif name in {
+                "py.eq",
+                "py.ne",
+                "py.lt",
+                "py.le",
+                "py.gt",
+                "py.ge",
             }:
                 remapped_lhs = self._remap_summary_value_to_callsite(
                     operands[0],
@@ -361,31 +384,19 @@ class ExprCallableRemapMixin:
                 )
                 if remapped_lhs is None or remapped_rhs is None:
                     result = None
-                elif op_name == "py.num.eq":
-                    result = py_ops.NumEqOp(
-                        value.type, remapped_lhs, remapped_rhs
-                    ).result
-                elif op_name == "py.num.ne":
-                    result = py_ops.NumNeOp(
-                        value.type, remapped_lhs, remapped_rhs
-                    ).result
-                elif op_name == "py.num.lt":
-                    result = py_ops.NumLtOp(
-                        value.type, remapped_lhs, remapped_rhs
-                    ).result
-                elif op_name == "py.num.le":
-                    result = py_ops.NumLeOp(
-                        value.type, remapped_lhs, remapped_rhs
-                    ).result
-                elif op_name == "py.num.gt":
-                    result = py_ops.NumGtOp(
-                        value.type, remapped_lhs, remapped_rhs
-                    ).result
+                elif name == "py.eq":
+                    result = py_ops.EqOp(value.type, remapped_lhs, remapped_rhs).result
+                elif name == "py.ne":
+                    result = py_ops.NeOp(value.type, remapped_lhs, remapped_rhs).result
+                elif name == "py.lt":
+                    result = py_ops.LtOp(value.type, remapped_lhs, remapped_rhs).result
+                elif name == "py.le":
+                    result = py_ops.LeOp(value.type, remapped_lhs, remapped_rhs).result
+                elif name == "py.gt":
+                    result = py_ops.GtOp(value.type, remapped_lhs, remapped_rhs).result
                 else:
-                    result = py_ops.NumGeOp(
-                        value.type, remapped_lhs, remapped_rhs
-                    ).result
-            elif op_name == "arith.cmpi":
+                    result = py_ops.GeOp(value.type, remapped_lhs, remapped_rhs).result
+            elif name == "arith.cmpi":
                 remapped_lhs = self._remap_summary_value_to_callsite(
                     operands[0],
                     summary_info=summary_info,
@@ -412,7 +423,7 @@ class ExprCallableRemapMixin:
                     result = arith_ops.CmpIOp(
                         attributes["predicate"], remapped_lhs, remapped_rhs
                     ).result
-            elif op_name == "arith.cmpf":
+            elif name == "arith.cmpf":
                 remapped_lhs = self._remap_summary_value_to_callsite(
                     operands[0],
                     summary_info=summary_info,
@@ -439,7 +450,7 @@ class ExprCallableRemapMixin:
                     result = arith_ops.CmpFOp(
                         attributes["predicate"], remapped_lhs, remapped_rhs
                     ).result
-            elif op_name in {
+            elif name in {
                 "arith.addi",
                 "arith.subi",
                 "arith.muli",
@@ -473,23 +484,23 @@ class ExprCallableRemapMixin:
                 )
                 if remapped_lhs is None or remapped_rhs is None:
                     result = None
-                elif op_name == "arith.addi":
+                elif name == "arith.addi":
                     result = arith_ops.AddIOp(remapped_lhs, remapped_rhs).result
-                elif op_name == "arith.subi":
+                elif name == "arith.subi":
                     result = arith_ops.SubIOp(remapped_lhs, remapped_rhs).result
-                elif op_name == "arith.muli":
+                elif name == "arith.muli":
                     result = arith_ops.MulIOp(remapped_lhs, remapped_rhs).result
-                elif op_name == "arith.divsi":
+                elif name == "arith.divsi":
                     result = arith_ops.DivSIOp(remapped_lhs, remapped_rhs).result
-                elif op_name == "arith.remsi":
+                elif name == "arith.remsi":
                     result = arith_ops.RemSIOp(remapped_lhs, remapped_rhs).result
-                elif op_name == "arith.addf":
+                elif name == "arith.addf":
                     result = arith_ops.AddFOp(remapped_lhs, remapped_rhs).result
-                elif op_name == "arith.subf":
+                elif name == "arith.subf":
                     result = arith_ops.SubFOp(remapped_lhs, remapped_rhs).result
-                elif op_name == "arith.mulf":
+                elif name == "arith.mulf":
                     result = arith_ops.MulFOp(remapped_lhs, remapped_rhs).result
-                elif op_name == "arith.divf":
+                elif name == "arith.divf":
                     result = arith_ops.DivFOp(remapped_lhs, remapped_rhs).result
                 else:
                     result = arith_ops.RemFOp(remapped_lhs, remapped_rhs).result

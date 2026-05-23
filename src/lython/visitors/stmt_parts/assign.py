@@ -1,14 +1,19 @@
-# pyright: reportAttributeAccessIssue=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownVariableType=false
 from __future__ import annotations
 
 import ast
+from typing import TYPE_CHECKING
 
 from ...mlir import ir
 from ...mlir.dialects import _lython_ops_gen as py_ops
 from ...mlir.dialects import arith as arith_ops
 
+if TYPE_CHECKING:
+    from ..contracts import VisitorRuntime
+else:
+    VisitorRuntime = object
 
-class StmtAssignMixin:
+
+class StmtAssignMixin(VisitorRuntime):
     """Statement lowering for assignment-like AST nodes."""
 
     def visit_Assign(self, node: ast.Assign) -> None:
@@ -45,7 +50,7 @@ class StmtAssignMixin:
                 self.undefine_function_binding(target.id)
 
             if expr_visitor:
-                pending = getattr(expr_visitor, "_pending_prim_const", None)
+                pending = expr_visitor._pending_prim_const
                 if pending is not None:
                     mlir_type, const_value = pending
                     self.register_prim_constant(target.id, mlir_type, const_value)
@@ -54,14 +59,13 @@ class StmtAssignMixin:
 
         if isinstance(target, ast.Attribute):
             obj = self.require_value(target.value, self.visit(target.value))
-            attr_type = self.get_attribute_type(obj.type, target.attr)
-            pending_attrs = getattr(self, "_pending_attributes", None)
+            pending_attrs = self._pending_attributes
             if (
                 pending_attrs is not None
                 and isinstance(target.value, ast.Name)
                 and target.value.id == "self"
             ):
-                current_method = getattr(self, "_current_method", None)
+                current_method = self._current_method
                 if current_method is None:
                     raise RuntimeError("Internal error: self assignment outside method")
                 if current_method != "__init__" and target.attr not in pending_attrs:
@@ -69,7 +73,7 @@ class StmtAssignMixin:
                         f"Dynamic field introduction outside __init__ is not supported: "
                         f"self.{target.attr}"
                     )
-                inferred_type = value.type
+                inferred_type = self.typed_node_type(target)
                 if (
                     target.attr in pending_attrs
                     and pending_attrs[target.attr] != inferred_type
@@ -81,6 +85,8 @@ class StmtAssignMixin:
                 pending_attrs[target.attr] = inferred_type
                 attr_type = inferred_type
                 self._current_method_mutates_self = True
+            else:
+                attr_type = self.typed_node_type(target)
             if str(obj.type).startswith('!py.class<"'):
                 value = self.coerce_value_to_type(value, attr_type, self._loc(node))
             with self._loc(node), self.insertion_point():
@@ -94,16 +100,13 @@ class StmtAssignMixin:
                 raise NotImplementedError(
                     "Subscript assignment is only supported for typed dict values"
                 )
-            key_type, value_type = dict_types
+            key_type, _ = dict_types
+            value_type = self.typed_node_type(target)
             key = self.require_value(target.slice, self.visit(target.slice))
             key = self.coerce_value_to_type(key, key_type, self._loc(node))
             value = self.coerce_value_to_type(value, value_type, self._loc(node))
             with self._loc(node), self.insertion_point():
-                updated = py_ops.DictInsertOp(
-                    container.type, container, key, value
-                ).result
-            if isinstance(target.value, ast.Name):
-                self.define_symbol(target.value.id, updated)
+                py_ops.DictInsertOp(container, key, value)
             return
 
         raise NotImplementedError(
@@ -127,8 +130,8 @@ class StmtAssignMixin:
 
         if isinstance(node.target, ast.Attribute):
             obj = self.require_value(node.target.value, self.visit(node.target.value))
-            attr_type = self.get_attribute_type(obj.type, node.target.attr)
-            pending_attrs = getattr(self, "_pending_attributes", None)
+            attr_type = self.typed_node_type(node.target)
+            pending_attrs = self._pending_attributes
             if (
                 pending_attrs is not None
                 and isinstance(node.target.value, ast.Name)
@@ -136,7 +139,7 @@ class StmtAssignMixin:
             ):
                 if node.target.attr not in pending_attrs:
                     raise ValueError(
-                        f"Unknown field '{node.target.attr}' in self mutation"
+                        f"Unresolved field '{node.target.attr}' in self mutation"
                     )
                 self._current_method_mutates_self = True
 
@@ -167,9 +170,9 @@ class StmtAssignMixin:
                 if self.is_primitive_int_type(lhs.type):
                     return arith_ops.SubIOp(lhs, rhs).result
         if isinstance(op, ast.Add):
-            return py_ops.NumAddOp(lhs, rhs).result
+            return py_ops.AddOp(lhs.type, lhs, rhs).result
         if isinstance(op, ast.Sub):
-            return py_ops.NumSubOp(lhs, rhs).result
+            return py_ops.SubOp(lhs.type, lhs, rhs).result
         raise NotImplementedError(f"Operator {type(op).__name__} not supported")
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:

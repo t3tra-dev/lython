@@ -1,30 +1,27 @@
 #include "Optimizer/Utils.h"
 
-using namespace mlir;
+namespace py::optimizer::publication {
 
-namespace py {
-
-void runEarlyPublicationPreparation(ModuleOp module) {
-  optimizer::computeLocalPublicationSummaries(module);
-  optimizer::insertPublishesAtPublicationBoundaries(module);
-  optimizer::computeLocalPublicationSummaries(module);
+void prepare(mlir::ModuleOp module) {
+  compute(module);
+  insertBoundaries(module);
+  compute(module);
 }
 
-} // namespace py
+} // namespace py::optimizer::publication
 
 namespace py::optimizer {
 
-void runClassLayoutPreLoweringOptimizations(ModuleOp module) {
-  eliminateRedundantClassPublishes(module);
-  markKnownLocalStaticClassAccesses(module);
-  markConsumedAttrSetValues(module);
-  markZeroInitializedSelfFirstStores(module);
+void pipeline::classLayoutPre(mlir::ModuleOp module) {
+  class_state::eliminatePublishes(module);
+  consume::attrSetValues(module);
+  class_state::markFirstStores(module);
 }
 
-void runCallPreLoweringOptimizations(ModuleOp module) {
-  applyStaticMakeFunctionDefaults(module);
-  cleanupRedundantClassIncrefsAfterDirectCalls(module);
-  rewriteDirectFuncCallsToPreferredHelpers(module);
+void pipeline::callPre(mlir::ModuleOp module) {
+  call::staticDefaults(module);
+  call::cleanupClassIncrefs(module);
+  call::rewritePreferred(module);
 }
 
 } // namespace py::optimizer

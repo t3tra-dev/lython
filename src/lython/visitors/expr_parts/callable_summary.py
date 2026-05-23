@@ -1,65 +1,18 @@
-# pyright: reportAttributeAccessIssue=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownVariableType=false
 from __future__ import annotations
 
 import ast
+from typing import TYPE_CHECKING
 
+from ...frontend.symbols import FunctionInfo
 from ...mlir import ir
-from ...mlir.dialects import _lython_ops_gen as py_ops
-from .._base import FunctionInfo
+
+if TYPE_CHECKING:
+    from ..contracts import VisitorRuntime
+else:
+    VisitorRuntime = object
 
 
-class ExprCallableSummaryMixin:
-    def _attach_returned_callable_metadata(
-        self,
-        op: ir.Operation,
-        func_info: FunctionInfo,
-    ) -> None:
-        self._attach_returned_callable_info(op, func_info.returned_function_info)
-
-    def _attach_returned_callable_info(
-        self,
-        op: ir.Operation,
-        returned: FunctionInfo | None,
-    ) -> None:
-        if returned is None:
-            return
-        op.attributes["lython.returned_callable_symbol"] = ir.FlatSymbolRefAttr.get(
-            returned.symbol, self.ctx
-        )
-        op.attributes["lython.returned_callable_defaults_count"] = ir.IntegerAttr.get(
-            ir.IntegerType.get_signless(64, context=self.ctx),
-            returned.defaults_count,
-        )
-        if returned.kwdefault_names:
-            op.attributes["lython.returned_callable_kwdefault_names"] = self.array_attr(
-                [
-                    ir.StringAttr.get(name, self.ctx)
-                    for name in returned.kwdefault_names
-                ],
-            )
-
-    def _materialize_known_callable_result(
-        self,
-        value: ir.Value,
-        info: FunctionInfo | None,
-        loc: ir.Location,
-    ) -> ir.Value:
-        if info is None or not str(value.type).startswith("!py.func<"):
-            return value
-        return self._build_python_callable(
-            symbol=info.symbol,
-            func_type=value.type,
-            defaults=info.defaults,
-            kwdefaults=info.kwdefaults,
-            closure=info.closure,
-            loc=loc,
-            force_make_function=bool(
-                info.defaults is not None
-                or info.kwdefaults is not None
-                or info.closure is not None
-            ),
-        )
-
+class ExprCallableSummaryMixin(VisitorRuntime):
     def _resolve_returned_callable_info_from_call(
         self,
         *,
@@ -248,77 +201,3 @@ class ExprCallableSummaryMixin:
                 closure=(remapped_or_rebuilt_closure if attempted_closure else None),
             )
         return info
-
-    def _build_python_callable(
-        self,
-        *,
-        symbol: str,
-        func_type: ir.Type,
-        defaults: ir.Value | None,
-        kwdefaults: ir.Value | None,
-        closure: ir.Value | None,
-        loc: ir.Location,
-        force_make_function: bool = False,
-    ) -> ir.Value:
-        with loc, self.insertion_point():
-            if (
-                not force_make_function
-                and defaults is None
-                and kwdefaults is None
-                and closure is None
-            ):
-                return py_ops.FuncObjectOp(func_type, symbol).result
-            return py_ops.MakeFunctionOp(
-                func_type,
-                ir.FlatSymbolRefAttr.get(symbol, self.ctx),
-                defaults=(
-                    self._clone_bound_callable_metadata(defaults, loc)
-                    if defaults is not None
-                    else None
-                ),
-                kwdefaults=(
-                    self._clone_bound_callable_metadata(kwdefaults, loc)
-                    if kwdefaults is not None
-                    else None
-                ),
-                closure=(
-                    self._clone_bound_callable_metadata(closure, loc)
-                    if closure is not None
-                    else None
-                ),
-            ).result
-
-    def _build_method_callable(
-        self,
-        *,
-        symbol: str,
-        func_type: ir.Type,
-        defaults: ir.Value | None,
-        kwdefaults: ir.Value | None,
-        loc: ir.Location,
-        force_make_function: bool = False,
-    ) -> ir.Value:
-        return self._build_python_callable(
-            symbol=symbol,
-            func_type=func_type,
-            defaults=defaults,
-            kwdefaults=kwdefaults,
-            closure=None,
-            loc=loc,
-            force_make_function=force_make_function,
-        )
-
-    def _needs_keyword_callable_materialization(self, value: ir.Value) -> bool:
-        current = value
-        while True:
-            op = self._value_operation(current)
-            if op is None:
-                return False
-            op_name = str(getattr(op, "name", ""))
-            if op_name == "py.cast.identity":
-                operands = list(getattr(op, "operands", ()))
-                if not operands:
-                    return False
-                current = operands[0]
-                continue
-            return op_name == "py.func.object"

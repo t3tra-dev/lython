@@ -3,16 +3,21 @@
 //   - Dead tuple cleanup (removing tuples only used by DecRefOp)
 //   - Integer constant hoisting and CSE
 //   - Small integer DecRef removal (immortal integers -5 to 256)
-//   - String creation CSE (LyUnicode_FromUTF8)
 //   - Singleton getter CSE (Ly_GetBuiltinPrint, Ly_GetNone, etc.)
 //   - Bool boxing/unboxing elimination (LyBool_FromBool + LyBool_AsBool)
 //   - LLVM constant CSE
-//   - Dead code elimination for unused LLVM operations
+//   - Dead code elimination for unused LLVM/tensor producer operations
 
+#include "Optimizer/Utils.h"
+
+#include "Common/LoweringUtils.h"
 #include "Common/RuntimeSupport.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/Pass/Pass.h"
@@ -22,26 +27,20 @@
 
 #include <algorithm>
 
-#define GET_OP_CLASSES
-#include "PyOps.h.inc"
-#undef GET_OP_CLASSES
-
-using namespace mlir;
-
 namespace py::optimizer {
 
-Value stripIdentityCasts(Value value);
+mlir::Value value::stripCasts(mlir::Value value);
 
-bool isCallTo(LLVM::CallOp callOp, llvm::StringRef calleeName) {
+bool runtime::Call::is(mlir::LLVM::CallOp callOp, llvm::StringRef calleeName) {
   auto callee = callOp.getCallee();
   return callee && *callee == calleeName;
 }
 
-LLVM::CallOp getOptionalDecRefUser(Value value) {
-  LLVM::CallOp decRefCall = nullptr;
-  for (Operation *user : value.getUsers()) {
-    auto callUser = dyn_cast<LLVM::CallOp>(user);
-    if (!callUser || !isCallTo(callUser, RuntimeSymbols::kDecRef))
+mlir::LLVM::CallOp runtime::Call::optionalReleaseUser(mlir::Value value) {
+  mlir::LLVM::CallOp decRefCall = nullptr;
+  for (mlir::Operation *user : value.getUsers()) {
+    auto callUser = mlir::dyn_cast<mlir::LLVM::CallOp>(user);
+    if (!callUser || !runtime::Call::is(callUser, RuntimeSymbols::kDecRef))
       return nullptr;
     if (decRefCall)
       return nullptr;
@@ -50,12 +49,12 @@ LLVM::CallOp getOptionalDecRefUser(Value value) {
   return decRefCall;
 }
 
-void eraseCallAndOptionalDecRefUsers(LLVM::CallOp callOp) {
+void runtime::Call::eraseWithOptionalRelease(mlir::LLVM::CallOp callOp) {
   if (!callOp || callOp->getNumResults() != 1)
     return;
 
-  Value result = callOp.getResult();
-  LLVM::CallOp decRefCall = getOptionalDecRefUser(result);
+  mlir::Value result = callOp.getResult();
+  mlir::LLVM::CallOp decRefCall = runtime::Call::optionalReleaseUser(result);
   if (decRefCall)
     decRefCall->erase();
 
@@ -63,64 +62,73 @@ void eraseCallAndOptionalDecRefUsers(LLVM::CallOp callOp) {
     callOp->erase();
 }
 
-LLVM::LLVMFuncOp getOrCreateRuntimeFunc(ModuleOp module, StringRef name,
-                                        Type resultType, ValueRange operands) {
-  if (auto fn = module.lookupSymbol<LLVM::LLVMFuncOp>(name))
+mlir::LLVM::LLVMFuncOp runtime::Func::getOrCreate(mlir::ModuleOp module,
+                                                  llvm::StringRef name,
+                                                  mlir::Type resultType,
+                                                  mlir::ValueRange operands) {
+  if (auto fn = module.lookupSymbol<mlir::LLVM::LLVMFuncOp>(name))
     return fn;
 
-  OpBuilder moduleBuilder(module.getBodyRegion());
-  SmallVector<Type> argTypes;
+  mlir::OpBuilder moduleBuilder(module.getBodyRegion());
+  llvm::SmallVector<mlir::Type> argTypes;
   argTypes.reserve(operands.size());
-  for (Value operand : operands)
+  for (mlir::Value operand : operands)
     argTypes.push_back(operand.getType());
 
-  auto fnType = LLVM::LLVMFunctionType::get(resultType, argTypes, false);
-  return moduleBuilder.create<LLVM::LLVMFuncOp>(module.getLoc(), name, fnType);
+  auto fnType = mlir::LLVM::LLVMFunctionType::get(resultType, argTypes, false);
+  return moduleBuilder.create<mlir::LLVM::LLVMFuncOp>(module.getLoc(), name,
+                                                      fnType);
 }
 
-Value materializeI64FromLong(ModuleOp module, OpBuilder &builder, Location loc,
-                             Value boxedLong) {
-  if (auto fromI64Call = boxedLong.getDefiningOp<LLVM::CallOp>()) {
-    if (isCallTo(fromI64Call, RuntimeSymbols::kLongFromI64) &&
+mlir::Value runtime::Long::asI64(mlir::ModuleOp module,
+                                 mlir::OpBuilder &builder, mlir::Location loc,
+                                 mlir::Value boxedLong) {
+  if (auto fromI64Call = boxedLong.getDefiningOp<mlir::LLVM::CallOp>()) {
+    if (runtime::Call::is(fromI64Call, RuntimeSymbols::kLongFromI64) &&
         fromI64Call.getNumOperands() == 1) {
       return fromI64Call.getOperand(0);
     }
   }
 
-  auto asI64Func =
-      getOrCreateRuntimeFunc(module, RuntimeSymbols::kLongAsI64,
-                             builder.getI64Type(), ValueRange{boxedLong});
-  return builder.create<LLVM::CallOp>(loc, asI64Func, ValueRange{boxedLong})
+  auto asI64Func = runtime::Func::getOrCreate(
+      module, RuntimeSymbols::kLongAsI64, builder.getI64Type(),
+      mlir::ValueRange{boxedLong});
+  return builder
+      .create<mlir::LLVM::CallOp>(loc, asI64Func, mlir::ValueRange{boxedLong})
       .getResult();
 }
 
 /// Remove py.incref on !py.class values when it only survives because a
 /// tuple-consuming call was rewritten into a direct func.call that borrows
 /// the class slot.
-bool cleanupRedundantClassIncrefsAfterDirectCalls(ModuleOp module) {
-  SmallVector<IncRefOp> toErase;
+bool call::cleanupClassIncrefs(mlir::ModuleOp module) {
+  llvm::SmallVector<IncRefOp> toErase;
 
   module.walk([&](IncRefOp incref) {
-    Value object = incref.getObject();
-    if (!isa<ClassType>(object.getType()))
+    mlir::Value object = incref.getObject();
+    if (!mlir::isa<ClassType>(object.getType()))
       return;
 
-    for (Operation *cursor = incref->getNextNode(); cursor;
+    for (mlir::Operation *cursor = incref->getNextNode(); cursor;
          cursor = cursor->getNextNode()) {
-      if (isa<CastIdentityOp, func::ConstantOp>(cursor))
+      if (mlir::isa<mlir::UnrealizedConversionCastOp, mlir::func::ConstantOp>(
+              cursor))
         continue;
 
-      auto call = dyn_cast<func::CallOp>(cursor);
+      auto call = mlir::dyn_cast<mlir::func::CallOp>(cursor);
       if (!call)
         break;
 
-      bool passesClass = llvm::any_of(call.getOperands(), [&](Value operand) {
-        if (operand == object)
-          return true;
-        if (auto cast = operand.getDefiningOp<CastIdentityOp>())
-          return cast.getInput() == object;
-        return false;
-      });
+      bool passesClass =
+          llvm::any_of(call.getOperands(), [&](mlir::Value operand) {
+            if (operand == object)
+              return true;
+            if (auto cast =
+                    operand.getDefiningOp<mlir::UnrealizedConversionCastOp>())
+              return cast->getNumOperands() == 1 &&
+                     cast.getOperand(0) == object;
+            return false;
+          });
       if (passesClass)
         toErase.push_back(incref);
       break;
@@ -133,8 +141,8 @@ bool cleanupRedundantClassIncrefsAfterDirectCalls(ModuleOp module) {
   return !toErase.empty();
 }
 
-void removeUnusedNoneOps(ModuleOp module) {
-  SmallVector<NoneOp> toErase;
+void scalar::removeUnusedNone(mlir::ModuleOp module) {
+  llvm::SmallVector<NoneOp> toErase;
   module.walk([&](NoneOp op) {
     if (op.getResult().use_empty())
       toErase.push_back(op);
@@ -143,29 +151,30 @@ void removeUnusedNoneOps(ModuleOp module) {
     op.erase();
 }
 
-void removeNoneDecrefs(ModuleOp module) {
-  SmallVector<DecRefOp> toErase;
+void scalar::dropNoneDecrefs(mlir::ModuleOp module) {
+  llvm::SmallVector<DecRefOp> toErase;
   module.walk([&](DecRefOp op) {
-    if (isa<NoneType>(op.getObject().getType()))
+    if (mlir::isa<NoneType>(op.getObject().getType()))
       toErase.push_back(op);
   });
   for (DecRefOp op : toErase)
     op.erase();
 }
 
-void markConsumedAttrSetValues(ModuleOp module) {
-  SmallVector<DecRefOp> toErase;
+void consume::attrSetValues(mlir::ModuleOp module) {
+  llvm::SmallVector<DecRefOp> toErase;
 
   module.walk([&](AttrSetOp op) {
-    Value value = op.getValue();
-    if (!isPyType(value.getType()) || isa<NoneType, BoolType>(value.getType()))
+    mlir::Value value = op.getValue();
+    if (!isPyType(value.getType()) ||
+        mlir::isa<NoneType, BoolType>(value.getType()))
       return;
 
     DecRefOp trailingDrop;
-    for (Operation *user : value.getUsers()) {
+    for (mlir::Operation *user : value.getUsers()) {
       if (user == op.getOperation())
         continue;
-      auto decref = dyn_cast<DecRefOp>(user);
+      auto decref = mlir::dyn_cast<DecRefOp>(user);
       if (!decref || trailingDrop)
         return;
       trailingDrop = decref;
@@ -178,7 +187,7 @@ void markConsumedAttrSetValues(ModuleOp module) {
     if (!op->isBeforeInBlock(trailingDrop))
       return;
 
-    op->setAttr("lython.consume_value", UnitAttr::get(module.getContext()));
+    op->setAttr("ly.consume_value", mlir::UnitAttr::get(module.getContext()));
     toErase.push_back(trailingDrop);
   });
 
@@ -186,12 +195,13 @@ void markConsumedAttrSetValues(ModuleOp module) {
     op.erase();
 }
 
-void markConsumedListAppendValues(ModuleOp module) {
-  SmallVector<DecRefOp> toErase;
+void consume::listAppendValues(mlir::ModuleOp module) {
+  llvm::SmallVector<DecRefOp> toErase;
 
   module.walk([&](ListAppendOp op) {
-    Value value = op.getValue();
-    if (!isPyType(value.getType()) || isa<NoneType, BoolType>(value.getType()))
+    mlir::Value value = op.getValue();
+    if (!isPyType(value.getType()) ||
+        mlir::isa<NoneType, BoolType>(value.getType()))
       return;
     // Only steal ownership that was materialized explicitly for a publication
     // boundary. Borrowed values such as function arguments must keep the
@@ -200,10 +210,10 @@ void markConsumedListAppendValues(ModuleOp module) {
       return;
 
     DecRefOp trailingDrop;
-    for (Operation *user : value.getUsers()) {
+    for (mlir::Operation *user : value.getUsers()) {
       if (user == op.getOperation())
         continue;
-      auto decref = dyn_cast<DecRefOp>(user);
+      auto decref = mlir::dyn_cast<DecRefOp>(user);
       if (!decref || trailingDrop)
         return;
       trailingDrop = decref;
@@ -216,7 +226,7 @@ void markConsumedListAppendValues(ModuleOp module) {
     if (!op->isBeforeInBlock(trailingDrop))
       return;
 
-    op->setAttr("lython.consume_value", UnitAttr::get(module.getContext()));
+    op->setAttr("ly.consume_value", mlir::UnitAttr::get(module.getContext()));
     toErase.push_back(trailingDrop);
   });
 
@@ -224,16 +234,21 @@ void markConsumedListAppendValues(ModuleOp module) {
     op.erase();
 }
 
-Value stripIdentityCasts(Value value) {
-  while (auto identity = value.getDefiningOp<CastIdentityOp>())
-    value = identity.getInput();
+mlir::Value value::stripCasts(mlir::Value value) {
+  while (auto cast = value.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+    if (cast->getNumOperands() != 1)
+      break;
+    value = cast.getOperand(0);
+  }
   return value;
 }
 
-Value stripTransparentPublicationOps(Value value) {
+mlir::Value value::stripPublications(mlir::Value value) {
   while (true) {
-    if (auto identity = value.getDefiningOp<CastIdentityOp>()) {
-      value = identity.getInput();
+    if (auto cast = value.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+      if (cast->getNumOperands() != 1)
+        break;
+      value = cast.getOperand(0);
       continue;
     }
     if (auto publish = value.getDefiningOp<PublishOp>()) {
@@ -245,15 +260,15 @@ Value stripTransparentPublicationOps(Value value) {
   return value;
 }
 
-bool isPublicationSummaryResultType(Type type) {
-  return isa<ListType, DictType, TupleType, ObjectType, ClassType>(type);
+bool publication::tracks(mlir::Type type) {
+  return mlir::isa<ListType, DictType, TupleType, ObjectType, ClassType>(type);
 }
 
-bool arrayAttrContainsIndex(ArrayAttr attr, unsigned index) {
+bool attr::containsIndex(mlir::ArrayAttr attr, unsigned index) {
   if (!attr)
     return false;
-  for (Attribute element : attr) {
-    auto intAttr = dyn_cast<IntegerAttr>(element);
+  for (mlir::Attribute element : attr) {
+    auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(element);
     if (!intAttr)
       continue;
     if (intAttr.getInt() == static_cast<int64_t>(index))
@@ -262,31 +277,32 @@ bool arrayAttrContainsIndex(ArrayAttr attr, unsigned index) {
   return false;
 }
 
-FuncOp resolveDirectPyFuncSymbol(Operation *from, Value callable) {
-  callable = stripIdentityCasts(callable);
+FuncOp call::pyFunc(mlir::Operation *from, mlir::Value callable) {
+  callable = value::stripCasts(callable);
 
   if (auto funcObject = callable.getDefiningOp<FuncObjectOp>()) {
-    Operation *symbol =
-        SymbolTable::lookupNearestSymbolFrom(from, funcObject.getTargetAttr());
-    return dyn_cast_or_null<FuncOp>(symbol);
+    mlir::Operation *symbol = mlir::SymbolTable::lookupNearestSymbolFrom(
+        from, funcObject.getTargetAttr());
+    return mlir::dyn_cast_or_null<FuncOp>(symbol);
   }
   if (auto makeFunc = callable.getDefiningOp<MakeFunctionOp>()) {
-    Operation *symbol =
-        SymbolTable::lookupNearestSymbolFrom(from, makeFunc.getTargetAttr());
-    return dyn_cast_or_null<FuncOp>(symbol);
+    mlir::Operation *symbol = mlir::SymbolTable::lookupNearestSymbolFrom(
+        from, makeFunc.getTargetAttr());
+    return mlir::dyn_cast_or_null<FuncOp>(symbol);
   }
   return nullptr;
 }
 
-bool funcResultIsPublished(Operation *funcLike, unsigned resultIndex) {
-  return funcLike && arrayAttrContainsIndex(funcLike->getAttrOfType<ArrayAttr>(
-                                                "lython.returns_published"),
-                                            resultIndex);
+bool publication::result(mlir::Operation *funcLike, unsigned resultIndex) {
+  return funcLike &&
+         attr::containsIndex(
+             funcLike->getAttrOfType<mlir::ArrayAttr>("ly.returns_published"),
+             resultIndex);
 }
 
-int getEntryArgumentIndex(FuncOp func, Value value) {
-  value = stripTransparentPublicationOps(value);
-  auto arg = dyn_cast<BlockArgument>(value);
+int publication::entryArg(FuncOp func, mlir::Value value) {
+  value = ::py::optimizer::value::stripPublications(value);
+  auto arg = mlir::dyn_cast<mlir::BlockArgument>(value);
   if (!arg)
     return -1;
   if (arg.getOwner() != &func.getBody().front())
@@ -294,28 +310,28 @@ int getEntryArgumentIndex(FuncOp func, Value value) {
   return static_cast<int>(arg.getArgNumber());
 }
 
-ArrayAttr buildSortedIndexArrayAttr(MLIRContext *ctx,
-                                    const llvm::DenseSet<int> &indices) {
-  SmallVector<int64_t, 4> sorted(indices.begin(), indices.end());
+mlir::ArrayAttr attr::indexArray(mlir::MLIRContext *ctx,
+                                 const llvm::DenseSet<int> &indices) {
+  llvm::SmallVector<int64_t, 4> sorted(indices.begin(), indices.end());
   std::sort(sorted.begin(), sorted.end());
 
-  SmallVector<Attribute, 4> attrs;
+  llvm::SmallVector<mlir::Attribute, 4> attrs;
   attrs.reserve(sorted.size());
   for (int64_t idx : sorted)
-    attrs.push_back(IntegerAttr::get(IntegerType::get(ctx, 64), idx));
-  return ArrayAttr::get(ctx, attrs);
+    attrs.push_back(
+        mlir::IntegerAttr::get(mlir::IntegerType::get(ctx, 64), idx));
+  return mlir::ArrayAttr::get(ctx, attrs);
 }
 
-bool updateFuncPublicationSummaryAttrs(
-    FuncOp func, const llvm::DenseSet<int> &publishesArgs,
-    const llvm::DenseSet<int> &capturesPublished,
-    const llvm::DenseSet<int> &returnsPublished,
-    const llvm::DenseSet<int> &readonlyArgs,
-    const llvm::DenseSet<int> &mutableArgs) {
+bool publication::update(FuncOp func, const llvm::DenseSet<int> &publishesArgs,
+                         const llvm::DenseSet<int> &capturesPublished,
+                         const llvm::DenseSet<int> &returnsPublished,
+                         const llvm::DenseSet<int> &readonlyArgs,
+                         const llvm::DenseSet<int> &mutableArgs) {
   bool changed = false;
-  auto clearOrSetArrayAttr = [&](StringRef name,
+  auto clearOrSetArrayAttr = [&](llvm::StringRef name,
                                  const llvm::DenseSet<int> &indices) {
-    ArrayAttr current = func->getAttrOfType<ArrayAttr>(name);
+    mlir::ArrayAttr current = func->getAttrOfType<mlir::ArrayAttr>(name);
     if (indices.empty()) {
       if (current) {
         func->removeAttr(name);
@@ -323,32 +339,34 @@ bool updateFuncPublicationSummaryAttrs(
       }
       return;
     }
-    ArrayAttr updated = buildSortedIndexArrayAttr(func.getContext(), indices);
+    mlir::ArrayAttr updated = attr::indexArray(func.getContext(), indices);
     if (current == updated)
       return;
     func->setAttr(name, updated);
     changed = true;
   };
 
-  clearOrSetArrayAttr("lython.publishes_args", publishesArgs);
-  clearOrSetArrayAttr("lython.captures_published", capturesPublished);
-  clearOrSetArrayAttr("lython.returns_published", returnsPublished);
-  clearOrSetArrayAttr("lython.readonly_args", readonlyArgs);
-  clearOrSetArrayAttr("lython.mutable_args", mutableArgs);
+  clearOrSetArrayAttr("ly.publishes_args", publishesArgs);
+  clearOrSetArrayAttr("ly.captures_published", capturesPublished);
+  clearOrSetArrayAttr("ly.returns_published", returnsPublished);
+  clearOrSetArrayAttr("ly.readonly_args", readonlyArgs);
+  clearOrSetArrayAttr("ly.mutable_args", mutableArgs);
   return changed;
 }
 
-bool isDefinitelyPublishedStaticClassValue(Value value);
+bool class_state::published(mlir::Value value);
 
-static TupleCreateOp getStaticTupleCreate(Value value) {
-  value = stripIdentityCasts(value);
-  return dyn_cast_or_null<TupleCreateOp>(value.getDefiningOp());
+static TupleCreateOp getStaticTupleCreate(mlir::Value value) {
+  value = value::stripCasts(value);
+  return mlir::dyn_cast_or_null<TupleCreateOp>(value.getDefiningOp());
 }
 
-static Value stripStaticMetadataValue(Value value) {
+static mlir::Value stripStaticMetadataValue(mlir::Value value) {
   while (true) {
-    value = stripTransparentPublicationOps(value);
+    value = value::stripPublications(value);
     if (auto upcast = value.getDefiningOp<UpcastOp>()) {
+      if (isCompilerOwnedMemRefContainerType(upcast.getInput().getType()))
+        return value;
       value = upcast.getInput();
       continue;
     }
@@ -356,33 +374,47 @@ static Value stripStaticMetadataValue(Value value) {
   }
 }
 
-static bool collectStaticDictStringValues(Value dictValue,
-                                          llvm::StringMap<Value> &values) {
-  SmallVector<std::pair<StringRef, Value>, 8> reversed;
-  Value current = stripTransparentPublicationOps(dictValue);
-  while (auto insert = current.getDefiningOp<DictInsertOp>()) {
-    Value key = stripIdentityCasts(insert.getKey());
+static bool
+collectStaticDictStringValues(mlir::Value dictValue, mlir::Operation *beforeOp,
+                              llvm::StringMap<mlir::Value> &values) {
+  mlir::Value root = value::stripPublications(dictValue);
+  if (!root.getDefiningOp<DictEmptyOp>())
+    return false;
+
+  llvm::SmallVector<DictInsertOp, 8> inserts;
+  for (mlir::Operation *user : root.getUsers()) {
+    auto insert = mlir::dyn_cast<DictInsertOp>(user);
+    if (!insert)
+      continue;
+    if (beforeOp && insert->getBlock() != beforeOp->getBlock())
+      return false;
+    if (beforeOp && !insert->isBeforeInBlock(beforeOp))
+      continue;
+    inserts.push_back(insert);
+  }
+  llvm::sort(inserts, [](DictInsertOp lhs, DictInsertOp rhs) {
+    return lhs->isBeforeInBlock(rhs);
+  });
+
+  for (DictInsertOp insert : inserts) {
+    mlir::Value key = value::stripCasts(insert.getKey());
     auto strConst = key.getDefiningOp<StrConstantOp>();
     if (!strConst)
       return false;
-    reversed.push_back({strConst.getValueAttr().getValue(),
-                        stripStaticMetadataValue(insert.getValue())});
-    current = stripTransparentPublicationOps(insert.getDict());
+    values[strConst.getValueAttr().getValue()] =
+        stripStaticMetadataValue(insert.getValue());
   }
-  if (!current.getDefiningOp<DictEmptyOp>())
-    return false;
-  for (auto [key, value] : llvm::reverse(reversed))
-    values[key] = value;
   return true;
 }
 
-static bool collectStaticKeywordArgumentValues(Value namesValue,
-                                               Value valuesValue,
-                                               llvm::StringMap<Value> &values) {
-  namesValue = stripIdentityCasts(namesValue);
-  valuesValue = stripIdentityCasts(valuesValue);
-  if (isa_and_nonnull<TupleEmptyOp>(namesValue.getDefiningOp()) &&
-      isa_and_nonnull<TupleEmptyOp>(valuesValue.getDefiningOp()))
+static bool
+collectStaticKeywordArgumentValues(mlir::Value namesValue,
+                                   mlir::Value valuesValue,
+                                   llvm::StringMap<mlir::Value> &values) {
+  namesValue = value::stripCasts(namesValue);
+  valuesValue = value::stripCasts(valuesValue);
+  if (mlir::isa_and_nonnull<TupleEmptyOp>(namesValue.getDefiningOp()) &&
+      mlir::isa_and_nonnull<TupleEmptyOp>(valuesValue.getDefiningOp()))
     return true;
 
   auto names = namesValue.getDefiningOp<TupleCreateOp>();
@@ -393,7 +425,7 @@ static bool collectStaticKeywordArgumentValues(Value namesValue,
 
   for (auto [name, value] :
        llvm::zip(names.getElements(), args.getElements())) {
-    name = stripIdentityCasts(name);
+    name = value::stripCasts(name);
     auto strConst = name.getDefiningOp<StrConstantOp>();
     if (!strConst)
       return false;
@@ -403,26 +435,26 @@ static bool collectStaticKeywordArgumentValues(Value namesValue,
   return true;
 }
 
-void applyStaticMakeFunctionDefaults(ModuleOp module) {
-  SmallVector<CallVectorOp> calls;
+void call::staticDefaults(mlir::ModuleOp module) {
+  llvm::SmallVector<CallVectorOp> calls;
   module.walk([&](CallVectorOp op) { calls.push_back(op); });
 
   for (CallVectorOp call : calls) {
-    Value callable = stripIdentityCasts(call.getCallable());
+    mlir::Value callable = value::stripCasts(call.getCallable());
     auto makeFunc = callable.getDefiningOp<MakeFunctionOp>();
     if (!makeFunc || (!makeFunc.getDefaults() && !makeFunc.getKwdefaults() &&
                       !makeFunc.getClosure()))
       continue;
 
-    auto funcType = dyn_cast<FuncType>(makeFunc.getResult().getType());
+    auto funcType = mlir::dyn_cast<FuncType>(makeFunc.getResult().getType());
     if (!funcType)
       continue;
     auto signature = funcType.getSignature();
     if (signature.hasVararg())
       continue;
-    ArrayRef<Type> positionalTypes = signature.getPositionalTypes();
+    llvm::ArrayRef<mlir::Type> positionalTypes = signature.getPositionalTypes();
     unsigned positionalCount = static_cast<unsigned>(positionalTypes.size());
-    ArrayRef<Type> kwonlyTypes = signature.getKwOnlyTypes();
+    llvm::ArrayRef<mlir::Type> kwonlyTypes = signature.getKwOnlyTypes();
     unsigned kwonlyCount = static_cast<unsigned>(kwonlyTypes.size());
 
     TupleCreateOp posargs = getStaticTupleCreate(call.getPosargs());
@@ -433,7 +465,7 @@ void applyStaticMakeFunctionDefaults(ModuleOp module) {
     if (providedCount > positionalCount)
       continue;
 
-    SmallVector<Value, 8> elements;
+    llvm::SmallVector<mlir::Value, 8> elements;
     elements.append(posargs.getElements().begin(), posargs.getElements().end());
     if (providedCount < positionalCount) {
       TupleCreateOp defaults = getStaticTupleCreate(makeFunc.getDefaults());
@@ -452,25 +484,26 @@ void applyStaticMakeFunctionDefaults(ModuleOp module) {
     }
 
     if (kwonlyCount > 0) {
-      ArrayAttr kwonlyNames = nullptr;
-      if (Operation *symbol = SymbolTable::lookupNearestSymbolFrom(
+      mlir::ArrayAttr kwonlyNames = nullptr;
+      if (mlir::Operation *symbol = mlir::SymbolTable::lookupNearestSymbolFrom(
               call, makeFunc.getTargetAttr()))
-        if (auto targetFunc = dyn_cast<FuncOp>(symbol))
+        if (auto targetFunc = mlir::dyn_cast<FuncOp>(symbol))
           kwonlyNames = targetFunc.getKwonlyNamesAttr();
       if (!kwonlyNames || kwonlyNames.size() != kwonlyCount)
         continue;
-      llvm::StringMap<Value> kwdefaultValues;
+      llvm::StringMap<mlir::Value> kwdefaultValues;
       if (!makeFunc.getKwdefaults() ||
           !collectStaticDictStringValues(makeFunc.getKwdefaults(),
+                                         makeFunc.getOperation(),
                                          kwdefaultValues))
         continue;
-      llvm::StringMap<Value> explicitKwValues;
+      llvm::StringMap<mlir::Value> explicitKwValues;
       if (!collectStaticKeywordArgumentValues(
               call.getKwnames(), call.getKwvalues(), explicitKwValues))
         continue;
       bool missingDefault = false;
-      for (Attribute attr : kwonlyNames) {
-        auto nameAttr = dyn_cast<StringAttr>(attr);
+      for (mlir::Attribute attr : kwonlyNames) {
+        auto nameAttr = mlir::dyn_cast<mlir::StringAttr>(attr);
         if (!nameAttr) {
           missingDefault = true;
           break;
@@ -491,7 +524,7 @@ void applyStaticMakeFunctionDefaults(ModuleOp module) {
         continue;
     }
 
-    if (Value closureValue = makeFunc.getClosure()) {
+    if (mlir::Value closureValue = makeFunc.getClosure()) {
       TupleCreateOp closure = getStaticTupleCreate(closureValue);
       if (!closure)
         continue;
@@ -502,12 +535,12 @@ void applyStaticMakeFunctionDefaults(ModuleOp module) {
     if (elements.size() == posargs.getElements().size())
       continue;
 
-    SmallVector<Type, 8> elementTypes;
+    llvm::SmallVector<mlir::Type, 8> elementTypes;
     elementTypes.reserve(elements.size());
-    for (Value element : elements)
+    for (mlir::Value element : elements)
       elementTypes.push_back(element.getType());
 
-    OpBuilder builder(call);
+    mlir::OpBuilder builder(call);
     auto newTuple = builder.create<TupleCreateOp>(
         call.getLoc(), TupleType::get(module.getContext(), elementTypes),
         elements);
@@ -523,19 +556,19 @@ void applyStaticMakeFunctionDefaults(ModuleOp module) {
   }
 }
 
-static bool insertPublishBeforeOperand(Operation *owner,
+static bool insertPublishBeforeOperand(mlir::Operation *owner,
                                        unsigned operandIndex) {
-  Value operand = owner->getOperand(operandIndex);
-  if (!isPublicationSummaryResultType(operand.getType()))
+  mlir::Value operand = owner->getOperand(operandIndex);
+  if (!publication::tracks(operand.getType()))
     return false;
-  Value root = stripIdentityCasts(operand);
-  if (isa_and_nonnull<PublishOp>(root.getDefiningOp()))
+  mlir::Value root = value::stripCasts(operand);
+  if (mlir::isa_and_nonnull<PublishOp>(root.getDefiningOp()))
     return false;
-  if (isa<ClassType>(operand.getType()) &&
-      isDefinitelyPublishedStaticClassValue(operand))
+  if (mlir::isa<ClassType>(operand.getType()) &&
+      class_state::published(operand))
     return false;
 
-  OpBuilder builder(owner);
+  mlir::OpBuilder builder(owner);
   auto publish =
       builder.create<PublishOp>(owner->getLoc(), operand.getType(), operand);
   owner->setOperand(operandIndex, publish.getResult());
@@ -547,17 +580,17 @@ static bool insertPublishBeforeTupleElement(TupleCreateOp tupleCreate,
   if (!tupleCreate || operandIndex >= tupleCreate->getNumOperands())
     return false;
 
-  Value operand = tupleCreate->getOperand(operandIndex);
-  if (!isPublicationSummaryResultType(operand.getType()))
+  mlir::Value operand = tupleCreate->getOperand(operandIndex);
+  if (!publication::tracks(operand.getType()))
     return false;
-  Value root = stripIdentityCasts(operand);
-  if (isa_and_nonnull<PublishOp>(root.getDefiningOp()))
+  mlir::Value root = value::stripCasts(operand);
+  if (mlir::isa_and_nonnull<PublishOp>(root.getDefiningOp()))
     return false;
-  if (isa<ClassType>(operand.getType()) &&
-      isDefinitelyPublishedStaticClassValue(operand))
+  if (mlir::isa<ClassType>(operand.getType()) &&
+      class_state::published(operand))
     return false;
 
-  OpBuilder builder(tupleCreate);
+  mlir::OpBuilder builder(tupleCreate);
   auto publish = builder.create<PublishOp>(tupleCreate.getLoc(),
                                            operand.getType(), operand);
   tupleCreate->setOperand(operandIndex, publish.getResult());
@@ -567,13 +600,13 @@ static bool insertPublishBeforeTupleElement(TupleCreateOp tupleCreate,
 template <typename CallbackT>
 static void forEachDirectPositionalOperand(CallVectorOp op,
                                            CallbackT &&callback) {
-  auto kwnames = stripIdentityCasts(op.getKwnames());
-  auto kwvalues = stripIdentityCasts(op.getKwvalues());
-  if (!isa_and_nonnull<TupleEmptyOp>(kwnames.getDefiningOp()) ||
-      !isa_and_nonnull<TupleEmptyOp>(kwvalues.getDefiningOp()))
+  auto kwnames = value::stripCasts(op.getKwnames());
+  auto kwvalues = value::stripCasts(op.getKwvalues());
+  if (!mlir::isa_and_nonnull<TupleEmptyOp>(kwnames.getDefiningOp()) ||
+      !mlir::isa_and_nonnull<TupleEmptyOp>(kwvalues.getDefiningOp()))
     return;
 
-  Value posargs = stripIdentityCasts(op.getPosargs());
+  mlir::Value posargs = value::stripCasts(op.getPosargs());
   if (auto tupleCreate = posargs.getDefiningOp<TupleCreateOp>()) {
     for (auto [idx, operand] : llvm::enumerate(tupleCreate.getOperands()))
       callback(static_cast<unsigned>(idx), operand);
@@ -582,11 +615,11 @@ static void forEachDirectPositionalOperand(CallVectorOp op,
 
 template <typename CallbackT>
 static void forEachDirectPositionalOperand(CallOp op, CallbackT &&callback) {
-  Value kwargs = stripIdentityCasts(op.getKwargs());
-  if (!isa_and_nonnull<NoneOp>(kwargs.getDefiningOp()))
+  mlir::Value kwargs = value::stripCasts(op.getKwargs());
+  if (!mlir::isa_and_nonnull<NoneOp>(kwargs.getDefiningOp()))
     return;
 
-  Value posargs = stripIdentityCasts(op.getPosargs());
+  mlir::Value posargs = value::stripCasts(op.getPosargs());
   if (auto tupleCreate = posargs.getDefiningOp<TupleCreateOp>()) {
     for (auto [idx, operand] : llvm::enumerate(tupleCreate.getOperands()))
       callback(static_cast<unsigned>(idx), operand);
@@ -595,30 +628,30 @@ static void forEachDirectPositionalOperand(CallOp op, CallbackT &&callback) {
 
 template <typename CallbackT>
 static void forEachDirectPositionalOperand(InvokeOp op, CallbackT &&callback) {
-  auto kwnames = stripIdentityCasts(op.getKwnames());
-  auto kwvalues = stripIdentityCasts(op.getKwvalues());
-  if (!isa_and_nonnull<TupleEmptyOp>(kwnames.getDefiningOp()) ||
-      !isa_and_nonnull<TupleEmptyOp>(kwvalues.getDefiningOp()))
+  auto kwnames = value::stripCasts(op.getKwnames());
+  auto kwvalues = value::stripCasts(op.getKwvalues());
+  if (!mlir::isa_and_nonnull<TupleEmptyOp>(kwnames.getDefiningOp()) ||
+      !mlir::isa_and_nonnull<TupleEmptyOp>(kwvalues.getDefiningOp()))
     return;
 
-  Value posargs = stripIdentityCasts(op.getPosargs());
+  mlir::Value posargs = value::stripCasts(op.getPosargs());
   if (auto tupleCreate = posargs.getDefiningOp<TupleCreateOp>()) {
     for (auto [idx, operand] : llvm::enumerate(tupleCreate.getOperands()))
       callback(static_cast<unsigned>(idx), operand);
   }
 }
 
-static SmallVector<unsigned, 4>
+static llvm::SmallVector<unsigned, 4>
 getPublicationArgsForDirectCallee(CallVectorOp op) {
-  auto callee = resolveDirectPyFuncSymbol(op, op.getCallable());
+  auto callee = call::pyFunc(op, op.getCallable());
   if (!callee)
     return {};
   llvm::SmallDenseSet<unsigned, 4> indices;
-  auto collect = [&](ArrayAttr attr) {
+  auto collect = [&](mlir::ArrayAttr attr) {
     if (!attr)
       return;
-    for (Attribute element : attr) {
-      auto intAttr = dyn_cast<IntegerAttr>(element);
+    for (mlir::Attribute element : attr) {
+      auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(element);
       if (!intAttr)
         continue;
       int64_t argIndex = intAttr.getInt();
@@ -627,23 +660,24 @@ getPublicationArgsForDirectCallee(CallVectorOp op) {
       indices.insert(static_cast<unsigned>(argIndex));
     }
   };
-  collect(callee->getAttrOfType<ArrayAttr>("lython.publishes_args"));
-  collect(callee->getAttrOfType<ArrayAttr>("lython.captures_published"));
-  SmallVector<unsigned, 4> result(indices.begin(), indices.end());
+  collect(callee->getAttrOfType<mlir::ArrayAttr>("ly.publishes_args"));
+  collect(callee->getAttrOfType<mlir::ArrayAttr>("ly.captures_published"));
+  llvm::SmallVector<unsigned, 4> result(indices.begin(), indices.end());
   llvm::sort(result);
   return result;
 }
 
-static SmallVector<unsigned, 4> getPublicationArgsForDirectCallee(CallOp op) {
-  auto callee = resolveDirectPyFuncSymbol(op, op.getCallable());
+static llvm::SmallVector<unsigned, 4>
+getPublicationArgsForDirectCallee(CallOp op) {
+  auto callee = call::pyFunc(op, op.getCallable());
   if (!callee)
     return {};
   llvm::SmallDenseSet<unsigned, 4> indices;
-  auto collect = [&](ArrayAttr attr) {
+  auto collect = [&](mlir::ArrayAttr attr) {
     if (!attr)
       return;
-    for (Attribute element : attr) {
-      auto intAttr = dyn_cast<IntegerAttr>(element);
+    for (mlir::Attribute element : attr) {
+      auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(element);
       if (!intAttr)
         continue;
       int64_t argIndex = intAttr.getInt();
@@ -652,23 +686,24 @@ static SmallVector<unsigned, 4> getPublicationArgsForDirectCallee(CallOp op) {
       indices.insert(static_cast<unsigned>(argIndex));
     }
   };
-  collect(callee->getAttrOfType<ArrayAttr>("lython.publishes_args"));
-  collect(callee->getAttrOfType<ArrayAttr>("lython.captures_published"));
-  SmallVector<unsigned, 4> result(indices.begin(), indices.end());
+  collect(callee->getAttrOfType<mlir::ArrayAttr>("ly.publishes_args"));
+  collect(callee->getAttrOfType<mlir::ArrayAttr>("ly.captures_published"));
+  llvm::SmallVector<unsigned, 4> result(indices.begin(), indices.end());
   llvm::sort(result);
   return result;
 }
 
-static SmallVector<unsigned, 4> getPublicationArgsForDirectCallee(InvokeOp op) {
-  auto callee = resolveDirectPyFuncSymbol(op, op.getCallable());
+static llvm::SmallVector<unsigned, 4>
+getPublicationArgsForDirectCallee(InvokeOp op) {
+  auto callee = call::pyFunc(op, op.getCallable());
   if (!callee)
     return {};
   llvm::SmallDenseSet<unsigned, 4> indices;
-  auto collect = [&](ArrayAttr attr) {
+  auto collect = [&](mlir::ArrayAttr attr) {
     if (!attr)
       return;
-    for (Attribute element : attr) {
-      auto intAttr = dyn_cast<IntegerAttr>(element);
+    for (mlir::Attribute element : attr) {
+      auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(element);
       if (!intAttr)
         continue;
       int64_t argIndex = intAttr.getInt();
@@ -677,24 +712,26 @@ static SmallVector<unsigned, 4> getPublicationArgsForDirectCallee(InvokeOp op) {
       indices.insert(static_cast<unsigned>(argIndex));
     }
   };
-  collect(callee->getAttrOfType<ArrayAttr>("lython.publishes_args"));
-  collect(callee->getAttrOfType<ArrayAttr>("lython.captures_published"));
-  SmallVector<unsigned, 4> result(indices.begin(), indices.end());
+  collect(callee->getAttrOfType<mlir::ArrayAttr>("ly.publishes_args"));
+  collect(callee->getAttrOfType<mlir::ArrayAttr>("ly.captures_published"));
+  llvm::SmallVector<unsigned, 4> result(indices.begin(), indices.end());
   llvm::sort(result);
   return result;
 }
 
 static void collectMakeFunctionPublicationSites(
     MakeFunctionOp op,
-    SmallVectorImpl<std::pair<Operation *, unsigned>> &insertionSites,
-    SmallVectorImpl<std::pair<TupleCreateOp, unsigned>> &tupleInsertionSites) {
+    llvm::SmallVectorImpl<std::pair<mlir::Operation *, unsigned>>
+        &insertionSites,
+    llvm::SmallVectorImpl<std::pair<TupleCreateOp, unsigned>>
+        &tupleInsertionSites) {
   unsigned operandIndex = 0;
 
-  auto collectTupleElements = [&](Value tupleValue) {
-    Value root = stripIdentityCasts(tupleValue);
+  auto collectTupleElements = [&](mlir::Value tupleValue) {
+    mlir::Value root = value::stripCasts(tupleValue);
     if (auto tupleCreate = root.getDefiningOp<TupleCreateOp>()) {
       for (auto [idx, operand] : llvm::enumerate(tupleCreate.getOperands())) {
-        if (!isPublicationSummaryResultType(operand.getType()))
+        if (!publication::tracks(operand.getType()))
           continue;
         tupleInsertionSites.emplace_back(tupleCreate,
                                          static_cast<unsigned>(idx));
@@ -704,33 +741,33 @@ static void collectMakeFunctionPublicationSites(
     return false;
   };
 
-  if (Value defaults = op.getDefaults()) {
+  if (mlir::Value defaults = op.getDefaults()) {
     if (!collectTupleElements(defaults))
       insertionSites.emplace_back(op.getOperation(), operandIndex);
     ++operandIndex;
   }
-  if (Value kwdefaults = op.getKwdefaults()) {
+  if (mlir::Value kwdefaults = op.getKwdefaults()) {
     insertionSites.emplace_back(op.getOperation(), operandIndex);
     ++operandIndex;
   }
-  if (Value closure = op.getClosure()) {
+  if (mlir::Value closure = op.getClosure()) {
     if (!collectTupleElements(closure))
       insertionSites.emplace_back(op.getOperation(), operandIndex);
     ++operandIndex;
   }
-  if (Value annotations = op.getAnnotations()) {
+  if (mlir::Value annotations = op.getAnnotations()) {
     insertionSites.emplace_back(op.getOperation(), operandIndex);
     ++operandIndex;
   }
-  if (Value moduleName = op.getModule()) {
+  if (mlir::Value moduleName = op.getModule()) {
     insertionSites.emplace_back(op.getOperation(), operandIndex);
     ++operandIndex;
   }
 }
 
-void insertPublishesAtPublicationBoundaries(ModuleOp module) {
-  SmallVector<std::pair<Operation *, unsigned>, 16> insertionSites;
-  SmallVector<std::pair<TupleCreateOp, unsigned>, 16> tupleInsertionSites;
+void publication::insertBoundaries(mlir::ModuleOp module) {
+  llvm::SmallVector<std::pair<mlir::Operation *, unsigned>, 16> insertionSites;
+  llvm::SmallVector<std::pair<TupleCreateOp, unsigned>, 16> tupleInsertionSites;
 
   module.walk([&](ListAppendOp op) {
     insertionSites.emplace_back(op.getOperation(), 1);
@@ -742,13 +779,13 @@ void insertPublishesAtPublicationBoundaries(ModuleOp module) {
   });
 
   module.walk([&](AttrSetOp op) {
-    if (isDefinitelyPublishedStaticClassValue(op.getObject()))
+    if (class_state::published(op.getObject()))
       insertionSites.emplace_back(op.getOperation(), 1);
   });
 
   module.walk([&](ReturnOp op) {
     for (auto [operandIndex, operand] : llvm::enumerate(op.getOperands())) {
-      if (!isPublicationSummaryResultType(operand.getType()))
+      if (!publication::tracks(operand.getType()))
         continue;
       insertionSites.emplace_back(op.getOperation(),
                                   static_cast<unsigned>(operandIndex));
@@ -799,7 +836,7 @@ void insertPublishesAtPublicationBoundaries(ModuleOp module) {
     insertPublishBeforeTupleElement(tupleCreate, operandIndex);
 }
 
-void computeLocalPublicationSummaries(ModuleOp module) {
+void publication::compute(mlir::ModuleOp module) {
   bool changed = false;
   do {
     changed = false;
@@ -812,11 +849,11 @@ void computeLocalPublicationSummaries(ModuleOp module) {
       llvm::DenseSet<int> mutableArgs;
 
       func.walk([&](ListAppendOp op) {
-        int listArgIndex = getEntryArgumentIndex(func, op.getList());
+        int listArgIndex = publication::entryArg(func, op.getList());
         if (listArgIndex >= 0)
           mutableArgs.insert(listArgIndex);
 
-        int argIndex = getEntryArgumentIndex(func, op.getValue());
+        int argIndex = publication::entryArg(func, op.getValue());
         if (argIndex < 0)
           return;
         publishesArgs.insert(argIndex);
@@ -824,24 +861,24 @@ void computeLocalPublicationSummaries(ModuleOp module) {
       });
 
       func.walk([&](ListRemoveOp op) {
-        int argIndex = getEntryArgumentIndex(func, op.getList());
+        int argIndex = publication::entryArg(func, op.getList());
         if (argIndex >= 0)
           mutableArgs.insert(argIndex);
       });
 
       func.walk([&](ListGetOp op) {
-        int argIndex = getEntryArgumentIndex(func, op.getList());
+        int argIndex = publication::entryArg(func, op.getList());
         if (argIndex >= 0)
           readonlyArgs.insert(argIndex);
       });
 
       func.walk([&](DictInsertOp op) {
-        int dictArgIndex = getEntryArgumentIndex(func, op.getDict());
+        int dictArgIndex = publication::entryArg(func, op.getDict());
         if (dictArgIndex >= 0)
           mutableArgs.insert(dictArgIndex);
 
-        for (Value operand : {op.getKey(), op.getValue()}) {
-          int argIndex = getEntryArgumentIndex(func, operand);
+        for (mlir::Value operand : {op.getKey(), op.getValue()}) {
+          int argIndex = publication::entryArg(func, operand);
           if (argIndex < 0)
             continue;
           publishesArgs.insert(argIndex);
@@ -850,23 +887,23 @@ void computeLocalPublicationSummaries(ModuleOp module) {
       });
 
       func.walk([&](DictGetOp op) {
-        int argIndex = getEntryArgumentIndex(func, op.getDict());
+        int argIndex = publication::entryArg(func, op.getDict());
         if (argIndex >= 0)
           readonlyArgs.insert(argIndex);
       });
 
       func.walk([&](AttrSetOp op) {
-        if (!isDefinitelyPublishedStaticClassValue(op.getObject()))
+        if (!class_state::published(op.getObject()))
           return;
-        int argIndex = getEntryArgumentIndex(func, op.getValue());
+        int argIndex = publication::entryArg(func, op.getValue());
         if (argIndex < 0)
           return;
         publishesArgs.insert(argIndex);
         capturesPublished.insert(argIndex);
       });
 
-      auto recordEscapingArgument = [&](Value value) {
-        int argIndex = getEntryArgumentIndex(func, value);
+      auto recordEscapingArgument = [&](mlir::Value value) {
+        int argIndex = publication::entryArg(func, value);
         if (argIndex < 0)
           return;
         publishesArgs.insert(argIndex);
@@ -874,11 +911,11 @@ void computeLocalPublicationSummaries(ModuleOp module) {
       };
 
       func.walk([&](MakeFunctionOp op) {
-        auto recordTupleElements = [&](Value tupleValue) {
-          Value root = stripIdentityCasts(tupleValue);
+        auto recordTupleElements = [&](mlir::Value tupleValue) {
+          mlir::Value root = value::stripCasts(tupleValue);
           if (auto tupleCreate = root.getDefiningOp<TupleCreateOp>()) {
-            for (Value element : tupleCreate.getElements()) {
-              if (!isPublicationSummaryResultType(element.getType()))
+            for (mlir::Value element : tupleCreate.getElements()) {
+              if (!publication::tracks(element.getType()))
                 continue;
               recordEscapingArgument(element);
             }
@@ -887,22 +924,22 @@ void computeLocalPublicationSummaries(ModuleOp module) {
           return false;
         };
 
-        if (Value defaults = op.getDefaults())
+        if (mlir::Value defaults = op.getDefaults())
           if (!recordTupleElements(defaults) &&
-              isPublicationSummaryResultType(defaults.getType()))
+              publication::tracks(defaults.getType()))
             recordEscapingArgument(defaults);
 
-        if (Value kwdefaults = op.getKwdefaults())
-          if (isPublicationSummaryResultType(kwdefaults.getType()))
+        if (mlir::Value kwdefaults = op.getKwdefaults())
+          if (publication::tracks(kwdefaults.getType()))
             recordEscapingArgument(kwdefaults);
 
-        if (Value closure = op.getClosure())
+        if (mlir::Value closure = op.getClosure())
           if (!recordTupleElements(closure) &&
-              isPublicationSummaryResultType(closure.getType()))
+              publication::tracks(closure.getType()))
             recordEscapingArgument(closure);
 
-        if (Value annotations = op.getAnnotations())
-          if (isPublicationSummaryResultType(annotations.getType()))
+        if (mlir::Value annotations = op.getAnnotations())
+          if (publication::tracks(annotations.getType()))
             recordEscapingArgument(annotations);
       });
 
@@ -910,18 +947,20 @@ void computeLocalPublicationSummaries(ModuleOp module) {
         if (!callee)
           return;
 
-        llvm::DenseMap<unsigned, Value> operandByIndex;
-        forEachDirectPositionalOperand(op, [&](unsigned idx, Value operand) {
-          operandByIndex[idx] = operand;
-        });
+        llvm::DenseMap<unsigned, mlir::Value> operandByIndex;
+        forEachDirectPositionalOperand(op,
+                                       [&](unsigned idx, mlir::Value operand) {
+                                         operandByIndex[idx] = operand;
+                                       });
         if (operandByIndex.empty())
           return;
 
-        auto recordPublicationIndices = [&](ArrayAttr indices, bool capture) {
+        auto recordPublicationIndices = [&](mlir::ArrayAttr indices,
+                                            bool capture) {
           if (!indices)
             return;
-          for (Attribute element : indices) {
-            auto intAttr = dyn_cast<IntegerAttr>(element);
+          for (mlir::Attribute element : indices) {
+            auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(element);
             if (!intAttr)
               continue;
             int64_t formalIndex = intAttr.getInt();
@@ -930,7 +969,7 @@ void computeLocalPublicationSummaries(ModuleOp module) {
             auto it = operandByIndex.find(static_cast<unsigned>(formalIndex));
             if (it == operandByIndex.end())
               continue;
-            int argIndex = getEntryArgumentIndex(func, it->second);
+            int argIndex = publication::entryArg(func, it->second);
             if (argIndex < 0)
               continue;
             publishesArgs.insert(argIndex);
@@ -939,12 +978,12 @@ void computeLocalPublicationSummaries(ModuleOp module) {
           }
         };
 
-        auto recordAccessIndices = [&](ArrayAttr indices,
+        auto recordAccessIndices = [&](mlir::ArrayAttr indices,
                                        llvm::DenseSet<int> &target) {
           if (!indices)
             return;
-          for (Attribute element : indices) {
-            auto intAttr = dyn_cast<IntegerAttr>(element);
+          for (mlir::Attribute element : indices) {
+            auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(element);
             if (!intAttr)
               continue;
             int64_t formalIndex = intAttr.getInt();
@@ -953,47 +992,44 @@ void computeLocalPublicationSummaries(ModuleOp module) {
             auto it = operandByIndex.find(static_cast<unsigned>(formalIndex));
             if (it == operandByIndex.end())
               continue;
-            int argIndex = getEntryArgumentIndex(func, it->second);
+            int argIndex = publication::entryArg(func, it->second);
             if (argIndex >= 0)
               target.insert(argIndex);
           }
         };
 
         recordPublicationIndices(
-            callee->getAttrOfType<ArrayAttr>("lython.publishes_args"),
+            callee->getAttrOfType<mlir::ArrayAttr>("ly.publishes_args"),
             /*capture=*/false);
         recordPublicationIndices(
-            callee->getAttrOfType<ArrayAttr>("lython.captures_published"),
+            callee->getAttrOfType<mlir::ArrayAttr>("ly.captures_published"),
             /*capture=*/true);
         recordAccessIndices(
-            callee->getAttrOfType<ArrayAttr>("lython.readonly_args"),
+            callee->getAttrOfType<mlir::ArrayAttr>("ly.readonly_args"),
             readonlyArgs);
         recordAccessIndices(
-            callee->getAttrOfType<ArrayAttr>("lython.mutable_args"),
+            callee->getAttrOfType<mlir::ArrayAttr>("ly.mutable_args"),
             mutableArgs);
       };
 
       func.walk([&](CallVectorOp op) {
-        propagateFromCalleeSummary(
-            op, resolveDirectPyFuncSymbol(op, op.getCallable()));
+        propagateFromCalleeSummary(op, call::pyFunc(op, op.getCallable()));
       });
 
       func.walk([&](CallOp op) {
-        propagateFromCalleeSummary(
-            op, resolveDirectPyFuncSymbol(op, op.getCallable()));
+        propagateFromCalleeSummary(op, call::pyFunc(op, op.getCallable()));
       });
 
       func.walk([&](InvokeOp op) {
-        propagateFromCalleeSummary(
-            op, resolveDirectPyFuncSymbol(op, op.getCallable()));
+        propagateFromCalleeSummary(op, call::pyFunc(op, op.getCallable()));
       });
 
       func.walk([&](ReturnOp op) {
         for (auto [resultIndex, operand] : llvm::enumerate(op.getOperands())) {
-          if (!isPublicationSummaryResultType(operand.getType()))
+          if (!publication::tracks(operand.getType()))
             continue;
-          if (isa<ClassType>(operand.getType()) &&
-              !isDefinitelyPublishedStaticClassValue(operand))
+          if (mlir::isa<ClassType>(operand.getType()) &&
+              !class_state::published(operand))
             continue;
           returnsPublished.insert(static_cast<int>(resultIndex));
         }
@@ -1002,165 +1038,171 @@ void computeLocalPublicationSummaries(ModuleOp module) {
       for (int argIndex : mutableArgs)
         readonlyArgs.erase(argIndex);
 
-      changed |= updateFuncPublicationSummaryAttrs(
-          func, publishesArgs, capturesPublished, returnsPublished,
-          readonlyArgs, mutableArgs);
+      changed |=
+          publication::update(func, publishesArgs, capturesPublished,
+                              returnsPublished, readonlyArgs, mutableArgs);
     });
   } while (changed);
 }
 
-bool isDefinitelyLocalStaticClassValue(Value value) {
-  value = stripIdentityCasts(value);
+bool class_state::local(mlir::Value value) {
+  value = ::py::optimizer::value::stripCasts(value);
 
-  if (auto arg = dyn_cast<BlockArgument>(value)) {
+  if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(value)) {
     auto *owner = arg.getOwner();
     auto func =
-        owner ? dyn_cast_or_null<func::FuncOp>(owner->getParentOp()) : nullptr;
+        owner ? mlir::dyn_cast_or_null<mlir::func::FuncOp>(owner->getParentOp())
+              : nullptr;
     if (!func)
       return false;
     return arg.getArgNumber() == 0 &&
-           (static_cast<bool>(func->getAttr("lython.zero_initialized_self")) ||
-            static_cast<bool>(func->getAttr("lython.local_self_arg0")));
+           (static_cast<bool>(func->getAttr("ly.zero_initialized_self")) ||
+            static_cast<bool>(func->getAttr("ly.local_self_arg0")));
   }
 
-  if (!isa<ClassType>(value.getType()))
+  if (!mlir::isa<ClassType>(value.getType()))
     return false;
 
-  Operation *def = value.getDefiningOp();
+  mlir::Operation *def = value.getDefiningOp();
   if (!def)
     return false;
-  if (isa<ClassNewOp>(def))
+  if (mlir::isa<ClassNewOp>(def))
     return true;
-  if (isa<PublishOp, ClassPromoteOp, ListGetOp>(def))
+  if (mlir::isa<PublishOp, ClassPromoteOp, ListGetOp>(def))
     return false;
   return false;
 }
 
-bool isDefinitelyFreshStaticClassValue(Value value) {
-  value = stripIdentityCasts(value);
+bool class_state::fresh(mlir::Value value) {
+  value = ::py::optimizer::value::stripCasts(value);
 
-  if (auto arg = dyn_cast<BlockArgument>(value)) {
+  if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(value)) {
     auto *owner = arg.getOwner();
     auto func =
-        owner ? dyn_cast_or_null<func::FuncOp>(owner->getParentOp()) : nullptr;
+        owner ? mlir::dyn_cast_or_null<mlir::func::FuncOp>(owner->getParentOp())
+              : nullptr;
     return func && arg.getArgNumber() == 0 &&
-           static_cast<bool>(func->getAttr("lython.zero_initialized_self"));
+           static_cast<bool>(func->getAttr("ly.zero_initialized_self"));
   }
 
-  return isa_and_nonnull<ClassNewOp>(value.getDefiningOp());
+  return mlir::isa_and_nonnull<ClassNewOp>(value.getDefiningOp());
 }
 
-bool isDefinitelyPublishedStaticClassValue(Value value) {
-  value = stripIdentityCasts(value);
-  if (!isa<ClassType>(value.getType()))
+bool class_state::published(mlir::Value value) {
+  value = ::py::optimizer::value::stripCasts(value);
+  if (!mlir::isa<ClassType>(value.getType()))
     return false;
 
-  if (auto arg = dyn_cast<BlockArgument>(value)) {
-    Block *owner = arg.getOwner();
+  if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(value)) {
+    mlir::Block *owner = arg.getOwner();
     if (!owner)
       return false;
-    Block *pred = owner->getUniquePredecessor();
+    mlir::Block *pred = owner->getUniquePredecessor();
     if (!pred)
       return false;
-    auto invoke = dyn_cast_or_null<InvokeOp>(pred->getTerminator());
+    auto invoke = mlir::dyn_cast_or_null<InvokeOp>(pred->getTerminator());
     if (!invoke || invoke.getNormalDest() != owner)
       return false;
-    auto callee = resolveDirectPyFuncSymbol(invoke, invoke.getCallable());
-    return funcResultIsPublished(callee, arg.getArgNumber());
+    auto callee = call::pyFunc(invoke, invoke.getCallable());
+    return publication::result(callee, arg.getArgNumber());
   }
 
-  Operation *def = value.getDefiningOp();
+  mlir::Operation *def = value.getDefiningOp();
   if (!def)
     return false;
-  if (isa<PublishOp, ClassPromoteOp, ListGetOp>(def))
+  if (mlir::isa<PublishOp, ClassPromoteOp, ListGetOp>(def))
     return true;
 
-  auto result = dyn_cast<OpResult>(value);
+  auto result = mlir::dyn_cast<mlir::OpResult>(value);
   if (!result)
     return false;
 
-  if (auto call = dyn_cast<CallOp>(def))
-    return funcResultIsPublished(
-        resolveDirectPyFuncSymbol(call, call.getCallable()),
+  if (auto call = mlir::dyn_cast<CallOp>(def))
+    return publication::result(
+        ::py::optimizer::call::pyFunc(call, call.getCallable()),
         result.getResultNumber());
 
-  if (auto call = dyn_cast<CallVectorOp>(def))
-    return funcResultIsPublished(
-        resolveDirectPyFuncSymbol(call, call.getCallable()),
+  if (auto call = mlir::dyn_cast<CallVectorOp>(def))
+    return publication::result(
+        ::py::optimizer::call::pyFunc(call, call.getCallable()),
         result.getResultNumber());
 
-  if (auto call = dyn_cast<func::CallOp>(def)) {
-    ModuleOp module = call->getParentOfType<ModuleOp>();
+  if (auto call = mlir::dyn_cast<mlir::func::CallOp>(def)) {
+    mlir::ModuleOp module = call->getParentOfType<mlir::ModuleOp>();
     if (!module)
       return false;
-    return funcResultIsPublished(
-        module.lookupSymbol<func::FuncOp>(call.getCallee()),
+    return publication::result(
+        module.lookupSymbol<mlir::func::FuncOp>(call.getCallee()),
         result.getResultNumber());
   }
 
   return false;
 }
 
-func::FuncOp resolveLocalSelfHelper(func::FuncOp callee, ModuleOp module) {
+mlir::func::FuncOp call::localSelfHelper(mlir::func::FuncOp callee,
+                                         mlir::ModuleOp module) {
   auto helperAttr =
-      callee->getAttrOfType<SymbolRefAttr>("lython.local_self_helper");
+      callee->getAttrOfType<mlir::SymbolRefAttr>("ly.local_self_helper");
   if (!helperAttr)
     return nullptr;
   auto helperName = helperAttr.getLeafReference().empty()
                         ? helperAttr.getRootReference().getValue()
                         : helperAttr.getLeafReference().getValue();
-  return module.lookupSymbol<func::FuncOp>(helperName);
+  return module.lookupSymbol<mlir::func::FuncOp>(helperName);
 }
 
-func::FuncOp resolveFreshInitHelper(func::FuncOp callee, ModuleOp module) {
+mlir::func::FuncOp call::freshInitHelper(mlir::func::FuncOp callee,
+                                         mlir::ModuleOp module) {
   auto helperAttr =
-      callee->getAttrOfType<SymbolRefAttr>("lython.fresh_init_helper");
+      callee->getAttrOfType<mlir::SymbolRefAttr>("ly.fresh_init_helper");
   if (!helperAttr)
     return nullptr;
   auto helperName = helperAttr.getLeafReference().empty()
                         ? helperAttr.getRootReference().getValue()
                         : helperAttr.getLeafReference().getValue();
-  return module.lookupSymbol<func::FuncOp>(helperName);
+  return module.lookupSymbol<mlir::func::FuncOp>(helperName);
 }
 
-std::string getPublishedBorrowHelperAttrName(unsigned argIndex) {
-  return "lython.published_borrow_helper_arg" + std::to_string(argIndex);
+std::string call::publishedBorrowAttr(unsigned argIndex) {
+  return ::py::publication::borrow::Attr::name(argIndex);
 }
 
-func::FuncOp resolvePublishedBorrowHelper(func::FuncOp callee,
-                                          unsigned argIndex, ModuleOp module) {
-  auto helperAttr = callee->getAttrOfType<SymbolRefAttr>(
-      getPublishedBorrowHelperAttrName(argIndex));
+mlir::func::FuncOp call::publishedBorrowHelper(mlir::func::FuncOp callee,
+                                               unsigned argIndex,
+                                               mlir::ModuleOp module) {
+  auto helperAttr = callee->getAttrOfType<mlir::SymbolRefAttr>(
+      call::publishedBorrowAttr(argIndex));
   if (!helperAttr)
     return nullptr;
   auto helperName = helperAttr.getLeafReference().empty()
                         ? helperAttr.getRootReference().getValue()
                         : helperAttr.getLeafReference().getValue();
-  return module.lookupSymbol<func::FuncOp>(helperName);
+  return module.lookupSymbol<mlir::func::FuncOp>(helperName);
 }
 
-func::FuncOp resolvePreferredDirectCallTarget(func::FuncOp callee,
-                                              func::CallOp call,
-                                              ModuleOp module) {
-  func::FuncOp preferredTarget = callee;
+mlir::func::FuncOp call::preferredTarget(mlir::func::FuncOp callee,
+                                         mlir::func::CallOp call,
+                                         mlir::ModuleOp module) {
+  mlir::func::FuncOp preferredTarget = callee;
 
   if (call.getNumOperands() != 0) {
-    if (isDefinitelyFreshStaticClassValue(call.getOperand(0))) {
-      if (auto freshHelper = resolveFreshInitHelper(preferredTarget, module))
+    if (class_state::fresh(call.getOperand(0))) {
+      if (auto freshHelper =
+              ::py::optimizer::call::freshInitHelper(preferredTarget, module))
         preferredTarget = freshHelper;
     }
-    if (preferredTarget == callee &&
-        isDefinitelyLocalStaticClassValue(call.getOperand(0))) {
-      if (auto localHelper = resolveLocalSelfHelper(preferredTarget, module))
+    if (preferredTarget == callee && class_state::local(call.getOperand(0))) {
+      if (auto localHelper =
+              ::py::optimizer::call::localSelfHelper(preferredTarget, module))
         preferredTarget = localHelper;
     }
   }
 
   for (unsigned idx = 1; idx < call.getNumOperands(); ++idx) {
-    if (!isDefinitelyPublishedStaticClassValue(call.getOperand(idx)))
+    if (!class_state::published(call.getOperand(idx)))
       continue;
-    if (auto publishedHelper =
-            resolvePublishedBorrowHelper(preferredTarget, idx, module)) {
+    if (auto publishedHelper = ::py::optimizer::call::publishedBorrowHelper(
+            preferredTarget, idx, module)) {
       preferredTarget = publishedHelper;
     }
   }
@@ -1168,16 +1210,16 @@ func::FuncOp resolvePreferredDirectCallTarget(func::FuncOp callee,
   return preferredTarget;
 }
 
-void rewriteDirectFuncCallsToPreferredHelpers(ModuleOp module) {
-  SmallVector<func::CallOp> toRewrite;
+void call::rewritePreferred(mlir::ModuleOp module) {
+  llvm::SmallVector<mlir::func::CallOp> toRewrite;
 
-  module.walk([&](func::CallOp call) {
-    auto callee = module.lookupSymbol<func::FuncOp>(call.getCallee());
+  module.walk([&](mlir::func::CallOp call) {
+    auto callee = module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
     if (!callee)
       return;
 
     auto preferredHelper =
-        resolvePreferredDirectCallTarget(callee, call, module);
+        ::py::optimizer::call::preferredTarget(callee, call, module);
     if (!preferredHelper || preferredHelper == callee)
       return;
 
@@ -1198,29 +1240,29 @@ void rewriteDirectFuncCallsToPreferredHelpers(ModuleOp module) {
     toRewrite.push_back(call);
   });
 
-  for (func::CallOp call : toRewrite) {
-    auto callee = module.lookupSymbol<func::FuncOp>(call.getCallee());
+  for (mlir::func::CallOp call : toRewrite) {
+    auto callee = module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
     if (!callee)
       continue;
     auto preferredHelper =
-        resolvePreferredDirectCallTarget(callee, call, module);
+        ::py::optimizer::call::preferredTarget(callee, call, module);
     if (!preferredHelper || preferredHelper == callee)
       continue;
-    OpBuilder builder(call);
-    auto replacement = builder.create<func::CallOp>(
+    mlir::OpBuilder builder(call);
+    auto replacement = builder.create<mlir::func::CallOp>(
         call.getLoc(), preferredHelper, call.getOperands());
     call.replaceAllUsesWith(replacement.getResults());
     call.erase();
   }
 }
 
-void eliminateRedundantClassPublishes(ModuleOp module) {
-  SmallVector<PublishOp> toErase;
+void class_state::eliminatePublishes(mlir::ModuleOp module) {
+  llvm::SmallVector<PublishOp> toErase;
 
   module.walk([&](PublishOp op) {
-    if (!isa<ClassType>(op.getResult().getType()))
+    if (!mlir::isa<ClassType>(op.getResult().getType()))
       return;
-    if (!isDefinitelyPublishedStaticClassValue(op.getInput()))
+    if (!class_state::published(op.getInput()))
       return;
 
     op.getResult().replaceAllUsesWith(op.getInput());
@@ -1231,77 +1273,86 @@ void eliminateRedundantClassPublishes(ModuleOp module) {
     op.erase();
 }
 
-void markKnownLocalStaticClassAccesses(ModuleOp module) {
-  module.walk([&](Operation *op) {
-    Value object;
-    if (auto attrGet = dyn_cast<AttrGetOp>(op)) {
+static bool isZeroCostLocalClassFieldCandidate(mlir::Type fieldType) {
+  return !mlir::isa<ClassType, ListType, TupleType, DictType>(fieldType);
+}
+
+void class_state::proveLocalAccess(mlir::ModuleOp module) {
+  module.walk([&](mlir::Operation *op) {
+    mlir::Value object;
+    mlir::Type fieldType;
+    if (auto attrGet = mlir::dyn_cast<AttrGetOp>(op)) {
       object = attrGet.getObject();
-    } else if (auto attrSet = dyn_cast<AttrSetOp>(op)) {
+      fieldType = attrGet.getResult().getType();
+    } else if (auto attrSet = mlir::dyn_cast<AttrSetOp>(op)) {
       object = attrSet.getObject();
+      fieldType = attrSet.getValue().getType();
     } else {
       return;
     }
 
-    if (!isDefinitelyLocalStaticClassValue(object))
+    if (!class_state::local(object))
+      return;
+    if (!isZeroCostLocalClassFieldCandidate(fieldType))
       return;
 
-    op->setAttr("lython.known_local_class_access",
-                UnitAttr::get(module.getContext()));
+    op->setAttr("ly.proven_local_class_access",
+                mlir::UnitAttr::get(module.getContext()));
   });
 }
 
-void markZeroInitializedSelfFirstStores(ModuleOp module) {
+void class_state::markFirstStores(mlir::ModuleOp module) {
   module.walk([&](AttrSetOp op) {
-    auto parentFunc = op->getParentOfType<func::FuncOp>();
-    if (!parentFunc || !parentFunc->getAttr("lython.zero_initialized_self"))
+    auto parentFunc = op->getParentOfType<mlir::func::FuncOp>();
+    if (!parentFunc || !parentFunc->getAttr("ly.zero_initialized_self"))
       return;
     if (!parentFunc.getBody().hasOneBlock())
       return;
 
-    Value objectRoot = stripIdentityCasts(op.getObject());
-    auto selfArg = dyn_cast<BlockArgument>(objectRoot);
+    mlir::Value objectRoot = value::stripCasts(op.getObject());
+    auto selfArg = mlir::dyn_cast<mlir::BlockArgument>(objectRoot);
     if (!selfArg || selfArg.getOwner() != &parentFunc.getBody().front() ||
         selfArg.getArgNumber() != 0)
       return;
 
-    for (Operation *cursor = op->getPrevNode(); cursor;
+    for (mlir::Operation *cursor = op->getPrevNode(); cursor;
          cursor = cursor->getPrevNode()) {
       bool touchesSelf =
-          llvm::any_of(cursor->getOperands(), [&](Value operand) {
-            return stripIdentityCasts(operand) == objectRoot;
+          llvm::any_of(cursor->getOperands(), [&](mlir::Value operand) {
+            return value::stripCasts(operand) == objectRoot;
           });
       if (!touchesSelf)
         continue;
 
-      if (auto prevSet = dyn_cast<AttrSetOp>(cursor)) {
-        if (stripIdentityCasts(prevSet.getObject()) == objectRoot &&
+      if (auto prevSet = mlir::dyn_cast<AttrSetOp>(cursor)) {
+        if (value::stripCasts(prevSet.getObject()) == objectRoot &&
             prevSet.getNameAttr() == op.getNameAttr())
           return;
         continue;
       }
 
-      if (isa<CastIdentityOp, AttrGetOp>(cursor))
+      if (mlir::isa<mlir::UnrealizedConversionCastOp, AttrGetOp>(cursor))
         continue;
 
       return;
     }
 
-    op->setAttr("lython.zero_init_first_store",
-                UnitAttr::get(module.getContext()));
+    op->setAttr("ly.zero_init_first_store",
+                mlir::UnitAttr::get(module.getContext()));
   });
 }
 
 /// Hoist integer constants to entry block and perform CSE.
-void hoistIntConstants(ModuleOp module) {
-  module.walk([&](func::FuncOp func) {
+void scalar::hoistInts(mlir::ModuleOp module) {
+  module.walk([&](mlir::func::FuncOp func) {
     if (func.isExternal())
       return;
 
-    Block &entryBlock = func.getBody().front();
+    mlir::Block &entryBlock = func.getBody().front();
     llvm::StringMap<IntConstantOp> constantMap;
 
     // First pass: collect all IntConstantOp
-    SmallVector<IntConstantOp> allConstants;
+    llvm::SmallVector<IntConstantOp> allConstants;
     func.walk([&](IntConstantOp op) { allConstants.push_back(op); });
 
     // Second pass: CSE and hoist (using string value as key)
@@ -1325,11 +1376,11 @@ void hoistIntConstants(ModuleOp module) {
 
 /// Remove DecRef for small integer constants (-5 to 256).
 /// These are immortal in Python's small integer cache.
-void removeSmallIntDecrefs(ModuleOp module) {
-  SmallVector<DecRefOp> toErase;
+void scalar::dropSmallIntDecrefs(mlir::ModuleOp module) {
+  llvm::SmallVector<DecRefOp> toErase;
 
   module.walk([&](DecRefOp decref) {
-    Value obj = decref.getObject();
+    mlir::Value obj = decref.getObject();
     if (auto intConst = obj.getDefiningOp<IntConstantOp>()) {
       llvm::StringRef valueStr = intConst.getValue();
       // Parse the string to check if it's in small int range
@@ -1347,95 +1398,18 @@ void removeSmallIntDecrefs(ModuleOp module) {
     op->erase();
 }
 
-// Post-lowering optimizations (operate on LLVM dialect ops)
-
-/// CSE for LyUnicode_FromUTF8 calls within each function.
-/// This reduces redundant string key creation for attribute access.
-/// After CSE, adds DecRef at function end for the cached strings.
-void cseStringCreation(ModuleOp module) {
-  module.walk([&](func::FuncOp func) {
-    if (func.isExternal())
-      return;
-
-    DominanceInfo dom(func);
-
-    // Map from (string_global_symbol, length) -> first call result
-    llvm::DenseMap<std::pair<StringRef, int64_t>, LLVM::CallOp> stringCache;
-    SmallVector<LLVM::CallOp> toErase;
-    SmallVector<LLVM::CallOp> cachedStrings;
-
-    func.walk([&](LLVM::CallOp callOp) {
-      auto callee = callOp.getCallee();
-      if (!callee || *callee != "LyUnicode_FromUTF8")
-        return;
-
-      // Get the string global and length arguments
-      if (callOp.getNumOperands() != 2)
-        return;
-
-      // First operand should be a GEP pointing to a global string
-      auto gepOp = callOp.getOperand(0).getDefiningOp<LLVM::GEPOp>();
-      if (!gepOp)
-        return;
-      auto addrOp = gepOp.getBase().getDefiningOp<LLVM::AddressOfOp>();
-      if (!addrOp)
-        return;
-      StringRef globalName = addrOp.getGlobalName();
-
-      // Second operand should be a constant length
-      auto lenConst = callOp.getOperand(1).getDefiningOp<LLVM::ConstantOp>();
-      if (!lenConst)
-        return;
-      auto lenAttr = llvm::dyn_cast<IntegerAttr>(lenConst.getValue());
-      if (!lenAttr)
-        return;
-      int64_t len = lenAttr.getInt();
-
-      auto key = std::make_pair(globalName, len);
-      auto it = stringCache.find(key);
-      if (it != stringCache.end()) {
-        // Replace with cached result
-        callOp.getResult().replaceAllUsesWith(it->second.getResult());
-        toErase.push_back(callOp);
-      } else {
-        stringCache[key] = callOp;
-        cachedStrings.push_back(callOp);
-      }
-    });
-
-    for (auto op : toErase)
-      op->erase();
-
-    // Add DecRef for cached strings before each return
-    if (!cachedStrings.empty()) {
-      func.walk([&](func::ReturnOp returnOp) {
-        OpBuilder builder(returnOp);
-        auto decrefFunc = module.lookupSymbol<LLVM::LLVMFuncOp>("Ly_DecRef");
-        if (decrefFunc) {
-          for (auto cachedCall : cachedStrings) {
-            if (!dom.dominates(cachedCall, returnOp))
-              continue;
-            builder.create<LLVM::CallOp>(returnOp.getLoc(), decrefFunc,
-                                         ValueRange{cachedCall.getResult()});
-          }
-        }
-      });
-    }
-  });
-}
-
 /// CSE for singleton getter calls (Ly_GetBuiltinPrint, Ly_GetNone). These
 /// return borrowed references to singletons, so no DecRef needed.
-void cseSingletonGetters(ModuleOp module) {
-  module.walk([&](func::FuncOp func) {
+void scalar::cseSingletons(mlir::ModuleOp module) {
+  module.walk([&](mlir::func::FuncOp func) {
     if (func.isExternal())
       return;
 
     // Cache for each singleton getter function
-    llvm::StringMap<LLVM::CallOp> singletonCache;
-    SmallVector<LLVM::CallOp> toErase;
+    llvm::StringMap<mlir::LLVM::CallOp> singletonCache;
+    llvm::SmallVector<mlir::LLVM::CallOp> toErase;
 
-    func.walk([&](LLVM::CallOp callOp) {
+    func.walk([&](mlir::LLVM::CallOp callOp) {
       auto callee = callOp.getCallee();
       if (!callee)
         return;
@@ -1444,7 +1418,7 @@ void cseSingletonGetters(ModuleOp module) {
       if (*callee != "Ly_GetBuiltinPrint" && *callee != "Ly_GetNone")
         return;
 
-      StringRef funcName = *callee;
+      llvm::StringRef funcName = *callee;
       auto it = singletonCache.find(funcName);
       if (it != singletonCache.end()) {
         // Replace with cached result
@@ -1466,11 +1440,11 @@ void cseSingletonGetters(ModuleOp module) {
 ///   %unboxed = llvm.call @LyBool_AsBool(%boxed) : (!llvm.ptr) -> i1
 ///   llvm.call @Ly_DecRef(%boxed) : (!llvm.ptr) -> ()
 /// Replaced with direct use of %i1_val.
-void eliminateBoolBoxingUnboxing(ModuleOp module) {
-  SmallVector<LLVM::CallOp> fromBoolCalls;
+void scalar::elideBoolBoxing(mlir::ModuleOp module) {
+  llvm::SmallVector<mlir::LLVM::CallOp> fromBoolCalls;
 
   // First pass: find all LyBool_FromBool calls
-  module.walk([&](LLVM::CallOp callOp) {
+  module.walk([&](mlir::LLVM::CallOp callOp) {
     auto callee = callOp.getCallee();
     if (callee && *callee == "LyBool_FromBool")
       fromBoolCalls.push_back(callOp);
@@ -1481,16 +1455,16 @@ void eliminateBoolBoxingUnboxing(ModuleOp module) {
     if (fromBoolCall.getNumOperands() != 1)
       continue;
 
-    Value i1Value = fromBoolCall.getOperand(0);
-    Value boxedValue = fromBoolCall.getResult();
+    mlir::Value i1Value = fromBoolCall.getOperand(0);
+    mlir::Value boxedValue = fromBoolCall.getResult();
 
     // Find users of the boxed value
-    LLVM::CallOp asBoolCall = nullptr;
-    LLVM::CallOp decRefCall = nullptr;
+    mlir::LLVM::CallOp asBoolCall = nullptr;
+    mlir::LLVM::CallOp decRefCall = nullptr;
     bool hasOtherUsers = false;
 
-    for (Operation *user : boxedValue.getUsers()) {
-      if (auto callUser = dyn_cast<LLVM::CallOp>(user)) {
+    for (mlir::Operation *user : boxedValue.getUsers()) {
+      if (auto callUser = mlir::dyn_cast<mlir::LLVM::CallOp>(user)) {
         auto callee = callUser.getCallee();
         if (callee && *callee == "LyBool_AsBool" && !asBoolCall) {
           asBoolCall = callUser;
@@ -1528,11 +1502,11 @@ void eliminateBoolBoxingUnboxing(ModuleOp module) {
 ///   %unboxed = llvm.call @LyLong_AsI64(%boxed) : (!llvm.ptr) -> i64
 ///   llvm.call @Ly_DecRef(%boxed) : (!llvm.ptr) -> ()
 /// Replaced with direct use of %i64_val.
-void eliminateLongBoxingUnboxing(ModuleOp module) {
-  SmallVector<LLVM::CallOp> fromI64Calls;
+void scalar::elideLongBoxing(mlir::ModuleOp module) {
+  llvm::SmallVector<mlir::LLVM::CallOp> fromI64Calls;
 
-  module.walk([&](LLVM::CallOp callOp) {
-    if (isCallTo(callOp, RuntimeSymbols::kLongFromI64))
+  module.walk([&](mlir::LLVM::CallOp callOp) {
+    if (runtime::Call::is(callOp, RuntimeSymbols::kLongFromI64))
       fromI64Calls.push_back(callOp);
   });
 
@@ -1540,23 +1514,25 @@ void eliminateLongBoxingUnboxing(ModuleOp module) {
     if (fromI64Call.getNumOperands() != 1)
       continue;
 
-    Value i64Value = fromI64Call.getOperand(0);
-    Value boxedValue = fromI64Call.getResult();
+    mlir::Value i64Value = fromI64Call.getOperand(0);
+    mlir::Value boxedValue = fromI64Call.getResult();
 
-    LLVM::CallOp asI64Call = nullptr;
-    LLVM::CallOp decRefCall = nullptr;
+    mlir::LLVM::CallOp asI64Call = nullptr;
+    mlir::LLVM::CallOp decRefCall = nullptr;
     bool hasOtherUsers = false;
 
-    for (Operation *user : boxedValue.getUsers()) {
-      auto callUser = dyn_cast<LLVM::CallOp>(user);
+    for (mlir::Operation *user : boxedValue.getUsers()) {
+      auto callUser = mlir::dyn_cast<mlir::LLVM::CallOp>(user);
       if (!callUser) {
         hasOtherUsers = true;
         break;
       }
 
-      if (isCallTo(callUser, RuntimeSymbols::kLongAsI64) && !asI64Call) {
+      if (runtime::Call::is(callUser, RuntimeSymbols::kLongAsI64) &&
+          !asI64Call) {
         asI64Call = callUser;
-      } else if (isCallTo(callUser, RuntimeSymbols::kDecRef) && !decRefCall) {
+      } else if (runtime::Call::is(callUser, RuntimeSymbols::kDecRef) &&
+                 !decRefCall) {
         decRefCall = callUser;
       } else {
         hasOtherUsers = true;
@@ -1585,11 +1561,11 @@ void eliminateLongBoxingUnboxing(ModuleOp module) {
 ///   llvm.call @Ly_DecRef(%res_box) : (!llvm.ptr) -> ()
 /// Replaced with direct i64 add/sub, materializing LyLong_AsI64 only for
 /// boxed operands that are not already from LyLong_FromI64.
-void eliminateLongArithmeticRoundTrips(ModuleOp module) {
-  SmallVector<LLVM::CallOp> asI64Calls;
+void scalar::elideLongArithRoundTrips(mlir::ModuleOp module) {
+  llvm::SmallVector<mlir::LLVM::CallOp> asI64Calls;
 
-  module.walk([&](LLVM::CallOp callOp) {
-    if (isCallTo(callOp, RuntimeSymbols::kLongAsI64))
+  module.walk([&](mlir::LLVM::CallOp callOp) {
+    if (runtime::Call::is(callOp, RuntimeSymbols::kLongAsI64))
       asI64Calls.push_back(callOp);
   });
 
@@ -1597,20 +1573,21 @@ void eliminateLongArithmeticRoundTrips(ModuleOp module) {
     if (asI64Call.getNumOperands() != 1)
       continue;
 
-    auto arithmeticCall = asI64Call.getOperand(0).getDefiningOp<LLVM::CallOp>();
+    auto arithmeticCall =
+        asI64Call.getOperand(0).getDefiningOp<mlir::LLVM::CallOp>();
     if (!arithmeticCall || arithmeticCall.getNumOperands() != 2)
       continue;
 
-    bool isAdd = isCallTo(arithmeticCall, RuntimeSymbols::kLongAdd);
-    bool isSub = isCallTo(arithmeticCall, RuntimeSymbols::kLongSub);
+    bool isAdd = runtime::Call::is(arithmeticCall, RuntimeSymbols::kLongAdd);
+    bool isSub = runtime::Call::is(arithmeticCall, RuntimeSymbols::kLongSub);
     if (!isAdd && !isSub)
       continue;
 
-    Value boxedResult = arithmeticCall.getResult();
-    LLVM::CallOp decRefCall = nullptr;
+    mlir::Value boxedResult = arithmeticCall.getResult();
+    mlir::LLVM::CallOp decRefCall = nullptr;
     bool hasOtherUsers = false;
-    for (Operation *user : boxedResult.getUsers()) {
-      auto callUser = dyn_cast<LLVM::CallOp>(user);
+    for (mlir::Operation *user : boxedResult.getUsers()) {
+      auto callUser = mlir::dyn_cast<mlir::LLVM::CallOp>(user);
       if (!callUser) {
         hasOtherUsers = true;
         break;
@@ -1619,7 +1596,7 @@ void eliminateLongArithmeticRoundTrips(ModuleOp module) {
       if (callUser == asI64Call) {
         continue;
       }
-      if (isCallTo(callUser, RuntimeSymbols::kDecRef) && !decRefCall) {
+      if (runtime::Call::is(callUser, RuntimeSymbols::kDecRef) && !decRefCall) {
         decRefCall = callUser;
       } else {
         hasOtherUsers = true;
@@ -1630,21 +1607,23 @@ void eliminateLongArithmeticRoundTrips(ModuleOp module) {
     if (hasOtherUsers)
       continue;
 
-    OpBuilder builder(asI64Call);
-    Location loc = asI64Call.getLoc();
-    Value lhsBoxed = arithmeticCall.getOperand(0);
-    Value rhsBoxed = arithmeticCall.getOperand(1);
+    mlir::OpBuilder builder(asI64Call);
+    mlir::Location loc = asI64Call.getLoc();
+    mlir::Value lhsBoxed = arithmeticCall.getOperand(0);
+    mlir::Value rhsBoxed = arithmeticCall.getOperand(1);
 
-    Value lhs = materializeI64FromLong(module, builder, loc, lhsBoxed);
-    Value rhs = materializeI64FromLong(module, builder, loc, rhsBoxed);
+    mlir::Value lhs = runtime::Long::asI64(module, builder, loc, lhsBoxed);
+    mlir::Value rhs = runtime::Long::asI64(module, builder, loc, rhsBoxed);
 
-    Value arithmeticResult;
+    mlir::Value arithmeticResult;
     if (isAdd) {
       arithmeticResult =
-          builder.create<LLVM::AddOp>(loc, lhs.getType(), lhs, rhs).getResult();
+          builder.create<mlir::LLVM::AddOp>(loc, lhs.getType(), lhs, rhs)
+              .getResult();
     } else {
       arithmeticResult =
-          builder.create<LLVM::SubOp>(loc, lhs.getType(), lhs, rhs).getResult();
+          builder.create<mlir::LLVM::SubOp>(loc, lhs.getType(), lhs, rhs)
+              .getResult();
     }
 
     asI64Call.getResult().replaceAllUsesWith(arithmeticResult);
@@ -1654,37 +1633,40 @@ void eliminateLongArithmeticRoundTrips(ModuleOp module) {
     asI64Call->erase();
     arithmeticCall->erase();
 
-    if (auto fromI64Call = lhsBoxed.getDefiningOp<LLVM::CallOp>();
-        fromI64Call && isCallTo(fromI64Call, RuntimeSymbols::kLongFromI64)) {
-      eraseCallAndOptionalDecRefUsers(fromI64Call);
+    if (auto fromI64Call = lhsBoxed.getDefiningOp<mlir::LLVM::CallOp>();
+        fromI64Call &&
+        runtime::Call::is(fromI64Call, RuntimeSymbols::kLongFromI64)) {
+      runtime::Call::eraseWithOptionalRelease(fromI64Call);
     }
-    if (auto fromI64Call = rhsBoxed.getDefiningOp<LLVM::CallOp>();
-        fromI64Call && isCallTo(fromI64Call, RuntimeSymbols::kLongFromI64)) {
-      eraseCallAndOptionalDecRefUsers(fromI64Call);
+    if (auto fromI64Call = rhsBoxed.getDefiningOp<mlir::LLVM::CallOp>();
+        fromI64Call &&
+        runtime::Call::is(fromI64Call, RuntimeSymbols::kLongFromI64)) {
+      runtime::Call::eraseWithOptionalRelease(fromI64Call);
     }
   }
 }
 
 /// CSE for LyLong_FromI64 for small integers (-5 to 256).
 /// Small integers are immortal, so sharing is safe.
-void cseSmallIntFromI64(ModuleOp module) {
-  module.walk([&](func::FuncOp func) {
+void scalar::cseSmallInts(mlir::ModuleOp module) {
+  module.walk([&](mlir::func::FuncOp func) {
     if (func.isExternal())
       return;
 
-    llvm::DenseMap<int64_t, LLVM::CallOp> cache;
-    SmallVector<LLVM::CallOp> toErase;
+    llvm::DenseMap<int64_t, mlir::LLVM::CallOp> cache;
+    llvm::SmallVector<mlir::LLVM::CallOp> toErase;
 
-    func.walk([&](LLVM::CallOp callOp) {
+    func.walk([&](mlir::LLVM::CallOp callOp) {
       auto callee = callOp.getCallee();
       if (!callee || *callee != "LyLong_FromI64")
         return;
       if (callOp.getNumOperands() != 1)
         return;
-      auto constOp = callOp.getOperand(0).getDefiningOp<LLVM::ConstantOp>();
+      auto constOp =
+          callOp.getOperand(0).getDefiningOp<mlir::LLVM::ConstantOp>();
       if (!constOp)
         return;
-      auto intAttr = llvm::dyn_cast<IntegerAttr>(constOp.getValue());
+      auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(constOp.getValue());
       if (!intAttr)
         return;
       int64_t value = intAttr.getInt();
@@ -1706,16 +1688,18 @@ void cseSmallIntFromI64(ModuleOp module) {
 }
 
 /// CSE for LLVM constants within each function.
-void cseConstants(ModuleOp module) {
-  module.walk([&](func::FuncOp func) {
+void scalar::cseConstants(mlir::ModuleOp module) {
+  module.walk([&](mlir::func::FuncOp func) {
     if (func.isExternal())
       return;
 
     // Map from (type, value) -> first constant op
-    llvm::DenseMap<std::pair<Type, Attribute>, LLVM::ConstantOp> constantCache;
-    SmallVector<LLVM::ConstantOp> toErase;
+    llvm::DenseMap<std::pair<mlir::Type, mlir::Attribute>,
+                   mlir::LLVM::ConstantOp>
+        constantCache;
+    llvm::SmallVector<mlir::LLVM::ConstantOp> toErase;
 
-    func.walk([&](LLVM::ConstantOp constOp) {
+    func.walk([&](mlir::LLVM::ConstantOp constOp) {
       auto key = std::make_pair(constOp.getType(), constOp.getValue());
       auto it = constantCache.find(key);
       if (it != constantCache.end()) {
@@ -1731,23 +1715,45 @@ void cseConstants(ModuleOp module) {
   });
 }
 
-/// Dead code elimination for unused LLVM operations after CSE.
-/// This cleans up AddressOf, GEP, and constants that were only used by CSE'd
-/// calls.
-void eliminateDeadCode(ModuleOp module) {
+static bool hasOnlyTensorResults(mlir::Operation *op) {
+  if (op->getNumResults() == 0)
+    return false;
+  return llvm::all_of(op->getResultTypes(), [](mlir::Type type) {
+    return mlir::isa<mlir::RankedTensorType>(type);
+  });
+}
+
+static bool isDeadCodeCandidate(mlir::Operation *op) {
+  if (mlir::isa<mlir::LLVM::AddressOfOp, mlir::LLVM::GEPOp,
+                mlir::LLVM::ConstantOp>(op))
+    return true;
+  if (mlir::isa<mlir::tensor::EmptyOp, mlir::tensor::FromElementsOp>(op))
+    return true;
+  if (mlir::isa<mlir::arith::ConstantOp, mlir::arith::AddFOp,
+                mlir::arith::SubFOp, mlir::arith::MulFOp>(op))
+    return hasOnlyTensorResults(op);
+  if (mlir::isa<mlir::linalg::FillOp, mlir::linalg::GenericOp>(op))
+    return hasOnlyTensorResults(op);
+  return false;
+}
+
+/// Dead code elimination for unused operations after CSE/lowering.
+/// This cleans up LLVM address constants and tensor/linalg producers that
+/// became dead after compile-time tensor repr materialization.
+void scalar::dce(mlir::ModuleOp module) {
   bool changed = true;
   while (changed) {
     changed = false;
-    SmallVector<Operation *> toErase;
+    llvm::SmallVector<mlir::Operation *> toErase;
 
-    module.walk([&](Operation *op) {
+    module.walk([&](mlir::Operation *op) {
       // Only consider operations with no side effects
-      if (!isa<LLVM::AddressOfOp, LLVM::GEPOp, LLVM::ConstantOp>(op))
+      if (!isDeadCodeCandidate(op))
         return;
 
       // Check if all results are unused
       bool allUnused = true;
-      for (Value result : op->getResults()) {
+      for (mlir::Value result : op->getResults()) {
         if (!result.use_empty()) {
           allUnused = false;
           break;
@@ -1757,7 +1763,7 @@ void eliminateDeadCode(ModuleOp module) {
         toErase.push_back(op);
     });
 
-    for (Operation *op : toErase) {
+    for (mlir::Operation *op : toErase) {
       op->erase();
       changed = true;
     }

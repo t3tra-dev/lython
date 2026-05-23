@@ -1,14 +1,19 @@
-# pyright: reportAttributeAccessIssue=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownVariableType=false
 from __future__ import annotations
 
 import ast
+from typing import TYPE_CHECKING
 
+from ...frontend.symbols import ClassInfo
 from ...mlir import ir
 from ...mlir.dialects import _lython_ops_gen as py_ops
-from .._base import ClassInfo
+
+if TYPE_CHECKING:
+    from ..contracts import VisitorRuntime
+else:
+    VisitorRuntime = object
 
 
-class ExprCallMethodsMixin:
+class ExprCallMethodsMixin(VisitorRuntime):
     def _handle_class_instantiation(
         self, node: ast.Call, class_info: ClassInfo, loc: ir.Location
     ) -> ir.Value:
@@ -123,10 +128,23 @@ class ExprCallMethodsMixin:
                     py_ops.ListRemoveOp(obj, value)
                 return py_ops.NoneOp(self.get_py_type("!py.none")).result
 
+        obj_type_str = str(obj.type)
+        if obj_type_str.startswith("!py.task<"):
+            if method_name != "cancel":
+                raise NotImplementedError(
+                    f"Task method '{method_name}' is not supported"
+                )
+            if node.keywords:
+                raise NotImplementedError(
+                    "Keyword arguments for task.cancel() are not supported"
+                )
+            if arg_values:
+                raise ValueError("task.cancel() expects no arguments")
+            with loc, self.insertion_point():
+                return py_ops.TaskCancelOp(self.get_py_type("!py.bool"), obj).accepted
+
         # For now, we need to determine the class from the object type
         # This is a simplified implementation
-        obj_type = obj.type
-        obj_type_str = str(obj_type)
 
         # Extract class name from type like !py.class<"Counter">
         if obj_type_str.startswith('!py.class<"') and obj_type_str.endswith('">'):
@@ -138,7 +156,7 @@ class ExprCallMethodsMixin:
 
         class_info = self.lookup_class(class_name)
         if class_info is None:
-            raise NameError(f"Unknown class '{class_name}'")
+            raise NameError(f"Unresolved class '{class_name}'")
 
         if method_name not in class_info.methods:
             raise AttributeError(f"Class '{class_name}' has no method '{method_name}'")

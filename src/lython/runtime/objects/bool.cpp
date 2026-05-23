@@ -6,7 +6,7 @@ namespace {
 LyBoolObject *trueSingleton() {
   static LyBoolObject trueObj = [] {
     LyBoolObject obj{};
-    obj.ob_refcnt = 1;
+    obj.ob_refcnt = kLyImmortalRefcount;
     obj.ob_type = &LyBool_Type();
     obj.value = true;
     return obj;
@@ -17,7 +17,7 @@ LyBoolObject *trueSingleton() {
 LyBoolObject *falseSingleton() {
   static LyBoolObject falseObj = [] {
     LyBoolObject obj{};
-    obj.ob_refcnt = 1;
+    obj.ob_refcnt = kLyImmortalRefcount;
     obj.ob_type = &LyBool_Type();
     obj.value = false;
     return obj;

@@ -1,13 +1,18 @@
-# pyright: reportAttributeAccessIssue=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownVariableType=false
 from __future__ import annotations
 
 import ast
+from typing import TYPE_CHECKING
 
 from ...mlir import ir
 from ...mlir.dialects import _lython_ops_gen as py_ops
 
+if TYPE_CHECKING:
+    from ..contracts import VisitorRuntime
+else:
+    VisitorRuntime = object
 
-class ExprContainerMixin:
+
+class ExprContainerMixin(VisitorRuntime):
     """Expression lowering for typed list/dict/tuple containers."""
 
     def visit_Dict(self, node: ast.Dict) -> ir.Value:
@@ -27,7 +32,7 @@ class ExprContainerMixin:
         dict_type = self.get_py_type(f"!py.dict<{key_type}, {value_type}>")
 
         with self._loc(node), self.insertion_point():
-            current = py_ops.DictEmptyOp(dict_type).result
+            result = py_ops.DictEmptyOp(dict_type).result
 
         for key, value in entries:
             if key.type != key_type:
@@ -35,24 +40,25 @@ class ExprContainerMixin:
             if value.type != value_type:
                 value = self.coerce_value_to_type(value, value_type, self._loc(node))
             with self._loc(node), self.insertion_point():
-                current = py_ops.DictInsertOp(dict_type, current, key, value).result
-        return current
+                py_ops.DictInsertOp(result, key, value)
+        return result
 
     def visit_Subscript(self, node: ast.Subscript) -> ir.Value:
         container = self.require_value(node.value, self.visit(node.value))
+        result_type = self.typed_node_type(node)
         element_type = self.get_list_element_type(container.type)
         if element_type is not None:
             index = self.require_value(node.slice, self.visit(node.slice))
             with self._loc(node), self.insertion_point():
-                return py_ops.ListGetOp(element_type, container, index).result
+                return py_ops.ListGetOp(result_type, container, index).result
 
         dict_types = self.get_dict_key_value_types(container.type)
         if dict_types is not None:
-            key_type, value_type = dict_types
+            key_type, _ = dict_types
             key = self.require_value(node.slice, self.visit(node.slice))
             key = self.coerce_value_to_type(key, key_type, self._loc(node))
             with self._loc(node), self.insertion_point():
-                return py_ops.DictGetOp(value_type, container, key).result
+                return py_ops.DictGetOp(result_type, container, key).result
 
         raise NotImplementedError(
             f"Subscript access is only supported on !py.list or !py.dict values, got {container.type}"

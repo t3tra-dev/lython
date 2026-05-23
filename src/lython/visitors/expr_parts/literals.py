@@ -1,14 +1,19 @@
-# pyright: reportAttributeAccessIssue=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownVariableType=false
 from __future__ import annotations
 
 import ast
+from typing import TYPE_CHECKING
 
 from ...mlir import ir
 from ...mlir.dialects import _lython_ops_gen as py_ops
 from ...mlir.dialects import arith as arith_ops
 
+if TYPE_CHECKING:
+    from ..contracts import VisitorRuntime
+else:
+    VisitorRuntime = object
 
-class ExprLiteralMixin:
+
+class ExprLiteralMixin(VisitorRuntime):
     """Expression lowering for constants and currently unsupported literal forms."""
 
     def visit_Set(self, node: ast.Set) -> None:

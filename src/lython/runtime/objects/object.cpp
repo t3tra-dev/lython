@@ -5,7 +5,9 @@
 #include "objects/long.h"
 #include "objects/unicode.h"
 
+#include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace {
@@ -15,7 +17,7 @@ LyTypeObject makeType(const char *name, Ly_ssize_t basicsize,
                       LyDeallocFunc dealloc = nullptr,
                       LyReprFunc repr = nullptr) {
   LyTypeObject type{};
-  type.ob_base.ob_base.ob_refcnt = 1;
+  type.ob_base.ob_base.ob_refcnt = kLyImmortalRefcount;
   type.ob_base.ob_base.ob_type = nullptr;
   type.ob_base.ob_size = 0;
   type.tp_name = name;
@@ -111,7 +113,7 @@ extern "C" {
 LyObject *Ly_GetNone() {
   static LyObject none = [] {
     LyObject obj{};
-    obj.ob_refcnt = 1;
+    obj.ob_refcnt = kLyImmortalRefcount;
     obj.ob_type = &LyNone_Type();
     return obj;
   }();
@@ -132,8 +134,14 @@ void Ly_DecRef(LyObject *object) {
   if (isImmortalObject(object))
     return;
   Ly_ssize_t previous = 0;
-  if (!atomicTryDecRefCount(&object->ob_refcnt, previous))
-    return;
+  if (!atomicTryDecRefCount(&object->ob_refcnt, previous)) {
+    std::fprintf(stderr,
+                 "fatal: Ly_DecRef observed non-positive refcount (%td) for "
+                 "object %p\n",
+                 static_cast<std::ptrdiff_t>(previous),
+                 static_cast<void *>(object));
+    std::abort();
+  }
   if (previous == 1) {
     LyTypeObject *type = object->ob_type;
     if (type && type->tp_dealloc)

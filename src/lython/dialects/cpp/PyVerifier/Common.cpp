@@ -1,25 +1,23 @@
 #include "cpp/PyVerifier/Common.h"
 
-using namespace mlir;
-
 namespace py {
 
-ClassOp lookupClassSymbol(Operation *from, ClassType classType) {
-  StringAttr nameAttr =
-      StringAttr::get(from->getContext(), classType.getClassName());
-  for (Operation *symbolTableOp = from; symbolTableOp;
+ClassOp lookupClassSymbol(mlir::Operation *from, ClassType classType) {
+  mlir::StringAttr nameAttr =
+      mlir::StringAttr::get(from->getContext(), classType.getClassName());
+  for (mlir::Operation *symbolTableOp = from; symbolTableOp;
        symbolTableOp = symbolTableOp->getParentOp()) {
-    if (!symbolTableOp->hasTrait<OpTrait::SymbolTable>())
+    if (!symbolTableOp->hasTrait<mlir::OpTrait::SymbolTable>())
       continue;
-    if (Operation *symbol =
-            SymbolTable::lookupSymbolIn(symbolTableOp, nameAttr))
-      if (ClassOp classOp = dyn_cast<ClassOp>(symbol))
+    if (mlir::Operation *symbol =
+            mlir::SymbolTable::lookupSymbolIn(symbolTableOp, nameAttr))
+      if (ClassOp classOp = mlir::dyn_cast<ClassOp>(symbol))
         return classOp;
   }
   return nullptr;
 }
 
-FuncOp lookupMethodByName(ClassOp classOp, StringRef methodName) {
+FuncOp lookupMethodByName(ClassOp classOp, llvm::StringRef methodName) {
   for (FuncOp method : classOp.getBody().front().getOps<FuncOp>()) {
     if (mlir::StringAttr nameAttr = method.getSymNameAttr())
       if (nameAttr.getValue() == methodName)
@@ -28,30 +26,31 @@ FuncOp lookupMethodByName(ClassOp classOp, StringRef methodName) {
   return nullptr;
 }
 
-FailureOr<Type> lookupClassFieldType(Operation *from, ClassType classType,
-                                     StringRef fieldName) {
+mlir::FailureOr<mlir::Type> lookupClassFieldType(mlir::Operation *from,
+                                                 ClassType classType,
+                                                 llvm::StringRef fieldName) {
   ClassOp classOp = lookupClassSymbol(from, classType);
   if (!classOp) {
     from->emitOpError("unable to resolve class '")
         << classType.getClassName() << "'";
-    return failure();
+    return mlir::failure();
   }
 
-  ArrayAttr fieldNames = classOp.getFieldNamesAttr();
-  ArrayAttr fieldTypes = classOp.getFieldTypesAttr();
+  mlir::ArrayAttr fieldNames = classOp.getFieldNamesAttr();
+  mlir::ArrayAttr fieldTypes = classOp.getFieldTypesAttr();
   if (!fieldNames || !fieldTypes) {
     from->emitOpError("class '") << classType.getClassName()
                                  << "' does not define a static field schema";
-    return failure();
+    return mlir::failure();
   }
 
   for (auto [nameAttr, typeAttr] : llvm::zip(fieldNames, fieldTypes)) {
-    auto stringAttr = dyn_cast<StringAttr>(nameAttr);
-    auto mlirTypeAttr = dyn_cast<TypeAttr>(typeAttr);
+    auto stringAttr = mlir::dyn_cast<mlir::StringAttr>(nameAttr);
+    auto mlirTypeAttr = mlir::dyn_cast<mlir::TypeAttr>(typeAttr);
     if (!stringAttr || !mlirTypeAttr) {
       from->emitOpError("class '")
           << classType.getClassName() << "' has malformed field schema";
-      return failure();
+      return mlir::failure();
     }
     if (stringAttr.getValue() == fieldName)
       return mlirTypeAttr.getValue();
@@ -59,7 +58,7 @@ FailureOr<Type> lookupClassFieldType(Operation *from, ClassType classType,
 
   from->emitOpError("class '")
       << classType.getClassName() << "' has no field '" << fieldName << "'";
-  return failure();
+  return mlir::failure();
 }
 
 static ThrowEffect getEffectFromFuncOp(FuncOp funcOp) {
@@ -70,86 +69,94 @@ static ThrowEffect getEffectFromFuncOp(FuncOp funcOp) {
   return ThrowEffect::MayThrow;
 }
 
-static Value stripIdentityCasts(Value value);
+static mlir::Value stripBridgeCasts(mlir::Value value);
 
-static FuncOp lookupReturnedCallableFuncFromValue(Operation *op,
-                                                  Value callable) {
-  if (auto identity = callable.getDefiningOp<CastIdentityOp>()) {
-    if (auto symbolAttr = identity->getAttrOfType<SymbolRefAttr>(
-            "lython.returned_callable_symbol")) {
-      Operation *symbol = SymbolTable::lookupNearestSymbolFrom(op, symbolAttr);
-      return dyn_cast_or_null<FuncOp>(symbol);
+static FuncOp lookupReturnedCallableFuncFromValue(mlir::Operation *op,
+                                                  mlir::Value callable) {
+  if (auto cast = callable.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+    if (auto symbolAttr = cast->getAttrOfType<mlir::SymbolRefAttr>(
+            "ly.returned_callable_symbol")) {
+      mlir::Operation *symbol =
+          mlir::SymbolTable::lookupNearestSymbolFrom(op, symbolAttr);
+      return mlir::dyn_cast_or_null<FuncOp>(symbol);
     }
-    return lookupReturnedCallableFuncFromValue(op, identity.getInput());
+    if (cast->getNumOperands() == 1)
+      return lookupReturnedCallableFuncFromValue(op, cast.getOperand(0));
   }
   if (auto callVector = callable.getDefiningOp<CallVectorOp>()) {
-    if (auto symbolAttr = callVector->getAttrOfType<SymbolRefAttr>(
-            "lython.returned_callable_symbol")) {
-      Operation *symbol = SymbolTable::lookupNearestSymbolFrom(op, symbolAttr);
-      return dyn_cast_or_null<FuncOp>(symbol);
+    if (auto symbolAttr = callVector->getAttrOfType<mlir::SymbolRefAttr>(
+            "ly.returned_callable_symbol")) {
+      mlir::Operation *symbol =
+          mlir::SymbolTable::lookupNearestSymbolFrom(op, symbolAttr);
+      return mlir::dyn_cast_or_null<FuncOp>(symbol);
     }
   }
   if (auto call = callable.getDefiningOp<CallOp>()) {
-    if (auto symbolAttr = call->getAttrOfType<SymbolRefAttr>(
-            "lython.returned_callable_symbol")) {
-      Operation *symbol = SymbolTable::lookupNearestSymbolFrom(op, symbolAttr);
-      return dyn_cast_or_null<FuncOp>(symbol);
+    if (auto symbolAttr = call->getAttrOfType<mlir::SymbolRefAttr>(
+            "ly.returned_callable_symbol")) {
+      mlir::Operation *symbol =
+          mlir::SymbolTable::lookupNearestSymbolFrom(op, symbolAttr);
+      return mlir::dyn_cast_or_null<FuncOp>(symbol);
     }
   }
   return nullptr;
 }
 
-static IntegerAttr getReturnedCallableDefaultsCountAttr(Value callable) {
-  if (auto identity = callable.getDefiningOp<CastIdentityOp>()) {
-    if (auto attr = identity->getAttrOfType<IntegerAttr>(
-            "lython.returned_callable_defaults_count"))
+static mlir::IntegerAttr
+getReturnedCallableDefaultsCountAttr(mlir::Value callable) {
+  if (auto cast = callable.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+    if (auto attr = cast->getAttrOfType<mlir::IntegerAttr>(
+            "ly.returned_callable_defaults_count"))
       return attr;
-    return getReturnedCallableDefaultsCountAttr(identity.getInput());
+    if (cast->getNumOperands() == 1)
+      return getReturnedCallableDefaultsCountAttr(cast.getOperand(0));
   }
   if (auto callVector = callable.getDefiningOp<CallVectorOp>())
-    return callVector->getAttrOfType<IntegerAttr>(
-        "lython.returned_callable_defaults_count");
+    return callVector->getAttrOfType<mlir::IntegerAttr>(
+        "ly.returned_callable_defaults_count");
   if (auto call = callable.getDefiningOp<CallOp>())
-    return call->getAttrOfType<IntegerAttr>(
-        "lython.returned_callable_defaults_count");
+    return call->getAttrOfType<mlir::IntegerAttr>(
+        "ly.returned_callable_defaults_count");
   return {};
 }
 
-static ArrayAttr getReturnedCallableKwdefaultNamesAttr(Value callable) {
-  if (auto identity = callable.getDefiningOp<CastIdentityOp>()) {
-    if (auto attr = identity->getAttrOfType<ArrayAttr>(
-            "lython.returned_callable_kwdefault_names"))
+static mlir::ArrayAttr
+getReturnedCallableKwdefaultNamesAttr(mlir::Value callable) {
+  if (auto cast = callable.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+    if (auto attr = cast->getAttrOfType<mlir::ArrayAttr>(
+            "ly.returned_callable_kwdefault_names"))
       return attr;
-    return getReturnedCallableKwdefaultNamesAttr(identity.getInput());
+    if (cast->getNumOperands() == 1)
+      return getReturnedCallableKwdefaultNamesAttr(cast.getOperand(0));
   }
   if (auto callVector = callable.getDefiningOp<CallVectorOp>())
-    return callVector->getAttrOfType<ArrayAttr>(
-        "lython.returned_callable_kwdefault_names");
+    return callVector->getAttrOfType<mlir::ArrayAttr>(
+        "ly.returned_callable_kwdefault_names");
   if (auto call = callable.getDefiningOp<CallOp>())
-    return call->getAttrOfType<ArrayAttr>(
-        "lython.returned_callable_kwdefault_names");
+    return call->getAttrOfType<mlir::ArrayAttr>(
+        "ly.returned_callable_kwdefault_names");
   return {};
 }
 
-FailureOr<FuncSignatureType>
-resolveCallableSignature(Operation *op, Value callable,
-                         ArrayAttr &expectedArgNamesAttr,
-                         ArrayAttr &expectedKwNamesAttr) {
-  Type callableType = callable.getType();
-  if (auto funcTy = dyn_cast<FuncType>(callableType)) {
-    Value strippedCallable = stripIdentityCasts(callable);
+mlir::FailureOr<FuncSignatureType>
+resolveCallableSignature(mlir::Operation *op, mlir::Value callable,
+                         mlir::ArrayAttr &expectedArgNamesAttr,
+                         mlir::ArrayAttr &expectedKwNamesAttr) {
+  mlir::Type callableType = callable.getType();
+  if (auto funcTy = mlir::dyn_cast<FuncType>(callableType)) {
+    mlir::Value strippedCallable = stripBridgeCasts(callable);
     if (auto funcObject = strippedCallable.getDefiningOp<FuncObjectOp>()) {
-      Operation *symbol =
-          SymbolTable::lookupNearestSymbolFrom(op, funcObject.getTargetAttr());
-      if (auto funcOp = dyn_cast_or_null<FuncOp>(symbol)) {
+      mlir::Operation *symbol = mlir::SymbolTable::lookupNearestSymbolFrom(
+          op, funcObject.getTargetAttr());
+      if (auto funcOp = mlir::dyn_cast_or_null<FuncOp>(symbol)) {
         expectedArgNamesAttr = funcOp.getArgNamesAttr();
         expectedKwNamesAttr = funcOp.getKwonlyNamesAttr();
       }
     } else if (auto makeFunc =
                    strippedCallable.getDefiningOp<MakeFunctionOp>()) {
-      Operation *symbol =
-          SymbolTable::lookupNearestSymbolFrom(op, makeFunc.getTargetAttr());
-      if (auto funcOp = dyn_cast_or_null<FuncOp>(symbol)) {
+      mlir::Operation *symbol = mlir::SymbolTable::lookupNearestSymbolFrom(
+          op, makeFunc.getTargetAttr());
+      if (auto funcOp = mlir::dyn_cast_or_null<FuncOp>(symbol)) {
         expectedArgNamesAttr = funcOp.getArgNamesAttr();
         expectedKwNamesAttr = funcOp.getKwonlyNamesAttr();
       }
@@ -162,24 +169,24 @@ resolveCallableSignature(Operation *op, Value callable,
   }
 
   op->emitOpError("unexpected callable type");
-  return failure();
+  return mlir::failure();
 }
 
-FailureOr<ThrowEffect> resolveCallableThrowEffect(Operation *op,
-                                                  Value callable) {
-  Type callableType = callable.getType();
-  if (auto funcTy = dyn_cast<FuncType>(callableType)) {
-    Value strippedCallable = stripIdentityCasts(callable);
+mlir::FailureOr<ThrowEffect> resolveCallableThrowEffect(mlir::Operation *op,
+                                                        mlir::Value callable) {
+  mlir::Type callableType = callable.getType();
+  if (auto funcTy = mlir::dyn_cast<FuncType>(callableType)) {
+    mlir::Value strippedCallable = stripBridgeCasts(callable);
     if (auto funcObject = strippedCallable.getDefiningOp<FuncObjectOp>()) {
-      Operation *symbol =
-          SymbolTable::lookupNearestSymbolFrom(op, funcObject.getTargetAttr());
-      if (auto funcOp = dyn_cast_or_null<FuncOp>(symbol))
+      mlir::Operation *symbol = mlir::SymbolTable::lookupNearestSymbolFrom(
+          op, funcObject.getTargetAttr());
+      if (auto funcOp = mlir::dyn_cast_or_null<FuncOp>(symbol))
         return getEffectFromFuncOp(funcOp);
     } else if (auto makeFunc =
                    strippedCallable.getDefiningOp<MakeFunctionOp>()) {
-      Operation *symbol =
-          SymbolTable::lookupNearestSymbolFrom(op, makeFunc.getTargetAttr());
-      if (auto funcOp = dyn_cast_or_null<FuncOp>(symbol))
+      mlir::Operation *symbol = mlir::SymbolTable::lookupNearestSymbolFrom(
+          op, makeFunc.getTargetAttr());
+      if (auto funcOp = mlir::dyn_cast_or_null<FuncOp>(symbol))
         return getEffectFromFuncOp(funcOp);
     } else if (auto funcOp =
                    lookupReturnedCallableFuncFromValue(op, callable)) {
@@ -189,19 +196,19 @@ FailureOr<ThrowEffect> resolveCallableThrowEffect(Operation *op,
   }
 
   op->emitOpError("unexpected callable type");
-  return failure();
+  return mlir::failure();
 }
 
-FailureOr<TupleType> requireTuple(Operation *op, Value operand,
-                                  StringRef what) {
-  if (auto tupleTy = dyn_cast<TupleType>(operand.getType()))
+mlir::FailureOr<TupleType>
+requireTuple(mlir::Operation *op, mlir::Value operand, llvm::StringRef what) {
+  if (auto tupleTy = mlir::dyn_cast<TupleType>(operand.getType()))
     return tupleTy;
   op->emitOpError() << what << " operand must be a !py.tuple value";
-  return failure();
+  return mlir::failure();
 }
 
 unsigned getMinimumPositionalCountForCallable(FuncSignatureType signature,
-                                              Value callable) {
+                                              mlir::Value callable) {
   unsigned positionalCount = signature.getPositionalTypes().size();
   if (auto defaultsAttr = getReturnedCallableDefaultsCountAttr(callable)) {
     unsigned defaultsCount =
@@ -210,13 +217,13 @@ unsigned getMinimumPositionalCountForCallable(FuncSignatureType signature,
       return 0;
     return positionalCount - defaultsCount;
   }
-  auto makeFunc = stripIdentityCasts(callable).getDefiningOp<MakeFunctionOp>();
+  auto makeFunc = stripBridgeCasts(callable).getDefiningOp<MakeFunctionOp>();
   if (!makeFunc)
     return positionalCount;
-  Value defaults = makeFunc.getDefaults();
+  mlir::Value defaults = makeFunc.getDefaults();
   if (!defaults)
     return positionalCount;
-  auto defaultsTy = dyn_cast<TupleType>(defaults.getType());
+  auto defaultsTy = mlir::dyn_cast<TupleType>(defaults.getType());
   if (!defaultsTy)
     return positionalCount;
   unsigned defaultsCount = defaultsTy.getElementTypes().size();
@@ -225,67 +232,91 @@ unsigned getMinimumPositionalCountForCallable(FuncSignatureType signature,
   return positionalCount - defaultsCount;
 }
 
-static Value stripIdentityCasts(Value value) {
-  while (auto identity = value.getDefiningOp<CastIdentityOp>())
-    value = identity.getInput();
+static mlir::Value stripBridgeCasts(mlir::Value value) {
+  while (auto cast = value.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+    if (cast->getNumOperands() != 1)
+      break;
+    value = cast.getOperand(0);
+  }
   return value;
 }
 
-static bool collectStaticDictStringKeys(Value dictValue,
-                                        SmallVectorImpl<StringRef> &keys) {
-  SmallVector<StringRef> reversed;
-  Value current = stripIdentityCasts(dictValue);
-  while (auto insert = current.getDefiningOp<DictInsertOp>()) {
-    Value key = stripIdentityCasts(insert.getKey());
-    auto strConst = key.getDefiningOp<StrConstantOp>();
-    if (!strConst)
-      return false;
-    reversed.push_back(strConst.getValueAttr().getValue());
-    current = stripIdentityCasts(insert.getDict());
-  }
-
-  if (!current.getDefiningOp<DictEmptyOp>())
+static bool collectStaticDictStringKeyInserts(
+    mlir::Value dictValue, mlir::Operation *beforeOp,
+    llvm::SmallVectorImpl<DictInsertOp> &inserts) {
+  mlir::Value root = stripBridgeCasts(dictValue);
+  if (!root.getDefiningOp<DictEmptyOp>())
     return false;
 
-  keys.assign(reversed.rbegin(), reversed.rend());
+  mlir::Block *block = beforeOp ? beforeOp->getBlock() : nullptr;
+  for (mlir::Operation *user : root.getUsers()) {
+    auto insert = mlir::dyn_cast<DictInsertOp>(user);
+    if (!insert)
+      continue;
+    if (block && insert->getBlock() != block)
+      return false;
+    if (beforeOp && !insert->isBeforeInBlock(beforeOp))
+      continue;
+    inserts.push_back(insert);
+  }
+
+  llvm::sort(inserts, [](DictInsertOp lhs, DictInsertOp rhs) {
+    return lhs->isBeforeInBlock(rhs);
+  });
   return true;
 }
 
-static void collectDefaultedKeywordNames(Value callable,
+static bool
+collectStaticDictStringKeys(mlir::Value dictValue, mlir::Operation *beforeOp,
+                            llvm::SmallVectorImpl<llvm::StringRef> &keys) {
+  llvm::SmallVector<DictInsertOp, 8> inserts;
+  if (!collectStaticDictStringKeyInserts(dictValue, beforeOp, inserts))
+    return false;
+
+  for (DictInsertOp insert : inserts) {
+    mlir::Value key = stripBridgeCasts(insert.getKey());
+    auto strConst = key.getDefiningOp<StrConstantOp>();
+    if (!strConst)
+      return false;
+    keys.push_back(strConst.getValueAttr().getValue());
+  }
+  return true;
+}
+
+static void collectDefaultedKeywordNames(mlir::Value callable,
                                          llvm::StringSet<> &names) {
   if (auto attr = getReturnedCallableKwdefaultNamesAttr(callable)) {
-    for (Attribute entry : attr) {
-      if (auto strAttr = dyn_cast<StringAttr>(entry))
+    for (mlir::Attribute entry : attr) {
+      if (auto strAttr = mlir::dyn_cast<mlir::StringAttr>(entry))
         names.insert(strAttr.getValue());
     }
   }
-  auto makeFunc = stripIdentityCasts(callable).getDefiningOp<MakeFunctionOp>();
+  auto makeFunc = stripBridgeCasts(callable).getDefiningOp<MakeFunctionOp>();
   if (!makeFunc || !makeFunc.getKwdefaults())
     return;
 
-  SmallVector<StringRef> keyStorage;
-  if (!collectStaticDictStringKeys(makeFunc.getKwdefaults(), keyStorage))
+  llvm::SmallVector<llvm::StringRef> keyStorage;
+  if (!collectStaticDictStringKeys(makeFunc.getKwdefaults(),
+                                   makeFunc.getOperation(), keyStorage))
     return;
-  for (StringRef key : keyStorage)
+  for (llvm::StringRef key : keyStorage)
     names.insert(key);
 }
 
-static bool callableHasKwdefaults(Value callable) {
+static bool callableHasKwdefaults(mlir::Value callable) {
   if (auto attr = getReturnedCallableKwdefaultNamesAttr(callable))
     return !attr.empty();
-  auto makeFunc = stripIdentityCasts(callable).getDefiningOp<MakeFunctionOp>();
+  auto makeFunc = stripBridgeCasts(callable).getDefiningOp<MakeFunctionOp>();
   return makeFunc && static_cast<bool>(makeFunc.getKwdefaults());
 }
 
-LogicalResult verifyVectorCallOperands(Operation *op,
-                                       FuncSignatureType signature,
-                                       Value callable, Value posargs,
-                                       Value kwnames, Value kwvalues,
-                                       ArrayAttr expectedArgNamesAttr,
-                                       ArrayAttr expectedKwNamesAttr) {
+mlir::LogicalResult verifyVectorCallOperands(
+    mlir::Operation *op, FuncSignatureType signature, mlir::Value callable,
+    mlir::Value posargs, mlir::Value kwnames, mlir::Value kwvalues,
+    mlir::ArrayAttr expectedArgNamesAttr, mlir::ArrayAttr expectedKwNamesAttr) {
   auto posTupleOr = requireTuple(op, posargs, "posargs");
-  if (failed(posTupleOr))
-    return failure();
+  if (mlir::failed(posTupleOr))
+    return mlir::failure();
   TupleType posTuple = *posTupleOr;
   auto posElems = posTuple.getElementTypes();
   bool homogeneous = posElems.size() == 1;
@@ -302,11 +333,11 @@ LogicalResult verifyVectorCallOperands(Operation *op,
         return op->emitOpError(
             "posargs element type does not match positional parameter type");
   } else {
-    auto calleeVarargTy = dyn_cast<TupleType>(signature.getVarargType());
+    auto calleeVarargTy = mlir::dyn_cast<TupleType>(signature.getVarargType());
     if (!calleeVarargTy || calleeVarargTy.getElementTypes().size() != 1)
       return op->emitOpError(
           "vararg parameter must be !py.tuple<T> with single element type");
-    Type calleeElemType = calleeVarargTy.getElementTypes().front();
+    mlir::Type calleeElemType = calleeVarargTy.getElementTypes().front();
 
     if (homogeneous && !posElems.empty() && positionalTypes.empty()) {
       if (!isSubtypeOf(posElems.front(), calleeElemType))
@@ -330,21 +361,21 @@ LogicalResult verifyVectorCallOperands(Operation *op,
   }
 
   auto nameTupleOr = requireTuple(op, kwnames, "kwnames");
-  if (failed(nameTupleOr))
-    return failure();
+  if (mlir::failed(nameTupleOr))
+    return mlir::failure();
   auto valueTupleOr = requireTuple(op, kwvalues, "kwvalues");
-  if (failed(valueTupleOr))
-    return failure();
+  if (mlir::failed(valueTupleOr))
+    return mlir::failure();
 
   TupleType nameTuple = *nameTupleOr;
   TupleType valueTuple = *valueTupleOr;
   auto nameElems = nameTuple.getElementTypes();
-  for (Type elem : nameElems)
+  for (mlir::Type elem : nameElems)
     if (!isPyStrType(elem))
       return op->emitOpError("kwnames tuple elements must be !py.str");
 
   auto valueElems = valueTuple.getElementTypes();
-  for (Type elem : valueElems)
+  for (mlir::Type elem : valueElems)
     if (!isPyObjectType(elem))
       return op->emitOpError("kwvalues tuple elements must be !py.object");
 
@@ -360,8 +391,9 @@ LogicalResult verifyVectorCallOperands(Operation *op,
   if (!keywordsAccepted && !namesEmpty)
     return op->emitOpError("callee does not accept keyword arguments");
 
-  auto collectTupleValues = [&](Value tupleValue,
-                                SmallVectorImpl<Value> &values) -> bool {
+  auto collectTupleValues =
+      [&](mlir::Value tupleValue,
+          llvm::SmallVectorImpl<mlir::Value> &values) -> bool {
     if (auto create = tupleValue.getDefiningOp<TupleCreateOp>()) {
       values.append(create.getElements().begin(), create.getElements().end());
       return true;
@@ -371,11 +403,11 @@ LogicalResult verifyVectorCallOperands(Operation *op,
     return false;
   };
 
-  SmallVector<Value> nameValues;
+  llvm::SmallVector<mlir::Value> nameValues;
   bool hasLiteralNames = collectTupleValues(kwnames, nameValues);
-  SmallVector<StringRef> providedKwNames;
+  llvm::SmallVector<llvm::StringRef> providedKwNames;
   if (hasLiteralNames) {
-    for (Value nameVal : nameValues) {
+    for (mlir::Value nameVal : nameValues) {
       if (auto strConst = nameVal.getDefiningOp<StrConstantOp>()) {
         providedKwNames.push_back(strConst.getValueAttr().getValue());
       } else {
@@ -392,12 +424,12 @@ LogicalResult verifyVectorCallOperands(Operation *op,
   bool hasCallableKwdefaults = callableHasKwdefaults(callable);
 
   if (hasLiteralNames) {
-    llvm::SmallVector<StringRef> positionalNames;
+    llvm::SmallVector<llvm::StringRef> positionalNames;
     llvm::StringMap<unsigned> positionalNameToIndex;
     if (expectedArgNamesAttr) {
       positionalNames.reserve(expectedArgNamesAttr.size());
       for (auto [index, attr] : llvm::enumerate(expectedArgNamesAttr)) {
-        auto strAttr = dyn_cast<StringAttr>(attr);
+        auto strAttr = mlir::dyn_cast<mlir::StringAttr>(attr);
         if (!strAttr)
           continue;
         positionalNames.push_back(strAttr.getValue());
@@ -405,12 +437,12 @@ LogicalResult verifyVectorCallOperands(Operation *op,
       }
     }
 
-    llvm::SmallVector<StringRef> kwonlyNames;
+    llvm::SmallVector<llvm::StringRef> kwonlyNames;
     llvm::StringMap<unsigned> kwonlyNameToIndex;
     if (expectedKwNamesAttr) {
       kwonlyNames.reserve(expectedKwNamesAttr.size());
       for (auto [index, attr] : llvm::enumerate(expectedKwNamesAttr)) {
-        auto strAttr = dyn_cast<StringAttr>(attr);
+        auto strAttr = mlir::dyn_cast<mlir::StringAttr>(attr);
         if (!strAttr)
           continue;
         kwonlyNames.push_back(strAttr.getValue());
@@ -418,13 +450,13 @@ LogicalResult verifyVectorCallOperands(Operation *op,
       }
     }
 
-    llvm::SmallSet<StringRef, 8> providedSet;
-    for (StringRef providedName : providedKwNames)
+    llvm::SmallSet<llvm::StringRef, 8> providedSet;
+    for (llvm::StringRef providedName : providedKwNames)
       if (!providedSet.insert(providedName).second)
         return op->emitOpError("duplicate keyword '") << providedName << "'";
 
     if (!signature.hasKwarg()) {
-      for (StringRef providedName : providedKwNames)
+      for (llvm::StringRef providedName : providedKwNames)
         if (!positionalNameToIndex.count(providedName) &&
             !kwonlyNameToIndex.count(providedName))
           return op->emitOpError("unexpected keyword argument '")
@@ -440,7 +472,7 @@ LogicalResult verifyVectorCallOperands(Operation *op,
         return op->emitOpError("missing required argument '") << name << "'";
     }
 
-    for (StringRef expected : kwonlyNames) {
+    for (llvm::StringRef expected : kwonlyNames) {
       if (defaultedKeywordNames.contains(expected))
         continue;
       if (providedSet.contains(expected))
@@ -458,7 +490,7 @@ LogicalResult verifyVectorCallOperands(Operation *op,
         "posargs length mismatch with callee positional parameters");
   }
 
-  return success();
+  return mlir::success();
 }
 
 } // namespace py

@@ -4,64 +4,75 @@
 #include "mlir/IR/Types.h"
 #include "llvm/ADT/TypeSwitch.h"
 
-using namespace mlir;
-
 namespace py {
 
 namespace detail {
 
-SimpleTypeStorage *SimpleTypeStorage::construct(TypeStorageAllocator &allocator,
-                                                const KeyTy &key) {
+SimpleTypeStorage *
+SimpleTypeStorage::construct(mlir::TypeStorageAllocator &allocator,
+                             const KeyTy &key) {
   return new (allocator.allocate<SimpleTypeStorage>())
       SimpleTypeStorage(static_cast<unsigned>(key));
 }
 
-TupleTypeStorage *TupleTypeStorage::construct(TypeStorageAllocator &allocator,
-                                              const KeyTy &key) {
-  ArrayRef<Type> copied = allocator.copyInto(key);
+TupleTypeStorage *
+TupleTypeStorage::construct(mlir::TypeStorageAllocator &allocator,
+                            const KeyTy &key) {
+  llvm::ArrayRef<mlir::Type> copied = allocator.copyInto(key);
   return new (allocator.allocate<TupleTypeStorage>()) TupleTypeStorage(copied);
 }
 
-DictTypeStorage *DictTypeStorage::construct(TypeStorageAllocator &allocator,
-                                            const KeyTy &key) {
+DictTypeStorage *
+DictTypeStorage::construct(mlir::TypeStorageAllocator &allocator,
+                           const KeyTy &key) {
   return new (allocator.allocate<DictTypeStorage>())
       DictTypeStorage(key.first, key.second);
 }
 
-ListTypeStorage *ListTypeStorage::construct(TypeStorageAllocator &allocator,
-                                            const KeyTy &key) {
+ListTypeStorage *
+ListTypeStorage::construct(mlir::TypeStorageAllocator &allocator,
+                           const KeyTy &key) {
   return new (allocator.allocate<ListTypeStorage>()) ListTypeStorage(key);
 }
 
-ClassTypeStorage *ClassTypeStorage::construct(TypeStorageAllocator &allocator,
-                                              const KeyTy &key) {
+ClassTypeStorage *
+ClassTypeStorage::construct(mlir::TypeStorageAllocator &allocator,
+                            const KeyTy &key) {
   return new (allocator.allocate<ClassTypeStorage>())
       ClassTypeStorage(allocator.copyInto(key));
 }
 
 FuncSignatureStorage *
-FuncSignatureStorage::construct(TypeStorageAllocator &allocator,
+FuncSignatureStorage::construct(mlir::TypeStorageAllocator &allocator,
                                 const KeyTy &key) {
   // Key order: positional, vararg, kwonly, kwargs, results
-  ArrayRef<Type> positional = allocator.copyInto(std::get<0>(key));
-  Type vararg = std::get<1>(key);
-  ArrayRef<Type> kwonly = allocator.copyInto(std::get<2>(key));
-  Type kwargs = std::get<3>(key);
-  ArrayRef<Type> results = allocator.copyInto(std::get<4>(key));
+  llvm::ArrayRef<mlir::Type> positional = allocator.copyInto(std::get<0>(key));
+  mlir::Type vararg = std::get<1>(key);
+  llvm::ArrayRef<mlir::Type> kwonly = allocator.copyInto(std::get<2>(key));
+  mlir::Type kwargs = std::get<3>(key);
+  llvm::ArrayRef<mlir::Type> results = allocator.copyInto(std::get<4>(key));
   return new (allocator.allocate<FuncSignatureStorage>())
       FuncSignatureStorage(positional, vararg, kwonly, kwargs, results);
 }
 
-FuncTypeStorage *FuncTypeStorage::construct(TypeStorageAllocator &allocator,
-                                            const KeyTy &key) {
+FuncTypeStorage *
+FuncTypeStorage::construct(mlir::TypeStorageAllocator &allocator,
+                           const KeyTy &key) {
   return new (allocator.allocate<FuncTypeStorage>()) FuncTypeStorage(key);
 }
 
 FunctionTypeStorage *
-FunctionTypeStorage::construct(TypeStorageAllocator &allocator,
+FunctionTypeStorage::construct(mlir::TypeStorageAllocator &allocator,
                                const KeyTy &key) {
   return new (allocator.allocate<FunctionTypeStorage>())
       FunctionTypeStorage(key);
+}
+
+AwaitableTypeStorage *
+AwaitableTypeStorage::construct(mlir::TypeStorageAllocator &allocator,
+                                const KeyTy &key) {
+  return new (allocator.allocate<AwaitableTypeStorage>())
+      AwaitableTypeStorage(key);
 }
 
 } // namespace detail
@@ -70,23 +81,27 @@ FunctionTypeStorage::construct(TypeStorageAllocator &allocator,
 // Simple types
 //===----------------------------------------------------------------------===//
 
-IntType IntType::get(MLIRContext *ctx) { return Base::get(ctx, TypeKind::Int); }
+IntType IntType::get(mlir::MLIRContext *ctx) {
+  return Base::get(ctx, TypeKind::Int);
+}
 
-FloatType FloatType::get(MLIRContext *ctx) {
+FloatType FloatType::get(mlir::MLIRContext *ctx) {
   return Base::get(ctx, TypeKind::Float);
 }
 
-BoolType BoolType::get(MLIRContext *ctx) {
+BoolType BoolType::get(mlir::MLIRContext *ctx) {
   return Base::get(ctx, TypeKind::Bool);
 }
 
-StrType StrType::get(MLIRContext *ctx) { return Base::get(ctx, TypeKind::Str); }
+StrType StrType::get(mlir::MLIRContext *ctx) {
+  return Base::get(ctx, TypeKind::Str);
+}
 
-ObjectType ObjectType::get(MLIRContext *ctx) {
+ObjectType ObjectType::get(mlir::MLIRContext *ctx) {
   return Base::get(ctx, TypeKind::Object);
 }
 
-NoneType NoneType::get(MLIRContext *ctx) {
+NoneType NoneType::get(mlir::MLIRContext *ctx) {
   return Base::get(ctx, TypeKind::None);
 }
 
@@ -94,29 +109,31 @@ NoneType NoneType::get(MLIRContext *ctx) {
 // Composite types
 //===----------------------------------------------------------------------===//
 
-TupleType TupleType::get(MLIRContext *ctx, ArrayRef<Type> elementTypes) {
+TupleType TupleType::get(mlir::MLIRContext *ctx,
+                         llvm::ArrayRef<mlir::Type> elementTypes) {
   return Base::get(ctx, elementTypes);
 }
 
-ArrayRef<Type> TupleType::getElementTypes() const {
+llvm::ArrayRef<mlir::Type> TupleType::getElementTypes() const {
   return getImpl()->elementTypes;
 }
 
-DictType DictType::get(MLIRContext *ctx, Type keyType, Type valueType) {
+DictType DictType::get(mlir::MLIRContext *ctx, mlir::Type keyType,
+                       mlir::Type valueType) {
   return Base::get(ctx, std::make_pair(keyType, valueType));
 }
 
-Type DictType::getKeyType() const { return getImpl()->keyType; }
+mlir::Type DictType::getKeyType() const { return getImpl()->keyType; }
 
-Type DictType::getValueType() const { return getImpl()->valueType; }
+mlir::Type DictType::getValueType() const { return getImpl()->valueType; }
 
-ListType ListType::get(MLIRContext *ctx, Type elementType) {
+ListType ListType::get(mlir::MLIRContext *ctx, mlir::Type elementType) {
   return Base::get(ctx, elementType);
 }
 
-Type ListType::getElementType() const { return getImpl()->elementType; }
+mlir::Type ListType::getElementType() const { return getImpl()->elementType; }
 
-ClassType ClassType::get(MLIRContext *ctx, ::llvm::StringRef className) {
+ClassType ClassType::get(mlir::MLIRContext *ctx, ::llvm::StringRef className) {
   return Base::get(ctx, className);
 }
 
@@ -124,37 +141,38 @@ ClassType ClassType::get(MLIRContext *ctx, ::llvm::StringRef className) {
   return getImpl()->className;
 }
 
-ExceptionType ExceptionType::get(MLIRContext *ctx) {
+ExceptionType ExceptionType::get(mlir::MLIRContext *ctx) {
   return Base::get(ctx, TypeKind::Exception);
 }
 
-TracebackType TracebackType::get(MLIRContext *ctx) {
+TracebackType TracebackType::get(mlir::MLIRContext *ctx) {
   return Base::get(ctx, TypeKind::Traceback);
 }
 
-LocationType LocationType::get(MLIRContext *ctx) {
+LocationType LocationType::get(mlir::MLIRContext *ctx) {
   return Base::get(ctx, TypeKind::Location);
 }
 
-FuncSignatureType FuncSignatureType::get(MLIRContext *ctx,
-                                         ArrayRef<Type> positional,
-                                         ArrayRef<Type> kwonly, Type varargType,
-                                         Type kwargsType,
-                                         ArrayRef<Type> results) {
+FuncSignatureType FuncSignatureType::get(mlir::MLIRContext *ctx,
+                                         llvm::ArrayRef<mlir::Type> positional,
+                                         llvm::ArrayRef<mlir::Type> kwonly,
+                                         mlir::Type varargType,
+                                         mlir::Type kwargsType,
+                                         llvm::ArrayRef<mlir::Type> results) {
   // Key order: positional, vararg, kwonly, kwargs, results
   return Base::get(ctx, std::make_tuple(positional, varargType, kwonly,
                                         kwargsType, results));
 }
 
-ArrayRef<Type> FuncSignatureType::getPositionalTypes() const {
+llvm::ArrayRef<mlir::Type> FuncSignatureType::getPositionalTypes() const {
   return getImpl()->positionalTypes;
 }
 
-ArrayRef<Type> FuncSignatureType::getKwOnlyTypes() const {
+llvm::ArrayRef<mlir::Type> FuncSignatureType::getKwOnlyTypes() const {
   return getImpl()->kwOnlyTypes;
 }
 
-ArrayRef<Type> FuncSignatureType::getResultTypes() const {
+llvm::ArrayRef<mlir::Type> FuncSignatureType::getResultTypes() const {
   return getImpl()->resultTypes;
 }
 
@@ -162,15 +180,19 @@ bool FuncSignatureType::hasVararg() const {
   return static_cast<bool>(getImpl()->varargType);
 }
 
-Type FuncSignatureType::getVarargType() const { return getImpl()->varargType; }
+mlir::Type FuncSignatureType::getVarargType() const {
+  return getImpl()->varargType;
+}
 
 bool FuncSignatureType::hasKwarg() const {
   return static_cast<bool>(getImpl()->kwargsType);
 }
 
-Type FuncSignatureType::getKwargType() const { return getImpl()->kwargsType; }
+mlir::Type FuncSignatureType::getKwargType() const {
+  return getImpl()->kwargsType;
+}
 
-FuncType FuncType::get(MLIRContext *ctx, FuncSignatureType signature) {
+FuncType FuncType::get(mlir::MLIRContext *ctx, FuncSignatureType signature) {
   return Base::get(ctx, signature);
 }
 
@@ -178,63 +200,106 @@ FuncSignatureType FuncType::getSignature() const {
   return mlir::cast<FuncSignatureType>(getImpl()->signature);
 }
 
-PrimFuncType PrimFuncType::get(MLIRContext *ctx, FunctionType signature) {
+PrimFuncType PrimFuncType::get(mlir::MLIRContext *ctx,
+                               mlir::FunctionType signature) {
   return Base::get(ctx, signature);
 }
 
-FunctionType PrimFuncType::getSignature() const { return getImpl()->signature; }
+mlir::FunctionType PrimFuncType::getSignature() const {
+  return getImpl()->signature;
+}
+
+CoroutineType CoroutineType::get(mlir::MLIRContext *ctx,
+                                 mlir::Type resultType) {
+  return Base::get(ctx, resultType);
+}
+
+mlir::Type CoroutineType::getResultType() const {
+  return getImpl()->resultType;
+}
+
+TaskType TaskType::get(mlir::MLIRContext *ctx, mlir::Type resultType) {
+  return Base::get(ctx, resultType);
+}
+
+mlir::Type TaskType::getResultType() const { return getImpl()->resultType; }
+
+FutureType FutureType::get(mlir::MLIRContext *ctx, mlir::Type resultType) {
+  return Base::get(ctx, resultType);
+}
+
+mlir::Type FutureType::getResultType() const { return getImpl()->resultType; }
 
 //===----------------------------------------------------------------------===//
 // Helper predicates
 //===----------------------------------------------------------------------===//
 
-bool isPyIntType(Type type) { return mlir::isa<IntType>(type); }
+bool isPyIntType(mlir::Type type) { return mlir::isa<IntType>(type); }
 
-bool isPyFloatType(Type type) { return mlir::isa<FloatType>(type); }
+bool isPyFloatType(mlir::Type type) { return mlir::isa<FloatType>(type); }
 
-bool isPyBoolType(Type type) { return mlir::isa<BoolType>(type); }
+bool isPyBoolType(mlir::Type type) { return mlir::isa<BoolType>(type); }
 
-bool isPyStrType(Type type) { return mlir::isa<StrType>(type); }
+bool isPyStrType(mlir::Type type) { return mlir::isa<StrType>(type); }
 
-bool isPyObjectType(Type type) { return mlir::isa<ObjectType>(type); }
+bool isPyObjectType(mlir::Type type) { return mlir::isa<ObjectType>(type); }
 
-bool isPyNoneType(Type type) { return mlir::isa<NoneType>(type); }
+bool isPyNoneType(mlir::Type type) { return mlir::isa<NoneType>(type); }
 
-bool isPyTupleType(Type type) { return mlir::isa<TupleType>(type); }
+bool isPyTupleType(mlir::Type type) { return mlir::isa<TupleType>(type); }
 
-bool isPyDictType(Type type) { return mlir::isa<DictType>(type); }
+bool isPyDictType(mlir::Type type) { return mlir::isa<DictType>(type); }
 
-bool isPyListType(Type type) { return mlir::isa<ListType>(type); }
+bool isPyListType(mlir::Type type) { return mlir::isa<ListType>(type); }
 
-bool isPyClassType(Type type) { return mlir::isa<ClassType>(type); }
+bool isPyClassType(mlir::Type type) { return mlir::isa<ClassType>(type); }
 
-bool isPyExceptionType(Type type) { return mlir::isa<ExceptionType>(type); }
+bool isPyExceptionType(mlir::Type type) {
+  return mlir::isa<ExceptionType>(type);
+}
 
-bool isPyTracebackType(Type type) { return mlir::isa<TracebackType>(type); }
+bool isPyTracebackType(mlir::Type type) {
+  return mlir::isa<TracebackType>(type);
+}
 
-bool isPyLocationType(Type type) { return mlir::isa<LocationType>(type); }
+bool isPyLocationType(mlir::Type type) { return mlir::isa<LocationType>(type); }
 
-bool isPyFuncSigType(Type type) { return mlir::isa<FuncSignatureType>(type); }
+bool isPyFuncSigType(mlir::Type type) {
+  return mlir::isa<FuncSignatureType>(type);
+}
 
-bool isPyFuncType(Type type) { return mlir::isa<FuncType>(type); }
+bool isPyFuncType(mlir::Type type) { return mlir::isa<FuncType>(type); }
 
-bool isPyPrimFuncType(Type type) { return mlir::isa<PrimFuncType>(type); }
+bool isPyPrimFuncType(mlir::Type type) { return mlir::isa<PrimFuncType>(type); }
 
-bool isCallableType(Type type) { return mlir::isa<FuncType>(type); }
+bool isPyCoroutineType(mlir::Type type) {
+  return mlir::isa<CoroutineType>(type);
+}
 
-bool isPyType(Type type) {
-  return llvm::TypeSwitch<Type, bool>(type)
+bool isPyTaskType(mlir::Type type) { return mlir::isa<TaskType>(type); }
+
+bool isPyFutureType(mlir::Type type) { return mlir::isa<FutureType>(type); }
+
+bool isCallableType(mlir::Type type) { return mlir::isa<FuncType>(type); }
+
+bool isAwaitableType(mlir::Type type) {
+  return mlir::isa<CoroutineType, TaskType, FutureType>(type);
+}
+
+bool isPyType(mlir::Type type) {
+  return llvm::TypeSwitch<mlir::Type, bool>(type)
       .Case<IntType, FloatType, BoolType, StrType, ObjectType, NoneType,
             TupleType, DictType, ListType, ClassType, ExceptionType,
-            TracebackType, LocationType, FuncType>([](auto) { return true; })
-      .Default([](Type) { return false; });
+            TracebackType, LocationType, FuncType, CoroutineType, TaskType,
+            FutureType>([](auto) { return true; })
+      .Default([](mlir::Type) { return false; });
 }
 
 //===----------------------------------------------------------------------===//
 // Subtype checking (v2.1)
 //===----------------------------------------------------------------------===//
 
-bool isSubtypeOf(Type subtype, Type supertype) {
+bool isSubtypeOf(mlir::Type subtype, mlir::Type supertype) {
   // Reflexive: T <: T
   if (subtype == supertype)
     return true;
@@ -273,6 +338,24 @@ bool isSubtypeOf(Type subtype, Type supertype) {
     return isSubtypeOf(subtypeList.getElementType(),
                        supertypeList.getElementType());
   }
+
+  auto subtypeCoro = mlir::dyn_cast<CoroutineType>(subtype);
+  auto supertypeCoro = mlir::dyn_cast<CoroutineType>(supertype);
+  if (subtypeCoro && supertypeCoro)
+    return isSubtypeOf(subtypeCoro.getResultType(),
+                       supertypeCoro.getResultType());
+
+  auto subtypeTask = mlir::dyn_cast<TaskType>(subtype);
+  auto supertypeTask = mlir::dyn_cast<TaskType>(supertype);
+  if (subtypeTask && supertypeTask)
+    return isSubtypeOf(subtypeTask.getResultType(),
+                       supertypeTask.getResultType());
+
+  auto subtypeFuture = mlir::dyn_cast<FutureType>(subtype);
+  auto supertypeFuture = mlir::dyn_cast<FutureType>(supertype);
+  if (subtypeFuture && supertypeFuture)
+    return isSubtypeOf(subtypeFuture.getResultType(),
+                       supertypeFuture.getResultType());
 
   // No other subtype relations in v2.1
   // TODO(v3): Add class hierarchy support

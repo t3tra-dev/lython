@@ -2,6 +2,22 @@ add_executable(lyc
     CLI.cpp
 )
 
+get_target_property(MLIR_ASYNC_RUNTIME_LIBRARY mlir_async_runtime IMPORTED_LOCATION_RELEASE)
+if(NOT MLIR_ASYNC_RUNTIME_LIBRARY)
+    get_target_property(MLIR_ASYNC_RUNTIME_LIBRARY mlir_async_runtime IMPORTED_LOCATION)
+endif()
+if(NOT MLIR_ASYNC_RUNTIME_LIBRARY)
+    message(FATAL_ERROR "mlir_async_runtime imported target does not expose an imported location")
+endif()
+
+add_custom_command(
+    OUTPUT ${MLIR_ASYNC_RUNTIME_LIBRARY}
+    COMMAND ${CMAKE_COMMAND} --build ${LLVM_PROJECT_BUILD_DIR} --target mlir_async_runtime
+    COMMENT "Building MLIR async runtime support library"
+    VERBATIM
+)
+add_custom_target(MLIRAsyncRuntimeSupport DEPENDS ${MLIR_ASYNC_RUNTIME_LIBRARY})
+
 target_include_directories(lyc
     PUBLIC
     ${CMAKE_SOURCE_DIR}/src/lython/dialects/cpp
@@ -11,8 +27,14 @@ target_include_directories(lyc
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
+target_compile_definitions(lyc
+    PRIVATE
+    LYTHON_MLIR_ASYNC_RUNTIME_LIBRARY="${MLIR_ASYNC_RUNTIME_LIBRARY}"
+)
+
 # 生成ヘッダ依存 (PyDialectIncGen) を明示
 add_dependencies(lyc PyDialectIncGen)
+add_dependencies(lyc MLIRAsyncRuntimeSupport)
 
 target_link_libraries(lyc
     PRIVATE
@@ -27,6 +49,8 @@ target_link_libraries(lyc
     MLIRTransforms
     MLIRPass
     # Dialects
+    MLIRAsyncDialect
+    MLIRAsyncTransforms
     MLIRFuncDialect
     MLIRArithDialect
     MLIRBufferizationDialect
@@ -36,6 +60,7 @@ target_link_libraries(lyc
     MLIRLLVMDialect
     # Conversions / Translations
     MLIRArithToLLVM
+    MLIRAsyncToLLVM
     MLIRLinalgToStandard
     MLIRSCFToControlFlow
     MLIRControlFlowToLLVM
@@ -49,6 +74,9 @@ target_link_libraries(lyc
     MLIRToLLVMIRTranslationRegistration
     MLIRBuiltinToLLVMIRTranslation
     MLIRLLVMToLLVMIRTranslation
+    LLVMCoroutines
+    LLVMPasses
+    mlir_async_runtime
 )
 
 install(TARGETS lyc

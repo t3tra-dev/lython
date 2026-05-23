@@ -35,6 +35,7 @@ add_library(PyDialect STATIC
   cpp/PyVerifier/ClassFunc.cpp
   cpp/PyVerifier/Call.cpp
   cpp/PyVerifier/Casts.cpp
+  cpp/PyVerifier/Async.cpp
   cpp/PyVerifier/ConstTupleDict.cpp
   cpp/PyVerifier/EH.cpp
   cpp/PyVerifier/Numeric.cpp
@@ -44,6 +45,7 @@ add_dependencies(PyDialect PyDialectIncGen)
 
 target_link_libraries(PyDialect
   PRIVATE
+  MLIRAsyncDialect
   MLIRIR
   MLIRSupport
 )

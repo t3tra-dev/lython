@@ -1,14 +1,24 @@
-# pyright: reportAttributeAccessIssue=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownVariableType=false
 from __future__ import annotations
 
 import ast
-from typing import TypeAlias
+from typing import TYPE_CHECKING, TypeAlias, cast
 
 from ...mlir import ir
 from ...mlir.dialects import _lython_ops_gen as py_ops
 from ...mlir.dialects import arith as arith_ops
 from ...mlir.dialects import linalg as linalg_ops
 from ...mlir.dialects import tensor as tensor_ops
+from ..models import (
+    AffineMapFactory,
+    ArrayAttrFactory,
+    AttrBuilderFactory,
+    BlockFactory,
+)
+
+if TYPE_CHECKING:
+    from ..contracts import VisitorRuntime
+else:
+    VisitorRuntime = object
 
 # Base primitive type names(lyrt.prim)
 # Int[N] supports 1 - 8388608 bits(LLVM limit)
@@ -25,7 +35,7 @@ PrimitiveScalar: TypeAlias = int | float
 PrimitiveLiteral: TypeAlias = PrimitiveScalar | list["PrimitiveLiteral"]
 
 
-class PrimitiveMixin:
+class PrimitiveMixin(VisitorRuntime):
     """Helpers for lyrt primitive/native frontend support."""
 
     def get_primitive_type_from_spec(self, base_type: str, bits: int) -> ir.Type:
@@ -46,7 +56,68 @@ class PrimitiveMixin:
                 return ir.F64Type.get(context=self.ctx)
             if bits == 128:
                 return ir.Type.parse("f128", self.ctx)
-        raise ValueError(f"Unknown primitive base type: {base_type}")
+        raise ValueError(f"Unsupported primitive base type: {base_type}")
+
+    def _handle_prim_constructor(
+        self, node: ast.Call, base_type: str, loc: ir.Location
+    ) -> ir.Value:
+        if len(node.args) != 1:
+            raise ValueError(f"{base_type}[N]() requires exactly 1 argument")
+
+        assert isinstance(node.func, ast.Subscript)
+        if not isinstance(node.func.slice, ast.Constant) or not isinstance(
+            node.func.slice.value, int
+        ):
+            raise ValueError(f"{base_type} requires an integer bit width")
+        bits = node.func.slice.value
+        prim_type = self.get_primitive_type_from_spec(base_type, bits)
+        value_node = node.args[0]
+
+        if isinstance(value_node, ast.Constant):
+            value = value_node.value
+            with loc, self.insertion_point():
+                if base_type == "Int" and isinstance(value, int):
+                    attr = ir.IntegerAttr.get(prim_type, value)
+                    result = arith_ops.ConstantOp(prim_type, attr).result
+                    self._pending_prim_const = (prim_type, value)
+                    return result
+                if base_type == "Float" and isinstance(value, (int, float)):
+                    attr = ir.FloatAttr.get(prim_type, float(value))
+                    result = arith_ops.ConstantOp(prim_type, attr).result
+                    self._pending_prim_const = (prim_type, float(value))
+                    return result
+            raise ValueError(
+                f"Cannot convert {type(value).__name__} to {base_type}[{bits}]"
+            )
+
+        py_value = self.require_value(value_node, self.visit(value_node))
+        with loc, self.insertion_point():
+            return py_ops.CastToPrimOp(
+                prim_type, py_value, ir.StringAttr.get("exact", self.ctx)
+            ).result
+
+    def _handle_from_prim(self, node: ast.Call, loc: ir.Location) -> ir.Value:
+        self._ensure_not_in_native("from_prim", loc)
+        if len(node.args) != 1:
+            raise ValueError("from_prim() requires exactly 1 argument")
+
+        prim_value = self.require_value(node.args[0], self.visit(node.args[0]))
+        prim_type = prim_value.type
+        prim_type_str = str(prim_type)
+
+        if prim_type_str.startswith("i"):
+            result_type = self.get_py_type("!py.int")
+        elif prim_type_str.startswith("f"):
+            result_type = self.get_py_type("!py.float")
+        elif isinstance(prim_type, ir.RankedTensorType):
+            result_type = self.get_py_type("!py.str")
+        else:
+            raise ValueError(
+                f"Cannot convert primitive type {prim_type_str} to Python object"
+            )
+
+        with loc, self.insertion_point():
+            return py_ops.CastFromPrimOp(result_type, prim_value).result
 
     def is_primitive_base_type(self, type_name: str) -> bool:
         return type_name in self._prim_types or type_name in PRIMITIVE_BASE_TYPES
@@ -164,7 +235,8 @@ class PrimitiveMixin:
         self, op: linalg_ops.FillOp, elem_type: ir.Type, loc: ir.Location
     ) -> None:
         region = op.operation.regions[0]
-        block = ir.Block.create_at_start(region, [elem_type, elem_type])  # type: ignore
+        block_cls = cast(BlockFactory, ir.Block)
+        block = block_cls.create_at_start(region, [elem_type, elem_type])
         with ir.InsertionPoint(block), loc:
             linalg_ops.YieldOp([block.arguments[0]])
 
@@ -172,9 +244,8 @@ class PrimitiveMixin:
         self, op: linalg_ops.GenericOp, elem_type: ir.Type, loc: ir.Location
     ) -> None:
         region = op.operation.regions[0]
-        block = ir.Block.create_at_start(  # type: ignore
-            region, [elem_type, elem_type, elem_type]
-        )
+        block_cls = cast(BlockFactory, ir.Block)
+        block = block_cls.create_at_start(region, [elem_type, elem_type, elem_type])
         with ir.InsertionPoint(block), loc:
             prod = arith_ops.MulFOp(block.arguments[0], block.arguments[1]).result
             acc = arith_ops.AddFOp(prod, block.arguments[2]).result
@@ -198,11 +269,14 @@ class PrimitiveMixin:
         d0 = ir.AffineExpr.get_dim(0)
         d1 = ir.AffineExpr.get_dim(1)
         d2 = ir.AffineExpr.get_dim(2)
-        map_a = ir.AffineMap.get(3, 0, [d0, d2])  # type: ignore
-        map_b = ir.AffineMap.get(3, 0, [d2, d1])  # type: ignore
-        map_c = ir.AffineMap.get(3, 0, [d0, d1])  # type: ignore
-        iterator_builder = ir.AttrBuilder.get("IteratorTypeEnum")  # type: ignore
-        iterator_types = ir.ArrayAttr.get(  # type: ignore
+        affine_map_cls = cast(AffineMapFactory, ir.AffineMap)
+        map_a = affine_map_cls.get(3, 0, [d0, d2])
+        map_b = affine_map_cls.get(3, 0, [d2, d1])
+        map_c = affine_map_cls.get(3, 0, [d0, d1])
+        attr_builder_cls = cast(AttrBuilderFactory, ir.AttrBuilder)
+        iterator_builder = attr_builder_cls.get("IteratorTypeEnum")
+        array_attr_cls = cast(ArrayAttrFactory, ir.ArrayAttr)
+        iterator_types = array_attr_cls.get(
             [
                 iterator_builder(linalg_ops.IteratorType.parallel, context=self.ctx),
                 iterator_builder(linalg_ops.IteratorType.parallel, context=self.ctx),
@@ -301,6 +375,7 @@ class PrimitiveMixin:
         message: str | None,
         loc: ir.Location,
         exc_type_name: str = "Exception",
+        context: ir.Value | None = None,
     ) -> ir.Value:
         exc_type = self.get_py_type(f'!py.class<"{exc_type_name}">')
         empty_tuple = self.get_py_type("!py.tuple<>")
@@ -313,7 +388,10 @@ class PrimitiveMixin:
             ).result
             args = py_ops.TupleEmptyOp(empty_tuple).result
             cause = py_ops.ExceptionNullOp(self.get_py_type("!py.exception")).result
-            context = py_ops.ExceptionNullOp(self.get_py_type("!py.exception")).result
+            if context is None:
+                context = py_ops.ExceptionNullOp(
+                    self.get_py_type("!py.exception")
+                ).result
             tb = py_ops.TracebackNullOp(self.get_py_type("!py.traceback")).result
             location = py_ops.LocationCurrentOp(self.get_py_type("!py.location")).result
             extras = py_ops.DictEmptyOp(extras_dict).result

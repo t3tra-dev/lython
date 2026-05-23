@@ -63,6 +63,16 @@ _mlir_ciface_LyTupleF64Bits_Repr(UnrankedMemRefType<std::int64_t> *memref);
 LyUnicodeObject *
 _mlir_ciface_LyTuplePtr_Repr(UnrankedMemRefType<std::int64_t> *memref,
                              LyUnicodeObject *(*repr_item)(void *));
+LyUnicodeObject *LyDictPacked_Repr(UnrankedMemRefType<std::int64_t> *memref,
+                                   std::int64_t key_kind,
+                                   std::int64_t value_kind,
+                                   LyUnicodeObject *(*repr_key)(void *),
+                                   LyUnicodeObject *(*repr_value)(void *));
+LyUnicodeObject *
+_mlir_ciface_LyDictPacked_Repr(UnrankedMemRefType<std::int64_t> *memref,
+                               std::int64_t key_kind, std::int64_t value_kind,
+                               LyUnicodeObject *(*repr_key)(void *),
+                               LyUnicodeObject *(*repr_value)(void *));
 
 LyLongObject *LyLong_FromI64(std::int64_t value);
 std::int64_t LyLong_AsI64(LyObject *object);

@@ -5,6 +5,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <iostream>
 #include <string>
 #include <vector>
 
@@ -38,6 +39,43 @@ const char *safeStr(const char *value, const char *fallback) {
   return value ? value : fallback;
 }
 
+void printExceptionSummary(LyObject *exception) {
+  if (!exception) {
+    std::fprintf(stderr, "Exception: <unknown>\n");
+    return;
+  }
+  const char *typeName =
+      exception->ob_type ? exception->ob_type->tp_name : "Exception";
+  auto *excObj = reinterpret_cast<LyExceptionObject *>(exception);
+  const char *msg =
+      excObj->message
+          ? LyUnicode_AsUTF8(reinterpret_cast<LyObject *>(excObj->message))
+          : "";
+  if (msg && msg[0])
+    std::fprintf(stderr, "%s: %s\n", typeName, msg);
+  else
+    std::fprintf(stderr, "%s\n", typeName);
+}
+
+LyObject *getExceptionContext(LyObject *exception) {
+  if (!exception || exception->ob_type != &LyException_Type())
+    return nullptr;
+  return reinterpret_cast<LyExceptionObject *>(exception)->context;
+}
+
+void printExceptionContextChain(LyObject *exception, unsigned depth = 0) {
+  if (!exception || depth > 16)
+    return;
+  LyObject *context = getExceptionContext(exception);
+  if (!context || context == exception)
+    return;
+  printExceptionContextChain(context, depth + 1);
+  printExceptionSummary(context);
+  std::fprintf(stderr,
+               "\nDuring handling of the above exception, another exception "
+               "occurred:\n\n");
+}
+
 } // namespace
 
 extern "C" {
@@ -67,6 +105,11 @@ void LyTraceback_Clear() {
 }
 
 void LyTraceback_Print(LyObject *exception) {
+  std::cout.flush();
+  std::fflush(stdout);
+  LyObject *exc = exception ? exception : LyException_GetCurrent();
+  printExceptionContextChain(exc);
+
   std::fprintf(stderr, "Traceback (most recent call last):\n");
 
   // Collect frames to print from oldest to newest.
@@ -84,21 +127,7 @@ void LyTraceback_Print(LyObject *exception) {
       std::fprintf(stderr, "    %s\n", source.c_str());
   }
 
-  LyObject *exc = exception ? exception : LyException_GetCurrent();
-  if (!exc) {
-    std::fprintf(stderr, "Exception: <unknown>\n");
-    return;
-  }
-  const char *typeName = exc->ob_type ? exc->ob_type->tp_name : "Exception";
-  auto *excObj = reinterpret_cast<LyExceptionObject *>(exc);
-  const char *msg =
-      excObj->message
-          ? LyUnicode_AsUTF8(reinterpret_cast<LyObject *>(excObj->message))
-          : "";
-  if (msg && msg[0])
-    std::fprintf(stderr, "%s: %s\n", typeName, msg);
-  else
-    std::fprintf(stderr, "%s\n", typeName);
+  printExceptionSummary(exc);
 }
 
 std::int32_t LyEH_ReportUnhandled(LyObject *exception) {

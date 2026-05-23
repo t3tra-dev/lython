@@ -1,14 +1,19 @@
-# pyright: reportAttributeAccessIssue=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownVariableType=false
 from __future__ import annotations
 
 import ast
+from typing import TYPE_CHECKING
 
+from ...frontend.symbols import MethodInfo
 from ...mlir import ir
 from ...mlir.dialects import _lython_ops_gen as py_ops
-from .._base import MethodInfo
+
+if TYPE_CHECKING:
+    from ..contracts import VisitorRuntime
+else:
+    VisitorRuntime = object
 
 
-class StmtClassMixin:
+class StmtClassMixin(VisitorRuntime):
     """Statement lowering for class and method definitions."""
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
@@ -30,15 +35,14 @@ class StmtClassMixin:
         self._set_insertion_block(class_body_block)
         self.push_scope()
 
-        prev_class = getattr(self, "_current_class", None)
+        prev_class = self._current_class
         self._current_class = class_name
-        prev_class_definition_block = getattr(
-            self, "_current_class_definition_block", None
-        )
+        prev_class_definition_block = self._current_class_definition_block
         self._current_class_definition_block = prev_block
 
-        prev_pending_attrs = getattr(self, "_pending_attributes", None)
-        self._pending_attributes: dict[str, ir.Type] = {}
+        prev_pending_attrs = self._pending_attributes
+        pending_attributes: dict[str, ir.Type] = {}
+        self._pending_attributes = pending_attributes
 
         methods: dict[str, MethodInfo] = {}
         method_defs = [stmt for stmt in node.body if isinstance(stmt, ast.FunctionDef)]
@@ -58,7 +62,7 @@ class StmtClassMixin:
                 f"Class body can only contain method definitions, got {type(stmt).__name__}"
             )
 
-        attributes = self._pending_attributes
+        attributes = pending_attributes
         if attributes:
             field_name_attrs = [
                 ir.StringAttr.get(name, self.ctx) for name in attributes.keys()
@@ -69,7 +73,7 @@ class StmtClassMixin:
             ]
             class_op.attributes["field_names"] = self.array_attr(field_name_attrs)
             class_op.attributes["field_types"] = self.array_attr(field_type_attrs)
-        self._pending_attributes = prev_pending_attrs  # type: ignore
+        self._pending_attributes = prev_pending_attrs
         self._current_class = prev_class
         self._current_class_definition_block = prev_class_definition_block
         self.pop_scope()
@@ -110,11 +114,6 @@ class StmtClassMixin:
         else:
             result_ir_type = self.annotation_to_static_class_type(node.returns)
         result_type_spec = str(result_ir_type)
-        if node.name == "__repr__":
-            if len(node.args.args) != 1:
-                raise ValueError("__repr__ must take only 'self'")
-            if result_ir_type != self.get_py_type("!py.str"):
-                raise ValueError("__repr__ must return str")
         funcsig = self.build_funcsig(
             arg_type_specs, [result_type_spec], kwonly_types=kwonly_type_specs
         )
@@ -135,7 +134,7 @@ class StmtClassMixin:
 
         loc = self._loc(node)
         metadata_prev_block = self.current_block
-        metadata_block = getattr(self, "_current_class_definition_block", None)
+        metadata_block = self._current_class_definition_block
         if metadata_block is None:
             raise RuntimeError("Missing outer insertion block for method defaults")
         self._set_insertion_block(metadata_block)
@@ -173,8 +172,8 @@ class StmtClassMixin:
         self._enter_py_function(qualified_name)
         self.push_function_ast(node)
         self.push_return_type(result_ir_type)
-        prev_method = getattr(self, "_current_method", None)
-        prev_mutates_self = getattr(self, "_current_method_mutates_self", False)
+        prev_method = self._current_method
+        prev_mutates_self = self._current_method_mutates_self
         self._current_method = node.name
         self._current_method_mutates_self = False
 
@@ -217,7 +216,7 @@ class StmtClassMixin:
         self.pop_function_ast()
         self.pop_return_type()
         self._set_func_effect(func, maythrow)
-        mutates_self = bool(getattr(self, "_current_method_mutates_self", False))
+        mutates_self = self._current_method_mutates_self
         self._current_method = prev_method
         self._current_method_mutates_self = prev_mutates_self
         if node.name == "__init__":

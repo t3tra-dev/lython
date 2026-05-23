@@ -1,9 +1,12 @@
-// This pass lowers linalg ops to standard/scf while allowing other dialects.
+// This pass lowers linalg ops to standard/scf while preserving only the known
+// dialects that may survive until later lowering phases.
 
 #include "Common/RuntimeSupport.h"
 
 #include "mlir/Conversion/LinalgToStandard/LinalgToStandard.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Async/IR/Async.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -15,38 +18,40 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 
-using namespace mlir;
-
 namespace py {
 namespace {
 
 struct LinalgLoweringPass
-    : public PassWrapper<LinalgLoweringPass, OperationPass<ModuleOp>> {
+    : public mlir::PassWrapper<LinalgLoweringPass,
+                               mlir::OperationPass<mlir::ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LinalgLoweringPass)
 
   void runOnOperation() override {
-    ModuleOp module = getOperation();
-    MLIRContext *ctx = module.getContext();
-    RewritePatternSet patterns(ctx);
-    linalg::populateLinalgToStandardConversionPatterns(patterns);
+    mlir::ModuleOp module = getOperation();
+    mlir::MLIRContext *ctx = module.getContext();
+    mlir::RewritePatternSet patterns(ctx);
+    mlir::linalg::populateLinalgToStandardConversionPatterns(patterns);
 
-    ConversionTarget target(*ctx);
-    target.addLegalOp<ModuleOp>();
-    target.addLegalDialect<arith::ArithDialect, func::FuncDialect,
-                           tensor::TensorDialect, scf::SCFDialect,
-                           memref::MemRefDialect, cf::ControlFlowDialect,
-                           LLVM::LLVMDialect>();
-    target.addIllegalDialect<linalg::LinalgDialect>();
-    target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
+    mlir::ConversionTarget target(*ctx);
+    target.addLegalOp<mlir::ModuleOp>();
+    target.addLegalDialect<mlir::arith::ArithDialect, mlir::async::AsyncDialect,
+                           mlir::bufferization::BufferizationDialect,
+                           mlir::func::FuncDialect, mlir::tensor::TensorDialect,
+                           mlir::scf::SCFDialect, mlir::memref::MemRefDialect,
+                           mlir::cf::ControlFlowDialect,
+                           mlir::LLVM::LLVMDialect>();
+    target.addIllegalDialect<mlir::linalg::LinalgDialect>();
 
-    if (failed(applyPartialConversion(module, target, std::move(patterns))))
+    if (mlir::failed(
+            applyPartialConversion(module, target, std::move(patterns))))
       signalPassFailure();
   }
 };
 
 } // namespace
 
-std::unique_ptr<OperationPass<ModuleOp>> createLinalgLoweringPass() {
+std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
+createLinalgLoweringPass() {
   return std::make_unique<LinalgLoweringPass>();
 }
 
