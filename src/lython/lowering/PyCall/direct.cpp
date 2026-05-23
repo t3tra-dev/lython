@@ -46,6 +46,7 @@ struct CallVectorLowering : public mlir::OpConversionPattern<CallVectorOp> {
         rewriter.getI64IntegerAttr(std::max<std::size_t>(elements.size(), 1)));
     mlir::Value argsArray = rewriter.create<mlir::LLVM::AllocaOp>(
         op.getLoc(), ptrType, ptrType, storageCount, /*alignment=*/0);
+    ownership::Pointer::markNonObject(argsArray);
 
     for (auto [index, element] : llvm::enumerate(elements)) {
       mlir::Value asPtr = Slot::bridgePointer(op.getLoc(), element, rewriter);

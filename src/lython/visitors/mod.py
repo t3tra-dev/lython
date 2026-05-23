@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import ast
-from typing import Any
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, NoReturn
 
+from ..frontend.program import typed_program_for_module
 from ..mlir import ir
 from ..mlir.dialects import _lython_ops_gen as py_ops
 from ..mlir.dialects import arith as arith_ops
 from ._base import BaseVisitor
+
+if TYPE_CHECKING:
+    from .contracts import VisitorRuntime
 
 __all__ = ["ModVisitor"]
 
@@ -28,7 +33,7 @@ class ModVisitor(BaseVisitor):
         self,
         ctx: ir.Context,
         *,
-        subvisitors: dict[str, BaseVisitor],
+        subvisitors: Mapping[str, VisitorRuntime],
     ) -> None:
         super().__init__(ctx, subvisitors=subvisitors)
 
@@ -38,7 +43,13 @@ class ModVisitor(BaseVisitor):
         Module(stmt* body, type_ignore* type_ignores)
         ```
         """
-        module_name = getattr(node, "lython_module_name", "__main__")
+        module_name = "__main__"
+        typed_program = typed_program_for_module(node)
+        if typed_program is None:
+            raise TypeError(
+                "typed frontend analysis must run before py dialect emission"
+            )
+        self._set_typed_program(typed_program)
         with ir.Location.file("<module>", 1, 1, self.ctx):
             module = ir.Module.create()
         self._set_module(module)
@@ -103,7 +114,7 @@ class ModVisitor(BaseVisitor):
         self.pop_scope()
         return None
 
-    def visit_Interactive(self, node: ast.Interactive) -> Any:
+    def visit_Interactive(self, node: ast.Interactive) -> NoReturn:
         """
         ```asdl
         Interactive(stmt* body)
@@ -111,7 +122,7 @@ class ModVisitor(BaseVisitor):
         """
         raise NotImplementedError("Interactive mode not supported (static)")
 
-    def visit_Expression(self, node: ast.Expression) -> Any:
+    def visit_Expression(self, node: ast.Expression) -> NoReturn:
         """
         ```asdl
         Expression(expr body)

@@ -42,6 +42,7 @@
 #include "mlir/Target/LLVMIR/Dialect/All.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Export.h"
+#include "mlir/Target/LLVMIR/LLVMTranslationInterface.h"
 #include "mlir/Transforms/Passes.h"
 #include "llvm/ExecutionEngine/ObjectCache.h"
 #include "llvm/ExecutionEngine/Orc/CompileUtils.h"
@@ -158,6 +159,7 @@ import ast
 import os
 import sys
 from lython.mlir import ir
+from lython.frontend import analyze_module_types
 from lython.visitors._base import BaseVisitor
 
 def main():
@@ -169,6 +171,7 @@ def main():
     tree = ast.parse(source, filename=input_path)
     abs_path = os.path.abspath(input_path)
     tree.lython_module_name = abs_path
+    analyze_module_types(tree, filename=abs_path)
     ctx = ir.Context()
     parser = BaseVisitor(ctx)
     parser._set_module_name(abs_path)
@@ -854,6 +857,8 @@ struct LLVMSafetyProfile {
 static constexpr llvm::StringLiteral kLythonSafetyMetadataName{"ly.safety"};
 static constexpr llvm::StringLiteral kLythonSafetyMetadataVersion{
     "ly.safety.v1"};
+static constexpr llvm::StringLiteral kPySafetyContractIdAttr{
+    "py.safety_contract_id"};
 
 std::optional<StringRef> getStringAttr(Operation *op, StringRef attrName) {
   if (!op)
@@ -1141,6 +1146,12 @@ void collectLLVMSafetyContracts(ModuleOp module, LLVMSafetyProfile &profile) {
         LLVMSafetyContract contract;
         contract.id = static_cast<int64_t>(profile.contracts.size());
         contract.functionName = func.getName().str();
+        auto markContract = [&] {
+          op.setAttr(kPySafetyContractIdAttr,
+                     IntegerAttr::get(IntegerType::get(op.getContext(), 64),
+                                      contract.id));
+          profile.contracts.push_back(std::move(contract));
+        };
 
         if (auto call = dyn_cast<LLVM::CallOp>(&op)) {
           auto callee = call.getCallee();
@@ -1163,7 +1174,7 @@ void collectLLVMSafetyContracts(ModuleOp module, LLVMSafetyProfile &profile) {
             if (auto count = getMLIRLLVMConstantInt(call.getOperand(1)))
               contract.value = *count;
           }
-          profile.contracts.push_back(std::move(contract));
+          markContract();
           continue;
         }
 
@@ -1178,7 +1189,7 @@ void collectLLVMSafetyContracts(ModuleOp module, LLVMSafetyProfile &profile) {
               py::ThreadSafetyAttrs::kRoleAsyncCancelRequest)
             contract.asyncCancelFlag = hasMLIRAsyncCancelFlagProvenance(
                 atomic.getOperation(), atomic.getPtr());
-          profile.contracts.push_back(std::move(contract));
+          markContract();
           continue;
         }
 
@@ -1193,7 +1204,7 @@ void collectLLVMSafetyContracts(ModuleOp module, LLVMSafetyProfile &profile) {
               py::ThreadSafetyAttrs::kRoleAsyncExceptionStore)
             contract.asyncExceptionCell =
                 hasMLIRAsyncExceptionCellProvenance(cmpxchg.getPtr());
-          profile.contracts.push_back(std::move(contract));
+          markContract();
           continue;
         }
 
@@ -1211,7 +1222,7 @@ void collectLLVMSafetyContracts(ModuleOp module, LLVMSafetyProfile &profile) {
               py::ThreadSafetyAttrs::kRoleAsyncCancelLoad)
             contract.asyncCancelFlag = hasMLIRAsyncCancelFlagProvenance(
                 load.getOperation(), load.getAddr());
-          profile.contracts.push_back(std::move(contract));
+          markContract();
           continue;
         }
 
@@ -1220,21 +1231,22 @@ void collectLLVMSafetyContracts(ModuleOp module, LLVMSafetyProfile &profile) {
             continue;
           contract.kind = LLVMSafetyEffectKind::AtomicStore;
           contract.ordering = getMLIRAtomicOrderingName(store.getOrdering());
+          if (auto value = getMLIRLLVMConstantInt(store.getValue()))
+            contract.value = *value;
           appendAtomicAttrs(contract, store.getOperation());
-          profile.contracts.push_back(std::move(contract));
+          markContract();
         }
       }
     }
   });
 }
 
-void setLythonSafetyMetadata(llvm::Instruction &inst,
-                             const LLVMSafetyContract &contract) {
+void setLythonSafetyMetadataId(llvm::Instruction &inst, int64_t id) {
   llvm::LLVMContext &ctx = inst.getContext();
   llvm::Metadata *operands[] = {
       llvm::MDString::get(ctx, kLythonSafetyMetadataVersion),
       llvm::ConstantAsMetadata::get(
-          llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx), contract.id))};
+          llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx), id))};
   inst.setMetadata(kLythonSafetyMetadataName, llvm::MDNode::get(ctx, operands));
 }
 
@@ -1264,6 +1276,33 @@ lookupSafetyContract(llvm::Instruction &inst,
   return &profile.contracts[static_cast<size_t>(*id)];
 }
 
+class PySafetyLLVMIRTranslationInterface final
+    : public LLVMTranslationDialectInterface {
+public:
+  using LLVMTranslationDialectInterface::LLVMTranslationDialectInterface;
+
+  LogicalResult amendOperation(Operation *op,
+                               ArrayRef<llvm::Instruction *> instructions,
+                               NamedAttribute attribute,
+                               LLVM::ModuleTranslation &) const final {
+    if (attribute.getName() != kPySafetyContractIdAttr)
+      return success();
+    auto idAttr = dyn_cast<IntegerAttr>(attribute.getValue());
+    if (!idAttr)
+      return op->emitOpError("py.safety_contract_id must be an integer");
+    int64_t id = idAttr.getInt();
+    for (llvm::Instruction *instruction : instructions)
+      setLythonSafetyMetadataId(*instruction, id);
+    return success();
+  }
+};
+
+void registerPySafetyLLVMIRTranslation(DialectRegistry &registry) {
+  registry.addExtension(+[](MLIRContext *, py::PyDialect *dialect) {
+    dialect->addInterfaces<PySafetyLLVMIRTranslationInterface>();
+  });
+}
+
 void emitPostCoroVerifierError(llvm::Instruction &inst, llvm::StringRef msg);
 
 static llvm::StringRef getContractRole(const LLVMSafetyContract &contract) {
@@ -1290,50 +1329,42 @@ static bool hasRetainPremise(const LLVMSafetyContract &contract) {
   return !contract.retainPremise.empty();
 }
 
-LogicalResult annotateLLVMIRSafetyContracts(llvm::Module &llvmModule,
-                                            const LLVMSafetyProfile &profile) {
-  std::map<std::string, llvm::SmallVector<size_t, 16>> byFunction;
-  for (auto indexed : llvm::enumerate(profile.contracts))
-    byFunction[indexed.value().functionName].push_back(indexed.index());
-
-  std::map<std::string, size_t> cursors;
-  llvm::SmallVector<bool, 64> used(profile.contracts.size(), false);
+LogicalResult
+verifyLLVMIRSafetyMetadataAttached(llvm::Module &llvmModule,
+                                   const LLVMSafetyProfile &profile) {
+  std::vector<unsigned> used(profile.contracts.size(), 0);
   bool failedAny = false;
 
   for (llvm::Function &function : llvmModule) {
-    auto it = byFunction.find(function.getName().str());
-    if (it == byFunction.end())
-      continue;
-    llvm::ArrayRef<size_t> sequence = it->second;
-    size_t &cursor = cursors[function.getName().str()];
     for (llvm::BasicBlock &block : function) {
       for (llvm::Instruction &inst : block) {
         auto kind = getSafetyEffectKind(inst);
         if (!kind)
           continue;
-        if (cursor >= sequence.size()) {
+        auto id = getLythonSafetyMetadataId(inst);
+        if (!id || *id < 0 ||
+            static_cast<size_t>(*id) >= profile.contracts.size()) {
           emitPostCoroVerifierError(
-              inst, "LLVM IR safety effect has no MLIR contract");
+              inst, "LLVM IR safety effect has no preserved MLIR contract id");
           failedAny = true;
           continue;
         }
+
         const LLVMSafetyContract &contract =
-            profile.contracts[sequence[cursor]];
+            profile.contracts[static_cast<size_t>(*id)];
         if (contract.kind != *kind) {
           emitPostCoroVerifierError(
-              inst, "LLVM IR safety effect order diverges from MLIR contract");
+              inst, "LLVM IR safety effect kind differs from MLIR contract id");
           failedAny = true;
           continue;
         }
-        setLythonSafetyMetadata(inst, contract);
-        used[sequence[cursor]] = true;
-        ++cursor;
+        ++used[static_cast<size_t>(*id)];
       }
     }
   }
 
   for (auto indexed : llvm::enumerate(used)) {
-    if (indexed.value())
+    if (indexed.value() != 0)
       continue;
     const LLVMSafetyContract &contract = profile.contracts[indexed.index()];
     llvm::errs() << "error: LLVM IR safety contract for @"
@@ -1876,7 +1907,7 @@ LogicalResult runJIT(ModuleOp module) {
     llvm::errs() << "Failed to translate to LLVM IR\n";
     return failure();
   }
-  if (failed(annotateLLVMIRSafetyContracts(*llvmModule, safetyProfile)))
+  if (failed(verifyLLVMIRSafetyMetadataAttached(*llvmModule, safetyProfile)))
     return failure();
   if (failed(verifyPostCoroLLVMThreadSafety(*llvmModule, safetyProfile)))
     return failure();
@@ -2010,6 +2041,7 @@ int main(int argc, char **argv) {
   mlir::registerConvertFuncToLLVMInterface(registry);
   mlir::registerConvertMemRefToLLVMInterface(registry);
   mlir::registerAllToLLVMIRTranslations(registry);
+  registerPySafetyLLVMIRTranslation(registry);
 
   MLIRContext context;
   context.appendDialectRegistry(registry);
@@ -2050,7 +2082,7 @@ int main(int argc, char **argv) {
     llvm::errs() << "Failed to translate to LLVM IR\n";
     return 1;
   }
-  if (failed(annotateLLVMIRSafetyContracts(*llvmModule, safetyProfile)))
+  if (failed(verifyLLVMIRSafetyMetadataAttached(*llvmModule, safetyProfile)))
     return 1;
   if (failed(verifyPostCoroLLVMThreadSafety(*llvmModule, safetyProfile)))
     return 1;

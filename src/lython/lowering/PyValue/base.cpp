@@ -165,10 +165,14 @@ materializeLogicalValue(mlir::Location loc, mlir::Type logicalType,
     return mlir::failure();
   if (parts.size() == 1 && parts.front().getType() == logicalType)
     return parts.front();
-  return rewriter
-      .create<mlir::UnrealizedConversionCastOp>(
-          loc, mlir::TypeRange{logicalType}, parts)
-      .getResult(0);
+  auto cast = rewriter.create<mlir::UnrealizedConversionCastOp>(
+      loc, mlir::TypeRange{logicalType}, parts);
+  if (isPyOwnershipTrackedType(logicalType)) {
+    llvm::SmallVector<mlir::Attribute, 1> owned{rewriter.getI64IntegerAttr(0)};
+    cast->setAttr(OwnershipContractAttrs::kOwnedResults,
+                  rewriter.getArrayAttr(owned));
+  }
+  return cast.getResult(0);
 }
 
 static void cloneFinallyBlockBody(mlir::Block *finallyBlock,
@@ -458,7 +462,10 @@ lowerAwaitInExceptTry(AwaitOp awaitOp, mlir::Block *exceptEntry,
                 awaitOp.getLoc(), mlir::TypeRange{exceptArgType}, exception)
             .getResult(0);
   }
-  rewriter.create<IncRefOp>(awaitOp.getLoc(), exception);
+  auto retain = rewriter.create<IncRefOp>(awaitOp.getLoc(), exception);
+  if (loadedException)
+    threadsafe::Retain::premise(retain.getOperation(),
+                                ThreadSafetyAttrs::kPremiseAggregateBorrow);
   consumeAwaitedDescriptorWithLoadedException(
       awaitOp.getLoc(), awaitable, convertedAwaitableParts, awaitable.getType(),
       loadedException, awaitOp->getParentOfType<mlir::ModuleOp>(), rewriter,
@@ -517,6 +524,11 @@ convertExceptEntryArgument(mlir::Block *exceptEntry,
           .create<mlir::UnrealizedConversionCastOp>(
               oldArg.getLoc(), mlir::TypeRange{oldArg.getType()}, convertedArg)
           .getResult(0);
+  if (isPyOwnershipTrackedType(oldArg.getType())) {
+    llvm::SmallVector<mlir::Attribute, 1> owned{rewriter.getI64IntegerAttr(0)};
+    logicalArg.getDefiningOp()->setAttr(OwnershipContractAttrs::kOwnedResults,
+                                        rewriter.getArrayAttr(owned));
+  }
   oldArg.replaceAllUsesWith(logicalArg);
   exceptEntry->eraseArgument(0);
   return logicalArg;

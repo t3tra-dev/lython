@@ -1,40 +1,46 @@
-# pyright: reportAttributeAccessIssue=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownVariableType=false
 from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 from ...mlir import ir
 from ...mlir.dialects import _lython_ops_gen as py_ops
 from ...mlir.dialects import arith as arith_ops
+from ..mlir_access import (
+    block_owner,
+    op_attributes,
+    op_name,
+    op_operand_segment_sizes,
+    op_operands,
+    owner_parent,
+    value_operation,
+    value_owner,
+)
+
+if TYPE_CHECKING:
+    from ..contracts import VisitorRuntime
+else:
+    VisitorRuntime = object
 
 
-class ExprCallableCloneMixin:
+class ExprCallableCloneMixin(VisitorRuntime):
     def _clone_bound_callable_metadata(
         self, value: ir.Value, loc: ir.Location
     ) -> ir.Value:
-        current_parent = (
-            getattr(self.current_block, "owner", None)
-            if self.current_block is not None
-            else None
-        )
-        owner = getattr(value, "owner", None)
+        current_parent = block_owner(self.current_block)
+        owner = value_owner(value)
         if current_parent is not None and owner is not None:
-            owner_owner = getattr(owner, "owner", None)
-            if owner_owner is not None and owner_owner == current_parent:
+            parent = owner_parent(owner)
+            if parent is not None and parent == current_parent:
                 return value
-            owner_parent = getattr(owner, "parent", None)
-            if owner_parent is not None and owner_parent == current_parent:
-                return value
-        opview = getattr(owner, "opview", None)
-        if opview is None and owner is not None and not hasattr(owner, "operands"):
-            return value
-        op = getattr(opview, "operation", owner)
+        op = value_operation(value)
         if op is None:
             return value
-        op_name = str(getattr(op, "name", ""))
-        operands = list(getattr(op, "operands", []))
-        attributes = getattr(op, "attributes", {})
+        name = op_name(op)
+        operands = op_operands(op)
+        attributes = op_attributes(op)
 
         with loc, self.insertion_point():
-            if op_name == "py.publish":
+            if name == "py.publish":
                 info = self.resolve_function_info_from_value(value)
                 if info is not None:
                     return self._build_python_callable(
@@ -52,52 +58,52 @@ class ExprCallableCloneMixin:
                     )
                 if operands:
                     return self._clone_bound_callable_metadata(operands[0], loc)
-            if op_name == "py.str.constant":
+            if name == "py.str.constant":
                 return py_ops.StrConstantOp(value.type, attributes["value"]).result
-            if op_name == "py.int.constant":
+            if name == "py.int.constant":
                 return py_ops.IntConstantOp(value.type, attributes["value"]).result
-            if op_name == "py.float.constant":
+            if name == "py.float.constant":
                 return py_ops.FloatConstantOp(value.type, attributes["value"]).result
-            if op_name == "arith.constant":
+            if name == "arith.constant":
                 return arith_ops.ConstantOp(value.type, attributes["value"]).result
-            if op_name == "py.none":
+            if name == "py.none":
                 return py_ops.NoneOp(value.type).result
-            if op_name == "py.tuple.empty":
+            if name == "py.tuple.empty":
                 return py_ops.TupleEmptyOp(value.type).result
-            if op_name == "py.tuple.create":
+            if name == "py.tuple.create":
                 elements = [
                     self._clone_bound_callable_metadata(element, loc)
                     for element in operands
                 ]
                 return py_ops.TupleCreateOp(value.type, elements).result
-            if op_name == "py.dict.empty":
+            if name == "py.dict.empty":
                 return py_ops.DictEmptyOp(value.type).result
-            if op_name == "py.dict.insert":
+            if name == "py.dict.insert":
                 base = self._clone_bound_callable_metadata(operands[0], loc)
                 key = self._clone_bound_callable_metadata(operands[1], loc)
                 item = self._clone_bound_callable_metadata(operands[2], loc)
                 py_ops.DictInsertOp(base, key, item)
                 return base
-            if op_name == "py.upcast":
+            if name == "py.upcast":
                 cloned = self._clone_bound_callable_metadata(operands[0], loc)
                 return py_ops.UpcastOp(value.type, cloned).result
-            if op_name == "py.attr.get":
+            if name == "py.attr.get":
                 cloned_object = self._clone_bound_callable_metadata(operands[0], loc)
                 return py_ops.AttrGetOp(
                     value.type,
                     cloned_object,
                     attributes["name"],
                 ).result
-            if op_name == "py.list.get":
+            if name == "py.list.get":
                 cloned_list = self._clone_bound_callable_metadata(operands[0], loc)
                 cloned_index = self._clone_bound_callable_metadata(operands[1], loc)
                 return py_ops.ListGetOp(value.type, cloned_list, cloned_index).result
-            if op_name == "py.func.object":
+            if name == "py.func.object":
                 return py_ops.FuncObjectOp(value.type, attributes["target"]).result
-            if op_name == "py.make_function":
-                segment_sizes = [
-                    int(size) for size in attributes["operandSegmentSizes"]
-                ]
+            if name == "py.make_function":
+                segment_sizes = op_operand_segment_sizes(op)
+                if not segment_sizes:
+                    return value
                 segment_index = 0
                 operand_index = 0
 
@@ -148,101 +154,100 @@ class ExprCallableCloneMixin:
                     annotations=annotations,
                     module=module,
                 ).result
-            if op_name == "py.cast.to_prim":
+            if name == "py.cast.to_prim":
                 cloned_input = self._clone_bound_callable_metadata(operands[0], loc)
                 return py_ops.CastToPrimOp(
                     value.type,
                     cloned_input,
                     attributes["mode"],
                 ).result
-            if op_name == "py.cast.from_prim":
+            if name == "py.cast.from_prim":
                 cloned_input = self._clone_bound_callable_metadata(operands[0], loc)
                 return py_ops.CastFromPrimOp(value.type, cloned_input).result
-            if op_name == "py.repr":
+            if name == "py.repr":
                 cloned_input = self._clone_bound_callable_metadata(operands[0], loc)
                 return py_ops.ReprOp(value.type, cloned_input).result
-            if op_name == "py.add":
+            if name == "py.add":
                 lhs = self._clone_bound_callable_metadata(operands[0], loc)
                 rhs = self._clone_bound_callable_metadata(operands[1], loc)
                 return py_ops.AddOp(value.type, lhs, rhs).result
-            if op_name == "py.sub":
+            if name == "py.sub":
                 lhs = self._clone_bound_callable_metadata(operands[0], loc)
                 rhs = self._clone_bound_callable_metadata(operands[1], loc)
                 return py_ops.SubOp(value.type, lhs, rhs).result
-            if op_name == "py.eq":
+            if name == "py.eq":
                 lhs = self._clone_bound_callable_metadata(operands[0], loc)
                 rhs = self._clone_bound_callable_metadata(operands[1], loc)
                 return py_ops.EqOp(value.type, lhs, rhs).result
-            if op_name == "py.ne":
+            if name == "py.ne":
                 lhs = self._clone_bound_callable_metadata(operands[0], loc)
                 rhs = self._clone_bound_callable_metadata(operands[1], loc)
                 return py_ops.NeOp(value.type, lhs, rhs).result
-            if op_name == "py.lt":
+            if name == "py.lt":
                 lhs = self._clone_bound_callable_metadata(operands[0], loc)
                 rhs = self._clone_bound_callable_metadata(operands[1], loc)
                 return py_ops.LtOp(value.type, lhs, rhs).result
-            if op_name == "py.le":
+            if name == "py.le":
                 lhs = self._clone_bound_callable_metadata(operands[0], loc)
                 rhs = self._clone_bound_callable_metadata(operands[1], loc)
                 return py_ops.LeOp(value.type, lhs, rhs).result
-            if op_name == "py.gt":
+            if name == "py.gt":
                 lhs = self._clone_bound_callable_metadata(operands[0], loc)
                 rhs = self._clone_bound_callable_metadata(operands[1], loc)
                 return py_ops.GtOp(value.type, lhs, rhs).result
-            if op_name == "py.ge":
+            if name == "py.ge":
                 lhs = self._clone_bound_callable_metadata(operands[0], loc)
                 rhs = self._clone_bound_callable_metadata(operands[1], loc)
                 return py_ops.GeOp(value.type, lhs, rhs).result
-            if op_name == "arith.cmpi":
+            if name == "arith.cmpi":
                 lhs = self._clone_bound_callable_metadata(operands[0], loc)
                 rhs = self._clone_bound_callable_metadata(operands[1], loc)
                 return arith_ops.CmpIOp(attributes["predicate"], lhs, rhs).result
-            if op_name == "arith.cmpf":
+            if name == "arith.cmpf":
                 lhs = self._clone_bound_callable_metadata(operands[0], loc)
                 rhs = self._clone_bound_callable_metadata(operands[1], loc)
                 return arith_ops.CmpFOp(attributes["predicate"], lhs, rhs).result
-            if op_name == "arith.addi":
+            if name == "arith.addi":
                 lhs = self._clone_bound_callable_metadata(operands[0], loc)
                 rhs = self._clone_bound_callable_metadata(operands[1], loc)
                 return arith_ops.AddIOp(lhs, rhs).result
-            if op_name == "arith.subi":
+            if name == "arith.subi":
                 lhs = self._clone_bound_callable_metadata(operands[0], loc)
                 rhs = self._clone_bound_callable_metadata(operands[1], loc)
                 return arith_ops.SubIOp(lhs, rhs).result
-            if op_name == "arith.muli":
+            if name == "arith.muli":
                 lhs = self._clone_bound_callable_metadata(operands[0], loc)
                 rhs = self._clone_bound_callable_metadata(operands[1], loc)
                 return arith_ops.MulIOp(lhs, rhs).result
-            if op_name == "arith.divsi":
+            if name == "arith.divsi":
                 lhs = self._clone_bound_callable_metadata(operands[0], loc)
                 rhs = self._clone_bound_callable_metadata(operands[1], loc)
                 return arith_ops.DivSIOp(lhs, rhs).result
-            if op_name == "arith.remsi":
+            if name == "arith.remsi":
                 lhs = self._clone_bound_callable_metadata(operands[0], loc)
                 rhs = self._clone_bound_callable_metadata(operands[1], loc)
                 return arith_ops.RemSIOp(lhs, rhs).result
-            if op_name == "arith.addf":
+            if name == "arith.addf":
                 lhs = self._clone_bound_callable_metadata(operands[0], loc)
                 rhs = self._clone_bound_callable_metadata(operands[1], loc)
                 return arith_ops.AddFOp(lhs, rhs).result
-            if op_name == "arith.subf":
+            if name == "arith.subf":
                 lhs = self._clone_bound_callable_metadata(operands[0], loc)
                 rhs = self._clone_bound_callable_metadata(operands[1], loc)
                 return arith_ops.SubFOp(lhs, rhs).result
-            if op_name == "arith.mulf":
+            if name == "arith.mulf":
                 lhs = self._clone_bound_callable_metadata(operands[0], loc)
                 rhs = self._clone_bound_callable_metadata(operands[1], loc)
                 return arith_ops.MulFOp(lhs, rhs).result
-            if op_name == "arith.divf":
+            if name == "arith.divf":
                 lhs = self._clone_bound_callable_metadata(operands[0], loc)
                 rhs = self._clone_bound_callable_metadata(operands[1], loc)
                 return arith_ops.DivFOp(lhs, rhs).result
-            if op_name == "arith.remf":
+            if name == "arith.remf":
                 lhs = self._clone_bound_callable_metadata(operands[0], loc)
                 rhs = self._clone_bound_callable_metadata(operands[1], loc)
                 return arith_ops.RemFOp(lhs, rhs).result
 
         raise NotImplementedError(
-            f"Cloning bound callable metadata from {op_name or type(opview).__name__} "
-            "is not supported yet"
+            f"Cloning bound callable metadata from {name or type(op).__name__} is not supported yet"
         )

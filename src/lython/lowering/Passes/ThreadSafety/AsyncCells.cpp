@@ -74,12 +74,6 @@ bool provenance::asyncExceptionCell(mlir::Value value) {
       value = bitcast.getArg();
       continue;
     }
-    if (auto cast = value.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
-      if (cast->getNumOperands() == 1) {
-        value = cast.getOperand(0);
-        continue;
-      }
-    }
     break;
   }
 
@@ -103,12 +97,6 @@ bool provenance::asyncCancelFlag(mlir::Value value) {
     if (auto gep = value.getDefiningOp<mlir::LLVM::GEPOp>()) {
       value = gep.getBase();
       continue;
-    }
-    if (auto cast = value.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
-      if (cast->getNumOperands() == 1) {
-        value = cast.getOperand(0);
-        continue;
-      }
     }
     break;
   }
@@ -143,12 +131,6 @@ static void collect(mlir::Value value,
     if (auto bitcast = mlir::dyn_cast<mlir::LLVM::BitcastOp>(user)) {
       collect(bitcast.getResult(), seen, users);
       continue;
-    }
-    if (auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(user)) {
-      if (cast->getNumResults() == 1) {
-        collect(cast.getResult(0), seen, users);
-        continue;
-      }
     }
     users.push_back(user);
   }

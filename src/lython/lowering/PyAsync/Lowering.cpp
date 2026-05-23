@@ -2,6 +2,7 @@
 #include "Common/LoweringUtils.h"
 #include "Common/RuntimeSupport.h"
 #include "Common/SlotUtils.h"
+#include "Passes/Runtime/Helpers.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Async/IR/Async.h"
@@ -691,6 +692,43 @@ struct AsyncCallTypeLowering
   }
 };
 
+struct AsyncFuncSignatureLowering
+    : public mlir::OpConversionPattern<mlir::async::FuncOp> {
+  AsyncFuncSignatureLowering(PyLLVMTypeConverter &converter,
+                             mlir::MLIRContext *ctx)
+      : mlir::OpConversionPattern<mlir::async::FuncOp>(converter, ctx) {}
+
+  mlir::LogicalResult
+  matchAndRewrite(mlir::async::FuncOp op, OpAdaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto *typeConverter =
+        static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
+    mlir::FunctionType oldType = op.getFunctionType();
+    mlir::TypeConverter::SignatureConversion signature(oldType.getNumInputs());
+    llvm::SmallVector<mlir::Type> resultTypes;
+    if (mlir::failed(typeConverter->convertSignatureArgs(oldType.getInputs(),
+                                                         signature)) ||
+        mlir::failed(
+            typeConverter->convertTypes(oldType.getResults(), resultTypes)))
+      return rewriter.notifyMatchFailure(op,
+                                         "failed to convert async signature");
+
+    if (!op.isDeclaration()) {
+      if (mlir::failed(rewriter.convertRegionTypes(&op.getBody(),
+                                                   *typeConverter, &signature)))
+        return mlir::failure();
+    }
+
+    auto newType =
+        rewriter.getFunctionType(signature.getConvertedTypes(), resultTypes);
+    rewriter.modifyOpInPlace(op, [&] { op.setType(newType); });
+    lowering::runtime::async_args::mark(op.getOperation(), oldType.getInputs(),
+                                        *typeConverter,
+                                        /*trailingExceptionCell=*/true);
+    return mlir::success();
+  }
+};
+
 struct AwaitLowering : public mlir::OpConversionPattern<AwaitOp> {
   AwaitLowering(PyLLVMTypeConverter &converter, mlir::MLIRContext *ctx)
       : mlir::OpConversionPattern<AwaitOp>(converter, ctx) {}
@@ -1198,10 +1236,10 @@ namespace lowering::async_runtime::Patterns {
 void populate(PyLLVMTypeConverter &typeConverter,
               mlir::RewritePatternSet &patterns) {
   auto *ctx = patterns.getContext();
-  patterns.add<CoroCreateLowering, CoroStartLowering, AsyncCallTypeLowering,
-               AwaitLowering, AsyncReturnLowering, TaskCreateLowering,
-               TaskCancelLowering, AsyncSleepLowering, AsyncGatherLowering>(
-      typeConverter, ctx);
+  patterns.add<AsyncFuncSignatureLowering, CoroCreateLowering,
+               CoroStartLowering, AsyncCallTypeLowering, AwaitLowering,
+               AsyncReturnLowering, TaskCreateLowering, TaskCancelLowering,
+               AsyncSleepLowering, AsyncGatherLowering>(typeConverter, ctx);
 }
 } // namespace lowering::async_runtime::Patterns
 

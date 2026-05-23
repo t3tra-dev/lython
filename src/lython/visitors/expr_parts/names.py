@@ -1,14 +1,19 @@
-# pyright: reportAttributeAccessIssue=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownVariableType=false
 from __future__ import annotations
 
 import ast
+from typing import TYPE_CHECKING
 
 from ...mlir import ir
 from ...mlir.dialects import _lython_ops_gen as py_ops
 from ...mlir.dialects import arith as arith_ops
 
+if TYPE_CHECKING:
+    from ..contracts import VisitorRuntime
+else:
+    VisitorRuntime = object
 
-class ExprNameMixin:
+
+class ExprNameMixin(VisitorRuntime):
     """Expression lowering for names and attributes."""
 
     def visit_Name(self, node: ast.Name) -> ir.Value:
@@ -70,7 +75,7 @@ class ExprNameMixin:
 
     def visit_Attribute(self, node: ast.Attribute) -> ir.Value | None:
         obj = self.require_value(node.value, self.visit(node.value))
-        result_type = self.get_attribute_type(obj.type, node.attr)
+        result_type = self.typed_node_type(node)
 
         with self._loc(node), self.insertion_point():
             return py_ops.AttrGetOp(result_type, obj, node.attr).result

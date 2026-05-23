@@ -364,11 +364,6 @@ static void collect(mlir::Value value,
     }
     if (local_container::use(user, value))
       continue;
-    if (auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(user)) {
-      for (mlir::Value result : cast.getResults())
-        collect(result, seen, escapes);
-      continue;
-    }
     if (auto cast = mlir::dyn_cast<mlir::memref::CastOp>(user)) {
       collect(cast.getResult(), seen, escapes);
       continue;

@@ -1,12 +1,17 @@
-# pyright: reportAttributeAccessIssue=false, reportUnknownMemberType=false
 from __future__ import annotations
 
 import ast
+from typing import TYPE_CHECKING
 
 from .._base import PRIMITIVE_BASE_TYPES
 
+if TYPE_CHECKING:
+    from ..contracts import VisitorRuntime
+else:
+    VisitorRuntime = object
 
-class StmtImportMixin:
+
+class StmtImportMixin(VisitorRuntime):
     """Statement lowering for import-related AST nodes."""
 
     def visit_Import(self, node: ast.Import) -> None:
@@ -20,11 +25,11 @@ class StmtImportMixin:
         module = node.module
 
         if module == "asyncio":
-            supported = {"run", "create_task", "gather", "sleep"}
+            supported = {"run", "create_task", "ensure_future", "gather", "sleep"}
             for alias in node.names:
                 name = alias.name
                 if name not in supported:
-                    raise NotImplementedError(f"Unknown asyncio import: {name}")
+                    raise NotImplementedError(f"Unsupported asyncio import: {name}")
                 self._static_module_symbols[alias.asname or name] = ("asyncio", name)
             return
 
@@ -34,7 +39,7 @@ class StmtImportMixin:
                 if name in ("native", "to_prim", "from_prim", "alloc", "dealloc"):
                     self._lyrt_builtins.add(name)
                 else:
-                    raise NotImplementedError(f"Unknown lyrt import: {name}")
+                    raise NotImplementedError(f"Unsupported lyrt import: {name}")
             return
 
         if module == "lyrt.prim":
@@ -45,7 +50,7 @@ class StmtImportMixin:
                     local_name = alias.asname or name
                     self._prim_types[local_name] = name
                 else:
-                    raise NotImplementedError(f"Unknown lyrt.prim type: {name}")
+                    raise NotImplementedError(f"Unsupported lyrt.prim type: {name}")
             return
 
         raise NotImplementedError(f"Import from '{module}' not implemented")

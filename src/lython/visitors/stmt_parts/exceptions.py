@@ -1,115 +1,25 @@
-# pyright: reportAttributeAccessIssue=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownVariableType=false
 from __future__ import annotations
 
 import ast
+from typing import cast
 
 from ...mlir import ir
-from ...mlir.dialects import arith as arith_ops
-from ...mlir.dialects import _lython_ops_gen as py_ops
 from ...mlir.dialects import _async_ops_gen as async_ops
+from ...mlir.dialects import _lython_ops_gen as py_ops
+from ...mlir.dialects import arith as arith_ops
 from ...mlir.dialects import cf as cf_ops
 from ...mlir.dialects import func as func_ops
+from ..models import RegionBlocks
+from .exception_analysis import (
+    always_returns,
+    contains_return,
+    find_unsupported_finally_control,
+    stmt_always_returns,
+)
+from .finally_returns import FinallyReturnMixin
 
 
-class _UnsupportedFinallyControlDetector(ast.NodeVisitor):
-    def __init__(
-        self, *, allow_raise: bool = False, allow_return: bool = False
-    ) -> None:
-        self.allow_raise = allow_raise
-        self.allow_return = allow_return
-        self.unsupported: str | None = None
-
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        return
-
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        return
-
-    def visit_Lambda(self, node: ast.Lambda) -> None:
-        return
-
-    def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        return
-
-    def visit_Return(self, node: ast.Return) -> None:
-        if self.allow_return:
-            return
-        self.unsupported = "return"
-
-    def visit_Raise(self, node: ast.Raise) -> None:
-        if self.allow_raise:
-            return
-        self.unsupported = "raise"
-
-    def visit_Break(self, node: ast.Break) -> None:
-        self.unsupported = "break"
-
-    def visit_Continue(self, node: ast.Continue) -> None:
-        self.unsupported = "continue"
-
-
-def _find_unsupported_finally_control(
-    nodes: list[ast.stmt], *, allow_raise: bool = False, allow_return: bool = False
-) -> str | None:
-    detector = _UnsupportedFinallyControlDetector(
-        allow_raise=allow_raise, allow_return=allow_return
-    )
-    for node in nodes:
-        detector.visit(node)
-        if detector.unsupported is not None:
-            return detector.unsupported
-    return None
-
-
-class _FinallyReturnDetector(ast.NodeVisitor):
-    def __init__(self) -> None:
-        self.found = False
-
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        return
-
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        return
-
-    def visit_Lambda(self, node: ast.Lambda) -> None:
-        return
-
-    def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        return
-
-    def visit_Return(self, node: ast.Return) -> None:
-        self.found = True
-
-
-def _contains_return(nodes: list[ast.stmt]) -> bool:
-    detector = _FinallyReturnDetector()
-    for node in nodes:
-        detector.visit(node)
-        if detector.found:
-            return True
-    return False
-
-
-def _stmt_always_returns(node: ast.stmt) -> bool:
-    if isinstance(node, (ast.Return, ast.Raise)):
-        return True
-    if isinstance(node, ast.If):
-        return _always_returns(node.body) and _always_returns(node.orelse)
-    if isinstance(node, ast.Try):
-        return _always_returns(node.finalbody) or (
-            _always_returns(node.body)
-            and bool(node.handlers)
-            and all(_always_returns(handler.body) for handler in node.handlers)
-            and (not node.orelse or _always_returns(node.orelse))
-        )
-    return False
-
-
-def _always_returns(nodes: list[ast.stmt]) -> bool:
-    return bool(nodes) and _stmt_always_returns(nodes[-1])
-
-
-class StmtExceptionMixin:
+class StmtExceptionMixin(FinallyReturnMixin):
     """Statement lowering for return and exception-related AST nodes."""
 
     def _prepare_return_value(self, node: ast.Return, loc: ir.Location) -> ir.Value:
@@ -154,132 +64,6 @@ class StmtExceptionMixin:
                 py_ops.ReturnOp([value])
         self._advance_block_after_terminator()
 
-    def _current_finally_return_context(self) -> dict[str, object] | None:
-        if not self._finally_return_stack:
-            return None
-        return self._finally_return_stack[-1]
-
-    def _return_signal_constant(
-        self, signal_type: ir.Type, value: int, loc: ir.Location
-    ) -> ir.Value:
-        with loc, self.insertion_point():
-            return arith_ops.ConstantOp(
-                signal_type, ir.IntegerAttr.get(signal_type, value)
-            ).result
-
-    def _build_finally_return_seed(
-        self, return_type: ir.Type, loc: ir.Location
-    ) -> ir.Value:
-        expr_visitor = self.subvisitors.get("Expr")
-        seed_builder = getattr(expr_visitor, "_build_invoke_result_seed", None)
-        if seed_builder is not None:
-            expr_visitor.current_block = self.current_block
-            value = seed_builder(return_type, loc)
-            self.current_block = expr_visitor.current_block
-            return value
-
-        type_str = str(return_type)
-        with loc, self.insertion_point():
-            if type_str == "!py.none":
-                return py_ops.NoneOp(return_type).result
-            if type_str in {"!py.int", "!py.bool"}:
-                return py_ops.IntConstantOp(return_type, "0").result
-            if type_str == "!py.float":
-                return py_ops.FloatConstantOp(return_type, 0.0).result
-            if type_str.startswith("i"):
-                return arith_ops.ConstantOp(
-                    return_type, ir.IntegerAttr.get(return_type, 0)
-                ).result
-            if type_str.startswith("f"):
-                return arith_ops.ConstantOp(
-                    return_type, ir.FloatAttr.get(return_type, 0.0)
-                ).result
-        raise NotImplementedError(
-            f"finally return placeholder for {return_type} is not implemented yet"
-        )
-
-    def _emit_finally_return_yield(self, value: ir.Value, loc: ir.Location) -> None:
-        context = self._current_finally_return_context()
-        if context is None:
-            raise RuntimeError("finally return context is not active")
-        signal_type = context["signal_type"]
-        yield_kind = context["yield_kind"]
-        if not isinstance(signal_type, ir.Type) or not isinstance(yield_kind, str):
-            raise RuntimeError("invalid finally return context")
-        signal = self._return_signal_constant(signal_type, 1, loc)
-        with loc, self.insertion_point():
-            if yield_kind == "try":
-                py_ops.TryYieldOp([signal, value])
-            elif yield_kind == "except":
-                py_ops.ExceptYieldOp([signal, value])
-            elif yield_kind == "finally":
-                py_ops.FinallyYieldOp([signal, value])
-            else:
-                raise RuntimeError(f"unknown finally return yield kind: {yield_kind}")
-        self._advance_block_after_terminator()
-
-    def _emit_finally_fallthrough_yield(
-        self,
-        yield_kind: str,
-        return_type: ir.Type,
-        signal_type: ir.Type,
-        loc: ir.Location,
-    ) -> None:
-        signal = self._return_signal_constant(signal_type, 0, loc)
-        seed = self._build_finally_return_seed(return_type, loc)
-        with loc, self.insertion_point():
-            if yield_kind == "try":
-                py_ops.TryYieldOp([signal, seed])
-            elif yield_kind == "except":
-                py_ops.ExceptYieldOp([signal, seed])
-            else:
-                raise RuntimeError(
-                    f"unsupported finally fallthrough yield: {yield_kind}"
-                )
-
-    def _emit_finally_return_dispatch(
-        self,
-        try_op: object,
-        return_type: ir.Type,
-        loc: ir.Location,
-        *,
-        always_returns: bool = False,
-    ) -> None:
-        if always_returns:
-            self._emit_return_op(try_op.results[1], loc)
-            return
-
-        assert self.current_block is not None
-        parent_region = self.current_block.region
-        return_block = parent_region.blocks.append()
-        merge_block = parent_region.blocks.append()
-        with loc, self.insertion_point():
-            cf_ops.CondBranchOp(try_op.results[0], [], [], return_block, merge_block)
-
-        self._set_insertion_block(return_block)
-        self._emit_return_op(try_op.results[1], loc)
-        self._set_insertion_block(merge_block)
-
-    def _push_finally_return_context(
-        self,
-        yield_kind: str,
-        signal_type: ir.Type,
-        *,
-        return_type: ir.Type | None = None,
-        swallow_raise: bool = False,
-    ) -> None:
-        self._finally_return_stack.append(
-            {
-                "yield_kind": yield_kind,
-                "signal_type": signal_type,
-                "return_type": return_type,
-                "swallow_raise": swallow_raise,
-            }
-        )
-
-    def _pop_finally_return_context(self) -> None:
-        self._finally_return_stack.pop()
-
     def visit_Return(self, node: ast.Return) -> None:
         loc = self._loc(node)
         value = self._prepare_return_value(node, loc)
@@ -298,11 +82,7 @@ class StmtExceptionMixin:
                 signal_type = finally_context["signal_type"]
                 yield_kind = finally_context["yield_kind"]
                 return_type = finally_context["return_type"]
-                if not (
-                    isinstance(signal_type, ir.Type)
-                    and isinstance(yield_kind, str)
-                    and isinstance(return_type, ir.Type)
-                ):
+                if return_type is None:
                     raise RuntimeError("invalid finally raise context")
                 self._emit_finally_fallthrough_yield(
                     yield_kind, return_type, signal_type, self._loc(node)
@@ -358,11 +138,11 @@ class StmtExceptionMixin:
     def visit_Try(self, node: ast.Try) -> None:
         if node.handlers:
             if node.orelse and node.finalbody:
-                unsupported = _find_unsupported_finally_control(
+                unsupported = find_unsupported_finally_control(
                     [*node.body, *node.orelse, *node.finalbody]
                 )
                 for handler in node.handlers:
-                    unsupported = unsupported or _find_unsupported_finally_control(
+                    unsupported = unsupported or find_unsupported_finally_control(
                         handler.body
                     )
                 if unsupported is not None:
@@ -393,8 +173,9 @@ class StmtExceptionMixin:
                     try_end_block
                 )
                 self.pop_scope()
-                if not try_terminated:
-                    with loc, ir.InsertionPoint(try_end_block):
+                if try_end_block is not None and not try_terminated:
+                    self._set_insertion_block(try_end_block)
+                    with loc, self.insertion_point():
                         py_ops.TryYieldOp([])
 
                 self._set_insertion_block(finally_block)
@@ -407,8 +188,9 @@ class StmtExceptionMixin:
                     or self._block_terminated(finally_end_block)
                 )
                 self.pop_scope()
-                if not finally_terminated:
-                    with loc, ir.InsertionPoint(finally_end_block):
+                if finally_end_block is not None and not finally_terminated:
+                    self._set_insertion_block(finally_end_block)
+                    with loc, self.insertion_point():
                         py_ops.FinallyYieldOp()
 
                 self._set_insertion_block(prev_block)
@@ -427,18 +209,18 @@ class StmtExceptionMixin:
                     raise NotImplementedError(
                         "only bare except or except Exception is supported yet"
                     )
-            finalbody_always_returns = bool(node.finalbody) and _always_returns(
+            finalbody_always_returns = bool(node.finalbody) and always_returns(
                 node.finalbody
             )
             if node.finalbody:
                 unsupported = (
-                    _find_unsupported_finally_control(
+                    find_unsupported_finally_control(
                         node.body, allow_raise=True, allow_return=True
                     )
-                    or _find_unsupported_finally_control(
+                    or find_unsupported_finally_control(
                         handler.body, allow_raise=True, allow_return=True
                     )
-                    or _find_unsupported_finally_control(
+                    or find_unsupported_finally_control(
                         node.finalbody, allow_return=finalbody_always_returns
                     )
                 )
@@ -455,12 +237,15 @@ class StmtExceptionMixin:
                 not has_else
                 and return_type is not None
                 and (
-                    _contains_return([*node.body, *handler.body])
+                    contains_return([*node.body, *handler.body])
                     or finalbody_always_returns
                 )
             )
+            returns_type = return_type if returns_via_try else None
             result_types = (
-                [i1, return_type] if returns_via_try else ([i1] if has_else else [])
+                [i1, returns_type]
+                if returns_type is not None
+                else ([i1] if has_else else [])
             )
             with loc, self.insertion_point():
                 try_op = py_ops.TryOp(result_types)
@@ -471,7 +256,7 @@ class StmtExceptionMixin:
                     self.get_py_type("!py.exception")
                 )
                 if node.finalbody:
-                    if returns_via_try:
+                    if returns_type is not None:
                         finally_block = try_op.finally_region.blocks.append(
                             *result_types
                         )
@@ -483,27 +268,28 @@ class StmtExceptionMixin:
 
             self._set_insertion_block(try_block)
             self.push_scope()
-            if returns_via_try:
+            if returns_type is not None:
                 self._push_finally_return_context("try", i1)
             for stmt in node.body:
                 self.visit(stmt)
-            if returns_via_try:
+            if returns_type is not None:
                 self._pop_finally_return_context()
             try_end_block = self.current_block
             try_terminated = try_end_block is None or self._block_terminated(
                 try_end_block
             )
             self.pop_scope()
-            if not try_terminated:
-                with loc, ir.InsertionPoint(try_end_block):
+            if try_end_block is not None and not try_terminated:
+                self._set_insertion_block(try_end_block)
+                with loc, self.insertion_point():
                     if has_else:
                         completed = arith_ops.ConstantOp(
                             i1, ir.IntegerAttr.get(i1, 1)
                         ).result
                         py_ops.TryYieldOp([completed])
-                    elif returns_via_try:
+                    elif returns_type is not None:
                         self._emit_finally_fallthrough_yield(
-                            "try", return_type, i1, loc
+                            "try", returns_type, i1, loc
                         )
                     else:
                         py_ops.TryYieldOp([])
@@ -517,18 +303,18 @@ class StmtExceptionMixin:
                     ).result
                 self.define_symbol(handler.name, exception_object)
             self.push_exception_context(except_block.arguments[0])
-            if returns_via_try:
+            if returns_type is not None:
                 self._push_finally_return_context(
                     "except",
                     i1,
-                    return_type=return_type,
+                    return_type=returns_type,
                     swallow_raise=finalbody_always_returns,
                 )
             try:
                 for stmt in handler.body:
                     self.visit(stmt)
             finally:
-                if returns_via_try:
+                if returns_type is not None:
                     self._pop_finally_return_context()
                 self.pop_exception_context()
             except_end_block = self.current_block
@@ -536,16 +322,17 @@ class StmtExceptionMixin:
                 except_end_block
             )
             self.pop_scope()
-            if not except_terminated:
-                with loc, ir.InsertionPoint(except_end_block):
+            if except_end_block is not None and not except_terminated:
+                self._set_insertion_block(except_end_block)
+                with loc, self.insertion_point():
                     if has_else:
                         completed = arith_ops.ConstantOp(
                             i1, ir.IntegerAttr.get(i1, 0)
                         ).result
                         py_ops.ExceptYieldOp([completed])
-                    elif returns_via_try:
+                    elif returns_type is not None:
                         self._emit_finally_fallthrough_yield(
-                            "except", return_type, i1, loc
+                            "except", returns_type, i1, loc
                         )
                     else:
                         py_ops.ExceptYieldOp([])
@@ -553,11 +340,11 @@ class StmtExceptionMixin:
             if finally_block is not None:
                 self._set_insertion_block(finally_block)
                 self.push_scope()
-                if returns_via_try and finalbody_always_returns:
+                if returns_type is not None and finalbody_always_returns:
                     self._push_finally_return_context("finally", i1)
                 for stmt in node.finalbody:
                     self.visit(stmt)
-                if returns_via_try and finalbody_always_returns:
+                if returns_type is not None and finalbody_always_returns:
                     self._pop_finally_return_context()
                 finally_end_block = self.current_block
                 finally_terminated = (
@@ -565,28 +352,32 @@ class StmtExceptionMixin:
                     or self._block_terminated(finally_end_block)
                 )
                 self.pop_scope()
-                if not finally_terminated:
-                    with loc, ir.InsertionPoint(finally_end_block):
+                if finally_end_block is not None and not finally_terminated:
+                    self._set_insertion_block(finally_end_block)
+                    with loc, self.insertion_point():
                         operands = (
-                            list(finally_block.arguments) if returns_via_try else []
+                            list(finally_block.arguments)
+                            if returns_type is not None
+                            else []
                         )
                         py_ops.FinallyYieldOp(operands)
 
             self._set_insertion_block(prev_block)
-            if returns_via_try:
+            if returns_type is not None:
                 self._emit_finally_return_dispatch(
                     try_op,
-                    return_type,
+                    returns_type,
                     loc,
                     always_returns=finalbody_always_returns
-                    or _stmt_always_returns(node),
+                    or stmt_always_returns(node),
                 )
                 return
             if has_else:
                 assert self.current_block is not None
                 parent_region = self.current_block.region
-                else_block = parent_region.blocks.append()
-                merge_block = parent_region.blocks.append()
+                blocks = cast(RegionBlocks, parent_region.blocks)
+                else_block = blocks.append()
+                merge_block = blocks.append()
                 with loc, self.insertion_point():
                     cf_ops.CondBranchOp(
                         try_op.results[0], [], [], else_block, merge_block
@@ -610,10 +401,10 @@ class StmtExceptionMixin:
         if not node.finalbody:
             raise NotImplementedError("try without finally is not supported yet")
 
-        finalbody_always_returns = _always_returns(node.finalbody)
-        unsupported = _find_unsupported_finally_control(
+        finalbody_always_returns = always_returns(node.finalbody)
+        unsupported = find_unsupported_finally_control(
             node.body, allow_raise=True, allow_return=True
-        ) or _find_unsupported_finally_control(
+        ) or find_unsupported_finally_control(
             node.finalbody, allow_return=finalbody_always_returns
         )
         if unsupported is not None:
@@ -625,15 +416,18 @@ class StmtExceptionMixin:
         i1 = ir.IntegerType.get_signless(1, context=self.ctx)
         return_type = self.current_return_type()
         finally_return = return_type is not None and (
-            _contains_return(node.body) or finalbody_always_returns
+            contains_return(node.body) or finalbody_always_returns
         )
-        result_types = [i1, return_type] if finally_return else []
+        finally_return_type = return_type if finally_return else None
+        result_types = (
+            [i1, finally_return_type] if finally_return_type is not None else []
+        )
         with loc, self.insertion_point():
             try_op = py_ops.TryOp(result_types)
 
         with loc:
             try_block = try_op.try_region.blocks.append()
-            if finally_return:
+            if finally_return_type is not None:
                 finally_block = try_op.finally_region.blocks.append(*result_types)
             else:
                 finally_block = try_op.finally_region.blocks.append()
@@ -641,50 +435,58 @@ class StmtExceptionMixin:
 
         self._set_insertion_block(try_block)
         self.push_scope()
-        if finally_return:
+        if finally_return_type is not None:
             self._push_finally_return_context(
                 "try",
                 i1,
-                return_type=return_type,
+                return_type=finally_return_type,
                 swallow_raise=finalbody_always_returns,
             )
         for stmt in node.body:
             self.visit(stmt)
-        if finally_return:
+        if finally_return_type is not None:
             self._pop_finally_return_context()
         try_end_block = self.current_block
         try_terminated = try_end_block is None or self._block_terminated(try_end_block)
         self.pop_scope()
-        if not try_terminated:
-            with loc, ir.InsertionPoint(try_end_block):
-                if finally_return:
-                    self._emit_finally_fallthrough_yield("try", return_type, i1, loc)
+        if try_end_block is not None and not try_terminated:
+            self._set_insertion_block(try_end_block)
+            with loc, self.insertion_point():
+                if finally_return_type is not None:
+                    self._emit_finally_fallthrough_yield(
+                        "try", finally_return_type, i1, loc
+                    )
                 else:
                     py_ops.TryYieldOp([])
 
         self._set_insertion_block(finally_block)
         self.push_scope()
-        if finally_return and finalbody_always_returns:
+        if finally_return_type is not None and finalbody_always_returns:
             self._push_finally_return_context("finally", i1)
         for stmt in node.finalbody:
             self.visit(stmt)
-        if finally_return and finalbody_always_returns:
+        if finally_return_type is not None and finalbody_always_returns:
             self._pop_finally_return_context()
         finally_end_block = self.current_block
         finally_terminated = finally_end_block is None or self._block_terminated(
             finally_end_block
         )
         self.pop_scope()
-        if not finally_terminated:
-            with loc, ir.InsertionPoint(finally_end_block):
-                operands = list(finally_block.arguments) if finally_return else []
+        if finally_end_block is not None and not finally_terminated:
+            self._set_insertion_block(finally_end_block)
+            with loc, self.insertion_point():
+                operands = (
+                    list(finally_block.arguments)
+                    if finally_return_type is not None
+                    else []
+                )
                 py_ops.FinallyYieldOp(operands)
 
         self._set_insertion_block(prev_block)
-        if finally_return:
+        if finally_return_type is not None:
             self._emit_finally_return_dispatch(
                 try_op,
-                return_type,
+                finally_return_type,
                 loc,
                 always_returns=finalbody_always_returns,
             )

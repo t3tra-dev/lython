@@ -33,13 +33,6 @@ local_container::escape(mlir::Value value,
     if (local_container::use(user, value))
       continue;
 
-    if (auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(user)) {
-      for (mlir::Value result : cast.getResults())
-        if (mlir::Operation *escape = local_container::escape(result, seen))
-          return escape;
-      continue;
-    }
-
     if (auto cast = mlir::dyn_cast<mlir::memref::CastOp>(user)) {
       if (mlir::Operation *escape =
               local_container::escape(cast.getResult(), seen))

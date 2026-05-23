@@ -116,8 +116,6 @@ bool isPyOwnershipImmortalOp(mlir::Operation *op) {
 }
 
 bool isPyOwnershipIdentityTransform(mlir::Operation *op) {
-  if (auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(op))
-    return cast->getNumOperands() == 1 && cast->getNumResults() == 1;
   auto upcast = mlir::dyn_cast<UpcastOp>(op);
   return upcast &&
          !isCompilerOwnedMemRefContainerType(upcast.getInput().getType());
@@ -130,6 +128,8 @@ bool isPyOwnershipMaterializedObjectBridge(mlir::Operation *op) {
 }
 
 bool createsPyOwnedResult(mlir::Operation *op) {
+  if (op->hasAttr(OwnershipContractAttrs::kOwnedResults))
+    return true;
   if (isPyOwnershipImmortalOp(op))
     return false;
   if (isPyOwnershipMaterializedObjectBridge(op))

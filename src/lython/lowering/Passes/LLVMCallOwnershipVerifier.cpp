@@ -45,9 +45,6 @@ bool ownership(mlir::Value value) {
     return load->hasAttr(OwnershipContractAttrs::kAggregateSlotLoad);
   if (auto load = value.getDefiningOp<mlir::memref::LoadOp>())
     return load->hasAttr(OwnershipContractAttrs::kAggregateSlotLoad);
-  if (auto cast = value.getDefiningOp<mlir::UnrealizedConversionCastOp>())
-    if (cast->getNumOperands() == 1)
-      return ownership(cast.getOperand(0));
   return false;
 }
 
@@ -69,8 +66,6 @@ bool hasAttr(mlir::Value value, llvm::StringRef attrName) {
 namespace lowered_identity {
 
 bool transform(mlir::Operation *op) {
-  if (auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(op))
-    return cast->getNumOperands() == 1 && cast->getNumResults() == 1;
   if (mlir::isa<mlir::memref::CastOp, mlir::LLVM::BitcastOp,
                 mlir::LLVM::IntToPtrOp, mlir::LLVM::PtrToIntOp>(op))
     return op->getNumOperands() == 1 && op->getNumResults() == 1;
@@ -258,9 +253,6 @@ bool immortal(mlir::Value value) {
     return immortal(ptrToInt.getArg());
   if (auto bitcast = value.getDefiningOp<mlir::LLVM::BitcastOp>())
     return immortal(bitcast.getArg());
-  if (auto cast = value.getDefiningOp<mlir::UnrealizedConversionCastOp>())
-    if (cast->getNumOperands() == 1)
-      return immortal(cast.getOperand(0));
   auto call = value.getDefiningOp<mlir::LLVM::CallOp>();
   if (!call)
     return false;
@@ -318,9 +310,6 @@ bool loaded(mlir::Value value) {
     return loaded(intToPtr.getArg());
   if (auto bitcast = value.getDefiningOp<mlir::LLVM::BitcastOp>())
     return loaded(bitcast.getArg());
-  if (auto cast = value.getDefiningOp<mlir::UnrealizedConversionCastOp>())
-    if (cast->getNumOperands() == 1)
-      return loaded(cast.getOperand(0));
 
   if (auto load = value.getDefiningOp<mlir::LLVM::LoadOp>()) {
     auto role =
@@ -341,9 +330,6 @@ bool releaseLoaded(mlir::Value value) {
     return releaseLoaded(intToPtr.getArg());
   if (auto bitcast = value.getDefiningOp<mlir::LLVM::BitcastOp>())
     return releaseLoaded(bitcast.getArg());
-  if (auto cast = value.getDefiningOp<mlir::UnrealizedConversionCastOp>())
-    if (cast->getNumOperands() == 1)
-      return releaseLoaded(cast.getOperand(0));
   return false;
 }
 
@@ -375,42 +361,6 @@ bool priorTransferInBlock(mlir::LLVM::CallOp call, mlir::Value value,
 bool loadedAlias(mlir::Value value, const AliasAnalysis &aliases);
 
 } // namespace aggregate_slot
-
-namespace memref_descriptor {
-
-bool rankedPointerExtract(mlir::LLVM::ExtractValueOp op) {
-  if (!value_type::pointerLike(op.getResult().getType()))
-    return false;
-  llvm::ArrayRef<int64_t> position = op.getPosition();
-  if (position.size() != 1 || (position[0] != 0 && position[0] != 1))
-    return false;
-
-  auto structType =
-      mlir::dyn_cast<mlir::LLVM::LLVMStructType>(op.getContainer().getType());
-  if (!structType || structType.isOpaque())
-    return false;
-  llvm::ArrayRef<mlir::Type> body = structType.getBody();
-  return body.size() >= 5 && value_type::pointerLike(body[0]) &&
-         value_type::pointerLike(body[1]) && body[2].isInteger(64);
-}
-
-bool unrankedPointerExtract(mlir::LLVM::ExtractValueOp op) {
-  if (!value_type::pointerLike(op.getResult().getType()))
-    return false;
-  llvm::ArrayRef<int64_t> position = op.getPosition();
-  if (position.size() != 1 || position[0] != 1)
-    return false;
-
-  auto structType =
-      mlir::dyn_cast<mlir::LLVM::LLVMStructType>(op.getContainer().getType());
-  if (!structType || structType.isOpaque())
-    return false;
-  llvm::ArrayRef<mlir::Type> body = structType.getBody();
-  return body.size() == 2 && body[0].isInteger(64) &&
-         value_type::pointerLike(body[1]);
-}
-
-} // namespace memref_descriptor
 
 namespace aggregate_call {
 
@@ -597,9 +547,6 @@ static bool isLocalScratchAddress(mlir::Value value) {
     return isLocalScratchAddress(bitcast.getArg());
   if (auto gep = value.getDefiningOp<mlir::LLVM::GEPOp>())
     return isLocalScratchAddress(gep.getBase());
-  if (auto cast = value.getDefiningOp<mlir::UnrealizedConversionCastOp>())
-    if (cast->getNumOperands() == 1)
-      return isLocalScratchAddress(cast.getOperand(0));
   return value.getDefiningOp<mlir::LLVM::AllocaOp>() != nullptr;
 }
 
@@ -737,13 +684,8 @@ bool nonObject(mlir::Value value) {
         async_runtime::Callee::executeFunction(callee))
       return true;
   }
-  if (auto alloca = value.getDefiningOp<mlir::LLVM::AllocaOp>())
-    return !alloca->hasAttr(OwnershipContractAttrs::kOwnedLocalObject);
   if (auto bitcast = value.getDefiningOp<mlir::LLVM::BitcastOp>())
     return nonObject(bitcast.getArg());
-  if (auto cast = value.getDefiningOp<mlir::UnrealizedConversionCastOp>())
-    if (cast->getNumOperands() == 1)
-      return nonObject(cast.getOperand(0));
   if (auto gep = value.getDefiningOp<mlir::LLVM::GEPOp>())
     return nonObject(gep.getBase());
   if (value.getDefiningOp<mlir::LLVM::AddressOfOp>())
@@ -753,9 +695,6 @@ bool nonObject(mlir::Value value) {
   if (auto extract = value.getDefiningOp<mlir::LLVM::ExtractValueOp>()) {
     if (aggregate_slot::loadContract(extract.getOperation()))
       return false;
-    if (memref_descriptor::rankedPointerExtract(extract) ||
-        memref_descriptor::unrankedPointerExtract(extract))
-      return true;
     return nonObject(extract.getContainer());
   }
   if (async_runtime::ValueStorage::isAddress(value))
@@ -981,6 +920,14 @@ static mlir::LogicalResult verifyCallBorrowUses(mlir::LLVM::CallOp call,
       getIndexAttr(calleeOp, OwnershipContractAttrs::kSetFieldValueArg);
   auto setFieldRetainArg =
       getIndexAttr(calleeOp, OwnershipContractAttrs::kSetFieldRetainArg);
+  auto calleeArgNonObject = [&](unsigned argIndex) {
+    auto calleeFunc =
+        mlir::dyn_cast_or_null<mlir::FunctionOpInterface>(calleeOp);
+    return calleeFunc &&
+           static_cast<unsigned>(calleeFunc.getNumArguments()) > argIndex &&
+           calleeFunc.getArgAttr(argIndex,
+                                 OwnershipContractAttrs::kNonObjectPointer);
+  };
 
   bool shouldCheck = callHasCarrierOperand(call, aliases) ||
                      callHasCarrierResult(call) ||
@@ -1000,6 +947,8 @@ static mlir::LogicalResult verifyCallBorrowUses(mlir::LLVM::CallOp call,
     if (setFieldValueArg && *setFieldValueArg == argIndex &&
         setFieldRetainArg && *setFieldRetainArg < call.getNumOperands() &&
         constant::boolFalse(call.getOperand(*setFieldRetainArg)))
+      continue;
+    if (calleeArgNonObject(argIndex))
       continue;
     if (indexIn(retainArgs, argIndex))
       continue;
@@ -1367,6 +1316,14 @@ verifyInvokeBorrowUses(mlir::LLVM::InvokeOp invoke,
       getIndexAttr(calleeOp, OwnershipContractAttrs::kSetFieldValueArg);
   auto setFieldRetainArg =
       getIndexAttr(calleeOp, OwnershipContractAttrs::kSetFieldRetainArg);
+  auto calleeArgNonObject = [&](unsigned argIndex) {
+    auto calleeFunc =
+        mlir::dyn_cast_or_null<mlir::FunctionOpInterface>(calleeOp);
+    return calleeFunc &&
+           static_cast<unsigned>(calleeFunc.getNumArguments()) > argIndex &&
+           calleeFunc.getArgAttr(argIndex,
+                                 OwnershipContractAttrs::kNonObjectPointer);
+  };
 
   bool shouldCheck = invokeHasCarrierOperand(invoke, aliases) ||
                      invokeHasCarrierResult(invoke) ||
@@ -1384,6 +1341,8 @@ verifyInvokeBorrowUses(mlir::LLVM::InvokeOp invoke,
     if (setFieldValueArg && *setFieldValueArg == argIndex &&
         setFieldRetainArg && *setFieldRetainArg < operands.size() &&
         constant::boolFalse(operands[*setFieldRetainArg]))
+      continue;
+    if (calleeArgNonObject(argIndex))
       continue;
     if (indexIn(retainArgs, argIndex))
       continue;
@@ -2020,7 +1979,23 @@ struct LLVMCallOwnershipVerifierPass
 
 } // namespace
 
+static mlir::LogicalResult
+verifyNoUnrealizedCastsForOwnership(mlir::ModuleOp module) {
+  mlir::UnrealizedConversionCastOp offender = nullptr;
+  module.walk([&](mlir::UnrealizedConversionCastOp cast) {
+    offender = cast;
+    return mlir::WalkResult::interrupt();
+  });
+  if (!offender)
+    return mlir::success();
+  return offender.emitError(
+      "unrealized conversion cast reached LLVM ownership verifier");
+}
+
 mlir::LogicalResult verifyLLVMCallOwnership(mlir::ModuleOp module) {
+  if (mlir::failed(verifyNoUnrealizedCastsForOwnership(module)))
+    return mlir::failure();
+
   bool failedAny = false;
 
   module.walk([&](mlir::func::FuncOp func) {

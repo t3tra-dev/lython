@@ -1,15 +1,20 @@
-# pyright: reportAttributeAccessIssue=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownVariableType=false
 from __future__ import annotations
 
 import ast
+from typing import TYPE_CHECKING
 
 from ...mlir import ir
 from ...mlir.dialects import _lython_ops_gen as py_ops
 from ...mlir.dialects import arith as arith_ops
 from ...mlir.dialects import tensor as tensor_ops
 
+if TYPE_CHECKING:
+    from ..contracts import VisitorRuntime
+else:
+    VisitorRuntime = object
 
-class ExprOpsMixin:
+
+class ExprOpsMixin(VisitorRuntime):
     """Expression lowering for unary, binary, and comparison operations."""
 
     def visit_BinOp(self, node: ast.BinOp) -> ir.Value:

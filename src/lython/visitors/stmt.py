@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import TYPE_CHECKING
+
 from ..mlir import ir
 from ._base import BaseVisitor
 from .stmt_parts import (
@@ -11,6 +14,9 @@ from .stmt_parts import (
     StmtImportMixin,
     StmtMiscMixin,
 )
+
+if TYPE_CHECKING:
+    from .contracts import VisitorRuntime
 
 __all__ = ["StmtVisitor"]
 
@@ -84,6 +90,6 @@ class StmtVisitor(
         self,
         ctx: ir.Context,
         *,
-        subvisitors: dict[str, BaseVisitor],
+        subvisitors: Mapping[str, VisitorRuntime],
     ) -> None:
         super().__init__(ctx, subvisitors=subvisitors)

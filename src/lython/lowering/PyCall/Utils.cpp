@@ -400,8 +400,11 @@ mlir::Value createStaticClassSlot(mlir::Location loc,
   rewriter.setInsertionPointToStart(&parentFunc.getBody().front());
   mlir::Value one = rewriter.create<mlir::LLVM::ConstantOp>(
       loc, i64Type, rewriter.getI64IntegerAttr(1));
-  return rewriter.create<mlir::LLVM::AllocaOp>(loc, ptrType, objectType, one,
-                                               /*alignment=*/0);
+  auto slot = rewriter.create<mlir::LLVM::AllocaOp>(loc, ptrType, objectType,
+                                                    one, /*alignment=*/0);
+  slot->setAttr(OwnershipContractAttrs::kOwnedLocalObject,
+                rewriter.getUnitAttr());
+  return slot;
 }
 
 mlir::func::FuncOp resolvePreferredDirectHelper(mlir::func::FuncOp callee,

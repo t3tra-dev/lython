@@ -1,14 +1,20 @@
-# pyright: reportAttributeAccessIssue=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownVariableType=false
 from __future__ import annotations
 
 import ast
+from typing import TYPE_CHECKING, cast
 
 from ...mlir import ir
 from ...mlir.dialects import _lython_ops_gen as py_ops
 from ...mlir.dialects import cf as cf_ops
+from ..models import RegionBlocks
+
+if TYPE_CHECKING:
+    from ..contracts import VisitorRuntime
+else:
+    VisitorRuntime = object
 
 
-class StmtControlMixin:
+class StmtControlMixin(VisitorRuntime):
     """Statement lowering for structured control-flow AST nodes."""
 
     def visit_For(self, node: ast.For) -> None:
@@ -34,12 +40,9 @@ class StmtControlMixin:
 
         assert self.current_block is not None
         parent_region = self.current_block.region
-        true_block = (
-            parent_region.blocks.append()  # pyright: ignore[reportUnknownMemberType]
-        )
-        false_block = (
-            parent_region.blocks.append()  # pyright: ignore[reportUnknownMemberType]
-        )
+        blocks = cast(RegionBlocks, parent_region.blocks)
+        true_block = blocks.append()
+        false_block = blocks.append()
         with self._loc(node), self.insertion_point():
             cf_ops.CondBranchOp(cond, [], [], true_block, false_block)
 
@@ -59,9 +62,7 @@ class StmtControlMixin:
             self._set_insertion_block(None)
             return
 
-        merge_block = (
-            parent_region.blocks.append()  # pyright: ignore[reportUnknownMemberType]
-        )
+        merge_block = blocks.append()
         if not true_terminated:
             with self._loc(node), ir.InsertionPoint(true_block):
                 cf_ops.BranchOp([], merge_block)

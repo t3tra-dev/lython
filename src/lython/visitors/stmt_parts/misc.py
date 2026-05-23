@@ -1,11 +1,15 @@
-# pyright: reportAttributeAccessIssue=false, reportUnknownMemberType=false, reportUnknownVariableType=false
 from __future__ import annotations
 
 import ast
-from typing import Any
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..contracts import VisitorRuntime
+else:
+    VisitorRuntime = object
 
 
-class StmtMiscMixin:
+class StmtMiscMixin(VisitorRuntime):
     """Statement lowering for simple or currently unsupported AST nodes."""
 
     def visit_Delete(self, node: ast.Delete) -> None:
@@ -17,7 +21,7 @@ class StmtMiscMixin:
     def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
         raise NotImplementedError("Nonlocal statement not implemented")
 
-    def visit_Expr(self, node: ast.Expr) -> Any:
+    def visit_Expr(self, node: ast.Expr) -> None:
         expr_visitor = self.subvisitors.get("Expr")
         if expr_visitor is None:
             raise NotImplementedError("Expression visitor not available")

@@ -3,6 +3,7 @@
 #include "Common/Container.h"
 
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
+#include "mlir/Conversion/MemRefToLLVM/AllocLikeConversion.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/FunctionCallUtils.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -22,6 +23,48 @@ void copyDiscardableAttrs(mlir::Operation *from, mlir::Operation *to) {
   for (const mlir::NamedAttribute &attr : from->getDiscardableAttrs())
     to->setDiscardableAttr(attr.getName(), attr.getValue());
 }
+
+struct ContractAllocOpLowering : public mlir::AllocLikeOpLLVMLowering {
+  explicit ContractAllocOpLowering(const mlir::LLVMTypeConverter &converter)
+      : mlir::AllocLikeOpLLVMLowering(mlir::memref::AllocOp::getOperationName(),
+                                      converter, mlir::PatternBenefit(2)) {}
+
+  std::tuple<mlir::Value, mlir::Value>
+  allocateBuffer(mlir::ConversionPatternRewriter &rewriter, mlir::Location loc,
+                 mlir::Value sizeBytes, mlir::Operation *op) const override {
+    auto alloc = mlir::cast<mlir::memref::AllocOp>(op);
+    auto [allocatedPtr, alignedPtr] = allocateBufferManuallyAlign(
+        rewriter, loc, sizeBytes, op, getAlignment(rewriter, loc, alloc));
+    ownership::Pointer::markNonObject(allocatedPtr);
+    ownership::Pointer::markNonObject(alignedPtr);
+    return {allocatedPtr, alignedPtr};
+  }
+};
+
+struct ContractAllocaOpLowering : public mlir::AllocLikeOpLLVMLowering {
+  explicit ContractAllocaOpLowering(const mlir::LLVMTypeConverter &converter)
+      : mlir::AllocLikeOpLLVMLowering(
+            mlir::memref::AllocaOp::getOperationName(), converter,
+            mlir::PatternBenefit(2)) {
+    setRequiresNumElements();
+  }
+
+  std::tuple<mlir::Value, mlir::Value>
+  allocateBuffer(mlir::ConversionPatternRewriter &rewriter, mlir::Location loc,
+                 mlir::Value size, mlir::Operation *op) const override {
+    auto alloca = mlir::cast<mlir::memref::AllocaOp>(op);
+    mlir::Type elementType =
+        typeConverter->convertType(alloca.getType().getElementType());
+    unsigned addressSpace =
+        *getTypeConverter()->getMemRefAddressSpace(alloca.getType());
+    auto ptrType =
+        mlir::LLVM::LLVMPointerType::get(rewriter.getContext(), addressSpace);
+    auto lowered = rewriter.create<mlir::LLVM::AllocaOp>(
+        loc, ptrType, elementType, size, alloca.getAlignment().value_or(0));
+    ownership::Pointer::markNonObject(lowered.getResult());
+    return {lowered.getResult(), lowered.getResult()};
+  }
+};
 
 struct ContainerAccessLoadOpLowering
     : public mlir::ConvertOpToLLVMPattern<mlir::memref::LoadOp> {
@@ -203,6 +246,8 @@ namespace lowering::runtime::memref_to_llvm::Patterns {
 
 void populate(PyLLVMTypeConverter &typeConverter,
               mlir::RewritePatternSet &patterns) {
+  patterns.add<ContractAllocOpLowering, ContractAllocaOpLowering>(
+      typeConverter);
   patterns.add<ContainerAccessLoadOpLowering, ContainerAccessStoreOpLowering,
                ContractAtomicRMWOpLowering, ContractDeallocOpLowering>(
       typeConverter, mlir::PatternBenefit(2));

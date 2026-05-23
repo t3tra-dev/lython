@@ -811,37 +811,6 @@ static std::optional<int64_t> getArithConstantInt(mlir::Value value) {
   return std::nullopt;
 }
 
-static std::optional<int64_t> getLLVMConstantInt(mlir::Value value) {
-  if (auto constant = value.getDefiningOp<mlir::LLVM::ConstantOp>())
-    if (auto attr = mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue()))
-      return attr.getInt();
-  if (auto constant = value.getDefiningOp<mlir::arith::ConstantOp>())
-    if (auto attr = mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue()))
-      return attr.getInt();
-  return std::nullopt;
-}
-
-static bool stringAttrEquals(mlir::StringAttr actual,
-                             mlir::StringAttr expected) {
-  if (actual || expected)
-    return actual && expected && actual.getValue() == expected.getValue();
-  return true;
-}
-
-static bool stringAttrEquals(mlir::Operation *op, llvm::StringRef attrName,
-                             mlir::StringAttr expected) {
-  return stringAttrEquals(op->getAttrOfType<mlir::StringAttr>(attrName),
-                          expected);
-}
-
-static bool integerAttrEquals(mlir::Operation *op, llvm::StringRef attrName,
-                              std::optional<int64_t> expected) {
-  auto actual = op->getAttrOfType<mlir::IntegerAttr>(attrName);
-  if (actual || expected)
-    return actual && expected && actual.getInt() == *expected;
-  return true;
-}
-
 static std::optional<llvm::StringRef>
 getLoweringValueDefStringAttr(mlir::Value value, llvm::StringRef attrName) {
   value = stripLLVMPointerCasts(value);
@@ -926,7 +895,35 @@ static bool sameLoweringContainerDescriptorResource(mlir::Value header,
 static unsigned getFinalLLVMFunctionInputCount(mlir::Type inputType) {
   if (auto memref = mlir::dyn_cast<mlir::MemRefType>(inputType))
     return 3 + 2 * static_cast<unsigned>(memref.getRank());
+  if (mlir::isa<mlir::UnrankedMemRefType>(inputType))
+    return 2;
   return 1;
+}
+
+static bool hasEmitCInterface(mlir::func::FuncOp func) {
+  return func->hasAttr(mlir::LLVM::LLVMDialect::getEmitCWrapperAttrName());
+}
+
+static std::string cInterfaceName(llvm::StringRef name) {
+  return ("_mlir_ciface_" + name).str();
+}
+
+static void collectMemRefNonObjectArgs(
+    llvm::StringRef name, mlir::func::FuncOp func, unsigned sourceArgIndex,
+    unsigned flattenedIndex, mlir::Type inputType,
+    llvm::SmallVectorImpl<NonObjectArgContract> &contracts) {
+  if (mlir::isa<mlir::MemRefType>(inputType)) {
+    contracts.push_back({name.str(), flattenedIndex});
+    contracts.push_back({name.str(), flattenedIndex + 1});
+    if (hasEmitCInterface(func))
+      contracts.push_back({cInterfaceName(name), sourceArgIndex});
+    return;
+  }
+  if (mlir::isa<mlir::UnrankedMemRefType>(inputType)) {
+    contracts.push_back({name.str(), flattenedIndex + 1});
+    if (hasEmitCInterface(func))
+      contracts.push_back({cInterfaceName(name), sourceArgIndex});
+  }
 }
 
 void collectAsyncArgProvenanceContracts(
@@ -988,6 +985,74 @@ void collectAsyncArgProvenanceContracts(
                             : static_cast<unsigned>(converted.size());
     }
   });
+}
+
+void collectNonObjectArgContracts(
+    mlir::ModuleOp module,
+    llvm::SmallVectorImpl<NonObjectArgContract> &contracts) {
+  module.walk([&](mlir::func::FuncOp func) {
+    llvm::StringRef name = func.getSymName();
+    unsigned flattenedIndex = 0;
+    for (unsigned arg = 0, e = func.getFunctionType().getNumInputs(); arg < e;
+         ++arg) {
+      mlir::Type inputType = func.getFunctionType().getInput(arg);
+      collectMemRefNonObjectArgs(name, func, arg, flattenedIndex, inputType,
+                                 contracts);
+      flattenedIndex += getFinalLLVMFunctionInputCount(inputType);
+    }
+  });
+}
+
+void collectNonObjectArgContracts(
+    mlir::ModuleOp module, const PyLLVMTypeConverter &typeConverter,
+    llvm::SmallVectorImpl<NonObjectArgContract> &contracts) {
+  module.walk([&](mlir::func::FuncOp func) {
+    llvm::StringRef name = func.getSymName();
+    unsigned flattenedIndex = 0;
+    for (unsigned arg = 0, e = func.getFunctionType().getNumInputs(); arg < e;
+         ++arg) {
+      mlir::Type inputType = func.getFunctionType().getInput(arg);
+      llvm::SmallVector<mlir::Type, 4> converted;
+      if (mlir::failed(typeConverter.convertType(inputType, converted)) ||
+          converted.empty())
+        return;
+
+      collectMemRefNonObjectArgs(name, func, arg, flattenedIndex, inputType,
+                                 contracts);
+      flattenedIndex +=
+          mlir::isa<mlir::MemRefType, mlir::UnrankedMemRefType>(inputType)
+              ? getFinalLLVMFunctionInputCount(inputType)
+              : static_cast<unsigned>(converted.size());
+    }
+  });
+}
+
+mlir::LogicalResult preserveLLVMNonObjectArgContracts(
+    mlir::ModuleOp module, llvm::ArrayRef<NonObjectArgContract> contracts) {
+  bool failedAny = false;
+  for (const NonObjectArgContract &contract : contracts) {
+    mlir::Operation *funcLike = nullptr;
+    if (auto func =
+            module.lookupSymbol<mlir::LLVM::LLVMFuncOp>(contract.symbolName))
+      funcLike = func.getOperation();
+    else if (auto func =
+                 module.lookupSymbol<mlir::func::FuncOp>(contract.symbolName))
+      funcLike = func.getOperation();
+    else if (auto func =
+                 module.lookupSymbol<mlir::async::FuncOp>(contract.symbolName))
+      funcLike = func.getOperation();
+
+    if (!funcLike) {
+      mlir::emitError(module.getLoc())
+          << "non-object argument contract for @" << contract.symbolName
+          << " was not preserved through LLVM lowering";
+      failedAny = true;
+      continue;
+    }
+    markFunctionArgument(funcLike, contract.argIndex,
+                         OwnershipContractAttrs::kNonObjectPointer);
+  }
+  return mlir::failure(failedAny);
 }
 
 mlir::LogicalResult preserveLLVMAsyncArgProvenanceContracts(
@@ -1081,64 +1146,6 @@ void collectMemRefAtomicContracts(
   });
 }
 
-static bool atomicKindAndValueMatch(mlir::LLVM::AtomicRMWOp atomic,
-                                    const MemRefAtomicContract &contract) {
-  std::optional<int64_t> value = getLLVMConstantInt(atomic.getVal());
-  if (!value || *value != contract.value)
-    return false;
-
-  switch (contract.kind) {
-  case mlir::arith::AtomicRMWKind::addi:
-    return atomic.getBinOp() == mlir::LLVM::AtomicBinOp::add;
-  case mlir::arith::AtomicRMWKind::assign:
-    return atomic.getBinOp() == mlir::LLVM::AtomicBinOp::xchg;
-  case mlir::arith::AtomicRMWKind::maxu:
-    return atomic.getBinOp() == mlir::LLVM::AtomicBinOp::umax;
-  default:
-    return false;
-  }
-}
-
-static bool atomicCarriesExactContract(mlir::LLVM::AtomicRMWOp atomic,
-                                       const MemRefAtomicContract &contract) {
-  if (!atomicKindAndValueMatch(atomic, contract))
-    return false;
-  if (!stringAttrEquals(atomic.getOperation(), ThreadSafetyAttrs::kAtomicRole,
-                        contract.role))
-    return false;
-  if (!stringAttrEquals(atomic.getOperation(),
-                        ThreadSafetyAttrs::kAtomicOrdering, contract.ordering))
-    return false;
-  if (!stringAttrEquals(atomic.getOperation(),
-                        ThreadSafetyAttrs::kRetainPremise,
-                        contract.retainPremise))
-    return false;
-
-  mlir::StringAttr component = contract.component;
-  if (!component && contract.role.getValue().starts_with("container.")) {
-    mlir::Builder builder(atomic.getContext());
-    component = builder.getStringAttr(ContainerSafetyAttrs::kComponentHeader);
-  }
-
-  return stringAttrEquals(atomic.getOperation(),
-                          ThreadSafetyAttrs::kAtomicMemRefComponent,
-                          component) &&
-         integerAttrEquals(atomic.getOperation(),
-                           ThreadSafetyAttrs::kAtomicMemRefSlot,
-                           contract.slot) &&
-         stringAttrEquals(atomic.getOperation(),
-                          ThreadSafetyAttrs::kAtomicMemRefGroup,
-                          contract.group) &&
-         stringAttrEquals(atomic.getOperation(),
-                          ThreadSafetyAttrs::kAtomicContainerKind,
-                          contract.containerKind) &&
-         atomic->hasAttr(ThreadSafetyAttrs::kOwnedTokenVerified) ==
-             contract.ownedTokenVerified &&
-         stringAttrEquals(atomic.getOperation(),
-                          ThreadSafetyAttrs::kOwnedTokenProof,
-                          contract.ownedTokenProof);
-}
-
 mlir::LogicalResult preserveLoweredMemRefAtomicContracts(
     mlir::ModuleOp module, llvm::ArrayRef<MemRefAtomicContract> contracts) {
   llvm::SmallVector<bool> used(contracts.size(), false);
@@ -1197,16 +1204,6 @@ mlir::LogicalResult preserveLoweredMemRefAtomicContracts(
       failedAny = true;
       return;
     }
-    for (auto indexed : llvm::enumerate(contracts)) {
-      unsigned index = indexed.index();
-      if (used[index])
-        continue;
-      if (!atomicCarriesExactContract(atomic, indexed.value()))
-        continue;
-      applyContract(atomic, indexed.value());
-      used[index] = true;
-      return;
-    }
   });
 
   for (auto indexed : llvm::enumerate(contracts)) {
@@ -1253,20 +1250,6 @@ void collectMemRefAggregateLoadContracts(
   });
 }
 
-static bool
-aggregateLoadCarriesExactContract(mlir::LLVM::LoadOp load,
-                                  const MemRefAggregateLoadContract &contract) {
-  return stringAttrEquals(load.getOperation(),
-                          OwnershipContractAttrs::kAggregateSlotGroup,
-                          contract.group) &&
-         stringAttrEquals(load.getOperation(),
-                          OwnershipContractAttrs::kAggregateSlotComponent,
-                          contract.component) &&
-         integerAttrEquals(load.getOperation(),
-                           OwnershipContractAttrs::kAggregateSlotIndex,
-                           contract.slot);
-}
-
 mlir::LogicalResult preserveLoweredMemRefAggregateLoadContracts(
     mlir::ModuleOp module,
     llvm::ArrayRef<MemRefAggregateLoadContract> contracts) {
@@ -1307,16 +1290,6 @@ mlir::LogicalResult preserveLoweredMemRefAggregateLoadContracts(
     }
     if (!load->hasAttr(OwnershipContractAttrs::kAggregateSlotLoad))
       return;
-    for (auto indexed : llvm::enumerate(contracts)) {
-      unsigned index = indexed.index();
-      if (used[index])
-        continue;
-      if (!aggregateLoadCarriesExactContract(load, indexed.value()))
-        continue;
-      applyContract(load, indexed.value());
-      used[index] = true;
-      return;
-    }
   });
 
   for (auto indexed : llvm::enumerate(contracts)) {
@@ -1385,19 +1358,6 @@ preserve(mlir::ModuleOp module,
       return;
     }
     (void)addr;
-    for (auto indexed : llvm::enumerate(contracts)) {
-      unsigned index = indexed.index();
-      if (used[index] || indexed.value().store != store)
-        continue;
-      if (!stringAttrEquals(op, ContainerSafetyAttrs::kAccessGroup,
-                            indexed.value().group) ||
-          !stringAttrEquals(op, ContainerSafetyAttrs::kAccessComponent,
-                            indexed.value().component))
-        continue;
-      applyContract(op, indexed.value());
-      used[index] = true;
-      return;
-    }
   };
 
   module.walk([&](mlir::LLVM::LoadOp load) {
@@ -1514,17 +1474,6 @@ static bool isFreeCall(mlir::LLVM::CallOp call) {
   return callee && *callee == "free";
 }
 
-static bool
-deallocCallCarriesExactContract(mlir::LLVM::CallOp call,
-                                const MemRefDeallocContract &contract) {
-  return stringAttrEquals(call.getOperation(),
-                          ContainerSafetyAttrs::kDeallocGroup,
-                          contract.group) &&
-         stringAttrEquals(call.getOperation(),
-                          ContainerSafetyAttrs::kDeallocComponent,
-                          contract.component);
-}
-
 mlir::LogicalResult preserveLoweredMemRefDeallocContracts(
     mlir::ModuleOp module, llvm::ArrayRef<MemRefDeallocContract> contracts) {
   llvm::SmallVector<bool> used(contracts.size(), false);
@@ -1556,16 +1505,6 @@ mlir::LogicalResult preserveLoweredMemRefDeallocContracts(
       failedAny = true;
       return;
     }
-    for (auto indexed : llvm::enumerate(contracts)) {
-      unsigned index = indexed.index();
-      if (used[index])
-        continue;
-      if (!deallocCallCarriesExactContract(call, indexed.value()))
-        continue;
-      applyContract(call, indexed.value());
-      used[index] = true;
-      return;
-    }
   });
 
   for (auto indexed : llvm::enumerate(contracts)) {
@@ -1582,6 +1521,7 @@ mlir::LogicalResult preserveLoweredMemRefDeallocContracts(
 void collectLoweredSafetyContracts(mlir::ModuleOp module,
                                    LoweredSafetyContracts &contracts) {
   collectAsyncArgProvenanceContracts(module, contracts.asyncArgs);
+  collectNonObjectArgContracts(module, contracts.nonObjectArgs);
   collectMemRefAtomicContracts(module, contracts.memRefAtomics);
   collectMemRefAggregateLoadContracts(module, contracts.aggregateLoads);
   container::access::Contract::collect(module, contracts.containerAccesses);
@@ -1593,6 +1533,7 @@ void collectLoweredSafetyContracts(mlir::ModuleOp module,
                                    LoweredSafetyContracts &contracts) {
   collectAsyncArgProvenanceContracts(module, typeConverter,
                                      contracts.asyncArgs);
+  collectNonObjectArgContracts(module, typeConverter, contracts.nonObjectArgs);
   collectMemRefAtomicContracts(module, contracts.memRefAtomics);
   collectMemRefAggregateLoadContracts(module, contracts.aggregateLoads);
   container::access::Contract::collect(module, contracts.containerAccesses);
@@ -1604,6 +1545,9 @@ preserveLoweredSafetyContracts(mlir::ModuleOp module,
                                const LoweredSafetyContracts &contracts) {
   if (mlir::failed(
           preserveLLVMAsyncArgProvenanceContracts(module, contracts.asyncArgs)))
+    return mlir::failure();
+  if (mlir::failed(
+          preserveLLVMNonObjectArgContracts(module, contracts.nonObjectArgs)))
     return mlir::failure();
   if (mlir::failed(preserveLoweredMemRefAtomicContracts(
           module, contracts.memRefAtomics)))

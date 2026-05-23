@@ -266,11 +266,6 @@ struct RuntimeLoweringPass
       signalPassFailure();
       return;
     }
-    if (mlir::failed(lowering::runtime::async::normalizeFuncSignatures(
-            module, typeConverter))) {
-      signalPassFailure();
-      return;
-    }
 
     if (dumpInternalLowering) {
       llvm::errs() << "[After call conversion]\n";

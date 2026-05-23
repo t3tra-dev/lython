@@ -248,6 +248,11 @@ struct AsyncArgProvenanceContract {
   AsyncArgProvenanceKind kind;
 };
 
+struct NonObjectArgContract {
+  std::string symbolName;
+  unsigned argIndex;
+};
+
 struct MemRefAtomicContract {
   int64_t id;
   mlir::Location location;
@@ -289,6 +294,7 @@ struct MemRefDeallocContract {
 
 struct LoweredSafetyContracts {
   llvm::SmallVector<AsyncArgProvenanceContract> asyncArgs;
+  llvm::SmallVector<NonObjectArgContract> nonObjectArgs;
   llvm::SmallVector<MemRefAtomicContract> memRefAtomics;
   llvm::SmallVector<MemRefAggregateLoadContract> aggregateLoads;
   llvm::SmallVector<MemRefContainerAccessContract> containerAccesses;
@@ -441,6 +447,15 @@ void collectAsyncArgProvenanceContracts(
 mlir::LogicalResult preserveLLVMAsyncArgProvenanceContracts(
     mlir::ModuleOp module,
     llvm::ArrayRef<AsyncArgProvenanceContract> contracts);
+
+void collectNonObjectArgContracts(
+    mlir::ModuleOp module,
+    llvm::SmallVectorImpl<NonObjectArgContract> &contracts);
+void collectNonObjectArgContracts(
+    mlir::ModuleOp module, const PyLLVMTypeConverter &typeConverter,
+    llvm::SmallVectorImpl<NonObjectArgContract> &contracts);
+mlir::LogicalResult preserveLLVMNonObjectArgContracts(
+    mlir::ModuleOp module, llvm::ArrayRef<NonObjectArgContract> contracts);
 
 void collectMemRefAtomicContracts(
     mlir::ModuleOp module,

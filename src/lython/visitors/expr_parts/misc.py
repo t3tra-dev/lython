@@ -1,13 +1,18 @@
-# pyright: reportAttributeAccessIssue=false, reportUnknownMemberType=false, reportUnknownVariableType=false
 from __future__ import annotations
 
 import ast
+from typing import TYPE_CHECKING
 
 from ...mlir import ir
 from ...mlir.dialects import _lython_ops_gen as py_ops
 
+if TYPE_CHECKING:
+    from ..contracts import VisitorRuntime
+else:
+    VisitorRuntime = object
 
-class ExprMiscMixin:
+
+class ExprMiscMixin(VisitorRuntime):
     def visit_Lambda(self, node: ast.Lambda) -> None:
         """
         ラムダ式を処理する
@@ -45,11 +50,7 @@ class ExprMiscMixin:
         if immediate is not None:
             return immediate
         awaitable = self.require_value(node.value, self.visit(node.value))
-        payload_type = self.get_awaitable_payload_type(awaitable.type)
-        if payload_type is None:
-            raise TypeError(
-                f"Cannot await non-awaitable value of type {awaitable.type}"
-            )
+        payload_type = self.typed_node_type(node)
         with self._loc(node), self.insertion_point():
             return py_ops.AwaitOp(payload_type, awaitable).result
 

@@ -1,60 +1,74 @@
 from __future__ import annotations
 
-from typing import NamedTuple
+from collections.abc import MutableMapping
+from typing import Protocol, TypedDict
 
+from ..frontend.program import TypedProgram
+from ..frontend.symbols import ClassInfo, FunctionInfo, MethodInfo
 from ..mlir import ir
 
 
-class FunctionInfo(NamedTuple):
-    symbol: str
-    func_type: ir.Type
-    arg_types: tuple[ir.Type, ...]
-    result_types: tuple[ir.Type, ...]
-    has_vararg: bool
-    maythrow: bool
-    arg_names: tuple[str, ...] = ()
-    kwonly_arg_types: tuple[ir.Type, ...] = ()
-    kwonly_names: tuple[str, ...] = ()
-    kwdefault_names: tuple[str, ...] = ()
-    defaults_count: int = 0
-    positional_default_callable_infos: tuple["FunctionInfo | None", ...] = ()
-    kwonly_default_callable_infos: tuple["FunctionInfo | None", ...] = ()
-    defaults: ir.Value | None = None
-    kwdefaults: ir.Value | None = None
-    has_kwargs: bool = False
-    returned_function_info: "FunctionInfo | None" = None
-    returned_callable_arg_index: int | None = None
-    closure: ir.Value | None = None
-    closure_capture_arg_indices: tuple[int | None, ...] = ()
-    is_async: bool = False
+class FinallyReturnContext(TypedDict):
+    yield_kind: str
+    signal_type: ir.Type
+    return_type: ir.Type | None
+    swallow_raise: bool
 
 
-class MethodInfo(NamedTuple):
-    """Information about a class method."""
-
-    name: str
-    arg_types: tuple[ir.Type, ...]
-    result_types: tuple[ir.Type, ...]
-    maythrow: bool
-    mutates_self: bool
-    init_method: bool
-    arg_names: tuple[str, ...] = ()
-    kwonly_arg_types: tuple[ir.Type, ...] = ()
-    kwonly_names: tuple[str, ...] = ()
-    kwdefault_names: tuple[str, ...] = ()
-    defaults_count: int = 0
-    positional_default_callable_infos: tuple["FunctionInfo | None", ...] = ()
-    kwonly_default_callable_infos: tuple["FunctionInfo | None", ...] = ()
-    defaults: ir.Value | None = None
-    kwdefaults: ir.Value | None = None
-    returned_function_info: "FunctionInfo | None" = None
-    returned_callable_arg_index: int | None = None
+class NativeDecoratorInfo(TypedDict):
+    gc: str
 
 
-class ClassInfo(NamedTuple):
-    """Information about a class definition."""
+class AttributeCarrier(Protocol):
+    attributes: MutableMapping[str, object]
 
-    name: str
-    class_type: ir.Type
-    methods: dict[str, MethodInfo]
-    attributes: dict[str, ir.Type]
+
+class ArrayAttrFactory(Protocol):
+    def get(
+        self, attributes: list[ir.Attribute], *, context: ir.Context
+    ) -> ir.ArrayAttr: ...
+
+
+class BlockFactory(Protocol):
+    def create_at_start(
+        self, region: ir.Region, arg_types: list[ir.Type]
+    ) -> ir.Block: ...
+
+
+class RegionBlocks(Protocol):
+    def append(self, *arg_types: ir.Type) -> ir.Block: ...
+
+
+class AffineMapFactory(Protocol):
+    def get(
+        self, dim_count: int, symbol_count: int, exprs: list[ir.AffineExpr]
+    ) -> ir.AffineMap: ...
+
+
+class IteratorAttrBuilder(Protocol):
+    def __call__(self, value: object, *, context: ir.Context) -> ir.Attribute: ...
+
+
+class AttrBuilderFactory(Protocol):
+    def get(self, kind: str) -> IteratorAttrBuilder: ...
+
+
+VisitResult = ir.Value | None
+
+
+__all__ = [
+    "AffineMapFactory",
+    "ArrayAttrFactory",
+    "AttrBuilderFactory",
+    "AttributeCarrier",
+    "BlockFactory",
+    "ClassInfo",
+    "FinallyReturnContext",
+    "FunctionInfo",
+    "IteratorAttrBuilder",
+    "MethodInfo",
+    "NativeDecoratorInfo",
+    "RegionBlocks",
+    "TypedProgram",
+    "VisitResult",
+]

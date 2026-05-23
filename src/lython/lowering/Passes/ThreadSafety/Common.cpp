@@ -147,12 +147,6 @@ mlir::Value pointer::stripCasts(mlir::Value value) {
       value = ptrToInt.getArg();
       continue;
     }
-    if (auto cast = value.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
-      if (cast->getNumOperands() == 1) {
-        value = cast.getOperand(0);
-        continue;
-      }
-    }
     return value;
   }
 }

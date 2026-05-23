@@ -1,8 +1,5 @@
 #include "Passes/Runtime/Async.h"
 
-#include "Passes/Runtime/Conversion.h"
-#include "Passes/Runtime/Helpers.h"
-
 #include "mlir/Dialect/Async/IR/Async.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -89,93 +86,6 @@ mlir::LogicalResult verifyReturnPayloads(mlir::ModuleOp module) {
     }
   });
   return mlir::failure(failedAny);
-}
-
-mlir::LogicalResult
-normalizeFuncSignatures(mlir::ModuleOp module,
-                        PyLLVMTypeConverter &typeConverter) {
-  llvm::SmallVector<mlir::async::FuncOp> funcs;
-  module.walk([&](mlir::async::FuncOp op) { funcs.push_back(op); });
-
-  mlir::OpBuilder builder(module.getContext());
-  for (mlir::async::FuncOp op : funcs) {
-    mlir::FunctionType oldType = op.getFunctionType();
-    llvm::SmallVector<llvm::SmallVector<mlir::Type>> convertedArgTypes;
-    llvm::SmallVector<mlir::Type> flattenedArgTypes;
-    convertedArgTypes.reserve(oldType.getNumInputs());
-
-    for (mlir::Type inputType : oldType.getInputs()) {
-      llvm::SmallVector<mlir::Type> converted;
-      if (mlir::failed(typeConverter.convertType(inputType, converted)) ||
-          converted.empty())
-        return op.emitOpError("failed to convert async function argument type");
-      flattenedArgTypes.append(converted.begin(), converted.end());
-      convertedArgTypes.push_back(std::move(converted));
-    }
-
-    llvm::SmallVector<mlir::Type> resultTypes;
-    if (mlir::failed(
-            typeConverter.convertTypes(oldType.getResults(), resultTypes)))
-      return op.emitOpError("failed to convert async function result types");
-
-    if (::py::lowering::runtime::conversion::types::same(oldType.getInputs(),
-                                                         flattenedArgTypes) &&
-        ::py::lowering::runtime::conversion::types::same(oldType.getResults(),
-                                                         resultTypes))
-      continue;
-
-    op.setFunctionTypeAttr(mlir::TypeAttr::get(
-        builder.getFunctionType(flattenedArgTypes, resultTypes)));
-    ::py::lowering::runtime::async_args::mark(
-        op.getOperation(), oldType.getInputs(), typeConverter,
-        /*trailingExceptionCell=*/true);
-
-    if (op.isDeclaration())
-      continue;
-    if (op.getBody().empty())
-      return op.emitOpError("has no entry block");
-
-    mlir::Block &entry = op.getBody().front();
-    llvm::SmallVector<mlir::BlockArgument> oldArgs(entry.args_begin(),
-                                                   entry.args_end());
-    if (oldArgs.size() != convertedArgTypes.size())
-      return op.emitOpError("entry block argument count does not match type");
-
-    llvm::SmallVector<llvm::SmallVector<mlir::BlockArgument>>
-        convertedArgValues;
-    convertedArgValues.reserve(oldArgs.size());
-    for (auto [oldArg, convertedTypes] :
-         llvm::zip(oldArgs, convertedArgTypes)) {
-      llvm::SmallVector<mlir::Location> locs(convertedTypes.size(),
-                                             oldArg.getLoc());
-      auto addedArgs =
-          entry.addArguments(mlir::TypeRange(convertedTypes), locs);
-      convertedArgValues.push_back(llvm::SmallVector<mlir::BlockArgument>(
-          addedArgs.begin(), addedArgs.end()));
-    }
-
-    builder.setInsertionPointToStart(&entry);
-    for (auto [oldArg, convertedValues] :
-         llvm::zip(oldArgs, convertedArgValues)) {
-      mlir::Value replacement;
-      if (convertedValues.size() == 1 &&
-          convertedValues.front().getType() == oldArg.getType()) {
-        replacement = convertedValues.front();
-      } else {
-        llvm::SmallVector<mlir::Value> operands(convertedValues.begin(),
-                                                convertedValues.end());
-        replacement = builder
-                          .create<mlir::UnrealizedConversionCastOp>(
-                              oldArg.getLoc(),
-                              mlir::TypeRange{oldArg.getType()}, operands)
-                          .getResult(0);
-      }
-      oldArg.replaceAllUsesWith(replacement);
-    }
-    entry.eraseArguments(0, static_cast<unsigned>(oldArgs.size()));
-  }
-
-  return mlir::success();
 }
 
 } // namespace lowering::runtime::async

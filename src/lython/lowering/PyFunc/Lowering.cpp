@@ -135,6 +135,16 @@ void mark(mlir::func::FuncOp func, llvm::ArrayRef<mlir::Type> pyInputs,
         async_runtime::CancelFlag::markArgument(func.getOperation(),
                                                 flattenedIndex + 2);
     }
+    if (isCompilerOwnedMemRefContainerType(inputType)) {
+      mlir::Builder builder(func.getContext());
+      for (auto [offset, convertedType] : llvm::enumerate(converted)) {
+        if (!mlir::isa<mlir::LLVM::LLVMPointerType>(convertedType))
+          continue;
+        func.setArgAttr(flattenedIndex + static_cast<unsigned>(offset),
+                        OwnershipContractAttrs::kNonObjectPointer,
+                        builder.getUnitAttr());
+      }
+    }
     flattenedIndex += static_cast<unsigned>(converted.size());
   }
 }
@@ -827,6 +837,7 @@ struct FuncOpLowering : public mlir::OpConversionPattern<FuncOp> {
       auto ptrType = mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
       mlir::Value resultSlot = rewriter.create<mlir::LLVM::AllocaOp>(
           op.getLoc(), ptrType, classReturnObjectType, one, /*alignment=*/0);
+      ownership::Pointer::markNonObject(resultSlot);
       mlir::Value zero = rewriter.create<mlir::LLVM::ZeroOp>(
           op.getLoc(), classReturnObjectType);
       rewriter.create<mlir::LLVM::StoreOp>(op.getLoc(), zero, resultSlot);

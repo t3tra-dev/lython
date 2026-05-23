@@ -1,14 +1,19 @@
-# pyright: reportAttributeAccessIssue=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownVariableType=false
 from __future__ import annotations
 
 import ast
+from typing import TYPE_CHECKING
 
+from ...frontend.symbols import ClassInfo
 from ...mlir import ir
 from ...mlir.dialects import _lython_ops_gen as py_ops
-from .._base import ClassInfo
+
+if TYPE_CHECKING:
+    from ..contracts import VisitorRuntime
+else:
+    VisitorRuntime = object
 
 
-class ExprCallMethodsMixin:
+class ExprCallMethodsMixin(VisitorRuntime):
     def _handle_class_instantiation(
         self, node: ast.Call, class_info: ClassInfo, loc: ir.Location
     ) -> ir.Value:
@@ -151,7 +156,7 @@ class ExprCallMethodsMixin:
 
         class_info = self.lookup_class(class_name)
         if class_info is None:
-            raise NameError(f"Unknown class '{class_name}'")
+            raise NameError(f"Unresolved class '{class_name}'")
 
         if method_name not in class_info.methods:
             raise AttributeError(f"Class '{class_name}' has no method '{method_name}'")

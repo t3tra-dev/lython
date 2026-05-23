@@ -71,9 +71,6 @@ slotInProvenance(mlir::Value value,
     return slotInProvenance(gep.getBase(), seen);
   if (auto extract = value.getDefiningOp<mlir::LLVM::ExtractValueOp>())
     return slotInProvenance(extract.getContainer(), seen);
-  if (auto cast = value.getDefiningOp<mlir::UnrealizedConversionCastOp>())
-    if (cast->getNumOperands() == 1)
-      return slotInProvenance(cast.getOperand(0), seen);
   return std::nullopt;
 }
 

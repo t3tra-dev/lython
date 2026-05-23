@@ -110,9 +110,6 @@ static bool borrow(mlir::Value value,
     return borrow(intToPtr.getArg(), seen);
   if (auto ptrToInt = value.getDefiningOp<mlir::LLVM::PtrToIntOp>())
     return borrow(ptrToInt.getArg(), seen);
-  if (auto cast = value.getDefiningOp<mlir::UnrealizedConversionCastOp>())
-    if (cast->getNumOperands() == 1)
-      return borrow(cast.getOperand(0), seen);
 
   if (auto gep = value.getDefiningOp<mlir::LLVM::GEPOp>())
     return borrow(gep.getBase(), seen);
@@ -315,11 +312,6 @@ static void collectEscapes(mlir::Value value,
     }
     if (local_container::use(user, value))
       continue;
-    if (auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(user)) {
-      for (mlir::Value result : cast.getResults())
-        collectEscapes(result, seen, escapes);
-      continue;
-    }
     if (auto cast = mlir::dyn_cast<mlir::memref::CastOp>(user)) {
       collectEscapes(cast.getResult(), seen, escapes);
       continue;

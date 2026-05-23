@@ -2,6 +2,22 @@
 
 namespace py::threadsafe {
 
+namespace {
+
+mlir::LogicalResult verifyNoUnrealizedCasts(mlir::ModuleOp module) {
+  mlir::UnrealizedConversionCastOp offender = nullptr;
+  module.walk([&](mlir::UnrealizedConversionCastOp cast) {
+    offender = cast;
+    return mlir::WalkResult::interrupt();
+  });
+  if (!offender)
+    return mlir::success();
+  return offender.emitError(
+      "unrealized conversion cast reached thread-safety verifier");
+}
+
+} // namespace
+
 namespace verifier::function_like {
 
 static mlir::LogicalResult verify(mlir::Operation *funcLike,
@@ -41,6 +57,9 @@ static mlir::LogicalResult verify(mlir::Operation *funcLike,
 } // namespace verifier::function_like
 
 mlir::LogicalResult verifier::module::verify(mlir::ModuleOp module) {
+  if (mlir::failed(verifyNoUnrealizedCasts(module)))
+    return mlir::failure();
+
   bool failedAny = false;
   module.walk([&](mlir::memref::AtomicRMWOp op) {
     if (mlir::failed(verifier::memref::AtomicRMW::verify(op)))

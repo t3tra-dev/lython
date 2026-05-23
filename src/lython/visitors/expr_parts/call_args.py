@@ -1,13 +1,18 @@
-# pyright: reportAttributeAccessIssue=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownVariableType=false
 from __future__ import annotations
 
 import ast
+from typing import TYPE_CHECKING
 
 from ...mlir import ir
 from ...mlir.dialects import _lython_ops_gen as py_ops
 
+if TYPE_CHECKING:
+    from ..contracts import VisitorRuntime
+else:
+    VisitorRuntime = object
 
-class ExprCallArgsMixin:
+
+class ExprCallArgsMixin(VisitorRuntime):
     """Helpers for packing positional and keyword call operands."""
 
     def _build_direct_vectorcall_operands(

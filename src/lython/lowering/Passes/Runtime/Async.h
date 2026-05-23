@@ -8,7 +8,5 @@
 namespace py::lowering::runtime::async {
 
 mlir::LogicalResult verifyReturnPayloads(mlir::ModuleOp module);
-mlir::LogicalResult normalizeFuncSignatures(mlir::ModuleOp module,
-                                            PyLLVMTypeConverter &typeConverter);
 
 } // namespace py::lowering::runtime::async
