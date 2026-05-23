@@ -20,7 +20,7 @@ bool isBuiltinPrintCallable(mlir::Value callable);
 void ensureLandingpad(mlir::Block *unwind, mlir::Location loc,
                       mlir::ConversionPatternRewriter &rewriter);
 bool canUseVoidHelper(CallVectorOp op, mlir::func::FuncOp callee);
-mlir::Value stripIdentityCasts(mlir::Value value);
+mlir::Value stripBridgeCasts(mlir::Value value);
 
 mlir::FailureOr<mlir::LLVM::LLVMStructType>
 getStaticClassObjectType(mlir::Operation *from, ClassType classType,
@@ -54,9 +54,14 @@ void finalizeInvokeNormalBridge(mlir::Block *bridge, mlir::Block *finalDest,
 void eraseInvokeNormalSeedDrops(InvokeOp op, mlir::Value logicalSeed,
                                 mlir::ConversionPatternRewriter &rewriter);
 
-void populatePyDirectCallLoweringPatterns(PyLLVMTypeConverter &typeConverter,
-                                          mlir::RewritePatternSet &patterns);
-void populatePyInvokeLoweringPatterns(PyLLVMTypeConverter &typeConverter,
-                                      mlir::RewritePatternSet &patterns);
+namespace lowering::call::direct::Patterns {
+void populate(PyLLVMTypeConverter &typeConverter,
+              mlir::RewritePatternSet &patterns);
+} // namespace lowering::call::direct::Patterns
+
+namespace lowering::call::invoke::Patterns {
+void populate(PyLLVMTypeConverter &typeConverter,
+              mlir::RewritePatternSet &patterns);
+} // namespace lowering::call::invoke::Patterns
 
 } // namespace py

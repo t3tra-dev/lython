@@ -110,11 +110,6 @@ class StmtClassMixin:
         else:
             result_ir_type = self.annotation_to_static_class_type(node.returns)
         result_type_spec = str(result_ir_type)
-        if node.name == "__repr__":
-            if len(node.args.args) != 1:
-                raise ValueError("__repr__ must take only 'self'")
-            if result_ir_type != self.get_py_type("!py.str"):
-                raise ValueError("__repr__ must return str")
         funcsig = self.build_funcsig(
             arg_type_specs, [result_type_spec], kwonly_types=kwonly_type_specs
         )

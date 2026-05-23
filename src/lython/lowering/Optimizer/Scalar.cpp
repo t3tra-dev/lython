@@ -1,24 +1,21 @@
 #include "Optimizer/Utils.h"
 
-using namespace mlir;
-
 namespace py::optimizer {
 
-void runScalarPreLoweringOptimizations(ModuleOp module) {
-  removeUnusedNoneOps(module);
-  removeNoneDecrefs(module);
-  hoistIntConstants(module);
-  removeSmallIntDecrefs(module);
+void pipeline::scalarPre(mlir::ModuleOp module) {
+  scalar::removeUnusedNone(module);
+  scalar::dropNoneDecrefs(module);
+  scalar::hoistInts(module);
+  scalar::dropSmallIntDecrefs(module);
 }
 
-void runScalarPostLoweringOptimizations(ModuleOp module) {
-  cseStringCreation(module);
-  cseSingletonGetters(module);
-  eliminateBoolBoxingUnboxing(module);
-  eliminateLongArithmeticRoundTrips(module);
-  eliminateLongBoxingUnboxing(module);
-  cseSmallIntFromI64(module);
-  cseConstants(module);
+void pipeline::scalarPost(mlir::ModuleOp module) {
+  scalar::cseSingletons(module);
+  scalar::elideBoolBoxing(module);
+  scalar::elideLongArithRoundTrips(module);
+  scalar::elideLongBoxing(module);
+  scalar::cseSmallInts(module);
+  scalar::cseConstants(module);
 }
 
 } // namespace py::optimizer

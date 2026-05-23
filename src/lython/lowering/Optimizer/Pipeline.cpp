@@ -3,50 +3,54 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 
-using namespace mlir;
-
 namespace py {
 namespace {
 
 struct PublicationPreparationPass
-    : public PassWrapper<PublicationPreparationPass, OperationPass<ModuleOp>> {
+    : public mlir::PassWrapper<PublicationPreparationPass,
+                               mlir::OperationPass<mlir::ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PublicationPreparationPass)
 
-  StringRef getArgument() const override { return "py-prepare-publication"; }
+  llvm::StringRef getArgument() const override {
+    return "py-prepare-publication";
+  }
 
-  StringRef getDescription() const override {
+  llvm::StringRef getDescription() const override {
     return "Insert explicit py.publish boundaries before refcount insertion";
   }
 
   void runOnOperation() override {
-    runEarlyPublicationPreparation(getOperation());
+    optimizer::publication::prepare(getOperation());
   }
 };
 
 struct PyOptimizationPass
-    : public PassWrapper<PyOptimizationPass, OperationPass<ModuleOp>> {
+    : public mlir::PassWrapper<PyOptimizationPass,
+                               mlir::OperationPass<mlir::ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PyOptimizationPass)
 
-  StringRef getArgument() const override { return "py-optimize"; }
+  llvm::StringRef getArgument() const override { return "py-optimize"; }
 
-  StringRef getDescription() const override {
+  llvm::StringRef getDescription() const override {
     return "Apply Py dialect-specific optimizations";
   }
 
   void runOnOperation() override {
-    ModuleOp module = getOperation();
-    runPreLoweringOptimizations(module);
-    runPostLoweringOptimizations(module);
+    mlir::ModuleOp module = getOperation();
+    optimizer::pipeline::preLowering(module);
+    optimizer::pipeline::postLowering(module);
   }
 };
 
 } // namespace
 
-std::unique_ptr<OperationPass<ModuleOp>> createPyOptimizationPass() {
+std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
+createPyOptimizationPass() {
   return std::make_unique<PyOptimizationPass>();
 }
 
-std::unique_ptr<OperationPass<ModuleOp>> createPublicationPreparationPass() {
+std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
+createPublicationPreparationPass() {
   return std::make_unique<PublicationPreparationPass>();
 }
 

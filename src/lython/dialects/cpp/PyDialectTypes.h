@@ -27,7 +27,10 @@ enum class TypeKind : unsigned {
   Location,
   FuncSig,
   Func,
-  PrimFunc
+  PrimFunc,
+  Coroutine,
+  Task,
+  Future
 };
 
 namespace detail {
@@ -157,6 +160,19 @@ struct FunctionTypeStorage : public mlir::TypeStorage {
                                         const KeyTy &key);
 
   mlir::FunctionType signature;
+};
+
+struct AwaitableTypeStorage : public mlir::TypeStorage {
+  using KeyTy = mlir::Type;
+
+  explicit AwaitableTypeStorage(mlir::Type result) : resultType(result) {}
+
+  bool operator==(const KeyTy &key) const { return key == resultType; }
+
+  static AwaitableTypeStorage *construct(mlir::TypeStorageAllocator &allocator,
+                                         const KeyTy &key);
+
+  mlir::Type resultType;
 };
 
 } // namespace detail
@@ -381,6 +397,49 @@ public:
   mlir::FunctionType getSignature() const;
 };
 
+class CoroutineType
+    : public mlir::Type::TypeBase<CoroutineType, mlir::Type,
+                                  detail::AwaitableTypeStorage> {
+public:
+  using Base::Base;
+  static constexpr ::llvm::StringLiteral name{"py.coro"};
+
+  static CoroutineType get(mlir::MLIRContext *ctx, mlir::Type resultType);
+  static bool kindof(unsigned kind) {
+    return kind == static_cast<unsigned>(TypeKind::Coroutine);
+  }
+
+  mlir::Type getResultType() const;
+};
+
+class TaskType : public mlir::Type::TypeBase<TaskType, mlir::Type,
+                                             detail::AwaitableTypeStorage> {
+public:
+  using Base::Base;
+  static constexpr ::llvm::StringLiteral name{"py.task"};
+
+  static TaskType get(mlir::MLIRContext *ctx, mlir::Type resultType);
+  static bool kindof(unsigned kind) {
+    return kind == static_cast<unsigned>(TypeKind::Task);
+  }
+
+  mlir::Type getResultType() const;
+};
+
+class FutureType : public mlir::Type::TypeBase<FutureType, mlir::Type,
+                                               detail::AwaitableTypeStorage> {
+public:
+  using Base::Base;
+  static constexpr ::llvm::StringLiteral name{"py.future"};
+
+  static FutureType get(mlir::MLIRContext *ctx, mlir::Type resultType);
+  static bool kindof(unsigned kind) {
+    return kind == static_cast<unsigned>(TypeKind::Future);
+  }
+
+  mlir::Type getResultType() const;
+};
+
 bool isPyIntType(mlir::Type type);
 bool isPyFloatType(mlir::Type type);
 bool isPyBoolType(mlir::Type type);
@@ -397,9 +456,13 @@ bool isPyLocationType(mlir::Type type);
 bool isPyFuncSigType(mlir::Type type);
 bool isPyFuncType(mlir::Type type);
 bool isPyPrimFuncType(mlir::Type type);
+bool isPyCoroutineType(mlir::Type type);
+bool isPyTaskType(mlir::Type type);
+bool isPyFutureType(mlir::Type type);
 
 // v2: Callable type checking (!py.func or !py.class with __call__)
 bool isCallableType(mlir::Type type);
+bool isAwaitableType(mlir::Type type);
 
 bool isPyType(mlir::Type type);
 

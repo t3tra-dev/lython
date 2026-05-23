@@ -23,15 +23,15 @@ class ExprCallableSummaryMixin:
     ) -> None:
         if returned is None:
             return
-        op.attributes["lython.returned_callable_symbol"] = ir.FlatSymbolRefAttr.get(
+        op.attributes["ly.returned_callable_symbol"] = ir.FlatSymbolRefAttr.get(
             returned.symbol, self.ctx
         )
-        op.attributes["lython.returned_callable_defaults_count"] = ir.IntegerAttr.get(
+        op.attributes["ly.returned_callable_defaults_count"] = ir.IntegerAttr.get(
             ir.IntegerType.get_signless(64, context=self.ctx),
             returned.defaults_count,
         )
         if returned.kwdefault_names:
-            op.attributes["lython.returned_callable_kwdefault_names"] = self.array_attr(
+            op.attributes["ly.returned_callable_kwdefault_names"] = self.array_attr(
                 [
                     ir.StringAttr.get(name, self.ctx)
                     for name in returned.kwdefault_names
@@ -315,7 +315,7 @@ class ExprCallableSummaryMixin:
             if op is None:
                 return False
             op_name = str(getattr(op, "name", ""))
-            if op_name == "py.cast.identity":
+            if op_name == "py.publish":
                 operands = list(getattr(op, "operands", ()))
                 if not operands:
                     return False

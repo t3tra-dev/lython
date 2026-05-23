@@ -1,37 +1,35 @@
 #include "cpp/PyVerifier/Common.h"
 
-using namespace mlir;
-
 namespace py {
 
-static bool isSupportedStaticFieldType(Type type) {
-  if (isa<IntType, FloatType, BoolType, StrType, NoneType, IntegerType,
-          mlir::FloatType>(type))
+static bool isSupportedStaticFieldType(mlir::Type type) {
+  if (mlir::isa<IntType, FloatType, BoolType, StrType, NoneType,
+                mlir::IntegerType, mlir::FloatType>(type))
     return true;
-  auto isSupportedContainerElement = [](Type elementType) {
-    return isa<ClassType, IntType, FloatType, BoolType, StrType, NoneType,
-               ObjectType>(elementType);
+  auto isSupportedContainerElement = [](mlir::Type elementType) {
+    return mlir::isa<ClassType, IntType, FloatType, BoolType, StrType, NoneType,
+                     ObjectType>(elementType);
   };
-  if (auto listType = dyn_cast<ListType>(type)) {
+  if (auto listType = mlir::dyn_cast<ListType>(type)) {
     return isSupportedContainerElement(listType.getElementType());
   }
-  if (auto dictType = dyn_cast<DictType>(type)) {
+  if (auto dictType = mlir::dyn_cast<DictType>(type)) {
     return isSupportedContainerElement(dictType.getKeyType()) &&
            isSupportedContainerElement(dictType.getValueType());
   }
-  if (auto tupleType = dyn_cast<TupleType>(type)) {
+  if (auto tupleType = mlir::dyn_cast<TupleType>(type)) {
     return llvm::all_of(tupleType.getElementTypes(),
                         isSupportedContainerElement);
   }
   return false;
 }
 
-static LogicalResult verifyClassFieldSchema(ClassOp op) {
-  ArrayAttr fieldNames = op.getFieldNamesAttr();
-  ArrayAttr fieldTypes = op.getFieldTypesAttr();
+static mlir::LogicalResult verifyClassFieldSchema(ClassOp op) {
+  mlir::ArrayAttr fieldNames = op.getFieldNamesAttr();
+  mlir::ArrayAttr fieldTypes = op.getFieldTypesAttr();
 
   if (!fieldNames && !fieldTypes)
-    return success();
+    return mlir::success();
   if (!fieldNames || !fieldTypes)
     return op.emitOpError(
         "field_names and field_types must be provided together");
@@ -40,8 +38,8 @@ static LogicalResult verifyClassFieldSchema(ClassOp op) {
                           "number of elements");
 
   llvm::StringSet<> seenNames;
-  for (Attribute attr : fieldNames) {
-    auto nameAttr = dyn_cast<StringAttr>(attr);
+  for (mlir::Attribute attr : fieldNames) {
+    auto nameAttr = mlir::dyn_cast<mlir::StringAttr>(attr);
     if (!nameAttr)
       return op.emitOpError("field_names must contain only StringAttr values");
     if (!seenNames.insert(nameAttr.getValue()).second)
@@ -49,8 +47,8 @@ static LogicalResult verifyClassFieldSchema(ClassOp op) {
              << nameAttr.getValue() << "'";
   }
 
-  for (Attribute attr : fieldTypes) {
-    auto typeAttr = dyn_cast<TypeAttr>(attr);
+  for (mlir::Attribute attr : fieldTypes) {
+    auto typeAttr = mlir::dyn_cast<mlir::TypeAttr>(attr);
     if (!typeAttr)
       return op.emitOpError("field_types must contain only TypeAttr values");
     if (!isSupportedStaticFieldType(typeAttr.getValue()))
@@ -61,11 +59,11 @@ static LogicalResult verifyClassFieldSchema(ClassOp op) {
                 "dicts/tuples";
   }
 
-  return success();
+  return mlir::success();
 }
 
-static bool isAllowedClassBodyMetadataOp(Operation *op) {
-  StringRef name = op->getName().getStringRef();
+static bool isAllowedClassBodyMetadataOp(mlir::Operation *op) {
+  llvm::StringRef name = op->getName().getStringRef();
   return name == "py.str.constant" || name == "py.int.constant" ||
          name == "py.float.constant" || name == "py.none" ||
          name == "py.tuple.empty" || name == "py.tuple.create" ||
@@ -74,24 +72,24 @@ static bool isAllowedClassBodyMetadataOp(Operation *op) {
          name == "py.make_function" || name == "py.publish";
 }
 
-LogicalResult ClassOp::verify() {
-  Region &body = getBody();
+mlir::LogicalResult ClassOp::verify() {
+  mlir::Region &body = getBody();
   if (body.empty())
     return emitOpError("must contain a body region");
   if (!body.hasOneBlock())
     return emitOpError("body must consist of a single block");
-  if (failed(verifyClassFieldSchema(*this)))
-    return failure();
+  if (mlir::failed(verifyClassFieldSchema(*this)))
+    return mlir::failure();
 
-  Block &block = body.front();
+  mlir::Block &block = body.front();
   llvm::StringSet<> methodNames;
   ClassType classType =
       ClassType::get(getContext(), getSymNameAttr().getValue());
 
-  for (Operation &op : block) {
+  for (mlir::Operation &op : block) {
     if (isAllowedClassBodyMetadataOp(&op))
       continue;
-    FuncOp method = dyn_cast<FuncOp>(&op);
+    FuncOp method = mlir::dyn_cast<FuncOp>(&op);
     if (!method)
       return emitOpError(
           "body may only contain py.func operations or metadata ops");
@@ -106,7 +104,7 @@ LogicalResult ClassOp::verify() {
     mlir::TypeAttr fnTypeAttr = method.getFunctionTypeAttr();
     if (!fnTypeAttr)
       return method.emitOpError("requires 'function_type' attribute");
-    auto signature = dyn_cast<FuncSignatureType>(fnTypeAttr.getValue());
+    auto signature = mlir::dyn_cast<FuncSignatureType>(fnTypeAttr.getValue());
     if (!signature)
       return method.emitOpError("'function_type' must be a FuncSignatureType");
 
@@ -115,137 +113,167 @@ LogicalResult ClassOp::verify() {
       return method.emitOpError(
           "must declare a positional 'self' parameter as the first argument");
 
-    Type selfType = positionalTypes.front();
+    mlir::Type selfType = positionalTypes.front();
     if (selfType != classType)
       return method.emitOpError(
                  "first positional parameter must be of type !py.class<")
              << getSymNameAttr().getValue() << ">";
   }
 
-  return success();
+  return mlir::success();
 }
 
-LogicalResult ClassNewOp::verify() {
-  auto resultType = dyn_cast<ClassType>(getResult().getType());
+mlir::LogicalResult ClassNewOp::verify() {
+  auto resultType = mlir::dyn_cast<ClassType>(getResult().getType());
   if (!resultType)
     return emitOpError("result must be of type !py.class");
 
-  StringRef symbolName = getClassNameAttr().getValue();
+  llvm::StringRef symbolName = getClassNameAttr().getValue();
   if (resultType.getClassName() != symbolName)
     return emitOpError("result type must match referenced class symbol '")
            << symbolName << "'";
 
-  Operation *symbol =
-      SymbolTable::lookupNearestSymbolFrom(getOperation(), getClassNameAttr());
-  if (!dyn_cast_or_null<ClassOp>(symbol))
+  mlir::Operation *symbol = mlir::SymbolTable::lookupNearestSymbolFrom(
+      getOperation(), getClassNameAttr());
+  if (!mlir::dyn_cast_or_null<ClassOp>(symbol))
     return emitOpError("class_name must reference a py.class symbol");
 
-  return success();
+  return mlir::success();
 }
 
-LogicalResult ClassPromoteOp::verify() {
+mlir::LogicalResult ClassPromoteOp::verify() {
   if (getInput().getType() != getResult().getType())
     return emitOpError("input and result types must match");
-  if (!isa<ClassType>(getInput().getType()))
+  if (!mlir::isa<ClassType>(getInput().getType()))
     return emitOpError("operand must be of type !py.class");
-  return success();
+  return mlir::success();
 }
 
-LogicalResult PublishOp::verify() {
+mlir::LogicalResult PublishOp::verify() {
   if (getInput().getType() != getResult().getType())
     return emitOpError("input and result types must match");
   if (!isPyType(getInput().getType()))
     return emitOpError("operand must be a !py.* type");
-  return success();
+  return mlir::success();
 }
 
-LogicalResult AttrGetOp::verify() {
-  auto classType = dyn_cast<ClassType>(getObject().getType());
+mlir::LogicalResult AttrGetOp::verify() {
+  auto classType = mlir::dyn_cast<ClassType>(getObject().getType());
   if (!classType)
     return emitOpError("object operand must be of type !py.class");
 
-  FailureOr<Type> expectedType =
+  mlir::FailureOr<mlir::Type> expectedType =
       lookupClassFieldType(getOperation(), classType, getNameAttr().getValue());
-  if (failed(expectedType))
-    return failure();
+  if (mlir::failed(expectedType))
+    return mlir::failure();
   if (getResult().getType() != *expectedType)
     return emitOpError("result type must match declared field type");
 
-  return success();
+  return mlir::success();
 }
 
-LogicalResult ListNewOp::verify() {
-  auto listType = dyn_cast<ListType>(getResult().getType());
+mlir::LogicalResult AttrGetLocalOp::verify() {
+  auto classType = mlir::dyn_cast<ClassType>(getObject().getType());
+  if (!classType)
+    return emitOpError("object operand must be of type !py.class");
+
+  mlir::FailureOr<mlir::Type> expectedType =
+      lookupClassFieldType(getOperation(), classType, getNameAttr().getValue());
+  if (mlir::failed(expectedType))
+    return mlir::failure();
+  if (getResult().getType() != *expectedType)
+    return emitOpError("result type must match declared field type");
+
+  return mlir::success();
+}
+
+mlir::LogicalResult ListNewOp::verify() {
+  auto listType = mlir::dyn_cast<ListType>(getResult().getType());
   if (!listType)
     return emitOpError("result must be of type !py.list");
-  Type elementType = listType.getElementType();
-  if (!isa<ClassType, IntType, FloatType, BoolType, StrType, NoneType,
-           ObjectType>(elementType))
+  mlir::Type elementType = listType.getElementType();
+  if (!mlir::isa<ClassType, IntType, FloatType, BoolType, StrType, NoneType,
+                 ObjectType>(elementType))
     return emitOpError("unsupported list element type ") << elementType;
-  return success();
+  return mlir::success();
 }
 
-LogicalResult ListAppendOp::verify() {
-  auto listType = dyn_cast<ListType>(getList().getType());
+mlir::LogicalResult ListAppendOp::verify() {
+  auto listType = mlir::dyn_cast<ListType>(getList().getType());
   if (!listType)
     return emitOpError("list operand must be of type !py.list");
   if (getValue().getType() != listType.getElementType())
     return emitOpError("value type must match list element type");
-  return success();
+  return mlir::success();
 }
 
-LogicalResult ListRemoveOp::verify() {
-  auto listType = dyn_cast<ListType>(getList().getType());
+mlir::LogicalResult ListRemoveOp::verify() {
+  auto listType = mlir::dyn_cast<ListType>(getList().getType());
   if (!listType)
     return emitOpError("list operand must be of type !py.list");
   if (getValue().getType() != listType.getElementType())
     return emitOpError("value type must match list element type");
-  return success();
+  return mlir::success();
 }
 
-LogicalResult ListGetOp::verify() {
-  auto listType = dyn_cast<ListType>(getList().getType());
+mlir::LogicalResult ListGetOp::verify() {
+  auto listType = mlir::dyn_cast<ListType>(getList().getType());
   if (!listType)
     return emitOpError("list operand must be of type !py.list");
-  if (!isa<IntType, IntegerType>(getIndex().getType()))
+  if (!mlir::isa<IntType, mlir::IntegerType>(getIndex().getType()))
     return emitOpError("index operand must be !py.int or an integer");
   if (getResult().getType() != listType.getElementType())
     return emitOpError("result type must match list element type");
-  return success();
+  return mlir::success();
 }
 
-LogicalResult DictGetOp::verify() {
-  auto dictType = dyn_cast<DictType>(getDict().getType());
+mlir::LogicalResult DictGetOp::verify() {
+  auto dictType = mlir::dyn_cast<DictType>(getDict().getType());
   if (!dictType)
     return emitOpError("dict operand must be of type !py.dict");
   if (getKey().getType() != dictType.getKeyType())
     return emitOpError("key type must match dict key type");
   if (getResult().getType() != dictType.getValueType())
     return emitOpError("result type must match dict value type");
-  return success();
+  return mlir::success();
 }
 
-LogicalResult AttrSetOp::verify() {
-  auto classType = dyn_cast<ClassType>(getObject().getType());
+mlir::LogicalResult AttrSetOp::verify() {
+  auto classType = mlir::dyn_cast<ClassType>(getObject().getType());
   if (!classType)
     return emitOpError("object operand must be of type !py.class");
 
-  FailureOr<Type> expectedType =
+  mlir::FailureOr<mlir::Type> expectedType =
       lookupClassFieldType(getOperation(), classType, getNameAttr().getValue());
-  if (failed(expectedType))
-    return failure();
+  if (mlir::failed(expectedType))
+    return mlir::failure();
   if (getValue().getType() != *expectedType)
     return emitOpError("value type must match declared field type");
 
-  return success();
+  return mlir::success();
 }
 
-LogicalResult FuncOp::verify() {
+mlir::LogicalResult AttrSetLocalOp::verify() {
+  auto classType = mlir::dyn_cast<ClassType>(getObject().getType());
+  if (!classType)
+    return emitOpError("object operand must be of type !py.class");
+
+  mlir::FailureOr<mlir::Type> expectedType =
+      lookupClassFieldType(getOperation(), classType, getNameAttr().getValue());
+  if (mlir::failed(expectedType))
+    return mlir::failure();
+  if (getValue().getType() != *expectedType)
+    return emitOpError("value type must match declared field type");
+
+  return mlir::success();
+}
+
+mlir::LogicalResult FuncOp::verify() {
   mlir::TypeAttr fnTypeAttr = getFunctionTypeAttr();
   if (!fnTypeAttr)
     return emitOpError("requires 'function_type' attribute");
   FuncSignatureType signature =
-      dyn_cast<FuncSignatureType>(fnTypeAttr.getValue());
+      mlir::dyn_cast<FuncSignatureType>(fnTypeAttr.getValue());
   if (!signature)
     return emitOpError("'function_type' must be a FuncSignatureType");
 
@@ -263,10 +291,10 @@ LogicalResult FuncOp::verify() {
     return emitOpError(
         "maythrow and nothrow attributes are mutually exclusive");
 
-  if (signature.hasVararg() && !isa<TupleType>(signature.getVarargType()))
+  if (signature.hasVararg() && !mlir::isa<TupleType>(signature.getVarargType()))
     return emitOpError("vararg parameter must be of type !py.tuple");
   if (signature.hasVararg()) {
-    TupleType tupleTy = cast<TupleType>(signature.getVarargType());
+    TupleType tupleTy = mlir::cast<TupleType>(signature.getVarargType());
     mlir::ArrayRef<mlir::Type> elems = tupleTy.getElementTypes();
     if (elems.size() != 1)
       return emitOpError(
@@ -276,7 +304,7 @@ LogicalResult FuncOp::verify() {
   }
 
   if (signature.hasKwarg()) {
-    DictType dictTy = dyn_cast<DictType>(signature.getKwargType());
+    DictType dictTy = mlir::dyn_cast<DictType>(signature.getKwargType());
     if (!dictTy)
       return emitOpError("kwarg parameter must be of type !py.dict");
     if (!isPyStrType(dictTy.getKeyType()) ||
@@ -287,21 +315,21 @@ LogicalResult FuncOp::verify() {
   mlir::ArrayRef<mlir::Type> positionalTypes = signature.getPositionalTypes();
   mlir::ArrayRef<mlir::Type> kwonlyTypes = signature.getKwOnlyTypes();
 
-  if (ArrayAttr argNames = getArgNamesAttr()) {
+  if (mlir::ArrayAttr argNames = getArgNamesAttr()) {
     if (argNames.size() != positionalTypes.size())
       return emitOpError(
           "arg_names length must match positional parameter count");
-    for (Attribute attr : argNames)
-      if (!isa<StringAttr>(attr))
+    for (mlir::Attribute attr : argNames)
+      if (!mlir::isa<mlir::StringAttr>(attr))
         return emitOpError("arg_names must contain only StringAttr elements");
   }
 
-  if (ArrayAttr kwonlyNames = getKwonlyNamesAttr()) {
+  if (mlir::ArrayAttr kwonlyNames = getKwonlyNamesAttr()) {
     if (kwonlyNames.size() != kwonlyTypes.size())
       return emitOpError(
           "kwonly_names length must match keyword-only parameters");
-    for (Attribute attr : kwonlyNames)
-      if (!isa<StringAttr>(attr))
+    for (mlir::Attribute attr : kwonlyNames)
+      if (!mlir::isa<mlir::StringAttr>(attr))
         return emitOpError(
             "kwonly_names must contain only StringAttr elements");
   } else if (!kwonlyTypes.empty()) {
@@ -309,22 +337,22 @@ LogicalResult FuncOp::verify() {
         "keyword-only parameters require kwonly_names attribute");
   }
 
-  SmallVector<Type, 4> closureTypes;
-  if (ArrayAttr closureTypesAttr = getClosureTypesAttr()) {
+  llvm::SmallVector<mlir::Type, 4> closureTypes;
+  if (mlir::ArrayAttr closureTypesAttr = getClosureTypesAttr()) {
     closureTypes.reserve(closureTypesAttr.size());
-    for (Attribute attr : closureTypesAttr) {
-      auto typeAttr = dyn_cast<TypeAttr>(attr);
+    for (mlir::Attribute attr : closureTypesAttr) {
+      auto typeAttr = mlir::dyn_cast<mlir::TypeAttr>(attr);
       if (!typeAttr)
         return emitOpError("closure_types must contain only TypeAttr elements");
       closureTypes.push_back(typeAttr.getValue());
     }
   }
 
-  Region &body = getBody();
+  mlir::Region &body = getBody();
   if (body.empty())
     return emitOpError("must have a body region");
 
-  Block &entry = body.front();
+  mlir::Block &entry = body.front();
   unsigned expectedArgs = positionalTypes.size() + kwonlyTypes.size();
   if (signature.hasVararg())
     ++expectedArgs;
@@ -337,13 +365,13 @@ LogicalResult FuncOp::verify() {
         "entry block argument count must match signature inputs");
 
   unsigned index = 0;
-  for (Type expected : positionalTypes) {
+  for (mlir::Type expected : positionalTypes) {
     if (entry.getArgument(index).getType() != expected)
       return emitOpError("entry block argument ")
              << index << " type does not match positional parameter";
     ++index;
   }
-  for (Type expected : kwonlyTypes) {
+  for (mlir::Type expected : kwonlyTypes) {
     if (entry.getArgument(index).getType() != expected)
       return emitOpError("entry block argument ")
              << index << " type does not match keyword-only parameter";
@@ -369,11 +397,11 @@ LogicalResult FuncOp::verify() {
 
   bool foundReturn = false;
   auto expectedResults = signature.getResultTypes();
-  for (Block &block : body) {
-    Operation *term = block.getTerminator();
+  for (mlir::Block &block : body) {
+    mlir::Operation *term = block.getTerminator();
     if (!term)
       continue;
-    if (auto ret = dyn_cast<ReturnOp>(term)) {
+    if (auto ret = mlir::dyn_cast<ReturnOp>(term)) {
       foundReturn = true;
       if (ret.getNumOperands() != expectedResults.size())
         return ret.emitOpError("result count mismatch with function signature");
@@ -384,7 +412,7 @@ LogicalResult FuncOp::verify() {
               "return operand type does not match function result type");
       continue;
     }
-    if (isa<RaiseOp, RaiseCurrentOp>(term)) {
+    if (mlir::isa<RaiseOp, RaiseCurrentOp>(term)) {
       foundReturn = true;
       continue;
     }
@@ -393,46 +421,46 @@ LogicalResult FuncOp::verify() {
   if (!foundReturn)
     return emitOpError("body must contain at least one py.return");
 
-  return success();
+  return mlir::success();
 }
 
-LogicalResult FuncObjectOp::verify() {
-  auto funcType = dyn_cast<FuncType>(getResult().getType());
+mlir::LogicalResult FuncObjectOp::verify() {
+  auto funcType = mlir::dyn_cast<FuncType>(getResult().getType());
   if (!funcType)
     return emitOpError("result must be of type !py.func");
 
-  Operation *symbol =
-      SymbolTable::lookupNearestSymbolFrom(getOperation(), getTargetAttr());
-  auto pyFunc = dyn_cast_or_null<FuncOp>(symbol);
+  mlir::Operation *symbol = mlir::SymbolTable::lookupNearestSymbolFrom(
+      getOperation(), getTargetAttr());
+  auto pyFunc = mlir::dyn_cast_or_null<FuncOp>(symbol);
   if (!pyFunc)
     return emitOpError("target must reference a py.func symbol");
 
   auto expectedSig =
-      cast<FuncSignatureType>(pyFunc.getFunctionTypeAttr().getValue());
+      mlir::cast<FuncSignatureType>(pyFunc.getFunctionTypeAttr().getValue());
   if (funcType.getSignature() != expectedSig)
     return emitOpError("result type signature must match referenced py.func");
 
-  return success();
+  return mlir::success();
 }
 
-LogicalResult MakeFunctionOp::verify() {
-  FuncType funcType = dyn_cast<FuncType>(getResult().getType());
+mlir::LogicalResult MakeFunctionOp::verify() {
+  FuncType funcType = mlir::dyn_cast<FuncType>(getResult().getType());
   if (!funcType)
     return emitOpError("result must be of type !py.func");
 
-  Operation *symbol =
-      SymbolTable::lookupNearestSymbolFrom(getOperation(), getTargetAttr());
-  FuncOp pyFunc = dyn_cast_or_null<FuncOp>(symbol);
+  mlir::Operation *symbol = mlir::SymbolTable::lookupNearestSymbolFrom(
+      getOperation(), getTargetAttr());
+  FuncOp pyFunc = mlir::dyn_cast_or_null<FuncOp>(symbol);
   if (!pyFunc)
     return emitOpError("target must reference a py.func symbol");
 
   FuncSignatureType expectedSig =
-      cast<FuncSignatureType>(pyFunc.getFunctionTypeAttr().getValue());
+      mlir::cast<FuncSignatureType>(pyFunc.getFunctionTypeAttr().getValue());
   if (expectedSig != funcType.getSignature())
     return emitOpError("result type signature must match referenced py.func");
 
-  if (Value defaults = getDefaults()) {
-    auto tupleTy = dyn_cast<TupleType>(defaults.getType());
+  if (mlir::Value defaults = getDefaults()) {
+    auto tupleTy = mlir::dyn_cast<TupleType>(defaults.getType());
     if (!tupleTy)
       return emitOpError("defaults must be a !py.tuple value");
     auto positionalTypes = expectedSig.getPositionalTypes();
@@ -442,15 +470,15 @@ LogicalResult MakeFunctionOp::verify() {
           "defaults length must not exceed positional parameter count");
     unsigned start = positionalTypes.size() - defaultTypes.size();
     for (auto [idx, elemType] : llvm::enumerate(defaultTypes)) {
-      Type expected = positionalTypes[start + idx];
+      mlir::Type expected = positionalTypes[start + idx];
       if (!isSubtypeOf(elemType, expected))
         return emitOpError("default value type does not match positional "
                            "parameter type");
     }
   }
 
-  if (Value kwdefaults = getKwdefaults()) {
-    auto dictTy = dyn_cast<DictType>(kwdefaults.getType());
+  if (mlir::Value kwdefaults = getKwdefaults()) {
+    auto dictTy = mlir::dyn_cast<DictType>(kwdefaults.getType());
     if (!dictTy)
       return emitOpError("kwdefaults must be a !py.dict value");
     if (!isSubtypeOf(dictTy.getKeyType(), StrType::get(getContext())))
@@ -465,45 +493,67 @@ LogicalResult MakeFunctionOp::verify() {
       return emitOpError("target keyword-only parameters must define "
                          "kwonly_names for kwdefaults verification");
 
-    llvm::StringMap<Type> expectedByName;
+    llvm::StringMap<mlir::Type> expectedByName;
     for (auto [nameAttr, type] : llvm::zip(kwonlyNames, kwonlyTypes)) {
-      auto strAttr = dyn_cast<StringAttr>(nameAttr);
+      auto strAttr = mlir::dyn_cast<mlir::StringAttr>(nameAttr);
       if (!strAttr)
         return emitOpError(
             "kwonly_names must contain only StringAttr elements");
       expectedByName[strAttr.getValue()] = type;
     }
 
-    SmallVector<DictInsertOp> inserts;
-    Value current = kwdefaults;
-    while (auto insert = current.getDefiningOp<DictInsertOp>()) {
-      inserts.push_back(insert);
-      current = insert.getDict();
+    llvm::SmallVector<DictInsertOp> inserts;
+    mlir::Value current = kwdefaults;
+    while (auto cast =
+               current.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+      if (cast->getNumOperands() != 1)
+        break;
+      current = cast.getOperand(0);
+    }
+    if (auto empty = current.getDefiningOp<DictEmptyOp>()) {
+      (void)empty;
+      for (mlir::Operation *user : current.getUsers()) {
+        auto insert = mlir::dyn_cast<DictInsertOp>(user);
+        if (!insert)
+          continue;
+        if (insert->getBlock() != getOperation()->getBlock())
+          return emitOpError("statically provided kwdefaults inserts must be "
+                             "in the same block as py.make_function");
+        if (!insert->isBeforeInBlock(getOperation()))
+          continue;
+        inserts.push_back(insert);
+      }
+      llvm::sort(inserts, [](DictInsertOp lhs, DictInsertOp rhs) {
+        return lhs->isBeforeInBlock(rhs);
+      });
     }
     if (!inserts.empty()) {
-      if (!current.getDefiningOp<DictEmptyOp>())
-        return emitOpError("statically provided kwdefaults must be built from "
-                           "py.dict.empty/py.dict.insert");
       llvm::StringSet<> seen;
-      auto stripStoredValueType = [](Value value) -> Type {
+      auto stripStoredValueType = [](mlir::Value value) -> mlir::Type {
         while (true) {
-          if (auto identity = value.getDefiningOp<CastIdentityOp>()) {
-            value = identity.getInput();
+          if (auto cast =
+                  value.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+            if (cast->getNumOperands() != 1)
+              return value.getType();
+            value = cast.getOperand(0);
             continue;
           }
           if (auto upcast = value.getDefiningOp<UpcastOp>()) {
+            if (mlir::isa<ListType, TupleType, DictType>(
+                    upcast.getInput().getType()))
+              return value.getType();
             value = upcast.getInput();
             continue;
           }
           return value.getType();
         }
       };
-      for (DictInsertOp insert : llvm::reverse(inserts)) {
+      for (DictInsertOp insert : inserts) {
         auto key = insert.getKey().getDefiningOp<StrConstantOp>();
         if (!key)
           return emitOpError("statically provided kwdefaults keys must be "
                              "py.str.constant values");
-        StringRef keyName = key.getValueAttr().getValue();
+        llvm::StringRef keyName = key.getValueAttr().getValue();
         auto it = expectedByName.find(keyName);
         if (it == expectedByName.end())
           return emitOpError("kwdefaults key '")
@@ -519,11 +569,11 @@ LogicalResult MakeFunctionOp::verify() {
     }
   }
 
-  SmallVector<Type, 4> closureTypes;
-  if (ArrayAttr closureTypesAttr = pyFunc.getClosureTypesAttr()) {
+  llvm::SmallVector<mlir::Type, 4> closureTypes;
+  if (mlir::ArrayAttr closureTypesAttr = pyFunc.getClosureTypesAttr()) {
     closureTypes.reserve(closureTypesAttr.size());
-    for (Attribute attr : closureTypesAttr) {
-      auto typeAttr = dyn_cast<TypeAttr>(attr);
+    for (mlir::Attribute attr : closureTypesAttr) {
+      auto typeAttr = mlir::dyn_cast<mlir::TypeAttr>(attr);
       if (!typeAttr)
         return emitOpError(
             "target closure_types must contain only TypeAttr elements");
@@ -531,8 +581,8 @@ LogicalResult MakeFunctionOp::verify() {
     }
   }
 
-  if (Value closure = getClosure()) {
-    auto tupleTy = dyn_cast<TupleType>(closure.getType());
+  if (mlir::Value closure = getClosure()) {
+    auto tupleTy = mlir::dyn_cast<TupleType>(closure.getType());
     if (!tupleTy)
       return emitOpError("closure must be a !py.tuple value");
     auto elems = tupleTy.getElementTypes();
@@ -548,46 +598,47 @@ LogicalResult MakeFunctionOp::verify() {
         "target requires closure operand matching closure_types");
   }
 
-  if (Value annotations = getAnnotations()) {
-    auto dictTy = dyn_cast<DictType>(annotations.getType());
+  if (mlir::Value annotations = getAnnotations()) {
+    auto dictTy = mlir::dyn_cast<DictType>(annotations.getType());
     if (!dictTy)
       return emitOpError("annotations must be a !py.dict value");
     if (!isSubtypeOf(dictTy.getKeyType(), StrType::get(getContext())))
       return emitOpError("annotations keys must be compatible with !py.str");
   }
 
-  if (Value module = getModule())
+  if (mlir::Value module = getModule())
     if (!isSubtypeOf(module.getType(), StrType::get(getContext())))
       return emitOpError("module metadata must be compatible with !py.str");
 
-  return success();
+  return mlir::success();
 }
 
-LogicalResult MakeNativeOp::verify() {
-  PrimFuncType primFuncTy = dyn_cast<PrimFuncType>(getResult().getType());
+mlir::LogicalResult MakeNativeOp::verify() {
+  PrimFuncType primFuncTy = mlir::dyn_cast<PrimFuncType>(getResult().getType());
   if (!primFuncTy)
     return emitOpError("result must be of type !py.prim.func");
 
-  Operation *symbol =
-      SymbolTable::lookupNearestSymbolFrom(getOperation(), getTargetAttr());
-  mlir::func::FuncOp funcOp = dyn_cast_or_null<mlir::func::FuncOp>(symbol);
+  mlir::Operation *symbol = mlir::SymbolTable::lookupNearestSymbolFrom(
+      getOperation(), getTargetAttr());
+  mlir::func::FuncOp funcOp =
+      mlir::dyn_cast_or_null<mlir::func::FuncOp>(symbol);
   if (!funcOp)
     return emitOpError("target must reference a func.func symbol");
 
-  FunctionType signature = funcOp.getFunctionType();
+  mlir::FunctionType signature = funcOp.getFunctionType();
   if (primFuncTy.getSignature() != signature)
     return emitOpError("result type signature must match referenced func.func");
 
-  for (Type type : signature.getInputs())
+  for (mlir::Type type : signature.getInputs())
     if (isPyType(type))
       return emitOpError("func.func arguments referenced by py.make_native "
                          "must not use !py.* types");
-  for (Type type : signature.getResults())
+  for (mlir::Type type : signature.getResults())
     if (isPyType(type))
       return emitOpError("func.func results referenced by py.make_native must "
                          "not use !py.* types");
 
-  return success();
+  return mlir::success();
 }
 
 } // namespace py

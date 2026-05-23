@@ -1,25 +1,25 @@
 #include "Optimizer/Utils.h"
 
-using namespace mlir;
-
 namespace py::optimizer {
 
 /// Clean up dead tuple operations whose only users are DecRefOps.
 /// When removing a TupleCreateOp, we must add DecRefs for its elements
 /// since the tuple's destructor would have handled them.
 /// Returns true if any operations were erased.
-bool cleanupDeadTuples(ModuleOp module) {
-  SmallVector<Operation *> toErase;
-  SmallVector<std::pair<TupleCreateOp, SmallVector<Operation *>>> tupleCreates;
+bool container::cleanupDead(mlir::ModuleOp module) {
+  llvm::SmallVector<mlir::Operation *> toErase;
+  llvm::SmallVector<
+      std::pair<TupleCreateOp, llvm::SmallVector<mlir::Operation *>>>
+      tupleCreates;
 
-  module.walk([&](Operation *tupleOp) {
-    if (auto tupleEmpty = dyn_cast<TupleEmptyOp>(tupleOp)) {
-      Value result = tupleEmpty->getResult(0);
-      SmallVector<Operation *> decrefsToErase;
+  module.walk([&](mlir::Operation *tupleOp) {
+    if (auto tupleEmpty = mlir::dyn_cast<TupleEmptyOp>(tupleOp)) {
+      mlir::Value result = tupleEmpty->getResult(0);
+      llvm::SmallVector<mlir::Operation *> decrefsToErase;
       bool canErase = true;
 
-      for (Operation *user : result.getUsers()) {
-        if (auto decref = dyn_cast<DecRefOp>(user)) {
+      for (mlir::Operation *user : result.getUsers()) {
+        if (auto decref = mlir::dyn_cast<DecRefOp>(user)) {
           decrefsToErase.push_back(decref);
         } else {
           canErase = false;
@@ -28,17 +28,19 @@ bool cleanupDeadTuples(ModuleOp module) {
       }
 
       if (canErase && !decrefsToErase.empty()) {
-        for (Operation *decref : decrefsToErase)
+        for (mlir::Operation *decref : decrefsToErase)
           toErase.push_back(decref);
         toErase.push_back(tupleOp);
       }
-    } else if (auto tupleCreate = dyn_cast<TupleCreateOp>(tupleOp)) {
-      Value result = tupleCreate->getResult(0);
-      SmallVector<Operation *> decrefsToErase;
+    } else if (auto tupleCreate = mlir::dyn_cast<TupleCreateOp>(tupleOp)) {
+      if (tupleCreate->hasAttr("ly.async.gather_tuple"))
+        return;
+      mlir::Value result = tupleCreate->getResult(0);
+      llvm::SmallVector<mlir::Operation *> decrefsToErase;
       bool canErase = true;
 
-      for (Operation *user : result.getUsers()) {
-        if (auto decref = dyn_cast<DecRefOp>(user)) {
+      for (mlir::Operation *user : result.getUsers()) {
+        if (auto decref = mlir::dyn_cast<DecRefOp>(user)) {
           decrefsToErase.push_back(decref);
         } else {
           canErase = false;
@@ -52,12 +54,13 @@ bool cleanupDeadTuples(ModuleOp module) {
   });
 
   for (auto &[tupleCreate, decrefs] : tupleCreates) {
-    SmallVector<Value> elements(tupleCreate.getElements());
-    llvm::SmallDenseSet<Value, 8> elementSet(elements.begin(), elements.end());
+    llvm::SmallVector<mlir::Value> elements(tupleCreate.getElements());
+    llvm::SmallDenseSet<mlir::Value, 8> elementSet(elements.begin(),
+                                                   elements.end());
 
-    for (Operation *prev = tupleCreate->getPrevNode(); prev;
+    for (mlir::Operation *prev = tupleCreate->getPrevNode(); prev;
          prev = prev->getPrevNode()) {
-      auto incref = dyn_cast<IncRefOp>(prev);
+      auto incref = mlir::dyn_cast<IncRefOp>(prev);
       if (!incref)
         break;
       if (elementSet.contains(incref.getObject()))
@@ -65,31 +68,32 @@ bool cleanupDeadTuples(ModuleOp module) {
     }
 
     if (!decrefs.empty() && !elements.empty()) {
-      OpBuilder builder(decrefs.front());
-      for (Value element : elements) {
-        Value root = stripIdentityCasts(element);
-        if (Operation *defOp = root.getDefiningOp())
-          if (isa<NoneOp, FuncObjectOp, TupleEmptyOp>(defOp))
+      mlir::OpBuilder builder(decrefs.front());
+      for (mlir::Value element : elements) {
+        mlir::Value root = value::stripCasts(element);
+        if (mlir::Operation *defOp = root.getDefiningOp())
+          if (mlir::isa<NoneOp, FuncObjectOp, TupleEmptyOp>(defOp))
             continue;
 
         bool hasOtherUsers = false;
-        for (Operation *user : element.getUsers()) {
+        for (mlir::Operation *user : element.getUsers()) {
           if (user == tupleCreate.getOperation())
             continue;
-          if (isa<CastIdentityOp>(user))
+          if (mlir::isa<mlir::UnrealizedConversionCastOp>(user))
             continue;
           hasOtherUsers = true;
           break;
         }
 
         if (!hasOtherUsers) {
-          if (auto arg = dyn_cast<BlockArgument>(root)) {
+          if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(root)) {
             auto *owner = arg.getOwner();
             auto *parent = owner ? owner->getParentOp() : nullptr;
-            if (auto pyFunc = dyn_cast_or_null<FuncOp>(parent))
+            if (auto pyFunc = mlir::dyn_cast_or_null<FuncOp>(parent))
               if (owner == &pyFunc.getBody().front())
                 continue;
-            if (auto loweredFunc = dyn_cast_or_null<func::FuncOp>(parent))
+            if (auto loweredFunc =
+                    mlir::dyn_cast_or_null<mlir::func::FuncOp>(parent))
               if (owner == &loweredFunc.getBody().front())
                 continue;
           }
@@ -98,20 +102,20 @@ bool cleanupDeadTuples(ModuleOp module) {
       }
     }
 
-    for (Operation *decref : decrefs)
+    for (mlir::Operation *decref : decrefs)
       toErase.push_back(decref);
     toErase.push_back(tupleCreate.getOperation());
   }
 
-  for (Operation *op : toErase)
+  for (mlir::Operation *op : toErase)
     op->erase();
 
   return !toErase.empty();
 }
 
 /// Remove unused TupleEmptyOps.
-void removeUnusedTupleEmpties(ModuleOp module) {
-  SmallVector<TupleEmptyOp> toErase;
+void container::removeEmptyTuples(mlir::ModuleOp module) {
+  llvm::SmallVector<TupleEmptyOp> toErase;
   module.walk([&](TupleEmptyOp op) {
     if (op.getResult().use_empty())
       toErase.push_back(op);
@@ -120,10 +124,10 @@ void removeUnusedTupleEmpties(ModuleOp module) {
     op->erase();
 }
 
-void runContainerPreLoweringOptimizations(ModuleOp module) {
-  cleanupDeadTuples(module);
-  removeUnusedTupleEmpties(module);
-  markConsumedListAppendValues(module);
+void pipeline::containerPre(mlir::ModuleOp module) {
+  container::cleanupDead(module);
+  container::removeEmptyTuples(module);
+  consume::listAppendValues(module);
 }
 
 } // namespace py::optimizer

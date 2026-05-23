@@ -5,7 +5,14 @@
 
 struct LyExceptionObject {
   LyObject ob_base;
+  LyObject *type;
   LyUnicodeObject *message;
+  LyObject *args;
+  LyObject *cause;
+  LyObject *context;
+  LyObject *traceback;
+  LyObject *location;
+  LyObject *extras;
 };
 
 LyTypeObject &LyException_Type();
@@ -25,3 +32,4 @@ void LyEH_ClearJump();
 }
 
 void LyException_Dealloc(LyObject *object);
+LyUnicodeObject *LyException_Repr(LyObject *object);

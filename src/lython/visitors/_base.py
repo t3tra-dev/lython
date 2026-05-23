@@ -60,14 +60,22 @@ class BaseVisitor(PrimitiveMixin):
         self._returned_function_info_stack: list[FunctionInfo | None] = []
         self._returned_callable_arg_index_stack: list[int | None] = []
         self._returned_function_info_valid_stack: list[bool] = []
+        self._callable_value_info: dict[int, FunctionInfo] = {}
         self._function_ast_stack: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
         self._return_type_stack: list[ir.Type] = []
+        self._async_function_stack: list[bool] = []
+        self._finally_return_stack: list[dict[str, Any]] = []
+        self._finally_return_stack_save: list[list[dict[str, Any]] | None] = []
+        self._exception_context_stack: list[ir.Value] = []
+        self._exception_context_stack_save: list[list[ir.Value] | None] = []
         self._nested_function_counter: int = 0
         self._current_method_mutates_self: bool = False
         # Primitive world support
         self._in_native_func: bool = False  # True when inside @native function
         self._native_gc_mode: str | None = None
         self._prim_types: dict[str, str] = {}  # Imported primitive types: name -> kind
+        self._static_modules: dict[str, str] = {}
+        self._static_module_symbols: dict[str, tuple[str, str]] = {}
         self._lyrt_builtins: set[str] = (
             set()
         )  # Imported lyrt builtins (native, to_prim, from_prim)
@@ -113,10 +121,18 @@ class BaseVisitor(PrimitiveMixin):
             visitor._returned_function_info_valid_stack = (
                 self._returned_function_info_valid_stack
             )
+            visitor._callable_value_info = self._callable_value_info
             visitor._function_ast_stack = self._function_ast_stack
             visitor._return_type_stack = self._return_type_stack
+            visitor._async_function_stack = self._async_function_stack
+            visitor._finally_return_stack = self._finally_return_stack
+            visitor._finally_return_stack_save = self._finally_return_stack_save
+            visitor._exception_context_stack = self._exception_context_stack
+            visitor._exception_context_stack_save = self._exception_context_stack_save
             visitor._nested_function_counter = self._nested_function_counter
             visitor._prim_types = self._prim_types
+            visitor._static_modules = self._static_modules
+            visitor._static_module_symbols = self._static_module_symbols
             visitor._lyrt_builtins = self._lyrt_builtins
             visitor._native_gc_mode = self._native_gc_mode
             visitor._prim_allocated = self._prim_allocated
@@ -124,7 +140,7 @@ class BaseVisitor(PrimitiveMixin):
             visitor._prim_alloc_sites = self._prim_alloc_sites
             visitor._prim_constants = self._prim_constants
 
-    # Note : _pending_prim_const is not shared - each visitor has its own
+    # Note: _pending_prim_const is not shared; each visitor has its own.
 
     def _ensure_mlir_dialect_aliases(self) -> None:
         sys.modules.setdefault("mlir.dialects.linalg", linalg_ops)
@@ -194,6 +210,16 @@ class BaseVisitor(PrimitiveMixin):
         self.current_block = block
         for visitor in self.subvisitors.values():
             visitor.current_block = block
+
+    def _set_finally_return_stack(self, stack: list[dict[str, Any]]) -> None:
+        self._finally_return_stack = stack
+        for visitor in self.subvisitors.values():
+            visitor._finally_return_stack = stack
+
+    def _set_exception_context_stack(self, stack: list[ir.Value]) -> None:
+        self._exception_context_stack = stack
+        for visitor in self.subvisitors.values():
+            visitor._exception_context_stack = stack
 
     def _set_func_effect(self, func: Any, maythrow: bool) -> None:
         if "nothrow" in func.attributes:
@@ -338,7 +364,10 @@ class BaseVisitor(PrimitiveMixin):
 
     def annotation_to_py_type(self, annotation: ast.expr | None) -> str:
         if annotation is None:
-            return "!py.object"
+            raise TypeError(
+                "Missing type annotation; Lython requires statically known "
+                "Python-level types before lowering"
+            )
         if isinstance(annotation, ast.Constant) and annotation.value is None:
             return "!py.none"
         if isinstance(annotation, ast.Name):
@@ -354,6 +383,24 @@ class BaseVisitor(PrimitiveMixin):
             if self.lookup_class(annotation.id) is not None:
                 return f'!py.class<"{annotation.id}">'
         if isinstance(annotation, ast.Subscript):
+            async_kind: str | None = None
+            if isinstance(annotation.value, ast.Name):
+                async_kind = annotation.value.id
+            elif (
+                isinstance(annotation.value, ast.Attribute)
+                and isinstance(annotation.value.value, ast.Name)
+                and self._static_modules.get(annotation.value.value.id) == "asyncio"
+            ):
+                async_kind = annotation.value.attr
+            async_mapping = {
+                "Coroutine": "!py.coro",
+                "Coro": "!py.coro",
+                "Task": "!py.task",
+                "Future": "!py.future",
+            }
+            if async_kind in async_mapping:
+                element_spec = self.annotation_to_py_type(annotation.slice)
+                return f"{async_mapping[async_kind]}<{element_spec}>"
             if (
                 isinstance(annotation.value, ast.Name)
                 and annotation.value.id == "Callable"
@@ -572,30 +619,31 @@ class BaseVisitor(PrimitiveMixin):
     ) -> ir.Value:
         if info is None:
             return value
-        with loc, self.insertion_point():
-            wrapped = py_ops.CastIdentityOp(value.type, value).result
-        op = self._value_operation(wrapped)
+        self._callable_value_info[id(value)] = info
+        op = self._value_operation(value)
         if op is None:
-            return wrapped
-        op.attributes["lython.returned_callable_symbol"] = ir.FlatSymbolRefAttr.get(
+            return value
+        op.attributes["ly.returned_callable_symbol"] = ir.FlatSymbolRefAttr.get(
             info.symbol, self.ctx
         )
-        op.attributes["lython.returned_callable_defaults_count"] = ir.IntegerAttr.get(
+        op.attributes["ly.returned_callable_defaults_count"] = ir.IntegerAttr.get(
             ir.IntegerType.get_signless(64, context=self.ctx),
             info.defaults_count,
         )
         if info.kwdefault_names:
-            op.attributes["lython.returned_callable_kwdefault_names"] = self.array_attr(
+            op.attributes["ly.returned_callable_kwdefault_names"] = self.array_attr(
                 [ir.StringAttr.get(name, self.ctx) for name in info.kwdefault_names],
             )
-        return wrapped
+        return value
 
     def array_attr(self, attributes: list[Any]) -> ir.ArrayAttr:
         return ir.ArrayAttr.get(  # pyright: ignore[reportUnknownMemberType]
             attributes, context=self.ctx
         )
 
-    # --- Scope management -------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Scope management
+    # -------------------------------------------------------------------------
     def push_scope(self) -> None:
         self._scope_stack.append({})
         self._function_scope_stack.append({})
@@ -659,6 +707,7 @@ class BaseVisitor(PrimitiveMixin):
         closure_capture_arg_indices: (
             tuple[int | None, ...] | list[int | None] | None
         ) = None,
+        is_async: bool = False,
     ) -> None:
         info = FunctionInfo(
             symbol or name,
@@ -681,6 +730,7 @@ class BaseVisitor(PrimitiveMixin):
             returned_callable_arg_index,
             closure,
             tuple(closure_capture_arg_indices or ()),
+            is_async,
         )
         self._functions[name] = info
 
@@ -764,25 +814,22 @@ class BaseVisitor(PrimitiveMixin):
 
         current = value
         while True:
+            info = self._callable_value_info.get(id(current))
+            if info is not None:
+                return info
+
             op = self._value_operation(current)
             if op is None:
                 return None
 
             op_name = str(getattr(op, "name", ""))
-            if op_name == "py.cast.identity":
-                operands = list(getattr(op, "operands", ()))
-                if operands:
-                    inner_info = self.resolve_function_info_from_value(operands[0])
-                    if inner_info is not None:
-                        return inner_info
-                attributes = getattr(op, "attributes", {})
-                returned_symbol_attr = (
-                    attributes["lython.returned_callable_symbol"]
-                    if "lython.returned_callable_symbol" in attributes
-                    else None
-                )
-                if returned_symbol_attr is None:
-                    return None
+            attributes = getattr(op, "attributes", {})
+            returned_symbol_attr = (
+                attributes["ly.returned_callable_symbol"]
+                if "ly.returned_callable_symbol" in attributes
+                else None
+            )
+            if returned_symbol_attr is not None:
                 symbol = str(returned_symbol_attr)
                 if symbol.startswith("@"):
                     symbol = symbol[1:]
@@ -797,7 +844,6 @@ class BaseVisitor(PrimitiveMixin):
                 current = operands[0]
                 continue
 
-            attributes = getattr(op, "attributes", {})
             if op_name in {"py.func.object", "py.make_function"}:
                 target_attr = attributes["target"] if "target" in attributes else None
                 if target_attr is None:
@@ -1036,17 +1082,6 @@ class BaseVisitor(PrimitiveMixin):
         self, value: ir.Value
     ) -> int | None:
         current = value
-        while True:
-            op = self._value_operation(current)
-            if op is None:
-                break
-            if str(getattr(op, "name", "")) != "py.cast.identity":
-                break
-            operands = list(getattr(op, "operands", ()))
-            if not operands:
-                break
-            current = operands[0]
-
         if hasattr(current, "arg_number"):
             try:
                 return int(getattr(current, "arg_number"))
@@ -1231,6 +1266,18 @@ class BaseVisitor(PrimitiveMixin):
             self._returned_function_info_valid_stack[-1] = False
 
     def push_function_ast(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        saved_finally_returns = (
+            self._finally_return_stack if self._finally_return_stack else None
+        )
+        self._finally_return_stack_save.append(saved_finally_returns)
+        if saved_finally_returns is not None:
+            self._set_finally_return_stack([])
+        saved_exception_context = (
+            self._exception_context_stack if self._exception_context_stack else None
+        )
+        self._exception_context_stack_save.append(saved_exception_context)
+        if saved_exception_context is not None:
+            self._set_exception_context_stack([])
         self._function_ast_stack.append(node)
         for visitor in self.subvisitors.values():
             visitor._function_ast_stack = self._function_ast_stack
@@ -1239,6 +1286,12 @@ class BaseVisitor(PrimitiveMixin):
         if not self._function_ast_stack:
             raise RuntimeError("Function AST stack underflow")
         node = self._function_ast_stack.pop()
+        saved_finally_returns = self._finally_return_stack_save.pop()
+        if saved_finally_returns is not None:
+            self._set_finally_return_stack(saved_finally_returns)
+        saved_exception_context = self._exception_context_stack_save.pop()
+        if saved_exception_context is not None:
+            self._set_exception_context_stack(saved_exception_context)
         for visitor in self.subvisitors.values():
             visitor._function_ast_stack = self._function_ast_stack
         return node
@@ -1265,6 +1318,42 @@ class BaseVisitor(PrimitiveMixin):
         if not self._return_type_stack:
             return None
         return self._return_type_stack[-1]
+
+    def push_async_function(self, is_async: bool) -> None:
+        self._async_function_stack.append(is_async)
+        for visitor in self.subvisitors.values():
+            visitor._async_function_stack = self._async_function_stack
+
+    def pop_async_function(self) -> bool:
+        if not self._async_function_stack:
+            raise RuntimeError("Async function stack underflow")
+        value = self._async_function_stack.pop()
+        for visitor in self.subvisitors.values():
+            visitor._async_function_stack = self._async_function_stack
+        return value
+
+    def in_async_function(self) -> bool:
+        return bool(self._async_function_stack and self._async_function_stack[-1])
+
+    def get_awaitable_payload_type(self, awaitable_type: ir.Type) -> ir.Type | None:
+        type_spec = str(awaitable_type)
+        for prefix in ("!py.coro<", "!py.task<", "!py.future<", "!async.value<"):
+            if type_spec.startswith(prefix) and type_spec.endswith(">"):
+                return self.get_py_type(type_spec[len(prefix) : -1])
+        return None
+
+    def push_exception_context(self, exception: ir.Value) -> None:
+        self._exception_context_stack.append(exception)
+
+    def pop_exception_context(self) -> ir.Value:
+        if not self._exception_context_stack:
+            raise RuntimeError("Exception context stack underflow")
+        return self._exception_context_stack.pop()
+
+    def current_exception_context(self) -> ir.Value | None:
+        if not self._exception_context_stack:
+            return None
+        return self._exception_context_stack[-1]
 
     def register_class(
         self,
@@ -1317,13 +1406,16 @@ class BaseVisitor(PrimitiveMixin):
         オブジェクト型と属性名から属性の型を推論する。
 
         クラス処理中は _pending_attributes を、それ以外は登録済みの ClassInfo を参照する。
-        型が不明な場合は !py.object を返す。
+        型が不明な場合は前段で拒否する。!py.object への暗黙 fallback は
+        後段の materialization を増やし、静的 field 解決を破壊する。
         """
         obj_type_str = str(obj_type)
 
         # Extract class name from type like !py.class<"Counter">
         if not (obj_type_str.startswith('!py.class<"') and obj_type_str.endswith('">')):
-            return self.get_py_type("!py.object")
+            raise TypeError(
+                f"Cannot statically resolve attribute '{attr_name}' on {obj_type}"
+            )
 
         class_name = obj_type_str[len('!py.class<"') : -len('">')]  # noqa
 
@@ -1338,7 +1430,7 @@ class BaseVisitor(PrimitiveMixin):
         if class_info is not None and attr_name in class_info.attributes:
             return class_info.attributes[attr_name]
 
-        return self.get_py_type("!py.object")
+        raise TypeError(f"Unknown field '{attr_name}' for static class '{class_name}'")
 
     def resolve_static_expression_type(self, expr: ast.expr) -> ir.Type | None:
         if isinstance(expr, ast.Name):
@@ -1415,6 +1507,10 @@ class BaseVisitor(PrimitiveMixin):
             "py.raise",
             "py.raise.current",
             "py.invoke",
+            "py.try.yield",
+            "py.except.yield",
+            "py.finally.yield",
+            "async.return",
             "func.return",
             "cf.br",
             "cf.cond_br",
@@ -1434,6 +1530,10 @@ class BaseVisitor(PrimitiveMixin):
             "py.raise",
             "py.raise.current",
             "py.invoke",
+            "py.try.yield",
+            "py.except.yield",
+            "py.finally.yield",
+            "async.return",
             "func.return",
             "cf.br",
             "cf.cond_br",

@@ -123,10 +123,23 @@ class ExprCallMethodsMixin:
                     py_ops.ListRemoveOp(obj, value)
                 return py_ops.NoneOp(self.get_py_type("!py.none")).result
 
+        obj_type_str = str(obj.type)
+        if obj_type_str.startswith("!py.task<"):
+            if method_name != "cancel":
+                raise NotImplementedError(
+                    f"Task method '{method_name}' is not supported"
+                )
+            if node.keywords:
+                raise NotImplementedError(
+                    "Keyword arguments for task.cancel() are not supported"
+                )
+            if arg_values:
+                raise ValueError("task.cancel() expects no arguments")
+            with loc, self.insertion_point():
+                return py_ops.TaskCancelOp(self.get_py_type("!py.bool"), obj).accepted
+
         # For now, we need to determine the class from the object type
         # This is a simplified implementation
-        obj_type = obj.type
-        obj_type_str = str(obj_type)
 
         # Extract class name from type like !py.class<"Counter">
         if obj_type_str.startswith('!py.class<"') and obj_type_str.endswith('">'):

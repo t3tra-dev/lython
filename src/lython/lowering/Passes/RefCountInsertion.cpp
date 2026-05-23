@@ -1,6 +1,8 @@
 #include "Common/RuntimeSupport.h"
+#include "Passes/OwnershipAnalysis.h"
 
 #include "mlir/Analysis/Liveness.h"
+#include "mlir/Dialect/Async/IR/Async.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/IR/Dominance.h"
 #include "llvm/ADT/DenseMap.h"
@@ -16,265 +18,225 @@
 
 #define DEBUG_TYPE "py-refcount-insertion"
 
-using namespace mlir;
-
 namespace py {
 namespace {
 
-static bool needsRefCount(Type type) {
-  if (isa<FuncSignatureType>(type) || isa<PrimFuncType>(type))
-    return false;
-  return isPyType(type);
-}
-
-static bool isImmortal(Operation *op) {
-  // None is a singleton
-  if (isa<NoneOp>(op))
-    return true;
-  // TODO: Handle dynamically created closures differently
-  if (isa<FuncObjectOp>(op))
-    return true;
-  // Empty tuple is compiler-owned memref metadata.
-  if (isa<TupleEmptyOp>(op))
-    return true;
-  return false;
-}
-
-static bool isIdentityTransform(Operation *op) {
-  return isa<UpcastOp, CastIdentityOp>(op);
-}
-
-static bool createsNewRef(Operation *op) {
-  if (isImmortal(op))
-    return false;
-
-  if (isIdentityTransform(op))
-    return false;
-
-  if (isa<TupleCreateOp, TupleEmptyOp, DictEmptyOp, DictInsertOp, StrConstantOp,
-          IntConstantOp, FloatConstantOp, NumAddOp, NumSubOp, NumLeOp,
-          MakeFunctionOp, CastFromPrimOp, ClassNewOp, ClassPromoteOp, PublishOp,
-          ListNewOp, ListGetOp, AttrGetOp>(op))
-    return true;
-
-  if (isa<CallOp, CallVectorOp, NativeCallOp>(op))
-    return true;
-
-  return false;
-}
-
-static bool doesConsumeOperand(Operation *op, Value operand) {
-  if (isa<ReturnOp>(op))
-    return true;
-
-  if (isa<RaiseOp>(op))
-    return true;
-
-  if (isa<TupleCreateOp>(op))
-    return true;
-
-  return false;
-}
-
-static LogicalResult insertDecRefOnSuccessorEdge(OpBuilder &builder,
-                                                 Value value,
-                                                 Operation *terminator,
-                                                 unsigned successorIndex) {
-  Block *source = terminator->getBlock();
-  Block *successor = terminator->getSuccessor(successorIndex);
+static mlir::LogicalResult
+insertDecRefOnSuccessorEdge(mlir::OpBuilder &builder, mlir::Value value,
+                            mlir::Operation *terminator,
+                            unsigned successorIndex) {
+  mlir::Block *source = terminator->getBlock();
+  mlir::Block *successor = terminator->getSuccessor(successorIndex);
 
   if (successor->getUniquePredecessor() == source) {
     builder.setInsertionPointToStart(successor);
     builder.create<DecRefOp>(value.getLoc(), value);
-    return success();
+    return mlir::success();
   }
 
-  Block *refCountBlock = new Block();
-  for (BlockArgument arg : successor->getArguments())
+  mlir::Block *refCountBlock = new mlir::Block();
+  for (mlir::BlockArgument arg : successor->getArguments())
     refCountBlock->addArgument(arg.getType(), arg.getLoc());
   refCountBlock->insertBefore(successor);
 
   builder.setInsertionPointToStart(refCountBlock);
   builder.create<DecRefOp>(value.getLoc(), value);
-  builder.create<cf::BranchOp>(value.getLoc(), successor,
-                               refCountBlock->getArguments());
+  builder.create<mlir::cf::BranchOp>(value.getLoc(), successor,
+                                     refCountBlock->getArguments());
   terminator->setSuccessor(refCountBlock, successorIndex);
-  return success();
+  return mlir::success();
 }
 
-class AliasAnalysis {
-public:
-  AliasAnalysis(FuncOp func) {
-    func.walk([&](Operation *op) {
-      for (Value result : op->getResults()) {
-        parent[result] = result;
-      }
-      for (Value operand : op->getOperands()) {
-        if (!parent.count(operand))
-          parent[operand] = operand;
-      }
-    });
+using AliasAnalysis = OwnershipAliasAnalysis;
 
-    for (Block &block : func.getBody()) {
-      for (BlockArgument arg : block.getArguments()) {
-        parent[arg] = arg;
-      }
-    }
-
-    func.walk([&](Operation *op) {
-      if (!isIdentityTransform(op))
-        return;
-
-      Value input = op->getOperand(0);
-      Value output = op->getResult(0);
-      unionSets(input, output);
-    });
-
-    for (auto &kv : parent) {
-      Value root = find(kv.first);
-      members[root].push_back(kv.first);
-    }
+static bool hasImmortalProducer(mlir::Value root,
+                                const AliasAnalysis &aliases) {
+  llvm::SmallVector<mlir::Value, 4> aliasSet;
+  aliases.collectAliases(root, aliasSet);
+  for (mlir::Value member : aliasSet) {
+    mlir::Operation *def = member.getDefiningOp();
+    if (def && isPyOwnershipImmortalOp(def))
+      return true;
   }
-
-  Value getRoot(Value v) const { return find(v); }
-
-  void collectAliases(Value v, llvm::SmallVectorImpl<Value> &aliases) const {
-    Value root = find(v);
-    auto it = members.find(root);
-    if (it != members.end()) {
-      aliases.append(it->second.begin(), it->second.end());
-    } else {
-      aliases.push_back(v);
-    }
-  }
-
-private:
-  Value find(Value v) const {
-    auto it = parent.find(v);
-    if (it == parent.end())
-      return v;
-    if (it->second == v)
-      return v;
-    Value root = find(it->second);
-    parent[v] = root;
-    return root;
-  }
-
-  void unionSets(Value a, Value b) {
-    Value rootA = find(a);
-    Value rootB = find(b);
-    if (rootA != rootB) {
-      parent[rootB] = rootA;
-    }
-  }
-
-  mutable llvm::DenseMap<Value, Value> parent;
-  llvm::DenseMap<Value, llvm::SmallVector<Value, 4>> members;
-};
+  return false;
+}
 
 struct RefCountInsertionPass
-    : public PassWrapper<RefCountInsertionPass, OperationPass<ModuleOp>> {
+    : public mlir::PassWrapper<RefCountInsertionPass,
+                               mlir::OperationPass<mlir::ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RefCountInsertionPass)
 
   void runOnOperation() override {
-    ModuleOp module = getOperation();
+    mlir::ModuleOp module = getOperation();
 
     module.walk([&](FuncOp func) {
-      if (failed(processFunction(func)))
+      if (mlir::failed(processFunctionLike(func.getOperation(), func.getBody(),
+                                           /*entryArgsBorrowed=*/true)))
+        signalPassFailure();
+    });
+    module.walk([&](mlir::async::FuncOp func) {
+      if (mlir::failed(processFunctionLike(func.getOperation(), func.getBody(),
+                                           /*entryArgsBorrowed=*/true)))
         signalPassFailure();
     });
   }
 
 private:
-  LogicalResult processFunction(FuncOp func) {
-    if (func.getBody().empty())
-      return success();
+  mlir::LogicalResult processFunctionLike(mlir::Operation *funcLike,
+                                          mlir::Region &body,
+                                          bool entryArgsBorrowed) {
+    if (body.empty())
+      return mlir::success();
 
-    AliasAnalysis aliases(func);
-    Liveness liveness(func);
-    llvm::DenseSet<Value> processedRoots;
+    AliasAnalysis aliases(body, isPyOwnershipTrackedType,
+                          isPyOwnershipIdentityTransform);
+    mlir::Liveness liveness(funcLike);
+    llvm::DenseSet<mlir::Value> processedRoots;
 
-    // Skip function entry block arguments - they are borrowed references
-    // and should not be decremented by the callee. The caller owns them.
-    Block &entryBlock = func.getBody().front();
-    for (BlockArgument arg : entryBlock.getArguments()) {
-      if (needsRefCount(arg.getType())) {
-        Value root = aliases.getRoot(arg);
+    auto processOwnedRoot = [&](mlir::Value root) -> mlir::LogicalResult {
+      if (hasImmortalProducer(root, aliases))
+        return mlir::success();
+      if (processedRoots.insert(root).second)
+        return addRefCountingForAliasSet(root, aliases, liveness);
+      return mlir::success();
+    };
+
+    // Function entry block arguments are borrowed references and must not be
+    // decremented by the callee. Exception/try region entry arguments are
+    // ownership transfers and are handled by the same affine token model as
+    // ordinary owned producers.
+    mlir::Block &entryBlock = body.front();
+    for (mlir::BlockArgument arg : entryBlock.getArguments()) {
+      if (!isPyOwnershipTrackedType(arg.getType()))
+        continue;
+      mlir::Value root = aliases.getRoot(arg);
+      if (entryArgsBorrowed) {
+        if (hasImmortalProducer(root, aliases))
+          continue;
         processedRoots.insert(root);
+        addRetainsForBorrowedConsumes(root, aliases);
+        continue;
       }
+      if (mlir::failed(processOwnedRoot(root)))
+        return mlir::failure();
     }
 
-    for (Block &block : func.getBody()) {
-      // Skip entry block args since they're borrowed refs (handled above)
+    for (mlir::Block &block : body) {
+      // Skip entry block args since they were handled above according to the
+      // region entry ownership convention.
       if (&block == &entryBlock)
         continue;
 
-      for (BlockArgument arg : block.getArguments()) {
-        if (!needsRefCount(arg.getType()))
+      for (mlir::BlockArgument arg : block.getArguments()) {
+        if (!isPyOwnershipTrackedType(arg.getType()))
           continue;
 
-        Value root = aliases.getRoot(arg);
-        if (processedRoots.insert(root).second) {
-          if (failed(addRefCountingForAliasSet(root, aliases, liveness)))
-            return failure();
+        mlir::Value root = aliases.getRoot(arg);
+        if (mlir::failed(processOwnedRoot(root)))
+          return mlir::failure();
+      }
+    }
+
+    for (mlir::Block &block : body) {
+      for (mlir::Operation &operation : block) {
+        mlir::Operation *op = &operation;
+        if (!createsPyOwnedResult(op))
+          continue;
+
+        for (mlir::Value result : op->getResults()) {
+          if (!isPyOwnershipTrackedType(result.getType()))
+            continue;
+
+          mlir::Value root = aliases.getRoot(result);
+          if (mlir::failed(processOwnedRoot(root)))
+            return mlir::failure();
         }
       }
     }
 
-    func.walk([&](Operation *op) {
-      if (!createsNewRef(op))
-        return;
-
-      for (Value result : op->getResults()) {
-        if (!needsRefCount(result.getType()))
+    for (mlir::Block &block : body) {
+      for (mlir::Operation &operation : block) {
+        auto tryOp = mlir::dyn_cast<TryOp>(operation);
+        if (!tryOp)
           continue;
-
-        Value root = aliases.getRoot(result);
-        if (processedRoots.insert(root).second) {
-          if (failed(addRefCountingForAliasSet(root, aliases, liveness)))
-            signalPassFailure();
+        for (mlir::Region &region : tryOp->getRegions()) {
+          if (mlir::failed(processFunctionLike(tryOp.getOperation(), region,
+                                               /*entryArgsBorrowed=*/false)))
+            return mlir::failure();
         }
       }
-    });
+    }
 
-    return success();
+    return mlir::success();
   }
 
-  LogicalResult addRefCountingForAliasSet(Value root, AliasAnalysis &aliases,
-                                          Liveness &liveness) {
-    OpBuilder builder(root.getContext());
+  void addRetainsForBorrowedConsumes(mlir::Value root, AliasAnalysis &aliases) {
+    mlir::OpBuilder builder(root.getContext());
 
-    llvm::SmallVector<Value, 4> aliasSet;
+    llvm::SmallVector<mlir::Value, 4> aliasSet;
     aliases.collectAliases(root, aliasSet);
 
-    llvm::SmallPtrSet<Operation *, 8> allUsers;
-    for (Value alias : aliasSet) {
-      for (Operation *user : alias.getUsers()) {
-        if (!isIdentityTransform(user))
+    for (mlir::Value alias : aliasSet) {
+      for (mlir::OpOperand &use : alias.getUses()) {
+        mlir::Operation *user = use.getOwner();
+        if (isPyOwnershipIdentityTransform(user))
+          continue;
+        if (!consumesPyOwnedOperand(user, alias))
+          continue;
+
+        builder.setInsertionPoint(user);
+        builder.create<IncRefOp>(alias.getLoc(), alias);
+      }
+    }
+  }
+
+  mlir::LogicalResult addRefCountingForAliasSet(mlir::Value root,
+                                                AliasAnalysis &aliases,
+                                                mlir::Liveness &liveness) {
+    mlir::OpBuilder builder(root.getContext());
+
+    llvm::SmallVector<mlir::Value, 4> aliasSet;
+    aliases.collectAliases(root, aliasSet);
+
+    llvm::SmallPtrSet<mlir::Operation *, 8> allUsers;
+    llvm::DenseMap<mlir::Operation *, llvm::SmallVector<mlir::Value, 4>>
+        consumingOperandsByUser;
+    for (mlir::Value alias : aliasSet) {
+      for (mlir::Operation *user : alias.getUsers()) {
+        if (!isPyOwnershipIdentityTransform(user))
           allUsers.insert(user);
+      }
+      for (mlir::OpOperand &use : alias.getUses()) {
+        mlir::Operation *user = use.getOwner();
+        if (isPyOwnershipIdentityTransform(user))
+          continue;
+        if (!consumesPyOwnedOperand(user, alias))
+          continue;
+        consumingOperandsByUser[user].push_back(alias);
       }
     }
 
     if (allUsers.empty()) {
-      if (Operation *defOp = root.getDefiningOp()) {
+      if (mlir::Operation *defOp = root.getDefiningOp()) {
         builder.setInsertionPointAfter(defOp);
       } else {
         builder.setInsertionPointToStart(root.getParentBlock());
       }
       builder.create<DecRefOp>(root.getLoc(), root);
-      return success();
+      return mlir::success();
     }
 
-    Region *definingRegion = root.getParentRegion();
+    mlir::Region *definingRegion = root.getParentRegion();
 
-    llvm::DenseMap<Block *, Operation *> lastUserInBlock;
-    for (Operation *user : allUsers) {
-      Block *userBlock = user->getBlock();
-      Block *ancestor = definingRegion->findAncestorBlockInRegion(*userBlock);
+    llvm::DenseMap<mlir::Block *, mlir::Operation *> lastUserInBlock;
+    for (mlir::Operation *user : allUsers) {
+      mlir::Block *userBlock = user->getBlock();
+      mlir::Block *ancestor =
+          definingRegion->findAncestorBlockInRegion(*userBlock);
       if (!ancestor)
         continue;
 
-      Operation *ancestorOp = ancestor->findAncestorOpInBlock(*user);
+      mlir::Operation *ancestorOp = ancestor->findAncestorOpInBlock(*user);
       if (!ancestorOp)
         continue;
 
@@ -286,12 +248,13 @@ private:
     }
 
     for (auto &[block, lastUser] : lastUserInBlock) {
-      const LivenessBlockInfo *blockLiveness = liveness.getLiveness(block);
+      const mlir::LivenessBlockInfo *blockLiveness =
+          liveness.getLiveness(block);
       if (!blockLiveness)
         continue;
 
       bool anyLiveOut = false;
-      for (Value alias : aliasSet) {
+      for (mlir::Value alias : aliasSet) {
         if (blockLiveness->isLiveOut(alias)) {
           anyLiveOut = true;
           break;
@@ -299,11 +262,11 @@ private:
       }
 
       if (anyLiveOut)
-        continue; // Value doesn't die in this block
+        continue; // mlir::Value doesn't die in this block
 
-      Value usedAlias = root;
-      for (Value alias : aliasSet) {
-        for (Value operand : lastUser->getOperands()) {
+      mlir::Value usedAlias = root;
+      for (mlir::Value alias : aliasSet) {
+        for (mlir::Value operand : lastUser->getOperands()) {
           if (operand == alias) {
             usedAlias = alias;
             break;
@@ -312,7 +275,7 @@ private:
       }
 
       // Apply Affine SSA rules
-      if (doesConsumeOperand(lastUser, usedAlias)) {
+      if (consumesPyOwnedOperand(lastUser, usedAlias)) {
         // Last use + Consume = Move Semantics (no action needed)
       } else {
         // Last use + Borrow = Need to drop after use
@@ -321,32 +284,32 @@ private:
           builder.create<DecRefOp>(root.getLoc(), usedAlias);
         } else {
           for (unsigned i = 0; i < lastUser->getNumSuccessors(); ++i) {
-            if (failed(insertDecRefOnSuccessorEdge(builder, usedAlias, lastUser,
-                                                   i)))
-              return failure();
+            if (mlir::failed(insertDecRefOnSuccessorEdge(builder, usedAlias,
+                                                         lastUser, i)))
+              return mlir::failure();
           }
         }
       }
     }
 
-    for (Value alias : aliasSet) {
-      for (OpOperand &use : alias.getUses()) {
-        Operation *user = use.getOwner();
+    for (mlir::Value alias : aliasSet) {
+      for (mlir::OpOperand &use : alias.getUses()) {
+        mlir::Operation *user = use.getOwner();
 
-        if (isIdentityTransform(user))
+        if (isPyOwnershipIdentityTransform(user))
           continue;
 
-        if (!doesConsumeOperand(user, alias))
+        if (!consumesPyOwnedOperand(user, alias))
           continue;
 
-        Block *userBlock = user->getBlock();
-        const LivenessBlockInfo *blockLiveness =
+        mlir::Block *userBlock = user->getBlock();
+        const mlir::LivenessBlockInfo *blockLiveness =
             liveness.getLiveness(userBlock);
         if (!blockLiveness)
           continue;
 
         bool anyLiveOut = false;
-        for (Value a : aliasSet) {
+        for (mlir::Value a : aliasSet) {
           if (blockLiveness->isLiveOut(a)) {
             anyLiveOut = true;
             break;
@@ -363,29 +326,63 @@ private:
       }
     }
 
-    if (failed(addDropRefInDivergentSuccessors(root, aliasSet, liveness)))
-      return failure();
+    for (auto &[user, consumedOperands] : consumingOperandsByUser) {
+      if (consumedOperands.size() <= 1)
+        continue;
 
-    return success();
-  }
-
-  LogicalResult addDropRefInDivergentSuccessors(Value root,
-                                                llvm::ArrayRef<Value> aliasSet,
-                                                Liveness &liveness) {
-    using BlockSet = llvm::SmallPtrSet<Block *, 4>;
-    OpBuilder builder(root.getContext());
-
-    Region *definingRegion = root.getParentRegion();
-
-    llvm::SmallDenseMap<Block *, BlockSet> divergentBlocks;
-
-    for (Block &block : definingRegion->getBlocks()) {
-      const LivenessBlockInfo *blockLiveness = liveness.getLiveness(&block);
+      mlir::Block *userBlock = user->getBlock();
+      const mlir::LivenessBlockInfo *blockLiveness =
+          liveness.getLiveness(userBlock);
       if (!blockLiveness)
         continue;
 
       bool anyLiveOut = false;
-      for (Value alias : aliasSet) {
+      for (mlir::Value alias : aliasSet) {
+        if (blockLiveness->isLiveOut(alias)) {
+          anyLiveOut = true;
+          break;
+        }
+      }
+
+      bool isLastInBlock = lastUserInBlock.count(userBlock) &&
+                           lastUserInBlock[userBlock] == user;
+      if (anyLiveOut || !isLastInBlock)
+        continue;
+
+      // The last consuming operation may move the existing token once. Any
+      // additional consuming occurrence of the same ownership root needs a
+      // matching retain so the affine token count remains non-negative.
+      builder.setInsertionPoint(user);
+      for (size_t i = 1, e = consumedOperands.size(); i < e; ++i)
+        builder.create<IncRefOp>(consumedOperands[i].getLoc(),
+                                 consumedOperands[i]);
+    }
+
+    if (mlir::failed(addDropRefInDivergentSuccessors(root, aliasSet, liveness)))
+      return mlir::failure();
+
+    return mlir::success();
+  }
+
+  mlir::LogicalResult
+  addDropRefInDivergentSuccessors(mlir::Value root,
+                                  llvm::ArrayRef<mlir::Value> aliasSet,
+                                  mlir::Liveness &liveness) {
+    using BlockSet = llvm::SmallPtrSet<mlir::Block *, 4>;
+    mlir::OpBuilder builder(root.getContext());
+
+    mlir::Region *definingRegion = root.getParentRegion();
+
+    llvm::SmallDenseMap<mlir::Block *, BlockSet> divergentBlocks;
+
+    for (mlir::Block &block : definingRegion->getBlocks()) {
+      const mlir::LivenessBlockInfo *blockLiveness =
+          liveness.getLiveness(&block);
+      if (!blockLiveness)
+        continue;
+
+      bool anyLiveOut = false;
+      for (mlir::Value alias : aliasSet) {
         if (blockLiveness->isLiveOut(alias)) {
           anyLiveOut = true;
           break;
@@ -397,11 +394,12 @@ private:
       BlockSet liveInSuccessors;
       BlockSet noLiveInSuccessors;
 
-      for (Block *succ : block.getSuccessors()) {
-        const LivenessBlockInfo *succLiveness = liveness.getLiveness(succ);
+      for (mlir::Block *succ : block.getSuccessors()) {
+        const mlir::LivenessBlockInfo *succLiveness =
+            liveness.getLiveness(succ);
         bool anyLiveIn = false;
         if (succLiveness) {
-          for (Value alias : aliasSet) {
+          for (mlir::Value alias : aliasSet) {
             if (succLiveness->isLiveIn(alias)) {
               anyLiveIn = true;
               break;
@@ -420,25 +418,27 @@ private:
     }
 
     for (auto &[block, noLiveSuccessors] : divergentBlocks) {
-      Operation *terminator = block->getTerminator();
+      mlir::Operation *terminator = block->getTerminator();
 
-      for (Block *successor : noLiveSuccessors) {
+      for (mlir::Block *successor : noLiveSuccessors) {
         for (unsigned i = 0; i < terminator->getNumSuccessors(); ++i) {
           if (terminator->getSuccessor(i) != successor)
             continue;
-          if (failed(insertDecRefOnSuccessorEdge(builder, root, terminator, i)))
-            return failure();
+          if (mlir::failed(
+                  insertDecRefOnSuccessorEdge(builder, root, terminator, i)))
+            return mlir::failure();
         }
       }
     }
 
-    return success();
+    return mlir::success();
   }
 };
 
 } // namespace
 
-std::unique_ptr<OperationPass<ModuleOp>> createRefCountInsertionPass() {
+std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
+createRefCountInsertionPass() {
   return std::make_unique<RefCountInsertionPass>();
 }
 

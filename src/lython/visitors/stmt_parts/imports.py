@@ -10,10 +10,23 @@ class StmtImportMixin:
     """Statement lowering for import-related AST nodes."""
 
     def visit_Import(self, node: ast.Import) -> None:
-        raise NotImplementedError("Import statement not implemented")
+        for alias in node.names:
+            if alias.name == "asyncio":
+                self._static_modules[alias.asname or alias.name] = "asyncio"
+                continue
+            raise NotImplementedError(f"Import '{alias.name}' not implemented")
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         module = node.module
+
+        if module == "asyncio":
+            supported = {"run", "create_task", "gather", "sleep"}
+            for alias in node.names:
+                name = alias.name
+                if name not in supported:
+                    raise NotImplementedError(f"Unknown asyncio import: {name}")
+                self._static_module_symbols[alias.asname or name] = ("asyncio", name)
+            return
 
         if module == "lyrt":
             for alias in node.names:

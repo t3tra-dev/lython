@@ -20,36 +20,42 @@ def Py_Dialect : Dialect {
 }
 
 // Basic type predicates.
-def Py_IntType     : Type<CPred<"::py::isPyIntType($_self)">,     "py.int">;
-def Py_FloatType   : Type<CPred<"::py::isPyFloatType($_self)">,   "py.float">;
-def Py_BoolType    : Type<CPred<"::py::isPyBoolType($_self)">,    "py.bool">;
-def Py_StrType     : Type<CPred<"::py::isPyStrType($_self)">,     "py.str">;
-def Py_ObjectType  : Type<CPred<"::py::isPyObjectType($_self)">,  "py.object">;
-def Py_NoneType    : Type<CPred<"::py::isPyNoneType($_self)">,    "py.none">;
-def Py_TupleType   : Type<CPred<"::py::isPyTupleType($_self)">,   "py.tuple">;
-def Py_DictType    : Type<CPred<"::py::isPyDictType($_self)">,    "py.dict">;
-def Py_ListType    : Type<CPred<"::py::isPyListType($_self)">,    "py.list">;
-def Py_ClassType   : Type<CPred<"::py::isPyClassType($_self)">,   "py.class">;
-def Py_ExceptionType : Type<CPred<"::py::isPyExceptionType($_self)">, "py.exception">;
-def Py_TracebackType : Type<CPred<"::py::isPyTracebackType($_self)">, "py.traceback">;
-def Py_LocationType  : Type<CPred<"::py::isPyLocationType($_self)">,  "py.location">;
-def Py_FuncType    : Type<CPred<"::py::isPyFuncType($_self)">,    "py.func">;
+def Py_IntType : Type<CPred<"::py::isPyIntType($_self)">, "py.int">;
+def Py_FloatType : Type<CPred<"::py::isPyFloatType($_self)">, "py.float">;
+def Py_BoolType : Type<CPred<"::py::isPyBoolType($_self)">, "py.bool">;
+def Py_StrType : Type<CPred<"::py::isPyStrType($_self)">, "py.str">;
+def Py_ObjectType : Type<CPred<"::py::isPyObjectType($_self)">, "py.object">;
+def Py_NoneType : Type<CPred<"::py::isPyNoneType($_self)">, "py.none">;
+def Py_TupleType : Type<CPred<"::py::isPyTupleType($_self)">, "py.tuple">;
+def Py_DictType : Type<CPred<"::py::isPyDictType($_self)">, "py.dict">;
+def Py_ListType : Type<CPred<"::py::isPyListType($_self)">, "py.list">;
+def Py_ClassType : Type<CPred<"::py::isPyClassType($_self)">, "py.class">;
+def Py_ExceptionType
+    : Type<CPred<"::py::isPyExceptionType($_self)">, "py.exception">;
+def Py_TracebackType
+    : Type<CPred<"::py::isPyTracebackType($_self)">, "py.traceback">;
+def Py_LocationType
+    : Type<CPred<"::py::isPyLocationType($_self)">, "py.location">;
+def Py_FuncType : Type<CPred<"::py::isPyFuncType($_self)">, "py.func">;
 def Py_FuncSigType : Type<CPred<"::py::isPyFuncSigType($_self)">, "py.funcsig">;
-def Py_PrimFuncType: Type<CPred<"::py::isPyPrimFuncType($_self)">,"py.prim.func">;
-def Py_CallableType: Type<CPred<"::py::isCallableType($_self)">,  "callable">;
+def Py_PrimFuncType
+    : Type<CPred<"::py::isPyPrimFuncType($_self)">, "py.prim.func">;
+def Py_CallableType : Type<CPred<"::py::isCallableType($_self)">, "callable">;
+def Py_CoroType : Type<CPred<"::py::isPyCoroutineType($_self)">, "py.coro">;
+def Py_TaskType : Type<CPred<"::py::isPyTaskType($_self)">, "py.task">;
+def Py_FutureType : Type<CPred<"::py::isPyFutureType($_self)">, "py.future">;
+def Py_AwaitableType
+    : Type<CPred<"::py::isAwaitableType($_self)">, "awaitable">;
 
-class Py_Op<string mnemonic, list<Trait> traits = []> :
-    Op<Py_Dialect, mnemonic, traits>;
+class Py_Op<string mnemonic, list<Trait> traits = []>
+    : Op<Py_Dialect, mnemonic, traits>;
 
 def Py_ReturnOp : Py_Op<"return", [Terminator]> {
   let arguments = (ins Variadic<AnyType>:$operands);
   let assemblyFormat = "($operands^ `:` type($operands))? attr-dict";
 }
 
-def Py_FuncOp : Py_Op<"func", [
-    Symbol,
-    IsolatedFromAbove
-  ]> {
+def Py_FuncOp : Py_Op<"func", [Symbol, IsolatedFromAbove]> {
   let summary = "Python level function definition";
   let description = [{
     Defines a Python-visible function object. The `function_type` attribute
@@ -63,18 +69,13 @@ def Py_FuncOp : Py_Op<"func", [
     while controlling code bloat.
   }];
 
-  let arguments = (ins
-    SymbolNameAttr:$sym_name,
-    TypeAttrOf<Py_FuncSigType>:$function_type,
-    OptionalAttr<UnitAttr>:$has_vararg,
-    OptionalAttr<UnitAttr>:$has_kwargs,
-    OptionalAttr<ArrayAttr>:$arg_names,
-    OptionalAttr<ArrayAttr>:$kwonly_names,
-    OptionalAttr<ArrayAttr>:$closure_types,
-    OptionalAttr<UnitAttr>:$specialize,
-    OptionalAttr<UnitAttr>:$maythrow,
-    OptionalAttr<UnitAttr>:$nothrow
-  );
+  let arguments = (ins SymbolNameAttr:$sym_name,
+      TypeAttrOf<Py_FuncSigType>:$function_type,
+      OptionalAttr<UnitAttr>:$has_vararg, OptionalAttr<UnitAttr>:$has_kwargs,
+      OptionalAttr<ArrayAttr>:$arg_names, OptionalAttr<ArrayAttr>:$kwonly_names,
+      OptionalAttr<ArrayAttr>:$closure_types,
+      OptionalAttr<UnitAttr>:$specialize, OptionalAttr<UnitAttr>:$maythrow,
+      OptionalAttr<UnitAttr>:$nothrow);
 
   let regions = (region AnyRegion:$body);
 
@@ -82,23 +83,17 @@ def Py_FuncOp : Py_Op<"func", [
   let hasCustomAssemblyFormat = 0;
 }
 
-def Py_ClassOp : Py_Op<"class", [
-    Symbol,
-    SymbolTable,
-    IsolatedFromAbove,
-    NoTerminator
-  ]> {
+def Py_ClassOp
+    : Py_Op<"class", [Symbol, SymbolTable, IsolatedFromAbove, NoTerminator]> {
   let summary = "Python class definition";
   let description = [{
     Defines a statically resolved class. The class symbol owns the nominal
     class type and optional fixed field schema metadata.
   }];
 
-  let arguments = (ins
-    SymbolNameAttr:$sym_name,
-    OptionalAttr<StrArrayAttr>:$field_names,
-    OptionalAttr<TypeArrayAttr>:$field_types
-  );
+  let arguments = (ins SymbolNameAttr:$sym_name,
+      OptionalAttr<StrArrayAttr>:$field_names,
+      OptionalAttr<TypeArrayAttr>:$field_types);
 
   let regions = (region SizedRegion<1>:$body);
 
@@ -113,18 +108,15 @@ def Py_CallOp : Py_Op<"call"> {
     arguments are carried in a `!py.dict` or `!py.none`.
   }];
 
-  let arguments = (ins
-    Py_CallableType:$callable,
-    Py_TupleType:$posargs,
-    AnyTypeOf<[Py_DictType, Py_NoneType]>:$kwargs,
-    OptionalAttr<UnitAttr>:$vectorcall_hint
-  );
+  let arguments = (ins Py_CallableType:$callable, Py_TupleType:$posargs,
+      AnyTypeOf<[Py_DictType, Py_NoneType]>:$kwargs,
+      OptionalAttr<UnitAttr>:$vectorcall_hint);
 
   let results = (outs Variadic<AnyType>:$results);
 
   let assemblyFormat =
-    "$callable `:` type($callable) `(` $posargs `:` type($posargs) `,` "
-    "$kwargs `:` type($kwargs) `)` attr-dict `:` type($results)";
+      "$callable `:` type($callable) `(` $posargs `:` type($posargs) `,` "
+      "$kwargs `:` type($kwargs) `)` attr-dict `:` type($results)";
 
   let hasVerifier = 1;
 }
@@ -137,28 +129,21 @@ def Py_CallVectorOp : Py_Op<"call.vector"> {
     to materialise a dictionary at call sites.
   }];
 
-  let arguments = (ins
-    Py_CallableType:$callable,
-    Py_TupleType:$posargs,
-    Py_TupleType:$kwnames,
-    Py_TupleType:$kwvalues,
-    OptionalAttr<UnitAttr>:$vectorcall_hint
-  );
+  let arguments = (ins Py_CallableType:$callable, Py_TupleType:$posargs,
+      Py_TupleType:$kwnames, Py_TupleType:$kwvalues,
+      OptionalAttr<UnitAttr>:$vectorcall_hint);
 
   let results = (outs Variadic<AnyType>:$results);
 
   let assemblyFormat =
-    "$callable `:` type($callable) `(` $posargs `:` type($posargs) `,` "
-    "$kwnames `:` type($kwnames) `,` $kwvalues `:` type($kwvalues) `)` "
-    "attr-dict `:` type($results)";
+      "$callable `:` type($callable) `(` $posargs `:` type($posargs) `,` "
+      "$kwnames `:` type($kwnames) `,` $kwvalues `:` type($kwvalues) `)` "
+      "attr-dict `:` type($results)";
 
   let hasVerifier = 1;
 }
 
-def Py_InvokeOp : Py_Op<"invoke", [
-    Terminator,
-    AttrSizedOperandSegments
-  ]> {
+def Py_InvokeOp : Py_Op<"invoke", [Terminator, AttrSizedOperandSegments]> {
   let summary = "Invoke a Python callable with EH successors";
   let description = [{
     EH-aware call equivalent to `py.call.vector`. On success, control
@@ -166,17 +151,13 @@ def Py_InvokeOp : Py_Op<"invoke", [
     to the unwind destination.
   }];
 
-  let arguments = (ins
-    Py_CallableType:$callable,
-    Py_TupleType:$posargs,
-    Py_TupleType:$kwnames,
-    Py_TupleType:$kwvalues,
-    Variadic<AnyType>:$normalDestOperands,
-    Variadic<AnyType>:$unwindDestOperands
-  );
+  let arguments = (ins Py_CallableType:$callable, Py_TupleType:$posargs,
+      Py_TupleType:$kwnames, Py_TupleType:$kwvalues,
+      Variadic<AnyType>:$normalDestOperands,
+      Variadic<AnyType>:$unwindDestOperands);
 
   let successors = (successor AnySuccessor:$normalDest,
-                               AnySuccessor:$unwindDest);
+      AnySuccessor:$unwindDest);
 
   let hasVerifier = 1;
 }
@@ -185,9 +166,8 @@ def Py_TryOp : Py_Op<"try"> {
   let summary = "Try/Except/Finally structured control flow";
 
   let results = (outs Variadic<AnyType>:$results);
-  let regions = (region AnyRegion:$try_region,
-                        AnyRegion:$except_region,
-                        AnyRegion:$finally_region);
+  let regions = (region AnyRegion:$try_region, AnyRegion:$except_region,
+      AnyRegion:$finally_region);
 
   let hasVerifier = 1;
 }
@@ -203,7 +183,8 @@ def Py_ExceptYieldOp : Py_Op<"except.yield", [Terminator]> {
 }
 
 def Py_FinallyYieldOp : Py_Op<"finally.yield", [Terminator]> {
-  let assemblyFormat = "attr-dict";
+  let arguments = (ins Variadic<AnyType>:$operands);
+  let assemblyFormat = "($operands^ `:` type($operands))? attr-dict";
   let hasVerifier = 1;
 }
 
@@ -221,16 +202,10 @@ def Py_RaiseCurrentOp : Py_Op<"raise.current", [Terminator]> {
 def Py_ExceptionNewOp : Py_Op<"exception.new"> {
   let summary = "Create a py.exception with SSA payload";
 
-  let arguments = (ins
-    Py_ClassType:$type,
-    Py_StrType:$message,
-    Py_TupleType:$args,
-    Py_ExceptionType:$cause,
-    Py_ExceptionType:$context,
-    Py_TracebackType:$traceback,
-    Py_LocationType:$location,
-    Py_DictType:$extras
-  );
+  let arguments = (ins Py_ClassType:$type, Py_StrType:$message,
+      Py_TupleType:$args, Py_ExceptionType:$cause, Py_ExceptionType:$context,
+      Py_TracebackType:$traceback, Py_LocationType:$location,
+      Py_DictType:$extras);
 
   let results = (outs Py_ExceptionType:$result);
   let hasVerifier = 1;
@@ -257,7 +232,8 @@ def Py_LocationCurrentOp : Py_Op<"location.current", [Pure]> {
 def Py_ExceptMatchOp : Py_Op<"except.match", [Pure]> {
   let arguments = (ins Py_ExceptionType:$exception, Py_ClassType:$type);
   let results = (outs I1:$result);
-  let assemblyFormat = "$exception `,` $type `:` type($exception) `,` type($type) attr-dict";
+  let assemblyFormat =
+      "$exception `,` $type `:` type($exception) `,` type($type) attr-dict";
   let hasVerifier = 1;
 }
 
@@ -268,15 +244,12 @@ def Py_NativeCallOp : Py_Op<"native_call"> {
     The callee must not accept or return `!py.*` types.
   }];
 
-  let arguments = (ins
-    Py_PrimFuncType:$callee,
-    Variadic<AnyType>:$args
-  );
+  let arguments = (ins Py_PrimFuncType:$callee, Variadic<AnyType>:$args);
 
   let results = (outs Variadic<AnyType>:$results);
 
-  let assemblyFormat =
-    "$callee `:` type($callee) `(` $args `:` type($args) `)` attr-dict `:` type($results)";
+  let assemblyFormat = "$callee `:` type($callee) `(` $args `:` type($args) "
+                       "`)` attr-dict `:` type($results)";
 
   let hasVerifier = 1;
 }
@@ -295,23 +268,20 @@ def Py_MakeFunctionOp : Py_Op<"make_function", [AttrSizedOperandSegments]> {
     - module: Module name where the function is defined
   }];
 
-  let arguments = (ins
-    FlatSymbolRefAttr:$target,
-    Optional<Py_TupleType>:$defaults,
-    Optional<Py_DictType>:$kwdefaults,
-    Optional<Py_TupleType>:$closure,
-    Optional<Py_DictType>:$annotations,
-    Optional<Py_StrType>:$module
-  );
+  let arguments = (ins FlatSymbolRefAttr:$target,
+      Optional<Py_TupleType>:$defaults, Optional<Py_DictType>:$kwdefaults,
+      Optional<Py_TupleType>:$closure, Optional<Py_DictType>:$annotations,
+      Optional<Py_StrType>:$module);
 
   let results = (outs Py_FuncType:$result);
 
-  let assemblyFormat = "$target (`defaults` `(` $defaults^ `:` type($defaults) `)`)? "
-                       "(`kwdefaults` `(` $kwdefaults^ `:` type($kwdefaults) `)`)? "
-                       "(`closure` `(` $closure^ `:` type($closure) `)`)? "
-                       "(`annotations` `(` $annotations^ `:` type($annotations) `)`)? "
-                       "(`module` `(` $module^ `:` type($module) `)`)? "
-                       "attr-dict `:` type($result)";
+  let assemblyFormat =
+      "$target (`defaults` `(` $defaults^ `:` type($defaults) `)`)? "
+      "(`kwdefaults` `(` $kwdefaults^ `:` type($kwdefaults) `)`)? "
+      "(`closure` `(` $closure^ `:` type($closure) `)`)? "
+      "(`annotations` `(` $annotations^ `:` type($annotations) `)`)? "
+      "(`module` `(` $module^ `:` type($module) `)`)? "
+      "attr-dict `:` type($result)";
 
   let hasVerifier = 1;
 }
@@ -324,9 +294,7 @@ def Py_FuncObjectOp : Py_Op<"func.object", [Pure]> {
     definition.
   }];
 
-  let arguments = (ins
-    FlatSymbolRefAttr:$target
-  );
+  let arguments = (ins FlatSymbolRefAttr:$target);
 
   let results = (outs Py_FuncType:$result);
 
@@ -341,14 +309,95 @@ def Py_MakeNativeOp : Py_Op<"make_native", [Pure]> {
     symbol. The referenced function must not use any `!py.*` types.
   }];
 
-  let arguments = (ins
-    FlatSymbolRefAttr:$target
-  );
+  let arguments = (ins FlatSymbolRefAttr:$target);
 
   let results = (outs Py_PrimFuncType:$result);
 
   let assemblyFormat = "$target attr-dict `:` type($result)";
 
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// Async / coroutine operations
+//===----------------------------------------------------------------------===//
+
+def Py_CoroCreateOp : Py_Op<"coro.create"> {
+  let summary = "Create a typed coroutine value from an async function symbol";
+  let description = [{
+    Materializes a statically typed coroutine value. The operation preserves
+    Python-level coroutine semantics in PyDialect. The initial lowering maps
+    non-escaping coroutines directly to MLIR async calls.
+  }];
+
+  let arguments = (ins FlatSymbolRefAttr:$target, Variadic<AnyType>:$args);
+
+  let results = (outs Py_CoroType:$result);
+
+  let assemblyFormat =
+      "$target `(` $args `)` attr-dict `:` functional-type($args, $result)";
+
+  let hasVerifier = 1;
+}
+
+def Py_CoroStartOp : Py_Op<"coro.start"> {
+  let summary = "Start a typed coroutine and expose its async value";
+  let arguments = (ins Py_CoroType:$coroutine);
+  let results = (outs AnyType:$result);
+  let assemblyFormat =
+      "$coroutine attr-dict `:` type($coroutine) `->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_AwaitOp : Py_Op<"await"> {
+  let summary = "Await a statically typed awaitable value";
+  let arguments = (ins AnyType:$awaitable);
+  let results = (outs AnyType:$result);
+  let assemblyFormat =
+      "$awaitable attr-dict `:` type($awaitable) `->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_TaskCreateOp : Py_Op<"task.create"> {
+  let summary = "Schedule a typed coroutine as a task";
+  let arguments = (ins Py_CoroType:$coroutine);
+  let results = (outs Py_TaskType:$result);
+  let assemblyFormat =
+      "$coroutine attr-dict `:` type($coroutine) `->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_TaskCancelOp : Py_Op<"task.cancel"> {
+  let summary = "Request cancellation for a typed task";
+  let arguments = (ins Py_TaskType:$task);
+  let results = (outs Py_BoolType:$accepted);
+  let assemblyFormat = "$task attr-dict `:` type($task) `->` type($accepted)";
+  let hasVerifier = 1;
+}
+
+def Py_AsyncSleepOp : Py_Op<"async.sleep"> {
+  let summary = "Create a timer-backed typed future for asyncio.sleep";
+  let arguments = (ins AnyType:$seconds);
+  let results = (outs Py_FutureType:$result);
+  let assemblyFormat =
+      "$seconds attr-dict `:` type($seconds) `->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_AsyncGatherOp : Py_Op<"async.gather"> {
+  let summary = "Await statically typed awaitables and collect their results";
+  let description = [{
+    Represents the statically resolved subset of asyncio.gather used by
+    immediately-awaited gather expressions. The operation waits for all
+    operands and returns a typed tuple of payload values.
+  }];
+
+  let arguments = (ins Variadic<AnyType>:$awaitables);
+
+  let results = (outs Py_TupleType:$result);
+
+  let assemblyFormat =
+      "$awaitables attr-dict `:` functional-type($awaitables, $result)";
   let hasVerifier = 1;
 }
 
@@ -368,13 +417,12 @@ def Py_TupleCreateOp : Py_Op<"tuple.create", []> {
       %t2 = py.tuple.create %x, %y : (!py.object, !py.object) -> !py.tuple<!py.object>
   }];
 
-  let arguments = (ins
-    Variadic<AnyType>:$elements
-  );
+  let arguments = (ins Variadic<AnyType>:$elements);
 
   let results = (outs Py_TupleType:$result);
 
-  let assemblyFormat = "$elements attr-dict `:` functional-type($elements, $result)";
+  let assemblyFormat =
+      "$elements attr-dict `:` functional-type($elements, $result)";
   let hasVerifier = 1;
 }
 
@@ -408,23 +456,18 @@ def Py_DictEmptyOp : Py_Op<"dict.empty", []> {
 def Py_DictInsertOp : Py_Op<"dict.insert"> {
   let summary = "Insert a key-value pair into a dictionary";
   let description = [{
-    Inserts or updates a key-value pair in a Python dictionary.
-    Returns the updated dictionary (note: semantically creates a new dict
-    in SSA form, but may be optimized to in-place update at lowering).
+    Inserts or updates a key-value pair in a Python dictionary. This is a
+    mutating operation: the dictionary operand keeps its identity and no new
+    dictionary ownership token is produced.
 
     Example:
-      %d2 = py.dict.insert %d[%key] = %value : !py.dict<!py.str, !py.object>
+      py.dict.insert %d[%key] = %value : !py.dict<!py.str, !py.object>
   }];
 
-  let arguments = (ins
-    Py_DictType:$dict,
-    AnyType:$key,
-    AnyType:$value
-  );
+  let arguments = (ins Py_DictType:$dict, AnyType:$key, AnyType:$value);
 
-  let results = (outs Py_DictType:$result);
-
-  let assemblyFormat = "$dict `:` type($dict) `[` $key `:` type($key) `]` `=` $value `:` type($value) attr-dict `->` type($result)";
+  let assemblyFormat = "$dict `:` type($dict) `[` $key `:` type($key) `]` `=` "
+                       "$value `:` type($value) attr-dict";
   let hasVerifier = 1;
 }
 
@@ -434,14 +477,12 @@ def Py_DictGetOp : Py_Op<"dict.get", []> {
     Loads the value associated with a key from a typed dictionary.
   }];
 
-  let arguments = (ins
-    Py_DictType:$dict,
-    AnyType:$key
-  );
+  let arguments = (ins Py_DictType:$dict, AnyType:$key);
 
   let results = (outs AnyType:$result);
 
-  let assemblyFormat = "$dict `:` type($dict) `[` $key `:` type($key) `]` attr-dict `->` type($result)";
+  let assemblyFormat = "$dict `:` type($dict) `[` $key `:` type($key) `]` "
+                       "attr-dict `->` type($result)";
   let hasVerifier = 1;
 }
 
@@ -464,12 +505,10 @@ def Py_ListAppendOp : Py_Op<"list.append"> {
     Appends an element whose type matches the list element type.
   }];
 
-  let arguments = (ins
-    Py_ListType:$list,
-    AnyType:$value
-  );
+  let arguments = (ins Py_ListType:$list, AnyType:$value);
 
-  let assemblyFormat = "$list `:` type($list) `,` $value `:` type($value) attr-dict";
+  let assemblyFormat =
+      "$list `:` type($list) `,` $value `:` type($value) attr-dict";
   let hasVerifier = 1;
 }
 
@@ -480,12 +519,10 @@ def Py_ListRemoveOp : Py_Op<"list.remove"> {
     statically at lowering time from the list element type.
   }];
 
-  let arguments = (ins
-    Py_ListType:$list,
-    AnyType:$value
-  );
+  let arguments = (ins Py_ListType:$list, AnyType:$value);
 
-  let assemblyFormat = "$list `:` type($list) `,` $value `:` type($value) attr-dict";
+  let assemblyFormat =
+      "$list `:` type($list) `,` $value `:` type($value) attr-dict";
   let hasVerifier = 1;
 }
 
@@ -495,14 +532,12 @@ def Py_ListGetOp : Py_Op<"list.get", []> {
     Loads the element at the specified index from a typed list.
   }];
 
-  let arguments = (ins
-    Py_ListType:$list,
-    AnyType:$index
-  );
+  let arguments = (ins Py_ListType:$list, AnyType:$index);
 
   let results = (outs AnyType:$result);
 
-  let assemblyFormat = "$list `:` type($list) `[` $index `:` type($index) `]` attr-dict `->` type($result)";
+  let assemblyFormat = "$list `:` type($list) `[` $index `:` type($index) `]` "
+                       "attr-dict `->` type($result)";
   let hasVerifier = 1;
 }
 
@@ -582,9 +617,7 @@ def Py_CastFromPrimOp : Py_Op<"cast.from_prim", []> {
       %py_bool = py.cast.from_prim %i1_val : i1 -> !py.bool
   }];
 
-  let arguments = (ins
-    AnyType:$input
-  );
+  let arguments = (ins AnyType:$input);
 
   let results = (outs AnyType:$result);
 
@@ -608,38 +641,14 @@ def Py_CastToPrimOp : Py_Op<"cast.to_prim", [Pure]> {
       %i1_val = py.cast.to_prim %py_bool : !py.bool -> i1
   }];
 
-  let arguments = (ins
-    AnyType:$input,
-    StrAttr:$mode
-  );
+  let arguments = (ins AnyType:$input, StrAttr:$mode);
 
   let results = (outs AnyType:$result);
 
-  let assemblyFormat = "$input `mode` `=` $mode attr-dict `:` type($input) `->` type($result)";
+  let assemblyFormat =
+      "$input `mode` `=` $mode attr-dict `:` type($input) `->` type($result)";
   let hasVerifier = 1;
   let hasCustomAssemblyFormat = 0;
-
-}
-
-def Py_CastIdentityOp : Py_Op<"cast.identity", [Pure]> {
-  let summary = "Explicit identity cast used during lowering";
-  let description = [{
-    Serves as an explicit annotation that two SSA values share the same
-    in-memory representation even when their types differ. This is mainly
-    produced by the lowering pipeline to bridge !py.* types and their lowered
-    pointer representation. At least one of the operand or result types must be
-    a !py.* type.
-
-    Example:
-      %llvm = py.cast.identity %py_val : !py.int -> !llvm.ptr
-      %py = py.cast.identity %llvm_val : !llvm.ptr -> !py.int
-  }];
-
-  let arguments = (ins AnyType:$input);
-  let results = (outs AnyType:$result);
-
-  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
-  let hasVerifier = 1;
 }
 
 def Py_UpcastOp : Py_Op<"upcast", [Pure]> {
@@ -650,9 +659,7 @@ def Py_UpcastOp : Py_Op<"upcast", [Pure]> {
     conversions when a generic object is needed.
   }];
 
-  let arguments = (ins
-    AnyType:$input
-  );
+  let arguments = (ins AnyType:$input);
 
   let results = (outs Py_ObjectType:$result);
 
@@ -661,146 +668,148 @@ def Py_UpcastOp : Py_Op<"upcast", [Pure]> {
 }
 
 //===----------------------------------------------------------------------===//
-// Arithmetic operations
+// Python operation semantics
 //===----------------------------------------------------------------------===//
 
-def Py_NumAddOp : Py_Op<"num.add", [SameOperandsAndResultType]> {
-  let summary = "Python numeric addition";
+def Py_AddOp : Py_Op<"add", []> {
+  let summary = "Python addition operation";
   let description = [{
-    Performs addition on Python numeric types (!py.int, !py.float).
-    Both operands must have the same type, and the result has the same type.
+    Represents the Python `+` language operation. Method resolution (`__add__`,
+    `__radd__`) is a lowering concern; this op carries only the language
+    semantics and the statically declared result type.
 
     Example:
-      %sum = py.num.add %a, %b : !py.int
+      %sum = py.add %a : !py.int, %b : !py.int -> !py.int
   }];
 
-  let arguments = (ins
-    AnyType:$lhs,
-    AnyType:$rhs
-  );
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs);
 
   let results = (outs AnyType:$result);
 
-  let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict `->` type($result)";
+  let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict "
+                       "`->` type($result)";
   let hasVerifier = 1;
 }
 
-def Py_NumSubOp : Py_Op<"num.sub", [SameOperandsAndResultType]> {
-  let summary = "Python numeric subtraction";
+def Py_SubOp : Py_Op<"sub", []> {
+  let summary = "Python subtraction operation";
   let description = [{
-    Performs subtraction on Python numeric types (!py.int, !py.float).
-    Both operands must have the same type, and the result has the same type.
+    Represents the Python `-` language operation. Method resolution (`__sub__`,
+    `__rsub__`) is a lowering concern.
   }];
 
-  let arguments = (ins
-    AnyType:$lhs,
-    AnyType:$rhs
-  );
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs);
 
   let results = (outs AnyType:$result);
 
-  let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict `->` type($result)";
-}
-
-def Py_NumLeOp : Py_Op<"num.le", [Pure]> {
-  let summary = "Python numeric <= comparison";
-  let description = [{
-    Compares two numeric values and returns a `!py.bool` object.
-  }];
-
-  let arguments = (ins
-    AnyType:$lhs,
-    AnyType:$rhs
-  );
-
-  let results = (outs Py_BoolType:$result);
-
-  let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict `->` type($result)";
+  let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict "
+                       "`->` type($result)";
   let hasVerifier = 1;
 }
 
-def Py_NumLtOp : Py_Op<"num.lt", [Pure]> {
-  let summary = "Python numeric < comparison";
+def Py_LeOp : Py_Op<"le", [Pure]> {
+  let summary = "Python <= comparison";
   let description = [{
-    Compares two numeric values and returns a `!py.bool` object.
+    Represents Python `<=` and returns a `!py.bool` object.
   }];
 
-  let arguments = (ins
-    AnyType:$lhs,
-    AnyType:$rhs
-  );
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs);
 
   let results = (outs Py_BoolType:$result);
 
-  let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict `->` type($result)";
+  let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict "
+                       "`->` type($result)";
   let hasVerifier = 1;
 }
 
-def Py_NumGtOp : Py_Op<"num.gt", [Pure]> {
-  let summary = "Python numeric > comparison";
+def Py_LtOp : Py_Op<"lt", [Pure]> {
+  let summary = "Python < comparison";
   let description = [{
-    Compares two numeric values and returns a `!py.bool` object.
+    Represents Python `<` and returns a `!py.bool` object.
   }];
 
-  let arguments = (ins
-    AnyType:$lhs,
-    AnyType:$rhs
-  );
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs);
 
   let results = (outs Py_BoolType:$result);
 
-  let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict `->` type($result)";
+  let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict "
+                       "`->` type($result)";
   let hasVerifier = 1;
 }
 
-def Py_NumGeOp : Py_Op<"num.ge", [Pure]> {
-  let summary = "Python numeric >= comparison";
+def Py_GtOp : Py_Op<"gt", [Pure]> {
+  let summary = "Python > comparison";
   let description = [{
-    Compares two numeric values and returns a `!py.bool` object.
+    Represents Python `>` and returns a `!py.bool` object.
   }];
 
-  let arguments = (ins
-    AnyType:$lhs,
-    AnyType:$rhs
-  );
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs);
 
   let results = (outs Py_BoolType:$result);
 
-  let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict `->` type($result)";
+  let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict "
+                       "`->` type($result)";
   let hasVerifier = 1;
 }
 
-def Py_NumEqOp : Py_Op<"num.eq", [Pure]> {
-  let summary = "Python numeric == comparison";
+def Py_GeOp : Py_Op<"ge", [Pure]> {
+  let summary = "Python >= comparison";
   let description = [{
-    Compares two numeric values and returns a `!py.bool` object.
+    Represents Python `>=` and returns a `!py.bool` object.
   }];
 
-  let arguments = (ins
-    AnyType:$lhs,
-    AnyType:$rhs
-  );
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs);
 
   let results = (outs Py_BoolType:$result);
 
-  let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict `->` type($result)";
+  let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict "
+                       "`->` type($result)";
   let hasVerifier = 1;
 }
 
-def Py_NumNeOp : Py_Op<"num.ne", [Pure]> {
-  let summary = "Python numeric != comparison";
+def Py_EqOp : Py_Op<"eq", [Pure]> {
+  let summary = "Python == comparison";
   let description = [{
-    Compares two numeric values and returns a `!py.bool` object.
+    Represents Python `==` and returns a `!py.bool` object.
   }];
 
-  let arguments = (ins
-    AnyType:$lhs,
-    AnyType:$rhs
-  );
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs);
 
   let results = (outs Py_BoolType:$result);
 
-  let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict `->` type($result)";
+  let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict "
+                       "`->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_NeOp : Py_Op<"ne", [Pure]> {
+  let summary = "Python != comparison";
+  let description = [{
+    Represents Python `!=` and returns a `!py.bool` object.
+  }];
+
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs);
+
+  let results = (outs Py_BoolType:$result);
+
+  let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict "
+                       "`->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_ReprOp : Py_Op<"repr", []> {
+  let summary = "Python representation operation";
+  let description = [{
+    Represents Python `repr(value)` semantics. Static class/container/primitive
+    resolution and fallback to the normal LyException path are lowering
+    concerns. The result is always an owned `!py.str`.
+  }];
+
+  let arguments = (ins AnyType:$input);
+
+  let results = (outs Py_StrType:$result);
+
+  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
   let hasVerifier = 1;
 }
 
@@ -818,9 +827,7 @@ def Py_ClassNewOp : Py_Op<"class.new", []> {
       %instance = py.class.new @MyClass : !py.class<"MyClass">
   }];
 
-  let arguments = (ins
-    FlatSymbolRefAttr:$class_name
-  );
+  let arguments = (ins FlatSymbolRefAttr:$class_name);
 
   let results = (outs Py_ClassType:$result);
 
@@ -836,9 +843,7 @@ def Py_ClassPromoteOp : Py_Op<"class.promote", []> {
     managed storage, while already-managed instances are retained and forwarded.
   }];
 
-  let arguments = (ins
-    Py_ClassType:$input
-  );
+  let arguments = (ins Py_ClassType:$input);
 
   let results = (outs Py_ClassType:$result);
 
@@ -854,9 +859,7 @@ def Py_PublishOp : Py_Op<"publish", []> {
     need a shared representation.
   }];
 
-  let arguments = (ins
-    AnyType:$input
-  );
+  let arguments = (ins AnyType:$input);
 
   let results = (outs AnyType:$result);
 
@@ -877,14 +880,12 @@ def Py_AttrGetOp : Py_Op<"attr.get", []> {
       %val = py.attr.get %obj["value"] : !py.class<"Foo"> -> !py.int
   }];
 
-  let arguments = (ins
-    AnyType:$object,
-    StrAttr:$name
-  );
+  let arguments = (ins AnyType:$object, StrAttr:$name);
 
   let results = (outs AnyType:$result);
 
-  let assemblyFormat = "$object `[` $name `]` attr-dict `:` type($object) `->` type($result)";
+  let assemblyFormat =
+      "$object `[` $name `]` attr-dict `:` type($object) `->` type($result)";
   let hasVerifier = 1;
 }
 
@@ -897,13 +898,44 @@ def Py_AttrSetOp : Py_Op<"attr.set", []> {
       py.attr.set %obj["value"] = %val : !py.class<"Foo">, !py.int
   }];
 
-  let arguments = (ins
-    AnyType:$object,
-    StrAttr:$name,
-    AnyType:$value
-  );
+  let arguments = (ins AnyType:$object, StrAttr:$name, AnyType:$value);
 
-  let assemblyFormat = "$object `[` $name `]` `=` $value attr-dict `:` type($object) `,` type($value)";
+  let assemblyFormat = "$object `[` $name `]` `=` $value attr-dict `:` "
+                       "type($object) `,` type($value)";
+  let hasVerifier = 1;
+}
+
+def Py_AttrGetLocalOp : Py_Op<"attr.get_local", []> {
+  let summary = "Get a field through a proven-local class instance";
+  let description = [{
+    Internal zero-cost form of `py.attr.get`. This operation is only introduced
+    by an optimizer pass after proving that the class instance is local and not
+    shared. It preserves the source-level field access semantics but permits
+    direct storage access during lowering.
+  }];
+
+  let arguments = (ins AnyType:$object, StrAttr:$name);
+
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat =
+      "$object `[` $name `]` attr-dict `:` type($object) `->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_AttrSetLocalOp : Py_Op<"attr.set_local", []> {
+  let summary = "Set a field through a proven-local class instance";
+  let description = [{
+    Internal zero-cost form of `py.attr.set`. This operation is only introduced
+    by an optimizer pass after proving that the class instance is local and not
+    shared. It preserves the source-level field mutation semantics but permits
+    direct storage access during lowering.
+  }];
+
+  let arguments = (ins AnyType:$object, StrAttr:$name, AnyType:$value);
+
+  let assemblyFormat = "$object `[` $name `]` `=` $value attr-dict `:` "
+                       "type($object) `,` type($value)";
   let hasVerifier = 1;
 }
 

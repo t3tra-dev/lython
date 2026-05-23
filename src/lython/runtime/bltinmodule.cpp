@@ -6,6 +6,7 @@
 #include "mlir/ExecutionEngine/CRunnerUtils.h"
 
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -84,6 +85,47 @@ std::string formatPythonFloat(double value) {
   if (std::isfinite(value) && result.find_first_of(".eE") == std::string::npos)
     result.append(".0");
   return result;
+}
+
+enum class PackedSlotReprKind : std::int64_t {
+  I64 = 0,
+  Bool = 1,
+  F64Bits = 2,
+  PyObject = 3,
+  CallbackPtr = 4,
+};
+
+void appendPackedSlotRepr(std::string &out, std::int64_t bits,
+                          std::int64_t kind,
+                          LyUnicodeObject *(*repr_item)(void *)) {
+  switch (static_cast<PackedSlotReprKind>(kind)) {
+  case PackedSlotReprKind::Bool:
+    out.append(bits ? "True" : "False");
+    return;
+  case PackedSlotReprKind::F64Bits: {
+    double value;
+    std::memcpy(&value, &bits, sizeof(value));
+    out.append(formatPythonFloat(value));
+    return;
+  }
+  case PackedSlotReprKind::PyObject:
+  case PackedSlotReprKind::CallbackPtr: {
+    auto *object = reinterpret_cast<void *>(static_cast<std::uintptr_t>(bits));
+    LyUnicodeObject *repr =
+        repr_item ? repr_item(object)
+                  : LyObject_Repr(reinterpret_cast<LyObject *>(object));
+    if (!repr)
+      return;
+    if (repr->utf8_data)
+      out.append(repr->utf8_data, repr->utf8_length);
+    Ly_DecRef(reinterpret_cast<LyObject *>(repr));
+    return;
+  }
+  case PackedSlotReprKind::I64:
+    out.append(std::to_string(bits));
+    return;
+  }
+  out.append(std::to_string(bits));
 }
 
 template <typename Format>
@@ -273,6 +315,40 @@ LyUnicodeObject *LyTuplePtr_Repr(UnrankedMemRefType<std::int64_t> *memref,
   });
 }
 
+LyUnicodeObject *LyDictPacked_Repr(UnrankedMemRefType<std::int64_t> *memref,
+                                   std::int64_t key_kind,
+                                   std::int64_t value_kind,
+                                   LyUnicodeObject *(*repr_key)(void *),
+                                   LyUnicodeObject *(*repr_value)(void *)) {
+  DynamicMemRefType<std::int64_t> dyn(*memref);
+  auto loadSlot = [&](std::int64_t slot) -> std::int64_t {
+    return dyn.data[dyn.offset + slot * dyn.strides[0]];
+  };
+
+  std::int64_t size = loadSlot(0);
+  std::int64_t capacity = loadSlot(1);
+  std::int64_t keysBase = 5;
+  std::int64_t valuesBase = keysBase + capacity;
+  std::int64_t statesBase = valuesBase + capacity;
+
+  std::string out;
+  out.reserve(2 +
+              static_cast<std::size_t>(std::max<std::int64_t>(size, 0)) * 8);
+  out.push_back('{');
+  std::int64_t emitted = 0;
+  for (std::int64_t i = 0; i < capacity; ++i) {
+    if (loadSlot(statesBase + i) != 1)
+      continue;
+    if (emitted++ != 0)
+      out.append(", ");
+    appendPackedSlotRepr(out, loadSlot(keysBase + i), key_kind, repr_key);
+    out.append(": ");
+    appendPackedSlotRepr(out, loadSlot(valuesBase + i), value_kind, repr_value);
+  }
+  out.push_back('}');
+  return LyUnicode_FromUTF8(out.c_str(), out.size());
+}
+
 LyUnicodeObject *
 _mlir_ciface_LyListI64_Repr(UnrankedMemRefType<std::int64_t> *memref) {
   return LyListI64_Repr(memref);
@@ -315,12 +391,20 @@ _mlir_ciface_LyTuplePtr_Repr(UnrankedMemRefType<std::int64_t> *memref,
   return LyTuplePtr_Repr(memref, repr_item);
 }
 
+LyUnicodeObject *
+_mlir_ciface_LyDictPacked_Repr(UnrankedMemRefType<std::int64_t> *memref,
+                               std::int64_t key_kind, std::int64_t value_kind,
+                               LyUnicodeObject *(*repr_key)(void *),
+                               LyUnicodeObject *(*repr_value)(void *)) {
+  return LyDictPacked_Repr(memref, key_kind, value_kind, repr_key, repr_value);
+}
+
 LyFunctionObject *Ly_GetBuiltinPrint() {
   static LyFunctionObject *builtin = [] {
     void *raw = ::operator new(sizeof(LyFunctionObject));
     std::memset(raw, 0, sizeof(LyFunctionObject));
     auto *func = reinterpret_cast<LyFunctionObject *>(raw);
-    func->ob_base.ob_refcnt = 1;
+    func->ob_base.ob_refcnt = kLyImmortalRefcount;
     func->ob_base.ob_type = &LyFunction_Type();
     func->func_name =
         reinterpret_cast<LyObject *>(LyUnicode_FromUTF8("print", 5));

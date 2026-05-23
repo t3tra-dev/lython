@@ -301,6 +301,7 @@ class PrimitiveMixin:
         message: str | None,
         loc: ir.Location,
         exc_type_name: str = "Exception",
+        context: ir.Value | None = None,
     ) -> ir.Value:
         exc_type = self.get_py_type(f'!py.class<"{exc_type_name}">')
         empty_tuple = self.get_py_type("!py.tuple<>")
@@ -313,7 +314,10 @@ class PrimitiveMixin:
             ).result
             args = py_ops.TupleEmptyOp(empty_tuple).result
             cause = py_ops.ExceptionNullOp(self.get_py_type("!py.exception")).result
-            context = py_ops.ExceptionNullOp(self.get_py_type("!py.exception")).result
+            if context is None:
+                context = py_ops.ExceptionNullOp(
+                    self.get_py_type("!py.exception")
+                ).result
             tb = py_ops.TracebackNullOp(self.get_py_type("!py.traceback")).result
             location = py_ops.LocationCurrentOp(self.get_py_type("!py.location")).result
             extras = py_ops.DictEmptyOp(extras_dict).result

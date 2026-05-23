@@ -24,9 +24,9 @@ class ExprOpsMixin:
 
         with self._loc(node), self.insertion_point():
             if isinstance(node.op, ast.Add):
-                return py_ops.NumAddOp(lhs, rhs).result
+                return py_ops.AddOp(lhs.type, lhs, rhs).result
             if isinstance(node.op, ast.Sub):
-                return py_ops.NumSubOp(lhs, rhs).result
+                return py_ops.SubOp(lhs.type, lhs, rhs).result
         raise NotImplementedError("Unsupported binary operation")
 
     def _handle_primitive_binop(
@@ -139,10 +139,10 @@ class ExprOpsMixin:
             with loc, self.insertion_point():
                 if operand_type == self.get_py_type("!py.int"):
                     zero = py_ops.IntConstantOp(operand_type, "0").result
-                    return py_ops.NumSubOp(zero, operand).result
+                    return py_ops.SubOp(operand_type, zero, operand).result
                 if operand_type == self.get_py_type("!py.float"):
                     zero = py_ops.FloatConstantOp(operand_type, 0.0).result
-                    return py_ops.NumSubOp(zero, operand).result
+                    return py_ops.SubOp(operand_type, zero, operand).result
                 if isinstance(operand_type, ir.ShapedType):
                     raise NotImplementedError(
                         f"Unary minus is not supported for shaped primitive type {operand_type}"
@@ -232,17 +232,17 @@ class ExprOpsMixin:
         bool_type = self.get_py_type("!py.bool")
         with self._loc(node), self.insertion_point():
             if isinstance(op, ast.LtE):
-                return py_ops.NumLeOp(bool_type, lhs, rhs).result
+                return py_ops.LeOp(bool_type, lhs, rhs).result
             if isinstance(op, ast.Gt):
-                return py_ops.NumGtOp(bool_type, lhs, rhs).result
+                return py_ops.GtOp(bool_type, lhs, rhs).result
             if isinstance(op, ast.Lt):
-                return py_ops.NumLtOp(bool_type, lhs, rhs).result
+                return py_ops.LtOp(bool_type, lhs, rhs).result
             if isinstance(op, ast.GtE):
-                return py_ops.NumGeOp(bool_type, lhs, rhs).result
+                return py_ops.GeOp(bool_type, lhs, rhs).result
             if isinstance(op, ast.Eq):
-                return py_ops.NumEqOp(bool_type, lhs, rhs).result
+                return py_ops.EqOp(bool_type, lhs, rhs).result
             if isinstance(op, ast.NotEq):
-                return py_ops.NumNeOp(bool_type, lhs, rhs).result
+                return py_ops.NeOp(bool_type, lhs, rhs).result
         raise NotImplementedError(
             "Only <, <=, >, >=, ==, != comparisons supported in object mode"
         )

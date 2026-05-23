@@ -26,6 +26,7 @@ class FunctionInfo(NamedTuple):
     returned_callable_arg_index: int | None = None
     closure: ir.Value | None = None
     closure_capture_arg_indices: tuple[int | None, ...] = ()
+    is_async: bool = False
 
 
 class MethodInfo(NamedTuple):

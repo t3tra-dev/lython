@@ -27,7 +27,7 @@ class ExprContainerMixin:
         dict_type = self.get_py_type(f"!py.dict<{key_type}, {value_type}>")
 
         with self._loc(node), self.insertion_point():
-            current = py_ops.DictEmptyOp(dict_type).result
+            result = py_ops.DictEmptyOp(dict_type).result
 
         for key, value in entries:
             if key.type != key_type:
@@ -35,8 +35,8 @@ class ExprContainerMixin:
             if value.type != value_type:
                 value = self.coerce_value_to_type(value, value_type, self._loc(node))
             with self._loc(node), self.insertion_point():
-                current = py_ops.DictInsertOp(dict_type, current, key, value).result
-        return current
+                py_ops.DictInsertOp(result, key, value)
+        return result
 
     def visit_Subscript(self, node: ast.Subscript) -> ir.Value:
         container = self.require_value(node.value, self.visit(node.value))

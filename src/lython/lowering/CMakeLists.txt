@@ -1,15 +1,37 @@
 add_library(LythonRuntimeLowering STATIC
     Common/RuntimeSupport.cpp
-    Common/TypedSlotUtils.cpp
+    Common/SlotUtils.cpp
     Passes/RuntimeLowering.cpp
+    Passes/Runtime/Async.cpp
+    Passes/Runtime/Cleanup.cpp
+    Passes/Runtime/Conversion.cpp
+    Passes/Runtime/EH.cpp
+    Passes/Runtime/Helpers.cpp
+    Passes/Runtime/MemRefToLLVM.cpp
+    Passes/Runtime/Upcast.cpp
+    Passes/AsyncRuntimeRewrites.cpp
     Passes/LinalgLowering.cpp
+    Passes/LLVMCallOwnershipVerifier.cpp
+    Passes/ThreadSafetyVerifier.cpp
+    Passes/ThreadSafety/AsyncCells.cpp
+    Passes/ThreadSafety/AsyncHandles.cpp
+    Passes/ThreadSafety/AtomicContracts.cpp
+    Passes/ThreadSafety/ClassHelpers.cpp
+    Passes/ThreadSafety/Common.cpp
+    Passes/ThreadSafety/ContainerAccess.cpp
+    Passes/ThreadSafety/ContainerLifetime.cpp
+    Passes/ThreadSafety/LLVMAtomicContracts.cpp
+    Passes/ThreadSafety/Verifier.cpp
     Passes/NativeVerification.cpp
+    Passes/OwnershipAnalysis.cpp
+    Passes/Ownership.cpp
     PyFunc/Lowering.cpp
     Optimizer/Utils.cpp
     Optimizer/Class.cpp
     Optimizer/Container.cpp
     Optimizer/Scalar.cpp
     Optimizer/RefCount.cpp
+    Optimizer/ZeroCost.cpp
     Optimizer/Orchestration.cpp
     Optimizer/Pipeline.cpp
     PyValue/base.cpp
@@ -21,6 +43,7 @@ add_library(LythonRuntimeLowering STATIC
     PyCall/Utils.cpp
     PyCall/direct.cpp
     PyCall/invoke.cpp
+    PyAsync/Lowering.cpp
     PyRefCount/Lowering.cpp
     Passes/RefCountInsertion.cpp
 )
@@ -35,6 +58,7 @@ target_include_directories(LythonRuntimeLowering
 target_link_libraries(LythonRuntimeLowering
     PRIVATE
     PyDialect
+    MLIRAsyncDialect
     MLIRIR
     MLIRArithDialect
     MLIRControlFlowDialect

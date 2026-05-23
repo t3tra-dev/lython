@@ -34,7 +34,7 @@ class ExprCallableCloneMixin:
         attributes = getattr(op, "attributes", {})
 
         with loc, self.insertion_point():
-            if op_name in {"py.cast.identity", "py.publish"}:
+            if op_name == "py.publish":
                 info = self.resolve_function_info_from_value(value)
                 if info is not None:
                     return self._build_python_callable(
@@ -76,7 +76,8 @@ class ExprCallableCloneMixin:
                 base = self._clone_bound_callable_metadata(operands[0], loc)
                 key = self._clone_bound_callable_metadata(operands[1], loc)
                 item = self._clone_bound_callable_metadata(operands[2], loc)
-                return py_ops.DictInsertOp(value.type, base, key, item).result
+                py_ops.DictInsertOp(base, key, item)
+                return base
             if op_name == "py.upcast":
                 cloned = self._clone_bound_callable_metadata(operands[0], loc)
                 return py_ops.UpcastOp(value.type, cloned).result
@@ -157,38 +158,41 @@ class ExprCallableCloneMixin:
             if op_name == "py.cast.from_prim":
                 cloned_input = self._clone_bound_callable_metadata(operands[0], loc)
                 return py_ops.CastFromPrimOp(value.type, cloned_input).result
-            if op_name == "py.num.add":
+            if op_name == "py.repr":
+                cloned_input = self._clone_bound_callable_metadata(operands[0], loc)
+                return py_ops.ReprOp(value.type, cloned_input).result
+            if op_name == "py.add":
                 lhs = self._clone_bound_callable_metadata(operands[0], loc)
                 rhs = self._clone_bound_callable_metadata(operands[1], loc)
-                return py_ops.NumAddOp(lhs, rhs).result
-            if op_name == "py.num.sub":
+                return py_ops.AddOp(value.type, lhs, rhs).result
+            if op_name == "py.sub":
                 lhs = self._clone_bound_callable_metadata(operands[0], loc)
                 rhs = self._clone_bound_callable_metadata(operands[1], loc)
-                return py_ops.NumSubOp(lhs, rhs).result
-            if op_name == "py.num.eq":
+                return py_ops.SubOp(value.type, lhs, rhs).result
+            if op_name == "py.eq":
                 lhs = self._clone_bound_callable_metadata(operands[0], loc)
                 rhs = self._clone_bound_callable_metadata(operands[1], loc)
-                return py_ops.NumEqOp(value.type, lhs, rhs).result
-            if op_name == "py.num.ne":
+                return py_ops.EqOp(value.type, lhs, rhs).result
+            if op_name == "py.ne":
                 lhs = self._clone_bound_callable_metadata(operands[0], loc)
                 rhs = self._clone_bound_callable_metadata(operands[1], loc)
-                return py_ops.NumNeOp(value.type, lhs, rhs).result
-            if op_name == "py.num.lt":
+                return py_ops.NeOp(value.type, lhs, rhs).result
+            if op_name == "py.lt":
                 lhs = self._clone_bound_callable_metadata(operands[0], loc)
                 rhs = self._clone_bound_callable_metadata(operands[1], loc)
-                return py_ops.NumLtOp(value.type, lhs, rhs).result
-            if op_name == "py.num.le":
+                return py_ops.LtOp(value.type, lhs, rhs).result
+            if op_name == "py.le":
                 lhs = self._clone_bound_callable_metadata(operands[0], loc)
                 rhs = self._clone_bound_callable_metadata(operands[1], loc)
-                return py_ops.NumLeOp(value.type, lhs, rhs).result
-            if op_name == "py.num.gt":
+                return py_ops.LeOp(value.type, lhs, rhs).result
+            if op_name == "py.gt":
                 lhs = self._clone_bound_callable_metadata(operands[0], loc)
                 rhs = self._clone_bound_callable_metadata(operands[1], loc)
-                return py_ops.NumGtOp(value.type, lhs, rhs).result
-            if op_name == "py.num.ge":
+                return py_ops.GtOp(value.type, lhs, rhs).result
+            if op_name == "py.ge":
                 lhs = self._clone_bound_callable_metadata(operands[0], loc)
                 rhs = self._clone_bound_callable_metadata(operands[1], loc)
-                return py_ops.NumGeOp(value.type, lhs, rhs).result
+                return py_ops.GeOp(value.type, lhs, rhs).result
             if op_name == "arith.cmpi":
                 lhs = self._clone_bound_callable_metadata(operands[0], loc)
                 rhs = self._clone_bound_callable_metadata(operands[1], loc)

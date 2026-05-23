@@ -4,29 +4,28 @@
 
 #include <cstdint>
 
-using namespace mlir;
-
 namespace py {
 
-ClassOp lookupClassSymbol(Operation *from, ClassType classType);
+ClassOp lookupClassSymbol(mlir::Operation *from, ClassType classType);
 
 namespace {
 
-static void getLocInfo(Location loc, MLIRContext *ctx, StringAttr &fileAttr,
-                       std::int64_t &line, std::int64_t &col) {
-  if (auto fileLoc = llvm::dyn_cast<FileLineColLoc>(loc)) {
+static void getLocInfo(mlir::Location loc, mlir::MLIRContext *ctx,
+                       mlir::StringAttr &fileAttr, std::int64_t &line,
+                       std::int64_t &col) {
+  if (auto fileLoc = llvm::dyn_cast<mlir::FileLineColLoc>(loc)) {
     fileAttr = fileLoc.getFilename();
     line = static_cast<std::int64_t>(fileLoc.getLine());
     col = static_cast<std::int64_t>(fileLoc.getColumn());
     return;
   }
-  if (auto nameLoc = llvm::dyn_cast<NameLoc>(loc)) {
+  if (auto nameLoc = llvm::dyn_cast<mlir::NameLoc>(loc)) {
     getLocInfo(nameLoc.getChildLoc(), ctx, fileAttr, line, col);
     return;
   }
-  if (auto fused = llvm::dyn_cast<FusedLoc>(loc)) {
+  if (auto fused = llvm::dyn_cast<mlir::FusedLoc>(loc)) {
     for (auto subloc : fused.getLocations()) {
-      if (auto subfile = llvm::dyn_cast<FileLineColLoc>(subloc)) {
+      if (auto subfile = llvm::dyn_cast<mlir::FileLineColLoc>(subloc)) {
         fileAttr = subfile.getFilename();
         line = static_cast<std::int64_t>(subfile.getLine());
         col = static_cast<std::int64_t>(subfile.getColumn());
@@ -34,177 +33,180 @@ static void getLocInfo(Location loc, MLIRContext *ctx, StringAttr &fileAttr,
       }
     }
   }
-  fileAttr = StringAttr::get(ctx, "<unknown>");
+  fileAttr = mlir::StringAttr::get(ctx, "<unknown>");
   line = 0;
   col = 0;
 }
 
-static StringAttr getFuncNameAttr(func::FuncOp func, MLIRContext *ctx) {
+static mlir::StringAttr getFuncNameAttr(mlir::func::FuncOp func,
+                                        mlir::MLIRContext *ctx) {
   if (!func)
-    return StringAttr::get(ctx, "<unknown>");
-  StringRef name = func.getName();
+    return mlir::StringAttr::get(ctx, "<unknown>");
+  llvm::StringRef name = func.getName();
   if (name == "main")
-    return StringAttr::get(ctx, "<module>");
-  return StringAttr::get(ctx, name);
+    return mlir::StringAttr::get(ctx, "<module>");
+  return mlir::StringAttr::get(ctx, name);
 }
 
-static func::FuncOp resolveLocalSelfHelper(func::FuncOp callee,
-                                           ModuleOp module) {
+static mlir::func::FuncOp resolveLocalSelfHelper(mlir::func::FuncOp callee,
+                                                 mlir::ModuleOp module) {
   auto helperAttr =
-      callee->getAttrOfType<SymbolRefAttr>("lython.local_self_helper");
+      callee->getAttrOfType<mlir::SymbolRefAttr>("ly.local_self_helper");
   if (!helperAttr)
     return nullptr;
   auto helperName = helperAttr.getLeafReference().empty()
                         ? helperAttr.getRootReference().getValue()
                         : helperAttr.getLeafReference().getValue();
-  return module.lookupSymbol<func::FuncOp>(helperName);
+  return module.lookupSymbol<mlir::func::FuncOp>(helperName);
 }
 
-static func::FuncOp resolveFreshInitHelper(func::FuncOp callee,
-                                           ModuleOp module) {
+static mlir::func::FuncOp resolveFreshInitHelper(mlir::func::FuncOp callee,
+                                                 mlir::ModuleOp module) {
   auto helperAttr =
-      callee->getAttrOfType<SymbolRefAttr>("lython.fresh_init_helper");
+      callee->getAttrOfType<mlir::SymbolRefAttr>("ly.fresh_init_helper");
   if (!helperAttr)
     return nullptr;
   auto helperName = helperAttr.getLeafReference().empty()
                         ? helperAttr.getRootReference().getValue()
                         : helperAttr.getLeafReference().getValue();
-  return module.lookupSymbol<func::FuncOp>(helperName);
+  return module.lookupSymbol<mlir::func::FuncOp>(helperName);
 }
 
-static func::FuncOp resolveVoidHelper(func::FuncOp callee, ModuleOp module) {
-  auto helperAttr = callee->getAttrOfType<SymbolRefAttr>("lython.void_helper");
-  if (!helperAttr)
-    return nullptr;
-  auto helperName = helperAttr.getLeafReference().empty()
-                        ? helperAttr.getRootReference().getValue()
-                        : helperAttr.getLeafReference().getValue();
-  return module.lookupSymbol<func::FuncOp>(helperName);
-}
-
-static func::FuncOp resolveClassReturnHelper(func::FuncOp callee,
-                                             ModuleOp module) {
+static mlir::func::FuncOp resolveVoidHelper(mlir::func::FuncOp callee,
+                                            mlir::ModuleOp module) {
   auto helperAttr =
-      callee->getAttrOfType<SymbolRefAttr>("lython.class_return_helper");
+      callee->getAttrOfType<mlir::SymbolRefAttr>("ly.void_helper");
   if (!helperAttr)
     return nullptr;
   auto helperName = helperAttr.getLeafReference().empty()
                         ? helperAttr.getRootReference().getValue()
                         : helperAttr.getLeafReference().getValue();
-  return module.lookupSymbol<func::FuncOp>(helperName);
+  return module.lookupSymbol<mlir::func::FuncOp>(helperName);
 }
 
-static std::string getPublishedBorrowHelperAttrName(unsigned argIndex) {
-  return "lython.published_borrow_helper_arg" + std::to_string(argIndex);
-}
-
-static func::FuncOp resolvePublishedBorrowHelper(func::FuncOp callee,
-                                                 unsigned argIndex,
-                                                 ModuleOp module) {
-  auto helperAttr = callee->getAttrOfType<SymbolRefAttr>(
-      getPublishedBorrowHelperAttrName(argIndex));
+static mlir::func::FuncOp resolveClassReturnHelper(mlir::func::FuncOp callee,
+                                                   mlir::ModuleOp module) {
+  auto helperAttr =
+      callee->getAttrOfType<mlir::SymbolRefAttr>("ly.class_return_helper");
   if (!helperAttr)
     return nullptr;
   auto helperName = helperAttr.getLeafReference().empty()
                         ? helperAttr.getRootReference().getValue()
                         : helperAttr.getLeafReference().getValue();
-  return module.lookupSymbol<func::FuncOp>(helperName);
+  return module.lookupSymbol<mlir::func::FuncOp>(helperName);
 }
 
-static bool arrayAttrContainsIndex(ArrayAttr attr, unsigned index) {
+static mlir::func::FuncOp
+resolvePublishedBorrowHelper(mlir::func::FuncOp callee, unsigned argIndex,
+                             mlir::ModuleOp module) {
+  auto helperAttr = callee->getAttrOfType<mlir::SymbolRefAttr>(
+      publication::borrow::Attr::name(argIndex));
+  if (!helperAttr)
+    return nullptr;
+  auto helperName = helperAttr.getLeafReference().empty()
+                        ? helperAttr.getRootReference().getValue()
+                        : helperAttr.getLeafReference().getValue();
+  return module.lookupSymbol<mlir::func::FuncOp>(helperName);
+}
+
+static bool arrayAttrContainsIndex(mlir::ArrayAttr attr, unsigned index) {
   if (!attr)
     return false;
-  for (Attribute element : attr) {
-    auto intAttr = dyn_cast<IntegerAttr>(element);
+  for (mlir::Attribute element : attr) {
+    auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(element);
     if (intAttr && intAttr.getInt() == static_cast<int64_t>(index))
       return true;
   }
   return false;
 }
 
-static FuncOp resolveDirectPyFuncSymbol(Operation *from, Value callable) {
-  callable = stripIdentityCasts(callable);
+static FuncOp resolveDirectPyFuncSymbol(mlir::Operation *from,
+                                        mlir::Value callable) {
+  callable = stripBridgeCasts(callable);
 
   if (auto funcObject = callable.getDefiningOp<FuncObjectOp>()) {
-    Operation *symbol =
-        SymbolTable::lookupNearestSymbolFrom(from, funcObject.getTargetAttr());
-    return dyn_cast_or_null<FuncOp>(symbol);
+    mlir::Operation *symbol = mlir::SymbolTable::lookupNearestSymbolFrom(
+        from, funcObject.getTargetAttr());
+    return mlir::dyn_cast_or_null<FuncOp>(symbol);
   }
   return nullptr;
 }
 
-static bool funcResultIsPublished(Operation *funcLike, unsigned resultIndex) {
-  return funcLike && arrayAttrContainsIndex(funcLike->getAttrOfType<ArrayAttr>(
-                                                "lython.returns_published"),
-                                            resultIndex);
+static bool funcResultIsPublished(mlir::Operation *funcLike,
+                                  unsigned resultIndex) {
+  return funcLike &&
+         arrayAttrContainsIndex(
+             funcLike->getAttrOfType<mlir::ArrayAttr>("ly.returns_published"),
+             resultIndex);
 }
 
-static bool isFreshClassInstanceValue(Value value) {
-  return isa_and_nonnull<ClassNewOp>(stripIdentityCasts(value).getDefiningOp());
+static bool isFreshClassInstanceValue(mlir::Value value) {
+  return mlir::isa_and_nonnull<ClassNewOp>(
+      stripBridgeCasts(value).getDefiningOp());
 }
 
-static bool isLocalClassInstanceValue(Value value) {
-  value = stripIdentityCasts(value);
-  if (auto arg = dyn_cast<BlockArgument>(value)) {
+static bool isLocalClassInstanceValue(mlir::Value value) {
+  value = stripBridgeCasts(value);
+  if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(value)) {
     auto *owner = arg.getOwner();
     auto func = owner ? owner->getParentOp() : nullptr;
-    auto funcOp = dyn_cast_or_null<func::FuncOp>(func);
+    auto funcOp = mlir::dyn_cast_or_null<mlir::func::FuncOp>(func);
     if (!funcOp || arg.getArgNumber() != 0)
       return false;
-    return static_cast<bool>(funcOp->getAttr("lython.local_self_arg0")) ||
-           static_cast<bool>(funcOp->getAttr("lython.zero_initialized_self"));
+    return static_cast<bool>(funcOp->getAttr("ly.local_self_arg0")) ||
+           static_cast<bool>(funcOp->getAttr("ly.zero_initialized_self"));
   }
 
-  if (!isa<ClassType>(value.getType()))
+  if (!mlir::isa<ClassType>(value.getType()))
     return false;
-  return isa_and_nonnull<ClassNewOp>(value.getDefiningOp());
+  return mlir::isa_and_nonnull<ClassNewOp>(value.getDefiningOp());
 }
 
-static bool isPublishedClassInstanceValue(Value value) {
-  value = stripIdentityCasts(value);
-  if (!isa<ClassType>(value.getType()))
+static bool isPublishedClassInstanceValue(mlir::Value value) {
+  value = stripBridgeCasts(value);
+  if (!mlir::isa<ClassType>(value.getType()))
     return false;
 
-  if (auto arg = dyn_cast<BlockArgument>(value)) {
-    Block *owner = arg.getOwner();
+  if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(value)) {
+    mlir::Block *owner = arg.getOwner();
     if (!owner)
       return false;
-    Block *pred = owner->getUniquePredecessor();
+    mlir::Block *pred = owner->getUniquePredecessor();
     if (!pred)
       return false;
-    auto invoke = dyn_cast_or_null<InvokeOp>(pred->getTerminator());
+    auto invoke = mlir::dyn_cast_or_null<InvokeOp>(pred->getTerminator());
     if (!invoke || invoke.getNormalDest() != owner)
       return false;
     auto callee = resolveDirectPyFuncSymbol(invoke, invoke.getCallable());
     return funcResultIsPublished(callee, arg.getArgNumber());
   }
 
-  Operation *def = value.getDefiningOp();
+  mlir::Operation *def = value.getDefiningOp();
   if (!def)
     return false;
-  if (isa<PublishOp, ClassPromoteOp, ListGetOp>(def))
+  if (mlir::isa<PublishOp, ClassPromoteOp, ListGetOp>(def))
     return true;
 
-  auto result = dyn_cast<OpResult>(value);
+  auto result = mlir::dyn_cast<mlir::OpResult>(value);
   if (!result)
     return false;
 
-  if (auto call = dyn_cast<CallOp>(def))
+  if (auto call = mlir::dyn_cast<CallOp>(def))
     return funcResultIsPublished(
         resolveDirectPyFuncSymbol(call, call.getCallable()),
         result.getResultNumber());
 
-  if (auto call = dyn_cast<CallVectorOp>(def))
+  if (auto call = mlir::dyn_cast<CallVectorOp>(def))
     return funcResultIsPublished(
         resolveDirectPyFuncSymbol(call, call.getCallable()),
         result.getResultNumber());
 
-  if (auto call = dyn_cast<func::CallOp>(def)) {
-    ModuleOp module = call->getParentOfType<ModuleOp>();
+  if (auto call = mlir::dyn_cast<mlir::func::CallOp>(def)) {
+    mlir::ModuleOp module = call->getParentOfType<mlir::ModuleOp>();
     if (!module)
       return false;
     return funcResultIsPublished(
-        module.lookupSymbol<func::FuncOp>(call.getCallee()),
+        module.lookupSymbol<mlir::func::FuncOp>(call.getCallee()),
         result.getResultNumber());
   }
 
@@ -213,189 +215,200 @@ static bool isPublishedClassInstanceValue(Value value) {
 
 } // namespace
 
-void emitTracebackPush(Location loc, func::FuncOp func, RuntimeAPI &runtime,
-                       ConversionPatternRewriter &rewriter) {
-  StringAttr fileAttr;
+void emitTracebackPush(mlir::Location loc, mlir::func::FuncOp func,
+                       RuntimeAPI &runtime,
+                       mlir::ConversionPatternRewriter &rewriter) {
+  mlir::StringAttr fileAttr;
   std::int64_t line = 0;
   std::int64_t col = 0;
   getLocInfo(loc, rewriter.getContext(), fileAttr, line, col);
-  StringAttr funcAttr = getFuncNameAttr(func, rewriter.getContext());
-  Value filePtr = runtime.getStringLiteral(loc, fileAttr);
-  Value funcPtr = runtime.getStringLiteral(loc, funcAttr);
-  Value lineConst = rewriter.create<LLVM::ConstantOp>(
+  mlir::StringAttr funcAttr = getFuncNameAttr(func, rewriter.getContext());
+  mlir::Value filePtr = runtime.getStringLiteral(loc, fileAttr);
+  mlir::Value funcPtr = runtime.getStringLiteral(loc, funcAttr);
+  mlir::Value lineConst = rewriter.create<mlir::LLVM::ConstantOp>(
       loc, rewriter.getI32Type(),
       rewriter.getI32IntegerAttr(static_cast<int32_t>(line)));
-  Value colConst = rewriter.create<LLVM::ConstantOp>(
+  mlir::Value colConst = rewriter.create<mlir::LLVM::ConstantOp>(
       loc, rewriter.getI32Type(),
       rewriter.getI32IntegerAttr(static_cast<int32_t>(col)));
-  runtime.call(loc, RuntimeSymbols::kTracebackPush, Type(),
-               ValueRange{filePtr, funcPtr, lineConst, colConst});
+  runtime.call(loc, RuntimeSymbols::kTracebackPush, mlir::Type(),
+               mlir::ValueRange{filePtr, funcPtr, lineConst, colConst});
 }
 
-bool isBuiltinPrintCallable(Value callable) {
-  while (auto identity = callable.getDefiningOp<CastIdentityOp>())
-    callable = identity.getInput();
-  auto call = callable.getDefiningOp<LLVM::CallOp>();
+bool isBuiltinPrintCallable(mlir::Value callable) {
+  callable = stripBridgeCasts(callable);
+  auto call = callable.getDefiningOp<mlir::LLVM::CallOp>();
   if (!call)
     return false;
   auto callee = call.getCallee();
   return callee && *callee == RuntimeSymbols::kGetBuiltinPrint;
 }
 
-void ensureLandingpad(Block *unwind, Location loc,
-                      ConversionPatternRewriter &rewriter) {
+void ensureLandingpad(mlir::Block *unwind, mlir::Location loc,
+                      mlir::ConversionPatternRewriter &rewriter) {
   if (!unwind)
     return;
-  if (!unwind->empty() && llvm::isa<LLVM::LandingpadOp>(unwind->front()))
+  if (!unwind->empty() && llvm::isa<mlir::LLVM::LandingpadOp>(unwind->front()))
     return;
   rewriter.setInsertionPointToStart(unwind);
-  auto ptrType = LLVM::LLVMPointerType::get(rewriter.getContext());
+  auto ptrType = mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
   auto i32Type = rewriter.getI32Type();
-  auto lpType = LLVM::LLVMStructType::getLiteral(
-      rewriter.getContext(), ArrayRef<Type>{ptrType, i32Type});
-  rewriter.create<LLVM::LandingpadOp>(loc, lpType, rewriter.getUnitAttr(),
-                                      ValueRange{});
+  auto lpType = mlir::LLVM::LLVMStructType::getLiteral(
+      rewriter.getContext(), llvm::ArrayRef<mlir::Type>{ptrType, i32Type});
+  rewriter.create<mlir::LLVM::LandingpadOp>(loc, lpType, rewriter.getUnitAttr(),
+                                            mlir::ValueRange{});
 }
 
-bool canUseVoidHelper(CallVectorOp op, func::FuncOp callee) {
-  auto helperAttr = callee->getAttrOfType<SymbolRefAttr>("lython.void_helper");
+bool canUseVoidHelper(CallVectorOp op, mlir::func::FuncOp callee) {
+  auto helperAttr =
+      callee->getAttrOfType<mlir::SymbolRefAttr>("ly.void_helper");
   if (!helperAttr)
     return false;
-  if (op.getNumResults() != 1 || !isa<NoneType>(op.getResult(0).getType()))
+  if (op.getNumResults() != 1 ||
+      !mlir::isa<NoneType>(op.getResult(0).getType()))
     return false;
-  for (Operation *user : op.getResult(0).getUsers())
-    if (!isa<DecRefOp>(user))
+  for (mlir::Operation *user : op.getResult(0).getUsers())
+    if (!mlir::isa<DecRefOp>(user))
       return false;
   return true;
 }
 
-Value stripIdentityCasts(Value value) {
-  while (auto identity = value.getDefiningOp<CastIdentityOp>())
-    value = identity.getInput();
+mlir::Value stripBridgeCasts(mlir::Value value) {
+  while (auto cast = value.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+    if (cast->getNumOperands() != 1)
+      break;
+    value = cast.getOperand(0);
+  }
   return value;
 }
 
-FailureOr<LLVM::LLVMStructType>
-getStaticClassObjectType(Operation *from, ClassType classType,
+mlir::FailureOr<mlir::LLVM::LLVMStructType>
+getStaticClassObjectType(mlir::Operation *from, ClassType classType,
                          const PyLLVMTypeConverter &typeConverter) {
   ClassOp classOp = lookupClassSymbol(from, classType);
   if (!classOp) {
     from->emitError("unable to resolve class '")
         << classType.getClassName() << "'";
-    return failure();
+    return mlir::failure();
   }
 
-  ArrayAttr fieldNamesAttr = classOp.getFieldNamesAttr();
-  ArrayAttr fieldTypesAttr = classOp.getFieldTypesAttr();
+  mlir::ArrayAttr fieldNamesAttr = classOp.getFieldNamesAttr();
+  mlir::ArrayAttr fieldTypesAttr = classOp.getFieldTypesAttr();
   if (!fieldNamesAttr && !fieldTypesAttr) {
-    auto emptyStorage =
-        LLVM::LLVMStructType::getLiteral(from->getContext(), ArrayRef<Type>{});
-    return LLVM::LLVMStructType::getLiteral(
+    auto emptyStorage = mlir::LLVM::LLVMStructType::getLiteral(
+        from->getContext(), llvm::ArrayRef<mlir::Type>{});
+    return mlir::LLVM::LLVMStructType::getLiteral(
         from->getContext(),
-        ArrayRef<Type>{emptyStorage, IntegerType::get(from->getContext(), 1),
-                       IntegerType::get(from->getContext(), 32),
-                       IntegerType::get(from->getContext(), 64)});
+        llvm::ArrayRef<mlir::Type>{
+            emptyStorage, mlir::IntegerType::get(from->getContext(), 1),
+            mlir::IntegerType::get(from->getContext(), 32),
+            mlir::IntegerType::get(from->getContext(), 64)});
   }
   if (!fieldNamesAttr || !fieldTypesAttr ||
       fieldNamesAttr.size() != fieldTypesAttr.size()) {
     from->emitError("class '")
         << classType.getClassName() << "' has malformed static field schema";
-    return failure();
+    return mlir::failure();
   }
 
-  SmallVector<Type, 8> loweredFieldTypes;
-  auto getMemRefDescriptorType = [&](MemRefType memrefType) -> Type {
+  llvm::SmallVector<mlir::Type, 8> loweredFieldTypes;
+  auto getMemRefDescriptorType =
+      [&](mlir::MemRefType memrefType) -> mlir::Type {
     if (memrefType.getRank() != 1)
-      return Type();
-    auto ptrType = LLVM::LLVMPointerType::get(from->getContext());
-    auto i64Type = IntegerType::get(from->getContext(), 64);
-    auto sizesType = LLVM::LLVMArrayType::get(i64Type, 1);
-    return LLVM::LLVMStructType::getLiteral(
+      return mlir::Type();
+    auto ptrType = mlir::LLVM::LLVMPointerType::get(from->getContext());
+    auto i64Type = mlir::IntegerType::get(from->getContext(), 64);
+    auto sizesType = mlir::LLVM::LLVMArrayType::get(i64Type, 1);
+    return mlir::LLVM::LLVMStructType::getLiteral(
         from->getContext(),
-        ArrayRef<Type>{ptrType, ptrType, i64Type, sizesType, sizesType});
+        llvm::ArrayRef<mlir::Type>{ptrType, ptrType, i64Type, sizesType,
+                                   sizesType});
   };
-  for (Attribute typeAttr : fieldTypesAttr) {
-    auto mlirTypeAttr = dyn_cast<TypeAttr>(typeAttr);
+  for (mlir::Attribute typeAttr : fieldTypesAttr) {
+    auto mlirTypeAttr = mlir::dyn_cast<mlir::TypeAttr>(typeAttr);
     if (!mlirTypeAttr) {
       from->emitError("class '")
           << classType.getClassName() << "' has malformed static field schema";
-      return failure();
+      return mlir::failure();
     }
-    SmallVector<Type, 4> convertedTypes;
-    if (failed(typeConverter.convertType(mlirTypeAttr.getValue(),
-                                         convertedTypes)) ||
+    llvm::SmallVector<mlir::Type, 4> convertedTypes;
+    if (mlir::failed(typeConverter.convertType(mlirTypeAttr.getValue(),
+                                               convertedTypes)) ||
         convertedTypes.empty()) {
       from->emitError("failed to convert field type ")
           << mlirTypeAttr.getValue() << " in class '"
           << classType.getClassName() << "'";
-      return failure();
+      return mlir::failure();
     }
     if (convertedTypes.size() == 1) {
-      Type lowered = convertedTypes.front();
-      if (auto memrefType = dyn_cast<MemRefType>(lowered))
+      mlir::Type lowered = convertedTypes.front();
+      if (auto memrefType = mlir::dyn_cast<mlir::MemRefType>(lowered))
         lowered = getMemRefDescriptorType(memrefType);
       if (!lowered) {
         from->emitError("failed to convert field type ")
             << mlirTypeAttr.getValue() << " in class '"
             << classType.getClassName() << "'";
-        return failure();
+        return mlir::failure();
       }
       loweredFieldTypes.push_back(lowered);
       continue;
     }
 
-    SmallVector<Type, 4> descriptorTypes;
-    for (Type converted : convertedTypes) {
-      auto memrefType = dyn_cast<MemRefType>(converted);
+    llvm::SmallVector<mlir::Type, 4> descriptorTypes;
+    for (mlir::Type converted : convertedTypes) {
+      auto memrefType = mlir::dyn_cast<mlir::MemRefType>(converted);
       if (!memrefType) {
         from->emitError("failed to convert field type ")
             << mlirTypeAttr.getValue() << " in class '"
             << classType.getClassName() << "'";
-        return failure();
+        return mlir::failure();
       }
-      Type descriptorType = getMemRefDescriptorType(memrefType);
+      mlir::Type descriptorType = getMemRefDescriptorType(memrefType);
       if (!descriptorType) {
         from->emitError("failed to convert field type ")
             << mlirTypeAttr.getValue() << " in class '"
             << classType.getClassName() << "'";
-        return failure();
+        return mlir::failure();
       }
       descriptorTypes.push_back(descriptorType);
     }
-    loweredFieldTypes.push_back(
-        LLVM::LLVMStructType::getLiteral(from->getContext(), descriptorTypes));
+    loweredFieldTypes.push_back(mlir::LLVM::LLVMStructType::getLiteral(
+        from->getContext(), descriptorTypes));
   }
 
-  auto storageType =
-      LLVM::LLVMStructType::getLiteral(from->getContext(), loweredFieldTypes);
-  return LLVM::LLVMStructType::getLiteral(
+  auto storageType = mlir::LLVM::LLVMStructType::getLiteral(from->getContext(),
+                                                            loweredFieldTypes);
+  return mlir::LLVM::LLVMStructType::getLiteral(
       from->getContext(),
-      ArrayRef<Type>{storageType, IntegerType::get(from->getContext(), 1),
-                     IntegerType::get(from->getContext(), 32),
-                     IntegerType::get(from->getContext(), 64)});
+      llvm::ArrayRef<mlir::Type>{
+          storageType, mlir::IntegerType::get(from->getContext(), 1),
+          mlir::IntegerType::get(from->getContext(), 32),
+          mlir::IntegerType::get(from->getContext(), 64)});
 }
 
-Value createStaticClassSlot(Location loc, LLVM::LLVMStructType objectType,
-                            ConversionPatternRewriter &rewriter,
-                            Operation *anchor) {
-  auto ptrType = LLVM::LLVMPointerType::get(rewriter.getContext());
+mlir::Value createStaticClassSlot(mlir::Location loc,
+                                  mlir::LLVM::LLVMStructType objectType,
+                                  mlir::ConversionPatternRewriter &rewriter,
+                                  mlir::Operation *anchor) {
+  auto ptrType = mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
   auto i64Type = rewriter.getI64Type();
-  auto parentFunc = anchor->getParentOfType<func::FuncOp>();
+  auto parentFunc = anchor->getParentOfType<mlir::func::FuncOp>();
   if (!parentFunc)
-    return Value();
+    return mlir::Value();
 
-  OpBuilder::InsertionGuard guard(rewriter);
+  mlir::OpBuilder::InsertionGuard guard(rewriter);
   rewriter.setInsertionPointToStart(&parentFunc.getBody().front());
-  Value one = rewriter.create<LLVM::ConstantOp>(loc, i64Type,
-                                                rewriter.getI64IntegerAttr(1));
-  return rewriter.create<LLVM::AllocaOp>(loc, ptrType, objectType, one,
-                                         /*alignment=*/0);
+  mlir::Value one = rewriter.create<mlir::LLVM::ConstantOp>(
+      loc, i64Type, rewriter.getI64IntegerAttr(1));
+  return rewriter.create<mlir::LLVM::AllocaOp>(loc, ptrType, objectType, one,
+                                               /*alignment=*/0);
 }
 
-func::FuncOp resolvePreferredDirectHelper(func::FuncOp callee,
-                                          ValueRange operands, ModuleOp module,
-                                          bool allowVoidHelper) {
-  func::FuncOp preferred = callee;
+mlir::func::FuncOp resolvePreferredDirectHelper(mlir::func::FuncOp callee,
+                                                mlir::ValueRange operands,
+                                                mlir::ModuleOp module,
+                                                bool allowVoidHelper) {
+  mlir::func::FuncOp preferred = callee;
   if (!allowVoidHelper)
     if (auto classReturnHelper = resolveClassReturnHelper(callee, module))
       preferred = classReturnHelper;
@@ -410,7 +423,8 @@ func::FuncOp resolvePreferredDirectHelper(func::FuncOp callee,
         preferred = freshHelper, usedFreshHelper = true;
     }
     if (!usedFreshHelper && isLocalClassInstanceValue(operands.front())) {
-      func::FuncOp localHelperOwner = allowVoidHelper ? callee : preferred;
+      mlir::func::FuncOp localHelperOwner =
+          allowVoidHelper ? callee : preferred;
       if (auto localHelper = resolveLocalSelfHelper(localHelperOwner, module))
         preferred = localHelper;
     }
@@ -428,27 +442,28 @@ func::FuncOp resolvePreferredDirectHelper(func::FuncOp callee,
 }
 
 void eraseNoneResultUsers(CallVectorOp op,
-                          ConversionPatternRewriter &rewriter) {
-  for (Operation *user : llvm::make_early_inc_range(op.getResult(0).getUsers()))
+                          mlir::ConversionPatternRewriter &rewriter) {
+  for (mlir::Operation *user :
+       llvm::make_early_inc_range(op.getResult(0).getUsers()))
     rewriter.eraseOp(user);
 }
 
-void materializeLogicalResults(Location loc, TypeRange logicalTypes,
-                               ValueRange loweredResults,
-                               SmallVectorImpl<Value> &results,
+void materializeLogicalResults(mlir::Location loc, mlir::TypeRange logicalTypes,
+                               mlir::ValueRange loweredResults,
+                               llvm::SmallVectorImpl<mlir::Value> &results,
                                const PyLLVMTypeConverter &typeConverter,
-                               ConversionPatternRewriter &rewriter) {
+                               mlir::ConversionPatternRewriter &rewriter) {
   results.clear();
   results.reserve(logicalTypes.size());
   unsigned loweredIndex = 0;
-  for (Type logicalType : logicalTypes) {
-    SmallVector<Type, 4> convertedTypes;
-    if (failed(typeConverter.convertType(logicalType, convertedTypes)) ||
+  for (mlir::Type logicalType : logicalTypes) {
+    llvm::SmallVector<mlir::Type, 4> convertedTypes;
+    if (mlir::failed(typeConverter.convertType(logicalType, convertedTypes)) ||
         convertedTypes.empty() ||
         loweredIndex + convertedTypes.size() > loweredResults.size())
       return;
 
-    ValueRange loweredGroup =
+    mlir::ValueRange loweredGroup =
         loweredResults.slice(loweredIndex, convertedTypes.size());
     loweredIndex += convertedTypes.size();
     if (loweredGroup.size() == 1 &&
@@ -457,81 +472,87 @@ void materializeLogicalResults(Location loc, TypeRange logicalTypes,
       continue;
     }
     if (loweredGroup.size() == 1) {
-      auto cast = rewriter.create<CastIdentityOp>(loc, logicalType,
-                                                  loweredGroup.front());
-      results.push_back(cast.getResult());
+      auto cast = rewriter.create<mlir::UnrealizedConversionCastOp>(
+          loc, mlir::TypeRange{logicalType}, loweredGroup);
+      results.push_back(cast.getResult(0));
       continue;
     }
-    auto cast = rewriter.create<UnrealizedConversionCastOp>(
-        loc, TypeRange{logicalType}, loweredGroup);
+    auto cast = rewriter.create<mlir::UnrealizedConversionCastOp>(
+        loc, mlir::TypeRange{logicalType}, loweredGroup);
     results.push_back(cast.getResult(0));
   }
 }
 
-void materializeInvokeNormalResult(InvokeOp op, Value loweredResult,
-                                   ConversionPatternRewriter &rewriter) {
+void materializeInvokeNormalResult(InvokeOp op, mlir::Value loweredResult,
+                                   mlir::ConversionPatternRewriter &rewriter) {
   if (op.getNormalDestOperands().empty())
     return;
-  Block *normalDest = op.getNormalDest();
+  mlir::Block *normalDest = op.getNormalDest();
   if (!normalDest || normalDest->getNumArguments() == 0)
     return;
 
-  BlockArgument arg = normalDest->getArgument(0);
-  Value replacement = loweredResult;
+  mlir::BlockArgument arg = normalDest->getArgument(0);
+  mlir::Value replacement = loweredResult;
   if (loweredResult.getType() != arg.getType()) {
-    Type logicalType = arg.getType();
+    mlir::Type logicalType = arg.getType();
     arg.setType(loweredResult.getType());
-    OpBuilder::InsertionGuard guard(rewriter);
+    mlir::OpBuilder::InsertionGuard guard(rewriter);
     rewriter.setInsertionPointToStart(normalDest);
-    replacement =
-        rewriter.create<CastIdentityOp>(op.getLoc(), logicalType, loweredResult)
-            .getResult();
+    replacement = rewriter
+                      .create<mlir::UnrealizedConversionCastOp>(
+                          op.getLoc(), mlir::TypeRange{logicalType},
+                          mlir::ValueRange{loweredResult})
+                      .getResult(0);
   }
   arg.replaceAllUsesWith(replacement);
 }
 
-Block *createInvokeNormalBridge(Block *finalDest, Type bridgeArgType,
-                                Location loc,
-                                ConversionPatternRewriter &rewriter) {
+mlir::Block *
+createInvokeNormalBridge(mlir::Block *finalDest, mlir::Type bridgeArgType,
+                         mlir::Location loc,
+                         mlir::ConversionPatternRewriter &rewriter) {
   if (!finalDest)
     return nullptr;
-  auto *bridge = new Block();
+  auto *bridge = new mlir::Block();
   bridge->addArgument(bridgeArgType, loc);
   bridge->insertBefore(finalDest);
   return bridge;
 }
 
-void finalizeInvokeNormalBridge(Block *bridge, Block *finalDest,
-                                Value forwardedValue, Location loc,
-                                ConversionPatternRewriter &rewriter) {
+void finalizeInvokeNormalBridge(mlir::Block *bridge, mlir::Block *finalDest,
+                                mlir::Value forwardedValue, mlir::Location loc,
+                                mlir::ConversionPatternRewriter &rewriter) {
   if (!bridge || !finalDest || finalDest->getNumArguments() == 0)
     return;
 
-  BlockArgument finalArg = finalDest->getArgument(0);
+  mlir::BlockArgument finalArg = finalDest->getArgument(0);
   if (forwardedValue.getType() != finalArg.getType()) {
-    Type logicalType = finalArg.getType();
+    mlir::Type logicalType = finalArg.getType();
     finalArg.setType(forwardedValue.getType());
-    OpBuilder::InsertionGuard guard(rewriter);
+    mlir::OpBuilder::InsertionGuard guard(rewriter);
     rewriter.setInsertionPointToStart(finalDest);
-    Value replacement =
-        rewriter.create<CastIdentityOp>(loc, logicalType, forwardedValue)
-            .getResult();
+    mlir::Value replacement = rewriter
+                                  .create<mlir::UnrealizedConversionCastOp>(
+                                      loc, mlir::TypeRange{logicalType},
+                                      mlir::ValueRange{forwardedValue})
+                                  .getResult(0);
     finalArg.replaceAllUsesWith(replacement);
   }
-  OpBuilder::InsertionGuard guard(rewriter);
+  mlir::OpBuilder::InsertionGuard guard(rewriter);
   rewriter.setInsertionPointToEnd(bridge);
-  rewriter.create<cf::BranchOp>(loc, finalDest, ValueRange{forwardedValue});
+  rewriter.create<mlir::cf::BranchOp>(loc, finalDest,
+                                      mlir::ValueRange{forwardedValue});
 }
 
-void eraseInvokeNormalSeedDrops(InvokeOp op, Value logicalSeed,
-                                ConversionPatternRewriter &rewriter) {
-  Block *normalDest = op.getNormalDest();
+void eraseInvokeNormalSeedDrops(InvokeOp op, mlir::Value logicalSeed,
+                                mlir::ConversionPatternRewriter &rewriter) {
+  mlir::Block *normalDest = op.getNormalDest();
   if (!normalDest)
     return;
 
-  SmallVector<DecRefOp> decRefs;
-  for (Operation &nested : *normalDest)
-    if (auto decRef = dyn_cast<DecRefOp>(&nested))
+  llvm::SmallVector<DecRefOp> decRefs;
+  for (mlir::Operation &nested : *normalDest)
+    if (auto decRef = mlir::dyn_cast<DecRefOp>(&nested))
       if (decRef.getObject() == logicalSeed)
         decRefs.push_back(decRef);
 
@@ -539,10 +560,12 @@ void eraseInvokeNormalSeedDrops(InvokeOp op, Value logicalSeed,
     rewriter.eraseOp(decRef);
 }
 
-void populatePyCallLoweringPatterns(PyLLVMTypeConverter &typeConverter,
-                                    RewritePatternSet &patterns) {
-  populatePyDirectCallLoweringPatterns(typeConverter, patterns);
-  populatePyInvokeLoweringPatterns(typeConverter, patterns);
+namespace lowering::call::Patterns {
+void populate(PyLLVMTypeConverter &typeConverter,
+              mlir::RewritePatternSet &patterns) {
+  lowering::call::direct::Patterns::populate(typeConverter, patterns);
+  lowering::call::invoke::Patterns::populate(typeConverter, patterns);
 }
+} // namespace lowering::call::Patterns
 
 } // namespace py

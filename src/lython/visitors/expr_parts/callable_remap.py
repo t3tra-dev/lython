@@ -66,7 +66,7 @@ class ExprCallableRemapMixin:
         operands = list(getattr(op, "operands", ()))
         attributes = getattr(op, "attributes", {})
 
-        if op_name in {"py.cast.identity", "py.publish"}:
+        if op_name == "py.publish":
             if not operands:
                 cache[cache_key] = None
                 return None
@@ -134,12 +134,12 @@ class ExprCallableRemapMixin:
                 if any(operand is None for operand in remapped_operands):
                     result = None
                 else:
-                    result = py_ops.DictInsertOp(
-                        value.type,
+                    py_ops.DictInsertOp(
                         remapped_operands[0],
                         remapped_operands[1],
                         remapped_operands[2],
-                    ).result
+                    )
+                    result = remapped_operands[0]
             elif op_name == "py.upcast":
                 if not operands:
                     result = None
@@ -281,7 +281,23 @@ class ExprCallableRemapMixin:
                         if remapped_input is not None
                         else None
                     )
-            elif op_name == "py.num.add":
+            elif op_name == "py.repr":
+                remapped_input = self._remap_summary_value_to_callsite(
+                    operands[0],
+                    summary_info=summary_info,
+                    positional_param_names=positional_param_names,
+                    kwonly_names=kwonly_names,
+                    positional_arg_values=positional_arg_values,
+                    keyword_arg_values=keyword_arg_values,
+                    loc=loc,
+                    cache=cache,
+                )
+                result = (
+                    py_ops.ReprOp(value.type, remapped_input).result
+                    if remapped_input is not None
+                    else None
+                )
+            elif op_name == "py.add":
                 remapped_lhs = self._remap_summary_value_to_callsite(
                     operands[0],
                     summary_info=summary_info,
@@ -305,8 +321,8 @@ class ExprCallableRemapMixin:
                 if remapped_lhs is None or remapped_rhs is None:
                     result = None
                 else:
-                    result = py_ops.NumAddOp(remapped_lhs, remapped_rhs).result
-            elif op_name == "py.num.sub":
+                    result = py_ops.AddOp(value.type, remapped_lhs, remapped_rhs).result
+            elif op_name == "py.sub":
                 remapped_lhs = self._remap_summary_value_to_callsite(
                     operands[0],
                     summary_info=summary_info,
@@ -330,14 +346,14 @@ class ExprCallableRemapMixin:
                 if remapped_lhs is None or remapped_rhs is None:
                     result = None
                 else:
-                    result = py_ops.NumSubOp(remapped_lhs, remapped_rhs).result
+                    result = py_ops.SubOp(value.type, remapped_lhs, remapped_rhs).result
             elif op_name in {
-                "py.num.eq",
-                "py.num.ne",
-                "py.num.lt",
-                "py.num.le",
-                "py.num.gt",
-                "py.num.ge",
+                "py.eq",
+                "py.ne",
+                "py.lt",
+                "py.le",
+                "py.gt",
+                "py.ge",
             }:
                 remapped_lhs = self._remap_summary_value_to_callsite(
                     operands[0],
@@ -361,30 +377,18 @@ class ExprCallableRemapMixin:
                 )
                 if remapped_lhs is None or remapped_rhs is None:
                     result = None
-                elif op_name == "py.num.eq":
-                    result = py_ops.NumEqOp(
-                        value.type, remapped_lhs, remapped_rhs
-                    ).result
-                elif op_name == "py.num.ne":
-                    result = py_ops.NumNeOp(
-                        value.type, remapped_lhs, remapped_rhs
-                    ).result
-                elif op_name == "py.num.lt":
-                    result = py_ops.NumLtOp(
-                        value.type, remapped_lhs, remapped_rhs
-                    ).result
-                elif op_name == "py.num.le":
-                    result = py_ops.NumLeOp(
-                        value.type, remapped_lhs, remapped_rhs
-                    ).result
-                elif op_name == "py.num.gt":
-                    result = py_ops.NumGtOp(
-                        value.type, remapped_lhs, remapped_rhs
-                    ).result
+                elif op_name == "py.eq":
+                    result = py_ops.EqOp(value.type, remapped_lhs, remapped_rhs).result
+                elif op_name == "py.ne":
+                    result = py_ops.NeOp(value.type, remapped_lhs, remapped_rhs).result
+                elif op_name == "py.lt":
+                    result = py_ops.LtOp(value.type, remapped_lhs, remapped_rhs).result
+                elif op_name == "py.le":
+                    result = py_ops.LeOp(value.type, remapped_lhs, remapped_rhs).result
+                elif op_name == "py.gt":
+                    result = py_ops.GtOp(value.type, remapped_lhs, remapped_rhs).result
                 else:
-                    result = py_ops.NumGeOp(
-                        value.type, remapped_lhs, remapped_rhs
-                    ).result
+                    result = py_ops.GeOp(value.type, remapped_lhs, remapped_rhs).result
             elif op_name == "arith.cmpi":
                 remapped_lhs = self._remap_summary_value_to_callsite(
                     operands[0],

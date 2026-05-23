@@ -54,7 +54,6 @@ class StmtAssignMixin:
 
         if isinstance(target, ast.Attribute):
             obj = self.require_value(target.value, self.visit(target.value))
-            attr_type = self.get_attribute_type(obj.type, target.attr)
             pending_attrs = getattr(self, "_pending_attributes", None)
             if (
                 pending_attrs is not None
@@ -81,6 +80,8 @@ class StmtAssignMixin:
                 pending_attrs[target.attr] = inferred_type
                 attr_type = inferred_type
                 self._current_method_mutates_self = True
+            else:
+                attr_type = self.get_attribute_type(obj.type, target.attr)
             if str(obj.type).startswith('!py.class<"'):
                 value = self.coerce_value_to_type(value, attr_type, self._loc(node))
             with self._loc(node), self.insertion_point():
@@ -99,11 +100,7 @@ class StmtAssignMixin:
             key = self.coerce_value_to_type(key, key_type, self._loc(node))
             value = self.coerce_value_to_type(value, value_type, self._loc(node))
             with self._loc(node), self.insertion_point():
-                updated = py_ops.DictInsertOp(
-                    container.type, container, key, value
-                ).result
-            if isinstance(target.value, ast.Name):
-                self.define_symbol(target.value.id, updated)
+                py_ops.DictInsertOp(container, key, value)
             return
 
         raise NotImplementedError(
@@ -167,9 +164,9 @@ class StmtAssignMixin:
                 if self.is_primitive_int_type(lhs.type):
                     return arith_ops.SubIOp(lhs, rhs).result
         if isinstance(op, ast.Add):
-            return py_ops.NumAddOp(lhs, rhs).result
+            return py_ops.AddOp(lhs.type, lhs, rhs).result
         if isinstance(op, ast.Sub):
-            return py_ops.NumSubOp(lhs, rhs).result
+            return py_ops.SubOp(lhs.type, lhs, rhs).result
         raise NotImplementedError(f"Operator {type(op).__name__} not supported")
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
