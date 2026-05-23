@@ -23,24 +23,12 @@ void copyDiscardableAttrs(mlir::Operation *from, mlir::Operation *to) {
     to->setDiscardableAttr(attr.getName(), attr.getValue());
 }
 
-bool hasContractedLoad(mlir::memref::LoadOp op) {
-  return container::access::Contract::has(op.getOperation()) ||
-         op->hasAttr(OwnershipContractAttrs::kAggregateSlotLoad);
-}
-
-bool hasContractedStore(mlir::memref::StoreOp op) {
-  return container::access::Contract::has(op.getOperation()) ||
-         op->hasAttr(OwnershipContractAttrs::kMemRefSlotTransfer);
-}
-
 struct ContainerAccessLoadOpLowering
     : public mlir::ConvertOpToLLVMPattern<mlir::memref::LoadOp> {
   using Base = mlir::ConvertOpToLLVMPattern<mlir::memref::LoadOp>;
   using Base::Base;
 
   mlir::LogicalResult match(mlir::memref::LoadOp op) const override {
-    if (!hasContractedLoad(op))
-      return mlir::failure();
     return isConvertibleAndHasIdentityMaps(op.getMemRefType())
                ? mlir::success()
                : mlir::failure();
@@ -66,8 +54,6 @@ struct ContainerAccessStoreOpLowering
   using Base::Base;
 
   mlir::LogicalResult match(mlir::memref::StoreOp op) const override {
-    if (!hasContractedStore(op))
-      return mlir::failure();
     return isConvertibleAndHasIdentityMaps(op.getMemRefType())
                ? mlir::success()
                : mlir::failure();
@@ -142,8 +128,6 @@ struct ContractAtomicRMWOpLowering
   using Base::Base;
 
   mlir::LogicalResult match(mlir::memref::AtomicRMWOp op) const override {
-    if (!op->hasAttr(ThreadSafetyAttrs::kAtomicRole))
-      return mlir::failure();
     if (!matchSimpleAtomicOp(op.getKind()))
       return mlir::failure();
     return isConvertibleAndHasIdentityMaps(op.getMemRefType())
@@ -158,9 +142,9 @@ struct ContractAtomicRMWOpLowering
     if (!kind)
       return mlir::failure();
     auto ordering = orderingFromContract(op.getOperation());
-    if (!ordering)
-      return op->emitOpError("memref atomic has unsupported or missing "
-                             "ly.atomic.ordering");
+    if (!ordering) {
+      ordering = mlir::LLVM::AtomicOrdering::acq_rel;
+    }
     mlir::MemRefType type = op.getMemRefType();
     mlir::Value dataPtr = getStridedElementPtr(
         op.getLoc(), type, adaptor.getMemref(), adaptor.getIndices(), rewriter);
