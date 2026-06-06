@@ -150,6 +150,73 @@ bool control::llvmReleaseToZero(mlir::Value condition,
          matches(cmp.getRhs(), cmp.getLhs());
 }
 
+namespace {
+
+namespace host_dealloc {
+
+static bool shape(mlir::LLVM::CallOp call) {
+  return call.getNumResults() == 0 && call.getNumOperands() == 1 &&
+         mlir::isa<mlir::LLVM::LLVMPointerType>(call.getOperand(0).getType());
+}
+
+static mlir::LogicalResult requireShape(mlir::LLVM::CallOp call,
+                                        llvm::StringRef contractName) {
+  if (shape(call))
+    return mlir::success();
+  return call->emitOpError()
+         << contractName
+         << " contract must be attached to a void single-pointer host dealloc "
+            "boundary";
+}
+
+static mlir::LogicalResult
+requireDescriptorAllocated(mlir::LLVM::CallOp call,
+                           llvm::StringRef contractName) {
+  if (provenance::descriptorAllocated(call.getOperand(0)))
+    return mlir::success();
+  return call->emitOpError()
+         << contractName
+         << " contract does not target a lowered memref descriptor allocated "
+            "pointer";
+}
+
+} // namespace host_dealloc
+
+static bool objectReleaseToZero(mlir::Value condition) {
+  condition = pointer::stripCasts(condition);
+  if (!condition)
+    return false;
+  mlir::Operation *def = condition.getDefiningOp();
+  if (!def)
+    return false;
+  if (def->hasAttr(OwnershipContractAttrs::kObjectReleaseToZero))
+    return true;
+  llvm::StringRef name = def->getName().getStringRef();
+  if ((name == "llvm.sext" || name == "llvm.zext" || name == "llvm.trunc") &&
+      def->getNumOperands() == 1)
+    return objectReleaseToZero(def->getOperand(0));
+  return false;
+}
+
+static bool guardedByObjectReleaseToZero(mlir::LLVM::LLVMFuncOp fn,
+                                         mlir::Operation *dealloc) {
+  mlir::DominanceInfo dominance(fn.getOperation());
+  bool guarded = false;
+  fn.walk([&](mlir::Operation *terminator) {
+    if (guarded || terminator->getNumSuccessors() < 2)
+      return;
+    mlir::Value condition = control::condition(terminator);
+    if (!objectReleaseToZero(condition))
+      return;
+    mlir::Block *deallocSuccessor = terminator->getSuccessor(0);
+    guarded = ::py::threadsafe::dominance::block(deallocSuccessor, dealloc,
+                                                 dominance);
+  });
+  return guarded;
+}
+
+} // namespace
+
 mlir::Value control::condition(mlir::Operation *terminator) {
   if (auto branch = mlir::dyn_cast<mlir::cf::CondBranchOp>(terminator))
     return branch.getCondition();
@@ -159,6 +226,37 @@ mlir::Value control::condition(mlir::Operation *terminator) {
 }
 
 mlir::LogicalResult verifier::llvm::FreeCall::verify(mlir::LLVM::CallOp call) {
+  if (call->hasAttr(AsyncSafetyAttrs::kExceptionCellFree)) {
+    if (mlir::failed(
+            host_dealloc::requireShape(call, "async exception cell free")))
+      return mlir::failure();
+    if (!provenance::asyncExceptionCellAllocated(call.getOperand(0)))
+      return call->emitOpError(
+          "async exception cell free does not target a lowered memref "
+          "descriptor allocated pointer");
+    return mlir::success();
+  }
+
+  if (call->hasAttr(ClassSafetyAttrs::kDeallocPart)) {
+    if (mlir::failed(host_dealloc::requireShape(call, "class dealloc")))
+      return mlir::failure();
+    return host_dealloc::requireDescriptorAllocated(call, "class dealloc");
+  }
+
+  if (call->hasAttr(OwnershipContractAttrs::kObjectDeallocPart)) {
+    if (mlir::failed(host_dealloc::requireShape(call, "object dealloc")))
+      return mlir::failure();
+    if (mlir::failed(
+            host_dealloc::requireDescriptorAllocated(call, "object dealloc")))
+      return mlir::failure();
+    auto fn = call->getParentOfType<mlir::LLVM::LLVMFuncOp>();
+    if (!fn || !guardedByObjectReleaseToZero(fn, call.getOperation()))
+      return call->emitOpError(
+          "object dealloc contract is not guarded by object refcount release "
+          "returning zero");
+    return mlir::success();
+  }
+
   auto group =
       attrs::str(call.getOperation(), ContainerSafetyAttrs::kDeallocGroup);
   if (!group)
@@ -169,10 +267,11 @@ mlir::LogicalResult verifier::llvm::FreeCall::verify(mlir::LLVM::CallOp call) {
     return call->emitOpError("managed container free is outside an LLVM "
                              "function");
 
-  if (call.getNumOperands() < 1 ||
-      !provenance::descriptorAllocated(call.getOperand(0)))
-    return call->emitOpError("managed container free does not target a lowered "
-                             "memref descriptor allocated pointer");
+  if (mlir::failed(host_dealloc::requireShape(call, "managed container")))
+    return mlir::failure();
+  if (mlir::failed(
+          host_dealloc::requireDescriptorAllocated(call, "managed container")))
+    return mlir::failure();
 
   mlir::DominanceInfo dominance(fn.getOperation());
   bool guarded = false;

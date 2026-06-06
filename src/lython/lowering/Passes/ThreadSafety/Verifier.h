@@ -49,6 +49,12 @@ bool alloca(mlir::Value value);
 bool alloc(mlir::Value value);
 } // namespace memref_value
 
+namespace object_header {
+bool type(mlir::Type type);
+bool runtimeArg(mlir::BlockArgument arg);
+bool provenance(mlir::Value value);
+} // namespace object_header
+
 namespace local_container {
 bool escapeUser(mlir::Operation *op);
 bool use(mlir::Operation *op, mlir::Value value);
@@ -62,6 +68,7 @@ bool descriptorData(mlir::Value pointer);
 bool descriptorAllocated(mlir::Value pointer);
 bool entryArgRoot(mlir::Value value);
 bool asyncExceptionCell(mlir::Value value);
+bool asyncExceptionCellAllocated(mlir::Value value);
 bool asyncCancelFlag(mlir::Value value);
 bool asyncCancelFlag(mlir::Operation *op, mlir::Value value);
 } // namespace provenance
@@ -135,6 +142,9 @@ namespace verifier::memref {
 struct AtomicRMW {
   static mlir::LogicalResult verify(mlir::memref::AtomicRMWOp op);
 };
+struct GenericAtomicRMW {
+  static mlir::LogicalResult verify(mlir::memref::GenericAtomicRMWOp op);
+};
 struct Store {
   static mlir::LogicalResult verify(mlir::memref::StoreOp op);
 };
@@ -167,6 +177,7 @@ struct DescriptorAccess {
 namespace control {
 mlir::Value condition(mlir::Operation *terminator);
 bool llvmReleaseToZero(mlir::Value condition, ::llvm::StringRef group);
+bool noReturn(mlir::Operation *terminator);
 } // namespace control
 
 namespace verifier::llvm {
@@ -200,7 +211,6 @@ struct CmpXchg {
 namespace verifier::async_runtime {
 struct RefcountCall {
   static mlir::LogicalResult verify(mlir::Operation *op,
-                                    ::llvm::StringRef callee,
                                     mlir::ValueRange operands);
 };
 struct Cells {

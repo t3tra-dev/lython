@@ -1,18 +1,25 @@
 #include "Common/RuntimeSupport.h"
 
+#include "Common/ClassLayout.h"
 #include "Common/Container.h"
 #include "Common/LoweringUtils.h"
+#include "Common/Object.h"
+#include "Common/ThreadSafetyKernel.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Async/IR/Async.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/LLVMIR/FunctionCallUtils.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Diagnostics.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/FormatVariadic.h"
 
@@ -20,6 +27,10 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+
+#define GET_OP_CLASSES
+#include "PyOps.h.inc"
+#undef GET_OP_CLASSES
 
 namespace py {
 
@@ -44,50 +55,41 @@ static void setIndexArrayAttr(mlir::Operation *op, llvm::StringRef name,
   op->setAttr(name, builder.getArrayAttr(attrs));
 }
 
-static void setI64Attr(mlir::Operation *op, llvm::StringRef name,
-                       int64_t value) {
-  mlir::Builder builder(op->getContext());
-  op->setAttr(name, builder.getI64IntegerAttr(value));
+namespace storage_cast {
+
+static mlir::Value source(mlir::Value value) {
+  llvm::SmallPtrSet<mlir::Operation *, 4> seen;
+  while (value) {
+    mlir::Operation *def = value.getDefiningOp();
+    if (!def || !seen.insert(def).second)
+      return value;
+
+    if (auto cast = mlir::dyn_cast<mlir::memref::CastOp>(def)) {
+      mlir::Value input = cast.getSource();
+      if (!object_abi::Type::isStorage(input.getType()))
+        return value;
+      value = input;
+      continue;
+    }
+
+    if (auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(def)) {
+      if (cast->getNumOperands() != 1)
+        return value;
+      mlir::Value input = cast.getOperand(0);
+      if (!object_abi::Type::isStorage(input.getType()))
+        return value;
+      value = input;
+      continue;
+    }
+
+    return value;
+  }
+  return {};
 }
+
+} // namespace storage_cast
 
 } // namespace
-
-bool runtime::Callee::retain(llvm::StringRef name) {
-  return name == RuntimeSymbols::kIncRef ||
-         name.starts_with("__ly_class_incref_");
-}
-
-bool runtime::Callee::release(llvm::StringRef name) {
-  return name == RuntimeSymbols::kDecRef ||
-         name.starts_with("__ly_class_decref_");
-}
-
-bool runtime::Callee::transfer(llvm::StringRef name) {
-  return name == RuntimeSymbols::kEHThrow;
-}
-
-bool runtime::Callee::setField(llvm::StringRef name) {
-  return name.starts_with("__ly_class_setfield_");
-}
-
-bool runtime::Callee::alwaysOwnedResult(llvm::StringRef name) {
-  return name == RuntimeSymbols::kStrFromUtf8 ||
-         name == RuntimeSymbols::kUnicodeConcat ||
-         name == RuntimeSymbols::kFloatFromDouble ||
-         name == RuntimeSymbols::kNumberAdd ||
-         name == RuntimeSymbols::kNumberSub ||
-         name == RuntimeSymbols::kObjectRepr ||
-         name == RuntimeSymbols::kClassReprNamed ||
-         name == RuntimeSymbols::kExceptionNew ||
-         name == RuntimeSymbols::kLongFromString ||
-         name == RuntimeSymbols::kLongAdd || name == RuntimeSymbols::kLongSub ||
-         name.starts_with("__ly_class_promote_");
-}
-
-bool runtime::Callee::conditionalOwnedResult(llvm::StringRef name) {
-  return name == RuntimeSymbols::kLongFromI64 ||
-         name.starts_with("__ly_class_getfield_");
-}
 
 namespace runtime::mlir_async {
 namespace {
@@ -104,14 +106,15 @@ enum CalleeFlag : unsigned {
 struct Info {
   llvm::StringLiteral name;
   unsigned flags;
+  int64_t refcountDelta = 0;
 };
 
 static constexpr Info kCallees[] = {
     {"mlirAsyncRuntimeCreateToken", kCreateHandle},
     {"mlirAsyncRuntimeCreateValue", kCreateHandle},
     {"mlirAsyncRuntimeCreateGroup", kCreateHandle},
-    {"mlirAsyncRuntimeAddRef", kRefcount | kBorrowOperand0},
-    {"mlirAsyncRuntimeDropRef", kRefcount | kBorrowOperand0},
+    {"mlirAsyncRuntimeAddRef", kRefcount | kBorrowOperand0, 1},
+    {"mlirAsyncRuntimeDropRef", kRefcount | kBorrowOperand0, -1},
     {"mlirAsyncRuntimeEmplaceToken", kBorrowOperand0},
     {"mlirAsyncRuntimeEmplaceValue", kBorrowOperand0},
     {"mlirAsyncRuntimeSetTokenError", kBorrowOperand0},
@@ -167,6 +170,17 @@ bool Callee::awaitAndExecute(llvm::StringRef name) {
   return info && (info->flags & kAwaitAndExecute);
 }
 
+bool Callee::executeEntry(llvm::StringRef name) {
+  return name.starts_with("async_execute_fn");
+}
+
+std::optional<int64_t> Callee::refcountDelta(llvm::StringRef name) {
+  const auto *info = lookup(name);
+  if (!info || !(info->flags & kRefcount))
+    return std::nullopt;
+  return info->refcountDelta;
+}
+
 llvm::SmallVector<unsigned, 2>
 Callee::borrowedHandleOperands(llvm::StringRef name) {
   llvm::SmallVector<unsigned, 2> indices;
@@ -181,46 +195,23 @@ Callee::borrowedHandleOperands(llvm::StringRef name) {
 }
 } // namespace runtime::mlir_async
 
-namespace ownership::llvm_func::Contract {
-void apply(mlir::LLVM::LLVMFuncOp fn, llvm::StringRef name) {
-  if (!fn)
-    return;
-
-  mlir::Operation *op = fn.getOperation();
-
-  if (runtime::Callee::retain(name)) {
-    setIndexArrayAttr(op, OwnershipContractAttrs::kRetainArgs, {0});
-    return;
-  }
-
-  if (runtime::Callee::release(name)) {
-    setIndexArrayAttr(op, OwnershipContractAttrs::kReleaseArgs, {0});
-    return;
-  }
-
-  if (runtime::Callee::transfer(name)) {
-    setIndexArrayAttr(op, OwnershipContractAttrs::kTransferArgs, {0});
-    return;
-  }
-
-  if (runtime::Callee::setField(name)) {
-    setI64Attr(op, OwnershipContractAttrs::kSetFieldValueArg, 1);
-    setI64Attr(op, OwnershipContractAttrs::kSetFieldRetainArg, 2);
-    return;
-  }
-
-  if (name.starts_with("__ly_class_getfield_")) {
-    setI64Attr(op, OwnershipContractAttrs::kGetFieldBorrowArg, 1);
-    setI64Attr(op, OwnershipContractAttrs::kGetFieldOwnedResult, 0);
-    return;
-  }
-
-  if (runtime::Callee::alwaysOwnedResult(name)) {
-    setIndexArrayAttr(op, OwnershipContractAttrs::kOwnedResults, {0});
-    return;
-  }
+namespace ownership::effect {
+void retain(mlir::Operation *op, llvm::ArrayRef<int64_t> indices) {
+  setIndexArrayAttr(op, OwnershipContractAttrs::kRetainArgs, indices);
 }
-} // namespace ownership::llvm_func::Contract
+
+void release(mlir::Operation *op, llvm::ArrayRef<int64_t> indices) {
+  setIndexArrayAttr(op, OwnershipContractAttrs::kReleaseArgs, indices);
+}
+
+void transfer(mlir::Operation *op, llvm::ArrayRef<int64_t> indices) {
+  setIndexArrayAttr(op, OwnershipContractAttrs::kTransferArgs, indices);
+}
+
+void ownedResults(mlir::Operation *op, llvm::ArrayRef<int64_t> indices) {
+  setIndexArrayAttr(op, OwnershipContractAttrs::kOwnedResults, indices);
+}
+} // namespace ownership::effect
 
 namespace publication::borrow::Attr {
 std::string name(unsigned argIndex) {
@@ -348,6 +339,14 @@ static mlir::Value stripAggregatePointerCasts(mlir::Value value) {
       value = ptrToInt.getArg();
       continue;
     }
+    if (auto cast = value.getDefiningOp<mlir::memref::CastOp>()) {
+      value = cast.getSource();
+      continue;
+    }
+    if (auto subview = value.getDefiningOp<mlir::memref::SubViewOp>()) {
+      value = subview.getSource();
+      continue;
+    }
     if (auto cast = value.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
       if (cast->getNumOperands() == 1) {
         value = cast.getOperand(0);
@@ -386,6 +385,9 @@ static std::string makeAggregateValueGroup(mlir::Value value,
   if (auto group = getAggregateValueDefStringAttr(
           value, ContainerSafetyAttrs::kDescriptorGroup))
     return group->str();
+  if (auto group = getAggregateValueDefStringAttr(
+          value, OwnershipContractAttrs::kAggregateSlotGroup))
+    return group->str();
   if (value)
     if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(value))
       return llvm::formatv("{0}.blockarg.{1}", prefix, arg.getArgNumber())
@@ -414,6 +416,21 @@ static void setAggregateSlotProvenance(mlir::Operation *op,
                 builder.getI64IntegerAttr(*slot));
 }
 
+static void copyAggregateSlotProvenance(mlir::Operation *from,
+                                        mlir::Operation *to) {
+  if (!from || !to)
+    return;
+  llvm::StringRef attrs[] = {OwnershipContractAttrs::kAggregateSlotLoad,
+                             OwnershipContractAttrs::kAggregateSlotGroup,
+                             OwnershipContractAttrs::kAggregateSlotComponent,
+                             OwnershipContractAttrs::kAggregateSlotIndex,
+                             OwnershipContractAttrs::kAggregateSlotPartIndex};
+  for (llvm::StringRef attr : attrs) {
+    if (mlir::Attribute value = from->getAttr(attr))
+      to->setAttr(attr, value);
+  }
+}
+
 static void setMemRefAggregateSlotProvenance(mlir::Operation *op,
                                              mlir::Value memref,
                                              mlir::ValueRange indices) {
@@ -428,11 +445,25 @@ static void setMemRefAggregateSlotProvenance(mlir::Operation *op,
   setAggregateSlotProvenance(op, group, component, slot);
 }
 
+static void setMemRefViewAggregateSlotProvenance(mlir::Operation *op,
+                                                 mlir::Value memref) {
+  std::string group = makeAggregateValueGroup(memref, "memref");
+  llvm::StringRef component = ContainerSafetyAttrs::kComponentItems;
+  if (auto inferred = getAggregateValueDefStringAttr(
+          memref, ContainerSafetyAttrs::kDescriptorComponent))
+    component = *inferred;
+  setAggregateSlotProvenance(op, group, component, std::nullopt);
+}
+
 static void setLLVMAggregateSlotProvenance(mlir::Operation *op,
                                            mlir::Value address) {
   mlir::Value root = getAggregateAddressRoot(address);
+  llvm::StringRef component = "llvm-slot";
+  if (auto inferred = getAggregateValueDefStringAttr(
+          root, OwnershipContractAttrs::kAggregateSlotComponent))
+    component = *inferred;
   setAggregateSlotProvenance(op, makeAggregateValueGroup(root, "llvm"),
-                             "llvm-slot", getAggregateAddressSlot(address));
+                             component, getAggregateAddressSlot(address));
 }
 
 void ownership::aggregate::Slot::markLoad(mlir::Value value,
@@ -445,24 +476,73 @@ void ownership::aggregate::Slot::markLoad(mlir::Value value,
   if (!def)
     return;
   if (auto bitcast = mlir::dyn_cast<mlir::LLVM::BitcastOp>(def)) {
+    def->setAttr(OwnershipContractAttrs::kAggregateSlotLoad,
+                 mlir::UnitAttr::get(def->getContext()));
+    setAggregateSlotProvenance(def, group, component, slot);
     ownership::aggregate::Slot::markLoad(bitcast.getArg(), group, component,
                                          slot);
     return;
   }
   if (auto intToPtr = mlir::dyn_cast<mlir::LLVM::IntToPtrOp>(def)) {
+    def->setAttr(OwnershipContractAttrs::kAggregateSlotLoad,
+                 mlir::UnitAttr::get(def->getContext()));
+    setAggregateSlotProvenance(def, group, component, slot);
     ownership::aggregate::Slot::markLoad(intToPtr.getArg(), group, component,
                                          slot);
     return;
   }
   if (auto ptrToInt = mlir::dyn_cast<mlir::LLVM::PtrToIntOp>(def)) {
+    def->setAttr(OwnershipContractAttrs::kAggregateSlotLoad,
+                 mlir::UnitAttr::get(def->getContext()));
+    setAggregateSlotProvenance(def, group, component, slot);
     ownership::aggregate::Slot::markLoad(ptrToInt.getArg(), group, component,
                                          slot);
     return;
   }
+  if (auto indexCast = mlir::dyn_cast<mlir::arith::IndexCastOp>(def)) {
+    def->setAttr(OwnershipContractAttrs::kAggregateSlotLoad,
+                 mlir::UnitAttr::get(def->getContext()));
+    setAggregateSlotProvenance(def, group, component, slot);
+    ownership::aggregate::Slot::markLoad(indexCast.getIn(), group, component,
+                                         slot);
+    return;
+  }
   if (auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(def)) {
-    if (cast->getNumOperands() == 1)
+    if (cast->getNumOperands() == 1) {
+      def->setAttr(OwnershipContractAttrs::kAggregateSlotLoad,
+                   mlir::UnitAttr::get(def->getContext()));
+      setAggregateSlotProvenance(def, group, component, slot);
       ownership::aggregate::Slot::markLoad(cast.getOperand(0), group, component,
                                            slot);
+    }
+    return;
+  }
+  if (auto gep = mlir::dyn_cast<mlir::LLVM::GEPOp>(def)) {
+    def->setAttr(OwnershipContractAttrs::kAggregateSlotLoad,
+                 mlir::UnitAttr::get(def->getContext()));
+    setAggregateSlotProvenance(def, group, component,
+                               slot ? slot : getAggregateAddressSlot(value));
+    ownership::aggregate::Slot::markLoad(gep.getBase(), group, component, slot);
+    return;
+  }
+  if (auto subview = mlir::dyn_cast<mlir::memref::SubViewOp>(def)) {
+    def->setAttr(OwnershipContractAttrs::kAggregateSlotLoad,
+                 mlir::UnitAttr::get(def->getContext()));
+    setAggregateSlotProvenance(def, group, component, slot);
+    ownership::aggregate::Slot::markLoad(subview.getSource(), group, component,
+                                         slot);
+    return;
+  }
+  if (mlir::isa<mlir::LLVM::ExtractValueOp>(def)) {
+    def->setAttr(OwnershipContractAttrs::kAggregateSlotLoad,
+                 mlir::UnitAttr::get(def->getContext()));
+    setAggregateSlotProvenance(def, group, component, slot);
+    return;
+  }
+  if (mlir::isa<mlir::memref::ExtractAlignedPointerAsIndexOp>(def)) {
+    def->setAttr(OwnershipContractAttrs::kAggregateSlotLoad,
+                 mlir::UnitAttr::get(def->getContext()));
+    setAggregateSlotProvenance(def, group, component, slot);
     return;
   }
   if (mlir::isa<mlir::memref::LoadOp, mlir::LLVM::LoadOp>(def)) {
@@ -478,21 +558,71 @@ void ownership::aggregate::Slot::markLoad(mlir::Value value) {
   mlir::Operation *def = value.getDefiningOp();
   if (!def)
     return;
+  if (def->hasAttr(OwnershipContractAttrs::kAggregateSlotLoad) &&
+      def->hasAttr(OwnershipContractAttrs::kAggregateSlotIndex))
+    return;
   if (auto bitcast = mlir::dyn_cast<mlir::LLVM::BitcastOp>(def)) {
+    def->setAttr(OwnershipContractAttrs::kAggregateSlotLoad,
+                 mlir::UnitAttr::get(def->getContext()));
+    setLLVMAggregateSlotProvenance(def, value);
     ownership::aggregate::Slot::markLoad(bitcast.getArg());
     return;
   }
   if (auto intToPtr = mlir::dyn_cast<mlir::LLVM::IntToPtrOp>(def)) {
+    def->setAttr(OwnershipContractAttrs::kAggregateSlotLoad,
+                 mlir::UnitAttr::get(def->getContext()));
+    setLLVMAggregateSlotProvenance(def, value);
     ownership::aggregate::Slot::markLoad(intToPtr.getArg());
     return;
   }
   if (auto ptrToInt = mlir::dyn_cast<mlir::LLVM::PtrToIntOp>(def)) {
+    def->setAttr(OwnershipContractAttrs::kAggregateSlotLoad,
+                 mlir::UnitAttr::get(def->getContext()));
+    setLLVMAggregateSlotProvenance(def, value);
     ownership::aggregate::Slot::markLoad(ptrToInt.getArg());
     return;
   }
+  if (auto indexCast = mlir::dyn_cast<mlir::arith::IndexCastOp>(def)) {
+    def->setAttr(OwnershipContractAttrs::kAggregateSlotLoad,
+                 mlir::UnitAttr::get(def->getContext()));
+    setLLVMAggregateSlotProvenance(def, value);
+    ownership::aggregate::Slot::markLoad(indexCast.getIn());
+    return;
+  }
   if (auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(def)) {
-    if (cast->getNumOperands() == 1)
+    if (cast->getNumOperands() == 1) {
+      def->setAttr(OwnershipContractAttrs::kAggregateSlotLoad,
+                   mlir::UnitAttr::get(def->getContext()));
+      setLLVMAggregateSlotProvenance(def, value);
       ownership::aggregate::Slot::markLoad(cast.getOperand(0));
+    }
+    return;
+  }
+  if (auto gep = mlir::dyn_cast<mlir::LLVM::GEPOp>(def)) {
+    def->setAttr(OwnershipContractAttrs::kAggregateSlotLoad,
+                 mlir::UnitAttr::get(def->getContext()));
+    setLLVMAggregateSlotProvenance(def, value);
+    ownership::aggregate::Slot::markLoad(gep.getBase());
+    return;
+  }
+  if (auto subview = mlir::dyn_cast<mlir::memref::SubViewOp>(def)) {
+    def->setAttr(OwnershipContractAttrs::kAggregateSlotLoad,
+                 mlir::UnitAttr::get(def->getContext()));
+    setMemRefViewAggregateSlotProvenance(def, subview.getSource());
+    ownership::aggregate::Slot::markLoad(subview.getSource());
+    return;
+  }
+  if (mlir::isa<mlir::LLVM::ExtractValueOp>(def)) {
+    def->setAttr(OwnershipContractAttrs::kAggregateSlotLoad,
+                 mlir::UnitAttr::get(def->getContext()));
+    setLLVMAggregateSlotProvenance(def, value);
+    return;
+  }
+  if (auto extract =
+          mlir::dyn_cast<mlir::memref::ExtractAlignedPointerAsIndexOp>(def)) {
+    def->setAttr(OwnershipContractAttrs::kAggregateSlotLoad,
+                 mlir::UnitAttr::get(def->getContext()));
+    setMemRefAggregateSlotProvenance(def, extract.getSource(), {});
     return;
   }
   if (auto load = mlir::dyn_cast<mlir::memref::LoadOp>(def)) {
@@ -507,6 +637,21 @@ void ownership::aggregate::Slot::markLoad(mlir::Value value) {
     setLLVMAggregateSlotProvenance(def, load.getAddr());
     return;
   }
+}
+
+void ownership::aggregate::Slot::copyLoad(mlir::Value from, mlir::Value to) {
+  mlir::Operation *target = to ? to.getDefiningOp() : nullptr;
+  if (!target)
+    return;
+
+  mlir::Operation *source = from ? from.getDefiningOp() : nullptr;
+  if (!source || !source->hasAttr(OwnershipContractAttrs::kAggregateSlotLoad)) {
+    ownership::aggregate::Slot::markLoad(from);
+    source = from ? from.getDefiningOp() : nullptr;
+  }
+  if (!source || !source->hasAttr(OwnershipContractAttrs::kAggregateSlotLoad))
+    return;
+  copyAggregateSlotProvenance(source, target);
 }
 
 void ownership::aggregate::Slot::markStore(mlir::Operation *op) {
@@ -621,6 +766,534 @@ void container::access::Contract::mark(mlir::Operation *op, mlir::Value header,
                 builder.getStringAttr(*component));
 }
 
+// Async exception cells are not Python objects, but they follow the same
+// header/payload split: one pointer-sized atomic header word publishes the
+// payload, and the payload caches the lowered header/payload memref
+// descriptors that make up a LyException value.  The header remains i64
+// because it must hold both sentinel values and the published aligned header
+// pointer for cmpxchg.  Descriptor word 0 is that same published pointer, so
+// the payload cache stores only descriptor words 1..9.
+static constexpr unsigned kExceptionCellHeaderSlots = 1;
+static constexpr unsigned kExceptionCellStateSlot = 0;
+static constexpr unsigned kExceptionCellPayloadBaseSlot =
+    kExceptionCellHeaderSlots;
+static constexpr unsigned kExceptionPayloadAlignedSlot = 0;
+static constexpr unsigned kExceptionPayloadAllocatedSlot = 1;
+static constexpr unsigned kExceptionPayloadOffsetSlot = 2;
+static constexpr unsigned kExceptionPayloadSizeSlot = 3;
+static constexpr unsigned kExceptionPayloadStrideSlot = 4;
+static constexpr unsigned kExceptionCellDescriptorWords = 5;
+static constexpr unsigned kExceptionCellDescriptorCount = 3;
+static constexpr unsigned kExceptionPayloadWordCount =
+    kExceptionCellDescriptorWords * kExceptionCellDescriptorCount;
+static constexpr unsigned kExceptionCellPayloadSlots =
+    kExceptionPayloadWordCount - 1;
+static constexpr unsigned kExceptionCellTotalSlots =
+    kExceptionCellHeaderSlots + kExceptionCellPayloadSlots;
+static constexpr int64_t kExceptionCellEmpty = 0;
+static constexpr int64_t kExceptionCellPublishing = 1;
+
+mlir::MemRefType async_runtime::getExceptionCellType(mlir::MLIRContext *ctx) {
+  return mlir::MemRefType::get({kExceptionCellTotalSlots},
+                               mlir::IntegerType::get(ctx, 64));
+}
+
+bool async_runtime::isExceptionCellType(mlir::Type type) {
+  auto memrefType = mlir::dyn_cast<mlir::MemRefType>(type);
+  if (!memrefType || memrefType.getRank() != 1 ||
+      memrefType.getShape()[0] != kExceptionCellTotalSlots)
+    return false;
+  auto intType = mlir::dyn_cast<mlir::IntegerType>(memrefType.getElementType());
+  return intType && intType.getWidth() == 64;
+}
+
+bool async_runtime::isLoweredExceptionCellType(mlir::Type type) {
+  return object_abi::Type::isLoweredStorage(type);
+}
+
+static bool hasFunctionArgAttr(mlir::Value value, llvm::StringRef attrName) {
+  auto arg = mlir::dyn_cast<mlir::BlockArgument>(value);
+  if (!arg || !arg.getOwner())
+    return false;
+  mlir::Operation *parent = arg.getOwner()->getParentOp();
+  auto function = mlir::dyn_cast_or_null<mlir::FunctionOpInterface>(parent);
+  if (function && arg.getArgNumber() < function.getNumArguments() &&
+      function.getArgAttr(arg.getArgNumber(), attrName))
+    return true;
+
+  auto argAttrs = parent ? parent->getAttrOfType<mlir::ArrayAttr>("arg_attrs")
+                         : mlir::ArrayAttr();
+  if (!argAttrs || arg.getArgNumber() >= argAttrs.size())
+    return false;
+  auto dict =
+      mlir::dyn_cast<mlir::DictionaryAttr>(argAttrs[arg.getArgNumber()]);
+  return dict && static_cast<bool>(dict.get(attrName));
+}
+
+static mlir::Value getExceptionCellAddress(mlir::Location loc, mlir::Value cell,
+                                           mlir::OpBuilder &builder) {
+  if (!cell)
+    return {};
+  auto ptrType = mlir::LLVM::LLVMPointerType::get(builder.getContext());
+  if (async_runtime::ExceptionCell::hasProvenance(cell) &&
+      async_runtime::isExceptionCellType(cell.getType())) {
+    mlir::Value index =
+        builder.create<mlir::memref::ExtractAlignedPointerAsIndexOp>(loc, cell);
+    mlir::Value address = builder.create<mlir::arith::IndexCastOp>(
+        loc, builder.getI64Type(), index);
+    auto ptr = builder.create<mlir::LLVM::IntToPtrOp>(loc, ptrType, address);
+    ptr->setAttr(AsyncSafetyAttrs::kExceptionCell,
+                 mlir::UnitAttr::get(builder.getContext()));
+    return ptr;
+  }
+  if (auto descriptorType =
+          mlir::dyn_cast<mlir::LLVM::LLVMStructType>(cell.getType())) {
+    if (!async_runtime::isLoweredExceptionCellType(descriptorType) ||
+        !async_runtime::ExceptionCell::hasProvenance(cell))
+      return {};
+    auto aligned = builder.create<mlir::LLVM::ExtractValueOp>(
+        loc, descriptorType.getBody()[1], cell,
+        builder.getDenseI64ArrayAttr({1}));
+    aligned->setAttr(AsyncSafetyAttrs::kExceptionCell,
+                     mlir::UnitAttr::get(builder.getContext()));
+    return aligned;
+  }
+  return {};
+}
+
+static mlir::Value gepExceptionCellSlot(mlir::Location loc, mlir::Value base,
+                                        unsigned slot,
+                                        mlir::OpBuilder &builder) {
+  auto ptrType = mlir::LLVM::LLVMPointerType::get(builder.getContext());
+  auto i64Type = builder.getI64Type();
+  mlir::Value slotValue = builder.create<mlir::LLVM::ConstantOp>(
+      loc, i64Type, builder.getI64IntegerAttr(slot));
+  return builder.create<mlir::LLVM::GEPOp>(
+      loc, ptrType, i64Type, base,
+      llvm::ArrayRef<mlir::LLVM::GEPArg>{slotValue});
+}
+
+static mlir::Value loadExceptionCellSlot(mlir::Location loc, mlir::Value base,
+                                         unsigned slot,
+                                         mlir::OpBuilder &builder) {
+  mlir::Value address = gepExceptionCellSlot(loc, base, slot, builder);
+  auto load = builder.create<mlir::LLVM::LoadOp>(
+      loc, builder.getI64Type(), address, /*alignment=*/8,
+      /*isVolatile=*/false, /*isNonTemporal=*/false, /*isInvariant=*/false,
+      /*isInvariantGroup=*/false,
+      slot == kExceptionCellStateSlot ? mlir::LLVM::AtomicOrdering::acquire
+                                      : mlir::LLVM::AtomicOrdering::not_atomic);
+  if (slot == kExceptionCellStateSlot)
+    threadsafe::Atomic::set(load.getOperation(),
+                            ThreadSafetyAttrs::kRoleAsyncExceptionLoad,
+                            ThreadSafetyAttrs::kOrderingAcquire);
+  return load.getResult();
+}
+
+static mlir::Value loadExceptionCellMemRefSlot(mlir::Location loc,
+                                               mlir::Value cell, unsigned slot,
+                                               mlir::OpBuilder &builder) {
+  mlir::Value index = builder.create<mlir::arith::ConstantIndexOp>(loc, slot);
+  if (slot == kExceptionCellStateSlot) {
+    mlir::Value zero = builder.create<mlir::arith::ConstantIntOp>(loc, 0, 64);
+    auto load = builder.create<mlir::memref::AtomicRMWOp>(
+        loc, mlir::arith::AtomicRMWKind::addi, zero, cell,
+        mlir::ValueRange{index});
+    threadsafe::Atomic::set(load.getOperation(),
+                            ThreadSafetyAttrs::kRoleAsyncExceptionLoad,
+                            ThreadSafetyAttrs::kOrderingAcquire);
+    load->setAttr(AsyncSafetyAttrs::kExceptionCell, builder.getUnitAttr());
+    return load.getResult();
+  }
+  auto load = builder.create<mlir::memref::LoadOp>(loc, cell, index);
+  if (slot >= kExceptionCellPayloadBaseSlot)
+    ownership::aggregate::Slot::markLoad(load.getResult(),
+                                         "async.exception_cell", "exception",
+                                         slot - kExceptionCellPayloadBaseSlot);
+  return load.getResult();
+}
+
+static void storeExceptionCellMemRefSlot(mlir::Location loc, mlir::Value cell,
+                                         unsigned slot, mlir::Value value,
+                                         mlir::OpBuilder &builder) {
+  mlir::Value index = builder.create<mlir::arith::ConstantIndexOp>(loc, slot);
+  auto store = builder.create<mlir::memref::StoreOp>(loc, value, cell, index);
+  if (slot >= kExceptionCellPayloadBaseSlot)
+    store->setAttr(AsyncSafetyAttrs::kExceptionCellPayloadStore,
+                   builder.getUnitAttr());
+}
+
+static mlir::Value
+transitionExceptionCellState(mlir::Location loc, mlir::Value cell,
+                             mlir::Value expected, mlir::Value replacement,
+                             bool reservation, mlir::OpBuilder &builder) {
+  mlir::Value index = builder.create<mlir::arith::ConstantIndexOp>(
+      loc, kExceptionCellStateSlot);
+  auto atomic = builder.create<mlir::memref::GenericAtomicRMWOp>(
+      loc, cell, mlir::ValueRange{index});
+  threadsafe::Atomic::set(atomic.getOperation(),
+                          ThreadSafetyAttrs::kRoleAsyncExceptionStore,
+                          ThreadSafetyAttrs::kOrderingAcqRel);
+  atomic->setAttr(AsyncSafetyAttrs::kExceptionCellConditionalStore,
+                  builder.getUnitAttr());
+  if (reservation)
+    atomic->setAttr(AsyncSafetyAttrs::kExceptionCellReservation,
+                    builder.getUnitAttr());
+  async_runtime::ExceptionCell::mark(cell);
+
+  mlir::OpBuilder bodyBuilder =
+      mlir::OpBuilder::atBlockEnd(atomic.getBody(), builder.getListener());
+  mlir::Value current = atomic.getCurrentValue();
+  mlir::Value matches = bodyBuilder.create<mlir::arith::CmpIOp>(
+      loc, mlir::arith::CmpIPredicate::eq, current, expected);
+  mlir::Value next = bodyBuilder.create<mlir::arith::SelectOp>(
+      loc, matches, replacement, current);
+  bodyBuilder.create<mlir::memref::AtomicYieldOp>(loc, next);
+  return atomic.getResult();
+}
+
+static void storeExceptionCellSlot(mlir::Location loc, mlir::Value base,
+                                   unsigned slot, mlir::Value value,
+                                   mlir::OpBuilder &builder) {
+  mlir::Value address = gepExceptionCellSlot(loc, base, slot, builder);
+  auto store =
+      builder.create<mlir::LLVM::StoreOp>(loc, value, address, /*alignment=*/8);
+  if (slot >= kExceptionCellPayloadBaseSlot)
+    store->setAttr(AsyncSafetyAttrs::kExceptionCellPayloadStore,
+                   builder.getUnitAttr());
+}
+
+static void assumeExceptionCellEmpty(mlir::Location loc, mlir::Value cell,
+                                     mlir::OpBuilder &builder) {
+  if (!cell)
+    return;
+  if (async_runtime::isExceptionCellType(cell.getType())) {
+    mlir::Value slot = builder.create<mlir::arith::ConstantIndexOp>(
+        loc, kExceptionCellStateSlot);
+    mlir::Value word =
+        builder.create<mlir::memref::LoadOp>(loc, cell, slot).getResult();
+    mlir::Value zero = builder.create<mlir::arith::ConstantOp>(
+        loc, builder.getI64IntegerAttr(kExceptionCellEmpty));
+    mlir::Value empty = builder.create<mlir::arith::CmpIOp>(
+        loc, mlir::arith::CmpIPredicate::eq, word, zero);
+    builder.create<mlir::LLVM::AssumeOp>(loc, empty);
+    return;
+  }
+  if (async_runtime::ExceptionCell::hasProvenance(cell) &&
+      async_runtime::isLoweredExceptionCellType(cell.getType())) {
+    mlir::Value address = getExceptionCellAddress(loc, cell, builder);
+    mlir::Value word =
+        loadExceptionCellSlot(loc, address, kExceptionCellStateSlot, builder);
+    mlir::Value zero = builder.create<mlir::LLVM::ConstantOp>(
+        loc, builder.getI64Type(),
+        builder.getI64IntegerAttr(kExceptionCellEmpty));
+    mlir::Value empty = builder.create<mlir::LLVM::ICmpOp>(
+        loc, mlir::LLVM::ICmpPredicate::eq, word, zero);
+    builder.create<mlir::LLVM::AssumeOp>(loc, empty);
+  }
+}
+
+namespace exception_payload {
+
+static mlir::LLVM::LLVMStructType descriptorType(mlir::MLIRContext *ctx) {
+  return object_abi::Type::loweredStorage(ctx);
+}
+
+static mlir::LLVM::LLVMStructType partsDescriptorType(mlir::MLIRContext *ctx) {
+  auto single = descriptorType(ctx);
+  return mlir::LLVM::LLVMStructType::getLiteral(
+      ctx, llvm::ArrayRef<mlir::Type>{single, single, single});
+}
+
+static bool isPartsDescriptorType(mlir::Type type) {
+  if (!type)
+    return false;
+  auto aggregate = mlir::dyn_cast<mlir::LLVM::LLVMStructType>(type);
+  if (!aggregate || aggregate.isOpaque() ||
+      aggregate.getBody().size() != kExceptionCellDescriptorCount)
+    return false;
+  return llvm::all_of(aggregate.getBody(), [](mlir::Type part) {
+    return object_abi::Type::isLoweredStorage(part);
+  });
+}
+
+static bool isExceptionPartType(unsigned index, mlir::Type type) {
+  if (object_abi::Type::isLoweredStorage(type))
+    return true;
+  if (index == 0)
+    return object_abi::exception_abi::Parts::isHeader(type);
+  if (index == 1)
+    return object_abi::exception_abi::Parts::isMessageHeader(type);
+  if (index == 2)
+    return object_abi::exception_abi::Parts::isMessageBytes(type);
+  return false;
+}
+
+static mlir::Value ptrToI64(mlir::Location loc, mlir::Value pointer,
+                            mlir::OpBuilder &builder) {
+  if (pointer.getType().isInteger(64))
+    return pointer;
+  return builder.create<mlir::LLVM::PtrToIntOp>(loc, builder.getI64Type(),
+                                                pointer);
+}
+
+static mlir::Value nonObjectPtrToI64(mlir::Location loc, mlir::Value pointer,
+                                     mlir::OpBuilder &builder) {
+  mlir::Value bits = ptrToI64(loc, pointer, builder);
+  ownership::Pointer::markNonObject(bits);
+  return bits;
+}
+
+static mlir::Value i64ToPtr(mlir::Location loc, mlir::Value value,
+                            mlir::OpBuilder &builder) {
+  auto ptrType = mlir::LLVM::LLVMPointerType::get(builder.getContext());
+  if (value.getType() == ptrType)
+    return value;
+  return builder.create<mlir::LLVM::IntToPtrOp>(loc, ptrType, value);
+}
+
+static mlir::Value descriptorSizeForMemRef(mlir::Location loc,
+                                           mlir::MemRefType memrefType,
+                                           mlir::Value memref,
+                                           mlir::OpBuilder &builder) {
+  if (memrefType.getRank() != 1)
+    return {};
+  if (memrefType.hasStaticShape()) {
+    return builder.create<mlir::LLVM::ConstantOp>(
+        loc, builder.getI64Type(),
+        builder.getI64IntegerAttr(memrefType.getShape()[0]));
+  }
+  mlir::Value dim =
+      builder.create<mlir::memref::DimOp>(loc, memref, /*index=*/0);
+  return builder.create<mlir::arith::IndexCastOp>(loc, builder.getI64Type(),
+                                                  dim);
+}
+
+static mlir::Value alignedPointer(mlir::Location loc, mlir::Value exception,
+                                  mlir::OpBuilder &builder) {
+  if (!exception)
+    return {};
+  auto ptrType = mlir::LLVM::LLVMPointerType::get(builder.getContext());
+  if (auto cast = exception.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+    if (cast->getNumOperands() == kExceptionCellDescriptorCount)
+      return alignedPointer(loc, cast.getOperand(0), builder);
+  }
+  if (mlir::isa<mlir::MemRefType>(exception.getType())) {
+    mlir::Value index =
+        builder.create<mlir::memref::ExtractAlignedPointerAsIndexOp>(loc,
+                                                                     exception);
+    mlir::Value address = builder.create<mlir::arith::IndexCastOp>(
+        loc, builder.getI64Type(), index);
+    return builder.create<mlir::LLVM::IntToPtrOp>(loc, ptrType, address);
+  }
+  if (auto descriptor =
+          mlir::dyn_cast<mlir::LLVM::LLVMStructType>(exception.getType())) {
+    if (isPartsDescriptorType(descriptor)) {
+      mlir::Value root = builder.create<mlir::LLVM::ExtractValueOp>(
+          loc, descriptor.getBody()[0], exception,
+          builder.getDenseI64ArrayAttr({0}));
+      return alignedPointer(loc, root, builder);
+    }
+    if (!object_abi::Type::isLoweredStorage(descriptor))
+      return {};
+    return builder.create<mlir::LLVM::ExtractValueOp>(
+        loc, descriptor.getBody()[1], exception,
+        builder.getDenseI64ArrayAttr({1}));
+  }
+  return {};
+}
+
+static void appendOneDescriptorWords(mlir::Location loc, mlir::Value storage,
+                                     bool rootDescriptor,
+                                     llvm::SmallVectorImpl<mlir::Value> &words,
+                                     mlir::OpBuilder &builder) {
+  auto i64Type = builder.getI64Type();
+  auto zero = builder.create<mlir::LLVM::ConstantOp>(
+      loc, i64Type, builder.getI64IntegerAttr(0));
+  auto stride = builder.create<mlir::LLVM::ConstantOp>(
+      loc, i64Type, builder.getI64IntegerAttr(1));
+
+  if (auto memrefType = mlir::dyn_cast<mlir::MemRefType>(storage.getType())) {
+    mlir::Value aligned = alignedPointer(loc, storage, builder);
+    mlir::Value size =
+        descriptorSizeForMemRef(loc, memrefType, storage, builder);
+    if (!aligned || !size)
+      return;
+    mlir::Value alignedInt = rootDescriptor
+                                 ? ptrToI64(loc, aligned, builder)
+                                 : nonObjectPtrToI64(loc, aligned, builder);
+    mlir::Value allocatedInt = nonObjectPtrToI64(loc, aligned, builder);
+    words.append({alignedInt, allocatedInt, zero, size, stride});
+    return;
+  }
+
+  if (auto descriptor =
+          mlir::dyn_cast<mlir::LLVM::LLVMStructType>(storage.getType())) {
+    if (!object_abi::Type::isLoweredStorage(descriptor))
+      return;
+    auto body = descriptor.getBody();
+    mlir::Value allocated = builder.create<mlir::LLVM::ExtractValueOp>(
+        loc, body[0], storage, builder.getDenseI64ArrayAttr({0}));
+    mlir::Value aligned = builder.create<mlir::LLVM::ExtractValueOp>(
+        loc, body[1], storage, builder.getDenseI64ArrayAttr({1}));
+    mlir::Value offset = builder.create<mlir::LLVM::ExtractValueOp>(
+        loc, body[2], storage, builder.getDenseI64ArrayAttr({2}));
+    mlir::Value size = builder.create<mlir::LLVM::ExtractValueOp>(
+        loc, i64Type, storage, builder.getDenseI64ArrayAttr({3, 0}));
+    mlir::Value descriptorStride = builder.create<mlir::LLVM::ExtractValueOp>(
+        loc, i64Type, storage, builder.getDenseI64ArrayAttr({4, 0}));
+    words.push_back(rootDescriptor ? ptrToI64(loc, aligned, builder)
+                                   : nonObjectPtrToI64(loc, aligned, builder));
+    words.push_back(nonObjectPtrToI64(loc, allocated, builder));
+    words.push_back(offset);
+    words.push_back(size);
+    words.push_back(descriptorStride);
+    return;
+  }
+
+  (void)zero;
+  (void)stride;
+}
+
+static void appendDescriptorWords(mlir::Location loc, mlir::Value exception,
+                                  llvm::SmallVectorImpl<mlir::Value> &words,
+                                  mlir::OpBuilder &builder) {
+  words.clear();
+  if (!exception)
+    return;
+
+  if (auto cast = exception.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+    if (cast->getNumOperands() == kExceptionCellDescriptorCount) {
+      for (auto [index, operand] : llvm::enumerate(cast.getOperands()))
+        appendOneDescriptorWords(loc, operand, index == 0, words, builder);
+      return;
+    }
+  }
+
+  if (auto aggregate =
+          mlir::dyn_cast<mlir::LLVM::LLVMStructType>(exception.getType())) {
+    if (isPartsDescriptorType(aggregate)) {
+      for (unsigned index = 0; index < kExceptionCellDescriptorCount; ++index) {
+        mlir::Value part = builder.create<mlir::LLVM::ExtractValueOp>(
+            loc, aggregate.getBody()[index], exception,
+            builder.getDenseI64ArrayAttr({index}));
+        appendOneDescriptorWords(loc, part, index == 0, words, builder);
+      }
+      return;
+    }
+  }
+
+  appendOneDescriptorWords(loc, exception, /*rootDescriptor=*/true, words,
+                           builder);
+}
+
+static mlir::Value descriptorFromWords(mlir::Location loc, mlir::Value aligned,
+                                       mlir::Value allocated,
+                                       mlir::Value offset, mlir::Value size,
+                                       mlir::Value stride,
+                                       mlir::OpBuilder &builder) {
+  mlir::MLIRContext *ctx = builder.getContext();
+  auto ptrType = mlir::LLVM::LLVMPointerType::get(ctx);
+  auto i64Type = builder.getI64Type();
+  auto memrefDescriptorType = descriptorType(ctx);
+  mlir::Value allocatedPtr = i64ToPtr(loc, allocated, builder);
+  mlir::Value alignedPtr = i64ToPtr(loc, aligned, builder);
+  ownership::aggregate::Slot::markLoad(allocatedPtr, "async.exception_cell",
+                                       "exception", std::nullopt);
+  ownership::aggregate::Slot::markLoad(alignedPtr, "async.exception_cell",
+                                       "exception", std::nullopt);
+  mlir::Value descriptor =
+      builder.create<mlir::LLVM::UndefOp>(loc, memrefDescriptorType);
+  descriptor = builder.create<mlir::LLVM::InsertValueOp>(
+      loc, memrefDescriptorType, descriptor, allocatedPtr,
+      builder.getDenseI64ArrayAttr({0}));
+  ownership::aggregate::Slot::markLoad(descriptor, "async.exception_cell",
+                                       "exception", std::nullopt);
+  descriptor = builder.create<mlir::LLVM::InsertValueOp>(
+      loc, memrefDescriptorType, descriptor, alignedPtr,
+      builder.getDenseI64ArrayAttr({1}));
+  ownership::aggregate::Slot::markLoad(descriptor, "async.exception_cell",
+                                       "exception", std::nullopt);
+  descriptor = builder.create<mlir::LLVM::InsertValueOp>(
+      loc, memrefDescriptorType, descriptor, offset,
+      builder.getDenseI64ArrayAttr({2}));
+  ownership::aggregate::Slot::markLoad(descriptor, "async.exception_cell",
+                                       "exception", std::nullopt);
+  descriptor = builder.create<mlir::LLVM::InsertValueOp>(
+      loc, memrefDescriptorType, descriptor, size,
+      builder.getDenseI64ArrayAttr({3, 0}));
+  ownership::aggregate::Slot::markLoad(descriptor, "async.exception_cell",
+                                       "exception", std::nullopt);
+  descriptor = builder.create<mlir::LLVM::InsertValueOp>(
+      loc, memrefDescriptorType, descriptor, stride,
+      builder.getDenseI64ArrayAttr({4, 0}));
+  ownership::aggregate::Slot::markLoad(descriptor, "async.exception_cell",
+                                       "exception", std::nullopt);
+  (void)ptrType;
+  (void)i64Type;
+  return descriptor;
+}
+
+static mlir::Value partsDescriptorFromWords(mlir::Location loc,
+                                            llvm::ArrayRef<mlir::Value> words,
+                                            mlir::OpBuilder &builder) {
+  if (words.size() != kExceptionPayloadWordCount)
+    return {};
+  mlir::MLIRContext *ctx = builder.getContext();
+  auto partsType = partsDescriptorType(ctx);
+  mlir::Value aggregate = builder.create<mlir::LLVM::UndefOp>(loc, partsType);
+  for (unsigned index = 0; index < kExceptionCellDescriptorCount; ++index) {
+    unsigned base = index * kExceptionCellDescriptorWords;
+    mlir::Value descriptor =
+        descriptorFromWords(loc, words[base + kExceptionPayloadAlignedSlot],
+                            words[base + kExceptionPayloadAllocatedSlot],
+                            words[base + kExceptionPayloadOffsetSlot],
+                            words[base + kExceptionPayloadSizeSlot],
+                            words[base + kExceptionPayloadStrideSlot], builder);
+    aggregate = builder.create<mlir::LLVM::InsertValueOp>(
+        loc, partsType, aggregate, descriptor,
+        builder.getDenseI64ArrayAttr({index}));
+    ownership::aggregate::Slot::markLoad(aggregate, "async.exception_cell",
+                                         "exception", std::nullopt);
+  }
+  return aggregate;
+}
+
+static bool partsDescriptorParts(mlir::Location loc, mlir::Value exception,
+                                 mlir::OpBuilder &builder,
+                                 llvm::SmallVectorImpl<mlir::Value> &parts) {
+  parts.clear();
+  if (!exception)
+    return false;
+
+  if (auto cast = exception.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+    if (cast->getNumOperands() == kExceptionCellDescriptorCount) {
+      for (auto [index, operand] : llvm::enumerate(cast.getOperands()))
+        if (!isExceptionPartType(static_cast<unsigned>(index),
+                                 operand.getType()))
+          return false;
+      parts.append(cast.getOperands().begin(), cast.getOperands().end());
+      return true;
+    }
+  }
+
+  auto aggregate =
+      mlir::dyn_cast<mlir::LLVM::LLVMStructType>(exception.getType());
+  if (!isPartsDescriptorType(aggregate))
+    return false;
+  for (unsigned index = 0; index < kExceptionCellDescriptorCount; ++index) {
+    mlir::Value part = builder.create<mlir::LLVM::ExtractValueOp>(
+        loc, aggregate.getBody()[index], exception,
+        builder.getDenseI64ArrayAttr({index}));
+    ownership::aggregate::Slot::markLoad(part, "async.exception_cell",
+                                         "exception", index);
+    parts.push_back(part);
+  }
+  return true;
+}
+
+} // namespace exception_payload
+
 void async_runtime::ExceptionCell::mark(mlir::Value value) {
   if (!value)
     return;
@@ -656,15 +1329,104 @@ static void markFunctionArgument(mlir::Operation *funcLike, unsigned argIndex,
   if (!funcLike)
     return;
   auto function = mlir::dyn_cast<mlir::FunctionOpInterface>(funcLike);
-  if (!function || argIndex >= function.getNumArguments())
+  if (function && argIndex < function.getNumArguments()) {
+    function.setArgAttr(argIndex, attrName,
+                        mlir::UnitAttr::get(funcLike->getContext()));
     return;
-  function.setArgAttr(argIndex, attrName,
-                      mlir::UnitAttr::get(funcLike->getContext()));
+  }
+
+  if (funcLike->getNumRegions() == 0 || funcLike->getRegion(0).empty())
+    return;
+  unsigned numArgs = funcLike->getRegion(0).front().getNumArguments();
+  if (argIndex >= numArgs)
+    return;
+
+  mlir::Builder builder(funcLike->getContext());
+  auto existing = funcLike->getAttrOfType<mlir::ArrayAttr>("arg_attrs");
+  llvm::SmallVector<mlir::Attribute> attrs;
+  attrs.reserve(numArgs);
+  for (unsigned index = 0; index < numArgs; ++index) {
+    if (existing && index < existing.size())
+      attrs.push_back(existing[index]);
+    else
+      attrs.push_back(builder.getDictionaryAttr({}));
+  }
+
+  auto dict = mlir::dyn_cast<mlir::DictionaryAttr>(attrs[argIndex]);
+  mlir::NamedAttrList named(dict ? dict : builder.getDictionaryAttr({}));
+  named.set(attrName, builder.getUnitAttr());
+  attrs[argIndex] = named.getDictionary(funcLike->getContext());
+  funcLike->setAttr("arg_attrs", builder.getArrayAttr(attrs));
 }
 
 void async_runtime::ExceptionCell::markArgument(mlir::Operation *funcLike,
                                                 unsigned argIndex) {
   markFunctionArgument(funcLike, argIndex, AsyncSafetyAttrs::kExceptionCell);
+}
+
+static bool
+hasExceptionCellPointerProvenance(mlir::Value value,
+                                  llvm::SmallPtrSetImpl<mlir::Value> &seen) {
+  if (!value || !seen.insert(value).second)
+    return false;
+  if (hasFunctionArgAttr(value, AsyncSafetyAttrs::kExceptionCell))
+    return true;
+  mlir::Operation *def = value.getDefiningOp();
+  if (!def)
+    return false;
+  if (def->hasAttr(AsyncSafetyAttrs::kExceptionCell) ||
+      def->hasAttr(AsyncSafetyAttrs::kExceptionCellAllocated))
+    return true;
+  if (auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(def)) {
+    return cast->getNumOperands() == 1 &&
+           hasExceptionCellPointerProvenance(cast.getOperand(0), seen);
+  }
+  if (auto bitcast = mlir::dyn_cast<mlir::LLVM::BitcastOp>(def))
+    return hasExceptionCellPointerProvenance(bitcast.getArg(), seen);
+  if (auto extract = mlir::dyn_cast<mlir::LLVM::ExtractValueOp>(def))
+    return hasExceptionCellPointerProvenance(extract.getContainer(), seen);
+  return false;
+}
+
+static bool
+hasExceptionCellProvenance(mlir::Value value,
+                           llvm::SmallPtrSetImpl<mlir::Value> &seen) {
+  if (!value)
+    return false;
+  if (!seen.insert(value).second)
+    return false;
+  if (!mlir::isa<ExceptionCellType>(value.getType()) &&
+      !async_runtime::isExceptionCellType(value.getType()) &&
+      !async_runtime::isLoweredExceptionCellType(value.getType()))
+    return false;
+  if (hasFunctionArgAttr(value, AsyncSafetyAttrs::kExceptionCell))
+    return true;
+  mlir::Operation *def = value.getDefiningOp();
+  if (!def)
+    return false;
+  if (def->hasAttr(AsyncSafetyAttrs::kExceptionCell) ||
+      def->hasAttr(AsyncSafetyAttrs::kExceptionCellAllocated))
+    return true;
+  if (auto cast = mlir::dyn_cast<mlir::memref::CastOp>(def))
+    return hasExceptionCellProvenance(cast.getSource(), seen);
+  if (auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(def)) {
+    return cast->getNumOperands() == 1 &&
+           hasExceptionCellProvenance(cast.getOperand(0), seen);
+  }
+  if (auto insert = mlir::dyn_cast<mlir::LLVM::InsertValueOp>(def)) {
+    llvm::SmallPtrSet<mlir::Value, 8> pointerSeen;
+    return hasExceptionCellProvenance(insert.getContainer(), seen) ||
+           hasExceptionCellProvenance(insert.getValue(), seen) ||
+           hasExceptionCellPointerProvenance(insert.getValue(), pointerSeen);
+  }
+  if (auto extract = mlir::dyn_cast<mlir::LLVM::ExtractValueOp>(def))
+    return hasExceptionCellProvenance(extract.getContainer(), seen);
+  return false;
+}
+
+bool async_runtime::ExceptionCell::hasProvenance(mlir::Value value) {
+  llvm::SmallPtrSet<mlir::Value, 8> seen;
+  return hasExceptionCellProvenance(value, seen);
 }
 
 void async_runtime::CancelFlag::markArgument(mlir::Operation *funcLike,
@@ -677,81 +1439,362 @@ void async_runtime::RuntimeHandle::markArgument(mlir::Operation *funcLike,
   markFunctionArgument(funcLike, argIndex, AsyncSafetyAttrs::kRuntimeHandle);
 }
 
+static mlir::Value sourceExceptionCellMemRef(mlir::Value cell) {
+  if (async_runtime::ExceptionCell::hasProvenance(cell) &&
+      async_runtime::isExceptionCellType(cell.getType()))
+    return cell;
+  auto cast = cell.getDefiningOp<mlir::UnrealizedConversionCastOp>();
+  if (!cast || cast->getNumOperands() != 1)
+    return {};
+  mlir::Value source = cast.getOperand(0);
+  return async_runtime::ExceptionCell::hasProvenance(source) &&
+                 async_runtime::isExceptionCellType(source.getType())
+             ? source
+             : mlir::Value();
+}
+
 mlir::Value async_runtime::ExceptionCell::load(mlir::Location loc,
                                                mlir::Value cell,
-                                               mlir::OpBuilder &builder) {
+                                               mlir::RewriterBase &rewriter) {
+  mlir::Value memrefCell = sourceExceptionCellMemRef(cell);
+  auto loadSlot = [&](unsigned slot) -> mlir::Value {
+    if (memrefCell)
+      return loadExceptionCellMemRefSlot(loc, memrefCell, slot, rewriter);
+    mlir::Value address = getExceptionCellAddress(loc, cell, rewriter);
+    return loadExceptionCellSlot(loc, address, slot, rewriter);
+  };
+
+  if (memrefCell || async_runtime::ExceptionCell::hasProvenance(cell)) {
+    mlir::Value state = loadSlot(kExceptionCellStateSlot);
+    mlir::Value empty = rewriter.create<mlir::arith::ConstantIntOp>(
+        loc, kExceptionCellEmpty, 64);
+    mlir::Value publishing = rewriter.create<mlir::arith::ConstantIntOp>(
+        loc, kExceptionCellPublishing, 64);
+    mlir::Value notEmpty = rewriter.create<mlir::arith::CmpIOp>(
+        loc, mlir::arith::CmpIPredicate::ne, state, empty);
+    mlir::Value notPublishing = rewriter.create<mlir::arith::CmpIOp>(
+        loc, mlir::arith::CmpIPredicate::ne, state, publishing);
+    mlir::Value isPublished =
+        rewriter.create<mlir::arith::AndIOp>(loc, notEmpty, notPublishing);
+    auto descriptorType =
+        exception_payload::partsDescriptorType(rewriter.getContext());
+
+    mlir::Value zero = rewriter.create<mlir::arith::ConstantIntOp>(loc, 0, 64);
+    llvm::SmallVector<mlir::Value, kExceptionPayloadWordCount> nullWords(
+        kExceptionPayloadWordCount, zero);
+    mlir::Value nullDescriptor =
+        exception_payload::partsDescriptorFromWords(loc, nullWords, rewriter);
+
+    mlir::Block *currentBlock = rewriter.getInsertionBlock();
+    mlir::Block *afterBlock =
+        rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
+    afterBlock->addArgument(descriptorType, loc);
+    mlir::Block *publishedBlock = rewriter.createBlock(
+        afterBlock->getParent(), afterBlock->getIterator());
+
+    rewriter.setInsertionPointToEnd(currentBlock);
+    rewriter.create<mlir::cf::CondBranchOp>(loc, isPublished, publishedBlock,
+                                            mlir::ValueRange{}, afterBlock,
+                                            mlir::ValueRange{nullDescriptor});
+
+    rewriter.setInsertionPointToStart(publishedBlock);
+    llvm::SmallVector<mlir::Value, kExceptionPayloadWordCount> words;
+    words.resize(kExceptionPayloadWordCount);
+    // The acquire state load is the synchronization point.  It also carries
+    // the published root header pointer, so keep it as the canonical aligned
+    // word and load the remaining payload descriptor words from the payload
+    // area.
+    words[kExceptionPayloadAlignedSlot] = state;
+    for (unsigned word = 1; word < kExceptionPayloadWordCount; ++word) {
+      words[word] = loadSlot(kExceptionCellPayloadBaseSlot + word - 1);
+    }
+    mlir::Value descriptor =
+        exception_payload::partsDescriptorFromWords(loc, words, rewriter);
+    rewriter.create<mlir::cf::BranchOp>(loc, afterBlock,
+                                        mlir::ValueRange{descriptor});
+
+    rewriter.setInsertionPointToStart(afterBlock);
+    return afterBlock->getArgument(afterBlock->getNumArguments() - 1);
+  }
+  mlir::emitError(loc)
+      << "async exception cell load requires memref descriptor ABI";
+  return {};
+}
+
+mlir::Value async_runtime::ExceptionCell::isNull(mlir::Location loc,
+                                                 mlir::Value exception,
+                                                 mlir::OpBuilder &builder) {
   auto ptrType = mlir::LLVM::LLVMPointerType::get(builder.getContext());
-  auto load = builder.create<mlir::LLVM::LoadOp>(
-      loc, ptrType, cell, /*alignment=*/8, /*isVolatile=*/false,
-      /*isNonTemporal=*/false, /*isInvariant=*/false,
-      /*isInvariantGroup=*/false, mlir::LLVM::AtomicOrdering::acquire);
-  threadsafe::Atomic::set(load.getOperation(),
-                          ThreadSafetyAttrs::kRoleAsyncExceptionLoad,
-                          ThreadSafetyAttrs::kOrderingAcquire);
-  return load;
+  if (auto descriptor =
+          mlir::dyn_cast<mlir::LLVM::LLVMStructType>(exception.getType())) {
+    if (exception_payload::isPartsDescriptorType(descriptor)) {
+      mlir::Value root = builder.create<mlir::LLVM::ExtractValueOp>(
+          loc, descriptor.getBody()[0], exception,
+          builder.getDenseI64ArrayAttr({0}));
+      return isNull(loc, root, builder);
+    }
+    if (!object_abi::Type::isLoweredStorage(descriptor))
+      return {};
+    mlir::Value aligned = builder.create<mlir::LLVM::ExtractValueOp>(
+        loc, descriptor.getBody()[1], exception,
+        builder.getDenseI64ArrayAttr({1}));
+    mlir::Value nullPtr = builder.create<mlir::LLVM::ZeroOp>(loc, ptrType);
+    return builder.create<mlir::LLVM::ICmpOp>(
+        loc, mlir::LLVM::ICmpPredicate::eq, aligned, nullPtr);
+  }
+  return {};
 }
 
-void async_runtime::ExceptionCell::releaseLoaded(
-    mlir::Location loc, mlir::ModuleOp module, mlir::OpBuilder &builder,
+mlir::LogicalResult async_runtime::ExceptionCell::releaseLoaded(
+    mlir::Location loc, mlir::ModuleOp module, mlir::RewriterBase &rewriter,
     const PyLLVMTypeConverter &typeConverter, mlir::Value exception) {
-  RuntimeAPI runtime(module, builder, typeConverter);
-  auto call = runtime.call(loc, RuntimeSymbols::kDecRef, mlir::Type(),
-                           mlir::ValueRange{exception});
-  call->setAttr(OwnershipContractAttrs::kAggregateRelease,
-                builder.getUnitAttr());
-}
-
-void async_runtime::ExceptionCell::free(
-    mlir::Location loc, mlir::ModuleOp module, mlir::OpBuilder &builder,
-    const PyLLVMTypeConverter &typeConverter, mlir::Value exceptionCell) {
-  RuntimeAPI runtime(module, builder, typeConverter);
-  runtime.call(loc, RuntimeSymbols::kMemFree, mlir::Type(),
-               mlir::ValueRange{exceptionCell});
-}
-
-void async_runtime::ExceptionCell::destroy(
-    mlir::Location loc, mlir::ModuleOp module, mlir::OpBuilder &builder,
-    const PyLLVMTypeConverter &typeConverter, mlir::Value exceptionCell) {
-  mlir::Value exception = load(loc, exceptionCell, builder);
-  releaseLoaded(loc, module, builder, typeConverter, exception);
-  free(loc, module, builder, typeConverter, exceptionCell);
-}
-
-void async_runtime::ExceptionCell::storeFirst(
-    mlir::Location loc, mlir::Value cell, mlir::Value exception,
-    mlir::ModuleOp module, mlir::RewriterBase &rewriter,
-    const PyLLVMTypeConverter &typeConverter, llvm::StringRef retainPremise) {
-  RuntimeAPI runtime(module, rewriter, typeConverter);
-  auto retain = runtime.call(loc, RuntimeSymbols::kIncRef, mlir::Type(),
-                             mlir::ValueRange{exception});
-  threadsafe::Retain::premise(retain.getOperation(), retainPremise);
-  auto ptrType = mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
-  mlir::Value nullPtr = rewriter.create<mlir::LLVM::ZeroOp>(loc, ptrType);
-  auto cmpxchg = rewriter.create<mlir::LLVM::AtomicCmpXchgOp>(
-      loc, cell, nullPtr, exception, mlir::LLVM::AtomicOrdering::acq_rel,
-      mlir::LLVM::AtomicOrdering::acquire, llvm::StringRef(), /*alignment=*/8);
-  threadsafe::Atomic::set(cmpxchg.getOperation(),
-                          ThreadSafetyAttrs::kRoleAsyncExceptionStore,
-                          ThreadSafetyAttrs::kOrderingAcqRel);
-  mlir::Value success = rewriter.create<mlir::LLVM::ExtractValueOp>(
-      loc, rewriter.getI1Type(), cmpxchg.getRes(),
-      rewriter.getDenseI64ArrayAttr({1}));
+  mlir::Value isNull =
+      async_runtime::ExceptionCell::isNull(loc, exception, rewriter);
+  if (!isNull) {
+    if (mlir::failed(releasePayload(loc, module, rewriter, typeConverter,
+                                    exception,
+                                    /*aggregateLoaded=*/true)))
+      return mlir::failure();
+    return mlir::success();
+  }
 
   mlir::Block *currentBlock = rewriter.getInsertionBlock();
   mlir::Block *afterBlock =
       rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
-  mlir::Block *failedBlock =
+  mlir::Block *releaseBlock =
       rewriter.createBlock(afterBlock->getParent(), afterBlock->getIterator());
   rewriter.setInsertionPointToEnd(currentBlock);
-  rewriter.create<mlir::cf::CondBranchOp>(loc, success, afterBlock,
-                                          failedBlock);
+  rewriter.create<mlir::cf::CondBranchOp>(loc, isNull, afterBlock,
+                                          releaseBlock);
 
-  rewriter.setInsertionPointToStart(failedBlock);
-  runtime.call(loc, RuntimeSymbols::kDecRef, mlir::Type(),
-               mlir::ValueRange{exception});
+  rewriter.setInsertionPointToStart(releaseBlock);
+  if (mlir::failed(releasePayload(loc, module, rewriter, typeConverter,
+                                  exception,
+                                  /*aggregateLoaded=*/true)))
+    return mlir::failure();
   rewriter.create<mlir::cf::BranchOp>(loc, afterBlock);
 
   rewriter.setInsertionPointToStart(afterBlock);
+  return mlir::success();
+}
+
+mlir::LogicalResult async_runtime::ExceptionCell::retainPayload(
+    mlir::Location loc, mlir::ModuleOp module, mlir::OpBuilder &builder,
+    const PyLLVMTypeConverter &typeConverter, mlir::Value exception,
+    llvm::StringRef retainPremise) {
+  (void)module;
+  (void)typeConverter;
+  RuntimeAPI runtime(module, builder, typeConverter);
+  llvm::SmallVector<mlir::Value, 3> parts;
+  if (exception_payload::partsDescriptorParts(loc, exception, builder, parts)) {
+    auto call = runtime.call(loc, RuntimeSymbols::kIncRef, mlir::Type(),
+                             mlir::ValueRange{parts.front()});
+    threadsafe::Retain::premise(call.getOperation(), retainPremise);
+    return mlir::success();
+  }
+  mlir::emitError(loc)
+      << "async exception payload retain requires parts descriptor ABI";
+  return mlir::failure();
+}
+
+mlir::FailureOr<mlir::Operation *> async_runtime::ExceptionCell::releasePayload(
+    mlir::Location loc, mlir::ModuleOp module, mlir::OpBuilder &builder,
+    const PyLLVMTypeConverter &typeConverter, mlir::Value exception,
+    bool aggregateLoaded) {
+  RuntimeAPI runtime(module, builder, typeConverter);
+  llvm::SmallVector<mlir::Value, 3> parts;
+  if (exception_payload::partsDescriptorParts(loc, exception, builder, parts)) {
+    auto call = runtime.call(loc, RuntimeSymbols::kExceptionDecRef,
+                             mlir::Type(), parts);
+    if (aggregateLoaded)
+      call->setAttr(OwnershipContractAttrs::kAggregateRelease,
+                    builder.getUnitAttr());
+    return call.getOperation();
+  }
+  mlir::emitError(loc)
+      << "async exception payload release requires parts descriptor ABI";
+  return mlir::failure();
+}
+
+mlir::LogicalResult async_runtime::ExceptionCell::free(
+    mlir::Location loc, mlir::ModuleOp module, mlir::OpBuilder &builder,
+    const PyLLVMTypeConverter &typeConverter, mlir::Value exceptionCell) {
+  (void)typeConverter;
+  if (async_runtime::isExceptionCellType(exceptionCell.getType())) {
+    auto dealloc = builder.create<mlir::memref::DeallocOp>(loc, exceptionCell);
+    dealloc->setAttr(AsyncSafetyAttrs::kExceptionCellFree,
+                     builder.getUnitAttr());
+    return mlir::success();
+  }
+  module.emitError("async exception cell dealloc requires high-level memref "
+                   "cell ABI before memref-to-LLVM conversion");
+  return mlir::failure();
+}
+
+mlir::LogicalResult async_runtime::ExceptionCell::destroy(
+    mlir::Location loc, mlir::ModuleOp module, mlir::RewriterBase &rewriter,
+    const PyLLVMTypeConverter &typeConverter, mlir::Value exceptionCell) {
+  mlir::Value exception = load(loc, exceptionCell, rewriter);
+  if (mlir::failed(
+          releaseLoaded(loc, module, rewriter, typeConverter, exception)))
+    return mlir::failure();
+  return free(loc, module, rewriter, typeConverter, exceptionCell);
+}
+
+mlir::LogicalResult async_runtime::ExceptionCell::destroyKnownEmpty(
+    mlir::Location loc, mlir::ModuleOp module, mlir::OpBuilder &builder,
+    const PyLLVMTypeConverter &typeConverter, mlir::Value exceptionCell) {
+  assumeExceptionCellEmpty(loc, exceptionCell, builder);
+  return free(loc, module, builder, typeConverter, exceptionCell);
+}
+
+mlir::LogicalResult async_runtime::ExceptionCell::storeFirst(
+    mlir::Location loc, mlir::Value cell, mlir::Value exception,
+    mlir::ModuleOp module, mlir::RewriterBase &rewriter,
+    const PyLLVMTypeConverter &typeConverter, llvm::StringRef retainPremise) {
+  llvm::SmallVector<mlir::Value, kExceptionPayloadWordCount> descriptorWords;
+  exception_payload::appendDescriptorWords(loc, exception, descriptorWords,
+                                           rewriter);
+  mlir::Value stored =
+      exception_payload::alignedPointer(loc, exception, rewriter);
+  if (!stored) {
+    mlir::emitError(loc) << "async exception cell payload is not a memref "
+                            "exception storage value";
+    return mlir::failure();
+  }
+
+  if (async_runtime::ExceptionCell::hasProvenance(cell)) {
+    if (descriptorWords.size() != kExceptionPayloadWordCount) {
+      mlir::emitError(loc) << "async exception cell payload descriptor is "
+                              "not available";
+      return mlir::failure();
+    }
+
+    if (mlir::Value memrefCell = sourceExceptionCellMemRef(cell)) {
+      mlir::Value empty = rewriter.create<mlir::arith::ConstantIntOp>(
+          loc, kExceptionCellEmpty, 64);
+      mlir::Value publishing = rewriter.create<mlir::arith::ConstantIntOp>(
+          loc, kExceptionCellPublishing, 64);
+
+      mlir::Value previous = transitionExceptionCellState(
+          loc, memrefCell, empty, publishing, /*reservation=*/true, rewriter);
+      mlir::Value reserved = rewriter.create<mlir::arith::CmpIOp>(
+          loc, mlir::arith::CmpIPredicate::eq, previous, empty);
+
+      mlir::Block *currentBlock = rewriter.getInsertionBlock();
+      mlir::Block *afterBlock =
+          rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
+      mlir::Block *publishBlock = rewriter.createBlock(
+          afterBlock->getParent(), afterBlock->getIterator());
+      rewriter.setInsertionPointToEnd(currentBlock);
+      rewriter.create<mlir::cf::CondBranchOp>(loc, reserved, publishBlock,
+                                              afterBlock);
+
+      rewriter.setInsertionPointToStart(publishBlock);
+      if (mlir::failed(retainPayload(loc, module, rewriter, typeConverter,
+                                     exception, retainPremise)))
+        return mlir::failure();
+      for (unsigned word = 1; word < descriptorWords.size(); ++word) {
+        storeExceptionCellMemRefSlot(loc, memrefCell,
+                                     kExceptionCellPayloadBaseSlot +
+                                         static_cast<unsigned>(word - 1),
+                                     descriptorWords[word], rewriter);
+      }
+      mlir::Value published = descriptorWords[kExceptionPayloadAlignedSlot];
+      ownership::aggregate::Slot::copyLoad(exception, published);
+      mlir::Value previousPublish =
+          transitionExceptionCellState(loc, memrefCell, publishing, published,
+                                       /*reservation=*/false, rewriter);
+      mlir::Value publishSucceeded = rewriter.create<mlir::arith::CmpIOp>(
+          loc, mlir::arith::CmpIPredicate::eq, previousPublish, publishing);
+      mlir::Block *publishFailedBlock = rewriter.createBlock(
+          afterBlock->getParent(), afterBlock->getIterator());
+      rewriter.setInsertionPointAfter(publishSucceeded.getDefiningOp());
+      rewriter.create<mlir::cf::CondBranchOp>(loc, publishSucceeded, afterBlock,
+                                              publishFailedBlock);
+
+      rewriter.setInsertionPointToStart(publishFailedBlock);
+      if (mlir::failed(
+              releasePayload(loc, module, rewriter, typeConverter, exception)))
+        return mlir::failure();
+      rewriter.create<mlir::cf::BranchOp>(loc, afterBlock);
+
+      rewriter.setInsertionPointToStart(afterBlock);
+      return mlir::success();
+    }
+
+    mlir::Value address = getExceptionCellAddress(loc, cell, rewriter);
+    mlir::Value empty = rewriter.create<mlir::LLVM::ConstantOp>(
+        loc, rewriter.getI64Type(),
+        rewriter.getI64IntegerAttr(kExceptionCellEmpty));
+    mlir::Value publishing = rewriter.create<mlir::LLVM::ConstantOp>(
+        loc, rewriter.getI64Type(),
+        rewriter.getI64IntegerAttr(kExceptionCellPublishing));
+
+    auto reserve = rewriter.create<mlir::LLVM::AtomicCmpXchgOp>(
+        loc, address, empty, publishing, mlir::LLVM::AtomicOrdering::acq_rel,
+        mlir::LLVM::AtomicOrdering::acquire, llvm::StringRef(),
+        /*alignment=*/8);
+    threadsafe::Atomic::set(reserve.getOperation(),
+                            ThreadSafetyAttrs::kRoleAsyncExceptionStore,
+                            ThreadSafetyAttrs::kOrderingAcqRel);
+    reserve->setAttr(AsyncSafetyAttrs::kExceptionCellReservation,
+                     rewriter.getUnitAttr());
+    mlir::Value reserved = rewriter.create<mlir::LLVM::ExtractValueOp>(
+        loc, rewriter.getI1Type(), reserve.getRes(),
+        rewriter.getDenseI64ArrayAttr({1}));
+
+    mlir::Block *currentBlock = rewriter.getInsertionBlock();
+    mlir::Block *afterBlock =
+        rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
+    mlir::Block *publishBlock = rewriter.createBlock(afterBlock->getParent(),
+                                                     afterBlock->getIterator());
+    rewriter.setInsertionPointToEnd(currentBlock);
+    rewriter.create<mlir::cf::CondBranchOp>(loc, reserved, publishBlock,
+                                            afterBlock);
+
+    rewriter.setInsertionPointToStart(publishBlock);
+    if (mlir::failed(retainPayload(loc, module, rewriter, typeConverter,
+                                   exception, retainPremise)))
+      return mlir::failure();
+    for (unsigned word = 1; word < descriptorWords.size(); ++word) {
+      storeExceptionCellSlot(loc, address,
+                             kExceptionCellPayloadBaseSlot +
+                                 static_cast<unsigned>(word - 1),
+                             descriptorWords[word], rewriter);
+    }
+    mlir::Value published = descriptorWords[kExceptionPayloadAlignedSlot];
+    ownership::aggregate::Slot::copyLoad(exception, published);
+    auto publish = rewriter.create<mlir::LLVM::AtomicCmpXchgOp>(
+        loc, address, publishing, published,
+        mlir::LLVM::AtomicOrdering::acq_rel,
+        mlir::LLVM::AtomicOrdering::acquire, llvm::StringRef(),
+        /*alignment=*/8);
+    threadsafe::Atomic::set(publish.getOperation(),
+                            ThreadSafetyAttrs::kRoleAsyncExceptionStore,
+                            ThreadSafetyAttrs::kOrderingAcqRel);
+    mlir::Value publishSucceeded = rewriter.create<mlir::LLVM::ExtractValueOp>(
+        loc, rewriter.getI1Type(), publish.getRes(),
+        rewriter.getDenseI64ArrayAttr({1}));
+    mlir::Block *publishFailedBlock = rewriter.createBlock(
+        afterBlock->getParent(), afterBlock->getIterator());
+    rewriter.setInsertionPointAfter(publishSucceeded.getDefiningOp());
+    rewriter.create<mlir::cf::CondBranchOp>(loc, publishSucceeded, afterBlock,
+                                            publishFailedBlock);
+
+    rewriter.setInsertionPointToStart(publishFailedBlock);
+    if (mlir::failed(
+            releasePayload(loc, module, rewriter, typeConverter, exception)))
+      return mlir::failure();
+    rewriter.create<mlir::cf::BranchOp>(loc, afterBlock);
+
+    rewriter.setInsertionPointToStart(afterBlock);
+    return mlir::success();
+  }
+
+  mlir::emitError(loc)
+      << "async exception cell store requires memref descriptor ABI";
+  return mlir::failure();
 }
 
 static void copyContractAttr(mlir::Operation *from, mlir::Operation *to,
@@ -772,6 +1815,7 @@ void copy(mlir::Operation *from, mlir::Operation *to) {
   copyContractAttr(from, to, OwnershipContractAttrs::kAggregateSlotGroup);
   copyContractAttr(from, to, OwnershipContractAttrs::kAggregateSlotComponent);
   copyContractAttr(from, to, OwnershipContractAttrs::kAggregateSlotIndex);
+  copyContractAttr(from, to, OwnershipContractAttrs::kAggregateSlotPartIndex);
   copyContractAttr(from, to, OwnershipContractAttrs::kMemRefSlotTransfer);
   copyContractAttr(from, to, kMemRefContainerAccessContractId);
   copyContractAttr(from, to, kMemRefAggregateLoadContractId);
@@ -908,6 +1952,53 @@ static std::string cInterfaceName(llvm::StringRef name) {
   return ("_mlir_ciface_" + name).str();
 }
 
+static mlir::Attribute getFuncArgAttr(mlir::func::FuncOp func,
+                                      unsigned argIndex,
+                                      llvm::StringRef attrName) {
+  if (argIndex >= func.getNumArguments())
+    return {};
+  return func.getArgAttr(argIndex, attrName);
+}
+
+static std::optional<unsigned>
+flattenedInputCount(mlir::Type inputType,
+                    const PyLLVMTypeConverter *typeConverter,
+                    bool preserveUnrankedMemRefAbi) {
+  if (!typeConverter)
+    return getFinalLLVMFunctionInputCount(inputType);
+
+  llvm::SmallVector<mlir::Type, 4> converted;
+  if (mlir::failed(typeConverter->convertType(inputType, converted)) ||
+      converted.empty())
+    return std::nullopt;
+  if (mlir::isa<mlir::MemRefType>(inputType) ||
+      (preserveUnrankedMemRefAbi &&
+       mlir::isa<mlir::UnrankedMemRefType>(inputType)))
+    return getFinalLLVMFunctionInputCount(inputType);
+  return static_cast<unsigned>(converted.size());
+}
+
+template <typename Fn>
+static void forEachFlattenedFuncArg(mlir::ModuleOp module,
+                                    const PyLLVMTypeConverter *typeConverter,
+                                    bool preserveUnrankedMemRefAbi,
+                                    Fn callback) {
+  module.walk([&](mlir::func::FuncOp func) {
+    llvm::StringRef name = func.getSymName();
+    unsigned flattenedIndex = 0;
+    for (unsigned arg = 0, e = func.getFunctionType().getNumInputs(); arg < e;
+         ++arg) {
+      mlir::Type inputType = func.getFunctionType().getInput(arg);
+      std::optional<unsigned> inputCount = flattenedInputCount(
+          inputType, typeConverter, preserveUnrankedMemRefAbi);
+      if (!inputCount)
+        return;
+      callback(name, func, arg, flattenedIndex, inputType);
+      flattenedIndex += *inputCount;
+    }
+  });
+}
+
 static void collectMemRefNonObjectArgs(
     llvm::StringRef name, mlir::func::FuncOp func, unsigned sourceArgIndex,
     unsigned flattenedIndex, mlir::Type inputType,
@@ -926,171 +2017,146 @@ static void collectMemRefNonObjectArgs(
   }
 }
 
+static void collectAsyncArgProvenance(
+    llvm::StringRef name, mlir::func::FuncOp func, unsigned sourceArgIndex,
+    unsigned flattenedIndex, mlir::Type inputType,
+    llvm::SmallVectorImpl<AsyncArgProvenanceContract> &contracts) {
+  if (getFuncArgAttr(func, sourceArgIndex, AsyncSafetyAttrs::kRuntimeHandle))
+    contracts.push_back(
+        {name.str(), flattenedIndex, AsyncArgProvenanceKind::RuntimeHandle});
+  if (getFuncArgAttr(func, sourceArgIndex, AsyncSafetyAttrs::kExceptionCell))
+    contracts.push_back(
+        {name.str(), flattenedIndex, AsyncArgProvenanceKind::ExceptionCell});
+  if (getFuncArgAttr(func, sourceArgIndex, AsyncSafetyAttrs::kCancelFlag)) {
+    unsigned targetIndex = flattenedIndex;
+    if (mlir::isa<mlir::MemRefType>(inputType))
+      targetIndex = flattenedIndex + 1;
+    contracts.push_back(
+        {name.str(), targetIndex, AsyncArgProvenanceKind::CancelFlag});
+  }
+}
+
 void collectAsyncArgProvenanceContracts(
     mlir::ModuleOp module,
     llvm::SmallVectorImpl<AsyncArgProvenanceContract> &contracts) {
-  module.walk([&](mlir::func::FuncOp func) {
-    llvm::StringRef name = func.getSymName();
-    unsigned flattenedIndex = 0;
-    for (unsigned arg = 0, e = func.getFunctionType().getNumInputs(); arg < e;
-         ++arg) {
-      mlir::Type inputType = func.getFunctionType().getInput(arg);
-      if (func.getArgAttr(arg, AsyncSafetyAttrs::kRuntimeHandle))
-        contracts.push_back({name.str(), flattenedIndex,
-                             AsyncArgProvenanceKind::RuntimeHandle});
-      if (func.getArgAttr(arg, AsyncSafetyAttrs::kExceptionCell))
-        contracts.push_back({name.str(), flattenedIndex,
-                             AsyncArgProvenanceKind::ExceptionCell});
-      if (func.getArgAttr(arg, AsyncSafetyAttrs::kCancelFlag)) {
-        unsigned targetIndex = flattenedIndex;
-        if (mlir::isa<mlir::MemRefType>(inputType))
-          targetIndex = flattenedIndex + 1;
-        contracts.push_back(
-            {name.str(), targetIndex, AsyncArgProvenanceKind::CancelFlag});
-      }
-      flattenedIndex += getFinalLLVMFunctionInputCount(inputType);
-    }
-  });
+  forEachFlattenedFuncArg(
+      module, /*typeConverter=*/nullptr, /*preserveUnrankedMemRefAbi=*/false,
+      [&](llvm::StringRef name, mlir::func::FuncOp func, unsigned arg,
+          unsigned flattenedIndex, mlir::Type inputType) {
+        collectAsyncArgProvenance(name, func, arg, flattenedIndex, inputType,
+                                  contracts);
+      });
 }
 
 void collectAsyncArgProvenanceContracts(
     mlir::ModuleOp module, const PyLLVMTypeConverter &typeConverter,
     llvm::SmallVectorImpl<AsyncArgProvenanceContract> &contracts) {
-  module.walk([&](mlir::func::FuncOp func) {
-    llvm::StringRef name = func.getSymName();
-    unsigned flattenedIndex = 0;
-    for (unsigned arg = 0, e = func.getFunctionType().getNumInputs(); arg < e;
-         ++arg) {
-      mlir::Type inputType = func.getFunctionType().getInput(arg);
-      llvm::SmallVector<mlir::Type, 4> converted;
-      if (mlir::failed(typeConverter.convertType(inputType, converted)) ||
-          converted.empty())
-        return;
-
-      if (func.getArgAttr(arg, AsyncSafetyAttrs::kRuntimeHandle))
-        contracts.push_back({name.str(), flattenedIndex,
-                             AsyncArgProvenanceKind::RuntimeHandle});
-      if (func.getArgAttr(arg, AsyncSafetyAttrs::kExceptionCell))
-        contracts.push_back({name.str(), flattenedIndex,
-                             AsyncArgProvenanceKind::ExceptionCell});
-      if (func.getArgAttr(arg, AsyncSafetyAttrs::kCancelFlag)) {
-        unsigned targetIndex = flattenedIndex;
-        if (mlir::isa<mlir::MemRefType>(inputType))
-          targetIndex = flattenedIndex + 1;
-        contracts.push_back(
-            {name.str(), targetIndex, AsyncArgProvenanceKind::CancelFlag});
-      }
-      flattenedIndex += mlir::isa<mlir::MemRefType>(inputType)
-                            ? getFinalLLVMFunctionInputCount(inputType)
-                            : static_cast<unsigned>(converted.size());
-    }
-  });
+  forEachFlattenedFuncArg(
+      module, &typeConverter, /*preserveUnrankedMemRefAbi=*/false,
+      [&](llvm::StringRef name, mlir::func::FuncOp func, unsigned arg,
+          unsigned flattenedIndex, mlir::Type inputType) {
+        collectAsyncArgProvenance(name, func, arg, flattenedIndex, inputType,
+                                  contracts);
+      });
 }
 
 void collectNonObjectArgContracts(
     mlir::ModuleOp module,
     llvm::SmallVectorImpl<NonObjectArgContract> &contracts) {
-  module.walk([&](mlir::func::FuncOp func) {
-    llvm::StringRef name = func.getSymName();
-    unsigned flattenedIndex = 0;
-    for (unsigned arg = 0, e = func.getFunctionType().getNumInputs(); arg < e;
-         ++arg) {
-      mlir::Type inputType = func.getFunctionType().getInput(arg);
-      collectMemRefNonObjectArgs(name, func, arg, flattenedIndex, inputType,
-                                 contracts);
-      flattenedIndex += getFinalLLVMFunctionInputCount(inputType);
-    }
-  });
+  forEachFlattenedFuncArg(
+      module, /*typeConverter=*/nullptr, /*preserveUnrankedMemRefAbi=*/false,
+      [&](llvm::StringRef name, mlir::func::FuncOp func, unsigned arg,
+          unsigned flattenedIndex, mlir::Type inputType) {
+        collectMemRefNonObjectArgs(name, func, arg, flattenedIndex, inputType,
+                                   contracts);
+      });
 }
 
 void collectNonObjectArgContracts(
     mlir::ModuleOp module, const PyLLVMTypeConverter &typeConverter,
     llvm::SmallVectorImpl<NonObjectArgContract> &contracts) {
-  module.walk([&](mlir::func::FuncOp func) {
-    llvm::StringRef name = func.getSymName();
-    unsigned flattenedIndex = 0;
-    for (unsigned arg = 0, e = func.getFunctionType().getNumInputs(); arg < e;
-         ++arg) {
-      mlir::Type inputType = func.getFunctionType().getInput(arg);
-      llvm::SmallVector<mlir::Type, 4> converted;
-      if (mlir::failed(typeConverter.convertType(inputType, converted)) ||
-          converted.empty())
-        return;
-
-      collectMemRefNonObjectArgs(name, func, arg, flattenedIndex, inputType,
-                                 contracts);
-      flattenedIndex +=
-          mlir::isa<mlir::MemRefType, mlir::UnrankedMemRefType>(inputType)
-              ? getFinalLLVMFunctionInputCount(inputType)
-              : static_cast<unsigned>(converted.size());
-    }
-  });
+  forEachFlattenedFuncArg(
+      module, &typeConverter, /*preserveUnrankedMemRefAbi=*/true,
+      [&](llvm::StringRef name, mlir::func::FuncOp func, unsigned arg,
+          unsigned flattenedIndex, mlir::Type inputType) {
+        collectMemRefNonObjectArgs(name, func, arg, flattenedIndex, inputType,
+                                   contracts);
+      });
 }
 
-mlir::LogicalResult preserveLLVMNonObjectArgContracts(
-    mlir::ModuleOp module, llvm::ArrayRef<NonObjectArgContract> contracts) {
+static mlir::Operation *lookupFuncLike(mlir::ModuleOp module,
+                                       llvm::StringRef symbolName) {
+  if (auto func = module.lookupSymbol<mlir::LLVM::LLVMFuncOp>(symbolName))
+    return func.getOperation();
+  if (auto func = module.lookupSymbol<mlir::func::FuncOp>(symbolName))
+    return func.getOperation();
+  if (auto func = module.lookupSymbol<mlir::async::FuncOp>(symbolName))
+    return func.getOperation();
+  return nullptr;
+}
+
+template <typename Contract, typename Apply>
+static mlir::LogicalResult
+preserveFuncArgContracts(mlir::ModuleOp module,
+                         llvm::ArrayRef<Contract> contracts,
+                         llvm::StringRef label, Apply apply) {
   bool failedAny = false;
-  for (const NonObjectArgContract &contract : contracts) {
-    mlir::Operation *funcLike = nullptr;
-    if (auto func =
-            module.lookupSymbol<mlir::LLVM::LLVMFuncOp>(contract.symbolName))
-      funcLike = func.getOperation();
-    else if (auto func =
-                 module.lookupSymbol<mlir::func::FuncOp>(contract.symbolName))
-      funcLike = func.getOperation();
-    else if (auto func =
-                 module.lookupSymbol<mlir::async::FuncOp>(contract.symbolName))
-      funcLike = func.getOperation();
-
+  for (const Contract &contract : contracts) {
+    mlir::Operation *funcLike = lookupFuncLike(module, contract.symbolName);
     if (!funcLike) {
       mlir::emitError(module.getLoc())
-          << "non-object argument contract for @" << contract.symbolName
+          << label << " for @" << contract.symbolName
           << " was not preserved through LLVM lowering";
       failedAny = true;
       continue;
     }
-    markFunctionArgument(funcLike, contract.argIndex,
-                         OwnershipContractAttrs::kNonObjectPointer);
+    apply(funcLike, contract);
   }
   return mlir::failure(failedAny);
+}
+
+mlir::LogicalResult preserveLLVMNonObjectArgContracts(
+    mlir::ModuleOp module, llvm::ArrayRef<NonObjectArgContract> contracts) {
+  return preserveFuncArgContracts(
+      module, contracts, "non-object argument contract",
+      [&](mlir::Operation *funcLike, const NonObjectArgContract &contract) {
+        markFunctionArgument(funcLike, contract.argIndex,
+                             OwnershipContractAttrs::kNonObjectPointer);
+
+        module.walk([&](mlir::LLVM::CallOp call) {
+          auto callee = call.getCallee();
+          if (!callee || *callee != contract.symbolName)
+            return;
+          if (contract.argIndex >= call.getNumOperands())
+            return;
+          mlir::Value operand = call.getCalleeOperands()[contract.argIndex];
+          if (mlir::isa<mlir::LLVM::LLVMPointerType>(operand.getType()))
+            ownership::Pointer::markNonObject(operand);
+        });
+      });
 }
 
 mlir::LogicalResult preserveLLVMAsyncArgProvenanceContracts(
     mlir::ModuleOp module,
     llvm::ArrayRef<AsyncArgProvenanceContract> contracts) {
-  bool failedAny = false;
-  for (const AsyncArgProvenanceContract &contract : contracts) {
-    mlir::Operation *funcLike = nullptr;
-    if (auto func =
-            module.lookupSymbol<mlir::LLVM::LLVMFuncOp>(contract.symbolName))
-      funcLike = func.getOperation();
-    else if (auto func =
-                 module.lookupSymbol<mlir::func::FuncOp>(contract.symbolName))
-      funcLike = func.getOperation();
-    else if (auto func =
-                 module.lookupSymbol<mlir::async::FuncOp>(contract.symbolName))
-      funcLike = func.getOperation();
-
-    if (!funcLike) {
-      mlir::emitError(module.getLoc())
-          << "async argument provenance contract for @" << contract.symbolName
-          << " was not preserved through LLVM lowering";
-      failedAny = true;
-      continue;
-    }
-    switch (contract.kind) {
-    case AsyncArgProvenanceKind::RuntimeHandle:
-      async_runtime::RuntimeHandle::markArgument(funcLike, contract.argIndex);
-      break;
-    case AsyncArgProvenanceKind::ExceptionCell:
-      async_runtime::ExceptionCell::markArgument(funcLike, contract.argIndex);
-      break;
-    case AsyncArgProvenanceKind::CancelFlag:
-      async_runtime::CancelFlag::markArgument(funcLike, contract.argIndex);
-      break;
-    }
-  }
-  return mlir::failure(failedAny);
+  return preserveFuncArgContracts(
+      module, contracts, "async argument provenance contract",
+      [](mlir::Operation *funcLike,
+         const AsyncArgProvenanceContract &contract) {
+        switch (contract.kind) {
+        case AsyncArgProvenanceKind::RuntimeHandle:
+          async_runtime::RuntimeHandle::markArgument(funcLike,
+                                                     contract.argIndex);
+          break;
+        case AsyncArgProvenanceKind::ExceptionCell:
+          async_runtime::ExceptionCell::markArgument(funcLike,
+                                                     contract.argIndex);
+          break;
+        case AsyncArgProvenanceKind::CancelFlag:
+          async_runtime::CancelFlag::markArgument(funcLike, contract.argIndex);
+          break;
+        }
+      });
 }
 
 void collectMemRefAtomicContracts(
@@ -1146,9 +2212,57 @@ void collectMemRefAtomicContracts(
   });
 }
 
+template <typename Contract> class ContractPreserver {
+public:
+  ContractPreserver(llvm::ArrayRef<Contract> contracts,
+                    llvm::StringRef missingMessage)
+      : contracts(contracts), used(contracts.size(), false),
+        missingMessage(missingMessage) {}
+
+  template <typename Accept, typename Validate, typename Apply>
+  void apply(mlir::Operation *op, llvm::StringRef idAttrName,
+             llvm::StringRef unknownMessage, Accept accept, Validate validate,
+             Apply materialize) {
+    auto idAttr = op->getAttrOfType<mlir::IntegerAttr>(idAttrName);
+    if (!idAttr)
+      return;
+
+    int64_t id = idAttr.getInt();
+    for (auto indexed : llvm::enumerate(contracts)) {
+      const Contract &contract = indexed.value();
+      if (contract.id != id || !accept(contract))
+        continue;
+      if (mlir::failed(validate(contract))) {
+        failedAny = true;
+        return;
+      }
+      materialize(contract);
+      used[indexed.index()] = true;
+      return;
+    }
+    op->emitOpError(unknownMessage);
+    failedAny = true;
+  }
+
+  mlir::LogicalResult finish() {
+    for (auto indexed : llvm::enumerate(contracts)) {
+      if (used[indexed.index()])
+        continue;
+      mlir::emitError(indexed.value().location) << missingMessage;
+      failedAny = true;
+    }
+    return mlir::failure(failedAny);
+  }
+
+private:
+  llvm::ArrayRef<Contract> contracts;
+  llvm::SmallVector<bool> used;
+  llvm::StringRef missingMessage;
+  bool failedAny = false;
+};
+
 mlir::LogicalResult preserveLoweredMemRefAtomicContracts(
     mlir::ModuleOp module, llvm::ArrayRef<MemRefAtomicContract> contracts) {
-  llvm::SmallVector<bool> used(contracts.size(), false);
   auto applyContract = [](mlir::LLVM::AtomicRMWOp atomic,
                           const MemRefAtomicContract &contract) {
     threadsafe::Atomic::set(atomic.getOperation(), contract.role.getValue(),
@@ -1158,8 +2272,12 @@ mlir::LogicalResult preserveLoweredMemRefAtomicContracts(
                                 : llvm::StringRef{});
     llvm::StringRef component =
         contract.component ? contract.component.getValue() : llvm::StringRef{};
-    bool isContainerAtomic = contract.role.getValue().starts_with("container.");
+    bool isContainerAtomic = role::containerAtomic(contract.role.getValue());
+    bool isObjectAtomic = role::objectAtomic(contract.role.getValue());
+    bool isClassAtomic = role::classAtomic(contract.role.getValue());
     if (component.empty() && isContainerAtomic)
+      component = ContainerSafetyAttrs::kComponentHeader;
+    if (component.empty() && isClassAtomic)
       component = ContainerSafetyAttrs::kComponentHeader;
     if (isContainerAtomic) {
       threadsafe::memref::Atomic::set(
@@ -1167,6 +2285,17 @@ mlir::LogicalResult preserveLoweredMemRefAtomicContracts(
           contract.group ? contract.group.getValue() : llvm::StringRef{},
           contract.containerKind ? contract.containerKind.getValue()
                                  : llvm::StringRef{});
+    }
+    if (isObjectAtomic)
+      threadsafe::memref::Atomic::set(atomic.getOperation(), component,
+                                      contract.slot, llvm::StringRef{},
+                                      llvm::StringRef{});
+    if (isClassAtomic)
+      threadsafe::memref::Atomic::set(
+          atomic.getOperation(), component, contract.slot,
+          contract.group ? contract.group.getValue() : llvm::StringRef{},
+          llvm::StringRef{});
+    if (isContainerAtomic || isObjectAtomic || isClassAtomic) {
       mlir::OpBuilder builder(atomic.getContext());
       atomic->setAttr(ThreadSafetyAttrs::kAtomicProvenance,
                       builder.getStringAttr(
@@ -1187,33 +2316,20 @@ mlir::LogicalResult preserveLoweredMemRefAtomicContracts(
     atomic->removeAttr(kMemRefAtomicContractId);
   };
 
-  bool failedAny = false;
+  ContractPreserver<MemRefAtomicContract> preserver(
+      contracts, "memref atomic contract was not preserved through LLVM "
+                 "lowering");
   module.walk([&](mlir::LLVM::AtomicRMWOp atomic) {
-    if (auto idAttr =
-            atomic->getAttrOfType<mlir::IntegerAttr>(kMemRefAtomicContractId)) {
-      int64_t id = idAttr.getInt();
-      for (auto indexed : llvm::enumerate(contracts)) {
-        unsigned index = indexed.index();
-        if (indexed.value().id != id)
-          continue;
-        applyContract(atomic, indexed.value());
-        used[index] = true;
-        return;
-      }
-      atomic->emitOpError("carries an unknown memref atomic contract id");
-      failedAny = true;
-      return;
-    }
+    preserver.apply(
+        atomic.getOperation(), kMemRefAtomicContractId,
+        "carries an unknown memref atomic contract id",
+        [](const MemRefAtomicContract &) { return true; },
+        [](const MemRefAtomicContract &) { return mlir::success(); },
+        [&](const MemRefAtomicContract &contract) {
+          applyContract(atomic, contract);
+        });
   });
-
-  for (auto indexed : llvm::enumerate(contracts)) {
-    if (used[indexed.index()])
-      continue;
-    mlir::emitError(indexed.value().location)
-        << "memref atomic contract was not preserved through LLVM lowering";
-    failedAny = true;
-  }
-  return mlir::failure(failedAny);
+  return preserver.finish();
 }
 
 void collectMemRefAggregateLoadContracts(
@@ -1221,86 +2337,75 @@ void collectMemRefAggregateLoadContracts(
     llvm::SmallVectorImpl<MemRefAggregateLoadContract> &contracts) {
   mlir::OpBuilder builder(module.getContext());
   int64_t nextId = 0;
-  module.walk([&](mlir::memref::LoadOp load) {
-    if (!load->hasAttr(OwnershipContractAttrs::kAggregateSlotLoad))
+  auto collect = [&](mlir::Operation *op, mlir::Value memref,
+                     mlir::ValueRange indices) {
+    if (!op->hasAttr(OwnershipContractAttrs::kAggregateSlotLoad))
       return;
-    auto group = load->getAttrOfType<mlir::StringAttr>(
+    auto group = op->getAttrOfType<mlir::StringAttr>(
         OwnershipContractAttrs::kAggregateSlotGroup);
     if (!group)
       if (auto groupName = getLoweringValueDefStringAttr(
-              load.getMemref(), ContainerSafetyAttrs::kDescriptorGroup))
+              memref, ContainerSafetyAttrs::kDescriptorGroup))
         group = builder.getStringAttr(*groupName);
-    auto component = load->getAttrOfType<mlir::StringAttr>(
+    auto component = op->getAttrOfType<mlir::StringAttr>(
         OwnershipContractAttrs::kAggregateSlotComponent);
     if (!component)
       if (auto componentName = getLoweringValueDefStringAttr(
-              load.getMemref(), ContainerSafetyAttrs::kDescriptorComponent))
+              memref, ContainerSafetyAttrs::kDescriptorComponent))
         component = builder.getStringAttr(*componentName);
     std::optional<int64_t> slot;
-    if (auto slotAttr = load->getAttrOfType<mlir::IntegerAttr>(
+    if (auto slotAttr = op->getAttrOfType<mlir::IntegerAttr>(
             OwnershipContractAttrs::kAggregateSlotIndex))
       slot = slotAttr.getInt();
-    else if (load.getIndices().size() == 1)
-      slot = getArithConstantInt(load.getIndices().front());
+    else if (indices.size() == 1)
+      slot = getArithConstantInt(indices.front());
     int64_t id = nextId++;
-    load->setAttr(kMemRefAggregateLoadContractId,
-                  builder.getI64IntegerAttr(id));
+    op->setAttr(kMemRefAggregateLoadContractId, builder.getI64IntegerAttr(id));
     contracts.push_back(
-        MemRefAggregateLoadContract{id, load.getLoc(), group, component, slot});
+        MemRefAggregateLoadContract{id, op->getLoc(), group, component, slot});
+  };
+
+  module.walk([&](mlir::memref::LoadOp load) {
+    collect(load.getOperation(), load.getMemref(), load.getIndices());
+  });
+  module.walk([&](mlir::memref::ExtractAlignedPointerAsIndexOp extract) {
+    collect(extract.getOperation(), extract.getSource(), {});
   });
 }
 
 mlir::LogicalResult preserveLoweredMemRefAggregateLoadContracts(
     mlir::ModuleOp module,
     llvm::ArrayRef<MemRefAggregateLoadContract> contracts) {
-  llvm::SmallVector<bool> used(contracts.size(), false);
-  auto applyContract = [](mlir::LLVM::LoadOp load,
+  auto applyContract = [](mlir::Operation *op,
                           const MemRefAggregateLoadContract &contract) {
-    mlir::OpBuilder builder(load.getContext());
-    load->setAttr(OwnershipContractAttrs::kAggregateSlotLoad,
-                  builder.getUnitAttr());
+    mlir::OpBuilder builder(op->getContext());
+    op->setAttr(OwnershipContractAttrs::kAggregateSlotLoad,
+                builder.getUnitAttr());
     if (contract.group)
-      load->setAttr(OwnershipContractAttrs::kAggregateSlotGroup,
-                    contract.group);
+      op->setAttr(OwnershipContractAttrs::kAggregateSlotGroup, contract.group);
     if (contract.component)
-      load->setAttr(OwnershipContractAttrs::kAggregateSlotComponent,
-                    contract.component);
+      op->setAttr(OwnershipContractAttrs::kAggregateSlotComponent,
+                  contract.component);
     if (contract.slot)
-      load->setAttr(OwnershipContractAttrs::kAggregateSlotIndex,
-                    builder.getI64IntegerAttr(*contract.slot));
-    load->removeAttr(kMemRefAggregateLoadContractId);
+      op->setAttr(OwnershipContractAttrs::kAggregateSlotIndex,
+                  builder.getI64IntegerAttr(*contract.slot));
+    op->removeAttr(kMemRefAggregateLoadContractId);
   };
 
-  bool failedAny = false;
-  module.walk([&](mlir::LLVM::LoadOp load) {
-    if (auto idAttr = load->getAttrOfType<mlir::IntegerAttr>(
-            kMemRefAggregateLoadContractId)) {
-      int64_t id = idAttr.getInt();
-      for (auto indexed : llvm::enumerate(contracts)) {
-        unsigned index = indexed.index();
-        if (indexed.value().id != id)
-          continue;
-        applyContract(load, indexed.value());
-        used[index] = true;
-        return;
-      }
-      load->emitOpError("carries an unknown aggregate load contract id");
-      failedAny = true;
-      return;
-    }
-    if (!load->hasAttr(OwnershipContractAttrs::kAggregateSlotLoad))
-      return;
+  ContractPreserver<MemRefAggregateLoadContract> preserver(
+      contracts, "aggregate slot load contract was not preserved through LLVM "
+                 "lowering");
+  module.walk([&](mlir::Operation *op) {
+    preserver.apply(
+        op, kMemRefAggregateLoadContractId,
+        "carries an unknown aggregate load contract id",
+        [](const MemRefAggregateLoadContract &) { return true; },
+        [](const MemRefAggregateLoadContract &) { return mlir::success(); },
+        [&](const MemRefAggregateLoadContract &contract) {
+          applyContract(op, contract);
+        });
   });
-
-  for (auto indexed : llvm::enumerate(contracts)) {
-    if (used[indexed.index()])
-      continue;
-    mlir::emitError(indexed.value().location)
-        << "aggregate slot load contract was not preserved through LLVM "
-           "lowering";
-    failedAny = true;
-  }
-  return mlir::failure(failedAny);
+  return preserver.finish();
 }
 
 namespace container::access::Contract {
@@ -1331,7 +2436,6 @@ void collect(mlir::ModuleOp module,
 mlir::LogicalResult
 preserve(mlir::ModuleOp module,
          llvm::ArrayRef<MemRefContainerAccessContract> contracts) {
-  llvm::SmallVector<bool> used(contracts.size(), false);
   auto applyContract = [](mlir::Operation *op,
                           const MemRefContainerAccessContract &contract) {
     op->setAttr(ContainerSafetyAttrs::kAccessGroup, contract.group);
@@ -1340,42 +2444,31 @@ preserve(mlir::ModuleOp module,
     op->removeAttr(kMemRefContainerAccessContractId);
   };
 
-  bool failedAny = false;
-  auto match = [&](mlir::Operation *op, bool store, mlir::Value addr) {
-    if (auto idAttr = op->getAttrOfType<mlir::IntegerAttr>(
-            kMemRefContainerAccessContractId)) {
-      int64_t id = idAttr.getInt();
-      for (auto indexed : llvm::enumerate(contracts)) {
-        unsigned index = indexed.index();
-        if (indexed.value().id != id || indexed.value().store != store)
-          continue;
-        applyContract(op, indexed.value());
-        used[index] = true;
-        return;
-      }
-      op->emitOpError("carries an unknown container access contract id");
-      failedAny = true;
-      return;
-    }
-    (void)addr;
+  ContractPreserver<MemRefContainerAccessContract> preserver(
+      contracts,
+      "managed container access contract was not preserved through LLVM "
+      "lowering");
+  auto match = [&](mlir::Operation *op, bool store) {
+    preserver.apply(
+        op, kMemRefContainerAccessContractId,
+        "carries an unknown container access contract id",
+        [&](const MemRefContainerAccessContract &contract) {
+          return contract.store == store;
+        },
+        [](const MemRefContainerAccessContract &) { return mlir::success(); },
+        [&](const MemRefContainerAccessContract &contract) {
+          applyContract(op, contract);
+        });
   };
 
   module.walk([&](mlir::LLVM::LoadOp load) {
-    match(load.getOperation(), /*store=*/false, load.getAddr());
+    match(load.getOperation(), /*store=*/false);
   });
   module.walk([&](mlir::LLVM::StoreOp store) {
-    match(store.getOperation(), /*store=*/true, store.getAddr());
+    match(store.getOperation(), /*store=*/true);
   });
 
-  for (auto indexed : llvm::enumerate(contracts)) {
-    if (used[indexed.index()])
-      continue;
-    mlir::emitError(indexed.value().location)
-        << "managed container access contract was not preserved through LLVM "
-           "lowering";
-    failedAny = true;
-  }
-  return mlir::failure(failedAny);
+  return preserver.finish();
 }
 } // namespace container::access::Contract
 
@@ -1437,6 +2530,12 @@ void collectMemRefDeallocContracts(
   module.walk([&](mlir::memref::DeallocOp dealloc) {
     auto explicitGroup = dealloc->getAttrOfType<mlir::StringAttr>(
         ContainerSafetyAttrs::kDeallocGroup);
+    auto classPart = dealloc->getAttrOfType<mlir::StringAttr>(
+        ClassSafetyAttrs::kDeallocPart);
+    auto objectPart = dealloc->getAttrOfType<mlir::StringAttr>(
+        OwnershipContractAttrs::kObjectDeallocPart);
+    bool exceptionCellFree =
+        dealloc->hasAttr(AsyncSafetyAttrs::kExceptionCellFree);
     mlir::StringAttr guardedGroup;
     std::optional<llvm::StringRef> inferredGroup;
     if (!explicitGroup) {
@@ -1450,7 +2549,7 @@ void collectMemRefDeallocContracts(
             : (guardedGroup
                    ? guardedGroup.getValue()
                    : (inferredGroup ? *inferredGroup : llvm::StringRef{}));
-    if (groupName.empty())
+    if (groupName.empty() && !classPart && !objectPart && !exceptionCellFree)
       return;
     auto explicitComponent = dealloc->getAttrOfType<mlir::StringAttr>(
         ContainerSafetyAttrs::kDeallocComponent);
@@ -1461,61 +2560,62 @@ void collectMemRefDeallocContracts(
     int64_t id = nextId++;
     dealloc->setAttr(kMemRefDeallocContractId, builder.getI64IntegerAttr(id));
     contracts.push_back(MemRefDeallocContract{
-        id, dealloc.getLoc(), builder.getStringAttr(groupName),
+        id, dealloc.getLoc(),
+        groupName.empty() ? mlir::StringAttr{}
+                          : builder.getStringAttr(groupName),
         explicitComponent
             ? explicitComponent
             : (inferredComponent ? builder.getStringAttr(*inferredComponent)
-                                 : mlir::StringAttr{})});
+                                 : mlir::StringAttr{}),
+        classPart, objectPart, exceptionCellFree});
   });
 }
 
-static bool isFreeCall(mlir::LLVM::CallOp call) {
-  auto callee = call.getCallee();
-  return callee && *callee == "free";
+static bool deallocShape(mlir::LLVM::CallOp call) {
+  return call.getNumResults() == 0 && call.getNumOperands() == 1 &&
+         mlir::isa<mlir::LLVM::LLVMPointerType>(call.getOperand(0).getType());
 }
 
 mlir::LogicalResult preserveLoweredMemRefDeallocContracts(
     mlir::ModuleOp module, llvm::ArrayRef<MemRefDeallocContract> contracts) {
-  llvm::SmallVector<bool> used(contracts.size(), false);
   auto applyContract = [](mlir::LLVM::CallOp call,
                           const MemRefDeallocContract &contract) {
-    call->setAttr(ContainerSafetyAttrs::kDeallocGroup, contract.group);
+    if (contract.group)
+      call->setAttr(ContainerSafetyAttrs::kDeallocGroup, contract.group);
     if (contract.component)
       call->setAttr(ContainerSafetyAttrs::kDeallocComponent,
                     contract.component);
+    if (contract.classPart)
+      call->setAttr(ClassSafetyAttrs::kDeallocPart, contract.classPart);
+    if (contract.objectPart)
+      call->setAttr(OwnershipContractAttrs::kObjectDeallocPart,
+                    contract.objectPart);
+    if (contract.exceptionCellFree)
+      call->setAttr(AsyncSafetyAttrs::kExceptionCellFree,
+                    mlir::UnitAttr::get(call.getContext()));
     call->removeAttr(kMemRefDeallocContractId);
   };
 
-  bool failedAny = false;
+  ContractPreserver<MemRefDeallocContract> preserver(
+      contracts, "memref dealloc safety contract was not preserved through "
+                 "LLVM lowering");
   module.walk([&](mlir::LLVM::CallOp call) {
-    if (!isFreeCall(call))
-      return;
-    if (auto idAttr =
-            call->getAttrOfType<mlir::IntegerAttr>(kMemRefDeallocContractId)) {
-      int64_t id = idAttr.getInt();
-      for (auto indexed : llvm::enumerate(contracts)) {
-        unsigned index = indexed.index();
-        if (indexed.value().id != id)
-          continue;
-        applyContract(call, indexed.value());
-        used[index] = true;
-        return;
-      }
-      call->emitOpError("carries an unknown memref dealloc contract id");
-      failedAny = true;
-      return;
-    }
+    preserver.apply(
+        call.getOperation(), kMemRefDeallocContractId,
+        "carries an unknown memref dealloc contract id",
+        [](const MemRefDeallocContract &) { return true; },
+        [&](const MemRefDeallocContract &) -> mlir::LogicalResult {
+          if (!deallocShape(call))
+            return call->emitOpError("memref dealloc contract lowered to a "
+                                     "non-dealloc call shape");
+          return mlir::success();
+        },
+        [&](const MemRefDeallocContract &contract) {
+          applyContract(call, contract);
+        });
   });
 
-  for (auto indexed : llvm::enumerate(contracts)) {
-    if (used[indexed.index()])
-      continue;
-    mlir::emitError(indexed.value().location)
-        << "managed container dealloc contract was not preserved through LLVM "
-           "lowering";
-    failedAny = true;
-  }
-  return mlir::failure(failedAny);
+  return preserver.finish();
 }
 
 void collectLoweredSafetyContracts(mlir::ModuleOp module,
@@ -1568,8 +2668,8 @@ static bool isPyRuntimeBridgeType(mlir::Type type) {
   return isPyType(type) || mlir::isa<FuncType>(type) ||
          mlir::isa<TupleType>(type) || mlir::isa<ListType>(type) ||
          mlir::isa<ClassType>(type) || mlir::isa<DictType>(type) ||
-         mlir::isa<ObjectType>(type) || mlir::isa<CoroutineType>(type) ||
-         mlir::isa<FutureType>(type) || mlir::isa<TaskType>(type);
+         mlir::isa<CoroutineType>(type) || mlir::isa<FutureType>(type) ||
+         mlir::isa<TaskType>(type);
 }
 
 static bool isConvertedAsyncDescriptorBridge(mlir::Type resultType,
@@ -1581,15 +2681,14 @@ static bool isConvertedAsyncDescriptorBridge(mlir::Type resultType,
     return false;
   if (!mlir::isa<mlir::async::ValueType>(inputs[0].getType()))
     return false;
-  if (!mlir::isa<mlir::LLVM::LLVMPointerType>(inputs[1].getType()))
+  if (!async_runtime::ExceptionCell::hasProvenance(inputs[1]))
     return false;
   return !expectsCancelFlag || mlir::isa<mlir::MemRefType>(inputs[2].getType());
 }
 
-PyLLVMTypeConverter::PyLLVMTypeConverter(mlir::MLIRContext *ctx)
-    : mlir::LLVMTypeConverter(ctx) {
-  pyObjectPtrType = mlir::LLVM::LLVMPointerType::get(ctx);
-
+PyLLVMTypeConverter::PyLLVMTypeConverter(mlir::MLIRContext *ctx,
+                                         mlir::ModuleOp module)
+    : mlir::LLVMTypeConverter(ctx), module(module) {
   addConversion([](mlir::Type type) -> std::optional<mlir::Type> {
     if (mlir::isa<mlir::IntegerType, mlir::FloatType, mlir::RankedTensorType>(
             type))
@@ -1614,31 +2713,54 @@ PyLLVMTypeConverter::PyLLVMTypeConverter(mlir::MLIRContext *ctx)
     return mlir::LLVM::LLVMStructType::getLiteral(ctx, storageParts);
   };
 
-  addConversion([this, convertAsyncPayload](
+  addConversion([ctx, convertAsyncPayload](
                     mlir::Type type) -> std::optional<mlir::Type> {
     if (mlir::isa<ListType, DictType, TupleType, CoroutineType, TaskType,
                   FutureType>(type))
       return std::nullopt;
+    if (mlir::isa<BoolType>(type))
+      return mlir::IntegerType::get(ctx, 1);
+    if (mlir::isa<NoneType>(type))
+      return mlir::IntegerType::get(ctx, 1);
+    if (mlir::isa<ExceptionCellType>(type))
+      return async_runtime::getExceptionCellType(ctx);
+    if (mlir::isa<FloatType>(type))
+      return mlir::Float64Type::get(ctx);
+    if (mlir::isa<FuncType>(type))
+      return mlir::FunctionType::get(ctx, {}, {});
     if (auto asyncValueType = mlir::dyn_cast<mlir::async::ValueType>(type)) {
       auto valueType = convertAsyncPayload(asyncValueType.getValueType());
       if (!valueType)
         return std::nullopt;
       return mlir::async::ValueType::get(*valueType);
     }
-    if ((isPyType(type) &&
-         !mlir::isa<CoroutineType, TaskType, FutureType>(type)) ||
-        mlir::isa<FuncType>(type) || mlir::isa<TupleType>(type) ||
-        mlir::isa<ClassType>(type) || mlir::isa<DictType>(type) ||
-        mlir::isa<ObjectType>(type))
-      return pyObjectPtrType;
-    if (mlir::isa<NoneType>(type))
-      return pyObjectPtrType;
     return std::nullopt;
   });
 
-  addConversion([ctx, convertAsyncPayload](
+  addConversion([this, ctx, convertAsyncPayload](
                     mlir::Type type, mlir::SmallVectorImpl<mlir::Type> &results)
                     -> std::optional<mlir::LogicalResult> {
+    if (mlir::isa<IntType>(type)) {
+      object_abi::long_abi::Parts::storageTypes(ctx, results);
+      return mlir::success();
+    }
+    if (mlir::isa<StrType>(type)) {
+      object_abi::str_abi::Parts::storageTypes(ctx, results);
+      return mlir::success();
+    }
+    if (mlir::isa<ExceptionType>(type)) {
+      object_abi::exception_abi::Parts::storageTypes(ctx, results);
+      return mlir::success();
+    }
+    if (auto classType = mlir::dyn_cast<ClassType>(type)) {
+      mlir::FailureOr<class_layout::Layout> layout =
+          class_layout::get(this->module.getOperation(), classType, *this);
+      if (mlir::failed(layout))
+        return std::nullopt;
+      class_layout::partsValueTypes(*layout, results);
+      return mlir::success();
+    }
+
     mlir::Type payloadType;
     bool includeCancelFlag = false;
     if (auto coroType = mlir::dyn_cast<CoroutineType>(type)) {
@@ -1655,7 +2777,7 @@ PyLLVMTypeConverter::PyLLVMTypeConverter(mlir::MLIRContext *ctx)
     if (!resultType)
       return std::nullopt;
     results.push_back(mlir::async::ValueType::get(*resultType));
-    results.push_back(mlir::LLVM::LLVMPointerType::get(ctx));
+    results.push_back(async_runtime::getExceptionCellType(ctx));
     if (!includeCancelFlag)
       return mlir::success();
     results.push_back(
@@ -1664,33 +2786,42 @@ PyLLVMTypeConverter::PyLLVMTypeConverter(mlir::MLIRContext *ctx)
   });
 
   addConversion(
-      [ctx](ListType listType, mlir::SmallVectorImpl<mlir::Type> &results)
+      [this](ListType listType, mlir::SmallVectorImpl<mlir::Type> &results)
           -> std::optional<mlir::LogicalResult> {
-        auto itemsType = getListItemsMemRefType(listType.getElementType(), ctx);
+        auto itemsType = getListItemsMemRefType(listType);
         if (!itemsType)
           return std::nullopt;
-        results.push_back(getListHeaderMemRefType(ctx));
+        results.push_back(getListHeaderMemRefType(&getContext()));
+        results.push_back(getContainerLockMemRefType(&getContext()));
         results.push_back(itemsType);
         return mlir::success();
       });
 
   addConversion(
-      [ctx](TupleType tupleType, mlir::SmallVectorImpl<mlir::Type> &results)
+      [this](TupleType tupleType, mlir::SmallVectorImpl<mlir::Type> &results)
           -> std::optional<mlir::LogicalResult> {
-        results.push_back(getTupleHeaderMemRefType(ctx));
-        results.push_back(getTupleItemsMemRefType(tupleType, ctx));
+        auto itemsType = getTupleItemsMemRefType(tupleType);
+        if (!itemsType)
+          return std::nullopt;
+        results.push_back(getTupleHeaderMemRefType(&getContext()));
+        results.push_back(itemsType);
         return mlir::success();
       });
 
   addConversion(
-      [ctx](DictType dictType, mlir::SmallVectorImpl<mlir::Type> &results)
+      [this](DictType dictType, mlir::SmallVectorImpl<mlir::Type> &results)
           -> std::optional<mlir::LogicalResult> {
         if (container::Slot::supported(dictType.getKeyType()) &&
             container::Slot::supported(dictType.getValueType())) {
-          results.push_back(getDictHeaderMemRefType(ctx));
-          results.push_back(getDictKeysMemRefType(dictType, ctx));
-          results.push_back(getDictValuesMemRefType(dictType, ctx));
-          results.push_back(getDictStatesMemRefType(ctx));
+          auto keysType = getDictKeysMemRefType(dictType);
+          auto valuesType = getDictValuesMemRefType(dictType);
+          if (!keysType || !valuesType)
+            return std::nullopt;
+          results.push_back(getDictHeaderMemRefType(&getContext()));
+          results.push_back(getContainerLockMemRefType(&getContext()));
+          results.push_back(keysType);
+          results.push_back(valuesType);
+          results.push_back(getDictStatesMemRefType(&getContext()));
           return mlir::success();
         }
         return std::nullopt;
@@ -1735,10 +2866,94 @@ PyLLVMTypeConverter::PyLLVMTypeConverter(mlir::MLIRContext *ctx)
   addTargetMaterialization(materializeTargetBridge);
 }
 
+mlir::Type
+PyLLVMTypeConverter::getContainerStorageType(mlir::Type logicalType) const {
+  if (auto classType = mlir::dyn_cast<ClassType>(logicalType)) {
+    if (mlir::Type objectType = class_layout::carrierStorageType(
+            module, classType, *this, &getContext()))
+      return objectType;
+  }
+  if (mlir::isa<StrType, ExceptionType>(logicalType)) {
+    llvm::SmallVector<mlir::Type, 2> storageTypes;
+    if (mlir::isa<StrType>(logicalType))
+      object_abi::str_abi::Parts::storageTypes(&getContext(), storageTypes);
+    else
+      object_abi::exception_abi::Parts::storageTypes(&getContext(),
+                                                     storageTypes);
+    llvm::SmallVector<mlir::MemRefType, 2> partTypes;
+    for (mlir::Type storageType : storageTypes) {
+      auto memrefType = mlir::dyn_cast<mlir::MemRefType>(storageType);
+      if (!memrefType)
+        return {};
+      partTypes.push_back(memrefType);
+    }
+    return class_layout::objectCarrierType(&getContext(), partTypes);
+  }
+  return container::Slot::storageType(logicalType, &getContext());
+}
+
+mlir::MemRefType
+PyLLVMTypeConverter::getListItemsMemRefType(ListType listType) const {
+  if (!listType)
+    return {};
+  mlir::Type storageType = getContainerStorageType(listType.getElementType());
+  if (!storageType)
+    return {};
+  return mlir::MemRefType::get({mlir::ShapedType::kDynamic}, storageType);
+}
+
+mlir::Type
+PyLLVMTypeConverter::getTupleItemsStorageType(TupleType tupleType) const {
+  if (!tupleType)
+    return {};
+  auto elementTypes = tupleType.getElementTypes();
+  if (elementTypes.empty())
+    return mlir::IntegerType::get(&getContext(), 8);
+  mlir::Type firstStorage = getContainerStorageType(elementTypes.front());
+  if (!firstStorage)
+    return {};
+  for (mlir::Type elementType : elementTypes.drop_front()) {
+    mlir::Type storage = getContainerStorageType(elementType);
+    if (!storage || storage != firstStorage)
+      return {};
+  }
+  return firstStorage;
+}
+
+mlir::MemRefType
+PyLLVMTypeConverter::getTupleItemsMemRefType(TupleType tupleType) const {
+  mlir::Type storageType = getTupleItemsStorageType(tupleType);
+  if (!storageType)
+    return {};
+  return mlir::MemRefType::get(
+      {static_cast<int64_t>(tupleType.getElementTypes().size())}, storageType);
+}
+
+mlir::MemRefType
+PyLLVMTypeConverter::getDictKeysMemRefType(DictType dictType) const {
+  if (!dictType)
+    return {};
+  mlir::Type storageType = getContainerStorageType(dictType.getKeyType());
+  if (!storageType)
+    return {};
+  return mlir::MemRefType::get({mlir::ShapedType::kDynamic}, storageType);
+}
+
+mlir::MemRefType
+PyLLVMTypeConverter::getDictValuesMemRefType(DictType dictType) const {
+  if (!dictType)
+    return {};
+  mlir::Type storageType = getContainerStorageType(dictType.getValueType());
+  if (!storageType)
+    return {};
+  return mlir::MemRefType::get({mlir::ShapedType::kDynamic}, storageType);
+}
+
 RuntimeAPI::RuntimeAPI(mlir::ModuleOp module, mlir::OpBuilder &rewriter,
                        const PyLLVMTypeConverter &typeConverter)
-    : module(module), rewriter(rewriter),
-      pyObjectPtrType(typeConverter.getPyObjectPtrType()) {}
+    : module(module), rewriter(rewriter) {
+  (void)typeConverter;
+}
 
 static mlir::LLVM::LLVMFuncOp
 declareRuntimeFunc(mlir::Location loc, mlir::ModuleOp module,
@@ -1754,59 +2969,248 @@ declareRuntimeFunc(mlir::Location loc, mlir::ModuleOp module,
   return rewriter.create<mlir::LLVM::LLVMFuncOp>(loc, name, funcType);
 }
 
-mlir::LLVM::CallOp RuntimeAPI::call(mlir::Location loc, llvm::StringRef name,
-                                    mlir::Type resultType,
-                                    mlir::ValueRange operands) {
+static bool requiresFuncRuntimeCall(mlir::Type type) {
+  return mlir::isa<mlir::MemRefType>(type);
+}
+
+static void appendLoweredObjectMemRefDescriptor(
+    mlir::Location loc, mlir::Value descriptor,
+    llvm::SmallVectorImpl<mlir::Value> &operands, mlir::OpBuilder &rewriter) {
+  auto descriptorType =
+      mlir::cast<mlir::LLVM::LLVMStructType>(descriptor.getType());
+  auto body = descriptorType.getBody();
+  auto i64Type = rewriter.getI64Type();
+  operands.push_back(rewriter.create<mlir::LLVM::ExtractValueOp>(
+      loc, body[0], descriptor, rewriter.getDenseI64ArrayAttr({0})));
+  operands.push_back(rewriter.create<mlir::LLVM::ExtractValueOp>(
+      loc, body[1], descriptor, rewriter.getDenseI64ArrayAttr({1})));
+  operands.push_back(rewriter.create<mlir::LLVM::ExtractValueOp>(
+      loc, body[2], descriptor, rewriter.getDenseI64ArrayAttr({2})));
+  operands.push_back(rewriter.create<mlir::LLVM::ExtractValueOp>(
+      loc, i64Type, descriptor, rewriter.getDenseI64ArrayAttr({3, 0})));
+  operands.push_back(rewriter.create<mlir::LLVM::ExtractValueOp>(
+      loc, i64Type, descriptor, rewriter.getDenseI64ArrayAttr({4, 0})));
+}
+
+static mlir::Value loweredObjectStorageSource(mlir::Value value) {
+  llvm::SmallPtrSet<mlir::Operation *, 4> seen;
+  while (auto cast = value.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+    if (!seen.insert(cast.getOperation()).second || cast->getNumOperands() != 1)
+      return {};
+    value = cast.getOperand(0);
+    if (object_abi::Type::isLoweredStorage(value.getType()))
+      return value;
+  }
+  return {};
+}
+
+static bool compatibleMemRefCast(mlir::MemRefType from, mlir::MemRefType to) {
+  if (!from || !to || from.getRank() != to.getRank() ||
+      from.getElementType() != to.getElementType())
+    return false;
+  for (auto [lhs, rhs] : llvm::zip(from.getShape(), to.getShape())) {
+    if (lhs == rhs || lhs == mlir::ShapedType::kDynamic ||
+        rhs == mlir::ShapedType::kDynamic)
+      continue;
+    return false;
+  }
+  return true;
+}
+
+static mlir::Value adaptRuntimeOperand(mlir::Location loc, mlir::Value operand,
+                                       mlir::Type expected,
+                                       mlir::OpBuilder &rewriter) {
+  if (!operand || !expected || operand.getType() == expected)
+    return operand;
+  if (mlir::Value source = storage_cast::source(operand))
+    operand = source;
+  if (operand.getType() == expected)
+    return operand;
+
+  auto from = mlir::dyn_cast<mlir::MemRefType>(operand.getType());
+  auto to = mlir::dyn_cast<mlir::MemRefType>(expected);
+  if (!compatibleMemRefCast(from, to))
+    return operand;
+
+  mlir::Value casted = rewriter.create<mlir::memref::CastOp>(loc, to, operand);
+  if (object_abi::Header::isOwned(operand.getType()) ||
+      object_abi::Header::isView(expected))
+    casted.getDefiningOp()->setAttr(OwnershipContractAttrs::kObjectHeader,
+                                    rewriter.getUnitAttr());
+  return casted;
+}
+
+static mlir::func::FuncOp
+declareFuncRuntimeFunc(mlir::Location loc, mlir::ModuleOp module,
+                       mlir::OpBuilder &rewriter, llvm::StringRef name,
+                       mlir::TypeRange resultTypes,
+                       llvm::ArrayRef<mlir::Type> argTypes) {
+  auto markObjectHeaderArgs = [&](mlir::func::FuncOp fn) {
+    for (auto [index, type] : llvm::enumerate(argTypes)) {
+      if (!object_abi::Header::isOwned(type) &&
+          !object_abi::Header::isView(type))
+        continue;
+      if (static_cast<unsigned>(index) >= fn.getNumArguments())
+        continue;
+      fn.setArgAttr(static_cast<unsigned>(index),
+                    OwnershipContractAttrs::kObjectHeader,
+                    rewriter.getUnitAttr());
+    }
+  };
+
+  if (auto fn = module.lookupSymbol<mlir::func::FuncOp>(name)) {
+    markObjectHeaderArgs(fn);
+    return fn;
+  }
+
+  mlir::OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPointToStart(module.getBody());
+  auto funcType =
+      mlir::FunctionType::get(module.getContext(), argTypes, resultTypes);
+  auto fn = rewriter.create<mlir::func::FuncOp>(loc, name, funcType);
+  markObjectHeaderArgs(fn);
+  return fn;
+}
+
+static void markRuntimeCallResults(mlir::Operation *call,
+                                   mlir::TypeRange resultTypes,
+                                   mlir::OpBuilder &rewriter) {
+  if (!call)
+    return;
+  if (!resultTypes.empty() && object_abi::Header::isOwned(resultTypes.front()))
+    call->setAttr(OwnershipContractAttrs::kObjectHeader,
+                  rewriter.getUnitAttr());
+}
+
+RuntimeAPI::Call RuntimeAPI::call(mlir::Location loc, llvm::StringRef name,
+                                  mlir::TypeRange resultTypes,
+                                  mlir::ValueRange operands) {
+  mlir::SmallVector<mlir::Value> callOperands;
+  callOperands.reserve(operands.size() * 2);
+
+  mlir::func::FuncOp existingFunc =
+      module.lookupSymbol<mlir::func::FuncOp>(name);
+  mlir::FunctionType existingType =
+      existingFunc ? existingFunc.getFunctionType() : mlir::FunctionType();
+  if (existingType && existingType.getNumInputs() == operands.size()) {
+    for (auto [operand, expected] :
+         llvm::zip(operands, existingType.getInputs())) {
+      callOperands.push_back(
+          adaptRuntimeOperand(loc, operand, expected, rewriter));
+    }
+  }
+
+  if (callOperands.empty()) {
+    for (mlir::Value operand : operands) {
+      if (mlir::Value lowered = loweredObjectStorageSource(operand))
+        operand = lowered;
+      if (object_abi::Type::isLoweredStorage(operand.getType())) {
+        appendLoweredObjectMemRefDescriptor(loc, operand, callOperands,
+                                            rewriter);
+        continue;
+      }
+      callOperands.push_back(operand);
+    }
+  }
+
   mlir::SmallVector<mlir::Type> operandTypes;
-  operandTypes.reserve(operands.size());
-  for (mlir::Value operand : operands)
+  operandTypes.reserve(callOperands.size());
+  for (mlir::Value operand : callOperands)
     operandTypes.push_back(operand.getType());
 
+  bool isVoid = resultTypes.empty();
+
+  bool useFuncCall =
+      static_cast<bool>(module.lookupSymbol<mlir::func::FuncOp>(name));
+  if (!useFuncCall) {
+    useFuncCall = resultTypes.size() > 1 ||
+                  llvm::any_of(resultTypes, requiresFuncRuntimeCall) ||
+                  llvm::any_of(operandTypes, requiresFuncRuntimeCall);
+  }
+  if (useFuncCall) {
+    auto callee = declareFuncRuntimeFunc(loc, module, rewriter, name,
+                                         resultTypes, operandTypes);
+    auto symbolRef =
+        mlir::SymbolRefAttr::get(module.getContext(), callee.getName());
+    auto call = rewriter.create<mlir::func::CallOp>(loc, symbolRef, resultTypes,
+                                                    callOperands);
+    markRuntimeCallResults(call.getOperation(), resultTypes, rewriter);
+    return RuntimeAPI::Call(call.getOperation());
+  }
+
   mlir::Type actualResult =
-      resultType ? resultType
-                 : mlir::LLVM::LLVMVoidType::get(module.getContext());
+      isVoid ? mlir::LLVM::LLVMVoidType::get(module.getContext())
+             : resultTypes.front();
   auto callee = declareRuntimeFunc(loc, module, rewriter, name, actualResult,
                                    operandTypes);
-  ownership::llvm_func::Contract::apply(callee, name);
   auto symbolRef =
       mlir::SymbolRefAttr::get(module.getContext(), callee.getName());
-  bool isVoid = llvm::isa<mlir::LLVM::LLVMVoidType>(actualResult);
   llvm::SmallVector<mlir::Type, 1> resultStorage;
   if (!isVoid)
     resultStorage.push_back(actualResult);
   mlir::TypeRange results(resultStorage);
-  return rewriter.create<mlir::LLVM::CallOp>(loc, results, symbolRef, operands);
+  auto call = rewriter.create<mlir::LLVM::CallOp>(loc, results, symbolRef,
+                                                  callOperands);
+  markRuntimeCallResults(call.getOperation(), resultTypes, rewriter);
+  return RuntimeAPI::Call(call.getOperation());
 }
 
-mlir::Value RuntimeAPI::getStringLiteral(mlir::Location loc,
-                                         mlir::StringAttr literal) {
-  llvm::SmallString<32> symbolName("__ly_str_");
-  auto hashValue = static_cast<uint64_t>(llvm::hash_value(literal.getValue()));
-  symbolName += llvm::formatv("{0:X}", hashValue).str();
+RuntimeAPI::Call RuntimeAPI::call(mlir::Location loc, llvm::StringRef name,
+                                  mlir::Type resultType,
+                                  mlir::ValueRange operands) {
+  llvm::SmallVector<mlir::Type, 1> resultTypes;
+  if (resultType && !mlir::isa<mlir::LLVM::LLVMVoidType>(resultType))
+    resultTypes.push_back(resultType);
+  return call(loc, name, mlir::TypeRange(resultTypes), operands);
+}
 
-  mlir::LLVM::GlobalOp global =
-      module.lookupSymbol<mlir::LLVM::GlobalOp>(symbolName);
-  if (!global) {
-    mlir::OpBuilder::InsertionGuard guard(rewriter);
-    rewriter.setInsertionPointToStart(module.getBody());
-    auto arrayType = mlir::LLVM::LLVMArrayType::get(
-        rewriter.getI8Type(), literal.getValue().size() + 1);
+RuntimeAPI::Call RuntimeAPI::call(mlir::Location loc, llvm::StringRef name,
+                                  std::nullptr_t, mlir::ValueRange operands) {
+  return call(loc, name, mlir::Type(), operands);
+}
 
-    llvm::SmallString<32> storage(literal.getValue());
-    storage.push_back('\0');
-    global = rewriter.create<mlir::LLVM::GlobalOp>(
-        loc, arrayType, /*isConstant=*/true, mlir::LLVM::Linkage::Internal,
-        symbolName, rewriter.getStringAttr(storage));
+mlir::Value RuntimeAPI::getByteLiteral(mlir::Location loc,
+                                       mlir::StringAttr literal) {
+  mlir::Type byteType = rewriter.getI8Type();
+  auto staticType = mlir::MemRefType::get(
+      {static_cast<int64_t>(literal.getValue().size())}, byteType);
+  mlir::Value storage =
+      rewriter.create<mlir::memref::AllocaOp>(loc, staticType);
+  for (auto indexed : llvm::enumerate(literal.getValue())) {
+    auto byte = static_cast<uint8_t>(indexed.value());
+    mlir::Value value =
+        rewriter.create<mlir::arith::ConstantIntOp>(loc, byte, byteType);
+    mlir::Value index =
+        rewriter.create<mlir::arith::ConstantIndexOp>(loc, indexed.index());
+    rewriter.create<mlir::memref::StoreOp>(loc, value, storage, index);
   }
 
-  auto ptrType = mlir::LLVM::LLVMPointerType::get(module.getContext());
-  mlir::Value addr = rewriter.create<mlir::LLVM::AddressOfOp>(
-      loc, ptrType, global.getSymNameAttr());
-  mlir::Value zero = rewriter.create<mlir::LLVM::ConstantOp>(
-      loc, rewriter.getI64Type(), rewriter.getIndexAttr(0));
-  return rewriter.create<mlir::LLVM::GEPOp>(
-      loc, ptrType, global.getType(), addr,
-      llvm::ArrayRef<mlir::Value>{zero, zero});
+  auto dynamicType =
+      mlir::MemRefType::get({mlir::ShapedType::kDynamic}, byteType);
+  return rewriter.create<mlir::memref::CastOp>(loc, dynamicType, storage);
+}
+
+mlir::Value RuntimeAPI::getUnicodeLiteral(mlir::Location loc,
+                                          mlir::StringAttr literal) {
+  mlir::emitError(loc)
+      << "single-result unicode literal lowering is unavailable; use split "
+         "unicode memref ABI";
+  return {};
+}
+
+mlir::Value RuntimeAPI::getUnicodeLiteral(mlir::Location loc,
+                                          mlir::StringAttr literal,
+                                          mlir::Type resultType) {
+  (void)literal;
+  (void)resultType;
+  mlir::emitError(loc)
+      << "single-result unicode literal lowering is unavailable; use split "
+         "unicode memref ABI";
+  return {};
+}
+
+mlir::Value RuntimeAPI::getNoneValue(mlir::Location loc) {
+  return rewriter.create<mlir::arith::ConstantIntOp>(loc, 0, 1);
 }
 
 mlir::Value RuntimeAPI::getI64Constant(mlir::Location loc, std::int64_t value) {

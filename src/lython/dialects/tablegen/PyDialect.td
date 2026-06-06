@@ -24,7 +24,6 @@ def Py_IntType : Type<CPred<"::py::isPyIntType($_self)">, "py.int">;
 def Py_FloatType : Type<CPred<"::py::isPyFloatType($_self)">, "py.float">;
 def Py_BoolType : Type<CPred<"::py::isPyBoolType($_self)">, "py.bool">;
 def Py_StrType : Type<CPred<"::py::isPyStrType($_self)">, "py.str">;
-def Py_ObjectType : Type<CPred<"::py::isPyObjectType($_self)">, "py.object">;
 def Py_NoneType : Type<CPred<"::py::isPyNoneType($_self)">, "py.none">;
 def Py_TupleType : Type<CPred<"::py::isPyTupleType($_self)">, "py.tuple">;
 def Py_DictType : Type<CPred<"::py::isPyDictType($_self)">, "py.dict">;
@@ -32,6 +31,8 @@ def Py_ListType : Type<CPred<"::py::isPyListType($_self)">, "py.list">;
 def Py_ClassType : Type<CPred<"::py::isPyClassType($_self)">, "py.class">;
 def Py_ExceptionType
     : Type<CPred<"::py::isPyExceptionType($_self)">, "py.exception">;
+def Py_ExceptionCellType
+    : Type<CPred<"::py::isPyExceptionCellType($_self)">, "py.exception_cell">;
 def Py_TracebackType
     : Type<CPred<"::py::isPyTracebackType($_self)">, "py.traceback">;
 def Py_LocationType
@@ -88,10 +89,12 @@ def Py_ClassOp
   let summary = "Python class definition";
   let description = [{
     Defines a statically resolved class. The class symbol owns the nominal
-    class type and optional fixed field schema metadata.
+    class type, immutable PyTypeObject-style base metadata, and optional fixed
+    field schema metadata.
   }];
 
   let arguments = (ins SymbolNameAttr:$sym_name,
+      OptionalAttr<StrArrayAttr>:$base_names,
       OptionalAttr<StrArrayAttr>:$field_names,
       OptionalAttr<TypeArrayAttr>:$field_types);
 
@@ -200,14 +203,11 @@ def Py_RaiseCurrentOp : Py_Op<"raise.current", [Terminator]> {
 }
 
 def Py_ExceptionNewOp : Py_Op<"exception.new"> {
-  let summary = "Create a py.exception with SSA payload";
+  let summary = "Create a py.exception value";
 
-  let arguments = (ins Py_ClassType:$type, Py_StrType:$message,
-      Py_TupleType:$args, Py_ExceptionType:$cause, Py_ExceptionType:$context,
-      Py_TracebackType:$traceback, Py_LocationType:$location,
-      Py_DictType:$extras);
-
+  let arguments = (ins Variadic<Py_StrType>:$args);
   let results = (outs Py_ExceptionType:$result);
+  let assemblyFormat = "($args^ `:` type($args))? attr-dict `:` type($result)";
   let hasVerifier = 1;
 }
 
@@ -409,12 +409,13 @@ def Py_TupleCreateOp : Py_Op<"tuple.create", []> {
   let summary = "Create a Python tuple from elements";
   let description = [{
     Constructs a `!py.tuple` value from a variadic list of elements.
-    All elements must be of compatible types. If elements are heterogeneous,
-    they should be upcast to `!py.object` first.
+    All elements must be represented in the tuple type. Heterogeneous tuples
+    keep their static element types instead of being packed through a generic
+    object top type.
 
     Example:
       %t = py.tuple.create %a, %b : (!py.int, !py.int) -> !py.tuple<!py.int>
-      %t2 = py.tuple.create %x, %y : (!py.object, !py.object) -> !py.tuple<!py.object>
+      %t2 = py.tuple.create %x, %y : (!py.int, !py.str) -> !py.tuple<!py.int, !py.str>
   }];
 
   let arguments = (ins Variadic<AnyType>:$elements);
@@ -445,7 +446,7 @@ def Py_DictEmptyOp : Py_Op<"dict.empty", []> {
     Creates an empty `!py.dict<K, V>` value with the specified key and value types.
 
     Example:
-      %d = py.dict.empty : !py.dict<!py.str, !py.object>
+      %d = py.dict.empty : !py.dict<!py.str, !py.int>
   }];
 
   let results = (outs Py_DictType:$result);
@@ -461,7 +462,7 @@ def Py_DictInsertOp : Py_Op<"dict.insert"> {
     dictionary ownership token is produced.
 
     Example:
-      py.dict.insert %d[%key] = %value : !py.dict<!py.str, !py.object>
+      py.dict.insert %d[%key] = %value : !py.dict<!py.str, !py.int>
   }];
 
   let arguments = (ins Py_DictType:$dict, AnyType:$key, AnyType:$value);
@@ -651,22 +652,6 @@ def Py_CastToPrimOp : Py_Op<"cast.to_prim", [Pure]> {
   let hasCustomAssemblyFormat = 0;
 }
 
-def Py_UpcastOp : Py_Op<"upcast", [Pure]> {
-  let summary = "Explicitly widen a Python value to !py.object";
-  let description = [{
-    Performs an explicit upcast from any !py.* value to the canonical
-    !py.object supertype. This is required instead of relying on implicit
-    conversions when a generic object is needed.
-  }];
-
-  let arguments = (ins AnyType:$input);
-
-  let results = (outs Py_ObjectType:$result);
-
-  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
-  let hasVerifier = 1;
-}
-
 //===----------------------------------------------------------------------===//
 // Python operation semantics
 //===----------------------------------------------------------------------===//
@@ -688,6 +673,24 @@ def Py_AddOp : Py_Op<"add", []> {
 
   let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict "
                        "`->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_StrConcat3Op : Py_Op<"str.concat3", []> {
+  let summary = "Optimized three-way Python string concatenation";
+  let description = [{
+    Represents a proven-safe reassociation of `(a + b) + c` for statically
+    typed `!py.str` values. This op is introduced only after ownership has
+    been made explicit, so operand drops can be moved after the fused use
+    without changing Python-level evaluation or reference-count semantics.
+  }];
+
+  let arguments = (ins Py_StrType:$lhs, Py_StrType:$middle, Py_StrType:$rhs);
+  let results = (outs Py_StrType:$result);
+
+  let assemblyFormat = "$lhs `:` type($lhs) `,` $middle `:` type($middle) "
+                       "`,` $rhs `:` type($rhs) attr-dict `->` "
+                       "type($result)";
   let hasVerifier = 1;
 }
 
@@ -801,7 +804,7 @@ def Py_ReprOp : Py_Op<"repr", []> {
   let summary = "Python representation operation";
   let description = [{
     Represents Python `repr(value)` semantics. Static class/container/primitive
-    resolution and fallback to the normal LyException path are lowering
+    resolution and unsupported-operation LyException emission are lowering
     concerns. The result is always an owned `!py.str`.
   }];
 
@@ -953,7 +956,7 @@ def Py_IncRefOp : Py_Op<"incref", []> {
     at runtime.
 
     Example:
-      py.incref %obj : !py.object
+      py.incref %obj : !py.int
   }];
 
   let arguments = (ins AnyType:$object);
@@ -970,7 +973,7 @@ def Py_DecRefOp : Py_Op<"decref", []> {
     at runtime.
 
     Example:
-      py.decref %obj : !py.object
+      py.decref %obj : !py.int
   }];
 
   let arguments = (ins AnyType:$object);

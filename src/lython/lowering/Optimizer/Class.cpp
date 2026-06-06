@@ -19,7 +19,6 @@ void pipeline::classLayoutPre(mlir::ModuleOp module) {
 }
 
 void pipeline::callPre(mlir::ModuleOp module) {
-  call::staticDefaults(module);
   call::cleanupClassIncrefs(module);
   call::rewritePreferred(module);
 }

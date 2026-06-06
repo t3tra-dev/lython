@@ -28,6 +28,7 @@ class VisitorRuntime:
     _returned_callable_arg_index_stack: list[int | None]
     _returned_function_info_valid_stack: list[bool]
     _callable_value_info: dict[int, FunctionInfo]
+    _class_ast_defs: dict[str, ast.ClassDef]
     _function_ast_stack: list[ast.FunctionDef | ast.AsyncFunctionDef]
     _return_type_stack: list[ir.Type]
     _async_function_stack: list[bool]
@@ -109,6 +110,7 @@ class VisitorRuntime:
         self,
         name: str,
         class_type: ir.Type,
+        base_names: tuple[str, ...],
         methods: dict[str, MethodInfo],
         attributes: dict[str, ir.Type] | None = None,
     ) -> None: ...
@@ -330,7 +332,7 @@ class VisitorRuntime:
     def build_exception_value(
         self,
         *,
-        message: str | None,
+        message: ir.Value | None,
         loc: ir.Location,
         exc_type_name: str = "Exception",
         context: ir.Value | None = None,

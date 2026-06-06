@@ -34,11 +34,7 @@ static bool carrier(mlir::Value value) {
     return false;
   if (def->hasAttr(AsyncSafetyAttrs::kRuntimeHandle))
     return true;
-  auto callee = getDirectCallee(def);
-  if (!callee)
-    return false;
-  mlir::Operation *calleeOp = lookupCallableSymbol(def, *callee);
-  return py::async_runtime::Handle::ownedResult(*callee, calleeOp);
+  return py::async_runtime::Handle::ownedResult(def);
 }
 
 static mlir::Value root(mlir::Value value) {
@@ -50,8 +46,12 @@ static mlir::Value root(mlir::Value value) {
 struct HandleState {
   ::llvm::DenseMap<mlir::Value, int64_t> balance;
   ::llvm::DenseMap<mlir::Value, int64_t> consumedEntry;
+  ::llvm::DenseMap<mlir::Value, int64_t> consumedGenerated;
 
-  bool empty() const { return balance.empty() && consumedEntry.empty(); }
+  bool empty() const {
+    return balance.empty() && consumedEntry.empty() &&
+           consumedGenerated.empty();
+  }
 };
 
 static bool mapEquals(const ::llvm::DenseMap<mlir::Value, int64_t> &lhs,
@@ -72,6 +72,20 @@ static bool statesEqual(const HandleState &lhs, const HandleState &rhs,
     return false;
   return !compareConsumedEntry ||
          mapEquals(lhs.consumedEntry, rhs.consumedEntry);
+}
+
+static bool mergeMayConsumedGenerated(HandleState &existing,
+                                      const HandleState &incoming) {
+  bool changed = false;
+  for (auto [root, count] : incoming.consumedGenerated) {
+    int64_t &slot = existing.consumedGenerated[root];
+    int64_t merged = std::max(slot, count);
+    if (slot == merged)
+      continue;
+    slot = merged;
+    changed = true;
+  }
+  return changed;
 }
 
 static bool entryRoot(mlir::Value value, mlir::Block &entry) {
@@ -106,11 +120,20 @@ static mlir::LogicalResult add(HandleState &state, mlir::Value value,
   int64_t current = state.balance.lookup(root);
   if (current >= required) {
     state.balance[root] = current - required;
+    if (state.balance.lookup(root) == 0 && value.getDefiningOp())
+      state.consumedGenerated[root] = 1;
     eraseIfZero(state.balance, root);
     return mlir::success();
   }
 
   int64_t deficit = required - current;
+  if (value.getDefiningOp() && deficit == 1 &&
+      state.consumedGenerated.lookup(root) == 0) {
+    state.balance.erase(root);
+    state.consumedGenerated[root] = 1;
+    return mlir::success();
+  }
+
   if (entryRoot(root, entry) && state.consumedEntry.lookup(root) == 0 &&
       deficit == 1) {
     state.balance.erase(root);
@@ -121,6 +144,17 @@ static mlir::LogicalResult add(HandleState &state, mlir::Value value,
   return op->emitOpError("MLIR async runtime handle refcount becomes negative "
                          "for ")
          << value;
+}
+
+static mlir::LogicalResult addOwnedResult(HandleState &state, mlir::Value value,
+                                          mlir::Operation *op) {
+  if (!value || !mlir::isa<mlir::LLVM::LLVMPointerType>(value.getType()))
+    return mlir::success();
+  mlir::Value root = handle::root(value);
+  if (!root)
+    return op->emitOpError("MLIR async runtime handle result has no root");
+  ++state.balance[root];
+  return mlir::success();
 }
 
 static bool live(const HandleState &state, mlir::Value value,
@@ -140,47 +174,57 @@ static mlir::LogicalResult verify(mlir::Operation *op, mlir::Value value,
                                   mlir::Block &entry) {
   if (live(state, value, entry))
     return mlir::success();
-  return op->emitOpError("MLIR async runtime handle borrow lacks a live "
-                         "refcounted handle for ")
-         << value;
+  mlir::InFlightDiagnostic diag = op->emitOpError(
+      "MLIR async runtime handle borrow lacks a live refcounted handle for ");
+  diag << value;
+  diag << "; live roots=[";
+  ::llvm::interleaveComma(state.balance, diag, [&](auto item) {
+    diag << item.first << ":" << item.second;
+  });
+  diag << "], consumed-generated=[";
+  ::llvm::interleaveComma(state.consumedGenerated, diag, [&](auto item) {
+    diag << item.first << ":" << item.second;
+  });
+  diag << "]";
+  diag << "; op=" << *op;
+  return diag;
 }
 
 } // namespace borrow
 
 static mlir::LogicalResult applyCall(mlir::Operation *op, HandleState &state,
                                      mlir::Block &entry) {
-  auto callee = getDirectCallee(op);
-  if (!callee)
-    return mlir::success();
-  mlir::Operation *calleeOp = lookupCallableSymbol(op, *callee);
-  for (unsigned index : py::async_runtime::Handle::borrowedOperands(*callee))
+  if (auto delta = attrs::i64(op, AsyncSafetyAttrs::kRuntimeRefcountDelta)) {
+    if (op->getNumOperands() != 2)
+      return op->emitOpError("async runtime refcount effect must have handle "
+                             "and count operands");
+    if (mlir::failed(borrow::verify(op, op->getOperand(0), state, entry)))
+      return mlir::failure();
+    auto count = constant::anyInt(op->getOperand(1));
+    if (!count || *count <= 0)
+      return op->emitOpError("async runtime refcount count must be a positive "
+                             "integer constant");
+    return handle::add(state, op->getOperand(0), (*delta) * (*count), op,
+                       entry);
+  }
+  for (unsigned index : py::async_runtime::Handle::borrowedOperands(op))
     if (index < op->getNumOperands())
       if (mlir::failed(borrow::verify(op, op->getOperand(index), state, entry)))
         return mlir::failure();
 
-  if (py::async_runtime::Callee::refcount(*callee)) {
-    if (op->getNumOperands() != 2)
-      return mlir::success();
-    auto count = constant::anyInt(op->getOperand(1));
-    if (!count || *count <= 0)
-      return mlir::success();
-    int64_t delta = *callee == "mlirAsyncRuntimeAddRef" ? *count : -*count;
-    return handle::add(state, op->getOperand(0), delta, op, entry);
-  }
-
-  if (py::async_runtime::Handle::transferToExecute(*callee) &&
-      op->getNumOperands() > 0) {
-    if (mlir::failed(handle::add(state, op->getOperand(0), -1, op, entry)))
+  for (unsigned index : py::async_runtime::Handle::transferredOperands(op)) {
+    if (index >= op->getNumOperands())
+      continue;
+    if (mlir::failed(handle::add(state, op->getOperand(index), -1, op, entry)))
       return mlir::failure();
   }
 
-  if (!py::async_runtime::Handle::ownedResult(*callee, calleeOp))
+  if (!py::async_runtime::Handle::ownedResult(op))
     return mlir::success();
 
   for (mlir::Value result : op->getResults())
-    if (handle::carrier(result))
-      if (mlir::failed(handle::add(state, result, +1, op, entry)))
-        return mlir::failure();
+    if (mlir::failed(handle::addOwnedResult(state, result, op)))
+      return mlir::failure();
   return mlir::success();
 }
 
@@ -217,6 +261,7 @@ static void remapSuccessor(mlir::Operation *terminator, unsigned successorIndex,
       continue;
     handle::moveRoot(state.balance, operand, argument);
     handle::moveRoot(state.consumedEntry, operand, argument);
+    handle::moveRoot(state.consumedGenerated, operand, argument);
   }
 }
 
@@ -235,9 +280,8 @@ collectTransfers(mlir::Block *block,
   for (mlir::Operation &op : *block) {
     if (!op.hasAttr(OwnershipContractAttrs::kFrameTransfer))
       continue;
-    auto callee = getDirectCallee(&op);
-    if (!callee || *callee != "mlirAsyncRuntimeDropRef" ||
-        op.getNumOperands() < 1)
+    auto delta = attrs::i64(&op, AsyncSafetyAttrs::kRuntimeRefcountDelta);
+    if (!delta || *delta >= 0 || op.getNumOperands() < 1)
       continue;
     mlir::Value root = handle::root(op.getOperand(0));
     if (!::llvm::is_contained(transferredRoots, root))
@@ -288,7 +332,9 @@ static mlir::LogicalResult stateMismatch(mlir::Operation *funcLike,
   diag << "; existing refs=" << existing.balance.size()
        << ", incoming refs=" << incoming.balance.size()
        << ", existing consumed-entry=" << existing.consumedEntry.size()
-       << ", incoming consumed-entry=" << incoming.consumedEntry.size();
+       << ", incoming consumed-entry=" << incoming.consumedEntry.size()
+       << ", existing consumed-generated=" << existing.consumedGenerated.size()
+       << ", incoming consumed-generated=" << incoming.consumedGenerated.size();
   diag << "; existing roots=[";
   ::llvm::interleaveComma(existing.balance, diag, [&](auto entry) {
     diag << entry.first << ":" << entry.second;
@@ -305,6 +351,9 @@ namespace exit {
 
 static mlir::LogicalResult verify(mlir::Operation *terminator,
                                   const handle::HandleState &state) {
+  if (control::noReturn(terminator))
+    return mlir::success();
+
   ::llvm::DenseMap<mlir::Value, int64_t> returned;
   if (mlir::isa<mlir::func::ReturnOp, mlir::LLVM::ReturnOp>(terminator))
     for (mlir::Value operand : terminator->getOperands())
@@ -373,6 +422,9 @@ verifier::async_runtime::Handles::balance(mlir::Operation *funcLike,
       if (!inserted) {
         if (!handle::statesEqual(it->second, edgeState, compareConsumedEntry))
           return stateMismatch(funcLike, successor, it->second, edgeState);
+        if (handle::mergeMayConsumedGenerated(it->second, edgeState))
+          if (queued.insert(successor).second)
+            worklist.push_back(successor);
         continue;
       }
       if (queued.insert(successor).second)

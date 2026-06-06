@@ -1,8 +1,11 @@
 #include "Passes/Runtime/Upcast.h"
 
+#include "Common/ClassLayout.h"
 #include "Common/Container.h"
 #include "Common/LoweringUtils.h"
+#include "Common/Object.h"
 #include "Common/SlotUtils.h"
+#include "PyValue/ClassHelpers.h"
 
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -11,7 +14,6 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 
@@ -24,152 +26,8 @@
 namespace py {
 namespace {
 
-static llvm::StringRef getTypedListReprHelperName(ListType listType) {
-  mlir::Type elementType = listType.getElementType();
-  if (mlir::isa<BoolType>(elementType))
-    return "LyListBool_Repr";
-  if (mlir::isa<mlir::FloatType>(elementType))
-    return "LyListF64Bits_Repr";
-  if (mlir::isa<ClassType>(elementType))
-    return "LyListPtr_Repr";
-  return "LyListI64_Repr";
-}
-
-static llvm::StringRef getTypedTupleReprHelperName(TupleType tupleType) {
-  auto elements = tupleType.getElementTypes();
-  if (!elements.empty() && llvm::all_of(elements, [](mlir::Type type) {
-        return mlir::isa<BoolType>(type);
-      }))
-    return "LyTupleBool_Repr";
-  if (!elements.empty() && llvm::all_of(elements, [](mlir::Type type) {
-        return mlir::isa<mlir::FloatType>(type);
-      }))
-    return "LyTupleF64Bits_Repr";
-  if (!elements.empty() && llvm::all_of(elements, [](mlir::Type type) {
-        return mlir::isa<ClassType>(type);
-      }))
-    return "LyTuplePtr_Repr";
-  return "LyTupleI64_Repr";
-}
-
-static void markFuncOwnedResult(mlir::func::FuncOp fn,
-                                unsigned resultIndex = 0) {
-  if (!fn)
-    return;
-  mlir::Builder builder(fn.getContext());
-  fn->setAttr(OwnershipContractAttrs::kOwnedResults,
-              builder.getArrayAttr({builder.getI64IntegerAttr(resultIndex)}));
-}
-
-static mlir::func::FuncOp
-getOrInsertTypedListReprFunc(mlir::Location loc, mlir::ModuleOp module,
-                             ListType listType, mlir::Type memrefType,
-                             llvm::ArrayRef<mlir::Type> extraArgTypes,
-                             mlir::Type resultType, mlir::OpBuilder &builder) {
-  llvm::StringRef name = getTypedListReprHelperName(listType);
-  if (auto fn = module.lookupSymbol<mlir::func::FuncOp>(name)) {
-    markFuncOwnedResult(fn);
-    return fn;
-  }
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(module.getBody());
-  llvm::SmallVector<mlir::Type> inputTypes;
-  inputTypes.push_back(memrefType);
-  inputTypes.append(extraArgTypes.begin(), extraArgTypes.end());
-  auto fnType =
-      mlir::FunctionType::get(module.getContext(), inputTypes, {resultType});
-  auto fn = builder.create<mlir::func::FuncOp>(loc, name, fnType);
-  fn->setAttr("llvm.emit_c_interface", builder.getUnitAttr());
-  fn.setVisibility(mlir::SymbolTable::Visibility::Private);
-  markFuncOwnedResult(fn);
-  return fn;
-}
-
-static mlir::func::FuncOp
-getOrInsertTypedTupleReprFunc(mlir::Location loc, mlir::ModuleOp module,
-                              TupleType tupleType, mlir::Type memrefType,
-                              llvm::ArrayRef<mlir::Type> extraArgTypes,
-                              mlir::Type resultType, mlir::OpBuilder &builder) {
-  llvm::StringRef name = getTypedTupleReprHelperName(tupleType);
-  if (auto fn = module.lookupSymbol<mlir::func::FuncOp>(name)) {
-    markFuncOwnedResult(fn);
-    return fn;
-  }
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(module.getBody());
-  llvm::SmallVector<mlir::Type> inputTypes;
-  inputTypes.push_back(memrefType);
-  inputTypes.append(extraArgTypes.begin(), extraArgTypes.end());
-  auto fnType =
-      mlir::FunctionType::get(module.getContext(), inputTypes, {resultType});
-  auto fn = builder.create<mlir::func::FuncOp>(loc, name, fnType);
-  fn->setAttr("llvm.emit_c_interface", builder.getUnitAttr());
-  fn.setVisibility(mlir::SymbolTable::Visibility::Private);
-  markFuncOwnedResult(fn);
-  return fn;
-}
-
-static mlir::func::FuncOp
-getOrInsertTypedDictReprFunc(mlir::Location loc, mlir::ModuleOp module,
-                             mlir::Type memrefType, mlir::Type resultType,
-                             mlir::OpBuilder &builder) {
-  llvm::StringRef name = "LyDictPacked_Repr";
-  if (auto fn = module.lookupSymbol<mlir::func::FuncOp>(name)) {
-    markFuncOwnedResult(fn);
-    return fn;
-  }
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(module.getBody());
-  auto ptrType = mlir::LLVM::LLVMPointerType::get(module.getContext());
-  mlir::Type i64Type = builder.getI64Type();
-  auto fnType = mlir::FunctionType::get(
-      module.getContext(), {memrefType, i64Type, i64Type, ptrType, ptrType},
-      {resultType});
-  auto fn = builder.create<mlir::func::FuncOp>(loc, name, fnType);
-  fn->setAttr("llvm.emit_c_interface", builder.getUnitAttr());
-  fn.setVisibility(mlir::SymbolTable::Visibility::Private);
-  markFuncOwnedResult(fn);
-  return fn;
-}
-
 static std::string getStaticClassReprCallbackName(ClassType classType) {
   return ("__ly_class_repr_" + classType.getClassName()).str();
-}
-
-enum class PackedReprSlotKind : int64_t {
-  I64 = 0,
-  Bool = 1,
-  F64Bits = 2,
-  PyObject = 3,
-  CallbackPtr = 4,
-};
-
-static int64_t getPackedReprSlotKind(mlir::Type type) {
-  if (mlir::isa<BoolType>(type))
-    return static_cast<int64_t>(PackedReprSlotKind::Bool);
-  if (mlir::isa<mlir::FloatType>(type))
-    return static_cast<int64_t>(PackedReprSlotKind::F64Bits);
-  if (mlir::isa<ClassType>(type))
-    return static_cast<int64_t>(PackedReprSlotKind::CallbackPtr);
-  if (mlir::isa<NoneType, StrType, ObjectType, ExceptionType, TracebackType,
-                LocationType>(type))
-    return static_cast<int64_t>(PackedReprSlotKind::PyObject);
-  return static_cast<int64_t>(PackedReprSlotKind::I64);
-}
-
-static mlir::Value getPackedReprCallback(mlir::Location loc, mlir::Type type,
-                                         mlir::ModuleOp module,
-                                         mlir::OpBuilder &builder) {
-  auto ptrType = mlir::LLVM::LLVMPointerType::get(builder.getContext());
-  if (auto classType = mlir::dyn_cast<ClassType>(type)) {
-    std::string reprName = getStaticClassReprCallbackName(classType);
-    return builder.create<mlir::LLVM::AddressOfOp>(
-        loc, ptrType, mlir::StringAttr::get(module.getContext(), reprName));
-  }
-  return builder.create<mlir::LLVM::ZeroOp>(loc, ptrType);
 }
 
 static mlir::Value widenReprSlot(mlir::Location loc, mlir::Value value,
@@ -189,12 +47,315 @@ static mlir::Value widenReprSlot(mlir::Location loc, mlir::Value value,
   return {};
 }
 
+namespace unicode {
+
+using Value = llvm::SmallVector<mlir::Value, 2>;
+
+llvm::SmallVector<mlir::Type, 2> types(mlir::MLIRContext *ctx) {
+  llvm::SmallVector<mlir::Type, 2> result;
+  object_abi::str_abi::Parts::storageTypes(ctx, result);
+  return result;
+}
+
+Value take(mlir::ValueRange values, size_t count) {
+  Value result;
+  result.reserve(count);
+  for (size_t index = 0; index < count && index < values.size(); ++index)
+    result.push_back(values[index]);
+  return result;
+}
+
+Value literal(mlir::Location loc, llvm::StringRef text, mlir::ModuleOp module,
+              mlir::OpBuilder &builder,
+              const PyLLVMTypeConverter &typeConverter, bool owned) {
+  (void)owned;
+  RuntimeAPI runtime(module, builder, typeConverter);
+  mlir::Value bytes = runtime.getByteLiteral(loc, builder.getStringAttr(text));
+  mlir::Value start = builder.create<mlir::arith::ConstantIndexOp>(loc, 0);
+  mlir::Value length =
+      runtime.getI64Constant(loc, static_cast<int64_t>(text.size()));
+  auto resultTypes = types(builder.getContext());
+  auto call = runtime.call(loc, RuntimeSymbols::kUnicodeFromBytes,
+                           mlir::TypeRange(resultTypes),
+                           mlir::ValueRange{bytes, start, length});
+  return Value(call.getResults());
+}
+
+Value concat(mlir::Location loc, mlir::ValueRange lhs, mlir::ValueRange rhs,
+             mlir::ModuleOp module, mlir::OpBuilder &builder,
+             const PyLLVMTypeConverter &typeConverter) {
+  RuntimeAPI runtime(module, builder, typeConverter);
+  auto resultTypes = types(builder.getContext());
+  llvm::SmallVector<mlir::Value, 6> operands;
+  operands.append(lhs.begin(), lhs.end());
+  operands.append(rhs.begin(), rhs.end());
+  auto call = runtime.call(loc, RuntimeSymbols::kUnicodeConcat,
+                           mlir::TypeRange(resultTypes), operands);
+  return Value(call.getResults());
+}
+
+Value concat3(mlir::Location loc, mlir::ValueRange lhs, mlir::ValueRange middle,
+              mlir::ValueRange rhs, mlir::ModuleOp module,
+              mlir::OpBuilder &builder,
+              const PyLLVMTypeConverter &typeConverter) {
+  RuntimeAPI runtime(module, builder, typeConverter);
+  auto resultTypes = types(builder.getContext());
+  llvm::SmallVector<mlir::Value, 9> operands;
+  operands.append(lhs.begin(), lhs.end());
+  operands.append(middle.begin(), middle.end());
+  operands.append(rhs.begin(), rhs.end());
+  auto call = runtime.call(loc, RuntimeSymbols::kUnicodeConcat3,
+                           mlir::TypeRange(resultTypes), operands);
+  return Value(call.getResults());
+}
+
+void release(mlir::Location loc, mlir::ValueRange value, mlir::ModuleOp module,
+             mlir::OpBuilder &builder, const PyLLVMTypeConverter &typeConverter,
+             bool aggregateEffect = false) {
+  (void)aggregateEffect;
+  RuntimeAPI runtime(module, builder, typeConverter);
+  runtime.call(loc, RuntimeSymbols::kUnicodeDecRef, mlir::Type(), value);
+}
+
+void yield(mlir::Location loc, mlir::ValueRange value,
+           mlir::OpBuilder &builder) {
+  builder.create<mlir::scf::YieldOp>(loc, value);
+}
+
+} // namespace unicode
+
+static mlir::Value classPartMemRef(mlir::Location loc, mlir::Value descriptor,
+                                   mlir::MemRefType targetType,
+                                   mlir::OpBuilder &builder) {
+  if (!descriptor || !targetType)
+    return {};
+  if (descriptor.getType() == targetType)
+    return descriptor;
+  if (mlir::Operation *def = descriptor.getDefiningOp())
+    if (class_layout::DescriptorShape::has(def) &&
+        mlir::failed(class_layout::DescriptorShape::verify(
+            def, targetType, "class carrier descriptor")))
+      return {};
+  if (mlir::isa<mlir::MemRefType>(descriptor.getType()))
+    return builder.create<mlir::memref::CastOp>(loc, targetType, descriptor);
+  auto cast = builder.create<mlir::UnrealizedConversionCastOp>(
+      loc, targetType, mlir::ValueRange{descriptor});
+  class_layout::DescriptorShape::mark(cast.getOperation(), targetType);
+  return cast.getResult(0);
+}
+
+static mlir::Value
+loadedClassObjectDescriptor(mlir::Location loc, mlir::Value objectDescriptor,
+                            mlir::LLVM::LLVMStructType objectType,
+                            mlir::OpBuilder &builder) {
+  if (objectDescriptor.getType() == objectType)
+    return objectDescriptor;
+  auto memrefType =
+      mlir::dyn_cast<mlir::MemRefType>(objectDescriptor.getType());
+  if (!memrefType || memrefType.getRank() != 1 ||
+      memrefType.getElementType() != objectType)
+    return {};
+  auto load = builder.create<mlir::memref::LoadOp>(
+      loc, objectDescriptor, createIndexConstant(loc, builder, 0));
+  load->setAttr(ClassSafetyAttrs::kCarrierLoad, builder.getUnitAttr());
+  ownership::aggregate::Slot::markLoad(load.getResult());
+  return load.getResult();
+}
+
+static mlir::FailureOr<unicode::Value>
+unicodePartsFromCarrier(mlir::Location loc, mlir::Value value,
+                        mlir::OpBuilder &builder) {
+  auto objectType = class_layout::objectCarrierType(value.getType());
+  if (!objectType)
+    return mlir::failure();
+  mlir::Value object =
+      loadedClassObjectDescriptor(loc, value, objectType, builder);
+  if (!object)
+    return mlir::failure();
+  llvm::SmallVector<mlir::Type, 2> storageTypes;
+  object_abi::str_abi::Parts::storageTypes(builder.getContext(), storageTypes);
+  if (storageTypes.size() !=
+      static_cast<size_t>(class_layout::Object::partCount(objectType)))
+    return mlir::failure();
+  unicode::Value parts;
+  for (auto [index, storageType] : llvm::enumerate(storageTypes)) {
+    auto memrefType = mlir::dyn_cast<mlir::MemRefType>(storageType);
+    if (!memrefType)
+      return mlir::failure();
+    mlir::Value descriptor = class_layout::Object::descriptor(
+        loc, objectType, object, static_cast<int64_t>(index), builder);
+    mlir::Value part = classPartMemRef(loc, descriptor, memrefType, builder);
+    if (!part)
+      return mlir::failure();
+    parts.push_back(part);
+  }
+  return parts;
+}
+
+static mlir::LogicalResult
+appendClassReprArgs(mlir::Location loc, ClassType classType,
+                    mlir::Value objectDescriptor, mlir::func::FuncOp func,
+                    mlir::ModuleOp module, mlir::OpBuilder &builder,
+                    const PyLLVMTypeConverter &typeConverter,
+                    llvm::SmallVectorImpl<mlir::Value> &args) {
+  mlir::FunctionType fnType = func.getFunctionType();
+  if (fnType.getNumInputs() == 1) {
+    mlir::Type argType = fnType.getInput(0);
+    if (objectDescriptor.getType() != argType) {
+      auto descriptorType =
+          mlir::dyn_cast<mlir::MemRefType>(objectDescriptor.getType());
+      auto targetType = mlir::dyn_cast<mlir::MemRefType>(argType);
+      if (descriptorType && descriptorType.getRank() == 1 &&
+          descriptorType.getElementType() == argType) {
+        auto objectType = class_layout::objectCarrierType(argType);
+        if (!objectType)
+          return mlir::failure();
+        objectDescriptor = loadedClassObjectDescriptor(loc, objectDescriptor,
+                                                       objectType, builder);
+      } else if (!descriptorType || !targetType ||
+                 descriptorType.getRank() != targetType.getRank() ||
+                 descriptorType.getElementType() !=
+                     targetType.getElementType()) {
+        return mlir::failure();
+      } else {
+        objectDescriptor = builder.create<mlir::memref::CastOp>(
+            loc, targetType, objectDescriptor);
+      }
+    }
+    if (!objectDescriptor)
+      return mlir::failure();
+    args.push_back(objectDescriptor);
+    return mlir::success();
+  }
+
+  mlir::FailureOr<class_layout::Layout> layout =
+      class_layout::get(module, classType, typeConverter);
+  if (mlir::failed(layout))
+    return mlir::failure();
+  llvm::SmallVector<mlir::Type, 4> expectedTypes;
+  class_layout::partsValueTypes(*layout, expectedTypes);
+  if (!llvm::equal(fnType.getInputs(), expectedTypes))
+    return mlir::failure();
+  auto headerType = mlir::dyn_cast<mlir::MemRefType>(expectedTypes[0]);
+  auto objectType = layout->objectType;
+  if (!headerType || class_layout::Object::partCount(objectType) !=
+                         static_cast<int64_t>(expectedTypes.size()))
+    return mlir::failure();
+  mlir::Value object =
+      loadedClassObjectDescriptor(loc, objectDescriptor, objectType, builder);
+  if (!object)
+    return mlir::failure();
+
+  for (auto [index, expected] : llvm::enumerate(expectedTypes)) {
+    auto memrefType = mlir::dyn_cast<mlir::MemRefType>(expected);
+    if (!memrefType)
+      return mlir::failure();
+    mlir::Value descriptor = class_layout::Object::descriptor(
+        loc, objectType, object, static_cast<int64_t>(index), builder);
+    mlir::Value memref = classPartMemRef(loc, descriptor, memrefType, builder);
+    if (!memref)
+      return mlir::failure();
+    args.push_back(memref);
+  }
+  return mlir::success();
+}
+
+static mlir::FailureOr<unicode::Value>
+callClassReprSymbol(mlir::Location loc, llvm::StringRef symbol,
+                    ClassType classType, mlir::Value objectDescriptor,
+                    mlir::ModuleOp module, mlir::OpBuilder &builder,
+                    const PyLLVMTypeConverter &typeConverter) {
+  auto func = module.lookupSymbol<mlir::func::FuncOp>(symbol);
+  auto strTypes = unicode::types(builder.getContext());
+  if (!func || func.getFunctionType().getNumResults() != strTypes.size())
+    return mlir::failure();
+  if (!llvm::all_of(
+          llvm::zip(func.getFunctionType().getResults(), strTypes),
+          [](auto pair) { return std::get<0>(pair) == std::get<1>(pair); }))
+    return mlir::failure();
+
+  llvm::SmallVector<mlir::Value, 2> args;
+  if (mlir::failed(appendClassReprArgs(loc, classType, objectDescriptor, func,
+                                       module, builder, typeConverter, args)))
+    return mlir::failure();
+
+  auto call = builder.create<mlir::func::CallOp>(loc, func, args);
+  call->setAttr(OwnershipContractAttrs::kOwnedResults,
+                builder.getArrayAttr({builder.getI64IntegerAttr(0)}));
+  if (call.getNumResults() != strTypes.size())
+    return mlir::failure();
+
+  unicode::Value result;
+  result.reserve(strTypes.size());
+  result.append(call.getResults().begin(), call.getResults().end());
+  return result;
+}
+
+static mlir::FailureOr<unicode::Value>
+callStaticClassRepr(mlir::Location loc, ClassType classType,
+                    mlir::Value objectDescriptor, mlir::ModuleOp module,
+                    mlir::OpBuilder &builder,
+                    const PyLLVMTypeConverter &typeConverter) {
+  (void)typeConverter;
+  std::string reprName = getStaticClassReprCallbackName(classType);
+  if (auto repr =
+          callClassReprSymbol(loc, reprName, classType, objectDescriptor,
+                              module, builder, typeConverter);
+      mlir::succeeded(repr))
+    return repr;
+
+  std::string customName = (classType.getClassName() + ".__repr__").str();
+  if (auto repr =
+          callClassReprSymbol(loc, customName, classType, objectDescriptor,
+                              module, builder, typeConverter);
+      mlir::succeeded(repr))
+    return repr;
+
+  return mlir::failure();
+}
+
+static mlir::Value
+classDescriptorForRepr(mlir::Location loc, ClassType classType,
+                       mlir::Value value, mlir::ModuleOp module,
+                       mlir::OpBuilder &builder,
+                       const PyLLVMTypeConverter &typeConverter) {
+  auto objectType =
+      class_layout::objectCarrierType(class_layout::carrierStorageType(
+          module, classType, typeConverter, builder.getContext()));
+  if (!objectType)
+    return {};
+
+  if (value.getType() == objectType)
+    return value;
+
+  if (auto memrefType = mlir::dyn_cast<mlir::MemRefType>(value.getType())) {
+    if (memrefType.getRank() == 1 &&
+        memrefType.getElementType() == objectType) {
+      auto targetType =
+          class_layout::carrierType(objectType, builder.getContext());
+      if (value.getType() == targetType)
+        return value;
+      return builder.create<mlir::memref::CastOp>(loc, targetType, value)
+          .getResult();
+    }
+  }
+
+  return {};
+}
+
 struct ReprSnapshot {
-  mlir::Value flat;
+  mlir::Value storage;
   mlir::Value size;
 };
 
-static mlir::FailureOr<ReprSnapshot> materializeListReprFlat(
+struct DictReprSnapshot {
+  mlir::Value keys;
+  mlir::Value values;
+  mlir::Value states;
+  mlir::Value capacity;
+};
+
+static mlir::FailureOr<ReprSnapshot> materializeListReprSnapshot(
     mlir::Location loc, mlir::Value header, mlir::Value items,
     mlir::Type elementType, mlir::ModuleOp module, mlir::OpBuilder &builder,
     const PyLLVMTypeConverter &typeConverter, llvm::StringRef retainPremise,
@@ -209,21 +370,11 @@ static mlir::FailureOr<ReprSnapshot> materializeListReprFlat(
     container::access::Contract::mark(sizeI64.getDefiningOp(), header, header);
   mlir::Value size = builder.create<mlir::arith::IndexCastOp>(
       loc, builder.getIndexType(), sizeI64);
-  mlir::Value headerSlots = createIndexConstant(loc, builder, kListHeaderSize);
-  mlir::Value flatSize =
-      builder.create<mlir::arith::AddIOp>(loc, size, headerSlots);
-  auto flatType =
-      mlir::MemRefType::get({mlir::ShapedType::kDynamic}, builder.getI64Type());
-  mlir::Value flat = builder.create<mlir::memref::AllocaOp>(
-      loc, flatType, mlir::ValueRange{flatSize});
-  for (int64_t slot = 0; slot < kListHeaderSize; ++slot) {
-    mlir::Value index = createIndexConstant(loc, builder, slot);
-    mlir::Value value =
-        builder.create<mlir::memref::LoadOp>(loc, header, index);
-    if (markManagedAccesses)
-      container::access::Contract::mark(value.getDefiningOp(), header, header);
-    builder.create<mlir::memref::StoreOp>(loc, value, flat, index);
-  }
+  mlir::Value snapshot = builder.create<mlir::memref::AllocaOp>(
+      loc, itemsType, mlir::ValueRange{size});
+  ClassType inlineClassType = mlir::dyn_cast<ClassType>(elementType);
+  auto inlineCarrierType = class_layout::objectCarrierType(itemsType);
+  bool inlineClass = inlineClassType && inlineCarrierType;
 
   mlir::Value zero = createIndexConstant(loc, builder, 0);
   mlir::Value one = createIndexConstant(loc, builder, 1);
@@ -232,33 +383,56 @@ static mlir::FailureOr<ReprSnapshot> materializeListReprFlat(
     mlir::OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToStart(loop.getBody());
     mlir::Value iv = loop.getInductionVar();
-    mlir::Value value = builder.create<mlir::memref::LoadOp>(loc, items, iv);
-    if (markManagedAccesses)
-      container::access::Contract::mark(value.getDefiningOp(), header, items);
-    value = widenReprSlot(loc, value, builder);
-    if (!value)
-      return mlir::failure();
-    mlir::Value destIndex =
-        builder.create<mlir::arith::AddIOp>(loc, iv, headerSlots);
-    Slot::refcount(loc, value, elementType, module, builder, typeConverter,
-                   "incref", /*aggregateEffect=*/true, retainPremise);
-    auto store =
-        builder.create<mlir::memref::StoreOp>(loc, value, flat, destIndex);
-    if (Slot::refcounted(elementType))
-      Slot::markTransfer(store.getOperation());
+    mlir::Value value;
+    if (inlineClass) {
+      mlir::Value sourceSlot =
+          Slot::classCarrierView(loc, items, iv, inlineCarrierType, builder);
+      if (!sourceSlot)
+        return mlir::failure();
+      mlir::Value destSlot =
+          Slot::classCarrierView(loc, snapshot, iv, inlineCarrierType, builder);
+      if (!destSlot)
+        return mlir::failure();
+      if (mlir::failed(Slot::classCarrierInitialize(
+              loc, destSlot, inlineClassType, module, builder, typeConverter)))
+        return mlir::failure();
+      if (mlir::failed(::py::lowering::value::class_::Copy::ensure(
+              loc, module, inlineClassType, builder, typeConverter)))
+        return mlir::failure();
+      if (mlir::failed(Slot::classCarrierCopy(
+              loc, destSlot, sourceSlot, inlineClassType, module, builder)))
+        return mlir::failure();
+    } else {
+      value = builder.create<mlir::memref::LoadOp>(loc, items, iv);
+      if (markManagedAccesses)
+        container::access::Contract::mark(value.getDefiningOp(), header, items);
+      if (mlir::failed(Slot::refcount(loc, value, elementType, module, builder,
+                                      typeConverter, "incref",
+                                      /*aggregateEffect=*/true, retainPremise)))
+        return mlir::failure();
+      auto store =
+          builder.create<mlir::memref::StoreOp>(loc, value, snapshot, iv);
+      if (Slot::refcounted(elementType))
+        Slot::markTransfer(store.getOperation());
+    }
   }
-  return ReprSnapshot{flat, size};
+  return ReprSnapshot{snapshot, size};
 }
 
-static void releaseListReprSnapshot(mlir::Location loc, mlir::Value flat,
-                                    mlir::Value size, mlir::Type elementType,
-                                    mlir::ModuleOp module,
-                                    mlir::OpBuilder &builder,
-                                    const PyLLVMTypeConverter &typeConverter) {
+static mlir::LogicalResult
+releaseListReprSnapshot(mlir::Location loc, mlir::Value items, mlir::Value size,
+                        mlir::Type elementType, mlir::ModuleOp module,
+                        mlir::OpBuilder &builder,
+                        const PyLLVMTypeConverter &typeConverter) {
   if (!Slot::refcounted(elementType))
-    return;
+    return mlir::success();
 
-  mlir::Value headerSlots = createIndexConstant(loc, builder, kListHeaderSize);
+  auto itemsType = mlir::dyn_cast<mlir::MemRefType>(items.getType());
+  if (!itemsType)
+    return mlir::success();
+  ClassType inlineClassType = mlir::dyn_cast<ClassType>(elementType);
+  auto inlineCarrierType = class_layout::objectCarrierType(itemsType);
+  bool inlineClass = inlineClassType && inlineCarrierType;
   mlir::Value zero = createIndexConstant(loc, builder, 0);
   mlir::Value one = createIndexConstant(loc, builder, 1);
   auto loop = builder.create<mlir::scf::ForOp>(loc, zero, size, one);
@@ -266,24 +440,305 @@ static void releaseListReprSnapshot(mlir::Location loc, mlir::Value flat,
     mlir::OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToStart(loop.getBody());
     mlir::Value iv = loop.getInductionVar();
-    mlir::Value sourceIndex =
-        builder.create<mlir::arith::AddIOp>(loc, iv, headerSlots);
-    mlir::Value slot =
-        builder.create<mlir::memref::LoadOp>(loc, flat, sourceIndex);
-    Slot::refcount(loc, slot, elementType, module, builder, typeConverter,
-                   "decref", /*aggregateEffect=*/true);
+    if (inlineClass) {
+      mlir::Value objectSlot =
+          Slot::classCarrierView(loc, items, iv, inlineCarrierType, builder);
+      if (!objectSlot)
+        return mlir::failure();
+      Slot::classCarrierRefcount(loc, objectSlot, inlineClassType, module,
+                                 builder, "decref",
+                                 /*aggregateEffect=*/true);
+    } else {
+      mlir::Value slot = builder.create<mlir::memref::LoadOp>(loc, items, iv);
+      if (mlir::failed(Slot::refcount(loc, slot, elementType, module, builder,
+                                      typeConverter, "decref",
+                                      /*aggregateEffect=*/true)))
+        return mlir::failure();
+    }
   }
+  return mlir::success();
 }
 
-static mlir::FailureOr<ReprSnapshot> materializeDictReprFlat(
+static mlir::FailureOr<unicode::Value>
+buildReprSlot(mlir::Location loc, mlir::Value value, mlir::Type logicalType,
+              mlir::ModuleOp module, mlir::OpBuilder &builder,
+              const PyLLVMTypeConverter &typeConverter) {
+  RuntimeAPI runtime(module, builder, typeConverter);
+  auto strTypes = unicode::types(builder.getContext());
+
+  if (auto classType = mlir::dyn_cast<ClassType>(logicalType)) {
+    mlir::Value objectDescriptor = classDescriptorForRepr(
+        loc, classType, value, module, builder, typeConverter);
+    if (!objectDescriptor)
+      return mlir::failure();
+    ownership::aggregate::Slot::markLoad(objectDescriptor);
+    return callStaticClassRepr(loc, classType, objectDescriptor, module,
+                               builder, typeConverter);
+  }
+
+  if (mlir::isa<BoolType>(logicalType)) {
+    if (value.getType() == builder.getI1Type()) {
+      auto select =
+          builder.create<mlir::scf::IfOp>(loc, mlir::TypeRange(strTypes), value,
+                                          /*withElseRegion=*/true);
+      {
+        mlir::OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPointToStart(select.thenBlock());
+        unicode::Value trueText =
+            unicode::literal(loc, "True", module, builder, typeConverter,
+                             /*owned=*/true);
+        unicode::yield(loc, trueText, builder);
+      }
+      {
+        mlir::OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPointToStart(select.elseBlock());
+        unicode::Value falseText =
+            unicode::literal(loc, "False", module, builder, typeConverter,
+                             /*owned=*/true);
+        unicode::yield(loc, falseText, builder);
+      }
+      return unicode::Value(select.getResults());
+    }
+    auto intType = mlir::dyn_cast<mlir::IntegerType>(value.getType());
+    if (!intType)
+      return mlir::failure();
+    mlir::Value zero =
+        builder.create<mlir::arith::ConstantIntOp>(loc, 0, intType);
+    mlir::Value isTrue = builder.create<mlir::arith::CmpIOp>(
+        loc, mlir::arith::CmpIPredicate::ne, value, zero);
+    auto select =
+        builder.create<mlir::scf::IfOp>(loc, mlir::TypeRange(strTypes), isTrue,
+                                        /*withElseRegion=*/true);
+    {
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToStart(select.thenBlock());
+      unicode::Value trueText =
+          unicode::literal(loc, "True", module, builder, typeConverter,
+                           /*owned=*/true);
+      unicode::yield(loc, trueText, builder);
+    }
+    {
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToStart(select.elseBlock());
+      unicode::Value falseText =
+          unicode::literal(loc, "False", module, builder, typeConverter,
+                           /*owned=*/true);
+      unicode::yield(loc, falseText, builder);
+    }
+    return unicode::Value(select.getResults());
+  }
+
+  if (mlir::isa<IntType>(logicalType)) {
+    mlir::Value bits = widenReprSlot(loc, value, builder);
+    if (!bits)
+      return mlir::failure();
+    auto repr = runtime.call(loc, RuntimeSymbols::kUnicodeFromI64,
+                             mlir::TypeRange(strTypes), mlir::ValueRange{bits});
+    return unicode::Value(repr.getResults());
+  }
+
+  if (mlir::isa<NoneType>(logicalType))
+    return unicode::literal(loc, "None", module, builder, typeConverter,
+                            /*owned=*/true);
+
+  if (mlir::isa<StrType>(logicalType)) {
+    mlir::FailureOr<unicode::Value> parts =
+        unicodePartsFromCarrier(loc, value, builder);
+    if (mlir::failed(parts))
+      return mlir::failure();
+    unicode::Value quote = unicode::literal(loc, "'", module, builder,
+                                            typeConverter, /*owned=*/true);
+    unicode::Value result = unicode::concat3(loc, quote, *parts, quote, module,
+                                             builder, typeConverter);
+    unicode::release(loc, quote, module, builder, typeConverter);
+    return result;
+  }
+
+  return mlir::failure();
+}
+
+static mlir::FailureOr<unicode::Value>
+buildListReprFromSnapshot(mlir::Location loc, mlir::Value items,
+                          mlir::Value size, mlir::Type elementType,
+                          mlir::ModuleOp module, mlir::OpBuilder &builder,
+                          const PyLLVMTypeConverter &typeConverter) {
+  auto itemsType = mlir::dyn_cast<mlir::MemRefType>(items.getType());
+  if (!itemsType)
+    return mlir::failure();
+
+  auto strTypes = unicode::types(builder.getContext());
+  unicode::Value initial =
+      unicode::literal(loc, "[", module, builder, typeConverter,
+                       /*owned=*/true);
+
+  mlir::Value zero = createIndexConstant(loc, builder, 0);
+  mlir::Value one = createIndexConstant(loc, builder, 1);
+  ClassType inlineClassType = mlir::dyn_cast<ClassType>(elementType);
+  auto inlineCarrierType = class_layout::objectCarrierType(itemsType);
+  bool inlineClass = inlineClassType && inlineCarrierType;
+  auto loop = builder.create<mlir::scf::ForOp>(loc, zero, size, one,
+                                               mlir::ValueRange(initial));
+  {
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(loop.getBody());
+    mlir::Value iv = loop.getInductionVar();
+    unicode::Value current =
+        unicode::take(loop.getRegionIterArgs(), strTypes.size());
+    mlir::Value first = builder.create<mlir::arith::CmpIOp>(
+        loc, mlir::arith::CmpIPredicate::eq, iv, zero);
+    auto separatorSelect =
+        builder.create<mlir::scf::IfOp>(loc, mlir::TypeRange(strTypes), first,
+                                        /*withElseRegion=*/true);
+    {
+      mlir::OpBuilder::InsertionGuard thenGuard(builder);
+      builder.setInsertionPointToStart(separatorSelect.thenBlock());
+      unicode::Value empty =
+          unicode::literal(loc, "", module, builder, typeConverter,
+                           /*owned=*/true);
+      unicode::yield(loc, empty, builder);
+    }
+    {
+      mlir::OpBuilder::InsertionGuard elseGuard(builder);
+      builder.setInsertionPointToStart(separatorSelect.elseBlock());
+      unicode::Value comma =
+          unicode::literal(loc, ", ", module, builder, typeConverter,
+                           /*owned=*/true);
+      unicode::yield(loc, comma, builder);
+    }
+    unicode::Value separator(separatorSelect.getResults());
+
+    mlir::Value value;
+    if (inlineClass) {
+      value =
+          Slot::classCarrierView(loc, items, iv, inlineCarrierType, builder);
+      if (!value)
+        return mlir::failure();
+    } else {
+      value = builder.create<mlir::memref::LoadOp>(loc, items, iv);
+      ownership::aggregate::Slot::markLoad(value);
+    }
+    mlir::FailureOr<unicode::Value> itemRepr =
+        buildReprSlot(loc, value, elementType, module, builder, typeConverter);
+    if (mlir::failed(itemRepr))
+      return mlir::failure();
+    unicode::Value next = unicode::concat3(loc, current, separator, *itemRepr,
+                                           module, builder, typeConverter);
+    unicode::release(loc, current, module, builder, typeConverter,
+                     /*aggregateEffect=*/true);
+    unicode::release(loc, separator, module, builder, typeConverter);
+    unicode::release(loc, *itemRepr, module, builder, typeConverter);
+    unicode::yield(loc, next, builder);
+  }
+
+  unicode::Value current(loop.getResults());
+  unicode::Value close = unicode::literal(loc, "]", module, builder,
+                                          typeConverter, /*owned=*/true);
+  unicode::Value result =
+      unicode::concat(loc, current, close, module, builder, typeConverter);
+  unicode::release(loc, current, module, builder, typeConverter,
+                   /*aggregateEffect=*/true);
+  unicode::release(loc, close, module, builder, typeConverter);
+  return result;
+}
+
+static mlir::FailureOr<unicode::Value>
+buildTupleReprFromSnapshot(mlir::Location loc, mlir::Value items,
+                           llvm::ArrayRef<mlir::Type> elementTypes,
+                           mlir::ModuleOp module, mlir::OpBuilder &builder,
+                           const PyLLVMTypeConverter &typeConverter) {
+  auto itemsType = mlir::dyn_cast<mlir::MemRefType>(items.getType());
+  if (!itemsType)
+    return mlir::failure();
+
+  unicode::Value current =
+      unicode::literal(loc, "(", module, builder, typeConverter,
+                       /*owned=*/true);
+  auto inlineCarrierType = class_layout::objectCarrierType(itemsType);
+
+  for (auto [index, elementType] : llvm::enumerate(elementTypes)) {
+    unicode::Value separator =
+        unicode::literal(loc, index == 0 ? "" : ", ", module, builder,
+                         typeConverter, /*owned=*/true);
+
+    mlir::Value sourceIndex =
+        createIndexConstant(loc, builder, static_cast<int64_t>(index));
+    ClassType inlineClassType = mlir::dyn_cast<ClassType>(elementType);
+    bool inlineClass = inlineClassType && inlineCarrierType;
+    mlir::Value value;
+    if (inlineClass) {
+      value = Slot::classCarrierView(loc, items, sourceIndex, inlineCarrierType,
+                                     builder);
+      if (!value)
+        return mlir::failure();
+      Slot::classCarrierRefcount(
+          loc, value, inlineClassType, module, builder, "incref",
+          /*aggregateEffect=*/true, ThreadSafetyAttrs::kPremiseAggregateBorrow);
+    } else {
+      value = builder.create<mlir::memref::LoadOp>(loc, items, sourceIndex);
+      ownership::aggregate::Slot::markLoad(value);
+      if (mlir::failed(
+              Slot::refcount(loc, value, elementType, module, builder,
+                             typeConverter, "incref", /*aggregateEffect=*/true,
+                             ThreadSafetyAttrs::kPremiseAggregateBorrow)))
+        return mlir::failure();
+    }
+    mlir::FailureOr<unicode::Value> itemRepr =
+        buildReprSlot(loc, value, elementType, module, builder, typeConverter);
+    if (mlir::failed(itemRepr))
+      return mlir::failure();
+    if (inlineClass) {
+      Slot::classCarrierRefcount(loc, value, inlineClassType, module, builder,
+                                 "decref", /*aggregateEffect=*/true);
+    } else {
+      if (mlir::failed(Slot::refcount(loc, value, elementType, module, builder,
+                                      typeConverter, "decref",
+                                      /*aggregateEffect=*/true)))
+        return mlir::failure();
+    }
+    unicode::Value next = unicode::concat3(loc, current, separator, *itemRepr,
+                                           module, builder, typeConverter);
+    unicode::release(loc, current, module, builder, typeConverter,
+                     /*aggregateEffect=*/true);
+    unicode::release(loc, separator, module, builder, typeConverter);
+    unicode::release(loc, *itemRepr, module, builder, typeConverter);
+    current = next;
+  }
+
+  if (elementTypes.size() == 1) {
+    unicode::Value comma = unicode::literal(loc, ",", module, builder,
+                                            typeConverter, /*owned=*/true);
+    unicode::Value close =
+        unicode::literal(loc, ")", module, builder, typeConverter,
+                         /*owned=*/true);
+    unicode::Value result = unicode::concat3(loc, current, comma, close, module,
+                                             builder, typeConverter);
+    unicode::release(loc, current, module, builder, typeConverter,
+                     /*aggregateEffect=*/true);
+    unicode::release(loc, comma, module, builder, typeConverter);
+    unicode::release(loc, close, module, builder, typeConverter);
+    return result;
+  }
+
+  unicode::Value close = unicode::literal(loc, ")", module, builder,
+                                          typeConverter, /*owned=*/true);
+  unicode::Value result =
+      unicode::concat(loc, current, close, module, builder, typeConverter);
+  unicode::release(loc, current, module, builder, typeConverter,
+                   /*aggregateEffect=*/true);
+  unicode::release(loc, close, module, builder, typeConverter);
+  return result;
+}
+
+static mlir::FailureOr<DictReprSnapshot> materializeDictReprSnapshot(
     mlir::Location loc, mlir::Value header, mlir::Value keys,
     mlir::Value values, mlir::Value states, DictType dictType,
     mlir::ModuleOp module, mlir::OpBuilder &builder,
     const PyLLVMTypeConverter &typeConverter, llvm::StringRef retainPremise,
     bool markManagedAccesses) {
-  if (!mlir::dyn_cast<mlir::MemRefType>(keys.getType()) ||
-      !mlir::dyn_cast<mlir::MemRefType>(values.getType()) ||
-      !mlir::dyn_cast<mlir::MemRefType>(states.getType()))
+  auto keysType = mlir::dyn_cast<mlir::MemRefType>(keys.getType());
+  auto valuesType = mlir::dyn_cast<mlir::MemRefType>(values.getType());
+  auto statesType = mlir::dyn_cast<mlir::MemRefType>(states.getType());
+  if (!keysType || !valuesType || !statesType)
     return mlir::failure();
 
   mlir::Value capacityI64 = builder.create<mlir::memref::LoadOp>(
@@ -293,31 +748,13 @@ static mlir::FailureOr<ReprSnapshot> materializeDictReprFlat(
                                       header);
   mlir::Value capacity = builder.create<mlir::arith::IndexCastOp>(
       loc, builder.getIndexType(), capacityI64);
-  mlir::Value headerSlots = createIndexConstant(loc, builder, kDictHeaderSize);
-  mlir::Value three = createIndexConstant(loc, builder, 3);
-  mlir::Value payloadSlots =
-      builder.create<mlir::arith::MulIOp>(loc, capacity, three);
-  mlir::Value flatSize =
-      builder.create<mlir::arith::AddIOp>(loc, headerSlots, payloadSlots);
-  auto flatType =
-      mlir::MemRefType::get({mlir::ShapedType::kDynamic}, builder.getI64Type());
-  mlir::Value flat = builder.create<mlir::memref::AllocaOp>(
-      loc, flatType, mlir::ValueRange{flatSize});
+  mlir::Value snapshotKeys = builder.create<mlir::memref::AllocaOp>(
+      loc, keysType, mlir::ValueRange{capacity});
+  mlir::Value snapshotValues = builder.create<mlir::memref::AllocaOp>(
+      loc, valuesType, mlir::ValueRange{capacity});
+  mlir::Value snapshotStates = builder.create<mlir::memref::AllocaOp>(
+      loc, statesType, mlir::ValueRange{capacity});
 
-  for (int64_t slot = 0; slot < kDictHeaderSize; ++slot) {
-    mlir::Value index = createIndexConstant(loc, builder, slot);
-    mlir::Value value =
-        builder.create<mlir::memref::LoadOp>(loc, header, index);
-    if (markManagedAccesses)
-      container::access::Contract::mark(value.getDefiningOp(), header, header);
-    builder.create<mlir::memref::StoreOp>(loc, value, flat, index);
-  }
-
-  mlir::Value keysBase = headerSlots;
-  mlir::Value valuesBase =
-      builder.create<mlir::arith::AddIOp>(loc, keysBase, capacity);
-  mlir::Value statesBase =
-      builder.create<mlir::arith::AddIOp>(loc, valuesBase, capacity);
   mlir::Value zero = createIndexConstant(loc, builder, 0);
   mlir::Value one = createIndexConstant(loc, builder, 1);
   auto loop = builder.create<mlir::scf::ForOp>(loc, zero, capacity, one);
@@ -330,18 +767,7 @@ static mlir::FailureOr<ReprSnapshot> materializeDictReprFlat(
       container::access::Contract::mark(stateLoad.getOperation(), header,
                                         states);
     mlir::Value state = stateLoad;
-    mlir::Value stateI64 = state;
-    if (auto intType = mlir::dyn_cast<mlir::IntegerType>(state.getType())) {
-      if (intType.getWidth() < 64)
-        stateI64 = builder.create<mlir::arith::ExtUIOp>(
-            loc, builder.getI64Type(), state);
-      else if (intType.getWidth() > 64)
-        stateI64 = builder.create<mlir::arith::TruncIOp>(
-            loc, builder.getI64Type(), state);
-    }
-    mlir::Value stateIndex =
-        builder.create<mlir::arith::AddIOp>(loc, statesBase, iv);
-    builder.create<mlir::memref::StoreOp>(loc, stateI64, flat, stateIndex);
+    builder.create<mlir::memref::StoreOp>(loc, state, snapshotStates, iv);
 
     mlir::Value occupied = builder.create<mlir::arith::CmpIOp>(
         loc, mlir::arith::CmpIPredicate::eq, state,
@@ -355,16 +781,13 @@ static mlir::FailureOr<ReprSnapshot> materializeDictReprFlat(
       auto keyLoad = builder.create<mlir::memref::LoadOp>(loc, keys, iv);
       if (markManagedAccesses)
         container::access::Contract::mark(keyLoad.getOperation(), header, keys);
-      mlir::Value key = widenReprSlot(loc, keyLoad, builder);
-      if (!key)
+      mlir::Value key = keyLoad;
+      if (mlir::failed(Slot::refcount(loc, key, dictType.getKeyType(), module,
+                                      builder, typeConverter, "incref",
+                                      /*aggregateEffect=*/true, retainPremise)))
         return mlir::failure();
-      mlir::Value keyIndex =
-          builder.create<mlir::arith::AddIOp>(loc, keysBase, iv);
-      Slot::refcount(loc, key, dictType.getKeyType(), module, builder,
-                     typeConverter, "incref",
-                     /*aggregateEffect=*/true, retainPremise);
       auto keyStore =
-          builder.create<mlir::memref::StoreOp>(loc, key, flat, keyIndex);
+          builder.create<mlir::memref::StoreOp>(loc, key, snapshotKeys, iv);
       if (Slot::refcounted(dictType.getKeyType()))
         Slot::markTransfer(keyStore.getOperation());
 
@@ -372,39 +795,33 @@ static mlir::FailureOr<ReprSnapshot> materializeDictReprFlat(
       if (markManagedAccesses)
         container::access::Contract::mark(valueLoad.getOperation(), header,
                                           values);
-      mlir::Value value = widenReprSlot(loc, valueLoad, builder);
-      if (!value)
+      mlir::Value value = valueLoad;
+      if (mlir::failed(Slot::refcount(loc, value, dictType.getValueType(),
+                                      module, builder, typeConverter, "incref",
+                                      /*aggregateEffect=*/true, retainPremise)))
         return mlir::failure();
-      mlir::Value valueIndex =
-          builder.create<mlir::arith::AddIOp>(loc, valuesBase, iv);
-      Slot::refcount(loc, value, dictType.getValueType(), module, builder,
-                     typeConverter, "incref",
-                     /*aggregateEffect=*/true, retainPremise);
       auto valueStore =
-          builder.create<mlir::memref::StoreOp>(loc, value, flat, valueIndex);
+          builder.create<mlir::memref::StoreOp>(loc, value, snapshotValues, iv);
       if (Slot::refcounted(dictType.getValueType()))
         Slot::markTransfer(valueStore.getOperation());
     }
   }
 
-  return ReprSnapshot{flat, capacity};
+  return DictReprSnapshot{snapshotKeys, snapshotValues, snapshotStates,
+                          capacity};
 }
 
-static void releaseDictReprSnapshot(mlir::Location loc, mlir::Value flat,
-                                    mlir::Value capacity, DictType dictType,
-                                    mlir::ModuleOp module,
-                                    mlir::OpBuilder &builder,
-                                    const PyLLVMTypeConverter &typeConverter) {
+static mlir::LogicalResult
+releaseDictReprSnapshot(mlir::Location loc, mlir::Value keys,
+                        mlir::Value values, mlir::Value states,
+                        mlir::Value capacity, DictType dictType,
+                        mlir::ModuleOp module, mlir::OpBuilder &builder,
+                        const PyLLVMTypeConverter &typeConverter) {
   bool keyRefcounted = Slot::refcounted(dictType.getKeyType());
   bool valueRefcounted = Slot::refcounted(dictType.getValueType());
   if (!keyRefcounted && !valueRefcounted)
-    return;
+    return mlir::success();
 
-  mlir::Value keysBase = createIndexConstant(loc, builder, kDictHeaderSize);
-  mlir::Value valuesBase =
-      builder.create<mlir::arith::AddIOp>(loc, keysBase, capacity);
-  mlir::Value statesBase =
-      builder.create<mlir::arith::AddIOp>(loc, valuesBase, capacity);
   mlir::Value zero = createIndexConstant(loc, builder, 0);
   mlir::Value one = createIndexConstant(loc, builder, 1);
   auto loop = builder.create<mlir::scf::ForOp>(loc, zero, capacity, one);
@@ -412,325 +829,343 @@ static void releaseDictReprSnapshot(mlir::Location loc, mlir::Value flat,
     mlir::OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToStart(loop.getBody());
     mlir::Value iv = loop.getInductionVar();
-    mlir::Value stateIndex =
-        builder.create<mlir::arith::AddIOp>(loc, statesBase, iv);
-    mlir::Value state =
-        builder.create<mlir::memref::LoadOp>(loc, flat, stateIndex);
+    mlir::Value state = builder.create<mlir::memref::LoadOp>(loc, states, iv);
     mlir::Value occupied = builder.create<mlir::arith::CmpIOp>(
         loc, mlir::arith::CmpIPredicate::eq, state,
-        createI64Constant(loc, builder, 1));
+        builder.create<mlir::arith::ConstantIntOp>(loc, 1, state.getType()));
     auto releaseIfOccupied = builder.create<mlir::scf::IfOp>(
         loc, occupied, /*withElseRegion=*/false);
     {
       mlir::OpBuilder::InsertionGuard ifGuard(builder);
       builder.setInsertionPointToStart(releaseIfOccupied.thenBlock());
       if (keyRefcounted) {
-        mlir::Value keyIndex =
-            builder.create<mlir::arith::AddIOp>(loc, keysBase, iv);
-        mlir::Value key =
-            builder.create<mlir::memref::LoadOp>(loc, flat, keyIndex);
-        Slot::refcount(loc, key, dictType.getKeyType(), module, builder,
-                       typeConverter, "decref",
-                       /*aggregateEffect=*/true);
+        mlir::Value key = builder.create<mlir::memref::LoadOp>(loc, keys, iv);
+        if (mlir::failed(Slot::refcount(loc, key, dictType.getKeyType(), module,
+                                        builder, typeConverter, "decref",
+                                        /*aggregateEffect=*/true)))
+          return mlir::failure();
       }
       if (valueRefcounted) {
-        mlir::Value valueIndex =
-            builder.create<mlir::arith::AddIOp>(loc, valuesBase, iv);
         mlir::Value value =
-            builder.create<mlir::memref::LoadOp>(loc, flat, valueIndex);
-        Slot::refcount(loc, value, dictType.getValueType(), module, builder,
-                       typeConverter, "decref",
-                       /*aggregateEffect=*/true);
+            builder.create<mlir::memref::LoadOp>(loc, values, iv);
+        if (mlir::failed(Slot::refcount(loc, value, dictType.getValueType(),
+                                        module, builder, typeConverter,
+                                        "decref",
+                                        /*aggregateEffect=*/true)))
+          return mlir::failure();
       }
     }
   }
+  return mlir::success();
 }
 
-/// py.upcast forwards pointer-backed py.* operands. Compiler-owned typed
-/// containers are not pointer-compatible; upcasting them materializes an owned
-/// object bridge from a borrowed container snapshot.
-struct UpcastLowering : public mlir::OpConversionPattern<UpcastOp> {
-  UpcastLowering(PyLLVMTypeConverter &converter, mlir::MLIRContext *ctx)
-      : mlir::OpConversionPattern<UpcastOp>(converter, ctx) {}
+static mlir::FailureOr<unicode::Value>
+buildDictReprFromSnapshot(mlir::Location loc, mlir::Value keys,
+                          mlir::Value values, mlir::Value states,
+                          mlir::Value capacity, DictType dictType,
+                          mlir::ModuleOp module, mlir::OpBuilder &builder,
+                          const PyLLVMTypeConverter &typeConverter) {
+  if (!mlir::dyn_cast<mlir::MemRefType>(keys.getType()) ||
+      !mlir::dyn_cast<mlir::MemRefType>(values.getType()) ||
+      !mlir::dyn_cast<mlir::MemRefType>(states.getType()))
+    return mlir::failure();
+
+  auto strTypes = unicode::types(builder.getContext());
+  unicode::Value initial =
+      unicode::literal(loc, "{", module, builder, typeConverter,
+                       /*owned=*/true);
+  mlir::Value emittedInit = createI64Constant(loc, builder, 0);
+
+  mlir::Value zero = createIndexConstant(loc, builder, 0);
+  mlir::Value one = createIndexConstant(loc, builder, 1);
+  llvm::SmallVector<mlir::Value, 4> initArgs;
+  initArgs.append(initial.begin(), initial.end());
+  initArgs.push_back(emittedInit);
+  auto loop = builder.create<mlir::scf::ForOp>(loc, zero, capacity, one,
+                                               mlir::ValueRange(initArgs));
+  {
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(loop.getBody());
+    mlir::Value iv = loop.getInductionVar();
+    unicode::Value current =
+        unicode::take(loop.getRegionIterArgs(), strTypes.size());
+    mlir::Value emitted = loop.getRegionIterArgs()[strTypes.size()];
+    mlir::Value state = builder.create<mlir::memref::LoadOp>(loc, states, iv);
+    mlir::Value occupied = builder.create<mlir::arith::CmpIOp>(
+        loc, mlir::arith::CmpIPredicate::eq, state,
+        builder.create<mlir::arith::ConstantIntOp>(loc, 1, state.getType()));
+    llvm::SmallVector<mlir::Type, 3> ifResultTypes(strTypes.begin(),
+                                                   strTypes.end());
+    ifResultTypes.push_back(builder.getI64Type());
+    auto emitIfOccupied = builder.create<mlir::scf::IfOp>(
+        loc, mlir::TypeRange(ifResultTypes), occupied,
+        /*withElseRegion=*/true);
+    {
+      mlir::OpBuilder::InsertionGuard ifGuard(builder);
+      builder.setInsertionPointToStart(emitIfOccupied.thenBlock());
+      mlir::Value first = builder.create<mlir::arith::CmpIOp>(
+          loc, mlir::arith::CmpIPredicate::eq, emitted,
+          createI64Constant(loc, builder, 0));
+      auto separatorSelect =
+          builder.create<mlir::scf::IfOp>(loc, mlir::TypeRange(strTypes), first,
+                                          /*withElseRegion=*/true);
+      {
+        mlir::OpBuilder::InsertionGuard thenGuard(builder);
+        builder.setInsertionPointToStart(separatorSelect.thenBlock());
+        unicode::Value empty =
+            unicode::literal(loc, "", module, builder, typeConverter,
+                             /*owned=*/true);
+        unicode::yield(loc, empty, builder);
+      }
+      {
+        mlir::OpBuilder::InsertionGuard elseGuard(builder);
+        builder.setInsertionPointToStart(separatorSelect.elseBlock());
+        unicode::Value comma =
+            unicode::literal(loc, ", ", module, builder, typeConverter,
+                             /*owned=*/true);
+        unicode::yield(loc, comma, builder);
+      }
+      unicode::Value separator(separatorSelect.getResults());
+
+      mlir::Value keyBits = builder.create<mlir::memref::LoadOp>(loc, keys, iv);
+      ownership::aggregate::Slot::markLoad(keyBits);
+      mlir::FailureOr<unicode::Value> keyRepr = buildReprSlot(
+          loc, keyBits, dictType.getKeyType(), module, builder, typeConverter);
+      if (mlir::failed(keyRepr))
+        return mlir::failure();
+      unicode::Value withKey = unicode::concat3(
+          loc, current, separator, *keyRepr, module, builder, typeConverter);
+      unicode::release(loc, current, module, builder, typeConverter,
+                       /*aggregateEffect=*/true);
+      unicode::release(loc, separator, module, builder, typeConverter);
+      unicode::release(loc, *keyRepr, module, builder, typeConverter);
+
+      unicode::Value colon = unicode::literal(loc, ": ", module, builder,
+                                              typeConverter, /*owned=*/true);
+
+      mlir::Value valueBits =
+          builder.create<mlir::memref::LoadOp>(loc, values, iv);
+      ownership::aggregate::Slot::markLoad(valueBits);
+      mlir::FailureOr<unicode::Value> valueRepr =
+          buildReprSlot(loc, valueBits, dictType.getValueType(), module,
+                        builder, typeConverter);
+      if (mlir::failed(valueRepr))
+        return mlir::failure();
+      unicode::Value next = unicode::concat3(loc, withKey, colon, *valueRepr,
+                                             module, builder, typeConverter);
+      unicode::release(loc, withKey, module, builder, typeConverter);
+      unicode::release(loc, colon, module, builder, typeConverter);
+      unicode::release(loc, *valueRepr, module, builder, typeConverter);
+      mlir::Value emittedNext = builder.create<mlir::arith::AddIOp>(
+          loc, emitted, createI64Constant(loc, builder, 1));
+      llvm::SmallVector<mlir::Value, 4> yielded;
+      yielded.append(next.begin(), next.end());
+      yielded.push_back(emittedNext);
+      builder.create<mlir::scf::YieldOp>(loc, yielded);
+    }
+    {
+      mlir::OpBuilder::InsertionGuard elseGuard(builder);
+      builder.setInsertionPointToStart(emitIfOccupied.elseBlock());
+      llvm::SmallVector<mlir::Value, 4> yielded;
+      yielded.append(current.begin(), current.end());
+      yielded.push_back(emitted);
+      builder.create<mlir::scf::YieldOp>(loc, yielded);
+    }
+    builder.create<mlir::scf::YieldOp>(loc, emitIfOccupied.getResults());
+  }
+
+  unicode::Value current = unicode::take(loop.getResults(), strTypes.size());
+  unicode::Value close = unicode::literal(loc, "}", module, builder,
+                                          typeConverter, /*owned=*/true);
+  unicode::Value result =
+      unicode::concat(loc, current, close, module, builder, typeConverter);
+  unicode::release(loc, current, module, builder, typeConverter,
+                   /*aggregateEffect=*/true);
+  unicode::release(loc, close, module, builder, typeConverter);
+  return result;
+}
+
+/// Container repr lowering is still housed in this file for historical reasons.
+/// Generic object upcast has been removed from the dialect; repr lowering must
+/// keep static element types throughout.
+struct ContainerReprLowering : public mlir::OpConversionPattern<ReprOp> {
+  ContainerReprLowering(PyLLVMTypeConverter &converter, mlir::MLIRContext *ctx)
+      : mlir::OpConversionPattern<ReprOp>(converter, ctx) {}
 
   mlir::LogicalResult
-  matchAndRewrite(UpcastOp op, OneToNOpAdaptor adaptor,
+  matchAndRewrite(ReprOp op, OneToNOpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
-    if (adaptor.getInput().empty())
+    mlir::ModuleOp module = op->getParentOfType<mlir::ModuleOp>();
+    if (!module || adaptor.getInput().empty())
       return mlir::failure();
-    if (auto listType = mlir::dyn_cast<ListType>(op.getInput().getType())) {
-      if (isCompilerOwnedMemRefListType(listType)) {
-        mlir::ModuleOp module = op->getParentOfType<mlir::ModuleOp>();
-        if (!module)
-          return mlir::failure();
-        auto *converter =
-            static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
-        auto unrankedType = mlir::UnrankedMemRefType::get(rewriter.getI64Type(),
-                                                          /*memorySpace=*/0);
-        mlir::Value reprMemref;
-        mlir::Value reprSnapshotSize;
-        bool releaseSnapshot = false;
-        if (adaptor.getInput().size() == 2) {
-          mlir::Value header = adaptor.getInput().front();
-          mlir::Value items = adaptor.getInput().back();
-          auto flatType = mlir::MemRefType::get({mlir::ShapedType::kDynamic},
-                                                rewriter.getI64Type());
+    auto *converter =
+        static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
+    mlir::Type inputType = op.getInput().getType();
 
-          mlir::Value isManaged = container::Managed::predicate(
-              op.getLoc(), header, kTypedListRefcountSlot, rewriter);
-          auto lockedCopy = rewriter.create<mlir::scf::IfOp>(
-              op.getLoc(), mlir::TypeRange{flatType, rewriter.getIndexType()},
-              isManaged,
-              /*withElseRegion=*/true);
-          {
-            mlir::OpBuilder::InsertionGuard guard(rewriter);
-            rewriter.setInsertionPointToStart(lockedCopy.thenBlock());
-            container::Managed::lock(op.getLoc(), header, kTypedListLockSlot,
-                                     rewriter);
-            mlir::FailureOr<ReprSnapshot> snapshot = materializeListReprFlat(
-                op.getLoc(), header, items, listType.getElementType(), module,
-                rewriter, *converter, ThreadSafetyAttrs::kPremiseLockedBorrow,
-                /*markManagedAccesses=*/true);
-            if (mlir::failed(snapshot))
-              return mlir::failure();
-            container::Managed::unlock(op.getLoc(), header, kTypedListLockSlot,
-                                       rewriter);
-            rewriter.create<mlir::scf::YieldOp>(
-                op.getLoc(), mlir::ValueRange{snapshot->flat, snapshot->size});
-          }
-          {
-            mlir::OpBuilder::InsertionGuard guard(rewriter);
-            rewriter.setInsertionPointToStart(lockedCopy.elseBlock());
-            mlir::FailureOr<ReprSnapshot> snapshot = materializeListReprFlat(
-                op.getLoc(), header, items, listType.getElementType(), module,
-                rewriter, *converter,
-                ThreadSafetyAttrs::kPremiseAggregateBorrow,
-                /*markManagedAccesses=*/false);
-            if (mlir::failed(snapshot))
-              return mlir::failure();
-            rewriter.create<mlir::scf::YieldOp>(
-                op.getLoc(), mlir::ValueRange{snapshot->flat, snapshot->size});
-          }
-          reprMemref = lockedCopy.getResult(0);
-          reprSnapshotSize = lockedCopy.getResult(1);
-          releaseSnapshot = Slot::refcounted(listType.getElementType());
-        } else if (adaptor.getInput().size() == 1) {
-          reprMemref = adaptor.getInput().front();
-        } else {
-          return mlir::failure();
-        }
-        mlir::Value unranked = rewriter.create<mlir::memref::CastOp>(
-            op.getLoc(), unrankedType, reprMemref);
-        llvm::SmallVector<mlir::Type> extraTypes;
-        llvm::SmallVector<mlir::Value> extraOperands;
-        if (auto classType =
-                mlir::dyn_cast<ClassType>(listType.getElementType())) {
-          auto ptrType =
-              mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
-          extraTypes.push_back(ptrType);
-          std::string reprName = getStaticClassReprCallbackName(classType);
-          extraOperands.push_back(rewriter.create<mlir::LLVM::AddressOfOp>(
-              op.getLoc(), ptrType,
-              mlir::StringAttr::get(module.getContext(), reprName)));
-        }
-        auto reprFunc = getOrInsertTypedListReprFunc(
-            op.getLoc(), module, listType, unrankedType, extraTypes,
-            converter->getPyObjectPtrType(), rewriter);
-        llvm::SmallVector<mlir::Value> operands;
-        operands.push_back(unranked);
-        operands.append(extraOperands.begin(), extraOperands.end());
-        auto call = rewriter.create<mlir::func::CallOp>(op.getLoc(), reprFunc,
-                                                        operands);
-        if (releaseSnapshot)
-          releaseListReprSnapshot(op.getLoc(), reprMemref, reprSnapshotSize,
-                                  listType.getElementType(), module, rewriter,
-                                  *converter);
-        rewriter.replaceOp(op, call.getResults());
-        return mlir::success();
-      }
-    }
-    if (auto tupleType = mlir::dyn_cast<TupleType>(op.getInput().getType())) {
-      if (isCompilerOwnedMemRefTupleType(tupleType)) {
-        mlir::ModuleOp module = op->getParentOfType<mlir::ModuleOp>();
-        if (!module)
-          return mlir::failure();
-        auto *converter =
-            static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
-        auto unrankedType = mlir::UnrankedMemRefType::get(rewriter.getI64Type(),
-                                                          /*memorySpace=*/0);
-        if (adaptor.getInput().size() != 2)
-          return mlir::failure();
+    if (auto listType = mlir::dyn_cast<ListType>(inputType)) {
+      if (!isCompilerOwnedMemRefListType(listType))
+        return mlir::failure();
 
-        mlir::Value header = adaptor.getInput().front();
-        mlir::Value items = adaptor.getInput().back();
-        auto itemsType = mlir::dyn_cast<mlir::MemRefType>(items.getType());
-        if (!itemsType)
-          return rewriter.notifyMatchFailure(
-              op, "tuple repr requires memref item storage");
-        auto elements = tupleType.getElementTypes();
-
-        mlir::Value sizeI64 = rewriter.create<mlir::memref::LoadOp>(
-            op.getLoc(), header, createIndexConstant(op.getLoc(), rewriter, 0));
-        mlir::Value size = rewriter.create<mlir::arith::IndexCastOp>(
-            op.getLoc(), rewriter.getIndexType(), sizeI64);
-        mlir::Value headerSlots =
-            createIndexConstant(op.getLoc(), rewriter, kTupleHeaderSize);
-        mlir::Value flatSize = rewriter.create<mlir::arith::AddIOp>(
-            op.getLoc(), size, headerSlots);
-        auto flatType = mlir::MemRefType::get({mlir::ShapedType::kDynamic},
-                                              rewriter.getI64Type());
-        mlir::Value flat = rewriter.create<mlir::memref::AllocaOp>(
-            op.getLoc(), flatType, mlir::ValueRange{flatSize});
-        for (int64_t slot = 0; slot < kTupleHeaderSize; ++slot) {
-          mlir::Value index = createIndexConstant(op.getLoc(), rewriter, slot);
-          mlir::Value value =
-              rewriter.create<mlir::memref::LoadOp>(op.getLoc(), header, index);
-          rewriter.create<mlir::memref::StoreOp>(op.getLoc(), value, flat,
-                                                 index);
-        }
-
-        for (auto [index, elementType] : llvm::enumerate(elements)) {
-          mlir::Value sourceIndex = createIndexConstant(
-              op.getLoc(), rewriter, static_cast<int64_t>(index));
-          mlir::Value value = rewriter.create<mlir::memref::LoadOp>(
-              op.getLoc(), items, sourceIndex);
-          value = widenReprSlot(op.getLoc(), value, rewriter);
-          if (!value)
-            return mlir::failure();
-          mlir::Value destIndex = createIndexConstant(
-              op.getLoc(), rewriter,
-              kTupleHeaderSize + static_cast<int64_t>(index));
-          Slot::refcount(op.getLoc(), value, elementType, module, rewriter,
-                         *converter, "incref",
-                         /*aggregateEffect=*/true,
-                         ThreadSafetyAttrs::kPremiseAggregateBorrow);
-          auto store = rewriter.create<mlir::memref::StoreOp>(
-              op.getLoc(), value, flat, destIndex);
-          if (Slot::refcounted(elementType))
-            Slot::markTransfer(store.getOperation());
-        }
-
-        mlir::Value unranked = rewriter.create<mlir::memref::CastOp>(
-            op.getLoc(), unrankedType, flat);
-        llvm::SmallVector<mlir::Type> extraTypes;
-        llvm::SmallVector<mlir::Value> extraOperands;
-        if (!elements.empty() && llvm::all_of(elements, [](mlir::Type type) {
-              return mlir::isa<ClassType>(type);
-            })) {
-          auto classType = mlir::cast<ClassType>(elements.front());
-          auto ptrType =
-              mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
-          extraTypes.push_back(ptrType);
-          std::string reprName = getStaticClassReprCallbackName(classType);
-          extraOperands.push_back(rewriter.create<mlir::LLVM::AddressOfOp>(
-              op.getLoc(), ptrType,
-              mlir::StringAttr::get(module.getContext(), reprName)));
-        }
-        auto reprFunc = getOrInsertTypedTupleReprFunc(
-            op.getLoc(), module, tupleType, unrankedType, extraTypes,
-            converter->getPyObjectPtrType(), rewriter);
-        llvm::SmallVector<mlir::Value> operands;
-        operands.push_back(unranked);
-        operands.append(extraOperands.begin(), extraOperands.end());
-        auto call = rewriter.create<mlir::func::CallOp>(op.getLoc(), reprFunc,
-                                                        operands);
-        for (auto [index, elementType] : llvm::enumerate(elements)) {
-          if (!Slot::refcounted(elementType))
-            continue;
-          mlir::Value sourceIndex = createIndexConstant(
-              op.getLoc(), rewriter,
-              kTupleHeaderSize + static_cast<int64_t>(index));
-          mlir::Value slot = rewriter.create<mlir::memref::LoadOp>(
-              op.getLoc(), flat, sourceIndex);
-          Slot::refcount(op.getLoc(), slot, elementType, module, rewriter,
-                         *converter, "decref",
-                         /*aggregateEffect=*/true);
-        }
-        rewriter.replaceOp(op, call.getResults());
-        return mlir::success();
-      }
-    }
-    if (auto dictType = mlir::dyn_cast<DictType>(op.getInput().getType())) {
-      if (isCompilerOwnedMemRefDictType(dictType)) {
-        mlir::ModuleOp module = op->getParentOfType<mlir::ModuleOp>();
-        if (!module)
-          return mlir::failure();
-        auto *converter =
-            static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
-        auto unrankedType = mlir::UnrankedMemRefType::get(rewriter.getI64Type(),
-                                                          /*memorySpace=*/0);
-        auto flatType = mlir::MemRefType::get({mlir::ShapedType::kDynamic},
-                                              rewriter.getI64Type());
-        if (adaptor.getInput().size() != 4)
-          return mlir::failure();
-
-        mlir::Value header = adaptor.getInput()[0];
-        mlir::Value keys = adaptor.getInput()[1];
-        mlir::Value values = adaptor.getInput()[2];
-        mlir::Value states = adaptor.getInput()[3];
+      mlir::Value reprMemref;
+      mlir::Value reprSnapshotSize;
+      bool releaseSnapshot = false;
+      if (adaptor.getInput().size() == 3) {
+        mlir::Value header = adaptor.getInput()[kListHeaderComponent];
+        mlir::Value lock = adaptor.getInput()[kListLockComponent];
+        mlir::Value items = adaptor.getInput()[kListItemsComponent];
+        auto snapshotType = items.getType();
         mlir::Value isManaged = container::Managed::predicate(
-            op.getLoc(), header, kTypedDictRefcountSlot, rewriter);
+            op.getLoc(), header, kTypedListRefcountSlot, rewriter);
         auto lockedCopy = rewriter.create<mlir::scf::IfOp>(
-            op.getLoc(), mlir::TypeRange{flatType, rewriter.getIndexType()},
+            op.getLoc(), mlir::TypeRange{snapshotType, rewriter.getIndexType()},
             isManaged,
             /*withElseRegion=*/true);
         {
           mlir::OpBuilder::InsertionGuard guard(rewriter);
           rewriter.setInsertionPointToStart(lockedCopy.thenBlock());
-          container::Managed::lock(op.getLoc(), header, kTypedDictLockSlot,
-                                   rewriter);
-          mlir::FailureOr<ReprSnapshot> snapshot = materializeDictReprFlat(
-              op.getLoc(), header, keys, values, states, dictType, module,
+          container::Managed::lock(op.getLoc(), lock, rewriter);
+          mlir::FailureOr<ReprSnapshot> snapshot = materializeListReprSnapshot(
+              op.getLoc(), header, items, listType.getElementType(), module,
               rewriter, *converter, ThreadSafetyAttrs::kPremiseLockedBorrow,
               /*markManagedAccesses=*/true);
           if (mlir::failed(snapshot))
             return mlir::failure();
-          container::Managed::unlock(op.getLoc(), header, kTypedDictLockSlot,
-                                     rewriter);
+          container::Managed::unlock(op.getLoc(), lock, rewriter);
           rewriter.create<mlir::scf::YieldOp>(
-              op.getLoc(), mlir::ValueRange{snapshot->flat, snapshot->size});
+              op.getLoc(), mlir::ValueRange{snapshot->storage, snapshot->size});
         }
         {
           mlir::OpBuilder::InsertionGuard guard(rewriter);
           rewriter.setInsertionPointToStart(lockedCopy.elseBlock());
-          mlir::FailureOr<ReprSnapshot> snapshot = materializeDictReprFlat(
-              op.getLoc(), header, keys, values, states, dictType, module,
+          mlir::FailureOr<ReprSnapshot> snapshot = materializeListReprSnapshot(
+              op.getLoc(), header, items, listType.getElementType(), module,
               rewriter, *converter, ThreadSafetyAttrs::kPremiseAggregateBorrow,
               /*markManagedAccesses=*/false);
           if (mlir::failed(snapshot))
             return mlir::failure();
           rewriter.create<mlir::scf::YieldOp>(
-              op.getLoc(), mlir::ValueRange{snapshot->flat, snapshot->size});
+              op.getLoc(), mlir::ValueRange{snapshot->storage, snapshot->size});
         }
-
-        mlir::Value unranked = rewriter.create<mlir::memref::CastOp>(
-            op.getLoc(), unrankedType, lockedCopy.getResult(0));
-        auto reprFunc = getOrInsertTypedDictReprFunc(
-            op.getLoc(), module, unrankedType, converter->getPyObjectPtrType(),
-            rewriter);
-        mlir::Value keyKind =
-            createI64Constant(op.getLoc(), rewriter,
-                              getPackedReprSlotKind(dictType.getKeyType()));
-        mlir::Value valueKind =
-            createI64Constant(op.getLoc(), rewriter,
-                              getPackedReprSlotKind(dictType.getValueType()));
-        mlir::Value keyCallback = getPackedReprCallback(
-            op.getLoc(), dictType.getKeyType(), module, rewriter);
-        mlir::Value valueCallback = getPackedReprCallback(
-            op.getLoc(), dictType.getValueType(), module, rewriter);
-        auto call = rewriter.create<mlir::func::CallOp>(
-            op.getLoc(), reprFunc,
-            mlir::ValueRange{unranked, keyKind, valueKind, keyCallback,
-                             valueCallback});
-        releaseDictReprSnapshot(op.getLoc(), lockedCopy.getResult(0),
-                                lockedCopy.getResult(1), dictType, module,
-                                rewriter, *converter);
-        rewriter.replaceOp(op, call.getResults());
-        return mlir::success();
+        reprMemref = lockedCopy.getResult(0);
+        reprSnapshotSize = lockedCopy.getResult(1);
+        releaseSnapshot = Slot::refcounted(listType.getElementType());
+      } else if (adaptor.getInput().size() == 1) {
+        reprMemref = adaptor.getInput().front();
+      } else {
+        return mlir::failure();
       }
+      mlir::Value snapshotSize = reprSnapshotSize;
+      if (!snapshotSize) {
+        auto sizeLoad = rewriter.create<mlir::memref::LoadOp>(
+            op.getLoc(), reprMemref,
+            createIndexConstant(op.getLoc(), rewriter, 0));
+        snapshotSize = rewriter.create<mlir::arith::IndexCastOp>(
+            op.getLoc(), rewriter.getIndexType(), sizeLoad);
+      }
+      mlir::FailureOr<unicode::Value> repr = buildListReprFromSnapshot(
+          op.getLoc(), reprMemref, snapshotSize, listType.getElementType(),
+          module, rewriter, *converter);
+      if (mlir::failed(repr))
+        return mlir::failure();
+      if (releaseSnapshot)
+        if (mlir::failed(releaseListReprSnapshot(
+                op.getLoc(), reprMemref, snapshotSize,
+                listType.getElementType(), module, rewriter, *converter)))
+          return mlir::failure();
+      rewriter.replaceOpWithMultiple(
+          op, llvm::ArrayRef<mlir::ValueRange>{mlir::ValueRange(*repr)});
+      return mlir::success();
     }
-    rewriter.replaceOp(op, adaptor.getInput().front());
-    return mlir::success();
+
+    if (auto tupleType = mlir::dyn_cast<TupleType>(inputType)) {
+      if (!isCompilerOwnedMemRefTupleType(tupleType) ||
+          adaptor.getInput().size() != 2)
+        return mlir::failure();
+
+      mlir::Value items = adaptor.getInput().back();
+      auto itemsType = mlir::dyn_cast<mlir::MemRefType>(items.getType());
+      if (!itemsType)
+        return rewriter.notifyMatchFailure(
+            op, "tuple repr requires memref item storage");
+      auto elements = tupleType.getElementTypes();
+
+      mlir::FailureOr<unicode::Value> repr = buildTupleReprFromSnapshot(
+          op.getLoc(), items, elements, module, rewriter, *converter);
+      if (mlir::failed(repr))
+        return mlir::failure();
+      rewriter.replaceOpWithMultiple(
+          op, llvm::ArrayRef<mlir::ValueRange>{mlir::ValueRange(*repr)});
+      return mlir::success();
+    }
+
+    if (auto dictType = mlir::dyn_cast<DictType>(inputType)) {
+      if (!isCompilerOwnedMemRefDictType(dictType) ||
+          adaptor.getInput().size() != 5)
+        return mlir::failure();
+
+      mlir::Value header = adaptor.getInput()[kDictHeaderComponent];
+      mlir::Value lock = adaptor.getInput()[kDictLockComponent];
+      mlir::Value keys = adaptor.getInput()[kDictKeysComponent];
+      mlir::Value values = adaptor.getInput()[kDictValuesComponent];
+      mlir::Value states = adaptor.getInput()[kDictStatesComponent];
+      mlir::Value isManaged = container::Managed::predicate(
+          op.getLoc(), header, kTypedDictRefcountSlot, rewriter);
+      auto lockedCopy = rewriter.create<mlir::scf::IfOp>(
+          op.getLoc(),
+          mlir::TypeRange{keys.getType(), values.getType(), states.getType(),
+                          rewriter.getIndexType()},
+          isManaged, /*withElseRegion=*/true);
+      {
+        mlir::OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(lockedCopy.thenBlock());
+        container::Managed::lock(op.getLoc(), lock, rewriter);
+        mlir::FailureOr<DictReprSnapshot> snapshot =
+            materializeDictReprSnapshot(
+                op.getLoc(), header, keys, values, states, dictType, module,
+                rewriter, *converter, ThreadSafetyAttrs::kPremiseLockedBorrow,
+                /*markManagedAccesses=*/true);
+        if (mlir::failed(snapshot))
+          return mlir::failure();
+        container::Managed::unlock(op.getLoc(), lock, rewriter);
+        rewriter.create<mlir::scf::YieldOp>(
+            op.getLoc(),
+            mlir::ValueRange{snapshot->keys, snapshot->values, snapshot->states,
+                             snapshot->capacity});
+      }
+      {
+        mlir::OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(lockedCopy.elseBlock());
+        mlir::FailureOr<DictReprSnapshot> snapshot =
+            materializeDictReprSnapshot(
+                op.getLoc(), header, keys, values, states, dictType, module,
+                rewriter, *converter,
+                ThreadSafetyAttrs::kPremiseAggregateBorrow,
+                /*markManagedAccesses=*/false);
+        if (mlir::failed(snapshot))
+          return mlir::failure();
+        rewriter.create<mlir::scf::YieldOp>(
+            op.getLoc(),
+            mlir::ValueRange{snapshot->keys, snapshot->values, snapshot->states,
+                             snapshot->capacity});
+      }
+
+      mlir::FailureOr<unicode::Value> repr = buildDictReprFromSnapshot(
+          op.getLoc(), lockedCopy.getResult(0), lockedCopy.getResult(1),
+          lockedCopy.getResult(2), lockedCopy.getResult(3), dictType, module,
+          rewriter, *converter);
+      if (mlir::failed(repr))
+        return mlir::failure();
+      if (mlir::failed(releaseDictReprSnapshot(
+              op.getLoc(), lockedCopy.getResult(0), lockedCopy.getResult(1),
+              lockedCopy.getResult(2), lockedCopy.getResult(3), dictType,
+              module, rewriter, *converter)))
+        return mlir::failure();
+      rewriter.replaceOpWithMultiple(
+          op, llvm::ArrayRef<mlir::ValueRange>{mlir::ValueRange(*repr)});
+      return mlir::success();
+    }
+
+    return mlir::failure();
   }
 };
 
@@ -740,7 +1175,7 @@ namespace lowering::runtime::upcast::Patterns {
 
 void populate(PyLLVMTypeConverter &typeConverter,
               mlir::RewritePatternSet &patterns) {
-  patterns.add<UpcastLowering>(typeConverter, patterns.getContext());
+  patterns.add<ContainerReprLowering>(typeConverter, patterns.getContext());
 }
 
 } // namespace lowering::runtime::upcast::Patterns

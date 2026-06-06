@@ -98,8 +98,9 @@ class StmtExceptionMixin(FinallyReturnMixin):
                 raise NotImplementedError("raise ... from ... is not supported")
 
             if isinstance(node.exc, ast.Constant) and isinstance(node.exc.value, str):
+                message = self.require_value(node.exc, self.visit(node.exc))
                 exc_value = self.build_exception_value(
-                    message=node.exc.value,
+                    message=message,
                     loc=self._loc(node),
                     context=self.current_exception_context(),
                 )
@@ -112,18 +113,20 @@ class StmtExceptionMixin(FinallyReturnMixin):
                     isinstance(node.exc.func, ast.Name)
                     and node.exc.func.id == "Exception"
                 ):
-                    if len(node.exc.args) != 1 or not isinstance(
-                        node.exc.args[0], ast.Constant
-                    ):
+                    if len(node.exc.args) > 1:
                         raise NotImplementedError(
-                            "Exception(...) requires a single string literal"
+                            "Exception(...) supports zero or one argument"
                         )
-                    if not isinstance(node.exc.args[0].value, str):
-                        raise NotImplementedError(
-                            "Exception(...) requires a string literal"
+                    message = None
+                    if node.exc.args:
+                        message = self.require_value(
+                            node.exc.args[0], self.visit(node.exc.args[0])
+                        )
+                        message = self.coerce_value_to_type(
+                            message, self.get_py_type("!py.str"), self._loc(node)
                         )
                     exc_value = self.build_exception_value(
-                        message=node.exc.args[0].value,
+                        message=message,
                         loc=self._loc(node),
                         context=self.current_exception_context(),
                     )
@@ -132,7 +135,7 @@ class StmtExceptionMixin(FinallyReturnMixin):
                     return
 
             raise NotImplementedError(
-                "raise requires a string literal or bare raise (for now)"
+                "raise requires Exception(...), a string literal, or bare raise (for now)"
             )
 
     def visit_Try(self, node: ast.Try) -> None:
@@ -204,10 +207,10 @@ class StmtExceptionMixin(FinallyReturnMixin):
             if handler.type is not None:
                 if not (
                     isinstance(handler.type, ast.Name)
-                    and handler.type.id == "Exception"
+                    and handler.type.id in {"BaseException", "Exception"}
                 ):
                     raise NotImplementedError(
-                        "only bare except or except Exception is supported yet"
+                        "only bare except, except Exception, or except BaseException is supported yet"
                     )
             finalbody_always_returns = bool(node.finalbody) and always_returns(
                 node.finalbody
@@ -297,11 +300,7 @@ class StmtExceptionMixin(FinallyReturnMixin):
             self._set_insertion_block(except_block)
             self.push_scope()
             if handler.name is not None:
-                with loc, self.insertion_point():
-                    exception_object = py_ops.UpcastOp(
-                        self.get_py_type("!py.object"), except_block.arguments[0]
-                    ).result
-                self.define_symbol(handler.name, exception_object)
+                self.define_symbol(handler.name, except_block.arguments[0])
             self.push_exception_context(except_block.arguments[0])
             if returns_type is not None:
                 self._push_finally_return_context(

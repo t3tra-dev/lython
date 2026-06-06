@@ -18,42 +18,6 @@ namespace {
 
 using AliasAnalysis = OwnershipAliasAnalysis;
 
-namespace root {
-
-bool immortal(mlir::Value root, const AliasAnalysis &aliases) {
-  llvm::SmallVector<mlir::Value, 4> aliasSet;
-  aliases.collectAliases(root, aliasSet);
-  for (mlir::Value member : aliasSet) {
-    mlir::Operation *def = member.getDefiningOp();
-    if (def && isPyOwnershipImmortalOp(def))
-      return true;
-  }
-  return false;
-}
-
-bool aggregateBorrow(mlir::Value root, const AliasAnalysis &aliases) {
-  llvm::SmallVector<mlir::Value, 4> aliasSet;
-  aliases.collectAliases(root, aliasSet);
-  for (mlir::Value member : aliasSet) {
-    mlir::Operation *def = member.getDefiningOp();
-    if (!def)
-      continue;
-    if (def->hasAttr(OwnershipContractAttrs::kAggregateSlotLoad))
-      return true;
-    auto role =
-        def->getAttrOfType<mlir::StringAttr>(ThreadSafetyAttrs::kAtomicRole);
-    if (role && role.getValue() == ThreadSafetyAttrs::kRoleAsyncExceptionLoad)
-      return true;
-  }
-  return false;
-}
-
-bool same(mlir::Value lhs, mlir::Value rhs, const AliasAnalysis &aliases) {
-  return aliases.getRoot(lhs) == aliases.getRoot(rhs);
-}
-
-} // namespace root
-
 namespace operation {
 
 bool refcount(mlir::Operation *op) { return mlir::isa<IncRefOp, DecRefOp>(op); }
@@ -62,11 +26,11 @@ bool mentionsRoot(mlir::Operation *op, mlir::Value root,
                   const AliasAnalysis &aliases) {
   for (mlir::Value operand : op->getOperands())
     if (isPyOwnershipTrackedType(operand.getType()) &&
-        root::same(operand, root, aliases))
+        aliases.sameRoot(operand, root))
       return true;
   for (mlir::Value result : op->getResults())
     if (isPyOwnershipTrackedType(result.getType()) &&
-        root::same(result, root, aliases))
+        aliases.sameRoot(result, root))
       return true;
   return false;
 }
@@ -100,7 +64,7 @@ DecRefOp pairedDecRef(IncRefOp inc, const AliasAnalysis &aliases) {
   mlir::Operation *cursor = inc->getNextNode();
   while (cursor) {
     if (auto dec = mlir::dyn_cast<DecRefOp>(cursor)) {
-      if (root::same(dec.getObject(), object, aliases))
+      if (aliases.sameRoot(dec.getObject(), object))
         return dec;
       return nullptr;
     }
@@ -157,22 +121,12 @@ struct State {
   }
 };
 
-bool trackedThroughAlias(mlir::Value value, const AliasAnalysis &aliases) {
-  if (isPyOwnershipTrackedType(value.getType()))
-    return true;
-  llvm::SmallVector<mlir::Value, 4> aliasSet;
-  aliases.collectAliases(value, aliasSet);
-  return llvm::any_of(aliasSet, [](mlir::Value alias) {
-    return isPyOwnershipTrackedType(alias.getType());
-  });
-}
-
 mlir::LogicalResult add(State &state, mlir::Value value, int64_t delta,
                         mlir::Operation *op, const AliasAnalysis &aliases) {
-  if (!trackedThroughAlias(value, aliases))
+  if (!aliases.tracksThroughAlias(value))
     return mlir::success();
   mlir::Value rootValue = aliases.getRoot(value);
-  if (root::immortal(rootValue, aliases))
+  if (aliases.rootIsImmortal(rootValue))
     return mlir::success();
   int64_t &current = state.balance[rootValue];
   current += delta;
@@ -186,21 +140,10 @@ mlir::LogicalResult add(State &state, mlir::Value value, int64_t delta,
 
 bool hasToken(const State &state, mlir::Value value,
               const AliasAnalysis &aliases) {
-  if (!trackedThroughAlias(value, aliases))
+  if (!aliases.tracksThroughAlias(value))
     return true;
   mlir::Value root = aliases.getRoot(value);
   return state.balance.contains(root);
-}
-
-bool entryBorrowed(mlir::Value value, mlir::Block &entry,
-                   const AliasAnalysis &aliases) {
-  if (!isPyOwnershipTrackedType(value.getType()))
-    return false;
-  mlir::Value root = aliases.getRoot(value);
-  for (mlir::BlockArgument arg : entry.getArguments())
-    if (aliases.getRoot(arg) == root)
-      return true;
-  return false;
 }
 
 } // namespace ownership_state
@@ -213,19 +156,18 @@ mlir::LogicalResult verifyPremise(const ownership_state::State &state,
                                   bool entryArgsBorrowed) {
   mlir::Value object = inc.getObject();
   mlir::Value rootValue = aliases.getRoot(object);
-  if (root::immortal(rootValue, aliases))
+  if (aliases.rootIsImmortal(rootValue))
     return mlir::success();
   if (ownership_state::hasToken(state, object, aliases)) {
     threadsafe::Retain::verifyOwnedToken(inc.getOperation());
     return mlir::success();
   }
-  if (root::aggregateBorrow(rootValue, aliases)) {
+  if (aliases.rootHasAggregateBorrow(rootValue)) {
     threadsafe::Retain::premise(inc.getOperation(),
                                 ThreadSafetyAttrs::kPremiseAggregateBorrow);
     return mlir::success();
   }
-  if (entryArgsBorrowed &&
-      ownership_state::entryBorrowed(object, entry, aliases)) {
+  if (entryArgsBorrowed && aliases.rootIsEntryBorrowed(object, entry)) {
     threadsafe::Retain::premise(inc.getOperation(),
                                 ThreadSafetyAttrs::kPremiseEntryBorrowed);
     return mlir::success();
@@ -265,12 +207,11 @@ mlir::LogicalResult verifyUse(const ownership_state::State &state,
   if (!isPyOwnershipTrackedType(value.getType()))
     return mlir::success();
   mlir::Value rootValue = aliases.getRoot(value);
-  if (root::immortal(rootValue, aliases))
+  if (aliases.rootIsImmortal(rootValue))
     return mlir::success();
   if (ownership_state::hasToken(state, value, aliases))
     return mlir::success();
-  if (entryArgsBorrowed &&
-      ownership_state::entryBorrowed(value, entry, aliases))
+  if (entryArgsBorrowed && aliases.rootIsEntryBorrowed(value, entry))
     return mlir::success();
   return op.emitOpError("borrow use lacks a live ownership token or explicit "
                         "entry-borrowed lifetime for ")

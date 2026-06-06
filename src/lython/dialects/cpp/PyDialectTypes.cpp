@@ -97,10 +97,6 @@ StrType StrType::get(mlir::MLIRContext *ctx) {
   return Base::get(ctx, TypeKind::Str);
 }
 
-ObjectType ObjectType::get(mlir::MLIRContext *ctx) {
-  return Base::get(ctx, TypeKind::Object);
-}
-
 NoneType NoneType::get(mlir::MLIRContext *ctx) {
   return Base::get(ctx, TypeKind::None);
 }
@@ -143,6 +139,10 @@ ClassType ClassType::get(mlir::MLIRContext *ctx, ::llvm::StringRef className) {
 
 ExceptionType ExceptionType::get(mlir::MLIRContext *ctx) {
   return Base::get(ctx, TypeKind::Exception);
+}
+
+ExceptionCellType ExceptionCellType::get(mlir::MLIRContext *ctx) {
+  return Base::get(ctx, TypeKind::ExceptionCell);
 }
 
 TracebackType TracebackType::get(mlir::MLIRContext *ctx) {
@@ -242,8 +242,6 @@ bool isPyBoolType(mlir::Type type) { return mlir::isa<BoolType>(type); }
 
 bool isPyStrType(mlir::Type type) { return mlir::isa<StrType>(type); }
 
-bool isPyObjectType(mlir::Type type) { return mlir::isa<ObjectType>(type); }
-
 bool isPyNoneType(mlir::Type type) { return mlir::isa<NoneType>(type); }
 
 bool isPyTupleType(mlir::Type type) { return mlir::isa<TupleType>(type); }
@@ -256,6 +254,10 @@ bool isPyClassType(mlir::Type type) { return mlir::isa<ClassType>(type); }
 
 bool isPyExceptionType(mlir::Type type) {
   return mlir::isa<ExceptionType>(type);
+}
+
+bool isPyExceptionCellType(mlir::Type type) {
+  return mlir::isa<ExceptionCellType>(type);
 }
 
 bool isPyTracebackType(mlir::Type type) {
@@ -288,8 +290,8 @@ bool isAwaitableType(mlir::Type type) {
 
 bool isPyType(mlir::Type type) {
   return llvm::TypeSwitch<mlir::Type, bool>(type)
-      .Case<IntType, FloatType, BoolType, StrType, ObjectType, NoneType,
-            TupleType, DictType, ListType, ClassType, ExceptionType,
+      .Case<IntType, FloatType, BoolType, StrType, NoneType, TupleType,
+            DictType, ListType, ClassType, ExceptionType, ExceptionCellType,
             TracebackType, LocationType, FuncType, CoroutineType, TaskType,
             FutureType>([](auto) { return true; })
       .Default([](mlir::Type) { return false; });
@@ -303,10 +305,6 @@ bool isSubtypeOf(mlir::Type subtype, mlir::Type supertype) {
   // Reflexive: T <: T
   if (subtype == supertype)
     return true;
-
-  // Top type: object-world T <: !py.object
-  if (mlir::isa<ObjectType>(supertype))
-    return isPyType(subtype) && !mlir::isa<ClassType>(subtype);
 
   // Tuple covariance: !py.tuple<S> <: !py.tuple<T> if S <: T
   auto subtypeTuple = mlir::dyn_cast<TupleType>(subtype);

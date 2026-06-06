@@ -158,10 +158,11 @@ class SymbolTableMixin(VisitorRuntime):
         self,
         name: str,
         class_type: ir.Type,
+        base_names: tuple[str, ...],
         methods: dict[str, MethodInfo],
         attributes: dict[str, ir.Type] | None = None,
     ) -> None:
-        info = ClassInfo(name, class_type, methods, attributes or {})
+        info = ClassInfo(name, class_type, base_names, methods, attributes or {})
         self._classes[name] = info
 
     def lookup_class(self, name: str) -> ClassInfo | None:

@@ -1,4 +1,6 @@
 add_library(LythonRuntimeLowering STATIC
+    Common/RuntimeLibrary.cpp
+    Common/ClassLayout.cpp
     Common/RuntimeSupport.cpp
     Common/SlotUtils.cpp
     Passes/RuntimeLowering.cpp
@@ -48,11 +50,75 @@ add_library(LythonRuntimeLowering STATIC
     Passes/RefCountInsertion.cpp
 )
 
+add_executable(LythonRuntimeMlirBytecode
+    Tools/RuntimeMlirBytecode.cpp
+)
+
+add_dependencies(LythonRuntimeMlirBytecode PyDialectIncGen)
+
+target_include_directories(LythonRuntimeMlirBytecode
+    PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/lython/dialects/cpp
+    ${CMAKE_BINARY_DIR}/src/lython/dialects
+)
+
+target_link_libraries(LythonRuntimeMlirBytecode
+    PRIVATE
+    PyDialect
+    MLIRArithDialect
+    MLIRAsyncDialect
+    MLIRBufferizationDialect
+    MLIRBytecodeWriter
+    MLIRControlFlowDialect
+    MLIRFuncDialect
+    MLIRIR
+    MLIRLLVMDialect
+    MLIRLinalgDialect
+    MLIRMemRefDialect
+    MLIRParser
+    MLIRSCFDialect
+    MLIRSupport
+    MLIRTensorDialect
+)
+
+target_compile_options(LythonRuntimeMlirBytecode PRIVATE -frtti)
+
+set(LYTHON_RUNTIME_OBJECT_BYTECODE_DIR "${CMAKE_CURRENT_BINARY_DIR}/runtime_objects")
+file(GLOB LYTHON_RUNTIME_OBJECT_MLIR CONFIGURE_DEPENDS
+    "${CMAKE_SOURCE_DIR}/src/lython/runtime/objects/*.mlir"
+)
+
+set(LYTHON_RUNTIME_OBJECT_BYTECODE)
+foreach(runtime_object_mlir IN LISTS LYTHON_RUNTIME_OBJECT_MLIR)
+    get_filename_component(runtime_object_name "${runtime_object_mlir}" NAME_WE)
+    set(runtime_object_bc "${LYTHON_RUNTIME_OBJECT_BYTECODE_DIR}/${runtime_object_name}.mlirbc")
+    add_custom_command(
+        OUTPUT "${runtime_object_bc}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${LYTHON_RUNTIME_OBJECT_BYTECODE_DIR}"
+        COMMAND $<TARGET_FILE:LythonRuntimeMlirBytecode> "${runtime_object_mlir}" -o "${runtime_object_bc}"
+        DEPENDS LythonRuntimeMlirBytecode "${runtime_object_mlir}"
+        COMMENT "Generating runtime MLIR bytecode ${runtime_object_name}.mlirbc"
+        VERBATIM
+    )
+    list(APPEND LYTHON_RUNTIME_OBJECT_BYTECODE "${runtime_object_bc}")
+endforeach()
+
+add_custom_target(LythonRuntimeObjectBytecode
+    DEPENDS ${LYTHON_RUNTIME_OBJECT_BYTECODE}
+)
+add_dependencies(LythonRuntimeLowering LythonRuntimeObjectBytecode)
+
 target_include_directories(LythonRuntimeLowering
     PUBLIC
     ${CMAKE_SOURCE_DIR}/src/lython/dialects/cpp
     ${CMAKE_BINARY_DIR}/src/lython/dialects
     ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_compile_definitions(LythonRuntimeLowering
+    PRIVATE
+    LYTHON_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    LYTHON_RUNTIME_MLIR_BC_DIR="${LYTHON_RUNTIME_OBJECT_BYTECODE_DIR}"
 )
 
 target_link_libraries(LythonRuntimeLowering
@@ -67,6 +133,9 @@ target_link_libraries(LythonRuntimeLowering
     MLIRLinalgDialect
     MLIRLinalgToStandard
     MLIRMemRefDialect
+    MLIRMemRefTransforms
+    MLIRParser
+    MLIRBytecodeReader
     MLIRSCFDialect
     MLIRSCFToControlFlow
     MLIRSupport

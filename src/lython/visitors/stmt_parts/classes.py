@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 from typing import TYPE_CHECKING
 
+from ...frontend.program import compute_c3_mro
 from ...frontend.symbols import MethodInfo
 from ...mlir import ir
 from ...mlir.dialects import _lython_ops_gen as py_ops
@@ -17,16 +18,17 @@ class StmtClassMixin(VisitorRuntime):
     """Statement lowering for class and method definitions."""
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        if node.bases:
-            raise NotImplementedError("Class inheritance not yet supported")
         if node.decorator_list:
             raise NotImplementedError("Class decorators not yet supported")
 
         class_name = node.name
+        base_names = self._class_base_names(node)
         loc = self._loc(node)
 
         with loc, ir.InsertionPoint(self.module.body):
-            class_op = py_ops.ClassOp(class_name)
+            class_op = py_ops.ClassOp(
+                class_name, base_names=list(base_names) if base_names else None
+            )
 
         class_body_block = class_op.body.blocks.append()
         class_type = self.get_py_type(f'!py.class<"{class_name}">')
@@ -41,11 +43,12 @@ class StmtClassMixin(VisitorRuntime):
         self._current_class_definition_block = prev_block
 
         prev_pending_attrs = self._pending_attributes
-        pending_attributes: dict[str, ir.Type] = {}
+        pending_attributes = self._inherited_class_attributes(class_name)
         self._pending_attributes = pending_attributes
 
         methods: dict[str, MethodInfo] = {}
         method_defs = [stmt for stmt in node.body if isinstance(stmt, ast.FunctionDef)]
+        own_method_names = {stmt.name for stmt in method_defs}
         ordered_methods = [stmt for stmt in method_defs if stmt.name == "__init__"] + [
             stmt for stmt in method_defs if stmt.name != "__init__"
         ]
@@ -54,6 +57,9 @@ class StmtClassMixin(VisitorRuntime):
             method_info = self._visit_method_def(stmt, class_name, class_type)
             if method_info is not None:
                 methods[stmt.name] = method_info
+        self._emit_inherited_method_specializations(
+            class_name, class_type, own_method_names, methods
+        )
 
         for stmt in node.body:
             if isinstance(stmt, (ast.FunctionDef, ast.Pass)):
@@ -79,7 +85,65 @@ class StmtClassMixin(VisitorRuntime):
         self.pop_scope()
         self._set_insertion_block(prev_block)
 
-        self.register_class(class_name, class_type, methods, attributes)
+        self.register_class(class_name, class_type, base_names, methods, attributes)
+
+    def _class_base_names(self, node: ast.ClassDef) -> tuple[str, ...]:
+        base_names: list[str] = []
+        for base in node.bases:
+            if not isinstance(base, ast.Name):
+                raise NotImplementedError(
+                    "Class inheritance supports statically named bases only"
+                )
+            base_names.append(base.id)
+        return tuple(base_names)
+
+    def _class_mro(self, class_name: str) -> tuple[str, ...]:
+        typed_program = self._typed_program
+        if typed_program is None:
+            raise RuntimeError("typed frontend analysis must run before class emission")
+        return compute_c3_mro(typed_program.classes, class_name)
+
+    def _inherited_class_attributes(self, class_name: str) -> dict[str, ir.Type]:
+        typed_program = self._typed_program
+        if typed_program is None:
+            raise RuntimeError("typed frontend analysis must run before class emission")
+        attributes: dict[str, ir.Type] = {}
+        for ancestor_name in reversed(self._class_mro(class_name)[1:]):
+            ancestor = typed_program.classes[ancestor_name]
+            for name, term in ancestor.fields.items():
+                attr_type = self._type_resolver.term_to_ir_type(term)
+                existing = attributes.get(name)
+                if existing is not None and existing != attr_type:
+                    raise TypeError(
+                        f"Inherited field '{name}' in class '{class_name}' "
+                        f"has incompatible static types: {existing} vs {attr_type}"
+                    )
+                attributes[name] = attr_type
+        return attributes
+
+    def _emit_inherited_method_specializations(
+        self,
+        class_name: str,
+        class_type: ir.Type,
+        own_method_names: set[str],
+        methods: dict[str, MethodInfo],
+    ) -> None:
+        for ancestor_name in self._class_mro(class_name)[1:]:
+            ancestor_ast = self._class_ast_defs.get(ancestor_name)
+            if ancestor_ast is None:
+                continue
+            method_defs = [
+                stmt for stmt in ancestor_ast.body if isinstance(stmt, ast.FunctionDef)
+            ]
+            ordered_methods = [
+                stmt for stmt in method_defs if stmt.name == "__init__"
+            ] + [stmt for stmt in method_defs if stmt.name != "__init__"]
+            for method_ast in ordered_methods:
+                if method_ast.name in own_method_names or method_ast.name in methods:
+                    continue
+                method_info = self._visit_method_def(method_ast, class_name, class_type)
+                if method_info is not None:
+                    methods[method_ast.name] = method_info
 
     def _visit_method_def(
         self, node: ast.FunctionDef, class_name: str, class_type: ir.Type

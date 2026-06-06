@@ -1,6 +1,39 @@
 #include "Optimizer/Utils.h"
 
+#include "Passes/OwnershipAnalysis.h"
+
 namespace py::optimizer {
+
+namespace {
+
+mlir::Value tupleDropValue(mlir::Value element) { return element; }
+
+bool isPureConstantRoot(mlir::Operation *op) {
+  return mlir::isa_and_nonnull<NoneOp, FuncObjectOp, TupleEmptyOp,
+                               StrConstantOp, IntConstantOp, FloatConstantOp>(
+      op);
+}
+
+bool usedOnlyByDeadTupleElement(mlir::Value root, mlir::Value element,
+                                TupleCreateOp tupleCreate) {
+  if (!root || !element || !tupleCreate)
+    return false;
+
+  mlir::Operation *elementProducer = element.getDefiningOp();
+  for (mlir::Operation *user : element.getUsers())
+    if (user != tupleCreate.getOperation() && !mlir::isa<DecRefOp>(user))
+      return false;
+
+  for (mlir::Operation *user : root.getUsers()) {
+    if (user == tupleCreate.getOperation() || user == elementProducer ||
+        mlir::isa<DecRefOp>(user))
+      continue;
+    return false;
+  }
+  return true;
+}
+
+} // namespace
 
 /// Clean up dead tuple operations whose only users are DecRefOps.
 /// When removing a TupleCreateOp, we must add DecRefs for its elements
@@ -57,48 +90,50 @@ bool container::cleanupDead(mlir::ModuleOp module) {
     llvm::SmallVector<mlir::Value> elements(tupleCreate.getElements());
     llvm::SmallDenseSet<mlir::Value, 8> elementSet(elements.begin(),
                                                    elements.end());
+    llvm::SmallDenseSet<mlir::Value, 8> retainedElements;
 
     for (mlir::Operation *prev = tupleCreate->getPrevNode(); prev;
          prev = prev->getPrevNode()) {
       auto incref = mlir::dyn_cast<IncRefOp>(prev);
       if (!incref)
         break;
-      if (elementSet.contains(incref.getObject()))
+      if (elementSet.contains(incref.getObject())) {
         toErase.push_back(incref);
+        retainedElements.insert(incref.getObject());
+      }
     }
 
     if (!decrefs.empty() && !elements.empty()) {
       mlir::OpBuilder builder(decrefs.front());
       for (mlir::Value element : elements) {
-        mlir::Value root = value::stripCasts(element);
+        mlir::Value dropValue = element;
+        if (!consumesPyOwnedOperand(tupleCreate.getOperation(), element))
+          continue;
+        if (retainedElements.contains(element) ||
+            retainedElements.contains(dropValue) ||
+            retainedElements.contains(tupleDropValue(element)))
+          continue;
+        if (mlir::isa<ClassType>(dropValue.getType()) &&
+            class_state::local(dropValue))
+          continue;
+        mlir::Value root = value::stripCasts(dropValue);
         if (mlir::Operation *defOp = root.getDefiningOp())
-          if (mlir::isa<NoneOp, FuncObjectOp, TupleEmptyOp>(defOp))
+          if (isPureConstantRoot(defOp) &&
+              usedOnlyByDeadTupleElement(root, element, tupleCreate))
             continue;
 
-        bool hasOtherUsers = false;
-        for (mlir::Operation *user : element.getUsers()) {
-          if (user == tupleCreate.getOperation())
-            continue;
-          if (mlir::isa<mlir::UnrealizedConversionCastOp>(user))
-            continue;
-          hasOtherUsers = true;
-          break;
+        if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(root)) {
+          auto *owner = arg.getOwner();
+          auto *parent = owner ? owner->getParentOp() : nullptr;
+          if (auto pyFunc = mlir::dyn_cast_or_null<FuncOp>(parent))
+            if (owner == &pyFunc.getBody().front())
+              continue;
+          if (auto loweredFunc =
+                  mlir::dyn_cast_or_null<mlir::func::FuncOp>(parent))
+            if (owner == &loweredFunc.getBody().front())
+              continue;
         }
-
-        if (!hasOtherUsers) {
-          if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(root)) {
-            auto *owner = arg.getOwner();
-            auto *parent = owner ? owner->getParentOp() : nullptr;
-            if (auto pyFunc = mlir::dyn_cast_or_null<FuncOp>(parent))
-              if (owner == &pyFunc.getBody().front())
-                continue;
-            if (auto loweredFunc =
-                    mlir::dyn_cast_or_null<mlir::func::FuncOp>(parent))
-              if (owner == &loweredFunc.getBody().front())
-                continue;
-          }
-          builder.create<DecRefOp>(tupleCreate.getLoc(), element);
-        }
+        builder.create<DecRefOp>(tupleCreate.getLoc(), dropValue);
       }
     }
 
@@ -121,7 +156,7 @@ void container::removeEmptyTuples(mlir::ModuleOp module) {
       toErase.push_back(op);
   });
   for (auto op : toErase)
-    op->erase();
+    op.erase();
 }
 
 void pipeline::containerPre(mlir::ModuleOp module) {

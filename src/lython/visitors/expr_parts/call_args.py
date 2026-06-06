@@ -111,7 +111,7 @@ class ExprCallArgsMixin(VisitorRuntime):
                         ir.StringAttr.get(keyword.arg, self.ctx),
                     ).result
                 )
-                kwvalue_values.append(self.ensure_object(value, loc=loc))
+                kwvalue_values.append(value)
 
         required_positional_count = len(positional_param_types) - defaults_count
         for index, name in enumerate(positional_param_names):

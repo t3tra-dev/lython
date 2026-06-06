@@ -84,9 +84,6 @@ class ExprCallableCloneMixin(VisitorRuntime):
                 item = self._clone_bound_callable_metadata(operands[2], loc)
                 py_ops.DictInsertOp(base, key, item)
                 return base
-            if name == "py.upcast":
-                cloned = self._clone_bound_callable_metadata(operands[0], loc)
-                return py_ops.UpcastOp(value.type, cloned).result
             if name == "py.attr.get":
                 cloned_object = self._clone_bound_callable_metadata(operands[0], loc)
                 return py_ops.AttrGetOp(

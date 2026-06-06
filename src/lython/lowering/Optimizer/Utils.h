@@ -23,8 +23,6 @@ namespace runtime {
 
 struct Call {
   static bool is(mlir::LLVM::CallOp op, llvm::StringRef callee);
-  static mlir::LLVM::CallOp optionalReleaseUser(mlir::Value value);
-  static void eraseWithOptionalRelease(mlir::LLVM::CallOp op);
 };
 
 struct Func {
@@ -32,11 +30,7 @@ struct Func {
                                             mlir::StringRef name,
                                             mlir::Type resultType,
                                             mlir::ValueRange operands);
-};
-
-struct Long {
-  static mlir::Value asI64(mlir::ModuleOp module, mlir::OpBuilder &builder,
-                           mlir::Location loc, mlir::Value boxed);
+  static bool eraseUnusedDecls(mlir::ModuleOp module);
 };
 
 } // namespace runtime
@@ -162,13 +156,10 @@ namespace scalar {
 
 void removeUnusedNone(mlir::ModuleOp module);
 void dropNoneDecrefs(mlir::ModuleOp module);
+void fuseStrConcat3(mlir::ModuleOp module);
+void foldStaticBuiltinPrintRepr(mlir::ModuleOp module);
+void foldIntConstants(mlir::ModuleOp module);
 void hoistInts(mlir::ModuleOp module);
-void dropSmallIntDecrefs(mlir::ModuleOp module);
-void cseSingletons(mlir::ModuleOp module);
-void elideBoolBoxing(mlir::ModuleOp module);
-void elideLongArithRoundTrips(mlir::ModuleOp module);
-void elideLongBoxing(mlir::ModuleOp module);
-void cseSmallInts(mlir::ModuleOp module);
 void cseConstants(mlir::ModuleOp module);
 void dce(mlir::ModuleOp module);
 
@@ -198,7 +189,8 @@ void refcountPost(mlir::ModuleOp module);
 void zeroCostProofPre(mlir::ModuleOp module);
 void zeroCostRewritePre(mlir::ModuleOp module);
 void preLowering(mlir::ModuleOp module);
-void postLowering(mlir::ModuleOp module);
+void postValueLowering(mlir::ModuleOp module);
+void finalLLVMCleanup(mlir::ModuleOp module);
 
 } // namespace pipeline
 

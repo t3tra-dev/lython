@@ -14,6 +14,8 @@ bool pyBridgeCasts(mlir::Operation *container);
 bool pyMultiCasts(mlir::Operation *container);
 bool voidPyReturns(mlir::Operation *container);
 bool memrefDescriptorCasts(mlir::Operation *container);
+bool memrefRuntimeCalls(mlir::Operation *container);
+bool pointerRoundTrips(mlir::Operation *container);
 } // namespace cleanup
 
 } // namespace py::lowering::runtime

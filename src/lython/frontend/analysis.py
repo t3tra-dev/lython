@@ -12,6 +12,7 @@ from .program import (
     SourceTypeOracle,
     TypedProgram,
     bind_typed_program,
+    compute_c3_mro,
 )
 
 
@@ -35,12 +36,14 @@ class TypeAnalyzer(ast.NodeVisitor):
         self.current_function: FunctionSig | None = None
         self.current_return: TypeTerm | None = None
         self.in_async_function = False
+        self._install_builtin_classes()
 
     def analyze(self, module: ast.Module) -> TypedProgram:
         self._scan_declarations(module.body)
         for stmt in module.body:
             if isinstance(stmt, ast.ClassDef):
                 self._collect_class_fields(stmt)
+        self._inherit_class_members()
         self.visit(module)
         self.m.solve()
         finalized = {
@@ -110,7 +113,9 @@ class TypeAnalyzer(ast.NodeVisitor):
 
     def visit_Assign(self, node: ast.Assign) -> None:
         if len(node.targets) != 1:
-            raise InferenceError(f"multiple assignment is unsupported: {self._loc(node)}")
+            raise InferenceError(
+                f"multiple assignment is unsupported: {self._loc(node)}"
+            )
         value_type = self.expr(node.value)
         self._assign(node.targets[0], value_type)
 
@@ -276,9 +281,11 @@ class TypeAnalyzer(ast.NodeVisitor):
         return self.annotations.resolve(node)
 
     def _scan_declarations(self, body: Iterable[ast.stmt]) -> None:
+        self._install_builtin_classes()
         for stmt in body:
             if isinstance(stmt, ast.ClassDef):
-                self.classes.setdefault(stmt.name, ClassSig(stmt.name))
+                base_names = self._class_base_names(stmt)
+                self.classes[stmt.name] = ClassSig(stmt.name, base_names=base_names)
         for stmt in body:
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 self.functions[stmt.name] = self._function_sig(
@@ -374,11 +381,19 @@ class TypeAnalyzer(ast.NodeVisitor):
             tuple(arg_names),
             tuple(kwonly),
             tuple(arg.arg for arg in node.args.kwonlyargs),
+            defaults_count=len(node.args.defaults),
+            kwdefault_names=tuple(
+                arg.arg
+                for arg, default in zip(node.args.kwonlyargs, node.args.kw_defaults)
+                if default is not None
+            ),
             is_async=is_async,
         )
 
     def _call_expr(self, node: ast.Call) -> TypeTerm:
-        if isinstance(node.func, ast.Subscript) and self._is_type_constructor(node.func):
+        if isinstance(node.func, ast.Subscript) and self._is_type_constructor(
+            node.func
+        ):
             result = self.annotation(node.func)
             for arg in node.args:
                 self.expr(arg)
@@ -393,6 +408,10 @@ class TypeAnalyzer(ast.NodeVisitor):
                 return self._record(node, special_attr)
 
         callee = self.expr(node.func)
+        if node.keywords:
+            raise InferenceError(
+                f"keyword calls require a statically known callable: {self._loc(node)}"
+            )
         args = tuple(self.expr(arg) for arg in node.args)
         result = self.m.fresh_var("call")
         self.m.require_call(
@@ -413,7 +432,9 @@ class TypeAnalyzer(ast.NodeVisitor):
             return TypeCon("None")
         if name == "from_prim":
             if len(node.args) != 1:
-                raise InferenceError(f"from_prim expects one argument: {self._loc(node)}")
+                raise InferenceError(
+                    f"from_prim expects one argument: {self._loc(node)}"
+                )
             arg = self.expr(node.args[0])
             if isinstance(arg, TypeCon):
                 if arg.name.startswith("Int"):
@@ -427,11 +448,11 @@ class TypeAnalyzer(ast.NodeVisitor):
             class_sig = self.classes[name]
             init = class_sig.methods.get("__init__")
             if init is not None:
-                self._check_call_args(init.args[1:], node.args, "__init__", node)
+                self._check_signature_call(init, node, "__init__", skip_args=1)
             return class_sig.term()
         if name in self.functions:
             sig = self.functions[name]
-            self._check_call_args(sig.args, node.args, name, node)
+            self._check_signature_call(sig, node, name)
             return TypeCon("coro", (sig.ret,)) if sig.is_async else sig.ret
         return None
 
@@ -444,7 +465,9 @@ class TypeAnalyzer(ast.NodeVisitor):
         ):
             if func.attr == "run":
                 if len(node.args) != 1:
-                    raise InferenceError(f"asyncio.run expects one argument: {self._loc(node)}")
+                    raise InferenceError(
+                        f"asyncio.run expects one argument: {self._loc(node)}"
+                    )
                 awaitable = self.expr(node.args[0])
                 result = self.m.fresh_var("asyncio_run")
                 self.m.require_await(
@@ -487,6 +510,17 @@ class TypeAnalyzer(ast.NodeVisitor):
                 return TypeCon("future", (TypeCon("None"),))
 
         owner = self.expr(func.value)
+        if isinstance(owner, TypeCon) and owner.name == "task":
+            if func.attr != "cancel":
+                raise InferenceError(
+                    f"Unsupported task method '{func.attr}': {self._loc(func)}"
+                )
+            if node.args or node.keywords:
+                raise InferenceError(
+                    f"task.cancel() expects no arguments: {self._loc(node)}"
+                )
+            return TypeCon("bool")
+
         method = self.m.fresh_var(func.attr)
         self.m.require_attribute(
             owner,
@@ -496,6 +530,10 @@ class TypeAnalyzer(ast.NodeVisitor):
             self._loc(func),
         )
         args = tuple(self.expr(arg) for arg in node.args)
+        if node.keywords:
+            raise InferenceError(
+                f"keyword method calls require a statically known method: {self._loc(node)}"
+            )
         result = self.m.fresh_var("method_call")
         self.m.require_call(
             method,
@@ -529,7 +567,9 @@ class TypeAnalyzer(ast.NodeVisitor):
         value_type = self.expr(node.values[0])
         for key, value in zip(node.keys[1:], node.values[1:]):
             if key is None:
-                raise InferenceError(f"dict unpacking is unsupported: {self._loc(node)}")
+                raise InferenceError(
+                    f"dict unpacking is unsupported: {self._loc(node)}"
+                )
             self.m.require_equal(
                 self.expr(key),
                 key_type,
@@ -544,9 +584,7 @@ class TypeAnalyzer(ast.NodeVisitor):
             )
         return self._record(node, TypeCon("dict", (key_type, value_type)))
 
-    def _matmul_type(
-        self, lhs: TypeTerm, rhs: TypeTerm, node: ast.AST
-    ) -> TypeTerm:
+    def _matmul_type(self, lhs: TypeTerm, rhs: TypeTerm, node: ast.AST) -> TypeTerm:
         if (
             isinstance(lhs, TypeCon)
             and isinstance(rhs, TypeCon)
@@ -635,23 +673,80 @@ class TypeAnalyzer(ast.NodeVisitor):
             f"unsupported assignment target {type(target).__name__}: {self._loc(target)}"
         )
 
-    def _check_call_args(
+    def _check_signature_call(
         self,
-        expected: tuple[TypeTerm, ...],
-        args: list[ast.expr],
+        sig: FunctionSig,
+        node: ast.Call,
         callee: str,
-        node: ast.AST,
+        *,
+        skip_args: int = 0,
     ) -> None:
-        if len(expected) != len(args):
+        expected = sig.args[skip_args:]
+        arg_names = sig.arg_names[skip_args:]
+        if len(node.args) > len(expected):
             raise InferenceError(
-                f"{callee} expects {len(expected)} args, got {len(args)}: {self._loc(node)}"
+                f"{callee} expects at most {len(expected)} positional args, "
+                f"got {len(node.args)}: {self._loc(node)}"
             )
-        for expected_type, arg in zip(expected, args):
+        for expected_type, arg in zip(expected, node.args):
             self.m.require_equal(
                 self.expr(arg),
                 expected_type,
                 f"{callee} argument type mismatch",
                 self._loc(arg),
+            )
+        positional_by_name = {name: index for index, name in enumerate(arg_names)}
+        kwonly_by_name = {name: index for index, name in enumerate(sig.kwonly_names)}
+        seen_keywords: set[str] = set()
+        for keyword in node.keywords:
+            if keyword.arg is None:
+                raise InferenceError(
+                    f"{callee} does not support keyword unpacking: {self._loc(keyword)}"
+                )
+            if keyword.arg in seen_keywords:
+                raise InferenceError(
+                    f"{callee} received duplicate keyword '{keyword.arg}': "
+                    f"{self._loc(keyword)}"
+                )
+            seen_keywords.add(keyword.arg)
+            if keyword.arg in positional_by_name:
+                index = positional_by_name[keyword.arg]
+                if index < len(node.args):
+                    raise InferenceError(
+                        f"{callee} argument '{keyword.arg}' was provided both "
+                        f"positionally and by keyword: {self._loc(keyword)}"
+                    )
+                expected_type = expected[index]
+            elif keyword.arg in kwonly_by_name:
+                expected_type = sig.kwonly[kwonly_by_name[keyword.arg]]
+            else:
+                raise InferenceError(
+                    f"{callee} got unexpected keyword '{keyword.arg}': "
+                    f"{self._loc(keyword)}"
+                )
+            self.m.require_equal(
+                self.expr(keyword.value),
+                expected_type,
+                f"{callee} keyword argument '{keyword.arg}' type mismatch",
+                self._loc(keyword.value),
+            )
+
+        min_positional = max(0, len(expected) - sig.defaults_count)
+        for index, name in enumerate(arg_names):
+            if index < len(node.args) or name in seen_keywords:
+                continue
+            if index < min_positional:
+                raise InferenceError(
+                    f"{callee} missing required argument '{name}': {self._loc(node)}"
+                )
+
+        kwdefault_names = set(sig.kwdefault_names)
+        for name in sig.kwonly_names:
+            if name in seen_keywords or name in kwdefault_names:
+                continue
+            raise InferenceError(
+                f"{callee} missing required keyword-only argument '{name}': "
+                f"{self._loc(node)}"
             )
 
     def _push_scope(self) -> None:
@@ -673,9 +768,73 @@ class TypeAnalyzer(ast.NodeVisitor):
             return self.functions[name].callable_type()
         if name in self.classes:
             return self.classes[name].term()
-        if name == "Exception":
-            return TypeCon("class:Exception")
         raise InferenceError(f"unknown symbol '{name}'")
+
+    def _install_builtin_classes(self) -> None:
+        self.classes.setdefault("BaseException", ClassSig("BaseException"))
+        self.classes.setdefault(
+            "Exception", ClassSig("Exception", base_names=("BaseException",))
+        )
+
+    @staticmethod
+    def _builtin_class_bases(name: str) -> tuple[str, ...]:
+        if name == "Exception":
+            return ("BaseException",)
+        return ()
+
+    def _class_base_names(self, node: ast.ClassDef) -> tuple[str, ...]:
+        if not node.bases:
+            return self._builtin_class_bases(node.name)
+        base_names: list[str] = []
+        for base in node.bases:
+            if not isinstance(base, ast.Name):
+                raise InferenceError(
+                    f"class bases must be statically named classes: {self._loc(base)}"
+                )
+            if base.id not in self.classes:
+                raise InferenceError(
+                    f"unknown base class '{base.id}': {self._loc(base)}"
+                )
+            base_names.append(base.id)
+        return tuple(base_names)
+
+    def _inherit_class_members(self) -> None:
+        for class_name, class_sig in list(self.classes.items()):
+            mro = compute_c3_mro(self.classes, class_name)
+            inherited_fields: dict[str, TypeTerm] = {}
+            inherited_methods: dict[str, FunctionSig] = {}
+            for ancestor_name in reversed(mro[1:]):
+                ancestor = self.classes[ancestor_name]
+                self._merge_inherited_fields(
+                    inherited_fields, ancestor.fields, class_name, ancestor_name
+                )
+                inherited_methods.update(ancestor.methods)
+
+            own_fields = dict(class_sig.fields)
+            self._merge_inherited_fields(
+                inherited_fields, own_fields, class_name, class_name
+            )
+            inherited_methods.update(class_sig.methods)
+            class_sig.fields = inherited_fields
+            class_sig.methods = inherited_methods
+
+    def _merge_inherited_fields(
+        self,
+        target: dict[str, TypeTerm],
+        source: dict[str, TypeTerm],
+        class_name: str,
+        source_name: str,
+    ) -> None:
+        for field_name, field_type in source.items():
+            existing = target.get(field_name)
+            if existing is not None:
+                self.m.require_equal(
+                    existing,
+                    field_type,
+                    f"inherited field '{field_name}' in class '{class_name}' "
+                    f"must keep the same static type when merged from '{source_name}'",
+                )
+            target[field_name] = field_type
 
     def _record(self, node: ast.AST, term: TypeTerm) -> TypeTerm:
         self.node_types[id(node)] = term
@@ -700,7 +859,9 @@ class TypeAnalyzer(ast.NodeVisitor):
         return f"{self.filename}:{line}:{int(col) + 1}"
 
 
-def analyze_module_types(module: ast.Module, *, filename: str = "<module>") -> TypedProgram:
+def analyze_module_types(
+    module: ast.Module, *, filename: str = "<module>"
+) -> TypedProgram:
     analyzer = TypeAnalyzer(filename=filename)
     result = analyzer.analyze(module)
     bind_typed_program(module, result)

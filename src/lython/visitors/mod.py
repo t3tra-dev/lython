@@ -54,17 +54,28 @@ class ModVisitor(BaseVisitor):
             module = ir.Module.create()
         self._set_module(module)
         self._set_module_name(module_name)
+        self._class_ast_defs = {
+            stmt.name: stmt for stmt in node.body if isinstance(stmt, ast.ClassDef)
+        }
+        for visitor in self.subvisitors.values():
+            visitor._class_ast_defs = self._class_ast_defs
 
         self.push_scope()
         with ir.InsertionPoint(module.body), ir.Location.unknown(self.ctx):
-            exc_class = py_ops.ClassOp("Exception")
+            base_exc_class = py_ops.ClassOp("BaseException")
+            base_exc_class.body.blocks.append()
+            exc_class = py_ops.ClassOp("Exception", base_names=["BaseException"])
             exc_class.body.blocks.append()
+            base_exc_type = self.get_py_type('!py.class<"BaseException">')
+            exc_type = self.get_py_type('!py.class<"Exception">')
+            self.register_class("BaseException", base_exc_type, (), {}, {})
+            self.register_class("Exception", exc_type, ("BaseException",), {}, {})
 
             builtin_sig = self.get_py_type(
-                "!py.funcsig<[], vararg = !py.tuple<!py.object> -> [!py.none]>"
+                "!py.funcsig<[], vararg = !py.tuple<!py.str> -> [!py.none]>"
             )
             builtin_func_type = self.get_py_type(
-                "!py.func<!py.funcsig<[], vararg = !py.tuple<!py.object> -> [!py.none]>>"
+                "!py.func<!py.funcsig<[], vararg = !py.tuple<!py.str> -> [!py.none]>>"
             )
             builtin = py_ops.FuncOp(
                 "__builtin_print",
@@ -73,7 +84,7 @@ class ModVisitor(BaseVisitor):
                 nothrow=True,
             )
             builtin_block = builtin.body.blocks.append(
-                self.get_py_type("!py.tuple<!py.object>")
+                self.get_py_type("!py.tuple<!py.str>")
             )
             with ir.InsertionPoint(builtin_block), ir.Location.unknown(self.ctx):
                 none_value = py_ops.NoneOp(self.get_py_type("!py.none")).result

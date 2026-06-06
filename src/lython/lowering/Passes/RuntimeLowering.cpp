@@ -15,6 +15,7 @@
 // Optimizations are implemented under Optimizer/.
 
 #include "Common/LoweringUtils.h"
+#include "Common/RuntimeLibrary.h"
 #include "Common/RuntimeSupport.h"
 #include "Passes/OwnershipAnalysis.h"
 #include "Passes/Runtime/Async.h"
@@ -32,15 +33,22 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Async/IR/Async.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/Bufferization/Transforms/OneShotAnalysis.h"
+#include "mlir/Dialect/Bufferization/Transforms/Passes.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Linalg/Passes.h"
+#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/MemRef/Transforms/Transforms.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/Support/Process.h"
@@ -56,13 +64,83 @@
 
 namespace py {
 
-namespace optimizer::call {
-void staticDefaults(mlir::ModuleOp module);
-} // namespace optimizer::call
+namespace optimizer::scalar {
+void foldIntConstants(mlir::ModuleOp module);
+} // namespace optimizer::scalar
 
 namespace {
 
 // RuntimeLoweringPass: Main pipeline orchestration
+
+void copyDiscardableAttrs(mlir::Operation *from, mlir::Operation *to) {
+  if (!from || !to)
+    return;
+  for (const mlir::NamedAttribute &attr : from->getDiscardableAttrs())
+    to->setDiscardableAttr(attr.getName(), attr.getValue());
+}
+
+mlir::Value materializeIndex(mlir::Location loc, mlir::OpFoldResult value,
+                             mlir::PatternRewriter &rewriter) {
+  if (auto dynamic = mlir::dyn_cast<mlir::Value>(value))
+    return dynamic;
+  auto attr = mlir::cast<mlir::IntegerAttr>(mlir::cast<mlir::Attribute>(value));
+  return rewriter.create<mlir::arith::ConstantIndexOp>(loc, attr.getInt());
+}
+
+mlir::Value mulIndex(mlir::Location loc, mlir::Value lhs,
+                     mlir::OpFoldResult rhs, mlir::PatternRewriter &rewriter) {
+  if (auto attr = mlir::dyn_cast<mlir::Attribute>(rhs)) {
+    int64_t value = mlir::cast<mlir::IntegerAttr>(attr).getInt();
+    if (value == 1)
+      return lhs;
+    if (value == 0)
+      return rewriter.create<mlir::arith::ConstantIndexOp>(loc, 0);
+  }
+  return rewriter.create<mlir::arith::MulIOp>(
+      loc, lhs, materializeIndex(loc, rhs, rewriter));
+}
+
+struct AttrPreservingRank1SubviewExpansion
+    : public mlir::OpRewritePattern<mlir::memref::SubViewOp> {
+  using mlir::OpRewritePattern<mlir::memref::SubViewOp>::OpRewritePattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(mlir::memref::SubViewOp subview,
+                  mlir::PatternRewriter &rewriter) const override {
+    auto sourceType =
+        mlir::dyn_cast<mlir::MemRefType>(subview.getSource().getType());
+    auto resultType = mlir::dyn_cast<mlir::MemRefType>(subview.getType());
+    if (!sourceType || !resultType || sourceType.getRank() != 1 ||
+        resultType.getRank() != 1 || subview.getDroppedDims().any())
+      return mlir::failure();
+
+    mlir::Location loc = subview.getLoc();
+    auto metadata = rewriter.create<mlir::memref::ExtractStridedMetadataOp>(
+        loc, subview.getSource());
+    copyDiscardableAttrs(subview.getOperation(), metadata.getOperation());
+
+    mlir::OpFoldResult subOffset = subview.getMixedOffsets().front();
+    mlir::OpFoldResult subSize = subview.getMixedSizes().front();
+    mlir::OpFoldResult subStride = subview.getMixedStrides().front();
+    mlir::Value sourceOffset = metadata.getOffset();
+    mlir::Value sourceStride = metadata.getStrides().front();
+    mlir::Value scaledOffset = mulIndex(loc, sourceStride, subOffset, rewriter);
+    mlir::Value finalOffset =
+        rewriter.create<mlir::arith::AddIOp>(loc, sourceOffset, scaledOffset);
+    mlir::Value finalStride = mulIndex(loc, sourceStride, subStride, rewriter);
+
+    llvm::SmallVector<mlir::OpFoldResult, 1> sizes{subSize};
+    llvm::SmallVector<mlir::OpFoldResult, 1> strides{finalStride};
+    llvm::SmallVector<mlir::NamedAttribute, 4> attrs(
+        subview->getDiscardableAttrs().begin(),
+        subview->getDiscardableAttrs().end());
+    auto cast = rewriter.create<mlir::memref::ReinterpretCastOp>(
+        loc, resultType, metadata.getBaseBuffer(), finalOffset, sizes, strides,
+        attrs);
+    rewriter.replaceOp(subview, cast.getResult());
+    return mlir::success();
+  }
+};
 
 bool containsPyRuntimeType(mlir::Type type) {
   if (isPyType(type))
@@ -83,37 +161,64 @@ bool containsPyRuntimeType(mlir::Type type) {
 
 mlir::LogicalResult verifyPyTypesLowered(mlir::ModuleOp module) {
   mlir::Operation *offender = nullptr;
+  mlir::Type offenderType;
+  bool offenderIsOperand = false;
+  unsigned offenderIndex = 0;
   module.walk([&](mlir::Operation *op) -> mlir::WalkResult {
-    for (mlir::Type type : op->getOperandTypes()) {
+    for (auto [index, type] : llvm::enumerate(op->getOperandTypes())) {
       if (!containsPyRuntimeType(type))
         continue;
       offender = op;
+      offenderType = type;
+      offenderIsOperand = true;
+      offenderIndex = index;
       return mlir::WalkResult::interrupt();
     }
-    for (mlir::Type type : op->getResultTypes()) {
+    for (auto [index, type] : llvm::enumerate(op->getResultTypes())) {
       if (!containsPyRuntimeType(type))
         continue;
       offender = op;
+      offenderType = type;
+      offenderIsOperand = false;
+      offenderIndex = index;
       return mlir::WalkResult::interrupt();
     }
     return mlir::WalkResult::advance();
   });
   if (!offender)
     return mlir::success();
-  return offender->emitError(
-      "Py runtime type survived lowered ABI finalization");
+  auto diagnostic =
+      offender->emitError("Py runtime type survived lowered ABI finalization");
+  diagnostic << " in " << (offenderIsOperand ? "operand" : "result") << " #"
+             << offenderIndex << " of type " << offenderType << " on op '"
+             << offender->getName() << "'";
+  return mlir::failure();
 }
 
-mlir::LogicalResult verifyNoUnrealizedCasts(mlir::ModuleOp module) {
-  mlir::UnrealizedConversionCastOp offender = nullptr;
-  module.walk([&](mlir::UnrealizedConversionCastOp cast) {
-    offender = cast;
-    return mlir::WalkResult::interrupt();
-  });
-  if (!offender)
-    return mlir::success();
-  return offender.emitError(
-      "unrealized conversion cast survived lowering boundary");
+mlir::LogicalResult expandMemRefMetadata(mlir::ModuleOp module) {
+  // LLVM helper bodies can temporarily contain memref ops plus lowered
+  // descriptor casts while the generic conversion is still pending. Expanding
+  // memref metadata there materializes memref.extract_strided_metadata on
+  // LLVM descriptor structs, which is not a valid high-level memref operand.
+  // Keep this pre-expansion scoped to high-level func.func/async.func bodies;
+  // llvm.func bodies are handled by the later memref-to-LLVM conversion.
+  for (mlir::func::FuncOp fn : module.getOps<mlir::func::FuncOp>()) {
+    mlir::RewritePatternSet patterns(module.getContext());
+    patterns.add<AttrPreservingRank1SubviewExpansion>(module.getContext(),
+                                                      mlir::PatternBenefit(2));
+    mlir::memref::populateExpandStridedMetadataPatterns(patterns);
+    if (mlir::failed(mlir::applyPatternsGreedily(fn, std::move(patterns))))
+      return mlir::failure();
+  }
+  for (mlir::async::FuncOp fn : module.getOps<mlir::async::FuncOp>()) {
+    mlir::RewritePatternSet patterns(module.getContext());
+    patterns.add<AttrPreservingRank1SubviewExpansion>(module.getContext(),
+                                                      mlir::PatternBenefit(2));
+    mlir::memref::populateExpandStridedMetadataPatterns(patterns);
+    if (mlir::failed(mlir::applyPatternsGreedily(fn, std::move(patterns))))
+      return mlir::failure();
+  }
+  return mlir::success();
 }
 
 mlir::LogicalResult verifyFrontendTypesFinalized(mlir::ModuleOp module) {
@@ -143,14 +248,160 @@ mlir::LogicalResult verifyFrontendTypesFinalized(mlir::ModuleOp module) {
   return mlir::success();
 }
 
+bool containsTensorType(mlir::Type type) {
+  if (mlir::isa<mlir::TensorType>(type))
+    return true;
+  if (auto functionType = mlir::dyn_cast<mlir::FunctionType>(type)) {
+    return llvm::any_of(functionType.getInputs(), containsTensorType) ||
+           llvm::any_of(functionType.getResults(), containsTensorType);
+  }
+  return false;
+}
+
+bool containsMemRefType(mlir::Type type) {
+  if (mlir::isa<mlir::MemRefType>(type))
+    return true;
+  if (auto functionType = mlir::dyn_cast<mlir::FunctionType>(type)) {
+    return llvm::any_of(functionType.getInputs(), containsMemRefType) ||
+           llvm::any_of(functionType.getResults(), containsMemRefType);
+  }
+  if (auto asyncValue = mlir::dyn_cast<mlir::async::ValueType>(type))
+    return containsMemRefType(asyncValue.getValueType());
+  return false;
+}
+
+bool opHasMemRefType(mlir::Operation *op) {
+  return llvm::any_of(op->getOperandTypes(), containsMemRefType) ||
+         llvm::any_of(op->getResultTypes(), containsMemRefType);
+}
+
+bool opHasTensorOrLinalgWork(mlir::Operation *op) {
+  if (mlir::isa<mlir::linalg::LinalgOp>(op))
+    return true;
+  return llvm::any_of(op->getOperandTypes(), containsTensorType) ||
+         llvm::any_of(op->getResultTypes(), containsTensorType);
+}
+
+bool functionHasTensorOrLinalgWork(mlir::FunctionOpInterface function) {
+  if (llvm::any_of(function.getArgumentTypes(), containsTensorType) ||
+      llvm::any_of(function.getResultTypes(), containsTensorType))
+    return true;
+
+  bool found = false;
+  function->walk([&](mlir::Operation *op) -> mlir::WalkResult {
+    if (op == function.getOperation())
+      return mlir::WalkResult::advance();
+    if (opHasTensorOrLinalgWork(op)) {
+      found = true;
+      return mlir::WalkResult::interrupt();
+    }
+    return mlir::WalkResult::advance();
+  });
+  return found;
+}
+
+llvm::SmallVector<mlir::Operation *, 4>
+collectTensorWorkFunctions(mlir::ModuleOp module) {
+  llvm::SmallVector<mlir::Operation *, 4> functions;
+  module.walk([&](mlir::Operation *op) {
+    if (auto function = mlir::dyn_cast<mlir::FunctionOpInterface>(op)) {
+      if (functionHasTensorOrLinalgWork(function))
+        functions.push_back(op);
+    }
+  });
+  return functions;
+}
+
+bool isInTensorWorkFunction(
+    mlir::Operation *op,
+    llvm::ArrayRef<mlir::Operation *> tensorWorkFunctions) {
+  auto contains = [&](mlir::Operation *candidate) {
+    for (mlir::Operation *function : tensorWorkFunctions)
+      if (function == candidate)
+        return true;
+    return false;
+  };
+
+  if (mlir::isa<mlir::ModuleOp>(op))
+    return true;
+  if (auto function = mlir::dyn_cast<mlir::FunctionOpInterface>(op))
+    return contains(function.getOperation());
+  if (auto parent = op->getParentOfType<mlir::func::FuncOp>())
+    return contains(parent.getOperation());
+  return false;
+}
+
+mlir::LogicalResult lowerTensorProgramLevelOps(mlir::ModuleOp module,
+                                               mlir::MLIRContext *ctx) {
+  llvm::SmallVector<mlir::Operation *, 4> tensorWorkFunctions =
+      collectTensorWorkFunctions(module);
+  if (tensorWorkFunctions.empty())
+    return mlir::success();
+
+  mlir::RewritePatternSet elementwisePatterns(ctx);
+  mlir::linalg::populateElementwiseToLinalgConversionPatterns(
+      elementwisePatterns);
+  if (mlir::failed(
+          applyPatternsGreedily(module, std::move(elementwisePatterns))))
+    return mlir::failure();
+
+  mlir::PassManager pm(ctx);
+  mlir::bufferization::OneShotBufferizationOptions options;
+  options.allowUnknownOps = true;
+  options.bufferizeFunctionBoundaries = true;
+  options.setFunctionBoundaryTypeConversion(
+      mlir::bufferization::LayoutMapOption::IdentityLayoutMap);
+  options.opFilter.allowOperation([tensorWorkFunctions](mlir::Operation *op) {
+    return isInTensorWorkFunction(op, tensorWorkFunctions);
+  });
+  pm.addPass(mlir::bufferization::createOneShotBufferizePass(options));
+  pm.addPass(mlir::createConvertLinalgToLoopsPass());
+  return pm.run(module);
+}
+
+void populateGenericLLVMConversion(PyLLVMTypeConverter &typeConverter,
+                                   mlir::RewritePatternSet &patterns) {
+  lowering::async_runtime::Patterns::populate(typeConverter, patterns);
+  populateSCFToControlFlowConversionPatterns(patterns);
+  mlir::cf::populateControlFlowToLLVMConversionPatterns(typeConverter,
+                                                        patterns);
+  mlir::arith::populateArithToLLVMConversionPatterns(typeConverter, patterns);
+  lowering::runtime::memref_to_llvm::Patterns::populate(typeConverter,
+                                                        patterns);
+  populateFinalizeMemRefToLLVMConversionPatterns(typeConverter, patterns);
+  populateFuncToLLVMConversionPatterns(typeConverter, patterns);
+}
+
+void configureGenericLLVMTarget(mlir::ConversionTarget &target) {
+  target.addLegalDialect<mlir::LLVM::LLVMDialect>();
+  target.addLegalDialect<mlir::async::AsyncDialect>();
+  target.addIllegalDialect<mlir::bufferization::BufferizationDialect>();
+  target.addIllegalDialect<mlir::linalg::LinalgDialect>();
+  target.addIllegalDialect<mlir::tensor::TensorDialect>();
+  target.addIllegalDialect<mlir::func::FuncDialect>();
+  target.addIllegalDialect<mlir::cf::ControlFlowDialect>();
+  target.addIllegalDialect<mlir::scf::SCFDialect>();
+  target.addIllegalDialect<mlir::memref::MemRefDialect>();
+  target.addIllegalDialect<mlir::arith::ArithDialect>();
+  target.addDynamicallyLegalOp<mlir::async::FuncOp>([](mlir::async::FuncOp op) {
+    return !containsMemRefType(op.getFunctionType());
+  });
+  target.addDynamicallyLegalOp<mlir::async::CallOp>(
+      [](mlir::async::CallOp op) { return !opHasMemRefType(op); });
+  target.addDynamicallyLegalOp<mlir::async::ReturnOp>(
+      [](mlir::async::ReturnOp op) { return !opHasMemRefType(op); });
+  target.addLegalOp<mlir::ModuleOp>();
+  target.addLegalOp<mlir::cf::AssertOp>();
+}
+
 struct RuntimeLoweringPass
     : public mlir::PassWrapper<RuntimeLoweringPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RuntimeLoweringPass)
 
   void getDependentDialects(mlir::DialectRegistry &registry) const override {
-    registry.insert<mlir::LLVM::LLVMDialect, mlir::async::AsyncDialect,
-                    mlir::arith::ArithDialect,
+    registry.insert<PyDialect, mlir::LLVM::LLVMDialect,
+                    mlir::async::AsyncDialect, mlir::arith::ArithDialect,
                     mlir::bufferization::BufferizationDialect,
                     mlir::func::FuncDialect, mlir::cf::ControlFlowDialect,
                     mlir::linalg::LinalgDialect, mlir::memref::MemRefDialect,
@@ -160,12 +411,13 @@ struct RuntimeLoweringPass
   void runOnOperation() override {
     mlir::ModuleOp module = getOperation();
     mlir::MLIRContext *ctx = module.getContext();
-    ctx->loadDialect<mlir::async::AsyncDialect, mlir::arith::ArithDialect,
+    ctx->loadDialect<PyDialect, mlir::async::AsyncDialect,
+                     mlir::arith::ArithDialect,
                      mlir::bufferization::BufferizationDialect,
                      mlir::cf::ControlFlowDialect, mlir::func::FuncDialect,
                      mlir::linalg::LinalgDialect, mlir::memref::MemRefDialect,
                      mlir::scf::SCFDialect, mlir::tensor::TensorDialect>();
-    PyLLVMTypeConverter typeConverter(ctx);
+    PyLLVMTypeConverter typeConverter(ctx, module);
     bool dumpLowering = static_cast<bool>(
         llvm::sys::Process::GetEnv("LYTHON_DUMP_LOWERING_IR"));
     bool dumpInternalLowering = static_cast<bool>(
@@ -180,20 +432,21 @@ struct RuntimeLoweringPass
       return;
     }
 
-    optimizer::call::staticDefaults(module);
-
-    // Phase 1: Function conversion (py.func/py.return -> func.func/func.return)
+    // Phase 1a: Function definition conversion (py.func -> func.func).
+    // Keep py.return conversion separate; moving a py.func body and replacing
+    // nested returns in the same delayed conversion can invalidate commit
+    // ordering for multi-result lowered values.
 
     auto runFuncConversion = [&]() -> mlir::LogicalResult {
       return lowering::runtime::conversion::runPartial(
           module, ctx,
           [&](mlir::RewritePatternSet &patterns) {
-            lowering::runtime::conversion::function::Patterns::populate(
-                typeConverter, patterns);
+            lowering::runtime::conversion::function::definition::Patterns::
+                populate(typeConverter, patterns);
           },
           [&](mlir::ConversionTarget &target) {
             lowering::runtime::conversion::configurePyTarget(target);
-            target.addIllegalOp<FuncOp, ReturnOp>();
+            target.addIllegalOp<FuncOp>();
           },
           materializationFilter);
     };
@@ -202,9 +455,29 @@ struct RuntimeLoweringPass
       signalPassFailure();
       return;
     }
+
+    // Phase 1b: Function return conversion (py.return -> func.return).
+    auto runReturnConversion = [&]() -> mlir::LogicalResult {
+      return lowering::runtime::conversion::runPartial(
+          module, ctx,
+          [&](mlir::RewritePatternSet &patterns) {
+            lowering::runtime::conversion::function::returns::Patterns::
+                populate(typeConverter, patterns);
+          },
+          [&](mlir::ConversionTarget &target) {
+            lowering::runtime::conversion::configurePyTarget(target);
+            target.addIllegalOp<ReturnOp>();
+          },
+          materializationFilter);
+    };
+
+    if (mlir::failed(runReturnConversion())) {
+      signalPassFailure();
+      return;
+    }
+
     while (lowering::runtime::cleanup::voidPyReturns(module))
       ;
-    lowering::runtime::helpers::retainBorrowedEntryBlockReturns(module);
     lowering::runtime::helpers::synthesizeLocalSelf(module);
     lowering::runtime::helpers::synthesizePublishedBorrow(module);
 
@@ -213,16 +486,14 @@ struct RuntimeLoweringPass
       module.dump();
     }
 
-    optimizer::call::staticDefaults(module);
-
     // Phase 2: Function object conversion (py.func_object -> references)
 
     auto runFuncObjectConversion = [&]() -> mlir::LogicalResult {
       return lowering::runtime::conversion::runPartial(
           module, ctx,
           [&](mlir::RewritePatternSet &patterns) {
-            lowering::runtime::conversion::function::Patterns::populate(
-                typeConverter, patterns);
+            lowering::runtime::conversion::function::objects::Patterns::
+                populate(typeConverter, patterns);
           },
           [&](mlir::ConversionTarget &target) {
             lowering::runtime::conversion::configurePyTarget(target);
@@ -239,6 +510,8 @@ struct RuntimeLoweringPass
       llvm::errs() << "[After func object conversion]\n";
       module.dump();
     }
+
+    optimizer::scalar::foldIntConstants(module);
 
     // Phase 3: Call conversion (py.call_vector/py.call -> calls)
 
@@ -311,6 +584,15 @@ struct RuntimeLoweringPass
       module.dump();
     }
 
+    // Runtime MLIR signatures are part of the ABI contract. Import them before
+    // value conversion so RuntimeAPI can adapt operands by signature instead of
+    // classifying callees by name. A second call after value conversion
+    // materializes contracts on newly emitted calls.
+    if (mlir::failed(runtime_library::embedObjectModules(module))) {
+      signalPassFailure();
+      return;
+    }
+
     // Phase 5: mlir::Value conversion (py.* ops -> LLVM ops)
 
     auto runValueConversion = [&]() -> mlir::LogicalResult {
@@ -336,35 +618,37 @@ struct RuntimeLoweringPass
       return;
     }
 
-    // Apply post-lowering optimizations
-    optimizer::pipeline::postLowering(module);
+    // Apply Python-value cleanup at the boundary where object-level scalar
+    // concepts have just been lowered to runtime/LLVM calls.
+    optimizer::pipeline::postValueLowering(module);
+    if (mlir::failed(runtime_library::embedObjectModules(module))) {
+      signalPassFailure();
+      return;
+    }
 
-    // Normalize invoke unwind block arguments to LLVM pointer types.
-    {
-      auto pyObject = mlir::LLVM::LLVMPointerType::get(ctx);
-      module.walk([&](mlir::LLVM::InvokeOp invoke) {
-        mlir::Block *unwind = invoke.getUnwindDest();
-        if (!unwind)
-          return;
-        for (mlir::BlockArgument arg :
-             llvm::make_early_inc_range(unwind->getArguments())) {
-          if (!isPyType(arg.getType()))
-            continue;
-          arg.setType(pyObject);
-          for (auto &use : llvm::make_early_inc_range(arg.getUses())) {
-            auto *owner = use.getOwner();
-            auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(owner);
-            if (!cast)
+    // A Python-typed unwind payload reaching LLVM invoke lowering is an ABI
+    // leak. Do not hide it behind llvm.ptr; the exception lowering must choose
+    // the descriptor shape before this boundary.
+    bool hasUnloweredUnwindPyArg = false;
+    module.walk(
+        [&](mlir::LLVM::InvokeOp invoke) {
+          mlir::Block *unwind = invoke.getUnwindDest();
+          if (!unwind)
+            return;
+          for (mlir::BlockArgument arg : unwind->getArguments()) {
+            if (!isPyType(arg.getType()))
               continue;
-            if (cast->getNumOperands() != 1 || cast->getNumResults() != 1)
-              continue;
-            if (cast.getResult(0).getType() != pyObject)
-              continue;
-            cast.getResult(0).replaceAllUsesWith(arg);
-            cast.erase();
+            invoke.emitError()
+                << "unwind block argument kept high-level Python type "
+                << arg.getType()
+                << " after value conversion; lower it to the exception "
+                   "descriptor ABI before LLVM invoke lowering";
+            hasUnloweredUnwindPyArg = true;
           }
-        }
-      });
+        });
+    if (hasUnloweredUnwindPyArg) {
+      signalPassFailure();
+      return;
     }
 
     // Some passes may drop llvm.personality; restore it for landingpads.
@@ -395,6 +679,26 @@ struct RuntimeLoweringPass
       return;
     }
 
+    // Bufferize tensor/linalg values before generic LLVM conversion. Leaving
+    // tensor ops legal during arith-to-LLVM forces index casts back from i64,
+    // which hides an ABI mismatch until the final cleanup verifier.
+    if (mlir::failed(lowerTensorProgramLevelOps(module, ctx))) {
+      signalPassFailure();
+      return;
+    }
+    if (dumpInternalLowering) {
+      llvm::errs() << "[After tensor bufferization]\n";
+      module.dump();
+    }
+
+    // Header/payload object ABI uses memref.subview to expose the common
+    // header. Expand it before memref-to-LLVM, where SubViewOp is intentionally
+    // illegal.
+    if (mlir::failed(expandMemRefMetadata(module))) {
+      signalPassFailure();
+      return;
+    }
+
     // Phase 6: Convert func.func to llvm.func before final EH materialization.
     {
       if (dumpInternalLowering) {
@@ -405,28 +709,9 @@ struct RuntimeLoweringPass
       collectLoweredSafetyContracts(module, typeConverter, safetyContracts);
 
       mlir::RewritePatternSet patterns(ctx);
-      populateSCFToControlFlowConversionPatterns(patterns);
-      mlir::cf::populateControlFlowToLLVMConversionPatterns(typeConverter,
-                                                            patterns);
-      mlir::arith::populateArithToLLVMConversionPatterns(typeConverter,
-                                                         patterns);
-      lowering::runtime::memref_to_llvm::Patterns::populate(typeConverter,
-                                                            patterns);
-      populateFinalizeMemRefToLLVMConversionPatterns(typeConverter, patterns);
-      populateFuncToLLVMConversionPatterns(typeConverter, patterns);
+      populateGenericLLVMConversion(typeConverter, patterns);
       mlir::ConversionTarget target(*ctx);
-      target.addLegalDialect<mlir::LLVM::LLVMDialect>();
-      target.addLegalDialect<mlir::async::AsyncDialect>();
-      target.addLegalDialect<mlir::bufferization::BufferizationDialect>();
-      target.addLegalDialect<mlir::linalg::LinalgDialect>();
-      target.addLegalDialect<mlir::tensor::TensorDialect>();
-      target.addIllegalDialect<mlir::func::FuncDialect>();
-      target.addIllegalDialect<mlir::cf::ControlFlowDialect>();
-      target.addIllegalDialect<mlir::scf::SCFDialect>();
-      target.addIllegalDialect<mlir::memref::MemRefDialect>();
-      target.addIllegalDialect<mlir::arith::ArithDialect>();
-      target.addLegalOp<mlir::ModuleOp>();
-      target.addLegalOp<mlir::cf::AssertOp>();
+      configureGenericLLVMTarget(target);
       if (mlir::failed(
               applyPartialConversion(module, target, std::move(patterns)))) {
         signalPassFailure();
@@ -447,7 +732,14 @@ struct RuntimeLoweringPass
       ;
     while (lowering::runtime::cleanup::memrefDescriptorCasts(module))
       ;
-    if (mlir::failed(verifyNoUnrealizedCasts(module))) {
+    while (lowering::runtime::cleanup::memrefRuntimeCalls(module))
+      ;
+    while (lowering::runtime::cleanup::memrefDescriptorCasts(module))
+      ;
+    while (lowering::runtime::cleanup::pointerRoundTrips(module))
+      ;
+    if (mlir::failed(lowering::verifyNoUnrealizedCasts(
+            module, "runtime lowering boundary"))) {
       signalPassFailure();
       return;
     }

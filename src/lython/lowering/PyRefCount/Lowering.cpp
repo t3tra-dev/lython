@@ -1,5 +1,7 @@
+#include "Common/ClassLayout.h"
 #include "Common/Container.h"
 #include "Common/LoweringUtils.h"
+#include "Common/Object.h"
 #include "Common/RuntimeSupport.h"
 #include "Common/SlotUtils.h"
 #include "Passes/OwnershipAnalysis.h"
@@ -26,34 +28,94 @@ mlir::LogicalResult dec(mlir::Location loc, mlir::Type logicalType,
                         mlir::ConversionPatternRewriter &rewriter,
                         const PyLLVMTypeConverter &typeConverter);
 } // namespace lowering::refcount::Value
-
 namespace lowering::refcount::Class {
 
-mlir::LogicalResult emit(mlir::Operation *op, mlir::Value object,
-                         ClassType classType, mlir::ModuleOp module,
-                         mlir::ConversionPatternRewriter &rewriter,
-                         llvm::StringRef suffix,
-                         llvm::StringRef retainPremise = {},
-                         bool verifiedOwnedToken = false) {
-  auto ptrType = mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
-  auto helper = getOrInsertLLVMFunc(
-      op->getLoc(), module, rewriter, getClassHelperName(classType, suffix),
-      mlir::LLVM::LLVMVoidType::get(rewriter.getContext()), {ptrType});
-  ownership::llvm_func::Contract::apply(helper, helper.getName());
-  auto helperRef =
-      mlir::SymbolRefAttr::get(module.getContext(), helper.getName());
-  auto call = rewriter.create<mlir::LLVM::CallOp>(
-      op->getLoc(), mlir::TypeRange{}, helperRef, mlir::ValueRange{object});
-  if (suffix == "incref") {
-    threadsafe::Retain::premise(call.getOperation(), retainPremise);
-    if (retainPremise == ThreadSafetyAttrs::kPremiseOwnedToken &&
-        verifiedOwnedToken)
-      threadsafe::Retain::verifyOwnedToken(call.getOperation());
+mlir::LogicalResult
+emit(mlir::Operation *op, mlir::ValueRange values, ClassType classType,
+     mlir::ModuleOp module, mlir::ConversionPatternRewriter &rewriter,
+     const PyLLVMTypeConverter &typeConverter, llvm::StringRef suffix,
+     llvm::StringRef retainPremise = {}, bool verifiedOwnedToken = false) {
+  auto layout = class_layout::get(op, classType, typeConverter);
+  if (mlir::failed(layout))
+    return mlir::failure();
+  llvm::SmallVector<mlir::Type, 2> helperInputTypes;
+  class_layout::partsValueTypes(*layout, helperInputTypes);
+  std::string helperName = getClassHelperName(classType, suffix);
+  auto helper = module.lookupSymbol<mlir::func::FuncOp>(helperName);
+  if (!helper) {
+    mlir::OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(module.getBody());
+    helper = rewriter.create<mlir::func::FuncOp>(
+        op->getLoc(), helperName,
+        mlir::FunctionType::get(rewriter.getContext(), helperInputTypes, {}));
+    helper.setVisibility(mlir::SymbolTable::Visibility::Private);
   }
-  if (suffix == "destroy_local")
-    call->setAttr(OwnershipContractAttrs::kLocalDestroy,
-                  rewriter.getUnitAttr());
-  return mlir::success();
+  if (suffix == "incref")
+    ownership::effect::retain(helper.getOperation(), {0, 1});
+  else if (suffix == "decref")
+    ownership::effect::release(helper.getOperation(), {0, 1});
+
+  auto applyCallContracts = [&](mlir::func::CallOp call) {
+    if (!call)
+      return;
+    if (suffix == "incref") {
+      threadsafe::Retain::premise(call.getOperation(), retainPremise);
+      if (retainPremise == ThreadSafetyAttrs::kPremiseOwnedToken &&
+          verifiedOwnedToken)
+        threadsafe::Retain::verifyOwnedToken(call.getOperation());
+    }
+    if (suffix == "decref") {
+      mlir::Attribute attr =
+          op->getAttr(OwnershipContractAttrs::kAggregateRelease);
+      call->setAttr(OwnershipContractAttrs::kAggregateRelease,
+                    attr ? attr : rewriter.getUnitAttr());
+    }
+    if (suffix == "destroy_local")
+      call->setAttr(OwnershipContractAttrs::kLocalDestroy,
+                    rewriter.getUnitAttr());
+  };
+
+  if (values.size() == helperInputTypes.size()) {
+    llvm::SmallVector<mlir::Value, 4> args;
+    for (auto [value, expected] : llvm::zip(values, helperInputTypes)) {
+      if (value.getType() == expected) {
+        args.push_back(value);
+        continue;
+      }
+      auto valueMemRef = mlir::dyn_cast<mlir::MemRefType>(value.getType());
+      auto expectedMemRef = mlir::dyn_cast<mlir::MemRefType>(expected);
+      if (!valueMemRef || !expectedMemRef)
+        return mlir::failure();
+      args.push_back(rewriter.create<mlir::memref::CastOp>(
+          op->getLoc(), expectedMemRef, value));
+    }
+    auto call = rewriter.create<mlir::func::CallOp>(op->getLoc(), helper, args);
+    applyCallContracts(call);
+    return mlir::success();
+  }
+
+  if (values.size() == 1) {
+    auto objectStruct = class_layout::objectCarrierType(layout->objectType);
+    if (!objectStruct)
+      return mlir::failure();
+    mlir::Value carrier = values.front();
+    if (carrier.getType() != layout->objectType) {
+      if (suffix == "destroy_local")
+        return mlir::failure();
+      carrier = Slot::classCarrierFromValues(op->getLoc(), values, objectStruct,
+                                             rewriter);
+      if (!carrier)
+        return mlir::failure();
+    }
+    auto call = Slot::classCarrierRefcount(
+        op->getLoc(), carrier, classType, module, rewriter, suffix,
+        /*aggregateEffect=*/false, retainPremise);
+    if (!call)
+      return mlir::failure();
+    applyCallContracts(call);
+    return mlir::success();
+  }
+  return mlir::failure();
 }
 
 } // namespace lowering::refcount::Class
@@ -77,7 +139,9 @@ bool known(mlir::Value value) {
   mlir::Operation *def = value.getDefiningOp();
   if (!def)
     return false;
-  if (mlir::isa<NoneOp, FuncObjectOp, TupleEmptyOp, StrConstantOp,
+  if (def->hasAttr(OwnershipContractAttrs::kImmortalObject))
+    return true;
+  if (mlir::isa<NoneOp, FuncObjectOp, TupleEmptyOp, IntConstantOp,
                 ExceptionNullOp, TracebackNullOp, LocationCurrentOp>(def))
     return true;
   if (auto classNew = mlir::dyn_cast<ClassNewOp>(def))
@@ -85,11 +149,6 @@ bool known(mlir::Value value) {
   if (auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(def))
     if (cast->getNumOperands() == 1)
       return known(cast.getOperand(0));
-  if (auto upcast = mlir::dyn_cast<UpcastOp>(def)) {
-    if (isPyOwnershipMaterializedObjectBridge(def))
-      return false;
-    return known(upcast.getInput());
-  }
   return false;
 }
 
@@ -181,36 +240,33 @@ mlir::LogicalResult dec(mlir::Location loc, mlir::Type logicalType,
   if (borrowedEntryDescriptor(header))
     return mlir::success();
   if (header.getDefiningOp<mlir::memref::AllocaOp>()) {
-    container::Elements::refcount(loc, logicalType, descriptor, module,
-                                  rewriter, typeConverter, "decref");
-    return mlir::success();
+    return container::Elements::refcount(loc, logicalType, descriptor, module,
+                                         rewriter, typeConverter, "decref");
   }
 
   mlir::Value refcount = Atomic::load(loc, header, *refcountSlot, rewriter);
   mlir::Value zero = createI64Constant(loc, rewriter, 0);
   mlir::Value isManaged = rewriter.create<mlir::arith::CmpIOp>(
       loc, mlir::arith::CmpIPredicate::ne, refcount, zero);
-  auto managed = rewriter.create<mlir::scf::IfOp>(loc, isManaged,
-                                                  /*withElseRegion=*/false);
+  rewriter.create<mlir::cf::AssertOp>(
+      loc, isManaged, "managed container decref observed zero refcount");
+  mlir::Value previous = Atomic::add(
+      loc, header, *refcountSlot, -1,
+      ThreadSafetyAttrs::kRoleContainerRefcountRelease, {}, rewriter);
+  mlir::Value one = createI64Constant(loc, rewriter, 1);
+  mlir::Value shouldFree = rewriter.create<mlir::arith::CmpIOp>(
+      loc, mlir::arith::CmpIPredicate::eq, previous, one);
+  auto free = rewriter.create<mlir::scf::IfOp>(loc, shouldFree,
+                                               /*withElseRegion=*/false);
   {
-    mlir::OpBuilder::InsertionGuard guard(rewriter);
-    rewriter.setInsertionPointToStart(managed.thenBlock());
-    mlir::Value previous = Atomic::add(
-        loc, header, *refcountSlot, -1,
-        ThreadSafetyAttrs::kRoleContainerRefcountRelease, {}, rewriter);
-    mlir::Value one = createI64Constant(loc, rewriter, 1);
-    mlir::Value shouldFree = rewriter.create<mlir::arith::CmpIOp>(
-        loc, mlir::arith::CmpIPredicate::eq, previous, one);
-    auto free = rewriter.create<mlir::scf::IfOp>(loc, shouldFree,
-                                                 /*withElseRegion=*/false);
-    {
-      mlir::OpBuilder::InsertionGuard freeGuard(rewriter);
-      rewriter.setInsertionPointToStart(free.thenBlock());
-      container::Elements::refcount(loc, logicalType, descriptor, module,
-                                    rewriter, typeConverter, "decref");
-      for (mlir::Value memref : descriptor)
-        rewriter.create<mlir::memref::DeallocOp>(loc, memref);
-    }
+    mlir::OpBuilder::InsertionGuard freeGuard(rewriter);
+    rewriter.setInsertionPointToStart(free.thenBlock());
+    if (mlir::failed(container::Elements::refcount(loc, logicalType, descriptor,
+                                                   module, rewriter,
+                                                   typeConverter, "decref")))
+      return mlir::failure();
+    for (mlir::Value memref : descriptor)
+      rewriter.create<mlir::memref::DeallocOp>(loc, memref);
   }
   return mlir::success();
 }
@@ -218,6 +274,22 @@ mlir::LogicalResult dec(mlir::Location loc, mlir::Type logicalType,
 } // namespace lowering::refcount::managed_container
 
 namespace lowering::refcount::async_descriptor {
+
+mlir::ValueRange expand(mlir::ValueRange descriptor,
+                        llvm::SmallVectorImpl<mlir::Value> &sink) {
+  if (descriptor.size() != 1)
+    return descriptor;
+  auto cast =
+      descriptor.front().getDefiningOp<mlir::UnrealizedConversionCastOp>();
+  if (!cast || cast->getNumResults() != 1 ||
+      cast.getResult(0) != descriptor.front())
+    return descriptor;
+  if (!mlir::isa<CoroutineType, FutureType, TaskType>(
+          cast.getResult(0).getType()))
+    return descriptor;
+  sink.append(cast.getOperands().begin(), cast.getOperands().end());
+  return mlir::ValueRange(sink);
+}
 
 mlir::Type payloadType(mlir::Type descriptorType) {
   if (auto coroType = mlir::dyn_cast<CoroutineType>(descriptorType))
@@ -295,8 +367,9 @@ mlir::LogicalResult drain(DecRefOp op, mlir::ValueRange descriptor,
     rewriter.setInsertionPointToStart(afterBlock);
   }
 
-  async_runtime::ExceptionCell::destroy(op.getLoc(), module, rewriter,
-                                        typeConverter, exceptionCell);
+  if (mlir::failed(async_runtime::ExceptionCell::destroy(
+          op.getLoc(), module, rewriter, typeConverter, exceptionCell)))
+    return mlir::failure();
   if (isTask)
     rewriter.create<mlir::memref::DeallocOp>(op.getLoc(), descriptor[2]);
   drop(op.getLoc(), asyncValue, rewriter);
@@ -314,6 +387,24 @@ mlir::LogicalResult dec(mlir::Location loc, mlir::Type logicalType,
   if (!isPyOwnershipTrackedType(logicalType))
     return mlir::success();
 
+  if (mlir::isa<IntType>(logicalType) && values.size() == 3) {
+    RuntimeAPI runtime(module, rewriter, typeConverter);
+    auto release = runtime.call(loc, RuntimeSymbols::kLongDecRef,
+                                /*resultType=*/nullptr, values);
+    release->setAttr(OwnershipContractAttrs::kAggregateRelease,
+                     rewriter.getUnitAttr());
+    return mlir::success();
+  }
+
+  if (mlir::isa<StrType>(logicalType) && values.size() == 2) {
+    RuntimeAPI runtime(module, rewriter, typeConverter);
+    auto release = runtime.call(loc, RuntimeSymbols::kUnicodeDecRef,
+                                /*resultType=*/nullptr, values);
+    release->setAttr(OwnershipContractAttrs::kAggregateRelease,
+                     rewriter.getUnitAttr());
+    return mlir::success();
+  }
+
   if (isCompilerOwnedMemRefListType(logicalType) ||
       isCompilerOwnedMemRefDictType(logicalType) ||
       isCompilerOwnedMemRefTupleType(logicalType)) {
@@ -325,21 +416,30 @@ mlir::LogicalResult dec(mlir::Location loc, mlir::Type logicalType,
     if (values.empty())
       return mlir::failure();
     return lowering::refcount::Class::emit(
-        rewriter.getInsertionBlock()->getParentOp(), values.front(), classType,
-        module, rewriter, "decref");
+        rewriter.getInsertionBlock()->getParentOp(), values, classType, module,
+        rewriter, typeConverter, "decref");
+  }
+
+  if (mlir::isa<ExceptionType>(logicalType)) {
+    if (values.size() == 3) {
+      RuntimeAPI runtime(module, rewriter, typeConverter);
+      auto release = runtime.call(loc, RuntimeSymbols::kExceptionDecRef,
+                                  /*resultType=*/nullptr, values);
+      release->setAttr(OwnershipContractAttrs::kAggregateRelease,
+                       rewriter.getUnitAttr());
+      return mlir::success();
+    }
+    if (values.size() == 1) {
+      return async_runtime::ExceptionCell::releasePayload(
+          loc, module, rewriter, typeConverter, values.front());
+    }
+    return mlir::failure();
   }
 
   if (mlir::isa<FuncType, PrimFuncType>(logicalType))
     return mlir::success();
 
-  if (values.size() != 1 ||
-      !mlir::isa<mlir::LLVM::LLVMPointerType>(values.front().getType()))
-    return mlir::failure();
-
-  RuntimeAPI runtime(module, rewriter, typeConverter);
-  runtime.call(loc, RuntimeSymbols::kDecRef, /*resultType=*/nullptr,
-               mlir::ValueRange{values.front()});
-  return mlir::success();
+  return mlir::failure();
 }
 
 } // namespace lowering::refcount::Value
@@ -373,8 +473,9 @@ mlir::LogicalResult dec(DecRefOp op, mlir::ValueRange descriptor,
         asyncValue, exceptionCell);
 
   if (op->hasAttr("ly.async.await_consumed_descriptor")) {
-    async_runtime::ExceptionCell::destroy(op.getLoc(), module, rewriter,
-                                          typeConverter, exceptionCell);
+    if (mlir::failed(async_runtime::ExceptionCell::destroy(
+            op.getLoc(), module, rewriter, typeConverter, exceptionCell)))
+      return mlir::failure();
     if (isTask)
       rewriter.create<mlir::memref::DeallocOp>(op.getLoc(), descriptor[2]);
     drop(op.getLoc(), asyncValue, rewriter);
@@ -412,8 +513,9 @@ mlir::LogicalResult dec(DecRefOp op, mlir::ValueRange descriptor,
     rewriter.setInsertionPoint(op);
   }
 
-  async_runtime::ExceptionCell::destroy(op.getLoc(), module, rewriter,
-                                        typeConverter, exceptionCell);
+  if (mlir::failed(async_runtime::ExceptionCell::destroy(
+          op.getLoc(), module, rewriter, typeConverter, exceptionCell)))
+    return mlir::failure();
   if (isTask)
     rewriter.create<mlir::memref::DeallocOp>(op.getLoc(), descriptor[2]);
   drop(op.getLoc(), asyncValue, rewriter);
@@ -421,6 +523,53 @@ mlir::LogicalResult dec(DecRefOp op, mlir::ValueRange descriptor,
 }
 
 } // namespace lowering::refcount::async_descriptor
+
+namespace lowering::refcount::task_cancel {
+
+bool canCleanupPayload(mlir::Type logicalType,
+                       const PyLLVMTypeConverter &typeConverter) {
+  if (!isPyOwnershipTrackedType(logicalType))
+    return true;
+
+  llvm::SmallVector<mlir::Type> convertedTypes;
+  if (mlir::failed(typeConverter.convertType(logicalType, convertedTypes)) ||
+      convertedTypes.size() != 1)
+    return false;
+
+  mlir::Type convertedType = convertedTypes.front();
+  return object_abi::Type::isStorageLike(convertedType);
+}
+
+bool isFreshCleanupWitness(DecRefOp op,
+                           const PyLLVMTypeConverter &typeConverter) {
+  auto taskCreate = op.getObject().getDefiningOp<TaskCreateOp>();
+  if (!taskCreate)
+    return false;
+
+  auto taskType = mlir::dyn_cast<TaskType>(op.getObject().getType());
+  if (!taskType || !canCleanupPayload(taskType.getResultType(), typeConverter))
+    return false;
+
+  auto coroCreate = taskCreate.getCoroutine().getDefiningOp<CoroCreateOp>();
+  if (!coroCreate || !coroCreate.getArgs().empty())
+    return false;
+
+  bool hasCancel = false;
+  for (mlir::Operation *user : taskCreate.getResult().getUsers()) {
+    if (user == op.getOperation())
+      continue;
+    if (mlir::isa<DecRefOp>(user))
+      continue;
+    if (mlir::isa<TaskCancelOp>(user)) {
+      hasCancel = true;
+      continue;
+    }
+    return false;
+  }
+  return hasCancel;
+}
+
+} // namespace lowering::refcount::task_cancel
 
 struct IncRefLowering : public mlir::OpConversionPattern<IncRefOp> {
   IncRefLowering(PyLLVMTypeConverter &converter, mlir::MLIRContext *ctx)
@@ -436,6 +585,11 @@ struct IncRefLowering : public mlir::OpConversionPattern<IncRefOp> {
     auto *typeConverter =
         static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
     if (lowering::refcount::Immortal::known(op.getObject())) {
+      rewriter.eraseOp(op);
+      return mlir::success();
+    }
+    if (isPyType(op.getObject().getType()) &&
+        !isPyOwnershipTrackedType(op.getObject().getType())) {
       rewriter.eraseOp(op);
       return mlir::success();
     }
@@ -467,23 +621,65 @@ struct IncRefLowering : public mlir::OpConversionPattern<IncRefOp> {
       if (adaptor.getObject().empty())
         return mlir::failure();
       if (mlir::failed(lowering::refcount::Class::emit(
-              op, adaptor.getObject().front(), classType, module, rewriter,
-              "incref", retainPremise,
+              op, adaptor.getObject(), classType, module, rewriter,
+              *typeConverter, "incref", retainPremise,
               op->hasAttr(ThreadSafetyAttrs::kOwnedTokenVerified))))
         return mlir::failure();
       rewriter.eraseOp(op);
       return mlir::success();
     }
-    RuntimeAPI runtime(module, rewriter, *typeConverter);
-
-    auto retain = runtime.call(op.getLoc(), RuntimeSymbols::kIncRef,
-                               /*resultType=*/nullptr, adaptor.getObject());
-    threadsafe::Retain::premise(retain.getOperation(), retainPremise);
-    if (retainPremise == ThreadSafetyAttrs::kPremiseOwnedToken &&
-        op->hasAttr(ThreadSafetyAttrs::kOwnedTokenVerified))
-      threadsafe::Retain::verifyOwnedToken(retain.getOperation());
-    rewriter.eraseOp(op);
-    return mlir::success();
+    if (mlir::isa<ExceptionType>(op.getObject().getType())) {
+      if (adaptor.getObject().size() == 3) {
+        RuntimeAPI runtime(module, rewriter, *typeConverter);
+        auto retain =
+            runtime.call(op.getLoc(), RuntimeSymbols::kIncRef,
+                         /*resultType=*/nullptr,
+                         mlir::ValueRange{adaptor.getObject().front()});
+        threadsafe::Retain::premise(retain.getOperation(), retainPremise);
+        if (retainPremise == ThreadSafetyAttrs::kPremiseOwnedToken &&
+            op->hasAttr(ThreadSafetyAttrs::kOwnedTokenVerified))
+          threadsafe::Retain::verifyOwnedToken(retain.getOperation());
+      } else if (adaptor.getObject().size() == 1) {
+        if (mlir::failed(async_runtime::ExceptionCell::retainPayload(
+                op.getLoc(), module, rewriter, *typeConverter,
+                adaptor.getObject().front(), retainPremise)))
+          return mlir::failure();
+      } else {
+        return mlir::failure();
+      }
+      rewriter.eraseOp(op);
+      return mlir::success();
+    }
+    if ((mlir::isa<IntType>(op.getObject().getType()) &&
+         adaptor.getObject().size() == 3) ||
+        (mlir::isa<StrType>(op.getObject().getType()) &&
+         adaptor.getObject().size() == 2)) {
+      RuntimeAPI runtime(module, rewriter, *typeConverter);
+      auto retain = runtime.call(op.getLoc(), RuntimeSymbols::kIncRef,
+                                 /*resultType=*/nullptr,
+                                 mlir::ValueRange{adaptor.getObject().front()});
+      threadsafe::Retain::premise(retain.getOperation(), retainPremise);
+      if (retainPremise == ThreadSafetyAttrs::kPremiseOwnedToken &&
+          op->hasAttr(ThreadSafetyAttrs::kOwnedTokenVerified))
+        threadsafe::Retain::verifyOwnedToken(retain.getOperation());
+      rewriter.eraseOp(op);
+      return mlir::success();
+    }
+    if (adaptor.getObject().size() == 1 &&
+        object_abi::Type::isStorageLike(
+            adaptor.getObject().front().getType())) {
+      RuntimeAPI runtime(module, rewriter, *typeConverter);
+      auto retain = runtime.call(op.getLoc(), RuntimeSymbols::kIncRef,
+                                 /*resultType=*/nullptr, adaptor.getObject());
+      threadsafe::Retain::premise(retain.getOperation(), retainPremise);
+      if (retainPremise == ThreadSafetyAttrs::kPremiseOwnedToken &&
+          op->hasAttr(ThreadSafetyAttrs::kOwnedTokenVerified))
+        threadsafe::Retain::verifyOwnedToken(retain.getOperation());
+      rewriter.eraseOp(op);
+      return mlir::success();
+    }
+    return op->emitError("py.incref requires a typed memref descriptor; raw "
+                         "pointer/object fallback is not part of the ABI");
   }
 };
 
@@ -508,6 +704,11 @@ struct DecRefLowering : public mlir::OpConversionPattern<DecRefOp> {
       rewriter.eraseOp(op);
       return mlir::success();
     }
+    if (isPyType(op.getObject().getType()) &&
+        !isPyOwnershipTrackedType(op.getObject().getType())) {
+      rewriter.eraseOp(op);
+      return mlir::success();
+    }
     if (isCompilerOwnedMemRefListType(op.getObject().getType()) ||
         isCompilerOwnedMemRefDictType(op.getObject().getType()) ||
         isCompilerOwnedMemRefTupleType(op.getObject().getType())) {
@@ -524,8 +725,12 @@ struct DecRefLowering : public mlir::OpConversionPattern<DecRefOp> {
     }
     if (mlir::isa<CoroutineType, TaskType, FutureType>(
             op.getObject().getType())) {
+      llvm::SmallVector<mlir::Value> descriptorStorage;
+      mlir::ValueRange descriptor =
+          lowering::refcount::async_descriptor::expand(adaptor.getObject(),
+                                                       descriptorStorage);
       if (mlir::failed(lowering::refcount::async_descriptor::dec(
-              op, adaptor.getObject(), module, rewriter, *typeConverter)))
+              op, descriptor, module, rewriter, *typeConverter)))
         return mlir::failure();
       rewriter.eraseOp(op);
       return mlir::success();
@@ -538,18 +743,105 @@ struct DecRefLowering : public mlir::OpConversionPattern<DecRefOp> {
       if (adaptor.getObject().empty())
         return mlir::failure();
       if (mlir::failed(lowering::refcount::Class::emit(
-              op, adaptor.getObject().front(), classType, module, rewriter,
-              suffix)))
+              op, adaptor.getObject(), classType, module, rewriter,
+              *typeConverter, suffix)))
         return mlir::failure();
       rewriter.eraseOp(op);
       return mlir::success();
     }
-    RuntimeAPI runtime(module, rewriter, *typeConverter);
+    if (mlir::isa<ExceptionType>(op.getObject().getType())) {
+      if (adaptor.getObject().size() == 3) {
+        RuntimeAPI runtime(module, rewriter, *typeConverter);
+        auto release =
+            runtime.call(op.getLoc(), RuntimeSymbols::kExceptionDecRef,
+                         /*resultType=*/nullptr, adaptor.getObject());
+        release->setAttr(OwnershipContractAttrs::kAggregateRelease,
+                         rewriter.getUnitAttr());
+      } else if (adaptor.getObject().size() == 1) {
+        if (mlir::failed(async_runtime::ExceptionCell::releasePayload(
+                op.getLoc(), module, rewriter, *typeConverter,
+                adaptor.getObject().front(),
+                op->hasAttr(OwnershipContractAttrs::kAggregateRelease))))
+          return mlir::failure();
+      } else {
+        return mlir::failure();
+      }
+      rewriter.eraseOp(op);
+      return mlir::success();
+    }
+    if (mlir::isa<IntType>(op.getObject().getType()) &&
+        adaptor.getObject().size() == 3) {
+      RuntimeAPI runtime(module, rewriter, *typeConverter);
+      auto release = runtime.call(op.getLoc(), RuntimeSymbols::kLongDecRef,
+                                  /*resultType=*/nullptr, adaptor.getObject());
+      mlir::Attribute attr =
+          op->getAttr(OwnershipContractAttrs::kAggregateRelease);
+      release->setAttr(OwnershipContractAttrs::kAggregateRelease,
+                       attr ? attr : rewriter.getUnitAttr());
+      rewriter.eraseOp(op);
+      return mlir::success();
+    }
+    if (mlir::isa<StrType>(op.getObject().getType()) &&
+        adaptor.getObject().size() == 2) {
+      RuntimeAPI runtime(module, rewriter, *typeConverter);
+      auto release = runtime.call(op.getLoc(), RuntimeSymbols::kUnicodeDecRef,
+                                  /*resultType=*/nullptr, adaptor.getObject());
+      mlir::Attribute attr =
+          op->getAttr(OwnershipContractAttrs::kAggregateRelease);
+      release->setAttr(OwnershipContractAttrs::kAggregateRelease,
+                       attr ? attr : rewriter.getUnitAttr());
+      rewriter.eraseOp(op);
+      return mlir::success();
+    }
+    return op->emitError("py.decref requires a typed memref descriptor; raw "
+                         "pointer/object fallback is not part of the ABI");
+  }
+};
 
-    runtime.call(op.getLoc(), RuntimeSymbols::kDecRef, /*resultType=*/nullptr,
-                 adaptor.getObject());
+struct AsyncDecRefLowering : public mlir::OpConversionPattern<DecRefOp> {
+  AsyncDecRefLowering(PyLLVMTypeConverter &converter, mlir::MLIRContext *ctx)
+      : mlir::OpConversionPattern<DecRefOp>(converter, ctx,
+                                            mlir::PatternBenefit(2)) {}
+
+  mlir::LogicalResult
+  rewriteAsync(DecRefOp op, mlir::ValueRange object,
+               mlir::ConversionPatternRewriter &rewriter) const {
+    if (!mlir::isa<CoroutineType, TaskType, FutureType>(
+            op.getObject().getType()))
+      return mlir::failure();
+
+    mlir::ModuleOp module = op->getParentOfType<mlir::ModuleOp>();
+    if (!module)
+      return mlir::failure();
+    auto *typeConverter =
+        static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
+    if (mlir::isa<TaskType>(op.getObject().getType()) &&
+        lowering::refcount::task_cancel::isFreshCleanupWitness(
+            op, *typeConverter)) {
+      rewriter.eraseOp(op);
+      return mlir::success();
+    }
+    llvm::SmallVector<mlir::Value> descriptorStorage;
+    mlir::ValueRange descriptor =
+        lowering::refcount::async_descriptor::expand(object, descriptorStorage);
+    if (mlir::failed(lowering::refcount::async_descriptor::dec(
+            op, descriptor, module, rewriter, *typeConverter)))
+      return mlir::failure();
     rewriter.eraseOp(op);
     return mlir::success();
+  }
+
+  mlir::LogicalResult
+  matchAndRewrite(DecRefOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    llvm::SmallVector<mlir::Value, 1> object{adaptor.getObject()};
+    return rewriteAsync(op, mlir::ValueRange(object), rewriter);
+  }
+
+  mlir::LogicalResult
+  matchAndRewrite(DecRefOp op, OneToNOpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    return rewriteAsync(op, adaptor.getObject(), rewriter);
   }
 };
 
@@ -559,7 +851,8 @@ namespace lowering::refcount::Patterns {
 void populate(PyLLVMTypeConverter &typeConverter,
               mlir::RewritePatternSet &patterns) {
   auto *ctx = patterns.getContext();
-  patterns.add<IncRefLowering, DecRefLowering>(typeConverter, ctx);
+  patterns.add<IncRefLowering, AsyncDecRefLowering, DecRefLowering>(
+      typeConverter, ctx);
 }
 } // namespace lowering::refcount::Patterns
 

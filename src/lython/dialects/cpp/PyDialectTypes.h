@@ -16,13 +16,13 @@ enum class TypeKind : unsigned {
   Float,
   Bool,
   Str,
-  Object,
   None,
   Tuple,
   Dict,
   List,
   Class, // User-defined class type
   Exception,
+  ExceptionCell,
   Traceback,
   Location,
   FuncSig,
@@ -225,18 +225,6 @@ public:
   }
 };
 
-class ObjectType : public mlir::Type::TypeBase<ObjectType, mlir::Type,
-                                               detail::SimpleTypeStorage> {
-public:
-  using Base::Base;
-  static constexpr ::llvm::StringLiteral name{"py.object"};
-
-  static ObjectType get(mlir::MLIRContext *ctx);
-  static bool kindof(unsigned kind) {
-    return kind == static_cast<unsigned>(TypeKind::Object);
-  }
-};
-
 class NoneType : public mlir::Type::TypeBase<NoneType, mlir::Type,
                                              detail::SimpleTypeStorage> {
 public:
@@ -317,6 +305,19 @@ public:
   static ExceptionType get(mlir::MLIRContext *ctx);
   static bool kindof(unsigned kind) {
     return kind == static_cast<unsigned>(TypeKind::Exception);
+  }
+};
+
+class ExceptionCellType
+    : public mlir::Type::TypeBase<ExceptionCellType, mlir::Type,
+                                  detail::SimpleTypeStorage> {
+public:
+  using Base::Base;
+  static constexpr ::llvm::StringLiteral name{"py.exception_cell"};
+
+  static ExceptionCellType get(mlir::MLIRContext *ctx);
+  static bool kindof(unsigned kind) {
+    return kind == static_cast<unsigned>(TypeKind::ExceptionCell);
   }
 };
 
@@ -444,13 +445,13 @@ bool isPyIntType(mlir::Type type);
 bool isPyFloatType(mlir::Type type);
 bool isPyBoolType(mlir::Type type);
 bool isPyStrType(mlir::Type type);
-bool isPyObjectType(mlir::Type type);
 bool isPyNoneType(mlir::Type type);
 bool isPyTupleType(mlir::Type type);
 bool isPyDictType(mlir::Type type);
 bool isPyListType(mlir::Type type);
 bool isPyClassType(mlir::Type type);
 bool isPyExceptionType(mlir::Type type);
+bool isPyExceptionCellType(mlir::Type type);
 bool isPyTracebackType(mlir::Type type);
 bool isPyLocationType(mlir::Type type);
 bool isPyFuncSigType(mlir::Type type);

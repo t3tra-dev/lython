@@ -3,6 +3,7 @@
 namespace py::optimizer::pipeline {
 
 void preLowering(mlir::ModuleOp module) {
+  ::py::optimizer::scalar::foldStaticBuiltinPrintRepr(module);
   containerPre(module);
   callPre(module);
   classLayoutPre(module);
@@ -13,10 +14,16 @@ void preLowering(mlir::ModuleOp module) {
   zeroCostRewritePre(module);
 }
 
-void postLowering(mlir::ModuleOp module) {
+void postValueLowering(mlir::ModuleOp module) {
   scalarPost(module);
   refcountPost(module);
   ::py::optimizer::scalar::dce(module);
+}
+
+void finalLLVMCleanup(mlir::ModuleOp module) {
+  ::py::optimizer::scalar::cseConstants(module);
+  ::py::optimizer::scalar::dce(module);
+  ::py::optimizer::runtime::Func::eraseUnusedDecls(module);
 }
 
 } // namespace py::optimizer::pipeline

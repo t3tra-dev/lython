@@ -25,6 +25,21 @@ void populate(PyLLVMTypeConverter &typeConverter,
               mlir::RewritePatternSet &patterns);
 } // namespace function::Patterns
 
+namespace function::definition::Patterns {
+void populate(PyLLVMTypeConverter &typeConverter,
+              mlir::RewritePatternSet &patterns);
+} // namespace function::definition::Patterns
+
+namespace function::returns::Patterns {
+void populate(PyLLVMTypeConverter &typeConverter,
+              mlir::RewritePatternSet &patterns);
+} // namespace function::returns::Patterns
+
+namespace function::objects::Patterns {
+void populate(PyLLVMTypeConverter &typeConverter,
+              mlir::RewritePatternSet &patterns);
+} // namespace function::objects::Patterns
+
 namespace call::Patterns {
 void populate(PyLLVMTypeConverter &typeConverter,
               mlir::RewritePatternSet &patterns);

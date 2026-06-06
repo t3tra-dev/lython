@@ -45,7 +45,7 @@ class AsyncFunctionMixin(VisitorRuntime):
         entry_arg_types = [self.get_py_type(spec) for spec in arg_type_specs]
         result_ir_type = self.get_py_type(result_type_spec)
         async_result_type = ir.Type.parse(f"!async.value<{result_type_spec}>", self.ctx)
-        exception_cell_type = ir.Type.parse("!llvm.ptr", self.ctx)
+        exception_cell_type = self.get_py_type("!py.exception_cell")
         coro_type = self.get_py_type(f"!py.coro<{result_type_spec}>")
         symbol_name = node.name if node.name != "main" else "__lython_async_main"
 
@@ -109,6 +109,7 @@ class AsyncFunctionMixin(VisitorRuntime):
         self.pop_async_function()
         self.pop_function_ast()
         self.pop_return_type()
+        self._set_func_effect(func, maythrow)
         self.register_function(
             node.name,
             coro_type,

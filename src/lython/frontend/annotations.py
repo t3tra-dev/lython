@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import ast
-from collections.abc import Mapping, Set as AbstractSet
+from collections.abc import Mapping
+from collections.abc import Set as AbstractSet
 
 from .inference import InferenceError, TypeCon, TypeTerm
-
 
 _BUILTIN_ANNOTATIONS = {
     "int": "int",
@@ -33,6 +33,11 @@ class AnnotationResolver:
         if isinstance(node, ast.Constant) and node.value is None:
             return TypeCon("None")
         if isinstance(node, ast.Name):
+            if node.id == "object":
+                raise InferenceError(
+                    "generic object annotations are not supported; use a "
+                    "concrete Python-level type"
+                )
             builtin = _BUILTIN_ANNOTATIONS.get(node.id)
             if builtin is not None:
                 return TypeCon(builtin)
@@ -66,7 +71,9 @@ class AnnotationResolver:
             return TypeCon("dict", (self.resolve(args[0]), self.resolve(args[1])))
         if base_name in {"tuple", "Tuple"}:
             if isinstance(node.slice, ast.Tuple):
-                return TypeCon("tuple", tuple(self.resolve(arg) for arg in node.slice.elts))
+                return TypeCon(
+                    "tuple", tuple(self.resolve(arg) for arg in node.slice.elts)
+                )
             return TypeCon("tuple", (self.resolve(node.slice),))
         if base_name in {"Coroutine", "Coro"}:
             return TypeCon("coro", (self.resolve(node.slice),))

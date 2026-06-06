@@ -12,7 +12,6 @@ namespace py {
 bool isPyOwnershipTrackedType(mlir::Type type);
 bool isPyOwnershipImmortalOp(mlir::Operation *op);
 bool isPyOwnershipIdentityTransform(mlir::Operation *op);
-bool isPyOwnershipMaterializedObjectBridge(mlir::Operation *op);
 bool createsPyOwnedResult(mlir::Operation *op);
 bool consumesPyOwnedOperand(mlir::Operation *op, mlir::Value operand);
 
@@ -32,7 +31,12 @@ public:
                          IdentityPredicate isIdentityTransform);
 
   mlir::Value getRoot(mlir::Value value) const;
+  bool sameRoot(mlir::Value lhs, mlir::Value rhs) const;
   bool isCarrier(mlir::Value value) const;
+  bool tracksThroughAlias(mlir::Value value) const;
+  bool rootIsImmortal(mlir::Value root) const;
+  bool rootHasAggregateBorrow(mlir::Value root) const;
+  bool rootIsEntryBorrowed(mlir::Value value, mlir::Block &entry) const;
   void collectAliases(mlir::Value value,
                       llvm::SmallVectorImpl<mlir::Value> &aliases) const;
 

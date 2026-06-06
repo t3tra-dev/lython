@@ -21,10 +21,10 @@
 namespace py {
 
 void PyDialect::initialize() {
-  addTypes<IntType, FloatType, BoolType, StrType, ObjectType, NoneType,
-           TupleType, DictType, ListType, ClassType, ExceptionType,
-           TracebackType, LocationType, FuncSignatureType, FuncType,
-           PrimFuncType, CoroutineType, TaskType, FutureType>();
+  addTypes<IntType, FloatType, BoolType, StrType, NoneType, TupleType, DictType,
+           ListType, ClassType, ExceptionType, ExceptionCellType, TracebackType,
+           LocationType, FuncSignatureType, FuncType, PrimFuncType,
+           CoroutineType, TaskType, FutureType>();
 
   addOperations<
 #define GET_OP_LIST
@@ -62,8 +62,6 @@ mlir::Type PyDialect::parseType(mlir::DialectAsmParser &parser) const {
     return BoolType::get(ctx);
   if (keyword == "str")
     return StrType::get(ctx);
-  if (keyword == "object")
-    return ObjectType::get(ctx);
   if (keyword == "none")
     return NoneType::get(ctx);
   if (keyword == "tuple") {
@@ -133,6 +131,8 @@ mlir::Type PyDialect::parseType(mlir::DialectAsmParser &parser) const {
   }
   if (keyword == "exception")
     return ExceptionType::get(ctx);
+  if (keyword == "exception_cell")
+    return ExceptionCellType::get(ctx);
   if (keyword == "traceback")
     return TracebackType::get(ctx);
   if (keyword == "location")
@@ -237,7 +237,6 @@ void PyDialect::printType(mlir::Type type,
       .Case<FloatType>([&](FloatType) { printer << "float"; })
       .Case<BoolType>([&](BoolType) { printer << "bool"; })
       .Case<StrType>([&](StrType) { printer << "str"; })
-      .Case<ObjectType>([&](ObjectType) { printer << "object"; })
       .Case<NoneType>([&](NoneType) { printer << "none"; })
       .Case<TupleType>([&](TupleType tupleTy) {
         printer << "tuple<";
@@ -266,6 +265,8 @@ void PyDialect::printType(mlir::Type type,
         printer << "class<\"" << classTy.getClassName() << "\">";
       })
       .Case<ExceptionType>([&](ExceptionType) { printer << "exception"; })
+      .Case<ExceptionCellType>(
+          [&](ExceptionCellType) { printer << "exception_cell"; })
       .Case<TracebackType>([&](TracebackType) { printer << "traceback"; })
       .Case<LocationType>([&](LocationType) { printer << "location"; })
       .Case<FuncSignatureType>([&](FuncSignatureType sigTy) {

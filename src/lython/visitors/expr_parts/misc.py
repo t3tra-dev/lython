@@ -43,6 +43,7 @@ class ExprMiscMixin(VisitorRuntime):
         """
         if not self.in_async_function():
             raise SyntaxError("'await' is only supported inside async functions")
+        self._note_maythrow()
         gather_call = self._resolve_asyncio_call(node.value, "gather")
         if gather_call is not None:
             return self._emit_asyncio_gather(gather_call, self._loc(node))

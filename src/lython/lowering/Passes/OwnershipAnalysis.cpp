@@ -6,15 +6,14 @@
 
 #include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/Dialect/Async/IR/Async.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Interfaces/InferTypeOpInterface.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/STLExtras.h"
-
-#include <cstdlib>
-#include <string>
 
 #include "PyDialect.h.inc"
 
@@ -26,105 +25,28 @@ namespace py {
 
 bool isPyOwnershipTrackedType(mlir::Type type);
 
-static bool isSmallIntConstant(mlir::Operation *op) {
-  auto intConst = mlir::dyn_cast<IntConstantOp>(op);
-  if (!intConst)
-    return false;
-
-  std::string text = intConst.getValue().str();
-  const char *begin = text.c_str();
-  char *end = nullptr;
-  long long value = std::strtoll(begin, &end, 10);
-  return end == begin + text.size() && value >= -5 && value <= 256;
-}
-
-static bool isSmallLLVMIntegerConstant(mlir::Value value) {
-  auto constant = value.getDefiningOp<mlir::LLVM::ConstantOp>();
-  if (!constant)
-    return false;
-  auto integer = mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue());
-  if (!integer)
-    return false;
-  int64_t raw = integer.getInt();
-  return raw >= -5 && raw <= 256;
-}
-
-static bool isSmallRuntimeLongBridge(mlir::Operation *op) {
-  auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(op);
-  if (!cast || cast->getNumOperands() != 1 || cast->getNumResults() != 1 ||
-      !mlir::isa<IntType>(cast.getResult(0).getType()))
-    return false;
-  auto call = cast.getOperand(0).getDefiningOp<mlir::LLVM::CallOp>();
-  if (!call)
-    return false;
-  auto callee = call.getCallee();
-  return callee && *callee == RuntimeSymbols::kLongFromI64 &&
-         call.getNumOperands() == 1 &&
-         isSmallLLVMIntegerConstant(call.getOperand(0));
-}
-
-static bool isOwnedRuntimeObjectBridge(mlir::Operation *op) {
-  auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(op);
-  if (!cast || cast->getNumOperands() != 1 || cast->getNumResults() != 1 ||
-      !isPyOwnershipTrackedType(cast.getResult(0).getType()) ||
-      isPyOwnershipTrackedType(cast.getOperand(0).getType()))
-    return false;
-  auto call = cast.getOperand(0).getDefiningOp<mlir::LLVM::CallOp>();
-  if (!call)
-    return false;
-  auto callee = call.getCallee();
-  if (!callee)
-    return false;
-  if (runtime::Callee::alwaysOwnedResult(*callee))
-    return true;
-  if (*callee == RuntimeSymbols::kLongFromI64)
-    return call.getNumOperands() != 1 ||
-           !isSmallLLVMIntegerConstant(call.getOperand(0));
-  return false;
-}
-
-static bool isOwnedAsyncPayloadBridge(mlir::Operation *op) {
-  auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(op);
-  if (!cast || cast->getNumOperands() != 1 || cast->getNumResults() != 1 ||
-      !isPyOwnershipTrackedType(cast.getResult(0).getType()) ||
-      isPyOwnershipTrackedType(cast.getOperand(0).getType()))
-    return false;
-  mlir::Operation *def = cast.getOperand(0).getDefiningOp();
-  return def &&
-         mlir::isa<mlir::async::AwaitOp, mlir::async::RuntimeLoadOp>(def);
-}
-
 bool isPyOwnershipTrackedType(mlir::Type type) {
-  if (mlir::isa<FuncSignatureType, FuncType, PrimFuncType, NoneType, BoolType>(
-          type))
+  if (mlir::isa<FuncSignatureType, FuncType, PrimFuncType, NoneType, BoolType,
+                FloatType>(type))
     return false;
   return isPyType(type);
 }
 
 bool isPyOwnershipImmortalOp(mlir::Operation *op) {
-  if (isSmallRuntimeLongBridge(op))
-    return true;
-  if (isSmallIntConstant(op))
+  if (mlir::isa<IntConstantOp>(op))
     return true;
   if (op->getNumResults() == 1 &&
       mlir::isa<BoolType>(op->getResult(0).getType()))
     return true;
   if (auto classNew = mlir::dyn_cast<ClassNewOp>(op))
     return classNew.getClassNameAttr().getValue() == "Exception";
-  return mlir::isa<NoneOp, FuncObjectOp, TupleEmptyOp, StrConstantOp,
-                   ExceptionNullOp, TracebackNullOp, LocationCurrentOp>(op);
+  return mlir::isa<NoneOp, FuncObjectOp, TupleEmptyOp, ExceptionNullOp,
+                   TracebackNullOp, LocationCurrentOp>(op);
 }
 
 bool isPyOwnershipIdentityTransform(mlir::Operation *op) {
-  auto upcast = mlir::dyn_cast<UpcastOp>(op);
-  return upcast &&
-         !isCompilerOwnedMemRefContainerType(upcast.getInput().getType());
-}
-
-bool isPyOwnershipMaterializedObjectBridge(mlir::Operation *op) {
-  auto upcast = mlir::dyn_cast<UpcastOp>(op);
-  return upcast &&
-         isCompilerOwnedMemRefContainerType(upcast.getInput().getType());
+  (void)op;
+  return false;
 }
 
 bool createsPyOwnedResult(mlir::Operation *op) {
@@ -132,49 +54,101 @@ bool createsPyOwnedResult(mlir::Operation *op) {
     return true;
   if (isPyOwnershipImmortalOp(op))
     return false;
-  if (isPyOwnershipMaterializedObjectBridge(op))
-    return true;
-  if (auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(op)) {
-    if (cast->getNumOperands() == 1 && cast->getNumResults() == 1 &&
-        isPyOwnershipTrackedType(cast.getResult(0).getType()) &&
-        !isPyOwnershipTrackedType(cast.getOperand(0).getType())) {
-      if (isOwnedRuntimeObjectBridge(op))
-        return true;
-      if (isOwnedAsyncPayloadBridge(op))
-        return true;
-      if (mlir::Operation *def = cast.getOperand(0).getDefiningOp())
-        if (createsPyOwnedResult(def))
-          return true;
-    }
-  }
-  if (isPyOwnershipIdentityTransform(op))
-    return false;
-
-  if (mlir::isa<TryOp, TupleCreateOp, DictEmptyOp, IntConstantOp,
-                FloatConstantOp, AddOp, SubOp, ReprOp, MakeFunctionOp,
-                CastFromPrimOp, ClassNewOp, ClassPromoteOp, PublishOp,
-                ListNewOp, ListGetOp, DictGetOp, AttrGetOp, AttrGetLocalOp,
-                ExceptionNewOp, AwaitOp, AsyncGatherOp, CoroCreateOp,
-                TaskCreateOp, AsyncSleepOp>(op))
+  if (mlir::isa<TryOp, TupleCreateOp, DictEmptyOp, StrConstantOp, IntConstantOp,
+                FloatConstantOp, AddOp, StrConcat3Op, SubOp, ReprOp,
+                MakeFunctionOp, CastFromPrimOp, ClassNewOp, ClassPromoteOp,
+                PublishOp, ListNewOp, ListGetOp, DictGetOp, AttrGetOp,
+                AttrGetLocalOp, ExceptionNewOp, AwaitOp, AsyncGatherOp,
+                CoroCreateOp, TaskCreateOp, AsyncSleepOp>(op))
     return true;
 
   return mlir::isa<CallOp, CallVectorOp, NativeCallOp>(op);
+}
+
+static bool tupleCreateConsumesOperand(TupleCreateOp tuple,
+                                       mlir::Value operand) {
+  auto isDirectCallPack = [](TupleCreateOp tuple) {
+    llvm::SmallVector<mlir::Value, 4> worklist{tuple.getResult()};
+    llvm::SmallPtrSet<mlir::Value, 4> seen;
+    bool sawCallPackUse = false;
+    while (!worklist.empty()) {
+      mlir::Value value = worklist.pop_back_val();
+      if (!value || !seen.insert(value).second)
+        continue;
+      for (mlir::Operation *user : value.getUsers()) {
+        if (mlir::isa<DecRefOp>(user))
+          continue;
+        if (auto cast =
+                mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(user)) {
+          for (mlir::Value result : cast.getResults())
+            worklist.push_back(result);
+          continue;
+        }
+        if (auto call = mlir::dyn_cast<CallVectorOp>(user)) {
+          if (call.getPosargs() != value)
+            return false;
+          sawCallPackUse = true;
+          continue;
+        }
+        if (auto call = mlir::dyn_cast<CallOp>(user)) {
+          if (call.getPosargs() != value)
+            return false;
+          sawCallPackUse = true;
+          continue;
+        }
+        if (auto invoke = mlir::dyn_cast<InvokeOp>(user)) {
+          if (invoke.getPosargs() != value)
+            return false;
+          sawCallPackUse = true;
+          continue;
+        }
+        return false;
+      }
+    }
+    return sawCallPackUse;
+  };
+
+  if (isDirectCallPack(tuple))
+    return false;
+
+  auto tupleType = mlir::dyn_cast<TupleType>(tuple.getResult().getType());
+  if (!tupleType)
+    return true;
+  for (auto [index, element] : llvm::enumerate(tuple.getElements())) {
+    if (element != operand)
+      continue;
+    mlir::Type elementType = tupleType.getElementTypes()[index];
+    switch (container::Slot::policy(elementType)) {
+    case container::SlotPolicy::NativeInteger:
+    case container::SlotPolicy::NativeBool:
+    case container::SlotPolicy::NativeFloat:
+      return false;
+    case container::SlotPolicy::Unsupported:
+      return true;
+    }
+  }
+  return false;
 }
 
 bool consumesPyOwnedOperand(mlir::Operation *op, mlir::Value operand) {
   if (mlir::isa<ReturnOp, RaiseOp, TryYieldOp, ExceptYieldOp, FinallyYieldOp,
                 mlir::async::ReturnOp>(op))
     return true;
-  if (mlir::isa<TupleCreateOp>(op))
-    return true;
+  if (auto tuple = mlir::dyn_cast<TupleCreateOp>(op))
+    return tupleCreateConsumesOperand(tuple, operand);
   if (auto awaitOp = mlir::dyn_cast<AwaitOp>(op))
     return awaitOp.getAwaitable() == operand;
   if (auto taskCreate = mlir::dyn_cast<TaskCreateOp>(op))
     return taskCreate.getCoroutine() == operand;
   if (auto gather = mlir::dyn_cast<AsyncGatherOp>(op))
     return llvm::is_contained(gather.getAwaitables(), operand);
+  if (auto exception = mlir::dyn_cast<ExceptionNewOp>(op))
+    return llvm::is_contained(exception.getArgs(), operand);
   if (auto attrSet = mlir::dyn_cast<AttrSetOp>(op))
     return attrSet.getValue() == operand && op->hasAttr("ly.consume_value");
+  if (auto attrSetLocal = mlir::dyn_cast<AttrSetLocalOp>(op))
+    return attrSetLocal.getValue() == operand &&
+           op->hasAttr("ly.consume_value");
   if (auto listAppend = mlir::dyn_cast<ListAppendOp>(op))
     return listAppend.getValue() == operand && op->hasAttr("ly.consume_value");
   if (auto dictInsert = mlir::dyn_cast<DictInsertOp>(op))
@@ -199,32 +173,59 @@ OwnershipAliasAnalysis::OwnershipAliasAnalysis(
   }
 
   region.walk([&](mlir::Operation *op) {
-    if (!isIdentityTransform(op))
+    if (isIdentityTransform(op)) {
+      unionSets(op->getOperand(0), op->getResult(0));
       return;
-    unionSets(op->getOperand(0), op->getResult(0));
+    }
+  });
+  llvm::SmallVector<mlir::LLVM::ExtractValueOp, 32> extracts;
+  region.walk([&](mlir::LLVM::ExtractValueOp extract) {
+    for (mlir::LLVM::ExtractValueOp prior : extracts) {
+      if (prior.getContainer() == extract.getContainer() &&
+          prior.getPosition() == extract.getPosition()) {
+        unionSets(prior.getResult(), extract.getResult());
+        break;
+      }
+    }
+    extracts.push_back(extract);
   });
 
   for (mlir::Block &block : region) {
     mlir::Operation *terminator = block.getTerminator();
+    auto unionBranchValues = [&](mlir::ValueRange operands,
+                                 mlir::Block *successor) {
+      if (!successor)
+        return;
+      unsigned count =
+          std::min<unsigned>(operands.size(), successor->getNumArguments());
+      for (unsigned j = 0; j != count; ++j) {
+        mlir::BlockArgument argument = successor->getArgument(j);
+        mlir::Value operand = operands[j];
+        if (operand && ((tracksType(operand.getType()) &&
+                         tracksType(argument.getType())) ||
+                        operand.getType() == argument.getType()))
+          unionSets(operand, argument);
+      }
+    };
+    if (auto br = mlir::dyn_cast_or_null<mlir::LLVM::BrOp>(terminator))
+      unionBranchValues(br.getDestOperands(), br.getDest());
+    if (auto cond = mlir::dyn_cast_or_null<mlir::LLVM::CondBrOp>(terminator)) {
+      unionBranchValues(cond.getTrueDestOperands(), cond.getTrueDest());
+      unionBranchValues(cond.getFalseDestOperands(), cond.getFalseDest());
+    }
+    if (auto br = mlir::dyn_cast_or_null<mlir::cf::BranchOp>(terminator))
+      unionBranchValues(br.getDestOperands(), br.getDest());
+    if (auto cond =
+            mlir::dyn_cast_or_null<mlir::cf::CondBranchOp>(terminator)) {
+      unionBranchValues(cond.getTrueDestOperands(), cond.getTrueDest());
+      unionBranchValues(cond.getFalseDestOperands(), cond.getFalseDest());
+    }
     auto branch = mlir::dyn_cast_or_null<mlir::BranchOpInterface>(terminator);
     if (branch) {
       for (unsigned i = 0, e = branch->getNumSuccessors(); i != e; ++i) {
         mlir::Block *successor = branch->getSuccessor(i);
         mlir::SuccessorOperands operands = branch.getSuccessorOperands(i);
-        unsigned count =
-            std::min<unsigned>(operands.size(), successor->getNumArguments());
-        for (unsigned j = 0; j != count; ++j) {
-          mlir::BlockArgument argument = successor->getArgument(j);
-          if (operands.isOperandProduced(j)) {
-            continue;
-          }
-
-          mlir::Value operand = operands[j];
-          if (operand && ((tracksType(operand.getType()) &&
-                           tracksType(argument.getType())) ||
-                          operand.getType() == argument.getType()))
-            unionSets(operand, argument);
-        }
+        unionBranchValues(operands.getForwardedOperands(), successor);
       }
     }
 
@@ -266,6 +267,33 @@ OwnershipAliasAnalysis::OwnershipAliasAnalysis(
         op->getNumResults() == 1)
       unionSets(op->getOperand(0), op->getResult(0));
 
+    auto addBranchPairs = [&](mlir::ValueRange operands,
+                              mlir::Block *successor) {
+      if (!successor)
+        return;
+      unsigned count =
+          std::min<unsigned>(operands.size(), successor->getNumArguments());
+      for (unsigned j = 0; j != count; ++j) {
+        mlir::Value operand = operands[j];
+        mlir::BlockArgument argument = successor->getArgument(j);
+        if (operand)
+          branchPairs.push_back({operand, argument});
+      }
+    };
+
+    if (auto br = mlir::dyn_cast<mlir::LLVM::BrOp>(op))
+      addBranchPairs(br.getDestOperands(), br.getDest());
+    if (auto cond = mlir::dyn_cast<mlir::LLVM::CondBrOp>(op)) {
+      addBranchPairs(cond.getTrueDestOperands(), cond.getTrueDest());
+      addBranchPairs(cond.getFalseDestOperands(), cond.getFalseDest());
+    }
+    if (auto br = mlir::dyn_cast<mlir::cf::BranchOp>(op))
+      addBranchPairs(br.getDestOperands(), br.getDest());
+    if (auto cond = mlir::dyn_cast<mlir::cf::CondBranchOp>(op)) {
+      addBranchPairs(cond.getTrueDestOperands(), cond.getTrueDest());
+      addBranchPairs(cond.getFalseDestOperands(), cond.getFalseDest());
+    }
+
     auto branch = mlir::dyn_cast<mlir::BranchOpInterface>(op);
     if (!branch)
       return;
@@ -283,6 +311,17 @@ OwnershipAliasAnalysis::OwnershipAliasAnalysis(
           branchPairs.push_back({operand, argument});
       }
     }
+  });
+  llvm::SmallVector<mlir::LLVM::ExtractValueOp, 32> extracts;
+  region.walk([&](mlir::LLVM::ExtractValueOp extract) {
+    for (mlir::LLVM::ExtractValueOp prior : extracts) {
+      if (prior.getContainer() == extract.getContainer() &&
+          prior.getPosition() == extract.getPosition()) {
+        unionSets(prior.getResult(), extract.getResult());
+        break;
+      }
+    }
+    extracts.push_back(extract);
   });
 
   for (auto &kv : parent)
@@ -320,8 +359,61 @@ mlir::Value OwnershipAliasAnalysis::getRoot(mlir::Value value) const {
   return find(value);
 }
 
+bool OwnershipAliasAnalysis::sameRoot(mlir::Value lhs, mlir::Value rhs) const {
+  return getRoot(lhs) == getRoot(rhs);
+}
+
 bool OwnershipAliasAnalysis::isCarrier(mlir::Value value) const {
   return carrierRoots.contains(find(value));
+}
+
+bool OwnershipAliasAnalysis::tracksThroughAlias(mlir::Value value) const {
+  if (isPyOwnershipTrackedType(value.getType()))
+    return true;
+  llvm::SmallVector<mlir::Value, 4> aliasSet;
+  collectAliases(value, aliasSet);
+  return llvm::any_of(aliasSet, [](mlir::Value alias) {
+    return isPyOwnershipTrackedType(alias.getType());
+  });
+}
+
+bool OwnershipAliasAnalysis::rootIsImmortal(mlir::Value root) const {
+  llvm::SmallVector<mlir::Value, 4> aliasSet;
+  collectAliases(root, aliasSet);
+  for (mlir::Value member : aliasSet) {
+    mlir::Operation *def = member.getDefiningOp();
+    if (def && isPyOwnershipImmortalOp(def))
+      return true;
+  }
+  return false;
+}
+
+bool OwnershipAliasAnalysis::rootHasAggregateBorrow(mlir::Value root) const {
+  llvm::SmallVector<mlir::Value, 4> aliasSet;
+  collectAliases(root, aliasSet);
+  for (mlir::Value member : aliasSet) {
+    mlir::Operation *def = member.getDefiningOp();
+    if (!def)
+      continue;
+    if (def->hasAttr(OwnershipContractAttrs::kAggregateSlotLoad))
+      return true;
+    auto role =
+        def->getAttrOfType<mlir::StringAttr>(ThreadSafetyAttrs::kAtomicRole);
+    if (role && role.getValue() == ThreadSafetyAttrs::kRoleAsyncExceptionLoad)
+      return true;
+  }
+  return false;
+}
+
+bool OwnershipAliasAnalysis::rootIsEntryBorrowed(mlir::Value value,
+                                                 mlir::Block &entry) const {
+  if (!isPyOwnershipTrackedType(value.getType()))
+    return false;
+  mlir::Value root = getRoot(value);
+  for (mlir::BlockArgument arg : entry.getArguments())
+    if (sameRoot(arg, root))
+      return true;
+  return false;
 }
 
 void OwnershipAliasAnalysis::collectAliases(

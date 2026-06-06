@@ -145,7 +145,8 @@ class PrimitiveMixin(VisitorRuntime):
         shape = [
             ir.ShapedType.get_dynamic_size() if dim is None else dim for dim in dims
         ]
-        return ir.RankedTensorType.get(shape, elem_type)
+        with self._loc(slice_expr):
+            return ir.RankedTensorType.get(shape, elem_type)
 
     def _parse_primitive_shaped_spec(
         self, base_type: str, slice_expr: ast.expr
@@ -372,39 +373,17 @@ class PrimitiveMixin(VisitorRuntime):
     def build_exception_value(
         self,
         *,
-        message: str | None,
+        message: ir.Value | None,
         loc: ir.Location,
         exc_type_name: str = "Exception",
         context: ir.Value | None = None,
     ) -> ir.Value:
-        exc_type = self.get_py_type(f'!py.class<"{exc_type_name}">')
-        empty_tuple = self.get_py_type("!py.tuple<>")
-        extras_dict = self.get_py_type("!py.dict<!py.str, !py.object>")
+        del exc_type_name, context
         with loc, self.insertion_point():
-            exc_type_val = py_ops.ClassNewOp(exc_type, exc_type_name).result
-            msg = py_ops.StrConstantOp(
-                self.get_py_type("!py.str"),
-                ir.StringAttr.get(message or "", self.ctx),
-            ).result
-            args = py_ops.TupleEmptyOp(empty_tuple).result
-            cause = py_ops.ExceptionNullOp(self.get_py_type("!py.exception")).result
-            if context is None:
-                context = py_ops.ExceptionNullOp(
-                    self.get_py_type("!py.exception")
-                ).result
-            tb = py_ops.TracebackNullOp(self.get_py_type("!py.traceback")).result
-            location = py_ops.LocationCurrentOp(self.get_py_type("!py.location")).result
-            extras = py_ops.DictEmptyOp(extras_dict).result
+            args = [] if message is None else [message]
             return py_ops.ExceptionNewOp(
                 self.get_py_type("!py.exception"),
-                exc_type_val,
-                msg,
                 args,
-                cause,
-                context,
-                tb,
-                location,
-                extras,
             ).result
 
     def _set_in_native_func(self, value: bool) -> None:

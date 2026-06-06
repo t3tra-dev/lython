@@ -1,5 +1,10 @@
 #include "Verifier.h"
 
+#include "Common/LoweringUtils.h"
+#include "Common/Object.h"
+
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+
 namespace py::threadsafe {
 
 std::optional<::llvm::StringRef> attrs::str(mlir::Operation *op,
@@ -24,19 +29,7 @@ std::optional<int64_t> attrs::i64(mlir::Operation *op,
 
 mlir::SmallVector<int64_t> attrs::i64Array(mlir::Operation *op,
                                            ::llvm::StringRef attrName) {
-  mlir::SmallVector<int64_t> values;
-  if (!op)
-    return values;
-  auto array = op->getAttrOfType<mlir::ArrayAttr>(attrName);
-  if (!array)
-    return values;
-  for (mlir::Attribute attr : array) {
-    auto integer = mlir::dyn_cast<mlir::IntegerAttr>(attr);
-    if (!integer)
-      continue;
-    values.push_back(integer.getInt());
-  }
-  return values;
+  return lowering::attrs::i64Array(op, attrName);
 }
 
 bool constant::memrefInt(mlir::Value value, int64_t expected) {
@@ -102,7 +95,10 @@ std::optional<int64_t> header_slot::refcount(mlir::Value header) {
 }
 
 std::optional<int64_t> header_slot::lock(mlir::Value header) {
-  return container::Lock::slot(header);
+  auto component = descriptor::component(header);
+  if (component && *component == ContainerSafetyAttrs::kComponentLock)
+    return kTypedContainerLockSlot;
+  return std::nullopt;
 }
 
 bool memref_value::alloca(mlir::Value value) {
@@ -111,6 +107,46 @@ bool memref_value::alloca(mlir::Value value) {
 
 bool memref_value::alloc(mlir::Value value) {
   return value.getDefiningOp<mlir::memref::AllocOp>() != nullptr;
+}
+
+bool object_header::type(mlir::Type type) {
+  return object_abi::Header::isOwned(type) || object_abi::Header::isView(type);
+}
+
+bool object_header::runtimeArg(mlir::BlockArgument arg) {
+  if (!object_header::type(arg.getType()))
+    return false;
+  mlir::Operation *parent =
+      arg.getOwner() ? arg.getOwner()->getParentOp() : nullptr;
+  auto func = mlir::dyn_cast_or_null<mlir::func::FuncOp>(parent);
+  if (!func)
+    return false;
+  if (arg.getArgNumber() >= func.getNumArguments())
+    return false;
+  return func.getArgAttr(arg.getArgNumber(),
+                         OwnershipContractAttrs::kObjectHeader) != nullptr;
+}
+
+static bool objectHeaderProvenance(mlir::Value value,
+                                   ::llvm::SmallPtrSetImpl<mlir::Value> &seen) {
+  if (!value || !seen.insert(value).second ||
+      !object_header::type(value.getType()))
+    return false;
+  if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(value))
+    return object_header::runtimeArg(arg);
+  mlir::Operation *def = value.getDefiningOp();
+  if (!def)
+    return false;
+  if (def->hasAttr(OwnershipContractAttrs::kObjectHeader))
+    return true;
+  if (auto cast = mlir::dyn_cast<mlir::memref::CastOp>(def))
+    return objectHeaderProvenance(cast.getSource(), seen);
+  return false;
+}
+
+bool object_header::provenance(mlir::Value value) {
+  ::llvm::SmallPtrSet<mlir::Value, 8> seen;
+  return objectHeaderProvenance(value, seen);
 }
 
 bool local_container::escapeUser(mlir::Operation *op);
@@ -191,7 +227,10 @@ std::optional<int64_t> header_slot::expectedRefcount(::llvm::StringRef kind) {
 }
 
 std::optional<int64_t> header_slot::expectedLock(::llvm::StringRef kind) {
-  return container::Lock::slotForKindName(kind);
+  auto parsed = container::Kind::fromName(kind);
+  if (!parsed || *parsed == KindId::Tuple)
+    return std::nullopt;
+  return kTypedContainerLockSlot;
 }
 
 std::string resource::group(mlir::Value header) {
@@ -340,6 +379,9 @@ bool function_arg::loweredRank1MemRefDescriptor(mlir::BlockArgument arg,
 
 bool provenance::descriptorData(mlir::Value ptr) {
   ptr = pointer::stripCasts(ptr);
+  if (mlir::Operation *def = ptr.getDefiningOp())
+    if (def->hasAttr(ContainerSafetyAttrs::kDescriptorData))
+      return true;
   if (ptr.getDefiningOp<mlir::LLVM::AllocaOp>())
     return true;
   if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(ptr))
@@ -351,6 +393,9 @@ bool provenance::descriptorData(mlir::Value ptr) {
   if (!gep)
     return false;
   mlir::Value base = pointer::stripCasts(gep.getBase());
+  if (mlir::Operation *def = base.getDefiningOp())
+    if (def->hasAttr(ContainerSafetyAttrs::kDescriptorData))
+      return true;
   if (base.getDefiningOp<mlir::LLVM::AllocaOp>())
     return true;
   if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(base))
@@ -371,6 +416,15 @@ bool provenance::descriptorAllocated(mlir::Value ptr) {
   if (!extract)
     return false;
   return extract.getPosition() == ::llvm::ArrayRef<int64_t>{0};
+}
+
+bool provenance::asyncExceptionCellAllocated(mlir::Value value) {
+  value = pointer::stripCasts(value);
+  if (provenance::descriptorAllocated(value))
+    return true;
+  if (mlir::Operation *def = value.getDefiningOp())
+    return def->hasAttr(AsyncSafetyAttrs::kExceptionCellAllocated);
+  return false;
 }
 
 bool function_arg::hasAttr(mlir::Value value, ::llvm::StringRef attrName) {
@@ -497,6 +551,16 @@ bool compare::llvmZero(mlir::LLVM::ICmpOp cmp, mlir::Value value,
     return false;
   return (cmp.getLhs() == value && constant::llvmInt(cmp.getRhs(), 0)) ||
          (cmp.getRhs() == value && constant::llvmInt(cmp.getLhs(), 0));
+}
+
+bool control::noReturn(mlir::Operation *terminator) {
+  if (!mlir::isa_and_nonnull<mlir::LLVM::UnreachableOp>(terminator))
+    return false;
+  auto call =
+      mlir::dyn_cast_or_null<mlir::LLVM::CallOp>(terminator->getPrevNode());
+  if (!call)
+    return false;
+  return call->hasAttr(ControlFlowContractAttrs::kNoReturn);
 }
 
 } // namespace py::threadsafe

@@ -73,18 +73,4 @@ mlir::LogicalResult CastToPrimOp::verify() {
          << inputType << " to " << resultType;
 }
 
-mlir::LogicalResult UpcastOp::verify() {
-  mlir::Type inputType = getInput().getType();
-  mlir::Type resultType = getResult().getType();
-
-  if (!isPyType(inputType))
-    return emitOpError("input must be a !py.* type");
-  if (mlir::isa<ClassType>(inputType))
-    return emitOpError("static class instances cannot be upcast to !py.object");
-  if (!isPyObjectType(resultType))
-    return emitOpError("result must be of type !py.object");
-
-  return mlir::success();
-}
-
 } // namespace py

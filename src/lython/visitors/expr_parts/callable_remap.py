@@ -147,25 +147,6 @@ class ExprCallableRemapMixin(VisitorRuntime):
                         remapped_operands[2],
                     )
                     result = remapped_operands[0]
-            elif name == "py.upcast":
-                if not operands:
-                    result = None
-                else:
-                    remapped = self._remap_summary_value_to_callsite(
-                        operands[0],
-                        summary_info=summary_info,
-                        positional_param_names=positional_param_names,
-                        kwonly_names=kwonly_names,
-                        positional_arg_values=positional_arg_values,
-                        keyword_arg_values=keyword_arg_values,
-                        loc=loc,
-                        cache=cache,
-                    )
-                    result = (
-                        py_ops.UpcastOp(value.type, remapped).result
-                        if remapped is not None
-                        else None
-                    )
             elif name == "py.attr.get":
                 if not operands:
                     result = None

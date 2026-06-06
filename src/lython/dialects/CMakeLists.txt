@@ -31,6 +31,7 @@ include_directories(${CMAKE_CURRENT_BINARY_DIR})
 add_library(PyDialect STATIC
   cpp/PyDialect.cpp
   cpp/PyDialectTypes.cpp
+  cpp/PyTypeObject.cpp
   cpp/PyVerifier/Common.cpp
   cpp/PyVerifier/ClassFunc.cpp
   cpp/PyVerifier/Call.cpp

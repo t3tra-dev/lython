@@ -1,5 +1,7 @@
 #include "cpp/PyVerifier/Common.h"
 
+#include "cpp/PyTypeObject.h"
+
 namespace py {
 
 mlir::LogicalResult TryOp::verify() {
@@ -74,8 +76,19 @@ mlir::LogicalResult RaiseCurrentOp::verify() {
   auto *parent = getOperation()->getParentOp();
   auto tryOp = mlir::dyn_cast_or_null<TryOp>(parent);
   if (tryOp) {
-    if (getOperation()->getParentRegion() != &tryOp.getExceptRegion())
-      return emitOpError("must be inside py.try except region");
+    if (getOperation()->getParentRegion() != &tryOp.getExceptRegion()) {
+      if (getOperation()->getParentRegion() == &tryOp.getTryRegion()) {
+        mlir::Block *block = getOperation()->getBlock();
+        for (mlir::Block *pred : block->getPredecessors()) {
+          auto invoke = mlir::dyn_cast_or_null<InvokeOp>(pred->getTerminator());
+          if (invoke && invoke.getUnwindDest() == block)
+            return mlir::success();
+        }
+        return emitOpError("must be inside py.try except region");
+      } else {
+        return emitOpError("must be inside py.try except region");
+      }
+    }
     return mlir::success();
   }
 
@@ -84,10 +97,32 @@ mlir::LogicalResult RaiseCurrentOp::verify() {
     return emitOpError("must be nested inside py.try except region");
   mlir::Operation *container = block->getParentOp();
   bool isInvokeUnwind = false;
-  container->walk([&](InvokeOp invoke) {
-    if (invoke.getUnwindDest() == block)
-      isInvokeUnwind = true;
-  });
+  auto detectInvokeUnwind = [&](mlir::Operation *scope) {
+    if (!scope)
+      return;
+    scope->walk([&](InvokeOp invoke) {
+      if (invoke.getUnwindDest() == block)
+        isInvokeUnwind = true;
+    });
+  };
+  detectInvokeUnwind(container);
+  if (!isInvokeUnwind)
+    if (mlir::Region *region = block->getParent())
+      if (mlir::Operation *parent = region->getParentOp())
+        detectInvokeUnwind(parent);
+  if (!isInvokeUnwind)
+    if (mlir::Operation *parent =
+            container ? container->getParentOp() : nullptr)
+      detectInvokeUnwind(parent);
+  if (!isInvokeUnwind) {
+    for (mlir::Block *pred : block->getPredecessors()) {
+      auto invoke = mlir::dyn_cast_or_null<InvokeOp>(pred->getTerminator());
+      if (invoke && invoke.getUnwindDest() == block) {
+        isInvokeUnwind = true;
+        break;
+      }
+    }
+  }
   if (isInvokeUnwind)
     return mlir::success();
 
@@ -112,24 +147,19 @@ mlir::LogicalResult FinallyYieldOp::verify() {
 }
 
 mlir::LogicalResult ExceptionNewOp::verify() {
-  if (!isPyClassType(getType().getType()))
-    return emitOpError("type must be !py.class");
-  if (!isPyStrType(getMessage().getType()))
-    return emitOpError("message must be !py.str");
-  if (!isPyTupleType(getArgs().getType()))
-    return emitOpError("args must be !py.tuple");
-  if (!isPyExceptionType(getCause().getType()))
-    return emitOpError("cause must be !py.exception");
-  if (!isPyExceptionType(getContext().getType()))
-    return emitOpError("context must be !py.exception");
-  if (!isPyTracebackType(getTraceback().getType()))
-    return emitOpError("traceback must be !py.traceback");
-  if (!isPyLocationType(getLocation().getType()))
-    return emitOpError("location must be !py.location");
-  if (!isPyDictType(getExtras().getType()))
-    return emitOpError("extras must be !py.dict");
   if (!isPyExceptionType(getResult().getType()))
     return emitOpError("result must be !py.exception");
+  mlir::FailureOr<bool> hasExceptionRoot = type_object::isSubclassOf(
+      getOperation(), type_object::kException, type_object::kBaseException);
+  if (mlir::failed(hasExceptionRoot))
+    return mlir::failure();
+  if (!*hasExceptionRoot)
+    return emitOpError("requires Exception <: BaseException");
+  if (getArgs().size() > 1)
+    return emitOpError("takes at most one message argument");
+  for (mlir::Value arg : getArgs())
+    if (!isPyStrType(arg.getType()))
+      return emitOpError("message argument must be !py.str");
   return mlir::success();
 }
 
@@ -140,6 +170,17 @@ mlir::LogicalResult ExceptMatchOp::verify() {
     return emitOpError("must be nested inside py.try except region");
   if (getOperation()->getParentRegion() != &tryOp.getExceptRegion())
     return emitOpError("must be inside py.try except region");
+  auto handlerType = mlir::dyn_cast<ClassType>(getType().getType());
+  if (!handlerType)
+    return emitOpError("handler operand must be !py.class");
+  mlir::FailureOr<bool> matches =
+      type_object::exceptionMatches(getOperation(), handlerType.getClassName());
+  if (mlir::failed(matches))
+    return mlir::failure();
+  if (!*matches)
+    return emitOpError("handler class '")
+           << handlerType.getClassName()
+           << "' is not a static superclass of Exception";
   return mlir::success();
 }
 

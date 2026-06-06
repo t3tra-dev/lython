@@ -1,17 +1,21 @@
+#include "Common/Object.h"
 #include "Common/RuntimeSupport.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/IR/Matchers.h"
+#include "llvm/ADT/APInt.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
 
-#include <cerrno>
-#include <cstdlib>
+#include <algorithm>
+#include <cstdint>
+#include <optional>
 #include <string>
 
 #define GET_OP_CLASSES
@@ -285,32 +289,6 @@ static void eraseDeadTensorProducerTree(mlir::Value value,
     eraseDeadTensorProducerTree(operand, rewriter);
 }
 
-static mlir::func::FuncOp getOrInsertTensorReprFunc(mlir::ModuleOp module,
-                                                    llvm::StringRef name,
-                                                    mlir::Type memrefType,
-                                                    mlir::Type resultType) {
-  auto markOwnedResult = [](mlir::func::FuncOp fn) {
-    mlir::Builder builder(fn.getContext());
-    fn->setAttr(OwnershipContractAttrs::kOwnedResults,
-                builder.getArrayAttr({builder.getI64IntegerAttr(0)}));
-  };
-  if (auto fn = module.lookupSymbol<mlir::func::FuncOp>(name)) {
-    markOwnedResult(fn);
-    return fn;
-  }
-
-  mlir::OpBuilder builder(module.getContext());
-  builder.setInsertionPointToStart(module.getBody());
-  auto funcType =
-      mlir::FunctionType::get(module.getContext(), {memrefType}, {resultType});
-  auto func =
-      builder.create<mlir::func::FuncOp>(module.getLoc(), name, funcType);
-  func->setAttr("llvm.emit_c_interface", builder.getUnitAttr());
-  func.setVisibility(mlir::SymbolTable::Visibility::Private);
-  markOwnedResult(func);
-  return func;
-}
-
 static std::string formatTensorLiteral(llvm::ArrayRef<int64_t> shape,
                                        llvm::ArrayRef<std::string> flat,
                                        size_t &index) {
@@ -330,6 +308,341 @@ static std::string formatTensorLiteral(llvm::ArrayRef<int64_t> shape,
   return result;
 }
 
+static bool isLongPartsTypes(llvm::ArrayRef<mlir::Type> types) {
+  return types.size() == 3 && object_abi::long_abi::Parts::isHeader(types[0]) &&
+         object_abi::long_abi::Parts::isMeta(types[1]) &&
+         object_abi::long_abi::Parts::isDigits(types[2]);
+}
+
+static bool isUnicodePartsTypes(llvm::ArrayRef<mlir::Type> types) {
+  return types.size() == 2 && object_abi::str_abi::Parts::isHeader(types[0]) &&
+         object_abi::str_abi::Parts::isBytes(types[1]);
+}
+
+static llvm::SmallVector<mlir::ValueRange, 1>
+asReplacement(mlir::ValueRange results) {
+  return llvm::SmallVector<mlir::ValueRange, 1>{mlir::ValueRange(results)};
+}
+
+static llvm::SmallVector<mlir::ValueRange, 1>
+asReplacement(mlir::Operation::result_range results) {
+  return asReplacement(mlir::ValueRange(results));
+}
+
+static mlir::LogicalResult
+replaceWithPartsCall(mlir::Operation *op, RuntimeAPI::Call call,
+                     mlir::ConversionPatternRewriter &rewriter) {
+  if (!call || call.getOperation()->getNumResults() == 0)
+    return mlir::failure();
+  rewriter.replaceOpWithMultiple(op, asReplacement(call.getResults()));
+  return mlir::success();
+}
+
+struct LongLiteralDigits {
+  int64_t sign = 0;
+  llvm::SmallVector<int64_t, 4> digits;
+};
+
+static std::optional<LongLiteralDigits>
+parseLongLiteralDigits(llvm::StringRef text) {
+  LongLiteralDigits result;
+  bool negative = false;
+  if (text.consume_front("-"))
+    negative = true;
+  else
+    text.consume_front("+");
+
+  llvm::SmallVector<uint8_t, 32> decimal;
+  decimal.reserve(text.size());
+  for (char ch : text) {
+    if (ch == '_')
+      continue;
+    if (ch < '0' || ch > '9')
+      return std::nullopt;
+    decimal.push_back(static_cast<uint8_t>(ch - '0'));
+  }
+  while (!decimal.empty() && decimal.front() == 0)
+    decimal.erase(decimal.begin());
+  if (decimal.empty())
+    return result;
+
+  result.sign = negative ? -1 : 1;
+  constexpr uint64_t base = 1ULL << object_abi::long_abi::kDigitBits;
+  while (!decimal.empty()) {
+    llvm::SmallVector<uint8_t, 32> quotient;
+    uint64_t remainder = 0;
+    bool seenNonZero = false;
+    for (uint8_t digit : decimal) {
+      uint64_t accum = remainder * 10 + digit;
+      uint8_t q = static_cast<uint8_t>(accum / base);
+      remainder = accum % base;
+      if (q != 0 || seenNonZero) {
+        quotient.push_back(q);
+        seenNonZero = true;
+      }
+    }
+    result.digits.push_back(static_cast<int64_t>(remainder));
+    decimal = std::move(quotient);
+  }
+  return result;
+}
+
+static std::string longLiteralGlobalName(const LongLiteralDigits &literal) {
+  llvm::hash_code hash = llvm::hash_combine(literal.sign);
+  hash = llvm::hash_combine(hash, literal.digits.size());
+  for (int64_t digit : literal.digits)
+    hash = llvm::hash_combine(hash, digit);
+  return ("__ly_long_const_" +
+          llvm::utohexstr(static_cast<uint64_t>(static_cast<size_t>(hash))));
+}
+
+static llvm::SmallVector<mlir::Value, 3>
+emitLongPartsLiteral(mlir::Location loc, const LongLiteralDigits &literal,
+                     mlir::ModuleOp module, mlir::PatternRewriter &rewriter) {
+  std::string base = longLiteralGlobalName(literal);
+  auto *ctx = rewriter.getContext();
+  auto i64Type = rewriter.getI64Type();
+  auto i32Type = rewriter.getI32Type();
+  auto i8Type = rewriter.getI8Type();
+  mlir::MemRefType headerType = object_abi::Header::owned(ctx);
+  mlir::MemRefType metaType = object_abi::long_abi::Meta::storage(ctx);
+  mlir::MemRefType digitsType = object_abi::long_abi::Digits::storage(ctx);
+
+  auto ensureGlobal = [&](llvm::StringRef suffix, mlir::MemRefType type,
+                          mlir::DenseElementsAttr initial) {
+    std::string symbol = base + suffix.str();
+    if (!module.lookupSymbol<mlir::memref::GlobalOp>(symbol)) {
+      mlir::OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(module.getBody());
+      rewriter.create<mlir::memref::GlobalOp>(
+          loc, symbol, rewriter.getStringAttr("private"), type, initial, true,
+          mlir::IntegerAttr());
+    }
+    return symbol;
+  };
+
+  llvm::SmallVector<int64_t, 2> headerValues{object_abi::kImmortalRefcount,
+                                             object_abi::long_abi::kLayoutId};
+  auto headerAttr = mlir::DenseIntElementsAttr::get(
+      mlir::RankedTensorType::get({object_abi::kHeaderSlots}, i64Type),
+      headerValues);
+  std::string headerSymbol = ensureGlobal("_header", headerType, headerAttr);
+
+  auto i8Attr = [](int64_t value) {
+    return llvm::APInt(8, static_cast<uint64_t>(value), /*isSigned=*/true);
+  };
+  llvm::SmallVector<llvm::APInt, 2> metaValues(
+      static_cast<size_t>(object_abi::long_abi::kMetaSlots), i8Attr(0));
+  metaValues[object_abi::long_abi::kSignSlot] = i8Attr(literal.sign);
+  metaValues[object_abi::long_abi::kDigitCountSlot] =
+      i8Attr(static_cast<int64_t>(literal.digits.size()));
+  auto metaAttr = mlir::DenseIntElementsAttr::get(
+      mlir::RankedTensorType::get({object_abi::long_abi::kMetaSlots}, i8Type),
+      metaValues);
+  std::string metaSymbol = ensureGlobal("_meta", metaType, metaAttr);
+
+  auto i32Attr = [](int64_t value) {
+    return llvm::APInt(32, static_cast<uint64_t>(value), /*isSigned=*/true);
+  };
+  llvm::SmallVector<llvm::APInt, 3> digitValues(
+      static_cast<size_t>(object_abi::long_abi::kDigitsSlots), i32Attr(0));
+  for (auto [index, digit] : llvm::enumerate(literal.digits)) {
+    digitValues[object_abi::long_abi::kDigitsBaseSlot + index] =
+        i32Attr(digit & object_abi::long_abi::kDigitMask);
+  }
+  auto digitsAttr = mlir::DenseIntElementsAttr::get(
+      mlir::RankedTensorType::get({object_abi::long_abi::kDigitsSlots},
+                                  i32Type),
+      digitValues);
+  std::string digitsSymbol = ensureGlobal("_digits", digitsType, digitsAttr);
+
+  mlir::Value header =
+      rewriter.create<mlir::memref::GetGlobalOp>(loc, headerType, headerSymbol);
+  mlir::Value meta =
+      rewriter.create<mlir::memref::GetGlobalOp>(loc, metaType, metaSymbol);
+  mlir::Value digits =
+      rewriter.create<mlir::memref::GetGlobalOp>(loc, digitsType, digitsSymbol);
+  for (mlir::Value value : {header, meta, digits})
+    if (mlir::Operation *def = value.getDefiningOp())
+      def->setAttr(OwnershipContractAttrs::kImmortalObject,
+                   rewriter.getUnitAttr());
+  return {header, meta, digits};
+}
+
+static mlir::Value boxBool(mlir::Location loc, mlir::Value value,
+                           mlir::Type resultType, RuntimeAPI &runtime) {
+  auto *ctx = resultType.getContext();
+  if (resultType == mlir::IntegerType::get(ctx, 1)) {
+    if (value.getType() == resultType)
+      return value;
+    if (auto intType = mlir::dyn_cast<mlir::IntegerType>(value.getType())) {
+      mlir::OpBuilder &builder = runtime.getBuilder();
+      mlir::Value zero =
+          builder.create<mlir::arith::ConstantIntOp>(loc, 0, intType);
+      return builder.create<mlir::arith::CmpIOp>(
+          loc, mlir::arith::CmpIPredicate::ne, value, zero);
+    }
+    return {};
+  }
+  if (!object_abi::Type::isStorageLike(resultType))
+    return {};
+  return {};
+}
+
+static mlir::Value boxFloat(mlir::Location loc, mlir::Value value,
+                            mlir::Type resultType, RuntimeAPI &runtime) {
+  auto *ctx = resultType.getContext();
+  if (resultType == mlir::Float64Type::get(ctx)) {
+    mlir::OpBuilder &builder = runtime.getBuilder();
+    if (value.getType() == resultType)
+      return value;
+    if (value.getType().isInteger(64))
+      return builder.create<mlir::arith::BitcastOp>(loc, resultType, value);
+    if (mlir::isa<mlir::Float32Type>(value.getType()))
+      return builder.create<mlir::arith::ExtFOp>(loc, resultType, value);
+    return {};
+  }
+  if (!object_abi::Type::isStorageLike(resultType))
+    return {};
+  return {};
+}
+
+static mlir::Value unboxBool(mlir::Location loc, mlir::Value value,
+                             mlir::PatternRewriter &rewriter,
+                             RuntimeAPI &runtime) {
+  (void)runtime;
+  if (value.getType() == rewriter.getI1Type())
+    return value;
+  if (auto intType = mlir::dyn_cast<mlir::IntegerType>(value.getType())) {
+    mlir::Value zero =
+        rewriter.create<mlir::arith::ConstantIntOp>(loc, 0, intType);
+    return rewriter.create<mlir::arith::CmpIOp>(
+        loc, mlir::arith::CmpIPredicate::ne, value, zero);
+  }
+  return {};
+}
+
+static mlir::Value unboxFloat(mlir::Location loc, mlir::Value value,
+                              mlir::PatternRewriter &rewriter,
+                              RuntimeAPI &runtime) {
+  (void)runtime;
+  if (value.getType() == rewriter.getF64Type())
+    return value;
+  if (value.getType().isInteger(64))
+    return rewriter.create<mlir::arith::BitcastOp>(loc, rewriter.getF64Type(),
+                                                   value);
+  return {};
+}
+
+static mlir::Value lowerFloatBinary(mlir::Location loc, mlir::Value lhs,
+                                    mlir::Value rhs, mlir::Type resultType,
+                                    bool subtract,
+                                    mlir::PatternRewriter &rewriter,
+                                    RuntimeAPI &runtime) {
+  mlir::Value lhsValue = unboxFloat(loc, lhs, rewriter, runtime);
+  mlir::Value rhsValue = unboxFloat(loc, rhs, rewriter, runtime);
+  if (!lhsValue || !rhsValue)
+    return {};
+  mlir::Value result =
+      subtract ? rewriter.create<mlir::arith::SubFOp>(loc, lhsValue, rhsValue)
+                     .getResult()
+               : rewriter.create<mlir::arith::AddFOp>(loc, lhsValue, rhsValue)
+                     .getResult();
+  return boxFloat(loc, result, resultType, runtime);
+}
+
+static mlir::Value
+lowerFloatCompare(mlir::Location loc, mlir::Value lhs, mlir::Value rhs,
+                  mlir::arith::CmpFPredicate predicate, mlir::Type resultType,
+                  mlir::PatternRewriter &rewriter, RuntimeAPI &runtime) {
+  mlir::Value lhsValue = unboxFloat(loc, lhs, rewriter, runtime);
+  mlir::Value rhsValue = unboxFloat(loc, rhs, rewriter, runtime);
+  if (!lhsValue || !rhsValue)
+    return {};
+  mlir::Value bit =
+      rewriter.create<mlir::arith::CmpFOp>(loc, predicate, lhsValue, rhsValue);
+  return boxBool(loc, bit, resultType, runtime);
+}
+
+static mlir::Value
+lowerBoolCompare(mlir::Location loc, mlir::Value lhs, mlir::Value rhs,
+                 mlir::LLVM::ICmpPredicate predicate, mlir::Type resultType,
+                 mlir::PatternRewriter &rewriter, RuntimeAPI &runtime) {
+  mlir::Value lhsValue = unboxBool(loc, lhs, rewriter, runtime);
+  mlir::Value rhsValue = unboxBool(loc, rhs, rewriter, runtime);
+  if (!lhsValue || !rhsValue)
+    return {};
+  auto arithPredicate = predicate == mlir::LLVM::ICmpPredicate::eq
+                            ? mlir::arith::CmpIPredicate::eq
+                            : mlir::arith::CmpIPredicate::ne;
+  mlir::Value bit = rewriter.create<mlir::arith::CmpIOp>(loc, arithPredicate,
+                                                         lhsValue, rhsValue);
+  return boxBool(loc, bit, resultType, runtime);
+}
+
+static mlir::Value longAsI64(mlir::Location loc, mlir::ValueRange value,
+                             mlir::PatternRewriter &rewriter,
+                             RuntimeAPI &runtime) {
+  if (value.size() == 3) {
+    return runtime
+        .call(loc, RuntimeSymbols::kLongAsI64, rewriter.getI64Type(), value)
+        .getResult();
+  }
+  if (value.size() == 1 && value.front().getType() == rewriter.getI64Type())
+    return value.front();
+  return {};
+}
+
+static mlir::LogicalResult
+replaceWithLongFromI64(mlir::Operation *op, mlir::Value value,
+                       llvm::ArrayRef<mlir::Type> results, RuntimeAPI &runtime,
+                       mlir::ConversionPatternRewriter &rewriter) {
+  if (isLongPartsTypes(results)) {
+    auto call = runtime.call(op->getLoc(), RuntimeSymbols::kLongFromI64,
+                             mlir::TypeRange(results), mlir::ValueRange{value});
+    return replaceWithPartsCall(op, call, rewriter);
+  }
+  return mlir::failure();
+}
+
+static mlir::Value lowerIntCompare(mlir::Location loc, mlir::ValueRange lhs,
+                                   mlir::ValueRange rhs,
+                                   mlir::arith::CmpIPredicate arithPredicate,
+                                   mlir::Type resultType,
+                                   mlir::PatternRewriter &rewriter,
+                                   RuntimeAPI &runtime) {
+  mlir::Value lhsValue = longAsI64(loc, lhs, rewriter, runtime);
+  mlir::Value rhsValue = longAsI64(loc, rhs, rewriter, runtime);
+  if (!lhsValue || !rhsValue)
+    return {};
+  mlir::Value bit = rewriter.create<mlir::arith::CmpIOp>(loc, arithPredicate,
+                                                         lhsValue, rhsValue);
+  return boxBool(loc, bit, resultType, runtime);
+}
+
+static llvm::SmallVector<mlir::Value, 3>
+unicodeLiteralOwnedParts(mlir::Location loc, llvm::StringRef text,
+                         mlir::OpBuilder &builder, RuntimeAPI &runtime) {
+  auto attr = builder.getStringAttr(text);
+  mlir::Value bytes = runtime.getByteLiteral(loc, attr);
+  mlir::Value start = builder.create<mlir::arith::ConstantIndexOp>(loc, 0);
+  mlir::Value length =
+      runtime.getI64Constant(loc, static_cast<int64_t>(text.size()));
+  llvm::SmallVector<mlir::Type, 3> resultTypes;
+  object_abi::str_abi::Parts::storageTypes(builder.getContext(), resultTypes);
+  auto call = runtime.call(loc, RuntimeSymbols::kUnicodeFromBytes,
+                           mlir::TypeRange(resultTypes),
+                           mlir::ValueRange{bytes, start, length});
+  return llvm::SmallVector<mlir::Value, 3>(call.getResults());
+}
+
+static void yieldUnicodeLiteral(mlir::Location loc, llvm::StringRef text,
+                                mlir::OpBuilder &builder, RuntimeAPI &runtime) {
+  llvm::SmallVector<mlir::Value, 3> values =
+      unicodeLiteralOwnedParts(loc, text, builder, runtime);
+  builder.create<mlir::scf::YieldOp>(loc, values);
+}
+
 struct StrConstantLowering : public mlir::OpConversionPattern<StrConstantOp> {
   StrConstantLowering(PyLLVMTypeConverter &converter, mlir::MLIRContext *ctx)
       : mlir::OpConversionPattern<StrConstantOp>(converter, ctx) {}
@@ -344,20 +657,27 @@ struct StrConstantLowering : public mlir::OpConversionPattern<StrConstantOp> {
         static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
     RuntimeAPI runtime(module, rewriter, *typeConverter);
 
-    mlir::Type resultType =
-        typeConverter->convertType(op.getResult().getType());
-    if (!resultType)
+    llvm::SmallVector<mlir::Type, 3> resultTypes;
+    if (mlir::failed(typeConverter->convertType(op.getResult().getType(),
+                                                resultTypes)) ||
+        resultTypes.empty())
       return mlir::failure();
 
-    mlir::Value dataPtr =
-        runtime.getStringLiteral(op.getLoc(), op.getValueAttr());
-    mlir::Value length = runtime.getI64Constant(
-        op.getLoc(), op.getValueAttr().getValue().size());
+    if (isUnicodePartsTypes(resultTypes)) {
+      mlir::Value bytes =
+          runtime.getByteLiteral(op.getLoc(), op.getValueAttr());
+      mlir::Value start =
+          rewriter.create<mlir::arith::ConstantIndexOp>(op.getLoc(), 0);
+      mlir::Value length =
+          runtime.getI64Constant(op.getLoc(), op.getValue().size());
+      auto call = runtime.call(op.getLoc(), RuntimeSymbols::kUnicodeFromBytes,
+                               mlir::TypeRange(resultTypes),
+                               mlir::ValueRange{bytes, start, length});
+      return replaceWithPartsCall(op, call, rewriter);
+    }
 
-    auto call = runtime.call(op.getLoc(), RuntimeSymbols::kStrInternStaticUtf8,
-                             resultType, mlir::ValueRange{dataPtr, length});
-    rewriter.replaceOp(op, call.getResults());
-    return mlir::success();
+    return rewriter.notifyMatchFailure(
+        op, "str constants require unicode header/payload parts");
   }
 };
 
@@ -376,9 +696,14 @@ struct NoneLowering : public mlir::OpConversionPattern<NoneOp> {
     RuntimeAPI runtime(module, rewriter, *typeConverter);
     mlir::Type resultType =
         typeConverter->convertType(op.getResult().getType());
-    auto call = runtime.call(op.getLoc(), RuntimeSymbols::kGetNone, resultType,
-                             mlir::ValueRange{});
-    rewriter.replaceOp(op, call.getResults());
+    mlir::Value none = runtime.getNoneValue(op.getLoc());
+    if (none.getType() != resultType)
+      none = rewriter
+                 .create<mlir::UnrealizedConversionCastOp>(
+                     op.getLoc(), mlir::TypeRange{resultType},
+                     mlir::ValueRange{none})
+                 .getResult(0);
+    rewriter.replaceOp(op, none);
     return mlir::success();
   }
 };
@@ -395,42 +720,33 @@ struct IntConstantLowering : public mlir::OpConversionPattern<IntConstantOp> {
       return mlir::failure();
     auto *typeConverter =
         static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
-    RuntimeAPI runtime(module, rewriter, *typeConverter);
-    mlir::Type resultType =
-        typeConverter->convertType(op.getResult().getType());
-    if (!resultType)
+    llvm::SmallVector<mlir::Type, 3> resultTypes;
+    if (mlir::failed(typeConverter->convertType(op.getResult().getType(),
+                                                resultTypes)) ||
+        resultTypes.empty())
       return mlir::failure();
 
     // Integer value is stored as decimal string to support arbitrary precision
     llvm::StringRef valueStr = op.getValue();
 
-    // Hybrid approach: try to parse as int64_t for fast path
-    // Max int64_t is 19 digits, so only try for shorter strings
-    if (valueStr.size() <= 19) {
-      char *end;
-      errno = 0;
-      long long parsed = std::strtoll(valueStr.data(), &end, 10);
-      // Check if parsing succeeded: entire string consumed, no overflow
-      if (end == valueStr.data() + valueStr.size() && errno != ERANGE) {
-        // Use fast LyLong_FromI64 path
-        mlir::Value value =
-            runtime.getI64Constant(op.getLoc(), static_cast<int64_t>(parsed));
-        auto call = runtime.call(op.getLoc(), RuntimeSymbols::kLongFromI64,
-                                 resultType, mlir::ValueRange{value});
-        rewriter.replaceOp(op, call.getResults());
-        return mlir::success();
-      }
+    if (isLongPartsTypes(resultTypes)) {
+      std::optional<LongLiteralDigits> literal =
+          parseLongLiteralDigits(valueStr);
+      if (!literal)
+        return rewriter.notifyMatchFailure(op,
+                                           "unsupported integer literal text");
+      if (literal->digits.size() >
+          static_cast<size_t>(object_abi::long_abi::kInlineDigits))
+        return op.emitOpError("integer literal exceeds compact LyLong ABI");
+      llvm::SmallVector<mlir::Value, 3> values =
+          emitLongPartsLiteral(op.getLoc(), *literal, module, rewriter);
+      rewriter.replaceOpWithMultiple(
+          op, llvm::ArrayRef<mlir::ValueRange>{mlir::ValueRange(values)});
+      return mlir::success();
     }
 
-    // Fall back to string-based creation for arbitrary precision
-    mlir::Value dataPtr = runtime.getStringLiteral(
-        op.getLoc(), mlir::StringAttr::get(rewriter.getContext(), valueStr));
-    mlir::Value length = runtime.getI64Constant(
-        op.getLoc(), static_cast<int64_t>(valueStr.size()));
-    auto call = runtime.call(op.getLoc(), RuntimeSymbols::kLongFromString,
-                             resultType, mlir::ValueRange{dataPtr, length});
-    rewriter.replaceOp(op, call.getResults());
-    return mlir::success();
+    return rewriter.notifyMatchFailure(
+        op, "py.int lowering requires long header/payload parts");
   }
 };
 
@@ -454,42 +770,20 @@ struct FloatConstantLowering
       return mlir::failure();
     mlir::Value value =
         runtime.getF64Constant(op.getLoc(), op.getValue().convertToDouble());
-    auto call = runtime.call(op.getLoc(), RuntimeSymbols::kFloatFromDouble,
-                             resultType, mlir::ValueRange{value});
-    rewriter.replaceOp(op, call.getResults());
+    if (resultType == rewriter.getF64Type()) {
+      rewriter.replaceOp(op, value);
+      return mlir::success();
+    }
+    if (!object_abi::Type::isStorageLike(resultType))
+      return rewriter.notifyMatchFailure(
+          op, "py.float lowering requires memref object storage");
+    mlir::Value boxed = boxFloat(op.getLoc(), value, resultType, runtime);
+    if (!boxed)
+      return rewriter.notifyMatchFailure(
+          op, "py.float lowering requires native float storage");
+    rewriter.replaceOp(op, boxed);
     return mlir::success();
   }
-};
-
-// Lowering numeric operations to runtime calls
-template <typename OpT>
-struct NumericBinaryLowering : public mlir::OpConversionPattern<OpT> {
-  NumericBinaryLowering(PyLLVMTypeConverter &converter, mlir::MLIRContext *ctx,
-                        llvm::StringLiteral symbol)
-      : mlir::OpConversionPattern<OpT>(converter, ctx), symbol(symbol) {}
-
-  mlir::LogicalResult
-  matchAndRewrite(OpT op,
-                  typename mlir::OpConversionPattern<OpT>::OpAdaptor adaptor,
-                  mlir::ConversionPatternRewriter &rewriter) const override {
-    mlir::ModuleOp module = op->template getParentOfType<mlir::ModuleOp>();
-    if (!module)
-      return mlir::failure();
-    auto *typeConverter =
-        static_cast<const PyLLVMTypeConverter *>(this->getTypeConverter());
-    RuntimeAPI runtime(module, rewriter, *typeConverter);
-    mlir::Type resultType =
-        typeConverter->convertType(op.getResult().getType());
-    if (!resultType)
-      return mlir::failure();
-    auto call = runtime.call(op.getLoc(), symbol, resultType,
-                             mlir::ValueRange{adaptor.getOperands()});
-    rewriter.replaceOp(op, call.getResults());
-    return mlir::success();
-  }
-
-private:
-  llvm::StringLiteral symbol;
 };
 
 // mlir::Type-specialized lowering for AddOp
@@ -498,7 +792,7 @@ struct AddLowering : public mlir::OpConversionPattern<AddOp> {
       : mlir::OpConversionPattern<AddOp>(converter, ctx) {}
 
   mlir::LogicalResult
-  matchAndRewrite(AddOp op, OpAdaptor adaptor,
+  matchAndRewrite(AddOp op, OneToNOpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     mlir::ModuleOp module = op->getParentOfType<mlir::ModuleOp>();
     if (!module)
@@ -506,25 +800,91 @@ struct AddLowering : public mlir::OpConversionPattern<AddOp> {
     auto *typeConverter =
         static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
     RuntimeAPI runtime(module, rewriter, *typeConverter);
-    mlir::Type resultType =
-        typeConverter->convertType(op.getResult().getType());
-    if (!resultType)
+    llvm::SmallVector<mlir::Type, 3> resultTypes;
+    if (mlir::failed(typeConverter->convertType(op.getResult().getType(),
+                                                resultTypes)) ||
+        resultTypes.empty())
       return mlir::failure();
 
-    // Use type-specialized function for int operands
-    llvm::StringRef symbol;
     if (isPyIntType(op.getLhs().getType()) &&
-        isPyIntType(op.getRhs().getType()))
-      symbol = RuntimeSymbols::kLongAdd;
-    else if (isPyStrType(op.getLhs().getType()) &&
-             isPyStrType(op.getRhs().getType()))
-      symbol = RuntimeSymbols::kUnicodeConcat;
-    else
-      symbol = RuntimeSymbols::kNumberAdd;
-    auto call =
-        runtime.call(op.getLoc(), symbol, resultType, adaptor.getOperands());
-    rewriter.replaceOp(op, call.getResults());
-    return mlir::success();
+        isPyIntType(op.getRhs().getType())) {
+      mlir::Value lhs =
+          longAsI64(op.getLoc(), adaptor.getLhs(), rewriter, runtime);
+      mlir::Value rhs =
+          longAsI64(op.getLoc(), adaptor.getRhs(), rewriter, runtime);
+      if (!lhs || !rhs)
+        return rewriter.notifyMatchFailure(
+            op, "int add requires memref object storage");
+      mlir::Value sum =
+          rewriter.create<mlir::arith::AddIOp>(op.getLoc(), lhs, rhs);
+      return replaceWithLongFromI64(op, sum, resultTypes, runtime, rewriter);
+    }
+
+    if (isPyFloatType(op.getLhs().getType()) &&
+        isPyFloatType(op.getRhs().getType())) {
+      mlir::Value result =
+          lowerFloatBinary(op.getLoc(), adaptor.getLhs().front(),
+                           adaptor.getRhs().front(), resultTypes.front(),
+                           /*subtract=*/false, rewriter, runtime);
+      if (!result)
+        return rewriter.notifyMatchFailure(
+            op, "float add requires memref object storage");
+      rewriter.replaceOp(op, result);
+      return mlir::success();
+    }
+
+    if (isPyStrType(op.getLhs().getType()) &&
+        isPyStrType(op.getRhs().getType())) {
+      if (isUnicodePartsTypes(resultTypes)) {
+        if (adaptor.getLhs().size() != 2 || adaptor.getRhs().size() != 2)
+          return mlir::failure();
+        llvm::SmallVector<mlir::Value, 4> operands;
+        operands.append(adaptor.getLhs().begin(), adaptor.getLhs().end());
+        operands.append(adaptor.getRhs().begin(), adaptor.getRhs().end());
+        auto call = runtime.call(op.getLoc(), RuntimeSymbols::kUnicodeConcat,
+                                 mlir::TypeRange(resultTypes), operands);
+        return replaceWithPartsCall(op, call, rewriter);
+      }
+      return rewriter.notifyMatchFailure(
+          op, "str add requires unicode header/payload parts");
+    }
+
+    return rewriter.notifyMatchFailure(op, "unsupported statically typed add");
+  }
+};
+
+struct StrConcat3Lowering : public mlir::OpConversionPattern<StrConcat3Op> {
+  StrConcat3Lowering(PyLLVMTypeConverter &converter, mlir::MLIRContext *ctx)
+      : mlir::OpConversionPattern<StrConcat3Op>(converter, ctx) {}
+
+  mlir::LogicalResult
+  matchAndRewrite(StrConcat3Op op, OneToNOpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    mlir::ModuleOp module = op->getParentOfType<mlir::ModuleOp>();
+    if (!module)
+      return mlir::failure();
+    auto *typeConverter =
+        static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
+    RuntimeAPI runtime(module, rewriter, *typeConverter);
+    llvm::SmallVector<mlir::Type, 3> resultTypes;
+    if (mlir::failed(typeConverter->convertType(op.getResult().getType(),
+                                                resultTypes)) ||
+        resultTypes.empty())
+      return mlir::failure();
+    if (isUnicodePartsTypes(resultTypes)) {
+      if (adaptor.getLhs().size() != 2 || adaptor.getMiddle().size() != 2 ||
+          adaptor.getRhs().size() != 2)
+        return mlir::failure();
+      llvm::SmallVector<mlir::Value, 6> operands;
+      operands.append(adaptor.getLhs().begin(), adaptor.getLhs().end());
+      operands.append(adaptor.getMiddle().begin(), adaptor.getMiddle().end());
+      operands.append(adaptor.getRhs().begin(), adaptor.getRhs().end());
+      auto call = runtime.call(op.getLoc(), RuntimeSymbols::kUnicodeConcat3,
+                               mlir::TypeRange(resultTypes), operands);
+      return replaceWithPartsCall(op, call, rewriter);
+    }
+    return rewriter.notifyMatchFailure(
+        op, "str.concat3 requires unicode header/payload parts");
   }
 };
 
@@ -534,7 +894,7 @@ struct SubLowering : public mlir::OpConversionPattern<SubOp> {
       : mlir::OpConversionPattern<SubOp>(converter, ctx) {}
 
   mlir::LogicalResult
-  matchAndRewrite(SubOp op, OpAdaptor adaptor,
+  matchAndRewrite(SubOp op, OneToNOpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     mlir::ModuleOp module = op->getParentOfType<mlir::ModuleOp>();
     if (!module)
@@ -542,20 +902,40 @@ struct SubLowering : public mlir::OpConversionPattern<SubOp> {
     auto *typeConverter =
         static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
     RuntimeAPI runtime(module, rewriter, *typeConverter);
-    mlir::Type resultType =
-        typeConverter->convertType(op.getResult().getType());
-    if (!resultType)
+    llvm::SmallVector<mlir::Type, 3> resultTypes;
+    if (mlir::failed(typeConverter->convertType(op.getResult().getType(),
+                                                resultTypes)) ||
+        resultTypes.empty())
       return mlir::failure();
 
-    // Use type-specialized function for int operands
-    llvm::StringRef symbol =
-        isPyIntType(op.getLhs().getType()) && isPyIntType(op.getRhs().getType())
-            ? RuntimeSymbols::kLongSub
-            : RuntimeSymbols::kNumberSub;
-    auto call =
-        runtime.call(op.getLoc(), symbol, resultType, adaptor.getOperands());
-    rewriter.replaceOp(op, call.getResults());
-    return mlir::success();
+    if (isPyIntType(op.getLhs().getType()) &&
+        isPyIntType(op.getRhs().getType())) {
+      mlir::Value lhs =
+          longAsI64(op.getLoc(), adaptor.getLhs(), rewriter, runtime);
+      mlir::Value rhs =
+          longAsI64(op.getLoc(), adaptor.getRhs(), rewriter, runtime);
+      if (!lhs || !rhs)
+        return rewriter.notifyMatchFailure(
+            op, "int sub requires memref object storage");
+      mlir::Value diff =
+          rewriter.create<mlir::arith::SubIOp>(op.getLoc(), lhs, rhs);
+      return replaceWithLongFromI64(op, diff, resultTypes, runtime, rewriter);
+    }
+
+    if (isPyFloatType(op.getLhs().getType()) &&
+        isPyFloatType(op.getRhs().getType())) {
+      mlir::Value result =
+          lowerFloatBinary(op.getLoc(), adaptor.getLhs().front(),
+                           adaptor.getRhs().front(), resultTypes.front(),
+                           /*subtract=*/true, rewriter, runtime);
+      if (!result)
+        return rewriter.notifyMatchFailure(
+            op, "float sub requires memref object storage");
+      rewriter.replaceOp(op, result);
+      return mlir::success();
+    }
+
+    return rewriter.notifyMatchFailure(op, "unsupported statically typed sub");
   }
 };
 
@@ -565,7 +945,7 @@ struct LeLowering : public mlir::OpConversionPattern<LeOp> {
       : mlir::OpConversionPattern<LeOp>(converter, ctx) {}
 
   mlir::LogicalResult
-  matchAndRewrite(LeOp op, OpAdaptor adaptor,
+  matchAndRewrite(LeOp op, OneToNOpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     mlir::ModuleOp module = op->getParentOfType<mlir::ModuleOp>();
     if (!module)
@@ -578,28 +958,31 @@ struct LeLowering : public mlir::OpConversionPattern<LeOp> {
     if (!resultType)
       return mlir::failure();
 
-    // For int operands, use LyLong_Compare + LyBool_FromBool
     if (isPyIntType(op.getLhs().getType()) &&
         isPyIntType(op.getRhs().getType())) {
-      // LyLong_Compare returns int: -1 (less), 0 (equal), 1 (greater)
-      auto cmpCall = runtime.call(op.getLoc(), RuntimeSymbols::kLongCompare,
-                                  rewriter.getI32Type(), adaptor.getOperands());
-      // For <=: compare result <= 0
-      mlir::Value zero = rewriter.create<mlir::LLVM::ConstantOp>(
-          op.getLoc(), rewriter.getI32Type(), rewriter.getI32IntegerAttr(0));
-      mlir::Value leZero = rewriter.create<mlir::LLVM::ICmpOp>(
-          op.getLoc(), mlir::LLVM::ICmpPredicate::sle, cmpCall.getResult(),
-          zero);
-      // Convert i1 to LyBool
-      auto boolCall = runtime.call(op.getLoc(), RuntimeSymbols::kBoolFromBool,
-                                   resultType, mlir::ValueRange{leZero});
-      rewriter.replaceOp(op, boolCall.getResults());
-    } else {
-      auto call = runtime.call(op.getLoc(), RuntimeSymbols::kNumberLe,
-                               resultType, adaptor.getOperands());
-      rewriter.replaceOp(op, call.getResults());
+      mlir::Value result = lowerIntCompare(
+          op.getLoc(), adaptor.getLhs(), adaptor.getRhs(),
+          mlir::arith::CmpIPredicate::sle, resultType, rewriter, runtime);
+      if (!result)
+        return rewriter.notifyMatchFailure(
+            op, "int compare requires memref object storage");
+      rewriter.replaceOp(op, result);
+      return mlir::success();
     }
-    return mlir::success();
+
+    if (isPyFloatType(op.getLhs().getType()) &&
+        isPyFloatType(op.getRhs().getType())) {
+      mlir::Value result = lowerFloatCompare(
+          op.getLoc(), adaptor.getLhs().front(), adaptor.getRhs().front(),
+          mlir::arith::CmpFPredicate::OLE, resultType, rewriter, runtime);
+      if (!result)
+        return rewriter.notifyMatchFailure(
+            op, "float compare requires memref object storage");
+      rewriter.replaceOp(op, result);
+      return mlir::success();
+    }
+
+    return rewriter.notifyMatchFailure(op, "unsupported statically typed le");
   }
 };
 
@@ -609,7 +992,7 @@ struct LtLowering : public mlir::OpConversionPattern<LtOp> {
       : mlir::OpConversionPattern<LtOp>(converter, ctx) {}
 
   mlir::LogicalResult
-  matchAndRewrite(LtOp op, OpAdaptor adaptor,
+  matchAndRewrite(LtOp op, OneToNOpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     mlir::ModuleOp module = op->getParentOfType<mlir::ModuleOp>();
     if (!module)
@@ -622,28 +1005,31 @@ struct LtLowering : public mlir::OpConversionPattern<LtOp> {
     if (!resultType)
       return mlir::failure();
 
-    // For int operands, use LyLong_Compare + LyBool_FromBool
     if (isPyIntType(op.getLhs().getType()) &&
         isPyIntType(op.getRhs().getType())) {
-      // LyLong_Compare returns int: -1 (less), 0 (equal), 1 (greater)
-      auto cmpCall = runtime.call(op.getLoc(), RuntimeSymbols::kLongCompare,
-                                  rewriter.getI32Type(), adaptor.getOperands());
-      // For <: compare result < 0
-      mlir::Value zero = rewriter.create<mlir::LLVM::ConstantOp>(
-          op.getLoc(), rewriter.getI32Type(), rewriter.getI32IntegerAttr(0));
-      mlir::Value ltZero = rewriter.create<mlir::LLVM::ICmpOp>(
-          op.getLoc(), mlir::LLVM::ICmpPredicate::slt, cmpCall.getResult(),
-          zero);
-      // Convert i1 to LyBool
-      auto boolCall = runtime.call(op.getLoc(), RuntimeSymbols::kBoolFromBool,
-                                   resultType, mlir::ValueRange{ltZero});
-      rewriter.replaceOp(op, boolCall.getResults());
-    } else {
-      auto call = runtime.call(op.getLoc(), RuntimeSymbols::kNumberLt,
-                               resultType, adaptor.getOperands());
-      rewriter.replaceOp(op, call.getResults());
+      mlir::Value result = lowerIntCompare(
+          op.getLoc(), adaptor.getLhs(), adaptor.getRhs(),
+          mlir::arith::CmpIPredicate::slt, resultType, rewriter, runtime);
+      if (!result)
+        return rewriter.notifyMatchFailure(
+            op, "int compare requires memref object storage");
+      rewriter.replaceOp(op, result);
+      return mlir::success();
     }
-    return mlir::success();
+
+    if (isPyFloatType(op.getLhs().getType()) &&
+        isPyFloatType(op.getRhs().getType())) {
+      mlir::Value result = lowerFloatCompare(
+          op.getLoc(), adaptor.getLhs().front(), adaptor.getRhs().front(),
+          mlir::arith::CmpFPredicate::OLT, resultType, rewriter, runtime);
+      if (!result)
+        return rewriter.notifyMatchFailure(
+            op, "float compare requires memref object storage");
+      rewriter.replaceOp(op, result);
+      return mlir::success();
+    }
+
+    return rewriter.notifyMatchFailure(op, "unsupported statically typed lt");
   }
 };
 
@@ -653,7 +1039,7 @@ struct GtLowering : public mlir::OpConversionPattern<GtOp> {
       : mlir::OpConversionPattern<GtOp>(converter, ctx) {}
 
   mlir::LogicalResult
-  matchAndRewrite(GtOp op, OpAdaptor adaptor,
+  matchAndRewrite(GtOp op, OneToNOpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     mlir::ModuleOp module = op->getParentOfType<mlir::ModuleOp>();
     if (!module)
@@ -666,28 +1052,31 @@ struct GtLowering : public mlir::OpConversionPattern<GtOp> {
     if (!resultType)
       return mlir::failure();
 
-    // For int operands, use LyLong_Compare + LyBool_FromBool
     if (isPyIntType(op.getLhs().getType()) &&
         isPyIntType(op.getRhs().getType())) {
-      // LyLong_Compare returns int: -1 (less), 0 (equal), 1 (greater)
-      auto cmpCall = runtime.call(op.getLoc(), RuntimeSymbols::kLongCompare,
-                                  rewriter.getI32Type(), adaptor.getOperands());
-      // For >: compare result > 0
-      mlir::Value zero = rewriter.create<mlir::LLVM::ConstantOp>(
-          op.getLoc(), rewriter.getI32Type(), rewriter.getI32IntegerAttr(0));
-      mlir::Value gtZero = rewriter.create<mlir::LLVM::ICmpOp>(
-          op.getLoc(), mlir::LLVM::ICmpPredicate::sgt, cmpCall.getResult(),
-          zero);
-      // Convert i1 to LyBool
-      auto boolCall = runtime.call(op.getLoc(), RuntimeSymbols::kBoolFromBool,
-                                   resultType, mlir::ValueRange{gtZero});
-      rewriter.replaceOp(op, boolCall.getResults());
-    } else {
-      auto call = runtime.call(op.getLoc(), RuntimeSymbols::kNumberGt,
-                               resultType, adaptor.getOperands());
-      rewriter.replaceOp(op, call.getResults());
+      mlir::Value result = lowerIntCompare(
+          op.getLoc(), adaptor.getLhs(), adaptor.getRhs(),
+          mlir::arith::CmpIPredicate::sgt, resultType, rewriter, runtime);
+      if (!result)
+        return rewriter.notifyMatchFailure(
+            op, "int compare requires memref object storage");
+      rewriter.replaceOp(op, result);
+      return mlir::success();
     }
-    return mlir::success();
+
+    if (isPyFloatType(op.getLhs().getType()) &&
+        isPyFloatType(op.getRhs().getType())) {
+      mlir::Value result = lowerFloatCompare(
+          op.getLoc(), adaptor.getLhs().front(), adaptor.getRhs().front(),
+          mlir::arith::CmpFPredicate::OGT, resultType, rewriter, runtime);
+      if (!result)
+        return rewriter.notifyMatchFailure(
+            op, "float compare requires memref object storage");
+      rewriter.replaceOp(op, result);
+      return mlir::success();
+    }
+
+    return rewriter.notifyMatchFailure(op, "unsupported statically typed gt");
   }
 };
 
@@ -697,7 +1086,7 @@ struct GeLowering : public mlir::OpConversionPattern<GeOp> {
       : mlir::OpConversionPattern<GeOp>(converter, ctx) {}
 
   mlir::LogicalResult
-  matchAndRewrite(GeOp op, OpAdaptor adaptor,
+  matchAndRewrite(GeOp op, OneToNOpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     mlir::ModuleOp module = op->getParentOfType<mlir::ModuleOp>();
     if (!module)
@@ -710,28 +1099,31 @@ struct GeLowering : public mlir::OpConversionPattern<GeOp> {
     if (!resultType)
       return mlir::failure();
 
-    // For int operands, use LyLong_Compare + LyBool_FromBool
     if (isPyIntType(op.getLhs().getType()) &&
         isPyIntType(op.getRhs().getType())) {
-      // LyLong_Compare returns int: -1 (less), 0 (equal), 1 (greater)
-      auto cmpCall = runtime.call(op.getLoc(), RuntimeSymbols::kLongCompare,
-                                  rewriter.getI32Type(), adaptor.getOperands());
-      // For >=: compare result >= 0
-      mlir::Value zero = rewriter.create<mlir::LLVM::ConstantOp>(
-          op.getLoc(), rewriter.getI32Type(), rewriter.getI32IntegerAttr(0));
-      mlir::Value geZero = rewriter.create<mlir::LLVM::ICmpOp>(
-          op.getLoc(), mlir::LLVM::ICmpPredicate::sge, cmpCall.getResult(),
-          zero);
-      // Convert i1 to LyBool
-      auto boolCall = runtime.call(op.getLoc(), RuntimeSymbols::kBoolFromBool,
-                                   resultType, mlir::ValueRange{geZero});
-      rewriter.replaceOp(op, boolCall.getResults());
-    } else {
-      auto call = runtime.call(op.getLoc(), RuntimeSymbols::kNumberGe,
-                               resultType, adaptor.getOperands());
-      rewriter.replaceOp(op, call.getResults());
+      mlir::Value result = lowerIntCompare(
+          op.getLoc(), adaptor.getLhs(), adaptor.getRhs(),
+          mlir::arith::CmpIPredicate::sge, resultType, rewriter, runtime);
+      if (!result)
+        return rewriter.notifyMatchFailure(
+            op, "int compare requires memref object storage");
+      rewriter.replaceOp(op, result);
+      return mlir::success();
     }
-    return mlir::success();
+
+    if (isPyFloatType(op.getLhs().getType()) &&
+        isPyFloatType(op.getRhs().getType())) {
+      mlir::Value result = lowerFloatCompare(
+          op.getLoc(), adaptor.getLhs().front(), adaptor.getRhs().front(),
+          mlir::arith::CmpFPredicate::OGE, resultType, rewriter, runtime);
+      if (!result)
+        return rewriter.notifyMatchFailure(
+            op, "float compare requires memref object storage");
+      rewriter.replaceOp(op, result);
+      return mlir::success();
+    }
+
+    return rewriter.notifyMatchFailure(op, "unsupported statically typed ge");
   }
 };
 
@@ -741,7 +1133,7 @@ struct EqLowering : public mlir::OpConversionPattern<EqOp> {
       : mlir::OpConversionPattern<EqOp>(converter, ctx) {}
 
   mlir::LogicalResult
-  matchAndRewrite(EqOp op, OpAdaptor adaptor,
+  matchAndRewrite(EqOp op, OneToNOpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     mlir::ModuleOp module = op->getParentOfType<mlir::ModuleOp>();
     if (!module)
@@ -754,28 +1146,43 @@ struct EqLowering : public mlir::OpConversionPattern<EqOp> {
     if (!resultType)
       return mlir::failure();
 
-    // For int operands, use LyLong_Compare + LyBool_FromBool
     if (isPyIntType(op.getLhs().getType()) &&
         isPyIntType(op.getRhs().getType())) {
-      // LyLong_Compare returns int: -1 (less), 0 (equal), 1 (greater)
-      auto cmpCall = runtime.call(op.getLoc(), RuntimeSymbols::kLongCompare,
-                                  rewriter.getI32Type(), adaptor.getOperands());
-      // For ==: compare result == 0
-      mlir::Value zero = rewriter.create<mlir::LLVM::ConstantOp>(
-          op.getLoc(), rewriter.getI32Type(), rewriter.getI32IntegerAttr(0));
-      mlir::Value eqZero = rewriter.create<mlir::LLVM::ICmpOp>(
-          op.getLoc(), mlir::LLVM::ICmpPredicate::eq, cmpCall.getResult(),
-          zero);
-      // Convert i1 to LyBool
-      auto boolCall = runtime.call(op.getLoc(), RuntimeSymbols::kBoolFromBool,
-                                   resultType, mlir::ValueRange{eqZero});
-      rewriter.replaceOp(op, boolCall.getResults());
-    } else {
-      auto call = runtime.call(op.getLoc(), RuntimeSymbols::kNumberEq,
-                               resultType, adaptor.getOperands());
-      rewriter.replaceOp(op, call.getResults());
+      mlir::Value result = lowerIntCompare(
+          op.getLoc(), adaptor.getLhs(), adaptor.getRhs(),
+          mlir::arith::CmpIPredicate::eq, resultType, rewriter, runtime);
+      if (!result)
+        return rewriter.notifyMatchFailure(
+            op, "int compare requires memref object storage");
+      rewriter.replaceOp(op, result);
+      return mlir::success();
     }
-    return mlir::success();
+
+    if (isPyFloatType(op.getLhs().getType()) &&
+        isPyFloatType(op.getRhs().getType())) {
+      mlir::Value result = lowerFloatCompare(
+          op.getLoc(), adaptor.getLhs().front(), adaptor.getRhs().front(),
+          mlir::arith::CmpFPredicate::OEQ, resultType, rewriter, runtime);
+      if (!result)
+        return rewriter.notifyMatchFailure(
+            op, "float compare requires memref object storage");
+      rewriter.replaceOp(op, result);
+      return mlir::success();
+    }
+
+    if (isPyBoolType(op.getLhs().getType()) &&
+        isPyBoolType(op.getRhs().getType())) {
+      mlir::Value result = lowerBoolCompare(
+          op.getLoc(), adaptor.getLhs().front(), adaptor.getRhs().front(),
+          mlir::LLVM::ICmpPredicate::eq, resultType, rewriter, runtime);
+      if (!result)
+        return rewriter.notifyMatchFailure(
+            op, "bool compare requires memref object storage");
+      rewriter.replaceOp(op, result);
+      return mlir::success();
+    }
+
+    return rewriter.notifyMatchFailure(op, "unsupported statically typed eq");
   }
 };
 
@@ -785,7 +1192,7 @@ struct NeLowering : public mlir::OpConversionPattern<NeOp> {
       : mlir::OpConversionPattern<NeOp>(converter, ctx) {}
 
   mlir::LogicalResult
-  matchAndRewrite(NeOp op, OpAdaptor adaptor,
+  matchAndRewrite(NeOp op, OneToNOpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     mlir::ModuleOp module = op->getParentOfType<mlir::ModuleOp>();
     if (!module)
@@ -798,28 +1205,140 @@ struct NeLowering : public mlir::OpConversionPattern<NeOp> {
     if (!resultType)
       return mlir::failure();
 
-    // For int operands, use LyLong_Compare + LyBool_FromBool
     if (isPyIntType(op.getLhs().getType()) &&
         isPyIntType(op.getRhs().getType())) {
-      // LyLong_Compare returns int: -1 (less), 0 (equal), 1 (greater)
-      auto cmpCall = runtime.call(op.getLoc(), RuntimeSymbols::kLongCompare,
-                                  rewriter.getI32Type(), adaptor.getOperands());
-      // For !=: compare result != 0
-      mlir::Value zero = rewriter.create<mlir::LLVM::ConstantOp>(
-          op.getLoc(), rewriter.getI32Type(), rewriter.getI32IntegerAttr(0));
-      mlir::Value neZero = rewriter.create<mlir::LLVM::ICmpOp>(
-          op.getLoc(), mlir::LLVM::ICmpPredicate::ne, cmpCall.getResult(),
-          zero);
-      // Convert i1 to LyBool
-      auto boolCall = runtime.call(op.getLoc(), RuntimeSymbols::kBoolFromBool,
-                                   resultType, mlir::ValueRange{neZero});
-      rewriter.replaceOp(op, boolCall.getResults());
-    } else {
-      auto call = runtime.call(op.getLoc(), RuntimeSymbols::kNumberNe,
-                               resultType, adaptor.getOperands());
-      rewriter.replaceOp(op, call.getResults());
+      mlir::Value result = lowerIntCompare(
+          op.getLoc(), adaptor.getLhs(), adaptor.getRhs(),
+          mlir::arith::CmpIPredicate::ne, resultType, rewriter, runtime);
+      if (!result)
+        return rewriter.notifyMatchFailure(
+            op, "int compare requires memref object storage");
+      rewriter.replaceOp(op, result);
+      return mlir::success();
     }
-    return mlir::success();
+
+    if (isPyFloatType(op.getLhs().getType()) &&
+        isPyFloatType(op.getRhs().getType())) {
+      mlir::Value result = lowerFloatCompare(
+          op.getLoc(), adaptor.getLhs().front(), adaptor.getRhs().front(),
+          mlir::arith::CmpFPredicate::UNE, resultType, rewriter, runtime);
+      if (!result)
+        return rewriter.notifyMatchFailure(
+            op, "float compare requires memref object storage");
+      rewriter.replaceOp(op, result);
+      return mlir::success();
+    }
+
+    if (isPyBoolType(op.getLhs().getType()) &&
+        isPyBoolType(op.getRhs().getType())) {
+      mlir::Value result = lowerBoolCompare(
+          op.getLoc(), adaptor.getLhs().front(), adaptor.getRhs().front(),
+          mlir::LLVM::ICmpPredicate::ne, resultType, rewriter, runtime);
+      if (!result)
+        return rewriter.notifyMatchFailure(
+            op, "bool compare requires memref object storage");
+      rewriter.replaceOp(op, result);
+      return mlir::success();
+    }
+
+    return rewriter.notifyMatchFailure(op, "unsupported statically typed ne");
+  }
+};
+
+struct ReprLowering : public mlir::OpConversionPattern<ReprOp> {
+  ReprLowering(PyLLVMTypeConverter &converter, mlir::MLIRContext *ctx)
+      : mlir::OpConversionPattern<ReprOp>(converter, ctx) {}
+
+  mlir::LogicalResult
+  matchAndRewrite(ReprOp op, OneToNOpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    mlir::ModuleOp module = op->getParentOfType<mlir::ModuleOp>();
+    if (!module)
+      return mlir::failure();
+    auto *typeConverter =
+        static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
+    RuntimeAPI runtime(module, rewriter, *typeConverter);
+    llvm::SmallVector<mlir::Type, 3> resultTypes;
+    if (mlir::failed(typeConverter->convertType(op.getResult().getType(),
+                                                resultTypes)) ||
+        resultTypes.empty())
+      return mlir::failure();
+    bool partsResult = isUnicodePartsTypes(resultTypes);
+
+    mlir::Type inputType = op.getInput().getType();
+    mlir::ValueRange input = adaptor.getInput();
+    if (!partsResult)
+      return rewriter.notifyMatchFailure(
+          op, "repr requires unicode header/payload parts result");
+    if (mlir::isa<BoolType>(inputType)) {
+      if (input.size() != 1)
+        return mlir::failure();
+      mlir::Value bit =
+          unboxBool(op.getLoc(), input.front(), rewriter, runtime);
+      auto select = rewriter.create<mlir::scf::IfOp>(
+          op.getLoc(), mlir::TypeRange(resultTypes), bit,
+          /*withElseRegion=*/true);
+      {
+        mlir::OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(select.thenBlock());
+        yieldUnicodeLiteral(op.getLoc(), "True", rewriter, runtime);
+      }
+      {
+        mlir::OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(select.elseBlock());
+        yieldUnicodeLiteral(op.getLoc(), "False", rewriter, runtime);
+      }
+      rewriter.replaceOpWithMultiple(op, asReplacement(select.getResults()));
+      return mlir::success();
+    }
+
+    if (mlir::isa<NoneType>(inputType)) {
+      llvm::SmallVector<mlir::Value, 3> values =
+          unicodeLiteralOwnedParts(op.getLoc(), "None", rewriter, runtime);
+      rewriter.replaceOpWithMultiple(op, asReplacement(values));
+      return mlir::success();
+    }
+
+    if (mlir::isa<IntType>(inputType)) {
+      if (auto literal = op.getInput().getDefiningOp<IntConstantOp>()) {
+        llvm::SmallVector<mlir::Value, 3> values = unicodeLiteralOwnedParts(
+            op.getLoc(), literal.getValue(), rewriter, runtime);
+        rewriter.replaceOpWithMultiple(op, asReplacement(values));
+        return mlir::success();
+      }
+      if (partsResult && input.size() == 3) {
+        mlir::Value asI64 = longAsI64(op.getLoc(), input, rewriter, runtime);
+        if (!asI64)
+          return mlir::failure();
+        auto call =
+            runtime.call(op.getLoc(), RuntimeSymbols::kUnicodeFromI64,
+                         mlir::TypeRange(resultTypes), mlir::ValueRange{asI64});
+        return replaceWithPartsCall(op, call, rewriter);
+      }
+      return rewriter.notifyMatchFailure(
+          op, "int repr requires long header/meta/digits parts");
+    }
+
+    if (mlir::isa<StrType>(inputType)) {
+      if (partsResult && input.size() == 2) {
+        auto repr = runtime.call(op.getLoc(), RuntimeSymbols::kUnicodeCopy,
+                                 mlir::TypeRange(resultTypes), input);
+        return replaceWithPartsCall(op, repr, rewriter);
+      }
+      return rewriter.notifyMatchFailure(
+          op, "str repr requires unicode header/payload parts");
+    }
+
+    if (mlir::isa<ExceptionType>(inputType)) {
+      if (input.size() != 3)
+        return mlir::failure();
+      auto repr = runtime.call(op.getLoc(), RuntimeSymbols::kUnicodeCopy,
+                               mlir::TypeRange(resultTypes),
+                               mlir::ValueRange{input[1], input[2]});
+      return replaceWithPartsCall(op, repr, rewriter);
+    }
+
+    return rewriter.notifyMatchFailure(op, "unsupported statically typed repr");
   }
 };
 struct CastToPrimLowering : public mlir::OpConversionPattern<CastToPrimOp> {
@@ -827,7 +1346,7 @@ struct CastToPrimLowering : public mlir::OpConversionPattern<CastToPrimOp> {
       : mlir::OpConversionPattern<CastToPrimOp>(converter, ctx) {}
 
   mlir::LogicalResult
-  matchAndRewrite(CastToPrimOp op, OpAdaptor adaptor,
+  matchAndRewrite(CastToPrimOp op, OneToNOpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     mlir::ModuleOp module = op->getParentOfType<mlir::ModuleOp>();
     if (!module)
@@ -840,32 +1359,44 @@ struct CastToPrimLowering : public mlir::OpConversionPattern<CastToPrimOp> {
 
     if (inputType == BoolType::get(rewriter.getContext()) &&
         resultType == rewriter.getI1Type()) {
-      auto call = runtime.call(op.getLoc(), RuntimeSymbols::kBoolAsBool,
-                               rewriter.getI1Type(), adaptor.getInput());
-      rewriter.replaceOp(op, call.getResults());
+      if (adaptor.getInput().size() != 1)
+        return mlir::failure();
+      mlir::Value value =
+          unboxBool(op.getLoc(), adaptor.getInput().front(), rewriter, runtime);
+      if (!value)
+        return rewriter.notifyMatchFailure(
+            op, "bool cast.to_prim requires memref object storage");
+      rewriter.replaceOp(op, value);
       return mlir::success();
     }
 
     if (inputType == IntType::get(rewriter.getContext())) {
-      mlir::Value asI64 = runtime
-                              .call(op.getLoc(), RuntimeSymbols::kLongAsI64,
-                                    rewriter.getI64Type(), adaptor.getInput())
-                              .getResult();
+      mlir::Value asI64 =
+          longAsI64(op.getLoc(), adaptor.getInput(), rewriter, runtime);
+      if (!asI64)
+        return rewriter.notifyMatchFailure(
+            op, "int cast.to_prim requires memref object storage");
       if (resultType == rewriter.getI64Type()) {
         rewriter.replaceOp(op, asI64);
         return mlir::success();
       }
       if (resultType == rewriter.getI32Type()) {
-        rewriter.replaceOpWithNewOp<mlir::LLVM::TruncOp>(op, resultType, asI64);
+        rewriter.replaceOpWithNewOp<mlir::arith::TruncIOp>(op, resultType,
+                                                           asI64);
         return mlir::success();
       }
     }
 
     if (inputType == FloatType::get(rewriter.getContext()) &&
         resultType == rewriter.getF64Type()) {
-      auto call = runtime.call(op.getLoc(), RuntimeSymbols::kFloatAsDouble,
-                               rewriter.getF64Type(), adaptor.getInput());
-      rewriter.replaceOp(op, call.getResults());
+      if (adaptor.getInput().size() != 1)
+        return mlir::failure();
+      mlir::Value value = unboxFloat(op.getLoc(), adaptor.getInput().front(),
+                                     rewriter, runtime);
+      if (!value)
+        return rewriter.notifyMatchFailure(
+            op, "float cast.to_prim requires memref object storage");
+      rewriter.replaceOp(op, value);
       return mlir::success();
     }
 
@@ -887,10 +1418,13 @@ struct CastFromPrimLowering : public mlir::OpConversionPattern<CastFromPrimOp> {
     auto *typeConverter =
         static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
     RuntimeAPI runtime(module, rewriter, *typeConverter);
-    mlir::Type resultType =
-        typeConverter->convertType(op.getResult().getType());
-    if (!resultType)
+    llvm::SmallVector<mlir::Type, 3> resultTypes;
+    if (mlir::failed(typeConverter->convertType(op.getResult().getType(),
+                                                resultTypes)) ||
+        resultTypes.empty())
       return mlir::failure();
+    mlir::Type resultType =
+        resultTypes.size() == 1 ? resultTypes.front() : mlir::Type();
 
     mlir::Value input = adaptor.getInput();
     mlir::Type inputType = input.getType();
@@ -898,9 +1432,11 @@ struct CastFromPrimLowering : public mlir::OpConversionPattern<CastFromPrimOp> {
 
     if (inputType == rewriter.getI1Type() &&
         pyResultType == BoolType::get(rewriter.getContext())) {
-      auto call = runtime.call(op.getLoc(), RuntimeSymbols::kBoolFromBool,
-                               resultType, mlir::ValueRange{input});
-      rewriter.replaceOp(op, call.getResults());
+      mlir::Value boxed = boxBool(op.getLoc(), input, resultType, runtime);
+      if (!boxed)
+        return rewriter.notifyMatchFailure(
+            op, "bool cast.from_prim requires memref object storage");
+      rewriter.replaceOp(op, boxed);
       return mlir::success();
     }
 
@@ -913,7 +1449,7 @@ struct CastFromPrimLowering : public mlir::OpConversionPattern<CastFromPrimOp> {
         // Sign-extend to i64
         auto i64Type = rewriter.getI64Type();
         i64Val =
-            rewriter.create<mlir::LLVM::SExtOp>(op.getLoc(), i64Type, input);
+            rewriter.create<mlir::arith::ExtSIOp>(op.getLoc(), i64Type, input);
       } else if (width == 64) {
         i64Val = input;
       } else {
@@ -921,10 +1457,7 @@ struct CastFromPrimLowering : public mlir::OpConversionPattern<CastFromPrimOp> {
             op, "integer width > 64 not supported for from_prim");
       }
 
-      auto call = runtime.call(op.getLoc(), RuntimeSymbols::kLongFromI64,
-                               resultType, mlir::ValueRange{i64Val});
-      rewriter.replaceOp(op, call.getResults());
-      return mlir::success();
+      return replaceWithLongFromI64(op, i64Val, resultTypes, runtime, rewriter);
     }
 
     // Handle float types -> !py.float
@@ -932,17 +1465,21 @@ struct CastFromPrimLowering : public mlir::OpConversionPattern<CastFromPrimOp> {
       // Extend f32 to f64
       auto f64Type = rewriter.getF64Type();
       mlir::Value f64Val =
-          rewriter.create<mlir::LLVM::FPExtOp>(op.getLoc(), f64Type, input);
-      auto call = runtime.call(op.getLoc(), RuntimeSymbols::kFloatFromDouble,
-                               resultType, mlir::ValueRange{f64Val});
-      rewriter.replaceOp(op, call.getResults());
+          rewriter.create<mlir::arith::ExtFOp>(op.getLoc(), f64Type, input);
+      mlir::Value boxed = boxFloat(op.getLoc(), f64Val, resultType, runtime);
+      if (!boxed)
+        return rewriter.notifyMatchFailure(
+            op, "float cast.from_prim requires memref object storage");
+      rewriter.replaceOp(op, boxed);
       return mlir::success();
     }
 
     if (llvm::isa<mlir::Float64Type>(inputType)) {
-      auto call = runtime.call(op.getLoc(), RuntimeSymbols::kFloatFromDouble,
-                               resultType, mlir::ValueRange{input});
-      rewriter.replaceOp(op, call.getResults());
+      mlir::Value boxed = boxFloat(op.getLoc(), input, resultType, runtime);
+      if (!boxed)
+        return rewriter.notifyMatchFailure(
+            op, "float cast.from_prim requires memref object storage");
+      rewriter.replaceOp(op, boxed);
       return mlir::success();
     }
 
@@ -961,55 +1498,26 @@ struct CastFromPrimLowering : public mlir::OpConversionPattern<CastFromPrimOp> {
 
       if (flat.empty()) {
         auto elemType = tensorType.getElementType();
-        auto floatType = llvm::dyn_cast<mlir::FloatType>(elemType);
-        if (!floatType)
+        if (!llvm::isa<mlir::FloatType, mlir::IntegerType>(elemType))
           return rewriter.notifyMatchFailure(
-              op, "from_prim for tensor requires float element type");
-
-        unsigned width = floatType.getWidth();
-        llvm::StringRef funcName;
-        if (width == 16) {
-          funcName = "LyTensorF16_Repr";
-        } else if (width == 32) {
-          funcName = "LyTensorF32_Repr";
-        } else if (width == 64) {
-          funcName = "LyTensorF64_Repr";
-        } else if (width == 128) {
-          funcName = "LyTensorF128_Repr";
-        } else {
-          return rewriter.notifyMatchFailure(
-              op, "unsupported float width for tensor repr");
-        }
-
-        auto memrefType =
-            mlir::MemRefType::get(tensorType.getShape(), elemType);
-        mlir::Value memref = rewriter.create<mlir::bufferization::ToMemrefOp>(
-            op.getLoc(), memrefType, input);
-        auto unrankedType = mlir::UnrankedMemRefType::get(elemType, 0);
-        mlir::Value unranked = rewriter.create<mlir::memref::CastOp>(
-            op.getLoc(), unrankedType, memref);
-
-        auto func = getOrInsertTensorReprFunc(module, funcName, unrankedType,
-                                              resultType);
-        auto call = rewriter.create<mlir::func::CallOp>(
-            op.getLoc(), func, mlir::ValueRange{unranked});
-        rewriter.replaceOp(op, call.getResults());
-        return mlir::success();
+              op, "from_prim for tensor requires numeric element type");
+        return rewriter.notifyMatchFailure(
+            op, "dynamic tensor repr requires unicode parts implementation");
       }
 
       size_t index = 0;
       std::string text =
           formatTensorLiteral(tensorType.getShape(), flat, index);
 
-      mlir::Value dataPtr = runtime.getStringLiteral(
-          op.getLoc(), mlir::StringAttr::get(rewriter.getContext(), text));
-      mlir::Value length = runtime.getI64Constant(
-          op.getLoc(), static_cast<int64_t>(text.size()));
-      auto call = runtime.call(op.getLoc(), RuntimeSymbols::kStrFromUtf8,
-                               resultType, mlir::ValueRange{dataPtr, length});
-      rewriter.replaceOp(op, call.getResults());
-      eraseDeadTensorProducerTree(input, rewriter);
-      return mlir::success();
+      if (isUnicodePartsTypes(resultTypes)) {
+        llvm::SmallVector<mlir::Value, 3> values =
+            unicodeLiteralOwnedParts(op.getLoc(), text, rewriter, runtime);
+        rewriter.replaceOpWithMultiple(op, asReplacement(values));
+        eraseDeadTensorProducerTree(input, rewriter);
+        return mlir::success();
+      }
+      return rewriter.notifyMatchFailure(
+          op, "tensor repr requires unicode header/payload parts result");
     }
 
     return rewriter.notifyMatchFailure(op,
@@ -1023,10 +1531,12 @@ namespace lowering::value::number::Patterns {
 void populate(PyLLVMTypeConverter &typeConverter,
               mlir::RewritePatternSet &patterns) {
   auto *ctx = patterns.getContext();
-  patterns.add<StrConstantLowering, NoneLowering, IntConstantLowering,
-               FloatConstantLowering, AddLowering, SubLowering, LtLowering,
-               LeLowering, GtLowering, GeLowering, EqLowering, NeLowering,
-               CastToPrimLowering, CastFromPrimLowering>(typeConverter, ctx);
+  patterns
+      .add<StrConstantLowering, NoneLowering, IntConstantLowering,
+           FloatConstantLowering, AddLowering, StrConcat3Lowering, SubLowering,
+           LtLowering, LeLowering, GtLowering, GeLowering, EqLowering,
+           NeLowering, ReprLowering, CastToPrimLowering, CastFromPrimLowering>(
+          typeConverter, ctx);
 }
 } // namespace lowering::value::number::Patterns
 

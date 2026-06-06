@@ -1,5 +1,7 @@
+#include "Common/Object.h"
 #include "Common/RuntimeSupport.h"
 #include "Passes/OwnershipAnalysis.h"
+#include "cpp/PyTypeObject.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Async/IR/Async.h"
@@ -9,6 +11,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Location.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 
 #include <cerrno>
 #include <cstdint>
@@ -60,44 +63,152 @@ static mlir::StringAttr getFuncNameAttr(mlir::func::FuncOp func,
 }
 
 static bool isExceptionCell(mlir::Value value) {
-  return value && mlir::isa<mlir::LLVM::LLVMPointerType>(value.getType());
+  return async_runtime::ExceptionCell::hasProvenance(value);
 }
 
-static mlir::Value getCurrentAsyncExceptionCell(mlir::Operation *op) {
-  auto asyncFunc = op->getParentOfType<mlir::async::FuncOp>();
-  if (!asyncFunc || asyncFunc.getBody().empty())
+static bool isLoweredExceptionCellCarrierType(mlir::Type type) {
+  return async_runtime::isExceptionCellType(type) ||
+         async_runtime::isLoweredExceptionCellType(type);
+}
+
+static mlir::Value trailingExceptionCell(mlir::Region &body,
+                                         bool allowAsyncSignatureCarrier) {
+  if (body.empty())
     return {};
-  mlir::Block &entry = asyncFunc.getBody().front();
+  mlir::Block &entry = body.front();
   if (entry.getNumArguments() == 0)
     return {};
   mlir::Value candidate = entry.getArgument(entry.getNumArguments() - 1);
-  return isExceptionCell(candidate) ? candidate : mlir::Value();
+  if (isExceptionCell(candidate))
+    return candidate;
+  if (allowAsyncSignatureCarrier &&
+      isLoweredExceptionCellCarrierType(candidate.getType()))
+    return candidate;
+  return {};
 }
 
-static void storeExceptionCell(mlir::Location loc, mlir::Value cell,
-                               mlir::Value exception, mlir::ModuleOp module,
-                               mlir::PatternRewriter &rewriter,
-                               const PyLLVMTypeConverter &typeConverter) {
+static mlir::Value getCurrentAsyncExceptionCell(mlir::Operation *op) {
+  if (auto asyncFunc = op ? op->getParentOfType<mlir::async::FuncOp>()
+                          : mlir::async::FuncOp()) {
+    mlir::Value cell =
+        trailingExceptionCell(asyncFunc.getBody(),
+                              /*allowAsyncSignatureCarrier=*/true);
+    if (cell && !async_runtime::ExceptionCell::hasProvenance(cell)) {
+      mlir::Block &entry = asyncFunc.getBody().front();
+      async_runtime::ExceptionCell::markArgument(asyncFunc.getOperation(),
+                                                 entry.getNumArguments() - 1);
+    }
+    return cell;
+  }
+
+  auto function = op ? op->getParentOfType<mlir::FunctionOpInterface>()
+                     : mlir::FunctionOpInterface();
+  if (!function || function.getFunctionBody().empty())
+    return {};
+  return trailingExceptionCell(function.getFunctionBody(),
+                               /*allowAsyncSignatureCarrier=*/false);
+}
+
+static mlir::LogicalResult
+storeExceptionCell(mlir::Location loc, mlir::Value cell, mlir::Value exception,
+                   mlir::ModuleOp module, mlir::PatternRewriter &rewriter,
+                   const PyLLVMTypeConverter &typeConverter) {
   if (!isExceptionCell(cell))
-    return;
-  async_runtime::ExceptionCell::storeFirst(loc, cell, exception, module,
-                                           rewriter, typeConverter);
+    return mlir::success();
+  return async_runtime::ExceptionCell::storeFirst(loc, cell, exception, module,
+                                                  rewriter, typeConverter);
 }
 
 static mlir::Value loadExceptionCell(mlir::Location loc, mlir::Value cell,
-                                     mlir::OpBuilder &builder) {
-  return async_runtime::ExceptionCell::load(loc, cell, builder);
+                                     mlir::RewriterBase &rewriter) {
+  return async_runtime::ExceptionCell::load(loc, cell, rewriter);
 }
 
-static void copyExceptionCell(mlir::Location loc, mlir::Value sourceCell,
-                              mlir::Value destCell, mlir::ModuleOp module,
-                              mlir::PatternRewriter &rewriter,
-                              const PyLLVMTypeConverter &typeConverter) {
+static mlir::LLVM::LLVMStructType
+loweredExceptionDescriptorType(mlir::MLIRContext *ctx) {
+  return object_abi::Type::loweredStorage(ctx);
+}
+
+static mlir::LLVM::LLVMStructType
+loweredExceptionPartsDescriptorType(mlir::MLIRContext *ctx) {
+  auto descriptor = loweredExceptionDescriptorType(ctx);
+  return mlir::LLVM::LLVMStructType::getLiteral(
+      ctx, llvm::ArrayRef<mlir::Type>{descriptor, descriptor, descriptor});
+}
+
+static mlir::Value
+packExceptionPartsForAsyncCell(mlir::Location loc, mlir::ValueRange parts,
+                               mlir::PatternRewriter &rewriter) {
+  if (parts.size() != 3)
+    return {};
+  return rewriter
+      .create<mlir::UnrealizedConversionCastOp>(
+          loc,
+          mlir::TypeRange{
+              loweredExceptionPartsDescriptorType(rewriter.getContext())},
+          parts)
+      .getResult(0);
+}
+
+static void markEHExceptionPart(mlir::Value value, unsigned index) {
+  ownership::aggregate::Slot::markLoad(value, "eh.current_exception",
+                                       "exception", index);
+}
+
+static mlir::Value captureLandingpadException(
+    mlir::Location loc, mlir::LLVM::LandingpadOp landingpad,
+    mlir::Type targetType, mlir::ModuleOp module,
+    mlir::PatternRewriter &rewriter, const PyLLVMTypeConverter &typeConverter) {
+  if (!landingpad)
+    return {};
+  auto ptrType = mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
+
+  auto partsType = loweredExceptionPartsDescriptorType(rewriter.getContext());
+  auto i64Type = rewriter.getI64Type();
+  mlir::Value one = rewriter.create<mlir::LLVM::ConstantOp>(
+      loc, i64Type, rewriter.getI64IntegerAttr(1));
+  mlir::Value descriptorStorage = rewriter.create<mlir::LLVM::AllocaOp>(
+      loc, ptrType, partsType, one, /*alignment=*/0);
+  ownership::Pointer::markNonObject(descriptorStorage);
+  RuntimeAPI runtime(module, rewriter, typeConverter);
+  mlir::Value captured =
+      runtime
+          .call(loc, RuntimeSymbols::kEHTakeCurrentDescriptor,
+                rewriter.getI1Type(), mlir::ValueRange{descriptorStorage})
+          .getResult();
+  rewriter.create<mlir::cf::AssertOp>(
+      loc, captured, "current exception is not a parts descriptor");
+
+  mlir::Value split =
+      rewriter.create<mlir::LLVM::LoadOp>(loc, partsType, descriptorStorage);
+  ownership::aggregate::Slot::markLoad(split, "eh.current_exception",
+                                       "exception", std::nullopt);
+  for (unsigned index = 0; index < 3; ++index) {
+    auto descriptorType =
+        mlir::cast<mlir::LLVM::LLVMStructType>(partsType.getBody()[index]);
+    mlir::Value descriptor = rewriter.create<mlir::LLVM::ExtractValueOp>(
+        loc, descriptorType, split,
+        rewriter.getDenseI64ArrayAttr({static_cast<int64_t>(index)}));
+    markEHExceptionPart(descriptor, index);
+  }
+  return rewriter
+      .create<mlir::UnrealizedConversionCastOp>(
+          loc, mlir::TypeRange{targetType}, split)
+      .getResult(0);
+}
+
+static mlir::LogicalResult
+copyExceptionCell(mlir::Location loc, mlir::Value sourceCell,
+                  mlir::Value destCell, mlir::ModuleOp module,
+                  mlir::PatternRewriter &rewriter,
+                  const PyLLVMTypeConverter &typeConverter) {
   if (!isExceptionCell(sourceCell) || !isExceptionCell(destCell) ||
       sourceCell == destCell)
-    return;
+    return mlir::success();
   mlir::Value exception = loadExceptionCell(loc, sourceCell, rewriter);
-  storeExceptionCell(loc, destCell, exception, module, rewriter, typeConverter);
+  return async_runtime::ExceptionCell::storeFirst(
+      loc, destCell, exception, module, rewriter, typeConverter,
+      ThreadSafetyAttrs::kPremiseAggregateBorrow);
 }
 
 static void consumeAwaitedDescriptor(mlir::Location loc, mlir::Value awaitable,
@@ -106,7 +217,7 @@ static void consumeAwaitedDescriptor(mlir::Location loc, mlir::Value awaitable,
   dec->setAttr("ly.async.await_consumed_descriptor", rewriter.getUnitAttr());
 }
 
-static void consumeAwaitedDescriptorWithLoadedException(
+static mlir::LogicalResult consumeAwaitedDescriptorWithLoadedException(
     mlir::Location loc, mlir::Value awaitable, mlir::ValueRange descriptor,
     mlir::Type awaitableType, mlir::Value loadedException,
     mlir::ModuleOp module, mlir::PatternRewriter &rewriter,
@@ -115,10 +226,12 @@ static void consumeAwaitedDescriptorWithLoadedException(
     mlir::Value exception =
         loadedException ? loadedException
                         : loadExceptionCell(loc, descriptor[1], rewriter);
-    async_runtime::ExceptionCell::releaseLoaded(loc, module, rewriter,
-                                                typeConverter, exception);
-    async_runtime::ExceptionCell::free(loc, module, rewriter, typeConverter,
-                                       descriptor[1]);
+    if (mlir::failed(async_runtime::ExceptionCell::releaseLoaded(
+            loc, module, rewriter, typeConverter, exception)))
+      return mlir::failure();
+    if (mlir::failed(async_runtime::ExceptionCell::free(
+            loc, module, rewriter, typeConverter, descriptor[1])))
+      return mlir::failure();
   }
 
   if (mlir::isa<TaskType>(awaitableType) && descriptor.size() == 3 &&
@@ -132,6 +245,7 @@ static void consumeAwaitedDescriptorWithLoadedException(
 
   auto witness = rewriter.create<DecRefOp>(loc, awaitable);
   witness->setAttr("ly.ownership.lowered_witness", rewriter.getUnitAttr());
+  return mlir::success();
 }
 
 static void drainGatherCleanupDescriptor(mlir::Location loc,
@@ -173,6 +287,31 @@ materializeLogicalValue(mlir::Location loc, mlir::Type logicalType,
                   rewriter.getArrayAttr(owned));
   }
   return cast.getResult(0);
+}
+
+static llvm::SmallVector<mlir::Type> blockArgumentTypes(mlir::Block *block) {
+  llvm::SmallVector<mlir::Type> types;
+  if (!block)
+    return types;
+  for (mlir::BlockArgument argument : block->getArguments())
+    types.push_back(argument.getType());
+  return types;
+}
+
+static mlir::FailureOr<llvm::SmallVector<mlir::Value>>
+convertLogicalValueForBlock(mlir::Location loc, mlir::Value value,
+                            mlir::Block *dest,
+                            mlir::PatternRewriter &rewriter) {
+  llvm::SmallVector<mlir::Type> destTypes = blockArgumentTypes(dest);
+  if (destTypes.empty())
+    return llvm::SmallVector<mlir::Value>{};
+  if (destTypes.size() == 1 && value.getType() == destTypes.front())
+    return llvm::SmallVector<mlir::Value>{value};
+  auto cast = rewriter.create<mlir::UnrealizedConversionCastOp>(
+      loc, mlir::TypeRange(destTypes), value);
+  llvm::SmallVector<mlir::Value> results;
+  results.append(cast.getResults().begin(), cast.getResults().end());
+  return results;
 }
 
 static void cloneFinallyBlockBody(mlir::Block *finallyBlock,
@@ -324,9 +463,10 @@ static mlir::FailureOr<mlir::Value> lowerAwaitInFinallyTry(
                                           errorBlock, awaitBlock);
 
   rewriter.setInsertionPointToStart(errorBlock);
-  copyExceptionCell(
-      awaitOp.getLoc(), awaitableExceptionCell, currentExceptionCell,
-      awaitOp->getParentOfType<mlir::ModuleOp>(), rewriter, typeConverter);
+  if (mlir::failed(copyExceptionCell(
+          awaitOp.getLoc(), awaitableExceptionCell, currentExceptionCell,
+          awaitOp->getParentOfType<mlir::ModuleOp>(), rewriter, typeConverter)))
+    return mlir::failure();
   consumeAwaitedDescriptor(awaitOp.getLoc(), awaitable, rewriter);
   for (mlir::Value payload : cleanupPayloads)
     if (isPyOwnershipTrackedType(payload.getType()))
@@ -452,24 +592,20 @@ lowerAwaitInExceptTry(AwaitOp awaitOp, mlir::Block *exceptEntry,
                 exception)
             .getResult(0);
   }
-  mlir::Type exceptArgType = exceptEntry->getNumArguments() == 0
-                                 ? mlir::Type()
-                                 : exceptEntry->getArgument(0).getType();
-  if (exceptArgType && exception.getType() != exceptArgType) {
-    exception =
-        rewriter
-            .create<mlir::UnrealizedConversionCastOp>(
-                awaitOp.getLoc(), mlir::TypeRange{exceptArgType}, exception)
-            .getResult(0);
-  }
   auto retain = rewriter.create<IncRefOp>(awaitOp.getLoc(), exception);
   if (loadedException)
     threadsafe::Retain::premise(retain.getOperation(),
                                 ThreadSafetyAttrs::kPremiseAggregateBorrow);
-  consumeAwaitedDescriptorWithLoadedException(
-      awaitOp.getLoc(), awaitable, convertedAwaitableParts, awaitable.getType(),
-      loadedException, awaitOp->getParentOfType<mlir::ModuleOp>(), rewriter,
-      typeConverter);
+  mlir::FailureOr<llvm::SmallVector<mlir::Value>> branchArgs =
+      convertLogicalValueForBlock(awaitOp.getLoc(), exception, exceptEntry,
+                                  rewriter);
+  if (mlir::failed(branchArgs))
+    return mlir::failure();
+  if (mlir::failed(consumeAwaitedDescriptorWithLoadedException(
+          awaitOp.getLoc(), awaitable, convertedAwaitableParts,
+          awaitable.getType(), loadedException,
+          awaitOp->getParentOfType<mlir::ModuleOp>(), rewriter, typeConverter)))
+    return mlir::failure();
   for (mlir::Value payload : cleanupPayloads)
     if (isPyOwnershipTrackedType(payload.getType()))
       rewriter.create<DecRefOp>(awaitOp.getLoc(), payload);
@@ -478,7 +614,7 @@ lowerAwaitInExceptTry(AwaitOp awaitOp, mlir::Block *exceptEntry,
       drainGatherCleanupDescriptor(awaitOp.getLoc(), awaitableToCleanup,
                                    rewriter);
   rewriter.create<mlir::cf::BranchOp>(awaitOp.getLoc(), exceptEntry,
-                                      mlir::ValueRange{exception});
+                                      mlir::ValueRange{*branchArgs});
 
   rewriter.setInsertionPoint(awaitOp);
   auto asyncAwait = rewriter.create<mlir::async::AwaitOp>(awaitOp.getLoc(),
@@ -509,20 +645,28 @@ convertExceptEntryArgument(mlir::Block *exceptEntry,
     return mlir::failure();
 
   mlir::BlockArgument oldArg = exceptEntry->getArgument(0);
-  mlir::Type convertedType = typeConverter.convertType(oldArg.getType());
-  if (!convertedType)
+  llvm::SmallVector<mlir::Type> convertedTypes;
+  if (mlir::failed(
+          typeConverter.convertType(oldArg.getType(), convertedTypes)) ||
+      convertedTypes.empty())
     return mlir::failure();
-  if (convertedType == oldArg.getType())
+  if (convertedTypes.size() == 1 && convertedTypes.front() == oldArg.getType())
     return oldArg;
 
-  mlir::BlockArgument convertedArg =
-      exceptEntry->addArgument(convertedType, oldArg.getLoc());
+  llvm::SmallVector<mlir::BlockArgument> convertedArgs;
+  for (mlir::Type convertedType : convertedTypes)
+    convertedArgs.push_back(
+        exceptEntry->addArgument(convertedType, oldArg.getLoc()));
   mlir::OpBuilder::InsertionGuard guard(rewriter);
   rewriter.setInsertionPointToStart(exceptEntry);
+  llvm::SmallVector<mlir::Value> convertedValues;
+  for (mlir::BlockArgument argument : convertedArgs)
+    convertedValues.push_back(argument);
   mlir::Value logicalArg =
       rewriter
           .create<mlir::UnrealizedConversionCastOp>(
-              oldArg.getLoc(), mlir::TypeRange{oldArg.getType()}, convertedArg)
+              oldArg.getLoc(), mlir::TypeRange{oldArg.getType()},
+              convertedValues)
           .getResult(0);
   if (isPyOwnershipTrackedType(oldArg.getType())) {
     llvm::SmallVector<mlir::Attribute, 1> owned{rewriter.getI64IntegerAttr(0)};
@@ -604,6 +748,26 @@ static mlir::LogicalResult convertFinallyEntryArguments(
   return mlir::success();
 }
 
+static void erasePrecedingExceptionDrops(mlir::Value exception,
+                                         mlir::Operation *anchor,
+                                         mlir::PatternRewriter &rewriter) {
+  if (!exception || !anchor)
+    return;
+  llvm::SmallVector<mlir::Operation *> drops;
+  for (mlir::OpOperand &use : llvm::make_early_inc_range(exception.getUses())) {
+    mlir::Operation *user = use.getOwner();
+    if (!mlir::isa<DecRefOp>(user))
+      continue;
+    if (user->getBlock() != anchor->getBlock())
+      continue;
+    if (!user->isBeforeInBlock(anchor))
+      continue;
+    drops.push_back(user);
+  }
+  for (mlir::Operation *drop : drops)
+    rewriter.eraseOp(drop);
+}
+
 static void
 replaceRaiseCurrentInExceptBlocks(llvm::ArrayRef<mlir::Block *> exceptBlocks,
                                   mlir::Value caughtException,
@@ -621,6 +785,7 @@ replaceRaiseCurrentInExceptBlocks(llvm::ArrayRef<mlir::Block *> exceptBlocks,
   for (RaiseCurrentOp raiseCurrent : raises) {
     rewriter.setInsertionPoint(raiseCurrent);
     mlir::Value exception = caughtException;
+    erasePrecedingExceptionDrops(exception, raiseCurrent, rewriter);
     if (exception.getType() != exceptionType) {
       exception = rewriter
                       .create<mlir::UnrealizedConversionCastOp>(
@@ -628,7 +793,60 @@ replaceRaiseCurrentInExceptBlocks(llvm::ArrayRef<mlir::Block *> exceptBlocks,
                           exception)
                       .getResult(0);
     }
+    auto retain = rewriter.create<IncRefOp>(raiseCurrent.getLoc(), exception);
+    threadsafe::Retain::premise(retain.getOperation(),
+                                ThreadSafetyAttrs::kPremiseAggregateBorrow);
     rewriter.replaceOpWithNewOp<RaiseOp>(raiseCurrent, exception);
+  }
+}
+
+static bool isDropOnlyExceptionUse(mlir::Operation *user) {
+  return mlir::isa<DecRefOp>(user);
+}
+
+static bool caughtExceptionOnlyDropped(mlir::Block *exceptEntry) {
+  if (!exceptEntry || exceptEntry->getNumArguments() != 1)
+    return false;
+  mlir::BlockArgument exception = exceptEntry->getArgument(0);
+  return llvm::all_of(exception.getUsers(), isDropOnlyExceptionUse);
+}
+
+static bool hasRaiseCurrent(llvm::ArrayRef<mlir::Block *> blocks) {
+  for (mlir::Block *block : blocks) {
+    if (block
+            ->walk([](RaiseCurrentOp) { return mlir::WalkResult::interrupt(); })
+            .wasInterrupted())
+      return true;
+  }
+  return false;
+}
+
+static bool hasNestedTry(TryOp op) {
+  bool nested = false;
+  for (mlir::Region &region : op->getRegions()) {
+    region.walk([&](TryOp candidate) {
+      if (candidate != op)
+        nested = true;
+    });
+    if (nested)
+      return true;
+  }
+  return false;
+}
+
+static void eraseDropUsers(mlir::Value value, mlir::PatternRewriter &rewriter) {
+  llvm::SmallVector<mlir::Operation *> drops;
+  for (mlir::OpOperand &use : llvm::make_early_inc_range(value.getUses())) {
+    mlir::Operation *user = use.getOwner();
+    if (isDropOnlyExceptionUse(user))
+      drops.push_back(user);
+  }
+  llvm::SmallPtrSet<mlir::Operation *, 8> seen;
+  for (mlir::Operation *drop : drops) {
+    if (!seen.insert(drop).second)
+      continue;
+    if (!drop->hasTrait<mlir::OpTrait::IsTerminator>())
+      rewriter.eraseOp(drop);
   }
 }
 
@@ -830,9 +1048,27 @@ struct ExceptionNullLowering
                   mlir::ConversionPatternRewriter &rewriter) const override {
     auto *typeConverter =
         static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
-    mlir::Type resultType =
-        typeConverter->convertType(op.getResult().getType());
-    rewriter.replaceOpWithNewOp<mlir::LLVM::ZeroOp>(op, resultType);
+    llvm::SmallVector<mlir::Type> resultTypes;
+    if (mlir::failed(
+            typeConverter->convertType(op.getResult().getType(), resultTypes)))
+      return rewriter.notifyMatchFailure(op, "failed to convert exception");
+    llvm::SmallVector<mlir::Value> results;
+    for (mlir::Type resultType : resultTypes) {
+      if (mlir::isa<mlir::MemRefType>(resultType))
+        return rewriter.notifyMatchFailure(
+            op, "exception null cannot allocate a memref object; it must lower "
+                "only after the nullable exception has become a zero lowered "
+                "descriptor");
+      auto structType = mlir::dyn_cast<mlir::LLVM::LLVMStructType>(resultType);
+      if (!structType ||
+          (!object_abi::Type::isLoweredStorage(structType) &&
+           structType != loweredExceptionPartsDescriptorType(op.getContext())))
+        return rewriter.notifyMatchFailure(
+            op, "exception null requires lowered exception descriptor ABI");
+      results.push_back(
+          rewriter.create<mlir::LLVM::ZeroOp>(op.getLoc(), resultType));
+    }
+    rewriter.replaceOp(op, results);
     return mlir::success();
   }
 };
@@ -885,35 +1121,69 @@ struct ExceptionNewLowering : public mlir::OpConversionPattern<ExceptionNewOp> {
     auto *typeConverter =
         static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
     RuntimeAPI runtime(module, rewriter, *typeConverter);
-    mlir::Type resultType =
-        typeConverter->convertType(op.getResult().getType());
-    llvm::ArrayRef<mlir::ValueRange> operands = adaptor.getOperands();
-    if (operands.size() != op->getNumOperands())
+    llvm::SmallVector<mlir::Type> resultTypes;
+    if (mlir::failed(
+            typeConverter->convertType(op.getResult().getType(), resultTypes)))
+      return rewriter.notifyMatchFailure(op, "failed to convert exception");
+    if (resultTypes.size() != 3)
       return rewriter.notifyMatchFailure(
-          op, "exception.new operand conversion arity mismatch");
+          op, "exception split ABI requires header and unicode message");
 
-    auto firstOperand = [&](unsigned index) -> mlir::Value {
-      if (index >= operands.size() || operands[index].empty())
-        return {};
-      return operands[index].front();
-    };
-    mlir::Value type = firstOperand(0);
-    mlir::Value message = firstOperand(1);
-    mlir::Value cause = firstOperand(3);
-    mlir::Value context = firstOperand(4);
-    mlir::Value traceback = firstOperand(5);
-    mlir::Value location = firstOperand(6);
-    if (!type || !message || !cause || !context || !traceback || !location)
-      return rewriter.notifyMatchFailure(
-          op, "exception.new requires scalar runtime bridge operands");
+    llvm::SmallVector<mlir::Value, 2> messageParts;
+    if (adaptor.getArgs().size() > 1)
+      return rewriter.notifyMatchFailure(op, "too many exception arguments");
+    if (adaptor.getArgs().empty()) {
+      mlir::Value bytes =
+          runtime.getByteLiteral(op.getLoc(), rewriter.getStringAttr(""));
+      mlir::Value start =
+          rewriter.create<mlir::arith::ConstantIndexOp>(op.getLoc(), 0);
+      mlir::Value length = runtime.getI64Constant(op.getLoc(), 0);
+      llvm::SmallVector<mlir::Type, 2> unicodeTypes;
+      object_abi::str_abi::Parts::storageTypes(rewriter.getContext(),
+                                               unicodeTypes);
+      auto message =
+          runtime.call(op.getLoc(), RuntimeSymbols::kUnicodeFromBytes,
+                       mlir::TypeRange(unicodeTypes),
+                       mlir::ValueRange{bytes, start, length});
+      messageParts.append(message.getResults().begin(),
+                          message.getResults().end());
+    } else {
+      mlir::ValueRange message = adaptor.getArgs().front();
+      messageParts.append(message.begin(), message.end());
+    }
+    if (messageParts.size() != 2)
+      return rewriter.notifyMatchFailure(op,
+                                         "message must lower to unicode parts");
 
-    mlir::Value nullPtr = rewriter.create<mlir::LLVM::ZeroOp>(
-        op.getLoc(), mlir::LLVM::LLVMPointerType::get(rewriter.getContext()));
-    auto call =
-        runtime.call(op.getLoc(), RuntimeSymbols::kExceptionNew, resultType,
-                     mlir::ValueRange{type, message, nullPtr, cause, context,
-                                      traceback, location, nullPtr});
-    rewriter.replaceOp(op, call.getResults());
+    auto storage =
+        runtime.call(op.getLoc(), RuntimeSymbols::kExceptionNew,
+                     mlir::TypeRange{resultTypes.front()}, mlir::ValueRange{});
+    llvm::SmallVector<mlir::Value, 3> exceptionParts;
+    exceptionParts.push_back(storage.getResult());
+    exceptionParts.append(messageParts.begin(), messageParts.end());
+    rewriter.replaceOpWithMultiple(
+        op, llvm::ArrayRef<mlir::ValueRange>{mlir::ValueRange{exceptionParts}});
+    return mlir::success();
+  }
+};
+
+struct ExceptMatchLowering : public mlir::OpConversionPattern<ExceptMatchOp> {
+  ExceptMatchLowering(PyLLVMTypeConverter &converter, mlir::MLIRContext *ctx)
+      : mlir::OpConversionPattern<ExceptMatchOp>(converter, ctx) {}
+
+  mlir::LogicalResult
+  matchAndRewrite(ExceptMatchOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    (void)adaptor;
+    auto handlerType = mlir::dyn_cast<ClassType>(op.getType().getType());
+    if (!handlerType)
+      return rewriter.notifyMatchFailure(op, "handler is not a class type");
+    mlir::FailureOr<bool> matches =
+        type_object::exceptionMatches(op, handlerType.getClassName());
+    if (mlir::failed(matches))
+      return mlir::failure();
+    rewriter.replaceOpWithNewOp<mlir::arith::ConstantIntOp>(
+        op, *matches ? 1 : 0, 1);
     return mlir::success();
   }
 };
@@ -927,6 +1197,8 @@ struct TryLowering : public mlir::OpRewritePattern<TryOp> {
   matchAndRewrite(TryOp op, mlir::PatternRewriter &rewriter) const override {
     if (op.getTryRegion().empty())
       return rewriter.notifyMatchFailure(op, "empty try region");
+    if (hasNestedTry(op))
+      return rewriter.notifyMatchFailure(op, "nested py.try must lower first");
 
     bool hasExcept = !op.getExceptRegion().empty();
     bool hasFinally = !op.getFinallyRegion().empty();
@@ -1019,6 +1291,9 @@ struct TryLowering : public mlir::OpRewritePattern<TryOp> {
     if (hasFinally)
       for (mlir::Block &block : op.getFinallyRegion())
         finallyBlocks.push_back(&block);
+    bool exceptDropsCaughtException = hasExcept &&
+                                      caughtExceptionOnlyDropped(exceptEntry) &&
+                                      !hasRaiseCurrent(exceptBlocks);
 
     // Move operations after py.try into merge block.
     for (auto it = std::next(op->getIterator()); it != parentBlock->end();) {
@@ -1037,6 +1312,8 @@ struct TryLowering : public mlir::OpRewritePattern<TryOp> {
                                   mergeBlock->getIterator());
 
     if (hasExcept) {
+      if (exceptDropsCaughtException)
+        eraseDropUsers(exceptEntry->getArgument(0), rewriter);
       mlir::FailureOr<mlir::Value> caughtException =
           convertExceptEntryArgument(exceptEntry, typeConverter, rewriter);
       if (mlir::failed(caughtException))
@@ -1065,39 +1342,86 @@ struct TryLowering : public mlir::OpRewritePattern<TryOp> {
       for (mlir::Block *block : activeTryBlocks) {
         for (auto invoke : block->getOps<InvokeOp>()) {
           mlir::OpBuilder builder(invoke);
-          mlir::Type exceptArgType = exceptEntry->getArgument(0).getType();
           mlir::Value excNull;
-          if (mlir::isa<mlir::LLVM::LLVMPointerType>(exceptArgType)) {
-            excNull = builder.create<mlir::LLVM::ZeroOp>(invoke.getLoc(),
-                                                         exceptArgType);
-          } else {
-            excNull = builder.create<ExceptionNullOp>(
-                invoke.getLoc(), ExceptionType::get(op.getContext()));
-            if (excNull.getType() != exceptArgType)
-              excNull = builder
-                            .create<mlir::UnrealizedConversionCastOp>(
-                                invoke.getLoc(), mlir::TypeRange{exceptArgType},
-                                excNull)
-                            .getResult(0);
-          }
-          invoke.getUnwindDestOperandsMutable().assign(excNull);
+          excNull = builder.create<ExceptionNullOp>(
+              invoke.getLoc(), ExceptionType::get(op.getContext()));
+          llvm::SmallVector<mlir::Type> exceptArgTypes =
+              blockArgumentTypes(exceptEntry);
+          auto cast = builder.create<mlir::UnrealizedConversionCastOp>(
+              invoke.getLoc(), mlir::TypeRange(exceptArgTypes), excNull);
+          invoke.getUnwindDestOperandsMutable().assign(cast.getResults());
           invoke->setSuccessor(exceptEntry, 1);
         }
         if (auto raise = mlir::dyn_cast<RaiseOp>(block->getTerminator())) {
           rewriter.setInsertionPoint(raise);
-          mlir::Value exception = raise.getException();
-          mlir::Type exceptArgType = exceptEntry->getArgument(0).getType();
-          if (exception.getType() != exceptArgType)
-            exception = rewriter
-                            .create<mlir::UnrealizedConversionCastOp>(
-                                raise.getLoc(), mlir::TypeRange{exceptArgType},
-                                exception)
-                            .getResult(0);
+          mlir::Value raisedException = raise.getException();
+          mlir::Value exception = raisedException;
+          if (exceptDropsCaughtException) {
+            exception = rewriter.create<ExceptionNullOp>(
+                raise.getLoc(), ExceptionType::get(op.getContext()));
+          }
+          mlir::FailureOr<llvm::SmallVector<mlir::Value>> branchArgs =
+              convertLogicalValueForBlock(raise.getLoc(), exception,
+                                          exceptEntry, rewriter);
+          if (mlir::failed(branchArgs))
+            return mlir::failure();
+          if (exceptDropsCaughtException &&
+              isPyOwnershipTrackedType(raisedException.getType()))
+            rewriter.create<DecRefOp>(raise.getLoc(), raisedException);
           eraseOpsAfter(raise, rewriter);
           raise->setAttr("ly.redirected_to_except", rewriter.getUnitAttr());
           rewriter.create<mlir::cf::BranchOp>(raise.getLoc(), exceptEntry,
-                                              mlir::ValueRange{exception});
+                                              mlir::ValueRange{*branchArgs});
           rewriter.eraseOp(raise);
+        }
+        if (auto raiseCurrent =
+                mlir::dyn_cast<RaiseCurrentOp>(block->getTerminator())) {
+          rewriter.setInsertionPoint(raiseCurrent);
+          mlir::Value exception;
+          auto landingpad = mlir::dyn_cast_or_null<mlir::LLVM::LandingpadOp>(
+              block->empty() ? nullptr : &block->front());
+          if (exceptDropsCaughtException) {
+            exception = rewriter.create<ExceptionNullOp>(
+                raiseCurrent.getLoc(), ExceptionType::get(op.getContext()));
+          } else if (landingpad) {
+            exception = captureLandingpadException(
+                raiseCurrent.getLoc(), landingpad,
+                ExceptionType::get(op.getContext()),
+                op->getParentOfType<mlir::ModuleOp>(), rewriter, typeConverter);
+          } else if (block->getNumArguments() ==
+                     exceptEntry->getNumArguments()) {
+            llvm::SmallVector<mlir::Value> parts;
+            for (mlir::BlockArgument argument : block->getArguments())
+              parts.push_back(argument);
+            mlir::FailureOr<mlir::Value> logicalException =
+                materializeLogicalValue(raiseCurrent.getLoc(),
+                                        ExceptionType::get(op.getContext()),
+                                        parts, rewriter);
+            if (mlir::failed(logicalException))
+              return mlir::failure();
+            exception = *logicalException;
+          } else if (block->getNumArguments() == 1) {
+            exception = block->getArgument(0);
+          } else {
+            return rewriter.notifyMatchFailure(
+                op, "raise.current unwind block must carry one exception");
+          }
+          if (!exception)
+            return rewriter.notifyMatchFailure(
+                op, "failed to capture current exception");
+          erasePrecedingExceptionDrops(exception, raiseCurrent, rewriter);
+          mlir::FailureOr<llvm::SmallVector<mlir::Value>> branchArgs =
+              convertLogicalValueForBlock(raiseCurrent.getLoc(), exception,
+                                          exceptEntry, rewriter);
+          if (mlir::failed(branchArgs))
+            return mlir::failure();
+          eraseOpsAfter(raiseCurrent, rewriter);
+          raiseCurrent->setAttr("ly.redirected_to_except",
+                                rewriter.getUnitAttr());
+          rewriter.create<mlir::cf::BranchOp>(raiseCurrent.getLoc(),
+                                              exceptEntry,
+                                              mlir::ValueRange{*branchArgs});
+          rewriter.eraseOp(raiseCurrent);
         }
       }
     }
@@ -1203,7 +1527,7 @@ struct RaiseLowering : public mlir::OpConversionPattern<RaiseOp> {
       : mlir::OpConversionPattern<RaiseOp>(converter, ctx) {}
 
   mlir::LogicalResult
-  matchAndRewrite(RaiseOp op, OpAdaptor adaptor,
+  matchAndRewrite(RaiseOp op, OneToNOpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     mlir::ModuleOp module = op->getParentOfType<mlir::ModuleOp>();
     if (!module)
@@ -1211,11 +1535,27 @@ struct RaiseLowering : public mlir::OpConversionPattern<RaiseOp> {
     auto *typeConverter =
         static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
     RuntimeAPI runtime(module, rewriter, *typeConverter);
+    mlir::ValueRange exceptionParts = adaptor.getException();
     if (mlir::Value exceptionCell = getCurrentAsyncExceptionCell(op)) {
-      storeExceptionCell(op.getLoc(), exceptionCell, adaptor.getException(),
-                         module, rewriter, *typeConverter);
-      runtime.call(op.getLoc(), RuntimeSymbols::kDecRef, mlir::Type(),
-                   mlir::ValueRange{adaptor.getException()});
+      mlir::Value exceptionForCell =
+          exceptionParts.size() == 3
+              ? packExceptionPartsForAsyncCell(op.getLoc(), exceptionParts,
+                                               rewriter)
+              : mlir::Value();
+      if (!exceptionForCell) {
+        mlir::FailureOr<mlir::Value> exception = materializeLogicalValue(
+            op.getLoc(), op.getException().getType(), exceptionParts, rewriter);
+        if (mlir::failed(exception))
+          return mlir::failure();
+        exceptionForCell = *exception;
+      }
+      if (mlir::failed(storeExceptionCell(op.getLoc(), exceptionCell,
+                                          exceptionForCell, module, rewriter,
+                                          *typeConverter)))
+        return mlir::failure();
+      if (mlir::failed(async_runtime::ExceptionCell::releasePayload(
+              op.getLoc(), module, rewriter, *typeConverter, exceptionForCell)))
+        return mlir::failure();
       mlir::Value falseValue = rewriter.create<mlir::arith::ConstantOp>(
           op.getLoc(), rewriter.getBoolAttr(false));
       rewriter.create<mlir::cf::AssertOp>(op.getLoc(), falseValue,
@@ -1236,21 +1576,23 @@ struct RaiseLowering : public mlir::OpConversionPattern<RaiseOp> {
     getLocInfo(op.getLoc(), op.getContext(), fileAttr, line, col);
     mlir::StringAttr funcAttr = getFuncNameAttr(
         op->getParentOfType<mlir::func::FuncOp>(), op.getContext());
-    mlir::Value filePtr = runtime.getStringLiteral(op.getLoc(), fileAttr);
-    mlir::Value funcPtr = runtime.getStringLiteral(op.getLoc(), funcAttr);
-    mlir::Value lineConst = rewriter.create<mlir::LLVM::ConstantOp>(
-        op.getLoc(), rewriter.getI32Type(),
-        rewriter.getI32IntegerAttr(static_cast<int32_t>(line)));
-    mlir::Value colConst = rewriter.create<mlir::LLVM::ConstantOp>(
-        op.getLoc(), rewriter.getI32Type(),
-        rewriter.getI32IntegerAttr(static_cast<int32_t>(col)));
+    mlir::Value fileBytes = runtime.getByteLiteral(op.getLoc(), fileAttr);
+    mlir::Value funcBytes = runtime.getByteLiteral(op.getLoc(), funcAttr);
+    mlir::Value lineConst = rewriter.create<mlir::arith::ConstantIntOp>(
+        op.getLoc(), static_cast<int32_t>(line), 32);
+    mlir::Value colConst = rewriter.create<mlir::arith::ConstantIntOp>(
+        op.getLoc(), static_cast<int32_t>(col), 32);
     runtime.call(op.getLoc(), RuntimeSymbols::kTracebackPush, mlir::Type(),
-                 mlir::ValueRange{filePtr, funcPtr, lineConst, colConst});
-    runtime.call(op.getLoc(), RuntimeSymbols::kEHThrow, mlir::Type(),
-                 mlir::ValueRange{adaptor.getException()});
-    rewriter.create<mlir::LLVM::UnreachableOp>(op.getLoc());
-    rewriter.eraseOp(op);
-    return mlir::success();
+                 mlir::ValueRange{fileBytes, funcBytes, lineConst, colConst});
+    if (exceptionParts.size() == 3) {
+      runtime.call(op.getLoc(), RuntimeSymbols::kEHThrowException, mlir::Type(),
+                   exceptionParts);
+      rewriter.create<mlir::LLVM::UnreachableOp>(op.getLoc());
+      rewriter.eraseOp(op);
+      return mlir::success();
+    }
+    return rewriter.notifyMatchFailure(
+        op, "py.raise requires exception parts descriptor ABI");
   }
 };
 
@@ -1267,16 +1609,8 @@ struct RaiseCurrentLowering : public mlir::OpConversionPattern<RaiseCurrentOp> {
     auto *typeConverter =
         static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
     RuntimeAPI runtime(module, rewriter, *typeConverter);
-    mlir::Type pyObject = runtime.getPyObjectPtrType();
-    auto current =
-        runtime.call(op.getLoc(), RuntimeSymbols::kExceptionGetCurrent,
-                     pyObject, mlir::ValueRange{});
-    auto retain = runtime.call(op.getLoc(), RuntimeSymbols::kIncRef,
-                               mlir::Type(), current.getResults());
-    threadsafe::Retain::premise(retain.getOperation(),
-                                ThreadSafetyAttrs::kPremiseOwnedToken);
-    runtime.call(op.getLoc(), RuntimeSymbols::kEHThrow, mlir::Type(),
-                 current.getResults());
+    runtime.call(op.getLoc(), RuntimeSymbols::kEHRethrowCurrent, mlir::Type(),
+                 mlir::ValueRange{});
     rewriter.create<mlir::LLVM::UnreachableOp>(op.getLoc());
     rewriter.eraseOp(op);
     return mlir::success();
@@ -1291,7 +1625,7 @@ void populate(PyLLVMTypeConverter &typeConverter,
   auto *ctx = patterns.getContext();
   patterns.add<ExceptionNullLowering, TracebackNullLowering,
                LocationCurrentLowering, ExceptionNewLowering, RaiseLowering,
-               RaiseCurrentLowering>(typeConverter, ctx);
+               RaiseCurrentLowering, ExceptMatchLowering>(typeConverter, ctx);
 }
 } // namespace lowering::value::base::Patterns
 

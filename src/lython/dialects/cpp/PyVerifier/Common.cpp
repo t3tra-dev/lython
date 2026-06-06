@@ -1,5 +1,10 @@
 #include "cpp/PyVerifier/Common.h"
 
+#include "cpp/PyTypeObject.h"
+
+#include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/StringSet.h"
+
 namespace py {
 
 ClassOp lookupClassSymbol(mlir::Operation *from, ClassType classType) {
@@ -18,10 +23,19 @@ ClassOp lookupClassSymbol(mlir::Operation *from, ClassType classType) {
 }
 
 FuncOp lookupMethodByName(ClassOp classOp, llvm::StringRef methodName) {
-  for (FuncOp method : classOp.getBody().front().getOps<FuncOp>()) {
-    if (mlir::StringAttr nameAttr = method.getSymNameAttr())
-      if (nameAttr.getValue() == methodName)
-        return method;
+  auto mro =
+      type_object::mroNames(classOp, classOp.getSymNameAttr().getValue());
+  if (mlir::failed(mro))
+    return nullptr;
+  for (llvm::StringRef className : *mro) {
+    ClassOp owner = type_object::lookup(classOp, className);
+    if (!owner || owner.getBody().empty())
+      continue;
+    for (FuncOp method : owner.getBody().front().getOps<FuncOp>()) {
+      if (mlir::StringAttr nameAttr = method.getSymNameAttr())
+        if (nameAttr.getValue() == methodName)
+          return method;
+    }
   }
   return nullptr;
 }
@@ -36,24 +50,34 @@ mlir::FailureOr<mlir::Type> lookupClassFieldType(mlir::Operation *from,
     return mlir::failure();
   }
 
-  mlir::ArrayAttr fieldNames = classOp.getFieldNamesAttr();
-  mlir::ArrayAttr fieldTypes = classOp.getFieldTypesAttr();
-  if (!fieldNames || !fieldTypes) {
-    from->emitOpError("class '") << classType.getClassName()
-                                 << "' does not define a static field schema";
+  auto mro = type_object::mroNames(from, classType.getClassName());
+  if (mlir::failed(mro))
     return mlir::failure();
-  }
-
-  for (auto [nameAttr, typeAttr] : llvm::zip(fieldNames, fieldTypes)) {
-    auto stringAttr = mlir::dyn_cast<mlir::StringAttr>(nameAttr);
-    auto mlirTypeAttr = mlir::dyn_cast<mlir::TypeAttr>(typeAttr);
-    if (!stringAttr || !mlirTypeAttr) {
+  for (llvm::StringRef ownerName : *mro) {
+    ClassOp owner = type_object::lookup(from, ownerName);
+    if (!owner)
+      continue;
+    mlir::ArrayAttr fieldNames = owner.getFieldNamesAttr();
+    mlir::ArrayAttr fieldTypes = owner.getFieldTypesAttr();
+    if (!fieldNames && !fieldTypes)
+      continue;
+    if (!fieldNames || !fieldTypes || fieldNames.size() != fieldTypes.size()) {
       from->emitOpError("class '")
-          << classType.getClassName() << "' has malformed field schema";
+          << ownerName << "' has malformed field schema";
       return mlir::failure();
     }
-    if (stringAttr.getValue() == fieldName)
-      return mlirTypeAttr.getValue();
+
+    for (auto [nameAttr, typeAttr] : llvm::zip(fieldNames, fieldTypes)) {
+      auto stringAttr = mlir::dyn_cast<mlir::StringAttr>(nameAttr);
+      auto mlirTypeAttr = mlir::dyn_cast<mlir::TypeAttr>(typeAttr);
+      if (!stringAttr || !mlirTypeAttr) {
+        from->emitOpError("class '")
+            << ownerName << "' has malformed field schema";
+        return mlir::failure();
+      }
+      if (stringAttr.getValue() == fieldName)
+        return mlirTypeAttr.getValue();
+    }
   }
 
   from->emitOpError("class '")
@@ -322,16 +346,31 @@ mlir::LogicalResult verifyVectorCallOperands(
   bool homogeneous = posElems.size() == 1;
 
   auto positionalTypes = signature.getPositionalTypes();
+  auto kwonlyTypes = signature.getKwOnlyTypes();
   unsigned minPositionalCount =
       getMinimumPositionalCountForCallable(signature, callable);
+  unsigned normalizedKwonlyCount = 0;
   if (!signature.hasVararg()) {
-    if (posElems.size() > positionalTypes.size())
+    unsigned normalizedPosargLimit =
+        positionalTypes.size() + kwonlyTypes.size();
+    if (posElems.size() > normalizedPosargLimit)
       return op->emitOpError(
           "posargs length mismatch with callee positional parameters");
-    for (auto [elemType, expected] : llvm::zip(posElems, positionalTypes))
-      if (!isSubtypeOf(elemType, expected))
+    for (size_t index = 0;
+         index < posElems.size() && index < positionalTypes.size(); ++index)
+      if (!isSubtypeOf(posElems[index], positionalTypes[index]))
         return op->emitOpError(
             "posargs element type does not match positional parameter type");
+    if (posElems.size() > positionalTypes.size()) {
+      normalizedKwonlyCount =
+          static_cast<unsigned>(posElems.size() - positionalTypes.size());
+      for (size_t index = 0; index < normalizedKwonlyCount; ++index) {
+        if (!isSubtypeOf(posElems[positionalTypes.size() + index],
+                         kwonlyTypes[index]))
+          return op->emitOpError("normalized keyword-only argument type "
+                                 "does not match parameter type");
+      }
+    }
   } else {
     auto calleeVarargTy = mlir::dyn_cast<TupleType>(signature.getVarargType());
     if (!calleeVarargTy || calleeVarargTy.getElementTypes().size() != 1)
@@ -375,15 +414,10 @@ mlir::LogicalResult verifyVectorCallOperands(
       return op->emitOpError("kwnames tuple elements must be !py.str");
 
   auto valueElems = valueTuple.getElementTypes();
-  for (mlir::Type elem : valueElems)
-    if (!isPyObjectType(elem))
-      return op->emitOpError("kwvalues tuple elements must be !py.object");
-
   if (nameElems.size() != valueElems.size())
     return op->emitOpError(
         "kwnames and kwvalues must describe the same number of entries");
 
-  auto kwonlyTypes = signature.getKwOnlyTypes();
   bool keywordsAccepted =
       signature.hasKwarg() || !kwonlyTypes.empty() ||
       (expectedArgNamesAttr && !expectedArgNamesAttr.empty());
@@ -455,12 +489,44 @@ mlir::LogicalResult verifyVectorCallOperands(
       if (!providedSet.insert(providedName).second)
         return op->emitOpError("duplicate keyword '") << providedName << "'";
 
+    mlir::Type kwargValueType;
+    if (signature.hasKwarg()) {
+      auto kwargType = mlir::dyn_cast<DictType>(signature.getKwargType());
+      if (!kwargType)
+        return op->emitOpError("kwarg parameter must be a !py.dict value");
+      kwargValueType = kwargType.getValueType();
+    }
+
     if (!signature.hasKwarg()) {
       for (llvm::StringRef providedName : providedKwNames)
         if (!positionalNameToIndex.count(providedName) &&
             !kwonlyNameToIndex.count(providedName))
           return op->emitOpError("unexpected keyword argument '")
                  << providedName << "'";
+    }
+
+    for (auto [index, providedName] : llvm::enumerate(providedKwNames)) {
+      mlir::Type expected;
+      if (auto positionalIt = positionalNameToIndex.find(providedName);
+          positionalIt != positionalNameToIndex.end()) {
+        if (positionalIt->second < posElems.size())
+          return op->emitOpError("argument '")
+                 << providedName
+                 << "' was provided both positionally and by keyword";
+        expected = positionalTypes[positionalIt->second];
+      } else if (auto kwonlyIt = kwonlyNameToIndex.find(providedName);
+                 kwonlyIt != kwonlyNameToIndex.end()) {
+        expected = kwonlyTypes[kwonlyIt->second];
+      } else if (kwargValueType) {
+        expected = kwargValueType;
+      } else {
+        return op->emitOpError("unexpected keyword argument '")
+               << providedName << "'";
+      }
+      if (!isSubtypeOf(valueElems[index], expected))
+        return op->emitOpError("keyword argument '")
+               << providedName << "' has type " << valueElems[index]
+               << " but expected " << expected;
     }
 
     for (auto [index, name] : llvm::enumerate(positionalNames)) {
@@ -472,7 +538,9 @@ mlir::LogicalResult verifyVectorCallOperands(
         return op->emitOpError("missing required argument '") << name << "'";
     }
 
-    for (llvm::StringRef expected : kwonlyNames) {
+    for (auto [index, expected] : llvm::enumerate(kwonlyNames)) {
+      if (index < normalizedKwonlyCount)
+        continue;
       if (defaultedKeywordNames.contains(expected))
         continue;
       if (providedSet.contains(expected))
@@ -485,6 +553,9 @@ mlir::LogicalResult verifyVectorCallOperands(
              defaultedKeywordNames.size() < kwonlyTypes.size()) {
     return op->emitOpError(
         "callee expects keyword arguments but none were provided");
+  } else if (!valueElems.empty()) {
+    return op->emitOpError(
+        "keyword argument names must be statically literal for typed kwvalues");
   } else if (!signature.hasVararg() && posElems.size() < minPositionalCount) {
     return op->emitOpError(
         "posargs length mismatch with callee positional parameters");

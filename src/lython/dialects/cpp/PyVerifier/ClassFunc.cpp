@@ -1,14 +1,18 @@
 #include "cpp/PyVerifier/Common.h"
 
+#include "cpp/PyTypeObject.h"
+
+#include "llvm/ADT/StringSet.h"
+
 namespace py {
 
 static bool isSupportedStaticFieldType(mlir::Type type) {
-  if (mlir::isa<IntType, FloatType, BoolType, StrType, NoneType,
+  if (mlir::isa<ClassType, IntType, FloatType, BoolType, StrType, NoneType,
                 mlir::IntegerType, mlir::FloatType>(type))
     return true;
   auto isSupportedContainerElement = [](mlir::Type elementType) {
     return mlir::isa<ClassType, IntType, FloatType, BoolType, StrType, NoneType,
-                     ObjectType>(elementType);
+                     mlir::IntegerType, mlir::FloatType>(elementType);
   };
   if (auto listType = mlir::dyn_cast<ListType>(type)) {
     return isSupportedContainerElement(listType.getElementType());
@@ -54,9 +58,9 @@ static mlir::LogicalResult verifyClassFieldSchema(ClassOp op) {
     if (!isSupportedStaticFieldType(typeAttr.getValue()))
       return op.emitOpError("unsupported static field type ")
              << typeAttr.getValue()
-             << "; supported field types are !py.int, !py.float, !py.bool, "
-                "!py.str, !py.none, integers, floats, typed lists, and typed "
-                "dicts/tuples";
+             << "; supported field types are !py.class, !py.int, !py.float, "
+                "!py.bool, !py.str, !py.none, integers, floats, typed lists, "
+                "and typed dicts/tuples";
   }
 
   return mlir::success();
@@ -68,8 +72,8 @@ static bool isAllowedClassBodyMetadataOp(mlir::Operation *op) {
          name == "py.float.constant" || name == "py.none" ||
          name == "py.tuple.empty" || name == "py.tuple.create" ||
          name == "py.dict.empty" || name == "py.dict.insert" ||
-         name == "py.upcast" || name == "py.func.object" ||
-         name == "py.make_function" || name == "py.publish";
+         name == "py.func.object" || name == "py.make_function" ||
+         name == "py.publish";
 }
 
 mlir::LogicalResult ClassOp::verify() {
@@ -80,12 +84,13 @@ mlir::LogicalResult ClassOp::verify() {
     return emitOpError("body must consist of a single block");
   if (mlir::failed(verifyClassFieldSchema(*this)))
     return mlir::failure();
+  if (mlir::failed(type_object::verifyBases(*this)))
+    return mlir::failure();
 
   mlir::Block &block = body.front();
   llvm::StringSet<> methodNames;
   ClassType classType =
       ClassType::get(getContext(), getSymNameAttr().getValue());
-
   for (mlir::Operation &op : block) {
     if (isAllowedClassBodyMetadataOp(&op))
       continue;
@@ -193,7 +198,7 @@ mlir::LogicalResult ListNewOp::verify() {
     return emitOpError("result must be of type !py.list");
   mlir::Type elementType = listType.getElementType();
   if (!mlir::isa<ClassType, IntType, FloatType, BoolType, StrType, NoneType,
-                 ObjectType>(elementType))
+                 mlir::IntegerType, mlir::FloatType>(elementType))
     return emitOpError("unsupported list element type ") << elementType;
   return mlir::success();
 }
@@ -307,9 +312,8 @@ mlir::LogicalResult FuncOp::verify() {
     DictType dictTy = mlir::dyn_cast<DictType>(signature.getKwargType());
     if (!dictTy)
       return emitOpError("kwarg parameter must be of type !py.dict");
-    if (!isPyStrType(dictTy.getKeyType()) ||
-        !isPyObjectType(dictTy.getValueType()))
-      return emitOpError("kwarg mapping must be !py.dict<!py.str, !py.object>");
+    if (!isPyStrType(dictTy.getKeyType()) || !isPyType(dictTy.getValueType()))
+      return emitOpError("kwarg mapping must be !py.dict<!py.str, !py.*>");
   }
 
   mlir::ArrayRef<mlir::Type> positionalTypes = signature.getPositionalTypes();
@@ -483,9 +487,8 @@ mlir::LogicalResult MakeFunctionOp::verify() {
       return emitOpError("kwdefaults must be a !py.dict value");
     if (!isSubtypeOf(dictTy.getKeyType(), StrType::get(getContext())))
       return emitOpError("kwdefaults keys must be compatible with !py.str");
-    if (!isSubtypeOf(dictTy.getValueType(), ObjectType::get(getContext())))
-      return emitOpError(
-          "kwdefaults values must be compatible with !py.object");
+    if (!isPyType(dictTy.getValueType()))
+      return emitOpError("kwdefaults values must be !py.* typed values");
 
     auto kwonlyTypes = expectedSig.getKwOnlyTypes();
     auto kwonlyNames = pyFunc.getKwonlyNamesAttr();
@@ -536,13 +539,6 @@ mlir::LogicalResult MakeFunctionOp::verify() {
             if (cast->getNumOperands() != 1)
               return value.getType();
             value = cast.getOperand(0);
-            continue;
-          }
-          if (auto upcast = value.getDefiningOp<UpcastOp>()) {
-            if (mlir::isa<ListType, TupleType, DictType>(
-                    upcast.getInput().getType()))
-              return value.getType();
-            value = upcast.getInput();
             continue;
           }
           return value.getType();
