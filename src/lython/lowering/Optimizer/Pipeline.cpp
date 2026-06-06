@@ -1,4 +1,5 @@
 #include "Common/RuntimeSupport.h"
+#include "Optimizer/Utils.h"
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
@@ -20,7 +21,9 @@ struct PublicationPreparationPass
   }
 
   void runOnOperation() override {
-    optimizer::publication::prepare(getOperation());
+    mlir::ModuleOp module = getOperation();
+    optimizer::call::staticDefaults(module);
+    optimizer::publication::prepare(module);
   }
 };
 
@@ -38,7 +41,6 @@ struct PyOptimizationPass
   void runOnOperation() override {
     mlir::ModuleOp module = getOperation();
     optimizer::pipeline::preLowering(module);
-    optimizer::pipeline::postLowering(module);
   }
 };
 

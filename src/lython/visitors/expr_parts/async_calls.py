@@ -84,6 +84,8 @@ class ExprAsyncCallMixin(VisitorRuntime):
         if resolved is None:
             return None
         call_node, func_info = resolved
+        if func_info.maythrow:
+            self._note_maythrow()
         awaitable = self._handle_async_function_call(call_node, func_info, loc)
         payload_type = self.get_awaitable_payload_type(awaitable.type)
         if payload_type is None:
@@ -111,8 +113,11 @@ class ExprAsyncCallMixin(VisitorRuntime):
             resolved = self._resolve_direct_async_call(arg)
             if resolved is not None:
                 call_node, func_info = resolved
+                if func_info.maythrow:
+                    self._note_maythrow()
                 awaitable = self._handle_async_function_call(call_node, func_info, loc)
             else:
+                self._note_maythrow()
                 awaitable = self.require_value(arg, self.visit(arg))
             payload_type = self.get_awaitable_payload_type(awaitable.type)
             if payload_type is None:

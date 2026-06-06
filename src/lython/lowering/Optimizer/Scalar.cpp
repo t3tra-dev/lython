@@ -5,16 +5,13 @@ namespace py::optimizer {
 void pipeline::scalarPre(mlir::ModuleOp module) {
   scalar::removeUnusedNone(module);
   scalar::dropNoneDecrefs(module);
+  scalar::fuseStrConcat3(module);
+  scalar::foldIntConstants(module);
   scalar::hoistInts(module);
-  scalar::dropSmallIntDecrefs(module);
+  scalar::dce(module);
 }
 
 void pipeline::scalarPost(mlir::ModuleOp module) {
-  scalar::cseSingletons(module);
-  scalar::elideBoolBoxing(module);
-  scalar::elideLongArithRoundTrips(module);
-  scalar::elideLongBoxing(module);
-  scalar::cseSmallInts(module);
   scalar::cseConstants(module);
 }
 

@@ -4,16 +4,20 @@
 
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Location.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -21,52 +25,31 @@
 namespace py {
 
 struct RuntimeSymbols {
-  static constexpr llvm::StringLiteral kStrFromUtf8{"LyUnicode_FromUTF8"};
-  static constexpr llvm::StringLiteral kStrInternStaticUtf8{
-      "LyUnicode_InternStaticUTF8"};
-  static constexpr llvm::StringLiteral kUnicodeConcat{"LyUnicode_Concat"};
-  static constexpr llvm::StringLiteral kLongFromI64{"LyLong_FromI64"};
-  static constexpr llvm::StringLiteral kLongAsI64{"LyLong_AsI64"};
-  static constexpr llvm::StringLiteral kLongFromString{"LyLong_FromString"};
-  static constexpr llvm::StringLiteral kFloatFromDouble{"LyFloat_FromDouble"};
-  static constexpr llvm::StringLiteral kFloatAsDouble{"LyFloat_AsDouble"};
-  static constexpr llvm::StringLiteral kGetNone{"Ly_GetNone"};
-  static constexpr llvm::StringLiteral kGetBuiltinPrint{"Ly_GetBuiltinPrint"};
-  static constexpr llvm::StringLiteral kBuiltinPrintImpl{"builtin_print_impl"};
+  static constexpr llvm::StringLiteral kHostPrintMemRefLine{"LyHost_PrintLine"};
   static constexpr llvm::StringLiteral kExceptionNew{"LyException_New"};
-  static constexpr llvm::StringLiteral kExceptionSetCurrent{
-      "LyException_SetCurrent"};
-  static constexpr llvm::StringLiteral kExceptionGetCurrent{
-      "LyException_GetCurrent"};
-  static constexpr llvm::StringLiteral kExceptionClear{"LyException_Clear"};
-  static constexpr llvm::StringLiteral kEHThrow{"LyEH_Throw"};
-  static constexpr llvm::StringLiteral kEHCapture{"LyEH_Capture"};
-  static constexpr llvm::StringLiteral kEHReportUnhandled{
-      "LyEH_ReportUnhandled"};
+  static constexpr llvm::StringLiteral kExceptionDecRef{"LyException_DecRef"};
+  static constexpr llvm::StringLiteral kEHThrowException{"LyEH_ThrowException"};
+  static constexpr llvm::StringLiteral kEHRethrowCurrent{"LyEH_RethrowCurrent"};
+  static constexpr llvm::StringLiteral kEHTakeCurrentDescriptor{
+      "LyEH_TakeCurrentDescriptor"};
   static constexpr llvm::StringLiteral kTracebackPush{"LyTraceback_Push"};
   static constexpr llvm::StringLiteral kTracebackPop{"LyTraceback_Pop"};
-  // Generic numeric operations (with type dispatch)
-  static constexpr llvm::StringLiteral kNumberAdd{"LyNumber_Add"};
-  static constexpr llvm::StringLiteral kNumberSub{"LyNumber_Sub"};
-  static constexpr llvm::StringLiteral kNumberLt{"LyNumber_Lt"};
-  static constexpr llvm::StringLiteral kNumberLe{"LyNumber_Le"};
-  static constexpr llvm::StringLiteral kNumberGt{"LyNumber_Gt"};
-  static constexpr llvm::StringLiteral kNumberGe{"LyNumber_Ge"};
-  static constexpr llvm::StringLiteral kNumberEq{"LyNumber_Eq"};
-  static constexpr llvm::StringLiteral kNumberNe{"LyNumber_Ne"};
-  // Type-specialized integer operations (inlinable fast paths)
-  static constexpr llvm::StringLiteral kLongAdd{"LyLong_Add"};
-  static constexpr llvm::StringLiteral kLongSub{"LyLong_Sub"};
-  static constexpr llvm::StringLiteral kLongCompare{"LyLong_Compare"};
-  static constexpr llvm::StringLiteral kBoolFromBool{"LyBool_FromBool"};
-  static constexpr llvm::StringLiteral kBoolAsBool{"LyBool_AsBool"};
+  static constexpr llvm::StringLiteral kTracebackClear{"LyTraceback_Clear"};
+  static constexpr llvm::StringLiteral kTracebackPrintMessage{
+      "LyTraceback_PrintMessage"};
+  static constexpr llvm::StringLiteral kLongFromI64{"LyLong_FromI64"};
+  static constexpr llvm::StringLiteral kLongAsI64{"LyLong_AsI64"};
+  static constexpr llvm::StringLiteral kLongDecRef{"LyLong_DecRef"};
+  static constexpr llvm::StringLiteral kUnicodeFromBytes{"LyUnicode_FromBytes"};
+  static constexpr llvm::StringLiteral kUnicodeAlloc{"__ly_unicode_alloc"};
+  static constexpr llvm::StringLiteral kUnicodeConcat{"LyUnicode_Concat"};
+  static constexpr llvm::StringLiteral kUnicodeConcat3{"LyUnicode_Concat3"};
+  static constexpr llvm::StringLiteral kUnicodeCopy{"LyUnicode_Copy"};
+  static constexpr llvm::StringLiteral kUnicodeLength{"LyUnicode_Length"};
+  static constexpr llvm::StringLiteral kUnicodePrintLine{"LyUnicode_PrintLine"};
+  static constexpr llvm::StringLiteral kUnicodeDecRef{"LyUnicode_DecRef"};
+  static constexpr llvm::StringLiteral kUnicodeFromI64{"LyUnicode_FromI64"};
   static constexpr llvm::StringLiteral kIncRef{"Ly_IncRef"};
-  static constexpr llvm::StringLiteral kDecRef{"Ly_DecRef"};
-  static constexpr llvm::StringLiteral kObjectRepr{"LyObject_Repr"};
-  static constexpr llvm::StringLiteral kObjectEqBool{"LyObject_EqBool"};
-  static constexpr llvm::StringLiteral kClassReprNamed{"LyClass_ReprNamed"};
-  static constexpr llvm::StringLiteral kMemAlloc{"LyMem_Alloc"};
-  static constexpr llvm::StringLiteral kMemFree{"LyMem_Free"};
 };
 
 namespace OwnershipContractAttrs {
@@ -104,11 +87,25 @@ static constexpr llvm::StringLiteral kAggregateSlotComponent{
     "ly.ownership.aggregate_slot_component"};
 static constexpr llvm::StringLiteral kAggregateSlotIndex{
     "ly.ownership.aggregate_slot_index"};
+static constexpr llvm::StringLiteral kAggregateSlotPartIndex{
+    "ly.ownership.aggregate_slot_part_index"};
 static constexpr llvm::StringLiteral kNonObjectPointer{
     "ly.ownership.non_object_pointer"};
 static constexpr llvm::StringLiteral kOwnedLocalObject{
     "ly.ownership.owned_local_object"};
+static constexpr llvm::StringLiteral kObjectHeader{
+    "ly.ownership.object_header"};
+static constexpr llvm::StringLiteral kImmortalObject{
+    "ly.ownership.immortal_object"};
+static constexpr llvm::StringLiteral kObjectReleaseToZero{
+    "ly.ownership.object_release_to_zero"};
+static constexpr llvm::StringLiteral kObjectDeallocPart{
+    "ly.ownership.object_dealloc_part"};
 } // namespace OwnershipContractAttrs
+
+namespace ControlFlowContractAttrs {
+static constexpr llvm::StringLiteral kNoReturn{"ly.control.noreturn"};
+} // namespace ControlFlowContractAttrs
 
 namespace ThreadSafetyAttrs {
 static constexpr llvm::StringLiteral kAtomicRole{"ly.atomic.role"};
@@ -151,6 +148,19 @@ static constexpr llvm::StringLiteral kRoleContainerRefcountRetain{
     "container.refcount.retain"};
 static constexpr llvm::StringLiteral kRoleContainerRefcountRelease{
     "container.refcount.release"};
+static constexpr llvm::StringLiteral kRoleObjectRefcountLoad{
+    "object.refcount.load"};
+static constexpr llvm::StringLiteral kRoleObjectRefcountInit{
+    "object.refcount.init"};
+static constexpr llvm::StringLiteral kRoleObjectRefcountRetain{
+    "object.refcount.retain"};
+static constexpr llvm::StringLiteral kRoleObjectRefcountRelease{
+    "object.refcount.release"};
+static constexpr llvm::StringLiteral kRoleObjectKindInit{"object.kind.init"};
+static constexpr llvm::StringLiteral kRoleObjectPayloadInit{
+    "object.payload.init"};
+static constexpr llvm::StringLiteral kRoleObjectPayloadLoad{
+    "object.payload.load"};
 static constexpr llvm::StringLiteral kRoleContainerLockAcquire{
     "container.lock.acquire"};
 static constexpr llvm::StringLiteral kRoleContainerLockRelease{
@@ -159,6 +169,8 @@ static constexpr llvm::StringLiteral kRoleClassRefcountRetain{
     "class.refcount.retain"};
 static constexpr llvm::StringLiteral kRoleClassRefcountRelease{
     "class.refcount.release"};
+static constexpr llvm::StringLiteral kRoleClassRefcountLoad{
+    "class.refcount.load"};
 static constexpr llvm::StringLiteral kRoleClassLockAcquire{
     "class.lock.acquire"};
 static constexpr llvm::StringLiteral kRoleClassLockRelease{
@@ -184,6 +196,8 @@ static constexpr llvm::StringLiteral kDescriptorKind{
     "ly.container.descriptor_kind"};
 static constexpr llvm::StringLiteral kDescriptorComponent{
     "ly.container.descriptor_component"};
+static constexpr llvm::StringLiteral kDescriptorData{
+    "ly.container.descriptor_data"};
 static constexpr llvm::StringLiteral kAccessGroup{"ly.container.access_group"};
 static constexpr llvm::StringLiteral kAccessComponent{
     "ly.container.access_component"};
@@ -199,6 +213,7 @@ static constexpr llvm::StringLiteral kComponentItems{"items"};
 static constexpr llvm::StringLiteral kComponentKeys{"keys"};
 static constexpr llvm::StringLiteral kComponentValues{"values"};
 static constexpr llvm::StringLiteral kComponentStates{"states"};
+static constexpr llvm::StringLiteral kComponentLock{"lock"};
 } // namespace ContainerSafetyAttrs
 
 namespace ClassSafetyAttrs {
@@ -206,6 +221,8 @@ static constexpr llvm::StringLiteral kHelperKind{"ly.class_helper.kind"};
 static constexpr llvm::StringLiteral kHelperClass{"ly.class_helper.class"};
 static constexpr llvm::StringLiteral kHelperFieldIndex{
     "ly.class_helper.field_index"};
+static constexpr llvm::StringLiteral kHelperFieldCount{
+    "ly.class_helper.field_count"};
 static constexpr llvm::StringLiteral kHelperDirectRefcountFields{
     "ly.class_helper.direct_refcount_fields"};
 static constexpr llvm::StringLiteral kHelperContainerFields{
@@ -214,14 +231,25 @@ static constexpr llvm::StringLiteral kHelperDirectRefcountFieldIndices{
     "ly.class_helper.direct_refcount_field_indices"};
 static constexpr llvm::StringLiteral kHelperContainerFieldIndices{
     "ly.class_helper.container_field_indices"};
+static constexpr llvm::StringLiteral kBorrowedLocalField{
+    "ly.class_helper.borrowed_local_field"};
 static constexpr llvm::StringLiteral kPromoteFreshObject{
     "ly.class_helper.promote_fresh_object"};
-static constexpr llvm::StringLiteral kPromoteManagedInit{
-    "ly.class_helper.promote_managed_init"};
 static constexpr llvm::StringLiteral kPromoteLockInit{
     "ly.class_helper.promote_lock_init"};
 static constexpr llvm::StringLiteral kPromoteRefcountInit{
     "ly.class_helper.promote_refcount_init"};
+static constexpr llvm::StringLiteral kDeallocPart{"ly.class.dealloc_part"};
+static constexpr llvm::StringLiteral kPayloadPart{"ly.class.payload_part"};
+static constexpr llvm::StringLiteral kCarrierPack{"ly.class_carrier.pack"};
+static constexpr llvm::StringLiteral kCarrierPart{"ly.class_carrier.part"};
+static constexpr llvm::StringLiteral kCarrierLoad{"ly.class_carrier.load"};
+static constexpr llvm::StringLiteral kCarrierPartRank{
+    "ly.class_carrier.part_rank"};
+static constexpr llvm::StringLiteral kCarrierPartElementWidth{
+    "ly.class_carrier.part_element_width"};
+static constexpr llvm::StringLiteral kCarrierPartStaticSize{
+    "ly.class_carrier.part_static_size"};
 static constexpr llvm::StringLiteral kKindIncref{"incref"};
 static constexpr llvm::StringLiteral kKindDecref{"decref"};
 static constexpr llvm::StringLiteral kKindDestroyLocal{"destroy_local"};
@@ -232,8 +260,34 @@ static constexpr llvm::StringLiteral kKindSetField{"setfield"};
 
 namespace AsyncSafetyAttrs {
 static constexpr llvm::StringLiteral kExceptionCell{"ly.async.exception_cell"};
+static constexpr llvm::StringLiteral kExceptionCellReservation{
+    "ly.async.exception_cell_reservation"};
+static constexpr llvm::StringLiteral kExceptionCellConditionalStore{
+    "ly.async.exception_cell_conditional_store"};
+static constexpr llvm::StringLiteral kExceptionCellAllocated{
+    "ly.async.exception_cell_allocated"};
+static constexpr llvm::StringLiteral kExceptionCellFree{
+    "ly.async.exception_cell_free"};
+static constexpr llvm::StringLiteral kExceptionCellPayloadStore{
+    "ly.async.exception_cell_payload_store"};
 static constexpr llvm::StringLiteral kCancelFlag{"ly.async.cancel_flag"};
 static constexpr llvm::StringLiteral kRuntimeHandle{"ly.async.runtime_handle"};
+static constexpr llvm::StringLiteral kRuntimeRefcountDelta{
+    "ly.async.runtime_refcount_delta"};
+static constexpr llvm::StringLiteral kRuntimeHandleBorrowArgs{
+    "ly.async.runtime_handle_borrow_args"};
+static constexpr llvm::StringLiteral kRuntimeHandleTransferArgs{
+    "ly.async.runtime_handle_transfer_args"};
+static constexpr llvm::StringLiteral kRuntimeHandleOwnedResults{
+    "ly.async.runtime_handle_owned_results"};
+static constexpr llvm::StringLiteral kRuntimeExecuteEntry{
+    "ly.async.runtime_execute_entry"};
+static constexpr llvm::StringLiteral kRuntimeAwaitExecute{
+    "ly.async.runtime_await_execute"};
+static constexpr llvm::StringLiteral kRuntimeErrorQuery{
+    "ly.async.runtime_error_query"};
+static constexpr llvm::StringLiteral kRuntimeValueStorage{
+    "ly.async.runtime_value_storage"};
 } // namespace AsyncSafetyAttrs
 
 enum class AsyncArgProvenanceKind {
@@ -290,6 +344,9 @@ struct MemRefDeallocContract {
   mlir::Location location;
   mlir::StringAttr group;
   mlir::StringAttr component;
+  mlir::StringAttr classPart;
+  mlir::StringAttr objectPart;
+  bool exceptionCellFree;
 };
 
 struct LoweredSafetyContracts {
@@ -303,17 +360,6 @@ struct LoweredSafetyContracts {
 
 class PyLLVMTypeConverter;
 
-namespace runtime {
-struct Callee {
-  static bool retain(llvm::StringRef name);
-  static bool release(llvm::StringRef name);
-  static bool transfer(llvm::StringRef name);
-  static bool setField(llvm::StringRef name);
-  static bool alwaysOwnedResult(llvm::StringRef name);
-  static bool conditionalOwnedResult(llvm::StringRef name);
-};
-} // namespace runtime
-
 namespace runtime::mlir_async {
 struct Callee {
   static bool valueStorage(llvm::StringRef name);
@@ -322,14 +368,19 @@ struct Callee {
   static bool createHandle(llvm::StringRef name);
   static bool isError(llvm::StringRef name);
   static bool awaitAndExecute(llvm::StringRef name);
+  static bool executeEntry(llvm::StringRef name);
+  static std::optional<int64_t> refcountDelta(llvm::StringRef name);
   static llvm::SmallVector<unsigned, 2>
   borrowedHandleOperands(llvm::StringRef name);
 };
 } // namespace runtime::mlir_async
 
-namespace ownership::llvm_func::Contract {
-void apply(mlir::LLVM::LLVMFuncOp fn, llvm::StringRef name);
-} // namespace ownership::llvm_func::Contract
+namespace ownership::effect {
+void retain(mlir::Operation *op, llvm::ArrayRef<int64_t> indices);
+void release(mlir::Operation *op, llvm::ArrayRef<int64_t> indices);
+void transfer(mlir::Operation *op, llvm::ArrayRef<int64_t> indices);
+void ownedResults(mlir::Operation *op, llvm::ArrayRef<int64_t> indices);
+} // namespace ownership::effect
 
 namespace publication::borrow::Attr {
 std::string name(unsigned argIndex);
@@ -363,6 +414,7 @@ struct Slot {
   static void markLoad(mlir::Value value, llvm::StringRef group,
                        llvm::StringRef component,
                        std::optional<int64_t> slot = std::nullopt);
+  static void copyLoad(mlir::Value from, mlir::Value to);
   static void markStore(mlir::Operation *op);
   static void markStore(mlir::Operation *op, llvm::StringRef group,
                         llvm::StringRef component,
@@ -391,6 +443,10 @@ void mark(mlir::Value value, llvm::StringRef group, llvm::StringRef component);
 
 namespace async_runtime {
 
+mlir::MemRefType getExceptionCellType(mlir::MLIRContext *ctx);
+bool isExceptionCellType(mlir::Type type);
+bool isLoweredExceptionCellType(mlir::Type type);
+
 struct CancelFlag {
   static void mark(mlir::Value value);
   static void markArgument(mlir::Operation *funcLike, unsigned argIndex);
@@ -404,25 +460,40 @@ struct RuntimeHandle {
 struct ExceptionCell {
   static void mark(mlir::Value value);
   static void markArgument(mlir::Operation *funcLike, unsigned argIndex);
+  static bool hasProvenance(mlir::Value value);
   static mlir::Value load(mlir::Location loc, mlir::Value cell,
-                          mlir::OpBuilder &builder);
-  static void storeFirst(
+                          mlir::RewriterBase &rewriter);
+  static mlir::Value isNull(mlir::Location loc, mlir::Value exception,
+                            mlir::OpBuilder &builder);
+  static mlir::LogicalResult storeFirst(
       mlir::Location loc, mlir::Value cell, mlir::Value exception,
       mlir::ModuleOp module, mlir::RewriterBase &rewriter,
       const PyLLVMTypeConverter &typeConverter,
       llvm::StringRef retainPremise = ThreadSafetyAttrs::kPremiseOwnedToken);
-  static void releaseLoaded(mlir::Location loc, mlir::ModuleOp module,
-                            mlir::OpBuilder &builder,
-                            const PyLLVMTypeConverter &typeConverter,
-                            mlir::Value exception);
-  static void free(mlir::Location loc, mlir::ModuleOp module,
-                   mlir::OpBuilder &builder,
-                   const PyLLVMTypeConverter &typeConverter,
-                   mlir::Value exceptionCell);
-  static void destroy(mlir::Location loc, mlir::ModuleOp module,
-                      mlir::OpBuilder &builder,
-                      const PyLLVMTypeConverter &typeConverter,
-                      mlir::Value exceptionCell);
+  static mlir::LogicalResult releaseLoaded(
+      mlir::Location loc, mlir::ModuleOp module, mlir::RewriterBase &rewriter,
+      const PyLLVMTypeConverter &typeConverter, mlir::Value exception);
+  static mlir::LogicalResult
+  retainPayload(mlir::Location loc, mlir::ModuleOp module,
+                mlir::OpBuilder &builder,
+                const PyLLVMTypeConverter &typeConverter, mlir::Value exception,
+                llvm::StringRef retainPremise);
+  static mlir::FailureOr<mlir::Operation *>
+  releasePayload(mlir::Location loc, mlir::ModuleOp module,
+                 mlir::OpBuilder &builder,
+                 const PyLLVMTypeConverter &typeConverter,
+                 mlir::Value exception, bool aggregateLoaded = false);
+  static mlir::LogicalResult free(mlir::Location loc, mlir::ModuleOp module,
+                                  mlir::OpBuilder &builder,
+                                  const PyLLVMTypeConverter &typeConverter,
+                                  mlir::Value exceptionCell);
+  static mlir::LogicalResult destroy(mlir::Location loc, mlir::ModuleOp module,
+                                     mlir::RewriterBase &rewriter,
+                                     const PyLLVMTypeConverter &typeConverter,
+                                     mlir::Value exceptionCell);
+  static mlir::LogicalResult destroyKnownEmpty(
+      mlir::Location loc, mlir::ModuleOp module, mlir::OpBuilder &builder,
+      const PyLLVMTypeConverter &typeConverter, mlir::Value exceptionCell);
 };
 
 } // namespace async_runtime
@@ -487,30 +558,64 @@ preserveLoweredSafetyContracts(mlir::ModuleOp module,
 
 class PyLLVMTypeConverter : public mlir::LLVMTypeConverter {
 public:
-  explicit PyLLVMTypeConverter(mlir::MLIRContext *ctx);
+  explicit PyLLVMTypeConverter(mlir::MLIRContext *ctx,
+                               mlir::ModuleOp module = {});
 
-  mlir::Type getPyObjectPtrType() const { return pyObjectPtrType; }
+  mlir::Type getContainerStorageType(mlir::Type logicalType) const;
+  mlir::MemRefType getListItemsMemRefType(ListType listType) const;
+  mlir::Type getTupleItemsStorageType(TupleType tupleType) const;
+  mlir::MemRefType getTupleItemsMemRefType(TupleType tupleType) const;
+  mlir::MemRefType getDictKeysMemRefType(DictType dictType) const;
+  mlir::MemRefType getDictValuesMemRefType(DictType dictType) const;
 
 private:
-  mlir::Type pyObjectPtrType;
+  mlir::ModuleOp module;
 };
 
 class RuntimeAPI {
 public:
+  class Call {
+  public:
+    Call() = default;
+    explicit Call(mlir::Operation *op) : op(op) {}
+
+    mlir::Value getResult(unsigned index = 0) const {
+      return op ? op->getResult(index) : mlir::Value();
+    }
+
+    mlir::Operation::result_range getResults() const {
+      return op->getResults();
+    }
+
+    mlir::Operation *getOperation() const { return op; }
+    mlir::Operation *operator->() const { return op; }
+    explicit operator bool() const { return op != nullptr; }
+
+  private:
+    mlir::Operation *op = nullptr;
+  };
+
   RuntimeAPI(mlir::ModuleOp module, mlir::OpBuilder &rewriter,
              const PyLLVMTypeConverter &typeConverter);
 
-  mlir::LLVM::CallOp call(mlir::Location loc, llvm::StringRef name,
-                          mlir::Type resultType, mlir::ValueRange operands);
-  mlir::Value getStringLiteral(mlir::Location loc, mlir::StringAttr literal);
+  Call call(mlir::Location loc, llvm::StringRef name,
+            mlir::TypeRange resultTypes, mlir::ValueRange operands);
+  Call call(mlir::Location loc, llvm::StringRef name, std::nullptr_t,
+            mlir::ValueRange operands);
+  Call call(mlir::Location loc, llvm::StringRef name, mlir::Type resultType,
+            mlir::ValueRange operands);
+  mlir::Value getByteLiteral(mlir::Location loc, mlir::StringAttr literal);
+  mlir::Value getUnicodeLiteral(mlir::Location loc, mlir::StringAttr literal);
+  mlir::Value getUnicodeLiteral(mlir::Location loc, mlir::StringAttr literal,
+                                mlir::Type resultType);
+  mlir::Value getNoneValue(mlir::Location loc);
   mlir::Value getI64Constant(mlir::Location loc, std::int64_t value);
   mlir::Value getF64Constant(mlir::Location loc, double value);
-  mlir::Type getPyObjectPtrType() const { return pyObjectPtrType; }
+  mlir::OpBuilder &getBuilder() const { return rewriter; }
 
 private:
   mlir::ModuleOp module;
   mlir::OpBuilder &rewriter;
-  mlir::Type pyObjectPtrType;
 };
 
 // Pattern population functions
@@ -565,6 +670,21 @@ void populate(PyLLVMTypeConverter &typeConverter,
               mlir::RewritePatternSet &patterns);
 } // namespace lowering::func::Patterns
 
+namespace lowering::func::definition::Patterns {
+void populate(PyLLVMTypeConverter &typeConverter,
+              mlir::RewritePatternSet &patterns);
+} // namespace lowering::func::definition::Patterns
+
+namespace lowering::func::returns::Patterns {
+void populate(PyLLVMTypeConverter &typeConverter,
+              mlir::RewritePatternSet &patterns);
+} // namespace lowering::func::returns::Patterns
+
+namespace lowering::func::objects::Patterns {
+void populate(PyLLVMTypeConverter &typeConverter,
+              mlir::RewritePatternSet &patterns);
+} // namespace lowering::func::objects::Patterns
+
 namespace lowering::async_runtime::Patterns {
 void populate(PyLLVMTypeConverter &typeConverter,
               mlir::RewritePatternSet &patterns);
@@ -583,9 +703,15 @@ namespace optimizer::pipeline {
 /// Call this after call conversion and before value conversion.
 void preLowering(mlir::ModuleOp module);
 
-/// Runs post-lowering optimizations on LLVM dialect ops.
-/// Call this after value conversion completes.
-void postLowering(mlir::ModuleOp module);
+/// Runs Python-value cleanup immediately after Py value conversion. This is
+/// still the lowering boundary for object-level scalar concepts such as boxing
+/// round trips and immortal singleton materialization.
+void postValueLowering(mlir::ModuleOp module);
+
+/// Runs only target-level cleanup after async/final LLVM conversion. High-level
+/// concepts such as class layout, variables, ownership, and atomics must have
+/// been optimized before this point.
+void finalLLVMCleanup(mlir::ModuleOp module);
 } // namespace optimizer::pipeline
 
 /// Creates a pass that applies all Py-specific optimizations.
@@ -614,7 +740,7 @@ createOwnershipVerifierPass();
 mlir::LogicalResult verifyOwnership(mlir::ModuleOp module);
 
 /// Creates a pass that verifies lowered LLVM/runtime calls preserve ownership
-/// balance for owned LyObject-family values.
+/// balance for owned object-family descriptors.
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createLLVMCallOwnershipVerifierPass();
 

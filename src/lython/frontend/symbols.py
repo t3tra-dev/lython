@@ -52,5 +52,6 @@ class MethodInfo(NamedTuple):
 class ClassInfo(NamedTuple):
     name: str
     class_type: ir.Type
+    base_names: tuple[str, ...]
     methods: dict[str, MethodInfo]
     attributes: dict[str, ir.Type]

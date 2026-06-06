@@ -1,8 +1,12 @@
+#include "Common/ClassLayout.h"
 #include "Common/Container.h"
 #include "Common/LoweringUtils.h"
 #include "Common/RuntimeSupport.h"
 #include "Common/SlotUtils.h"
+#include "PyValue/ClassHelpers.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 
 #define GET_OP_CLASSES
@@ -11,6 +15,89 @@
 
 namespace py {
 namespace {
+
+namespace lowering::value::tuple::ClassSlot {
+
+mlir::Value carrierFromValues(mlir::Location loc, mlir::ValueRange values,
+                              mlir::LLVM::LLVMStructType objectType,
+                              mlir::OpBuilder &builder) {
+  return Slot::classCarrierFromValues(loc, values, objectType, builder);
+}
+
+mlir::Value view(mlir::Location loc, mlir::Value items, int64_t index,
+                 mlir::LLVM::LLVMStructType objectType,
+                 mlir::ConversionPatternRewriter &rewriter) {
+  return Slot::classCarrierView(loc, items,
+                                createIndexConstant(loc, rewriter, index),
+                                objectType, rewriter);
+}
+
+mlir::LogicalResult copyInto(mlir::Location loc, mlir::ModuleOp module,
+                             ClassType classType,
+                             mlir::LLVM::LLVMStructType objectType,
+                             mlir::Value destPtr, mlir::Value source,
+                             mlir::ConversionPatternRewriter &rewriter,
+                             const PyLLVMTypeConverter &typeConverter) {
+  (void)objectType;
+  if (mlir::failed(::py::lowering::value::class_::Copy::ensure(
+          loc, module, classType, rewriter, typeConverter)))
+    return mlir::failure();
+  if (!mlir::isa<mlir::MemRefType>(destPtr.getType()))
+    return mlir::failure();
+  if (mlir::failed(Slot::classCarrierInitialize(loc, destPtr, classType, module,
+                                                rewriter, typeConverter)))
+    return mlir::failure();
+  return Slot::classCarrierCopyTo(loc, destPtr, source, classType, module,
+                                  rewriter);
+}
+
+} // namespace lowering::value::tuple::ClassSlot
+
+static mlir::Value stripTupleSourceCasts(mlir::Value value) {
+  while (auto cast = value.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+    if (cast->getNumOperands() != 1)
+      break;
+    value = cast.getOperand(0);
+  }
+  return value;
+}
+
+static bool hasUseAfter(mlir::Operation *anchor, mlir::Value value) {
+  value = stripTupleSourceCasts(value);
+  for (mlir::Operation *user : value.getUsers()) {
+    if (user == anchor)
+      continue;
+    if (user->getBlock() != anchor->getBlock())
+      return true;
+    if (anchor->isBeforeInBlock(user))
+      return true;
+  }
+  return false;
+}
+
+static void consumeInlineClassSource(
+    mlir::Location loc, mlir::ModuleOp module, ClassType classType,
+    mlir::LLVM::LLVMStructType objectType, mlir::ValueRange loweredSource,
+    mlir::Value sourceCarrier, mlir::Value logicalSource,
+    mlir::Operation *owner, mlir::ConversionPatternRewriter &rewriter) {
+  mlir::Value root = stripTupleSourceCasts(logicalSource);
+  bool localSource = mlir::isa_and_nonnull<ClassNewOp>(root.getDefiningOp());
+  bool canDestroyLocal = localSource && !hasUseAfter(owner, logicalSource) &&
+                         loweredSource.size() == 1 &&
+                         loweredSource.front().getType() == objectType;
+  if (canDestroyLocal) {
+    Slot::classRefcount(loc, loweredSource.front(), classType, module, rewriter,
+                        "destroy_local", /*aggregateEffect=*/true,
+                        ThreadSafetyAttrs::kPremiseOwnedToken);
+    return;
+  }
+
+  if (!mlir::isa<mlir::MemRefType>(sourceCarrier.getType()))
+    return;
+  Slot::classCarrierRefcount(loc, sourceCarrier, classType, module, rewriter,
+                             "decref", /*aggregateEffect=*/true,
+                             ThreadSafetyAttrs::kPremiseOwnedToken);
+}
 
 struct TupleEmptyLowering : public mlir::OpConversionPattern<TupleEmptyOp> {
   TupleEmptyLowering(PyLLVMTypeConverter &converter, mlir::MLIRContext *ctx)
@@ -33,9 +120,13 @@ struct TupleEmptyLowering : public mlir::OpConversionPattern<TupleEmptyOp> {
       return mlir::failure();
     auto header =
         rewriter.create<mlir::memref::AllocaOp>(op.getLoc(), headerType);
-    auto items = rewriter.create<mlir::memref::AllocaOp>(
-        op.getLoc(), itemsType,
-        mlir::ValueRange{createIndexConstant(op.getLoc(), rewriter, 0)});
+    auto items =
+        itemsType.hasStaticShape()
+            ? rewriter.create<mlir::memref::AllocaOp>(op.getLoc(), itemsType)
+            : rewriter.create<mlir::memref::AllocaOp>(
+                  op.getLoc(), itemsType,
+                  mlir::ValueRange{
+                      createIndexConstant(op.getLoc(), rewriter, 0)});
     std::string descriptorGroup =
         container::descriptor::Group::make(op.getOperation(), "tuple");
     container::descriptor::Component::mark(
@@ -81,12 +172,16 @@ struct TupleCreateLowering : public mlir::OpConversionPattern<TupleCreateOp> {
     auto itemsType = mlir::dyn_cast<mlir::MemRefType>(resultTypes[1]);
     if (!headerType || !itemsType)
       return mlir::failure();
-    mlir::Value allocSize = createIndexConstant(
-        op.getLoc(), rewriter, static_cast<int64_t>(op.getElements().size()));
     auto header =
         rewriter.create<mlir::memref::AllocaOp>(op.getLoc(), headerType);
-    auto items = rewriter.create<mlir::memref::AllocaOp>(
-        op.getLoc(), itemsType, mlir::ValueRange{allocSize});
+    auto items =
+        itemsType.hasStaticShape()
+            ? rewriter.create<mlir::memref::AllocaOp>(op.getLoc(), itemsType)
+            : rewriter.create<mlir::memref::AllocaOp>(
+                  op.getLoc(), itemsType,
+                  mlir::ValueRange{createIndexConstant(
+                      op.getLoc(), rewriter,
+                      static_cast<int64_t>(op.getElements().size()))});
     std::string descriptorGroup =
         container::descriptor::Group::make(op.getOperation(), "tuple");
     container::descriptor::Component::mark(
@@ -108,18 +203,47 @@ struct TupleCreateLowering : public mlir::OpConversionPattern<TupleCreateOp> {
         createIndexConstant(op.getLoc(), rewriter, 2));
 
     auto elementTypes = tupleType.getElementTypes();
+    auto itemCarrierType = class_layout::objectCarrierType(itemsType);
     for (auto [index, element] : llvm::enumerate(adaptor.getElements())) {
       mlir::Value source = element.front();
-      mlir::Value stored =
-          Slot::storage(op.getLoc(), source, elementTypes[index], module,
-                        rewriter, *typeConverter);
-      if (!stored)
-        return mlir::failure();
-      auto store = rewriter.create<mlir::memref::StoreOp>(
-          op.getLoc(), stored, items,
-          createIndexConstant(op.getLoc(), rewriter,
-                              static_cast<int64_t>(index)));
-      Slot::markTransfer(store.getOperation());
+      if (itemCarrierType) {
+        auto classType = mlir::dyn_cast<ClassType>(elementTypes[index]);
+        source = lowering::value::tuple::ClassSlot::carrierFromValues(
+            op.getLoc(), element, itemCarrierType, rewriter);
+        if (!source)
+          return mlir::failure();
+        if (classType) {
+          mlir::Value destSlot = lowering::value::tuple::ClassSlot::view(
+              op.getLoc(), items, static_cast<int64_t>(index), itemCarrierType,
+              rewriter);
+          if (!destSlot)
+            return mlir::failure();
+          if (mlir::failed(lowering::value::tuple::ClassSlot::copyInto(
+                  op.getLoc(), module, classType, itemCarrierType, destSlot,
+                  source, rewriter, *typeConverter)))
+            return mlir::failure();
+          consumeInlineClassSource(
+              op.getLoc(), module, classType, itemCarrierType, element, source,
+              op.getElements()[index], op.getOperation(), rewriter);
+        } else {
+          auto store = rewriter.create<mlir::memref::StoreOp>(
+              op.getLoc(), source, items,
+              createIndexConstant(op.getLoc(), rewriter,
+                                  static_cast<int64_t>(index)));
+          Slot::markTransfer(store.getOperation());
+        }
+      } else {
+        mlir::Value stored = Slot::storage(
+            op.getLoc(), element, elementTypes[index],
+            itemsType.getElementType(), module, rewriter, *typeConverter);
+        if (!stored)
+          return mlir::failure();
+        auto store = rewriter.create<mlir::memref::StoreOp>(
+            op.getLoc(), stored, items,
+            createIndexConstant(op.getLoc(), rewriter,
+                                static_cast<int64_t>(index)));
+        Slot::markTransfer(store.getOperation());
+      }
       Slot::releaseSource(op.getLoc(), source, elementTypes[index], module,
                           rewriter, *typeConverter);
     }

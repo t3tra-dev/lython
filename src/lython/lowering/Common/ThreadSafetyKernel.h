@@ -82,12 +82,14 @@ namespace role {
 
 inline bool retainRefcount(llvm::StringRef role) {
   return role == ThreadSafetyAttrs::kRoleContainerRefcountRetain ||
-         role == ThreadSafetyAttrs::kRoleClassRefcountRetain;
+         role == ThreadSafetyAttrs::kRoleClassRefcountRetain ||
+         role == ThreadSafetyAttrs::kRoleObjectRefcountRetain;
 }
 
 inline bool releaseRefcount(llvm::StringRef role) {
   return role == ThreadSafetyAttrs::kRoleContainerRefcountRelease ||
-         role == ThreadSafetyAttrs::kRoleClassRefcountRelease;
+         role == ThreadSafetyAttrs::kRoleClassRefcountRelease ||
+         role == ThreadSafetyAttrs::kRoleObjectRefcountRelease;
 }
 
 inline bool lockAcquire(llvm::StringRef role) {
@@ -106,6 +108,22 @@ inline bool containerAtomic(llvm::StringRef role) {
          role == ThreadSafetyAttrs::kRoleContainerRefcountRelease ||
          role == ThreadSafetyAttrs::kRoleContainerLockAcquire ||
          role == ThreadSafetyAttrs::kRoleContainerLockRelease;
+}
+
+inline bool objectAtomic(llvm::StringRef role) {
+  return role == ThreadSafetyAttrs::kRoleObjectRefcountLoad ||
+         role == ThreadSafetyAttrs::kRoleObjectRefcountInit ||
+         role == ThreadSafetyAttrs::kRoleObjectRefcountRetain ||
+         role == ThreadSafetyAttrs::kRoleObjectRefcountRelease ||
+         role == ThreadSafetyAttrs::kRoleObjectKindInit ||
+         role == ThreadSafetyAttrs::kRoleObjectPayloadInit ||
+         role == ThreadSafetyAttrs::kRoleObjectPayloadLoad;
+}
+
+inline bool classAtomic(llvm::StringRef role) {
+  return role == ThreadSafetyAttrs::kRoleClassRefcountLoad ||
+         role == ThreadSafetyAttrs::kRoleClassRefcountRetain ||
+         role == ThreadSafetyAttrs::kRoleClassRefcountRelease;
 }
 
 } // namespace role

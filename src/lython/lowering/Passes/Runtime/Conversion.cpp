@@ -46,6 +46,27 @@ void populate(PyLLVMTypeConverter &typeConverter,
 }
 } // namespace function::Patterns
 
+namespace function::definition::Patterns {
+void populate(PyLLVMTypeConverter &typeConverter,
+              mlir::RewritePatternSet &patterns) {
+  ::py::lowering::func::definition::Patterns::populate(typeConverter, patterns);
+}
+} // namespace function::definition::Patterns
+
+namespace function::returns::Patterns {
+void populate(PyLLVMTypeConverter &typeConverter,
+              mlir::RewritePatternSet &patterns) {
+  ::py::lowering::func::returns::Patterns::populate(typeConverter, patterns);
+}
+} // namespace function::returns::Patterns
+
+namespace function::objects::Patterns {
+void populate(PyLLVMTypeConverter &typeConverter,
+              mlir::RewritePatternSet &patterns) {
+  ::py::lowering::func::objects::Patterns::populate(typeConverter, patterns);
+}
+} // namespace function::objects::Patterns
+
 void configurePyTarget(mlir::ConversionTarget &target) {
   target.addLegalDialect<
       ::py::PyDialect, mlir::LLVM::LLVMDialect, mlir::async::AsyncDialect,
@@ -105,7 +126,7 @@ namespace types {
 
 bool containsPyRuntime(mlir::Type type) {
   if (isPyType(type) ||
-      mlir::isa<FuncType, TupleType, ListType, ClassType, DictType, ObjectType,
+      mlir::isa<FuncType, TupleType, ListType, ClassType, DictType,
                 CoroutineType, FutureType, TaskType>(type))
     return true;
   if (auto asyncValue = mlir::dyn_cast<mlir::async::ValueType>(type))
@@ -161,9 +182,9 @@ void configureValueTarget(mlir::ConversionTarget &target,
       TupleCreateOp, DictEmptyOp, DictInsertOp, DictGetOp, ListNewOp,
       ListAppendOp, ListRemoveOp, ListGetOp, NoneOp, FuncObjectOp,
       MakeFunctionOp, AddOp, SubOp, LtOp, LeOp, GtOp, GeOp, EqOp, NeOp, ReprOp,
-      CastToPrimOp, CastFromPrimOp, UpcastOp, IncRefOp, DecRefOp, ClassNewOp,
-      ClassPromoteOp, PublishOp, AttrGetOp, AttrSetOp, AttrGetLocalOp,
-      AttrSetLocalOp, ClassOp, ExceptionNullOp, TracebackNullOp,
+      StrConcat3Op, CastToPrimOp, CastFromPrimOp, IncRefOp, DecRefOp,
+      ClassNewOp, ClassPromoteOp, PublishOp, AttrGetOp, AttrSetOp,
+      AttrGetLocalOp, AttrSetLocalOp, ClassOp, ExceptionNullOp, TracebackNullOp,
       LocationCurrentOp, ExceptionNewOp, RaiseOp, RaiseCurrentOp, TryOp,
       TryYieldOp, ExceptYieldOp, FinallyYieldOp, ExceptMatchOp, CoroCreateOp,
       CoroStartOp, AwaitOp, TaskCreateOp, TaskCancelOp, AsyncSleepOp,

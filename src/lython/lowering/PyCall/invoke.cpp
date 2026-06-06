@@ -1,9 +1,112 @@
 #include "PyCall/Utils.h"
 
+#include "Common/Object.h"
+
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "llvm/ADT/STLExtras.h"
 
 namespace py {
 namespace {
+
+static mlir::LogicalResult
+appendLLVMInvokeOperand(mlir::Location loc, mlir::Value operand,
+                        llvm::SmallVectorImpl<mlir::Value> &operands,
+                        mlir::ConversionPatternRewriter &rewriter,
+                        const PyLLVMTypeConverter &converter) {
+  mlir::Type converted = converter.convertType(operand.getType());
+  if (!converted)
+    return mlir::failure();
+  if (converted != operand.getType()) {
+    operand =
+        rewriter
+            .create<mlir::UnrealizedConversionCastOp>(
+                loc, mlir::TypeRange{converted}, mlir::ValueRange{operand})
+            .getResult(0);
+  }
+
+  auto descriptor =
+      mlir::dyn_cast<mlir::LLVM::LLVMStructType>(operand.getType());
+  if (!object_abi::Type::isLoweredStorage(descriptor)) {
+    operands.push_back(operand);
+    return mlir::success();
+  }
+
+  llvm::ArrayRef<mlir::Type> body = descriptor.getBody();
+  operands.push_back(rewriter.create<mlir::LLVM::ExtractValueOp>(
+      loc, body[0], operand, rewriter.getDenseI64ArrayAttr({0})));
+  operands.push_back(rewriter.create<mlir::LLVM::ExtractValueOp>(
+      loc, body[1], operand, rewriter.getDenseI64ArrayAttr({1})));
+  operands.push_back(rewriter.create<mlir::LLVM::ExtractValueOp>(
+      loc, body[2], operand, rewriter.getDenseI64ArrayAttr({2})));
+  operands.push_back(rewriter.create<mlir::LLVM::ExtractValueOp>(
+      loc, rewriter.getI64Type(), operand,
+      rewriter.getDenseI64ArrayAttr({3, 0})));
+  operands.push_back(rewriter.create<mlir::LLVM::ExtractValueOp>(
+      loc, rewriter.getI64Type(), operand,
+      rewriter.getDenseI64ArrayAttr({4, 0})));
+  return mlir::success();
+}
+
+static void collectEarlyArgDrops(TupleCreateOp tupleCreate,
+                                 mlir::Operation *anchor,
+                                 llvm::SmallVectorImpl<DecRefOp> &drops) {
+  if (!tupleCreate || !anchor)
+    return;
+  for (mlir::Value element : tupleCreate.getElements()) {
+    for (mlir::Operation *user : element.getUsers()) {
+      auto drop = mlir::dyn_cast<DecRefOp>(user);
+      if (!drop || drop->getBlock() != anchor->getBlock() ||
+          !drop->isBeforeInBlock(anchor))
+        continue;
+      if (!llvm::is_contained(drops, drop))
+        drops.push_back(drop);
+    }
+  }
+}
+
+static void collectTupleDrops(TupleCreateOp tupleCreate,
+                              llvm::SmallVectorImpl<DecRefOp> &drops) {
+  if (!tupleCreate)
+    return;
+  for (mlir::Operation *user : tupleCreate.getResult().getUsers()) {
+    if (auto drop = mlir::dyn_cast<DecRefOp>(user))
+      drops.push_back(drop);
+  }
+}
+
+static void cloneDropAtBlockStart(DecRefOp drop, mlir::Block *block,
+                                  mlir::ConversionPatternRewriter &rewriter) {
+  if (!drop || !block)
+    return;
+  mlir::OpBuilder::InsertionGuard guard(rewriter);
+  if (!block->empty() && mlir::isa<mlir::LLVM::LandingpadOp>(block->front()))
+    rewriter.setInsertionPointAfter(&block->front());
+  else
+    rewriter.setInsertionPointToStart(block);
+  auto clone = rewriter.create<DecRefOp>(drop.getLoc(), drop.getObject());
+  for (mlir::NamedAttribute attr : drop->getAttrs())
+    clone->setAttr(attr.getName(), attr.getValue());
+}
+
+static void releaseArgsAfterInvoke(llvm::ArrayRef<DecRefOp> drops,
+                                   mlir::Block *normalDest,
+                                   mlir::Block *unwindDest,
+                                   mlir::ConversionPatternRewriter &rewriter) {
+  for (DecRefOp drop : drops) {
+    cloneDropAtBlockStart(drop, normalDest, rewriter);
+    cloneDropAtBlockStart(drop, unwindDest, rewriter);
+    rewriter.eraseOp(drop);
+  }
+}
+
+static void cleanupCallPack(TupleCreateOp tupleCreate,
+                            llvm::ArrayRef<DecRefOp> tupleDrops,
+                            mlir::ConversionPatternRewriter &rewriter) {
+  for (DecRefOp drop : tupleDrops)
+    rewriter.eraseOp(drop);
+  if (tupleCreate && tupleCreate->use_empty())
+    rewriter.eraseOp(tupleCreate);
+}
 
 struct InvokeLowering : public mlir::OpConversionPattern<InvokeOp> {
   InvokeLowering(PyLLVMTypeConverter &converter, mlir::MLIRContext *ctx)
@@ -13,7 +116,7 @@ struct InvokeLowering : public mlir::OpConversionPattern<InvokeOp> {
   lowerViaRuntime(InvokeOp op,
                   mlir::ConversionPatternRewriter &rewriter) const {
     return rewriter.notifyMatchFailure(
-        op, "dynamic invoke runtime fallback is disabled");
+        op, "dynamic invoke requires static call resolution");
   }
 
   mlir::LogicalResult
@@ -55,48 +158,30 @@ struct InvokeLowering : public mlir::OpConversionPattern<InvokeOp> {
       return lowerViaRuntime(op, rewriter);
 
     llvm::SmallVector<mlir::Value> callOperands;
+    TupleCreateOp staticPosargs;
+    llvm::SmallVector<DecRefOp> argDrops;
+    llvm::SmallVector<DecRefOp> tupleDrops;
     auto funcType = func.getFunctionType();
-    bool hiddenClassReturnOutArg =
-        op.getNormalDestOperands().size() == 1 &&
-        mlir::isa<ClassType>(op.getNormalDestOperands().front().getType()) &&
-        funcType.getNumResults() == 0;
-    unsigned directInputCount =
-        funcType.getNumInputs() - (hiddenClassReturnOutArg ? 1u : 0u);
+    unsigned directInputCount = funcType.getNumInputs();
     if (auto tupleCreate = mlir::dyn_cast_or_null<TupleCreateOp>(posargsOp)) {
+      staticPosargs = tupleCreate;
+      collectEarlyArgDrops(tupleCreate, op.getOperation(), argDrops);
+      collectTupleDrops(tupleCreate, tupleDrops);
       bool allowVoidHelper = op.getNormalDestOperands().empty();
       func = resolvePreferredDirectHelper(func, tupleCreate.getElements(),
                                           module, allowVoidHelper);
       funcType = func.getFunctionType();
-      hiddenClassReturnOutArg =
-          op.getNormalDestOperands().size() == 1 &&
-          mlir::isa<ClassType>(op.getNormalDestOperands().front().getType()) &&
-          funcType.getNumResults() == 0;
-      directInputCount =
-          funcType.getNumInputs() - (hiddenClassReturnOutArg ? 1u : 0u);
-      if (tupleCreate.getElements().size() != directInputCount)
+      directInputCount = funcType.getNumInputs();
+      if (mlir::failed(::py::appendFlattenedCallOperands(
+              op.getLoc(), tupleCreate.getElements(), funcType,
+              directInputCount, callOperands, rewriter, *converter)))
         return lowerViaRuntime(op, rewriter);
-      for (auto [idx, element] : llvm::enumerate(tupleCreate.getElements())) {
-        mlir::Type expected = funcType.getInput(idx);
-        mlir::Value operand = element;
-        if (operand.getType() != expected)
-          operand = rewriter
-                        .create<mlir::UnrealizedConversionCastOp>(
-                            op.getLoc(), mlir::TypeRange{expected},
-                            mlir::ValueRange{operand})
-                        .getResult(0);
-        callOperands.push_back(operand);
-      }
     } else if (mlir::isa<TupleEmptyOp>(posargsOp)) {
       bool allowVoidHelper = op.getNormalDestOperands().empty();
       func = resolvePreferredDirectHelper(func, mlir::ValueRange{}, module,
                                           allowVoidHelper);
       funcType = func.getFunctionType();
-      hiddenClassReturnOutArg =
-          op.getNormalDestOperands().size() == 1 &&
-          mlir::isa<ClassType>(op.getNormalDestOperands().front().getType()) &&
-          funcType.getNumResults() == 0;
-      directInputCount =
-          funcType.getNumInputs() - (hiddenClassReturnOutArg ? 1u : 0u);
+      directInputCount = funcType.getNumInputs();
       if (directInputCount != 0)
         return lowerViaRuntime(op, rewriter);
     } else {
@@ -105,22 +190,12 @@ struct InvokeLowering : public mlir::OpConversionPattern<InvokeOp> {
 
     mlir::Block *normalDest = op.getNormalDest();
     mlir::Block *finalNormalDest = normalDest;
-    mlir::Value hiddenClassReturnSeed = nullptr;
-    if (hiddenClassReturnOutArg) {
-      if (adaptor.getNormalDestOperands().size() != 1 ||
-          adaptor.getNormalDestOperands().front().size() != 1)
-        return rewriter.notifyMatchFailure(
-            op, "class-return invoke expects a single normal destination seed");
-      hiddenClassReturnSeed = adaptor.getNormalDestOperands().front().front();
-      callOperands.push_back(hiddenClassReturnSeed);
-      eraseInvokeNormalSeedDrops(op, op.getNormalDestOperands().front(),
-                                 rewriter);
-    }
-
     llvm::SmallVector<mlir::Type> results;
     for (mlir::Type res : funcType.getResults())
       if (mlir::failed(converter->convertType(res, results)))
         return mlir::failure();
+    if (!op.getNormalDestOperands().empty() && results.empty())
+      return lowerViaRuntime(op, rewriter);
 
     mlir::Block *unwind = op.getUnwindDest();
     emitTracebackPush(op.getLoc(), op->getParentOfType<mlir::func::FuncOp>(),
@@ -134,34 +209,30 @@ struct InvokeLowering : public mlir::OpConversionPattern<InvokeOp> {
       unwindOperands.append(values.begin(), values.end());
     if (!op.getNormalDestOperands().empty() && finalNormalDest &&
         finalNormalDest->getNumArguments() == 1) {
-      mlir::Type bridgeArgType = hiddenClassReturnOutArg
-                                     ? hiddenClassReturnSeed.getType()
-                                     : results.front();
+      mlir::Type bridgeArgType = results.front();
       normalDest = createInvokeNormalBridge(finalNormalDest, bridgeArgType,
                                             op.getLoc(), rewriter);
       normalOperands.clear();
-      if (hiddenClassReturnOutArg) {
-        normalOperands.push_back(hiddenClassReturnSeed);
-      } else {
-        normalOperands.push_back(
-            rewriter.create<mlir::LLVM::ZeroOp>(op.getLoc(), bridgeArgType));
-      }
+      normalOperands.push_back(
+          rewriter.create<mlir::LLVM::ZeroOp>(op.getLoc(), bridgeArgType));
     }
+
+    llvm::SmallVector<mlir::Value> invokeOperands;
+    for (mlir::Value operand : callOperands)
+      if (mlir::failed(appendLLVMInvokeOperand(
+              op.getLoc(), operand, invokeOperands, rewriter, *converter)))
+        return mlir::failure();
 
     auto invoke = rewriter.create<mlir::LLVM::InvokeOp>(
         op.getLoc(), results,
         mlir::FlatSymbolRefAttr::get(op.getContext(), func.getName()),
-        callOperands, normalDest, normalOperands, unwind, unwindOperands);
+        invokeOperands, normalDest, normalOperands, unwind, unwindOperands);
 
     if (!op.getNormalDestOperands().empty()) {
       if (normalDest != finalNormalDest) {
-        mlir::Value forwarded = hiddenClassReturnOutArg
-                                    ? normalDest->getArgument(0)
-                                    : invoke.getResult();
+        mlir::Value forwarded = invoke.getResult();
         finalizeInvokeNormalBridge(normalDest, finalNormalDest, forwarded,
                                    op.getLoc(), rewriter);
-      } else if (hiddenClassReturnOutArg) {
-        materializeInvokeNormalResult(op, hiddenClassReturnSeed, rewriter);
       } else if (!results.empty()) {
         materializeInvokeNormalResult(op, invoke.getResult(), rewriter);
       }
@@ -171,6 +242,11 @@ struct InvokeLowering : public mlir::OpConversionPattern<InvokeOp> {
 
     if (constOp->use_empty())
       rewriter.eraseOp(constOp);
+
+    releaseArgsAfterInvoke(argDrops,
+                           finalNormalDest ? finalNormalDest : normalDest,
+                           unwind, rewriter);
+    cleanupCallPack(staticPosargs, tupleDrops, rewriter);
 
     if (normalDest) {
       mlir::OpBuilder::InsertionGuard guard(rewriter);

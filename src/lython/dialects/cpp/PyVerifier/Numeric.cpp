@@ -27,6 +27,15 @@ mlir::LogicalResult AddOp::verify() {
   return verifyPythonResult(getOperation(), getResult().getType());
 }
 
+mlir::LogicalResult StrConcat3Op::verify() {
+  if (!isPyStrType(getLhs().getType()) || !isPyStrType(getMiddle().getType()) ||
+      !isPyStrType(getRhs().getType()))
+    return emitOpError("operands must be !py.str");
+  if (!isPyStrType(getResult().getType()))
+    return emitOpError("result must be !py.str");
+  return mlir::success();
+}
+
 mlir::LogicalResult SubOp::verify() {
   if (mlir::failed(verifyPythonOperands(getOperation(), getLhs(), getRhs())))
     return mlir::failure();

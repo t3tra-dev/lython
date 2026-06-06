@@ -49,18 +49,6 @@ insertDecRefOnSuccessorEdge(mlir::OpBuilder &builder, mlir::Value value,
 
 using AliasAnalysis = OwnershipAliasAnalysis;
 
-static bool hasImmortalProducer(mlir::Value root,
-                                const AliasAnalysis &aliases) {
-  llvm::SmallVector<mlir::Value, 4> aliasSet;
-  aliases.collectAliases(root, aliasSet);
-  for (mlir::Value member : aliasSet) {
-    mlir::Operation *def = member.getDefiningOp();
-    if (def && isPyOwnershipImmortalOp(def))
-      return true;
-  }
-  return false;
-}
-
 struct RefCountInsertionPass
     : public mlir::PassWrapper<RefCountInsertionPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -94,7 +82,7 @@ private:
     llvm::DenseSet<mlir::Value> processedRoots;
 
     auto processOwnedRoot = [&](mlir::Value root) -> mlir::LogicalResult {
-      if (hasImmortalProducer(root, aliases))
+      if (aliases.rootIsImmortal(root))
         return mlir::success();
       if (processedRoots.insert(root).second)
         return addRefCountingForAliasSet(root, aliases, liveness);
@@ -111,7 +99,7 @@ private:
         continue;
       mlir::Value root = aliases.getRoot(arg);
       if (entryArgsBorrowed) {
-        if (hasImmortalProducer(root, aliases))
+        if (aliases.rootIsImmortal(root))
           continue;
         processedRoots.insert(root);
         addRetainsForBorrowedConsumes(root, aliases);

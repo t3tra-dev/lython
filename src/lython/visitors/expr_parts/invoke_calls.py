@@ -54,10 +54,6 @@ class ExprInvokeMixin(VisitorRuntime):
         if type_str == "!py.location":
             with loc, self.insertion_point():
                 return py_ops.LocationCurrentOp(result_type).result
-        if type_str == "!py.object":
-            with loc, self.insertion_point():
-                none_val = py_ops.NoneOp(self.get_py_type("!py.none")).result
-            return self.ensure_object(none_val, loc=loc)
         if type_str in {"!py.int", "!py.bool"}:
             with loc, self.insertion_point():
                 return py_ops.IntConstantOp(result_type, "0").result

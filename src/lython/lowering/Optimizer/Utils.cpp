@@ -2,9 +2,6 @@
 // and its lowered LLVM representation. These optimizations include:
 //   - Dead tuple cleanup (removing tuples only used by DecRefOp)
 //   - Integer constant hoisting and CSE
-//   - Small integer DecRef removal (immortal integers -5 to 256)
-//   - Singleton getter CSE (Ly_GetBuiltinPrint, Ly_GetNone, etc.)
-//   - Bool boxing/unboxing elimination (LyBool_FromBool + LyBool_AsBool)
 //   - LLVM constant CSE
 //   - Dead code elimination for unused LLVM/tensor producer operations
 
@@ -20,46 +17,36 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Dominance.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
+#include "llvm/Support/FormatVariadic.h"
 
 #include <algorithm>
+#include <optional>
 
 namespace py::optimizer {
 
 mlir::Value value::stripCasts(mlir::Value value);
 
+template <typename OpT>
+static OpT findDominatingCached(const llvm::SmallVectorImpl<OpT> &candidates,
+                                OpT current, mlir::DominanceInfo &dominance) {
+  for (OpT candidate : candidates)
+    if (dominance.dominates(candidate.getOperation(), current.getOperation()))
+      return candidate;
+  return {};
+}
+
 bool runtime::Call::is(mlir::LLVM::CallOp callOp, llvm::StringRef calleeName) {
   auto callee = callOp.getCallee();
   return callee && *callee == calleeName;
-}
-
-mlir::LLVM::CallOp runtime::Call::optionalReleaseUser(mlir::Value value) {
-  mlir::LLVM::CallOp decRefCall = nullptr;
-  for (mlir::Operation *user : value.getUsers()) {
-    auto callUser = mlir::dyn_cast<mlir::LLVM::CallOp>(user);
-    if (!callUser || !runtime::Call::is(callUser, RuntimeSymbols::kDecRef))
-      return nullptr;
-    if (decRefCall)
-      return nullptr;
-    decRefCall = callUser;
-  }
-  return decRefCall;
-}
-
-void runtime::Call::eraseWithOptionalRelease(mlir::LLVM::CallOp callOp) {
-  if (!callOp || callOp->getNumResults() != 1)
-    return;
-
-  mlir::Value result = callOp.getResult();
-  mlir::LLVM::CallOp decRefCall = runtime::Call::optionalReleaseUser(result);
-  if (decRefCall)
-    decRefCall->erase();
-
-  if (result.use_empty())
-    callOp->erase();
 }
 
 mlir::LLVM::LLVMFuncOp runtime::Func::getOrCreate(mlir::ModuleOp module,
@@ -80,22 +67,38 @@ mlir::LLVM::LLVMFuncOp runtime::Func::getOrCreate(mlir::ModuleOp module,
                                                       fnType);
 }
 
-mlir::Value runtime::Long::asI64(mlir::ModuleOp module,
-                                 mlir::OpBuilder &builder, mlir::Location loc,
-                                 mlir::Value boxedLong) {
-  if (auto fromI64Call = boxedLong.getDefiningOp<mlir::LLVM::CallOp>()) {
-    if (runtime::Call::is(fromI64Call, RuntimeSymbols::kLongFromI64) &&
-        fromI64Call.getNumOperands() == 1) {
-      return fromI64Call.getOperand(0);
-    }
-  }
+bool runtime::Func::eraseUnusedDecls(mlir::ModuleOp module) {
+  llvm::DenseSet<llvm::StringRef> referenced;
+  module.walk([&](mlir::LLVM::CallOp call) {
+    if (auto callee = call.getCallee())
+      referenced.insert(*callee);
+  });
+  module.walk([&](mlir::LLVM::InvokeOp invoke) {
+    if (auto callee = invoke.getCallee())
+      referenced.insert(*callee);
+  });
+  module.walk([&](mlir::LLVM::AddressOfOp addressOf) {
+    referenced.insert(addressOf.getGlobalName());
+  });
+  module.walk([&](mlir::LLVM::LLVMFuncOp fn) {
+    auto personality =
+        fn->getAttrOfType<mlir::FlatSymbolRefAttr>("personality");
+    if (personality)
+      referenced.insert(personality.getValue());
+  });
 
-  auto asI64Func = runtime::Func::getOrCreate(
-      module, RuntimeSymbols::kLongAsI64, builder.getI64Type(),
-      mlir::ValueRange{boxedLong});
-  return builder
-      .create<mlir::LLVM::CallOp>(loc, asI64Func, mlir::ValueRange{boxedLong})
-      .getResult();
+  llvm::SmallVector<mlir::LLVM::LLVMFuncOp> unused;
+  module.walk([&](mlir::LLVM::LLVMFuncOp fn) {
+    if (!fn.getBody().empty())
+      return;
+    if (referenced.contains(fn.getSymName()))
+      return;
+    unused.push_back(fn);
+  });
+
+  for (mlir::LLVM::LLVMFuncOp fn : unused)
+    fn.erase();
+  return !unused.empty();
 }
 
 /// Remove py.incref on !py.class values when it only survives because a
@@ -107,6 +110,8 @@ bool call::cleanupClassIncrefs(mlir::ModuleOp module) {
   module.walk([&](IncRefOp incref) {
     mlir::Value object = incref.getObject();
     if (!mlir::isa<ClassType>(object.getType()))
+      return;
+    if (!class_state::local(object))
       return;
 
     for (mlir::Operation *cursor = incref->getNextNode(); cursor;
@@ -168,6 +173,8 @@ void consume::attrSetValues(mlir::ModuleOp module) {
     mlir::Value value = op.getValue();
     if (!isPyType(value.getType()) ||
         mlir::isa<NoneType, BoolType>(value.getType()))
+      return;
+    if (mlir::isa<ClassType, ListType, TupleType, DictType>(value.getType()))
       return;
 
     DecRefOp trailingDrop;
@@ -261,7 +268,7 @@ mlir::Value value::stripPublications(mlir::Value value) {
 }
 
 bool publication::tracks(mlir::Type type) {
-  return mlir::isa<ListType, DictType, TupleType, ObjectType, ClassType>(type);
+  return mlir::isa<ListType, DictType, TupleType, ClassType>(type);
 }
 
 bool attr::containsIndex(mlir::ArrayAttr attr, unsigned index) {
@@ -364,12 +371,6 @@ static TupleCreateOp getStaticTupleCreate(mlir::Value value) {
 static mlir::Value stripStaticMetadataValue(mlir::Value value) {
   while (true) {
     value = value::stripPublications(value);
-    if (auto upcast = value.getDefiningOp<UpcastOp>()) {
-      if (isCompilerOwnedMemRefContainerType(upcast.getInput().getType()))
-        return value;
-      value = upcast.getInput();
-      continue;
-    }
     return value;
   }
 }
@@ -435,6 +436,62 @@ collectStaticKeywordArgumentValues(mlir::Value namesValue,
   return true;
 }
 
+static void eraseDeadStaticMetadataTree(mlir::Value value) {
+  if (!value)
+    return;
+
+  if (auto publish = value.getDefiningOp<PublishOp>()) {
+    mlir::Value input = publish.getInput();
+    if (publish->use_empty())
+      publish.erase();
+    eraseDeadStaticMetadataTree(input);
+    return;
+  }
+
+  if (auto tuple = value.getDefiningOp<TupleCreateOp>()) {
+    if (!tuple->use_empty())
+      return;
+    llvm::SmallVector<mlir::Value, 8> elements(tuple.getElements().begin(),
+                                               tuple.getElements().end());
+    tuple.erase();
+    for (mlir::Value element : elements)
+      eraseDeadStaticMetadataTree(element);
+    return;
+  }
+
+  if (auto tuple = value.getDefiningOp<TupleEmptyOp>()) {
+    if (tuple->use_empty())
+      tuple.erase();
+    return;
+  }
+
+  if (auto dict = value.getDefiningOp<DictEmptyOp>()) {
+    llvm::SmallVector<mlir::Value, 8> operands;
+    llvm::SmallVector<DictInsertOp, 8> inserts;
+    for (mlir::Operation *user : dict.getResult().getUsers()) {
+      auto insert = mlir::dyn_cast<DictInsertOp>(user);
+      if (!insert || insert.getDict() != dict.getResult())
+        return;
+      operands.push_back(insert.getKey());
+      operands.push_back(insert.getValue());
+      inserts.push_back(insert);
+    }
+    for (DictInsertOp insert : inserts)
+      insert.erase();
+    if (dict->use_empty())
+      dict.erase();
+    for (mlir::Value operand : operands)
+      eraseDeadStaticMetadataTree(operand);
+    return;
+  }
+
+  mlir::Operation *producer = value.getDefiningOp();
+  if (mlir::isa_and_nonnull<StrConstantOp, IntConstantOp, FloatConstantOp>(
+          producer) &&
+      producer->use_empty())
+    producer->erase();
+}
+
 void call::staticDefaults(mlir::ModuleOp module) {
   llvm::SmallVector<CallVectorOp> calls;
   module.walk([&](CallVectorOp op) { calls.push_back(op); });
@@ -442,8 +499,7 @@ void call::staticDefaults(mlir::ModuleOp module) {
   for (CallVectorOp call : calls) {
     mlir::Value callable = value::stripCasts(call.getCallable());
     auto makeFunc = callable.getDefiningOp<MakeFunctionOp>();
-    if (!makeFunc || (!makeFunc.getDefaults() && !makeFunc.getKwdefaults() &&
-                      !makeFunc.getClosure()))
+    if (!makeFunc)
       continue;
 
     auto funcType = mlir::dyn_cast<FuncType>(makeFunc.getResult().getType());
@@ -457,6 +513,15 @@ void call::staticDefaults(mlir::ModuleOp module) {
     llvm::ArrayRef<mlir::Type> kwonlyTypes = signature.getKwOnlyTypes();
     unsigned kwonlyCount = static_cast<unsigned>(kwonlyTypes.size());
 
+    llvm::StringMap<mlir::Value> explicitKwValues;
+    if (!collectStaticKeywordArgumentValues(
+            call.getKwnames(), call.getKwvalues(), explicitKwValues))
+      continue;
+    bool hasExplicitKeywords = !explicitKwValues.empty();
+    if (!makeFunc.getDefaults() && !makeFunc.getKwdefaults() &&
+        !makeFunc.getClosure() && !hasExplicitKeywords)
+      continue;
+
     TupleCreateOp posargs = getStaticTupleCreate(call.getPosargs());
     if (!posargs)
       continue;
@@ -465,55 +530,102 @@ void call::staticDefaults(mlir::ModuleOp module) {
     if (providedCount > positionalCount)
       continue;
 
-    llvm::SmallVector<mlir::Value, 8> elements;
-    elements.append(posargs.getElements().begin(), posargs.getElements().end());
-    if (providedCount < positionalCount) {
-      TupleCreateOp defaults = getStaticTupleCreate(makeFunc.getDefaults());
-      if (!defaults)
+    FuncOp targetFunc = nullptr;
+    if (mlir::Operation *symbol = mlir::SymbolTable::lookupNearestSymbolFrom(
+            call, makeFunc.getTargetAttr()))
+      targetFunc = mlir::dyn_cast<FuncOp>(symbol);
+
+    llvm::StringMap<unsigned> positionalNameToIndex;
+    if (targetFunc) {
+      mlir::ArrayAttr argNames = targetFunc.getArgNamesAttr();
+      if (argNames && argNames.size() == positionalCount) {
+        for (auto [index, attr] : llvm::enumerate(argNames)) {
+          auto nameAttr = mlir::dyn_cast<mlir::StringAttr>(attr);
+          if (!nameAttr)
+            continue;
+          positionalNameToIndex[nameAttr.getValue()] = index;
+        }
+      }
+    }
+
+    llvm::StringMap<unsigned> kwonlyNameToIndex;
+    llvm::SmallVector<llvm::StringRef, 8> kwonlyNames;
+    if (kwonlyCount > 0) {
+      if (!targetFunc)
         continue;
+      mlir::ArrayAttr kwonlyNamesAttr = targetFunc.getKwonlyNamesAttr();
+      if (!kwonlyNamesAttr || kwonlyNamesAttr.size() != kwonlyCount)
+        continue;
+      kwonlyNames.reserve(kwonlyCount);
+      for (auto [index, attr] : llvm::enumerate(kwonlyNamesAttr)) {
+        auto nameAttr = mlir::dyn_cast<mlir::StringAttr>(attr);
+        if (!nameAttr)
+          continue;
+        kwonlyNames.push_back(nameAttr.getValue());
+        kwonlyNameToIndex[nameAttr.getValue()] = index;
+      }
+      if (kwonlyNames.size() != kwonlyCount)
+        continue;
+    }
+
+    llvm::SmallVector<mlir::Value, 8> positionalElements(positionalCount);
+    for (auto [index, element] : llvm::enumerate(posargs.getElements()))
+      positionalElements[index] = element;
+
+    bool invalidKeyword = false;
+    llvm::StringSet<> consumedKeywords;
+    for (auto &entry : explicitKwValues) {
+      auto positionalIt = positionalNameToIndex.find(entry.getKey());
+      if (positionalIt == positionalNameToIndex.end())
+        continue;
+      unsigned index = positionalIt->second;
+      if (index < providedCount || positionalElements[index]) {
+        invalidKeyword = true;
+        break;
+      }
+      positionalElements[index] = entry.getValue();
+      consumedKeywords.insert(entry.getKey());
+    }
+    if (invalidKeyword)
+      continue;
+
+    if (llvm::any_of(positionalElements,
+                     [](mlir::Value value) { return !value; })) {
+      TupleCreateOp defaults = getStaticTupleCreate(makeFunc.getDefaults());
       unsigned defaultsCount =
-          static_cast<unsigned>(defaults.getElements().size());
-      if (providedCount + defaultsCount < positionalCount)
+          defaults ? static_cast<unsigned>(defaults.getElements().size()) : 0;
+      if (defaultsCount > positionalCount)
         continue;
 
       unsigned firstDefaultIndex = positionalCount - defaultsCount;
-      if (providedCount < firstDefaultIndex)
-        continue;
       for (unsigned index = providedCount; index < positionalCount; ++index)
-        elements.push_back(defaults.getElements()[index - firstDefaultIndex]);
+        if (!positionalElements[index] && index >= firstDefaultIndex)
+          positionalElements[index] =
+              defaults.getElements()[index - firstDefaultIndex];
+      if (llvm::any_of(positionalElements,
+                       [](mlir::Value value) { return !value; }))
+        continue;
     }
 
+    llvm::SmallVector<mlir::Value, 8> elements;
+    elements.append(positionalElements.begin(), positionalElements.end());
+
     if (kwonlyCount > 0) {
-      mlir::ArrayAttr kwonlyNames = nullptr;
-      if (mlir::Operation *symbol = mlir::SymbolTable::lookupNearestSymbolFrom(
-              call, makeFunc.getTargetAttr()))
-        if (auto targetFunc = mlir::dyn_cast<FuncOp>(symbol))
-          kwonlyNames = targetFunc.getKwonlyNamesAttr();
-      if (!kwonlyNames || kwonlyNames.size() != kwonlyCount)
-        continue;
       llvm::StringMap<mlir::Value> kwdefaultValues;
-      if (!makeFunc.getKwdefaults() ||
+      if (makeFunc.getKwdefaults() &&
           !collectStaticDictStringValues(makeFunc.getKwdefaults(),
                                          makeFunc.getOperation(),
                                          kwdefaultValues))
         continue;
-      llvm::StringMap<mlir::Value> explicitKwValues;
-      if (!collectStaticKeywordArgumentValues(
-              call.getKwnames(), call.getKwvalues(), explicitKwValues))
-        continue;
       bool missingDefault = false;
-      for (mlir::Attribute attr : kwonlyNames) {
-        auto nameAttr = mlir::dyn_cast<mlir::StringAttr>(attr);
-        if (!nameAttr) {
-          missingDefault = true;
-          break;
-        }
-        auto explicitIt = explicitKwValues.find(nameAttr.getValue());
+      for (llvm::StringRef name : kwonlyNames) {
+        auto explicitIt = explicitKwValues.find(name);
         if (explicitIt != explicitKwValues.end()) {
           elements.push_back(explicitIt->second);
+          consumedKeywords.insert(name);
           continue;
         }
-        auto defaultIt = kwdefaultValues.find(nameAttr.getValue());
+        auto defaultIt = kwdefaultValues.find(name);
         if (defaultIt == kwdefaultValues.end()) {
           missingDefault = true;
           break;
@@ -524,6 +636,9 @@ void call::staticDefaults(mlir::ModuleOp module) {
         continue;
     }
 
+    if (consumedKeywords.size() != explicitKwValues.size())
+      continue;
+
     if (mlir::Value closureValue = makeFunc.getClosure()) {
       TupleCreateOp closure = getStaticTupleCreate(closureValue);
       if (!closure)
@@ -532,8 +647,15 @@ void call::staticDefaults(mlir::ModuleOp module) {
                       closure.getElements().end());
     }
 
-    if (elements.size() == posargs.getElements().size())
+    if (elements.size() == posargs.getElements().size() && !hasExplicitKeywords)
       continue;
+
+    mlir::Value oldPosargs = call.getPosargs();
+    mlir::Value oldKwnames = call.getKwnames();
+    mlir::Value oldKwvalues = call.getKwvalues();
+    mlir::Value defaults = makeFunc.getDefaults();
+    mlir::Value kwdefaults = makeFunc.getKwdefaults();
+    mlir::Value closure = makeFunc.getClosure();
 
     llvm::SmallVector<mlir::Type, 8> elementTypes;
     elementTypes.reserve(elements.size());
@@ -553,6 +675,15 @@ void call::staticDefaults(mlir::ModuleOp module) {
     call.getCallableMutable().assign(funcObject.getResult());
     call.getKwnamesMutable().assign(emptyKwTuple.getResult());
     call.getKwvaluesMutable().assign(emptyKwTuple.getResult());
+    eraseDeadStaticMetadataTree(oldPosargs);
+    eraseDeadStaticMetadataTree(oldKwnames);
+    eraseDeadStaticMetadataTree(oldKwvalues);
+    if (makeFunc->use_empty()) {
+      makeFunc.erase();
+      eraseDeadStaticMetadataTree(defaults);
+      eraseDeadStaticMetadataTree(kwdefaults);
+      eraseDeadStaticMetadataTree(closure);
+    }
   }
 }
 
@@ -765,11 +896,18 @@ static void collectMakeFunctionPublicationSites(
   }
 }
 
+static bool storesInlineClassAggregate(ListAppendOp op) {
+  auto listType = mlir::dyn_cast<ListType>(op.getList().getType());
+  return listType && mlir::isa<ClassType>(listType.getElementType());
+}
+
 void publication::insertBoundaries(mlir::ModuleOp module) {
   llvm::SmallVector<std::pair<mlir::Operation *, unsigned>, 16> insertionSites;
   llvm::SmallVector<std::pair<TupleCreateOp, unsigned>, 16> tupleInsertionSites;
 
   module.walk([&](ListAppendOp op) {
+    if (storesInlineClassAggregate(op))
+      return;
     insertionSites.emplace_back(op.getOperation(), 1);
   });
 
@@ -852,6 +990,9 @@ void publication::compute(mlir::ModuleOp module) {
         int listArgIndex = publication::entryArg(func, op.getList());
         if (listArgIndex >= 0)
           mutableArgs.insert(listArgIndex);
+
+        if (storesInlineClassAggregate(op))
+          return;
 
         int argIndex = publication::entryArg(func, op.getValue());
         if (argIndex < 0)
@@ -1277,13 +1418,47 @@ static bool isZeroCostLocalClassFieldCandidate(mlir::Type fieldType) {
   return !mlir::isa<ClassType, ListType, TupleType, DictType>(fieldType);
 }
 
+static bool isBorrowOnlyLocalFieldUser(mlir::Operation *user) {
+  return mlir::isa<AddOp, StrConcat3Op, SubOp, LeOp, LtOp, GtOp, GeOp, EqOp,
+                   NeOp, ReprOp, ListAppendOp, ListRemoveOp, ListGetOp>(user);
+}
+
+static bool hasSingleBorrowThenDrop(mlir::Value value) {
+  DecRefOp drop;
+  mlir::Operation *borrowUser = nullptr;
+
+  for (mlir::Operation *user : value.getUsers()) {
+    if (auto decref = mlir::dyn_cast<DecRefOp>(user)) {
+      if (drop)
+        return false;
+      drop = decref;
+      continue;
+    }
+    if (!isBorrowOnlyLocalFieldUser(user))
+      return false;
+    if (borrowUser)
+      return false;
+    borrowUser = user;
+  }
+
+  if (!borrowUser || !drop)
+    return false;
+  if (borrowUser->getBlock() != drop->getBlock())
+    return false;
+  return borrowUser->isBeforeInBlock(drop);
+}
+
 void class_state::proveLocalAccess(mlir::ModuleOp module) {
   module.walk([&](mlir::Operation *op) {
     mlir::Value object;
     mlir::Type fieldType;
+    bool borrowedContainerField = false;
     if (auto attrGet = mlir::dyn_cast<AttrGetOp>(op)) {
       object = attrGet.getObject();
       fieldType = attrGet.getResult().getType();
+      borrowedContainerField =
+          mlir::isa<ListType, TupleType, DictType>(fieldType) &&
+          hasSingleBorrowThenDrop(attrGet.getResult());
     } else if (auto attrSet = mlir::dyn_cast<AttrSetOp>(op)) {
       object = attrSet.getObject();
       fieldType = attrSet.getValue().getType();
@@ -1293,11 +1468,15 @@ void class_state::proveLocalAccess(mlir::ModuleOp module) {
 
     if (!class_state::local(object))
       return;
-    if (!isZeroCostLocalClassFieldCandidate(fieldType))
+    if (!isZeroCostLocalClassFieldCandidate(fieldType) &&
+        !borrowedContainerField)
       return;
 
     op->setAttr("ly.proven_local_class_access",
                 mlir::UnitAttr::get(module.getContext()));
+    if (borrowedContainerField)
+      op->setAttr(ClassSafetyAttrs::kBorrowedLocalField,
+                  mlir::UnitAttr::get(module.getContext()));
   });
 }
 
@@ -1342,6 +1521,192 @@ void class_state::markFirstStores(mlir::ModuleOp module) {
   });
 }
 
+static std::optional<llvm::APInt> parsePyIntLiteral(llvm::StringRef text) {
+  bool negative = text.consume_front("-");
+  if (!negative)
+    (void)text.consume_front("+");
+  if (text.empty())
+    return std::nullopt;
+  for (char c : text)
+    if (c < '0' || c > '9')
+      return std::nullopt;
+
+  unsigned bitWidth =
+      std::max<unsigned>(2, static_cast<unsigned>(text.size()) * 4 + 2);
+  llvm::APInt magnitude(bitWidth, text, 10);
+  if (!negative)
+    return magnitude;
+  return -magnitude;
+}
+
+static std::string formatPyIntLiteral(const llvm::APInt &value) {
+  llvm::SmallString<64> out;
+  value.toStringSigned(out, 10);
+  return out.str().str();
+}
+
+static bool isStrAdd(AddOp op) {
+  return op && mlir::isa<StrType>(op.getLhs().getType()) &&
+         mlir::isa<StrType>(op.getRhs().getType()) &&
+         mlir::isa<StrType>(op.getResult().getType());
+}
+
+static DecRefOp movableDropBefore(mlir::Value value, mlir::Operation *onlyUser,
+                                  mlir::Operation *before) {
+  DecRefOp drop;
+  for (mlir::Operation *user : value.getUsers()) {
+    if (user == onlyUser)
+      continue;
+    auto candidate = mlir::dyn_cast<DecRefOp>(user);
+    if (!candidate || candidate->getBlock() != before->getBlock())
+      return nullptr;
+    if (!onlyUser->isBeforeInBlock(candidate) ||
+        !candidate->isBeforeInBlock(before))
+      return nullptr;
+    if (drop)
+      return nullptr;
+    drop = candidate;
+  }
+  return drop;
+}
+
+static DecRefOp soleDropAfter(mlir::Value value, mlir::Operation *onlyUser,
+                              mlir::Operation *after) {
+  DecRefOp drop;
+  for (mlir::Operation *user : value.getUsers()) {
+    if (user == onlyUser)
+      continue;
+    auto candidate = mlir::dyn_cast<DecRefOp>(user);
+    if (!candidate || candidate->getBlock() != after->getBlock())
+      return nullptr;
+    if (!after->isBeforeInBlock(candidate))
+      return nullptr;
+    if (drop)
+      return nullptr;
+    drop = candidate;
+  }
+  return drop;
+}
+
+struct StrConcat3Candidate {
+  AddOp inner;
+  AddOp outer;
+  DecRefOp lhsDrop;
+  DecRefOp middleDrop;
+  DecRefOp innerDrop;
+};
+
+static std::optional<StrConcat3Candidate> matchStrConcat3(AddOp outer) {
+  if (!isStrAdd(outer))
+    return std::nullopt;
+  auto inner = value::stripCasts(outer.getLhs()).getDefiningOp<AddOp>();
+  if (!isStrAdd(inner) || inner->getBlock() != outer->getBlock())
+    return std::nullopt;
+
+  DecRefOp lhsDrop =
+      movableDropBefore(inner.getLhs(), inner.getOperation(), outer);
+  DecRefOp middleDrop =
+      movableDropBefore(inner.getRhs(), inner.getOperation(), outer);
+  DecRefOp innerDrop =
+      soleDropAfter(inner.getResult(), outer.getOperation(), outer);
+  if (!lhsDrop || !middleDrop || !innerDrop)
+    return std::nullopt;
+
+  return StrConcat3Candidate{inner, outer, lhsDrop, middleDrop, innerDrop};
+}
+
+static bool fuseOneStrConcat3(mlir::ModuleOp module) {
+  std::optional<StrConcat3Candidate> candidate;
+  module.walk([&](AddOp outer) -> mlir::WalkResult {
+    candidate = matchStrConcat3(outer);
+    return candidate ? mlir::WalkResult::interrupt()
+                     : mlir::WalkResult::advance();
+  });
+  if (!candidate)
+    return false;
+
+  mlir::OpBuilder builder(candidate->outer);
+  auto fused = builder.create<StrConcat3Op>(
+      candidate->outer.getLoc(), candidate->outer.getResult().getType(),
+      candidate->inner.getLhs(), candidate->inner.getRhs(),
+      candidate->outer.getRhs());
+  candidate->outer.getResult().replaceAllUsesWith(fused.getResult());
+
+  mlir::Operation *after = fused.getOperation();
+  candidate->lhsDrop->moveAfter(after);
+  after = candidate->lhsDrop.getOperation();
+  candidate->middleDrop->moveAfter(after);
+
+  candidate->innerDrop.erase();
+  candidate->outer.erase();
+  if (candidate->inner.getResult().use_empty())
+    candidate->inner.erase();
+  return true;
+}
+
+void scalar::fuseStrConcat3(mlir::ModuleOp module) {
+  while (fuseOneStrConcat3(module))
+    ;
+}
+
+static bool foldIntBinaryConstant(mlir::Operation *op, mlir::Value lhs,
+                                  mlir::Value rhs, mlir::Type resultType,
+                                  bool subtract) {
+  if (!mlir::isa<IntType>(resultType))
+    return false;
+
+  auto lhsConst = value::stripCasts(lhs).getDefiningOp<IntConstantOp>();
+  auto rhsConst = value::stripCasts(rhs).getDefiningOp<IntConstantOp>();
+  if (!lhsConst || !rhsConst)
+    return false;
+
+  std::optional<llvm::APInt> lhsValue = parsePyIntLiteral(lhsConst.getValue());
+  std::optional<llvm::APInt> rhsValue = parsePyIntLiteral(rhsConst.getValue());
+  if (!lhsValue || !rhsValue)
+    return false;
+
+  unsigned resultBits =
+      std::max(lhsValue->getBitWidth(), rhsValue->getBitWidth()) + 2;
+  llvm::APInt lhsWide = lhsValue->sextOrTrunc(resultBits);
+  llvm::APInt rhsWide = rhsValue->sextOrTrunc(resultBits);
+  llvm::APInt folded = subtract ? lhsWide - rhsWide : lhsWide + rhsWide;
+
+  mlir::OpBuilder builder(op);
+  auto replacement = builder.create<IntConstantOp>(op->getLoc(), resultType,
+                                                   formatPyIntLiteral(folded));
+  op->getResult(0).replaceAllUsesWith(replacement.getResult());
+  op->erase();
+  return true;
+}
+
+void scalar::foldStaticBuiltinPrintRepr(mlir::ModuleOp module) {
+  // This optimization used to bypass typed string lowering by emitting an
+  // erased host print call directly.  That violates the
+  // memref-centered ABI because the high-level optimizer would introduce a host
+  // boundary before value lowering can prove ownership. Keep the pass disabled
+  // until it can emit py/unicode memref operations.
+  (void)module;
+}
+
+void scalar::foldIntConstants(mlir::ModuleOp module) {
+  llvm::SmallVector<mlir::Operation *> candidates;
+  module.walk([&](mlir::Operation *op) {
+    if (mlir::isa<AddOp, SubOp>(op))
+      candidates.push_back(op);
+  });
+
+  for (mlir::Operation *op : candidates) {
+    if (auto add = mlir::dyn_cast<AddOp>(op)) {
+      foldIntBinaryConstant(add.getOperation(), add.getLhs(), add.getRhs(),
+                            add.getResult().getType(), /*subtract=*/false);
+      continue;
+    }
+    if (auto sub = mlir::dyn_cast<SubOp>(op))
+      foldIntBinaryConstant(sub.getOperation(), sub.getLhs(), sub.getRhs(),
+                            sub.getResult().getType(), /*subtract=*/true);
+  }
+}
+
 /// Hoist integer constants to entry block and perform CSE.
 void scalar::hoistInts(mlir::ModuleOp module) {
   module.walk([&](mlir::func::FuncOp func) {
@@ -1374,339 +1739,28 @@ void scalar::hoistInts(mlir::ModuleOp module) {
   });
 }
 
-/// Remove DecRef for small integer constants (-5 to 256).
-/// These are immortal in Python's small integer cache.
-void scalar::dropSmallIntDecrefs(mlir::ModuleOp module) {
-  llvm::SmallVector<DecRefOp> toErase;
-
-  module.walk([&](DecRefOp decref) {
-    mlir::Value obj = decref.getObject();
-    if (auto intConst = obj.getDefiningOp<IntConstantOp>()) {
-      llvm::StringRef valueStr = intConst.getValue();
-      // Parse the string to check if it's in small int range
-      char *end;
-      long long value = std::strtoll(valueStr.data(), &end, 10);
-      // Only apply optimization if parsing succeeded and value is in range
-      if (end == valueStr.data() + valueStr.size() && value >= -5 &&
-          value <= 256) {
-        toErase.push_back(decref);
-      }
-    }
-  });
-
-  for (auto op : toErase)
-    op->erase();
-}
-
-/// CSE for singleton getter calls (Ly_GetBuiltinPrint, Ly_GetNone). These
-/// return borrowed references to singletons, so no DecRef needed.
-void scalar::cseSingletons(mlir::ModuleOp module) {
-  module.walk([&](mlir::func::FuncOp func) {
-    if (func.isExternal())
-      return;
-
-    // Cache for each singleton getter function
-    llvm::StringMap<mlir::LLVM::CallOp> singletonCache;
-    llvm::SmallVector<mlir::LLVM::CallOp> toErase;
-
-    func.walk([&](mlir::LLVM::CallOp callOp) {
-      auto callee = callOp.getCallee();
-      if (!callee)
-        return;
-
-      // Singleton getters that we want to CSE
-      if (*callee != "Ly_GetBuiltinPrint" && *callee != "Ly_GetNone")
-        return;
-
-      llvm::StringRef funcName = *callee;
-      auto it = singletonCache.find(funcName);
-      if (it != singletonCache.end()) {
-        // Replace with cached result
-        callOp.getResult().replaceAllUsesWith(it->second.getResult());
-        toErase.push_back(callOp);
-      } else {
-        singletonCache[funcName] = callOp;
-      }
-    });
-
-    for (auto op : toErase)
-      op->erase();
-  });
-}
-
-/// Eliminate redundant Bool boxing/unboxing patterns.
-/// Pattern:
-///   %boxed = llvm.call @LyBool_FromBool(%i1_val) : (i1) -> !llvm.ptr
-///   %unboxed = llvm.call @LyBool_AsBool(%boxed) : (!llvm.ptr) -> i1
-///   llvm.call @Ly_DecRef(%boxed) : (!llvm.ptr) -> ()
-/// Replaced with direct use of %i1_val.
-void scalar::elideBoolBoxing(mlir::ModuleOp module) {
-  llvm::SmallVector<mlir::LLVM::CallOp> fromBoolCalls;
-
-  // First pass: find all LyBool_FromBool calls
-  module.walk([&](mlir::LLVM::CallOp callOp) {
-    auto callee = callOp.getCallee();
-    if (callee && *callee == "LyBool_FromBool")
-      fromBoolCalls.push_back(callOp);
-  });
-
-  // Second pass: check each FromBool call for the pattern
-  for (auto fromBoolCall : fromBoolCalls) {
-    if (fromBoolCall.getNumOperands() != 1)
-      continue;
-
-    mlir::Value i1Value = fromBoolCall.getOperand(0);
-    mlir::Value boxedValue = fromBoolCall.getResult();
-
-    // Find users of the boxed value
-    mlir::LLVM::CallOp asBoolCall = nullptr;
-    mlir::LLVM::CallOp decRefCall = nullptr;
-    bool hasOtherUsers = false;
-
-    for (mlir::Operation *user : boxedValue.getUsers()) {
-      if (auto callUser = mlir::dyn_cast<mlir::LLVM::CallOp>(user)) {
-        auto callee = callUser.getCallee();
-        if (callee && *callee == "LyBool_AsBool" && !asBoolCall) {
-          asBoolCall = callUser;
-        } else if (callee && *callee == "Ly_DecRef" && !decRefCall) {
-          decRefCall = callUser;
-        } else {
-          hasOtherUsers = true;
-        }
-      } else {
-        hasOtherUsers = true;
-      }
-    }
-
-    // Only optimize if the pattern matches:
-    // - One LyBool_AsBool call
-    // - Optional Ly_DecRef call (bool singletons are immortal)
-    // - No other users
-    if (!asBoolCall || hasOtherUsers)
-      continue;
-
-    // Replace uses of the AsBool result with the original i1 value
-    asBoolCall.getResult().replaceAllUsesWith(i1Value);
-
-    // Erase the operations (in reverse order of dependencies)
-    if (decRefCall)
-      decRefCall->erase();
-    asBoolCall->erase();
-    fromBoolCall->erase();
-  }
-}
-
-/// Eliminate redundant long boxing/unboxing patterns.
-/// Pattern:
-///   %boxed = llvm.call @LyLong_FromI64(%i64_val) : (i64) -> !llvm.ptr
-///   %unboxed = llvm.call @LyLong_AsI64(%boxed) : (!llvm.ptr) -> i64
-///   llvm.call @Ly_DecRef(%boxed) : (!llvm.ptr) -> ()
-/// Replaced with direct use of %i64_val.
-void scalar::elideLongBoxing(mlir::ModuleOp module) {
-  llvm::SmallVector<mlir::LLVM::CallOp> fromI64Calls;
-
-  module.walk([&](mlir::LLVM::CallOp callOp) {
-    if (runtime::Call::is(callOp, RuntimeSymbols::kLongFromI64))
-      fromI64Calls.push_back(callOp);
-  });
-
-  for (auto fromI64Call : fromI64Calls) {
-    if (fromI64Call.getNumOperands() != 1)
-      continue;
-
-    mlir::Value i64Value = fromI64Call.getOperand(0);
-    mlir::Value boxedValue = fromI64Call.getResult();
-
-    mlir::LLVM::CallOp asI64Call = nullptr;
-    mlir::LLVM::CallOp decRefCall = nullptr;
-    bool hasOtherUsers = false;
-
-    for (mlir::Operation *user : boxedValue.getUsers()) {
-      auto callUser = mlir::dyn_cast<mlir::LLVM::CallOp>(user);
-      if (!callUser) {
-        hasOtherUsers = true;
-        break;
-      }
-
-      if (runtime::Call::is(callUser, RuntimeSymbols::kLongAsI64) &&
-          !asI64Call) {
-        asI64Call = callUser;
-      } else if (runtime::Call::is(callUser, RuntimeSymbols::kDecRef) &&
-                 !decRefCall) {
-        decRefCall = callUser;
-      } else {
-        hasOtherUsers = true;
-        break;
-      }
-    }
-
-    if (!asI64Call || hasOtherUsers)
-      continue;
-
-    asI64Call.getResult().replaceAllUsesWith(i64Value);
-
-    if (decRefCall)
-      decRefCall->erase();
-    asI64Call->erase();
-    fromI64Call->erase();
-  }
-}
-
-/// Rewrites LyLong_Add/Sub round-trips through heap objects into direct i64
-/// arithmetic when the result is immediately unboxed.
-/// Pattern:
-///   %lhs_box = llvm.call @LyLong_FromI64(%lhs) : (i64) -> !llvm.ptr
-///   %res_box = llvm.call @LyLong_Add|Sub(%lhs_box, %rhs_box) : ... ->
-///   !llvm.ptr %res = llvm.call @LyLong_AsI64(%res_box) : (!llvm.ptr) -> i64
-///   llvm.call @Ly_DecRef(%res_box) : (!llvm.ptr) -> ()
-/// Replaced with direct i64 add/sub, materializing LyLong_AsI64 only for
-/// boxed operands that are not already from LyLong_FromI64.
-void scalar::elideLongArithRoundTrips(mlir::ModuleOp module) {
-  llvm::SmallVector<mlir::LLVM::CallOp> asI64Calls;
-
-  module.walk([&](mlir::LLVM::CallOp callOp) {
-    if (runtime::Call::is(callOp, RuntimeSymbols::kLongAsI64))
-      asI64Calls.push_back(callOp);
-  });
-
-  for (auto asI64Call : asI64Calls) {
-    if (asI64Call.getNumOperands() != 1)
-      continue;
-
-    auto arithmeticCall =
-        asI64Call.getOperand(0).getDefiningOp<mlir::LLVM::CallOp>();
-    if (!arithmeticCall || arithmeticCall.getNumOperands() != 2)
-      continue;
-
-    bool isAdd = runtime::Call::is(arithmeticCall, RuntimeSymbols::kLongAdd);
-    bool isSub = runtime::Call::is(arithmeticCall, RuntimeSymbols::kLongSub);
-    if (!isAdd && !isSub)
-      continue;
-
-    mlir::Value boxedResult = arithmeticCall.getResult();
-    mlir::LLVM::CallOp decRefCall = nullptr;
-    bool hasOtherUsers = false;
-    for (mlir::Operation *user : boxedResult.getUsers()) {
-      auto callUser = mlir::dyn_cast<mlir::LLVM::CallOp>(user);
-      if (!callUser) {
-        hasOtherUsers = true;
-        break;
-      }
-
-      if (callUser == asI64Call) {
-        continue;
-      }
-      if (runtime::Call::is(callUser, RuntimeSymbols::kDecRef) && !decRefCall) {
-        decRefCall = callUser;
-      } else {
-        hasOtherUsers = true;
-        break;
-      }
-    }
-
-    if (hasOtherUsers)
-      continue;
-
-    mlir::OpBuilder builder(asI64Call);
-    mlir::Location loc = asI64Call.getLoc();
-    mlir::Value lhsBoxed = arithmeticCall.getOperand(0);
-    mlir::Value rhsBoxed = arithmeticCall.getOperand(1);
-
-    mlir::Value lhs = runtime::Long::asI64(module, builder, loc, lhsBoxed);
-    mlir::Value rhs = runtime::Long::asI64(module, builder, loc, rhsBoxed);
-
-    mlir::Value arithmeticResult;
-    if (isAdd) {
-      arithmeticResult =
-          builder.create<mlir::LLVM::AddOp>(loc, lhs.getType(), lhs, rhs)
-              .getResult();
-    } else {
-      arithmeticResult =
-          builder.create<mlir::LLVM::SubOp>(loc, lhs.getType(), lhs, rhs)
-              .getResult();
-    }
-
-    asI64Call.getResult().replaceAllUsesWith(arithmeticResult);
-
-    if (decRefCall)
-      decRefCall->erase();
-    asI64Call->erase();
-    arithmeticCall->erase();
-
-    if (auto fromI64Call = lhsBoxed.getDefiningOp<mlir::LLVM::CallOp>();
-        fromI64Call &&
-        runtime::Call::is(fromI64Call, RuntimeSymbols::kLongFromI64)) {
-      runtime::Call::eraseWithOptionalRelease(fromI64Call);
-    }
-    if (auto fromI64Call = rhsBoxed.getDefiningOp<mlir::LLVM::CallOp>();
-        fromI64Call &&
-        runtime::Call::is(fromI64Call, RuntimeSymbols::kLongFromI64)) {
-      runtime::Call::eraseWithOptionalRelease(fromI64Call);
-    }
-  }
-}
-
-/// CSE for LyLong_FromI64 for small integers (-5 to 256).
-/// Small integers are immortal, so sharing is safe.
-void scalar::cseSmallInts(mlir::ModuleOp module) {
-  module.walk([&](mlir::func::FuncOp func) {
-    if (func.isExternal())
-      return;
-
-    llvm::DenseMap<int64_t, mlir::LLVM::CallOp> cache;
-    llvm::SmallVector<mlir::LLVM::CallOp> toErase;
-
-    func.walk([&](mlir::LLVM::CallOp callOp) {
-      auto callee = callOp.getCallee();
-      if (!callee || *callee != "LyLong_FromI64")
-        return;
-      if (callOp.getNumOperands() != 1)
-        return;
-      auto constOp =
-          callOp.getOperand(0).getDefiningOp<mlir::LLVM::ConstantOp>();
-      if (!constOp)
-        return;
-      auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(constOp.getValue());
-      if (!intAttr)
-        return;
-      int64_t value = intAttr.getInt();
-      if (value < -5 || value > 256)
-        return;
-
-      auto it = cache.find(value);
-      if (it != cache.end()) {
-        callOp.getResult().replaceAllUsesWith(it->second.getResult());
-        toErase.push_back(callOp);
-      } else {
-        cache[value] = callOp;
-      }
-    });
-
-    for (auto op : toErase)
-      op->erase();
-  });
-}
-
 /// CSE for LLVM constants within each function.
 void scalar::cseConstants(mlir::ModuleOp module) {
   module.walk([&](mlir::func::FuncOp func) {
     if (func.isExternal())
       return;
 
+    mlir::DominanceInfo dominance(func.getOperation());
     // Map from (type, value) -> first constant op
     llvm::DenseMap<std::pair<mlir::Type, mlir::Attribute>,
-                   mlir::LLVM::ConstantOp>
+                   llvm::SmallVector<mlir::LLVM::ConstantOp, 4>>
         constantCache;
     llvm::SmallVector<mlir::LLVM::ConstantOp> toErase;
 
     func.walk([&](mlir::LLVM::ConstantOp constOp) {
       auto key = std::make_pair(constOp.getType(), constOp.getValue());
-      auto it = constantCache.find(key);
-      if (it != constantCache.end()) {
-        constOp.getResult().replaceAllUsesWith(it->second.getResult());
+      auto &candidates = constantCache[key];
+      if (mlir::LLVM::ConstantOp dominating =
+              findDominatingCached(candidates, constOp, dominance)) {
+        constOp.getResult().replaceAllUsesWith(dominating.getResult());
         toErase.push_back(constOp);
       } else {
-        constantCache[key] = constOp;
+        candidates.push_back(constOp);
       }
     });
 
@@ -1724,6 +1778,10 @@ static bool hasOnlyTensorResults(mlir::Operation *op) {
 }
 
 static bool isDeadCodeCandidate(mlir::Operation *op) {
+  if (mlir::isa<TupleCreateOp>(op) && op->hasAttr("ly.dead_call_pack"))
+    return true;
+  if (mlir::isa<StrConstantOp, IntConstantOp, FloatConstantOp>(op))
+    return true;
   if (mlir::isa<mlir::LLVM::AddressOfOp, mlir::LLVM::GEPOp,
                 mlir::LLVM::ConstantOp>(op))
     return true;

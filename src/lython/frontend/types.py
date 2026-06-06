@@ -15,7 +15,6 @@ from .inference import (
 )
 from .symbols import ClassInfo, FunctionInfo
 
-
 TypeParser = Callable[[str], ir.Type]
 PrimitiveAnnotationResolver = Callable[[ast.expr | None], ir.Type | None]
 ClassLookup = Callable[[str], ClassInfo | None]
@@ -64,10 +63,16 @@ class TypeResolver:
             "bool": "!py.bool",
             "str": "!py.str",
             "None": "!py.none",
-            "object": "!py.object",
         }
         if term.name in scalar:
             return scalar[term.name]
+        if term.name == "Exception":
+            return "!py.exception"
+        if term.name == "object":
+            raise TypeError(
+                "Generic object type is not part of the statically typed "
+                "lowering ABI; use a concrete Python-level type"
+            )
         if term.name.startswith("class:"):
             return f'!py.class<"{term.name[len("class:") :]}">'
         if term.name == "list" and len(term.args) == 1:
@@ -135,6 +140,11 @@ class TypeResolver:
             }
             if annotation.id in mapping:
                 return mapping[annotation.id]
+            if annotation.id == "object":
+                raise TypeError(
+                    "Generic object annotations are not supported; use a "
+                    "concrete Python-level type"
+                )
             if self.class_lookup(annotation.id) is not None:
                 return f'!py.class<"{annotation.id}">'
         if isinstance(annotation, ast.Subscript):
@@ -362,7 +372,9 @@ class TypeResolver:
         element_spec = list_type_str[len("!py.list<") : -1]
         return self.parse_type(element_spec)
 
-    def dict_key_value_types(self, dict_type: ir.Type) -> tuple[ir.Type, ir.Type] | None:
+    def dict_key_value_types(
+        self, dict_type: ir.Type
+    ) -> tuple[ir.Type, ir.Type] | None:
         dict_type_str = str(dict_type)
         if not (dict_type_str.startswith("!py.dict<") and dict_type_str.endswith(">")):
             return None

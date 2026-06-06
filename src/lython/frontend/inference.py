@@ -115,9 +115,7 @@ class SemanticOracle(Protocol):
 
     def call(self, callee: TypeTerm, args: tuple[TypeTerm, ...]) -> TypeTerm | None: ...
 
-    def subscript(
-        self, container: TypeTerm, index: TypeTerm
-    ) -> TypeTerm | None: ...
+    def subscript(self, container: TypeTerm, index: TypeTerm) -> TypeTerm | None: ...
 
     def awaitable(self, awaitable: TypeTerm) -> TypeTerm | None: ...
 
@@ -239,7 +237,9 @@ def apply_substitution(term: TypeTerm, subst: Mapping[int, TypeTerm]) -> TypeTer
     )
 
 
-def apply_constraint(constraint: Constraint, subst: Mapping[int, TypeTerm]) -> Constraint:
+def apply_constraint(
+    constraint: Constraint, subst: Mapping[int, TypeTerm]
+) -> Constraint:
     if isinstance(constraint, Equal):
         return Equal(
             apply_substitution(constraint.lhs, subst),
@@ -389,9 +389,7 @@ class AlgorithmM:
                         f"Cannot resolve attribute '{constraint.name}' on "
                         f"{constraint.owner.display()}: {constraint.reason.describe()}"
                     )
-                pending.insert(
-                    0, Equal(constraint.result, resolved, constraint.reason)
-                )
+                pending.insert(0, Equal(constraint.result, resolved, constraint.reason))
                 continue
             if isinstance(constraint, Call):
                 resolved = self.oracle.call(constraint.callee, constraint.args)
@@ -400,22 +398,16 @@ class AlgorithmM:
                         f"Cannot resolve call of {constraint.callee.display()}: "
                         f"{constraint.reason.describe()}"
                     )
-                pending.insert(
-                    0, Equal(constraint.result, resolved, constraint.reason)
-                )
+                pending.insert(0, Equal(constraint.result, resolved, constraint.reason))
                 continue
             if isinstance(constraint, Subscript):
-                resolved = self.oracle.subscript(
-                    constraint.container, constraint.index
-                )
+                resolved = self.oracle.subscript(constraint.container, constraint.index)
                 if resolved is None:
                     raise InferenceError(
                         f"Cannot resolve subscript of {constraint.container.display()}: "
                         f"{constraint.reason.describe()}"
                     )
-                pending.insert(
-                    0, Equal(constraint.result, resolved, constraint.reason)
-                )
+                pending.insert(0, Equal(constraint.result, resolved, constraint.reason))
                 continue
             resolved = self.oracle.awaitable(constraint.awaitable)
             if resolved is None:
@@ -505,10 +497,11 @@ def parse_py_type_spec(spec: str, split_args: Callable[[str], list[str]]) -> Typ
         "!py.bool": "bool",
         "!py.str": "str",
         "!py.none": "None",
-        "!py.object": "object",
     }
     if spec in scalar:
         return TypeCon(scalar[spec])
+    if spec == "!py.exception":
+        return TypeCon("Exception")
     if spec.startswith(func_prefix) and spec.endswith(">>"):
         inner = spec[len(func_prefix) : -2]
         lhs, rhs = _split_top_level_arrow(inner)
@@ -554,6 +547,8 @@ def parse_py_type_spec(spec: str, split_args: Callable[[str], list[str]]) -> Typ
                 name,
                 tuple(parse_py_type_spec(arg, split_args) for arg in split_args(inner)),
             )
+    if spec.startswith("!py."):
+        raise InferenceError(f"Unsupported py dialect type spec: {spec}")
     return TypeCon(spec)
 
 

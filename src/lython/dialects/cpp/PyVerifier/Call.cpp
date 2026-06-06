@@ -82,8 +82,9 @@ mlir::LogicalResult CallOp::verify() {
           "callee requires keyword arguments but received !py.none");
     if (!isSubtypeOf(dictTy.getKeyType(), StrType::get(getContext())))
       return emitOpError("kwargs mapping must use !py.str keys");
-    if (!isSubtypeOf(dictTy.getValueType(), ObjectType::get(getContext())))
-      return emitOpError("kwargs mapping must use !py.object values");
+    if (!isPyType(dictTy.getValueType()))
+      return emitOpError(
+          "kwargs mapping must use statically typed !py.* values");
   } else if (!kwargsIsNone) {
     return emitOpError(
         "callee does not accept keyword arguments; use !py.none");

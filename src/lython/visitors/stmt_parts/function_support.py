@@ -78,7 +78,15 @@ class FunctionSupportMixin(VisitorRuntime):
             if default_node is not None
         ]
         if kwdefault_entries:
-            dict_type = self.get_py_type("!py.dict<!py.str, !py.object>")
+            value_type = kwdefault_entries[0][2]
+            if any(
+                str(expected) != str(value_type) for _, _, expected in kwdefault_entries
+            ):
+                raise NotImplementedError(
+                    "Heterogeneous keyword-only defaults require typed tuple "
+                    "metadata ABI"
+                )
+            dict_type = self.get_py_type(f"!py.dict<!py.str, {value_type}>")
             with loc, self.insertion_point():
                 current = py_ops.DictEmptyOp(dict_type).result
                 for name, default_node, expected_type in kwdefault_entries:
@@ -86,7 +94,6 @@ class FunctionSupportMixin(VisitorRuntime):
                     value = self.coerce_value_to_type(
                         value, expected_type, self._loc(default_node)
                     )
-                    value = self.ensure_object(value, loc=loc)
                     key = py_ops.StrConstantOp(
                         self.get_py_type("!py.str"), ir.StringAttr.get(name, self.ctx)
                     ).result

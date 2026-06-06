@@ -25,6 +25,12 @@ collectSameBlockUsersAfter(mlir::Value value, mlir::Operation *anchor,
   }
 }
 
+static bool localClassProducer(mlir::Value object) {
+  if (object.getDefiningOp<ClassNewOp>())
+    return true;
+  return false;
+}
+
 void refcount::sinkClassDecrefs(mlir::ModuleOp module) {
   llvm::SmallVector<std::pair<DecRefOp, mlir::Operation *>> moves;
 
@@ -77,7 +83,7 @@ void refcount::markFinalLocal(mlir::ModuleOp module) {
     mlir::Value object = value::stripCasts(decref.getObject());
     if (!mlir::isa<ClassType>(object.getType()))
       return;
-    if (!object.getDefiningOp<ClassNewOp>())
+    if (!localClassProducer(object))
       return;
 
     for (mlir::Operation *user : object.getUsers()) {

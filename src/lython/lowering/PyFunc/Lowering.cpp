@@ -2,12 +2,16 @@
 // py.func_object operations. These patterns convert Python-style function
 // definitions to standard MLIR func dialect operations.
 
+#include "Common/Container.h"
 #include "Common/LoweringUtils.h"
+#include "Common/Object.h"
 #include "Common/RuntimeSupport.h"
+#include "Common/SlotUtils.h"
 
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/IRMapping.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
@@ -23,9 +27,6 @@
 
 namespace py {
 ClassOp lookupClassSymbol(mlir::Operation *from, ClassType classType);
-mlir::FailureOr<mlir::LLVM::LLVMStructType>
-getStaticClassObjectType(mlir::Operation *from, ClassType classType,
-                         const PyLLVMTypeConverter &typeConverter);
 
 namespace {
 
@@ -67,9 +68,12 @@ translate(FuncSignatureType sig, const PyLLVMTypeConverter &typeConverter,
     if (mlir::failed(appendConverted(ty, convertedInputs)))
       return mlir::failure();
 
-  for (mlir::Type result : sig.getResultTypes())
+  for (mlir::Type result : sig.getResultTypes()) {
+    if (mlir::isa<NoneType>(result))
+      continue;
     if (mlir::failed(appendConverted(result, convertedResults)))
       return mlir::failure();
+  }
 
   return mlir::success();
 }
@@ -111,7 +115,103 @@ appendClosureInputs(mlir::ArrayAttr closureTypesAttr,
 
 } // namespace lowering::func::signature
 
-namespace lowering::func::args::AsyncDescriptor {
+namespace lowering::func::args::ABI {
+
+static void setUnitAttr(mlir::func::FuncOp func, unsigned argIndex,
+                        llvm::StringRef name) {
+  if (argIndex >= func.getNumArguments())
+    return;
+  func.setArgAttr(argIndex, name, mlir::UnitAttr::get(func.getContext()));
+}
+
+static void setStringAttr(mlir::func::FuncOp func, unsigned argIndex,
+                          llvm::StringRef name, llvm::StringRef value) {
+  if (argIndex >= func.getNumArguments())
+    return;
+  func.setArgAttr(argIndex, name,
+                  mlir::StringAttr::get(func.getContext(), value));
+}
+
+static bool hasObjectHeaderPart(mlir::Type type) {
+  return mlir::isa<IntType, StrType, ExceptionType, ClassType>(type);
+}
+
+static std::optional<llvm::StringRef> containerKind(mlir::Type type) {
+  if (mlir::isa<ListType>(type))
+    return ContainerSafetyAttrs::kKindList;
+  if (mlir::isa<TupleType>(type))
+    return ContainerSafetyAttrs::kKindTuple;
+  if (mlir::isa<DictType>(type))
+    return ContainerSafetyAttrs::kKindDict;
+  return std::nullopt;
+}
+
+static llvm::StringRef containerComponent(mlir::Type type, unsigned slot) {
+  if (slot == kTupleHeaderComponent)
+    return ContainerSafetyAttrs::kComponentHeader;
+  if (mlir::isa<TupleType>(type)) {
+    if (slot == kTupleItemsComponent)
+      return ContainerSafetyAttrs::kComponentItems;
+    return {};
+  }
+  if (mlir::isa<ListType>(type)) {
+    switch (slot) {
+    case kListLockComponent:
+      return ContainerSafetyAttrs::kComponentLock;
+    case kListItemsComponent:
+      return ContainerSafetyAttrs::kComponentItems;
+    default:
+      break;
+    }
+  }
+  if (mlir::isa<DictType>(type)) {
+    switch (slot) {
+    case kDictLockComponent:
+      return ContainerSafetyAttrs::kComponentLock;
+    case kDictKeysComponent:
+      return ContainerSafetyAttrs::kComponentKeys;
+    case kDictValuesComponent:
+      return ContainerSafetyAttrs::kComponentValues;
+    case kDictStatesComponent:
+      return ContainerSafetyAttrs::kComponentStates;
+    default:
+      break;
+    }
+  }
+  return {};
+}
+
+static void markObjectHeader(mlir::func::FuncOp func, mlir::Type logicalType,
+                             llvm::ArrayRef<mlir::Type> converted,
+                             unsigned flattenedIndex) {
+  if (!hasObjectHeaderPart(logicalType) || converted.empty() ||
+      !object_abi::Header::isOwned(converted.front()))
+    return;
+  setUnitAttr(func, flattenedIndex, OwnershipContractAttrs::kObjectHeader);
+}
+
+static void markContainerDescriptor(mlir::func::FuncOp func,
+                                    mlir::Type logicalType,
+                                    unsigned logicalIndex,
+                                    unsigned flattenedIndex,
+                                    unsigned convertedWidth) {
+  auto kind = containerKind(logicalType);
+  if (!kind)
+    return;
+  std::string group =
+      (llvm::Twine(*kind) + ".arg" + llvm::Twine(logicalIndex)).str();
+  for (unsigned slot = 0; slot < convertedWidth; ++slot) {
+    llvm::StringRef component = containerComponent(logicalType, slot);
+    if (component.empty())
+      continue;
+    unsigned argIndex = flattenedIndex + slot;
+    setStringAttr(func, argIndex, ContainerSafetyAttrs::kDescriptorGroup,
+                  group);
+    setStringAttr(func, argIndex, ContainerSafetyAttrs::kDescriptorKind, *kind);
+    setStringAttr(func, argIndex, ContainerSafetyAttrs::kDescriptorComponent,
+                  component);
+  }
+}
 
 void mark(mlir::func::FuncOp func, llvm::ArrayRef<mlir::Type> pyInputs,
           const PyLLVMTypeConverter &typeConverter) {
@@ -119,11 +219,16 @@ void mark(mlir::func::FuncOp func, llvm::ArrayRef<mlir::Type> pyInputs,
     return;
 
   unsigned flattenedIndex = 0;
+  unsigned logicalIndex = 0;
   for (mlir::Type inputType : pyInputs) {
     llvm::SmallVector<mlir::Type, 4> converted;
     if (mlir::failed(typeConverter.convertType(inputType, converted)) ||
         converted.empty())
       return;
+
+    markObjectHeader(func, inputType, converted, flattenedIndex);
+    markContainerDescriptor(func, inputType, logicalIndex, flattenedIndex,
+                            static_cast<unsigned>(converted.size()));
 
     if (mlir::isa<CoroutineType, FutureType, TaskType>(inputType) &&
         converted.size() >= 2) {
@@ -140,18 +245,30 @@ void mark(mlir::func::FuncOp func, llvm::ArrayRef<mlir::Type> pyInputs,
       for (auto [offset, convertedType] : llvm::enumerate(converted)) {
         if (!mlir::isa<mlir::LLVM::LLVMPointerType>(convertedType))
           continue;
+        if (flattenedIndex + static_cast<unsigned>(offset) >=
+            func.getNumArguments())
+          continue;
         func.setArgAttr(flattenedIndex + static_cast<unsigned>(offset),
                         OwnershipContractAttrs::kNonObjectPointer,
                         builder.getUnitAttr());
       }
     }
     flattenedIndex += static_cast<unsigned>(converted.size());
+    ++logicalIndex;
   }
 }
 
-} // namespace lowering::func::args::AsyncDescriptor
+} // namespace lowering::func::args::ABI
 
 namespace lowering::func::result::Ownership {
+
+static bool ownsMemRefResultSlot(mlir::Type logicalType, unsigned slot) {
+  if (mlir::isa<IntType, StrType>(logicalType))
+    return slot == 0;
+  if (mlir::isa<ClassType>(logicalType))
+    return slot == 0;
+  return slot == 0 && isCompilerOwnedMemRefContainerType(logicalType);
+}
 
 void mark(mlir::func::FuncOp func, llvm::ArrayRef<mlir::Type> logicalResults,
           const PyLLVMTypeConverter &typeConverter) {
@@ -167,12 +284,13 @@ void mark(mlir::func::FuncOp func, llvm::ArrayRef<mlir::Type> logicalResults,
       return;
 
     bool immortalNone = mlir::isa<NoneType>(logicalType);
-    for (mlir::Type loweredType : converted) {
-      if (mlir::isa<mlir::LLVM::LLVMPointerType>(loweredType)) {
-        if (immortalNone)
-          borrowedResults.push_back(static_cast<int64_t>(flattenedIndex));
-        else
-          ownedResults.push_back(static_cast<int64_t>(flattenedIndex));
+    for (auto [slot, loweredType] : llvm::enumerate(converted)) {
+      // Raw LLVM pointer results are backend handles or host-boundary carriers,
+      // not LyObject ownership. Object-family values expose ownership through
+      // their header memref slot and payload descriptors.
+      if (!immortalNone && mlir::isa<mlir::MemRefType>(loweredType) &&
+          ownsMemRefResultSlot(logicalType, static_cast<unsigned>(slot))) {
+        ownedResults.push_back(static_cast<int64_t>(flattenedIndex));
       }
       ++flattenedIndex;
     }
@@ -252,7 +370,6 @@ void copySpecialized(mlir::func::FuncOp from, mlir::func::FuncOp to) {
                                                    "ly.mutable_args",
                                                    "ly.local_self_arg0",
                                                    "ly.zero_initialized_self",
-                                                   "ly.class_return_outarg",
                                                    "kwonly_names",
                                                    "closure_types"};
   copyAll(from.getOperation(), to.getOperation(), kAttrs);
@@ -348,23 +465,6 @@ struct FuncOpLowering : public mlir::OpConversionPattern<FuncOp> {
       return mlir::failure();
 
     bool useVoidHelper = lowering::func::void_helper::shouldUse(op, sig);
-    bool createClassReturnHelper = false;
-    ClassType classReturnType;
-    mlir::Type classReturnStorageType;
-    mlir::LLVM::LLVMStructType classReturnObjectType;
-    if (!useVoidHelper) {
-      auto results = sig.getResultTypes();
-      if (results.size() == 1)
-        if (auto classType = mlir::dyn_cast<ClassType>(results.front())) {
-          createClassReturnHelper = true;
-          classReturnType = classType;
-          classReturnStorageType = llvmResultTypes.front();
-          auto objectTypeOr = getStaticClassObjectType(op, classType, *tc);
-          if (mlir::failed(objectTypeOr))
-            return mlir::failure();
-          classReturnObjectType = *objectTypeOr;
-        }
-    }
     bool createFreshInitHelper =
         useVoidHelper && static_cast<bool>(op->getAttr("init_method"));
     bool hasSelfReceiver = false;
@@ -390,16 +490,11 @@ struct FuncOpLowering : public mlir::OpConversionPattern<FuncOp> {
       publishedClassArgIndices.clear();
     std::string freshHelperName;
     std::string localSelfHelperName;
-    std::string classReturnHelperName;
     if (createFreshInitHelper)
       freshHelperName = (nameAttr.getValue() + "$fresh").str();
-    if (createLocalSelfHelper && !createClassReturnHelper)
+    if (createLocalSelfHelper)
       localSelfHelperName = (nameAttr.getValue() + "$local").str();
-    if (createClassReturnHelper) {
-      classReturnHelperName = (nameAttr.getValue() + "$sret").str();
-      if (createLocalSelfHelper)
-        localSelfHelperName = classReturnHelperName + "$local";
-    }
+    bool needsCInterface = nameAttr.getValue() == "main";
 
     auto createLoweredFuncWithInputs =
         [&](llvm::StringRef name, llvm::ArrayRef<mlir::Type> inputs,
@@ -407,7 +502,7 @@ struct FuncOpLowering : public mlir::OpConversionPattern<FuncOp> {
       auto loweredType = mlir::FunctionType::get(getContext(), inputs, results);
       auto func =
           rewriter.create<mlir::func::FuncOp>(op.getLoc(), name, loweredType);
-      lowering::func::args::AsyncDescriptor::mark(func, pyInputTypes, *tc);
+      lowering::func::args::ABI::mark(func, pyInputTypes, *tc);
       if (!results.empty())
         lowering::func::result::Ownership::mark(func, pyResultTypes, *tc);
       return func;
@@ -417,16 +512,10 @@ struct FuncOpLowering : public mlir::OpConversionPattern<FuncOp> {
             llvm::ArrayRef<mlir::Type> results) -> mlir::func::FuncOp {
       return createLoweredFuncWithInputs(name, llvmInputTypes, results);
     };
-    llvm::SmallVector<mlir::Type, 8> classReturnHelperInputs(
-        llvmInputTypes.begin(), llvmInputTypes.end());
-    if (createClassReturnHelper)
-      classReturnHelperInputs.push_back(classReturnStorageType);
-
     mlir::func::FuncOp loweredFunc;
     mlir::func::FuncOp helperFunc;
     mlir::func::FuncOp freshHelperFunc;
     mlir::func::FuncOp localSelfHelperFunc;
-    mlir::func::FuncOp classReturnHelperFunc;
     llvm::SmallVector<std::pair<unsigned, mlir::func::FuncOp>, 2>
         publishedBorrowHelpers;
     llvm::SmallVector<std::pair<unsigned, mlir::func::FuncOp>, 2>
@@ -440,7 +529,8 @@ struct FuncOpLowering : public mlir::OpConversionPattern<FuncOp> {
       lowering::func::attrs::copyPy(op, helperFunc);
 
       loweredFunc = createLoweredFunc(nameAttr.getValue(), llvmResultTypes);
-      loweredFunc->setAttr("llvm.emit_c_interface", rewriter.getUnitAttr());
+      if (needsCInterface)
+        loweredFunc->setAttr("llvm.emit_c_interface", rewriter.getUnitAttr());
       loweredFunc->setAttr("ly.void_helper",
                            mlir::SymbolRefAttr::get(rewriter.getContext(),
                                                     helperFunc.getName()));
@@ -504,68 +594,10 @@ struct FuncOpLowering : public mlir::OpConversionPattern<FuncOp> {
                                      freshHelperFunc.getName()));
       }
       lowering::func::attrs::copyPy(op, loweredFunc);
-    } else if (createClassReturnHelper) {
-      classReturnHelperFunc = createLoweredFuncWithInputs(
-          classReturnHelperName, classReturnHelperInputs, {});
-      classReturnHelperFunc.setVisibility(
-          mlir::SymbolTable::Visibility::Private);
-      lowering::func::attrs::copyPy(op, classReturnHelperFunc);
-      classReturnHelperFunc->setAttr("ly.class_return_outarg",
-                                     rewriter.getUnitAttr());
-
-      loweredFunc = createLoweredFunc(nameAttr.getValue(), llvmResultTypes);
-      loweredFunc->setAttr("llvm.emit_c_interface", rewriter.getUnitAttr());
-      loweredFunc->setAttr(
-          "ly.class_return_helper",
-          mlir::SymbolRefAttr::get(rewriter.getContext(),
-                                   classReturnHelperFunc.getName()));
-      lowering::func::attrs::copyPy(op, loweredFunc);
-
-      if (createLocalSelfHelper) {
-        localSelfHelperFunc = createLoweredFuncWithInputs(
-            localSelfHelperName, classReturnHelperInputs, {});
-        localSelfHelperFunc.setVisibility(
-            mlir::SymbolTable::Visibility::Private);
-        lowering::func::attrs::copyPy(op, localSelfHelperFunc);
-        localSelfHelperFunc->setAttr("ly.local_self_arg0",
-                                     rewriter.getUnitAttr());
-        localSelfHelperFunc->setAttr("ly.class_return_outarg",
-                                     rewriter.getUnitAttr());
-        classReturnHelperFunc->setAttr(
-            "ly.local_self_helper",
-            mlir::SymbolRefAttr::get(rewriter.getContext(),
-                                     localSelfHelperFunc.getName()));
-      }
-
-      for (unsigned idx : publishedClassArgIndices) {
-        std::string sharedHelperName = classReturnHelperName + "$published_arg";
-        sharedHelperName += std::to_string(idx);
-        auto publishedHelper = createLoweredFuncWithInputs(
-            sharedHelperName, classReturnHelperInputs, {});
-        publishedHelper.setVisibility(mlir::SymbolTable::Visibility::Private);
-        lowering::func::attrs::copyPy(op, publishedHelper);
-        publishedHelper->setAttr("ly.class_return_outarg",
-                                 rewriter.getUnitAttr());
-        publishedBorrowHelpers.emplace_back(idx, publishedHelper);
-
-        if (createLocalSelfHelper) {
-          std::string localHelperName = localSelfHelperName + "_published_arg";
-          localHelperName += std::to_string(idx);
-          auto localPublishedHelper = createLoweredFuncWithInputs(
-              localHelperName, classReturnHelperInputs, {});
-          localPublishedHelper.setVisibility(
-              mlir::SymbolTable::Visibility::Private);
-          lowering::func::attrs::copyPy(op, localPublishedHelper);
-          localPublishedHelper->setAttr("ly.local_self_arg0",
-                                        rewriter.getUnitAttr());
-          localPublishedHelper->setAttr("ly.class_return_outarg",
-                                        rewriter.getUnitAttr());
-          localPublishedBorrowHelpers.emplace_back(idx, localPublishedHelper);
-        }
-      }
     } else {
       loweredFunc = createLoweredFunc(nameAttr.getValue(), llvmResultTypes);
-      loweredFunc->setAttr("llvm.emit_c_interface", rewriter.getUnitAttr());
+      if (needsCInterface)
+        loweredFunc->setAttr("llvm.emit_c_interface", rewriter.getUnitAttr());
       lowering::func::attrs::copyPy(op, loweredFunc);
       if (createLocalSelfHelper) {
         localSelfHelperFunc =
@@ -615,25 +647,12 @@ struct FuncOpLowering : public mlir::OpConversionPattern<FuncOp> {
         helperFunc->setAttr("ly.self_receiver_arg0", selfAttr);
       if (freshHelperFunc)
         freshHelperFunc->setAttr("ly.self_receiver_arg0", selfAttr);
-      if (classReturnHelperFunc)
-        classReturnHelperFunc->setAttr("ly.self_receiver_arg0", selfAttr);
     }
 
     if (op.getBody().empty())
       op.getBody().emplaceBlock();
 
-    mlir::func::FuncOp bodyTarget =
-        useVoidHelper
-            ? helperFunc
-            : (createClassReturnHelper ? classReturnHelperFunc : loweredFunc);
-    auto appendClassReturnOutArg = [&](mlir::func::FuncOp func) {
-      if (!createClassReturnHelper || !func || func.getBody().empty())
-        return;
-      mlir::Block &entry = func.getBody().front();
-      if (entry.getNumArguments() == func.getFunctionType().getNumInputs())
-        return;
-      entry.addArgument(classReturnStorageType, op.getLoc());
-    };
+    mlir::func::FuncOp bodyTarget = useVoidHelper ? helperFunc : loweredFunc;
     if (freshHelperFunc) {
       mlir::IRMapping mapping;
       op.getBody().cloneInto(&freshHelperFunc.getBody(), mapping);
@@ -666,11 +685,7 @@ struct FuncOpLowering : public mlir::OpConversionPattern<FuncOp> {
       std::string attrName = publication::borrow::Attr::name(idx);
       auto helperRef =
           mlir::SymbolRefAttr::get(rewriter.getContext(), helper.getName());
-      if (createClassReturnHelper) {
-        classReturnHelperFunc->setAttr(attrName, helperRef);
-      } else {
-        loweredFunc->setAttr(attrName, helperRef);
-      }
+      loweredFunc->setAttr(attrName, helperRef);
       if (helperFunc)
         helperFunc->setAttr(attrName, helperRef);
       activePublishedBorrowHelpers.emplace_back(idx, helper);
@@ -758,56 +773,37 @@ struct FuncOpLowering : public mlir::OpConversionPattern<FuncOp> {
 
     rewriter.inlineRegionBefore(op.getBody(), bodyTarget.getBody(),
                                 bodyTarget.getBody().end());
-    appendClassReturnOutArg(bodyTarget);
-    appendClassReturnOutArg(localSelfHelperFunc);
-    for (auto &[idx, helper] : publishedBorrowHelpers)
-      appendClassReturnOutArg(helper);
-    for (auto &[idx, helper] : localPublishedBorrowHelpers)
-      appendClassReturnOutArg(helper);
-    for (mlir::func::FuncOp helper : nestedPublishedBorrowHelpers)
-      appendClassReturnOutArg(helper);
     auto convertEntryBlock =
-        [&](mlir::func::FuncOp func,
-            bool preserveClassReturnOutArg) -> mlir::LogicalResult {
+        [&](mlir::func::FuncOp func) -> mlir::LogicalResult {
       auto &entry = func.getBody().front();
       mlir::TypeConverter::SignatureConversion conversion(
           entry.getNumArguments());
       if (mlir::failed(tc->convertSignatureArgs(mlir::TypeRange(pyInputTypes),
                                                 conversion)))
         return mlir::failure();
-      if (preserveClassReturnOutArg) {
-        unsigned outArgIndex = static_cast<unsigned>(pyInputTypes.size());
-        if (entry.getNumArguments() <= outArgIndex)
-          return mlir::failure();
-        llvm::SmallVector<mlir::Type, 1> packed{
-            entry.getArgument(outArgIndex).getType()};
-        conversion.addInputs(outArgIndex, packed);
-      }
       return rewriter.applySignatureConversion(&entry, conversion,
                                                getTypeConverter())
                  ? mlir::success()
                  : mlir::failure();
     };
-    if (mlir::failed(convertEntryBlock(bodyTarget, createClassReturnHelper)))
+    if (mlir::failed(convertEntryBlock(bodyTarget)))
       return mlir::failure();
-    if (freshHelperFunc &&
-        mlir::failed(convertEntryBlock(freshHelperFunc, false)))
+    if (freshHelperFunc && mlir::failed(convertEntryBlock(freshHelperFunc)))
       return mlir::failure();
     if (localSelfHelperFunc &&
-        mlir::failed(
-            convertEntryBlock(localSelfHelperFunc, createClassReturnHelper)))
+        mlir::failed(convertEntryBlock(localSelfHelperFunc)))
       return mlir::failure();
     for (auto &[idx, helper] : publishedBorrowHelpers)
-      if (mlir::failed(convertEntryBlock(helper, createClassReturnHelper)))
+      if (mlir::failed(convertEntryBlock(helper)))
         return mlir::failure();
     for (auto &[idx, helper] : freshPublishedBorrowHelpers)
-      if (mlir::failed(convertEntryBlock(helper, false)))
+      if (mlir::failed(convertEntryBlock(helper)))
         return mlir::failure();
     for (auto &[idx, helper] : localPublishedBorrowHelpers)
-      if (mlir::failed(convertEntryBlock(helper, createClassReturnHelper)))
+      if (mlir::failed(convertEntryBlock(helper)))
         return mlir::failure();
     for (mlir::func::FuncOp helper : nestedPublishedBorrowHelpers)
-      if (mlir::failed(convertEntryBlock(helper, createClassReturnHelper)))
+      if (mlir::failed(convertEntryBlock(helper)))
         return mlir::failure();
 
     if (useVoidHelper) {
@@ -816,51 +812,24 @@ struct FuncOpLowering : public mlir::OpConversionPattern<FuncOp> {
       rewriter.setInsertionPointToStart(wrapperEntry);
       rewriter.create<mlir::func::CallOp>(op.getLoc(), helperFunc,
                                           wrapperEntry->getArguments());
+      if (llvmResultTypes.empty()) {
+        rewriter.create<mlir::func::ReturnOp>(op.getLoc());
+        rewriter.eraseOp(op);
+        return mlir::success();
+      }
       mlir::ModuleOp module = loweredFunc->getParentOfType<mlir::ModuleOp>();
       if (!module)
         return mlir::failure();
-      auto noneFn = getOrInsertLLVMFunc(op.getLoc(), module, rewriter,
-                                        RuntimeSymbols::kGetNone,
-                                        llvmResultTypes.front(), {});
-      auto noneRef =
-          mlir::SymbolRefAttr::get(rewriter.getContext(), noneFn.getName());
-      auto noneValue = rewriter.create<mlir::LLVM::CallOp>(
-          op.getLoc(), mlir::TypeRange{llvmResultTypes.front()}, noneRef,
-          mlir::ValueRange{});
-      rewriter.create<mlir::func::ReturnOp>(op.getLoc(), noneValue.getResult());
-    } else if (createClassReturnHelper) {
-      mlir::Block *wrapperEntry = loweredFunc.addEntryBlock();
-      mlir::OpBuilder::InsertionGuard guard(rewriter);
-      rewriter.setInsertionPointToStart(wrapperEntry);
-      mlir::Value one = rewriter.create<mlir::LLVM::ConstantOp>(
-          op.getLoc(), rewriter.getI64Type(), rewriter.getI64IntegerAttr(1));
-      auto ptrType = mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
-      mlir::Value resultSlot = rewriter.create<mlir::LLVM::AllocaOp>(
-          op.getLoc(), ptrType, classReturnObjectType, one, /*alignment=*/0);
-      ownership::Pointer::markNonObject(resultSlot);
-      mlir::Value zero = rewriter.create<mlir::LLVM::ZeroOp>(
-          op.getLoc(), classReturnObjectType);
-      rewriter.create<mlir::LLVM::StoreOp>(op.getLoc(), zero, resultSlot);
-
-      llvm::SmallVector<mlir::Value> helperOperands(
-          wrapperEntry->getArguments().begin(),
-          wrapperEntry->getArguments().end());
-      helperOperands.push_back(resultSlot);
-      rewriter.create<mlir::func::CallOp>(op.getLoc(), classReturnHelperFunc,
-                                          helperOperands);
-
-      auto module = loweredFunc->getParentOfType<mlir::ModuleOp>();
-      if (!module)
-        return mlir::failure();
-      auto promoteHelper = getOrInsertLLVMFunc(
-          op.getLoc(), module, rewriter,
-          getClassHelperName(classReturnType, "promote"), ptrType, {ptrType});
-      auto promoteRef = mlir::SymbolRefAttr::get(rewriter.getContext(),
-                                                 promoteHelper.getName());
-      auto promoted = rewriter.create<mlir::LLVM::CallOp>(
-          op.getLoc(), mlir::TypeRange{ptrType}, promoteRef,
-          mlir::ValueRange{resultSlot});
-      rewriter.create<mlir::func::ReturnOp>(op.getLoc(), promoted.getResult());
+      RuntimeAPI runtime(module, rewriter, *tc);
+      mlir::Value noneValue = runtime.getNoneValue(op.getLoc());
+      if (noneValue.getType() != llvmResultTypes.front())
+        noneValue =
+            rewriter
+                .create<mlir::UnrealizedConversionCastOp>(
+                    op.getLoc(), mlir::TypeRange{llvmResultTypes.front()},
+                    mlir::ValueRange{noneValue})
+                .getResult(0);
+      rewriter.create<mlir::func::ReturnOp>(op.getLoc(), noneValue);
     }
 
     rewriter.eraseOp(op);
@@ -884,44 +853,6 @@ struct ReturnLowering : public mlir::OpConversionPattern<ReturnOp> {
         flattened.append(group.begin(), group.end());
       return flattened;
     };
-    if (parentFunc && parentFunc->getAttr("ly.class_return_outarg")) {
-      llvm::SmallVector<mlir::Value> operands = flattenOperands();
-      if (operands.size() != 1)
-        return rewriter.notifyMatchFailure(
-            op, "class return helper expects exactly one return operand");
-      auto classType =
-          mlir::dyn_cast<ClassType>(op.getOperands().front().getType());
-      if (!classType)
-        return rewriter.notifyMatchFailure(
-            op, "class return helper expects a static class return operand");
-
-      auto *converter =
-          static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
-      auto objectTypeOr = getStaticClassObjectType(op, classType, *converter);
-      if (mlir::failed(objectTypeOr))
-        return mlir::failure();
-
-      mlir::ModuleOp module = op->getParentOfType<mlir::ModuleOp>();
-      if (!module)
-        return mlir::failure();
-
-      mlir::Block &entry = parentFunc.getBody().front();
-      mlir::Value outArg = entry.getArgument(entry.getNumArguments() - 1);
-      auto ptrType = mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
-      auto copyHelper = getOrInsertLLVMFunc(
-          op.getLoc(), module, rewriter, getClassHelperName(classType, "copy"),
-          mlir::LLVM::LLVMVoidType::get(rewriter.getContext()),
-          {ptrType, ptrType});
-      auto copyRef =
-          mlir::SymbolRefAttr::get(rewriter.getContext(), copyHelper.getName());
-      llvm::SmallVector<mlir::Value> copyOperands;
-      copyOperands.push_back(outArg);
-      copyOperands.append(operands.begin(), operands.end());
-      rewriter.create<mlir::LLVM::CallOp>(op.getLoc(), mlir::TypeRange{},
-                                          copyRef, copyOperands);
-      rewriter.replaceOpWithNewOp<mlir::func::ReturnOp>(op);
-      return mlir::success();
-    }
     if (parentFunc && parentFunc.getFunctionType().getNumResults() == 0) {
       NoneOp noneOp = nullptr;
       llvm::SmallVector<mlir::Value> operands = flattenOperands();
@@ -947,26 +878,31 @@ struct FuncObjectLowering : public mlir::OpConversionPattern<FuncObjectOp> {
   mlir::LogicalResult
   matchAndRewrite(FuncObjectOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
-    static llvm::StringMap<llvm::StringLiteral> builtinTable = {
-        {"__builtin_print", RuntimeSymbols::kGetBuiltinPrint},
-        {"print", RuntimeSymbols::kGetBuiltinPrint},
-    };
-
     mlir::ModuleOp module = op->getParentOfType<mlir::ModuleOp>();
     if (!module)
       return mlir::failure();
 
     llvm::StringRef symbol = op.getTargetAttr().getValue();
 
-    // Check if this is a builtin function
-    if (auto it = builtinTable.find(symbol); it != builtinTable.end()) {
-      auto *converter =
-          static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
-      RuntimeAPI runtime(module, rewriter, *converter);
-      mlir::Type resultType = converter->convertType(op.getResult().getType());
-      auto call =
-          runtime.call(op.getLoc(), it->second, resultType, mlir::ValueRange{});
-      rewriter.replaceOp(op, call.getResults());
+    if (symbol == "__builtin_print" || symbol == "print") {
+      llvm::StringRef builtinSymbol = "__builtin_print";
+      auto func = module.lookupSymbol<mlir::func::FuncOp>(builtinSymbol);
+      if (!func) {
+        mlir::OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(module.getBody());
+        auto markerType =
+            mlir::FunctionType::get(rewriter.getContext(), {}, {});
+        func = rewriter.create<mlir::func::FuncOp>(op.getLoc(), builtinSymbol,
+                                                   markerType);
+        func.setPrivate();
+      }
+      auto constOp = rewriter.create<mlir::func::ConstantOp>(
+          op.getLoc(), func.getFunctionType(),
+          mlir::SymbolRefAttr::get(rewriter.getContext(), builtinSymbol));
+      auto bridge = rewriter.create<mlir::UnrealizedConversionCastOp>(
+          op.getLoc(), mlir::TypeRange{op.getResult().getType()},
+          mlir::ValueRange{constOp.getResult()});
+      rewriter.replaceOp(op, bridge.getResult(0));
       return mlir::success();
     }
 
@@ -1033,5 +969,27 @@ void populate(PyLLVMTypeConverter &typeConverter,
                MakeFunctionLowering>(typeConverter, ctx);
 }
 } // namespace lowering::func::Patterns
+
+namespace lowering::func::definition::Patterns {
+void populate(PyLLVMTypeConverter &typeConverter,
+              mlir::RewritePatternSet &patterns) {
+  patterns.add<FuncOpLowering>(typeConverter, patterns.getContext());
+}
+} // namespace lowering::func::definition::Patterns
+
+namespace lowering::func::returns::Patterns {
+void populate(PyLLVMTypeConverter &typeConverter,
+              mlir::RewritePatternSet &patterns) {
+  patterns.add<ReturnLowering>(typeConverter, patterns.getContext());
+}
+} // namespace lowering::func::returns::Patterns
+
+namespace lowering::func::objects::Patterns {
+void populate(PyLLVMTypeConverter &typeConverter,
+              mlir::RewritePatternSet &patterns) {
+  auto *ctx = patterns.getContext();
+  patterns.add<FuncObjectLowering, MakeFunctionLowering>(typeConverter, ctx);
+}
+} // namespace lowering::func::objects::Patterns
 
 } // namespace py

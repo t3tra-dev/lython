@@ -22,25 +22,20 @@ void ensureLandingpad(mlir::Block *unwind, mlir::Location loc,
 bool canUseVoidHelper(CallVectorOp op, mlir::func::FuncOp callee);
 mlir::Value stripBridgeCasts(mlir::Value value);
 
-mlir::FailureOr<mlir::LLVM::LLVMStructType>
-getStaticClassObjectType(mlir::Operation *from, ClassType classType,
-                         const PyLLVMTypeConverter &typeConverter);
-mlir::Value createStaticClassSlot(mlir::Location loc,
-                                  mlir::LLVM::LLVMStructType objectType,
-                                  mlir::ConversionPatternRewriter &rewriter,
-                                  mlir::Operation *anchor);
-
 mlir::func::FuncOp resolvePreferredDirectHelper(mlir::func::FuncOp callee,
                                                 mlir::ValueRange operands,
                                                 mlir::ModuleOp module,
                                                 bool allowVoidHelper);
-void eraseNoneResultUsers(CallVectorOp op,
-                          mlir::ConversionPatternRewriter &rewriter);
+mlir::LogicalResult appendFlattenedCallOperands(
+    mlir::Location loc, mlir::ValueRange elements, mlir::FunctionType funcType,
+    unsigned directInputCount, llvm::SmallVectorImpl<mlir::Value> &operands,
+    mlir::RewriterBase &rewriter, const PyLLVMTypeConverter &typeConverter);
+void eraseNoneResultUsers(CallVectorOp op, mlir::RewriterBase &rewriter);
 void materializeLogicalResults(mlir::Location loc, mlir::TypeRange logicalTypes,
                                mlir::ValueRange loweredResults,
                                llvm::SmallVectorImpl<mlir::Value> &results,
                                const PyLLVMTypeConverter &typeConverter,
-                               mlir::ConversionPatternRewriter &rewriter);
+                               mlir::RewriterBase &rewriter);
 
 void materializeInvokeNormalResult(InvokeOp op, mlir::Value loweredResult,
                                    mlir::ConversionPatternRewriter &rewriter);

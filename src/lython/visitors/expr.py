@@ -48,12 +48,9 @@ class ExprVisitor(
 ):
     """
     式(expr)ノードの訪問を担当するクラス
-    以下のようなオブジェクト型に対応する
-    - int => PyInt (PyObject派生)
-    - bool => PyBool (PyObject派生)
-    - str => PyUnicodeObject (PyObject派生)
-    - list => PyListObject (PyObject派生)
-    - dict => PyDictObject (PyObject派生)
+    Python ソースの式を一対一で py dialect へ写像する。
+    型解決済みの値は Lython の静的型に対応し、generic object 経路へ
+    暗黙 materialize しない。
 
     ```asdl
           -- BoolOp() can use left & right?

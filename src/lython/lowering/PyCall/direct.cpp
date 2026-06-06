@@ -1,29 +1,448 @@
 #include "PyCall/Utils.h"
 
+#include "Common/Object.h"
 #include "Common/SlotUtils.h"
+#include "Passes/OwnershipAnalysis.h"
+
+#include "mlir/Dialect/SCF/IR/SCF.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
 
 #include <algorithm>
+
+namespace py::optimizer::class_state {
+bool local(mlir::Value value);
+} // namespace py::optimizer::class_state
 
 namespace py {
 namespace {
 
+static bool canDropNoneResult(CallVectorOp op) {
+  if (op.getNumResults() == 0)
+    return true;
+  if (op.getNumResults() != 1 ||
+      !mlir::isa<NoneType>(op.getResult(0).getType()))
+    return false;
+  return llvm::all_of(op.getResult(0).getUsers(), [](mlir::Operation *user) {
+    return mlir::isa<DecRefOp>(user);
+  });
+}
+
+static TupleCreateOp
+collectDeadStaticPosargs(CallVectorOp op,
+                         llvm::SmallVectorImpl<DecRefOp> &drops) {
+  auto tupleCreate =
+      stripBridgeCasts(op.getPosargs()).getDefiningOp<TupleCreateOp>();
+  if (!tupleCreate)
+    return {};
+
+  llvm::SmallPtrSet<mlir::Operation *, 8> seenDrops;
+  auto collectDrop = [&](mlir::Operation *user) -> bool {
+    if (user == op.getOperation())
+      return true;
+    if (auto drop = mlir::dyn_cast<DecRefOp>(user)) {
+      if (seenDrops.insert(drop.getOperation()).second)
+        drops.push_back(drop);
+      return true;
+    }
+    return false;
+  };
+
+  for (mlir::Operation *user : tupleCreate.getResult().getUsers()) {
+    if (collectDrop(user))
+      continue;
+    if (auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(user)) {
+      bool onlyCallOrDrop = true;
+      for (mlir::Value result : cast->getResults()) {
+        for (mlir::Operation *castUser : result.getUsers()) {
+          if (collectDrop(castUser))
+            continue;
+          onlyCallOrDrop = false;
+          break;
+        }
+        if (!onlyCallOrDrop)
+          break;
+      }
+      if (onlyCallOrDrop)
+        continue;
+    }
+    drops.clear();
+    return {};
+  }
+  return tupleCreate;
+}
+
+static void eraseDeadBridgeUsers(mlir::Value value,
+                                 mlir::RewriterBase &rewriter) {
+  for (mlir::Operation *user : llvm::make_early_inc_range(value.getUsers())) {
+    auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(user);
+    if (!cast || !cast->use_empty())
+      continue;
+    rewriter.eraseOp(cast);
+  }
+}
+
+static void cleanupDeadCallPack(TupleCreateOp tuple,
+                                llvm::ArrayRef<DecRefOp> drops,
+                                mlir::RewriterBase &rewriter) {
+  for (DecRefOp drop : drops)
+    if (drop)
+      rewriter.eraseOp(drop);
+  if (!tuple)
+    return;
+  eraseDeadBridgeUsers(tuple.getResult(), rewriter);
+  if (tuple->use_empty()) {
+    rewriter.eraseOp(tuple);
+  } else {
+    tuple->setAttr("ly.dead_call_pack",
+                   mlir::UnitAttr::get(tuple->getContext()));
+  }
+}
+
+static void collectArgTransferDrops(TupleCreateOp tupleCreate,
+                                    mlir::Operation *callOp,
+                                    llvm::SmallVectorImpl<DecRefOp> &drops) {
+  if (!tupleCreate || !callOp || tupleCreate->getBlock() != callOp->getBlock())
+    return;
+  llvm::SmallPtrSet<mlir::Operation *, 8> seen;
+  for (mlir::Value element : tupleCreate.getElements()) {
+    for (mlir::Operation *user : element.getUsers()) {
+      auto drop = mlir::dyn_cast<DecRefOp>(user);
+      if (!drop || drop->getBlock() != callOp->getBlock())
+        continue;
+      if (!tupleCreate->isBeforeInBlock(drop) || !drop->isBeforeInBlock(callOp))
+        continue;
+      if (seen.insert(drop.getOperation()).second)
+        drops.push_back(drop);
+    }
+  }
+}
+
+static bool hasDecRefUser(mlir::Value value) {
+  value = stripBridgeCasts(value);
+  for (mlir::Operation *user : value.getUsers())
+    if (mlir::isa<DecRefOp>(user))
+      return true;
+  return false;
+}
+
+static void releaseOwnedStringCallArgs(TupleCreateOp tupleCreate,
+                                       mlir::Operation *anchor,
+                                       mlir::RewriterBase &rewriter) {
+  if (!tupleCreate || !anchor)
+    return;
+  mlir::Operation *cursor = anchor;
+  for (mlir::Value element : tupleCreate.getElements()) {
+    if (!mlir::isa<StrType>(element.getType()))
+      continue;
+    if (hasDecRefUser(element))
+      continue;
+    rewriter.setInsertionPointAfter(cursor);
+    auto drop = rewriter.create<DecRefOp>(element.getLoc(), element);
+    cursor = drop.getOperation();
+  }
+}
+
+static void moveAfter(mlir::Operation *anchor, llvm::ArrayRef<DecRefOp> drops) {
+  mlir::Operation *cursor = anchor;
+  for (DecRefOp drop : drops) {
+    if (!drop || !cursor || drop->getBlock() != cursor->getBlock())
+      continue;
+    drop->moveAfter(cursor);
+    cursor = drop.getOperation();
+  }
+}
+
+static mlir::Value tupleDropValue(mlir::Value element) { return element; }
+
+static mlir::Value stripLocalClassForwarding(mlir::Value value) {
+  while (value) {
+    if (auto cast = value.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+      if (cast->getNumOperands() != 1)
+        return value;
+      value = cast.getOperand(0);
+      continue;
+    }
+    return value;
+  }
+  return value;
+}
+
+static bool isAlreadyDroppedByArgTransfer(mlir::Value element,
+                                          llvm::ArrayRef<DecRefOp> drops) {
+  mlir::Value payload = stripLocalClassForwarding(tupleDropValue(element));
+  mlir::Value root = stripLocalClassForwarding(element);
+  for (DecRefOp drop : drops) {
+    if (!drop)
+      continue;
+    mlir::Value dropped = stripLocalClassForwarding(drop.getObject());
+    if (dropped == root || dropped == payload)
+      return true;
+  }
+  return false;
+}
+
+static bool hasExistingElementDrop(mlir::Value element) {
+  mlir::Value payload = stripLocalClassForwarding(tupleDropValue(element));
+  mlir::Value root = stripLocalClassForwarding(element);
+  for (mlir::Value candidate : {element, payload, root}) {
+    if (!candidate)
+      continue;
+    for (mlir::Operation *user : candidate.getUsers())
+      if (mlir::isa<DecRefOp>(user))
+        return true;
+  }
+  return false;
+}
+
+static bool hasElementDropAfter(mlir::Operation *anchor, mlir::Value element) {
+  if (!anchor)
+    return hasExistingElementDrop(element);
+
+  mlir::Value payload = stripLocalClassForwarding(tupleDropValue(element));
+  mlir::Value root = stripLocalClassForwarding(element);
+  for (mlir::Value candidate : {element, payload, root}) {
+    if (!candidate)
+      continue;
+    for (mlir::Operation *user : candidate.getUsers()) {
+      if (!mlir::isa<DecRefOp>(user))
+        continue;
+      if (user->getBlock() != anchor->getBlock())
+        return true;
+      if (anchor->isBeforeInBlock(user))
+        return true;
+    }
+  }
+  return false;
+}
+
+static bool classValueHasOwnedProducer(mlir::Value value) {
+  value = stripLocalClassForwarding(value);
+  mlir::Operation *def = value ? value.getDefiningOp() : nullptr;
+  if (!def)
+    return false;
+  return mlir::isa<ClassNewOp, AttrGetOp, AttrGetLocalOp, ClassPromoteOp,
+                   CallVectorOp, CallOp>(def);
+}
+
+static bool hasNonDropUseAfter(mlir::Operation *anchor, mlir::Value value) {
+  if (!anchor)
+    return true;
+
+  value = stripLocalClassForwarding(value);
+  for (mlir::Operation *user : value.getUsers()) {
+    if (user == anchor || mlir::isa<DecRefOp>(user))
+      continue;
+    if (user->getBlock() != anchor->getBlock())
+      return true;
+    if (anchor->isBeforeInBlock(user))
+      return true;
+  }
+  return false;
+}
+
+static bool tupleSlotCanOwnRef(TupleCreateOp tupleCreate, unsigned index) {
+  auto tupleType = mlir::dyn_cast<TupleType>(tupleCreate.getType());
+  if (!tupleType || index >= tupleType.getElementTypes().size())
+    return true;
+  switch (container::Slot::policy(tupleType.getElementTypes()[index])) {
+  case container::SlotPolicy::NativeInteger:
+  case container::SlotPolicy::NativeBool:
+  case container::SlotPolicy::NativeFloat:
+    return false;
+  case container::SlotPolicy::Unsupported:
+    return true;
+  }
+  return true;
+}
+
+static void
+closeDeadLocalClassArguments(TupleCreateOp tupleCreate, mlir::Operation *anchor,
+                             llvm::ArrayRef<DecRefOp> argTransferDrops,
+                             mlir::PatternRewriter &rewriter) {
+  if (!tupleCreate || !anchor)
+    return;
+
+  mlir::OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPointAfter(anchor);
+  for (auto [index, element] : llvm::enumerate(tupleCreate.getElements())) {
+    if (!tupleSlotCanOwnRef(tupleCreate, static_cast<unsigned>(index)))
+      continue;
+    if (isAlreadyDroppedByArgTransfer(element, argTransferDrops))
+      continue;
+    if (hasElementDropAfter(anchor, element))
+      continue;
+    if (!consumesPyOwnedOperand(tupleCreate.getOperation(), element))
+      continue;
+    mlir::Value value = tupleDropValue(element);
+    if (!mlir::isa<ClassType>(value.getType()))
+      continue;
+    if (!classValueHasOwnedProducer(value))
+      continue;
+    if (hasNonDropUseAfter(anchor, value))
+      continue;
+    auto drop = rewriter.create<DecRefOp>(value.getLoc(), value);
+    drop->setAttr("ly.dead_call_pack_decref", rewriter.getUnitAttr());
+  }
+}
+
+struct LoweredString {
+  llvm::SmallVector<mlir::Value, 3> values;
+  bool owned = false;
+
+  bool split() const {
+    if (values.size() != 2)
+      return false;
+    return object_abi::str_abi::Parts::isHeader(values[0].getType()) &&
+           object_abi::str_abi::Parts::isBytes(values[1].getType());
+  }
+
+  mlir::Value single() const {
+    return values.size() == 1 ? values.front() : mlir::Value();
+  }
+};
+
+static bool isLoweredStringStorage(mlir::Value value) {
+  return value && (object_abi::Type::isStorage(value.getType()) ||
+                   object_abi::Type::isLoweredStorage(value.getType()));
+}
+
+static RuntimeAPI::Call emitHostPrintLiteral(mlir::Location loc,
+                                             llvm::StringRef text,
+                                             RuntimeAPI &runtime) {
+  mlir::OpBuilder &builder = runtime.getBuilder();
+  mlir::StringAttr literal = builder.getStringAttr(text);
+  mlir::Value bytes = runtime.getByteLiteral(loc, literal);
+  mlir::Value start = builder.create<mlir::arith::ConstantIndexOp>(loc, 0);
+  mlir::Value length =
+      runtime.getI64Constant(loc, static_cast<int64_t>(text.size()));
+  llvm::SmallVector<mlir::Type, 3> resultTypes;
+  object_abi::str_abi::Parts::storageTypes(builder.getContext(), resultTypes);
+  RuntimeAPI::Call unicode = runtime.call(
+      loc, RuntimeSymbols::kUnicodeFromBytes, mlir::TypeRange(resultTypes),
+      mlir::ValueRange{bytes, start, length});
+  llvm::SmallVector<mlir::Value, 3> parts(unicode.getResults());
+  runtime.call(loc, RuntimeSymbols::kUnicodePrintLine, mlir::Type(),
+               mlir::ValueRange(parts));
+  RuntimeAPI::Call release =
+      runtime.call(loc, RuntimeSymbols::kUnicodeDecRef, mlir::Type(),
+                   mlir::ValueRange(parts));
+  release->setAttr(OwnershipContractAttrs::kAggregateRelease,
+                   builder.getUnitAttr());
+  return release;
+}
+
+static mlir::FailureOr<mlir::Operation *>
+emitHostPrintBool(mlir::Location loc, mlir::Value value,
+                  mlir::PatternRewriter &rewriter, RuntimeAPI &runtime) {
+  mlir::Value bit = value;
+  if (mlir::isa<BoolType>(value.getType())) {
+    bit = rewriter
+              .create<CastToPrimOp>(loc, rewriter.getI1Type(), value,
+                                    rewriter.getStringAttr("exact"))
+              .getResult();
+  }
+  if (bit.getType() != rewriter.getI1Type())
+    return mlir::failure();
+
+  auto branch =
+      rewriter.create<mlir::scf::IfOp>(loc, bit, /*withElseRegion=*/true);
+  {
+    mlir::OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(branch.thenBlock());
+    emitHostPrintLiteral(loc, "True", runtime);
+  }
+  {
+    mlir::OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(branch.elseBlock());
+    emitHostPrintLiteral(loc, "False", runtime);
+  }
+  return branch.getOperation();
+}
+
+static llvm::SmallVector<mlir::Value, 3>
+emitUnicodePartsLiteral(mlir::Location loc, mlir::StringAttr literal,
+                        mlir::PatternRewriter &rewriter, RuntimeAPI &runtime) {
+  mlir::Value bytes = runtime.getByteLiteral(loc, literal);
+  mlir::Value start = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 0);
+  mlir::Value length =
+      runtime.getI64Constant(loc, static_cast<int64_t>(literal.size()));
+  llvm::SmallVector<mlir::Type, 3> resultTypes;
+  object_abi::str_abi::Parts::storageTypes(rewriter.getContext(), resultTypes);
+  RuntimeAPI::Call call = runtime.call(loc, RuntimeSymbols::kUnicodeFromBytes,
+                                       mlir::TypeRange(resultTypes),
+                                       mlir::ValueRange{bytes, start, length});
+  return llvm::SmallVector<mlir::Value, 3>(call.getResults());
+}
+
+static mlir::FailureOr<LoweredString> lowerStringForImmediatePrint(
+    mlir::Location loc, mlir::Value value, mlir::ModuleOp module,
+    mlir::PatternRewriter &rewriter, RuntimeAPI &runtime) {
+  if (isLoweredStringStorage(value))
+    return LoweredString{{value}, /*owned=*/false};
+
+  if (auto literal = value.getDefiningOp<StrConstantOp>()) {
+    return LoweredString{
+        emitUnicodePartsLiteral(loc, literal.getValueAttr(), rewriter, runtime),
+        /*owned=*/true};
+  }
+
+  if (auto add = value.getDefiningOp<AddOp>()) {
+    if (!mlir::isa<StrType>(add.getLhs().getType()) ||
+        !mlir::isa<StrType>(add.getRhs().getType()))
+      return mlir::failure();
+    auto lhs = lowerStringForImmediatePrint(loc, add.getLhs(), module, rewriter,
+                                            runtime);
+    if (mlir::failed(lhs))
+      return mlir::failure();
+    auto rhs = lowerStringForImmediatePrint(loc, add.getRhs(), module, rewriter,
+                                            runtime);
+    if (mlir::failed(rhs))
+      return mlir::failure();
+    if (!lhs->split() || !rhs->split())
+      return mlir::failure();
+    llvm::SmallVector<mlir::Value, 4> operands;
+    operands.append(lhs->values.begin(), lhs->values.end());
+    operands.append(rhs->values.begin(), rhs->values.end());
+    llvm::SmallVector<mlir::Type, 3> resultTypes;
+    object_abi::str_abi::Parts::storageTypes(module.getContext(), resultTypes);
+    RuntimeAPI::Call result =
+        runtime.call(loc, RuntimeSymbols::kUnicodeConcat,
+                     mlir::TypeRange(resultTypes), mlir::ValueRange(operands));
+    if (lhs->owned)
+      runtime.call(loc, RuntimeSymbols::kUnicodeDecRef, mlir::Type(),
+                   mlir::ValueRange(lhs->values));
+    if (rhs->owned)
+      runtime.call(loc, RuntimeSymbols::kUnicodeDecRef, mlir::Type(),
+                   mlir::ValueRange(rhs->values));
+    return LoweredString{llvm::SmallVector<mlir::Value, 3>(result.getResults()),
+                         /*owned=*/true};
+  }
+
+  return mlir::failure();
+}
+
 struct CallVectorLowering : public mlir::OpConversionPattern<CallVectorOp> {
   CallVectorLowering(PyLLVMTypeConverter &converter, mlir::MLIRContext *ctx)
-      : mlir::OpConversionPattern<CallVectorOp>(converter, ctx) {}
+      : mlir::OpConversionPattern<CallVectorOp>(converter, ctx,
+                                                mlir::PatternBenefit(10)),
+        typeConverter(converter) {}
 
-  mlir::LogicalResult
-  lowerBuiltinPrint(CallVectorOp op,
-                    mlir::ConversionPatternRewriter &rewriter) const {
-    if (!mlir::isa<TupleEmptyOp>(op.getKwnames().getDefiningOp()) ||
-        !mlir::isa<TupleEmptyOp>(op.getKwvalues().getDefiningOp()))
+  mlir::LogicalResult lowerBuiltinPrint(CallVectorOp op,
+                                        mlir::PatternRewriter &rewriter) const {
+    if (!mlir::isa<TupleEmptyOp>(
+            stripBridgeCasts(op.getKwnames()).getDefiningOp()) ||
+        !mlir::isa<TupleEmptyOp>(
+            stripBridgeCasts(op.getKwvalues()).getDefiningOp()))
       return rewriter.notifyMatchFailure(
           op, "builtin print keyword arguments are not supported");
 
-    auto posargsOp = op.getPosargs().getDefiningOp();
+    auto posargsOp = stripBridgeCasts(op.getPosargs()).getDefiningOp();
+    TupleCreateOp staticPosargs;
     llvm::SmallVector<mlir::Value> elements;
     if (auto tupleCreate = mlir::dyn_cast_or_null<TupleCreateOp>(posargsOp)) {
+      staticPosargs = tupleCreate;
       elements.append(tupleCreate.getElements().begin(),
                       tupleCreate.getElements().end());
     } else if (!mlir::isa<TupleEmptyOp>(posargsOp)) {
@@ -34,129 +453,192 @@ struct CallVectorLowering : public mlir::OpConversionPattern<CallVectorOp> {
     mlir::ModuleOp module = op->getParentOfType<mlir::ModuleOp>();
     if (!module)
       return mlir::failure();
-    auto *converter =
-        static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
-    auto ptrType = mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
-    auto i64Type = rewriter.getI64Type();
-    auto i32Type = rewriter.getI32Type();
-    mlir::Value argc = rewriter.create<mlir::LLVM::ConstantOp>(
-        op.getLoc(), i64Type, rewriter.getI64IntegerAttr(elements.size()));
-    mlir::Value storageCount = rewriter.create<mlir::LLVM::ConstantOp>(
-        op.getLoc(), i64Type,
-        rewriter.getI64IntegerAttr(std::max<std::size_t>(elements.size(), 1)));
-    mlir::Value argsArray = rewriter.create<mlir::LLVM::AllocaOp>(
-        op.getLoc(), ptrType, ptrType, storageCount, /*alignment=*/0);
-    ownership::Pointer::markNonObject(argsArray);
+    RuntimeAPI runtime(module, rewriter, typeConverter);
 
-    for (auto [index, element] : llvm::enumerate(elements)) {
-      mlir::Value asPtr = Slot::bridgePointer(op.getLoc(), element, rewriter);
-      mlir::Value idx = rewriter.create<mlir::LLVM::ConstantOp>(
-          op.getLoc(), i64Type, rewriter.getI64IntegerAttr(index));
-      mlir::Value slot = rewriter.create<mlir::LLVM::GEPOp>(
-          op.getLoc(), ptrType, ptrType, argsArray, mlir::ValueRange{idx});
-      rewriter.create<mlir::LLVM::StoreOp>(op.getLoc(), asPtr, slot);
-    }
+    if (elements.size() != 1)
+      return rewriter.notifyMatchFailure(
+          op, "builtin print currently requires one statically resolved arg");
 
-    mlir::Value nullPtr =
-        rewriter.create<mlir::LLVM::ZeroOp>(op.getLoc(), ptrType);
-    mlir::Value flush = rewriter.create<mlir::LLVM::ConstantOp>(
-        op.getLoc(), i32Type, rewriter.getI32IntegerAttr(0));
-    auto printFn = getOrInsertLLVMFunc(
-        op.getLoc(), module, rewriter, RuntimeSymbols::kBuiltinPrintImpl,
-        ptrType,
-        {ptrType, ptrType, i64Type, ptrType, ptrType, ptrType, i32Type});
-    auto printRef =
-        mlir::SymbolRefAttr::get(rewriter.getContext(), printFn.getName());
-    auto call = rewriter.create<mlir::LLVM::CallOp>(
-        op.getLoc(), mlir::TypeRange{ptrType}, printRef,
-        mlir::ValueRange{nullPtr, argsArray, argc, nullPtr, nullPtr, nullPtr,
-                         flush});
-
-    if (op.getNumResults() == 0) {
-      rewriter.eraseOp(op);
-      return mlir::success();
-    }
-
-    llvm::SmallVector<mlir::Value> logicalResults;
-    materializeLogicalResults(op.getLoc(), op.getResultTypes(),
-                              call.getResults(), logicalResults, *converter,
-                              rewriter);
-    rewriter.replaceOp(op, logicalResults);
-    return mlir::success();
-  }
-
-  mlir::LogicalResult
-  lowerViaRuntime(CallVectorOp op,
-                  mlir::ConversionPatternRewriter &rewriter) const {
-    return rewriter.notifyMatchFailure(
-        op, "dynamic vectorcall runtime fallback is disabled");
-  }
-
-  mlir::LogicalResult
-  appendFlattenedCallOperands(mlir::Location loc, mlir::ValueRange elements,
-                              mlir::FunctionType funcType,
-                              unsigned directInputCount,
-                              llvm::SmallVectorImpl<mlir::Value> &operands,
-                              mlir::ConversionPatternRewriter &rewriter) const {
-    auto *converter =
-        static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
-    unsigned expectedIndex = 0;
-    for (mlir::Value element : elements) {
-      llvm::SmallVector<mlir::Value> remapped;
-      llvm::SmallVector<mlir::Type> convertedElementTypes;
-      if (mlir::failed(converter->convertType(element.getType(),
-                                              convertedElementTypes)) ||
-          convertedElementTypes.empty())
-        return mlir::failure();
-
-      bool needsMaterializedExpansion = false;
-      if (mlir::succeeded(rewriter.getRemappedValues(mlir::ValueRange{element},
-                                                     remapped))) {
-        needsMaterializedExpansion =
-            remapped.size() != convertedElementTypes.size();
-      } else {
-        needsMaterializedExpansion = true;
+    mlir::Value literalCandidate = elements.front();
+    auto emitStaticPrintLiteral =
+        [&](llvm::StringRef text,
+            mlir::Operation *producer) -> mlir::LogicalResult {
+      llvm::SmallVector<DecRefOp> deadPosargDrops;
+      TupleCreateOp deadPosargs = collectDeadStaticPosargs(op, deadPosargDrops);
+      if (!deadPosargs)
+        deadPosargs = staticPosargs;
+      emitHostPrintLiteral(op.getLoc(), text, runtime);
+      if (op.getNumResults() != 0) {
+        if (canDropNoneResult(op)) {
+          eraseNoneResultUsers(op, rewriter);
+        } else {
+          auto none = rewriter.create<NoneOp>(op.getLoc(),
+                                              NoneType::get(op.getContext()));
+          rewriter.replaceOp(op, none.getResult());
+          cleanupDeadCallPack(deadPosargs, deadPosargDrops, rewriter);
+          if (producer && producer->use_empty())
+            rewriter.eraseOp(producer);
+          return mlir::success();
+        }
       }
-      if (!needsMaterializedExpansion) {
-        for (auto [value, type] : llvm::zip(remapped, convertedElementTypes)) {
-          if (value.getType() == element.getType() && value.getType() != type) {
-            needsMaterializedExpansion = true;
-            break;
+      rewriter.eraseOp(op);
+      cleanupDeadCallPack(deadPosargs, deadPosargDrops, rewriter);
+      if (producer && producer->use_empty())
+        rewriter.eraseOp(producer);
+      return mlir::success();
+    };
+    if (auto literal = literalCandidate.getDefiningOp<StrConstantOp>()) {
+      return emitStaticPrintLiteral(literal.getValue(), literal.getOperation());
+    }
+    if (auto literal = literalCandidate.getDefiningOp<IntConstantOp>()) {
+      return emitStaticPrintLiteral(literal.getValue(), literal.getOperation());
+    }
+
+    {
+      llvm::SmallVector<DecRefOp> deadPosargDrops;
+      llvm::SmallVector<DecRefOp> sourceTransferDrops;
+      TupleCreateOp deadPosargs = collectDeadStaticPosargs(op, deadPosargDrops);
+      if (!deadPosargs)
+        deadPosargs = staticPosargs;
+      collectArgTransferDrops(deadPosargs, op.getOperation(),
+                              sourceTransferDrops);
+      mlir::Value printable = elements.front();
+      bool releasePrintable = false;
+      auto finishDirectPrint =
+          [&](mlir::Operation *printAnchor) -> mlir::LogicalResult {
+        moveAfter(printAnchor, sourceTransferDrops);
+        if (op.getNumResults() != 0) {
+          if (canDropNoneResult(op)) {
+            eraseNoneResultUsers(op, rewriter);
+          } else {
+            auto none = rewriter.create<NoneOp>(op.getLoc(),
+                                                NoneType::get(op.getContext()));
+            rewriter.replaceOp(op, none.getResult());
+            cleanupDeadCallPack(deadPosargs, deadPosargDrops, rewriter);
+            return mlir::success();
+          }
+        }
+        rewriter.eraseOp(op);
+        cleanupDeadCallPack(deadPosargs, deadPosargDrops, rewriter);
+        return mlir::success();
+      };
+      if (!isPyStrType(printable.getType())) {
+        if (mlir::isa<BoolType>(printable.getType())) {
+          mlir::FailureOr<mlir::Operation *> printAnchor =
+              emitHostPrintBool(op.getLoc(), printable, rewriter, runtime);
+          if (mlir::failed(printAnchor))
+            return rewriter.notifyMatchFailure(
+                op, "failed to lower bool print to host print");
+          return finishDirectPrint(*printAnchor);
+        }
+        if (mlir::isa<ClassType>(printable.getType())) {
+          printable =
+              rewriter
+                  .create<ReprOp>(op.getLoc(), StrType::get(op.getContext()),
+                                  printable)
+                  .getResult();
+          releasePrintable = true;
+        } else {
+          printable =
+              rewriter
+                  .create<ReprOp>(op.getLoc(), StrType::get(op.getContext()),
+                                  printable)
+                  .getResult();
+          releasePrintable = true;
+        }
+      }
+      mlir::Operation *printAnchor = nullptr;
+      mlir::Value strStorage = printable;
+      llvm::SmallVector<mlir::Value, 3> strPartsStorage;
+      bool partsPrintStorage = false;
+      bool helperOwned = false;
+      if (mlir::isa<StrType>(printable.getType())) {
+        auto lowered = lowerStringForImmediatePrint(op.getLoc(), printable,
+                                                    module, rewriter, runtime);
+        if (mlir::succeeded(lowered)) {
+          helperOwned = lowered->owned;
+          if (lowered->split()) {
+            strPartsStorage.append(lowered->values.begin(),
+                                   lowered->values.end());
+            partsPrintStorage = true;
+          } else if (mlir::Value single = lowered->single()) {
+            strStorage = single;
+          } else {
+            return rewriter.notifyMatchFailure(
+                op, "lowered string has unsupported storage shape");
           }
         }
       }
-      if (needsMaterializedExpansion) {
-        remapped = converter->materializeTargetConversion(
-            rewriter, loc, mlir::TypeRange(convertedElementTypes),
-            mlir::ValueRange{element}, element.getType());
-        if (remapped.empty())
-          return mlir::failure();
+      if (partsPrintStorage) {
+        auto printCall =
+            runtime.call(op.getLoc(), RuntimeSymbols::kUnicodePrintLine,
+                         mlir::Type(), mlir::ValueRange(strPartsStorage));
+        printAnchor = printCall.getOperation();
+      } else if (strStorage == printable &&
+                 mlir::isa<StrType>(printable.getType())) {
+        llvm::SmallVector<mlir::Type, 3> strTypes;
+        object_abi::str_abi::Parts::storageTypes(op.getContext(), strTypes);
+        auto cast = rewriter.create<mlir::UnrealizedConversionCastOp>(
+            op.getLoc(), mlir::TypeRange(strTypes),
+            mlir::ValueRange{printable});
+        strPartsStorage.append(cast.getResults().begin(),
+                               cast.getResults().end());
+        auto printCall =
+            runtime.call(op.getLoc(), RuntimeSymbols::kUnicodePrintLine,
+                         mlir::Type(), mlir::ValueRange(strPartsStorage));
+        printAnchor = printCall.getOperation();
+        partsPrintStorage = true;
+      } else {
+        return rewriter.notifyMatchFailure(
+            op, "print requires unicode header/payload parts");
       }
-      if (expectedIndex + remapped.size() > directInputCount)
-        return mlir::failure();
-      for (mlir::Value operand : remapped) {
-        mlir::Type expected = funcType.getInput(expectedIndex++);
-        if (operand.getType() != expected)
-          operand =
-              rewriter
-                  .create<mlir::UnrealizedConversionCastOp>(
-                      loc, mlir::TypeRange{expected}, mlir::ValueRange{operand})
-                  .getResult(0);
-        operands.push_back(operand);
+      bool releasePrintStorage = helperOwned;
+      if (!deadPosargDrops.empty() && !releasePrintable &&
+          object_abi::Type::isStorageLike(strStorage.getType())) {
+        releasePrintStorage = true;
       }
+      if (releasePrintStorage) {
+        if (printAnchor)
+          rewriter.setInsertionPointAfter(printAnchor);
+        if (!partsPrintStorage)
+          return rewriter.notifyMatchFailure(
+              op, "print release requires unicode header/payload parts");
+        RuntimeAPI::Call releaseCall =
+            runtime.call(op.getLoc(), RuntimeSymbols::kUnicodeDecRef,
+                         mlir::Type(), mlir::ValueRange(strPartsStorage));
+        releaseCall->setAttr(OwnershipContractAttrs::kAggregateRelease,
+                             rewriter.getUnitAttr());
+        printAnchor = releaseCall.getOperation();
+      }
+      moveAfter(printAnchor, sourceTransferDrops);
+      if (op.getNumResults() != 0) {
+        if (canDropNoneResult(op)) {
+          eraseNoneResultUsers(op, rewriter);
+        } else {
+          auto none = rewriter.create<NoneOp>(op.getLoc(),
+                                              NoneType::get(op.getContext()));
+          rewriter.replaceOp(op, none.getResult());
+          cleanupDeadCallPack(deadPosargs, deadPosargDrops, rewriter);
+          return mlir::success();
+        }
+      }
+      rewriter.eraseOp(op);
+      cleanupDeadCallPack(deadPosargs, deadPosargDrops, rewriter);
+      return mlir::success();
     }
-    return mlir::success(expectedIndex == directInputCount);
   }
 
-  mlir::LogicalResult
-  matchAndRewrite(CallVectorOp op, OneToNOpAdaptor adaptor,
-                  mlir::ConversionPatternRewriter &rewriter) const override {
-    (void)adaptor;
+  mlir::LogicalResult lowerViaRuntime(CallVectorOp op,
+                                      mlir::PatternRewriter &rewriter) const {
+    return rewriter.notifyMatchFailure(
+        op, "dynamic vectorcall requires static call resolution");
+  }
+
+  mlir::LogicalResult lowerCallVector(CallVectorOp op,
+                                      mlir::PatternRewriter &rewriter) const {
     mlir::ModuleOp module = op->getParentOfType<mlir::ModuleOp>();
     if (!module)
       return mlir::failure();
-    auto *converter =
-        static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
 
     if (isBuiltinPrintCallable(op.getCallable()))
       return lowerBuiltinPrint(op, rewriter);
@@ -176,20 +658,33 @@ struct CallVectorLowering : public mlir::OpConversionPattern<CallVectorOp> {
       return lowerViaRuntime(op, rewriter);
 
     if (canUseVoidHelper(op, func)) {
-      auto posargsOp = op.getPosargs().getDefiningOp();
+      auto posargsOp = stripBridgeCasts(op.getPosargs()).getDefiningOp();
       llvm::SmallVector<mlir::Value> helperOperands;
+      llvm::SmallVector<DecRefOp> argTransferDrops;
+      llvm::SmallVector<DecRefOp> deadPosargDrops;
+      TupleCreateOp deadPosargs = collectDeadStaticPosargs(op, deadPosargDrops);
       if (auto tupleCreate = mlir::dyn_cast_or_null<TupleCreateOp>(posargsOp)) {
+        if (!deadPosargs)
+          deadPosargs = tupleCreate;
         auto helperFunc = resolvePreferredDirectHelper(
             func, tupleCreate.getElements(), module, /*allowVoidHelper=*/true);
         if (!helperFunc)
           return rewriter.notifyMatchFailure(op, "missing void helper");
         auto helperType = helperFunc.getFunctionType();
-        if (mlir::failed(appendFlattenedCallOperands(
+        if (mlir::failed(::py::appendFlattenedCallOperands(
                 op.getLoc(), tupleCreate.getElements(), helperType,
-                helperType.getNumInputs(), helperOperands, rewriter)))
+                helperType.getNumInputs(), helperOperands, rewriter,
+                typeConverter)))
           return lowerViaRuntime(op, rewriter);
-        rewriter.create<mlir::func::CallOp>(op.getLoc(), helperFunc,
-                                            helperOperands);
+        collectArgTransferDrops(tupleCreate, op.getOperation(),
+                                argTransferDrops);
+        auto helperCall = rewriter.create<mlir::func::CallOp>(
+            op.getLoc(), helperFunc, helperOperands);
+        moveAfter(helperCall.getOperation(), argTransferDrops);
+        releaseOwnedStringCallArgs(tupleCreate, helperCall.getOperation(),
+                                   rewriter);
+        closeDeadLocalClassArguments(tupleCreate, helperCall.getOperation(),
+                                     argTransferDrops, rewriter);
       } else if (mlir::isa<TupleEmptyOp>(posargsOp)) {
         auto helperFunc =
             resolvePreferredDirectHelper(func, mlir::ValueRange{}, module,
@@ -206,16 +701,19 @@ struct CallVectorLowering : public mlir::OpConversionPattern<CallVectorOp> {
       }
       eraseNoneResultUsers(op, rewriter);
       rewriter.eraseOp(op);
+      cleanupDeadCallPack(deadPosargs, deadPosargDrops, rewriter);
       if (constOp->use_empty())
         rewriter.eraseOp(constOp);
       return mlir::success();
     }
 
-    if (!mlir::isa<TupleEmptyOp>(op.getKwnames().getDefiningOp()) ||
-        !mlir::isa<TupleEmptyOp>(op.getKwvalues().getDefiningOp()))
+    if (!mlir::isa<TupleEmptyOp>(
+            stripBridgeCasts(op.getKwnames()).getDefiningOp()) ||
+        !mlir::isa<TupleEmptyOp>(
+            stripBridgeCasts(op.getKwvalues()).getDefiningOp()))
       return lowerViaRuntime(op, rewriter);
 
-    auto posargsOp = op.getPosargs().getDefiningOp();
+    auto posargsOp = stripBridgeCasts(op.getPosargs()).getDefiningOp();
     if (auto tupleCreate = mlir::dyn_cast_or_null<TupleCreateOp>(posargsOp)) {
       func =
           resolvePreferredDirectHelper(func, tupleCreate.getElements(), module,
@@ -224,17 +722,20 @@ struct CallVectorLowering : public mlir::OpConversionPattern<CallVectorOp> {
 
     auto funcType = func.getFunctionType();
     llvm::SmallVector<mlir::Value> callOperands;
-    bool hiddenClassReturnOutArg =
-        op.getNumResults() == 1 &&
-        mlir::isa<ClassType>(op.getResult(0).getType()) &&
-        funcType.getNumResults() == 0;
-    unsigned directInputCount =
-        funcType.getNumInputs() - (hiddenClassReturnOutArg ? 1u : 0u);
+    llvm::SmallVector<DecRefOp> argTransferDrops;
+    unsigned directInputCount = funcType.getNumInputs();
+    TupleCreateOp staticPosargs;
+    llvm::SmallVector<DecRefOp> deadPosargDrops;
+    TupleCreateOp deadPosargs = collectDeadStaticPosargs(op, deadPosargDrops);
     if (auto tupleCreate = mlir::dyn_cast_or_null<TupleCreateOp>(posargsOp)) {
-      if (mlir::failed(appendFlattenedCallOperands(
+      staticPosargs = tupleCreate;
+      if (!deadPosargs)
+        deadPosargs = tupleCreate;
+      if (mlir::failed(::py::appendFlattenedCallOperands(
               op.getLoc(), tupleCreate.getElements(), funcType,
-              directInputCount, callOperands, rewriter)))
+              directInputCount, callOperands, rewriter, typeConverter)))
         return lowerViaRuntime(op, rewriter);
+      collectArgTransferDrops(tupleCreate, op.getOperation(), argTransferDrops);
     } else if (mlir::isa<TupleEmptyOp>(posargsOp)) {
       if (directInputCount != 0)
         return lowerViaRuntime(op, rewriter);
@@ -242,41 +743,86 @@ struct CallVectorLowering : public mlir::OpConversionPattern<CallVectorOp> {
       return lowerViaRuntime(op, rewriter);
     }
 
-    mlir::Value classReturnSlot;
-    if (hiddenClassReturnOutArg) {
-      auto classType = mlir::cast<ClassType>(op.getResult(0).getType());
-      auto objectTypeOr = getStaticClassObjectType(op, classType, *converter);
-      if (mlir::failed(objectTypeOr))
-        return mlir::failure();
-      classReturnSlot =
-          createStaticClassSlot(op.getLoc(), *objectTypeOr, rewriter, op);
-      if (!classReturnSlot)
-        return mlir::failure();
-      mlir::Value zero =
-          rewriter.create<mlir::LLVM::ZeroOp>(op.getLoc(), *objectTypeOr);
-      rewriter.create<mlir::LLVM::StoreOp>(op.getLoc(), zero, classReturnSlot);
-      callOperands.push_back(classReturnSlot);
-    }
-
     auto call =
         rewriter.create<mlir::func::CallOp>(op.getLoc(), func, callOperands);
+    moveAfter(call.getOperation(), argTransferDrops);
+    releaseOwnedStringCallArgs(staticPosargs, call.getOperation(), rewriter);
+    closeDeadLocalClassArguments(staticPosargs, call.getOperation(),
+                                 argTransferDrops, rewriter);
 
-    if (hiddenClassReturnOutArg) {
-      rewriter.replaceOp(op, classReturnSlot);
-    } else if (call.getNumResults() == 0) {
-      rewriter.eraseOp(op);
+    if (call.getNumResults() == 0) {
+      if (op.getNumResults() == 1 &&
+          mlir::isa<NoneType>(op.getResult(0).getType())) {
+        if (canDropNoneResult(op)) {
+          eraseNoneResultUsers(op, rewriter);
+          rewriter.eraseOp(op);
+          cleanupDeadCallPack(deadPosargs, deadPosargDrops, rewriter);
+        } else {
+          auto none = rewriter.create<NoneOp>(op.getLoc(),
+                                              NoneType::get(op.getContext()));
+          rewriter.replaceOp(op, none.getResult());
+          cleanupDeadCallPack(deadPosargs, deadPosargDrops, rewriter);
+        }
+      } else {
+        rewriter.eraseOp(op);
+        cleanupDeadCallPack(deadPosargs, deadPosargDrops, rewriter);
+      }
     } else {
       llvm::SmallVector<mlir::Value> logicalResults;
       materializeLogicalResults(op.getLoc(), op.getResultTypes(),
-                                call.getResults(), logicalResults, *converter,
-                                rewriter);
+                                call.getResults(), logicalResults,
+                                typeConverter, rewriter);
       rewriter.replaceOp(op, logicalResults);
+      cleanupDeadCallPack(deadPosargs, deadPosargDrops, rewriter);
     }
 
     if (constOp->use_empty())
       rewriter.eraseOp(constOp);
     return mlir::success();
   }
+
+  mlir::LogicalResult
+  matchAndRewrite(CallVectorOp op, OneToNOpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    (void)adaptor;
+    return lowerCallVector(op, rewriter);
+  }
+
+  PyLLVMTypeConverter &typeConverter;
+};
+
+struct CallVectorRewrite : public mlir::OpRewritePattern<CallVectorOp> {
+  CallVectorRewrite(PyLLVMTypeConverter &converter, mlir::MLIRContext *ctx)
+      : mlir::OpRewritePattern<CallVectorOp>(ctx, mlir::PatternBenefit(90)),
+        typeConverter(converter) {}
+
+  mlir::LogicalResult
+  matchAndRewrite(CallVectorOp op,
+                  mlir::PatternRewriter &rewriter) const override {
+    CallVectorLowering lowerer(typeConverter, rewriter.getContext());
+    return lowerer.lowerCallVector(op, rewriter);
+  }
+
+  PyLLVMTypeConverter &typeConverter;
+};
+
+struct BuiltinPrintVectorRewrite : public mlir::OpRewritePattern<CallVectorOp> {
+  BuiltinPrintVectorRewrite(PyLLVMTypeConverter &converter,
+                            mlir::MLIRContext *ctx)
+      : mlir::OpRewritePattern<CallVectorOp>(ctx, mlir::PatternBenefit(100)),
+        typeConverter(converter) {}
+
+  mlir::LogicalResult
+  matchAndRewrite(CallVectorOp op,
+                  mlir::PatternRewriter &rewriter) const override {
+    if (!isBuiltinPrintCallable(op.getCallable()))
+      return rewriter.notifyMatchFailure(op, "not a builtin print call");
+
+    CallVectorLowering lowerer(typeConverter, rewriter.getContext());
+    return lowerer.lowerBuiltinPrint(op, rewriter);
+  }
+
+  PyLLVMTypeConverter &typeConverter;
 };
 
 struct CallOpLowering : public mlir::OpConversionPattern<CallOp> {
@@ -288,7 +834,7 @@ struct CallOpLowering : public mlir::OpConversionPattern<CallOp> {
                   mlir::ConversionPatternRewriter &rewriter) const override {
     (void)adaptor;
     return rewriter.notifyMatchFailure(
-        op, "dynamic call runtime fallback is disabled");
+        op, "dynamic call requires static call resolution");
   }
 };
 
@@ -298,7 +844,8 @@ namespace lowering::call::direct::Patterns {
 void populate(PyLLVMTypeConverter &typeConverter,
               mlir::RewritePatternSet &patterns) {
   auto *ctx = patterns.getContext();
-  patterns.add<CallVectorLowering, CallOpLowering>(typeConverter, ctx);
+  patterns.add<BuiltinPrintVectorRewrite, CallVectorRewrite, CallVectorLowering,
+               CallOpLowering>(typeConverter, ctx);
 }
 } // namespace lowering::call::direct::Patterns
 

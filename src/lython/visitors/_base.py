@@ -80,6 +80,7 @@ class BaseVisitor(
         self._returned_callable_arg_index_stack: list[int | None] = []
         self._returned_function_info_valid_stack: list[bool] = []
         self._callable_value_info: dict[int, FunctionInfo] = {}
+        self._class_ast_defs: dict[str, ast.ClassDef] = {}
         self._function_ast_stack: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
         self._return_type_stack: list[ir.Type] = []
         self._async_function_stack: list[bool] = []

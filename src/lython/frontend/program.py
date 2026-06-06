@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from .inference import FuncType, InferenceError, TypeCon, TypeTerm
@@ -22,6 +23,8 @@ class FunctionSig:
     arg_names: tuple[str, ...]
     kwonly: tuple[TypeTerm, ...] = ()
     kwonly_names: tuple[str, ...] = ()
+    defaults_count: int = 0
+    kwdefault_names: tuple[str, ...] = ()
     is_async: bool = False
 
     def callable_type(self) -> FuncType:
@@ -32,11 +35,52 @@ class FunctionSig:
 @dataclass(slots=True)
 class ClassSig:
     name: str
+    base_names: tuple[str, ...] = ()
     fields: dict[str, TypeTerm] = field(default_factory=_empty_fields)
     methods: dict[str, FunctionSig] = field(default_factory=_empty_methods)
 
     def term(self) -> TypeCon:
         return TypeCon(f"class:{self.name}")
+
+
+def compute_c3_mro(classes: Mapping[str, ClassSig], class_name: str) -> tuple[str, ...]:
+    visiting: set[str] = set()
+
+    def mro(name: str) -> list[str]:
+        if name in visiting:
+            raise InferenceError(f"class inheritance cycle through '{name}'")
+        class_sig = classes.get(name)
+        if class_sig is None:
+            raise InferenceError(f"unknown base class '{name}'")
+        visiting.add(name)
+        base_mros = [mro(base) for base in class_sig.base_names]
+        visiting.remove(name)
+        return [name, *_c3_merge([*base_mros, list(class_sig.base_names)], name)]
+
+    return tuple(mro(class_name))
+
+
+def _c3_merge(sequences: Sequence[list[str]], class_name: str) -> list[str]:
+    pending = [list(seq) for seq in sequences if seq]
+    result: list[str] = []
+    while pending:
+        candidate = None
+        for seq in pending:
+            head = seq[0]
+            if not any(head in other[1:] for other in pending):
+                candidate = head
+                break
+        if candidate is None:
+            raise InferenceError(f"inconsistent C3 MRO for class '{class_name}'")
+        result.append(candidate)
+        next_pending: list[list[str]] = []
+        for seq in pending:
+            if seq and seq[0] == candidate:
+                seq = seq[1:]
+            if seq:
+                next_pending.append(seq)
+        pending = next_pending
+    return result
 
 
 @dataclass(slots=True)
@@ -78,15 +122,13 @@ class SourceTypeOracle:
         if isinstance(owner, TypeCon):
             class_name = self._class_name(owner)
             if class_name is not None:
-                class_sig = self.classes.get(class_name)
-                if class_sig is None:
-                    return None
-                field = class_sig.fields.get(name)
-                if field is not None:
-                    return field
-                method = class_sig.methods.get(name)
-                if method is not None:
-                    return FuncType(method.args[1:], method.ret, method.kwonly)
+                for class_sig in self._class_mro(class_name):
+                    field = class_sig.fields.get(name)
+                    if field is not None:
+                        return field
+                    method = class_sig.methods.get(name)
+                    if method is not None:
+                        return FuncType(method.args[1:], method.ret, method.kwonly)
             if owner.name == "list" and len(owner.args) == 1:
                 element = owner.args[0]
                 if name in {"append", "remove"}:
@@ -132,3 +174,18 @@ class SourceTypeOracle:
         if not term.name.startswith("class:"):
             return None
         return term.name[len("class:") :]
+
+    def _class_mro(
+        self, class_name: str, seen: set[str] | None = None
+    ) -> Iterable[ClassSig]:
+        if seen is None:
+            seen = set()
+        if class_name in seen:
+            return
+        seen.add(class_name)
+        class_sig = self.classes.get(class_name)
+        if class_sig is None:
+            return
+        yield class_sig
+        for base_name in class_sig.base_names:
+            yield from self._class_mro(base_name, seen)

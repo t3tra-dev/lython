@@ -1,8 +1,7 @@
 #include "traceback.h"
 
-#include "objects/exception.h"
-#include "objects/unicode.h"
-
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
@@ -11,12 +10,31 @@
 
 namespace {
 
-thread_local LyTracebackFrame *g_traceback_top = nullptr;
+struct LyTracebackFrame {
+  std::string filename;
+  std::string funcname;
+  std::int32_t line;
+  std::int32_t col;
+};
 
-std::string readSourceLine(const char *filename, std::int32_t line) {
-  if (!filename || line <= 0)
+thread_local std::vector<LyTracebackFrame> g_traceback_stack;
+
+std::string copyMemRefString(const LyI8Descriptor &descriptor) {
+  if (!lython::abi::memref::readable(descriptor) || descriptor.size == 0)
     return {};
-  std::FILE *fp = std::fopen(filename, "r");
+  std::string result;
+  result.reserve(static_cast<std::size_t>(descriptor.size));
+  for (std::int64_t i = 0; i < descriptor.size; ++i) {
+    std::int64_t index = lython::abi::memref::index(descriptor, i);
+    result.push_back(static_cast<char>(descriptor.aligned[index]));
+  }
+  return result;
+}
+
+std::string readSourceLine(const std::string &filename, std::int32_t line) {
+  if (filename.empty() || line <= 0)
+    return {};
+  std::FILE *fp = std::fopen(filename.c_str(), "r");
   if (!fp)
     return {};
   std::string result;
@@ -35,106 +53,81 @@ std::string readSourceLine(const char *filename, std::int32_t line) {
   return result;
 }
 
-const char *safeStr(const char *value, const char *fallback) {
-  return value ? value : fallback;
+const char *safeStr(const std::string &value, const char *defaultValue) {
+  return value.empty() ? defaultValue : value.c_str();
 }
 
-void printExceptionSummary(LyObject *exception) {
-  if (!exception) {
+void printExceptionSummary(const LyI8Descriptor &payload) {
+  if (!lython::abi::memref::rootDynamic(payload)) {
+    std::fprintf(stderr, "Exception: <invalid>\n");
+    return;
+  }
+
+  if (payload.size == 0) {
+    std::fprintf(stderr, "Exception\n");
+    return;
+  }
+
+  if (!payload.aligned) {
     std::fprintf(stderr, "Exception: <unknown>\n");
     return;
   }
-  const char *typeName =
-      exception->ob_type ? exception->ob_type->tp_name : "Exception";
-  auto *excObj = reinterpret_cast<LyExceptionObject *>(exception);
-  const char *msg =
-      excObj->message
-          ? LyUnicode_AsUTF8(reinterpret_cast<LyObject *>(excObj->message))
-          : "";
-  if (msg && msg[0])
-    std::fprintf(stderr, "%s: %s\n", typeName, msg);
-  else
-    std::fprintf(stderr, "%s\n", typeName);
-}
 
-LyObject *getExceptionContext(LyObject *exception) {
-  if (!exception || exception->ob_type != &LyException_Type())
-    return nullptr;
-  return reinterpret_cast<LyExceptionObject *>(exception)->context;
-}
-
-void printExceptionContextChain(LyObject *exception, unsigned depth = 0) {
-  if (!exception || depth > 16)
-    return;
-  LyObject *context = getExceptionContext(exception);
-  if (!context || context == exception)
-    return;
-  printExceptionContextChain(context, depth + 1);
-  printExceptionSummary(context);
-  std::fprintf(stderr,
-               "\nDuring handling of the above exception, another exception "
-               "occurred:\n\n");
+  std::string message = copyMemRefString(payload);
+  std::fprintf(stderr, "Exception: %.*s\n", static_cast<int>(message.size()),
+               message.data());
 }
 
 } // namespace
 
 extern "C" {
 
-void LyTraceback_Push(const char *filename, const char *funcname,
+void LyTraceback_Push(std::uint8_t *file_allocated, std::uint8_t *file_aligned,
+                      std::int64_t file_offset, std::int64_t file_size,
+                      std::int64_t file_stride, std::uint8_t *func_allocated,
+                      std::uint8_t *func_aligned, std::int64_t func_offset,
+                      std::int64_t func_size, std::int64_t func_stride,
                       std::int32_t line, std::int32_t col) {
-  auto *frame = new LyTracebackFrame();
-  frame->filename = filename;
-  frame->funcname = funcname;
-  frame->line = line;
-  frame->col = col;
-  frame->prev = g_traceback_top;
-  g_traceback_top = frame;
+  LyI8Descriptor file = lython::abi::memref::i8(
+      file_allocated, file_aligned, file_offset, file_size, file_stride);
+  LyI8Descriptor function = lython::abi::memref::i8(
+      func_allocated, func_aligned, func_offset, func_size, func_stride);
+  g_traceback_stack.push_back(
+      {copyMemRefString(file), copyMemRefString(function), line, col});
 }
 
 void LyTraceback_Pop() {
-  if (!g_traceback_top)
+  if (g_traceback_stack.empty())
     return;
-  auto *top = g_traceback_top;
-  g_traceback_top = top->prev;
-  delete top;
+  g_traceback_stack.pop_back();
 }
 
-void LyTraceback_Clear() {
-  while (g_traceback_top)
-    LyTraceback_Pop();
-}
+void LyTraceback_Clear() { g_traceback_stack.clear(); }
 
-void LyTraceback_Print(LyObject *exception) {
+void LyTraceback_PrintMessage(std::uint8_t *payload_allocated,
+                              std::uint8_t *payload_aligned,
+                              std::int64_t payload_offset,
+                              std::int64_t payload_size,
+                              std::int64_t payload_stride) {
   std::cout.flush();
   std::fflush(stdout);
-  LyObject *exc = exception ? exception : LyException_GetCurrent();
-  printExceptionContextChain(exc);
 
   std::fprintf(stderr, "Traceback (most recent call last):\n");
 
-  // Collect frames to print from oldest to newest.
-  std::vector<LyTracebackFrame *> frames;
-  for (auto *frame = g_traceback_top; frame; frame = frame->prev)
-    frames.push_back(frame);
-  for (auto it = frames.rbegin(); it != frames.rend(); ++it) {
-    LyTracebackFrame *frame = *it;
-    const char *filename = safeStr(frame->filename, "<unknown>");
-    const char *funcname = safeStr(frame->funcname, "<unknown>");
+  for (const LyTracebackFrame &frame : g_traceback_stack) {
+    const char *filename = safeStr(frame.filename, "<unknown>");
+    const char *funcname = safeStr(frame.funcname, "<unknown>");
     std::fprintf(stderr, "  File \"%s\", line %d, in %s\n", filename,
-                 static_cast<int>(frame->line), funcname);
-    std::string source = readSourceLine(filename, frame->line);
+                 static_cast<int>(frame.line), funcname);
+    std::string source = readSourceLine(frame.filename, frame.line);
     if (!source.empty())
       std::fprintf(stderr, "    %s\n", source.c_str());
   }
 
-  printExceptionSummary(exc);
-}
-
-std::int32_t LyEH_ReportUnhandled(LyObject *exception) {
-  LyTraceback_Print(exception);
-  LyException_Clear();
-  LyTraceback_Clear();
-  return 1;
+  LyI8Descriptor payload =
+      lython::abi::memref::i8(payload_allocated, payload_aligned,
+                              payload_offset, payload_size, payload_stride);
+  printExceptionSummary(payload);
 }
 
 } // extern "C"

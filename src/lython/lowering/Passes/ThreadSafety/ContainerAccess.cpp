@@ -42,6 +42,35 @@ static mlir::LLVM::LoadOp llvmSlotLoad(mlir::Value value) {
   return {};
 }
 
+static bool aggregateLoadFromGroup(mlir::Value value, llvm::StringRef group,
+                                   llvm::SmallPtrSetImpl<mlir::Value> &seen) {
+  value = pointer::stripCasts(value);
+  if (!value || !seen.insert(value).second)
+    return false;
+
+  mlir::Operation *def = value.getDefiningOp();
+  if (!def)
+    return false;
+  if (def->hasAttr(OwnershipContractAttrs::kAggregateSlotLoad)) {
+    auto loadGroup =
+        attrs::str(def, OwnershipContractAttrs::kAggregateSlotGroup);
+    if (loadGroup && *loadGroup == group)
+      return true;
+  }
+  if (auto gep = mlir::dyn_cast<mlir::LLVM::GEPOp>(def))
+    return aggregateLoadFromGroup(gep.getBase(), group, seen);
+  if (auto extract = mlir::dyn_cast<mlir::LLVM::ExtractValueOp>(def))
+    return aggregateLoadFromGroup(extract.getContainer(), group, seen);
+  if (auto load = mlir::dyn_cast<mlir::LLVM::LoadOp>(def))
+    return aggregateLoadFromGroup(load.getAddr(), group, seen);
+  return false;
+}
+
+static bool aggregateLoadFromGroup(mlir::Value value, llvm::StringRef group) {
+  llvm::SmallPtrSet<mlir::Value, 8> seen;
+  return aggregateLoadFromGroup(value, group, seen);
+}
+
 } // namespace provenance
 
 namespace retain {
@@ -76,10 +105,29 @@ static bool classFieldRetain(mlir::Operation *lock, mlir::Operation *retain) {
   if (!lockRole || *lockRole != ThreadSafetyAttrs::kRoleClassLockAcquire)
     return false;
 
+  auto helper = lock->getParentOfType<mlir::LLVM::LLVMFuncOp>();
+  auto helperKind =
+      helper ? attrs::str(helper.getOperation(), ClassSafetyAttrs::kHelperKind)
+             : std::optional<::llvm::StringRef>{};
+  auto retainGroup =
+      attrs::str(retain, OwnershipContractAttrs::kAggregateSlotGroup);
+  auto retainComponent =
+      attrs::str(retain, OwnershipContractAttrs::kAggregateSlotComponent);
+  bool inFieldHelper =
+      helperKind && (*helperKind == ClassSafetyAttrs::kKindGetField ||
+                     *helperKind == ClassSafetyAttrs::kKindSetField);
+  if (inFieldHelper && retainGroup && *retainGroup == "class.field" &&
+      retainComponent && *retainComponent == "payload")
+    return true;
+
   mlir::Value lockRoot = atomic::llvmRoot(lock);
   mlir::Value retainPointer = retain::pointer(retain);
   if (!lockRoot || !retainPointer)
     return false;
+
+  if (inFieldHelper &&
+      provenance::aggregateLoadFromGroup(retainPointer, "class.field"))
+    return true;
 
   mlir::LLVM::LoadOp fieldLoad = provenance::classFieldLoad(retainPointer);
   if (!fieldLoad)
@@ -112,6 +160,10 @@ static bool containerSlotRetain(mlir::Operation *lock,
     return lockGroup && accessGroup && *lockGroup == *accessGroup;
   }
 
+  if (lockGroup &&
+      provenance::aggregateLoadFromGroup(retainPointer, *lockGroup))
+    return true;
+
   return false;
 }
 
@@ -134,6 +186,46 @@ static bool same(mlir::Operation *lhs, mlir::Operation *rhs) {
   mlir::Value lhsRoot = atomic::llvmRoot(lhs);
   mlir::Value rhsRoot = atomic::llvmRoot(rhs);
   return lhsRoot && rhsRoot && lhsRoot == rhsRoot;
+}
+
+static bool closedCriticalSection(mlir::Operation *acquire,
+                                  mlir::Operation *access,
+                                  ::llvm::ArrayRef<mlir::Operation *> releases,
+                                  mlir::DominanceInfo &dominance,
+                                  mlir::PostDominanceInfo &postDominance) {
+  if (!dominance.dominates(acquire, access))
+    return false;
+
+  for (mlir::Operation *release : releases) {
+    if (!same(acquire, release))
+      continue;
+    if (dominance.properlyDominates(release, access))
+      return false;
+  }
+
+  for (mlir::Operation *release : releases) {
+    if (!same(acquire, release))
+      continue;
+    if (!dominance.dominates(acquire, release))
+      continue;
+    if (postDominance.postDominates(release, access))
+      return true;
+  }
+  return false;
+}
+
+template <typename Protects>
+static bool protectsClosed(::llvm::ArrayRef<mlir::Operation *> acquires,
+                           mlir::Operation *access,
+                           ::llvm::ArrayRef<mlir::Operation *> releases,
+                           mlir::DominanceInfo &dominance,
+                           mlir::PostDominanceInfo &postDominance,
+                           Protects protects) {
+  for (mlir::Operation *acquire : acquires)
+    if (protects(acquire) && closedCriticalSection(acquire, access, releases,
+                                                   dominance, postDominance))
+      return true;
+  return false;
 }
 
 } // namespace lock
@@ -161,42 +253,13 @@ verifier::container::BorrowRetain::dominance(mlir::Operation *funcLike) {
   });
 
   for (mlir::Operation *retain : retains) {
-    mlir::Operation *protectingAcquire = nullptr;
-    for (mlir::Operation *acquire : acquires) {
-      if (lock::protectsRetain(acquire, retain) &&
-          dominance.dominates(acquire, retain)) {
-        protectingAcquire = acquire;
-        break;
-      }
-    }
-    if (!protectingAcquire)
+    if (!lock::protectsClosed(acquires, retain, releases, dominance,
+                              postDominance, [&](mlir::Operation *acquire) {
+                                return lock::protectsRetain(acquire, retain);
+                              }))
       return retain->emitOpError(
-          "locked-borrow retain is not dominated by a protecting lock acquire");
-
-    for (mlir::Operation *release : releases) {
-      if (lock::same(protectingAcquire, release) &&
-          dominance.dominates(protectingAcquire, release) &&
-          dominance.properlyDominates(release, retain))
-        return retain->emitOpError(
-            "locked-borrow retain is dominated by a prior protecting lock "
-            "release");
-    }
-
-    bool hasPostDominatingRelease = false;
-    for (mlir::Operation *release : releases) {
-      if (!lock::same(protectingAcquire, release))
-        continue;
-      if (!dominance.dominates(protectingAcquire, release))
-        continue;
-      if (postDominance.postDominates(release, retain)) {
-        hasPostDominatingRelease = true;
-        break;
-      }
-    }
-    if (!hasPostDominatingRelease)
-      return retain->emitOpError(
-          "locked-borrow retain is not followed by a protecting lock release "
-          "on every exit path");
+          "locked-borrow retain is not enclosed by a protecting lock "
+          "acquire/release region");
   }
   return mlir::success();
 }
@@ -445,11 +508,7 @@ static bool freshBeforeEscape(mlir::Operation *access, mlir::Value target) {
 
 } // namespace access
 
-static bool protectsAccess(mlir::Operation *acquire, mlir::Operation *access,
-                           mlir::Value header,
-                           ::llvm::ArrayRef<mlir::Operation *> releases,
-                           mlir::DominanceInfo &dominance,
-                           mlir::PostDominanceInfo &postDominance) {
+static bool protectsAccess(mlir::Operation *acquire, mlir::Value header) {
   auto acquireRole = attrs::str(acquire, ThreadSafetyAttrs::kAtomicRole);
   if (!acquireRole ||
       *acquireRole != ThreadSafetyAttrs::kRoleContainerLockAcquire)
@@ -457,25 +516,7 @@ static bool protectsAccess(mlir::Operation *acquire, mlir::Operation *access,
   mlir::Value acquireHeader = atomic::memrefHeader(acquire);
   if (!descriptor::sameResource(header, acquireHeader))
     return false;
-  if (!dominance.dominates(acquire, access))
-    return false;
-
-  for (mlir::Operation *release : releases) {
-    if (!lock::same(acquire, release))
-      continue;
-    if (dominance.properlyDominates(release, access))
-      return false;
-  }
-
-  for (mlir::Operation *release : releases) {
-    if (!lock::same(acquire, release))
-      continue;
-    if (!dominance.dominates(acquire, release))
-      continue;
-    if (postDominance.postDominates(release, access))
-      return true;
-  }
-  return false;
+  return true;
 }
 
 mlir::LogicalResult
@@ -515,15 +556,10 @@ verifier::container::Access::regions(mlir::Operation *funcLike) {
     });
 
     for (mlir::Operation *accessOp : accesses) {
-      bool protectedByLock = false;
-      for (mlir::Operation *acquire : acquires) {
-        if (protectsAccess(acquire, accessOp, header, releases, dominance,
-                           postDominance)) {
-          protectedByLock = true;
-          break;
-        }
-      }
-      if (!protectedByLock) {
+      if (!lock::protectsClosed(acquires, accessOp, releases, dominance,
+                                postDominance, [&](mlir::Operation *acquire) {
+                                  return protectsAccess(acquire, header);
+                                })) {
         accessOp->emitOpError(
             "managed container load/store is not protected by the "
             "descriptor's lock acquire/release");
@@ -564,10 +600,7 @@ verifier::container::Access::coverage(mlir::Operation *funcLike) {
 }
 
 static bool protectsFinalAccess(mlir::Operation *acquire,
-                                mlir::Operation *access,
-                                ::llvm::ArrayRef<mlir::Operation *> releases,
-                                mlir::DominanceInfo &dominance,
-                                mlir::PostDominanceInfo &postDominance) {
+                                mlir::Operation *access) {
   auto acquireRole = attrs::str(acquire, ThreadSafetyAttrs::kAtomicRole);
   if (!acquireRole ||
       *acquireRole != ThreadSafetyAttrs::kRoleContainerLockAcquire)
@@ -577,25 +610,7 @@ static bool protectsFinalAccess(mlir::Operation *acquire,
   auto accessGroup = attrs::str(access, ContainerSafetyAttrs::kAccessGroup);
   if (!acquireGroup || !accessGroup || *acquireGroup != *accessGroup)
     return false;
-  if (!dominance.dominates(acquire, access))
-    return false;
-
-  for (mlir::Operation *release : releases) {
-    if (!lock::same(acquire, release))
-      continue;
-    if (dominance.properlyDominates(release, access))
-      return false;
-  }
-
-  for (mlir::Operation *release : releases) {
-    if (!lock::same(acquire, release))
-      continue;
-    if (!dominance.dominates(acquire, release))
-      continue;
-    if (postDominance.postDominates(release, access))
-      return true;
-  }
-  return false;
+  return true;
 }
 
 mlir::LogicalResult
@@ -621,15 +636,10 @@ verifier::container::Access::final(mlir::Operation *funcLike) {
   });
 
   for (mlir::Operation *accessOp : accesses) {
-    bool protectedByLock = false;
-    for (mlir::Operation *acquire : acquires) {
-      if (protectsFinalAccess(acquire, accessOp, releases, dominance,
-                              postDominance)) {
-        protectedByLock = true;
-        break;
-      }
-    }
-    if (!protectedByLock)
+    if (!lock::protectsClosed(acquires, accessOp, releases, dominance,
+                              postDominance, [&](mlir::Operation *acquire) {
+                                return protectsFinalAccess(acquire, accessOp);
+                              }))
       return accessOp->emitOpError(
           "lowered managed container load/store is not protected by the "
           "descriptor's final LLVM lock acquire/release");

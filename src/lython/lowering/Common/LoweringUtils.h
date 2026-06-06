@@ -4,10 +4,12 @@
 #include "PyDialectTypes.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
+#include "llvm/ADT/STLExtras.h"
 
 namespace py {
 
@@ -41,6 +43,87 @@ getOrInsertLLVMFunc(mlir::Location loc, mlir::ModuleOp module,
   return builder.create<mlir::LLVM::LLVMFuncOp>(loc, name, fnType);
 }
 
+namespace lowering {
+
+namespace attrs {
+
+inline mlir::SmallVector<int64_t> i64Array(mlir::Operation *op,
+                                           llvm::StringRef attrName) {
+  mlir::SmallVector<int64_t> values;
+  if (!op)
+    return values;
+  mlir::Attribute attr = op->getAttr(attrName);
+  if (!attr)
+    return values;
+
+  if (auto dense = mlir::dyn_cast<mlir::DenseI64ArrayAttr>(attr)) {
+    values.append(dense.asArrayRef().begin(), dense.asArrayRef().end());
+    return values;
+  }
+  if (auto array = mlir::dyn_cast<mlir::ArrayAttr>(attr)) {
+    for (mlir::Attribute element : array)
+      if (auto integer = mlir::dyn_cast<mlir::IntegerAttr>(element))
+        values.push_back(integer.getInt());
+    return values;
+  }
+  if (auto integer = mlir::dyn_cast<mlir::IntegerAttr>(attr))
+    values.push_back(integer.getInt());
+  return values;
+}
+
+} // namespace attrs
+
+inline mlir::LogicalResult verifyNoUnrealizedCasts(mlir::ModuleOp module,
+                                                   llvm::StringRef boundary) {
+  mlir::UnrealizedConversionCastOp offender = nullptr;
+  module.walk([&](mlir::UnrealizedConversionCastOp cast) {
+    for (mlir::Operation *user : cast.getResult(0).getUsers())
+      if (mlir::isa<mlir::UnrealizedConversionCastOp>(user))
+        return mlir::WalkResult::advance();
+    offender = cast;
+    return mlir::WalkResult::interrupt();
+  });
+  if (!offender)
+    module.walk([&](mlir::UnrealizedConversionCastOp cast) {
+      offender = cast;
+      return mlir::WalkResult::interrupt();
+    });
+  if (!offender)
+    return mlir::success();
+
+  auto diag = offender.emitError()
+              << "unrealized conversion cast reached " << boundary
+              << "; operands = " << offender.getOperandTypes()
+              << ", results = " << offender.getResultTypes()
+              << ", op = " << *offender.getOperation();
+  if (auto parentFunc = offender->getParentOfType<mlir::func::FuncOp>())
+    diag << ", parent func = " << parentFunc.getName();
+  if (auto parentLLVMFunc = offender->getParentOfType<mlir::LLVM::LLVMFuncOp>())
+    diag << ", parent llvm func = " << parentLLVMFunc.getName();
+  diag << ", operand defs = [";
+  for (auto [index, operand] : llvm::enumerate(offender.getOperands())) {
+    if (index != 0)
+      diag << ", ";
+    if (mlir::Operation *def = operand.getDefiningOp())
+      diag << *def;
+    else
+      diag << "<block argument>";
+  }
+  diag << "]";
+  diag << ", users = [";
+  bool first = true;
+  for (mlir::Operation *user : offender.getResult(0).getUsers()) {
+    if (!first)
+      diag << ", ";
+    first = false;
+    diag << *user;
+  }
+  diag << "]";
+  return mlir::failure();
+}
+
+} // namespace lowering
+
 inline bool isEntryBorrowedValue(mlir::Value value) {
   while (true) {
     if (auto cast = value.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
@@ -48,6 +131,10 @@ inline bool isEntryBorrowedValue(mlir::Value value) {
         value = cast.getOperand(0);
         continue;
       }
+      if (cast->getNumOperands() > 1)
+        return llvm::all_of(cast.getOperands(), [](mlir::Value operand) {
+          return isEntryBorrowedValue(operand);
+        });
     }
     if (auto ptrToInt = value.getDefiningOp<mlir::LLVM::PtrToIntOp>()) {
       value = ptrToInt.getArg();
@@ -65,10 +152,15 @@ inline bool isEntryBorrowedValue(mlir::Value value) {
       value = gep.getBase();
       continue;
     }
+    if (auto insert = value.getDefiningOp<mlir::LLVM::InsertValueOp>())
+      return isEntryBorrowedValue(insert.getValue()) &&
+             isEntryBorrowedValue(insert.getContainer());
     if (auto extract = value.getDefiningOp<mlir::LLVM::ExtractValueOp>()) {
       value = extract.getContainer();
       continue;
     }
+    if (value.getDefiningOp<mlir::LLVM::UndefOp>())
+      return true;
     break;
   }
   auto arg = mlir::dyn_cast<mlir::BlockArgument>(value);
@@ -88,20 +180,22 @@ enum class SlotPolicy {
   NativeInteger,
   NativeBool,
   NativeFloat,
-  PointerBits,
 };
 
 struct Slot {
   static SlotPolicy policy(mlir::Type type) {
+    if (mlir::isa<mlir::IntegerType>(type))
+      return SlotPolicy::NativeInteger;
+    if (mlir::isa<mlir::FloatType>(type))
+      return SlotPolicy::NativeFloat;
     if (mlir::isa<IntType>(type))
       return SlotPolicy::NativeInteger;
     if (mlir::isa<BoolType>(type))
       return SlotPolicy::NativeBool;
     if (mlir::isa<FloatType>(type))
       return SlotPolicy::NativeFloat;
-    if (mlir::isa<NoneType, StrType, ObjectType, ClassType, ExceptionType,
-                  TracebackType, LocationType>(type))
-      return SlotPolicy::PointerBits;
+    if (mlir::isa<NoneType>(type))
+      return SlotPolicy::NativeBool;
     return SlotPolicy::Unsupported;
   }
 
@@ -114,7 +208,6 @@ struct Slot {
     case SlotPolicy::NativeInteger:
     case SlotPolicy::NativeBool:
     case SlotPolicy::NativeFloat:
-    case SlotPolicy::PointerBits:
       return true;
     case SlotPolicy::Unsupported:
       return false;
@@ -124,6 +217,13 @@ struct Slot {
 
   static mlir::Type storageType(mlir::Type logicalType,
                                 mlir::MLIRContext *ctx) {
+    if (auto intType = mlir::dyn_cast<mlir::IntegerType>(logicalType)) {
+      if (intType.getWidth() == 1)
+        return mlir::IntegerType::get(ctx, 8);
+      return logicalType;
+    }
+    if (mlir::isa<mlir::FloatType>(logicalType))
+      return logicalType;
     switch (policy(logicalType)) {
     case SlotPolicy::NativeInteger:
       return mlir::IntegerType::get(ctx, 64);
@@ -131,8 +231,6 @@ struct Slot {
       return mlir::IntegerType::get(ctx, 8);
     case SlotPolicy::NativeFloat:
       return mlir::Float64Type::get(ctx);
-    case SlotPolicy::PointerBits:
-      return mlir::IntegerType::get(ctx, 64);
     case SlotPolicy::Unsupported:
       return {};
     }
@@ -145,6 +243,10 @@ struct Slot {
 inline mlir::MemRefType getListHeaderMemRefType(mlir::MLIRContext *ctx) {
   return mlir::MemRefType::get({kListHeaderSize},
                                mlir::IntegerType::get(ctx, 64));
+}
+
+inline mlir::MemRefType getContainerLockMemRefType(mlir::MLIRContext *ctx) {
+  return mlir::MemRefType::get({1}, mlir::IntegerType::get(ctx, 32));
 }
 
 inline mlir::MemRefType getListItemsMemRefType(mlir::Type elementType,
@@ -164,23 +266,26 @@ inline mlir::Type getTupleItemsStorageType(TupleType tupleType,
                                            mlir::MLIRContext *ctx) {
   auto elementTypes = tupleType.getElementTypes();
   if (elementTypes.empty())
-    return mlir::IntegerType::get(ctx, 64);
+    return mlir::IntegerType::get(ctx, 8);
   mlir::Type firstStorage =
       container::Slot::storageType(elementTypes.front(), ctx);
   if (!firstStorage)
-    return mlir::IntegerType::get(ctx, 64);
+    return {};
   for (mlir::Type elementType : elementTypes.drop_front()) {
     mlir::Type storage = container::Slot::storageType(elementType, ctx);
-    if (storage != firstStorage)
-      return mlir::IntegerType::get(ctx, 64);
+    if (!storage || storage != firstStorage)
+      return {};
   }
   return firstStorage;
 }
 
 inline mlir::MemRefType getTupleItemsMemRefType(TupleType tupleType,
                                                 mlir::MLIRContext *ctx) {
-  return mlir::MemRefType::get({mlir::ShapedType::kDynamic},
-                               getTupleItemsStorageType(tupleType, ctx));
+  mlir::Type storageType = getTupleItemsStorageType(tupleType, ctx);
+  if (!storageType)
+    return {};
+  return mlir::MemRefType::get(
+      {static_cast<int64_t>(tupleType.getElementTypes().size())}, storageType);
 }
 
 inline mlir::MemRefType getDictHeaderMemRefType(mlir::MLIRContext *ctx) {
@@ -212,7 +317,7 @@ inline mlir::MemRefType getDictStatesMemRefType(mlir::MLIRContext *ctx) {
 }
 
 inline bool isMemRefSlotCompatibleScalarType(mlir::Type type) {
-  return container::Slot::supported(type);
+  return container::Slot::supported(type) || mlir::isa<ClassType>(type);
 }
 
 inline bool isCompilerOwnedMemRefListType(mlir::Type type) {

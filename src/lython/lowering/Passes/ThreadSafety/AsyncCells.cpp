@@ -70,17 +70,25 @@ verifier::memref::Alloca::verify(mlir::memref::AllocaOp alloca) {
 
 bool provenance::asyncExceptionCell(mlir::Value value) {
   while (true) {
+    if (mlir::isa<mlir::BlockArgument>(value))
+      return function_arg::hasAttr(value, AsyncSafetyAttrs::kExceptionCell);
+    if (mlir::Operation *def = value.getDefiningOp())
+      if (def->hasAttr(AsyncSafetyAttrs::kExceptionCell))
+        return true;
     if (auto bitcast = value.getDefiningOp<mlir::LLVM::BitcastOp>()) {
       value = bitcast.getArg();
       continue;
     }
+    if (auto extract = value.getDefiningOp<mlir::LLVM::ExtractValueOp>()) {
+      value = extract.getContainer();
+      continue;
+    }
+    if (auto gep = value.getDefiningOp<mlir::LLVM::GEPOp>()) {
+      value = gep.getBase();
+      continue;
+    }
     break;
   }
-
-  if (mlir::isa<mlir::BlockArgument>(value))
-    return function_arg::hasAttr(value, AsyncSafetyAttrs::kExceptionCell);
-  if (mlir::Operation *def = value.getDefiningOp())
-    return def->hasAttr(AsyncSafetyAttrs::kExceptionCell);
   return false;
 }
 
@@ -132,6 +140,18 @@ static void collect(mlir::Value value,
       collect(bitcast.getResult(), seen, users);
       continue;
     }
+    if (auto extract = mlir::dyn_cast<mlir::LLVM::ExtractValueOp>(user)) {
+      collect(extract.getResult(), seen, users);
+      continue;
+    }
+    if (auto gep = mlir::dyn_cast<mlir::LLVM::GEPOp>(user)) {
+      collect(gep.getResult(), seen, users);
+      continue;
+    }
+    if (auto insert = mlir::dyn_cast<mlir::LLVM::InsertValueOp>(user)) {
+      collect(insert.getResult(), seen, users);
+      continue;
+    }
     users.push_back(user);
   }
 }
@@ -141,11 +161,18 @@ static void collect(mlir::Value value,
 namespace init {
 
 static bool store(mlir::Value cell, mlir::Operation *user) {
+  if (auto store = mlir::dyn_cast<mlir::memref::StoreOp>(user)) {
+    if (store.getMemref() != cell || store.getIndices().size() != 1)
+      return false;
+    auto index = constant::index(store.getIndices().front());
+    return index && *index == 0 && constant::memrefInt(store.getValue(), 0);
+  }
   auto store = mlir::dyn_cast<mlir::LLVM::StoreOp>(user);
   if (!store)
     return false;
   return pointer::stripCasts(store.getAddr()) == pointer::stripCasts(cell) &&
-         constant::llvmNullPtr(store.getValue()) &&
+         (constant::llvmNullPtr(store.getValue()) ||
+          constant::llvmInt(store.getValue(), 0)) &&
          store.getOrdering() == mlir::LLVM::AtomicOrdering::not_atomic;
 }
 
@@ -181,6 +208,135 @@ static mlir::LogicalResult verify(mlir::Value cell,
 }
 
 } // namespace init
+
+namespace lifetime {
+
+static mlir::Value root(mlir::Value value) {
+  while (value) {
+    value = pointer::stripCasts(value);
+    if (auto extract = value.getDefiningOp<mlir::LLVM::ExtractValueOp>()) {
+      value = extract.getContainer();
+      continue;
+    }
+    if (auto gep = value.getDefiningOp<mlir::LLVM::GEPOp>()) {
+      value = gep.getBase();
+      continue;
+    }
+    break;
+  }
+  return pointer::stripCasts(value);
+}
+
+static bool sameCell(mlir::Value cell, mlir::Value value) {
+  return root(cell) == root(value);
+}
+
+static bool free(mlir::Value cell, mlir::Operation *user) {
+  if (auto dealloc = mlir::dyn_cast<mlir::memref::DeallocOp>(user))
+    return sameCell(cell, dealloc.getMemref());
+
+  auto call = mlir::dyn_cast<mlir::LLVM::CallOp>(user);
+  if (!call || !call->hasAttr(AsyncSafetyAttrs::kExceptionCellFree) ||
+      call->getNumOperands() == 0)
+    return false;
+  return sameCell(cell, call->getOperand(0));
+}
+
+static bool mayUseAfterFree(mlir::Operation *freeOp, mlir::Operation *user) {
+  if (user == freeOp)
+    return false;
+  if (auto call = mlir::dyn_cast<mlir::LLVM::CallOp>(user))
+    if (call->hasAttr(AsyncSafetyAttrs::kExceptionCellFree))
+      return false;
+  return true;
+}
+
+static mlir::Operation *exitWithoutFree(mlir::Value cell,
+                                        mlir::Operation *owner) {
+  if (!owner || !owner->getBlock())
+    return owner;
+  bool presplitCoroutine = hasPresplitCoroutinePassthrough(scope::local(owner));
+
+  llvm::SmallVector<std::pair<mlir::Block *, mlir::Operation *>, 16> worklist;
+  llvm::SmallPtrSet<mlir::Operation *, 32> seenStarts;
+  auto enqueue = [&](mlir::Block *block, mlir::Operation *start) {
+    if (!block)
+      return;
+    if (!start)
+      start = block->getTerminator();
+    if (!start || start->getBlock() != block)
+      return;
+    if (!seenStarts.insert(start).second)
+      return;
+    worklist.push_back({block, start});
+  };
+
+  enqueue(owner->getBlock(), owner->getNextNode());
+
+  while (!worklist.empty()) {
+    auto [block, start] = worklist.pop_back_val();
+    for (mlir::Operation *op = start; op; op = op->getNextNode()) {
+      if (free(cell, op))
+        break;
+
+      if (op != block->getTerminator())
+        continue;
+
+      if (op->getNumSuccessors() == 0) {
+        if (control::noReturn(op))
+          break;
+        return op;
+      }
+
+      for (mlir::Block *successor : op->getSuccessors()) {
+        if (presplitCoroutine) {
+          auto switchOp = mlir::dyn_cast<mlir::LLVM::SwitchOp>(op);
+          if (switchOp && successor == switchOp.getDefaultDestination() &&
+              isCoroSuspendStatus(switchOp.getValue()))
+            continue;
+        }
+        enqueue(successor, &successor->front());
+      }
+      break;
+    }
+  }
+
+  return nullptr;
+}
+
+static mlir::LogicalResult verify(mlir::Value cell,
+                                  mlir::DominanceInfo &dominance,
+                                  mlir::Operation *owner) {
+  mlir::SmallVector<mlir::Operation *> users;
+  ::llvm::SmallPtrSet<mlir::Value, 8> seen;
+  users::collect(cell, seen, users);
+
+  mlir::SmallVector<mlir::Operation *> frees;
+  for (mlir::Operation *user : users)
+    if (free(cell, user))
+      frees.push_back(user);
+
+  if (frees.empty())
+    return owner->emitOpError("async exception cell allocation has no matching "
+                              "free on any ownership path");
+
+  if (mlir::Operation *exit = exitWithoutFree(cell, owner))
+    return exit->emitOpError("async exception cell can reach a function exit "
+                             "without a matching free");
+
+  for (mlir::Operation *freeOp : frees) {
+    for (mlir::Operation *user : users) {
+      if (!mayUseAfterFree(freeOp, user))
+        continue;
+      if (dominance.properlyDominates(freeOp, user))
+        return user->emitOpError(
+            "async exception cell is used after a dominating free");
+    }
+  }
+  return mlir::success();
+}
+
+} // namespace lifetime
 
 } // namespace exception_cell
 
@@ -241,6 +397,19 @@ verifier::async_runtime::Cells::verify(mlir::Operation *funcLike) {
       return;
     if (mlir::failed(exception_cell::init::verify(call.getResult(), dominance,
                                                   call.getOperation())))
+      failedAny = true;
+    if (mlir::failed(exception_cell::lifetime::verify(
+            call.getResult(), dominance, call.getOperation())))
+      failedAny = true;
+  });
+  funcLike->walk([&](mlir::memref::AllocOp alloc) {
+    if (!alloc->hasAttr(AsyncSafetyAttrs::kExceptionCell))
+      return;
+    if (mlir::failed(exception_cell::init::verify(alloc.getResult(), dominance,
+                                                  alloc.getOperation())))
+      failedAny = true;
+    if (mlir::failed(exception_cell::lifetime::verify(
+            alloc.getResult(), dominance, alloc.getOperation())))
       failedAny = true;
   });
 

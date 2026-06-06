@@ -30,28 +30,17 @@ class ValueMaterializationMixin(VisitorRuntime):
     def ensure_object(
         self, value: ir.Value, *, loc: ir.Location | None = None
     ) -> ir.Value:
-        object_type = self.get_py_type("!py.object")
-        if value.type == object_type:
-            return value
-        if str(value.type).startswith('!py.class<"'):
-            raise TypeError("Static class instances cannot be converted to !py.object")
-        if not self.is_py_type(value.type):
-            raise TypeError(
-                f"Cannot convert primitive value {value.type} to !py.object"
-            )
-        location = loc or ir.Location.unknown(self.ctx)
-        with location, self.insertion_point():
-            return py_ops.UpcastOp(object_type, value).result
+        del value, loc
+        raise TypeError(
+            "Generic object materialization is not supported; keep values "
+            "statically typed"
+        )
 
     def coerce_value_to_type(
         self, value: ir.Value, expected_type: ir.Type, loc: ir.Location
     ) -> ir.Value:
         if value.type == expected_type:
             return value
-
-        object_type = self.get_py_type("!py.object")
-        if expected_type == object_type:
-            return self.ensure_object(value, loc=loc)
 
         raise TypeError(f"Cannot coerce {value.type} to {expected_type} at {loc}")
 

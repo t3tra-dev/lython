@@ -14,6 +14,17 @@ else:
 
 
 class ExprCallMixin(VisitorRuntime):
+    def _materialize_builtin_print_arg(
+        self, value: ir.Value, loc: ir.Location
+    ) -> ir.Value:
+        str_type = self.get_py_type("!py.str")
+        if value.type == str_type:
+            return value
+        if not self.is_py_type(value.type):
+            raise TypeError(f"print() argument must be a !py.* value, got {value.type}")
+        with loc, self.insertion_point():
+            return py_ops.ReprOp(str_type, value).result
+
     def visit_Call(self, node: ast.Call) -> ir.Value | None:
         """
         関数呼び出しを処理する。
@@ -170,10 +181,17 @@ class ExprCallMixin(VisitorRuntime):
                     raise NotImplementedError(
                         "Keyword arguments for variadic functions are not supported yet"
                     )
-                object_args = [
-                    self.ensure_object(value, loc=loc) for value in arg_values
-                ]
-                posargs = self.build_tuple(object_args, loc=loc)
+                if func_info.symbol == "__builtin_print":
+                    print_args = [
+                        self._materialize_builtin_print_arg(value, loc)
+                        for value in arg_values
+                    ]
+                    posargs = self.build_tuple(print_args, loc=loc)
+                else:
+                    raise NotImplementedError(
+                        "Variadic calls that require generic object packing are not supported; "
+                        "lower the callable with a statically typed vararg tuple"
+                    )
                 empty_tuple_type = self.get_py_type("!py.tuple<>")
                 kwnames = py_ops.TupleEmptyOp(empty_tuple_type).result
                 kwvalues = py_ops.TupleEmptyOp(empty_tuple_type).result
