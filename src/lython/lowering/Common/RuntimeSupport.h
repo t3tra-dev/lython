@@ -39,6 +39,11 @@ struct RuntimeSymbols {
       "LyTraceback_PrintMessage"};
   static constexpr llvm::StringLiteral kLongFromI64{"LyLong_FromI64"};
   static constexpr llvm::StringLiteral kLongAsI64{"LyLong_AsI64"};
+  static constexpr llvm::StringLiteral kLongAdd{"LyLong_Add"};
+  static constexpr llvm::StringLiteral kLongSub{"LyLong_Sub"};
+  static constexpr llvm::StringLiteral kLongMul{"LyLong_Mul"};
+  static constexpr llvm::StringLiteral kLongCompare{"LyLong_Compare"};
+  static constexpr llvm::StringLiteral kLongRepr{"LyLong_Repr"};
   static constexpr llvm::StringLiteral kLongDecRef{"LyLong_DecRef"};
   static constexpr llvm::StringLiteral kUnicodeFromBytes{"LyUnicode_FromBytes"};
   static constexpr llvm::StringLiteral kUnicodeAlloc{"__ly_unicode_alloc"};

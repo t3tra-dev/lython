@@ -429,10 +429,14 @@ emitLongPartsLiteral(mlir::Location loc, const LongLiteralDigits &literal,
   auto *ctx = rewriter.getContext();
   auto i64Type = rewriter.getI64Type();
   auto i32Type = rewriter.getI32Type();
-  auto i8Type = rewriter.getI8Type();
   mlir::MemRefType headerType = object_abi::Header::owned(ctx);
   mlir::MemRefType metaType = object_abi::long_abi::Meta::storage(ctx);
-  mlir::MemRefType digitsType = object_abi::long_abi::Digits::storage(ctx);
+  mlir::MemRefType dynamicDigitsType =
+      object_abi::long_abi::Digits::storage(ctx);
+  int64_t digitSlots =
+      std::max<int64_t>(1, static_cast<int64_t>(literal.digits.size()));
+  mlir::MemRefType digitsType =
+      mlir::MemRefType::get({digitSlots}, rewriter.getI32Type());
 
   auto ensureGlobal = [&](llvm::StringRef suffix, mlir::MemRefType type,
                           mlir::DenseElementsAttr initial) {
@@ -454,32 +458,30 @@ emitLongPartsLiteral(mlir::Location loc, const LongLiteralDigits &literal,
       headerValues);
   std::string headerSymbol = ensureGlobal("_header", headerType, headerAttr);
 
-  auto i8Attr = [](int64_t value) {
-    return llvm::APInt(8, static_cast<uint64_t>(value), /*isSigned=*/true);
+  auto i64Attr = [](int64_t value) {
+    return llvm::APInt(64, static_cast<uint64_t>(value), /*isSigned=*/true);
   };
   llvm::SmallVector<llvm::APInt, 2> metaValues(
-      static_cast<size_t>(object_abi::long_abi::kMetaSlots), i8Attr(0));
-  metaValues[object_abi::long_abi::kSignSlot] = i8Attr(literal.sign);
+      static_cast<size_t>(object_abi::long_abi::kMetaSlots), i64Attr(0));
+  metaValues[object_abi::long_abi::kSignSlot] = i64Attr(literal.sign);
   metaValues[object_abi::long_abi::kDigitCountSlot] =
-      i8Attr(static_cast<int64_t>(literal.digits.size()));
+      i64Attr(static_cast<int64_t>(literal.digits.size()));
   auto metaAttr = mlir::DenseIntElementsAttr::get(
-      mlir::RankedTensorType::get({object_abi::long_abi::kMetaSlots}, i8Type),
+      mlir::RankedTensorType::get({object_abi::long_abi::kMetaSlots}, i64Type),
       metaValues);
   std::string metaSymbol = ensureGlobal("_meta", metaType, metaAttr);
 
   auto i32Attr = [](int64_t value) {
     return llvm::APInt(32, static_cast<uint64_t>(value), /*isSigned=*/true);
   };
-  llvm::SmallVector<llvm::APInt, 3> digitValues(
-      static_cast<size_t>(object_abi::long_abi::kDigitsSlots), i32Attr(0));
+  llvm::SmallVector<llvm::APInt, 3> digitValues(static_cast<size_t>(digitSlots),
+                                                i32Attr(0));
   for (auto [index, digit] : llvm::enumerate(literal.digits)) {
     digitValues[object_abi::long_abi::kDigitsBaseSlot + index] =
         i32Attr(digit & object_abi::long_abi::kDigitMask);
   }
   auto digitsAttr = mlir::DenseIntElementsAttr::get(
-      mlir::RankedTensorType::get({object_abi::long_abi::kDigitsSlots},
-                                  i32Type),
-      digitValues);
+      mlir::RankedTensorType::get({digitSlots}, i32Type), digitValues);
   std::string digitsSymbol = ensureGlobal("_digits", digitsType, digitsAttr);
 
   mlir::Value header =
@@ -488,6 +490,10 @@ emitLongPartsLiteral(mlir::Location loc, const LongLiteralDigits &literal,
       rewriter.create<mlir::memref::GetGlobalOp>(loc, metaType, metaSymbol);
   mlir::Value digits =
       rewriter.create<mlir::memref::GetGlobalOp>(loc, digitsType, digitsSymbol);
+  if (digits.getType() != dynamicDigitsType) {
+    digits =
+        rewriter.create<mlir::memref::CastOp>(loc, dynamicDigitsType, digits);
+  }
   for (mlir::Value value : {header, meta, digits})
     if (mlir::Operation *def = value.getDefiningOp())
       def->setAttr(OwnershipContractAttrs::kImmortalObject,
@@ -654,6 +660,21 @@ replaceWithLongFromI64(mlir::Operation *op, mlir::Value value,
   return mlir::failure();
 }
 
+static mlir::LogicalResult replaceWithLongBinaryCall(
+    mlir::Operation *op, mlir::ValueRange lhsRange, mlir::ValueRange rhsRange,
+    llvm::ArrayRef<mlir::Type> resultTypes, llvm::StringRef callee,
+    RuntimeAPI &runtime, mlir::ConversionPatternRewriter &rewriter) {
+  if (!isLongPartsTypes(resultTypes) || lhsRange.size() != 3 ||
+      rhsRange.size() != 3)
+    return mlir::failure();
+  llvm::SmallVector<mlir::Value, 6> operands;
+  operands.append(lhsRange.begin(), lhsRange.end());
+  operands.append(rhsRange.begin(), rhsRange.end());
+  auto call = runtime.call(op->getLoc(), callee, mlir::TypeRange(resultTypes),
+                           operands);
+  return replaceWithPartsCall(op, call, rewriter);
+}
+
 enum class IntBinaryKind {
   FloorDiv,
   Mod,
@@ -738,12 +759,18 @@ static mlir::Value lowerIntCompare(mlir::Location loc, mlir::ValueRange lhs,
                                    mlir::Type resultType,
                                    mlir::PatternRewriter &rewriter,
                                    RuntimeAPI &runtime) {
-  mlir::Value lhsValue = longAsI64(loc, lhs, rewriter, runtime);
-  mlir::Value rhsValue = longAsI64(loc, rhs, rewriter, runtime);
-  if (!lhsValue || !rhsValue)
+  if (lhs.size() != 3 || rhs.size() != 3)
     return {};
-  mlir::Value bit = rewriter.create<mlir::arith::CmpIOp>(loc, arithPredicate,
-                                                         lhsValue, rhsValue);
+  llvm::SmallVector<mlir::Value, 6> operands;
+  operands.append(lhs.begin(), lhs.end());
+  operands.append(rhs.begin(), rhs.end());
+  mlir::Value cmp = runtime
+                        .call(loc, RuntimeSymbols::kLongCompare,
+                              rewriter.getI64Type(), operands)
+                        .getResult();
+  mlir::Value zero = rewriter.create<mlir::arith::ConstantIntOp>(loc, 0, 64);
+  mlir::Value bit =
+      rewriter.create<mlir::arith::CmpIOp>(loc, arithPredicate, cmp, zero);
   return boxBool(loc, bit, resultType, runtime);
 }
 
@@ -881,9 +908,6 @@ struct IntConstantLowering : public mlir::OpConversionPattern<IntConstantOp> {
       if (!literal)
         return rewriter.notifyMatchFailure(op,
                                            "unsupported integer literal text");
-      if (literal->digits.size() >
-          static_cast<size_t>(object_abi::long_abi::kInlineDigits))
-        return op.emitOpError("integer literal exceeds compact LyLong ABI");
       llvm::SmallVector<mlir::Value, 3> values =
           emitLongPartsLiteral(op.getLoc(), *literal, module, rewriter);
       rewriter.replaceOpWithMultiple(
@@ -954,16 +978,11 @@ struct AddLowering : public mlir::OpConversionPattern<AddOp> {
 
     if (isPyIntType(op.getLhs().getType()) &&
         isPyIntType(op.getRhs().getType())) {
-      mlir::Value lhs =
-          longAsI64(op.getLoc(), adaptor.getLhs(), rewriter, runtime);
-      mlir::Value rhs =
-          longAsI64(op.getLoc(), adaptor.getRhs(), rewriter, runtime);
-      if (!lhs || !rhs)
-        return rewriter.notifyMatchFailure(
-            op, "int add requires memref object storage");
-      mlir::Value sum =
-          rewriter.create<mlir::arith::AddIOp>(op.getLoc(), lhs, rhs);
-      return replaceWithLongFromI64(op, sum, resultTypes, runtime, rewriter);
+      if (mlir::succeeded(replaceWithLongBinaryCall(
+              op, adaptor.getLhs(), adaptor.getRhs(), resultTypes,
+              RuntimeSymbols::kLongAdd, runtime, rewriter)))
+        return mlir::success();
+      return rewriter.notifyMatchFailure(op, "int add requires LyLong parts");
     }
 
     if (isPyFloatType(op.getLhs().getType()) &&
@@ -1056,16 +1075,11 @@ struct SubLowering : public mlir::OpConversionPattern<SubOp> {
 
     if (isPyIntType(op.getLhs().getType()) &&
         isPyIntType(op.getRhs().getType())) {
-      mlir::Value lhs =
-          longAsI64(op.getLoc(), adaptor.getLhs(), rewriter, runtime);
-      mlir::Value rhs =
-          longAsI64(op.getLoc(), adaptor.getRhs(), rewriter, runtime);
-      if (!lhs || !rhs)
-        return rewriter.notifyMatchFailure(
-            op, "int sub requires memref object storage");
-      mlir::Value diff =
-          rewriter.create<mlir::arith::SubIOp>(op.getLoc(), lhs, rhs);
-      return replaceWithLongFromI64(op, diff, resultTypes, runtime, rewriter);
+      if (mlir::succeeded(replaceWithLongBinaryCall(
+              op, adaptor.getLhs(), adaptor.getRhs(), resultTypes,
+              RuntimeSymbols::kLongSub, runtime, rewriter)))
+        return mlir::success();
+      return rewriter.notifyMatchFailure(op, "int sub requires LyLong parts");
     }
 
     if (isPyFloatType(op.getLhs().getType()) &&
@@ -1107,17 +1121,11 @@ struct MulLowering : public mlir::OpConversionPattern<MulOp> {
 
     if (isPyIntType(op.getLhs().getType()) &&
         isPyIntType(op.getRhs().getType())) {
-      mlir::Value lhs =
-          longAsI64(op.getLoc(), adaptor.getLhs(), rewriter, runtime);
-      mlir::Value rhs =
-          longAsI64(op.getLoc(), adaptor.getRhs(), rewriter, runtime);
-      if (!lhs || !rhs)
-        return rewriter.notifyMatchFailure(
-            op, "int mul requires memref object storage");
-      mlir::Value product =
-          rewriter.create<mlir::arith::MulIOp>(op.getLoc(), lhs, rhs);
-      return replaceWithLongFromI64(op, product, resultTypes, runtime,
-                                    rewriter);
+      if (mlir::succeeded(replaceWithLongBinaryCall(
+              op, adaptor.getLhs(), adaptor.getRhs(), resultTypes,
+              RuntimeSymbols::kLongMul, runtime, rewriter)))
+        return mlir::success();
+      return rewriter.notifyMatchFailure(op, "int mul requires LyLong parts");
     }
 
     if (isPyFloatType(op.getLhs().getType()) &&
@@ -1690,12 +1698,8 @@ struct ReprLowering : public mlir::OpConversionPattern<ReprOp> {
         return mlir::success();
       }
       if (partsResult && input.size() == 3) {
-        mlir::Value asI64 = longAsI64(op.getLoc(), input, rewriter, runtime);
-        if (!asI64)
-          return mlir::failure();
-        auto call =
-            runtime.call(op.getLoc(), RuntimeSymbols::kUnicodeFromI64,
-                         mlir::TypeRange(resultTypes), mlir::ValueRange{asI64});
+        auto call = runtime.call(op.getLoc(), RuntimeSymbols::kLongRepr,
+                                 mlir::TypeRange(resultTypes), input);
         return replaceWithPartsCall(op, call, rewriter);
       }
       return rewriter.notifyMatchFailure(

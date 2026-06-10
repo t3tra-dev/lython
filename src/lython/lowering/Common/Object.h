@@ -172,17 +172,15 @@ static constexpr int64_t kDigitCountSlot = 1;
 static constexpr int64_t kMetaSlots = 2;
 static constexpr int64_t kDigitsBaseSlot = 0;
 static constexpr int64_t kInlineDigits = 3;
-static constexpr int64_t kDigitsSlots = kDigitsBaseSlot + kInlineDigits;
-static constexpr int64_t kPayloadSlots = kMetaSlots + kDigitsSlots;
 static constexpr int64_t kDigitBits = 30;
 static constexpr int64_t kDigitMask = (1LL << kDigitBits) - 1;
 
-// Compact LyLong separates narrow metadata from arithmetic digits.  sign and
-// digit_count fit in i8, while 30-bit digits stay i32 to avoid byte packing on
-// arithmetic hot paths.
+// LyLong follows CPython's PyLong shape: signed size metadata plus base-2^30
+// digits.  The digit buffer is dynamic so overflow moves smoothly into the
+// bigint path instead of falling off a fixed compact representation.
 struct Meta {
   static mlir::MemRefType storage(mlir::MLIRContext *ctx) {
-    return mlir::MemRefType::get({kMetaSlots}, mlir::IntegerType::get(ctx, 8));
+    return mlir::MemRefType::get({kMetaSlots}, mlir::IntegerType::get(ctx, 64));
   }
 
   static bool isStorage(mlir::Type type) {
@@ -192,7 +190,7 @@ struct Meta {
 
 struct Digits {
   static mlir::MemRefType storage(mlir::MLIRContext *ctx) {
-    return mlir::MemRefType::get({kDigitsSlots},
+    return mlir::MemRefType::get({mlir::ShapedType::kDynamic},
                                  mlir::IntegerType::get(ctx, 32));
   }
 

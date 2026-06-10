@@ -165,6 +165,12 @@ void dce(mlir::ModuleOp module);
 
 } // namespace scalar
 
+namespace int_fastpath {
+
+void specialize(mlir::ModuleOp module);
+
+} // namespace int_fastpath
+
 namespace refcount {
 
 void sinkClassDecrefs(mlir::ModuleOp module);

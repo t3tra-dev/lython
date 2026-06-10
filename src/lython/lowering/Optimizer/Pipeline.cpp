@@ -23,6 +23,7 @@ struct PublicationPreparationPass
   void runOnOperation() override {
     mlir::ModuleOp module = getOperation();
     optimizer::call::staticDefaults(module);
+    optimizer::int_fastpath::specialize(module);
     optimizer::publication::prepare(module);
   }
 };

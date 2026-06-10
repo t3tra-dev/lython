@@ -34,6 +34,7 @@ add_library(LythonRuntimeLowering STATIC
     Optimizer/Scalar.cpp
     Optimizer/RefCount.cpp
     Optimizer/ZeroCost.cpp
+    Optimizer/IntFastPath.cpp
     Optimizer/Orchestration.cpp
     Optimizer/Pipeline.cpp
     PyValue/base.cpp
