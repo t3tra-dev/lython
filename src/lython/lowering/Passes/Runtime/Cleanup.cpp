@@ -37,10 +37,11 @@ bool eraseUnreachableBlocksInRegion(mlir::Region &region) {
     if (!reachable.insert(block).second)
       continue;
     mlir::Operation *terminator = block->getTerminator();
-    if (!terminator)
+    auto branch = mlir::dyn_cast_or_null<mlir::BranchOpInterface>(terminator);
+    if (!branch)
       continue;
-    for (mlir::Block *successor : terminator->getSuccessors())
-      worklist.push_back(successor);
+    for (unsigned i = 0, e = branch->getNumSuccessors(); i != e; ++i)
+      worklist.push_back(branch->getSuccessor(i));
   }
 
   bool changed = false;
@@ -1338,9 +1339,12 @@ bool unreachableBlocks(mlir::ModuleOp module) {
   do {
     changed = false;
     llvm::SmallVector<mlir::Region *> regions;
-    module.walk([&](mlir::Operation *op) {
-      for (mlir::Region &region : op->getRegions())
-        regions.push_back(&region);
+    module.walk([&](mlir::func::FuncOp func) {
+      regions.push_back(&func.getBody());
+    });
+    module.walk([&](mlir::LLVM::LLVMFuncOp func) {
+      if (!func.isExternal())
+        regions.push_back(&func.getBody());
     });
     for (mlir::Region *region : regions)
       changed |= terminateEmptyFallthroughBlocksInRegion(*region);
