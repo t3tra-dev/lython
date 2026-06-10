@@ -720,10 +720,76 @@ static void setValueDefStringAttr(mlir::Value value, llvm::StringRef attrName,
   def->setAttr(attrName, builder.getStringAttr(attrValue));
 }
 
+static mlir::Value descriptorAttrSource(mlir::Value value) {
+  llvm::SmallPtrSet<mlir::Operation *, 8> seen;
+  while (value) {
+    if (auto publish = value.getDefiningOp<PublishOp>()) {
+      value = publish.getInput();
+      continue;
+    }
+
+    auto result = mlir::dyn_cast<mlir::OpResult>(value);
+    auto cast = result
+                    ? mlir::dyn_cast_or_null<mlir::UnrealizedConversionCastOp>(
+                          result.getOwner())
+                    : mlir::UnrealizedConversionCastOp();
+    if (!cast || !seen.insert(cast.getOperation()).second)
+      return value;
+
+    unsigned resultIndex = result.getResultNumber();
+    if (cast->getNumOperands() == cast->getNumResults() &&
+        resultIndex < cast->getNumOperands()) {
+      value = cast.getOperand(resultIndex);
+      continue;
+    }
+
+    if (cast->getNumOperands() == 1) {
+      mlir::Value source = cast.getOperand(0);
+      if (auto sourceCast =
+              source.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+        if (resultIndex < sourceCast->getNumOperands()) {
+          value = sourceCast.getOperand(resultIndex);
+          continue;
+        }
+      }
+      value = source;
+      continue;
+    }
+
+    return value;
+  }
+  return {};
+}
+
 static std::optional<llvm::StringRef>
 getValueDefStringAttr(mlir::Value value, llvm::StringRef attrName) {
   if (!value)
     return std::nullopt;
+  value = descriptorAttrSource(value);
+  if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(value)) {
+    mlir::Operation *parent =
+        arg.getOwner() ? arg.getOwner()->getParentOp() : nullptr;
+    auto function = mlir::dyn_cast_or_null<mlir::FunctionOpInterface>(parent);
+    if (function && arg.getArgNumber() < function.getNumArguments()) {
+      auto attr = mlir::dyn_cast_or_null<mlir::StringAttr>(
+          function.getArgAttr(arg.getArgNumber(), attrName));
+      if (attr)
+        return attr.getValue();
+    }
+
+    auto argAttrs = parent ? parent->getAttrOfType<mlir::ArrayAttr>("arg_attrs")
+                           : mlir::ArrayAttr();
+    if (!argAttrs || arg.getArgNumber() >= argAttrs.size())
+      return std::nullopt;
+    auto dict =
+        mlir::dyn_cast<mlir::DictionaryAttr>(argAttrs[arg.getArgNumber()]);
+    if (!dict)
+      return std::nullopt;
+    auto attr = mlir::dyn_cast_or_null<mlir::StringAttr>(dict.get(attrName));
+    if (!attr)
+      return std::nullopt;
+    return attr.getValue();
+  }
   mlir::Operation *def = value.getDefiningOp();
   if (!def)
     return std::nullopt;
@@ -2595,6 +2661,23 @@ mlir::LogicalResult preserveLoweredMemRefDeallocContracts(
                     mlir::UnitAttr::get(call.getContext()));
     call->removeAttr(kMemRefDeallocContractId);
   };
+  auto applyMemRefContract = [](mlir::memref::DeallocOp dealloc,
+                                const MemRefDeallocContract &contract) {
+    if (contract.group)
+      dealloc->setAttr(ContainerSafetyAttrs::kDeallocGroup, contract.group);
+    if (contract.component)
+      dealloc->setAttr(ContainerSafetyAttrs::kDeallocComponent,
+                       contract.component);
+    if (contract.classPart)
+      dealloc->setAttr(ClassSafetyAttrs::kDeallocPart, contract.classPart);
+    if (contract.objectPart)
+      dealloc->setAttr(OwnershipContractAttrs::kObjectDeallocPart,
+                       contract.objectPart);
+    if (contract.exceptionCellFree)
+      dealloc->setAttr(AsyncSafetyAttrs::kExceptionCellFree,
+                       mlir::UnitAttr::get(dealloc.getContext()));
+    dealloc->removeAttr(kMemRefDeallocContractId);
+  };
 
   ContractPreserver<MemRefDeallocContract> preserver(
       contracts, "memref dealloc safety contract was not preserved through "
@@ -2612,6 +2695,16 @@ mlir::LogicalResult preserveLoweredMemRefDeallocContracts(
         },
         [&](const MemRefDeallocContract &contract) {
           applyContract(call, contract);
+        });
+  });
+  module.walk([&](mlir::memref::DeallocOp dealloc) {
+    preserver.apply(
+        dealloc.getOperation(), kMemRefDeallocContractId,
+        "carries an unknown memref dealloc contract id",
+        [](const MemRefDeallocContract &) { return true; },
+        [](const MemRefDeallocContract &) { return mlir::success(); },
+        [&](const MemRefDeallocContract &contract) {
+          applyMemRefContract(dealloc, contract);
         });
   });
 
@@ -2925,6 +3018,8 @@ PyLLVMTypeConverter::getTupleItemsMemRefType(TupleType tupleType) const {
   mlir::Type storageType = getTupleItemsStorageType(tupleType);
   if (!storageType)
     return {};
+  if (tupleType.getElementTypes().size() == 1)
+    return mlir::MemRefType::get({mlir::ShapedType::kDynamic}, storageType);
   return mlir::MemRefType::get(
       {static_cast<int64_t>(tupleType.getElementTypes().size())}, storageType);
 }
@@ -3034,6 +3129,7 @@ static mlir::Value adaptRuntimeOperand(mlir::Location loc, mlir::Value operand,
 
   mlir::Value casted = rewriter.create<mlir::memref::CastOp>(loc, to, operand);
   if (object_abi::Header::isOwned(operand.getType()) ||
+      object_abi::exception_abi::Header::isOwned(operand.getType()) ||
       object_abi::Header::isView(expected))
     casted.getDefiningOp()->setAttr(OwnershipContractAttrs::kObjectHeader,
                                     rewriter.getUnitAttr());
@@ -3048,6 +3144,7 @@ declareFuncRuntimeFunc(mlir::Location loc, mlir::ModuleOp module,
   auto markObjectHeaderArgs = [&](mlir::func::FuncOp fn) {
     for (auto [index, type] : llvm::enumerate(argTypes)) {
       if (!object_abi::Header::isOwned(type) &&
+          !object_abi::exception_abi::Header::isOwned(type) &&
           !object_abi::Header::isView(type))
         continue;
       if (static_cast<unsigned>(index) >= fn.getNumArguments())
@@ -3077,7 +3174,9 @@ static void markRuntimeCallResults(mlir::Operation *call,
                                    mlir::OpBuilder &rewriter) {
   if (!call)
     return;
-  if (!resultTypes.empty() && object_abi::Header::isOwned(resultTypes.front()))
+  if (!resultTypes.empty() &&
+      (object_abi::Header::isOwned(resultTypes.front()) ||
+       object_abi::exception_abi::Header::isOwned(resultTypes.front())))
     call->setAttr(OwnershipContractAttrs::kObjectHeader,
                   rewriter.getUnitAttr());
 }

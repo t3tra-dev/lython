@@ -2,13 +2,6 @@
 
 # Lython - Python compiler toolchain based on LLVM
 
-> [!TIP]
-> Searching for **pyc**? You are in the right repo. **pyc** has been renamed to **Lython**.
-
-現在、Lython を完全にリライトする作業を行っています。旧実装は `legacy` ブランチを参照してください。
-
----
-
 ## セットアップ
 
 ### 必要なもの
@@ -17,23 +10,28 @@
 - CMake 3.20+
 - Ninja
 - C++17 対応コンパイラ
+- LLVM/MLIR 20 (`llvm@20` または `llvm-20-dev` / `libmlir-20-dev`)
 - uv (Python パッケージマネージャ)
-- nanobind, pybind11
 
 ### ビルド手順
 
 ```bash
-git clone --recurse-submodules https://github.com/t3tra-dev/lython.git
+git clone https://github.com/t3tra-dev/lython.git
 cd lython
 uv sync
 
-# LLVM/MLIR (初回のみ、時間がかかります)
-uv run cmake -B third_party/build -S third_party
-uv run cmake --build third_party/build
+# macOS:
+brew install llvm@20
+
+# Ubuntu:
+# wget https://apt.llvm.org/llvm.sh
+# chmod +x llvm.sh
+# sudo ./llvm.sh 20
+# sudo apt-get install -y clang-20 lld-20 llvm-20-dev libmlir-20-dev mlir-20-tools
 
 # Lython 本体
 uv run cmake -B build -S .
-uv run cmake --build build
+uv run cmake --build build -j$(nproc)
 ```
 
 ### 実行
@@ -48,4 +46,3 @@ uv run cmake --build build
 ## ライセンス
 
 本リポジトリのソースコードは、特記がない限り [MIT License](https://opensource.org/licenses/MIT) で配布されています。  
-詳細はソースコード内の記述 (`lython/__init__.py` など) をご参照ください。

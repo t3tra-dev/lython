@@ -49,6 +49,47 @@ static mlir::Value stripContainerAccessCasts(mlir::Value value) {
   }
 }
 
+static mlir::Value descriptorAttrSource(mlir::Value value) {
+  llvm::SmallPtrSet<mlir::Operation *, 8> seen;
+  while (value) {
+    if (auto publish = value.getDefiningOp<PublishOp>()) {
+      value = publish.getInput();
+      continue;
+    }
+
+    auto result = mlir::dyn_cast<mlir::OpResult>(value);
+    auto cast = result
+                    ? mlir::dyn_cast_or_null<mlir::UnrealizedConversionCastOp>(
+                          result.getOwner())
+                    : mlir::UnrealizedConversionCastOp();
+    if (!cast || !seen.insert(cast.getOperation()).second)
+      return value;
+
+    unsigned resultIndex = result.getResultNumber();
+    if (cast->getNumOperands() == cast->getNumResults() &&
+        resultIndex < cast->getNumOperands()) {
+      value = cast.getOperand(resultIndex);
+      continue;
+    }
+
+    if (cast->getNumOperands() == 1) {
+      mlir::Value source = cast.getOperand(0);
+      if (auto sourceCast =
+              source.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+        if (resultIndex < sourceCast->getNumOperands()) {
+          value = sourceCast.getOperand(resultIndex);
+          continue;
+        }
+      }
+      value = source;
+      continue;
+    }
+
+    return value;
+  }
+  return {};
+}
+
 static unsigned getLogicalArgWidth(mlir::Block &entry, unsigned argIndex) {
   mlir::Value arg = entry.getArgument(argIndex);
   unsigned remaining = entry.getNumArguments() - argIndex;
@@ -551,15 +592,28 @@ static void storeHeaderSlot(mlir::Location loc, mlir::Value header,
 
 static std::optional<llvm::StringRef>
 descriptorStringAttr(mlir::Value value, llvm::StringRef attrName) {
+  value = descriptorAttrSource(value);
   value = stripContainerAccessCasts(value);
   if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(value)) {
     mlir::Operation *parent =
         arg.getOwner() ? arg.getOwner()->getParentOp() : nullptr;
     auto function = mlir::dyn_cast_or_null<mlir::FunctionOpInterface>(parent);
-    if (!function || arg.getArgNumber() >= function.getNumArguments())
+    if (function && arg.getArgNumber() < function.getNumArguments()) {
+      auto attr = mlir::dyn_cast_or_null<mlir::StringAttr>(
+          function.getArgAttr(arg.getArgNumber(), attrName));
+      if (attr)
+        return attr.getValue();
+    }
+
+    auto argAttrs = parent ? parent->getAttrOfType<mlir::ArrayAttr>("arg_attrs")
+                           : mlir::ArrayAttr();
+    if (!argAttrs || arg.getArgNumber() >= argAttrs.size())
       return std::nullopt;
-    auto attr = mlir::dyn_cast_or_null<mlir::StringAttr>(
-        function.getArgAttr(arg.getArgNumber(), attrName));
+    auto dict =
+        mlir::dyn_cast<mlir::DictionaryAttr>(argAttrs[arg.getArgNumber()]);
+    if (!dict)
+      return std::nullopt;
+    auto attr = mlir::dyn_cast_or_null<mlir::StringAttr>(dict.get(attrName));
     if (!attr)
       return std::nullopt;
     return attr.getValue();
@@ -573,12 +627,15 @@ descriptorStringAttr(mlir::Value value, llvm::StringRef attrName) {
   return attr.getValue();
 }
 
-static void markLockAtomicResource(mlir::Operation *op, mlir::Value lock) {
+static void markLockAtomicResource(mlir::Operation *op, mlir::Value header,
+                                   mlir::Value lock) {
   if (!op || !lock)
     return;
+  mlir::Value source = header ? header : lock;
   auto group =
-      descriptorStringAttr(lock, ContainerSafetyAttrs::kDescriptorGroup);
-  auto kind = descriptorStringAttr(lock, ContainerSafetyAttrs::kDescriptorKind);
+      descriptorStringAttr(source, ContainerSafetyAttrs::kDescriptorGroup);
+  auto kind =
+      descriptorStringAttr(source, ContainerSafetyAttrs::kDescriptorKind);
   if (!group || !kind)
     return;
   threadsafe::memref::Atomic::set(op, ContainerSafetyAttrs::kComponentLock,
@@ -1649,6 +1706,35 @@ Slot::replaceBoxedStorage(mlir::Operation *op, mlir::Value value,
     return mlir::success();
   }
 
+  if (mlir::isa<StrType, ExceptionType>(logicalType) &&
+      resultTypes.size() > 1) {
+    auto objectType = class_layout::objectCarrierType(value.getType());
+    if (!objectType)
+      return mlir::failure();
+    if (class_layout::Object::partCount(objectType) !=
+        static_cast<int64_t>(resultTypes.size()))
+      return mlir::failure();
+
+    llvm::SmallVector<mlir::Value, 4> parts;
+    parts.reserve(resultTypes.size());
+    for (auto [index, expected] : llvm::enumerate(resultTypes)) {
+      auto memrefType = mlir::dyn_cast<mlir::MemRefType>(expected);
+      if (!memrefType)
+        return mlir::failure();
+      mlir::Value descriptor = class_layout::Object::descriptor(
+          op->getLoc(), objectType, value, static_cast<int64_t>(index),
+          rewriter);
+      mlir::Value part =
+          memRefFromDescriptor(op->getLoc(), descriptor, memrefType, rewriter);
+      if (!part)
+        return mlir::failure();
+      parts.push_back(part);
+    }
+    rewriter.replaceOpWithMultiple(
+        op, llvm::ArrayRef<mlir::ValueRange>{mlir::ValueRange(parts)});
+    return mlir::success();
+  }
+
   if (auto classType = mlir::dyn_cast<ClassType>(logicalType)) {
     mlir::FailureOr<class_layout::Layout> layout =
         class_layout::get(module, classType, typeConverter);
@@ -1686,6 +1772,30 @@ Slot::replaceBoxedStorage(mlir::Operation *op, mlir::Value value,
     llvm::SmallVector<mlir::ValueRange, 1> replacements{
         mlir::ValueRange(parts)};
     rewriter.replaceOpWithMultiple(op, replacements);
+    return mlir::success();
+  }
+
+  if (auto logicalInt = mlir::dyn_cast<mlir::IntegerType>(logicalType)) {
+    auto valueInt = mlir::dyn_cast<mlir::IntegerType>(value.getType());
+    if (!valueInt || resultTypes.size() != 1 ||
+        resultTypes.front() != logicalInt)
+      return mlir::failure();
+    mlir::Value replacement = value;
+    if (valueInt.getWidth() < logicalInt.getWidth())
+      replacement = rewriter.create<mlir::arith::ExtSIOp>(op->getLoc(),
+                                                          logicalInt, value);
+    else if (valueInt.getWidth() > logicalInt.getWidth())
+      replacement = rewriter.create<mlir::arith::TruncIOp>(op->getLoc(),
+                                                           logicalInt, value);
+    rewriter.replaceOp(op, replacement);
+    return mlir::success();
+  }
+
+  if (mlir::isa<mlir::FloatType>(logicalType)) {
+    if (resultTypes.size() != 1 || resultTypes.front() != logicalType ||
+        value.getType() != logicalType)
+      return mlir::failure();
+    rewriter.replaceOp(op, value);
     return mlir::success();
   }
 
@@ -2110,8 +2220,8 @@ mlir::Value container::Managed::predicate(mlir::Location loc,
       createI64Constant(loc, builder, 0));
 }
 
-void container::Managed::lock(mlir::Location loc, mlir::Value lock,
-                              mlir::OpBuilder &builder) {
+void container::Managed::lock(mlir::Location loc, mlir::Value header,
+                              mlir::Value lock, mlir::OpBuilder &builder) {
   mlir::Value lockIndex =
       createIndexConstant(loc, builder, kTypedContainerLockSlot);
   auto whileOp = builder.create<mlir::scf::WhileOp>(loc, mlir::TypeRange{},
@@ -2128,7 +2238,7 @@ void container::Managed::lock(mlir::Location loc, mlir::Value lock,
     threadsafe::Atomic::set(atomic.getOperation(),
                             ThreadSafetyAttrs::kRoleContainerLockAcquire,
                             ThreadSafetyAttrs::kOrderingAcquire);
-    markLockAtomicResource(atomic.getOperation(), lock);
+    markLockAtomicResource(atomic.getOperation(), header, lock);
     mlir::Value previous = atomic;
     mlir::Value busy = builder.create<mlir::arith::CmpIOp>(
         loc, mlir::arith::CmpIPredicate::ne, previous,
@@ -2144,8 +2254,8 @@ void container::Managed::lock(mlir::Location loc, mlir::Value lock,
   }
 }
 
-void container::Managed::unlock(mlir::Location loc, mlir::Value lock,
-                                mlir::OpBuilder &builder) {
+void container::Managed::unlock(mlir::Location loc, mlir::Value header,
+                                mlir::Value lock, mlir::OpBuilder &builder) {
   auto atomic = builder.create<mlir::memref::AtomicRMWOp>(
       loc, mlir::arith::AtomicRMWKind::assign,
       builder.create<mlir::arith::ConstantIntOp>(loc, 0, builder.getI32Type()),
@@ -2155,7 +2265,17 @@ void container::Managed::unlock(mlir::Location loc, mlir::Value lock,
   threadsafe::Atomic::set(atomic.getOperation(),
                           ThreadSafetyAttrs::kRoleContainerLockRelease,
                           ThreadSafetyAttrs::kOrderingRelease);
-  markLockAtomicResource(atomic.getOperation(), lock);
+  markLockAtomicResource(atomic.getOperation(), header, lock);
+}
+
+void container::Managed::lock(mlir::Location loc, mlir::Value lock,
+                              mlir::OpBuilder &builder) {
+  container::Managed::lock(loc, {}, lock, builder);
+}
+
+void container::Managed::unlock(mlir::Location loc, mlir::Value lock,
+                                mlir::OpBuilder &builder) {
+  container::Managed::unlock(loc, {}, lock, builder);
 }
 
 } // namespace py

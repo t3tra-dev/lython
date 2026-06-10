@@ -34,6 +34,7 @@ add_library(LythonRuntimeLowering STATIC
     Optimizer/Scalar.cpp
     Optimizer/RefCount.cpp
     Optimizer/ZeroCost.cpp
+    Optimizer/IntFastPath.cpp
     Optimizer/Orchestration.cpp
     Optimizer/Pipeline.cpp
     PyValue/base.cpp
@@ -65,20 +66,8 @@ target_include_directories(LythonRuntimeMlirBytecode
 target_link_libraries(LythonRuntimeMlirBytecode
     PRIVATE
     PyDialect
-    MLIRArithDialect
-    MLIRAsyncDialect
-    MLIRBufferizationDialect
-    MLIRBytecodeWriter
-    MLIRControlFlowDialect
-    MLIRFuncDialect
-    MLIRIR
-    MLIRLLVMDialect
-    MLIRLinalgDialect
-    MLIRMemRefDialect
-    MLIRParser
-    MLIRSCFDialect
-    MLIRSupport
-    MLIRTensorDialect
+    MLIR
+    LLVM
 )
 
 target_compile_options(LythonRuntimeMlirBytecode PRIVATE -frtti)
@@ -124,20 +113,6 @@ target_compile_definitions(LythonRuntimeLowering
 target_link_libraries(LythonRuntimeLowering
     PRIVATE
     PyDialect
-    MLIRAsyncDialect
-    MLIRIR
-    MLIRArithDialect
-    MLIRControlFlowDialect
-    MLIRFuncDialect
-    MLIRLLVMDialect
-    MLIRLinalgDialect
-    MLIRLinalgToStandard
-    MLIRMemRefDialect
-    MLIRMemRefTransforms
-    MLIRParser
-    MLIRBytecodeReader
-    MLIRSCFDialect
-    MLIRSCFToControlFlow
-    MLIRSupport
-    MLIRTensorDialect
+    MLIR
+    LLVM
 )

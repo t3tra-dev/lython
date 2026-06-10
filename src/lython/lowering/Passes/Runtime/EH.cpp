@@ -116,6 +116,30 @@ appendMemRefDescriptorOperands(mlir::Location loc, mlir::Value descriptor,
   operands.push_back(extractValue(loc, descriptor, i64Type, {4, 0}, builder));
 }
 
+static mlir::Value
+loadExceptionClassId(mlir::Location loc, mlir::Value headerDescriptor,
+                     mlir::LLVM::LLVMStructType descriptorType,
+                     mlir::OpBuilder &builder) {
+  auto body = descriptorType.getBody();
+  mlir::Value aligned =
+      extractValue(loc, headerDescriptor, body[1], {1}, builder);
+  auto i64Type = builder.getI64Type();
+  mlir::Value offset =
+      extractValue(loc, headerDescriptor, i64Type, {2}, builder);
+  mlir::Value stride =
+      extractValue(loc, headerDescriptor, i64Type, {4, 0}, builder);
+  mlir::Value slot = builder.create<mlir::LLVM::ConstantOp>(
+      loc, i64Type,
+      builder.getI64IntegerAttr(object_abi::exception_abi::kClassIdSlot));
+  mlir::Value scaled = builder.create<mlir::LLVM::MulOp>(loc, slot, stride);
+  mlir::Value index = builder.create<mlir::LLVM::AddOp>(loc, offset, scaled);
+  auto ptrType = mlir::LLVM::LLVMPointerType::get(builder.getContext());
+  mlir::Value address = builder.create<mlir::LLVM::GEPOp>(
+      loc, ptrType, i64Type, aligned,
+      llvm::ArrayRef<mlir::LLVM::GEPArg>{index});
+  return builder.create<mlir::LLVM::LoadOp>(loc, i64Type, address);
+}
+
 } // namespace
 
 namespace lowering::runtime::eh {
@@ -258,6 +282,8 @@ void wrapTopLevelMain(mlir::ModuleOp module) {
   markEHExceptionPart(messageHeader, 1);
   markEHExceptionPart(messageBytes, 2);
   llvm::SmallVector<mlir::Value, 5> printOperands;
+  printOperands.push_back(
+      loadExceptionClassId(module.getLoc(), header, descriptorType, builder));
   appendMemRefDescriptorOperands(module.getLoc(), messageBytes, descriptorType,
                                  printOperands, builder);
   emitLLVMRuntimeCall(module, builder, module.getLoc(),

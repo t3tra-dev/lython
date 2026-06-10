@@ -160,6 +160,17 @@ mlir::LogicalResult ExceptionNewOp::verify() {
   for (mlir::Value arg : getArgs())
     if (!isPyStrType(arg.getType()))
       return emitOpError("message argument must be !py.str");
+  if (auto classAttr =
+          (*this)->getAttrOfType<mlir::StringAttr>("py.exception.class")) {
+    mlir::FailureOr<bool> isExceptionClass = type_object::isSubclassOf(
+        getOperation(), classAttr.getValue(), type_object::kBaseException);
+    if (mlir::failed(isExceptionClass))
+      return mlir::failure();
+    if (!*isExceptionClass)
+      return emitOpError("'py.exception.class' must name a BaseException "
+                         "subclass, got '")
+             << classAttr.getValue() << "'";
+  }
   return mlir::success();
 }
 
@@ -170,17 +181,17 @@ mlir::LogicalResult ExceptMatchOp::verify() {
     return emitOpError("must be nested inside py.try except region");
   if (getOperation()->getParentRegion() != &tryOp.getExceptRegion())
     return emitOpError("must be inside py.try except region");
-  auto handlerType = mlir::dyn_cast<ClassType>(getType().getType());
+  auto handlerType = mlir::dyn_cast<ClassType>(getHandlerAttr().getValue());
   if (!handlerType)
-    return emitOpError("handler operand must be !py.class");
-  mlir::FailureOr<bool> matches =
-      type_object::exceptionMatches(getOperation(), handlerType.getClassName());
-  if (mlir::failed(matches))
+    return emitOpError("handler must be a !py.class type attribute");
+  mlir::FailureOr<bool> isExceptionClass = type_object::isSubclassOf(
+      getOperation(), handlerType.getClassName(), type_object::kBaseException);
+  if (mlir::failed(isExceptionClass))
     return mlir::failure();
-  if (!*matches)
+  if (!*isExceptionClass)
     return emitOpError("handler class '")
            << handlerType.getClassName()
-           << "' is not a static superclass of Exception";
+           << "' is not a static subclass of BaseException";
   return mlir::success();
 }
 

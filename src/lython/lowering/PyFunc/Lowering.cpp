@@ -185,7 +185,8 @@ static void markObjectHeader(mlir::func::FuncOp func, mlir::Type logicalType,
                              llvm::ArrayRef<mlir::Type> converted,
                              unsigned flattenedIndex) {
   if (!hasObjectHeaderPart(logicalType) || converted.empty() ||
-      !object_abi::Header::isOwned(converted.front()))
+      (!object_abi::Header::isOwned(converted.front()) &&
+       !object_abi::exception_abi::Header::isOwned(converted.front())))
     return;
   setUnitAttr(func, flattenedIndex, OwnershipContractAttrs::kObjectHeader);
 }
@@ -436,8 +437,9 @@ struct FuncOpLowering : public mlir::OpConversionPattern<FuncOp> {
     if (!nameAttr)
       return rewriter.notifyMatchFailure(op, "missing sym_name");
 
-    // Skip builtin print function - it's handled specially
-    if (nameAttr.getValue() == "__builtin_print") {
+    // Skip builtin print functions - they are handled specially.
+    if (nameAttr.getValue() == "__builtin_print" ||
+        nameAttr.getValue() == "__builtin_print_raw") {
       rewriter.eraseOp(op);
       return mlir::success();
     }
@@ -482,10 +484,8 @@ struct FuncOpLowering : public mlir::OpConversionPattern<FuncOp> {
                              .take_front(visibleInputCount)))
       if ((idx != 0 || !hasSelfReceiver) && mlir::isa<ClassType>(ty))
         publishedClassArgIndices.push_back(idx);
-    if (!std::getenv("LYTHON_ENABLE_CLASS_SPECIALIZED_HELPERS")) {
-      createLocalSelfHelper = false;
-      publishedClassArgIndices.clear();
-    }
+    createLocalSelfHelper = false;
+    publishedClassArgIndices.clear();
     if (static_cast<bool>(op->getAttr("maythrow")))
       publishedClassArgIndices.clear();
     std::string freshHelperName;
@@ -884,8 +884,11 @@ struct FuncObjectLowering : public mlir::OpConversionPattern<FuncObjectOp> {
 
     llvm::StringRef symbol = op.getTargetAttr().getValue();
 
-    if (symbol == "__builtin_print" || symbol == "print") {
-      llvm::StringRef builtinSymbol = "__builtin_print";
+    if (symbol == "__builtin_print" || symbol == "__builtin_print_raw" ||
+        symbol == "print") {
+      llvm::StringRef builtinSymbol = symbol == "__builtin_print_raw"
+                                          ? "__builtin_print_raw"
+                                          : "__builtin_print";
       auto func = module.lookupSymbol<mlir::func::FuncOp>(builtinSymbol);
       if (!func) {
         mlir::OpBuilder::InsertionGuard guard(rewriter);

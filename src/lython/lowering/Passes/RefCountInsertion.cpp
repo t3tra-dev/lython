@@ -4,6 +4,7 @@
 #include "mlir/Analysis/Liveness.h"
 #include "mlir/Dialect/Async/IR/Async.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Dominance.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -48,6 +49,66 @@ insertDecRefOnSuccessorEdge(mlir::OpBuilder &builder, mlir::Value value,
 }
 
 using AliasAnalysis = OwnershipAliasAnalysis;
+
+static mlir::Operation *directCallPackUse(mlir::Value value) {
+  llvm::SmallVector<mlir::Value, 4> worklist{value};
+  llvm::SmallPtrSet<mlir::Value, 4> seen;
+  mlir::Operation *callLike = nullptr;
+
+  while (!worklist.empty()) {
+    mlir::Value current = worklist.pop_back_val();
+    if (!current || !seen.insert(current).second)
+      continue;
+
+    for (mlir::Operation *user : current.getUsers()) {
+      if (mlir::isa<DecRefOp>(user))
+        continue;
+      if (auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(user)) {
+        for (mlir::Value result : cast.getResults())
+          worklist.push_back(result);
+        continue;
+      }
+
+      if (auto call = mlir::dyn_cast<CallVectorOp>(user)) {
+        if (call.getPosargs() != current)
+          return nullptr;
+        if (callLike && callLike != user)
+          return nullptr;
+        callLike = user;
+        continue;
+      }
+      if (auto call = mlir::dyn_cast<CallOp>(user)) {
+        if (call.getPosargs() != current)
+          return nullptr;
+        if (callLike && callLike != user)
+          return nullptr;
+        callLike = user;
+        continue;
+      }
+      if (auto invoke = mlir::dyn_cast<InvokeOp>(user)) {
+        if (invoke.getPosargs() != current)
+          return nullptr;
+        if (callLike && callLike != user)
+          return nullptr;
+        callLike = user;
+        continue;
+      }
+
+      return nullptr;
+    }
+  }
+
+  return callLike;
+}
+
+static mlir::Operation *borrowDropAnchor(mlir::Operation *lastUser) {
+  auto tuple = mlir::dyn_cast_or_null<TupleCreateOp>(lastUser);
+  if (!tuple)
+    return lastUser;
+  if (mlir::Operation *callLike = directCallPackUse(tuple.getResult()))
+    return callLike;
+  return lastUser;
+}
 
 struct RefCountInsertionPass
     : public mlir::PassWrapper<RefCountInsertionPass,
@@ -145,10 +206,14 @@ private:
     for (mlir::Block &block : body) {
       for (mlir::Operation &operation : block) {
         auto tryOp = mlir::dyn_cast<TryOp>(operation);
-        if (!tryOp)
+        auto ifOp = mlir::dyn_cast<mlir::scf::IfOp>(operation);
+        if (!tryOp && !ifOp)
           continue;
-        for (mlir::Region &region : tryOp->getRegions()) {
-          if (mlir::failed(processFunctionLike(tryOp.getOperation(), region,
+
+        mlir::Operation *regionOwner =
+            tryOp ? tryOp.getOperation() : ifOp.getOperation();
+        for (mlir::Region &region : regionOwner->getRegions()) {
+          if (mlir::failed(processFunctionLike(regionOwner, region,
                                                /*entryArgsBorrowed=*/false)))
             return mlir::failure();
         }
@@ -267,29 +332,22 @@ private:
         // Last use + Consume = Move Semantics (no action needed)
       } else {
         // Last use + Borrow = Need to drop after use
-        if (lastUser->getNumSuccessors() == 0) {
-          builder.setInsertionPointAfter(lastUser);
+        mlir::Operation *anchor = borrowDropAnchor(lastUser);
+        if (anchor->getNumSuccessors() == 0) {
+          builder.setInsertionPointAfter(anchor);
           builder.create<DecRefOp>(root.getLoc(), usedAlias);
         } else {
-          for (unsigned i = 0; i < lastUser->getNumSuccessors(); ++i) {
-            if (mlir::failed(insertDecRefOnSuccessorEdge(builder, usedAlias,
-                                                         lastUser, i)))
+          for (unsigned i = 0; i < anchor->getNumSuccessors(); ++i) {
+            if (mlir::failed(
+                    insertDecRefOnSuccessorEdge(builder, usedAlias, anchor, i)))
               return mlir::failure();
           }
         }
       }
     }
 
-    for (mlir::Value alias : aliasSet) {
-      for (mlir::OpOperand &use : alias.getUses()) {
-        mlir::Operation *user = use.getOwner();
-
-        if (isPyOwnershipIdentityTransform(user))
-          continue;
-
-        if (!consumesPyOwnedOperand(user, alias))
-          continue;
-
+    for (auto &[user, consumedOperands] : consumingOperandsByUser) {
+      for (mlir::Value alias : consumedOperands) {
         mlir::Block *userBlock = user->getBlock();
         const mlir::LivenessBlockInfo *blockLiveness =
             liveness.getLiveness(userBlock);
@@ -382,7 +440,11 @@ private:
       BlockSet liveInSuccessors;
       BlockSet noLiveInSuccessors;
 
-      for (mlir::Block *succ : block.getSuccessors()) {
+      mlir::Operation *terminator = block.getTerminator();
+      if (!terminator)
+        continue;
+
+      for (mlir::Block *succ : terminator->getSuccessors()) {
         const mlir::LivenessBlockInfo *succLiveness =
             liveness.getLiveness(succ);
         bool anyLiveIn = false;

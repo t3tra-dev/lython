@@ -14,9 +14,11 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Dominance.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/APInt.h"
@@ -363,9 +365,17 @@ bool publication::update(FuncOp func, const llvm::DenseSet<int> &publishesArgs,
 
 bool class_state::published(mlir::Value value);
 
-static TupleCreateOp getStaticTupleCreate(mlir::Value value) {
+static bool
+collectStaticTupleElements(mlir::Value value,
+                           llvm::SmallVectorImpl<mlir::Value> &elements) {
   value = value::stripCasts(value);
-  return mlir::dyn_cast_or_null<TupleCreateOp>(value.getDefiningOp());
+  if (mlir::isa_and_nonnull<TupleEmptyOp>(value.getDefiningOp()))
+    return true;
+  if (auto tuple = value.getDefiningOp<TupleCreateOp>()) {
+    elements.append(tuple.getElements().begin(), tuple.getElements().end());
+    return true;
+  }
+  return false;
 }
 
 static mlir::Value stripStaticMetadataValue(mlir::Value value) {
@@ -492,7 +502,189 @@ static void eraseDeadStaticMetadataTree(mlir::Value value) {
     producer->erase();
 }
 
+static llvm::StringRef symbolName(mlir::FlatSymbolRefAttr symbol) {
+  if (!symbol)
+    return {};
+  return symbol.getValue();
+}
+
+static bool isPureReturnedCallableCloneOp(mlir::Operation *op) {
+  return mlir::isa_and_nonnull<
+      mlir::arith::ConstantOp, CastFromPrimOp, CastToPrimOp, TupleCreateOp,
+      TupleEmptyOp, NoneOp, IntConstantOp, FloatConstantOp, StrConstantOp>(op);
+}
+
+static bool returnedCallableBodyIsPure(FuncOp func, MakeFunctionOp makeFunc,
+                                       ReturnOp returnOp) {
+  if (!func || !makeFunc || !returnOp || !func.getBody().hasOneBlock())
+    return false;
+  for (mlir::Operation &op : func.getBody().front()) {
+    if (&op == makeFunc.getOperation() || &op == returnOp.getOperation())
+      continue;
+    if (!isPureReturnedCallableCloneOp(&op))
+      return false;
+  }
+  return true;
+}
+
+static MakeFunctionOp findReturnedMakeFunction(FuncOp func,
+                                               llvm::StringRef targetName) {
+  if (!func || !func.getBody().hasOneBlock())
+    return {};
+
+  ReturnOp returnOp;
+  for (mlir::Operation &op : func.getBody().front()) {
+    if (auto candidate = mlir::dyn_cast<ReturnOp>(op)) {
+      if (returnOp)
+        return {};
+      returnOp = candidate;
+    }
+  }
+  if (!returnOp || returnOp->getNumOperands() != 1)
+    return {};
+
+  mlir::Value returned = value::stripCasts(returnOp->getOperand(0));
+  auto makeFunc = returned.getDefiningOp<MakeFunctionOp>();
+  if (!makeFunc || symbolName(makeFunc.getTargetAttr()) != targetName)
+    return {};
+  if (!returnedCallableBodyIsPure(func, makeFunc, returnOp))
+    return {};
+  return makeFunc;
+}
+
+static mlir::FailureOr<mlir::Value>
+clonePureReturnedCallableValue(mlir::Value value, mlir::OpBuilder &builder,
+                               mlir::IRMapping &mapping) {
+  if (!value)
+    return mlir::Value();
+  if (mlir::Value mapped = mapping.lookupOrNull(value))
+    return mapped;
+
+  if (auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(value)) {
+    (void)blockArg;
+    return mlir::failure();
+  }
+
+  mlir::Operation *def = value.getDefiningOp();
+  if (!isPureReturnedCallableCloneOp(def) || def->getNumRegions() != 0)
+    return mlir::failure();
+
+  for (mlir::Value operand : def->getOperands())
+    if (mlir::failed(clonePureReturnedCallableValue(operand, builder, mapping)))
+      return mlir::failure();
+
+  mlir::Operation *cloned = builder.clone(*def, mapping);
+  for (auto [original, copy] :
+       llvm::zip(def->getResults(), cloned->getResults()))
+    mapping.map(original, copy);
+  return mapping.lookup(value);
+}
+
+static bool mapReturnedCallableArguments(CallVectorOp sourceCall, FuncOp source,
+                                         mlir::IRMapping &mapping) {
+  if (!source || !source.getBody().hasOneBlock())
+    return false;
+  if (!mlir::isa<TupleEmptyOp>(
+          value::stripCasts(sourceCall.getKwnames()).getDefiningOp()) ||
+      !mlir::isa<TupleEmptyOp>(
+          value::stripCasts(sourceCall.getKwvalues()).getDefiningOp()))
+    return false;
+
+  llvm::SmallVector<mlir::Value, 8> args;
+  if (!collectStaticTupleElements(sourceCall.getPosargs(), args))
+    return false;
+
+  mlir::Block &entry = source.getBody().front();
+  if (entry.getNumArguments() != args.size())
+    return false;
+  for (auto [arg, value] : llvm::zip(entry.getArguments(), args))
+    mapping.map(arg, value);
+  return true;
+}
+
+static mlir::FailureOr<mlir::Value> cloneOptionalReturnedCallableMetadata(
+    mlir::Value value, mlir::OpBuilder &builder, mlir::IRMapping &mapping) {
+  if (!value)
+    return mlir::Value();
+  return clonePureReturnedCallableValue(value, builder, mapping);
+}
+
+static bool materializeReturnedCallable(CallVectorOp call) {
+  mlir::Value callable = value::stripCasts(call.getCallable());
+  auto sourceCall = callable.getDefiningOp<CallVectorOp>();
+  if (!sourceCall)
+    return false;
+  if (!llvm::hasSingleElement(sourceCall.getResult(0).getUsers()))
+    return false;
+
+  auto returnedSymbol = sourceCall->getAttrOfType<mlir::FlatSymbolRefAttr>(
+      "ly.returned_callable_symbol");
+  llvm::StringRef targetName = symbolName(returnedSymbol);
+  if (targetName.empty())
+    return false;
+
+  FuncOp sourceFunc =
+      call::pyFunc(sourceCall.getOperation(), sourceCall.getCallable());
+  MakeFunctionOp sourceMakeFunc =
+      findReturnedMakeFunction(sourceFunc, targetName);
+  if (!sourceMakeFunc)
+    return false;
+
+  mlir::OpBuilder builder(call);
+  mlir::IRMapping mapping;
+  if (!mapReturnedCallableArguments(sourceCall, sourceFunc, mapping))
+    return false;
+
+  mlir::FailureOr<mlir::Value> defaults = cloneOptionalReturnedCallableMetadata(
+      sourceMakeFunc.getDefaults(), builder, mapping);
+  if (mlir::failed(defaults))
+    return false;
+  mlir::FailureOr<mlir::Value> kwdefaults =
+      cloneOptionalReturnedCallableMetadata(sourceMakeFunc.getKwdefaults(),
+                                            builder, mapping);
+  if (mlir::failed(kwdefaults))
+    return false;
+  mlir::FailureOr<mlir::Value> closure = cloneOptionalReturnedCallableMetadata(
+      sourceMakeFunc.getClosure(), builder, mapping);
+  if (mlir::failed(closure))
+    return false;
+  mlir::FailureOr<mlir::Value> annotations =
+      cloneOptionalReturnedCallableMetadata(sourceMakeFunc.getAnnotations(),
+                                            builder, mapping);
+  if (mlir::failed(annotations))
+    return false;
+  mlir::FailureOr<mlir::Value> moduleName =
+      cloneOptionalReturnedCallableMetadata(sourceMakeFunc.getModule(), builder,
+                                            mapping);
+  if (mlir::failed(moduleName))
+    return false;
+
+  auto materialized = builder.create<MakeFunctionOp>(
+      call.getLoc(), call.getCallable().getType(),
+      sourceMakeFunc.getTargetAttr(), *defaults, *kwdefaults, *closure,
+      *annotations, *moduleName);
+  call.getCallableMutable().assign(materialized.getResult());
+
+  mlir::Value oldPosargs = sourceCall.getPosargs();
+  mlir::Value oldKwnames = sourceCall.getKwnames();
+  mlir::Value oldKwvalues = sourceCall.getKwvalues();
+  sourceCall.erase();
+  eraseDeadStaticMetadataTree(oldPosargs);
+  eraseDeadStaticMetadataTree(oldKwnames);
+  eraseDeadStaticMetadataTree(oldKwvalues);
+  return true;
+}
+
+static void materializeReturnedCallables(mlir::ModuleOp module) {
+  llvm::SmallVector<CallVectorOp> calls;
+  module.walk([&](CallVectorOp op) { calls.push_back(op); });
+  for (CallVectorOp call : calls)
+    materializeReturnedCallable(call);
+}
+
 void call::staticDefaults(mlir::ModuleOp module) {
+  materializeReturnedCallables(module);
+
   llvm::SmallVector<CallVectorOp> calls;
   module.walk([&](CallVectorOp op) { calls.push_back(op); });
 
@@ -522,11 +714,10 @@ void call::staticDefaults(mlir::ModuleOp module) {
         !makeFunc.getClosure() && !hasExplicitKeywords)
       continue;
 
-    TupleCreateOp posargs = getStaticTupleCreate(call.getPosargs());
-    if (!posargs)
+    llvm::SmallVector<mlir::Value, 8> providedElements;
+    if (!collectStaticTupleElements(call.getPosargs(), providedElements))
       continue;
-    unsigned providedCount =
-        static_cast<unsigned>(posargs.getElements().size());
+    unsigned providedCount = static_cast<unsigned>(providedElements.size());
     if (providedCount > positionalCount)
       continue;
 
@@ -569,7 +760,7 @@ void call::staticDefaults(mlir::ModuleOp module) {
     }
 
     llvm::SmallVector<mlir::Value, 8> positionalElements(positionalCount);
-    for (auto [index, element] : llvm::enumerate(posargs.getElements()))
+    for (auto [index, element] : llvm::enumerate(providedElements))
       positionalElements[index] = element;
 
     bool invalidKeyword = false;
@@ -591,9 +782,12 @@ void call::staticDefaults(mlir::ModuleOp module) {
 
     if (llvm::any_of(positionalElements,
                      [](mlir::Value value) { return !value; })) {
-      TupleCreateOp defaults = getStaticTupleCreate(makeFunc.getDefaults());
+      llvm::SmallVector<mlir::Value, 8> defaultElements;
+      bool hasStaticDefaults =
+          makeFunc.getDefaults() &&
+          collectStaticTupleElements(makeFunc.getDefaults(), defaultElements);
       unsigned defaultsCount =
-          defaults ? static_cast<unsigned>(defaults.getElements().size()) : 0;
+          hasStaticDefaults ? static_cast<unsigned>(defaultElements.size()) : 0;
       if (defaultsCount > positionalCount)
         continue;
 
@@ -601,7 +795,7 @@ void call::staticDefaults(mlir::ModuleOp module) {
       for (unsigned index = providedCount; index < positionalCount; ++index)
         if (!positionalElements[index] && index >= firstDefaultIndex)
           positionalElements[index] =
-              defaults.getElements()[index - firstDefaultIndex];
+              defaultElements[index - firstDefaultIndex];
       if (llvm::any_of(positionalElements,
                        [](mlir::Value value) { return !value; }))
         continue;
@@ -640,15 +834,11 @@ void call::staticDefaults(mlir::ModuleOp module) {
       continue;
 
     if (mlir::Value closureValue = makeFunc.getClosure()) {
-      TupleCreateOp closure = getStaticTupleCreate(closureValue);
-      if (!closure)
+      llvm::SmallVector<mlir::Value, 8> closureElements;
+      if (!collectStaticTupleElements(closureValue, closureElements))
         continue;
-      elements.append(closure.getElements().begin(),
-                      closure.getElements().end());
+      elements.append(closureElements.begin(), closureElements.end());
     }
-
-    if (elements.size() == posargs.getElements().size() && !hasExplicitKeywords)
-      continue;
 
     mlir::Value oldPosargs = call.getPosargs();
     mlir::Value oldKwnames = call.getKwnames();
@@ -1419,8 +1609,10 @@ static bool isZeroCostLocalClassFieldCandidate(mlir::Type fieldType) {
 }
 
 static bool isBorrowOnlyLocalFieldUser(mlir::Operation *user) {
-  return mlir::isa<AddOp, StrConcat3Op, SubOp, LeOp, LtOp, GtOp, GeOp, EqOp,
-                   NeOp, ReprOp, ListAppendOp, ListRemoveOp, ListGetOp>(user);
+  return mlir::isa<AddOp, StrConcat3Op, SubOp, MulOp, DivOp, FloorDivOp, ModOp,
+                   LShiftOp, RShiftOp, BitAndOp, BitOrOp, BitXorOp, LeOp, LtOp,
+                   GtOp, GeOp, EqOp, NeOp, ReprOp, ListAppendOp, ListRemoveOp,
+                   ListGetOp>(user);
 }
 
 static bool hasSingleBorrowThenDrop(mlir::Value value) {
@@ -1651,7 +1843,7 @@ void scalar::fuseStrConcat3(mlir::ModuleOp module) {
 
 static bool foldIntBinaryConstant(mlir::Operation *op, mlir::Value lhs,
                                   mlir::Value rhs, mlir::Type resultType,
-                                  bool subtract) {
+                                  llvm::StringRef operation) {
   if (!mlir::isa<IntType>(resultType))
     return false;
 
@@ -1669,7 +1861,14 @@ static bool foldIntBinaryConstant(mlir::Operation *op, mlir::Value lhs,
       std::max(lhsValue->getBitWidth(), rhsValue->getBitWidth()) + 2;
   llvm::APInt lhsWide = lhsValue->sextOrTrunc(resultBits);
   llvm::APInt rhsWide = rhsValue->sextOrTrunc(resultBits);
-  llvm::APInt folded = subtract ? lhsWide - rhsWide : lhsWide + rhsWide;
+  llvm::APInt folded(resultBits, 0, /*isSigned=*/true);
+  if (operation == "+") {
+    folded = lhsWide + rhsWide;
+  } else if (operation == "-") {
+    folded = lhsWide - rhsWide;
+  } else {
+    return false;
+  }
 
   mlir::OpBuilder builder(op);
   auto replacement = builder.create<IntConstantOp>(op->getLoc(), resultType,
@@ -1698,44 +1897,70 @@ void scalar::foldIntConstants(mlir::ModuleOp module) {
   for (mlir::Operation *op : candidates) {
     if (auto add = mlir::dyn_cast<AddOp>(op)) {
       foldIntBinaryConstant(add.getOperation(), add.getLhs(), add.getRhs(),
-                            add.getResult().getType(), /*subtract=*/false);
+                            add.getResult().getType(), "+");
       continue;
     }
     if (auto sub = mlir::dyn_cast<SubOp>(op))
       foldIntBinaryConstant(sub.getOperation(), sub.getLhs(), sub.getRhs(),
-                            sub.getResult().getType(), /*subtract=*/true);
+                            sub.getResult().getType(), "-");
   }
 }
 
 /// Hoist integer constants to entry block and perform CSE.
 void scalar::hoistInts(mlir::ModuleOp module) {
-  module.walk([&](mlir::func::FuncOp func) {
-    if (func.isExternal())
+  auto crossesPyStructuredResult = [](mlir::Operation *op,
+                                      mlir::Operation *root) {
+    for (mlir::Operation *parent = op->getParentOp(); parent && parent != root;
+         parent = parent->getParentOp()) {
+      auto ifOp = mlir::dyn_cast<mlir::scf::IfOp>(parent);
+      if (!ifOp)
+        continue;
+      if (llvm::any_of(ifOp.getResultTypes(), isPyType))
+        return true;
+    }
+    return false;
+  };
+
+  auto hoistInRegion = [&](mlir::Operation *op, mlir::Region &region) {
+    if (region.empty())
       return;
 
-    mlir::Block &entryBlock = func.getBody().front();
+    mlir::Block &entryBlock = region.front();
     llvm::StringMap<IntConstantOp> constantMap;
 
     // First pass: collect all IntConstantOp
     llvm::SmallVector<IntConstantOp> allConstants;
-    func.walk([&](IntConstantOp op) { allConstants.push_back(op); });
+    op->walk([&](IntConstantOp op) { allConstants.push_back(op); });
 
     // Second pass: CSE and hoist (using string value as key)
-    for (IntConstantOp op : allConstants) {
-      llvm::StringRef value = op.getValue();
-      auto it = constantMap.find(value);
-      if (it != constantMap.end()) {
+    for (IntConstantOp constant : allConstants) {
+      if (constant->getBlock() != &entryBlock &&
+          crossesPyStructuredResult(constant.getOperation(), op))
+        continue;
+
+      llvm::StringRef value = constant.getValue();
+      auto existing = constantMap.find(value);
+      if (existing != constantMap.end()) {
         // Replace with existing constant
-        op.getResult().replaceAllUsesWith(it->second.getResult());
-        op->erase();
+        constant.getResult().replaceAllUsesWith(existing->second.getResult());
+        constant->erase();
       } else {
         // Move to entry block if not already there
-        if (op->getBlock() != &entryBlock) {
-          op->moveBefore(&entryBlock, entryBlock.begin());
+        if (constant->getBlock() != &entryBlock) {
+          constant->moveBefore(&entryBlock, entryBlock.begin());
         }
-        constantMap[value] = op;
+        constantMap[value] = constant;
       }
     }
+  };
+
+  module.walk([&](mlir::func::FuncOp func) {
+    if (!func.isExternal())
+      hoistInRegion(func.getOperation(), func.getBody());
+  });
+  module.walk([&](FuncOp func) {
+    if (func->getNumRegions() != 0)
+      hoistInRegion(func.getOperation(), func->getRegion(0));
   });
 }
 
@@ -1780,7 +2005,7 @@ static bool hasOnlyTensorResults(mlir::Operation *op) {
 static bool isDeadCodeCandidate(mlir::Operation *op) {
   if (mlir::isa<TupleCreateOp>(op) && op->hasAttr("ly.dead_call_pack"))
     return true;
-  if (mlir::isa<StrConstantOp, IntConstantOp, FloatConstantOp>(op))
+  if (mlir::isa<StrConstantOp, IntConstantOp, FloatConstantOp, ReprOp>(op))
     return true;
   if (mlir::isa<mlir::LLVM::AddressOfOp, mlir::LLVM::GEPOp,
                 mlir::LLVM::ConstantOp>(op))

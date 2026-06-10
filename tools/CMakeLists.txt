@@ -2,21 +2,40 @@ add_executable(lyc
     CLI.cpp
 )
 
-get_target_property(MLIR_ASYNC_RUNTIME_LIBRARY mlir_async_runtime IMPORTED_LOCATION_RELEASE)
-if(NOT MLIR_ASYNC_RUNTIME_LIBRARY)
-    get_target_property(MLIR_ASYNC_RUNTIME_LIBRARY mlir_async_runtime IMPORTED_LOCATION)
-endif()
-if(NOT MLIR_ASYNC_RUNTIME_LIBRARY)
-    message(FATAL_ERROR "mlir_async_runtime imported target does not expose an imported location")
+set(MLIR_ASYNC_RUNTIME_LIBRARY "")
+if(TARGET mlir_async_runtime)
+    foreach(config RELEASE RELWITHDEBINFO MINSIZEREL DEBUG NOCONFIG)
+        if(MLIR_ASYNC_RUNTIME_LIBRARY)
+            break()
+        endif()
+        get_target_property(mlir_async_runtime_candidate
+            mlir_async_runtime IMPORTED_LOCATION_${config})
+        if(mlir_async_runtime_candidate)
+            set(MLIR_ASYNC_RUNTIME_LIBRARY "${mlir_async_runtime_candidate}")
+        endif()
+    endforeach()
+    if(NOT MLIR_ASYNC_RUNTIME_LIBRARY)
+        get_target_property(mlir_async_runtime_candidate
+            mlir_async_runtime IMPORTED_LOCATION)
+        if(mlir_async_runtime_candidate)
+            set(MLIR_ASYNC_RUNTIME_LIBRARY "${mlir_async_runtime_candidate}")
+        endif()
+    endif()
 endif()
 
-add_custom_command(
-    OUTPUT ${MLIR_ASYNC_RUNTIME_LIBRARY}
-    COMMAND ${CMAKE_COMMAND} --build ${LLVM_PROJECT_BUILD_DIR} --target mlir_async_runtime
-    COMMENT "Building MLIR async runtime support library"
-    VERBATIM
-)
-add_custom_target(MLIRAsyncRuntimeSupport DEPENDS ${MLIR_ASYNC_RUNTIME_LIBRARY})
+if(NOT MLIR_ASYNC_RUNTIME_LIBRARY)
+    find_library(MLIR_ASYNC_RUNTIME_LIBRARY
+        NAMES mlir_async_runtime libmlir_async_runtime
+        HINTS
+            ${MLIR_LIBRARY_DIRS}
+            ${LLVM_LIBRARY_DIRS}
+            /opt/homebrew/opt/llvm@20/lib
+            /usr/local/opt/llvm@20/lib
+            /usr/lib/llvm-20/lib
+        REQUIRED
+    )
+endif()
+message(STATUS "Using MLIR async runtime: ${MLIR_ASYNC_RUNTIME_LIBRARY}")
 
 target_include_directories(lyc
     PUBLIC
@@ -24,6 +43,8 @@ target_include_directories(lyc
     ${CMAKE_BINARY_DIR}/src/lython/dialects
     ${CMAKE_SOURCE_DIR}/src/lython/lowering
     ${CMAKE_SOURCE_DIR}/src/lython/runtime
+    ${CMAKE_SOURCE_DIR}/src/lython/parser/include
+    ${CMAKE_SOURCE_DIR}/src/lython/emitter/include
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
@@ -34,49 +55,17 @@ target_compile_definitions(lyc
 
 # 生成ヘッダ依存 (PyDialectIncGen) を明示
 add_dependencies(lyc PyDialectIncGen)
-add_dependencies(lyc MLIRAsyncRuntimeSupport)
 
 target_link_libraries(lyc
     PRIVATE
     PyDialect
     LythonRuntime
     LythonRuntimeLowering
-    # Core
-    MLIRIR
-    MLIRSupport
-    MLIRParser
-    MLIRExecutionEngine
-    MLIRTransforms
-    MLIRPass
-    # Dialects
-    MLIRAsyncDialect
-    MLIRAsyncTransforms
-    MLIRFuncDialect
-    MLIRArithDialect
-    MLIRBufferizationDialect
-    MLIRSCFDialect
-    MLIRTensorDialect
-    MLIRLinalgDialect
-    MLIRLLVMDialect
-    # Conversions / Translations
-    MLIRArithToLLVM
-    MLIRAsyncToLLVM
-    MLIRLinalgToStandard
-    MLIRSCFToControlFlow
-    MLIRControlFlowToLLVM
-    MLIRMemRefToLLVM
-    MLIRFuncToLLVM
-    MLIRReconcileUnrealizedCasts
-    MLIRConvertToLLVMPass
-    MLIRBufferizationTransforms
-    MLIRLinalgTransforms
-    MLIRTargetLLVMIRExport
-    MLIRToLLVMIRTranslationRegistration
-    MLIRBuiltinToLLVMIRTranslation
-    MLIRLLVMToLLVMIRTranslation
-    LLVMCoroutines
-    LLVMPasses
-    mlir_async_runtime
+    LythonParser
+    LythonEmitter
+    MLIR
+    LLVM
+    ${MLIR_ASYNC_RUNTIME_LIBRARY}
 )
 
 install(TARGETS lyc

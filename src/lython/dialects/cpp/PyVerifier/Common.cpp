@@ -334,6 +334,30 @@ static bool callableHasKwdefaults(mlir::Value callable) {
   return makeFunc && static_cast<bool>(makeFunc.getKwdefaults());
 }
 
+static llvm::SmallVector<mlir::Type, 4>
+getFuncObjectClosureTypes(mlir::Operation *op, mlir::Value callable) {
+  auto funcObject = stripBridgeCasts(callable).getDefiningOp<FuncObjectOp>();
+  if (!funcObject)
+    return {};
+  mlir::Operation *symbol = mlir::SymbolTable::lookupNearestSymbolFrom(
+      op, funcObject.getTargetAttr());
+  auto funcOp = mlir::dyn_cast_or_null<FuncOp>(symbol);
+  if (!funcOp)
+    return {};
+  mlir::ArrayAttr closureTypesAttr = funcOp.getClosureTypesAttr();
+  if (!closureTypesAttr)
+    return {};
+  llvm::SmallVector<mlir::Type, 4> closureTypes;
+  closureTypes.reserve(closureTypesAttr.size());
+  for (mlir::Attribute attr : closureTypesAttr) {
+    auto typeAttr = mlir::dyn_cast<mlir::TypeAttr>(attr);
+    if (!typeAttr)
+      return {};
+    closureTypes.push_back(typeAttr.getValue());
+  }
+  return closureTypes;
+}
+
 mlir::LogicalResult verifyVectorCallOperands(
     mlir::Operation *op, FuncSignatureType signature, mlir::Value callable,
     mlir::Value posargs, mlir::Value kwnames, mlir::Value kwvalues,
@@ -347,12 +371,14 @@ mlir::LogicalResult verifyVectorCallOperands(
 
   auto positionalTypes = signature.getPositionalTypes();
   auto kwonlyTypes = signature.getKwOnlyTypes();
+  llvm::SmallVector<mlir::Type, 4> closureTypes =
+      getFuncObjectClosureTypes(op, callable);
   unsigned minPositionalCount =
       getMinimumPositionalCountForCallable(signature, callable);
   unsigned normalizedKwonlyCount = 0;
   if (!signature.hasVararg()) {
-    unsigned normalizedPosargLimit =
-        positionalTypes.size() + kwonlyTypes.size();
+    unsigned visiblePosargLimit = positionalTypes.size() + kwonlyTypes.size();
+    unsigned normalizedPosargLimit = visiblePosargLimit + closureTypes.size();
     if (posElems.size() > normalizedPosargLimit)
       return op->emitOpError(
           "posargs length mismatch with callee positional parameters");
@@ -361,14 +387,25 @@ mlir::LogicalResult verifyVectorCallOperands(
       if (!isSubtypeOf(posElems[index], positionalTypes[index]))
         return op->emitOpError(
             "posargs element type does not match positional parameter type");
-    if (posElems.size() > positionalTypes.size()) {
-      normalizedKwonlyCount =
-          static_cast<unsigned>(posElems.size() - positionalTypes.size());
+    unsigned visiblePosargs = std::min<unsigned>(
+        static_cast<unsigned>(posElems.size()), visiblePosargLimit);
+    if (visiblePosargs > positionalTypes.size()) {
+      normalizedKwonlyCount = visiblePosargs - positionalTypes.size();
       for (size_t index = 0; index < normalizedKwonlyCount; ++index) {
         if (!isSubtypeOf(posElems[positionalTypes.size() + index],
                          kwonlyTypes[index]))
           return op->emitOpError("normalized keyword-only argument type "
                                  "does not match parameter type");
+      }
+    }
+    if (posElems.size() > visiblePosargLimit) {
+      unsigned closureCount =
+          static_cast<unsigned>(posElems.size() - visiblePosargLimit);
+      for (unsigned index = 0; index < closureCount; ++index) {
+        if (!isSubtypeOf(posElems[visiblePosargLimit + index],
+                         closureTypes[index]))
+          return op->emitOpError("closure argument type does not match "
+                                 "target closure_types");
       }
     }
   } else {

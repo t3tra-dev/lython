@@ -229,8 +229,10 @@ bool hasOwnedObjectHeaderResult(mlir::Operation *callee) {
            callee, OwnershipContractAttrs::kOwnedResults)) {
     if (index < 0 || static_cast<unsigned>(index) >= function.getNumResults())
       continue;
-    if (object_abi::Header::isOwned(
-            function.getResultTypes()[static_cast<unsigned>(index)]))
+    mlir::Type resultType =
+        function.getResultTypes()[static_cast<unsigned>(index)];
+    if (object_abi::Header::isOwned(resultType) ||
+        object_abi::exception_abi::Header::isOwned(resultType))
       return true;
   }
   return false;
@@ -301,7 +303,9 @@ void importRuntimeSymbol(mlir::ModuleOp target, mlir::Operation *op) {
 
   mlir::OpBuilder builder(target.getContext());
   builder.setInsertionPointToEnd(target.getBody());
-  builder.clone(*op);
+  mlir::Operation *cloned = builder.clone(*op);
+  if (auto symbol = llvm::dyn_cast<mlir::SymbolOpInterface>(cloned))
+    symbol.setVisibility(mlir::SymbolTable::Visibility::Private);
 }
 
 mlir::LogicalResult importRuntimeModule(mlir::ModuleOp target,

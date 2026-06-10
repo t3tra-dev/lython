@@ -9,6 +9,8 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 
+#include <optional>
+
 #define GET_OP_CLASSES
 #include "PyOps.h.inc"
 #undef GET_OP_CLASSES
@@ -73,6 +75,31 @@ static bool hasUseAfter(mlir::Operation *anchor, mlir::Value value) {
       return true;
   }
   return false;
+}
+
+static std::optional<int64_t> constantTupleIndex(mlir::Value value) {
+  auto constant = value.getDefiningOp<mlir::arith::ConstantOp>();
+  if (!constant)
+    return std::nullopt;
+  auto integer = mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue());
+  if (!integer)
+    return std::nullopt;
+  int64_t index = integer.getInt();
+  if (index < 0)
+    return std::nullopt;
+  return index;
+}
+
+static std::optional<mlir::Type> tupleElementType(TupleType tupleType,
+                                                  int64_t index) {
+  auto elementTypes = tupleType.getElementTypes();
+  if (elementTypes.empty())
+    return std::nullopt;
+  if (elementTypes.size() == 1)
+    return elementTypes.front();
+  if (index < 0 || index >= static_cast<int64_t>(elementTypes.size()))
+    return std::nullopt;
+  return elementTypes[index];
 }
 
 static void consumeInlineClassSource(
@@ -198,16 +225,15 @@ struct TupleCreateLowering : public mlir::OpConversionPattern<TupleCreateOp> {
     rewriter.create<mlir::memref::StoreOp>(
         op.getLoc(), createI64Constant(op.getLoc(), rewriter, 0), header,
         createIndexConstant(op.getLoc(), rewriter, 1));
-    rewriter.create<mlir::memref::StoreOp>(
-        op.getLoc(), createI64Constant(op.getLoc(), rewriter, 0), header,
-        createIndexConstant(op.getLoc(), rewriter, 2));
 
     auto elementTypes = tupleType.getElementTypes();
     auto itemCarrierType = class_layout::objectCarrierType(itemsType);
     for (auto [index, element] : llvm::enumerate(adaptor.getElements())) {
+      mlir::Type logicalElementType =
+          elementTypes.size() == 1 ? elementTypes.front() : elementTypes[index];
       mlir::Value source = element.front();
       if (itemCarrierType) {
-        auto classType = mlir::dyn_cast<ClassType>(elementTypes[index]);
+        auto classType = mlir::dyn_cast<ClassType>(logicalElementType);
         source = lowering::value::tuple::ClassSlot::carrierFromValues(
             op.getLoc(), element, itemCarrierType, rewriter);
         if (!source)
@@ -234,7 +260,7 @@ struct TupleCreateLowering : public mlir::OpConversionPattern<TupleCreateOp> {
         }
       } else {
         mlir::Value stored = Slot::storage(
-            op.getLoc(), element, elementTypes[index],
+            op.getLoc(), element, logicalElementType,
             itemsType.getElementType(), module, rewriter, *typeConverter);
         if (!stored)
           return mlir::failure();
@@ -244,7 +270,7 @@ struct TupleCreateLowering : public mlir::OpConversionPattern<TupleCreateOp> {
                                 static_cast<int64_t>(index)));
         Slot::markTransfer(store.getOperation());
       }
-      Slot::releaseSource(op.getLoc(), source, elementTypes[index], module,
+      Slot::releaseSource(op.getLoc(), source, logicalElementType, module,
                           rewriter, *typeConverter);
     }
 
@@ -255,13 +281,71 @@ struct TupleCreateLowering : public mlir::OpConversionPattern<TupleCreateOp> {
   }
 };
 
+struct TupleGetLowering : public mlir::OpConversionPattern<TupleGetOp> {
+  TupleGetLowering(PyLLVMTypeConverter &converter, mlir::MLIRContext *ctx)
+      : mlir::OpConversionPattern<TupleGetOp>(converter, ctx) {}
+
+  mlir::LogicalResult
+  matchAndRewrite(TupleGetOp op, OneToNOpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    mlir::ModuleOp module = op->getParentOfType<mlir::ModuleOp>();
+    if (!module)
+      return mlir::failure();
+    auto *typeConverter =
+        static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
+    auto tupleType = mlir::dyn_cast<TupleType>(op.getTuple().getType());
+    if (!tupleType)
+      return mlir::failure();
+    mlir::ValueRange tuple = adaptor.getTuple();
+    if (tuple.size() != 2)
+      return mlir::failure();
+    mlir::Value items = tuple[kTupleItemsComponent];
+    auto itemsType = mlir::dyn_cast<mlir::MemRefType>(items.getType());
+    if (!itemsType)
+      return mlir::failure();
+
+    std::optional<int64_t> index = constantTupleIndex(op.getIndex());
+    if (!index)
+      return rewriter.notifyMatchFailure(op, "tuple.get requires static index");
+    std::optional<mlir::Type> elementType = tupleElementType(tupleType, *index);
+    if (!elementType)
+      return mlir::failure();
+    if (class_layout::objectCarrierType(itemsType) &&
+        mlir::isa<ClassType>(*elementType))
+      return rewriter.notifyMatchFailure(
+          op, "tuple.get for inline class tuple elements is not implemented");
+
+    mlir::Value loaded = rewriter.create<mlir::memref::LoadOp>(
+        op.getLoc(), items, createIndexConstant(op.getLoc(), rewriter, *index));
+    if (!isPyType(*elementType)) {
+      if (loaded.getType() != op.getResult().getType())
+        return mlir::failure();
+      rewriter.replaceOp(op, loaded);
+      return mlir::success();
+    }
+
+    ownership::aggregate::Slot::markLoad(loaded);
+    if (mlir::failed(
+            Slot::refcount(op.getLoc(), loaded, *elementType, module, rewriter,
+                           *typeConverter, "incref", /*aggregateEffect=*/false,
+                           ThreadSafetyAttrs::kPremiseAggregateBorrow)))
+      return mlir::failure();
+    if (mlir::failed(Slot::replaceBoxedStorage(op.getOperation(), loaded,
+                                               *elementType, module, rewriter,
+                                               *typeConverter)))
+      return mlir::failure();
+    return mlir::success();
+  }
+};
+
 } // namespace
 
 namespace lowering::value::tuple::Patterns {
 void populate(PyLLVMTypeConverter &typeConverter,
               mlir::RewritePatternSet &patterns) {
   auto *ctx = patterns.getContext();
-  patterns.add<TupleEmptyLowering, TupleCreateLowering>(typeConverter, ctx);
+  patterns.add<TupleEmptyLowering, TupleCreateLowering, TupleGetLowering>(
+      typeConverter, ctx);
 }
 } // namespace lowering::value::tuple::Patterns
 

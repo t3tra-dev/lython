@@ -1,6 +1,8 @@
 #pragma once
 
+#include "Common/ClassLayout.h"
 #include "Common/Container.h"
+#include "Common/Object.h"
 #include "PyDialectTypes.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -180,6 +182,7 @@ enum class SlotPolicy {
   NativeInteger,
   NativeBool,
   NativeFloat,
+  ObjectParts,
 };
 
 struct Slot {
@@ -196,6 +199,8 @@ struct Slot {
       return SlotPolicy::NativeFloat;
     if (mlir::isa<NoneType>(type))
       return SlotPolicy::NativeBool;
+    if (mlir::isa<StrType>(type))
+      return SlotPolicy::ObjectParts;
     return SlotPolicy::Unsupported;
   }
 
@@ -209,6 +214,7 @@ struct Slot {
     case SlotPolicy::NativeBool:
     case SlotPolicy::NativeFloat:
       return true;
+    case SlotPolicy::ObjectParts:
     case SlotPolicy::Unsupported:
       return false;
     }
@@ -231,6 +237,18 @@ struct Slot {
       return mlir::IntegerType::get(ctx, 8);
     case SlotPolicy::NativeFloat:
       return mlir::Float64Type::get(ctx);
+    case SlotPolicy::ObjectParts: {
+      llvm::SmallVector<mlir::Type, 2> parts;
+      object_abi::str_abi::Parts::storageTypes(ctx, parts);
+      llvm::SmallVector<mlir::MemRefType, 2> memrefs;
+      for (mlir::Type part : parts) {
+        auto memref = mlir::dyn_cast<mlir::MemRefType>(part);
+        if (!memref)
+          return {};
+        memrefs.push_back(memref);
+      }
+      return class_layout::objectCarrierType(ctx, memrefs);
+    }
     case SlotPolicy::Unsupported:
       return {};
     }

@@ -33,7 +33,7 @@ StorageKind classify(ListType listType) {
   if (!listType)
     return StorageKind::Unsupported;
   mlir::Type elementType = listType.getElementType();
-  if (container::Slot::packedI64Bootstrap(elementType) ||
+  if (container::Slot::supported(elementType) ||
       mlir::isa<ClassType>(elementType))
     return StorageKind::TypedMemRefSlots;
   return StorageKind::Unsupported;
@@ -512,10 +512,10 @@ struct ListAppendLowering : public mlir::OpConversionPattern<ListAppendOp> {
         {
           mlir::OpBuilder::InsertionGuard guard(rewriter);
           rewriter.setInsertionPointToStart(ifOp.thenBlock());
-          container::Managed::lock(op.getLoc(), lock, rewriter);
+          container::Managed::lock(op.getLoc(), header, lock, rewriter);
           if (mlir::failed(emitAppendBody(/*sharedAccess=*/true)))
             return mlir::failure();
-          container::Managed::unlock(op.getLoc(), lock, rewriter);
+          container::Managed::unlock(op.getLoc(), header, lock, rewriter);
         }
         {
           mlir::OpBuilder::InsertionGuard guard(rewriter);
@@ -732,10 +732,10 @@ struct ListRemoveLowering : public mlir::OpConversionPattern<ListRemoveOp> {
       {
         mlir::OpBuilder::InsertionGuard guard(rewriter);
         rewriter.setInsertionPointToStart(ifOp.thenBlock());
-        container::Managed::lock(op.getLoc(), lock, rewriter);
+        container::Managed::lock(op.getLoc(), header, lock, rewriter);
         if (mlir::failed(emitRemoveBody(/*sharedAccess=*/true)))
           return mlir::failure();
-        container::Managed::unlock(op.getLoc(), lock, rewriter);
+        container::Managed::unlock(op.getLoc(), header, lock, rewriter);
       }
       {
         mlir::OpBuilder::InsertionGuard guard(rewriter);
@@ -839,12 +839,12 @@ struct ListGetLowering : public mlir::OpConversionPattern<ListGetOp> {
         {
           mlir::OpBuilder::InsertionGuard guard(rewriter);
           rewriter.setInsertionPointToStart(ifOp.thenBlock());
-          container::Managed::lock(op.getLoc(), lock, rewriter);
+          container::Managed::lock(op.getLoc(), header, lock, rewriter);
           if (mlir::failed(
                   emitLoadAndRetain(ThreadSafetyAttrs::kPremiseLockedBorrow,
                                     /*sharedAccess=*/true)))
             return mlir::failure();
-          container::Managed::unlock(op.getLoc(), lock, rewriter);
+          container::Managed::unlock(op.getLoc(), header, lock, rewriter);
         }
         {
           mlir::OpBuilder::InsertionGuard guard(rewriter);
@@ -862,13 +862,13 @@ struct ListGetLowering : public mlir::OpConversionPattern<ListGetOp> {
         {
           mlir::OpBuilder::InsertionGuard guard(rewriter);
           rewriter.setInsertionPointToStart(ifOp.thenBlock());
-          container::Managed::lock(op.getLoc(), lock, rewriter);
+          container::Managed::lock(op.getLoc(), header, lock, rewriter);
           mlir::FailureOr<mlir::Value> loaded =
               emitLoadAndRetain(ThreadSafetyAttrs::kPremiseLockedBorrow,
                                 /*sharedAccess=*/true);
           if (mlir::failed(loaded))
             return mlir::failure();
-          container::Managed::unlock(op.getLoc(), lock, rewriter);
+          container::Managed::unlock(op.getLoc(), header, lock, rewriter);
           rewriter.create<mlir::scf::YieldOp>(op.getLoc(), *loaded);
         }
         {

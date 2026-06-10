@@ -39,13 +39,20 @@ struct RuntimeSymbols {
       "LyTraceback_PrintMessage"};
   static constexpr llvm::StringLiteral kLongFromI64{"LyLong_FromI64"};
   static constexpr llvm::StringLiteral kLongAsI64{"LyLong_AsI64"};
+  static constexpr llvm::StringLiteral kLongAdd{"LyLong_Add"};
+  static constexpr llvm::StringLiteral kLongSub{"LyLong_Sub"};
+  static constexpr llvm::StringLiteral kLongMul{"LyLong_Mul"};
+  static constexpr llvm::StringLiteral kLongCompare{"LyLong_Compare"};
+  static constexpr llvm::StringLiteral kLongRepr{"LyLong_Repr"};
   static constexpr llvm::StringLiteral kLongDecRef{"LyLong_DecRef"};
   static constexpr llvm::StringLiteral kUnicodeFromBytes{"LyUnicode_FromBytes"};
   static constexpr llvm::StringLiteral kUnicodeAlloc{"__ly_unicode_alloc"};
   static constexpr llvm::StringLiteral kUnicodeConcat{"LyUnicode_Concat"};
   static constexpr llvm::StringLiteral kUnicodeConcat3{"LyUnicode_Concat3"};
   static constexpr llvm::StringLiteral kUnicodeCopy{"LyUnicode_Copy"};
+  static constexpr llvm::StringLiteral kUnicodeEqBool{"LyUnicode_EqBool"};
   static constexpr llvm::StringLiteral kUnicodeLength{"LyUnicode_Length"};
+  static constexpr llvm::StringLiteral kUnicodePrint{"LyUnicode_Print"};
   static constexpr llvm::StringLiteral kUnicodePrintLine{"LyUnicode_PrintLine"};
   static constexpr llvm::StringLiteral kUnicodeDecRef{"LyUnicode_DecRef"};
   static constexpr llvm::StringLiteral kUnicodeFromI64{"LyUnicode_FromI64"};
@@ -132,6 +139,8 @@ static constexpr llvm::StringLiteral kOrderingSeqCst{"seq_cst"};
 
 static constexpr llvm::StringLiteral kPremiseOwnedToken{"owned-token"};
 static constexpr llvm::StringLiteral kPremiseEntryBorrowed{"entry-borrowed"};
+static constexpr llvm::StringLiteral kPremiseCapturedBorrowed{
+    "captured-borrowed"};
 static constexpr llvm::StringLiteral kPremiseLockedBorrow{"locked-borrow"};
 static constexpr llvm::StringLiteral kPremiseAggregateBorrow{
     "aggregate-borrow"};

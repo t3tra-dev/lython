@@ -5,23 +5,35 @@
             "includePath": [
                 "${workspaceFolder}/**",
                 "${workspaceFolder}/src/**",
+                "${workspaceFolder}/src/lython/emitter/include",
+                "${workspaceFolder}/src/lython/parser/include",
+                "${workspaceFolder}/src/lython/dialects/cpp",
+                "${workspaceFolder}/build/src/lython/dialects",
                 "${workspaceFolder}/src/lython/dialects/**",
                 "${workspaceFolder}/build/src/lython/dialects/**",
                 "${workspaceFolder}/src/lython/lowering/**",
                 "${workspaceFolder}/build/src/lython/lowering/**",
                 "${workspaceFolder}/src/lython/runtime/**",
                 "${workspaceFolder}/build/src/lython/runtime/**",
-                "${workspaceFolder}/third_party/llvm-project/llvm/include/**",
-                "${workspaceFolder}/third_party/llvm-project/mlir/include/**",
-                "${workspaceFolder}/third_party/llvm-project/build/include/**",
-                "${workspaceFolder}/third_party/llvm-project/build/tools/mlir/include/**",
+                "/opt/homebrew/opt/llvm@20/include/**",
                 "/opt/homebrew/include/**"
             ],
-            "compilerPath": "/opt/homebrew/bin/clang++",
+            "compilerPath": "/opt/homebrew/opt/llvm@20/bin/clang++",
             "cStandard": "c17",
             "cppStandard": "c++17",
             "intelliSenseMode": "macos-clang-arm64",
             "configurationProvider": "ms-vscode.cmake-tools",
+            "mergeConfigurations": true,
+            "browse": {
+                "path": [
+                    "${workspaceFolder}/src",
+                    "${workspaceFolder}/build/src/lython/dialects",
+                    "${workspaceFolder}/build/src/lython/lowering",
+                    "${workspaceFolder}/build/src/lython/runtime",
+                    "/opt/homebrew/opt/llvm@20/include"
+                ],
+                "limitSymbolsToIncludedHeaders": true
+            },
             "compileCommands": "${workspaceFolder}/build/compile_commands.json"
         }
     ],

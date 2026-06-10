@@ -487,8 +487,6 @@ mlir::LogicalResult MakeFunctionOp::verify() {
       return emitOpError("kwdefaults must be a !py.dict value");
     if (!isSubtypeOf(dictTy.getKeyType(), StrType::get(getContext())))
       return emitOpError("kwdefaults keys must be compatible with !py.str");
-    if (!isPyType(dictTy.getValueType()))
-      return emitOpError("kwdefaults values must be !py.* typed values");
 
     auto kwonlyTypes = expectedSig.getKwOnlyTypes();
     auto kwonlyNames = pyFunc.getKwonlyNamesAttr();

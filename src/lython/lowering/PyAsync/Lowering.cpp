@@ -559,6 +559,7 @@ createExceptionWithMessage(mlir::Location loc, mlir::ModuleOp module,
                            mlir::ConversionPatternRewriter &rewriter,
                            const PyLLVMTypeConverter &typeConverter,
                            llvm::StringRef messageText) {
+  static constexpr int64_t kRuntimeErrorClassId = 3;
   RuntimeAPI runtime(module, rewriter, typeConverter);
   llvm::SmallVector<mlir::Type> resultTypes;
   object_abi::exception_abi::Parts::storageTypes(module.getContext(),
@@ -576,9 +577,10 @@ createExceptionWithMessage(mlir::Location loc, mlir::ModuleOp module,
                               mlir::TypeRange(unicodeTypes),
                               mlir::ValueRange{bytes, start, messageLength});
   llvm::SmallVector<mlir::Value, 3> parts;
-  auto header =
-      runtime.call(loc, RuntimeSymbols::kExceptionNew,
-                   mlir::TypeRange{resultTypes.front()}, mlir::ValueRange{});
+  mlir::Value classId = runtime.getI64Constant(loc, kRuntimeErrorClassId);
+  auto header = runtime.call(loc, RuntimeSymbols::kExceptionNew,
+                             mlir::TypeRange{resultTypes.front()},
+                             mlir::ValueRange{classId});
   parts.push_back(header.getResult());
   parts.append(message.getResults().begin(), message.getResults().end());
   return packAsyncPayload(loc, ExceptionType::get(module.getContext()), parts,

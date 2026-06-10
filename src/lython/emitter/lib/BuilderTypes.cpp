@@ -1,0 +1,2317 @@
+#include "BuilderImpl.h"
+
+#include "lython/parser/Parser.h"
+
+#include "mlir/Dialect/Async/IR/Async.h"
+
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/raw_ostream.h"
+
+#include <charconv>
+#include <cstring>
+#include <functional>
+#include <system_error>
+
+namespace lython::emitter {
+namespace {
+
+std::int64_t clampSliceIndex(std::int64_t value, std::int64_t length,
+                             std::int64_t lower, std::int64_t upper) {
+  if (value < 0)
+    value += length;
+  if (value < lower)
+    return lower;
+  if (value > upper)
+    return upper;
+  return value;
+}
+
+std::optional<double> staticNumericValue(const parser::Node &node) {
+  if (node.kind == "Constant") {
+    const parser::FieldValue *value = valueField(node, "value");
+    if (const auto *number = value ? std::get_if<double>(value) : nullptr)
+      return *number;
+    if (const auto *integer =
+            value ? std::get_if<std::int64_t>(value) : nullptr)
+      return static_cast<double>(*integer);
+    return std::nullopt;
+  }
+  if (node.kind == "UnaryOp") {
+    std::optional<std::string> op = symbolField(node, "op");
+    const parser::NodePtr *operand = nodeField(node, "operand");
+    if (!op || !operand || !*operand)
+      return std::nullopt;
+    std::optional<double> value = staticNumericValue(**operand);
+    if (!value)
+      return std::nullopt;
+    if (*op == "+")
+      return *value;
+    if (*op == "-")
+      return -*value;
+  }
+  return std::nullopt;
+}
+
+bool typeInferenceDependsOnEnvironmentUncached(const parser::Node &node) {
+  if (node.kind == "Name" || node.kind == "Attribute" || node.kind == "Call" ||
+      node.kind == "Subscript" || node.kind == "Await" ||
+      node.kind == "Lambda" || node.kind == "ListComp" ||
+      node.kind == "SetComp" || node.kind == "DictComp" ||
+      node.kind == "GeneratorExp" || node.kind == "Yield" ||
+      node.kind == "YieldFrom")
+    return true;
+
+  for (const parser::Field &field : node.fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (*child && typeInferenceDependsOnEnvironmentUncached(**child))
+        return true;
+      continue;
+    }
+    if (const auto *children =
+            std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
+      for (const parser::NodePtr &child : *children)
+        if (child && typeInferenceDependsOnEnvironmentUncached(*child))
+          return true;
+    }
+  }
+  return false;
+}
+
+bool isLenCall(const parser::Node &node) {
+  if (node.kind != "Call")
+    return false;
+  const parser::NodePtr *func = nodeField(node, "func");
+  const std::vector<parser::NodePtr> *args = nodeListField(node, "args");
+  const std::vector<parser::NodePtr> *keywords =
+      nodeListField(node, "keywords");
+  if (!func || !*func || (*func)->kind != "Name" || !args ||
+      args->size() != 1 || !args->front() || (keywords && !keywords->empty()))
+    return false;
+  const std::string *name = stringField(**func, "id");
+  return name && *name == "len";
+}
+
+bool isRangeCall(const parser::Node &node) {
+  if (node.kind != "Call")
+    return false;
+  const parser::NodePtr *func = nodeField(node, "func");
+  if (!func || !*func || (*func)->kind != "Name")
+    return false;
+  const std::string *name = stringField(**func, "id");
+  return name && *name == "range";
+}
+
+struct LambdaOracle final : typing::Oracle {
+  std::function<std::optional<typing::Term>(const typing::Term &,
+                                            llvm::StringRef)>
+      attributeFn;
+  std::function<std::optional<typing::Term>(const typing::Term &,
+                                            llvm::ArrayRef<typing::Term>)>
+      callFn;
+  std::function<std::optional<typing::Term>(const typing::Term &,
+                                            const typing::Term &)>
+      subscriptFn;
+  std::function<std::optional<typing::Term>(const typing::Term &)> awaitFn;
+
+  std::optional<typing::Term> attribute(const typing::Term &owner,
+                                        llvm::StringRef name) const override {
+    if (attributeFn)
+      return attributeFn(owner, name);
+    return typing::Oracle::attribute(owner, name);
+  }
+
+  std::optional<typing::Term>
+  call(const typing::Term &callee,
+       llvm::ArrayRef<typing::Term> args) const override {
+    if (callFn)
+      return callFn(callee, args);
+    return typing::Oracle::call(callee, args);
+  }
+
+  std::optional<typing::Term>
+  subscript(const typing::Term &container,
+            const typing::Term &index) const override {
+    if (subscriptFn)
+      return subscriptFn(container, index);
+    return typing::Oracle::subscript(container, index);
+  }
+
+  std::optional<typing::Term>
+  awaitable(const typing::Term &awaitable) const override {
+    if (awaitFn)
+      return awaitFn(awaitable);
+    return typing::Oracle::awaitable(awaitable);
+  }
+};
+
+} // namespace
+
+std::optional<typing::Term>
+Builder::Impl::typeTermFromType(mlir::Type type) const {
+  if (!type)
+    return std::nullopt;
+  if (mlir::isa<py::IntType>(type))
+    return typing::Term::con("int");
+  if (mlir::isa<py::FloatType>(type))
+    return typing::Term::con("float");
+  if (mlir::isa<py::BoolType>(type))
+    return typing::Term::con("bool");
+  if (mlir::isa<py::StrType>(type))
+    return typing::Term::con("str");
+  if (mlir::isa<py::NoneType>(type))
+    return typing::Term::con("None");
+  if (mlir::isa<py::ExceptionType>(type))
+    return typing::Term::con("Exception");
+  if (auto classTy = mlir::dyn_cast<py::ClassType>(type))
+    return typing::Term::con("class:" + classTy.getClassName().str());
+  if (auto listTy = mlir::dyn_cast<py::ListType>(type)) {
+    std::optional<typing::Term> element =
+        typeTermFromType(listTy.getElementType());
+    if (!element)
+      return std::nullopt;
+    return typing::Term::con("list", {*element});
+  }
+  if (auto dictTy = mlir::dyn_cast<py::DictType>(type)) {
+    std::optional<typing::Term> key = typeTermFromType(dictTy.getKeyType());
+    std::optional<typing::Term> value = typeTermFromType(dictTy.getValueType());
+    if (!key || !value)
+      return std::nullopt;
+    return typing::Term::con("dict", {*key, *value});
+  }
+  if (auto tupleTy = mlir::dyn_cast<py::TupleType>(type)) {
+    std::vector<typing::Term> elements;
+    elements.reserve(tupleTy.getElementTypes().size());
+    for (mlir::Type elementType : tupleTy.getElementTypes()) {
+      std::optional<typing::Term> element = typeTermFromType(elementType);
+      if (!element)
+        return std::nullopt;
+      elements.push_back(*element);
+    }
+    return typing::Term::con("tuple", elements);
+  }
+  if (auto coroTy = mlir::dyn_cast<py::CoroutineType>(type)) {
+    std::optional<typing::Term> result =
+        typeTermFromType(coroTy.getResultType());
+    if (!result)
+      return std::nullopt;
+    return typing::Term::con("coro", {*result});
+  }
+  if (auto taskTy = mlir::dyn_cast<py::TaskType>(type)) {
+    std::optional<typing::Term> result =
+        typeTermFromType(taskTy.getResultType());
+    if (!result)
+      return std::nullopt;
+    return typing::Term::con("task", {*result});
+  }
+  if (auto futureTy = mlir::dyn_cast<py::FutureType>(type)) {
+    std::optional<typing::Term> result =
+        typeTermFromType(futureTy.getResultType());
+    if (!result)
+      return std::nullopt;
+    return typing::Term::con("future", {*result});
+  }
+  if (auto asyncValue = mlir::dyn_cast<mlir::async::ValueType>(type)) {
+    std::optional<typing::Term> value =
+        typeTermFromType(asyncValue.getValueType());
+    if (!value)
+      return std::nullopt;
+    return typing::Term::con("async.value", {*value});
+  }
+  if (auto funcTy = mlir::dyn_cast<py::FuncType>(type)) {
+    py::FuncSignatureType signature = funcTy.getSignature();
+    std::vector<typing::Term> args;
+    std::vector<typing::Term> kwonly;
+    std::vector<typing::Term> results;
+    args.reserve(signature.getPositionalTypes().size());
+    kwonly.reserve(signature.getKwOnlyTypes().size());
+    results.reserve(signature.getResultTypes().size());
+    for (mlir::Type argType : signature.getPositionalTypes()) {
+      std::optional<typing::Term> arg = typeTermFromType(argType);
+      if (!arg)
+        return std::nullopt;
+      args.push_back(*arg);
+    }
+    for (mlir::Type argType : signature.getKwOnlyTypes()) {
+      std::optional<typing::Term> arg = typeTermFromType(argType);
+      if (!arg)
+        return std::nullopt;
+      kwonly.push_back(*arg);
+    }
+    for (mlir::Type resultType : signature.getResultTypes()) {
+      std::optional<typing::Term> result = typeTermFromType(resultType);
+      if (!result)
+        return std::nullopt;
+      results.push_back(*result);
+    }
+    return typing::Term::func(args, results, kwonly);
+  }
+  if (auto intTy = mlir::dyn_cast<mlir::IntegerType>(type))
+    return typing::Term::con("Int[" + std::to_string(intTy.getWidth()) + "]");
+  if (auto floatTy = mlir::dyn_cast<mlir::FloatType>(type))
+    return typing::Term::con("Float[" + std::to_string(floatTy.getWidth()) +
+                             "]");
+  if (auto tensorTy = mlir::dyn_cast<mlir::RankedTensorType>(type)) {
+    std::vector<typing::Term> args;
+    std::optional<typing::Term> element =
+        typeTermFromType(tensorTy.getElementType());
+    if (!element)
+      return std::nullopt;
+    args.push_back(*element);
+    for (std::int64_t dim : tensorTy.getShape())
+      args.push_back(typing::Term::con(std::to_string(dim)));
+    return typing::Term::con("Tensor", args);
+  }
+  return typing::Term::con(typeString(type));
+}
+
+std::optional<mlir::Type>
+Builder::Impl::typeFromTypeTerm(const typing::Term &term) {
+  if (term.kind == typing::Term::Kind::Var)
+    return std::nullopt;
+  if (term.kind == typing::Term::Kind::Func) {
+    llvm::SmallVector<mlir::Type> args;
+    llvm::SmallVector<mlir::Type> kwonly;
+    llvm::SmallVector<mlir::Type> results;
+    args.reserve(term.args.size());
+    kwonly.reserve(term.kwonly.size());
+    results.reserve(term.results.size());
+    for (const typing::Term &argTerm : term.args) {
+      std::optional<mlir::Type> argType = typeFromTypeTerm(argTerm);
+      if (!argType)
+        return std::nullopt;
+      args.push_back(*argType);
+    }
+    for (const typing::Term &argTerm : term.kwonly) {
+      std::optional<mlir::Type> argType = typeFromTypeTerm(argTerm);
+      if (!argType)
+        return std::nullopt;
+      kwonly.push_back(*argType);
+    }
+    for (const typing::Term &resultTerm : term.results) {
+      std::optional<mlir::Type> resultType = typeFromTypeTerm(resultTerm);
+      if (!resultType)
+        return std::nullopt;
+      results.push_back(*resultType);
+    }
+    return py::FuncType::get(
+        &context,
+        py::FuncSignatureType::get(&context, args, kwonly, {}, {}, results));
+  }
+
+  if (term.name == "int")
+    return intType();
+  if (term.name == "float")
+    return floatType();
+  if (term.name == "bool")
+    return boolType();
+  if (term.name == "str")
+    return strType();
+  if (term.name == "None")
+    return noneType();
+  if (term.name == "Exception")
+    return exceptionType();
+  if (llvm::StringRef(term.name).starts_with("class:"))
+    return classType(llvm::StringRef(term.name).drop_front(strlen("class:")));
+  if (term.name == "list" && term.args.size() == 1) {
+    std::optional<mlir::Type> element = typeFromTypeTerm(term.args.front());
+    if (!element)
+      return std::nullopt;
+    return listType(*element);
+  }
+  if (term.name == "dict" && term.args.size() == 2) {
+    std::optional<mlir::Type> key = typeFromTypeTerm(term.args[0]);
+    std::optional<mlir::Type> value = typeFromTypeTerm(term.args[1]);
+    if (!key || !value)
+      return std::nullopt;
+    return dictType(*key, *value);
+  }
+  if (term.name == "tuple") {
+    llvm::SmallVector<mlir::Type> elements;
+    elements.reserve(term.args.size());
+    for (const typing::Term &arg : term.args) {
+      std::optional<mlir::Type> element = typeFromTypeTerm(arg);
+      if (!element)
+        return std::nullopt;
+      elements.push_back(*element);
+    }
+    return py::TupleType::get(&context, elements);
+  }
+  if ((term.name == "coro" || term.name == "task" || term.name == "future" ||
+       term.name == "async.value") &&
+      term.args.size() == 1) {
+    std::optional<mlir::Type> result = typeFromTypeTerm(term.args.front());
+    if (!result)
+      return std::nullopt;
+    if (term.name == "coro")
+      return coroutineType(*result);
+    if (term.name == "task")
+      return taskType(*result);
+    if (term.name == "future")
+      return futureType(*result);
+    return mlir::async::ValueType::get(*result);
+  }
+  if (llvm::StringRef(term.name).starts_with("Int[") &&
+      llvm::StringRef(term.name).ends_with("]")) {
+    unsigned width = 0;
+    llvm::StringRef text(term.name);
+    if (!text.drop_front(4).drop_back().getAsInteger(10, width) && width > 0)
+      return builder.getIntegerType(width);
+  }
+  if (llvm::StringRef(term.name).starts_with("Float[") &&
+      llvm::StringRef(term.name).ends_with("]")) {
+    unsigned width = 0;
+    llvm::StringRef text(term.name);
+    if (!text.drop_front(6).drop_back().getAsInteger(10, width)) {
+      if (width == 16)
+        return builder.getF16Type();
+      if (width == 32)
+        return builder.getF32Type();
+      if (width == 64)
+        return builder.getF64Type();
+    }
+  }
+  if (term.name == "Tensor" && term.args.size() >= 2) {
+    std::optional<mlir::Type> element = typeFromTypeTerm(term.args.front());
+    if (!element)
+      return std::nullopt;
+    llvm::SmallVector<std::int64_t> shape;
+    for (const typing::Term &dim :
+         llvm::ArrayRef<typing::Term>(term.args).drop_front()) {
+      std::int64_t value = 0;
+      if (dim.kind != typing::Term::Kind::Con ||
+          llvm::StringRef(dim.name).getAsInteger(10, value))
+        return std::nullopt;
+      shape.push_back(value);
+    }
+    return mlir::RankedTensorType::get(shape, *element);
+  }
+  return std::nullopt;
+}
+
+std::string typeString(mlir::Type type) {
+  std::string storage;
+  llvm::raw_string_ostream os(storage);
+  type.print(os);
+  return storage;
+}
+
+py::IntType Builder::Impl::intType() { return py::IntType::get(&context); }
+py::FloatType Builder::Impl::floatType() {
+  return py::FloatType::get(&context);
+}
+py::BoolType Builder::Impl::boolType() { return py::BoolType::get(&context); }
+py::StrType Builder::Impl::strType() { return py::StrType::get(&context); }
+py::NoneType Builder::Impl::noneType() { return py::NoneType::get(&context); }
+py::ExceptionType Builder::Impl::exceptionType() {
+  return py::ExceptionType::get(&context);
+}
+py::ExceptionCellType Builder::Impl::exceptionCellType() {
+  return py::ExceptionCellType::get(&context);
+}
+py::ClassType Builder::Impl::classType(llvm::StringRef className) {
+  return py::ClassType::get(&context, className);
+}
+py::CoroutineType Builder::Impl::coroutineType(mlir::Type resultType) {
+  return py::CoroutineType::get(&context, resultType);
+}
+py::TaskType Builder::Impl::taskType(mlir::Type resultType) {
+  return py::TaskType::get(&context, resultType);
+}
+py::FutureType Builder::Impl::futureType(mlir::Type resultType) {
+  return py::FutureType::get(&context, resultType);
+}
+py::DictType Builder::Impl::dictType(mlir::Type keyType, mlir::Type valueType) {
+  return py::DictType::get(&context, keyType, valueType);
+}
+py::ListType Builder::Impl::listType(mlir::Type elementType) {
+  return py::ListType::get(&context, elementType);
+}
+mlir::Type Builder::Impl::i32Type() { return builder.getI32Type(); }
+mlir::Type Builder::Impl::i1Type() { return builder.getI1Type(); }
+
+bool Builder::Impl::typeInferenceDependsOnEnvironment(
+    const parser::Node &node) {
+  auto cached = typeInferenceDependencyCache.find(&node);
+  if (cached != typeInferenceDependencyCache.end())
+    return cached->second;
+  bool depends = typeInferenceDependsOnEnvironmentUncached(node);
+  typeInferenceDependencyCache.try_emplace(&node, depends);
+  return depends;
+}
+
+std::optional<mlir::Type>
+Builder::Impl::inferExpressionTypeAlgorithmM(const parser::Node &expr) {
+  LambdaOracle oracle;
+  typing::Oracle defaults;
+
+  oracle.attributeFn =
+      [&](const typing::Term &owner,
+          llvm::StringRef name) -> std::optional<typing::Term> {
+    if (owner.kind != typing::Term::Kind::Con)
+      return std::nullopt;
+    llvm::StringRef ownerName(owner.name);
+    if (!ownerName.starts_with("class:"))
+      return std::nullopt;
+    auto cls = classes.find(ownerName.drop_front(strlen("class:")).str());
+    if (cls == classes.end())
+      return std::nullopt;
+    auto field = cls->second.fields.find(name.str());
+    if (field == cls->second.fields.end())
+      return std::nullopt;
+    return typeTermFromType(field->second);
+  };
+
+  oracle.callFn =
+      [&](const typing::Term &callee,
+          llvm::ArrayRef<typing::Term> args) -> std::optional<typing::Term> {
+    if (callee.kind == typing::Term::Kind::Con) {
+      if (callee.name == "builtin:bool" && args.size() <= 1)
+        return typing::Term::con("bool");
+      if (callee.name == "builtin:int" && args.size() <= 1)
+        return typing::Term::con("int");
+      if (callee.name == "builtin:float" && args.size() <= 1)
+        return typing::Term::con("float");
+      if ((callee.name == "builtin:str" && args.size() <= 1) ||
+          (callee.name == "builtin:repr" && args.size() == 1))
+        return typing::Term::con("str");
+      if (callee.name == "builtin:len" && args.size() == 1)
+        return typing::Term::con("int");
+      if (llvm::StringRef(callee.name).starts_with("class-constructor:"))
+        return typing::Term::con("class:" +
+                                 llvm::StringRef(callee.name)
+                                     .drop_front(strlen("class-constructor:"))
+                                     .str());
+    }
+    return defaults.call(callee, args);
+  };
+
+  oracle.subscriptFn =
+      [&](const typing::Term &container,
+          const typing::Term &index) -> std::optional<typing::Term> {
+    return defaults.subscript(container, index);
+  };
+  oracle.awaitFn =
+      [&](const typing::Term &awaitable) -> std::optional<typing::Term> {
+    return defaults.awaitable(awaitable);
+  };
+
+  typing::AlgorithmM inference(oracle);
+  std::map<std::string, typing::Term> localTerms;
+
+  auto termFromKnownType = [&](mlir::Type type) -> std::optional<typing::Term> {
+    return typeTermFromType(type);
+  };
+
+  auto functionResultTerm =
+      [&](const FunctionInfo &info) -> std::optional<typing::Term> {
+    mlir::Type resultType =
+        info.isAsync ? static_cast<mlir::Type>(coroutineType(info.resultType))
+                     : info.resultType;
+    return termFromKnownType(resultType);
+  };
+
+  std::function<std::optional<typing::Term>(const parser::Node &)> infer =
+      [&](const parser::Node &node) -> std::optional<typing::Term> {
+    if (node.kind == "Name") {
+      const std::string *name = stringField(node, "id");
+      if (!name)
+        return std::nullopt;
+      auto local = localTerms.find(*name);
+      if (local != localTerms.end())
+        return local->second;
+      auto symbol = symbols.find(*name);
+      if (symbol != symbols.end())
+        return termFromKnownType(symbol->second.type);
+      auto constant = primitiveConstants.find(*name);
+      if (constant != primitiveConstants.end())
+        return termFromKnownType(constant->second.type);
+      auto localFunction = localFunctions.find(*name);
+      if (localFunction != localFunctions.end())
+        return termFromKnownType(localFunction->second.functionType);
+      auto function = functions.find(*name);
+      if (function != functions.end())
+        return termFromKnownType(function->second.functionType);
+      if (*name == "bool" || *name == "int" || *name == "float" ||
+          *name == "str" || *name == "repr" || *name == "len")
+        return typing::Term::con("builtin:" + *name);
+      if (classes.count(*name) || isBuiltinExceptionClass(*name))
+        return typing::Term::con("class-constructor:" + *name);
+      return std::nullopt;
+    }
+
+    if (node.kind == "Constant") {
+      const parser::FieldValue *value = valueField(node, "value");
+      if (!value)
+        return std::nullopt;
+      if (std::holds_alternative<std::string>(*value))
+        return typing::Term::con("str");
+      if (std::holds_alternative<std::int64_t>(*value) ||
+          std::holds_alternative<parser::BigInteger>(*value))
+        return typing::Term::con("int");
+      if (std::holds_alternative<double>(*value))
+        return typing::Term::con("float");
+      if (std::holds_alternative<bool>(*value))
+        return typing::Term::con("bool");
+      if (std::holds_alternative<std::monostate>(*value))
+        return typing::Term::con("None");
+      return std::nullopt;
+    }
+
+    if (node.kind == "JoinedStr" || node.kind == "FormattedValue" ||
+        node.kind == "TemplateStr" || node.kind == "Interpolation")
+      return typing::Term::con("str");
+
+    if (node.kind == "NamedExpr") {
+      const parser::NodePtr *value = nodeField(node, "value");
+      if (!value || !*value)
+        return std::nullopt;
+      return infer(**value);
+    }
+
+    if (node.kind == "Attribute") {
+      const parser::NodePtr *value = nodeField(node, "value");
+      const std::string *name = stringField(node, "attr");
+      if (!value || !*value || !name)
+        return std::nullopt;
+      std::optional<typing::Term> owner = infer(**value);
+      if (!owner)
+        return std::nullopt;
+      typing::Term result = inference.fresh("attr");
+      inference.requireAttribute(*owner, *name, result,
+                                 {"attribute resolution"});
+      return result;
+    }
+
+    if (node.kind == "Call") {
+      if (std::optional<PrimitiveConstant> constant =
+              primitiveScalarConstructorConstant(node))
+        return termFromKnownType(constant->type);
+
+      const parser::NodePtr *func = nodeField(node, "func");
+      const std::vector<parser::NodePtr> *args = nodeListField(node, "args");
+      if (!func || !*func || !args)
+        return std::nullopt;
+
+      if (std::optional<mlir::Type> targetType = typeFromAnnotation(*func);
+          targetType &&
+          mlir::isa<mlir::IntegerType, mlir::FloatType>(*targetType))
+        return termFromKnownType(*targetType);
+
+      if ((*func)->kind == "Name") {
+        const std::string *name = stringField(**func, "id");
+        if (!name)
+          return std::nullopt;
+        if (*name == "list" && args->size() == 1 && args->front()) {
+          std::optional<typing::Term> source = infer(*args->front());
+          if (!source || source->kind != typing::Term::Kind::Con)
+            return std::nullopt;
+          if (source->name == "list" && source->args.size() == 1)
+            return *source;
+          if (source->name == "tuple" && !source->args.empty()) {
+            const typing::Term &element = source->args.front();
+            for (const typing::Term &current : source->args)
+              if (current != element)
+                return std::nullopt;
+            return typing::Term::con("list", {element});
+          }
+        }
+        if (*name == "tuple") {
+          if (args->empty())
+            return typing::Term::con("tuple");
+          if (args->size() == 1 && args->front()) {
+            std::optional<typing::Term> source = infer(*args->front());
+            if (!source || source->kind != typing::Term::Kind::Con)
+              return std::nullopt;
+            if (source->name == "tuple")
+              return *source;
+            if (source->name == "list" && source->args.size() == 1)
+              return typing::Term::con("tuple", {source->args.front()});
+          }
+        }
+        if (isBuiltinExceptionClass(*name))
+          return typing::Term::con("Exception");
+        auto cls = classes.find(*name);
+        if (cls != classes.end())
+          return typing::Term::con("class:" + *name);
+        auto localFunction = localFunctions.find(*name);
+        if (localFunction != localFunctions.end())
+          return functionResultTerm(localFunction->second);
+        auto function = functions.find(*name);
+        if (function != functions.end())
+          return functionResultTerm(function->second);
+      }
+
+      if ((*func)->kind == "Attribute") {
+        const parser::NodePtr *value = nodeField(**func, "value");
+        const std::string *methodName = stringField(**func, "attr");
+        if (!value || !*value || !methodName)
+          return std::nullopt;
+        std::optional<typing::Term> owner = infer(**value);
+        if (owner && owner->kind == typing::Term::Kind::Con) {
+          llvm::StringRef ownerName(owner->name);
+          if (ownerName.starts_with("class:")) {
+            auto cls =
+                classes.find(ownerName.drop_front(strlen("class:")).str());
+            if (cls != classes.end()) {
+              auto method = cls->second.methods.find(*methodName);
+              if (method != cls->second.methods.end()) {
+                auto info = callableFunctionsBySymbol.find(method->second);
+                if (info != callableFunctionsBySymbol.end())
+                  return functionResultTerm(info->second);
+              }
+            }
+          }
+        }
+      }
+
+      std::optional<typing::Term> callee = infer(**func);
+      if (!callee)
+        return std::nullopt;
+      std::vector<typing::Term> argTerms;
+      argTerms.reserve(args->size());
+      for (const parser::NodePtr &arg : *args) {
+        if (!arg)
+          return std::nullopt;
+        std::optional<typing::Term> argTerm = infer(*arg);
+        if (!argTerm)
+          return std::nullopt;
+        argTerms.push_back(*argTerm);
+      }
+      typing::Term result = inference.fresh("call");
+      inference.requireCall(*callee, argTerms, result, {"call resolution"});
+      return result;
+    }
+
+    if (node.kind == "Subscript") {
+      const parser::NodePtr *value = nodeField(node, "value");
+      const parser::NodePtr *slice = nodeField(node, "slice");
+      if (!value || !*value || !slice || !*slice)
+        return std::nullopt;
+      std::optional<typing::Term> container = infer(**value);
+      if (!container)
+        return std::nullopt;
+      if (container->kind == typing::Term::Kind::Con &&
+          container->name == "tuple") {
+        std::optional<std::int64_t> index = staticIndexValue(**slice);
+        if (!index || *index < 0)
+          return std::nullopt;
+        if (container->args.size() == 1)
+          return container->args.front();
+        if (*index >= static_cast<std::int64_t>(container->args.size()))
+          return std::nullopt;
+        return container->args[static_cast<std::size_t>(*index)];
+      }
+      std::optional<typing::Term> index = infer(**slice);
+      if (!index)
+        return std::nullopt;
+      typing::Term result = inference.fresh("subscript");
+      inference.requireSubscript(*container, *index, result,
+                                 {"subscript resolution"});
+      return result;
+    }
+
+    if (node.kind == "List") {
+      const std::vector<parser::NodePtr> *elements =
+          nodeListField(node, "elts");
+      if (!elements || elements->empty())
+        return std::nullopt;
+      typing::Term element = inference.fresh("list.elem");
+      for (const parser::NodePtr &item : *elements) {
+        if (!item)
+          return std::nullopt;
+        std::optional<typing::Term> itemType = infer(*item);
+        if (!itemType)
+          return std::nullopt;
+        inference.requireEqual(element, *itemType,
+                               {"list element type consistency"});
+      }
+      return typing::Term::con("list", {element});
+    }
+
+    if (node.kind == "Tuple") {
+      const std::vector<parser::NodePtr> *elements =
+          nodeListField(node, "elts");
+      if (!elements)
+        return std::nullopt;
+      std::vector<typing::Term> elementTerms;
+      elementTerms.reserve(elements->size());
+      for (const parser::NodePtr &item : *elements) {
+        if (!item)
+          return std::nullopt;
+        std::optional<typing::Term> itemType = infer(*item);
+        if (!itemType)
+          return std::nullopt;
+        elementTerms.push_back(*itemType);
+      }
+      return typing::Term::con("tuple", elementTerms);
+    }
+
+    if (node.kind == "Dict") {
+      const std::vector<parser::NodePtr> *keys = nodeListField(node, "keys");
+      const std::vector<parser::NodePtr> *values =
+          nodeListField(node, "values");
+      if (!keys || !values || keys->empty() || keys->size() != values->size())
+        return std::nullopt;
+      typing::Term key = inference.fresh("dict.key");
+      typing::Term value = inference.fresh("dict.value");
+      for (std::size_t i = 0; i < keys->size(); ++i) {
+        if (!(*keys)[i] || !(*values)[i])
+          return std::nullopt;
+        std::optional<typing::Term> keyType = infer(*(*keys)[i]);
+        std::optional<typing::Term> valueType = infer(*(*values)[i]);
+        if (!keyType || !valueType)
+          return std::nullopt;
+        inference.requireEqual(key, *keyType, {"dict key type consistency"});
+        inference.requireEqual(value, *valueType,
+                               {"dict value type consistency"});
+      }
+      return typing::Term::con("dict", {key, value});
+    }
+
+    if (node.kind == "ListComp" || node.kind == "DictComp") {
+      const std::vector<parser::NodePtr> *generators =
+          nodeListField(node, "generators");
+      if (!generators || generators->size() != 1 || !generators->front())
+        return std::nullopt;
+      const parser::Node &generator = *generators->front();
+      const parser::NodePtr *target = nodeField(generator, "target");
+      const parser::NodePtr *iter = nodeField(generator, "iter");
+      const parser::FieldValue *isAsyncValue =
+          valueField(generator, "is_async");
+      const auto *isAsync =
+          isAsyncValue ? std::get_if<std::int64_t>(isAsyncValue) : nullptr;
+      if (!target || !*target || (*target)->kind != "Name" || !iter || !*iter ||
+          (isAsync && *isAsync != 0))
+        return std::nullopt;
+      const std::string *targetName = stringField(**target, "id");
+      std::optional<mlir::Type> targetType = inferRangeTargetType(**iter);
+      std::optional<typing::Term> targetTerm =
+          targetType ? termFromKnownType(*targetType) : std::nullopt;
+      if (!targetName || !targetTerm)
+        return std::nullopt;
+
+      std::optional<typing::Term> saved;
+      auto found = localTerms.find(*targetName);
+      if (found != localTerms.end())
+        saved = found->second;
+      localTerms[*targetName] = *targetTerm;
+
+      std::optional<typing::Term> result;
+      if (node.kind == "ListComp") {
+        const parser::NodePtr *element = nodeField(node, "elt");
+        if (element && *element) {
+          std::optional<typing::Term> elementType = infer(**element);
+          if (elementType)
+            result = typing::Term::con("list", {*elementType});
+        }
+      } else {
+        const parser::NodePtr *keyNode = nodeField(node, "key");
+        const parser::NodePtr *valueNode = nodeField(node, "value");
+        if (keyNode && *keyNode && valueNode && *valueNode) {
+          std::optional<typing::Term> keyType = infer(**keyNode);
+          std::optional<typing::Term> valueType = infer(**valueNode);
+          if (keyType && valueType)
+            result = typing::Term::con("dict", {*keyType, *valueType});
+        }
+      }
+
+      if (saved)
+        localTerms[*targetName] = *saved;
+      else
+        localTerms.erase(*targetName);
+      return result;
+    }
+
+    if (node.kind == "BinOp") {
+      const parser::NodePtr *lhs = nodeField(node, "left");
+      const parser::NodePtr *rhs = nodeField(node, "right");
+      std::optional<std::string> op = symbolField(node, "op");
+      if (!lhs || !*lhs || !rhs || !*rhs || !op)
+        return std::nullopt;
+      if (*op == "@" || *op == "*")
+        return std::nullopt;
+      std::optional<typing::Term> lhsType = infer(**lhs);
+      std::optional<typing::Term> rhsType = infer(**rhs);
+      if (!lhsType || !rhsType)
+        return std::nullopt;
+      inference.requireEqual(*lhsType, *rhsType,
+                             {"binary operand type consistency"});
+      return *lhsType;
+    }
+
+    if (node.kind == "UnaryOp") {
+      std::optional<std::string> op = symbolField(node, "op");
+      const parser::NodePtr *operand = nodeField(node, "operand");
+      if (!op || !operand || !*operand)
+        return std::nullopt;
+      std::optional<typing::Term> operandType = infer(**operand);
+      if (!operandType)
+        return std::nullopt;
+      if (*op == "not")
+        return typing::Term::con("bool");
+      if (*op == "+" || *op == "-" || *op == "~")
+        return *operandType;
+      return std::nullopt;
+    }
+
+    if (node.kind == "IfExp") {
+      const parser::NodePtr *body = nodeField(node, "body");
+      const parser::NodePtr *orelse = nodeField(node, "orelse");
+      if (!body || !*body || !orelse || !*orelse)
+        return std::nullopt;
+      std::optional<typing::Term> bodyType = infer(**body);
+      std::optional<typing::Term> elseType = infer(**orelse);
+      if (!bodyType || !elseType)
+        return std::nullopt;
+      inference.requireEqual(*bodyType, *elseType,
+                             {"conditional expression type consistency"});
+      return *bodyType;
+    }
+
+    if (node.kind == "Await") {
+      const parser::NodePtr *value = nodeField(node, "value");
+      if (!value || !*value)
+        return std::nullopt;
+      std::optional<typing::Term> awaitable = infer(**value);
+      if (!awaitable)
+        return std::nullopt;
+      typing::Term result = inference.fresh("await");
+      inference.requireAwait(*awaitable, result, {"await resolution"});
+      return result;
+    }
+
+    return std::nullopt;
+  };
+
+  try {
+    std::optional<typing::Term> term = infer(expr);
+    if (!term)
+      return std::nullopt;
+    typing::Term resolved = inference.resolve(*term);
+    return typeFromTypeTerm(resolved);
+  } catch (const typing::Error &) {
+    return std::nullopt;
+  }
+}
+
+std::optional<mlir::Type>
+Builder::Impl::inferExpressionType(const parser::Node &expr) {
+  auto cached = stableTypeInferenceCache.find(&expr);
+  if (cached != stableTypeInferenceCache.end())
+    return cached->second;
+
+  if (typeInferenceDependsOnEnvironment(expr))
+    return inferExpressionTypeUncached(expr);
+
+  std::optional<mlir::Type> inferred = inferExpressionTypeUncached(expr);
+  if (inferred)
+    stableTypeInferenceCache.try_emplace(&expr, *inferred);
+  return inferred;
+}
+
+std::optional<mlir::Type>
+Builder::Impl::inferExpressionTypeUncached(const parser::Node &expr) {
+  if (std::optional<mlir::Type> inferred = inferExpressionTypeAlgorithmM(expr))
+    return inferred;
+
+  if (expr.kind == "Name") {
+    const std::string *name = stringField(expr, "id");
+    if (!name)
+      return std::nullopt;
+    auto symbol = symbols.find(*name);
+    if (symbol != symbols.end())
+      return symbol->second.type;
+    auto constant = primitiveConstants.find(*name);
+    if (constant != primitiveConstants.end())
+      return constant->second.type;
+    auto localFunction = localFunctions.find(*name);
+    if (localFunction != localFunctions.end())
+      return localFunction->second.functionType;
+    auto function = functions.find(*name);
+    if (function != functions.end())
+      return function->second.functionType;
+    return std::nullopt;
+  }
+
+  if (expr.kind == "Constant") {
+    const parser::FieldValue *value = valueField(expr, "value");
+    if (!value)
+      return std::nullopt;
+    if (std::holds_alternative<std::string>(*value))
+      return strType();
+    if (std::holds_alternative<std::int64_t>(*value) ||
+        std::holds_alternative<parser::BigInteger>(*value))
+      return intType();
+    if (std::holds_alternative<double>(*value))
+      return floatType();
+    if (std::holds_alternative<bool>(*value))
+      return boolType();
+    if (std::holds_alternative<std::monostate>(*value))
+      return noneType();
+    return std::nullopt;
+  }
+
+  if (expr.kind == "JoinedStr" || expr.kind == "FormattedValue" ||
+      expr.kind == "TemplateStr" || expr.kind == "Interpolation")
+    return strType();
+
+  if (expr.kind == "NamedExpr") {
+    const parser::NodePtr *value = nodeField(expr, "value");
+    if (!value || !*value)
+      return std::nullopt;
+    return inferExpressionType(**value);
+  }
+
+  if (expr.kind == "Call") {
+    if (std::optional<PrimitiveConstant> constant =
+            primitiveScalarConstructorConstant(expr))
+      return constant->type;
+    const parser::NodePtr *func = nodeField(expr, "func");
+    const std::vector<parser::NodePtr> *args = nodeListField(expr, "args");
+    if (!func || !*func)
+      return std::nullopt;
+    if (std::optional<mlir::Type> targetType = typeFromAnnotation(*func);
+        targetType &&
+        mlir::isa<mlir::IntegerType, mlir::FloatType>(*targetType))
+      return *targetType;
+    if (isTensorConstructorCallee(**func))
+      return typeFromAnnotation(*func);
+    if (std::optional<std::string> lyrtName = lyrtBuiltinName(**func);
+        lyrtName && *lyrtName == "from_prim" && args && args->size() == 1 &&
+        args->front()) {
+      std::optional<mlir::Type> inputType = inferExpressionType(*args->front());
+      if (inputType && mlir::isa<mlir::RankedTensorType>(*inputType))
+        return strType();
+      if (inputType && mlir::isa<mlir::IntegerType>(*inputType))
+        return intType();
+      if (inputType && mlir::isa<mlir::FloatType>(*inputType))
+        return floatType();
+    }
+    if (std::optional<std::string> lyrtName = lyrtBuiltinName(**func);
+        lyrtName && *lyrtName == "to_prim" && args && args->size() == 2 &&
+        (*args)[1]) {
+      std::optional<mlir::Type> primitiveType = typeFromAnnotation((*args)[1]);
+      if (primitiveType && !mlir::isa<mlir::RankedTensorType>(*primitiveType))
+        return *primitiveType;
+    }
+    if ((*func)->kind == "Name") {
+      const std::string *name = stringField(**func, "id");
+      if (!name)
+        return std::nullopt;
+      if (*name == "bool" && args && args->size() <= 1)
+        return boolType();
+      if (*name == "int" && args && args->size() <= 1)
+        return intType();
+      if (*name == "float" && args && args->size() <= 1)
+        return floatType();
+      if ((*name == "str" && args && args->size() <= 1) ||
+          (*name == "repr" && args && args->size() == 1))
+        return strType();
+      if (*name == "len" && args && args->size() == 1)
+        return intType();
+      const std::vector<parser::NodePtr> *keywords =
+          nodeListField(expr, "keywords");
+      if (*name == "list" && args && args->size() == 1 && args->front() &&
+          (!keywords || keywords->empty())) {
+        if (isRangeCall(*args->front())) {
+          if (std::optional<mlir::Type> targetType =
+                  inferRangeTargetType(*args->front()))
+            return listType(*targetType);
+          return std::nullopt;
+        }
+        std::optional<mlir::Type> sourceType =
+            inferExpressionType(*args->front());
+        if (!sourceType)
+          return std::nullopt;
+        if (mlir::Type elementType = listElementType(*sourceType))
+          return listType(elementType);
+        if (auto tupleType = mlir::dyn_cast<py::TupleType>(*sourceType)) {
+          llvm::ArrayRef<mlir::Type> elementTypes = tupleType.getElementTypes();
+          if (elementTypes.empty())
+            return std::nullopt;
+          mlir::Type elementType = elementTypes.front();
+          for (mlir::Type current : elementTypes)
+            if (current != elementType)
+              return std::nullopt;
+          return listType(elementType);
+        }
+      }
+      if (*name == "tuple" && args && (!keywords || keywords->empty())) {
+        if (args->empty())
+          return py::TupleType::get(&context, {});
+        if (args->size() == 1 && args->front()) {
+          if (isRangeCall(*args->front())) {
+            if (std::optional<mlir::Type> targetType =
+                    inferRangeTargetType(*args->front()))
+              return py::TupleType::get(&context, {*targetType});
+            return std::nullopt;
+          }
+          std::optional<mlir::Type> sourceType =
+              inferExpressionType(*args->front());
+          if (!sourceType)
+            return std::nullopt;
+          if (auto tupleType = mlir::dyn_cast<py::TupleType>(*sourceType))
+            return tupleType;
+          if (mlir::Type elementType = listElementType(*sourceType))
+            return py::TupleType::get(&context, {elementType});
+        }
+      }
+      if (isBuiltinExceptionClass(*name))
+        return exceptionType();
+      auto cls = classes.find(*name);
+      if (cls != classes.end())
+        return classType(*name);
+      auto localFunction = localFunctions.find(*name);
+      if (localFunction != localFunctions.end())
+        return localFunction->second.resultType;
+      auto function = functions.find(*name);
+      if (function != functions.end()) {
+        if (function->second.isAsync)
+          return coroutineType(function->second.resultType);
+        return function->second.resultType;
+      }
+    }
+    return std::nullopt;
+  }
+
+  if (expr.kind == "Attribute") {
+    const parser::NodePtr *value = nodeField(expr, "value");
+    const std::string *name = stringField(expr, "attr");
+    if (!value || !*value || !name)
+      return std::nullopt;
+    std::optional<mlir::Type> objectType = inferExpressionType(**value);
+    std::optional<std::string> className =
+        objectType ? classNameFromType(*objectType) : std::nullopt;
+    if (!className)
+      return std::nullopt;
+    auto cls = classes.find(*className);
+    if (cls == classes.end())
+      return std::nullopt;
+    auto field = cls->second.fields.find(*name);
+    if (field == cls->second.fields.end())
+      return std::nullopt;
+    return field->second;
+  }
+
+  if (expr.kind == "Subscript") {
+    const parser::NodePtr *value = nodeField(expr, "value");
+    if (!value || !*value)
+      return std::nullopt;
+    std::optional<mlir::Type> containerType = inferExpressionType(**value);
+    if (!containerType)
+      return std::nullopt;
+    const parser::NodePtr *slice = nodeField(expr, "slice");
+    if (!slice || !*slice)
+      return std::nullopt;
+    if ((*slice)->kind == "Slice" && !mlir::isa<py::TupleType>(*containerType))
+      return std::nullopt;
+    if (mlir::Type elementType = listElementType(*containerType))
+      return elementType;
+    if (auto tupleType = mlir::dyn_cast<py::TupleType>(*containerType)) {
+      auto elementTypes = tupleType.getElementTypes();
+      if ((*slice)->kind == "Slice") {
+        if (elementTypes.size() == 1)
+          return std::nullopt;
+        const parser::NodePtr *lowerNode = nodeField(**slice, "lower");
+        const parser::NodePtr *upperNode = nodeField(**slice, "upper");
+        const parser::NodePtr *stepNode = nodeField(**slice, "step");
+        std::optional<std::int64_t> lower = lowerNode && *lowerNode
+                                                ? staticIndexValue(**lowerNode)
+                                                : std::optional<std::int64_t>{};
+        std::optional<std::int64_t> upper = upperNode && *upperNode
+                                                ? staticIndexValue(**upperNode)
+                                                : std::optional<std::int64_t>{};
+        std::optional<std::int64_t> step = stepNode && *stepNode
+                                               ? staticIndexValue(**stepNode)
+                                               : std::optional<std::int64_t>{1};
+        if ((lowerNode && *lowerNode && !lower) ||
+            (upperNode && *upperNode && !upper) ||
+            (stepNode && *stepNode && !step) || *step == 0)
+          return std::nullopt;
+
+        const std::int64_t length =
+            static_cast<std::int64_t>(elementTypes.size());
+        std::int64_t start = 0;
+        std::int64_t stop = length;
+        if (*step < 0) {
+          start = length - 1;
+          stop = -1;
+        }
+        if (lower)
+          start = *step > 0 ? clampSliceIndex(*lower, length, 0, length)
+                            : clampSliceIndex(*lower, length, -1, length - 1);
+        if (upper)
+          stop = *step > 0 ? clampSliceIndex(*upper, length, 0, length)
+                           : clampSliceIndex(*upper, length, -1, length - 1);
+
+        llvm::SmallVector<mlir::Type> resultTypes;
+        for (std::int64_t i = start; *step > 0 ? i < stop : i > stop;
+             i += *step)
+          resultTypes.push_back(elementTypes[static_cast<std::size_t>(i)]);
+        return py::TupleType::get(&context, resultTypes);
+      }
+      std::optional<std::int64_t> index = staticIndexValue(**slice);
+      if (!index || *index < 0)
+        return std::nullopt;
+      if (elementTypes.empty())
+        return std::nullopt;
+      if (elementTypes.size() == 1)
+        return elementTypes.front();
+      if (*index >= static_cast<std::int64_t>(elementTypes.size()))
+        return std::nullopt;
+      return elementTypes[*index];
+    }
+    return std::nullopt;
+  }
+
+  if (expr.kind == "List") {
+    const std::vector<parser::NodePtr> *elements = nodeListField(expr, "elts");
+    if (!elements || elements->empty() || !elements->front())
+      return std::nullopt;
+    std::optional<mlir::Type> elementType =
+        inferExpressionType(*elements->front());
+    if (!elementType)
+      return std::nullopt;
+    for (const parser::NodePtr &element :
+         llvm::ArrayRef<parser::NodePtr>(*elements).drop_front()) {
+      if (!element)
+        return std::nullopt;
+      std::optional<mlir::Type> currentType = inferExpressionType(*element);
+      if (!currentType || *currentType != *elementType)
+        return std::nullopt;
+    }
+    return listType(*elementType);
+  }
+
+  if (expr.kind == "ListComp") {
+    const parser::NodePtr *element = nodeField(expr, "elt");
+    const std::vector<parser::NodePtr> *generators =
+        nodeListField(expr, "generators");
+    if (!element || !*element || !generators || generators->size() != 1 ||
+        !generators->front())
+      return std::nullopt;
+    const parser::Node &generator = *generators->front();
+    const parser::NodePtr *target = nodeField(generator, "target");
+    const parser::NodePtr *iter = nodeField(generator, "iter");
+    const std::vector<parser::NodePtr> *ifs = nodeListField(generator, "ifs");
+    const parser::FieldValue *isAsyncValue = valueField(generator, "is_async");
+    const auto *isAsync =
+        isAsyncValue ? std::get_if<std::int64_t>(isAsyncValue) : nullptr;
+    if (!target || !*target || (*target)->kind != "Name" || !iter || !*iter ||
+        (ifs && !ifs->empty()) || (isAsync && *isAsync != 0))
+      return std::nullopt;
+    const std::string *targetName = stringField(**target, "id");
+    std::optional<mlir::Type> targetType = inferRangeTargetType(**iter);
+    if (!targetName || !targetType)
+      return std::nullopt;
+
+    NameBindingSnapshot saved = snapshotNameBinding(*targetName);
+    bindTemporaryName(*targetName, Value{{}, *targetType});
+    std::optional<mlir::Type> elementType = inferExpressionType(**element);
+    restoreNameBinding(*targetName, std::move(saved));
+    if (!elementType)
+      return std::nullopt;
+    return listType(*elementType);
+  }
+
+  if (expr.kind == "DictComp") {
+    const parser::NodePtr *key = nodeField(expr, "key");
+    const parser::NodePtr *value = nodeField(expr, "value");
+    const std::vector<parser::NodePtr> *generators =
+        nodeListField(expr, "generators");
+    if (!key || !*key || !value || !*value || !generators ||
+        generators->size() != 1 || !generators->front())
+      return std::nullopt;
+    const parser::Node &generator = *generators->front();
+    const parser::NodePtr *target = nodeField(generator, "target");
+    const parser::NodePtr *iter = nodeField(generator, "iter");
+    const parser::FieldValue *isAsyncValue = valueField(generator, "is_async");
+    const auto *isAsync =
+        isAsyncValue ? std::get_if<std::int64_t>(isAsyncValue) : nullptr;
+    if (!target || !*target || (*target)->kind != "Name" || !iter || !*iter ||
+        (isAsync && *isAsync != 0))
+      return std::nullopt;
+    const std::string *targetName = stringField(**target, "id");
+    std::optional<mlir::Type> targetType = inferRangeTargetType(**iter);
+    if (!targetName || !targetType)
+      return std::nullopt;
+
+    NameBindingSnapshot saved = snapshotNameBinding(*targetName);
+    bindTemporaryName(*targetName, Value{{}, *targetType});
+    std::optional<mlir::Type> keyType = inferExpressionType(**key);
+    std::optional<mlir::Type> valueType = inferExpressionType(**value);
+    restoreNameBinding(*targetName, std::move(saved));
+    if (!keyType || !valueType || !dictStorageSupported(*keyType, *valueType))
+      return std::nullopt;
+    return dictType(*keyType, *valueType);
+  }
+
+  if (expr.kind == "Tuple") {
+    const std::vector<parser::NodePtr> *elements = nodeListField(expr, "elts");
+    if (!elements)
+      return std::nullopt;
+    llvm::SmallVector<mlir::Type> elementTypes;
+    elementTypes.reserve(elements->size());
+    for (const parser::NodePtr &element : *elements) {
+      if (!element)
+        return std::nullopt;
+      std::optional<mlir::Type> elementType = inferExpressionType(*element);
+      if (!elementType)
+        return std::nullopt;
+      elementTypes.push_back(*elementType);
+    }
+    return py::TupleType::get(&context, elementTypes);
+  }
+
+  if (expr.kind == "Dict") {
+    const std::vector<parser::NodePtr> *keys = nodeListField(expr, "keys");
+    const std::vector<parser::NodePtr> *values = nodeListField(expr, "values");
+    if (!keys || !values || keys->empty() || keys->size() != values->size() ||
+        !keys->front() || !values->front())
+      return std::nullopt;
+    std::optional<mlir::Type> keyType = inferExpressionType(*keys->front());
+    std::optional<mlir::Type> valueType = inferExpressionType(*values->front());
+    if (!keyType || !valueType)
+      return std::nullopt;
+    for (std::size_t i = 1; i < keys->size(); ++i) {
+      if (!(*keys)[i] || !(*values)[i])
+        return std::nullopt;
+      std::optional<mlir::Type> currentKey = inferExpressionType(*(*keys)[i]);
+      std::optional<mlir::Type> currentValue =
+          inferExpressionType(*(*values)[i]);
+      if (!currentKey || !currentValue || *currentKey != *keyType ||
+          *currentValue != *valueType)
+        return std::nullopt;
+    }
+    return dictType(*keyType, *valueType);
+  }
+
+  if (expr.kind == "BinOp") {
+    const parser::NodePtr *lhs = nodeField(expr, "left");
+    const parser::NodePtr *rhs = nodeField(expr, "right");
+    std::optional<std::string> op = symbolField(expr, "op");
+    if (!lhs || !*lhs || !rhs || !*rhs || !op)
+      return std::nullopt;
+    std::optional<mlir::Type> lhsType = inferExpressionType(**lhs);
+    std::optional<mlir::Type> rhsType = inferExpressionType(**rhs);
+    if (!lhsType || !rhsType)
+      return std::nullopt;
+    if (*op == "@") {
+      auto lhsTensor = mlir::dyn_cast<mlir::RankedTensorType>(*lhsType);
+      auto rhsTensor = mlir::dyn_cast<mlir::RankedTensorType>(*rhsType);
+      if (!lhsTensor || !rhsTensor || lhsTensor.getRank() != 2 ||
+          rhsTensor.getRank() != 2 ||
+          lhsTensor.getElementType() != rhsTensor.getElementType() ||
+          lhsTensor.getDimSize(1) != rhsTensor.getDimSize(0))
+        return std::nullopt;
+      return mlir::RankedTensorType::get(
+          {lhsTensor.getDimSize(0), rhsTensor.getDimSize(1)},
+          lhsTensor.getElementType());
+    }
+    if (*op == "*") {
+      auto repeatTuple = [&](py::TupleType tupleType,
+                             std::int64_t count) -> mlir::Type {
+        llvm::ArrayRef<mlir::Type> elementTypes = tupleType.getElementTypes();
+        if (count <= 0 || elementTypes.empty())
+          return py::TupleType::get(&context, {});
+        llvm::SmallVector<mlir::Type> repeated;
+        repeated.reserve(elementTypes.size() * static_cast<std::size_t>(count));
+        for (std::int64_t iteration = 0; iteration < count; ++iteration)
+          repeated.append(elementTypes.begin(), elementTypes.end());
+        return py::TupleType::get(&context, repeated);
+      };
+      if (auto lhsTuple = mlir::dyn_cast<py::TupleType>(*lhsType)) {
+        if (std::optional<std::int64_t> count = staticIndexValue(**rhs))
+          return repeatTuple(lhsTuple, *count);
+      }
+      if (auto rhsTuple = mlir::dyn_cast<py::TupleType>(*rhsType)) {
+        if (std::optional<std::int64_t> count = staticIndexValue(**lhs))
+          return repeatTuple(rhsTuple, *count);
+      }
+      if (listElementType(*lhsType) && staticIndexValue(**rhs))
+        return *lhsType;
+      if (listElementType(*rhsType) && staticIndexValue(**lhs))
+        return *rhsType;
+    }
+    if (*lhsType == *rhsType)
+      return *lhsType;
+    if (mlir::isa<mlir::IntegerType>(*lhsType) && staticIndexValue(**rhs))
+      return *lhsType;
+    if (mlir::isa<mlir::IntegerType>(*rhsType) && staticIndexValue(**lhs))
+      return *rhsType;
+    return std::nullopt;
+  }
+
+  if (expr.kind == "Compare") {
+    const parser::NodePtr *lhs = nodeField(expr, "left");
+    std::optional<std::vector<std::string>> ops = symbolListField(expr, "ops");
+    const std::vector<parser::NodePtr> *comparators =
+        nodeListField(expr, "comparators");
+    if (!lhs || !*lhs || !ops || !comparators || comparators->empty() ||
+        ops->size() != comparators->size())
+      return std::nullopt;
+    if (ops->size() == 1 && ((*ops)[0] == "is" || (*ops)[0] == "is not")) {
+      if (!(*comparators)[0])
+        return std::nullopt;
+      std::optional<int> lhsKey = singletonKey(**lhs);
+      std::optional<int> rhsKey = singletonKey(*(*comparators)[0]);
+      if (lhsKey && rhsKey)
+        return boolType();
+      if (!lhsKey && !rhsKey)
+        return std::nullopt;
+      const parser::Node &valueNode = lhsKey ? *(*comparators)[0] : **lhs;
+      std::optional<mlir::Type> valueType = inferExpressionType(valueNode);
+      if (!valueType)
+        return std::nullopt;
+      if (*valueType == boolType() || *valueType == noneType() ||
+          valueNode.kind == "Name" || valueNode.kind == "Constant")
+        return boolType();
+      return std::nullopt;
+    }
+    if (ops->size() == 1 && ((*ops)[0] == "in" || (*ops)[0] == "not in") &&
+        (*comparators)[0] && (*comparators)[0]->kind == "Tuple") {
+      std::optional<mlir::Type> lhsType = inferExpressionType(**lhs);
+      if (!lhsType || !*lhsType ||
+          (!mlir::isa<mlir::IntegerType, mlir::FloatType>(*lhsType) &&
+           *lhsType != intType() && *lhsType != floatType()))
+        return std::nullopt;
+      const std::vector<parser::NodePtr> *elements =
+          nodeListField(*(*comparators)[0], "elts");
+      if (!elements)
+        return std::nullopt;
+      for (const parser::NodePtr &element : *elements) {
+        if (!element)
+          return std::nullopt;
+        std::optional<mlir::Type> elementType = inferExpressionType(*element);
+        if (!elementType || !*elementType || *elementType != *lhsType)
+          return std::nullopt;
+      }
+      return i1Type();
+    }
+    std::optional<mlir::Type> lhsType = inferExpressionType(**lhs);
+    if (!lhsType || !*lhsType)
+      return std::nullopt;
+    bool primitiveChain =
+        mlir::isa<mlir::IntegerType, mlir::FloatType>(*lhsType);
+    mlir::Type previousType = *lhsType;
+    for (const parser::NodePtr &comparator : *comparators) {
+      if (!comparator)
+        return std::nullopt;
+      std::optional<mlir::Type> rhsType = inferExpressionType(*comparator);
+      if (!rhsType || !*rhsType)
+        return std::nullopt;
+      if (*rhsType != previousType) {
+        if (mlir::isa<mlir::IntegerType>(previousType) &&
+            staticIndexValue(*comparator))
+          rhsType = previousType;
+        else
+          return std::nullopt;
+      }
+      if (!mlir::isa<mlir::IntegerType, mlir::FloatType>(*rhsType))
+        primitiveChain = false;
+      previousType = *rhsType;
+    }
+    if (primitiveChain)
+      return i1Type();
+    if (comparators->size() == 1)
+      return boolType();
+    return std::nullopt;
+  }
+
+  if (expr.kind == "UnaryOp") {
+    std::optional<std::string> op = symbolField(expr, "op");
+    const parser::NodePtr *operand = nodeField(expr, "operand");
+    if (!op || !operand || !*operand)
+      return std::nullopt;
+    std::optional<mlir::Type> operandType = inferExpressionType(**operand);
+    if (!operandType)
+      return std::nullopt;
+    if (*op == "not") {
+      if (*operandType == boolType())
+        return boolType();
+      if (*operandType == intType() || *operandType == floatType() ||
+          *operandType == strType())
+        return boolType();
+      if (auto tupleType = mlir::dyn_cast<py::TupleType>(*operandType)) {
+        if (tupleType.getElementTypes().size() != 1 ||
+            (*operand)->kind == "Tuple")
+          return boolType();
+      }
+      if (mlir::isa<mlir::IntegerType, mlir::FloatType>(*operandType))
+        return i1Type();
+      return std::nullopt;
+    }
+    if (*op == "+" || *op == "-")
+      return *operandType;
+    if (*op == "~" && (mlir::isa<mlir::IntegerType>(*operandType) ||
+                       *operandType == intType()))
+      return *operandType;
+    return std::nullopt;
+  }
+
+  if (expr.kind == "BoolOp") {
+    const std::vector<parser::NodePtr> *values = nodeListField(expr, "values");
+    if (!values || values->empty())
+      return std::nullopt;
+    bool allI1 = true;
+    for (const parser::NodePtr &value : *values) {
+      if (!value)
+        return std::nullopt;
+      std::optional<mlir::Type> valueType = inferExpressionType(*value);
+      if (!valueType)
+        return std::nullopt;
+      if (*valueType != i1Type())
+        allI1 = false;
+    }
+    return allI1 ? i1Type() : boolType();
+  }
+
+  if (expr.kind == "IfExp") {
+    const parser::NodePtr *body = nodeField(expr, "body");
+    const parser::NodePtr *orelse = nodeField(expr, "orelse");
+    if (!body || !*body || !orelse || !*orelse)
+      return std::nullopt;
+    std::optional<mlir::Type> bodyType = inferExpressionType(**body);
+    std::optional<mlir::Type> elseType = inferExpressionType(**orelse);
+    if (!bodyType || !elseType || *bodyType != *elseType)
+      return std::nullopt;
+    return *bodyType;
+  }
+
+  if (expr.kind == "Await") {
+    const parser::NodePtr *value = nodeField(expr, "value");
+    if (!value || !*value)
+      return std::nullopt;
+    std::optional<mlir::Type> awaitableType = inferExpressionType(**value);
+    if (!awaitableType)
+      return std::nullopt;
+    if (mlir::Type payloadType = awaitablePayloadType(*awaitableType))
+      return payloadType;
+  }
+
+  return std::nullopt;
+}
+
+std::optional<mlir::Type>
+Builder::Impl::inferRangeTargetType(const parser::Node &iter) {
+  if (iter.kind != "Call")
+    return std::nullopt;
+  const parser::NodePtr *func = nodeField(iter, "func");
+  const std::vector<parser::NodePtr> *args = nodeListField(iter, "args");
+  const std::vector<parser::NodePtr> *keywords =
+      nodeListField(iter, "keywords");
+  if (!func || !*func || (*func)->kind != "Name" || !args || args->empty() ||
+      args->size() > 3 || (keywords && !keywords->empty()))
+    return std::nullopt;
+  const std::string *callee = stringField(**func, "id");
+  if (!callee || *callee != "range")
+    return std::nullopt;
+
+  std::optional<mlir::Type> rangeType;
+  bool sawStaticIntegerLiteral = false;
+  for (const parser::NodePtr &arg : *args) {
+    if (!arg)
+      return std::nullopt;
+    std::optional<mlir::Type> argType;
+    if (std::optional<PrimitiveConstant> constant =
+            primitiveIntConstructorConstant(*arg)) {
+      argType = constant->type;
+    } else if (staticIndexValue(*arg) || isLenCall(*arg)) {
+      sawStaticIntegerLiteral = true;
+    } else {
+      argType = inferExpressionType(*arg);
+      if (!argType || !mlir::isa<mlir::IntegerType>(*argType))
+        return std::nullopt;
+    }
+    if (!argType)
+      continue;
+    if (!mlir::isa<mlir::IntegerType>(*argType))
+      return std::nullopt;
+    if (!rangeType)
+      rangeType = *argType;
+    else if (*rangeType != *argType)
+      return std::nullopt;
+  }
+  if (!rangeType && sawStaticIntegerLiteral)
+    return builder.getI64Type();
+  return rangeType;
+}
+
+std::optional<mlir::Type>
+Builder::Impl::typeFromAnnotation(const parser::NodePtr &node) {
+  if (!node)
+    return std::nullopt;
+  auto cached = annotationTypeCache.find(node.get());
+  if (cached != annotationTypeCache.end())
+    return cached->second;
+
+  const std::map<std::string, mlir::Type> typeVariables;
+  std::set<std::string> activeAliases;
+  std::optional<mlir::Type> resolved =
+      typeFromAnnotation(node, typeVariables, activeAliases);
+  if (resolved)
+    annotationTypeCache.try_emplace(node.get(), *resolved);
+  return resolved;
+}
+
+std::optional<mlir::Type> Builder::Impl::typeFromAnnotation(
+    const parser::NodePtr &node,
+    const std::map<std::string, mlir::Type> &typeVariables,
+    std::set<std::string> &activeAliases) {
+  if (!node)
+    return std::nullopt;
+  auto knownAnnotationName =
+      [&](const parser::Node &expr) -> std::optional<std::string> {
+    if (expr.kind == "Name") {
+      const std::string *name = stringField(expr, "id");
+      if (!name)
+        return std::nullopt;
+      auto alias = staticAnnotationAliases.find(*name);
+      if (alias != staticAnnotationAliases.end())
+        return alias->second;
+      return *name;
+    }
+    if (expr.kind == "Attribute") {
+      const parser::NodePtr *value = nodeField(expr, "value");
+      const std::string *attr = stringField(expr, "attr");
+      if (!value || !*value || !attr || (*value)->kind != "Name")
+        return std::nullopt;
+      const std::string *moduleAlias = stringField(**value, "id");
+      if (!moduleAlias)
+        return std::nullopt;
+      auto module = staticModules.find(*moduleAlias);
+      if (module == staticModules.end())
+        return std::nullopt;
+      if (module->second == "typing" || module->second == "collections.abc" ||
+          module->second == "asyncio")
+        return *attr;
+      return std::nullopt;
+    }
+    return std::nullopt;
+  };
+  auto isEllipsisConstant = [](const parser::NodePtr &expr) {
+    if (!expr || expr->kind != "Constant")
+      return false;
+    const parser::FieldValue *value = valueField(*expr, "value");
+    return value && std::holds_alternative<parser::Ellipsis>(*value);
+  };
+  auto typePackFromAnnotation =
+      [&](const parser::NodePtr &expr,
+          const std::map<std::string, mlir::Type> &variables,
+          std::set<std::string> &aliases) -> std::optional<py::TupleType> {
+    if (!expr)
+      return std::nullopt;
+    const parser::NodePtr *packExpr = &expr;
+    if (expr->kind == "Starred") {
+      const parser::NodePtr *value = nodeField(*expr, "value");
+      if (!value || !*value)
+        return std::nullopt;
+      packExpr = value;
+    }
+    std::optional<mlir::Type> packType =
+        typeFromAnnotation(*packExpr, variables, aliases);
+    if (!packType)
+      return std::nullopt;
+    return mlir::dyn_cast<py::TupleType>(*packType);
+  };
+  auto fixedCallablePackFromAnnotation =
+      [&](const parser::NodePtr &expr,
+          const std::map<std::string, mlir::Type> &variables,
+          std::set<std::string> &aliases) -> std::optional<py::TupleType> {
+    if (!expr)
+      return std::nullopt;
+    if (expr->kind == "List" || expr->kind == "Tuple") {
+      const std::vector<parser::NodePtr> *items = nodeListField(*expr, "elts");
+      if (!items)
+        return std::nullopt;
+      llvm::SmallVector<mlir::Type> elementTypes;
+      for (const parser::NodePtr &item : *items) {
+        std::optional<mlir::Type> itemType =
+            typeFromAnnotation(item, variables, aliases);
+        if (!itemType)
+          return std::nullopt;
+        elementTypes.push_back(*itemType);
+      }
+      return py::TupleType::get(&context, elementTypes);
+    }
+    return typePackFromAnnotation(expr, variables, aliases);
+  };
+  if (node->kind == "Name") {
+    const std::string *name = stringField(*node, "id");
+    if (!name)
+      return std::nullopt;
+    auto typeVariable = typeVariables.find(*name);
+    if (typeVariable != typeVariables.end())
+      return typeVariable->second;
+    if (*name == "int")
+      return intType();
+    if (*name == "str")
+      return strType();
+    if (*name == "float")
+      return floatType();
+    if (*name == "bool")
+      return boolType();
+    if (*name == "None")
+      return noneType();
+    if (isBuiltinExceptionClass(*name))
+      return exceptionType();
+    auto alias = typeAliases.find(*name);
+    if (alias != typeAliases.end())
+      return alias->second;
+    auto genericAlias = genericTypeAliases.find(*name);
+    if (genericAlias != genericTypeAliases.end()) {
+      if (!activeAliases.insert(*name).second)
+        return std::nullopt;
+      std::map<std::string, mlir::Type> substituted(typeVariables);
+      for (const TypeAliasParameter &parameter :
+           genericAlias->second.parameters) {
+        if (!parameter.defaultValue) {
+          activeAliases.erase(*name);
+          return std::nullopt;
+        }
+        if (parameter.kind == TypeAliasParameterKind::TypeVarTuple ||
+            parameter.kind == TypeAliasParameterKind::ParamSpec) {
+          std::optional<py::TupleType> pack =
+              parameter.kind == TypeAliasParameterKind::ParamSpec
+                  ? fixedCallablePackFromAnnotation(parameter.defaultValue,
+                                                    substituted, activeAliases)
+                  : typePackFromAnnotation(parameter.defaultValue, substituted,
+                                           activeAliases);
+          if (!pack) {
+            activeAliases.erase(*name);
+            return std::nullopt;
+          }
+          substituted[parameter.name] = *pack;
+          continue;
+        }
+        std::optional<mlir::Type> defaultType = typeFromAnnotation(
+            parameter.defaultValue, substituted, activeAliases);
+        if (!defaultType || (parameter.bound &&
+                             !typeAssignable(parameter.bound, *defaultType))) {
+          activeAliases.erase(*name);
+          return std::nullopt;
+        }
+        substituted[parameter.name] = *defaultType;
+      }
+      std::optional<mlir::Type> result = typeFromAnnotation(
+          genericAlias->second.value, substituted, activeAliases);
+      activeAliases.erase(*name);
+      return result;
+    }
+    if (classes.count(*name))
+      return classType(*name);
+    return std::nullopt;
+  }
+  if (node->kind == "Subscript") {
+    std::optional<unsigned> width = intWidthFromSubscript(*node);
+    if (width)
+      return builder.getIntegerType(*width);
+    const parser::NodePtr *value = nodeField(*node, "value");
+    const parser::NodePtr *slice = nodeField(*node, "slice");
+    if (!value || !*value || !slice || !*slice)
+      return std::nullopt;
+    if ((*value)->kind == "Name") {
+      const std::string *name = stringField(**value, "id");
+      auto alias =
+          name ? genericTypeAliases.find(*name) : genericTypeAliases.end();
+      if (alias != genericTypeAliases.end()) {
+        llvm::SmallVector<parser::NodePtr> args;
+        if ((*slice)->kind == "Tuple") {
+          const std::vector<parser::NodePtr> *items =
+              nodeListField(**slice, "elts");
+          if (!items)
+            return std::nullopt;
+          args.append(items->begin(), items->end());
+        } else {
+          args.push_back(*slice);
+        }
+        const TypeAliasInfo &info = alias->second;
+        if (!activeAliases.insert(*name).second)
+          return std::nullopt;
+        std::map<std::string, mlir::Type> substituted(typeVariables);
+
+        std::optional<std::size_t> packIndex;
+        for (auto indexed : llvm::enumerate(info.parameters)) {
+          if (indexed.value().kind == TypeAliasParameterKind::TypeVarTuple ||
+              indexed.value().kind == TypeAliasParameterKind::ParamSpec) {
+            packIndex = indexed.index();
+            break;
+          }
+        }
+
+        if (!packIndex) {
+          if (args.size() > info.parameters.size()) {
+            activeAliases.erase(*name);
+            return std::nullopt;
+          }
+          for (std::size_t index = 0; index < info.parameters.size(); ++index) {
+            const TypeAliasParameter &parameter = info.parameters[index];
+            const bool usesDefault = index >= args.size();
+            const parser::NodePtr *argument =
+                usesDefault ? &parameter.defaultValue : &args[index];
+            if (!argument || !*argument) {
+              activeAliases.erase(*name);
+              return std::nullopt;
+            }
+            std::optional<mlir::Type> argumentType = typeFromAnnotation(
+                *argument, usesDefault ? substituted : typeVariables,
+                activeAliases);
+            if (!argumentType) {
+              activeAliases.erase(*name);
+              return std::nullopt;
+            }
+            if (parameter.bound &&
+                !typeAssignable(parameter.bound, *argumentType)) {
+              activeAliases.erase(*name);
+              return std::nullopt;
+            }
+            substituted[parameter.name] = *argumentType;
+          }
+        } else {
+          const std::size_t fixedCount = *packIndex;
+          if (args.size() < fixedCount) {
+            for (std::size_t index = args.size(); index < fixedCount; ++index) {
+              if (!info.parameters[index].defaultValue) {
+                activeAliases.erase(*name);
+                return std::nullopt;
+              }
+            }
+          }
+          for (std::size_t index = 0; index < fixedCount; ++index) {
+            const TypeAliasParameter &parameter = info.parameters[index];
+            const bool usesDefault = index >= args.size();
+            const parser::NodePtr *argument =
+                usesDefault ? &parameter.defaultValue : &args[index];
+            if (!argument || !*argument) {
+              activeAliases.erase(*name);
+              return std::nullopt;
+            }
+            std::optional<mlir::Type> argumentType = typeFromAnnotation(
+                *argument, usesDefault ? substituted : typeVariables,
+                activeAliases);
+            if (!argumentType ||
+                (parameter.bound &&
+                 !typeAssignable(parameter.bound, *argumentType))) {
+              activeAliases.erase(*name);
+              return std::nullopt;
+            }
+            substituted[parameter.name] = *argumentType;
+          }
+
+          const TypeAliasParameter &packParameter = info.parameters[*packIndex];
+          llvm::SmallVector<mlir::Type> packTypes;
+          if (args.size() > fixedCount) {
+            if (packParameter.kind == TypeAliasParameterKind::ParamSpec &&
+                args.size() == fixedCount + 1 && args[fixedCount] &&
+                (args[fixedCount]->kind == "List" ||
+                 args[fixedCount]->kind == "Tuple")) {
+              std::optional<py::TupleType> expanded =
+                  fixedCallablePackFromAnnotation(args[fixedCount],
+                                                  typeVariables, activeAliases);
+              if (!expanded) {
+                activeAliases.erase(*name);
+                return std::nullopt;
+              }
+              packTypes.append(expanded->getElementTypes().begin(),
+                               expanded->getElementTypes().end());
+            } else {
+              for (std::size_t index = fixedCount; index < args.size();
+                   ++index) {
+                const parser::NodePtr &argument = args[index];
+                if (!argument) {
+                  activeAliases.erase(*name);
+                  return std::nullopt;
+                }
+                if (argument->kind == "Starred") {
+                  std::optional<py::TupleType> expanded =
+                      typePackFromAnnotation(argument, typeVariables,
+                                             activeAliases);
+                  if (!expanded) {
+                    activeAliases.erase(*name);
+                    return std::nullopt;
+                  }
+                  packTypes.append(expanded->getElementTypes().begin(),
+                                   expanded->getElementTypes().end());
+                  continue;
+                }
+                std::optional<mlir::Type> argumentType =
+                    typeFromAnnotation(argument, typeVariables, activeAliases);
+                if (!argumentType) {
+                  activeAliases.erase(*name);
+                  return std::nullopt;
+                }
+                packTypes.push_back(*argumentType);
+              }
+            }
+          } else if (packParameter.defaultValue) {
+            std::optional<py::TupleType> defaultPack =
+                packParameter.kind == TypeAliasParameterKind::ParamSpec
+                    ? fixedCallablePackFromAnnotation(
+                          packParameter.defaultValue, substituted,
+                          activeAliases)
+                    : typePackFromAnnotation(packParameter.defaultValue,
+                                             substituted, activeAliases);
+            if (!defaultPack) {
+              activeAliases.erase(*name);
+              return std::nullopt;
+            }
+            packTypes.append(defaultPack->getElementTypes().begin(),
+                             defaultPack->getElementTypes().end());
+          }
+          substituted[packParameter.name] =
+              py::TupleType::get(&context, packTypes);
+        }
+        std::optional<mlir::Type> result =
+            typeFromAnnotation(info.value, substituted, activeAliases);
+        activeAliases.erase(*name);
+        return result;
+      }
+    }
+    std::optional<std::string> annotationBase = knownAnnotationName(**value);
+    if (annotationBase) {
+      if (*annotationBase == "Coroutine" || *annotationBase == "Coro" ||
+          *annotationBase == "Task" || *annotationBase == "Future") {
+        std::optional<mlir::Type> resultType =
+            typeFromAnnotation(*slice, typeVariables, activeAliases);
+        if (!resultType)
+          return std::nullopt;
+        if (*annotationBase == "Task")
+          return taskType(*resultType);
+        if (*annotationBase == "Future")
+          return futureType(*resultType);
+        return coroutineType(*resultType);
+      }
+      if (*annotationBase == "Callable") {
+        if ((*slice)->kind != "Tuple")
+          return std::nullopt;
+        const std::vector<parser::NodePtr> *items =
+            nodeListField(**slice, "elts");
+        if (!items || items->size() != 2 || !items->front() || !(*items)[1])
+          return std::nullopt;
+        const parser::NodePtr &argsNode = items->front();
+        if (argsNode->kind == "Name") {
+          std::optional<py::TupleType> pack = fixedCallablePackFromAnnotation(
+              argsNode, typeVariables, activeAliases);
+          if (!pack)
+            return std::nullopt;
+          std::optional<mlir::Type> resultType =
+              typeFromAnnotation((*items)[1], typeVariables, activeAliases);
+          if (!resultType)
+            return std::nullopt;
+          return py::FuncType::get(
+              &context,
+              functionSignatureType(pack->getElementTypes(), *resultType));
+        }
+        if (argsNode->kind != "List" && argsNode->kind != "Tuple")
+          return std::nullopt;
+        const std::vector<parser::NodePtr> *argNodes =
+            nodeListField(*argsNode, "elts");
+        if (!argNodes)
+          return std::nullopt;
+        llvm::SmallVector<mlir::Type> argTypes;
+        for (const parser::NodePtr &arg : *argNodes) {
+          std::optional<mlir::Type> argType =
+              typeFromAnnotation(arg, typeVariables, activeAliases);
+          if (!argType)
+            return std::nullopt;
+          argTypes.push_back(*argType);
+        }
+        std::optional<mlir::Type> resultType =
+            typeFromAnnotation((*items)[1], typeVariables, activeAliases);
+        if (!resultType)
+          return std::nullopt;
+        return py::FuncType::get(&context,
+                                 functionSignatureType(argTypes, *resultType));
+      }
+      if (*annotationBase == "dict" || *annotationBase == "Dict") {
+        if ((*slice)->kind != "Tuple")
+          return std::nullopt;
+        const std::vector<parser::NodePtr> *items =
+            nodeListField(**slice, "elts");
+        if (!items || items->size() != 2 || !items->front() || !(*items)[1])
+          return std::nullopt;
+        std::optional<mlir::Type> keyType =
+            typeFromAnnotation(items->front(), typeVariables, activeAliases);
+        std::optional<mlir::Type> valueType =
+            typeFromAnnotation((*items)[1], typeVariables, activeAliases);
+        if (!keyType || !valueType)
+          return std::nullopt;
+        return dictType(*keyType, *valueType);
+      }
+      if (*annotationBase == "list" || *annotationBase == "List") {
+        std::optional<mlir::Type> elementType =
+            typeFromAnnotation(*slice, typeVariables, activeAliases);
+        if (!elementType)
+          return std::nullopt;
+        return listType(*elementType);
+      }
+      if (*annotationBase == "tuple" || *annotationBase == "Tuple") {
+        if ((*slice)->kind != "Tuple") {
+          if ((*slice)->kind == "Starred") {
+            std::optional<py::TupleType> pack =
+                typePackFromAnnotation(*slice, typeVariables, activeAliases);
+            if (!pack)
+              return std::nullopt;
+            return py::TupleType::get(&context, pack->getElementTypes());
+          }
+          std::optional<mlir::Type> elementType =
+              typeFromAnnotation(*slice, typeVariables, activeAliases);
+          if (!elementType)
+            return std::nullopt;
+          return py::TupleType::get(&context, {*elementType});
+        }
+        const std::vector<parser::NodePtr> *items =
+            nodeListField(**slice, "elts");
+        if (!items)
+          return std::nullopt;
+        if (items->size() == 2 && isEllipsisConstant((*items)[1])) {
+          std::optional<mlir::Type> elementType =
+              typeFromAnnotation(items->front(), typeVariables, activeAliases);
+          if (!elementType)
+            return std::nullopt;
+          return py::TupleType::get(&context, {*elementType});
+        }
+        llvm::SmallVector<mlir::Type> elementTypes;
+        for (const parser::NodePtr &item : *items) {
+          if (item && item->kind == "Starred") {
+            std::optional<py::TupleType> pack =
+                typePackFromAnnotation(item, typeVariables, activeAliases);
+            if (!pack)
+              return std::nullopt;
+            elementTypes.append(pack->getElementTypes().begin(),
+                                pack->getElementTypes().end());
+            continue;
+          }
+          std::optional<mlir::Type> elementType =
+              typeFromAnnotation(item, typeVariables, activeAliases);
+          if (!elementType)
+            return std::nullopt;
+          elementTypes.push_back(*elementType);
+        }
+        return py::TupleType::get(&context, elementTypes);
+      }
+    }
+    if (std::optional<std::string> name = primitiveTypeName(**value)) {
+      if (*name == "Float") {
+        if ((*slice)->kind != "Constant")
+          return std::nullopt;
+        const parser::FieldValue *bitsValue = valueField(**slice, "value");
+        const auto *bits =
+            bitsValue ? std::get_if<std::int64_t>(bitsValue) : nullptr;
+        if (!bits)
+          return std::nullopt;
+        if (*bits == 16)
+          return builder.getF16Type();
+        if (*bits == 32)
+          return builder.getF32Type();
+        if (*bits == 64)
+          return builder.getF64Type();
+        return std::nullopt;
+      }
+      if (*name == "Matrix" || *name == "Tensor") {
+        if ((*slice)->kind != "Tuple")
+          return std::nullopt;
+        const std::vector<parser::NodePtr> *items =
+            nodeListField(**slice, "elts");
+        if (!items || items->size() < 2 || !items->front())
+          return std::nullopt;
+        std::optional<mlir::Type> elementType =
+            typeFromAnnotation(items->front(), typeVariables, activeAliases);
+        if (!elementType)
+          return std::nullopt;
+        llvm::SmallVector<int64_t> shape;
+        for (std::size_t i = 1; i < items->size(); ++i) {
+          if (!(*items)[i] || (*items)[i]->kind != "Constant")
+            return std::nullopt;
+          const parser::FieldValue *dimValue =
+              valueField(*(*items)[i], "value");
+          const auto *dim =
+              dimValue ? std::get_if<std::int64_t>(dimValue) : nullptr;
+          if (!dim)
+            return std::nullopt;
+          shape.push_back(*dim);
+        }
+        if (*name == "Matrix" && shape.size() != 2)
+          return std::nullopt;
+        return mlir::RankedTensorType::get(shape, *elementType);
+      }
+      return std::nullopt;
+    }
+    return std::nullopt;
+  }
+  if (node->kind == "Constant") {
+    const parser::FieldValue *value = valueField(*node, "value");
+    if (const auto *annotation =
+            value ? std::get_if<std::string>(value) : nullptr) {
+      if (typeVariables.empty()) {
+        auto cached = stringAnnotationTypeCache.find(*annotation);
+        if (cached != stringAnnotationTypeCache.end())
+          return cached->second;
+      }
+
+      parser::ParseOptions options;
+      options.mode = parser::ParseMode::Expression;
+      parser::ParseResult parsed =
+          parser::parse(*annotation, "<annotation>", options);
+      if (!parsed.ok() || !parsed.tree)
+        return std::nullopt;
+      const parser::NodePtr *body = nodeField(*parsed.tree, "body");
+      if (!body || !*body || (*body)->kind == "Constant")
+        return std::nullopt;
+      std::optional<mlir::Type> resolved =
+          typeFromAnnotation(*body, typeVariables, activeAliases);
+      if (resolved && typeVariables.empty())
+        stringAnnotationTypeCache.try_emplace(*annotation, *resolved);
+      return resolved;
+    }
+    if (value && std::holds_alternative<std::monostate>(*value))
+      return noneType();
+  }
+  return std::nullopt;
+}
+
+bool Builder::Impl::isTypeAliasMarker(const parser::NodePtr &node) const {
+  if (!node)
+    return false;
+  if (node->kind == "Name") {
+    const std::string *name = stringField(*node, "id");
+    if (!name)
+      return false;
+    if (*name == "TypeAlias")
+      return true;
+    auto alias = staticAnnotationAliases.find(*name);
+    return alias != staticAnnotationAliases.end() &&
+           alias->second == "TypeAlias";
+  }
+  if (node->kind != "Attribute")
+    return false;
+  const parser::NodePtr *value = nodeField(*node, "value");
+  const std::string *attr = stringField(*node, "attr");
+  if (!value || !*value || (*value)->kind != "Name" || !attr ||
+      *attr != "TypeAlias")
+    return false;
+  const std::string *moduleAlias = stringField(**value, "id");
+  if (!moduleAlias)
+    return false;
+  auto module = staticModules.find(*moduleAlias);
+  return module != staticModules.end() && module->second == "typing";
+}
+
+bool Builder::Impl::typeAssignable(mlir::Type expected, mlir::Type actual) {
+  auto &byActual = typeAssignableCache[expected];
+  auto cached = byActual.find(actual);
+  if (cached != byActual.end())
+    return cached->second;
+
+  auto remember = [&](bool result) {
+    byActual.try_emplace(actual, result);
+    return result;
+  };
+
+  if (expected == actual)
+    return remember(true);
+
+  if (!expected || !actual)
+    return remember(false);
+
+  std::optional<typing::Term> expectedTerm = typeTermFromType(expected);
+  std::optional<typing::Term> actualTerm = typeTermFromType(actual);
+  if (!expectedTerm || !actualTerm)
+    return remember(false);
+
+  typing::Oracle oracle;
+  typing::AlgorithmM inference(oracle);
+  try {
+    inference.unify(*expectedTerm, *actualTerm, {{"assignment"}});
+    return remember(true);
+  } catch (const typing::Error &) {
+  }
+
+  if (expectedTerm->kind != typing::Term::Kind::Con ||
+      actualTerm->kind != typing::Term::Kind::Con ||
+      expectedTerm->name != "tuple" || actualTerm->name != "tuple" ||
+      expectedTerm->args.size() != 1 || actualTerm->args.empty())
+    return remember(false);
+
+  typing::AlgorithmM tupleInference(oracle);
+  try {
+    for (const typing::Term &element : actualTerm->args)
+      tupleInference.unify(expectedTerm->args.front(), element,
+                           {{"homogeneous tuple assignment"}});
+    return remember(true);
+  } catch (const typing::Error &) {
+    return remember(false);
+  }
+}
+
+mlir::Type Builder::Impl::typeFromClassAnnotation(llvm::StringRef className) {
+  auto found = classes.find(className.str());
+  if (found == classes.end())
+    return {};
+  return classType(className);
+}
+
+mlir::Type Builder::Impl::listElementType(mlir::Type type) {
+  if (auto list = mlir::dyn_cast<py::ListType>(type))
+    return list.getElementType();
+  return {};
+}
+
+std::optional<std::pair<mlir::Type, mlir::Type>>
+Builder::Impl::dictKeyValueTypes(mlir::Type type) {
+  if (auto dict = mlir::dyn_cast<py::DictType>(type))
+    return std::make_pair(dict.getKeyType(), dict.getValueType());
+  return std::nullopt;
+}
+
+bool Builder::Impl::dictStorageSupported(mlir::Type keyType,
+                                         mlir::Type valueType) {
+  auto isSlotType = [](mlir::Type type) {
+    return mlir::isa<mlir::IntegerType, mlir::FloatType, py::IntType,
+                     py::BoolType, py::FloatType, py::NoneType, py::StrType>(
+        type);
+  };
+  return isSlotType(keyType) && isSlotType(valueType);
+}
+
+std::optional<std::string> Builder::Impl::classNameFromType(mlir::Type type) {
+  if (auto classTy = mlir::dyn_cast<py::ClassType>(type))
+    return classTy.getClassName().str();
+  return std::nullopt;
+}
+
+bool Builder::Impl::isTensorConstructorCallee(const parser::Node &node) const {
+  if (node.kind != "Subscript")
+    return false;
+  const parser::NodePtr *value = nodeField(node, "value");
+  if (!value || !*value)
+    return false;
+  std::optional<std::string> name = primitiveTypeName(**value);
+  return name && (*name == "Matrix" || *name == "Tensor");
+}
+
+std::optional<std::int64_t>
+Builder::Impl::staticIndexValue(const parser::Node &node) const {
+  if (node.kind == "Constant") {
+    const parser::FieldValue *value = valueField(node, "value");
+    const auto *integer = value ? std::get_if<std::int64_t>(value) : nullptr;
+    if (integer)
+      return *integer;
+    return std::nullopt;
+  }
+
+  if (node.kind == "UnaryOp") {
+    std::optional<std::string> op = symbolField(node, "op");
+    const parser::NodePtr *operand = nodeField(node, "operand");
+    if (!op || !operand || !*operand)
+      return std::nullopt;
+    std::optional<std::int64_t> value = staticIndexValue(**operand);
+    if (!value)
+      return std::nullopt;
+    if (*op == "+")
+      return *value;
+    if (*op == "-")
+      return -*value;
+  }
+
+  return std::nullopt;
+}
+
+std::optional<std::int64_t>
+Builder::Impl::staticPyIntValue(mlir::Value value) const {
+  auto constant =
+      value ? value.getDefiningOp<py::IntConstantOp>() : py::IntConstantOp();
+  if (!constant)
+    return std::nullopt;
+
+  llvm::StringRef text = constant.getValue();
+  std::int64_t result = 0;
+  const char *begin = text.data();
+  const char *end = text.data() + text.size();
+  auto parsed = std::from_chars(begin, end, result);
+  if (parsed.ec != std::errc{} || parsed.ptr != end)
+    return std::nullopt;
+  return result;
+}
+
+std::optional<unsigned>
+Builder::Impl::intWidthFromSubscript(const parser::Node &node) {
+  if (node.kind != "Subscript")
+    return std::nullopt;
+  const parser::NodePtr *value = nodeField(node, "value");
+  const parser::NodePtr *slice = nodeField(node, "slice");
+  if (!value || !*value || !slice || !*slice || (*slice)->kind != "Constant")
+    return std::nullopt;
+  std::optional<std::string> name = primitiveTypeName(**value);
+  const parser::FieldValue *widthValue = valueField(**slice, "value");
+  const auto *width =
+      widthValue ? std::get_if<std::int64_t>(widthValue) : nullptr;
+  if (!name || *name != "Int" || !width || *width <= 0 || *width > 64)
+    return std::nullopt;
+  return static_cast<unsigned>(*width);
+}
+
+std::optional<PrimitiveConstant>
+Builder::Impl::primitiveIntConstructorConstant(const parser::Node &node) {
+  if (node.kind != "Call")
+    return std::nullopt;
+  const parser::NodePtr *func = nodeField(node, "func");
+  const std::vector<parser::NodePtr> *args = nodeListField(node, "args");
+  const std::vector<parser::NodePtr> *keywords =
+      nodeListField(node, "keywords");
+  if (!func || !*func || !args || args->size() != 1 || !args->front() ||
+      (keywords && !keywords->empty()))
+    return std::nullopt;
+
+  std::optional<unsigned> width = intWidthFromSubscript(**func);
+  std::optional<std::int64_t> integer = staticIndexValue(*args->front());
+  if (!width || !integer)
+    return std::nullopt;
+  return PrimitiveConstant{
+      mlir::IntegerType::get(&context, static_cast<unsigned>(*width)), *integer,
+      0.0};
+}
+
+std::optional<PrimitiveConstant>
+Builder::Impl::primitiveScalarConstructorConstant(const parser::Node &node) {
+  if (std::optional<PrimitiveConstant> integer =
+          primitiveIntConstructorConstant(node))
+    return integer;
+
+  if (node.kind != "Call")
+    return std::nullopt;
+  const parser::NodePtr *func = nodeField(node, "func");
+  const std::vector<parser::NodePtr> *args = nodeListField(node, "args");
+  const std::vector<parser::NodePtr> *keywords =
+      nodeListField(node, "keywords");
+  if (!func || !*func || !args || args->size() != 1 || !args->front() ||
+      (keywords && !keywords->empty()))
+    return std::nullopt;
+
+  std::optional<mlir::Type> type = typeFromAnnotation(*func);
+  if (!type)
+    return std::nullopt;
+  if (auto floatTy = mlir::dyn_cast<mlir::FloatType>(*type)) {
+    std::optional<double> number = staticNumericValue(*args->front());
+    if (!number)
+      return std::nullopt;
+    return PrimitiveConstant{floatTy, 0, *number};
+  }
+  return std::nullopt;
+}
+
+mlir::Type Builder::Impl::awaitablePayloadType(mlir::Type type) {
+  if (!type)
+    return {};
+  if (auto coro = mlir::dyn_cast<py::CoroutineType>(type))
+    return coro.getResultType();
+  if (auto task = mlir::dyn_cast<py::TaskType>(type))
+    return task.getResultType();
+  if (auto future = mlir::dyn_cast<py::FutureType>(type))
+    return future.getResultType();
+  if (auto asyncValue = mlir::dyn_cast<mlir::async::ValueType>(type))
+    return asyncValue.getValueType();
+  return {};
+}
+
+} // namespace lython::emitter

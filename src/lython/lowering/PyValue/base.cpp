@@ -24,6 +24,46 @@
 namespace py {
 namespace {
 
+struct BuiltinExceptionClass {
+  llvm::StringLiteral name;
+  std::int64_t id;
+};
+
+static constexpr BuiltinExceptionClass kBuiltinExceptionClasses[] = {
+    {type_object::kBaseException, 1},
+    {type_object::kException, 2},
+    {"RuntimeError", 3},
+    {"TypeError", 4},
+    {"ValueError", 5},
+    {"KeyError", 6},
+    {"IndexError", 7},
+    {"AssertionError", 8},
+};
+
+static mlir::FailureOr<std::int64_t>
+builtinExceptionClassId(mlir::Operation *op, llvm::StringRef className) {
+  for (const BuiltinExceptionClass &entry : kBuiltinExceptionClasses)
+    if (entry.name == className)
+      return entry.id;
+  op->emitOpError("unsupported builtin exception class '") << className << "'";
+  return mlir::failure();
+}
+
+static mlir::FailureOr<llvm::SmallVector<std::int64_t, 8>>
+matchingBuiltinExceptionClassIds(mlir::Operation *op,
+                                 llvm::StringRef handlerName) {
+  llvm::SmallVector<std::int64_t, 8> ids;
+  for (const BuiltinExceptionClass &entry : kBuiltinExceptionClasses) {
+    mlir::FailureOr<bool> matches =
+        type_object::isSubclassOf(op, entry.name, handlerName);
+    if (mlir::failed(matches))
+      return mlir::failure();
+    if (*matches)
+      ids.push_back(entry.id);
+  }
+  return ids;
+}
+
 static void getLocInfo(mlir::Location loc, mlir::MLIRContext *ctx,
                        mlir::StringAttr &fileAttr, std::int64_t &line,
                        std::int64_t &col) {
@@ -793,9 +833,6 @@ replaceRaiseCurrentInExceptBlocks(llvm::ArrayRef<mlir::Block *> exceptBlocks,
                           exception)
                       .getResult(0);
     }
-    auto retain = rewriter.create<IncRefOp>(raiseCurrent.getLoc(), exception);
-    threadsafe::Retain::premise(retain.getOperation(),
-                                ThreadSafetyAttrs::kPremiseAggregateBorrow);
     rewriter.replaceOpWithNewOp<RaiseOp>(raiseCurrent, exception);
   }
 }
@@ -1155,9 +1192,18 @@ struct ExceptionNewLowering : public mlir::OpConversionPattern<ExceptionNewOp> {
       return rewriter.notifyMatchFailure(op,
                                          "message must lower to unicode parts");
 
-    auto storage =
-        runtime.call(op.getLoc(), RuntimeSymbols::kExceptionNew,
-                     mlir::TypeRange{resultTypes.front()}, mlir::ValueRange{});
+    llvm::StringRef className = type_object::kException;
+    if (auto classAttr =
+            op->getAttrOfType<mlir::StringAttr>("py.exception.class"))
+      className = classAttr.getValue();
+    mlir::FailureOr<std::int64_t> classId =
+        builtinExceptionClassId(op.getOperation(), className);
+    if (mlir::failed(classId))
+      return mlir::failure();
+    mlir::Value classIdValue = runtime.getI64Constant(op.getLoc(), *classId);
+    auto storage = runtime.call(op.getLoc(), RuntimeSymbols::kExceptionNew,
+                                mlir::TypeRange{resultTypes.front()},
+                                mlir::ValueRange{classIdValue});
     llvm::SmallVector<mlir::Value, 3> exceptionParts;
     exceptionParts.push_back(storage.getResult());
     exceptionParts.append(messageParts.begin(), messageParts.end());
@@ -1172,18 +1218,41 @@ struct ExceptMatchLowering : public mlir::OpConversionPattern<ExceptMatchOp> {
       : mlir::OpConversionPattern<ExceptMatchOp>(converter, ctx) {}
 
   mlir::LogicalResult
-  matchAndRewrite(ExceptMatchOp op, OpAdaptor adaptor,
+  matchAndRewrite(ExceptMatchOp op, OneToNOpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
-    (void)adaptor;
-    auto handlerType = mlir::dyn_cast<ClassType>(op.getType().getType());
+    auto handlerType =
+        mlir::dyn_cast<ClassType>(op.getHandlerAttr().getValue());
     if (!handlerType)
       return rewriter.notifyMatchFailure(op, "handler is not a class type");
-    mlir::FailureOr<bool> matches =
-        type_object::exceptionMatches(op, handlerType.getClassName());
-    if (mlir::failed(matches))
+
+    mlir::ValueRange exceptionParts = adaptor.getException();
+    if (exceptionParts.size() != 3)
+      return rewriter.notifyMatchFailure(
+          op, "except.match requires exception parts descriptor ABI");
+    mlir::Value header = exceptionParts.front();
+    if (!object_abi::exception_abi::Header::isOwned(header.getType()))
+      return rewriter.notifyMatchFailure(
+          op, "except.match requires exception header descriptor");
+
+    mlir::FailureOr<llvm::SmallVector<std::int64_t, 8>> matchingIds =
+        matchingBuiltinExceptionClassIds(op.getOperation(),
+                                         handlerType.getClassName());
+    if (mlir::failed(matchingIds))
       return mlir::failure();
-    rewriter.replaceOpWithNewOp<mlir::arith::ConstantIntOp>(
-        op, *matches ? 1 : 0, 1);
+    mlir::Value classIdSlot = rewriter.create<mlir::arith::ConstantIndexOp>(
+        op.getLoc(), object_abi::exception_abi::kClassIdSlot);
+    mlir::Value classId =
+        rewriter.create<mlir::memref::LoadOp>(op.getLoc(), header, classIdSlot);
+    mlir::Value result =
+        rewriter.create<mlir::arith::ConstantIntOp>(op.getLoc(), 0, 1);
+    for (std::int64_t id : *matchingIds) {
+      mlir::Value expected =
+          rewriter.create<mlir::arith::ConstantIntOp>(op.getLoc(), id, 64);
+      mlir::Value match = rewriter.create<mlir::arith::CmpIOp>(
+          op.getLoc(), mlir::arith::CmpIPredicate::eq, classId, expected);
+      result = rewriter.create<mlir::arith::OrIOp>(op.getLoc(), result, match);
+    }
+    rewriter.replaceOp(op, result);
     return mlir::success();
   }
 };

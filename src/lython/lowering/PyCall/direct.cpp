@@ -10,6 +10,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 
 #include <algorithm>
+#include <optional>
 
 namespace py::optimizer::class_state {
 bool local(mlir::Value value);
@@ -27,6 +28,287 @@ static bool canDropNoneResult(CallVectorOp op) {
   return llvm::all_of(op.getResult(0).getUsers(), [](mlir::Operation *user) {
     return mlir::isa<DecRefOp>(user);
   });
+}
+
+struct DirectCallable {
+  mlir::func::FuncOp func;
+  mlir::FunctionType functionType;
+  std::string symbolName;
+  mlir::Operation *reference = nullptr;
+  mlir::ArrayAttr argNames;
+  mlir::ArrayAttr kwonlyNames;
+};
+
+static mlir::ArrayAttr getArrayAttr(mlir::Operation *op,
+                                    llvm::StringRef name) {
+  return op ? op->getAttrOfType<mlir::ArrayAttr>(name) : mlir::ArrayAttr{};
+}
+
+static std::optional<llvm::StringRef> stringAttrAt(mlir::ArrayAttr attr,
+                                                   std::size_t index) {
+  if (!attr || index >= attr.size())
+    return std::nullopt;
+  auto str = mlir::dyn_cast<mlir::StringAttr>(attr[index]);
+  if (!str)
+    return std::nullopt;
+  return str.getValue();
+}
+
+static std::optional<std::size_t>
+findKeyword(llvm::ArrayRef<llvm::StringRef> names, llvm::StringRef target,
+            llvm::ArrayRef<bool> consumed) {
+  for (auto [index, name] : llvm::enumerate(names)) {
+    if (consumed[index])
+      continue;
+    if (name == target)
+      return index;
+  }
+  return std::nullopt;
+}
+
+static bool collectTupleElements(mlir::Value tuple,
+                                 llvm::SmallVectorImpl<mlir::Value> &out) {
+  mlir::Value stripped = stripBridgeCasts(tuple);
+  if (auto create = stripped.getDefiningOp<TupleCreateOp>()) {
+    out.append(create.getElements().begin(), create.getElements().end());
+    return true;
+  }
+  return static_cast<bool>(stripped.getDefiningOp<TupleEmptyOp>());
+}
+
+static mlir::LogicalResult
+appendConvertedType(mlir::Type type, const PyLLVMTypeConverter &typeConverter,
+                    llvm::SmallVectorImpl<mlir::Type> &storage,
+                    mlir::Operation *emitOnError) {
+  llvm::SmallVector<mlir::Type, 4> converted;
+  if (mlir::failed(typeConverter.convertType(type, converted)) ||
+      converted.empty()) {
+    emitOnError->emitError("failed to convert direct callable type ") << type;
+    return mlir::failure();
+  }
+  storage.append(converted.begin(), converted.end());
+  return mlir::success();
+}
+
+static mlir::FailureOr<mlir::FunctionType>
+loweredPyFuncType(FuncOp func, const PyLLVMTypeConverter &typeConverter,
+                  mlir::Operation *emitOnError) {
+  auto sigAttr = func->getAttrOfType<mlir::TypeAttr>("function_type");
+  if (!sigAttr)
+    return mlir::failure();
+  auto sig = mlir::dyn_cast<FuncSignatureType>(sigAttr.getValue());
+  if (!sig)
+    return mlir::failure();
+
+  llvm::SmallVector<mlir::Type, 8> inputs;
+  llvm::SmallVector<mlir::Type, 4> results;
+  auto positional = sig.getPositionalTypes();
+  for (mlir::Type type : positional)
+    if (mlir::failed(
+            appendConvertedType(type, typeConverter, inputs, emitOnError)))
+      return mlir::failure();
+  auto kwonly = sig.getKwOnlyTypes();
+  for (mlir::Type type : kwonly)
+    if (mlir::failed(
+            appendConvertedType(type, typeConverter, inputs, emitOnError)))
+      return mlir::failure();
+  if (sig.hasVararg() &&
+      mlir::failed(appendConvertedType(sig.getVarargType(), typeConverter,
+                                       inputs, emitOnError)))
+    return mlir::failure();
+  if (sig.hasKwarg() &&
+      mlir::failed(appendConvertedType(sig.getKwargType(), typeConverter,
+                                       inputs, emitOnError)))
+    return mlir::failure();
+
+  if (mlir::ArrayAttr closureTypes = func.getClosureTypesAttr()) {
+    for (mlir::Attribute attr : closureTypes) {
+      auto typeAttr = mlir::dyn_cast<mlir::TypeAttr>(attr);
+      if (!typeAttr)
+        return mlir::failure();
+      if (mlir::failed(appendConvertedType(typeAttr.getValue(), typeConverter,
+                                           inputs, emitOnError)))
+        return mlir::failure();
+    }
+  }
+
+  for (mlir::Type type : sig.getResultTypes()) {
+    if (mlir::isa<NoneType>(type))
+      continue;
+    if (mlir::failed(
+            appendConvertedType(type, typeConverter, results, emitOnError)))
+      return mlir::failure();
+  }
+  return mlir::FunctionType::get(func.getContext(), inputs, results);
+}
+
+static mlir::LogicalResult packVectorArgsForDirectCall(
+    CallVectorOp op, mlir::ValueRange posElements,
+    mlir::ValueRange kwNameElements, mlir::ValueRange kwValueElements,
+    mlir::ArrayAttr argNamesAttr, mlir::ArrayAttr kwonlyNamesAttr,
+    llvm::SmallVectorImpl<mlir::Value> &directElements,
+    mlir::PatternRewriter &rewriter) {
+  auto callableType = mlir::dyn_cast<FuncType>(op.getCallable().getType());
+  if (!callableType)
+    return mlir::failure();
+
+  FuncSignatureType signature = callableType.getSignature();
+  auto positionalTypes = signature.getPositionalTypes();
+  auto kwonlyTypes = signature.getKwOnlyTypes();
+  if (kwNameElements.size() != kwValueElements.size())
+    return mlir::failure();
+
+  llvm::SmallVector<llvm::StringRef, 4> keywordNames;
+  keywordNames.reserve(kwNameElements.size());
+  for (mlir::Value nameValue : kwNameElements) {
+    auto name = stripBridgeCasts(nameValue).getDefiningOp<StrConstantOp>();
+    if (!name)
+      return mlir::failure();
+    keywordNames.push_back(name.getValueAttr().getValue());
+  }
+  llvm::SmallVector<bool, 8> keywordConsumed(keywordNames.size(), false);
+
+  if (signature.hasVararg() && !kwonlyTypes.empty())
+    return mlir::failure();
+
+  if (!signature.hasVararg() &&
+      posElements.size() > positionalTypes.size() + kwonlyTypes.size())
+    return mlir::failure();
+
+  for (std::size_t index = 0; index < positionalTypes.size(); ++index) {
+    if (index < posElements.size()) {
+      if (std::optional<llvm::StringRef> name =
+              stringAttrAt(argNamesAttr, index)) {
+        if (findKeyword(keywordNames, *name, keywordConsumed))
+          return mlir::failure();
+      }
+      directElements.push_back(posElements[index]);
+      continue;
+    }
+
+    std::optional<llvm::StringRef> name = stringAttrAt(argNamesAttr, index);
+    if (!name)
+      return mlir::failure();
+    std::optional<std::size_t> keywordIndex =
+        findKeyword(keywordNames, *name, keywordConsumed);
+    if (!keywordIndex)
+      return mlir::failure();
+    directElements.push_back(kwValueElements[*keywordIndex]);
+    keywordConsumed[*keywordIndex] = true;
+  }
+
+  if (!signature.hasVararg()) {
+    for (std::size_t index = 0; index < kwonlyTypes.size(); ++index) {
+      std::size_t normalizedIndex = positionalTypes.size() + index;
+      if (normalizedIndex < posElements.size()) {
+        directElements.push_back(posElements[normalizedIndex]);
+        continue;
+      }
+
+      std::optional<llvm::StringRef> name =
+          stringAttrAt(kwonlyNamesAttr, index);
+      if (!name)
+        return mlir::failure();
+      std::optional<std::size_t> keywordIndex =
+          findKeyword(keywordNames, *name, keywordConsumed);
+      if (!keywordIndex)
+        return mlir::failure();
+      directElements.push_back(kwValueElements[*keywordIndex]);
+      keywordConsumed[*keywordIndex] = true;
+    }
+  }
+
+  if (signature.hasVararg()) {
+    std::size_t positionalCount = positionalTypes.size();
+    if (posElements.size() < positionalCount)
+      return mlir::failure();
+
+    auto varargType = mlir::dyn_cast<TupleType>(signature.getVarargType());
+    if (!varargType || varargType.getElementTypes().size() != 1)
+      return mlir::failure();
+
+    llvm::SmallVector<mlir::Value, 4> varargElements(
+        posElements.begin() + positionalCount, posElements.end());
+    mlir::Value varargs =
+        rewriter.create<TupleCreateOp>(op.getLoc(), varargType, varargElements);
+    directElements.push_back(varargs);
+  }
+
+  if (signature.hasKwarg()) {
+    auto kwargsType = mlir::dyn_cast<DictType>(signature.getKwargType());
+    if (!kwargsType)
+      return mlir::failure();
+    mlir::Value kwargs =
+        rewriter.create<DictEmptyOp>(op.getLoc(), kwargsType);
+    for (auto [index, consumed] : llvm::enumerate(keywordConsumed)) {
+      if (consumed)
+        continue;
+      rewriter.create<DictInsertOp>(op.getLoc(), kwargs, kwNameElements[index],
+                                    kwValueElements[index]);
+    }
+    directElements.push_back(kwargs);
+  } else if (llvm::any_of(keywordConsumed, [](bool consumed) {
+               return !consumed;
+             })) {
+    return mlir::failure();
+  }
+  return mlir::success();
+}
+
+static DirectCallable resolveDirectCallableBySymbol(
+    CallVectorOp op, mlir::ModuleOp module, llvm::StringRef symbolName,
+    mlir::Operation *reference, const PyLLVMTypeConverter &typeConverter) {
+  if (auto func = module.lookupSymbol<mlir::func::FuncOp>(symbolName))
+    return {func,
+            func.getFunctionType(),
+            symbolName.str(),
+            reference,
+            getArrayAttr(func.getOperation(), "arg_names"),
+            getArrayAttr(func.getOperation(), "kwonly_names")};
+  if (auto func = module.lookupSymbol<FuncOp>(symbolName)) {
+    mlir::FailureOr<mlir::FunctionType> type =
+        loweredPyFuncType(func, typeConverter, op.getOperation());
+    if (mlir::succeeded(type))
+      return {nullptr,
+              *type,
+              symbolName.str(),
+              reference,
+              func.getArgNamesAttr(),
+              func.getKwonlyNamesAttr()};
+  }
+  return {};
+}
+
+static DirectCallable
+resolveDirectCallable(CallVectorOp op, mlir::ModuleOp module,
+                      const PyLLVMTypeConverter &typeConverter) {
+  mlir::Value callable = stripBridgeCasts(op.getCallable());
+  mlir::Operation *producer = callable.getDefiningOp();
+  if (auto constOp = mlir::dyn_cast_or_null<mlir::func::ConstantOp>(producer)) {
+    mlir::SymbolRefAttr symbolRef = constOp.getValueAttr();
+    llvm::StringRef symbolName = symbolRef.getLeafReference().empty()
+                                     ? symbolRef.getRootReference().getValue()
+                                     : symbolRef.getLeafReference().getValue();
+    return resolveDirectCallableBySymbol(op, module, symbolName, constOp,
+                                         typeConverter);
+  }
+
+  if (auto funcObject = mlir::dyn_cast_or_null<FuncObjectOp>(producer)) {
+    return resolveDirectCallableBySymbol(
+        op, module, funcObject.getTargetAttr().getValue(),
+        funcObject.getOperation(), typeConverter);
+  }
+
+  if (auto makeFunction = mlir::dyn_cast_or_null<MakeFunctionOp>(producer)) {
+    if (makeFunction.getDefaults() || makeFunction.getKwdefaults() ||
+        makeFunction.getClosure())
+      return {};
+    return resolveDirectCallableBySymbol(
+        op, module, makeFunction.getTargetAttr().getValue(),
+        makeFunction.getOperation(), typeConverter);
+  }
+
+  return {};
 }
 
 static TupleCreateOp
@@ -251,6 +533,7 @@ static bool tupleSlotCanOwnRef(TupleCreateOp tupleCreate, unsigned index) {
   case container::SlotPolicy::NativeBool:
   case container::SlotPolicy::NativeFloat:
     return false;
+  case container::SlotPolicy::ObjectParts:
   case container::SlotPolicy::Unsupported:
     return true;
   }
@@ -310,7 +593,8 @@ static bool isLoweredStringStorage(mlir::Value value) {
 
 static RuntimeAPI::Call emitHostPrintLiteral(mlir::Location loc,
                                              llvm::StringRef text,
-                                             RuntimeAPI &runtime) {
+                                             RuntimeAPI &runtime,
+                                             llvm::StringRef printSymbol) {
   mlir::OpBuilder &builder = runtime.getBuilder();
   mlir::StringAttr literal = builder.getStringAttr(text);
   mlir::Value bytes = runtime.getByteLiteral(loc, literal);
@@ -323,8 +607,7 @@ static RuntimeAPI::Call emitHostPrintLiteral(mlir::Location loc,
       loc, RuntimeSymbols::kUnicodeFromBytes, mlir::TypeRange(resultTypes),
       mlir::ValueRange{bytes, start, length});
   llvm::SmallVector<mlir::Value, 3> parts(unicode.getResults());
-  runtime.call(loc, RuntimeSymbols::kUnicodePrintLine, mlir::Type(),
-               mlir::ValueRange(parts));
+  runtime.call(loc, printSymbol, mlir::Type(), mlir::ValueRange(parts));
   RuntimeAPI::Call release =
       runtime.call(loc, RuntimeSymbols::kUnicodeDecRef, mlir::Type(),
                    mlir::ValueRange(parts));
@@ -335,7 +618,8 @@ static RuntimeAPI::Call emitHostPrintLiteral(mlir::Location loc,
 
 static mlir::FailureOr<mlir::Operation *>
 emitHostPrintBool(mlir::Location loc, mlir::Value value,
-                  mlir::PatternRewriter &rewriter, RuntimeAPI &runtime) {
+                  mlir::PatternRewriter &rewriter, RuntimeAPI &runtime,
+                  llvm::StringRef printSymbol) {
   mlir::Value bit = value;
   if (mlir::isa<BoolType>(value.getType())) {
     bit = rewriter
@@ -351,12 +635,12 @@ emitHostPrintBool(mlir::Location loc, mlir::Value value,
   {
     mlir::OpBuilder::InsertionGuard guard(rewriter);
     rewriter.setInsertionPointToStart(branch.thenBlock());
-    emitHostPrintLiteral(loc, "True", runtime);
+    emitHostPrintLiteral(loc, "True", runtime, printSymbol);
   }
   {
     mlir::OpBuilder::InsertionGuard guard(rewriter);
     rewriter.setInsertionPointToStart(branch.elseBlock());
-    emitHostPrintLiteral(loc, "False", runtime);
+    emitHostPrintLiteral(loc, "False", runtime, printSymbol);
   }
   return branch.getOperation();
 }
@@ -454,6 +738,9 @@ struct CallVectorLowering : public mlir::OpConversionPattern<CallVectorOp> {
     if (!module)
       return mlir::failure();
     RuntimeAPI runtime(module, rewriter, typeConverter);
+    llvm::StringRef printSymbol = isBuiltinPrintRawCallable(op.getCallable())
+                                      ? RuntimeSymbols::kUnicodePrint
+                                      : RuntimeSymbols::kUnicodePrintLine;
 
     if (elements.size() != 1)
       return rewriter.notifyMatchFailure(
@@ -464,10 +751,13 @@ struct CallVectorLowering : public mlir::OpConversionPattern<CallVectorOp> {
         [&](llvm::StringRef text,
             mlir::Operation *producer) -> mlir::LogicalResult {
       llvm::SmallVector<DecRefOp> deadPosargDrops;
+      llvm::SmallVector<DecRefOp> sourceTransferDrops;
       TupleCreateOp deadPosargs = collectDeadStaticPosargs(op, deadPosargDrops);
       if (!deadPosargs)
         deadPosargs = staticPosargs;
-      emitHostPrintLiteral(op.getLoc(), text, runtime);
+      collectArgTransferDrops(deadPosargs, op.getOperation(),
+                              sourceTransferDrops);
+      emitHostPrintLiteral(op.getLoc(), text, runtime, printSymbol);
       if (op.getNumResults() != 0) {
         if (canDropNoneResult(op)) {
           eraseNoneResultUsers(op, rewriter);
@@ -482,6 +772,9 @@ struct CallVectorLowering : public mlir::OpConversionPattern<CallVectorOp> {
         }
       }
       rewriter.eraseOp(op);
+      for (DecRefOp drop : sourceTransferDrops)
+        if (drop)
+          rewriter.eraseOp(drop);
       cleanupDeadCallPack(deadPosargs, deadPosargDrops, rewriter);
       if (producer && producer->use_empty())
         rewriter.eraseOp(producer);
@@ -492,6 +785,12 @@ struct CallVectorLowering : public mlir::OpConversionPattern<CallVectorOp> {
     }
     if (auto literal = literalCandidate.getDefiningOp<IntConstantOp>()) {
       return emitStaticPrintLiteral(literal.getValue(), literal.getOperation());
+    }
+    if (auto repr = literalCandidate.getDefiningOp<ReprOp>()) {
+      if (auto literal = stripBridgeCasts(repr.getInput())
+                             .getDefiningOp<IntConstantOp>()) {
+        return emitStaticPrintLiteral(literal.getValue(), repr.getOperation());
+      }
     }
 
     {
@@ -524,8 +823,8 @@ struct CallVectorLowering : public mlir::OpConversionPattern<CallVectorOp> {
       };
       if (!isPyStrType(printable.getType())) {
         if (mlir::isa<BoolType>(printable.getType())) {
-          mlir::FailureOr<mlir::Operation *> printAnchor =
-              emitHostPrintBool(op.getLoc(), printable, rewriter, runtime);
+          mlir::FailureOr<mlir::Operation *> printAnchor = emitHostPrintBool(
+              op.getLoc(), printable, rewriter, runtime, printSymbol);
           if (mlir::failed(printAnchor))
             return rewriter.notifyMatchFailure(
                 op, "failed to lower bool print to host print");
@@ -570,9 +869,8 @@ struct CallVectorLowering : public mlir::OpConversionPattern<CallVectorOp> {
         }
       }
       if (partsPrintStorage) {
-        auto printCall =
-            runtime.call(op.getLoc(), RuntimeSymbols::kUnicodePrintLine,
-                         mlir::Type(), mlir::ValueRange(strPartsStorage));
+        auto printCall = runtime.call(op.getLoc(), printSymbol, mlir::Type(),
+                                      mlir::ValueRange(strPartsStorage));
         printAnchor = printCall.getOperation();
       } else if (strStorage == printable &&
                  mlir::isa<StrType>(printable.getType())) {
@@ -583,9 +881,8 @@ struct CallVectorLowering : public mlir::OpConversionPattern<CallVectorOp> {
             mlir::ValueRange{printable});
         strPartsStorage.append(cast.getResults().begin(),
                                cast.getResults().end());
-        auto printCall =
-            runtime.call(op.getLoc(), RuntimeSymbols::kUnicodePrintLine,
-                         mlir::Type(), mlir::ValueRange(strPartsStorage));
+        auto printCall = runtime.call(op.getLoc(), printSymbol, mlir::Type(),
+                                      mlir::ValueRange(strPartsStorage));
         printAnchor = printCall.getOperation();
         partsPrintStorage = true;
       } else {
@@ -643,21 +940,26 @@ struct CallVectorLowering : public mlir::OpConversionPattern<CallVectorOp> {
     if (isBuiltinPrintCallable(op.getCallable()))
       return lowerBuiltinPrint(op, rewriter);
 
-    mlir::Value callable = stripBridgeCasts(op.getCallable());
-    mlir::Operation *producer = callable.getDefiningOp();
-    auto constOp = mlir::dyn_cast_or_null<mlir::func::ConstantOp>(producer);
-    if (!constOp)
+    DirectCallable direct = resolveDirectCallable(op, module, typeConverter);
+    auto func = direct.func;
+    if (!func && !direct.functionType)
       return lowerViaRuntime(op, rewriter);
 
-    mlir::SymbolRefAttr symbolRef = constOp.getValueAttr();
-    llvm::StringRef symbolName = symbolRef.getLeafReference().empty()
-                                     ? symbolRef.getRootReference().getValue()
-                                     : symbolRef.getLeafReference().getValue();
-    auto func = module.lookupSymbol<mlir::func::FuncOp>(symbolName);
-    if (!func)
+    auto callableType = mlir::dyn_cast<FuncType>(op.getCallable().getType());
+    if (!callableType)
+      return lowerViaRuntime(op, rewriter);
+    FuncSignatureType signature = callableType.getSignature();
+
+    llvm::SmallVector<mlir::Value, 4> kwNameElements;
+    llvm::SmallVector<mlir::Value, 4> kwValueElements;
+    if (!collectTupleElements(op.getKwnames(), kwNameElements) ||
+        !collectTupleElements(op.getKwvalues(), kwValueElements))
+      return lowerViaRuntime(op, rewriter);
+    if (kwNameElements.size() != kwValueElements.size())
       return lowerViaRuntime(op, rewriter);
 
-    if (canUseVoidHelper(op, func)) {
+    if (func && !signature.hasVararg() && !signature.hasKwarg() &&
+        kwNameElements.empty() && canUseVoidHelper(op, func)) {
       auto posargsOp = stripBridgeCasts(op.getPosargs()).getDefiningOp();
       llvm::SmallVector<mlir::Value> helperOperands;
       llvm::SmallVector<DecRefOp> argTransferDrops;
@@ -702,25 +1004,23 @@ struct CallVectorLowering : public mlir::OpConversionPattern<CallVectorOp> {
       eraseNoneResultUsers(op, rewriter);
       rewriter.eraseOp(op);
       cleanupDeadCallPack(deadPosargs, deadPosargDrops, rewriter);
-      if (constOp->use_empty())
-        rewriter.eraseOp(constOp);
+      if (direct.reference && direct.reference->use_empty())
+        rewriter.eraseOp(direct.reference);
       return mlir::success();
     }
 
-    if (!mlir::isa<TupleEmptyOp>(
-            stripBridgeCasts(op.getKwnames()).getDefiningOp()) ||
-        !mlir::isa<TupleEmptyOp>(
-            stripBridgeCasts(op.getKwvalues()).getDefiningOp()))
-      return lowerViaRuntime(op, rewriter);
-
     auto posargsOp = stripBridgeCasts(op.getPosargs()).getDefiningOp();
     if (auto tupleCreate = mlir::dyn_cast_or_null<TupleCreateOp>(posargsOp)) {
-      func =
-          resolvePreferredDirectHelper(func, tupleCreate.getElements(), module,
-                                       /*allowVoidHelper=*/false);
+      if (func) {
+        func = resolvePreferredDirectHelper(func, tupleCreate.getElements(),
+                                            module,
+                                            /*allowVoidHelper=*/false);
+        if (func)
+          direct.functionType = func.getFunctionType();
+      }
     }
 
-    auto funcType = func.getFunctionType();
+    auto funcType = direct.functionType;
     llvm::SmallVector<mlir::Value> callOperands;
     llvm::SmallVector<DecRefOp> argTransferDrops;
     unsigned directInputCount = funcType.getNumInputs();
@@ -731,20 +1031,42 @@ struct CallVectorLowering : public mlir::OpConversionPattern<CallVectorOp> {
       staticPosargs = tupleCreate;
       if (!deadPosargs)
         deadPosargs = tupleCreate;
+      llvm::SmallVector<mlir::Value, 8> directElements;
+      if (mlir::failed(packVectorArgsForDirectCall(
+              op, tupleCreate.getElements(), kwNameElements, kwValueElements,
+              direct.argNames, direct.kwonlyNames, directElements, rewriter)))
+        return lowerViaRuntime(op, rewriter);
       if (mlir::failed(::py::appendFlattenedCallOperands(
-              op.getLoc(), tupleCreate.getElements(), funcType,
-              directInputCount, callOperands, rewriter, typeConverter)))
+              op.getLoc(), directElements, funcType, directInputCount,
+              callOperands, rewriter, typeConverter)))
         return lowerViaRuntime(op, rewriter);
       collectArgTransferDrops(tupleCreate, op.getOperation(), argTransferDrops);
     } else if (mlir::isa<TupleEmptyOp>(posargsOp)) {
-      if (directInputCount != 0)
+      llvm::SmallVector<mlir::Value, 1> directElements;
+      if (mlir::failed(packVectorArgsForDirectCall(
+              op, mlir::ValueRange{}, kwNameElements, kwValueElements,
+              direct.argNames, direct.kwonlyNames, directElements, rewriter)))
         return lowerViaRuntime(op, rewriter);
+      if (directElements.empty()) {
+        if (directInputCount != 0)
+          return lowerViaRuntime(op, rewriter);
+      } else if (mlir::failed(::py::appendFlattenedCallOperands(
+                     op.getLoc(), directElements, funcType, directInputCount,
+                     callOperands, rewriter, typeConverter))) {
+        return lowerViaRuntime(op, rewriter);
+      }
     } else {
       return lowerViaRuntime(op, rewriter);
     }
 
-    auto call =
-        rewriter.create<mlir::func::CallOp>(op.getLoc(), func, callOperands);
+    mlir::func::CallOp call;
+    if (func) {
+      call =
+          rewriter.create<mlir::func::CallOp>(op.getLoc(), func, callOperands);
+    } else {
+      call = rewriter.create<mlir::func::CallOp>(
+          op.getLoc(), direct.symbolName, funcType.getResults(), callOperands);
+    }
     moveAfter(call.getOperation(), argTransferDrops);
     releaseOwnedStringCallArgs(staticPosargs, call.getOperation(), rewriter);
     closeDeadLocalClassArguments(staticPosargs, call.getOperation(),
@@ -776,8 +1098,8 @@ struct CallVectorLowering : public mlir::OpConversionPattern<CallVectorOp> {
       cleanupDeadCallPack(deadPosargs, deadPosargDrops, rewriter);
     }
 
-    if (constOp->use_empty())
-      rewriter.eraseOp(constOp);
+    if (direct.reference && direct.reference->use_empty())
+      rewriter.eraseOp(direct.reference);
     return mlir::success();
   }
 

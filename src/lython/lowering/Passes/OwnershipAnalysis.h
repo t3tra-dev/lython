@@ -37,6 +37,7 @@ public:
   bool rootIsImmortal(mlir::Value root) const;
   bool rootHasAggregateBorrow(mlir::Value root) const;
   bool rootIsEntryBorrowed(mlir::Value value, mlir::Block &entry) const;
+  bool rootIsCapturedBorrow(mlir::Value root, mlir::Region &region) const;
   void collectAliases(mlir::Value value,
                       llvm::SmallVectorImpl<mlir::Value> &aliases) const;
 

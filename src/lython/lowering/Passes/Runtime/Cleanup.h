@@ -16,6 +16,8 @@ bool voidPyReturns(mlir::Operation *container);
 bool memrefDescriptorCasts(mlir::Operation *container);
 bool memrefRuntimeCalls(mlir::Operation *container);
 bool pointerRoundTrips(mlir::Operation *container);
+bool llvmFuncReturns(mlir::Operation *container);
+bool finalBoundary(mlir::ModuleOp module);
 } // namespace cleanup
 
 } // namespace py::lowering::runtime

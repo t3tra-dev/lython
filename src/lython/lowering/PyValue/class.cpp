@@ -33,7 +33,7 @@ namespace class_field::Refcount {
 namespace Parts {
 static std::optional<size_t> count(mlir::Type logicalType) {
   if (mlir::isa<IntType>(logicalType))
-    return 2;
+    return 3;
   if (mlir::isa<StrType>(logicalType))
     return 2;
   return std::nullopt;
@@ -80,6 +80,8 @@ bool needed(mlir::Type logicalType, mlir::Type storageType,
   if (!isPyType(logicalType) ||
       mlir::isa<ClassType, NoneType, BoolType, FloatType>(logicalType))
     return false;
+  if (Parts::count(logicalType))
+    return true;
   if (Parts::storage(logicalType, storageType))
     return true;
   return object_abi::Type::isLoweredStorage(storageType);
@@ -2441,11 +2443,195 @@ mlir::func::FuncOp get(mlir::Location loc, mlir::ModuleOp module,
 } // namespace class_helper::Eq
 
 namespace class_container::Clone {
+std::optional<unsigned> scalarElementBytes(mlir::Type type) {
+  if (type.isInteger(64) || type.isF64())
+    return 8;
+  if (type.isInteger(32) || type.isF32())
+    return 4;
+  if (type.isInteger(16))
+    return 2;
+  if (type.isInteger(8) || type.isInteger(1))
+    return 1;
+  return std::nullopt;
+}
+
+mlir::Value gepRank1Element(mlir::Location loc, mlir::Value aligned,
+                            mlir::Value offset, mlir::Value stride,
+                            unsigned index, mlir::Type elementType,
+                            mlir::OpBuilder &builder) {
+  mlir::Value indexValue = builder.create<mlir::LLVM::ConstantOp>(
+      loc, builder.getI64Type(), builder.getI64IntegerAttr(index));
+  mlir::Value scaled =
+      builder.create<mlir::LLVM::MulOp>(loc, indexValue, stride);
+  mlir::Value linear = builder.create<mlir::LLVM::AddOp>(loc, offset, scaled);
+  auto ptrType = mlir::LLVM::LLVMPointerType::get(builder.getContext());
+  return builder.create<mlir::LLVM::GEPOp>(
+      loc, ptrType, elementType, aligned,
+      llvm::ArrayRef<mlir::LLVM::GEPArg>{linear});
+}
+
+mlir::Value cloneStaticScalarDescriptor(mlir::Location loc,
+                                        mlir::Value descriptor,
+                                        mlir::MemRefType memrefType,
+                                        mlir::OpBuilder &builder) {
+  if (memrefType.getRank() != 1 || memrefType.isDynamicDim(0))
+    return {};
+  std::optional<unsigned> elementBytes =
+      scalarElementBytes(memrefType.getElementType());
+  if (!elementBytes)
+    return {};
+
+  mlir::Operation *parentOp = builder.getBlock()->getParentOp();
+  mlir::ModuleOp module =
+      parentOp ? parentOp->getParentOfType<mlir::ModuleOp>() : mlir::ModuleOp{};
+  if (!module)
+    return {};
+
+  auto mallocFunc =
+      mlir::LLVM::lookupOrCreateMallocFn(module, builder.getI64Type());
+  if (mlir::failed(mallocFunc))
+    return {};
+
+  auto descriptorType =
+      mlir::cast<mlir::LLVM::LLVMStructType>(descriptor.getType());
+  int64_t elementCount = memrefType.getDimSize(0);
+  mlir::Value sizeBytes = builder.create<mlir::LLVM::ConstantOp>(
+      loc, builder.getI64Type(),
+      builder.getI64IntegerAttr(elementCount * *elementBytes));
+  mlir::Value allocated = builder
+                              .create<mlir::LLVM::CallOp>(
+                                  loc, *mallocFunc, mlir::ValueRange{sizeBytes})
+                              .getResult();
+  ownership::Pointer::markNonObject(allocated);
+  mlir::Value sourceAligned = builder.create<mlir::LLVM::ExtractValueOp>(
+      loc, descriptorType.getBody()[1], descriptor,
+      builder.getDenseI64ArrayAttr({1}));
+  mlir::Value sourceOffset = builder.create<mlir::LLVM::ExtractValueOp>(
+      loc, builder.getI64Type(), descriptor, builder.getDenseI64ArrayAttr({2}));
+  mlir::Value sourceStride = builder.create<mlir::LLVM::ExtractValueOp>(
+      loc, builder.getI64Type(), descriptor,
+      builder.getDenseI64ArrayAttr({4, 0}));
+
+  for (int64_t index = 0; index < elementCount; ++index) {
+    mlir::Value sourceAddress = gepRank1Element(
+        loc, sourceAligned, sourceOffset, sourceStride,
+        static_cast<unsigned>(index), memrefType.getElementType(), builder);
+    mlir::Value value = builder.create<mlir::LLVM::LoadOp>(
+        loc, memrefType.getElementType(), sourceAddress);
+    mlir::Value destIndex = builder.create<mlir::LLVM::ConstantOp>(
+        loc, builder.getI64Type(), builder.getI64IntegerAttr(index));
+    auto ptrType = mlir::LLVM::LLVMPointerType::get(builder.getContext());
+    mlir::Value destAddress = builder.create<mlir::LLVM::GEPOp>(
+        loc, ptrType, memrefType.getElementType(), allocated,
+        llvm::ArrayRef<mlir::LLVM::GEPArg>{destIndex});
+    builder.create<mlir::LLVM::StoreOp>(loc, value, destAddress);
+  }
+
+  mlir::Value result = builder.create<mlir::LLVM::UndefOp>(loc, descriptorType);
+  mlir::Value zero = builder.create<mlir::LLVM::ConstantOp>(
+      loc, builder.getI64Type(), builder.getI64IntegerAttr(0));
+  mlir::Value size = builder.create<mlir::LLVM::ConstantOp>(
+      loc, builder.getI64Type(), builder.getI64IntegerAttr(elementCount));
+  mlir::Value stride = builder.create<mlir::LLVM::ConstantOp>(
+      loc, builder.getI64Type(), builder.getI64IntegerAttr(1));
+  result = builder.create<mlir::LLVM::InsertValueOp>(
+      loc, descriptorType, result, allocated,
+      builder.getDenseI64ArrayAttr({0}));
+  result = builder.create<mlir::LLVM::InsertValueOp>(
+      loc, descriptorType, result, allocated,
+      builder.getDenseI64ArrayAttr({1}));
+  result = builder.create<mlir::LLVM::InsertValueOp>(
+      loc, descriptorType, result, zero, builder.getDenseI64ArrayAttr({2}));
+  result = builder.create<mlir::LLVM::InsertValueOp>(
+      loc, descriptorType, result, size, builder.getDenseI64ArrayAttr({3, 0}));
+  result = builder.create<mlir::LLVM::InsertValueOp>(
+      loc, descriptorType, result, stride,
+      builder.getDenseI64ArrayAttr({4, 0}));
+  return result;
+}
+
+mlir::Value cloneContiguousDescriptor(mlir::Location loc,
+                                      mlir::Value descriptor,
+                                      mlir::MemRefType memrefType,
+                                      mlir::OpBuilder &builder) {
+  if (memrefType.getRank() != 1)
+    return {};
+
+  mlir::Operation *parentOp = builder.getBlock()->getParentOp();
+  mlir::ModuleOp module =
+      parentOp ? parentOp->getParentOfType<mlir::ModuleOp>() : mlir::ModuleOp{};
+  if (!module)
+    return {};
+
+  auto mallocFunc =
+      mlir::LLVM::lookupOrCreateMallocFn(module, builder.getI64Type());
+  if (mlir::failed(mallocFunc))
+    return {};
+
+  auto descriptorType =
+      mlir::cast<mlir::LLVM::LLVMStructType>(descriptor.getType());
+  auto ptrType = mlir::LLVM::LLVMPointerType::get(builder.getContext());
+  mlir::Type elementType = memrefType.getElementType();
+  mlir::Value sourceAligned = builder.create<mlir::LLVM::ExtractValueOp>(
+      loc, descriptorType.getBody()[1], descriptor,
+      builder.getDenseI64ArrayAttr({1}));
+  mlir::Value sourceOffset = builder.create<mlir::LLVM::ExtractValueOp>(
+      loc, builder.getI64Type(), descriptor, builder.getDenseI64ArrayAttr({2}));
+  mlir::Value sourceSize = builder.create<mlir::LLVM::ExtractValueOp>(
+      loc, builder.getI64Type(), descriptor,
+      builder.getDenseI64ArrayAttr({3, 0}));
+  mlir::Value sourceStart = builder.create<mlir::LLVM::GEPOp>(
+      loc, ptrType, elementType, sourceAligned,
+      llvm::ArrayRef<mlir::LLVM::GEPArg>{sourceOffset});
+
+  mlir::Value nullPtr = builder.create<mlir::LLVM::ZeroOp>(loc, ptrType);
+  mlir::Value endPtr = builder.create<mlir::LLVM::GEPOp>(
+      loc, ptrType, elementType, nullPtr,
+      llvm::ArrayRef<mlir::LLVM::GEPArg>{sourceSize});
+  mlir::Value sizeBytes =
+      builder.create<mlir::LLVM::PtrToIntOp>(loc, builder.getI64Type(), endPtr);
+  mlir::Value allocated = builder
+                              .create<mlir::LLVM::CallOp>(
+                                  loc, *mallocFunc, mlir::ValueRange{sizeBytes})
+                              .getResult();
+  ownership::Pointer::markNonObject(allocated);
+  builder.create<mlir::LLVM::MemcpyOp>(loc, allocated, sourceStart, sizeBytes,
+                                       false);
+
+  mlir::Value result = builder.create<mlir::LLVM::UndefOp>(loc, descriptorType);
+  mlir::Value zero = builder.create<mlir::LLVM::ConstantOp>(
+      loc, builder.getI64Type(), builder.getI64IntegerAttr(0));
+  mlir::Value stride = builder.create<mlir::LLVM::ConstantOp>(
+      loc, builder.getI64Type(), builder.getI64IntegerAttr(1));
+  result = builder.create<mlir::LLVM::InsertValueOp>(
+      loc, descriptorType, result, allocated,
+      builder.getDenseI64ArrayAttr({0}));
+  result = builder.create<mlir::LLVM::InsertValueOp>(
+      loc, descriptorType, result, allocated,
+      builder.getDenseI64ArrayAttr({1}));
+  result = builder.create<mlir::LLVM::InsertValueOp>(
+      loc, descriptorType, result, zero, builder.getDenseI64ArrayAttr({2}));
+  result = builder.create<mlir::LLVM::InsertValueOp>(
+      loc, descriptorType, result, sourceSize,
+      builder.getDenseI64ArrayAttr({3, 0}));
+  result = builder.create<mlir::LLVM::InsertValueOp>(
+      loc, descriptorType, result, stride,
+      builder.getDenseI64ArrayAttr({4, 0}));
+  return result;
+}
+
 mlir::Value rank1Descriptor(mlir::Location loc, mlir::Value descriptor,
                             mlir::MemRefType memrefType,
                             mlir::OpBuilder &builder) {
   auto descriptorType =
       mlir::cast<mlir::LLVM::LLVMStructType>(descriptor.getType());
+  if (mlir::Value cloned =
+          cloneStaticScalarDescriptor(loc, descriptor, memrefType, builder))
+    return cloned;
+  if (mlir::Value cloned =
+          cloneContiguousDescriptor(loc, descriptor, memrefType, builder))
+    return cloned;
+
   mlir::Value source = builder
                            .create<mlir::UnrealizedConversionCastOp>(
                                loc, memrefType, mlir::ValueRange{descriptor})
@@ -2484,6 +2670,43 @@ mlir::Value rank1Descriptor(mlir::Location loc, mlir::Value descriptor,
 void markOwnership(mlir::Location loc, mlir::Value headerDescriptor,
                    mlir::MemRefType headerType, int64_t markerSlot,
                    int64_t markerValue, mlir::OpBuilder &builder) {
+  if (auto descriptorType = mlir::dyn_cast<mlir::LLVM::LLVMStructType>(
+          headerDescriptor.getType())) {
+    if (!descriptorType.isOpaque() && descriptorType.getBody().size() == 5 &&
+        headerType.getRank() == 1) {
+      mlir::Value aligned = builder.create<mlir::LLVM::ExtractValueOp>(
+          loc, descriptorType.getBody()[1], headerDescriptor,
+          builder.getDenseI64ArrayAttr({1}));
+      mlir::Value offset = builder.create<mlir::LLVM::ExtractValueOp>(
+          loc, builder.getI64Type(), headerDescriptor,
+          builder.getDenseI64ArrayAttr({2}));
+      mlir::Value stride = builder.create<mlir::LLVM::ExtractValueOp>(
+          loc, builder.getI64Type(), headerDescriptor,
+          builder.getDenseI64ArrayAttr({4, 0}));
+      mlir::Value slot = builder.create<mlir::LLVM::ConstantOp>(
+          loc, builder.getI64Type(), builder.getI64IntegerAttr(markerSlot));
+      mlir::Value scaled = builder.create<mlir::LLVM::MulOp>(loc, slot, stride);
+      mlir::Value linear =
+          builder.create<mlir::LLVM::AddOp>(loc, offset, scaled);
+      auto ptrType = mlir::LLVM::LLVMPointerType::get(builder.getContext());
+      mlir::Value address = builder.create<mlir::LLVM::GEPOp>(
+          loc, ptrType, headerType.getElementType(), aligned,
+          llvm::ArrayRef<mlir::LLVM::GEPArg>{linear});
+      address.getDefiningOp()->setAttr(
+          ContainerSafetyAttrs::kDescriptorData,
+          mlir::UnitAttr::get(builder.getContext()));
+      mlir::Value value = builder.create<mlir::LLVM::ConstantOp>(
+          loc, builder.getI64Type(), builder.getI64IntegerAttr(markerValue));
+      auto store = builder.create<mlir::LLVM::StoreOp>(loc, value, address);
+      store->setAttr(ContainerSafetyAttrs::kRefcountInit,
+                     builder.getI64IntegerAttr(markerValue));
+      store->setAttr(
+          ContainerSafetyAttrs::kRefcountState,
+          builder.getStringAttr(ContainerSafetyAttrs::kStateManaged));
+      return;
+    }
+  }
+
   mlir::Value header =
       builder
           .create<mlir::UnrealizedConversionCastOp>(
@@ -2574,14 +2797,16 @@ mlir::Value retainOrCloneLocalAlias(mlir::Location loc, mlir::Value descriptor,
   if (!refcountSlot)
     return descriptor;
 
-  auto *parent = builder.getInsertionBlock()->getParent();
-  auto i64Type = builder.getI64Type();
   mlir::Block *currentBlock = builder.getInsertionBlock();
+  auto *parent = currentBlock->getParent();
+  mlir::Block *afterBlock =
+      currentBlock->splitBlock(builder.getInsertionPoint());
+  afterBlock->addArgument(descriptor.getType(), loc);
+  mlir::Value result = afterBlock->getArguments().back();
+  auto i64Type = builder.getI64Type();
   mlir::Block *nonNullBlock = builder.createBlock(parent);
   mlir::Block *retainBlock = builder.createBlock(parent);
   mlir::Block *cloneBlock = builder.createBlock(parent);
-  mlir::Block *afterBlock = builder.createBlock(parent);
-  afterBlock->addArgument(descriptor.getType(), loc);
 
   builder.setInsertionPointToEnd(currentBlock);
   mlir::Value header =
@@ -2647,7 +2872,7 @@ mlir::Value retainOrCloneLocalAlias(mlir::Location loc, mlir::Value descriptor,
   builder.create<mlir::cf::BranchOp>(loc, afterBlock, mlir::ValueRange{cloned});
 
   builder.setInsertionPointToStart(afterBlock);
-  return afterBlock->getArgument(0);
+  return result;
 }
 
 mlir::Value retainOrCloneOwned(mlir::Location loc, mlir::Value descriptor,
@@ -2659,14 +2884,16 @@ mlir::Value retainOrCloneOwned(mlir::Location loc, mlir::Value descriptor,
   if (!refcountSlot)
     return descriptor;
 
-  auto *parent = builder.getInsertionBlock()->getParent();
-  auto i64Type = builder.getI64Type();
   mlir::Block *currentBlock = builder.getInsertionBlock();
+  auto *parent = currentBlock->getParent();
+  mlir::Block *afterBlock =
+      currentBlock->splitBlock(builder.getInsertionPoint());
+  afterBlock->addArgument(descriptor.getType(), loc);
+  mlir::Value result = afterBlock->getArguments().back();
+  auto i64Type = builder.getI64Type();
   mlir::Block *nonNullBlock = builder.createBlock(parent);
   mlir::Block *retainBlock = builder.createBlock(parent);
   mlir::Block *cloneBlock = builder.createBlock(parent);
-  mlir::Block *afterBlock = builder.createBlock(parent);
-  afterBlock->addArgument(descriptor.getType(), loc);
 
   builder.setInsertionPointToEnd(currentBlock);
   mlir::Value header =
@@ -2732,7 +2959,7 @@ mlir::Value retainOrCloneOwned(mlir::Location loc, mlir::Value descriptor,
   builder.create<mlir::cf::BranchOp>(loc, afterBlock, mlir::ValueRange{cloned});
 
   builder.setInsertionPointToStart(afterBlock);
-  return afterBlock->getArgument(0);
+  return result;
 }
 } // namespace class_container::Clone
 
@@ -3427,14 +3654,27 @@ mlir::func::FuncOp get(mlir::Location loc, mlir::ModuleOp module,
       return false;
 
     auto *parent = builder.getInsertionBlock()->getParent();
-    auto i64Type = builder.getI64Type();
     mlir::Block *currentBlock = builder.getInsertionBlock();
+    mlir::Block *retainValueBlock = builder.createBlock(parent);
+    mlir::Block *transferValueBlock = builder.createBlock(parent);
+
+    builder.setInsertionPointToEnd(currentBlock);
+    builder.create<mlir::cf::CondBranchOp>(loc, retainNewValue,
+                                           retainValueBlock,
+                                           transferValueBlock);
+
+    builder.setInsertionPointToStart(transferValueBlock);
+    if (!storeContainerAndReturn(value, /*transferOwnership=*/true, lockValue,
+                                 alreadyLocked, loadOldValue))
+      return false;
+
+    builder.setInsertionPointToStart(retainValueBlock);
+    auto i64Type = builder.getI64Type();
     mlir::Block *nonNullBlock = builder.createBlock(parent);
     mlir::Block *retainBlock = builder.createBlock(parent);
     mlir::Block *cloneBlock = builder.createBlock(parent);
     mlir::Block *nullBlock = builder.createBlock(parent);
 
-    builder.setInsertionPointToEnd(currentBlock);
     mlir::Value header =
         class_container::Descriptor::header(loc, value, builder);
     mlir::Value hasHeader = class_container::MemRef::present(
@@ -3486,7 +3726,9 @@ mlir::func::FuncOp get(mlir::Location loc, mlir::ModuleOp module,
     threadsafe::Atomic::set(previous.getDefiningOp(),
                             ThreadSafetyAttrs::kRoleContainerRefcountRetain,
                             ThreadSafetyAttrs::kOrderingMonotonic,
-                            ThreadSafetyAttrs::kPremiseEntryBorrowed);
+                            ThreadSafetyAttrs::kPremiseOwnedToken);
+    threadsafe::Retain::verifyOwnedToken(
+        previous.getDefiningOp(), ThreadSafetyAttrs::kProofClassFieldHelper);
     class_container::Atomic::markHeader(previous.getDefiningOp(), header,
                                         refcountSlot, fieldInfo.logicalType);
     if (!storeContainerAndReturn(value, /*transferOwnership=*/true, lockValue,
@@ -3974,36 +4216,12 @@ static mlir::FailureOr<llvm::SmallVector<mlir::Value>> boxStaticFieldValues(
 }
 
 namespace attr_get::Borrow {
-bool onlyUser(mlir::Operation *user) {
-  return mlir::isa<AddOp, StrConcat3Op, SubOp, LeOp, LtOp, GtOp, GeOp, EqOp,
-                   NeOp, ReprOp, ListAppendOp, ListRemoveOp, ListGetOp>(user);
-}
-
 template <typename AttrGetLikeOp> DecRefOp drop(AttrGetLikeOp op) {
-  DecRefOp drop;
-  mlir::Operation *borrowUser = nullptr;
-
-  for (mlir::Operation *user : op.getResult().getUsers()) {
-    if (auto decref = mlir::dyn_cast<DecRefOp>(user)) {
-      if (drop)
-        return nullptr;
-      drop = decref;
-      continue;
-    }
-    if (!attr_get::Borrow::onlyUser(user))
-      return nullptr;
-    if (borrowUser)
-      return nullptr;
-    borrowUser = user;
-  }
-
-  if (!borrowUser || !drop)
-    return nullptr;
-  if (borrowUser->getBlock() != drop->getBlock())
-    return nullptr;
-  if (!borrowUser->isBeforeInBlock(drop))
-    return nullptr;
-  return drop;
+  (void)op;
+  // AttrGetOp has an owned-result contract. High-level users such as py.add
+  // lower to helpers that release their inputs, so returning a borrowed field
+  // here would allow those users to release the stored field itself.
+  return nullptr;
 }
 } // namespace attr_get::Borrow
 

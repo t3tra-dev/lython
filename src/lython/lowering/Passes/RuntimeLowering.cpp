@@ -50,11 +50,15 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/Support/Process.h"
 #include "llvm/Support/raw_ostream.h"
 
-#include <cstdlib>
+#include <chrono>
+#include <optional>
+#include <string>
 
 #include "PyDialect.h.inc"
 
@@ -72,6 +76,51 @@ namespace {
 
 // RuntimeLoweringPass: Main pipeline orchestration
 
+bool runtimePerfEnabled() {
+  static const bool enabled = [] {
+    auto value = llvm::sys::Process::GetEnv("LYTHON_PERF");
+    if (!value)
+      return false;
+    llvm::StringRef text(*value);
+    return text == "1" || text.equals_insensitive("true") ||
+           text.equals_insensitive("yes") || text.equals_insensitive("on");
+  }();
+  return enabled;
+}
+
+class RuntimePerfScope {
+public:
+  explicit RuntimePerfScope(llvm::StringRef phase) : phase(phase.str()) {
+    if (!runtimePerfEnabled())
+      return;
+    enabled = true;
+    start = Clock::now();
+  }
+
+  ~RuntimePerfScope() {
+    if (!enabled)
+      return;
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                       Clock::now() - start)
+                       .count();
+    llvm::errs() << "[LYTHON_PERF] phase=" << phase << " wall_us=" << elapsed
+                 << "\n";
+  }
+
+private:
+  using Clock = std::chrono::steady_clock;
+  std::string phase;
+  bool enabled = false;
+  Clock::time_point start;
+};
+
+template <typename Fn>
+mlir::LogicalResult timedRuntimePhase(llvm::StringRef name, Fn run) {
+  std::string phase = ("lowering.runtime-lowering." + name).str();
+  RuntimePerfScope perf(phase);
+  return run();
+}
+
 void copyDiscardableAttrs(mlir::Operation *from, mlir::Operation *to) {
   if (!from || !to)
     return;
@@ -80,93 +129,175 @@ void copyDiscardableAttrs(mlir::Operation *from, mlir::Operation *to) {
 }
 
 mlir::Value materializeIndex(mlir::Location loc, mlir::OpFoldResult value,
-                             mlir::PatternRewriter &rewriter) {
+                             mlir::OpBuilder &builder) {
   if (auto dynamic = mlir::dyn_cast<mlir::Value>(value))
     return dynamic;
   auto attr = mlir::cast<mlir::IntegerAttr>(mlir::cast<mlir::Attribute>(value));
-  return rewriter.create<mlir::arith::ConstantIndexOp>(loc, attr.getInt());
+  return builder.create<mlir::arith::ConstantIndexOp>(loc, attr.getInt());
 }
 
 mlir::Value mulIndex(mlir::Location loc, mlir::Value lhs,
-                     mlir::OpFoldResult rhs, mlir::PatternRewriter &rewriter) {
+                     mlir::OpFoldResult rhs, mlir::OpBuilder &builder) {
   if (auto attr = mlir::dyn_cast<mlir::Attribute>(rhs)) {
     int64_t value = mlir::cast<mlir::IntegerAttr>(attr).getInt();
     if (value == 1)
       return lhs;
     if (value == 0)
-      return rewriter.create<mlir::arith::ConstantIndexOp>(loc, 0);
+      return builder.create<mlir::arith::ConstantIndexOp>(loc, 0);
   }
-  return rewriter.create<mlir::arith::MulIOp>(
-      loc, lhs, materializeIndex(loc, rhs, rewriter));
+  return builder.create<mlir::arith::MulIOp>(
+      loc, lhs, materializeIndex(loc, rhs, builder));
 }
 
-struct AttrPreservingRank1SubviewExpansion
-    : public mlir::OpRewritePattern<mlir::memref::SubViewOp> {
-  using mlir::OpRewritePattern<mlir::memref::SubViewOp>::OpRewritePattern;
+bool getStaticRank1Layout(mlir::MemRefType type, int64_t &offset,
+                          int64_t &stride) {
+  llvm::SmallVector<int64_t, 1> strides;
+  if (mlir::failed(type.getStridesAndOffset(strides, offset)) ||
+      strides.size() != 1)
+    return false;
+  if (mlir::ShapedType::isDynamic(offset) ||
+      mlir::ShapedType::isDynamic(strides.front()))
+    return false;
+  stride = strides.front();
+  return true;
+}
 
-  mlir::LogicalResult
-  matchAndRewrite(mlir::memref::SubViewOp subview,
-                  mlir::PatternRewriter &rewriter) const override {
-    auto sourceType =
-        mlir::dyn_cast<mlir::MemRefType>(subview.getSource().getType());
-    auto resultType = mlir::dyn_cast<mlir::MemRefType>(subview.getType());
-    if (!sourceType || !resultType || sourceType.getRank() != 1 ||
-        resultType.getRank() != 1 || subview.getDroppedDims().any())
-      return mlir::failure();
+std::optional<int64_t> getStaticIndex(mlir::OpFoldResult value) {
+  auto attr = mlir::dyn_cast<mlir::Attribute>(value);
+  if (!attr)
+    return std::nullopt;
+  return mlir::cast<mlir::IntegerAttr>(attr).getInt();
+}
 
-    mlir::Location loc = subview.getLoc();
-    auto metadata = rewriter.create<mlir::memref::ExtractStridedMetadataOp>(
-        loc, subview.getSource());
-    copyDiscardableAttrs(subview.getOperation(), metadata.getOperation());
+mlir::OpFoldResult affineIndex(mlir::Location loc, int64_t base, int64_t scale,
+                               mlir::OpFoldResult input,
+                               mlir::OpBuilder &builder) {
+  if (std::optional<int64_t> value = getStaticIndex(input))
+    return builder.getIndexAttr(base + scale * *value);
 
-    mlir::OpFoldResult subOffset = subview.getMixedOffsets().front();
-    mlir::OpFoldResult subSize = subview.getMixedSizes().front();
-    mlir::OpFoldResult subStride = subview.getMixedStrides().front();
-    mlir::Value sourceOffset = metadata.getOffset();
-    mlir::Value sourceStride = metadata.getStrides().front();
-    mlir::Value scaledOffset = mulIndex(loc, sourceStride, subOffset, rewriter);
-    mlir::Value finalOffset =
-        rewriter.create<mlir::arith::AddIOp>(loc, sourceOffset, scaledOffset);
-    mlir::Value finalStride = mulIndex(loc, sourceStride, subStride, rewriter);
+  mlir::Value result = materializeIndex(loc, input, builder);
+  if (scale != 1) {
+    mlir::Value scaleValue =
+        builder.create<mlir::arith::ConstantIndexOp>(loc, scale);
+    result = builder.create<mlir::arith::MulIOp>(loc, result, scaleValue);
+  }
+  if (base != 0) {
+    mlir::Value baseValue =
+        builder.create<mlir::arith::ConstantIndexOp>(loc, base);
+    result = builder.create<mlir::arith::AddIOp>(loc, baseValue, result);
+  }
+  return result;
+}
+
+mlir::OpFoldResult scaledIndex(mlir::Location loc, int64_t scale,
+                               mlir::OpFoldResult input,
+                               mlir::OpBuilder &builder) {
+  if (std::optional<int64_t> value = getStaticIndex(input))
+    return builder.getIndexAttr(scale * *value);
+  if (scale == 1)
+    return input;
+  mlir::Value scaleValue =
+      builder.create<mlir::arith::ConstantIndexOp>(loc, scale);
+  return builder
+      .create<mlir::arith::MulIOp>(loc, materializeIndex(loc, input, builder),
+                                   scaleValue)
+      .getResult();
+}
+
+mlir::FailureOr<mlir::Value> expandRank1Subview(mlir::memref::SubViewOp subview,
+                                                mlir::OpBuilder &builder) {
+  auto sourceType =
+      mlir::dyn_cast<mlir::MemRefType>(subview.getSource().getType());
+  auto resultType = mlir::dyn_cast<mlir::MemRefType>(subview.getType());
+  if (!sourceType || !resultType || sourceType.getRank() != 1 ||
+      resultType.getRank() != 1 || subview.getDroppedDims().any())
+    return subview.emitError("unsupported memref.subview before LLVM lowering");
+
+  mlir::Location loc = subview.getLoc();
+
+  mlir::OpFoldResult subOffset = subview.getMixedOffsets().front();
+  mlir::OpFoldResult subSize = subview.getMixedSizes().front();
+  mlir::OpFoldResult subStride = subview.getMixedStrides().front();
+
+  int64_t staticOffset = 0;
+  int64_t staticStride = 1;
+  if (getStaticRank1Layout(sourceType, staticOffset, staticStride)) {
+    mlir::OpFoldResult finalOffset =
+        affineIndex(loc, staticOffset, staticStride, subOffset, builder);
+    mlir::OpFoldResult finalStride =
+        scaledIndex(loc, staticStride, subStride, builder);
 
     llvm::SmallVector<mlir::OpFoldResult, 1> sizes{subSize};
     llvm::SmallVector<mlir::OpFoldResult, 1> strides{finalStride};
     llvm::SmallVector<mlir::NamedAttribute, 4> attrs(
         subview->getDiscardableAttrs().begin(),
         subview->getDiscardableAttrs().end());
-    auto cast = rewriter.create<mlir::memref::ReinterpretCastOp>(
-        loc, resultType, metadata.getBaseBuffer(), finalOffset, sizes, strides,
+    auto cast = builder.create<mlir::memref::ReinterpretCastOp>(
+        loc, resultType, subview.getSource(), finalOffset, sizes, strides,
         attrs);
-    rewriter.replaceOp(subview, cast.getResult());
-    return mlir::success();
+    return cast.getResult();
   }
-};
 
-bool containsPyRuntimeType(mlir::Type type) {
+  auto metadata = builder.create<mlir::memref::ExtractStridedMetadataOp>(
+      loc, subview.getSource());
+  copyDiscardableAttrs(subview.getOperation(), metadata.getOperation());
+
+  mlir::Value sourceOffset = metadata.getOffset();
+  mlir::Value sourceStride = metadata.getStrides().front();
+  mlir::Value scaledOffset = mulIndex(loc, sourceStride, subOffset, builder);
+  mlir::Value finalOffset =
+      builder.create<mlir::arith::AddIOp>(loc, sourceOffset, scaledOffset);
+  mlir::Value finalStride = mulIndex(loc, sourceStride, subStride, builder);
+
+  llvm::SmallVector<mlir::OpFoldResult, 1> sizes{subSize};
+  llvm::SmallVector<mlir::OpFoldResult, 1> strides{finalStride};
+  llvm::SmallVector<mlir::NamedAttribute, 4> attrs(
+      subview->getDiscardableAttrs().begin(),
+      subview->getDiscardableAttrs().end());
+  auto cast = builder.create<mlir::memref::ReinterpretCastOp>(
+      loc, resultType, metadata.getBaseBuffer(), finalOffset, sizes, strides,
+      attrs);
+  return cast.getResult();
+}
+
+bool containsPyRuntimeType(mlir::Type type,
+                           llvm::DenseMap<mlir::Type, bool> &cache) {
+  if (auto cached = cache.find(type); cached != cache.end())
+    return cached->second;
+
+  bool contains = false;
   if (isPyType(type))
-    return true;
+    contains = true;
   if (auto asyncValue = mlir::dyn_cast<mlir::async::ValueType>(type))
-    return containsPyRuntimeType(asyncValue.getValueType());
+    contains =
+        contains || containsPyRuntimeType(asyncValue.getValueType(), cache);
   if (auto memref = mlir::dyn_cast<mlir::MemRefType>(type))
-    return containsPyRuntimeType(memref.getElementType());
+    contains =
+        contains || containsPyRuntimeType(memref.getElementType(), cache);
   if (auto llvmStruct = mlir::dyn_cast<mlir::LLVM::LLVMStructType>(type)) {
-    if (llvmStruct.isOpaque())
-      return false;
-    return llvm::any_of(llvmStruct.getBody(), containsPyRuntimeType);
+    if (!llvmStruct.isOpaque()) {
+      contains = contains ||
+                 llvm::any_of(llvmStruct.getBody(), [&](mlir::Type element) {
+                   return containsPyRuntimeType(element, cache);
+                 });
+    }
   }
   if (auto llvmArray = mlir::dyn_cast<mlir::LLVM::LLVMArrayType>(type))
-    return containsPyRuntimeType(llvmArray.getElementType());
-  return false;
+    contains =
+        contains || containsPyRuntimeType(llvmArray.getElementType(), cache);
+  cache[type] = contains;
+  return contains;
 }
 
 mlir::LogicalResult verifyPyTypesLowered(mlir::ModuleOp module) {
+  llvm::DenseMap<mlir::Type, bool> typeCache;
   mlir::Operation *offender = nullptr;
   mlir::Type offenderType;
   bool offenderIsOperand = false;
   unsigned offenderIndex = 0;
   module.walk([&](mlir::Operation *op) -> mlir::WalkResult {
     for (auto [index, type] : llvm::enumerate(op->getOperandTypes())) {
-      if (!containsPyRuntimeType(type))
+      if (!containsPyRuntimeType(type, typeCache))
         continue;
       offender = op;
       offenderType = type;
@@ -175,7 +306,7 @@ mlir::LogicalResult verifyPyTypesLowered(mlir::ModuleOp module) {
       return mlir::WalkResult::interrupt();
     }
     for (auto [index, type] : llvm::enumerate(op->getResultTypes())) {
-      if (!containsPyRuntimeType(type))
+      if (!containsPyRuntimeType(type, typeCache))
         continue;
       offender = op;
       offenderType = type;
@@ -196,27 +327,26 @@ mlir::LogicalResult verifyPyTypesLowered(mlir::ModuleOp module) {
 }
 
 mlir::LogicalResult expandMemRefMetadata(mlir::ModuleOp module) {
-  // LLVM helper bodies can temporarily contain memref ops plus lowered
-  // descriptor casts while the generic conversion is still pending. Expanding
-  // memref metadata there materializes memref.extract_strided_metadata on
-  // LLVM descriptor structs, which is not a valid high-level memref operand.
-  // Keep this pre-expansion scoped to high-level func.func/async.func bodies;
-  // llvm.func bodies are handled by the later memref-to-LLVM conversion.
-  for (mlir::func::FuncOp fn : module.getOps<mlir::func::FuncOp>()) {
-    mlir::RewritePatternSet patterns(module.getContext());
-    patterns.add<AttrPreservingRank1SubviewExpansion>(module.getContext(),
-                                                      mlir::PatternBenefit(2));
-    mlir::memref::populateExpandStridedMetadataPatterns(patterns);
-    if (mlir::failed(mlir::applyPatternsGreedily(fn, std::move(patterns))))
+  // Expand only the subview operation that the header/payload object ABI uses.
+  // Running the generic expand-strided-metadata rewrite greedily also invokes
+  // region DCE; at this point class carriers may already contain temporary
+  // LLVM descriptor bridges, and the generic DCE path is too broad for that
+  // mixed-level IR. The remaining memref metadata ops are lowered by the
+  // memref-to-LLVM conversion.
+  llvm::SmallVector<mlir::memref::SubViewOp> subviews;
+  module.walk(
+      [&](mlir::memref::SubViewOp subview) { subviews.push_back(subview); });
+
+  for (mlir::memref::SubViewOp subview : subviews) {
+    if (!subview || !subview->getBlock())
+      continue;
+    mlir::OpBuilder builder(subview);
+    mlir::FailureOr<mlir::Value> replacement =
+        expandRank1Subview(subview, builder);
+    if (mlir::failed(replacement))
       return mlir::failure();
-  }
-  for (mlir::async::FuncOp fn : module.getOps<mlir::async::FuncOp>()) {
-    mlir::RewritePatternSet patterns(module.getContext());
-    patterns.add<AttrPreservingRank1SubviewExpansion>(module.getContext(),
-                                                      mlir::PatternBenefit(2));
-    mlir::memref::populateExpandStridedMetadataPatterns(patterns);
-    if (mlir::failed(mlir::applyPatternsGreedily(fn, std::move(patterns))))
-      return mlir::failure();
+    subview.replaceAllUsesWith(*replacement);
+    subview.erase();
   }
   return mlir::success();
 }
@@ -359,6 +489,93 @@ mlir::LogicalResult lowerTensorProgramLevelOps(mlir::ModuleOp module,
   return pm.run(module);
 }
 
+void collectReferencedSymbols(mlir::Attribute attr,
+                              llvm::DenseSet<llvm::StringRef> &referenced) {
+  if (auto symbol = mlir::dyn_cast<mlir::SymbolRefAttr>(attr)) {
+    referenced.insert(symbol.getRootReference());
+    for (mlir::FlatSymbolRefAttr nested : symbol.getNestedReferences())
+      referenced.insert(nested.getValue());
+    return;
+  }
+  if (auto array = mlir::dyn_cast<mlir::ArrayAttr>(attr)) {
+    for (mlir::Attribute nested : array)
+      collectReferencedSymbols(nested, referenced);
+    return;
+  }
+  if (auto dict = mlir::dyn_cast<mlir::DictionaryAttr>(attr)) {
+    for (mlir::NamedAttribute nested : dict)
+      collectReferencedSymbols(nested.getValue(), referenced);
+  }
+}
+
+bool eraseUnusedPrivateFuncSymbols(mlir::ModuleOp module) {
+  auto hasOnlyEffectArg = [](mlir::func::FuncOp func, llvm::StringRef attrName,
+                             unsigned argIndex) {
+    auto attr = func->getAttrOfType<mlir::ArrayAttr>(attrName);
+    if (!attr || attr.size() != 1)
+      return false;
+    auto integer = mlir::dyn_cast<mlir::IntegerAttr>(attr[0]);
+    return integer && integer.getInt() == static_cast<int64_t>(argIndex);
+  };
+
+  auto hasObjectHeaderArg = [](mlir::func::FuncOp func, unsigned argIndex) {
+    return static_cast<unsigned>(func.getNumArguments()) > argIndex &&
+           static_cast<bool>(func.getArgAttr(
+               argIndex, OwnershipContractAttrs::kObjectHeader));
+  };
+
+  auto keepForLateLowering = [](mlir::func::FuncOp func) {
+    return func->hasAttr(OwnershipContractAttrs::kObjectReleaseToZero);
+  };
+
+  auto keepRuntimeObjectEffectRoot = [&](mlir::func::FuncOp func) {
+    if (!hasObjectHeaderArg(func, /*argIndex=*/0))
+      return false;
+    return hasOnlyEffectArg(func, OwnershipContractAttrs::kRetainArgs,
+                            /*argIndex=*/0) ||
+           hasOnlyEffectArg(func, OwnershipContractAttrs::kReleaseArgs,
+                            /*argIndex=*/0);
+  };
+
+  bool changed = false;
+  for (;;) {
+    llvm::DenseSet<llvm::StringRef> referenced;
+    module.walk([&](mlir::Operation *op) {
+      for (mlir::NamedAttribute attr : op->getAttrs()) {
+        if (mlir::isa<mlir::SymbolOpInterface>(op) &&
+            attr.getName() == mlir::SymbolTable::getSymbolAttrName())
+          continue;
+        collectReferencedSymbols(attr.getValue(), referenced);
+      }
+    });
+
+    llvm::SmallVector<mlir::Operation *> unused;
+    module.walk([&](mlir::func::FuncOp func) {
+      if (func.getSymName() == "main" || !func.isPrivate())
+        return;
+      if (keepForLateLowering(func) || keepRuntimeObjectEffectRoot(func))
+        return;
+      if (referenced.contains(func.getSymName()))
+        return;
+      unused.push_back(func.getOperation());
+    });
+    module.walk([&](mlir::LLVM::LLVMFuncOp func) {
+      auto symbol = llvm::cast<mlir::SymbolOpInterface>(func.getOperation());
+      if (func.getSymName() == "main" ||
+          symbol.getVisibility() != mlir::SymbolTable::Visibility::Private)
+        return;
+      if (referenced.contains(func.getSymName()))
+        return;
+      unused.push_back(func.getOperation());
+    });
+    if (unused.empty())
+      return changed;
+    for (mlir::Operation *op : unused)
+      op->erase();
+    changed = true;
+  }
+}
+
 void populateGenericLLVMConversion(PyLLVMTypeConverter &typeConverter,
                                    mlir::RewritePatternSet &patterns) {
   lowering::async_runtime::Patterns::populate(typeConverter, patterns);
@@ -390,8 +607,11 @@ void configureGenericLLVMTarget(mlir::ConversionTarget &target) {
       [](mlir::async::CallOp op) { return !opHasMemRefType(op); });
   target.addDynamicallyLegalOp<mlir::async::ReturnOp>(
       [](mlir::async::ReturnOp op) { return !opHasMemRefType(op); });
+  target.addDynamicallyLegalOp<mlir::LLVM::LLVMFuncOp>(
+      [](mlir::LLVM::LLVMFuncOp) { return true; });
   target.addLegalOp<mlir::ModuleOp>();
   target.addLegalOp<mlir::cf::AssertOp>();
+  target.addLegalOp<mlir::UnrealizedConversionCastOp>();
 }
 
 struct RuntimeLoweringPass
@@ -418,10 +638,6 @@ struct RuntimeLoweringPass
                      mlir::linalg::LinalgDialect, mlir::memref::MemRefDialect,
                      mlir::scf::SCFDialect, mlir::tensor::TensorDialect>();
     PyLLVMTypeConverter typeConverter(ctx, module);
-    bool dumpLowering = static_cast<bool>(
-        llvm::sys::Process::GetEnv("LYTHON_DUMP_LOWERING_IR"));
-    bool dumpInternalLowering = static_cast<bool>(
-        llvm::sys::Process::GetEnv("LYTHON_DUMP_INTERNAL_LOWERING_IR"));
 
     auto materializationFilter = [](mlir::Diagnostic &) -> mlir::LogicalResult {
       return mlir::failure();
@@ -451,7 +667,7 @@ struct RuntimeLoweringPass
           materializationFilter);
     };
 
-    if (mlir::failed(runFuncConversion())) {
+    if (mlir::failed(timedRuntimePhase("func-definition", runFuncConversion))) {
       signalPassFailure();
       return;
     }
@@ -471,19 +687,18 @@ struct RuntimeLoweringPass
           materializationFilter);
     };
 
-    if (mlir::failed(runReturnConversion())) {
+    if (mlir::failed(
+            timedRuntimePhase("return-conversion", runReturnConversion))) {
       signalPassFailure();
       return;
     }
 
-    while (lowering::runtime::cleanup::voidPyReturns(module))
-      ;
-    lowering::runtime::helpers::synthesizeLocalSelf(module);
-    lowering::runtime::helpers::synthesizePublishedBorrow(module);
-
-    if (dumpInternalLowering) {
-      llvm::errs() << "[After func conversion]\n";
-      module.dump();
+    {
+      RuntimePerfScope perf("lowering.runtime-lowering.post-return-helpers");
+      while (lowering::runtime::cleanup::voidPyReturns(module))
+        ;
+      lowering::runtime::helpers::synthesizeLocalSelf(module);
+      lowering::runtime::helpers::synthesizePublishedBorrow(module);
     }
 
     // Phase 2: Function object conversion (py.func_object -> references)
@@ -502,16 +717,16 @@ struct RuntimeLoweringPass
           materializationFilter);
     };
 
-    if (mlir::failed(runFuncObjectConversion())) {
+    if (mlir::failed(
+            timedRuntimePhase("func-object", runFuncObjectConversion))) {
       signalPassFailure();
       return;
     }
-    if (dumpInternalLowering) {
-      llvm::errs() << "[After func object conversion]\n";
-      module.dump();
-    }
 
-    optimizer::scalar::foldIntConstants(module);
+    {
+      RuntimePerfScope perf("lowering.runtime-lowering.fold-int-constants");
+      optimizer::scalar::foldIntConstants(module);
+    }
 
     // Phase 3: Call conversion (py.call_vector/py.call -> calls)
 
@@ -529,20 +744,21 @@ struct RuntimeLoweringPass
           materializationFilter);
     };
 
-    if (mlir::failed(runCallConversion())) {
+    if (mlir::failed(timedRuntimePhase("call-conversion", runCallConversion))) {
       signalPassFailure();
       return;
     }
     // Apply pre-lowering optimizations
-    optimizer::pipeline::preLowering(module);
-    if (mlir::failed(verifyOwnership(module))) {
-      signalPassFailure();
-      return;
+    {
+      RuntimePerfScope perf("lowering.runtime-lowering.pre-lowering-1");
+      optimizer::pipeline::preLowering(module);
     }
-
-    if (dumpInternalLowering) {
-      llvm::errs() << "[After call conversion]\n";
-      module.dump();
+    {
+      RuntimePerfScope perf("lowering.runtime-lowering.verify-ownership-1");
+      if (mlir::failed(verifyOwnership(module))) {
+        signalPassFailure();
+        return;
+      }
     }
 
     // Phase 4: Structured exception control-flow conversion. This must run
@@ -558,39 +774,37 @@ struct RuntimeLoweringPass
           !lowering::runtime::conversion::try_ops::hasStructured(module));
     };
 
-    if (mlir::failed(runTryConversion())) {
-      if (dumpInternalLowering) {
-        llvm::errs() << "[Try conversion failed]\n";
-        module.dump();
+    if (mlir::failed(timedRuntimePhase("try-conversion", runTryConversion))) {
+      signalPassFailure();
+      return;
+    }
+    {
+      RuntimePerfScope perf("lowering.runtime-lowering.pre-lowering-2");
+      optimizer::pipeline::preLowering(module);
+    }
+    {
+      RuntimePerfScope perf("lowering.runtime-lowering.verify-ownership-2");
+      if (mlir::failed(verifyOwnership(module))) {
+        signalPassFailure();
+        return;
       }
-      signalPassFailure();
-      return;
     }
-    if (std::getenv("LYTHON_DEBUG_TRY_LOWERING"))
-      llvm::errs() << "[TryPhase] pre-lowering opts\n";
-    optimizer::pipeline::preLowering(module);
-    if (mlir::failed(verifyOwnership(module))) {
-      signalPassFailure();
-      return;
-    }
-    if (std::getenv("LYTHON_DEBUG_TRY_LOWERING"))
-      llvm::errs() << "[TryPhase] erase unreachable\n";
-    lowering::runtime::cleanup::unreachableBlocks(module);
-    if (std::getenv("LYTHON_DEBUG_TRY_LOWERING"))
-      llvm::errs() << "[TryPhase] done cleanup\n";
-
-    if (dumpInternalLowering) {
-      llvm::errs() << "[After try conversion]\n";
-      module.dump();
+    {
+      RuntimePerfScope perf("lowering.runtime-lowering.unreachable-blocks-1");
+      lowering::runtime::cleanup::unreachableBlocks(module);
     }
 
     // Runtime MLIR signatures are part of the ABI contract. Import them before
     // value conversion so RuntimeAPI can adapt operands by signature instead of
     // classifying callees by name. A second call after value conversion
     // materializes contracts on newly emitted calls.
-    if (mlir::failed(runtime_library::embedObjectModules(module))) {
-      signalPassFailure();
-      return;
+    {
+      RuntimePerfScope perf(
+          "lowering.runtime-lowering.embed-runtime-before-value");
+      if (mlir::failed(runtime_library::embedObjectModules(module))) {
+        signalPassFailure();
+        return;
+      }
     }
 
     // Phase 5: mlir::Value conversion (py.* ops -> LLVM ops)
@@ -609,102 +823,118 @@ struct RuntimeLoweringPass
           materializationFilter);
     };
 
-    if (mlir::failed(runValueConversion())) {
-      if (dumpInternalLowering) {
-        llvm::errs() << "[mlir::Value conversion failed]\n";
-        module.dump();
-      }
+    if (mlir::failed(
+            timedRuntimePhase("value-conversion", runValueConversion))) {
       signalPassFailure();
       return;
     }
 
     // Apply Python-value cleanup at the boundary where object-level scalar
     // concepts have just been lowered to runtime/LLVM calls.
-    optimizer::pipeline::postValueLowering(module);
-    if (mlir::failed(runtime_library::embedObjectModules(module))) {
-      signalPassFailure();
-      return;
+    {
+      RuntimePerfScope perf("lowering.runtime-lowering.post-value-lowering");
+      optimizer::pipeline::postValueLowering(module);
+    }
+    {
+      RuntimePerfScope perf(
+          "lowering.runtime-lowering.embed-runtime-after-value");
+      if (mlir::failed(runtime_library::embedObjectModules(module))) {
+        signalPassFailure();
+        return;
+      }
+    }
+    {
+      RuntimePerfScope perf("lowering.runtime-lowering.pre-generic-symbol-dce");
+      eraseUnusedPrivateFuncSymbols(module);
     }
 
     // A Python-typed unwind payload reaching LLVM invoke lowering is an ABI
     // leak. Do not hide it behind llvm.ptr; the exception lowering must choose
     // the descriptor shape before this boundary.
     bool hasUnloweredUnwindPyArg = false;
-    module.walk(
-        [&](mlir::LLVM::InvokeOp invoke) {
-          mlir::Block *unwind = invoke.getUnwindDest();
-          if (!unwind)
-            return;
-          for (mlir::BlockArgument arg : unwind->getArguments()) {
-            if (!isPyType(arg.getType()))
-              continue;
-            invoke.emitError()
-                << "unwind block argument kept high-level Python type "
-                << arg.getType()
-                << " after value conversion; lower it to the exception "
-                   "descriptor ABI before LLVM invoke lowering";
-            hasUnloweredUnwindPyArg = true;
-          }
-        });
+    {
+      RuntimePerfScope perf("lowering.runtime-lowering.verify-unwind-py-args");
+      module.walk([&](mlir::LLVM::InvokeOp invoke) {
+        mlir::Block *unwind = invoke.getUnwindDest();
+        if (!unwind)
+          return;
+        for (mlir::BlockArgument arg : unwind->getArguments()) {
+          if (!isPyType(arg.getType()))
+            continue;
+          invoke.emitError()
+              << "unwind block argument kept high-level Python type "
+              << arg.getType()
+              << " after value conversion; lower it to the exception "
+                 "descriptor ABI before LLVM invoke lowering";
+          hasUnloweredUnwindPyArg = true;
+        }
+      });
+    }
     if (hasUnloweredUnwindPyArg) {
       signalPassFailure();
       return;
     }
 
     // Some passes may drop llvm.personality; restore it for landingpads.
-    lowering::runtime::eh::ensureFuncPersonalities(module);
-
-    if (dumpInternalLowering) {
-      llvm::errs() << "[After optimizations]\n";
-      module.dump();
+    {
+      RuntimePerfScope perf("lowering.runtime-lowering.ensure-personalities");
+      lowering::runtime::eh::ensureFuncPersonalities(module);
     }
 
     // Async result storage outlives the coroutine frame. Ensure container
     // payload descriptors were promoted before memref-to-LLVM erases
     // stack-vs-heap allocation provenance.
-    if (mlir::failed(lowering::runtime::async::verifyReturnPayloads(module))) {
-      signalPassFailure();
-      return;
+    {
+      RuntimePerfScope perf("lowering.runtime-lowering.verify-async-payloads");
+      if (mlir::failed(
+              lowering::runtime::async::verifyReturnPayloads(module))) {
+        signalPassFailure();
+        return;
+      }
     }
 
     // Phase 5: Freeze the lowered Py ABI. After this boundary all !py.* value
     // shapes must be represented by their fixed memref/LLVM forms.
 
-    while (lowering::runtime::cleanup::pyBridgeCasts(module))
-      ;
-    while (lowering::runtime::cleanup::pyMultiCasts(module))
-      ;
-    if (mlir::failed(verifyPyTypesLowered(module))) {
-      signalPassFailure();
-      return;
+    {
+      RuntimePerfScope perf("lowering.runtime-lowering.py-cast-cleanup");
+      while (lowering::runtime::cleanup::pyBridgeCasts(module))
+        ;
+      while (lowering::runtime::cleanup::pyMultiCasts(module))
+        ;
+    }
+    {
+      RuntimePerfScope perf(
+          "lowering.runtime-lowering.verify-py-types-lowered");
+      if (mlir::failed(verifyPyTypesLowered(module))) {
+        signalPassFailure();
+        return;
+      }
     }
 
     // Bufferize tensor/linalg values before generic LLVM conversion. Leaving
     // tensor ops legal during arith-to-LLVM forces index casts back from i64,
     // which hides an ABI mismatch until the final cleanup verifier.
-    if (mlir::failed(lowerTensorProgramLevelOps(module, ctx))) {
-      signalPassFailure();
-      return;
-    }
-    if (dumpInternalLowering) {
-      llvm::errs() << "[After tensor bufferization]\n";
-      module.dump();
+    {
+      RuntimePerfScope perf("lowering.runtime-lowering.tensor-lowering");
+      if (mlir::failed(lowerTensorProgramLevelOps(module, ctx))) {
+        signalPassFailure();
+        return;
+      }
     }
 
     // Header/payload object ABI uses memref.subview to expose the common
     // header. Expand it before memref-to-LLVM, where SubViewOp is intentionally
     // illegal.
-    if (mlir::failed(expandMemRefMetadata(module))) {
-      signalPassFailure();
-      return;
+    {
+      RuntimePerfScope perf("lowering.runtime-lowering.expand-memref-metadata");
+      if (mlir::failed(expandMemRefMetadata(module))) {
+        signalPassFailure();
+        return;
+      }
     }
 
-    // Phase 6: Convert func.func to llvm.func before final EH materialization.
-    {
-      if (dumpInternalLowering) {
-        llvm::errs() << "[Before func-to-llvm conversion]\n";
-        module.dump();
-      }
+    auto runGenericLLVMConversion = [&](bool full) -> mlir::LogicalResult {
       LoweredSafetyContracts safetyContracts;
       collectLoweredSafetyContracts(module, typeConverter, safetyContracts);
 
@@ -712,55 +942,57 @@ struct RuntimeLoweringPass
       populateGenericLLVMConversion(typeConverter, patterns);
       mlir::ConversionTarget target(*ctx);
       configureGenericLLVMTarget(target);
-      if (mlir::failed(
-              applyPartialConversion(module, target, std::move(patterns)))) {
+      mlir::LogicalResult converted =
+          full ? applyFullConversion(module, target, std::move(patterns))
+               : applyPartialConversion(module, target, std::move(patterns));
+      if (mlir::failed(converted))
+        return mlir::failure();
+      if (mlir::failed(preserveLoweredSafetyContracts(module, safetyContracts)))
+        return mlir::failure();
+      return mlir::success();
+    };
+
+    // Phase 6: Convert func.func to llvm.func before final EH materialization.
+    {
+      RuntimePerfScope perf(
+          "lowering.runtime-lowering.generic-llvm-conversion");
+      if (mlir::failed(runGenericLLVMConversion(/*full=*/false))) {
         signalPassFailure();
         return;
-      }
-      if (mlir::failed(
-              preserveLoweredSafetyContracts(module, safetyContracts))) {
-        signalPassFailure();
-        return;
-      }
-      if (dumpInternalLowering) {
-        llvm::errs() << "[After func-to-llvm conversion]\n";
-        module.dump();
       }
     }
 
-    while (lowering::runtime::cleanup::pyMultiCasts(module))
-      ;
-    while (lowering::runtime::cleanup::memrefDescriptorCasts(module))
-      ;
-    while (lowering::runtime::cleanup::memrefRuntimeCalls(module))
-      ;
-    while (lowering::runtime::cleanup::memrefDescriptorCasts(module))
-      ;
-    while (lowering::runtime::cleanup::pointerRoundTrips(module))
-      ;
-    if (mlir::failed(lowering::verifyNoUnrealizedCasts(
-            module, "runtime lowering boundary"))) {
-      signalPassFailure();
-      return;
+    {
+      RuntimePerfScope perf("lowering.runtime-lowering.final-cleanups");
+      lowering::runtime::cleanup::finalBoundary(module);
     }
-    if (dumpLowering) {
-      llvm::errs() << "[After RuntimeLowering cleanup]\n";
-      module.dump();
+    {
+      RuntimePerfScope perf("lowering.runtime-lowering.verify-no-casts");
+      if (mlir::failed(lowering::verifyNoUnrealizedCasts(
+              module, "runtime lowering boundary"))) {
+        signalPassFailure();
+        return;
+      }
     }
 
     // Finalize unwind blocks with landingpad in LLVM world.
-    lowering::runtime::eh::finalizeUnwindBlocks(module);
-    if (dumpLowering) {
-      llvm::errs() << "[After EH finalize]\n";
-      module.dump();
+    {
+      RuntimePerfScope perf("lowering.runtime-lowering.finalize-unwind");
+      lowering::runtime::eh::finalizeUnwindBlocks(module);
     }
 
     // Insert a top-level exception handler wrapper for `main`.
-    lowering::runtime::eh::wrapTopLevelMain(module);
+    {
+      RuntimePerfScope perf("lowering.runtime-lowering.wrap-main");
+      lowering::runtime::eh::wrapTopLevelMain(module);
+    }
 
-    if (mlir::failed(verifyLLVMCallOwnership(module))) {
-      signalPassFailure();
-      return;
+    {
+      RuntimePerfScope perf("lowering.runtime-lowering.verify-llvm-ownership");
+      if (mlir::failed(verifyLLVMCallOwnership(module))) {
+        signalPassFailure();
+        return;
+      }
     }
   }
 };

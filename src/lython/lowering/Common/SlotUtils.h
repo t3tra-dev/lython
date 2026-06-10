@@ -149,6 +149,10 @@ struct Managed {
   static bool mutableArgument(mlir::Operation *op, mlir::Value value);
   static mlir::Value predicate(mlir::Location loc, mlir::Value header,
                                int64_t refcountSlot, mlir::OpBuilder &builder);
+  static void lock(mlir::Location loc, mlir::Value header, mlir::Value lock,
+                   mlir::OpBuilder &builder);
+  static void unlock(mlir::Location loc, mlir::Value header, mlir::Value lock,
+                     mlir::OpBuilder &builder);
   static void lock(mlir::Location loc, mlir::Value lock,
                    mlir::OpBuilder &builder);
   static void unlock(mlir::Location loc, mlir::Value lock,

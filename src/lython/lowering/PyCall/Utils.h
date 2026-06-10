@@ -17,6 +17,7 @@ void emitTracebackPush(mlir::Location loc, mlir::func::FuncOp func,
                        RuntimeAPI &runtime,
                        mlir::ConversionPatternRewriter &rewriter);
 bool isBuiltinPrintCallable(mlir::Value callable);
+bool isBuiltinPrintRawCallable(mlir::Value callable);
 void ensureLandingpad(mlir::Block *unwind, mlir::Location loc,
                       mlir::ConversionPatternRewriter &rewriter);
 bool canUseVoidHelper(CallVectorOp op, mlir::func::FuncOp callee);
