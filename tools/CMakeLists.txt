@@ -2,13 +2,40 @@ add_executable(lyc
     CLI.cpp
 )
 
-get_target_property(MLIR_ASYNC_RUNTIME_LIBRARY mlir_async_runtime IMPORTED_LOCATION_RELEASE)
-if(NOT MLIR_ASYNC_RUNTIME_LIBRARY)
-    get_target_property(MLIR_ASYNC_RUNTIME_LIBRARY mlir_async_runtime IMPORTED_LOCATION)
+set(MLIR_ASYNC_RUNTIME_LIBRARY "")
+if(TARGET mlir_async_runtime)
+    foreach(config RELEASE RELWITHDEBINFO MINSIZEREL DEBUG NOCONFIG)
+        if(MLIR_ASYNC_RUNTIME_LIBRARY)
+            break()
+        endif()
+        get_target_property(mlir_async_runtime_candidate
+            mlir_async_runtime IMPORTED_LOCATION_${config})
+        if(mlir_async_runtime_candidate)
+            set(MLIR_ASYNC_RUNTIME_LIBRARY "${mlir_async_runtime_candidate}")
+        endif()
+    endforeach()
+    if(NOT MLIR_ASYNC_RUNTIME_LIBRARY)
+        get_target_property(mlir_async_runtime_candidate
+            mlir_async_runtime IMPORTED_LOCATION)
+        if(mlir_async_runtime_candidate)
+            set(MLIR_ASYNC_RUNTIME_LIBRARY "${mlir_async_runtime_candidate}")
+        endif()
+    endif()
 endif()
+
 if(NOT MLIR_ASYNC_RUNTIME_LIBRARY)
-    message(FATAL_ERROR "mlir_async_runtime imported target does not expose an imported location")
+    find_library(MLIR_ASYNC_RUNTIME_LIBRARY
+        NAMES mlir_async_runtime libmlir_async_runtime
+        HINTS
+            ${MLIR_LIBRARY_DIRS}
+            ${LLVM_LIBRARY_DIRS}
+            /opt/homebrew/opt/llvm@20/lib
+            /usr/local/opt/llvm@20/lib
+            /usr/lib/llvm-20/lib
+        REQUIRED
+    )
 endif()
+message(STATUS "Using MLIR async runtime: ${MLIR_ASYNC_RUNTIME_LIBRARY}")
 
 target_include_directories(lyc
     PUBLIC
@@ -38,7 +65,7 @@ target_link_libraries(lyc
     LythonEmitter
     MLIR
     LLVM
-    mlir_async_runtime
+    ${MLIR_ASYNC_RUNTIME_LIBRARY}
 )
 
 install(TARGETS lyc
