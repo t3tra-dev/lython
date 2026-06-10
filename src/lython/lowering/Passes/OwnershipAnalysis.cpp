@@ -9,6 +9,7 @@
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Interfaces/InferTypeOpInterface.h"
@@ -54,12 +55,17 @@ bool createsPyOwnedResult(mlir::Operation *op) {
     return true;
   if (isPyOwnershipImmortalOp(op))
     return false;
+  if (auto ifOp = mlir::dyn_cast<mlir::scf::IfOp>(op))
+    return llvm::any_of(ifOp.getResults(), [](mlir::Value result) {
+      return isPyOwnershipTrackedType(result.getType());
+    });
   if (mlir::isa<TryOp, TupleCreateOp, DictEmptyOp, StrConstantOp, IntConstantOp,
-                FloatConstantOp, AddOp, StrConcat3Op, SubOp, ReprOp,
-                MakeFunctionOp, CastFromPrimOp, ClassNewOp, ClassPromoteOp,
-                PublishOp, ListNewOp, ListGetOp, DictGetOp, AttrGetOp,
-                AttrGetLocalOp, ExceptionNewOp, AwaitOp, AsyncGatherOp,
-                CoroCreateOp, TaskCreateOp, AsyncSleepOp>(op))
+                FloatConstantOp, AddOp, StrConcat3Op, SubOp, MulOp, ReprOp,
+                DivOp, FloorDivOp, ModOp, LShiftOp, RShiftOp, BitAndOp, BitOrOp,
+                BitXorOp, MakeFunctionOp, CastFromPrimOp, ClassNewOp,
+                ClassPromoteOp, PublishOp, ListNewOp, ListGetOp, TupleGetOp,
+                DictGetOp, AttrGetOp, AttrGetLocalOp, ExceptionNewOp, AwaitOp,
+                AsyncGatherOp, CoroCreateOp, TaskCreateOp, AsyncSleepOp>(op))
     return true;
 
   return mlir::isa<CallOp, CallVectorOp, NativeCallOp>(op);
@@ -114,15 +120,20 @@ static bool tupleCreateConsumesOperand(TupleCreateOp tuple,
   auto tupleType = mlir::dyn_cast<TupleType>(tuple.getResult().getType());
   if (!tupleType)
     return true;
+  auto elementTypes = tupleType.getElementTypes();
   for (auto [index, element] : llvm::enumerate(tuple.getElements())) {
     if (element != operand)
       continue;
-    mlir::Type elementType = tupleType.getElementTypes()[index];
+    if (elementTypes.empty())
+      return true;
+    mlir::Type elementType =
+        elementTypes.size() == 1 ? elementTypes.front() : elementTypes[index];
     switch (container::Slot::policy(elementType)) {
     case container::SlotPolicy::NativeInteger:
     case container::SlotPolicy::NativeBool:
     case container::SlotPolicy::NativeFloat:
       return false;
+    case container::SlotPolicy::ObjectParts:
     case container::SlotPolicy::Unsupported:
       return true;
     }
@@ -131,6 +142,8 @@ static bool tupleCreateConsumesOperand(TupleCreateOp tuple,
 }
 
 bool consumesPyOwnedOperand(mlir::Operation *op, mlir::Value operand) {
+  if (auto decRef = mlir::dyn_cast<DecRefOp>(op))
+    return decRef.getObject() == operand;
   if (mlir::isa<ReturnOp, RaiseOp, TryYieldOp, ExceptYieldOp, FinallyYieldOp,
                 mlir::async::ReturnOp>(op))
     return true;
@@ -155,6 +168,16 @@ bool consumesPyOwnedOperand(mlir::Operation *op, mlir::Value operand) {
     return (dictInsert.getKey() == operand ||
             dictInsert.getValue() == operand) &&
            op->hasAttr("ly.consume_value");
+  if (auto yield = mlir::dyn_cast<mlir::scf::YieldOp>(op)) {
+    auto ifOp = yield->getParentOfType<mlir::scf::IfOp>();
+    if (!ifOp)
+      return false;
+    for (auto [index, yielded] : llvm::enumerate(yield.getOperands())) {
+      if (yielded == operand && index < ifOp.getNumResults())
+        return isPyOwnershipTrackedType(ifOp.getResult(index).getType());
+    }
+    return false;
+  }
   return false;
 }
 
@@ -413,6 +436,23 @@ bool OwnershipAliasAnalysis::rootIsEntryBorrowed(mlir::Value value,
   for (mlir::BlockArgument arg : entry.getArguments())
     if (sameRoot(arg, root))
       return true;
+  return false;
+}
+
+bool OwnershipAliasAnalysis::rootIsCapturedBorrow(mlir::Value root,
+                                                  mlir::Region &region) const {
+  llvm::SmallVector<mlir::Value, 4> aliasSet;
+  collectAliases(root, aliasSet);
+  for (mlir::Value member : aliasSet) {
+    if (!isPyOwnershipTrackedType(member.getType()))
+      continue;
+    if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(member))
+      if (arg.getOwner()->getParent() != &region)
+        return true;
+    if (mlir::Operation *def = member.getDefiningOp())
+      if (def->getParentRegion() != &region)
+        return true;
+  }
   return false;
 }
 

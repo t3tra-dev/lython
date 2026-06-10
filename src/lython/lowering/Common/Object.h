@@ -256,17 +256,42 @@ struct Parts {
 namespace exception_abi {
 
 static constexpr int64_t kLayoutId = 5;
+static constexpr int64_t kClassIdSlot = object_abi::kHeaderSlots;
+static constexpr int64_t kHeaderSlots = object_abi::kHeaderSlots + 1;
+
+struct Header {
+  static mlir::MemRefType owned(mlir::MLIRContext *ctx) {
+    return mlir::MemRefType::get({kHeaderSlots},
+                                 mlir::IntegerType::get(ctx, 64));
+  }
+
+  static mlir::MemRefType view(mlir::MLIRContext *ctx) {
+    auto layout = mlir::StridedLayoutAttr::get(ctx, mlir::ShapedType::kDynamic,
+                                               llvm::ArrayRef<int64_t>{1});
+    return mlir::MemRefType::get({kHeaderSlots},
+                                 mlir::IntegerType::get(ctx, 64), layout);
+  }
+
+  static bool isOwned(mlir::Type type) {
+    auto memref = mlir::dyn_cast<mlir::MemRefType>(type);
+    return memref && memref.getRank() == 1 && memref.hasStaticShape() &&
+           memref.getShape()[0] == kHeaderSlots &&
+           memref.getElementType().isInteger(64);
+  }
+};
 
 struct Parts {
   static void storageTypes(mlir::MLIRContext *ctx,
                            llvm::SmallVectorImpl<mlir::Type> &types) {
     types.push_back(Header::owned(ctx));
-    types.push_back(Header::owned(ctx));
+    types.push_back(object_abi::Header::owned(ctx));
     types.push_back(str_abi::Bytes::storage(ctx));
   }
 
   static bool isHeader(mlir::Type type) { return Header::isOwned(type); }
-  static bool isMessageHeader(mlir::Type type) { return Header::isOwned(type); }
+  static bool isMessageHeader(mlir::Type type) {
+    return object_abi::Header::isOwned(type);
+  }
   static bool isMessageBytes(mlir::Type type) {
     return str_abi::Bytes::storage(type.getContext()) == type;
   }

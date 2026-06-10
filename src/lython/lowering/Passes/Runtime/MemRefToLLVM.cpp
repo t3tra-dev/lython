@@ -28,6 +28,13 @@ void copyDiscardableAttrs(mlir::Operation *from, mlir::Operation *to) {
     to->setDiscardableAttr(attr.getName(), attr.getValue());
 }
 
+void copyAttrs(mlir::Operation *from, mlir::Operation *to) {
+  if (!from || !to)
+    return;
+  for (const mlir::NamedAttribute &attr : from->getAttrs())
+    to->setAttr(attr.getName(), attr.getValue());
+}
+
 void markDescriptorData(mlir::Value value) {
   mlir::Operation *def = value ? value.getDefiningOp() : nullptr;
   if (!def)
@@ -510,9 +517,11 @@ struct ContractDeallocOpLowering
                          .allocatedPtr(rewriter, op.getLoc());
     }
 
-    auto lowered = rewriter.replaceOpWithNewOp<mlir::LLVM::CallOp>(
-        op, freeFunc.value(), allocatedPtr);
-    copyDiscardableAttrs(op.getOperation(), lowered.getOperation());
+    auto lowered =
+        rewriter.create<mlir::LLVM::CallOp>(op.getLoc(), freeFunc.value(),
+                                            mlir::ValueRange{allocatedPtr});
+    copyAttrs(op.getOperation(), lowered.getOperation());
+    rewriter.eraseOp(op);
     return mlir::success();
   }
 };
@@ -528,8 +537,10 @@ void populate(PyLLVMTypeConverter &typeConverter,
   patterns.add<ContainerAccessLoadOpLowering, ContainerAccessStoreOpLowering,
                ContractAtomicRMWOpLowering, ContractGenericAtomicRMWOpLowering,
                ContractExtractAlignedPointerAsIndexLowering,
-               ContractReinterpretCastOpLowering, ContractDeallocOpLowering>(
+               ContractReinterpretCastOpLowering>(
       typeConverter, mlir::PatternBenefit(2));
+  patterns.add<ContractDeallocOpLowering>(typeConverter,
+                                          mlir::PatternBenefit(100));
 }
 
 } // namespace lowering::runtime::memref_to_llvm::Patterns

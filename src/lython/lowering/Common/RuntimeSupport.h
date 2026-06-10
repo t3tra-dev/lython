@@ -45,7 +45,9 @@ struct RuntimeSymbols {
   static constexpr llvm::StringLiteral kUnicodeConcat{"LyUnicode_Concat"};
   static constexpr llvm::StringLiteral kUnicodeConcat3{"LyUnicode_Concat3"};
   static constexpr llvm::StringLiteral kUnicodeCopy{"LyUnicode_Copy"};
+  static constexpr llvm::StringLiteral kUnicodeEqBool{"LyUnicode_EqBool"};
   static constexpr llvm::StringLiteral kUnicodeLength{"LyUnicode_Length"};
+  static constexpr llvm::StringLiteral kUnicodePrint{"LyUnicode_Print"};
   static constexpr llvm::StringLiteral kUnicodePrintLine{"LyUnicode_PrintLine"};
   static constexpr llvm::StringLiteral kUnicodeDecRef{"LyUnicode_DecRef"};
   static constexpr llvm::StringLiteral kUnicodeFromI64{"LyUnicode_FromI64"};
@@ -132,6 +134,8 @@ static constexpr llvm::StringLiteral kOrderingSeqCst{"seq_cst"};
 
 static constexpr llvm::StringLiteral kPremiseOwnedToken{"owned-token"};
 static constexpr llvm::StringLiteral kPremiseEntryBorrowed{"entry-borrowed"};
+static constexpr llvm::StringLiteral kPremiseCapturedBorrowed{
+    "captured-borrowed"};
 static constexpr llvm::StringLiteral kPremiseLockedBorrow{"locked-borrow"};
 static constexpr llvm::StringLiteral kPremiseAggregateBorrow{
     "aggregate-borrow"};

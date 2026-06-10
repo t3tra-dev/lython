@@ -11,6 +11,7 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/Transforms/Patterns.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/STLExtras.h"
@@ -22,6 +23,144 @@
 #undef GET_OP_CLASSES
 
 namespace py::lowering::runtime::conversion {
+
+namespace {
+
+llvm::SmallVector<mlir::Value>
+flatten(llvm::ArrayRef<mlir::ValueRange> ranges) {
+  llvm::SmallVector<mlir::Value> values;
+  for (mlir::ValueRange range : ranges)
+    values.append(range.begin(), range.end());
+  return values;
+}
+
+llvm::SmallVector<mlir::Type> typesOf(mlir::ValueRange values) {
+  llvm::SmallVector<mlir::Type> types;
+  for (mlir::Value value : values)
+    types.push_back(value.getType());
+  return types;
+}
+
+bool sameTypes(mlir::TypeRange lhs, llvm::ArrayRef<mlir::Type> rhs) {
+  if (lhs.size() != rhs.size())
+    return false;
+  return llvm::all_of(llvm::zip(lhs, rhs), [](auto pair) {
+    return std::get<0>(pair) == std::get<1>(pair);
+  });
+}
+
+mlir::FailureOr<mlir::Block *>
+convertSuccessorBlock(mlir::ConversionPatternRewriter &rewriter,
+                      const mlir::TypeConverter &converter,
+                      mlir::Operation *branchOp, mlir::Block *block,
+                      mlir::ValueRange operands) {
+  if (!block)
+    return rewriter.notifyMatchFailure(branchOp, "missing successor block");
+  if (block->isEntryBlock())
+    return rewriter.notifyMatchFailure(
+        branchOp, "entry block cannot be converted through a branch");
+
+  llvm::SmallVector<mlir::Type> expected = typesOf(operands);
+  if (sameTypes(block->getArgumentTypes(), expected))
+    return block;
+
+  std::optional<mlir::TypeConverter::SignatureConversion> conversion =
+      converter.convertBlockSignature(block);
+  if (!conversion)
+    return rewriter.notifyMatchFailure(branchOp,
+                                       "could not compute block signature");
+  if (!sameTypes(conversion->getConvertedTypes(), expected))
+    return rewriter.notifyMatchFailure(
+        branchOp,
+        "mismatch between converted branch operands and block signature");
+  return rewriter.applySignatureConversion(block, *conversion, &converter);
+}
+
+struct BranchLowering : mlir::OpConversionPattern<mlir::cf::BranchOp> {
+  BranchLowering(PyLLVMTypeConverter &converter, mlir::MLIRContext *ctx)
+      : mlir::OpConversionPattern<mlir::cf::BranchOp>(converter, ctx) {}
+
+  mlir::LogicalResult
+  matchAndRewrite(mlir::cf::BranchOp op, OneToNOpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    llvm::SmallVector<mlir::Value> operands = flatten(adaptor.getOperands());
+    mlir::FailureOr<mlir::Block *> dest = convertSuccessorBlock(
+        rewriter, *getTypeConverter(), op, op.getDest(), operands);
+    if (mlir::failed(dest))
+      return mlir::failure();
+    rewriter.replaceOpWithNewOp<mlir::cf::BranchOp>(op, *dest, operands);
+    return mlir::success();
+  }
+};
+
+struct CondBranchLowering : mlir::OpConversionPattern<mlir::cf::CondBranchOp> {
+  CondBranchLowering(PyLLVMTypeConverter &converter, mlir::MLIRContext *ctx)
+      : mlir::OpConversionPattern<mlir::cf::CondBranchOp>(converter, ctx) {}
+
+  mlir::LogicalResult
+  matchAndRewrite(mlir::cf::CondBranchOp op, OneToNOpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    llvm::ArrayRef<mlir::ValueRange> operandGroups = adaptor.getOperands();
+    if (operandGroups.empty() || operandGroups.front().size() != 1)
+      return rewriter.notifyMatchFailure(
+          op, "condition must remain a single lowered value");
+
+    unsigned trueCount = op.getNumTrueOperands();
+    unsigned falseCount = op.getNumFalseOperands();
+    if (operandGroups.size() != 1u + trueCount + falseCount)
+      return rewriter.notifyMatchFailure(op, "unexpected operand group count");
+
+    mlir::Value condition = operandGroups.front().front();
+    llvm::ArrayRef<mlir::ValueRange> trueGroups =
+        operandGroups.slice(1, trueCount);
+    llvm::ArrayRef<mlir::ValueRange> falseGroups =
+        operandGroups.slice(1 + trueCount, falseCount);
+    llvm::SmallVector<mlir::Value> trueOperands = flatten(trueGroups);
+    llvm::SmallVector<mlir::Value> falseOperands = flatten(falseGroups);
+
+    mlir::FailureOr<mlir::Block *> trueDest = convertSuccessorBlock(
+        rewriter, *getTypeConverter(), op, op.getTrueDest(), trueOperands);
+    if (mlir::failed(trueDest))
+      return mlir::failure();
+    mlir::FailureOr<mlir::Block *> falseDest = convertSuccessorBlock(
+        rewriter, *getTypeConverter(), op, op.getFalseDest(), falseOperands);
+    if (mlir::failed(falseDest))
+      return mlir::failure();
+
+    rewriter.replaceOpWithNewOp<mlir::cf::CondBranchOp>(
+        op, condition, *trueDest, trueOperands, *falseDest, falseOperands);
+    return mlir::success();
+  }
+};
+
+struct PySelectToScfIf : mlir::OpRewritePattern<mlir::arith::SelectOp> {
+  using mlir::OpRewritePattern<mlir::arith::SelectOp>::OpRewritePattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(mlir::arith::SelectOp op,
+                  mlir::PatternRewriter &rewriter) const override {
+    if (!isPyType(op.getResult().getType()))
+      return mlir::failure();
+
+    auto ifOp = rewriter.create<mlir::scf::IfOp>(
+        op.getLoc(), mlir::TypeRange{op.getResult().getType()},
+        op.getCondition(), /*withElseRegion=*/true);
+    {
+      mlir::OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(ifOp.thenBlock());
+      rewriter.create<mlir::scf::YieldOp>(op.getLoc(), op.getTrueValue());
+    }
+    {
+      mlir::OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(ifOp.elseBlock());
+      rewriter.create<mlir::scf::YieldOp>(op.getLoc(), op.getFalseValue());
+    }
+    rewriter.replaceOp(op, ifOp.getResults());
+    return mlir::success();
+  }
+};
+
+} // namespace
 
 mlir::LogicalResult
 runPartial(mlir::ModuleOp module, mlir::MLIRContext *ctx,
@@ -97,6 +236,12 @@ void populate(PyLLVMTypeConverter &typeConverter,
   ::py::lowering::async_runtime::Patterns::populate(typeConverter, patterns);
   ::py::lowering::refcount::Patterns::populate(typeConverter, patterns);
   ::py::lowering::runtime::upcast::Patterns::populate(typeConverter, patterns);
+  mlir::scf::populateSCFStructuralTypeConversions(typeConverter, patterns);
+  mlir::scf::populateSCFStructuralOneToNTypeConversions(typeConverter,
+                                                        patterns);
+  patterns.add<BranchLowering, CondBranchLowering>(typeConverter,
+                                                   patterns.getContext());
+  patterns.add<PySelectToScfIf>(patterns.getContext());
 }
 } // namespace value::Patterns
 
@@ -149,7 +294,6 @@ bool loweredRuntime(mlir::Type type) { return !containsPyRuntime(type); }
 
 void configureValueTarget(mlir::ConversionTarget &target,
                           PyLLVMTypeConverter &typeConverter) {
-  (void)typeConverter;
   target.addLegalDialect<
       mlir::LLVM::LLVMDialect, mlir::async::AsyncDialect,
       mlir::func::FuncDialect, mlir::arith::ArithDialect,
@@ -175,14 +319,50 @@ void configureValueTarget(mlir::ConversionTarget &target,
       [&](mlir::async::ReturnOp op) {
         return llvm::all_of(op.getOperandTypes(), loweredRuntime);
       });
+  target.addDynamicallyLegalOp<mlir::arith::SelectOp>(
+      [](mlir::arith::SelectOp op) {
+        return llvm::none_of(op.getOperandTypes(), containsPyRuntime) &&
+               llvm::none_of(op->getResultTypes(), containsPyRuntime);
+      });
+  auto blockLowered = [](mlir::Block *block) {
+    return block && llvm::all_of(block->getArgumentTypes(), loweredRuntime);
+  };
+  target.addDynamicallyLegalOp<mlir::cf::BranchOp>([&](mlir::cf::BranchOp op) {
+    return llvm::all_of(op.getOperandTypes(), loweredRuntime) &&
+           blockLowered(op.getDest());
+  });
+  target.addDynamicallyLegalOp<mlir::cf::CondBranchOp>(
+      [&](mlir::cf::CondBranchOp op) {
+        return llvm::all_of(op.getOperandTypes(), loweredRuntime) &&
+               blockLowered(op.getTrueDest()) &&
+               blockLowered(op.getFalseDest());
+      });
   target.addLegalOp<mlir::ModuleOp>();
   target.addLegalOp<mlir::UnrealizedConversionCastOp>();
+  target.addDynamicallyLegalOp<mlir::scf::IfOp>([](mlir::scf::IfOp op) {
+    return llvm::none_of(op.getResultTypes(), containsPyRuntime);
+  });
+  target.addDynamicallyLegalOp<mlir::scf::ForOp>([](mlir::scf::ForOp op) {
+    return llvm::none_of(op.getResultTypes(), containsPyRuntime) &&
+           llvm::none_of(op.getInitArgs().getTypes(), containsPyRuntime);
+  });
+  target.addDynamicallyLegalOp<mlir::scf::WhileOp>([](mlir::scf::WhileOp op) {
+    return llvm::none_of(op.getResultTypes(), containsPyRuntime) &&
+           llvm::none_of(op.getOperandTypes(), containsPyRuntime);
+  });
+  target.addDynamicallyLegalOp<mlir::scf::YieldOp>([](mlir::scf::YieldOp op) {
+    if (!mlir::isa<mlir::scf::IfOp, mlir::scf::ForOp, mlir::scf::WhileOp>(
+            op->getParentOp()))
+      return true;
+    return llvm::none_of(op.getOperandTypes(), containsPyRuntime);
+  });
   target.addIllegalOp<
       StrConstantOp, IntConstantOp, FloatConstantOp, TupleEmptyOp,
-      TupleCreateOp, DictEmptyOp, DictInsertOp, DictGetOp, ListNewOp,
-      ListAppendOp, ListRemoveOp, ListGetOp, NoneOp, FuncObjectOp,
-      MakeFunctionOp, AddOp, SubOp, LtOp, LeOp, GtOp, GeOp, EqOp, NeOp, ReprOp,
-      StrConcat3Op, CastToPrimOp, CastFromPrimOp, IncRefOp, DecRefOp,
+      TupleCreateOp, TupleGetOp, DictEmptyOp, DictInsertOp, DictGetOp,
+      ListNewOp, ListAppendOp, ListRemoveOp, ListGetOp, NoneOp, FuncObjectOp,
+      MakeFunctionOp, AddOp, SubOp, MulOp, DivOp, FloorDivOp, ModOp, LShiftOp,
+      RShiftOp, BitAndOp, BitOrOp, BitXorOp, LtOp, LeOp, GtOp, GeOp, EqOp, NeOp,
+      ReprOp, StrConcat3Op, CastToPrimOp, CastFromPrimOp, IncRefOp, DecRefOp,
       ClassNewOp, ClassPromoteOp, PublishOp, AttrGetOp, AttrSetOp,
       AttrGetLocalOp, AttrSetLocalOp, ClassOp, ExceptionNullOp, TracebackNullOp,
       LocationCurrentOp, ExceptionNewOp, RaiseOp, RaiseCurrentOp, TryOp,

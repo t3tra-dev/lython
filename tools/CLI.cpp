@@ -43,7 +43,6 @@
 #include "mlir/Target/LLVMIR/Export.h"
 #include "mlir/Target/LLVMIR/LLVMTranslationInterface.h"
 #include "mlir/Transforms/Passes.h"
-#include "llvm/ExecutionEngine/ObjectCache.h"
 #include "llvm/ExecutionEngine/Orc/CompileUtils.h"
 #include "llvm/ExecutionEngine/Orc/ExecutionUtils.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
@@ -71,7 +70,6 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Process.h"
-#include "llvm/Support/Program.h"
 #include "llvm/Support/Signals.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
@@ -81,14 +79,24 @@
 #include "llvm/Transforms/Coroutines/CoroEarly.h"
 #include "llvm/Transforms/Coroutines/CoroSplit.h"
 
-#include <cstdio>
-#include <cstdlib>
+#include <chrono>
+#include <cstdint>
 #include <limits>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <system_error>
 #include <vector>
+
+#include <sys/resource.h>
+
+#if defined(__linux__)
+#include <linux/perf_event.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 #include "Common/Object.h"
 #include "Common/RuntimeLibrary.h"
@@ -96,6 +104,8 @@
 #include "Common/ThreadSafetyKernel.h"
 #include "Passes/Runtime/Cleanup.h"
 #include "lyrt.h"
+#include "lython/emitter/Emitter.h"
+#include "lython/parser/Parser.h"
 
 #include "PyDialect.h.inc"
 
@@ -130,374 +140,418 @@ std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createLinalgLoweringPass();
 } // namespace py
 
 namespace {
-class FileObjectCache final : public llvm::ObjectCache {
-public:
-  explicit FileObjectCache(std::string outputPath)
-      : outputPath(std::move(outputPath)) {}
+std::string trimEnvToken(llvm::StringRef token) {
+  token = token.trim();
+  return token.str();
+}
 
-  void notifyObjectCompiled(const llvm::Module *M,
-                            llvm::MemoryBufferRef ObjBuffer) override {
-    (void)M;
-    std::error_code ec;
-    llvm::raw_fd_ostream os(outputPath, ec, llvm::sys::fs::OF_None);
-    if (ec) {
-      llvm::errs() << "error: failed to write JIT object to " << outputPath
-                   << ": " << ec.message() << "\n";
-      return;
+struct IRDumpConfig {
+  bool all = false;
+  std::set<std::string> passes;
+
+  static IRDumpConfig fromEnv() {
+    IRDumpConfig config;
+    auto value = llvm::sys::Process::GetEnv("LYTHON_IR_DUMP");
+    if (!value || value->empty())
+      return config;
+    llvm::SmallVector<llvm::StringRef, 16> tokens;
+    llvm::StringRef(*value).split(tokens, ",", /*MaxSplit=*/-1,
+                                  /*KeepEmpty=*/false);
+    for (llvm::StringRef token : tokens) {
+      std::string name = trimEnvToken(token);
+      if (name.empty())
+        continue;
+      if (name == "all" || name == "*") {
+        config.all = true;
+        continue;
+      }
+      config.passes.insert(std::move(name));
     }
-    os.write(ObjBuffer.getBufferStart(), ObjBuffer.getBufferSize());
-    os.flush();
+    return config;
   }
 
-  std::unique_ptr<llvm::MemoryBuffer>
-  getObject(const llvm::Module *M) override {
-    (void)M;
-    return nullptr;
+  bool shouldDump(llvm::StringRef passName) const {
+    return all || passes.count(passName.str()) != 0;
+  }
+};
+
+void dumpMLIRForPass(const IRDumpConfig &config, llvm::StringRef passName,
+                     ModuleOp module) {
+  if (!config.shouldDump(passName))
+    return;
+  llvm::errs() << "\n=== [LYTHON_IR_DUMP:" << passName << " MLIR] ===\n";
+  module->print(llvm::errs());
+  llvm::errs() << "\n";
+}
+
+void dumpLLVMForPass(const IRDumpConfig &config, llvm::StringRef passName,
+                     llvm::Module &module) {
+  if (!config.shouldDump(passName))
+    return;
+  llvm::errs() << "\n=== [LYTHON_IR_DUMP:" << passName << " LLVM] ===\n";
+  module.print(llvm::errs(), nullptr);
+  llvm::errs() << "\n";
+}
+
+bool perfEnabled() {
+  static const bool enabled = [] {
+    auto value = llvm::sys::Process::GetEnv("LYTHON_PERF");
+    if (!value)
+      return false;
+    llvm::StringRef text(*value);
+    return text == "1" || text.equals_insensitive("true") ||
+           text.equals_insensitive("yes") || text.equals_insensitive("on");
+  }();
+  return enabled;
+}
+
+std::uint64_t timevalMicros(const timeval &value) {
+  return static_cast<std::uint64_t>(value.tv_sec) * 1000000ULL +
+         static_cast<std::uint64_t>(value.tv_usec);
+}
+
+#if defined(__linux__)
+long perfEventOpen(perf_event_attr *attr, pid_t pid, int cpu, int groupFd,
+                   unsigned long flags) {
+  return syscall(__NR_perf_event_open, attr, pid, cpu, groupFd, flags);
+}
+
+class HardwareCounter {
+public:
+  explicit HardwareCounter(std::uint64_t config) {
+    perf_event_attr attr = {};
+    attr.type = PERF_TYPE_HARDWARE;
+    attr.size = sizeof(attr);
+    attr.config = config;
+    attr.disabled = 1;
+    attr.exclude_kernel = 0;
+    attr.exclude_hv = 1;
+    fd = static_cast<int>(perfEventOpen(&attr, /*pid=*/0, /*cpu=*/-1,
+                                        /*groupFd=*/-1, /*flags=*/0));
+  }
+
+  ~HardwareCounter() {
+    if (fd >= 0)
+      close(fd);
+  }
+
+  void start() {
+    if (fd < 0)
+      return;
+    ioctl(fd, PERF_EVENT_IOC_RESET, 0);
+    ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
+  }
+
+  std::optional<std::uint64_t> stop() {
+    if (fd < 0)
+      return std::nullopt;
+    ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
+    std::uint64_t value = 0;
+    if (read(fd, &value, sizeof(value)) != static_cast<ssize_t>(sizeof(value)))
+      return std::nullopt;
+    return value;
   }
 
 private:
-  std::string outputPath;
+  int fd = -1;
+};
+#endif
+
+class PerfScope {
+public:
+  explicit PerfScope(llvm::StringRef phase) : phase(phase.str()) {
+    if (!perfEnabled())
+      return;
+    enabled = true;
+    wallStart = Clock::now();
+    getrusage(RUSAGE_SELF, &usageStart);
+#if defined(__linux__)
+    instructions.emplace(PERF_COUNT_HW_INSTRUCTIONS);
+    cycles.emplace(PERF_COUNT_HW_CPU_CYCLES);
+    instructions->start();
+    cycles->start();
+#endif
+  }
+
+  ~PerfScope() {
+    if (!enabled)
+      return;
+#if defined(__linux__)
+    std::optional<std::uint64_t> instructionCount = instructions->stop();
+    std::optional<std::uint64_t> cycleCount = cycles->stop();
+#else
+    std::optional<std::uint64_t> instructionCount;
+    std::optional<std::uint64_t> cycleCount;
+#endif
+    rusage usageEnd = {};
+    getrusage(RUSAGE_SELF, &usageEnd);
+    auto wallEnd = Clock::now();
+    auto wallUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                      wallEnd - wallStart)
+                      .count();
+    std::uint64_t userUs =
+        timevalMicros(usageEnd.ru_utime) - timevalMicros(usageStart.ru_utime);
+    std::uint64_t sysUs =
+        timevalMicros(usageEnd.ru_stime) - timevalMicros(usageStart.ru_stime);
+
+    llvm::errs()
+        << "[LYTHON_PERF] phase=" << phase << " wall_us=" << wallUs
+        << " user_us=" << userUs << " sys_us=" << sysUs
+        << " minor_faults=" << (usageEnd.ru_minflt - usageStart.ru_minflt)
+        << " major_faults=" << (usageEnd.ru_majflt - usageStart.ru_majflt)
+        << " voluntary_csw=" << (usageEnd.ru_nvcsw - usageStart.ru_nvcsw)
+        << " involuntary_csw=" << (usageEnd.ru_nivcsw - usageStart.ru_nivcsw)
+        << " maxrss=" << usageEnd.ru_maxrss;
+    if (instructionCount)
+      llvm::errs() << " instructions=" << *instructionCount;
+    else
+      llvm::errs() << " instructions=unavailable";
+    if (cycleCount)
+      llvm::errs() << " cycles=" << *cycleCount;
+    else
+      llvm::errs() << " cycles=unavailable";
+    llvm::errs() << "\n";
+  }
+
+private:
+  using Clock = std::chrono::steady_clock;
+
+  std::string phase;
+  bool enabled = false;
+  Clock::time_point wallStart;
+  rusage usageStart = {};
+#if defined(__linux__)
+  std::optional<HardwareCounter> instructions;
+  std::optional<HardwareCounter> cycles;
+#endif
 };
 
-constexpr llvm::StringLiteral kPythonFrontendScript = R"PY(
-import ast
-import os
-import sys
-from lython.mlir import ir
-from lython.frontend import analyze_module_types
-from lython.visitors._base import BaseVisitor
-
-def main():
-    if len(sys.argv) < 2:
-        raise SystemExit("expected input.py")
-    input_path = sys.argv[1]
-    with open(input_path, "r", encoding="utf-8") as source_file:
-        source = source_file.read()
-    tree = ast.parse(source, filename=input_path)
-    abs_path = os.path.abspath(input_path)
-    tree.lython_module_name = abs_path
-    analyze_module_types(tree, filename=abs_path)
-    ctx = ir.Context()
-    parser = BaseVisitor(ctx)
-    parser._set_module_name(abs_path)
-    parser.visit(tree)
-    module = parser.module
-    module.operation.print(file=sys.stdout, enable_debug_info=True)
-    sys.stdout.flush()
-
-if __name__ == "__main__":
-    main()
-)PY";
-
-void setEnvVar(llvm::StringRef name, llvm::StringRef value) {
-#if defined(_WIN32)
-  _putenv_s(name.str().c_str(), value.str().c_str());
-#else
-  setenv(name.str().c_str(), value.str().c_str(), 1);
-#endif
+template <typename Populate>
+LogicalResult runLoweringPhase(llvm::StringRef name, MLIRContext &context,
+                               ModuleOp module, Populate populate) {
+  std::string phase = ("lowering." + name).str();
+  PerfScope perf(phase);
+  PassManager pm(&context);
+  populate(pm);
+  return pm.run(module);
 }
 
-void unsetEnvVar(llvm::StringRef name) {
-#if defined(_WIN32)
-  _putenv_s(name.str().c_str(), "");
-#else
-  unsetenv(name.str().c_str());
-#endif
-}
-
-LogicalResult runPipeline(ModuleOp module, MLIRContext &context) {
-  bool dumpIR =
-      static_cast<bool>(llvm::sys::Process::GetEnv("LYTHON_DUMP_LOWERING_IR"));
-
-  if (dumpIR) {
-    llvm::errs() << "=== [Frontend Output (before any passes)] ===\n";
-    module.dump();
-  }
+LogicalResult runPipeline(ModuleOp module, MLIRContext &context,
+                          const IRDumpConfig &irDump) {
+  dumpMLIRForPass(irDump, "frontend", module);
 
   // Phase 1: Native verification
-  {
-    if (dumpIR)
-      llvm::errs() << "[Pipeline] NativeVerificationPass\n";
-    PassManager pm(&context);
-    pm.addPass(py::createNativeVerificationPass());
-    if (failed(pm.run(module)))
-      return failure();
-  }
-
-  if (dumpIR) {
-    llvm::errs() << "\n=== [After NativeVerificationPass] ===\n";
-    module.dump();
-  }
+  if (failed(runLoweringPhase("native-verification", context, module,
+                              [&](PassManager &pm) {
+                                pm.addPass(py::createNativeVerificationPass());
+                              })))
+    return failure();
+  dumpMLIRForPass(irDump, "native-verification", module);
 
   // Phase 2: Publication preparation
-  {
-    if (dumpIR)
-      llvm::errs() << "[Pipeline] PublicationPreparationPass\n";
-    PassManager pm(&context);
-    pm.addPass(py::createPublicationPreparationPass());
-    if (failed(pm.run(module)))
-      return failure();
-  }
-
-  if (dumpIR) {
-    llvm::errs() << "\n=== [After PublicationPreparationPass] ===\n";
-    module.dump();
-  }
+  if (failed(runLoweringPhase(
+          "publication-preparation", context, module, [&](PassManager &pm) {
+            pm.addPass(py::createPublicationPreparationPass());
+          })))
+    return failure();
+  dumpMLIRForPass(irDump, "publication-preparation", module);
 
   // Phase 3: Reference counting insertion
-  {
-    if (dumpIR)
-      llvm::errs() << "[Pipeline] RefCountInsertionPass\n";
-    PassManager pm(&context);
-    pm.addPass(py::createRefCountInsertionPass());
-    if (failed(pm.run(module)))
-      return failure();
-  }
-
-  if (dumpIR) {
-    llvm::errs() << "\n=== [After RefCountInsertionPass] ===\n";
-    module.dump();
-  }
+  if (failed(runLoweringPhase("refcount-insertion", context, module,
+                              [&](PassManager &pm) {
+                                pm.addPass(py::createRefCountInsertionPass());
+                              })))
+    return failure();
+  dumpMLIRForPass(irDump, "refcount-insertion", module);
 
   // Phase 3.1: Proven refcount pair elision
-  {
-    if (dumpIR)
-      llvm::errs() << "[Pipeline] RefCountPairElisionPass\n";
-    PassManager pm(&context);
-    pm.addPass(py::createRefCountPairElisionPass());
-    if (failed(pm.run(module)))
-      return failure();
-  }
-
-  if (dumpIR) {
-    llvm::errs() << "\n=== [After RefCountPairElisionPass] ===\n";
-    module.dump();
-  }
+  if (failed(runLoweringPhase("refcount-elision", context, module,
+                              [&](PassManager &pm) {
+                                pm.addPass(py::createRefCountPairElisionPass());
+                              })))
+    return failure();
+  dumpMLIRForPass(irDump, "refcount-elision", module);
 
   // Phase 3.15: High-level Py semantic optimizations. This must run before
   // runtime MLIR embedding so the imported runtime roots match the optimized
   // py dialect, and before OwnershipVerifierPass so all ownership rewrites are
   // still checked by the quantitative kernel.
-  {
-    if (dumpIR)
-      llvm::errs() << "[Pipeline] PyOptimizationPass\n";
-    PassManager pm(&context);
-    pm.addPass(py::createPyOptimizationPass());
-    if (failed(pm.run(module)))
-      return failure();
-  }
-
-  if (dumpIR) {
-    llvm::errs() << "\n=== [After PyOptimizationPass] ===\n";
-    module.dump();
-  }
+  if (failed(runLoweringPhase("py-optimization", context, module,
+                              [&](PassManager &pm) {
+                                pm.addPass(py::createPyOptimizationPass());
+                              })))
+    return failure();
+  dumpMLIRForPass(irDump, "py-optimization", module);
 
   // Phase 3.2: Quantitative ownership verification
-  {
-    if (dumpIR)
-      llvm::errs() << "[Pipeline] OwnershipVerifierPass\n";
-    PassManager pm(&context);
-    pm.addPass(py::createOwnershipVerifierPass());
-    if (failed(pm.run(module)))
-      return failure();
-  }
-
-  if (dumpIR) {
-    llvm::errs() << "\n=== [After OwnershipVerifierPass] ===\n";
-    module.dump();
-  }
+  if (failed(runLoweringPhase("ownership-verifier", context, module,
+                              [&](PassManager &pm) {
+                                pm.addPass(py::createOwnershipVerifierPass());
+                              })))
+    return failure();
+  dumpMLIRForPass(irDump, "ownership-verifier", module);
 
   // Phase 4: Early canonicalization and CSE
-  {
-    if (dumpIR)
-      llvm::errs() << "[Pipeline] Canonicalizer + CSE\n";
-    PassManager pm(&context);
-    pm.addPass(mlir::createCanonicalizerPass());
-    pm.addPass(mlir::createCSEPass());
-    if (failed(pm.run(module)))
-      return failure();
-  }
-
-  if (dumpIR) {
-    llvm::errs() << "\n=== [After Canonicalizer + CSE] ===\n";
-    module.dump();
-  }
+  if (failed(runLoweringPhase("canonicalize", context, module,
+                              [&](PassManager &pm) {
+                                pm.addPass(mlir::createCanonicalizerPass());
+                                pm.addPass(mlir::createCSEPass());
+                              })))
+    return failure();
+  dumpMLIRForPass(irDump, "canonicalize", module);
 
   // Phase 4.5: Import runtime object definitions written in MLIR. These
   // fragments are kept at func/memref level and flow through the same lowering
   // pipeline as user code.
   {
-    if (dumpIR)
-      llvm::errs() << "[Pipeline] Runtime object MLIR embedding\n";
+    PerfScope perf("lowering.runtime-objects");
     if (failed(py::runtime_library::embedObjectModules(module)))
       return failure();
   }
-
-  if (dumpIR) {
-    llvm::errs() << "\n=== [After Runtime object MLIR embedding] ===\n";
-    module.dump();
-  }
+  dumpMLIRForPass(irDump, "runtime-objects", module);
 
   // Phase 5: Runtime lowering (Py dialect -> func/LLVM)
-  {
-    if (dumpIR)
-      llvm::errs() << "[Pipeline] RuntimeLoweringPass\n";
-    PassManager pm(&context);
-    pm.addPass(py::createRuntimeLoweringPass());
-    if (failed(pm.run(module)))
-      return failure();
-  }
+  if (failed(runLoweringPhase("runtime-lowering", context, module,
+                              [&](PassManager &pm) {
+                                pm.addPass(py::createRuntimeLoweringPass());
+                              })))
+    return failure();
+  dumpMLIRForPass(irDump, "runtime-lowering", module);
 
   // Phase 5.5: Let generic MLIR cleanup remove artifacts created by lowering
   // and runtime embedding.
+  if (failed(runLoweringPhase("post-lowering-cleanup", context, module,
+                              [&](PassManager &pm) {
+                                pm.addPass(mlir::createCanonicalizerPass());
+                                pm.addPass(mlir::createCSEPass());
+                                pm.addPass(mlir::createSymbolDCEPass());
+                              })))
+    return failure();
   {
-    if (dumpIR)
-      llvm::errs()
-          << "[Pipeline] Post-lowering Canonicalizer + CSE + SymbolDCE\n";
-    PassManager pm(&context);
-    pm.addPass(mlir::createCanonicalizerPass());
-    pm.addPass(mlir::createCSEPass());
-    pm.addPass(mlir::createSymbolDCEPass());
-    if (failed(pm.run(module)))
-      return failure();
+    PerfScope perf("lowering.pointer-roundtrip-cleanup");
     while (py::lowering::runtime::cleanup::pointerRoundTrips(module))
       ;
   }
-
-  if (dumpIR) {
-    llvm::errs() << "\n=== [After Post-lowering Canonicalizer + CSE + "
-                    "SymbolDCE] ===\n";
-    module.dump();
-  }
+  dumpMLIRForPass(irDump, "post-lowering-cleanup", module);
 
   // Phase 5.6: Validate that post-lowering cleanup did not alter ownership of
   // runtime calls that return or consume owned object-family descriptors.
-  {
-    if (dumpIR)
-      llvm::errs() << "[Pipeline] LLVMCallOwnershipVerifierPass\n";
-    PassManager pm(&context);
-    pm.addPass(py::createLLVMCallOwnershipVerifierPass());
-    if (failed(pm.run(module)))
-      return failure();
-  }
+  if (failed(runLoweringPhase(
+          "llvm-call-verifier", context, module, [&](PassManager &pm) {
+            pm.addPass(py::createLLVMCallOwnershipVerifierPass());
+          })))
+    return failure();
+  dumpMLIRForPass(irDump, "llvm-call-verifier", module);
 
   // Phase 5.7: Validate memref-level no-GIL contracts before final lowering.
-  {
-    if (dumpIR)
-      llvm::errs() << "[Pipeline] LLVMThreadSafetyVerifierPass\n";
-    PassManager pm(&context);
-    pm.addPass(py::createLLVMThreadSafetyVerifierPass());
-    if (failed(pm.run(module)))
-      return failure();
-  }
+  if (failed(runLoweringPhase(
+          "thread-safety-verifier", context, module, [&](PassManager &pm) {
+            pm.addPass(py::createLLVMThreadSafetyVerifierPass());
+          })))
+    return failure();
+  dumpMLIRForPass(irDump, "thread-safety-verifier", module);
 
   // Phase 6: Lower async.func/async.await to the MLIR async runtime, then
   // convert those runtime ops to LLVM. Lython owns !py.coro/!py.task/!py.future
   // descriptors linearly, so async runtime refcounting is emitted by Py
   // lowering instead of the generic MLIR async refcount pass.
-  {
-    if (dumpIR)
-      llvm::errs() << "[Pipeline] AsyncToLLVM\n";
-    PassManager pm(&context);
-    pm.addPass(mlir::createAsyncFuncToAsyncRuntimePass());
-    pm.addPass(mlir::createAsyncToAsyncRuntimePass());
-    if (failed(pm.run(module)))
-      return failure();
-  }
-  if (dumpIR) {
-    llvm::errs() << "[After async func/runtime conversion]\n";
-    module.dump();
-  }
-  {
-    PassManager pm(&context);
-    pm.addPass(py::createAsyncRuntimeRewritePass());
-    if (failed(pm.run(module)))
-      return failure();
-  }
-  if (dumpIR) {
-    llvm::errs() << "[After Lython async exception rewrites]\n";
-    module.dump();
-  }
+  if (failed(runLoweringPhase(
+          "async-runtime", context, module, [&](PassManager &pm) {
+            pm.addPass(mlir::createAsyncFuncToAsyncRuntimePass());
+            pm.addPass(mlir::createAsyncToAsyncRuntimePass());
+          })))
+    return failure();
+  dumpMLIRForPass(irDump, "async-runtime", module);
+  if (failed(runLoweringPhase("async-exception-rewrite", context, module,
+                              [&](PassManager &pm) {
+                                pm.addPass(py::createAsyncRuntimeRewritePass());
+                              })))
+    return failure();
+  dumpMLIRForPass(irDump, "async-exception-rewrite", module);
   SmallVector<py::AsyncArgProvenanceContract> asyncArgContracts;
-  py::collectAsyncArgProvenanceContracts(module, asyncArgContracts);
   {
-    PassManager pm(&context);
-    pm.addPass(mlir::createConvertAsyncToLLVMPass());
-    pm.addPass(mlir::createCanonicalizerPass());
-    pm.addPass(mlir::createCSEPass());
-    if (failed(pm.run(module)))
-      return failure();
+    PerfScope perf("lowering.collect-async-provenance");
+    py::collectAsyncArgProvenanceContracts(module, asyncArgContracts);
   }
-  if (failed(py::preserveLLVMAsyncArgProvenanceContracts(module,
-                                                         asyncArgContracts)))
+  if (failed(runLoweringPhase(
+          "convert-async-to-llvm", context, module, [&](PassManager &pm) {
+            pm.addPass(mlir::createConvertAsyncToLLVMPass());
+            pm.addPass(mlir::createCanonicalizerPass());
+            pm.addPass(mlir::createCSEPass());
+          })))
     return failure();
   {
-    PassManager pm(&context);
-    pm.addPass(py::createAsyncRuntimeRewritePass());
-    if (failed(pm.run(module)))
+    PerfScope perf("lowering.preserve-async-provenance");
+    if (failed(py::preserveLLVMAsyncArgProvenanceContracts(module,
+                                                           asyncArgContracts)))
       return failure();
   }
-  py::optimizer::pipeline::finalLLVMCleanup(module);
-  if (dumpIR) {
-    llvm::errs() << "[After ConvertAsyncToLLVM]\n";
-    module.dump();
-  }
+  if (failed(runLoweringPhase("post-async-rewrite", context, module,
+                              [&](PassManager &pm) {
+                                pm.addPass(py::createAsyncRuntimeRewritePass());
+                              })))
+    return failure();
   {
-    if (dumpIR)
-      llvm::errs() << "[Pipeline] Post-async LLVMCallOwnershipVerifierPass\n";
-    PassManager pm(&context);
-    pm.addPass(py::createLLVMCallOwnershipVerifierPass());
-    if (failed(pm.run(module)))
-      return failure();
+    PerfScope perf("lowering.post-async-final-cleanup");
+    py::optimizer::pipeline::finalLLVMCleanup(module);
   }
+  dumpMLIRForPass(irDump, "async-to-llvm", module);
+  if (failed(runLoweringPhase("post-async-ownership-verifier", context, module,
+                              [&](PassManager &pm) {
+                                pm.addPass(
+                                    py::createLLVMCallOwnershipVerifierPass());
+                              })))
+    return failure();
+  dumpMLIRForPass(irDump, "post-async-ownership-verifier", module);
 
   // Phase 7: Final lowering to LLVM
   {
-    if (dumpIR)
-      llvm::errs() << "[Pipeline] ConvertToLLVM\n";
     py::LoweredSafetyContracts finalSafetyContracts;
-    py::collectLoweredSafetyContracts(module, finalSafetyContracts);
-    PassManager pm(&context);
-    pm.addPass(mlir::createConvertSCFToCFPass());
-    pm.addPass(mlir::createArithToLLVMConversionPass());
-    pm.addPass(mlir::createConvertControlFlowToLLVMPass());
-    pm.addPass(mlir::createConvertToLLVMPass());
-    pm.addPass(mlir::createReconcileUnrealizedCastsPass());
-    pm.addNestedPass<mlir::func::FuncOp>(
-        mlir::createReconcileUnrealizedCastsPass());
-    pm.addPass(mlir::createCanonicalizerPass());
-    if (failed(pm.run(module)))
+    {
+      PerfScope perf("lowering.collect-final-safety-contracts");
+      py::collectLoweredSafetyContracts(module, finalSafetyContracts);
+    }
+    if (failed(runLoweringPhase(
+            "convert-to-llvm", context, module, [&](PassManager &pm) {
+              pm.addPass(mlir::createConvertSCFToCFPass());
+              pm.addPass(mlir::createArithToLLVMConversionPass());
+              pm.addPass(mlir::createConvertControlFlowToLLVMPass());
+              pm.addPass(mlir::createConvertToLLVMPass());
+              pm.addPass(mlir::createReconcileUnrealizedCastsPass());
+              pm.addNestedPass<mlir::func::FuncOp>(
+                  mlir::createReconcileUnrealizedCastsPass());
+              pm.addPass(mlir::createCanonicalizerPass());
+            })))
       return failure();
-    if (failed(
-            py::preserveLoweredSafetyContracts(module, finalSafetyContracts)))
-      return failure();
-    py::optimizer::pipeline::finalLLVMCleanup(module);
+    {
+      PerfScope perf("lowering.preserve-final-safety-contracts");
+      if (failed(
+              py::preserveLoweredSafetyContracts(module, finalSafetyContracts)))
+        return failure();
+    }
+    {
+      PerfScope perf("lowering.final-llvm-cleanup");
+      py::optimizer::pipeline::finalLLVMCleanup(module);
+    }
   }
-
-  if (dumpIR) {
-    llvm::errs() << "\n=== [Final LLVM IR] ===\n";
-    module.dump();
-  }
+  dumpMLIRForPass(irDump, "convert-to-llvm", module);
 
   // Phase 7.4: Re-check ownership after final conversion rewrites.
-  {
-    if (dumpIR)
-      llvm::errs() << "[Pipeline] Final LLVMCallOwnershipVerifierPass\n";
-    PassManager pm(&context);
-    pm.addPass(py::createLLVMCallOwnershipVerifierPass());
-    if (failed(pm.run(module)))
-      return failure();
-  }
+  if (failed(runLoweringPhase(
+          "final-ownership-verifier", context, module, [&](PassManager &pm) {
+            pm.addPass(py::createLLVMCallOwnershipVerifierPass());
+          })))
+    return failure();
+  dumpMLIRForPass(irDump, "final-ownership-verifier", module);
 
   // Phase 7.5: Validate final LLVM atomic orderings after MemRefToLLVM.
-  {
-    if (dumpIR)
-      llvm::errs() << "[Pipeline] Final LLVMThreadSafetyVerifierPass\n";
-    PassManager pm(&context);
-    pm.addPass(py::createLLVMThreadSafetyVerifierPass());
-    if (failed(pm.run(module)))
-      return failure();
-  }
+  if (failed(runLoweringPhase("final-thread-safety-verifier", context, module,
+                              [&](PassManager &pm) {
+                                pm.addPass(
+                                    py::createLLVMThreadSafetyVerifierPass());
+                              })))
+    return failure();
+  dumpMLIRForPass(irDump, "final-thread-safety-verifier", module);
 
   return success();
 }
@@ -569,6 +623,43 @@ OwningOpRef<ModuleOp> parseModuleFromBuffer(StringRef buffer,
   return module;
 }
 
+LogicalResult runCppParserDump(StringRef inputPath, bool typeComments,
+                               bool includeAttributes, bool interactiveMode,
+                               bool expressionMode, bool functionTypeMode) {
+  auto file = llvm::MemoryBuffer::getFile(inputPath);
+  if (!file) {
+    llvm::errs() << "error: could not open input file '" << inputPath << "'\n";
+    return failure();
+  }
+
+  lython::parser::ParseOptions options;
+  options.typeComments = typeComments;
+  if (interactiveMode)
+    options.mode = lython::parser::ParseMode::Interactive;
+  if (expressionMode)
+    options.mode = lython::parser::ParseMode::Expression;
+  if (functionTypeMode)
+    options.mode = lython::parser::ParseMode::FunctionType;
+  lython::parser::ParseResult result;
+  {
+    PerfScope perf("parse");
+    result = lython::parser::parse(file->get()->getBuffer(), inputPath.str(),
+                                   options);
+  }
+  if (!result.ok()) {
+    for (const lython::parser::Diagnostic &diagnostic : result.diagnostics) {
+      llvm::errs() << inputPath << ':' << diagnostic.location.line << ':'
+                   << diagnostic.location.column
+                   << ": error: " << diagnostic.message << "\n";
+    }
+    return failure();
+  }
+
+  llvm::outs() << lython::parser::dumpAst(*result.tree, includeAttributes)
+               << "\n";
+  return success();
+}
+
 std::optional<std::string> findBuildRoot(StringRef argv0) {
   llvm::SmallString<256> exePath(argv0);
   if (auto ec = llvm::sys::fs::real_path(exePath, exePath)) {
@@ -591,143 +682,51 @@ std::optional<std::string> findBuildRoot(StringRef argv0) {
   return std::nullopt;
 }
 
-std::optional<std::string> findSourceRoot(StringRef buildRoot) {
-  llvm::SmallString<256> cachePath(buildRoot);
-  llvm::sys::path::append(cachePath, "CMakeCache.txt");
-  auto bufferOrErr = llvm::MemoryBuffer::getFile(cachePath);
-  if (!bufferOrErr)
-    return std::nullopt;
-
-  llvm::StringRef content = bufferOrErr->get()->getBuffer();
-  llvm::StringRef key = "CMAKE_HOME_DIRECTORY:";
-  size_t pos = content.find(key);
-  if (pos == llvm::StringRef::npos)
-    return std::nullopt;
-  llvm::StringRef line = content.substr(pos);
-  line = line.substr(0, line.find('\n'));
-  size_t eq = line.find('=');
-  if (eq == llvm::StringRef::npos)
-    return std::nullopt;
-  llvm::StringRef value = line.substr(eq + 1).trim();
-  if (value.empty())
-    return std::nullopt;
-  return value.str();
-}
-
-LogicalResult generateMlirFromPython(StringRef pythonFile, StringRef sourceRoot,
-                                     std::string &mlirBuffer) {
-  auto findProjectPython =
-      [&](llvm::StringRef executable) -> std::optional<std::string> {
-    llvm::SmallString<256> candidate(sourceRoot);
-    llvm::sys::path::append(candidate, ".venv");
-#if defined(_WIN32)
-    llvm::sys::path::append(candidate, "Scripts");
-#else
-    llvm::sys::path::append(candidate, "bin");
-#endif
-    llvm::SmallString<256> binary(candidate);
-    llvm::sys::path::append(binary, executable);
-    if (llvm::sys::fs::exists(binary))
-      return std::string(binary.str());
-    return std::nullopt;
-  };
-
-  std::optional<std::string> pythonExe;
-#if defined(_WIN32)
-  pythonExe = findProjectPython("python.exe");
-#else
-  pythonExe = findProjectPython("python3");
-  if (!pythonExe)
-    pythonExe = findProjectPython("python");
-#endif
-  if (!pythonExe) {
-    auto sysPython = llvm::sys::findProgramByName("python3");
-    if (!sysPython)
-      sysPython = llvm::sys::findProgramByName("python");
-    if (!sysPython) {
-      llvm::errs() << "error: could not find python3/python executable\n";
-      return failure();
-    }
-    pythonExe = *sysPython;
-  }
-
-  llvm::SmallString<256> scriptPath;
-  if (auto ec = llvm::sys::fs::createTemporaryFile("lython_frontend", "py",
-                                                   scriptPath)) {
-    llvm::errs() << "error: failed to create temporary frontend script: "
-                 << ec.message() << "\n";
+LogicalResult generateModuleFromCppFrontend(StringRef pythonFile,
+                                            MLIRContext &context,
+                                            OwningOpRef<ModuleOp> &module) {
+  auto file = llvm::MemoryBuffer::getFile(pythonFile);
+  if (!file) {
+    llvm::errs() << "error: could not open input file '" << pythonFile << "'\n";
     return failure();
   }
-  llvm::FileRemover scriptCleanup(scriptPath);
+
+  lython::parser::ParseOptions options;
+  options.typeComments = true;
+  lython::parser::ParseResult parsed;
   {
-    std::error_code ec;
-    llvm::raw_fd_ostream scriptFile(scriptPath, ec, llvm::sys::fs::OF_Text);
-    if (ec) {
-      llvm::errs() << "error: failed to open temporary frontend script: "
-                   << ec.message() << "\n";
-      return failure();
+    PerfScope perf("parse");
+    parsed = lython::parser::parse(file->get()->getBuffer(), pythonFile.str(),
+                                   options);
+  }
+  if (!parsed.ok()) {
+    for (const lython::parser::Diagnostic &diagnostic : parsed.diagnostics) {
+      llvm::errs() << pythonFile << ':' << diagnostic.location.line << ':'
+                   << diagnostic.location.column
+                   << ": parse error: " << diagnostic.message << "\n";
     }
-    scriptFile << kPythonFrontendScript.str();
+    return failure();
   }
 
-  auto existingPyPath = llvm::sys::Process::GetEnv("PYTHONPATH");
-  llvm::SmallString<256> newPyPath(sourceRoot);
-  llvm::sys::path::append(newPyPath, "src");
-  if (existingPyPath && !existingPyPath->empty()) {
-    newPyPath += llvm::sys::path::get_separator();
-    newPyPath += *existingPyPath;
-  }
-  setEnvVar("PYTHONPATH", newPyPath);
-
-  std::string command;
+  lython::emitter::EmitResult emitted;
   {
-    llvm::raw_string_ostream os(command);
-    llvm::sys::printArg(os, *pythonExe, /*Quote=*/true);
-    os << ' ';
-    llvm::sys::printArg(os, scriptPath.str(), /*Quote=*/true);
-    os << ' ';
-    llvm::sys::printArg(os, pythonFile, /*Quote=*/true);
+    PerfScope perf("ir-generation");
+    emitted = lython::emitter::emitModule(*parsed.tree, context, "__main__");
   }
-
-#if defined(_WIN32)
-  FILE *pipe = _popen(command.c_str(), "rb");
-#else
-  FILE *pipe = popen(command.c_str(), "r");
-#endif
-  if (!pipe) {
-    llvm::errs() << "error: failed to invoke python frontend\n";
-    if (existingPyPath)
-      setEnvVar("PYTHONPATH", *existingPyPath);
-    else
-      unsetEnvVar("PYTHONPATH");
+  if (!emitted.ok()) {
+    for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics) {
+      llvm::errs() << pythonFile << ':' << diagnostic.location.line << ':'
+                   << diagnostic.location.column
+                   << ": emit error: " << diagnostic.message << "\n";
+    }
     return failure();
   }
 
-  mlirBuffer.clear();
-  char buffer[4096];
-  while (fgets(buffer, sizeof(buffer), pipe))
-    mlirBuffer.append(buffer);
-
-#if defined(_WIN32)
-  int result = _pclose(pipe);
-#else
-  int result = pclose(pipe);
-#endif
-
-  if (existingPyPath)
-    setEnvVar("PYTHONPATH", *existingPyPath);
-  else
-    unsetEnvVar("PYTHONPATH");
-
-  if (result != 0) {
-    llvm::errs() << "error: python frontend failed for '" << pythonFile
-                 << "'\n";
-    return failure();
-  }
+  module = std::move(emitted.module);
   return success();
 }
 
-LogicalResult dumpLLVMIR(llvm::Module &llvmModule, StringRef outputPath) {
+LogicalResult writeLLVMIR(llvm::Module &llvmModule, StringRef outputPath) {
   std::error_code ec;
   llvm::raw_fd_ostream out(outputPath, ec, llvm::sys::fs::OF_None);
   if (ec) {
@@ -1101,145 +1100,150 @@ LogicalResult buildExecutable(llvm::Module &llvmModule,
   return success();
 }
 
-LogicalResult runJIT(ModuleOp module) {
-  llvm::InitializeNativeTarget();
-  llvm::InitializeNativeTargetAsmPrinter();
+LogicalResult runJIT(ModuleOp module, const IRDumpConfig &irDump) {
+  std::unique_ptr<llvm::orc::LLJIT> jit;
+  llvm::orc::ExecutorAddr entryAddress;
 
-  auto tmBuilderOrErr = llvm::orc::JITTargetMachineBuilder::detectHost();
-  if (!tmBuilderOrErr) {
-    llvm::errs() << "Failed to create JITTargetMachineBuilder: "
-                 << llvm::toString(tmBuilderOrErr.takeError()) << "\n";
-    return failure();
-  }
-  auto tmBuilder = std::move(*tmBuilderOrErr);
-  auto options = tmBuilder.getOptions();
-  options.ExceptionModel = llvm::ExceptionHandling::DwarfCFI;
-  options.MCOptions.EmitCompactUnwindNonCanonical = true;
-  options.ForceDwarfFrameSection = true;
-  options.MCOptions.EmitDwarfUnwind = llvm::EmitDwarfUnwindType::Always;
-  tmBuilder.setOptions(options);
+  {
+    PerfScope perf("jit-build");
+    llvm::InitializeNativeTarget();
+    llvm::InitializeNativeTargetAsmPrinter();
 
-  std::unique_ptr<FileObjectCache> objectCache;
-  if (const char *dumpEnv = std::getenv("LYTHON_DUMP_JIT_OBJECT")) {
-    std::string dumpPath = dumpEnv;
-    if (dumpPath.empty() || dumpPath == "1")
-      dumpPath = "/tmp/lython_jit.o";
-    objectCache = std::make_unique<FileObjectCache>(std::move(dumpPath));
-  }
-
-  auto compileFunctionCreator = [&](llvm::orc::JITTargetMachineBuilder jtmb)
-      -> llvm::Expected<
-          std::unique_ptr<llvm::orc::IRCompileLayer::IRCompiler>> {
-    auto tmOrErr = jtmb.createTargetMachine();
-    if (!tmOrErr)
-      return tmOrErr.takeError();
-    return std::make_unique<llvm::orc::TMOwningSimpleCompiler>(
-        std::move(*tmOrErr), objectCache.get());
-  };
-
-  auto objectLayerCreator =
-      [](llvm::orc::ExecutionSession &session,
-         const llvm::Triple &tt) -> std::unique_ptr<llvm::orc::ObjectLayer> {
-    auto layer = std::make_unique<llvm::orc::ObjectLinkingLayer>(session);
-    if (tt.isOSBinFormatCOFF()) {
-      layer->setOverrideObjectFlagsWithResponsibilityFlags(true);
-      layer->setAutoClaimResponsibilityForObjectSymbols(true);
+    auto tmBuilderOrErr = llvm::orc::JITTargetMachineBuilder::detectHost();
+    if (!tmBuilderOrErr) {
+      llvm::errs() << "Failed to create JITTargetMachineBuilder: "
+                   << llvm::toString(tmBuilderOrErr.takeError()) << "\n";
+      return failure();
     }
-    return layer;
-  };
+    auto tmBuilder = std::move(*tmBuilderOrErr);
+    auto options = tmBuilder.getOptions();
+    options.ExceptionModel = llvm::ExceptionHandling::DwarfCFI;
+    options.MCOptions.EmitCompactUnwindNonCanonical = true;
+    options.ForceDwarfFrameSection = true;
+    options.MCOptions.EmitDwarfUnwind = llvm::EmitDwarfUnwindType::Always;
+    tmBuilder.setOptions(options);
 
-  llvm::orc::LLJITBuilder builder;
-  builder.setJITTargetMachineBuilder(std::move(tmBuilder))
-      .setCompileFunctionCreator(compileFunctionCreator)
-      .setObjectLinkingLayerCreator(objectLayerCreator)
-      .setPrePlatformSetup([](llvm::orc::LLJIT &jit) -> llvm::Error {
-        auto psjd = jit.getProcessSymbolsJITDylib();
-        if (!psjd)
-          return llvm::make_error<llvm::StringError>(
-              "Native platforms require a process symbols JITDylib",
-              llvm::inconvertibleErrorCode());
-        auto dlGen =
-            llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
-                jit.getDataLayout().getGlobalPrefix());
-        if (dlGen)
-          psjd->addGenerator(std::move(*dlGen));
+    auto compileFunctionCreator = [](llvm::orc::JITTargetMachineBuilder jtmb)
+        -> llvm::Expected<
+            std::unique_ptr<llvm::orc::IRCompileLayer::IRCompiler>> {
+      auto tmOrErr = jtmb.createTargetMachine();
+      if (!tmOrErr)
+        return tmOrErr.takeError();
+      return std::make_unique<llvm::orc::TMOwningSimpleCompiler>(
+          std::move(*tmOrErr));
+    };
+
+    auto objectLayerCreator =
+        [](llvm::orc::ExecutionSession &session,
+           const llvm::Triple &tt) -> std::unique_ptr<llvm::orc::ObjectLayer> {
+      auto layer = std::make_unique<llvm::orc::ObjectLinkingLayer>(session);
+      if (tt.isOSBinFormatCOFF()) {
+        layer->setOverrideObjectFlagsWithResponsibilityFlags(true);
+        layer->setAutoClaimResponsibilityForObjectSymbols(true);
+      }
+      return layer;
+    };
+
+    llvm::orc::LLJITBuilder builder;
+    builder.setJITTargetMachineBuilder(std::move(tmBuilder))
+        .setCompileFunctionCreator(compileFunctionCreator)
+        .setObjectLinkingLayerCreator(objectLayerCreator)
+        .setPrePlatformSetup([](llvm::orc::LLJIT &jit) -> llvm::Error {
+          auto psjd = jit.getProcessSymbolsJITDylib();
+          if (!psjd)
+            return llvm::make_error<llvm::StringError>(
+                "Native platforms require a process symbols JITDylib",
+                llvm::inconvertibleErrorCode());
+          auto dlGen =
+              llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
+                  jit.getDataLayout().getGlobalPrefix());
+          if (dlGen)
+            psjd->addGenerator(std::move(*dlGen));
 #if defined(__APPLE__)
-        const char *libcppCandidates[] = {
-            "/usr/lib/libc++.1.dylib",
-            "libc++.1.dylib",
-            "/usr/lib/libc++abi.dylib",
-            "libc++abi.dylib",
-        };
-        for (const char *lib : libcppCandidates) {
-          if (auto gen = llvm::orc::DynamicLibrarySearchGenerator::Load(
-                  lib, jit.getDataLayout().getGlobalPrefix())) {
-            psjd->addGenerator(std::move(*gen));
-          } else {
-            llvm::consumeError(gen.takeError());
+          const char *libcppCandidates[] = {
+              "/usr/lib/libc++.1.dylib",
+              "libc++.1.dylib",
+              "/usr/lib/libc++abi.dylib",
+              "libc++abi.dylib",
+          };
+          for (const char *lib : libcppCandidates) {
+            if (auto gen = llvm::orc::DynamicLibrarySearchGenerator::Load(
+                    lib, jit.getDataLayout().getGlobalPrefix())) {
+              psjd->addGenerator(std::move(*gen));
+            } else {
+              llvm::consumeError(gen.takeError());
+            }
           }
-        }
 #endif
-        return llvm::Error::success();
-      });
-  auto jitExpected = builder.create();
-  if (!jitExpected) {
-    llvm::errs() << "Failed to create LLJIT\n";
-    return failure();
-  }
-  auto jit = std::move(*jitExpected);
+          return llvm::Error::success();
+        });
+    auto jitExpected = builder.create();
+    if (!jitExpected) {
+      llvm::errs() << "Failed to create LLJIT\n";
+      return failure();
+    }
+    jit = std::move(*jitExpected);
 
-  LLVMSafetyProfile safetyProfile;
-  collectLLVMSafetyContracts(module, safetyProfile);
+    LLVMSafetyProfile safetyProfile;
+    collectLLVMSafetyContracts(module, safetyProfile);
 
-  auto llvmContext = std::make_unique<llvm::LLVMContext>();
-  auto llvmModule = mlir::translateModuleToLLVMIR(module, *llvmContext);
-  if (!llvmModule) {
-    llvm::errs() << "Failed to translate to LLVM IR\n";
-    return failure();
-  }
-  if (failed(verifyLLVMIRSafetyMetadataAttached(*llvmModule, safetyProfile)))
-    return failure();
-  if (failed(verifyPostCoroLLVMThreadSafety(*llvmModule, safetyProfile)))
-    return failure();
-  for (auto &func : *llvmModule) {
-    if (!func.isDeclaration())
-      func.setUWTableKind(llvm::UWTableKind::Async);
+    auto llvmContext = std::make_unique<llvm::LLVMContext>();
+    auto llvmModule = mlir::translateModuleToLLVMIR(module, *llvmContext);
+    if (!llvmModule) {
+      llvm::errs() << "Failed to translate to LLVM IR\n";
+      return failure();
+    }
+    if (failed(verifyLLVMIRSafetyMetadataAttached(*llvmModule, safetyProfile)))
+      return failure();
+    if (failed(verifyPostCoroLLVMThreadSafety(*llvmModule, safetyProfile)))
+      return failure();
+    for (auto &func : *llvmModule) {
+      if (!func.isDeclaration())
+        func.setUWTableKind(llvm::UWTableKind::Async);
+    }
+
+    llvmModule->setDataLayout(jit->getDataLayout());
+    llvmModule->setTargetTriple(jit->getTargetTriple().getTriple());
+    runLLVMCoroLowering(*llvmModule);
+    dumpLLVMForPass(irDump, "llvm-translation", *llvmModule);
+    if (failed(verifyPostCoroLLVMThreadSafety(*llvmModule, safetyProfile)))
+      return failure();
+
+    auto &jd = jit->getMainJITDylib();
+    auto dlGen = llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
+        jit->getDataLayout().getGlobalPrefix());
+    if (dlGen)
+      jd.addGenerator(std::move(*dlGen));
+    llvm::orc::MangleAndInterner interner(jd.getExecutionSession(),
+                                          jit->getDataLayout());
+    auto symbolMap = buildRuntimeSymbolMap(interner);
+    cantFail(jd.define(absoluteSymbols(std::move(symbolMap))));
+
+    auto tsm = llvm::orc::ThreadSafeModule(std::move(llvmModule),
+                                           std::move(llvmContext));
+    if (auto err = jit->addIRModule(std::move(tsm))) {
+      llvm::errs() << "JIT add module error: " << err << "\n";
+      return failure();
+    }
+    if (auto err = jit->initialize(jd)) {
+      llvm::errs() << "JIT initialize error: " << err << "\n";
+      return failure();
+    }
+
+    auto sym = jit->lookup("_mlir_ciface_main");
+    if (!sym) {
+      llvm::errs() << "JIT lookup failed: " << sym.takeError() << "\n";
+      return failure();
+    }
+    entryAddress = *sym;
   }
 
-  llvmModule->setDataLayout(jit->getDataLayout());
-  llvmModule->setTargetTriple(jit->getTargetTriple().getTriple());
-  runLLVMCoroLowering(*llvmModule);
-  if (failed(verifyPostCoroLLVMThreadSafety(*llvmModule, safetyProfile)))
-    return failure();
-
-  auto &jd = jit->getMainJITDylib();
-  auto dlGen = llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
-      jit->getDataLayout().getGlobalPrefix());
-  if (dlGen)
-    jd.addGenerator(std::move(*dlGen));
-  llvm::orc::MangleAndInterner interner(jd.getExecutionSession(),
-                                        jit->getDataLayout());
-  auto symbolMap = buildRuntimeSymbolMap(interner);
-  cantFail(jd.define(absoluteSymbols(std::move(symbolMap))));
-
-  auto tsm = llvm::orc::ThreadSafeModule(std::move(llvmModule),
-                                         std::move(llvmContext));
-  if (auto err = jit->addIRModule(std::move(tsm))) {
-    llvm::errs() << "JIT add module error: " << err << "\n";
-    return failure();
+  auto *entry = entryAddress.toPtr<int32_t (*)()>();
+  int32_t exitCode = 0;
+  {
+    PerfScope perf("execution");
+    exitCode = entry();
   }
-  if (auto err = jit->initialize(jd)) {
-    llvm::errs() << "JIT initialize error: " << err << "\n";
-    return failure();
-  }
-
-  auto sym = jit->lookup("_mlir_ciface_main");
-  if (!sym) {
-    llvm::errs() << "JIT lookup failed: " << sym.takeError() << "\n";
-    return failure();
-  }
-  auto *entry = sym->toPtr<int32_t (*)()>();
-  int32_t exitCode = entry();
   return exitCode == 0 ? success() : failure();
 }
 
@@ -1261,21 +1265,52 @@ static llvm::cl::SubCommand JitCommand("jit", "JIT execute an input file");
 static llvm::cl::opt<std::string>
     JitInputFilename(llvm::cl::Positional, llvm::cl::desc("<input file>"),
                      llvm::cl::Required, llvm::cl::sub(JitCommand));
+static llvm::cl::SubCommand ParseCommand(
+    "parse",
+    "Parse Python source with the vendored CPython 3.14 PEG/ASDL C++ frontend");
+static llvm::cl::opt<std::string>
+    ParseInputFilename(llvm::cl::Positional, llvm::cl::desc("<input file>"),
+                       llvm::cl::Required, llvm::cl::sub(ParseCommand));
+static llvm::cl::opt<bool> ParseTypeComments(
+    "type-comments",
+    llvm::cl::desc("Include CPython-style type comments in the dumped C++ AST"),
+    llvm::cl::init(false), llvm::cl::sub(ParseCommand));
+static llvm::cl::opt<bool> ParseAttributes(
+    "attributes",
+    llvm::cl::desc("Include CPython-style source location attributes in the "
+                   "dumped C++ AST"),
+    llvm::cl::init(false), llvm::cl::sub(ParseCommand));
+static llvm::cl::opt<bool>
+    ParseInteractiveMode("interactive",
+                         llvm::cl::desc("Parse input as a single interactive "
+                                        "statement, like ast.parse(..., "
+                                        "mode=\"single\")"),
+                         llvm::cl::init(false), llvm::cl::sub(ParseCommand));
+static llvm::cl::opt<bool>
+    ParseExpressionMode("expression",
+                        llvm::cl::desc("Parse input as a single expression"),
+                        llvm::cl::init(false), llvm::cl::sub(ParseCommand));
+static llvm::cl::opt<bool> ParseFunctionTypeMode(
+    "function-type",
+    llvm::cl::desc("Parse input as a CPython function type comment"),
+    llvm::cl::init(false), llvm::cl::sub(ParseCommand));
 
 int main(int argc, char **argv) {
-  if (std::getenv("LYTHON_DEBUG_SIGNALS")) {
-    llvm::sys::PrintStackTraceOnErrorSignal(argv[0]);
-  }
+  llvm::sys::PrintStackTraceOnErrorSignal(argv[0]);
   llvm::cl::SetVersionPrinter(
       [](llvm::raw_ostream &os) { os << "Lython CLI based on MLIR\n"; });
   llvm::cl::ParseCommandLineOptions(argc, argv,
                                     "Lython compiler driver (clang-style)\n");
+  IRDumpConfig irDump = IRDumpConfig::fromEnv();
 
   const bool jitMode = static_cast<bool>(JitCommand);
+  const bool parseMode = static_cast<bool>(ParseCommand);
   std::string inputPath;
   std::string outputPath = OutputFilename;
 
-  if (jitMode) {
+  if (parseMode) {
+    inputPath = ParseInputFilename;
+  } else if (jitMode) {
     inputPath = JitInputFilename;
   } else {
     if (InputFilename.empty()) {
@@ -1284,6 +1319,23 @@ int main(int argc, char **argv) {
       return 1;
     }
     inputPath = InputFilename;
+  }
+
+  if (parseMode) {
+    const int parseModeCount = (ParseInteractiveMode ? 1 : 0) +
+                               (ParseExpressionMode ? 1 : 0) +
+                               (ParseFunctionTypeMode ? 1 : 0);
+    if (parseModeCount > 1) {
+      llvm::errs() << "error: --interactive, --expression, and "
+                      "--function-type are mutually exclusive\n";
+      return 1;
+    }
+
+    return failed(runCppParserDump(inputPath, ParseTypeComments,
+                                   ParseAttributes, ParseInteractiveMode,
+                                   ParseExpressionMode, ParseFunctionTypeMode))
+               ? 1
+               : 0;
   }
 
   auto buildRoot = findBuildRoot(argv[0]);
@@ -1301,21 +1353,11 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  auto projectSourceRoot = findSourceRoot(*buildRoot);
-  if (!projectSourceRoot) {
-    llvm::errs() << "error: unable to determine source root\n";
-    return 1;
-  }
-
   llvm::SmallString<256> asyncRuntimeLibPath(LYTHON_MLIR_ASYNC_RUNTIME_LIBRARY);
   if (!llvm::sys::fs::exists(asyncRuntimeLibPath))
     asyncRuntimeLibPath.clear();
 
   bool isPythonInput = llvm::sys::path::extension(inputPath) == ".py";
-  std::optional<std::string> sourceRoot;
-  if (isPythonInput) {
-    sourceRoot = projectSourceRoot;
-  }
 
   DialectRegistry registry;
   registry.insert<py::PyDialect, async::AsyncDialect, func::FuncDialect,
@@ -1337,8 +1379,10 @@ int main(int argc, char **argv) {
   context.appendDialectRegistry(registry);
 
   std::string mlirSource;
+  OwningOpRef<ModuleOp> module;
+
   if (isPythonInput) {
-    if (failed(generateMlirFromPython(inputPath, *sourceRoot, mlirSource)))
+    if (failed(generateModuleFromCppFrontend(inputPath, context, module)))
       return 1;
   } else {
     auto file = mlir::openInputFile(inputPath);
@@ -1350,17 +1394,21 @@ int main(int argc, char **argv) {
     mlirSource = std::string(file->getBuffer());
   }
 
-  OwningOpRef<ModuleOp> module = parseModuleFromBuffer(mlirSource, context);
+  if (!module)
+    module = parseModuleFromBuffer(mlirSource, context);
   if (!module)
     return 1;
 
-  if (failed(runPipeline(*module, context))) {
-    llvm::errs() << "Failed to run lowering pipeline\n";
-    return 1;
+  {
+    PerfScope perf("lowering");
+    if (failed(runPipeline(*module, context, irDump))) {
+      llvm::errs() << "Failed to run lowering pipeline\n";
+      return 1;
+    }
   }
 
   if (jitMode) {
-    return failed(runJIT(*module)) ? 1 : 0;
+    return failed(runJIT(*module, irDump)) ? 1 : 0;
   }
 
   LLVMSafetyProfile safetyProfile;
@@ -1372,13 +1420,14 @@ int main(int argc, char **argv) {
     llvm::errs() << "Failed to translate to LLVM IR\n";
     return 1;
   }
+  dumpLLVMForPass(irDump, "llvm-translation", *llvmModule);
   if (failed(verifyLLVMIRSafetyMetadataAttached(*llvmModule, safetyProfile)))
     return 1;
   if (failed(verifyPostCoroLLVMThreadSafety(*llvmModule, safetyProfile)))
     return 1;
 
   if (EmitLLVMOnly)
-    return failed(dumpLLVMIR(*llvmModule, outputPath)) ? 1 : 0;
+    return failed(writeLLVMIR(*llvmModule, outputPath)) ? 1 : 0;
 
   if (llvm::InitializeNativeTarget()) {
     llvm::errs() << "error: could not initialize native target\n";

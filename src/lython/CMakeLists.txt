@@ -1,3 +1,5 @@
 add_subdirectory(dialects)
 add_subdirectory(runtime)
 add_subdirectory(lowering)
+add_subdirectory(parser)
+add_subdirectory(emitter)

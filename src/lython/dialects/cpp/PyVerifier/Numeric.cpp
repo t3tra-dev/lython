@@ -42,6 +42,60 @@ mlir::LogicalResult SubOp::verify() {
   return verifyPythonResult(getOperation(), getResult().getType());
 }
 
+mlir::LogicalResult MulOp::verify() {
+  if (mlir::failed(verifyPythonOperands(getOperation(), getLhs(), getRhs())))
+    return mlir::failure();
+  return verifyPythonResult(getOperation(), getResult().getType());
+}
+
+mlir::LogicalResult DivOp::verify() {
+  if (mlir::failed(verifyPythonOperands(getOperation(), getLhs(), getRhs())))
+    return mlir::failure();
+  return verifyPythonResult(getOperation(), getResult().getType());
+}
+
+mlir::LogicalResult FloorDivOp::verify() {
+  if (mlir::failed(verifyPythonOperands(getOperation(), getLhs(), getRhs())))
+    return mlir::failure();
+  return verifyPythonResult(getOperation(), getResult().getType());
+}
+
+mlir::LogicalResult ModOp::verify() {
+  if (mlir::failed(verifyPythonOperands(getOperation(), getLhs(), getRhs())))
+    return mlir::failure();
+  return verifyPythonResult(getOperation(), getResult().getType());
+}
+
+mlir::LogicalResult LShiftOp::verify() {
+  if (mlir::failed(verifyPythonOperands(getOperation(), getLhs(), getRhs())))
+    return mlir::failure();
+  return verifyPythonResult(getOperation(), getResult().getType());
+}
+
+mlir::LogicalResult RShiftOp::verify() {
+  if (mlir::failed(verifyPythonOperands(getOperation(), getLhs(), getRhs())))
+    return mlir::failure();
+  return verifyPythonResult(getOperation(), getResult().getType());
+}
+
+mlir::LogicalResult BitAndOp::verify() {
+  if (mlir::failed(verifyPythonOperands(getOperation(), getLhs(), getRhs())))
+    return mlir::failure();
+  return verifyPythonResult(getOperation(), getResult().getType());
+}
+
+mlir::LogicalResult BitOrOp::verify() {
+  if (mlir::failed(verifyPythonOperands(getOperation(), getLhs(), getRhs())))
+    return mlir::failure();
+  return verifyPythonResult(getOperation(), getResult().getType());
+}
+
+mlir::LogicalResult BitXorOp::verify() {
+  if (mlir::failed(verifyPythonOperands(getOperation(), getLhs(), getRhs())))
+    return mlir::failure();
+  return verifyPythonResult(getOperation(), getResult().getType());
+}
+
 mlir::LogicalResult FloatConstantOp::verify() { return mlir::success(); }
 
 static mlir::LogicalResult verifyPythonComparison(mlir::Operation *op,
@@ -86,8 +140,9 @@ mlir::LogicalResult NeOp::verify() {
 }
 
 mlir::LogicalResult ReprOp::verify() {
-  if (!isPyType(getInput().getType()))
-    return emitOpError("input must be a !py.* type");
+  mlir::Type inputType = getInput().getType();
+  if (!isPyType(inputType) && !mlir::isa<mlir::IntegerType>(inputType))
+    return emitOpError("input must be a !py.* type or primitive integer");
   if (!isPyStrType(getResult().getType()))
     return emitOpError("result must be !py.str");
   return mlir::success();

@@ -119,21 +119,4 @@
     "C_Cpp.enhancedColorization": "enabled",
     "C_Cpp.intelliSenseMemoryLimit": 4096,
     "C_Cpp.workspaceParsingPriority": "highest",
-    "files.exclude": {
-        "**/.git": true,
-        "**/.svn": true,
-        "**/.hg": true,
-        "**/CVS": true,
-        "**/.DS_Store": true,
-        "**/build": false,
-        "**/__pycache__": true,
-        "**/*.pyc": true
-    },
-    "search.exclude": {
-        "**/node_modules": true,
-        "**/bower_components": true,
-        "**/*.code-search": true,
-        "**/build": false,
-        "**/__pycache__": true
-    }
 }

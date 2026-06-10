@@ -4,10 +4,7 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = [
-    "numpy>=2.4.1",
-    "pyyaml>=6.0.3",
-]
+dependencies = []
 
 [dependency-groups]
 dev = [
@@ -26,19 +23,18 @@ build-backend = "hatchling.build"
 [tool.pyright]
 include = ["src/lython"]
 exclude = ["**/__pycache__", "**/*.pyi"]
-ignore = ["third_party/", "src/lython/mlir/"]
+ignore = ["third_party/"]
 typeCheckingMode = "strict"
 
 [tool.black]
 extend-exclude = """
 ^/third_party/*
-|^/src/lython/mlir/*
 """
 
 [tool.isort]
 profile = "black"
 line_length = 88
-extend_skip_glob = ["third_party/*", "src/lython/mlir/*"]
+extend_skip_glob = ["third_party/*"]
 
 [tool.uv.sources]
 lython = { workspace = true }

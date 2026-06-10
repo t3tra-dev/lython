@@ -1,4 +1,5 @@
 module {
+  func.func private @LyHost_Print(memref<?xi8>, i64)
   func.func private @LyHost_PrintLine(memref<?xi8>, i64)
 
   func.func private @__ly_unicode_alloc(%len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
@@ -32,6 +33,30 @@ module {
     %length_index = memref.dim %bytes, %c0 : memref<?xi8>
     %length = arith.index_cast %length_index : index to i64
     func.return %length : i64
+  }
+
+  func.func @LyUnicode_EqBool(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_bytes: memref<?xi8>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_bytes: memref<?xi8>) -> i1 {
+    %lhs_len = func.call @LyUnicode_Length(%lhs_header, %lhs_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %rhs_len = func.call @LyUnicode_Length(%rhs_header, %rhs_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %same_len = arith.cmpi eq, %lhs_len, %rhs_len : i64
+    %result = scf.if %same_len -> (i1) {
+      %lower = arith.constant 0 : index
+      %upper = arith.index_cast %lhs_len : i64 to index
+      %step = arith.constant 1 : index
+      %true = arith.constant true
+      %all_equal = scf.for %index = %lower to %upper step %step iter_args(%current = %true) -> (i1) {
+        %lhs_byte = memref.load %lhs_bytes[%index] : memref<?xi8>
+        %rhs_byte = memref.load %rhs_bytes[%index] : memref<?xi8>
+        %byte_equal = arith.cmpi eq, %lhs_byte, %rhs_byte : i8
+        %next = arith.andi %current, %byte_equal : i1
+        scf.yield %next : i1
+      }
+      scf.yield %all_equal : i1
+    } else {
+      %false = arith.constant false
+      scf.yield %false : i1
+    }
+    func.return %result : i1
   }
 
   func.func @LyUnicode_Copy(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
@@ -97,6 +122,12 @@ module {
   func.func @LyUnicode_PrintLine(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) {
     %length = func.call @LyUnicode_Length(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
     func.call @LyHost_PrintLine(%bytes, %length) : (memref<?xi8>, i64) -> ()
+    func.return
+  }
+
+  func.func @LyUnicode_Print(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) {
+    %length = func.call @LyUnicode_Length(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    func.call @LyHost_Print(%bytes, %length) : (memref<?xi8>, i64) -> ()
     func.return
   }
 

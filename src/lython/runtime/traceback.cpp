@@ -57,25 +57,50 @@ const char *safeStr(const std::string &value, const char *defaultValue) {
   return value.empty() ? defaultValue : value.c_str();
 }
 
-void printExceptionSummary(const LyI8Descriptor &payload) {
+const char *exceptionClassName(std::int64_t classId) {
+  switch (classId) {
+  case 1:
+    return "BaseException";
+  case 2:
+    return "Exception";
+  case 3:
+    return "RuntimeError";
+  case 4:
+    return "TypeError";
+  case 5:
+    return "ValueError";
+  case 6:
+    return "KeyError";
+  case 7:
+    return "IndexError";
+  case 8:
+    return "AssertionError";
+  default:
+    return "Exception";
+  }
+}
+
+void printExceptionSummary(std::int64_t classId,
+                           const LyI8Descriptor &payload) {
+  const char *className = exceptionClassName(classId);
   if (!lython::abi::memref::rootDynamic(payload)) {
-    std::fprintf(stderr, "Exception: <invalid>\n");
+    std::fprintf(stderr, "%s: <invalid>\n", className);
     return;
   }
 
   if (payload.size == 0) {
-    std::fprintf(stderr, "Exception\n");
+    std::fprintf(stderr, "%s\n", className);
     return;
   }
 
   if (!payload.aligned) {
-    std::fprintf(stderr, "Exception: <unknown>\n");
+    std::fprintf(stderr, "%s: <unknown>\n", className);
     return;
   }
 
   std::string message = copyMemRefString(payload);
-  std::fprintf(stderr, "Exception: %.*s\n", static_cast<int>(message.size()),
-               message.data());
+  std::fprintf(stderr, "%s: %.*s\n", className,
+               static_cast<int>(message.size()), message.data());
 }
 
 } // namespace
@@ -104,7 +129,8 @@ void LyTraceback_Pop() {
 
 void LyTraceback_Clear() { g_traceback_stack.clear(); }
 
-void LyTraceback_PrintMessage(std::uint8_t *payload_allocated,
+void LyTraceback_PrintMessage(std::int64_t class_id,
+                              std::uint8_t *payload_allocated,
                               std::uint8_t *payload_aligned,
                               std::int64_t payload_offset,
                               std::int64_t payload_size,
@@ -127,7 +153,7 @@ void LyTraceback_PrintMessage(std::uint8_t *payload_allocated,
   LyI8Descriptor payload =
       lython::abi::memref::i8(payload_allocated, payload_aligned,
                               payload_offset, payload_size, payload_stride);
-  printExceptionSummary(payload);
+  printExceptionSummary(class_id, payload);
 }
 
 } // extern "C"

@@ -58,14 +58,15 @@ module {
     func.return %false : i1
   }
 
-  func.func @LyException_DecRef(%header: memref<2xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) attributes {ly.ownership.release_args = [0]} {
-    %header_view = memref.cast %header : memref<2xi64> to memref<2xi64, strided<[1], offset: ?>>
-    %became_zero = func.call @__ly_decref_release(%header_view) : (memref<2xi64, strided<[1], offset: ?>>) -> i1
+  func.func @LyException_DecRef(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) attributes {ly.ownership.release_args = [0]} {
+    %c0 = arith.constant 0 : index
+    %sub_header = memref.subview %header[%c0] [2] [1] : memref<3xi64> to memref<2xi64, strided<[1], offset: ?>>
+    %became_zero = func.call @__ly_decref_release(%sub_header) : (memref<2xi64, strided<[1], offset: ?>>) -> i1
     cf.cond_br %became_zero, ^dealloc, ^done
 
   ^dealloc:
     func.call @LyUnicode_DecRef(%message_header, %message_bytes) : (memref<2xi64>, memref<?xi8>) -> ()
-    memref.dealloc %header {ly.ownership.object_dealloc_part = "header"} : memref<2xi64>
+    memref.dealloc %header {ly.ownership.object_dealloc_part = "header"} : memref<3xi64>
     cf.br ^done
 
   ^done:

@@ -221,20 +221,28 @@ void emitTracebackPush(mlir::Location loc, mlir::func::FuncOp func,
                mlir::ValueRange{fileBytes, funcBytes, lineConst, colConst});
 }
 
-bool isBuiltinPrintCallable(mlir::Value callable) {
+static std::optional<llvm::StringRef> builtinCallableName(mlir::Value callable) {
   callable = stripBridgeCasts(callable);
-  if (auto funcObject = callable.getDefiningOp<FuncObjectOp>()) {
-    llvm::StringRef name = funcObject.getTarget();
-    return name == "__builtin_print" || name == "print";
-  }
+  if (auto funcObject = callable.getDefiningOp<FuncObjectOp>())
+    return funcObject.getTarget();
   if (auto constant = callable.getDefiningOp<mlir::func::ConstantOp>()) {
     mlir::SymbolRefAttr symbol = constant.getValueAttr();
-    llvm::StringRef name = symbol.getLeafReference().empty()
-                               ? symbol.getRootReference().getValue()
-                               : symbol.getLeafReference().getValue();
-    return name == "__builtin_print" || name == "print";
+    return symbol.getLeafReference().empty()
+               ? symbol.getRootReference().getValue()
+               : symbol.getLeafReference().getValue();
   }
-  return false;
+  return std::nullopt;
+}
+
+bool isBuiltinPrintCallable(mlir::Value callable) {
+  std::optional<llvm::StringRef> name = builtinCallableName(callable);
+  return name && (*name == "__builtin_print" ||
+                  *name == "__builtin_print_raw" || *name == "print");
+}
+
+bool isBuiltinPrintRawCallable(mlir::Value callable) {
+  std::optional<llvm::StringRef> name = builtinCallableName(callable);
+  return name && *name == "__builtin_print_raw";
 }
 
 void ensureLandingpad(mlir::Block *unwind, mlir::Location loc,

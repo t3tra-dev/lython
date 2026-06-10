@@ -230,10 +230,11 @@ def Py_LocationCurrentOp : Py_Op<"location.current", [Pure]> {
 }
 
 def Py_ExceptMatchOp : Py_Op<"except.match", [Pure]> {
-  let arguments = (ins Py_ExceptionType:$exception, Py_ClassType:$type);
+  let arguments = (ins Py_ExceptionType:$exception,
+      TypeAttrOf<Py_ClassType>:$handler);
   let results = (outs I1:$result);
   let assemblyFormat =
-      "$exception `,` $type `:` type($exception) `,` type($type) attr-dict";
+      "$exception `,` $handler `:` type($exception) attr-dict";
   let hasVerifier = 1;
 }
 
@@ -437,6 +438,23 @@ def Py_TupleEmptyOp : Py_Op<"tuple.empty", [Pure]> {
   let results = (outs Py_TupleType:$result);
 
   let assemblyFormat = "attr-dict `:` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_TupleGetOp : Py_Op<"tuple.get", []> {
+  let summary = "Get an element from a statically typed Python tuple";
+  let description = [{
+    Loads an element from a typed tuple using a statically known index. The
+    operation preserves the element's static type and lowers to a memref slot
+    load from the tuple items descriptor.
+  }];
+
+  let arguments = (ins Py_TupleType:$tuple, AnyType:$index);
+
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat = "$tuple `:` type($tuple) `[` $index `:` type($index) "
+                       "`]` attr-dict `->` type($result)";
   let hasVerifier = 1;
 }
 
@@ -699,6 +717,150 @@ def Py_SubOp : Py_Op<"sub", []> {
   let description = [{
     Represents the Python `-` language operation. Method resolution (`__sub__`,
     `__rsub__`) is a lowering concern.
+  }];
+
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs);
+
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict "
+                       "`->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_MulOp : Py_Op<"mul", []> {
+  let summary = "Python multiplication operation";
+  let description = [{
+    Represents the Python `*` language operation. Method resolution (`__mul__`,
+    `__rmul__`) is a lowering concern.
+  }];
+
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs);
+
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict "
+                       "`->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_DivOp : Py_Op<"div", []> {
+  let summary = "Python true division operation";
+  let description = [{
+    Represents the Python `/` language operation. Method resolution
+    (`__truediv__`, `__rtruediv__`) is a lowering concern.
+  }];
+
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs);
+
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict "
+                       "`->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_FloorDivOp : Py_Op<"floordiv", []> {
+  let summary = "Python floor division operation";
+  let description = [{
+    Represents the Python `//` language operation. Method resolution
+    (`__floordiv__`, `__rfloordiv__`) is a lowering concern.
+  }];
+
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs);
+
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict "
+                       "`->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_ModOp : Py_Op<"mod", []> {
+  let summary = "Python modulo operation";
+  let description = [{
+    Represents the Python `%` language operation. Method resolution (`__mod__`,
+    `__rmod__`) is a lowering concern.
+  }];
+
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs);
+
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict "
+                       "`->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_LShiftOp : Py_Op<"lshift", []> {
+  let summary = "Python left shift operation";
+  let description = [{
+    Represents the Python `<<` language operation. Method resolution
+    (`__lshift__`, `__rlshift__`) is a lowering concern.
+  }];
+
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs);
+
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict "
+                       "`->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_RShiftOp : Py_Op<"rshift", []> {
+  let summary = "Python right shift operation";
+  let description = [{
+    Represents the Python `>>` language operation. Method resolution
+    (`__rshift__`, `__rrshift__`) is a lowering concern.
+  }];
+
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs);
+
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict "
+                       "`->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_BitAndOp : Py_Op<"bitand", []> {
+  let summary = "Python bitwise and operation";
+  let description = [{
+    Represents the Python `&` language operation. Method resolution
+    (`__and__`, `__rand__`) is a lowering concern.
+  }];
+
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs);
+
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict "
+                       "`->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_BitOrOp : Py_Op<"bitor", []> {
+  let summary = "Python bitwise or operation";
+  let description = [{
+    Represents the Python `|` language operation. Method resolution (`__or__`,
+    `__ror__`) is a lowering concern.
+  }];
+
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs);
+
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat = "$lhs `:` type($lhs) `,` $rhs `:` type($rhs) attr-dict "
+                       "`->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_BitXorOp : Py_Op<"bitxor", []> {
+  let summary = "Python bitwise xor operation";
+  let description = [{
+    Represents the Python `^` language operation. Method resolution
+    (`__xor__`, `__rxor__`) is a lowering concern.
   }];
 
   let arguments = (ins AnyType:$lhs, AnyType:$rhs);

@@ -110,7 +110,9 @@ bool memref_value::alloc(mlir::Value value) {
 }
 
 bool object_header::type(mlir::Type type) {
-  return object_abi::Header::isOwned(type) || object_abi::Header::isView(type);
+  return object_abi::Header::isOwned(type) ||
+         object_abi::Header::isView(type) ||
+         object_abi::exception_abi::Header::isOwned(type);
 }
 
 bool object_header::runtimeArg(mlir::BlockArgument arg) {

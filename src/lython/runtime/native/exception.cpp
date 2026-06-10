@@ -4,7 +4,8 @@
 
 namespace {
 
-constexpr std::int64_t kExceptionHeaderSlots = 2;
+constexpr std::int64_t kObjectHeaderSlots = 2;
+constexpr std::int64_t kExceptionHeaderSlots = 3;
 
 enum class CurrentExceptionKind {
   None,
@@ -26,7 +27,12 @@ void releaseCurrentException() {
   std::abort();
 }
 
-void validateHeaderDescriptor(const LyI64Descriptor &header) {
+void validateObjectHeaderDescriptor(const LyI64Descriptor &header) {
+  if (!lython::abi::memref::root(header, kObjectHeaderSlots))
+    std::abort();
+}
+
+void validateExceptionHeaderDescriptor(const LyI64Descriptor &header) {
   if (!lython::abi::memref::root(header, kExceptionHeaderSlots))
     std::abort();
 }
@@ -55,8 +61,8 @@ LyExceptionPartsDescriptor makePartsDescriptor(
                               message_bytes_offset, message_bytes_size,
                               message_bytes_stride),
   };
-  validateHeaderDescriptor(descriptor.header);
-  validateHeaderDescriptor(descriptor.message_header);
+  validateExceptionHeaderDescriptor(descriptor.header);
+  validateObjectHeaderDescriptor(descriptor.message_header);
   validateBytesDescriptor(descriptor.message_bytes);
   return descriptor;
 }

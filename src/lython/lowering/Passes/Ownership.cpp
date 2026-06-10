@@ -2,10 +2,14 @@
 #include "Passes/OwnershipAnalysis.h"
 
 #include "mlir/Dialect/Async/IR/Async.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
+
+#include <utility>
 
 #include "PyDialect.h.inc"
 
@@ -146,6 +150,8 @@ bool hasToken(const State &state, mlir::Value value,
   return state.balance.contains(root);
 }
 
+bool equal(const State &lhs, const State &rhs);
+
 } // namespace ownership_state
 
 namespace inc_ref {
@@ -172,8 +178,14 @@ mlir::LogicalResult verifyPremise(const ownership_state::State &state,
                                 ThreadSafetyAttrs::kPremiseEntryBorrowed);
     return mlir::success();
   }
+  if (aliases.rootIsCapturedBorrow(rootValue, *entry.getParent())) {
+    threadsafe::Retain::premise(inc.getOperation(),
+                                ThreadSafetyAttrs::kPremiseCapturedBorrowed);
+    return mlir::success();
+  }
   return inc->emitOpError(
-             "incref requires an owned token or entry-borrowed lifetime for ")
+             "incref requires an owned token, entry-borrowed lifetime, or "
+             "captured borrowed lifetime for ")
          << object;
 }
 
@@ -213,8 +225,10 @@ mlir::LogicalResult verifyUse(const ownership_state::State &state,
     return mlir::success();
   if (entryArgsBorrowed && aliases.rootIsEntryBorrowed(value, entry))
     return mlir::success();
+  if (aliases.rootIsCapturedBorrow(rootValue, *entry.getParent()))
+    return mlir::success();
   return op.emitOpError("borrow use lacks a live ownership token or explicit "
-                        "entry-borrowed lifetime for ")
+                        "entry/captured borrowed lifetime for ")
          << value;
 }
 
@@ -243,6 +257,111 @@ mlir::LogicalResult verify(mlir::Operation *funcLike, mlir::Region &body,
                            bool entryArgsBorrowed);
 } // namespace function_like
 
+namespace effect {
+mlir::LogicalResult apply(mlir::Operation &op, ownership_state::State &state,
+                          mlir::Block &entry, const AliasAnalysis &aliases,
+                          bool entryArgsBorrowed);
+} // namespace effect
+
+namespace structured_control {
+
+mlir::LogicalResult verifyYieldResultShape(mlir::scf::IfOp ifOp) {
+  if (ifOp.getNumResults() == 0)
+    return mlir::success();
+  for (mlir::Region &region : ifOp->getRegions()) {
+    if (region.empty())
+      return ifOp->emitOpError("scf.if region is empty");
+    mlir::Operation *terminator = region.front().getTerminator();
+    auto yield = mlir::dyn_cast_or_null<mlir::scf::YieldOp>(terminator);
+    if (!yield)
+      return ifOp->emitOpError("scf.if region must end with scf.yield");
+    if (yield.getNumOperands() != ifOp.getNumResults())
+      return yield.emitOpError("yield/result arity mismatch");
+    for (auto [result, operand] :
+         llvm::zip(ifOp.getResults(), yield.getOperands())) {
+      if (isPyOwnershipTrackedType(result.getType()) &&
+          !isPyOwnershipTrackedType(operand.getType())) {
+        return yield.emitOpError(
+            "ownership-tracked scf.if result requires tracked yield operand");
+      }
+    }
+  }
+  return mlir::success();
+}
+
+mlir::LogicalResult
+applyRegion(mlir::Region &region, ownership_state::State initialState,
+            mlir::Block &entry, const AliasAnalysis &aliases,
+            bool entryArgsBorrowed, ownership_state::State &exitState) {
+  if (region.empty()) {
+    exitState = std::move(initialState);
+    return mlir::success();
+  }
+  if (!llvm::hasSingleElement(region))
+    return region.getParentOp()->emitOpError(
+        "structured ownership verification expects single-block scf regions");
+
+  ownership_state::State state = std::move(initialState);
+  mlir::Block &block = region.front();
+  if (block.empty())
+    return region.getParentOp()->emitOpError("scf region has no terminator");
+
+  for (mlir::Operation &op : block) {
+    if (op.hasTrait<mlir::OpTrait::IsTerminator>()) {
+      if (!mlir::isa<mlir::scf::YieldOp>(&op))
+        return op.emitOpError(
+            "structured ownership verification expects scf.yield");
+      if (mlir::failed(
+              borrow::verifyUses(state, op, entry, aliases, entryArgsBorrowed)))
+        return mlir::failure();
+      for (mlir::Value operand : op.getOperands()) {
+        if (!consumesPyOwnedOperand(&op, operand))
+          continue;
+        if (mlir::failed(
+                ownership_state::add(state, operand, -1, &op, aliases)))
+          return mlir::failure();
+      }
+      exitState = std::move(state);
+      return mlir::success();
+    }
+    if (mlir::failed(
+            effect::apply(op, state, entry, aliases, entryArgsBorrowed)))
+      return mlir::failure();
+  }
+
+  return region.getParentOp()->emitOpError("scf region has no terminator");
+}
+
+mlir::LogicalResult apply(mlir::scf::IfOp ifOp, ownership_state::State &state,
+                          mlir::Block &entry, const AliasAnalysis &aliases,
+                          bool entryArgsBorrowed) {
+  if (mlir::failed(verifyYieldResultShape(ifOp)))
+    return mlir::failure();
+
+  ownership_state::State thenState;
+  ownership_state::State elseState;
+  if (mlir::failed(applyRegion(ifOp.getThenRegion(), state, entry, aliases,
+                               entryArgsBorrowed, thenState)))
+    return mlir::failure();
+  if (mlir::failed(applyRegion(ifOp.getElseRegion(), state, entry, aliases,
+                               entryArgsBorrowed, elseState)))
+    return mlir::failure();
+
+  if (!ownership_state::equal(thenState, elseState))
+    return ifOp->emitOpError(
+        "ownership balance differs between scf.if branches");
+  state = std::move(thenState);
+  for (mlir::Value result : ifOp.getResults()) {
+    if (!isPyOwnershipTrackedType(result.getType()))
+      continue;
+    if (mlir::failed(ownership_state::add(state, result, +1, ifOp, aliases)))
+      return mlir::failure();
+  }
+  return mlir::success();
+}
+
+} // namespace structured_control
+
 namespace nested_effect {
 
 mlir::LogicalResult verifyAbsent(mlir::Operation &op) {
@@ -258,6 +377,8 @@ mlir::LogicalResult verifyAbsent(mlir::Operation &op) {
     }
     return mlir::success();
   }
+  if (mlir::isa<mlir::scf::IfOp>(&op))
+    return mlir::success();
 
   mlir::Operation *bad = nullptr;
   for (mlir::Region &region : op.getRegions()) {
@@ -281,6 +402,14 @@ namespace effect {
 mlir::LogicalResult apply(mlir::Operation &op, ownership_state::State &state,
                           mlir::Block &entry, const AliasAnalysis &aliases,
                           bool entryArgsBorrowed) {
+  if (auto ifOp = mlir::dyn_cast<mlir::scf::IfOp>(&op)) {
+    if (mlir::failed(
+            borrow::verifyUses(state, op, entry, aliases, entryArgsBorrowed)))
+      return mlir::failure();
+    return structured_control::apply(ifOp, state, entry, aliases,
+                                     entryArgsBorrowed);
+  }
+
   if (mlir::failed(
           borrow::verifyUses(state, op, entry, aliases, entryArgsBorrowed)))
     return mlir::failure();

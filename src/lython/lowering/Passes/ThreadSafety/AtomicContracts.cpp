@@ -323,6 +323,8 @@ verifier::refcount::RetainPremise::verify(mlir::Operation *op) {
     return op->emitOpError("entry-borrowed retain premise does not target a "
                            "function entry argument resource");
   }
+  if (*premise == ThreadSafetyAttrs::kPremiseCapturedBorrowed)
+    return mlir::success();
   if (*premise == ThreadSafetyAttrs::kPremiseAggregateBorrow) {
     if (retain::aggregateBorrow(op))
       return mlir::success();
