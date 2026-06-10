@@ -589,8 +589,9 @@ mlir::LogicalResult verify(mlir::Operation *funcLike, mlir::Region &body,
       continue;
     }
 
-    for (auto [successorIndex, successor] :
-         llvm::enumerate(block->getSuccessors())) {
+    for (unsigned successorIndex = 0, e = terminator->getNumSuccessors();
+         successorIndex != e; ++successorIndex) {
+      mlir::Block *successor = terminator->getSuccessor(successorIndex);
       ownership_state::State edgeState = state;
       if (mlir::failed(successor_arg::addProducedOwnership(
               terminator, successorIndex, edgeState, aliases)))

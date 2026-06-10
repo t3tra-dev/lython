@@ -445,11 +445,21 @@ static bool reaches(mlir::Block *from, mlir::Block *to) {
   if (from == to)
     return true;
 
+  auto enqueueSuccessors = [](mlir::Block *block,
+                              mlir::SmallVectorImpl<mlir::Block *> &worklist) {
+    if (!block)
+      return;
+    mlir::Operation *terminator = block->getTerminator();
+    if (!terminator)
+      return;
+    for (mlir::Block *successor : terminator->getSuccessors())
+      worklist.push_back(successor);
+  };
+
   mlir::SmallVector<mlir::Block *> worklist;
   ::llvm::SmallPtrSet<mlir::Block *, 16> seen;
   seen.insert(from);
-  for (mlir::Block *successor : from->getSuccessors())
-    worklist.push_back(successor);
+  enqueueSuccessors(from, worklist);
 
   while (!worklist.empty()) {
     mlir::Block *block = worklist.pop_back_val();
@@ -457,8 +467,7 @@ static bool reaches(mlir::Block *from, mlir::Block *to) {
       continue;
     if (block == to)
       return true;
-    for (mlir::Block *successor : block->getSuccessors())
-      worklist.push_back(successor);
+    enqueueSuccessors(block, worklist);
   }
   return false;
 }

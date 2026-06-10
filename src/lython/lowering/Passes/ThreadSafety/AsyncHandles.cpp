@@ -413,8 +413,9 @@ verifier::async_runtime::Handles::balance(mlir::Operation *funcLike,
       continue;
     }
 
-    for (auto [successorIndex, successor] :
-         ::llvm::enumerate(block->getSuccessors())) {
+    for (unsigned successorIndex = 0, e = terminator->getNumSuccessors();
+         successorIndex != e; ++successorIndex) {
+      mlir::Block *successor = terminator->getSuccessor(successorIndex);
       handle::HandleState edgeState = state;
       handle::remapSuccessor(terminator, successorIndex, edgeState);
       frame::dropOnSuspendDefault(terminator, successor, edgeState);

@@ -440,7 +440,11 @@ private:
       BlockSet liveInSuccessors;
       BlockSet noLiveInSuccessors;
 
-      for (mlir::Block *succ : block.getSuccessors()) {
+      mlir::Operation *terminator = block.getTerminator();
+      if (!terminator)
+        continue;
+
+      for (mlir::Block *succ : terminator->getSuccessors()) {
         const mlir::LivenessBlockInfo *succLiveness =
             liveness.getLiveness(succ);
         bool anyLiveIn = false;

@@ -46,6 +46,8 @@ jobs:
           cmake --build build -j$(nproc)
 
       - name: Test
+        env:
+          LLVM_SYMBOLIZER_PATH: /usr/bin/llvm-symbolizer-20
         run: |
           ./build/bin/lyc jit examples/hello.py
           ./build/bin/lyc jit examples/oop.py
