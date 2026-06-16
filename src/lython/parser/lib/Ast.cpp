@@ -1,6 +1,5 @@
-#include "lython/parser/Ast.h"
-
-#include "lython/parser/CpythonSpec.h"
+#include "Ast.h"
+#include "CpythonSpec.h"
 
 #include <optional>
 #include <sstream>

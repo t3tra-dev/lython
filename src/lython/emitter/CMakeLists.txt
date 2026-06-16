@@ -36,6 +36,7 @@ target_link_libraries(LythonEmitter
     LLVM
     PRIVATE
     PyDialect
+    LythonProtocolEvidence
 )
 
 add_dependencies(LythonEmitter PyDialectIncGen)

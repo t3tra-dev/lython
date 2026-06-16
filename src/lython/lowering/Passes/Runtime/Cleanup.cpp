@@ -1,6 +1,5 @@
 #include "Passes/Runtime/Cleanup.h"
 
-#include "Common/LoweringUtils.h"
 #include "Common/Object.h"
 #include "Common/RuntimeSupport.h"
 
@@ -10,7 +9,6 @@
 #include "mlir/Dialect/LLVMIR/FunctionCallUtils.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -211,6 +209,13 @@ mlir::Value materialize(mlir::Value value, mlir::OpBuilder &builder) {
     if (structTypeOf(cast.getOperand(0)))
       return cast.getOperand(0);
 
+  if (cast->getNumOperands() == cast->getNumResults() &&
+      result.getResultNumber() < cast->getNumOperands()) {
+    mlir::Value source = cast.getOperand(result.getResultNumber());
+    if (structTypeOf(source))
+      return source;
+  }
+
   if (auto source = directExtractSource(cast))
     return extract(result, *source, builder);
   if (auto source = nestedExtractSource(cast))
@@ -358,7 +363,8 @@ bool foldBareMemRefPointer(mlir::UnrealizedConversionCastOp cast,
 bool eraseDead(mlir::Operation *container) {
   llvm::SmallVector<mlir::UnrealizedConversionCastOp> deadCasts;
   container->walk([&](mlir::UnrealizedConversionCastOp cast) {
-    if (cast->use_empty())
+    if (llvm::all_of(cast->getResults(),
+                     [](mlir::Value result) { return result.use_empty(); }))
       deadCasts.push_back(cast);
   });
   for (auto cast : deadCasts)
@@ -1339,9 +1345,8 @@ bool unreachableBlocks(mlir::ModuleOp module) {
   do {
     changed = false;
     llvm::SmallVector<mlir::Region *> regions;
-    module.walk([&](mlir::func::FuncOp func) {
-      regions.push_back(&func.getBody());
-    });
+    module.walk(
+        [&](mlir::func::FuncOp func) { regions.push_back(&func.getBody()); });
     module.walk([&](mlir::LLVM::LLVMFuncOp func) {
       if (!func.isExternal())
         regions.push_back(&func.getBody());
@@ -1403,11 +1408,25 @@ bool pyMultiCasts(mlir::Operation *container) {
           break;
         }
       }
-      if (!compatible)
-        continue;
-      for (auto [result, operand] :
-           llvm::zip(cast.getResults(), source.getOperands()))
-        result.replaceAllUsesWith(operand);
+      if (compatible) {
+        for (auto [result, operand] :
+             llvm::zip(cast.getResults(), source.getOperands()))
+          result.replaceAllUsesWith(operand);
+      } else {
+        bool pyFreeBoundary =
+            llvm::none_of(source.getOperands(),
+                          [](mlir::Value operand) {
+                            return isPyType(operand.getType());
+                          }) &&
+            llvm::none_of(cast.getResultTypes(),
+                          [](mlir::Type type) { return isPyType(type); });
+        if (!pyFreeBoundary)
+          continue;
+        mlir::OpBuilder builder(cast);
+        auto replacement = builder.create<mlir::UnrealizedConversionCastOp>(
+            cast.getLoc(), cast.getResultTypes(), source.getOperands());
+        cast->replaceAllUsesWith(replacement.getOperation());
+      }
       cast.erase();
       if (source->use_empty())
         source.erase();
@@ -1454,6 +1473,17 @@ bool pointerRoundTrips(mlir::Operation *container) {
   return pointer_roundtrip::cleanup(container);
 }
 
+bool deadUnrealizedCasts(mlir::Operation *container) {
+  llvm::SmallVector<mlir::UnrealizedConversionCastOp> deadCasts;
+  container->walk([&](mlir::UnrealizedConversionCastOp cast) {
+    if (cast->use_empty())
+      deadCasts.push_back(cast);
+  });
+  for (mlir::UnrealizedConversionCastOp cast : deadCasts)
+    cast.erase();
+  return !deadCasts.empty();
+}
+
 bool llvmFuncReturns(mlir::Operation *container) {
   llvm::SmallVector<mlir::func::ReturnOp> returns;
   container->walk([&](mlir::func::ReturnOp ret) {
@@ -1486,6 +1516,7 @@ bool finalBoundary(mlir::ModuleOp module) {
     changed |= memrefRuntimeCalls(module);
     // Runtime-call rewriting can expose descriptor materialization casts.
     changed |= memrefDescriptorCasts(module);
+    changed |= deadUnrealizedCasts(module);
     changed |= pointerRoundTrips(module);
     changed |= llvmFuncReturns(module);
     everChanged |= changed;

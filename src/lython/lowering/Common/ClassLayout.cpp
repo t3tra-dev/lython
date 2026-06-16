@@ -4,7 +4,6 @@
 #include "Common/RuntimeSupport.h"
 #include "cpp/PyTypeObject.h"
 
-#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/STLExtras.h"
@@ -133,6 +132,13 @@ mlir::MemRefType Payload::lockMemRefType(mlir::MLIRContext *ctx) {
   return mlir::MemRefType::get({1}, mlir::IntegerType::get(ctx, 32));
 }
 
+mlir::MemRefType Payload::tableMemRefType(mlir::MLIRContext *ctx) {
+  auto layout = mlir::StridedLayoutAttr::get(ctx, mlir::ShapedType::kDynamic,
+                                             llvm::ArrayRef<int64_t>{1});
+  return mlir::MemRefType::get({mlir::ShapedType::kDynamic},
+                               object_abi::Type::loweredStorage(ctx), layout);
+}
+
 mlir::MemRefType Payload::fieldMemRefType(mlir::Type fieldStorageType,
                                           mlir::MLIRContext *ctx) {
   auto layout = mlir::StridedLayoutAttr::get(ctx, mlir::ShapedType::kDynamic,
@@ -152,22 +158,24 @@ static void appendPayloadMetadata(mlir::MLIRContext *ctx,
 
 static void assignStorage(Layout &layout, mlir::MLIRContext *ctx) {
   llvm::SmallVector<mlir::Type, 8> payloadTypes;
+  appendPayloadMetadata(ctx, payloadTypes);
   for (const FieldInfo &field : layout.fields)
     payloadTypes.append(field.storageParts.begin(), field.storageParts.end());
-  appendPayloadMetadata(ctx, payloadTypes);
   layout.headerType = Header::memrefType(ctx);
   layout.storageType = mlir::LLVM::LLVMStructType::getLiteral(
       ctx, llvm::ArrayRef<mlir::Type>(payloadTypes));
   layout.payloadPartTypes.clear();
-  for (size_t index = 0, end = payloadTypes.size() - 1; index != end; ++index)
-    layout.payloadPartTypes.push_back(
-        Payload::fieldMemRefType(payloadTypes[index], ctx));
   layout.payloadPartTypes.push_back(Payload::lockMemRefType(ctx));
+  for (const FieldInfo &field : layout.fields)
+    for (mlir::Type storagePart : field.storageParts)
+      layout.payloadPartTypes.push_back(
+          Payload::fieldMemRefType(storagePart, ctx));
   mlir::Type headerDescriptorType =
       descriptorStorageType(layout.headerType, ctx);
-  llvm::SmallVector<mlir::Type, 8> descriptors{headerDescriptorType};
-  for (mlir::MemRefType payloadPartType : layout.payloadPartTypes)
-    descriptors.push_back(descriptorStorageType(payloadPartType, ctx));
+  mlir::Type tableDescriptorType =
+      descriptorStorageType(Payload::tableMemRefType(ctx), ctx);
+  llvm::SmallVector<mlir::Type, 2> descriptors{headerDescriptorType,
+                                               tableDescriptorType};
   layout.objectType = objectType(ctx, descriptors);
 }
 
@@ -271,7 +279,7 @@ int64_t Payload::fieldPartCount(const Layout &layout, int64_t fieldIndex) {
 }
 
 int64_t Payload::lockPartIndex(const Layout &layout) {
-  return static_cast<int64_t>(layout.payloadPartTypes.size()) - 1;
+  return layout.payloadPartTypes.empty() ? -1 : 0;
 }
 
 mlir::MemRefType Payload::fieldPartType(const Layout &layout,
@@ -518,8 +526,7 @@ mlir::MemRefType carrierType(mlir::LLVM::LLVMStructType objectType,
 void partsValueTypes(const Layout &layout,
                      llvm::SmallVectorImpl<mlir::Type> &types) {
   types.push_back(layout.headerType);
-  for (mlir::MemRefType payloadPart : Payload::partTypes(layout))
-    types.push_back(payloadPart);
+  types.push_back(Payload::tableMemRefType(layout.headerType.getContext()));
 }
 
 static mlir::FailureOr<Layout>
@@ -551,12 +558,7 @@ static mlir::LogicalResult appendClassFields(
     }
     auto existing = fieldIndexes.find(stringAttr.getValue());
     if (existing != fieldIndexes.end()) {
-      if (fields[existing->second].second.getValue() != type.getValue()) {
-        return from->emitError("inherited field '")
-               << stringAttr.getValue()
-               << "' has incompatible static types in class '"
-               << owner.getSymNameAttr().getValue() << "'";
-      }
+      fields[existing->second] = {stringAttr, type};
       continue;
     }
     fieldIndexes[stringAttr.getValue()] = static_cast<unsigned>(fields.size());
@@ -597,14 +599,14 @@ fieldStorageType(mlir::Operation *from, mlir::Type logicalType,
         build(from, fieldClassType, typeConverter, activeClasses);
     if (mlir::failed(layout))
       return {};
-    storageParts.reserve(class_layout::Object::partCount(layout->objectType));
-    mlir::Type headerDescriptor =
-        descriptorStorageType(layout->headerType, ctx);
-    if (!headerDescriptor)
-      return {};
-    storageParts.push_back(headerDescriptor);
-    for (mlir::MemRefType partType : Payload::partTypes(*layout)) {
-      mlir::Type descriptor = descriptorStorageType(partType, ctx);
+    llvm::SmallVector<mlir::Type, 2> abiParts;
+    partsValueTypes(*layout, abiParts);
+    storageParts.reserve(abiParts.size());
+    for (mlir::Type abiPart : abiParts) {
+      auto memrefType = mlir::dyn_cast<mlir::MemRefType>(abiPart);
+      if (!memrefType)
+        return {};
+      mlir::Type descriptor = descriptorStorageType(memrefType, ctx);
       if (!descriptor)
         return {};
       storageParts.push_back(descriptor);
@@ -688,7 +690,7 @@ build(mlir::Operation *from, ClassType classType,
     return layout;
   }
 
-  int64_t nextPayloadPart = 0;
+  int64_t nextPayloadPart = 1;
   for (auto [stringAttr, type] : *schema) {
     mlir::Type logicalType = type.getValue();
     llvm::SmallVector<mlir::Type, 4> storageParts;

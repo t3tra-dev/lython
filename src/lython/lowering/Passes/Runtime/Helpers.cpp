@@ -1,12 +1,8 @@
 #include "Passes/Runtime/Helpers.h"
 
-#include "Common/LoweringUtils.h"
-#include "Passes/OwnershipAnalysis.h"
-
-#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "Common/Container.h"
 #include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/SmallVector.h"
 
 #include <string>
 
@@ -69,6 +65,68 @@ mlir::Value stripPublishCasts(mlir::Value value) {
 
 namespace lowering::runtime::async_args {
 
+static void setFunctionArgumentStringAttr(mlir::Operation *funcLike,
+                                          unsigned argIndex,
+                                          llvm::StringRef attrName,
+                                          llvm::StringRef value) {
+  if (!funcLike)
+    return;
+  mlir::Builder builder(funcLike->getContext());
+  if (auto function = mlir::dyn_cast<mlir::FunctionOpInterface>(funcLike)) {
+    if (argIndex < function.getNumArguments())
+      function.setArgAttr(argIndex, attrName, builder.getStringAttr(value));
+    return;
+  }
+
+  if (funcLike->getNumRegions() == 0 || funcLike->getRegion(0).empty())
+    return;
+  unsigned numArgs = funcLike->getRegion(0).front().getNumArguments();
+  if (argIndex >= numArgs)
+    return;
+
+  auto existing = funcLike->getAttrOfType<mlir::ArrayAttr>("arg_attrs");
+  llvm::SmallVector<mlir::Attribute> attrs;
+  attrs.reserve(numArgs);
+  for (unsigned index = 0; index < numArgs; ++index) {
+    if (existing && index < existing.size())
+      attrs.push_back(existing[index]);
+    else
+      attrs.push_back(builder.getDictionaryAttr({}));
+  }
+
+  auto dict = mlir::dyn_cast<mlir::DictionaryAttr>(attrs[argIndex]);
+  mlir::NamedAttrList named(dict ? dict : builder.getDictionaryAttr({}));
+  named.set(attrName, builder.getStringAttr(value));
+  attrs[argIndex] = named.getDictionary(funcLike->getContext());
+  funcLike->setAttr("arg_attrs", builder.getArrayAttr(attrs));
+}
+
+static void markContainerDescriptor(mlir::Operation *funcLike,
+                                    mlir::Type logicalType,
+                                    unsigned logicalIndex,
+                                    unsigned flattenedIndex,
+                                    unsigned convertedWidth) {
+  auto kind = container::Descriptor::kindNameForLogicalType(logicalType);
+  if (!kind)
+    return;
+  std::string group =
+      (llvm::Twine(*kind) + ".arg" + llvm::Twine(logicalIndex)).str();
+  for (unsigned slot = 0; slot < convertedWidth; ++slot) {
+    llvm::StringRef component =
+        container::Descriptor::componentForLogicalType(logicalType, slot);
+    if (component.empty())
+      continue;
+    unsigned argIndex = flattenedIndex + slot;
+    setFunctionArgumentStringAttr(
+        funcLike, argIndex, ContainerSafetyAttrs::kDescriptorGroup, group);
+    setFunctionArgumentStringAttr(funcLike, argIndex,
+                                  ContainerSafetyAttrs::kDescriptorKind, *kind);
+    setFunctionArgumentStringAttr(funcLike, argIndex,
+                                  ContainerSafetyAttrs::kDescriptorComponent,
+                                  component);
+  }
+}
+
 void mark(mlir::Operation *funcLike, llvm::ArrayRef<mlir::Type> inputs,
           const PyLLVMTypeConverter &typeConverter,
           bool trailingExceptionCell) {
@@ -82,13 +140,15 @@ void mark(mlir::Operation *funcLike, llvm::ArrayRef<mlir::Type> inputs,
         converted.empty())
       return;
 
-    if (mlir::isa<CoroutineType, FutureType, TaskType>(inputType) &&
-        converted.size() >= 2) {
+    markContainerDescriptor(funcLike, inputType, static_cast<unsigned>(index),
+                            flattenedIndex,
+                            static_cast<unsigned>(converted.size()));
+
+    if (isCoroutineProtocolType(inputType) && converted.size() >= 2) {
+      ::py::async_runtime::RuntimeHandle::markArgument(funcLike,
+                                                       flattenedIndex);
       ::py::async_runtime::ExceptionCell::markArgument(funcLike,
                                                        flattenedIndex + 1);
-      if (mlir::isa<TaskType>(inputType) && converted.size() >= 3)
-        ::py::async_runtime::CancelFlag::markArgument(funcLike,
-                                                      flattenedIndex + 2);
     } else if (trailingExceptionCell && index + 1 == inputs.size() &&
                (::py::async_runtime::isExceptionCellType(inputType) ||
                 ::py::async_runtime::isLoweredExceptionCellType(inputType))) {

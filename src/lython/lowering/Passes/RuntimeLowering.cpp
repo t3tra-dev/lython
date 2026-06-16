@@ -1,9 +1,9 @@
 // This file implements the main RuntimeLoweringPass which orchestrates the
 // complete lowering pipeline from Py dialect to LLVM dialect. It coordinates
 // the various conversion phases:
-//   1. Function conversion (py.func -> func.func)
-//   2. Function object conversion (py.func_object -> references)
-//   3. Call conversion (py.call_vector -> runtime calls or direct calls)
+//   1. Function conversion (py.callable.func -> func.func)
+//   2. Callable object conversion (py.callable.object -> references)
+//   3. Call conversion (py.call -> runtime calls or direct calls)
 //   4. mlir::Value conversion (py.* ops -> LLVM ops via runtime calls)
 //
 // Individual lowering patterns are implemented in separate files:
@@ -17,7 +17,6 @@
 #include "Common/LoweringUtils.h"
 #include "Common/RuntimeLibrary.h"
 #include "Common/RuntimeSupport.h"
-#include "Passes/OwnershipAnalysis.h"
 #include "Passes/Runtime/Async.h"
 #include "Passes/Runtime/Cleanup.h"
 #include "Passes/Runtime/Conversion.h"
@@ -323,6 +322,24 @@ mlir::LogicalResult verifyPyTypesLowered(mlir::ModuleOp module) {
   diagnostic << " in " << (offenderIsOperand ? "operand" : "result") << " #"
              << offenderIndex << " of type " << offenderType << " on op '"
              << offender->getName() << "'";
+  if (auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(offender)) {
+    diagnostic << "; operands = " << cast.getOperandTypes()
+               << ", results = " << cast.getResultTypes()
+               << ", op = " << *cast.getOperation();
+    diagnostic << ", users = [";
+    bool firstUser = true;
+    for (mlir::Operation *user : cast.getResult(0).getUsers()) {
+      if (!firstUser)
+        diagnostic << ", ";
+      firstUser = false;
+      diagnostic << *user;
+    }
+    diagnostic << "]";
+  }
+  if (auto parentFunc = offender->getParentOfType<mlir::func::FuncOp>())
+    diagnostic << ", parent func = " << parentFunc.getName();
+  if (auto parentLLVMFunc = offender->getParentOfType<mlir::LLVM::LLVMFuncOp>())
+    diagnostic << ", parent llvm func = " << parentLLVMFunc.getName();
   return mlir::failure();
 }
 
@@ -361,6 +378,11 @@ mlir::LogicalResult verifyFrontendTypesFinalized(mlir::ModuleOp module) {
       return mlir::WalkResult::interrupt();
     }
     if (auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(op)) {
+      // The runtime library fabricates descriptor values (tagged longs)
+      // through explicitly marked bridge casts; only unmarked casts indicate
+      // a frontend type-inference leak.
+      if (cast->hasAttr("ly.runtime.descriptor_bridge"))
+        return mlir::WalkResult::advance();
       materialization = cast;
       return mlir::WalkResult::interrupt();
     }
@@ -648,10 +670,10 @@ struct RuntimeLoweringPass
       return;
     }
 
-    // Phase 1a: Function definition conversion (py.func -> func.func).
-    // Keep py.return conversion separate; moving a py.func body and replacing
-    // nested returns in the same delayed conversion can invalidate commit
-    // ordering for multi-result lowered values.
+    // Phase 1a: Function definition conversion (py.callable.func -> func.func).
+    // Keep py.return conversion separate; moving a py.callable.func body and
+    // replacing nested returns in the same delayed conversion can invalidate
+    // commit ordering for multi-result lowered values.
 
     auto runFuncConversion = [&]() -> mlir::LogicalResult {
       return lowering::runtime::conversion::runPartial(
@@ -662,7 +684,7 @@ struct RuntimeLoweringPass
           },
           [&](mlir::ConversionTarget &target) {
             lowering::runtime::conversion::configurePyTarget(target);
-            target.addIllegalOp<FuncOp>();
+            target.addIllegalOp<CallableFuncOp>();
           },
           materializationFilter);
     };
@@ -701,9 +723,9 @@ struct RuntimeLoweringPass
       lowering::runtime::helpers::synthesizePublishedBorrow(module);
     }
 
-    // Phase 2: Function object conversion (py.func_object -> references)
+    // Phase 2: Callable object conversion (py.callable.object -> references)
 
-    auto runFuncObjectConversion = [&]() -> mlir::LogicalResult {
+    auto runCallableObjectConversion = [&]() -> mlir::LogicalResult {
       return lowering::runtime::conversion::runPartial(
           module, ctx,
           [&](mlir::RewritePatternSet &patterns) {
@@ -712,13 +734,13 @@ struct RuntimeLoweringPass
           },
           [&](mlir::ConversionTarget &target) {
             lowering::runtime::conversion::configurePyTarget(target);
-            target.addIllegalOp<FuncObjectOp, MakeFunctionOp>();
+            target.addIllegalOp<CallableObjectOp, MakeFunctionOp>();
           },
           materializationFilter);
     };
 
-    if (mlir::failed(
-            timedRuntimePhase("func-object", runFuncObjectConversion))) {
+    if (mlir::failed(timedRuntimePhase("callable-object",
+                                       runCallableObjectConversion))) {
       signalPassFailure();
       return;
     }
@@ -728,7 +750,7 @@ struct RuntimeLoweringPass
       optimizer::scalar::foldIntConstants(module);
     }
 
-    // Phase 3: Call conversion (py.call_vector/py.call -> calls)
+    // Phase 3: Call conversion (py.call -> calls)
 
     auto runCallConversion = [&]() -> mlir::LogicalResult {
       return lowering::runtime::conversion::runPartial(
@@ -739,7 +761,9 @@ struct RuntimeLoweringPass
           },
           [&](mlir::ConversionTarget &target) {
             lowering::runtime::conversion::configurePyTarget(target);
-            target.addIllegalOp<CallVectorOp, CallOp, InvokeOp>();
+            target.addIllegalOp<EnterOp, ExitOp, AEnterOp, AExitOp, SendOp,
+                                ThrowOp, CloseOp, ASendOp, AThrowOp, ACloseOp,
+                                IterOp, NextOp, CallOp, InvokeOp>();
           },
           materializationFilter);
     };

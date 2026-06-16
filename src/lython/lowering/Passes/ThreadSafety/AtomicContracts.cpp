@@ -501,7 +501,6 @@ enum class Target {
   ClassRefcount,
   ContainerLock,
   ClassLock,
-  AsyncCancelRequest,
 };
 
 struct ContainerSlot {
@@ -546,8 +545,6 @@ static constexpr Spec kSpecs[] = {
      /*retainPremise=*/false, /*acquireControlFlow=*/true},
     {ThreadSafetyAttrs::kRoleClassLockRelease, Target::ClassLock, 0,
      OrderingRule::Release, "class lock release"},
-    {ThreadSafetyAttrs::kRoleAsyncCancelRequest, Target::AsyncCancelRequest, 1,
-     OrderingRule::AcqRel, "async cancel request"},
 };
 
 static const Spec *lookup(::llvm::StringRef role) {
@@ -749,22 +746,6 @@ verifyClassLock(mlir::memref::AtomicRMWOp op, ::llvm::StringRef ordering,
   return mlir::success();
 }
 
-static mlir::LogicalResult
-verifyAsyncCancelRequest(mlir::memref::AtomicRMWOp op,
-                         ::llvm::StringRef ordering, const Spec &spec) {
-  auto flagIndex = op.getIndices().size() == 1
-                       ? constant::index(op.getIndices().front())
-                       : std::nullopt;
-  if (!flagIndex || *flagIndex != 0)
-    return op->emitOpError("async cancel request must target flag slot 0");
-  if (mlir::failed(verifyKindValue(op, mlir::arith::AtomicRMWKind::maxu,
-                                   spec.value, spec.what, "be maxu 1")) ||
-      mlir::failed(verifyOrdering(op.getOperation(), ordering, spec.ordering,
-                                  spec.what)))
-    return mlir::failure();
-  return mlir::success();
-}
-
 } // namespace atomic_rmw
 
 namespace generic_refcount {
@@ -876,8 +857,6 @@ verifier::memref::AtomicRMW::verify(mlir::memref::AtomicRMWOp op) {
     return atomic_rmw::verifyClassLock(op, *ordering, spec->value,
                                        spec->ordering, spec->what,
                                        spec->acquireControlFlow);
-  case atomic_rmw::Target::AsyncCancelRequest:
-    return atomic_rmw::verifyAsyncCancelRequest(op, *ordering, *spec);
   }
 
   return op->emitOpError("unsupported ly.atomic.role: ") << *role;

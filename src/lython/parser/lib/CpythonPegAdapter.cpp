@@ -1,6 +1,6 @@
 #include "CpythonPegAdapter.h"
 
-#include "lython/parser/CpythonSpec.h"
+#include "CpythonSpec.h"
 
 #include <initializer_list>
 

@@ -36,6 +36,11 @@ static mlir::memref::LoadOp memrefSlotLoad(mlir::Value value) {
 
 static mlir::LLVM::LoadOp llvmSlotLoad(mlir::Value value) {
   value = pointer::stripCasts(value);
+  // Multi-part slot values (a str slot is a struct of two descriptors) reach
+  // the retain through nested extractvalue projections of the marked load;
+  // projections preserve the loaded resource.
+  if (auto extract = value.getDefiningOp<mlir::LLVM::ExtractValueOp>())
+    return llvmSlotLoad(extract.getContainer());
   if (auto load = value.getDefiningOp<mlir::LLVM::LoadOp>())
     if (load->hasAttr(ContainerSafetyAttrs::kAccessGroup))
       return load;

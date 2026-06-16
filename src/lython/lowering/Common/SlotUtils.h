@@ -16,6 +16,7 @@ namespace py {
 struct Slot {
   struct ClassCarrierParts {
     mlir::Value header;
+    mlir::Value payloadTable;
     llvm::SmallVector<mlir::Value, 8> payloadParts;
   };
 

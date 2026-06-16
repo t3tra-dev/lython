@@ -1,15 +1,15 @@
 #include "BuilderImpl.h"
 
-#include "lython/parser/Parser.h"
+#include "Parser.h"
 
 #include "mlir/Dialect/Async/IR/Async.h"
-
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <charconv>
 #include <cstring>
 #include <functional>
+#include <set>
 #include <system_error>
 
 namespace lython::emitter {
@@ -50,6 +50,27 @@ std::optional<double> staticNumericValue(const parser::Node &node) {
       return -*value;
   }
   return std::nullopt;
+}
+
+void collectProtocolMethodNames(const protocols::Table &table,
+                                llvm::StringRef protocolName,
+                                std::set<std::string> &out,
+                                std::set<std::string> &visited,
+                                unsigned depth = 0) {
+  if (depth > 16)
+    return;
+  std::string key = protocolName.str();
+  if (!visited.insert(key).second)
+    return;
+  const protocols::ProtocolInfo *info = table.lookup(protocolName);
+  if (!info)
+    return;
+  for (const auto &[methodName, ignored] : info->methods) {
+    (void)ignored;
+    out.insert(methodName);
+  }
+  for (const protocols::ProtocolBase &base : info->bases)
+    collectProtocolMethodNames(table, base.name, out, visited, depth + 1);
 }
 
 bool typeInferenceDependsOnEnvironmentUncached(const parser::Node &node) {
@@ -99,6 +120,34 @@ bool isRangeCall(const parser::Node &node) {
     return false;
   const std::string *name = stringField(**func, "id");
   return name && *name == "range";
+}
+
+bool isEllipsisConstant(const parser::NodePtr &expr) {
+  if (!expr || expr->kind != "Constant")
+    return false;
+  const parser::FieldValue *value = valueField(*expr, "value");
+  return value && std::holds_alternative<parser::Ellipsis>(*value);
+}
+
+bool isCallableEllipsisContract(py::CallableType signature) {
+  if (!signature.getPositionalTypes().empty() ||
+      !signature.getKwOnlyTypes().empty() || !signature.hasVararg() ||
+      !signature.hasKwarg() || signature.hasParameterMetadata())
+    return false;
+  auto varargTuple = mlir::dyn_cast<py::TupleType>(signature.getVarargType());
+  if (!varargTuple || varargTuple.getElementTypes().size() != 1 ||
+      !mlir::isa<py::ObjectType>(varargTuple.getElementTypes().front()))
+    return false;
+  auto kwargsDict = mlir::dyn_cast<py::DictType>(signature.getKwargType());
+  return kwargsDict && mlir::isa<py::StrType>(kwargsDict.getKeyType()) &&
+         mlir::isa<py::ObjectType>(kwargsDict.getValueType());
+}
+
+mlir::Type callableVarargElementType(mlir::Type varargType) {
+  auto tuple = mlir::dyn_cast_if_present<py::TupleType>(varargType);
+  if (!tuple || tuple.getElementTypes().size() != 1)
+    return {};
+  return tuple.getElementTypes().front();
 }
 
 struct LambdaOracle final : typing::Oracle {
@@ -160,10 +209,33 @@ Builder::Impl::typeTermFromType(mlir::Type type) const {
     return typing::Term::con("str");
   if (mlir::isa<py::NoneType>(type))
     return typing::Term::con("None");
+  if (mlir::isa<py::ObjectType>(type))
+    return typing::Term::con("object");
   if (mlir::isa<py::ExceptionType>(type))
     return typing::Term::con("Exception");
+  if (mlir::isa<py::TracebackType>(type))
+    return typing::Term::con("TracebackType");
+  if (auto typeTy = mlir::dyn_cast<py::TypeType>(type)) {
+    std::optional<typing::Term> instance =
+        typeTermFromType(typeTy.getInstanceType());
+    if (!instance)
+      return std::nullopt;
+    return typing::Term::con("type", {*instance});
+  }
   if (auto classTy = mlir::dyn_cast<py::ClassType>(type))
     return typing::Term::con("class:" + classTy.getClassName().str());
+  if (auto protocolTy = mlir::dyn_cast<py::ProtocolType>(type)) {
+    std::vector<typing::Term> args;
+    args.reserve(protocolTy.getArguments().size());
+    for (mlir::Type argType : protocolTy.getArguments()) {
+      std::optional<typing::Term> arg = typeTermFromType(argType);
+      if (!arg)
+        return std::nullopt;
+      args.push_back(*arg);
+    }
+    return typing::Term::con("protocol:" + protocolTy.getProtocolName().str(),
+                             args);
+  }
   if (auto listTy = mlir::dyn_cast<py::ListType>(type)) {
     std::optional<typing::Term> element =
         typeTermFromType(listTy.getElementType());
@@ -189,26 +261,16 @@ Builder::Impl::typeTermFromType(mlir::Type type) const {
     }
     return typing::Term::con("tuple", elements);
   }
-  if (auto coroTy = mlir::dyn_cast<py::CoroutineType>(type)) {
-    std::optional<typing::Term> result =
-        typeTermFromType(coroTy.getResultType());
-    if (!result)
-      return std::nullopt;
-    return typing::Term::con("coro", {*result});
-  }
-  if (auto taskTy = mlir::dyn_cast<py::TaskType>(type)) {
-    std::optional<typing::Term> result =
-        typeTermFromType(taskTy.getResultType());
-    if (!result)
-      return std::nullopt;
-    return typing::Term::con("task", {*result});
-  }
-  if (auto futureTy = mlir::dyn_cast<py::FutureType>(type)) {
-    std::optional<typing::Term> result =
-        typeTermFromType(futureTy.getResultType());
-    if (!result)
-      return std::nullopt;
-    return typing::Term::con("future", {*result});
+  if (auto unionTy = mlir::dyn_cast<py::UnionType>(type)) {
+    std::vector<typing::Term> members;
+    members.reserve(unionTy.getMemberTypes().size());
+    for (mlir::Type memberType : unionTy.getMemberTypes()) {
+      std::optional<typing::Term> member = typeTermFromType(memberType);
+      if (!member)
+        return std::nullopt;
+      members.push_back(*member);
+    }
+    return typing::Term::con("union", members);
   }
   if (auto asyncValue = mlir::dyn_cast<mlir::async::ValueType>(type)) {
     std::optional<typing::Term> value =
@@ -217,10 +279,11 @@ Builder::Impl::typeTermFromType(mlir::Type type) const {
       return std::nullopt;
     return typing::Term::con("async.value", {*value});
   }
-  if (auto funcTy = mlir::dyn_cast<py::FuncType>(type)) {
-    py::FuncSignatureType signature = funcTy.getSignature();
+  if (py::CallableType signature = py::getCallableContract(type)) {
     std::vector<typing::Term> args;
     std::vector<typing::Term> kwonly;
+    std::vector<typing::Term> vararg;
+    std::vector<typing::Term> kwarg;
     std::vector<typing::Term> results;
     args.reserve(signature.getPositionalTypes().size());
     kwonly.reserve(signature.getKwOnlyTypes().size());
@@ -237,13 +300,31 @@ Builder::Impl::typeTermFromType(mlir::Type type) const {
         return std::nullopt;
       kwonly.push_back(*arg);
     }
+    if (signature.hasVararg()) {
+      std::optional<typing::Term> arg =
+          typeTermFromType(signature.getVarargType());
+      if (!arg)
+        return std::nullopt;
+      vararg.push_back(*arg);
+    }
+    if (signature.hasKwarg()) {
+      std::optional<typing::Term> arg =
+          typeTermFromType(signature.getKwargType());
+      if (!arg)
+        return std::nullopt;
+      kwarg.push_back(*arg);
+    }
     for (mlir::Type resultType : signature.getResultTypes()) {
       std::optional<typing::Term> result = typeTermFromType(resultType);
       if (!result)
         return std::nullopt;
       results.push_back(*result);
     }
-    return typing::Term::func(args, results, kwonly);
+    std::optional<unsigned> positionalOnlyCount;
+    if (signature.hasParameterMetadata())
+      positionalOnlyCount = signature.getPositionalOnlyCount();
+    return typing::Term::func(args, results, kwonly, vararg, kwarg,
+                              positionalOnlyCount);
   }
   if (auto intTy = mlir::dyn_cast<mlir::IntegerType>(type))
     return typing::Term::con("Int[" + std::to_string(intTy.getWidth()) + "]");
@@ -272,6 +353,10 @@ Builder::Impl::typeFromTypeTerm(const typing::Term &term) {
     llvm::SmallVector<mlir::Type> args;
     llvm::SmallVector<mlir::Type> kwonly;
     llvm::SmallVector<mlir::Type> results;
+    mlir::Type vararg;
+    mlir::Type kwarg;
+    if (term.vararg.size() > 1 || term.kwarg.size() > 1)
+      return std::nullopt;
     args.reserve(term.args.size());
     kwonly.reserve(term.kwonly.size());
     results.reserve(term.results.size());
@@ -287,15 +372,27 @@ Builder::Impl::typeFromTypeTerm(const typing::Term &term) {
         return std::nullopt;
       kwonly.push_back(*argType);
     }
+    if (!term.vararg.empty()) {
+      std::optional<mlir::Type> argType = typeFromTypeTerm(term.vararg.front());
+      if (!argType)
+        return std::nullopt;
+      vararg = *argType;
+    }
+    if (!term.kwarg.empty()) {
+      std::optional<mlir::Type> argType = typeFromTypeTerm(term.kwarg.front());
+      if (!argType)
+        return std::nullopt;
+      kwarg = *argType;
+    }
     for (const typing::Term &resultTerm : term.results) {
       std::optional<mlir::Type> resultType = typeFromTypeTerm(resultTerm);
       if (!resultType)
         return std::nullopt;
       results.push_back(*resultType);
     }
-    return py::FuncType::get(
-        &context,
-        py::FuncSignatureType::get(&context, args, kwonly, {}, {}, results));
+    return py::CallableType::get(&context, args, kwonly, vararg, kwarg, results,
+                                 {}, {}, {}, {}, {}, {},
+                                 term.positionalOnlyCount.value_or(0));
   }
 
   if (term.name == "int")
@@ -308,10 +405,36 @@ Builder::Impl::typeFromTypeTerm(const typing::Term &term) {
     return strType();
   if (term.name == "None")
     return noneType();
+  if (term.name == "object")
+    return py::ObjectType::get(&context);
   if (term.name == "Exception")
     return exceptionType();
+  if (term.name == "TracebackType")
+    return py::TracebackType::get(&context);
+  if (term.name == "type" && term.args.size() == 1) {
+    std::optional<mlir::Type> instance = typeFromTypeTerm(term.args.front());
+    if (!instance)
+      return std::nullopt;
+    return py::TypeType::get(&context, *instance);
+  }
   if (llvm::StringRef(term.name).starts_with("class:"))
     return classType(llvm::StringRef(term.name).drop_front(strlen("class:")));
+  if (llvm::StringRef(term.name).starts_with("protocol:")) {
+    llvm::StringRef name =
+        llvm::StringRef(term.name).drop_front(strlen("protocol:"));
+    llvm::SmallVector<mlir::Type> args;
+    args.reserve(term.args.size());
+    for (const typing::Term &arg : term.args) {
+      std::optional<mlir::Type> argType = typeFromTypeTerm(arg);
+      if (!argType)
+        return std::nullopt;
+      args.push_back(*argType);
+    }
+    std::optional<py::ProtocolType> protocol = protocolType(name, args);
+    if (!protocol)
+      return std::nullopt;
+    return *protocol;
+  }
   if (term.name == "list" && term.args.size() == 1) {
     std::optional<mlir::Type> element = typeFromTypeTerm(term.args.front());
     if (!element)
@@ -336,18 +459,24 @@ Builder::Impl::typeFromTypeTerm(const typing::Term &term) {
     }
     return py::TupleType::get(&context, elements);
   }
-  if ((term.name == "coro" || term.name == "task" || term.name == "future" ||
-       term.name == "async.value") &&
-      term.args.size() == 1) {
+  if (term.name == "union" && term.args.size() >= 2) {
+    llvm::SmallVector<mlir::Type> members;
+    members.reserve(term.args.size());
+    for (const typing::Term &arg : term.args) {
+      std::optional<mlir::Type> member = typeFromTypeTerm(arg);
+      if (!member)
+        return std::nullopt;
+      members.push_back(*member);
+    }
+    mlir::Type normalized = py::UnionType::getNormalized(&context, members);
+    if (!normalized)
+      return std::nullopt;
+    return normalized;
+  }
+  if (term.name == "async.value" && term.args.size() == 1) {
     std::optional<mlir::Type> result = typeFromTypeTerm(term.args.front());
     if (!result)
       return std::nullopt;
-    if (term.name == "coro")
-      return coroutineType(*result);
-    if (term.name == "task")
-      return taskType(*result);
-    if (term.name == "future")
-      return futureType(*result);
     return mlir::async::ValueType::get(*result);
   }
   if (llvm::StringRef(term.name).starts_with("Int[") &&
@@ -395,6 +524,17 @@ std::string typeString(mlir::Type type) {
   return storage;
 }
 
+std::optional<py::ProtocolType>
+Builder::Impl::protocolType(llvm::StringRef protocolName,
+                            llvm::ArrayRef<mlir::Type> suppliedArguments) {
+  std::optional<std::vector<mlir::Type>> completed =
+      protocols::Table::get(context).completeProtocolArguments(
+          protocolName, suppliedArguments);
+  if (!completed)
+    return std::nullopt;
+  return py::ProtocolType::get(&context, protocolName, *completed);
+}
+
 py::IntType Builder::Impl::intType() { return py::IntType::get(&context); }
 py::FloatType Builder::Impl::floatType() {
   return py::FloatType::get(&context);
@@ -411,14 +551,25 @@ py::ExceptionCellType Builder::Impl::exceptionCellType() {
 py::ClassType Builder::Impl::classType(llvm::StringRef className) {
   return py::ClassType::get(&context, className);
 }
-py::CoroutineType Builder::Impl::coroutineType(mlir::Type resultType) {
-  return py::CoroutineType::get(&context, resultType);
+mlir::Type Builder::Impl::coroutineType(mlir::Type resultType) {
+  if (std::optional<py::ProtocolType> protocol =
+          protocolType("Coroutine", {resultType}))
+    return *protocol;
+  return py::ProtocolType::get(&context, "Coroutine",
+                               {py::ObjectType::get(&context),
+                                py::ObjectType::get(&context), resultType});
 }
-py::TaskType Builder::Impl::taskType(mlir::Type resultType) {
-  return py::TaskType::get(&context, resultType);
+mlir::Type Builder::Impl::taskType(mlir::Type resultType) {
+  if (std::optional<py::ProtocolType> protocol =
+          protocolType("Task", {resultType}))
+    return *protocol;
+  return py::ProtocolType::get(&context, "Task", {resultType});
 }
-py::FutureType Builder::Impl::futureType(mlir::Type resultType) {
-  return py::FutureType::get(&context, resultType);
+mlir::Type Builder::Impl::futureType(mlir::Type resultType) {
+  if (std::optional<py::ProtocolType> protocol =
+          protocolType("Future", {resultType}))
+    return *protocol;
+  return py::ProtocolType::get(&context, "Future", {resultType});
 }
 py::DictType Builder::Impl::dictType(mlir::Type keyType, mlir::Type valueType) {
   return py::DictType::get(&context, keyType, valueType);
@@ -534,8 +685,10 @@ Builder::Impl::inferExpressionTypeAlgorithmM(const parser::Node &expr) {
       if (*name == "bool" || *name == "int" || *name == "float" ||
           *name == "str" || *name == "repr" || *name == "len")
         return typing::Term::con("builtin:" + *name);
-      if (classes.count(*name) || isBuiltinExceptionClass(*name))
-        return typing::Term::con("class-constructor:" + *name);
+      if (isBuiltinExceptionClass(*name))
+        return typing::Term::con("type", {typing::Term::con("Exception")});
+      if (classes.count(*name))
+        return typing::Term::con("type", {typing::Term::con("class:" + *name)});
       return std::nullopt;
     }
 
@@ -631,8 +784,41 @@ Builder::Impl::inferExpressionTypeAlgorithmM(const parser::Node &expr) {
         if (isBuiltinExceptionClass(*name))
           return typing::Term::con("Exception");
         auto cls = classes.find(*name);
-        if (cls != classes.end())
-          return typing::Term::con("class:" + *name);
+        if (cls != classes.end()) {
+          std::string className = *name;
+          const std::vector<parser::NodePtr> *keywords =
+              nodeListField(node, "keywords");
+          auto initMethod = cls->second.methods.find("__init__");
+          auto initInfo = initMethod == cls->second.methods.end()
+                              ? functions.end()
+                              : functions.find(initMethod->second);
+          if ((!keywords || keywords->empty()) && initInfo != functions.end()) {
+            llvm::SmallVector<mlir::Type> actualTypes;
+            bool haveActualTypes = true;
+            actualTypes.reserve(args->size());
+            for (const parser::NodePtr &arg : *args) {
+              if (!arg) {
+                haveActualTypes = false;
+                break;
+              }
+              std::optional<typing::Term> argTerm = infer(*arg);
+              std::optional<mlir::Type> argType =
+                  argTerm ? typeFromTypeTerm(*argTerm) : std::nullopt;
+              if (!argType) {
+                haveActualTypes = false;
+                break;
+              }
+              actualTypes.push_back(*argType);
+            }
+            if (haveActualTypes) {
+              if (std::optional<std::string> specialized =
+                      specializeClassForConstructorFieldTypes(
+                          node, *name, initInfo->second, actualTypes))
+                className = *specialized;
+            }
+          }
+          return typing::Term::con("class:" + className);
+        }
         auto localFunction = localFunctions.find(*name);
         if (localFunction != localFunctions.end())
           return functionResultTerm(localFunction->second);
@@ -930,6 +1116,10 @@ Builder::Impl::inferExpressionTypeUncached(const parser::Node &expr) {
     auto function = functions.find(*name);
     if (function != functions.end())
       return function->second.functionType;
+    if (isBuiltinExceptionClass(*name))
+      return py::TypeType::get(&context, exceptionType());
+    if (classes.count(*name))
+      return py::TypeType::get(&context, classType(*name));
     return std::nullopt;
   }
 
@@ -968,11 +1158,32 @@ Builder::Impl::inferExpressionTypeUncached(const parser::Node &expr) {
       return constant->type;
     const parser::NodePtr *func = nodeField(expr, "func");
     const std::vector<parser::NodePtr> *args = nodeListField(expr, "args");
+    const std::vector<parser::NodePtr> *keywords =
+        nodeListField(expr, "keywords");
     if (!func || !*func)
       return std::nullopt;
+    auto inferArgumentTypes =
+        [&]() -> std::optional<llvm::SmallVector<mlir::Type>> {
+      if (!args)
+        return std::nullopt;
+      llvm::SmallVector<mlir::Type> argumentTypes;
+      argumentTypes.reserve(args->size());
+      for (const parser::NodePtr &arg : *args) {
+        if (!arg)
+          return std::nullopt;
+        std::optional<mlir::Type> argType = inferExpressionType(*arg);
+        if (!argType)
+          return std::nullopt;
+        argumentTypes.push_back(*argType);
+      }
+      return argumentTypes;
+    };
     if (std::optional<mlir::Type> targetType = typeFromAnnotation(*func);
         targetType &&
         mlir::isa<mlir::IntegerType, mlir::FloatType>(*targetType))
+      return *targetType;
+    if (std::optional<mlir::Type> targetType = typeFromAnnotation(*func);
+        targetType && mlir::isa<py::ClassType>(*targetType))
       return *targetType;
     if (isTensorConstructorCallee(**func))
       return typeFromAnnotation(*func);
@@ -1009,8 +1220,6 @@ Builder::Impl::inferExpressionTypeUncached(const parser::Node &expr) {
         return strType();
       if (*name == "len" && args && args->size() == 1)
         return intType();
-      const std::vector<parser::NodePtr> *keywords =
-          nodeListField(expr, "keywords");
       if (*name == "list" && args && args->size() == 1 && args->front() &&
           (!keywords || keywords->empty())) {
         if (isRangeCall(*args->front())) {
@@ -1059,7 +1268,7 @@ Builder::Impl::inferExpressionTypeUncached(const parser::Node &expr) {
       if (isBuiltinExceptionClass(*name))
         return exceptionType();
       auto cls = classes.find(*name);
-      if (cls != classes.end())
+      if (cls != classes.end() && !cls->second.isGenericTemplate)
         return classType(*name);
       auto localFunction = localFunctions.find(*name);
       if (localFunction != localFunctions.end())
@@ -1070,6 +1279,36 @@ Builder::Impl::inferExpressionTypeUncached(const parser::Node &expr) {
           return coroutineType(function->second.resultType);
         return function->second.resultType;
       }
+    }
+    if ((*func)->kind == "Attribute" && (!keywords || keywords->empty())) {
+      const parser::NodePtr *receiver = nodeField(**func, "value");
+      const std::string *methodName = stringField(**func, "attr");
+      if (!receiver || !*receiver || !methodName)
+        return std::nullopt;
+      std::optional<mlir::Type> receiverType = inferExpressionType(**receiver);
+      std::optional<llvm::SmallVector<mlir::Type>> argumentTypes =
+          inferArgumentTypes();
+      if (!receiverType || !argumentTypes)
+        return std::nullopt;
+      std::optional<mlir::Type> resultType =
+          protocols::Table::get(context).resolveMethodResultOn(
+              *receiverType, *methodName, *argumentTypes);
+      if (resultType)
+        return *resultType;
+
+      std::optional<std::string> className = classNameFromType(*receiverType);
+      if (!className)
+        return std::nullopt;
+      auto classFound = classes.find(*className);
+      if (classFound == classes.end())
+        return std::nullopt;
+      auto methodFound = classFound->second.methods.find(*methodName);
+      if (methodFound == classFound->second.methods.end())
+        return std::nullopt;
+      auto functionFound = functions.find(methodFound->second);
+      if (functionFound == functions.end())
+        return std::nullopt;
+      return functionFound->second.resultType;
     }
     return std::nullopt;
   }
@@ -1161,7 +1400,31 @@ Builder::Impl::inferExpressionTypeUncached(const parser::Node &expr) {
         return std::nullopt;
       return elementTypes[*index];
     }
-    return std::nullopt;
+    std::optional<mlir::Type> indexType = inferExpressionType(**slice);
+    if (!indexType)
+      return std::nullopt;
+    std::optional<mlir::Type> resultType =
+        protocols::Table::get(context).resolveMethodResultOn(
+            *containerType, "__getitem__", {*indexType});
+    if (resultType)
+      return *resultType;
+    std::optional<std::string> className = classNameFromType(*containerType);
+    if (!className)
+      return std::nullopt;
+    auto classFound = classes.find(*className);
+    if (classFound == classes.end())
+      return std::nullopt;
+    auto methodFound = classFound->second.methods.find("__getitem__");
+    if (methodFound == classFound->second.methods.end())
+      return std::nullopt;
+    auto functionFound = functions.find(methodFound->second);
+    if (functionFound == functions.end())
+      return std::nullopt;
+    const FunctionInfo &method = functionFound->second;
+    if (method.argTypes.size() != 2 ||
+        !typeAssignable(method.argTypes[1], *indexType))
+      return std::nullopt;
+    return method.resultType;
   }
 
   if (expr.kind == "List") {
@@ -1388,6 +1651,20 @@ Builder::Impl::inferExpressionTypeUncached(const parser::Node &expr) {
       }
       return i1Type();
     }
+    if (ops->size() == 1 && ((*ops)[0] == "in" || (*ops)[0] == "not in") &&
+        (*comparators)[0]) {
+      std::optional<mlir::Type> itemType = inferExpressionType(**lhs);
+      std::optional<mlir::Type> containerType =
+          inferExpressionType(*(*comparators)[0]);
+      if (!itemType || !containerType)
+        return std::nullopt;
+      std::optional<mlir::Type> resultType =
+          protocols::Table::get(context).resolveMethodResultOn(
+              *containerType, "__contains__", {*itemType});
+      if (resultType && *resultType == boolType())
+        return i1Type();
+      return std::nullopt;
+    }
     std::optional<mlir::Type> lhsType = inferExpressionType(**lhs);
     if (!lhsType || !*lhsType)
       return std::nullopt;
@@ -1556,8 +1833,116 @@ Builder::Impl::typeFromAnnotation(const parser::NodePtr &node) {
 
 std::optional<mlir::Type> Builder::Impl::typeFromAnnotation(
     const parser::NodePtr &node,
+    const std::map<std::string, mlir::Type> &typeVariables) {
+  std::set<std::string> activeAliases;
+  return typeFromAnnotation(node, typeVariables, activeAliases);
+}
+
+std::optional<py::CallableType>
+Builder::Impl::callableParameterPackFromAnnotation(
+    const parser::NodePtr &node,
     const std::map<std::string, mlir::Type> &typeVariables,
     std::set<std::string> &activeAliases) {
+  return callableParameterPackFromAnnotation(node, typeVariables, activeAliases,
+                                             AnnotationUse::Value);
+}
+
+std::optional<py::CallableType>
+Builder::Impl::callableParameterPackFromAnnotation(
+    const parser::NodePtr &node,
+    const std::map<std::string, mlir::Type> &typeVariables,
+    std::set<std::string> &activeAliases, AnnotationUse annotationUse) {
+  if (!node)
+    return std::nullopt;
+
+  const parser::NodePtr *packExpr = &node;
+  if (node->kind == "Starred") {
+    const parser::NodePtr *value = nodeField(*node, "value");
+    if (!value || !*value)
+      return std::nullopt;
+    packExpr = value;
+  }
+
+  if ((*packExpr)->kind == "List" || (*packExpr)->kind == "Tuple") {
+    const std::vector<parser::NodePtr> *items =
+        nodeListField(**packExpr, "elts");
+    if (!items)
+      return std::nullopt;
+    llvm::SmallVector<mlir::Type> elementTypes;
+    for (const parser::NodePtr &item : *items) {
+      std::optional<mlir::Type> itemType =
+          typeFromAnnotation(item, typeVariables, activeAliases, annotationUse);
+      if (!itemType)
+        return std::nullopt;
+      elementTypes.push_back(*itemType);
+    }
+    return callableParameterPackFromTuple(elementTypes);
+  }
+  if (isEllipsisConstant(*packExpr)) {
+    mlir::Type object = py::ObjectType::get(&context);
+    mlir::Type vararg = py::TupleType::get(&context, {object});
+    mlir::Type kwargs = dictType(strType(), object);
+    return py::CallableType::get(&context, {}, {}, vararg, kwargs, {});
+  }
+
+  if ((*packExpr)->kind == "Subscript") {
+    const parser::NodePtr *value = nodeField(**packExpr, "value");
+    const parser::NodePtr *slice = nodeField(**packExpr, "slice");
+    if (!value || !*value || !slice || !*slice)
+      return std::nullopt;
+    if (isTypingName(**value, "Concatenate")) {
+      llvm::SmallVector<parser::NodePtr> items;
+      if ((*slice)->kind == "Tuple") {
+        const std::vector<parser::NodePtr> *elts =
+            nodeListField(**slice, "elts");
+        if (!elts)
+          return std::nullopt;
+        items.append(elts->begin(), elts->end());
+      } else {
+        items.push_back(*slice);
+      }
+      if (items.size() < 2 || !items.back())
+        return std::nullopt;
+      llvm::SmallVector<mlir::Type> prefixTypes;
+      for (const parser::NodePtr &item : llvm::ArrayRef(items).drop_back()) {
+        std::optional<mlir::Type> itemType = typeFromAnnotation(
+            item, typeVariables, activeAliases, annotationUse);
+        if (!itemType)
+          return std::nullopt;
+        prefixTypes.push_back(*itemType);
+      }
+      std::optional<py::CallableType> suffix =
+          callableParameterPackFromAnnotation(items.back(), typeVariables,
+                                              activeAliases, annotationUse);
+      if (!suffix)
+        return std::nullopt;
+      return prependCallableParameterPack(prefixTypes, *suffix);
+    }
+  }
+
+  std::optional<mlir::Type> packType = typeFromAnnotation(
+      *packExpr, typeVariables, activeAliases, annotationUse);
+  if (!packType)
+    return std::nullopt;
+  if (auto signature = mlir::dyn_cast<py::CallableType>(*packType))
+    return signature;
+  if (auto tuple = mlir::dyn_cast<py::TupleType>(*packType))
+    return callableParameterPackFromTuple(tuple.getElementTypes());
+  return std::nullopt;
+}
+
+std::optional<mlir::Type> Builder::Impl::typeFromAnnotation(
+    const parser::NodePtr &node,
+    const std::map<std::string, mlir::Type> &typeVariables,
+    std::set<std::string> &activeAliases) {
+  return typeFromAnnotation(node, typeVariables, activeAliases,
+                            AnnotationUse::Value);
+}
+
+std::optional<mlir::Type> Builder::Impl::typeFromAnnotation(
+    const parser::NodePtr &node,
+    const std::map<std::string, mlir::Type> &typeVariables,
+    std::set<std::string> &activeAliases, AnnotationUse annotationUse) {
   if (!node)
     return std::nullopt;
   auto knownAnnotationName =
@@ -1583,7 +1968,7 @@ std::optional<mlir::Type> Builder::Impl::typeFromAnnotation(
       if (module == staticModules.end())
         return std::nullopt;
       if (module->second == "typing" || module->second == "collections.abc" ||
-          module->second == "asyncio")
+          module->second == "asyncio" || module->second == "types")
         return *attr;
       return std::nullopt;
     }
@@ -1609,40 +1994,75 @@ std::optional<mlir::Type> Builder::Impl::typeFromAnnotation(
       packExpr = value;
     }
     std::optional<mlir::Type> packType =
-        typeFromAnnotation(*packExpr, variables, aliases);
+        typeFromAnnotation(*packExpr, variables, aliases, annotationUse);
     if (!packType)
       return std::nullopt;
     return mlir::dyn_cast<py::TupleType>(*packType);
   };
-  auto fixedCallablePackFromAnnotation =
-      [&](const parser::NodePtr &expr,
-          const std::map<std::string, mlir::Type> &variables,
-          std::set<std::string> &aliases) -> std::optional<py::TupleType> {
-    if (!expr)
+  auto annotationArguments = [&](const parser::NodePtr &slice)
+      -> std::optional<llvm::SmallVector<parser::NodePtr>> {
+    if (!slice)
       return std::nullopt;
-    if (expr->kind == "List" || expr->kind == "Tuple") {
-      const std::vector<parser::NodePtr> *items = nodeListField(*expr, "elts");
+    llvm::SmallVector<parser::NodePtr> args;
+    if (slice->kind == "Tuple") {
+      const std::vector<parser::NodePtr> *items = nodeListField(*slice, "elts");
       if (!items)
         return std::nullopt;
-      llvm::SmallVector<mlir::Type> elementTypes;
-      for (const parser::NodePtr &item : *items) {
-        std::optional<mlir::Type> itemType =
-            typeFromAnnotation(item, variables, aliases);
-        if (!itemType)
-          return std::nullopt;
-        elementTypes.push_back(*itemType);
-      }
-      return py::TupleType::get(&context, elementTypes);
+      args.append(items->begin(), items->end());
+    } else {
+      args.push_back(slice);
     }
-    return typePackFromAnnotation(expr, variables, aliases);
+    return args;
+  };
+  auto protocolAnnotationType =
+      [&](llvm::StringRef protocolName, const parser::NodePtr &slice,
+          const std::map<std::string, mlir::Type> &variables,
+          std::set<std::string> &aliases) -> std::optional<mlir::Type> {
+    const protocols::Table &table = protocols::Table::get(context);
+    const protocols::ProtocolInfo *info = table.lookup(protocolName);
+    if (!info || !info->isProtocol || protocolName == "Protocol")
+      return std::nullopt;
+    llvm::SmallVector<parser::NodePtr> parsedArgsStorage;
+    if (slice) {
+      std::optional<llvm::SmallVector<parser::NodePtr>> parsedArgs =
+          annotationArguments(slice);
+      if (!parsedArgs)
+        return std::nullopt;
+      parsedArgsStorage = std::move(*parsedArgs);
+    }
+    llvm::SmallVector<mlir::Type> args;
+    for (const parser::NodePtr &arg : parsedArgsStorage) {
+      std::optional<mlir::Type> argType = typeFromAnnotation(
+          arg, variables, aliases, AnnotationUse::TypeContract);
+      if (!argType)
+        return std::nullopt;
+      args.push_back(*argType);
+    }
+    std::optional<std::vector<mlir::Type>> completed =
+        table.completeProtocolArguments(protocolName, args);
+    if (!completed)
+      return std::nullopt;
+    return py::ProtocolType::get(&context, protocolName, *completed);
   };
   if (node->kind == "Name") {
     const std::string *name = stringField(*node, "id");
     if (!name)
       return std::nullopt;
+    std::string annotationName = *name;
+    auto annotationAlias = staticAnnotationAliases.find(*name);
+    if (annotationAlias != staticAnnotationAliases.end())
+      annotationName = annotationAlias->second;
     auto typeVariable = typeVariables.find(*name);
     if (typeVariable != typeVariables.end())
       return typeVariable->second;
+    if (annotationName == "Any" || annotationName == "object")
+      return py::ObjectType::get(&context);
+    if (annotationName == "NoneType")
+      return noneType();
+    if (annotationName == "TracebackType")
+      return py::TracebackType::get(&context);
+    if (annotationName == "type" || annotationName == "Type")
+      return py::TypeType::get(&context, py::ObjectType::get(&context));
     if (*name == "int")
       return intType();
     if (*name == "str")
@@ -1653,6 +2073,9 @@ std::optional<mlir::Type> Builder::Impl::typeFromAnnotation(
       return boolType();
     if (*name == "None")
       return noneType();
+    if (std::optional<mlir::Type> protocol = protocolAnnotationType(
+            annotationName, parser::NodePtr{}, typeVariables, activeAliases))
+      return protocol;
     if (isBuiltinExceptionClass(*name))
       return exceptionType();
     auto alias = typeAliases.find(*name);
@@ -1671,21 +2094,29 @@ std::optional<mlir::Type> Builder::Impl::typeFromAnnotation(
         }
         if (parameter.kind == TypeAliasParameterKind::TypeVarTuple ||
             parameter.kind == TypeAliasParameterKind::ParamSpec) {
-          std::optional<py::TupleType> pack =
-              parameter.kind == TypeAliasParameterKind::ParamSpec
-                  ? fixedCallablePackFromAnnotation(parameter.defaultValue,
-                                                    substituted, activeAliases)
-                  : typePackFromAnnotation(parameter.defaultValue, substituted,
-                                           activeAliases);
-          if (!pack) {
-            activeAliases.erase(*name);
-            return std::nullopt;
+          if (parameter.kind == TypeAliasParameterKind::ParamSpec) {
+            std::optional<py::CallableType> pack =
+                callableParameterPackFromAnnotation(parameter.defaultValue,
+                                                    substituted, activeAliases,
+                                                    annotationUse);
+            if (!pack) {
+              activeAliases.erase(*name);
+              return std::nullopt;
+            }
+            substituted[parameter.name] = *pack;
+          } else {
+            std::optional<py::TupleType> pack = typePackFromAnnotation(
+                parameter.defaultValue, substituted, activeAliases);
+            if (!pack) {
+              activeAliases.erase(*name);
+              return std::nullopt;
+            }
+            substituted[parameter.name] = *pack;
           }
-          substituted[parameter.name] = *pack;
           continue;
         }
         std::optional<mlir::Type> defaultType = typeFromAnnotation(
-            parameter.defaultValue, substituted, activeAliases);
+            parameter.defaultValue, substituted, activeAliases, annotationUse);
         if (!defaultType || (parameter.bound &&
                              !typeAssignable(parameter.bound, *defaultType))) {
           activeAliases.erase(*name);
@@ -1693,14 +2124,69 @@ std::optional<mlir::Type> Builder::Impl::typeFromAnnotation(
         }
         substituted[parameter.name] = *defaultType;
       }
-      std::optional<mlir::Type> result = typeFromAnnotation(
-          genericAlias->second.value, substituted, activeAliases);
+      std::optional<mlir::Type> result =
+          typeFromAnnotation(genericAlias->second.value, substituted,
+                             activeAliases, annotationUse);
       activeAliases.erase(*name);
       return result;
     }
-    if (classes.count(*name))
+    auto classFound = classes.find(*name);
+    if (classFound != classes.end() && !classFound->second.isGenericTemplate)
       return classType(*name);
     return std::nullopt;
+  }
+  if (node->kind == "Attribute") {
+    std::optional<std::string> annotationName = knownAnnotationName(*node);
+    if (!annotationName)
+      return std::nullopt;
+    if (*annotationName == "Any" || *annotationName == "object")
+      return py::ObjectType::get(&context);
+    if (*annotationName == "NoneType")
+      return noneType();
+    if (*annotationName == "TracebackType")
+      return py::TracebackType::get(&context);
+    if (*annotationName == "type" || *annotationName == "Type")
+      return py::TypeType::get(&context, py::ObjectType::get(&context));
+    if (std::optional<mlir::Type> protocol = protocolAnnotationType(
+            *annotationName, parser::NodePtr{}, typeVariables, activeAliases))
+      return protocol;
+    return std::nullopt;
+  }
+  // Union values lower with an explicit active-member tag, so primitive-backed
+  // members can participate without relying on nullable object headers.
+  auto supportedUnionAnnotation = [annotationUse](mlir::Type type) {
+    auto unionType = mlir::dyn_cast<py::UnionType>(type);
+    if (!unionType)
+      return true;
+    if (annotationUse == AnnotationUse::TypeContract)
+      return true;
+    for (mlir::Type member : unionType.getMemberTypes()) {
+      if (mlir::isa<py::NoneType>(member))
+        continue;
+      if (!mlir::isa<py::IntType, py::BoolType, py::FloatType, py::StrType,
+                     py::ExceptionType, py::TracebackType, py::ClassType,
+                     py::TypeType>(member))
+        return false;
+    }
+    return true;
+  };
+  if (node->kind == "BinOp") {
+    std::optional<std::string> op = symbolField(*node, "op");
+    const parser::NodePtr *lhs = nodeField(*node, "left");
+    const parser::NodePtr *rhs = nodeField(*node, "right");
+    if (!op || *op != "|" || !lhs || !*lhs || !rhs || !*rhs)
+      return std::nullopt;
+    std::optional<mlir::Type> lhsType =
+        typeFromAnnotation(*lhs, typeVariables, activeAliases, annotationUse);
+    std::optional<mlir::Type> rhsType =
+        typeFromAnnotation(*rhs, typeVariables, activeAliases, annotationUse);
+    if (!lhsType || !rhsType)
+      return std::nullopt;
+    mlir::Type normalized =
+        py::UnionType::getNormalized(&context, {*lhsType, *rhsType});
+    if (!normalized || !supportedUnionAnnotation(normalized))
+      return std::nullopt;
+    return normalized;
   }
   if (node->kind == "Subscript") {
     std::optional<unsigned> width = intWidthFromSubscript(*node);
@@ -1755,7 +2241,7 @@ std::optional<mlir::Type> Builder::Impl::typeFromAnnotation(
             }
             std::optional<mlir::Type> argumentType = typeFromAnnotation(
                 *argument, usesDefault ? substituted : typeVariables,
-                activeAliases);
+                activeAliases, annotationUse);
             if (!argumentType) {
               activeAliases.erase(*name);
               return std::nullopt;
@@ -1788,7 +2274,7 @@ std::optional<mlir::Type> Builder::Impl::typeFromAnnotation(
             }
             std::optional<mlir::Type> argumentType = typeFromAnnotation(
                 *argument, usesDefault ? substituted : typeVariables,
-                activeAliases);
+                activeAliases, annotationUse);
             if (!argumentType ||
                 (parameter.bound &&
                  !typeAssignable(parameter.bound, *argumentType))) {
@@ -1800,20 +2286,17 @@ std::optional<mlir::Type> Builder::Impl::typeFromAnnotation(
 
           const TypeAliasParameter &packParameter = info.parameters[*packIndex];
           llvm::SmallVector<mlir::Type> packTypes;
+          std::optional<py::CallableType> paramSpecPack;
           if (args.size() > fixedCount) {
             if (packParameter.kind == TypeAliasParameterKind::ParamSpec &&
-                args.size() == fixedCount + 1 && args[fixedCount] &&
-                (args[fixedCount]->kind == "List" ||
-                 args[fixedCount]->kind == "Tuple")) {
-              std::optional<py::TupleType> expanded =
-                  fixedCallablePackFromAnnotation(args[fixedCount],
-                                                  typeVariables, activeAliases);
-              if (!expanded) {
+                args.size() == fixedCount + 1) {
+              paramSpecPack = callableParameterPackFromAnnotation(
+                  args[fixedCount], typeVariables, activeAliases,
+                  annotationUse);
+              if (!paramSpecPack) {
                 activeAliases.erase(*name);
                 return std::nullopt;
               }
-              packTypes.append(expanded->getElementTypes().begin(),
-                               expanded->getElementTypes().end());
             } else {
               for (std::size_t index = fixedCount; index < args.size();
                    ++index) {
@@ -1834,8 +2317,8 @@ std::optional<mlir::Type> Builder::Impl::typeFromAnnotation(
                                    expanded->getElementTypes().end());
                   continue;
                 }
-                std::optional<mlir::Type> argumentType =
-                    typeFromAnnotation(argument, typeVariables, activeAliases);
+                std::optional<mlir::Type> argumentType = typeFromAnnotation(
+                    argument, typeVariables, activeAliases, annotationUse);
                 if (!argumentType) {
                   activeAliases.erase(*name);
                   return std::nullopt;
@@ -1844,43 +2327,127 @@ std::optional<mlir::Type> Builder::Impl::typeFromAnnotation(
               }
             }
           } else if (packParameter.defaultValue) {
-            std::optional<py::TupleType> defaultPack =
-                packParameter.kind == TypeAliasParameterKind::ParamSpec
-                    ? fixedCallablePackFromAnnotation(
-                          packParameter.defaultValue, substituted,
-                          activeAliases)
-                    : typePackFromAnnotation(packParameter.defaultValue,
-                                             substituted, activeAliases);
-            if (!defaultPack) {
-              activeAliases.erase(*name);
-              return std::nullopt;
+            if (packParameter.kind == TypeAliasParameterKind::ParamSpec) {
+              paramSpecPack = callableParameterPackFromAnnotation(
+                  packParameter.defaultValue, substituted, activeAliases,
+                  annotationUse);
+              if (!paramSpecPack) {
+                activeAliases.erase(*name);
+                return std::nullopt;
+              }
+            } else {
+              std::optional<py::TupleType> defaultPack = typePackFromAnnotation(
+                  packParameter.defaultValue, substituted, activeAliases);
+              if (!defaultPack) {
+                activeAliases.erase(*name);
+                return std::nullopt;
+              }
+              packTypes.append(defaultPack->getElementTypes().begin(),
+                               defaultPack->getElementTypes().end());
             }
-            packTypes.append(defaultPack->getElementTypes().begin(),
-                             defaultPack->getElementTypes().end());
           }
-          substituted[packParameter.name] =
-              py::TupleType::get(&context, packTypes);
+          if (packParameter.kind == TypeAliasParameterKind::ParamSpec)
+            substituted[packParameter.name] =
+                paramSpecPack
+                    ? mlir::Type(*paramSpecPack)
+                    : mlir::Type(callableParameterPackFromTuple(packTypes));
+          else
+            substituted[packParameter.name] =
+                py::TupleType::get(&context, packTypes);
         }
-        std::optional<mlir::Type> result =
-            typeFromAnnotation(info.value, substituted, activeAliases);
+        std::optional<mlir::Type> result = typeFromAnnotation(
+            info.value, substituted, activeAliases, annotationUse);
         activeAliases.erase(*name);
         return result;
+      }
+      auto classTemplate = name ? classes.find(*name) : classes.end();
+      if (classTemplate != classes.end() &&
+          classTemplate->second.isGenericTemplate) {
+        llvm::SmallVector<parser::NodePtr> args;
+        if ((*slice)->kind == "Tuple") {
+          const std::vector<parser::NodePtr> *items =
+              nodeListField(**slice, "elts");
+          if (!items)
+            return std::nullopt;
+          args.append(items->begin(), items->end());
+        } else {
+          args.push_back(*slice);
+        }
+        std::optional<std::string> specialized =
+            instantiateGenericClassFromAnnotation(*node, *name, args,
+                                                  typeVariables, activeAliases);
+        if (!specialized)
+          return std::nullopt;
+        return classType(*specialized);
       }
     }
     std::optional<std::string> annotationBase = knownAnnotationName(**value);
     if (annotationBase) {
-      if (*annotationBase == "Coroutine" || *annotationBase == "Coro" ||
-          *annotationBase == "Task" || *annotationBase == "Future") {
-        std::optional<mlir::Type> resultType =
-            typeFromAnnotation(*slice, typeVariables, activeAliases);
+      if (*annotationBase == "Optional") {
+        std::optional<mlir::Type> payload = typeFromAnnotation(
+            *slice, typeVariables, activeAliases, annotationUse);
+        if (!payload)
+          return std::nullopt;
+        mlir::Type normalized =
+            py::UnionType::getNormalized(&context, {*payload, noneType()});
+        if (!normalized || !supportedUnionAnnotation(normalized))
+          return std::nullopt;
+        return normalized;
+      }
+      if (*annotationBase == "Union") {
+        llvm::SmallVector<parser::NodePtr> items;
+        if ((*slice)->kind == "Tuple") {
+          const std::vector<parser::NodePtr> *elements =
+              nodeListField(**slice, "elts");
+          if (!elements)
+            return std::nullopt;
+          items.append(elements->begin(), elements->end());
+        } else {
+          items.push_back(*slice);
+        }
+        llvm::SmallVector<mlir::Type> members;
+        for (const parser::NodePtr &item : items) {
+          std::optional<mlir::Type> member = typeFromAnnotation(
+              item, typeVariables, activeAliases, annotationUse);
+          if (!member)
+            return std::nullopt;
+          members.push_back(*member);
+        }
+        mlir::Type normalized = py::UnionType::getNormalized(&context, members);
+        if (!normalized || !supportedUnionAnnotation(normalized))
+          return std::nullopt;
+        return normalized;
+      }
+      if (*annotationBase == "Iterator") {
+        std::optional<mlir::Type> element = typeFromAnnotation(
+            *slice, typeVariables, activeAliases, annotationUse);
+        if (!element)
+          return std::nullopt;
+        std::optional<py::ProtocolType> iterator =
+            protocolType("Iterator", {*element});
+        if (!iterator)
+          return std::nullopt;
+        return *iterator;
+      }
+      if (*annotationBase == "type" || *annotationBase == "Type") {
+        std::optional<mlir::Type> instance = typeFromAnnotation(
+            *slice, typeVariables, activeAliases, annotationUse);
+        if (!instance)
+          return std::nullopt;
+        return py::TypeType::get(&context, *instance);
+      }
+      if (*annotationBase == "Task" || *annotationBase == "Future") {
+        std::optional<mlir::Type> resultType = typeFromAnnotation(
+            *slice, typeVariables, activeAliases, annotationUse);
         if (!resultType)
           return std::nullopt;
         if (*annotationBase == "Task")
           return taskType(*resultType);
-        if (*annotationBase == "Future")
-          return futureType(*resultType);
-        return coroutineType(*resultType);
+        return futureType(*resultType);
       }
+      if (std::optional<mlir::Type> protocol = protocolAnnotationType(
+              *annotationBase, *slice, typeVariables, activeAliases))
+        return protocol;
       if (*annotationBase == "Callable") {
         if ((*slice)->kind != "Tuple")
           return std::nullopt;
@@ -1889,39 +2456,16 @@ std::optional<mlir::Type> Builder::Impl::typeFromAnnotation(
         if (!items || items->size() != 2 || !items->front() || !(*items)[1])
           return std::nullopt;
         const parser::NodePtr &argsNode = items->front();
-        if (argsNode->kind == "Name") {
-          std::optional<py::TupleType> pack = fixedCallablePackFromAnnotation(
-              argsNode, typeVariables, activeAliases);
-          if (!pack)
-            return std::nullopt;
-          std::optional<mlir::Type> resultType =
-              typeFromAnnotation((*items)[1], typeVariables, activeAliases);
-          if (!resultType)
-            return std::nullopt;
-          return py::FuncType::get(
-              &context,
-              functionSignatureType(pack->getElementTypes(), *resultType));
-        }
-        if (argsNode->kind != "List" && argsNode->kind != "Tuple")
+        std::optional<py::CallableType> pack =
+            callableParameterPackFromAnnotation(argsNode, typeVariables,
+                                                activeAliases, annotationUse);
+        if (!pack)
           return std::nullopt;
-        const std::vector<parser::NodePtr> *argNodes =
-            nodeListField(*argsNode, "elts");
-        if (!argNodes)
-          return std::nullopt;
-        llvm::SmallVector<mlir::Type> argTypes;
-        for (const parser::NodePtr &arg : *argNodes) {
-          std::optional<mlir::Type> argType =
-              typeFromAnnotation(arg, typeVariables, activeAliases);
-          if (!argType)
-            return std::nullopt;
-          argTypes.push_back(*argType);
-        }
-        std::optional<mlir::Type> resultType =
-            typeFromAnnotation((*items)[1], typeVariables, activeAliases);
+        std::optional<mlir::Type> resultType = typeFromAnnotation(
+            (*items)[1], typeVariables, activeAliases, annotationUse);
         if (!resultType)
           return std::nullopt;
-        return py::FuncType::get(&context,
-                                 functionSignatureType(argTypes, *resultType));
+        return callableSignatureWithResult(*pack, *resultType);
       }
       if (*annotationBase == "dict" || *annotationBase == "Dict") {
         if ((*slice)->kind != "Tuple")
@@ -1930,17 +2474,17 @@ std::optional<mlir::Type> Builder::Impl::typeFromAnnotation(
             nodeListField(**slice, "elts");
         if (!items || items->size() != 2 || !items->front() || !(*items)[1])
           return std::nullopt;
-        std::optional<mlir::Type> keyType =
-            typeFromAnnotation(items->front(), typeVariables, activeAliases);
-        std::optional<mlir::Type> valueType =
-            typeFromAnnotation((*items)[1], typeVariables, activeAliases);
+        std::optional<mlir::Type> keyType = typeFromAnnotation(
+            items->front(), typeVariables, activeAliases, annotationUse);
+        std::optional<mlir::Type> valueType = typeFromAnnotation(
+            (*items)[1], typeVariables, activeAliases, annotationUse);
         if (!keyType || !valueType)
           return std::nullopt;
         return dictType(*keyType, *valueType);
       }
       if (*annotationBase == "list" || *annotationBase == "List") {
-        std::optional<mlir::Type> elementType =
-            typeFromAnnotation(*slice, typeVariables, activeAliases);
+        std::optional<mlir::Type> elementType = typeFromAnnotation(
+            *slice, typeVariables, activeAliases, annotationUse);
         if (!elementType)
           return std::nullopt;
         return listType(*elementType);
@@ -1954,8 +2498,8 @@ std::optional<mlir::Type> Builder::Impl::typeFromAnnotation(
               return std::nullopt;
             return py::TupleType::get(&context, pack->getElementTypes());
           }
-          std::optional<mlir::Type> elementType =
-              typeFromAnnotation(*slice, typeVariables, activeAliases);
+          std::optional<mlir::Type> elementType = typeFromAnnotation(
+              *slice, typeVariables, activeAliases, annotationUse);
           if (!elementType)
             return std::nullopt;
           return py::TupleType::get(&context, {*elementType});
@@ -1965,8 +2509,8 @@ std::optional<mlir::Type> Builder::Impl::typeFromAnnotation(
         if (!items)
           return std::nullopt;
         if (items->size() == 2 && isEllipsisConstant((*items)[1])) {
-          std::optional<mlir::Type> elementType =
-              typeFromAnnotation(items->front(), typeVariables, activeAliases);
+          std::optional<mlir::Type> elementType = typeFromAnnotation(
+              items->front(), typeVariables, activeAliases, annotationUse);
           if (!elementType)
             return std::nullopt;
           return py::TupleType::get(&context, {*elementType});
@@ -1982,8 +2526,8 @@ std::optional<mlir::Type> Builder::Impl::typeFromAnnotation(
                                 pack->getElementTypes().end());
             continue;
           }
-          std::optional<mlir::Type> elementType =
-              typeFromAnnotation(item, typeVariables, activeAliases);
+          std::optional<mlir::Type> elementType = typeFromAnnotation(
+              item, typeVariables, activeAliases, annotationUse);
           if (!elementType)
             return std::nullopt;
           elementTypes.push_back(*elementType);
@@ -2015,8 +2559,8 @@ std::optional<mlir::Type> Builder::Impl::typeFromAnnotation(
             nodeListField(**slice, "elts");
         if (!items || items->size() < 2 || !items->front())
           return std::nullopt;
-        std::optional<mlir::Type> elementType =
-            typeFromAnnotation(items->front(), typeVariables, activeAliases);
+        std::optional<mlir::Type> elementType = typeFromAnnotation(
+            items->front(), typeVariables, activeAliases, annotationUse);
         if (!elementType)
           return std::nullopt;
         llvm::SmallVector<int64_t> shape;
@@ -2043,7 +2587,7 @@ std::optional<mlir::Type> Builder::Impl::typeFromAnnotation(
     const parser::FieldValue *value = valueField(*node, "value");
     if (const auto *annotation =
             value ? std::get_if<std::string>(value) : nullptr) {
-      if (typeVariables.empty()) {
+      if (annotationUse == AnnotationUse::Value && typeVariables.empty()) {
         auto cached = stringAnnotationTypeCache.find(*annotation);
         if (cached != stringAnnotationTypeCache.end())
           return cached->second;
@@ -2058,9 +2602,10 @@ std::optional<mlir::Type> Builder::Impl::typeFromAnnotation(
       const parser::NodePtr *body = nodeField(*parsed.tree, "body");
       if (!body || !*body || (*body)->kind == "Constant")
         return std::nullopt;
-      std::optional<mlir::Type> resolved =
-          typeFromAnnotation(*body, typeVariables, activeAliases);
-      if (resolved && typeVariables.empty())
+      std::optional<mlir::Type> resolved = typeFromAnnotation(
+          *body, typeVariables, activeAliases, annotationUse);
+      if (resolved && annotationUse == AnnotationUse::Value &&
+          typeVariables.empty())
         stringAnnotationTypeCache.try_emplace(*annotation, *resolved);
       return resolved;
     }
@@ -2097,6 +2642,580 @@ bool Builder::Impl::isTypeAliasMarker(const parser::NodePtr &node) const {
   return module != staticModules.end() && module->second == "typing";
 }
 
+bool Builder::Impl::classSubtypeOf(llvm::StringRef derived,
+                                   llvm::StringRef base) const {
+  if (derived == base)
+    return true;
+
+  auto found = classes.find(derived.str());
+  if (found == classes.end())
+    return false;
+
+  const ClassInfo &info = found->second;
+  if (!info.mro.empty())
+    return llvm::is_contained(info.mro, base.str());
+
+  std::set<std::string> seen;
+  std::function<bool(llvm::StringRef)> walk = [&](llvm::StringRef current) {
+    auto currentInfo = classes.find(current.str());
+    if (currentInfo == classes.end())
+      return false;
+    if (!seen.insert(current.str()).second)
+      return false;
+    for (const std::string &baseName : currentInfo->second.baseNames) {
+      if (baseName == base || walk(baseName))
+        return true;
+    }
+    return false;
+  };
+  return walk(derived);
+}
+
+bool Builder::Impl::classLayoutCompatible(llvm::StringRef derived,
+                                          llvm::StringRef base) const {
+  if (!classSubtypeOf(derived, base))
+    return false;
+  auto derivedIt = classes.find(derived.str());
+  auto baseIt = classes.find(base.str());
+  if (derivedIt == classes.end() || baseIt == classes.end())
+    return false;
+  return derivedIt->second.fields == baseIt->second.fields;
+}
+
+bool Builder::Impl::classConformsToProtocol(py::ClassType subtype,
+                                            py::ProtocolType protocol) {
+  auto classFound = classes.find(subtype.getClassName().str());
+  if (classFound == classes.end())
+    return false;
+  if (!classFound->second.inheritanceResolved) {
+    if (!classFound->second.definition)
+      return false;
+    std::set<std::string> resolving;
+    if (!resolveClassInheritance(classFound->second.name,
+                                 *classFound->second.definition, resolving))
+      return false;
+    classFound = classes.find(subtype.getClassName().str());
+    if (classFound == classes.end() || !classFound->second.inheritanceResolved)
+      return false;
+  }
+
+  const protocols::Table &table = protocols::Table::get(context);
+  const protocols::ProtocolInfo *protocolInfo =
+      table.lookup(protocol.getProtocolName());
+  if (!protocolInfo || !protocolInfo->isProtocol)
+    return false;
+
+  std::string conformanceKey =
+      subtype.getClassName().str() + "<:" + typeString(protocol);
+  if (activeProtocolConformance.count(conformanceKey))
+    return true;
+  activeProtocolConformance.insert(conformanceKey);
+  struct ConformanceGuard {
+    std::set<std::string> &active;
+    std::string key;
+    ~ConformanceGuard() { active.erase(key); }
+  } guard{activeProtocolConformance, conformanceKey};
+
+  std::set<std::string> methodNames;
+  std::set<std::string> visitedProtocols;
+  collectProtocolMethodNames(table, protocol.getProtocolName(), methodNames,
+                             visitedProtocols);
+
+  auto varargElementType = [](mlir::Type varargType) -> mlir::Type {
+    auto tuple = mlir::dyn_cast_if_present<py::TupleType>(varargType);
+    if (!tuple || tuple.getElementTypes().size() != 1)
+      return {};
+    return tuple.getElementTypes().front();
+  };
+
+  auto methodSatisfiesContract =
+      [&](const FunctionInfo &method,
+          const protocols::ProtocolMethod &contract) -> bool {
+    if (!method.methodKind.empty() && method.methodKind != "instance")
+      return false;
+    if (method.argTypes.empty() || !contract.signature)
+      return false;
+
+    llvm::ArrayRef<mlir::Type> expectedPositional =
+        contract.signature.getPositionalTypes();
+    if (expectedPositional.empty())
+      return false;
+    llvm::ArrayRef<mlir::Type> expectedUserPositional =
+        expectedPositional.drop_front();
+
+    llvm::ArrayRef<mlir::Type> actualArgs(method.argTypes);
+    if (method.positionalCount == 0 ||
+        method.positionalCount > actualArgs.size())
+      return false;
+    llvm::ArrayRef<mlir::Type> actualUserPositional =
+        actualArgs.take_front(method.positionalCount).drop_front();
+
+    std::size_t defaultCount =
+        std::min(method.defaultValues.size(), actualUserPositional.size());
+    std::size_t requiredActual = actualUserPositional.size() - defaultCount;
+    if (requiredActual > expectedUserPositional.size())
+      return false;
+
+    mlir::Type actualVarargElement = varargElementType(method.varargType);
+    if (expectedUserPositional.size() > actualUserPositional.size() &&
+        !actualVarargElement)
+      return false;
+
+    for (auto [index, expected] : llvm::enumerate(expectedUserPositional)) {
+      mlir::Type actual = index < actualUserPositional.size()
+                              ? actualUserPositional[index]
+                              : actualVarargElement;
+      if (!actual || !typeAssignable(actual, expected))
+        return false;
+    }
+
+    if (contract.signature.hasVararg()) {
+      mlir::Type expectedVarargElement =
+          varargElementType(contract.signature.getVarargType());
+      if (!actualVarargElement || !expectedVarargElement ||
+          !typeAssignable(actualVarargElement, expectedVarargElement))
+        return false;
+    }
+
+    llvm::ArrayRef<mlir::Type> expectedKwonly =
+        contract.signature.getKwOnlyTypes();
+    llvm::ArrayRef<mlir::Type> actualKwonly =
+        actualArgs.drop_front(method.positionalCount);
+    if (!expectedKwonly.empty() || !actualKwonly.empty()) {
+      std::size_t requiredActualKwonly = 0;
+      for (const parser::NodePtr &defaultValue : method.kwonlyDefaultValues)
+        if (!defaultValue)
+          ++requiredActualKwonly;
+      if (requiredActualKwonly > expectedKwonly.size())
+        return false;
+      if (expectedKwonly.size() > actualKwonly.size() && !method.kwargType)
+        return false;
+      for (auto [index, expected] : llvm::enumerate(expectedKwonly)) {
+        if (index >= actualKwonly.size())
+          break;
+        if (!typeAssignable(actualKwonly[index], expected))
+          return false;
+      }
+    }
+
+    if (contract.signature.hasKwarg() && !method.kwargType)
+      return false;
+
+    llvm::ArrayRef<mlir::Type> expectedResults =
+        contract.signature.getResultTypes();
+    if (expectedResults.size() != 1)
+      return false;
+    mlir::Type actualResult =
+        method.isAsync ? coroutineType(method.resultType) : method.resultType;
+    return typeAssignable(expectedResults.front(), actualResult);
+  };
+
+  for (const std::string &methodName : methodNames) {
+    auto methodSymbol = classFound->second.methods.find(methodName);
+    if (methodSymbol == classFound->second.methods.end())
+      return false;
+    auto methodFound = functions.find(methodSymbol->second);
+    if (methodFound == functions.end())
+      return false;
+
+    std::vector<protocols::ProtocolMethod> contracts =
+        table.methodContractsOn(protocol, methodName);
+    if (contracts.empty())
+      return false;
+    for (const protocols::ProtocolMethod &contract : contracts)
+      if (!methodSatisfiesContract(methodFound->second, contract))
+        return false;
+  }
+  return true;
+}
+
+bool Builder::Impl::classConformsToCallable(py::ClassType subtype,
+                                            py::CallableType callable) {
+  auto classFound = classes.find(subtype.getClassName().str());
+  if (classFound == classes.end())
+    return false;
+  if (!classFound->second.inheritanceResolved) {
+    if (!classFound->second.definition)
+      return false;
+    std::set<std::string> resolving;
+    if (!resolveClassInheritance(classFound->second.name,
+                                 *classFound->second.definition, resolving))
+      return false;
+    classFound = classes.find(subtype.getClassName().str());
+    if (classFound == classes.end() || !classFound->second.inheritanceResolved)
+      return false;
+  }
+
+  auto methodSymbol = classFound->second.methods.find("__call__");
+  if (methodSymbol == classFound->second.methods.end())
+    return false;
+  auto methodFound = functions.find(methodSymbol->second);
+  if (methodFound == functions.end())
+    return false;
+
+  auto varargElementType = [](mlir::Type varargType) -> mlir::Type {
+    auto tuple = mlir::dyn_cast_if_present<py::TupleType>(varargType);
+    if (!tuple || tuple.getElementTypes().size() != 1)
+      return {};
+    return tuple.getElementTypes().front();
+  };
+
+  const FunctionInfo &method = methodFound->second;
+  if (!method.methodKind.empty() && method.methodKind != "instance")
+    return false;
+  if (method.argTypes.empty() || !callable)
+    return false;
+
+  llvm::ArrayRef<mlir::Type> expectedUserPositional =
+      callable.getPositionalTypes();
+  llvm::ArrayRef<mlir::Type> actualArgs(method.argTypes);
+  if (method.positionalCount == 0 || method.positionalCount > actualArgs.size())
+    return false;
+  llvm::ArrayRef<mlir::Type> actualUserPositional =
+      actualArgs.take_front(method.positionalCount).drop_front();
+
+  std::size_t defaultCount =
+      std::min(method.defaultValues.size(), actualUserPositional.size());
+  std::size_t requiredActual = actualUserPositional.size() - defaultCount;
+  if (requiredActual > expectedUserPositional.size())
+    return false;
+
+  mlir::Type actualVarargElement = varargElementType(method.varargType);
+  if (expectedUserPositional.size() > actualUserPositional.size() &&
+      !actualVarargElement)
+    return false;
+
+  for (auto [index, expected] : llvm::enumerate(expectedUserPositional)) {
+    mlir::Type actual = index < actualUserPositional.size()
+                            ? actualUserPositional[index]
+                            : actualVarargElement;
+    if (!actual || !typeAssignable(actual, expected))
+      return false;
+  }
+
+  if (callable.hasVararg()) {
+    mlir::Type expectedVarargElement =
+        varargElementType(callable.getVarargType());
+    if (!actualVarargElement || !expectedVarargElement ||
+        !typeAssignable(actualVarargElement, expectedVarargElement))
+      return false;
+  }
+
+  llvm::ArrayRef<mlir::Type> expectedKwonly = callable.getKwOnlyTypes();
+  llvm::ArrayRef<mlir::Type> actualKwonly =
+      actualArgs.drop_front(method.positionalCount);
+  if (!expectedKwonly.empty() || !actualKwonly.empty()) {
+    std::size_t requiredActualKwonly = 0;
+    for (const parser::NodePtr &defaultValue : method.kwonlyDefaultValues)
+      if (!defaultValue)
+        ++requiredActualKwonly;
+    if (requiredActualKwonly > expectedKwonly.size())
+      return false;
+    if (expectedKwonly.size() > actualKwonly.size() && !method.kwargType)
+      return false;
+    for (auto [index, expected] : llvm::enumerate(expectedKwonly)) {
+      if (index >= actualKwonly.size())
+        break;
+      if (!typeAssignable(actualKwonly[index], expected))
+        return false;
+    }
+  }
+
+  if (callable.hasKwarg() && !method.kwargType)
+    return false;
+
+  llvm::ArrayRef<mlir::Type> expectedResults = callable.getResultTypes();
+  if (expectedResults.size() != 1)
+    return false;
+  mlir::Type actualResult =
+      method.isAsync ? coroutineType(method.resultType) : method.resultType;
+  return typeAssignable(expectedResults.front(), actualResult);
+}
+
+bool Builder::Impl::typeSubtypeOf(mlir::Type subtype, mlir::Type supertype) {
+  if (subtype == supertype)
+    return true;
+  if (!subtype || !supertype)
+    return false;
+
+  if (mlir::isa<py::ObjectType>(supertype))
+    return py::isPyType(subtype);
+
+  auto subtypeOfUnionMember = [&](mlir::Type candidate,
+                                  py::UnionType unionType) {
+    return llvm::any_of(unionType.getMemberTypes(), [&](mlir::Type member) {
+      return typeSubtypeOf(candidate, member);
+    });
+  };
+
+  if (auto superUnion = mlir::dyn_cast<py::UnionType>(supertype)) {
+    if (auto subUnion = mlir::dyn_cast<py::UnionType>(subtype)) {
+      return llvm::all_of(subUnion.getMemberTypes(), [&](mlir::Type member) {
+        return subtypeOfUnionMember(member, superUnion);
+      });
+    }
+    return subtypeOfUnionMember(subtype, superUnion);
+  }
+
+  if (auto subUnion = mlir::dyn_cast<py::UnionType>(subtype)) {
+    return llvm::all_of(subUnion.getMemberTypes(), [&](mlir::Type member) {
+      return typeSubtypeOf(member, supertype);
+    });
+  }
+
+  if (py::CallableType superCallable = py::getCallableContract(supertype)) {
+    if (!py::getCallableContract(subtype)) {
+      if (auto subClass = mlir::dyn_cast<py::ClassType>(subtype))
+        return classConformsToCallable(subClass, superCallable);
+      return false;
+    }
+  }
+
+  if (auto superProtocol = mlir::dyn_cast<py::ProtocolType>(supertype)) {
+    if (protocols::Table::get(context).conformsTo(subtype, superProtocol))
+      return true;
+    if (auto subClass = mlir::dyn_cast<py::ClassType>(subtype))
+      return classConformsToProtocol(subClass, superProtocol);
+    return false;
+  }
+
+  auto subClass = mlir::dyn_cast<py::ClassType>(subtype);
+  auto superClass = mlir::dyn_cast<py::ClassType>(supertype);
+  if (subClass && superClass)
+    return classSubtypeOf(subClass.getClassName(), superClass.getClassName());
+
+  auto subTuple = mlir::dyn_cast<py::TupleType>(subtype);
+  auto superTuple = mlir::dyn_cast<py::TupleType>(supertype);
+  if (subTuple && superTuple) {
+    auto subElems = subTuple.getElementTypes();
+    auto superElems = superTuple.getElementTypes();
+    if (subElems.size() != superElems.size())
+      return false;
+    for (auto [sub, sup] : llvm::zip(subElems, superElems))
+      if (!typeSubtypeOf(sub, sup))
+        return false;
+    return true;
+  }
+
+  auto subList = mlir::dyn_cast<py::ListType>(subtype);
+  auto superList = mlir::dyn_cast<py::ListType>(supertype);
+  if (subList && superList)
+    return subList.getElementType() == superList.getElementType();
+
+  auto subDict = mlir::dyn_cast<py::DictType>(subtype);
+  auto superDict = mlir::dyn_cast<py::DictType>(supertype);
+  if (subDict && superDict)
+    return subDict.getKeyType() == superDict.getKeyType() &&
+           subDict.getValueType() == superDict.getValueType();
+
+  py::CallableType subSig = py::getCallableContract(subtype);
+  py::CallableType superSig = py::getCallableContract(supertype);
+  if (subSig && superSig) {
+    if (isCallableEllipsisContract(superSig)) {
+      if (subSig.getResultTypes().size() != superSig.getResultTypes().size())
+        return false;
+      for (auto [subResult, superResult] :
+           llvm::zip(subSig.getResultTypes(), superSig.getResultTypes()))
+        if (!typeSubtypeOf(subResult, superResult))
+          return false;
+      return true;
+    }
+    if (isCallableEllipsisContract(subSig))
+      return false;
+    if ((!subSig.hasVararg() && superSig.hasVararg()) ||
+        (superSig.hasKwarg() && !subSig.hasKwarg()) ||
+        subSig.getPositionalOnlyCount() > superSig.getPositionalOnlyCount())
+      return false;
+    if (subSig.getKwOnlyTypes().size() != superSig.getKwOnlyTypes().size() ||
+        subSig.getResultTypes().size() != superSig.getResultTypes().size())
+      return false;
+    llvm::ArrayRef<mlir::Type> subPositional = subSig.getPositionalTypes();
+    llvm::ArrayRef<mlir::Type> superPositional = superSig.getPositionalTypes();
+    if (!subSig.hasVararg() && subPositional.size() != superPositional.size())
+      return false;
+    if (subSig.hasVararg() && !superSig.hasVararg() &&
+        subPositional.size() > superPositional.size())
+      return false;
+    mlir::Type subVarargElement =
+        subSig.hasVararg() ? callableVarargElementType(subSig.getVarargType())
+                           : mlir::Type();
+    if (subSig.hasVararg() && !subVarargElement)
+      return false;
+    for (auto [index, superArg] : llvm::enumerate(superPositional)) {
+      mlir::Type subArg = index < subPositional.size() ? subPositional[index]
+                                                       : subVarargElement;
+      if (!subArg)
+        return false;
+      if (index < subPositional.size() && subArg != superArg)
+        return false;
+      if (index >= subPositional.size() && !typeSubtypeOf(superArg, subArg))
+        return false;
+    }
+    for (auto [subArg, superArg] :
+         llvm::zip(subSig.getKwOnlyTypes(), superSig.getKwOnlyTypes()))
+      if (!typeSubtypeOf(superArg, subArg))
+        return false;
+    if (superSig.hasVararg()) {
+      mlir::Type superVarargElement =
+          callableVarargElementType(superSig.getVarargType());
+      if (!superVarargElement ||
+          !typeSubtypeOf(superVarargElement, subVarargElement))
+        return false;
+    }
+    if (superSig.hasKwarg() &&
+        !typeSubtypeOf(superSig.getKwargType(), subSig.getKwargType()))
+      return false;
+    for (auto [subResult, superResult] :
+         llvm::zip(subSig.getResultTypes(), superSig.getResultTypes()))
+      if (!typeSubtypeOf(subResult, superResult))
+        return false;
+    return true;
+  }
+
+  return py::isSubtypeOf(subtype, supertype);
+}
+
+std::optional<std::string>
+Builder::Impl::mostSpecificKnownClass(const Value &value) const {
+  if (value.exactClass)
+    return value.exactClass;
+  if (value.provenClass)
+    return value.provenClass;
+  if (value.type) {
+    auto classType = mlir::dyn_cast<py::ClassType>(value.type);
+    if (classType)
+      return classType.getClassName().str();
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string>
+Builder::Impl::classFactForView(const Value &value) const {
+  if (value.exactClass)
+    return value.exactClass;
+  if (value.provenClass)
+    return value.provenClass;
+  return std::nullopt;
+}
+
+Value Builder::Impl::markExactClass(Value value,
+                                    llvm::StringRef className) const {
+  value.exactClass = className.str();
+  value.provenClass = className.str();
+  return value;
+}
+
+Value Builder::Impl::markProvenClass(Value value,
+                                     llvm::StringRef className) const {
+  if (value.exactClass)
+    return value;
+  if (value.provenClass && classSubtypeOf(*value.provenClass, className))
+    return value;
+  value.provenClass = className.str();
+  return value;
+}
+
+std::optional<Value>
+Builder::Impl::concreteProtocolValue(const Value &value) const {
+  if (!value.value || !mlir::isa<py::ProtocolType>(value.type) ||
+      !value.protocolConcreteType)
+    return std::nullopt;
+  mlir::Type concrete = *value.protocolConcreteType;
+  if (!concrete || mlir::isa<py::ProtocolType>(concrete) ||
+      concrete == value.type)
+    return std::nullopt;
+  if (value.value.getType() != concrete)
+    return std::nullopt;
+  return Value{value.value, concrete, value.exactClass, value.provenClass};
+}
+
+Value Builder::Impl::applyReturnedClassSummary(Value value,
+                                               const FunctionInfo &info) const {
+  if (!value.value || !info.returnedExactClass)
+    return value;
+  return markExactClass(std::move(value), *info.returnedExactClass);
+}
+
+Value Builder::Impl::viewClassAs(const parser::Node &anchor, Value value,
+                                 llvm::StringRef targetClassName) {
+  py::ClassType inputClass =
+      value.type ? mlir::dyn_cast<py::ClassType>(value.type) : py::ClassType();
+  if (!value.value || !inputClass) {
+    error(anchor, "class view refinement requires a class value");
+    return Value{{}, classType(targetClassName)};
+  }
+
+  py::ClassType targetType = classType(targetClassName);
+  if (inputClass.getClassName() == targetClassName) {
+    if (value.exactClass &&
+        !classSubtypeOf(*value.exactClass, targetClassName)) {
+      value.exactClass.reset();
+    }
+    return markProvenClass(std::move(value), targetClassName);
+  }
+
+  if (typeSubtypeOf(value.type, targetType)) {
+    mlir::Value cast =
+        builder.create<py::ClassUpcastOp>(loc(anchor), targetType, value.value);
+    Value result{cast, targetType, value.exactClass, value.provenClass};
+    std::optional<std::string> fact = mostSpecificKnownClass(value);
+    if (fact)
+      result.provenClass = *fact;
+    return result;
+  }
+
+  if (!classSubtypeOf(targetClassName, inputClass.getClassName())) {
+    error(anchor, "class view refinement from " + typeString(value.type) +
+                      " to " + typeString(targetType) +
+                      " is not a nominal downcast");
+    return Value{{}, targetType};
+  }
+
+  std::optional<std::string> fact = classFactForView(value);
+  if (fact && !classSubtypeOf(*fact, targetClassName)) {
+    error(anchor, "known runtime class '" + *fact +
+                      "' is not compatible with refined view " +
+                      typeString(targetType));
+    return Value{{}, targetType};
+  }
+
+  mlir::Value refined =
+      builder.create<py::ClassRefineOp>(loc(anchor), targetType, value.value);
+  Value result{refined, targetType, value.exactClass, value.provenClass};
+  result = markProvenClass(std::move(result), targetClassName);
+  return result;
+}
+
+std::vector<Builder::Impl::UnionMemberMatch>
+Builder::Impl::unionMembersMatchingType(py::UnionType unionType,
+                                        mlir::Type tested,
+                                        bool requireLayoutCompatibleDowncast) {
+  std::vector<UnionMemberMatch> matches;
+  if (!unionType || !tested)
+    return matches;
+  for (mlir::Type member : unionType.getMemberTypes()) {
+    if (mlir::isa<py::NoneType>(tested)) {
+      if (mlir::isa<py::NoneType>(member))
+        matches.push_back(UnionMemberMatch{member, member});
+      continue;
+    }
+    if (typeSubtypeOf(member, tested)) {
+      matches.push_back(UnionMemberMatch{member, member});
+      continue;
+    }
+    auto memberClass = mlir::dyn_cast<py::ClassType>(member);
+    auto testedClass = mlir::dyn_cast<py::ClassType>(tested);
+    if (memberClass && testedClass &&
+        classSubtypeOf(testedClass.getClassName(),
+                       memberClass.getClassName()) &&
+        (!requireLayoutCompatibleDowncast ||
+         classLayoutCompatible(testedClass.getClassName(),
+                               memberClass.getClassName())))
+      matches.push_back(UnionMemberMatch{member, tested});
+  }
+  return matches;
+}
+
 bool Builder::Impl::typeAssignable(mlir::Type expected, mlir::Type actual) {
   auto &byActual = typeAssignableCache[expected];
   auto cached = byActual.find(actual);
@@ -2113,6 +3232,32 @@ bool Builder::Impl::typeAssignable(mlir::Type expected, mlir::Type actual) {
 
   if (!expected || !actual)
     return remember(false);
+
+  std::string assignabilityKey =
+      typeString(expected) + "<-" + typeString(actual);
+  if (activeTypeAssignable.count(assignabilityKey))
+    return true;
+  activeTypeAssignable.insert(assignabilityKey);
+  struct TypeAssignableGuard {
+    std::set<std::string> &active;
+    std::string key;
+    ~TypeAssignableGuard() { active.erase(key); }
+  } guard{activeTypeAssignable, assignabilityKey};
+
+  if (auto expectedProtocol = mlir::dyn_cast<py::ProtocolType>(expected)) {
+    if (protocols::Table::get(context).conformsTo(actual, expectedProtocol))
+      return remember(true);
+    if (auto actualClass = mlir::dyn_cast<py::ClassType>(actual)) {
+      if (classConformsToProtocol(actualClass, expectedProtocol))
+        return remember(true);
+      return false;
+    }
+  }
+
+  // Subtyping is assignability. The IR-level representation adaptation
+  // remains a separate concern handled by coerceToExpectedType where needed.
+  if (typeSubtypeOf(actual, expected))
+    return remember(true);
 
   std::optional<typing::Term> expectedTerm = typeTermFromType(expected);
   std::optional<typing::Term> actualTerm = typeTermFromType(actual);
@@ -2144,6 +3289,247 @@ bool Builder::Impl::typeAssignable(mlir::Type expected, mlir::Type actual) {
   }
 }
 
+std::optional<protocols::ProtocolMethod>
+Builder::Impl::resolveProtocolMethodContract(
+    const parser::Node &anchor, mlir::Type receiverType,
+    llvm::StringRef methodName, llvm::ArrayRef<mlir::Type> argumentTypes,
+    llvm::StringRef contextLabel) {
+  std::optional<protocols::ProtocolMethod> contract =
+      protocols::Table::get(context).resolveMethodContractOn(
+          receiverType, methodName, argumentTypes);
+  if (!contract) {
+    std::string message = contextLabel.str() + " has no " + methodName.str() +
+                          " contract on " + typeString(receiverType) +
+                          " for argument types";
+    if (argumentTypes.empty()) {
+      message += " []";
+    } else {
+      message += " [";
+      llvm::raw_string_ostream os(message);
+      for (auto indexed : llvm::enumerate(argumentTypes)) {
+        if (indexed.index() != 0)
+          os << ", ";
+        indexed.value().print(os);
+      }
+      os << "]";
+    }
+    error(anchor, message);
+    return std::nullopt;
+  }
+  return contract;
+}
+
+std::optional<mlir::Type> Builder::Impl::resolveProtocolMethodResult(
+    const parser::Node &anchor, mlir::Type receiverType,
+    llvm::StringRef methodName, llvm::ArrayRef<mlir::Type> argumentTypes,
+    llvm::StringRef contextLabel) {
+  std::optional<protocols::ProtocolMethod> contract =
+      resolveProtocolMethodContract(anchor, receiverType, methodName,
+                                    argumentTypes, contextLabel);
+  if (!contract)
+    return std::nullopt;
+
+  llvm::ArrayRef<mlir::Type> results = contract->signature.getResultTypes();
+  if (results.size() != 1) {
+    error(anchor, contextLabel.str() + " contract " + methodName.str() +
+                      " on " + typeString(receiverType) +
+                      " must return one "
+                      "value, got " +
+                      std::to_string(results.size()));
+    return std::nullopt;
+  }
+  return results.front();
+}
+
+py::CallableType Builder::Impl::unaryMethodContract(mlir::Type receiverType,
+                                                    mlir::Type argumentType,
+                                                    mlir::Type resultType) {
+  return py::CallableType::get(&context, {receiverType, argumentType}, {}, {},
+                               {}, {resultType});
+}
+
+py::CallableType Builder::Impl::containsMethodContract(mlir::Type receiverType,
+                                                       mlir::Type itemType) {
+  return unaryMethodContract(receiverType, itemType, boolType());
+}
+
+// Protocol oracle: the conformance closure of the abstract container table
+// (rfc/iterator-protocol.md). Iterable[T]/Iterator[T]/Container[T]/Sized/
+// Reversible[T]/Collection[T]/Sequence[T] form the abstraction tower; these
+// queries answer what the expansion of a concrete type's bases yields.
+//   list[T]        |- Sequence[T]            -> Iterable[T], Sized
+//   tuple[T, ...]  |- Sequence[T]   (homogeneous)
+//   str            |- Sequence[str]
+//   dict[K, V]     |- Collection[K]          -> Iterable[K], Sized
+//   range          |- Sequence[int] (final)
+//   Iterator[E]    |- Iterable[E]
+std::optional<mlir::Type>
+Builder::Impl::protocolIterableElement(mlir::Type type) {
+  const protocols::Table &table = protocols::Table::get(context);
+  std::optional<mlir::Type> result =
+      table.resolveMethodResultOn(type, "__iter__", {});
+  if (!result)
+    return std::nullopt;
+  auto iterator = mlir::dyn_cast<py::ProtocolType>(*result);
+  if (!iterator || iterator.getProtocolName() != "Iterator" ||
+      iterator.getArguments().size() != 1)
+    return std::nullopt;
+  return iterator.getArguments().front();
+}
+
+std::optional<mlir::Type>
+Builder::Impl::protocolAsyncIterableElement(mlir::Type type) {
+  const protocols::Table &table = protocols::Table::get(context);
+  std::optional<mlir::Type> iteratorType =
+      table.resolveMethodResultOn(type, "__aiter__", {});
+  if (!iteratorType)
+    return std::nullopt;
+
+  std::optional<mlir::Type> awaitableType =
+      table.resolveMethodResultOn(*iteratorType, "__anext__", {});
+  if (!awaitableType)
+    return std::nullopt;
+
+  mlir::Type payloadType = awaitablePayloadType(*awaitableType);
+  if (!payloadType)
+    return std::nullopt;
+  return payloadType;
+}
+
+Value Builder::Impl::coerceToExpectedType(const parser::Node &anchor,
+                                          Value value, mlir::Type expected) {
+  if (!value.value || !expected || value.type == expected)
+    return value;
+
+  if (mlir::isa<py::BoolType>(expected)) {
+    auto integer = mlir::dyn_cast<mlir::IntegerType>(value.type);
+    if (integer && integer.getWidth() == 1) {
+      mlir::Value boxed = builder.create<py::CastFromPrimOp>(
+          loc(anchor), expected, value.value);
+      return Value{boxed, expected};
+    }
+  }
+  if (mlir::isa<py::IntType>(expected) &&
+      mlir::isa<mlir::IntegerType>(value.type)) {
+    mlir::Value boxed =
+        builder.create<py::CastFromPrimOp>(loc(anchor), expected, value.value);
+    return Value{boxed, expected};
+  }
+  if (mlir::isa<py::FloatType>(expected) &&
+      mlir::isa<mlir::FloatType>(value.type)) {
+    mlir::Value boxed =
+        builder.create<py::CastFromPrimOp>(loc(anchor), expected, value.value);
+    return Value{boxed, expected};
+  }
+
+  if (py::isCallableType(expected)) {
+    if (py::isCallableType(value.type) && typeAssignable(expected, value.type))
+      return value;
+    if (py::isCallableType(value.type) && value.callableInfo &&
+        (value.callableInfo->varargParameterPack ||
+         value.callableInfo->kwargParameterPack)) {
+      py::CallableType pack = value.callableInfo->varargParameterPack
+                                  ? value.callableInfo->varargParameterPack
+                                  : value.callableInfo->kwargParameterPack;
+      mlir::Type externalType =
+          callableSignatureWithResult(pack, value.callableInfo->resultType);
+      if (typeAssignable(expected, externalType)) {
+        mlir::Value cast = builder
+                               .create<mlir::UnrealizedConversionCastOp>(
+                                   loc(anchor), expected, value.value)
+                               .getResult(0);
+        Value result{cast, expected};
+        result.callableInfo = value.callableInfo;
+        return result;
+      }
+    }
+  }
+
+  if (mlir::isa<py::ProtocolType>(value.type) && value.protocolConcreteType &&
+      !mlir::isa<py::ProtocolType>(expected) &&
+      typeAssignable(expected, *value.protocolConcreteType)) {
+    if (std::optional<Value> concrete = concreteProtocolValue(value))
+      return *concrete;
+  }
+
+  if (auto expectedProtocol = mlir::dyn_cast<py::ProtocolType>(expected)) {
+    mlir::Type concrete =
+        value.protocolConcreteType ? *value.protocolConcreteType : value.type;
+    if (concrete && !mlir::isa<py::ProtocolType>(concrete) &&
+        typeAssignable(expectedProtocol, concrete))
+      return Value{value.value, expectedProtocol, value.exactClass,
+                   value.provenClass, concrete};
+  }
+
+  auto upcastClass = [&](Value input, mlir::Type target) -> Value {
+    auto inputClass = mlir::dyn_cast<py::ClassType>(input.type);
+    auto targetClass = mlir::dyn_cast<py::ClassType>(target);
+    if (!input.value || !inputClass || !targetClass ||
+        !typeSubtypeOf(input.type, target) || input.type == target)
+      return input;
+    mlir::Value cast =
+        builder.create<py::ClassUpcastOp>(loc(anchor), target, input.value);
+    Value result{cast, target, input.exactClass, input.provenClass};
+    std::optional<std::string> fact = mostSpecificKnownClass(input);
+    if (fact)
+      result.provenClass = *fact;
+    return result;
+  };
+
+  if (auto expectedClass = mlir::dyn_cast<py::ClassType>(expected)) {
+    if (mlir::isa<py::UnionType>(value.type) &&
+        (typeSubtypeOf(value.type, expected) ||
+         (classFactForView(value) &&
+          classSubtypeOf(*classFactForView(value),
+                         expectedClass.getClassName())))) {
+      mlir::Value unwrapped =
+          builder.create<py::UnionUnwrapOp>(loc(anchor), expected, value.value);
+      Value result{unwrapped, expected, value.exactClass, value.provenClass};
+      if (result.exactClass &&
+          !classSubtypeOf(*result.exactClass, expectedClass.getClassName()))
+        result.exactClass.reset();
+      result = markProvenClass(std::move(result), expectedClass.getClassName());
+      return result;
+    }
+    if (auto valueClass = mlir::dyn_cast<py::ClassType>(value.type)) {
+      if (!typeSubtypeOf(value.type, expected) &&
+          classSubtypeOf(expectedClass.getClassName(),
+                         valueClass.getClassName())) {
+        std::optional<std::string> fact = classFactForView(value);
+        if (fact && classSubtypeOf(*fact, expectedClass.getClassName()))
+          return viewClassAs(anchor, std::move(value),
+                             expectedClass.getClassName());
+      }
+    }
+    return upcastClass(value, expected);
+  }
+
+  auto unionType = mlir::dyn_cast<py::UnionType>(expected);
+  if (!unionType)
+    return value;
+  if (auto valueUnion = mlir::dyn_cast<py::UnionType>(value.type)) {
+    // Subset widening: union<...S> flows into union<...T> when S ⊆ T.
+    if (!py::isSubtypeOf(valueUnion, unionType))
+      return value;
+  } else if (!unionType.hasMember(value.type)) {
+    mlir::Type matchingMember;
+    for (mlir::Type member : unionType.getMemberTypes()) {
+      if (typeSubtypeOf(value.type, member)) {
+        matchingMember = member;
+        break;
+      }
+    }
+    if (!matchingMember)
+      return value;
+    value = upcastClass(value, matchingMember);
+    if (value.type != matchingMember)
+      return value;
+  }
+  mlir::Value wrapped =
+      builder.create<py::UnionWrapOp>(loc(anchor), expected, value.value);
+  return Value{wrapped, expected, value.exactClass, value.provenClass};
+}
+
 mlir::Type Builder::Impl::typeFromClassAnnotation(llvm::StringRef className) {
   auto found = classes.find(className.str());
   if (found == classes.end())
@@ -2162,6 +3548,34 @@ Builder::Impl::dictKeyValueTypes(mlir::Type type) {
   if (auto dict = mlir::dyn_cast<py::DictType>(type))
     return std::make_pair(dict.getKeyType(), dict.getValueType());
   return std::nullopt;
+}
+
+mlir::Type
+Builder::Impl::listLiteralElementTypeForExpected(mlir::Type expectedType) {
+  if (mlir::Type element = listElementType(expectedType))
+    return element;
+  std::optional<mlir::Type> protocolElement =
+      protocolIterableElement(expectedType);
+  return protocolElement ? *protocolElement : mlir::Type();
+}
+
+std::optional<std::pair<mlir::Type, mlir::Type>>
+Builder::Impl::protocolMappingKeyValueTypes(mlir::Type type) {
+  auto protocol = mlir::dyn_cast<py::ProtocolType>(type);
+  if (!protocol || protocol.getArguments().size() < 2)
+    return std::nullopt;
+  llvm::StringRef name = protocol.getProtocolName();
+  if (name != "Mapping" && name != "MutableMapping")
+    return std::nullopt;
+  return std::make_pair(protocol.getArguments()[0], protocol.getArguments()[1]);
+}
+
+std::optional<std::pair<mlir::Type, mlir::Type>>
+Builder::Impl::dictLiteralKeyValueTypesForExpected(mlir::Type expectedType) {
+  if (std::optional<std::pair<mlir::Type, mlir::Type>> dictTypes =
+          dictKeyValueTypes(expectedType))
+    return dictTypes;
+  return protocolMappingKeyValueTypes(expectedType);
 }
 
 bool Builder::Impl::dictStorageSupported(mlir::Type keyType,
@@ -2301,17 +3715,7 @@ Builder::Impl::primitiveScalarConstructorConstant(const parser::Node &node) {
 }
 
 mlir::Type Builder::Impl::awaitablePayloadType(mlir::Type type) {
-  if (!type)
-    return {};
-  if (auto coro = mlir::dyn_cast<py::CoroutineType>(type))
-    return coro.getResultType();
-  if (auto task = mlir::dyn_cast<py::TaskType>(type))
-    return task.getResultType();
-  if (auto future = mlir::dyn_cast<py::FutureType>(type))
-    return future.getResultType();
-  if (auto asyncValue = mlir::dyn_cast<mlir::async::ValueType>(type))
-    return asyncValue.getValueType();
-  return {};
+  return protocols::Table::get(context).awaitablePayloadType(type);
 }
 
 } // namespace lython::emitter

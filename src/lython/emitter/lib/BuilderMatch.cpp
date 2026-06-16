@@ -199,8 +199,11 @@ mlir::Value Builder::Impl::emitMatchPatternCondition(
       }
       mlir::Value indexValue = builder.create<mlir::arith::ConstantIndexOp>(
           loc(*child), static_cast<int64_t>(index));
-      mlir::Value component = builder.create<py::TupleGetOp>(
-          loc(*child), elementTypes[index], subject.value, indexValue);
+      py::CallableType contract = unaryMethodContract(
+          subject.type, indexValue.getType(), elementTypes[index]);
+      mlir::Value component =
+          builder.create<py::GetItemOp>(loc(*child), elementTypes[index],
+                                        contract, subject.value, indexValue);
       mlir::Value condition = emitMatchPatternCondition(
           *child, Value{component, elementTypes[index]}, captures);
       if (!condition)
@@ -257,17 +260,15 @@ void Builder::Impl::emitMatch(const parser::Node &stmt) {
     bool unsupported = false;
   };
 
-  auto directNameTarget = [](const parser::Node &target,
-                             llvm::StringRef name) {
+  auto directNameTarget = [](const parser::Node &target, llvm::StringRef name) {
     if (target.kind != "Name")
       return false;
     const std::string *targetName = stringField(target, "id");
     return targetName && *targetName == name;
   };
 
-  auto inferDirectBinding =
-      [&](const parser::Node &branchStmt,
-          llvm::StringRef name) -> BranchBinding {
+  auto inferDirectBinding = [&](const parser::Node &branchStmt,
+                                llvm::StringRef name) -> BranchBinding {
     if (branchStmt.kind == "Assign") {
       const std::vector<parser::NodePtr> *targets =
           nodeListField(branchStmt, "targets");
@@ -312,9 +313,8 @@ void Builder::Impl::emitMatch(const parser::Node &stmt) {
     return BranchBinding{};
   };
 
-  auto inferCaseBinding =
-      [&](const std::vector<parser::NodePtr> &statements,
-          llvm::StringRef name) -> BranchBinding {
+  auto inferCaseBinding = [&](const std::vector<parser::NodePtr> &statements,
+                              llvm::StringRef name) -> BranchBinding {
     BranchBinding current;
     for (const parser::NodePtr &child : statements) {
       if (!child)
@@ -413,9 +413,9 @@ void Builder::Impl::emitMatch(const parser::Node &stmt) {
     std::vector<std::pair<std::string, Value>> captures;
     symbols = outerSymbols;
     callableAliases = outerCallableAliases;
-    bool exhaustiveFinalCase =
-        caseIndex + 1 == cases->size() && (!guard || !*guard) &&
-        isExhaustiveMatchAs(**pattern);
+    bool exhaustiveFinalCase = caseIndex + 1 == cases->size() &&
+                               (!guard || !*guard) &&
+                               isExhaustiveMatchAs(**pattern);
     mlir::Value condition;
     if (exhaustiveFinalCase) {
       if (const std::string *name = stringField(**pattern, "name"))

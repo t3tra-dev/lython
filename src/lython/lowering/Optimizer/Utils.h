@@ -54,8 +54,8 @@ namespace publication {
 
 bool tracks(mlir::Type type);
 bool result(mlir::Operation *funcLike, unsigned resultIndex);
-int entryArg(FuncOp func, mlir::Value value);
-bool update(FuncOp func, const llvm::DenseSet<int> &publishesArgs,
+int entryArg(CallableFuncOp func, mlir::Value value);
+bool update(CallableFuncOp func, const llvm::DenseSet<int> &publishesArgs,
             const llvm::DenseSet<int> &capturesPublished,
             const llvm::DenseSet<int> &returnsPublished,
             const llvm::DenseSet<int> &readonlyArgs,
@@ -68,7 +68,7 @@ void prepare(mlir::ModuleOp module);
 
 namespace call {
 
-FuncOp pyFunc(mlir::Operation *from, mlir::Value callable);
+CallableFuncOp pyFunc(mlir::Operation *from, mlir::Value callable);
 mlir::func::FuncOp localSelfHelper(mlir::func::FuncOp callee,
                                    mlir::ModuleOp module);
 mlir::func::FuncOp freshInitHelper(mlir::func::FuncOp callee,
@@ -82,23 +82,11 @@ mlir::func::FuncOp preferredTarget(mlir::func::FuncOp callee,
                                    mlir::ModuleOp module);
 
 template <typename CallbackT>
-void forEachDirectPositionalOperand(CallVectorOp op, CallbackT &&callback) {
+void forEachDirectPositionalOperand(CallOp op, CallbackT &&callback) {
   auto kwnames = value::stripCasts(op.getKwnames());
   auto kwvalues = value::stripCasts(op.getKwvalues());
   if (!mlir::isa_and_nonnull<TupleEmptyOp>(kwnames.getDefiningOp()) ||
       !mlir::isa_and_nonnull<TupleEmptyOp>(kwvalues.getDefiningOp()))
-    return;
-
-  mlir::Value posargs = value::stripCasts(op.getPosargs());
-  if (auto tupleCreate = posargs.getDefiningOp<TupleCreateOp>())
-    for (auto [idx, operand] : llvm::enumerate(tupleCreate.getOperands()))
-      callback(static_cast<unsigned>(idx), operand);
-}
-
-template <typename CallbackT>
-void forEachDirectPositionalOperand(CallOp op, CallbackT &&callback) {
-  mlir::Value kwargs = value::stripCasts(op.getKwargs());
-  if (!mlir::isa_and_nonnull<NoneOp>(kwargs.getDefiningOp()))
     return;
 
   mlir::Value posargs = value::stripCasts(op.getPosargs());

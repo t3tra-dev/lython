@@ -1,5 +1,5 @@
-#include "lython/parser/CpythonContract.h"
-#include "lython/parser/CpythonSpec.h"
+#include "CpythonContract.h"
+#include "CpythonSpec.h"
 
 #include <cctype>
 #include <cstdlib>
@@ -117,12 +117,10 @@ void writeList(std::ostream &os, const Range &range, Writer writer) {
   os << "}";
 }
 
-void writeStringList(std::ostream &os,
-                     const std::vector<std::string> &values) {
-  writeList(os, values,
-            [](std::ostream &out, const std::string &value) {
-              writeString(out, value);
-            });
+void writeStringList(std::ostream &os, const std::vector<std::string> &values) {
+  writeList(os, values, [](std::ostream &out, const std::string &value) {
+    writeString(out, value);
+  });
 }
 
 void writeExpr(std::ostream &os, const lython::parser::CpythonPegExpr &expr);
@@ -146,15 +144,14 @@ void writeExpr(std::ostream &os, const lython::parser::CpythonPegExpr &expr) {
   writeString(os, expr.label);
   os << ", ";
   writeList(os, expr.children,
-            [](std::ostream &out,
-               const lython::parser::CpythonPegExpr &child) {
+            [](std::ostream &out, const lython::parser::CpythonPegExpr &child) {
               writeExpr(out, child);
             });
   os << "}";
 }
 
-void writeAlternative(
-    std::ostream &os, const lython::parser::CpythonPegAlternative &alt) {
+void writeAlternative(std::ostream &os,
+                      const lython::parser::CpythonPegAlternative &alt) {
   os << "CpythonPegAlternative{";
   writeExpr(os, alt.expr);
   os << ", ";
@@ -290,34 +287,33 @@ void writeSpec(std::ostream &os, const lython::parser::CpythonSpec &spec) {
     out << "{";
     writeString(out, entry.first);
     out << ", ";
-    writeList(out, entry.second,
-              [](std::ostream &nested,
-                 const lython::parser::AstFieldSpec &field) {
-                nested << "AstFieldSpec{";
-                writeString(nested, field.name);
-                nested << ", ";
-                writeString(nested, field.type);
-                nested << ", " << (field.optional ? "true" : "false")
-                       << ", " << (field.sequence ? "true" : "false")
-                       << ", "
-                       << (field.nullableElement ? "true" : "false") << "}";
-              });
+    writeList(
+        out, entry.second,
+        [](std::ostream &nested, const lython::parser::AstFieldSpec &field) {
+          nested << "AstFieldSpec{";
+          writeString(nested, field.name);
+          nested << ", ";
+          writeString(nested, field.type);
+          nested << ", " << (field.optional ? "true" : "false") << ", "
+                 << (field.sequence ? "true" : "false") << ", "
+                 << (field.nullableElement ? "true" : "false") << "}";
+        });
     out << "}";
   });
   os << ";\n";
 
   os << "  spec.generatedRules = ";
-  writeList(os, spec.generatedRules,
-            [](std::ostream &out,
-               const lython::parser::GeneratedRuleSpec &rule) {
-              out << "GeneratedRuleSpec{";
-              writeString(out, rule.name);
-              out << ", ";
-              writeString(out, rule.functionName);
-              out << ", ";
-              writeString(out, rule.returnType);
-              out << ", " << rule.typeId << "}";
-            });
+  writeList(
+      os, spec.generatedRules,
+      [](std::ostream &out, const lython::parser::GeneratedRuleSpec &rule) {
+        out << "GeneratedRuleSpec{";
+        writeString(out, rule.name);
+        out << ", ";
+        writeString(out, rule.functionName);
+        out << ", ";
+        writeString(out, rule.returnType);
+        out << ", " << rule.typeId << "}";
+      });
   os << ";\n";
 
   os << "  spec.generatedRuleIndices = ";
@@ -330,27 +326,28 @@ void writeSpec(std::ostream &os, const lython::parser::CpythonSpec &spec) {
   os << ";\n";
 
   os << "  spec.peg.rules = ";
-  writeList(os, spec.peg.rules, [](std::ostream &out,
-                                   const lython::parser::CpythonPegRule &rule) {
-    out << "CpythonPegRule{";
-    writeString(out, rule.name);
-    out << ", ";
-    writeString(out, rule.returnType);
-    out << ", " << (rule.memo ? "true" : "false") << ", "
-        << (rule.invalid ? "true" : "false") << ", ";
-    writeExpr(out, rule.expr);
-    out << ", ";
-    writeFirstSet(out, rule.first);
-    out << ", ";
-    writeFirstSet(out, rule.recoveryFirst);
-    out << ", ";
-    writeList(out, rule.alternatives,
-              [](std::ostream &nested,
-                 const lython::parser::CpythonPegAlternative &alternative) {
-                writeAlternative(nested, alternative);
-              });
-    out << "}";
-  });
+  writeList(os, spec.peg.rules,
+            [](std::ostream &out, const lython::parser::CpythonPegRule &rule) {
+              out << "CpythonPegRule{";
+              writeString(out, rule.name);
+              out << ", ";
+              writeString(out, rule.returnType);
+              out << ", " << (rule.memo ? "true" : "false") << ", "
+                  << (rule.invalid ? "true" : "false") << ", ";
+              writeExpr(out, rule.expr);
+              out << ", ";
+              writeFirstSet(out, rule.first);
+              out << ", ";
+              writeFirstSet(out, rule.recoveryFirst);
+              out << ", ";
+              writeList(
+                  out, rule.alternatives,
+                  [](std::ostream &nested,
+                     const lython::parser::CpythonPegAlternative &alternative) {
+                    writeAlternative(nested, alternative);
+                  });
+              out << "}";
+            });
   os << ";\n";
 
   os << "  spec.peg.ruleIndices = ";

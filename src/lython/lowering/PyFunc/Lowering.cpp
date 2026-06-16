@@ -1,25 +1,15 @@
-// This file implements lowering patterns for py.func, py.return, and
-// py.func_object operations. These patterns convert Python-style function
+// This file implements lowering patterns for py.callable.func, py.return, and
+// py.callable.object operations. These patterns convert Python-style function
 // definitions to standard MLIR func dialect operations.
 
 #include "Common/Container.h"
 #include "Common/LoweringUtils.h"
 #include "Common/Object.h"
 #include "Common/RuntimeSupport.h"
-#include "Common/SlotUtils.h"
-
-#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/IRMapping.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/SmallString.h"
-#include "llvm/ADT/StringExtras.h"
-#include "llvm/ADT/StringMap.h"
-#include "llvm/Support/FormatVariadic.h"
-
-#include <algorithm>
 
 #define GET_OP_CLASSES
 #include "PyOps.h.inc"
@@ -33,7 +23,7 @@ namespace {
 namespace lowering::func::signature {
 
 mlir::LogicalResult
-translate(FuncSignatureType sig, const PyLLVMTypeConverter &typeConverter,
+translate(CallableType sig, const PyLLVMTypeConverter &typeConverter,
           llvm::SmallVectorImpl<mlir::Type> &pyInputs,
           llvm::SmallVectorImpl<mlir::Type> &convertedInputs,
           llvm::SmallVectorImpl<mlir::Type> &convertedResults,
@@ -133,52 +123,15 @@ static void setStringAttr(mlir::func::FuncOp func, unsigned argIndex,
 }
 
 static bool hasObjectHeaderPart(mlir::Type type) {
-  return mlir::isa<IntType, StrType, ExceptionType, ClassType>(type);
+  return mlir::isa<IntType, StrType, ExceptionType, ClassType, TypeType>(type);
 }
 
 static std::optional<llvm::StringRef> containerKind(mlir::Type type) {
-  if (mlir::isa<ListType>(type))
-    return ContainerSafetyAttrs::kKindList;
-  if (mlir::isa<TupleType>(type))
-    return ContainerSafetyAttrs::kKindTuple;
-  if (mlir::isa<DictType>(type))
-    return ContainerSafetyAttrs::kKindDict;
-  return std::nullopt;
+  return container::Descriptor::kindNameForLogicalType(type);
 }
 
 static llvm::StringRef containerComponent(mlir::Type type, unsigned slot) {
-  if (slot == kTupleHeaderComponent)
-    return ContainerSafetyAttrs::kComponentHeader;
-  if (mlir::isa<TupleType>(type)) {
-    if (slot == kTupleItemsComponent)
-      return ContainerSafetyAttrs::kComponentItems;
-    return {};
-  }
-  if (mlir::isa<ListType>(type)) {
-    switch (slot) {
-    case kListLockComponent:
-      return ContainerSafetyAttrs::kComponentLock;
-    case kListItemsComponent:
-      return ContainerSafetyAttrs::kComponentItems;
-    default:
-      break;
-    }
-  }
-  if (mlir::isa<DictType>(type)) {
-    switch (slot) {
-    case kDictLockComponent:
-      return ContainerSafetyAttrs::kComponentLock;
-    case kDictKeysComponent:
-      return ContainerSafetyAttrs::kComponentKeys;
-    case kDictValuesComponent:
-      return ContainerSafetyAttrs::kComponentValues;
-    case kDictStatesComponent:
-      return ContainerSafetyAttrs::kComponentStates;
-    default:
-      break;
-    }
-  }
-  return {};
+  return container::Descriptor::componentForLogicalType(type, slot);
 }
 
 static void markObjectHeader(mlir::func::FuncOp func, mlir::Type logicalType,
@@ -196,13 +149,14 @@ static void markContainerDescriptor(mlir::func::FuncOp func,
                                     unsigned logicalIndex,
                                     unsigned flattenedIndex,
                                     unsigned convertedWidth) {
-  auto kind = containerKind(logicalType);
+  auto kind = lowering::func::args::ABI::containerKind(logicalType);
   if (!kind)
     return;
   std::string group =
       (llvm::Twine(*kind) + ".arg" + llvm::Twine(logicalIndex)).str();
   for (unsigned slot = 0; slot < convertedWidth; ++slot) {
-    llvm::StringRef component = containerComponent(logicalType, slot);
+    llvm::StringRef component =
+        lowering::func::args::ABI::containerComponent(logicalType, slot);
     if (component.empty())
       continue;
     unsigned argIndex = flattenedIndex + slot;
@@ -231,15 +185,11 @@ void mark(mlir::func::FuncOp func, llvm::ArrayRef<mlir::Type> pyInputs,
     markContainerDescriptor(func, inputType, logicalIndex, flattenedIndex,
                             static_cast<unsigned>(converted.size()));
 
-    if (mlir::isa<CoroutineType, FutureType, TaskType>(inputType) &&
-        converted.size() >= 2) {
+    if (isCoroutineProtocolType(inputType) && converted.size() >= 2) {
       async_runtime::RuntimeHandle::markArgument(func.getOperation(),
                                                  flattenedIndex);
       async_runtime::ExceptionCell::markArgument(func.getOperation(),
                                                  flattenedIndex + 1);
-      if (mlir::isa<TaskType>(inputType) && converted.size() >= 3)
-        async_runtime::CancelFlag::markArgument(func.getOperation(),
-                                                flattenedIndex + 2);
     }
     if (isCompilerOwnedMemRefContainerType(inputType)) {
       mlir::Builder builder(func.getContext());
@@ -263,12 +213,45 @@ void mark(mlir::func::FuncOp func, llvm::ArrayRef<mlir::Type> pyInputs,
 
 namespace lowering::func::result::Ownership {
 
+static void setStringResultAttr(mlir::func::FuncOp func, unsigned resultIndex,
+                                llvm::StringRef name, llvm::StringRef value) {
+  if (resultIndex >= func.getNumResults())
+    return;
+  func.setResultAttr(resultIndex, name,
+                     mlir::StringAttr::get(func.getContext(), value));
+}
+
 static bool ownsMemRefResultSlot(mlir::Type logicalType, unsigned slot) {
   if (mlir::isa<IntType, StrType>(logicalType))
     return slot == 0;
   if (mlir::isa<ClassType>(logicalType))
     return slot == 0;
   return slot == 0 && isCompilerOwnedMemRefContainerType(logicalType);
+}
+
+static void markContainerDescriptor(mlir::func::FuncOp func,
+                                    mlir::Type logicalType,
+                                    unsigned logicalIndex,
+                                    unsigned flattenedIndex,
+                                    unsigned convertedWidth) {
+  auto kind = lowering::func::args::ABI::containerKind(logicalType);
+  if (!kind)
+    return;
+  std::string group =
+      (llvm::Twine(*kind) + ".result" + llvm::Twine(logicalIndex)).str();
+  for (unsigned slot = 0; slot < convertedWidth; ++slot) {
+    llvm::StringRef component =
+        lowering::func::args::ABI::containerComponent(logicalType, slot);
+    if (component.empty())
+      continue;
+    unsigned resultIndex = flattenedIndex + slot;
+    setStringResultAttr(func, resultIndex,
+                        ContainerSafetyAttrs::kDescriptorGroup, group);
+    setStringResultAttr(func, resultIndex,
+                        ContainerSafetyAttrs::kDescriptorKind, *kind);
+    setStringResultAttr(func, resultIndex,
+                        ContainerSafetyAttrs::kDescriptorComponent, component);
+  }
 }
 
 void mark(mlir::func::FuncOp func, llvm::ArrayRef<mlir::Type> logicalResults,
@@ -278,11 +261,15 @@ void mark(mlir::func::FuncOp func, llvm::ArrayRef<mlir::Type> logicalResults,
   llvm::SmallVector<int64_t, 4> ownedResults;
   llvm::SmallVector<int64_t, 4> borrowedResults;
   unsigned flattenedIndex = 0;
+  unsigned logicalIndex = 0;
   for (mlir::Type logicalType : logicalResults) {
     llvm::SmallVector<mlir::Type, 4> converted;
     if (mlir::failed(typeConverter.convertType(logicalType, converted)) ||
         converted.empty())
       return;
+
+    markContainerDescriptor(func, logicalType, logicalIndex, flattenedIndex,
+                            static_cast<unsigned>(converted.size()));
 
     bool immortalNone = mlir::isa<NoneType>(logicalType);
     for (auto [slot, loweredType] : llvm::enumerate(converted)) {
@@ -295,6 +282,7 @@ void mark(mlir::func::FuncOp func, llvm::ArrayRef<mlir::Type> logicalResults,
       }
       ++flattenedIndex;
     }
+    ++logicalIndex;
   }
   if (ownedResults.empty() && borrowedResults.empty())
     return;
@@ -318,7 +306,7 @@ void mark(mlir::func::FuncOp func, llvm::ArrayRef<mlir::Type> logicalResults,
 
 namespace lowering::func::void_helper {
 
-bool shouldUse(FuncOp op, FuncSignatureType sig) {
+bool shouldUse(CallableFuncOp op, CallableType sig) {
   auto results = sig.getResultTypes();
   if (results.size() != 1 || !mlir::isa<NoneType>(results.front()))
     return false;
@@ -342,7 +330,7 @@ static void copyAll(mlir::Operation *from, mlir::Operation *to,
     copyNamed(from, to, name);
 }
 
-void copyPy(FuncOp from, mlir::func::FuncOp to) {
+void copyPy(CallableFuncOp from, mlir::func::FuncOp to) {
   static constexpr llvm::StringLiteral kAttrs[] = {"arg_names",
                                                    "mutates_self",
                                                    "init_method",
@@ -424,14 +412,14 @@ bool specialize(mlir::func::FuncOp func, unsigned argIndex) {
 
 } // namespace lowering::func::published_borrow
 
-// FuncOpLowering: py.func -> func.func
+// FuncOpLowering: py.callable.func -> func.func
 
-struct FuncOpLowering : public mlir::OpConversionPattern<FuncOp> {
+struct FuncOpLowering : public mlir::OpConversionPattern<CallableFuncOp> {
   FuncOpLowering(PyLLVMTypeConverter &converter, mlir::MLIRContext *ctx)
-      : mlir::OpConversionPattern<FuncOp>(converter, ctx) {}
+      : mlir::OpConversionPattern<CallableFuncOp>(converter, ctx) {}
 
   mlir::LogicalResult
-  matchAndRewrite(FuncOp op, OpAdaptor adaptor,
+  matchAndRewrite(CallableFuncOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     auto nameAttr = op->getAttrOfType<mlir::StringAttr>("sym_name");
     if (!nameAttr)
@@ -448,9 +436,9 @@ struct FuncOpLowering : public mlir::OpConversionPattern<FuncOp> {
     if (!sigAttr)
       return rewriter.notifyMatchFailure(op, "missing function_type attr");
 
-    auto sig = mlir::dyn_cast<FuncSignatureType>(sigAttr.getValue());
+    auto sig = mlir::dyn_cast<CallableType>(sigAttr.getValue());
     if (!sig)
-      return rewriter.notifyMatchFailure(op, "expected FuncSignatureType");
+      return rewriter.notifyMatchFailure(op, "expected CallableType");
 
     auto *tc = static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
     llvm::SmallVector<mlir::Type, 8> pyInputTypes;
@@ -869,14 +857,15 @@ struct ReturnLowering : public mlir::OpConversionPattern<ReturnOp> {
   }
 };
 
-// FuncObjectLowering: py.func_object -> function reference
+// CallableObjectLowering: py.callable.object -> function reference
 
-struct FuncObjectLowering : public mlir::OpConversionPattern<FuncObjectOp> {
-  FuncObjectLowering(PyLLVMTypeConverter &converter, mlir::MLIRContext *ctx)
-      : mlir::OpConversionPattern<FuncObjectOp>(converter, ctx) {}
+struct CallableObjectLowering
+    : public mlir::OpConversionPattern<CallableObjectOp> {
+  CallableObjectLowering(PyLLVMTypeConverter &converter, mlir::MLIRContext *ctx)
+      : mlir::OpConversionPattern<CallableObjectOp>(converter, ctx) {}
 
   mlir::LogicalResult
-  matchAndRewrite(FuncObjectOp op, OpAdaptor adaptor,
+  matchAndRewrite(CallableObjectOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     mlir::ModuleOp module = op->getParentOfType<mlir::ModuleOp>();
     if (!module)
@@ -939,9 +928,8 @@ struct MakeFunctionLowering : public mlir::OpConversionPattern<MakeFunctionOp> {
     if (!module)
       return mlir::failure();
 
-    FuncType funcType = mlir::dyn_cast<FuncType>(op.getResult().getType());
-    if (!funcType)
-      return rewriter.notifyMatchFailure(op, "result must be !py.func");
+    if (!getCallableContract(op.getResult().getType()))
+      return rewriter.notifyMatchFailure(op, "result must be Callable");
 
     llvm::StringRef targetName =
         op.getTargetAttr().getLeafReference().empty()
@@ -968,7 +956,7 @@ namespace lowering::func::Patterns {
 void populate(PyLLVMTypeConverter &typeConverter,
               mlir::RewritePatternSet &patterns) {
   auto *ctx = patterns.getContext();
-  patterns.add<FuncOpLowering, ReturnLowering, FuncObjectLowering,
+  patterns.add<FuncOpLowering, ReturnLowering, CallableObjectLowering,
                MakeFunctionLowering>(typeConverter, ctx);
 }
 } // namespace lowering::func::Patterns
@@ -991,7 +979,8 @@ namespace lowering::func::objects::Patterns {
 void populate(PyLLVMTypeConverter &typeConverter,
               mlir::RewritePatternSet &patterns) {
   auto *ctx = patterns.getContext();
-  patterns.add<FuncObjectLowering, MakeFunctionLowering>(typeConverter, ctx);
+  patterns.add<CallableObjectLowering, MakeFunctionLowering>(typeConverter,
+                                                             ctx);
 }
 } // namespace lowering::func::objects::Patterns
 

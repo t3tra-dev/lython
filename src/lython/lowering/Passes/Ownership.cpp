@@ -40,8 +40,11 @@ bool mentionsRoot(mlir::Operation *op, mlir::Value root,
 }
 
 bool hasOwnershipEffect(mlir::Operation *op) {
-  if (createsPyOwnedResult(op) || mlir::isa<IncRefOp, DecRefOp>(op))
+  if (mlir::isa<IncRefOp, DecRefOp>(op))
     return true;
+  for (mlir::Value result : op->getResults())
+    if (isPyOwnedResult(result))
+      return true;
   for (mlir::Value operand : op->getOperands())
     if (consumesPyOwnedOperand(op, operand))
       return true;
@@ -168,6 +171,8 @@ mlir::LogicalResult verifyPremise(const ownership_state::State &state,
     threadsafe::Retain::verifyOwnedToken(inc.getOperation());
     return mlir::success();
   }
+  if (isPyLinearAsyncDescriptorType(object.getType()))
+    return inc->emitOpError("cannot retain linear async descriptor ") << object;
   if (aliases.rootHasAggregateBorrow(rootValue)) {
     threadsafe::Retain::premise(inc.getOperation(),
                                 ThreadSafetyAttrs::kPremiseAggregateBorrow);
@@ -223,9 +228,11 @@ mlir::LogicalResult verifyUse(const ownership_state::State &state,
     return mlir::success();
   if (ownership_state::hasToken(state, value, aliases))
     return mlir::success();
-  if (entryArgsBorrowed && aliases.rootIsEntryBorrowed(value, entry))
+  if (entryArgsBorrowed && !isPyLinearAsyncDescriptorType(value.getType()) &&
+      aliases.rootIsEntryBorrowed(value, entry))
     return mlir::success();
-  if (aliases.rootIsCapturedBorrow(rootValue, *entry.getParent()))
+  if (!isPyLinearAsyncDescriptorType(value.getType()) &&
+      aliases.rootIsCapturedBorrow(rootValue, *entry.getParent()))
     return mlir::success();
   return op.emitOpError("borrow use lacks a live ownership token or explicit "
                         "entry/captured borrowed lifetime for ")
@@ -236,6 +243,8 @@ mlir::LogicalResult verifyUses(const ownership_state::State &state,
                                mlir::Operation &op, mlir::Block &entry,
                                const AliasAnalysis &aliases,
                                bool entryArgsBorrowed) {
+  if (isPyOwnershipIdentityTransform(&op))
+    return mlir::success();
   for (mlir::Value operand : op.getOperands()) {
     if (mlir::isa<IncRefOp, DecRefOp>(&op))
       continue;
@@ -416,7 +425,8 @@ mlir::LogicalResult apply(mlir::Operation &op, ownership_state::State &state,
 
   if (createsPyOwnedResult(&op))
     for (mlir::Value result : op.getResults())
-      if (mlir::failed(ownership_state::add(state, result, +1, &op, aliases)))
+      if (isPyOwnedResult(result) &&
+          mlir::failed(ownership_state::add(state, result, +1, &op, aliases)))
         return mlir::failure();
 
   if (auto inc = mlir::dyn_cast<IncRefOp>(&op))
@@ -552,11 +562,12 @@ mlir::LogicalResult verify(mlir::Operation *funcLike, mlir::Region &body,
 
   mlir::Block *entry = &body.front();
   ownership_state::State initialState;
-  if (!entryArgsBorrowed) {
-    for (mlir::BlockArgument arg : entry->getArguments())
+  for (mlir::BlockArgument arg : entry->getArguments()) {
+    if (!entryArgsBorrowed || isPyLinearAsyncDescriptorType(arg.getType())) {
       if (mlir::failed(
               ownership_state::add(initialState, arg, +1, funcLike, aliases)))
         return mlir::failure();
+    }
   }
   entryStates.try_emplace(entry, initialState);
   worklist.push_back(entry);
@@ -629,7 +640,7 @@ struct RefCountPairElisionPass
 
   void runOnOperation() override {
     bool changed = false;
-    getOperation().walk([&](FuncOp func) {
+    getOperation().walk([&](CallableFuncOp func) {
       changed |= pair_elision::run(func.getOperation(), func.getBody());
     });
     getOperation().walk([&](mlir::async::FuncOp func) {
@@ -670,7 +681,7 @@ createOwnershipVerifierPass() {
 
 mlir::LogicalResult verifyOwnership(mlir::ModuleOp module) {
   bool failedAny = false;
-  module.walk([&](FuncOp func) {
+  module.walk([&](CallableFuncOp func) {
     if (mlir::failed(function_like::verify(func.getOperation(), func.getBody(),
                                            /*entryArgsBorrowed=*/true)))
       failedAny = true;

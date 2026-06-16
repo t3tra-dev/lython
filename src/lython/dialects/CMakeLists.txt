@@ -24,6 +24,8 @@ add_library(PyDialect STATIC
   cpp/PyVerifier/ConstTupleDict.cpp
   cpp/PyVerifier/EH.cpp
   cpp/PyVerifier/Numeric.cpp
+  cpp/PyVerifier/Union.cpp
+  cpp/PyVerifier/Iteration.cpp
 )
 
 add_dependencies(PyDialect PyDialectIncGen)

@@ -45,8 +45,12 @@ mlir::Value fromDescriptors(mlir::Location loc,
 } // namespace Object
 
 namespace Payload {
-inline int64_t lockIndex(int64_t fieldCount) { return fieldCount; }
+inline int64_t lockIndex(int64_t fieldCount) {
+  (void)fieldCount;
+  return 0;
+}
 mlir::MemRefType lockMemRefType(mlir::MLIRContext *ctx);
+mlir::MemRefType tableMemRefType(mlir::MLIRContext *ctx);
 mlir::MemRefType fieldMemRefType(mlir::Type fieldStorageType,
                                  mlir::MLIRContext *ctx);
 } // namespace Payload

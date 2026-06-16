@@ -219,6 +219,8 @@ mlir::Value zero(mlir::Location loc, mlir::Type storageType,
   if (storageType == builder.getF64Type())
     return builder.create<mlir::arith::ConstantFloatOp>(loc, llvm::APFloat(0.0),
                                                         builder.getF64Type());
+  if (class_layout::isObjectCarrierType(storageType))
+    return builder.create<mlir::LLVM::UndefOp>(loc, storageType);
   return {};
 }
 
@@ -613,12 +615,12 @@ struct DictInsertLowering : public mlir::OpConversionPattern<DictInsertOp> {
   }
 };
 
-struct DictGetLowering : public mlir::OpConversionPattern<DictGetOp> {
-  DictGetLowering(PyLLVMTypeConverter &converter, mlir::MLIRContext *ctx)
-      : mlir::OpConversionPattern<DictGetOp>(converter, ctx) {}
+struct DictGetItemLowering : public mlir::OpConversionPattern<GetItemOp> {
+  DictGetItemLowering(PyLLVMTypeConverter &converter, mlir::MLIRContext *ctx)
+      : mlir::OpConversionPattern<GetItemOp>(converter, ctx) {}
 
   mlir::LogicalResult
-  matchAndRewrite(DictGetOp op, OneToNOpAdaptor adaptor,
+  matchAndRewrite(GetItemOp op, OneToNOpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     rewriter.setInsertionPoint(op);
     mlir::ModuleOp module = op->getParentOfType<mlir::ModuleOp>();
@@ -626,13 +628,13 @@ struct DictGetLowering : public mlir::OpConversionPattern<DictGetOp> {
       return mlir::failure();
     auto *converter =
         static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
-    auto dictType = mlir::dyn_cast<DictType>(op.getDict().getType());
+    auto dictType = mlir::dyn_cast<DictType>(op.getContainer().getType());
     if (!dictType || lowering::value::dict::Storage::classify(dictType) !=
                          StorageKind::TypedMemRefs)
       return mlir::failure();
 
-    mlir::ValueRange dict = adaptor.getDict();
-    if (dict.size() != 5 || adaptor.getKey().empty())
+    mlir::ValueRange dict = adaptor.getContainer();
+    if (dict.size() != 5 || adaptor.getIndex().empty())
       return mlir::failure();
     mlir::Value header = dict[kDictHeaderComponent];
     mlir::Value lock = dict[kDictLockComponent];
@@ -644,7 +646,7 @@ struct DictGetLowering : public mlir::OpConversionPattern<DictGetOp> {
     if (!keysType || !valuesType)
       return mlir::failure();
     mlir::Value key =
-        Slot::storage(op.getLoc(), adaptor.getKey(), dictType.getKeyType(),
+        Slot::storage(op.getLoc(), adaptor.getIndex(), dictType.getKeyType(),
                       keysType.getElementType(), module, rewriter, *converter);
     if (!key)
       return mlir::failure();
@@ -728,6 +730,11 @@ struct DictGetLowering : public mlir::OpConversionPattern<DictGetOp> {
           markAccess(valueLoad.getOperation(), values);
           if (!sharedAccess)
             ownership::aggregate::Slot::markLoad(valueLoad.getResult());
+          if (mlir::failed(Slot::refcount(
+                  op.getLoc(), valueLoad.getResult(), dictType.getValueType(),
+                  module, rewriter, *converter, "incref",
+                  /*aggregateEffect=*/false, retainPremise)))
+            return mlir::failure();
           rewriter.create<mlir::scf::YieldOp>(op.getLoc(),
                                               valueLoad.getResult());
         }
@@ -742,18 +749,6 @@ struct DictGetLowering : public mlir::OpConversionPattern<DictGetOp> {
       }
       mlir::Value found = loop.getResult(0);
       mlir::Value result = loop.getResult(1);
-      auto retainIfFound =
-          rewriter.create<mlir::scf::IfOp>(op.getLoc(), found,
-                                           /*withElseRegion=*/false);
-      {
-        mlir::OpBuilder::InsertionGuard retainGuard(rewriter);
-        rewriter.setInsertionPointToStart(retainIfFound.thenBlock());
-        if (mlir::failed(
-                Slot::refcount(op.getLoc(), result, dictType.getValueType(),
-                               module, rewriter, *converter, "incref",
-                               /*aggregateEffect=*/false, retainPremise)))
-          return mlir::failure();
-      }
       return std::pair<mlir::Value, mlir::Value>{found, result};
     };
 
@@ -822,14 +817,136 @@ struct DictGetLowering : public mlir::OpConversionPattern<DictGetOp> {
   }
 };
 
+struct DictContainsLowering : public mlir::OpConversionPattern<ContainsOp> {
+  DictContainsLowering(PyLLVMTypeConverter &converter, mlir::MLIRContext *ctx)
+      : mlir::OpConversionPattern<ContainsOp>(converter, ctx) {}
+
+  mlir::LogicalResult
+  matchAndRewrite(ContainsOp op, OneToNOpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    rewriter.setInsertionPoint(op);
+    mlir::ModuleOp module = op->getParentOfType<mlir::ModuleOp>();
+    if (!module)
+      return mlir::failure();
+    auto *converter =
+        static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
+    auto dictType = mlir::dyn_cast<DictType>(op.getContainer().getType());
+    if (!dictType || lowering::value::dict::Storage::classify(dictType) !=
+                         StorageKind::TypedMemRefs)
+      return mlir::failure();
+
+    mlir::ValueRange dict = adaptor.getContainer();
+    if (dict.size() != 5 || adaptor.getItem().empty())
+      return mlir::failure();
+    mlir::Value header = dict[kDictHeaderComponent];
+    mlir::Value lock = dict[kDictLockComponent];
+    mlir::Value keys = dict[kDictKeysComponent];
+    mlir::Value states = dict[kDictStatesComponent];
+    auto keysType = mlir::dyn_cast<mlir::MemRefType>(keys.getType());
+    if (!keysType)
+      return mlir::failure();
+    mlir::Value key =
+        Slot::storage(op.getLoc(), adaptor.getItem(), dictType.getKeyType(),
+                      keysType.getElementType(), module, rewriter, *converter);
+    if (!key)
+      return mlir::failure();
+
+    auto emitContains = [&](bool sharedAccess) -> mlir::FailureOr<mlir::Value> {
+      auto markAccess = [&](mlir::Operation *access, mlir::Value target) {
+        if (sharedAccess)
+          container::access::Contract::mark(access, header, target);
+      };
+      mlir::Value lower = createIndexConstant(op.getLoc(), rewriter, 0);
+      mlir::Value upper =
+          createIndexConstant(op.getLoc(), rewriter, kTypedDictDefaultCapacity);
+      mlir::Value step = createIndexConstant(op.getLoc(), rewriter, 1);
+      mlir::Value foundInit = rewriter.create<mlir::arith::ConstantIntOp>(
+          op.getLoc(), false, rewriter.getI1Type());
+      auto loop = rewriter.create<mlir::scf::ForOp>(
+          op.getLoc(), lower, upper, step, mlir::ValueRange{foundInit});
+      {
+        mlir::OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(loop.getBody());
+        mlir::Value iv = loop.getInductionVar();
+        mlir::Value currentFound = loop.getRegionIterArgs()[0];
+        mlir::Value probeSlot = lowering::value::dict::Probe::slot(
+            op.getLoc(), rewriter, key, dictType.getKeyType(), iv);
+        if (!probeSlot)
+          return mlir::failure();
+        auto stateLoad = rewriter.create<mlir::memref::LoadOp>(
+            op.getLoc(), states, probeSlot);
+        markAccess(stateLoad.getOperation(), states);
+        mlir::Value occupiedState = rewriter.create<mlir::arith::ConstantIntOp>(
+            op.getLoc(), 1, rewriter.getI8Type());
+        mlir::Value occupied = rewriter.create<mlir::arith::CmpIOp>(
+            op.getLoc(), mlir::arith::CmpIPredicate::eq, stateLoad,
+            occupiedState);
+        auto sameKeyIf = rewriter.create<mlir::scf::IfOp>(
+            op.getLoc(), rewriter.getI1Type(), occupied,
+            /*withElseRegion=*/true);
+        {
+          mlir::OpBuilder::InsertionGuard sameGuard(rewriter);
+          rewriter.setInsertionPointToStart(sameKeyIf.thenBlock());
+          auto keyLoad = rewriter.create<mlir::memref::LoadOp>(op.getLoc(),
+                                                               keys, probeSlot);
+          markAccess(keyLoad.getOperation(), keys);
+          mlir::Value same = lowering::value::dict::Storage::equal(
+              op.getLoc(), keyLoad, key, dictType.getKeyType(), module,
+              rewriter, *converter);
+          if (!same)
+            return mlir::failure();
+          rewriter.create<mlir::scf::YieldOp>(op.getLoc(), same);
+        }
+        {
+          mlir::OpBuilder::InsertionGuard sameGuard(rewriter);
+          rewriter.setInsertionPointToStart(sameKeyIf.elseBlock());
+          mlir::Value falseValue = rewriter.create<mlir::arith::ConstantIntOp>(
+              op.getLoc(), false, rewriter.getI1Type());
+          rewriter.create<mlir::scf::YieldOp>(op.getLoc(), falseValue);
+        }
+        mlir::Value nextFound = rewriter.create<mlir::arith::OrIOp>(
+            op.getLoc(), currentFound, sameKeyIf.getResult(0));
+        rewriter.create<mlir::scf::YieldOp>(op.getLoc(), nextFound);
+      }
+      return loop.getResult(0);
+    };
+
+    mlir::Value isManaged = container::Managed::predicate(
+        op.getLoc(), header, kTypedDictRefcountSlot, rewriter);
+    auto ifOp = rewriter.create<mlir::scf::IfOp>(
+        op.getLoc(), rewriter.getI1Type(), isManaged,
+        /*withElseRegion=*/true);
+    {
+      mlir::OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(ifOp.thenBlock());
+      container::Managed::lock(op.getLoc(), header, lock, rewriter);
+      mlir::FailureOr<mlir::Value> found = emitContains(/*sharedAccess=*/true);
+      if (mlir::failed(found))
+        return mlir::failure();
+      container::Managed::unlock(op.getLoc(), header, lock, rewriter);
+      rewriter.create<mlir::scf::YieldOp>(op.getLoc(), *found);
+    }
+    {
+      mlir::OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(ifOp.elseBlock());
+      mlir::FailureOr<mlir::Value> found = emitContains(/*sharedAccess=*/false);
+      if (mlir::failed(found))
+        return mlir::failure();
+      rewriter.create<mlir::scf::YieldOp>(op.getLoc(), *found);
+    }
+    rewriter.replaceOp(op, ifOp.getResult(0));
+    return mlir::success();
+  }
+};
+
 } // namespace
 
 namespace lowering::value::dict::Patterns {
 void populate(PyLLVMTypeConverter &typeConverter,
               mlir::RewritePatternSet &patterns) {
   auto *ctx = patterns.getContext();
-  patterns.add<DictEmptyLowering, DictInsertLowering, DictGetLowering>(
-      typeConverter, ctx);
+  patterns.add<DictEmptyLowering, DictInsertLowering, DictGetItemLowering,
+               DictContainsLowering>(typeConverter, ctx);
 }
 } // namespace lowering::value::dict::Patterns
 

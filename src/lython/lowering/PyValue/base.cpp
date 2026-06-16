@@ -38,6 +38,8 @@ static constexpr BuiltinExceptionClass kBuiltinExceptionClasses[] = {
     {"KeyError", 6},
     {"IndexError", 7},
     {"AssertionError", 8},
+    {"StopIteration", 9},
+    {"StopAsyncIteration", 10},
 };
 
 static mlir::FailureOr<std::int64_t>
@@ -262,6 +264,7 @@ static mlir::LogicalResult consumeAwaitedDescriptorWithLoadedException(
     mlir::Type awaitableType, mlir::Value loadedException,
     mlir::ModuleOp module, mlir::PatternRewriter &rewriter,
     const PyLLVMTypeConverter &typeConverter) {
+  (void)awaitableType;
   if (descriptor.size() >= 2 && isExceptionCell(descriptor[1])) {
     mlir::Value exception =
         loadedException ? loadedException
@@ -274,10 +277,6 @@ static mlir::LogicalResult consumeAwaitedDescriptorWithLoadedException(
       return mlir::failure();
   }
 
-  if (mlir::isa<TaskType>(awaitableType) && descriptor.size() == 3 &&
-      mlir::isa<mlir::MemRefType>(descriptor[2].getType()))
-    rewriter.create<mlir::memref::DeallocOp>(loc, descriptor[2]);
-
   if (!descriptor.empty() &&
       mlir::isa<mlir::async::ValueType>(descriptor.front().getType()))
     rewriter.create<mlir::async::RuntimeDropRefOp>(
@@ -286,13 +285,6 @@ static mlir::LogicalResult consumeAwaitedDescriptorWithLoadedException(
   auto witness = rewriter.create<DecRefOp>(loc, awaitable);
   witness->setAttr("ly.ownership.lowered_witness", rewriter.getUnitAttr());
   return mlir::success();
-}
-
-static void drainGatherCleanupDescriptor(mlir::Location loc,
-                                         mlir::Value awaitable,
-                                         mlir::PatternRewriter &rewriter) {
-  auto dec = rewriter.create<DecRefOp>(loc, awaitable);
-  dec->setAttr("ly.async.gather_drain_descriptor", rewriter.getUnitAttr());
 }
 
 static llvm::SmallVector<mlir::Value> unpackAsyncPayload(
@@ -439,8 +431,7 @@ cloneFinallyBeforeEscapes(mlir::Block *finallyBlock,
 
 static mlir::FailureOr<mlir::Value> lowerAwaitInFinallyTry(
     AwaitOp awaitOp, TryOp tryOp, const PyLLVMTypeConverter &typeConverter,
-    mlir::PatternRewriter &rewriter, mlir::ValueRange cleanupPayloads = {},
-    mlir::ValueRange cleanupAwaitables = {}) {
+    mlir::PatternRewriter &rewriter, mlir::ValueRange cleanupPayloads = {}) {
   mlir::Value awaitable = awaitOp.getAwaitable();
   llvm::SmallVector<mlir::Type> awaitableTypes;
   if (mlir::failed(
@@ -478,20 +469,6 @@ static mlir::FailureOr<mlir::Value> lowerAwaitInFinallyTry(
   auto isError = rewriter.create<mlir::async::RuntimeIsErrorOp>(
       awaitOp.getLoc(), rewriter.getI1Type(), convertedAwaitable);
   mlir::Value shouldRunFinally = isError.getIsError();
-  if (mlir::isa<TaskType>(awaitable.getType()) &&
-      convertedAwaitableParts.size() == 3 &&
-      mlir::isa<mlir::MemRefType>(convertedAwaitableParts[2].getType())) {
-    mlir::Value zeroIndex =
-        rewriter.create<mlir::arith::ConstantIndexOp>(awaitOp.getLoc(), 0);
-    mlir::Value flag = rewriter.create<mlir::memref::LoadOp>(
-        awaitOp.getLoc(), convertedAwaitableParts[2], zeroIndex);
-    mlir::Value zero =
-        rewriter.create<mlir::arith::ConstantIntOp>(awaitOp.getLoc(), 0, 8);
-    mlir::Value isCancelled = rewriter.create<mlir::arith::CmpIOp>(
-        awaitOp.getLoc(), mlir::arith::CmpIPredicate::ne, flag, zero);
-    shouldRunFinally = rewriter.create<mlir::arith::OrIOp>(
-        awaitOp.getLoc(), shouldRunFinally, isCancelled);
-  }
 
   mlir::Block *currentBlock = rewriter.getInsertionBlock();
   mlir::Block *awaitBlock =
@@ -511,15 +488,11 @@ static mlir::FailureOr<mlir::Value> lowerAwaitInFinallyTry(
   for (mlir::Value payload : cleanupPayloads)
     if (isPyOwnershipTrackedType(payload.getType()))
       rewriter.create<DecRefOp>(awaitOp.getLoc(), payload);
-  for (mlir::Value awaitableToCleanup : cleanupAwaitables)
-    if (isPyOwnershipTrackedType(awaitableToCleanup.getType()))
-      drainGatherCleanupDescriptor(awaitOp.getLoc(), awaitableToCleanup,
-                                   rewriter);
   cloneFinallyBody(tryOp, rewriter, markerId);
   mlir::Value falseValue = rewriter.create<mlir::arith::ConstantOp>(
       awaitOp.getLoc(), rewriter.getBoolAttr(false));
   rewriter.create<mlir::cf::AssertOp>(awaitOp.getLoc(), falseValue,
-                                      "task cancelled");
+                                      "awaitable failed");
   rewriter.create<mlir::cf::BranchOp>(awaitOp.getLoc(), errorBlock);
 
   rewriter.setInsertionPoint(awaitOp);
@@ -547,8 +520,7 @@ static mlir::FailureOr<mlir::Value>
 lowerAwaitInExceptTry(AwaitOp awaitOp, mlir::Block *exceptEntry,
                       const PyLLVMTypeConverter &typeConverter,
                       mlir::PatternRewriter &rewriter,
-                      mlir::ValueRange cleanupPayloads = {},
-                      mlir::ValueRange cleanupAwaitables = {}) {
+                      mlir::ValueRange cleanupPayloads = {}) {
   if (!exceptEntry)
     return mlir::failure();
 
@@ -587,20 +559,6 @@ lowerAwaitInExceptTry(AwaitOp awaitOp, mlir::Block *exceptEntry,
   auto isError = rewriter.create<mlir::async::RuntimeIsErrorOp>(
       awaitOp.getLoc(), rewriter.getI1Type(), convertedAwaitable);
   mlir::Value shouldCatch = isError.getIsError();
-  if (mlir::isa<TaskType>(awaitable.getType()) &&
-      convertedAwaitableParts.size() == 3 &&
-      mlir::isa<mlir::MemRefType>(convertedAwaitableParts[2].getType())) {
-    mlir::Value zeroIndex =
-        rewriter.create<mlir::arith::ConstantIndexOp>(awaitOp.getLoc(), 0);
-    mlir::Value flag = rewriter.create<mlir::memref::LoadOp>(
-        awaitOp.getLoc(), convertedAwaitableParts[2], zeroIndex);
-    mlir::Value zero =
-        rewriter.create<mlir::arith::ConstantIntOp>(awaitOp.getLoc(), 0, 8);
-    mlir::Value isCancelled = rewriter.create<mlir::arith::CmpIOp>(
-        awaitOp.getLoc(), mlir::arith::CmpIPredicate::ne, flag, zero);
-    shouldCatch = rewriter.create<mlir::arith::OrIOp>(awaitOp.getLoc(),
-                                                      shouldCatch, isCancelled);
-  }
 
   mlir::Block *currentBlock = rewriter.getInsertionBlock();
   mlir::Block *awaitBlock =
@@ -649,10 +607,6 @@ lowerAwaitInExceptTry(AwaitOp awaitOp, mlir::Block *exceptEntry,
   for (mlir::Value payload : cleanupPayloads)
     if (isPyOwnershipTrackedType(payload.getType()))
       rewriter.create<DecRefOp>(awaitOp.getLoc(), payload);
-  for (mlir::Value awaitableToCleanup : cleanupAwaitables)
-    if (isPyOwnershipTrackedType(awaitableToCleanup.getType()))
-      drainGatherCleanupDescriptor(awaitOp.getLoc(), awaitableToCleanup,
-                                   rewriter);
   rewriter.create<mlir::cf::BranchOp>(awaitOp.getLoc(), exceptEntry,
                                       mlir::ValueRange{*branchArgs});
 
@@ -918,167 +872,32 @@ collectAwaitsExcludingNestedTry(llvm::ArrayRef<mlir::Block *> blocks,
   }
 }
 
-static void collectGathersExcludingNestedTry(
-    llvm::ArrayRef<mlir::Block *> blocks,
-    llvm::SmallVectorImpl<AsyncGatherOp> &gathers) {
-  for (mlir::Block *block : blocks) {
-    for (mlir::Operation &root : *block) {
-      if (mlir::isa<TryOp>(root))
-        continue;
-      root.walk<mlir::WalkOrder::PreOrder>(
-          [&](mlir::Operation *nested) -> mlir::WalkResult {
-            if (nested != &root && mlir::isa<TryOp>(nested))
-              return mlir::WalkResult::skip();
-            if (auto gatherOp = mlir::dyn_cast<AsyncGatherOp>(nested))
-              gathers.push_back(gatherOp);
-            return mlir::WalkResult::advance();
-          });
-    }
-  }
-}
-
-static bool collectOnlyDecrefUsers(mlir::Value value,
-                                   llvm::SmallVectorImpl<DecRefOp> &decrefs) {
-  for (mlir::Operation *user : value.getUsers()) {
-    auto decref = mlir::dyn_cast<DecRefOp>(user);
-    if (!decref)
-      return false;
-    decrefs.push_back(decref);
-  }
-  return !decrefs.empty();
-}
-
-static mlir::FailureOr<llvm::SmallVector<mlir::Value>>
-lowerGatherOperandsInFinallyTry(AsyncGatherOp gatherOp, TryOp tryOp,
-                                const PyLLVMTypeConverter &typeConverter,
-                                mlir::PatternRewriter &rewriter,
-                                llvm::ArrayRef<mlir::Type> elementTypes) {
-  llvm::SmallVector<mlir::Value> payloads;
-  payloads.reserve(elementTypes.size());
-  llvm::SmallVector<mlir::Value> awaitables(gatherOp.getAwaitables());
-  for (auto [index, awaitable] : llvm::enumerate(awaitables)) {
-    mlir::Type payloadType = elementTypes[index];
-    llvm::ArrayRef<mlir::Value> remainingAwaitables =
-        llvm::ArrayRef<mlir::Value>(awaitables).drop_front(index + 1);
-    rewriter.setInsertionPoint(gatherOp);
-    auto awaitOp =
-        rewriter.create<AwaitOp>(gatherOp.getLoc(), payloadType, awaitable);
-    mlir::FailureOr<mlir::Value> payload =
-        lowerAwaitInFinallyTry(awaitOp, tryOp, typeConverter, rewriter,
-                               mlir::ValueRange(payloads), remainingAwaitables);
-    if (mlir::failed(payload))
-      return mlir::failure();
-    payloads.push_back(*payload);
-  }
-  return payloads;
-}
-
-static mlir::FailureOr<llvm::SmallVector<mlir::Value>>
-lowerGatherOperandsInExceptTry(AsyncGatherOp gatherOp, mlir::Block *exceptEntry,
-                               const PyLLVMTypeConverter &typeConverter,
-                               mlir::PatternRewriter &rewriter,
-                               llvm::ArrayRef<mlir::Type> elementTypes,
-                               bool releaseEachPayload = false) {
-  llvm::SmallVector<mlir::Value> payloads;
-  llvm::SmallVector<mlir::Value> livePayloads;
-  payloads.reserve(elementTypes.size());
-  livePayloads.reserve(elementTypes.size());
-  llvm::SmallVector<mlir::Value> awaitables(gatherOp.getAwaitables());
-  for (auto [index, awaitable] : llvm::enumerate(awaitables)) {
-    mlir::Type payloadType = elementTypes[index];
-    llvm::ArrayRef<mlir::Value> remainingAwaitables =
-        llvm::ArrayRef<mlir::Value>(awaitables).drop_front(index + 1);
-    rewriter.setInsertionPoint(gatherOp);
-    auto awaitOp =
-        rewriter.create<AwaitOp>(gatherOp.getLoc(), payloadType, awaitable);
-    mlir::FailureOr<mlir::Value> payload = lowerAwaitInExceptTry(
-        awaitOp, exceptEntry, typeConverter, rewriter,
-        mlir::ValueRange(livePayloads), remainingAwaitables);
-    if (mlir::failed(payload))
-      return mlir::failure();
-    rewriter.setInsertionPoint(gatherOp);
-    if (releaseEachPayload && isPyOwnershipTrackedType(payload->getType())) {
-      rewriter.create<DecRefOp>(gatherOp.getLoc(), *payload);
-    } else {
-      livePayloads.push_back(*payload);
-    }
-    payloads.push_back(*payload);
-  }
-  return payloads;
-}
-
-static mlir::LogicalResult
-lowerGatherInFinallyTry(AsyncGatherOp gatherOp, TryOp tryOp,
-                        const PyLLVMTypeConverter &typeConverter,
-                        mlir::PatternRewriter &rewriter) {
-  auto tupleType = mlir::dyn_cast<TupleType>(gatherOp.getResult().getType());
-  if (!tupleType)
-    return rewriter.notifyMatchFailure(gatherOp,
-                                       "gather result is not a tuple");
-
-  auto elementTypes = tupleType.getElementTypes();
-  if (elementTypes.size() != gatherOp.getAwaitables().size())
-    return rewriter.notifyMatchFailure(
-        gatherOp, "gather awaitable count must match tuple arity");
-
-  mlir::FailureOr<llvm::SmallVector<mlir::Value>> payloads =
-      lowerGatherOperandsInFinallyTry(gatherOp, tryOp, typeConverter, rewriter,
-                                      elementTypes);
-  if (mlir::failed(payloads))
-    return mlir::failure();
-
-  rewriter.setInsertionPoint(gatherOp);
-  auto tuple = rewriter.create<TupleCreateOp>(
-      gatherOp.getLoc(), gatherOp.getResult().getType(), *payloads);
-  tuple->setAttr("ly.async.gather_tuple", rewriter.getUnitAttr());
-  rewriter.replaceOp(gatherOp, tuple.getResult());
-  return mlir::success();
-}
-
-static mlir::LogicalResult
-lowerGatherInExceptTry(AsyncGatherOp gatherOp, mlir::Block *exceptEntry,
-                       const PyLLVMTypeConverter &typeConverter,
-                       mlir::PatternRewriter &rewriter) {
-  auto tupleType = mlir::dyn_cast<TupleType>(gatherOp.getResult().getType());
-  if (!tupleType)
-    return rewriter.notifyMatchFailure(gatherOp,
-                                       "gather result is not a tuple");
-
-  auto elementTypes = tupleType.getElementTypes();
-  if (elementTypes.size() != gatherOp.getAwaitables().size())
-    return rewriter.notifyMatchFailure(
-        gatherOp, "gather awaitable count must match tuple arity");
-
-  llvm::SmallVector<DecRefOp> discardUsers;
-  if (collectOnlyDecrefUsers(gatherOp.getResult(), discardUsers)) {
-    if (mlir::failed(lowerGatherOperandsInExceptTry(
-            gatherOp, exceptEntry, typeConverter, rewriter, elementTypes,
-            /*releaseEachPayload=*/true)))
-      return mlir::failure();
-    for (DecRefOp decref : discardUsers)
-      rewriter.eraseOp(decref);
-    rewriter.eraseOp(gatherOp);
-    return mlir::success();
-  }
-
-  mlir::FailureOr<llvm::SmallVector<mlir::Value>> payloads =
-      lowerGatherOperandsInExceptTry(gatherOp, exceptEntry, typeConverter,
-                                     rewriter, elementTypes);
-  if (mlir::failed(payloads))
-    return mlir::failure();
-
-  rewriter.setInsertionPoint(gatherOp);
-  auto tuple = rewriter.create<TupleCreateOp>(
-      gatherOp.getLoc(), gatherOp.getResult().getType(), *payloads);
-  tuple->setAttr("ly.async.gather_tuple", rewriter.getUnitAttr());
-  rewriter.replaceOp(gatherOp, tuple.getResult());
-  return mlir::success();
-}
-
 struct ExceptionNullLowering
     : public mlir::OpConversionPattern<ExceptionNullOp> {
   ExceptionNullLowering(PyLLVMTypeConverter &converter, mlir::MLIRContext *ctx)
       : mlir::OpConversionPattern<ExceptionNullOp>(converter, ctx) {}
+
+  static mlir::Value zeroMemRef(mlir::Location loc, mlir::MemRefType type,
+                                mlir::ConversionPatternRewriter &rewriter) {
+    if (!type.hasStaticShape() || type.getRank() != 1)
+      return {};
+    mlir::Value storage = rewriter.create<mlir::memref::AllocaOp>(loc, type);
+    mlir::Type elementType = type.getElementType();
+    mlir::Value zero;
+    if (auto intType = mlir::dyn_cast<mlir::IntegerType>(elementType)) {
+      zero = rewriter.create<mlir::arith::ConstantIntOp>(loc, 0,
+                                                         intType.getWidth());
+    } else {
+      return {};
+    }
+    for (int64_t index = 0; index < type.getShape().front(); ++index) {
+      mlir::Value iv =
+          rewriter.create<mlir::arith::ConstantIndexOp>(loc, index);
+      rewriter.create<mlir::memref::StoreOp>(loc, zero, storage,
+                                             mlir::ValueRange{iv});
+    }
+    return storage;
+  }
 
   mlir::LogicalResult
   matchAndRewrite(ExceptionNullOp op, OpAdaptor adaptor,
@@ -1091,11 +910,14 @@ struct ExceptionNullLowering
       return rewriter.notifyMatchFailure(op, "failed to convert exception");
     llvm::SmallVector<mlir::Value> results;
     for (mlir::Type resultType : resultTypes) {
-      if (mlir::isa<mlir::MemRefType>(resultType))
-        return rewriter.notifyMatchFailure(
-            op, "exception null cannot allocate a memref object; it must lower "
-                "only after the nullable exception has become a zero lowered "
-                "descriptor");
+      if (auto memref = mlir::dyn_cast<mlir::MemRefType>(resultType)) {
+        mlir::Value zero = zeroMemRef(op.getLoc(), memref, rewriter);
+        if (!zero)
+          return rewriter.notifyMatchFailure(
+              op, "exception null requires static integer memref storage");
+        results.push_back(zero);
+        continue;
+      }
       auto structType = mlir::dyn_cast<mlir::LLVM::LLVMStructType>(resultType);
       if (!structType ||
           (!object_abi::Type::isLoweredStorage(structType) &&
@@ -1122,6 +944,15 @@ struct TracebackNullLowering
         static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
     mlir::Type resultType =
         typeConverter->convertType(op.getResult().getType());
+    if (auto memref = mlir::dyn_cast<mlir::MemRefType>(resultType)) {
+      mlir::Value zero =
+          ExceptionNullLowering::zeroMemRef(op.getLoc(), memref, rewriter);
+      if (!zero)
+        return rewriter.notifyMatchFailure(
+            op, "traceback null requires static integer memref storage");
+      rewriter.replaceOp(op, zero);
+      return mlir::success();
+    }
     rewriter.replaceOpWithNewOp<mlir::LLVM::ZeroOp>(op, resultType);
     return mlir::success();
   }
@@ -1315,15 +1146,6 @@ struct TryLowering : public mlir::OpRewritePattern<TryOp> {
       llvm::SmallVector<mlir::Block *> tryBlocksForAwait;
       for (mlir::Block &block : op.getTryRegion())
         tryBlocksForAwait.push_back(&block);
-      llvm::SmallVector<AsyncGatherOp> gathers;
-      collectGathersExcludingNestedTry(tryBlocksForAwait, gathers);
-      for (AsyncGatherOp gatherOp : gathers)
-        if (mlir::failed(
-                lowerGatherInFinallyTry(gatherOp, op, typeConverter, rewriter)))
-          return mlir::failure();
-      tryBlocksForAwait.clear();
-      for (mlir::Block &block : op.getTryRegion())
-        tryBlocksForAwait.push_back(&block);
       llvm::SmallVector<AwaitOp> awaits;
       collectAwaitsExcludingNestedTry(tryBlocksForAwait, awaits);
       for (AwaitOp awaitOp : awaits)
@@ -1389,12 +1211,6 @@ struct TryLowering : public mlir::OpRewritePattern<TryOp> {
         return mlir::failure();
       replaceRaiseCurrentInExceptBlocks(exceptBlocks, *caughtException,
                                         rewriter);
-      llvm::SmallVector<AsyncGatherOp> gathers;
-      collectGathersExcludingNestedTry(tryBlocks, gathers);
-      for (AsyncGatherOp gatherOp : gathers)
-        if (mlir::failed(lowerGatherInExceptTry(gatherOp, exceptEntry,
-                                                typeConverter, rewriter)))
-          return mlir::failure();
       llvm::SmallVector<AwaitOp> awaits;
       collectAwaitsExcludingNestedTry(collectBlockSpan(tryEntry, exceptEntry),
                                       awaits);

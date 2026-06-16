@@ -35,6 +35,30 @@ module {
     func.return %length : i64
   }
 
+  func.func @LyUnicode_CodepointLength(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> i64 {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %byte_count = memref.dim %bytes, %c0 : memref<?xi8>
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %continuation_mask = arith.constant 192 : i64
+    %continuation_tag = arith.constant 128 : i64
+    %count = scf.for %index = %c0 to %byte_count step %c1 iter_args(%current = %zero) -> (i64) {
+      %byte = memref.load %bytes[%index] : memref<?xi8>
+      %byte_i64 = arith.extui %byte : i8 to i64
+      %tag = arith.andi %byte_i64, %continuation_mask : i64
+      %is_continuation = arith.cmpi eq, %tag, %continuation_tag : i64
+      %next = scf.if %is_continuation -> (i64) {
+        scf.yield %current : i64
+      } else {
+        %incremented = arith.addi %current, %one : i64
+        scf.yield %incremented : i64
+      }
+      scf.yield %next : i64
+    }
+    func.return %count : i64
+  }
+
   func.func @LyUnicode_EqBool(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_bytes: memref<?xi8>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_bytes: memref<?xi8>) -> i1 {
     %lhs_len = func.call @LyUnicode_Length(%lhs_header, %lhs_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
     %rhs_len = func.call @LyUnicode_Length(%rhs_header, %rhs_bytes) : (memref<2xi64>, memref<?xi8>) -> i64

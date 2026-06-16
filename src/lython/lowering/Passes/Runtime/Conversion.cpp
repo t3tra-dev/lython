@@ -13,7 +13,6 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/Patterns.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
-#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/STLExtras.h"
 
 #include "PyDialect.h.inc"
@@ -233,6 +232,7 @@ void populate(PyLLVMTypeConverter &typeConverter,
   ::py::lowering::value::class_::Patterns::populate(typeConverter, patterns);
   ::py::lowering::value::tuple::Patterns::populate(typeConverter, patterns);
   ::py::lowering::value::dict::Patterns::populate(typeConverter, patterns);
+  ::py::lowering::value::union_::Patterns::populate(typeConverter, patterns);
   ::py::lowering::async_runtime::Patterns::populate(typeConverter, patterns);
   ::py::lowering::refcount::Patterns::populate(typeConverter, patterns);
   ::py::lowering::runtime::upcast::Patterns::populate(typeConverter, patterns);
@@ -271,8 +271,7 @@ namespace types {
 
 bool containsPyRuntime(mlir::Type type) {
   if (isPyType(type) ||
-      mlir::isa<FuncType, TupleType, ListType, ClassType, DictType,
-                CoroutineType, FutureType, TaskType>(type))
+      mlir::isa<TupleType, ListType, ClassType, DictType>(type))
     return true;
   if (auto asyncValue = mlir::dyn_cast<mlir::async::ValueType>(type))
     return containsPyRuntime(asyncValue.getValueType());
@@ -358,17 +357,19 @@ void configureValueTarget(mlir::ConversionTarget &target,
   });
   target.addIllegalOp<
       StrConstantOp, IntConstantOp, FloatConstantOp, TupleEmptyOp,
-      TupleCreateOp, TupleGetOp, DictEmptyOp, DictInsertOp, DictGetOp,
-      ListNewOp, ListAppendOp, ListRemoveOp, ListGetOp, NoneOp, FuncObjectOp,
+      TupleCreateOp, GetItemOp, ContainsOp, DictEmptyOp, DictInsertOp,
+      ListNewOp, ListAppendOp, ListRemoveOp, NoneOp, CallableObjectOp,
       MakeFunctionOp, AddOp, SubOp, MulOp, DivOp, FloorDivOp, ModOp, LShiftOp,
       RShiftOp, BitAndOp, BitOrOp, BitXorOp, LtOp, LeOp, GtOp, GeOp, EqOp, NeOp,
       ReprOp, StrConcat3Op, CastToPrimOp, CastFromPrimOp, IncRefOp, DecRefOp,
-      ClassNewOp, ClassPromoteOp, PublishOp, AttrGetOp, AttrSetOp,
-      AttrGetLocalOp, AttrSetLocalOp, ClassOp, ExceptionNullOp, TracebackNullOp,
+      ClassNewOp, ClassPromoteOp, ClassUpcastOp, ClassRefineOp, ClassTestOp,
+      ProtocolViewOp, PublishOp, AttrGetOp, AttrSetOp, AttrGetLocalOp,
+      AttrSetLocalOp, ClassOp, ExceptionNullOp, TracebackNullOp,
       LocationCurrentOp, ExceptionNewOp, RaiseOp, RaiseCurrentOp, TryOp,
-      TryYieldOp, ExceptYieldOp, FinallyYieldOp, ExceptMatchOp, CoroCreateOp,
-      CoroStartOp, AwaitOp, TaskCreateOp, TaskCancelOp, AsyncSleepOp,
-      AsyncGatherOp>();
+      TryYieldOp, ExceptYieldOp, FinallyYieldOp, ExceptMatchOp, EnterOp, ExitOp,
+      AEnterOp, AExitOp, SendOp, ThrowOp, CloseOp, ASendOp, AThrowOp, ACloseOp,
+      IterOp, NextOp, AwaitOp, AsyncNextOp, UnionWrapOp, UnionTestOp,
+      UnionUnwrapOp, LenOp>();
 }
 
 bool same(mlir::TypeRange lhs, llvm::ArrayRef<mlir::Type> rhs) {

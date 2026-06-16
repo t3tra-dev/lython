@@ -1,13 +1,12 @@
-#include "Common/Object.h"
 #include "Common/RuntimeSupport.h"
 
+#include "Common/Object.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
-#include "mlir/IR/Matchers.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/SmallString.h"
@@ -438,15 +437,18 @@ emitLongPartsLiteral(mlir::Location loc, const LongLiteralDigits &literal,
   mlir::MemRefType digitsType =
       mlir::MemRefType::get({digitSlots}, rewriter.getI32Type());
 
+  // All literal parts are true constants: the refcount kernel checks the
+  // immortal sentinel with an acquire load before its RMW, so immortal
+  // headers are never written and may live in read-only sections.
   auto ensureGlobal = [&](llvm::StringRef suffix, mlir::MemRefType type,
-                          mlir::DenseElementsAttr initial) {
+                          mlir::DenseElementsAttr initial, bool constant) {
     std::string symbol = base + suffix.str();
     if (!module.lookupSymbol<mlir::memref::GlobalOp>(symbol)) {
       mlir::OpBuilder::InsertionGuard guard(rewriter);
       rewriter.setInsertionPointToStart(module.getBody());
       rewriter.create<mlir::memref::GlobalOp>(
-          loc, symbol, rewriter.getStringAttr("private"), type, initial, true,
-          mlir::IntegerAttr());
+          loc, symbol, rewriter.getStringAttr("private"), type, initial,
+          constant, mlir::IntegerAttr());
     }
     return symbol;
   };
@@ -456,7 +458,8 @@ emitLongPartsLiteral(mlir::Location loc, const LongLiteralDigits &literal,
   auto headerAttr = mlir::DenseIntElementsAttr::get(
       mlir::RankedTensorType::get({object_abi::kHeaderSlots}, i64Type),
       headerValues);
-  std::string headerSymbol = ensureGlobal("_header", headerType, headerAttr);
+  std::string headerSymbol =
+      ensureGlobal("_header", headerType, headerAttr, /*constant=*/true);
 
   auto i64Attr = [](int64_t value) {
     return llvm::APInt(64, static_cast<uint64_t>(value), /*isSigned=*/true);
@@ -469,7 +472,8 @@ emitLongPartsLiteral(mlir::Location loc, const LongLiteralDigits &literal,
   auto metaAttr = mlir::DenseIntElementsAttr::get(
       mlir::RankedTensorType::get({object_abi::long_abi::kMetaSlots}, i64Type),
       metaValues);
-  std::string metaSymbol = ensureGlobal("_meta", metaType, metaAttr);
+  std::string metaSymbol =
+      ensureGlobal("_meta", metaType, metaAttr, /*constant=*/true);
 
   auto i32Attr = [](int64_t value) {
     return llvm::APInt(32, static_cast<uint64_t>(value), /*isSigned=*/true);
@@ -482,7 +486,8 @@ emitLongPartsLiteral(mlir::Location loc, const LongLiteralDigits &literal,
   }
   auto digitsAttr = mlir::DenseIntElementsAttr::get(
       mlir::RankedTensorType::get({digitSlots}, i32Type), digitValues);
-  std::string digitsSymbol = ensureGlobal("_digits", digitsType, digitsAttr);
+  std::string digitsSymbol =
+      ensureGlobal("_digits", digitsType, digitsAttr, /*constant=*/true);
 
   mlir::Value header =
       rewriter.create<mlir::memref::GetGlobalOp>(loc, headerType, headerSymbol);

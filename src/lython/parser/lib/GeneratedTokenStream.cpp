@@ -1,7 +1,7 @@
 #include "GeneratedTokenStream.h"
 
+#include "CpythonSpec.h"
 #include "Lexer.h"
-#include "lython/parser/CpythonSpec.h"
 
 #include <algorithm>
 #include <optional>

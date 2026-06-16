@@ -10,9 +10,11 @@
 namespace py {
 
 bool isPyOwnershipTrackedType(mlir::Type type);
+bool isPyLinearAsyncDescriptorType(mlir::Type type);
 bool isPyOwnershipImmortalOp(mlir::Operation *op);
 bool isPyOwnershipIdentityTransform(mlir::Operation *op);
 bool createsPyOwnedResult(mlir::Operation *op);
+bool isPyOwnedResult(mlir::Value result);
 bool consumesPyOwnedOperand(mlir::Operation *op, mlir::Value operand);
 
 /// Shared ownership alias analysis used by both refcount insertion and

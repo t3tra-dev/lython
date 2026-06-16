@@ -7,7 +7,6 @@
 
 #include "Optimizer/Utils.h"
 
-#include "Common/LoweringUtils.h"
 #include "Common/RuntimeSupport.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -20,15 +19,12 @@
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/SymbolTable.h"
-#include "mlir/Pass/Pass.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
-#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
-#include "llvm/Support/FormatVariadic.h"
 
 #include <algorithm>
 #include <optional>
@@ -244,10 +240,18 @@ void consume::listAppendValues(mlir::ModuleOp module) {
 }
 
 mlir::Value value::stripCasts(mlir::Value value) {
-  while (auto cast = value.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
-    if (cast->getNumOperands() != 1)
-      break;
-    value = cast.getOperand(0);
+  while (value) {
+    if (auto cast = value.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+      if (cast->getNumOperands() != 1)
+        break;
+      value = cast.getOperand(0);
+      continue;
+    }
+    if (auto upcast = value.getDefiningOp<ClassUpcastOp>()) {
+      value = upcast.getInput();
+      continue;
+    }
+    break;
   }
   return value;
 }
@@ -262,6 +266,10 @@ mlir::Value value::stripPublications(mlir::Value value) {
     }
     if (auto publish = value.getDefiningOp<PublishOp>()) {
       value = publish.getInput();
+      continue;
+    }
+    if (auto upcast = value.getDefiningOp<ClassUpcastOp>()) {
+      value = upcast.getInput();
       continue;
     }
     break;
@@ -286,18 +294,18 @@ bool attr::containsIndex(mlir::ArrayAttr attr, unsigned index) {
   return false;
 }
 
-FuncOp call::pyFunc(mlir::Operation *from, mlir::Value callable) {
+CallableFuncOp call::pyFunc(mlir::Operation *from, mlir::Value callable) {
   callable = value::stripCasts(callable);
 
-  if (auto funcObject = callable.getDefiningOp<FuncObjectOp>()) {
+  if (auto funcObject = callable.getDefiningOp<CallableObjectOp>()) {
     mlir::Operation *symbol = mlir::SymbolTable::lookupNearestSymbolFrom(
         from, funcObject.getTargetAttr());
-    return mlir::dyn_cast_or_null<FuncOp>(symbol);
+    return mlir::dyn_cast_or_null<CallableFuncOp>(symbol);
   }
   if (auto makeFunc = callable.getDefiningOp<MakeFunctionOp>()) {
     mlir::Operation *symbol = mlir::SymbolTable::lookupNearestSymbolFrom(
         from, makeFunc.getTargetAttr());
-    return mlir::dyn_cast_or_null<FuncOp>(symbol);
+    return mlir::dyn_cast_or_null<CallableFuncOp>(symbol);
   }
   return nullptr;
 }
@@ -309,7 +317,7 @@ bool publication::result(mlir::Operation *funcLike, unsigned resultIndex) {
              resultIndex);
 }
 
-int publication::entryArg(FuncOp func, mlir::Value value) {
+int publication::entryArg(CallableFuncOp func, mlir::Value value) {
   value = ::py::optimizer::value::stripPublications(value);
   auto arg = mlir::dyn_cast<mlir::BlockArgument>(value);
   if (!arg)
@@ -332,7 +340,8 @@ mlir::ArrayAttr attr::indexArray(mlir::MLIRContext *ctx,
   return mlir::ArrayAttr::get(ctx, attrs);
 }
 
-bool publication::update(FuncOp func, const llvm::DenseSet<int> &publishesArgs,
+bool publication::update(CallableFuncOp func,
+                         const llvm::DenseSet<int> &publishesArgs,
                          const llvm::DenseSet<int> &capturesPublished,
                          const llvm::DenseSet<int> &returnsPublished,
                          const llvm::DenseSet<int> &readonlyArgs,
@@ -514,7 +523,8 @@ static bool isPureReturnedCallableCloneOp(mlir::Operation *op) {
       TupleEmptyOp, NoneOp, IntConstantOp, FloatConstantOp, StrConstantOp>(op);
 }
 
-static bool returnedCallableBodyIsPure(FuncOp func, MakeFunctionOp makeFunc,
+static bool returnedCallableBodyIsPure(CallableFuncOp func,
+                                       MakeFunctionOp makeFunc,
                                        ReturnOp returnOp) {
   if (!func || !makeFunc || !returnOp || !func.getBody().hasOneBlock())
     return false;
@@ -527,7 +537,7 @@ static bool returnedCallableBodyIsPure(FuncOp func, MakeFunctionOp makeFunc,
   return true;
 }
 
-static MakeFunctionOp findReturnedMakeFunction(FuncOp func,
+static MakeFunctionOp findReturnedMakeFunction(CallableFuncOp func,
                                                llvm::StringRef targetName) {
   if (!func || !func.getBody().hasOneBlock())
     return {};
@@ -580,7 +590,8 @@ clonePureReturnedCallableValue(mlir::Value value, mlir::OpBuilder &builder,
   return mapping.lookup(value);
 }
 
-static bool mapReturnedCallableArguments(CallVectorOp sourceCall, FuncOp source,
+static bool mapReturnedCallableArguments(CallOp sourceCall,
+                                         CallableFuncOp source,
                                          mlir::IRMapping &mapping) {
   if (!source || !source.getBody().hasOneBlock())
     return false;
@@ -609,9 +620,9 @@ static mlir::FailureOr<mlir::Value> cloneOptionalReturnedCallableMetadata(
   return clonePureReturnedCallableValue(value, builder, mapping);
 }
 
-static bool materializeReturnedCallable(CallVectorOp call) {
+static bool materializeReturnedCallable(CallOp call) {
   mlir::Value callable = value::stripCasts(call.getCallable());
-  auto sourceCall = callable.getDefiningOp<CallVectorOp>();
+  auto sourceCall = callable.getDefiningOp<CallOp>();
   if (!sourceCall)
     return false;
   if (!llvm::hasSingleElement(sourceCall.getResult(0).getUsers()))
@@ -623,7 +634,7 @@ static bool materializeReturnedCallable(CallVectorOp call) {
   if (targetName.empty())
     return false;
 
-  FuncOp sourceFunc =
+  CallableFuncOp sourceFunc =
       call::pyFunc(sourceCall.getOperation(), sourceCall.getCallable());
   MakeFunctionOp sourceMakeFunc =
       findReturnedMakeFunction(sourceFunc, targetName);
@@ -676,30 +687,63 @@ static bool materializeReturnedCallable(CallVectorOp call) {
 }
 
 static void materializeReturnedCallables(mlir::ModuleOp module) {
-  llvm::SmallVector<CallVectorOp> calls;
-  module.walk([&](CallVectorOp op) { calls.push_back(op); });
-  for (CallVectorOp call : calls)
+  llvm::SmallVector<CallOp> calls;
+  module.walk([&](CallOp op) { calls.push_back(op); });
+  for (CallOp call : calls)
     materializeReturnedCallable(call);
 }
 
 void call::staticDefaults(mlir::ModuleOp module) {
   materializeReturnedCallables(module);
 
-  llvm::SmallVector<CallVectorOp> calls;
-  module.walk([&](CallVectorOp op) { calls.push_back(op); });
+  llvm::SmallVector<CallOp> calls;
+  module.walk([&](CallOp op) { calls.push_back(op); });
 
-  for (CallVectorOp call : calls) {
+  for (CallOp call : calls) {
     mlir::Value callable = value::stripCasts(call.getCallable());
     auto makeFunc = callable.getDefiningOp<MakeFunctionOp>();
     if (!makeFunc)
       continue;
 
-    auto funcType = mlir::dyn_cast<FuncType>(makeFunc.getResult().getType());
-    if (!funcType)
+    auto signature = getCallableContract(makeFunc.getResult().getType());
+    if (!signature)
       continue;
-    auto signature = funcType.getSignature();
-    if (signature.hasVararg())
+    if (signature.hasVararg()) {
+      mlir::Value closure = makeFunc.getClosure();
+      if (!closure || makeFunc.getDefaults() || makeFunc.getKwdefaults())
+        continue;
+
+      llvm::SmallVector<mlir::Value, 8> elements;
+      if (!collectStaticTupleElements(call.getPosargs(), elements))
+        continue;
+      llvm::SmallVector<mlir::Value, 8> closureElements;
+      if (!collectStaticTupleElements(closure, closureElements))
+        continue;
+      elements.append(closureElements.begin(), closureElements.end());
+
+      mlir::Value oldPosargs = call.getPosargs();
+
+      llvm::SmallVector<mlir::Type, 8> elementTypes;
+      elementTypes.reserve(elements.size());
+      for (mlir::Value element : elements)
+        elementTypes.push_back(element.getType());
+
+      mlir::OpBuilder builder(call);
+      auto newTuple = builder.create<TupleCreateOp>(
+          call.getLoc(), TupleType::get(module.getContext(), elementTypes),
+          elements);
+      auto funcObject = builder.create<CallableObjectOp>(
+          call.getLoc(), makeFunc.getResult().getType(),
+          makeFunc.getTargetAttr());
+      call.getPosargsMutable().assign(newTuple.getResult());
+      call.getCallableMutable().assign(funcObject.getResult());
+      eraseDeadStaticMetadataTree(oldPosargs);
+      if (makeFunc->use_empty()) {
+        makeFunc.erase();
+        eraseDeadStaticMetadataTree(closure);
+      }
       continue;
+    }
     llvm::ArrayRef<mlir::Type> positionalTypes = signature.getPositionalTypes();
     unsigned positionalCount = static_cast<unsigned>(positionalTypes.size());
     llvm::ArrayRef<mlir::Type> kwonlyTypes = signature.getKwOnlyTypes();
@@ -721,10 +765,10 @@ void call::staticDefaults(mlir::ModuleOp module) {
     if (providedCount > positionalCount)
       continue;
 
-    FuncOp targetFunc = nullptr;
+    CallableFuncOp targetFunc = nullptr;
     if (mlir::Operation *symbol = mlir::SymbolTable::lookupNearestSymbolFrom(
             call, makeFunc.getTargetAttr()))
-      targetFunc = mlir::dyn_cast<FuncOp>(symbol);
+      targetFunc = mlir::dyn_cast<CallableFuncOp>(symbol);
 
     llvm::StringMap<unsigned> positionalNameToIndex;
     if (targetFunc) {
@@ -856,7 +900,7 @@ void call::staticDefaults(mlir::ModuleOp module) {
     auto newTuple = builder.create<TupleCreateOp>(
         call.getLoc(), TupleType::get(module.getContext(), elementTypes),
         elements);
-    auto funcObject = builder.create<FuncObjectOp>(
+    auto funcObject = builder.create<CallableObjectOp>(
         call.getLoc(), makeFunc.getResult().getType(),
         makeFunc.getTargetAttr());
     auto emptyKwTuple = builder.create<TupleEmptyOp>(
@@ -919,25 +963,11 @@ static bool insertPublishBeforeTupleElement(TupleCreateOp tupleCreate,
 }
 
 template <typename CallbackT>
-static void forEachDirectPositionalOperand(CallVectorOp op,
-                                           CallbackT &&callback) {
+static void forEachDirectPositionalOperand(CallOp op, CallbackT &&callback) {
   auto kwnames = value::stripCasts(op.getKwnames());
   auto kwvalues = value::stripCasts(op.getKwvalues());
   if (!mlir::isa_and_nonnull<TupleEmptyOp>(kwnames.getDefiningOp()) ||
       !mlir::isa_and_nonnull<TupleEmptyOp>(kwvalues.getDefiningOp()))
-    return;
-
-  mlir::Value posargs = value::stripCasts(op.getPosargs());
-  if (auto tupleCreate = posargs.getDefiningOp<TupleCreateOp>()) {
-    for (auto [idx, operand] : llvm::enumerate(tupleCreate.getOperands()))
-      callback(static_cast<unsigned>(idx), operand);
-  }
-}
-
-template <typename CallbackT>
-static void forEachDirectPositionalOperand(CallOp op, CallbackT &&callback) {
-  mlir::Value kwargs = value::stripCasts(op.getKwargs());
-  if (!mlir::isa_and_nonnull<NoneOp>(kwargs.getDefiningOp()))
     return;
 
   mlir::Value posargs = value::stripCasts(op.getPosargs());
@@ -960,32 +990,6 @@ static void forEachDirectPositionalOperand(InvokeOp op, CallbackT &&callback) {
     for (auto [idx, operand] : llvm::enumerate(tupleCreate.getOperands()))
       callback(static_cast<unsigned>(idx), operand);
   }
-}
-
-static llvm::SmallVector<unsigned, 4>
-getPublicationArgsForDirectCallee(CallVectorOp op) {
-  auto callee = call::pyFunc(op, op.getCallable());
-  if (!callee)
-    return {};
-  llvm::SmallDenseSet<unsigned, 4> indices;
-  auto collect = [&](mlir::ArrayAttr attr) {
-    if (!attr)
-      return;
-    for (mlir::Attribute element : attr) {
-      auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(element);
-      if (!intAttr)
-        continue;
-      int64_t argIndex = intAttr.getInt();
-      if (argIndex < 0)
-        continue;
-      indices.insert(static_cast<unsigned>(argIndex));
-    }
-  };
-  collect(callee->getAttrOfType<mlir::ArrayAttr>("ly.publishes_args"));
-  collect(callee->getAttrOfType<mlir::ArrayAttr>("ly.captures_published"));
-  llvm::SmallVector<unsigned, 4> result(indices.begin(), indices.end());
-  llvm::sort(result);
-  return result;
 }
 
 static llvm::SmallVector<unsigned, 4>
@@ -1091,6 +1095,11 @@ static bool storesInlineClassAggregate(ListAppendOp op) {
   return listType && mlir::isa<ClassType>(listType.getElementType());
 }
 
+static bool getItemFromList(mlir::Operation *op) {
+  auto getItem = mlir::dyn_cast_or_null<GetItemOp>(op);
+  return getItem && mlir::isa<ListType>(getItem.getContainer().getType());
+}
+
 void publication::insertBoundaries(mlir::ModuleOp module) {
   llvm::SmallVector<std::pair<mlir::Operation *, unsigned>, 16> insertionSites;
   llvm::SmallVector<std::pair<TupleCreateOp, unsigned>, 16> tupleInsertionSites;
@@ -1120,20 +1129,18 @@ void publication::insertBoundaries(mlir::ModuleOp module) {
     }
   });
 
+  // A tracked value injected into a union may escape through any
+  // union-typed edge (returns, stores), so the publication boundary sits on
+  // the injection itself.
+  module.walk([&](UnionWrapOp op) {
+    if (!publication::tracks(op.getInput().getType()))
+      return;
+    insertionSites.emplace_back(op.getOperation(), 0);
+  });
+
   module.walk([&](MakeFunctionOp op) {
     collectMakeFunctionPublicationSites(op, insertionSites,
                                         tupleInsertionSites);
-  });
-
-  module.walk([&](CallVectorOp op) {
-    auto publicationArgs = getPublicationArgsForDirectCallee(op);
-    if (publicationArgs.empty())
-      return;
-    auto tupleCreate = op.getPosargs().getDefiningOp<TupleCreateOp>();
-    if (!tupleCreate)
-      return;
-    for (unsigned argIndex : publicationArgs)
-      tupleInsertionSites.emplace_back(tupleCreate, argIndex);
   });
 
   module.walk([&](CallOp op) {
@@ -1169,7 +1176,7 @@ void publication::compute(mlir::ModuleOp module) {
   do {
     changed = false;
 
-    module.walk([&](FuncOp func) {
+    module.walk([&](CallableFuncOp func) {
       llvm::DenseSet<int> publishesArgs;
       llvm::DenseSet<int> capturesPublished;
       llvm::DenseSet<int> returnsPublished;
@@ -1197,8 +1204,8 @@ void publication::compute(mlir::ModuleOp module) {
           mutableArgs.insert(argIndex);
       });
 
-      func.walk([&](ListGetOp op) {
-        int argIndex = publication::entryArg(func, op.getList());
+      func.walk([&](GetItemOp op) {
+        int argIndex = publication::entryArg(func, op.getContainer());
         if (argIndex >= 0)
           readonlyArgs.insert(argIndex);
       });
@@ -1217,8 +1224,8 @@ void publication::compute(mlir::ModuleOp module) {
         }
       });
 
-      func.walk([&](DictGetOp op) {
-        int argIndex = publication::entryArg(func, op.getDict());
+      func.walk([&](ContainsOp op) {
+        int argIndex = publication::entryArg(func, op.getContainer());
         if (argIndex >= 0)
           readonlyArgs.insert(argIndex);
       });
@@ -1274,7 +1281,7 @@ void publication::compute(mlir::ModuleOp module) {
             recordEscapingArgument(annotations);
       });
 
-      auto propagateFromCalleeSummary = [&](auto op, FuncOp callee) {
+      auto propagateFromCalleeSummary = [&](auto op, CallableFuncOp callee) {
         if (!callee)
           return;
 
@@ -1343,10 +1350,6 @@ void publication::compute(mlir::ModuleOp module) {
             mutableArgs);
       };
 
-      func.walk([&](CallVectorOp op) {
-        propagateFromCalleeSummary(op, call::pyFunc(op, op.getCallable()));
-      });
-
       func.walk([&](CallOp op) {
         propagateFromCalleeSummary(op, call::pyFunc(op, op.getCallable()));
       });
@@ -1399,7 +1402,7 @@ bool class_state::local(mlir::Value value) {
     return false;
   if (mlir::isa<ClassNewOp>(def))
     return true;
-  if (mlir::isa<PublishOp, ClassPromoteOp, ListGetOp>(def))
+  if (mlir::isa<PublishOp, ClassPromoteOp>(def) || getItemFromList(def))
     return false;
   return false;
 }
@@ -1441,7 +1444,7 @@ bool class_state::published(mlir::Value value) {
   mlir::Operation *def = value.getDefiningOp();
   if (!def)
     return false;
-  if (mlir::isa<PublishOp, ClassPromoteOp, ListGetOp>(def))
+  if (mlir::isa<PublishOp, ClassPromoteOp>(def) || getItemFromList(def))
     return true;
 
   auto result = mlir::dyn_cast<mlir::OpResult>(value);
@@ -1449,11 +1452,6 @@ bool class_state::published(mlir::Value value) {
     return false;
 
   if (auto call = mlir::dyn_cast<CallOp>(def))
-    return publication::result(
-        ::py::optimizer::call::pyFunc(call, call.getCallable()),
-        result.getResultNumber());
-
-  if (auto call = mlir::dyn_cast<CallVectorOp>(def))
     return publication::result(
         ::py::optimizer::call::pyFunc(call, call.getCallable()),
         result.getResultNumber());
@@ -1612,7 +1610,7 @@ static bool isBorrowOnlyLocalFieldUser(mlir::Operation *user) {
   return mlir::isa<AddOp, StrConcat3Op, SubOp, MulOp, DivOp, FloorDivOp, ModOp,
                    LShiftOp, RShiftOp, BitAndOp, BitOrOp, BitXorOp, LeOp, LtOp,
                    GtOp, GeOp, EqOp, NeOp, ReprOp, ListAppendOp, ListRemoveOp,
-                   ListGetOp>(user);
+                   GetItemOp>(user);
 }
 
 static bool hasSingleBorrowThenDrop(mlir::Value value) {
@@ -1958,7 +1956,7 @@ void scalar::hoistInts(mlir::ModuleOp module) {
     if (!func.isExternal())
       hoistInRegion(func.getOperation(), func.getBody());
   });
-  module.walk([&](FuncOp func) {
+  module.walk([&](CallableFuncOp func) {
     if (func->getNumRegions() != 0)
       hoistInRegion(func.getOperation(), func->getRegion(0));
   });

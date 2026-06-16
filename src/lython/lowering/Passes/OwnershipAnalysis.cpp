@@ -4,16 +4,11 @@
 #include "Common/RuntimeSupport.h"
 #include "PyDialectTypes.h"
 
-#include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/Dialect/Async/IR/Async.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
-#include "mlir/Interfaces/InferTypeOpInterface.h"
-#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/STLExtras.h"
 
 #include "PyDialect.h.inc"
@@ -25,11 +20,18 @@
 namespace py {
 
 bool isPyOwnershipTrackedType(mlir::Type type);
+bool isPyLinearAsyncDescriptorType(mlir::Type type);
+
+bool isPyLinearAsyncDescriptorType(mlir::Type type) {
+  return isCoroutineProtocolType(type);
+}
 
 bool isPyOwnershipTrackedType(mlir::Type type) {
-  if (mlir::isa<FuncSignatureType, FuncType, PrimFuncType, NoneType, BoolType,
-                FloatType>(type))
+  if (mlir::isa<CallableType, NoneType, BoolType, FloatType, TracebackType,
+                TypeType>(type))
     return false;
+  if (auto unionType = mlir::dyn_cast<UnionType>(type))
+    return llvm::any_of(unionType.getMemberTypes(), isPyOwnershipTrackedType);
   return isPyType(type);
 }
 
@@ -41,13 +43,34 @@ bool isPyOwnershipImmortalOp(mlir::Operation *op) {
     return true;
   if (auto classNew = mlir::dyn_cast<ClassNewOp>(op))
     return classNew.getClassNameAttr().getValue() == "Exception";
-  return mlir::isa<NoneOp, FuncObjectOp, TupleEmptyOp, ExceptionNullOp,
-                   TracebackNullOp, LocationCurrentOp>(op);
+  if (auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(op))
+    if (cast->getNumOperands() == 1)
+      if (mlir::Operation *source = cast.getOperand(0).getDefiningOp())
+        return isPyOwnershipImmortalOp(source);
+  return mlir::isa<NoneOp, CallableObjectOp, ClassObjectOp, TupleEmptyOp,
+                   ExceptionNullOp, TracebackNullOp, LocationCurrentOp>(op);
 }
 
 bool isPyOwnershipIdentityTransform(mlir::Operation *op) {
-  (void)op;
-  return false;
+  // Union projection and nominal class view changes forward the same resource:
+  // the result is an alias of the operand and carries no ownership effect of
+  // its own. Union injection is a move-producing operation instead: wrapping a
+  // tracked member consumes that member token and creates the union token,
+  // while wrapping None creates the null optional payload without consuming
+  // input.
+  if (auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(op))
+    if (cast->getNumOperands() == 1 && cast->getNumResults() == 1) {
+      mlir::Type source = cast.getOperand(0).getType();
+      mlir::Type result = cast.getResult(0).getType();
+      if (isPyOwnershipTrackedType(source) && isPyOwnershipTrackedType(result))
+        return true;
+      return mlir::isa<TypeType>(source) &&
+             mlir::isa<ObjectType, ProtocolType>(result);
+    }
+  if (auto iter = mlir::dyn_cast<IterOp>(op))
+    return iter->hasAttr("returned_self");
+  return mlir::isa<UnionUnwrapOp, ClassUpcastOp, ClassRefineOp, ProtocolViewOp>(
+      op);
 }
 
 bool createsPyOwnedResult(mlir::Operation *op) {
@@ -55,20 +78,49 @@ bool createsPyOwnedResult(mlir::Operation *op) {
     return true;
   if (isPyOwnershipImmortalOp(op))
     return false;
+  if (auto iter = mlir::dyn_cast<IterOp>(op))
+    if (iter->hasAttr("returned_self"))
+      return false;
+  if (mlir::isa<NextOp>(op))
+    return true;
   if (auto ifOp = mlir::dyn_cast<mlir::scf::IfOp>(op))
     return llvm::any_of(ifOp.getResults(), [](mlir::Value result) {
       return isPyOwnershipTrackedType(result.getType());
     });
-  if (mlir::isa<TryOp, TupleCreateOp, DictEmptyOp, StrConstantOp, IntConstantOp,
-                FloatConstantOp, AddOp, StrConcat3Op, SubOp, MulOp, ReprOp,
-                DivOp, FloorDivOp, ModOp, LShiftOp, RShiftOp, BitAndOp, BitOrOp,
-                BitXorOp, MakeFunctionOp, CastFromPrimOp, ClassNewOp,
-                ClassPromoteOp, PublishOp, ListNewOp, ListGetOp, TupleGetOp,
-                DictGetOp, AttrGetOp, AttrGetLocalOp, ExceptionNewOp, AwaitOp,
-                AsyncGatherOp, CoroCreateOp, TaskCreateOp, AsyncSleepOp>(op))
+  if (mlir::isa<TryOp, TupleCreateOp, GetItemOp, DictEmptyOp, StrConstantOp,
+                IntConstantOp, FloatConstantOp, AddOp, StrConcat3Op, SubOp,
+                MulOp, ReprOp, DivOp, FloorDivOp, ModOp, LShiftOp, RShiftOp,
+                BitAndOp, BitOrOp, BitXorOp, MakeFunctionOp, CastFromPrimOp,
+                ClassNewOp, ClassPromoteOp, PublishOp, ListNewOp, AttrGetOp,
+                AttrGetLocalOp, ExceptionNewOp, AwaitOp, AsyncNextOp,
+                UnionWrapOp, EnterOp, ExitOp, AEnterOp, AExitOp, SendOp,
+                ThrowOp, CloseOp, ASendOp, AThrowOp, ACloseOp, IterOp, NextOp,
+                LenOp>(op))
     return true;
 
-  return mlir::isa<CallOp, CallVectorOp, NativeCallOp>(op);
+  return mlir::isa<CallOp>(op);
+}
+
+bool isPyOwnedResult(mlir::Value result) {
+  if (!result || !isPyOwnershipTrackedType(result.getType()))
+    return false;
+  auto opResult = mlir::dyn_cast<mlir::OpResult>(result);
+  if (!opResult)
+    return false;
+  mlir::Operation *op = opResult.getOwner();
+  if (auto owned = op->getAttrOfType<mlir::ArrayAttr>(
+          OwnershipContractAttrs::kOwnedResults)) {
+    unsigned index = opResult.getResultNumber();
+    for (mlir::Attribute attr : owned) {
+      auto integer = mlir::dyn_cast<mlir::IntegerAttr>(attr);
+      if (integer && integer.getInt() == static_cast<int64_t>(index))
+        return true;
+    }
+    return false;
+  }
+  if (auto next = mlir::dyn_cast<NextOp>(op))
+    return result == next.getElement();
+  return createsPyOwnedResult(op);
 }
 
 static bool tupleCreateConsumesOperand(TupleCreateOp tuple,
@@ -90,7 +142,7 @@ static bool tupleCreateConsumesOperand(TupleCreateOp tuple,
             worklist.push_back(result);
           continue;
         }
-        if (auto call = mlir::dyn_cast<CallVectorOp>(user)) {
+        if (auto call = mlir::dyn_cast<CallOp>(user)) {
           if (call.getPosargs() != value)
             return false;
           sawCallPackUse = true;
@@ -115,7 +167,7 @@ static bool tupleCreateConsumesOperand(TupleCreateOp tuple,
   };
 
   if (isDirectCallPack(tuple))
-    return false;
+    return isPyLinearAsyncDescriptorType(operand.getType());
 
   auto tupleType = mlir::dyn_cast<TupleType>(tuple.getResult().getType());
   if (!tupleType)
@@ -151,10 +203,8 @@ bool consumesPyOwnedOperand(mlir::Operation *op, mlir::Value operand) {
     return tupleCreateConsumesOperand(tuple, operand);
   if (auto awaitOp = mlir::dyn_cast<AwaitOp>(op))
     return awaitOp.getAwaitable() == operand;
-  if (auto taskCreate = mlir::dyn_cast<TaskCreateOp>(op))
-    return taskCreate.getCoroutine() == operand;
-  if (auto gather = mlir::dyn_cast<AsyncGatherOp>(op))
-    return llvm::is_contained(gather.getAwaitables(), operand);
+  if (auto asyncNext = mlir::dyn_cast<AsyncNextOp>(op))
+    return asyncNext.getAwaitable() == operand;
   if (auto exception = mlir::dyn_cast<ExceptionNewOp>(op))
     return llvm::is_contained(exception.getArgs(), operand);
   if (auto attrSet = mlir::dyn_cast<AttrSetOp>(op))
@@ -168,6 +218,9 @@ bool consumesPyOwnedOperand(mlir::Operation *op, mlir::Value operand) {
     return (dictInsert.getKey() == operand ||
             dictInsert.getValue() == operand) &&
            op->hasAttr("ly.consume_value");
+  if (auto wrap = mlir::dyn_cast<UnionWrapOp>(op))
+    return wrap.getInput() == operand &&
+           isPyOwnershipTrackedType(wrap.getResult().getType());
   if (auto yield = mlir::dyn_cast<mlir::scf::YieldOp>(op)) {
     auto ifOp = yield->getParentOfType<mlir::scf::IfOp>();
     if (!ifOp)
@@ -200,6 +253,8 @@ OwnershipAliasAnalysis::OwnershipAliasAnalysis(
       unionSets(op->getOperand(0), op->getResult(0));
       return;
     }
+    if (auto next = mlir::dyn_cast<NextOp>(op))
+      unionSets(next.getIterator(), next.getNext());
   });
   llvm::SmallVector<mlir::LLVM::ExtractValueOp, 32> extracts;
   region.walk([&](mlir::LLVM::ExtractValueOp extract) {
@@ -289,6 +344,8 @@ OwnershipAliasAnalysis::OwnershipAliasAnalysis(
     if (isIdentityTransform(op) && op->getNumOperands() == 1 &&
         op->getNumResults() == 1)
       unionSets(op->getOperand(0), op->getResult(0));
+    if (auto next = mlir::dyn_cast<NextOp>(op))
+      unionSets(next.getIterator(), next.getNext());
 
     auto addBranchPairs = [&](mlir::ValueRange operands,
                               mlir::Block *successor) {

@@ -10,7 +10,6 @@ namespace atomic_role {
 enum class OrderingRule { Acquire, Release, AcqRel, RefcountInc };
 
 enum class Target {
-  AsyncCancelFlag,
   AsyncExceptionCell,
   Container,
   ObjectRefcount,
@@ -30,9 +29,6 @@ struct Spec {
 };
 
 static constexpr Spec kSpecs[] = {
-    {ThreadSafetyAttrs::kRoleAsyncCancelRequest, Target::AsyncCancelFlag,
-     mlir::LLVM::AtomicBinOp::umax, 1, OrderingRule::AcqRel,
-     "async cancel request"},
     {ThreadSafetyAttrs::kRoleAsyncExceptionLoad, Target::AsyncExceptionCell,
      mlir::LLVM::AtomicBinOp::add, 0, OrderingRule::Acquire,
      "async exception cell load"},
@@ -203,10 +199,6 @@ static mlir::LogicalResult verifyClassRefcount(mlir::LLVM::AtomicRMWOp op,
 static mlir::LogicalResult verifyProvenance(mlir::LLVM::AtomicRMWOp op,
                                             const Spec &spec) {
   switch (spec.target) {
-  case Target::AsyncCancelFlag:
-    if (provenance::asyncCancelFlag(op.getOperation(), op.getPtr()))
-      return mlir::success();
-    return op->emitOpError() << spec.what << " lacks cancel-flag provenance";
   case Target::AsyncExceptionCell:
     if (provenance::asyncExceptionCell(op.getPtr()))
       return mlir::success();
@@ -568,7 +560,6 @@ namespace load_role {
 
 enum class Target {
   AsyncExceptionCell,
-  AsyncCancelFlag,
   ObjectRefcount,
   ObjectPayload,
 };
@@ -582,8 +573,6 @@ struct Spec {
 static constexpr Spec kSpecs[] = {
     {ThreadSafetyAttrs::kRoleAsyncExceptionLoad, Target::AsyncExceptionCell,
      "async exception cell load"},
-    {ThreadSafetyAttrs::kRoleAsyncCancelLoad, Target::AsyncCancelFlag,
-     "async cancel flag load"},
     {ThreadSafetyAttrs::kRoleObjectRefcountLoad, Target::ObjectRefcount,
      "object refcount load"},
     {ThreadSafetyAttrs::kRoleObjectPayloadLoad, Target::ObjectPayload,
@@ -625,10 +614,6 @@ static mlir::LogicalResult verifyProvenance(mlir::LLVM::LoadOp op,
     if (provenance::asyncExceptionCell(op.getAddr()))
       return mlir::success();
     return op->emitOpError() << spec.what << " lacks exception-cell provenance";
-  case Target::AsyncCancelFlag:
-    if (provenance::asyncCancelFlag(op.getOperation(), op.getAddr()))
-      return mlir::success();
-    return op->emitOpError() << spec.what << " lacks cancel-flag provenance";
   case Target::ObjectRefcount: {
     if (mlir::failed(requireDescriptor(op, spec)))
       return mlir::failure();

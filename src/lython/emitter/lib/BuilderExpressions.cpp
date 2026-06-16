@@ -66,6 +66,20 @@ bool isEmptyFStringFormatSpec(const parser::NodePtr *formatSpecNode) {
   return true;
 }
 
+bool exactScalarEqualityAlwaysFalse(mlir::Type lhs, mlir::Type rhs) {
+  if (lhs == rhs)
+    return false;
+  auto isNumeric = [](mlir::Type type) {
+    return mlir::isa<py::IntType, py::FloatType, py::BoolType>(type);
+  };
+  auto isExactScalar = [&](mlir::Type type) {
+    return isNumeric(type) || mlir::isa<py::StrType, py::NoneType>(type);
+  };
+  if (!isExactScalar(lhs) || !isExactScalar(rhs))
+    return false;
+  return !(isNumeric(lhs) && isNumeric(rhs));
+}
+
 std::optional<std::size_t> staticTupleArity(mlir::Type type,
                                             mlir::Value value) {
   auto tupleType = mlir::dyn_cast<py::TupleType>(type);
@@ -192,24 +206,16 @@ Value Builder::Impl::emitExpressionWithExpectedType(const parser::Node &expr,
                                   ? stringField(**func, "id")
                                   : nullptr;
     if (name && *name == "list" && args && (!keywords || keywords->empty())) {
-      auto listTy = mlir::dyn_cast<py::ListType>(expectedType);
-      if (!listTy) {
-        error(expr, "list() requires a list[...] expected type");
+      mlir::Type elementType = listLiteralElementTypeForExpected(expectedType);
+      if (!elementType) {
+        error(expr, "list() requires a list-like expected type");
         return Value{{}, expectedType};
       }
       if (args->empty())
-        return emitListFromValues(expr, {}, listTy.getElementType());
+        return emitListFromValues(expr, {}, elementType);
       if (args->size() == 1 && args->front()) {
         if (args->front()->kind == "GeneratorExp") {
-          Value generated =
-              emitListComprehension(*args->front(), listTy.getElementType());
-          if (generated.value && generated.type != expectedType) {
-            error(expr, "list(generator) result type mismatch: expected " +
-                            typeString(expectedType) + ", got " +
-                            typeString(generated.type));
-            return Value{{}, expectedType};
-          }
-          return generated;
+          return emitListComprehension(*args->front(), elementType);
         }
         if (args->front()->kind == "Call") {
           const parser::NodePtr *rangeFunc = nodeField(*args->front(), "func");
@@ -218,11 +224,10 @@ Value Builder::Impl::emitExpressionWithExpectedType(const parser::Node &expr,
             if (rangeName && *rangeName == "range") {
               std::optional<StaticRangeElements> range =
                   emitStaticRangeElements(*args->front(), "list()",
-                                          listTy.getElementType());
+                                          elementType);
               if (!range)
                 return Value{{}, expectedType};
-              return emitListFromValues(expr, range->values,
-                                        listTy.getElementType());
+              return emitListFromValues(expr, range->values, elementType);
             }
           }
         }
@@ -230,7 +235,7 @@ Value Builder::Impl::emitExpressionWithExpectedType(const parser::Node &expr,
           const std::vector<parser::NodePtr> *elements =
               nodeListField(*args->front(), "elts");
           if (elements && elements->empty())
-            return emitListFromValues(expr, {}, listTy.getElementType());
+            return emitListFromValues(expr, {}, elementType);
         }
         Value source = emitExpression(*args->front());
         if (!source.value)
@@ -239,7 +244,7 @@ Value Builder::Impl::emitExpressionWithExpectedType(const parser::Node &expr,
             finiteSequenceElements(*args->front(), source, "list()");
         if (!elements)
           return Value{{}, expectedType};
-        return emitListFromValues(expr, *elements, listTy.getElementType());
+        return emitListFromValues(expr, *elements, elementType);
       }
       error(expr, "list() expects at most one argument");
       return Value{{}, expectedType};
@@ -334,39 +339,41 @@ Value Builder::Impl::emitExpressionWithExpectedType(const parser::Node &expr,
     }
     if (name && args && args->empty() && (!keywords || keywords->empty())) {
       if (*name == "dict") {
-        auto dictTy = mlir::dyn_cast<py::DictType>(expectedType);
-        if (!dictTy) {
-          error(expr, "dict() requires a dict[K, V] expected type");
+        std::optional<std::pair<mlir::Type, mlir::Type>> dictTypes =
+            dictLiteralKeyValueTypesForExpected(expectedType);
+        if (!dictTypes) {
+          error(expr, "dict() requires a mapping-like expected type");
           return Value{{}, expectedType};
         }
-        if (!dictStorageSupported(dictTy.getKeyType(), dictTy.getValueType())) {
+        if (!dictStorageSupported(dictTypes->first, dictTypes->second)) {
           error(expr, "dict() expected key/value types are not supported by "
                       "typed memref lowering yet: " +
-                          typeString(dictTy.getKeyType()) + ", " +
-                          typeString(dictTy.getValueType()));
+                          typeString(dictTypes->first) + ", " +
+                          typeString(dictTypes->second));
           return Value{{}, expectedType};
         }
+        mlir::Type concreteType = dictType(dictTypes->first, dictTypes->second);
         mlir::Value result =
-            builder.create<py::DictEmptyOp>(loc(expr), expectedType);
-        return Value{result, expectedType};
+            builder.create<py::DictEmptyOp>(loc(expr), concreteType);
+        return Value{result, concreteType};
       }
     }
   }
 
   if (expr.kind == "ListComp") {
-    auto listTy = mlir::dyn_cast<py::ListType>(expectedType);
-    if (!listTy) {
-      error(expr, "list comprehension requires a list[...] expected type");
+    mlir::Type elementType = listLiteralElementTypeForExpected(expectedType);
+    if (!elementType) {
+      error(expr, "list comprehension requires a list-like expected type");
       return Value{{}, expectedType};
     }
-    return emitListComprehension(expr, listTy.getElementType());
+    return emitListComprehension(expr, elementType);
   }
 
   if (expr.kind == "DictComp") {
     std::optional<std::pair<mlir::Type, mlir::Type>> dictTypes =
-        dictKeyValueTypes(expectedType);
+        dictLiteralKeyValueTypesForExpected(expectedType);
     if (!dictTypes) {
-      error(expr, "dict comprehension requires a dict[K, V] expected type");
+      error(expr, "dict comprehension requires a mapping-like expected type");
       return Value{{}, expectedType};
     }
     return emitDictComprehension(expr, dictTypes->first, dictTypes->second);
@@ -381,19 +388,19 @@ Value Builder::Impl::emitExpressionWithExpectedType(const parser::Node &expr,
   }
 
   if (expr.kind == "List") {
-    auto listTy = mlir::dyn_cast<py::ListType>(expectedType);
-    if (!listTy) {
-      error(expr, "list literal requires a list[...] expected type");
+    mlir::Type elementType = listLiteralElementTypeForExpected(expectedType);
+    if (!elementType) {
+      error(expr, "list literal requires a list-like expected type");
       return Value{{}, expectedType};
     }
-    return emitList(expr, listTy.getElementType());
+    return emitList(expr, elementType);
   }
 
   if (expr.kind == "Dict") {
     std::optional<std::pair<mlir::Type, mlir::Type>> dictTypes =
-        dictKeyValueTypes(expectedType);
+        dictLiteralKeyValueTypesForExpected(expectedType);
     if (!dictTypes) {
-      error(expr, "dict literal requires a dict[K, V] expected type");
+      error(expr, "dict literal requires a mapping-like expected type");
       return Value{{}, expectedType};
     }
     return emitDict(expr, dictTypes->first, dictTypes->second);
@@ -404,6 +411,8 @@ Value Builder::Impl::emitExpressionWithExpectedType(const parser::Node &expr,
 
 Value Builder::Impl::emitCondition(const parser::Node &expr) {
   Value value = emitExpression(expr);
+  if (!value.value)
+    return Value{{}, i1Type()};
   if (value.type == i1Type())
     return value;
   if (auto intTy = mlir::dyn_cast<mlir::IntegerType>(value.type)) {
@@ -602,6 +611,19 @@ Value Builder::Impl::emitName(const parser::Node &expr) {
   auto function = functions.find(*name);
   if (function != functions.end()) {
     return emitFunctionObject(expr, function->second);
+  }
+
+  if (isBuiltinExceptionClass(*name)) {
+    mlir::Type resultType = py::TypeType::get(&context, exceptionType());
+    mlir::Value object =
+        builder.create<py::ClassObjectOp>(loc(expr), resultType, *name);
+    return Value{object, resultType};
+  }
+  if (classes.count(*name)) {
+    mlir::Type resultType = py::TypeType::get(&context, classType(*name));
+    mlir::Value object =
+        builder.create<py::ClassObjectOp>(loc(expr), resultType, *name);
+    return Value{object, resultType};
   }
 
   error(expr, "unknown name '" + *name + "'");
@@ -1255,6 +1277,14 @@ Value Builder::Impl::emitCompare(const parser::Node &expr) {
       if (!value.value)
         return Value{{}, boolType()};
       resultBit = boolBit(loc(valueExpr), key == 0);
+    } else if (auto unionTy = mlir::dyn_cast<py::UnionType>(*valueType);
+               unionTy && key == 0 && unionTy.hasMember(noneType())) {
+      Value value = emitExpression(valueExpr);
+      if (!value.value)
+        return Value{{}, boolType()};
+      resultBit =
+          builder.create<py::UnionTestOp>(loc(valueExpr), i1Type(), value.value,
+                                          mlir::TypeAttr::get(noneType()));
     } else {
       if (valueExpr.kind != "Name" && valueExpr.kind != "Constant") {
         error(valueExpr,
@@ -1342,6 +1372,200 @@ Value Builder::Impl::emitCompare(const parser::Node &expr) {
         rhsNode->kind == "Tuple")
       return emitTupleLiteralMembership(expr, **lhsNode, *rhsNode,
                                         ops->front() == "not in");
+    if (ops->front() == "in" || ops->front() == "not in") {
+      std::optional<mlir::Type> rhsStaticType = inferExpressionType(*rhsNode);
+      std::optional<Value> concreteProtocolRhs;
+      std::optional<Value> emittedProtocolRhs;
+      if (rhsStaticType && mlir::isa<py::ProtocolType>(*rhsStaticType)) {
+        Value rhs = emitExpression(*rhsNode);
+        if (!rhs.value)
+          return Value{{}, i1Type()};
+        emittedProtocolRhs = rhs;
+        if (std::optional<Value> concrete = concreteProtocolValue(rhs)) {
+          concreteProtocolRhs = *concrete;
+          rhsStaticType = concrete->type;
+        }
+      }
+      auto emitRhs = [&]() -> Value {
+        if (concreteProtocolRhs)
+          return *concreteProtocolRhs;
+        if (emittedProtocolRhs)
+          return *emittedProtocolRhs;
+        return emitExpression(*rhsNode);
+      };
+      if (mlir::Type elementType =
+              rhsStaticType ? listElementType(*rhsStaticType) : mlir::Type{}) {
+        Value rhs = emitRhs();
+        if (!rhs.value)
+          return Value{{}, i1Type()};
+        Value lhs = emitExpression(**lhsNode);
+        if (!lhs.value)
+          return Value{{}, i1Type()};
+        std::optional<protocols::ProtocolMethod> containsContract =
+            resolveProtocolMethodContract(expr, rhs.type, "__contains__",
+                                          {lhs.type}, "list membership");
+        if (!containsContract)
+          return Value{{}, i1Type()};
+        llvm::ArrayRef<mlir::Type> containsResults =
+            containsContract->signature.getResultTypes();
+        if (containsResults.size() != 1 ||
+            containsResults.front() != boolType()) {
+          error(expr, "list membership does not satisfy Sequence.__contains__");
+          return Value{{}, i1Type()};
+        }
+        mlir::Value bit = builder.create<py::ContainsOp>(
+            loc(expr), i1Type(), containsContract->signature, rhs.value,
+            lhs.value);
+        if (ops->front() == "not in")
+          bit = invertBit(loc(expr), bit);
+        return Value{bit, i1Type()};
+      }
+      if (auto tupleType = rhsStaticType
+                               ? mlir::dyn_cast<py::TupleType>(*rhsStaticType)
+                               : py::TupleType{}) {
+        llvm::ArrayRef<mlir::Type> elementTypes = tupleType.getElementTypes();
+        Value rhs = emitRhs();
+        if (!rhs.value)
+          return Value{{}, i1Type()};
+        if (elementTypes.empty()) {
+          mlir::Value bit = boolBit(loc(expr), ops->front() == "not in");
+          return Value{bit, i1Type()};
+        }
+        Value lhs = emitExpression(**lhsNode);
+        if (!lhs.value)
+          return Value{{}, i1Type()};
+        std::optional<protocols::ProtocolMethod> containsContract =
+            resolveProtocolMethodContract(expr, rhs.type, "__contains__",
+                                          {lhs.type}, "tuple membership");
+        if (!containsContract)
+          return Value{{}, i1Type()};
+        llvm::ArrayRef<mlir::Type> containsResults =
+            containsContract->signature.getResultTypes();
+        if (containsResults.size() != 1 ||
+            containsResults.front() != boolType()) {
+          error(expr,
+                "tuple membership does not satisfy Sequence.__contains__");
+          return Value{{}, i1Type()};
+        }
+
+        mlir::Value bit = builder.create<py::ContainsOp>(
+            loc(expr), i1Type(), containsContract->signature, rhs.value,
+            lhs.value);
+        if (ops->front() == "not in")
+          bit = invertBit(loc(expr), bit);
+        return Value{bit, i1Type()};
+      }
+      if (std::optional<std::pair<mlir::Type, mlir::Type>> dictTypes =
+              rhsStaticType ? dictKeyValueTypes(*rhsStaticType)
+                            : std::nullopt) {
+        Value rhs = emitRhs();
+        if (!rhs.value)
+          return Value{{}, i1Type()};
+        Value lhs = emitExpression(**lhsNode);
+        if (!lhs.value)
+          return Value{{}, i1Type()};
+        std::optional<protocols::ProtocolMethod> containsContract =
+            resolveProtocolMethodContract(expr, rhs.type, "__contains__",
+                                          {lhs.type}, "dict membership");
+        if (!containsContract)
+          return Value{{}, i1Type()};
+        llvm::ArrayRef<mlir::Type> containsResults =
+            containsContract->signature.getResultTypes();
+        if (containsResults.size() != 1 ||
+            containsResults.front() != boolType()) {
+          error(expr, "dict membership does not satisfy Mapping.__contains__");
+          return Value{{}, i1Type()};
+        }
+        if (lhs.type != dictTypes->first) {
+          if (exactScalarEqualityAlwaysFalse(lhs.type, dictTypes->first)) {
+            mlir::Value bit = boolBit(loc(expr), ops->front() == "not in");
+            return Value{bit, i1Type()};
+          }
+          error(expr, "dict membership resolves " + typeString(rhs.type) +
+                          ".__contains__(" + typeString(lhs.type) +
+                          ") -> bool, but dictionary lookup lowering for item "
+                          "type " +
+                          typeString(lhs.type) + " and key type " +
+                          typeString(dictTypes->first) +
+                          " is not implemented yet");
+          return Value{{}, i1Type()};
+        }
+        mlir::Value bit = builder.create<py::ContainsOp>(
+            loc(expr), i1Type(), containsContract->signature, rhs.value,
+            lhs.value);
+        if (ops->front() == "not in")
+          bit = invertBit(loc(expr), bit);
+        return Value{bit, i1Type()};
+      }
+      if (auto classType = rhsStaticType
+                               ? mlir::dyn_cast<py::ClassType>(*rhsStaticType)
+                               : py::ClassType{}) {
+        Value rhs = emitRhs();
+        if (!rhs.value)
+          return Value{{}, i1Type()};
+        Value lhs = emitExpression(**lhsNode);
+        if (!lhs.value)
+          return Value{{}, i1Type()};
+
+        std::optional<py::ProtocolType> container =
+            protocolType("Container", {lhs.type});
+        if (!container) {
+          error(expr, "unknown Container protocol");
+          return Value{{}, i1Type()};
+        }
+        if (!classConformsToProtocol(classType, *container)) {
+          error(expr, "class receiver " + typeString(rhs.type) +
+                          " does not satisfy Container.__contains__(" +
+                          typeString(lhs.type) + ") -> bool");
+          return Value{{}, i1Type()};
+        }
+
+        std::optional<FunctionInfo> method =
+            resolveClassMethod(expr, rhs, "__contains__");
+        if (!method)
+          return Value{{}, i1Type()};
+        if (method->resultType != boolType()) {
+          error(expr, "class __contains__ on " + typeString(rhs.type) +
+                          " must return !py.bool, got " +
+                          typeString(method->resultType));
+          return Value{{}, i1Type()};
+        }
+
+        Value result = emitResolvedMethodCall(expr, rhs, *method, {lhs});
+        if (!result.value)
+          return Value{{}, i1Type()};
+        mlir::Value bit = builder.create<py::CastToPrimOp>(
+            loc(expr), i1Type(), result.value, "exact");
+        if (ops->front() == "not in")
+          bit = invertBit(loc(expr), bit);
+        return Value{bit, i1Type()};
+      }
+      if (rhsStaticType && mlir::isa<py::ProtocolType>(*rhsStaticType)) {
+        std::optional<mlir::Type> lhsStaticType =
+            inferExpressionType(**lhsNode);
+        if (!lhsStaticType) {
+          error(**lhsNode,
+                "protocol membership requires a statically known item type");
+          return Value{{}, i1Type()};
+        }
+        std::optional<mlir::Type> containsResult = resolveProtocolMethodResult(
+            expr, *rhsStaticType, "__contains__", {*lhsStaticType},
+            "protocol membership");
+        if (!containsResult)
+          return Value{{}, i1Type()};
+        if (*containsResult != boolType()) {
+          error(expr, "protocol membership __contains__ result must be bool, "
+                      "got " +
+                          typeString(*containsResult));
+          return Value{{}, i1Type()};
+        }
+        error(expr, "protocol membership on " + typeString(*rhsStaticType) +
+                        " resolves statically to " + typeString(boolType()) +
+                        ", but lowering for protocol-typed receivers is not "
+                        "implemented yet");
+        return Value{{}, i1Type()};
+      }
+    }
   }
 
   Value lhs = emitExpression(**lhsNode);

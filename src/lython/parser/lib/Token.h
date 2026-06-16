@@ -1,6 +1,6 @@
 #pragma once
 
-#include "lython/parser/Ast.h"
+#include "Ast.h"
 
 #include <map>
 #include <string>

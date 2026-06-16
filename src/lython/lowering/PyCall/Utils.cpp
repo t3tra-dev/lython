@@ -1,6 +1,11 @@
 #include "PyCall/Utils.h"
 
+#include "Common/Object.h"
+#include "Common/RuntimeSupport.h"
+#include "Passes/OwnershipAnalysis.h"
+
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 
 #include "llvm/ADT/STLExtras.h"
 
@@ -108,14 +113,14 @@ static bool arrayAttrContainsIndex(mlir::ArrayAttr attr, unsigned index) {
   return false;
 }
 
-static FuncOp resolveDirectPyFuncSymbol(mlir::Operation *from,
-                                        mlir::Value callable) {
+static CallableFuncOp resolveDirectPyFuncSymbol(mlir::Operation *from,
+                                                mlir::Value callable) {
   callable = stripBridgeCasts(callable);
 
-  if (auto funcObject = callable.getDefiningOp<FuncObjectOp>()) {
+  if (auto funcObject = callable.getDefiningOp<CallableObjectOp>()) {
     mlir::Operation *symbol = mlir::SymbolTable::lookupNearestSymbolFrom(
         from, funcObject.getTargetAttr());
-    return mlir::dyn_cast_or_null<FuncOp>(symbol);
+    return mlir::dyn_cast_or_null<CallableFuncOp>(symbol);
   }
   return nullptr;
 }
@@ -172,19 +177,16 @@ static bool isPublishedClassInstanceValue(mlir::Value value) {
   mlir::Operation *def = value.getDefiningOp();
   if (!def)
     return false;
-  if (mlir::isa<PublishOp, ClassPromoteOp, ListGetOp>(def))
+  if (mlir::isa<PublishOp, ClassPromoteOp>(def))
     return true;
+  if (auto getItem = mlir::dyn_cast<GetItemOp>(def))
+    return mlir::isa<ListType>(getItem.getContainer().getType());
 
   auto result = mlir::dyn_cast<mlir::OpResult>(value);
   if (!result)
     return false;
 
   if (auto call = mlir::dyn_cast<CallOp>(def))
-    return funcResultIsPublished(
-        resolveDirectPyFuncSymbol(call, call.getCallable()),
-        result.getResultNumber());
-
-  if (auto call = mlir::dyn_cast<CallVectorOp>(def))
     return funcResultIsPublished(
         resolveDirectPyFuncSymbol(call, call.getCallable()),
         result.getResultNumber());
@@ -221,9 +223,10 @@ void emitTracebackPush(mlir::Location loc, mlir::func::FuncOp func,
                mlir::ValueRange{fileBytes, funcBytes, lineConst, colConst});
 }
 
-static std::optional<llvm::StringRef> builtinCallableName(mlir::Value callable) {
+static std::optional<llvm::StringRef>
+builtinCallableName(mlir::Value callable) {
   callable = stripBridgeCasts(callable);
-  if (auto funcObject = callable.getDefiningOp<FuncObjectOp>())
+  if (auto funcObject = callable.getDefiningOp<CallableObjectOp>())
     return funcObject.getTarget();
   if (auto constant = callable.getDefiningOp<mlir::func::ConstantOp>()) {
     mlir::SymbolRefAttr symbol = constant.getValueAttr();
@@ -260,7 +263,7 @@ void ensureLandingpad(mlir::Block *unwind, mlir::Location loc,
                                             mlir::ValueRange{});
 }
 
-bool canUseVoidHelper(CallVectorOp op, mlir::func::FuncOp callee) {
+bool canUseVoidHelper(CallOp op, mlir::func::FuncOp callee) {
   auto helperAttr =
       callee->getAttrOfType<mlir::SymbolRefAttr>("ly.void_helper");
   if (!helperAttr)
@@ -275,10 +278,18 @@ bool canUseVoidHelper(CallVectorOp op, mlir::func::FuncOp callee) {
 }
 
 mlir::Value stripBridgeCasts(mlir::Value value) {
-  while (auto cast = value.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
-    if (cast->getNumOperands() != 1)
-      break;
-    value = cast.getOperand(0);
+  while (value) {
+    if (auto cast = value.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+      if (cast->getNumOperands() != 1)
+        break;
+      value = cast.getOperand(0);
+      continue;
+    }
+    if (auto upcast = value.getDefiningOp<ClassUpcastOp>()) {
+      value = upcast.getInput();
+      continue;
+    }
+    break;
   }
   return value;
 }
@@ -319,8 +330,68 @@ mlir::func::FuncOp resolvePreferredDirectHelper(mlir::func::FuncOp callee,
 
 static bool canBridgeCallOperandType(mlir::Type type) {
   return isPyType(type) ||
-         mlir::isa<FuncType, TupleType, ListType, ClassType, DictType,
-                   CoroutineType, FutureType, TaskType>(type);
+         mlir::isa<TupleType, ListType, ClassType, DictType>(type);
+}
+
+static bool carriesObjectHeaderPrefix(mlir::Type type) {
+  return mlir::isa<IntType, StrType, ExceptionType, ClassType, TypeType,
+                   ObjectType, ProtocolType, TracebackType>(type);
+}
+
+static mlir::Value materializeNoneObjectHeader(mlir::Location loc,
+                                               mlir::RewriterBase &rewriter) {
+  mlir::MemRefType headerType =
+      object_abi::Header::owned(rewriter.getContext());
+  mlir::Value header = rewriter.create<mlir::memref::AllocaOp>(loc, headerType);
+  mlir::Type i64Type = rewriter.getI64Type();
+  auto storeI64 = [&](int64_t slot, int64_t value) {
+    mlir::Value iv = rewriter.create<mlir::arith::ConstantIndexOp>(loc, slot);
+    mlir::Value constant =
+        rewriter.create<mlir::arith::ConstantIntOp>(loc, value, i64Type);
+    rewriter.create<mlir::memref::StoreOp>(loc, constant, header,
+                                           mlir::ValueRange{iv});
+  };
+  storeI64(object_abi::kRefcountSlot, object_abi::kImmortalRefcount);
+  storeI64(object_abi::kLayoutIdSlot,
+           static_cast<int64_t>(object_abi::KindId::None));
+  if (mlir::Operation *def = header.getDefiningOp())
+    def->setAttr(OwnershipContractAttrs::kImmortalObject,
+                 rewriter.getUnitAttr());
+  return header;
+}
+
+static std::optional<llvm::SmallVector<mlir::Value>>
+materializeObjectHeaderView(mlir::Location loc, mlir::Value element,
+                            mlir::RewriterBase &rewriter,
+                            const PyLLVMTypeConverter &typeConverter) {
+  if (!mlir::isa<ObjectType, ProtocolType>(element.getType()))
+    return std::nullopt;
+  auto cast = element.getDefiningOp<mlir::UnrealizedConversionCastOp>();
+  if (!cast || cast.getNumOperands() != 1)
+    return std::nullopt;
+  mlir::Value source = cast.getOperand(0);
+  if (mlir::isa<NoneType>(source.getType()))
+    return llvm::SmallVector<mlir::Value>{
+        materializeNoneObjectHeader(loc, rewriter)};
+  if (source.getType() == element.getType() ||
+      !carriesObjectHeaderPrefix(source.getType()))
+    return std::nullopt;
+
+  llvm::SmallVector<mlir::Type> sourceParts;
+  if (mlir::failed(typeConverter.convertType(source.getType(), sourceParts)) ||
+      sourceParts.empty())
+    return std::nullopt;
+
+  llvm::SmallVector<mlir::Value> loweredParts;
+  if (sourceParts.size() == 1 && source.getType() == sourceParts.front()) {
+    loweredParts.push_back(source);
+  } else {
+    auto lowered = rewriter.create<mlir::UnrealizedConversionCastOp>(
+        loc, mlir::TypeRange(sourceParts), mlir::ValueRange{source});
+    loweredParts.append(lowered.getResults().begin(),
+                        lowered.getResults().end());
+  }
+  return llvm::SmallVector<mlir::Value>{loweredParts.front()};
 }
 
 mlir::LogicalResult appendFlattenedCallOperands(
@@ -330,22 +401,28 @@ mlir::LogicalResult appendFlattenedCallOperands(
   unsigned expectedIndex = 0;
   for (mlir::Value element : elements) {
     llvm::SmallVector<mlir::Value> remapped;
-    llvm::SmallVector<mlir::Type> convertedElementTypes;
-    if (mlir::failed(typeConverter.convertType(element.getType(),
-                                               convertedElementTypes)) ||
-        convertedElementTypes.empty())
-      return mlir::failure();
-
-    if (convertedElementTypes.size() == 1 &&
-        element.getType() == convertedElementTypes.front()) {
-      remapped.push_back(element);
+    if (std::optional<llvm::SmallVector<mlir::Value>> header =
+            materializeObjectHeaderView(loc, element, rewriter,
+                                        typeConverter)) {
+      remapped = std::move(*header);
     } else {
-      if (!canBridgeCallOperandType(element.getType()))
+      llvm::SmallVector<mlir::Type> convertedElementTypes;
+      if (mlir::failed(typeConverter.convertType(element.getType(),
+                                                 convertedElementTypes)) ||
+          convertedElementTypes.empty())
         return mlir::failure();
-      auto cast = rewriter.create<mlir::UnrealizedConversionCastOp>(
-          loc, mlir::TypeRange(convertedElementTypes),
-          mlir::ValueRange{element});
-      remapped.assign(cast.getResults().begin(), cast.getResults().end());
+
+      if (convertedElementTypes.size() == 1 &&
+          element.getType() == convertedElementTypes.front()) {
+        remapped.push_back(element);
+      } else {
+        if (!canBridgeCallOperandType(element.getType()))
+          return mlir::failure();
+        auto cast = rewriter.create<mlir::UnrealizedConversionCastOp>(
+            loc, mlir::TypeRange(convertedElementTypes),
+            mlir::ValueRange{element});
+        remapped.assign(cast.getResults().begin(), cast.getResults().end());
+      }
     }
     if (expectedIndex + remapped.size() > directInputCount)
       return mlir::failure();
@@ -363,7 +440,7 @@ mlir::LogicalResult appendFlattenedCallOperands(
   return mlir::success(expectedIndex == directInputCount);
 }
 
-void eraseNoneResultUsers(CallVectorOp op, mlir::RewriterBase &rewriter) {
+void eraseNoneResultUsers(CallOp op, mlir::RewriterBase &rewriter) {
   for (mlir::Operation *user :
        llvm::make_early_inc_range(op.getResult(0).getUsers()))
     rewriter.eraseOp(user);
@@ -395,11 +472,23 @@ void materializeLogicalResults(mlir::Location loc, mlir::TypeRange logicalTypes,
     if (loweredGroup.size() == 1) {
       auto cast = rewriter.create<mlir::UnrealizedConversionCastOp>(
           loc, mlir::TypeRange{logicalType}, loweredGroup);
+      if (isPyOwnershipTrackedType(logicalType)) {
+        llvm::SmallVector<mlir::Attribute, 1> owned{
+            rewriter.getI64IntegerAttr(0)};
+        cast->setAttr(OwnershipContractAttrs::kOwnedResults,
+                      rewriter.getArrayAttr(owned));
+      }
       results.push_back(cast.getResult(0));
       continue;
     }
     auto cast = rewriter.create<mlir::UnrealizedConversionCastOp>(
         loc, mlir::TypeRange{logicalType}, loweredGroup);
+    if (isPyOwnershipTrackedType(logicalType)) {
+      llvm::SmallVector<mlir::Attribute, 1> owned{
+          rewriter.getI64IntegerAttr(0)};
+      cast->setAttr(OwnershipContractAttrs::kOwnedResults,
+                    rewriter.getArrayAttr(owned));
+    }
     results.push_back(cast.getResult(0));
   }
 }

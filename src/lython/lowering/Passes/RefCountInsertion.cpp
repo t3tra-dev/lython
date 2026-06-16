@@ -69,7 +69,7 @@ static mlir::Operation *directCallPackUse(mlir::Value value) {
         continue;
       }
 
-      if (auto call = mlir::dyn_cast<CallVectorOp>(user)) {
+      if (auto call = mlir::dyn_cast<CallOp>(user)) {
         if (call.getPosargs() != current)
           return nullptr;
         if (callLike && callLike != user)
@@ -110,6 +110,16 @@ static mlir::Operation *borrowDropAnchor(mlir::Operation *lastUser) {
   return lastUser;
 }
 
+static mlir::LogicalResult insertRetainOrFail(mlir::OpBuilder &builder,
+                                              mlir::Operation *user,
+                                              mlir::Value value) {
+  if (isPyLinearAsyncDescriptorType(value.getType()))
+    return user->emitOpError("cannot retain linear async descriptor ")
+           << value << "; move it exactly once";
+  builder.create<IncRefOp>(value.getLoc(), value);
+  return mlir::success();
+}
+
 struct RefCountInsertionPass
     : public mlir::PassWrapper<RefCountInsertionPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -118,7 +128,7 @@ struct RefCountInsertionPass
   void runOnOperation() override {
     mlir::ModuleOp module = getOperation();
 
-    module.walk([&](FuncOp func) {
+    module.walk([&](CallableFuncOp func) {
       if (mlir::failed(processFunctionLike(func.getOperation(), func.getBody(),
                                            /*entryArgsBorrowed=*/true)))
         signalPassFailure();
@@ -160,10 +170,16 @@ private:
         continue;
       mlir::Value root = aliases.getRoot(arg);
       if (entryArgsBorrowed) {
+        if (isPyLinearAsyncDescriptorType(arg.getType())) {
+          if (mlir::failed(processOwnedRoot(root)))
+            return mlir::failure();
+          continue;
+        }
         if (aliases.rootIsImmortal(root))
           continue;
         processedRoots.insert(root);
-        addRetainsForBorrowedConsumes(root, aliases);
+        if (mlir::failed(addRetainsForBorrowedConsumes(root, aliases)))
+          return mlir::failure();
         continue;
       }
       if (mlir::failed(processOwnedRoot(root)))
@@ -193,7 +209,7 @@ private:
           continue;
 
         for (mlir::Value result : op->getResults()) {
-          if (!isPyOwnershipTrackedType(result.getType()))
+          if (!isPyOwnedResult(result))
             continue;
 
           mlir::Value root = aliases.getRoot(result);
@@ -223,7 +239,8 @@ private:
     return mlir::success();
   }
 
-  void addRetainsForBorrowedConsumes(mlir::Value root, AliasAnalysis &aliases) {
+  mlir::LogicalResult addRetainsForBorrowedConsumes(mlir::Value root,
+                                                    AliasAnalysis &aliases) {
     mlir::OpBuilder builder(root.getContext());
 
     llvm::SmallVector<mlir::Value, 4> aliasSet;
@@ -238,9 +255,11 @@ private:
           continue;
 
         builder.setInsertionPoint(user);
-        builder.create<IncRefOp>(alias.getLoc(), alias);
+        if (mlir::failed(insertRetainOrFail(builder, user, alias)))
+          return mlir::failure();
       }
     }
+    return mlir::success();
   }
 
   mlir::LogicalResult addRefCountingForAliasSet(mlir::Value root,
@@ -367,7 +386,8 @@ private:
 
         if (anyLiveOut || !isLastInBlock) {
           builder.setInsertionPoint(user);
-          builder.create<IncRefOp>(alias.getLoc(), alias);
+          if (mlir::failed(insertRetainOrFail(builder, user, alias)))
+            return mlir::failure();
         }
       }
     }
@@ -400,8 +420,9 @@ private:
       // matching retain so the affine token count remains non-negative.
       builder.setInsertionPoint(user);
       for (size_t i = 1, e = consumedOperands.size(); i < e; ++i)
-        builder.create<IncRefOp>(consumedOperands[i].getLoc(),
-                                 consumedOperands[i]);
+        if (mlir::failed(
+                insertRetainOrFail(builder, user, consumedOperands[i])))
+          return mlir::failure();
     }
 
     if (mlir::failed(addDropRefInDivergentSuccessors(root, aliasSet, liveness)))

@@ -1,5 +1,3 @@
-#include "Common/Container.h"
-
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/AsyncToLLVM/AsyncToLLVM.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
@@ -20,7 +18,6 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/BufferizableOpInterfaceImpl.h"
-#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/BufferizableOpInterfaceImpl.h"
@@ -31,8 +28,6 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/MLIRContext.h"
-#include "mlir/IR/PatternMatch.h"
-#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
@@ -61,6 +56,8 @@
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/IRReader/IRReader.h"
+#include "llvm/Linker/Linker.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/CodeGen.h"
@@ -71,18 +68,16 @@
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Process.h"
 #include "llvm/Support/Signals.h"
+#include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/TargetParser/Host.h"
 #include "llvm/Transforms/Coroutines/CoroCleanup.h"
 #include "llvm/Transforms/Coroutines/CoroEarly.h"
-#include "llvm/Transforms/Coroutines/CoroSplit.h"
 
 #include <chrono>
 #include <cstdint>
-#include <limits>
-#include <map>
 #include <optional>
 #include <set>
 #include <string>
@@ -98,14 +93,12 @@
 #include <unistd.h>
 #endif
 
-#include "Common/Object.h"
 #include "Common/RuntimeLibrary.h"
 #include "Common/RuntimeSupport.h"
-#include "Common/ThreadSafetyKernel.h"
+#include "Emitter.h"
+#include "Parser.h"
 #include "Passes/Runtime/Cleanup.h"
 #include "lyrt.h"
-#include "lython/emitter/Emitter.h"
-#include "lython/parser/Parser.h"
 
 #include "PyDialect.h.inc"
 
@@ -452,7 +445,7 @@ LogicalResult runPipeline(ModuleOp module, MLIRContext &context,
   dumpMLIRForPass(irDump, "thread-safety-verifier", module);
 
   // Phase 6: Lower async.func/async.await to the MLIR async runtime, then
-  // convert those runtime ops to LLVM. Lython owns !py.coro/!py.task/!py.future
+  // convert those runtime ops to LLVM. Lython owns Awaitable/Coroutine protocol
   // descriptors linearly, so async runtime refcounting is emitted by Py
   // lowering instead of the generic MLIR async refcount pass.
   if (failed(runLoweringPhase(
@@ -564,6 +557,7 @@ buildRuntimeSymbolMap(llvm::orc::MangleAndInterner interner) {
                                  llvm::JITSymbolFlags::Exported};
   };
   add("LyHost_PrintLine", &LyHost_PrintLine);
+  add("LyRt_InstallStackGuard", &LyRt_InstallStackGuard);
   add("LyEH_ThrowException", &LyEH_ThrowException);
   add("LyEH_RethrowCurrent", &LyEH_RethrowCurrent);
   add("LyEH_TakeCurrentDescriptor", &LyEH_TakeCurrentDescriptor);
@@ -737,6 +731,12 @@ LogicalResult writeLLVMIR(llvm::Module &llvmModule, StringRef outputPath) {
   return success();
 }
 
+// Lowers LLVM coroutines and runs the standard O2 module pipeline. MLIR-level
+// passes never ran SROA/mem2reg-class cleanups on the translated IR, so
+// without this the descriptor allocas of every lowered object stay in the
+// frame (~2KB per object-handling call frame) and nothing is ever inlined.
+// The O2 default pipeline already contains the coroutine lowering phases
+// (CoroEarly/CoroSplit/CoroCleanup) at their correct positions.
 void runLLVMCoroLowering(llvm::Module &llvmModule) {
   llvm::LoopAnalysisManager loopAM;
   llvm::FunctionAnalysisManager functionAM;
@@ -749,13 +749,8 @@ void runLLVMCoroLowering(llvm::Module &llvmModule) {
   passBuilder.registerLoopAnalyses(loopAM);
   passBuilder.crossRegisterProxies(loopAM, functionAM, cgsccAM, moduleAM);
 
-  llvm::ModulePassManager modulePM;
-  modulePM.addPass(llvm::CoroEarlyPass());
-  llvm::CGSCCPassManager cgsccPM;
-  cgsccPM.addPass(llvm::CoroSplitPass());
-  modulePM.addPass(
-      llvm::createModuleToPostOrderCGSCCPassAdaptor(std::move(cgsccPM)));
-  modulePM.addPass(llvm::CoroCleanupPass());
+  llvm::ModulePassManager modulePM =
+      passBuilder.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O2);
   modulePM.run(llvmModule, moduleAM);
 }
 
@@ -770,6 +765,9 @@ struct LLVMSafetyContract {
   int64_t id = -1;
   std::string functionName;
   LLVMSafetyEffectKind kind;
+  std::optional<llvm::AtomicRMWInst::BinOp> rmwBinOp;
+  std::optional<int64_t> integerOperand;
+  std::optional<llvm::AtomicOrdering> ordering;
 };
 
 struct LLVMSafetyProfile {
@@ -779,6 +777,12 @@ struct LLVMSafetyProfile {
 static constexpr llvm::StringLiteral kLythonSafetyMetadataName{"ly.safety"};
 static constexpr llvm::StringLiteral kLythonSafetyMetadataVersion{
     "ly.safety.v1"};
+// Atomics inside the pre-lowered runtime cache were verified by the full
+// pipeline when the cache was generated at build time. Their metadata is
+// sealed to this version so the per-compile verifier can recognize them
+// without confusing their stale contract ids with the current profile.
+static constexpr llvm::StringLiteral kLythonRuntimeSafetyMetadataVersion{
+    "ly.safety.runtime.v1"};
 static constexpr llvm::StringLiteral kPySafetyContractIdAttr{
     "py.safety_contract_id"};
 
@@ -797,23 +801,173 @@ getStructuralSafetyEffectKind(llvm::Instruction &inst) {
   return std::nullopt;
 }
 
+static std::optional<llvm::AtomicRMWInst::BinOp>
+mapAtomicBinOp(LLVM::AtomicBinOp op) {
+  switch (op) {
+  case LLVM::AtomicBinOp::xchg:
+    return llvm::AtomicRMWInst::Xchg;
+  case LLVM::AtomicBinOp::add:
+    return llvm::AtomicRMWInst::Add;
+  case LLVM::AtomicBinOp::sub:
+    return llvm::AtomicRMWInst::Sub;
+  case LLVM::AtomicBinOp::_and:
+    return llvm::AtomicRMWInst::And;
+  case LLVM::AtomicBinOp::nand:
+    return llvm::AtomicRMWInst::Nand;
+  case LLVM::AtomicBinOp::_or:
+    return llvm::AtomicRMWInst::Or;
+  case LLVM::AtomicBinOp::_xor:
+    return llvm::AtomicRMWInst::Xor;
+  case LLVM::AtomicBinOp::max:
+    return llvm::AtomicRMWInst::Max;
+  case LLVM::AtomicBinOp::min:
+    return llvm::AtomicRMWInst::Min;
+  case LLVM::AtomicBinOp::umax:
+    return llvm::AtomicRMWInst::UMax;
+  case LLVM::AtomicBinOp::umin:
+    return llvm::AtomicRMWInst::UMin;
+  case LLVM::AtomicBinOp::fadd:
+    return llvm::AtomicRMWInst::FAdd;
+  case LLVM::AtomicBinOp::fsub:
+    return llvm::AtomicRMWInst::FSub;
+  case LLVM::AtomicBinOp::fmax:
+    return llvm::AtomicRMWInst::FMax;
+  case LLVM::AtomicBinOp::fmin:
+    return llvm::AtomicRMWInst::FMin;
+  case LLVM::AtomicBinOp::uinc_wrap:
+    return llvm::AtomicRMWInst::UIncWrap;
+  case LLVM::AtomicBinOp::udec_wrap:
+    return llvm::AtomicRMWInst::UDecWrap;
+  case LLVM::AtomicBinOp::usub_cond:
+    return llvm::AtomicRMWInst::USubCond;
+  case LLVM::AtomicBinOp::usub_sat:
+    return llvm::AtomicRMWInst::USubSat;
+  }
+  return std::nullopt;
+}
+
+static std::optional<llvm::AtomicOrdering>
+mapAtomicOrdering(LLVM::AtomicOrdering ordering) {
+  switch (ordering) {
+  case LLVM::AtomicOrdering::not_atomic:
+    return llvm::AtomicOrdering::NotAtomic;
+  case LLVM::AtomicOrdering::unordered:
+    return llvm::AtomicOrdering::Unordered;
+  case LLVM::AtomicOrdering::monotonic:
+    return llvm::AtomicOrdering::Monotonic;
+  case LLVM::AtomicOrdering::acquire:
+    return llvm::AtomicOrdering::Acquire;
+  case LLVM::AtomicOrdering::release:
+    return llvm::AtomicOrdering::Release;
+  case LLVM::AtomicOrdering::acq_rel:
+    return llvm::AtomicOrdering::AcquireRelease;
+  case LLVM::AtomicOrdering::seq_cst:
+    return llvm::AtomicOrdering::SequentiallyConsistent;
+  }
+  return std::nullopt;
+}
+
+static std::optional<int64_t> mlirIntegerConstant(Value value) {
+  if (auto constant = value.getDefiningOp<LLVM::ConstantOp>())
+    if (auto attr = dyn_cast<IntegerAttr>(constant.getValue()))
+      return attr.getInt();
+  return std::nullopt;
+}
+
+static std::optional<int64_t> llvmIntegerConstant(llvm::Value *value) {
+  auto *constant = llvm::dyn_cast_or_null<llvm::ConstantInt>(value);
+  if (!constant)
+    return std::nullopt;
+  return constant->getSExtValue();
+}
+
+static bool sameAtomicRMWBinOp(llvm::AtomicRMWInst::BinOp actual,
+                               const LLVMSafetyContract &contract) {
+  if (!contract.rmwBinOp)
+    return true;
+  if (actual == *contract.rmwBinOp)
+    return true;
+
+  // LLVM's O2 pipeline canonicalizes no-op integer atomic reads in some
+  // inlined helpers from `atomicrmw add 0` to `atomicrmw or 0`. The MLIR
+  // thread-safety verifier has already validated the source contract, so keep
+  // the post-optimization metadata check semantic for this one no-op shape.
+  if (contract.integerOperand && *contract.integerOperand == 0 &&
+      *contract.rmwBinOp == llvm::AtomicRMWInst::Add &&
+      actual == llvm::AtomicRMWInst::Or)
+    return true;
+
+  return false;
+}
+
 static bool instructionMatchesContract(llvm::Instruction &inst,
                                        const LLVMSafetyContract &contract) {
   switch (contract.kind) {
-  case LLVMSafetyEffectKind::AtomicRMW:
-    return llvm::isa<llvm::AtomicRMWInst>(inst);
+  case LLVMSafetyEffectKind::AtomicRMW: {
+    auto *rmw = llvm::dyn_cast<llvm::AtomicRMWInst>(&inst);
+    if (!rmw)
+      return false;
+    if (!sameAtomicRMWBinOp(rmw->getOperation(), contract))
+      return false;
+    if (contract.integerOperand) {
+      std::optional<int64_t> actual = llvmIntegerConstant(rmw->getValOperand());
+      if (!actual || *actual != *contract.integerOperand)
+        return false;
+    }
+    if (contract.ordering && rmw->getOrdering() != *contract.ordering)
+      return false;
+    return true;
+  }
   case LLVMSafetyEffectKind::AtomicCmpXchg:
     return llvm::isa<llvm::AtomicCmpXchgInst>(inst);
   case LLVMSafetyEffectKind::AtomicLoad: {
     auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst);
-    return load && load->isAtomic();
+    return load && load->isAtomic() &&
+           (!contract.ordering || load->getOrdering() == *contract.ordering);
   }
   case LLVMSafetyEffectKind::AtomicStore: {
     auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
-    return store && store->isAtomic();
+    return store && store->isAtomic() &&
+           (!contract.ordering || store->getOrdering() == *contract.ordering);
   }
   }
   return false;
+}
+
+static std::optional<int64_t>
+recoverDroppedNoOpAtomicReadContract(llvm::Instruction &inst,
+                                     const LLVMSafetyProfile &profile) {
+  auto *rmw = llvm::dyn_cast<llvm::AtomicRMWInst>(&inst);
+  if (!rmw)
+    return std::nullopt;
+  std::optional<int64_t> actualValue =
+      llvmIntegerConstant(rmw->getValOperand());
+  if (!actualValue || *actualValue != 0)
+    return std::nullopt;
+
+  llvm::Function *function = inst.getFunction();
+  if (!function)
+    return std::nullopt;
+  for (const LLVMSafetyContract &contract : profile.contracts) {
+    if (contract.functionName != function->getName())
+      continue;
+    if (contract.kind != LLVMSafetyEffectKind::AtomicRMW)
+      continue;
+    if (!contract.rmwBinOp || *contract.rmwBinOp != llvm::AtomicRMWInst::Add)
+      continue;
+    if (!contract.integerOperand || *contract.integerOperand != 0)
+      continue;
+    if (contract.ordering &&
+        *contract.ordering != llvm::AtomicOrdering::Acquire)
+      continue;
+    if (rmw->getOperation() != llvm::AtomicRMWInst::Add &&
+        rmw->getOperation() != llvm::AtomicRMWInst::Or)
+      continue;
+    if (!instructionMatchesContract(inst, contract))
+      continue;
+    return contract.id;
+  }
+  return std::nullopt;
 }
 
 void collectLLVMSafetyContracts(ModuleOp module, LLVMSafetyProfile &profile) {
@@ -832,6 +986,9 @@ void collectLLVMSafetyContracts(ModuleOp module, LLVMSafetyProfile &profile) {
 
         if (auto atomic = dyn_cast<LLVM::AtomicRMWOp>(&op)) {
           contract.kind = LLVMSafetyEffectKind::AtomicRMW;
+          contract.rmwBinOp = mapAtomicBinOp(atomic.getBinOp());
+          contract.integerOperand = mlirIntegerConstant(atomic.getVal());
+          contract.ordering = mapAtomicOrdering(atomic.getOrdering());
           markContract();
           continue;
         }
@@ -846,6 +1003,7 @@ void collectLLVMSafetyContracts(ModuleOp module, LLVMSafetyProfile &profile) {
           if (load.getOrdering() == LLVM::AtomicOrdering::not_atomic)
             continue;
           contract.kind = LLVMSafetyEffectKind::AtomicLoad;
+          contract.ordering = mapAtomicOrdering(load.getOrdering());
           markContract();
           continue;
         }
@@ -854,6 +1012,7 @@ void collectLLVMSafetyContracts(ModuleOp module, LLVMSafetyProfile &profile) {
           if (store.getOrdering() == LLVM::AtomicOrdering::not_atomic)
             continue;
           contract.kind = LLVMSafetyEffectKind::AtomicStore;
+          contract.ordering = mapAtomicOrdering(store.getOrdering());
           markContract();
         }
       }
@@ -885,6 +1044,52 @@ std::optional<int64_t> getLythonSafetyMetadataId(llvm::Instruction &inst) {
   if (!intConstant)
     return std::nullopt;
   return intConstant->getSExtValue();
+}
+
+bool hasRuntimeVerifiedSafetyMetadata(llvm::Instruction &inst) {
+  llvm::MDNode *node = inst.getMetadata(kLythonSafetyMetadataName);
+  if (!node || node->getNumOperands() < 1)
+    return false;
+  auto *version = llvm::dyn_cast<llvm::MDString>(node->getOperand(0));
+  return version && version->getString() == kLythonRuntimeSafetyMetadataVersion;
+}
+
+// Rewrites the safety metadata of every contracted instruction to the
+// runtime-verified version. Called only by the prelower generation run after
+// all verifications have passed; the resulting IR is the build-time cache.
+void sealRuntimeSafetyMetadata(llvm::Module &llvmModule) {
+  llvm::LLVMContext &ctx = llvmModule.getContext();
+  llvm::Metadata *operands[] = {
+      llvm::MDString::get(ctx, kLythonRuntimeSafetyMetadataVersion)};
+  llvm::MDNode *sealed = llvm::MDNode::get(ctx, operands);
+  for (llvm::Function &function : llvmModule)
+    for (llvm::BasicBlock &block : function)
+      for (llvm::Instruction &inst : block)
+        if (getLythonSafetyMetadataId(inst))
+          inst.setMetadata(kLythonSafetyMetadataName, sealed);
+}
+
+LogicalResult linkPrelinkedRuntime(llvm::Module &llvmModule) {
+  std::optional<std::string> path =
+      py::runtime_library::prelinkedRuntimeIRPath();
+  if (!path)
+    return success();
+  llvm::SMDiagnostic diagnostic;
+  std::unique_ptr<llvm::Module> runtime =
+      llvm::parseIRFile(*path, diagnostic, llvmModule.getContext());
+  if (!runtime) {
+    llvm::errs() << "error: failed to load pre-lowered runtime IR from '"
+                 << *path << "': " << diagnostic.getMessage() << "\n";
+    return failure();
+  }
+  runtime->setDataLayout(llvmModule.getDataLayout());
+  runtime->setTargetTriple(llvmModule.getTargetTriple());
+  if (llvm::Linker::linkModules(llvmModule, std::move(runtime),
+                                llvm::Linker::Flags::LinkOnlyNeeded)) {
+    llvm::errs() << "error: failed to link pre-lowered runtime IR\n";
+    return failure();
+  }
+  return success();
 }
 
 class PySafetyLLVMIRTranslationInterface final
@@ -926,15 +1131,24 @@ verifyLLVMIRSafetyMetadataPreserved(llvm::Module &llvmModule,
   for (llvm::Function &function : llvmModule) {
     for (llvm::BasicBlock &block : function) {
       for (llvm::Instruction &inst : block) {
+        // Instructions from the pre-lowered runtime cache carry sealed
+        // metadata: their contracts were verified when the cache was built.
+        if (hasRuntimeVerifiedSafetyMetadata(inst))
+          continue;
         auto id = getLythonSafetyMetadataId(inst);
         if (!id) {
-          if (getStructuralSafetyEffectKind(inst)) {
+          if (auto recovered =
+                  recoverDroppedNoOpAtomicReadContract(inst, profile)) {
+            setLythonSafetyMetadataId(inst, *recovered);
+            id = recovered;
+          } else if (getStructuralSafetyEffectKind(inst)) {
             emitLLVMSafetyVerifierError(
                 inst, "LLVM atomic safety effect has no preserved MLIR "
                       "contract id");
             failedAny = true;
           }
-          continue;
+          if (!id)
+            continue;
         }
         if (*id < 0 || static_cast<size_t>(*id) >= profile.contracts.size()) {
           emitLLVMSafetyVerifierError(
@@ -1048,7 +1262,16 @@ LogicalResult linkExecutable(StringRef objectPath, StringRef runtimeLib,
   std::vector<std::string> argStorage;
   argStorage.push_back(clangProgram);
   argStorage.emplace_back(objectPath.str());
+  // The runtime archive carries constructor-installed process state (the
+  // stack-overflow guard); force every object in so constructors run even
+  // when no symbol from their object file is referenced.
+#if defined(__APPLE__)
+  argStorage.emplace_back("-Wl,-force_load," + runtimeLib.str());
+#else
+  argStorage.emplace_back("-Wl,--whole-archive");
   argStorage.emplace_back(runtimeLib.str());
+  argStorage.emplace_back("-Wl,--no-whole-archive");
+#endif
   if (!asyncRuntimeLib.empty()) {
     argStorage.emplace_back(asyncRuntimeLib.str());
     llvm::SmallString<256> asyncRuntimeDir(asyncRuntimeLib);
@@ -1078,6 +1301,21 @@ LogicalResult linkExecutable(StringRef objectPath, StringRef runtimeLib,
     return failure();
   }
   return success();
+}
+
+// The async runtime dylib transitively loads libLLVM, which costs hundreds of
+// milliseconds of dyld fixups at every process start. Link it only when the
+// translated module actually references the MLIR async runtime ABI. The
+// prefix intentionally omits the trailing "e" to cover the upstream
+// mlirAsyncRuntimGetNumWorkerThreads spelling.
+bool usesAsyncRuntime(const llvm::Module &llvmModule) {
+  for (const llvm::Function &function : llvmModule) {
+    if (!function.getName().starts_with("mlirAsyncRuntim"))
+      continue;
+    if (!function.isDeclaration() || !function.use_empty())
+      return true;
+  }
+  return false;
 }
 
 LogicalResult buildExecutable(llvm::Module &llvmModule,
@@ -1204,6 +1442,8 @@ LogicalResult runJIT(ModuleOp module, const IRDumpConfig &irDump) {
 
     llvmModule->setDataLayout(jit->getDataLayout());
     llvmModule->setTargetTriple(jit->getTargetTriple().getTriple());
+    if (failed(linkPrelinkedRuntime(*llvmModule)))
+      return failure();
     runLLVMCoroLowering(*llvmModule);
     dumpLLVMForPass(irDump, "llvm-translation", *llvmModule);
     if (failed(verifyPostCoroLLVMThreadSafety(*llvmModule, safetyProfile)))
@@ -1426,6 +1666,11 @@ int main(int argc, char **argv) {
   if (failed(verifyPostCoroLLVMThreadSafety(*llvmModule, safetyProfile)))
     return 1;
 
+  if (py::runtime_library::prelowerGenerationMode())
+    sealRuntimeSafetyMetadata(*llvmModule);
+  else if (failed(linkPrelinkedRuntime(*llvmModule)))
+    return 1;
+
   if (EmitLLVMOnly)
     return failed(writeLLVMIR(*llvmModule, outputPath)) ? 1 : 0;
 
@@ -1437,6 +1682,9 @@ int main(int argc, char **argv) {
     llvm::errs() << "error: could not initialize native asm printer\n";
     return 1;
   }
+
+  if (!usesAsyncRuntime(*llvmModule))
+    asyncRuntimeLibPath.clear();
 
   return failed(buildExecutable(*llvmModule, safetyProfile, runtimeLibPath,
                                 asyncRuntimeLibPath, outputPath))

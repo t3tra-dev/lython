@@ -1,6 +1,5 @@
-#include "lython/parser/CpythonContract.h"
-
-#include "lython/parser/CpythonSpec.h"
+#include "CpythonContract.h"
+#include "CpythonSpec.h"
 
 #include <algorithm>
 #include <initializer_list>

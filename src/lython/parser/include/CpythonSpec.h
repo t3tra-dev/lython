@@ -1,6 +1,6 @@
 #pragma once
 
-#include "lython/parser/Grammar.h"
+#include "Grammar.h"
 
 #include <map>
 #include <optional>

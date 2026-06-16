@@ -1,7 +1,7 @@
 #pragma once
 
-#include "lython/parser/Ast.h"
-#include "lython/parser/Diagnostics.h"
+#include "Ast.h"
+#include "Diagnostics.h"
 
 #include <string>
 #include <string_view>

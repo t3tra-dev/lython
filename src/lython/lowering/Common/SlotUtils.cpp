@@ -621,6 +621,9 @@ descriptorStringAttr(mlir::Value value, llvm::StringRef attrName) {
   mlir::Operation *def = value.getDefiningOp();
   if (!def)
     return std::nullopt;
+  if (auto result = mlir::dyn_cast<mlir::OpResult>(value))
+    if (auto attr = functionCallResultStringAttr(result, attrName))
+      return *attr;
   auto attr = def->getAttrOfType<mlir::StringAttr>(attrName);
   if (!attr)
     return std::nullopt;
@@ -1259,19 +1262,45 @@ mlir::FailureOr<Slot::ClassCarrierParts> Slot::classCarrierInitializeParts(
       mlir::ValueRange{createIndexConstant(loc, builder, 0)});
   lockStore->setAttr(ClassSafetyAttrs::kPromoteLockInit, builder.getUnitAttr());
 
-  mlir::Value headerDescriptor =
-      descriptorFromMemRef(loc, header, layout->headerType, builder);
-  if (!headerDescriptor)
+  mlir::MemRefType payloadTableType =
+      class_layout::Payload::tableMemRefType(builder.getContext());
+  mlir::MemRefType payloadTableStorageType =
+      mlir::MemRefType::get({class_layout::Payload::partCount(*layout)},
+                            payloadTableType.getElementType());
+  mlir::Value payloadTableStorage =
+      builder.create<mlir::memref::AllocOp>(loc, payloadTableStorageType);
+  if (mlir::Operation *def = payloadTableStorage.getDefiningOp())
+    def->setAttr(ClassSafetyAttrs::kPayloadPart, builder.getUnitAttr());
+  mlir::Value payloadTable =
+      memRefView(loc, payloadTableStorage, payloadTableType, builder);
+  if (!payloadTable)
     return mlir::failure();
-  llvm::SmallVector<mlir::Value, 8> descriptors{headerDescriptor};
   for (auto [index, part] : llvm::enumerate(payloadParts)) {
     mlir::MemRefType partType =
         class_layout::Payload::partType(*layout, static_cast<int64_t>(index));
     mlir::Value descriptor = descriptorFromMemRef(loc, part, partType, builder);
     if (!descriptor)
       return mlir::failure();
-    descriptors.push_back(descriptor);
+    auto tableStore = builder.create<mlir::memref::StoreOp>(
+        loc, descriptor, payloadTable,
+        mlir::ValueRange{
+            createIndexConstant(loc, builder, static_cast<int64_t>(index))});
+    tableStore->setAttr(OwnershipContractAttrs::kMemRefSlotTransfer,
+                        builder.getUnitAttr());
+    tableStore->setAttr(OwnershipContractAttrs::kAggregateSlotGroup,
+                        builder.getStringAttr("class.payload_table"));
+    tableStore->setAttr(OwnershipContractAttrs::kAggregateSlotComponent,
+                        builder.getStringAttr("descriptor"));
   }
+
+  mlir::Value headerDescriptor =
+      descriptorFromMemRef(loc, header, layout->headerType, builder);
+  mlir::Value tableDescriptor =
+      descriptorFromMemRef(loc, payloadTable, payloadTableType, builder);
+  if (!headerDescriptor || !tableDescriptor)
+    return mlir::failure();
+  llvm::SmallVector<mlir::Value, 2> descriptors{headerDescriptor,
+                                                tableDescriptor};
   mlir::Value objectValue = class_layout::Object::fromDescriptors(
       loc, layout->objectType, descriptors, builder);
   if (!objectValue)
@@ -1287,7 +1316,7 @@ mlir::FailureOr<Slot::ClassCarrierParts> Slot::classCarrierInitializeParts(
     objectStore->setAttr(OwnershipContractAttrs::kAggregateSlotComponent,
                          builder.getStringAttr("parts"));
   }
-  return ClassCarrierParts{header, payloadParts};
+  return ClassCarrierParts{header, payloadTable, payloadParts};
 }
 
 mlir::LogicalResult

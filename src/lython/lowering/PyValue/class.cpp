@@ -5,8 +5,10 @@
 #include "Common/RuntimeSupport.h"
 #include "Common/SlotUtils.h"
 #include "PyValue/ClassHelpers.h"
+#include "cpp/PyTypeObject.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Async/IR/Async.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/FunctionCallUtils.h"
@@ -15,7 +17,9 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 
+#include <cctype>
 #include <cstdint>
+#include <functional>
 #include <string>
 
 #define GET_OP_CLASSES
@@ -28,6 +32,12 @@ namespace {
 using StaticClassFieldInfo = class_layout::FieldInfo;
 using StaticClassLayout = class_layout::Layout;
 static constexpr llvm::StringLiteral kDecrefIntent{"__ly_decref_intent"};
+
+static mlir::FailureOr<llvm::SmallVector<mlir::Value, 2>>
+emitClassPromoteDispatch(mlir::Location loc, mlir::Operation *from,
+                         mlir::ValueRange inputParts, ClassType staticType,
+                         mlir::ModuleOp module, mlir::OpBuilder &builder,
+                         const PyLLVMTypeConverter &typeConverter);
 
 namespace class_field::Refcount {
 namespace Parts {
@@ -78,7 +88,8 @@ bool needed(mlir::Type logicalType, mlir::Type storageType,
             const PyLLVMTypeConverter &typeConverter) {
   (void)typeConverter;
   if (!isPyType(logicalType) ||
-      mlir::isa<ClassType, NoneType, BoolType, FloatType>(logicalType))
+      mlir::isa<ClassType, ObjectType, ProtocolType, TypeType, TracebackType,
+                NoneType, BoolType, FloatType>(logicalType))
     return false;
   if (Parts::count(logicalType))
     return true;
@@ -365,12 +376,17 @@ namespace class_object::Slot {
 mlir::Value create(mlir::Location loc, mlir::MemRefType memrefType,
                    mlir::ConversionPatternRewriter &rewriter,
                    mlir::Operation *anchor) {
-  auto parentFunc = anchor ? anchor->getParentOfType<mlir::func::FuncOp>()
-                           : mlir::func::FuncOp();
-  if (!parentFunc)
+  mlir::Region *body = nullptr;
+  if (anchor) {
+    if (auto parentFunc = anchor->getParentOfType<mlir::func::FuncOp>())
+      body = &parentFunc.getBody();
+    else if (auto parentAsync = anchor->getParentOfType<mlir::async::FuncOp>())
+      body = &parentAsync.getBody();
+  }
+  if (!body || body->empty())
     return {};
   mlir::OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPointToStart(&parentFunc.getBody().front());
+  rewriter.setInsertionPointToStart(&body->front());
   auto ownedType =
       mlir::MemRefType::get(memrefType.getShape(), memrefType.getElementType());
   mlir::Value storage =
@@ -447,6 +463,99 @@ mlir::Value memRefFromDescriptor(mlir::Location loc, mlir::Value descriptor,
   return cast.getResult(0);
 }
 
+mlir::MemRefType payloadTableStorageType(const StaticClassLayout &layout,
+                                         mlir::MLIRContext *ctx) {
+  return mlir::MemRefType::get(
+      {class_layout::Payload::partCount(layout)},
+      class_layout::Payload::tableMemRefType(ctx).getElementType());
+}
+
+mlir::Value payloadTableView(mlir::Location loc, mlir::Value table,
+                             mlir::OpBuilder &builder) {
+  mlir::MemRefType tableType =
+      class_layout::Payload::tableMemRefType(builder.getContext());
+  if (table.getType() == tableType)
+    return table;
+  if (!mlir::isa<mlir::MemRefType>(table.getType()))
+    return {};
+  return builder.create<mlir::memref::CastOp>(loc, tableType, table);
+}
+
+mlir::Value payloadTable(mlir::Location loc, mlir::Value objectValue,
+                         const StaticClassLayout &layout,
+                         mlir::OpBuilder &builder) {
+  if (objectValue.getType() != layout.objectType)
+    return {};
+  mlir::Value descriptor = class_layout::Object::descriptor(
+      loc, layout.objectType, objectValue, class_layout::Object::kPayloadIndex,
+      builder);
+  if (!descriptor)
+    return {};
+  return class_object::Local::memRefFromDescriptor(
+      loc, descriptor,
+      class_layout::Payload::tableMemRefType(builder.getContext()), builder);
+}
+
+mlir::Value createPayloadTable(mlir::Location loc,
+                               const StaticClassLayout &layout,
+                               mlir::ConversionPatternRewriter &rewriter,
+                               mlir::Operation *anchor) {
+  mlir::MemRefType storageType =
+      payloadTableStorageType(layout, rewriter.getContext());
+  mlir::Value storage =
+      class_object::Slot::create(loc, storageType, rewriter, anchor);
+  if (!storage)
+    return {};
+  return payloadTableView(loc, storage, rewriter);
+}
+
+mlir::Value createManagedPayloadTable(mlir::Location loc,
+                                      const StaticClassLayout &layout,
+                                      mlir::OpBuilder &builder) {
+  mlir::MemRefType storageType =
+      payloadTableStorageType(layout, builder.getContext());
+  mlir::Value storage = builder.create<mlir::memref::AllocOp>(loc, storageType);
+  if (mlir::Operation *def = storage.getDefiningOp()) {
+    def->setAttr(ClassSafetyAttrs::kPayloadPart, builder.getUnitAttr());
+    def->setAttr(ClassSafetyAttrs::kPromoteFreshObject, builder.getUnitAttr());
+  }
+  return payloadTableView(loc, storage, builder);
+}
+
+mlir::Operation *initializePayloadTable(mlir::Location loc, mlir::Value table,
+                                        mlir::ValueRange payloadParts,
+                                        const StaticClassLayout &layout,
+                                        bool managed,
+                                        mlir::OpBuilder &builder) {
+  if (!table ||
+      payloadParts.size() !=
+          static_cast<size_t>(class_layout::Payload::partCount(layout)))
+    return nullptr;
+  mlir::Operation *lastStore = nullptr;
+  for (auto [index, payload] : llvm::enumerate(payloadParts)) {
+    mlir::MemRefType partType =
+        class_layout::Payload::partType(layout, static_cast<int64_t>(index));
+    mlir::Value descriptor = class_object::Local::descriptorFromMemRef(
+        loc, payload, partType, builder);
+    if (!descriptor)
+      return nullptr;
+    mlir::Value indexValue = builder.create<mlir::arith::ConstantIndexOp>(
+        loc, static_cast<int64_t>(index));
+    auto store = builder.create<mlir::memref::StoreOp>(
+        loc, descriptor, table, mlir::ValueRange{indexValue});
+    if (managed) {
+      store->setAttr(OwnershipContractAttrs::kMemRefSlotTransfer,
+                     builder.getUnitAttr());
+      store->setAttr(OwnershipContractAttrs::kAggregateSlotGroup,
+                     builder.getStringAttr("class.payload_table"));
+      store->setAttr(OwnershipContractAttrs::kAggregateSlotComponent,
+                     builder.getStringAttr("descriptor"));
+    }
+    lastStore = store.getOperation();
+  }
+  return lastStore;
+}
+
 mlir::Value partDescriptor(mlir::Location loc, mlir::Value objectValue,
                            const StaticClassLayout &layout, int64_t index,
                            mlir::OpBuilder &builder) {
@@ -477,11 +586,14 @@ mlir::Value payloadPart(mlir::Location loc, mlir::Value object,
       class_object::Local::loadObject(loc, object, layout, builder);
   if (!objectValue)
     return {};
-  mlir::Value descriptor = class_object::Local::partDescriptor(
-      loc, objectValue, layout, class_layout::Object::kPayloadIndex + partIndex,
-      builder);
-  if (!descriptor)
+  mlir::Value table =
+      class_object::Local::payloadTable(loc, objectValue, layout, builder);
+  if (!table)
     return {};
+  mlir::Value descriptor = builder.create<mlir::memref::LoadOp>(
+      loc, table,
+      mlir::ValueRange{
+          builder.create<mlir::arith::ConstantIndexOp>(loc, partIndex)});
   mlir::MemRefType payloadType =
       class_layout::Payload::partType(layout, partIndex);
   if (!payloadType)
@@ -491,31 +603,32 @@ mlir::Value payloadPart(mlir::Location loc, mlir::Value object,
 }
 
 mlir::Value objectValueFromParts(mlir::Location loc, mlir::Value header,
-                                 mlir::ValueRange payloadParts,
+                                 mlir::Value payloadTable,
                                  const StaticClassLayout &layout,
                                  mlir::OpBuilder &builder) {
   mlir::Value headerDescriptor = class_object::Local::descriptorFromMemRef(
       loc, header, layout.headerType, builder);
-  if (!headerDescriptor ||
-      payloadParts.size() !=
-          static_cast<size_t>(class_layout::Payload::partCount(layout)))
+  mlir::Value tableDescriptor = class_object::Local::descriptorFromMemRef(
+      loc, payloadTable,
+      class_layout::Payload::tableMemRefType(builder.getContext()), builder);
+  if (!headerDescriptor || !tableDescriptor)
     return {};
-
-  llvm::SmallVector<mlir::Value, 8> descriptors;
-  descriptors.push_back(headerDescriptor);
-  for (auto [index, payload] : llvm::enumerate(payloadParts)) {
-    mlir::MemRefType payloadType =
-        class_layout::Payload::partType(layout, static_cast<int64_t>(index));
-    if (!payloadType)
-      return {};
-    mlir::Value descriptor = class_object::Local::descriptorFromMemRef(
-        loc, payload, payloadType, builder);
-    if (!descriptor)
-      return {};
-    descriptors.push_back(descriptor);
-  }
+  llvm::SmallVector<mlir::Value, 2> descriptors{headerDescriptor,
+                                                tableDescriptor};
   return class_layout::Object::fromDescriptors(loc, layout.objectType,
                                                descriptors, builder);
+}
+
+mlir::Value objectValueFromPayloadParts(mlir::Location loc, mlir::Value header,
+                                        mlir::Value payloadTable,
+                                        mlir::ValueRange payloadParts,
+                                        const StaticClassLayout &layout,
+                                        bool managed,
+                                        mlir::OpBuilder &builder) {
+  if (!initializePayloadTable(loc, payloadTable, payloadParts, layout, managed,
+                              builder))
+    return {};
+  return objectValueFromParts(loc, header, payloadTable, layout, builder);
 }
 
 void deallocParts(mlir::Location loc, mlir::Value object,
@@ -528,6 +641,17 @@ void deallocParts(mlir::Location loc, mlir::Value object,
       auto dealloc = builder.create<mlir::memref::DeallocOp>(loc, part);
       dealloc->setAttr(ClassSafetyAttrs::kDeallocPart,
                        builder.getStringAttr("payload"));
+    }
+  }
+  mlir::Value objectValue =
+      class_object::Local::loadObject(loc, object, layout, builder);
+  if (objectValue) {
+    mlir::Value table =
+        class_object::Local::payloadTable(loc, objectValue, layout, builder);
+    if (table) {
+      auto dealloc = builder.create<mlir::memref::DeallocOp>(loc, table);
+      dealloc->setAttr(ClassSafetyAttrs::kDeallocPart,
+                       builder.getStringAttr("payload_table"));
     }
   }
   mlir::Value header =
@@ -1680,22 +1804,30 @@ mlir::Value object(mlir::Location loc, mlir::ValueRange values,
                    const StaticClassLayout &layout, mlir::OpBuilder &builder) {
   if (values.size() == 1)
     return values.front();
-  int64_t payloadCount = class_layout::Payload::partCount(layout);
-  if (values.size() != static_cast<size_t>(1 + payloadCount))
+  if (values.size() != 2)
     return {};
-  return class_object::Local::objectValueFromParts(
-      loc, values[0], values.drop_front(), layout, builder);
+  mlir::Value header = values[0];
+  mlir::Value table = values[1];
+  if (header.getType() != layout.headerType)
+    header =
+        object_abi::Type::castStorage(loc, header, layout.headerType, builder);
+  table = class_object::Local::payloadTableView(loc, table, builder);
+  if (!header || !table)
+    return {};
+  return class_object::Local::objectValueFromParts(loc, header, table, layout,
+                                                   builder);
 }
 
 mlir::Value objectFromArgs(mlir::Location loc, mlir::Block *entry,
                            unsigned firstArg, const StaticClassLayout &layout,
                            mlir::OpBuilder &builder) {
-  int64_t payloadCount = class_layout::Payload::partCount(layout);
-  if (!entry || entry->getNumArguments() < firstArg + 1 + payloadCount)
+  llvm::SmallVector<mlir::Type, 2> abiTypes;
+  class_layout::partsValueTypes(layout, abiTypes);
+  if (!entry || entry->getNumArguments() < firstArg + abiTypes.size())
     return {};
-  llvm::SmallVector<mlir::Value, 8> values;
-  values.reserve(1 + payloadCount);
-  for (int64_t index = 0; index < 1 + payloadCount; ++index)
+  llvm::SmallVector<mlir::Value, 2> values;
+  values.reserve(abiTypes.size());
+  for (size_t index = 0; index < abiTypes.size(); ++index)
     values.push_back(
         entry->getArgument(firstArg + static_cast<unsigned>(index)));
   return object(loc, values, layout, builder);
@@ -1708,23 +1840,22 @@ void append(mlir::Location loc, mlir::Value object,
       class_object::Local::header(loc, object, layout, builder);
   if (!header)
     return;
+  mlir::Value objectValue =
+      class_object::Local::loadObject(loc, object, layout, builder);
+  if (!objectValue)
+    return;
+  mlir::Value table =
+      class_object::Local::payloadTable(loc, objectValue, layout, builder);
+  if (!table)
+    return;
   args.push_back(header);
-  for (int64_t index = 0; index < class_layout::Payload::partCount(layout);
-       ++index) {
-    mlir::Value part =
-        class_object::Local::payloadPart(loc, object, layout, index, builder);
-    if (!part)
-      return;
-    args.push_back(part);
-  }
+  args.push_back(table);
 }
 
 void append(mlir::Location loc, mlir::ValueRange values,
             const StaticClassLayout &layout, mlir::OpBuilder &builder,
             llvm::SmallVectorImpl<mlir::Value> &args) {
-  int64_t payloadCount = class_layout::Payload::partCount(layout);
-  if (values.size() == static_cast<size_t>(1 + payloadCount) &&
-      payloadCount >= 1) {
+  if (values.size() == 2) {
     mlir::Value header = object_abi::Header::isOwned(values[0].getType())
                              ? values[0]
                              : object_abi::Type::castStorage(
@@ -1732,19 +1863,11 @@ void append(mlir::Location loc, mlir::ValueRange values,
     if (!header || header.getType() != layout.headerType)
       return;
     args.push_back(header);
-    for (int64_t index = 0; index < payloadCount; ++index) {
-      mlir::Value part = values[static_cast<size_t>(1 + index)];
-      mlir::MemRefType partType =
-          class_layout::Payload::partType(layout, index);
-      if (!partType)
-        return;
-      if (part.getType() != partType &&
-          mlir::isa<mlir::MemRefType>(part.getType()))
-        part = builder.create<mlir::memref::CastOp>(loc, partType, part);
-      if (!part || part.getType() != partType)
-        return;
-      args.push_back(part);
-    }
+    mlir::Value table =
+        class_object::Local::payloadTableView(loc, values[1], builder);
+    if (!table)
+      return;
+    args.push_back(table);
     return;
   }
   if (values.size() == 1)
@@ -3036,21 +3159,11 @@ mlir::func::FuncOp get(mlir::Location loc, mlir::ModuleOp module,
   builder.create<mlir::cf::CondBranchOp>(loc, managed, managedBlock, copyBlock);
 
   builder.setInsertionPointToStart(managedBlock);
-  mlir::Value inputHeader =
-      class_object::Local::header(loc, inputDescriptor, layout, builder);
-  llvm::SmallVector<mlir::Value, 8> inputParts;
-  for (int64_t index = 0; index < class_layout::Payload::partCount(layout);
-       ++index) {
-    mlir::Value part = class_object::Local::payloadPart(loc, inputDescriptor,
-                                                        layout, index, builder);
-    if (!part)
-      return fn;
-    inputParts.push_back(part);
-  }
-  if (!inputHeader)
+  llvm::SmallVector<mlir::Value, 2> retainArgs;
+  class_helper::Parts::append(loc, inputDescriptor, layout, builder,
+                              retainArgs);
+  if (retainArgs.size() != objectArgTypes.size())
     return fn;
-  llvm::SmallVector<mlir::Value, 8> retainArgs{inputHeader};
-  retainArgs.append(inputParts.begin(), inputParts.end());
   auto retain =
       builder.create<mlir::func::CallOp>(loc, retainHelper, retainArgs);
   threadsafe::Retain::premise(retain.getOperation(),
@@ -3088,8 +3201,14 @@ mlir::func::FuncOp get(mlir::Location loc, mlir::ModuleOp module,
       loc, payloadParts, fieldValues, layout, /*managed=*/true, builder);
   if (!payloadStore)
     return fn;
-  mlir::Value initializedObject = class_object::Local::objectValueFromParts(
-      loc, header, payloadParts, layout, builder);
+  mlir::Value payloadTable =
+      class_object::Local::createManagedPayloadTable(loc, layout, builder);
+  if (!payloadTable)
+    return fn;
+  mlir::Value initializedObject =
+      class_object::Local::objectValueFromPayloadParts(
+          loc, header, payloadTable, payloadParts, layout, /*managed=*/true,
+          builder);
   if (!initializedObject)
     return fn;
   class_container::Clone::fields(loc, initializedObject, layout, builder,
@@ -3102,8 +3221,7 @@ mlir::func::FuncOp get(mlir::Location loc, mlir::ModuleOp module,
           /*includeContainerFields=*/true,
           /*includeDirectClassFields=*/false)))
     return {};
-  llvm::SmallVector<mlir::Value, 8> resultParts{header};
-  resultParts.append(payloadParts.begin(), payloadParts.end());
+  llvm::SmallVector<mlir::Value, 2> resultParts{header, payloadTable};
   builder.create<mlir::func::ReturnOp>(loc, resultParts);
   return fn;
 }
@@ -3117,18 +3235,17 @@ mlir::Value value(mlir::Location loc, mlir::Value object, ClassType classType,
       class_layout::get(module.getOperation(), classType, typeConverter);
   if (mlir::failed(layout))
     return {};
-  auto helper = class_helper::Promote::get(loc, module, classType, *layout,
-                                           builder, typeConverter);
-  if (!helper)
-    return {};
   llvm::SmallVector<mlir::Value, 8> args;
   class_helper::Parts::append(loc, object, *layout, builder, args);
-  if (args.size() !=
-      static_cast<size_t>(class_layout::Object::partCount(layout->objectType)))
+  if (args.size() != 2)
     return {};
-  auto call =
-      builder.create<mlir::func::CallOp>(loc, helper, mlir::ValueRange{args});
-  return class_helper::Parts::object(loc, call.getResults(), *layout, builder);
+  auto promoted = emitClassPromoteDispatch(loc, module.getOperation(),
+                                           mlir::ValueRange(args), classType,
+                                           module, builder, typeConverter);
+  if (mlir::failed(promoted))
+    return {};
+  return class_helper::Parts::object(loc, mlir::ValueRange(*promoted), *layout,
+                                     builder);
 }
 
 void fields(mlir::Location loc, mlir::Value object,
@@ -3659,9 +3776,8 @@ mlir::func::FuncOp get(mlir::Location loc, mlir::ModuleOp module,
     mlir::Block *transferValueBlock = builder.createBlock(parent);
 
     builder.setInsertionPointToEnd(currentBlock);
-    builder.create<mlir::cf::CondBranchOp>(loc, retainNewValue,
-                                           retainValueBlock,
-                                           transferValueBlock);
+    builder.create<mlir::cf::CondBranchOp>(
+        loc, retainNewValue, retainValueBlock, transferValueBlock);
 
     builder.setInsertionPointToStart(transferValueBlock);
     if (!storeContainerAndReturn(value, /*transferOwnership=*/true, lockValue,
@@ -4173,25 +4289,15 @@ static mlir::FailureOr<llvm::SmallVector<mlir::Value>> boxStaticFieldValues(
         Slot::classRefcount(loc, storageValue, classType, module, rewriter,
                             "incref", /*aggregateEffect=*/true,
                             ThreadSafetyAttrs::kPremiseAggregateBorrow);
-      mlir::Value header =
-          class_object::Local::header(loc, storageValue, *layoutOr, rewriter);
-      if (!header ||
-          convertedTypes.size() !=
-              static_cast<size_t>(
-                  class_layout::Object::partCount(layoutOr->objectType)) ||
-          header.getType() != convertedTypes[0])
+      llvm::SmallVector<mlir::Value, 2> values;
+      class_helper::Parts::append(loc, storageValue, *layoutOr, rewriter,
+                                  values);
+      if (values.size() != convertedTypes.size())
         return mlir::failure();
-      llvm::SmallVector<mlir::Value> values{header};
-      for (int64_t index = 0;
-           index < class_layout::Payload::partCount(*layoutOr); ++index) {
-        mlir::Value part = class_object::Local::payloadPart(
-            loc, storageValue, *layoutOr, index, rewriter);
-        if (!part ||
-            part.getType() != convertedTypes[static_cast<size_t>(1 + index)])
+      for (auto [value, expected] : llvm::zip(values, convertedTypes))
+        if (value.getType() != expected)
           return mlir::failure();
-        values.push_back(part);
-      }
-      return values;
+      return llvm::SmallVector<mlir::Value>(values.begin(), values.end());
     }
     if (auto extracted = extractContainerDescriptorParts(
             loc, storageValue, logicalType, mlir::TypeRange(convertedTypes),
@@ -4253,19 +4359,17 @@ unboxStaticFieldValue(mlir::Location loc, mlir::Value boxedValue,
         class_layout::get(module.getOperation(), classType, typeConverter);
     if (mlir::failed(layoutOr))
       return mlir::failure();
-    auto helper = class_helper::Promote::get(loc, module, classType, *layoutOr,
-                                             rewriter, typeConverter);
-    if (!helper)
-      return mlir::failure();
     llvm::SmallVector<mlir::Value, 8> args;
     class_helper::Parts::append(loc, boxedValue, *layoutOr, rewriter, args);
-    if (args.size() != static_cast<size_t>(class_layout::Object::partCount(
-                           layoutOr->objectType)))
+    if (args.size() != 2)
       return mlir::failure();
-    auto promote = rewriter.create<mlir::func::CallOp>(loc, helper,
-                                                       mlir::ValueRange{args});
+    auto promotedParts = emitClassPromoteDispatch(
+        loc, module.getOperation(), mlir::ValueRange(args), classType, module,
+        rewriter, typeConverter);
+    if (mlir::failed(promotedParts))
+      return mlir::failure();
     mlir::Value promoted = class_helper::Parts::object(
-        loc, promote.getResults(), *layoutOr, rewriter);
+        loc, mlir::ValueRange(*promotedParts), *layoutOr, rewriter);
     if (!promoted)
       return mlir::failure();
     if (promoted.getType() == storageType)
@@ -4428,6 +4532,121 @@ bool skipOldDrop(mlir::Operation *op, mlir::Value object) {
 }
 } // namespace class_object::Fresh
 
+static llvm::SmallVector<ClassType, 4>
+classPromoteCandidates(mlir::ModuleOp module, ClassType staticType,
+                       mlir::Operation *from) {
+  llvm::SmallVector<ClassType, 4> candidates;
+  if (module) {
+    module.walk([&](ClassOp classOp) {
+      ClassType candidate =
+          ClassType::get(staticType.getContext(), classOp.getSymName());
+      if (candidate == staticType)
+        return;
+      mlir::FailureOr<bool> subclass = type_object::isSubclassOf(
+          from, candidate.getClassName(), staticType.getClassName());
+      if (mlir::succeeded(subclass) && *subclass)
+        candidates.push_back(candidate);
+    });
+  }
+  candidates.push_back(staticType);
+  return candidates;
+}
+
+static mlir::FailureOr<llvm::SmallVector<mlir::Value, 2>>
+emitClassPromoteCall(mlir::Location loc, mlir::Operation *from,
+                     mlir::ValueRange inputParts, ClassType classType,
+                     mlir::ModuleOp module, mlir::OpBuilder &builder,
+                     const PyLLVMTypeConverter &typeConverter) {
+  mlir::FailureOr<StaticClassLayout> layoutOr = class_layout::get(
+      from ? from : module.getOperation(), classType, typeConverter);
+  if (mlir::failed(layoutOr))
+    return mlir::failure();
+  auto helper = class_helper::Promote::get(loc, module, classType, *layoutOr,
+                                           builder, typeConverter);
+  if (!helper)
+    return mlir::failure();
+  llvm::SmallVector<mlir::Value, 2> args;
+  class_helper::Parts::append(loc, inputParts, *layoutOr, builder, args);
+  if (args.size() != helper.getFunctionType().getNumInputs())
+    return mlir::failure();
+  auto call =
+      builder.create<mlir::func::CallOp>(loc, helper, mlir::ValueRange{args});
+  if (call.getNumResults() != 2)
+    return mlir::failure();
+  return llvm::SmallVector<mlir::Value, 2>{call.getResult(0),
+                                           call.getResult(1)};
+}
+
+static mlir::FailureOr<llvm::SmallVector<mlir::Value, 2>>
+emitClassPromoteDispatch(mlir::Location loc, mlir::Operation *from,
+                         mlir::ValueRange inputParts, ClassType staticType,
+                         mlir::ModuleOp module, mlir::OpBuilder &builder,
+                         const PyLLVMTypeConverter &typeConverter) {
+  if (inputParts.size() != 2 || !module)
+    return mlir::failure();
+
+  llvm::SmallVector<ClassType, 4> candidates =
+      classPromoteCandidates(module, staticType, from);
+  if (candidates.size() == 1)
+    return emitClassPromoteCall(loc, from, inputParts, candidates.front(),
+                                module, builder, typeConverter);
+
+  mlir::Value header = inputParts.front();
+  if (!mlir::isa<mlir::MemRefType>(header.getType()))
+    return mlir::failure();
+  mlir::Value layoutSlot = builder.create<mlir::arith::ConstantIndexOp>(
+      loc, class_layout::Header::kLayoutIdSlot);
+  mlir::Value layoutId =
+      builder.create<mlir::memref::LoadOp>(loc, header, layoutSlot);
+
+  llvm::SmallVector<mlir::Type, 2> resultTypes;
+  mlir::FailureOr<StaticClassLayout> staticLayout = class_layout::get(
+      from ? from : module.getOperation(), staticType, typeConverter);
+  if (mlir::failed(staticLayout))
+    return mlir::failure();
+  class_layout::partsValueTypes(*staticLayout, resultTypes);
+  if (resultTypes.size() != 2)
+    return mlir::failure();
+
+  std::function<mlir::FailureOr<llvm::SmallVector<mlir::Value, 2>>(size_t)>
+      selectCandidate = [&](size_t index)
+      -> mlir::FailureOr<llvm::SmallVector<mlir::Value, 2>> {
+    if (index + 1 == candidates.size())
+      return emitClassPromoteCall(loc, from, inputParts, candidates[index],
+                                  module, builder, typeConverter);
+
+    mlir::Value expected = class_object::Header::i64(
+        loc, class_object::Header::layoutId(candidates[index]), builder);
+    mlir::Value matches = builder.create<mlir::arith::CmpIOp>(
+        loc, mlir::arith::CmpIPredicate::eq, layoutId, expected);
+    auto ifOp = builder.create<mlir::scf::IfOp>(
+        loc, mlir::TypeRange(resultTypes), matches,
+        /*withElseRegion=*/true);
+    {
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToStart(ifOp.thenBlock());
+      auto promoted =
+          emitClassPromoteCall(loc, from, inputParts, candidates[index], module,
+                               builder, typeConverter);
+      if (mlir::failed(promoted))
+        return mlir::failure();
+      builder.create<mlir::scf::YieldOp>(loc, mlir::ValueRange(*promoted));
+    }
+    {
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToStart(ifOp.elseBlock());
+      auto promoted = selectCandidate(index + 1);
+      if (mlir::failed(promoted))
+        return mlir::failure();
+      builder.create<mlir::scf::YieldOp>(loc, mlir::ValueRange(*promoted));
+    }
+    return llvm::SmallVector<mlir::Value, 2>{ifOp.getResult(0),
+                                             ifOp.getResult(1)};
+  };
+
+  return selectCandidate(0);
+}
+
 // Static class instances lower to function-local stack slots.
 struct ClassNewLowering : public mlir::OpConversionPattern<ClassNewOp> {
   ClassNewLowering(PyLLVMTypeConverter &converter, mlir::MLIRContext *ctx)
@@ -4489,8 +4708,13 @@ struct ClassNewLowering : public mlir::OpConversionPattern<ClassNewOp> {
                                            fieldValues, *layoutOr,
                                            /*managed=*/false, rewriter))
       return mlir::failure();
-    mlir::Value objectValue = class_object::Local::objectValueFromParts(
-        op.getLoc(), header, payloadParts, *layoutOr, rewriter);
+    mlir::Value payloadTable = class_object::Local::createPayloadTable(
+        op.getLoc(), *layoutOr, rewriter, op);
+    if (!payloadTable)
+      return mlir::failure();
+    mlir::Value objectValue = class_object::Local::objectValueFromPayloadParts(
+        op.getLoc(), header, payloadTable, payloadParts, *layoutOr,
+        /*managed=*/false, rewriter);
     if (!objectValue)
       return mlir::failure();
     auto markOwnedLocal = [&](mlir::Value value) {
@@ -4502,11 +4726,66 @@ struct ClassNewLowering : public mlir::OpConversionPattern<ClassNewOp> {
       }
     };
     markOwnedLocal(header);
-    llvm::SmallVector<mlir::Value> replacementValues{header};
-    replacementValues.append(payloadParts.begin(), payloadParts.end());
+    llvm::SmallVector<mlir::Value> replacementValues{header, payloadTable};
     llvm::SmallVector<mlir::ValueRange, 1> replacements{
         mlir::ValueRange(replacementValues)};
     rewriter.replaceOpWithMultiple(op, replacements);
+    return mlir::success();
+  }
+};
+
+static std::string classObjectGlobalName(llvm::StringRef className) {
+  std::string result = "__ly_type_object_";
+  for (char ch : className) {
+    unsigned char byte = static_cast<unsigned char>(ch);
+    result.push_back(std::isalnum(byte) ? static_cast<char>(byte) : '_');
+  }
+  return result;
+}
+
+struct ClassObjectLowering : public mlir::OpConversionPattern<ClassObjectOp> {
+  ClassObjectLowering(PyLLVMTypeConverter &converter, mlir::MLIRContext *ctx)
+      : mlir::OpConversionPattern<ClassObjectOp>(converter, ctx) {}
+
+  mlir::LogicalResult
+  matchAndRewrite(ClassObjectOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    (void)adaptor;
+    auto *typeConverter =
+        static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
+    mlir::Type loweredType =
+        typeConverter->convertType(op.getResult().getType());
+    auto headerType = mlir::dyn_cast_or_null<mlir::MemRefType>(loweredType);
+    if (!object_abi::Header::isOwned(headerType))
+      return mlir::failure();
+
+    mlir::ModuleOp module = op->getParentOfType<mlir::ModuleOp>();
+    if (!module)
+      return mlir::failure();
+
+    std::string symbol =
+        classObjectGlobalName(op.getClassNameAttr().getValue());
+    if (!module.lookupSymbol<mlir::memref::GlobalOp>(symbol)) {
+      mlir::OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(module.getBody());
+      llvm::SmallVector<int64_t, 2> headerValues{
+          object_abi::kImmortalRefcount,
+          static_cast<int64_t>(object_abi::KindId::Object)};
+      auto attr = mlir::DenseIntElementsAttr::get(
+          mlir::RankedTensorType::get({object_abi::kHeaderSlots},
+                                      rewriter.getI64Type()),
+          headerValues);
+      rewriter.create<mlir::memref::GlobalOp>(
+          op.getLoc(), symbol, rewriter.getStringAttr("private"), headerType,
+          attr, /*constant=*/true, mlir::IntegerAttr());
+    }
+
+    mlir::Value header = rewriter.create<mlir::memref::GetGlobalOp>(
+        op.getLoc(), headerType, symbol);
+    if (mlir::Operation *def = header.getDefiningOp())
+      def->setAttr(OwnershipContractAttrs::kImmortalObject,
+                   rewriter.getUnitAttr());
+    rewriter.replaceOp(op, header);
     return mlir::success();
   }
 };
@@ -4516,7 +4795,7 @@ struct ClassPromoteLowering : public mlir::OpConversionPattern<ClassPromoteOp> {
       : mlir::OpConversionPattern<ClassPromoteOp>(converter, ctx) {}
 
   mlir::LogicalResult
-  matchAndRewrite(ClassPromoteOp op, OpAdaptor adaptor,
+  matchAndRewrite(ClassPromoteOp op, OneToNOpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     auto classType = mlir::dyn_cast<ClassType>(op.getResult().getType());
     if (!classType)
@@ -4527,25 +4806,155 @@ struct ClassPromoteLowering : public mlir::OpConversionPattern<ClassPromoteOp> {
 
     auto *typeConverter =
         static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
-    mlir::FailureOr<StaticClassLayout> layoutOr =
-        class_layout::get(op, classType, *typeConverter);
-    if (mlir::failed(layoutOr))
+    auto promoted = emitClassPromoteDispatch(op.getLoc(), op.getOperation(),
+                                             adaptor.getInput(), classType,
+                                             module, rewriter, *typeConverter);
+    if (mlir::failed(promoted))
       return mlir::failure();
-    auto helper = class_helper::Promote::get(
-        op.getLoc(), module, classType, *layoutOr, rewriter, *typeConverter);
-    if (!helper)
-      return mlir::failure();
-    llvm::SmallVector<mlir::Value, 8> args;
-    class_helper::Parts::append(op.getLoc(), adaptor.getInput(), *layoutOr,
-                                rewriter, args);
-    if (args.size() != static_cast<size_t>(class_layout::Object::partCount(
-                           layoutOr->objectType)))
-      return mlir::failure();
-    auto call = rewriter.create<mlir::func::CallOp>(op.getLoc(), helper,
-                                                    mlir::ValueRange{args});
     llvm::SmallVector<mlir::ValueRange, 1> replacements{
-        mlir::ValueRange(call.getResults())};
+        mlir::ValueRange(*promoted)};
     rewriter.replaceOpWithMultiple(op, replacements);
+    return mlir::success();
+  }
+};
+
+struct ClassUpcastLowering : public mlir::OpConversionPattern<ClassUpcastOp> {
+  ClassUpcastLowering(PyLLVMTypeConverter &converter, mlir::MLIRContext *ctx)
+      : mlir::OpConversionPattern<ClassUpcastOp>(converter, ctx) {}
+
+  mlir::LogicalResult
+  matchAndRewrite(ClassUpcastOp op, OneToNOpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto sourceType = mlir::dyn_cast<ClassType>(op.getInput().getType());
+    auto targetType = mlir::dyn_cast<ClassType>(op.getResult().getType());
+    if (!sourceType || !targetType)
+      return mlir::failure();
+
+    llvm::SmallVector<mlir::Value> replacement(adaptor.getInput().begin(),
+                                               adaptor.getInput().end());
+    if (replacement.size() != 2)
+      return mlir::failure();
+    rewriter.replaceOpWithMultiple(
+        op, llvm::ArrayRef<mlir::ValueRange>{mlir::ValueRange(replacement)});
+    return mlir::success();
+  }
+};
+
+struct ClassRefineLowering : public mlir::OpConversionPattern<ClassRefineOp> {
+  ClassRefineLowering(PyLLVMTypeConverter &converter, mlir::MLIRContext *ctx)
+      : mlir::OpConversionPattern<ClassRefineOp>(converter, ctx) {}
+
+  mlir::LogicalResult
+  matchAndRewrite(ClassRefineOp op, OneToNOpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto sourceType = mlir::dyn_cast<ClassType>(op.getInput().getType());
+    auto targetType = mlir::dyn_cast<ClassType>(op.getResult().getType());
+    if (!sourceType || !targetType)
+      return mlir::failure();
+
+    llvm::SmallVector<mlir::Value> replacement(adaptor.getInput().begin(),
+                                               adaptor.getInput().end());
+    if (replacement.size() != 2)
+      return mlir::failure();
+    rewriter.replaceOpWithMultiple(
+        op, llvm::ArrayRef<mlir::ValueRange>{mlir::ValueRange(replacement)});
+    return mlir::success();
+  }
+};
+
+struct ProtocolViewLowering : public mlir::OpConversionPattern<ProtocolViewOp> {
+  ProtocolViewLowering(PyLLVMTypeConverter &converter, mlir::MLIRContext *ctx)
+      : mlir::OpConversionPattern<ProtocolViewOp>(converter, ctx) {}
+
+  mlir::LogicalResult
+  matchAndRewrite(ProtocolViewOp op, OneToNOpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto protocolType = mlir::dyn_cast<ProtocolType>(op.getResult().getType());
+    if (!protocolType)
+      return mlir::failure();
+
+    auto *typeConverter =
+        static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
+    llvm::SmallVector<mlir::Type, 1> resultTypes;
+    if (mlir::failed(typeConverter->convertType(protocolType, resultTypes)) ||
+        resultTypes.size() != 1)
+      return mlir::failure();
+
+    mlir::ValueRange inputParts = adaptor.getInput();
+    if (inputParts.empty())
+      return rewriter.notifyMatchFailure(op, "missing protocol view input");
+
+    mlir::Value header = inputParts.front();
+    if (header.getType() != resultTypes.front()) {
+      header = object_abi::Type::castStorage(op.getLoc(), header,
+                                             resultTypes.front(), rewriter);
+      if (!header)
+        return rewriter.notifyMatchFailure(
+            op, "input does not expose an object header compatible with "
+                "protocol ABI");
+    }
+
+    rewriter.replaceOpWithMultiple(
+        op, llvm::ArrayRef<mlir::ValueRange>{mlir::ValueRange(header)});
+    return mlir::success();
+  }
+};
+
+struct ClassTestLowering : public mlir::OpConversionPattern<ClassTestOp> {
+  ClassTestLowering(PyLLVMTypeConverter &converter, mlir::MLIRContext *ctx)
+      : mlir::OpConversionPattern<ClassTestOp>(converter, ctx) {}
+
+  mlir::LogicalResult
+  matchAndRewrite(ClassTestOp op, OneToNOpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto inputType = mlir::dyn_cast<ClassType>(op.getInput().getType());
+    auto targetType = mlir::dyn_cast<ClassType>(op.getTarget());
+    if (!inputType || !targetType || adaptor.getInput().empty())
+      return mlir::failure();
+
+    mlir::ModuleOp module = op->getParentOfType<mlir::ModuleOp>();
+    if (!module)
+      return mlir::failure();
+
+    mlir::Value header = adaptor.getInput().front();
+    if (!mlir::isa<mlir::MemRefType>(header.getType()))
+      return mlir::failure();
+    mlir::Value layoutSlot = rewriter.create<mlir::arith::ConstantIndexOp>(
+        op.getLoc(), class_layout::Header::kLayoutIdSlot);
+    mlir::Value layoutId =
+        rewriter.create<mlir::memref::LoadOp>(op.getLoc(), header, layoutSlot);
+
+    llvm::SmallVector<ClassType, 4> candidates{targetType};
+    module.walk([&](ClassOp classOp) {
+      ClassType candidate =
+          ClassType::get(op.getContext(), classOp.getSymName());
+      if (candidate == targetType)
+        return;
+      mlir::FailureOr<bool> isTargetSubtype =
+          type_object::isSubclassOf(op.getOperation(), candidate.getClassName(),
+                                    targetType.getClassName());
+      if (mlir::failed(isTargetSubtype) || !*isTargetSubtype)
+        return;
+      mlir::FailureOr<bool> isInputSubtype =
+          type_object::isSubclassOf(op.getOperation(), candidate.getClassName(),
+                                    inputType.getClassName());
+      if (mlir::succeeded(isInputSubtype) && *isInputSubtype)
+        candidates.push_back(candidate);
+    });
+
+    mlir::Value result;
+    for (ClassType candidate : candidates) {
+      mlir::Value expected = class_object::Header::i64(
+          op.getLoc(), class_object::Header::layoutId(candidate), rewriter);
+      mlir::Value matches = rewriter.create<mlir::arith::CmpIOp>(
+          op.getLoc(), mlir::arith::CmpIPredicate::eq, layoutId, expected);
+      result = result ? rewriter.create<mlir::arith::OrIOp>(op.getLoc(), result,
+                                                            matches)
+                      : matches;
+    }
+    if (!result)
+      result = rewriter.create<mlir::arith::ConstantIntOp>(op.getLoc(), 0, 1);
+    rewriter.replaceOp(op, result);
     return mlir::success();
   }
 };
@@ -4619,25 +5028,13 @@ struct PublishLowering : public mlir::OpConversionPattern<PublishOp> {
     if (auto classType = mlir::dyn_cast<ClassType>(op.getResult().getType())) {
       if (adaptor.getInput().empty())
         return mlir::failure();
-      mlir::FailureOr<StaticClassLayout> layoutOr =
-          class_layout::get(op, classType, *pyTypeConverter);
-      if (mlir::failed(layoutOr))
+      auto promoted = emitClassPromoteDispatch(
+          op.getLoc(), op.getOperation(), adaptor.getInput(), classType, module,
+          rewriter, *pyTypeConverter);
+      if (mlir::failed(promoted))
         return mlir::failure();
-      auto helper =
-          class_helper::Promote::get(op.getLoc(), module, classType, *layoutOr,
-                                     rewriter, *pyTypeConverter);
-      if (!helper)
-        return mlir::failure();
-      llvm::SmallVector<mlir::Value, 8> args;
-      class_helper::Parts::append(op.getLoc(), adaptor.getInput(), *layoutOr,
-                                  rewriter, args);
-      if (args.size() != static_cast<size_t>(class_layout::Object::partCount(
-                             layoutOr->objectType)))
-        return mlir::failure();
-      auto call =
-          rewriter.create<mlir::func::CallOp>(op.getLoc(), helper, args);
       llvm::SmallVector<mlir::ValueRange, 1> replacements{
-          mlir::ValueRange(call.getResults())};
+          mlir::ValueRange(*promoted)};
       rewriter.replaceOpWithMultiple(op, replacements);
       return mlir::success();
     }
@@ -5096,10 +5493,11 @@ namespace lowering::value::class_::Patterns {
 void populate(PyLLVMTypeConverter &typeConverter,
               mlir::RewritePatternSet &patterns) {
   auto *ctx = patterns.getContext();
-  patterns.add<ClassNewLowering, ClassPromoteLowering, PublishLowering,
-               ClassReprLowering, AttrGetLowering, AttrGetLocalLowering,
-               AttrSetLowering, AttrSetLocalLowering, ClassOpLowering>(
-      typeConverter, ctx);
+  patterns.add<ClassNewLowering, ClassObjectLowering, ClassPromoteLowering,
+               ClassUpcastLowering, ClassRefineLowering, ClassTestLowering,
+               ProtocolViewLowering, PublishLowering, ClassReprLowering,
+               AttrGetLowering, AttrGetLocalLowering, AttrSetLowering,
+               AttrSetLocalLowering, ClassOpLowering>(typeConverter, ctx);
 }
 } // namespace lowering::value::class_::Patterns
 

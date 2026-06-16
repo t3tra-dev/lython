@@ -1,8 +1,8 @@
 #include "Lexer.h"
 
+#include "CpythonSpec.h"
 #include "UnicodeNormalize.h"
 #include "UnicodeXid.h"
-#include "lython/parser/CpythonSpec.h"
 
 #include <algorithm>
 #include <cctype>

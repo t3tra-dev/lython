@@ -25,10 +25,15 @@ def Py_FloatType : Type<CPred<"::py::isPyFloatType($_self)">, "py.float">;
 def Py_BoolType : Type<CPred<"::py::isPyBoolType($_self)">, "py.bool">;
 def Py_StrType : Type<CPred<"::py::isPyStrType($_self)">, "py.str">;
 def Py_NoneType : Type<CPred<"::py::isPyNoneType($_self)">, "py.none">;
+def Py_ObjectType : Type<CPred<"::py::isPyObjectType($_self)">, "py.object">;
 def Py_TupleType : Type<CPred<"::py::isPyTupleType($_self)">, "py.tuple">;
 def Py_DictType : Type<CPred<"::py::isPyDictType($_self)">, "py.dict">;
 def Py_ListType : Type<CPred<"::py::isPyListType($_self)">, "py.list">;
 def Py_ClassType : Type<CPred<"::py::isPyClassType($_self)">, "py.class">;
+def Py_TypeType : Type<CPred<"::py::isPyTypeType($_self)">, "py.type">;
+def Py_ProtocolType
+    : Type<CPred<"::py::isPyProtocolType($_self)">, "py.protocol">;
+def Py_SelfType : Type<CPred<"::py::isPySelfType($_self)">, "py.self">;
 def Py_ExceptionType
     : Type<CPred<"::py::isPyExceptionType($_self)">, "py.exception">;
 def Py_ExceptionCellType
@@ -37,16 +42,9 @@ def Py_TracebackType
     : Type<CPred<"::py::isPyTracebackType($_self)">, "py.traceback">;
 def Py_LocationType
     : Type<CPred<"::py::isPyLocationType($_self)">, "py.location">;
-def Py_FuncType : Type<CPred<"::py::isPyFuncType($_self)">, "py.func">;
-def Py_FuncSigType : Type<CPred<"::py::isPyFuncSigType($_self)">, "py.funcsig">;
-def Py_PrimFuncType
-    : Type<CPred<"::py::isPyPrimFuncType($_self)">, "py.prim.func">;
-def Py_CallableType : Type<CPred<"::py::isCallableType($_self)">, "callable">;
-def Py_CoroType : Type<CPred<"::py::isPyCoroutineType($_self)">, "py.coro">;
-def Py_TaskType : Type<CPred<"::py::isPyTaskType($_self)">, "py.task">;
-def Py_FutureType : Type<CPred<"::py::isPyFutureType($_self)">, "py.future">;
-def Py_AwaitableType
-    : Type<CPred<"::py::isAwaitableType($_self)">, "awaitable">;
+def Py_CallableType
+    : Type<CPred<"::py::isCallableType($_self)">, "Callable contract">;
+def Py_UnionType : Type<CPred<"::py::isPyUnionType($_self)">, "py.union">;
 
 class Py_Op<string mnemonic, list<Trait> traits = []>
     : Op<Py_Dialect, mnemonic, traits>;
@@ -56,12 +54,12 @@ def Py_ReturnOp : Py_Op<"return", [Terminator]> {
   let assemblyFormat = "($operands^ `:` type($operands))? attr-dict";
 }
 
-def Py_FuncOp : Py_Op<"func", [Symbol, IsolatedFromAbove]> {
+def Py_CallableFuncOp : Py_Op<"callable.func", [Symbol, IsolatedFromAbove]> {
   let summary = "Python level function definition";
   let description = [{
-    Defines a Python-visible function object. The `function_type` attribute
-    carries the MLIR function signature used within the body region. When
-    `has_vararg`/`has_kwargs` are true, the final one or two inputs are
+    Defines a Python-visible Callable implementation. The `function_type`
+    attribute carries the complete Callable contract used by the body region.
+    When `has_vararg`/`has_kwargs` are true, the final one or two inputs are
     expected to be `!py.tuple` / `!py.dict` respectively.
 
     v3: The `specialize` attribute enables polymorphic specialization.
@@ -71,7 +69,7 @@ def Py_FuncOp : Py_Op<"func", [Symbol, IsolatedFromAbove]> {
   }];
 
   let arguments = (ins SymbolNameAttr:$sym_name,
-      TypeAttrOf<Py_FuncSigType>:$function_type,
+      TypeAttrOf<Py_CallableType>:$function_type,
       OptionalAttr<UnitAttr>:$has_vararg, OptionalAttr<UnitAttr>:$has_kwargs,
       OptionalAttr<ArrayAttr>:$arg_names, OptionalAttr<ArrayAttr>:$kwonly_names,
       OptionalAttr<ArrayAttr>:$closure_types,
@@ -81,7 +79,8 @@ def Py_FuncOp : Py_Op<"func", [Symbol, IsolatedFromAbove]> {
   let regions = (region AnyRegion:$body);
 
   let hasVerifier = 1;
-  let hasCustomAssemblyFormat = 0;
+  let assemblyFormat =
+      "$sym_name `:` $function_type attr-dict-with-keyword $body";
 }
 
 def Py_ClassOp
@@ -96,45 +95,31 @@ def Py_ClassOp
   let arguments = (ins SymbolNameAttr:$sym_name,
       OptionalAttr<StrArrayAttr>:$base_names,
       OptionalAttr<StrArrayAttr>:$field_names,
-      OptionalAttr<TypeArrayAttr>:$field_types);
+      OptionalAttr<TypeArrayAttr>:$field_types,
+      OptionalAttr<StrArrayAttr>:$method_names,
+      OptionalAttr<TypeArrayAttr>:$method_types,
+      OptionalAttr<StrArrayAttr>:$method_kinds);
 
+  // A class with an empty block and no methods is a declaration: the typing
+  // manifest (runtime/typing.mlir) declares the abstract container tower
+  // this way. The custom parser materializes the mandatory block for `{}`.
   let regions = (region SizedRegion<1>:$body);
 
   let hasVerifier = 1;
+  let hasCustomAssemblyFormat = 1;
 }
 
 def Py_CallOp : Py_Op<"call"> {
-  let summary = "Invoke a Python function";
-  let description = [{
-    Calls a Python-level function.
-    Positional arguments are packed into a `!py.tuple` while keyword
-    arguments are carried in a `!py.dict` or `!py.none`.
-  }];
-
-  let arguments = (ins Py_CallableType:$callable, Py_TupleType:$posargs,
-      AnyTypeOf<[Py_DictType, Py_NoneType]>:$kwargs,
-      OptionalAttr<UnitAttr>:$vectorcall_hint);
-
-  let results = (outs Variadic<AnyType>:$results);
-
-  let assemblyFormat =
-      "$callable `:` type($callable) `(` $posargs `:` type($posargs) `,` "
-      "$kwargs `:` type($kwargs) `)` attr-dict `:` type($results)";
-
-  let hasVerifier = 1;
-}
-
-def Py_CallVectorOp : Py_Op<"call.vector"> {
-  let summary = "Invoke a Python callable using vectorcall-style arguments";
+  let summary = "Invoke a Python callable";
   let description = [{
     Supplies positional arguments along with parallel tuples of keyword names
-    and values. This mirrors CPython's vectorcall protocol and avoids the need
-    to materialise a dictionary at call sites.
+    and values. This is the canonical Python call operation: keyword
+    dictionaries are a lowering/runtime concern and are not represented as a
+    separate dialect call shape.
   }];
 
   let arguments = (ins Py_CallableType:$callable, Py_TupleType:$posargs,
-      Py_TupleType:$kwnames, Py_TupleType:$kwvalues,
-      OptionalAttr<UnitAttr>:$vectorcall_hint);
+      Py_TupleType:$kwnames, Py_TupleType:$kwvalues);
 
   let results = (outs Variadic<AnyType>:$results);
 
@@ -149,7 +134,7 @@ def Py_CallVectorOp : Py_Op<"call.vector"> {
 def Py_InvokeOp : Py_Op<"invoke", [Terminator, AttrSizedOperandSegments]> {
   let summary = "Invoke a Python callable with EH successors";
   let description = [{
-    EH-aware call equivalent to `py.call.vector`. On success, control
+    EH-aware call equivalent to `py.call`. On success, control
     transfers to the normal destination. On exception, control transfers
     to the unwind destination.
   }];
@@ -238,28 +223,12 @@ def Py_ExceptMatchOp : Py_Op<"except.match", [Pure]> {
   let hasVerifier = 1;
 }
 
-def Py_NativeCallOp : Py_Op<"native_call"> {
-  let summary = "Invoke a native (func.func) implementation";
+def Py_MakeFunctionOp : Py_Op<"make_function", [Pure, AttrSizedOperandSegments]> {
+  let summary = "Materialize a Callable value from a Python function symbol";
   let description = [{
-    Calls into a primitive, native function defined with `func.func`.
-    The callee must not accept or return `!py.*` types.
-  }];
-
-  let arguments = (ins Py_PrimFuncType:$callee, Variadic<AnyType>:$args);
-
-  let results = (outs Variadic<AnyType>:$results);
-
-  let assemblyFormat = "$callee `:` type($callee) `(` $args `:` type($args) "
-                       "`)` attr-dict `:` type($results)";
-
-  let hasVerifier = 1;
-}
-
-def Py_MakeFunctionOp : Py_Op<"make_function", [AttrSizedOperandSegments]> {
-  let summary = "Materialize a !py.func value from a py.func symbol";
-  let description = [{
-    Produces a `!py.func` SSA value corresponding to the referenced `py.func`
-    symbol. The result type must match the signature recorded on that symbol.
+    Produces a Callable SSA value corresponding to the referenced Python
+    function symbol. The result type must match the Callable contract recorded
+    on that symbol.
 
     v2: Optionally accepts runtime metadata:
     - defaults: Tuple of default values for positional parameters
@@ -274,7 +243,7 @@ def Py_MakeFunctionOp : Py_Op<"make_function", [AttrSizedOperandSegments]> {
       Optional<Py_TupleType>:$closure, Optional<Py_DictType>:$annotations,
       Optional<Py_StrType>:$module);
 
-  let results = (outs Py_FuncType:$result);
+  let results = (outs Py_CallableType:$result);
 
   let assemblyFormat =
       "$target (`defaults` `(` $defaults^ `:` type($defaults) `)`)? "
@@ -287,66 +256,19 @@ def Py_MakeFunctionOp : Py_Op<"make_function", [AttrSizedOperandSegments]> {
   let hasVerifier = 1;
 }
 
-def Py_FuncObjectOp : Py_Op<"func.object", [Pure]> {
-  let summary = "Create a !py.func reference to an existing py.func symbol";
+def Py_CallableObjectOp : Py_Op<"callable.object", [Pure]> {
+  let summary = "Create a Callable reference to an existing function symbol";
   let description = [{
     Produces a lightweight callable handle without attaching defaults or
-    closure state. This is ideal for simply referencing an existing py.func
-    definition.
+    closure state. This is ideal for simply referencing an existing Python
+    function definition.
   }];
 
   let arguments = (ins FlatSymbolRefAttr:$target);
 
-  let results = (outs Py_FuncType:$result);
+  let results = (outs Py_CallableType:$result);
 
   let assemblyFormat = "$target attr-dict `:` type($result)";
-  let hasVerifier = 1;
-}
-
-def Py_MakeNativeOp : Py_Op<"make_native", [Pure]> {
-  let summary = "Materialize a !py.prim.func value from a func.func symbol";
-  let description = [{
-    Produces a `!py.prim.func` SSA value referencing a primitive `func.func`
-    symbol. The referenced function must not use any `!py.*` types.
-  }];
-
-  let arguments = (ins FlatSymbolRefAttr:$target);
-
-  let results = (outs Py_PrimFuncType:$result);
-
-  let assemblyFormat = "$target attr-dict `:` type($result)";
-
-  let hasVerifier = 1;
-}
-
-//===----------------------------------------------------------------------===//
-// Async / coroutine operations
-//===----------------------------------------------------------------------===//
-
-def Py_CoroCreateOp : Py_Op<"coro.create"> {
-  let summary = "Create a typed coroutine value from an async function symbol";
-  let description = [{
-    Materializes a statically typed coroutine value. The operation preserves
-    Python-level coroutine semantics in PyDialect. The initial lowering maps
-    non-escaping coroutines directly to MLIR async calls.
-  }];
-
-  let arguments = (ins FlatSymbolRefAttr:$target, Variadic<AnyType>:$args);
-
-  let results = (outs Py_CoroType:$result);
-
-  let assemblyFormat =
-      "$target `(` $args `)` attr-dict `:` functional-type($args, $result)";
-
-  let hasVerifier = 1;
-}
-
-def Py_CoroStartOp : Py_Op<"coro.start"> {
-  let summary = "Start a typed coroutine and expose its async value";
-  let arguments = (ins Py_CoroType:$coroutine);
-  let results = (outs AnyType:$result);
-  let assemblyFormat =
-      "$coroutine attr-dict `:` type($coroutine) `->` type($result)";
   let hasVerifier = 1;
 }
 
@@ -359,46 +281,211 @@ def Py_AwaitOp : Py_Op<"await"> {
   let hasVerifier = 1;
 }
 
-def Py_TaskCreateOp : Py_Op<"task.create"> {
-  let summary = "Schedule a typed coroutine as a task";
-  let arguments = (ins Py_CoroType:$coroutine);
-  let results = (outs Py_TaskType:$result);
-  let assemblyFormat =
-      "$coroutine attr-dict `:` type($coroutine) `->` type($result)";
-  let hasVerifier = 1;
-}
-
-def Py_TaskCancelOp : Py_Op<"task.cancel"> {
-  let summary = "Request cancellation for a typed task";
-  let arguments = (ins Py_TaskType:$task);
-  let results = (outs Py_BoolType:$accepted);
-  let assemblyFormat = "$task attr-dict `:` type($task) `->` type($accepted)";
-  let hasVerifier = 1;
-}
-
-def Py_AsyncSleepOp : Py_Op<"async.sleep"> {
-  let summary = "Create a timer-backed typed future for asyncio.sleep";
-  let arguments = (ins AnyType:$seconds);
-  let results = (outs Py_FutureType:$result);
-  let assemblyFormat =
-      "$seconds attr-dict `:` type($seconds) `->` type($result)";
-  let hasVerifier = 1;
-}
-
-def Py_AsyncGatherOp : Py_Op<"async.gather"> {
-  let summary = "Await statically typed awaitables and collect their results";
+def Py_AsyncNextOp : Py_Op<"async.next"> {
+  let summary = "Advance an async iterator one step";
   let description = [{
-    Represents the statically resolved subset of asyncio.gather used by
-    immediately-awaited gather expressions. The operation waits for all
-    operands and returns a typed tuple of payload values.
+    Represents one step of the Python async iteration protocol after
+    `__anext__` has been resolved statically. The operand is the concrete
+    awaitable returned by `__anext__`. The operation awaits it and maps
+    `StopAsyncIteration` to a false valid bit, matching `py.next`'s
+    element/valid split for synchronous iteration.
   }];
 
-  let arguments = (ins Variadic<AnyType>:$awaitables);
+  let arguments = (ins AnyType:$awaitable);
 
-  let results = (outs Py_TupleType:$result);
+  let results = (outs AnyType:$element, I1:$valid);
 
   let assemblyFormat =
-      "$awaitables attr-dict `:` functional-type($awaitables, $result)";
+      "$awaitable attr-dict `:` type($awaitable) `->` type($element)";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// Resolved special-method protocol operations
+//===----------------------------------------------------------------------===//
+
+def Py_EnterOp : Py_Op<"enter"> {
+  let summary = "Invoke a statically resolved __enter__ contract";
+  let description = [{
+    Represents `manager.__enter__()` after the frontend has resolved the
+    matching ContextManager contract from runtime/typing.mlir and selected the
+    concrete method implementation. Lowering treats this as a static call while
+    keeping the Python object-family special method visible in PyDialect.
+  }];
+
+  let arguments = (ins FlatSymbolRefAttr:$target,
+      TypeAttrOf<Py_CallableType>:$callee_type, AnyType:$manager,
+      OptionalAttr<UnitAttr>:$async_method);
+
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat =
+      "$target `:` $callee_type `(` $manager `:` type($manager) `)` "
+      "attr-dict `->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_ExitOp : Py_Op<"exit"> {
+  let summary = "Invoke a statically resolved __exit__ contract";
+  let description = [{
+    Represents `manager.__exit__(exc_type, exc_value, traceback)` after the
+    frontend has resolved the matching ContextManager contract from
+    runtime/typing.mlir and selected the concrete method implementation.
+  }];
+
+  let arguments = (ins FlatSymbolRefAttr:$target,
+      TypeAttrOf<Py_CallableType>:$callee_type, AnyType:$manager,
+      AnyType:$exc_type, AnyType:$exc_value, AnyType:$traceback,
+      OptionalAttr<UnitAttr>:$async_method);
+
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat =
+      "$target `:` $callee_type `(` $manager `:` type($manager) `,` "
+      "$exc_type `:` type($exc_type) `,` $exc_value `:` type($exc_value) `,` "
+      "$traceback `:` type($traceback) `)` attr-dict `->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_AEnterOp : Py_Op<"aenter"> {
+  let summary = "Invoke a statically resolved __aenter__ contract";
+  let description = [{
+    Represents `manager.__aenter__()` after the frontend has resolved the
+    matching AsyncContextManager contract from runtime/typing.mlir and selected
+    the concrete method implementation. The result is the awaitable produced by
+    the special method.
+  }];
+
+  let arguments = (ins FlatSymbolRefAttr:$target,
+      TypeAttrOf<Py_CallableType>:$callee_type, AnyType:$manager,
+      OptionalAttr<UnitAttr>:$async_method);
+
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat =
+      "$target `:` $callee_type `(` $manager `:` type($manager) `)` "
+      "attr-dict `->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_AExitOp : Py_Op<"aexit"> {
+  let summary = "Invoke a statically resolved __aexit__ contract";
+  let description = [{
+    Represents `manager.__aexit__(exc_type, exc_value, traceback)` after the
+    frontend has resolved the matching AsyncContextManager contract from
+    runtime/typing.mlir and selected the concrete method implementation. The
+    result is the awaitable produced by the special method.
+  }];
+
+  let arguments = (ins FlatSymbolRefAttr:$target,
+      TypeAttrOf<Py_CallableType>:$callee_type, AnyType:$manager,
+      AnyType:$exc_type, AnyType:$exc_value, AnyType:$traceback,
+      OptionalAttr<UnitAttr>:$async_method);
+
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat =
+      "$target `:` $callee_type `(` $manager `:` type($manager) `,` "
+      "$exc_type `:` type($exc_type) `,` $exc_value `:` type($exc_value) `,` "
+      "$traceback `:` type($traceback) `)` attr-dict `->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_SendOp : Py_Op<"send"> {
+  let summary = "Invoke a statically resolved Generator/Coroutine send contract";
+  let description = [{
+    Represents `receiver.send(value)` after the frontend has resolved the
+    matching Generator or Coroutine contract from runtime/typing.mlir and
+    selected the concrete method implementation.
+  }];
+
+  let arguments = (ins FlatSymbolRefAttr:$target,
+      TypeAttrOf<Py_CallableType>:$callee_type, AnyType:$receiver,
+      AnyType:$value);
+
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat =
+      "$target `:` $callee_type `(` $receiver `:` type($receiver) `,` "
+      "$value `:` type($value) `)` attr-dict `->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_ThrowOp : Py_Op<"throw"> {
+  let summary = "Invoke a statically resolved Generator/Coroutine throw contract";
+  let description = [{
+    Represents `receiver.throw(...)` after overload resolution against the
+    Generator or Coroutine contract in runtime/typing.mlir.
+  }];
+
+  let arguments = (ins FlatSymbolRefAttr:$target,
+      TypeAttrOf<Py_CallableType>:$callee_type, AnyType:$receiver,
+      Py_TupleType:$args);
+
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat =
+      "$target `:` $callee_type `(` $receiver `:` type($receiver) `,` "
+      "$args `:` type($args) `)` attr-dict `->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_CloseOp : Py_Op<"close"> {
+  let summary = "Invoke a statically resolved Generator/Coroutine close contract";
+
+  let arguments = (ins FlatSymbolRefAttr:$target,
+      TypeAttrOf<Py_CallableType>:$callee_type, AnyType:$receiver);
+
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat =
+      "$target `:` $callee_type `(` $receiver `:` type($receiver) `)` "
+      "attr-dict `->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_ASendOp : Py_Op<"asend"> {
+  let summary = "Invoke a statically resolved AsyncGenerator asend contract";
+
+  let arguments = (ins FlatSymbolRefAttr:$target,
+      TypeAttrOf<Py_CallableType>:$callee_type, AnyType:$receiver,
+      AnyType:$value, OptionalAttr<UnitAttr>:$async_method);
+
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat =
+      "$target `:` $callee_type `(` $receiver `:` type($receiver) `,` "
+      "$value `:` type($value) `)` attr-dict `->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_AThrowOp : Py_Op<"athrow"> {
+  let summary = "Invoke a statically resolved AsyncGenerator athrow contract";
+
+  let arguments = (ins FlatSymbolRefAttr:$target,
+      TypeAttrOf<Py_CallableType>:$callee_type, AnyType:$receiver,
+      Py_TupleType:$args, OptionalAttr<UnitAttr>:$async_method);
+
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat =
+      "$target `:` $callee_type `(` $receiver `:` type($receiver) `,` "
+      "$args `:` type($args) `)` attr-dict `->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_ACloseOp : Py_Op<"aclose"> {
+  let summary = "Invoke a statically resolved AsyncGenerator aclose contract";
+
+  let arguments = (ins FlatSymbolRefAttr:$target,
+      TypeAttrOf<Py_CallableType>:$callee_type, AnyType:$receiver,
+      OptionalAttr<UnitAttr>:$async_method);
+
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat =
+      "$target `:` $callee_type `(` $receiver `:` type($receiver) `)` "
+      "attr-dict `->` type($result)";
   let hasVerifier = 1;
 }
 
@@ -441,20 +528,23 @@ def Py_TupleEmptyOp : Py_Op<"tuple.empty", [Pure]> {
   let hasVerifier = 1;
 }
 
-def Py_TupleGetOp : Py_Op<"tuple.get", []> {
-  let summary = "Get an element from a statically typed Python tuple";
+def Py_GetItemOp : Py_Op<"getitem", []> {
+  let summary = "Python item access operation";
   let description = [{
-    Loads an element from a typed tuple using a statically known index. The
-    operation preserves the element's static type and lowers to a memref slot
-    load from the tuple items descriptor.
+    Represents `x[index]` / `x.__getitem__(index)` after the frontend has
+    resolved a matching `__getitem__` contract from runtime/typing.mlir. The
+    operation is intentionally container-generic; lowering selects the concrete
+    tuple/list/dict ABI from the statically known receiver type.
   }];
 
-  let arguments = (ins Py_TupleType:$tuple, AnyType:$index);
+  let arguments = (ins TypeAttrOf<Py_CallableType>:$callee_type,
+      AnyType:$container, AnyType:$index);
 
   let results = (outs AnyType:$result);
 
-  let assemblyFormat = "$tuple `:` type($tuple) `[` $index `:` type($index) "
-                       "`]` attr-dict `->` type($result)";
+  let assemblyFormat =
+      "$callee_type `(` $container `[` $index `:` type($index) `]` `:` "
+      "type($container) `)` attr-dict `->` type($result)";
   let hasVerifier = 1;
 }
 
@@ -490,18 +580,23 @@ def Py_DictInsertOp : Py_Op<"dict.insert"> {
   let hasVerifier = 1;
 }
 
-def Py_DictGetOp : Py_Op<"dict.get", []> {
-  let summary = "Get a value from a typed Python dictionary";
+def Py_ContainsOp : Py_Op<"contains", []> {
+  let summary = "Python containment operation";
   let description = [{
-    Loads the value associated with a key from a typed dictionary.
+    Represents `item in container` after the frontend has resolved a matching
+    `__contains__` contract from runtime/typing.mlir. The operation is
+    container-generic; lowering selects the concrete ABI from the statically
+    known receiver type.
   }];
 
-  let arguments = (ins Py_DictType:$dict, AnyType:$key);
+  let arguments = (ins TypeAttrOf<Py_CallableType>:$callee_type,
+      AnyType:$container, AnyType:$item);
 
-  let results = (outs AnyType:$result);
+  let results = (outs I1:$result);
 
-  let assemblyFormat = "$dict `:` type($dict) `[` $key `:` type($key) `]` "
-                       "attr-dict `->` type($result)";
+  let assemblyFormat =
+      "$callee_type `(` $item `in` $container `)` attr-dict `:` "
+      "type($item) `,` type($container)";
   let hasVerifier = 1;
 }
 
@@ -545,27 +640,11 @@ def Py_ListRemoveOp : Py_Op<"list.remove"> {
   let hasVerifier = 1;
 }
 
-def Py_ListGetOp : Py_Op<"list.get", []> {
-  let summary = "Get an element from a typed Python list";
-  let description = [{
-    Loads the element at the specified index from a typed list.
-  }];
-
-  let arguments = (ins Py_ListType:$list, AnyType:$index);
-
-  let results = (outs AnyType:$result);
-
-  let assemblyFormat = "$list `:` type($list) `[` $index `:` type($index) `]` "
-                       "attr-dict `->` type($result)";
-  let hasVerifier = 1;
-}
-
 def Py_NoneOp : Py_Op<"none", [Pure]> {
   let summary = "Produce the Python None singleton";
   let description = [{
     Materializes the canonical `None` object in the Python dialect. This is
-    typically used when supplying the absence of keyword arguments to
-    `py.call` or representing literal `None` in the IR.
+    typically used when representing literal `None` in the IR.
 
     Example:
       %none = py.none : !py.none
@@ -1000,6 +1079,21 @@ def Py_ClassNewOp : Py_Op<"class.new", []> {
   let hasVerifier = 1;
 }
 
+def Py_ClassObjectOp : Py_Op<"class.object", [Pure]> {
+  let summary = "Materialize a statically resolved class object";
+  let description = [{
+    Creates the class object value for a statically resolved class name. The
+    result carries `!py.type<T>` where `T` is the corresponding instance type.
+  }];
+
+  let arguments = (ins FlatSymbolRefAttr:$class_name);
+
+  let results = (outs Py_TypeType:$result);
+
+  let assemblyFormat = "$class_name attr-dict `:` type($result)";
+  let hasVerifier = 1;
+}
+
 def Py_ClassPromoteOp : Py_Op<"class.promote", []> {
   let summary = "Promote a static class value to managed storage";
   let description = [{
@@ -1013,6 +1107,72 @@ def Py_ClassPromoteOp : Py_Op<"class.promote", []> {
   let results = (outs Py_ClassType:$result);
 
   let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_ClassUpcastOp : Py_Op<"class.upcast", []> {
+  let summary = "View a class value as one of its nominal base classes";
+  let description = [{
+    Alias-preserving nominal upcast. The input and result are the same runtime
+    object resource; only the static class view changes. The verifier requires
+    the input class to be a subclass of the result class according to the
+    module's `py.class` hierarchy.
+  }];
+
+  let arguments = (ins Py_ClassType:$input);
+
+  let results = (outs Py_ClassType:$result);
+
+  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_ClassRefineOp : Py_Op<"class.refine", []> {
+  let summary = "View a class value as a proven runtime subclass";
+  let description = [{
+    Alias-preserving checked-view refinement. The operation performs no runtime
+    test by itself; it records a fact already proven by frontend flow analysis
+    or by an exact allocation fact. The verifier requires the result class to
+    be a nominal subclass of the input class.
+  }];
+
+  let arguments = (ins Py_ClassType:$input);
+
+  let results = (outs Py_ClassType:$result);
+
+  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_ProtocolViewOp : Py_Op<"protocol.view", []> {
+  let summary = "View a Python object as a statically proven protocol";
+  let description = [{
+    Alias-preserving structural protocol view. The input and result are the
+    same runtime object resource; only the static contract changes after the
+    frontend has proven conformance from the typing manifest.
+  }];
+
+  let arguments = (ins AnyType:$input);
+
+  let results = (outs Py_ProtocolType:$result);
+
+  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_ClassTestOp : Py_Op<"class.test", [Pure]> {
+  let summary = "Test whether a class value has a compatible runtime class";
+  let description = [{
+    Runtime nominal class test over a statically class-typed value. The target
+    is a class type attribute; lowering compares the object's class layout id
+    against the target class and its known subclasses.
+  }];
+
+  let arguments = (ins Py_ClassType:$input, TypeAttr:$target);
+
+  let results = (outs I1:$result);
+
+  let assemblyFormat = "$input `,` $target `:` type($input) attr-dict";
   let hasVerifier = 1;
 }
 
@@ -1101,6 +1261,140 @@ def Py_AttrSetLocalOp : Py_Op<"attr.set_local", []> {
 
   let assemblyFormat = "$object `[` $name `]` `=` $value attr-dict `:` "
                        "type($object) `,` type($value)";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// Iteration protocol operations
+//===----------------------------------------------------------------------===//
+
+def Py_IterOp : Py_Op<"iter", []> {
+  let summary = "Produce an iterator from an iterable value";
+  let description = [{
+    Represents the Python `iter(x)` language operation after the frontend has
+    resolved a matching `__iter__` contract from runtime/typing.mlir and
+    selected the concrete method implementation. The iterator borrows its
+    source: it aliases the iterable for liveness, and the concrete iteration
+    state shape is recovered from this producer during iterator expansion.
+  }];
+
+  let arguments = (ins FlatSymbolRefAttr:$target,
+      TypeAttrOf<Py_CallableType>:$callee_type, AnyType:$iterable,
+      OptionalAttr<UnitAttr>:$returned_self);
+
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat =
+      "$target `:` $callee_type `(` $iterable `:` type($iterable) `)` "
+      "attr-dict `->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_NextOp : Py_Op<"next", [AllTypesMatch<["iterator", "next"]>]> {
+  let summary = "Advance an iterator one step";
+  let description = [{
+    Represents one step of the Python iteration protocol with linear state
+    threading: the operands and results form a pure SSA chain so iteration
+    composes with scf.while directly. Returns the element, an is-valid bit,
+    and the advanced iterator. Exhaustion is the false bit, not an
+    exception; the element lanes are null descriptors on the exhausted path
+    and carry no ownership token there. A valid element result is owned.
+  }];
+
+  let arguments = (ins FlatSymbolRefAttr:$target,
+      TypeAttrOf<Py_CallableType>:$callee_type, AnyType:$iterator);
+
+  let results = (outs AnyType:$element, I1:$valid, AnyType:$next);
+
+  let assemblyFormat = "$target `:` $callee_type `(` $iterator `:` "
+                       "type($iterator) `)` attr-dict `->` type($element)";
+  let hasVerifier = 1;
+}
+
+def Py_LenOp : Py_Op<"len", []> {
+  let summary = "Python length operation";
+  let description = [{
+    Represents the Python `len(x)` language operation. `__len__` resolution
+    is a typing-manifest concern: the frontend may emit this operation only
+    after resolving a `__len__ -> int` contract from runtime/typing.mlir.
+    Lowering then implements the operation from the receiver's concrete ABI.
+    The result is an owned `!py.int`.
+  }];
+
+  let arguments = (ins TypeAttrOf<Py_CallableType>:$callee_type,
+      AnyType:$input);
+
+  let results = (outs Py_IntType:$result);
+
+  let assemblyFormat =
+      "$callee_type `(` $input `:` type($input) `)` attr-dict `->` "
+      "type($result)";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// Union (sum type) operations
+//===----------------------------------------------------------------------===//
+
+def Py_UnionWrapOp : Py_Op<"union.wrap", [Pure]> {
+  let summary = "Inject a member value into a union";
+  let description = [{
+    Injects a value whose type is a member (or a subset union) of the result
+    union. This is an ownership identity transform: the result is the same
+    resource as the operand and no ownership token is produced or consumed.
+
+    Example:
+      %u = py.union.wrap %x : !py.str -> !py.union<!py.none, !py.str>
+  }];
+
+  let arguments = (ins AnyType:$input);
+
+  let results = (outs Py_UnionType:$result);
+
+  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_UnionTestOp : Py_Op<"union.test", [Pure]> {
+  let summary = "Test whether the active union member has the given type";
+  let description = [{
+    Discriminates the active member of a union value. The tested member type
+    is carried as a type attribute and must be a member of the operand union.
+    The result is a primitive i1 intended to feed structured control flow;
+    it never escapes as a Python value.
+
+    Example:
+      %is_none = py.union.test %u, !py.none : !py.union<!py.none, !py.str>
+  }];
+
+  let arguments = (ins Py_UnionType:$input, TypeAttr:$member);
+
+  let results = (outs I1:$result);
+
+  let assemblyFormat = "$input `,` $member `:` type($input) attr-dict";
+  let hasVerifier = 1;
+}
+
+def Py_UnionUnwrapOp : Py_Op<"union.unwrap", [Pure]> {
+  let summary = "Project the proven active member out of a union";
+  let description = [{
+    Projects the active member of a union value as the statically declared
+    result type. The result type must be a member (or a subset union, the
+    proven complement of a member test) of the operand union. The
+    frontend may only emit this operation where the active member has been
+    established (a dominating py.union.test branch); the operation performs
+    no runtime re-check. Like py.union.wrap this is an ownership identity
+    transform over the same resource.
+
+    Example:
+      %s = py.union.unwrap %u : !py.union<!py.none, !py.str> -> !py.str
+  }];
+
+  let arguments = (ins Py_UnionType:$input);
+
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
   let hasVerifier = 1;
 }
 

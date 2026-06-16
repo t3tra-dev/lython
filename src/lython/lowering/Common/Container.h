@@ -2,7 +2,9 @@
 
 #include "Common/RuntimeSupport.h"
 
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -13,6 +15,24 @@
 #include <optional>
 
 namespace py {
+
+static inline std::optional<llvm::StringRef>
+functionCallResultStringAttr(mlir::OpResult result, llvm::StringRef attrName) {
+  auto call = mlir::dyn_cast<mlir::func::CallOp>(result.getOwner());
+  if (!call)
+    return std::nullopt;
+  mlir::ModuleOp module = call->getParentOfType<mlir::ModuleOp>();
+  if (!module)
+    return std::nullopt;
+  auto callee = module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
+  if (!callee || result.getResultNumber() >= callee.getNumResults())
+    return std::nullopt;
+  auto attr = mlir::dyn_cast_or_null<mlir::StringAttr>(
+      callee.getResultAttr(result.getResultNumber(), attrName));
+  if (!attr)
+    return std::nullopt;
+  return attr.getValue();
+}
 
 enum class KindId {
   Tuple,
@@ -122,12 +142,27 @@ struct Kind {
             ContainerSafetyAttrs::kDescriptorKind))
       return fromName(kind.getValue());
 
+    if (auto result = mlir::dyn_cast<mlir::OpResult>(header))
+      if (auto kind = functionCallResultStringAttr(
+              result, ContainerSafetyAttrs::kDescriptorKind))
+        return fromName(*kind);
+
     if (auto group = def->getAttrOfType<mlir::StringAttr>(
             ContainerSafetyAttrs::kDescriptorGroup)) {
       llvm::StringRef kind =
           group.getValue().take_until([](char c) { return c == '.'; });
       if (auto parsed = fromName(kind))
         return parsed;
+    }
+
+    if (auto result = mlir::dyn_cast<mlir::OpResult>(header)) {
+      if (auto group = functionCallResultStringAttr(
+              result, ContainerSafetyAttrs::kDescriptorGroup)) {
+        llvm::StringRef kind =
+            group->take_until([](char c) { return c == '.'; });
+        if (auto parsed = fromName(kind))
+          return parsed;
+      }
     }
 
     if (auto cast = mlir::dyn_cast<mlir::memref::CastOp>(def))
@@ -197,6 +232,53 @@ struct Refcount {
 };
 
 struct Descriptor {
+  static std::optional<llvm::StringRef>
+  kindNameForLogicalType(mlir::Type type) {
+    if (mlir::isa<ListType>(type))
+      return ContainerSafetyAttrs::kKindList;
+    if (mlir::isa<TupleType>(type))
+      return ContainerSafetyAttrs::kKindTuple;
+    if (mlir::isa<DictType>(type))
+      return ContainerSafetyAttrs::kKindDict;
+    return std::nullopt;
+  }
+
+  static llvm::StringRef componentForLogicalType(mlir::Type type,
+                                                 unsigned slot) {
+    if (slot == kTupleHeaderComponent)
+      return ContainerSafetyAttrs::kComponentHeader;
+    if (mlir::isa<TupleType>(type)) {
+      if (slot == kTupleItemsComponent)
+        return ContainerSafetyAttrs::kComponentItems;
+      return {};
+    }
+    if (mlir::isa<ListType>(type)) {
+      switch (slot) {
+      case kListLockComponent:
+        return ContainerSafetyAttrs::kComponentLock;
+      case kListItemsComponent:
+        return ContainerSafetyAttrs::kComponentItems;
+      default:
+        break;
+      }
+    }
+    if (mlir::isa<DictType>(type)) {
+      switch (slot) {
+      case kDictLockComponent:
+        return ContainerSafetyAttrs::kComponentLock;
+      case kDictKeysComponent:
+        return ContainerSafetyAttrs::kComponentKeys;
+      case kDictValuesComponent:
+        return ContainerSafetyAttrs::kComponentValues;
+      case kDictStatesComponent:
+        return ContainerSafetyAttrs::kComponentStates;
+      default:
+        break;
+      }
+    }
+    return {};
+  }
+
   static unsigned componentCount(mlir::Value header) {
     if (!header)
       return 1;

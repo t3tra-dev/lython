@@ -1,6 +1,6 @@
 #include "BuilderImpl.h"
 
-#include "lython/parser/Parser.h"
+#include "Parser.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -44,6 +44,22 @@ void collectArgumentNames(const parser::Node &arguments,
       if (const std::string *name = stringField(**arg, "arg"))
         names.insert(*name);
   }
+}
+
+parser::NodePtr makeLoadName(llvm::StringRef name, parser::SourceRange range) {
+  parser::NodePtr node = parser::makeNode("Name", range);
+  parser::addField(*node, "id", name.str());
+  parser::addField(*node, "ctx", parser::makeNode("Load", range));
+  return node;
+}
+
+parser::NodePtr makeUnaryCall(parser::NodePtr callee, parser::NodePtr arg,
+                              parser::SourceRange range) {
+  parser::NodePtr call = parser::makeNode("Call", range);
+  parser::addField(*call, "func", std::move(callee));
+  parser::addField(*call, "args", std::vector<parser::NodePtr>{std::move(arg)});
+  parser::addField(*call, "keywords", std::vector<parser::NodePtr>{});
+  return call;
 }
 
 class NestedCaptureCollector {
@@ -141,17 +157,24 @@ private:
 
 } // namespace
 
-std::optional<mlir::Type>
-Builder::Impl::parameterType(const parser::Node &arg, mlir::Type fallbackType) {
+std::optional<mlir::Type> Builder::Impl::parameterType(
+    const parser::Node &arg,
+    const std::map<std::string, mlir::Type> *typeVariables,
+    mlir::Type fallbackType) {
   const parser::NodePtr *annotation = nodeField(arg, "annotation");
   std::optional<mlir::Type> argType =
-      annotation ? typeFromAnnotation(*annotation) : std::nullopt;
+      annotation
+          ? (typeVariables ? typeFromAnnotation(*annotation, *typeVariables)
+                           : typeFromAnnotation(*annotation))
+          : std::nullopt;
   if (!argType) {
     const std::string *typeComment = stringField(arg, "type_comment");
     if (typeComment && !typeComment->empty()) {
       parser::NodePtr annotationText = parser::makeNode("Constant", arg.range);
       parser::addField(*annotationText, "value", *typeComment);
-      argType = typeFromAnnotation(annotationText);
+      argType = typeVariables
+                    ? typeFromAnnotation(annotationText, *typeVariables)
+                    : typeFromAnnotation(annotationText);
     }
   }
   if (!argType && fallbackType)
@@ -159,12 +182,13 @@ Builder::Impl::parameterType(const parser::Node &arg, mlir::Type fallbackType) {
   return argType;
 }
 
-bool Builder::Impl::appendAnnotatedParameter(const parser::Node &arg,
-                                             FunctionInfo &info,
-                                             llvm::StringRef role,
-                                             mlir::Type fallbackType) {
+bool Builder::Impl::appendAnnotatedParameter(
+    const parser::Node &arg, FunctionInfo &info, llvm::StringRef role,
+    const std::map<std::string, mlir::Type> *typeVariables,
+    mlir::Type fallbackType) {
   const std::string *argName = stringField(arg, "arg");
-  std::optional<mlir::Type> argType = parameterType(arg, fallbackType);
+  std::optional<mlir::Type> argType =
+      parameterType(arg, typeVariables, fallbackType);
   if (!argName || !argType) {
     error(arg, role.str() + " must have simple static annotations");
     return false;
@@ -174,8 +198,9 @@ bool Builder::Impl::appendAnnotatedParameter(const parser::Node &arg,
   return true;
 }
 
-std::optional<FunctionTypeComment>
-Builder::Impl::parseFunctionTypeComment(const parser::Node &function) {
+std::optional<FunctionTypeComment> Builder::Impl::parseFunctionTypeComment(
+    const parser::Node &function,
+    const std::map<std::string, mlir::Type> *typeVariables) {
   const std::string *comment = stringField(function, "type_comment");
   if (!comment || comment->empty())
     return std::nullopt;
@@ -206,7 +231,9 @@ Builder::Impl::parseFunctionTypeComment(const parser::Node &function) {
 
   FunctionTypeComment result;
   for (const parser::NodePtr &arg : *argNodes) {
-    std::optional<mlir::Type> argType = typeFromAnnotation(arg);
+    std::optional<mlir::Type> argType =
+        typeVariables ? typeFromAnnotation(arg, *typeVariables)
+                      : typeFromAnnotation(arg);
     if (!argType) {
       error(function, "function type_comment contains unsupported argument "
                       "annotation");
@@ -215,7 +242,9 @@ Builder::Impl::parseFunctionTypeComment(const parser::Node &function) {
     result.argTypes.push_back(*argType);
   }
 
-  std::optional<mlir::Type> resultType = typeFromAnnotation(*returns);
+  std::optional<mlir::Type> resultType =
+      typeVariables ? typeFromAnnotation(*returns, *typeVariables)
+                    : typeFromAnnotation(*returns);
   if (!resultType) {
     error(function,
           "function type_comment contains unsupported return annotation");
@@ -225,42 +254,147 @@ Builder::Impl::parseFunctionTypeComment(const parser::Node &function) {
   return result;
 }
 
-bool Builder::Impl::collectCallableDefaults(const parser::Node &callable,
-                                            const parser::Node &arguments,
-                                            FunctionInfo &info) {
+bool Builder::Impl::collectCallableDefaults(
+    const parser::Node &callable, const parser::Node &arguments,
+    FunctionInfo &info,
+    const std::map<std::string, mlir::Type> *typeVariables) {
   bool ok = true;
+  auto paramSpecPackFromAttribute =
+      [&](const parser::Node &arg,
+          llvm::StringRef attrName) -> std::optional<py::CallableType> {
+    if (!typeVariables)
+      return std::nullopt;
+    const parser::NodePtr *annotation = nodeField(arg, "annotation");
+    if (!annotation || !*annotation || (*annotation)->kind != "Attribute")
+      return std::nullopt;
+    const parser::NodePtr *value = nodeField(**annotation, "value");
+    const std::string *attr = stringField(**annotation, "attr");
+    if (!value || !*value || (*value)->kind != "Name" || !attr ||
+        *attr != attrName)
+      return std::nullopt;
+    const std::string *name = stringField(**value, "id");
+    auto found = name ? typeVariables->find(*name) : typeVariables->end();
+    if (found == typeVariables->end())
+      return std::nullopt;
+    return mlir::dyn_cast<py::CallableType>(found->second);
+  };
+
+  auto allPyTypes = [](llvm::ArrayRef<mlir::Type> types) {
+    return llvm::all_of(types,
+                        [](mlir::Type type) { return py::isPyType(type); });
+  };
+
   const parser::NodePtr *vararg = nodeField(arguments, "vararg");
   if (vararg && *vararg) {
     const std::string *argName = stringField(**vararg, "arg");
-    std::optional<mlir::Type> elementType = parameterType(**vararg);
-    if (!argName || !elementType) {
-      error(**vararg, "vararg parameter must have a simple static annotation");
-      ok = false;
-    } else if (!py::isPyType(*elementType)) {
-      error(**vararg,
-            "vararg parameter element type must be a !py.* type, got " +
-                typeString(*elementType));
-      ok = false;
+    if (std::optional<py::CallableType> pack =
+            paramSpecPackFromAttribute(**vararg, "args")) {
+      info.varargParameterPack = *pack;
+      if (!argName) {
+        error(**vararg, "vararg parameter must have a name");
+        ok = false;
+      } else if (!pack->getPositionalTypes().empty() && pack->hasVararg()) {
+        error(**vararg, "ParamSpec args with both fixed and variadic "
+                        "positional parameters are not representable yet");
+        ok = false;
+      } else if (!pack->getPositionalTypes().empty()) {
+        if (!allPyTypes(pack->getPositionalTypes())) {
+          error(**vararg, "ParamSpec args must contain only !py.* types");
+          ok = false;
+        } else {
+          info.varargName = *argName;
+          info.varargType =
+              py::TupleType::get(&context, pack->getPositionalTypes());
+        }
+      } else if (pack->hasVararg()) {
+        auto tuple = mlir::dyn_cast<py::TupleType>(pack->getVarargType());
+        if (!tuple || !allPyTypes(tuple.getElementTypes())) {
+          error(**vararg, "ParamSpec variadic args must lower to !py.tuple");
+          ok = false;
+        } else {
+          info.varargName = *argName;
+          info.varargType = tuple;
+        }
+      } else {
+        info.varargName = *argName;
+        info.varargType = py::TupleType::get(&context, {});
+      }
     } else {
-      info.varargName = *argName;
-      info.varargType = py::TupleType::get(&context, {*elementType});
+      std::optional<mlir::Type> elementType =
+          parameterType(**vararg, typeVariables);
+      if (!argName || !elementType) {
+        error(**vararg,
+              "vararg parameter must have a simple static annotation");
+        ok = false;
+      } else if (!py::isPyType(*elementType)) {
+        error(**vararg,
+              "vararg parameter element type must be a !py.* type, got " +
+                  typeString(*elementType));
+        ok = false;
+      } else {
+        info.varargName = *argName;
+        info.varargType = py::TupleType::get(&context, {*elementType});
+      }
     }
   }
 
   const parser::NodePtr *kwarg = nodeField(arguments, "kwarg");
   if (kwarg && *kwarg) {
     const std::string *argName = stringField(**kwarg, "arg");
-    std::optional<mlir::Type> valueType = parameterType(**kwarg);
-    if (!argName || !valueType) {
-      error(**kwarg, "kwarg parameter must have a simple static annotation");
-      ok = false;
-    } else if (!py::isPyType(*valueType)) {
-      error(**kwarg, "kwarg parameter value type must be a !py.* type, got " +
-                         typeString(*valueType));
-      ok = false;
+    if (std::optional<py::CallableType> pack =
+            paramSpecPackFromAttribute(**kwarg, "kwargs")) {
+      info.kwargParameterPack = *pack;
+      bool branchOk = true;
+      if (!argName) {
+        error(**kwarg, "kwarg parameter must have a name");
+        branchOk = false;
+      } else {
+        llvm::SmallVector<mlir::Type> keywordValueTypes;
+        if (!pack->getPositionalNames().empty())
+          keywordValueTypes.append(pack->getPositionalTypes().begin(),
+                                   pack->getPositionalTypes().end());
+        keywordValueTypes.append(pack->getKwOnlyTypes().begin(),
+                                 pack->getKwOnlyTypes().end());
+        if (pack->hasKwarg()) {
+          auto dict = mlir::dyn_cast<py::DictType>(pack->getKwargType());
+          if (!dict || dict.getKeyType() != strType()) {
+            error(**kwarg,
+                  "ParamSpec kwargs must lower to !py.dict<!py.str, T>");
+            branchOk = false;
+          } else {
+            keywordValueTypes.push_back(dict.getValueType());
+          }
+        }
+        if (branchOk && !allPyTypes(keywordValueTypes)) {
+          error(**kwarg,
+                "ParamSpec kwargs must contain only !py.* value types");
+          branchOk = false;
+        } else if (branchOk) {
+          mlir::Type valueType =
+              keywordValueTypes.empty()
+                  ? py::ObjectType::get(&context)
+                  : py::UnionType::getNormalized(&context, keywordValueTypes);
+          if (!valueType)
+            valueType = py::ObjectType::get(&context);
+          info.kwargName = *argName;
+          info.kwargType = dictType(strType(), valueType);
+        }
+      }
+      ok = ok && branchOk;
     } else {
-      info.kwargName = *argName;
-      info.kwargType = dictType(strType(), *valueType);
+      std::optional<mlir::Type> valueType =
+          parameterType(**kwarg, typeVariables);
+      if (!argName || !valueType) {
+        error(**kwarg, "kwarg parameter must have a simple static annotation");
+        ok = false;
+      } else if (!py::isPyType(*valueType)) {
+        error(**kwarg, "kwarg parameter value type must be a !py.* type, got " +
+                           typeString(*valueType));
+        ok = false;
+      } else {
+        info.kwargName = *argName;
+        info.kwargType = dictType(strType(), *valueType);
+      }
     }
   }
 
@@ -294,7 +428,7 @@ bool Builder::Impl::collectCallableDefaults(const parser::Node &callable,
         continue;
       }
       const std::string *argName = stringField(*arg, "arg");
-      std::optional<mlir::Type> argType = parameterType(*arg);
+      std::optional<mlir::Type> argType = parameterType(*arg, typeVariables);
       if (!argName || !argType) {
         error(*arg,
               "keyword-only arguments must have simple static annotations");
@@ -332,10 +466,58 @@ Value Builder::Impl::materializeClosureStorage(const parser::Node &anchor,
           "closure capture '" + capture.name + "' has no materialized value");
     return Value{{}, capture.storageType};
   }
-  if (capture.value.type == capture.storageType)
-    return capture.value;
+
+  Value captureValue = capture.value;
+  mlir::Region *currentRegion =
+      builder.getBlock() ? builder.getBlock()->getParent() : nullptr;
+  auto rematerializeIfNeeded = [&]() -> bool {
+    if (!currentRegion)
+      return true;
+    if (mlir::Operation *definingOp = captureValue.value.getDefiningOp()) {
+      if (definingOp->getParentRegion() == currentRegion)
+        return true;
+      if (auto constant = mlir::dyn_cast<py::IntConstantOp>(definingOp)) {
+        captureValue.value = builder.create<py::IntConstantOp>(
+            loc(anchor), constant.getType(), constant.getValue());
+        return true;
+      }
+      if (auto constant = mlir::dyn_cast<py::FloatConstantOp>(definingOp)) {
+        captureValue.value = builder.create<py::FloatConstantOp>(
+            loc(anchor), constant.getType(), constant.getValue());
+        return true;
+      }
+      if (auto constant = mlir::dyn_cast<py::StrConstantOp>(definingOp)) {
+        captureValue.value = builder.create<py::StrConstantOp>(
+            loc(anchor), constant.getType(), constant.getValue());
+        return true;
+      }
+      if (auto none = mlir::dyn_cast<py::NoneOp>(definingOp)) {
+        captureValue.value =
+            builder.create<py::NoneOp>(loc(anchor), none.getType());
+        return true;
+      }
+      if (auto constant = mlir::dyn_cast<mlir::arith::ConstantOp>(definingOp)) {
+        captureValue.value =
+            builder.clone(*constant.getOperation())->getResult(0);
+        return true;
+      }
+      return false;
+    }
+
+    auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(captureValue.value);
+    return blockArg && blockArg.getOwner() &&
+           blockArg.getOwner()->getParent() == currentRegion;
+  };
+  if (!rematerializeIfNeeded()) {
+    error(anchor, "closure capture '" + capture.name +
+                      "' cannot be materialized across function regions");
+    return Value{{}, capture.storageType};
+  }
+
+  if (captureValue.type == capture.storageType)
+    return captureValue;
   mlir::Value storage = builder.create<py::CastFromPrimOp>(
-      loc(anchor), capture.storageType, capture.value.value);
+      loc(anchor), capture.storageType, captureValue.value);
   return Value{storage, capture.storageType};
 }
 
@@ -432,8 +614,19 @@ bool Builder::Impl::hasCallableMetadata(const FunctionInfo &info) const {
 }
 
 bool Builder::Impl::hasCallableFormal(const FunctionInfo &info) const {
+  return llvm::any_of(info.argTypes,
+                      [](mlir::Type type) { return py::isCallableType(type); });
+}
+
+bool Builder::Impl::hasProtocolFormal(const FunctionInfo &info) const {
   return llvm::any_of(info.argTypes, [](mlir::Type type) {
-    return mlir::isa<py::FuncType>(type);
+    return mlir::isa<py::ProtocolType>(type);
+  });
+}
+
+bool Builder::Impl::hasClassFormal(const FunctionInfo &info) const {
+  return llvm::any_of(info.argTypes, [](mlir::Type type) {
+    return mlir::isa<py::ClassType>(type);
   });
 }
 
@@ -565,9 +758,11 @@ Value Builder::Impl::emitFunctionObject(const parser::Node &anchor,
       llvm::any_of(info.kwonlyDefaultValues,
                    [](const parser::NodePtr &node) { return !!node; });
   if (info.isNative || info.isAsync || !needsMakeFunction) {
-    mlir::Value materialized = builder.create<py::FuncObjectOp>(
+    mlir::Value materialized = builder.create<py::CallableObjectOp>(
         loc(anchor), info.functionType, info.symbolName);
-    return Value{materialized, info.functionType};
+    Value result{materialized, info.functionType};
+    result.callableInfo = std::make_shared<FunctionInfo>(info);
+    return result;
   }
 
   Value defaults = emitFunctionDefaults(anchor, info);
@@ -585,7 +780,9 @@ Value Builder::Impl::emitFunctionObject(const parser::Node &anchor,
   mlir::Value materialized = builder.create<py::MakeFunctionOp>(
       loc(anchor), info.functionType, info.symbolName, defaults.value,
       kwdefaults.value, closure.value, mlir::Value{}, mlir::Value{});
-  return Value{materialized, info.functionType};
+  Value result{materialized, info.functionType};
+  result.callableInfo = std::make_shared<FunctionInfo>(info);
+  return result;
 }
 
 void Builder::Impl::emitFunctionBinding(const parser::Node &function) {
@@ -599,36 +796,77 @@ void Builder::Impl::emitFunctionBinding(const parser::Node &function) {
     return;
   if (found->second.isNative || found->second.isAsync)
     return;
+  if (!found->second.typeParameters.empty())
+    return;
   if (hasCallableFormal(found->second))
+    return;
+  if (hasProtocolFormal(found->second))
+    return;
+  if (hasClassFormal(found->second))
     return;
   Value functionValue = emitFunctionObject(function, found->second);
   if (!functionValue.value)
     return;
+
   symbols[*name] = functionValue;
   callableAliases[*name] = found->second;
+
+  const std::vector<parser::NodePtr> *decorators =
+      nodeListField(function, "decorator_list");
+  if (!decorators || decorators->empty())
+    return;
+
+  for (auto decorator = decorators->rbegin(); decorator != decorators->rend();
+       ++decorator) {
+    if (!*decorator || isNativeDecorator(**decorator))
+      continue;
+
+    parser::NodePtr currentFunctionName = makeLoadName(*name, function.range);
+    parser::NodePtr decoratorCall =
+        makeUnaryCall(*decorator, currentFunctionName, (**decorator).range);
+    Value decorated = emitCall(*decoratorCall);
+    if (!decorated.value)
+      return;
+    if (!py::isCallableType(decorated.type)) {
+      error(**decorator, "function decorator for '" + *name +
+                             "' must return a statically typed Callable");
+      return;
+    }
+
+    std::optional<FunctionInfo> decoratedInfo =
+        resolveCallableInfo(decorated.value);
+    if (!decoratedInfo) {
+      error(**decorator, "function decorator for '" + *name +
+                             "' must return a statically known callable");
+      return;
+    }
+    symbols[*name] = decorated;
+    callableAliases[*name] = *decoratedInfo;
+  }
 }
 
-std::optional<FunctionInfo>
-Builder::Impl::parseFunctionInfo(const parser::Node &function) {
+std::optional<FunctionInfo> Builder::Impl::parseFunctionInfo(
+    const parser::Node &function,
+    const std::map<std::string, mlir::Type> *typeVariables) {
   const std::string *name = stringField(function, "name");
   const parser::NodePtr *argsNode = nodeField(function, "args");
   if (!name || !argsNode || !*argsNode) {
     error(function, "FunctionDef.name or FunctionDef.args is missing");
     return std::nullopt;
   }
-  if (hasTypeParams(function)) {
-    error(function, "generic function type parameters are parsed from CPython "
-                    "3.14 syntax but static specialization is not implemented "
-                    "in the C++ emitter yet");
-    return std::nullopt;
-  }
 
   FunctionInfo info;
   info.name = *name;
+  info.definition = &function;
   info.isAsync = function.kind == "AsyncFunctionDef";
   info.symbolName = *name == "main" ? (info.isAsync ? "__lython_async_main"
                                                     : "__lython_user_main")
                                     : *name;
+  info.typeParameters = parseTypeParameters(function, /*allowParamSpec=*/true);
+  if (info.typeParameters.empty())
+    info.typeParameters = referencedFunctionTypeParameters(function);
+  if (typeVariables)
+    info.typeSubstitutions = *typeVariables;
   const std::vector<parser::NodePtr> *decorators =
       nodeListField(function, "decorator_list");
   bool unsupportedDecorator = false;
@@ -645,17 +883,13 @@ Builder::Impl::parseFunctionInfo(const parser::Node &function) {
         info.isNative = true;
         continue;
       }
-      error(*decorator, "function decorators other than @native(gc=\"none\") "
-                        "are parsed but not implemented in the C++ emitter "
-                        "yet");
-      unsupportedDecorator = true;
     }
   }
   if (unsupportedDecorator)
     return std::nullopt;
 
   std::optional<FunctionTypeComment> typeComment =
-      parseFunctionTypeComment(function);
+      parseFunctionTypeComment(function, typeVariables);
   if (stringField(function, "type_comment") && !typeComment)
     return std::nullopt;
   std::size_t typeCommentArgIndex = 0;
@@ -672,6 +906,60 @@ Builder::Impl::parseFunctionInfo(const parser::Node &function) {
     error(**argsNode, "arguments.args is missing");
     return std::nullopt;
   }
+
+  if (!typeVariables && !info.typeParameters.empty()) {
+    if (posonlyargs) {
+      for (const parser::NodePtr &arg : *posonlyargs) {
+        const std::string *argName = arg ? stringField(*arg, "arg") : nullptr;
+        if (argName)
+          info.argNames.push_back(*argName);
+      }
+    }
+    info.positionalOnlyCount = info.argNames.size();
+    for (const parser::NodePtr &arg : *args) {
+      const std::string *argName = arg ? stringField(*arg, "arg") : nullptr;
+      if (argName)
+        info.argNames.push_back(*argName);
+    }
+    info.positionalCount = info.argNames.size();
+    const parser::NodePtr *vararg = nodeField(**argsNode, "vararg");
+    if (vararg && *vararg) {
+      const std::string *argName = stringField(**vararg, "arg");
+      if (argName)
+        info.varargName = *argName;
+    }
+    const parser::NodePtr *kwarg = nodeField(**argsNode, "kwarg");
+    if (kwarg && *kwarg) {
+      const std::string *argName = stringField(**kwarg, "arg");
+      if (argName)
+        info.kwargName = *argName;
+    }
+    const std::vector<parser::NodePtr> *defaults =
+        nodeListField(**argsNode, "defaults");
+    if (defaults)
+      info.defaultValues.assign(defaults->begin(), defaults->end());
+    const std::vector<parser::NodePtr> *kwonlyargs =
+        nodeListField(**argsNode, "kwonlyargs");
+    const std::vector<parser::NodePtr> *kwDefaults =
+        nodeListField(**argsNode, "kw_defaults");
+    if (kwonlyargs) {
+      for (const parser::NodePtr &arg : *kwonlyargs) {
+        const std::string *argName = arg ? stringField(*arg, "arg") : nullptr;
+        if (!argName)
+          continue;
+        info.argNames.push_back(*argName);
+        info.kwonlyNames.push_back(*argName);
+      }
+    }
+    if (kwDefaults)
+      info.kwonlyDefaultValues.assign(kwDefaults->begin(), kwDefaults->end());
+    info.resultType = noneType();
+    info.signatureType = functionSignatureType({}, noneType());
+    info.functionType = info.signatureType;
+    info.isGenericTemplate = true;
+    return info;
+  }
+
   std::size_t positionalParameterCount =
       (posonlyargs ? posonlyargs->size() : 0) + args->size();
   if (typeComment && typeComment->argTypes.size() != positionalParameterCount) {
@@ -685,7 +973,7 @@ Builder::Impl::parseFunctionInfo(const parser::Node &function) {
       if (!arg)
         continue;
       if (!appendAnnotatedParameter(*arg, info, "positional-only argument",
-                                    nextCommentArgType()))
+                                    typeVariables, nextCommentArgType()))
         return std::nullopt;
     }
   }
@@ -694,11 +982,11 @@ Builder::Impl::parseFunctionInfo(const parser::Node &function) {
     if (!arg)
       continue;
     if (!appendAnnotatedParameter(*arg, info, "function argument",
-                                  nextCommentArgType()))
+                                  typeVariables, nextCommentArgType()))
       return std::nullopt;
   }
   info.positionalCount = info.argNames.size();
-  if (!collectCallableDefaults(function, **argsNode, info))
+  if (!collectCallableDefaults(function, **argsNode, info, typeVariables))
     return std::nullopt;
   if ((info.varargType || info.kwargType) && (info.isNative || info.isAsync)) {
     error(function,
@@ -709,7 +997,8 @@ Builder::Impl::parseFunctionInfo(const parser::Node &function) {
   const parser::NodePtr *returns = nodeField(function, "returns");
   std::optional<mlir::Type> resultType;
   if (returns && *returns)
-    resultType = typeFromAnnotation(*returns);
+    resultType = typeVariables ? typeFromAnnotation(*returns, *typeVariables)
+                               : typeFromAnnotation(*returns);
   else if (typeComment)
     resultType = typeComment->resultType;
   else
@@ -718,26 +1007,25 @@ Builder::Impl::parseFunctionInfo(const parser::Node &function) {
     error(function, "function return annotation is unsupported");
     return std::nullopt;
   }
+  if (!info.isNative && !info.isAsync) {
+    if (std::optional<mlir::Type> concreteResult =
+            directReturnedConcreteType(*resultType, function))
+      resultType = *concreteResult;
+  }
   info.resultType = *resultType;
-  llvm::ArrayRef<mlir::Type> allArgTypes(info.argTypes);
-  info.signatureType = functionSignatureType(
-      allArgTypes.take_front(info.positionalCount), info.resultType,
-      info.varargType, allArgTypes.drop_front(info.positionalCount),
-      info.kwargType);
-  info.functionType = py::FuncType::get(&context, info.signatureType);
-  if (info.isAsync)
-    info.asyncFunctionType = asyncFunctionType(info.argTypes, info.resultType);
-  llvm::SmallVector<mlir::Type> nativeResults;
-  if (info.resultType != noneType())
-    nativeResults.push_back(info.resultType);
-  info.nativeFunctionType =
-      mlir::FunctionType::get(&context, info.argTypes, nativeResults);
+  refreshFunctionTypes(info);
+  if (!info.isNative && !info.isAsync && info.resultType != noneType()) {
+    info.returnedExactClass = directReturnedExactClass(info, function);
+    info.returnedValueArgIndex = directReturnedValueArgIndex(info, function);
+    if (!info.returnedExactClass)
+      info.returnedClassArgIndex = directReturnedClassArgIndex(info, function);
+  }
   return info;
 }
 
 std::optional<FunctionInfo>
 Builder::Impl::parseLambdaInfo(const parser::Node &lambda,
-                               py::FuncType expectedType) {
+                               mlir::Type expectedType) {
   const parser::NodePtr *argsNode = nodeField(lambda, "args");
   const parser::NodePtr *bodyNode = nodeField(lambda, "body");
   if (!argsNode || !*argsNode || !bodyNode || !*bodyNode) {
@@ -745,7 +1033,11 @@ Builder::Impl::parseLambdaInfo(const parser::Node &lambda,
     return std::nullopt;
   }
 
-  py::FuncSignatureType signature = expectedType.getSignature();
+  py::CallableType signature = py::getCallableContract(expectedType);
+  if (!signature) {
+    error(lambda, "lambda expected type must be Callable");
+    return std::nullopt;
+  }
   if (signature.hasVararg() || signature.hasKwarg() ||
       !signature.getKwOnlyTypes().empty()) {
     error(lambda, "lambda expected Callable type must be a fixed positional "
@@ -892,7 +1184,7 @@ void Builder::Impl::scanReturnedCallableSummaries(
     auto found = functions.find(*name);
     if (found == functions.end())
       continue;
-    if (!mlir::isa<py::FuncType>(found->second.resultType))
+    if (!py::isCallableType(found->second.resultType))
       continue;
     found->second.returnedCallable =
         directReturnedNestedCallable(found->second, *stmt);
@@ -937,7 +1229,7 @@ void Builder::Impl::scanMethodReturnedCallableSummaries() {
       if (function == functions.end())
         continue;
       FunctionInfo &info = function->second;
-      if (!mlir::isa<py::FuncType>(info.resultType)) {
+      if (!py::isCallableType(info.resultType)) {
         callableFunctionsBySymbol[info.symbolName] = info;
         continue;
       }
@@ -1022,7 +1314,10 @@ Builder::Impl::directReturnedNestedCallable(const FunctionInfo &outer,
   if (!nested)
     return nullptr;
 
-  std::optional<FunctionInfo> nestedInfo = parseFunctionInfo(*nested);
+  const std::map<std::string, mlir::Type> *typeVariables =
+      outer.typeSubstitutions.empty() ? nullptr : &outer.typeSubstitutions;
+  std::optional<FunctionInfo> nestedInfo =
+      parseFunctionInfo(*nested, typeVariables);
   if (!nestedInfo || nestedInfo->isNative || nestedInfo->isAsync)
     return nullptr;
   nestedInfo->symbolName = outer.symbolName + "__" + *returnedName;
@@ -1117,7 +1412,10 @@ std::optional<FunctionInfo> Builder::Impl::directReturnedNestedCallableMetadata(
   if (!nested)
     return std::nullopt;
 
-  std::optional<FunctionInfo> nestedInfo = parseFunctionInfo(*nested);
+  const std::map<std::string, mlir::Type> *typeVariables =
+      outer.typeSubstitutions.empty() ? nullptr : &outer.typeSubstitutions;
+  std::optional<FunctionInfo> nestedInfo =
+      parseFunctionInfo(*nested, typeVariables);
   if (!nestedInfo || nestedInfo->isNative || nestedInfo->isAsync)
     return std::nullopt;
   nestedInfo->symbolName = outer.symbolName + "__" + *returnedName;
@@ -1191,7 +1489,270 @@ std::optional<std::size_t> Builder::Impl::directReturnedCallableArgIndex(
     std::size_t index =
         static_cast<std::size_t>(std::distance(info.argNames.begin(), argIt));
     if (index >= info.argTypes.size() ||
-        !mlir::isa<py::FuncType>(info.argTypes[index]))
+        !py::isCallableType(info.argTypes[index]))
+      return std::nullopt;
+
+    if (!sawReturn) {
+      returnedIndex = index;
+      sawReturn = true;
+      continue;
+    }
+    if (returnedIndex != index)
+      return std::nullopt;
+  }
+  return sawReturn ? returnedIndex : std::nullopt;
+}
+
+std::optional<std::size_t>
+Builder::Impl::directReturnedValueArgIndex(const FunctionInfo &info,
+                                           const parser::Node &function) {
+  const std::vector<parser::NodePtr> *body = nodeListField(function, "body");
+  if (!body)
+    return std::nullopt;
+
+  std::optional<std::size_t> returnedIndex;
+  bool sawReturn = false;
+  for (const parser::NodePtr &stmt : *body) {
+    if (!stmt || stmt->kind == "Pass")
+      continue;
+    if (stmt->kind != "Return")
+      return std::nullopt;
+
+    const parser::NodePtr *valueNode = nodeField(*stmt, "value");
+    if (!valueNode || !*valueNode || (*valueNode)->kind != "Name")
+      return std::nullopt;
+    const std::string *name = stringField(**valueNode, "id");
+    if (!name)
+      return std::nullopt;
+
+    auto argIt = std::find(info.argNames.begin(), info.argNames.end(), *name);
+    if (argIt == info.argNames.end())
+      return std::nullopt;
+    std::size_t index =
+        static_cast<std::size_t>(std::distance(info.argNames.begin(), argIt));
+    if (index >= info.argTypes.size())
+      return std::nullopt;
+    if (!typeAssignable(info.resultType, info.argTypes[index])) {
+      bool deferredProtocolClass =
+          mlir::isa<py::ProtocolType>(info.resultType) &&
+          mlir::isa<py::ClassType>(info.argTypes[index]);
+      if (!deferredProtocolClass)
+        return std::nullopt;
+    }
+
+    if (!sawReturn) {
+      returnedIndex = index;
+      sawReturn = true;
+      continue;
+    }
+    if (returnedIndex != index)
+      return std::nullopt;
+  }
+  return sawReturn ? returnedIndex : std::nullopt;
+}
+
+std::optional<mlir::Type>
+Builder::Impl::directReturnedConcreteType(mlir::Type declaredResultType,
+                                          const parser::Node &function) {
+  const std::map<std::string, mlir::Type> knownNames;
+  return directReturnedConcreteType(declaredResultType, function, knownNames);
+}
+
+std::optional<mlir::Type> Builder::Impl::directReturnedConcreteType(
+    mlir::Type declaredResultType, const parser::Node &function,
+    const std::map<std::string, mlir::Type> &knownNames) {
+  if (!mlir::isa<py::ProtocolType>(declaredResultType))
+    return std::nullopt;
+
+  auto emptyBuiltinCall = [](const parser::Node &expr,
+                             llvm::StringRef expectedName) {
+    if (expr.kind != "Call")
+      return false;
+    const parser::NodePtr *func = nodeField(expr, "func");
+    const std::vector<parser::NodePtr> *args = nodeListField(expr, "args");
+    const std::vector<parser::NodePtr> *keywords =
+        nodeListField(expr, "keywords");
+    if (!func || !*func || (*func)->kind != "Name" || !args || !args->empty() ||
+        (keywords && !keywords->empty()))
+      return false;
+    const std::string *name = stringField(**func, "id");
+    return name && *name == expectedName;
+  };
+
+  auto emptyListLiteral = [](const parser::Node &expr) {
+    if (expr.kind != "List")
+      return false;
+    const std::vector<parser::NodePtr> *elements = nodeListField(expr, "elts");
+    return elements && elements->empty();
+  };
+
+  auto emptyDictLiteral = [](const parser::Node &expr) {
+    if (expr.kind != "Dict")
+      return false;
+    const std::vector<parser::NodePtr> *keys = nodeListField(expr, "keys");
+    const std::vector<parser::NodePtr> *values = nodeListField(expr, "values");
+    return keys && values && keys->empty() && values->empty();
+  };
+
+  auto expectedConcreteType =
+      [&](const parser::Node &expr) -> std::optional<mlir::Type> {
+    if (expr.kind == "Name") {
+      const std::string *name = stringField(expr, "id");
+      auto found = name ? knownNames.find(*name) : knownNames.end();
+      if (found != knownNames.end() &&
+          !mlir::isa<py::ProtocolType>(found->second) &&
+          typeAssignable(declaredResultType, found->second))
+        return found->second;
+    }
+    if (emptyListLiteral(expr) || emptyBuiltinCall(expr, "list")) {
+      std::optional<mlir::Type> elementType =
+          protocolIterableElement(declaredResultType);
+      if (!elementType)
+        return std::nullopt;
+      mlir::Type concrete = listType(*elementType);
+      return typeAssignable(declaredResultType, concrete)
+                 ? std::optional<mlir::Type>{concrete}
+                 : std::nullopt;
+    }
+    if (emptyDictLiteral(expr) || emptyBuiltinCall(expr, "dict")) {
+      std::optional<std::pair<mlir::Type, mlir::Type>> dictTypes =
+          protocolMappingKeyValueTypes(declaredResultType);
+      if (!dictTypes ||
+          !dictStorageSupported(dictTypes->first, dictTypes->second))
+        return std::nullopt;
+      mlir::Type concrete = dictType(dictTypes->first, dictTypes->second);
+      return typeAssignable(declaredResultType, concrete)
+                 ? std::optional<mlir::Type>{concrete}
+                 : std::nullopt;
+    }
+    return std::nullopt;
+  };
+
+  const std::vector<parser::NodePtr> *body = nodeListField(function, "body");
+  if (!body)
+    return std::nullopt;
+
+  std::function<bool(const std::vector<parser::NodePtr> &)> collectReturns;
+  std::optional<mlir::Type> returnedType;
+  bool sawReturn = false;
+  collectReturns = [&](const std::vector<parser::NodePtr> &statements) -> bool {
+    for (const parser::NodePtr &stmt : statements) {
+      if (!stmt || stmt->kind == "Pass")
+        continue;
+      if (stmt->kind == "If") {
+        const std::vector<parser::NodePtr> *ifBody =
+            nodeListField(*stmt, "body");
+        const std::vector<parser::NodePtr> *orelse =
+            nodeListField(*stmt, "orelse");
+        if ((ifBody && !collectReturns(*ifBody)) ||
+            (orelse && !collectReturns(*orelse)))
+          return false;
+        continue;
+      }
+      if (stmt->kind != "Return")
+        continue;
+
+      const parser::NodePtr *valueNode = nodeField(*stmt, "value");
+      if (!valueNode || !*valueNode)
+        return false;
+      std::optional<mlir::Type> valueType = expectedConcreteType(**valueNode);
+      if (!valueType)
+        valueType = inferExpressionType(**valueNode);
+      if (!valueType || mlir::isa<py::ProtocolType>(*valueType) ||
+          !typeAssignable(declaredResultType, *valueType))
+        return false;
+
+      if (!sawReturn) {
+        returnedType = *valueType;
+        sawReturn = true;
+        continue;
+      }
+      if (*returnedType != *valueType)
+        return false;
+    }
+    return true;
+  };
+
+  if (!collectReturns(*body))
+    return std::nullopt;
+
+  return sawReturn ? returnedType : std::nullopt;
+}
+
+std::optional<std::string>
+Builder::Impl::directReturnedExactClass(const FunctionInfo &info,
+                                        const parser::Node &function) {
+  const std::vector<parser::NodePtr> *body = nodeListField(function, "body");
+  if (!body)
+    return std::nullopt;
+
+  std::optional<std::string> returnedClass;
+  bool sawReturn = false;
+  for (const parser::NodePtr &stmt : *body) {
+    if (!stmt || stmt->kind == "Pass")
+      continue;
+    if (stmt->kind != "Return")
+      return std::nullopt;
+
+    const parser::NodePtr *valueNode = nodeField(*stmt, "value");
+    if (!valueNode || !*valueNode || (*valueNode)->kind != "Call")
+      return std::nullopt;
+    const parser::NodePtr *funcNode = nodeField(**valueNode, "func");
+    if (!funcNode || !*funcNode || (*funcNode)->kind != "Name")
+      return std::nullopt;
+    const std::string *name = stringField(**funcNode, "id");
+    if (!name || !classes.count(*name))
+      return std::nullopt;
+    if (!typeSubtypeOf(classType(*name), info.resultType))
+      return std::nullopt;
+
+    if (!sawReturn) {
+      returnedClass = *name;
+      sawReturn = true;
+      continue;
+    }
+    if (returnedClass != *name)
+      return std::nullopt;
+  }
+  return sawReturn ? returnedClass : std::nullopt;
+}
+
+std::optional<std::size_t>
+Builder::Impl::directReturnedClassArgIndex(const FunctionInfo &info,
+                                           const parser::Node &function) {
+  const std::vector<parser::NodePtr> *body = nodeListField(function, "body");
+  if (!body)
+    return std::nullopt;
+
+  auto carriesClassFact = [](mlir::Type type) {
+    return mlir::isa<py::ClassType>(type) || mlir::isa<py::UnionType>(type);
+  };
+  if (!carriesClassFact(info.resultType))
+    return std::nullopt;
+
+  std::optional<std::size_t> returnedIndex;
+  bool sawReturn = false;
+  for (const parser::NodePtr &stmt : *body) {
+    if (!stmt || stmt->kind == "Pass")
+      continue;
+    if (stmt->kind != "Return")
+      return std::nullopt;
+
+    const parser::NodePtr *valueNode = nodeField(*stmt, "value");
+    if (!valueNode || !*valueNode || (*valueNode)->kind != "Name")
+      return std::nullopt;
+    const std::string *name = stringField(**valueNode, "id");
+    if (!name)
+      return std::nullopt;
+
+    auto argIt = std::find(info.argNames.begin(), info.argNames.end(), *name);
+    if (argIt == info.argNames.end())
+      return std::nullopt;
+    std::size_t index =
+        static_cast<std::size_t>(std::distance(info.argNames.begin(), argIt));
+    if (index >= info.argTypes.size() ||
+        !carriesClassFact(info.argTypes[index]) ||
+        !typeAssignable(info.resultType, info.argTypes[index]))
       return std::nullopt;
 
     if (!sawReturn) {
@@ -1268,6 +1829,54 @@ bool Builder::Impl::expressionMayThrow(const parser::Node &expr) const {
       return true;
     if (func && *func && expressionMayThrow(**func))
       return true;
+    if (func && *func && (*func)->kind == "Attribute") {
+      const parser::NodePtr *receiver = nodeField(**func, "value");
+      const std::string *methodName = stringField(**func, "attr");
+      if (receiver && *receiver && methodName) {
+        Builder::Impl *mutableSelf = const_cast<Builder::Impl *>(this);
+        std::optional<mlir::Type> receiverType =
+            mutableSelf->inferExpressionType(**receiver);
+        llvm::SmallVector<mlir::Type> argumentTypes;
+        bool haveArgumentTypes = static_cast<bool>(args);
+        if (args) {
+          argumentTypes.reserve(args->size());
+          for (const parser::NodePtr &arg : *args) {
+            if (!arg) {
+              haveArgumentTypes = false;
+              break;
+            }
+            std::optional<mlir::Type> argType =
+                mutableSelf->inferExpressionType(*arg);
+            if (!argType) {
+              haveArgumentTypes = false;
+              break;
+            }
+            argumentTypes.push_back(*argType);
+          }
+        }
+        if (receiverType && haveArgumentTypes) {
+          std::optional<protocols::ProtocolMethod> contract =
+              protocols::Table::get(context).resolveMethodContractOn(
+                  *receiverType, *methodName, argumentTypes);
+          if (contract)
+            return contract->mayThrow;
+        }
+        if (receiverType) {
+          std::optional<std::string> className =
+              mutableSelf->classNameFromType(*receiverType);
+          auto classFound =
+              className ? classes.find(*className) : classes.end();
+          if (classFound != classes.end()) {
+            auto method = classFound->second.methods.find(*methodName);
+            if (method != classFound->second.methods.end()) {
+              auto found = functions.find(method->second);
+              if (found != functions.end())
+                return found->second.mayThrow;
+            }
+          }
+        }
+      }
+    }
     if (func && *func && (*func)->kind == "Name") {
       const std::string *name = stringField(**func, "id");
       if (name) {
@@ -1434,7 +2043,8 @@ void Builder::Impl::propagateMayThrow(const parser::Node &moduleNode) {
       if (!className || !classBody)
         continue;
       for (const parser::NodePtr &member : *classBody) {
-        if (!member || member->kind != "FunctionDef")
+        if (!member || (member->kind != "FunctionDef" &&
+                        member->kind != "AsyncFunctionDef"))
           continue;
         const std::string *methodName = stringField(*member, "name");
         const std::vector<parser::NodePtr> *methodBody =
@@ -1454,11 +2064,12 @@ void Builder::Impl::propagateMayThrow(const parser::Node &moduleNode) {
 }
 
 void Builder::Impl::emitMain(const parser::Node &moduleNode) {
-  py::FuncSignatureType signature = functionSignatureType({}, i32Type());
+  py::CallableType signature = functionSignatureType({}, i32Type());
   const std::vector<parser::NodePtr> *body = nodeListField(moduleNode, "body");
   bool mainMayThrow = body && statementListMayThrow(*body);
-  py::FuncOp main = createFunc("main", signature, {}, /*hasVararg=*/false,
-                               /*hasKwarg=*/false, mainMayThrow);
+  py::CallableFuncOp main =
+      createFunc("main", signature, {}, /*hasVararg=*/false,
+                 /*hasKwarg=*/false, mainMayThrow);
   addEntryBlock(main, {});
 
   mlir::Type savedReturnType = currentReturnType;
@@ -1494,28 +2105,39 @@ void Builder::Impl::emitUserFunctions(const parser::Node &moduleNode) {
   for (const parser::NodePtr &stmt : *body) {
     if (!stmt)
       continue;
-    if (stmt->kind == "FunctionDef")
+    if (stmt->kind == "FunctionDef") {
+      const std::string *name = stringField(*stmt, "name");
+      auto found = name ? functions.find(*name) : functions.end();
+      if (found != functions.end() &&
+          (hasProtocolFormal(found->second) || hasClassFormal(found->second)))
+        continue;
       emitFunctionDef(*stmt);
-    else if (stmt->kind == "AsyncFunctionDef")
+    } else if (stmt->kind == "AsyncFunctionDef")
       emitAsyncFunctionDef(*stmt);
   }
 
   auto emitPendingSpecializations = [&]() -> bool {
     bool emittedAny = false;
     for (const parser::NodePtr &stmt : *body) {
-      if (!stmt || stmt->kind != "FunctionDef")
+      if (!stmt ||
+          (stmt->kind != "FunctionDef" && stmt->kind != "AsyncFunctionDef"))
         continue;
       const std::string *name = stringField(*stmt, "name");
       if (!name)
         continue;
       auto found = functions.find(*name);
-      if (found == functions.end() || !hasCallableFormal(found->second))
+      if (found == functions.end() || (!hasCallableFormal(found->second) &&
+                                       !hasProtocolFormal(found->second) &&
+                                       !hasClassFormal(found->second) &&
+                                       found->second.typeParameters.empty()))
         continue;
 
       std::vector<std::string> pendingKeys;
       for (const auto &entry : functionSpecializations) {
         const FunctionSpecialization &specialization = entry.second;
         if (specialization.info.name != *name)
+          continue;
+        if (hasProtocolFormal(specialization.info))
           continue;
         if (emittedFunctionSpecializations.count(entry.first))
           continue;
@@ -1527,8 +2149,15 @@ void Builder::Impl::emitUserFunctions(const parser::Node &moduleNode) {
         if (specialization == functionSpecializations.end())
           continue;
         emittedFunctionSpecializations.insert(key);
-        emitFunctionBody(*stmt, specialization->second.info,
-                         specialization->second.callableAliases);
+        if (specialization->second.info.returnedCallable ||
+            specialization->second.info.returnedCallableArgIndex)
+          continue;
+        if (stmt->kind == "AsyncFunctionDef")
+          emitAsyncFunctionDef(*stmt, specialization->second.info,
+                               specialization->second.callableAliases);
+        else
+          emitFunctionBody(*stmt, specialization->second.info,
+                           specialization->second.callableAliases);
         emittedAny = true;
       }
     }
@@ -1546,7 +2175,8 @@ void Builder::Impl::emitFunctionDef(const parser::Node &function) {
   auto found = functions.find(*name);
   if (found == functions.end())
     return;
-  if (hasCallableFormal(found->second))
+  if (hasCallableFormal(found->second) || hasProtocolFormal(found->second) ||
+      !found->second.typeParameters.empty())
     return;
   emitFunctionBody(function, found->second);
 }
@@ -1576,6 +2206,8 @@ void Builder::Impl::emitFunctionBody(
   std::set<std::string> savedActiveGlobalNames = std::move(activeGlobalNames);
   std::set<std::string> savedActiveNonlocalNames =
       std::move(activeNonlocalNames);
+  std::map<std::string, mlir::Type> savedActiveTypeSubstitutions =
+      std::move(activeTypeSubstitutions);
   mlir::Type savedReturnType = currentReturnType;
   bool savedTerminated = blockTerminated;
   bool savedInNativeFunction = inNativeFunction;
@@ -1587,6 +2219,7 @@ void Builder::Impl::emitFunctionBody(
   callableAliases.clear();
   activeGlobalNames.clear();
   activeNonlocalNames.clear();
+  activeTypeSubstitutions = info.typeSubstitutions;
   callableAliases = initialCallableAliases;
   currentReturnType = info.resultType;
   blockTerminated = false;
@@ -1616,7 +2249,7 @@ void Builder::Impl::emitFunctionBody(
     if (info.kwargType)
       entryTypes.push_back(info.kwargType);
     entryTypes.append(closureTypes.begin(), closureTypes.end());
-    py::FuncOp func = createFunc(
+    py::CallableFuncOp func = createFunc(
         info.symbolName, info.signatureType,
         stringArrayAttr(allArgNames.take_front(info.positionalCount)),
         /*hasVararg=*/static_cast<bool>(info.varargType),
@@ -1633,12 +2266,16 @@ void Builder::Impl::emitFunctionBody(
     if (info.varargName && info.varargType) {
       mlir::Value arg =
           func.getBody().front().getArgument(info.argTypes.size());
-      symbols.emplace(*info.varargName, Value{arg, info.varargType});
+      Value value{arg, info.varargType};
+      value.paramSpecArgs = info.varargParameterPack;
+      symbols.emplace(*info.varargName, value);
     }
     if (info.kwargName && info.kwargType) {
       mlir::Value arg = func.getBody().front().getArgument(
           info.argTypes.size() + (info.varargType ? 1 : 0));
-      symbols.emplace(*info.kwargName, Value{arg, info.kwargType});
+      Value value{arg, info.kwargType};
+      value.paramSpecKwargs = info.kwargParameterPack;
+      symbols.emplace(*info.kwargName, value);
     }
     const unsigned closureOffset =
         static_cast<unsigned>(info.argTypes.size() + (info.varargType ? 1 : 0) +
@@ -1651,7 +2288,10 @@ void Builder::Impl::emitFunctionBody(
           function, storage, capture.storageType, capture.value.type);
       if (!restored.value)
         continue;
+      restored.callableInfo = capture.value.callableInfo;
       symbols.emplace(capture.name, restored);
+      if (restored.callableInfo)
+        callableAliases.emplace(capture.name, *restored.callableInfo);
       auto capturedFunction = savedLocalFunctions.find(capture.name);
       if (capturedFunction != savedLocalFunctions.end())
         localFunctions.emplace(capture.name, capturedFunction->second);
@@ -1683,6 +2323,7 @@ void Builder::Impl::emitFunctionBody(
   callableAliases = std::move(savedCallableAliases);
   activeGlobalNames = std::move(savedActiveGlobalNames);
   activeNonlocalNames = std::move(savedActiveNonlocalNames);
+  activeTypeSubstitutions = std::move(savedActiveTypeSubstitutions);
   currentReturnType = savedReturnType;
   blockTerminated = savedTerminated;
   inNativeFunction = savedInNativeFunction;
@@ -1700,7 +2341,10 @@ void Builder::Impl::emitNestedFunctionDef(const parser::Node &function) {
     return;
   }
 
-  std::optional<FunctionInfo> parsed = parseFunctionInfo(function);
+  const std::map<std::string, mlir::Type> *typeVariables =
+      activeTypeSubstitutions.empty() ? nullptr : &activeTypeSubstitutions;
+  std::optional<FunctionInfo> parsed =
+      parseFunctionInfo(function, typeVariables);
   if (!parsed)
     return;
   if (parsed->isNative || parsed->isAsync) {
@@ -1731,15 +2375,20 @@ void Builder::Impl::emitNestedFunctionDef(const parser::Node &function) {
 
 Value Builder::Impl::emitLambda(const parser::Node &expr,
                                 mlir::Type expectedType) {
-  auto funcType = mlir::dyn_cast<py::FuncType>(expectedType);
-  if (!funcType) {
+  if (!py::getCallableContract(expectedType)) {
     error(expr, "lambda expression requires an expected Callable[...] type, "
                 "got " +
                     typeString(expectedType));
     return Value{{}, expectedType};
   }
 
-  std::optional<FunctionInfo> parsed = parseLambdaInfo(expr, funcType);
+  std::optional<FunctionInfo> parsed;
+  auto cached = lambdaCallableInfos.find(&expr);
+  if (cached != lambdaCallableInfos.end() &&
+      typeAssignable(expectedType, cached->second.functionType))
+    parsed = cached->second;
+  else
+    parsed = parseLambdaInfo(expr, expectedType);
   if (!parsed)
     return Value{{}, expectedType};
 
@@ -1763,6 +2412,7 @@ Value Builder::Impl::emitLambda(const parser::Node &expr,
   parser::addField(*function, "type_params", std::vector<parser::NodePtr>{});
 
   parsed->closureCaptures = collectNestedFunctionCaptures(*function);
+  lambdaCallableInfos[&expr] = *parsed;
   if (functionStack.empty() && !parsed->closureCaptures.empty()) {
     error(expr, "module-scope lambda captures are not supported because "
                 "Python globals use late binding semantics");
@@ -1781,7 +2431,8 @@ Value Builder::Impl::emitLambda(const parser::Node &expr,
 
   emitFunctionBody(*function, *parsed);
   if (enclosingTopLevel) {
-    if (auto lambdaFunc = module->lookupSymbol<py::FuncOp>(parsed->symbolName))
+    if (auto lambdaFunc =
+            module->lookupSymbol<py::CallableFuncOp>(parsed->symbolName))
       lambdaFunc->moveBefore(enclosingTopLevel);
   }
 

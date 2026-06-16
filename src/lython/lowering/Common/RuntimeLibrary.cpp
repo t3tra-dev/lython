@@ -3,6 +3,7 @@
 #include "Common/LoweringUtils.h"
 #include "Common/Object.h"
 #include "Common/RuntimeSupport.h"
+#include "embedded.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -10,142 +11,46 @@
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Parser/Parser.h"
-#include "llvm/ADT/SmallString.h"
-#include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/FileSystem.h"
-#include "llvm/Support/Path.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Process.h"
-#include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/SourceMgr.h"
 
-#include <algorithm>
 #include <optional>
 #include <string>
-#include <system_error>
-#include <vector>
 
 namespace py::runtime_library {
+
+bool prelowerGenerationMode() {
+  static const bool enabled = [] {
+    auto value = llvm::sys::Process::GetEnv("LYTHON_RUNTIME_PRELOWER");
+    if (!value)
+      return false;
+    llvm::StringRef text(*value);
+    return text == "1" || text.equals_insensitive("true") ||
+           text.equals_insensitive("yes") || text.equals_insensitive("on");
+  }();
+  return enabled;
+}
+
+std::optional<std::string> prelinkedRuntimeIRPath() {
+  if (prelowerGenerationMode())
+    return std::nullopt;
+  if (auto env = llvm::sys::Process::GetEnv("LYTHON_RUNTIME_PRELINKED_IR")) {
+    if (env->empty())
+      return std::nullopt; // explicit opt-out
+    if (llvm::sys::fs::exists(*env))
+      return *env;
+    return std::nullopt;
+  }
+#if defined(LYTHON_RUNTIME_PRELINKED_IR)
+  if (llvm::sys::fs::exists(LYTHON_RUNTIME_PRELINKED_IR))
+    return std::string(LYTHON_RUNTIME_PRELINKED_IR);
+#endif
+  return std::nullopt;
+}
+
 namespace {
-
-std::optional<std::string> sourceModuleDir() {
-  if (auto env = llvm::sys::Process::GetEnv("LYTHON_RUNTIME_MLIR_DIR"))
-    return *env;
-
-#if defined(LYTHON_SOURCE_DIR)
-  llvm::SmallString<256> dir(LYTHON_SOURCE_DIR);
-  llvm::sys::path::append(dir, "src", "lython", "runtime", "objects");
-  return dir.str().str();
-#else
-  return std::nullopt;
-#endif
-}
-
-std::optional<std::string> bytecodeModuleDir() {
-  if (auto env = llvm::sys::Process::GetEnv("LYTHON_RUNTIME_MLIR_BC_DIR"))
-    return *env;
-
-#if defined(LYTHON_RUNTIME_MLIR_BC_DIR)
-  if (llvm::sys::fs::exists(LYTHON_RUNTIME_MLIR_BC_DIR))
-    return std::string(LYTHON_RUNTIME_MLIR_BC_DIR);
-#endif
-
-  return std::nullopt;
-}
-
-bool isMlirSourceModule(llvm::StringRef path) {
-  return llvm::sys::path::extension(path) == ".mlir";
-}
-
-bool isMlirBytecodeModule(llvm::StringRef path) {
-  return llvm::sys::path::extension(path) == ".mlirbc";
-}
-
-bool isFallbackRuntimeModule(llvm::StringRef path) {
-  llvm::StringRef ext = llvm::sys::path::extension(path);
-  return ext == ".mlirbc" || ext == ".mlir";
-}
-
-using ModuleFilter = bool (*)(llvm::StringRef);
-
-mlir::LogicalResult collectModuleFiles(llvm::StringRef dir, ModuleFilter filter,
-                                       std::vector<std::string> &files) {
-  if (!llvm::sys::fs::exists(dir)) {
-    llvm::errs() << "error: runtime MLIR object directory does not exist: "
-                 << dir << "\n";
-    return mlir::failure();
-  }
-
-  std::error_code ec;
-  for (llvm::sys::fs::directory_iterator it(dir, ec), end; it != end;
-       it.increment(ec)) {
-    if (ec)
-      break;
-    if (!llvm::sys::fs::is_regular_file(it->path()))
-      continue;
-    if (filter(it->path()))
-      files.emplace_back(it->path());
-  }
-  if (ec) {
-    llvm::errs() << "error: failed to enumerate runtime MLIR object modules in "
-                 << dir << ": " << ec.message() << "\n";
-    return mlir::failure();
-  }
-
-  std::sort(files.begin(), files.end());
-  return mlir::success();
-}
-
-std::optional<std::string> bytecodePathForSource(llvm::StringRef sourcePath) {
-  auto bytecodeDir = bytecodeModuleDir();
-  if (!bytecodeDir)
-    return std::nullopt;
-
-  std::string bytecodeName = llvm::sys::path::stem(sourcePath).str();
-  bytecodeName += ".mlirbc";
-  llvm::SmallString<256> bytecodePath(*bytecodeDir);
-  llvm::sys::path::append(bytecodePath, bytecodeName);
-  if (!llvm::sys::fs::exists(bytecodePath))
-    return std::nullopt;
-  return bytecodePath.str().str();
-}
-
-mlir::LogicalResult
-collectSourceBackedRuntimeModules(llvm::StringRef sourceDir,
-                                  std::vector<std::string> &files) {
-  std::vector<std::string> sources;
-  if (mlir::failed(collectModuleFiles(sourceDir, isMlirSourceModule, sources)))
-    return mlir::failure();
-
-  for (const std::string &source : sources) {
-    if (std::optional<std::string> bytecode = bytecodePathForSource(source)) {
-      files.push_back(*bytecode);
-      continue;
-    }
-    files.push_back(source);
-  }
-  return mlir::success();
-}
-
-mlir::LogicalResult collectRuntimeModules(std::vector<std::string> &files) {
-  if (auto sourceDir = sourceModuleDir()) {
-    if (llvm::sys::fs::exists(*sourceDir))
-      return collectSourceBackedRuntimeModules(*sourceDir, files);
-  }
-
-  // Installed-tree fallback: without source manifests, trust the configured
-  // runtime directory. In a build tree, source-backed collection above prevents
-  // stale bytecode from reintroducing removed runtime symbols.
-  if (auto bytecodeDir = bytecodeModuleDir()) {
-    if (llvm::sys::fs::exists(*bytecodeDir))
-      return collectModuleFiles(*bytecodeDir, isMlirBytecodeModule, files);
-  }
-
-  if (auto sourceDir = sourceModuleDir())
-    if (llvm::sys::fs::exists(*sourceDir))
-      return collectModuleFiles(*sourceDir, isFallbackRuntimeModule, files);
-
-  llvm::errs() << "error: runtime MLIR object directory is not configured\n";
-  return mlir::failure();
-}
 
 bool hasBody(mlir::Operation *op) {
   return op->getNumRegions() > 0 && !op->getRegion(0).empty();
@@ -290,10 +195,19 @@ bool canReplaceDeclaration(mlir::Operation *existing,
   return false;
 }
 
-void importRuntimeSymbol(mlir::ModuleOp target, mlir::Operation *op) {
+void importRuntimeSymbol(mlir::ModuleOp target, mlir::Operation *op,
+                         bool declarationsOnly) {
+  // With the pre-lowered runtime cache, function bodies stay out of the
+  // per-compile module: only the signature and its materialized contracts
+  // are needed by the lowering and the verifiers. Non-function symbols
+  // (small-int cache globals etc.) are referenced exclusively by runtime
+  // bodies and live in the cache.
+  if (declarationsOnly && !mlir::isa<mlir::FunctionOpInterface>(op))
+    return;
+
   if (auto symbol = llvm::dyn_cast<mlir::SymbolOpInterface>(op)) {
     if (mlir::Operation *existing = target.lookupSymbol(symbol.getName())) {
-      if (!canReplaceDeclaration(existing, *op)) {
+      if (declarationsOnly || !canReplaceDeclaration(existing, *op)) {
         mergeRuntimeContractAttrs(existing, op);
         return;
       }
@@ -303,36 +217,53 @@ void importRuntimeSymbol(mlir::ModuleOp target, mlir::Operation *op) {
 
   mlir::OpBuilder builder(target.getContext());
   builder.setInsertionPointToEnd(target.getBody());
-  mlir::Operation *cloned = builder.clone(*op);
-  if (auto symbol = llvm::dyn_cast<mlir::SymbolOpInterface>(cloned))
-    symbol.setVisibility(mlir::SymbolTable::Visibility::Private);
+  mlir::Operation *cloned =
+      declarationsOnly ? builder.cloneWithoutRegions(*op) : builder.clone(*op);
+  if (auto symbol = llvm::dyn_cast<mlir::SymbolOpInterface>(cloned)) {
+    // The prelower generation run must keep the runtime bodies public so
+    // SymbolDCE does not erase them from the otherwise empty module.
+    if (!prelowerGenerationMode())
+      symbol.setVisibility(mlir::SymbolTable::Visibility::Private);
+  }
 }
 
 mlir::LogicalResult importRuntimeModule(mlir::ModuleOp target,
-                                        llvm::StringRef path) {
+                                        const embedded::Module &entry,
+                                        bool declarationsOnly) {
+  // The bytecode was generated from source at build time and compiled into
+  // this binary; it is the manifest, not a cache, so it cannot be stale.
+  llvm::SourceMgr sourceMgr;
+  sourceMgr.AddNewSourceBuffer(
+      llvm::MemoryBuffer::getMemBuffer(
+          llvm::StringRef(reinterpret_cast<const char *>(entry.data),
+                          entry.size),
+          entry.name, /*RequiresNullTerminator=*/false),
+      llvm::SMLoc());
   auto source =
-      mlir::parseSourceFile<mlir::ModuleOp>(path, target.getContext());
+      mlir::parseSourceFile<mlir::ModuleOp>(sourceMgr, target.getContext());
   if (!source) {
-    target.emitError() << "failed to parse runtime MLIR object module: "
-                       << path;
+    target.emitError() << "failed to parse embedded runtime MLIR module: "
+                       << entry.name;
     return mlir::failure();
   }
 
   for (mlir::Operation &op : source->getBody()->getOperations())
     if (mlir::isa<mlir::SymbolOpInterface>(op))
-      importRuntimeSymbol(target, &op);
+      importRuntimeSymbol(target, &op, declarationsOnly);
   return mlir::success();
 }
 
 } // namespace
 
 mlir::LogicalResult embedObjectModules(mlir::ModuleOp module) {
-  std::vector<std::string> files;
-  if (mlir::failed(collectRuntimeModules(files)))
-    return mlir::failure();
-
-  for (const std::string &file : files) {
-    if (mlir::failed(importRuntimeModule(module, file)))
+  const bool declarationsOnly = prelinkedRuntimeIRPath().has_value();
+  for (std::size_t index = 0; index < embedded::moduleCount(); ++index) {
+    const embedded::Module &entry = embedded::modules()[index];
+    // The typing manifest is consumed by the frontend protocol oracle, not
+    // by lowering.
+    if (llvm::StringRef(entry.name) == "typing")
+      continue;
+    if (mlir::failed(importRuntimeModule(module, entry, declarationsOnly)))
       return mlir::failure();
   }
   materializeRuntimeContracts(module);

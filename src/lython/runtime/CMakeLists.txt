@@ -1,6 +1,7 @@
 add_library(LythonRuntime STATIC
     bltinmodule.cpp
     traceback.cpp
+    stackguard.cpp
     native/exception.cpp
 )
 

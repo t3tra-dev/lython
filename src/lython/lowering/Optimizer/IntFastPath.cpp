@@ -112,14 +112,14 @@ mlir::arith::CmpIPredicate predicateFor(mlir::Operation *op) {
   return mlir::arith::CmpIPredicate::ne;
 }
 
-FuncOp directTarget(mlir::Operation *from, mlir::Value callable) {
+CallableFuncOp directTarget(mlir::Operation *from, mlir::Value callable) {
   callable = value::stripCasts(callable);
-  auto funcObject = callable.getDefiningOp<FuncObjectOp>();
+  auto funcObject = callable.getDefiningOp<CallableObjectOp>();
   if (!funcObject)
     return nullptr;
   mlir::Operation *symbol = mlir::SymbolTable::lookupNearestSymbolFrom(
       from, funcObject.getTargetAttr());
-  return mlir::dyn_cast_or_null<FuncOp>(symbol);
+  return mlir::dyn_cast_or_null<CallableFuncOp>(symbol);
 }
 
 bool isEmptyTuple(mlir::Value value) {
@@ -127,7 +127,7 @@ bool isEmptyTuple(mlir::Value value) {
       value::stripCasts(value).getDefiningOp());
 }
 
-std::optional<mlir::Value> singlePosArg(CallVectorOp call) {
+std::optional<mlir::Value> singlePosArg(CallOp call) {
   if (!isEmptyTuple(call.getKwnames()) || !isEmptyTuple(call.getKwvalues()))
     return std::nullopt;
   auto tuple =
@@ -137,10 +137,10 @@ std::optional<mlir::Value> singlePosArg(CallVectorOp call) {
   return tuple.getElements().front();
 }
 
-bool isIntUnarySignature(FuncOp func) {
+bool isIntUnarySignature(CallableFuncOp func) {
   auto attr = func->getAttrOfType<mlir::TypeAttr>("function_type");
-  auto sig = attr ? mlir::dyn_cast<FuncSignatureType>(attr.getValue())
-                  : FuncSignatureType();
+  auto sig =
+      attr ? mlir::dyn_cast<CallableType>(attr.getValue()) : CallableType();
   if (!sig || sig.hasVararg() || sig.hasKwarg())
     return false;
   return sig.getPositionalTypes().size() == 1 &&
@@ -170,16 +170,24 @@ struct EvalFrame {
 
 class IntEvaluator {
 public:
-  IntEvaluator(FuncOp func, unsigned bits) : func(func), bits(bits) {}
+  IntEvaluator(CallableFuncOp func, unsigned bits) : func(func), bits(bits) {}
 
   std::optional<int64_t> evaluate(int64_t input) {
     if (!fitsSigned(input, bits))
       return std::nullopt;
     if (auto it = memo.find(input); it != memo.end())
       return it->second;
+    // The interpreter recurses on the C++ stack per nested call; without a
+    // depth bound a linearly recursive program overflows the compiler stack
+    // (e.g. deep(2000000)). Past this depth the fold is abandoned and the
+    // call stays a runtime call.
+    if (depth >= kMaxEvalDepth)
+      return std::nullopt;
     if (!active.insert(input).second)
       return std::nullopt;
+    ++depth;
     std::optional<int64_t> result = evaluateUncached(input);
+    --depth;
     active.erase(input);
     if (result)
       memo[input] = *result;
@@ -241,7 +249,7 @@ private:
           frame.ints[op->getResult(0)] = result;
           continue;
         }
-        if (auto call = mlir::dyn_cast<CallVectorOp>(op)) {
+        if (auto call = mlir::dyn_cast<CallOp>(op)) {
           if (directTarget(call, call.getCallable()) != func)
             return std::nullopt;
           std::optional<mlir::Value> arg = singlePosArg(call);
@@ -256,7 +264,7 @@ private:
           frame.ints[call.getResult(0)] = *result;
           continue;
         }
-        if (mlir::isa<FuncObjectOp, TupleCreateOp, TupleEmptyOp>(op))
+        if (mlir::isa<CallableObjectOp, TupleCreateOp, TupleEmptyOp>(op))
           continue;
         if (auto cond = mlir::dyn_cast<mlir::cf::CondBranchOp>(op)) {
           auto condition = frame.boolValue(cond.getCondition());
@@ -308,15 +316,18 @@ private:
     return true;
   }
 
-  FuncOp func;
+  static constexpr unsigned kMaxEvalDepth = 1024;
+
+  CallableFuncOp func;
   unsigned bits;
+  unsigned depth = 0;
   llvm::DenseMap<int64_t, int64_t> memo;
   llvm::DenseSet<int64_t> active;
 };
 
 class HelperBuilder {
 public:
-  HelperBuilder(FuncOp source, mlir::func::FuncOp helper, unsigned bits)
+  HelperBuilder(CallableFuncOp source, mlir::func::FuncOp helper, unsigned bits)
       : source(source), helper(helper), bits(bits) {}
 
   bool build() {
@@ -450,9 +461,9 @@ private:
         tupleMap[tuple.getResult()] = {};
         continue;
       }
-      if (mlir::isa<FuncObjectOp>(op))
+      if (mlir::isa<CallableObjectOp>(op))
         continue;
-      if (auto call = mlir::dyn_cast<CallVectorOp>(op)) {
+      if (auto call = mlir::dyn_cast<CallOp>(op)) {
         if (directTarget(call, call.getCallable()) != source)
           return false;
         auto args = mappedTuple(call.getPosargs());
@@ -499,7 +510,7 @@ private:
     return true;
   }
 
-  FuncOp source;
+  CallableFuncOp source;
   mlir::func::FuncOp helper;
   unsigned bits;
   llvm::DenseMap<mlir::Block *, mlir::Block *> blockMap;
@@ -507,11 +518,11 @@ private:
   llvm::DenseMap<mlir::Value, llvm::SmallVector<mlir::Value, 4>> tupleMap;
 };
 
-std::string helperName(FuncOp func, unsigned bits) {
+std::string helperName(CallableFuncOp func, unsigned bits) {
   return (func.getSymName() + "$int_i" + llvm::Twine(bits)).str();
 }
 
-mlir::func::FuncOp getOrCreateHelper(FuncOp func, mlir::ModuleOp module,
+mlir::func::FuncOp getOrCreateHelper(CallableFuncOp func, mlir::ModuleOp module,
                                      unsigned bits) {
   std::string name = helperName(func, bits);
   if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(name))
@@ -552,7 +563,7 @@ void eraseDeadStaticCallTree(mlir::Value value) {
       tuple.erase();
     return;
   }
-  if (auto func = value.getDefiningOp<FuncObjectOp>()) {
+  if (auto func = value.getDefiningOp<CallableObjectOp>()) {
     if (func->use_empty())
       func.erase();
     return;
@@ -562,7 +573,7 @@ void eraseDeadStaticCallTree(mlir::Value value) {
       constant.erase();
 }
 
-void rewriteCall(CallVectorOp call, mlir::func::FuncOp helper) {
+void rewriteCall(CallOp call, mlir::func::FuncOp helper) {
   std::optional<mlir::Value> arg = singlePosArg(call);
   if (!arg)
     return;
@@ -593,13 +604,13 @@ void rewriteCall(CallVectorOp call, mlir::func::FuncOp helper) {
 } // namespace
 
 void int_fastpath::specialize(mlir::ModuleOp module) {
-  llvm::SmallVector<CallVectorOp> calls;
-  module.walk([&](CallVectorOp call) { calls.push_back(call); });
+  llvm::SmallVector<CallOp> calls;
+  module.walk([&](CallOp call) { calls.push_back(call); });
 
-  llvm::DenseMap<FuncOp, std::unique_ptr<IntEvaluator>> evaluators32;
-  llvm::DenseMap<FuncOp, std::unique_ptr<IntEvaluator>> evaluators64;
-  for (CallVectorOp call : calls) {
-    FuncOp func = directTarget(call, call.getCallable());
+  llvm::DenseMap<CallableFuncOp, std::unique_ptr<IntEvaluator>> evaluators32;
+  llvm::DenseMap<CallableFuncOp, std::unique_ptr<IntEvaluator>> evaluators64;
+  for (CallOp call : calls) {
+    CallableFuncOp func = directTarget(call, call.getCallable());
     if (!func || !isIntUnarySignature(func))
       continue;
     std::optional<mlir::Value> arg = singlePosArg(call);

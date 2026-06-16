@@ -1,6 +1,6 @@
 #pragma once
 
-#include "lython/emitter/Emitter.h"
+#include "Emitter.h"
 
 #include <memory>
 

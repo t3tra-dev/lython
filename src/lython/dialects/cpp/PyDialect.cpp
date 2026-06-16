@@ -21,10 +21,10 @@
 namespace py {
 
 void PyDialect::initialize() {
-  addTypes<IntType, FloatType, BoolType, StrType, NoneType, TupleType, DictType,
-           ListType, ClassType, ExceptionType, ExceptionCellType, TracebackType,
-           LocationType, FuncSignatureType, FuncType, PrimFuncType,
-           CoroutineType, TaskType, FutureType>();
+  addTypes<IntType, FloatType, BoolType, StrType, NoneType, ObjectType,
+           TupleType, DictType, ListType, ClassType, TypeType, ProtocolType,
+           ExceptionType, ExceptionCellType, TracebackType, LocationType,
+           CallableType, UnionType, SelfType>();
 
   addOperations<
 #define GET_OP_LIST
@@ -53,6 +53,181 @@ mlir::Type PyDialect::parseType(mlir::DialectAsmParser &parser) const {
     } while (mlir::succeeded(parser.parseOptionalComma()));
     return parser.parseRSquare();
   };
+  auto parseStringArray =
+      [&](llvm::SmallVectorImpl<mlir::StringAttr> &out) -> mlir::LogicalResult {
+    mlir::ArrayAttr arrayAttr;
+    if (parser.parseAttribute(arrayAttr))
+      return mlir::failure();
+    for (mlir::Attribute element : arrayAttr) {
+      auto stringAttr = mlir::dyn_cast<mlir::StringAttr>(element);
+      if (!stringAttr) {
+        parser.emitError(parser.getCurrentLocation(),
+                         "expected string elements in Callable metadata");
+        return mlir::failure();
+      }
+      out.push_back(stringAttr);
+    }
+    return mlir::success();
+  };
+  auto parseBoolArray =
+      [&](llvm::SmallVectorImpl<mlir::BoolAttr> &out) -> mlir::LogicalResult {
+    mlir::ArrayAttr arrayAttr;
+    if (parser.parseAttribute(arrayAttr))
+      return mlir::failure();
+    for (mlir::Attribute element : arrayAttr) {
+      auto boolAttr = mlir::dyn_cast<mlir::BoolAttr>(element);
+      if (!boolAttr) {
+        parser.emitError(parser.getCurrentLocation(),
+                         "expected bool elements in Callable metadata");
+        return mlir::failure();
+      }
+      out.push_back(boolAttr);
+    }
+    return mlir::success();
+  };
+  auto parseCallableType = [&]() -> mlir::Type {
+    llvm::SmallVector<mlir::Type, 4> positionalTypes;
+    llvm::SmallVector<mlir::Type, 4> kwonlyTypes;
+    llvm::SmallVector<mlir::Type, 4> resultTypes;
+    llvm::SmallVector<mlir::StringAttr, 4> positionalNames;
+    llvm::SmallVector<mlir::StringAttr, 4> kwOnlyNames;
+    llvm::SmallVector<mlir::BoolAttr, 4> positionalDefaults;
+    llvm::SmallVector<mlir::BoolAttr, 4> kwOnlyDefaults;
+    mlir::Type varargType;
+    mlir::Type kwargsType;
+    mlir::StringAttr varargName;
+    mlir::StringAttr kwargsName;
+    uint64_t positionalOnlyCount = 0;
+    bool varargSeen = false;
+    bool kwonlySeen = false;
+    bool kwargsSeen = false;
+    bool posonlySeen = false;
+    bool argNamesSeen = false;
+    bool kwNamesSeen = false;
+    bool argDefaultsSeen = false;
+    bool kwDefaultsSeen = false;
+    bool varargNameSeen = false;
+    bool kwargsNameSeen = false;
+
+    if (mlir::failed(parseTypeList(positionalTypes)))
+      return mlir::Type();
+
+    while (mlir::succeeded(parser.parseOptionalComma())) {
+      llvm::StringRef section;
+      if (parser.parseKeyword(&section))
+        return mlir::Type();
+      if (section == "vararg") {
+        if (varargSeen || parser.parseEqual() || parser.parseType(varargType))
+          return mlir::Type();
+        varargSeen = true;
+        continue;
+      }
+      if (section == "posonly") {
+        if (posonlySeen || parser.parseEqual() ||
+            parser.parseInteger(positionalOnlyCount))
+          return mlir::Type();
+        posonlySeen = true;
+        continue;
+      }
+      if (section == "kwonly") {
+        if (kwonlySeen || parser.parseEqual() ||
+            mlir::failed(parseTypeList(kwonlyTypes)))
+          return mlir::Type();
+        kwonlySeen = true;
+        continue;
+      }
+      if (section == "kwargs") {
+        if (kwargsSeen || parser.parseEqual() || parser.parseType(kwargsType))
+          return mlir::Type();
+        kwargsSeen = true;
+        continue;
+      }
+      if (section == "arg_names") {
+        if (argNamesSeen || parser.parseEqual() ||
+            mlir::failed(parseStringArray(positionalNames)))
+          return mlir::Type();
+        argNamesSeen = true;
+        continue;
+      }
+      if (section == "kw_names") {
+        if (kwNamesSeen || parser.parseEqual() ||
+            mlir::failed(parseStringArray(kwOnlyNames)))
+          return mlir::Type();
+        kwNamesSeen = true;
+        continue;
+      }
+      if (section == "arg_defaults") {
+        if (argDefaultsSeen || parser.parseEqual() ||
+            mlir::failed(parseBoolArray(positionalDefaults)))
+          return mlir::Type();
+        argDefaultsSeen = true;
+        continue;
+      }
+      if (section == "kw_defaults") {
+        if (kwDefaultsSeen || parser.parseEqual() ||
+            mlir::failed(parseBoolArray(kwOnlyDefaults)))
+          return mlir::Type();
+        kwDefaultsSeen = true;
+        continue;
+      }
+      if (section == "vararg_name") {
+        if (varargNameSeen || parser.parseEqual() ||
+            parser.parseAttribute(varargName))
+          return mlir::Type();
+        varargNameSeen = true;
+        continue;
+      }
+      if (section == "kwargs_name") {
+        if (kwargsNameSeen || parser.parseEqual() ||
+            parser.parseAttribute(kwargsName))
+          return mlir::Type();
+        kwargsNameSeen = true;
+        continue;
+      }
+      parser.emitError(parser.getCurrentLocation(),
+                       "unexpected token '" + section +
+                           "' in Callable contract declaration");
+      return mlir::Type();
+    }
+
+    if (parser.parseArrow())
+      return mlir::Type();
+    if (mlir::failed(parseTypeList(resultTypes)))
+      return mlir::Type();
+
+    auto wrongSize = [&](llvm::StringRef name, std::size_t got,
+                         std::size_t expected) {
+      parser.emitError(parser.getCurrentLocation(),
+                       "Callable metadata '" + name + "' has " +
+                           std::to_string(got) + " entries but expected " +
+                           std::to_string(expected));
+      return mlir::Type();
+    };
+    if (!positionalNames.empty() &&
+        positionalNames.size() != positionalTypes.size())
+      return wrongSize("arg_names", positionalNames.size(),
+                       positionalTypes.size());
+    if (!positionalDefaults.empty() &&
+        positionalDefaults.size() != positionalTypes.size())
+      return wrongSize("arg_defaults", positionalDefaults.size(),
+                       positionalTypes.size());
+    if (!kwOnlyNames.empty() && kwOnlyNames.size() != kwonlyTypes.size())
+      return wrongSize("kw_names", kwOnlyNames.size(), kwonlyTypes.size());
+    if (!kwOnlyDefaults.empty() && kwOnlyDefaults.size() != kwonlyTypes.size())
+      return wrongSize("kw_defaults", kwOnlyDefaults.size(),
+                       kwonlyTypes.size());
+    if (varargName && !varargType)
+      return wrongSize("vararg_name", 1, 0);
+    if (kwargsName && !kwargsType)
+      return wrongSize("kwargs_name", 1, 0);
+    if (positionalOnlyCount > positionalTypes.size())
+      return wrongSize("posonly", positionalOnlyCount, positionalTypes.size());
+
+    return CallableType::get(
+        ctx, positionalTypes, kwonlyTypes, varargType, kwargsType, resultTypes,
+        positionalNames, kwOnlyNames, positionalDefaults, kwOnlyDefaults,
+        varargName, kwargsName, static_cast<unsigned>(positionalOnlyCount));
+  };
 
   if (keyword == "int")
     return IntType::get(ctx);
@@ -64,6 +239,10 @@ mlir::Type PyDialect::parseType(mlir::DialectAsmParser &parser) const {
     return StrType::get(ctx);
   if (keyword == "none")
     return NoneType::get(ctx);
+  if (keyword == "object")
+    return ObjectType::get(ctx);
+  if (keyword == "self")
+    return SelfType::get(ctx);
   if (keyword == "tuple") {
     if (parser.parseLess())
       return mlir::Type();
@@ -97,29 +276,30 @@ mlir::Type PyDialect::parseType(mlir::DialectAsmParser &parser) const {
       return mlir::Type();
     return ListType::get(ctx, elementType);
   }
-  if (keyword == "coro") {
+  if (keyword == "union") {
     if (parser.parseLess())
       return mlir::Type();
-    mlir::Type resultType;
-    if (parser.parseType(resultType) || parser.parseGreater())
+    llvm::SmallVector<mlir::Type> memberTypes;
+    do {
+      mlir::Type member;
+      if (parser.parseType(member))
+        return mlir::Type();
+      memberTypes.push_back(member);
+    } while (mlir::succeeded(parser.parseOptionalComma()));
+    if (parser.parseGreater())
       return mlir::Type();
-    return CoroutineType::get(ctx, resultType);
-  }
-  if (keyword == "task") {
-    if (parser.parseLess())
+    if (memberTypes.size() < 2) {
+      parser.emitError(parser.getCurrentLocation(),
+                       "py.union requires at least two member types");
       return mlir::Type();
-    mlir::Type resultType;
-    if (parser.parseType(resultType) || parser.parseGreater())
+    }
+    mlir::Type normalized = UnionType::getNormalized(ctx, memberTypes);
+    if (!normalized || !mlir::isa<UnionType>(normalized)) {
+      parser.emitError(parser.getCurrentLocation(),
+                       "py.union requires at least two distinct member types");
       return mlir::Type();
-    return TaskType::get(ctx, resultType);
-  }
-  if (keyword == "future") {
-    if (parser.parseLess())
-      return mlir::Type();
-    mlir::Type resultType;
-    if (parser.parseType(resultType) || parser.parseGreater())
-      return mlir::Type();
-    return FutureType::get(ctx, resultType);
+    }
+    return normalized;
   }
   if (keyword == "class") {
     if (parser.parseLess())
@@ -129,6 +309,31 @@ mlir::Type PyDialect::parseType(mlir::DialectAsmParser &parser) const {
       return mlir::Type();
     return ClassType::get(ctx, classNameAttr.getValue());
   }
+  if (keyword == "type") {
+    if (parser.parseLess())
+      return mlir::Type();
+    mlir::Type instanceType;
+    if (parser.parseType(instanceType) || parser.parseGreater())
+      return mlir::Type();
+    return TypeType::get(ctx, instanceType);
+  }
+  if (keyword == "protocol") {
+    if (parser.parseLess())
+      return mlir::Type();
+    mlir::StringAttr protocolNameAttr;
+    llvm::SmallVector<mlir::Type> arguments;
+    if (parser.parseAttribute(protocolNameAttr) || parser.parseComma())
+      return mlir::Type();
+    if (protocolNameAttr.getValue() == "Callable") {
+      mlir::Type callable = parseCallableType();
+      if (!callable || parser.parseGreater())
+        return mlir::Type();
+      return callable;
+    }
+    if (mlir::failed(parseTypeList(arguments)) || parser.parseGreater())
+      return mlir::Type();
+    return ProtocolType::get(ctx, protocolNameAttr.getValue(), arguments);
+  }
   if (keyword == "exception")
     return ExceptionType::get(ctx);
   if (keyword == "exception_cell")
@@ -137,87 +342,6 @@ mlir::Type PyDialect::parseType(mlir::DialectAsmParser &parser) const {
     return TracebackType::get(ctx);
   if (keyword == "location")
     return LocationType::get(ctx);
-  if (keyword == "func") {
-    if (parser.parseLess())
-      return mlir::Type();
-    mlir::Type signatureType;
-    if (parser.parseType(signatureType) || parser.parseGreater())
-      return mlir::Type();
-    auto signature = mlir::dyn_cast<FuncSignatureType>(signatureType);
-    if (!signature) {
-      parser.emitError(parser.getCurrentLocation(),
-                       "expected FuncSignatureType after 'func<'");
-      return mlir::Type();
-    }
-    return FuncType::get(ctx, signature);
-  }
-  if (keyword == "funcsig") {
-    if (parser.parseLess())
-      return mlir::Type();
-    llvm::SmallVector<mlir::Type, 4> positionalTypes;
-    llvm::SmallVector<mlir::Type, 4> kwonlyTypes;
-    llvm::SmallVector<mlir::Type, 4> resultTypes;
-    mlir::Type varargType;
-    mlir::Type kwargsType;
-    bool varargSeen = false;
-    bool kwonlySeen = false;
-    bool kwargsSeen = false;
-
-    if (mlir::failed(parseTypeList(positionalTypes)))
-      return mlir::Type();
-
-    while (mlir::succeeded(parser.parseOptionalComma())) {
-      llvm::StringRef section;
-      if (parser.parseKeyword(&section))
-        return mlir::Type();
-      if (section == "vararg") {
-        if (varargSeen || parser.parseEqual() || parser.parseType(varargType))
-          return mlir::Type();
-        varargSeen = true;
-        continue;
-      }
-      if (section == "kwonly") {
-        if (kwonlySeen || parser.parseEqual() ||
-            mlir::failed(parseTypeList(kwonlyTypes)))
-          return mlir::Type();
-        kwonlySeen = true;
-        continue;
-      }
-      if (section == "kwargs") {
-        if (kwargsSeen || parser.parseEqual() || parser.parseType(kwargsType))
-          return mlir::Type();
-        kwargsSeen = true;
-        continue;
-      }
-      parser.emitError(parser.getCurrentLocation(),
-                       "unexpected token '" + section +
-                           "' in funcsig type declaration");
-      return mlir::Type();
-    }
-
-    if (parser.parseArrow())
-      return mlir::Type();
-    if (mlir::failed(parseTypeList(resultTypes)) || parser.parseGreater())
-      return mlir::Type();
-
-    return FuncSignatureType::get(ctx, positionalTypes, kwonlyTypes, varargType,
-                                  kwargsType, resultTypes);
-  }
-  if (keyword == "prim.func") {
-    if (parser.parseLess())
-      return mlir::Type();
-    mlir::Type signatureType;
-    if (parser.parseType(signatureType) || parser.parseGreater())
-      return mlir::Type();
-    auto signature = mlir::dyn_cast<mlir::FunctionType>(signatureType);
-    if (!signature) {
-      parser.emitError(parser.getCurrentLocation(),
-                       "expected FunctionType after 'prim.func<'");
-      return mlir::Type();
-    }
-    return PrimFuncType::get(ctx, signature);
-  }
-
   parser.emitError(parser.getCurrentLocation(), "unknown py dialect type '")
       << keyword << "'";
   return mlir::Type();
@@ -231,6 +355,15 @@ void PyDialect::printType(mlir::Type type,
                           [&](mlir::Type element) { printer << element; });
     printer << "]";
   };
+  auto printAttrList = [&](auto attrs) {
+    printer << "[";
+    for (std::size_t index = 0; index < attrs.size(); ++index) {
+      if (index != 0)
+        printer << ", ";
+      printer << attrs[index];
+    }
+    printer << "]";
+  };
 
   llvm::TypeSwitch<mlir::Type>(type)
       .Case<IntType>([&](IntType) { printer << "int"; })
@@ -238,6 +371,8 @@ void PyDialect::printType(mlir::Type type,
       .Case<BoolType>([&](BoolType) { printer << "bool"; })
       .Case<StrType>([&](StrType) { printer << "str"; })
       .Case<NoneType>([&](NoneType) { printer << "none"; })
+      .Case<ObjectType>([&](ObjectType) { printer << "object"; })
+      .Case<SelfType>([&](SelfType) { printer << "self"; })
       .Case<TupleType>([&](TupleType tupleTy) {
         printer << "tuple<";
         auto elements = tupleTy.getElementTypes();
@@ -252,26 +387,28 @@ void PyDialect::printType(mlir::Type type,
       .Case<ListType>([&](ListType listTy) {
         printer << "list<" << listTy.getElementType() << ">";
       })
-      .Case<CoroutineType>([&](CoroutineType coroTy) {
-        printer << "coro<" << coroTy.getResultType() << ">";
-      })
-      .Case<TaskType>([&](TaskType taskTy) {
-        printer << "task<" << taskTy.getResultType() << ">";
-      })
-      .Case<FutureType>([&](FutureType futureTy) {
-        printer << "future<" << futureTy.getResultType() << ">";
+      .Case<UnionType>([&](UnionType unionTy) {
+        printer << "union<";
+        llvm::interleaveComma(unionTy.getMemberTypes(), printer,
+                              [&](mlir::Type member) { printer << member; });
+        printer << ">";
       })
       .Case<ClassType>([&](ClassType classTy) {
         printer << "class<\"" << classTy.getClassName() << "\">";
       })
-      .Case<ExceptionType>([&](ExceptionType) { printer << "exception"; })
-      .Case<ExceptionCellType>(
-          [&](ExceptionCellType) { printer << "exception_cell"; })
-      .Case<TracebackType>([&](TracebackType) { printer << "traceback"; })
-      .Case<LocationType>([&](LocationType) { printer << "location"; })
-      .Case<FuncSignatureType>([&](FuncSignatureType sigTy) {
-        printer << "funcsig<";
+      .Case<TypeType>([&](TypeType typeTy) {
+        printer << "type<" << typeTy.getInstanceType() << ">";
+      })
+      .Case<ProtocolType>([&](ProtocolType protocolTy) {
+        printer << "protocol<\"" << protocolTy.getProtocolName() << "\", ";
+        printTypeList(protocolTy.getArguments());
+        printer << ">";
+      })
+      .Case<CallableType>([&](CallableType sigTy) {
+        printer << "protocol<\"Callable\", ";
         printTypeList(sigTy.getPositionalTypes());
+        if (sigTy.getPositionalOnlyCount() != 0)
+          printer << ", posonly = " << sigTy.getPositionalOnlyCount();
         if (sigTy.hasVararg()) {
           printer << ", vararg = " << sigTy.getVarargType();
         }
@@ -282,18 +419,65 @@ void PyDialect::printType(mlir::Type type,
         if (sigTy.hasKwarg()) {
           printer << ", kwargs = " << sigTy.getKwargType();
         }
+        if (!sigTy.getPositionalNames().empty()) {
+          printer << ", arg_names = ";
+          printAttrList(sigTy.getPositionalNames());
+        }
+        if (!sigTy.getPositionalDefaults().empty()) {
+          printer << ", arg_defaults = ";
+          printAttrList(sigTy.getPositionalDefaults());
+        }
+        if (!sigTy.getKwOnlyNames().empty()) {
+          printer << ", kw_names = ";
+          printAttrList(sigTy.getKwOnlyNames());
+        }
+        if (!sigTy.getKwOnlyDefaults().empty()) {
+          printer << ", kw_defaults = ";
+          printAttrList(sigTy.getKwOnlyDefaults());
+        }
+        if (sigTy.getVarargName())
+          printer << ", vararg_name = " << sigTy.getVarargName();
+        if (sigTy.getKwargName())
+          printer << ", kwargs_name = " << sigTy.getKwargName();
         printer << " -> ";
         printTypeList(sigTy.getResultTypes());
         printer << ">";
       })
-      .Case<FuncType>([&](FuncType funcTy) {
-        printer << "func<" << funcTy.getSignature() << ">";
-      })
-      .Case<PrimFuncType>([&](PrimFuncType primTy) {
-        printer << "prim.func<" << primTy.getSignature() << ">";
-      })
+      .Case<ExceptionType>([&](ExceptionType) { printer << "exception"; })
+      .Case<ExceptionCellType>(
+          [&](ExceptionCellType) { printer << "exception_cell"; })
+      .Case<TracebackType>([&](TracebackType) { printer << "traceback"; })
+      .Case<LocationType>([&](LocationType) { printer << "location"; })
       .Default(
           [&](mlir::Type) { llvm_unreachable("unknown py type to print"); });
+}
+
+mlir::ParseResult ClassOp::parse(mlir::OpAsmParser &parser,
+                                 mlir::OperationState &state) {
+  mlir::StringAttr nameAttr;
+  if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(),
+                             state.attributes))
+    return mlir::failure();
+  if (parser.parseOptionalAttrDictWithKeyword(state.attributes))
+    return mlir::failure();
+  mlir::Region *body = state.addRegion();
+  if (parser.parseRegion(*body))
+    return mlir::failure();
+  // `{}` parses as an empty region; materialize the block the SymbolTable
+  // trait requires so declaration-only classes stay writable by hand.
+  if (body->empty())
+    body->emplaceBlock();
+  return mlir::success();
+}
+
+void ClassOp::print(mlir::OpAsmPrinter &printer) {
+  printer << ' ';
+  printer.printSymbolName(getSymName());
+  printer.printOptionalAttrDictWithKeyword(
+      (*this)->getAttrs(), {mlir::SymbolTable::getSymbolAttrName()});
+  printer << ' ';
+  printer.printRegion(getBody(), /*printEntryBlockArgs=*/false,
+                      /*printBlockTerminators=*/true);
 }
 
 } // namespace py

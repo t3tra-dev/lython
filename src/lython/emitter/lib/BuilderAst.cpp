@@ -161,4 +161,34 @@ std::optional<int> singletonKey(const parser::Node &node) {
   return std::nullopt;
 }
 
+bool referencesName(const parser::Node &node, llvm::StringRef name) {
+  if (node.kind == "Name") {
+    const std::string *id = stringField(node, "id");
+    if (id && *id == name)
+      return true;
+  }
+  for (const parser::Field &field : node.fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (*child && referencesName(**child, name))
+        return true;
+      continue;
+    }
+    if (const auto *children =
+            std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
+      for (const parser::NodePtr &item : *children)
+        if (item && referencesName(*item, name))
+          return true;
+    }
+  }
+  return false;
+}
+
+bool referencesName(const std::vector<parser::NodePtr> &statements,
+                    llvm::StringRef name) {
+  for (const parser::NodePtr &statement : statements)
+    if (statement && referencesName(*statement, name))
+      return true;
+  return false;
+}
+
 } // namespace lython::emitter

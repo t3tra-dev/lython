@@ -25,12 +25,20 @@ struct Term {
   std::string name;
   std::vector<Term> args;
   std::vector<Term> kwonly;
+  std::vector<Term> vararg;
+  std::vector<Term> kwarg;
   std::vector<Term> results;
+  std::optional<unsigned> positionalOnlyCount;
 
   static Term var(std::uint64_t id, llvm::StringRef name = {});
   static Term con(llvm::StringRef name, llvm::ArrayRef<Term> args = {});
   static Term func(llvm::ArrayRef<Term> args, llvm::ArrayRef<Term> results,
-                   llvm::ArrayRef<Term> kwonly = {});
+                   llvm::ArrayRef<Term> kwonly = {},
+                   std::optional<unsigned> positionalOnlyCount = std::nullopt);
+  static Term func(llvm::ArrayRef<Term> args, llvm::ArrayRef<Term> results,
+                   llvm::ArrayRef<Term> kwonly, llvm::ArrayRef<Term> vararg,
+                   llvm::ArrayRef<Term> kwarg,
+                   std::optional<unsigned> positionalOnlyCount = std::nullopt);
 
   std::string display() const;
 };

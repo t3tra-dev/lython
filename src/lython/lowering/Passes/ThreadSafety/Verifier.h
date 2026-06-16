@@ -69,8 +69,6 @@ bool descriptorAllocated(mlir::Value pointer);
 bool entryArgRoot(mlir::Value value);
 bool asyncExceptionCell(mlir::Value value);
 bool asyncExceptionCellAllocated(mlir::Value value);
-bool asyncCancelFlag(mlir::Value value);
-bool asyncCancelFlag(mlir::Operation *op, mlir::Value value);
 } // namespace provenance
 
 namespace pointer {

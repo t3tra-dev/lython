@@ -9,7 +9,7 @@ namespace {
 mlir::Value tupleDropValue(mlir::Value element) { return element; }
 
 bool isPureConstantRoot(mlir::Operation *op) {
-  return mlir::isa_and_nonnull<NoneOp, FuncObjectOp, TupleEmptyOp,
+  return mlir::isa_and_nonnull<NoneOp, CallableObjectOp, TupleEmptyOp,
                                StrConstantOp, IntConstantOp, FloatConstantOp>(
       op);
 }
@@ -66,8 +66,6 @@ bool container::cleanupDead(mlir::ModuleOp module) {
         toErase.push_back(tupleOp);
       }
     } else if (auto tupleCreate = mlir::dyn_cast<TupleCreateOp>(tupleOp)) {
-      if (tupleCreate->hasAttr("ly.async.gather_tuple"))
-        return;
       mlir::Value result = tupleCreate->getResult(0);
       llvm::SmallVector<mlir::Operation *> decrefsToErase;
       bool canErase = true;
@@ -125,7 +123,7 @@ bool container::cleanupDead(mlir::ModuleOp module) {
         if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(root)) {
           auto *owner = arg.getOwner();
           auto *parent = owner ? owner->getParentOp() : nullptr;
-          if (auto pyFunc = mlir::dyn_cast_or_null<FuncOp>(parent))
+          if (auto pyFunc = mlir::dyn_cast_or_null<CallableFuncOp>(parent))
             if (owner == &pyFunc.getBody().front())
               continue;
           if (auto loweredFunc =

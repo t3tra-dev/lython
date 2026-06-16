@@ -1,7 +1,6 @@
 #include "Common/ClassLayout.h"
 #include "Common/Container.h"
 #include "Common/LoweringUtils.h"
-#include "Common/Object.h"
 #include "Common/RuntimeSupport.h"
 #include "Common/SlotUtils.h"
 #include "PyValue/ClassHelpers.h"
@@ -10,8 +9,6 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Interfaces/FunctionInterfaces.h"
-
 #define GET_OP_CLASSES
 #include "PyOps.h.inc"
 #undef GET_OP_CLASSES
@@ -26,6 +23,34 @@ enum class StorageKind {
   Unsupported,
   TypedMemRefSlots,
 };
+
+bool exactScalarEqualityLoweringSupported(mlir::Type lhs, mlir::Type rhs) {
+  if (lhs != rhs)
+    return false;
+  return mlir::isa<IntType, FloatType, BoolType, StrType>(lhs);
+}
+
+bool exactScalarEqualityAlwaysFalse(mlir::Type lhs, mlir::Type rhs) {
+  if (lhs == rhs)
+    return false;
+  auto isNumeric = [](mlir::Type type) {
+    return mlir::isa<IntType, FloatType, BoolType>(type);
+  };
+  auto isExactScalar = [&](mlir::Type type) {
+    return isNumeric(type) || mlir::isa<StrType, NoneType>(type);
+  };
+  if (!isExactScalar(lhs) || !isExactScalar(rhs))
+    return false;
+  return !(isNumeric(lhs) && isNumeric(rhs));
+}
+
+CallableType unaryMethodContract(mlir::MLIRContext *ctx,
+                                 mlir::Type receiverType,
+                                 mlir::Type argumentType,
+                                 mlir::Type resultType) {
+  return CallableType::get(ctx, {receiverType, argumentType}, {}, {}, {},
+                           {resultType});
+}
 
 namespace lowering::value::list::Storage {
 
@@ -134,6 +159,7 @@ mlir::LogicalResult copyIntoParts(mlir::Location loc, mlir::ModuleOp module,
 
 struct LocalCopySlot {
   mlir::Value header;
+  mlir::Value payloadTable;
   llvm::SmallVector<mlir::Value, 8> payloadParts;
   mlir::Value view;
 };
@@ -155,7 +181,8 @@ localCopySlot(mlir::Location loc, mlir::ModuleOp module, ClassType classType,
                                         /*transferToSlot=*/false);
   if (mlir::failed(parts))
     return mlir::failure();
-  return LocalCopySlot{parts->header, parts->payloadParts, view};
+  return LocalCopySlot{parts->header, parts->payloadTable, parts->payloadParts,
+                       view};
 }
 
 void refcount(mlir::Location loc, mlir::ModuleOp module, ClassType classType,
@@ -246,7 +273,9 @@ bool safeUseBeforeAppend(mlir::Operation *user, ListAppendOp append) {
     return false;
   if (!user->isBeforeInBlock(append.getOperation()))
     return true;
-  return mlir::isa<ListAppendOp, ListGetOp, ListRemoveOp>(user);
+  if (auto getItem = mlir::dyn_cast<GetItemOp>(user))
+    return getItem.getContainer() == append.getList();
+  return mlir::isa<ListAppendOp, ListRemoveOp>(user);
 }
 
 bool freshBeforeEscape(ListAppendOp append) {
@@ -751,20 +780,87 @@ struct ListRemoveLowering : public mlir::OpConversionPattern<ListRemoveOp> {
   }
 };
 
-struct ListGetLowering : public mlir::OpConversionPattern<ListGetOp> {
-  using mlir::OpConversionPattern<ListGetOp>::OpConversionPattern;
+struct ListContainsLowering : public mlir::OpConversionPattern<ContainsOp> {
+  using mlir::OpConversionPattern<ContainsOp>::OpConversionPattern;
 
   mlir::LogicalResult
-  matchAndRewrite(ListGetOp op, OneToNOpAdaptor adaptor,
+  matchAndRewrite(ContainsOp op, OneToNOpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    (void)adaptor;
+    auto listType = mlir::dyn_cast<ListType>(op.getContainer().getType());
+    if (!listType)
+      return mlir::failure();
+    mlir::Type elementType = listType.getElementType();
+    mlir::Type itemType = op.getItem().getType();
+    if (!exactScalarEqualityLoweringSupported(itemType, elementType)) {
+      if (exactScalarEqualityAlwaysFalse(itemType, elementType)) {
+        auto falseValue = rewriter.create<mlir::arith::ConstantIntOp>(
+            op.getLoc(), false, rewriter.getI1Type());
+        rewriter.replaceOp(op, falseValue);
+        return mlir::success();
+      }
+      return op.emitOpError("list contains equality lowering is not "
+                            "implemented for item type ")
+             << itemType << " and element type " << elementType;
+    }
+
+    mlir::MLIRContext *ctx = rewriter.getContext();
+    mlir::Type intType = IntType::get(ctx);
+    CallableType lenContract = CallableType::get(
+        ctx, {op.getContainer().getType()}, {}, {}, {}, {intType});
+    auto length = rewriter.create<LenOp>(op.getLoc(), intType, lenContract,
+                                         op.getContainer());
+    auto stopI64 = rewriter.create<CastToPrimOp>(
+        op.getLoc(), rewriter.getI64Type(), length, "exact");
+    mlir::Value lower = createIndexConstant(op.getLoc(), rewriter, 0);
+    mlir::Value upper = rewriter.create<mlir::arith::IndexCastOp>(
+        op.getLoc(), rewriter.getIndexType(), stopI64);
+    mlir::Value step = createIndexConstant(op.getLoc(), rewriter, 1);
+    mlir::Value foundInit = rewriter.create<mlir::arith::ConstantIntOp>(
+        op.getLoc(), false, rewriter.getI1Type());
+
+    auto loop = rewriter.create<mlir::scf::ForOp>(
+        op.getLoc(), lower, upper, step, mlir::ValueRange{foundInit});
+    {
+      mlir::OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(loop.getBody());
+      mlir::Value iv = loop.getInductionVar();
+      mlir::Value ivI64 = rewriter.create<mlir::arith::IndexCastOp>(
+          op.getLoc(), rewriter.getI64Type(), iv);
+      CallableType getitemContract = unaryMethodContract(
+          rewriter.getContext(), op.getContainer().getType(), ivI64.getType(),
+          elementType);
+      mlir::Value element = rewriter.create<GetItemOp>(
+          op.getLoc(), elementType, getitemContract, op.getContainer(), ivI64);
+      mlir::Value equals = rewriter.create<EqOp>(
+          op.getLoc(), BoolType::get(rewriter.getContext()), op.getItem(),
+          element);
+      mlir::Value equalsBit = rewriter.create<CastToPrimOp>(
+          op.getLoc(), rewriter.getI1Type(), equals, "exact");
+      mlir::Value next = rewriter.create<mlir::arith::OrIOp>(
+          op.getLoc(), loop.getRegionIterArgs()[0], equalsBit);
+      rewriter.create<mlir::scf::YieldOp>(op.getLoc(), next);
+    }
+
+    rewriter.replaceOp(op, loop.getResult(0));
+    return mlir::success();
+  }
+};
+
+struct ListGetItemLowering : public mlir::OpConversionPattern<GetItemOp> {
+  using mlir::OpConversionPattern<GetItemOp>::OpConversionPattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(GetItemOp op, OneToNOpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     mlir::ModuleOp module = op->getParentOfType<mlir::ModuleOp>();
     if (!module)
       return mlir::failure();
     auto *typeConverter =
         static_cast<const PyLLVMTypeConverter *>(getTypeConverter());
-    auto listType = mlir::dyn_cast<ListType>(op.getList().getType());
+    auto listType = mlir::dyn_cast<ListType>(op.getContainer().getType());
     if (listType && lowering::value::list::Storage::memref(listType)) {
-      mlir::ValueRange list = adaptor.getList();
+      mlir::ValueRange list = adaptor.getContainer();
       if (list.size() != 3)
         return mlir::failure();
       mlir::Value header = list[kListHeaderComponent];
@@ -793,8 +889,8 @@ struct ListGetLowering : public mlir::OpConversionPattern<ListGetOp> {
         if (mlir::failed(localCopy))
           return mlir::failure();
         inlineClassResult = *localCopy;
-        if (!inlineClassResult.header ||
-            inlineClassResult.payloadParts.empty() || !inlineClassResult.view)
+        if (!inlineClassResult.header || !inlineClassResult.payloadTable ||
+            !inlineClassResult.view)
           return mlir::failure();
       }
       auto emitLoadAndRetain =
@@ -805,10 +901,8 @@ struct ListGetLowering : public mlir::OpConversionPattern<ListGetOp> {
               op.getLoc(), items, index, inlineCarrierType, rewriter);
           if (!objectSlot)
             return mlir::failure();
-          llvm::SmallVector<mlir::Value, 8> destValues{
-              inlineClassResult.header};
-          destValues.append(inlineClassResult.payloadParts.begin(),
-                            inlineClassResult.payloadParts.end());
+          llvm::SmallVector<mlir::Value, 2> destValues{
+              inlineClassResult.header, inlineClassResult.payloadTable};
           if (mlir::failed(lowering::value::list::ClassSlot::copyIntoParts(
                   op.getLoc(), module, inlineClassType, inlineCarrierType,
                   mlir::ValueRange(destValues), mlir::ValueRange{objectSlot},
@@ -884,10 +978,8 @@ struct ListGetLowering : public mlir::OpConversionPattern<ListGetOp> {
         loaded = ifOp.getResult(0);
       }
       if (inlineClass) {
-        llvm::SmallVector<mlir::Value, 8> replacements{
-            inlineClassResult.header};
-        replacements.append(inlineClassResult.payloadParts.begin(),
-                            inlineClassResult.payloadParts.end());
+        llvm::SmallVector<mlir::Value, 2> replacements{
+            inlineClassResult.header, inlineClassResult.payloadTable};
         rewriter.replaceOpWithMultiple(op, llvm::ArrayRef<mlir::ValueRange>{
                                                mlir::ValueRange(replacements)});
         return mlir::success();
@@ -910,7 +1002,7 @@ void populate(PyLLVMTypeConverter &typeConverter,
               mlir::RewritePatternSet &patterns) {
   auto *ctx = patterns.getContext();
   patterns.add<ListNewLowering, ListAppendLowering, ListRemoveLowering,
-               ListGetLowering>(typeConverter, ctx);
+               ListContainsLowering, ListGetItemLowering>(typeConverter, ctx);
 }
 } // namespace lowering::value::list::Patterns
 

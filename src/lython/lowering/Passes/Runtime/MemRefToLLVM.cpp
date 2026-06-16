@@ -1,18 +1,15 @@
 #include "Passes/Runtime/MemRefToLLVM.h"
 
-#include "Common/Container.h"
 #include "Common/Object.h"
 #include "Common/RuntimeSupport.h"
 
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Conversion/MemRefToLLVM/AllocLikeConversion.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/FunctionCallUtils.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/IRMapping.h"
-#include "llvm/ADT/SmallVector.h"
 
 #include <optional>
 
@@ -58,8 +55,7 @@ void copyAsyncCellAttrs(mlir::Operation *from, mlir::Value to) {
   mlir::Operation *def = to ? to.getDefiningOp() : nullptr;
   if (!from || !def)
     return;
-  for (llvm::StringRef attrName :
-       {AsyncSafetyAttrs::kExceptionCell, AsyncSafetyAttrs::kCancelFlag})
+  for (llvm::StringRef attrName : {AsyncSafetyAttrs::kExceptionCell})
     if (from->hasAttr(attrName))
       def->setAttr(attrName, mlir::UnitAttr::get(def->getContext()));
 }
@@ -158,6 +154,21 @@ struct ContainerAccessLoadOpLowering
     markDescriptorData(dataPtr);
     if (op->hasAttr(AsyncSafetyAttrs::kExceptionCell))
       async_runtime::ExceptionCell::mark(dataPtr);
+    auto role =
+        op->getAttrOfType<mlir::StringAttr>(ThreadSafetyAttrs::kAtomicRole);
+    if (role && role.getValue() == ThreadSafetyAttrs::kRoleObjectRefcountLoad) {
+      // Refcount reads annotated at memref level (the immortal fast path in
+      // the runtime kernel) lower to an acquire atomic load carrying the
+      // same object-refcount provenance contract as the RMW initial load.
+      auto lowered = rewriter.replaceOpWithNewOp<mlir::LLVM::LoadOp>(
+          op, typeConverter->convertType(type.getElementType()), dataPtr,
+          /*alignment=*/8, /*isVolatile=*/false,
+          /*isNonTemporal=*/op.getNontemporal(), /*isInvariant=*/false,
+          /*isInvariantGroup=*/false, mlir::LLVM::AtomicOrdering::acquire);
+      copyDiscardableAttrs(op.getOperation(), lowered.getOperation());
+      sealObjectRefcountMemRefProvenance(lowered.getOperation(), rewriter);
+      return mlir::success();
+    }
     auto lowered = rewriter.replaceOpWithNewOp<mlir::LLVM::LoadOp>(
         op, typeConverter->convertType(type.getElementType()), dataPtr, 0,
         false, op.getNontemporal());
@@ -280,11 +291,6 @@ struct ContractAtomicRMWOpLowering
       async_runtime::ExceptionCell::mark(dataPtr);
       lowered->setAttr(AsyncSafetyAttrs::kExceptionCell,
                        mlir::UnitAttr::get(rewriter.getContext()));
-    }
-    if (role && role.getValue() == ThreadSafetyAttrs::kRoleAsyncCancelRequest) {
-      lowered->setAttr(AsyncSafetyAttrs::kCancelFlag,
-                       mlir::UnitAttr::get(rewriter.getContext()));
-      async_runtime::CancelFlag::mark(dataPtr);
     }
     return mlir::success();
   }
@@ -517,9 +523,8 @@ struct ContractDeallocOpLowering
                          .allocatedPtr(rewriter, op.getLoc());
     }
 
-    auto lowered =
-        rewriter.create<mlir::LLVM::CallOp>(op.getLoc(), freeFunc.value(),
-                                            mlir::ValueRange{allocatedPtr});
+    auto lowered = rewriter.create<mlir::LLVM::CallOp>(
+        op.getLoc(), freeFunc.value(), mlir::ValueRange{allocatedPtr});
     copyAttrs(op.getOperation(), lowered.getOperation());
     rewriter.eraseOp(op);
     return mlir::success();
@@ -537,8 +542,8 @@ void populate(PyLLVMTypeConverter &typeConverter,
   patterns.add<ContainerAccessLoadOpLowering, ContainerAccessStoreOpLowering,
                ContractAtomicRMWOpLowering, ContractGenericAtomicRMWOpLowering,
                ContractExtractAlignedPointerAsIndexLowering,
-               ContractReinterpretCastOpLowering>(
-      typeConverter, mlir::PatternBenefit(2));
+               ContractReinterpretCastOpLowering>(typeConverter,
+                                                  mlir::PatternBenefit(2));
   patterns.add<ContractDeallocOpLowering>(typeConverter,
                                           mlir::PatternBenefit(100));
 }

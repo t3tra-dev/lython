@@ -1,4 +1,4 @@
-#include "lython/parser/CpythonSpec.h"
+#include "CpythonSpec.h"
 
 #include <algorithm>
 #include <cctype>
@@ -17,8 +17,6 @@
 
 namespace lython::parser {
 namespace {
-
-#if defined(LYTHON_CPYTHON_SPEC_RUNTIME_FILE_IO)
 
 std::string trim(std::string text);
 
@@ -899,17 +897,15 @@ AstSchema collectAstSchema(const std::string &asdl,
   return spec;
 }
 
-#endif
-
-#if !defined(LYTHON_CPYTHON_SPEC_RUNTIME_FILE_IO)
+#if __has_include("CpythonSpecSnapshot.inc")
 #include "CpythonSpecSnapshot.inc"
 #endif
 
 CpythonSpec loadSpec() {
-#if defined(LYTHON_CPYTHON_SPEC_RUNTIME_FILE_IO)
-  return loadSpecFromVendoredFiles();
-#else
+#if __has_include("CpythonSpecSnapshot.inc")
   return loadGeneratedSpec();
+#else
+  return loadSpecFromVendoredFiles();
 #endif
 }
 

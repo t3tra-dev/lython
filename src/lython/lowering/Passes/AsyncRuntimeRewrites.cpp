@@ -24,8 +24,6 @@ namespace {
 
 constexpr llvm::StringLiteral kAsyncExceptionEdgeMarker =
     "__lython_async_exception_edge_marker";
-constexpr llvm::StringLiteral kAsyncTaskCancelMarker =
-    "__lython_async_task_cancel_marker";
 
 std::optional<llvm::StringRef> directCallee(mlir::Operation *op) {
   if (auto call = mlir::dyn_cast<mlir::LLVM::CallOp>(op))
@@ -37,7 +35,7 @@ std::optional<llvm::StringRef> directCallee(mlir::Operation *op) {
 
 namespace async_marker {
 
-enum class Kind { ExceptionEdge, TaskCancel };
+enum class Kind { ExceptionEdge };
 
 struct Spec {
   Kind kind;
@@ -48,8 +46,6 @@ struct Spec {
 
 static constexpr Spec kSpecs[] = {
     {Kind::ExceptionEdge, kAsyncExceptionEdgeMarker, /*allowSuffix=*/true,
-     /*eraseFuncDeclarationOnly=*/true},
-    {Kind::TaskCancel, kAsyncTaskCancelMarker, /*allowSuffix=*/false,
      /*eraseFuncDeclarationOnly=*/true},
 };
 
@@ -191,64 +187,6 @@ bool ownedPayload(mlir::Type type) {
 }
 
 } // namespace value_type
-
-namespace cancel_marker {
-
-mlir::Value awaitedHandle(mlir::Operation *marker) {
-  for (mlir::Operation *cursor = marker ? marker->getPrevNode() : nullptr;
-       cursor; cursor = cursor->getPrevNode()) {
-    if (cursor->hasTrait<mlir::OpTrait::IsTerminator>())
-      return {};
-    if (auto load = mlir::dyn_cast<mlir::async::RuntimeLoadOp>(cursor))
-      return load.getOperand();
-    if (auto load = mlir::dyn_cast<mlir::LLVM::LoadOp>(cursor)) {
-      if (async_runtime::ValueStorage::isAddress(load.getAddr())) {
-        if (auto storage = load.getAddr().getDefiningOp<mlir::LLVM::CallOp>()) {
-          if (storage.getNumOperands() > 0)
-            return storage.getOperand(0);
-        }
-      }
-    }
-    if (mlir::isa<mlir::async::RuntimeAwaitOp>(cursor) ||
-        mlir::isa<mlir::async::RuntimeAwaitAndResumeOp>(cursor))
-      return {};
-  }
-  return {};
-}
-
-mlir::Value discardedPayload(mlir::Operation *marker) {
-  for (mlir::Operation *cursor = marker ? marker->getPrevNode() : nullptr;
-       cursor; cursor = cursor->getPrevNode()) {
-    if (cursor->hasTrait<mlir::OpTrait::IsTerminator>())
-      return {};
-    if (auto call = mlir::dyn_cast<mlir::LLVM::CallOp>(cursor)) {
-      auto callee = call.getCallee();
-      if (callee &&
-          async_marker::is(*callee, async_marker::Kind::ExceptionEdge))
-        continue;
-    }
-    if (auto call = mlir::dyn_cast<mlir::func::CallOp>(cursor))
-      if (async_marker::is(call.getCallee(), async_marker::Kind::ExceptionEdge))
-        continue;
-    if (auto load = mlir::dyn_cast<mlir::async::RuntimeLoadOp>(cursor)) {
-      mlir::Value result = load.getResult();
-      return value_type::ownedPayload(result.getType()) ? result
-                                                        : mlir::Value();
-    }
-    if (auto load = mlir::dyn_cast<mlir::LLVM::LoadOp>(cursor)) {
-      mlir::Value result = load.getResult();
-      if (value_type::ownedPayload(result.getType()) &&
-          async_runtime::ValueStorage::isAddress(load.getAddr()))
-        return result;
-    }
-    if (mlir::isa<mlir::async::RuntimeAwaitOp>(cursor) ||
-        mlir::isa<mlir::async::RuntimeAwaitAndResumeOp>(cursor))
-      return {};
-  }
-  return {};
-}
-
-} // namespace cancel_marker
 
 namespace runtime_call {
 
@@ -831,6 +769,9 @@ void transfer(mlir::Operation &op,
       if (value_type::pointerLike(result.getType()))
         value_set::add(handles, result);
   }
+  for (unsigned index : async_runtime::Handle::transferredOperands(&op))
+    if (index < op.getNumOperands())
+      value_set::erase(handles, op.getOperand(index));
   for (mlir::Value handle : llvm::make_early_inc_range(handles))
     if (async_ref::dropFor(op, handle))
       value_set::erase(handles, handle);
@@ -1898,247 +1839,6 @@ mlir::LogicalResult rewrite(mlir::ModuleOp module) {
 
 } // namespace await_exception_cell
 
-namespace cancel_flag {
-
-mlir::MemRefType storageType(mlir::MLIRContext *ctx) {
-  return mlir::MemRefType::get({1}, mlir::IntegerType::get(ctx, 8));
-}
-
-bool storage(mlir::Type type) {
-  auto memrefType = mlir::dyn_cast<mlir::MemRefType>(type);
-  if (!memrefType || memrefType.getRank() != 1 || memrefType.getShape()[0] != 1)
-    return false;
-  auto intType = mlir::dyn_cast<mlir::IntegerType>(memrefType.getElementType());
-  return intType && intType.getWidth() == 8;
-}
-
-bool loweredDescriptor(mlir::Type type) {
-  return object_abi::Type::isLoweredStorage(type);
-}
-
-mlir::Value descriptor(mlir::Location loc, mlir::IRRewriter &rewriter,
-                       mlir::ValueRange operands) {
-  if (operands.size() < 5)
-    return {};
-
-  auto ptrType = mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
-  if (operands[0].getType() != ptrType || operands[1].getType() != ptrType ||
-      !operands[2].getType().isInteger(64) ||
-      !operands[3].getType().isInteger(64) ||
-      !operands[4].getType().isInteger(64))
-    return {};
-
-  auto descriptorType = object_abi::Type::loweredStorage(rewriter.getContext());
-  mlir::Value result =
-      rewriter.create<mlir::LLVM::UndefOp>(loc, descriptorType);
-  result = rewriter.create<mlir::LLVM::InsertValueOp>(
-      loc, descriptorType, result, operands[0],
-      rewriter.getDenseI64ArrayAttr({0}));
-  result = rewriter.create<mlir::LLVM::InsertValueOp>(
-      loc, descriptorType, result, operands[1],
-      rewriter.getDenseI64ArrayAttr({1}));
-  result = rewriter.create<mlir::LLVM::InsertValueOp>(
-      loc, descriptorType, result, operands[2],
-      rewriter.getDenseI64ArrayAttr({2}));
-  result = rewriter.create<mlir::LLVM::InsertValueOp>(
-      loc, descriptorType, result, operands[3],
-      rewriter.getDenseI64ArrayAttr({3, 0}));
-  result = rewriter.create<mlir::LLVM::InsertValueOp>(
-      loc, descriptorType, result, operands[4],
-      rewriter.getDenseI64ArrayAttr({4, 0}));
-  async_runtime::CancelFlag::mark(result);
-  return result;
-}
-
-mlir::Value pointer(mlir::Location loc, mlir::IRRewriter &rewriter,
-                    mlir::Value flagStorage) {
-  if (!flagStorage)
-    return {};
-  auto descriptorType =
-      mlir::dyn_cast<mlir::LLVM::LLVMStructType>(flagStorage.getType());
-  if (!object_abi::Type::isLoweredStorage(descriptorType))
-    return {};
-  return rewriter.create<mlir::LLVM::ExtractValueOp>(
-      loc, descriptorType.getBody()[1], flagStorage,
-      rewriter.getDenseI64ArrayAttr({1}));
-}
-
-mlir::LogicalResult dealloc(mlir::Location loc, mlir::ModuleOp module,
-                            mlir::IRRewriter &rewriter,
-                            mlir::Value flagStorage) {
-  if (!flagStorage)
-    return mlir::success();
-  if (storage(flagStorage.getType())) {
-    rewriter.create<mlir::memref::DeallocOp>(loc, flagStorage);
-    return mlir::success();
-  }
-  if (loweredDescriptor(flagStorage.getType())) {
-    mlir::Value storage = rewriter
-                              .create<mlir::UnrealizedConversionCastOp>(
-                                  loc, storageType(rewriter.getContext()),
-                                  mlir::ValueRange{flagStorage})
-                              .getResult(0);
-    rewriter.create<mlir::memref::DeallocOp>(loc, storage);
-    return mlir::success();
-  }
-  module.emitError("invalid async cancel flag dealloc operand");
-  return mlir::failure();
-}
-
-} // namespace cancel_flag
-
-namespace task_cancel {
-
-mlir::LogicalResult rewrite(mlir::ModuleOp module) {
-  struct Marker {
-    mlir::Operation *op;
-    mlir::Value flagStorage;
-    mlir::SmallVector<mlir::Value, 5> loweredFlagDescriptor;
-    mlir::Value sourceCell;
-    mlir::Value destCell;
-  };
-  llvm::SmallVector<Marker> markers;
-  mlir::LogicalResult result = mlir::success();
-  module.walk([&](mlir::func::CallOp call) {
-    if (!async_marker::is(call.getCallee(), async_marker::Kind::TaskCancel))
-      return;
-    if (call.getNumOperands() != 3) {
-      call.emitError("invalid async task cancel marker operand count");
-      result = mlir::failure();
-      return;
-    }
-    markers.push_back({call.getOperation(),
-                       call.getOperand(0),
-                       {},
-                       call.getOperand(1),
-                       call.getOperand(2)});
-  });
-  module.walk([&](mlir::LLVM::CallOp call) {
-    auto callee = call.getCallee();
-    if (!callee || !async_marker::is(*callee, async_marker::Kind::TaskCancel))
-      return;
-    if (call.getNumOperands() == 3) {
-      markers.push_back({call.getOperation(),
-                         call.getOperand(0),
-                         {},
-                         call.getOperand(1),
-                         call.getOperand(2)});
-      return;
-    }
-    if (call.getNumOperands() >= 7) {
-      mlir::SmallVector<mlir::Value, 5> flagDescriptor;
-      for (unsigned index = 0; index < 5; ++index)
-        flagDescriptor.push_back(call.getOperand(index));
-      markers.push_back({call.getOperation(),
-                         {},
-                         flagDescriptor,
-                         call.getOperand(call.getNumOperands() - 2),
-                         call.getOperand(call.getNumOperands() - 1)});
-      return;
-    }
-    call.emitError("invalid async task cancel marker operand count");
-    result = mlir::failure();
-  });
-
-  for (Marker marker : markers) {
-    mlir::Block *continuationBlock = marker.op->getBlock();
-    mlir::Block *errorBlock =
-        await_error::blockForContinuation(continuationBlock);
-    if (!errorBlock) {
-      marker.op->emitError(
-          "failed to find async await error branch for task cancellation");
-      result = mlir::failure();
-      continue;
-    }
-    mlir::async::RuntimeSetErrorOp setError;
-    for (mlir::Operation &op : errorBlock->getOperations()) {
-      setError = mlir::dyn_cast<mlir::async::RuntimeSetErrorOp>(op);
-      if (setError)
-        break;
-    }
-    mlir::Operation *errorTerminator = errorBlock->getTerminator();
-    if (!setError || !errorTerminator ||
-        errorTerminator->getNumSuccessors() != 1) {
-      marker.op->emitError(
-          "failed to find async await error merge for task cancellation");
-      result = mlir::failure();
-      continue;
-    }
-    mlir::Block *errorMergeBlock = errorTerminator->getSuccessor(0);
-    mlir::Value discardedPayload = cancel_marker::discardedPayload(marker.op);
-    mlir::Value awaitedHandle = cancel_marker::awaitedHandle(marker.op);
-
-    mlir::IRRewriter rewriter(module.getContext());
-    rewriter.setInsertionPoint(marker.op);
-    mlir::Value flagStorage = marker.flagStorage;
-    if (!flagStorage && !marker.loweredFlagDescriptor.empty())
-      flagStorage = cancel_flag::descriptor(marker.op->getLoc(), rewriter,
-                                            marker.loweredFlagDescriptor);
-    mlir::Value flagPtr =
-        cancel_flag::pointer(marker.op->getLoc(), rewriter, flagStorage);
-    if (!flagPtr) {
-      marker.op->emitError("failed to materialize async task cancel flag");
-      result = mlir::failure();
-      continue;
-    }
-
-    mlir::Block *currentBlock = marker.op->getBlock();
-    mlir::Block *successBlock =
-        rewriter.splitBlock(currentBlock, marker.op->getIterator());
-    mlir::Block *cancelBlock = rewriter.createBlock(
-        successBlock->getParent(), successBlock->getIterator());
-
-    rewriter.setInsertionPointToEnd(currentBlock);
-    mlir::Value flag = rewriter.create<mlir::LLVM::LoadOp>(
-        marker.op->getLoc(), rewriter.getI8Type(), flagPtr,
-        /*alignment=*/1, /*isVolatile=*/false, /*isNonTemporal=*/false,
-        /*isInvariant=*/false, /*isInvariantGroup=*/false,
-        mlir::LLVM::AtomicOrdering::acquire);
-    threadsafe::Atomic::set(flag.getDefiningOp(),
-                            ThreadSafetyAttrs::kRoleAsyncCancelLoad,
-                            ThreadSafetyAttrs::kOrderingAcquire);
-    flag.getDefiningOp()->setAttr(AsyncSafetyAttrs::kCancelFlag,
-                                  mlir::UnitAttr::get(rewriter.getContext()));
-    mlir::Value zero = rewriter.create<mlir::LLVM::ConstantOp>(
-        marker.op->getLoc(), rewriter.getI8Type(),
-        rewriter.getIntegerAttr(rewriter.getI8Type(), 0));
-    mlir::Value isCancelled = rewriter.create<mlir::LLVM::ICmpOp>(
-        marker.op->getLoc(), mlir::LLVM::ICmpPredicate::ne, flag, zero);
-    rewriter.create<mlir::cf::CondBranchOp>(marker.op->getLoc(), isCancelled,
-                                            cancelBlock, successBlock);
-
-    rewriter.setInsertionPointToStart(cancelBlock);
-    if (discardedPayload) {
-      mlir::FailureOr<mlir::Operation *> release = async_payload_ref::release(
-          module, marker.op->getLoc(), rewriter, discardedPayload);
-      if (mlir::failed(release))
-        return mlir::failure();
-    }
-    if (mlir::failed(exception_cell::moveAt(module, marker.op->getLoc(),
-                                            rewriter, marker.sourceCell,
-                                            marker.destCell)))
-      return mlir::failure();
-    if (mlir::failed(cancel_flag::dealloc(marker.op->getLoc(), module, rewriter,
-                                          flagStorage)))
-      return mlir::failure();
-    if (awaitedHandle) {
-      async_handle_ref::drop(module, marker.op->getLoc(), rewriter,
-                             awaitedHandle, /*allowAsyncOp=*/true,
-                             /*frameTransfer=*/false);
-    }
-    rewriter.create<mlir::async::RuntimeSetErrorOp>(marker.op->getLoc(),
-                                                    setError.getOperand());
-    rewriter.create<mlir::cf::BranchOp>(marker.op->getLoc(), errorMergeBlock);
-    marker.op->erase();
-  }
-
-  async_marker::eraseDeclarations(module, async_marker::Kind::TaskCancel);
-
-  return result;
-}
-
-} // namespace task_cancel
-
 namespace finally_error {
 
 mlir::LogicalResult rewrite(mlir::ModuleOp module) {
@@ -2313,6 +2013,32 @@ static void copyPresplitCoroutineAttrs(mlir::Operation *callee,
   if (call->getNumResults() > 0)
     async_contract::setIndexArray(
         call, AsyncSafetyAttrs::kRuntimeHandleOwnedResults, {0});
+
+  auto function = mlir::dyn_cast<mlir::FunctionOpInterface>(callee);
+  if (!function)
+    return;
+
+  llvm::SmallVector<int64_t, 2> transferredHandles;
+  llvm::SmallVector<int64_t, 2> transferredExceptionCells;
+  for (unsigned index = 0, e = function.getNumArguments(); index < e; ++index) {
+    if (!function.getArgAttr(index, AsyncSafetyAttrs::kRuntimeHandle))
+      continue;
+    if (index >= call->getNumOperands())
+      continue;
+    transferredHandles.push_back(static_cast<int64_t>(index));
+
+    unsigned cellIndex = index + 1;
+    if (cellIndex < e && cellIndex < call->getNumOperands() &&
+        function.getArgAttr(cellIndex, AsyncSafetyAttrs::kExceptionCell))
+      transferredExceptionCells.push_back(static_cast<int64_t>(cellIndex));
+  }
+  if (!transferredHandles.empty())
+    async_contract::setIndexArray(
+        call, AsyncSafetyAttrs::kRuntimeHandleTransferArgs, transferredHandles);
+  if (!transferredExceptionCells.empty())
+    async_contract::setIndexArray(call,
+                                  AsyncSafetyAttrs::kExceptionCellTransferArgs,
+                                  transferredExceptionCells);
 }
 
 static void copyThrowAttrs(mlir::Operation *from, mlir::Operation *to) {
@@ -2361,7 +2087,7 @@ struct AsyncRuntimeRewritePass
   }
 
   llvm::StringRef getDescription() const override {
-    return "Rewrite Lython async exception/cancel markers after async runtime "
+    return "Rewrite Lython async exception markers after async runtime "
            "conversion";
   }
 
@@ -2369,7 +2095,6 @@ struct AsyncRuntimeRewritePass
     mlir::ModuleOp module = getOperation();
     if (mlir::failed(async_runtime_contract::annotate(module)) ||
         mlir::failed(finally_error::rewrite(module)) ||
-        mlir::failed(task_cancel::rewrite(module)) ||
         mlir::failed(exception_payload::rewrite(module)) ||
         mlir::failed(error_handle_cleanup::rewrite(module)) ||
         mlir::failed(await_exception_cell::rewrite(module)) ||

@@ -4,7 +4,6 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <deque>
-#include <sstream>
 #include <utility>
 
 namespace lython::emitter::typing {
@@ -30,6 +29,18 @@ void mergeInto(std::set<std::uint64_t> &target,
   target.insert(source.begin(), source.end());
 }
 
+std::optional<Term> varargElementType(const Term &vararg) {
+  if (vararg.kind != Term::Kind::Con || vararg.name != "tuple" ||
+      vararg.args.size() != 1)
+    return std::nullopt;
+  return vararg.args.front();
+}
+
+bool isObjectTop(const Term &term) {
+  return term.kind == Term::Kind::Con &&
+         (term.name == "object" || term.name == "!py.object");
+}
+
 } // namespace
 
 Term Term::var(std::uint64_t id, llvm::StringRef name) {
@@ -49,12 +60,24 @@ Term Term::con(llvm::StringRef name, llvm::ArrayRef<Term> args) {
 }
 
 Term Term::func(llvm::ArrayRef<Term> args, llvm::ArrayRef<Term> results,
-                llvm::ArrayRef<Term> kwonly) {
+                llvm::ArrayRef<Term> kwonly,
+                std::optional<unsigned> positionalOnlyCount) {
+  return func(args, results, kwonly, llvm::ArrayRef<Term>{},
+              llvm::ArrayRef<Term>{}, positionalOnlyCount);
+}
+
+Term Term::func(llvm::ArrayRef<Term> args, llvm::ArrayRef<Term> results,
+                llvm::ArrayRef<Term> kwonly, llvm::ArrayRef<Term> vararg,
+                llvm::ArrayRef<Term> kwarg,
+                std::optional<unsigned> positionalOnlyCount) {
   Term term;
   term.kind = Kind::Func;
   term.args.assign(args.begin(), args.end());
   term.results.assign(results.begin(), results.end());
   term.kwonly.assign(kwonly.begin(), kwonly.end());
+  term.vararg.assign(vararg.begin(), vararg.end());
+  term.kwarg.assign(kwarg.begin(), kwarg.end());
+  term.positionalOnlyCount = positionalOnlyCount;
   return term;
 }
 
@@ -80,8 +103,14 @@ std::string Term::display() const {
   }
 
   std::string result = "func<[" + joinTerms(args) + "]";
+  if (positionalOnlyCount && *positionalOnlyCount != 0)
+    result += ", posonly = " + std::to_string(*positionalOnlyCount);
   if (!kwonly.empty())
     result += ", kwonly = [" + joinTerms(kwonly) + "]";
+  if (!vararg.empty())
+    result += ", vararg = " + vararg.front().display();
+  if (!kwarg.empty())
+    result += ", kwarg = " + kwarg.front().display();
   result += " -> [" + joinTerms(results) + "]>";
   return result;
 }
@@ -89,7 +118,9 @@ std::string Term::display() const {
 bool operator==(const Term &lhs, const Term &rhs) {
   return lhs.kind == rhs.kind && lhs.id == rhs.id && lhs.name == rhs.name &&
          lhs.args == rhs.args && lhs.kwonly == rhs.kwonly &&
-         lhs.results == rhs.results;
+         lhs.vararg == rhs.vararg && lhs.kwarg == rhs.kwarg &&
+         lhs.results == rhs.results &&
+         lhs.positionalOnlyCount == rhs.positionalOnlyCount;
 }
 
 bool operator!=(const Term &lhs, const Term &rhs) { return !(lhs == rhs); }
@@ -100,8 +131,12 @@ std::optional<Term> Oracle::attribute(const Term &, llvm::StringRef) const {
 
 std::optional<Term> Oracle::call(const Term &callee,
                                  llvm::ArrayRef<Term> args) const {
-  if (callee.kind != Term::Kind::Func || callee.args.size() != args.size() ||
-      callee.results.size() != 1)
+  if (callee.kind != Term::Kind::Func || callee.results.size() != 1 ||
+      !callee.kwonly.empty())
+    return std::nullopt;
+  if (callee.vararg.empty() && callee.args.size() != args.size())
+    return std::nullopt;
+  if (!callee.vararg.empty() && callee.args.size() > args.size())
     return std::nullopt;
   return callee.results.front();
 }
@@ -120,11 +155,15 @@ std::optional<Term> Oracle::subscript(const Term &container,
 }
 
 std::optional<Term> Oracle::awaitable(const Term &awaitable) const {
-  if (awaitable.kind != Term::Kind::Con || awaitable.args.size() != 1)
+  if (awaitable.kind != Term::Kind::Con)
     return std::nullopt;
-  if (awaitable.name == "coro" || awaitable.name == "task" ||
-      awaitable.name == "future" || awaitable.name == "async.value")
+  if (awaitable.args.size() == 1 && (awaitable.name == "async.value" ||
+                                     awaitable.name == "protocol:Awaitable" ||
+                                     awaitable.name == "protocol:Future" ||
+                                     awaitable.name == "protocol:Task"))
     return awaitable.args.front();
+  if (awaitable.name == "protocol:Coroutine" && awaitable.args.size() == 3)
+    return awaitable.args[2];
   return std::nullopt;
 }
 
@@ -266,8 +305,15 @@ void AlgorithmM::solve() {
 
     if (constraint.kind == Constraint::Kind::Call &&
         constraint.lhs.kind == Term::Kind::Func) {
-      if (constraint.lhs.args.size() != constraint.args.size() ||
-          !constraint.lhs.kwonly.empty() || constraint.lhs.results.size() != 1)
+      if (!constraint.lhs.kwonly.empty() || constraint.lhs.results.size() != 1)
+        throw Error("cannot resolve call of " + constraint.lhs.display() +
+                    ": " + constraint.reason.message);
+      if (constraint.lhs.vararg.empty() &&
+          constraint.lhs.args.size() != constraint.args.size())
+        throw Error("cannot resolve call of " + constraint.lhs.display() +
+                    ": " + constraint.reason.message);
+      if (!constraint.lhs.vararg.empty() &&
+          constraint.lhs.args.size() > constraint.args.size())
         throw Error("cannot resolve call of " + constraint.lhs.display() +
                     ": " + constraint.reason.message);
       pending.push_front(Constraint{Constraint::Kind::Equal,
@@ -278,12 +324,34 @@ void AlgorithmM::solve() {
                                     constraint.reason});
       for (auto [expected, actual] :
            llvm::zip(constraint.lhs.args, constraint.args)) {
+        if (isObjectTop(expected))
+          continue;
         pending.push_front(Constraint{Constraint::Kind::Equal,
                                       expected,
                                       actual,
                                       {},
                                       {},
                                       constraint.reason});
+      }
+      if (!constraint.lhs.vararg.empty() &&
+          constraint.args.size() > constraint.lhs.args.size()) {
+        std::optional<Term> element =
+            varargElementType(constraint.lhs.vararg.front());
+        if (!element)
+          throw Error("cannot resolve call of " + constraint.lhs.display() +
+                      ": " + constraint.reason.message);
+        llvm::ArrayRef<Term> extraArgs(constraint.args);
+        extraArgs = extraArgs.drop_front(constraint.lhs.args.size());
+        for (const Term &actual : extraArgs) {
+          if (isObjectTop(*element))
+            continue;
+          pending.push_front(Constraint{Constraint::Kind::Equal,
+                                        *element,
+                                        actual,
+                                        {},
+                                        {},
+                                        constraint.reason});
+        }
       }
       continue;
     }
@@ -356,11 +424,20 @@ void AlgorithmM::unify(Term lhs, Term rhs, std::optional<Reason> reason) {
   if (lhs.kind == Term::Kind::Func && rhs.kind == Term::Kind::Func) {
     if (lhs.args.size() != rhs.args.size() ||
         lhs.kwonly.size() != rhs.kwonly.size() ||
+        lhs.vararg.size() != rhs.vararg.size() ||
+        lhs.kwarg.size() != rhs.kwarg.size() ||
         lhs.results.size() != rhs.results.size())
+      failUnify(lhs, rhs, reason);
+    if (lhs.positionalOnlyCount && rhs.positionalOnlyCount &&
+        *lhs.positionalOnlyCount != *rhs.positionalOnlyCount)
       failUnify(lhs, rhs, reason);
     for (auto [lhsArg, rhsArg] : llvm::zip(lhs.args, rhs.args))
       unify(lhsArg, rhsArg, reason);
     for (auto [lhsArg, rhsArg] : llvm::zip(lhs.kwonly, rhs.kwonly))
+      unify(lhsArg, rhsArg, reason);
+    for (auto [lhsArg, rhsArg] : llvm::zip(lhs.vararg, rhs.vararg))
+      unify(lhsArg, rhsArg, reason);
+    for (auto [lhsArg, rhsArg] : llvm::zip(lhs.kwarg, rhs.kwarg))
       unify(lhsArg, rhsArg, reason);
     for (auto [lhsResult, rhsResult] : llvm::zip(lhs.results, rhs.results))
       unify(lhsResult, rhsResult, reason);
@@ -403,6 +480,10 @@ std::set<std::uint64_t> freeVars(const Term &term) {
     mergeInto(result, freeVars(arg));
   for (const Term &arg : term.kwonly)
     mergeInto(result, freeVars(arg));
+  for (const Term &arg : term.vararg)
+    mergeInto(result, freeVars(arg));
+  for (const Term &arg : term.kwarg)
+    mergeInto(result, freeVars(arg));
   for (const Term &resultType : term.results)
     mergeInto(result, freeVars(resultType));
   return result;
@@ -421,6 +502,10 @@ Term applySubstitution(const Term &term,
   for (Term &arg : result.args)
     arg = applySubstitution(arg, substitution);
   for (Term &arg : result.kwonly)
+    arg = applySubstitution(arg, substitution);
+  for (Term &arg : result.vararg)
+    arg = applySubstitution(arg, substitution);
+  for (Term &arg : result.kwarg)
     arg = applySubstitution(arg, substitution);
   for (Term &resultType : result.results)
     resultType = applySubstitution(resultType, substitution);

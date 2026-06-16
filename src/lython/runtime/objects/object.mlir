@@ -3,6 +3,26 @@ module {
     %slot = arith.constant 0 : index
     %zero = arith.constant 0 : i64
     %immortal = arith.constant 9223372036854775807 : i64
+    // Tagged fast path: a header whose aligned pointer has bit 0 set is an
+    // inline tagged long (rfc/tagged-long.md). It owns no memory and must
+    // not be dereferenced at all.
+    %ptr_index = memref.extract_aligned_pointer_as_index %header : memref<2xi64, strided<[1], offset: ?>> -> index
+    %ptr_bits = arith.index_cast %ptr_index : index to i64
+    %tag_one = arith.constant 1 : i64
+    %tag_bit = arith.andi %ptr_bits, %tag_one : i64
+    %is_tagged = arith.cmpi eq, %tag_bit, %tag_one : i64
+    cf.cond_br %is_tagged, ^done, ^probe
+
+  ^probe:
+    // Immortal fast path: immortality is fixed at object creation and never
+    // changes, so a pre-RMW acquire read is a stable witness. Skipping the
+    // RMW keeps immortal headers write-free, which lets constant literals
+    // live in read-only sections.
+    %observed = memref.load %header[%slot] {ly.atomic.ordering = "acquire", ly.atomic.role = "object.refcount.load"} : memref<2xi64, strided<[1], offset: ?>>
+    %pre_immortal = arith.cmpi eq, %observed, %immortal : i64
+    cf.cond_br %pre_immortal, ^done, ^mutate
+
+  ^mutate:
     %previous = memref.generic_atomic_rmw %header[%slot] : memref<2xi64, strided<[1], offset: ?>> {
     ^bb0(%current : i64):
       %body_zero = arith.constant 0 : i64
@@ -31,6 +51,22 @@ module {
     %slot = arith.constant 0 : index
     %zero = arith.constant 0 : i64
     %immortal = arith.constant 9223372036854775807 : i64
+    // Tagged fast path: see Ly_IncRef and rfc/tagged-long.md.
+    %ptr_index = memref.extract_aligned_pointer_as_index %header : memref<2xi64, strided<[1], offset: ?>> -> index
+    %ptr_bits = arith.index_cast %ptr_index : index to i64
+    %tag_one = arith.constant 1 : i64
+    %tag_bit = arith.andi %ptr_bits, %tag_one : i64
+    %is_tagged = arith.cmpi eq, %tag_bit, %tag_one : i64
+    cf.cond_br %is_tagged, ^done, ^probe
+
+  ^probe:
+    // Immortal fast path: see Ly_IncRef. Immortal headers are never written,
+    // so constant literal objects stay in read-only storage.
+    %observed = memref.load %header[%slot] {ly.atomic.ordering = "acquire", ly.atomic.role = "object.refcount.load"} : memref<2xi64, strided<[1], offset: ?>>
+    %pre_immortal = arith.cmpi eq, %observed, %immortal : i64
+    cf.cond_br %pre_immortal, ^done, ^mutate
+
+  ^mutate:
     %previous = memref.generic_atomic_rmw %header[%slot] : memref<2xi64, strided<[1], offset: ?>> {
     ^bb0(%current : i64):
       %body_zero = arith.constant 0 : i64

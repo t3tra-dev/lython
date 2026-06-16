@@ -13,7 +13,6 @@ target_include_directories(LythonCpythonSpecGen
 target_compile_definitions(LythonCpythonSpecGen
     PRIVATE
     LYTHON_CPYTHON_314_PARSER_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
-    LYTHON_CPYTHON_SPEC_RUNTIME_FILE_IO=1
 )
 
 set(LYTHON_CPYTHON_SPEC_SNAPSHOT

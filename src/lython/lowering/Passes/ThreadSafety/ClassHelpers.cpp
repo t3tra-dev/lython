@@ -1,7 +1,5 @@
 #include "Verifier.h"
 
-#include "Common/ClassLayout.h"
-
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 
@@ -151,6 +149,15 @@ static void add(Map &expected, ::llvm::ArrayRef<int64_t> slots,
                 unsigned countPerSlot) {
   for (int64_t slot : slots)
     expected[slot] += countPerSlot;
+}
+
+static Map only(const Map &counts, ::llvm::ArrayRef<int64_t> slots) {
+  ::llvm::DenseSet<int64_t> allowed(slots.begin(), slots.end());
+  Map result;
+  for (auto [slot, count] : counts)
+    if (allowed.contains(slot))
+      result[slot] = count;
+  return result;
 }
 
 static mlir::LogicalResult exact(mlir::LLVM::LLVMFuncOp fn, const Map &got,
@@ -728,12 +735,34 @@ verifier::class_helper::Promote::verify(mlir::LLVM::LLVMFuncOp fn) {
   auto &containerFields = fields.containers;
 
   mlir::SmallVector<mlir::Value> freshObjects = promote::freshObjects(fn);
-  size_t expectedFreshObjects = 3 + containerFields.size();
-  if (freshObjects.size() != expectedFreshObjects)
+  // The erased class ABI returns only header + payload-table descriptors, while
+  // the copy path still allocates every concrete payload slot plus the table.
+  // The exact count is therefore a layout property, not derivable from the
+  // helper signature after ABI erasure.
+  if (freshObjects.size() < 2)
     return fn.emitOpError()
            << "class promote helper fresh managed allocation count is "
-           << freshObjects.size() << ", expected " << expectedFreshObjects
-           << " (header, payload, lock, and promoted container fields)";
+           << freshObjects.size()
+           << ", expected at least header plus payload table";
+  unsigned freshHeaderCount = 0;
+  for (mlir::Value fresh : freshObjects) {
+    mlir::Operation *def = fresh.getDefiningOp();
+    if (!def)
+      continue;
+    if (def->hasAttr(OwnershipContractAttrs::kObjectHeader)) {
+      ++freshHeaderCount;
+      continue;
+    }
+    if (!def->hasAttr(ClassSafetyAttrs::kPayloadPart))
+      return def->emitOpError(
+          "class promote fresh allocation is neither the object header nor "
+          "a payload part");
+  }
+  if (freshHeaderCount != 1)
+    return fn.emitOpError()
+           << "class promote helper must allocate exactly one fresh object "
+              "header, found "
+           << freshHeaderCount;
   if (mlir::failed(promote::freshAllocationContract(fn, freshObjects)))
     return mlir::failure();
 
@@ -770,10 +799,10 @@ verifier::class_helper::Promote::verify(mlir::LLVM::LLVMFuncOp fn) {
       return fn.emitOpError() << "class promote helper direct field slot "
                               << slot << " uses both retain and promote";
   }
-  if (mlir::failed(
-          slot_counts::atLeast(fn, class_field::Slots::loads(fn),
-                               slot_counts::expected(directFields, 1),
-                               "class promote helper direct field load")))
+  if (mlir::failed(slot_counts::atLeast(
+          fn, slot_counts::only(class_field::Slots::loads(fn), directFields),
+          slot_counts::expected(directFields, 1),
+          "class promote helper direct field load")))
     return mlir::failure();
   if (mlir::failed(slot_counts::exact(
           fn,

@@ -14,7 +14,15 @@ void Builder::Impl::emitAsyncFunctionDef(const parser::Node &function) {
   auto found = functions.find(*name);
   if (found == functions.end())
     return;
-  const FunctionInfo &info = found->second;
+  if (hasCallableFormal(found->second) || hasProtocolFormal(found->second) ||
+      hasClassFormal(found->second) || !found->second.typeParameters.empty())
+    return;
+  emitAsyncFunctionDef(function, found->second, {});
+}
+
+void Builder::Impl::emitAsyncFunctionDef(
+    const parser::Node &function, const FunctionInfo &info,
+    const std::map<std::string, FunctionInfo> &initialCallableAliases) {
   const std::vector<parser::NodePtr> *body = nodeListField(function, "body");
   if (!body) {
     error(function, "AsyncFunctionDef.body is missing");
@@ -42,6 +50,7 @@ void Builder::Impl::emitAsyncFunctionDef(const parser::Node &function) {
   unsigned savedExceptionContextDepth = exceptionContextDepth;
   symbols.clear();
   callableAliases.clear();
+  callableAliases = initialCallableAliases;
   currentReturnType = info.resultType;
   blockTerminated = false;
   inNativeFunction = false;
@@ -134,16 +143,7 @@ Value Builder::Impl::emitAwait(const parser::Node &expr) {
   Value awaitable = emitExpression(**valueNode);
   if (!awaitable.value)
     return Value{{}, noneType()};
-  mlir::Type payloadType = awaitablePayloadType(awaitable.type);
-  if (!payloadType) {
-    error(**valueNode, "await expects !py.coro<T>, !py.task<T>, "
-                       "!py.future<T>, or !async.value<T>, got " +
-                           typeString(awaitable.type));
-    return Value{{}, noneType()};
-  }
-  mlir::Value result =
-      builder.create<py::AwaitOp>(loc(expr), payloadType, awaitable.value);
-  return Value{result, payloadType};
+  return awaitConcreteValue(expr, awaitable, "await operand");
 }
 
 Value Builder::Impl::emitAsyncioCall(const parser::Node &expr,
@@ -182,6 +182,14 @@ Value Builder::Impl::emitAsyncioCall(const parser::Node &expr,
       error(*args.front(), "asyncio.run expects a statically typed awaitable");
       return Value{{}, noneType()};
     }
+    if (!lowerableAwaitableValueType(awaitable)) {
+      error(*args.front(),
+            "asyncio.run awaitable " + typeString(awaitable.type) +
+                " resolves statically to " + typeString(payloadType) +
+                ", but lowering currently requires a native "
+                "Coroutine protocol descriptor or async.value");
+      return Value{{}, payloadType};
+    }
     mlir::Value result =
         builder.create<py::AwaitOp>(loc(expr), payloadType, awaitable.value);
     return Value{result, payloadType};
@@ -193,18 +201,18 @@ Value Builder::Impl::emitAsyncioCall(const parser::Node &expr,
       return Value{{}, noneType()};
     }
     Value coroutine = emitExpression(*args.front());
-    py::CoroutineType coroType;
-    if (coroutine.type)
-      coroType = mlir::dyn_cast<py::CoroutineType>(coroutine.type);
-    if (!coroutine.value || !coroType) {
+    mlir::Type payloadType = awaitablePayloadType(coroutine.type);
+    if (!coroutine.value || !payloadType ||
+        !lowerableAwaitableValueType(coroutine)) {
       error(*args.front(),
             "asyncio." + name.str() + " expects a statically typed coroutine");
       return Value{{}, noneType()};
     }
-    mlir::Type resultType = taskType(coroType.getResultType());
-    mlir::Value task = builder.create<py::TaskCreateOp>(loc(expr), resultType,
-                                                        coroutine.value);
-    return Value{task, resultType};
+    mlir::Type resultType = taskType(payloadType);
+    error(expr, "asyncio." + name.str() +
+                    " now resolves through the _asyncio.Task contract; "
+                    "runtime Task object lowering is not implemented yet");
+    return Value{{}, resultType};
   }
 
   if (name == "sleep") {
@@ -212,13 +220,10 @@ Value Builder::Impl::emitAsyncioCall(const parser::Node &expr,
       error(expr, "asyncio.sleep expects exactly one duration");
       return Value{{}, noneType()};
     }
-    Value seconds = emitExpression(*args.front());
-    if (!seconds.value)
-      return Value{{}, noneType()};
     mlir::Type resultType = futureType(noneType());
-    mlir::Value future =
-        builder.create<py::AsyncSleepOp>(loc(expr), resultType, seconds.value);
-    return Value{future, resultType};
+    error(expr, "asyncio.sleep now resolves through the _asyncio.Future "
+                "contract; event-loop Future lowering is not implemented yet");
+    return Value{{}, resultType};
   }
 
   if (name == "gather") {
@@ -241,7 +246,6 @@ Value Builder::Impl::emitAsyncioGather(
   }
 
   llvm::SmallVector<mlir::Type> payloadTypes;
-  llvm::SmallVector<mlir::Value> operands;
   for (const parser::NodePtr &arg : args) {
     if (!arg)
       continue;
@@ -251,17 +255,23 @@ Value Builder::Impl::emitAsyncioGather(
       error(*arg, "asyncio.gather expects statically typed awaitables");
       return Value{{}, noneType()};
     }
+    if (!lowerableAwaitableValueType(awaitable)) {
+      error(*arg, "asyncio.gather awaitable " + typeString(awaitable.type) +
+                      " resolves statically to " + typeString(payloadType) +
+                      ", but lowering currently requires native Coroutine "
+                      "protocol descriptors or async.value operands");
+      return Value{{}, noneType()};
+    }
     payloadTypes.push_back(payloadType);
-    operands.push_back(awaitable.value);
   }
 
-  if (operands.empty())
+  if (payloadTypes.empty())
     return emitEmptyTuple();
 
   mlir::Type tupleType = py::TupleType::get(&context, payloadTypes);
-  mlir::Value result =
-      builder.create<py::AsyncGatherOp>(loc(expr), tupleType, operands);
-  return Value{result, tupleType};
+  error(expr, "asyncio.gather now resolves through the asyncio contract; "
+              "general gather runtime lowering is not implemented yet");
+  return Value{{}, tupleType};
 }
 
 } // namespace lython::emitter

@@ -92,38 +92,6 @@ bool provenance::asyncExceptionCell(mlir::Value value) {
   return false;
 }
 
-bool provenance::asyncCancelFlag(mlir::Value value) {
-  while (true) {
-    if (auto bitcast = value.getDefiningOp<mlir::LLVM::BitcastOp>()) {
-      value = bitcast.getArg();
-      continue;
-    }
-    if (auto extract = value.getDefiningOp<mlir::LLVM::ExtractValueOp>()) {
-      value = extract.getContainer();
-      continue;
-    }
-    if (auto gep = value.getDefiningOp<mlir::LLVM::GEPOp>()) {
-      value = gep.getBase();
-      continue;
-    }
-    break;
-  }
-
-  if (mlir::isa<mlir::BlockArgument>(value))
-    return function_arg::hasAttr(value, AsyncSafetyAttrs::kCancelFlag);
-  if (value.getDefiningOp<mlir::LLVM::AllocaOp>())
-    return true;
-  if (mlir::Operation *def = value.getDefiningOp())
-    return def->hasAttr(AsyncSafetyAttrs::kCancelFlag);
-  return false;
-}
-
-bool provenance::asyncCancelFlag(mlir::Operation *op, mlir::Value value) {
-  if (op && op->hasAttr(AsyncSafetyAttrs::kCancelFlag))
-    return true;
-  return provenance::asyncCancelFlag(value);
-}
-
 namespace exception_cell {
 
 namespace users {
@@ -227,7 +195,34 @@ static mlir::Value root(mlir::Value value) {
   return pointer::stripCasts(value);
 }
 
+static bool derivedFrom(mlir::Value source, mlir::Value value,
+                        ::llvm::SmallPtrSetImpl<mlir::Value> &seen) {
+  source = pointer::stripCasts(source);
+  value = pointer::stripCasts(value);
+  if (!source || !value)
+    return false;
+  if (source == value)
+    return true;
+  if (!seen.insert(value).second)
+    return false;
+
+  if (auto insert = value.getDefiningOp<mlir::LLVM::InsertValueOp>())
+    return derivedFrom(source, insert.getContainer(), seen) ||
+           derivedFrom(source, insert.getValue(), seen);
+  if (auto extract = value.getDefiningOp<mlir::LLVM::ExtractValueOp>())
+    return derivedFrom(source, extract.getContainer(), seen);
+  if (auto gep = value.getDefiningOp<mlir::LLVM::GEPOp>())
+    return derivedFrom(source, gep.getBase(), seen);
+  return false;
+}
+
 static bool sameCell(mlir::Value cell, mlir::Value value) {
+  ::llvm::SmallPtrSet<mlir::Value, 8> lhsSeen;
+  if (derivedFrom(cell, value, lhsSeen))
+    return true;
+  ::llvm::SmallPtrSet<mlir::Value, 8> rhsSeen;
+  if (derivedFrom(value, cell, rhsSeen))
+    return true;
   return root(cell) == root(value);
 }
 
@@ -242,12 +237,29 @@ static bool free(mlir::Value cell, mlir::Operation *user) {
   return sameCell(cell, call->getOperand(0));
 }
 
+static bool transfer(mlir::Value cell, mlir::Operation *user) {
+  llvm::SmallVector<unsigned, 2> transferArgs =
+      async_runtime::contract::indices(
+          user, AsyncSafetyAttrs::kExceptionCellTransferArgs);
+  for (unsigned index : transferArgs)
+    if (index < user->getNumOperands() &&
+        sameCell(cell, user->getOperand(index)))
+      return true;
+  return false;
+}
+
+static bool release(mlir::Value cell, mlir::Operation *user) {
+  return free(cell, user) || transfer(cell, user);
+}
+
 static bool mayUseAfterFree(mlir::Operation *freeOp, mlir::Operation *user) {
   if (user == freeOp)
     return false;
   if (auto call = mlir::dyn_cast<mlir::LLVM::CallOp>(user))
     if (call->hasAttr(AsyncSafetyAttrs::kExceptionCellFree))
       return false;
+  if (user->hasAttr(AsyncSafetyAttrs::kExceptionCellTransferArgs))
+    return false;
   return true;
 }
 
@@ -276,7 +288,7 @@ static mlir::Operation *exitWithoutFree(mlir::Value cell,
   while (!worklist.empty()) {
     auto [block, start] = worklist.pop_back_val();
     for (mlir::Operation *op = start; op; op = op->getNextNode()) {
-      if (free(cell, op))
+      if (release(cell, op))
         break;
 
       if (op != block->getTerminator())
@@ -311,12 +323,12 @@ static mlir::LogicalResult verify(mlir::Value cell,
   ::llvm::SmallPtrSet<mlir::Value, 8> seen;
   users::collect(cell, seen, users);
 
-  mlir::SmallVector<mlir::Operation *> frees;
+  mlir::SmallVector<mlir::Operation *> releases;
   for (mlir::Operation *user : users)
-    if (free(cell, user))
-      frees.push_back(user);
+    if (release(cell, user))
+      releases.push_back(user);
 
-  if (frees.empty())
+  if (releases.empty())
     return owner->emitOpError("async exception cell allocation has no matching "
                               "free on any ownership path");
 
@@ -324,7 +336,7 @@ static mlir::LogicalResult verify(mlir::Value cell,
     return exit->emitOpError("async exception cell can reach a function exit "
                              "without a matching free");
 
-  for (mlir::Operation *freeOp : frees) {
+  for (mlir::Operation *freeOp : releases) {
     for (mlir::Operation *user : users) {
       if (!mayUseAfterFree(freeOp, user))
         continue;
@@ -339,51 +351,6 @@ static mlir::LogicalResult verify(mlir::Value cell,
 } // namespace lifetime
 
 } // namespace exception_cell
-
-namespace cancel_flag {
-
-namespace init {
-
-static bool store(mlir::Value flag, mlir::Operation *user) {
-  auto store = mlir::dyn_cast<mlir::memref::StoreOp>(user);
-  if (!store ||
-      pointer::stripCasts(store.getMemref()) != pointer::stripCasts(flag))
-    return false;
-  if (store.getIndices().size() != 1)
-    return false;
-  auto index = constant::index(store.getIndices().front());
-  return index && *index == 0 && constant::memrefInt(store.getValue(), 0);
-}
-
-static mlir::LogicalResult verify(mlir::Value flag, mlir::Operation *owner,
-                                  mlir::DominanceInfo &dominance) {
-  mlir::Operation *init = nullptr;
-  for (mlir::Operation *user : flag.getUsers()) {
-    if (!store(flag, user))
-      continue;
-    if (init)
-      return user->emitOpError(
-          "async cancel flag has multiple zero initialization stores");
-    init = user;
-  }
-
-  if (!init)
-    return owner->emitOpError(
-        "async cancel flag allocation lacks zero initialization store");
-
-  for (mlir::Operation *user : flag.getUsers()) {
-    if (user == init)
-      continue;
-    if (!dominance.dominates(init, user))
-      return user->emitOpError("async cancel flag is used before its zero "
-                               "initialization store");
-  }
-  return mlir::success();
-}
-
-} // namespace init
-
-} // namespace cancel_flag
 
 mlir::LogicalResult
 verifier::async_runtime::Cells::verify(mlir::Operation *funcLike) {
@@ -410,21 +377,6 @@ verifier::async_runtime::Cells::verify(mlir::Operation *funcLike) {
       failedAny = true;
     if (mlir::failed(exception_cell::lifetime::verify(
             alloc.getResult(), dominance, alloc.getOperation())))
-      failedAny = true;
-  });
-
-  funcLike->walk([&](mlir::memref::AllocOp alloc) {
-    if (!alloc->hasAttr(AsyncSafetyAttrs::kCancelFlag))
-      return;
-    if (mlir::failed(cancel_flag::init::verify(
-            alloc.getResult(), alloc.getOperation(), dominance)))
-      failedAny = true;
-  });
-  funcLike->walk([&](mlir::memref::AllocaOp alloca) {
-    if (!alloca->hasAttr(AsyncSafetyAttrs::kCancelFlag))
-      return;
-    if (mlir::failed(cancel_flag::init::verify(
-            alloca.getResult(), alloca.getOperation(), dominance)))
       failedAny = true;
   });
 

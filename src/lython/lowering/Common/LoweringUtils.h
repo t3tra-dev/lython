@@ -77,6 +77,15 @@ inline mlir::SmallVector<int64_t> i64Array(mlir::Operation *op,
 
 inline mlir::LogicalResult verifyNoUnrealizedCasts(mlir::ModuleOp module,
                                                    llvm::StringRef boundary) {
+  llvm::SmallVector<mlir::UnrealizedConversionCastOp> deadCasts;
+  module.walk([&](mlir::UnrealizedConversionCastOp cast) {
+    if (llvm::all_of(cast->getResults(),
+                     [](mlir::Value result) { return result.use_empty(); }))
+      deadCasts.push_back(cast);
+  });
+  for (mlir::UnrealizedConversionCastOp cast : deadCasts)
+    cast.erase();
+
   mlir::UnrealizedConversionCastOp offender = nullptr;
   module.walk([&](mlir::UnrealizedConversionCastOp cast) {
     for (mlir::Operation *user : cast.getResult(0).getUsers())

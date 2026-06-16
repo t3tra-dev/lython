@@ -1,6 +1,4 @@
-#include "lython/parser/Parser.h"
-
-#include "lython/parser/CpythonSpec.h"
+#include "Parser.h"
 
 #include "../pegen.h"
 #include "CpythonPegAdapter.h"
@@ -16,7 +14,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <initializer_list>
-#include <iomanip>
 #include <limits>
 #include <map>
 #include <optional>

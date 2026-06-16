@@ -75,6 +75,10 @@ const char *exceptionClassName(std::int64_t classId) {
     return "IndexError";
   case 8:
     return "AssertionError";
+  case 9:
+    return "StopIteration";
+  case 10:
+    return "StopAsyncIteration";
   default:
     return "Exception";
   }

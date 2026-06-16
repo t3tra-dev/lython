@@ -4,10 +4,15 @@
 #include <tuple>
 #include <utility>
 
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/TypeSupport.h"
 #include "mlir/IR/Types.h"
 #include "llvm/ADT/StringRef.h"
+
+namespace mlir {
+class Operation;
+} // namespace mlir
 
 namespace py {
 
@@ -25,12 +30,12 @@ enum class TypeKind : unsigned {
   ExceptionCell,
   Traceback,
   Location,
-  FuncSig,
-  Func,
-  PrimFunc,
-  Coroutine,
-  Task,
-  Future
+  Callable,
+  Union,
+  Object,
+  Type,
+  Protocol,
+  Self
 };
 
 namespace detail {
@@ -107,72 +112,104 @@ struct ClassTypeStorage : public mlir::TypeStorage {
   ::llvm::StringRef className;
 };
 
-struct FuncSignatureStorage : public mlir::TypeStorage {
-  // Key order: positional, vararg, kwonly, kwargs, results
-  using KeyTy = std::tuple<mlir::ArrayRef<mlir::Type>, mlir::Type,
-                           mlir::ArrayRef<mlir::Type>, mlir::Type,
-                           mlir::ArrayRef<mlir::Type>>;
+struct CallableTypeStorage : public mlir::TypeStorage {
+  // Key order: positional, vararg, kwonly, kwargs, results, positional-only
+  // count, positional names, kwonly names, positional default flags, kwonly
+  // default flags, vararg name, kwargs name.
+  using KeyTy = std::tuple<
+      mlir::ArrayRef<mlir::Type>, mlir::Type, mlir::ArrayRef<mlir::Type>,
+      mlir::Type, mlir::ArrayRef<mlir::Type>, unsigned,
+      mlir::ArrayRef<mlir::StringAttr>, mlir::ArrayRef<mlir::StringAttr>,
+      mlir::ArrayRef<mlir::BoolAttr>, mlir::ArrayRef<mlir::BoolAttr>,
+      mlir::StringAttr, mlir::StringAttr>;
 
-  FuncSignatureStorage(mlir::ArrayRef<mlir::Type> positional, mlir::Type vararg,
-                       mlir::ArrayRef<mlir::Type> kwonly, mlir::Type kwargs,
-                       mlir::ArrayRef<mlir::Type> results)
+  CallableTypeStorage(mlir::ArrayRef<mlir::Type> positional, mlir::Type vararg,
+                      mlir::ArrayRef<mlir::Type> kwonly, mlir::Type kwargs,
+                      mlir::ArrayRef<mlir::Type> results,
+                      unsigned positionalOnlyCount,
+                      mlir::ArrayRef<mlir::StringAttr> positionalNames,
+                      mlir::ArrayRef<mlir::StringAttr> kwOnlyNames,
+                      mlir::ArrayRef<mlir::BoolAttr> positionalDefaults,
+                      mlir::ArrayRef<mlir::BoolAttr> kwOnlyDefaults,
+                      mlir::StringAttr varargName, mlir::StringAttr kwargsName)
       : positionalTypes(positional), varargType(vararg), kwOnlyTypes(kwonly),
-        kwargsType(kwargs), resultTypes(results) {}
+        kwargsType(kwargs), resultTypes(results),
+        positionalOnlyCount(positionalOnlyCount),
+        positionalNames(positionalNames), kwOnlyNames(kwOnlyNames),
+        positionalDefaults(positionalDefaults), kwOnlyDefaults(kwOnlyDefaults),
+        varargName(varargName), kwargsName(kwargsName) {}
 
   bool operator==(const KeyTy &key) const {
     return std::get<0>(key) == positionalTypes &&
            std::get<1>(key) == varargType && std::get<2>(key) == kwOnlyTypes &&
-           std::get<3>(key) == kwargsType && std::get<4>(key) == resultTypes;
+           std::get<3>(key) == kwargsType && std::get<4>(key) == resultTypes &&
+           std::get<5>(key) == positionalOnlyCount &&
+           std::get<6>(key) == positionalNames &&
+           std::get<7>(key) == kwOnlyNames &&
+           std::get<8>(key) == positionalDefaults &&
+           std::get<9>(key) == kwOnlyDefaults &&
+           std::get<10>(key) == varargName && std::get<11>(key) == kwargsName;
   }
 
-  static FuncSignatureStorage *construct(mlir::TypeStorageAllocator &allocator,
-                                         const KeyTy &key);
+  static CallableTypeStorage *construct(mlir::TypeStorageAllocator &allocator,
+                                        const KeyTy &key);
 
   mlir::ArrayRef<mlir::Type> positionalTypes;
   mlir::Type varargType;
   mlir::ArrayRef<mlir::Type> kwOnlyTypes;
   mlir::Type kwargsType;
   mlir::ArrayRef<mlir::Type> resultTypes;
+  unsigned positionalOnlyCount;
+  mlir::ArrayRef<mlir::StringAttr> positionalNames;
+  mlir::ArrayRef<mlir::StringAttr> kwOnlyNames;
+  mlir::ArrayRef<mlir::BoolAttr> positionalDefaults;
+  mlir::ArrayRef<mlir::BoolAttr> kwOnlyDefaults;
+  mlir::StringAttr varargName;
+  mlir::StringAttr kwargsName;
 };
 
-struct FuncTypeStorage : public mlir::TypeStorage {
+struct UnaryTypeStorage : public mlir::TypeStorage {
   using KeyTy = mlir::Type;
 
-  explicit FuncTypeStorage(mlir::Type signature) : signature(signature) {}
+  explicit UnaryTypeStorage(mlir::Type value) : valueType(value) {}
 
-  bool operator==(const KeyTy &key) const { return key == signature; }
+  bool operator==(const KeyTy &key) const { return key == valueType; }
 
-  static FuncTypeStorage *construct(mlir::TypeStorageAllocator &allocator,
-                                    const KeyTy &key);
+  static UnaryTypeStorage *construct(mlir::TypeStorageAllocator &allocator,
+                                     const KeyTy &key);
 
-  mlir::Type signature;
+  mlir::Type valueType;
 };
 
-struct FunctionTypeStorage : public mlir::TypeStorage {
-  using KeyTy = mlir::FunctionType;
+struct UnionTypeStorage : public mlir::TypeStorage {
+  using KeyTy = mlir::ArrayRef<mlir::Type>;
 
-  explicit FunctionTypeStorage(mlir::FunctionType signature)
-      : signature(signature) {}
+  explicit UnionTypeStorage(mlir::ArrayRef<mlir::Type> members)
+      : memberTypes(members) {}
 
-  bool operator==(const KeyTy &key) const { return key == signature; }
+  bool operator==(const KeyTy &key) const { return key == memberTypes; }
 
-  static FunctionTypeStorage *construct(mlir::TypeStorageAllocator &allocator,
+  static UnionTypeStorage *construct(mlir::TypeStorageAllocator &allocator,
+                                     const KeyTy &key);
+
+  mlir::ArrayRef<mlir::Type> memberTypes;
+};
+
+struct ProtocolTypeStorage : public mlir::TypeStorage {
+  using KeyTy = std::pair<::llvm::StringRef, mlir::ArrayRef<mlir::Type>>;
+
+  ProtocolTypeStorage(::llvm::StringRef name, mlir::ArrayRef<mlir::Type> args)
+      : protocolName(name), arguments(args) {}
+
+  bool operator==(const KeyTy &key) const {
+    return key.first == protocolName && key.second == arguments;
+  }
+
+  static ProtocolTypeStorage *construct(mlir::TypeStorageAllocator &allocator,
                                         const KeyTy &key);
 
-  mlir::FunctionType signature;
-};
-
-struct AwaitableTypeStorage : public mlir::TypeStorage {
-  using KeyTy = mlir::Type;
-
-  explicit AwaitableTypeStorage(mlir::Type result) : resultType(result) {}
-
-  bool operator==(const KeyTy &key) const { return key == resultType; }
-
-  static AwaitableTypeStorage *construct(mlir::TypeStorageAllocator &allocator,
-                                         const KeyTy &key);
-
-  mlir::Type resultType;
+  ::llvm::StringRef protocolName;
+  mlir::ArrayRef<mlir::Type> arguments;
 };
 
 } // namespace detail
@@ -237,6 +274,18 @@ public:
   }
 };
 
+class ObjectType : public mlir::Type::TypeBase<ObjectType, mlir::Type,
+                                               detail::SimpleTypeStorage> {
+public:
+  using Base::Base;
+  static constexpr ::llvm::StringLiteral name{"py.object"};
+
+  static ObjectType get(mlir::MLIRContext *ctx);
+  static bool kindof(unsigned kind) {
+    return kind == static_cast<unsigned>(TypeKind::Object);
+  }
+};
+
 class TupleType : public mlir::Type::TypeBase<TupleType, mlir::Type,
                                               detail::TupleTypeStorage> {
 public:
@@ -280,6 +329,49 @@ public:
   }
 
   ::llvm::StringRef getClassName() const;
+};
+
+class TypeType : public mlir::Type::TypeBase<TypeType, mlir::Type,
+                                             detail::UnaryTypeStorage> {
+public:
+  using Base::Base;
+  static constexpr ::llvm::StringLiteral name{"py.type"};
+
+  static TypeType get(mlir::MLIRContext *ctx, mlir::Type instanceType);
+  static bool kindof(unsigned kind) {
+    return kind == static_cast<unsigned>(TypeKind::Type);
+  }
+
+  mlir::Type getInstanceType() const;
+};
+
+class ProtocolType : public mlir::Type::TypeBase<ProtocolType, mlir::Type,
+                                                 detail::ProtocolTypeStorage> {
+public:
+  using Base::Base;
+  static constexpr ::llvm::StringLiteral name{"py.protocol"};
+
+  static ProtocolType get(mlir::MLIRContext *ctx,
+                          ::llvm::StringRef protocolName,
+                          mlir::ArrayRef<mlir::Type> arguments);
+  static bool kindof(unsigned kind) {
+    return kind == static_cast<unsigned>(TypeKind::Protocol);
+  }
+
+  ::llvm::StringRef getProtocolName() const;
+  mlir::ArrayRef<mlir::Type> getArguments() const;
+};
+
+class SelfType : public mlir::Type::TypeBase<SelfType, mlir::Type,
+                                             detail::SimpleTypeStorage> {
+public:
+  using Base::Base;
+  static constexpr ::llvm::StringLiteral name{"py.self"};
+
+  static SelfType get(mlir::MLIRContext *ctx);
+  static bool kindof(unsigned kind) {
+    return kind == static_cast<unsigned>(TypeKind::Self);
+  }
 };
 
 class ListType : public mlir::Type::TypeBase<ListType, mlir::Type,
@@ -345,20 +437,29 @@ public:
   }
 };
 
-class FuncSignatureType
-    : public mlir::Type::TypeBase<FuncSignatureType, mlir::Type,
-                                  detail::FuncSignatureStorage> {
+class CallableType : public mlir::Type::TypeBase<CallableType, mlir::Type,
+                                                 detail::CallableTypeStorage> {
 public:
   using Base::Base;
-  static constexpr ::llvm::StringLiteral name{"py.funcsig"};
+  static constexpr ::llvm::StringLiteral name{"py.callable"};
 
-  static FuncSignatureType get(mlir::MLIRContext *ctx,
-                               mlir::ArrayRef<mlir::Type> positional,
-                               mlir::ArrayRef<mlir::Type> kwonly,
-                               mlir::Type varargType, mlir::Type kwargsType,
-                               mlir::ArrayRef<mlir::Type> results);
+  static CallableType get(mlir::MLIRContext *ctx,
+                          mlir::ArrayRef<mlir::Type> positional,
+                          mlir::ArrayRef<mlir::Type> kwonly,
+                          mlir::Type varargType, mlir::Type kwargsType,
+                          mlir::ArrayRef<mlir::Type> results);
+  static CallableType
+  get(mlir::MLIRContext *ctx, mlir::ArrayRef<mlir::Type> positional,
+      mlir::ArrayRef<mlir::Type> kwonly, mlir::Type varargType,
+      mlir::Type kwargsType, mlir::ArrayRef<mlir::Type> results,
+      mlir::ArrayRef<mlir::StringAttr> positionalNames,
+      mlir::ArrayRef<mlir::StringAttr> kwOnlyNames,
+      mlir::ArrayRef<mlir::BoolAttr> positionalDefaults,
+      mlir::ArrayRef<mlir::BoolAttr> kwOnlyDefaults,
+      mlir::StringAttr varargName = {}, mlir::StringAttr kwargsName = {},
+      unsigned positionalOnlyCount = 0);
   static bool kindof(unsigned kind) {
-    return kind == static_cast<unsigned>(TypeKind::FuncSig);
+    return kind == static_cast<unsigned>(TypeKind::Callable);
   }
 
   mlir::ArrayRef<mlir::Type> getPositionalTypes() const;
@@ -368,77 +469,39 @@ public:
   mlir::Type getVarargType() const;
   bool hasKwarg() const;
   mlir::Type getKwargType() const;
+  mlir::ArrayRef<mlir::StringAttr> getPositionalNames() const;
+  mlir::ArrayRef<mlir::StringAttr> getKwOnlyNames() const;
+  mlir::ArrayRef<mlir::BoolAttr> getPositionalDefaults() const;
+  mlir::ArrayRef<mlir::BoolAttr> getKwOnlyDefaults() const;
+  mlir::StringAttr getVarargName() const;
+  mlir::StringAttr getKwargName() const;
+  unsigned getPositionalOnlyCount() const;
+  bool hasParameterMetadata() const;
 };
 
-class FuncType : public mlir::Type::TypeBase<FuncType, mlir::Type,
-                                             detail::FuncTypeStorage> {
+class UnionType : public mlir::Type::TypeBase<UnionType, mlir::Type,
+                                              detail::UnionTypeStorage> {
 public:
   using Base::Base;
-  static constexpr ::llvm::StringLiteral name{"py.func"};
+  static constexpr ::llvm::StringLiteral name{"py.union"};
 
-  static FuncType get(mlir::MLIRContext *ctx, FuncSignatureType signature);
+  // Returns the normalized union of `memberTypes`: nested unions are
+  // flattened, duplicates removed, and members sorted by a deterministic
+  // canonical key. A single distinct member collapses to that member (the
+  // result is then not a UnionType). Zero members returns a null type.
+  static mlir::Type getNormalized(mlir::MLIRContext *ctx,
+                                  mlir::ArrayRef<mlir::Type> memberTypes);
   static bool kindof(unsigned kind) {
-    return kind == static_cast<unsigned>(TypeKind::Func);
+    return kind == static_cast<unsigned>(TypeKind::Union);
   }
 
-  FuncSignatureType getSignature() const;
-};
+  mlir::ArrayRef<mlir::Type> getMemberTypes() const;
+  bool hasMember(mlir::Type member) const;
 
-class PrimFuncType : public mlir::Type::TypeBase<PrimFuncType, mlir::Type,
-                                                 detail::FunctionTypeStorage> {
-public:
-  using Base::Base;
-  static constexpr ::llvm::StringLiteral name{"py.prim.func"};
-
-  static PrimFuncType get(mlir::MLIRContext *ctx, mlir::FunctionType signature);
-  static bool kindof(unsigned kind) {
-    return kind == static_cast<unsigned>(TypeKind::PrimFunc);
-  }
-
-  mlir::FunctionType getSignature() const;
-};
-
-class CoroutineType
-    : public mlir::Type::TypeBase<CoroutineType, mlir::Type,
-                                  detail::AwaitableTypeStorage> {
-public:
-  using Base::Base;
-  static constexpr ::llvm::StringLiteral name{"py.coro"};
-
-  static CoroutineType get(mlir::MLIRContext *ctx, mlir::Type resultType);
-  static bool kindof(unsigned kind) {
-    return kind == static_cast<unsigned>(TypeKind::Coroutine);
-  }
-
-  mlir::Type getResultType() const;
-};
-
-class TaskType : public mlir::Type::TypeBase<TaskType, mlir::Type,
-                                             detail::AwaitableTypeStorage> {
-public:
-  using Base::Base;
-  static constexpr ::llvm::StringLiteral name{"py.task"};
-
-  static TaskType get(mlir::MLIRContext *ctx, mlir::Type resultType);
-  static bool kindof(unsigned kind) {
-    return kind == static_cast<unsigned>(TypeKind::Task);
-  }
-
-  mlir::Type getResultType() const;
-};
-
-class FutureType : public mlir::Type::TypeBase<FutureType, mlir::Type,
-                                               detail::AwaitableTypeStorage> {
-public:
-  using Base::Base;
-  static constexpr ::llvm::StringLiteral name{"py.future"};
-
-  static FutureType get(mlir::MLIRContext *ctx, mlir::Type resultType);
-  static bool kindof(unsigned kind) {
-    return kind == static_cast<unsigned>(TypeKind::Future);
-  }
-
-  mlir::Type getResultType() const;
+  // Optional shape: exactly two members, one of which is !py.none.
+  bool isOptional() const;
+  // The non-None member of an Optional-shaped union; null otherwise.
+  mlir::Type getOptionalPayloadType() const;
 };
 
 bool isPyIntType(mlir::Type type);
@@ -446,29 +509,37 @@ bool isPyFloatType(mlir::Type type);
 bool isPyBoolType(mlir::Type type);
 bool isPyStrType(mlir::Type type);
 bool isPyNoneType(mlir::Type type);
+bool isPyObjectType(mlir::Type type);
 bool isPyTupleType(mlir::Type type);
 bool isPyDictType(mlir::Type type);
 bool isPyListType(mlir::Type type);
 bool isPyClassType(mlir::Type type);
+bool isPyTypeType(mlir::Type type);
+bool isPyProtocolType(mlir::Type type);
+bool isPySelfType(mlir::Type type);
 bool isPyExceptionType(mlir::Type type);
 bool isPyExceptionCellType(mlir::Type type);
 bool isPyTracebackType(mlir::Type type);
 bool isPyLocationType(mlir::Type type);
-bool isPyFuncSigType(mlir::Type type);
-bool isPyFuncType(mlir::Type type);
-bool isPyPrimFuncType(mlir::Type type);
-bool isPyCoroutineType(mlir::Type type);
-bool isPyTaskType(mlir::Type type);
-bool isPyFutureType(mlir::Type type);
+bool isPyUnionType(mlir::Type type);
 
-// v2: Callable type checking (!py.func or !py.class with __call__)
+// Callable contract checking. A Callable contract owns the complete static
+// __call__ shape, including parameter and return metadata.
 bool isCallableType(mlir::Type type);
-bool isAwaitableType(mlir::Type type);
+CallableType getCallableContract(mlir::Type type);
 
 bool isPyType(mlir::Type type);
 
+// Awaitable contract helpers. These cover the dialect-level awaitable
+// primitives and the manifest protocol spellings whose payload is encoded in
+// the type arguments.
+bool isCoroutineProtocolType(mlir::Type type);
+mlir::Type awaitablePayloadType(mlir::Type type);
+
 // Subtype checking (v2.1)
 bool isSubtypeOf(mlir::Type subtype, mlir::Type supertype);
+bool isSubtypeOf(mlir::Type subtype, mlir::Type supertype,
+                 mlir::Operation *from);
 
 } // namespace py
 

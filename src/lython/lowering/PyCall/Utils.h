@@ -20,7 +20,7 @@ bool isBuiltinPrintCallable(mlir::Value callable);
 bool isBuiltinPrintRawCallable(mlir::Value callable);
 void ensureLandingpad(mlir::Block *unwind, mlir::Location loc,
                       mlir::ConversionPatternRewriter &rewriter);
-bool canUseVoidHelper(CallVectorOp op, mlir::func::FuncOp callee);
+bool canUseVoidHelper(CallOp op, mlir::func::FuncOp callee);
 mlir::Value stripBridgeCasts(mlir::Value value);
 
 mlir::func::FuncOp resolvePreferredDirectHelper(mlir::func::FuncOp callee,
@@ -31,7 +31,7 @@ mlir::LogicalResult appendFlattenedCallOperands(
     mlir::Location loc, mlir::ValueRange elements, mlir::FunctionType funcType,
     unsigned directInputCount, llvm::SmallVectorImpl<mlir::Value> &operands,
     mlir::RewriterBase &rewriter, const PyLLVMTypeConverter &typeConverter);
-void eraseNoneResultUsers(CallVectorOp op, mlir::RewriterBase &rewriter);
+void eraseNoneResultUsers(CallOp op, mlir::RewriterBase &rewriter);
 void materializeLogicalResults(mlir::Location loc, mlir::TypeRange logicalTypes,
                                mlir::ValueRange loweredResults,
                                llvm::SmallVectorImpl<mlir::Value> &results,

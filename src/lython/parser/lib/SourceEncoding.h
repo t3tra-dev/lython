@@ -1,6 +1,6 @@
 #pragma once
 
-#include "lython/parser/Diagnostics.h"
+#include "Diagnostics.h"
 
 #include <string>
 #include <string_view>

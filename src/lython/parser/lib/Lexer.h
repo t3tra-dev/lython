@@ -1,7 +1,7 @@
 #pragma once
 
+#include "Diagnostics.h"
 #include "Token.h"
-#include "lython/parser/Diagnostics.h"
 
 #include <cstddef>
 #include <string_view>

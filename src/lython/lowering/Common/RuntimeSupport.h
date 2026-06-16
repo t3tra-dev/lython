@@ -52,6 +52,8 @@ struct RuntimeSymbols {
   static constexpr llvm::StringLiteral kUnicodeCopy{"LyUnicode_Copy"};
   static constexpr llvm::StringLiteral kUnicodeEqBool{"LyUnicode_EqBool"};
   static constexpr llvm::StringLiteral kUnicodeLength{"LyUnicode_Length"};
+  static constexpr llvm::StringLiteral kUnicodeCodepointLength{
+      "LyUnicode_CodepointLength"};
   static constexpr llvm::StringLiteral kUnicodePrint{"LyUnicode_Print"};
   static constexpr llvm::StringLiteral kUnicodePrintLine{"LyUnicode_PrintLine"};
   static constexpr llvm::StringLiteral kUnicodeDecRef{"LyUnicode_DecRef"};
@@ -184,9 +186,6 @@ static constexpr llvm::StringLiteral kRoleClassLockAcquire{
     "class.lock.acquire"};
 static constexpr llvm::StringLiteral kRoleClassLockRelease{
     "class.lock.release"};
-static constexpr llvm::StringLiteral kRoleAsyncCancelRequest{
-    "async.cancel.request"};
-static constexpr llvm::StringLiteral kRoleAsyncCancelLoad{"async.cancel.load"};
 static constexpr llvm::StringLiteral kRoleAsyncExceptionLoad{
     "async.exception.load"};
 static constexpr llvm::StringLiteral kRoleAsyncExceptionStore{
@@ -277,9 +276,10 @@ static constexpr llvm::StringLiteral kExceptionCellAllocated{
     "ly.async.exception_cell_allocated"};
 static constexpr llvm::StringLiteral kExceptionCellFree{
     "ly.async.exception_cell_free"};
+static constexpr llvm::StringLiteral kExceptionCellTransferArgs{
+    "ly.async.exception_cell_transfer_args"};
 static constexpr llvm::StringLiteral kExceptionCellPayloadStore{
     "ly.async.exception_cell_payload_store"};
-static constexpr llvm::StringLiteral kCancelFlag{"ly.async.cancel_flag"};
 static constexpr llvm::StringLiteral kRuntimeHandle{"ly.async.runtime_handle"};
 static constexpr llvm::StringLiteral kRuntimeRefcountDelta{
     "ly.async.runtime_refcount_delta"};
@@ -302,7 +302,6 @@ static constexpr llvm::StringLiteral kRuntimeValueStorage{
 enum class AsyncArgProvenanceKind {
   RuntimeHandle,
   ExceptionCell,
-  CancelFlag,
 };
 
 struct AsyncArgProvenanceContract {
@@ -456,11 +455,6 @@ mlir::MemRefType getExceptionCellType(mlir::MLIRContext *ctx);
 bool isExceptionCellType(mlir::Type type);
 bool isLoweredExceptionCellType(mlir::Type type);
 
-struct CancelFlag {
-  static void mark(mlir::Value value);
-  static void markArgument(mlir::Operation *funcLike, unsigned argIndex);
-};
-
 struct RuntimeHandle {
   static void mark(mlir::Value value);
   static void markArgument(mlir::Operation *funcLike, unsigned argIndex);
@@ -581,6 +575,26 @@ private:
   mlir::ModuleOp module;
 };
 
+namespace union_abi {
+
+// A union value lowers to an i64 active-member tag followed by the concatenated
+// parts of its non-None members in normalized member order. MemberSlice locates
+// each member's payload parts inside the lowered value. The None member has an
+// empty slice and is represented solely by its tag.
+struct MemberSlice {
+  mlir::Type memberType;
+  unsigned offset = 0;
+  unsigned count = 0;
+};
+
+std::optional<unsigned> memberTag(UnionType unionType, mlir::Type memberType);
+
+mlir::LogicalResult
+memberPartSlices(const PyLLVMTypeConverter &typeConverter, UnionType unionType,
+                 llvm::SmallVectorImpl<MemberSlice> &slices);
+
+} // namespace union_abi
+
 class RuntimeAPI {
 public:
   class Call {
@@ -663,6 +677,11 @@ namespace lowering::value::dict::Patterns {
 void populate(PyLLVMTypeConverter &typeConverter,
               mlir::RewritePatternSet &patterns);
 } // namespace lowering::value::dict::Patterns
+
+namespace lowering::value::union_::Patterns {
+void populate(PyLLVMTypeConverter &typeConverter,
+              mlir::RewritePatternSet &patterns);
+} // namespace lowering::value::union_::Patterns
 
 namespace lowering::call::Patterns {
 void populate(PyLLVMTypeConverter &typeConverter,

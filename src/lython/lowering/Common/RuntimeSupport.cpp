@@ -19,8 +19,6 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/StringExtras.h"
-#include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/FormatVariadic.h"
 
 #include <atomic>
@@ -301,6 +299,9 @@ getAggregateValueDefStringAttr(mlir::Value value, llvm::StringRef attrName) {
   mlir::Operation *def = value.getDefiningOp();
   if (!def)
     return std::nullopt;
+  if (auto result = mlir::dyn_cast<mlir::OpResult>(value))
+    if (auto attr = functionCallResultStringAttr(result, attrName))
+      return *attr;
   auto attr = def->getAttrOfType<mlir::StringAttr>(attrName);
   if (!attr)
     return std::nullopt;
@@ -793,6 +794,9 @@ getValueDefStringAttr(mlir::Value value, llvm::StringRef attrName) {
   mlir::Operation *def = value.getDefiningOp();
   if (!def)
     return std::nullopt;
+  if (auto result = mlir::dyn_cast<mlir::OpResult>(value))
+    if (auto attr = functionCallResultStringAttr(result, attrName))
+      return *attr;
   auto attr = def->getAttrOfType<mlir::StringAttr>(attrName);
   if (!attr)
     return std::nullopt;
@@ -1370,16 +1374,6 @@ void async_runtime::ExceptionCell::mark(mlir::Value value) {
                mlir::UnitAttr::get(def->getContext()));
 }
 
-void async_runtime::CancelFlag::mark(mlir::Value value) {
-  if (!value)
-    return;
-  mlir::Operation *def = value.getDefiningOp();
-  if (!def)
-    return;
-  def->setAttr(AsyncSafetyAttrs::kCancelFlag,
-               mlir::UnitAttr::get(def->getContext()));
-}
-
 void async_runtime::RuntimeHandle::mark(mlir::Value value) {
   if (!value)
     return;
@@ -1493,11 +1487,6 @@ hasExceptionCellProvenance(mlir::Value value,
 bool async_runtime::ExceptionCell::hasProvenance(mlir::Value value) {
   llvm::SmallPtrSet<mlir::Value, 8> seen;
   return hasExceptionCellProvenance(value, seen);
-}
-
-void async_runtime::CancelFlag::markArgument(mlir::Operation *funcLike,
-                                             unsigned argIndex) {
-  markFunctionArgument(funcLike, argIndex, AsyncSafetyAttrs::kCancelFlag);
 }
 
 void async_runtime::RuntimeHandle::markArgument(mlir::Operation *funcLike,
@@ -2087,19 +2076,13 @@ static void collectAsyncArgProvenance(
     llvm::StringRef name, mlir::func::FuncOp func, unsigned sourceArgIndex,
     unsigned flattenedIndex, mlir::Type inputType,
     llvm::SmallVectorImpl<AsyncArgProvenanceContract> &contracts) {
+  (void)inputType;
   if (getFuncArgAttr(func, sourceArgIndex, AsyncSafetyAttrs::kRuntimeHandle))
     contracts.push_back(
         {name.str(), flattenedIndex, AsyncArgProvenanceKind::RuntimeHandle});
   if (getFuncArgAttr(func, sourceArgIndex, AsyncSafetyAttrs::kExceptionCell))
     contracts.push_back(
         {name.str(), flattenedIndex, AsyncArgProvenanceKind::ExceptionCell});
-  if (getFuncArgAttr(func, sourceArgIndex, AsyncSafetyAttrs::kCancelFlag)) {
-    unsigned targetIndex = flattenedIndex;
-    if (mlir::isa<mlir::MemRefType>(inputType))
-      targetIndex = flattenedIndex + 1;
-    contracts.push_back(
-        {name.str(), targetIndex, AsyncArgProvenanceKind::CancelFlag});
-  }
 }
 
 void collectAsyncArgProvenanceContracts(
@@ -2218,9 +2201,6 @@ mlir::LogicalResult preserveLLVMAsyncArgProvenanceContracts(
           async_runtime::ExceptionCell::markArgument(funcLike,
                                                      contract.argIndex);
           break;
-        case AsyncArgProvenanceKind::CancelFlag:
-          async_runtime::CancelFlag::markArgument(funcLike, contract.argIndex);
-          break;
         }
       });
 }
@@ -2258,6 +2238,14 @@ void collectMemRefAtomicContracts(
         containerKind = builder.getStringAttr(*kindName);
     if (!containerKind)
       containerKind = inferContainerKindAttr(atomic.getMemref(), builder);
+    if (!containerKind && group) {
+      llvm::StringRef kindName =
+          group.getValue().take_until([](char c) { return c == '.'; });
+      if (kindName == ContainerSafetyAttrs::kKindList ||
+          kindName == ContainerSafetyAttrs::kKindTuple ||
+          kindName == ContainerSafetyAttrs::kKindDict)
+        containerKind = builder.getStringAttr(kindName);
+    }
     auto component = atomic->getAttrOfType<mlir::StringAttr>(
         ThreadSafetyAttrs::kAtomicMemRefComponent);
     if (!component)
@@ -2366,12 +2354,6 @@ mlir::LogicalResult preserveLoweredMemRefAtomicContracts(
       atomic->setAttr(ThreadSafetyAttrs::kAtomicProvenance,
                       builder.getStringAttr(
                           ThreadSafetyAttrs::kProvenanceMemRefDescriptor));
-    }
-    if (contract.role.getValue() ==
-        ThreadSafetyAttrs::kRoleAsyncCancelRequest) {
-      atomic->setAttr(AsyncSafetyAttrs::kCancelFlag,
-                      mlir::UnitAttr::get(atomic.getContext()));
-      async_runtime::CancelFlag::mark(atomic.getPtr());
     }
     if (contract.ownedTokenVerified)
       threadsafe::Retain::verifyOwnedToken(
@@ -2758,25 +2740,55 @@ preserveLoweredSafetyContracts(mlir::ModuleOp module,
 }
 
 static bool isPyRuntimeBridgeType(mlir::Type type) {
-  return isPyType(type) || mlir::isa<FuncType>(type) ||
-         mlir::isa<TupleType>(type) || mlir::isa<ListType>(type) ||
-         mlir::isa<ClassType>(type) || mlir::isa<DictType>(type) ||
-         mlir::isa<CoroutineType>(type) || mlir::isa<FutureType>(type) ||
-         mlir::isa<TaskType>(type);
+  return isPyType(type) || mlir::isa<TupleType>(type) ||
+         mlir::isa<ListType>(type) || mlir::isa<ClassType>(type) ||
+         mlir::isa<DictType>(type);
+}
+
+static mlir::Type coroutineProtocolPayloadType(mlir::Type type) {
+  if (!isCoroutineProtocolType(type))
+    return {};
+  return awaitablePayloadType(type);
 }
 
 static bool isConvertedAsyncDescriptorBridge(mlir::Type resultType,
                                              mlir::ValueRange inputs) {
-  if (!mlir::isa<CoroutineType, FutureType, TaskType>(resultType))
+  if (!coroutineProtocolPayloadType(resultType))
     return false;
-  bool expectsCancelFlag = mlir::isa<TaskType>(resultType);
-  if (inputs.size() != (expectsCancelFlag ? 3 : 2))
+  if (inputs.size() != 2)
     return false;
   if (!mlir::isa<mlir::async::ValueType>(inputs[0].getType()))
     return false;
   if (!async_runtime::ExceptionCell::hasProvenance(inputs[1]))
     return false;
-  return !expectsCancelFlag || mlir::isa<mlir::MemRefType>(inputs[2].getType());
+  return true;
+}
+
+mlir::LogicalResult
+union_abi::memberPartSlices(const PyLLVMTypeConverter &typeConverter,
+                            UnionType unionType,
+                            llvm::SmallVectorImpl<MemberSlice> &slices) {
+  unsigned offset = 1; // slot 0 is the active-member tag.
+  for (mlir::Type member : unionType.getMemberTypes()) {
+    if (mlir::isa<NoneType>(member)) {
+      slices.push_back({member, offset, 0});
+      continue;
+    }
+    llvm::SmallVector<mlir::Type> parts;
+    if (mlir::failed(typeConverter.convertType(member, parts)) || parts.empty())
+      return mlir::failure();
+    slices.push_back({member, offset, static_cast<unsigned>(parts.size())});
+    offset += static_cast<unsigned>(parts.size());
+  }
+  return mlir::success();
+}
+
+std::optional<unsigned> union_abi::memberTag(UnionType unionType,
+                                             mlir::Type memberType) {
+  for (auto indexed : llvm::enumerate(unionType.getMemberTypes()))
+    if (indexed.value() == memberType)
+      return static_cast<unsigned>(indexed.index());
+  return std::nullopt;
 }
 
 PyLLVMTypeConverter::PyLLVMTypeConverter(mlir::MLIRContext *ctx,
@@ -2808,8 +2820,8 @@ PyLLVMTypeConverter::PyLLVMTypeConverter(mlir::MLIRContext *ctx,
 
   addConversion([ctx, convertAsyncPayload](
                     mlir::Type type) -> std::optional<mlir::Type> {
-    if (mlir::isa<ListType, DictType, TupleType, CoroutineType, TaskType,
-                  FutureType>(type))
+    if (mlir::isa<ListType, DictType, TupleType>(type) ||
+        coroutineProtocolPayloadType(type))
       return std::nullopt;
     if (mlir::isa<BoolType>(type))
       return mlir::IntegerType::get(ctx, 1);
@@ -2819,7 +2831,7 @@ PyLLVMTypeConverter::PyLLVMTypeConverter(mlir::MLIRContext *ctx,
       return async_runtime::getExceptionCellType(ctx);
     if (mlir::isa<FloatType>(type))
       return mlir::Float64Type::get(ctx);
-    if (mlir::isa<FuncType>(type))
+    if (mlir::isa<CallableType>(type))
       return mlir::FunctionType::get(ctx, {}, {});
     if (auto asyncValueType = mlir::dyn_cast<mlir::async::ValueType>(type)) {
       auto valueType = convertAsyncPayload(asyncValueType.getValueType());
@@ -2833,6 +2845,31 @@ PyLLVMTypeConverter::PyLLVMTypeConverter(mlir::MLIRContext *ctx,
   addConversion([this, ctx, convertAsyncPayload](
                     mlir::Type type, mlir::SmallVectorImpl<mlir::Type> &results)
                     -> std::optional<mlir::LogicalResult> {
+    if (auto unionType = mlir::dyn_cast<UnionType>(type)) {
+      // A union lowers to an active-member tag followed by the concatenated
+      // payload parts of its non-None members in normalized member order.
+      // Inactive member payloads are zero-filled; None carries no payload.
+      results.push_back(mlir::IntegerType::get(ctx, 64));
+      for (mlir::Type member : unionType.getMemberTypes()) {
+        if (mlir::isa<NoneType>(member))
+          continue;
+        if (mlir::failed(convertType(member, results)))
+          return std::nullopt;
+      }
+      return mlir::success();
+    }
+    if (mlir::Type payloadType = coroutineProtocolPayloadType(type)) {
+      auto resultType = convertAsyncPayload(payloadType);
+      if (!resultType)
+        return std::nullopt;
+      results.push_back(mlir::async::ValueType::get(*resultType));
+      results.push_back(async_runtime::getExceptionCellType(ctx));
+      return mlir::success();
+    }
+    if (mlir::isa<ObjectType, ProtocolType, TracebackType, TypeType>(type)) {
+      results.push_back(object_abi::Header::owned(ctx));
+      return mlir::success();
+    }
     if (mlir::isa<IntType>(type)) {
       object_abi::long_abi::Parts::storageTypes(ctx, results);
       return mlir::success();
@@ -2854,28 +2891,7 @@ PyLLVMTypeConverter::PyLLVMTypeConverter(mlir::MLIRContext *ctx,
       return mlir::success();
     }
 
-    mlir::Type payloadType;
-    bool includeCancelFlag = false;
-    if (auto coroType = mlir::dyn_cast<CoroutineType>(type)) {
-      payloadType = coroType.getResultType();
-    } else if (auto futureType = mlir::dyn_cast<FutureType>(type)) {
-      payloadType = futureType.getResultType();
-    } else if (auto taskType = mlir::dyn_cast<TaskType>(type)) {
-      payloadType = taskType.getResultType();
-      includeCancelFlag = true;
-    } else {
-      return std::nullopt;
-    }
-    auto resultType = convertAsyncPayload(payloadType);
-    if (!resultType)
-      return std::nullopt;
-    results.push_back(mlir::async::ValueType::get(*resultType));
-    results.push_back(async_runtime::getExceptionCellType(ctx));
-    if (!includeCancelFlag)
-      return mlir::success();
-    results.push_back(
-        mlir::MemRefType::get({1}, mlir::IntegerType::get(ctx, 8)));
-    return mlir::success();
+    return std::nullopt;
   });
 
   addConversion(

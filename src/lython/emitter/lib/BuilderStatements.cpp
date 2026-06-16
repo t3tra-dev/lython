@@ -93,6 +93,8 @@ void Builder::Impl::emitStatement(const parser::Node &stmt) {
   if (stmt.kind == "Pass" || stmt.kind == "AsyncFunctionDef" ||
       stmt.kind == "ClassDef")
     return;
+  if (isTypeVarDefinition(stmt))
+    return;
   if (stmt.kind == "FunctionDef") {
     if (!inModuleMain) {
       emitNestedFunctionDef(stmt);
@@ -178,8 +180,7 @@ void Builder::Impl::emitStatement(const parser::Node &stmt) {
     return;
   }
   if (stmt.kind == "AsyncFor") {
-    error(stmt, "async for statement is parsed but async iterator lowering is "
-                "not implemented in the C++ emitter yet");
+    emitAsyncFor(stmt);
     return;
   }
   if (stmt.kind == "With") {
@@ -187,8 +188,7 @@ void Builder::Impl::emitStatement(const parser::Node &stmt) {
     return;
   }
   if (stmt.kind == "AsyncWith") {
-    error(stmt, "async with statement is parsed but async context-manager "
-                "lowering is not implemented in the C++ emitter yet");
+    emitAsyncWith(stmt);
     return;
   }
   if (stmt.kind == "While") {
@@ -286,6 +286,7 @@ void Builder::Impl::emitDelete(const parser::Node &stmt) {
     if (symbol != symbols.end())
       symbols.erase(symbol);
     primitiveConstants.erase(*name);
+    callableAliases.erase(*name);
     staticModules.erase(*name);
     staticModuleSymbols.erase(*name);
     staticAnnotationAliases.erase(*name);
@@ -303,7 +304,13 @@ void Builder::Impl::emitAssign(const parser::Node &stmt) {
       assignLiteralElementsToTarget(stmt, *targets->front(), **valueNode))
     return;
 
-  Value value = emitExpression(**valueNode);
+  std::optional<mlir::Type> expectedType;
+  if (targets->size() == 1 && targets->front())
+    expectedType = inferExpressionType(*targets->front());
+
+  Value value = expectedType
+                    ? emitExpressionWithExpectedType(**valueNode, *expectedType)
+                    : emitExpression(**valueNode);
   if (!value.value)
     return;
   if (targets->size() > 1 && py::isPyType(value.type)) {
@@ -536,6 +543,30 @@ bool Builder::Impl::assignLiteralElementsToTarget(const parser::Node &stmt,
   return true;
 }
 
+void Builder::Impl::updateCallableAliasForBinding(
+    llvm::StringRef name, const Value &value, const parser::Node *sourceNode) {
+  std::string key = name.str();
+  if (!py::isCallableType(value.type)) {
+    callableAliases.erase(key);
+    return;
+  }
+
+  if (value.callableInfo) {
+    callableAliases[key] = *value.callableInfo;
+    return;
+  }
+
+  std::optional<FunctionInfo> info;
+  if (sourceNode)
+    info = resolveCallableInfo(*sourceNode);
+  if (!info)
+    info = resolveCallableInfo(value.value);
+  if (info)
+    callableAliases[key] = *info;
+  else
+    callableAliases.erase(key);
+}
+
 void Builder::Impl::assignValueToTarget(const parser::Node &stmt,
                                         const parser::Node &target,
                                         const Value &value,
@@ -550,8 +581,10 @@ void Builder::Impl::assignValueToTarget(const parser::Node &stmt,
     mlir::Type elementType = finiteTupleElementType(tupleType, index);
     mlir::Value indexValue = builder.create<mlir::arith::ConstantIndexOp>(
         loc(anchor), static_cast<std::int64_t>(index));
-    mlir::Value component = builder.create<py::TupleGetOp>(
-        loc(anchor), elementType, value.value, indexValue);
+    py::CallableType contract =
+        unaryMethodContract(value.type, indexValue.getType(), elementType);
+    mlir::Value component = builder.create<py::GetItemOp>(
+        loc(anchor), elementType, contract, value.value, indexValue);
     return Value{component, elementType};
   };
   auto assignTupleRestList = [&](const parser::Node &starredTarget,
@@ -635,19 +668,7 @@ void Builder::Impl::assignValueToTarget(const parser::Node &stmt,
       return;
     }
     symbols[*name] = value;
-    if (mlir::isa<py::FuncType>(value.type)) {
-      std::optional<FunctionInfo> info;
-      if (sourceNode)
-        info = resolveCallableInfo(*sourceNode);
-      if (!info)
-        info = resolveCallableInfo(value.value);
-      if (info)
-        callableAliases[*name] = *info;
-      else
-        callableAliases.erase(*name);
-    } else {
-      callableAliases.erase(*name);
-    }
+    updateCallableAliasForBinding(*name, value, sourceNode);
     if (inModuleMain) {
       if (sourceNode) {
         if (std::optional<PrimitiveConstant> constant =
@@ -762,7 +783,8 @@ void Builder::Impl::assignValueToTarget(const parser::Node &stmt,
 
 void Builder::Impl::assignAttributeValue(const parser::Node &stmt,
                                          const parser::Node &target,
-                                         const Value &value) {
+                                         const Value &inputValue) {
+  Value value = inputValue;
   if (!value.value)
     return;
   const parser::NodePtr *objectNode = nodeField(target, "value");
@@ -774,24 +796,42 @@ void Builder::Impl::assignAttributeValue(const parser::Node &stmt,
   Value object = emitExpression(**objectNode);
   if (!object.value)
     return;
-  std::optional<std::string> className = classNameFromType(object.type);
-  if (!className) {
+  std::optional<std::string> staticClassName = classNameFromType(object.type);
+  if (!staticClassName) {
     error(target, "attribute assignment requires a class receiver");
     return;
   }
-  auto classFound = classes.find(*className);
-  if (classFound == classes.end()) {
-    error(target, "unknown class '" + *className + "'");
+
+  auto findField = [&](llvm::StringRef candidate)
+      -> std::optional<std::pair<std::string, mlir::Type>> {
+    auto classFound = classes.find(candidate.str());
+    if (classFound == classes.end())
+      return std::nullopt;
+    auto fieldFound = classFound->second.fields.find(*name);
+    if (fieldFound == classFound->second.fields.end())
+      return std::nullopt;
+    return std::make_pair(candidate.str(), fieldFound->second);
+  };
+
+  std::optional<std::pair<std::string, mlir::Type>> resolved;
+  if (std::optional<std::string> fact = classFactForView(object))
+    resolved = findField(*fact);
+  if (!resolved)
+    resolved = findField(*staticClassName);
+  if (!resolved) {
+    error(target,
+          "class '" + *staticClassName + "' has no field '" + *name + "'");
     return;
   }
-  auto fieldFound = classFound->second.fields.find(*name);
-  if (fieldFound == classFound->second.fields.end()) {
-    error(target, "class '" + *className + "' has no field '" + *name + "'");
-    return;
+  if (resolved->first != *staticClassName) {
+    object = viewClassAs(target, std::move(object), resolved->first);
+    if (!object.value)
+      return;
   }
-  if (value.type != fieldFound->second) {
+  value = coerceToExpectedType(stmt, std::move(value), resolved->second);
+  if (!typeAssignable(resolved->second, value.type)) {
     error(stmt, "attribute assignment type mismatch: expected " +
-                    typeString(fieldFound->second) + ", got " +
+                    typeString(resolved->second) + ", got " +
                     typeString(value.type));
     return;
   }
@@ -908,6 +948,7 @@ void Builder::Impl::emitAnnAssign(const parser::Node &stmt) {
   Value value = emitExpressionWithExpectedType(**valueNode, *annotatedType);
   if (!value.value)
     return;
+  value = coerceToExpectedType(**valueNode, std::move(value), *annotatedType);
   if (!typeAssignable(*annotatedType, value.type)) {
     error(stmt, "annotated assignment type mismatch: expected " +
                     typeString(*annotatedType) + ", got " +
@@ -932,6 +973,7 @@ void Builder::Impl::emitAnnAssign(const parser::Node &stmt) {
       return;
     }
     symbols[*name] = value;
+    updateCallableAliasForBinding(*name, value, valueNode->get());
     if (inModuleMain) {
       if (std::optional<PrimitiveConstant> constant =
               primitiveScalarConstructorConstant(**valueNode))
@@ -1016,6 +1058,7 @@ void Builder::Impl::emitAugAssign(const parser::Node &stmt) {
     if (!result.value)
       return;
     symbols[*name] = result;
+    updateCallableAliasForBinding(*name, result, valueNode->get());
     if (inModuleMain)
       primitiveConstants.erase(*name);
     return;
@@ -1072,9 +1115,11 @@ void Builder::Impl::emitAugAssign(const parser::Node &stmt) {
         emitDictSubscriptTarget(**target);
     if (!dictTarget)
       return;
-    mlir::Value current = builder.create<py::DictGetOp>(
-        loc(**target), dictTarget->valueType, dictTarget->container.value,
-        dictTarget->key.value);
+    mlir::Value current = builder.create<py::GetItemOp>(
+        loc(**target), dictTarget->valueType,
+        unaryMethodContract(dictTarget->container.type, dictTarget->key.type,
+                            dictTarget->valueType),
+        dictTarget->container.value, dictTarget->key.value);
     Value rhs = emitExpression(**valueNode);
     if (!rhs.value)
       return;
@@ -1090,6 +1135,191 @@ void Builder::Impl::emitAugAssign(const parser::Node &stmt) {
               "subscript augmented assignment targets for now");
 }
 
+std::optional<std::pair<const parser::Node *, mlir::Type>>
+Builder::Impl::matchIsinstanceCall(const parser::Node &call) {
+  if (call.kind != "Call")
+    return std::nullopt;
+  const parser::NodePtr *func = nodeField(call, "func");
+  const std::vector<parser::NodePtr> *args = nodeListField(call, "args");
+  const std::vector<parser::NodePtr> *keywords =
+      nodeListField(call, "keywords");
+  if (!func || !*func || (*func)->kind != "Name" || !args ||
+      args->size() != 2 || !(*args)[0] || !(*args)[1] ||
+      (keywords && !keywords->empty()))
+    return std::nullopt;
+  const std::string *callee = stringField(**func, "id");
+  if (!callee || *callee != "isinstance")
+    return std::nullopt;
+  std::optional<mlir::Type> memberType = typeFromAnnotation((*args)[1]);
+  if (!memberType)
+    return std::nullopt;
+  return std::make_pair((*args)[0].get(), *memberType);
+}
+
+std::optional<Builder::Impl::NarrowingTest>
+Builder::Impl::matchUnionNarrowingTest(const parser::Node &test) {
+  const parser::Node *nameNode = nullptr;
+  mlir::Type testedType;
+  bool negated = false;
+
+  if (test.kind == "Compare") {
+    const parser::NodePtr *lhsNode = nodeField(test, "left");
+    std::optional<std::vector<std::string>> ops = symbolListField(test, "ops");
+    const std::vector<parser::NodePtr> *comparators =
+        nodeListField(test, "comparators");
+    if (!lhsNode || !*lhsNode || !ops || !comparators || ops->size() != 1 ||
+        comparators->size() != 1 || !(*comparators)[0])
+      return std::nullopt;
+    llvm::StringRef op = (*ops)[0];
+    if (op != "is" && op != "is not")
+      return std::nullopt;
+
+    std::optional<int> lhsKey = singletonKey(**lhsNode);
+    std::optional<int> rhsKey = singletonKey(*(*comparators)[0]);
+    if (!lhsKey && rhsKey && *rhsKey == 0)
+      nameNode = lhsNode->get();
+    else if (!rhsKey && lhsKey && *lhsKey == 0)
+      nameNode = (*comparators)[0].get();
+    testedType = noneType();
+    negated = op == "is not";
+  } else if (test.kind == "Call") {
+    auto isinstanceMatch = matchIsinstanceCall(test);
+    if (!isinstanceMatch)
+      return std::nullopt;
+    nameNode = isinstanceMatch->first;
+    testedType = isinstanceMatch->second;
+  }
+
+  if (!nameNode || nameNode->kind != "Name" || !testedType)
+    return std::nullopt;
+  const std::string *name = stringField(*nameNode, "id");
+  if (!name)
+    return std::nullopt;
+  auto found = symbols.find(*name);
+  if (found == symbols.end())
+    return std::nullopt;
+  Value source = found->second;
+
+  auto baseStaticTruth = [&]() -> std::optional<bool> {
+    if (mlir::isa<py::NoneType>(testedType)) {
+      if (mlir::isa<py::NoneType>(source.type))
+        return true;
+      if (source.exactClass || mlir::isa<py::ClassType>(source.type))
+        return false;
+      return std::nullopt;
+    }
+
+    auto testedClass = mlir::dyn_cast<py::ClassType>(testedType);
+    if (!testedClass)
+      return std::nullopt;
+    if (source.exactClass)
+      return classSubtypeOf(*source.exactClass, testedClass.getClassName());
+    if (source.provenClass) {
+      if (classSubtypeOf(*source.provenClass, testedClass.getClassName()))
+        return true;
+      if (!classSubtypeOf(testedClass.getClassName(), *source.provenClass))
+        return false;
+    }
+    if (typeSubtypeOf(source.type, testedType))
+      return true;
+    auto sourceClass = mlir::dyn_cast<py::ClassType>(source.type);
+    if (sourceClass &&
+        !classSubtypeOf(testedClass.getClassName(),
+                        sourceClass.getClassName()) &&
+        !classSubtypeOf(sourceClass.getClassName(), testedClass.getClassName()))
+      return false;
+    return std::nullopt;
+  };
+
+  auto makeStaticTruth = [&](bool baseTruth) {
+    return negated ? !baseTruth : baseTruth;
+  };
+
+  std::optional<bool> knownBaseTruth = baseStaticTruth();
+  auto unionType = mlir::dyn_cast<py::UnionType>(source.type);
+  if (!unionType) {
+    auto sourceClass = mlir::dyn_cast<py::ClassType>(source.type);
+    auto testedClass = mlir::dyn_cast<py::ClassType>(testedType);
+    if (!sourceClass || !testedClass) {
+      if (!knownBaseTruth)
+        return std::nullopt;
+      return NarrowingTest{*name,
+                           source.type,
+                           {},
+                           {},
+                           negated,
+                           /*staticTruthKnown=*/true,
+                           makeStaticTruth(*knownBaseTruth)};
+    }
+
+    mlir::Type matchType;
+    if (typeSubtypeOf(source.type, testedType)) {
+      matchType = source.type;
+    } else if (classSubtypeOf(testedClass.getClassName(),
+                              sourceClass.getClassName())) {
+      matchType = testedType;
+    } else if (!knownBaseTruth || *knownBaseTruth) {
+      return std::nullopt;
+    }
+
+    bool staticTruthKnown = knownBaseTruth.has_value();
+    bool staticTruth =
+        staticTruthKnown ? makeStaticTruth(*knownBaseTruth) : false;
+    return NarrowingTest{*name,   source.type,      matchType,  {},
+                         negated, staticTruthKnown, staticTruth};
+  }
+
+  std::vector<UnionMemberMatch> matches =
+      unionMembersMatchingType(unionType, testedType,
+                               /*requireLayoutCompatibleDowncast=*/false);
+  if (matches.empty())
+    return knownBaseTruth ? std::optional<NarrowingTest>(
+                                NarrowingTest{*name,
+                                              source.type,
+                                              {},
+                                              {},
+                                              negated,
+                                              /*staticTruthKnown=*/true,
+                                              makeStaticTruth(*knownBaseTruth)})
+                          : std::nullopt;
+
+  bool viewAsTestedType =
+      mlir::isa<py::ClassType>(testedType) &&
+      llvm::all_of(matches, [&](const UnionMemberMatch &match) {
+        return match.sourceMember == match.narrowedType &&
+               typeSubtypeOf(match.sourceMember, testedType);
+      });
+
+  llvm::SmallVector<mlir::Type> matchTypes;
+  llvm::SmallVector<mlir::Type> excludedFromComplement;
+  if (viewAsTestedType) {
+    matchTypes.push_back(testedType);
+  }
+  for (const UnionMemberMatch &match : matches) {
+    if (!viewAsTestedType)
+      matchTypes.push_back(match.narrowedType);
+    if (match.sourceMember == match.narrowedType)
+      excludedFromComplement.push_back(match.sourceMember);
+  }
+
+  llvm::SmallVector<mlir::Type> complement;
+  for (mlir::Type member : unionType.getMemberTypes())
+    if (!llvm::is_contained(excludedFromComplement, member))
+      complement.push_back(member);
+
+  mlir::Type matchType = py::UnionType::getNormalized(&context, matchTypes);
+  mlir::Type complementType =
+      complement.empty() ? mlir::Type()
+                         : py::UnionType::getNormalized(&context, complement);
+  if (!matchType)
+    return std::nullopt;
+  bool staticTruthKnown = knownBaseTruth.has_value() || complement.empty();
+  bool staticTruth =
+      knownBaseTruth ? makeStaticTruth(*knownBaseTruth) : !negated;
+  return NarrowingTest{*name,   source.type,      matchType,  complementType,
+                       negated, staticTruthKnown, staticTruth};
+}
+
 void Builder::Impl::emitIf(const parser::Node &stmt) {
   const parser::NodePtr *test = nodeField(stmt, "test");
   const std::vector<parser::NodePtr> *body = nodeListField(stmt, "body");
@@ -1099,9 +1329,67 @@ void Builder::Impl::emitIf(const parser::Node &stmt) {
     return;
   }
 
-  Value condition = emitCondition(**test);
+  std::optional<NarrowingTest> narrowing = matchUnionNarrowingTest(**test);
+
+  Value condition =
+      narrowing && narrowing->staticTruthKnown
+          ? Value{builder.create<mlir::arith::ConstantIntOp>(
+                      loc(**test), narrowing->staticTruth ? 1 : 0, 1),
+                  i1Type()}
+          : emitCondition(**test);
   if (!condition.value)
     return;
+
+  // Branch-local narrowing: rebind the tested union local to its proven
+  // member (or to the complement subset union) via py.union.unwrap. The
+  // unwrap must be emitted at the current insertion point, which the caller
+  // positions inside the branch. Branches that never read the name skip the
+  // rebind: a dead unwrap would keep the union root live into early-exit
+  // branches and block the divergent-successor ownership drop. The proven
+  // None binding is skipped for the same reason.
+  auto narrowedSymbols = [&](const std::map<std::string, Value> &base,
+                             bool branchTruth,
+                             const std::vector<parser::NodePtr> *branchBody) {
+    std::map<std::string, Value> branchSymbols = base;
+    if (!narrowing)
+      return branchSymbols;
+    auto found = branchSymbols.find(narrowing->name);
+    if (found == branchSymbols.end() ||
+        found->second.type != narrowing->sourceType)
+      return branchSymbols;
+    const bool provesMatch = narrowing->negated ? !branchTruth : branchTruth;
+    mlir::Type targetType =
+        provesMatch ? narrowing->matchType : narrowing->complementType;
+    if (!targetType || mlir::isa<py::NoneType>(targetType))
+      return branchSymbols;
+    if (targetType == found->second.type)
+      return branchSymbols;
+    if (branchBody && !referencesName(*branchBody, narrowing->name))
+      return branchSymbols;
+    if (mlir::isa<py::UnionType>(found->second.type)) {
+      mlir::Value unwrapped = builder.create<py::UnionUnwrapOp>(
+          loc(stmt), targetType, found->second.value);
+      Value narrowed{unwrapped, targetType, found->second.exactClass,
+                     found->second.provenClass};
+      if (auto targetClass = mlir::dyn_cast<py::ClassType>(targetType)) {
+        if (narrowed.exactClass &&
+            !classSubtypeOf(*narrowed.exactClass, targetClass.getClassName()))
+          narrowed.exactClass.reset();
+        narrowed =
+            markProvenClass(std::move(narrowed), targetClass.getClassName());
+      }
+      found->second = std::move(narrowed);
+      return branchSymbols;
+    }
+    if (mlir::isa<py::ClassType>(found->second.type)) {
+      auto targetClass = mlir::dyn_cast<py::ClassType>(targetType);
+      if (!targetClass)
+        return branchSymbols;
+      found->second = viewClassAs(stmt, std::move(found->second),
+                                  targetClass.getClassName());
+    }
+    return branchSymbols;
+  };
 
   std::set<std::string> assignedNames;
   for (const parser::NodePtr &child : *body)
@@ -1250,7 +1538,7 @@ void Builder::Impl::emitIf(const parser::Node &stmt) {
     bool savedTerminated = blockTerminated;
 
     builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
-    symbols = outerSymbols;
+    symbols = narrowedSymbols(outerSymbols, /*branchTruth=*/true, body);
     callableAliases = outerCallableAliases;
     blockTerminated = false;
     for (const parser::NodePtr &child : *body) {
@@ -1261,7 +1549,7 @@ void Builder::Impl::emitIf(const parser::Node &stmt) {
       ensureScfYield(builder, loc(stmt), currentCarriedValues(symbols));
 
     builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
-    symbols = outerSymbols;
+    symbols = narrowedSymbols(outerSymbols, /*branchTruth=*/false, orelse);
     callableAliases = outerCallableAliases;
     blockTerminated = false;
     for (const parser::NodePtr &child : *orelse) {
@@ -1296,15 +1584,16 @@ void Builder::Impl::emitIf(const parser::Node &stmt) {
   std::map<std::string, Value> outerSymbols = symbols;
   std::map<std::string, FunctionInfo> outerCallableAliases = callableAliases;
   builder.setInsertionPointToStart(trueBlock);
-  bool trueTerminated =
-      emitStatementList(*body, outerSymbols, outerCallableAliases);
+  bool trueTerminated = emitStatementList(
+      *body, narrowedSymbols(outerSymbols, true, body), outerCallableAliases);
   if (!trueTerminated)
     builder.create<mlir::cf::BranchOp>(loc(), continueBlock,
                                        currentCarriedValues(symbols));
 
   builder.setInsertionPointToStart(falseBlock);
   bool falseTerminated =
-      emitStatementList(*orelse, outerSymbols, outerCallableAliases);
+      emitStatementList(*orelse, narrowedSymbols(outerSymbols, false, orelse),
+                        outerCallableAliases);
   if (!falseTerminated)
     builder.create<mlir::cf::BranchOp>(loc(), continueBlock,
                                        currentCarriedValues(symbols));
@@ -1321,6 +1610,12 @@ void Builder::Impl::emitIf(const parser::Node &stmt) {
     symbols[name] =
         Value{continueBlock->getArgument(index), carriedTypes[index]};
   blockTerminated = false;
+  // Early-exit narrowing: when exactly one branch reaches the continuation,
+  // its branch-local facts hold for the rest of the block
+  // (e.g. `if x is None: return` proves x is not None below the if).
+  if (trueTerminated != falseTerminated)
+    symbols = narrowedSymbols(symbols, /*branchTruth=*/falseTerminated,
+                              /*branchBody=*/nullptr);
 }
 
 void Builder::Impl::emitWith(const parser::Node &stmt) {
@@ -1380,25 +1675,76 @@ void Builder::Impl::emitWith(const parser::Node &stmt) {
     Value manager = emitExpression(**contextExpr);
     if (!manager.value)
       return;
+    if (std::optional<Value> concrete = concreteProtocolValue(manager))
+      manager = *concrete;
     std::optional<FunctionInfo> enter =
         resolveClassMethod(**contextExpr, manager, "__enter__");
     std::optional<FunctionInfo> exit =
         resolveClassMethod(**contextExpr, manager, "__exit__");
     if (!enter || !exit)
       return;
+    llvm::SmallVector<mlir::Type, 3> exitArgTypes{noneType(), noneType(),
+                                                  noneType()};
+    std::optional<py::ProtocolType> contextManager =
+        protocolType("ContextManager", {enter->resultType});
+    if (!contextManager) {
+      error(**contextExpr, "failed to instantiate ContextManager protocol");
+      return;
+    }
+    std::optional<mlir::Type> expectedEnter =
+        resolveProtocolMethodResult(**contextExpr, *contextManager, "__enter__",
+                                    {}, "ContextManager.__enter__");
+    if (!expectedEnter)
+      return;
+    if (!typeAssignable(*expectedEnter, enter->resultType)) {
+      error(**contextExpr, "ContextManager.__enter__ contract for " +
+                               typeString(*contextManager) +
+                               " does not match method result " +
+                               typeString(enter->resultType));
+      return;
+    }
+    std::optional<mlir::Type> expectedExit =
+        resolveProtocolMethodResult(**contextExpr, *contextManager, "__exit__",
+                                    exitArgTypes, "ContextManager.__exit__");
+    if (!expectedExit)
+      return;
+    if (!typeAssignable(*expectedExit, exit->resultType)) {
+      error(**contextExpr, "__exit__ must satisfy " +
+                               typeString(*contextManager) +
+                               " for __exit__(None, None, None), got " +
+                               typeString(exit->resultType));
+      return;
+    }
+    if (auto managerClass = mlir::dyn_cast<py::ClassType>(manager.type)) {
+      if (!classConformsToProtocol(managerClass, *contextManager)) {
+        error(**contextExpr,
+              "with context manager " + typeString(manager.type) +
+                  " does not satisfy " + typeString(*contextManager));
+        return;
+      }
+    }
     if (enter->mayThrow || exit->mayThrow) {
       error(**contextExpr, "with requires nothrow __enter__ and __exit__ "
                            "methods until exception-path lowering is "
                            "implemented");
       return;
     }
-    if (exit->resultType != boolType() && exit->resultType != noneType()) {
-      error(**contextExpr, "__exit__ must return bool or None in the current "
-                           "C++ emitter subset");
+    if (enter->isAsync || exit->isAsync) {
+      error(**contextExpr, "with requires synchronous __enter__ and __exit__ "
+                           "methods; use async with for async context "
+                           "managers");
       return;
     }
 
-    Value entered = emitResolvedMethodCall(**contextExpr, manager, *enter, {});
+    std::optional<std::vector<Value>> enterArgs =
+        prepareResolvedMethodCallArguments(**contextExpr, manager, *enter, {});
+    if (!enterArgs)
+      return;
+    auto enterOp = builder.create<py::EnterOp>(
+        loc(**contextExpr), enter->resultType, enter->symbolName,
+        enter->functionType, (*enterArgs)[0].value, mlir::UnitAttr{});
+    Value entered = applyReturnedClassSummary(
+        Value{enterOp.getResult(), enter->resultType}, *enter);
     if (!entered.value)
       return;
     if (optionalVars && *optionalVars)
@@ -1414,11 +1760,216 @@ void Builder::Impl::emitWith(const parser::Node &stmt) {
     return;
 
   for (auto it = activeContexts.rbegin(); it != activeContexts.rend(); ++it) {
-    mlir::Value none = builder.create<py::NoneOp>(loc(stmt), noneType());
-    Value noneValue{none, noneType()};
-    llvm::SmallVector<Value, 3> exitArgs{noneValue, noneValue, noneValue};
-    Value ignored =
-        emitResolvedMethodCall(stmt, it->manager, it->exit, exitArgs);
+    mlir::Value excType = builder.create<py::NoneOp>(loc(stmt), noneType());
+    mlir::Value excValue = builder.create<py::NoneOp>(loc(stmt), noneType());
+    mlir::Value traceback = builder.create<py::NoneOp>(loc(stmt), noneType());
+    llvm::SmallVector<Value, 3> exitArgs{Value{excType, noneType()},
+                                         Value{excValue, noneType()},
+                                         Value{traceback, noneType()}};
+    std::optional<std::vector<Value>> prepared =
+        prepareResolvedMethodCallArguments(stmt, it->manager, it->exit,
+                                           exitArgs);
+    if (!prepared)
+      return;
+    builder.create<py::ExitOp>(
+        loc(stmt), it->exit.resultType, it->exit.symbolName,
+        it->exit.functionType, (*prepared)[0].value, (*prepared)[1].value,
+        (*prepared)[2].value, (*prepared)[3].value, mlir::UnitAttr{});
+  }
+}
+
+void Builder::Impl::emitAsyncWith(const parser::Node &stmt) {
+  if (!inAsyncFunction) {
+    error(stmt, "async with statements are valid only inside async functions");
+    return;
+  }
+  if (inNativeFunction) {
+    error(stmt,
+          "async with statements are not supported inside @native functions");
+    return;
+  }
+
+  const std::vector<parser::NodePtr> *items = nodeListField(stmt, "items");
+  const std::vector<parser::NodePtr> *body = nodeListField(stmt, "body");
+  if (!items || items->empty() || !body) {
+    error(stmt, "AsyncWith.items or AsyncWith.body is missing");
+    return;
+  }
+  if (statementListHasUnstructuredControl(*body)) {
+    error(stmt, "async with body containing return, raise, break, continue, or "
+                "assert requires guaranteed __aexit__ control-flow lowering "
+                "and is not implemented yet");
+    return;
+  }
+  if (statementListMayThrow(*body)) {
+    error(stmt, "async with body may throw; __aexit__ exception suppression "
+                "lowering is not implemented yet");
+    return;
+  }
+
+  struct ActiveAsyncContext {
+    Value manager;
+    FunctionInfo exit;
+  };
+  std::vector<ActiveAsyncContext> activeContexts;
+  activeContexts.reserve(items->size());
+
+  for (const parser::NodePtr &item : *items) {
+    if (!item || item->kind != "withitem") {
+      error(stmt, "AsyncWith.items must contain withitem nodes");
+      return;
+    }
+    const parser::NodePtr *contextExpr = nodeField(*item, "context_expr");
+    const parser::NodePtr *optionalVars = nodeField(*item, "optional_vars");
+    if (!contextExpr || !*contextExpr) {
+      error(*item, "withitem.context_expr is missing");
+      return;
+    }
+    if ((*contextExpr)->kind == "Call") {
+      error(**contextExpr,
+            "async with context expression calls require "
+            "maythrow constructor/invoke analysis and are not "
+            "implemented yet; bind the manager before async with");
+      return;
+    }
+    if (expressionMayThrow(**contextExpr)) {
+      error(**contextExpr, "async with context expression may throw; __aexit__ "
+                           "exception-path lowering is not implemented yet");
+      return;
+    }
+
+    Value manager = emitExpression(**contextExpr);
+    if (!manager.value)
+      return;
+    if (std::optional<Value> concrete = concreteProtocolValue(manager))
+      manager = *concrete;
+    std::optional<FunctionInfo> enter =
+        resolveClassMethod(**contextExpr, manager, "__aenter__");
+    std::optional<FunctionInfo> exit =
+        resolveClassMethod(**contextExpr, manager, "__aexit__");
+    if (!enter || !exit)
+      return;
+
+    mlir::Type enterAwaitableType = methodAwaitableType(*enter);
+    mlir::Type exitAwaitableType = methodAwaitableType(*exit);
+    mlir::Type enterPayload = awaitablePayloadType(enterAwaitableType);
+    mlir::Type exitPayload = awaitablePayloadType(exitAwaitableType);
+    if (!enterPayload) {
+      error(**contextExpr, "__aenter__ must return an awaitable in async with, "
+                           "got " +
+                               typeString(enterAwaitableType));
+      return;
+    }
+    if (!exitPayload) {
+      error(**contextExpr, "__aexit__ must return an awaitable in async with, "
+                           "got " +
+                               typeString(exitAwaitableType));
+      return;
+    }
+    llvm::SmallVector<mlir::Type, 3> exitArgTypes{noneType(), noneType(),
+                                                  noneType()};
+    std::optional<py::ProtocolType> asyncContextManager =
+        protocolType("AsyncContextManager", {enterPayload});
+    if (!asyncContextManager) {
+      error(**contextExpr,
+            "failed to instantiate AsyncContextManager protocol");
+      return;
+    }
+    std::optional<mlir::Type> expectedEnterAwaitable =
+        resolveProtocolMethodResult(**contextExpr, *asyncContextManager,
+                                    "__aenter__", {},
+                                    "AsyncContextManager.__aenter__");
+    if (!expectedEnterAwaitable)
+      return;
+    if (!typeAssignable(*expectedEnterAwaitable, enterAwaitableType)) {
+      error(**contextExpr, "AsyncContextManager.__aenter__ contract for " +
+                               typeString(*asyncContextManager) +
+                               " does not match method result " +
+                               typeString(enterAwaitableType));
+      return;
+    }
+    std::optional<mlir::Type> expectedExitAwaitable =
+        resolveProtocolMethodResult(**contextExpr, *asyncContextManager,
+                                    "__aexit__", exitArgTypes,
+                                    "AsyncContextManager.__aexit__");
+    if (!expectedExitAwaitable)
+      return;
+    if (!typeAssignable(*expectedExitAwaitable, exitAwaitableType)) {
+      error(**contextExpr, "__aexit__ must satisfy " +
+                               typeString(*asyncContextManager) +
+                               " for __aexit__(None, None, None), got " +
+                               typeString(exitAwaitableType));
+      return;
+    }
+    if (!lowerableAwaitableType(enterAwaitableType) ||
+        !lowerableAwaitableType(exitAwaitableType)) {
+      error(**contextExpr,
+            "async with currently requires native Coroutine protocol "
+            "descriptors or async.value results from __aenter__ and __aexit__");
+      return;
+    }
+    if (auto managerClass = mlir::dyn_cast<py::ClassType>(manager.type)) {
+      if (!classConformsToProtocol(managerClass, *asyncContextManager)) {
+        error(**contextExpr,
+              "async with context manager " + typeString(manager.type) +
+                  " does not satisfy " + typeString(*asyncContextManager));
+        return;
+      }
+    }
+    if (enter->mayThrow || exit->mayThrow) {
+      error(**contextExpr, "async with requires nothrow __aenter__ and "
+                           "__aexit__ methods until exception-path lowering is "
+                           "implemented");
+      return;
+    }
+
+    std::optional<std::vector<Value>> enterArgs =
+        prepareResolvedMethodCallArguments(**contextExpr, manager, *enter, {});
+    if (!enterArgs)
+      return;
+    mlir::UnitAttr enterAsync =
+        enter->isAsync ? builder.getUnitAttr() : mlir::UnitAttr{};
+    auto enterOp = builder.create<py::AEnterOp>(
+        loc(**contextExpr), enterAwaitableType, enter->symbolName,
+        enter->functionType, (*enterArgs)[0].value, enterAsync);
+    Value enteredAwaitable{enterOp.getResult(), enterAwaitableType};
+    Value entered = awaitConcreteValue(**contextExpr, enteredAwaitable,
+                                       "__aenter__ result");
+    if (!entered.value)
+      return;
+    if (optionalVars && *optionalVars)
+      assignValueToTarget(stmt, **optionalVars, entered);
+    activeContexts.push_back(ActiveAsyncContext{manager, *exit});
+  }
+
+  for (const parser::NodePtr &child : *body) {
+    if (child && !blockTerminated)
+      emitStatement(*child);
+  }
+  if (blockTerminated)
+    return;
+
+  for (auto it = activeContexts.rbegin(); it != activeContexts.rend(); ++it) {
+    mlir::Value excType = builder.create<py::NoneOp>(loc(stmt), noneType());
+    mlir::Value excValue = builder.create<py::NoneOp>(loc(stmt), noneType());
+    mlir::Value traceback = builder.create<py::NoneOp>(loc(stmt), noneType());
+    llvm::SmallVector<Value, 3> exitArgs{Value{excType, noneType()},
+                                         Value{excValue, noneType()},
+                                         Value{traceback, noneType()}};
+    std::optional<std::vector<Value>> prepared =
+        prepareResolvedMethodCallArguments(stmt, it->manager, it->exit,
+                                           exitArgs);
+    if (!prepared)
+      return;
+    mlir::Type exitAwaitableType = methodAwaitableType(it->exit);
+    mlir::UnitAttr exitAsync =
+        it->exit.isAsync ? builder.getUnitAttr() : mlir::UnitAttr{};
+    auto exitOp = builder.create<py::AExitOp>(
+        loc(stmt), exitAwaitableType, it->exit.symbolName,
+        it->exit.functionType, (*prepared)[0].value, (*prepared)[1].value,
+        (*prepared)[2].value, (*prepared)[3].value, exitAsync);
+    Value exitAwaitable{exitOp.getResult(), exitAwaitableType};
+    Value ignored = awaitConcreteValue(stmt, exitAwaitable, "__aexit__ result");
     if (!ignored.value)
       return;
   }
@@ -1449,18 +2000,36 @@ void Builder::Impl::emitReturn(const parser::Node &stmt) {
 
   Value value;
   if (valueNode && *valueNode) {
-    value = emitExpression(**valueNode);
+    value = emitExpressionWithExpectedType(**valueNode, currentReturnType);
   } else {
     mlir::Value none = builder.create<py::NoneOp>(loc(), noneType());
     value = Value{none, noneType()};
   }
   if (!value.value)
     return;
+  value = coerceToExpectedType(stmt, std::move(value), currentReturnType);
   if (!typeAssignable(currentReturnType, value.type)) {
     error(stmt, "return type mismatch: expected " +
                     typeString(currentReturnType) + ", got " +
                     typeString(value.type));
     return;
+  }
+  if (value.value.getType() != currentReturnType &&
+      value.type == currentReturnType) {
+    if (mlir::isa<py::ProtocolType>(currentReturnType) &&
+        mlir::isa<py::ClassType>(value.value.getType())) {
+      value.value = builder.create<py::ProtocolViewOp>(
+          loc(stmt), currentReturnType, value.value);
+    } else if (py::isCallableType(currentReturnType) &&
+               py::isCallableType(value.value.getType()) &&
+               typeAssignable(currentReturnType, value.value.getType())) {
+      value.type = value.value.getType();
+    } else {
+      error(stmt, "return value type " + typeString(value.value.getType()) +
+                      " cannot be materialized as " +
+                      typeString(currentReturnType));
+      return;
+    }
   }
   if (inNativeFunction) {
     if (currentReturnType == noneType())

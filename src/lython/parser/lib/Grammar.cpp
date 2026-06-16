@@ -1,4 +1,4 @@
-#include "lython/parser/Grammar.h"
+#include "Grammar.h"
 
 #include <algorithm>
 #include <cctype>

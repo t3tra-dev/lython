@@ -42,10 +42,61 @@ const std::set<std::string> &typingModules() {
   return values;
 }
 
+const std::set<std::string> &typesAnnotationNames() {
+  static const std::set<std::string> values = {"NoneType", "TracebackType"};
+  return values;
+}
+
 const std::set<std::string> &typingAnnotationNames() {
-  static const std::set<std::string> values = {
-      "Callable", "Coroutine", "Coro", "Task",  "Future", "List",
-      "Tuple",    "Dict",      "list", "tuple", "dict",   "TypeAlias"};
+  static const std::set<std::string> values = {"Any",
+                                               "Callable",
+                                               "Coroutine",
+                                               "Task",
+                                               "Future",
+                                               "Awaitable",
+                                               "Generator",
+                                               "AsyncIterable",
+                                               "AsyncIterator",
+                                               "AsyncGenerator",
+                                               "ContextManager",
+                                               "AsyncContextManager",
+                                               "TracebackType",
+                                               "Type",
+                                               "SupportsInt",
+                                               "SupportsFloat",
+                                               "SupportsComplex",
+                                               "SupportsBytes",
+                                               "SupportsIndex",
+                                               "SupportsAbs",
+                                               "SupportsRound",
+                                               "Iterable",
+                                               "Iterator",
+                                               "Container",
+                                               "Sized",
+                                               "Reversible",
+                                               "Collection",
+                                               "Sequence",
+                                               "MutableSequence",
+                                               "Mapping",
+                                               "MutableMapping",
+                                               "AbstractSet",
+                                               "MutableSet",
+                                               "Hashable",
+                                               "List",
+                                               "Tuple",
+                                               "Dict",
+                                               "list",
+                                               "tuple",
+                                               "dict",
+                                               "type",
+                                               "TypeAlias",
+                                               "Optional",
+                                               "Union",
+                                               "TypeVar",
+                                               "TypeVarTuple",
+                                               "ParamSpec",
+                                               "Concatenate",
+                                               "Generic"};
   return values;
 }
 
@@ -92,6 +143,10 @@ void Builder::Impl::emitImport(const parser::Node &stmt, bool reportErrors) {
     }
     if (typingModules().count(*name)) {
       staticModules[(asname && !asname->empty()) ? *asname : *name] = *name;
+      continue;
+    }
+    if (*name == "types") {
+      staticModules[(asname && !asname->empty()) ? *asname : *name] = "types";
       continue;
     }
     if (*name == "lyrt") {
@@ -161,6 +216,26 @@ void Builder::Impl::emitImportFrom(const parser::Node &stmt,
       if (!typingAnnotationNames().count(*name)) {
         report(*alias, "Unsupported type-only import from " + *moduleName +
                            ": " + *name);
+        continue;
+      }
+      staticAnnotationAliases[(asname && !asname->empty()) ? *asname : *name] =
+          *name;
+    }
+    return;
+  }
+
+  if (*moduleName == "types" && (!level || *level == 0)) {
+    for (const parser::NodePtr &alias : *names) {
+      if (!alias)
+        continue;
+      const std::string *name = stringField(*alias, "name");
+      const std::string *asname = stringField(*alias, "asname");
+      if (!name) {
+        report(*alias, "import alias name is missing");
+        continue;
+      }
+      if (!typesAnnotationNames().count(*name)) {
+        report(*alias, "Unsupported type-only import from types: " + *name);
         continue;
       }
       staticAnnotationAliases[(asname && !asname->empty()) ? *asname : *name] =

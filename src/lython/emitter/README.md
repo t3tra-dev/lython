@@ -102,7 +102,7 @@ Current status:
   values,
   definition-time callable defaults/kwdefaults via `py.make_function` metadata,
   `Callable[[...], Ret]` value calls when the callable target metadata is
-  statically recoverable from a local `py.func.object` or `py.make_function`,
+  statically recoverable from a local `py.callable.object` or `py.make_function`,
   static specialization for functions that accept known `Callable` arguments,
   return-summary lowering for functions that return a known callable or one of
   their callable parameters, and direct materialization of simple nested
@@ -115,7 +115,7 @@ Current status:
   have late-binding semantics that should not be silently value-captured.
   Callable parameters still require statically known callable arguments or
   defaults so the emitter can specialize the callee; it must not generate
-  dynamic vectorcall IR that the lowering pipeline cannot prove. Returned
+  dynamic call IR that the lowering pipeline cannot prove. Returned
   method closure summaries currently reject `self`/class-object captures until
   class object closure ownership and promotion are proven in the same model.
   Function decorators other than `@native(gc="none")`, async function
