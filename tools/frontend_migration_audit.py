@@ -29,6 +29,21 @@ ALLOWED_AST_PARSE_REFERENCES = {
 CPYTHON_SPEC_TEXT_FILES = {
     ROOT / "src/lython/parser/parser.c",
 }
+REMOVED_TYPED_PYTHON_REFERENCES = [
+    "CallVectorOp",
+    "call.vector",
+    "ListGetOp",
+    "DictGetOp",
+    "TupleGetOp",
+    "py.funcsig",
+    "py.task",
+    "TaskType",
+    "getNormalDestOperands",
+    "deprecatedNormalDestOperands",
+    "lowerAsyncCallAsLogicalCoroutine",
+    "Coroutine/Awaitable",
+    "Awaitable/Coroutine protocol",
+]
 PRUNED_TEXT_DIRS = {
     ROOT / ".git",
     ROOT / ".venv",
@@ -116,6 +131,21 @@ def check_python_c_api_references(failures: list[str]) -> None:
         failures.append(f"unexpected Python C API reference in {path.relative_to(ROOT)}")
 
 
+def check_removed_typed_python_references(failures: list[str]) -> None:
+    for path in iter_text_files():
+        if path == ROOT / "tools/frontend_migration_audit.py":
+            continue
+        if path.suffix not in {".cpp", ".h", ".td", ".mlir"}:
+            continue
+        try:
+            text = path.read_text(errors="ignore")
+        except OSError:
+            continue
+        for needle in REMOVED_TYPED_PYTHON_REFERENCES:
+            if needle in text:
+                failures.append(f"removed typed-python reference '{needle}' in {path.relative_to(ROOT)}")
+
+
 def main() -> int:
     failures: list[str] = []
     check_removed_paths(failures)
@@ -123,6 +153,7 @@ def main() -> int:
     check_legacy_references(failures)
     check_ast_parse_references(failures)
     check_python_c_api_references(failures)
+    check_removed_typed_python_references(failures)
     if failures:
         print("frontend migration audit failed")
         for failure in failures:

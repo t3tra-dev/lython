@@ -22,9 +22,10 @@ namespace py {
 
 void PyDialect::initialize() {
   addTypes<IntType, FloatType, BoolType, StrType, NoneType, ObjectType,
-           TupleType, DictType, ListType, ClassType, TypeType, ProtocolType,
-           ExceptionType, ExceptionCellType, TracebackType, LocationType,
-           CallableType, UnionType, SelfType>();
+           TupleType, DictType, ListType, IteratorStateType, ClassType,
+           ContractType, LiteralType, TypeVarType, ParamSpecType, TypeType,
+           ProtocolType, ExceptionType, ExceptionCellType, TracebackType,
+           LocationType, CallableType, UnionType, OverloadType, SelfType>();
 
   addOperations<
 #define GET_OP_LIST
@@ -243,6 +244,53 @@ mlir::Type PyDialect::parseType(mlir::DialectAsmParser &parser) const {
     return ObjectType::get(ctx);
   if (keyword == "self")
     return SelfType::get(ctx);
+  if (keyword == "contract") {
+    if (parser.parseLess())
+      return mlir::Type();
+    mlir::StringAttr contractNameAttr;
+    llvm::SmallVector<mlir::Type> arguments;
+    if (parser.parseAttribute(contractNameAttr))
+      return mlir::Type();
+    if (mlir::succeeded(parser.parseOptionalComma()) &&
+        mlir::failed(parseTypeList(arguments)))
+      return mlir::Type();
+    if (parser.parseGreater())
+      return mlir::Type();
+    return ContractType::get(ctx, contractNameAttr.getValue(), arguments);
+  }
+  if (keyword == "literal") {
+    if (parser.parseLess())
+      return mlir::Type();
+    llvm::StringRef literalKeyword;
+    std::string spelling;
+    if (mlir::succeeded(parser.parseOptionalKeyword(&literalKeyword))) {
+      spelling = literalKeyword.str();
+    } else {
+      mlir::StringAttr literalAttr;
+      if (parser.parseAttribute(literalAttr))
+        return mlir::Type();
+      spelling = literalAttr.getValue().str();
+    }
+    if (parser.parseGreater())
+      return mlir::Type();
+    return LiteralType::get(ctx, spelling);
+  }
+  if (keyword == "typevar") {
+    if (parser.parseLess())
+      return mlir::Type();
+    mlir::StringAttr nameAttr;
+    if (parser.parseAttribute(nameAttr) || parser.parseGreater())
+      return mlir::Type();
+    return TypeVarType::get(ctx, nameAttr.getValue());
+  }
+  if (keyword == "paramspec") {
+    if (parser.parseLess())
+      return mlir::Type();
+    mlir::StringAttr nameAttr;
+    if (parser.parseAttribute(nameAttr) || parser.parseGreater())
+      return mlir::Type();
+    return ParamSpecType::get(ctx, nameAttr.getValue());
+  }
   if (keyword == "tuple") {
     if (parser.parseLess())
       return mlir::Type();
@@ -276,6 +324,15 @@ mlir::Type PyDialect::parseType(mlir::DialectAsmParser &parser) const {
       return mlir::Type();
     return ListType::get(ctx, elementType);
   }
+  if (keyword == "iterator_state") {
+    if (parser.parseLess())
+      return mlir::Type();
+    mlir::Type sourceType, elementType;
+    if (parser.parseType(sourceType) || parser.parseComma() ||
+        parser.parseType(elementType) || parser.parseGreater())
+      return mlir::Type();
+    return IteratorStateType::get(ctx, sourceType, elementType);
+  }
   if (keyword == "union") {
     if (parser.parseLess())
       return mlir::Type();
@@ -300,6 +357,26 @@ mlir::Type PyDialect::parseType(mlir::DialectAsmParser &parser) const {
       return mlir::Type();
     }
     return normalized;
+  }
+  if (keyword == "overload") {
+    if (parser.parseLess())
+      return mlir::Type();
+    llvm::SmallVector<mlir::Type> candidateTypes;
+    if (mlir::failed(parseTypeList(candidateTypes)) || parser.parseGreater())
+      return mlir::Type();
+    if (candidateTypes.size() < 2) {
+      parser.emitError(parser.getCurrentLocation(),
+                       "py.overload requires at least two candidates");
+      return mlir::Type();
+    }
+    for (mlir::Type candidate : candidateTypes) {
+      if (mlir::isa<CallableType>(candidate))
+        continue;
+      parser.emitError(parser.getCurrentLocation(),
+                       "py.overload candidates must be Callable contracts");
+      return mlir::Type();
+    }
+    return OverloadType::get(ctx, candidateTypes);
   }
   if (keyword == "class") {
     if (parser.parseLess())
@@ -387,14 +464,40 @@ void PyDialect::printType(mlir::Type type,
       .Case<ListType>([&](ListType listTy) {
         printer << "list<" << listTy.getElementType() << ">";
       })
+      .Case<IteratorStateType>([&](IteratorStateType iteratorTy) {
+        printer << "iterator_state<" << iteratorTy.getSourceType() << ", "
+                << iteratorTy.getElementType() << ">";
+      })
       .Case<UnionType>([&](UnionType unionTy) {
         printer << "union<";
         llvm::interleaveComma(unionTy.getMemberTypes(), printer,
                               [&](mlir::Type member) { printer << member; });
         printer << ">";
       })
+      .Case<OverloadType>([&](OverloadType overloadTy) {
+        printer << "overload<";
+        printTypeList(overloadTy.getCandidateTypes());
+        printer << ">";
+      })
       .Case<ClassType>([&](ClassType classTy) {
         printer << "class<\"" << classTy.getClassName() << "\">";
+      })
+      .Case<ContractType>([&](ContractType contractTy) {
+        printer << "contract<\"" << contractTy.getContractName() << "\"";
+        if (!contractTy.getArguments().empty()) {
+          printer << ", ";
+          printTypeList(contractTy.getArguments());
+        }
+        printer << ">";
+      })
+      .Case<LiteralType>([&](LiteralType literalTy) {
+        printer << "literal<" << literalTy.getSpelling() << ">";
+      })
+      .Case<TypeVarType>([&](TypeVarType typeVarTy) {
+        printer << "typevar<\"" << typeVarTy.getName() << "\">";
+      })
+      .Case<ParamSpecType>([&](ParamSpecType paramSpecTy) {
+        printer << "paramspec<\"" << paramSpecTy.getName() << "\">";
       })
       .Case<TypeType>([&](TypeType typeTy) {
         printer << "type<" << typeTy.getInstanceType() << ">";

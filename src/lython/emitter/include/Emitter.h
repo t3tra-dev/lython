@@ -24,8 +24,10 @@ struct TextEmitResult {
 };
 
 EmitResult emitModule(const parser::Node &module, mlir::MLIRContext &context,
-                      std::string moduleName = "__main__");
+                      std::string moduleName = "__main__",
+                      std::string sourceName = {});
 TextEmitResult emitModuleText(const parser::Node &module,
-                              std::string moduleName = "__main__");
+                              std::string moduleName = "__main__",
+                              std::string sourceName = {});
 
 } // namespace lython::emitter

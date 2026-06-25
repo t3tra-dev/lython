@@ -1,8 +1,12 @@
 #include "PyProtocols.h"
 
+#include "CallableArgumentMatcher.h"
+#include "CandidateSelection.h"
+#include "cpp/PyCallableShape.h"
 #include "embedded.h"
 
 #include "mlir/Bytecode/BytecodeOpInterface.h"
+#include "mlir/Dialect/Async/IR/Async.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Interfaces/InferTypeOpInterface.h"
@@ -13,15 +17,35 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <utility>
 
 #define GET_OP_CLASSES
 #include "PyOps.h.inc"
 #undef GET_OP_CLASSES
 
 namespace py::protocols {
+
+bool sameMethodContract(const ProtocolMethod &lhs, const ProtocolMethod &rhs) {
+  return lhs.signature == rhs.signature && lhs.mayThrow == rhs.mayThrow &&
+         lhs.noThrow == rhs.noThrow;
+}
+
+std::optional<std::int64_t> normalizeFiniteTupleIndex(std::int64_t index,
+                                                      std::size_t size) {
+  if (size == 0)
+    return std::nullopt;
+  if (index < 0)
+    index += static_cast<std::int64_t>(size);
+  if (index < 0 || index >= static_cast<std::int64_t>(size))
+    return std::nullopt;
+  return index;
+}
+
 namespace {
 
 // The typing manifest (runtime/typing.mlir) is parsed, verified, and
@@ -133,14 +157,17 @@ bool hasMarker(mlir::Operation *op, llvm::StringRef name) {
   return op && op->hasAttr(name);
 }
 
-std::string methodName(mlir::Operation *op, llvm::StringRef fallback) {
-  if (auto attr = op->getAttrOfType<mlir::StringAttr>("ly.typing.method_name"))
-    return attr.getValue().str();
-  return fallback.str();
-}
-
 // Type variable occurrences are class types whose name starts with '$'.
 std::optional<llvm::StringRef> typeVariableName(mlir::Type type) {
+  if (auto typeVar = mlir::dyn_cast<py::TypeVarType>(type))
+    return typeVar.getName();
+  if (auto paramSpec = mlir::dyn_cast<py::ParamSpecType>(type))
+    return paramSpec.getName();
+  if (auto contract = mlir::dyn_cast<py::ContractType>(type)) {
+    llvm::StringRef name = contract.getContractName();
+    if (name.starts_with("$"))
+      return name.drop_front();
+  }
   auto classType = mlir::dyn_cast<py::ClassType>(type);
   if (!classType || !classType.getClassName().starts_with("$"))
     return std::nullopt;
@@ -172,6 +199,18 @@ mlir::Type substitute(mlir::Type type,
   if (auto classType = mlir::dyn_cast<py::ClassType>(type)) {
     auto found = binding.find(classType.getClassName().str());
     return found == binding.end() ? type : found->second;
+  }
+  if (auto contract = mlir::dyn_cast<py::ContractType>(type)) {
+    llvm::SmallVector<mlir::Type> args;
+    args.reserve(contract.getArguments().size());
+    for (mlir::Type arg : contract.getArguments()) {
+      mlir::Type substituted = substitute(arg, binding);
+      if (!substituted)
+        return {};
+      args.push_back(substituted);
+    }
+    return py::ContractType::get(type.getContext(), contract.getContractName(),
+                                 args);
   }
   if (auto tuple = mlir::dyn_cast<py::TupleType>(type)) {
     llvm::SmallVector<mlir::Type> elements;
@@ -220,27 +259,35 @@ mlir::Type substitute(mlir::Type type,
     }
     return py::UnionType::getNormalized(type.getContext(), members);
   }
+  if (auto overload = mlir::dyn_cast<py::OverloadType>(type)) {
+    llvm::SmallVector<mlir::Type> candidates;
+    for (mlir::Type candidate : overload.getCandidateTypes()) {
+      mlir::Type substituted = substitute(candidate, binding);
+      if (!substituted)
+        return {};
+      if (auto nested = mlir::dyn_cast<py::OverloadType>(substituted)) {
+        candidates.append(nested.getCandidateTypes().begin(),
+                          nested.getCandidateTypes().end());
+        continue;
+      }
+      if (!mlir::isa<py::CallableType>(substituted))
+        return {};
+      if (!llvm::is_contained(candidates, substituted))
+        candidates.push_back(substituted);
+    }
+    if (candidates.empty())
+      return {};
+    if (candidates.size() == 1)
+      return candidates.front();
+    return py::OverloadType::get(type.getContext(), candidates);
+  }
   if (auto signature = mlir::dyn_cast<py::CallableType>(type))
     return substituteSignature(signature, binding);
+  if (auto asyncValue = mlir::dyn_cast<mlir::async::ValueType>(type)) {
+    mlir::Type value = substitute(asyncValue.getValueType(), binding);
+    return value ? mlir::async::ValueType::get(value) : mlir::Type();
+  }
   return type;
-}
-
-bool contractAssignable(mlir::Type expected, mlir::Type actual,
-                        const std::map<std::string, ProtocolInfo> *classes);
-
-bool protocolArgumentAssignable(
-    mlir::Type expected, mlir::Type actual, llvm::StringRef variance,
-    const std::map<std::string, ProtocolInfo> *classes) {
-  if (variance == "contravariant")
-    return contractAssignable(actual, expected, classes);
-  if (variance == "invariant")
-    return expected == actual;
-  return contractAssignable(expected, actual, classes);
-}
-
-bool callableContractAssignable(py::CallableType expected, mlir::Type actual) {
-  py::CallableType actualCallable = py::getCallableContract(actual);
-  return actualCallable && py::isSubtypeOf(actualCallable, expected);
 }
 
 std::optional<ProtocolMethod> callableCallContract(py::CallableType callable) {
@@ -279,177 +326,6 @@ std::optional<ProtocolMethod> callableCallContract(py::CallableType callable) {
   return contract;
 }
 
-bool contractAssignable(mlir::Type expected, mlir::Type actual,
-                        const std::map<std::string, ProtocolInfo> *classes) {
-  if (expected == actual)
-    return true;
-  if (mlir::isa<py::ObjectType>(expected))
-    return static_cast<bool>(actual);
-  if (mlir::isa<py::IntType>(expected) && mlir::isa<mlir::IntegerType>(actual))
-    return true;
-  if (mlir::isa<py::BoolType>(expected)) {
-    auto integer = mlir::dyn_cast<mlir::IntegerType>(actual);
-    if (integer && integer.getWidth() == 1)
-      return true;
-  }
-  if (mlir::isa<py::FloatType>(expected) && mlir::isa<mlir::FloatType>(actual))
-    return true;
-  if (auto unionType = mlir::dyn_cast<py::UnionType>(expected))
-    return llvm::any_of(unionType.getMemberTypes(), [&](mlir::Type member) {
-      return contractAssignable(member, actual, classes);
-    });
-  if (auto expectedCallable = mlir::dyn_cast<py::CallableType>(expected))
-    return callableContractAssignable(expectedCallable, actual);
-  auto expectedProtocol = mlir::dyn_cast<py::ProtocolType>(expected);
-  auto actualProtocol = mlir::dyn_cast<py::ProtocolType>(actual);
-  if (expectedProtocol && actualProtocol) {
-    if (expectedProtocol.getProtocolName() != actualProtocol.getProtocolName())
-      return false;
-    if (expectedProtocol.getArguments().size() !=
-        actualProtocol.getArguments().size())
-      return false;
-    const ProtocolInfo *info = nullptr;
-    if (classes) {
-      auto found = classes->find(expectedProtocol.getProtocolName().str());
-      if (found != classes->end())
-        info = &found->second;
-    }
-    for (auto [index, args] : llvm::enumerate(llvm::zip(
-             expectedProtocol.getArguments(), actualProtocol.getArguments()))) {
-      auto [expectedArg, actualArg] = args;
-      llvm::StringRef variance = "covariant";
-      if (info && index < info->paramVariance.size())
-        variance = info->paramVariance[index];
-      if (!protocolArgumentAssignable(expectedArg, actualArg, variance,
-                                      classes))
-        return false;
-    }
-    return true;
-  }
-  auto expectedMeta = mlir::dyn_cast<py::TypeType>(expected);
-  auto actualMeta = mlir::dyn_cast<py::TypeType>(actual);
-  if (expectedMeta && actualMeta)
-    return contractAssignable(expectedMeta.getInstanceType(),
-                              actualMeta.getInstanceType(), classes);
-  return false;
-}
-
-bool bindMethodTypeVariables(mlir::Type expected, mlir::Type actual,
-                             std::map<std::string, mlir::Type> &binding) {
-  if (!expected || !actual)
-    return false;
-  if (mlir::isa<py::SelfType>(expected)) {
-    auto found = binding.find("Self");
-    if (found != binding.end())
-      return found->second == actual;
-    binding.emplace("Self", actual);
-    return true;
-  }
-  if (std::optional<llvm::StringRef> variable = typeVariableName(expected)) {
-    std::string name = variable->str();
-    auto found = binding.find(name);
-    if (found != binding.end())
-      return found->second == actual;
-    binding.emplace(std::move(name), actual);
-    return true;
-  }
-  if (auto expectedTuple = mlir::dyn_cast<py::TupleType>(expected)) {
-    auto actualTuple = mlir::dyn_cast<py::TupleType>(actual);
-    if (!actualTuple || expectedTuple.getElementTypes().size() !=
-                            actualTuple.getElementTypes().size())
-      return false;
-    bool bound = false;
-    for (auto [expectedElement, actualElement] : llvm::zip(
-             expectedTuple.getElementTypes(), actualTuple.getElementTypes())) {
-      if (bindMethodTypeVariables(expectedElement, actualElement, binding))
-        bound = true;
-    }
-    return bound;
-  }
-  if (auto expectedList = mlir::dyn_cast<py::ListType>(expected)) {
-    auto actualList = mlir::dyn_cast<py::ListType>(actual);
-    return actualList &&
-           bindMethodTypeVariables(expectedList.getElementType(),
-                                   actualList.getElementType(), binding);
-  }
-  if (auto expectedDict = mlir::dyn_cast<py::DictType>(expected)) {
-    auto actualDict = mlir::dyn_cast<py::DictType>(actual);
-    if (!actualDict)
-      return false;
-    bool bound = bindMethodTypeVariables(expectedDict.getKeyType(),
-                                         actualDict.getKeyType(), binding);
-    return bindMethodTypeVariables(expectedDict.getValueType(),
-                                   actualDict.getValueType(), binding) ||
-           bound;
-  }
-  if (auto expectedType = mlir::dyn_cast<py::TypeType>(expected)) {
-    auto actualType = mlir::dyn_cast<py::TypeType>(actual);
-    return actualType &&
-           bindMethodTypeVariables(expectedType.getInstanceType(),
-                                   actualType.getInstanceType(), binding);
-  }
-  if (auto expectedSignature = mlir::dyn_cast<py::CallableType>(expected)) {
-    auto actualSignature = mlir::dyn_cast<py::CallableType>(actual);
-    if (!actualSignature ||
-        expectedSignature.getPositionalTypes().size() !=
-            actualSignature.getPositionalTypes().size() ||
-        expectedSignature.getKwOnlyTypes().size() !=
-            actualSignature.getKwOnlyTypes().size() ||
-        expectedSignature.getResultTypes().size() !=
-            actualSignature.getResultTypes().size() ||
-        expectedSignature.hasVararg() != actualSignature.hasVararg() ||
-        expectedSignature.hasKwarg() != actualSignature.hasKwarg())
-      return false;
-    bool bound = false;
-    for (auto [expectedType, actualType] :
-         llvm::zip(expectedSignature.getPositionalTypes(),
-                   actualSignature.getPositionalTypes()))
-      if (bindMethodTypeVariables(expectedType, actualType, binding))
-        bound = true;
-    for (auto [expectedType, actualType] :
-         llvm::zip(expectedSignature.getKwOnlyTypes(),
-                   actualSignature.getKwOnlyTypes()))
-      if (bindMethodTypeVariables(expectedType, actualType, binding))
-        bound = true;
-    for (auto [expectedType, actualType] :
-         llvm::zip(expectedSignature.getResultTypes(),
-                   actualSignature.getResultTypes()))
-      if (bindMethodTypeVariables(expectedType, actualType, binding))
-        bound = true;
-    if (expectedSignature.hasVararg() &&
-        bindMethodTypeVariables(expectedSignature.getVarargType(),
-                                actualSignature.getVarargType(), binding))
-      bound = true;
-    if (expectedSignature.hasKwarg() &&
-        bindMethodTypeVariables(expectedSignature.getKwargType(),
-                                actualSignature.getKwargType(), binding))
-      bound = true;
-    return bound;
-  }
-  if (py::CallableType expectedFunc = py::getCallableContract(expected)) {
-    py::CallableType actualFunc = py::getCallableContract(actual);
-    return actualFunc &&
-           bindMethodTypeVariables(expectedFunc, actualFunc, binding);
-  }
-  if (auto expectedProtocol = mlir::dyn_cast<py::ProtocolType>(expected)) {
-    auto actualProtocol = mlir::dyn_cast<py::ProtocolType>(actual);
-    if (!actualProtocol ||
-        expectedProtocol.getProtocolName() !=
-            actualProtocol.getProtocolName() ||
-        expectedProtocol.getArguments().size() !=
-            actualProtocol.getArguments().size())
-      return false;
-    bool bound = false;
-    for (auto [expectedArg, actualArg] : llvm::zip(
-             expectedProtocol.getArguments(), actualProtocol.getArguments())) {
-      if (bindMethodTypeVariables(expectedArg, actualArg, binding))
-        bound = true;
-    }
-    return bound;
-  }
-  return false;
-}
-
 std::optional<std::map<std::string, mlir::Type>>
 bindProtocolParams(const ProtocolInfo &info, llvm::ArrayRef<mlir::Type> args) {
   if (args.size() > info.params.size())
@@ -466,34 +342,54 @@ bindProtocolParams(const ProtocolInfo &info, llvm::ArrayRef<mlir::Type> args) {
   return binding;
 }
 
-bool protocolInstantiationMatches(
-    const std::map<std::string, ProtocolInfo> &classes,
-    llvm::StringRef actualName,
-    const std::map<std::string, mlir::Type> &actualBinding,
-    py::ProtocolType expected) {
-  if (actualName != expected.getProtocolName())
-    return false;
-  auto found = classes.find(actualName.str());
-  if (found == classes.end())
-    return false;
-  const ProtocolInfo &info = found->second;
-  std::optional<std::map<std::string, mlir::Type>> expectedBinding =
-      bindProtocolParams(info, expected.getArguments());
-  if (!expectedBinding)
-    return false;
-  for (auto [index, param] : llvm::enumerate(info.params)) {
-    auto actual = actualBinding.find(param);
-    auto expectedArg = expectedBinding->find(param);
-    if (actual == actualBinding.end() || expectedArg == expectedBinding->end())
-      return false;
-    llvm::StringRef variance = "covariant";
-    if (index < info.paramVariance.size())
-      variance = info.paramVariance[index];
-    if (!protocolArgumentAssignable(expectedArg->second, actual->second,
-                                    variance, &classes))
-      return false;
+std::optional<std::vector<mlir::Type>>
+completeProtocolInstantiationArguments(const ProtocolInfo &info,
+                                       llvm::ArrayRef<mlir::Type> supplied) {
+  if (std::optional<std::vector<mlir::Type>> direct =
+          completeDirectArguments(info, supplied))
+    return direct;
+  for (const ProtocolShortForm &shortForm : info.shortForms)
+    if (std::optional<std::vector<mlir::Type>> expanded =
+            completeShortArguments(info, shortForm, supplied))
+      return expanded;
+  return std::nullopt;
+}
+
+std::optional<std::map<std::string, mlir::Type>>
+bindProtocolInstantiation(const ProtocolInfo &info,
+                          llvm::ArrayRef<mlir::Type> supplied) {
+  std::optional<std::vector<mlir::Type>> args =
+      completeProtocolInstantiationArguments(info, supplied);
+  if (!args)
+    return std::nullopt;
+  return bindProtocolParams(info, *args);
+}
+
+std::optional<std::map<std::string, mlir::Type>>
+bindBaseInstantiation(const std::map<std::string, ProtocolInfo> &classes,
+                      const ProtocolBase &baseInfo,
+                      const std::map<std::string, mlir::Type> &binding) {
+  auto base = classes.find(baseInfo.name);
+  if (base == classes.end())
+    return std::nullopt;
+
+  llvm::SmallVector<mlir::Type> args;
+  args.reserve(baseInfo.arguments.size());
+  for (mlir::Type arg : baseInfo.arguments) {
+    mlir::Type substituted = substitute(arg, binding);
+    if (!substituted)
+      return std::nullopt;
+    args.push_back(substituted);
   }
-  return true;
+
+  std::optional<std::map<std::string, mlir::Type>> baseBinding =
+      bindProtocolInstantiation(base->second, args);
+  if (!baseBinding)
+    return std::nullopt;
+  auto self = binding.find("Self");
+  if (self != binding.end())
+    (*baseBinding)["Self"] = self->second;
+  return baseBinding;
 }
 
 py::CallableType
@@ -540,9 +436,52 @@ substituteSignature(py::CallableType signature,
       signature.getPositionalOnlyCount());
 }
 
+py::CallableType bindReceiverCallableImpl(py::CallableType signature) {
+  if (!signature || signature.getPositionalTypes().empty())
+    return {};
+
+  mlir::MLIRContext *ctx = signature.getContext();
+  llvm::ArrayRef<mlir::Type> positionalTail =
+      signature.getPositionalTypes().drop_front();
+  llvm::SmallVector<mlir::Type> positional(positionalTail.begin(),
+                                           positionalTail.end());
+
+  llvm::SmallVector<mlir::StringAttr> positionalNames;
+  if (!signature.getPositionalNames().empty()) {
+    if (signature.getPositionalNames().size() !=
+        signature.getPositionalTypes().size())
+      return {};
+    auto names = signature.getPositionalNames().drop_front();
+    positionalNames.append(names.begin(), names.end());
+  }
+
+  llvm::SmallVector<mlir::BoolAttr> positionalDefaults;
+  if (!signature.getPositionalDefaults().empty()) {
+    if (signature.getPositionalDefaults().size() !=
+        signature.getPositionalTypes().size())
+      return {};
+    auto defaults = signature.getPositionalDefaults().drop_front();
+    positionalDefaults.append(defaults.begin(), defaults.end());
+  }
+
+  unsigned positionalOnlyCount = signature.getPositionalOnlyCount();
+  if (positionalOnlyCount != 0)
+    --positionalOnlyCount;
+
+  return py::CallableType::get(
+      ctx, positional, signature.getKwOnlyTypes(),
+      signature.hasVararg() ? signature.getVarargType() : mlir::Type(),
+      signature.hasKwarg() ? signature.getKwargType() : mlir::Type(),
+      signature.getResultTypes(), positionalNames, signature.getKwOnlyNames(),
+      positionalDefaults, signature.getKwOnlyDefaults(),
+      signature.getVarargName(), signature.getKwargName(), positionalOnlyCount);
+}
+
 // Binds a concrete dialect type to its manifest class and parameter map.
 std::optional<std::pair<std::string, std::map<std::string, mlir::Type>>>
 bindConcrete(mlir::Type type) {
+  if (mlir::isa<py::ObjectType>(type))
+    return {{"object", {}}};
   if (mlir::isa<py::BoolType>(type))
     return {{"bool", {}}};
   if (mlir::isa<py::IntType>(type))
@@ -557,14 +496,31 @@ bindConcrete(mlir::Type type) {
     llvm::ArrayRef<mlir::Type> elements = tuple.getElementTypes();
     if (elements.empty())
       return {{"tuple", {{"T", py::ObjectType::get(type.getContext())}}}};
+    mlir::Type elementType = elements.front();
     for (mlir::Type element : elements)
-      if (element != elements.front())
-        return std::nullopt;
-    return {{"tuple", {{"T", elements.front()}}}};
+      if (element != elementType) {
+        elementType = py::UnionType::getNormalized(type.getContext(), elements);
+        break;
+      }
+    return {{"tuple", {{"T", elementType}}}};
   }
   if (auto dict = mlir::dyn_cast<py::DictType>(type))
     return {{"dict", {{"K", dict.getKeyType()}, {"V", dict.getValueType()}}}};
+  if (mlir::Type element = py::primitiveIteratorStateElementType(type))
+    return {{"Iterator", {{"T", element}}}};
+  if (auto asyncValue = mlir::dyn_cast<mlir::async::ValueType>(type))
+    return {{"Awaitable", {{"T", asyncValue.getValueType()}}}};
   return std::nullopt;
+}
+
+std::string manifestClassNameForContract(llvm::StringRef name) {
+  for (llvm::StringRef prefix :
+       {"builtins.", "typing.", "types.", "contextlib.", "_asyncio.",
+        "asyncio.", "contextvars."}) {
+    if (name.consume_front(prefix))
+      return name.str();
+  }
+  return name.str();
 }
 
 std::optional<std::pair<std::string, std::map<std::string, mlir::Type>>>
@@ -573,6 +529,40 @@ bindReceiver(mlir::Type type,
   if (auto concrete = bindConcrete(type))
     return concrete;
 
+  if (auto contract = mlir::dyn_cast<py::ContractType>(type)) {
+    std::string className =
+        manifestClassNameForContract(contract.getContractName());
+    auto found = classes.find(className);
+    if (found != classes.end()) {
+      std::optional<std::map<std::string, mlir::Type>> binding =
+          bindProtocolInstantiation(found->second, contract.getArguments());
+      if (binding)
+        return {{std::move(className), *binding}};
+    }
+  }
+
+  if (auto typeObject = mlir::dyn_cast<py::TypeType>(type)) {
+    auto found = classes.find("type");
+    if (found != classes.end()) {
+      std::optional<std::map<std::string, mlir::Type>> binding =
+          bindProtocolInstantiation(found->second, {});
+      if (binding) {
+        (*binding)["T"] = typeObject.getInstanceType();
+        return {{"type", *binding}};
+      }
+    }
+  }
+
+  if (auto classType = mlir::dyn_cast<py::ClassType>(type)) {
+    auto found = classes.find(classType.getClassName().str());
+    if (found != classes.end()) {
+      std::optional<std::map<std::string, mlir::Type>> binding =
+          bindProtocolInstantiation(found->second, {});
+      if (binding)
+        return {{classType.getClassName().str(), *binding}};
+    }
+  }
+
   auto protocol = mlir::dyn_cast<py::ProtocolType>(type);
   if (!protocol)
     return std::nullopt;
@@ -580,7 +570,7 @@ bindReceiver(mlir::Type type,
   if (found == classes.end() || !found->second.isProtocol)
     return std::nullopt;
   std::optional<std::map<std::string, mlir::Type>> binding =
-      bindProtocolParams(found->second, protocol.getArguments());
+      bindProtocolInstantiation(found->second, protocol.getArguments());
   if (!binding)
     return std::nullopt;
   return {{protocol.getProtocolName().str(), *binding}};
@@ -594,13 +584,97 @@ withSelfBinding(const std::map<std::string, mlir::Type> &binding,
   return result;
 }
 
+std::optional<std::vector<mlir::Type>>
+protocolArgumentsForImpl(const std::map<std::string, ProtocolInfo> &classes,
+                         mlir::Type receiverType,
+                         llvm::StringRef protocolName) {
+  auto target = classes.find(protocolName.str());
+  if (target == classes.end() || !target->second.isProtocol)
+    return std::nullopt;
+  auto binding = bindReceiver(receiverType, classes);
+  if (!binding)
+    return std::nullopt;
+
+  std::function<std::optional<std::vector<mlir::Type>>(
+      llvm::StringRef, const std::map<std::string, mlir::Type> &, unsigned)>
+      walk = [&](llvm::StringRef className,
+                 const std::map<std::string, mlir::Type> &currentBinding,
+                 unsigned depth) -> std::optional<std::vector<mlir::Type>> {
+    if (depth > 16)
+      return std::nullopt;
+    auto found = classes.find(className.str());
+    if (found == classes.end())
+      return std::nullopt;
+    const ProtocolInfo &info = found->second;
+
+    if (className == protocolName) {
+      std::vector<mlir::Type> args;
+      args.reserve(info.params.size());
+      for (const std::string &param : info.params) {
+        auto arg = currentBinding.find(param);
+        if (arg == currentBinding.end())
+          return std::nullopt;
+        args.push_back(arg->second);
+      }
+      return args;
+    }
+
+    for (const ProtocolBase &baseInfo : info.bases) {
+      std::optional<std::map<std::string, mlir::Type>> baseBinding =
+          bindBaseInstantiation(classes, baseInfo, currentBinding);
+      if (!baseBinding)
+        continue;
+      if (std::optional<std::vector<mlir::Type>> result =
+              walk(baseInfo.name, *baseBinding, depth + 1))
+        return result;
+    }
+    return std::nullopt;
+  };
+
+  return walk(binding->first, binding->second, 0);
+}
+
+bool sameProtocolEvidence(const std::optional<ProtocolEvidence> &lhs,
+                          const std::optional<ProtocolEvidence> &rhs) {
+  if (lhs.has_value() != rhs.has_value())
+    return false;
+  if (!lhs)
+    return true;
+  return lhs->manifestClass == rhs->manifestClass &&
+         lhs->binding == rhs->binding && lhs->info == rhs->info;
+}
+
+bool sameContractResolution(const ContractResolution &lhs,
+                            const ContractResolution &rhs) {
+  return sameMethodContract(lhs.method, rhs.method) &&
+         lhs.methodName == rhs.methodName &&
+         lhs.typeBindings == rhs.typeBindings &&
+         sameProtocolEvidence(lhs.receiverEvidence, rhs.receiverEvidence);
+}
+
+} // namespace
+
+py::CallableType bindReceiverCallable(py::CallableType signature) {
+  return bindReceiverCallableImpl(signature);
+}
+
+namespace {
+
+std::mutex &tableMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::map<mlir::MLIRContext *, std::unique_ptr<Table>> &tableSlots() {
+  static std::map<mlir::MLIRContext *, std::unique_ptr<Table>> tables;
+  return tables;
+}
+
 } // namespace
 
 const Table &Table::get(mlir::MLIRContext &context) {
-  static std::mutex mutex;
-  static std::map<mlir::MLIRContext *, std::unique_ptr<Table>> tables;
-  std::lock_guard<std::mutex> lock(mutex);
-  std::unique_ptr<Table> &slot = tables[&context];
+  std::lock_guard<std::mutex> lock(tableMutex());
+  std::unique_ptr<Table> &slot = tableSlots()[&context];
   if (slot)
     return *slot;
   slot = std::make_unique<Table>();
@@ -663,20 +737,48 @@ const Table &Table::get(mlir::MLIRContext &context) {
     baseArgs.resize(baseNames.size());
     for (auto [baseName, args] : llvm::zip(baseNames, baseArgs))
       entry.bases.push_back(ProtocolBase{baseName, std::move(args)});
-    if (!classOp.getBody().empty()) {
-      for (mlir::Operation &member : classOp.getBody().front()) {
-        auto method = mlir::dyn_cast<py::CallableFuncOp>(&member);
-        if (!method)
-          continue;
-        auto signature = mlir::dyn_cast<py::CallableType>(
-            method.getFunctionTypeAttr().getValue());
-        if (signature) {
-          ProtocolMethod methodInfo;
-          methodInfo.signature = signature;
-          methodInfo.mayThrow = hasMarker(method, "maythrow");
-          methodInfo.noThrow = hasMarker(method, "nothrow");
-          entry.methods[methodName(method, method.getSymName())].push_back(
-              methodInfo);
+    if (auto fieldNames = classOp.getFieldNamesAttr()) {
+      mlir::ArrayAttr fieldTypes = classOp.getFieldContractTypesAttr();
+      if (!fieldTypes)
+        fieldTypes = classOp.getFieldTypesAttr();
+      if (fieldTypes && fieldNames.size() == fieldTypes.size()) {
+        for (auto [nameAttr, typeAttr] : llvm::zip(fieldNames, fieldTypes)) {
+          auto name = mlir::dyn_cast<mlir::StringAttr>(nameAttr);
+          auto type = mlir::dyn_cast<mlir::TypeAttr>(typeAttr);
+          if (name && type)
+            entry.fields[name.getValue().str()] = type.getValue();
+        }
+      }
+    }
+    if (auto methodNames = classOp.getMethodNamesAttr()) {
+      mlir::ArrayAttr methodContracts = classOp.getMethodContractsAttr();
+      if (methodContracts && methodNames.size() == methodContracts.size()) {
+        for (auto [nameAttr, typeAttr] :
+             llvm::zip(methodNames, methodContracts)) {
+          auto name = mlir::dyn_cast<mlir::StringAttr>(nameAttr);
+          auto type = mlir::dyn_cast<mlir::TypeAttr>(typeAttr);
+          if (!name || !type)
+            continue;
+
+          auto pushSignature = [&](py::CallableType signature) {
+            if (!signature)
+              return;
+            ProtocolMethod methodInfo;
+            methodInfo.signature = signature;
+            methodInfo.mayThrow = true;
+            entry.methods[name.getValue().str()].push_back(methodInfo);
+          };
+
+          if (auto signature =
+                  mlir::dyn_cast<py::CallableType>(type.getValue())) {
+            pushSignature(signature);
+            continue;
+          }
+          if (auto overload =
+                  mlir::dyn_cast<py::OverloadType>(type.getValue())) {
+            for (mlir::Type candidate : overload.getCandidateTypes())
+              pushSignature(mlir::dyn_cast<py::CallableType>(candidate));
+          }
         }
       }
     }
@@ -697,15 +799,25 @@ const Table &Table::get(mlir::MLIRContext &context) {
   return *slot;
 }
 
-void Table::collectMethodContractsIn(
+Table &Table::getMutable(mlir::MLIRContext &context) {
+  (void)get(context);
+  std::lock_guard<std::mutex> lock(tableMutex());
+  return *tableSlots()[&context];
+}
+
+void Table::registerClass(llvm::StringRef name, ProtocolInfo info) {
+  classes[name.str()] = std::move(info);
+}
+
+bool Table::collectMethodContractsIn(
     llvm::StringRef className, const std::map<std::string, mlir::Type> &binding,
     llvm::StringRef methodName, unsigned depth,
     std::vector<ProtocolMethod> &out) const {
   if (depth > 16)
-    return;
+    return false;
   auto found = classes.find(className.str());
   if (found == classes.end())
-    return;
+    return false;
   const ProtocolInfo &entry = found->second;
 
   auto method = entry.methods.find(methodName.str());
@@ -720,80 +832,54 @@ void Table::collectMethodContractsIn(
       if (overload.signature)
         out.push_back(overload);
     }
+    return true;
   }
 
   for (const ProtocolBase &baseInfo : entry.bases) {
-    auto base = classes.find(baseInfo.name);
-    if (base == classes.end())
-      continue;
-    llvm::SmallVector<mlir::Type> args;
-    for (mlir::Type arg : baseInfo.arguments) {
-      mlir::Type substituted = substitute(arg, binding);
-      if (!substituted)
-        return;
-      args.push_back(substituted);
-    }
     std::optional<std::map<std::string, mlir::Type>> baseBinding =
-        bindProtocolParams(base->second, args);
+        bindBaseInstantiation(classes, baseInfo, binding);
     if (!baseBinding)
-      return;
-    auto self = binding.find("Self");
-    if (self != binding.end())
-      (*baseBinding)["Self"] = self->second;
-    collectMethodContractsIn(baseInfo.name, *baseBinding, methodName, depth + 1,
-                             out);
+      continue;
+    if (collectMethodContractsIn(baseInfo.name, *baseBinding, methodName,
+                                 depth + 1, out))
+      return true;
   }
+  return false;
 }
 
-std::optional<py::CallableType>
-Table::methodOn(mlir::Type receiverType, llvm::StringRef methodName) const {
-  if (methodName == "__call__") {
-    auto callable = mlir::dyn_cast<py::CallableType>(receiverType);
-    if (std::optional<ProtocolMethod> contract = callableCallContract(callable))
-      return contract->signature;
+std::optional<FieldResolution> Table::collectFieldResolutionIn(
+    llvm::StringRef className, const std::map<std::string, mlir::Type> &binding,
+    llvm::StringRef fieldName, unsigned depth) const {
+  if (depth > 16)
+    return std::nullopt;
+  auto found = classes.find(className.str());
+  if (found == classes.end())
+    return std::nullopt;
+  const ProtocolInfo &entry = found->second;
+
+  auto field = entry.fields.find(fieldName.str());
+  if (field != entry.fields.end()) {
+    mlir::Type substituted = substitute(field->second, binding);
+    if (substituted)
+      return FieldResolution{substituted, fieldName.str(), binding,
+                             std::nullopt};
   }
 
-  auto binding = bindReceiver(receiverType, classes);
-  if (!binding)
-    return std::nullopt;
-  std::map<std::string, mlir::Type> selfBinding =
-      withSelfBinding(binding->second, receiverType);
-  std::vector<ProtocolMethod> contracts;
-  collectMethodContractsIn(binding->first, selfBinding, methodName, 0,
-                           contracts);
-  if (contracts.empty())
-    return std::nullopt;
-  return contracts.front().signature;
-}
-
-std::vector<py::CallableType>
-Table::methodOverloadsOn(mlir::Type receiverType,
-                         llvm::StringRef methodName) const {
-  std::vector<py::CallableType> result;
-  if (methodName == "__call__") {
-    auto callable = mlir::dyn_cast<py::CallableType>(receiverType);
-    if (std::optional<ProtocolMethod> contract = callableCallContract(callable))
-      result.push_back(contract->signature);
-    if (!result.empty())
-      return result;
+  for (const ProtocolBase &baseInfo : entry.bases) {
+    std::optional<std::map<std::string, mlir::Type>> baseBinding =
+        bindBaseInstantiation(classes, baseInfo, binding);
+    if (!baseBinding)
+      continue;
+    if (std::optional<FieldResolution> inherited = collectFieldResolutionIn(
+            baseInfo.name, *baseBinding, fieldName, depth + 1))
+      return inherited;
   }
-
-  auto binding = bindReceiver(receiverType, classes);
-  if (!binding)
-    return result;
-  std::map<std::string, mlir::Type> selfBinding =
-      withSelfBinding(binding->second, receiverType);
-  std::vector<ProtocolMethod> contracts;
-  collectMethodContractsIn(binding->first, selfBinding, methodName, 0,
-                           contracts);
-  for (const ProtocolMethod &contract : contracts)
-    result.push_back(contract.signature);
-  return result;
+  return std::nullopt;
 }
 
 std::vector<ProtocolMethod>
-Table::methodContractsOn(mlir::Type receiverType,
-                         llvm::StringRef methodName) const {
+Table::collectReceiverMethodContracts(mlir::Type receiverType,
+                                      llvm::StringRef methodName) const {
   std::vector<ProtocolMethod> result;
   if (methodName == "__call__") {
     auto callable = mlir::dyn_cast<py::CallableType>(receiverType);
@@ -812,141 +898,45 @@ Table::methodContractsOn(mlir::Type receiverType,
   return result;
 }
 
-std::optional<ProtocolMethod>
-Table::resolveMethodContractOn(mlir::Type receiverType,
-                               llvm::StringRef methodName,
-                               llvm::ArrayRef<mlir::Type> argumentTypes) const {
-  for (ProtocolMethod contract : methodContractsOn(receiverType, methodName)) {
-    py::CallableType signature = contract.signature;
-    llvm::ArrayRef<mlir::Type> positional = signature.getPositionalTypes();
-    if (positional.empty())
-      continue;
-    llvm::ArrayRef<mlir::Type> explicitParams = positional.drop_front();
-    if (!signature.hasVararg() && explicitParams.size() != argumentTypes.size())
-      continue;
-    if (signature.hasVararg() && argumentTypes.size() < explicitParams.size())
-      continue;
-    bool matches = true;
-    std::map<std::string, mlir::Type> methodBinding;
-    for (auto [expected, actual] : llvm::zip(
-             explicitParams, argumentTypes.take_front(explicitParams.size()))) {
-      auto expectedProtocol = mlir::dyn_cast<py::ProtocolType>(expected);
-      if (!bindMethodTypeVariables(expected, actual, methodBinding) &&
-          !contractAssignable(expected, actual, &classes) &&
-          !(expectedProtocol && conformsTo(actual, expectedProtocol))) {
-        matches = false;
-        break;
-      }
-    }
-    if (matches && signature.hasVararg() &&
-        argumentTypes.size() > explicitParams.size()) {
-      auto varargTuple =
-          mlir::dyn_cast<py::TupleType>(signature.getVarargType());
-      if (!varargTuple || varargTuple.getElementTypes().size() != 1) {
-        matches = false;
-      } else {
-        mlir::Type repeatedExpected = varargTuple.getElementTypes().front();
-        for (mlir::Type actual :
-             argumentTypes.drop_front(explicitParams.size())) {
-          auto expectedProtocol =
-              mlir::dyn_cast<py::ProtocolType>(repeatedExpected);
-          if (!bindMethodTypeVariables(repeatedExpected, actual,
-                                       methodBinding) &&
-              !contractAssignable(repeatedExpected, actual, &classes) &&
-              !(expectedProtocol && conformsTo(actual, expectedProtocol))) {
-            matches = false;
-            break;
-          }
-        }
-      }
-    }
-    if (matches) {
-      if (!methodBinding.empty())
-        contract.signature = substituteSignature(signature, methodBinding);
-      return contract.signature ? std::optional<ProtocolMethod>(contract)
-                                : std::nullopt;
-    }
+std::vector<ContractResolution>
+Table::methodContractCandidatesWithEvidence(mlir::Type receiverType,
+                                            llvm::StringRef methodName) const {
+  std::vector<ContractResolution> result;
+  std::optional<ProtocolEvidence> receiverEvidence = evidenceFor(receiverType);
+  std::map<std::string, mlir::Type> receiverBinding =
+      receiverEvidence
+          ? withSelfBinding(receiverEvidence->binding, receiverType)
+          : std::map<std::string, mlir::Type>{};
+
+  for (ProtocolMethod method :
+       collectReceiverMethodContracts(receiverType, methodName)) {
+    result.push_back(ContractResolution{std::move(method), methodName.str(),
+                                        receiverBinding, receiverEvidence,
+                                        /*score=*/0});
   }
-  return std::nullopt;
+  return result;
 }
 
-std::optional<py::CallableType>
-Table::resolveMethodOn(mlir::Type receiverType, llvm::StringRef methodName,
-                       llvm::ArrayRef<mlir::Type> argumentTypes) const {
-  std::optional<ProtocolMethod> contract =
-      resolveMethodContractOn(receiverType, methodName, argumentTypes);
-  return contract ? std::optional<py::CallableType>(contract->signature)
-                  : std::nullopt;
-}
-
-std::optional<mlir::Type>
-Table::resolveMethodResultOn(mlir::Type receiverType,
-                             llvm::StringRef methodName,
-                             llvm::ArrayRef<mlir::Type> argumentTypes) const {
-  std::optional<ProtocolMethod> contract =
-      resolveMethodContractOn(receiverType, methodName, argumentTypes);
-  if (!contract || contract->signature.getResultTypes().size() != 1)
+std::optional<FieldResolution>
+Table::resolveFieldContractWithEvidence(mlir::Type receiverType,
+                                        llvm::StringRef fieldName) const {
+  std::optional<ProtocolEvidence> receiverEvidence = evidenceFor(receiverType);
+  if (!receiverEvidence)
     return std::nullopt;
-  return contract->signature.getResultTypes().front();
+  std::map<std::string, mlir::Type> selfBinding =
+      withSelfBinding(receiverEvidence->binding, receiverType);
+  std::optional<FieldResolution> resolution = collectFieldResolutionIn(
+      receiverEvidence->manifestClass, selfBinding, fieldName, 0);
+  if (!resolution)
+    return std::nullopt;
+  resolution->receiverEvidence = std::move(receiverEvidence);
+  return resolution;
 }
 
 std::optional<std::vector<mlir::Type>>
 Table::protocolArgumentsFor(mlir::Type receiverType,
                             llvm::StringRef protocolName) const {
-  const ProtocolInfo *target = lookup(protocolName);
-  if (!target || !target->isProtocol)
-    return std::nullopt;
-  auto binding = bindReceiver(receiverType, classes);
-  if (!binding)
-    return std::nullopt;
-
-  std::function<std::optional<std::vector<mlir::Type>>(
-      llvm::StringRef, const std::map<std::string, mlir::Type> &, unsigned)>
-      walk = [&](llvm::StringRef className,
-                 const std::map<std::string, mlir::Type> &currentBinding,
-                 unsigned depth) -> std::optional<std::vector<mlir::Type>> {
-    if (depth > 16)
-      return std::nullopt;
-    auto found = classes.find(className.str());
-    if (found == classes.end())
-      return std::nullopt;
-    const ProtocolInfo &info = found->second;
-
-    if (className == protocolName) {
-      std::vector<mlir::Type> args;
-      args.reserve(info.params.size());
-      for (const std::string &param : info.params) {
-        auto arg = currentBinding.find(param);
-        if (arg == currentBinding.end())
-          return std::nullopt;
-        args.push_back(arg->second);
-      }
-      return args;
-    }
-
-    for (const ProtocolBase &baseInfo : info.bases) {
-      auto base = classes.find(baseInfo.name);
-      if (base == classes.end())
-        continue;
-      llvm::SmallVector<mlir::Type> args;
-      for (mlir::Type arg : baseInfo.arguments) {
-        mlir::Type substituted = substitute(arg, currentBinding);
-        if (!substituted)
-          return std::nullopt;
-        args.push_back(substituted);
-      }
-      std::optional<std::map<std::string, mlir::Type>> baseBinding =
-          bindProtocolParams(base->second, args);
-      if (!baseBinding)
-        continue;
-      if (std::optional<std::vector<mlir::Type>> result =
-              walk(baseInfo.name, *baseBinding, depth + 1))
-        return result;
-    }
-    return std::nullopt;
-  };
-
-  return walk(binding->first, binding->second, 0);
+  return protocolArgumentsForImpl(classes, receiverType, protocolName);
 }
 
 std::optional<std::vector<mlir::Type>>
@@ -955,14 +945,7 @@ Table::completeProtocolArguments(llvm::StringRef protocolName,
   const ProtocolInfo *info = lookup(protocolName);
   if (!info || !info->isProtocol)
     return std::nullopt;
-  if (std::optional<std::vector<mlir::Type>> direct =
-          completeDirectArguments(*info, supplied))
-    return direct;
-  for (const ProtocolShortForm &shortForm : info->shortForms)
-    if (std::optional<std::vector<mlir::Type>> expanded =
-            completeShortArguments(*info, shortForm, supplied))
-      return expanded;
-  return std::nullopt;
+  return completeProtocolInstantiationArguments(*info, supplied);
 }
 
 std::optional<ProtocolEvidence>
@@ -976,62 +959,70 @@ Table::evidenceFor(mlir::Type receiverType) const {
   return ProtocolEvidence{binding->first, std::move(binding->second), info};
 }
 
-mlir::Type Table::awaitablePayloadType(mlir::Type type) const {
-  if (mlir::Type payload = py::awaitablePayloadType(type))
-    return payload;
-  auto protocol = mlir::dyn_cast<py::ProtocolType>(type);
-  if (!protocol)
-    return {};
-  std::optional<mlir::Type> awaitResult =
-      resolveMethodResultOn(protocol, "__await__", {});
-  if (!awaitResult)
-    return {};
-  auto generator = mlir::dyn_cast<py::ProtocolType>(*awaitResult);
+static mlir::Type awaitIteratorPayloadType(mlir::Type iteratorType) {
+  auto generator = mlir::dyn_cast_if_present<py::ProtocolType>(iteratorType);
   if (!generator || generator.getProtocolName() != "Generator" ||
       generator.getArguments().size() != 3)
     return {};
   return generator.getArguments()[2];
 }
 
-bool Table::conformsTo(mlir::Type receiverType,
-                       py::ProtocolType protocol) const {
-  auto binding = bindReceiver(receiverType, classes);
-  if (!binding)
-    return false;
+std::optional<AwaitableResolution>
+Table::resolveAwaitableWithEvidence(mlir::Type type) const {
+  if (!type)
+    return std::nullopt;
 
-  std::function<bool(llvm::StringRef, const std::map<std::string, mlir::Type> &,
-                     unsigned)>
-      walk = [&](llvm::StringRef className,
-                 const std::map<std::string, mlir::Type> &currentBinding,
-                 unsigned depth) -> bool {
-    if (depth > 16)
-      return false;
-    if (protocolInstantiationMatches(classes, className, currentBinding,
-                                     protocol))
-      return true;
-    auto found = classes.find(className.str());
-    if (found == classes.end())
-      return false;
-    for (const ProtocolBase &baseInfo : found->second.bases) {
-      auto base = classes.find(baseInfo.name);
-      if (base == classes.end())
-        continue;
-      llvm::SmallVector<mlir::Type> args;
-      for (mlir::Type arg : baseInfo.arguments) {
-        mlir::Type substituted = substitute(arg, currentBinding);
-        if (!substituted)
-          return false;
-        args.push_back(substituted);
-      }
-      std::optional<std::map<std::string, mlir::Type>> baseBinding =
-          bindProtocolParams(base->second, args);
-      if (baseBinding && walk(baseInfo.name, *baseBinding, depth + 1))
-        return true;
-    }
-    return false;
-  };
+  auto selection = lython::selection::bestCandidate<ContractResolution>(
+      [](const ContractResolution &candidate) { return candidate.score; },
+      [](const ContractResolution &lhs, const ContractResolution &rhs) {
+        return sameContractResolution(lhs, rhs);
+      });
+  for (ContractResolution candidate :
+       methodContractCandidatesWithEvidence(type, "__await__")) {
+    std::optional<py::CallableSignatureShape> shape =
+        py::callableSignatureShape(candidate.method.signature,
+                                   /*firstParameter=*/1);
+    if (!shape)
+      continue;
+    lython::callable::InvocationSpecificityScore observer;
+    bool matched = py::matchCallableInvocationWithObserver(
+        *shape, llvm::ArrayRef<mlir::Type>{}, llvm::ArrayRef<KeywordArgument>{},
+        [](mlir::Type, mlir::Type) { return true; },
+        [](const KeywordArgument &keyword) -> llvm::StringRef {
+          return keyword.name;
+        },
+        [](const KeywordArgument &keyword) -> mlir::Type {
+          return keyword.type;
+        },
+        observer);
+    if (!matched)
+      continue;
+    candidate.score = observer.score;
+    selection.consider(std::move(candidate));
+  }
+  if (std::optional<ContractResolution> resolution =
+          std::move(selection).finish()) {
+    llvm::ArrayRef<mlir::Type> results =
+        resolution->method.signature.getResultTypes();
+    if (results.size() == 1)
+      if (mlir::Type payload = awaitIteratorPayloadType(results.front()))
+        return AwaitableResolution{payload, std::move(resolution)};
+  }
 
-  return walk(binding->first, binding->second, 0);
+  if (auto asyncValue = mlir::dyn_cast<mlir::async::ValueType>(type))
+    return AwaitableResolution{asyncValue.getValueType(), std::nullopt};
+  if (mlir::Type payload = awaitableDescriptorPayloadType(type))
+    return AwaitableResolution{payload, std::nullopt};
+
+  return std::nullopt;
+}
+
+mlir::Type Table::awaitablePayloadType(mlir::Type type) const {
+  std::optional<AwaitableResolution> resolution =
+      resolveAwaitableWithEvidence(type);
+  if (resolution)
+    return resolution->payloadType;
+  return {};
 }
 
 const ProtocolInfo *Table::lookup(llvm::StringRef name) const {

@@ -1,23 +1,17 @@
 #pragma once
 
-#include "Common/RuntimeSupport.h"
-
 #include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/Operation.h"
-#include "mlir/Transforms/DialectConversion.h"
 
-namespace py::lowering::runtime {
+namespace py::lowering::runtime::cleanup {
 
-namespace cleanup {
 bool unreachableBlocks(mlir::ModuleOp module);
-bool pyBridgeCasts(mlir::Operation *container);
-bool pyMultiCasts(mlir::Operation *container);
-bool voidPyReturns(mlir::Operation *container);
-bool memrefDescriptorCasts(mlir::Operation *container);
-bool memrefRuntimeCalls(mlir::Operation *container);
-bool pointerRoundTrips(mlir::Operation *container);
-bool llvmFuncReturns(mlir::Operation *container);
+bool pyBridgeCasts(mlir::Operation *op);
+bool pyMultiCasts(mlir::Operation *op);
+bool voidPyReturns(mlir::Operation *op);
+bool memrefDescriptorCasts(mlir::Operation *op);
+bool memrefRuntimeCalls(mlir::Operation *op);
+bool pointerRoundTrips(mlir::ModuleOp module);
+bool llvmFuncReturns(mlir::Operation *op);
 bool finalBoundary(mlir::ModuleOp module);
-} // namespace cleanup
 
-} // namespace py::lowering::runtime
+} // namespace py::lowering::runtime::cleanup

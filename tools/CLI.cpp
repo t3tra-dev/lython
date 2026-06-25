@@ -27,6 +27,7 @@
 #include "mlir/ExecutionEngine/ExecutionEngine.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/DialectRegistry.h"
+#include "mlir/IR/Location.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/Pass.h"
@@ -46,11 +47,14 @@
 #include "llvm/Support/Error.h"
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/ExecutionEngine/JITSymbol.h"
 #include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/LegacyPassManager.h"
@@ -445,7 +449,7 @@ LogicalResult runPipeline(ModuleOp module, MLIRContext &context,
   dumpMLIRForPass(irDump, "thread-safety-verifier", module);
 
   // Phase 6: Lower async.func/async.await to the MLIR async runtime, then
-  // convert those runtime ops to LLVM. Lython owns Awaitable/Coroutine protocol
+  // convert those runtime ops to LLVM. Lython owns Awaitable protocol
   // descriptors linearly, so async runtime refcounting is emitted by Py
   // lowering instead of the generic MLIR async refcount pass.
   if (failed(runLoweringPhase(
@@ -562,9 +566,12 @@ buildRuntimeSymbolMap(llvm::orc::MangleAndInterner interner) {
   add("LyEH_RethrowCurrent", &LyEH_RethrowCurrent);
   add("LyEH_TakeCurrentDescriptor", &LyEH_TakeCurrentDescriptor);
   add("LyTraceback_Push", &LyTraceback_Push);
+  add("LyTraceback_PushCString", &LyTraceback_PushCString);
+  add("LyTraceback_PushCStringRange", &LyTraceback_PushCStringRange);
   add("LyTraceback_Pop", &LyTraceback_Pop);
   add("LyTraceback_Clear", &LyTraceback_Clear);
   add("LyTraceback_PrintMessage", &LyTraceback_PrintMessage);
+  add("LyRunPythonMain", &LyRunPythonMain);
   add("mlirAsyncRuntimeAddRef", &mlir::runtime::mlirAsyncRuntimeAddRef);
   add("mlirAsyncRuntimeDropRef", &mlir::runtime::mlirAsyncRuntimeDropRef);
   add("mlirAsyncRuntimeCreateToken",
@@ -676,6 +683,8 @@ std::optional<std::string> findBuildRoot(StringRef argv0) {
   return std::nullopt;
 }
 
+std::string pythonTracebackPath(StringRef inputPath);
+
 LogicalResult generateModuleFromCppFrontend(StringRef pythonFile,
                                             MLIRContext &context,
                                             OwningOpRef<ModuleOp> &module) {
@@ -705,7 +714,8 @@ LogicalResult generateModuleFromCppFrontend(StringRef pythonFile,
   lython::emitter::EmitResult emitted;
   {
     PerfScope perf("ir-generation");
-    emitted = lython::emitter::emitModule(*parsed.tree, context, "__main__");
+    emitted = lython::emitter::emitModule(*parsed.tree, context, "__main__",
+                                          pythonTracebackPath(pythonFile));
   }
   if (!emitted.ok()) {
     for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics) {
@@ -720,6 +730,16 @@ LogicalResult generateModuleFromCppFrontend(StringRef pythonFile,
   return success();
 }
 
+std::string pythonTracebackPath(StringRef inputPath) {
+  if (llvm::sys::path::is_absolute(inputPath))
+    return inputPath.str();
+  llvm::SmallString<256> current;
+  if (llvm::sys::fs::current_path(current))
+    return inputPath.str();
+  llvm::sys::path::append(current, inputPath);
+  return current.str().str();
+}
+
 LogicalResult writeLLVMIR(llvm::Module &llvmModule, StringRef outputPath) {
   std::error_code ec;
   llvm::raw_fd_ostream out(outputPath, ec, llvm::sys::fs::OF_None);
@@ -728,6 +748,48 @@ LogicalResult writeLLVMIR(llvm::Module &llvmModule, StringRef outputPath) {
     return failure();
   }
   llvmModule.print(out, nullptr);
+  return success();
+}
+
+LogicalResult installAOTEntryPoint(llvm::Module &llvmModule) {
+  llvm::Function *pythonMain = llvmModule.getFunction("__main__");
+  if (!pythonMain) {
+    llvm::errs() << "error: cannot build executable: missing __main__ entry\n";
+    return failure();
+  }
+  if (!pythonMain->arg_empty() || !pythonMain->getReturnType()->isVoidTy()) {
+    llvm::errs() << "error: cannot build executable: __main__ must have type "
+                    "void ()\n";
+    return failure();
+  }
+
+  if (llvm::Function *existing = llvmModule.getFunction("main")) {
+    if (!existing->isDeclaration()) {
+      llvm::errs()
+          << "error: cannot build executable: symbol 'main' already exists\n";
+      return failure();
+    }
+    existing->eraseFromParent();
+  }
+
+  llvm::LLVMContext &context = llvmModule.getContext();
+  llvm::Type *i32 = llvm::Type::getInt32Ty(context);
+  llvm::Type *ptr = llvm::PointerType::getUnqual(context);
+  llvm::FunctionType *mainType =
+      llvm::FunctionType::get(i32, /*isVarArg=*/false);
+  llvm::Function *main = llvm::Function::Create(
+      mainType, llvm::GlobalValue::ExternalLinkage, "main", llvmModule);
+  main->setUWTableKind(llvm::UWTableKind::Async);
+
+  llvm::FunctionType *runnerType =
+      llvm::FunctionType::get(i32, {ptr}, /*isVarArg=*/false);
+  llvm::FunctionCallee runner =
+      llvmModule.getOrInsertFunction("LyRunPythonMain", runnerType);
+
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", main);
+  llvm::IRBuilder<> builder(entry);
+  llvm::CallInst *status = builder.CreateCall(runner, {pythonMain});
+  builder.CreateRet(status);
   return success();
 }
 
@@ -772,6 +834,11 @@ struct LLVMSafetyContract {
 
 struct LLVMSafetyProfile {
   llvm::SmallVector<LLVMSafetyContract, 64> contracts;
+};
+
+enum class LLVMSafetyContractCoverage {
+  RequireEveryContract,
+  AllowOptimizerElision,
 };
 
 static constexpr llvm::StringLiteral kLythonSafetyMetadataName{"ly.safety"};
@@ -870,7 +937,7 @@ mapAtomicOrdering(LLVM::AtomicOrdering ordering) {
 static std::optional<int64_t> mlirIntegerConstant(Value value) {
   if (auto constant = value.getDefiningOp<LLVM::ConstantOp>())
     if (auto attr = dyn_cast<IntegerAttr>(constant.getValue()))
-      return attr.getInt();
+      return attr.getValue().getSExtValue();
   return std::nullopt;
 }
 
@@ -935,39 +1002,38 @@ static bool instructionMatchesContract(llvm::Instruction &inst,
 }
 
 static std::optional<int64_t>
-recoverDroppedNoOpAtomicReadContract(llvm::Instruction &inst,
-                                     const LLVMSafetyProfile &profile) {
-  auto *rmw = llvm::dyn_cast<llvm::AtomicRMWInst>(&inst);
-  if (!rmw)
-    return std::nullopt;
-  std::optional<int64_t> actualValue =
-      llvmIntegerConstant(rmw->getValOperand());
-  if (!actualValue || *actualValue != 0)
+recoverDroppedAtomicRMWContract(llvm::Instruction &inst,
+                                const LLVMSafetyProfile &profile,
+                                llvm::ArrayRef<unsigned> reserved) {
+  if (!llvm::isa<llvm::AtomicRMWInst>(&inst))
     return std::nullopt;
 
   llvm::Function *function = inst.getFunction();
   if (!function)
     return std::nullopt;
+  std::optional<int64_t> fallback;
   for (const LLVMSafetyContract &contract : profile.contracts) {
     if (contract.functionName != function->getName())
       continue;
     if (contract.kind != LLVMSafetyEffectKind::AtomicRMW)
       continue;
-    if (!contract.rmwBinOp || *contract.rmwBinOp != llvm::AtomicRMWInst::Add)
-      continue;
-    if (!contract.integerOperand || *contract.integerOperand != 0)
-      continue;
-    if (contract.ordering &&
-        *contract.ordering != llvm::AtomicOrdering::Acquire)
-      continue;
-    if (rmw->getOperation() != llvm::AtomicRMWInst::Add &&
-        rmw->getOperation() != llvm::AtomicRMWInst::Or)
-      continue;
     if (!instructionMatchesContract(inst, contract))
       continue;
-    return contract.id;
+    if (contract.id >= 0 &&
+        static_cast<size_t>(contract.id) < reserved.size() &&
+        reserved[static_cast<size_t>(contract.id)] == 0)
+      return contract.id;
+    if (!fallback)
+      fallback = contract.id;
   }
-  return std::nullopt;
+  return fallback;
+}
+
+static std::optional<int64_t>
+recoverDroppedSafetyContract(llvm::Instruction &inst,
+                             const LLVMSafetyProfile &profile,
+                             llvm::ArrayRef<unsigned> reserved) {
+  return recoverDroppedAtomicRMWContract(inst, profile, reserved);
 }
 
 void collectLLVMSafetyContracts(ModuleOp module, LLVMSafetyProfile &profile) {
@@ -1121,12 +1187,22 @@ void registerPySafetyLLVMIRTranslation(DialectRegistry &registry) {
 
 void emitLLVMSafetyVerifierError(llvm::Instruction &inst, llvm::StringRef msg);
 
-LogicalResult
-verifyLLVMIRSafetyMetadataPreserved(llvm::Module &llvmModule,
-                                    const LLVMSafetyProfile &profile,
-                                    llvm::StringRef label) {
+LogicalResult verifyLLVMIRSafetyMetadataPreserved(
+    llvm::Module &llvmModule, const LLVMSafetyProfile &profile,
+    llvm::StringRef label, LLVMSafetyContractCoverage coverage) {
   std::vector<unsigned> used(profile.contracts.size(), 0);
+  std::vector<unsigned> reserved(profile.contracts.size(), 0);
   bool failedAny = false;
+
+  for (llvm::Function &function : llvmModule) {
+    for (llvm::BasicBlock &block : function) {
+      for (llvm::Instruction &inst : block) {
+        if (auto id = getLythonSafetyMetadataId(inst))
+          if (*id >= 0 && static_cast<size_t>(*id) < reserved.size())
+            ++reserved[static_cast<size_t>(*id)];
+      }
+    }
+  }
 
   for (llvm::Function &function : llvmModule) {
     for (llvm::BasicBlock &block : function) {
@@ -1138,9 +1214,12 @@ verifyLLVMIRSafetyMetadataPreserved(llvm::Module &llvmModule,
         auto id = getLythonSafetyMetadataId(inst);
         if (!id) {
           if (auto recovered =
-                  recoverDroppedNoOpAtomicReadContract(inst, profile)) {
+                  recoverDroppedSafetyContract(inst, profile, reserved)) {
             setLythonSafetyMetadataId(inst, *recovered);
             id = recovered;
+            if (*recovered >= 0 &&
+                static_cast<size_t>(*recovered) < reserved.size())
+              ++reserved[static_cast<size_t>(*recovered)];
           } else if (getStructuralSafetyEffectKind(inst)) {
             emitLLVMSafetyVerifierError(
                 inst, "LLVM atomic safety effect has no preserved MLIR "
@@ -1171,13 +1250,23 @@ verifyLLVMIRSafetyMetadataPreserved(llvm::Module &llvmModule,
     }
   }
 
-  for (auto indexed : llvm::enumerate(used)) {
-    if (indexed.value() != 0)
-      continue;
-    const LLVMSafetyContract &contract = profile.contracts[indexed.index()];
-    llvm::errs() << "error: " << label << ": MLIR safety contract for @"
-                 << contract.functionName << " was not preserved\n";
-    failedAny = true;
+  if (coverage == LLVMSafetyContractCoverage::RequireEveryContract) {
+    for (auto indexed : llvm::enumerate(used)) {
+      if (indexed.value() != 0)
+        continue;
+      const LLVMSafetyContract &contract = profile.contracts[indexed.index()];
+      llvm::errs() << "error: " << label << ": MLIR safety contract for @"
+                   << contract.functionName << " was not preserved"
+                   << " (kind=" << static_cast<int>(contract.kind);
+      if (contract.rmwBinOp)
+        llvm::errs() << ", rmw=" << static_cast<int>(*contract.rmwBinOp);
+      if (contract.integerOperand)
+        llvm::errs() << ", value=" << *contract.integerOperand;
+      if (contract.ordering)
+        llvm::errs() << ", ordering=" << static_cast<int>(*contract.ordering);
+      llvm::errs() << ")\n";
+      failedAny = true;
+    }
   }
 
   return failure(failedAny);
@@ -1187,7 +1276,8 @@ LogicalResult
 verifyLLVMIRSafetyMetadataAttached(llvm::Module &llvmModule,
                                    const LLVMSafetyProfile &profile) {
   return verifyLLVMIRSafetyMetadataPreserved(
-      llvmModule, profile, "LLVM IR safety metadata verifier");
+      llvmModule, profile, "LLVM IR safety metadata verifier",
+      LLVMSafetyContractCoverage::RequireEveryContract);
 }
 
 void emitLLVMSafetyVerifierError(llvm::Instruction &inst, llvm::StringRef msg) {
@@ -1197,13 +1287,22 @@ void emitLLVMSafetyVerifierError(llvm::Instruction &inst, llvm::StringRef msg) {
   llvm::errs() << "  instruction: " << inst << "\n";
 }
 
-LogicalResult verifyPostCoroLLVMThreadSafety(llvm::Module &llvmModule,
-                                             const LLVMSafetyProfile &profile) {
+LogicalResult verifyPostCoroLLVMThreadSafety(
+    llvm::Module &llvmModule, const LLVMSafetyProfile &profile,
+    LLVMSafetyContractCoverage coverage =
+        LLVMSafetyContractCoverage::RequireEveryContract) {
   if (llvm::verifyModule(llvmModule, &llvm::errs()))
     return failure();
 
-  return verifyLLVMIRSafetyMetadataPreserved(llvmModule, profile,
-                                             "post-coro LLVM safety verifier");
+  return verifyLLVMIRSafetyMetadataPreserved(
+      llvmModule, profile, "post-coro LLVM safety verifier", coverage);
+}
+
+LogicalResult
+verifyOptimizedLLVMThreadSafety(llvm::Module &llvmModule,
+                                const LLVMSafetyProfile &profile) {
+  return verifyPostCoroLLVMThreadSafety(
+      llvmModule, profile, LLVMSafetyContractCoverage::AllowOptimizerElision);
 }
 
 LogicalResult emitObjectFile(llvm::Module &llvmModule,
@@ -1222,13 +1321,17 @@ LogicalResult emitObjectFile(llvm::Module &llvmModule,
   }
 
   llvm::TargetOptions opt;
+  opt.ExceptionModel = llvm::ExceptionHandling::DwarfCFI;
+  opt.MCOptions.EmitCompactUnwindNonCanonical = true;
+  opt.ForceDwarfFrameSection = true;
+  opt.MCOptions.EmitDwarfUnwind = llvm::EmitDwarfUnwindType::Always;
   auto targetMachine =
       std::unique_ptr<llvm::TargetMachine>(target->createTargetMachine(
           targetTriple, "generic", "", opt, std::nullopt));
   llvmModule.setTargetTriple(targetTriple);
   llvmModule.setDataLayout(targetMachine->createDataLayout());
   runLLVMCoroLowering(llvmModule);
-  if (failed(verifyPostCoroLLVMThreadSafety(llvmModule, safetyProfile)))
+  if (failed(verifyOptimizedLLVMThreadSafety(llvmModule, safetyProfile)))
     return failure();
 
   std::error_code ec;
@@ -1316,6 +1419,112 @@ bool usesAsyncRuntime(const llvm::Module &llvmModule) {
       return true;
   }
   return false;
+}
+
+std::optional<FileLineColLoc> findPythonSourceLoc(Location loc) {
+  if (auto fileLoc = dyn_cast<FileLineColLoc>(loc)) {
+    if (fileLoc.getFilename().getValue().ends_with(".py"))
+      return fileLoc;
+    return std::nullopt;
+  }
+  if (auto nameLoc = dyn_cast<NameLoc>(loc))
+    return findPythonSourceLoc(nameLoc.getChildLoc());
+  if (auto fused = dyn_cast<FusedLoc>(loc)) {
+    for (Location child : fused.getLocations())
+      if (auto found = findPythonSourceLoc(child))
+        return found;
+  }
+  return std::nullopt;
+}
+
+struct PythonDebugScopeCache {
+  MLIRContext *context;
+  llvm::StringMap<LLVM::DIFileAttr> files;
+  llvm::StringMap<LLVM::DICompileUnitAttr> compileUnits;
+
+  explicit PythonDebugScopeCache(MLIRContext *context) : context(context) {}
+
+  LLVM::DIFileAttr fileFor(StringRef sourcePath) {
+    if (auto found = files.find(sourcePath); found != files.end())
+      return found->second;
+
+    StringRef directory = llvm::sys::path::parent_path(sourcePath);
+    StringRef basename = llvm::sys::path::filename(sourcePath);
+    if (directory.empty())
+      directory = ".";
+    LLVM::DIFileAttr file = LLVM::DIFileAttr::get(context, basename, directory);
+    files[sourcePath] = file;
+    return file;
+  }
+
+  LLVM::DICompileUnitAttr compileUnitFor(StringRef sourcePath) {
+    if (auto found = compileUnits.find(sourcePath); found != compileUnits.end())
+      return found->second;
+
+    LLVM::DICompileUnitAttr unit = LLVM::DICompileUnitAttr::get(
+        DistinctAttr::create(UnitAttr::get(context)),
+        llvm::dwarf::DW_LANG_Python, fileFor(sourcePath),
+        StringAttr::get(context, "lython"),
+        /*isOptimized=*/true, LLVM::DIEmissionKind::LineTablesOnly);
+    compileUnits[sourcePath] = unit;
+    return unit;
+  }
+};
+
+Location scopedPythonDebugLoc(Location loc, LLVM::DISubprogramAttr scope) {
+  if (loc->findInstanceOf<FusedLocWith<LLVM::DILocalScopeAttr>>())
+    return loc;
+  return FusedLoc::get(loc.getContext(), {loc}, scope);
+}
+
+void attachPythonDebugInfo(ModuleOp module) {
+  PythonDebugScopeCache cache(module.getContext());
+  LLVM::DINullTypeAttr voidType =
+      LLVM::DINullTypeAttr::get(module.getContext());
+  LLVM::DISubroutineTypeAttr subroutineType = LLVM::DISubroutineTypeAttr::get(
+      module.getContext(), ArrayRef<LLVM::DITypeAttr>{voidType});
+
+  module.walk([&](LLVM::LLVMFuncOp function) {
+    if (function.getLoc()
+            ->findInstanceOf<FusedLocWith<LLVM::DISubprogramAttr>>())
+      return;
+
+    std::optional<FileLineColLoc> sourceLoc =
+        findPythonSourceLoc(function.getLoc());
+    if (!sourceLoc)
+      return;
+
+    StringRef sourcePath = sourceLoc->getFilename().getValue();
+    LLVM::DIFileAttr file = cache.fileFor(sourcePath);
+    LLVM::DICompileUnitAttr compileUnit = cache.compileUnitFor(sourcePath);
+    StringRef linkageName = function.getSymName();
+    StringRef displayName =
+        linkageName == "__main__" ? "<module>" : linkageName;
+    uint32_t flagBits =
+        static_cast<uint32_t>(LLVM::DISubprogramFlags::Definition) |
+        static_cast<uint32_t>(LLVM::DISubprogramFlags::Optimized);
+    if (linkageName == "__main__")
+      flagBits |=
+          static_cast<uint32_t>(LLVM::DISubprogramFlags::MainSubprogram);
+    auto flags = static_cast<LLVM::DISubprogramFlags>(flagBits);
+
+    LLVM::DISubprogramAttr subprogram = LLVM::DISubprogramAttr::get(
+        module.getContext(),
+        DistinctAttr::create(UnitAttr::get(module.getContext())), compileUnit,
+        compileUnit, StringAttr::get(module.getContext(), displayName),
+        StringAttr::get(module.getContext(), linkageName), file,
+        sourceLoc->getLine(), sourceLoc->getLine(), flags, subroutineType,
+        ArrayRef<LLVM::DINodeAttr>{}, ArrayRef<LLVM::DINodeAttr>{});
+
+    function->setLoc(scopedPythonDebugLoc(function.getLoc(), subprogram));
+    function.walk([&](Operation *op) {
+      if (op == function.getOperation())
+        return;
+      if (!findPythonSourceLoc(op->getLoc()))
+        return;
+      op->setLoc(scopedPythonDebugLoc(op->getLoc(), subprogram));
+    });
+  });
 }
 
 LogicalResult buildExecutable(llvm::Module &llvmModule,
@@ -1424,6 +1633,9 @@ LogicalResult runJIT(ModuleOp module, const IRDumpConfig &irDump) {
 
     LLVMSafetyProfile safetyProfile;
     collectLLVMSafetyContracts(module, safetyProfile);
+    llvm::SmallVector<py::PythonCallSiteRange, 16> pythonCallSites;
+    py::collectPythonCallSiteRanges(module, pythonCallSites);
+    attachPythonDebugInfo(module);
 
     auto llvmContext = std::make_unique<llvm::LLVMContext>();
     auto llvmModule = mlir::translateModuleToLLVMIR(module, *llvmContext);
@@ -1431,6 +1643,7 @@ LogicalResult runJIT(ModuleOp module, const IRDumpConfig &irDump) {
       llvm::errs() << "Failed to translate to LLVM IR\n";
       return failure();
     }
+    py::installPythonExceptionCleanupFrames(*llvmModule, pythonCallSites);
     if (failed(verifyLLVMIRSafetyMetadataAttached(*llvmModule, safetyProfile)))
       return failure();
     if (failed(verifyPostCoroLLVMThreadSafety(*llvmModule, safetyProfile)))
@@ -1446,7 +1659,7 @@ LogicalResult runJIT(ModuleOp module, const IRDumpConfig &irDump) {
       return failure();
     runLLVMCoroLowering(*llvmModule);
     dumpLLVMForPass(irDump, "llvm-translation", *llvmModule);
-    if (failed(verifyPostCoroLLVMThreadSafety(*llvmModule, safetyProfile)))
+    if (failed(verifyOptimizedLLVMThreadSafety(*llvmModule, safetyProfile)))
       return failure();
 
     auto &jd = jit->getMainJITDylib();
@@ -1470,7 +1683,7 @@ LogicalResult runJIT(ModuleOp module, const IRDumpConfig &irDump) {
       return failure();
     }
 
-    auto sym = jit->lookup("_mlir_ciface_main");
+    auto sym = jit->lookup("__main__");
     if (!sym) {
       llvm::errs() << "JIT lookup failed: " << sym.takeError() << "\n";
       return failure();
@@ -1478,13 +1691,13 @@ LogicalResult runJIT(ModuleOp module, const IRDumpConfig &irDump) {
     entryAddress = *sym;
   }
 
-  auto *entry = entryAddress.toPtr<int32_t (*)()>();
-  int32_t exitCode = 0;
+  auto *entry = entryAddress.toPtr<void (*)()>();
   {
     PerfScope perf("execution");
-    exitCode = entry();
+    if (LyRunPythonMain(entry) != 0)
+      return failure();
   }
-  return exitCode == 0 ? success() : failure();
+  return success();
 }
 
 } // namespace
@@ -1653,6 +1866,9 @@ int main(int argc, char **argv) {
 
   LLVMSafetyProfile safetyProfile;
   collectLLVMSafetyContracts(*module, safetyProfile);
+  llvm::SmallVector<py::PythonCallSiteRange, 16> pythonCallSites;
+  py::collectPythonCallSiteRanges(*module, pythonCallSites);
+  attachPythonDebugInfo(*module);
 
   llvm::LLVMContext llvmContext;
   auto llvmModule = mlir::translateModuleToLLVMIR(*module, llvmContext);
@@ -1660,6 +1876,7 @@ int main(int argc, char **argv) {
     llvm::errs() << "Failed to translate to LLVM IR\n";
     return 1;
   }
+  py::installPythonExceptionCleanupFrames(*llvmModule, pythonCallSites);
   dumpLLVMForPass(irDump, "llvm-translation", *llvmModule);
   if (failed(verifyLLVMIRSafetyMetadataAttached(*llvmModule, safetyProfile)))
     return 1;
@@ -1669,6 +1886,10 @@ int main(int argc, char **argv) {
   if (py::runtime_library::prelowerGenerationMode())
     sealRuntimeSafetyMetadata(*llvmModule);
   else if (failed(linkPrelinkedRuntime(*llvmModule)))
+    return 1;
+
+  if (!py::runtime_library::prelowerGenerationMode() &&
+      failed(installAOTEntryPoint(*llvmModule)))
     return 1;
 
   if (EmitLLVMOnly)

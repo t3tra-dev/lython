@@ -1,22 +1,27 @@
 #include "Emitter.h"
 
-#include "Builder.h"
+#include "EmitterCore.h"
+
+#include "mlir/IR/BuiltinOps.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <utility>
 
 namespace lython::emitter {
 
-EmitResult emitModule(const parser::Node &module, mlir::MLIRContext &context,
-                      std::string moduleName) {
-  Builder builder(context, std::move(moduleName));
-  return builder.emit(module);
+EmitResult emitModule(const parser::Node &moduleNode,
+                      mlir::MLIRContext &context, std::string moduleName,
+                      std::string sourceName) {
+  ModuleEmitter emitter(moduleNode, context, std::move(moduleName),
+                        std::move(sourceName));
+  return emitter.emit();
 }
 
-TextEmitResult emitModuleText(const parser::Node &module,
-                              std::string moduleName) {
+TextEmitResult emitModuleText(const parser::Node &moduleNode,
+                              std::string moduleName, std::string sourceName) {
   mlir::MLIRContext context;
-  EmitResult emitted = emitModule(module, context, std::move(moduleName));
+  EmitResult emitted = emitModule(moduleNode, context, std::move(moduleName),
+                                  std::move(sourceName));
   TextEmitResult result;
   result.diagnostics = std::move(emitted.diagnostics);
   if (!emitted.module)

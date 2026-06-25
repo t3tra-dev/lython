@@ -11,6 +11,11 @@ void LyTraceback_Push(std::uint8_t *file_allocated, std::uint8_t *file_aligned,
                       std::uint8_t *func_aligned, std::int64_t func_offset,
                       std::int64_t func_size, std::int64_t func_stride,
                       std::int32_t line, std::int32_t col);
+void LyTraceback_PushCString(const char *file, const char *func,
+                             std::int32_t line, std::int32_t col);
+void LyTraceback_PushCStringRange(const char *file, const char *func,
+                                  std::int32_t line, std::int32_t col,
+                                  std::int32_t end_line, std::int32_t end_col);
 void LyTraceback_Pop();
 void LyTraceback_Clear();
 void LyTraceback_PrintMessage(std::int64_t class_id,
@@ -19,4 +24,5 @@ void LyTraceback_PrintMessage(std::int64_t class_id,
                               std::int64_t payload_offset,
                               std::int64_t payload_size,
                               std::int64_t payload_stride);
+int LyRunPythonMain(void (*entry)());
 }

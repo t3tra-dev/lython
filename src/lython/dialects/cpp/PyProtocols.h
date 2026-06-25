@@ -2,9 +2,11 @@
 
 #include "PyDialectTypes.h"
 #include "mlir/IR/MLIRContext.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 
-#include <map>
+#include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
@@ -23,6 +25,20 @@ struct ProtocolMethod {
   py::CallableType signature;
   bool mayThrow = false;
   bool noThrow = false;
+};
+
+bool sameMethodContract(const ProtocolMethod &lhs, const ProtocolMethod &rhs);
+
+std::optional<std::int64_t> normalizeFiniteTupleIndex(std::int64_t index,
+                                                      std::size_t size);
+
+// Returns the callable view used for a bound method by dropping the receiver
+// parameter while preserving parameter metadata.
+py::CallableType bindReceiverCallable(py::CallableType signature);
+
+struct KeywordArgument {
+  std::string name;
+  mlir::Type type;
 };
 
 // Optional annotation-only short form for protocols whose public generic
@@ -44,6 +60,7 @@ struct ProtocolInfo {
   std::vector<mlir::Type> paramDefaults;
   std::vector<ProtocolShortForm> shortForms;
   std::vector<ProtocolBase> bases;
+  std::map<std::string, mlir::Type> fields;
   std::map<std::string, std::vector<ProtocolMethod>> methods;
   bool isProtocol = false;
   bool isAbstract = false;
@@ -59,6 +76,37 @@ struct ProtocolEvidence {
   const ProtocolInfo *info = nullptr;
 };
 
+// A selected method contract plus the evidence used to select and specialize
+// it. This is the manifest-level proof object that higher layers should carry
+// when they need to lower a protocol operation without recomputing the same
+// facts.
+struct ContractResolution {
+  ProtocolMethod method;
+  std::string methodName;
+  std::map<std::string, mlir::Type> typeBindings;
+  std::optional<ProtocolEvidence> receiverEvidence;
+  int score = 0;
+};
+
+// A selected field contract plus the binding/evidence used to specialize it.
+// This mirrors ContractResolution for attributes so callers do not have to
+// recompute or discard manifest binding facts when resolving fields.
+struct FieldResolution {
+  mlir::Type contractType;
+  std::string fieldName;
+  std::map<std::string, mlir::Type> typeBindings;
+  std::optional<ProtocolEvidence> receiverEvidence;
+};
+
+// A selected awaitable contract. Native async.value<T> has no manifest method
+// contract but still has a payload; protocol-backed awaitables carry the
+// __await__ contract used to derive that payload so inference/lowering can keep
+// the same evidence.
+struct AwaitableResolution {
+  mlir::Type payloadType;
+  std::optional<ContractResolution> awaitContract;
+};
+
 // The loaded manifest. The dialect (TableGen) keeps only value-level runtime
 // representations; the Protocol tower
 // (Iterable/Container/Sized/Iterator/Reversible/Collection/Sequence/range) is
@@ -69,26 +117,20 @@ public:
   // owned by the context). The manifest bytecode is compiled into the
   // binary at build time.
   static const Table &get(mlir::MLIRContext &context);
+  static Table &getMutable(mlir::MLIRContext &context);
 
-  // Resolves a method on a concrete dialect type or an already-erased
-  // !py.protocol receiver by binding it to its manifest class and walking the
-  // instantiated bases. The returned signature has all type variables
-  // substituted.
-  std::optional<py::CallableType> methodOn(mlir::Type receiverType,
-                                           llvm::StringRef methodName) const;
-  std::vector<py::CallableType>
-  methodOverloadsOn(mlir::Type receiverType, llvm::StringRef methodName) const;
-  std::vector<ProtocolMethod>
-  methodContractsOn(mlir::Type receiverType, llvm::StringRef methodName) const;
-  std::optional<ProtocolMethod>
-  resolveMethodContractOn(mlir::Type receiverType, llvm::StringRef methodName,
-                          llvm::ArrayRef<mlir::Type> argumentTypes) const;
-  std::optional<py::CallableType>
-  resolveMethodOn(mlir::Type receiverType, llvm::StringRef methodName,
-                  llvm::ArrayRef<mlir::Type> argumentTypes) const;
-  std::optional<mlir::Type>
-  resolveMethodResultOn(mlir::Type receiverType, llvm::StringRef methodName,
-                        llvm::ArrayRef<mlir::Type> argumentTypes) const;
+  void registerClass(llvm::StringRef name, ProtocolInfo info);
+
+  // Enumerates manifest method candidates on a concrete dialect type or an
+  // already-erased !py.protocol receiver. Each candidate carries the receiver
+  // binding/evidence used to specialize its signature; call-site selection is
+  // performed by the caller's Callable matcher.
+  std::vector<ContractResolution>
+  methodContractCandidatesWithEvidence(mlir::Type receiverType,
+                                       llvm::StringRef methodName) const;
+  std::optional<FieldResolution>
+  resolveFieldContractWithEvidence(mlir::Type receiverType,
+                                   llvm::StringRef fieldName) const;
   std::optional<std::vector<mlir::Type>>
   protocolArgumentsFor(mlir::Type receiverType,
                        llvm::StringRef protocolName) const;
@@ -96,20 +138,27 @@ public:
   completeProtocolArguments(llvm::StringRef protocolName,
                             llvm::ArrayRef<mlir::Type> supplied) const;
   std::optional<ProtocolEvidence> evidenceFor(mlir::Type receiverType) const;
+  std::optional<AwaitableResolution>
+  resolveAwaitableWithEvidence(mlir::Type type) const;
   mlir::Type awaitablePayloadType(mlir::Type type) const;
-  bool conformsTo(mlir::Type receiverType, py::ProtocolType protocol) const;
 
   const ProtocolInfo *lookup(llvm::StringRef name) const;
   bool isProtocol(llvm::StringRef name) const;
   bool loaded() const { return !classes.empty(); }
 
 private:
-  void
+  std::optional<FieldResolution>
+  collectFieldResolutionIn(llvm::StringRef className,
+                           const std::map<std::string, mlir::Type> &binding,
+                           llvm::StringRef fieldName, unsigned depth) const;
+  std::vector<ProtocolMethod>
+  collectReceiverMethodContracts(mlir::Type receiverType,
+                                 llvm::StringRef methodName) const;
+  bool
   collectMethodContractsIn(llvm::StringRef className,
                            const std::map<std::string, mlir::Type> &binding,
                            llvm::StringRef methodName, unsigned depth,
                            std::vector<ProtocolMethod> &out) const;
-
   std::map<std::string, ProtocolInfo> classes;
 };
 

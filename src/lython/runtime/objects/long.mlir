@@ -1,90 +1,15 @@
-module {
+module attributes {ly.runtime.contracts = ["builtins.int"]} {
   func.func private @LyLong_DecRef(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %digits: memref<?xi32>) attributes {ly.ownership.release_args = [0]}
+  func.func private @LyFloat_FromF64(%value: f64) -> (memref<2xi64>, memref<1xf64>)
   func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]}
   func.func private @LyUnicode_FromI64(%value: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]}
 
-
-  // Builds the three descriptor parts of an inline tagged long
-  // (rfc/tagged-long.md). The tagged word (payload << 1 | 1) sits in the
-  // pointer lanes of every part; nothing may dereference them. Genuine
-  // allocations are at least 8-byte aligned, so bit 0 discriminates.
-  func.func private @__ly_long_make_tagged(%payload: i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) {
-    %one = arith.constant 1 : i64
-    %shifted = arith.shli %payload, %one : i64
-    %word = arith.ori %shifted, %one : i64
-    %ptr = llvm.inttoptr %word : i64 to !llvm.ptr
-    %zero_l = llvm.mlir.constant(0 : i64) : i64
-    %one_l = llvm.mlir.constant(1 : i64) : i64
-    %two_l = llvm.mlir.constant(2 : i64) : i64
-    %undef = llvm.mlir.undef : !llvm.struct<(ptr, ptr, i64, array<1 x i64>, array<1 x i64>)>
-    %p0 = llvm.insertvalue %ptr, %undef[0] : !llvm.struct<(ptr, ptr, i64, array<1 x i64>, array<1 x i64>)>
-    %p1 = llvm.insertvalue %ptr, %p0[1] : !llvm.struct<(ptr, ptr, i64, array<1 x i64>, array<1 x i64>)>
-    %p2 = llvm.insertvalue %zero_l, %p1[2] : !llvm.struct<(ptr, ptr, i64, array<1 x i64>, array<1 x i64>)>
-    %w3 = llvm.insertvalue %two_l, %p2[3, 0] : !llvm.struct<(ptr, ptr, i64, array<1 x i64>, array<1 x i64>)>
-    %w4 = llvm.insertvalue %one_l, %w3[4, 0] : !llvm.struct<(ptr, ptr, i64, array<1 x i64>, array<1 x i64>)>
-    %header = builtin.unrealized_conversion_cast %w4 : !llvm.struct<(ptr, ptr, i64, array<1 x i64>, array<1 x i64>)> to memref<2xi64> {ly.runtime.descriptor_bridge}
-    %meta = builtin.unrealized_conversion_cast %w4 : !llvm.struct<(ptr, ptr, i64, array<1 x i64>, array<1 x i64>)> to memref<2xi64> {ly.runtime.descriptor_bridge}
-    %d3 = llvm.insertvalue %zero_l, %p2[3, 0] : !llvm.struct<(ptr, ptr, i64, array<1 x i64>, array<1 x i64>)>
-    %d4 = llvm.insertvalue %one_l, %d3[4, 0] : !llvm.struct<(ptr, ptr, i64, array<1 x i64>, array<1 x i64>)>
-    %digits = builtin.unrealized_conversion_cast %d4 : !llvm.struct<(ptr, ptr, i64, array<1 x i64>, array<1 x i64>)> to memref<?xi32> {ly.runtime.descriptor_bridge}
-    func.return %header, %meta, %digits : memref<2xi64>, memref<2xi64>, memref<?xi32>
-  }
-
-  // Selects the digit view of a long operand. Tagged payloads are
-  // materialized into caller-provided stack scratch; heap operands pass
-  // through untouched. The scratch never escapes the caller frame, and the
-  // digit algorithms below stay tag-free.
-  func.func private @__ly_long_operand_view(%header: memref<2xi64>, %meta: memref<2xi64>, %digits: memref<?xi32>, %scratch_meta: memref<2xi64>, %scratch_digits: memref<3xi32>) -> (memref<2xi64>, memref<?xi32>) {
-    %tag_one = arith.constant 1 : i64
-    %ptr = memref.extract_aligned_pointer_as_index %header : memref<2xi64> -> index
-    %bits = arith.index_cast %ptr : index to i64
-    %bit = arith.andi %bits, %tag_one : i64
-    %tagged = arith.cmpi eq, %bit, %tag_one : i64
-    cf.cond_br %tagged, ^spill, ^pass
-
-  ^pass:
+  // Long values are represented as ordinary heap-backed runtime objects here.
+  // The runtime manifest must not fabricate memref descriptors from unrelated
+  // LLVM values. If immediates are reintroduced later, they should be modeled as
+  // a real lowering ABI primitive before entering this object implementation.
+  func.func private @__ly_long_operand_view(%meta: memref<2xi64>, %digits: memref<?xi32>) -> (memref<2xi64>, memref<?xi32>) {
     func.return %meta, %digits : memref<2xi64>, memref<?xi32>
-
-  ^spill:
-    %payload = arith.shrsi %bits, %tag_one : i64
-    %zero = arith.constant 0 : i64
-    %one = arith.constant 1 : i64
-    %two = arith.constant 2 : i64
-    %three = arith.constant 3 : i64
-    %is_zero = arith.cmpi eq, %payload, %zero : i64
-    %is_negative = arith.cmpi slt, %payload, %zero : i64
-    %neg_one = arith.constant -1 : i64
-    %signed_sign = arith.select %is_negative, %neg_one, %one : i1, i64
-    %sign = arith.select %is_zero, %zero, %signed_sign : i1, i64
-    %negated = arith.subi %zero, %payload : i64
-    %abs_value = arith.select %is_negative, %negated, %payload : i1, i64
-    %mask = arith.constant 1073741823 : i64
-    %shift30 = arith.constant 30 : i64
-    %shift60 = arith.constant 60 : i64
-    %digit0_i64 = arith.andi %abs_value, %mask : i64
-    %digit1_shifted = arith.shrui %abs_value, %shift30 : i64
-    %digit1_i64 = arith.andi %digit1_shifted, %mask : i64
-    %digit2_i64 = arith.shrui %abs_value, %shift60 : i64
-    %digit1_nonzero = arith.cmpi ne, %digit1_i64, %zero : i64
-    %digit2_nonzero = arith.cmpi ne, %digit2_i64, %zero : i64
-    %one_or_two = arith.select %digit1_nonzero, %two, %one : i1, i64
-    %nonzero_digits = arith.select %digit2_nonzero, %three, %one_or_two : i1, i64
-    %ndigits = arith.select %is_zero, %zero, %nonzero_digits : i1, i64
-    %sign_slot = arith.constant 0 : index
-    %count_slot = arith.constant 1 : index
-    memref.store %sign, %scratch_meta[%sign_slot] : memref<2xi64>
-    memref.store %ndigits, %scratch_meta[%count_slot] : memref<2xi64>
-    %d0 = arith.trunci %digit0_i64 : i64 to i32
-    %d1 = arith.trunci %digit1_i64 : i64 to i32
-    %d2 = arith.trunci %digit2_i64 : i64 to i32
-    %c0 = arith.constant 0 : index
-    %c1 = arith.constant 1 : index
-    %c2 = arith.constant 2 : index
-    memref.store %d0, %scratch_digits[%c0] : memref<3xi32>
-    memref.store %d1, %scratch_digits[%c1] : memref<3xi32>
-    memref.store %d2, %scratch_digits[%c2] : memref<3xi32>
-    %digits_view = memref.cast %scratch_digits : memref<3xi32> to memref<?xi32>
-    func.return %scratch_meta, %digits_view : memref<2xi64>, memref<?xi32>
   }
 
   func.func private @__ly_long_alloc_raw(%sign: i64, %capacity: i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) {
@@ -283,21 +208,7 @@ module {
     func.return %header, %meta, %digits : memref<2xi64>, memref<2xi64>, memref<?xi32>
   }
 
-  func.func @LyLong_FromI64(%value: i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0]} {
-    // Values that round-trip a 1-bit shift fit the 63-bit tagged payload and
-    // never allocate (rfc/tagged-long.md). This also subsumes the small-int
-    // cache.
-    %tag_one = arith.constant 1 : i64
-    %fits_shifted = arith.shli %value, %tag_one : i64
-    %fits_back = arith.shrsi %fits_shifted, %tag_one : i64
-    %fits = arith.cmpi eq, %fits_back, %value : i64
-    cf.cond_br %fits, ^tagged, ^alloc
-
-  ^tagged:
-    %th, %tm, %td = func.call @__ly_long_make_tagged(%value) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %th, %tm, %td : memref<2xi64>, memref<2xi64>, memref<?xi32>
-
-  ^alloc:
+  func.func @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 1 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %two = arith.constant 2 : i64
@@ -346,21 +257,54 @@ module {
     func.return %header, %meta, %digits : memref<2xi64>, memref<2xi64>, memref<?xi32>
   }
 
-  func.func @LyLong_AsI64(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %digits: memref<?xi32>) -> i64 {
-    %tag_one = arith.constant 1 : i64
-    %hdr_ptr = memref.extract_aligned_pointer_as_index %header : memref<2xi64> -> index
-    %hdr_bits = arith.index_cast %hdr_ptr : index to i64
-    %hdr_tagbit = arith.andi %hdr_bits, %tag_one : i64
-    %hdr_tagged = arith.cmpi eq, %hdr_tagbit, %tag_one : i64
-    cf.cond_br %hdr_tagged, ^tagged, ^heap
-
-  ^tagged:
-    %payload = arith.shrsi %hdr_bits, %tag_one : i64
-    func.return %payload : i64
-
-  ^heap:
+  func.func @LyLong_AsI64(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %digits: memref<?xi32>) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__int__", ly.runtime.primitive = "unbox.i64"} {
     %result = func.call @__ly_long_view_as_i64(%meta, %digits) : (memref<2xi64>, memref<?xi32>) -> i64
     func.return %result : i64
+  }
+
+  func.func @LyLong_AsF64(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %digits: memref<?xi32>) -> f64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "unbox.f64"} {
+    %value = func.call @LyLong_AsI64(%header, %meta, %digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+    %float_value = arith.sitofp %value : i64 to f64
+    func.return %float_value : f64
+  }
+
+  func.func @LyLong_Init(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %digits: memref<?xi32>) attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__init__"} {
+    func.return
+  }
+
+  func.func @LyLong_Bool(%header: memref<2xi64> {ly.ownership.object_header}, %meta_raw: memref<2xi64>, %digits_raw: memref<?xi32>) -> i1 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__bool__"} {
+    %meta, %digits = func.call @__ly_long_operand_view(%meta_raw, %digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
+    %count_slot = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
+    %count = memref.load %meta[%count_slot] : memref<2xi64>
+    %result = arith.cmpi ne, %count, %zero : i64
+    func.return %result : i1
+  }
+
+  func.func @LyLong_Pos(%header: memref<2xi64> {ly.ownership.object_header}, %meta_raw: memref<2xi64>, %digits_raw: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__pos__"} {
+    %meta, %digits = func.call @__ly_long_operand_view(%meta_raw, %digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
+    %h, %m, %d = func.call @__ly_long_copy(%meta, %digits) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
+  }
+
+  func.func @LyLong_Neg(%header: memref<2xi64> {ly.ownership.object_header}, %meta_raw: memref<2xi64>, %digits_raw: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__neg__"} {
+    %meta, %digits = func.call @__ly_long_operand_view(%meta_raw, %digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
+    %sign_slot = arith.constant 0 : index
+    %zero = arith.constant 0 : i64
+    %sign = memref.load %meta[%sign_slot] : memref<2xi64>
+    %negated = arith.subi %zero, %sign : i64
+    %h, %m, %d = func.call @__ly_long_copy_with_sign(%negated, %meta, %digits) : (i64, memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
+  }
+
+  func.func @LyLong_Invert(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %digits: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__invert__"} {
+    %neg_h, %neg_m, %neg_d = func.call @LyLong_Neg(%header, %meta, %digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    %one = arith.constant 1 : i64
+    %one_h, %one_m, %one_d = func.call @LyLong_FromI64(%one) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    %result_h, %result_m, %result_d = func.call @LyLong_Sub(%neg_h, %neg_m, %neg_d, %one_h, %one_m, %one_d) : (memref<2xi64>, memref<2xi64>, memref<?xi32>, memref<2xi64>, memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    func.call @LyLong_DecRef(%neg_h, %neg_m, %neg_d) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> ()
+    func.call @LyLong_DecRef(%one_h, %one_m, %one_d) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> ()
+    func.return %result_h, %result_m, %result_d : memref<2xi64>, memref<2xi64>, memref<?xi32>
   }
 
   // Reads a (meta, digits) view whose magnitude fits i64 (at most two
@@ -410,34 +354,9 @@ module {
     func.return %result : i64
   }
 
-  func.func @LyLong_Add(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_meta_raw: memref<2xi64>, %lhs_digits_raw: memref<?xi32>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_meta_raw: memref<2xi64>, %rhs_digits_raw: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0]} {
-    %tag_one = arith.constant 1 : i64
-    %lhs_ptr = memref.extract_aligned_pointer_as_index %lhs_header : memref<2xi64> -> index
-    %lhs_bits = arith.index_cast %lhs_ptr : index to i64
-    %lhs_tagbit = arith.andi %lhs_bits, %tag_one : i64
-    %lhs_tagged = arith.cmpi eq, %lhs_tagbit, %tag_one : i64
-    %rhs_ptr = memref.extract_aligned_pointer_as_index %rhs_header : memref<2xi64> -> index
-    %rhs_bits = arith.index_cast %rhs_ptr : index to i64
-    %rhs_tagbit = arith.andi %rhs_bits, %tag_one : i64
-    %rhs_tagged = arith.cmpi eq, %rhs_tagbit, %tag_one : i64
-    %both_tagged = arith.andi %lhs_tagged, %rhs_tagged : i1
-    %lhs_scratch_meta = memref.alloca() : memref<2xi64>
-    %lhs_scratch_digits = memref.alloca() : memref<3xi32>
-    %rhs_scratch_meta = memref.alloca() : memref<2xi64>
-    %rhs_scratch_digits = memref.alloca() : memref<3xi32>
-    cf.cond_br %both_tagged, ^fast, ^general
-
-  ^fast:
-    // Two 63-bit payloads cannot wrap i64; FromI64 re-tags when it fits.
-    %fast_a = arith.shrsi %lhs_bits, %tag_one : i64
-    %fast_b = arith.shrsi %rhs_bits, %tag_one : i64
-    %fast_sum = arith.addi %fast_a, %fast_b : i64
-    %fh, %fm, %fd = func.call @LyLong_FromI64(%fast_sum) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %fh, %fm, %fd : memref<2xi64>, memref<2xi64>, memref<?xi32>
-
-  ^general:
-    %lhs_meta, %lhs_digits = func.call @__ly_long_operand_view(%lhs_header, %lhs_meta_raw, %lhs_digits_raw, %lhs_scratch_meta, %lhs_scratch_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>, memref<2xi64>, memref<3xi32>) -> (memref<2xi64>, memref<?xi32>)
-    %rhs_meta, %rhs_digits = func.call @__ly_long_operand_view(%rhs_header, %rhs_meta_raw, %rhs_digits_raw, %rhs_scratch_meta, %rhs_scratch_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>, memref<2xi64>, memref<3xi32>) -> (memref<2xi64>, memref<?xi32>)
+  func.func @LyLong_Add(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_meta_raw: memref<2xi64>, %lhs_digits_raw: memref<?xi32>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_meta_raw: memref<2xi64>, %rhs_digits_raw: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__add__"} {
+    %lhs_meta, %lhs_digits = func.call @__ly_long_operand_view(%lhs_meta_raw, %lhs_digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
+    %rhs_meta, %rhs_digits = func.call @__ly_long_operand_view(%rhs_meta_raw, %rhs_digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
     %small_two = arith.constant 2 : i64
     %small_count_slot = arith.constant 1 : index
     %lhs_view_count = memref.load %lhs_meta[%small_count_slot] : memref<2xi64>
@@ -448,9 +367,7 @@ module {
     cf.cond_br %both_small, ^small, ^digits
 
   ^small:
-    // At most two 30-bit limbs per side: compute natively and re-enter the
-    // tagged domain through FromI64. This absorbs heap-immortal literals
-    // into tagged values after a single operation.
+    // At most two 30-bit limbs per side fit the primitive fast path.
     %small_a = func.call @__ly_long_view_as_i64(%lhs_meta, %lhs_digits) : (memref<2xi64>, memref<?xi32>) -> i64
     %small_b = func.call @__ly_long_view_as_i64(%rhs_meta, %rhs_digits) : (memref<2xi64>, memref<?xi32>) -> i64
     %small_sum = arith.addi %small_a, %small_b : i64
@@ -502,33 +419,9 @@ module {
     func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi32>
   }
 
-  func.func @LyLong_Sub(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_meta_raw: memref<2xi64>, %rhs_digits_raw: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0]} {
-    %tag_one = arith.constant 1 : i64
-    %lhs_ptr = memref.extract_aligned_pointer_as_index %lhs_header : memref<2xi64> -> index
-    %lhs_bits = arith.index_cast %lhs_ptr : index to i64
-    %lhs_tagbit = arith.andi %lhs_bits, %tag_one : i64
-    %lhs_tagged = arith.cmpi eq, %lhs_tagbit, %tag_one : i64
-    %rhs_ptr = memref.extract_aligned_pointer_as_index %rhs_header : memref<2xi64> -> index
-    %rhs_bits = arith.index_cast %rhs_ptr : index to i64
-    %rhs_tagbit = arith.andi %rhs_bits, %tag_one : i64
-    %rhs_tagged = arith.cmpi eq, %rhs_tagbit, %tag_one : i64
-    %both_tagged = arith.andi %lhs_tagged, %rhs_tagged : i1
-    %lhs_scratch_meta = memref.alloca() : memref<2xi64>
-    %lhs_scratch_digits = memref.alloca() : memref<3xi32>
-    %rhs_scratch_meta = memref.alloca() : memref<2xi64>
-    %rhs_scratch_digits = memref.alloca() : memref<3xi32>
-    cf.cond_br %both_tagged, ^fast, ^general
-
-  ^fast:
-    %fast_a = arith.shrsi %lhs_bits, %tag_one : i64
-    %fast_b = arith.shrsi %rhs_bits, %tag_one : i64
-    %fast_diff = arith.subi %fast_a, %fast_b : i64
-    %fh, %fm, %fd = func.call @LyLong_FromI64(%fast_diff) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %fh, %fm, %fd : memref<2xi64>, memref<2xi64>, memref<?xi32>
-
-  ^general:
-    %lhs_meta_view, %lhs_digits_view = func.call @__ly_long_operand_view(%lhs_header, %lhs_meta, %lhs_digits, %lhs_scratch_meta, %lhs_scratch_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>, memref<2xi64>, memref<3xi32>) -> (memref<2xi64>, memref<?xi32>)
-    %rhs_meta, %rhs_digits = func.call @__ly_long_operand_view(%rhs_header, %rhs_meta_raw, %rhs_digits_raw, %rhs_scratch_meta, %rhs_scratch_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>, memref<2xi64>, memref<3xi32>) -> (memref<2xi64>, memref<?xi32>)
+  func.func @LyLong_Sub(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_meta_raw: memref<2xi64>, %rhs_digits_raw: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__sub__"} {
+    %lhs_meta_view, %lhs_digits_view = func.call @__ly_long_operand_view(%lhs_meta, %lhs_digits) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
+    %rhs_meta, %rhs_digits = func.call @__ly_long_operand_view(%rhs_meta_raw, %rhs_digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
     %small_two = arith.constant 2 : i64
     %small_count_slot = arith.constant 1 : index
     %lhs_view_count = memref.load %lhs_meta_view[%small_count_slot] : memref<2xi64>
@@ -557,39 +450,9 @@ module {
     func.return %result_h, %result_m, %result_d : memref<2xi64>, memref<2xi64>, memref<?xi32>
   }
 
-  func.func @LyLong_Mul(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_meta_raw: memref<2xi64>, %lhs_digits_raw: memref<?xi32>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_meta_raw: memref<2xi64>, %rhs_digits_raw: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0]} {
-    %tag_one = arith.constant 1 : i64
-    %lhs_ptr = memref.extract_aligned_pointer_as_index %lhs_header : memref<2xi64> -> index
-    %lhs_bits = arith.index_cast %lhs_ptr : index to i64
-    %lhs_tagbit = arith.andi %lhs_bits, %tag_one : i64
-    %lhs_tagged = arith.cmpi eq, %lhs_tagbit, %tag_one : i64
-    %rhs_ptr = memref.extract_aligned_pointer_as_index %rhs_header : memref<2xi64> -> index
-    %rhs_bits = arith.index_cast %rhs_ptr : index to i64
-    %rhs_tagbit = arith.andi %rhs_bits, %tag_one : i64
-    %rhs_tagged = arith.cmpi eq, %rhs_tagbit, %tag_one : i64
-    %both_tagged = arith.andi %lhs_tagged, %rhs_tagged : i1
-    %lhs_scratch_meta = memref.alloca() : memref<2xi64>
-    %lhs_scratch_digits = memref.alloca() : memref<3xi32>
-    %rhs_scratch_meta = memref.alloca() : memref<2xi64>
-    %rhs_scratch_digits = memref.alloca() : memref<3xi32>
-    cf.cond_br %both_tagged, ^fast, ^general
-
-  ^fast:
-    %fast_a = arith.shrsi %lhs_bits, %tag_one : i64
-    %fast_b = arith.shrsi %rhs_bits, %tag_one : i64
-    %fast_low, %fast_high = arith.mulsi_extended %fast_a, %fast_b : i64
-    %c63 = arith.constant 63 : i64
-    %fast_sign_ext = arith.shrsi %fast_low, %c63 : i64
-    %fits_i64 = arith.cmpi eq, %fast_high, %fast_sign_ext : i64
-    cf.cond_br %fits_i64, ^fast_fit, ^general
-
-  ^fast_fit:
-    %fh, %fm, %fd = func.call @LyLong_FromI64(%fast_low) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %fh, %fm, %fd : memref<2xi64>, memref<2xi64>, memref<?xi32>
-
-  ^general:
-    %lhs_meta, %lhs_digits = func.call @__ly_long_operand_view(%lhs_header, %lhs_meta_raw, %lhs_digits_raw, %lhs_scratch_meta, %lhs_scratch_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>, memref<2xi64>, memref<3xi32>) -> (memref<2xi64>, memref<?xi32>)
-    %rhs_meta, %rhs_digits = func.call @__ly_long_operand_view(%rhs_header, %rhs_meta_raw, %rhs_digits_raw, %rhs_scratch_meta, %rhs_scratch_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>, memref<2xi64>, memref<3xi32>) -> (memref<2xi64>, memref<?xi32>)
+  func.func @LyLong_Mul(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_meta_raw: memref<2xi64>, %lhs_digits_raw: memref<?xi32>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_meta_raw: memref<2xi64>, %rhs_digits_raw: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__mul__"} {
+    %lhs_meta, %lhs_digits = func.call @__ly_long_operand_view(%lhs_meta_raw, %lhs_digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
+    %rhs_meta, %rhs_digits = func.call @__ly_long_operand_view(%rhs_meta_raw, %rhs_digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
     %small_two = arith.constant 2 : i64
     %small_count_slot = arith.constant 1 : index
     %lhs_view_count = memref.load %lhs_meta[%small_count_slot] : memref<2xi64>
@@ -600,9 +463,8 @@ module {
     cf.cond_br %both_small, ^small, ^digits
 
   ^small:
-    // At most two 30-bit limbs per side: compute natively and re-enter the
-    // tagged domain through FromI64. This absorbs heap-immortal literals
-    // into tagged values after a single operation.
+    // At most two 30-bit limbs per side fit the primitive fast path when the
+    // product remains in i64.
     %small_a = func.call @__ly_long_view_as_i64(%lhs_meta, %lhs_digits) : (memref<2xi64>, memref<?xi32>) -> i64
     %small_b = func.call @__ly_long_view_as_i64(%rhs_meta, %rhs_digits) : (memref<2xi64>, memref<?xi32>) -> i64
     %small_low, %small_high = arith.mulsi_extended %small_a, %small_b : i64
@@ -692,38 +554,148 @@ module {
     func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi32>
   }
 
-  func.func @LyLong_Compare(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_meta_raw: memref<2xi64>, %lhs_digits_raw: memref<?xi32>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_meta_raw: memref<2xi64>, %rhs_digits_raw: memref<?xi32>) -> i64 {
-    %tag_one = arith.constant 1 : i64
-    %lhs_ptr = memref.extract_aligned_pointer_as_index %lhs_header : memref<2xi64> -> index
-    %lhs_bits = arith.index_cast %lhs_ptr : index to i64
-    %lhs_tagbit = arith.andi %lhs_bits, %tag_one : i64
-    %lhs_tagged = arith.cmpi eq, %lhs_tagbit, %tag_one : i64
-    %rhs_ptr = memref.extract_aligned_pointer_as_index %rhs_header : memref<2xi64> -> index
-    %rhs_bits = arith.index_cast %rhs_ptr : index to i64
-    %rhs_tagbit = arith.andi %rhs_bits, %tag_one : i64
-    %rhs_tagged = arith.cmpi eq, %rhs_tagbit, %tag_one : i64
-    %both_tagged = arith.andi %lhs_tagged, %rhs_tagged : i1
-    %lhs_scratch_meta = memref.alloca() : memref<2xi64>
-    %lhs_scratch_digits = memref.alloca() : memref<3xi32>
-    %rhs_scratch_meta = memref.alloca() : memref<2xi64>
-    %rhs_scratch_digits = memref.alloca() : memref<3xi32>
-    cf.cond_br %both_tagged, ^fast, ^general
+  func.func @LyLong_TrueDiv(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> (memref<2xi64>, memref<1xf64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__truediv__"} {
+    %lhs = func.call @LyLong_AsF64(%lhs_header, %lhs_meta, %lhs_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> f64
+    %rhs = func.call @LyLong_AsF64(%rhs_header, %rhs_meta, %rhs_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> f64
+    %zero = arith.constant 0.0 : f64
+    %rhs_nonzero = arith.cmpf one, %rhs, %zero : f64
+    cf.assert %rhs_nonzero, "integer true division by zero"
+    %quotient = arith.divf %lhs, %rhs : f64
+    %h, %p = func.call @LyFloat_FromF64(%quotient) : (f64) -> (memref<2xi64>, memref<1xf64>)
+    func.return %h, %p : memref<2xi64>, memref<1xf64>
+  }
 
-  ^fast:
-    %fast_a = arith.shrsi %lhs_bits, %tag_one : i64
-    %fast_b = arith.shrsi %rhs_bits, %tag_one : i64
-    %fast_zero = arith.constant 0 : i64
-    %fast_one = arith.constant 1 : i64
-    %fast_neg_one = arith.constant -1 : i64
-    %fast_gt = arith.cmpi sgt, %fast_a, %fast_b : i64
-    %fast_lt = arith.cmpi slt, %fast_a, %fast_b : i64
-    %fast_pos = arith.select %fast_gt, %fast_one, %fast_zero : i1, i64
-    %fast_cmp = arith.select %fast_lt, %fast_neg_one, %fast_pos : i1, i64
-    func.return %fast_cmp : i64
+  func.func @LyLong_FloorDiv(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__floordiv__"} {
+    %lhs = func.call @LyLong_AsI64(%lhs_header, %lhs_meta, %lhs_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+    %rhs = func.call @LyLong_AsI64(%rhs_header, %rhs_meta, %rhs_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %rhs_nonzero = arith.cmpi ne, %rhs, %zero : i64
+    cf.assert %rhs_nonzero, "integer division by zero"
+    %trunc_q = arith.divsi %lhs, %rhs : i64
+    %trunc_r = arith.remsi %lhs, %rhs : i64
+    %has_remainder = arith.cmpi ne, %trunc_r, %zero : i64
+    %lhs_negative = arith.cmpi slt, %lhs, %zero : i64
+    %rhs_negative = arith.cmpi slt, %rhs, %zero : i64
+    %different_sign = arith.cmpi ne, %lhs_negative, %rhs_negative : i1
+    %adjust = arith.andi %has_remainder, %different_sign : i1
+    %decremented = arith.subi %trunc_q, %one : i64
+    %floor_q = arith.select %adjust, %decremented, %trunc_q : i1, i64
+    %h, %m, %d = func.call @LyLong_FromI64(%floor_q) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
+  }
 
-  ^general:
-    %lhs_meta, %lhs_digits = func.call @__ly_long_operand_view(%lhs_header, %lhs_meta_raw, %lhs_digits_raw, %lhs_scratch_meta, %lhs_scratch_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>, memref<2xi64>, memref<3xi32>) -> (memref<2xi64>, memref<?xi32>)
-    %rhs_meta, %rhs_digits = func.call @__ly_long_operand_view(%rhs_header, %rhs_meta_raw, %rhs_digits_raw, %rhs_scratch_meta, %rhs_scratch_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>, memref<2xi64>, memref<3xi32>) -> (memref<2xi64>, memref<?xi32>)
+  func.func @LyLong_Mod(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__mod__"} {
+    %lhs = func.call @LyLong_AsI64(%lhs_header, %lhs_meta, %lhs_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+    %rhs = func.call @LyLong_AsI64(%rhs_header, %rhs_meta, %rhs_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+    %zero = arith.constant 0 : i64
+    %rhs_nonzero = arith.cmpi ne, %rhs, %zero : i64
+    cf.assert %rhs_nonzero, "integer modulo by zero"
+    %trunc_r = arith.remsi %lhs, %rhs : i64
+    %has_remainder = arith.cmpi ne, %trunc_r, %zero : i64
+    %remainder_negative = arith.cmpi slt, %trunc_r, %zero : i64
+    %rhs_negative = arith.cmpi slt, %rhs, %zero : i64
+    %different_sign = arith.cmpi ne, %remainder_negative, %rhs_negative : i1
+    %adjust = arith.andi %has_remainder, %different_sign : i1
+    %adjusted = arith.addi %trunc_r, %rhs : i64
+    %mod = arith.select %adjust, %adjusted, %trunc_r : i1, i64
+    %h, %m, %d = func.call @LyLong_FromI64(%mod) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
+  }
+
+  func.func @LyLong_BitAnd(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__and__"} {
+    %lhs = func.call @LyLong_AsI64(%lhs_header, %lhs_meta, %lhs_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+    %rhs = func.call @LyLong_AsI64(%rhs_header, %rhs_meta, %rhs_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+    %value = arith.andi %lhs, %rhs : i64
+    %h, %m, %d = func.call @LyLong_FromI64(%value) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
+  }
+
+  func.func @LyLong_BitOr(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__or__"} {
+    %lhs = func.call @LyLong_AsI64(%lhs_header, %lhs_meta, %lhs_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+    %rhs = func.call @LyLong_AsI64(%rhs_header, %rhs_meta, %rhs_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+    %value = arith.ori %lhs, %rhs : i64
+    %h, %m, %d = func.call @LyLong_FromI64(%value) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
+  }
+
+  func.func @LyLong_BitXor(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__xor__"} {
+    %lhs = func.call @LyLong_AsI64(%lhs_header, %lhs_meta, %lhs_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+    %rhs = func.call @LyLong_AsI64(%rhs_header, %rhs_meta, %rhs_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+    %value = arith.xori %lhs, %rhs : i64
+    %h, %m, %d = func.call @LyLong_FromI64(%value) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
+  }
+
+  func.func @LyLong_LShift(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__lshift__"} {
+    %lhs = func.call @LyLong_AsI64(%lhs_header, %lhs_meta, %lhs_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+    %rhs = func.call @LyLong_AsI64(%rhs_header, %rhs_meta, %rhs_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+    %zero = arith.constant 0 : i64
+    %nonnegative = arith.cmpi sge, %rhs, %zero : i64
+    cf.assert %nonnegative, "negative shift count"
+    %value = arith.shli %lhs, %rhs : i64
+    %h, %m, %d = func.call @LyLong_FromI64(%value) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
+  }
+
+  func.func @LyLong_RShift(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__rshift__"} {
+    %lhs = func.call @LyLong_AsI64(%lhs_header, %lhs_meta, %lhs_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+    %rhs = func.call @LyLong_AsI64(%rhs_header, %rhs_meta, %rhs_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+    %zero = arith.constant 0 : i64
+    %nonnegative = arith.cmpi sge, %rhs, %zero : i64
+    cf.assert %nonnegative, "negative shift count"
+    %value = arith.shrsi %lhs, %rhs : i64
+    %h, %m, %d = func.call @LyLong_FromI64(%value) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
+  }
+
+  func.func @LyLong_Round(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %digits: memref<?xi32>, %ndigits: i64 {ly.runtime.default_i64 = 0 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__round__"} {
+    %value = func.call @LyLong_AsI64(%header, %meta, %digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+    %zero = arith.constant 0 : i64
+    %round_to_integer = arith.cmpi sge, %ndigits, %zero : i64
+    %rounded = scf.if %round_to_integer -> (i64) {
+      scf.yield %value : i64
+    } else {
+      %one = arith.constant 1 : i64
+      %two = arith.constant 2 : i64
+      %ten = arith.constant 10 : i64
+      %eighteen = arith.constant 18 : i64
+      %places = arith.subi %zero, %ndigits : i64
+      %too_large = arith.cmpi sgt, %places, %eighteen : i64
+      %limited_places = arith.select %too_large, %eighteen, %places : i1, i64
+      %upper = arith.index_cast %limited_places : i64 to index
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %scale = scf.for %i = %c0 to %upper step %c1 iter_args(%current = %one) -> (i64) {
+        %next = arith.muli %current, %ten : i64
+        scf.yield %next : i64
+      }
+      %negative = arith.cmpi slt, %value, %zero : i64
+      %negated = arith.subi %zero, %value : i64
+      %abs_value = arith.select %negative, %negated, %value : i1, i64
+      %quotient = arith.divsi %abs_value, %scale : i64
+      %remainder = arith.remsi %abs_value, %scale : i64
+      %twice_remainder = arith.muli %remainder, %two : i64
+      %greater_than_half = arith.cmpi sgt, %twice_remainder, %scale : i64
+      %exactly_half = arith.cmpi eq, %twice_remainder, %scale : i64
+      %low_bit = arith.andi %quotient, %one : i64
+      %quotient_odd = arith.cmpi ne, %low_bit, %zero : i64
+      %tie_rounds_up = arith.andi %exactly_half, %quotient_odd : i1
+      %rounds_up = arith.ori %greater_than_half, %tie_rounds_up : i1
+      %incremented = arith.addi %quotient, %one : i64
+      %rounded_quotient = arith.select %rounds_up, %incremented, %quotient : i1, i64
+      %rounded_abs = arith.muli %rounded_quotient, %scale : i64
+      %rounded_neg = arith.subi %zero, %rounded_abs : i64
+      %signed = arith.select %negative, %rounded_neg, %rounded_abs : i1, i64
+      scf.yield %signed : i64
+    }
+    %h, %m, %d = func.call @LyLong_FromI64(%rounded) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
+  }
+
+  func.func @LyLong_Compare(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_meta_raw: memref<2xi64>, %lhs_digits_raw: memref<?xi32>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_meta_raw: memref<2xi64>, %rhs_digits_raw: memref<?xi32>) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__richcompare__"} {
+    %lhs_meta, %lhs_digits = func.call @__ly_long_operand_view(%lhs_meta_raw, %lhs_digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
+    %rhs_meta, %rhs_digits = func.call @__ly_long_operand_view(%rhs_meta_raw, %rhs_digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
     %small_two = arith.constant 2 : i64
     %small_count_slot = arith.constant 1 : index
     %lhs_view_count = memref.load %lhs_meta[%small_count_slot] : memref<2xi64>
@@ -734,9 +706,7 @@ module {
     cf.cond_br %both_small, ^small, ^digits
 
   ^small:
-    // At most two 30-bit limbs per side: compute natively and re-enter the
-    // tagged domain through FromI64. This absorbs heap-immortal literals
-    // into tagged values after a single operation.
+    // At most two 30-bit limbs per side fit a primitive comparison.
     %small_a = func.call @__ly_long_view_as_i64(%lhs_meta, %lhs_digits) : (memref<2xi64>, memref<?xi32>) -> i64
     %small_b = func.call @__ly_long_view_as_i64(%rhs_meta, %rhs_digits) : (memref<2xi64>, memref<?xi32>) -> i64
     %small_zero = arith.constant 0 : i64
@@ -778,10 +748,50 @@ module {
     func.return %result : i64
   }
 
-  func.func @LyLong_Repr(%header: memref<2xi64> {ly.ownership.object_header}, %meta_raw: memref<2xi64>, %digits_raw: memref<?xi32>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
-    %repr_scratch_meta = memref.alloca() : memref<2xi64>
-    %repr_scratch_digits = memref.alloca() : memref<3xi32>
-    %meta, %digits = func.call @__ly_long_operand_view(%header, %meta_raw, %digits_raw, %repr_scratch_meta, %repr_scratch_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>, memref<2xi64>, memref<3xi32>) -> (memref<2xi64>, memref<?xi32>)
+  func.func @LyLong_EqBool(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> i1 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__eq__"} {
+    %cmp = func.call @LyLong_Compare(%lhs_header, %lhs_meta, %lhs_digits, %rhs_header, %rhs_meta, %rhs_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>, memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+    %zero = arith.constant 0 : i64
+    %result = arith.cmpi eq, %cmp, %zero : i64
+    func.return %result : i1
+  }
+
+  func.func @LyLong_NeBool(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> i1 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__ne__"} {
+    %cmp = func.call @LyLong_Compare(%lhs_header, %lhs_meta, %lhs_digits, %rhs_header, %rhs_meta, %rhs_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>, memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+    %zero = arith.constant 0 : i64
+    %result = arith.cmpi ne, %cmp, %zero : i64
+    func.return %result : i1
+  }
+
+  func.func @LyLong_LtBool(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> i1 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__lt__"} {
+    %cmp = func.call @LyLong_Compare(%lhs_header, %lhs_meta, %lhs_digits, %rhs_header, %rhs_meta, %rhs_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>, memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+    %zero = arith.constant 0 : i64
+    %result = arith.cmpi slt, %cmp, %zero : i64
+    func.return %result : i1
+  }
+
+  func.func @LyLong_LeBool(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> i1 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__le__"} {
+    %cmp = func.call @LyLong_Compare(%lhs_header, %lhs_meta, %lhs_digits, %rhs_header, %rhs_meta, %rhs_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>, memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+    %zero = arith.constant 0 : i64
+    %result = arith.cmpi sle, %cmp, %zero : i64
+    func.return %result : i1
+  }
+
+  func.func @LyLong_GtBool(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> i1 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__gt__"} {
+    %cmp = func.call @LyLong_Compare(%lhs_header, %lhs_meta, %lhs_digits, %rhs_header, %rhs_meta, %rhs_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>, memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+    %zero = arith.constant 0 : i64
+    %result = arith.cmpi sgt, %cmp, %zero : i64
+    func.return %result : i1
+  }
+
+  func.func @LyLong_GeBool(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> i1 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__ge__"} {
+    %cmp = func.call @LyLong_Compare(%lhs_header, %lhs_meta, %lhs_digits, %rhs_header, %rhs_meta, %rhs_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>, memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+    %zero = arith.constant 0 : i64
+    %result = arith.cmpi sge, %cmp, %zero : i64
+    func.return %result : i1
+  }
+
+  func.func @LyLong_Repr(%header: memref<2xi64> {ly.ownership.object_header}, %meta_raw: memref<2xi64>, %digits_raw: memref<?xi32>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__repr__"} {
+    %meta, %digits = func.call @__ly_long_operand_view(%meta_raw, %digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %ten = arith.constant 10 : i64

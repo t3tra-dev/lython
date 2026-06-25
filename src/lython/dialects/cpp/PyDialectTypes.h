@@ -1,6 +1,7 @@
 #ifndef LYTHON_PYDIALECTTYPES_H
 #define LYTHON_PYDIALECTTYPES_H
 
+#include <optional>
 #include <tuple>
 #include <utility>
 
@@ -8,6 +9,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/TypeSupport.h"
 #include "mlir/IR/Types.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 
 namespace mlir {
@@ -15,6 +17,11 @@ class Operation;
 } // namespace mlir
 
 namespace py {
+
+namespace attrs {
+inline constexpr ::llvm::StringLiteral kPublicContractType{
+    "ly.public_contract_type"};
+} // namespace attrs
 
 enum class TypeKind : unsigned {
   Int = 0,
@@ -35,7 +42,13 @@ enum class TypeKind : unsigned {
   Object,
   Type,
   Protocol,
-  Self
+  Self,
+  IteratorState,
+  Overload,
+  Contract,
+  Literal,
+  TypeVar,
+  ParamSpec
 };
 
 namespace detail {
@@ -55,18 +68,17 @@ struct SimpleTypeStorage : public mlir::TypeStorage {
   unsigned kind;
 };
 
-struct TupleTypeStorage : public mlir::TypeStorage {
+struct TypeListStorage : public mlir::TypeStorage {
   using KeyTy = mlir::ArrayRef<mlir::Type>;
 
-  explicit TupleTypeStorage(mlir::ArrayRef<mlir::Type> elements)
-      : elementTypes(elements) {}
+  explicit TypeListStorage(mlir::ArrayRef<mlir::Type> types) : types(types) {}
 
-  bool operator==(const KeyTy &key) const { return key == elementTypes; }
+  bool operator==(const KeyTy &key) const { return key == types; }
 
-  static TupleTypeStorage *construct(mlir::TypeStorageAllocator &allocator,
-                                     const KeyTy &key);
+  static TypeListStorage *construct(mlir::TypeStorageAllocator &allocator,
+                                    const KeyTy &key);
 
-  mlir::ArrayRef<mlir::Type> elementTypes;
+  mlir::ArrayRef<mlir::Type> types;
 };
 
 struct DictTypeStorage : public mlir::TypeStorage {
@@ -96,6 +108,23 @@ struct ListTypeStorage : public mlir::TypeStorage {
   static ListTypeStorage *construct(mlir::TypeStorageAllocator &allocator,
                                     const KeyTy &key);
 
+  mlir::Type elementType;
+};
+
+struct IteratorStateTypeStorage : public mlir::TypeStorage {
+  using KeyTy = std::pair<mlir::Type, mlir::Type>;
+
+  IteratorStateTypeStorage(mlir::Type source, mlir::Type element)
+      : sourceType(source), elementType(element) {}
+
+  bool operator==(const KeyTy &key) const {
+    return key.first == sourceType && key.second == elementType;
+  }
+
+  static IteratorStateTypeStorage *
+  construct(mlir::TypeStorageAllocator &allocator, const KeyTy &key);
+
+  mlir::Type sourceType;
   mlir::Type elementType;
 };
 
@@ -179,20 +208,6 @@ struct UnaryTypeStorage : public mlir::TypeStorage {
                                      const KeyTy &key);
 
   mlir::Type valueType;
-};
-
-struct UnionTypeStorage : public mlir::TypeStorage {
-  using KeyTy = mlir::ArrayRef<mlir::Type>;
-
-  explicit UnionTypeStorage(mlir::ArrayRef<mlir::Type> members)
-      : memberTypes(members) {}
-
-  bool operator==(const KeyTy &key) const { return key == memberTypes; }
-
-  static UnionTypeStorage *construct(mlir::TypeStorageAllocator &allocator,
-                                     const KeyTy &key);
-
-  mlir::ArrayRef<mlir::Type> memberTypes;
 };
 
 struct ProtocolTypeStorage : public mlir::TypeStorage {
@@ -287,7 +302,7 @@ public:
 };
 
 class TupleType : public mlir::Type::TypeBase<TupleType, mlir::Type,
-                                              detail::TupleTypeStorage> {
+                                              detail::TypeListStorage> {
 public:
   using Base::Base;
   static constexpr ::llvm::StringLiteral name{"py.tuple"};
@@ -329,6 +344,36 @@ public:
   }
 
   ::llvm::StringRef getClassName() const;
+};
+
+class ContractType : public mlir::Type::TypeBase<ContractType, mlir::Type,
+                                                 detail::ProtocolTypeStorage> {
+public:
+  using Base::Base;
+  static constexpr ::llvm::StringLiteral name{"py.contract"};
+
+  static ContractType get(mlir::MLIRContext *ctx, ::llvm::StringRef name,
+                          mlir::ArrayRef<mlir::Type> arguments = {});
+  static bool kindof(unsigned kind) {
+    return kind == static_cast<unsigned>(TypeKind::Contract);
+  }
+
+  ::llvm::StringRef getContractName() const;
+  mlir::ArrayRef<mlir::Type> getArguments() const;
+};
+
+class LiteralType : public mlir::Type::TypeBase<LiteralType, mlir::Type,
+                                                detail::ClassTypeStorage> {
+public:
+  using Base::Base;
+  static constexpr ::llvm::StringLiteral name{"py.literal"};
+
+  static LiteralType get(mlir::MLIRContext *ctx, ::llvm::StringRef spelling);
+  static bool kindof(unsigned kind) {
+    return kind == static_cast<unsigned>(TypeKind::Literal);
+  }
+
+  ::llvm::StringRef getSpelling() const;
 };
 
 class TypeType : public mlir::Type::TypeBase<TypeType, mlir::Type,
@@ -374,6 +419,34 @@ public:
   }
 };
 
+class TypeVarType : public mlir::Type::TypeBase<TypeVarType, mlir::Type,
+                                                detail::ClassTypeStorage> {
+public:
+  using Base::Base;
+  static constexpr ::llvm::StringLiteral name{"py.typevar"};
+
+  static TypeVarType get(mlir::MLIRContext *ctx, ::llvm::StringRef name);
+  static bool kindof(unsigned kind) {
+    return kind == static_cast<unsigned>(TypeKind::TypeVar);
+  }
+
+  ::llvm::StringRef getName() const;
+};
+
+class ParamSpecType : public mlir::Type::TypeBase<ParamSpecType, mlir::Type,
+                                                  detail::ClassTypeStorage> {
+public:
+  using Base::Base;
+  static constexpr ::llvm::StringLiteral name{"py.paramspec"};
+
+  static ParamSpecType get(mlir::MLIRContext *ctx, ::llvm::StringRef name);
+  static bool kindof(unsigned kind) {
+    return kind == static_cast<unsigned>(TypeKind::ParamSpec);
+  }
+
+  ::llvm::StringRef getName() const;
+};
+
 class ListType : public mlir::Type::TypeBase<ListType, mlir::Type,
                                              detail::ListTypeStorage> {
 public:
@@ -385,6 +458,23 @@ public:
     return kind == static_cast<unsigned>(TypeKind::List);
   }
 
+  mlir::Type getElementType() const;
+};
+
+class IteratorStateType
+    : public mlir::Type::TypeBase<IteratorStateType, mlir::Type,
+                                  detail::IteratorStateTypeStorage> {
+public:
+  using Base::Base;
+  static constexpr ::llvm::StringLiteral name{"py.iterator_state"};
+
+  static IteratorStateType get(mlir::MLIRContext *ctx, mlir::Type sourceType,
+                               mlir::Type elementType);
+  static bool kindof(unsigned kind) {
+    return kind == static_cast<unsigned>(TypeKind::IteratorState);
+  }
+
+  mlir::Type getSourceType() const;
   mlir::Type getElementType() const;
 };
 
@@ -480,7 +570,7 @@ public:
 };
 
 class UnionType : public mlir::Type::TypeBase<UnionType, mlir::Type,
-                                              detail::UnionTypeStorage> {
+                                              detail::TypeListStorage> {
 public:
   using Base::Base;
   static constexpr ::llvm::StringLiteral name{"py.union"};
@@ -504,6 +594,21 @@ public:
   mlir::Type getOptionalPayloadType() const;
 };
 
+class OverloadType : public mlir::Type::TypeBase<OverloadType, mlir::Type,
+                                                 detail::TypeListStorage> {
+public:
+  using Base::Base;
+  static constexpr ::llvm::StringLiteral name{"py.overload"};
+
+  static OverloadType get(mlir::MLIRContext *ctx,
+                          mlir::ArrayRef<mlir::Type> candidateTypes);
+  static bool kindof(unsigned kind) {
+    return kind == static_cast<unsigned>(TypeKind::Overload);
+  }
+
+  mlir::ArrayRef<mlir::Type> getCandidateTypes() const;
+};
+
 bool isPyIntType(mlir::Type type);
 bool isPyFloatType(mlir::Type type);
 bool isPyBoolType(mlir::Type type);
@@ -513,33 +618,77 @@ bool isPyObjectType(mlir::Type type);
 bool isPyTupleType(mlir::Type type);
 bool isPyDictType(mlir::Type type);
 bool isPyListType(mlir::Type type);
+bool isPyIteratorStateType(mlir::Type type);
+mlir::Type primitiveIteratorStateType(mlir::MLIRContext *ctx,
+                                      mlir::Type sourceType,
+                                      mlir::Type elementType);
+bool isPrimitiveIteratorStateType(mlir::Type type);
+mlir::Type primitiveIteratorStateSourceType(mlir::Type type);
+mlir::Type primitiveIteratorStateElementType(mlir::Type type);
+mlir::Type primitiveIteratorSourceElementType(mlir::Type sourceType);
+mlir::Type iteratorProtocolType(mlir::MLIRContext *ctx, mlir::Type elementType);
+mlir::Type iteratorDescriptorElementType(mlir::Type type);
+bool isIteratorDescriptorType(mlir::Type type);
 bool isPyClassType(mlir::Type type);
 bool isPyTypeType(mlir::Type type);
 bool isPyProtocolType(mlir::Type type);
+bool isPyContractType(mlir::Type type);
+bool isPyLiteralType(mlir::Type type);
 bool isPySelfType(mlir::Type type);
+bool isPyTypeVarType(mlir::Type type);
+bool isPyParamSpecType(mlir::Type type);
 bool isPyExceptionType(mlir::Type type);
 bool isPyExceptionCellType(mlir::Type type);
 bool isPyTracebackType(mlir::Type type);
 bool isPyLocationType(mlir::Type type);
 bool isPyUnionType(mlir::Type type);
+bool isPyOverloadType(mlir::Type type);
 
 // Callable contract checking. A Callable contract owns the complete static
 // __call__ shape, including parameter and return metadata.
 bool isCallableType(mlir::Type type);
 CallableType getCallableContract(mlir::Type type);
+bool isCallableEllipsisContract(CallableType signature);
 
 bool isPyType(mlir::Type type);
+bool isStaticTypeParameter(mlir::Type type);
+mlir::Type eraseStaticTypeParameters(mlir::Type type);
 
-// Awaitable contract helpers. These cover the dialect-level awaitable
-// primitives and the manifest protocol spellings whose payload is encoded in
-// the type arguments.
-bool isCoroutineProtocolType(mlir::Type type);
-mlir::Type awaitablePayloadType(mlir::Type type);
+// Protocol descriptor helpers. Manifest protocol instantiations can be queried
+// through their base graph without adding a dedicated dialect type for each
+// high-level typing contract.
+std::optional<llvm::SmallVector<mlir::Type, 3>>
+protocolDescriptorArguments(mlir::Type type, llvm::StringRef protocolName);
+mlir::Type unaryProtocolDescriptorPayloadType(mlir::Type type,
+                                              llvm::StringRef protocolName);
+
+// Awaitable protocol helpers. Manifest protocol instantiations whose base graph
+// reaches Awaitable[T] use the low-level descriptor ABI. Native async.value<T>
+// remains a single MLIR async value and is handled explicitly by await users.
+mlir::Type awaitableProtocolType(mlir::MLIRContext *ctx,
+                                 mlir::Type payloadType);
+mlir::Type awaitableDescriptorPayloadType(mlir::Type type);
+bool isAwaitableDescriptorType(mlir::Type type);
 
 // Subtype checking (v2.1)
+struct SubtypeBindings {
+  mlir::Type self;
+};
+
 bool isSubtypeOf(mlir::Type subtype, mlir::Type supertype);
 bool isSubtypeOf(mlir::Type subtype, mlir::Type supertype,
                  mlir::Operation *from);
+bool isSubtypeOf(mlir::Type subtype, mlir::Type supertype,
+                 mlir::Operation *from, SubtypeBindings *bindings);
+
+// Assignment compatibility at the dialect boundary. This keeps the pure
+// subtype relation separate from ABI conveniences such as builtin MLIR integer
+// and float values flowing into their Python primitive contracts.
+bool isAssignableTo(mlir::Type actual, mlir::Type expected);
+bool isAssignableTo(mlir::Type actual, mlir::Type expected,
+                    mlir::Operation *from);
+bool isAssignableTo(mlir::Type actual, mlir::Type expected,
+                    mlir::Operation *from, SubtypeBindings *bindings);
 
 } // namespace py
 

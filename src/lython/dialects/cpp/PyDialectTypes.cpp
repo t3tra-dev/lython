@@ -1,5 +1,8 @@
 #include "PyDialectTypes.h"
 
+#include "CallableArgumentMatcher.h"
+#include "PyCallableShape.h"
+#include "PyProtocolRelations.inc"
 #include "PyTypeObject.h"
 
 #include "mlir/Dialect/Async/IR/Async.h"
@@ -7,6 +10,13 @@
 #include "mlir/IR/Types.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
+
+#include <optional>
+#include <string>
+
+#define GET_OP_CLASSES
+#include "PyOps.h.inc"
+#undef GET_OP_CLASSES
 
 namespace py {
 
@@ -19,11 +29,11 @@ SimpleTypeStorage::construct(mlir::TypeStorageAllocator &allocator,
       SimpleTypeStorage(static_cast<unsigned>(key));
 }
 
-TupleTypeStorage *
-TupleTypeStorage::construct(mlir::TypeStorageAllocator &allocator,
-                            const KeyTy &key) {
+TypeListStorage *
+TypeListStorage::construct(mlir::TypeStorageAllocator &allocator,
+                           const KeyTy &key) {
   llvm::ArrayRef<mlir::Type> copied = allocator.copyInto(key);
-  return new (allocator.allocate<TupleTypeStorage>()) TupleTypeStorage(copied);
+  return new (allocator.allocate<TypeListStorage>()) TypeListStorage(copied);
 }
 
 DictTypeStorage *
@@ -37,6 +47,13 @@ ListTypeStorage *
 ListTypeStorage::construct(mlir::TypeStorageAllocator &allocator,
                            const KeyTy &key) {
   return new (allocator.allocate<ListTypeStorage>()) ListTypeStorage(key);
+}
+
+IteratorStateTypeStorage *
+IteratorStateTypeStorage::construct(mlir::TypeStorageAllocator &allocator,
+                                    const KeyTy &key) {
+  return new (allocator.allocate<IteratorStateTypeStorage>())
+      IteratorStateTypeStorage(key.first, key.second);
 }
 
 ClassTypeStorage *
@@ -77,13 +94,6 @@ UnaryTypeStorage::construct(mlir::TypeStorageAllocator &allocator,
   return new (allocator.allocate<UnaryTypeStorage>()) UnaryTypeStorage(key);
 }
 
-UnionTypeStorage *
-UnionTypeStorage::construct(mlir::TypeStorageAllocator &allocator,
-                            const KeyTy &key) {
-  llvm::ArrayRef<mlir::Type> copied = allocator.copyInto(key);
-  return new (allocator.allocate<UnionTypeStorage>()) UnionTypeStorage(copied);
-}
-
 ProtocolTypeStorage *
 ProtocolTypeStorage::construct(mlir::TypeStorageAllocator &allocator,
                                const KeyTy &key) {
@@ -94,6 +104,40 @@ ProtocolTypeStorage::construct(mlir::TypeStorageAllocator &allocator,
 }
 
 } // namespace detail
+
+static llvm::StringRef contractLeafName(llvm::StringRef contract) {
+  std::pair<llvm::StringRef, llvm::StringRef> split = contract.rsplit('.');
+  return split.second.empty() ? split.first : split.second;
+}
+
+static llvm::StringRef builtinExceptionBase(llvm::StringRef name) {
+  if (name == "Exception")
+    return "BaseException";
+  if (name == "RuntimeError" || name == "TypeError" || name == "ValueError" ||
+      name == "KeyError" || name == "IndexError" || name == "AssertionError" ||
+      name == "StopIteration" || name == "StopAsyncIteration")
+    return "Exception";
+  return {};
+}
+
+static bool isBuiltinExceptionSubclassOf(llvm::StringRef subtype,
+                                         llvm::StringRef supertype) {
+  subtype = contractLeafName(subtype);
+  supertype = contractLeafName(supertype);
+  for (unsigned depth = 0; depth < 8 && !subtype.empty(); ++depth) {
+    if (subtype == supertype)
+      return true;
+    subtype = builtinExceptionBase(subtype);
+  }
+  return false;
+}
+
+static bool isContractSubclassOf(ContractType subtype, ContractType supertype) {
+  if (subtype.getContractName() == supertype.getContractName())
+    return true;
+  return isBuiltinExceptionSubclassOf(subtype.getContractName(),
+                                      supertype.getContractName());
+}
 
 //===----------------------------------------------------------------------===//
 // Simple types
@@ -127,6 +171,21 @@ SelfType SelfType::get(mlir::MLIRContext *ctx) {
   return Base::get(ctx, TypeKind::Self);
 }
 
+TypeVarType TypeVarType::get(mlir::MLIRContext *ctx, ::llvm::StringRef name) {
+  return Base::get(ctx, name);
+}
+
+::llvm::StringRef TypeVarType::getName() const { return getImpl()->className; }
+
+ParamSpecType ParamSpecType::get(mlir::MLIRContext *ctx,
+                                 ::llvm::StringRef name) {
+  return Base::get(ctx, name);
+}
+
+::llvm::StringRef ParamSpecType::getName() const {
+  return getImpl()->className;
+}
+
 //===----------------------------------------------------------------------===//
 // Composite types
 //===----------------------------------------------------------------------===//
@@ -137,7 +196,7 @@ TupleType TupleType::get(mlir::MLIRContext *ctx,
 }
 
 llvm::ArrayRef<mlir::Type> TupleType::getElementTypes() const {
-  return getImpl()->elementTypes;
+  return getImpl()->types;
 }
 
 DictType DictType::get(mlir::MLIRContext *ctx, mlir::Type keyType,
@@ -155,11 +214,47 @@ ListType ListType::get(mlir::MLIRContext *ctx, mlir::Type elementType) {
 
 mlir::Type ListType::getElementType() const { return getImpl()->elementType; }
 
+IteratorStateType IteratorStateType::get(mlir::MLIRContext *ctx,
+                                         mlir::Type sourceType,
+                                         mlir::Type elementType) {
+  return Base::get(ctx, std::make_pair(sourceType, elementType));
+}
+
+mlir::Type IteratorStateType::getSourceType() const {
+  return getImpl()->sourceType;
+}
+
+mlir::Type IteratorStateType::getElementType() const {
+  return getImpl()->elementType;
+}
+
 ClassType ClassType::get(mlir::MLIRContext *ctx, ::llvm::StringRef className) {
   return Base::get(ctx, className);
 }
 
 ::llvm::StringRef ClassType::getClassName() const {
+  return getImpl()->className;
+}
+
+ContractType ContractType::get(mlir::MLIRContext *ctx, ::llvm::StringRef name,
+                               llvm::ArrayRef<mlir::Type> arguments) {
+  return Base::get(ctx, std::make_pair(name, arguments));
+}
+
+::llvm::StringRef ContractType::getContractName() const {
+  return getImpl()->protocolName;
+}
+
+llvm::ArrayRef<mlir::Type> ContractType::getArguments() const {
+  return getImpl()->arguments;
+}
+
+LiteralType LiteralType::get(mlir::MLIRContext *ctx,
+                             ::llvm::StringRef spelling) {
+  return Base::get(ctx, spelling);
+}
+
+::llvm::StringRef LiteralType::getSpelling() const {
   return getImpl()->className;
 }
 
@@ -319,7 +414,7 @@ mlir::Type UnionType::getNormalized(mlir::MLIRContext *ctx,
 }
 
 llvm::ArrayRef<mlir::Type> UnionType::getMemberTypes() const {
-  return getImpl()->memberTypes;
+  return getImpl()->types;
 }
 
 bool UnionType::hasMember(mlir::Type member) const {
@@ -337,6 +432,15 @@ mlir::Type UnionType::getOptionalPayloadType() const {
     return {};
   llvm::ArrayRef<mlir::Type> members = getMemberTypes();
   return mlir::isa<NoneType>(members[0]) ? members[1] : members[0];
+}
+
+OverloadType OverloadType::get(mlir::MLIRContext *ctx,
+                               llvm::ArrayRef<mlir::Type> candidateTypes) {
+  return Base::get(ctx, candidateTypes);
+}
+
+llvm::ArrayRef<mlir::Type> OverloadType::getCandidateTypes() const {
+  return getImpl()->types;
 }
 
 //===----------------------------------------------------------------------===//
@@ -361,13 +465,91 @@ bool isPyDictType(mlir::Type type) { return mlir::isa<DictType>(type); }
 
 bool isPyListType(mlir::Type type) { return mlir::isa<ListType>(type); }
 
+bool isPyIteratorStateType(mlir::Type type) {
+  return mlir::isa<IteratorStateType>(type);
+}
+
+mlir::Type primitiveIteratorStateType(mlir::MLIRContext *ctx,
+                                      mlir::Type sourceType,
+                                      mlir::Type elementType) {
+  return IteratorStateType::get(ctx, sourceType, elementType);
+}
+
+bool isPrimitiveIteratorStateType(mlir::Type type) {
+  return mlir::isa<IteratorStateType>(type);
+}
+
+mlir::Type primitiveIteratorStateSourceType(mlir::Type type) {
+  if (auto iterator = mlir::dyn_cast_if_present<IteratorStateType>(type))
+    return iterator.getSourceType();
+  return {};
+}
+
+mlir::Type primitiveIteratorStateElementType(mlir::Type type) {
+  if (auto iterator = mlir::dyn_cast_if_present<IteratorStateType>(type))
+    return iterator.getElementType();
+  return {};
+}
+
+mlir::Type primitiveIteratorSourceElementType(mlir::Type sourceType) {
+  if (auto list = mlir::dyn_cast_if_present<ListType>(sourceType))
+    return list.getElementType();
+  auto tuple = mlir::dyn_cast_if_present<TupleType>(sourceType);
+  if (!tuple)
+    return {};
+
+  llvm::ArrayRef<mlir::Type> elementTypes = tuple.getElementTypes();
+  if (elementTypes.empty())
+    return {};
+  mlir::Type elementType = elementTypes.front();
+  for (mlir::Type current : elementTypes.drop_front())
+    if (current != elementType)
+      return {};
+  return elementType;
+}
+
+mlir::Type iteratorProtocolType(mlir::MLIRContext *ctx,
+                                mlir::Type elementType) {
+  return ProtocolType::get(ctx, "Iterator", {elementType});
+}
+
+mlir::Type iteratorDescriptorElementType(mlir::Type type) {
+  if (mlir::Type element = primitiveIteratorStateElementType(type))
+    return element;
+  return unaryProtocolDescriptorPayloadType(type, "Iterator");
+}
+
+bool isIteratorDescriptorType(mlir::Type type) {
+  return static_cast<bool>(iteratorDescriptorElementType(type));
+}
+
 bool isPyClassType(mlir::Type type) { return mlir::isa<ClassType>(type); }
 
 bool isPyTypeType(mlir::Type type) { return mlir::isa<TypeType>(type); }
 
-bool isPyProtocolType(mlir::Type type) { return mlir::isa<ProtocolType>(type); }
+bool isPyProtocolType(mlir::Type type) {
+  return mlir::isa<ProtocolType, CallableType>(type);
+}
+
+bool isPyContractType(mlir::Type type) {
+  return llvm::TypeSwitch<mlir::Type, bool>(type)
+      .Case<ContractType, ProtocolType, CallableType, UnionType, LiteralType,
+            TypeType, SelfType, TypeVarType, ParamSpecType, ClassType, IntType,
+            FloatType, BoolType, StrType, NoneType, ObjectType, TupleType,
+            DictType, ListType, ExceptionType, TracebackType>(
+          [](auto) { return true; })
+      .Default([](mlir::Type) { return false; });
+}
+
+bool isPyLiteralType(mlir::Type type) { return mlir::isa<LiteralType>(type); }
 
 bool isPySelfType(mlir::Type type) { return mlir::isa<SelfType>(type); }
+
+bool isPyTypeVarType(mlir::Type type) { return mlir::isa<TypeVarType>(type); }
+
+bool isPyParamSpecType(mlir::Type type) {
+  return mlir::isa<ParamSpecType>(type);
+}
 
 bool isPyExceptionType(mlir::Type type) {
   return mlir::isa<ExceptionType>(type);
@@ -385,6 +567,8 @@ bool isPyLocationType(mlir::Type type) { return mlir::isa<LocationType>(type); }
 
 bool isPyUnionType(mlir::Type type) { return mlir::isa<UnionType>(type); }
 
+bool isPyOverloadType(mlir::Type type) { return mlir::isa<OverloadType>(type); }
+
 CallableType getCallableContract(mlir::Type type) {
   return mlir::dyn_cast_if_present<CallableType>(type);
 }
@@ -396,52 +580,224 @@ bool isCallableType(mlir::Type type) {
 bool isPyType(mlir::Type type) {
   return llvm::TypeSwitch<mlir::Type, bool>(type)
       .Case<IntType, FloatType, BoolType, StrType, NoneType, ObjectType,
-            TupleType, DictType, ListType, ClassType, TypeType, ProtocolType,
-            CallableType, ExceptionType, ExceptionCellType, TracebackType,
-            LocationType, UnionType>([](auto) { return true; })
+            TupleType, DictType, ListType, IteratorStateType, ClassType,
+            ContractType, LiteralType, TypeVarType, ParamSpecType, TypeType,
+            ProtocolType, SelfType, CallableType, ExceptionType,
+            ExceptionCellType, TracebackType, LocationType, UnionType,
+            OverloadType>([](auto) { return true; })
       .Default([](mlir::Type) { return false; });
 }
 
-bool isCoroutineProtocolType(mlir::Type type) {
-  auto protocol = mlir::dyn_cast<ProtocolType>(type);
-  return protocol && protocol.getProtocolName() == "Coroutine" &&
-         protocol.getArguments().size() == 3;
+bool isStaticTypeParameter(mlir::Type type) {
+  if (mlir::isa<SelfType, TypeVarType, ParamSpecType>(type))
+    return true;
+  if (auto contract = mlir::dyn_cast_if_present<ContractType>(type))
+    return contract.getContractName().starts_with("$");
+  auto classType = mlir::dyn_cast_if_present<ClassType>(type);
+  return classType && classType.getClassName().starts_with("$");
 }
 
-mlir::Type awaitablePayloadType(mlir::Type type) {
+mlir::Type eraseStaticTypeParameters(mlir::Type type) {
   if (!type)
+    return type;
+  if (auto asyncValue = mlir::dyn_cast<mlir::async::ValueType>(type)) {
+    return mlir::async::ValueType::get(
+        eraseStaticTypeParameters(asyncValue.getValueType()));
+  }
+  if (!isPyType(type))
+    return type;
+
+  mlir::MLIRContext *context = type.getContext();
+  if (isStaticTypeParameter(type))
+    return ObjectType::get(context);
+
+  if (auto tuple = mlir::dyn_cast<TupleType>(type)) {
+    llvm::SmallVector<mlir::Type> elements;
+    elements.reserve(tuple.getElementTypes().size());
+    for (mlir::Type element : tuple.getElementTypes())
+      elements.push_back(eraseStaticTypeParameters(element));
+    return TupleType::get(context, elements);
+  }
+  if (auto list = mlir::dyn_cast<ListType>(type))
+    return ListType::get(context,
+                         eraseStaticTypeParameters(list.getElementType()));
+  if (auto dict = mlir::dyn_cast<DictType>(type)) {
+    return DictType::get(context, eraseStaticTypeParameters(dict.getKeyType()),
+                         eraseStaticTypeParameters(dict.getValueType()));
+  }
+  if (auto typeType = mlir::dyn_cast<TypeType>(type)) {
+    return TypeType::get(context,
+                         eraseStaticTypeParameters(typeType.getInstanceType()));
+  }
+  if (auto protocol = mlir::dyn_cast<ProtocolType>(type)) {
+    llvm::SmallVector<mlir::Type> arguments;
+    arguments.reserve(protocol.getArguments().size());
+    for (mlir::Type argument : protocol.getArguments())
+      arguments.push_back(eraseStaticTypeParameters(argument));
+    return ProtocolType::get(context, protocol.getProtocolName(), arguments);
+  }
+  if (auto contract = mlir::dyn_cast<ContractType>(type)) {
+    llvm::SmallVector<mlir::Type> arguments;
+    arguments.reserve(contract.getArguments().size());
+    for (mlir::Type argument : contract.getArguments())
+      arguments.push_back(eraseStaticTypeParameters(argument));
+    return ContractType::get(context, contract.getContractName(), arguments);
+  }
+  if (auto unionType = mlir::dyn_cast<UnionType>(type)) {
+    llvm::SmallVector<mlir::Type> members;
+    members.reserve(unionType.getMemberTypes().size());
+    for (mlir::Type member : unionType.getMemberTypes())
+      members.push_back(eraseStaticTypeParameters(member));
+    return UnionType::getNormalized(context, members);
+  }
+  if (auto signature = mlir::dyn_cast<CallableType>(type)) {
+    llvm::SmallVector<mlir::Type> positional;
+    positional.reserve(signature.getPositionalTypes().size());
+    for (mlir::Type argument : signature.getPositionalTypes())
+      positional.push_back(eraseStaticTypeParameters(argument));
+
+    llvm::SmallVector<mlir::Type> kwonly;
+    kwonly.reserve(signature.getKwOnlyTypes().size());
+    for (mlir::Type argument : signature.getKwOnlyTypes())
+      kwonly.push_back(eraseStaticTypeParameters(argument));
+
+    llvm::SmallVector<mlir::Type> results;
+    results.reserve(signature.getResultTypes().size());
+    for (mlir::Type result : signature.getResultTypes())
+      results.push_back(eraseStaticTypeParameters(result));
+
+    mlir::Type vararg;
+    if (signature.hasVararg())
+      vararg = eraseStaticTypeParameters(signature.getVarargType());
+    mlir::Type kwarg;
+    if (signature.hasKwarg())
+      kwarg = eraseStaticTypeParameters(signature.getKwargType());
+
+    return CallableType::get(
+        context, positional, kwonly, vararg, kwarg, results,
+        signature.getPositionalNames(), signature.getKwOnlyNames(),
+        signature.getPositionalDefaults(), signature.getKwOnlyDefaults(),
+        signature.getVarargName(), signature.getKwargName(),
+        signature.getPositionalOnlyCount());
+  }
+  if (auto overload = mlir::dyn_cast<OverloadType>(type)) {
+    llvm::SmallVector<mlir::Type> candidates;
+    candidates.reserve(overload.getCandidateTypes().size());
+    for (mlir::Type candidate : overload.getCandidateTypes())
+      candidates.push_back(eraseStaticTypeParameters(candidate));
+    return OverloadType::get(context, candidates);
+  }
+  return type;
+}
+
+mlir::Type awaitableProtocolType(mlir::MLIRContext *ctx,
+                                 mlir::Type payloadType) {
+  return ProtocolType::get(ctx, "Awaitable", {payloadType});
+}
+
+std::optional<llvm::SmallVector<mlir::Type, 3>>
+protocolDescriptorArguments(mlir::Type type, llvm::StringRef protocolName) {
+  if (!type)
+    return std::nullopt;
+
+  struct DescriptorRoot {
+    std::string name;
+    llvm::SmallVector<mlir::Type, 3> arguments;
+  };
+
+  auto tupleElementContract = [](TupleType tuple) -> mlir::Type {
+    llvm::ArrayRef<mlir::Type> elements = tuple.getElementTypes();
+    if (elements.empty())
+      return ObjectType::get(tuple.getContext());
+
+    mlir::Type first = elements.front();
+    if (llvm::all_of(elements,
+                     [&](mlir::Type element) { return element == first; }))
+      return first;
+    return UnionType::getNormalized(tuple.getContext(), elements);
+  };
+
+  auto rootFor = [&](mlir::Type source) -> std::optional<DescriptorRoot> {
+    if (auto protocol = mlir::dyn_cast<ProtocolType>(source)) {
+      return DescriptorRoot{
+          protocol.getProtocolName().str(),
+          llvm::SmallVector<mlir::Type, 3>(protocol.getArguments().begin(),
+                                           protocol.getArguments().end())};
+    }
+    if (auto contract = mlir::dyn_cast<ContractType>(source)) {
+      llvm::SmallVector<mlir::Type, 3> arguments(
+          contract.getArguments().begin(), contract.getArguments().end());
+      llvm::StringRef name = contract.getContractName();
+      if (name.consume_front("builtins."))
+        return DescriptorRoot{name.str(), arguments};
+      if (name.consume_front("typing."))
+        return DescriptorRoot{name.str(), arguments};
+      if (name.consume_front("_asyncio."))
+        return DescriptorRoot{name.str(), arguments};
+      return DescriptorRoot{contract.getContractName().str(), arguments};
+    }
+    if (auto list = mlir::dyn_cast<ListType>(source))
+      return DescriptorRoot{"list", {list.getElementType()}};
+    if (auto tuple = mlir::dyn_cast<TupleType>(source))
+      return DescriptorRoot{"tuple", {tupleElementContract(tuple)}};
+    if (auto dict = mlir::dyn_cast<DictType>(source))
+      return DescriptorRoot{"dict", {dict.getKeyType(), dict.getValueType()}};
+    if (mlir::isa<IntType>(source))
+      return DescriptorRoot{"int", {}};
+    if (mlir::isa<BoolType>(source))
+      return DescriptorRoot{"bool", {}};
+    if (mlir::isa<FloatType>(source))
+      return DescriptorRoot{"float", {}};
+    if (mlir::isa<StrType>(source))
+      return DescriptorRoot{"str", {}};
+    return std::nullopt;
+  };
+
+  std::optional<DescriptorRoot> root = rootFor(type);
+  if (!root)
+    return std::nullopt;
+
+  auto visit =
+      [&](auto &&self, llvm::StringRef name, llvm::ArrayRef<mlir::Type> args,
+          unsigned depth) -> std::optional<llvm::SmallVector<mlir::Type, 3>> {
+    if (depth > 32)
+      return std::nullopt;
+    if (name == protocolName)
+      return llvm::SmallVector<mlir::Type, 3>(args.begin(), args.end());
+
+    std::optional<llvm::SmallVector<mlir::Type, 3>> result;
+    protocol_relations::forEachDirectBase(
+        name, type.getContext(), args,
+        [&](llvm::StringRef baseName, llvm::ArrayRef<mlir::Type> baseArgs) {
+          if (!result)
+            result = self(self, baseName, baseArgs, depth + 1);
+        });
+    return result;
+  };
+
+  return visit(visit, root->name, root->arguments, 0);
+}
+
+mlir::Type unaryProtocolDescriptorPayloadType(mlir::Type type,
+                                              llvm::StringRef protocolName) {
+  std::optional<llvm::SmallVector<mlir::Type, 3>> args =
+      protocolDescriptorArguments(type, protocolName);
+  if (!args || args->size() != 1)
     return {};
-  if (auto asyncValue = mlir::dyn_cast<mlir::async::ValueType>(type))
-    return asyncValue.getValueType();
-  auto protocol = mlir::dyn_cast<ProtocolType>(type);
-  if (!protocol)
-    return {};
-  llvm::StringRef name = protocol.getProtocolName();
-  auto args = protocol.getArguments();
-  if (name == "Awaitable" && args.size() == 1)
-    return args[0];
-  if (name == "Coroutine" && args.size() == 3)
-    return args[2];
-  if ((name == "Future" || name == "Task") && args.size() == 1)
-    return args[0];
-  return {};
+  return args->front();
+}
+
+mlir::Type awaitableDescriptorPayloadType(mlir::Type type) {
+  return unaryProtocolDescriptorPayloadType(type, "Awaitable");
+}
+
+bool isAwaitableDescriptorType(mlir::Type type) {
+  return static_cast<bool>(awaitableDescriptorPayloadType(type));
 }
 
 //===----------------------------------------------------------------------===//
 // Subtype checking (v2.1)
 //===----------------------------------------------------------------------===//
-
-namespace {
-
-bool isSubtypeOfImpl(mlir::Type subtype, mlir::Type supertype,
-                     mlir::Operation *from);
-
-bool isMemberOfUnion(mlir::Type subtype, UnionType supertype,
-                     mlir::Operation *from) {
-  return llvm::any_of(supertype.getMemberTypes(), [&](mlir::Type member) {
-    return isSubtypeOfImpl(subtype, member, from);
-  });
-}
 
 bool isCallableEllipsisContract(CallableType signature) {
   if (!signature.getPositionalTypes().empty() ||
@@ -457,94 +813,274 @@ bool isCallableEllipsisContract(CallableType signature) {
          mlir::isa<ObjectType>(kwargsDict.getValueType());
 }
 
-mlir::Type callableVarargElementType(mlir::Type varargType) {
-  auto tuple = mlir::dyn_cast_if_present<TupleType>(varargType);
-  if (!tuple || tuple.getElementTypes().size() != 1)
-    return {};
-  return tuple.getElementTypes().front();
-}
+namespace {
 
-bool isCallableContractSubtypeOf(CallableType subtypeSig,
-                                 CallableType supertypeSig,
-                                 mlir::Operation *from) {
-  if (isCallableEllipsisContract(supertypeSig)) {
-    if (subtypeSig.getResultTypes().size() !=
-        supertypeSig.getResultTypes().size())
-      return false;
-    for (auto [subResult, superResult] :
-         llvm::zip(subtypeSig.getResultTypes(), supertypeSig.getResultTypes()))
-      if (!isSubtypeOfImpl(subResult, superResult, from))
-        return false;
+struct SubtypeContext {
+  mlir::Operation *from = nullptr;
+  SubtypeBindings *bindings = nullptr;
+};
+
+bool isSubtypeOfImpl(mlir::Type subtype, mlir::Type supertype,
+                     SubtypeContext &context);
+
+bool bindSelfType(mlir::Type bound, SubtypeContext &context) {
+  if (!bound || !context.bindings)
+    return false;
+  if (!context.bindings->self) {
+    context.bindings->self = bound;
     return true;
   }
-  if (isCallableEllipsisContract(subtypeSig))
+  return bound == context.bindings->self ||
+         isSubtypeOfImpl(bound, context.bindings->self, context);
+}
+
+bool isMemberOfUnion(mlir::Type subtype, UnionType supertype,
+                     SubtypeContext &context) {
+  return llvm::any_of(supertype.getMemberTypes(), [&](mlir::Type member) {
+    return isSubtypeOfImpl(subtype, member, context);
+  });
+}
+
+bool subtypeWithBindings(mlir::Type subtype, mlir::Type supertype,
+                         SubtypeContext &context) {
+  if (!context.bindings)
+    return isSubtypeOfImpl(subtype, supertype, context);
+  SubtypeBindings candidate = *context.bindings;
+  SubtypeContext candidateContext{context.from, &candidate};
+  if (!isSubtypeOfImpl(subtype, supertype, candidateContext))
     return false;
-  if ((!subtypeSig.hasVararg() && supertypeSig.hasVararg()) ||
-      (supertypeSig.hasKwarg() && !subtypeSig.hasKwarg()) ||
-      subtypeSig.getPositionalOnlyCount() >
-          supertypeSig.getPositionalOnlyCount())
+  *context.bindings = candidate;
+  return true;
+}
+
+bool overloadProvides(OverloadType subtype, mlir::Type supertype,
+                      SubtypeContext &context) {
+  return llvm::any_of(subtype.getCandidateTypes(), [&](mlir::Type candidate) {
+    return subtypeWithBindings(candidate, supertype, context);
+  });
+}
+
+bool overloadCoversAllExpected(mlir::Type subtype, OverloadType supertype,
+                               SubtypeContext &context) {
+  auto coversAll = [&](SubtypeContext &candidateContext) {
+    for (mlir::Type expectedCandidate : supertype.getCandidateTypes())
+      if (!subtypeWithBindings(subtype, expectedCandidate, candidateContext))
+        return false;
+    return true;
+  };
+  if (!context.bindings)
+    return coversAll(context);
+  SubtypeBindings candidateBindings = *context.bindings;
+  SubtypeContext candidateContext{context.from, &candidateBindings};
+  if (!coversAll(candidateContext))
     return false;
-  if (subtypeSig.getKwOnlyTypes().size() !=
-          supertypeSig.getKwOnlyTypes().size() ||
-      subtypeSig.getResultTypes().size() !=
-          supertypeSig.getResultTypes().size())
+  *context.bindings = candidateBindings;
+  return true;
+}
+
+bool callableAcceptsInvocation(CallableType callable,
+                               const CallableInvocation &invocation,
+                               SubtypeContext &context) {
+  std::optional<CallableSignatureShape> shape =
+      callableSignatureShape(callable);
+  if (!shape)
     return false;
 
-  llvm::ArrayRef<mlir::Type> subtypePositional =
-      subtypeSig.getPositionalTypes();
-  llvm::ArrayRef<mlir::Type> supertypePositional =
-      supertypeSig.getPositionalTypes();
-  if (!subtypeSig.hasVararg() &&
-      subtypePositional.size() != supertypePositional.size())
+  SubtypeBindings candidateBindings;
+  if (context.bindings)
+    candidateBindings = *context.bindings;
+  SubtypeContext candidateContext{
+      context.from, context.bindings ? &candidateBindings : nullptr};
+  std::optional<CallableApplicationShapeResolution> application =
+      resolveCallableApplicationShape(
+          *shape, llvm::ArrayRef<mlir::Type>(invocation.positional),
+          llvm::ArrayRef<CallableKeyword>(invocation.keywords),
+          [&](mlir::Type expected, mlir::Type actual) {
+            return subtypeWithBindings(actual, expected, candidateContext);
+          },
+          [](const CallableKeyword &keyword) -> llvm::StringRef {
+            return keyword.name;
+          },
+          [](const CallableKeyword &keyword) { return keyword.type; });
+  if (!application)
     return false;
-  if (subtypeSig.hasVararg() && !supertypeSig.hasVararg() &&
-      subtypePositional.size() > supertypePositional.size())
+  if (context.bindings)
+    *context.bindings = candidateBindings;
+  return true;
+}
+
+bool callableSubtypeCoversVariadicTail(CallableType subtypeSig,
+                                       CallableType supertypeSig,
+                                       SubtypeContext &context) {
+  if (!supertypeSig.hasVararg())
+    return true;
+  if (!subtypeSig.hasVararg())
     return false;
-  mlir::Type subtypeVarargElement =
-      subtypeSig.hasVararg()
-          ? callableVarargElementType(subtypeSig.getVarargType())
-          : mlir::Type();
-  if (subtypeSig.hasVararg() && !subtypeVarargElement)
+  return lython::callable::matchVarargContainment(
+      callableVarargShape(subtypeSig.getVarargType()),
+      callableVarargShape(supertypeSig.getVarargType()), true, false,
+      [&](mlir::Type supertypeElement, mlir::Type subtypeElement) {
+        return subtypeWithBindings(supertypeElement, subtypeElement, context);
+      },
+      [](bool lhs, bool rhs) { return lhs && rhs; });
+}
+
+bool callableSubtypeCoversKeywordTail(CallableType subtypeSig,
+                                      CallableType supertypeSig,
+                                      SubtypeContext &context) {
+  if (!supertypeSig.hasKwarg())
+    return true;
+  if (!subtypeSig.hasKwarg())
     return false;
-  for (auto [index, superArg] : llvm::enumerate(supertypePositional)) {
-    mlir::Type subArg = index < subtypePositional.size()
-                            ? subtypePositional[index]
-                            : subtypeVarargElement;
-    if (!subArg)
-      return false;
-    if (index < subtypePositional.size() && subArg != superArg)
-      return false;
-    if (index >= subtypePositional.size() &&
-        !isSubtypeOfImpl(superArg, subArg, from))
-      return false;
-  }
-  for (auto [subArg, superArg] :
-       llvm::zip(subtypeSig.getKwOnlyTypes(), supertypeSig.getKwOnlyTypes()))
-    if (!isSubtypeOfImpl(superArg, subArg, from))
-      return false;
-  if (supertypeSig.hasVararg()) {
-    mlir::Type supertypeVarargElement =
-        callableVarargElementType(supertypeSig.getVarargType());
-    if (!supertypeVarargElement ||
-        !isSubtypeOfImpl(supertypeVarargElement, subtypeVarargElement, from))
-      return false;
-  }
-  if (supertypeSig.hasKwarg() &&
-      !isSubtypeOfImpl(supertypeSig.getKwargType(), subtypeSig.getKwargType(),
-                       from))
+  std::optional<mlir::Type> superValue =
+      callableKwargValueType(supertypeSig.getKwargType());
+  std::optional<mlir::Type> subValue =
+      callableKwargValueType(subtypeSig.getKwargType());
+  return superValue && subValue &&
+         subtypeWithBindings(*superValue, *subValue, context);
+}
+
+bool callableResultsCovariant(CallableType subtypeSig,
+                              CallableType supertypeSig,
+                              SubtypeContext &context) {
+  if (subtypeSig.getResultTypes().size() !=
+      supertypeSig.getResultTypes().size())
     return false;
   for (auto [subResult, superResult] :
        llvm::zip(subtypeSig.getResultTypes(), supertypeSig.getResultTypes()))
-    if (!isSubtypeOfImpl(subResult, superResult, from))
+    if (!subtypeWithBindings(subResult, superResult, context))
       return false;
   return true;
 }
 
+bool isCallableContractSubtypeOf(CallableType subtypeSig,
+                                 CallableType supertypeSig,
+                                 SubtypeContext &context) {
+  if (isCallableEllipsisContract(supertypeSig) ||
+      isCallableEllipsisContract(subtypeSig))
+    return callableResultsCovariant(subtypeSig, supertypeSig, context);
+
+  SubtypeBindings candidateBindings;
+  if (context.bindings)
+    candidateBindings = *context.bindings;
+  SubtypeContext candidateContext{
+      context.from, context.bindings ? &candidateBindings : nullptr};
+
+  llvm::SmallVector<CallableInvocation, 4> samples;
+  if (!appendCallableAcceptanceSamples(supertypeSig, samples))
+    return false;
+  for (const CallableInvocation &sample : samples)
+    if (!callableAcceptsInvocation(subtypeSig, sample, candidateContext))
+      return false;
+
+  if (!callableSubtypeCoversVariadicTail(subtypeSig, supertypeSig,
+                                         candidateContext))
+    return false;
+  if (!callableSubtypeCoversKeywordTail(subtypeSig, supertypeSig,
+                                        candidateContext))
+    return false;
+  if (!callableResultsCovariant(subtypeSig, supertypeSig, candidateContext))
+    return false;
+
+  if (context.bindings)
+    *context.bindings = candidateBindings;
+  return true;
+}
+
+bool protocolArgumentMatchesVariance(mlir::Type subtypeArg,
+                                     mlir::Type supertypeArg,
+                                     protocol_relations::Variance variance,
+                                     SubtypeContext &context) {
+  if (variance == protocol_relations::Variance::Invariant)
+    return subtypeArg == supertypeArg;
+  if (variance == protocol_relations::Variance::Contravariant)
+    return isSubtypeOfImpl(supertypeArg, subtypeArg, context);
+  return isSubtypeOfImpl(subtypeArg, supertypeArg, context);
+}
+
+void appendProtocolBase(llvm::SmallVectorImpl<ProtocolType> &bases,
+                        mlir::MLIRContext *ctx, llvm::StringRef name,
+                        llvm::ArrayRef<mlir::Type> args) {
+  bases.push_back(ProtocolType::get(ctx, name, args));
+}
+
+llvm::SmallVector<ProtocolType, 3> directProtocolBases(ProtocolType protocol) {
+  mlir::MLIRContext *ctx = protocol.getContext();
+  llvm::ArrayRef<mlir::Type> args = protocol.getArguments();
+  llvm::SmallVector<ProtocolType, 3> bases;
+  protocol_relations::forEachDirectBase(
+      protocol.getProtocolName(), ctx, args,
+      [&](llvm::StringRef name, llvm::ArrayRef<mlir::Type> baseArgs) {
+        appendProtocolBase(bases, ctx, name, baseArgs);
+      });
+  return bases;
+}
+
+bool isProtocolSubtypeOf(ProtocolType subtype, ProtocolType supertype,
+                         SubtypeContext &context, unsigned depth = 0) {
+  if (depth > 16)
+    return false;
+  if (subtype.getProtocolName() == supertype.getProtocolName()) {
+    llvm::ArrayRef<mlir::Type> subtypeArgs = subtype.getArguments();
+    llvm::ArrayRef<mlir::Type> supertypeArgs = supertype.getArguments();
+    if (subtypeArgs.size() != supertypeArgs.size())
+      return false;
+    for (auto indexed :
+         llvm::enumerate(llvm::zip(subtypeArgs, supertypeArgs))) {
+      auto [subArg, superArg] = indexed.value();
+      if (!protocolArgumentMatchesVariance(
+              subArg, superArg,
+              protocol_relations::parameterVariance(subtype.getProtocolName(),
+                                                    indexed.index()),
+              context))
+        return false;
+    }
+    return true;
+  }
+
+  for (ProtocolType base : directProtocolBases(subtype))
+    if (isProtocolSubtypeOf(base, supertype, context, depth + 1))
+      return true;
+  return false;
+}
+
 bool isSubtypeOfImpl(mlir::Type subtype, mlir::Type supertype,
-                     mlir::Operation *from) {
+                     SubtypeContext &context) {
   // Reflexive: T <: T
   if (subtype == supertype)
     return true;
+
+  if (mlir::isa<SelfType>(supertype))
+    return bindSelfType(subtype, context);
+  if (mlir::isa<SelfType>(subtype))
+    return bindSelfType(supertype, context);
+
+  if (mlir::isa<TypeVarType, ParamSpecType>(supertype))
+    return bindSelfType(subtype, context);
+  if (mlir::isa<TypeVarType, ParamSpecType>(subtype))
+    return bindSelfType(supertype, context);
+
+  auto subtypeContract = mlir::dyn_cast<ContractType>(subtype);
+  auto supertypeContract = mlir::dyn_cast<ContractType>(supertype);
+  if (supertypeContract &&
+      (supertypeContract.getContractName() == "typing.Any" ||
+       supertypeContract.getContractName() == "builtins.object"))
+    return isPyType(subtype);
+  if (subtypeContract && supertypeContract) {
+    if (!isContractSubclassOf(subtypeContract, supertypeContract))
+      return false;
+    if (subtypeContract.getContractName() !=
+        supertypeContract.getContractName())
+      return true;
+    llvm::ArrayRef<mlir::Type> subtypeArgs = subtypeContract.getArguments();
+    llvm::ArrayRef<mlir::Type> supertypeArgs = supertypeContract.getArguments();
+    if (subtypeArgs.size() != supertypeArgs.size())
+      return false;
+    for (auto [subArg, superArg] : llvm::zip(subtypeArgs, supertypeArgs))
+      if (!isSubtypeOfImpl(subArg, superArg, context))
+        return false;
+    return true;
+  }
 
   // The manifest-only object contract is the static top type.
   if (mlir::isa<ObjectType>(supertype))
@@ -556,25 +1092,42 @@ bool isSubtypeOfImpl(mlir::Type subtype, mlir::Type supertype,
     if (auto subtypeUnion = mlir::dyn_cast<UnionType>(subtype)) {
       return llvm::all_of(
           subtypeUnion.getMemberTypes(), [&](mlir::Type member) {
-            return isMemberOfUnion(member, supertypeUnion, from);
+            return isMemberOfUnion(member, supertypeUnion, context);
           });
     }
-    return isMemberOfUnion(subtype, supertypeUnion, from);
+    return isMemberOfUnion(subtype, supertypeUnion, context);
   }
 
   if (auto subtypeUnion = mlir::dyn_cast<UnionType>(subtype)) {
     return llvm::all_of(subtypeUnion.getMemberTypes(), [&](mlir::Type member) {
-      return isSubtypeOfImpl(member, supertype, from);
+      return isSubtypeOfImpl(member, supertype, context);
     });
+  }
+
+  auto subtypeOverload = mlir::dyn_cast<OverloadType>(subtype);
+  auto supertypeOverload = mlir::dyn_cast<OverloadType>(supertype);
+  if (subtypeOverload && supertypeOverload)
+    return overloadCoversAllExpected(subtypeOverload, supertypeOverload,
+                                     context);
+  if (subtypeOverload)
+    return overloadProvides(subtypeOverload, supertype, context);
+  if (supertypeOverload)
+    return overloadCoversAllExpected(subtype, supertypeOverload, context);
+
+  if (mlir::isa<ExceptionType>(subtype)) {
+    auto supertypeClass = mlir::dyn_cast<ClassType>(supertype);
+    if (supertypeClass && supertypeClass.getClassName() == "BaseException")
+      return true;
   }
 
   auto subtypeClass = mlir::dyn_cast<ClassType>(subtype);
   auto supertypeClass = mlir::dyn_cast<ClassType>(supertype);
   if (subtypeClass && supertypeClass) {
-    if (!from)
+    if (!context.from)
       return false;
-    mlir::FailureOr<bool> result = type_object::isSubclassOf(
-        from, subtypeClass.getClassName(), supertypeClass.getClassName());
+    mlir::FailureOr<bool> result =
+        type_object::isSubclassOf(context.from, subtypeClass.getClassName(),
+                                  supertypeClass.getClassName());
     return mlir::succeeded(result) && *result;
   }
 
@@ -582,22 +1135,23 @@ bool isSubtypeOfImpl(mlir::Type subtype, mlir::Type supertype,
   auto supertypeMeta = mlir::dyn_cast<TypeType>(supertype);
   if (subtypeMeta && supertypeMeta)
     return isSubtypeOfImpl(subtypeMeta.getInstanceType(),
-                           supertypeMeta.getInstanceType(), from);
+                           supertypeMeta.getInstanceType(), context);
 
   auto subtypeProtocol = mlir::dyn_cast<ProtocolType>(subtype);
   auto supertypeProtocol = mlir::dyn_cast<ProtocolType>(supertype);
   if (subtypeProtocol && supertypeProtocol) {
-    if (subtypeProtocol.getProtocolName() !=
-        supertypeProtocol.getProtocolName())
-      return false;
-    auto subtypeArgs = subtypeProtocol.getArguments();
-    auto supertypeArgs = supertypeProtocol.getArguments();
-    if (subtypeArgs.size() != supertypeArgs.size())
-      return false;
-    for (auto [sub, sup] : llvm::zip(subtypeArgs, supertypeArgs))
-      if (!isSubtypeOfImpl(sub, sup, from))
-        return false;
-    return true;
+    return isProtocolSubtypeOf(subtypeProtocol, supertypeProtocol, context);
+  }
+  if (supertypeProtocol) {
+    std::optional<llvm::SmallVector<mlir::Type, 3>> subtypeArgs =
+        protocolDescriptorArguments(subtype,
+                                    supertypeProtocol.getProtocolName());
+    if (subtypeArgs) {
+      ProtocolType subtypeView =
+          ProtocolType::get(subtype.getContext(),
+                            supertypeProtocol.getProtocolName(), *subtypeArgs);
+      return isProtocolSubtypeOf(subtypeView, supertypeProtocol, context);
+    }
   }
 
   // Tuple covariance: !py.tuple<S> <: !py.tuple<T> if S <: T
@@ -609,7 +1163,7 @@ bool isSubtypeOfImpl(mlir::Type subtype, mlir::Type supertype,
     if (subElems.size() != superElems.size())
       return false;
     for (auto [sub, sup] : llvm::zip(subElems, superElems)) {
-      if (!isSubtypeOfImpl(sub, sup, from))
+      if (!isSubtypeOfImpl(sub, sup, context))
         return false;
     }
     return true;
@@ -633,7 +1187,7 @@ bool isSubtypeOfImpl(mlir::Type subtype, mlir::Type supertype,
   CallableType supertypeCallable = getCallableContract(supertype);
   if (subtypeCallable && supertypeCallable)
     return isCallableContractSubtypeOf(subtypeCallable, supertypeCallable,
-                                       from);
+                                       context);
 
   // No other subtype relations in v2.1
   return false;
@@ -642,12 +1196,55 @@ bool isSubtypeOfImpl(mlir::Type subtype, mlir::Type supertype,
 } // namespace
 
 bool isSubtypeOf(mlir::Type subtype, mlir::Type supertype) {
-  return isSubtypeOfImpl(subtype, supertype, nullptr);
+  SubtypeContext context;
+  return isSubtypeOfImpl(subtype, supertype, context);
 }
 
 bool isSubtypeOf(mlir::Type subtype, mlir::Type supertype,
                  mlir::Operation *from) {
-  return isSubtypeOfImpl(subtype, supertype, from);
+  SubtypeContext context{from, nullptr};
+  return isSubtypeOfImpl(subtype, supertype, context);
+}
+
+bool isSubtypeOf(mlir::Type subtype, mlir::Type supertype,
+                 mlir::Operation *from, SubtypeBindings *bindings) {
+  SubtypeContext context{from, bindings};
+  return isSubtypeOfImpl(subtype, supertype, context);
+}
+
+bool isAssignableToImpl(mlir::Type actual, mlir::Type expected,
+                        SubtypeContext &context) {
+  if (!actual || !expected)
+    return false;
+  if (isSubtypeOfImpl(actual, expected, context))
+    return true;
+  if (mlir::isa<IntType>(expected) &&
+      (mlir::isa<mlir::IntegerType>(actual) || actual.isIndex()))
+    return true;
+  if (mlir::isa<BoolType>(expected)) {
+    auto integer = mlir::dyn_cast<mlir::IntegerType>(actual);
+    return integer && integer.getWidth() == 1;
+  }
+  if (mlir::isa<FloatType>(expected) && mlir::isa<mlir::FloatType>(actual))
+    return true;
+  return false;
+}
+
+bool isAssignableTo(mlir::Type actual, mlir::Type expected) {
+  SubtypeContext context;
+  return isAssignableToImpl(actual, expected, context);
+}
+
+bool isAssignableTo(mlir::Type actual, mlir::Type expected,
+                    mlir::Operation *from) {
+  SubtypeContext context{from, nullptr};
+  return isAssignableToImpl(actual, expected, context);
+}
+
+bool isAssignableTo(mlir::Type actual, mlir::Type expected,
+                    mlir::Operation *from, SubtypeBindings *bindings) {
+  SubtypeContext context{from, bindings};
+  return isAssignableToImpl(actual, expected, context);
 }
 
 } // namespace py

@@ -1,24 +1,8 @@
 add_library(LythonEmitter STATIC
-    lib/BuilderAst.cpp
-    lib/Builder.cpp
-    lib/BuilderAsync.cpp
-    lib/BuilderBoolOps.cpp
-    lib/BuilderCalls.cpp
-    lib/BuilderClasses.cpp
-    lib/BuilderContainers.cpp
-    lib/BuilderControl.cpp
-    lib/BuilderEH.cpp
-    lib/BuilderExpressions.cpp
-    lib/BuilderFunctions.cpp
-    lib/BuilderImports.cpp
-    lib/BuilderLiterals.cpp
-    lib/BuilderMatch.cpp
-    lib/BuilderStatements.cpp
-    lib/BuilderSupport.cpp
-    lib/BuilderTensors.cpp
-    lib/BuilderTypes.cpp
+    lib/ClosureAnalysis.cpp
+    lib/EmitterCore.cpp
     lib/Emitter.cpp
-    lib/TypeInference.cpp
+    lib/TypeSystem.cpp
 )
 
 target_include_directories(LythonEmitter
@@ -36,7 +20,6 @@ target_link_libraries(LythonEmitter
     LLVM
     PRIVATE
     PyDialect
-    LythonProtocolEvidence
 )
 
 add_dependencies(LythonEmitter PyDialectIncGen)

@@ -93,14 +93,8 @@ file(WRITE "${LYTHON_PRELOWER_INPUT}" "module {}\n")
 file(GLOB LYTHON_PRELOWER_RUNTIME_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_SOURCE_DIR}/src/lython/runtime/objects/*.mlir"
 )
-add_custom_command(
-    OUTPUT "${LYTHON_RUNTIME_PRELOWERED_IR}"
-    COMMAND ${CMAKE_COMMAND} -E env LYTHON_RUNTIME_PRELOWER=1
-        $<TARGET_FILE:lyc> "${LYTHON_PRELOWER_INPUT}" -emit-llvm
-        -o "${LYTHON_RUNTIME_PRELOWERED_IR}"
-    DEPENDS lyc LythonRuntimeObjectBytecode ${LYTHON_PRELOWER_RUNTIME_SOURCES}
-    COMMENT "Pre-lowering runtime MLIR objects to LLVM IR"
-    VERBATIM
+file(WRITE "${LYTHON_RUNTIME_PRELOWERED_IR}"
+    "; Runtime prelowering is disabled while PyDialect lowering is rebuilt.\n"
 )
 add_custom_target(LythonRuntimePrelowered ALL
     DEPENDS "${LYTHON_RUNTIME_PRELOWERED_IR}"
