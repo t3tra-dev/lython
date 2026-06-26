@@ -47,15 +47,6 @@ primitiveI64ComparePredicate(llvm::StringRef methodName) {
       .Default(std::nullopt);
 }
 
-bool hasPrimitiveI64Evidence(const RuntimeBundle *bundle) {
-  return bundle && bundle->kind == RuntimeBundle::Kind::Object &&
-         bundle->contractName() == "builtins.int" && bundle->primitiveI64 &&
-         bundle->primitiveI64->value &&
-         bundle->primitiveI64->value.getType().isInteger(64) &&
-         bundle->primitiveI64->valid &&
-         bundle->primitiveI64->valid.getType().isInteger(1);
-}
-
 mlir::Value boolConstant(mlir::OpBuilder &builder, mlir::Location loc,
                          bool value) {
   return builder.create<mlir::arith::ConstantIntOp>(loc, value ? 1 : 0, 1)
@@ -64,8 +55,7 @@ mlir::Value boolConstant(mlir::OpBuilder &builder, mlir::Location loc,
 
 mlir::Value i64Constant(mlir::OpBuilder &builder, mlir::Location loc,
                         std::int64_t value) {
-  return builder.create<mlir::arith::ConstantIntOp>(loc, value, 64)
-      .getResult();
+  return builder.create<mlir::arith::ConstantIntOp>(loc, value, 64).getResult();
 }
 
 mlir::Value logicalAnd(mlir::OpBuilder &builder, mlir::Location loc,
@@ -75,8 +65,8 @@ mlir::Value logicalAnd(mlir::OpBuilder &builder, mlir::Location loc,
 
 mlir::Value logicalNot(mlir::OpBuilder &builder, mlir::Location loc,
                        mlir::Value value) {
-  return builder.create<mlir::arith::XOrIOp>(
-                    loc, value, boolConstant(builder, loc, true))
+  return builder
+      .create<mlir::arith::XOrIOp>(loc, value, boolConstant(builder, loc, true))
       .getResult();
 }
 
@@ -84,14 +74,16 @@ mlir::Value signedAddOverflow(mlir::OpBuilder &builder, mlir::Location loc,
                               mlir::Value lhs, mlir::Value rhs,
                               mlir::Value result) {
   mlir::Value zero = i64Constant(builder, loc, 0);
-  mlir::Value lhsNegative = builder.create<mlir::arith::CmpIOp>(
-                                     loc, mlir::arith::CmpIPredicate::slt, lhs,
-                                     zero)
-                                 .getResult();
-  mlir::Value rhsNegative = builder.create<mlir::arith::CmpIOp>(
-                                     loc, mlir::arith::CmpIPredicate::slt, rhs,
-                                     zero)
-                                 .getResult();
+  mlir::Value lhsNegative =
+      builder
+          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::slt,
+                                       lhs, zero)
+          .getResult();
+  mlir::Value rhsNegative =
+      builder
+          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::slt,
+                                       rhs, zero)
+          .getResult();
   mlir::Value resultNegative =
       builder
           .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::slt,
@@ -114,14 +106,16 @@ mlir::Value signedSubOverflow(mlir::OpBuilder &builder, mlir::Location loc,
                               mlir::Value lhs, mlir::Value rhs,
                               mlir::Value result) {
   mlir::Value zero = i64Constant(builder, loc, 0);
-  mlir::Value lhsNegative = builder.create<mlir::arith::CmpIOp>(
-                                     loc, mlir::arith::CmpIPredicate::slt, lhs,
-                                     zero)
-                                 .getResult();
-  mlir::Value rhsNegative = builder.create<mlir::arith::CmpIOp>(
-                                     loc, mlir::arith::CmpIPredicate::slt, rhs,
-                                     zero)
-                                 .getResult();
+  mlir::Value lhsNegative =
+      builder
+          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::slt,
+                                       lhs, zero)
+          .getResult();
+  mlir::Value rhsNegative =
+      builder
+          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::slt,
+                                       rhs, zero)
+          .getResult();
   mlir::Value resultNegative =
       builder
           .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::slt,
@@ -156,8 +150,7 @@ buildPrimitiveI64Arithmetic(mlir::OpBuilder &builder, mlir::Location loc,
     return {result, signedSubOverflow(builder, loc, lhs, rhs, result)};
   }
   case PrimitiveI64ArithmeticKind::Mul: {
-    auto extended =
-        builder.create<mlir::arith::MulSIExtendedOp>(loc, lhs, rhs);
+    auto extended = builder.create<mlir::arith::MulSIExtendedOp>(loc, lhs, rhs);
     mlir::Value shift = i64Constant(builder, loc, 63);
     mlir::Value expectedHigh =
         builder.create<mlir::arith::ShRSIOp>(loc, extended.getLow(), shift)
@@ -189,22 +182,65 @@ bool RuntimeBundleLowerer::canAppendExactValueSequence(
   return true;
 }
 
+static bool canAppendExactValues(mlir::FunctionType functionType,
+                                 unsigned inputIndex, mlir::ValueRange values) {
+  if (values.empty() ||
+      inputIndex + values.size() > functionType.getNumInputs())
+    return false;
+  for (auto [offset, value] : llvm::enumerate(values))
+    if (value.getType() != functionType.getInput(inputIndex + offset))
+      return false;
+  return true;
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::appendRuntimeSource(
     mlir::Operation *op, const RuntimeSymbol &symbol,
     mlir::FunctionType functionType, unsigned &inputIndex,
     const RuntimeBundle &source, llvm::SmallVectorImpl<mlir::Value> &operands) {
   llvm::ArrayRef<mlir::Value> sourceValues = source.physicalValues();
-  if (canAppendExactValueSequence(functionType, inputIndex, source)) {
+  if (canAppendExactValues(functionType, inputIndex, sourceValues)) {
     operands.append(sourceValues.begin(), sourceValues.end());
     inputIndex += static_cast<unsigned>(sourceValues.size());
     return mlir::success();
   }
 
   mlir::Type expected = functionType.getInput(inputIndex);
+  std::optional<RuntimeValue> materializedObject;
+  auto materializeLazySource = [&]() -> mlir::LogicalResult {
+    if (materializedObject)
+      return mlir::success();
+    mlir::FailureOr<RuntimeValue> value =
+        RuntimeBundleLowerer::materializePrimitiveI64Object(op, source);
+    if (mlir::failed(value))
+      return mlir::failure();
+    materializedObject = std::move(*value);
+    sourceValues = materializedObject->values;
+    return mlir::success();
+  };
+
+  if (RuntimeBundleLowerer::hasLazyPrimitiveI64Object(source) &&
+      expected.isInteger(64)) {
+    operands.push_back(source.primitiveI64->value);
+    ++inputIndex;
+    return mlir::success();
+  }
+
+  if (RuntimeBundleLowerer::hasLazyPrimitiveI64Object(source)) {
+    if (mlir::failed(materializeLazySource()))
+      return mlir::failure();
+    if (canAppendExactValues(functionType, inputIndex, sourceValues)) {
+      operands.append(sourceValues.begin(), sourceValues.end());
+      inputIndex += static_cast<unsigned>(sourceValues.size());
+      return mlir::success();
+    }
+  }
+
   if (source.kind == RuntimeBundle::Kind::Object &&
       isErasedObjectStorageType(expected)) {
+    const RuntimeValue &objectValue =
+        materializedObject ? *materializedObject : source.objectValue;
     mlir::FailureOr<mlir::Value> storage =
-        RuntimeBundleLowerer::erasedObjectStorageView(op, source.objectValue,
+        RuntimeBundleLowerer::erasedObjectStorageView(op, objectValue,
                                                       expected);
     if (mlir::failed(storage))
       return mlir::failure();
@@ -215,8 +251,10 @@ mlir::LogicalResult RuntimeBundleLowerer::appendRuntimeSource(
 
   if (source.kind == RuntimeBundle::Kind::Object &&
       isBuiltinsObjectHeaderType(expected)) {
+    const RuntimeValue &objectValue =
+        materializedObject ? *materializedObject : source.objectValue;
     mlir::FailureOr<mlir::Value> header =
-        RuntimeBundleLowerer::objectHeaderView(op, source.objectValue);
+        RuntimeBundleLowerer::objectHeaderView(op, objectValue);
     if (mlir::failed(header))
       return mlir::failure();
     operands.push_back(*header);
@@ -341,7 +379,7 @@ bool RuntimeBundleLowerer::canAppendRuntimeSource(
     const RuntimeSymbol &symbol, mlir::FunctionType functionType,
     unsigned &inputIndex, const RuntimeBundle &source) const {
   llvm::ArrayRef<mlir::Value> sourceValues = source.physicalValues();
-  if (canAppendExactValueSequence(functionType, inputIndex, source)) {
+  if (canAppendExactValues(functionType, inputIndex, sourceValues)) {
     inputIndex += static_cast<unsigned>(sourceValues.size());
     return true;
   }
@@ -349,6 +387,39 @@ bool RuntimeBundleLowerer::canAppendRuntimeSource(
     return false;
 
   mlir::Type expected = functionType.getInput(inputIndex);
+  if (RuntimeBundleLowerer::hasLazyPrimitiveI64Object(source)) {
+    if (expected.isInteger(64)) {
+      ++inputIndex;
+      return true;
+    }
+    const RuntimeValueShape *shape = manifest.valueShape("builtins.int");
+    if (shape &&
+        inputIndex + shape->valueTypes.size() <= functionType.getNumInputs()) {
+      bool exact = true;
+      for (auto [offset, type] : llvm::enumerate(shape->valueTypes)) {
+        if (type != functionType.getInput(inputIndex + offset)) {
+          exact = false;
+          break;
+        }
+      }
+      if (exact) {
+        inputIndex += static_cast<unsigned>(shape->valueTypes.size());
+        return true;
+      }
+      if (!shape->valueTypes.empty() && isBuiltinsObjectHeaderType(expected) &&
+          compatibleRankOneMemRefStorage(shape->valueTypes.front(), expected,
+                                         /*targetMustBeDynamic=*/false)) {
+        ++inputIndex;
+        return true;
+      }
+      if (!shape->valueTypes.empty() && isErasedObjectStorageType(expected) &&
+          compatibleRankOneMemRefStorage(shape->valueTypes.front(), expected,
+                                         /*targetMustBeDynamic=*/true)) {
+        ++inputIndex;
+        return true;
+      }
+    }
+  }
   if (source.kind == RuntimeBundle::Kind::Object &&
       isErasedObjectStorageType(expected) && !sourceValues.empty() &&
       compatibleRankOneMemRefStorage(sourceValues.front().getType(), expected,
@@ -504,8 +575,9 @@ mlir::LogicalResult RuntimeBundleLowerer::buildRuntimeCallOperands(
 mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
     mlir::Operation *op, llvm::StringRef methodName,
     llvm::ArrayRef<const RuntimeBundle *> sources, mlir::Value resultValue) {
-  if (sources.size() != 2 || !hasPrimitiveI64Evidence(sources[0]) ||
-      !hasPrimitiveI64Evidence(sources[1]))
+  if (sources.size() != 2 ||
+      !RuntimeBundleLowerer::hasPrimitiveI64Evidence(sources[0]) ||
+      !RuntimeBundleLowerer::hasPrimitiveI64Evidence(sources[1]))
     return op->emitError()
            << "primitive i64 lowering requires two int operands with evidence";
 
@@ -514,13 +586,46 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
   std::optional<mlir::arith::CmpIPredicate> compare =
       primitiveI64ComparePredicate(methodName);
   if (!arithmetic && !compare)
-    return op->emitError()
-           << "unsupported primitive i64 special method " << methodName;
+    return op->emitError() << "unsupported primitive i64 special method "
+                           << methodName;
+
+  builder.setInsertionPoint(op);
+  mlir::Location loc = op->getLoc();
+  const RuntimePrimitiveI64Evidence &lhs = *sources[0]->primitiveI64;
+  const RuntimePrimitiveI64Evidence &rhs = *sources[1]->primitiveI64;
+  mlir::Value operandsValid = logicalAnd(builder, loc, lhs.valid, rhs.valid);
+
+  if (RuntimeBundleLowerer::isPrimitiveI64CallableClone(
+          op->getParentOfType<mlir::func::FuncOp>())) {
+    if (arithmetic) {
+      auto [rawResult, overflow] = buildPrimitiveI64Arithmetic(
+          builder, loc, *arithmetic, lhs.value, rhs.value);
+      mlir::Value valid = logicalAnd(builder, loc, operandsValid,
+                                     logicalNot(builder, loc, overflow));
+      RuntimeBundle result;
+      if (mlir::failed(RuntimeBundleLowerer::makePrimitiveI64Bundle(
+              op, resultValue.getType(), rawResult, valid, result)))
+        return mlir::failure();
+      valueBundles[resultValue] = std::move(result);
+      return mlir::success();
+    }
+
+    mlir::Value compared =
+        builder.create<mlir::arith::CmpIOp>(loc, *compare, lhs.value, rhs.value)
+            .getResult();
+    mlir::Value fastResult = logicalAnd(builder, loc, operandsValid, compared);
+    RuntimeBundle result;
+    if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+            op, resultValue.getType(), mlir::ValueRange{fastResult}, result)))
+      return mlir::failure();
+    valueBundles[resultValue] = std::move(result);
+    return mlir::success();
+  }
 
   mlir::FailureOr<RuntimeSymbol> selected =
-      RuntimeBundleLowerer::selectManifestMethod(
-          op, *sources.front(), methodName, sources,
-          /*allowUnusedSources=*/false);
+      RuntimeBundleLowerer::selectManifestMethod(op, *sources.front(),
+                                                 methodName, sources,
+                                                 /*allowUnusedSources=*/false);
   if (mlir::failed(selected))
     return mlir::failure();
 
@@ -545,9 +650,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
   if (mlir::failed(resultTypes))
     return mlir::failure();
 
-  auto checkPhysicalTypes =
-      [&](mlir::ValueRange values, llvm::StringRef label)
-          -> mlir::LogicalResult {
+  auto checkPhysicalTypes = [&](mlir::ValueRange values,
+                                llvm::StringRef label) -> mlir::LogicalResult {
     if (values.size() != resultTypes->size())
       return op->emitError()
              << label << " produced " << values.size()
@@ -564,11 +668,6 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
   };
 
   context->loadDialect<mlir::scf::SCFDialect>();
-  builder.setInsertionPoint(op);
-  mlir::Location loc = op->getLoc();
-  const RuntimePrimitiveI64Evidence &lhs = *sources[0]->primitiveI64;
-  const RuntimePrimitiveI64Evidence &rhs = *sources[1]->primitiveI64;
-  mlir::Value operandsValid = logicalAnd(builder, loc, lhs.valid, rhs.valid);
 
   auto emitFallbackYield = [&]() -> mlir::LogicalResult {
     llvm::SmallVector<mlir::Value, 8> operands;
@@ -586,11 +685,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
   if (arithmetic) {
     auto [rawResult, overflow] = buildPrimitiveI64Arithmetic(
         builder, loc, *arithmetic, lhs.value, rhs.value);
-    mlir::Value fastValid =
-        logicalAnd(builder, loc, operandsValid, logicalNot(builder, loc,
-                                                          overflow));
-    auto ifOp = builder.create<mlir::scf::IfOp>(
-        loc, *resultTypes, fastValid, /*withElseRegion=*/true);
+    mlir::Value fastValid = logicalAnd(builder, loc, operandsValid,
+                                       logicalNot(builder, loc, overflow));
+    auto ifOp = builder.create<mlir::scf::IfOp>(loc, *resultTypes, fastValid,
+                                                /*withElseRegion=*/true);
 
     builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
     RuntimeBundle fastBundle;
@@ -622,8 +720,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
   mlir::Value fastResult =
       builder.create<mlir::arith::CmpIOp>(loc, *compare, lhs.value, rhs.value)
           .getResult();
-  auto ifOp = builder.create<mlir::scf::IfOp>(
-      loc, *resultTypes, operandsValid, /*withElseRegion=*/true);
+  auto ifOp = builder.create<mlir::scf::IfOp>(loc, *resultTypes, operandsValid,
+                                              /*withElseRegion=*/true);
 
   builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
   builder.create<mlir::scf::YieldOp>(loc, mlir::ValueRange{fastResult});
@@ -650,8 +748,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBinarySpecial(
           op, inputs, "binary special method operands need runtime bundles",
           sources)))
     return mlir::failure();
-  if (sources.size() == 2 && hasPrimitiveI64Evidence(sources[0]) &&
-      hasPrimitiveI64Evidence(sources[1]) &&
+  if (sources.size() == 2 &&
+      RuntimeBundleLowerer::hasPrimitiveI64Evidence(sources[0]) &&
+      RuntimeBundleLowerer::hasPrimitiveI64Evidence(sources[1]) &&
       (primitiveI64ArithmeticKind(methodName) ||
        primitiveI64ComparePredicate(methodName))) {
     if (mlir::failed(RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(

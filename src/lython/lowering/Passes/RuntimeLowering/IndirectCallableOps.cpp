@@ -73,6 +73,16 @@ mlir::LogicalResult RuntimeBundleLowerer::appendBundlePhysicalOperands(
     llvm::ArrayRef<mlir::Type> expectedTypes,
     llvm::SmallVectorImpl<mlir::Value> &operands) {
   llvm::ArrayRef<mlir::Value> values = bundle.physicalValues();
+  std::optional<RuntimeValue> materializedObject;
+  if (values.empty() &&
+      RuntimeBundleLowerer::hasLazyPrimitiveI64Object(bundle)) {
+    mlir::FailureOr<RuntimeValue> value =
+        RuntimeBundleLowerer::materializePrimitiveI64Object(op, bundle);
+    if (mlir::failed(value))
+      return mlir::failure();
+    materializedObject = std::move(*value);
+    values = materializedObject->values;
+  }
   if (values.size() == expectedTypes.size()) {
     bool exact = true;
     for (auto [value, expected] : llvm::zip(values, expectedTypes)) {
@@ -89,8 +99,10 @@ mlir::LogicalResult RuntimeBundleLowerer::appendBundlePhysicalOperands(
 
   if (expectedTypes.size() == 1 && bundle.kind == RuntimeBundle::Kind::Object &&
       isBuiltinsObjectHeaderType(expectedTypes.front())) {
+    const RuntimeValue &objectValue =
+        materializedObject ? *materializedObject : bundle.objectValue;
     mlir::FailureOr<mlir::Value> header =
-        RuntimeBundleLowerer::objectHeaderView(op, bundle.objectValue);
+        RuntimeBundleLowerer::objectHeaderView(op, objectValue);
     if (mlir::failed(header))
       return mlir::failure();
     operands.push_back(*header);
@@ -116,8 +128,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
     return mlir::failure();
   llvm::SmallVector<mlir::Type, 8> continuationTypes(resultTypes->begin(),
                                                      resultTypes->end());
-  RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(op.getResult(0).getType(),
-                                                        continuationTypes);
+  RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(
+      op.getResult(0).getType(), continuationTypes);
 
   llvm::SmallVector<mlir::func::FuncOp, 8> targets =
       RuntimeBundleLowerer::collectIndirectCallableTargets(op, callable);
@@ -148,8 +160,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
     continuationArgs.push_back(arg);
   }
 
-  llvm::ArrayRef<mlir::Value> objectContinuationArgs(
-      continuationArgs.data(), resultTypes->size());
+  llvm::ArrayRef<mlir::Value> objectContinuationArgs(continuationArgs.data(),
+                                                     resultTypes->size());
   RuntimeBundle result;
   if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
           op, op.getResult(0).getType(), objectContinuationArgs, result)))
@@ -160,9 +172,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
       return op.emitError()
              << "indirect callable int result continuation is missing "
                 "primitive evidence";
-    result.primitiveI64 =
-        RuntimePrimitiveI64Evidence{continuationArgs[offset],
-                                    continuationArgs[offset + 1]};
+    result.primitiveI64 = RuntimePrimitiveI64Evidence{
+        continuationArgs[offset], continuationArgs[offset + 1]};
   }
   valueBundles[op.getResult(0)] = std::move(result);
 
@@ -213,16 +224,32 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
              << "indirect async callable dispatch for " << targetName
              << " requires coroutine frame evidence";
 
-    mlir::FailureOr<mlir::func::CallOp> call =
-        RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(
-            op, target, targetName, sources);
-    if (mlir::failed(call))
-      return mlir::failure();
-
     RuntimeBundle targetResult;
-    if (mlir::failed(RuntimeBundleLowerer::bundleFunctionTargetCallResult(
-            op, target, targetName, *call, sources, targetResult)))
-      return mlir::failure();
+    bool usedPrimitiveClone = false;
+    if (std::optional<std::string> cloneName =
+            RuntimeBundleLowerer::primitiveI64CloneFor(targetName)) {
+      if (RuntimeBundleLowerer::allSourcesHavePrimitiveI64Evidence(sources)) {
+        if (mlir::func::FuncOp clone =
+                module.lookupSymbol<mlir::func::FuncOp>(*cloneName)) {
+          if (mlir::failed(
+                  RuntimeBundleLowerer::emitPrimitiveI64CloneFallbackResult(
+                      op, target, targetName, clone, sources, targetResult)))
+            return mlir::failure();
+          usedPrimitiveClone = true;
+        }
+      }
+    }
+    if (!usedPrimitiveClone) {
+      mlir::FailureOr<mlir::func::CallOp> call =
+          RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(
+              op, target, targetName, sources);
+      if (mlir::failed(call))
+        return mlir::failure();
+
+      if (mlir::failed(RuntimeBundleLowerer::bundleFunctionTargetCallResult(
+              op, target, targetName, *call, sources, targetResult)))
+        return mlir::failure();
+    }
     llvm::SmallVector<mlir::Value, 4> branchOperands;
     if (mlir::failed(RuntimeBundleLowerer::appendBundlePhysicalOperands(
             op, targetResult, *resultTypes, branchOperands)))

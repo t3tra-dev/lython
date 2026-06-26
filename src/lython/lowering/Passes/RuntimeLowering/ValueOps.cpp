@@ -145,9 +145,11 @@ RuntimeBundleLowerer::lowerIntConstant(py::IntConstantOp op) {
   mlir::Location loc = op.getLoc();
   mlir::Value value =
       builder.create<mlir::arith::ConstantIntOp>(loc, parsed, 64).getResult();
+  mlir::Value valid =
+      builder.create<mlir::arith::ConstantIntOp>(loc, 1, 1).getResult();
   RuntimeBundle result;
-  if (mlir::failed(initializeObjectFromRawValues(
-          op, op.getResult().getType(), mlir::ValueRange{value}, result)))
+  if (mlir::failed(RuntimeBundleLowerer::makePrimitiveI64Bundle(
+          op, op.getResult().getType(), value, valid, result)))
     return mlir::failure();
   valueBundles[op.getResult()] = std::move(result);
   erase.push_back(op);
@@ -822,6 +824,17 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBindingRef(py::BindingRefOp op) {
 mlir::LogicalResult
 RuntimeBundleLowerer::lowerFunctionBindingRef(py::BindingRefOp op,
                                               mlir::func::FuncOp function) {
+  mlir::func::FuncOp targetFunction = function;
+  if (RuntimeBundleLowerer::isPrimitiveI64CallableClone(
+          op->getParentOfType<mlir::func::FuncOp>())) {
+    if (std::optional<std::string> cloneName =
+            RuntimeBundleLowerer::primitiveI64CloneFor(function.getSymName())) {
+      if (mlir::func::FuncOp clone =
+              module.lookupSymbol<mlir::func::FuncOp>(*cloneName))
+        targetFunction = clone;
+    }
+  }
+
   auto callableType = function->getAttrOfType<mlir::TypeAttr>("callable_type");
   if (!callableType)
     return op.emitError() << "runtime binding '" << op.getBinding()
@@ -834,8 +847,8 @@ RuntimeBundleLowerer::lowerFunctionBindingRef(py::BindingRefOp op,
   mlir::Type functionContract =
       runtimeContractType(context, "builtins.function");
   RuntimeBundle bundle = RuntimeBundle::object(functionContract, {});
-  bundle.functionTarget = function.getSymName().str();
-  if (mlir::failed(appendClosureValues(op, function, bundle)))
+  bundle.functionTarget = targetFunction.getSymName().str();
+  if (mlir::failed(appendClosureValues(op, targetFunction, bundle)))
     return mlir::failure();
 
   // A direct call only needs callable evidence. Emitting builtins.function here
@@ -855,12 +868,13 @@ RuntimeBundleLowerer::lowerFunctionBindingRef(py::BindingRefOp op,
 
   builder.setInsertionPoint(op);
   llvm::SmallVector<mlir::Value, 6> operands;
-  operands.push_back(
-      builder
-          .create<mlir::arith::ConstantIntOp>(
-              op.getLoc(),
-              RuntimeBundleLowerer::functionTargetId(function.getSymName()), 64)
-          .getResult());
+  operands.push_back(builder
+                         .create<mlir::arith::ConstantIntOp>(
+                             op.getLoc(),
+                             RuntimeBundleLowerer::functionTargetId(
+                                 targetFunction.getSymName()),
+                             64)
+                         .getResult());
   for (unsigned index = 0; index < 5; ++index)
     operands.push_back(
         builder.create<mlir::arith::ConstantIntOp>(op.getLoc(), 0, 64)
@@ -871,8 +885,8 @@ RuntimeBundleLowerer::lowerFunctionBindingRef(py::BindingRefOp op,
   if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
           op, functionContract, call.getResults(), bundle)))
     return mlir::failure();
-  bundle.functionTarget = function.getSymName().str();
-  if (mlir::failed(appendClosureValues(op, function, bundle)))
+  bundle.functionTarget = targetFunction.getSymName().str();
+  if (mlir::failed(appendClosureValues(op, targetFunction, bundle)))
     return mlir::failure();
   valueBundles[op.getResult()] = std::move(bundle);
   erase.push_back(op);

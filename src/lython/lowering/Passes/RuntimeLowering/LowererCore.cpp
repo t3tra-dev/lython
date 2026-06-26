@@ -19,6 +19,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerModule() {
     return mlir::failure();
   if (mlir::failed(buildCallableAggregateEvidenceABIs()))
     return mlir::failure();
+  if (mlir::failed(buildPrimitiveI64CallableClones()))
+    return mlir::failure();
   if (mlir::failed(buildReturnedCoroutineSummaries()))
     return mlir::failure();
   if (mlir::failed(buildReturnedObjectEvidenceSummaries()))

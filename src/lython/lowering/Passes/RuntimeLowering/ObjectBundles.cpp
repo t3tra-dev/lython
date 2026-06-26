@@ -33,17 +33,78 @@ RuntimeBundleLowerer::makeObjectBundle(mlir::Operation *op, mlir::Type contract,
   return mlir::success();
 }
 
+mlir::LogicalResult RuntimeBundleLowerer::makePrimitiveI64Bundle(
+    mlir::Operation *op, mlir::Type contract, mlir::Value value,
+    mlir::Value valid, RuntimeBundle &bundle) const {
+  if (runtimeContractName(contract) != "builtins.int" ||
+      !value.getType().isInteger(64) || !valid.getType().isInteger(1))
+    return op->emitError()
+           << "primitive i64 bundle requires builtins.int, i64 value, and i1 "
+              "valid flag";
+  bundle = RuntimeBundle::object(contract, mlir::ValueRange{});
+  bundle.primitiveI64 = RuntimePrimitiveI64Evidence{value, valid};
+  return mlir::success();
+}
+
 void RuntimeBundleLowerer::seedPrimitiveI64Evidence(mlir::Operation *op,
                                                     mlir::Type contract,
                                                     mlir::ValueRange rawValues,
                                                     RuntimeBundle &bundle) {
-  if (runtimeContractName(contract) != "builtins.int" || rawValues.size() != 1 ||
-      !rawValues.front().getType().isInteger(64))
+  if (runtimeContractName(contract) != "builtins.int" ||
+      rawValues.size() != 1 || !rawValues.front().getType().isInteger(64))
     return;
   mlir::Value valid =
       builder.create<mlir::arith::ConstantIntOp>(op->getLoc(), 1, 1)
           .getResult();
   bundle.primitiveI64 = RuntimePrimitiveI64Evidence{rawValues.front(), valid};
+}
+
+bool RuntimeBundleLowerer::hasLazyPrimitiveI64Object(
+    const RuntimeBundle &bundle) const {
+  return bundle.kind == RuntimeBundle::Kind::Object &&
+         bundle.contractName() == "builtins.int" &&
+         bundle.physicalValues().empty() && bundle.primitiveI64 &&
+         bundle.primitiveI64->value &&
+         bundle.primitiveI64->value.getType().isInteger(64) &&
+         bundle.primitiveI64->valid &&
+         bundle.primitiveI64->valid.getType().isInteger(1);
+}
+
+bool RuntimeBundleLowerer::canMaterializePrimitiveI64Object(
+    const RuntimeBundle &bundle) const {
+  return RuntimeBundleLowerer::hasLazyPrimitiveI64Object(bundle);
+}
+
+bool RuntimeBundleLowerer::hasPrimitiveI64Evidence(
+    const RuntimeBundle *bundle) const {
+  return bundle && bundle->kind == RuntimeBundle::Kind::Object &&
+         bundle->contractName() == "builtins.int" && bundle->primitiveI64 &&
+         bundle->primitiveI64->value &&
+         bundle->primitiveI64->value.getType().isInteger(64) &&
+         bundle->primitiveI64->valid &&
+         bundle->primitiveI64->valid.getType().isInteger(1);
+}
+
+bool RuntimeBundleLowerer::allSourcesHavePrimitiveI64Evidence(
+    llvm::ArrayRef<const RuntimeBundle *> sources) const {
+  return llvm::all_of(sources, [&](const RuntimeBundle *source) {
+    return RuntimeBundleLowerer::hasPrimitiveI64Evidence(source);
+  });
+}
+
+mlir::FailureOr<RuntimeValue>
+RuntimeBundleLowerer::materializePrimitiveI64Object(
+    mlir::Operation *op, const RuntimeBundle &bundle) {
+  if (!RuntimeBundleLowerer::canMaterializePrimitiveI64Object(bundle))
+    return op->emitError()
+           << "bundle has no materializable primitive i64 object";
+  std::optional<RuntimeSymbol> initializer =
+      manifest.initializer("builtins.int", "__new__");
+  if (!initializer)
+    return op->emitError() << "runtime manifest has no builtins.int.__new__";
+  mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+      op->getLoc(), *initializer, mlir::ValueRange{bundle.primitiveI64->value});
+  return RuntimeValue::object(bundle.objectValue.contract, call.getResults());
 }
 
 bool RuntimeBundleLowerer::objectShapeMatches(llvm::StringRef contract,
@@ -116,6 +177,14 @@ mlir::LogicalResult RuntimeBundleLowerer::bundleRawObjectValues(
            << "default argument has no concrete runtime contract";
 
   mlir::Type concreteContract = runtimeContractType(context, contractName);
+  if (contractName == "builtins.int" && values.size() == 1 &&
+      values.front().getType().isInteger(64)) {
+    mlir::Value valid =
+        builder.create<mlir::arith::ConstantIntOp>(op->getLoc(), 1, 1)
+            .getResult();
+    return RuntimeBundleLowerer::makePrimitiveI64Bundle(
+        op, concreteContract, values.front(), valid, bundle);
+  }
   if (objectShapeMatches(contractName, values))
     return RuntimeBundleLowerer::makeObjectBundle(op, concreteContract, values,
                                                   bundle);

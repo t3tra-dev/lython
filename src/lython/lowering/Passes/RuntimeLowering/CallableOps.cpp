@@ -1,5 +1,7 @@
 #include "RuntimeLowering/RuntimeLowering.h"
 
+#include "mlir/Dialect/SCF/IR/SCF.h"
+
 namespace py::runtime_lowering {
 namespace {
 
@@ -640,6 +642,20 @@ RuntimeBundleLowerer::lowerFunctionTargetCall(py::CallOp op,
     return RuntimeBundleLowerer::lowerAsyncFunctionTargetCall(
         op, target, callable.functionTarget, sources);
 
+  if (RuntimeBundleLowerer::isPrimitiveI64CallableClone(target))
+    return RuntimeBundleLowerer::lowerPrimitiveI64CloneCall(
+        op, target, callable.functionTarget, sources);
+
+  if (std::optional<std::string> cloneName =
+          RuntimeBundleLowerer::primitiveI64CloneFor(callable.functionTarget)) {
+    if (RuntimeBundleLowerer::allSourcesHavePrimitiveI64Evidence(sources)) {
+      if (mlir::func::FuncOp clone =
+              module.lookupSymbol<mlir::func::FuncOp>(*cloneName))
+        return RuntimeBundleLowerer::lowerPrimitiveI64CloneFallbackCall(
+            op, target, callable.functionTarget, clone, sources);
+    }
+  }
+
   mlir::FailureOr<mlir::func::CallOp> call =
       RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(
           op, target, callable.functionTarget, sources);
@@ -652,6 +668,142 @@ RuntimeBundleLowerer::lowerFunctionTargetCall(py::CallOp op,
     return mlir::failure();
   valueBundles[op.getResult(0)] = std::move(result);
   erase.push_back(op);
+  return mlir::success();
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::bundlePrimitiveI64CloneCallResult(
+    py::CallOp op, mlir::func::FuncOp target, mlir::func::CallOp call,
+    RuntimeBundle &result) {
+  if (call.getNumResults() != 2 || !call.getResult(0).getType().isInteger(64) ||
+      !call.getResult(1).getType().isInteger(1))
+    return op.emitError() << "primitive i64 callable clone '"
+                          << target.getSymName() << "' must return (i64, i1)";
+  return RuntimeBundleLowerer::makePrimitiveI64Bundle(
+      op, op.getResult(0).getType(), call.getResult(0), call.getResult(1),
+      result);
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64CloneCall(
+    py::CallOp op, mlir::func::FuncOp target, llvm::StringRef targetName,
+    llvm::ArrayRef<const RuntimeBundle *> sources) {
+  mlir::FailureOr<mlir::func::CallOp> call =
+      RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(op, target,
+                                                          targetName, sources);
+  if (mlir::failed(call))
+    return mlir::failure();
+
+  RuntimeBundle result;
+  if (mlir::failed(RuntimeBundleLowerer::bundlePrimitiveI64CloneCallResult(
+          op, target, *call, result)))
+    return mlir::failure();
+  valueBundles[op.getResult(0)] = std::move(result);
+  erase.push_back(op);
+  return mlir::success();
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64CloneFallbackCall(
+    py::CallOp op, mlir::func::FuncOp original, llvm::StringRef originalName,
+    mlir::func::FuncOp clone, llvm::ArrayRef<const RuntimeBundle *> sources) {
+  RuntimeBundle result;
+  if (mlir::failed(RuntimeBundleLowerer::emitPrimitiveI64CloneFallbackResult(
+          op, original, originalName, clone, sources, result)))
+    return mlir::failure();
+  valueBundles[op.getResult(0)] = std::move(result);
+  erase.push_back(op);
+  return mlir::success();
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::emitPrimitiveI64CloneFallbackResult(
+    py::CallOp op, mlir::func::FuncOp original, llvm::StringRef originalName,
+    mlir::func::FuncOp clone, llvm::ArrayRef<const RuntimeBundle *> sources,
+    RuntimeBundle &result) {
+  mlir::Type resultType = op.getResult(0).getType();
+  if (runtimeContractName(resultType).empty()) {
+    auto callableAttr =
+        original->getAttrOfType<mlir::TypeAttr>("callable_type");
+    auto callable = mlir::dyn_cast_if_present<py::CallableType>(
+        callableAttr ? callableAttr.getValue() : mlir::Type());
+    if (callable && callable.getResultTypes().size() == 1)
+      resultType = callable.getResultTypes().front();
+  }
+  if (runtimeContractName(resultType) != "builtins.int")
+    return op.emitError()
+           << "primitive i64 callable clone fallback requires builtins.int "
+              "result";
+
+  mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> objectTypes =
+      RuntimeBundleLowerer::runtimeValueTypesFor(
+          op, resultType, "primitive i64 callable clone fallback result ABI");
+  if (mlir::failed(objectTypes))
+    return mlir::failure();
+
+  mlir::FailureOr<mlir::func::CallOp> cloneCall =
+      RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(
+          op, clone, clone.getSymName(), sources);
+  if (mlir::failed(cloneCall))
+    return mlir::failure();
+  if ((*cloneCall).getNumResults() != 2 ||
+      !(*cloneCall).getResult(0).getType().isInteger(64) ||
+      !(*cloneCall).getResult(1).getType().isInteger(1))
+    return op.emitError() << "primitive i64 callable clone '"
+                          << clone.getSymName() << "' must return (i64, i1)";
+
+  context->loadDialect<mlir::scf::SCFDialect>();
+  mlir::Location loc = op.getLoc();
+  llvm::SmallVector<mlir::Type, 10> ifResultTypes;
+  ifResultTypes.append(objectTypes->begin(), objectTypes->end());
+  ifResultTypes.push_back(mlir::IntegerType::get(context, 64));
+  ifResultTypes.push_back(mlir::IntegerType::get(context, 1));
+
+  auto ifOp = builder.create<mlir::scf::IfOp>(loc, ifResultTypes,
+                                              (*cloneCall).getResult(1),
+                                              /*withElseRegion=*/true);
+
+  builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+  RuntimeBundle fastObject;
+  if (mlir::failed(RuntimeBundleLowerer::initializeObjectFromRawValues(
+          op, resultType, mlir::ValueRange{(*cloneCall).getResult(0)},
+          fastObject)))
+    return mlir::failure();
+  llvm::SmallVector<mlir::Value, 10> fastYield(
+      fastObject.physicalValues().begin(), fastObject.physicalValues().end());
+  if (fastYield.size() != objectTypes->size())
+    return op.emitError() << "primitive i64 clone fast path produced "
+                          << fastYield.size() << " object values, expected "
+                          << objectTypes->size();
+  fastYield.push_back((*cloneCall).getResult(0));
+  fastYield.push_back((*cloneCall).getResult(1));
+  builder.create<mlir::scf::YieldOp>(loc, fastYield);
+
+  builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
+  mlir::FailureOr<mlir::func::CallOp> fallbackCall =
+      RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(
+          op, original, originalName, sources);
+  if (mlir::failed(fallbackCall))
+    return mlir::failure();
+  if ((*fallbackCall).getNumResults() != ifResultTypes.size())
+    return op.emitError() << "primitive i64 clone fallback call returned "
+                          << (*fallbackCall).getNumResults()
+                          << " values, expected " << ifResultTypes.size();
+  for (auto [index, value] : llvm::enumerate((*fallbackCall).getResults())) {
+    if (value.getType() != ifResultTypes[index])
+      return op.emitError()
+             << "primitive i64 clone fallback result " << index << " has type "
+             << value.getType() << ", expected " << ifResultTypes[index];
+  }
+  builder.create<mlir::scf::YieldOp>(loc, (*fallbackCall).getResults());
+
+  builder.setInsertionPointAfter(ifOp);
+  llvm::SmallVector<mlir::Value, 8> objectValues;
+  for (unsigned index = 0, end = static_cast<unsigned>(objectTypes->size());
+       index < end; ++index)
+    objectValues.push_back(ifOp.getResult(index));
+  if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
+          op, resultType, objectValues, result)))
+    return mlir::failure();
+  result.primitiveI64 =
+      RuntimePrimitiveI64Evidence{ifOp.getResult(objectTypes->size()),
+                                  ifOp.getResult(objectTypes->size() + 1)};
   return mlir::success();
 }
 
@@ -682,6 +834,34 @@ RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(
             callableAttr.getValue()))
       logicalInputTypes =
           RuntimeBundleLowerer::callableLogicalInputTypes(target, callable);
+  }
+
+  if (RuntimeBundleLowerer::isPrimitiveI64CallableClone(target)) {
+    if (sources.size() != logicalInputTypes.size())
+      return op.emitError() << "primitive i64 callable clone '" << targetName
+                            << "' expects " << logicalInputTypes.size()
+                            << " arguments, got " << sources.size();
+    llvm::SmallVector<mlir::Value, 8> operands;
+    unsigned inputIndex = 0;
+    for (auto [sourceIndex, source] : llvm::enumerate(sources)) {
+      if (!RuntimeBundleLowerer::hasPrimitiveI64Evidence(source))
+        return op.emitError() << "primitive i64 callable clone '" << targetName
+                              << "' argument " << sourceIndex
+                              << " has no primitive i64 evidence";
+      if (inputIndex + 2 > functionType.getNumInputs() ||
+          !functionType.getInput(inputIndex).isInteger(64) ||
+          !functionType.getInput(inputIndex + 1).isInteger(1))
+        return op.emitError() << "primitive i64 callable clone '" << targetName
+                              << "' has malformed ABI at input " << inputIndex;
+      operands.push_back(source->primitiveI64->value);
+      operands.push_back(source->primitiveI64->valid);
+      inputIndex += 2;
+    }
+    if (inputIndex != functionType.getNumInputs())
+      return op.emitError() << "primitive i64 callable clone '" << targetName
+                            << "' ABI was not fully populated";
+    return RuntimeBundleLowerer::createRuntimeCall(op.getLoc(), targetSymbol,
+                                                   operands);
   }
 
   llvm::SmallVector<mlir::Value, 8> operands;
@@ -751,9 +931,8 @@ mlir::LogicalResult RuntimeBundleLowerer::bundleFunctionTargetCallResult(
       return op.emitError()
              << "function target '" << targetName << "' returned no "
              << "primitive i64 evidence for " << label;
-    bundle.primitiveI64 =
-        RuntimePrimitiveI64Evidence{call.getResult(resultIndex),
-                                    call.getResult(resultIndex + 1)};
+    bundle.primitiveI64 = RuntimePrimitiveI64Evidence{
+        call.getResult(resultIndex), call.getResult(resultIndex + 1)};
     resultIndex += 2;
     return mlir::success();
   };
@@ -763,8 +942,8 @@ mlir::LogicalResult RuntimeBundleLowerer::bundleFunctionTargetCallResult(
   if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
           op, expectedResult, objectValues, result)))
     return mlir::failure();
-  if (mlir::failed(consumePrimitiveI64Evidence(expectedResult, result,
-                                              "result object")))
+  if (mlir::failed(
+          consumePrimitiveI64Evidence(expectedResult, result, "result object")))
     return mlir::failure();
 
   if (returnedCoroutine != returnedCoroutineSummaries.end()) {
@@ -796,8 +975,8 @@ mlir::LogicalResult RuntimeBundleLowerer::bundleFunctionTargetCallResult(
       if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
               op, sourceType, sourceValues, sourceBundle)))
         return mlir::failure();
-      if (mlir::failed(consumePrimitiveI64Evidence(
-              sourceType, sourceBundle, "coroutine frame source")))
+      if (mlir::failed(consumePrimitiveI64Evidence(sourceType, sourceBundle,
+                                                   "coroutine frame source")))
         return mlir::failure();
       result.coroutineSources.push_back(sourceBundle.objectValue);
     }

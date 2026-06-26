@@ -80,9 +80,8 @@ private:
   appendRuntimeValueTypes(mlir::Operation *op, mlir::Type type,
                           llvm::SmallVectorImpl<mlir::Type> &types) const;
   bool hasPrimitiveI64ABI(mlir::Type type) const;
-  void appendPrimitiveI64EvidenceTypes(mlir::Type type,
-                                       llvm::SmallVectorImpl<mlir::Type> &types)
-      const;
+  void appendPrimitiveI64EvidenceTypes(
+      mlir::Type type, llvm::SmallVectorImpl<mlir::Type> &types) const;
   mlir::LogicalResult appendPrimitiveI64EvidenceOperand(
       mlir::Operation *op, mlir::FunctionType functionType,
       unsigned &inputIndex, const RuntimeBundle &source,
@@ -104,7 +103,13 @@ private:
   mlir::LogicalResult buildCallableProtocolArgumentABIs();
   mlir::LogicalResult buildCallableArgumentEvidenceABIs();
   mlir::LogicalResult buildCallableAggregateEvidenceABIs();
+  mlir::LogicalResult buildPrimitiveI64CallableClones();
   mlir::LogicalResult prepareCallableFunctionABIs();
+  bool isPrimitiveI64CallableClone(mlir::func::FuncOp function) const;
+  bool isPrimitiveI64CallableEligible(mlir::func::FuncOp function) const;
+  std::optional<std::string> primitiveI64CloneFor(llvm::StringRef target) const;
+  mlir::LogicalResult seedPrimitiveI64CallableEntryArgumentBundles(
+      mlir::func::FuncOp function, mlir::ArrayRef<mlir::Type> logicalTypes);
   mlir::LogicalResult seedCallableEntryArgumentBundles(
       mlir::func::FuncOp function, mlir::ArrayRef<mlir::Type> logicalTypes,
       mlir::ArrayRef<mlir::Type> abiTypes,
@@ -115,9 +120,22 @@ private:
   mlir::LogicalResult makeObjectBundle(mlir::Operation *op, mlir::Type contract,
                                        mlir::ValueRange values,
                                        RuntimeBundle &bundle) const;
+  mlir::LogicalResult makePrimitiveI64Bundle(mlir::Operation *op,
+                                             mlir::Type contract,
+                                             mlir::Value value,
+                                             mlir::Value valid,
+                                             RuntimeBundle &bundle) const;
   void seedPrimitiveI64Evidence(mlir::Operation *op, mlir::Type contract,
                                 mlir::ValueRange rawValues,
                                 RuntimeBundle &bundle);
+  bool hasLazyPrimitiveI64Object(const RuntimeBundle &bundle) const;
+  bool canMaterializePrimitiveI64Object(const RuntimeBundle &bundle) const;
+  bool hasPrimitiveI64Evidence(const RuntimeBundle *bundle) const;
+  bool allSourcesHavePrimitiveI64Evidence(
+      llvm::ArrayRef<const RuntimeBundle *> sources) const;
+  mlir::FailureOr<RuntimeValue>
+  materializePrimitiveI64Object(mlir::Operation *op,
+                                const RuntimeBundle &bundle);
   bool objectShapeMatches(llvm::StringRef contract,
                           mlir::ValueRange values) const;
   bool isBuiltinsObjectHeaderType(mlir::Type type) const;
@@ -248,10 +266,11 @@ private:
                                             llvm::StringRef label) const;
   mlir::LogicalResult verifySelectedRuntimeTarget(mlir::Operation *op,
                                                   RuntimeSymbol &symbol);
-  mlir::FailureOr<RuntimeSymbol> selectManifestMethod(
-      mlir::Operation *op, const RuntimeBundle &receiver,
-      llvm::StringRef methodName, llvm::ArrayRef<const RuntimeBundle *> sources,
-      bool allowUnusedSources);
+  mlir::FailureOr<RuntimeSymbol>
+  selectManifestMethod(mlir::Operation *op, const RuntimeBundle &receiver,
+                       llvm::StringRef methodName,
+                       llvm::ArrayRef<const RuntimeBundle *> sources,
+                       bool allowUnusedSources);
   mlir::LogicalResult emitManifestMethodCall(
       mlir::Operation *op, const RuntimeBundle &receiver,
       llvm::StringRef methodName, llvm::ArrayRef<const RuntimeBundle *> sources,
@@ -314,6 +333,17 @@ private:
   mlir::LogicalResult lowerFunctionTargetCall(py::CallOp op,
                                               const RuntimeBundle &callable);
   mlir::LogicalResult
+  lowerPrimitiveI64CloneCall(py::CallOp op, mlir::func::FuncOp target,
+                             llvm::StringRef targetName,
+                             llvm::ArrayRef<const RuntimeBundle *> sources);
+  mlir::LogicalResult lowerPrimitiveI64CloneFallbackCall(
+      py::CallOp op, mlir::func::FuncOp original, llvm::StringRef originalName,
+      mlir::func::FuncOp clone, llvm::ArrayRef<const RuntimeBundle *> sources);
+  mlir::LogicalResult emitPrimitiveI64CloneFallbackResult(
+      py::CallOp op, mlir::func::FuncOp original, llvm::StringRef originalName,
+      mlir::func::FuncOp clone, llvm::ArrayRef<const RuntimeBundle *> sources,
+      RuntimeBundle &result);
+  mlir::LogicalResult
   lowerIndirectFunctionObjectCall(py::CallOp op, const RuntimeBundle &callable);
   llvm::SmallVector<mlir::func::FuncOp, 8>
   collectIndirectCallableTargets(py::CallOp op, const RuntimeBundle &callable);
@@ -347,6 +377,10 @@ private:
       py::CallOp op, mlir::func::FuncOp target, llvm::StringRef targetName,
       mlir::func::CallOp call, llvm::ArrayRef<const RuntimeBundle *> sources,
       RuntimeBundle &result);
+  mlir::LogicalResult
+  bundlePrimitiveI64CloneCallResult(py::CallOp op, mlir::func::FuncOp target,
+                                    mlir::func::CallOp call,
+                                    RuntimeBundle &result);
   mlir::LogicalResult
   lowerAsyncFunctionTargetCall(py::CallOp op, mlir::func::FuncOp target,
                                llvm::StringRef targetName,
@@ -504,6 +538,7 @@ private:
       callableProtocolArgumentABIs;
   llvm::StringMap<CallableArgumentEvidenceABI> callableArgumentEvidenceABIs;
   llvm::StringMap<CallableAggregateEvidenceABI> callableAggregateEvidenceABIs;
+  llvm::StringMap<std::string> primitiveI64CallableClones;
   llvm::StringMap<std::int64_t> functionTargetIds;
   llvm::DenseMap<mlir::Block *, std::int64_t> tryHandlerIds;
   llvm::SmallVector<CallableLogicalEntryArgs, 8> callableLogicalEntryArgCounts;

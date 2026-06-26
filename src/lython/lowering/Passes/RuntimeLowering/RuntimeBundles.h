@@ -126,6 +126,12 @@ struct CallableLogicalEntryArgs {
   unsigned count = 0;
 };
 
+// Primitive callable clones are derived from the Callable contract and use the
+// lyrt.prim-shaped value/evidence pair directly. They are not separate Python
+// object types.
+inline constexpr llvm::StringLiteral kPrimitiveI64CloneAttr{
+    "ly.primitive_i64_clone"};
+
 struct ControlFlowLogicalBlockArgumentABI {
   mlir::BlockArgument argument;
 };

@@ -205,6 +205,104 @@ RuntimeBundleLowerer::callableLogicalInputTypes(
   return logicalInputTypes;
 }
 
+bool RuntimeBundleLowerer::isPrimitiveI64CallableClone(
+    mlir::func::FuncOp function) const {
+  return function && function->hasAttr(kPrimitiveI64CloneAttr);
+}
+
+std::optional<std::string>
+RuntimeBundleLowerer::primitiveI64CloneFor(llvm::StringRef target) const {
+  auto found = primitiveI64CallableClones.find(target);
+  if (found == primitiveI64CallableClones.end())
+    return std::nullopt;
+  return found->second;
+}
+
+bool RuntimeBundleLowerer::isPrimitiveI64CallableEligible(
+    mlir::func::FuncOp function) const {
+  if (!function || function.isDeclaration() ||
+      RuntimeBundleLowerer::isPrimitiveI64CallableClone(function))
+    return false;
+  if (!RuntimeBundleLowerer::callableClosureTypes(function).empty())
+    return false;
+
+  auto callableAttr = function->getAttrOfType<mlir::TypeAttr>("callable_type");
+  auto callable = mlir::dyn_cast_if_present<py::CallableType>(
+      callableAttr ? callableAttr.getValue() : mlir::Type());
+  if (!callable || callable.getResultTypes().size() != 1 ||
+      callable.hasVararg() || callable.hasKwarg() ||
+      !callable.getKwOnlyTypes().empty() ||
+      llvm::any_of(callable.getPositionalDefaults(),
+                   [](mlir::BoolAttr attr) { return attr && attr.getValue(); }))
+    return false;
+  if (runtimeContractName(callable.getResultTypes().front()) != "builtins.int")
+    return false;
+  return llvm::all_of(callable.getPositionalTypes(), [](mlir::Type type) {
+    return runtimeContractName(type) == "builtins.int";
+  });
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::buildPrimitiveI64CallableClones() {
+  llvm::SmallVector<mlir::func::FuncOp, 8> originals;
+  module.walk([&](mlir::func::FuncOp function) {
+    if (RuntimeBundleLowerer::isPrimitiveI64CallableEligible(function))
+      originals.push_back(function);
+  });
+
+  for (mlir::func::FuncOp original : originals) {
+    std::string originalName = original.getSymName().str();
+    std::string cloneName = (original.getSymName() + "__lyrt_prim_i64").str();
+    if (module.lookupSymbol<mlir::func::FuncOp>(cloneName)) {
+      primitiveI64CallableClones[originalName] = cloneName;
+      continue;
+    }
+
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointAfter(original);
+    mlir::func::FuncOp clone = original.clone();
+    clone.setSymName(cloneName);
+    clone->setAttr(kPrimitiveI64CloneAttr,
+                   builder.getStringAttr(original.getSymName()));
+    mlir::SymbolTable::setSymbolVisibility(
+        clone, mlir::SymbolTable::Visibility::Private);
+    builder.insert(clone);
+    primitiveI64CallableClones[originalName] = cloneName;
+  }
+  return mlir::success();
+}
+
+mlir::LogicalResult
+RuntimeBundleLowerer::seedPrimitiveI64CallableEntryArgumentBundles(
+    mlir::func::FuncOp function, mlir::ArrayRef<mlir::Type> logicalTypes) {
+  if (function.isDeclaration())
+    return mlir::success();
+  mlir::Block &entry = function.getBody().front();
+  if (entry.getNumArguments() != logicalTypes.size())
+    return function.emitError()
+           << "primitive i64 callable clone entry argument count does not "
+              "match callable_type";
+
+  unsigned logicalArgCount = entry.getNumArguments();
+  for (auto [index, logicalType] : llvm::enumerate(logicalTypes)) {
+    if (runtimeContractName(logicalType) != "builtins.int")
+      return function.emitError()
+             << "primitive i64 callable clone argument " << index
+             << " must be builtins.int, got " << logicalType;
+    mlir::BlockArgument logicalArg = entry.getArgument(index);
+    mlir::BlockArgument raw = entry.addArgument(
+        mlir::IntegerType::get(context, 64), logicalArg.getLoc());
+    mlir::BlockArgument valid = entry.addArgument(
+        mlir::IntegerType::get(context, 1), logicalArg.getLoc());
+
+    RuntimeBundle bundle = RuntimeBundle::object(logicalType, {});
+    bundle.primitiveI64 = RuntimePrimitiveI64Evidence{raw, valid};
+    valueBundles[logicalArg] = std::move(bundle);
+  }
+  callableLogicalEntryArgCounts.push_back(
+      CallableLogicalEntryArgs{function, logicalArgCount});
+  return mlir::success();
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::buildCallableProtocolArgumentABIs() {
   struct Accumulator {
     llvm::SmallVector<mlir::Type, 8> concreteTypes;
@@ -292,6 +390,40 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
     }
     llvm::SmallVector<mlir::Type, 8> logicalInputTypes =
         callableLogicalInputTypes(function, callable);
+    if (RuntimeBundleLowerer::isPrimitiveI64CallableClone(function)) {
+      llvm::SmallVector<mlir::Type, 8> inputTypes;
+      for (mlir::Type logicalType : logicalInputTypes) {
+        if (runtimeContractName(logicalType) != "builtins.int") {
+          function.emitError()
+              << "primitive i64 callable clone parameter must be builtins.int";
+          result = mlir::failure();
+          return mlir::WalkResult::interrupt();
+        }
+        RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(logicalType,
+                                                              inputTypes);
+      }
+      if (callable.getResultTypes().size() != 1 ||
+          runtimeContractName(callable.getResultTypes().front()) !=
+              "builtins.int") {
+        function.emitError()
+            << "primitive i64 callable clone result must be builtins.int";
+        result = mlir::failure();
+        return mlir::WalkResult::interrupt();
+      }
+      llvm::SmallVector<mlir::Type, 2> resultTypes;
+      RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(
+          callable.getResultTypes().front(), resultTypes);
+      if (!function.isDeclaration() &&
+          mlir::failed(seedPrimitiveI64CallableEntryArgumentBundles(
+              function, logicalInputTypes))) {
+        result = mlir::failure();
+        return mlir::WalkResult::interrupt();
+      }
+      function.setFunctionType(
+          mlir::FunctionType::get(context, inputTypes, resultTypes));
+      return mlir::WalkResult::advance();
+    }
+
     llvm::SmallVector<mlir::Type, 8> abiInputTypes = logicalInputTypes;
     auto protocolEvidence =
         callableProtocolArgumentABIs.find(function.getSymName());
@@ -462,7 +594,7 @@ mlir::LogicalResult RuntimeBundleLowerer::seedCallableEntryArgumentBundles(
             function, abiType, physicalArgs, bundle)))
       return mlir::failure();
     if (mlir::failed(seedHiddenPrimitiveI64Evidence(abiType, bundle,
-                                                   logicalArg.getLoc())))
+                                                    logicalArg.getLoc())))
       return mlir::failure();
     valueBundles[logicalArg] = std::move(bundle);
   }
@@ -483,8 +615,8 @@ mlir::LogicalResult RuntimeBundleLowerer::seedCallableEntryArgumentBundles(
     if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
             function, logicalType, physicalArgs, bundle)))
       return mlir::failure();
-    if (mlir::failed(seedHiddenPrimitiveI64Evidence(
-            logicalType, bundle, function.getLoc())))
+    if (mlir::failed(seedHiddenPrimitiveI64Evidence(logicalType, bundle,
+                                                    function.getLoc())))
       return mlir::failure();
     return bundle.objectValue;
   };

@@ -107,6 +107,54 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
     unsigned resultIndex = 0;
     unsigned logicalResultIndex = 0;
     builder.setInsertionPoint(op);
+    if (RuntimeBundleLowerer::isPrimitiveI64CallableClone(function)) {
+      for (mlir::Value operand : op.getOperands()) {
+        if (mlir::failed(
+                RuntimeBundleLowerer::ensureValueBundle(op, operand))) {
+          result = mlir::failure();
+          return mlir::WalkResult::interrupt();
+        }
+        const RuntimeBundle *bundle = RuntimeBundleLowerer::bundleFor(operand);
+        if (!bundle || bundle->kind != RuntimeBundle::Kind::Object ||
+            bundle->contractName() != "builtins.int") {
+          op.emitError()
+              << "primitive i64 callable clone return needs builtins.int";
+          result = mlir::failure();
+          return mlir::WalkResult::interrupt();
+        }
+        if (resultIndex + 2 > functionType.getNumResults() ||
+            !functionType.getResult(resultIndex).isInteger(64) ||
+            !functionType.getResult(resultIndex + 1).isInteger(1)) {
+          op.emitError()
+              << "primitive i64 callable clone has malformed return ABI";
+          result = mlir::failure();
+          return mlir::WalkResult::interrupt();
+        }
+        if (bundle->primitiveI64) {
+          operands.push_back(bundle->primitiveI64->value);
+          operands.push_back(bundle->primitiveI64->valid);
+        } else {
+          operands.push_back(
+              builder.create<mlir::arith::ConstantIntOp>(op.getLoc(), 0, 64)
+                  .getResult());
+          operands.push_back(
+              builder.create<mlir::arith::ConstantIntOp>(op.getLoc(), 0, 1)
+                  .getResult());
+        }
+        resultIndex += 2;
+      }
+      if (resultIndex != functionType.getNumResults()) {
+        op.emitError() << "primitive i64 callable clone return ABI expected "
+                       << functionType.getNumResults()
+                       << " physical values, but lowering produced "
+                       << resultIndex;
+        result = mlir::failure();
+        return mlir::WalkResult::interrupt();
+      }
+      builder.create<mlir::func::ReturnOp>(op.getLoc(), operands);
+      erase.push_back(op);
+      return mlir::WalkResult::advance();
+    }
     auto appendPrimitiveReturnEvidence =
         [&](const RuntimeBundle &bundle) -> mlir::LogicalResult {
       if (bundle.contractName() != "builtins.int" ||
@@ -132,6 +180,16 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
         [&](const RuntimeBundle &bundle,
             llvm::StringRef label) -> mlir::LogicalResult {
       llvm::ArrayRef<mlir::Value> values = bundle.physicalValues();
+      std::optional<RuntimeValue> materializedObject;
+      if (values.empty() &&
+          RuntimeBundleLowerer::hasLazyPrimitiveI64Object(bundle)) {
+        mlir::FailureOr<RuntimeValue> value =
+            RuntimeBundleLowerer::materializePrimitiveI64Object(op, bundle);
+        if (mlir::failed(value))
+          return mlir::failure();
+        materializedObject = std::move(*value);
+        values = materializedObject->values;
+      }
       if (resultIndex + values.size() <= functionType.getNumResults()) {
         bool exact = true;
         for (auto [offset, value] : llvm::enumerate(values)) {
@@ -150,8 +208,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
       if (resultIndex < functionType.getNumResults() &&
           bundle.kind == RuntimeBundle::Kind::Object &&
           isBuiltinsObjectHeaderType(functionType.getResult(resultIndex))) {
+        const RuntimeValue &objectValue =
+            materializedObject ? *materializedObject : bundle.objectValue;
         mlir::FailureOr<mlir::Value> header =
-            RuntimeBundleLowerer::objectHeaderView(op, bundle.objectValue);
+            RuntimeBundleLowerer::objectHeaderView(op, objectValue);
         if (mlir::failed(header))
           return mlir::failure();
         operands.push_back(*header);
