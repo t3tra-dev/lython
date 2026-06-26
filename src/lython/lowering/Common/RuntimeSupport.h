@@ -18,17 +18,7 @@ namespace py {
 
 class PyLLVMTypeConverter;
 
-enum class AsyncArgProvenanceKind { RuntimeHandle, ExceptionCell };
-
-struct AsyncArgProvenanceContract {
-  std::string function;
-  unsigned argumentIndex = 0;
-  AsyncArgProvenanceKind kind = AsyncArgProvenanceKind::RuntimeHandle;
-};
-
-struct LoweredSafetyContracts {
-  llvm::SmallVector<AsyncArgProvenanceContract, 8> asyncArgs;
-};
+struct LoweredSafetyContracts {};
 
 struct PythonCallSiteRange {
   std::string caller;
@@ -40,16 +30,6 @@ struct PythonCallSiteRange {
   std::int32_t endLine = 0;
   std::int32_t endColumn = 0;
 };
-
-void collectAsyncArgProvenanceContracts(
-    mlir::ModuleOp module,
-    llvm::SmallVectorImpl<AsyncArgProvenanceContract> &contracts);
-void collectAsyncArgProvenanceContracts(
-    mlir::ModuleOp module, const PyLLVMTypeConverter &typeConverter,
-    llvm::SmallVectorImpl<AsyncArgProvenanceContract> &contracts);
-mlir::LogicalResult preserveLLVMAsyncArgProvenanceContracts(
-    mlir::ModuleOp module,
-    llvm::ArrayRef<AsyncArgProvenanceContract> contracts);
 
 void collectLoweredSafetyContracts(mlir::ModuleOp module,
                                    LoweredSafetyContracts &contracts);
@@ -97,7 +77,7 @@ createLLVMThreadSafetyVerifierPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createNativeVerificationPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createAsyncRuntimeRewritePass();
+createAsyncThunkLoweringPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createLinalgLoweringPass();
 
 } // namespace py

@@ -78,7 +78,7 @@ callableSignatureShape(CallableType callable, std::size_t firstParameter = 0) {
   shape.positionalNames.resize(shape.positional.size());
   for (std::size_t index = 0; index < shape.positional.size(); ++index) {
     std::size_t fullIndex = index + firstParameter;
-    if (fullIndex < positionalNames.size())
+    if (fullIndex < positionalNames.size() && positionalNames[fullIndex])
       shape.positionalNames[index] =
           positionalNames[fullIndex].getValue().str();
   }
@@ -96,7 +96,7 @@ callableSignatureShape(CallableType callable, std::size_t firstParameter = 0) {
   shape.kwonlyNames.resize(shape.kwonly.size());
   llvm::ArrayRef<mlir::StringAttr> kwonlyNames = callable.getKwOnlyNames();
   for (std::size_t index = 0; index < shape.kwonly.size(); ++index)
-    if (index < kwonlyNames.size())
+    if (index < kwonlyNames.size() && kwonlyNames[index])
       shape.kwonlyNames[index] = kwonlyNames[index].getValue().str();
 
   shape.kwonlyDefaults.resize(shape.kwonly.size(), 0);
@@ -129,6 +129,13 @@ inline void applyCallableApplicationShapeOptions(
 
 inline lython::callable::VarargShape<mlir::Type>
 callableVarargShape(mlir::Type varargType) {
+  if (auto unpack = mlir::dyn_cast_if_present<UnpackType>(varargType)) {
+    mlir::Type packed = unpack.getPackedType();
+    if (mlir::isa<TypeVarTupleType>(packed))
+      return lython::callable::VarargShape<mlir::Type>::repeatedOf(
+          ObjectType::get(varargType.getContext()));
+    return callableVarargShape(packed);
+  }
   if (auto pack = mlir::dyn_cast_if_present<CallableType>(varargType)) {
     if (!pack.getPositionalTypes().empty() && !pack.hasVararg())
       return lython::callable::VarargShape<mlir::Type>::exactOf(
@@ -136,6 +143,15 @@ callableVarargShape(mlir::Type varargType) {
     if (pack.hasVararg())
       return callableVarargShape(pack.getVarargType());
     return lython::callable::VarargShape<mlir::Type>::exactOf({});
+  }
+  if (auto contract = mlir::dyn_cast_if_present<ContractType>(varargType)) {
+    if (contract.getContractName() == "builtins.tuple") {
+      llvm::ArrayRef<mlir::Type> arguments = contract.getArguments();
+      if (arguments.size() == 1)
+        return lython::callable::VarargShape<mlir::Type>::repeatedOf(
+            arguments.front());
+      return lython::callable::VarargShape<mlir::Type>::exactOf(arguments);
+    }
   }
   auto tuple = mlir::dyn_cast_if_present<TupleType>(varargType);
   if (!tuple)
@@ -153,7 +169,8 @@ inline std::optional<mlir::Type> callableKwargValueType(mlir::Type kwargType) {
     if (!pack.getPositionalNames().empty())
       valueTypes.append(pack.getPositionalTypes().begin(),
                         pack.getPositionalTypes().end());
-    valueTypes.append(pack.getKwOnlyTypes().begin(), pack.getKwOnlyTypes().end());
+    valueTypes.append(pack.getKwOnlyTypes().begin(),
+                      pack.getKwOnlyTypes().end());
     if (pack.hasKwarg()) {
       std::optional<mlir::Type> fallback =
           callableKwargValueType(pack.getKwargType());
@@ -165,6 +182,17 @@ inline std::optional<mlir::Type> callableKwargValueType(mlir::Type kwargType) {
       return ObjectType::get(kwargType.getContext());
     return UnionType::getNormalized(kwargType.getContext(), valueTypes);
   }
+  if (auto contract = mlir::dyn_cast_if_present<ContractType>(kwargType)) {
+    if (contract.getContractName() == "builtins.dict") {
+      llvm::ArrayRef<mlir::Type> arguments = contract.getArguments();
+      if (arguments.size() < 2)
+        return ObjectType::get(kwargType.getContext());
+      auto key = mlir::dyn_cast_if_present<ContractType>(arguments.front());
+      if (!key || key.getContractName() != "builtins.str")
+        return std::nullopt;
+      return arguments[1];
+    }
+  }
   auto dict = mlir::dyn_cast_if_present<DictType>(kwargType);
   if (!dict)
     return kwargType;
@@ -175,6 +203,16 @@ inline std::optional<mlir::Type> callableKwargValueType(mlir::Type kwargType) {
 
 inline std::optional<mlir::Type>
 callableUnpackedKeywordValueType(mlir::Type mappingType) {
+  if (auto contract = mlir::dyn_cast_if_present<ContractType>(mappingType)) {
+    if (contract.getContractName() == "builtins.dict") {
+      llvm::ArrayRef<mlir::Type> arguments = contract.getArguments();
+      if (arguments.size() >= 2) {
+        auto key = mlir::dyn_cast_if_present<ContractType>(arguments.front());
+        if (key && key.getContractName() == "builtins.str")
+          return arguments[1];
+      }
+    }
+  }
   auto dict = mlir::dyn_cast_if_present<DictType>(mappingType);
   if (dict && mlir::isa<StrType>(dict.getKeyType()))
     return dict.getValueType();

@@ -20,7 +20,10 @@ struct FunctionSignature {
   llvm::SmallVector<mlir::Type, 4> kwOnlyTypes;
   llvm::SmallVector<bool, 8> positionalDefaults;
   llvm::SmallVector<bool, 4> kwOnlyDefaults;
+  // Runtime-local type of the `args` variable. For `*args: Unpack[Ts]` this is
+  // a tuple object; the Callable contract tail is kept separately below.
   mlir::Type varargType;
+  mlir::Type callableVarargType;
   mlir::Type kwargType;
   std::optional<std::string> varargName;
   std::optional<std::string> kwargName;
@@ -93,8 +96,12 @@ public:
   Scope pushScope() const;
   void bindSymbol(llvm::StringRef name, mlir::Type type);
   std::optional<mlir::Type> lookupSymbol(llvm::StringRef name) const;
+  std::optional<std::string> lookupCanonicalBinding(llvm::StringRef name) const;
   void bindClass(llvm::StringRef name, mlir::Type instanceType);
   std::optional<mlir::Type> lookupClass(llvm::StringRef name) const;
+  bool bindImportedModule(llvm::StringRef module, llvm::StringRef localName);
+  bool bindImportedName(llvm::StringRef module, llvm::StringRef exportedName,
+                        llvm::StringRef localName);
 
   mlir::Type annotationType(const parser::Node *node) const;
   mlir::Type inferExpr(const parser::Node *node) const;
@@ -109,6 +116,10 @@ public:
   mlir::Type inferCall(mlir::Type calleeType,
                        mlir::ArrayRef<mlir::Type> positional,
                        mlir::ArrayRef<CallKeywordType> keywords) const;
+  mlir::Type
+  inferClassInstantiation(mlir::Type instanceType,
+                          mlir::ArrayRef<mlir::Type> positional,
+                          mlir::ArrayRef<CallKeywordType> keywords) const;
   mlir::Type join(mlir::ArrayRef<mlir::Type> types) const;
   mlir::Type widenLiteral(mlir::Type type) const;
 
@@ -121,10 +132,16 @@ public:
 private:
   void popScope() const;
   void bindLocalSymbol(llvm::StringRef name, mlir::Type type) const;
+  void bindCanonicalSymbol(llvm::StringRef name, llvm::StringRef canonical,
+                           mlir::Type type);
+  void bindAnnotationAlias(llvm::StringRef name, llvm::StringRef target);
+  std::string resolveAnnotationName(llvm::StringRef name) const;
 
   mlir::MLIRContext &context;
   llvm::StringMap<mlir::Type> symbols;
   llvm::StringMap<mlir::Type> classes;
+  llvm::StringMap<std::string> canonicalBindings;
+  llvm::StringMap<std::string> annotationAliases;
   mutable llvm::SmallVector<llvm::StringMap<mlir::Type>, 8> scopes;
 };
 

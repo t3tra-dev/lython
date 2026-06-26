@@ -114,9 +114,14 @@ static llvm::StringRef builtinExceptionBase(llvm::StringRef name) {
   if (name == "Exception")
     return "BaseException";
   if (name == "RuntimeError" || name == "TypeError" || name == "ValueError" ||
-      name == "KeyError" || name == "IndexError" || name == "AssertionError" ||
-      name == "StopIteration" || name == "StopAsyncIteration")
+      name == "ArithmeticError" || name == "LookupError" ||
+      name == "AssertionError" || name == "StopIteration" ||
+      name == "StopAsyncIteration")
     return "Exception";
+  if (name == "ZeroDivisionError")
+    return "ArithmeticError";
+  if (name == "KeyError" || name == "IndexError")
+    return "LookupError";
   return {};
 }
 
@@ -137,6 +142,28 @@ static bool isContractSubclassOf(ContractType subtype, ContractType supertype) {
     return true;
   return isBuiltinExceptionSubclassOf(subtype.getContractName(),
                                       supertype.getContractName());
+}
+
+static bool isIntegerLiteralSpelling(llvm::StringRef spelling) {
+  if (spelling.empty())
+    return false;
+  if (spelling.front() == '-')
+    spelling = spelling.drop_front();
+  return !spelling.empty() &&
+         llvm::all_of(spelling, [](char ch) { return ch >= '0' && ch <= '9'; });
+}
+
+static std::optional<llvm::StringRef> literalContractName(LiteralType literal) {
+  llvm::StringRef spelling = literal.getSpelling();
+  if (spelling == "True" || spelling == "False")
+    return llvm::StringRef("builtins.bool");
+  if (spelling == "None")
+    return llvm::StringRef("types.NoneType");
+  if (spelling.starts_with("\"") && spelling.ends_with("\""))
+    return llvm::StringRef("builtins.str");
+  if (isIntegerLiteralSpelling(spelling))
+    return llvm::StringRef("builtins.int");
+  return std::nullopt;
 }
 
 //===----------------------------------------------------------------------===//
@@ -185,6 +212,21 @@ ParamSpecType ParamSpecType::get(mlir::MLIRContext *ctx,
 ::llvm::StringRef ParamSpecType::getName() const {
   return getImpl()->className;
 }
+
+TypeVarTupleType TypeVarTupleType::get(mlir::MLIRContext *ctx,
+                                       ::llvm::StringRef name) {
+  return Base::get(ctx, name);
+}
+
+::llvm::StringRef TypeVarTupleType::getName() const {
+  return getImpl()->className;
+}
+
+UnpackType UnpackType::get(mlir::MLIRContext *ctx, mlir::Type packedType) {
+  return Base::get(ctx, packedType);
+}
+
+mlir::Type UnpackType::getPackedType() const { return getImpl()->valueType; }
 
 //===----------------------------------------------------------------------===//
 // Composite types
@@ -534,10 +576,10 @@ bool isPyProtocolType(mlir::Type type) {
 bool isPyContractType(mlir::Type type) {
   return llvm::TypeSwitch<mlir::Type, bool>(type)
       .Case<ContractType, ProtocolType, CallableType, UnionType, LiteralType,
-            TypeType, SelfType, TypeVarType, ParamSpecType, ClassType, IntType,
-            FloatType, BoolType, StrType, NoneType, ObjectType, TupleType,
-            DictType, ListType, ExceptionType, TracebackType>(
-          [](auto) { return true; })
+            TypeType, SelfType, TypeVarType, ParamSpecType, TypeVarTupleType,
+            UnpackType, ClassType, IntType, FloatType, BoolType, StrType,
+            NoneType, ObjectType, TupleType, DictType, ListType, ExceptionType,
+            TracebackType>([](auto) { return true; })
       .Default([](mlir::Type) { return false; });
 }
 
@@ -550,6 +592,12 @@ bool isPyTypeVarType(mlir::Type type) { return mlir::isa<TypeVarType>(type); }
 bool isPyParamSpecType(mlir::Type type) {
   return mlir::isa<ParamSpecType>(type);
 }
+
+bool isPyTypeVarTupleType(mlir::Type type) {
+  return mlir::isa<TypeVarTupleType>(type);
+}
+
+bool isPyUnpackType(mlir::Type type) { return mlir::isa<UnpackType>(type); }
 
 bool isPyExceptionType(mlir::Type type) {
   return mlir::isa<ExceptionType>(type);
@@ -581,16 +629,18 @@ bool isPyType(mlir::Type type) {
   return llvm::TypeSwitch<mlir::Type, bool>(type)
       .Case<IntType, FloatType, BoolType, StrType, NoneType, ObjectType,
             TupleType, DictType, ListType, IteratorStateType, ClassType,
-            ContractType, LiteralType, TypeVarType, ParamSpecType, TypeType,
-            ProtocolType, SelfType, CallableType, ExceptionType,
-            ExceptionCellType, TracebackType, LocationType, UnionType,
-            OverloadType>([](auto) { return true; })
+            ContractType, LiteralType, TypeVarType, ParamSpecType,
+            TypeVarTupleType, UnpackType, TypeType, ProtocolType, SelfType,
+            CallableType, ExceptionType, ExceptionCellType, TracebackType,
+            LocationType, UnionType, OverloadType>([](auto) { return true; })
       .Default([](mlir::Type) { return false; });
 }
 
 bool isStaticTypeParameter(mlir::Type type) {
-  if (mlir::isa<SelfType, TypeVarType, ParamSpecType>(type))
+  if (mlir::isa<SelfType, TypeVarType, ParamSpecType, TypeVarTupleType>(type))
     return true;
+  if (auto unpack = mlir::dyn_cast<UnpackType>(type))
+    return isStaticTypeParameter(unpack.getPackedType());
   if (auto contract = mlir::dyn_cast_if_present<ContractType>(type))
     return contract.getContractName().starts_with("$");
   auto classType = mlir::dyn_cast_if_present<ClassType>(type);
@@ -608,6 +658,10 @@ mlir::Type eraseStaticTypeParameters(mlir::Type type) {
     return type;
 
   mlir::MLIRContext *context = type.getContext();
+  if (auto unpack = mlir::dyn_cast<UnpackType>(type))
+    return UnpackType::get(context,
+                           eraseStaticTypeParameters(unpack.getPackedType()));
+
   if (isStaticTypeParameter(type))
     return ObjectType::get(context);
 
@@ -723,6 +777,17 @@ protocolDescriptorArguments(mlir::Type type, llvm::StringRef protocolName) {
           protocol.getProtocolName().str(),
           llvm::SmallVector<mlir::Type, 3>(protocol.getArguments().begin(),
                                            protocol.getArguments().end())};
+    }
+    if (auto literal = mlir::dyn_cast<LiteralType>(source)) {
+      if (std::optional<llvm::StringRef> contract =
+              literalContractName(literal)) {
+        llvm::StringRef name = *contract;
+        if (name.consume_front("builtins."))
+          return DescriptorRoot{name.str(), {}};
+        if (name.consume_front("types."))
+          return DescriptorRoot{name.str(), {}};
+        return DescriptorRoot{contract->str(), {}};
+      }
     }
     if (auto contract = mlir::dyn_cast<ContractType>(source)) {
       llvm::SmallVector<mlir::Type, 3> arguments(
@@ -1055,9 +1120,9 @@ bool isSubtypeOfImpl(mlir::Type subtype, mlir::Type supertype,
   if (mlir::isa<SelfType>(subtype))
     return bindSelfType(supertype, context);
 
-  if (mlir::isa<TypeVarType, ParamSpecType>(supertype))
+  if (mlir::isa<TypeVarType, ParamSpecType, TypeVarTupleType>(supertype))
     return bindSelfType(subtype, context);
-  if (mlir::isa<TypeVarType, ParamSpecType>(subtype))
+  if (mlir::isa<TypeVarType, ParamSpecType, TypeVarTupleType>(subtype))
     return bindSelfType(supertype, context);
 
   auto subtypeContract = mlir::dyn_cast<ContractType>(subtype);
@@ -1066,6 +1131,15 @@ bool isSubtypeOfImpl(mlir::Type subtype, mlir::Type supertype,
       (supertypeContract.getContractName() == "typing.Any" ||
        supertypeContract.getContractName() == "builtins.object"))
     return isPyType(subtype);
+  if (auto subtypeLiteral = mlir::dyn_cast<LiteralType>(subtype)) {
+    if (supertypeContract) {
+      std::optional<llvm::StringRef> literalContract =
+          literalContractName(subtypeLiteral);
+      if (literalContract &&
+          *literalContract == supertypeContract.getContractName())
+        return true;
+    }
+  }
   if (subtypeContract && supertypeContract) {
     if (!isContractSubclassOf(subtypeContract, supertypeContract))
       return false;

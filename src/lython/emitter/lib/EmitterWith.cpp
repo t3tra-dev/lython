@@ -1,0 +1,90 @@
+#include "EmitterCore.h"
+
+#include "AstAccess.h"
+
+#include "mlir/Bytecode/BytecodeOpInterface.h"
+#include "mlir/IR/Block.h"
+#include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/OpDefinition.h"
+#include "mlir/Interfaces/InferTypeOpInterface.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "llvm/ADT/STLExtras.h"
+
+#include "PyDialect.h.inc"
+#define GET_OP_CLASSES
+#include "PyOps.h.inc"
+#undef GET_OP_CLASSES
+
+namespace lython::emitter {
+
+void ModuleEmitter::emitWith(const parser::Node &statement, bool async) {
+  std::size_t cleanupStart = activeWithCleanups.size();
+  if (const auto *items = ast::nodeList(statement, "items")) {
+    for (const parser::NodePtr &item : *items) {
+      Value contextValue = emitExpr(ast::node(*item, "context_expr"));
+      CallInferenceResult enterInference = types.inferMethodCallWithEvidence(
+          contextValue.type, async ? "__aenter__" : "__enter__", {});
+      mlir::Type enterType =
+          enterInference ? enterInference.resultType : types.object();
+      Value entered;
+      if (async) {
+        auto enter = builder.create<py::AEnterOp>(
+            loc(*item), enterType, "__aenter__",
+            callProtocolFor(enterInference), contextValue.value,
+            mlir::UnitAttr());
+        entered = emitAwaitValue(*item, Value{enter.getResult(), enterType});
+      } else {
+        auto enter = builder.create<py::EnterOp>(
+            loc(*item), enterType, "__enter__", callProtocolFor(enterInference),
+            contextValue.value, mlir::UnitAttr());
+        entered = Value{enter.getResult(), enterType};
+      }
+      if (const parser::Node *optional = ast::node(*item, "optional_vars"))
+        emitAssignTarget(*optional, entered);
+      activeWithCleanups.push_back(WithCleanup{contextValue, async});
+    }
+  }
+  emitStatements(ast::nodeList(statement, "body"));
+
+  mlir::Block *block = builder.getInsertionBlock();
+  bool terminated = block && !block->empty() &&
+                    block->back().hasTrait<mlir::OpTrait::IsTerminator>();
+  if (!terminated) {
+    for (std::size_t index = activeWithCleanups.size(); index > cleanupStart;
+         --index)
+      emitWithCleanup(statement, activeWithCleanups[index - 1]);
+  }
+  activeWithCleanups.resize(cleanupStart);
+}
+
+void ModuleEmitter::emitWithCleanup(const parser::Node &anchor,
+                                    const WithCleanup &cleanup) {
+  auto noneOp = builder.create<py::NoneOp>(loc(anchor), types.none());
+  Value none{noneOp.getResult(), types.none()};
+  if (cleanup.async) {
+    CallInferenceResult exitInference = types.inferMethodCallWithEvidence(
+        cleanup.manager.type, "__aexit__", {none.type, none.type, none.type});
+    mlir::Type exitType =
+        exitInference ? exitInference.resultType : types.object();
+    auto exit = builder.create<py::AExitOp>(
+        loc(anchor), exitType, "__aexit__", callProtocolFor(exitInference),
+        cleanup.manager.value, none.value, none.value, none.value,
+        mlir::UnitAttr());
+    (void)emitAwaitValue(anchor, Value{exit.getResult(), exitType});
+    return;
+  }
+
+  CallInferenceResult exitInference = types.inferMethodCallWithEvidence(
+      cleanup.manager.type, "__exit__", {none.type, none.type, none.type});
+  builder.create<py::ExitOp>(loc(anchor), types.boolType(), "__exit__",
+                             callProtocolFor(exitInference),
+                             cleanup.manager.value, none.value, none.value,
+                             none.value, mlir::UnitAttr());
+}
+
+void ModuleEmitter::emitActiveCleanups(const parser::Node &anchor) {
+  for (const WithCleanup &cleanup : llvm::reverse(activeWithCleanups))
+    emitWithCleanup(anchor, cleanup);
+}
+
+} // namespace lython::emitter

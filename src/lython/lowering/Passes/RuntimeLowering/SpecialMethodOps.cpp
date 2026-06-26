@@ -57,43 +57,20 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerLen(py::LenOp op) {
       op, op.getInput(), op.getResult(), "len input", *methodName);
 }
 
-mlir::LogicalResult RuntimeBundleLowerer::lowerGetItem(py::GetItemOp op) {
-  const RuntimeBundle *container =
-      RuntimeBundleLowerer::bundleFor(op.getContainer());
-  const RuntimeBundle *index = RuntimeBundleLowerer::bundleFor(op.getIndex());
-  if (!container || !index)
-    return op.emitError() << "getitem operands need runtime bundles";
-
-  llvm::SmallVector<const RuntimeBundle *, 2> sources{container, index};
-  mlir::FailureOr<llvm::StringRef> methodName =
-      RuntimeBundleLowerer::requireMethodTarget(op, op.getTargetAttr(),
-                                                "__getitem__");
-  if (mlir::failed(methodName))
-    return mlir::failure();
-  if (mlir::failed(lowerManifestMethodResult(
-          op, op.getResult(), *container, *methodName, sources,
-          /*allowUnusedSources=*/false,
-          /*preferManifestObjectResult=*/true)))
-    return mlir::failure();
-  erase.push_back(op);
-  return mlir::success();
-}
-
 mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
-  const RuntimeBundle *container =
-      RuntimeBundleLowerer::bundleFor(op.getContainer());
-  const RuntimeBundle *index = RuntimeBundleLowerer::bundleFor(op.getIndex());
-  const RuntimeBundle *value = RuntimeBundleLowerer::bundleFor(op.getValue());
-  if (!container || !index || !value)
-    return op.emitError() << "setitem operands need runtime bundles";
-
-  llvm::SmallVector<const RuntimeBundle *, 3> sources{container, index, value};
+  llvm::SmallVector<mlir::Value, 3> inputs{op.getContainer(), op.getIndex(),
+                                           op.getValue()};
+  llvm::SmallVector<const RuntimeBundle *, 3> sources;
+  if (mlir::failed(collectObjectSources(
+          op, inputs, "setitem operands need runtime bundles", sources)))
+    return mlir::failure();
   mlir::FailureOr<llvm::StringRef> methodName =
       RuntimeBundleLowerer::requireMethodTarget(op, op.getTargetAttr(),
                                                 "__setitem__");
   if (mlir::failed(methodName))
     return mlir::failure();
-  if (mlir::failed(lowerManifestVoidMethod(op, *container, *methodName, sources,
+  if (mlir::failed(lowerManifestVoidMethod(op, *sources.front(), *methodName,
+                                           sources,
                                            /*allowUnusedSources=*/false)))
     return mlir::failure();
   erase.push_back(op);
@@ -101,19 +78,18 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::lowerDelItem(py::DelItemOp op) {
-  const RuntimeBundle *container =
-      RuntimeBundleLowerer::bundleFor(op.getContainer());
-  const RuntimeBundle *index = RuntimeBundleLowerer::bundleFor(op.getIndex());
-  if (!container || !index)
-    return op.emitError() << "delitem operands need runtime bundles";
-
-  llvm::SmallVector<const RuntimeBundle *, 2> sources{container, index};
+  llvm::SmallVector<mlir::Value, 2> inputs{op.getContainer(), op.getIndex()};
+  llvm::SmallVector<const RuntimeBundle *, 2> sources;
+  if (mlir::failed(collectObjectSources(
+          op, inputs, "delitem operands need runtime bundles", sources)))
+    return mlir::failure();
   mlir::FailureOr<llvm::StringRef> methodName =
       RuntimeBundleLowerer::requireMethodTarget(op, op.getTargetAttr(),
                                                 "__delitem__");
   if (mlir::failed(methodName))
     return mlir::failure();
-  if (mlir::failed(lowerManifestVoidMethod(op, *container, *methodName, sources,
+  if (mlir::failed(lowerManifestVoidMethod(op, *sources.front(), *methodName,
+                                           sources,
                                            /*allowUnusedSources=*/false)))
     return mlir::failure();
   erase.push_back(op);
@@ -121,27 +97,28 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerDelItem(py::DelItemOp op) {
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::lowerContains(py::ContainsOp op) {
-  const RuntimeBundle *container =
-      RuntimeBundleLowerer::bundleFor(op.getContainer());
-  const RuntimeBundle *item = RuntimeBundleLowerer::bundleFor(op.getItem());
-  if (!container || !item)
-    return op.emitError() << "contains operands need runtime bundles";
-
-  llvm::SmallVector<const RuntimeBundle *, 2> sources{container, item};
+  llvm::SmallVector<mlir::Value, 2> inputs{op.getContainer(), op.getItem()};
+  llvm::SmallVector<const RuntimeBundle *, 2> sources;
+  if (mlir::failed(collectObjectSources(
+          op, inputs, "contains operands need runtime bundles", sources)))
+    return mlir::failure();
   mlir::FailureOr<llvm::StringRef> methodName =
       RuntimeBundleLowerer::requireMethodTarget(op, op.getTargetAttr(),
                                                 "__contains__");
   if (mlir::failed(methodName))
     return mlir::failure();
-  if (mlir::failed(lowerManifestI1MethodResult(op, op.getResult(), *container,
-                                               *methodName, sources,
-                                               /*allowUnusedSources=*/false)))
+  if (mlir::failed(lowerManifestI1MethodResult(
+          op, op.getResult(), *sources.front(), *methodName, sources,
+          /*allowUnusedSources=*/false)))
     return mlir::failure();
   erase.push_back(op);
   return mlir::success();
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::lowerIter(py::IterOp op) {
+  if (op.getReturnedSelf())
+    return RuntimeBundleLowerer::lowerAliasView(op, op.getIterable(),
+                                                op.getResult());
   mlir::FailureOr<llvm::StringRef> methodName =
       RuntimeBundleLowerer::requireMethodTarget(op, op.getTargetAttr(),
                                                 "__iter__");
@@ -231,26 +208,19 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerEnter(py::EnterOp op) {
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::lowerExit(py::ExitOp op) {
-  const RuntimeBundle *manager =
-      RuntimeBundleLowerer::bundleFor(op.getManager());
-  const RuntimeBundle *excType =
-      RuntimeBundleLowerer::bundleFor(op.getExcType());
-  const RuntimeBundle *excValue =
-      RuntimeBundleLowerer::bundleFor(op.getExcValue());
-  const RuntimeBundle *traceback =
-      RuntimeBundleLowerer::bundleFor(op.getTraceback());
-  if (!manager || !excType || !excValue || !traceback)
-    return op.emitError() << "exit operands need runtime bundles";
-
-  llvm::SmallVector<const RuntimeBundle *, 4> sources{manager, excType,
-                                                      excValue, traceback};
+  llvm::SmallVector<mlir::Value, 4> inputs{op.getManager(), op.getExcType(),
+                                           op.getExcValue(), op.getTraceback()};
+  llvm::SmallVector<const RuntimeBundle *, 4> sources;
+  if (mlir::failed(collectObjectSources(
+          op, inputs, "exit operands need runtime bundles", sources)))
+    return mlir::failure();
   mlir::FailureOr<llvm::StringRef> methodName =
       RuntimeBundleLowerer::requireMethodTarget(op, op.getTargetAttr(),
                                                 "__exit__");
   if (mlir::failed(methodName))
     return mlir::failure();
   if (mlir::failed(lowerManifestMethodResult(
-          op, op.getResult(), *manager, *methodName, sources,
+          op, op.getResult(), *sources.front(), *methodName, sources,
           /*allowUnusedSources=*/true,
           /*preferManifestObjectResult=*/true)))
     return mlir::failure();
@@ -270,26 +240,19 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAEnter(py::AEnterOp op) {
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::lowerAExit(py::AExitOp op) {
-  const RuntimeBundle *manager =
-      RuntimeBundleLowerer::bundleFor(op.getManager());
-  const RuntimeBundle *excType =
-      RuntimeBundleLowerer::bundleFor(op.getExcType());
-  const RuntimeBundle *excValue =
-      RuntimeBundleLowerer::bundleFor(op.getExcValue());
-  const RuntimeBundle *traceback =
-      RuntimeBundleLowerer::bundleFor(op.getTraceback());
-  if (!manager || !excType || !excValue || !traceback)
-    return op.emitError() << "aexit operands need runtime bundles";
-
-  llvm::SmallVector<const RuntimeBundle *, 4> sources{manager, excType,
-                                                      excValue, traceback};
+  llvm::SmallVector<mlir::Value, 4> inputs{op.getManager(), op.getExcType(),
+                                           op.getExcValue(), op.getTraceback()};
+  llvm::SmallVector<const RuntimeBundle *, 4> sources;
+  if (mlir::failed(collectObjectSources(
+          op, inputs, "aexit operands need runtime bundles", sources)))
+    return mlir::failure();
   mlir::FailureOr<llvm::StringRef> methodName =
       RuntimeBundleLowerer::requireMethodTarget(op, op.getTargetAttr(),
                                                 "__aexit__");
   if (mlir::failed(methodName))
     return mlir::failure();
   if (mlir::failed(lowerManifestMethodResult(
-          op, op.getResult(), *manager, *methodName, sources,
+          op, op.getResult(), *sources.front(), *methodName, sources,
           /*allowUnusedSources=*/true,
           /*preferManifestObjectResult=*/true)))
     return mlir::failure();
@@ -298,6 +261,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAExit(py::AExitOp op) {
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::lowerAIter(py::AIterOp op) {
+  if (op.getReturnedSelf())
+    return RuntimeBundleLowerer::lowerAliasView(op, op.getAsyncIterable(),
+                                                op.getResult());
   mlir::FailureOr<llvm::StringRef> methodName =
       RuntimeBundleLowerer::requireMethodTarget(op, op.getTargetAttr(),
                                                 "__aiter__");
@@ -325,13 +291,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerRound(py::RoundOp op) {
     return op.emitError() << "round requires at least a receiver input";
 
   llvm::SmallVector<const RuntimeBundle *, 2> sources;
-  sources.reserve(op.getInputs().size());
-  for (mlir::Value input : op.getInputs()) {
-    const RuntimeBundle *bundle = RuntimeBundleLowerer::bundleFor(input);
-    if (!bundle)
-      return op.emitError() << "round input has no lowered runtime bundle";
-    sources.push_back(bundle);
-  }
+  if (mlir::failed(collectObjectSources(
+          op, op.getInputs(), "round input has no lowered runtime bundle",
+          sources)))
+    return mlir::failure();
 
   mlir::FailureOr<llvm::StringRef> methodName =
       RuntimeBundleLowerer::requireMethodTarget(op, op.getTargetAttr(),
@@ -351,6 +314,20 @@ mlir::LogicalResult
 RuntimeBundleLowerer::lowerUnarySpecial(mlir::Operation *op, mlir::Value input,
                                         llvm::StringRef methodName,
                                         mlir::Value resultValue) {
+  if (methodName == "__repr__") {
+    const RuntimeBundle *inputBundle = RuntimeBundleLowerer::bundleFor(input);
+    if (!inputBundle)
+      return op->emitError() << "repr operand has no lowered runtime bundle";
+    if (RuntimeBundleLowerer::needsDefaultObjectRepr(*inputBundle)) {
+      RuntimeBundle result;
+      if (mlir::failed(RuntimeBundleLowerer::materializeDefaultObjectRepr(
+              op, *inputBundle, result)))
+        return mlir::failure();
+      valueBundles[resultValue] = std::move(result);
+      erase.push_back(op);
+      return mlir::success();
+    }
+  }
   return RuntimeBundleLowerer::lowerReceiverMethodResult(
       op, input, resultValue, "unary special method operand", methodName,
       /*preferManifestObjectResult=*/true);

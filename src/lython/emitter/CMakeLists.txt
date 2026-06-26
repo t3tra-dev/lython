@@ -1,6 +1,7 @@
 add_library(LythonEmitter STATIC
     lib/ClosureAnalysis.cpp
     lib/EmitterCore.cpp
+    lib/EmitterWith.cpp
     lib/Emitter.cpp
     lib/TypeSystem.cpp
 )

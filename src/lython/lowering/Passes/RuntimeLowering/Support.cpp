@@ -45,6 +45,40 @@ std::string runtimeContractName(mlir::Type type) {
   return "";
 }
 
+std::string runtimeShapeContractName(mlir::Type type) {
+  std::string contract = runtimeContractName(type);
+  if (!contract.empty())
+    return contract;
+
+  // Structural protocol values are erased Python objects at the ABI boundary.
+  // The protocol remains the logical contract carried in RuntimeBundle; only
+  // the physical lane shape is borrowed from builtins.object.
+  if (mlir::isa<py::ProtocolType>(type))
+    return "builtins.object";
+
+  return "";
+}
+
+bool compatibleRuntimeObjectEvidenceContract(mlir::Type resultType,
+                                             mlir::Type evidenceType) {
+  std::string resultContract = runtimeContractName(resultType);
+  std::string evidenceContract = runtimeContractName(evidenceType);
+  if (!resultContract.empty() && !evidenceContract.empty())
+    return resultContract == evidenceContract;
+
+  std::string resultShape = runtimeShapeContractName(resultType);
+  std::string evidenceShape = runtimeShapeContractName(evidenceType);
+  if (resultShape.empty() || evidenceShape.empty())
+    return false;
+  if (resultShape == evidenceShape)
+    return true;
+
+  // Protocol-typed values are object-erased at ABI boundaries. The concrete
+  // evidence still belongs to the object returned from the function and may be
+  // carried through the hidden evidence ABI.
+  return resultShape == "builtins.object" || evidenceShape == "builtins.object";
+}
+
 mlir::Type runtimeContractType(mlir::MLIRContext *context,
                                llvm::StringRef contract) {
   return py::ContractType::get(context, contract);

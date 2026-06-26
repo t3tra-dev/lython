@@ -1,6 +1,10 @@
 #include "abi.h"
+#include "traceback.h"
 
 #include <cstdlib>
+
+extern "C" void *__cxa_begin_catch(void *);
+extern "C" void __cxa_end_catch();
 
 namespace {
 
@@ -16,15 +20,66 @@ struct LyEHSignal {};
 
 struct CurrentException {
   CurrentExceptionKind kind = CurrentExceptionKind::None;
+  bool nativeCatchActive = false;
   LyExceptionPartsDescriptor parts;
 };
 
 thread_local CurrentException g_current_exception;
 
+void validateExceptionHeaderDescriptor(const LyI64Descriptor &header);
+
+std::int64_t exceptionBaseClassId(std::int64_t classId) {
+  switch (classId) {
+  case 50:     // Exception
+    return 5;  // BaseException
+  case 62:     // asyncio.CancelledError
+    return 5;  // BaseException
+  case 51:     // RuntimeError
+  case 52:     // TypeError
+  case 53:     // ValueError
+  case 56:     // AssertionError
+  case 57:     // StopIteration
+  case 58:     // StopAsyncIteration
+  case 59:     // ArithmeticError
+  case 60:     // LookupError
+    return 50; // Exception
+  case 54:     // KeyError
+  case 55:     // IndexError
+    return 60; // LookupError
+  case 61:     // ZeroDivisionError
+    return 59; // ArithmeticError
+  default:
+    return 0;
+  }
+}
+
+std::int64_t exceptionClassId(const LyExceptionPartsDescriptor &descriptor) {
+  constexpr std::int64_t kClassSlot = 2;
+  validateExceptionHeaderDescriptor(descriptor.header);
+  return descriptor.header.aligned[kClassSlot];
+}
+
+bool classIdMatches(std::int64_t exceptionClassId,
+                    std::int64_t handlerClassId) {
+  while (exceptionClassId != 0) {
+    if (exceptionClassId == handlerClassId)
+      return true;
+    exceptionClassId = exceptionBaseClassId(exceptionClassId);
+  }
+  return false;
+}
+
 void releaseCurrentException() {
   if (g_current_exception.kind == CurrentExceptionKind::None)
     return;
   std::abort();
+}
+
+void endNativeCatchIfActive() {
+  if (!g_current_exception.nativeCatchActive)
+    return;
+  __cxa_end_catch();
+  g_current_exception.nativeCatchActive = false;
 }
 
 void validateObjectHeaderDescriptor(const LyI64Descriptor &header) {
@@ -78,9 +133,22 @@ bool takeCurrentPartsDescriptor(LyExceptionPartsDescriptor *descriptor) {
       g_current_exception.kind != CurrentExceptionKind::MemRefParts)
     return false;
 
+  endNativeCatchIfActive();
   *descriptor = g_current_exception.parts;
   g_current_exception = {};
   return true;
+}
+
+std::int64_t currentExceptionClassId() {
+  if (g_current_exception.kind != CurrentExceptionKind::MemRefParts)
+    return 0;
+  return exceptionClassId(g_current_exception.parts);
+}
+
+void discardCurrentException() {
+  endNativeCatchIfActive();
+  g_current_exception = {};
+  LyTraceback_Clear();
 }
 
 } // namespace
@@ -105,9 +173,40 @@ void LyEH_ThrowException(
   throw LyEHSignal{};
 }
 
+void LyEH_BeginCatch(void *exception_object) {
+  if (!exception_object ||
+      g_current_exception.kind != CurrentExceptionKind::MemRefParts)
+    std::abort();
+  __cxa_begin_catch(exception_object);
+  g_current_exception.nativeCatchActive = true;
+}
+
+bool LyEH_ClassIdMatches(std::int64_t exception_class_id,
+                         std::int64_t handler_class_id) {
+  return classIdMatches(exception_class_id, handler_class_id);
+}
+
+std::int64_t LyEH_CurrentExceptionClassId() {
+  return currentExceptionClassId();
+}
+
+bool LyEH_CurrentExceptionMatches(std::int64_t handler_class_id) {
+  return classIdMatches(currentExceptionClassId(), handler_class_id);
+}
+
+bool LyEH_DiscardCurrentExceptionIfMatches(std::int64_t handler_class_id) {
+  if (!LyEH_CurrentExceptionMatches(handler_class_id))
+    return false;
+  discardCurrentException();
+  return true;
+}
+
+void LyEH_DiscardCurrentException() { discardCurrentException(); }
+
 void LyEH_RethrowCurrent() {
   if (g_current_exception.kind == CurrentExceptionKind::None)
     std::abort();
+  endNativeCatchIfActive();
   throw LyEHSignal{};
 }
 

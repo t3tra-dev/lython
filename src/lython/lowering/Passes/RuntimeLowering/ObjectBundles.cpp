@@ -1,0 +1,226 @@
+#include "RuntimeLowering/RuntimeLowering.h"
+
+namespace py::runtime_lowering {
+
+mlir::LogicalResult RuntimeBundleLowerer::validateObjectShape(
+    mlir::Operation *op, mlir::Type contract, mlir::ValueRange values) const {
+  mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> expectedTypes =
+      RuntimeBundleLowerer::runtimeValueTypesFor(op, contract,
+                                                 "runtime bundle");
+  if (mlir::failed(expectedTypes))
+    return mlir::failure();
+  if (expectedTypes->size() != values.size())
+    return op->emitError() << "runtime bundle for " << contract << " has "
+                           << values.size() << " values, but ABI expects "
+                           << expectedTypes->size();
+  for (auto [index, value] : llvm::enumerate(values)) {
+    mlir::Type expected = (*expectedTypes)[index];
+    if (value.getType() != expected)
+      return op->emitError() << "runtime bundle value " << index << " for "
+                             << contract << " has type " << value.getType()
+                             << ", but ABI expects " << expected;
+  }
+  return mlir::success();
+}
+
+mlir::LogicalResult
+RuntimeBundleLowerer::makeObjectBundle(mlir::Operation *op, mlir::Type contract,
+                                       mlir::ValueRange values,
+                                       RuntimeBundle &bundle) const {
+  if (mlir::failed(validateObjectShape(op, contract, values)))
+    return mlir::failure();
+  bundle = RuntimeBundle::object(contract, values);
+  return mlir::success();
+}
+
+void RuntimeBundleLowerer::seedPrimitiveI64Evidence(mlir::Operation *op,
+                                                    mlir::Type contract,
+                                                    mlir::ValueRange rawValues,
+                                                    RuntimeBundle &bundle) {
+  if (runtimeContractName(contract) != "builtins.int" || rawValues.size() != 1 ||
+      !rawValues.front().getType().isInteger(64))
+    return;
+  mlir::Value valid =
+      builder.create<mlir::arith::ConstantIntOp>(op->getLoc(), 1, 1)
+          .getResult();
+  bundle.primitiveI64 = RuntimePrimitiveI64Evidence{rawValues.front(), valid};
+}
+
+bool RuntimeBundleLowerer::objectShapeMatches(llvm::StringRef contract,
+                                              mlir::ValueRange values) const {
+  const RuntimeValueShape *shape = manifest.valueShape(contract);
+  if (!shape)
+    return false;
+  if (shape->valueTypes.size() != values.size())
+    return false;
+  for (auto [index, value] : llvm::enumerate(values))
+    if (value.getType() != shape->valueTypes[index])
+      return false;
+  return true;
+}
+
+bool RuntimeBundleLowerer::rawValuesMatchRuntimeInputs(
+    const RuntimeSymbol &symbol, mlir::ValueRange values) const {
+  mlir::func::FuncOp function = symbol.function;
+  mlir::FunctionType functionType = function.getFunctionType();
+  if (functionType.getNumInputs() != values.size())
+    return false;
+  for (auto [index, value] : llvm::enumerate(values))
+    if (value.getType() != functionType.getInput(index))
+      return false;
+  return true;
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::initializeObjectFromRawValues(
+    mlir::Operation *op, mlir::Type contract, mlir::ValueRange values,
+    RuntimeBundle &bundle, bool emitErrors) {
+  std::string contractName = runtimeContractName(contract);
+  if (contractName.empty()) {
+    if (emitErrors)
+      return op->emitError()
+             << "runtime initializer target has no concrete contract";
+    return mlir::failure();
+  }
+
+  std::optional<RuntimeSymbol> initializer =
+      manifest.initializer(contractName, "__new__");
+  if (!initializer) {
+    if (emitErrors)
+      return op->emitError()
+             << "runtime manifest has no " << contractName << ".__new__";
+    return mlir::failure();
+  }
+  if (!rawValuesMatchRuntimeInputs(*initializer, values)) {
+    if (emitErrors)
+      return op->emitError() << "runtime initializer " << contractName
+                             << ".__new__ cannot accept raw input values "
+                             << describeValueTypes(values);
+    return mlir::failure();
+  }
+
+  mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+      op->getLoc(), *initializer, values);
+  if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+          op, contract, call.getResults(), bundle)))
+    return mlir::failure();
+  RuntimeBundleLowerer::seedPrimitiveI64Evidence(op, contract, values, bundle);
+  return mlir::success();
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::bundleRawObjectValues(
+    mlir::Operation *op, mlir::Type contract, mlir::ValueRange values,
+    RuntimeBundle &bundle) {
+  std::string contractName = runtimeContractName(contract);
+  if (contractName.empty())
+    return op->emitError()
+           << "default argument has no concrete runtime contract";
+
+  mlir::Type concreteContract = runtimeContractType(context, contractName);
+  if (objectShapeMatches(contractName, values))
+    return RuntimeBundleLowerer::makeObjectBundle(op, concreteContract, values,
+                                                  bundle);
+  if (mlir::succeeded(initializeObjectFromRawValues(
+          op, concreteContract, values, bundle, /*emitErrors=*/false)))
+    return mlir::success();
+  return RuntimeBundleLowerer::makeObjectBundle(op, concreteContract, values,
+                                                bundle);
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultValue(
+    mlir::Operation *op, mlir::Type parameterType, mlir::Attribute attr,
+    RuntimeBundle &bundle) {
+  auto dict = mlir::dyn_cast_or_null<mlir::DictionaryAttr>(attr);
+  if (!dict)
+    return op->emitError() << "callable default value metadata is malformed";
+  auto kind = dict.getAs<mlir::StringAttr>("kind");
+  if (!kind)
+    return op->emitError() << "callable default value has no kind";
+
+  mlir::Location loc = op->getLoc();
+  llvm::StringRef spelling = kind.getValue();
+  if (spelling == "none")
+    return RuntimeBundleLowerer::bundleRawObjectValues(
+        op, parameterType, mlir::ValueRange{}, bundle);
+  if (spelling == "bool") {
+    auto value = dict.getAs<mlir::BoolAttr>("value");
+    if (!value)
+      return op->emitError() << "bool default value has no payload";
+    mlir::Value bit =
+        builder.create<mlir::arith::ConstantIntOp>(loc, value.getValue(), 1)
+            .getResult();
+    return RuntimeBundleLowerer::bundleRawObjectValues(op, parameterType, bit,
+                                                       bundle);
+  }
+  if (spelling == "int") {
+    auto value = dict.getAs<mlir::StringAttr>("value");
+    if (!value)
+      return op->emitError() << "int default value has no payload";
+    std::int64_t parsed = 0;
+    if (value.getValue().getAsInteger(10, parsed))
+      return op->emitError()
+             << "integer default value is outside the lowered i64 path";
+    mlir::Value integer =
+        builder.create<mlir::arith::ConstantIntOp>(loc, parsed, 64).getResult();
+    return RuntimeBundleLowerer::bundleRawObjectValues(op, parameterType,
+                                                       integer, bundle);
+  }
+  if (spelling == "float") {
+    auto value = dict.getAs<mlir::FloatAttr>("value");
+    if (!value)
+      return op->emitError() << "float default value has no payload";
+    mlir::Value number = builder
+                             .create<mlir::arith::ConstantFloatOp>(
+                                 loc, value.getValue(), builder.getF64Type())
+                             .getResult();
+    return RuntimeBundleLowerer::bundleRawObjectValues(op, parameterType,
+                                                       number, bundle);
+  }
+  if (spelling == "str") {
+    auto value = dict.getAs<mlir::StringAttr>("value");
+    if (!value)
+      return op->emitError() << "str default value has no payload";
+    mlir::Value bytes =
+        RuntimeBundleLowerer::materializeByteBuffer(loc, value.getValue());
+    mlir::Value start =
+        builder.create<mlir::arith::ConstantIndexOp>(loc, 0).getResult();
+    mlir::Value length =
+        builder
+            .create<mlir::arith::ConstantIntOp>(
+                loc, static_cast<std::int64_t>(value.getValue().size()), 64)
+            .getResult();
+    return RuntimeBundleLowerer::bundleRawObjectValues(
+        op, parameterType, mlir::ValueRange{bytes, start, length}, bundle);
+  }
+  if (spelling == "unsupported") {
+    auto value = dict.getAs<mlir::StringAttr>("value");
+    if (value)
+      return op->emitError()
+             << "unsupported callable default expression " << value;
+    return op->emitError() << "unsupported callable default expression";
+  }
+  return op->emitError() << "unknown callable default value kind '" << spelling
+                         << "'";
+}
+
+mlir::LogicalResult
+RuntimeBundleLowerer::assignObjectBundle(mlir::Operation *op, mlir::Value value,
+                                         mlir::Type contract,
+                                         mlir::ValueRange values) {
+  RuntimeBundle bundle;
+  if (mlir::failed(makeObjectBundle(op, contract, values, bundle)))
+    return mlir::failure();
+  valueBundles[value] = std::move(bundle);
+  return mlir::success();
+}
+
+mlir::FailureOr<llvm::StringRef>
+RuntimeBundleLowerer::requireMethodTarget(mlir::Operation *op,
+                                          mlir::FlatSymbolRefAttr target,
+                                          llvm::StringRef expectedName) const {
+  if (target)
+    return target.getValue();
+  return op->emitError() << "resolved special-method op for " << expectedName
+                         << " has no manifest method target";
+}
+
+} // namespace py::runtime_lowering

@@ -79,6 +79,13 @@ void LyEH_ThrowException(
     std::uint8_t *message_bytes_allocated, std::uint8_t *message_bytes_aligned,
     std::int64_t message_bytes_offset, std::int64_t message_bytes_size,
     std::int64_t message_bytes_stride);
+void LyEH_BeginCatch(void *exception_object);
+bool LyEH_ClassIdMatches(std::int64_t exception_class_id,
+                         std::int64_t handler_class_id);
+std::int64_t LyEH_CurrentExceptionClassId();
+bool LyEH_CurrentExceptionMatches(std::int64_t handler_class_id);
+bool LyEH_DiscardCurrentExceptionIfMatches(std::int64_t handler_class_id);
+void LyEH_DiscardCurrentException();
 void LyEH_RethrowCurrent();
 bool LyEH_TakeCurrentDescriptor(LyExceptionPartsDescriptor *descriptor);
 }

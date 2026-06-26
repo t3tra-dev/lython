@@ -28,7 +28,8 @@ def Py_Dialect : Dialect {
 //
 //   1. contract algebra terms that cannot be recovered from structural class
 //      contracts alone (`!py.protocol`, `!py.union`, `!py.literal`,
-//      `!py.type`, `!py.self`, `!py.typevar`, `!py.paramspec`);
+//      `!py.type`, `!py.self`, `!py.typevar`, `!py.paramspec`,
+//      `!py.typevartuple`, `!py.unpack`);
 //   2. non-Python compiler payloads that have no typeshed surface contract
 //      (`!py.location` today).
 //
@@ -44,7 +45,10 @@ def Py_Dialect : Dialect {
 // `ContextManager`, `Sequence`, `Mapping`, and similar Python-level concepts
 // are manifest contracts. A function object is just an object whose contract
 // contains `__call__`; `NoneType` is a final manifest class whose `__bool__`
-// returns `Literal[False]`.
+// returns `Literal[False]`. The textual `!py.callable<..., returns = ...>`
+// spelling is the canonical parse/print form of the Callable protocol
+// contract; it exists so nested Callable and variadic argument packs can round
+// trip through MLIR assembly without introducing a second callable primitive.
 def Py_ContractType
     : Type<CPred<"::py::isPyContractType($_self)">, "Python contract term">;
 
@@ -62,6 +66,11 @@ def Py_TypeVarType
     : Type<CPred<"::py::isPyTypeVarType($_self)">, "py.typevar">;
 def Py_ParamSpecType
     : Type<CPred<"::py::isPyParamSpecType($_self)">, "py.paramspec">;
+def Py_TypeVarTupleType
+    : Type<CPred<"::py::isPyTypeVarTupleType($_self)">,
+           "py.typevartuple">;
+def Py_UnpackType
+    : Type<CPred<"::py::isPyUnpackType($_self)">, "py.unpack">;
 def Py_UnionType : Type<CPred<"::py::isPyUnionType($_self)">, "py.union">;
 
 // Non-Python compiler payloads. These are not user-visible Python classes and
@@ -266,6 +275,23 @@ def Py_ExceptMatchOp : Py_Op<"except.match", [Pure]> {
       TypeAttrOf<Py_TypeType>:$handler);
   let results = (outs I1:$result);
   let assemblyFormat = "$exception `,` $handler `:` type($exception) attr-dict";
+  let hasVerifier = 1;
+}
+
+def Py_ExceptCurrentMatchOp : Py_Op<"except.current_match", []> {
+  let summary = "Match and consume the current Python EH payload";
+  let description = [{
+    Tests the active runtime exception against a handler declared as a Python
+    type object contract. This op is intentionally separate from
+    `py.except.match`: landingpad-based EH keeps the current exception in the
+    runtime TLS until a handler claims it. A successful match consumes that
+    current exception; a failed match leaves it available for rethrow or for a
+    later handler.
+  }];
+
+  let arguments = (ins TypeAttrOf<Py_TypeType>:$handler);
+  let results = (outs I1:$result);
+  let assemblyFormat = "$handler attr-dict";
   let hasVerifier = 1;
 }
 

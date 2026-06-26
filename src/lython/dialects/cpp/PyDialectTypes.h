@@ -48,7 +48,9 @@ enum class TypeKind : unsigned {
   Contract,
   Literal,
   TypeVar,
-  ParamSpec
+  ParamSpec,
+  TypeVarTuple,
+  Unpack
 };
 
 namespace detail {
@@ -447,6 +449,35 @@ public:
   ::llvm::StringRef getName() const;
 };
 
+class TypeVarTupleType
+    : public mlir::Type::TypeBase<TypeVarTupleType, mlir::Type,
+                                  detail::ClassTypeStorage> {
+public:
+  using Base::Base;
+  static constexpr ::llvm::StringLiteral name{"py.typevartuple"};
+
+  static TypeVarTupleType get(mlir::MLIRContext *ctx, ::llvm::StringRef name);
+  static bool kindof(unsigned kind) {
+    return kind == static_cast<unsigned>(TypeKind::TypeVarTuple);
+  }
+
+  ::llvm::StringRef getName() const;
+};
+
+class UnpackType : public mlir::Type::TypeBase<UnpackType, mlir::Type,
+                                               detail::UnaryTypeStorage> {
+public:
+  using Base::Base;
+  static constexpr ::llvm::StringLiteral name{"py.unpack"};
+
+  static UnpackType get(mlir::MLIRContext *ctx, mlir::Type packedType);
+  static bool kindof(unsigned kind) {
+    return kind == static_cast<unsigned>(TypeKind::Unpack);
+  }
+
+  mlir::Type getPackedType() const;
+};
+
 class ListType : public mlir::Type::TypeBase<ListType, mlir::Type,
                                              detail::ListTypeStorage> {
 public:
@@ -637,6 +668,8 @@ bool isPyLiteralType(mlir::Type type);
 bool isPySelfType(mlir::Type type);
 bool isPyTypeVarType(mlir::Type type);
 bool isPyParamSpecType(mlir::Type type);
+bool isPyTypeVarTupleType(mlir::Type type);
+bool isPyUnpackType(mlir::Type type);
 bool isPyExceptionType(mlir::Type type);
 bool isPyExceptionCellType(mlir::Type type);
 bool isPyTracebackType(mlir::Type type);

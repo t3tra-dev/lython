@@ -73,6 +73,12 @@ const char *exceptionClassName(std::int64_t classId) {
     return "TypeError";
   case 53:
     return "ValueError";
+  case 59:
+    return "ArithmeticError";
+  case 60:
+    return "LookupError";
+  case 61:
+    return "ZeroDivisionError";
   case 54:
     return "KeyError";
   case 55:
@@ -83,6 +89,8 @@ const char *exceptionClassName(std::int64_t classId) {
     return "StopIteration";
   case 58:
     return "StopAsyncIteration";
+  case 62:
+    return "CancelledError";
   default:
     return "Exception";
   }

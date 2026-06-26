@@ -163,6 +163,8 @@ std::optional<llvm::StringRef> typeVariableName(mlir::Type type) {
     return typeVar.getName();
   if (auto paramSpec = mlir::dyn_cast<py::ParamSpecType>(type))
     return paramSpec.getName();
+  if (auto typeVarTuple = mlir::dyn_cast<py::TypeVarTupleType>(type))
+    return typeVarTuple.getName();
   if (auto contract = mlir::dyn_cast<py::ContractType>(type)) {
     llvm::StringRef name = contract.getContractName();
     if (name.starts_with("$"))
@@ -211,6 +213,11 @@ mlir::Type substitute(mlir::Type type,
     }
     return py::ContractType::get(type.getContext(), contract.getContractName(),
                                  args);
+  }
+  if (auto unpack = mlir::dyn_cast<py::UnpackType>(type)) {
+    mlir::Type packed = substitute(unpack.getPackedType(), binding);
+    return packed ? py::UnpackType::get(type.getContext(), packed)
+                  : mlir::Type();
   }
   if (auto tuple = mlir::dyn_cast<py::TupleType>(type)) {
     llvm::SmallVector<mlir::Type> elements;

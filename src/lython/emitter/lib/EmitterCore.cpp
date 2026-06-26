@@ -3,7 +3,10 @@
 #include "AstAccess.h"
 #include "ClosureAnalysis.h"
 
+#include "cpp/PyProtocols.h"
+
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Block.h"
@@ -11,7 +14,9 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include "PyDialect.h.inc"
 #define GET_OP_CLASSES
@@ -20,6 +25,12 @@
 
 namespace lython::emitter {
 namespace {
+
+constexpr llvm::StringLiteral kCallableVarargValueTypeAttr{
+    "callable_vararg_value_type"};
+constexpr llvm::StringLiteral kCallableKwargValueTypeAttr{
+    "callable_kwarg_value_type"};
+constexpr llvm::StringLiteral kPackUnpackedOperandsAttr{"ly.unpack_operands"};
 
 mlir::ArrayAttr stringArray(mlir::Builder &builder,
                             llvm::ArrayRef<std::string> values) {
@@ -43,6 +54,119 @@ mlir::ArrayAttr typeArray(mlir::Builder &builder,
   for (mlir::Type value : values)
     attrs.push_back(mlir::TypeAttr::get(value));
   return builder.getArrayAttr(attrs);
+}
+
+mlir::ArrayAttr boolArray(mlir::Builder &builder, llvm::ArrayRef<char> values) {
+  llvm::SmallVector<mlir::Attribute, 8> attrs;
+  attrs.reserve(values.size());
+  for (char value : values)
+    attrs.push_back(builder.getBoolAttr(value != 0));
+  return builder.getArrayAttr(attrs);
+}
+
+mlir::Type replaceSelfType(mlir::Type type, mlir::Type selfType) {
+  if (!type || !selfType)
+    return type;
+  mlir::MLIRContext *context = type.getContext();
+  if (mlir::isa<py::SelfType>(type))
+    return selfType;
+  if (auto contract = mlir::dyn_cast<py::ContractType>(type)) {
+    llvm::SmallVector<mlir::Type, 4> arguments;
+    bool changed = false;
+    for (mlir::Type argument : contract.getArguments()) {
+      mlir::Type replaced = replaceSelfType(argument, selfType);
+      changed |= replaced != argument;
+      arguments.push_back(replaced);
+    }
+    if (changed)
+      return py::ContractType::get(context, contract.getContractName(),
+                                   arguments);
+    return type;
+  }
+  if (auto protocol = mlir::dyn_cast<py::ProtocolType>(type)) {
+    llvm::SmallVector<mlir::Type, 4> arguments;
+    bool changed = false;
+    for (mlir::Type argument : protocol.getArguments()) {
+      mlir::Type replaced = replaceSelfType(argument, selfType);
+      changed |= replaced != argument;
+      arguments.push_back(replaced);
+    }
+    if (changed)
+      return py::ProtocolType::get(context, protocol.getProtocolName(),
+                                   arguments);
+    return type;
+  }
+  if (auto callable = mlir::dyn_cast<py::CallableType>(type)) {
+    llvm::SmallVector<mlir::Type, 8> positional;
+    llvm::SmallVector<mlir::Type, 4> kwonly;
+    llvm::SmallVector<mlir::Type, 1> results;
+    for (mlir::Type argument : callable.getPositionalTypes())
+      positional.push_back(replaceSelfType(argument, selfType));
+    for (mlir::Type argument : callable.getKwOnlyTypes())
+      kwonly.push_back(replaceSelfType(argument, selfType));
+    for (mlir::Type result : callable.getResultTypes())
+      results.push_back(replaceSelfType(result, selfType));
+    mlir::Type vararg =
+        callable.hasVararg()
+            ? replaceSelfType(callable.getVarargType(), selfType)
+            : mlir::Type();
+    mlir::Type kwarg = callable.hasKwarg()
+                           ? replaceSelfType(callable.getKwargType(), selfType)
+                           : mlir::Type();
+    return py::CallableType::get(
+        context, positional, kwonly, vararg, kwarg, results,
+        callable.getPositionalNames(), callable.getKwOnlyNames(),
+        callable.getPositionalDefaults(), callable.getKwOnlyDefaults(),
+        callable.getVarargName(), callable.getKwargName(),
+        callable.getPositionalOnlyCount());
+  }
+  if (auto unionType = mlir::dyn_cast<py::UnionType>(type)) {
+    llvm::SmallVector<mlir::Type, 4> members;
+    bool changed = false;
+    for (mlir::Type member : unionType.getMemberTypes()) {
+      mlir::Type replaced = replaceSelfType(member, selfType);
+      changed |= replaced != member;
+      members.push_back(replaced);
+    }
+    return changed ? py::UnionType::getNormalized(context, members) : type;
+  }
+  if (auto typeObject = mlir::dyn_cast<py::TypeType>(type)) {
+    mlir::Type instance =
+        replaceSelfType(typeObject.getInstanceType(), selfType);
+    return instance != typeObject.getInstanceType()
+               ? py::TypeType::get(context, instance)
+               : type;
+  }
+  if (auto unpack = mlir::dyn_cast<py::UnpackType>(type)) {
+    mlir::Type packed = replaceSelfType(unpack.getPackedType(), selfType);
+    return packed != unpack.getPackedType()
+               ? py::UnpackType::get(context, packed)
+               : type;
+  }
+  if (auto list = mlir::dyn_cast<py::ListType>(type)) {
+    mlir::Type element = replaceSelfType(list.getElementType(), selfType);
+    return element != list.getElementType()
+               ? py::ListType::get(context, element)
+               : type;
+  }
+  return type;
+}
+
+void replaceSelfInSignature(FunctionSignature &sig, mlir::Type selfType,
+                            AlgorithmM &types) {
+  for (mlir::Type &type : sig.positionalTypes)
+    type = replaceSelfType(type, selfType);
+  for (mlir::Type &type : sig.kwOnlyTypes)
+    type = replaceSelfType(type, selfType);
+  sig.varargType = replaceSelfType(sig.varargType, selfType);
+  sig.callableVarargType = replaceSelfType(sig.callableVarargType, selfType);
+  sig.kwargType = replaceSelfType(sig.kwargType, selfType);
+  sig.resultType = replaceSelfType(sig.resultType, selfType);
+  types.refreshCallable(sig);
+}
+
+bool anyTrue(llvm::ArrayRef<char> values) {
+  return llvm::any_of(values, [](char value) { return value != 0; });
 }
 
 std::string methodKind(const parser::Node &function) {
@@ -77,9 +201,34 @@ mlir::Type elementType(mlir::Type type, AlgorithmM &types) {
   return types.object();
 }
 
+void appendStarredArgumentTypes(mlir::Type type, AlgorithmM &types,
+                                llvm::SmallVectorImpl<mlir::Type> &out) {
+  type = types.widenLiteral(type);
+  if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(type)) {
+    if (contract.getContractName() == "builtins.tuple" &&
+        !contract.getArguments().empty()) {
+      out.push_back(contract.getArguments().front());
+      return;
+    }
+  }
+  if (auto tuple = mlir::dyn_cast_if_present<py::TupleType>(type)) {
+    out.append(tuple.getElementTypes().begin(), tuple.getElementTypes().end());
+    return;
+  }
+  out.push_back(types.object());
+}
+
 bool isTopLevelDecl(const parser::Node &node) {
   return node.kind == "FunctionDef" || node.kind == "AsyncFunctionDef" ||
          node.kind == "ClassDef";
+}
+
+std::string importBindingName(std::string_view module,
+                              std::optional<std::string_view> asname) {
+  if (asname)
+    return std::string(*asname);
+  std::string_view::size_type dot = module.find('.');
+  return std::string(module.substr(0, dot));
 }
 
 mlir::Attribute defaultValueAttr(mlir::Builder &builder,
@@ -181,7 +330,37 @@ void ensureYield(mlir::OpBuilder &builder, mlir::Location loc,
 
 bool insertionBlockTerminated(const mlir::OpBuilder &builder) {
   mlir::Block *block = builder.getInsertionBlock();
-  return block && blockHasTerminator(*block);
+  if (!block)
+    return false;
+  auto insertionPoint = builder.getInsertionPoint();
+  if (insertionPoint == block->begin())
+    return false;
+  auto previous = insertionPoint;
+  --previous;
+  return previous->hasTrait<mlir::OpTrait::IsTerminator>();
+}
+
+bool containsReturnStatement(const std::vector<parser::NodePtr> *statements) {
+  if (!statements)
+    return false;
+  for (const parser::NodePtr &statement : *statements) {
+    if (!statement)
+      continue;
+    if (statement->kind == "Return")
+      return true;
+    if (statement->kind == "FunctionDef" ||
+        statement->kind == "AsyncFunctionDef" || statement->kind == "ClassDef")
+      continue;
+    if (containsReturnStatement(ast::nodeList(*statement, "body")) ||
+        containsReturnStatement(ast::nodeList(*statement, "orelse")) ||
+        containsReturnStatement(ast::nodeList(*statement, "finalbody")))
+      return true;
+    if (const auto *handlers = ast::nodeList(*statement, "handlers"))
+      for (const parser::NodePtr &handler : *handlers)
+        if (handler && containsReturnStatement(ast::nodeList(*handler, "body")))
+          return true;
+  }
+  return false;
 }
 
 bool containsObjectTop(mlir::Type type, const AlgorithmM &types) {
@@ -229,6 +408,87 @@ bool containsObjectTop(mlir::Type type, const AlgorithmM &types) {
       return true;
   }
   return false;
+}
+
+bool isNoneTypeLike(mlir::Type type) {
+  if (mlir::isa_and_nonnull<py::NoneType>(type))
+    return true;
+  if (auto literal = mlir::dyn_cast_if_present<py::LiteralType>(type))
+    return literal.getSpelling() == "None";
+  if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(type))
+    return contract.getContractName() == "types.NoneType";
+  return false;
+}
+
+mlir::Type removeNoneFromType(mlir::Type type, AlgorithmM &types) {
+  if (!type || isNoneTypeLike(type))
+    return {};
+  auto unionType = mlir::dyn_cast_if_present<py::UnionType>(type);
+  if (!unionType)
+    return {};
+
+  bool sawNone = false;
+  llvm::SmallVector<mlir::Type, 4> payloads;
+  for (mlir::Type member : unionType.getMemberTypes()) {
+    member = types.widenLiteral(member);
+    if (isNoneTypeLike(member)) {
+      sawNone = true;
+      continue;
+    }
+    payloads.push_back(member);
+  }
+  return sawNone ? types.join(payloads) : mlir::Type{};
+}
+
+struct NoneComparisonNarrowing {
+  std::string name;
+  bool trueBranchIsNone = true;
+  mlir::Type payloadType;
+};
+
+const parser::Node *nameComparedWithNone(const parser::Node *left,
+                                         const parser::Node *right) {
+  if (!left || !right)
+    return nullptr;
+  if (left->kind == "Name" && right->kind == "Constant" &&
+      ast::isNoneField(*right, "value"))
+    return left;
+  if (right->kind == "Name" && left->kind == "Constant" &&
+      ast::isNoneField(*left, "value"))
+    return right;
+  return nullptr;
+}
+
+std::optional<NoneComparisonNarrowing>
+optionalNoneComparison(const parser::Node &test, AlgorithmM &types) {
+  if (test.kind != "Compare")
+    return std::nullopt;
+  const auto *comparators = ast::nodeList(test, "comparators");
+  const auto *ops = ast::nodeList(test, "ops");
+  if (!comparators || comparators->size() != 1 || !ops || ops->size() != 1)
+    return std::nullopt;
+
+  const parser::Node *op = ops->front().get();
+  bool trueBranchIsNone = true;
+  if (ast::isOperator(op, "Is")) {
+    trueBranchIsNone = true;
+  } else if (ast::isOperator(op, "IsNot")) {
+    trueBranchIsNone = false;
+  } else {
+    return std::nullopt;
+  }
+
+  const parser::Node *name =
+      nameComparedWithNone(ast::node(test, "left"), comparators->front().get());
+  if (!name)
+    return std::nullopt;
+  llvm::StringRef spelling = ast::nameSpelling(*name);
+  std::optional<mlir::Type> currentType = types.lookupSymbol(spelling);
+  mlir::Type payloadType =
+      currentType ? removeNoneFromType(*currentType, types) : mlir::Type{};
+  if (!payloadType)
+    return std::nullopt;
+  return NoneComparisonNarrowing{spelling.str(), trueBranchIsNone, payloadType};
 }
 
 mlir::Type widenInferredLiterals(mlir::Type type, const AlgorithmM &types) {
@@ -411,7 +671,8 @@ ModuleEmitter::ModuleEmitter(const parser::Node &moduleNode,
 
 EmitResult ModuleEmitter::emit() {
   context.loadDialect<py::PyDialect, mlir::arith::ArithDialect,
-                      mlir::func::FuncDialect, mlir::scf::SCFDialect>();
+                      mlir::cf::ControlFlowDialect, mlir::func::FuncDialect,
+                      mlir::scf::SCFDialect>();
   types.seedBuiltins();
 
   module = mlir::ModuleOp::create(builder.getUnknownLoc());
@@ -427,7 +688,7 @@ EmitResult ModuleEmitter::emit() {
   mlir::Block *entry = main.addEntryBlock();
   builder.setInsertionPointToStart(entry);
   emitStatements(ast::nodeList(moduleNode, "body"), /*skipDeclarations=*/true);
-  if (!blockHasTerminator(*entry))
+  if (!insertionBlockTerminated(builder))
     builder.create<mlir::func::ReturnOp>(loc(moduleNode));
 
   EmitResult result;
@@ -479,15 +740,99 @@ mlir::Type ModuleEmitter::boolProtocol() const {
   return types.protocol("Callable");
 }
 
+mlir::Type ModuleEmitter::coroutineType(mlir::Type resultType) const {
+  return types.contract("types.CoroutineType",
+                        {types.object(), types.object(),
+                         resultType ? resultType : types.object()});
+}
+
+FunctionSignature
+ModuleEmitter::asyncPublicSignature(FunctionSignature sig) const {
+  sig.resultType = coroutineType(sig.resultType);
+  types.refreshCallable(sig);
+  return sig;
+}
+
 void ModuleEmitter::predeclareTopLevel() {
   if (const auto *body = ast::nodeList(moduleNode, "body")) {
     for (const parser::NodePtr &statement : *body) {
-      if (!statement || statement->kind != "ClassDef")
+      if (!statement)
         continue;
-      if (auto name = ast::string(*statement, "name"))
-        types.bindClass(*name, types.contract(*name));
+      if (statement->kind == "Import" || statement->kind == "ImportFrom") {
+        bindImportStatement(*statement, /*diagnoseUnsupported=*/false);
+        continue;
+      }
+      if (statement->kind == "ClassDef")
+        if (auto name = ast::string(*statement, "name"))
+          types.bindClass(*name, types.contract(*name));
     }
   }
+}
+
+bool ModuleEmitter::bindImportStatement(const parser::Node &statement,
+                                        bool diagnoseUnsupported) {
+  if (statement.kind == "Import") {
+    const auto *names = ast::nodeList(statement, "names");
+    if (!names)
+      return true;
+    for (const parser::NodePtr &alias : *names) {
+      if (!alias)
+        continue;
+      std::optional<std::string_view> name = ast::string(*alias, "name");
+      if (!name)
+        continue;
+      std::optional<std::string_view> asname = ast::string(*alias, "asname");
+      std::string local = importBindingName(*name, asname);
+      if (!types.bindImportedModule(llvm::StringRef(*name),
+                                    llvm::StringRef(local)) &&
+          diagnoseUnsupported) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, alias->range.start,
+            "unsupported import '" + std::string(*name) + "'"});
+      }
+    }
+    return true;
+  }
+
+  if (statement.kind != "ImportFrom")
+    return false;
+
+  std::int64_t level = ast::integer(statement, "level").value_or(0);
+  std::optional<std::string_view> module = ast::string(statement, "module");
+  if (level != 0 || !module) {
+    if (diagnoseUnsupported)
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, statement.range.start,
+          "relative import is not supported by the static emitter"});
+    return true;
+  }
+  const auto *names = ast::nodeList(statement, "names");
+  if (!names)
+    return true;
+  for (const parser::NodePtr &alias : *names) {
+    if (!alias)
+      continue;
+    std::optional<std::string_view> name = ast::string(*alias, "name");
+    if (!name || *name == "*") {
+      if (diagnoseUnsupported)
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, alias->range.start,
+            "star import is not supported by the static emitter"});
+      continue;
+    }
+    std::optional<std::string_view> asname = ast::string(*alias, "asname");
+    llvm::StringRef local =
+        asname ? llvm::StringRef(*asname) : llvm::StringRef(*name);
+    if (!types.bindImportedName(llvm::StringRef(*module),
+                                llvm::StringRef(*name), local) &&
+        diagnoseUnsupported) {
+      diagnostics.push_back(
+          parser::Diagnostic{parser::Severity::Error, alias->range.start,
+                             "unsupported import '" + std::string(*module) +
+                                 "." + std::string(*name) + "'"});
+    }
+  }
+  return true;
 }
 
 void ModuleEmitter::emitTopLevelDeclarations() {
@@ -510,7 +855,9 @@ void ModuleEmitter::emitFunctionDecl(const parser::Node &function) {
     return;
   FunctionSignature sig = types.functionSignature(function);
   emitCallableFunction(function, *name, sig, {}, /*isLambda=*/false);
-  types.bindSymbol(*name, sig.callable);
+  FunctionSignature publicSig =
+      function.kind == "AsyncFunctionDef" ? asyncPublicSignature(sig) : sig;
+  types.bindSymbol(*name, publicSig.callable);
 }
 
 void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
@@ -524,6 +871,10 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
   llvm::SmallVector<mlir::Type, 8> logicalInputs(sig.positionalTypes.begin(),
                                                  sig.positionalTypes.end());
   logicalInputs.append(sig.kwOnlyTypes.begin(), sig.kwOnlyTypes.end());
+  if (sig.varargType)
+    logicalInputs.push_back(sig.varargType);
+  if (sig.kwargType)
+    logicalInputs.push_back(sig.kwargType);
   for (const Capture &capture : captures)
     logicalInputs.push_back(capture.value.type);
 
@@ -533,8 +884,16 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
       builder.create<mlir::func::FuncOp>(loc(callable), symbolName, funcType);
   func.setPrivate();
   func->setAttr("callable_type", mlir::TypeAttr::get(sig.callable));
+  if (sig.varargType)
+    func->setAttr(kCallableVarargValueTypeAttr,
+                  mlir::TypeAttr::get(sig.varargType));
+  if (sig.kwargType)
+    func->setAttr(kCallableKwargValueTypeAttr,
+                  mlir::TypeAttr::get(sig.kwargType));
   func->setAttr("callable_default_values",
                 callableDefaultValues(builder, callable, sig));
+  if (callable.kind == "AsyncFunctionDef")
+    func->setAttr("ly.async.body_result", mlir::TypeAttr::get(sig.resultType));
   if (!captures.empty()) {
     llvm::SmallVector<std::string, 4> captureNames;
     llvm::SmallVector<mlir::Type, 4> captureTypes;
@@ -545,8 +904,6 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
     func->setAttr("closure_names", stringArray(builder, captureNames));
     func->setAttr("closure_types", typeArray(builder, captureTypes));
   }
-  if (sig.varargType || sig.kwargType)
-    return;
 
   llvm::StringMap<Value> savedValues = values;
   mlir::Type savedReturnType = currentReturnType;
@@ -557,6 +914,7 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
   values.clear();
   currentReturnType = sig.resultType;
   currentFunctionPrefix = symbolName.str();
+  types.bindSymbol(symbolName, sig.callable);
   if (const parser::Node *arguments = ast::node(callable, "args")) {
     llvm::SmallVector<const parser::Node *, 8> positional =
         positionalArgumentNodes(*arguments);
@@ -581,9 +939,27 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
         types.bindSymbol(name, sig.kwOnlyTypes[index]);
       }
     }
+    unsigned variadicOffset = static_cast<unsigned>(sig.positionalTypes.size() +
+                                                    sig.kwOnlyTypes.size());
+    if (sig.varargType) {
+      if (sig.varargName && variadicOffset < entry->getNumArguments()) {
+        values[*sig.varargName] =
+            Value{entry->getArgument(variadicOffset), sig.varargType};
+        types.bindSymbol(*sig.varargName, sig.varargType);
+      }
+      ++variadicOffset;
+    }
+    if (sig.kwargType) {
+      if (sig.kwargName && variadicOffset < entry->getNumArguments()) {
+        values[*sig.kwargName] =
+            Value{entry->getArgument(variadicOffset), sig.kwargType};
+        types.bindSymbol(*sig.kwargName, sig.kwargType);
+      }
+    }
   }
-  unsigned captureOffset = static_cast<unsigned>(sig.positionalTypes.size() +
-                                                 sig.kwOnlyTypes.size());
+  unsigned captureOffset = static_cast<unsigned>(
+      sig.positionalTypes.size() + sig.kwOnlyTypes.size() +
+      (sig.varargType ? 1 : 0) + (sig.kwargType ? 1 : 0));
   for (auto [index, capture] : llvm::enumerate(captures)) {
     values[capture.name] =
         Value{entry->getArgument(captureOffset + index), capture.value.type};
@@ -598,7 +974,7 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
   } else {
     emitStatements(ast::nodeList(callable, "body"));
   }
-  if (!blockHasTerminator(*entry)) {
+  if (!insertionBlockTerminated(builder)) {
     Value none = emitNone(callable);
     Value result = coerceValue(none, currentReturnType, callable);
     builder.create<mlir::func::ReturnOp>(loc(callable), result.value);
@@ -607,6 +983,36 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
   values = std::move(savedValues);
   currentReturnType = savedReturnType;
   currentFunctionPrefix = std::move(savedFunctionPrefix);
+}
+
+std::optional<ModuleEmitter::MethodBinding>
+ModuleEmitter::lookupClassMethod(mlir::Type receiverType,
+                                 llvm::StringRef methodName) const {
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(receiverType);
+  if (!contract)
+    return std::nullopt;
+  auto classMethods = classMethodBindings.find(contract.getContractName());
+  if (classMethods == classMethodBindings.end())
+    return std::nullopt;
+  auto method = classMethods->second.find(methodName);
+  if (method == classMethods->second.end())
+    return std::nullopt;
+  return method->second;
+}
+
+std::optional<mlir::Type>
+ModuleEmitter::lookupClassField(mlir::Type receiverType,
+                                llvm::StringRef fieldName) const {
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(receiverType);
+  if (!contract)
+    return std::nullopt;
+  auto classFields = classFieldBindings.find(contract.getContractName());
+  if (classFields == classFieldBindings.end())
+    return std::nullopt;
+  auto field = classFields->second.find(fieldName);
+  if (field == classFields->second.end())
+    return std::nullopt;
+  return field->second;
 }
 
 ModuleEmitter::Value
@@ -623,6 +1029,8 @@ ModuleEmitter::emitNestedFunctionDecl(const parser::Node &function) {
   }
 
   FunctionSignature sig = types.functionSignature(function);
+  FunctionSignature publicSig =
+      function.kind == "AsyncFunctionDef" ? asyncPublicSignature(sig) : sig;
   std::string symbolName =
       (llvm::Twine(currentFunctionPrefix.empty() ? "__main__"
                                                  : currentFunctionPrefix) +
@@ -632,7 +1040,7 @@ ModuleEmitter::emitNestedFunctionDecl(const parser::Node &function) {
        llvm::Twine(function.range.start.column))
           .str();
   emitCallableFunction(function, symbolName, sig, captures, /*isLambda=*/false);
-  return emitFunctionObject(function, symbolName, sig.callable, captures);
+  return emitFunctionObject(function, symbolName, publicSig.callable, captures);
 }
 
 ModuleEmitter::Value ModuleEmitter::emitLambda(const parser::Node &expr,
@@ -700,9 +1108,12 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef) {
   collectClassFields(classDef, fieldMap);
   llvm::SmallVector<std::string, 8> fieldNames;
   llvm::SmallVector<mlir::Type, 8> fieldTypes;
+  llvm::StringMap<mlir::Type> &registeredFields = classFieldBindings[*name];
+  registeredFields.clear();
   for (const auto &entry : fieldMap) {
     fieldNames.push_back(entry.getKey().str());
     fieldTypes.push_back(entry.getValue());
+    registeredFields[entry.getKey()] = entry.getValue();
   }
 
   llvm::SmallVector<std::string, 8> methodNames;
@@ -721,9 +1132,19 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef) {
           *statement, kind == "static"
                           ? std::optional<llvm::StringRef>()
                           : std::optional<llvm::StringRef>("self"));
+      if (kind == "instance")
+        replaceSelfInSignature(sig, types.contract(*name), types);
+      else if (kind == "class")
+        replaceSelfInSignature(sig, types.typeObject(types.contract(*name)),
+                               types);
+      if (statement->kind == "AsyncFunctionDef")
+        sig = asyncPublicSignature(sig);
       methodNames.push_back(std::string(*methodName));
       methodKinds.push_back(std::move(kind));
       methodContracts.push_back(sig.callable);
+
+      classMethodBindings[*name][*methodName] =
+          MethodBinding{statement.get(), sig};
     }
   }
 
@@ -744,6 +1165,27 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef) {
 
 void ModuleEmitter::collectClassFields(
     const parser::Node &classDef, llvm::StringMap<mlir::Type> &fields) const {
+  auto collectInitArgTypes = [&](const parser::Node &method,
+                                 llvm::StringMap<mlir::Type> &argTypes) {
+    const parser::Node *arguments = ast::node(method, "args");
+    if (!arguments)
+      return;
+    auto collectArgs = [&](llvm::StringRef fieldName) {
+      if (const auto *args = ast::nodeList(*arguments, fieldName)) {
+        for (const parser::NodePtr &arg : *args) {
+          if (!arg)
+            continue;
+          llvm::StringRef name = ast::nameSpelling(*arg);
+          if (name == "self")
+            continue;
+          argTypes[name] = types.annotationType(ast::node(*arg, "annotation"));
+        }
+      }
+    };
+    collectArgs("posonlyargs");
+    collectArgs("args");
+  };
+
   auto collectTarget = [&](const parser::Node &target, mlir::Type type) {
     if (target.kind != "Attribute")
       return;
@@ -758,6 +1200,8 @@ void ModuleEmitter::collectClassFields(
     for (const parser::NodePtr &method : *body) {
       if (!method || ast::nameSpelling(*method) != "__init__")
         continue;
+      llvm::StringMap<mlir::Type> initArgTypes;
+      collectInitArgTypes(*method, initArgTypes);
       if (const auto *stmts = ast::nodeList(*method, "body")) {
         for (const parser::NodePtr &stmt : *stmts) {
           if (!stmt)
@@ -766,7 +1210,13 @@ void ModuleEmitter::collectClassFields(
             collectTarget(*ast::node(*stmt, "target"),
                           types.annotationType(ast::node(*stmt, "annotation")));
           } else if (stmt->kind == "Assign") {
-            mlir::Type valueType = types.inferExpr(ast::node(*stmt, "value"));
+            const parser::Node *value = ast::node(*stmt, "value");
+            mlir::Type valueType = types.inferExpr(value);
+            if (value && value->kind == "Name") {
+              auto found = initArgTypes.find(ast::nameSpelling(*value));
+              if (found != initArgTypes.end())
+                valueType = found->second;
+            }
             if (const auto *targets = ast::nodeList(*stmt, "targets"))
               for (const parser::NodePtr &target : *targets)
                 collectTarget(*target, valueType);
@@ -792,6 +1242,10 @@ void ModuleEmitter::emitStatements(
 void ModuleEmitter::emitStatement(const parser::Node &statement) {
   if (statement.kind == "Expr") {
     emitExpr(ast::node(statement, "value"));
+  } else if (statement.kind == "Import") {
+    bindImportStatement(statement, /*diagnoseUnsupported=*/true);
+  } else if (statement.kind == "ImportFrom") {
+    bindImportStatement(statement, /*diagnoseUnsupported=*/true);
   } else if (statement.kind == "Assign") {
     const parser::Node *rhs = ast::node(statement, "value");
     Value value{{}, {}};
@@ -842,8 +1296,10 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
     emitAssignTarget(*ast::node(statement, "target"), value);
   } else if (statement.kind == "If") {
     emitIf(statement);
-  } else if (statement.kind == "For" || statement.kind == "AsyncFor") {
+  } else if (statement.kind == "For") {
     emitFor(statement);
+  } else if (statement.kind == "AsyncFor") {
+    emitAsyncFor(statement);
   } else if (statement.kind == "With") {
     emitWith(statement, false);
   } else if (statement.kind == "AsyncWith") {
@@ -863,11 +1319,39 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
       types.bindSymbol(*name, function.type);
     }
   } else if (statement.kind == "Return") {
-    Value value = emitExpr(ast::node(statement, "value"));
+    const parser::Node *returnValue = ast::node(statement, "value");
+    Value value = returnValue && returnValue->kind == "Lambda"
+                      ? emitLambda(*returnValue,
+                                   mlir::dyn_cast_if_present<py::CallableType>(
+                                       currentReturnType))
+                      : emitExpr(returnValue);
+    if (!inlineReturnContexts.empty()) {
+      InlineReturnContext &ctx = inlineReturnContexts.back();
+      Value result = ctx.resultType
+                         ? coerceValue(value, ctx.resultType, statement)
+                         : value;
+      emitActiveCleanups(statement);
+      builder.create<mlir::cf::BranchOp>(loc(statement), ctx.target,
+                                         result.value);
+      return;
+    }
     if (currentReturnType) {
       Value result = coerceValue(value, currentReturnType, statement);
+      emitActiveCleanups(statement);
       builder.create<mlir::func::ReturnOp>(loc(statement), result.value);
     }
+  } else if (statement.kind == "Pass") {
+    return;
+  } else if (statement.kind == "Try") {
+    emitTry(statement);
+  } else if (statement.kind == "TryStar") {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, statement.range.start,
+        "except* requires exception-group-aware py.try lowering"});
+  } else {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, statement.range.start,
+        "unsupported statement kind '" + statement.kind + "'"});
   }
 }
 
@@ -919,34 +1403,78 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
 }
 
 void ModuleEmitter::emitIf(const parser::Node &statement) {
-  mlir::Value condition =
-      emitBoolValue(emitExpr(ast::node(statement, "test")), statement);
+  const parser::Node *test = ast::node(statement, "test");
+  std::optional<NoneComparisonNarrowing> narrowing =
+      test ? optionalNoneComparison(*test, types) : std::nullopt;
+  auto applyNarrowing = [&](const NoneComparisonNarrowing &fact,
+                            bool conditionIsTrue) {
+    mlir::Type narrowed = conditionIsTrue == fact.trueBranchIsNone
+                              ? types.none()
+                              : fact.payloadType;
+    if (!narrowed)
+      return;
+    auto found = values.find(fact.name);
+    if (found != values.end()) {
+      if (mlir::isa<py::UnionType>(found->second.value.getType()) &&
+          found->second.value.getType() != narrowed) {
+        auto unwrap = builder.create<py::UnionUnwrapOp>(
+            loc(statement), narrowed, found->second.value);
+        found->second.value = unwrap.getResult();
+      }
+      found->second.type = narrowed;
+    }
+    types.bindSymbol(fact.name, narrowed);
+  };
+
+  mlir::Value condition = emitBoolValue(emitExpr(test), statement);
   const auto *orelse = ast::nodeList(statement, "orelse");
   bool hasElse = orelse && !orelse->empty();
-  auto ifOp =
-      builder.create<mlir::scf::IfOp>(loc(statement), condition, hasElse);
+  mlir::Block *entry = builder.getInsertionBlock();
+  mlir::Region *region = entry->getParent();
+  mlir::Block *continuation = entry->splitBlock(builder.getInsertionPoint());
+  mlir::Block *thenBlock =
+      builder.createBlock(region, continuation->getIterator());
+  mlir::Block *elseBlock =
+      hasElse ? builder.createBlock(region, continuation->getIterator())
+              : continuation;
+
+  builder.setInsertionPointToEnd(entry);
+  builder.create<mlir::cf::CondBranchOp>(loc(statement), condition, thenBlock,
+                                         mlir::ValueRange{}, elseBlock,
+                                         mlir::ValueRange{});
 
   llvm::StringMap<Value> saved = values;
-  mlir::Block &thenBlock = ifOp.getThenRegion().front();
-  setInsertionBeforeTerminator(builder, thenBlock);
+  builder.setInsertionPointToStart(thenBlock);
   {
     auto typeScope = types.pushScope();
+    if (narrowing)
+      applyNarrowing(*narrowing, /*conditionIsTrue=*/true);
     emitStatements(ast::nodeList(statement, "body"));
   }
-  ensureYield(builder, loc(statement), thenBlock);
+  bool thenTerminates = insertionBlockTerminated(builder);
+  if (!thenTerminates)
+    builder.create<mlir::cf::BranchOp>(loc(statement), continuation);
 
   values = saved;
+  bool elseTerminates = false;
   if (hasElse) {
-    mlir::Block &elseBlock = ifOp.getElseRegion().front();
-    setInsertionBeforeTerminator(builder, elseBlock);
+    builder.setInsertionPointToStart(elseBlock);
     {
       auto typeScope = types.pushScope();
+      if (narrowing)
+        applyNarrowing(*narrowing, /*conditionIsTrue=*/false);
       emitStatements(orelse);
     }
-    ensureYield(builder, loc(statement), elseBlock);
+    elseTerminates = insertionBlockTerminated(builder);
+    if (!elseTerminates)
+      builder.create<mlir::cf::BranchOp>(loc(statement), continuation);
   }
   values = saved;
-  builder.setInsertionPointAfter(ifOp);
+  setInsertionBeforeTerminator(builder, *continuation);
+  if (narrowing && thenTerminates && !elseTerminates)
+    applyNarrowing(*narrowing, /*conditionIsTrue=*/false);
+  else if (narrowing && hasElse && elseTerminates && !thenTerminates)
+    applyNarrowing(*narrowing, /*conditionIsTrue=*/true);
 }
 
 void ModuleEmitter::emitFor(const parser::Node &statement) {
@@ -957,9 +1485,11 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
       types.inferMethodCallWithEvidence(iterable.type, "__iter__", {});
   if (iterInference)
     iteratorType = iterInference.resultType;
+  mlir::UnitAttr returnedSelf =
+      iteratorType == iterable.type ? builder.getUnitAttr() : mlir::UnitAttr();
   auto iterator = builder.create<py::IterOp>(
       loc(statement), iteratorType, "__iter__", callProtocolFor(iterInference),
-      iterable.value, mlir::UnitAttr());
+      iterable.value, returnedSelf);
   auto whileOp = builder.create<mlir::scf::WhileOp>(
       loc(statement), mlir::TypeRange{}, mlir::ValueRange{});
 
@@ -1006,53 +1536,281 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
   builder.setInsertionPointAfter(whileOp);
 }
 
-void ModuleEmitter::emitWith(const parser::Node &statement, bool async) {
-  llvm::SmallVector<Value, 4> managers;
-  if (const auto *items = ast::nodeList(statement, "items")) {
-    for (const parser::NodePtr &item : *items) {
-      Value contextValue = emitExpr(ast::node(*item, "context_expr"));
-      managers.push_back(contextValue);
-      CallInferenceResult enterInference = types.inferMethodCallWithEvidence(
-          contextValue.type, async ? "__aenter__" : "__enter__", {});
-      mlir::Type enterType =
-          enterInference ? enterInference.resultType : types.object();
-      Value entered{
-          async
-              ? builder
-                    .create<py::AEnterOp>(loc(*item), enterType, "__aenter__",
-                                          callProtocolFor(enterInference),
-                                          contextValue.value, mlir::UnitAttr())
-                    .getResult()
-              : builder
-                    .create<py::EnterOp>(loc(*item), enterType, "__enter__",
-                                         callProtocolFor(enterInference),
-                                         contextValue.value, mlir::UnitAttr())
-                    .getResult(),
-          enterType};
-      if (const parser::Node *optional = ast::node(*item, "optional_vars"))
-        emitAssignTarget(*optional, entered);
+void ModuleEmitter::emitAsyncFor(const parser::Node &statement) {
+  if (const auto *orelse = ast::nodeList(statement, "orelse")) {
+    if (!orelse->empty()) {
+      diagnostics.push_back(
+          parser::Diagnostic{parser::Severity::Error, statement.range.start,
+                             "async for/else is not implemented yet"});
+      return;
     }
   }
-  emitStatements(ast::nodeList(statement, "body"));
-  for (Value manager : llvm::reverse(managers)) {
-    auto noneOp = builder.create<py::NoneOp>(loc(statement), types.none());
-    Value none{noneOp.getResult(), types.none()};
-    if (async) {
-      CallInferenceResult exitInference = types.inferMethodCallWithEvidence(
-          manager.type, "__aexit__", {none.type, none.type, none.type});
-      builder.create<py::AExitOp>(loc(statement), types.boolType(), "__aexit__",
-                                  callProtocolFor(exitInference), manager.value,
-                                  none.value, none.value, none.value,
-                                  mlir::UnitAttr());
-    } else {
-      CallInferenceResult exitInference = types.inferMethodCallWithEvidence(
-          manager.type, "__exit__", {none.type, none.type, none.type});
-      builder.create<py::ExitOp>(loc(statement), types.boolType(), "__exit__",
-                                 callProtocolFor(exitInference), manager.value,
-                                 none.value, none.value, none.value,
-                                 mlir::UnitAttr());
+  if (containsReturnStatement(ast::nodeList(statement, "body"))) {
+    diagnostics.push_back(
+        parser::Diagnostic{parser::Severity::Error, statement.range.start,
+                           "return inside async for is not implemented yet"});
+    return;
+  }
+
+  Value iterable = emitExpr(ast::node(statement, "iter"));
+  mlir::Type iteratorType = types.protocol("AsyncIterator", {types.object()});
+  CallInferenceResult iterInference =
+      types.inferMethodCallWithEvidence(iterable.type, "__aiter__", {});
+  if (iterInference)
+    iteratorType = iterInference.resultType;
+  mlir::UnitAttr returnedSelf =
+      iteratorType == iterable.type ? builder.getUnitAttr() : mlir::UnitAttr();
+  auto iterator = builder.create<py::AIterOp>(
+      loc(statement), iteratorType, "__aiter__", callProtocolFor(iterInference),
+      iterable.value, returnedSelf);
+
+  auto whileOp = builder.create<mlir::scf::WhileOp>(
+      loc(statement), mlir::TypeRange{}, mlir::ValueRange{});
+
+  llvm::StringMap<Value> saved = values;
+  {
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    mlir::Block *before = builder.createBlock(&whileOp.getBefore());
+    builder.setInsertionPointToStart(before);
+
+    mlir::OperationState tryState(loc(statement),
+                                  py::TryOp::getOperationName());
+    tryState.addTypes(types.boolType());
+    tryState.addRegion();
+    tryState.addRegion();
+    tryState.addRegion();
+    auto tryOp = mlir::cast<py::TryOp>(builder.create(tryState));
+
+    mlir::Block *tryBlock = new mlir::Block;
+    tryOp.getTryRegion().push_back(tryBlock);
+    builder.setInsertionPointToStart(tryBlock);
+    CallInferenceResult nextInference =
+        types.inferMethodCallWithEvidence(iteratorType, "__anext__", {});
+    mlir::Type awaitableType =
+        nextInference ? nextInference.resultType
+                      : types.protocol("Awaitable", {types.object()});
+    auto next = builder.create<py::ANextOp>(
+        loc(statement), awaitableType, "__anext__",
+        callProtocolFor(nextInference), iterator.getResult());
+    Value item =
+        emitAwaitValue(statement, Value{next.getAwaitable(), awaitableType});
+    values = saved;
+    {
+      auto typeScope = types.pushScope();
+      emitAssignTarget(*ast::node(statement, "target"), item);
+      emitStatements(ast::nodeList(statement, "body"));
+    }
+    if (!blockHasTerminator(*tryBlock)) {
+      mlir::Type trueType = types.literal("True");
+      Value trueValue{builder
+                          .create<py::BoolConstantOp>(loc(statement), trueType,
+                                                      builder.getBoolAttr(true))
+                          .getResult(),
+                      trueType};
+      mlir::Value keepGoing =
+          coerceValue(trueValue, types.boolType(), statement).value;
+      builder.create<py::TryYieldOp>(loc(statement),
+                                     mlir::ValueRange{keepGoing});
+    }
+
+    mlir::Block *checkBlock = new mlir::Block;
+    mlir::Block *stopBlock = new mlir::Block;
+    mlir::Block *rethrowBlock = new mlir::Block;
+    tryOp.getExceptRegion().push_back(checkBlock);
+    tryOp.getExceptRegion().push_back(stopBlock);
+    tryOp.getExceptRegion().push_back(rethrowBlock);
+
+    builder.setInsertionPointToStart(checkBlock);
+    mlir::Type stopAsyncIteration =
+        types.typeObject(types.contract("builtins.StopAsyncIteration"));
+    mlir::OperationState matchState(
+        loc(statement), py::ExceptCurrentMatchOp::getOperationName());
+    matchState.addTypes(builder.getI1Type());
+    matchState.addAttribute("handler", mlir::TypeAttr::get(stopAsyncIteration));
+    auto match =
+        mlir::cast<py::ExceptCurrentMatchOp>(builder.create(matchState));
+    builder.create<mlir::cf::CondBranchOp>(loc(statement), match.getResult(),
+                                           stopBlock, mlir::ValueRange{},
+                                           rethrowBlock, mlir::ValueRange{});
+
+    builder.setInsertionPointToStart(stopBlock);
+    mlir::Type falseType = types.literal("False");
+    Value falseValue{builder
+                         .create<py::BoolConstantOp>(loc(statement), falseType,
+                                                     builder.getBoolAttr(false))
+                         .getResult(),
+                     falseType};
+    mlir::Value stop =
+        coerceValue(falseValue, types.boolType(), statement).value;
+    builder.create<py::ExceptYieldOp>(loc(statement), mlir::ValueRange{stop});
+
+    builder.setInsertionPointToStart(rethrowBlock);
+    builder.create<py::RaiseCurrentOp>(loc(statement));
+
+    builder.setInsertionPointAfter(tryOp);
+    auto keepGoing = builder.create<py::BoolOp>(
+        loc(statement), builder.getI1Type(),
+        mlir::FlatSymbolRefAttr::get(&context, "__bool__"), boolProtocol(),
+        tryOp.getResult(0));
+    builder.create<mlir::scf::ConditionOp>(
+        loc(statement), keepGoing.getResult(), mlir::ValueRange{});
+  }
+
+  {
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    mlir::Block *after = builder.createBlock(&whileOp.getAfter());
+    builder.setInsertionPointToStart(after);
+    builder.create<mlir::scf::YieldOp>(loc(statement));
+  }
+
+  values = saved;
+  builder.setInsertionPointAfter(whileOp);
+}
+
+void ModuleEmitter::emitTry(const parser::Node &statement) {
+  const auto *handlers = ast::nodeList(statement, "handlers");
+  if (!handlers || handlers->empty()) {
+    diagnostics.push_back(
+        parser::Diagnostic{parser::Severity::Error, statement.range.start,
+                           "try without except is not implemented yet"});
+    return;
+  }
+  if (const auto *orelse = ast::nodeList(statement, "orelse")) {
+    if (!orelse->empty()) {
+      diagnostics.push_back(
+          parser::Diagnostic{parser::Severity::Error, statement.range.start,
+                             "try/else is not implemented yet"});
+      return;
     }
   }
+  if (const auto *finalbody = ast::nodeList(statement, "finalbody")) {
+    if (!finalbody->empty()) {
+      diagnostics.push_back(
+          parser::Diagnostic{parser::Severity::Error, statement.range.start,
+                             "try/finally is not implemented yet"});
+      return;
+    }
+  }
+  if (containsReturnStatement(ast::nodeList(statement, "body"))) {
+    diagnostics.push_back(
+        parser::Diagnostic{parser::Severity::Error, statement.range.start,
+                           "return inside try is not implemented yet"});
+    return;
+  }
+  if (const auto *handlersForReturn = ast::nodeList(statement, "handlers")) {
+    for (const parser::NodePtr &handler : *handlersForReturn) {
+      if (handler && containsReturnStatement(ast::nodeList(*handler, "body"))) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, handler->range.start,
+            "return inside except handler is not implemented yet"});
+        return;
+      }
+    }
+  }
+
+  mlir::OperationState state(loc(statement), py::TryOp::getOperationName());
+  state.addRegion();
+  state.addRegion();
+  state.addRegion();
+  mlir::Operation *rawTry = builder.create(state);
+  auto tryOp = mlir::cast<py::TryOp>(rawTry);
+
+  llvm::StringMap<Value> saved = values;
+  {
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    auto *tryBlock = new mlir::Block;
+    tryOp.getTryRegion().push_back(tryBlock);
+    builder.setInsertionPointToStart(tryBlock);
+    values = saved;
+    {
+      auto typeScope = types.pushScope();
+      emitStatements(ast::nodeList(statement, "body"));
+    }
+    if (!blockHasTerminator(*tryBlock))
+      builder.create<py::TryYieldOp>(loc(statement), mlir::ValueRange{});
+  }
+
+  {
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    llvm::SmallVector<mlir::Block *, 8> checkBlocks;
+    llvm::SmallVector<mlir::Block *, 8> bodyBlocks;
+    checkBlocks.reserve(handlers->size());
+    bodyBlocks.reserve(handlers->size());
+    for (std::size_t index = 0; index < handlers->size(); ++index) {
+      checkBlocks.push_back(new mlir::Block);
+      bodyBlocks.push_back(new mlir::Block);
+      tryOp.getExceptRegion().push_back(checkBlocks.back());
+      tryOp.getExceptRegion().push_back(bodyBlocks.back());
+    }
+    mlir::Block *rethrowBlock = new mlir::Block;
+    tryOp.getExceptRegion().push_back(rethrowBlock);
+
+    for (auto [index, handlerPtr] : llvm::enumerate(*handlers)) {
+      const parser::Node &handler = *handlerPtr;
+      if (auto name = ast::string(handler, "name")) {
+        diagnostics.push_back(
+            parser::Diagnostic{parser::Severity::Error, handler.range.start,
+                               "except-as binding is not implemented yet"});
+        continue;
+      }
+
+      const parser::Node *typeNode = ast::node(handler, "type");
+      if (!typeNode && index + 1 != handlers->size()) {
+        diagnostics.push_back(
+            parser::Diagnostic{parser::Severity::Error, handler.range.start,
+                               "bare except must be the last handler"});
+        continue;
+      }
+      if (typeNode && typeNode->kind == "Tuple") {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, typeNode->range.start,
+            "tuple exception handlers are not implemented yet"});
+        continue;
+      }
+
+      mlir::Type handlerType =
+          typeNode ? types.inferExpr(typeNode)
+                   : types.typeObject(types.contract("builtins.BaseException"));
+      if (!mlir::isa_and_nonnull<py::TypeType>(handlerType)) {
+        handlerType = types.typeObject(types.annotationType(typeNode));
+      }
+      if (!mlir::isa_and_nonnull<py::TypeType>(handlerType)) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error,
+            typeNode ? typeNode->range.start : handler.range.start,
+            "except handler must resolve to a Python type object"});
+        continue;
+      }
+
+      builder.setInsertionPointToStart(checkBlocks[index]);
+      mlir::OperationState matchState(
+          loc(handler), py::ExceptCurrentMatchOp::getOperationName());
+      matchState.addTypes(builder.getI1Type());
+      matchState.addAttribute("handler", mlir::TypeAttr::get(handlerType));
+      auto match =
+          mlir::cast<py::ExceptCurrentMatchOp>(builder.create(matchState));
+      mlir::Block *miss =
+          index + 1 == handlers->size() ? rethrowBlock : checkBlocks[index + 1];
+      builder.create<mlir::cf::CondBranchOp>(
+          loc(handler), match.getResult(), bodyBlocks[index],
+          mlir::ValueRange{}, miss, mlir::ValueRange{});
+
+      builder.setInsertionPointToStart(bodyBlocks[index]);
+      values = saved;
+      {
+        auto typeScope = types.pushScope();
+        emitStatements(ast::nodeList(handler, "body"));
+      }
+      if (!blockHasTerminator(*bodyBlocks[index]))
+        builder.create<py::ExceptYieldOp>(loc(handler), mlir::ValueRange{});
+    }
+
+    builder.setInsertionPointToStart(rethrowBlock);
+    builder.create<py::RaiseCurrentOp>(loc(statement));
+  }
+
+  values = saved;
+  builder.setInsertionPointAfter(tryOp);
 }
 
 ModuleEmitter::Value ModuleEmitter::emitExpr(const parser::Node *expr) {
@@ -1073,7 +1831,11 @@ ModuleEmitter::Value ModuleEmitter::emitExpr(const parser::Node *expr) {
       auto op = builder.create<py::TypeObjectOp>(loc(*expr), typeType, *cls);
       return {op.getResult(), typeType};
     }
-    return emitBindingRef(*expr, name, type);
+    std::string binding = std::string(name);
+    if (std::optional<std::string> canonical =
+            types.lookupCanonicalBinding(name))
+      binding = *canonical;
+    return emitBindingRef(*expr, binding, type);
   }
   if (expr->kind == "Call")
     return emitCall(*expr);
@@ -1085,8 +1847,26 @@ ModuleEmitter::Value ModuleEmitter::emitExpr(const parser::Node *expr) {
     return emitCompare(*expr);
   if (expr->kind == "Subscript")
     return emitSubscript(*expr);
-  if (expr->kind == "Attribute")
+  if (expr->kind == "Attribute") {
+    std::string qualified = ast::qualifiedName(expr);
+    if (!qualified.empty())
+      if (auto cls = types.lookupClass(qualified)) {
+        mlir::Type typeType = types.typeObject(*cls);
+        auto op = builder.create<py::TypeObjectOp>(loc(*expr), typeType, *cls);
+        return {op.getResult(), typeType};
+      }
+    if (!qualified.empty())
+      if (auto symbol = types.lookupSymbol(qualified)) {
+        std::string binding = qualified;
+        if (std::optional<std::string> canonical =
+                types.lookupCanonicalBinding(qualified))
+          binding = *canonical;
+        return emitBindingRef(*expr, binding, *symbol);
+      }
     return emitAttribute(*expr);
+  }
+  if (expr->kind == "Await")
+    return emitAwait(*expr);
   if (expr->kind == "List" || expr->kind == "Tuple" || expr->kind == "Dict")
     return emitContainerLiteral(*expr);
   if (expr->kind == "IfExp") {
@@ -1168,6 +1948,12 @@ ModuleEmitter::Value ModuleEmitter::emitConstant(const parser::Node &expr) {
 
 ModuleEmitter::Value ModuleEmitter::emitCall(const parser::Node &expr) {
   const parser::Node *calleeNode = ast::node(expr, "func");
+  std::string calleeQualified = ast::qualifiedName(calleeNode);
+  if (!calleeQualified.empty())
+    if (auto cls = types.lookupClass(calleeQualified))
+      return emitClassInstantiation(expr, llvm::StringRef(calleeQualified),
+                                    *cls);
+
   if (calleeNode && calleeNode->kind == "Name") {
     llvm::StringRef name = ast::nameSpelling(*calleeNode);
     if (auto cls = types.lookupClass(name))
@@ -1211,65 +1997,352 @@ ModuleEmitter::Value ModuleEmitter::emitCall(const parser::Node &expr) {
     }
   }
 
-  Value callee = emitExpr(calleeNode);
-  llvm::SmallVector<Value, 8> positional;
-  llvm::SmallVector<mlir::Type, 8> positionalTypes;
-  if (const auto *args = ast::nodeList(expr, "args"))
-    for (const parser::NodePtr &arg : *args) {
-      Value value = emitExpr(arg.get());
+  auto emitDirectCallableCall =
+      [&](Value callee, mlir::Type resultOverride = {},
+          llvm::ArrayRef<Value> leadingPositional = {},
+          bool includeAstArguments = true) -> Value {
+    llvm::SmallVector<Value, 8> positional;
+    llvm::SmallVector<char, 8> positionalUnpacked;
+    llvm::SmallVector<mlir::Type, 8> positionalTypes;
+    for (Value value : leadingPositional) {
       positional.push_back(value);
+      positionalUnpacked.push_back(0);
       positionalTypes.push_back(value.type);
     }
+    if (includeAstArguments) {
+      if (const auto *args = ast::nodeList(expr, "args"))
+        for (const parser::NodePtr &arg : *args) {
+          bool unpacked = arg && arg->kind == "Starred";
+          const parser::Node *valueNode =
+              unpacked ? ast::node(*arg, "value") : arg.get();
+          Value value = emitExpr(valueNode);
+          positional.push_back(value);
+          positionalUnpacked.push_back(unpacked ? 1 : 0);
+          if (unpacked)
+            appendStarredArgumentTypes(value.type, types, positionalTypes);
+          else
+            positionalTypes.push_back(value.type);
+        }
+    }
 
-  llvm::SmallVector<Value, 4> kwNames;
-  llvm::SmallVector<Value, 4> kwValues;
-  llvm::SmallVector<CallKeywordType, 4> keywordTypes;
-  if (const auto *keywords = ast::nodeList(expr, "keywords")) {
-    for (const parser::NodePtr &keyword : *keywords) {
-      if (auto name = ast::string(*keyword, "arg")) {
-        mlir::Type literal = types.literal("\"" + std::string(*name) + "\"");
-        auto stringOp = builder.create<py::StrConstantOp>(
-            loc(*keyword), literal, builder.getStringAttr(*name));
-        kwNames.push_back({stringOp.getResult(), literal});
-        Value keywordValue = emitExpr(ast::node(*keyword, "value"));
-        kwValues.push_back(keywordValue);
-        keywordTypes.push_back(
-            CallKeywordType{std::string(*name), keywordValue.type});
-        continue;
+    llvm::SmallVector<Value, 4> kwNames;
+    llvm::SmallVector<Value, 4> kwValues;
+    llvm::SmallVector<CallKeywordType, 4> keywordTypes;
+    if (includeAstArguments) {
+      if (const auto *keywords = ast::nodeList(expr, "keywords")) {
+        for (const parser::NodePtr &keyword : *keywords) {
+          if (auto name = ast::string(*keyword, "arg")) {
+            mlir::Type literal =
+                types.literal("\"" + std::string(*name) + "\"");
+            auto stringOp = builder.create<py::StrConstantOp>(
+                loc(*keyword), literal, builder.getStringAttr(*name));
+            kwNames.push_back({stringOp.getResult(), literal});
+            Value keywordValue = emitExpr(ast::node(*keyword, "value"));
+            kwValues.push_back(keywordValue);
+            keywordTypes.push_back(
+                CallKeywordType{std::string(*name), keywordValue.type});
+            continue;
+          }
+          kwValues.push_back(emitExpr(ast::node(*keyword, "value")));
+        }
       }
-      kwValues.push_back(emitExpr(ast::node(*keyword, "value")));
+    }
+
+    Value posPack = emitPack(positional, positionalUnpacked);
+    Value namePack = emitPack(kwNames);
+    Value valuePack = emitPack(kwValues);
+    CallInferenceResult inference =
+        types.inferCallWithEvidence(callee.type, positionalTypes, keywordTypes);
+    mlir::Type resultType =
+        resultOverride ? resultOverride
+                       : (inference ? inference.resultType : types.object());
+    auto op = builder.create<py::CallOp>(
+        loc(expr), mlir::TypeRange{resultType},
+        callProtocolFor(inference, callee.type), callee.value, posPack.value,
+        namePack.value, valuePack.value);
+    return {op.getResults().front(), resultType};
+  };
+
+  auto emitBuiltinBinding = [&](llvm::StringRef name) -> Value {
+    mlir::Type type = types.lookupSymbol(name).value_or(types.object());
+    std::string binding = name.str();
+    if (std::optional<std::string> canonical =
+            types.lookupCanonicalBinding(name))
+      binding = *canonical;
+    return emitBindingRef(*calleeNode, binding, type);
+  };
+
+  if (calleeNode && calleeNode->kind == "Name") {
+    llvm::StringRef name = ast::nameSpelling(*calleeNode);
+    const auto *args = ast::nodeList(expr, "args");
+    const auto *keywords = ast::nodeList(expr, "keywords");
+    bool builtinVisible = values.find(name) == values.end();
+    bool hasKeywords = keywords && !keywords->empty();
+    if (builtinVisible && args && args->size() == 1 && !hasKeywords &&
+        (name == "repr" || name == "print")) {
+      mlir::Type argumentType = types.inferExpr(args->front().get());
+      if (std::optional<MethodBinding> method =
+              lookupClassMethod(argumentType, "__repr__")) {
+        Value argument = emitExpr(args->front().get());
+        llvm::StringMap<Value> emptyKeywords;
+        Value repr =
+            emitInlineMethodBody(expr, argument, *method, {}, emptyKeywords);
+        if (name == "repr")
+          return repr;
+        return emitDirectCallableCall(emitBuiltinBinding(name), types.none(),
+                                      {repr}, /*includeAstArguments=*/false);
+      }
     }
   }
 
-  Value posPack = emitPack(positional);
-  Value namePack = emitPack(kwNames);
-  Value valuePack = emitPack(kwValues);
-  CallInferenceResult inference =
-      types.inferCallWithEvidence(callee.type, positionalTypes, keywordTypes);
-  mlir::Type resultType = inference ? inference.resultType : types.object();
-  auto op = builder.create<py::CallOp>(loc(expr), mlir::TypeRange{resultType},
-                                       callProtocolFor(inference, callee.type),
-                                       callee.value, posPack.value,
-                                       namePack.value, valuePack.value);
-  return {op.getResults().front(), resultType};
+  if (calleeNode && calleeNode->kind == "Name") {
+    llvm::StringRef name = ast::nameSpelling(*calleeNode);
+    if (values.find(name) == values.end())
+      if (std::optional<std::string> canonical =
+              types.lookupCanonicalBinding(name))
+        if (*canonical == "asyncio.sleep")
+          if (auto symbol = types.lookupSymbol(name))
+            return emitDirectCallableCall(
+                emitBindingRef(*calleeNode, *canonical, *symbol),
+                types.inferExpr(&expr));
+  }
+
+  if (calleeNode && calleeNode->kind == "Attribute" &&
+      !calleeQualified.empty()) {
+    if (auto symbol = types.lookupSymbol(calleeQualified)) {
+      std::string binding = calleeQualified;
+      if (std::optional<std::string> canonical =
+              types.lookupCanonicalBinding(calleeQualified))
+        binding = *canonical;
+      mlir::Type resultOverride =
+          binding == "asyncio.sleep" ? types.inferExpr(&expr) : mlir::Type();
+      return emitDirectCallableCall(
+          emitBindingRef(*calleeNode, binding, *symbol), resultOverride);
+    }
+  }
+
+  if (calleeNode && calleeNode->kind == "Attribute") {
+    if (const parser::Node *receiverNode = ast::node(*calleeNode, "value")) {
+      if (auto methodName = ast::string(*calleeNode, "attr")) {
+        Value receiver = emitExpr(receiverNode);
+        if (std::optional<MethodBinding> method =
+                lookupClassMethod(receiver.type, *methodName)) {
+          return emitInlineMethodCall(expr, receiver, *method);
+        }
+
+        llvm::SmallVector<Value, 8> positional;
+        llvm::SmallVector<char, 8> positionalUnpacked;
+        llvm::SmallVector<mlir::Type, 8> positionalTypes;
+        if (const auto *args = ast::nodeList(expr, "args"))
+          for (const parser::NodePtr &arg : *args) {
+            bool unpacked = arg && arg->kind == "Starred";
+            const parser::Node *valueNode =
+                unpacked ? ast::node(*arg, "value") : arg.get();
+            Value value = emitExpr(valueNode);
+            positional.push_back(value);
+            positionalUnpacked.push_back(unpacked ? 1 : 0);
+            if (unpacked)
+              appendStarredArgumentTypes(value.type, types, positionalTypes);
+            else
+              positionalTypes.push_back(value.type);
+          }
+
+        llvm::SmallVector<Value, 4> kwNames;
+        llvm::SmallVector<Value, 4> kwValues;
+        llvm::SmallVector<CallKeywordType, 4> keywordTypes;
+        if (const auto *keywords = ast::nodeList(expr, "keywords")) {
+          for (const parser::NodePtr &keyword : *keywords) {
+            if (auto name = ast::string(*keyword, "arg")) {
+              mlir::Type literal =
+                  types.literal("\"" + std::string(*name) + "\"");
+              auto stringOp = builder.create<py::StrConstantOp>(
+                  loc(*keyword), literal, builder.getStringAttr(*name));
+              kwNames.push_back({stringOp.getResult(), literal});
+              Value keywordValue = emitExpr(ast::node(*keyword, "value"));
+              kwValues.push_back(keywordValue);
+              keywordTypes.push_back(
+                  CallKeywordType{std::string(*name), keywordValue.type});
+              continue;
+            }
+            kwValues.push_back(emitExpr(ast::node(*keyword, "value")));
+          }
+        }
+
+        Value posPack = emitPack(positional, positionalUnpacked);
+        Value namePack = emitPack(kwNames);
+        Value valuePack = emitPack(kwValues);
+        CallInferenceResult inference = types.inferMethodCallWithEvidence(
+            receiver.type, *methodName, positionalTypes, keywordTypes);
+        mlir::Type resultType =
+            inference ? inference.resultType : types.inferExpr(&expr);
+        auto op = builder.create<py::CallOp>(
+            loc(expr), mlir::TypeRange{resultType}, callProtocolFor(inference),
+            receiver.value, posPack.value, namePack.value, valuePack.value);
+        op->setAttr("ly.bound_method", builder.getStringAttr(*methodName));
+        return {op.getResults().front(), resultType};
+      }
+    }
+  }
+
+  return emitDirectCallableCall(emitExpr(calleeNode));
+}
+
+ModuleEmitter::Value
+ModuleEmitter::emitInlineMethodCall(const parser::Node &expr, Value receiver,
+                                    const MethodBinding &method) {
+  if (!method.method)
+    return emitNone(expr);
+
+  llvm::SmallVector<Value, 8> positional;
+  if (const auto *args = ast::nodeList(expr, "args")) {
+    for (const parser::NodePtr &arg : *args) {
+      if (arg && arg->kind == "Starred") {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, arg->range.start,
+            "starred arguments are not supported for inlined class methods"});
+        continue;
+      }
+      positional.push_back(emitExpr(arg.get()));
+    }
+  }
+
+  llvm::StringMap<Value> keywords;
+  if (const auto *keywordNodes = ast::nodeList(expr, "keywords")) {
+    for (const parser::NodePtr &keyword : *keywordNodes) {
+      if (auto name = ast::string(*keyword, "arg")) {
+        keywords[*name] = emitExpr(ast::node(*keyword, "value"));
+        continue;
+      }
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, keyword->range.start,
+          "variadic keyword arguments are not supported for inlined class "
+          "methods"});
+    }
+  }
+
+  return emitInlineMethodBody(expr, receiver, method, positional, keywords);
+}
+
+ModuleEmitter::Value ModuleEmitter::emitInlineMethodBody(
+    const parser::Node &anchor, Value receiver, const MethodBinding &method,
+    llvm::ArrayRef<Value> positional, const llvm::StringMap<Value> &keywords) {
+  if (!method.method)
+    return emitNone(anchor);
+  const FunctionSignature &sig = method.signature;
+  const auto *body = ast::nodeList(*method.method, "body");
+  mlir::Type resultType = sig.resultType ? sig.resultType : types.none();
+
+  llvm::StringMap<Value> savedValues = values;
+  auto scope = types.pushScope();
+  llvm::StringSet<> bound;
+  auto bind = [&](llvm::StringRef name, Value value) {
+    values[name] = value;
+    types.bindSymbol(name, value.type);
+    bound.insert(name);
+  };
+
+  unsigned parameterIndex = 0;
+  if (!sig.positionalNames.empty()) {
+    bind(sig.positionalNames.front(), receiver);
+    parameterIndex = 1;
+  }
+
+  for (Value argument : positional) {
+    if (parameterIndex >= sig.positionalNames.size()) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, anchor.range.start,
+          "too many positional arguments for inlined class method"});
+      break;
+    }
+    bind(sig.positionalNames[parameterIndex++], argument);
+  }
+
+  auto bindKeyword = [&](llvm::StringRef name, Value value) {
+    for (llvm::StringRef positionalName : sig.positionalNames) {
+      if (positionalName != name)
+        continue;
+      if (bound.contains(name)) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, anchor.range.start,
+            "multiple values for inlined class method argument '" + name.str() +
+                "'"});
+        return;
+      }
+      bind(name, value);
+      return;
+    }
+    for (llvm::StringRef kwOnlyName : sig.kwOnlyNames) {
+      if (kwOnlyName != name)
+        continue;
+      bind(name, value);
+      return;
+    }
+    diagnostics.push_back(
+        parser::Diagnostic{parser::Severity::Error, anchor.range.start,
+                           "unexpected keyword argument '" + name.str() +
+                               "' for inlined class method"});
+  };
+  for (auto &entry : keywords)
+    bindKeyword(entry.getKey(), entry.getValue());
+
+  mlir::Block *entryBlock = builder.getInsertionBlock();
+  mlir::Region *region = entryBlock ? entryBlock->getParent() : nullptr;
+  if (!region) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, anchor.range.start,
+        "inlined class method call requires an active insertion region"});
+    values = std::move(savedValues);
+    return emitNone(anchor);
+  }
+  mlir::Block *continuation =
+      entryBlock->splitBlock(builder.getInsertionPoint());
+  continuation->addArgument(resultType, loc(anchor));
+  mlir::Block *bodyBlock =
+      builder.createBlock(region, continuation->getIterator());
+
+  builder.setInsertionPointToEnd(entryBlock);
+  builder.create<mlir::cf::BranchOp>(loc(anchor), bodyBlock);
+  builder.setInsertionPointToStart(bodyBlock);
+  inlineReturnContexts.push_back(InlineReturnContext{continuation, resultType});
+  emitStatements(body);
+  inlineReturnContexts.pop_back();
+  if (!insertionBlockTerminated(builder)) {
+    if (resultType != types.none()) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, method.method->range.start,
+          "inlined class method can fall through without returning a value"});
+    }
+    Value none = emitNone(anchor);
+    Value result = coerceValue(none, resultType, anchor);
+    builder.create<mlir::cf::BranchOp>(loc(anchor), continuation, result.value);
+  }
+  builder.setInsertionPointToStart(continuation);
+  values = std::move(savedValues);
+  return {continuation->getArgument(0), resultType};
 }
 
 ModuleEmitter::Value ModuleEmitter::emitClassInstantiation(
     const parser::Node &expr, llvm::StringRef name, mlir::Type instanceType) {
-  mlir::Type classType = types.typeObject(instanceType);
-  auto classObject =
-      builder.create<py::TypeObjectOp>(loc(expr), classType, instanceType);
-
   llvm::SmallVector<Value, 8> positional;
   if (const auto *args = ast::nodeList(expr, "args"))
     for (const parser::NodePtr &arg : *args)
       positional.push_back(emitExpr(arg.get()));
+  llvm::SmallVector<mlir::Type, 8> positionalTypes;
+  positionalTypes.reserve(positional.size());
+  for (const Value &arg : positional)
+    positionalTypes.push_back(arg.type);
+
+  mlir::Type inferredInstanceType =
+      types.inferClassInstantiation(instanceType, positionalTypes, {});
+  mlir::Type classType = types.typeObject(inferredInstanceType);
+  auto classObject = builder.create<py::TypeObjectOp>(loc(expr), classType,
+                                                      inferredInstanceType);
   Value posPack = emitPack(positional);
   Value emptyNames = emitPack({});
   Value emptyValues = emitPack({});
 
   auto newOp = builder.create<py::NewOp>(
-      loc(expr), instanceType,
+      loc(expr), inferredInstanceType,
       mlir::FlatSymbolRefAttr::get(&context, "__new__"), callableProtocol(),
       classObject.getResult(), posPack.value, emptyNames.value,
       emptyValues.value);
@@ -1278,7 +2351,7 @@ ModuleEmitter::Value ModuleEmitter::emitClassInstantiation(
       mlir::FlatSymbolRefAttr::get(&context, "__init__"), callableProtocol(),
       newOp.getInstance(), posPack.value, emptyNames.value, emptyValues.value);
   (void)name;
-  return {newOp.getInstance(), instanceType};
+  return {newOp.getInstance(), inferredInstanceType};
 }
 
 ModuleEmitter::Value ModuleEmitter::emitUnary(const parser::Node &expr) {
@@ -1386,6 +2459,31 @@ ModuleEmitter::Value ModuleEmitter::emitCompare(const parser::Node &expr) {
   }
   Value rhs = emitExpr(comparators->front().get());
   const parser::Node *op = ops && !ops->empty() ? ops->front().get() : nullptr;
+  auto emitNoneIdentityTest = [&](Value candidate,
+                                  Value other) -> std::optional<Value> {
+    auto unionType = mlir::dyn_cast_if_present<py::UnionType>(candidate.type);
+    if (!unionType || !unionType.hasMember(types.none()) ||
+        !isNoneTypeLike(other.type))
+      return std::nullopt;
+
+    auto test = builder.create<py::UnionTestOp>(
+        loc(expr), builder.getI1Type(), candidate.value,
+        mlir::TypeAttr::get(types.none()));
+    mlir::Value bit = test.getResult();
+    if (ast::isOperator(op, "IsNot")) {
+      auto one = builder.create<mlir::arith::ConstantIntOp>(loc(expr), 1, 1);
+      bit = builder.create<mlir::arith::XOrIOp>(loc(expr), bit, one);
+    }
+    auto pyBool =
+        builder.create<py::CastFromPrimOp>(loc(expr), types.boolType(), bit);
+    return Value{pyBool.getResult(), types.boolType()};
+  };
+  if (ast::isOperator(op, "Is") || ast::isOperator(op, "IsNot")) {
+    if (auto narrowed = emitNoneIdentityTest(lhs, rhs))
+      return *narrowed;
+    if (auto narrowed = emitNoneIdentityTest(rhs, lhs))
+      return *narrowed;
+  }
   if (ast::isOperator(op, "NotEq") || ast::isOperator(op, "IsNot"))
     return emitBinarySpecial<py::NeOp>(expr, "__ne__", lhs, rhs,
                                        types.boolType());
@@ -1420,8 +2518,41 @@ ModuleEmitter::Value ModuleEmitter::emitSubscript(const parser::Node &expr) {
 ModuleEmitter::Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
   Value object = emitExpr(ast::node(expr, "value"));
   mlir::Type result = types.inferExpr(&expr);
+  if (auto attr = ast::string(expr, "attr"))
+    if (std::optional<mlir::Type> field = lookupClassField(object.type, *attr))
+      result = *field;
   auto op = builder.create<py::AttrGetOp>(loc(expr), result, object.value,
                                           *ast::string(expr, "attr"));
+  return {op.getResult(), result};
+}
+
+ModuleEmitter::Value ModuleEmitter::emitAwait(const parser::Node &expr) {
+  Value awaitable = emitExpr(ast::node(expr, "value"));
+  return emitAwaitValue(expr, awaitable);
+}
+
+ModuleEmitter::Value ModuleEmitter::emitAwaitValue(const parser::Node &anchor,
+                                                   Value awaitable) {
+  const py::protocols::Table &table = py::protocols::Table::get(context);
+  std::optional<py::protocols::AwaitableResolution> resolution =
+      table.resolveAwaitableWithEvidence(types.widenLiteral(awaitable.type));
+  mlir::Type result = resolution ? resolution->payloadType : types.object();
+  mlir::Type awaitContract = callableProtocol();
+  if (resolution && resolution->awaitContract)
+    awaitContract =
+        callProtocolFor(resolution->awaitContract->method.signature);
+  if (!resolution) {
+    std::string typeText;
+    llvm::raw_string_ostream typeStream(typeText);
+    typeStream << awaitable.type;
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, anchor.range.start,
+        "await expression requires an Awaitable value, got " +
+            typeStream.str()});
+  }
+
+  auto op = builder.create<py::AwaitOp>(loc(anchor), result, awaitContract,
+                                        awaitable.value);
   return {op.getResult(), result};
 }
 
@@ -1476,7 +2607,8 @@ ModuleEmitter::Value ModuleEmitter::emitNone(const parser::Node &anchor) {
   return {op.getResult(), types.none()};
 }
 
-ModuleEmitter::Value ModuleEmitter::emitPack(mlir::ArrayRef<Value> valuesIn) {
+ModuleEmitter::Value ModuleEmitter::emitPack(mlir::ArrayRef<Value> valuesIn,
+                                             llvm::ArrayRef<char> unpacked) {
   llvm::SmallVector<mlir::Value, 8> operands;
   llvm::SmallVector<mlir::Type, 8> elementTypes;
   for (Value value : valuesIn) {
@@ -1488,6 +2620,16 @@ ModuleEmitter::Value ModuleEmitter::emitPack(mlir::ArrayRef<Value> valuesIn) {
   mlir::Type resultType = types.tupleOf(element);
   auto op =
       builder.create<py::PackOp>(builder.getUnknownLoc(), resultType, operands);
+  if (!unpacked.empty() && anyTrue(unpacked)) {
+    if (unpacked.size() != valuesIn.size()) {
+      diagnostics.push_back(
+          parser::Diagnostic{parser::Severity::Error,
+                             {},
+                             "internal pack unpack metadata mismatch"});
+    } else {
+      op->setAttr(kPackUnpackedOperandsAttr, boolArray(builder, unpacked));
+    }
+  }
   return {op.getResult(), resultType};
 }
 
@@ -1503,9 +2645,14 @@ ModuleEmitter::Value ModuleEmitter::coerceValue(Value value,
       return {op.getResult(), targetType};
     }
   }
-  if (mlir::isa<py::ContractType, py::LiteralType, py::ProtocolType,
-                py::CallableType, py::TypeType, py::SelfType, py::TypeVarType,
-                py::ParamSpecType>(targetType)) {
+  if (mlir::isa<py::ProtocolType>(targetType)) {
+    auto op = builder.create<py::ProtocolViewOp>(loc(anchor), targetType,
+                                                 value.value);
+    return {op.getResult(), targetType};
+  }
+  if (mlir::isa<py::ContractType, py::LiteralType, py::CallableType,
+                py::TypeType, py::SelfType, py::TypeVarType, py::ParamSpecType>(
+          targetType)) {
     auto op =
         builder.create<py::ClassUpcastOp>(loc(anchor), targetType, value.value);
     return {op.getResult(), targetType};
@@ -1515,6 +2662,8 @@ ModuleEmitter::Value ModuleEmitter::coerceValue(Value value,
 
 mlir::Value ModuleEmitter::emitBoolValue(Value value,
                                          const parser::Node &anchor) {
+  if (value.value && value.value.getType().isInteger(1))
+    return value.value;
   CallInferenceResult inference =
       types.inferMethodCallWithEvidence(value.type, "__bool__", {});
   auto op = builder.create<py::BoolOp>(

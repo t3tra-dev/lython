@@ -309,6 +309,12 @@ mlir::LogicalResult ExceptMatchOp::verify() {
   return requireTypeAttr(getOperation(), "handler");
 }
 
+mlir::LogicalResult ExceptCurrentMatchOp::verify() {
+  if (mlir::failed(requireI1(getOperation(), getResult().getType(), "result")))
+    return mlir::failure();
+  return requireTypeAttr(getOperation(), "handler");
+}
+
 mlir::LogicalResult AwaitOp::verify() {
   return verifyResolvedProtocolCall(getOperation(), "await_contract");
 }

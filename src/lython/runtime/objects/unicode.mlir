@@ -1,8 +1,26 @@
 module attributes {ly.runtime.contracts = ["builtins.object", "builtins.str"]} {
   func.func private @LyHost_Print(memref<?xi8>, i64)
   func.func private @LyHost_PrintLine(memref<?xi8>, i64)
+  func.func private @LyBaseException_New(%class_id: i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func private @LyBaseException_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func private @LyEH_ThrowException(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>)
 
   func.func private @LyBuiltin_Repr() -> (memref<2xi64>, memref<?xi8>) attributes {ly.runtime.builtin = "repr", ly.runtime.builtin_lowering = "method", ly.runtime.builtin_method = "__repr__", ly.runtime.contract = "builtins.object", ly.runtime.primitive = "builtin_repr", ly.runtime.result_contract = "builtins.str"}
+
+  memref.global "private" constant @__ly_unicode_msg_string_index_out_of_range : memref<25xi8> = dense<[115, 116, 114, 105, 110, 103, 32, 105, 110, 100, 101, 120, 32, 111, 117, 116, 32, 111, 102, 32, 114, 97, 110, 103, 101]>
+
+  func.func private @__ly_unicode_raise_index_error() {
+    %class_id = arith.constant 55 : i64
+    %length = arith.constant 25 : i64
+    %start = arith.constant 0 : index
+    %message_static = memref.get_global @__ly_unicode_msg_string_index_out_of_range : memref<25xi8>
+    %message = memref.cast %message_static : memref<25xi8> to memref<?xi8>
+    %exception:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%message, %start, %length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    func.call @LyEH_ThrowException(%initialized#0, %initialized#1, %initialized#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    func.return
+  }
 
   func.func private @__ly_unicode_alloc(%len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.primitive = "alloc"} {
     %header = memref.alloc() {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<2xi64>
@@ -110,39 +128,45 @@ module attributes {ly.runtime.contracts = ["builtins.object", "builtins.str"]} {
     %lower_ok = arith.cmpi sge, %index, %zero : i64
     %upper_ok = arith.cmpi slt, %index, %codepoints : i64
     %valid = arith.andi %lower_ok, %upper_ok : i1
-    cf.assert %valid, "str index out of range"
-
-    %c0 = arith.constant 0 : index
-    %c1 = arith.constant 1 : index
-    %byte_count = memref.dim %bytes, %c0 : memref<?xi8>
-    %false = arith.constant false
-    %continuation_mask = arith.constant 192 : i64
-    %continuation_tag = arith.constant 128 : i64
-    %scan:5 = scf.for %i = %c0 to %byte_count step %c1 iter_args(%ordinal = %zero, %start = %c0, %end = %byte_count, %found = %false, %done = %false) -> (i64, index, index, i1, i1) {
-      %byte = memref.load %bytes[%i] : memref<?xi8>
-      %byte_i64 = arith.extui %byte : i8 to i64
-      %tag = arith.andi %byte_i64, %continuation_mask : i64
-      %is_start = arith.cmpi ne, %tag, %continuation_tag : i64
-      %ordinal_matches = arith.cmpi eq, %ordinal, %index : i64
-      %not_found = arith.cmpi eq, %found, %false : i1
-      %not_done = arith.cmpi eq, %done, %false : i1
-      %start_candidate = arith.andi %is_start, %ordinal_matches : i1
-      %take_start_base = arith.andi %start_candidate, %not_found : i1
-      %take_start = arith.andi %take_start_base, %not_done : i1
-      %next_start = arith.select %take_start, %i, %start : i1, index
-      %next_found = arith.ori %found, %take_start : i1
-      %end_candidate = arith.andi %found, %is_start : i1
-      %take_end = arith.andi %end_candidate, %not_done : i1
-      %next_end = arith.select %take_end, %i, %end : i1, index
-      %next_done = arith.ori %done, %take_end : i1
-      %incremented = arith.addi %ordinal, %one : i64
-      %next_ordinal = arith.select %is_start, %incremented, %ordinal : i1, i64
-      scf.yield %next_ordinal, %next_start, %next_end, %next_found, %next_done : i64, index, index, i1, i1
+    %result:2 = scf.if %valid -> (memref<2xi64>, memref<?xi8>) {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %byte_count = memref.dim %bytes, %c0 : memref<?xi8>
+      %false = arith.constant false
+      %continuation_mask = arith.constant 192 : i64
+      %continuation_tag = arith.constant 128 : i64
+      %scan:5 = scf.for %i = %c0 to %byte_count step %c1 iter_args(%ordinal = %zero, %start = %c0, %end = %byte_count, %found = %false, %done = %false) -> (i64, index, index, i1, i1) {
+        %byte = memref.load %bytes[%i] : memref<?xi8>
+        %byte_i64 = arith.extui %byte : i8 to i64
+        %tag = arith.andi %byte_i64, %continuation_mask : i64
+        %is_start = arith.cmpi ne, %tag, %continuation_tag : i64
+        %ordinal_matches = arith.cmpi eq, %ordinal, %index : i64
+        %not_found = arith.cmpi eq, %found, %false : i1
+        %not_done = arith.cmpi eq, %done, %false : i1
+        %start_candidate = arith.andi %is_start, %ordinal_matches : i1
+        %take_start_base = arith.andi %start_candidate, %not_found : i1
+        %take_start = arith.andi %take_start_base, %not_done : i1
+        %next_start = arith.select %take_start, %i, %start : i1, index
+        %next_found = arith.ori %found, %take_start : i1
+        %end_candidate = arith.andi %found, %is_start : i1
+        %take_end = arith.andi %end_candidate, %not_done : i1
+        %next_end = arith.select %take_end, %i, %end : i1, index
+        %next_done = arith.ori %done, %take_end : i1
+        %incremented = arith.addi %ordinal, %one : i64
+        %next_ordinal = arith.select %is_start, %incremented, %ordinal : i1, i64
+        scf.yield %next_ordinal, %next_start, %next_end, %next_found, %next_done : i64, index, index, i1, i1
+      }
+      %length_index = arith.subi %scan#2, %scan#1 : index
+      %length = arith.index_cast %length_index : index to i64
+      %result_header, %result_bytes = func.call @LyUnicode_FromBytes(%bytes, %scan#1, %length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      scf.yield %result_header, %result_bytes : memref<2xi64>, memref<?xi8>
+    } else {
+      func.call @__ly_unicode_raise_index_error() : () -> ()
+      %c0 = arith.constant 0 : index
+      %result_header, %result_bytes = func.call @LyUnicode_FromBytes(%bytes, %c0, %zero) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      scf.yield %result_header, %result_bytes : memref<2xi64>, memref<?xi8>
     }
-    %length_index = arith.subi %scan#2, %scan#1 : index
-    %length = arith.index_cast %length_index : index to i64
-    %result_header, %result_bytes = func.call @LyUnicode_FromBytes(%bytes, %scan#1, %length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
-    func.return %result_header, %result_bytes : memref<2xi64>, memref<?xi8>
+    func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
   func.func @LyUnicode_Copy(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.primitive = "copy"} {

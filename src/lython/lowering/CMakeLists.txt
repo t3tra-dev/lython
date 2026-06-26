@@ -1,19 +1,29 @@
 add_library(LythonRuntimeLowering STATIC
     Common/RuntimeLibrary.cpp
     Passes/Lowering.cpp
+    Passes/RuntimeLowering/AwaitOps.cpp
+    Passes/RuntimeLowering/CallableABI.cpp
+    Passes/RuntimeLowering/CallableEvidence.cpp
     Passes/RuntimeLowering/CallableOps.cpp
+    Passes/RuntimeLowering/CallablePlanning.cpp
     Passes/RuntimeLowering/EHCleanup.cpp
+    Passes/RuntimeLowering/ControlFlowABI.cpp
     Passes/RuntimeLowering/ExceptionOps.cpp
     Passes/RuntimeLowering/Finalize.cpp
+    Passes/RuntimeLowering/GetItemOps.cpp
+    Passes/RuntimeLowering/IndirectCallableOps.cpp
     Passes/RuntimeLowering/LowererCore.cpp
     Passes/RuntimeLowering/LowererDispatch.cpp
     Passes/RuntimeLowering/ManifestCalls.cpp
     Passes/RuntimeLowering/ManifestIndex.cpp
+    Passes/RuntimeLowering/ObjectBundles.cpp
     Passes/RuntimeLowering/Passes.cpp
+    Passes/RuntimeLowering/ReturnedSummaries.cpp
     Passes/RuntimeLowering/RuntimeABI.cpp
     Passes/RuntimeLowering/RuntimeCalls.cpp
     Passes/RuntimeLowering/SpecialMethodOps.cpp
     Passes/RuntimeLowering/Support.cpp
+    Passes/RuntimeLowering/TryOps.cpp
     Passes/RuntimeLowering/ValueOps.cpp
 )
 
@@ -65,8 +75,19 @@ foreach(runtime_object_mlir IN LISTS LYTHON_RUNTIME_OBJECT_MLIR)
     list(APPEND LYTHON_RUNTIME_OBJECT_BYTECODE "${runtime_object_bc}")
 endforeach()
 
-add_custom_target(LythonRuntimeObjectBytecode
+set(LYTHON_RUNTIME_OBJECT_BYTECODE_STAMP
+    "${LYTHON_RUNTIME_OBJECT_BYTECODE_DIR}/runtime_bytecode.stamp"
+)
+add_custom_command(
+    OUTPUT "${LYTHON_RUNTIME_OBJECT_BYTECODE_STAMP}"
+    COMMAND ${CMAKE_COMMAND} -E touch "${LYTHON_RUNTIME_OBJECT_BYTECODE_STAMP}"
     DEPENDS ${LYTHON_RUNTIME_OBJECT_BYTECODE}
+    COMMENT "Stamping runtime MLIR bytecode"
+    VERBATIM
+)
+
+add_custom_target(LythonRuntimeObjectBytecode
+    DEPENDS "${LYTHON_RUNTIME_OBJECT_BYTECODE_STAMP}"
 )
 add_dependencies(LythonRuntimeLowering LythonRuntimeObjectBytecode)
 
@@ -88,7 +109,17 @@ set(arrays "")
 set(entries "")
 foreach(path IN LISTS module_list)
     get_filename_component(name "${path}" NAME_WE)
+    if(NOT EXISTS "${path}")
+        message(FATAL_ERROR "runtime bytecode module is missing: ${path}")
+    endif()
+    file(SIZE "${path}" byte_size)
+    if(byte_size EQUAL 0)
+        message(FATAL_ERROR "runtime bytecode module is empty: ${path}")
+    endif()
     file(READ "${path}" hex HEX)
+    if(hex STREQUAL "")
+        message(FATAL_ERROR "runtime bytecode module read as empty: ${path}")
+    endif()
     string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," bytes "${hex}")
     string(APPEND arrays
         "static const unsigned char k_${name}[] = {${bytes}};\n")
@@ -99,17 +130,16 @@ set(content "// Generated from src/lython/lowering/CMakeLists.txt. Do not edit.
 #include \"embedded.h\"
 
 namespace py::runtime_library::embedded {
-namespace {
+  namespace {
 
 ${arrays}
-const Module kModules[] = {
-${entries}};
+  const Module kModules[] = {${entries}};
 
-} // namespace
+  } // namespace
 
-const Module *modules() { return kModules; }
+  const Module *modules() { return kModules; }
 
-std::size_t moduleCount() { return sizeof(kModules) / sizeof(kModules[0]); }
+  std::size_t moduleCount() { return sizeof(kModules) / sizeof(kModules[0]); }
 
 } // namespace py::runtime_library::embedded
 ")
@@ -123,12 +153,13 @@ add_custom_command(
         -DOUTPUT=${LYTHON_EMBEDDED_RUNTIME_CPP}
         -DMODULES=${LYTHON_EMBEDDED_RUNTIME_INPUTS}
         -P ${LYTHON_EMBEDDED_RUNTIME_GENERATOR}
-    DEPENDS ${LYTHON_RUNTIME_OBJECT_BYTECODE}
+    DEPENDS "${LYTHON_RUNTIME_OBJECT_BYTECODE_STAMP}"
         ${LYTHON_EMBEDDED_RUNTIME_GENERATOR}
     COMMENT "Embedding runtime MLIR bytecode"
     VERBATIM
 )
 add_library(LythonEmbeddedRuntime STATIC "${LYTHON_EMBEDDED_RUNTIME_CPP}")
+add_dependencies(LythonEmbeddedRuntime LythonRuntimeObjectBytecode)
 target_include_directories(LythonEmbeddedRuntime
     PUBLIC
     ${CMAKE_SOURCE_DIR}/src/lython/runtime

@@ -5,18 +5,37 @@ namespace py::runtime_lowering {
 mlir::LogicalResult RuntimeBundleLowerer::bundleRuntimeResults(
     mlir::Operation *op, mlir::Type expectedContract, mlir::func::CallOp call,
     RuntimeBundle &result) {
-  std::string expected = runtimeContractName(expectedContract);
-  if (expected.empty())
-    return op->emitError() << "runtime call result has no concrete contract";
+  return bundleRuntimeResults(op, expectedContract, call.getResults(), result);
+}
 
-  mlir::Type contract = runtimeContractType(context, expected);
-  if (objectShapeMatches(expected, call.getResults()))
-    return RuntimeBundleLowerer::makeObjectBundle(op, contract,
-                                                  call.getResults(), result);
-  if (mlir::succeeded(initializeObjectFromRawValues(
-          op, contract, call.getResults(), result, /*emitErrors=*/false)))
+mlir::LogicalResult RuntimeBundleLowerer::bundleRuntimeResults(
+    mlir::Operation *op, mlir::Type expectedContract, mlir::ValueRange values,
+    RuntimeBundle &result) {
+  std::string expected = runtimeContractName(expectedContract);
+  mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> expectedTypes =
+      RuntimeBundleLowerer::runtimeValueTypesFor(op, expectedContract,
+                                                 "runtime call result ABI");
+  if (mlir::failed(expectedTypes))
+    return mlir::failure();
+
+  bool exact = values.size() == expectedTypes->size();
+  if (exact) {
+    for (auto [value, expectedType] : llvm::zip(values, *expectedTypes)) {
+      if (value.getType() == expectedType)
+        continue;
+      exact = false;
+      break;
+    }
+  }
+  if (exact)
+    return RuntimeBundleLowerer::makeObjectBundle(op, expectedContract, values,
+                                                  result);
+  if (!expected.empty() &&
+      mlir::succeeded(initializeObjectFromRawValues(
+          op, runtimeContractType(context, expected), values, result,
+          /*emitErrors=*/false)))
     return mlir::success();
-  return RuntimeBundleLowerer::makeObjectBundle(op, contract, call.getResults(),
+  return RuntimeBundleLowerer::makeObjectBundle(op, expectedContract, values,
                                                 result);
 }
 
@@ -59,6 +78,7 @@ RuntimeBundleLowerer::createRuntimeCall(mlir::Location loc,
                                         const RuntimeSymbol &symbol,
                                         mlir::ValueRange operands) {
   mlir::func::FuncOp function = symbol.function;
+  emitTryCallSiteMarkerIfNeeded(loc);
   return builder.create<mlir::func::CallOp>(
       loc, function.getSymName(), function.getFunctionType().getResults(),
       operands);
@@ -78,8 +98,77 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
     if (!function || !function->hasAttr("callable_type"))
       return mlir::WalkResult::advance();
 
+    auto returnedCoroutine =
+        returnedCoroutineSummaries.find(function.getSymName());
+    auto returnedObjectEvidence =
+        returnedObjectEvidenceSummaries.find(function.getSymName());
+    mlir::FunctionType functionType = function.getFunctionType();
     llvm::SmallVector<mlir::Value, 8> operands;
+    unsigned resultIndex = 0;
+    unsigned logicalResultIndex = 0;
+    builder.setInsertionPoint(op);
+    auto appendPrimitiveReturnEvidence =
+        [&](const RuntimeBundle &bundle) -> mlir::LogicalResult {
+      if (bundle.contractName() != "builtins.int" ||
+          resultIndex + 2 > functionType.getNumResults() ||
+          !functionType.getResult(resultIndex).isInteger(64) ||
+          !functionType.getResult(resultIndex + 1).isInteger(1))
+        return mlir::success();
+      if (bundle.primitiveI64) {
+        operands.push_back(bundle.primitiveI64->value);
+        operands.push_back(bundle.primitiveI64->valid);
+      } else {
+        operands.push_back(
+            builder.create<mlir::arith::ConstantIntOp>(op.getLoc(), 0, 64)
+                .getResult());
+        operands.push_back(
+            builder.create<mlir::arith::ConstantIntOp>(op.getLoc(), 0, 1)
+                .getResult());
+      }
+      resultIndex += 2;
+      return mlir::success();
+    };
+    auto appendReturnObject =
+        [&](const RuntimeBundle &bundle,
+            llvm::StringRef label) -> mlir::LogicalResult {
+      llvm::ArrayRef<mlir::Value> values = bundle.physicalValues();
+      if (resultIndex + values.size() <= functionType.getNumResults()) {
+        bool exact = true;
+        for (auto [offset, value] : llvm::enumerate(values)) {
+          if (value.getType() != functionType.getResult(resultIndex + offset)) {
+            exact = false;
+            break;
+          }
+        }
+        if (exact) {
+          operands.append(values.begin(), values.end());
+          resultIndex += static_cast<unsigned>(values.size());
+          return appendPrimitiveReturnEvidence(bundle);
+        }
+      }
+
+      if (resultIndex < functionType.getNumResults() &&
+          bundle.kind == RuntimeBundle::Kind::Object &&
+          isBuiltinsObjectHeaderType(functionType.getResult(resultIndex))) {
+        mlir::FailureOr<mlir::Value> header =
+            RuntimeBundleLowerer::objectHeaderView(op, bundle.objectValue);
+        if (mlir::failed(header))
+          return mlir::failure();
+        operands.push_back(*header);
+        ++resultIndex;
+        return appendPrimitiveReturnEvidence(bundle);
+      }
+
+      return op.emitError() << "cannot adapt " << bundle.contractName() << " "
+                            << label << " to callable return ABI "
+                            << resultIndex << " of " << function.getSymName();
+    };
+
     for (mlir::Value operand : op.getOperands()) {
+      if (mlir::failed(RuntimeBundleLowerer::ensureValueBundle(op, operand))) {
+        result = mlir::failure();
+        return mlir::WalkResult::interrupt();
+      }
       const RuntimeBundle *bundle = RuntimeBundleLowerer::bundleFor(operand);
       if (!bundle) {
         op.emitError() << "callable function return value has no lowered "
@@ -87,11 +176,95 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
         result = mlir::failure();
         return mlir::WalkResult::interrupt();
       }
-      llvm::ArrayRef<mlir::Value> values = bundle->physicalValues();
-      operands.append(values.begin(), values.end());
+      if (mlir::failed(appendReturnObject(*bundle, "return value"))) {
+        result = mlir::failure();
+        return mlir::WalkResult::interrupt();
+      }
+      if (returnedCoroutine != returnedCoroutineSummaries.end() &&
+          runtimeContractName(operand.getType()) == "types.CoroutineType") {
+        if (bundle->coroutineTarget != returnedCoroutine->second.target) {
+          op.emitError()
+              << "returned coroutine target evidence does not match function "
+                 "ABI summary";
+          result = mlir::failure();
+          return mlir::WalkResult::interrupt();
+        }
+        if (bundle->coroutineSources.size() !=
+            returnedCoroutine->second.sourceContracts.size()) {
+          op.emitError() << "returned coroutine frame source count does not "
+                            "match function ABI summary";
+          result = mlir::failure();
+          return mlir::WalkResult::interrupt();
+        }
+        for (auto [index, source] : llvm::enumerate(bundle->coroutineSources)) {
+          mlir::Type expected =
+              returnedCoroutine->second.sourceContracts[index];
+          if (runtimeContractName(source.contract) !=
+              runtimeContractName(expected)) {
+            op.emitError() << "returned coroutine frame source " << index
+                           << " has contract " << source.contract
+                           << ", expected " << expected;
+            result = mlir::failure();
+            return mlir::WalkResult::interrupt();
+          }
+          RuntimeBundle sourceBundle =
+              RuntimeBundle::object(source.contract, source.values);
+          if (mlir::failed(
+                  appendReturnObject(sourceBundle, "coroutine frame source"))) {
+            result = mlir::failure();
+            return mlir::WalkResult::interrupt();
+          }
+        }
+      }
+      if (returnedObjectEvidence != returnedObjectEvidenceSummaries.end() &&
+          returnedObjectEvidence->second.resultIndex == logicalResultIndex) {
+        for (llvm::StringRef flag : returnedObjectEvidence->second.flags) {
+          if (!bundle->objectEvidence.hasFlag(flag)) {
+            op.emitError() << "returned object evidence for "
+                           << function.getSymName() << " is missing flag '"
+                           << flag << "'";
+            result = mlir::failure();
+            return mlir::WalkResult::interrupt();
+          }
+        }
+        for (const ReturnedObjectEvidenceSlot &slot :
+             returnedObjectEvidence->second.slots) {
+          const RuntimeValue *value = bundle->objectEvidence.slot(slot.name);
+          if (!value) {
+            op.emitError() << "returned object evidence for "
+                           << function.getSymName() << " is missing slot '"
+                           << slot.name << "'";
+            result = mlir::failure();
+            return mlir::WalkResult::interrupt();
+          }
+          if (runtimeContractName(value->contract) !=
+              runtimeContractName(slot.sourceContract)) {
+            op.emitError() << "returned object evidence slot '" << slot.name
+                           << "' has contract " << value->contract
+                           << ", expected " << slot.sourceContract;
+            result = mlir::failure();
+            return mlir::WalkResult::interrupt();
+          }
+          RuntimeBundle valueBundle =
+              RuntimeBundle::object(value->contract, value->values);
+          if (mlir::failed(appendReturnObject(
+                  valueBundle, "returned object evidence slot"))) {
+            result = mlir::failure();
+            return mlir::WalkResult::interrupt();
+          }
+        }
+      }
+      ++logicalResultIndex;
+    }
+    if (resultIndex != functionType.getNumResults()) {
+      op.emitError() << "callable return ABI expected "
+                     << functionType.getNumResults()
+                     << " physical values, but lowering produced "
+                     << resultIndex;
+      result = mlir::failure();
+      return mlir::WalkResult::interrupt();
     }
 
-    builder.setInsertionPoint(op);
     builder.create<mlir::func::ReturnOp>(op.getLoc(), operands);
     erase.push_back(op);
     return mlir::WalkResult::advance();

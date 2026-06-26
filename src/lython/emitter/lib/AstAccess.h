@@ -3,6 +3,7 @@
 #include "Ast.h"
 
 #include <optional>
+#include <string>
 #include <string_view>
 
 namespace lython::emitter::ast {
@@ -88,6 +89,23 @@ inline std::string_view nameSpelling(const parser::Node &node) {
   if (auto arg = string(node, "arg"))
     return *arg;
   return {};
+}
+
+inline std::string qualifiedName(const parser::Node *node) {
+  if (!node)
+    return {};
+  if (node->kind == "Name")
+    return std::string(nameSpelling(*node));
+  if (node->kind != "Attribute")
+    return {};
+
+  std::string base = qualifiedName(ast::node(*node, "value"));
+  auto attr = string(*node, "attr");
+  if (base.empty() || !attr)
+    return {};
+  base.push_back('.');
+  base.append(attr->begin(), attr->end());
+  return base;
 }
 
 } // namespace lython::emitter::ast

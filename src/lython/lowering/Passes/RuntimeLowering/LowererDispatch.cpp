@@ -22,6 +22,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPyOp(mlir::Operation *op) {
           [&](auto typeObject) { return lowerTypeObject(typeObject); })
       .Case<py::ClassUpcastOp, py::ClassRefineOp, py::ProtocolViewOp>(
           [&](auto view) { return lowerAliasViewOp(view); })
+      .Case<py::UnionWrapOp>([&](auto wrap) { return lowerUnionWrap(wrap); })
+      .Case<py::UnionTestOp>([&](auto test) { return lowerUnionTest(test); })
+      .Case<py::UnionUnwrapOp>(
+          [&](auto unwrap) { return lowerUnionUnwrap(unwrap); })
+      .Case<py::AttrGetOp>([&](auto attr) { return lowerAttrGet(attr); })
+      .Case<py::AttrSetOp>([&](auto attr) { return lowerAttrSet(attr); })
       .Case<py::PackOp>([&](auto pack) { return lowerPack(pack); })
       .Case<py::BindingRefOp>(
           [&](auto binding) { return lowerBindingRef(binding); })
@@ -30,6 +36,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPyOp(mlir::Operation *op) {
       .Case<py::RaiseOp>([&](auto raise) { return lowerRaise(raise); })
       .Case<py::RaiseCurrentOp>(
           [&](auto raiseCurrent) { return lowerRaiseCurrent(raiseCurrent); })
+      .Case<py::ExceptMatchOp>(
+          [&](auto match) { return lowerExceptMatch(match); })
+      .Case<py::ExceptCurrentMatchOp>(
+          [&](auto match) { return lowerExceptCurrentMatch(match); })
       .Case<py::CallOp>([&](auto call) { return lowerCall(call); })
       .Case<py::BoolOp>([&](auto boolean) { return lowerBool(boolean); })
       .Case<py::LenOp>([&](auto len) { return lowerLen(len); })
@@ -42,6 +52,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPyOp(mlir::Operation *op) {
       .Case<py::AExitOp>([&](auto exit) { return lowerAExit(exit); })
       .Case<py::AIterOp>([&](auto iter) { return lowerAIter(iter); })
       .Case<py::ANextOp>([&](auto next) { return lowerANext(next); })
+      .Case<py::AwaitOp>([&](auto await) { return lowerAwait(await); })
       .Case<py::SetItemOp>([&](auto setItem) { return lowerSetItem(setItem); })
       .Case<py::DelItemOp>([&](auto delItem) { return lowerDelItem(delItem); })
       .Case<py::ContainsOp>(

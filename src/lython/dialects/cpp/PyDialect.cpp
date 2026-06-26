@@ -23,9 +23,10 @@ namespace py {
 void PyDialect::initialize() {
   addTypes<IntType, FloatType, BoolType, StrType, NoneType, ObjectType,
            TupleType, DictType, ListType, IteratorStateType, ClassType,
-           ContractType, LiteralType, TypeVarType, ParamSpecType, TypeType,
-           ProtocolType, ExceptionType, ExceptionCellType, TracebackType,
-           LocationType, CallableType, UnionType, OverloadType, SelfType>();
+           ContractType, LiteralType, TypeVarType, ParamSpecType,
+           TypeVarTupleType, UnpackType, TypeType, ProtocolType, ExceptionType,
+           ExceptionCellType, TracebackType, LocationType, CallableType,
+           UnionType, OverloadType, SelfType>();
 
   addOperations<
 #define GET_OP_LIST
@@ -86,7 +87,7 @@ mlir::Type PyDialect::parseType(mlir::DialectAsmParser &parser) const {
     }
     return mlir::success();
   };
-  auto parseCallableType = [&]() -> mlir::Type {
+  auto parseCallableType = [&](bool arrowResults) -> mlir::Type {
     llvm::SmallVector<mlir::Type, 4> positionalTypes;
     llvm::SmallVector<mlir::Type, 4> kwonlyTypes;
     llvm::SmallVector<mlir::Type, 4> resultTypes;
@@ -109,6 +110,7 @@ mlir::Type PyDialect::parseType(mlir::DialectAsmParser &parser) const {
     bool kwDefaultsSeen = false;
     bool varargNameSeen = false;
     bool kwargsNameSeen = false;
+    bool returnsSeen = false;
 
     if (mlir::failed(parseTypeList(positionalTypes)))
       return mlir::Type();
@@ -185,16 +187,29 @@ mlir::Type PyDialect::parseType(mlir::DialectAsmParser &parser) const {
         kwargsNameSeen = true;
         continue;
       }
+      if (!arrowResults && section == "returns") {
+        if (returnsSeen || parser.parseEqual() ||
+            mlir::failed(parseTypeList(resultTypes)))
+          return mlir::Type();
+        returnsSeen = true;
+        continue;
+      }
       parser.emitError(parser.getCurrentLocation(),
                        "unexpected token '" + section +
                            "' in Callable contract declaration");
       return mlir::Type();
     }
 
-    if (parser.parseArrow())
+    if (arrowResults) {
+      if (parser.parseArrow())
+        return mlir::Type();
+      if (mlir::failed(parseTypeList(resultTypes)))
+        return mlir::Type();
+    } else if (!returnsSeen) {
+      parser.emitError(parser.getCurrentLocation(),
+                       "expected 'returns = [...]' in Callable contract");
       return mlir::Type();
-    if (mlir::failed(parseTypeList(resultTypes)))
-      return mlir::Type();
+    }
 
     auto wrongSize = [&](llvm::StringRef name, std::size_t got,
                          std::size_t expected) {
@@ -291,6 +306,22 @@ mlir::Type PyDialect::parseType(mlir::DialectAsmParser &parser) const {
       return mlir::Type();
     return ParamSpecType::get(ctx, nameAttr.getValue());
   }
+  if (keyword == "typevartuple") {
+    if (parser.parseLess())
+      return mlir::Type();
+    mlir::StringAttr nameAttr;
+    if (parser.parseAttribute(nameAttr) || parser.parseGreater())
+      return mlir::Type();
+    return TypeVarTupleType::get(ctx, nameAttr.getValue());
+  }
+  if (keyword == "unpack") {
+    if (parser.parseLess())
+      return mlir::Type();
+    mlir::Type packedType;
+    if (parser.parseType(packedType) || parser.parseGreater())
+      return mlir::Type();
+    return UnpackType::get(ctx, packedType);
+  }
   if (keyword == "tuple") {
     if (parser.parseLess())
       return mlir::Type();
@@ -378,6 +409,14 @@ mlir::Type PyDialect::parseType(mlir::DialectAsmParser &parser) const {
     }
     return OverloadType::get(ctx, candidateTypes);
   }
+  if (keyword == "callable") {
+    if (parser.parseLess())
+      return mlir::Type();
+    mlir::Type callable = parseCallableType(/*arrowResults=*/false);
+    if (!callable || parser.parseGreater())
+      return mlir::Type();
+    return callable;
+  }
   if (keyword == "class") {
     if (parser.parseLess())
       return mlir::Type();
@@ -402,7 +441,7 @@ mlir::Type PyDialect::parseType(mlir::DialectAsmParser &parser) const {
     if (parser.parseAttribute(protocolNameAttr) || parser.parseComma())
       return mlir::Type();
     if (protocolNameAttr.getValue() == "Callable") {
-      mlir::Type callable = parseCallableType();
+      mlir::Type callable = parseCallableType(/*arrowResults=*/true);
       if (!callable || parser.parseGreater())
         return mlir::Type();
       return callable;
@@ -437,7 +476,10 @@ void PyDialect::printType(mlir::Type type,
     for (std::size_t index = 0; index < attrs.size(); ++index) {
       if (index != 0)
         printer << ", ";
-      printer << attrs[index];
+      if (attrs[index])
+        printer << attrs[index];
+      else
+        printer << "\"\"";
     }
     printer << "]";
   };
@@ -499,6 +541,12 @@ void PyDialect::printType(mlir::Type type,
       .Case<ParamSpecType>([&](ParamSpecType paramSpecTy) {
         printer << "paramspec<\"" << paramSpecTy.getName() << "\">";
       })
+      .Case<TypeVarTupleType>([&](TypeVarTupleType typeVarTupleTy) {
+        printer << "typevartuple<\"" << typeVarTupleTy.getName() << "\">";
+      })
+      .Case<UnpackType>([&](UnpackType unpackTy) {
+        printer << "unpack<" << unpackTy.getPackedType() << ">";
+      })
       .Case<TypeType>([&](TypeType typeTy) {
         printer << "type<" << typeTy.getInstanceType() << ">";
       })
@@ -508,7 +556,7 @@ void PyDialect::printType(mlir::Type type,
         printer << ">";
       })
       .Case<CallableType>([&](CallableType sigTy) {
-        printer << "protocol<\"Callable\", ";
+        printer << "callable<";
         printTypeList(sigTy.getPositionalTypes());
         if (sigTy.getPositionalOnlyCount() != 0)
           printer << ", posonly = " << sigTy.getPositionalOnlyCount();
@@ -542,7 +590,7 @@ void PyDialect::printType(mlir::Type type,
           printer << ", vararg_name = " << sigTy.getVarargName();
         if (sigTy.getKwargName())
           printer << ", kwargs_name = " << sigTy.getKwargName();
-        printer << " -> ";
+        printer << ", returns = ";
         printTypeList(sigTy.getResultTypes());
         printer << ">";
       })

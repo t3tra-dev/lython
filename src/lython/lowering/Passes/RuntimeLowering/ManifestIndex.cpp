@@ -2,6 +2,25 @@
 
 namespace py::runtime_lowering {
 
+namespace {
+
+class VerificationResult {
+public:
+  void fail() { result = mlir::failure(); }
+
+  void check(mlir::LogicalResult candidate) {
+    if (mlir::failed(candidate))
+      fail();
+  }
+
+  mlir::LogicalResult get() const { return result; }
+
+private:
+  mlir::LogicalResult result = mlir::success();
+};
+
+} // namespace
+
 RuntimeManifestIndex::RuntimeManifestIndex(mlir::ModuleOp module)
     : module(module) {
   build(module);
@@ -10,9 +29,18 @@ RuntimeManifestIndex::RuntimeManifestIndex(mlir::ModuleOp module)
 std::optional<RuntimeSymbol>
 RuntimeManifestIndex::lookup(llvm::StringRef contract, llvm::StringRef role,
                              llvm::StringRef name) const {
-  auto found = symbols.find(runtimeKey(contract, role, name));
-  if (found == symbols.end())
+  llvm::ArrayRef<RuntimeSymbol> candidates = lookupAll(contract, role, name);
+  if (candidates.empty())
     return std::nullopt;
+  return candidates.front();
+}
+
+llvm::ArrayRef<RuntimeSymbol>
+RuntimeManifestIndex::lookupAll(llvm::StringRef contract, llvm::StringRef role,
+                                llvm::StringRef name) const {
+  auto found = symbolSets.find(runtimeKey(contract, role, name));
+  if (found == symbolSets.end())
+    return {};
   return found->second;
 }
 
@@ -26,6 +54,12 @@ std::optional<RuntimeSymbol>
 RuntimeManifestIndex::method(llvm::StringRef contract,
                              llvm::StringRef name) const {
   return lookup(contract, "method", name);
+}
+
+llvm::ArrayRef<RuntimeSymbol>
+RuntimeManifestIndex::methodCandidates(llvm::StringRef contract,
+                                       llvm::StringRef name) const {
+  return lookupAll(contract, "method", name);
 }
 
 std::optional<RuntimeSymbol>
@@ -59,26 +93,25 @@ RuntimeManifestIndex::classId(llvm::StringRef contract) const {
 }
 
 mlir::LogicalResult RuntimeManifestIndex::verify() {
-  mlir::LogicalResult result = mlir::success();
-  auto markFailure = [&] { result = mlir::failure(); };
+  VerificationResult verified;
 
   for (RuntimeSymbolDuplicate &duplicate : duplicateSymbols) {
     duplicate.duplicate.emitError()
         << "duplicate runtime manifest symbol for " << duplicate.contract << " "
         << duplicate.role << " " << duplicate.name << "; first definition is @"
         << duplicate.first.getSymName();
-    markFailure();
+    verified.fail();
   }
 
   for (RuntimeBuiltinDuplicate &duplicate : duplicateBuiltins) {
     duplicate.duplicate.emitError()
         << "duplicate runtime builtin binding " << duplicate.name
         << "; first definition is @" << duplicate.first.getSymName();
-    markFailure();
+    verified.fail();
   }
 
   if (malformedContractsAttr)
-    markFailure();
+    verified.fail();
 
   for (const auto &entry : declaredContracts) {
     llvm::StringRef contract = entry.getKey();
@@ -86,7 +119,7 @@ mlir::LogicalResult RuntimeManifestIndex::verify() {
       continue;
     module.emitError() << "runtime contract " << contract << " is declared in "
                        << kManifestContractsAttr << " but has no ABI shape";
-    markFailure();
+    verified.fail();
   }
 
   for (RuntimeShapeDefinition &definition : shapeDefinitions) {
@@ -101,7 +134,7 @@ mlir::LogicalResult RuntimeManifestIndex::verify() {
         << describeTypeSequence(definition.valueTypes)
         << ", but canonical shape from " << shape->source << " is "
         << describeTypeSequence(shape->valueTypes);
-    markFailure();
+    verified.fail();
   }
 
   for (RuntimeClassIdDefinition &definition : classIdDefinitions) {
@@ -111,14 +144,14 @@ mlir::LogicalResult RuntimeManifestIndex::verify() {
     definition.function.emitError()
         << "runtime class id for " << definition.contract << " is "
         << definition.classId << ", but canonical class id is " << *expected;
-    markFailure();
+    verified.fail();
   }
 
-  for (auto &entry : symbols)
-    if (mlir::failed(verifySymbol(entry.second)))
-      markFailure();
+  for (auto &entry : symbolSets)
+    for (RuntimeSymbol &symbol : entry.second)
+      verified.check(verifySymbol(symbol));
 
-  return result;
+  return verified.get();
 }
 
 void RuntimeManifestIndex::recordDeclaredContracts(mlir::ModuleOp module) {
@@ -216,6 +249,7 @@ void RuntimeManifestIndex::record(mlir::func::FuncOp function,
                        role.str(),
                        name.str(),
                        stringAttr(kManifestResultContractAttr),
+                       stringAttr(kManifestResultEvidenceAttr),
                        stringAttr(kManifestElementContractAttr),
                        stringAttr(kManifestNextContractAttr),
                        stringAttr(kManifestBuiltinAttr),
@@ -226,15 +260,22 @@ void RuntimeManifestIndex::record(mlir::func::FuncOp function,
                        std::move(defaultArguments),
                        validResultIndex};
   std::string key = runtimeKey(contract, role, name);
+  llvm::SmallVector<RuntimeSymbol, 2> &candidates = symbolSets[key];
   auto existing = symbols.find(key);
   if (existing != symbols.end()) {
-    duplicateSymbols.push_back(RuntimeSymbolDuplicate{existing->second.function,
-                                                      function, contract.str(),
-                                                      role.str(), name.str()});
+    if (role != "method") {
+      duplicateSymbols.push_back(
+          RuntimeSymbolDuplicate{existing->second.function, function,
+                                 contract.str(), role.str(), name.str()});
+      candidates.push_back(std::move(symbol));
+      return;
+    }
+    candidates.push_back(std::move(symbol));
     return;
   }
   symbols[key] = std::move(symbol);
   RuntimeSymbol &stored = symbols.find(key)->second;
+  candidates.push_back(stored);
   if (!stored.builtinName.empty())
     recordBuiltin(stored);
 }
@@ -344,19 +385,18 @@ RuntimeManifestIndex::verifyNextResultPartition(RuntimeSymbol &symbol) {
            << "runtime manifest valid_result_index for " << symbol.contract
            << "." << symbol.name << " must point at an i1 result";
 
-  mlir::LogicalResult result = mlir::success();
+  VerificationResult verified;
   if (!symbol.elementContract.empty()) {
     const RuntimeValueShape *elementShape = requireShape(
         symbol.function, symbol.elementContract, "next element result");
     if (!elementShape) {
-      result = mlir::failure();
+      verified.fail();
     } else {
       llvm::SmallVector<mlir::Type, 4> elementTypes =
           takeSlice(functionType.getResults(), 0, validIndex);
-      if (mlir::failed(verifyTypeSequence(
-              symbol.function, "next element result", symbol.elementContract,
-              elementTypes, *elementShape)))
-        result = mlir::failure();
+      verified.check(verifyTypeSequence(symbol.function, "next element result",
+                                        symbol.elementContract, elementTypes,
+                                        *elementShape));
     }
   }
 
@@ -364,18 +404,17 @@ RuntimeManifestIndex::verifyNextResultPartition(RuntimeSymbol &symbol) {
     const RuntimeValueShape *nextShape =
         requireShape(symbol.function, symbol.nextContract, "next state result");
     if (!nextShape) {
-      result = mlir::failure();
+      verified.fail();
     } else {
       llvm::SmallVector<mlir::Type, 4> nextTypes =
           takeSlice(functionType.getResults(), validIndex + 1,
                     functionType.getNumResults());
-      if (mlir::failed(verifyTypeSequence(symbol.function, "next state result",
-                                          symbol.nextContract, nextTypes,
-                                          *nextShape)))
-        result = mlir::failure();
+      verified.check(verifyTypeSequence(symbol.function, "next state result",
+                                        symbol.nextContract, nextTypes,
+                                        *nextShape));
     }
   }
-  return result;
+  return verified.get();
 }
 
 mlir::LogicalResult
@@ -386,13 +425,13 @@ RuntimeManifestIndex::verifyClassIdArguments(RuntimeSymbol &symbol) {
     return symbol.function.emitError()
            << "runtime class id arguments are only supported on initializers";
 
-  mlir::LogicalResult result = mlir::success();
+  VerificationResult verified;
   mlir::FunctionType functionType = symbol.function.getFunctionType();
   for (unsigned inputIndex : symbol.classIdArgumentIndices) {
     if (inputIndex >= functionType.getNumInputs()) {
       symbol.function.emitError() << "runtime class id argument index "
                                   << inputIndex << " is outside the input list";
-      result = mlir::failure();
+      verified.fail();
       continue;
     }
     if (!functionType.getInput(inputIndex).isInteger(64)) {
@@ -400,21 +439,21 @@ RuntimeManifestIndex::verifyClassIdArguments(RuntimeSymbol &symbol) {
           << "runtime class id argument " << inputIndex << " for "
           << symbol.contract << "." << symbol.name
           << " must be an i64 input, got " << functionType.getInput(inputIndex);
-      result = mlir::failure();
+      verified.fail();
     }
   }
   if (!classId(symbol.contract)) {
     symbol.function.emitError()
         << "runtime class id argument for " << symbol.contract
         << " requires a ly.runtime.class_id declaration";
-    result = mlir::failure();
+    verified.fail();
   }
-  return result;
+  return verified.get();
 }
 
 mlir::LogicalResult
 RuntimeManifestIndex::verifyDefaultArguments(RuntimeSymbol &symbol) {
-  mlir::LogicalResult result = mlir::success();
+  VerificationResult verified;
   mlir::FunctionType functionType = symbol.function.getFunctionType();
   for (unsigned inputIndex = 0; inputIndex < functionType.getNumInputs();
        ++inputIndex) {
@@ -427,19 +466,19 @@ RuntimeManifestIndex::verifyDefaultArguments(RuntimeSymbol &symbol) {
       symbol.function.emitError()
           << "runtime input " << inputIndex
           << " cannot declare both i64 and f64 defaults";
-      result = mlir::failure();
+      verified.fail();
     }
     if (defaultI64) {
       if (!inputType.isInteger(64)) {
         symbol.function.emitError()
             << "runtime default_i64 input " << inputIndex
             << " must be an i64 input, got " << inputType;
-        result = mlir::failure();
+        verified.fail();
       }
       if (!mlir::isa<mlir::IntegerAttr>(defaultI64)) {
         symbol.function.emitError() << "runtime default_i64 input "
                                     << inputIndex << " must be an IntegerAttr";
-        result = mlir::failure();
+        verified.fail();
       }
     }
     if (defaultF64) {
@@ -447,16 +486,16 @@ RuntimeManifestIndex::verifyDefaultArguments(RuntimeSymbol &symbol) {
         symbol.function.emitError()
             << "runtime default_f64 input " << inputIndex
             << " must be an f64 input, got " << inputType;
-        result = mlir::failure();
+        verified.fail();
       }
       if (!mlir::isa<mlir::FloatAttr>(defaultF64)) {
         symbol.function.emitError() << "runtime default_f64 input "
                                     << inputIndex << " must be a FloatAttr";
-        result = mlir::failure();
+        verified.fail();
       }
     }
   }
-  return result;
+  return verified.get();
 }
 
 mlir::LogicalResult
@@ -506,36 +545,59 @@ RuntimeManifestIndex::verifyBuiltinCallable(RuntimeSymbol &symbol) {
                               functionType.getInputs(), *shape);
   }
 
+  if (symbol.builtinLowering == "direct") {
+    if (symbol.resultContract.empty())
+      return symbol.function.emitError()
+             << "runtime builtin binding " << symbol.builtinName
+             << " with direct lowering must declare "
+                "ly.runtime.result_contract";
+    return mlir::success();
+  }
+
+  if (symbol.builtinLowering == "asyncio_sleep") {
+    if (symbol.resultContract != "types.CoroutineType")
+      return symbol.function.emitError()
+             << "runtime builtin binding " << symbol.builtinName
+             << " with asyncio_sleep lowering must declare "
+                "ly.runtime.result_contract = \"types.CoroutineType\"";
+    return mlir::success();
+  }
+
   return symbol.function.emitError()
          << "runtime builtin binding " << symbol.builtinName
          << " has unsupported lowering strategy " << symbol.builtinLowering;
 }
 
 mlir::LogicalResult RuntimeManifestIndex::verifySymbol(RuntimeSymbol &symbol) {
-  mlir::LogicalResult result = mlir::success();
-  auto markFailure = [&] { result = mlir::failure(); };
+  VerificationResult verified;
 
-  if (mlir::failed(verifyBuiltinCallable(symbol)))
-    markFailure();
-  if (mlir::failed(verifyDefaultArguments(symbol)))
-    markFailure();
-  if (mlir::failed(verifyClassIdArguments(symbol)))
-    markFailure();
-  if (symbol.role == "initializer" &&
-      mlir::failed(
-          verifyResultShape(symbol, symbol.contract, "initializer result")))
-    markFailure();
-  if (symbol.role == "method" && mlir::failed(verifyReceiverShape(symbol)))
-    markFailure();
-  if (!symbol.resultContract.empty() &&
-      mlir::failed(verifyResultShape(symbol, symbol.resultContract,
-                                     "declared result_contract")))
-    markFailure();
-  if (symbol.validResultIndex &&
-      mlir::failed(verifyNextResultPartition(symbol)))
-    markFailure();
+  verified.check(verifyBuiltinCallable(symbol));
+  verified.check(verifyDefaultArguments(symbol));
+  verified.check(verifyClassIdArguments(symbol));
+  if (symbol.role == "initializer")
+    verified.check(
+        verifyResultShape(symbol, symbol.contract, "initializer result"));
+  if (symbol.role == "method")
+    verified.check(verifyReceiverShape(symbol));
+  if (!symbol.resultContract.empty())
+    verified.check(verifyResultShape(symbol, symbol.resultContract,
+                                     "declared result_contract"));
+  if (!symbol.resultEvidence.empty()) {
+    if (symbol.resultEvidence != "receiver") {
+      symbol.function.emitError() << kManifestResultEvidenceAttr
+                                  << " must currently be empty or \"receiver\"";
+      verified.fail();
+    } else if (symbol.role != "method") {
+      symbol.function.emitError()
+          << kManifestResultEvidenceAttr
+          << " = \"receiver\" is only valid for runtime methods";
+      verified.fail();
+    }
+  }
+  if (symbol.validResultIndex)
+    verified.check(verifyNextResultPartition(symbol));
 
-  return result;
+  return verified.get();
 }
 
 } // namespace py::runtime_lowering

@@ -1,5 +1,4 @@
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
-#include "mlir/Conversion/AsyncToLLVM/AsyncToLLVM.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
 #include "mlir/Conversion/ConvertToLLVM/ToLLVMPass.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
@@ -9,7 +8,6 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Async/IR/Async.h"
-#include "mlir/Dialect/Async/Passes.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Bufferization/Transforms/FuncBufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
@@ -23,7 +21,6 @@
 #include "mlir/Dialect/SCF/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
-#include "mlir/ExecutionEngine/AsyncRuntime.h"
 #include "mlir/ExecutionEngine/ExecutionEngine.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/DialectRegistry.h"
@@ -132,7 +129,7 @@ createLLVMThreadSafetyVerifierPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createNativeVerificationPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createAsyncRuntimeRewritePass();
+createAsyncThunkLoweringPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createLinalgLoweringPass();
 } // namespace py
 
@@ -333,6 +330,21 @@ LogicalResult runLoweringPhase(llvm::StringRef name, MLIRContext &context,
   return pm.run(module);
 }
 
+LogicalResult requireNoAsyncDialectOps(ModuleOp module) {
+  LogicalResult result = success();
+  module.walk([&](Operation *op) {
+    if (op->getName().getDialectNamespace() != "async")
+      return WalkResult::advance();
+    op->emitError()
+        << "unlowered async dialect operation remains after Lython async "
+           "runtime lowering; MLIR bundled async runtime is not part of the "
+           "runtime model";
+    result = failure();
+    return WalkResult::interrupt();
+  });
+  return result;
+}
+
 LogicalResult runPipeline(ModuleOp module, MLIRContext &context,
                           const IRDumpConfig &irDump) {
   dumpMLIRForPass(irDump, "frontend", module);
@@ -352,22 +364,6 @@ LogicalResult runPipeline(ModuleOp module, MLIRContext &context,
           })))
     return failure();
   dumpMLIRForPass(irDump, "publication-preparation", module);
-
-  // Phase 3: Reference counting insertion
-  if (failed(runLoweringPhase("refcount-insertion", context, module,
-                              [&](PassManager &pm) {
-                                pm.addPass(py::createRefCountInsertionPass());
-                              })))
-    return failure();
-  dumpMLIRForPass(irDump, "refcount-insertion", module);
-
-  // Phase 3.1: Proven refcount pair elision
-  if (failed(runLoweringPhase("refcount-elision", context, module,
-                              [&](PassManager &pm) {
-                                pm.addPass(py::createRefCountPairElisionPass());
-                              })))
-    return failure();
-  dumpMLIRForPass(irDump, "refcount-elision", module);
 
   // Phase 3.15: High-level Py semantic optimizations. This must run before
   // runtime MLIR embedding so the imported runtime roots match the optimized
@@ -415,6 +411,38 @@ LogicalResult runPipeline(ModuleOp module, MLIRContext &context,
     return failure();
   dumpMLIRForPass(irDump, "runtime-lowering", module);
 
+  // Phase 5.05: Manifest-driven ownership release insertion. This runs after
+  // runtime lowering because only then do user operations expose concrete
+  // runtime calls and runtime-library deallocator ABI shapes.
+  if (failed(runLoweringPhase("refcount-insertion", context, module,
+                              [&](PassManager &pm) {
+                                pm.addPass(py::createRefCountInsertionPass());
+                              })))
+    return failure();
+  dumpMLIRForPass(irDump, "refcount-insertion", module);
+
+  // Phase 5.06: Proven refcount pair elision.
+  if (failed(runLoweringPhase("refcount-elision", context, module,
+                              [&](PassManager &pm) {
+                                pm.addPass(py::createRefCountPairElisionPass());
+                              })))
+    return failure();
+  dumpMLIRForPass(irDump, "refcount-elision", module);
+
+  // Phase 5.1: Lower Lython-owned Python await thunks from the MLIR async
+  // dialect to the Lython runtime ABI before symbol cleanup can erase the
+  // statically selected coroutine body.
+  if (failed(runLoweringPhase("async-thunk-lowering", context, module,
+                              [&](PassManager &pm) {
+                                pm.addPass(py::createAsyncThunkLoweringPass());
+                                pm.addPass(mlir::createCanonicalizerPass());
+                                pm.addPass(mlir::createCSEPass());
+                              })))
+    return failure();
+  dumpMLIRForPass(irDump, "async-thunk-lowering", module);
+  if (failed(requireNoAsyncDialectOps(module)))
+    return failure();
+
   // Phase 5.5: Let generic MLIR cleanup remove artifacts created by lowering
   // and runtime embedding.
   if (failed(runLoweringPhase("post-lowering-cleanup", context, module,
@@ -447,59 +475,6 @@ LogicalResult runPipeline(ModuleOp module, MLIRContext &context,
           })))
     return failure();
   dumpMLIRForPass(irDump, "thread-safety-verifier", module);
-
-  // Phase 6: Lower async.func/async.await to the MLIR async runtime, then
-  // convert those runtime ops to LLVM. Lython owns Awaitable protocol
-  // descriptors linearly, so async runtime refcounting is emitted by Py
-  // lowering instead of the generic MLIR async refcount pass.
-  if (failed(runLoweringPhase(
-          "async-runtime", context, module, [&](PassManager &pm) {
-            pm.addPass(mlir::createAsyncFuncToAsyncRuntimePass());
-            pm.addPass(mlir::createAsyncToAsyncRuntimePass());
-          })))
-    return failure();
-  dumpMLIRForPass(irDump, "async-runtime", module);
-  if (failed(runLoweringPhase("async-exception-rewrite", context, module,
-                              [&](PassManager &pm) {
-                                pm.addPass(py::createAsyncRuntimeRewritePass());
-                              })))
-    return failure();
-  dumpMLIRForPass(irDump, "async-exception-rewrite", module);
-  SmallVector<py::AsyncArgProvenanceContract> asyncArgContracts;
-  {
-    PerfScope perf("lowering.collect-async-provenance");
-    py::collectAsyncArgProvenanceContracts(module, asyncArgContracts);
-  }
-  if (failed(runLoweringPhase(
-          "convert-async-to-llvm", context, module, [&](PassManager &pm) {
-            pm.addPass(mlir::createConvertAsyncToLLVMPass());
-            pm.addPass(mlir::createCanonicalizerPass());
-            pm.addPass(mlir::createCSEPass());
-          })))
-    return failure();
-  {
-    PerfScope perf("lowering.preserve-async-provenance");
-    if (failed(py::preserveLLVMAsyncArgProvenanceContracts(module,
-                                                           asyncArgContracts)))
-      return failure();
-  }
-  if (failed(runLoweringPhase("post-async-rewrite", context, module,
-                              [&](PassManager &pm) {
-                                pm.addPass(py::createAsyncRuntimeRewritePass());
-                              })))
-    return failure();
-  {
-    PerfScope perf("lowering.post-async-final-cleanup");
-    py::optimizer::pipeline::finalLLVMCleanup(module);
-  }
-  dumpMLIRForPass(irDump, "async-to-llvm", module);
-  if (failed(runLoweringPhase("post-async-ownership-verifier", context, module,
-                              [&](PassManager &pm) {
-                                pm.addPass(
-                                    py::createLLVMCallOwnershipVerifierPass());
-                              })))
-    return failure();
-  dumpMLIRForPass(irDump, "post-async-ownership-verifier", module);
 
   // Phase 7: Final lowering to LLVM
   {
@@ -563,6 +538,13 @@ buildRuntimeSymbolMap(llvm::orc::MangleAndInterner interner) {
   add("LyHost_PrintLine", &LyHost_PrintLine);
   add("LyRt_InstallStackGuard", &LyRt_InstallStackGuard);
   add("LyEH_ThrowException", &LyEH_ThrowException);
+  add("LyEH_BeginCatch", &LyEH_BeginCatch);
+  add("LyEH_ClassIdMatches", &LyEH_ClassIdMatches);
+  add("LyEH_CurrentExceptionClassId", &LyEH_CurrentExceptionClassId);
+  add("LyEH_CurrentExceptionMatches", &LyEH_CurrentExceptionMatches);
+  add("LyEH_DiscardCurrentExceptionIfMatches",
+      &LyEH_DiscardCurrentExceptionIfMatches);
+  add("LyEH_DiscardCurrentException", &LyEH_DiscardCurrentException);
   add("LyEH_RethrowCurrent", &LyEH_RethrowCurrent);
   add("LyEH_TakeCurrentDescriptor", &LyEH_TakeCurrentDescriptor);
   add("LyTraceback_Push", &LyTraceback_Push);
@@ -572,47 +554,6 @@ buildRuntimeSymbolMap(llvm::orc::MangleAndInterner interner) {
   add("LyTraceback_Clear", &LyTraceback_Clear);
   add("LyTraceback_PrintMessage", &LyTraceback_PrintMessage);
   add("LyRunPythonMain", &LyRunPythonMain);
-  add("mlirAsyncRuntimeAddRef", &mlir::runtime::mlirAsyncRuntimeAddRef);
-  add("mlirAsyncRuntimeDropRef", &mlir::runtime::mlirAsyncRuntimeDropRef);
-  add("mlirAsyncRuntimeCreateToken",
-      &mlir::runtime::mlirAsyncRuntimeCreateToken);
-  add("mlirAsyncRuntimeCreateValue",
-      &mlir::runtime::mlirAsyncRuntimeCreateValue);
-  add("mlirAsyncRuntimeCreateGroup",
-      &mlir::runtime::mlirAsyncRuntimeCreateGroup);
-  add("mlirAsyncRuntimeAddTokenToGroup",
-      &mlir::runtime::mlirAsyncRuntimeAddTokenToGroup);
-  add("mlirAsyncRuntimeEmplaceToken",
-      &mlir::runtime::mlirAsyncRuntimeEmplaceToken);
-  add("mlirAsyncRuntimeEmplaceValue",
-      &mlir::runtime::mlirAsyncRuntimeEmplaceValue);
-  add("mlirAsyncRuntimeSetTokenError",
-      &mlir::runtime::mlirAsyncRuntimeSetTokenError);
-  add("mlirAsyncRuntimeSetValueError",
-      &mlir::runtime::mlirAsyncRuntimeSetValueError);
-  add("mlirAsyncRuntimeIsTokenError",
-      &mlir::runtime::mlirAsyncRuntimeIsTokenError);
-  add("mlirAsyncRuntimeIsValueError",
-      &mlir::runtime::mlirAsyncRuntimeIsValueError);
-  add("mlirAsyncRuntimeIsGroupError",
-      &mlir::runtime::mlirAsyncRuntimeIsGroupError);
-  add("mlirAsyncRuntimeAwaitToken", &mlir::runtime::mlirAsyncRuntimeAwaitToken);
-  add("mlirAsyncRuntimeAwaitValue", &mlir::runtime::mlirAsyncRuntimeAwaitValue);
-  add("mlirAsyncRuntimeAwaitAllInGroup",
-      &mlir::runtime::mlirAsyncRuntimeAwaitAllInGroup);
-  add("mlirAsyncRuntimeExecute", &mlir::runtime::mlirAsyncRuntimeExecute);
-  add("mlirAsyncRuntimeGetValueStorage",
-      &mlir::runtime::mlirAsyncRuntimeGetValueStorage);
-  add("mlirAsyncRuntimeAwaitTokenAndExecute",
-      &mlir::runtime::mlirAsyncRuntimeAwaitTokenAndExecute);
-  add("mlirAsyncRuntimeAwaitValueAndExecute",
-      &mlir::runtime::mlirAsyncRuntimeAwaitValueAndExecute);
-  add("mlirAsyncRuntimeAwaitAllInGroupAndExecute",
-      &mlir::runtime::mlirAsyncRuntimeAwaitAllInGroupAndExecute);
-  add("mlirAsyncRuntimGetNumWorkerThreads",
-      &mlir::runtime::mlirAsyncRuntimGetNumWorkerThreads);
-  add("mlirAsyncRuntimePrintCurrentThreadId",
-      &mlir::runtime::mlirAsyncRuntimePrintCurrentThreadId);
   return symbolMap;
 }
 
@@ -1352,7 +1293,7 @@ LogicalResult emitObjectFile(llvm::Module &llvmModule,
 }
 
 LogicalResult linkExecutable(StringRef objectPath, StringRef runtimeLib,
-                             StringRef asyncRuntimeLib, StringRef outputPath) {
+                             StringRef outputPath) {
   auto clangExe = llvm::sys::findProgramByName("clang++");
   if (!clangExe)
     clangExe = llvm::sys::findProgramByName("clang");
@@ -1375,12 +1316,6 @@ LogicalResult linkExecutable(StringRef objectPath, StringRef runtimeLib,
   argStorage.emplace_back(runtimeLib.str());
   argStorage.emplace_back("-Wl,--no-whole-archive");
 #endif
-  if (!asyncRuntimeLib.empty()) {
-    argStorage.emplace_back(asyncRuntimeLib.str());
-    llvm::SmallString<256> asyncRuntimeDir(asyncRuntimeLib);
-    llvm::sys::path::remove_filename(asyncRuntimeDir);
-    argStorage.emplace_back("-Wl,-rpath," + asyncRuntimeDir.str().str());
-  }
   argStorage.emplace_back("-O2");
 #if defined(__linux__)
   argStorage.emplace_back("-no-pie");
@@ -1404,21 +1339,6 @@ LogicalResult linkExecutable(StringRef objectPath, StringRef runtimeLib,
     return failure();
   }
   return success();
-}
-
-// The async runtime dylib transitively loads libLLVM, which costs hundreds of
-// milliseconds of dyld fixups at every process start. Link it only when the
-// translated module actually references the MLIR async runtime ABI. The
-// prefix intentionally omits the trailing "e" to cover the upstream
-// mlirAsyncRuntimGetNumWorkerThreads spelling.
-bool usesAsyncRuntime(const llvm::Module &llvmModule) {
-  for (const llvm::Function &function : llvmModule) {
-    if (!function.getName().starts_with("mlirAsyncRuntim"))
-      continue;
-    if (!function.isDeclaration() || !function.use_empty())
-      return true;
-  }
-  return false;
 }
 
 std::optional<FileLineColLoc> findPythonSourceLoc(Location loc) {
@@ -1529,8 +1449,7 @@ void attachPythonDebugInfo(ModuleOp module) {
 
 LogicalResult buildExecutable(llvm::Module &llvmModule,
                               const LLVMSafetyProfile &safetyProfile,
-                              StringRef runtimeLib, StringRef asyncRuntimeLib,
-                              StringRef outputPath) {
+                              StringRef runtimeLib, StringRef outputPath) {
   llvm::SmallString<256> objectPath;
   if (auto ec =
           llvm::sys::fs::createTemporaryFile("lython", ".o", objectPath)) {
@@ -1541,8 +1460,7 @@ LogicalResult buildExecutable(llvm::Module &llvmModule,
   llvm::FileRemover objCleanup(objectPath);
   if (failed(emitObjectFile(llvmModule, safetyProfile, objectPath)))
     return failure();
-  if (failed(
-          linkExecutable(objectPath, runtimeLib, asyncRuntimeLib, outputPath)))
+  if (failed(linkExecutable(objectPath, runtimeLib, outputPath)))
     return failure();
   return success();
 }
@@ -1806,10 +1724,6 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  llvm::SmallString<256> asyncRuntimeLibPath(LYTHON_MLIR_ASYNC_RUNTIME_LIBRARY);
-  if (!llvm::sys::fs::exists(asyncRuntimeLibPath))
-    asyncRuntimeLibPath.clear();
-
   bool isPythonInput = llvm::sys::path::extension(inputPath) == ".py";
 
   DialectRegistry registry;
@@ -1904,11 +1818,8 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  if (!usesAsyncRuntime(*llvmModule))
-    asyncRuntimeLibPath.clear();
-
   return failed(buildExecutable(*llvmModule, safetyProfile, runtimeLibPath,
-                                asyncRuntimeLibPath, outputPath))
+                                outputPath))
              ? 1
              : 0;
 }
