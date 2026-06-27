@@ -1,30 +1,39 @@
 add_library(LythonRuntimeLowering STATIC
     Common/RuntimeLibrary.cpp
     Passes/Lowering.cpp
-    Passes/RuntimeLowering/AwaitOps.cpp
-    Passes/RuntimeLowering/CallableABI.cpp
-    Passes/RuntimeLowering/CallableEvidence.cpp
-    Passes/RuntimeLowering/CallableOps.cpp
+    Passes/RuntimeLowering/ABI/CallableABI.cpp
+    Passes/RuntimeLowering/ABI/ControlFlowABI.cpp
+    Passes/RuntimeLowering/ABI/RuntimeABI.cpp
+    Passes/RuntimeLowering/BuiltinCalls.cpp
+    Passes/RuntimeLowering/Ops/AsyncCallableOps.cpp
+    Passes/RuntimeLowering/Ops/AttributeOps.cpp
+    Passes/RuntimeLowering/Ops/AwaitOps.cpp
+    Passes/RuntimeLowering/CallableAggregateEvidence.cpp
+    Passes/RuntimeLowering/CallableArgumentEvidence.cpp
+    Passes/RuntimeLowering/CallableEvidenceSources.cpp
+    Passes/RuntimeLowering/Ops/CallableOps.cpp
     Passes/RuntimeLowering/CallablePlanning.cpp
     Passes/RuntimeLowering/EHCleanup.cpp
-    Passes/RuntimeLowering/ControlFlowABI.cpp
-    Passes/RuntimeLowering/ExceptionOps.cpp
+    Passes/RuntimeLowering/Ops/ExceptionOps.cpp
     Passes/RuntimeLowering/Finalize.cpp
-    Passes/RuntimeLowering/GetItemOps.cpp
-    Passes/RuntimeLowering/IndirectCallableOps.cpp
+    Passes/RuntimeLowering/Ops/FunctionTargetCalls.cpp
+    Passes/RuntimeLowering/Ops/GetItemOps.cpp
+    Passes/RuntimeLowering/Ops/IndirectCallableOps.cpp
+    Passes/RuntimeLowering/Ops/LiteralOps.cpp
     Passes/RuntimeLowering/LowererCore.cpp
     Passes/RuntimeLowering/LowererDispatch.cpp
     Passes/RuntimeLowering/ManifestCalls.cpp
     Passes/RuntimeLowering/ManifestIndex.cpp
     Passes/RuntimeLowering/ObjectBundles.cpp
     Passes/RuntimeLowering/Passes.cpp
+    Passes/RuntimeLowering/Ops/PackAndBindingOps.cpp
+    Passes/RuntimeLowering/PrimitiveI64Calls.cpp
     Passes/RuntimeLowering/ReturnedSummaries.cpp
-    Passes/RuntimeLowering/RuntimeABI.cpp
-    Passes/RuntimeLowering/RuntimeCalls.cpp
-    Passes/RuntimeLowering/SpecialMethodOps.cpp
+    Passes/RuntimeLowering/RuntimeCallOperands.cpp
+    Passes/RuntimeLowering/Ops/SpecialMethodOps.cpp
     Passes/RuntimeLowering/Support.cpp
-    Passes/RuntimeLowering/TryOps.cpp
-    Passes/RuntimeLowering/ValueOps.cpp
+    Passes/RuntimeLowering/Ops/TryOps.cpp
+    Passes/RuntimeLowering/Ops/UnionOps.cpp
 )
 
 add_executable(LythonRuntimeMlirBytecode
