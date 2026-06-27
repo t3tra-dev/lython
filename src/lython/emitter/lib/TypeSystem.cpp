@@ -246,6 +246,20 @@ bool annotationNameIs(llvm::StringRef name, llvm::StringRef bareName) {
   return annotationNamespaceTail(name) == bareName;
 }
 
+bool isLyrtPrimitiveIntName(llvm::StringRef name) {
+  return name == "Int" || name == "prim.Int" || name == "lyrt.prim.Int";
+}
+
+std::optional<unsigned>
+positiveIntegerAnnotationLiteral(const parser::Node *node) {
+  if (!node || node->kind != "Constant")
+    return std::nullopt;
+  std::int64_t value = ast::integer(*node, "value").value_or(0);
+  if (value <= 0)
+    return std::nullopt;
+  return static_cast<unsigned>(value);
+}
+
 std::optional<std::string> protocolAnnotationName(llvm::StringRef name) {
   name = annotationNamespaceTail(name);
   for (llvm::StringRef protocol :
@@ -1544,6 +1558,24 @@ bool AlgorithmM::bindImportedModule(llvm::StringRef module,
     bindModuleClass(localAttribute("Context"), "contextvars.Context");
     return true;
   }
+  if (module == "lyrt") {
+    bindModuleObject();
+    bindModuleCallable(localAttribute("from_prim"), "lyrt.from_prim",
+                       contract("builtins.function"));
+    bindModuleCallable(localAttribute("native"), "lyrt.native",
+                       contract("builtins.function"));
+    bindCanonicalSymbol(localAttribute("prim.Int"), "lyrt.prim.Int",
+                        typeObject(object()));
+    bindAnnotationAlias(localAttribute("prim.Int"), "lyrt.prim.Int");
+    return true;
+  }
+  if (module == "lyrt.prim") {
+    bindModuleObject();
+    bindCanonicalSymbol(localAttribute("Int"), "lyrt.prim.Int",
+                        typeObject(object()));
+    bindAnnotationAlias(localAttribute("Int"), "lyrt.prim.Int");
+    return true;
+  }
   if (module == "typing" || module == "typing_extensions") {
     bindModuleObject();
     bindAnnotationModuleAliases([&](llvm::StringRef name) {
@@ -1606,6 +1638,21 @@ bool AlgorithmM::bindImportedName(llvm::StringRef module,
   }
   if (module == "contextlib" && exportedName == "nullcontext")
     return bindContractClass("contextlib.nullcontext");
+  if (module == "lyrt" && exportedName == "from_prim") {
+    bindCanonicalSymbol(localName, "lyrt.from_prim",
+                        contract("builtins.function"));
+    return true;
+  }
+  if (module == "lyrt" && exportedName == "native") {
+    bindCanonicalSymbol(localName, "lyrt.native",
+                        contract("builtins.function"));
+    return true;
+  }
+  if (module == "lyrt.prim" && exportedName == "Int") {
+    bindCanonicalSymbol(localName, "lyrt.prim.Int", typeObject(object()));
+    bindAnnotationAlias(localName, "lyrt.prim.Int");
+    return true;
+  }
 
   if (module == "typing" || module == "typing_extensions" ||
       module == "collections.abc") {
@@ -1690,6 +1737,10 @@ mlir::Type AlgorithmM::annotationType(const parser::Node *node) const {
             ? llvm::StringRef(baseSpelling.data(), baseSpelling.size())
             : llvm::StringRef(qualifiedBase));
     llvm::StringRef baseName(resolvedBase);
+    if (isLyrtPrimitiveIntName(baseName))
+      if (std::optional<unsigned> width =
+              positiveIntegerAnnotationLiteral(slice))
+        return mlir::IntegerType::get(&context, *width);
     if (annotationNameIs(baseName, "Optional"))
       return py::UnionType::getNormalized(&context,
                                           {annotationType(slice), none()});

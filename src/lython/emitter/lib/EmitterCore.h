@@ -7,6 +7,8 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 
+#include <cstdint>
+
 namespace lython::emitter {
 
 class ModuleEmitter {
@@ -40,6 +42,11 @@ private:
   struct InlineReturnContext {
     mlir::Block *target = nullptr;
     mlir::Type resultType;
+  };
+
+  struct PrimitiveConstant {
+    mlir::Type type;
+    std::int64_t integerValue = 0;
   };
 
   mlir::Location loc(const parser::Node &node) const;
@@ -106,6 +113,10 @@ private:
   Value emitFunctionObject(const parser::Node &anchor,
                            llvm::StringRef symbolName, mlir::Type type,
                            llvm::ArrayRef<Capture> captures);
+  Value emitPrimitiveConstant(const parser::Node &anchor,
+                              const PrimitiveConstant &constant);
+  Value coercePrimitiveInteger(Value value, mlir::IntegerType targetType,
+                               const parser::Node &anchor);
   Value emitNone(const parser::Node &anchor);
   Value emitPack(mlir::ArrayRef<Value> values,
                  llvm::ArrayRef<char> unpacked = {});
@@ -129,6 +140,7 @@ private:
   AlgorithmM types;
   parser::Diagnostics diagnostics;
   llvm::StringMap<Value> values;
+  llvm::StringMap<PrimitiveConstant> primitiveConstants;
   llvm::StringMap<llvm::StringMap<mlir::Type>> classFieldBindings;
   llvm::StringMap<llvm::StringMap<MethodBinding>> classMethodBindings;
   mlir::Type currentReturnType;

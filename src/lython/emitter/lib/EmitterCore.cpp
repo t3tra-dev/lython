@@ -18,6 +18,8 @@
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <utility>
+
 #include "PyDialect.h.inc"
 #define GET_OP_CLASSES
 #include "PyOps.h.inc"
@@ -31,6 +33,90 @@ constexpr llvm::StringLiteral kCallableVarargValueTypeAttr{
 constexpr llvm::StringLiteral kCallableKwargValueTypeAttr{
     "callable_kwarg_value_type"};
 constexpr llvm::StringLiteral kPackUnpackedOperandsAttr{"ly.unpack_operands"};
+
+bool isLyrtPrimitiveIntName(llvm::StringRef name) {
+  return name == "Int" || name == "prim.Int" || name == "lyrt.prim.Int";
+}
+
+std::optional<std::int64_t> integerLiteralValue(const parser::Node *node) {
+  if (!node)
+    return std::nullopt;
+  if (node->kind == "Constant") {
+    if (auto value = ast::integer(*node, "value"))
+      return *value;
+    return std::nullopt;
+  }
+  if (node->kind == "UnaryOp" &&
+      ast::isOperator(ast::node(*node, "op"), "USub")) {
+    std::optional<std::int64_t> value =
+        integerLiteralValue(ast::node(*node, "operand"));
+    if (value)
+      return -*value;
+  }
+  return std::nullopt;
+}
+
+std::optional<unsigned>
+primitiveIntWidthFromSubscript(const parser::Node *node,
+                               const AlgorithmM &types) {
+  if (!node || node->kind != "Subscript")
+    return std::nullopt;
+  const parser::Node *base = ast::node(*node, "value");
+  std::string qualified = ast::qualifiedName(base);
+  llvm::StringRef name = qualified.empty()
+                             ? llvm::StringRef(ast::nameSpelling(*base))
+                             : llvm::StringRef(qualified);
+  std::string canonical = name.str();
+  if (std::optional<std::string> resolved = types.lookupCanonicalBinding(name))
+    canonical = *resolved;
+  if (!isLyrtPrimitiveIntName(canonical))
+    return std::nullopt;
+  std::optional<std::int64_t> width =
+      integerLiteralValue(ast::node(*node, "slice"));
+  if (!width || *width <= 0)
+    return std::nullopt;
+  return static_cast<unsigned>(*width);
+}
+
+std::optional<mlir::IntegerType>
+primitiveIntTypeFromSubscript(const parser::Node *node,
+                              const AlgorithmM &types) {
+  std::optional<unsigned> width = primitiveIntWidthFromSubscript(node, types);
+  if (!width)
+    return std::nullopt;
+  return mlir::IntegerType::get(&types.getContext(), *width);
+}
+
+std::optional<std::pair<mlir::IntegerType, std::int64_t>>
+primitiveIntegerConstantConstructor(const parser::Node *node,
+                                    const AlgorithmM &types) {
+  if (!node || node->kind != "Call")
+    return std::nullopt;
+  std::optional<mlir::IntegerType> type =
+      primitiveIntTypeFromSubscript(ast::node(*node, "func"), types);
+  if (!type)
+    return std::nullopt;
+  const auto *args = ast::nodeList(*node, "args");
+  const auto *keywords = ast::nodeList(*node, "keywords");
+  if (!args || args->size() != 1 || (keywords && !keywords->empty()))
+    return std::nullopt;
+  std::optional<std::int64_t> value = integerLiteralValue(args->front().get());
+  if (!value)
+    return std::nullopt;
+  return std::make_pair(*type, *value);
+}
+
+bool isPrimitiveOnlyCallable(py::CallableType callable) {
+  if (!callable || callable.hasVararg() || callable.hasKwarg() ||
+      callable.getResultTypes().size() != 1)
+    return false;
+  auto isPrimitive = [](mlir::Type type) {
+    return type && !py::isPyType(type);
+  };
+  return llvm::all_of(callable.getPositionalTypes(), isPrimitive) &&
+         llvm::all_of(callable.getKwOnlyTypes(), isPrimitive) &&
+         isPrimitive(callable.getResultTypes().front());
+}
 
 mlir::ArrayAttr stringArray(mlir::Builder &builder,
                             llvm::ArrayRef<std::string> values) {
@@ -765,6 +851,21 @@ void ModuleEmitter::predeclareTopLevel() {
       if (statement->kind == "ClassDef")
         if (auto name = ast::string(*statement, "name"))
           types.bindClass(*name, types.contract(*name));
+      if (statement->kind == "Assign") {
+        const auto *targets = ast::nodeList(*statement, "targets");
+        if (!targets || targets->size() != 1 || !targets->front() ||
+            targets->front()->kind != "Name")
+          continue;
+        std::optional<std::pair<mlir::IntegerType, std::int64_t>> primitive =
+            primitiveIntegerConstantConstructor(ast::node(*statement, "value"),
+                                                types);
+        if (!primitive)
+          continue;
+        llvm::StringRef name = ast::nameSpelling(*targets->front());
+        primitiveConstants[name] =
+            PrimitiveConstant{primitive->first, primitive->second};
+        types.bindSymbol(name, primitive->first);
+      }
     }
   }
 }
@@ -975,6 +1076,36 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
     emitStatements(ast::nodeList(callable, "body"));
   }
   if (!insertionBlockTerminated(builder)) {
+    auto emitPrimitiveFallbackReturn = [&]() -> bool {
+      if (!currentReturnType || py::isPyType(currentReturnType))
+        return false;
+      if (auto integer = mlir::dyn_cast<mlir::IntegerType>(currentReturnType)) {
+        auto zero = builder.create<mlir::arith::ConstantIntOp>(
+            loc(callable), 0, integer.getWidth());
+        builder.create<mlir::func::ReturnOp>(loc(callable), zero.getResult());
+        return true;
+      }
+      return false;
+    };
+    mlir::Block *currentBlock = builder.getInsertionBlock();
+    if (currentBlock && currentBlock != entry &&
+        currentBlock->hasNoPredecessors() && emitPrimitiveFallbackReturn()) {
+      values = std::move(savedValues);
+      currentReturnType = savedReturnType;
+      currentFunctionPrefix = std::move(savedFunctionPrefix);
+      return;
+    }
+    if (currentReturnType && !py::isPyType(currentReturnType)) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, callable.range.start,
+          "primitive function can fall through without returning a value"});
+      if (emitPrimitiveFallbackReturn()) {
+        values = std::move(savedValues);
+        currentReturnType = savedReturnType;
+        currentFunctionPrefix = std::move(savedFunctionPrefix);
+        return;
+      }
+    }
     Value none = emitNone(callable);
     Value result = coerceValue(none, currentReturnType, callable);
     builder.create<mlir::func::ReturnOp>(loc(callable), result.value);
@@ -1825,6 +1956,9 @@ ModuleEmitter::Value ModuleEmitter::emitExpr(const parser::Node *expr) {
     auto found = values.find(name);
     if (found != values.end())
       return found->second;
+    auto primitiveConstant = primitiveConstants.find(name);
+    if (primitiveConstant != primitiveConstants.end())
+      return emitPrimitiveConstant(*expr, primitiveConstant->second);
     mlir::Type type = types.lookupSymbol(name).value_or(types.object());
     if (auto cls = types.lookupClass(name)) {
       mlir::Type typeType = types.typeObject(*cls);
@@ -1949,6 +2083,50 @@ ModuleEmitter::Value ModuleEmitter::emitConstant(const parser::Node &expr) {
 ModuleEmitter::Value ModuleEmitter::emitCall(const parser::Node &expr) {
   const parser::Node *calleeNode = ast::node(expr, "func");
   std::string calleeQualified = ast::qualifiedName(calleeNode);
+
+  if (std::optional<mlir::IntegerType> primitiveInt =
+          primitiveIntTypeFromSubscript(calleeNode, types)) {
+    const auto *args = ast::nodeList(expr, "args");
+    const auto *keywords = ast::nodeList(expr, "keywords");
+    if (!args || args->size() != 1 || (keywords && !keywords->empty())) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, expr.range.start,
+          "lyrt.prim.Int constructor expects exactly one positional argument"});
+      return emitNone(expr);
+    }
+    if (std::optional<std::int64_t> literal =
+            integerLiteralValue(args->front().get()))
+      return emitPrimitiveConstant(expr,
+                                   PrimitiveConstant{*primitiveInt, *literal});
+    return coercePrimitiveInteger(emitExpr(args->front().get()), *primitiveInt,
+                                  expr);
+  }
+
+  if (calleeNode && calleeNode->kind == "Name") {
+    llvm::StringRef name = ast::nameSpelling(*calleeNode);
+    std::optional<std::string> canonical = types.lookupCanonicalBinding(name);
+    if (canonical && *canonical == "lyrt.from_prim") {
+      const auto *args = ast::nodeList(expr, "args");
+      const auto *keywords = ast::nodeList(expr, "keywords");
+      if (!args || args->size() != 1 || (keywords && !keywords->empty())) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, expr.range.start,
+            "lyrt.from_prim expects exactly one positional argument"});
+        return emitNone(expr);
+      }
+      Value input = emitExpr(args->front().get());
+      if (!mlir::isa<mlir::IntegerType>(input.value.getType())) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, expr.range.start,
+            "lyrt.from_prim currently expects an integer primitive"});
+        return input;
+      }
+      auto op = builder.create<py::CastFromPrimOp>(loc(expr), types.intType(),
+                                                   input.value);
+      return {op.getResult(), types.intType()};
+    }
+  }
+
   if (!calleeQualified.empty())
     if (auto cls = types.lookupClass(calleeQualified))
       return emitClassInstantiation(expr, llvm::StringRef(calleeQualified),
@@ -2071,6 +2249,42 @@ ModuleEmitter::Value ModuleEmitter::emitCall(const parser::Node &expr) {
       binding = *canonical;
     return emitBindingRef(*calleeNode, binding, type);
   };
+
+  auto emitDirectPrimitiveFunctionCall = [&]() -> std::optional<Value> {
+    if (!calleeNode || calleeNode->kind != "Name")
+      return std::nullopt;
+    llvm::StringRef name = ast::nameSpelling(*calleeNode);
+    auto symbolType = types.lookupSymbol(name);
+    auto callable = mlir::dyn_cast_if_present<py::CallableType>(
+        symbolType ? *symbolType : mlir::Type());
+    if (!isPrimitiveOnlyCallable(callable))
+      return std::nullopt;
+    auto target = module.lookupSymbol<mlir::func::FuncOp>(name);
+    if (!target)
+      return std::nullopt;
+    const auto *args = ast::nodeList(expr, "args");
+    const auto *keywords = ast::nodeList(expr, "keywords");
+    if (!args || args->size() != callable.getPositionalTypes().size() ||
+        (keywords && !keywords->empty()))
+      return std::nullopt;
+
+    llvm::SmallVector<mlir::Value, 8> operands;
+    operands.reserve(args->size());
+    for (auto [index, arg] : llvm::enumerate(*args)) {
+      Value value = emitExpr(arg.get());
+      auto expected = mlir::dyn_cast<mlir::IntegerType>(
+          callable.getPositionalTypes()[index]);
+      if (expected)
+        value = coercePrimitiveInteger(value, expected, expr);
+      operands.push_back(value.value);
+    }
+    auto call = builder.create<mlir::func::CallOp>(
+        loc(expr), target.getSymName(), callable.getResultTypes(), operands);
+    return Value{call.getResult(0), callable.getResultTypes().front()};
+  };
+
+  if (std::optional<Value> primitiveCall = emitDirectPrimitiveFunctionCall())
+    return *primitiveCall;
 
   if (calleeNode && calleeNode->kind == "Name") {
     llvm::StringRef name = ast::nameSpelling(*calleeNode);
@@ -2408,6 +2622,26 @@ ModuleEmitter::Value ModuleEmitter::emitBinary(const parser::Node &expr) {
   Value lhs = emitExpr(ast::node(expr, "left"));
   Value rhs = emitExpr(ast::node(expr, "right"));
   const parser::Node *op = ast::node(expr, "op");
+  if (auto lhsInt = mlir::dyn_cast<mlir::IntegerType>(lhs.value.getType())) {
+    if (mlir::isa<mlir::IntegerType>(rhs.value.getType())) {
+      rhs = coercePrimitiveInteger(rhs, lhsInt, expr);
+      if (ast::isOperator(op, "Sub")) {
+        auto result = builder.create<mlir::arith::SubIOp>(loc(expr), lhs.value,
+                                                          rhs.value);
+        return {result.getResult(), lhsInt};
+      }
+      if (ast::isOperator(op, "Mult")) {
+        auto result = builder.create<mlir::arith::MulIOp>(loc(expr), lhs.value,
+                                                          rhs.value);
+        return {result.getResult(), lhsInt};
+      }
+      if (ast::isOperator(op, "Add")) {
+        auto result = builder.create<mlir::arith::AddIOp>(loc(expr), lhs.value,
+                                                          rhs.value);
+        return {result.getResult(), lhsInt};
+      }
+    }
+  }
   mlir::Type left = types.widenLiteral(lhs.type);
   mlir::Type right = types.widenLiteral(rhs.type);
   mlir::Type result = types.join({left, right});
@@ -2459,6 +2693,25 @@ ModuleEmitter::Value ModuleEmitter::emitCompare(const parser::Node &expr) {
   }
   Value rhs = emitExpr(comparators->front().get());
   const parser::Node *op = ops && !ops->empty() ? ops->front().get() : nullptr;
+  if (auto lhsInt = mlir::dyn_cast<mlir::IntegerType>(lhs.value.getType())) {
+    if (mlir::isa<mlir::IntegerType>(rhs.value.getType())) {
+      rhs = coercePrimitiveInteger(rhs, lhsInt, expr);
+      mlir::arith::CmpIPredicate predicate = mlir::arith::CmpIPredicate::eq;
+      if (ast::isOperator(op, "NotEq"))
+        predicate = mlir::arith::CmpIPredicate::ne;
+      else if (ast::isOperator(op, "Lt"))
+        predicate = mlir::arith::CmpIPredicate::slt;
+      else if (ast::isOperator(op, "LtE"))
+        predicate = mlir::arith::CmpIPredicate::sle;
+      else if (ast::isOperator(op, "Gt"))
+        predicate = mlir::arith::CmpIPredicate::sgt;
+      else if (ast::isOperator(op, "GtE"))
+        predicate = mlir::arith::CmpIPredicate::sge;
+      auto result = builder.create<mlir::arith::CmpIOp>(loc(expr), predicate,
+                                                        lhs.value, rhs.value);
+      return {result.getResult(), builder.getI1Type()};
+    }
+  }
   auto emitNoneIdentityTest = [&](Value candidate,
                                   Value other) -> std::optional<Value> {
     auto unionType = mlir::dyn_cast_if_present<py::UnionType>(candidate.type);
@@ -2600,6 +2853,48 @@ ModuleEmitter::emitFunctionObject(const parser::Node &anchor,
   for (const Capture &capture : captures)
     captureValues.push_back(capture.value);
   return emitBindingRef(anchor, symbolName, type, captureValues);
+}
+
+ModuleEmitter::Value
+ModuleEmitter::emitPrimitiveConstant(const parser::Node &anchor,
+                                     const PrimitiveConstant &constant) {
+  auto integerType = mlir::dyn_cast<mlir::IntegerType>(constant.type);
+  if (!integerType) {
+    diagnostics.push_back(
+        parser::Diagnostic{parser::Severity::Error, anchor.range.start,
+                           "primitive constant has a non-integer type"});
+    return emitNone(anchor);
+  }
+  auto op = builder.create<mlir::arith::ConstantIntOp>(
+      loc(anchor), constant.integerValue, integerType.getWidth());
+  return {op.getResult(), integerType};
+}
+
+ModuleEmitter::Value
+ModuleEmitter::coercePrimitiveInteger(Value value, mlir::IntegerType targetType,
+                                      const parser::Node &anchor) {
+  if (!targetType || value.value.getType() == targetType)
+    return {value.value, targetType};
+
+  auto sourceType = mlir::dyn_cast<mlir::IntegerType>(value.value.getType());
+  if (!sourceType) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, anchor.range.start,
+        "primitive integer conversion requires an integer value"});
+    return value;
+  }
+
+  if (sourceType.getWidth() < targetType.getWidth()) {
+    auto op = builder.create<mlir::arith::ExtSIOp>(loc(anchor), targetType,
+                                                   value.value);
+    return {op.getResult(), targetType};
+  }
+  if (sourceType.getWidth() > targetType.getWidth()) {
+    auto op = builder.create<mlir::arith::TruncIOp>(loc(anchor), targetType,
+                                                    value.value);
+    return {op.getResult(), targetType};
+  }
+  return {value.value, targetType};
 }
 
 ModuleEmitter::Value ModuleEmitter::emitNone(const parser::Node &anchor) {

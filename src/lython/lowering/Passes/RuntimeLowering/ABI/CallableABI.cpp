@@ -1,6 +1,20 @@
 #include "RuntimeLowering/RuntimeLowering.h"
 
 namespace py::runtime_lowering {
+namespace {
+
+bool isPrimitiveOnlyCallable(py::CallableType callable) {
+  if (!callable || callable.hasVararg() || callable.hasKwarg())
+    return false;
+  auto isRuntimePrimitive = [](mlir::Type type) {
+    return type && !py::isPyType(type);
+  };
+  return llvm::all_of(callable.getPositionalTypes(), isRuntimePrimitive) &&
+         llvm::all_of(callable.getKwOnlyTypes(), isRuntimePrimitive) &&
+         llvm::all_of(callable.getResultTypes(), isRuntimePrimitive);
+}
+
+} // namespace
 
 const RuntimeValueShape *
 RuntimeBundleLowerer::runtimeValueShapeFor(mlir::Operation *op, mlir::Type type,
@@ -388,6 +402,8 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
       result = mlir::failure();
       return mlir::WalkResult::interrupt();
     }
+    if (isPrimitiveOnlyCallable(callable))
+      return mlir::WalkResult::advance();
     llvm::SmallVector<mlir::Type, 8> logicalInputTypes =
         callableLogicalInputTypes(function, callable);
     if (RuntimeBundleLowerer::isPrimitiveI64CallableClone(function)) {

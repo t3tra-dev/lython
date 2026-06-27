@@ -1,6 +1,23 @@
 #include "RuntimeLowering/RuntimeLowering.h"
 
 namespace py::runtime_lowering {
+namespace {
+
+bool isPrimitiveOnlyCallableFunction(mlir::func::FuncOp function) {
+  auto callableAttr = function->getAttrOfType<mlir::TypeAttr>("callable_type");
+  auto callable = mlir::dyn_cast_if_present<py::CallableType>(
+      callableAttr ? callableAttr.getValue() : mlir::Type());
+  if (!callable || callable.hasVararg() || callable.hasKwarg())
+    return false;
+  auto isRuntimePrimitive = [](mlir::Type type) {
+    return type && !py::isPyType(type);
+  };
+  return llvm::all_of(callable.getPositionalTypes(), isRuntimePrimitive) &&
+         llvm::all_of(callable.getKwOnlyTypes(), isRuntimePrimitive) &&
+         llvm::all_of(callable.getResultTypes(), isRuntimePrimitive);
+}
+
+} // namespace
 
 mlir::LogicalResult RuntimeBundleLowerer::bundleRuntimeResults(
     mlir::Operation *op, mlir::Type expectedContract, mlir::func::CallOp call,
@@ -96,6 +113,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
   module.walk([&](mlir::func::ReturnOp op) {
     auto function = op->getParentOfType<mlir::func::FuncOp>();
     if (!function || !function->hasAttr("callable_type"))
+      return mlir::WalkResult::advance();
+    if (isPrimitiveOnlyCallableFunction(function))
       return mlir::WalkResult::advance();
 
     auto returnedCoroutine =

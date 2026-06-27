@@ -115,6 +115,34 @@ RuntimeBundleLowerer::lowerCastFromPrim(py::CastFromPrimOp op) {
 
   builder.setInsertionPoint(op);
   llvm::SmallVector<mlir::Value, 1> inputValues{op.getInput()};
+  if (expected == "builtins.int") {
+    if (auto integer =
+            mlir::dyn_cast<mlir::IntegerType>(op.getInput().getType())) {
+      mlir::Value value = op.getInput();
+      mlir::Type i64 = builder.getI64Type();
+      if (integer.getWidth() < 64) {
+        if (integer.getWidth() == 1)
+          value = builder.create<mlir::arith::ExtUIOp>(op.getLoc(), i64, value)
+                      .getResult();
+        else
+          value = builder.create<mlir::arith::ExtSIOp>(op.getLoc(), i64, value)
+                      .getResult();
+      } else if (integer.getWidth() > 64) {
+        value = builder.create<mlir::arith::TruncIOp>(op.getLoc(), i64, value)
+                    .getResult();
+      }
+      mlir::Value valid =
+          builder.create<mlir::arith::ConstantIntOp>(op.getLoc(), 1, 1)
+              .getResult();
+      RuntimeBundle result;
+      if (mlir::failed(RuntimeBundleLowerer::makePrimitiveI64Bundle(
+              op, op.getResult().getType(), value, valid, result)))
+        return mlir::failure();
+      valueBundles[op.getResult()] = std::move(result);
+      erase.push_back(op);
+      return mlir::success();
+    }
+  }
   if (objectShapeMatches(expected, inputValues)) {
     if (mlir::failed(assignObjectBundle(op, op.getResult(),
                                         runtimeContractType(context, expected),
