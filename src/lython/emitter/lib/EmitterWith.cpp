@@ -1,19 +1,10 @@
 #include "EmitterCore.h"
+#include "EmitterPyOps.h"
+#include "EmitterSupport.h"
 
 #include "AstAccess.h"
 
-#include "mlir/Bytecode/BytecodeOpInterface.h"
-#include "mlir/IR/Block.h"
-#include "mlir/IR/BuiltinAttributes.h"
-#include "mlir/IR/OpDefinition.h"
-#include "mlir/Interfaces/InferTypeOpInterface.h"
-#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/STLExtras.h"
-
-#include "PyDialect.h.inc"
-#define GET_OP_CLASSES
-#include "PyOps.h.inc"
-#undef GET_OP_CLASSES
 
 namespace lython::emitter {
 
@@ -28,10 +19,10 @@ void ModuleEmitter::emitWith(const parser::Node &statement, bool async) {
           enterInference ? enterInference.resultType : types.object();
       Value entered;
       if (async) {
-        auto enter = builder.create<py::AEnterOp>(
-            loc(*item), enterType, "__aenter__",
-            callProtocolFor(enterInference), contextValue.value,
-            mlir::UnitAttr());
+        auto enter =
+            builder.create<py::AEnterOp>(loc(*item), enterType, "__aenter__",
+                                         callProtocolFor(enterInference),
+                                         contextValue.value, mlir::UnitAttr());
         entered = emitAwaitValue(*item, Value{enter.getResult(), enterType});
       } else {
         auto enter = builder.create<py::EnterOp>(
@@ -46,10 +37,7 @@ void ModuleEmitter::emitWith(const parser::Node &statement, bool async) {
   }
   emitStatements(ast::nodeList(statement, "body"));
 
-  mlir::Block *block = builder.getInsertionBlock();
-  bool terminated = block && !block->empty() &&
-                    block->back().hasTrait<mlir::OpTrait::IsTerminator>();
-  if (!terminated) {
+  if (!insertionBlockTerminated(builder)) {
     for (std::size_t index = activeWithCleanups.size(); index > cleanupStart;
          --index)
       emitWithCleanup(statement, activeWithCleanups[index - 1]);

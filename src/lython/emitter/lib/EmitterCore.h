@@ -1,13 +1,12 @@
 #pragma once
 
 #include "Emitter.h"
+#include "EmitterState.h"
 #include "TypeSystem.h"
 
 #include "mlir/IR/Builders.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
-
-#include <cstdint>
 
 namespace lython::emitter {
 
@@ -19,36 +18,6 @@ public:
   EmitResult emit();
 
 private:
-  struct Value {
-    mlir::Value value;
-    mlir::Type type;
-  };
-
-  struct Capture {
-    std::string name;
-    Value value;
-  };
-
-  struct MethodBinding {
-    const parser::Node *method = nullptr;
-    FunctionSignature signature;
-  };
-
-  struct WithCleanup {
-    Value manager;
-    bool async = false;
-  };
-
-  struct InlineReturnContext {
-    mlir::Block *target = nullptr;
-    mlir::Type resultType;
-  };
-
-  struct PrimitiveConstant {
-    mlir::Type type;
-    std::int64_t integerValue = 0;
-  };
-
   mlir::Location loc(const parser::Node &node) const;
   mlir::Type callableProtocol() const;
   mlir::Type callProtocolFor(mlir::Type calleeType) const;
@@ -92,6 +61,12 @@ private:
   Value emitExpr(const parser::Node *expr);
   Value emitConstant(const parser::Node &expr);
   Value emitCall(const parser::Node &expr);
+  CallOperands emitCallOperands(const parser::Node &expr,
+                                llvm::ArrayRef<Value> leadingPositional = {},
+                                bool includeAstArguments = true);
+  Value emitCallableDispatch(const parser::Node &anchor, Value callee,
+                             const CallOperands &operands,
+                             mlir::Type resultOverride = {});
   Value emitInlineMethodCall(const parser::Node &expr, Value receiver,
                              const MethodBinding &method);
   Value emitInlineMethodBody(const parser::Node &anchor, Value receiver,
@@ -113,6 +88,18 @@ private:
   Value emitFunctionObject(const parser::Node &anchor,
                            llvm::StringRef symbolName, mlir::Type type,
                            llvm::ArrayRef<Capture> captures);
+  std::optional<Value>
+  emitPrimitiveConstructorCall(const parser::Node &expr,
+                               const parser::Node *calleeNode);
+  std::optional<Value> emitPrimitiveRuntimeCall(const parser::Node &expr,
+                                                const parser::Node *calleeNode);
+  std::optional<Value>
+  emitDirectPrimitiveFunctionCall(const parser::Node &expr,
+                                  const parser::Node *calleeNode);
+  std::optional<Value> emitPrimitiveBinary(const parser::Node &expr, Value lhs,
+                                           Value rhs, const parser::Node *op);
+  std::optional<Value> emitPrimitiveCompare(const parser::Node &expr, Value lhs,
+                                            Value rhs, const parser::Node *op);
   Value emitPrimitiveConstant(const parser::Node &anchor,
                               const PrimitiveConstant &constant);
   Value coercePrimitiveInteger(Value value, mlir::IntegerType targetType,

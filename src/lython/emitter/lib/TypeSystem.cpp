@@ -11,6 +11,7 @@
 #include "llvm/ADT/Twine.h"
 
 #include <algorithm>
+#include <array>
 #include <map>
 #include <string>
 
@@ -338,6 +339,174 @@ void bindAnnotationModuleAliases(
                                "ContextManager",
                                "AsyncContextManager"})
     bind(name);
+}
+
+enum class ImportCallableFactory {
+  BuiltinsFunction,
+  AsyncioSleep,
+  AsyncioGetEventLoop,
+};
+
+mlir::Type importCallableType(const AlgorithmM &types,
+                              ImportCallableFactory factory) {
+  switch (factory) {
+  case ImportCallableFactory::BuiltinsFunction:
+    return types.contract("builtins.function");
+  case ImportCallableFactory::AsyncioSleep:
+    return makeAsyncioSleepCallable(types);
+  case ImportCallableFactory::AsyncioGetEventLoop:
+    return makeAsyncioGetEventLoopCallable(types);
+  }
+  return types.object();
+}
+
+struct ModuleClassImport {
+  const char *module;
+  const char *localAttr;
+  const char *contractName;
+  const char *rootLocalAttr = nullptr;
+};
+
+struct ModuleCallableImport {
+  const char *module;
+  const char *localAttr;
+  const char *canonicalName;
+  ImportCallableFactory factory;
+};
+
+struct ModuleAliasImport {
+  const char *module;
+  const char *localAttr;
+  const char *canonicalName;
+  bool annotationAlias = false;
+};
+
+struct NameClassImport {
+  const char *module;
+  const char *exportedName;
+  const char *contractName;
+};
+
+struct NameCallableImport {
+  const char *module;
+  const char *exportedName;
+  const char *canonicalName;
+  ImportCallableFactory factory;
+};
+
+struct NameAliasImport {
+  const char *module;
+  const char *exportedName;
+  const char *canonicalName;
+  bool annotationAlias = false;
+};
+
+constexpr std::array<ModuleClassImport, 10> kModuleClassImports{{
+    {"_asyncio", "Future", "_asyncio.Future"},
+    {"_asyncio", "Task", "_asyncio.Task"},
+    {"asyncio", "Future", "_asyncio.Future"},
+    {"asyncio", "Task", "_asyncio.Task"},
+    {"asyncio", "AbstractEventLoop", "asyncio.AbstractEventLoop"},
+    {"asyncio", "CancelledError", "asyncio.CancelledError"},
+    {"asyncio.events", "AbstractEventLoop", "asyncio.AbstractEventLoop",
+     "events.AbstractEventLoop"},
+    {"asyncio.exceptions", "CancelledError", "asyncio.CancelledError",
+     "exceptions.CancelledError"},
+    {"contextlib", "nullcontext", "contextlib.nullcontext"},
+    {"contextvars", "Context", "contextvars.Context"},
+}};
+
+constexpr std::array<ModuleCallableImport, 4> kModuleCallableImports{{
+    {"asyncio", "sleep", "asyncio.sleep", ImportCallableFactory::AsyncioSleep},
+    {"asyncio", "get_event_loop", "asyncio.get_event_loop",
+     ImportCallableFactory::AsyncioGetEventLoop},
+    {"lyrt", "from_prim", "lyrt.from_prim",
+     ImportCallableFactory::BuiltinsFunction},
+    {"lyrt", "native", "lyrt.native", ImportCallableFactory::BuiltinsFunction},
+}};
+
+constexpr std::array<ModuleAliasImport, 2> kModuleAliasImports{{
+    {"lyrt", "prim.Int", "lyrt.prim.Int", true},
+    {"lyrt.prim", "Int", "lyrt.prim.Int", true},
+}};
+
+constexpr std::array<NameClassImport, 9> kNameClassImports{{
+    {"_asyncio", "Future", "_asyncio.Future"},
+    {"asyncio", "Future", "_asyncio.Future"},
+    {"_asyncio", "Task", "_asyncio.Task"},
+    {"asyncio", "Task", "_asyncio.Task"},
+    {"asyncio", "AbstractEventLoop", "asyncio.AbstractEventLoop"},
+    {"asyncio.events", "AbstractEventLoop", "asyncio.AbstractEventLoop"},
+    {"asyncio", "CancelledError", "asyncio.CancelledError"},
+    {"asyncio.exceptions", "CancelledError", "asyncio.CancelledError"},
+    {"contextlib", "nullcontext", "contextlib.nullcontext"},
+}};
+
+constexpr std::array<NameCallableImport, 4> kNameCallableImports{{
+    {"asyncio", "sleep", "asyncio.sleep", ImportCallableFactory::AsyncioSleep},
+    {"asyncio", "get_event_loop", "asyncio.get_event_loop",
+     ImportCallableFactory::AsyncioGetEventLoop},
+    {"lyrt", "from_prim", "lyrt.from_prim",
+     ImportCallableFactory::BuiltinsFunction},
+    {"lyrt", "native", "lyrt.native", ImportCallableFactory::BuiltinsFunction},
+}};
+
+constexpr std::array<NameAliasImport, 1> kNameAliasImports{{
+    {"lyrt.prim", "Int", "lyrt.prim.Int", true},
+}};
+
+std::string importedAttribute(llvm::StringRef localName, llvm::StringRef attr) {
+  return (llvm::Twine(localName) + "." + attr).str();
+}
+
+std::string importedModuleAttribute(llvm::StringRef module,
+                                    llvm::StringRef localName,
+                                    const ModuleClassImport &entry) {
+  llvm::StringRef attr = entry.localAttr;
+  if (entry.rootLocalAttr && localName == module.split('.').first)
+    attr = entry.rootLocalAttr;
+  return importedAttribute(localName, attr);
+}
+
+enum class AnnotationModuleStyle {
+  Direct,
+  CollectionsAbc,
+  Collections,
+};
+
+std::optional<AnnotationModuleStyle>
+annotationModuleStyle(llvm::StringRef module) {
+  if (module == "typing" || module == "typing_extensions")
+    return AnnotationModuleStyle::Direct;
+  if (module == "collections.abc")
+    return AnnotationModuleStyle::CollectionsAbc;
+  if (module == "collections")
+    return AnnotationModuleStyle::Collections;
+  return std::nullopt;
+}
+
+std::string importedAnnotationAlias(llvm::StringRef module,
+                                    llvm::StringRef localName,
+                                    AnnotationModuleStyle style,
+                                    llvm::StringRef name) {
+  switch (style) {
+  case AnnotationModuleStyle::Direct:
+    return importedAttribute(localName, name);
+  case AnnotationModuleStyle::CollectionsAbc: {
+    std::string prefix = localName == module.split('.').first
+                             ? importedAttribute(localName, "abc")
+                             : std::string(localName);
+    return (llvm::Twine(prefix) + "." + name).str();
+  }
+  case AnnotationModuleStyle::Collections:
+    return importedAttribute(localName, (llvm::Twine("abc.") + name).str());
+  }
+  return name.str();
+}
+
+bool moduleExportsAnnotationNames(llvm::StringRef module) {
+  return module == "typing" || module == "typing_extensions" ||
+         module == "collections.abc";
 }
 
 std::optional<std::string> staticParameterName(mlir::Type type) {
@@ -1497,112 +1666,50 @@ bool AlgorithmM::bindImportedModule(llvm::StringRef module,
     localName = localStorage;
   }
 
-  auto bindModuleObject = [&] { bindSymbol(localName, object()); };
-  auto bindModuleClass = [&](llvm::StringRef localQualifiedName,
-                             llvm::StringRef contractName) {
-    bindClass(localQualifiedName, contract(contractName));
-  };
-  auto bindModuleCallable = [&](llvm::StringRef localQualifiedName,
-                                llvm::StringRef canonicalName,
-                                mlir::Type callableType) {
-    bindCanonicalSymbol(localQualifiedName, canonicalName, callableType);
-  };
-  auto localAttribute = [&](llvm::StringRef attr) {
-    return (llvm::Twine(localName) + "." + attr).str();
+  bool handled = false;
+  auto bindModuleObject = [&] {
+    if (!handled)
+      bindSymbol(localName, object());
+    handled = true;
   };
 
-  if (module == "_asyncio") {
+  for (const ModuleClassImport &entry : kModuleClassImports) {
+    if (module != entry.module)
+      continue;
     bindModuleObject();
-    bindModuleClass(localAttribute("Future"), "_asyncio.Future");
-    bindModuleClass(localAttribute("Task"), "_asyncio.Task");
-    return true;
-  }
-  if (module == "asyncio") {
-    bindModuleObject();
-    bindModuleClass(localAttribute("Future"), "_asyncio.Future");
-    bindModuleClass(localAttribute("Task"), "_asyncio.Task");
-    bindModuleClass(localAttribute("AbstractEventLoop"),
-                    "asyncio.AbstractEventLoop");
-    bindModuleClass(localAttribute("CancelledError"), "asyncio.CancelledError");
-    bindModuleCallable(localAttribute("sleep"), "asyncio.sleep",
-                       makeAsyncioSleepCallable(*this));
-    bindModuleCallable(localAttribute("get_event_loop"),
-                       "asyncio.get_event_loop",
-                       makeAsyncioGetEventLoopCallable(*this));
-    return true;
-  }
-  if (module == "asyncio.events") {
-    bindModuleObject();
-    std::string eventClass = localName == module.split('.').first
-                                 ? localAttribute("events.AbstractEventLoop")
-                                 : localAttribute("AbstractEventLoop");
-    bindModuleClass(eventClass, "asyncio.AbstractEventLoop");
-    return true;
-  }
-  if (module == "asyncio.exceptions") {
-    bindModuleObject();
-    std::string exceptionClass =
-        localName == module.split('.').first
-            ? localAttribute("exceptions.CancelledError")
-            : localAttribute("CancelledError");
-    bindModuleClass(exceptionClass, "asyncio.CancelledError");
-    return true;
-  }
-  if (module == "contextlib") {
-    bindModuleObject();
-    bindModuleClass(localAttribute("nullcontext"), "contextlib.nullcontext");
-    return true;
-  }
-  if (module == "contextvars") {
-    bindModuleObject();
-    bindModuleClass(localAttribute("Context"), "contextvars.Context");
-    return true;
-  }
-  if (module == "lyrt") {
-    bindModuleObject();
-    bindModuleCallable(localAttribute("from_prim"), "lyrt.from_prim",
-                       contract("builtins.function"));
-    bindModuleCallable(localAttribute("native"), "lyrt.native",
-                       contract("builtins.function"));
-    bindCanonicalSymbol(localAttribute("prim.Int"), "lyrt.prim.Int",
-                        typeObject(object()));
-    bindAnnotationAlias(localAttribute("prim.Int"), "lyrt.prim.Int");
-    return true;
-  }
-  if (module == "lyrt.prim") {
-    bindModuleObject();
-    bindCanonicalSymbol(localAttribute("Int"), "lyrt.prim.Int",
-                        typeObject(object()));
-    bindAnnotationAlias(localAttribute("Int"), "lyrt.prim.Int");
-    return true;
-  }
-  if (module == "typing" || module == "typing_extensions") {
-    bindModuleObject();
-    bindAnnotationModuleAliases([&](llvm::StringRef name) {
-      bindAnnotationAlias(localAttribute(name), name);
-    });
-    return true;
-  }
-  if (module == "collections.abc") {
-    bindModuleObject();
-    std::string prefix = localName == module.split('.').first
-                             ? localAttribute("abc")
-                             : std::string(localName);
-    bindAnnotationModuleAliases([&](llvm::StringRef name) {
-      bindAnnotationAlias((llvm::Twine(prefix) + "." + name).str(), name);
-    });
-    return true;
-  }
-  if (module == "collections") {
-    bindModuleObject();
-    bindAnnotationModuleAliases([&](llvm::StringRef name) {
-      bindAnnotationAlias(localAttribute((llvm::Twine("abc.") + name).str()),
-                          name);
-    });
-    return true;
+    bindClass(importedModuleAttribute(module, localName, entry),
+              contract(entry.contractName));
   }
 
-  return false;
+  for (const ModuleCallableImport &entry : kModuleCallableImports) {
+    if (module != entry.module)
+      continue;
+    bindModuleObject();
+    bindCanonicalSymbol(importedAttribute(localName, entry.localAttr),
+                        entry.canonicalName,
+                        importCallableType(*this, entry.factory));
+  }
+
+  for (const ModuleAliasImport &entry : kModuleAliasImports) {
+    if (module != entry.module)
+      continue;
+    bindModuleObject();
+    std::string local = importedAttribute(localName, entry.localAttr);
+    bindCanonicalSymbol(local, entry.canonicalName, typeObject(object()));
+    if (entry.annotationAlias)
+      bindAnnotationAlias(local, entry.canonicalName);
+  }
+
+  if (std::optional<AnnotationModuleStyle> style =
+          annotationModuleStyle(module)) {
+    bindModuleObject();
+    bindAnnotationModuleAliases([&](llvm::StringRef name) {
+      bindAnnotationAlias(
+          importedAnnotationAlias(module, localName, *style, name), name);
+    });
+  }
+
+  return handled;
 }
 
 bool AlgorithmM::bindImportedName(llvm::StringRef module,
@@ -1611,51 +1718,31 @@ bool AlgorithmM::bindImportedName(llvm::StringRef module,
   if (localName.empty())
     localName = exportedName;
 
-  auto bindContractClass = [&](llvm::StringRef contractName) {
-    bindClass(localName, contract(contractName));
-    return true;
-  };
-
-  if ((module == "_asyncio" || module == "asyncio") && exportedName == "Future")
-    return bindContractClass("_asyncio.Future");
-  if ((module == "_asyncio" || module == "asyncio") && exportedName == "Task")
-    return bindContractClass("_asyncio.Task");
-  if ((module == "asyncio" || module == "asyncio.events") &&
-      exportedName == "AbstractEventLoop")
-    return bindContractClass("asyncio.AbstractEventLoop");
-  if ((module == "asyncio" || module == "asyncio.exceptions") &&
-      exportedName == "CancelledError")
-    return bindContractClass("asyncio.CancelledError");
-  if (module == "asyncio" && exportedName == "sleep") {
-    bindCanonicalSymbol(localName, "asyncio.sleep",
-                        makeAsyncioSleepCallable(*this));
-    return true;
-  }
-  if (module == "asyncio" && exportedName == "get_event_loop") {
-    bindCanonicalSymbol(localName, "asyncio.get_event_loop",
-                        makeAsyncioGetEventLoopCallable(*this));
-    return true;
-  }
-  if (module == "contextlib" && exportedName == "nullcontext")
-    return bindContractClass("contextlib.nullcontext");
-  if (module == "lyrt" && exportedName == "from_prim") {
-    bindCanonicalSymbol(localName, "lyrt.from_prim",
-                        contract("builtins.function"));
-    return true;
-  }
-  if (module == "lyrt" && exportedName == "native") {
-    bindCanonicalSymbol(localName, "lyrt.native",
-                        contract("builtins.function"));
-    return true;
-  }
-  if (module == "lyrt.prim" && exportedName == "Int") {
-    bindCanonicalSymbol(localName, "lyrt.prim.Int", typeObject(object()));
-    bindAnnotationAlias(localName, "lyrt.prim.Int");
+  for (const NameClassImport &entry : kNameClassImports) {
+    if (module != entry.module || exportedName != entry.exportedName)
+      continue;
+    bindClass(localName, contract(entry.contractName));
     return true;
   }
 
-  if (module == "typing" || module == "typing_extensions" ||
-      module == "collections.abc") {
+  for (const NameCallableImport &entry : kNameCallableImports) {
+    if (module != entry.module || exportedName != entry.exportedName)
+      continue;
+    bindCanonicalSymbol(localName, entry.canonicalName,
+                        importCallableType(*this, entry.factory));
+    return true;
+  }
+
+  for (const NameAliasImport &entry : kNameAliasImports) {
+    if (module != entry.module || exportedName != entry.exportedName)
+      continue;
+    bindCanonicalSymbol(localName, entry.canonicalName, typeObject(object()));
+    if (entry.annotationAlias)
+      bindAnnotationAlias(localName, entry.canonicalName);
+    return true;
+  }
+
+  if (moduleExportsAnnotationNames(module)) {
     if (isImportedAnnotationName(exportedName)) {
       // annotationType interprets these names directly. Binding the local
       // spelling acknowledges import aliases without creating module objects.
