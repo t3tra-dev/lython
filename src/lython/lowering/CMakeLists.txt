@@ -28,6 +28,9 @@ add_library(LythonRuntimeLowering STATIC
     Passes/RuntimeLowering/Passes.cpp
     Passes/RuntimeLowering/Ops/PackAndBindingOps.cpp
     Passes/RuntimeLowering/PrimitiveI64Calls.cpp
+    Passes/RuntimeLowering/PrimitiveTensorGemm.cpp
+    Passes/RuntimeLowering/PrimitiveTensorMicroKernel.cpp
+    Passes/RuntimeLowering/PrimitiveTensorLowering.cpp
     Passes/RuntimeLowering/ReturnedSummaries.cpp
     Passes/RuntimeLowering/RuntimeCallOperands.cpp
     Passes/RuntimeLowering/Ops/SpecialMethodOps.cpp

@@ -2,6 +2,7 @@
 
 #include "AstAccess.h"
 #include "CandidateSelection.h"
+#include "PrimitiveTypes.h"
 #include "cpp/PyCallableShape.h"
 #include "cpp/PyProtocols.h"
 
@@ -247,20 +248,6 @@ bool annotationNameIs(llvm::StringRef name, llvm::StringRef bareName) {
   return annotationNamespaceTail(name) == bareName;
 }
 
-bool isLyrtPrimitiveIntName(llvm::StringRef name) {
-  return name == "Int" || name == "prim.Int" || name == "lyrt.prim.Int";
-}
-
-std::optional<unsigned>
-positiveIntegerAnnotationLiteral(const parser::Node *node) {
-  if (!node || node->kind != "Constant")
-    return std::nullopt;
-  std::int64_t value = ast::integer(*node, "value").value_or(0);
-  if (value <= 0)
-    return std::nullopt;
-  return static_cast<unsigned>(value);
-}
-
 std::optional<std::string> protocolAnnotationName(llvm::StringRef name) {
   name = annotationNamespaceTail(name);
   for (llvm::StringRef protocol :
@@ -425,9 +412,17 @@ constexpr std::array<ModuleCallableImport, 4> kModuleCallableImports{{
     {"lyrt", "native", "lyrt.native", ImportCallableFactory::BuiltinsFunction},
 }};
 
-constexpr std::array<ModuleAliasImport, 2> kModuleAliasImports{{
+constexpr std::array<ModuleAliasImport, 10> kModuleAliasImports{{
     {"lyrt", "prim.Int", "lyrt.prim.Int", true},
+    {"lyrt", "prim.Float", "lyrt.prim.Float", true},
+    {"lyrt", "prim.Vector", "lyrt.prim.Vector", true},
+    {"lyrt", "prim.Matrix", "lyrt.prim.Matrix", true},
+    {"lyrt", "prim.Tensor", "lyrt.prim.Tensor", true},
     {"lyrt.prim", "Int", "lyrt.prim.Int", true},
+    {"lyrt.prim", "Float", "lyrt.prim.Float", true},
+    {"lyrt.prim", "Vector", "lyrt.prim.Vector", true},
+    {"lyrt.prim", "Matrix", "lyrt.prim.Matrix", true},
+    {"lyrt.prim", "Tensor", "lyrt.prim.Tensor", true},
 }};
 
 constexpr std::array<NameClassImport, 9> kNameClassImports{{
@@ -451,8 +446,12 @@ constexpr std::array<NameCallableImport, 4> kNameCallableImports{{
     {"lyrt", "native", "lyrt.native", ImportCallableFactory::BuiltinsFunction},
 }};
 
-constexpr std::array<NameAliasImport, 1> kNameAliasImports{{
+constexpr std::array<NameAliasImport, 5> kNameAliasImports{{
     {"lyrt.prim", "Int", "lyrt.prim.Int", true},
+    {"lyrt.prim", "Float", "lyrt.prim.Float", true},
+    {"lyrt.prim", "Vector", "lyrt.prim.Vector", true},
+    {"lyrt.prim", "Matrix", "lyrt.prim.Matrix", true},
+    {"lyrt.prim", "Tensor", "lyrt.prim.Tensor", true},
 }};
 
 std::string importedAttribute(llvm::StringRef localName, llvm::StringRef attr) {
@@ -1470,6 +1469,32 @@ tryManifestMethod(const AlgorithmM &types, mlir::Type receiverType,
   return std::move(selection).finish();
 }
 
+std::optional<mlir::Type> primitiveBinaryResultType(mlir::Type left,
+                                                    mlir::Type right,
+                                                    const parser::Node *op) {
+  if (!left || !right)
+    return std::nullopt;
+  if (ast::isOperator(op, "Add") || ast::isOperator(op, "Sub") ||
+      ast::isOperator(op, "Mult")) {
+    if (left == right && (mlir::isa<mlir::IntegerType, mlir::FloatType>(left) ||
+                          mlir::isa<mlir::RankedTensorType>(left)))
+      return left;
+  }
+  if (!ast::isOperator(op, "MatMult"))
+    return std::nullopt;
+
+  auto lhsTensor = mlir::dyn_cast<mlir::RankedTensorType>(left);
+  auto rhsTensor = mlir::dyn_cast<mlir::RankedTensorType>(right);
+  if (!lhsTensor || !rhsTensor || lhsTensor.getRank() != 2 ||
+      rhsTensor.getRank() != 2 ||
+      lhsTensor.getElementType() != rhsTensor.getElementType() ||
+      lhsTensor.getDimSize(1) != rhsTensor.getDimSize(0))
+    return std::nullopt;
+  llvm::SmallVector<std::int64_t, 2> shape{lhsTensor.getDimSize(0),
+                                           rhsTensor.getDimSize(1)};
+  return mlir::RankedTensorType::get(shape, lhsTensor.getElementType());
+}
+
 } // namespace
 
 AlgorithmM::AlgorithmM(mlir::MLIRContext &context) : context(context) {}
@@ -1814,6 +1839,10 @@ mlir::Type AlgorithmM::annotationType(const parser::Node *node) const {
         &context, {annotationType(ast::node(*node, "left")),
                    annotationType(ast::node(*node, "right"))});
   if (node->kind == "Subscript") {
+    if (std::optional<PrimitiveTypeSpec> primitive =
+            primitiveTypeSpecFromSubscript(node, *this))
+      return primitive->type;
+
     const parser::Node *base = ast::node(*node, "value");
     const parser::Node *slice = ast::node(*node, "slice");
     std::string qualifiedBase = ast::qualifiedName(base);
@@ -1824,10 +1853,6 @@ mlir::Type AlgorithmM::annotationType(const parser::Node *node) const {
             ? llvm::StringRef(baseSpelling.data(), baseSpelling.size())
             : llvm::StringRef(qualifiedBase));
     llvm::StringRef baseName(resolvedBase);
-    if (isLyrtPrimitiveIntName(baseName))
-      if (std::optional<unsigned> width =
-              positiveIntegerAnnotationLiteral(slice))
-        return mlir::IntegerType::get(&context, *width);
     if (annotationNameIs(baseName, "Optional"))
       return py::UnionType::getNormalized(&context,
                                           {annotationType(slice), none()});
@@ -1988,6 +2013,9 @@ mlir::Type AlgorithmM::inferExpr(const parser::Node *node) const {
     return dictOf(keyValueTypes->first, keyValueTypes->second);
   }
   if (node->kind == "Subscript") {
+    if (std::optional<PrimitiveTypeSpec> primitive =
+            primitiveTypeSpecFromSubscript(node, *this))
+      return typeObject(primitive->type);
     mlir::Type container = widenLiteral(inferExpr(ast::node(*node, "value")));
     mlir::Type index = inferExpr(ast::node(*node, "slice"));
     if (std::optional<CallSolution> result =
@@ -2052,6 +2080,9 @@ mlir::Type AlgorithmM::inferExpr(const parser::Node *node) const {
       method = "__or__";
     else if (ast::isOperator(op, "BitXor"))
       method = "__xor__";
+    if (std::optional<mlir::Type> primitive =
+            primitiveBinaryResultType(left, right, op))
+      return *primitive;
     if (std::optional<CallSolution> result =
             tryManifestMethod(*this, left, method, {right}))
       return result->result;
@@ -2076,6 +2107,10 @@ mlir::Type AlgorithmM::inferExpr(const parser::Node *node) const {
   }
   if (node->kind == "Call") {
     const parser::Node *callee = ast::node(*node, "func");
+    if (std::optional<PrimitiveTypeSpec> primitive =
+            primitiveTypeSpecFromSubscript(callee, *this))
+      return primitive->type;
+
     llvm::SmallVector<mlir::Type, 8> positional;
     if (const auto *args = ast::nodeList(*node, "args")) {
       for (const parser::NodePtr &arg : *args) {
@@ -2127,18 +2162,26 @@ mlir::Type AlgorithmM::inferExpr(const parser::Node *node) const {
         return contract("builtins.range");
       if (auto cls = lookupClass(name))
         return inferClassInstantiation(*cls, positional, keywords);
-      if (std::optional<std::string> canonical = lookupCanonicalBinding(name))
+      if (std::optional<std::string> canonical = lookupCanonicalBinding(name)) {
+        if (*canonical == "lyrt.from_prim" && positional.size() == 1 &&
+            keywords.empty())
+          return primitivePythonResultType(positional.front(), *this);
         if (*canonical == "asyncio.sleep")
           return inferAsyncioSleepResult(*this, positional, keywords);
+      }
       if (auto symbol = lookupSymbol(name))
         return inferCall(*symbol, positional, keywords);
     }
     if (callee && callee->kind == "Attribute") {
       std::string qualified = ast::qualifiedName(callee);
       if (std::optional<std::string> canonical =
-              lookupCanonicalBinding(qualified))
+              lookupCanonicalBinding(qualified)) {
+        if (*canonical == "lyrt.from_prim" && positional.size() == 1 &&
+            keywords.empty())
+          return primitivePythonResultType(positional.front(), *this);
         if (*canonical == "asyncio.sleep")
           return inferAsyncioSleepResult(*this, positional, keywords);
+      }
       if (auto symbol = lookupSymbol(qualified))
         return inferCall(*symbol, positional, keywords);
     }

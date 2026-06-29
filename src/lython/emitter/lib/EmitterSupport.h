@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Ast.h"
+#include "PrimitiveTypes.h"
 #include "TypeSystem.h"
 
 #include "mlir/IR/Builders.h"
@@ -20,16 +21,6 @@ extern const llvm::StringLiteral kCallableVarargValueTypeAttr;
 extern const llvm::StringLiteral kCallableKwargValueTypeAttr;
 extern const llvm::StringLiteral kPackUnpackedOperandsAttr;
 
-bool isLyrtPrimitiveIntName(llvm::StringRef name);
-std::optional<std::int64_t> integerLiteralValue(const parser::Node *node);
-std::optional<unsigned> primitiveIntWidthFromSubscript(const parser::Node *node,
-                                                       const AlgorithmM &types);
-std::optional<mlir::IntegerType>
-primitiveIntTypeFromSubscript(const parser::Node *node,
-                              const AlgorithmM &types);
-std::optional<std::pair<mlir::IntegerType, std::int64_t>>
-primitiveIntegerConstantConstructor(const parser::Node *node,
-                                    const AlgorithmM &types);
 bool isPrimitiveOnlyCallable(py::CallableType callable);
 
 mlir::ArrayAttr stringArray(mlir::Builder &builder,

@@ -1,3 +1,4 @@
+#include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
 #include "mlir/Conversion/ConvertToLLVM/ToLLVMPass.h"
@@ -5,6 +6,9 @@
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
 #include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
+#include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVMPass.h"
+#include "mlir/Conversion/VectorToSCF/VectorToSCF.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Async/IR/Async.h"
@@ -17,10 +21,13 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/MemRef/Transforms/Passes.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/Dialect/Vector/Transforms/Passes.h"
 #include "mlir/ExecutionEngine/ExecutionEngine.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/DialectRegistry.h"
@@ -393,6 +400,17 @@ LogicalResult runPipeline(ModuleOp module, MLIRContext &context,
     return failure();
   dumpMLIRForPass(irDump, "canonicalize", module);
 
+  // Phase 4.1: Lower primitive tensor/linalg computations while the high-level
+  // contraction structure is still visible.  This keeps Python object lowering
+  // separate from numeric kernels and gives affine/vector passes an alias-free
+  // memref view of primitive tensors.
+  if (failed(runLoweringPhase("linalg-lowering", context, module,
+                              [&](PassManager &pm) {
+                                pm.addPass(py::createLinalgLoweringPass());
+                              })))
+    return failure();
+  dumpMLIRForPass(irDump, "linalg-lowering", module);
+
   // Phase 4.5: Import runtime object definitions written in MLIR. These
   // fragments are kept at func/memref level and flow through the same lowering
   // pipeline as user code.
@@ -485,6 +503,21 @@ LogicalResult runPipeline(ModuleOp module, MLIRContext &context,
     }
     if (failed(runLoweringPhase(
             "convert-to-llvm", context, module, [&](PassManager &pm) {
+              mlir::ConvertVectorToLLVMPassOptions vectorOptions;
+              vectorOptions.reassociateFPReductions = true;
+              mlir::VectorTransferToSCFOptions transferOptions;
+              transferOptions.setTargetRank(1);
+              pm.addPass(mlir::createLowerAffinePass());
+              pm.addPass(mlir::memref::createExpandStridedMetadataPass());
+              pm.addPass(mlir::createLowerAffinePass());
+              pm.addNestedPass<mlir::func::FuncOp>(
+                  mlir::vector::createLowerVectorMultiReductionPass(
+                      mlir::vector::VectorMultiReductionLowering::
+                          InnerReduction));
+              pm.addPass(mlir::createConvertVectorToSCFPass(transferOptions));
+              pm.addPass(mlir::createLowerAffinePass());
+              pm.addPass(mlir::createCanonicalizerPass());
+              pm.addPass(mlir::createConvertVectorToLLVMPass(vectorOptions));
               pm.addPass(mlir::createConvertSCFToCFPass());
               pm.addPass(mlir::createArithToLLVMConversionPass());
               pm.addPass(mlir::createConvertControlFlowToLLVMPass());
@@ -1727,11 +1760,12 @@ int main(int argc, char **argv) {
   bool isPythonInput = llvm::sys::path::extension(inputPath) == ".py";
 
   DialectRegistry registry;
-  registry.insert<py::PyDialect, async::AsyncDialect, func::FuncDialect,
-                  arith::ArithDialect, scf::SCFDialect,
+  registry.insert<py::PyDialect, affine::AffineDialect, async::AsyncDialect,
+                  func::FuncDialect, arith::ArithDialect, scf::SCFDialect,
                   mlir::cf::ControlFlowDialect, tensor::TensorDialect,
                   linalg::LinalgDialect, memref::MemRefDialect,
-                  bufferization::BufferizationDialect, LLVM::LLVMDialect>();
+                  vector::VectorDialect, bufferization::BufferizationDialect,
+                  LLVM::LLVMDialect>();
   arith::registerBufferizableOpInterfaceExternalModels(registry);
   bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(
       registry);

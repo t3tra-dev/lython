@@ -4,11 +4,14 @@
 #include "Passes/Runtime/Cleanup.h"
 
 #include "mlir/Dialect/Async/IR/Async.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 
 #include "llvm/ADT/STLExtras.h"
 
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -81,8 +84,9 @@ collectRuntimeDeallocators(mlir::ModuleOp module) {
       return;
     RuntimeDeallocator deallocator;
     deallocator.function = function;
-    deallocator.inputTypes.append(function.getFunctionType().getInputs().begin(),
-                                  function.getFunctionType().getInputs().end());
+    deallocator.inputTypes.append(
+        function.getFunctionType().getInputs().begin(),
+        function.getFunctionType().getInputs().end());
     deallocators.push_back(std::move(deallocator));
   });
   return deallocators;
@@ -165,9 +169,10 @@ mlir::func::FuncOp findRetainFunction(mlir::ModuleOp module) {
   return retained;
 }
 
-mlir::FailureOr<mlir::Value>
-buildRetainHeaderView(mlir::OpBuilder &builder, mlir::Location loc,
-                      mlir::Value header, mlir::Type retainInputType) {
+mlir::FailureOr<mlir::Value> buildRetainHeaderView(mlir::OpBuilder &builder,
+                                                   mlir::Location loc,
+                                                   mlir::Value header,
+                                                   mlir::Type retainInputType) {
   if (header.getType() == retainInputType)
     return header;
 
@@ -186,12 +191,10 @@ buildRetainHeaderView(mlir::OpBuilder &builder, mlir::Location loc,
 
   if (sourceType.hasStaticShape() && targetType.hasStaticShape() &&
       sourceType.getDimSize(0) >= targetType.getDimSize(0)) {
-    llvm::SmallVector<mlir::OpFoldResult, 1> offsets{
-        builder.getIndexAttr(0)};
+    llvm::SmallVector<mlir::OpFoldResult, 1> offsets{builder.getIndexAttr(0)};
     llvm::SmallVector<mlir::OpFoldResult, 1> sizes{
         builder.getIndexAttr(targetType.getDimSize(0))};
-    llvm::SmallVector<mlir::OpFoldResult, 1> strides{
-        builder.getIndexAttr(1)};
+    llvm::SmallVector<mlir::OpFoldResult, 1> strides{builder.getIndexAttr(1)};
     return builder
         .create<mlir::memref::SubViewOp>(loc, targetType, header, offsets,
                                          sizes, strides)
@@ -222,9 +225,9 @@ mlir::LogicalResult insertRetain(mlir::func::FuncOp retain,
   return mlir::success();
 }
 
-mlir::LogicalResult insertBorrowedReturnRetains(
-    mlir::ModuleOp module, mlir::func::FuncOp retain,
-    llvm::ArrayRef<RuntimeDeallocator> deallocators) {
+mlir::LogicalResult
+insertBorrowedReturnRetains(mlir::ModuleOp module, mlir::func::FuncOp retain,
+                            llvm::ArrayRef<RuntimeDeallocator> deallocators) {
   mlir::LogicalResult result = mlir::success();
   module.walk([&](mlir::func::FuncOp function) {
     if (mlir::failed(result))
@@ -235,9 +238,8 @@ mlir::LogicalResult insertBorrowedReturnRetains(
     function.walk([&](mlir::func::ReturnOp returnOp) {
       unsigned offset = 0;
       while (offset < returnOp.getNumOperands()) {
-        const RuntimeDeallocator *deallocator =
-            findDeallocatorForValueGroup(returnOp.getOperands(), offset,
-                                         deallocators);
+        const RuntimeDeallocator *deallocator = findDeallocatorForValueGroup(
+            returnOp.getOperands(), offset, deallocators);
         if (!deallocator) {
           ++offset;
           continue;
@@ -269,16 +271,15 @@ bool isOwnershipConsumingUse(mlir::ModuleOp module, mlir::OpOperand &use) {
                        callee, static_cast<unsigned>(use.getOperandNumber()));
 }
 
-mlir::Operation *latestUserInBlock(mlir::Operation *lhs,
-                                   mlir::Operation *rhs) {
+mlir::Operation *latestUserInBlock(mlir::Operation *lhs, mlir::Operation *rhs) {
   if (!lhs)
     return rhs;
   return lhs->isBeforeInBlock(rhs) ? rhs : lhs;
 }
 
-mlir::Operation *
-findReleaseInsertionPoint(mlir::ModuleOp module, mlir::func::CallOp owner,
-                          llvm::ArrayRef<mlir::Value> group) {
+mlir::Operation *findReleaseInsertionPoint(mlir::ModuleOp module,
+                                           mlir::func::CallOp owner,
+                                           llvm::ArrayRef<mlir::Value> group) {
   mlir::Block *block = owner->getBlock();
   mlir::Operation *lastUser = nullptr;
   for (mlir::Value result : group) {
@@ -303,9 +304,9 @@ bool callResultGroupIsOwned(mlir::func::FuncOp callee, unsigned resultIndex) {
          functionUsesOwnedReturnABI(callee);
 }
 
-mlir::LogicalResult insertOwnedResultReleases(
-    mlir::ModuleOp module, mlir::func::CallOp call,
-    llvm::ArrayRef<RuntimeDeallocator> deallocators) {
+mlir::LogicalResult
+insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
+                          llvm::ArrayRef<RuntimeDeallocator> deallocators) {
   mlir::func::FuncOp callee =
       module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
   if (!callee || call.getNumResults() == 0)
@@ -333,8 +334,8 @@ mlir::LogicalResult insertOwnedResultReleases(
     if (insertionPoint) {
       mlir::OpBuilder builder(insertionPoint);
       builder.setInsertionPointAfter(insertionPoint);
-      builder.create<mlir::func::CallOp>(call.getLoc(),
-                                         deallocator->function, group);
+      builder.create<mlir::func::CallOp>(call.getLoc(), deallocator->function,
+                                         group);
     }
     offset += groupSize;
   }
@@ -383,8 +384,8 @@ public:
       return;
 
     mlir::func::FuncOp retain = findRetainFunction(module);
-    if (mlir::failed(insertBorrowedReturnRetains(module, retain,
-                                                 deallocators))) {
+    if (mlir::failed(
+            insertBorrowedReturnRetains(module, retain, deallocators))) {
       signalPassFailure();
       return;
     }
@@ -638,12 +639,6 @@ createNativeVerificationPass() {
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createAsyncThunkLoweringPass() {
   return std::make_unique<runtime_lowering::AsyncThunkLoweringPass>();
-}
-
-std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createLinalgLoweringPass() {
-  return runtime_lowering::makeNoOpPass("lython-linalg-lowering",
-                                        "lower linalg helper operations");
 }
 
 namespace lowering::runtime::cleanup {

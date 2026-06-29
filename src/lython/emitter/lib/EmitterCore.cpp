@@ -6,7 +6,9 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h" // IWYU pragma: keep
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinAttributes.h"
 
 #include <utility>
@@ -28,7 +30,8 @@ ModuleEmitter::ModuleEmitter(const parser::Node &moduleNode,
 EmitResult ModuleEmitter::emit() {
   context.loadDialect<py::PyDialect, mlir::arith::ArithDialect,
                       mlir::cf::ControlFlowDialect, mlir::func::FuncDialect,
-                      mlir::scf::SCFDialect>();
+                      mlir::linalg::LinalgDialect, mlir::scf::SCFDialect,
+                      mlir::tensor::TensorDialect>();
   types.seedBuiltins();
 
   module = mlir::ModuleOp::create(builder.getUnknownLoc());
