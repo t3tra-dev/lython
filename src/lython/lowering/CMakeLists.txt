@@ -29,7 +29,12 @@ add_library(LythonRuntimeLowering STATIC
     Passes/RuntimeLowering/Ops/PackAndBindingOps.cpp
     Passes/RuntimeLowering/PrimitiveI64Calls.cpp
     Passes/RuntimeLowering/PrimitiveTensorGemm.cpp
-    Passes/RuntimeLowering/PrimitiveTensorMicroKernel.cpp
+    Passes/RuntimeLowering/PrimitiveTensorPacking.cpp
+    Passes/RuntimeLowering/Arch/Arm/PrimitiveTensorArmSME.cpp
+    Passes/RuntimeLowering/Arch/Arm/PrimitiveTensorArmSMEMatmul.cpp
+    Passes/RuntimeLowering/Arch/X86/PrimitiveTensorX86.cpp
+    Passes/RuntimeLowering/Arch/Generic/PrimitiveTensorGenericMicroKernel.cpp
+    Passes/RuntimeLowering/PrimitiveTensorSupport.cpp
     Passes/RuntimeLowering/PrimitiveTensorLowering.cpp
     Passes/RuntimeLowering/ReturnedSummaries.cpp
     Passes/RuntimeLowering/RuntimeCallOperands.cpp
@@ -103,9 +108,54 @@ add_custom_target(LythonRuntimeObjectBytecode
 )
 add_dependencies(LythonRuntimeLowering LythonRuntimeObjectBytecode)
 
+set(LYTHON_RUNTIME_NATIVE_MLIR
+    "${CMAKE_SOURCE_DIR}/src/lython/runtime/native/support.mlir"
+    "${CMAKE_SOURCE_DIR}/src/lython/runtime/native/support_darwin.mlir"
+    "${CMAKE_SOURCE_DIR}/src/lython/runtime/native/support_linux.mlir"
+)
+
+set(LYTHON_RUNTIME_NATIVE_BYTECODE_DIR
+    "${CMAKE_CURRENT_BINARY_DIR}/runtime_native"
+)
+set(LYTHON_RUNTIME_NATIVE_BYTECODE)
+foreach(native_runtime_mlir IN LISTS LYTHON_RUNTIME_NATIVE_MLIR)
+    get_filename_component(native_runtime_name "${native_runtime_mlir}" NAME_WE)
+    set(native_runtime_bc
+        "${LYTHON_RUNTIME_NATIVE_BYTECODE_DIR}/${native_runtime_name}.mlirbc"
+    )
+    add_custom_command(
+        OUTPUT "${native_runtime_bc}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            "${LYTHON_RUNTIME_NATIVE_BYTECODE_DIR}"
+        COMMAND $<TARGET_FILE:LythonRuntimeMlirBytecode>
+            "${native_runtime_mlir}" -o "${native_runtime_bc}"
+        DEPENDS LythonRuntimeMlirBytecode "${native_runtime_mlir}"
+        COMMENT "Generating native runtime MLIR bytecode ${native_runtime_name}.mlirbc"
+        VERBATIM
+    )
+    list(APPEND LYTHON_RUNTIME_NATIVE_BYTECODE "${native_runtime_bc}")
+endforeach()
+
+set(LYTHON_RUNTIME_NATIVE_BYTECODE_STAMP
+    "${LYTHON_RUNTIME_NATIVE_BYTECODE_DIR}/native_bytecode.stamp"
+)
+add_custom_command(
+    OUTPUT "${LYTHON_RUNTIME_NATIVE_BYTECODE_STAMP}"
+    COMMAND ${CMAKE_COMMAND} -E touch "${LYTHON_RUNTIME_NATIVE_BYTECODE_STAMP}"
+    DEPENDS ${LYTHON_RUNTIME_NATIVE_BYTECODE}
+    COMMENT "Stamping native runtime MLIR bytecode"
+    VERBATIM
+)
+
+add_custom_target(LythonRuntimeNativeBytecode
+    DEPENDS "${LYTHON_RUNTIME_NATIVE_BYTECODE_STAMP}"
+)
+add_dependencies(LythonRuntimeLowering LythonRuntimeNativeBytecode)
+
 # Compile every runtime bytecode module directly into the binary: the
-# compiler never reads runtime MLIR from the filesystem, and the embedded
-# bytecode is regenerated from source on every build, so it cannot be stale.
+# compiler never reads runtime MLIR from the filesystem. Runtime object MLIR is
+# embedded for manifest import, and native support MLIR is embedded separately
+# for late lowering after the final target triple is known.
 set(LYTHON_EMBEDDED_RUNTIME_CPP "${CMAKE_CURRENT_BINARY_DIR}/embedded_runtime.cpp")
 set(LYTHON_EMBEDDED_RUNTIME_GENERATOR
     "${CMAKE_CURRENT_BINARY_DIR}/GenerateEmbeddedRuntime.cmake"
@@ -120,6 +170,13 @@ string(REPLACE "," ";" module_list "${MODULES}")
 set(arrays "")
 set(entries "")
 foreach(path IN LISTS module_list)
+    set(kind "ModuleKind::MLIRBytecode")
+    if(path MATCHES "^native:")
+        set(kind "ModuleKind::NativeMLIRBytecode")
+        string(REGEX REPLACE "^native:" "" path "${path}")
+    elseif(path MATCHES "^mlir:")
+        string(REGEX REPLACE "^mlir:" "" path "${path}")
+    endif()
     get_filename_component(name "${path}" NAME_WE)
     if(NOT EXISTS "${path}")
         message(FATAL_ERROR "runtime bytecode module is missing: ${path}")
@@ -135,7 +192,8 @@ foreach(path IN LISTS module_list)
     string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," bytes "${hex}")
     string(APPEND arrays
         "static const unsigned char k_${name}[] = {${bytes}};\n")
-    string(APPEND entries "    {\"${name}\", k_${name}, sizeof(k_${name})},\n")
+    string(APPEND entries
+        "    {\"${name}\", ${kind}, k_${name}, sizeof(k_${name})},\n")
 endforeach()
 
 set(content "// Generated from src/lython/lowering/CMakeLists.txt. Do not edit.
@@ -158,7 +216,16 @@ ${arrays}
 
 file(WRITE "${OUTPUT}" "${content}")
 ]===])
-string(JOIN "," LYTHON_EMBEDDED_RUNTIME_INPUTS ${LYTHON_RUNTIME_OBJECT_BYTECODE})
+set(LYTHON_EMBEDDED_RUNTIME_INPUT_LIST)
+foreach(runtime_object_bc IN LISTS LYTHON_RUNTIME_OBJECT_BYTECODE)
+    list(APPEND LYTHON_EMBEDDED_RUNTIME_INPUT_LIST "mlir:${runtime_object_bc}")
+endforeach()
+foreach(native_runtime_bc IN LISTS LYTHON_RUNTIME_NATIVE_BYTECODE)
+    list(APPEND LYTHON_EMBEDDED_RUNTIME_INPUT_LIST "native:${native_runtime_bc}")
+endforeach()
+string(JOIN "," LYTHON_EMBEDDED_RUNTIME_INPUTS
+    ${LYTHON_EMBEDDED_RUNTIME_INPUT_LIST}
+)
 add_custom_command(
     OUTPUT "${LYTHON_EMBEDDED_RUNTIME_CPP}"
     COMMAND ${CMAKE_COMMAND}
@@ -166,12 +233,16 @@ add_custom_command(
         -DMODULES=${LYTHON_EMBEDDED_RUNTIME_INPUTS}
         -P ${LYTHON_EMBEDDED_RUNTIME_GENERATOR}
     DEPENDS "${LYTHON_RUNTIME_OBJECT_BYTECODE_STAMP}"
+        "${LYTHON_RUNTIME_NATIVE_BYTECODE_STAMP}"
         ${LYTHON_EMBEDDED_RUNTIME_GENERATOR}
     COMMENT "Embedding runtime MLIR bytecode"
     VERBATIM
 )
 add_library(LythonEmbeddedRuntime STATIC "${LYTHON_EMBEDDED_RUNTIME_CPP}")
-add_dependencies(LythonEmbeddedRuntime LythonRuntimeObjectBytecode)
+add_dependencies(LythonEmbeddedRuntime
+    LythonRuntimeObjectBytecode
+    LythonRuntimeNativeBytecode
+)
 target_include_directories(LythonEmbeddedRuntime
     PUBLIC
     ${CMAKE_SOURCE_DIR}/src/lython/runtime

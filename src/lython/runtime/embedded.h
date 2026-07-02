@@ -4,12 +4,18 @@
 
 namespace py::runtime_library::embedded {
 
-// One runtime MLIR bytecode module compiled into the binary at build time.
-// The registry carries the runtime object modules (object, long, unicode,
-// exception, ...) and the typing manifest ("typing"); see
-// src/lython/lowering/CMakeLists.txt.
+enum class ModuleKind {
+  MLIRBytecode,
+  NativeMLIRBytecode,
+};
+
+// One runtime module compiled into the binary at build time. The registry
+// carries high-level MLIR bytecode modules (object, long, unicode, exception,
+// typing, ...) plus native support MLIR bytecode. Native support is lowered to
+// LLVM IR inside lyc after the final target triple/data layout is known.
 struct Module {
   const char *name;
+  ModuleKind kind;
   const unsigned char *data;
   std::size_t size;
 };

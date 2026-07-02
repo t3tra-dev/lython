@@ -161,6 +161,8 @@ mlir::LogicalResult importRuntimeModule(mlir::ModuleOp target,
 mlir::LogicalResult embedObjectModules(mlir::ModuleOp module) {
   for (std::size_t index = 0; index < embedded::moduleCount(); ++index) {
     const embedded::Module &entry = embedded::modules()[index];
+    if (entry.kind != embedded::ModuleKind::MLIRBytecode)
+      continue;
     if (llvm::StringRef(entry.name) == "typing")
       continue;
     if (mlir::failed(importRuntimeModule(module, entry)))

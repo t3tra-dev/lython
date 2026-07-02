@@ -19,7 +19,6 @@ add_dependencies(lyc PyDialectIncGen)
 target_link_libraries(lyc
     PRIVATE
     PyDialect
-    LythonRuntime
     LythonRuntimeLowering
     LythonParser
     LythonEmitter

@@ -20,6 +20,34 @@ class PyLLVMTypeConverter;
 
 struct LoweredSafetyContracts {};
 
+enum class TensorLoweringArchitecture {
+  Generic,
+  ArmSME,
+  X86SSE42,
+  X86AVX2FMA,
+};
+
+struct TensorLoweringTarget {
+  TensorLoweringArchitecture architecture = TensorLoweringArchitecture::Generic;
+
+  bool usesArmSME() const {
+    return architecture == TensorLoweringArchitecture::ArmSME;
+  }
+
+  bool usesX86() const {
+    return architecture == TensorLoweringArchitecture::X86SSE42 ||
+           architecture == TensorLoweringArchitecture::X86AVX2FMA;
+  }
+
+  bool usesX86SSE42() const {
+    return architecture == TensorLoweringArchitecture::X86SSE42;
+  }
+
+  bool usesX86AVX2FMA() const {
+    return architecture == TensorLoweringArchitecture::X86AVX2FMA;
+  }
+};
+
 struct PythonCallSiteRange {
   std::string caller;
   std::string callee;
@@ -78,6 +106,7 @@ std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createNativeVerificationPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createAsyncThunkLoweringPass();
-std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createLinalgLoweringPass();
+std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
+createLinalgLoweringPass(TensorLoweringTarget target = {});
 
 } // namespace py

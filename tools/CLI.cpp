@@ -4,6 +4,7 @@
 #include "mlir/Conversion/ConvertToLLVM/ToLLVMPass.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
+#include "mlir/Conversion/Passes.h"
 #include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVMPass.h"
@@ -80,17 +81,26 @@
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
+#include "llvm/TargetParser/AArch64TargetParser.h"
 #include "llvm/TargetParser/Host.h"
+#include "llvm/TargetParser/SubtargetFeature.h"
+#include "llvm/TargetParser/X86TargetParser.h"
 #include "llvm/Transforms/Coroutines/CoroCleanup.h"
 #include "llvm/Transforms/Coroutines/CoroEarly.h"
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
 #include <system_error>
 #include <vector>
+
+#if defined(__APPLE__) && defined(__aarch64__)
+#include <sys/sysctl.h>
+#endif
 
 #include <sys/resource.h>
 
@@ -106,7 +116,9 @@
 #include "Emitter.h"
 #include "Parser.h"
 #include "Passes/Runtime/Cleanup.h"
-#include "lyrt.h"
+#include "Passes/RuntimeLowering/Arch/Arm/PrimitiveTensorArmSME.h"
+#include "Passes/RuntimeLowering/Arch/X86/PrimitiveTensorX86.h"
+#include "embedded.h"
 
 #include "PyDialect.h.inc"
 
@@ -137,13 +149,48 @@ std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createNativeVerificationPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createAsyncThunkLoweringPass();
-std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createLinalgLoweringPass();
 } // namespace py
 
 namespace {
+std::string TargetTriple;
+std::string TargetCPU;
+std::string TargetFPU;
+std::string TargetFloatABI;
+std::string TargetSysroot;
+std::vector<std::string> IncludeSearchPaths;
+std::vector<std::string> LibrarySearchPaths;
+
 std::string trimEnvToken(llvm::StringRef token) {
   token = token.trim();
   return token.str();
+}
+
+std::string configuredTargetTripleOverride() {
+  return trimEnvToken(TargetTriple);
+}
+
+std::string configuredTargetSysrootOverride() {
+  return trimEnvToken(TargetSysroot);
+}
+
+bool parseConfiguredFloatABI(llvm::FloatABI::ABIType &result) {
+  llvm::StringRef value = TargetFloatABI;
+  value = value.trim();
+  if (value.empty() || value == "default") {
+    result = llvm::FloatABI::Default;
+    return true;
+  }
+  if (value == "soft" || value == "softfp") {
+    result = llvm::FloatABI::Soft;
+    return true;
+  }
+  if (value == "hard") {
+    result = llvm::FloatABI::Hard;
+    return true;
+  }
+  llvm::errs() << "error: unsupported -mfloat-abi value '" << value
+               << "'; expected default, soft, softfp, or hard\n";
+  return false;
 }
 
 struct IRDumpConfig {
@@ -175,6 +222,233 @@ struct IRDumpConfig {
     return all || passes.count(passName.str()) != 0;
   }
 };
+
+std::string hostCPUNameForCodeGen() {
+  llvm::StringRef cpu = llvm::sys::getHostCPUName();
+  if (cpu.empty())
+    return "generic";
+  return cpu.str();
+}
+
+std::string hostCPUFeaturesForCodeGen() {
+  llvm::SubtargetFeatures features;
+  for (const auto &entry : llvm::sys::getHostCPUFeatures())
+    features.AddFeature(entry.getKey(), entry.getValue());
+#if defined(__APPLE__) && defined(__aarch64__)
+  auto addDarwinArmFeature = [&](llvm::StringRef sysctlName,
+                                 llvm::StringRef featureName) {
+    int enabled = 0;
+    size_t size = sizeof(enabled);
+    if (sysctlbyname(sysctlName.str().c_str(), &enabled, &size, nullptr, 0) ==
+            0 &&
+        enabled != 0)
+      features.AddFeature(featureName);
+  };
+  addDarwinArmFeature("hw.optional.arm.FEAT_SME", "sme");
+  addDarwinArmFeature("hw.optional.arm.FEAT_SME2", "sme2");
+#endif
+  return features.getString();
+}
+
+llvm::Triple codeGenTripleForTarget(py::TensorLoweringTarget target) {
+  (void)target;
+  std::string override = configuredTargetTripleOverride();
+  return llvm::Triple(override.empty() ? llvm::sys::getDefaultTargetTriple()
+                                       : override);
+}
+
+bool targetFeatureEnabled(const llvm::Triple &triple, llvm::StringRef feature);
+
+bool targetFeatureStringContains(llvm::StringRef features,
+                                 llvm::StringRef feature) {
+  llvm::SmallVector<llvm::StringRef, 32> tokens;
+  features.split(tokens, ",", /*MaxSplit=*/-1, /*KeepEmpty=*/false);
+  for (llvm::StringRef token : tokens) {
+    token = token.trim();
+    token.consume_front("+");
+    token.consume_front("-");
+    if (token == feature)
+      return true;
+  }
+  return false;
+}
+
+void appendTargetFeature(std::string &features, llvm::StringRef feature) {
+  if (targetFeatureStringContains(features, feature))
+    return;
+  if (!features.empty())
+    features += ",";
+  features += "+";
+  features += feature;
+}
+
+std::string configuredCPUNameForCodeGen(const llvm::Triple &triple) {
+  llvm::StringRef cpu = TargetCPU;
+  if (cpu.empty())
+    return "";
+  if (cpu != "native")
+    return cpu.str();
+
+  llvm::Triple hostTriple(llvm::sys::getDefaultTargetTriple());
+  if (triple.getArch() == hostTriple.getArch())
+    return hostCPUNameForCodeGen();
+  return "";
+}
+
+std::string codeGenCPUNameForTarget(py::TensorLoweringTarget target,
+                                    const llvm::Triple &triple) {
+  std::string configuredCPU = configuredCPUNameForCodeGen(triple);
+  if (!configuredCPU.empty())
+    return configuredCPU;
+  if (target.usesX86AVX2FMA())
+    return "haswell";
+  if (target.usesX86SSE42())
+    return "nehalem";
+  llvm::Triple hostTriple(llvm::sys::getDefaultTargetTriple());
+  if (triple.getArch() == hostTriple.getArch())
+    return hostCPUNameForCodeGen();
+  if (triple.getArch() == llvm::Triple::x86_64)
+    return "x86-64";
+  return hostCPUNameForCodeGen();
+}
+
+std::string codeGenFeaturesForTarget(py::TensorLoweringTarget target,
+                                     const llvm::Triple &triple) {
+  if (target.usesX86AVX2FMA())
+    return "+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+fma";
+  if (target.usesX86SSE42())
+    return "+sse2,+sse3,+ssse3,+sse4.1,+sse4.2";
+  if (target.usesArmSME()) {
+    std::string features;
+    llvm::Triple hostTriple(llvm::sys::getDefaultTargetTriple());
+    if (triple.getArch() == hostTriple.getArch())
+      features = hostCPUFeaturesForCodeGen();
+    appendTargetFeature(features, "sme");
+    if (targetFeatureEnabled(triple, "sme2"))
+      appendTargetFeature(features, "sme2");
+    return features;
+  }
+  llvm::Triple hostTriple(llvm::sys::getDefaultTargetTriple());
+  if (triple.getArch() != hostTriple.getArch())
+    return "";
+  return hostCPUFeaturesForCodeGen();
+}
+
+std::unique_ptr<llvm::TargetMachine>
+createCodeGenTargetMachine(py::TensorLoweringTarget target,
+                           std::string *normalizedTriple = nullptr) {
+  llvm::Triple triple = codeGenTripleForTarget(target);
+  std::string targetTriple = triple.normalize();
+  if (normalizedTriple)
+    *normalizedTriple = targetTriple;
+
+  std::string error;
+  const llvm::Target *llvmTarget =
+      llvm::TargetRegistry::lookupTarget(targetTriple, error);
+  if (!llvmTarget) {
+    llvm::errs() << "Failed to lookup target: " << error << "\n";
+    return nullptr;
+  }
+
+  llvm::TargetOptions opt;
+  opt.ExceptionModel = llvm::ExceptionHandling::DwarfCFI;
+  opt.MCOptions.EmitCompactUnwindNonCanonical = true;
+  opt.ForceDwarfFrameSection = true;
+  opt.MCOptions.EmitDwarfUnwind = llvm::EmitDwarfUnwindType::Always;
+  if (!parseConfiguredFloatABI(opt.FloatABIType))
+    return nullptr;
+  std::unique_ptr<llvm::TargetMachine> targetMachine(
+      llvmTarget->createTargetMachine(
+          targetTriple, codeGenCPUNameForTarget(target, triple),
+          codeGenFeaturesForTarget(target, triple), opt, std::nullopt));
+  if (!targetMachine)
+    llvm::errs() << "Failed to create target machine for " << targetTriple
+                 << "\n";
+  return targetMachine;
+}
+
+bool hostFeatureEnabled(llvm::StringRef feature) {
+  auto features = llvm::sys::getHostCPUFeatures();
+  auto found = features.find(feature);
+  if (found != features.end() && found->second)
+    return true;
+
+#if defined(__APPLE__) && defined(__aarch64__)
+  llvm::StringRef sysctlName;
+  if (feature == "sme")
+    sysctlName = "hw.optional.arm.FEAT_SME";
+  else if (feature == "sme2")
+    sysctlName = "hw.optional.arm.FEAT_SME2";
+  if (!sysctlName.empty()) {
+    int enabled = 0;
+    size_t size = sizeof(enabled);
+    return sysctlbyname(sysctlName.str().c_str(), &enabled, &size, nullptr,
+                        0) == 0 &&
+           enabled != 0;
+  }
+#endif
+
+  return false;
+}
+
+bool isHostCodeGenTriple(const llvm::Triple &triple) {
+  return triple.normalize() ==
+         llvm::Triple(llvm::sys::getDefaultTargetTriple()).normalize();
+}
+
+bool featureNameMatches(llvm::StringRef value, llvm::StringRef feature) {
+  value.consume_front("+");
+  return value == feature;
+}
+
+bool x86CPUFeatureEnabled(llvm::StringRef cpu, llvm::StringRef feature) {
+  llvm::SmallVector<llvm::StringRef, 64> features;
+  llvm::X86::getFeaturesForCPU(cpu, features, /*NeedPlus=*/false);
+  return llvm::is_contained(features, feature);
+}
+
+bool aarch64CPUFeatureEnabled(llvm::StringRef cpu, llvm::StringRef feature) {
+  std::optional<llvm::AArch64::CpuInfo> parsed = llvm::AArch64::parseCpu(cpu);
+  if (!parsed)
+    return false;
+  llvm::AArch64::ExtensionSet extensions;
+  extensions.addCPUDefaults(*parsed);
+  std::vector<std::string> features;
+  extensions.toLLVMFeatureList(features);
+  return llvm::any_of(features, [&](llvm::StringRef value) {
+    return featureNameMatches(value, feature);
+  });
+}
+
+bool targetFeatureEnabled(const llvm::Triple &triple, llvm::StringRef feature) {
+  llvm::StringRef cpu = TargetCPU;
+  if (!cpu.empty() && cpu != "native") {
+    if (triple.getArch() == llvm::Triple::x86_64)
+      return x86CPUFeatureEnabled(cpu, feature);
+    if (triple.isAArch64())
+      return aarch64CPUFeatureEnabled(cpu, feature);
+    return false;
+  }
+
+  if (!isHostCodeGenTriple(triple) && cpu != "native")
+    return false;
+  return hostFeatureEnabled(feature);
+}
+
+py::TensorLoweringTarget detectTensorLoweringTarget(llvm::Triple triple) {
+  py::TensorLoweringTarget target;
+  if (triple.isAArch64() && (targetFeatureEnabled(triple, "sme") ||
+                             targetFeatureEnabled(triple, "sme2")))
+    target.architecture = py::TensorLoweringArchitecture::ArmSME;
+  if (triple.getArch() == llvm::Triple::x86_64) {
+    if (targetFeatureEnabled(triple, "avx2") &&
+        targetFeatureEnabled(triple, "fma"))
+      target.architecture = py::TensorLoweringArchitecture::X86AVX2FMA;
+    else if (targetFeatureEnabled(triple, "sse4.2"))
+      target.architecture = py::TensorLoweringArchitecture::X86SSE42;
+  }
+  return target;
+}
 
 void dumpMLIRForPass(const IRDumpConfig &config, llvm::StringRef passName,
                      ModuleOp module) {
@@ -209,6 +483,49 @@ bool perfEnabled() {
 std::uint64_t timevalMicros(const timeval &value) {
   return static_cast<std::uint64_t>(value.tv_sec) * 1000000ULL +
          static_cast<std::uint64_t>(value.tv_usec);
+}
+
+void *armStreamingCompatibleMemcpy(void *dest, const void *src,
+                                   std::size_t count) {
+  auto *out = static_cast<volatile unsigned char *>(dest);
+  const auto *in = static_cast<const volatile unsigned char *>(src);
+  for (std::size_t index = 0; index < count; ++index)
+    out[index] = in[index];
+  return dest;
+}
+
+void *armStreamingCompatibleMemmove(void *dest, const void *src,
+                                    std::size_t count) {
+  auto *out = static_cast<volatile unsigned char *>(dest);
+  const auto *in = static_cast<const volatile unsigned char *>(src);
+  if (reinterpret_cast<std::uintptr_t>(dest) <=
+      reinterpret_cast<std::uintptr_t>(src)) {
+    for (std::size_t index = 0; index < count; ++index)
+      out[index] = in[index];
+  } else {
+    for (std::size_t index = count; index > 0; --index)
+      out[index - 1] = in[index - 1];
+  }
+  return dest;
+}
+
+void *armStreamingCompatibleMemset(void *dest, int value, std::size_t count) {
+  auto *out = static_cast<volatile unsigned char *>(dest);
+  auto byte = static_cast<unsigned char>(value);
+  for (std::size_t index = 0; index < count; ++index)
+    out[index] = byte;
+  return dest;
+}
+
+void *armStreamingCompatibleMemchr(void *ptr, int value, std::size_t count) {
+  auto *bytes = static_cast<unsigned char *>(ptr);
+  auto needle = static_cast<unsigned char>(value);
+  for (std::size_t index = 0; index < count; ++index) {
+    volatile unsigned char current = bytes[index];
+    if (current == needle)
+      return bytes + index;
+  }
+  return nullptr;
 }
 
 #if defined(__linux__)
@@ -353,7 +670,8 @@ LogicalResult requireNoAsyncDialectOps(ModuleOp module) {
 }
 
 LogicalResult runPipeline(ModuleOp module, MLIRContext &context,
-                          const IRDumpConfig &irDump) {
+                          const IRDumpConfig &irDump,
+                          py::TensorLoweringTarget tensorTarget) {
   dumpMLIRForPass(irDump, "frontend", module);
 
   // Phase 1: Native verification
@@ -404,10 +722,10 @@ LogicalResult runPipeline(ModuleOp module, MLIRContext &context,
   // contraction structure is still visible.  This keeps Python object lowering
   // separate from numeric kernels and gives affine/vector passes an alias-free
   // memref view of primitive tensors.
-  if (failed(runLoweringPhase("linalg-lowering", context, module,
-                              [&](PassManager &pm) {
-                                pm.addPass(py::createLinalgLoweringPass());
-                              })))
+  if (failed(runLoweringPhase(
+          "linalg-lowering", context, module, [&](PassManager &pm) {
+            pm.addPass(py::createLinalgLoweringPass(tensorTarget));
+          })))
     return failure();
   dumpMLIRForPass(irDump, "linalg-lowering", module);
 
@@ -505,11 +823,15 @@ LogicalResult runPipeline(ModuleOp module, MLIRContext &context,
             "convert-to-llvm", context, module, [&](PassManager &pm) {
               mlir::ConvertVectorToLLVMPassOptions vectorOptions;
               vectorOptions.reassociateFPReductions = true;
+              vectorOptions.x86Vector = tensorTarget.usesX86();
               mlir::VectorTransferToSCFOptions transferOptions;
               transferOptions.setTargetRank(1);
               pm.addPass(mlir::createLowerAffinePass());
               pm.addPass(mlir::memref::createExpandStridedMetadataPass());
               pm.addPass(mlir::createLowerAffinePass());
+              if (tensorTarget.usesArmSME())
+                py::runtime_lowering::arch::arm::
+                    addSMEPreControlFlowLLVMPrepPipeline(pm);
               pm.addNestedPass<mlir::func::FuncOp>(
                   mlir::vector::createLowerVectorMultiReductionPass(
                       mlir::vector::VectorMultiReductionLowering::
@@ -519,6 +841,9 @@ LogicalResult runPipeline(ModuleOp module, MLIRContext &context,
               pm.addPass(mlir::createCanonicalizerPass());
               pm.addPass(mlir::createConvertVectorToLLVMPass(vectorOptions));
               pm.addPass(mlir::createConvertSCFToCFPass());
+              if (tensorTarget.usesArmSME())
+                py::runtime_lowering::arch::arm::
+                    addSMEPostControlFlowLLVMPrepPipeline(pm);
               pm.addPass(mlir::createArithToLLVMConversionPass());
               pm.addPass(mlir::createConvertControlFlowToLLVMPass());
               pm.addPass(mlir::createConvertToLLVMPass());
@@ -568,25 +893,10 @@ buildRuntimeSymbolMap(llvm::orc::MangleAndInterner interner) {
     symbolMap[interner(name)] = {llvm::orc::ExecutorAddr::fromPtr(ptr),
                                  llvm::JITSymbolFlags::Exported};
   };
-  add("LyHost_PrintLine", &LyHost_PrintLine);
-  add("LyRt_InstallStackGuard", &LyRt_InstallStackGuard);
-  add("LyEH_ThrowException", &LyEH_ThrowException);
-  add("LyEH_BeginCatch", &LyEH_BeginCatch);
-  add("LyEH_ClassIdMatches", &LyEH_ClassIdMatches);
-  add("LyEH_CurrentExceptionClassId", &LyEH_CurrentExceptionClassId);
-  add("LyEH_CurrentExceptionMatches", &LyEH_CurrentExceptionMatches);
-  add("LyEH_DiscardCurrentExceptionIfMatches",
-      &LyEH_DiscardCurrentExceptionIfMatches);
-  add("LyEH_DiscardCurrentException", &LyEH_DiscardCurrentException);
-  add("LyEH_RethrowCurrent", &LyEH_RethrowCurrent);
-  add("LyEH_TakeCurrentDescriptor", &LyEH_TakeCurrentDescriptor);
-  add("LyTraceback_Push", &LyTraceback_Push);
-  add("LyTraceback_PushCString", &LyTraceback_PushCString);
-  add("LyTraceback_PushCStringRange", &LyTraceback_PushCStringRange);
-  add("LyTraceback_Pop", &LyTraceback_Pop);
-  add("LyTraceback_Clear", &LyTraceback_Clear);
-  add("LyTraceback_PrintMessage", &LyTraceback_PrintMessage);
-  add("LyRunPythonMain", &LyRunPythonMain);
+  add("__arm_sc_memcpy", &armStreamingCompatibleMemcpy);
+  add("__arm_sc_memmove", &armStreamingCompatibleMemmove);
+  add("__arm_sc_memset", &armStreamingCompatibleMemset);
+  add("__arm_sc_memchr", &armStreamingCompatibleMemchr);
   return symbolMap;
 }
 
@@ -633,28 +943,6 @@ LogicalResult runCppParserDump(StringRef inputPath, bool typeComments,
   llvm::outs() << lython::parser::dumpAst(*result.tree, includeAttributes)
                << "\n";
   return success();
-}
-
-std::optional<std::string> findBuildRoot(StringRef argv0) {
-  llvm::SmallString<256> exePath(argv0);
-  if (auto ec = llvm::sys::fs::real_path(exePath, exePath)) {
-    llvm::errs() << "error: unable to resolve executable path: " << ec.message()
-                 << "\n";
-    return std::nullopt;
-  }
-  llvm::sys::path::remove_filename(exePath);
-
-  llvm::SmallString<256> current(exePath);
-  while (!current.empty()) {
-    llvm::SmallString<256> cachePath(current);
-    llvm::sys::path::append(cachePath, "CMakeCache.txt");
-    if (llvm::sys::fs::exists(cachePath))
-      return std::string(current.str());
-    if (!llvm::sys::path::has_parent_path(current))
-      break;
-    llvm::sys::path::remove_filename(current);
-  }
-  return std::nullopt;
 }
 
 std::string pythonTracebackPath(StringRef inputPath);
@@ -731,9 +1019,9 @@ LogicalResult installAOTEntryPoint(llvm::Module &llvmModule) {
     llvm::errs() << "error: cannot build executable: missing __main__ entry\n";
     return failure();
   }
-  if (!pythonMain->arg_empty() || !pythonMain->getReturnType()->isVoidTy()) {
-    llvm::errs() << "error: cannot build executable: __main__ must have type "
-                    "void ()\n";
+  if (!pythonMain->arg_empty() || pythonMain->isVarArg()) {
+    llvm::errs() << "error: cannot build executable: __main__ must not take "
+                    "arguments\n";
     return failure();
   }
 
@@ -745,10 +1033,33 @@ LogicalResult installAOTEntryPoint(llvm::Module &llvmModule) {
     }
     existing->eraseFromParent();
   }
+  constexpr llvm::StringLiteral kAOTEntryThunkName = "__lython_aot_entry";
+  if (llvm::Function *existing = llvmModule.getFunction(kAOTEntryThunkName)) {
+    if (!existing->isDeclaration()) {
+      llvm::errs() << "error: cannot build executable: symbol '"
+                   << kAOTEntryThunkName << "' already exists\n";
+      return failure();
+    }
+    existing->eraseFromParent();
+  }
 
   llvm::LLVMContext &context = llvmModule.getContext();
+  llvm::Type *voidTy = llvm::Type::getVoidTy(context);
   llvm::Type *i32 = llvm::Type::getInt32Ty(context);
   llvm::Type *ptr = llvm::PointerType::getUnqual(context);
+  llvm::FunctionType *entryThunkType =
+      llvm::FunctionType::get(voidTy, /*isVarArg=*/false);
+  llvm::Function *entryThunk =
+      llvm::Function::Create(entryThunkType, llvm::GlobalValue::InternalLinkage,
+                             kAOTEntryThunkName, llvmModule);
+  entryThunk->setUWTableKind(llvm::UWTableKind::Async);
+
+  llvm::BasicBlock *thunkBlock =
+      llvm::BasicBlock::Create(context, "entry", entryThunk);
+  llvm::IRBuilder<> thunkBuilder(thunkBlock);
+  thunkBuilder.CreateCall(pythonMain->getFunctionType(), pythonMain, {});
+  thunkBuilder.CreateRetVoid();
+
   llvm::FunctionType *mainType =
       llvm::FunctionType::get(i32, /*isVarArg=*/false);
   llvm::Function *main = llvm::Function::Create(
@@ -762,7 +1073,7 @@ LogicalResult installAOTEntryPoint(llvm::Module &llvmModule) {
 
   llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", main);
   llvm::IRBuilder<> builder(entry);
-  llvm::CallInst *status = builder.CreateCall(runner, {pythonMain});
+  llvm::CallInst *status = builder.CreateCall(runner, {entryThunk});
   builder.CreateRet(status);
   return success();
 }
@@ -773,12 +1084,13 @@ LogicalResult installAOTEntryPoint(llvm::Module &llvmModule) {
 // frame (~2KB per object-handling call frame) and nothing is ever inlined.
 // The O2 default pipeline already contains the coroutine lowering phases
 // (CoroEarly/CoroSplit/CoroCleanup) at their correct positions.
-void runLLVMCoroLowering(llvm::Module &llvmModule) {
+void runLLVMCoroLowering(llvm::Module &llvmModule,
+                         llvm::TargetMachine *targetMachine = nullptr) {
   llvm::LoopAnalysisManager loopAM;
   llvm::FunctionAnalysisManager functionAM;
   llvm::CGSCCAnalysisManager cgsccAM;
   llvm::ModuleAnalysisManager moduleAM;
-  llvm::PassBuilder passBuilder;
+  llvm::PassBuilder passBuilder(targetMachine);
   passBuilder.registerModuleAnalyses(moduleAM);
   passBuilder.registerCGSCCAnalyses(cgsccAM);
   passBuilder.registerFunctionAnalyses(functionAM);
@@ -1132,6 +1444,117 @@ LogicalResult linkPrelinkedRuntime(llvm::Module &llvmModule) {
   return success();
 }
 
+bool isPlatformNativeSupport(llvm::StringRef name) {
+  return name == "support_darwin" || name == "support_linux";
+}
+
+bool shouldLinkEmbeddedLLVMRuntimeModule(llvm::StringRef name,
+                                         const llvm::Triple &targetTriple) {
+  if (name == "support_darwin")
+    return targetTriple.isOSDarwin();
+  if (name == "support_linux")
+    return targetTriple.isOSLinux();
+  return true;
+}
+
+void registerNativeRuntimeDialects(mlir::DialectRegistry &registry) {
+  registry.insert<mlir::arith::ArithDialect, mlir::cf::ControlFlowDialect,
+                  mlir::func::FuncDialect, mlir::LLVM::LLVMDialect,
+                  mlir::memref::MemRefDialect, mlir::scf::SCFDialect>();
+  mlir::registerConvertFuncToLLVMInterface(registry);
+  mlir::registerConvertMemRefToLLVMInterface(registry);
+  mlir::registerAllToLLVMIRTranslations(registry);
+}
+
+OwningOpRef<ModuleOp> parseEmbeddedNativeRuntimeModule(
+    const py::runtime_library::embedded::Module &entry, MLIRContext &context) {
+  llvm::SourceMgr sourceMgr;
+  sourceMgr.AddNewSourceBuffer(
+      llvm::MemoryBuffer::getMemBuffer(
+          llvm::StringRef(reinterpret_cast<const char *>(entry.data),
+                          entry.size),
+          entry.name, /*RequiresNullTerminator=*/false),
+      llvm::SMLoc());
+  return parseSourceFile<ModuleOp>(sourceMgr, &context);
+}
+
+LogicalResult lowerNativeRuntimeModule(ModuleOp module) {
+  PassManager pm(module.getContext());
+  pm.addPass(mlir::createCanonicalizerPass());
+  pm.addPass(mlir::createCSEPass());
+  pm.addPass(mlir::createConvertFuncToLLVMPass());
+  pm.addPass(mlir::createConvertSCFToCFPass());
+  pm.addPass(mlir::memref::createExpandStridedMetadataPass());
+  pm.addPass(mlir::createFinalizeMemRefToLLVMConversionPass());
+  pm.addPass(mlir::createArithToLLVMConversionPass());
+  pm.addPass(mlir::createConvertControlFlowToLLVMPass());
+  pm.addPass(mlir::createReconcileUnrealizedCastsPass());
+  pm.addPass(mlir::createCanonicalizerPass());
+  pm.addPass(mlir::createCSEPass());
+  return pm.run(module);
+}
+
+LogicalResult linkEmbeddedNativeRuntime(llvm::Module &llvmModule) {
+  namespace embedded = py::runtime_library::embedded;
+  llvm::Triple targetTriple(llvmModule.getTargetTriple());
+  bool sawPlatformNativeSupport = false;
+  bool linkedPlatformNativeSupport = false;
+  DialectRegistry registry;
+  registerNativeRuntimeDialects(registry);
+  MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+
+  for (std::size_t index = 0; index < embedded::moduleCount(); ++index) {
+    const embedded::Module &entry = embedded::modules()[index];
+    if (entry.kind != embedded::ModuleKind::NativeMLIRBytecode)
+      continue;
+    llvm::StringRef name(entry.name);
+    if (isPlatformNativeSupport(name))
+      sawPlatformNativeSupport = true;
+    if (!shouldLinkEmbeddedLLVMRuntimeModule(name, targetTriple))
+      continue;
+    if (isPlatformNativeSupport(name))
+      linkedPlatformNativeSupport = true;
+
+    OwningOpRef<ModuleOp> nativeModule =
+        parseEmbeddedNativeRuntimeModule(entry, context);
+    if (!nativeModule) {
+      llvm::errs() << "error: failed to parse embedded native runtime MLIR "
+                      "bytecode module '"
+                   << entry.name << "'\n";
+      return failure();
+    }
+    if (failed(lowerNativeRuntimeModule(*nativeModule))) {
+      llvm::errs() << "error: failed to lower embedded native runtime MLIR "
+                      "module '"
+                   << entry.name << "'\n";
+      return failure();
+    }
+    std::unique_ptr<llvm::Module> runtime =
+        mlir::translateModuleToLLVMIR(*nativeModule, llvmModule.getContext());
+    if (!runtime) {
+      llvm::errs() << "error: failed to translate embedded native runtime MLIR "
+                      "module '"
+                   << entry.name << "' to LLVM IR\n";
+      return failure();
+    }
+    runtime->setDataLayout(llvmModule.getDataLayout());
+    runtime->setTargetTriple(llvmModule.getTargetTriple());
+    if (llvm::Linker::linkModules(llvmModule, std::move(runtime))) {
+      llvm::errs() << "error: failed to link embedded native runtime module '"
+                   << entry.name << "'\n";
+      return failure();
+    }
+  }
+  if (sawPlatformNativeSupport && !linkedPlatformNativeSupport) {
+    llvm::errs() << "error: no embedded native runtime support for target OS '"
+                 << targetTriple.getOSName() << "' in target triple '"
+                 << targetTriple.str() << "'\n";
+    return failure();
+  }
+  return success();
+}
+
 class PySafetyLLVMIRTranslationInterface final
     : public LLVMTranslationDialectInterface {
 public:
@@ -1281,30 +1704,15 @@ verifyOptimizedLLVMThreadSafety(llvm::Module &llvmModule,
 
 LogicalResult emitObjectFile(llvm::Module &llvmModule,
                              const LLVMSafetyProfile &safetyProfile,
+                             py::TensorLoweringTarget tensorTarget,
                              StringRef objectPath) {
-  auto targetTriple = llvmModule.getTargetTriple();
-  if (targetTriple.empty())
-    targetTriple = llvm::sys::getDefaultTargetTriple();
-
-  std::string error;
-  const llvm::Target *target =
-      llvm::TargetRegistry::lookupTarget(targetTriple, error);
-  if (!target) {
-    llvm::errs() << "Failed to lookup target: " << error << "\n";
+  std::string targetTriple;
+  auto targetMachine = createCodeGenTargetMachine(tensorTarget, &targetTriple);
+  if (!targetMachine)
     return failure();
-  }
-
-  llvm::TargetOptions opt;
-  opt.ExceptionModel = llvm::ExceptionHandling::DwarfCFI;
-  opt.MCOptions.EmitCompactUnwindNonCanonical = true;
-  opt.ForceDwarfFrameSection = true;
-  opt.MCOptions.EmitDwarfUnwind = llvm::EmitDwarfUnwindType::Always;
-  auto targetMachine =
-      std::unique_ptr<llvm::TargetMachine>(target->createTargetMachine(
-          targetTriple, "generic", "", opt, std::nullopt));
   llvmModule.setTargetTriple(targetTriple);
   llvmModule.setDataLayout(targetMachine->createDataLayout());
-  runLLVMCoroLowering(llvmModule);
+  runLLVMCoroLowering(llvmModule, targetMachine.get());
   if (failed(verifyOptimizedLLVMThreadSafety(llvmModule, safetyProfile)))
     return failure();
 
@@ -1325,38 +1733,65 @@ LogicalResult emitObjectFile(llvm::Module &llvmModule,
   return success();
 }
 
-LogicalResult linkExecutable(StringRef objectPath, StringRef runtimeLib,
-                             StringRef outputPath) {
+LogicalResult
+configureLLVMModuleCodeGenTarget(llvm::Module &llvmModule,
+                                 py::TensorLoweringTarget tensorTarget) {
+  std::string targetTriple;
+  auto targetMachine = createCodeGenTargetMachine(tensorTarget, &targetTriple);
+  if (!targetMachine)
+    return failure();
+
+  llvmModule.setTargetTriple(targetTriple);
+  llvmModule.setDataLayout(targetMachine->createDataLayout());
+  return success();
+}
+
+std::optional<std::string> findExecutableLinkerDriver() {
   auto clangExe = llvm::sys::findProgramByName("clang++");
   if (!clangExe)
     clangExe = llvm::sys::findProgramByName("clang");
   if (!clangExe) {
     llvm::errs() << "error: clang++/clang executable not found in PATH\n";
-    return failure();
+    return std::nullopt;
   }
+  return *clangExe;
+}
 
-  std::string clangProgram = *clangExe;
-  std::vector<std::string> argStorage;
-  argStorage.push_back(clangProgram);
-  argStorage.emplace_back(objectPath.str());
-  // The runtime archive carries constructor-installed process state (the
-  // stack-overflow guard); force every object in so constructors run even
-  // when no symbol from their object file is referenced.
-#if defined(__APPLE__)
-  argStorage.emplace_back("-Wl,-force_load," + runtimeLib.str());
-#else
-  argStorage.emplace_back("-Wl,--whole-archive");
-  argStorage.emplace_back(runtimeLib.str());
-  argStorage.emplace_back("-Wl,--no-whole-archive");
-#endif
-  argStorage.emplace_back("-O2");
-#if defined(__linux__)
-  argStorage.emplace_back("-no-pie");
-#endif
-  argStorage.emplace_back("-o");
-  argStorage.emplace_back(outputPath.str());
+void appendLinkTargetArgs(std::vector<std::string> &args,
+                          py::TensorLoweringTarget tensorTarget) {
+  llvm::Triple targetTriple = codeGenTripleForTarget(tensorTarget);
+  llvm::Triple hostTriple(llvm::sys::getDefaultTargetTriple());
+  std::string sysroot = configuredTargetSysrootOverride();
+  if (targetTriple.normalize() != hostTriple.normalize()) {
+    args.emplace_back("-target");
+    args.emplace_back(targetTriple.normalize());
+  }
+  if (!sysroot.empty())
+    args.emplace_back("--sysroot=" + sysroot);
+  if (!TargetCPU.empty())
+    args.emplace_back("-mcpu=" + TargetCPU);
+  if (!TargetFPU.empty())
+    args.emplace_back("-mfpu=" + TargetFPU);
+  if (!TargetFloatABI.empty())
+    args.emplace_back("-mfloat-abi=" + TargetFloatABI);
+  for (const std::string &path : IncludeSearchPaths)
+    args.emplace_back("-I" + path);
+  for (const std::string &path : LibrarySearchPaths)
+    args.emplace_back("-L" + path);
+  if (targetTriple.getOS() != hostTriple.getOS())
+    args.emplace_back("-fuse-ld=lld");
+  if (tensorTarget.usesX86AVX2FMA()) {
+    args.emplace_back("-mavx2");
+    args.emplace_back("-mfma");
+  } else if (tensorTarget.usesX86SSE42()) {
+    args.emplace_back("-msse4.2");
+  }
+}
 
-  llvm::SmallVector<llvm::StringRef, 8> args;
+LogicalResult runLinkerCommand(StringRef clangProgram,
+                               const std::vector<std::string> &argStorage,
+                               StringRef failureMessage) {
+  llvm::SmallVector<llvm::StringRef, 16> args;
   for (const auto &arg : argStorage)
     args.push_back(arg);
 
@@ -1368,10 +1803,30 @@ LogicalResult linkExecutable(StringRef objectPath, StringRef runtimeLib,
   if (result != 0 || executionFailed) {
     if (!errorMessage.empty())
       llvm::errs() << errorMessage << "\n";
-    llvm::errs() << "error: linking failed\n";
+    llvm::errs() << failureMessage << "\n";
     return failure();
   }
   return success();
+}
+
+LogicalResult linkExecutable(StringRef objectPath,
+                             py::TensorLoweringTarget tensorTarget,
+                             StringRef outputPath) {
+  std::optional<std::string> clangProgram = findExecutableLinkerDriver();
+  if (!clangProgram)
+    return failure();
+
+  std::vector<std::string> argStorage;
+  argStorage.push_back(*clangProgram);
+  appendLinkTargetArgs(argStorage, tensorTarget);
+  argStorage.emplace_back(objectPath.str());
+  argStorage.emplace_back("-O2");
+  if (codeGenTripleForTarget(tensorTarget).isOSLinux())
+    argStorage.emplace_back("-no-pie");
+  argStorage.emplace_back("-o");
+  argStorage.emplace_back(outputPath.str());
+
+  return runLinkerCommand(*clangProgram, argStorage, "error: linking failed");
 }
 
 std::optional<FileLineColLoc> findPythonSourceLoc(Location loc) {
@@ -1482,7 +1937,8 @@ void attachPythonDebugInfo(ModuleOp module) {
 
 LogicalResult buildExecutable(llvm::Module &llvmModule,
                               const LLVMSafetyProfile &safetyProfile,
-                              StringRef runtimeLib, StringRef outputPath) {
+                              py::TensorLoweringTarget tensorTarget,
+                              StringRef outputPath) {
   llvm::SmallString<256> objectPath;
   if (auto ec =
           llvm::sys::fs::createTemporaryFile("lython", ".o", objectPath)) {
@@ -1491,16 +1947,35 @@ LogicalResult buildExecutable(llvm::Module &llvmModule,
     return failure();
   }
   llvm::FileRemover objCleanup(objectPath);
-  if (failed(emitObjectFile(llvmModule, safetyProfile, objectPath)))
+  if (failed(
+          emitObjectFile(llvmModule, safetyProfile, tensorTarget, objectPath)))
     return failure();
-  if (failed(linkExecutable(objectPath, runtimeLib, outputPath)))
+  if (failed(linkExecutable(objectPath, tensorTarget, outputPath)))
     return failure();
   return success();
 }
 
-LogicalResult runJIT(ModuleOp module, const IRDumpConfig &irDump) {
+LogicalResult runJIT(ModuleOp module, const IRDumpConfig &irDump,
+                     py::TensorLoweringTarget tensorTarget) {
+  llvm::Triple processTriple(llvm::sys::getDefaultTargetTriple());
+  if (tensorTarget.usesX86() &&
+      processTriple.getArch() != llvm::Triple::x86_64) {
+    llvm::errs()
+        << "error: x86 tensor target cannot be JIT-executed from a non-x86_64 "
+           "process; build/run lyc as x86_64 under Rosetta or use AOT/emit-llvm"
+        << "\n";
+    return failure();
+  }
+  if (tensorTarget.usesArmSME() && !processTriple.isAArch64()) {
+    llvm::errs()
+        << "error: arm-sme tensor target cannot be JIT-executed from a "
+           "non-aarch64 process\n";
+    return failure();
+  }
+
   std::unique_ptr<llvm::orc::LLJIT> jit;
   llvm::orc::ExecutorAddr entryAddress;
+  llvm::orc::ExecutorAddr runnerAddress;
 
   {
     PerfScope perf("jit-build");
@@ -1514,12 +1989,27 @@ LogicalResult runJIT(ModuleOp module, const IRDumpConfig &irDump) {
       return failure();
     }
     auto tmBuilder = std::move(*tmBuilderOrErr);
+    tmBuilder.setCPU(codeGenCPUNameForTarget(tensorTarget, processTriple));
+    tmBuilder.setFeatures(
+        codeGenFeaturesForTarget(tensorTarget, processTriple));
     auto options = tmBuilder.getOptions();
     options.ExceptionModel = llvm::ExceptionHandling::DwarfCFI;
     options.MCOptions.EmitCompactUnwindNonCanonical = true;
     options.ForceDwarfFrameSection = true;
     options.MCOptions.EmitDwarfUnwind = llvm::EmitDwarfUnwindType::Always;
     tmBuilder.setOptions(options);
+
+    auto optimizationTMBuilder = tmBuilder;
+    auto optimizationTargetMachineOrErr =
+        optimizationTMBuilder.createTargetMachine();
+    if (!optimizationTargetMachineOrErr) {
+      llvm::errs() << "Failed to create optimization TargetMachine: "
+                   << llvm::toString(optimizationTargetMachineOrErr.takeError())
+                   << "\n";
+      return failure();
+    }
+    std::unique_ptr<llvm::TargetMachine> optimizationTargetMachine =
+        std::move(*optimizationTargetMachineOrErr);
 
     auto compileFunctionCreator = [](llvm::orc::JITTargetMachineBuilder jtmb)
         -> llvm::Expected<
@@ -1608,7 +2098,9 @@ LogicalResult runJIT(ModuleOp module, const IRDumpConfig &irDump) {
     llvmModule->setTargetTriple(jit->getTargetTriple().getTriple());
     if (failed(linkPrelinkedRuntime(*llvmModule)))
       return failure();
-    runLLVMCoroLowering(*llvmModule);
+    if (failed(linkEmbeddedNativeRuntime(*llvmModule)))
+      return failure();
+    runLLVMCoroLowering(*llvmModule, optimizationTargetMachine.get());
     dumpLLVMForPass(irDump, "llvm-translation", *llvmModule);
     if (failed(verifyOptimizedLLVMThreadSafety(*llvmModule, safetyProfile)))
       return failure();
@@ -1640,12 +2132,20 @@ LogicalResult runJIT(ModuleOp module, const IRDumpConfig &irDump) {
       return failure();
     }
     entryAddress = *sym;
+    auto runnerSym = jit->lookup("LyRunPythonMain");
+    if (!runnerSym) {
+      llvm::errs() << "JIT runtime lookup failed: " << runnerSym.takeError()
+                   << "\n";
+      return failure();
+    }
+    runnerAddress = *runnerSym;
   }
 
   auto *entry = entryAddress.toPtr<void (*)()>();
+  auto *runner = runnerAddress.toPtr<int (*)(void (*)())>();
   {
     PerfScope perf("execution");
-    if (LyRunPythonMain(entry) != 0)
+    if (runner(entry) != 0)
       return failure();
   }
   return success();
@@ -1665,6 +2165,39 @@ static llvm::cl::opt<bool> EmitLLVMOnly(
     "emit-llvm",
     llvm::cl::desc("Stop after emitting LLVM IR to the output file"),
     llvm::cl::init(false), llvm::cl::cat(LythonCategory));
+static llvm::cl::opt<std::string>
+    TargetOption("target",
+                 llvm::cl::desc("Generate code for the given target triple"),
+                 llvm::cl::value_desc("triple"), llvm::cl::init(""),
+                 llvm::cl::cat(LythonCategory));
+static llvm::cl::opt<std::string>
+    TargetCPUOption("mcpu", llvm::cl::desc("Target a specific CPU name"),
+                    llvm::cl::value_desc("cpu-name"), llvm::cl::init(""),
+                    llvm::cl::cat(LythonCategory));
+static llvm::cl::opt<std::string> TargetFPUOption(
+    "mfpu", llvm::cl::desc("Target a specific FPU name for the linker driver"),
+    llvm::cl::value_desc("fpu-name"), llvm::cl::init(""),
+    llvm::cl::cat(LythonCategory));
+static llvm::cl::opt<std::string>
+    TargetFloatABIOption("mfloat-abi",
+                         llvm::cl::desc("Target floating-point ABI"),
+                         llvm::cl::value_desc("abi"), llvm::cl::init(""),
+                         llvm::cl::cat(LythonCategory));
+static llvm::cl::opt<std::string> TargetSysrootOption(
+    "sysroot",
+    llvm::cl::desc("Use a target sysroot when linking AOT executables"),
+    llvm::cl::value_desc("path"), llvm::cl::init(""),
+    llvm::cl::cat(LythonCategory));
+static llvm::cl::list<std::string>
+    IncludePathOptions("I",
+                       llvm::cl::desc("Add a clang-style include search path"),
+                       llvm::cl::value_desc("path"), llvm::cl::Prefix,
+                       llvm::cl::ZeroOrMore, llvm::cl::cat(LythonCategory));
+static llvm::cl::list<std::string>
+    LibraryPathOptions("L",
+                       llvm::cl::desc("Add a clang-style library search path"),
+                       llvm::cl::value_desc("path"), llvm::cl::Prefix,
+                       llvm::cl::ZeroOrMore, llvm::cl::cat(LythonCategory));
 static llvm::cl::SubCommand JitCommand("jit", "JIT execute an input file");
 static llvm::cl::opt<std::string>
     JitInputFilename(llvm::cl::Positional, llvm::cl::desc("<input file>"),
@@ -1705,6 +2238,15 @@ int main(int argc, char **argv) {
       [](llvm::raw_ostream &os) { os << "Lython CLI based on MLIR\n"; });
   llvm::cl::ParseCommandLineOptions(argc, argv,
                                     "Lython compiler driver (clang-style)\n");
+  TargetTriple = TargetOption;
+  TargetCPU = TargetCPUOption;
+  TargetFPU = TargetFPUOption;
+  TargetFloatABI = TargetFloatABIOption;
+  TargetSysroot = TargetSysrootOption;
+  IncludeSearchPaths.assign(IncludePathOptions.begin(),
+                            IncludePathOptions.end());
+  LibrarySearchPaths.assign(LibraryPathOptions.begin(),
+                            LibraryPathOptions.end());
   IRDumpConfig irDump = IRDumpConfig::fromEnv();
 
   const bool jitMode = static_cast<bool>(JitCommand);
@@ -1742,21 +2284,6 @@ int main(int argc, char **argv) {
                : 0;
   }
 
-  auto buildRoot = findBuildRoot(argv[0]);
-  if (!buildRoot) {
-    llvm::errs() << "error: unable to locate CMake build root\n";
-    return 1;
-  }
-
-  llvm::SmallString<256> runtimeLibPath(*buildRoot);
-  llvm::sys::path::append(runtimeLibPath, "src", "lython", "runtime",
-                          "libLythonRuntime.a");
-  if (!llvm::sys::fs::exists(runtimeLibPath)) {
-    llvm::errs() << "error: runtime library not found at '" << runtimeLibPath
-                 << "'\n";
-    return 1;
-  }
-
   bool isPythonInput = llvm::sys::path::extension(inputPath) == ".py";
 
   DialectRegistry registry;
@@ -1766,6 +2293,8 @@ int main(int argc, char **argv) {
                   linalg::LinalgDialect, memref::MemRefDialect,
                   vector::VectorDialect, bufferization::BufferizationDialect,
                   LLVM::LLVMDialect>();
+  py::runtime_lowering::arch::arm::registerSMEDialects(registry);
+  py::runtime_lowering::arch::x86::registerX86Dialects(registry);
   arith::registerBufferizableOpInterfaceExternalModels(registry);
   bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(
       registry);
@@ -1774,6 +2303,7 @@ int main(int argc, char **argv) {
   mlir::registerConvertFuncToLLVMInterface(registry);
   mlir::registerConvertMemRefToLLVMInterface(registry);
   mlir::registerAllToLLVMIRTranslations(registry);
+  py::runtime_lowering::arch::x86::registerX86Translations(registry);
   registerPySafetyLLVMIRTranslation(registry);
 
   MLIRContext context;
@@ -1800,16 +2330,19 @@ int main(int argc, char **argv) {
   if (!module)
     return 1;
 
+  py::TensorLoweringTarget tensorTarget =
+      detectTensorLoweringTarget(codeGenTripleForTarget({}));
+
   {
     PerfScope perf("lowering");
-    if (failed(runPipeline(*module, context, irDump))) {
+    if (failed(runPipeline(*module, context, irDump, tensorTarget))) {
       llvm::errs() << "Failed to run lowering pipeline\n";
       return 1;
     }
   }
 
   if (jitMode) {
-    return failed(runJIT(*module, irDump)) ? 1 : 0;
+    return failed(runJIT(*module, irDump, tensorTarget)) ? 1 : 0;
   }
 
   LLVMSafetyProfile safetyProfile;
@@ -1831,10 +2364,22 @@ int main(int argc, char **argv) {
   if (failed(verifyPostCoroLLVMThreadSafety(*llvmModule, safetyProfile)))
     return 1;
 
-  if (py::runtime_library::prelowerGenerationMode())
-    sealRuntimeSafetyMetadata(*llvmModule);
-  else if (failed(linkPrelinkedRuntime(*llvmModule)))
+  llvm::InitializeAllTargets();
+  llvm::InitializeAllTargetMCs();
+  llvm::InitializeAllAsmPrinters();
+  llvm::InitializeAllAsmParsers();
+
+  if (failed(configureLLVMModuleCodeGenTarget(*llvmModule, tensorTarget)))
     return 1;
+
+  if (py::runtime_library::prelowerGenerationMode()) {
+    sealRuntimeSafetyMetadata(*llvmModule);
+  } else {
+    if (failed(linkPrelinkedRuntime(*llvmModule)))
+      return 1;
+    if (failed(linkEmbeddedNativeRuntime(*llvmModule)))
+      return 1;
+  }
 
   if (!py::runtime_library::prelowerGenerationMode() &&
       failed(installAOTEntryPoint(*llvmModule)))
@@ -1843,16 +2388,7 @@ int main(int argc, char **argv) {
   if (EmitLLVMOnly)
     return failed(writeLLVMIR(*llvmModule, outputPath)) ? 1 : 0;
 
-  if (llvm::InitializeNativeTarget()) {
-    llvm::errs() << "error: could not initialize native target\n";
-    return 1;
-  }
-  if (llvm::InitializeNativeTargetAsmPrinter()) {
-    llvm::errs() << "error: could not initialize native asm printer\n";
-    return 1;
-  }
-
-  return failed(buildExecutable(*llvmModule, safetyProfile, runtimeLibPath,
+  return failed(buildExecutable(*llvmModule, safetyProfile, tensorTarget,
                                 outputPath))
              ? 1
              : 0;

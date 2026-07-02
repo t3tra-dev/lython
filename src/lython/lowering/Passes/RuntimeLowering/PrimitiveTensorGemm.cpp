@@ -1,5 +1,7 @@
 #include "PrimitiveTensorGemm.h"
 #include "PrimitiveTensorMicroKernel.h"
+#include "PrimitiveTensorPacking.h"
+#include "PrimitiveTensorSupport.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -23,30 +25,26 @@
 namespace py::runtime_lowering {
 namespace {
 
-constexpr int64_t kMatmulMTile = 64;
-constexpr int64_t kMatmulNTile = 64;
-constexpr int64_t kMatmulKTile = 32;
-constexpr int64_t kMatmulPackedMTile = 128;
-constexpr int64_t kMatmulPackedNTile = 64;
-constexpr int64_t kMatmulPackedKTileMax = 256;
-constexpr int64_t kMatmulMicroMTile = 4;
-constexpr int64_t kMatmulMicroNTile = 8;
-constexpr int64_t kMatmulWideMicroNTile = 16;
-constexpr int64_t kMatmulPackedMicroMTile = 2;
-constexpr int64_t kMatmulPackedMicroNTile = 32;
+constexpr int64_t kMatmulConservativeMC = 64;
+constexpr int64_t kMatmulConservativeNC = 64;
+constexpr int64_t kMatmulConservativeKC = 32;
+constexpr int64_t kMatmulPackedMC = 128;
+constexpr int64_t kMatmulPackedNC = 64;
+// Keep the packed panels below the point where a 512-wide reduction panel hurts
+// locality on Apple Silicon, while still allowing 768-wide reductions to use
+// two 384 panels instead of three 256 panels.
+constexpr int64_t kMatmulPackedKCMax = 384;
+constexpr int64_t kMatmulConservativeMR = 4;
+constexpr int64_t kMatmulConservativeNR = 8;
+constexpr int64_t kMatmulWideNR = 16;
+constexpr int64_t kMatmulPackedMR = 2;
+constexpr int64_t kMatmulPackedNR = 32;
 constexpr int64_t kMatmulScalarVectorKLimit = 4;
-constexpr int64_t kMatmulKeepKTile = 0;
-constexpr std::uint64_t kMatmulPackedMinWork = 384ull * 384ull * 128ull;
-constexpr std::uint64_t kMatmulPackedMinSourceElements = 384ull * 384ull;
-constexpr int64_t kPackedPanelAlignment = 64;
-constexpr int64_t kPackedCopyVectorBits = 512;
-constexpr llvm::StringLiteral kPackLhsCandidateAttr{
-    "ly.prim_tensor.pack_lhs_candidate"};
-constexpr llvm::StringLiteral kPackRhsCandidateAttr{
-    "ly.prim_tensor.pack_rhs_candidate"};
-constexpr llvm::StringLiteral kPackedLhsAttr{"ly.prim_tensor.packed_lhs"};
-constexpr llvm::StringLiteral kPackedRhsAttr{"ly.prim_tensor.packed_rhs"};
-constexpr llvm::StringLiteral kPackedPanelAttr{"ly.prim_tensor.packed_panel"};
+constexpr int64_t kMatmulKeepKC = 0;
+// Packing starts paying off for the current single-threaded RHS-prepack path at
+// 256x256 source panels. Smaller panels can still win for selected shapes, but
+// the generic threshold becomes noisy below this point.
+constexpr std::uint64_t kMatmulPackedMinWork = 256ull * 256ull * 128ull;
 constexpr llvm::StringLiteral kMicroMAttr{"ly.prim_tensor.micro_m"};
 constexpr llvm::StringLiteral kMicroNAttr{"ly.prim_tensor.micro_n"};
 constexpr llvm::StringLiteral kMicroKAttr{"ly.prim_tensor.micro_k"};
@@ -64,60 +62,31 @@ enum class MatmulLoweringPlan {
   TiledPackedVector,
 };
 
-enum class MatmulPanel {
-  Lhs,
-  Rhs,
-};
-
-struct MatmulPackPolicy {
-  bool lhs;
-  bool rhs;
-};
-
-struct GemmTargetModel {
-  MatmulTileShape outerTile;
-  MatmulTileShape microTile;
-  MatmulPackPolicy pack;
+struct GemmSchedule {
+  MatmulTileShape macroTile;
+  MatmulTileShape registerTile;
+  bool packRhs;
   llvm::SmallVector<unsigned, 3> outerInterchange;
 };
 
 struct MatmulLoweringPolicy {
   MatmulLoweringPlan plan;
-  GemmTargetModel target;
+  GemmSchedule schedule;
 };
 
-GemmTargetModel defaultGemmTargetModel() {
-  return GemmTargetModel{
-      MatmulTileShape{kMatmulMTile, kMatmulNTile, kMatmulKTile},
-      MatmulTileShape{kMatmulMicroMTile, kMatmulMicroNTile, kMatmulKeepKTile},
-      MatmulPackPolicy{false, false},
-      {}};
+GemmSchedule defaultGemmSchedule() {
+  return GemmSchedule{MatmulTileShape{kMatmulConservativeMC,
+                                      kMatmulConservativeNC,
+                                      kMatmulConservativeKC},
+                      MatmulTileShape{kMatmulConservativeMR,
+                                      kMatmulConservativeNR, kMatmulKeepKC},
+                      /*packRhs=*/false,
+                      {}};
 }
 
-bool isPrimitiveElementType(mlir::Type type) {
-  return mlir::isa<mlir::FloatType, mlir::IntegerType>(type);
-}
-
-std::optional<mlir::Value> zeroValueForElementType(mlir::OpBuilder &builder,
-                                                   mlir::Location loc,
-                                                   mlir::Type type) {
-  if (auto floatType = mlir::dyn_cast<mlir::FloatType>(type)) {
-    return builder.create<mlir::arith::ConstantOp>(
-        loc, floatType, builder.getFloatAttr(floatType, 0.0));
-  }
-  if (auto intType = mlir::dyn_cast<mlir::IntegerType>(type)) {
-    return builder.create<mlir::arith::ConstantOp>(
-        loc, intType, builder.getIntegerAttr(intType, 0));
-  }
-  return std::nullopt;
-}
-
-std::optional<int64_t> primitiveElementBitWidth(mlir::Type type) {
-  if (auto floatType = mlir::dyn_cast<mlir::FloatType>(type))
-    return floatType.getWidth();
-  if (auto intType = mlir::dyn_cast<mlir::IntegerType>(type))
-    return intType.getWidth();
-  return std::nullopt;
+mlir::Value createIndexConstant(mlir::OpBuilder &builder, mlir::Location loc,
+                                int64_t value) {
+  return builder.create<mlir::arith::ConstantIndexOp>(loc, value).getResult();
 }
 
 bool hasPrimitiveStaticShape(mlir::Value value) {
@@ -132,6 +101,8 @@ bool hasPrimitiveMatmulContract(mlir::linalg::MatmulOp matmul) {
          hasPrimitiveStaticShape(matmul.getDpsInputOperand(1)->get()) &&
          hasPrimitiveStaticShape(matmul.getDpsInitOperand(0)->get());
 }
+
+bool isBlockArgumentDefinedInside(mlir::Value value, mlir::Operation *scope);
 
 std::optional<MatmulTileShape>
 staticMatmulShape(mlir::linalg::MatmulOp matmul) {
@@ -174,7 +145,7 @@ int64_t selectPackedKTile(MatmulTileShape shape) {
   // exact tiling for now: the affine/vector cleanup pipeline is deliberately
   // simpler and does not need partial-panel special cases.
   int64_t candidate =
-      shape.k < kMatmulPackedKTileMax ? shape.k : kMatmulPackedKTileMax;
+      shape.k < kMatmulPackedKCMax ? shape.k : kMatmulPackedKCMax;
   while (candidate > 1 && shape.k % candidate != 0)
     --candidate;
   return candidate;
@@ -188,7 +159,7 @@ MatmulLoweringPlan classifyMatmulLowering(mlir::linalg::MatmulOp matmul) {
   if (!shape)
     return MatmulLoweringPlan::Conservative;
 
-  if (shape->m <= kMatmulMicroMTile && shape->n <= kMatmulMicroNTile &&
+  if (shape->m <= kMatmulConservativeMR && shape->n <= kMatmulConservativeNR &&
       shape->k <= kMatmulScalarVectorKLimit)
     return MatmulLoweringPlan::ScalarOrVector;
 
@@ -200,24 +171,25 @@ MatmulLoweringPlan classifyMatmulLowering(mlir::linalg::MatmulOp matmul) {
 
 MatmulLoweringPolicy selectMatmulLoweringPolicy(mlir::linalg::MatmulOp matmul) {
   MatmulLoweringPlan plan = classifyMatmulLowering(matmul);
-  GemmTargetModel target = defaultGemmTargetModel();
+  GemmSchedule schedule = defaultGemmSchedule();
   std::optional<MatmulTileShape> shape = staticMatmulShape(matmul);
 
   if (plan == MatmulLoweringPlan::TiledPackedVector) {
-    target.outerTile = MatmulTileShape{kMatmulPackedMTile, kMatmulPackedNTile,
-                                       shape ? selectPackedKTile(*shape)
-                                             : kMatmulPackedKTileMax};
-    target.microTile = MatmulTileShape{
-        kMatmulPackedMicroMTile, kMatmulPackedMicroNTile, kMatmulKeepKTile};
-    target.pack = MatmulPackPolicy{false, true};
-    // Mirror the BLAS macro-kernel shape where it already pays off: keep the
-    // packed RHS panel scoped by (N, K) and reuse it for all M tiles. LHS stays
-    // on source rows until an interleaved panel can lower to a single
-    // contiguous load and avoid scalar copy overhead.
-    target.outerInterchange = {1, 2, 0};
+    schedule.macroTile =
+        MatmulTileShape{kMatmulPackedMC, kMatmulPackedNC,
+                        shape ? selectPackedKTile(*shape) : kMatmulPackedKCMax};
+    schedule.registerTile =
+        MatmulTileShape{kMatmulPackedMR, kMatmulPackedNR, kMatmulKeepKC};
+    schedule.packRhs = true;
+    // BLAS-style loop ordering: keep the RHS B panel scoped by (N, K) and reuse
+    // it for all M tiles. A-side packing is intentionally absent from this
+    // schedule: the previous strided-MxK implementation was consistently slower
+    // in measured 512/768 f32 cases. Reintroduce it only together with a real
+    // Ap[k][ir] micro-kernel contract.
+    schedule.outerInterchange = {1, 2, 0};
   }
 
-  return MatmulLoweringPolicy{plan, std::move(target)};
+  return MatmulLoweringPolicy{plan, std::move(schedule)};
 }
 
 bool usesTiledMatmulPath(MatmulLoweringPlan plan) {
@@ -234,118 +206,9 @@ bool hasStaticShapeLargerThanTile(mlir::linalg::MatmulOp matmul,
          (tile.n > 0 && shape->n > tile.n) || (tile.k > 0 && shape->k > tile.k);
 }
 
-bool memrefHasRowMajorStrides(mlir::MemRefType type) {
-  if (!type.hasStaticShape())
-    return false;
-
-  llvm::SmallVector<int64_t, 4> strides;
-  int64_t offset = 0;
-  if (mlir::failed(type.getStridesAndOffset(strides, offset)))
-    return false;
-
-  llvm::SmallVector<int64_t, 4> expectedStrides(type.getRank(), 1);
-  int64_t stride = 1;
-  for (int64_t dim = type.getRank() - 1; dim >= 0; --dim) {
-    expectedStrides[dim] = stride;
-    stride *= type.getDimSize(dim);
-  }
-  return llvm::equal(strides, expectedStrides);
-}
-
-bool memrefHasContiguousInnerDimension(mlir::MemRefType type) {
-  if (!type.hasStaticShape() || type.getRank() == 0)
-    return false;
-
-  llvm::SmallVector<int64_t, 4> strides;
-  int64_t offset = 0;
-  if (mlir::failed(type.getStridesAndOffset(strides, offset)))
-    return false;
-  return strides.back() == 1;
-}
-
-std::optional<int64_t> selectPackedCopyVectorLanes(mlir::Type elementType,
-                                                   int64_t columns) {
-  std::optional<int64_t> bitWidth = primitiveElementBitWidth(elementType);
-  if (!bitWidth || *bitWidth <= 0 || columns <= 0)
-    return std::nullopt;
-
-  int64_t lanes = kPackedCopyVectorBits / *bitWidth;
-  if (lanes < 1)
-    lanes = 1;
-  if (lanes > columns)
-    lanes = columns;
-  while (lanes > 1 && columns % lanes != 0)
-    --lanes;
-  return lanes;
-}
-
-std::uint64_t staticElementCount(mlir::MemRefType type) {
-  if (!type.hasStaticShape())
-    return 0;
-
-  constexpr std::uint64_t max = std::numeric_limits<std::uint64_t>::max();
-  std::uint64_t count = 1;
-  for (int64_t dim : type.getShape()) {
-    if (dim <= 0)
-      return 0;
-    std::uint64_t value = static_cast<std::uint64_t>(dim);
-    if (count > max / value)
-      return max;
-    count *= value;
-  }
-  return count;
-}
-
-mlir::Value sourceMemrefForPanel(mlir::Value value) {
-  if (auto subview = value.getDefiningOp<mlir::memref::SubViewOp>())
-    return subview.getSource();
-  if (auto cast = value.getDefiningOp<mlir::memref::ReinterpretCastOp>())
-    return cast.getSource();
-  return value;
-}
-
-bool sourceIsLargePrimitiveTensor(mlir::Value value) {
-  auto sourceType =
-      mlir::dyn_cast<mlir::MemRefType>(sourceMemrefForPanel(value).getType());
-  if (!sourceType || sourceType.getRank() != 2 ||
-      !isPrimitiveElementType(sourceType.getElementType()))
-    return false;
-  return staticElementCount(sourceType) >= kMatmulPackedMinSourceElements;
-}
-
-llvm::StringLiteral candidateAttrForPanel(MatmulPanel panel) {
-  return panel == MatmulPanel::Lhs ? kPackLhsCandidateAttr
-                                   : kPackRhsCandidateAttr;
-}
-
-llvm::StringLiteral packedAttrForPanel(MatmulPanel panel) {
-  return panel == MatmulPanel::Lhs ? kPackedLhsAttr : kPackedRhsAttr;
-}
-
-mlir::OpOperand *operandForPanel(mlir::linalg::MatmulOp matmul,
-                                 MatmulPanel panel) {
-  return matmul.getDpsInputOperand(panel == MatmulPanel::Lhs ? 0 : 1);
-}
-
-bool shouldPackPanel(mlir::linalg::MatmulOp matmul, MatmulPanel panel) {
-  if (matmul->hasAttr(packedAttrForPanel(panel)))
-    return false;
-  if (!matmul->hasAttr(candidateAttrForPanel(panel)))
-    return false;
-
-  mlir::Value panelValue = operandForPanel(matmul, panel)->get();
-  auto panelType = mlir::dyn_cast<mlir::MemRefType>(panelValue.getType());
-  if (!panelType || panelType.getRank() != 2 || !panelType.hasStaticShape())
-    return false;
-  if (memrefHasRowMajorStrides(panelType))
-    return false;
-
-  return sourceIsLargePrimitiveTensor(panelValue);
-}
-
-mlir::Value packPanel(mlir::linalg::MatmulOp matmul, MatmulPanel panel,
-                      mlir::IRRewriter &rewriter) {
-  mlir::OpOperand *operand = operandForPanel(matmul, panel);
+mlir::Value packRhsPanel(mlir::linalg::MatmulOp matmul,
+                         mlir::IRRewriter &rewriter) {
+  mlir::OpOperand *operand = matmul.getDpsInputOperand(1);
   mlir::Value source = operand->get();
   auto sourceType = mlir::cast<mlir::MemRefType>(source.getType());
   mlir::MemRefType packedType = mlir::MemRefType::get(
@@ -364,8 +227,8 @@ mlir::Value packPanel(mlir::linalg::MatmulOp matmul, MatmulPanel panel,
       matmul.getLoc(), mlir::ValueRange{source}, mlir::ValueRange{packed},
       llvm::ArrayRef<mlir::NamedAttribute>{});
   operand->set(packed);
-  matmul->setAttr(packedAttrForPanel(panel), rewriter.getUnitAttr());
-  matmul->removeAttr(candidateAttrForPanel(panel));
+  matmul->setAttr(kPackedRhsAttr, rewriter.getUnitAttr());
+  matmul->removeAttr(kPackRhsCandidateAttr);
   return packed;
 }
 
@@ -373,7 +236,7 @@ void setMicroTileAttrs(mlir::Operation *op, MatmulTileShape tile);
 
 mlir::LogicalResult
 tileMatmul(mlir::linalg::MatmulOp matmul, MatmulTileShape tile,
-           mlir::IRRewriter &rewriter, MatmulPackPolicy pack = {false, false},
+           mlir::IRRewriter &rewriter, bool packRhs = false,
            llvm::ArrayRef<unsigned> interchange = {},
            std::optional<MatmulTileShape> nextMicroTile = std::nullopt) {
   mlir::linalg::LinalgTilingOptions options;
@@ -390,13 +253,21 @@ tileMatmul(mlir::linalg::MatmulOp matmul, MatmulTileShape tile,
   if (tiled->tensorResults.size() != matmul->getNumResults())
     return matmul.emitError()
            << "matmul tiling produced an unexpected result count";
-  if (pack.lhs)
-    tiled->op->setAttr(kPackLhsCandidateAttr, rewriter.getUnitAttr());
-  if (pack.rhs)
+  tiled->op->removeAttr(kMatmulZeroInitAttr);
+  tiled->op->removeAttr(kMatmulZeroInitFirstReductionAttr);
+  if (packRhs)
     tiled->op->setAttr(kPackRhsCandidateAttr, rewriter.getUnitAttr());
-  if (matmul->hasAttr(kMatmulZeroInitAttr) &&
-      (!tile.k || !hasStaticShapeLargerThanTile(matmul, {0, 0, tile.k})))
-    tiled->op->setAttr(kMatmulZeroInitAttr, rewriter.getUnitAttr());
+  if (matmul->hasAttr(kMatmulZeroInitFirstReductionAttr)) {
+    tiled->op->setAttr(kMatmulZeroInitFirstReductionAttr,
+                       rewriter.getUnitAttr());
+  } else if (matmul->hasAttr(kMatmulZeroInitAttr)) {
+    if (!tile.k || !hasStaticShapeLargerThanTile(matmul, {0, 0, tile.k})) {
+      tiled->op->setAttr(kMatmulZeroInitAttr, rewriter.getUnitAttr());
+    } else {
+      tiled->op->setAttr(kMatmulZeroInitFirstReductionAttr,
+                         rewriter.getUnitAttr());
+    }
+  }
   if (nextMicroTile)
     setMicroTileAttrs(tiled->op.getOperation(), *nextMicroTile);
 
@@ -433,10 +304,9 @@ MatmulTileShape selectMicroTile(mlir::linalg::MatmulOp matmul) {
     return *tile;
 
   std::optional<MatmulTileShape> shape = staticMatmulShape(matmul);
-  if (shape && shape->n >= kMatmulPackedNTile && shape->m >= kMatmulMTile)
-    return MatmulTileShape{kMatmulMicroMTile, kMatmulWideMicroNTile,
-                           kMatmulKeepKTile};
-  return defaultGemmTargetModel().microTile;
+  if (shape && shape->n >= kMatmulPackedNC && shape->m >= kMatmulConservativeMC)
+    return MatmulTileShape{kMatmulConservativeMR, kMatmulWideNR, kMatmulKeepKC};
+  return defaultGemmSchedule().registerTile;
 }
 
 bool isPrimitiveZeroConstant(mlir::Value value) {
@@ -451,23 +321,40 @@ bool isPrimitiveZeroConstant(mlir::Value value) {
   return false;
 }
 
-bool hasSingleReductionTile(mlir::linalg::MatmulOp matmul) {
+bool evenlyTiled(int64_t extent, int64_t tile) {
+  return tile <= 0 || (extent > 0 && extent % tile == 0);
+}
+
+bool zeroInitElisionCoversAllOutputTiles(mlir::linalg::MatmulOp matmul) {
   std::optional<MatmulTileShape> shape = staticMatmulShape(matmul);
   if (!shape)
     return false;
 
   MatmulLoweringPolicy policy = selectMatmulLoweringPolicy(matmul);
-  if (!usesTiledMatmulPath(policy.plan))
-    return true;
-  return policy.target.outerTile.k <= 0 ||
-         shape->k <= policy.target.outerTile.k;
+  if (policy.plan == MatmulLoweringPlan::Conservative)
+    return false;
+
+  if (!usesTiledMatmulPath(policy.plan)) {
+    MatmulTileShape microTile = defaultGemmSchedule().registerTile;
+    return shape->m <= microTile.m && shape->n <= microTile.n &&
+           shape->k <= kMatmulScalarVectorKLimit;
+  }
+
+  MatmulTileShape macroTile = policy.schedule.macroTile;
+  MatmulTileShape registerTile = policy.schedule.registerTile;
+  return evenlyTiled(shape->m, macroTile.m) &&
+         evenlyTiled(shape->n, macroTile.n) &&
+         evenlyTiled(shape->k, macroTile.k) &&
+         evenlyTiled(macroTile.m, registerTile.m) &&
+         evenlyTiled(macroTile.n, registerTile.n) &&
+         evenlyTiled(macroTile.k, registerTile.k);
 }
 
 bool canAbsorbZeroFill(mlir::linalg::MatmulOp matmul,
                        mlir::linalg::FillOp fill) {
   if (!hasPrimitiveMatmulContract(matmul) || fill->getNumResults() != 1 ||
       fill.getNumDpsInputs() != 1 || fill.getNumDpsInits() != 1 ||
-      !hasSingleReductionTile(matmul))
+      !zeroInitElisionCoversAllOutputTiles(matmul))
     return false;
 
   mlir::Value fillResult = fill->getResult(0);
@@ -547,7 +434,7 @@ public:
     getOperation().walk([&](mlir::linalg::MatmulOp matmul) {
       MatmulLoweringPolicy policy = selectMatmulLoweringPolicy(matmul);
       if (usesTiledMatmulPath(policy.plan) &&
-          hasStaticShapeLargerThanTile(matmul, policy.target.outerTile))
+          hasStaticShapeLargerThanTile(matmul, policy.schedule.macroTile))
         matmuls.push_back(TilingTarget{matmul, policy});
     });
 
@@ -555,10 +442,11 @@ public:
     for (const TilingTarget &target : matmuls) {
       if (!target.matmul->getBlock())
         continue;
-      if (mlir::failed(tileMatmul(target.matmul, target.policy.target.outerTile,
-                                  rewriter, target.policy.target.pack,
-                                  target.policy.target.outerInterchange,
-                                  target.policy.target.microTile))) {
+      if (mlir::failed(tileMatmul(target.matmul,
+                                  target.policy.schedule.macroTile, rewriter,
+                                  target.policy.schedule.packRhs,
+                                  target.policy.schedule.outerInterchange,
+                                  target.policy.schedule.registerTile))) {
         signalPassFailure();
         return;
       }
@@ -574,7 +462,7 @@ public:
 
   llvm::StringRef getArgument() const final { return "lython-matmul-packing"; }
   llvm::StringRef getDescription() const final {
-    return "pack non-contiguous primitive matmul panels";
+    return "pack primitive matmul panels for the selected GEMM schedule";
   }
 
   void getDependentDialects(mlir::DialectRegistry &registry) const final {
@@ -584,19 +472,18 @@ public:
   void runOnOperation() final {
     llvm::SmallVector<mlir::linalg::MatmulOp, 16> matmuls;
     getOperation().walk([&](mlir::linalg::MatmulOp matmul) {
-      if (shouldPackPanel(matmul, MatmulPanel::Lhs) ||
-          shouldPackPanel(matmul, MatmulPanel::Rhs))
+      if (shouldPackRhsPanel(matmul))
         matmuls.push_back(matmul);
     });
 
     mlir::IRRewriter rewriter(&getContext());
+    llvm::SmallVector<RhsPrepackPlan, 8> rhsPrepackPlans;
     for (mlir::linalg::MatmulOp matmul : matmuls) {
       if (!matmul->getBlock())
         continue;
-      if (shouldPackPanel(matmul, MatmulPanel::Lhs))
-        packPanel(matmul, MatmulPanel::Lhs, rewriter);
-      if (shouldPackPanel(matmul, MatmulPanel::Rhs))
-        packPanel(matmul, MatmulPanel::Rhs, rewriter);
+      if (shouldPackRhsPanel(matmul) &&
+          !tryPrepackFullRhsPanel(matmul, rewriter, rhsPrepackPlans))
+        packRhsPanel(matmul, rewriter);
     }
   }
 };
@@ -739,25 +626,21 @@ bool lowerInnerContiguousPackedPanelCopy(mlir::linalg::CopyOp copy,
     return false;
   mlir::Type elementType = targetType.getElementType();
   std::optional<int64_t> lanes =
-      selectPackedCopyVectorLanes(elementType, targetType.getDimSize(1));
+      selectDivisibleVectorLanes(elementType, targetType.getDimSize(1),
+                                 kPackedCopyVectorBits, /*minLanes=*/1);
   if (!lanes || *lanes <= 1)
     return false;
 
   mlir::Location loc = copy.getLoc();
   rewriter.setInsertionPoint(copy);
-  mlir::Value rowBegin = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 0);
-  mlir::Value rowEnd = rewriter.create<mlir::arith::ConstantIndexOp>(
-      loc, targetType.getDimSize(0));
-  mlir::Value rowStep = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 1);
+  mlir::Value rowBegin = createIndexConstant(rewriter, loc, 0);
+  mlir::Value rowEnd =
+      createIndexConstant(rewriter, loc, targetType.getDimSize(0));
+  mlir::Value rowStep = createIndexConstant(rewriter, loc, 1);
   mlir::Value colBegin = rowBegin;
-  mlir::Value colEnd = rewriter.create<mlir::arith::ConstantIndexOp>(
-      loc, targetType.getDimSize(1));
-  mlir::Value colStep =
-      rewriter.create<mlir::arith::ConstantIndexOp>(loc, *lanes);
-  std::optional<mlir::Value> padding =
-      zeroValueForElementType(rewriter, loc, elementType);
-  if (!padding)
-    return false;
+  mlir::Value colEnd =
+      createIndexConstant(rewriter, loc, targetType.getDimSize(1));
+  mlir::Value colStep = createIndexConstant(rewriter, loc, *lanes);
 
   auto rowLoop =
       rewriter.create<mlir::scf::ForOp>(loc, rowBegin, rowEnd, rowStep);
@@ -771,20 +654,16 @@ bool lowerInnerContiguousPackedPanelCopy(mlir::linalg::CopyOp copy,
       rewriter.setInsertionPointToStart(colLoop.getBody());
       mlir::VectorType vectorType =
           mlir::VectorType::get({*lanes}, elementType);
-      bool inBoundsValue = true;
-      llvm::ArrayRef<bool> inBounds(inBoundsValue);
       mlir::Value vector = rewriter
-                               .create<mlir::vector::TransferReadOp>(
+                               .create<mlir::vector::LoadOp>(
                                    loc, vectorType, source,
                                    mlir::ValueRange{rowLoop.getInductionVar(),
-                                                    colLoop.getInductionVar()},
-                                   *padding, inBounds)
-                               .getVector();
-      rewriter.create<mlir::vector::TransferWriteOp>(
+                                                    colLoop.getInductionVar()})
+                               .getResult();
+      rewriter.create<mlir::vector::StoreOp>(
           loc, vector, target,
           mlir::ValueRange{rowLoop.getInductionVar(),
-                           colLoop.getInductionVar()},
-          inBounds);
+                           colLoop.getInductionVar()});
     }
   }
 
@@ -857,7 +736,7 @@ public:
     return "lython-matmul-micro-tiling";
   }
   llvm::StringRef getDescription() const final {
-    return "tile primitive linalg.matmul ops to vector-contract sized kernels";
+    return "tile primitive linalg.matmul ops to register-blocked kernels";
   }
 
   void getDependentDialects(mlir::DialectRegistry &registry) const final {
@@ -919,7 +798,8 @@ public:
       if (!matmul->getBlock())
         continue;
       rewriter.setInsertionPoint(matmul);
-      if (mlir::succeeded(lowerMatmulMicroKernel(matmul, rewriter)))
+      if (mlir::succeeded(
+              arch::generic::lowerMatmulMicroKernel(matmul, rewriter)))
         continue;
       if (mlir::failed(mlir::linalg::vectorize(rewriter, matmul))) {
         matmul.emitError() << "failed to vectorize primitive matmul micro tile";

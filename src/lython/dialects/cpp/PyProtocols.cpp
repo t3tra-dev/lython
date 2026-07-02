@@ -54,7 +54,8 @@ namespace {
 const py::runtime_library::embedded::Module *embeddedTypingModule() {
   namespace embedded = py::runtime_library::embedded;
   for (std::size_t index = 0; index < embedded::moduleCount(); ++index)
-    if (llvm::StringRef(embedded::modules()[index].name) == "typing")
+    if (embedded::modules()[index].kind == embedded::ModuleKind::MLIRBytecode &&
+        llvm::StringRef(embedded::modules()[index].name) == "typing")
       return &embedded::modules()[index];
   return nullptr;
 }

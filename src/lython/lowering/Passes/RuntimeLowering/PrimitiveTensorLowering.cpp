@@ -1,5 +1,8 @@
+#include "Arch/Arm/PrimitiveTensorArmSME.h"
+#include "Arch/X86/PrimitiveTensorX86.h"
 #include "Common/RuntimeSupport.h"
 #include "PrimitiveTensorGemm.h"
+#include "PrimitiveTensorSupport.h"
 
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -17,13 +20,11 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
-#include "mlir/Dialect/Vector/Transforms/VectorRewritePatterns.h"
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
-#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 
 #include "llvm/ADT/STLExtras.h"
@@ -37,33 +38,10 @@
 namespace py::runtime_lowering {
 namespace {
 
-constexpr int64_t kReductionVectorBits = 512;
-
-class VectorReductionToContractPass
-    : public mlir::PassWrapper<VectorReductionToContractPass,
-                               mlir::OperationPass<mlir::ModuleOp>> {
-public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(VectorReductionToContractPass)
-
-  llvm::StringRef getArgument() const final {
-    return "lython-vector-reduction-to-contract";
-  }
-  llvm::StringRef getDescription() const final {
-    return "canonicalize vectorized primitive contractions to vector.contract";
-  }
-
-  void getDependentDialects(mlir::DialectRegistry &registry) const final {
-    registry.insert<mlir::vector::VectorDialect>();
-  }
-
-  void runOnOperation() final {
-    mlir::RewritePatternSet patterns(&getContext());
-    mlir::vector::populateVectorReductionToContractPatterns(patterns);
-    if (mlir::failed(
-            mlir::applyPatternsGreedily(getOperation(), std::move(patterns))))
-      signalPassFailure();
-  }
-};
+// Keep reductions at a width that lowers to efficient target vectors without
+// over-extending the reduction tree. Empirically, 256-bit reductions beat the
+// previous 512-bit width on the current matmul/sum and 3-D elementwise benches.
+constexpr int64_t kReductionVectorBits = 256;
 
 bool isRankPreservingUnitStrideSubview(mlir::memref::SubViewOp subview) {
   mlir::MemRefType sourceType = subview.getSourceType();
@@ -181,28 +159,6 @@ std::optional<int64_t> constantIndexValue(mlir::Value value) {
   mlir::IntegerAttr integer;
   if (mlir::matchPattern(value, mlir::m_Constant(&integer)))
     return integer.getInt();
-  return std::nullopt;
-}
-
-std::optional<int64_t> primitiveElementBitWidth(mlir::Type type) {
-  if (auto floatType = mlir::dyn_cast<mlir::FloatType>(type))
-    return floatType.getWidth();
-  if (auto intType = mlir::dyn_cast<mlir::IntegerType>(type))
-    return intType.getWidth();
-  return std::nullopt;
-}
-
-std::optional<mlir::Value>
-zeroValueForPrimitiveElement(mlir::OpBuilder &builder, mlir::Location loc,
-                             mlir::Type type) {
-  if (auto floatType = mlir::dyn_cast<mlir::FloatType>(type)) {
-    return builder.create<mlir::arith::ConstantOp>(
-        loc, floatType, builder.getFloatAttr(floatType, 0.0));
-  }
-  if (auto intType = mlir::dyn_cast<mlir::IntegerType>(type)) {
-    return builder.create<mlir::arith::ConstantOp>(
-        loc, intType, builder.getIntegerAttr(intType, 0));
-  }
   return std::nullopt;
 }
 
@@ -640,6 +596,41 @@ bool rewriteViewTransferWrite(mlir::vector::TransferWriteOp write,
   return true;
 }
 
+bool rewriteViewVectorLoad(mlir::vector::LoadOp load,
+                           mlir::IRRewriter &rewriter) {
+  rewriter.setInsertionPoint(load);
+  std::optional<ViewAccess> view = buildViewAccess(
+      load.getBase(), load.getIndices(), mlir::AffineMap(), rewriter);
+  if (!view)
+    return false;
+
+  rewriter.setInsertionPoint(load);
+  mlir::Value replacement =
+      rewriter
+          .create<mlir::vector::LoadOp>(
+              load.getLoc(), load.getResult().getType(), view->source,
+              view->sourceIndices, load.getNontemporal())
+          .getResult();
+  rewriter.replaceOp(load, replacement);
+  return true;
+}
+
+bool rewriteViewVectorStore(mlir::vector::StoreOp store,
+                            mlir::IRRewriter &rewriter) {
+  rewriter.setInsertionPoint(store);
+  std::optional<ViewAccess> view = buildViewAccess(
+      store.getBase(), store.getIndices(), mlir::AffineMap(), rewriter);
+  if (!view)
+    return false;
+
+  rewriter.setInsertionPoint(store);
+  rewriter.create<mlir::vector::StoreOp>(
+      store.getLoc(), store.getValueToStore(), view->source,
+      view->sourceIndices, store.getNontemporal());
+  rewriter.eraseOp(store);
+  return true;
+}
+
 class ViewAccessLoweringPass
     : public mlir::PassWrapper<ViewAccessLoweringPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -661,6 +652,7 @@ public:
     getOperation().walk([&](mlir::Operation *op) {
       if (mlir::isa<mlir::affine::AffineLoadOp, mlir::affine::AffineStoreOp,
                     mlir::memref::LoadOp, mlir::memref::StoreOp,
+                    mlir::vector::LoadOp, mlir::vector::StoreOp,
                     mlir::vector::TransferReadOp,
                     mlir::vector::TransferWriteOp>(op))
         accesses.push_back(op);
@@ -688,6 +680,14 @@ public:
       }
       if (auto read = mlir::dyn_cast<mlir::vector::TransferReadOp>(access)) {
         rewriteViewTransferRead(read, rewriter);
+        continue;
+      }
+      if (auto load = mlir::dyn_cast<mlir::vector::LoadOp>(access)) {
+        rewriteViewVectorLoad(load, rewriter);
+        continue;
+      }
+      if (auto store = mlir::dyn_cast<mlir::vector::StoreOp>(access)) {
+        rewriteViewVectorStore(store, rewriter);
         continue;
       }
       rewriteViewTransferWrite(
@@ -737,33 +737,10 @@ public:
   }
 };
 
-bool memrefHasContiguousInnerDimension(mlir::MemRefType type) {
-  if (!type.hasStaticShape() || type.getRank() == 0)
-    return false;
-
-  llvm::SmallVector<int64_t, 4> strides;
-  int64_t offset = 0;
-  if (mlir::failed(type.getStridesAndOffset(strides, offset)))
-    return false;
-  return strides.back() == 1;
-}
-
 std::optional<int64_t> selectReductionVectorLanes(mlir::Type elementType,
                                                   int64_t tripCount) {
-  std::optional<int64_t> bitWidth = primitiveElementBitWidth(elementType);
-  if (!bitWidth || *bitWidth <= 0 || tripCount <= 1)
-    return std::nullopt;
-
-  int64_t lanes = kReductionVectorBits / *bitWidth;
-  if (lanes < 2)
-    return std::nullopt;
-  if (lanes > tripCount)
-    lanes = tripCount;
-  while (lanes > 1 && tripCount % lanes != 0)
-    --lanes;
-  if (lanes <= 1)
-    return std::nullopt;
-  return lanes;
+  return selectDivisibleVectorLanes(elementType, tripCount,
+                                    kReductionVectorBits, /*minLanes=*/2);
 }
 
 std::optional<mlir::arith::FastMathFlags>
@@ -886,7 +863,7 @@ bool vectorizeContiguousReduction(mlir::scf::ForOp loop,
 
   rewriter.setInsertionPoint(loop);
   std::optional<mlir::Value> padding =
-      zeroValueForPrimitiveElement(rewriter, loc, elementType);
+      createPrimitiveZeroValue(rewriter, loc, elementType);
   if (!padding)
     return false;
 
@@ -906,13 +883,11 @@ bool vectorizeContiguousReduction(mlir::scf::ForOp loop,
             llvm::to_vector<4>(match.load.getIndices());
         indices.back() = iv;
 
-        bool inBoundsValue = true;
         mlir::Value vector =
             builder
-                .create<mlir::vector::TransferReadOp>(
-                    nestedLoc, vectorType, match.load.getMemRef(), indices,
-                    *padding, llvm::ArrayRef<bool>(inBoundsValue))
-                .getVector();
+                .create<mlir::vector::LoadOp>(nestedLoc, vectorType,
+                                              match.load.getMemRef(), indices)
+                .getResult();
         std::optional<mlir::Value> next =
             createPrimitiveVectorAdd(builder, nestedLoc, iterArgs.front(),
                                      vector, elementType, match.fastMath);
@@ -1126,6 +1101,9 @@ class LinalgLoweringPass
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LinalgLoweringPass)
 
+  explicit LinalgLoweringPass(py::TensorLoweringTarget target = {})
+      : target(target) {}
+
   llvm::StringRef getArgument() const final { return "lython-linalg-lowering"; }
   llvm::StringRef getDescription() const final {
     return "lower primitive tensor contractions through linalg/affine/vector";
@@ -1137,6 +1115,10 @@ public:
                     mlir::func::FuncDialect, mlir::linalg::LinalgDialect,
                     mlir::memref::MemRefDialect, mlir::scf::SCFDialect,
                     mlir::tensor::TensorDialect, mlir::vector::VectorDialect>();
+    if (arch::arm::usesSME(target))
+      arch::arm::registerSMEDialects(registry);
+    if (arch::x86::usesX86(target))
+      arch::x86::registerX86Dialects(registry);
   }
 
   void runOnOperation() final {
@@ -1151,14 +1133,23 @@ public:
     pipeline.addPass(createMatmulZeroInitElisionPass());
     pipeline.addPass(
         mlir::bufferization::createOneShotBufferizePass(bufferizeOptions));
+    if (arch::arm::usesSME(target))
+      pipeline.addPass(arch::arm::createMatmulSMELoweringPass());
     pipeline.addPass(createMatmulTilingPass());
     pipeline.addPass(createMatmulPackingPass());
     pipeline.addPass(createPackedPanelHoistingPass());
     pipeline.addPass(createPackedPanelCopyHoistingPass());
     pipeline.addPass(createPackedPanelCopyVectorizationPass());
+    pipeline.addPass(mlir::createLoopInvariantCodeMotionPass());
+    pipeline.addPass(mlir::createCSEPass());
     pipeline.addPass(createMatmulMicroTilingPass());
     pipeline.addPass(createMatmulVectorizationPass());
-    pipeline.addPass(std::make_unique<VectorReductionToContractPass>());
+    if (arch::arm::usesSME(target))
+      arch::arm::addSMELinalgPipeline(pipeline);
+    if (arch::x86::usesX86(target))
+      arch::x86::addX86LinalgPipeline(pipeline);
+    pipeline.addPass(mlir::createLoopInvariantCodeMotionPass());
+    pipeline.addPass(mlir::createCSEPass());
     pipeline.addPass(std::make_unique<ViewAccessLoweringPass>());
     pipeline.addPass(std::make_unique<ContiguousReductionVectorizationPass>());
     pipeline.addPass(mlir::createConvertLinalgToAffineLoopsPass());
@@ -1175,6 +1166,9 @@ public:
     if (mlir::failed(runPipeline(pipeline, getOperation())))
       signalPassFailure();
   }
+
+private:
+  py::TensorLoweringTarget target;
 };
 
 } // namespace
@@ -1183,8 +1177,8 @@ public:
 namespace py {
 
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createLinalgLoweringPass() {
-  return std::make_unique<runtime_lowering::LinalgLoweringPass>();
+createLinalgLoweringPass(TensorLoweringTarget target) {
+  return std::make_unique<runtime_lowering::LinalgLoweringPass>(target);
 }
 
 } // namespace py

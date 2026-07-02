@@ -53,6 +53,7 @@ jobs:
           ./build/bin/lyc jit examples/oop.py
           ./build/bin/lyc jit examples/tarai_prim.py
           ./build/bin/lyc jit examples/tensor_prim.py
+          ./build/bin/lyc jit examples/error.py || true
 
       - name: Benchmarks
         run: |
