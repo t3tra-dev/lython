@@ -334,6 +334,13 @@ std::string codeGenFeaturesForTarget(py::TensorLoweringTarget target,
   return hostCPUFeaturesForCodeGen();
 }
 
+llvm::ExceptionHandling
+exceptionModelForTargetTriple(const llvm::Triple &triple) {
+  if (triple.isOSWindows())
+    return llvm::ExceptionHandling::WinEH;
+  return llvm::ExceptionHandling::DwarfCFI;
+}
+
 std::unique_ptr<llvm::TargetMachine>
 createCodeGenTargetMachine(py::TensorLoweringTarget target,
                            std::string *normalizedTriple = nullptr) {
@@ -351,7 +358,7 @@ createCodeGenTargetMachine(py::TensorLoweringTarget target,
   }
 
   llvm::TargetOptions opt;
-  opt.ExceptionModel = llvm::ExceptionHandling::DwarfCFI;
+  opt.ExceptionModel = exceptionModelForTargetTriple(triple);
   opt.MCOptions.EmitCompactUnwindNonCanonical = true;
   opt.ForceDwarfFrameSection = true;
   opt.MCOptions.EmitDwarfUnwind = llvm::EmitDwarfUnwindType::Always;
@@ -1445,7 +1452,8 @@ LogicalResult linkPrelinkedRuntime(llvm::Module &llvmModule) {
 }
 
 bool isPlatformNativeSupport(llvm::StringRef name) {
-  return name == "support_darwin" || name == "support_linux";
+  return name == "support_darwin" || name == "support_linux" ||
+         name == "support_windows";
 }
 
 bool shouldLinkEmbeddedLLVMRuntimeModule(llvm::StringRef name,
@@ -1454,6 +1462,8 @@ bool shouldLinkEmbeddedLLVMRuntimeModule(llvm::StringRef name,
     return targetTriple.isOSDarwin();
   if (name == "support_linux")
     return targetTriple.isOSLinux();
+  if (name == "support_windows")
+    return targetTriple.isOSWindows();
   return true;
 }
 
@@ -1746,7 +1756,81 @@ configureLLVMModuleCodeGenTarget(llvm::Module &llvmModule,
   return success();
 }
 
-std::optional<std::string> findExecutableLinkerDriver() {
+llvm::StringRef exceptionPersonalityForTarget(const llvm::Triple &triple) {
+  if (triple.isWindowsGNUEnvironment())
+    return "__gxx_personality_seh0";
+  return "__gxx_personality_v0";
+}
+
+void rewriteExceptionPersonalityForTarget(llvm::Module &llvmModule) {
+  llvm::Triple triple(llvmModule.getTargetTriple());
+  llvm::StringRef personalityName = exceptionPersonalityForTarget(triple);
+  if (personalityName == "__gxx_personality_v0")
+    return;
+
+  llvm::LLVMContext &context = llvmModule.getContext();
+  llvm::FunctionType *personalityType = llvm::FunctionType::get(
+      llvm::Type::getInt32Ty(context), /*isVarArg=*/true);
+  llvm::Function *personalityFn = llvmModule.getFunction(personalityName);
+  if (!personalityFn)
+    personalityFn = llvm::Function::Create(personalityType,
+                                           llvm::GlobalValue::ExternalLinkage,
+                                           personalityName, llvmModule);
+
+  if (llvm::Function *itanium = llvmModule.getFunction("__gxx_personality_v0"))
+    itanium->replaceAllUsesWith(personalityFn);
+}
+
+enum class LinkerDriverFlavor {
+  Clang,
+  MinGWGcc,
+};
+
+struct LinkerDriver {
+  std::string program;
+  LinkerDriverFlavor flavor = LinkerDriverFlavor::Clang;
+};
+
+std::optional<std::string> findExecutableProgram(llvm::StringRef name) {
+  if (auto program = llvm::sys::findProgramByName(name))
+    return *program;
+  return std::nullopt;
+}
+
+std::optional<std::string> findHomebrewMinGWProgram(llvm::StringRef name) {
+  const char *prefixes[] = {"/opt/homebrew/opt/mingw-w64/bin",
+                            "/usr/local/opt/mingw-w64/bin"};
+  for (const char *prefix : prefixes) {
+    llvm::SmallString<256> path(prefix);
+    llvm::sys::path::append(path, name);
+    if (llvm::sys::fs::can_execute(path))
+      return path.str().str();
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string> findMinGWLinkerDriver(const llvm::Triple &triple) {
+  llvm::StringRef programName;
+  if (triple.getArch() == llvm::Triple::x86_64)
+    programName = "x86_64-w64-mingw32-g++";
+  else if (triple.getArch() == llvm::Triple::x86)
+    programName = "i686-w64-mingw32-g++";
+  else
+    return std::nullopt;
+
+  if (auto program = findExecutableProgram(programName))
+    return program;
+  return findHomebrewMinGWProgram(programName);
+}
+
+std::optional<LinkerDriver>
+findExecutableLinkerDriver(py::TensorLoweringTarget tensorTarget) {
+  llvm::Triple targetTriple = codeGenTripleForTarget(tensorTarget);
+  if (targetTriple.isWindowsGNUEnvironment()) {
+    if (auto mingw = findMinGWLinkerDriver(targetTriple))
+      return LinkerDriver{*mingw, LinkerDriverFlavor::MinGWGcc};
+  }
+
   auto clangExe = llvm::sys::findProgramByName("clang++");
   if (!clangExe)
     clangExe = llvm::sys::findProgramByName("clang");
@@ -1754,38 +1838,55 @@ std::optional<std::string> findExecutableLinkerDriver() {
     llvm::errs() << "error: clang++/clang executable not found in PATH\n";
     return std::nullopt;
   }
-  return *clangExe;
+  return LinkerDriver{*clangExe, LinkerDriverFlavor::Clang};
 }
 
 void appendLinkTargetArgs(std::vector<std::string> &args,
-                          py::TensorLoweringTarget tensorTarget) {
+                          py::TensorLoweringTarget tensorTarget,
+                          LinkerDriverFlavor driverFlavor) {
   llvm::Triple targetTriple = codeGenTripleForTarget(tensorTarget);
   llvm::Triple hostTriple(llvm::sys::getDefaultTargetTriple());
   std::string sysroot = configuredTargetSysrootOverride();
-  if (targetTriple.normalize() != hostTriple.normalize()) {
+  if (driverFlavor == LinkerDriverFlavor::Clang &&
+      targetTriple.normalize() != hostTriple.normalize()) {
     args.emplace_back("-target");
     args.emplace_back(targetTriple.normalize());
   }
   if (!sysroot.empty())
     args.emplace_back("--sysroot=" + sysroot);
-  if (!TargetCPU.empty())
+  if (driverFlavor == LinkerDriverFlavor::Clang && !TargetCPU.empty())
     args.emplace_back("-mcpu=" + TargetCPU);
-  if (!TargetFPU.empty())
+  if (driverFlavor == LinkerDriverFlavor::Clang && !TargetFPU.empty())
     args.emplace_back("-mfpu=" + TargetFPU);
-  if (!TargetFloatABI.empty())
+  if (driverFlavor == LinkerDriverFlavor::Clang && !TargetFloatABI.empty())
     args.emplace_back("-mfloat-abi=" + TargetFloatABI);
   for (const std::string &path : IncludeSearchPaths)
     args.emplace_back("-I" + path);
   for (const std::string &path : LibrarySearchPaths)
     args.emplace_back("-L" + path);
-  if (targetTriple.getOS() != hostTriple.getOS())
+  if (driverFlavor == LinkerDriverFlavor::Clang &&
+      targetTriple.getOS() != hostTriple.getOS())
     args.emplace_back("-fuse-ld=lld");
+  if (targetTriple.isWindowsGNUEnvironment()) {
+    args.emplace_back("-static");
+    args.emplace_back("-static-libstdc++");
+    args.emplace_back("-static-libgcc");
+  }
   if (tensorTarget.usesX86AVX2FMA()) {
     args.emplace_back("-mavx2");
     args.emplace_back("-mfma");
   } else if (tensorTarget.usesX86SSE42()) {
     args.emplace_back("-msse4.2");
   }
+}
+
+void appendLinkTargetLibraries(std::vector<std::string> &args,
+                               py::TensorLoweringTarget tensorTarget) {
+  llvm::Triple targetTriple = codeGenTripleForTarget(tensorTarget);
+  if (!targetTriple.isWindowsGNUEnvironment())
+    return;
+  args.emplace_back("-Wl,-Bstatic");
+  args.emplace_back("-lwinpthread");
 }
 
 LogicalResult runLinkerCommand(StringRef clangProgram,
@@ -1812,21 +1913,22 @@ LogicalResult runLinkerCommand(StringRef clangProgram,
 LogicalResult linkExecutable(StringRef objectPath,
                              py::TensorLoweringTarget tensorTarget,
                              StringRef outputPath) {
-  std::optional<std::string> clangProgram = findExecutableLinkerDriver();
-  if (!clangProgram)
+  std::optional<LinkerDriver> linker = findExecutableLinkerDriver(tensorTarget);
+  if (!linker)
     return failure();
 
   std::vector<std::string> argStorage;
-  argStorage.push_back(*clangProgram);
-  appendLinkTargetArgs(argStorage, tensorTarget);
+  argStorage.push_back(linker->program);
+  appendLinkTargetArgs(argStorage, tensorTarget, linker->flavor);
   argStorage.emplace_back(objectPath.str());
+  appendLinkTargetLibraries(argStorage, tensorTarget);
   argStorage.emplace_back("-O2");
   if (codeGenTripleForTarget(tensorTarget).isOSLinux())
     argStorage.emplace_back("-no-pie");
   argStorage.emplace_back("-o");
   argStorage.emplace_back(outputPath.str());
 
-  return runLinkerCommand(*clangProgram, argStorage, "error: linking failed");
+  return runLinkerCommand(linker->program, argStorage, "error: linking failed");
 }
 
 std::optional<FileLineColLoc> findPythonSourceLoc(Location loc) {
@@ -1993,7 +2095,7 @@ LogicalResult runJIT(ModuleOp module, const IRDumpConfig &irDump,
     tmBuilder.setFeatures(
         codeGenFeaturesForTarget(tensorTarget, processTriple));
     auto options = tmBuilder.getOptions();
-    options.ExceptionModel = llvm::ExceptionHandling::DwarfCFI;
+    options.ExceptionModel = exceptionModelForTargetTriple(processTriple);
     options.MCOptions.EmitCompactUnwindNonCanonical = true;
     options.ForceDwarfFrameSection = true;
     options.MCOptions.EmitDwarfUnwind = llvm::EmitDwarfUnwindType::Always;
@@ -2380,6 +2482,7 @@ int main(int argc, char **argv) {
     if (failed(linkEmbeddedNativeRuntime(*llvmModule)))
       return 1;
   }
+  rewriteExceptionPersonalityForTarget(*llvmModule);
 
   if (!py::runtime_library::prelowerGenerationMode() &&
       failed(installAOTEntryPoint(*llvmModule)))

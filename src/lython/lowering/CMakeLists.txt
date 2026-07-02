@@ -112,6 +112,7 @@ set(LYTHON_RUNTIME_NATIVE_MLIR
     "${CMAKE_SOURCE_DIR}/src/lython/runtime/native/support.mlir"
     "${CMAKE_SOURCE_DIR}/src/lython/runtime/native/support_darwin.mlir"
     "${CMAKE_SOURCE_DIR}/src/lython/runtime/native/support_linux.mlir"
+    "${CMAKE_SOURCE_DIR}/src/lython/runtime/native/support_windows.mlir"
 )
 
 set(LYTHON_RUNTIME_NATIVE_BYTECODE_DIR
