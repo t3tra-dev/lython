@@ -54,8 +54,42 @@ mlir::FailureOr<unsigned> RuntimeBundleLowerer::classFieldValueOffset(
 
 mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
   const RuntimeBundle *object = RuntimeBundleLowerer::bundleFor(op.getObject());
-  if (!object || object->kind != RuntimeBundle::Kind::Object)
+  if (!object)
     return op.emitError() << "attr.get object has no lowered runtime bundle";
+  if (object->kind == RuntimeBundle::Kind::TypeObject) {
+    mlir::LogicalResult descriptorResult =
+        RuntimeBundleLowerer::lowerStaticCtypesTypeFieldDescriptorGet(op,
+                                                                      *object);
+    if (mlir::succeeded(descriptorResult))
+      return mlir::success();
+    return op.emitError()
+           << "attr.get type object has no static runtime attribute '"
+           << op.getName() << "'";
+  }
+  if (object->kind != RuntimeBundle::Kind::Object)
+    return op.emitError() << "attr.get object has no lowered runtime bundle";
+
+  if (object->ctypes &&
+      object->ctypes->kind == RuntimeCtypesEvidence::Kind::Library)
+    return RuntimeBundleLowerer::lowerStaticCtypesAttrGet(op, *object);
+  if (object->ctypes &&
+      object->ctypes->kind == RuntimeCtypesEvidence::Kind::Module)
+    return RuntimeBundleLowerer::lowerStaticCtypesModuleAttrGet(op, *object);
+  if (object->ctypes &&
+      object->ctypes->kind == RuntimeCtypesEvidence::Kind::FieldDescriptor)
+    return RuntimeBundleLowerer::lowerStaticCtypesFieldDescriptorAttrGet(
+        op, *object);
+  if (object->ctypes &&
+      object->ctypes->kind == RuntimeCtypesEvidence::Kind::Cell) {
+    mlir::LogicalResult fieldResult =
+        RuntimeBundleLowerer::lowerStaticCtypesFieldAttrGet(op, *object);
+    if (mlir::succeeded(fieldResult))
+      return mlir::success();
+  }
+  if (object->ctypes &&
+      object->ctypes->kind == RuntimeCtypesEvidence::Kind::Cell &&
+      op.getName() == "value")
+    return RuntimeBundleLowerer::lowerStaticCtypesValueAttrGet(op, *object);
 
   auto fieldBundle = object->fieldBundles.find(op.getName());
   if (fieldBundle != object->fieldBundles.end()) {
@@ -127,6 +161,16 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
   const RuntimeBundle *value = RuntimeBundleLowerer::bundleFor(op.getValue());
   if (!object || object->kind != RuntimeBundle::Kind::Object)
     return op.emitError() << "attr.set object has no lowered runtime bundle";
+  if (object->ctypes &&
+      object->ctypes->kind == RuntimeCtypesEvidence::Kind::Symbol)
+    return RuntimeBundleLowerer::lowerStaticCtypesAttrSet(op, *object, value);
+  if (object->ctypes &&
+      object->ctypes->kind == RuntimeCtypesEvidence::Kind::Cell) {
+    mlir::LogicalResult fieldResult =
+        RuntimeBundleLowerer::lowerStaticCtypesFieldAttrSet(op, *object, value);
+    if (mlir::succeeded(fieldResult))
+      return mlir::success();
+  }
   if (!value || value->kind != RuntimeBundle::Kind::Object)
     return op.emitError() << "attr.set value has no lowered runtime bundle";
 

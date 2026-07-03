@@ -45,6 +45,12 @@ private:
   void emitClassContract(const parser::Node &classDef);
   void collectClassFields(const parser::Node &classDef,
                           llvm::StringMap<mlir::Type> &fields) const;
+  void collectStaticClassAssignments(
+      const parser::Node &classDef, llvm::SmallVectorImpl<std::string> &names,
+      llvm::SmallVectorImpl<mlir::Attribute> &values) const;
+  void collectStaticModuleAssignments(
+      const parser::Node &moduleNode, llvm::SmallVectorImpl<std::string> &names,
+      llvm::SmallVectorImpl<mlir::Attribute> &values) const;
 
   void emitStatements(const std::vector<parser::NodePtr> *statements,
                       bool skipDeclarations = false);

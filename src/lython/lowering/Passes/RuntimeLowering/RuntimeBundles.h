@@ -70,6 +70,74 @@ struct RuntimePrimitiveI64Evidence {
   mlir::Value valid;
 };
 
+// Buffer evidence is the lowered counterpart of Python's buffer protocol. It
+// deliberately carries only facts that can be proven statically by the
+// producer: a native base address, byte length, mutability, contiguity, and
+// explicit keepalive owners. ctypes.from_buffer consumes the writable view;
+// ctypes.from_buffer_copy consumes any readable view and materializes owned
+// ctypes storage.
+struct RuntimeBufferEvidence {
+  mlir::Value addressValue;
+  mlir::Value addressValid;
+  mlir::Value byteLength;
+  mlir::Value byteLengthValid;
+  llvm::SmallVector<RuntimeValue, 2> keepAlive;
+  bool readable = false;
+  bool writable = false;
+  bool cContiguous = false;
+};
+
+// Static ctypes evidence mirrors CPython's _CData boundary without copying its
+// dynamic GC bookkeeping. `storageAddressValue` is the b_ptr-like address of
+// the C memory block when the _CData storage exists. `addressValue` is the
+// native pointer value used when this evidence flows as a pointer argument
+// (identical to storageAddressValue for scalar cells, pointee address for
+// pointer objects). `keepAlive` represents explicit _objects/_b_base_ edges,
+// and the provenance/lifetime pair tells native-call lowering whether the
+// pointer is a call-region borrow, an owned native cell, or an external view.
+struct RuntimeCtypesEvidence {
+  enum class Kind { Module, Cell, Pointer, Library, Symbol, FieldDescriptor };
+  enum class Provenance {
+    None,
+    NativeCell,
+    CallRegionBorrow,
+    ExternalAddress,
+    Cast,
+    BufferView,
+    CallbackThunk
+  };
+  enum class Lifetime { Unknown, CallRegion, Owner, External, Static };
+
+  Kind kind = Kind::Cell;
+  Provenance provenance = Provenance::None;
+  Lifetime lifetime = Lifetime::Unknown;
+  std::string ctypeName;
+  mlir::Type ctype;
+  std::string libraryName;
+  std::string abi;
+  std::string symbolName;
+  std::string fieldName;
+  std::string fieldType;
+  std::uint64_t fieldOffset = 0;
+  std::uint64_t fieldSize = 0;
+  llvm::SmallVector<std::string, 8> argTypes;
+  std::optional<std::string> resultType;
+  std::string pointeeType;
+  mlir::Value pointeeScalarValue;
+  mlir::Value pointeeScalarValid;
+  mlir::Value scalarValue;
+  mlir::Value scalarValid;
+  mlir::Value storageAddressValue;
+  mlir::Value storageAddressValid;
+  mlir::Value addressValue;
+  mlir::Value addressValid;
+  llvm::SmallVector<RuntimeValue, 2> keepAlive;
+  bool processLibrary = false;
+  bool callRegionBorrow = false;
+  bool ownsNativeStorage = false;
+  bool materializedObject = false;
+};
+
 struct RuntimeBundle {
   enum class Kind { Object, Aggregate, BuiltinCallable, TypeObject };
 
@@ -89,6 +157,8 @@ struct RuntimeBundle {
   std::string coroutineTarget;
   llvm::SmallVector<RuntimeValue, 8> coroutineSources;
   std::optional<RuntimePrimitiveI64Evidence> primitiveI64;
+  std::optional<RuntimeBufferEvidence> buffer;
+  std::optional<RuntimeCtypesEvidence> ctypes;
   RuntimeObjectEvidence objectEvidence;
   llvm::StringMap<std::shared_ptr<RuntimeBundle>> fieldBundles;
   llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 8> sequenceElementBundles;

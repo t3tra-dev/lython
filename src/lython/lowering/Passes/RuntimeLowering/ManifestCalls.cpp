@@ -64,8 +64,8 @@ mlir::LogicalResult RuntimeBundleLowerer::emitManifestMethodCall(
     llvm::StringRef methodName, llvm::ArrayRef<const RuntimeBundle *> sources,
     bool allowUnusedSources, std::optional<EmittedRuntimeCall> &emitted) {
   mlir::FailureOr<RuntimeSymbol> selected =
-      RuntimeBundleLowerer::selectManifestMethod(
-          op, receiver, methodName, sources, allowUnusedSources);
+      RuntimeBundleLowerer::selectManifestMethod(op, receiver, methodName,
+                                                 sources, allowUnusedSources);
   if (mlir::failed(selected))
     return mlir::failure();
 
@@ -75,9 +75,8 @@ mlir::LogicalResult RuntimeBundleLowerer::emitManifestMethodCall(
                                             allowUnusedSources)))
     return mlir::failure();
 
-  mlir::func::CallOp call =
-      RuntimeBundleLowerer::createRuntimeCall(op->getLoc(), *selected,
-                                              operands);
+  mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+      op->getLoc(), *selected, operands);
   emitted.emplace(EmittedRuntimeCall{*selected, call});
   return mlir::success();
 }
@@ -188,6 +187,13 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerNew(py::NewOp op) {
                                                 "__new__");
   if (mlir::failed(methodName))
     return mlir::failure();
+  if (*methodName == "__new__" &&
+      mlir::succeeded(RuntimeBundleLowerer::bindErasedCtypesNew(op, contract)))
+    return mlir::success();
+  if (*methodName == "__new__" &&
+      mlir::succeeded(
+          RuntimeBundleLowerer::bindStaticCtypesLibraryNew(op, contract)))
+    return mlir::success();
   std::optional<RuntimeSymbol> initializer =
       manifest.initializer(contract, *methodName);
   if (!initializer)
@@ -284,6 +290,13 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
                                                 "__init__");
   if (mlir::failed(methodName))
     return mlir::failure();
+
+  if (*methodName == "__init__" && instance->ctypes &&
+      instance->ctypes->kind == RuntimeCtypesEvidence::Kind::Library)
+    return RuntimeBundleLowerer::lowerStaticCtypesLibraryInit(op, *instance,
+                                                              sources);
+  if (*methodName == "__init__" && instance->ctypes)
+    return RuntimeBundleLowerer::lowerErasedCtypesInit(op, *instance, sources);
 
   if (py::ClassOp classOp =
           RuntimeBundleLowerer::classForContract(op.getInstance().getType())) {

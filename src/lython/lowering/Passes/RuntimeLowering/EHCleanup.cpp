@@ -1,8 +1,7 @@
+#include "Common/PythonSourceRange.h"
 #include "Common/RuntimeSupport.h"
 
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
-#include "mlir/IR/BuiltinAttributes.h"
-#include "mlir/IR/Location.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/BinaryFormat/Dwarf.h"
@@ -20,14 +19,6 @@
 namespace py {
 namespace {
 
-struct PythonSourceRange {
-  std::string filename;
-  std::int32_t line = 0;
-  std::int32_t column = 0;
-  std::int32_t endLine = 0;
-  std::int32_t endColumn = 0;
-};
-
 struct PythonCatchTarget {
   llvm::BasicBlock *block = nullptr;
   llvm::CallInst *marker = nullptr;
@@ -38,79 +29,6 @@ struct PythonTryCallMarker {
   llvm::CallInst *marker = nullptr;
   llvm::BasicBlock *catchBlock = nullptr;
 };
-
-std::optional<mlir::FileLineColLoc> findPythonSourceLoc(mlir::Location loc) {
-  if (auto fileLoc = mlir::dyn_cast<mlir::FileLineColLoc>(loc)) {
-    if (fileLoc.getFilename().getValue().ends_with(".py"))
-      return fileLoc;
-    return std::nullopt;
-  }
-  if (auto nameLoc = mlir::dyn_cast<mlir::NameLoc>(loc))
-    return findPythonSourceLoc(nameLoc.getChildLoc());
-  if (auto fused = mlir::dyn_cast<mlir::FusedLoc>(loc)) {
-    for (mlir::Location child : fused.getLocations())
-      if (auto found = findPythonSourceLoc(child))
-        return found;
-  }
-  return std::nullopt;
-}
-
-std::optional<std::int32_t> i32Attr(mlir::DictionaryAttr dict,
-                                    llvm::StringRef name) {
-  auto attr = mlir::dyn_cast_or_null<mlir::IntegerAttr>(dict.get(name));
-  if (!attr)
-    return std::nullopt;
-  return static_cast<std::int32_t>(attr.getInt());
-}
-
-std::optional<PythonSourceRange>
-sourceRangeFromDict(mlir::DictionaryAttr dict) {
-  auto startLine = i32Attr(dict, "lython.source.start_line");
-  auto startCol = i32Attr(dict, "lython.source.start_col");
-  auto endLine = i32Attr(dict, "lython.source.end_line");
-  auto endCol = i32Attr(dict, "lython.source.end_col");
-  if (!startLine || !startCol || !endLine || !endCol)
-    return std::nullopt;
-  PythonSourceRange range;
-  range.line = *startLine;
-  range.column = *startCol;
-  range.endLine = *endLine;
-  range.endColumn = *endCol;
-  return range;
-}
-
-std::optional<PythonSourceRange> findSourceRangeMetadata(mlir::Location loc) {
-  if (auto nameLoc = mlir::dyn_cast<mlir::NameLoc>(loc))
-    return findSourceRangeMetadata(nameLoc.getChildLoc());
-  if (auto fused = mlir::dyn_cast<mlir::FusedLoc>(loc)) {
-    if (auto dict =
-            mlir::dyn_cast_or_null<mlir::DictionaryAttr>(fused.getMetadata()))
-      if (auto range = sourceRangeFromDict(dict))
-        return range;
-    for (mlir::Location child : fused.getLocations())
-      if (auto range = findSourceRangeMetadata(child))
-        return range;
-  }
-  return std::nullopt;
-}
-
-std::optional<PythonSourceRange> pythonSourceRange(mlir::Location loc) {
-  std::optional<mlir::FileLineColLoc> fileLoc = findPythonSourceLoc(loc);
-  if (!fileLoc)
-    return std::nullopt;
-
-  PythonSourceRange range;
-  range.filename = fileLoc->getFilename().getValue().str();
-  range.line = static_cast<std::int32_t>(fileLoc->getLine());
-  range.column = static_cast<std::int32_t>(fileLoc->getColumn());
-  range.endLine = range.line;
-  range.endColumn = 0;
-  if (auto metadata = findSourceRangeMetadata(loc)) {
-    metadata->filename = range.filename;
-    return metadata;
-  }
-  return range;
-}
 
 std::string tracebackFunctionName(llvm::StringRef symbolName) {
   return symbolName == "__main__" ? std::string("<module>") : symbolName.str();
@@ -144,9 +62,8 @@ bool mayPropagatePythonException(const llvm::Function *callee) {
       name == "LyEH_CurrentExceptionMatches" ||
       name == "LyEH_DiscardCurrentExceptionIfMatches" ||
       name == "LyEH_DiscardCurrentException" ||
-      name == "LyEH_TryCallSiteMarker" ||
-      name == "LyEH_TryCatchMarker" || name == "LyEH_TryCatchAnchor" ||
-      name.starts_with("LyTraceback_"))
+      name == "LyEH_TryCallSiteMarker" || name == "LyEH_TryCatchMarker" ||
+      name == "LyEH_TryCatchAnchor" || name.starts_with("LyTraceback_"))
     return false;
   return name.starts_with("Ly");
 }
@@ -166,10 +83,9 @@ std::optional<std::int64_t> i64ConstantArgument(const llvm::CallInst &call,
   return constant->getSExtValue();
 }
 
-std::optional<PythonTryCallMarker>
-tryCallMarkerFor(llvm::CallInst &call,
-                 const llvm::DenseMap<std::int64_t, PythonCatchTarget>
-                     &catchTargets) {
+std::optional<PythonTryCallMarker> tryCallMarkerFor(
+    llvm::CallInst &call,
+    const llvm::DenseMap<std::int64_t, PythonCatchTarget> &catchTargets) {
   llvm::BasicBlock *block = call.getParent();
   auto current = call.getIterator();
   if (current == block->begin())
@@ -346,15 +262,14 @@ void emitTracebackPush(llvm::IRBuilder<> &builder, llvm::Module &module,
 }
 
 llvm::BasicBlock *
-buildPythonCatchDispatchBlock(llvm::CallInst &call,
-                              llvm::BasicBlock *catchDest,
+buildPythonCatchDispatchBlock(llvm::CallInst &call, llvm::BasicBlock *catchDest,
                               llvm::DILocation &debugLoc,
                               const PythonCallSiteRange *site) {
   llvm::Function *function = call.getFunction();
   llvm::Module *module = function->getParent();
   llvm::LLVMContext &context = module->getContext();
-  llvm::BasicBlock *landing = llvm::BasicBlock::Create(
-      context, "py.try.catch", function, catchDest);
+  llvm::BasicBlock *landing =
+      llvm::BasicBlock::Create(context, "py.try.catch", function, catchDest);
   llvm::IRBuilder<> builder(landing);
   llvm::LandingPadInst *landingPad =
       createCatchAllLandingPad(builder, "py.catch.lpad");

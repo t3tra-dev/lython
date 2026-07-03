@@ -60,6 +60,10 @@ constexpr llvm::StringLiteral kRuntimeContractsAttr{"ly.runtime.contracts"};
 
 bool declarationsOnly() { return prelinkedRuntimeIRPath().has_value(); }
 
+bool isContractManifestModule(llvm::StringRef name) {
+  return name == "typing" || name == "ctypes";
+}
+
 bool shouldImportSymbol(mlir::Operation &op) {
   if (!mlir::isa<mlir::SymbolOpInterface>(op))
     return false;
@@ -163,7 +167,7 @@ mlir::LogicalResult embedObjectModules(mlir::ModuleOp module) {
     const embedded::Module &entry = embedded::modules()[index];
     if (entry.kind != embedded::ModuleKind::MLIRBytecode)
       continue;
-    if (llvm::StringRef(entry.name) == "typing")
+    if (isContractManifestModule(entry.name))
       continue;
     if (mlir::failed(importRuntimeModule(module, entry)))
       return mlir::failure();

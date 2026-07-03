@@ -138,6 +138,8 @@ public:
   completeProtocolArguments(llvm::StringRef protocolName,
                             llvm::ArrayRef<mlir::Type> supplied) const;
   std::optional<ProtocolEvidence> evidenceFor(mlir::Type receiverType) const;
+  bool isManifestSubclassOf(mlir::Type receiverType,
+                            llvm::StringRef baseClassName) const;
   std::optional<AwaitableResolution>
   resolveAwaitableWithEvidence(mlir::Type type) const;
   mlir::Type awaitablePayloadType(mlir::Type type) const;

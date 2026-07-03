@@ -443,6 +443,15 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerGetItem(py::GetItemOp op) {
   if (!container || !index)
     return op.emitError() << "getitem operands need runtime bundles";
 
+  if (container->ctypes &&
+      (container->ctypes->kind == RuntimeCtypesEvidence::Kind::Cell ||
+       container->ctypes->kind == RuntimeCtypesEvidence::Kind::Pointer)) {
+    mlir::LogicalResult ctypesHandled =
+        RuntimeBundleLowerer::lowerStaticCtypesGetItem(op, *container, *index);
+    if (mlir::succeeded(ctypesHandled))
+      return mlir::success();
+  }
+
   mlir::FailureOr<bool> sequenceHandled =
       RuntimeBundleLowerer::lowerSequenceEvidenceGetItem(op, *container,
                                                          *index);

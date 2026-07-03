@@ -29,8 +29,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCall(py::CallOp op) {
   if (auto method = op->getAttrOfType<mlir::StringAttr>("ly.bound_method"))
     return RuntimeBundleLowerer::lowerBoundMethodCall(op, *callable,
                                                       method.getValue());
+  if (callable->kind == RuntimeBundle::Kind::TypeObject)
+    return RuntimeBundleLowerer::lowerStaticCtypesTypeObjectCall(op, *callable);
   if (callable->kind != RuntimeBundle::Kind::BuiltinCallable)
     return RuntimeBundleLowerer::lowerObjectCallableCall(op, *callable);
+  if (RuntimeBundleLowerer::isStaticCtypesCallable(callable->binding))
+    return RuntimeBundleLowerer::lowerStaticCtypesCall(op, *callable);
   std::optional<RuntimeSymbol> builtin =
       manifest.builtinCallable(callable->binding);
   if (!builtin)
@@ -51,6 +55,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCall(py::CallOp op) {
 
 mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
     py::CallOp op, const RuntimeBundle &receiver, llvm::StringRef methodName) {
+  if (receiver.kind == RuntimeBundle::Kind::TypeObject)
+    return RuntimeBundleLowerer::lowerStaticCtypesTypeObjectMethodCall(
+        op, receiver, methodName);
   if (receiver.kind != RuntimeBundle::Kind::Object)
     return op.emitError() << "bound method receiver must be an object bundle";
   if (op.getNumResults() != 1)
@@ -65,6 +72,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
       receiverIt->second.contractName() == "_asyncio.Future")
     return RuntimeBundleLowerer::lowerFutureBoundMethod(op, receiverIt->second,
                                                         methodName);
+  if (receiver.ctypes &&
+      receiver.ctypes->kind == RuntimeCtypesEvidence::Kind::Module)
+    return RuntimeBundleLowerer::lowerStaticCtypesModuleCall(op, receiver,
+                                                             methodName);
 
   llvm::SmallVector<const RuntimeBundle *, 8> sources{&receiver};
   llvm::SmallVector<RuntimeBundle, 8> unpackedSources;
@@ -147,6 +158,9 @@ RuntimeBundleLowerer::lowerObjectCallableCall(py::CallOp op,
   if (callable.kind != RuntimeBundle::Kind::Object)
     return op.emitError()
            << "callable is not an object bundle with a __call__ contract";
+  if (callable.ctypes &&
+      callable.ctypes->kind == RuntimeCtypesEvidence::Kind::Symbol)
+    return RuntimeBundleLowerer::lowerStaticCtypesNativeCall(op, callable);
   if (!callable.functionTarget.empty())
     return RuntimeBundleLowerer::lowerFunctionTargetCall(op, callable);
   if (runtimeContractName(callable.contract) == "builtins.function")

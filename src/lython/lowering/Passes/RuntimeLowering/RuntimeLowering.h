@@ -133,6 +133,61 @@ private:
   bool hasPrimitiveI64Evidence(const RuntimeBundle *bundle) const;
   bool allSourcesHavePrimitiveI64Evidence(
       llvm::ArrayRef<const RuntimeBundle *> sources) const;
+  bool isStaticCtypesBinding(llvm::StringRef binding) const;
+  bool isStaticCtypesModuleBinding(llvm::StringRef binding) const;
+  bool isStaticCtypesCallable(llvm::StringRef binding) const;
+  bool isErasedCtypesContract(llvm::StringRef contract) const;
+  bool isStaticCtypesLibraryContract(llvm::StringRef contract) const;
+  mlir::LogicalResult lowerStaticCtypesBindingRef(py::BindingRefOp op);
+  mlir::LogicalResult lowerStaticCtypesModuleBindingRef(py::BindingRefOp op);
+  mlir::LogicalResult
+  lowerStaticCtypesModuleAttrGet(py::AttrGetOp op, const RuntimeBundle &object);
+  mlir::LogicalResult
+  lowerStaticCtypesValueAttrGet(py::AttrGetOp op, const RuntimeBundle &object);
+  mlir::LogicalResult
+  lowerStaticCtypesFieldDescriptorAttrGet(py::AttrGetOp op,
+                                          const RuntimeBundle &object);
+  mlir::LogicalResult
+  lowerStaticCtypesTypeFieldDescriptorGet(py::AttrGetOp op,
+                                          const RuntimeBundle &object);
+  mlir::LogicalResult
+  lowerStaticCtypesFieldAttrGet(py::AttrGetOp op, const RuntimeBundle &object);
+  mlir::LogicalResult lowerStaticCtypesFieldAttrSet(py::AttrSetOp op,
+                                                    const RuntimeBundle &object,
+                                                    const RuntimeBundle *value);
+  mlir::LogicalResult lowerStaticCtypesGetItem(py::GetItemOp op,
+                                               const RuntimeBundle &container,
+                                               const RuntimeBundle &index);
+  mlir::LogicalResult lowerStaticCtypesModuleCall(py::CallOp op,
+                                                  const RuntimeBundle &receiver,
+                                                  llvm::StringRef methodName);
+  mlir::LogicalResult
+  lowerStaticCtypesTypeObjectCall(py::CallOp op, const RuntimeBundle &callable);
+  mlir::LogicalResult lowerStaticCtypesTypeObjectMethodCall(
+      py::CallOp op, const RuntimeBundle &receiver, llvm::StringRef methodName);
+  mlir::LogicalResult lowerStaticCtypesArrayTypeMul(mlir::Operation *op,
+                                                    const RuntimeBundle &lhs,
+                                                    const RuntimeBundle &rhs,
+                                                    mlir::Value resultValue);
+  mlir::LogicalResult bindErasedCtypesNew(py::NewOp op,
+                                          llvm::StringRef contract);
+  mlir::LogicalResult bindStaticCtypesLibraryNew(py::NewOp op,
+                                                 llvm::StringRef contract);
+  mlir::LogicalResult
+  lowerErasedCtypesInit(py::InitOp op, const RuntimeBundle &instance,
+                        llvm::ArrayRef<const RuntimeBundle *> sources);
+  mlir::LogicalResult
+  lowerStaticCtypesLibraryInit(py::InitOp op, const RuntimeBundle &instance,
+                               llvm::ArrayRef<const RuntimeBundle *> sources);
+  mlir::LogicalResult lowerStaticCtypesAttrGet(py::AttrGetOp op,
+                                               const RuntimeBundle &object);
+  mlir::LogicalResult lowerStaticCtypesAttrSet(py::AttrSetOp op,
+                                               const RuntimeBundle &object,
+                                               const RuntimeBundle *value);
+  mlir::LogicalResult lowerStaticCtypesCall(py::CallOp op,
+                                            const RuntimeBundle &callable);
+  mlir::LogicalResult
+  lowerStaticCtypesNativeCall(py::CallOp op, const RuntimeBundle &callable);
   mlir::FailureOr<RuntimeValue>
   materializePrimitiveI64Object(mlir::Operation *op,
                                 const RuntimeBundle &bundle);

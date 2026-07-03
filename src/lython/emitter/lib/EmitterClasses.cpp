@@ -12,6 +12,89 @@
 #include <utility>
 
 namespace lython::emitter {
+namespace {
+
+mlir::Attribute sourceExprAttr(mlir::Builder &builder,
+                               const parser::Node *node) {
+  auto dict = [&](llvm::StringRef kind,
+                  llvm::ArrayRef<mlir::NamedAttribute> extra = {}) {
+    llvm::SmallVector<mlir::NamedAttribute, 4> attrs;
+    attrs.push_back(builder.getNamedAttr("kind", builder.getStringAttr(kind)));
+    attrs.append(extra.begin(), extra.end());
+    return builder.getDictionaryAttr(attrs);
+  };
+
+  if (!node)
+    return dict("none");
+  if (node->kind == "Constant") {
+    if (ast::isNoneField(*node, "value"))
+      return dict("constant.none");
+    if (auto value = ast::boolean(*node, "value"))
+      return dict("constant.bool",
+                  {builder.getNamedAttr("value", builder.getBoolAttr(*value))});
+    if (auto value = ast::integer(*node, "value"))
+      return dict("constant.int",
+                  {builder.getNamedAttr(
+                      "value", builder.getStringAttr(std::to_string(*value)))});
+    if (auto value = ast::floating(*node, "value"))
+      return dict(
+          "constant.float",
+          {builder.getNamedAttr("value", builder.getF64FloatAttr(*value))});
+    if (auto value = ast::string(*node, "value"))
+      return dict("constant.str", {builder.getNamedAttr(
+                                      "value", builder.getStringAttr(*value))});
+    if (const auto *fieldValue = ast::field(*node, "value"))
+      if (const auto *big = std::get_if<parser::BigInteger>(fieldValue))
+        return dict("constant.int",
+                    {builder.getNamedAttr(
+                        "value", builder.getStringAttr(big->decimal))});
+    return dict("unsupported", {builder.getNamedAttr(
+                                   "node", builder.getStringAttr("Constant"))});
+  }
+  if (node->kind == "Name" || node->kind == "Attribute") {
+    std::string qualified = ast::qualifiedName(node);
+    if (qualified.empty())
+      qualified = std::string(ast::nameSpelling(*node));
+    return dict("ref", {builder.getNamedAttr(
+                           "name", builder.getStringAttr(qualified))});
+  }
+  if (node->kind == "List" || node->kind == "Tuple") {
+    llvm::SmallVector<mlir::Attribute, 8> values;
+    if (const auto *elts = ast::nodeList(*node, "elts"))
+      for (const parser::NodePtr &element : *elts)
+        values.push_back(sourceExprAttr(builder, element.get()));
+    return dict(node->kind == "List" ? "list" : "tuple",
+                {builder.getNamedAttr("elts", builder.getArrayAttr(values))});
+  }
+  if (node->kind == "Call") {
+    llvm::SmallVector<mlir::Attribute, 8> args;
+    if (const auto *argNodes = ast::nodeList(*node, "args"))
+      for (const parser::NodePtr &arg : *argNodes)
+        args.push_back(sourceExprAttr(builder, arg.get()));
+    llvm::SmallVector<mlir::NamedAttribute, 3> attrs;
+    attrs.push_back(builder.getNamedAttr(
+        "callee", sourceExprAttr(builder, ast::node(*node, "func"))));
+    attrs.push_back(builder.getNamedAttr("args", builder.getArrayAttr(args)));
+    return dict("call", attrs);
+  }
+  if (node->kind == "BinOp") {
+    llvm::SmallVector<mlir::NamedAttribute, 4> attrs;
+    attrs.push_back(builder.getNamedAttr(
+        "op", builder.getStringAttr(ast::node(*node, "op")
+                                        ? ast::node(*node, "op")->kind
+                                        : std::string())));
+    attrs.push_back(builder.getNamedAttr(
+        "left", sourceExprAttr(builder, ast::node(*node, "left"))));
+    attrs.push_back(builder.getNamedAttr(
+        "right", sourceExprAttr(builder, ast::node(*node, "right"))));
+    return dict("binop", attrs);
+  }
+
+  return dict("unsupported", {builder.getNamedAttr(
+                                 "node", builder.getStringAttr(node->kind))});
+}
+
+} // namespace
 
 std::optional<MethodBinding>
 ModuleEmitter::lookupClassMethod(mlir::Type receiverType,
@@ -50,8 +133,16 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef) {
 
   llvm::SmallVector<llvm::StringRef, 4> bases;
   if (const auto *baseNodes = ast::nodeList(classDef, "bases")) {
-    for (const parser::NodePtr &base : *baseNodes)
+    for (const parser::NodePtr &base : *baseNodes) {
+      if (!base)
+        continue;
+      std::string qualified = ast::qualifiedName(base.get());
+      if (!qualified.empty()) {
+        bases.push_back(builder.getStringAttr(qualified).getValue());
+        continue;
+      }
       bases.push_back(ast::nameSpelling(*base));
+    }
   }
 
   llvm::StringMap<mlir::Type> fieldMap;
@@ -108,9 +199,58 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef) {
   state.addAttribute("method_names", stringArray(builder, methodNames));
   state.addAttribute("method_contracts", typeArray(builder, methodContracts));
   state.addAttribute("method_kinds", stringArray(builder, methodKinds));
+
+  llvm::SmallVector<std::string, 8> staticAttrNames;
+  llvm::SmallVector<mlir::Attribute, 8> staticAttrValues;
+  collectStaticClassAssignments(classDef, staticAttrNames, staticAttrValues);
+  if (!staticAttrNames.empty()) {
+    state.addAttribute("class_static_attr_names",
+                       stringArray(builder, staticAttrNames));
+    state.addAttribute("class_static_attr_values",
+                       builder.getArrayAttr(staticAttrValues));
+  }
+
   state.addRegion();
   mlir::Operation *op = builder.create(state);
   op->getRegion(0).push_back(new mlir::Block);
+}
+
+void ModuleEmitter::collectStaticClassAssignments(
+    const parser::Node &classDef, llvm::SmallVectorImpl<std::string> &names,
+    llvm::SmallVectorImpl<mlir::Attribute> &values) const {
+  mlir::Builder attrBuilder(&context);
+  if (const auto *body = ast::nodeList(classDef, "body")) {
+    for (const parser::NodePtr &statement : *body) {
+      if (!statement || statement->kind != "Assign")
+        continue;
+      const auto *targets = ast::nodeList(*statement, "targets");
+      if (!targets || targets->size() != 1 || !targets->front() ||
+          targets->front()->kind != "Name")
+        continue;
+      names.push_back(std::string(ast::nameSpelling(*targets->front())));
+      values.push_back(
+          sourceExprAttr(attrBuilder, ast::node(*statement, "value")));
+    }
+  }
+}
+
+void ModuleEmitter::collectStaticModuleAssignments(
+    const parser::Node &moduleNode, llvm::SmallVectorImpl<std::string> &names,
+    llvm::SmallVectorImpl<mlir::Attribute> &values) const {
+  mlir::Builder attrBuilder(&context);
+  if (const auto *body = ast::nodeList(moduleNode, "body")) {
+    for (const parser::NodePtr &statement : *body) {
+      if (!statement || statement->kind != "Assign")
+        continue;
+      const auto *targets = ast::nodeList(*statement, "targets");
+      if (!targets || targets->size() != 1 || !targets->front() ||
+          targets->front()->kind != "Name")
+        continue;
+      names.push_back(std::string(ast::nameSpelling(*targets->front())));
+      values.push_back(
+          sourceExprAttr(attrBuilder, ast::node(*statement, "value")));
+    }
+  }
 }
 
 void ModuleEmitter::collectClassFields(

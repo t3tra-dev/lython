@@ -341,6 +341,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBinarySpecial(
     erase.push_back(op);
     return mlir::success();
   }
+  if (methodName == "__mul__" && sources.size() == 2)
+    if (mlir::succeeded(RuntimeBundleLowerer::lowerStaticCtypesArrayTypeMul(
+            op, *sources[0], *sources[1], resultValue))) {
+      erase.push_back(op);
+      return mlir::success();
+    }
   if (mlir::failed(lowerManifestMethodResult(
           op, resultValue, *sources.front(), methodName, sources,
           /*allowUnusedSources=*/false,

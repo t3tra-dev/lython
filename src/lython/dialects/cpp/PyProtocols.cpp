@@ -48,16 +48,19 @@ std::optional<std::int64_t> normalizeFiniteTupleIndex(std::int64_t index,
 
 namespace {
 
-// The typing manifest (runtime/typing.mlir) is parsed, verified, and
-// bytecode-compiled into this binary at build time alongside the runtime
-// object modules.
-const py::runtime_library::embedded::Module *embeddedTypingModule() {
+bool isContractManifestModule(llvm::StringRef name) {
+  return name == "typing" || name == "ctypes";
+}
+
+std::vector<const py::runtime_library::embedded::Module *>
+embeddedContractManifestModules() {
   namespace embedded = py::runtime_library::embedded;
+  std::vector<const embedded::Module *> modules;
   for (std::size_t index = 0; index < embedded::moduleCount(); ++index)
     if (embedded::modules()[index].kind == embedded::ModuleKind::MLIRBytecode &&
-        llvm::StringRef(embedded::modules()[index].name) == "typing")
-      return &embedded::modules()[index];
-  return nullptr;
+        isContractManifestModule(embedded::modules()[index].name))
+      modules.push_back(&embedded::modules()[index]);
+  return modules;
 }
 
 std::vector<std::string> stringArray(mlir::Operation *op,
@@ -524,7 +527,7 @@ bindConcrete(mlir::Type type) {
 std::string manifestClassNameForContract(llvm::StringRef name) {
   for (llvm::StringRef prefix :
        {"builtins.", "typing.", "types.", "contextlib.", "_asyncio.",
-        "asyncio.", "contextvars."}) {
+        "asyncio.", "contextvars.", "ctypes.", "_ctypes.", "_typeshed."}) {
     if (name.consume_front(prefix))
       return name.str();
   }
@@ -687,110 +690,116 @@ const Table &Table::get(mlir::MLIRContext &context) {
     return *slot;
   slot = std::make_unique<Table>();
 
-  const py::runtime_library::embedded::Module *typing = embeddedTypingModule();
-  if (!typing) {
-    llvm::errs() << "warning: embedded typing manifest is missing; protocol "
+  std::vector<const py::runtime_library::embedded::Module *> manifests =
+      embeddedContractManifestModules();
+  if (manifests.empty()) {
+    llvm::errs() << "warning: embedded typing manifests are missing; protocol "
                     "conformance queries are empty\n";
     return *slot;
   }
-  llvm::SourceMgr sourceMgr;
-  sourceMgr.AddNewSourceBuffer(
-      llvm::MemoryBuffer::getMemBuffer(
-          llvm::StringRef(reinterpret_cast<const char *>(typing->data),
-                          typing->size),
-          typing->name, /*RequiresNullTerminator=*/false),
-      llvm::SMLoc());
-  mlir::OwningOpRef<mlir::ModuleOp> manifest =
-      mlir::parseSourceFile<mlir::ModuleOp>(sourceMgr, &context);
-  if (!manifest) {
-    llvm::errs() << "warning: failed to parse the embedded typing manifest\n";
-    return *slot;
-  }
 
-  for (mlir::Operation &op : manifest->getBody()->getOperations()) {
-    auto classOp = mlir::dyn_cast<py::ClassOp>(&op);
-    if (!classOp)
+  for (const py::runtime_library::embedded::Module *entry : manifests) {
+    llvm::SourceMgr sourceMgr;
+    sourceMgr.AddNewSourceBuffer(
+        llvm::MemoryBuffer::getMemBuffer(
+            llvm::StringRef(reinterpret_cast<const char *>(entry->data),
+                            entry->size),
+            entry->name, /*RequiresNullTerminator=*/false),
+        llvm::SMLoc());
+    mlir::OwningOpRef<mlir::ModuleOp> manifest =
+        mlir::parseSourceFile<mlir::ModuleOp>(sourceMgr, &context);
+    if (!manifest) {
+      llvm::errs() << "warning: failed to parse embedded typing manifest '"
+                   << entry->name << "'\n";
       continue;
-    ProtocolInfo entry;
-    entry.params = stringArray(classOp, "ly.typing.params");
-    entry.paramVariance = stringArray(classOp, "ly.typing.param_variance");
-    entry.paramVariance.resize(entry.params.size(), "covariant");
-    entry.paramDefaults = trailingTypeDefaults(
-        classOp, "ly.typing.param_defaults", entry.params.size());
-    ProtocolShortForm shortForm{
-        unsignedArray(classOp, "ly.typing.short_arg_positions"),
-        typeArray(classOp, "ly.typing.short_arg_defaults")};
-    if (!shortForm.positions.empty())
-      entry.shortForms.push_back(std::move(shortForm));
-    entry.isProtocol = hasMarker(classOp, "ly.typing.protocol");
-    entry.isAbstract = hasMarker(classOp, "ly.typing.abstract");
-    entry.isFinal = hasMarker(classOp, "ly.typing.final");
-    std::vector<std::string> baseNames;
-    if (auto bases = classOp.getBaseNamesAttr())
-      for (mlir::Attribute base : bases)
-        if (auto text = mlir::dyn_cast<mlir::StringAttr>(base))
-          baseNames.push_back(text.getValue().str());
-    std::vector<std::vector<mlir::Type>> baseArgs;
-    if (auto args =
-            classOp->getAttrOfType<mlir::ArrayAttr>("ly.typing.base_args")) {
-      for (mlir::Attribute group : args) {
-        std::vector<mlir::Type> types;
-        if (auto inner = mlir::dyn_cast<mlir::ArrayAttr>(group))
-          for (mlir::Attribute element : inner)
-            if (auto typeAttr = mlir::dyn_cast<mlir::TypeAttr>(element))
-              types.push_back(typeAttr.getValue());
-        baseArgs.push_back(std::move(types));
-      }
     }
-    baseArgs.resize(baseNames.size());
-    for (auto [baseName, args] : llvm::zip(baseNames, baseArgs))
-      entry.bases.push_back(ProtocolBase{baseName, std::move(args)});
-    if (auto fieldNames = classOp.getFieldNamesAttr()) {
-      mlir::ArrayAttr fieldTypes = classOp.getFieldContractTypesAttr();
-      if (!fieldTypes)
-        fieldTypes = classOp.getFieldTypesAttr();
-      if (fieldTypes && fieldNames.size() == fieldTypes.size()) {
-        for (auto [nameAttr, typeAttr] : llvm::zip(fieldNames, fieldTypes)) {
-          auto name = mlir::dyn_cast<mlir::StringAttr>(nameAttr);
-          auto type = mlir::dyn_cast<mlir::TypeAttr>(typeAttr);
-          if (name && type)
-            entry.fields[name.getValue().str()] = type.getValue();
+
+    for (mlir::Operation &op : manifest->getBody()->getOperations()) {
+      auto classOp = mlir::dyn_cast<py::ClassOp>(&op);
+      if (!classOp)
+        continue;
+      ProtocolInfo classInfo;
+      classInfo.params = stringArray(classOp, "ly.typing.params");
+      classInfo.paramVariance =
+          stringArray(classOp, "ly.typing.param_variance");
+      classInfo.paramVariance.resize(classInfo.params.size(), "covariant");
+      classInfo.paramDefaults = trailingTypeDefaults(
+          classOp, "ly.typing.param_defaults", classInfo.params.size());
+      ProtocolShortForm shortForm{
+          unsignedArray(classOp, "ly.typing.short_arg_positions"),
+          typeArray(classOp, "ly.typing.short_arg_defaults")};
+      if (!shortForm.positions.empty())
+        classInfo.shortForms.push_back(std::move(shortForm));
+      classInfo.isProtocol = hasMarker(classOp, "ly.typing.protocol");
+      classInfo.isAbstract = hasMarker(classOp, "ly.typing.abstract");
+      classInfo.isFinal = hasMarker(classOp, "ly.typing.final");
+      std::vector<std::string> baseNames;
+      if (auto bases = classOp.getBaseNamesAttr())
+        for (mlir::Attribute base : bases)
+          if (auto text = mlir::dyn_cast<mlir::StringAttr>(base))
+            baseNames.push_back(text.getValue().str());
+      std::vector<std::vector<mlir::Type>> baseArgs;
+      if (auto args =
+              classOp->getAttrOfType<mlir::ArrayAttr>("ly.typing.base_args")) {
+        for (mlir::Attribute group : args) {
+          std::vector<mlir::Type> types;
+          if (auto inner = mlir::dyn_cast<mlir::ArrayAttr>(group))
+            for (mlir::Attribute element : inner)
+              if (auto typeAttr = mlir::dyn_cast<mlir::TypeAttr>(element))
+                types.push_back(typeAttr.getValue());
+          baseArgs.push_back(std::move(types));
         }
       }
-    }
-    if (auto methodNames = classOp.getMethodNamesAttr()) {
-      mlir::ArrayAttr methodContracts = classOp.getMethodContractsAttr();
-      if (methodContracts && methodNames.size() == methodContracts.size()) {
-        for (auto [nameAttr, typeAttr] :
-             llvm::zip(methodNames, methodContracts)) {
-          auto name = mlir::dyn_cast<mlir::StringAttr>(nameAttr);
-          auto type = mlir::dyn_cast<mlir::TypeAttr>(typeAttr);
-          if (!name || !type)
-            continue;
-
-          auto pushSignature = [&](py::CallableType signature) {
-            if (!signature)
-              return;
-            ProtocolMethod methodInfo;
-            methodInfo.signature = signature;
-            methodInfo.mayThrow = true;
-            entry.methods[name.getValue().str()].push_back(methodInfo);
-          };
-
-          if (auto signature =
-                  mlir::dyn_cast<py::CallableType>(type.getValue())) {
-            pushSignature(signature);
-            continue;
-          }
-          if (auto overload =
-                  mlir::dyn_cast<py::OverloadType>(type.getValue())) {
-            for (mlir::Type candidate : overload.getCandidateTypes())
-              pushSignature(mlir::dyn_cast<py::CallableType>(candidate));
+      baseArgs.resize(baseNames.size());
+      for (auto [baseName, args] : llvm::zip(baseNames, baseArgs))
+        classInfo.bases.push_back(ProtocolBase{baseName, std::move(args)});
+      if (auto fieldNames = classOp.getFieldNamesAttr()) {
+        mlir::ArrayAttr fieldTypes = classOp.getFieldContractTypesAttr();
+        if (!fieldTypes)
+          fieldTypes = classOp.getFieldTypesAttr();
+        if (fieldTypes && fieldNames.size() == fieldTypes.size()) {
+          for (auto [nameAttr, typeAttr] : llvm::zip(fieldNames, fieldTypes)) {
+            auto name = mlir::dyn_cast<mlir::StringAttr>(nameAttr);
+            auto type = mlir::dyn_cast<mlir::TypeAttr>(typeAttr);
+            if (name && type)
+              classInfo.fields[name.getValue().str()] = type.getValue();
           }
         }
       }
+      if (auto methodNames = classOp.getMethodNamesAttr()) {
+        mlir::ArrayAttr methodContracts = classOp.getMethodContractsAttr();
+        if (methodContracts && methodNames.size() == methodContracts.size()) {
+          for (auto [nameAttr, typeAttr] :
+               llvm::zip(methodNames, methodContracts)) {
+            auto name = mlir::dyn_cast<mlir::StringAttr>(nameAttr);
+            auto type = mlir::dyn_cast<mlir::TypeAttr>(typeAttr);
+            if (!name || !type)
+              continue;
+
+            auto pushSignature = [&](py::CallableType signature) {
+              if (!signature)
+                return;
+              ProtocolMethod methodInfo;
+              methodInfo.signature = signature;
+              methodInfo.mayThrow = true;
+              classInfo.methods[name.getValue().str()].push_back(methodInfo);
+            };
+
+            if (auto signature =
+                    mlir::dyn_cast<py::CallableType>(type.getValue())) {
+              pushSignature(signature);
+              continue;
+            }
+            if (auto overload =
+                    mlir::dyn_cast<py::OverloadType>(type.getValue())) {
+              for (mlir::Type candidate : overload.getCandidateTypes())
+                pushSignature(mlir::dyn_cast<py::CallableType>(candidate));
+            }
+          }
+        }
+      }
+      slot->classes.emplace(classOp.getSymName().str(), std::move(classInfo));
     }
-    slot->classes.emplace(classOp.getSymName().str(), std::move(entry));
   }
   const ProtocolInfo *root = slot->lookup("Protocol");
   if (!root || !root->isProtocol) {
@@ -965,6 +974,31 @@ Table::evidenceFor(mlir::Type receiverType) const {
   if (!info)
     return std::nullopt;
   return ProtocolEvidence{binding->first, std::move(binding->second), info};
+}
+
+bool Table::isManifestSubclassOf(mlir::Type receiverType,
+                                 llvm::StringRef baseClassName) const {
+  std::optional<ProtocolEvidence> evidence = evidenceFor(receiverType);
+  if (!evidence)
+    return false;
+  std::string target = manifestClassNameForContract(baseClassName);
+
+  auto walk = [&](auto &&self, llvm::StringRef className,
+                  unsigned depth) -> bool {
+    if (depth > 32)
+      return false;
+    if (className == target)
+      return true;
+    auto found = classes.find(className.str());
+    if (found == classes.end())
+      return false;
+    for (const ProtocolBase &base : found->second.bases)
+      if (self(self, base.name, depth + 1))
+        return true;
+    return false;
+  };
+
+  return walk(walk, evidence->manifestClass, 0);
 }
 
 static mlir::Type awaitIteratorPayloadType(mlir::Type iteratorType) {

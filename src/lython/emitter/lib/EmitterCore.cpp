@@ -36,6 +36,15 @@ EmitResult ModuleEmitter::emit() {
 
   module = mlir::ModuleOp::create(builder.getUnknownLoc());
   module.setName(moduleName);
+  llvm::SmallVector<std::string, 8> staticAttrNames;
+  llvm::SmallVector<mlir::Attribute, 8> staticAttrValues;
+  collectStaticModuleAssignments(moduleNode, staticAttrNames, staticAttrValues);
+  if (!staticAttrNames.empty()) {
+    module->setAttr("ly.module_static_attr_names",
+                    stringArray(builder, staticAttrNames));
+    module->setAttr("ly.module_static_attr_values",
+                    builder.getArrayAttr(staticAttrValues));
+  }
   builder.setInsertionPointToEnd(module.getBody());
 
   predeclareTopLevel();

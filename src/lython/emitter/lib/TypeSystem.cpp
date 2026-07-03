@@ -12,7 +12,6 @@
 #include "llvm/ADT/Twine.h"
 
 #include <algorithm>
-#include <array>
 #include <map>
 #include <string>
 
@@ -388,7 +387,7 @@ struct NameAliasImport {
   bool annotationAlias = false;
 };
 
-constexpr std::array<ModuleClassImport, 10> kModuleClassImports{{
+constexpr ModuleClassImport kModuleClassImports[] = {
     {"_asyncio", "Future", "_asyncio.Future"},
     {"_asyncio", "Task", "_asyncio.Task"},
     {"asyncio", "Future", "_asyncio.Future"},
@@ -401,18 +400,18 @@ constexpr std::array<ModuleClassImport, 10> kModuleClassImports{{
      "exceptions.CancelledError"},
     {"contextlib", "nullcontext", "contextlib.nullcontext"},
     {"contextvars", "Context", "contextvars.Context"},
-}};
+};
 
-constexpr std::array<ModuleCallableImport, 4> kModuleCallableImports{{
+constexpr ModuleCallableImport kModuleCallableImports[] = {
     {"asyncio", "sleep", "asyncio.sleep", ImportCallableFactory::AsyncioSleep},
     {"asyncio", "get_event_loop", "asyncio.get_event_loop",
      ImportCallableFactory::AsyncioGetEventLoop},
     {"lyrt", "from_prim", "lyrt.from_prim",
      ImportCallableFactory::BuiltinsFunction},
     {"lyrt", "native", "lyrt.native", ImportCallableFactory::BuiltinsFunction},
-}};
+};
 
-constexpr std::array<ModuleAliasImport, 10> kModuleAliasImports{{
+constexpr ModuleAliasImport kModuleAliasImports[] = {
     {"lyrt", "prim.Int", "lyrt.prim.Int", true},
     {"lyrt", "prim.Float", "lyrt.prim.Float", true},
     {"lyrt", "prim.Vector", "lyrt.prim.Vector", true},
@@ -423,9 +422,9 @@ constexpr std::array<ModuleAliasImport, 10> kModuleAliasImports{{
     {"lyrt.prim", "Vector", "lyrt.prim.Vector", true},
     {"lyrt.prim", "Matrix", "lyrt.prim.Matrix", true},
     {"lyrt.prim", "Tensor", "lyrt.prim.Tensor", true},
-}};
+};
 
-constexpr std::array<NameClassImport, 9> kNameClassImports{{
+constexpr NameClassImport kNameClassImports[] = {
     {"_asyncio", "Future", "_asyncio.Future"},
     {"asyncio", "Future", "_asyncio.Future"},
     {"_asyncio", "Task", "_asyncio.Task"},
@@ -435,24 +434,24 @@ constexpr std::array<NameClassImport, 9> kNameClassImports{{
     {"asyncio", "CancelledError", "asyncio.CancelledError"},
     {"asyncio.exceptions", "CancelledError", "asyncio.CancelledError"},
     {"contextlib", "nullcontext", "contextlib.nullcontext"},
-}};
+};
 
-constexpr std::array<NameCallableImport, 4> kNameCallableImports{{
+constexpr NameCallableImport kNameCallableImports[] = {
     {"asyncio", "sleep", "asyncio.sleep", ImportCallableFactory::AsyncioSleep},
     {"asyncio", "get_event_loop", "asyncio.get_event_loop",
      ImportCallableFactory::AsyncioGetEventLoop},
     {"lyrt", "from_prim", "lyrt.from_prim",
      ImportCallableFactory::BuiltinsFunction},
     {"lyrt", "native", "lyrt.native", ImportCallableFactory::BuiltinsFunction},
-}};
+};
 
-constexpr std::array<NameAliasImport, 5> kNameAliasImports{{
+constexpr NameAliasImport kNameAliasImports[] = {
     {"lyrt.prim", "Int", "lyrt.prim.Int", true},
     {"lyrt.prim", "Float", "lyrt.prim.Float", true},
     {"lyrt.prim", "Vector", "lyrt.prim.Vector", true},
     {"lyrt.prim", "Matrix", "lyrt.prim.Matrix", true},
     {"lyrt.prim", "Tensor", "lyrt.prim.Tensor", true},
-}};
+};
 
 std::string importedAttribute(llvm::StringRef localName, llvm::StringRef attr) {
   return (llvm::Twine(localName) + "." + attr).str();
@@ -564,9 +563,14 @@ bool typeAccepts(const AlgorithmM &types, mlir::Type expected,
   if (isObjectTop(types, expected) || isObjectTop(types, actual))
     return true;
   if (auto expectedContract =
-          mlir::dyn_cast_if_present<py::ContractType>(expected))
+          mlir::dyn_cast_if_present<py::ContractType>(expected)) {
+    const py::protocols::Table &table =
+        py::protocols::Table::get(types.getContext());
+    if (table.isManifestSubclassOf(actual, expectedContract.getContractName()))
+      return true;
     if (structuralProtocolAccepts(types, expectedContract, actual))
       return true;
+  }
   return py::isAssignableTo(actual, expected);
 }
 
@@ -1702,8 +1706,8 @@ bool AlgorithmM::bindImportedModule(llvm::StringRef module,
     if (module != entry.module)
       continue;
     bindModuleObject();
-    bindClass(importedModuleAttribute(module, localName, entry),
-              contract(entry.contractName));
+    std::string imported = importedModuleAttribute(module, localName, entry);
+    bindClass(imported, contract(entry.contractName));
   }
 
   for (const ModuleCallableImport &entry : kModuleCallableImports) {
@@ -1734,7 +1738,9 @@ bool AlgorithmM::bindImportedModule(llvm::StringRef module,
     });
   }
 
-  return handled;
+  if (!handled)
+    bindCanonicalSymbol(localName, module, object());
+  return true;
 }
 
 bool AlgorithmM::bindImportedName(llvm::StringRef module,
@@ -1777,7 +1783,9 @@ bool AlgorithmM::bindImportedName(llvm::StringRef module,
     }
   }
 
-  return false;
+  bindCanonicalSymbol(
+      localName, (llvm::Twine(module) + "." + exportedName).str(), object());
+  return true;
 }
 
 mlir::Type AlgorithmM::annotationType(const parser::Node *node) const {
@@ -2057,8 +2065,10 @@ mlir::Type AlgorithmM::inferExpr(const parser::Node *node) const {
   }
   if (node->kind == "BinOp") {
     const parser::Node *op = ast::node(*node, "op");
-    mlir::Type left = widenLiteral(inferExpr(ast::node(*node, "left")));
-    mlir::Type right = widenLiteral(inferExpr(ast::node(*node, "right")));
+    mlir::Type rawLeft = inferExpr(ast::node(*node, "left"));
+    mlir::Type rawRight = inferExpr(ast::node(*node, "right"));
+    mlir::Type left = widenLiteral(rawLeft);
+    mlir::Type right = widenLiteral(rawRight);
     llvm::StringRef method = "__add__";
     if (ast::isOperator(op, "Sub"))
       method = "__sub__";

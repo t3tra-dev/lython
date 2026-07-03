@@ -17,16 +17,22 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 set(LYTHON_PROTOCOL_RELATIONS_INC
   "${CMAKE_CURRENT_BINARY_DIR}/PyProtocolRelations.inc"
 )
+file(GLOB LYTHON_PROTOCOL_MANIFEST_MLIR CONFIGURE_DEPENDS
+  "${CMAKE_SOURCE_DIR}/src/lython/runtime/lib/*.mlir"
+)
+list(PREPEND LYTHON_PROTOCOL_MANIFEST_MLIR
+  "${CMAKE_SOURCE_DIR}/src/lython/runtime/typing.mlir"
+)
 add_custom_command(
   OUTPUT "${LYTHON_PROTOCOL_RELATIONS_INC}"
   COMMAND "${Python3_EXECUTABLE}"
           "${CMAKE_SOURCE_DIR}/tools/dialects/GenerateProtocolRelations.py"
-          --input "${CMAKE_SOURCE_DIR}/src/lython/runtime/typing.mlir"
+          --input ${LYTHON_PROTOCOL_MANIFEST_MLIR}
           --output "${LYTHON_PROTOCOL_RELATIONS_INC}"
   DEPENDS
     "${CMAKE_SOURCE_DIR}/tools/dialects/GenerateProtocolRelations.py"
-    "${CMAKE_SOURCE_DIR}/src/lython/runtime/typing.mlir"
-  COMMENT "Generating protocol relation tables from typing.mlir"
+    ${LYTHON_PROTOCOL_MANIFEST_MLIR}
+  COMMENT "Generating protocol relation tables from typing manifests"
   VERBATIM
 )
 add_custom_target(PyProtocolRelationsIncGen

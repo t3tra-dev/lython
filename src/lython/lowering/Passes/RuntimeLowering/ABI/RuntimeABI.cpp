@@ -115,6 +115,8 @@ void RuntimeBundle::copyEvidenceFrom(const RuntimeBundle &source) {
   coroutineTarget = source.coroutineTarget;
   coroutineSources = source.coroutineSources;
   primitiveI64 = source.primitiveI64;
+  buffer = source.buffer;
+  ctypes = source.ctypes;
   objectEvidence = source.objectEvidence;
   fieldBundles = source.fieldBundles;
   sequenceElementBundles = source.sequenceElementBundles;

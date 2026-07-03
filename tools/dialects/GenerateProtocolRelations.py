@@ -262,13 +262,14 @@ def emit_base_tables(classes: list[ClassInfo]) -> tuple[str, str]:
     return ",\n".join(projection_rows), ",\n".join(rule_rows)
 
 
-def generate(text: str) -> str:
+def generate(text: str, sources: list[Path]) -> str:
     classes = parse_classes(text)
     variance_rules = emit_variance_rules(classes)
     projections, rules = emit_base_tables(classes)
+    source_comment = ", ".join(str(source) for source in sources)
     return f"""#pragma once
 
-// Generated from src/lython/runtime/typing.mlir. Do not edit.
+// Generated from {source_comment}. Do not edit.
 
 #include "mlir/IR/Types.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -405,11 +406,12 @@ void forEachDirectBase(llvm::StringRef name, mlir::MLIRContext *ctx,
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True)
+    parser.add_argument("--input", required=True, nargs="+")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
-    text = Path(args.input).read_text()
-    Path(args.output).write_text(generate(text))
+    inputs = [Path(path) for path in args.input]
+    text = "\n".join(path.read_text() for path in inputs)
+    Path(args.output).write_text(generate(text, inputs))
 
 
 if __name__ == "__main__":

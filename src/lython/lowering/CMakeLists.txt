@@ -13,6 +13,7 @@ add_library(LythonRuntimeLowering STATIC
     Passes/RuntimeLowering/CallableEvidenceSources.cpp
     Passes/RuntimeLowering/Ops/CallableOps.cpp
     Passes/RuntimeLowering/CallablePlanning.cpp
+    Passes/RuntimeLowering/CtypesEvidence.cpp
     Passes/RuntimeLowering/EHCleanup.cpp
     Passes/RuntimeLowering/Ops/ExceptionOps.cpp
     Passes/RuntimeLowering/Finalize.cpp
@@ -69,11 +70,15 @@ set(LYTHON_RUNTIME_OBJECT_BYTECODE_DIR "${CMAKE_CURRENT_BINARY_DIR}/runtime_obje
 file(GLOB LYTHON_RUNTIME_OBJECT_MLIR CONFIGURE_DEPENDS
     "${CMAKE_SOURCE_DIR}/src/lython/runtime/objects/*.mlir"
 )
+file(GLOB LYTHON_RUNTIME_LIB_MLIR CONFIGURE_DEPENDS
+    "${CMAKE_SOURCE_DIR}/src/lython/runtime/lib/*.mlir"
+)
 
 # The typing manifest rides the same parse/verify/bytecode path as the
 # runtime object modules and is embedded alongside them.
 list(APPEND LYTHON_RUNTIME_OBJECT_MLIR
     "${CMAKE_SOURCE_DIR}/src/lython/runtime/typing.mlir"
+    ${LYTHON_RUNTIME_LIB_MLIR}
 )
 list(SORT LYTHON_RUNTIME_OBJECT_MLIR)
 

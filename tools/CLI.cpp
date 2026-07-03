@@ -30,6 +30,7 @@
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Vector/Transforms/Passes.h"
 #include "mlir/ExecutionEngine/ExecutionEngine.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/Location.h"
@@ -309,7 +310,7 @@ std::string codeGenCPUNameForTarget(py::TensorLoweringTarget target,
     return hostCPUNameForCodeGen();
   if (triple.getArch() == llvm::Triple::x86_64)
     return "x86-64";
-  return hostCPUNameForCodeGen();
+  return "";
 }
 
 std::string codeGenFeaturesForTarget(py::TensorLoweringTarget target,
@@ -455,6 +456,42 @@ py::TensorLoweringTarget detectTensorLoweringTarget(llvm::Triple triple) {
       target.architecture = py::TensorLoweringArchitecture::X86SSE42;
   }
   return target;
+}
+
+std::uint64_t pointerWidthForTarget(const llvm::Triple &triple) {
+  if (triple.isArch64Bit())
+    return 64;
+  if (triple.isArch32Bit())
+    return 32;
+  return 0;
+}
+
+std::uint64_t cLongWidthForTarget(const llvm::Triple &triple,
+                                  std::uint64_t pointerWidth) {
+  if (triple.isOSWindows())
+    return 32;
+  return pointerWidth == 64 ? 64 : 32;
+}
+
+LogicalResult stampTargetPlatformFacts(ModuleOp module,
+                                       py::TensorLoweringTarget tensorTarget) {
+  llvm::Triple triple = codeGenTripleForTarget(tensorTarget);
+  std::uint64_t pointerWidth = pointerWidthForTarget(triple);
+  if (pointerWidth == 0) {
+    llvm::errs() << "error: cannot derive pointer width for target triple '"
+                 << triple.normalize() << "'\n";
+    return failure();
+  }
+
+  Builder builder(module.getContext());
+  module->setAttr("ly.target.triple",
+                  builder.getStringAttr(triple.normalize()));
+  module->setAttr("ly.target.pointer_width",
+                  builder.getI64IntegerAttr(pointerWidth));
+  module->setAttr(
+      "ly.target.c_long_width",
+      builder.getI64IntegerAttr(cLongWidthForTarget(triple, pointerWidth)));
+  return success();
 }
 
 void dumpMLIRForPass(const IRDumpConfig &config, llvm::StringRef passName,
@@ -2434,6 +2471,8 @@ int main(int argc, char **argv) {
 
   py::TensorLoweringTarget tensorTarget =
       detectTensorLoweringTarget(codeGenTripleForTarget({}));
+  if (failed(stampTargetPlatformFacts(*module, tensorTarget)))
+    return 1;
 
   {
     PerfScope perf("lowering");

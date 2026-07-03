@@ -576,10 +576,11 @@ bool isPyProtocolType(mlir::Type type) {
 bool isPyContractType(mlir::Type type) {
   return llvm::TypeSwitch<mlir::Type, bool>(type)
       .Case<ContractType, ProtocolType, CallableType, UnionType, LiteralType,
-            TypeType, SelfType, TypeVarType, ParamSpecType, TypeVarTupleType,
-            UnpackType, ClassType, IntType, FloatType, BoolType, StrType,
-            NoneType, ObjectType, TupleType, DictType, ListType, ExceptionType,
-            TracebackType>([](auto) { return true; })
+            OverloadType, TypeType, SelfType, TypeVarType, ParamSpecType,
+            TypeVarTupleType, UnpackType, ClassType, IntType, FloatType,
+            BoolType, StrType, NoneType, ObjectType, TupleType, DictType,
+            ListType, ExceptionType, TracebackType>(
+          [](auto) { return true; })
       .Default([](mlir::Type) { return false; });
 }
 
@@ -798,6 +799,10 @@ protocolDescriptorArguments(mlir::Type type, llvm::StringRef protocolName) {
       if (name.consume_front("typing."))
         return DescriptorRoot{name.str(), arguments};
       if (name.consume_front("_asyncio."))
+        return DescriptorRoot{name.str(), arguments};
+      if (name.consume_front("ctypes."))
+        return DescriptorRoot{name.str(), arguments};
+      if (name.consume_front("_ctypes."))
         return DescriptorRoot{name.str(), arguments};
       return DescriptorRoot{contract.getContractName().str(), arguments};
     }

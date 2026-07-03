@@ -27,11 +27,27 @@ static bool isCallArgumentPackUse(mlir::OpOperand &use) {
   return false;
 }
 
+static bool isStaticMetadataSequenceUse(mlir::OpOperand &use) {
+  mlir::Value value = use.get();
+  if (auto attrSet = mlir::dyn_cast<py::AttrSetOp>(use.getOwner()))
+    return attrSet.getValue() == value;
+  return false;
+}
+
 static bool isOnlyUsedAsCallArgumentPack(py::PackOp op) {
   if (op.getResult().use_empty())
     return false;
   for (mlir::OpOperand &use : op.getResult().getUses())
     if (!isCallArgumentPackUse(use))
+      return false;
+  return true;
+}
+
+static bool isOnlyUsedAsStaticMetadataSequence(py::PackOp op) {
+  if (op.getResult().use_empty())
+    return false;
+  for (mlir::OpOperand &use : op.getResult().getUses())
+    if (!isStaticMetadataSequenceUse(use))
       return false;
   return true;
 }
@@ -76,14 +92,32 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPack(py::PackOp op) {
   if (contractName != "builtins.dict") {
     elements.reserve(values.size());
     elementBundles.reserve(values.size());
+    bool allElementsObject = true;
     for (mlir::Value value : values) {
       const RuntimeBundle *bundle = RuntimeBundleLowerer::bundleFor(value);
-      if (!bundle || bundle->kind != RuntimeBundle::Kind::Object)
-        return op.emitError() << contractName
-                              << " literal element has no lowered object "
-                                 "bundle";
-      elements.push_back(bundle->objectValue);
+      if (!bundle)
+        return op.emitError()
+               << contractName << " literal element has no lowered bundle";
+      if (bundle->kind == RuntimeBundle::Kind::Object) {
+        elements.push_back(bundle->objectValue);
+      } else {
+        allElementsObject = false;
+      }
       elementBundles.push_back(std::make_shared<RuntimeBundle>(*bundle));
+    }
+    if (!allElementsObject) {
+      if (!isOnlyUsedAsStaticMetadataSequence(op))
+        return op.emitError()
+               << contractName
+               << " literal with non-object elements can only be used as "
+                  "static metadata evidence";
+      RuntimeBundle bundle =
+          RuntimeBundle::object(op.getResult().getType(), {});
+      bundle.sequenceElementBundles.append(elementBundles.begin(),
+                                           elementBundles.end());
+      valueBundles[op.getResult()] = std::move(bundle);
+      erase.push_back(op);
+      return mlir::success();
     }
   } else {
     if (values.size() % 2 != 0)
@@ -127,6 +161,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPack(py::PackOp op) {
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::lowerBindingRef(py::BindingRefOp op) {
+  if (RuntimeBundleLowerer::isStaticCtypesBinding(op.getBinding()))
+    return RuntimeBundleLowerer::lowerStaticCtypesBindingRef(op);
+
   std::optional<RuntimeSymbol> builtin =
       manifest.builtinCallable(op.getBinding());
   if (builtin) {
