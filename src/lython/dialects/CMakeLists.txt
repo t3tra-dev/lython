@@ -1,5 +1,5 @@
 # TableGenファイルからC++コードを生成
-set(LLVM_TARGET_DEFINITIONS tablegen/PyDialect.td)
+set(LLVM_TARGET_DEFINITIONS PyDialect.td)
 mlir_tablegen(PyDialect.cpp.inc -gen-dialect-defs)
 mlir_tablegen(PyDialect.h.inc -gen-dialect-decls)
 mlir_tablegen(PyOps.cpp.inc -gen-op-defs)
@@ -56,7 +56,7 @@ foreach(path IN LISTS module_list)
 endforeach()
 
 set(content "// Generated from src/lython/dialects/CMakeLists.txt. Do not edit.
-#include \"cpp/PyProtocols.h\"
+#include \"PyProtocols.h\"
 
 namespace py::protocols {
   namespace {
@@ -94,11 +94,11 @@ add_custom_command(
 )
 
 add_library(PyDialect STATIC
-  cpp/PyDialect.cpp
-  cpp/PyDialectTypes.cpp
-  cpp/PyProtocols.cpp
-  cpp/PyTypeObject.cpp
-  cpp/PyVerifier/Verifier.cpp
+  PyDialect.cpp
+  PyDialectTypes.cpp
+  PyProtocols.cpp
+  PyTypeObject.cpp
+  ../verifier/Verifier.cpp
   "${LYTHON_PROTOCOL_MANIFEST_SOURCES_CPP}"
 )
 

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "Ast.h"
-#include "cpp/PyDialectTypes.h"
+#include "PyDialectTypes.h"
 
 #include "mlir/IR/Builders.h"
 #include "llvm/ADT/SmallVector.h"

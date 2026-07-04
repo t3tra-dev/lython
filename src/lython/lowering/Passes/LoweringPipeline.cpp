@@ -3,8 +3,8 @@
 #include "Common/Instrumentation.h"
 #include "Common/RuntimeLibrary.h"
 #include "Common/RuntimeSupport.h"
-#include "Passes/Runtime/Cleanup.h"
-#include "Passes/RuntimeLowering/Arch/Arm/PrimitiveTensorArmSME.h"
+#include "Passes/Runtime/Cleanup/Transforms.h"
+#include "Passes/Runtime/Arch/Arm/PrimitiveTensorArmSME.h"
 
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"

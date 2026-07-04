@@ -20,7 +20,7 @@ target_include_directories(LythonEmitter
     PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE
-    ${CMAKE_SOURCE_DIR}/src/lython/dialects/cpp
+    ${CMAKE_SOURCE_DIR}/src/lython/dialects
     ${CMAKE_BINARY_DIR}/src/lython/dialects
 )
 

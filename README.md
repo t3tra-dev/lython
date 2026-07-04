@@ -30,8 +30,8 @@ brew install llvm@20
 # sudo apt-get install -y clang-20 lld-20 llvm-20-dev libmlir-20-dev mlir-20-tools
 
 # Lython 本体
-uv run cmake -B build -S .
-uv run cmake --build build -j$(nproc)
+cmake -B build -S .
+cmake --build build -j$(nproc)
 ```
 
 ### 実行

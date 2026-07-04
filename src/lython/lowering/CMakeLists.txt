@@ -2,48 +2,59 @@ add_library(LythonRuntimeLowering STATIC
     Common/Instrumentation.cpp
     Common/RuntimeLibrary.cpp
     Passes/LoweringPipeline.cpp
-    Passes/RuntimeLowering/ABI/CallableABI.cpp
-    Passes/RuntimeLowering/ABI/ControlFlowABI.cpp
-    Passes/RuntimeLowering/ABI/RuntimeABI.cpp
-    Passes/RuntimeLowering/BuiltinCalls.cpp
-    Passes/RuntimeLowering/Ops/AsyncCallableOps.cpp
-    Passes/RuntimeLowering/Ops/AttributeOps.cpp
-    Passes/RuntimeLowering/Ops/AwaitOps.cpp
-    Passes/RuntimeLowering/CallableAggregateEvidence.cpp
-    Passes/RuntimeLowering/CallableArgumentEvidence.cpp
-    Passes/RuntimeLowering/CallableEvidenceSources.cpp
-    Passes/RuntimeLowering/Ops/CallableOps.cpp
-    Passes/RuntimeLowering/CallablePlanning.cpp
-    Passes/RuntimeLowering/CtypesEvidence.cpp
-    Passes/RuntimeLowering/EHCleanup.cpp
-    Passes/RuntimeLowering/Ops/ExceptionOps.cpp
-    Passes/RuntimeLowering/Finalize.cpp
-    Passes/RuntimeLowering/Ops/FunctionTargetCalls.cpp
-    Passes/RuntimeLowering/Ops/GetItemOps.cpp
-    Passes/RuntimeLowering/Ops/IndirectCallableOps.cpp
-    Passes/RuntimeLowering/Ops/LiteralOps.cpp
-    Passes/RuntimeLowering/LowererCore.cpp
-    Passes/RuntimeLowering/LowererDispatch.cpp
-    Passes/RuntimeLowering/ManifestCalls.cpp
-    Passes/RuntimeLowering/ManifestIndex.cpp
-    Passes/RuntimeLowering/ObjectBundles.cpp
-    Passes/RuntimeLowering/Passes.cpp
-    Passes/RuntimeLowering/Ops/PackAndBindingOps.cpp
-    Passes/RuntimeLowering/PrimitiveI64Calls.cpp
-    Passes/RuntimeLowering/PrimitiveTensorGemm.cpp
-    Passes/RuntimeLowering/PrimitiveTensorPacking.cpp
-    Passes/RuntimeLowering/Arch/Arm/PrimitiveTensorArmSME.cpp
-    Passes/RuntimeLowering/Arch/Arm/PrimitiveTensorArmSMEMatmul.cpp
-    Passes/RuntimeLowering/Arch/X86/PrimitiveTensorX86.cpp
-    Passes/RuntimeLowering/Arch/Generic/PrimitiveTensorGenericMicroKernel.cpp
-    Passes/RuntimeLowering/PrimitiveTensorSupport.cpp
-    Passes/RuntimeLowering/PrimitiveTensorLowering.cpp
-    Passes/RuntimeLowering/ReturnedSummaries.cpp
-    Passes/RuntimeLowering/RuntimeCallOperands.cpp
-    Passes/RuntimeLowering/Ops/SpecialMethodOps.cpp
-    Passes/RuntimeLowering/Support.cpp
-    Passes/RuntimeLowering/Ops/TryOps.cpp
-    Passes/RuntimeLowering/Ops/UnionOps.cpp
+    Passes/Runtime/ABI/CallableABI.cpp
+    Passes/Runtime/ABI/ControlFlowABI.cpp
+    Passes/Runtime/ABI/Returns.cpp
+    Passes/Runtime/ABI/RuntimeABI.cpp
+    Passes/Runtime/Calls/Builtin.cpp
+    Passes/Runtime/Calls/Operands.cpp
+    Passes/Runtime/Cleanup/EH.cpp
+    Passes/Runtime/Core/Dispatch.cpp
+    Passes/Runtime/Core/Lowerer.cpp
+    Passes/Runtime/Core/ObjectBundles.cpp
+    Passes/Runtime/Ctypes/Calls.cpp
+    Passes/Runtime/Ctypes/Diagnostics.cpp
+    Passes/Runtime/Ctypes/Evidence.cpp
+    Passes/Runtime/Ctypes/Layout.cpp
+    Passes/Runtime/Ctypes/Materialization.cpp
+    Passes/Runtime/Ctypes/Names.cpp
+    Passes/Runtime/Ctypes/NativeCall.cpp
+    Passes/Runtime/Ctypes/Objects.cpp
+    Passes/Runtime/Ctypes/Symbols.cpp
+    Passes/Runtime/Evidence/CallableAggregate.cpp
+    Passes/Runtime/Evidence/CallableArgument.cpp
+    Passes/Runtime/Evidence/CallablePlanning.cpp
+    Passes/Runtime/Evidence/CallableSources.cpp
+    Passes/Runtime/Evidence/Returned.cpp
+    Passes/Runtime/Manifest/Calls.cpp
+    Passes/Runtime/Manifest/Index.cpp
+    Passes/Runtime/Model/Support.cpp
+    Passes/Runtime/Ops/AsyncCallableOps.cpp
+    Passes/Runtime/Ops/AttributeOps.cpp
+    Passes/Runtime/Ops/AwaitOps.cpp
+    Passes/Runtime/Ops/CallableOps.cpp
+    Passes/Runtime/Ops/ExceptionOps.cpp
+    Passes/Runtime/Ops/FunctionTargetCalls.cpp
+    Passes/Runtime/Ops/GetItemOps.cpp
+    Passes/Runtime/Ops/IndirectCallableOps.cpp
+    Passes/Runtime/Ops/LiteralOps.cpp
+    Passes/Runtime/Ops/PackAndBindingOps.cpp
+    Passes/Runtime/Ops/SpecialMethodOps.cpp
+    Passes/Runtime/Ops/TryOps.cpp
+    Passes/Runtime/Ops/UnionOps.cpp
+    Passes/Runtime/Passes/AsyncThunk.cpp
+    Passes/Runtime/Passes/Lowering.cpp
+    Passes/Runtime/Passes/Ownership.cpp
+    Passes/Runtime/Passes/Stubs.cpp
+    Passes/Runtime/Primitive/I64Calls.cpp
+    Passes/Runtime/Primitive/TensorGemm.cpp
+    Passes/Runtime/Primitive/TensorPacking.cpp
+    Passes/Runtime/Arch/Arm/PrimitiveTensorArmSME.cpp
+    Passes/Runtime/Arch/Arm/PrimitiveTensorArmSMEMatmul.cpp
+    Passes/Runtime/Arch/X86/PrimitiveTensorX86.cpp
+    Passes/Runtime/Arch/Generic/PrimitiveTensorGenericMicroKernel.cpp
+    Passes/Runtime/Primitive/TensorSupport.cpp
+    Passes/Runtime/Primitive/TensorLowering.cpp
 )
 
 add_executable(LythonRuntimeMlirBytecode
@@ -54,7 +65,7 @@ add_dependencies(LythonRuntimeMlirBytecode PyDialectIncGen)
 
 target_include_directories(LythonRuntimeMlirBytecode
     PRIVATE
-    ${CMAKE_SOURCE_DIR}/src/lython/dialects/cpp
+    ${CMAKE_SOURCE_DIR}/src/lython/dialects
     ${CMAKE_BINARY_DIR}/src/lython/dialects
 )
 
@@ -258,7 +269,7 @@ target_link_libraries(LythonRuntimeLowering PUBLIC LythonEmbeddedRuntime)
 
 target_include_directories(LythonRuntimeLowering
     PUBLIC
-    ${CMAKE_SOURCE_DIR}/src/lython/dialects/cpp
+    ${CMAKE_SOURCE_DIR}/src/lython/dialects
     ${CMAKE_BINARY_DIR}/src/lython/dialects
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/Passes

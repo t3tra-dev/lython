@@ -4,7 +4,7 @@ add_executable(lyc
 
 target_include_directories(lyc
     PUBLIC
-    ${CMAKE_SOURCE_DIR}/src/lython/dialects/cpp
+    ${CMAKE_SOURCE_DIR}/src/lython/dialects
     ${CMAKE_BINARY_DIR}/src/lython/dialects
     ${CMAKE_SOURCE_DIR}/src/lython/lowering
     ${CMAKE_SOURCE_DIR}/src/lython/runtime

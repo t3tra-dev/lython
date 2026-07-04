@@ -3,8 +3,8 @@
 #include "AstAccess.h"
 #include "CandidateSelection.h"
 #include "PrimitiveTypes.h"
-#include "cpp/PyCallableShape.h"
-#include "cpp/PyProtocols.h"
+#include "PyCallableShape.h"
+#include "PyProtocols.h"
 
 #include "mlir/IR/BuiltinTypes.h"
 #include "llvm/ADT/STLExtras.h"

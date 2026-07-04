@@ -93,8 +93,8 @@
 #include "Common/RuntimeSupport.h"
 #include "Emitter.h"
 #include "Parser.h"
-#include "Passes/RuntimeLowering/Arch/Arm/PrimitiveTensorArmSME.h"
-#include "Passes/RuntimeLowering/Arch/X86/PrimitiveTensorX86.h"
+#include "Passes/Runtime/Arch/Arm/PrimitiveTensorArmSME.h"
+#include "Passes/Runtime/Arch/X86/PrimitiveTensorX86.h"
 
 #include "PyDialect.h.inc"
 
