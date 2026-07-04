@@ -2,6 +2,8 @@
 
 #include "PyDialectTypes.h"
 #include "mlir/IR/MLIRContext.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/FunctionExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 
@@ -12,6 +14,16 @@
 #include <vector>
 
 namespace py::protocols {
+
+struct ManifestSource {
+  const char *name = nullptr;
+  const char *data = nullptr;
+  std::size_t size = 0;
+};
+
+llvm::ArrayRef<ManifestSource> manifestSources();
+
+enum class Variance { Covariant, Contravariant, Invariant };
 
 // One base protocol instantiation in the typing manifest.
 struct ProtocolBase {
@@ -113,9 +125,10 @@ struct AwaitableResolution {
 // constructed in the manifest and expanded here through base substitution.
 class Table {
 public:
-  // Loads the embedded typing manifest once per MLIRContext (types are
-  // owned by the context). The manifest bytecode is compiled into the
-  // binary at build time.
+  // Loads the embedded typing manifest sources once per MLIRContext (types are
+  // owned by the context). The manifest text is compiled into the binary at
+  // build time; protocol facts are still derived by parsing MLIR, not by a
+  // protocol-specific generator.
   static const Table &get(mlir::MLIRContext &context);
   static Table &getMutable(mlir::MLIRContext &context);
 
@@ -137,6 +150,12 @@ public:
   std::optional<std::vector<mlir::Type>>
   completeProtocolArguments(llvm::StringRef protocolName,
                             llvm::ArrayRef<mlir::Type> supplied) const;
+  Variance parameterVariance(llvm::StringRef protocolName,
+                             unsigned index) const;
+  bool isProtocolSubtypeOf(
+      py::ProtocolType subtype, py::ProtocolType supertype,
+      llvm::function_ref<bool(mlir::Type, mlir::Type, Variance)>
+          argumentMatches) const;
   std::optional<ProtocolEvidence> evidenceFor(mlir::Type receiverType) const;
   bool isManifestSubclassOf(mlir::Type receiverType,
                             llvm::StringRef baseClassName) const;

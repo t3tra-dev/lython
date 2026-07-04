@@ -1,6 +1,7 @@
 add_library(LythonRuntimeLowering STATIC
+    Common/Instrumentation.cpp
     Common/RuntimeLibrary.cpp
-    Passes/Lowering.cpp
+    Passes/LoweringPipeline.cpp
     Passes/RuntimeLowering/ABI/CallableABI.cpp
     Passes/RuntimeLowering/ABI/ControlFlowABI.cpp
     Passes/RuntimeLowering/ABI/RuntimeABI.cpp
@@ -254,30 +255,6 @@ target_include_directories(LythonEmbeddedRuntime
     ${CMAKE_SOURCE_DIR}/src/lython/runtime
 )
 target_link_libraries(LythonRuntimeLowering PUBLIC LythonEmbeddedRuntime)
-
-add_library(LythonProtocolEvidence STATIC
-    ${CMAKE_SOURCE_DIR}/src/lython/dialects/cpp/PyProtocols.cpp
-)
-add_dependencies(LythonProtocolEvidence
-    PyDialectIncGen
-    LythonRuntimeObjectBytecode
-)
-target_include_directories(LythonProtocolEvidence
-    PUBLIC
-    ${CMAKE_SOURCE_DIR}/src/lython/common
-    ${CMAKE_SOURCE_DIR}/src/lython/dialects/cpp
-    ${CMAKE_BINARY_DIR}/src/lython/dialects
-    ${CMAKE_SOURCE_DIR}/src/lython/runtime
-)
-target_link_libraries(LythonProtocolEvidence
-    PUBLIC
-    PyDialect
-    LythonEmbeddedRuntime
-    MLIR
-    LLVM
-)
-target_compile_options(LythonProtocolEvidence PRIVATE -frtti)
-target_link_libraries(LythonRuntimeLowering PUBLIC LythonProtocolEvidence)
 
 target_include_directories(LythonRuntimeLowering
     PUBLIC

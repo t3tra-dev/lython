@@ -1,4 +1,4 @@
-#include "RuntimeLowering/RuntimeLowering.h"
+#include "RuntimeLowering/RuntimeBundleLowerer.h"
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
 

@@ -3,9 +3,7 @@
 #include "CallableArgumentMatcher.h"
 #include "CandidateSelection.h"
 #include "cpp/PyCallableShape.h"
-#include "embedded.h"
 
-#include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/Dialect/Async/IR/Async.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -47,21 +45,6 @@ std::optional<std::int64_t> normalizeFiniteTupleIndex(std::int64_t index,
 }
 
 namespace {
-
-bool isContractManifestModule(llvm::StringRef name) {
-  return name == "typing" || name == "ctypes";
-}
-
-std::vector<const py::runtime_library::embedded::Module *>
-embeddedContractManifestModules() {
-  namespace embedded = py::runtime_library::embedded;
-  std::vector<const embedded::Module *> modules;
-  for (std::size_t index = 0; index < embedded::moduleCount(); ++index)
-    if (embedded::modules()[index].kind == embedded::ModuleKind::MLIRBytecode &&
-        isContractManifestModule(embedded::modules()[index].name))
-      modules.push_back(&embedded::modules()[index]);
-  return modules;
-}
 
 std::vector<std::string> stringArray(mlir::Operation *op,
                                      llvm::StringRef name) {
@@ -524,6 +507,28 @@ bindConcrete(mlir::Type type) {
   return std::nullopt;
 }
 
+bool isIntegerLiteralSpelling(llvm::StringRef spelling) {
+  if (spelling.empty())
+    return false;
+  if (spelling.front() == '-')
+    spelling = spelling.drop_front();
+  return !spelling.empty() &&
+         llvm::all_of(spelling, [](char ch) { return ch >= '0' && ch <= '9'; });
+}
+
+std::optional<std::string> manifestClassNameForLiteral(py::LiteralType literal) {
+  llvm::StringRef spelling = literal.getSpelling();
+  if (spelling == "True" || spelling == "False")
+    return std::string("bool");
+  if (spelling == "None")
+    return std::string("NoneType");
+  if (spelling.starts_with("\"") && spelling.ends_with("\""))
+    return std::string("str");
+  if (isIntegerLiteralSpelling(spelling))
+    return std::string("int");
+  return std::nullopt;
+}
+
 std::string manifestClassNameForContract(llvm::StringRef name) {
   for (llvm::StringRef prefix :
        {"builtins.", "typing.", "types.", "contextlib.", "_asyncio.",
@@ -539,6 +544,12 @@ bindReceiver(mlir::Type type,
              const std::map<std::string, ProtocolInfo> &classes) {
   if (auto concrete = bindConcrete(type))
     return concrete;
+
+  if (auto literal = mlir::dyn_cast<py::LiteralType>(type)) {
+    std::optional<std::string> className = manifestClassNameForLiteral(literal);
+    if (className && classes.find(*className) != classes.end())
+      return {{std::move(*className), {}}};
+  }
 
   if (auto contract = mlir::dyn_cast<py::ContractType>(type)) {
     std::string className =
@@ -645,6 +656,14 @@ protocolArgumentsForImpl(const std::map<std::string, ProtocolInfo> &classes,
   return walk(binding->first, binding->second, 0);
 }
 
+Variance parseVariance(llvm::StringRef variance) {
+  if (variance == "invariant")
+    return Variance::Invariant;
+  if (variance == "contravariant")
+    return Variance::Contravariant;
+  return Variance::Covariant;
+}
+
 bool sameProtocolEvidence(const std::optional<ProtocolEvidence> &lhs,
                           const std::optional<ProtocolEvidence> &rhs) {
   if (lhs.has_value() != rhs.has_value())
@@ -690,27 +709,25 @@ const Table &Table::get(mlir::MLIRContext &context) {
     return *slot;
   slot = std::make_unique<Table>();
 
-  std::vector<const py::runtime_library::embedded::Module *> manifests =
-      embeddedContractManifestModules();
+  llvm::ArrayRef<ManifestSource> manifests = manifestSources();
   if (manifests.empty()) {
-    llvm::errs() << "warning: embedded typing manifests are missing; protocol "
+    llvm::errs() << "warning: typing manifest sources are missing; protocol "
                     "conformance queries are empty\n";
     return *slot;
   }
 
-  for (const py::runtime_library::embedded::Module *entry : manifests) {
+  for (const ManifestSource &entry : manifests) {
     llvm::SourceMgr sourceMgr;
     sourceMgr.AddNewSourceBuffer(
         llvm::MemoryBuffer::getMemBuffer(
-            llvm::StringRef(reinterpret_cast<const char *>(entry->data),
-                            entry->size),
-            entry->name, /*RequiresNullTerminator=*/false),
+            llvm::StringRef(entry.data, entry.size), entry.name,
+            /*RequiresNullTerminator=*/false),
         llvm::SMLoc());
     mlir::OwningOpRef<mlir::ModuleOp> manifest =
         mlir::parseSourceFile<mlir::ModuleOp>(sourceMgr, &context);
     if (!manifest) {
-      llvm::errs() << "warning: failed to parse embedded typing manifest '"
-                   << entry->name << "'\n";
+      llvm::errs() << "warning: failed to parse typing manifest source '"
+                   << entry.name << "'\n";
       continue;
     }
 
@@ -963,6 +980,77 @@ Table::completeProtocolArguments(llvm::StringRef protocolName,
   if (!info || !info->isProtocol)
     return std::nullopt;
   return completeProtocolInstantiationArguments(*info, supplied);
+}
+
+Variance Table::parameterVariance(llvm::StringRef protocolName,
+                                  unsigned index) const {
+  const ProtocolInfo *info = lookup(protocolName);
+  if (!info || index >= info->paramVariance.size())
+    return Variance::Covariant;
+  return parseVariance(info->paramVariance[index]);
+}
+
+bool Table::isProtocolSubtypeOf(
+    py::ProtocolType subtype, py::ProtocolType supertype,
+    llvm::function_ref<bool(mlir::Type, mlir::Type, Variance)> argumentMatches)
+    const {
+  const ProtocolInfo *targetInfo = lookup(supertype.getProtocolName());
+  if (!targetInfo || !targetInfo->isProtocol)
+    return false;
+
+  std::optional<std::vector<mlir::Type>> targetArgs =
+      completeProtocolInstantiationArguments(*targetInfo,
+                                             supertype.getArguments());
+  if (!targetArgs)
+    return false;
+
+  auto binding = bindReceiver(subtype, classes);
+  if (!binding)
+    return false;
+
+  auto walk = [&](auto &&self, llvm::StringRef className,
+                  const std::map<std::string, mlir::Type> &currentBinding,
+                  unsigned depth) -> bool {
+    if (depth > 16)
+      return false;
+    auto found = classes.find(className.str());
+    if (found == classes.end())
+      return false;
+    const ProtocolInfo &info = found->second;
+
+    if (className == supertype.getProtocolName()) {
+      std::vector<mlir::Type> sourceArgs;
+      sourceArgs.reserve(info.params.size());
+      for (const std::string &param : info.params) {
+        auto arg = currentBinding.find(param);
+        if (arg == currentBinding.end())
+          return false;
+        sourceArgs.push_back(arg->second);
+      }
+      if (sourceArgs.size() != targetArgs->size())
+        return false;
+      for (auto indexed : llvm::enumerate(llvm::zip(sourceArgs, *targetArgs))) {
+        auto [sourceArg, targetArg] = indexed.value();
+        if (!argumentMatches(sourceArg, targetArg,
+                             parameterVariance(supertype.getProtocolName(),
+                                               indexed.index())))
+          return false;
+      }
+      return true;
+    }
+
+    for (const ProtocolBase &baseInfo : info.bases) {
+      std::optional<std::map<std::string, mlir::Type>> baseBinding =
+          bindBaseInstantiation(classes, baseInfo, currentBinding);
+      if (!baseBinding)
+        continue;
+      if (self(self, baseInfo.name, *baseBinding, depth + 1))
+        return true;
+    }
+    return false;
+  };
+
+  return walk(walk, binding->first, binding->second, 0);
 }
 
 std::optional<ProtocolEvidence>

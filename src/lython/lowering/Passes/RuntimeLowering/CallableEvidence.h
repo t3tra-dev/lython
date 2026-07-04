@@ -1,6 +1,6 @@
 #pragma once
 
-#include "RuntimeLowering/RuntimeLowering.h"
+#include "RuntimeLowering/RuntimeBundleLowerer.h"
 
 #include "cpp/PyCallableShape.h"
 

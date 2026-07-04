@@ -2,7 +2,7 @@
 
 #include "CallableArgumentMatcher.h"
 #include "PyCallableShape.h"
-#include "PyProtocolRelations.inc"
+#include "PyProtocols.h"
 #include "PyTypeObject.h"
 
 #include "mlir/Dialect/Async/IR/Async.h"
@@ -755,97 +755,12 @@ protocolDescriptorArguments(mlir::Type type, llvm::StringRef protocolName) {
   if (!type)
     return std::nullopt;
 
-  struct DescriptorRoot {
-    std::string name;
-    llvm::SmallVector<mlir::Type, 3> arguments;
-  };
-
-  auto tupleElementContract = [](TupleType tuple) -> mlir::Type {
-    llvm::ArrayRef<mlir::Type> elements = tuple.getElementTypes();
-    if (elements.empty())
-      return ObjectType::get(tuple.getContext());
-
-    mlir::Type first = elements.front();
-    if (llvm::all_of(elements,
-                     [&](mlir::Type element) { return element == first; }))
-      return first;
-    return UnionType::getNormalized(tuple.getContext(), elements);
-  };
-
-  auto rootFor = [&](mlir::Type source) -> std::optional<DescriptorRoot> {
-    if (auto protocol = mlir::dyn_cast<ProtocolType>(source)) {
-      return DescriptorRoot{
-          protocol.getProtocolName().str(),
-          llvm::SmallVector<mlir::Type, 3>(protocol.getArguments().begin(),
-                                           protocol.getArguments().end())};
-    }
-    if (auto literal = mlir::dyn_cast<LiteralType>(source)) {
-      if (std::optional<llvm::StringRef> contract =
-              literalContractName(literal)) {
-        llvm::StringRef name = *contract;
-        if (name.consume_front("builtins."))
-          return DescriptorRoot{name.str(), {}};
-        if (name.consume_front("types."))
-          return DescriptorRoot{name.str(), {}};
-        return DescriptorRoot{contract->str(), {}};
-      }
-    }
-    if (auto contract = mlir::dyn_cast<ContractType>(source)) {
-      llvm::SmallVector<mlir::Type, 3> arguments(
-          contract.getArguments().begin(), contract.getArguments().end());
-      llvm::StringRef name = contract.getContractName();
-      if (name.consume_front("builtins."))
-        return DescriptorRoot{name.str(), arguments};
-      if (name.consume_front("typing."))
-        return DescriptorRoot{name.str(), arguments};
-      if (name.consume_front("_asyncio."))
-        return DescriptorRoot{name.str(), arguments};
-      if (name.consume_front("ctypes."))
-        return DescriptorRoot{name.str(), arguments};
-      if (name.consume_front("_ctypes."))
-        return DescriptorRoot{name.str(), arguments};
-      return DescriptorRoot{contract.getContractName().str(), arguments};
-    }
-    if (auto list = mlir::dyn_cast<ListType>(source))
-      return DescriptorRoot{"list", {list.getElementType()}};
-    if (auto tuple = mlir::dyn_cast<TupleType>(source))
-      return DescriptorRoot{"tuple", {tupleElementContract(tuple)}};
-    if (auto dict = mlir::dyn_cast<DictType>(source))
-      return DescriptorRoot{"dict", {dict.getKeyType(), dict.getValueType()}};
-    if (mlir::isa<IntType>(source))
-      return DescriptorRoot{"int", {}};
-    if (mlir::isa<BoolType>(source))
-      return DescriptorRoot{"bool", {}};
-    if (mlir::isa<FloatType>(source))
-      return DescriptorRoot{"float", {}};
-    if (mlir::isa<StrType>(source))
-      return DescriptorRoot{"str", {}};
+  std::optional<std::vector<mlir::Type>> args =
+      protocols::Table::get(*type.getContext())
+          .protocolArgumentsFor(type, protocolName);
+  if (!args)
     return std::nullopt;
-  };
-
-  std::optional<DescriptorRoot> root = rootFor(type);
-  if (!root)
-    return std::nullopt;
-
-  auto visit =
-      [&](auto &&self, llvm::StringRef name, llvm::ArrayRef<mlir::Type> args,
-          unsigned depth) -> std::optional<llvm::SmallVector<mlir::Type, 3>> {
-    if (depth > 32)
-      return std::nullopt;
-    if (name == protocolName)
-      return llvm::SmallVector<mlir::Type, 3>(args.begin(), args.end());
-
-    std::optional<llvm::SmallVector<mlir::Type, 3>> result;
-    protocol_relations::forEachDirectBase(
-        name, type.getContext(), args,
-        [&](llvm::StringRef baseName, llvm::ArrayRef<mlir::Type> baseArgs) {
-          if (!result)
-            result = self(self, baseName, baseArgs, depth + 1);
-        });
-    return result;
-  };
-
-  return visit(visit, root->name, root->arguments, 0);
+  return llvm::SmallVector<mlir::Type, 3>(args->begin(), args->end());
 }
 
 mlir::Type unaryProtocolDescriptorPayloadType(mlir::Type type,
@@ -1059,59 +974,24 @@ bool isCallableContractSubtypeOf(CallableType subtypeSig,
 
 bool protocolArgumentMatchesVariance(mlir::Type subtypeArg,
                                      mlir::Type supertypeArg,
-                                     protocol_relations::Variance variance,
+                                     protocols::Variance variance,
                                      SubtypeContext &context) {
-  if (variance == protocol_relations::Variance::Invariant)
+  if (variance == protocols::Variance::Invariant)
     return subtypeArg == supertypeArg;
-  if (variance == protocol_relations::Variance::Contravariant)
+  if (variance == protocols::Variance::Contravariant)
     return isSubtypeOfImpl(supertypeArg, subtypeArg, context);
   return isSubtypeOfImpl(subtypeArg, supertypeArg, context);
 }
 
-void appendProtocolBase(llvm::SmallVectorImpl<ProtocolType> &bases,
-                        mlir::MLIRContext *ctx, llvm::StringRef name,
-                        llvm::ArrayRef<mlir::Type> args) {
-  bases.push_back(ProtocolType::get(ctx, name, args));
-}
-
-llvm::SmallVector<ProtocolType, 3> directProtocolBases(ProtocolType protocol) {
-  mlir::MLIRContext *ctx = protocol.getContext();
-  llvm::ArrayRef<mlir::Type> args = protocol.getArguments();
-  llvm::SmallVector<ProtocolType, 3> bases;
-  protocol_relations::forEachDirectBase(
-      protocol.getProtocolName(), ctx, args,
-      [&](llvm::StringRef name, llvm::ArrayRef<mlir::Type> baseArgs) {
-        appendProtocolBase(bases, ctx, name, baseArgs);
-      });
-  return bases;
-}
-
 bool isProtocolSubtypeOf(ProtocolType subtype, ProtocolType supertype,
-                         SubtypeContext &context, unsigned depth = 0) {
-  if (depth > 16)
-    return false;
-  if (subtype.getProtocolName() == supertype.getProtocolName()) {
-    llvm::ArrayRef<mlir::Type> subtypeArgs = subtype.getArguments();
-    llvm::ArrayRef<mlir::Type> supertypeArgs = supertype.getArguments();
-    if (subtypeArgs.size() != supertypeArgs.size())
-      return false;
-    for (auto indexed :
-         llvm::enumerate(llvm::zip(subtypeArgs, supertypeArgs))) {
-      auto [subArg, superArg] = indexed.value();
-      if (!protocolArgumentMatchesVariance(
-              subArg, superArg,
-              protocol_relations::parameterVariance(subtype.getProtocolName(),
-                                                    indexed.index()),
-              context))
-        return false;
-    }
-    return true;
-  }
-
-  for (ProtocolType base : directProtocolBases(subtype))
-    if (isProtocolSubtypeOf(base, supertype, context, depth + 1))
-      return true;
-  return false;
+                         SubtypeContext &context) {
+  return protocols::Table::get(*subtype.getContext())
+      .isProtocolSubtypeOf(subtype, supertype,
+                           [&](mlir::Type subtypeArg, mlir::Type supertypeArg,
+                               protocols::Variance variance) {
+                             return protocolArgumentMatchesVariance(
+                                 subtypeArg, supertypeArg, variance, context);
+                           });
 }
 
 bool isSubtypeOfImpl(mlir::Type subtype, mlir::Type supertype,

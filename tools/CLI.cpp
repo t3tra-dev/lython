@@ -1,14 +1,5 @@
-#include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
-#include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
-#include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
-#include "mlir/Conversion/ConvertToLLVM/ToLLVMPass.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
-#include "mlir/Conversion/Passes.h"
-#include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
-#include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
-#include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVMPass.h"
-#include "mlir/Conversion/VectorToSCF/VectorToSCF.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Transforms/BufferizableOpInterfaceImpl.h"
@@ -22,13 +13,11 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/MemRef/Transforms/Passes.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
-#include "mlir/Dialect/Vector/Transforms/Passes.h"
 #include "mlir/ExecutionEngine/ExecutionEngine.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -37,14 +26,12 @@
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/Pass.h"
-#include "mlir/Pass/PassManager.h"
 #include "mlir/Support/FileUtilities.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Target/LLVMIR/Dialect/All.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Export.h"
 #include "mlir/Target/LLVMIR/LLVMTranslationInterface.h"
-#include "mlir/Transforms/Passes.h"
 #include "llvm/ExecutionEngine/Orc/CompileUtils.h"
 #include "llvm/ExecutionEngine/Orc/ExecutionUtils.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
@@ -76,7 +63,6 @@
 #include "llvm/Support/FileUtilities.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
-#include "llvm/Support/Process.h"
 #include "llvm/Support/Signals.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/TargetSelect.h"
@@ -89,12 +75,10 @@
 #include "llvm/Transforms/Coroutines/CoroCleanup.h"
 #include "llvm/Transforms/Coroutines/CoroEarly.h"
 
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
-#include <set>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -103,23 +87,14 @@
 #include <sys/sysctl.h>
 #endif
 
-#include <sys/resource.h>
-
-#if defined(__linux__)
-#include <linux/perf_event.h>
-#include <sys/ioctl.h>
-#include <sys/syscall.h>
-#include <unistd.h>
-#endif
-
+#include "Common/Instrumentation.h"
+#include "Common/LoweringPipeline.h"
 #include "Common/RuntimeLibrary.h"
 #include "Common/RuntimeSupport.h"
 #include "Emitter.h"
 #include "Parser.h"
-#include "Passes/Runtime/Cleanup.h"
 #include "Passes/RuntimeLowering/Arch/Arm/PrimitiveTensorArmSME.h"
 #include "Passes/RuntimeLowering/Arch/X86/PrimitiveTensorX86.h"
-#include "embedded.h"
 
 #include "PyDialect.h.inc"
 
@@ -129,30 +104,9 @@
 
 using namespace mlir;
 
-// Forward declare our custom lowering pass factories
-namespace py {
-std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createRuntimeLoweringPass();
-std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createPublicationPreparationPass();
-std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createRefCountInsertionPass();
-std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createRefCountPairElisionPass();
-std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createPyOptimizationPass();
-std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createOwnershipVerifierPass();
-std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createLLVMCallOwnershipVerifierPass();
-std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createLLVMThreadSafetyVerifierPass();
-std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createNativeVerificationPass();
-std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createAsyncThunkLoweringPass();
-} // namespace py
-
 namespace {
+using py::PerfScope;
+
 std::string TargetTriple;
 std::string TargetCPU;
 std::string TargetFPU;
@@ -193,36 +147,6 @@ bool parseConfiguredFloatABI(llvm::FloatABI::ABIType &result) {
                << "'; expected default, soft, softfp, or hard\n";
   return false;
 }
-
-struct IRDumpConfig {
-  bool all = false;
-  std::set<std::string> passes;
-
-  static IRDumpConfig fromEnv() {
-    IRDumpConfig config;
-    auto value = llvm::sys::Process::GetEnv("LYTHON_IR_DUMP");
-    if (!value || value->empty())
-      return config;
-    llvm::SmallVector<llvm::StringRef, 16> tokens;
-    llvm::StringRef(*value).split(tokens, ",", /*MaxSplit=*/-1,
-                                  /*KeepEmpty=*/false);
-    for (llvm::StringRef token : tokens) {
-      std::string name = trimEnvToken(token);
-      if (name.empty())
-        continue;
-      if (name == "all" || name == "*") {
-        config.all = true;
-        continue;
-      }
-      config.passes.insert(std::move(name));
-    }
-    return config;
-  }
-
-  bool shouldDump(llvm::StringRef passName) const {
-    return all || passes.count(passName.str()) != 0;
-  }
-};
 
 std::string hostCPUNameForCodeGen() {
   llvm::StringRef cpu = llvm::sys::getHostCPUName();
@@ -494,39 +418,13 @@ LogicalResult stampTargetPlatformFacts(ModuleOp module,
   return success();
 }
 
-void dumpMLIRForPass(const IRDumpConfig &config, llvm::StringRef passName,
-                     ModuleOp module) {
-  if (!config.shouldDump(passName))
-    return;
-  llvm::errs() << "\n=== [LYTHON_IR_DUMP:" << passName << " MLIR] ===\n";
-  module->print(llvm::errs());
-  llvm::errs() << "\n";
-}
-
-void dumpLLVMForPass(const IRDumpConfig &config, llvm::StringRef passName,
+void dumpLLVMForPass(const py::IRDumpConfig &config, llvm::StringRef passName,
                      llvm::Module &module) {
   if (!config.shouldDump(passName))
     return;
   llvm::errs() << "\n=== [LYTHON_IR_DUMP:" << passName << " LLVM] ===\n";
   module.print(llvm::errs(), nullptr);
   llvm::errs() << "\n";
-}
-
-bool perfEnabled() {
-  static const bool enabled = [] {
-    auto value = llvm::sys::Process::GetEnv("LYTHON_PERF");
-    if (!value)
-      return false;
-    llvm::StringRef text(*value);
-    return text == "1" || text.equals_insensitive("true") ||
-           text.equals_insensitive("yes") || text.equals_insensitive("on");
-  }();
-  return enabled;
-}
-
-std::uint64_t timevalMicros(const timeval &value) {
-  return static_cast<std::uint64_t>(value.tv_sec) * 1000000ULL +
-         static_cast<std::uint64_t>(value.tv_usec);
 }
 
 void *armStreamingCompatibleMemcpy(void *dest, const void *src,
@@ -570,364 +468,6 @@ void *armStreamingCompatibleMemchr(void *ptr, int value, std::size_t count) {
       return bytes + index;
   }
   return nullptr;
-}
-
-#if defined(__linux__)
-long perfEventOpen(perf_event_attr *attr, pid_t pid, int cpu, int groupFd,
-                   unsigned long flags) {
-  return syscall(__NR_perf_event_open, attr, pid, cpu, groupFd, flags);
-}
-
-class HardwareCounter {
-public:
-  explicit HardwareCounter(std::uint64_t config) {
-    perf_event_attr attr = {};
-    attr.type = PERF_TYPE_HARDWARE;
-    attr.size = sizeof(attr);
-    attr.config = config;
-    attr.disabled = 1;
-    attr.exclude_kernel = 0;
-    attr.exclude_hv = 1;
-    fd = static_cast<int>(perfEventOpen(&attr, /*pid=*/0, /*cpu=*/-1,
-                                        /*groupFd=*/-1, /*flags=*/0));
-  }
-
-  ~HardwareCounter() {
-    if (fd >= 0)
-      close(fd);
-  }
-
-  void start() {
-    if (fd < 0)
-      return;
-    ioctl(fd, PERF_EVENT_IOC_RESET, 0);
-    ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
-  }
-
-  std::optional<std::uint64_t> stop() {
-    if (fd < 0)
-      return std::nullopt;
-    ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
-    std::uint64_t value = 0;
-    if (read(fd, &value, sizeof(value)) != static_cast<ssize_t>(sizeof(value)))
-      return std::nullopt;
-    return value;
-  }
-
-private:
-  int fd = -1;
-};
-#endif
-
-class PerfScope {
-public:
-  explicit PerfScope(llvm::StringRef phase) : phase(phase.str()) {
-    if (!perfEnabled())
-      return;
-    enabled = true;
-    wallStart = Clock::now();
-    getrusage(RUSAGE_SELF, &usageStart);
-#if defined(__linux__)
-    instructions.emplace(PERF_COUNT_HW_INSTRUCTIONS);
-    cycles.emplace(PERF_COUNT_HW_CPU_CYCLES);
-    instructions->start();
-    cycles->start();
-#endif
-  }
-
-  ~PerfScope() {
-    if (!enabled)
-      return;
-#if defined(__linux__)
-    std::optional<std::uint64_t> instructionCount = instructions->stop();
-    std::optional<std::uint64_t> cycleCount = cycles->stop();
-#else
-    std::optional<std::uint64_t> instructionCount;
-    std::optional<std::uint64_t> cycleCount;
-#endif
-    rusage usageEnd = {};
-    getrusage(RUSAGE_SELF, &usageEnd);
-    auto wallEnd = Clock::now();
-    auto wallUs = std::chrono::duration_cast<std::chrono::microseconds>(
-                      wallEnd - wallStart)
-                      .count();
-    std::uint64_t userUs =
-        timevalMicros(usageEnd.ru_utime) - timevalMicros(usageStart.ru_utime);
-    std::uint64_t sysUs =
-        timevalMicros(usageEnd.ru_stime) - timevalMicros(usageStart.ru_stime);
-
-    llvm::errs()
-        << "[LYTHON_PERF] phase=" << phase << " wall_us=" << wallUs
-        << " user_us=" << userUs << " sys_us=" << sysUs
-        << " minor_faults=" << (usageEnd.ru_minflt - usageStart.ru_minflt)
-        << " major_faults=" << (usageEnd.ru_majflt - usageStart.ru_majflt)
-        << " voluntary_csw=" << (usageEnd.ru_nvcsw - usageStart.ru_nvcsw)
-        << " involuntary_csw=" << (usageEnd.ru_nivcsw - usageStart.ru_nivcsw)
-        << " maxrss=" << usageEnd.ru_maxrss;
-    if (instructionCount)
-      llvm::errs() << " instructions=" << *instructionCount;
-    else
-      llvm::errs() << " instructions=unavailable";
-    if (cycleCount)
-      llvm::errs() << " cycles=" << *cycleCount;
-    else
-      llvm::errs() << " cycles=unavailable";
-    llvm::errs() << "\n";
-  }
-
-private:
-  using Clock = std::chrono::steady_clock;
-
-  std::string phase;
-  bool enabled = false;
-  Clock::time_point wallStart;
-  rusage usageStart = {};
-#if defined(__linux__)
-  std::optional<HardwareCounter> instructions;
-  std::optional<HardwareCounter> cycles;
-#endif
-};
-
-template <typename Populate>
-LogicalResult runLoweringPhase(llvm::StringRef name, MLIRContext &context,
-                               ModuleOp module, Populate populate) {
-  std::string phase = ("lowering." + name).str();
-  PerfScope perf(phase);
-  PassManager pm(&context);
-  populate(pm);
-  return pm.run(module);
-}
-
-LogicalResult requireNoAsyncDialectOps(ModuleOp module) {
-  LogicalResult result = success();
-  module.walk([&](Operation *op) {
-    if (op->getName().getDialectNamespace() != "async")
-      return WalkResult::advance();
-    op->emitError()
-        << "unlowered async dialect operation remains after Lython async "
-           "runtime lowering; MLIR bundled async runtime is not part of the "
-           "runtime model";
-    result = failure();
-    return WalkResult::interrupt();
-  });
-  return result;
-}
-
-LogicalResult runPipeline(ModuleOp module, MLIRContext &context,
-                          const IRDumpConfig &irDump,
-                          py::TensorLoweringTarget tensorTarget) {
-  dumpMLIRForPass(irDump, "frontend", module);
-
-  // Phase 1: Native verification
-  if (failed(runLoweringPhase("native-verification", context, module,
-                              [&](PassManager &pm) {
-                                pm.addPass(py::createNativeVerificationPass());
-                              })))
-    return failure();
-  dumpMLIRForPass(irDump, "native-verification", module);
-
-  // Phase 2: Publication preparation
-  if (failed(runLoweringPhase(
-          "publication-preparation", context, module, [&](PassManager &pm) {
-            pm.addPass(py::createPublicationPreparationPass());
-          })))
-    return failure();
-  dumpMLIRForPass(irDump, "publication-preparation", module);
-
-  // Phase 3.15: High-level Py semantic optimizations. This must run before
-  // runtime MLIR embedding so the imported runtime roots match the optimized
-  // py dialect, and before OwnershipVerifierPass so all ownership rewrites are
-  // still checked by the quantitative kernel.
-  if (failed(runLoweringPhase("py-optimization", context, module,
-                              [&](PassManager &pm) {
-                                pm.addPass(py::createPyOptimizationPass());
-                              })))
-    return failure();
-  dumpMLIRForPass(irDump, "py-optimization", module);
-
-  // Phase 3.2: Quantitative ownership verification
-  if (failed(runLoweringPhase("ownership-verifier", context, module,
-                              [&](PassManager &pm) {
-                                pm.addPass(py::createOwnershipVerifierPass());
-                              })))
-    return failure();
-  dumpMLIRForPass(irDump, "ownership-verifier", module);
-
-  // Phase 4: Early canonicalization and CSE
-  if (failed(runLoweringPhase("canonicalize", context, module,
-                              [&](PassManager &pm) {
-                                pm.addPass(mlir::createCanonicalizerPass());
-                                pm.addPass(mlir::createCSEPass());
-                              })))
-    return failure();
-  dumpMLIRForPass(irDump, "canonicalize", module);
-
-  // Phase 4.1: Lower primitive tensor/linalg computations while the high-level
-  // contraction structure is still visible.  This keeps Python object lowering
-  // separate from numeric kernels and gives affine/vector passes an alias-free
-  // memref view of primitive tensors.
-  if (failed(runLoweringPhase(
-          "linalg-lowering", context, module, [&](PassManager &pm) {
-            pm.addPass(py::createLinalgLoweringPass(tensorTarget));
-          })))
-    return failure();
-  dumpMLIRForPass(irDump, "linalg-lowering", module);
-
-  // Phase 4.5: Import runtime object definitions written in MLIR. These
-  // fragments are kept at func/memref level and flow through the same lowering
-  // pipeline as user code.
-  {
-    PerfScope perf("lowering.runtime-objects");
-    if (failed(py::runtime_library::embedObjectModules(module)))
-      return failure();
-  }
-  dumpMLIRForPass(irDump, "runtime-objects", module);
-
-  // Phase 5: Runtime lowering (Py dialect -> func/LLVM)
-  if (failed(runLoweringPhase("runtime-lowering", context, module,
-                              [&](PassManager &pm) {
-                                pm.addPass(py::createRuntimeLoweringPass());
-                              })))
-    return failure();
-  dumpMLIRForPass(irDump, "runtime-lowering", module);
-
-  // Phase 5.05: Manifest-driven ownership release insertion. This runs after
-  // runtime lowering because only then do user operations expose concrete
-  // runtime calls and runtime-library deallocator ABI shapes.
-  if (failed(runLoweringPhase("refcount-insertion", context, module,
-                              [&](PassManager &pm) {
-                                pm.addPass(py::createRefCountInsertionPass());
-                              })))
-    return failure();
-  dumpMLIRForPass(irDump, "refcount-insertion", module);
-
-  // Phase 5.06: Proven refcount pair elision.
-  if (failed(runLoweringPhase("refcount-elision", context, module,
-                              [&](PassManager &pm) {
-                                pm.addPass(py::createRefCountPairElisionPass());
-                              })))
-    return failure();
-  dumpMLIRForPass(irDump, "refcount-elision", module);
-
-  // Phase 5.1: Lower Lython-owned Python await thunks from the MLIR async
-  // dialect to the Lython runtime ABI before symbol cleanup can erase the
-  // statically selected coroutine body.
-  if (failed(runLoweringPhase("async-thunk-lowering", context, module,
-                              [&](PassManager &pm) {
-                                pm.addPass(py::createAsyncThunkLoweringPass());
-                                pm.addPass(mlir::createCanonicalizerPass());
-                                pm.addPass(mlir::createCSEPass());
-                              })))
-    return failure();
-  dumpMLIRForPass(irDump, "async-thunk-lowering", module);
-  if (failed(requireNoAsyncDialectOps(module)))
-    return failure();
-
-  // Phase 5.5: Let generic MLIR cleanup remove artifacts created by lowering
-  // and runtime embedding.
-  if (failed(runLoweringPhase("post-lowering-cleanup", context, module,
-                              [&](PassManager &pm) {
-                                pm.addPass(mlir::createCanonicalizerPass());
-                                pm.addPass(mlir::createCSEPass());
-                                pm.addPass(mlir::createSymbolDCEPass());
-                              })))
-    return failure();
-  {
-    PerfScope perf("lowering.pointer-roundtrip-cleanup");
-    while (py::lowering::runtime::cleanup::pointerRoundTrips(module))
-      ;
-  }
-  dumpMLIRForPass(irDump, "post-lowering-cleanup", module);
-
-  // Phase 5.6: Validate that post-lowering cleanup did not alter ownership of
-  // runtime calls that return or consume owned object-family descriptors.
-  if (failed(runLoweringPhase(
-          "llvm-call-verifier", context, module, [&](PassManager &pm) {
-            pm.addPass(py::createLLVMCallOwnershipVerifierPass());
-          })))
-    return failure();
-  dumpMLIRForPass(irDump, "llvm-call-verifier", module);
-
-  // Phase 5.7: Validate memref-level no-GIL contracts before final lowering.
-  if (failed(runLoweringPhase(
-          "thread-safety-verifier", context, module, [&](PassManager &pm) {
-            pm.addPass(py::createLLVMThreadSafetyVerifierPass());
-          })))
-    return failure();
-  dumpMLIRForPass(irDump, "thread-safety-verifier", module);
-
-  // Phase 7: Final lowering to LLVM
-  {
-    py::LoweredSafetyContracts finalSafetyContracts;
-    {
-      PerfScope perf("lowering.collect-final-safety-contracts");
-      py::collectLoweredSafetyContracts(module, finalSafetyContracts);
-    }
-    if (failed(runLoweringPhase(
-            "convert-to-llvm", context, module, [&](PassManager &pm) {
-              mlir::ConvertVectorToLLVMPassOptions vectorOptions;
-              vectorOptions.reassociateFPReductions = true;
-              vectorOptions.x86Vector = tensorTarget.usesX86();
-              mlir::VectorTransferToSCFOptions transferOptions;
-              transferOptions.setTargetRank(1);
-              pm.addPass(mlir::createLowerAffinePass());
-              pm.addPass(mlir::memref::createExpandStridedMetadataPass());
-              pm.addPass(mlir::createLowerAffinePass());
-              if (tensorTarget.usesArmSME())
-                py::runtime_lowering::arch::arm::
-                    addSMEPreControlFlowLLVMPrepPipeline(pm);
-              pm.addNestedPass<mlir::func::FuncOp>(
-                  mlir::vector::createLowerVectorMultiReductionPass(
-                      mlir::vector::VectorMultiReductionLowering::
-                          InnerReduction));
-              pm.addPass(mlir::createConvertVectorToSCFPass(transferOptions));
-              pm.addPass(mlir::createLowerAffinePass());
-              pm.addPass(mlir::createCanonicalizerPass());
-              pm.addPass(mlir::createConvertVectorToLLVMPass(vectorOptions));
-              pm.addPass(mlir::createConvertSCFToCFPass());
-              if (tensorTarget.usesArmSME())
-                py::runtime_lowering::arch::arm::
-                    addSMEPostControlFlowLLVMPrepPipeline(pm);
-              pm.addPass(mlir::createArithToLLVMConversionPass());
-              pm.addPass(mlir::createConvertControlFlowToLLVMPass());
-              pm.addPass(mlir::createConvertToLLVMPass());
-              pm.addPass(mlir::createReconcileUnrealizedCastsPass());
-              pm.addNestedPass<mlir::func::FuncOp>(
-                  mlir::createReconcileUnrealizedCastsPass());
-              pm.addPass(mlir::createCanonicalizerPass());
-            })))
-      return failure();
-    {
-      PerfScope perf("lowering.preserve-final-safety-contracts");
-      if (failed(
-              py::preserveLoweredSafetyContracts(module, finalSafetyContracts)))
-        return failure();
-    }
-    {
-      PerfScope perf("lowering.final-llvm-cleanup");
-      py::optimizer::pipeline::finalLLVMCleanup(module);
-    }
-  }
-  dumpMLIRForPass(irDump, "convert-to-llvm", module);
-
-  // Phase 7.4: Re-check ownership after final conversion rewrites.
-  if (failed(runLoweringPhase(
-          "final-ownership-verifier", context, module, [&](PassManager &pm) {
-            pm.addPass(py::createLLVMCallOwnershipVerifierPass());
-          })))
-    return failure();
-  dumpMLIRForPass(irDump, "final-ownership-verifier", module);
-
-  // Phase 7.5: Validate final LLVM atomic orderings after MemRefToLLVM.
-  if (failed(runLoweringPhase("final-thread-safety-verifier", context, module,
-                              [&](PassManager &pm) {
-                                pm.addPass(
-                                    py::createLLVMThreadSafetyVerifierPass());
-                              })))
-    return failure();
-  dumpMLIRForPass(irDump, "final-thread-safety-verifier", module);
-
-  return success();
 }
 
 llvm::orc::SymbolMap
@@ -1465,143 +1005,6 @@ void sealRuntimeSafetyMetadata(llvm::Module &llvmModule) {
           inst.setMetadata(kLythonSafetyMetadataName, sealed);
 }
 
-LogicalResult linkPrelinkedRuntime(llvm::Module &llvmModule) {
-  std::optional<std::string> path =
-      py::runtime_library::prelinkedRuntimeIRPath();
-  if (!path)
-    return success();
-  llvm::SMDiagnostic diagnostic;
-  std::unique_ptr<llvm::Module> runtime =
-      llvm::parseIRFile(*path, diagnostic, llvmModule.getContext());
-  if (!runtime) {
-    llvm::errs() << "error: failed to load pre-lowered runtime IR from '"
-                 << *path << "': " << diagnostic.getMessage() << "\n";
-    return failure();
-  }
-  runtime->setDataLayout(llvmModule.getDataLayout());
-  runtime->setTargetTriple(llvmModule.getTargetTriple());
-  if (llvm::Linker::linkModules(llvmModule, std::move(runtime),
-                                llvm::Linker::Flags::LinkOnlyNeeded)) {
-    llvm::errs() << "error: failed to link pre-lowered runtime IR\n";
-    return failure();
-  }
-  return success();
-}
-
-bool isPlatformNativeSupport(llvm::StringRef name) {
-  return name == "support_darwin" || name == "support_linux" ||
-         name == "support_windows";
-}
-
-bool shouldLinkEmbeddedLLVMRuntimeModule(llvm::StringRef name,
-                                         const llvm::Triple &targetTriple) {
-  if (name == "support_darwin")
-    return targetTriple.isOSDarwin();
-  if (name == "support_linux")
-    return targetTriple.isOSLinux();
-  if (name == "support_windows")
-    return targetTriple.isOSWindows();
-  return true;
-}
-
-void registerNativeRuntimeDialects(mlir::DialectRegistry &registry) {
-  registry.insert<mlir::arith::ArithDialect, mlir::cf::ControlFlowDialect,
-                  mlir::func::FuncDialect, mlir::LLVM::LLVMDialect,
-                  mlir::memref::MemRefDialect, mlir::scf::SCFDialect>();
-  mlir::registerConvertFuncToLLVMInterface(registry);
-  mlir::registerConvertMemRefToLLVMInterface(registry);
-  mlir::registerAllToLLVMIRTranslations(registry);
-}
-
-OwningOpRef<ModuleOp> parseEmbeddedNativeRuntimeModule(
-    const py::runtime_library::embedded::Module &entry, MLIRContext &context) {
-  llvm::SourceMgr sourceMgr;
-  sourceMgr.AddNewSourceBuffer(
-      llvm::MemoryBuffer::getMemBuffer(
-          llvm::StringRef(reinterpret_cast<const char *>(entry.data),
-                          entry.size),
-          entry.name, /*RequiresNullTerminator=*/false),
-      llvm::SMLoc());
-  return parseSourceFile<ModuleOp>(sourceMgr, &context);
-}
-
-LogicalResult lowerNativeRuntimeModule(ModuleOp module) {
-  PassManager pm(module.getContext());
-  pm.addPass(mlir::createCanonicalizerPass());
-  pm.addPass(mlir::createCSEPass());
-  pm.addPass(mlir::createConvertFuncToLLVMPass());
-  pm.addPass(mlir::createConvertSCFToCFPass());
-  pm.addPass(mlir::memref::createExpandStridedMetadataPass());
-  pm.addPass(mlir::createFinalizeMemRefToLLVMConversionPass());
-  pm.addPass(mlir::createArithToLLVMConversionPass());
-  pm.addPass(mlir::createConvertControlFlowToLLVMPass());
-  pm.addPass(mlir::createReconcileUnrealizedCastsPass());
-  pm.addPass(mlir::createCanonicalizerPass());
-  pm.addPass(mlir::createCSEPass());
-  return pm.run(module);
-}
-
-LogicalResult linkEmbeddedNativeRuntime(llvm::Module &llvmModule) {
-  namespace embedded = py::runtime_library::embedded;
-  llvm::Triple targetTriple(llvmModule.getTargetTriple());
-  bool sawPlatformNativeSupport = false;
-  bool linkedPlatformNativeSupport = false;
-  DialectRegistry registry;
-  registerNativeRuntimeDialects(registry);
-  MLIRContext context(registry);
-  context.loadAllAvailableDialects();
-
-  for (std::size_t index = 0; index < embedded::moduleCount(); ++index) {
-    const embedded::Module &entry = embedded::modules()[index];
-    if (entry.kind != embedded::ModuleKind::NativeMLIRBytecode)
-      continue;
-    llvm::StringRef name(entry.name);
-    if (isPlatformNativeSupport(name))
-      sawPlatformNativeSupport = true;
-    if (!shouldLinkEmbeddedLLVMRuntimeModule(name, targetTriple))
-      continue;
-    if (isPlatformNativeSupport(name))
-      linkedPlatformNativeSupport = true;
-
-    OwningOpRef<ModuleOp> nativeModule =
-        parseEmbeddedNativeRuntimeModule(entry, context);
-    if (!nativeModule) {
-      llvm::errs() << "error: failed to parse embedded native runtime MLIR "
-                      "bytecode module '"
-                   << entry.name << "'\n";
-      return failure();
-    }
-    if (failed(lowerNativeRuntimeModule(*nativeModule))) {
-      llvm::errs() << "error: failed to lower embedded native runtime MLIR "
-                      "module '"
-                   << entry.name << "'\n";
-      return failure();
-    }
-    std::unique_ptr<llvm::Module> runtime =
-        mlir::translateModuleToLLVMIR(*nativeModule, llvmModule.getContext());
-    if (!runtime) {
-      llvm::errs() << "error: failed to translate embedded native runtime MLIR "
-                      "module '"
-                   << entry.name << "' to LLVM IR\n";
-      return failure();
-    }
-    runtime->setDataLayout(llvmModule.getDataLayout());
-    runtime->setTargetTriple(llvmModule.getTargetTriple());
-    if (llvm::Linker::linkModules(llvmModule, std::move(runtime))) {
-      llvm::errs() << "error: failed to link embedded native runtime module '"
-                   << entry.name << "'\n";
-      return failure();
-    }
-  }
-  if (sawPlatformNativeSupport && !linkedPlatformNativeSupport) {
-    llvm::errs() << "error: no embedded native runtime support for target OS '"
-                 << targetTriple.getOSName() << "' in target triple '"
-                 << targetTriple.str() << "'\n";
-    return failure();
-  }
-  return success();
-}
-
 class PySafetyLLVMIRTranslationInterface final
     : public LLVMTranslationDialectInterface {
 public:
@@ -2094,7 +1497,7 @@ LogicalResult buildExecutable(llvm::Module &llvmModule,
   return success();
 }
 
-LogicalResult runJIT(ModuleOp module, const IRDumpConfig &irDump,
+LogicalResult runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
                      py::TensorLoweringTarget tensorTarget) {
   llvm::Triple processTriple(llvm::sys::getDefaultTargetTriple());
   if (tensorTarget.usesX86() &&
@@ -2235,9 +1638,9 @@ LogicalResult runJIT(ModuleOp module, const IRDumpConfig &irDump,
 
     llvmModule->setDataLayout(jit->getDataLayout());
     llvmModule->setTargetTriple(jit->getTargetTriple().getTriple());
-    if (failed(linkPrelinkedRuntime(*llvmModule)))
+    if (failed(py::runtime_library::linkPrelinkedRuntime(*llvmModule)))
       return failure();
-    if (failed(linkEmbeddedNativeRuntime(*llvmModule)))
+    if (failed(py::runtime_library::linkEmbeddedNativeRuntime(*llvmModule)))
       return failure();
     runLLVMCoroLowering(*llvmModule, optimizationTargetMachine.get());
     dumpLLVMForPass(irDump, "llvm-translation", *llvmModule);
@@ -2386,7 +1789,7 @@ int main(int argc, char **argv) {
                             IncludePathOptions.end());
   LibrarySearchPaths.assign(LibraryPathOptions.begin(),
                             LibraryPathOptions.end());
-  IRDumpConfig irDump = IRDumpConfig::fromEnv();
+  py::IRDumpConfig irDump = py::IRDumpConfig::fromEnv();
 
   const bool jitMode = static_cast<bool>(JitCommand);
   const bool parseMode = static_cast<bool>(ParseCommand);
@@ -2476,7 +1879,7 @@ int main(int argc, char **argv) {
 
   {
     PerfScope perf("lowering");
-    if (failed(runPipeline(*module, context, irDump, tensorTarget))) {
+    if (failed(py::runLoweringPipeline(*module, tensorTarget, irDump))) {
       llvm::errs() << "Failed to run lowering pipeline\n";
       return 1;
     }
@@ -2516,9 +1919,9 @@ int main(int argc, char **argv) {
   if (py::runtime_library::prelowerGenerationMode()) {
     sealRuntimeSafetyMetadata(*llvmModule);
   } else {
-    if (failed(linkPrelinkedRuntime(*llvmModule)))
+    if (failed(py::runtime_library::linkPrelinkedRuntime(*llvmModule)))
       return 1;
-    if (failed(linkEmbeddedNativeRuntime(*llvmModule)))
+    if (failed(py::runtime_library::linkEmbeddedNativeRuntime(*llvmModule)))
       return 1;
   }
   rewriteExceptionPersonalityForTarget(*llvmModule);
