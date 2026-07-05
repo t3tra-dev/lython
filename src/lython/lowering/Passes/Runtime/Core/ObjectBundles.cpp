@@ -1,6 +1,6 @@
 #include "Runtime/Core/Lowerer.h"
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 
 mlir::LogicalResult RuntimeBundleLowerer::validateObjectShape(
     mlir::Operation *op, mlir::Type contract, mlir::ValueRange values) const {
@@ -26,10 +26,19 @@ mlir::LogicalResult RuntimeBundleLowerer::validateObjectShape(
 mlir::LogicalResult
 RuntimeBundleLowerer::makeObjectBundle(mlir::Operation *op, mlir::Type contract,
                                        mlir::ValueRange values,
-                                       RuntimeBundle &bundle) const {
+                                       RuntimeBundle &bundle,
+                                       bool ownsObject) const {
+  return RuntimeBundleLowerer::makeObjectBundleWithOwnership(
+      op, contract, values, bundle,
+      ownership::logicalOwnershipKind(contract, ownsObject));
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::makeObjectBundleWithOwnership(
+    mlir::Operation *op, mlir::Type contract, mlir::ValueRange values,
+    RuntimeBundle &bundle, ownership::OwnershipKind ownership) const {
   if (mlir::failed(validateObjectShape(op, contract, values)))
     return mlir::failure();
-  bundle = RuntimeBundle::object(contract, values);
+  bundle = RuntimeBundle::objectWithOwnership(contract, values, ownership);
   return mlir::success();
 }
 
@@ -95,6 +104,14 @@ bool RuntimeBundleLowerer::allSourcesHavePrimitiveI64Evidence(
 mlir::FailureOr<RuntimeValue>
 RuntimeBundleLowerer::materializePrimitiveI64Object(
     mlir::Operation *op, const RuntimeBundle &bundle) {
+  builder.setInsertionPoint(op);
+  return RuntimeBundleLowerer::materializePrimitiveI64ObjectAtCurrentInsertion(
+      op, bundle);
+}
+
+mlir::FailureOr<RuntimeValue>
+RuntimeBundleLowerer::materializePrimitiveI64ObjectAtCurrentInsertion(
+    mlir::Operation *op, const RuntimeBundle &bundle) {
   if (!RuntimeBundleLowerer::canMaterializePrimitiveI64Object(bundle))
     return op->emitError()
            << "bundle has no materializable primitive i64 object";
@@ -104,7 +121,48 @@ RuntimeBundleLowerer::materializePrimitiveI64Object(
     return op->emitError() << "runtime manifest has no builtins.int.__new__";
   mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
       op->getLoc(), *initializer, mlir::ValueRange{bundle.primitiveI64->value});
-  return RuntimeValue::object(bundle.objectValue.contract, call.getResults());
+  mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> objectTypes =
+      RuntimeBundleLowerer::runtimeValueTypesFor(
+          op, bundle.objectValue.contract, "materialized primitive i64 object");
+  if (mlir::failed(objectTypes))
+    return mlir::failure();
+  if (call.getNumResults() < objectTypes->size())
+    return op->emitError()
+           << "builtins.int.__new__ returned too few object ABI values";
+  llvm::SmallVector<mlir::Value, 4> objectValues;
+  objectValues.reserve(objectTypes->size());
+  for (unsigned index = 0, end = static_cast<unsigned>(objectTypes->size());
+       index < end; ++index)
+    objectValues.push_back(call.getResult(index));
+  return RuntimeValue::object(bundle.objectValue.contract, objectValues);
+}
+
+mlir::FailureOr<RuntimeBundle>
+RuntimeBundleLowerer::materializeObjectBundleForStorage(
+    mlir::Operation *op, const RuntimeBundle &bundle, mlir::Type storageContract,
+    llvm::StringRef purpose) {
+  if (bundle.kind != RuntimeBundle::Kind::Object)
+    return op->emitError() << purpose << " requires an object bundle";
+
+  RuntimeBundle result = bundle;
+  if (RuntimeBundleLowerer::hasLazyPrimitiveI64Object(result)) {
+    mlir::FailureOr<RuntimeValue> materialized =
+        RuntimeBundleLowerer::materializePrimitiveI64Object(op, result);
+    if (mlir::failed(materialized))
+      return mlir::failure();
+    result.objectValue = *materialized;
+  }
+
+  mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> expectedTypes =
+      RuntimeBundleLowerer::runtimeValueTypesFor(op, storageContract, purpose);
+  if (mlir::failed(expectedTypes))
+    return mlir::failure();
+  if (expectedTypes->size() != result.physicalValues().size())
+    return op->emitError() << purpose << " has "
+                           << result.physicalValues().size()
+                           << " values, but storage expects "
+                           << expectedTypes->size();
+  return result;
 }
 
 bool RuntimeBundleLowerer::objectShapeMatches(llvm::StringRef contract,
@@ -292,4 +350,4 @@ RuntimeBundleLowerer::requireMethodTarget(mlir::Operation *op,
                          << " has no manifest method target";
 }
 
-} // namespace py::runtime_lowering
+} // namespace py::lowering

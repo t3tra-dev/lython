@@ -83,53 +83,6 @@ struct TypeListStorage : public mlir::TypeStorage {
   mlir::ArrayRef<mlir::Type> types;
 };
 
-struct DictTypeStorage : public mlir::TypeStorage {
-  using KeyTy = std::pair<mlir::Type, mlir::Type>;
-
-  DictTypeStorage(mlir::Type key, mlir::Type value)
-      : keyType(key), valueType(value) {}
-
-  bool operator==(const KeyTy &key) const {
-    return key.first == keyType && key.second == valueType;
-  }
-
-  static DictTypeStorage *construct(mlir::TypeStorageAllocator &allocator,
-                                    const KeyTy &key);
-
-  mlir::Type keyType;
-  mlir::Type valueType;
-};
-
-struct ListTypeStorage : public mlir::TypeStorage {
-  using KeyTy = mlir::Type;
-
-  explicit ListTypeStorage(mlir::Type element) : elementType(element) {}
-
-  bool operator==(const KeyTy &key) const { return key == elementType; }
-
-  static ListTypeStorage *construct(mlir::TypeStorageAllocator &allocator,
-                                    const KeyTy &key);
-
-  mlir::Type elementType;
-};
-
-struct IteratorStateTypeStorage : public mlir::TypeStorage {
-  using KeyTy = std::pair<mlir::Type, mlir::Type>;
-
-  IteratorStateTypeStorage(mlir::Type source, mlir::Type element)
-      : sourceType(source), elementType(element) {}
-
-  bool operator==(const KeyTy &key) const {
-    return key.first == sourceType && key.second == elementType;
-  }
-
-  static IteratorStateTypeStorage *
-  construct(mlir::TypeStorageAllocator &allocator, const KeyTy &key);
-
-  mlir::Type sourceType;
-  mlir::Type elementType;
-};
-
 struct ClassTypeStorage : public mlir::TypeStorage {
   using KeyTy = ::llvm::StringRef;
 
@@ -230,123 +183,6 @@ struct ProtocolTypeStorage : public mlir::TypeStorage {
 };
 
 } // namespace detail
-
-class IntType : public mlir::Type::TypeBase<IntType, mlir::Type,
-                                            detail::SimpleTypeStorage> {
-public:
-  using Base::Base;
-  static constexpr ::llvm::StringLiteral name{"py.int"};
-
-  static IntType get(mlir::MLIRContext *ctx);
-  static bool kindof(unsigned kind) {
-    return kind == static_cast<unsigned>(TypeKind::Int);
-  }
-};
-
-class FloatType : public mlir::Type::TypeBase<FloatType, mlir::Type,
-                                              detail::SimpleTypeStorage> {
-public:
-  using Base::Base;
-  static constexpr ::llvm::StringLiteral name{"py.float"};
-
-  static FloatType get(mlir::MLIRContext *ctx);
-  static bool kindof(unsigned kind) {
-    return kind == static_cast<unsigned>(TypeKind::Float);
-  }
-};
-
-class BoolType : public mlir::Type::TypeBase<BoolType, mlir::Type,
-                                             detail::SimpleTypeStorage> {
-public:
-  using Base::Base;
-  static constexpr ::llvm::StringLiteral name{"py.bool"};
-
-  static BoolType get(mlir::MLIRContext *ctx);
-  static bool kindof(unsigned kind) {
-    return kind == static_cast<unsigned>(TypeKind::Bool);
-  }
-};
-
-class StrType : public mlir::Type::TypeBase<StrType, mlir::Type,
-                                            detail::SimpleTypeStorage> {
-public:
-  using Base::Base;
-  static constexpr ::llvm::StringLiteral name{"py.str"};
-
-  static StrType get(mlir::MLIRContext *ctx);
-  static bool kindof(unsigned kind) {
-    return kind == static_cast<unsigned>(TypeKind::Str);
-  }
-};
-
-class NoneType : public mlir::Type::TypeBase<NoneType, mlir::Type,
-                                             detail::SimpleTypeStorage> {
-public:
-  using Base::Base;
-  static constexpr ::llvm::StringLiteral name{"py.none"};
-
-  static NoneType get(mlir::MLIRContext *ctx);
-  static bool kindof(unsigned kind) {
-    return kind == static_cast<unsigned>(TypeKind::None);
-  }
-};
-
-class ObjectType : public mlir::Type::TypeBase<ObjectType, mlir::Type,
-                                               detail::SimpleTypeStorage> {
-public:
-  using Base::Base;
-  static constexpr ::llvm::StringLiteral name{"py.object"};
-
-  static ObjectType get(mlir::MLIRContext *ctx);
-  static bool kindof(unsigned kind) {
-    return kind == static_cast<unsigned>(TypeKind::Object);
-  }
-};
-
-class TupleType : public mlir::Type::TypeBase<TupleType, mlir::Type,
-                                              detail::TypeListStorage> {
-public:
-  using Base::Base;
-  static constexpr ::llvm::StringLiteral name{"py.tuple"};
-
-  static TupleType get(mlir::MLIRContext *ctx,
-                       mlir::ArrayRef<mlir::Type> elementTypes);
-  static bool kindof(unsigned kind) {
-    return kind == static_cast<unsigned>(TypeKind::Tuple);
-  }
-
-  mlir::ArrayRef<mlir::Type> getElementTypes() const;
-};
-
-class DictType : public mlir::Type::TypeBase<DictType, mlir::Type,
-                                             detail::DictTypeStorage> {
-public:
-  using Base::Base;
-  static constexpr ::llvm::StringLiteral name{"py.dict"};
-
-  static DictType get(mlir::MLIRContext *ctx, mlir::Type keyType,
-                      mlir::Type valueType);
-  static bool kindof(unsigned kind) {
-    return kind == static_cast<unsigned>(TypeKind::Dict);
-  }
-
-  mlir::Type getKeyType() const;
-  mlir::Type getValueType() const;
-};
-
-class ClassType : public mlir::Type::TypeBase<ClassType, mlir::Type,
-                                              detail::ClassTypeStorage> {
-public:
-  using Base::Base;
-  static constexpr ::llvm::StringLiteral name{"py.class"};
-
-  static ClassType get(mlir::MLIRContext *ctx, ::llvm::StringRef className);
-  static bool kindof(unsigned kind) {
-    return kind == static_cast<unsigned>(TypeKind::Class);
-  }
-
-  ::llvm::StringRef getClassName() const;
-};
 
 class ContractType : public mlir::Type::TypeBase<ContractType, mlir::Type,
                                                  detail::ProtocolTypeStorage> {
@@ -476,37 +312,6 @@ public:
   }
 
   mlir::Type getPackedType() const;
-};
-
-class ListType : public mlir::Type::TypeBase<ListType, mlir::Type,
-                                             detail::ListTypeStorage> {
-public:
-  using Base::Base;
-  static constexpr ::llvm::StringLiteral name{"py.list"};
-
-  static ListType get(mlir::MLIRContext *ctx, mlir::Type elementType);
-  static bool kindof(unsigned kind) {
-    return kind == static_cast<unsigned>(TypeKind::List);
-  }
-
-  mlir::Type getElementType() const;
-};
-
-class IteratorStateType
-    : public mlir::Type::TypeBase<IteratorStateType, mlir::Type,
-                                  detail::IteratorStateTypeStorage> {
-public:
-  using Base::Base;
-  static constexpr ::llvm::StringLiteral name{"py.iterator_state"};
-
-  static IteratorStateType get(mlir::MLIRContext *ctx, mlir::Type sourceType,
-                               mlir::Type elementType);
-  static bool kindof(unsigned kind) {
-    return kind == static_cast<unsigned>(TypeKind::IteratorState);
-  }
-
-  mlir::Type getSourceType() const;
-  mlir::Type getElementType() const;
 };
 
 class ExceptionType : public mlir::Type::TypeBase<ExceptionType, mlir::Type,
@@ -676,6 +481,13 @@ bool isPyTracebackType(mlir::Type type);
 bool isPyLocationType(mlir::Type type);
 bool isPyUnionType(mlir::Type type);
 bool isPyOverloadType(mlir::Type type);
+bool isPyContractNamed(mlir::Type type, llvm::StringRef name);
+mlir::Type pyObjectContractType(mlir::MLIRContext *ctx);
+mlir::Type pyBoolContractType(mlir::MLIRContext *ctx);
+mlir::Type pyIntContractType(mlir::MLIRContext *ctx);
+mlir::Type pyFloatContractType(mlir::MLIRContext *ctx);
+mlir::Type pyStrContractType(mlir::MLIRContext *ctx);
+mlir::Type pyNoneContractType(mlir::MLIRContext *ctx);
 
 // Callable contract checking. A Callable contract owns the complete static
 // __call__ shape, including parameter and return metadata.

@@ -1,6 +1,6 @@
 #include "Runtime/Ctypes/Internal.h"
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 
 using namespace ctypes;
 
@@ -498,4 +498,4 @@ RuntimeBundleLowerer::lowerStaticCtypesCall(py::CallOp op,
                         << " has no erased ctypes lowering yet";
 }
 
-} // namespace py::runtime_lowering
+} // namespace py::lowering

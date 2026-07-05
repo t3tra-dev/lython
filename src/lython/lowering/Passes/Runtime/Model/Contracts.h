@@ -1,5 +1,7 @@
 #pragma once
 
+#include <Contracts.h>
+
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Value.h"
@@ -11,45 +13,30 @@
 
 #include <string>
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 
-inline constexpr llvm::StringLiteral kManifestContractsAttr{
-    "ly.runtime.contracts"};
-inline constexpr llvm::StringLiteral kManifestContractAttr{
-    "ly.runtime.contract"};
-inline constexpr llvm::StringLiteral kManifestMethodAttr{"ly.runtime.method"};
-inline constexpr llvm::StringLiteral kManifestInitializerAttr{
-    "ly.runtime.initializer"};
-inline constexpr llvm::StringLiteral kManifestPrimitiveAttr{
-    "ly.runtime.primitive"};
-inline constexpr llvm::StringLiteral kManifestBuiltinAttr{"ly.runtime.builtin"};
-inline constexpr llvm::StringLiteral kManifestBuiltinLoweringAttr{
-    "ly.runtime.builtin_lowering"};
-inline constexpr llvm::StringLiteral kManifestBuiltinMethodAttr{
-    "ly.runtime.builtin_method"};
-inline constexpr llvm::StringLiteral kManifestBuiltinSinkContractAttr{
-    "ly.runtime.builtin_sink_contract"};
-inline constexpr llvm::StringLiteral kManifestShapeAttr{"ly.runtime.shape"};
-inline constexpr llvm::StringLiteral kManifestDeallocatorAttr{
-    "ly.runtime.deallocator"};
-inline constexpr llvm::StringLiteral kManifestClassIdAttr{
-    "ly.runtime.class_id"};
-inline constexpr llvm::StringLiteral kManifestClassIdArgumentAttr{
-    "ly.runtime.class_id_argument"};
-inline constexpr llvm::StringLiteral kManifestDefaultI64Attr{
-    "ly.runtime.default_i64"};
-inline constexpr llvm::StringLiteral kManifestDefaultF64Attr{
-    "ly.runtime.default_f64"};
-inline constexpr llvm::StringLiteral kManifestResultContractAttr{
-    "ly.runtime.result_contract"};
-inline constexpr llvm::StringLiteral kManifestResultEvidenceAttr{
-    "ly.runtime.result_evidence"};
-inline constexpr llvm::StringLiteral kManifestElementContractAttr{
-    "ly.runtime.element_contract"};
-inline constexpr llvm::StringLiteral kManifestNextContractAttr{
-    "ly.runtime.next_contract"};
-inline constexpr llvm::StringLiteral kManifestValidResultIndexAttr{
-    "ly.runtime.valid_result_index"};
+using py::contracts::kManifestBuiltinAttr;
+using py::contracts::kManifestBuiltinLoweringAttr;
+using py::contracts::kManifestBuiltinMethodAttr;
+using py::contracts::kManifestBuiltinSinkContractAttr;
+using py::contracts::kManifestClassIdArgumentAttr;
+using py::contracts::kManifestClassIdAttr;
+using py::contracts::kManifestContractAttr;
+using py::contracts::kManifestContractsAttr;
+using py::contracts::kManifestDeallocatorAttr;
+using py::contracts::kManifestDefaultF64Attr;
+using py::contracts::kManifestDefaultI64Attr;
+using py::contracts::kManifestElementContractAttr;
+using py::contracts::kManifestInitializerAttr;
+using py::contracts::kManifestMethodAttr;
+using py::contracts::kManifestNextContractAttr;
+using py::contracts::kManifestPrimitiveAttr;
+using py::contracts::kManifestResultContractAttr;
+using py::contracts::kManifestResultEvidenceAttr;
+using py::contracts::kManifestShapeAttr;
+using py::contracts::kManifestValidResultIndexAttr;
+using py::contracts::isIntegerLiteralSpelling;
+using py::contracts::runtimeContractName;
 inline constexpr llvm::StringLiteral kCallableDefaultValuesAttr{
     "callable_default_values"};
 inline constexpr llvm::StringLiteral kCallableVarargValueTypeAttr{
@@ -61,8 +48,6 @@ inline constexpr llvm::StringLiteral kPackUnpackedOperandsAttr{
 
 std::string runtimeKey(llvm::StringRef contract, llvm::StringRef role,
                        llvm::StringRef name);
-bool isIntegerLiteralSpelling(llvm::StringRef spelling);
-std::string runtimeContractName(mlir::Type type);
 std::string runtimeShapeContractName(mlir::Type type);
 bool compatibleRuntimeObjectEvidenceContract(mlir::Type resultType,
                                              mlir::Type evidenceType);
@@ -77,4 +62,4 @@ llvm::SmallVector<mlir::Type, 4> takePrefix(llvm::ArrayRef<mlir::Type> types,
 llvm::SmallVector<mlir::Type, 4> takeSlice(llvm::ArrayRef<mlir::Type> types,
                                            unsigned begin, unsigned end);
 
-} // namespace py::runtime_lowering
+} // namespace py::lowering

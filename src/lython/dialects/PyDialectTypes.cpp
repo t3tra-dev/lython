@@ -5,18 +5,15 @@
 #include "PyProtocols.h"
 #include "PyTypeObject.h"
 
-#include "mlir/Dialect/Async/IR/Async.h"
+#include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/IR/Dialect.h"
+#include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/Types.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 
 #include <optional>
 #include <string>
-
-#define GET_OP_CLASSES
-#include "PyOps.h.inc"
-#undef GET_OP_CLASSES
 
 namespace py {
 
@@ -34,26 +31,6 @@ TypeListStorage::construct(mlir::TypeStorageAllocator &allocator,
                            const KeyTy &key) {
   llvm::ArrayRef<mlir::Type> copied = allocator.copyInto(key);
   return new (allocator.allocate<TypeListStorage>()) TypeListStorage(copied);
-}
-
-DictTypeStorage *
-DictTypeStorage::construct(mlir::TypeStorageAllocator &allocator,
-                           const KeyTy &key) {
-  return new (allocator.allocate<DictTypeStorage>())
-      DictTypeStorage(key.first, key.second);
-}
-
-ListTypeStorage *
-ListTypeStorage::construct(mlir::TypeStorageAllocator &allocator,
-                           const KeyTy &key) {
-  return new (allocator.allocate<ListTypeStorage>()) ListTypeStorage(key);
-}
-
-IteratorStateTypeStorage *
-IteratorStateTypeStorage::construct(mlir::TypeStorageAllocator &allocator,
-                                    const KeyTy &key) {
-  return new (allocator.allocate<IteratorStateTypeStorage>())
-      IteratorStateTypeStorage(key.first, key.second);
 }
 
 ClassTypeStorage *
@@ -166,33 +143,29 @@ static std::optional<llvm::StringRef> literalContractName(LiteralType literal) {
   return std::nullopt;
 }
 
+static std::string manifestClassNameForContract(llvm::StringRef name) {
+  for (llvm::StringRef prefix :
+       {"builtins.", "typing.", "types.", "contextlib.", "_asyncio.",
+        "asyncio.", "contextvars.", "ctypes.", "_ctypes.", "_typeshed."}) {
+    if (name.consume_front(prefix))
+      return name.str();
+  }
+  return name.str();
+}
+
+static bool isLiteralBool(LiteralType literal) {
+  llvm::StringRef spelling = literal.getSpelling();
+  return spelling == "True" || spelling == "False";
+}
+
+static bool isLiteralString(LiteralType literal) {
+  llvm::StringRef spelling = literal.getSpelling();
+  return spelling.starts_with("\"") && spelling.ends_with("\"");
+}
+
 //===----------------------------------------------------------------------===//
 // Simple types
 //===----------------------------------------------------------------------===//
-
-IntType IntType::get(mlir::MLIRContext *ctx) {
-  return Base::get(ctx, TypeKind::Int);
-}
-
-FloatType FloatType::get(mlir::MLIRContext *ctx) {
-  return Base::get(ctx, TypeKind::Float);
-}
-
-BoolType BoolType::get(mlir::MLIRContext *ctx) {
-  return Base::get(ctx, TypeKind::Bool);
-}
-
-StrType StrType::get(mlir::MLIRContext *ctx) {
-  return Base::get(ctx, TypeKind::Str);
-}
-
-NoneType NoneType::get(mlir::MLIRContext *ctx) {
-  return Base::get(ctx, TypeKind::None);
-}
-
-ObjectType ObjectType::get(mlir::MLIRContext *ctx) {
-  return Base::get(ctx, TypeKind::Object);
-}
 
 SelfType SelfType::get(mlir::MLIRContext *ctx) {
   return Base::get(ctx, TypeKind::Self);
@@ -231,52 +204,6 @@ mlir::Type UnpackType::getPackedType() const { return getImpl()->valueType; }
 //===----------------------------------------------------------------------===//
 // Composite types
 //===----------------------------------------------------------------------===//
-
-TupleType TupleType::get(mlir::MLIRContext *ctx,
-                         llvm::ArrayRef<mlir::Type> elementTypes) {
-  return Base::get(ctx, elementTypes);
-}
-
-llvm::ArrayRef<mlir::Type> TupleType::getElementTypes() const {
-  return getImpl()->types;
-}
-
-DictType DictType::get(mlir::MLIRContext *ctx, mlir::Type keyType,
-                       mlir::Type valueType) {
-  return Base::get(ctx, std::make_pair(keyType, valueType));
-}
-
-mlir::Type DictType::getKeyType() const { return getImpl()->keyType; }
-
-mlir::Type DictType::getValueType() const { return getImpl()->valueType; }
-
-ListType ListType::get(mlir::MLIRContext *ctx, mlir::Type elementType) {
-  return Base::get(ctx, elementType);
-}
-
-mlir::Type ListType::getElementType() const { return getImpl()->elementType; }
-
-IteratorStateType IteratorStateType::get(mlir::MLIRContext *ctx,
-                                         mlir::Type sourceType,
-                                         mlir::Type elementType) {
-  return Base::get(ctx, std::make_pair(sourceType, elementType));
-}
-
-mlir::Type IteratorStateType::getSourceType() const {
-  return getImpl()->sourceType;
-}
-
-mlir::Type IteratorStateType::getElementType() const {
-  return getImpl()->elementType;
-}
-
-ClassType ClassType::get(mlir::MLIRContext *ctx, ::llvm::StringRef className) {
-  return Base::get(ctx, className);
-}
-
-::llvm::StringRef ClassType::getClassName() const {
-  return getImpl()->className;
-}
 
 ContractType ContractType::get(mlir::MLIRContext *ctx, ::llvm::StringRef name,
                                llvm::ArrayRef<mlir::Type> arguments) {
@@ -466,14 +393,14 @@ bool UnionType::hasMember(mlir::Type member) const {
 bool UnionType::isOptional() const {
   llvm::ArrayRef<mlir::Type> members = getMemberTypes();
   return members.size() == 2 &&
-         (mlir::isa<NoneType>(members[0]) || mlir::isa<NoneType>(members[1]));
+         (isPyNoneType(members[0]) || isPyNoneType(members[1]));
 }
 
 mlir::Type UnionType::getOptionalPayloadType() const {
   if (!isOptional())
     return {};
   llvm::ArrayRef<mlir::Type> members = getMemberTypes();
-  return mlir::isa<NoneType>(members[0]) ? members[1] : members[0];
+  return isPyNoneType(members[0]) ? members[1] : members[0];
 }
 
 OverloadType OverloadType::get(mlir::MLIRContext *ctx,
@@ -489,64 +416,124 @@ llvm::ArrayRef<mlir::Type> OverloadType::getCandidateTypes() const {
 // Helper predicates
 //===----------------------------------------------------------------------===//
 
-bool isPyIntType(mlir::Type type) { return mlir::isa<IntType>(type); }
+bool isPyContractNamed(mlir::Type type, llvm::StringRef name) {
+  auto contract = mlir::dyn_cast_if_present<ContractType>(type);
+  return contract && contract.getContractName() == name;
+}
 
-bool isPyFloatType(mlir::Type type) { return mlir::isa<FloatType>(type); }
+mlir::Type pyObjectContractType(mlir::MLIRContext *ctx) {
+  return ContractType::get(ctx, "builtins.object");
+}
 
-bool isPyBoolType(mlir::Type type) { return mlir::isa<BoolType>(type); }
+mlir::Type pyBoolContractType(mlir::MLIRContext *ctx) {
+  return ContractType::get(ctx, "builtins.bool");
+}
 
-bool isPyStrType(mlir::Type type) { return mlir::isa<StrType>(type); }
+mlir::Type pyIntContractType(mlir::MLIRContext *ctx) {
+  return ContractType::get(ctx, "builtins.int");
+}
 
-bool isPyNoneType(mlir::Type type) { return mlir::isa<NoneType>(type); }
+mlir::Type pyFloatContractType(mlir::MLIRContext *ctx) {
+  return ContractType::get(ctx, "builtins.float");
+}
 
-bool isPyObjectType(mlir::Type type) { return mlir::isa<ObjectType>(type); }
+mlir::Type pyStrContractType(mlir::MLIRContext *ctx) {
+  return ContractType::get(ctx, "builtins.str");
+}
 
-bool isPyTupleType(mlir::Type type) { return mlir::isa<TupleType>(type); }
+mlir::Type pyNoneContractType(mlir::MLIRContext *ctx) {
+  return ContractType::get(ctx, "types.NoneType");
+}
 
-bool isPyDictType(mlir::Type type) { return mlir::isa<DictType>(type); }
+bool isPyIntType(mlir::Type type) {
+  if (isPyContractNamed(type, "builtins.int"))
+    return true;
+  auto literal = mlir::dyn_cast_if_present<LiteralType>(type);
+  return literal && isIntegerLiteralSpelling(literal.getSpelling());
+}
 
-bool isPyListType(mlir::Type type) { return mlir::isa<ListType>(type); }
+bool isPyFloatType(mlir::Type type) {
+  return isPyContractNamed(type, "builtins.float");
+}
+
+bool isPyBoolType(mlir::Type type) {
+  if (isPyContractNamed(type, "builtins.bool"))
+    return true;
+  auto literal = mlir::dyn_cast_if_present<LiteralType>(type);
+  return literal && isLiteralBool(literal);
+}
+
+bool isPyStrType(mlir::Type type) {
+  if (isPyContractNamed(type, "builtins.str"))
+    return true;
+  auto literal = mlir::dyn_cast_if_present<LiteralType>(type);
+  return literal && isLiteralString(literal);
+}
+
+bool isPyNoneType(mlir::Type type) {
+  if (isPyContractNamed(type, "types.NoneType"))
+    return true;
+  auto literal = mlir::dyn_cast_if_present<LiteralType>(type);
+  return literal && literal.getSpelling() == "None";
+}
+
+bool isPyObjectType(mlir::Type type) {
+  return isPyContractNamed(type, "builtins.object");
+}
+
+bool isPyTupleType(mlir::Type type) {
+  return isPyContractNamed(type, "builtins.tuple");
+}
+
+bool isPyDictType(mlir::Type type) {
+  return isPyContractNamed(type, "builtins.dict");
+}
+
+bool isPyListType(mlir::Type type) {
+  return isPyContractNamed(type, "builtins.list");
+}
 
 bool isPyIteratorStateType(mlir::Type type) {
-  return mlir::isa<IteratorStateType>(type);
+  return isIteratorDescriptorType(type);
 }
 
 mlir::Type primitiveIteratorStateType(mlir::MLIRContext *ctx,
                                       mlir::Type sourceType,
                                       mlir::Type elementType) {
-  return IteratorStateType::get(ctx, sourceType, elementType);
+  (void)sourceType;
+  return iteratorProtocolType(ctx, elementType);
 }
 
 bool isPrimitiveIteratorStateType(mlir::Type type) {
-  return mlir::isa<IteratorStateType>(type);
+  return isIteratorDescriptorType(type);
 }
 
 mlir::Type primitiveIteratorStateSourceType(mlir::Type type) {
-  if (auto iterator = mlir::dyn_cast_if_present<IteratorStateType>(type))
-    return iterator.getSourceType();
+  (void)type;
   return {};
 }
 
 mlir::Type primitiveIteratorStateElementType(mlir::Type type) {
-  if (auto iterator = mlir::dyn_cast_if_present<IteratorStateType>(type))
-    return iterator.getElementType();
-  return {};
+  return iteratorDescriptorElementType(type);
 }
 
 mlir::Type primitiveIteratorSourceElementType(mlir::Type sourceType) {
-  if (auto list = mlir::dyn_cast_if_present<ListType>(sourceType))
-    return list.getElementType();
-  auto tuple = mlir::dyn_cast_if_present<TupleType>(sourceType);
-  if (!tuple)
+  auto contract = mlir::dyn_cast_if_present<ContractType>(sourceType);
+  if (!contract)
+    return {};
+  llvm::ArrayRef<mlir::Type> arguments = contract.getArguments();
+  if (contract.getContractName() == "builtins.list")
+    return arguments.empty() ? mlir::Type() : arguments.front();
+  if (contract.getContractName() != "builtins.tuple")
     return {};
 
-  llvm::ArrayRef<mlir::Type> elementTypes = tuple.getElementTypes();
-  if (elementTypes.empty())
+  if (arguments.empty())
     return {};
-  mlir::Type elementType = elementTypes.front();
-  for (mlir::Type current : elementTypes.drop_front())
+  mlir::Type elementType = arguments.front();
+  for (mlir::Type current : arguments.drop_front()) {
     if (current != elementType)
-      return {};
+      return UnionType::getNormalized(sourceType.getContext(), arguments);
+  }
   return elementType;
 }
 
@@ -556,8 +543,6 @@ mlir::Type iteratorProtocolType(mlir::MLIRContext *ctx,
 }
 
 mlir::Type iteratorDescriptorElementType(mlir::Type type) {
-  if (mlir::Type element = primitiveIteratorStateElementType(type))
-    return element;
   return unaryProtocolDescriptorPayloadType(type, "Iterator");
 }
 
@@ -565,7 +550,10 @@ bool isIteratorDescriptorType(mlir::Type type) {
   return static_cast<bool>(iteratorDescriptorElementType(type));
 }
 
-bool isPyClassType(mlir::Type type) { return mlir::isa<ClassType>(type); }
+bool isPyClassType(mlir::Type type) {
+  (void)type;
+  return false;
+}
 
 bool isPyTypeType(mlir::Type type) { return mlir::isa<TypeType>(type); }
 
@@ -577,9 +565,8 @@ bool isPyContractType(mlir::Type type) {
   return llvm::TypeSwitch<mlir::Type, bool>(type)
       .Case<ContractType, ProtocolType, CallableType, UnionType, LiteralType,
             OverloadType, TypeType, SelfType, TypeVarType, ParamSpecType,
-            TypeVarTupleType, UnpackType, ClassType, IntType, FloatType,
-            BoolType, StrType, NoneType, ObjectType, TupleType, DictType,
-            ListType, ExceptionType, TracebackType>(
+            TypeVarTupleType, UnpackType, ExceptionType, ExceptionCellType,
+            TracebackType, LocationType>(
           [](auto) { return true; })
       .Default([](mlir::Type) { return false; });
 }
@@ -628,12 +615,11 @@ bool isCallableType(mlir::Type type) {
 
 bool isPyType(mlir::Type type) {
   return llvm::TypeSwitch<mlir::Type, bool>(type)
-      .Case<IntType, FloatType, BoolType, StrType, NoneType, ObjectType,
-            TupleType, DictType, ListType, IteratorStateType, ClassType,
-            ContractType, LiteralType, TypeVarType, ParamSpecType,
+      .Case<ContractType, LiteralType, TypeVarType, ParamSpecType,
             TypeVarTupleType, UnpackType, TypeType, ProtocolType, SelfType,
             CallableType, ExceptionType, ExceptionCellType, TracebackType,
-            LocationType, UnionType, OverloadType>([](auto) { return true; })
+            LocationType, UnionType, OverloadType>(
+          [](auto) { return true; })
       .Default([](mlir::Type) { return false; });
 }
 
@@ -644,17 +630,12 @@ bool isStaticTypeParameter(mlir::Type type) {
     return isStaticTypeParameter(unpack.getPackedType());
   if (auto contract = mlir::dyn_cast_if_present<ContractType>(type))
     return contract.getContractName().starts_with("$");
-  auto classType = mlir::dyn_cast_if_present<ClassType>(type);
-  return classType && classType.getClassName().starts_with("$");
+  return false;
 }
 
 mlir::Type eraseStaticTypeParameters(mlir::Type type) {
   if (!type)
     return type;
-  if (auto asyncValue = mlir::dyn_cast<mlir::async::ValueType>(type)) {
-    return mlir::async::ValueType::get(
-        eraseStaticTypeParameters(asyncValue.getValueType()));
-  }
   if (!isPyType(type))
     return type;
 
@@ -664,22 +645,7 @@ mlir::Type eraseStaticTypeParameters(mlir::Type type) {
                            eraseStaticTypeParameters(unpack.getPackedType()));
 
   if (isStaticTypeParameter(type))
-    return ObjectType::get(context);
-
-  if (auto tuple = mlir::dyn_cast<TupleType>(type)) {
-    llvm::SmallVector<mlir::Type> elements;
-    elements.reserve(tuple.getElementTypes().size());
-    for (mlir::Type element : tuple.getElementTypes())
-      elements.push_back(eraseStaticTypeParameters(element));
-    return TupleType::get(context, elements);
-  }
-  if (auto list = mlir::dyn_cast<ListType>(type))
-    return ListType::get(context,
-                         eraseStaticTypeParameters(list.getElementType()));
-  if (auto dict = mlir::dyn_cast<DictType>(type)) {
-    return DictType::get(context, eraseStaticTypeParameters(dict.getKeyType()),
-                         eraseStaticTypeParameters(dict.getValueType()));
-  }
+    return pyObjectContractType(context);
   if (auto typeType = mlir::dyn_cast<TypeType>(type)) {
     return TypeType::get(context,
                          eraseStaticTypeParameters(typeType.getInstanceType()));
@@ -789,13 +755,16 @@ bool isCallableEllipsisContract(CallableType signature) {
       !signature.getKwOnlyTypes().empty() || !signature.hasVararg() ||
       !signature.hasKwarg() || signature.hasParameterMetadata())
     return false;
-  auto varargTuple = mlir::dyn_cast<TupleType>(signature.getVarargType());
-  if (!varargTuple || varargTuple.getElementTypes().size() != 1 ||
-      !mlir::isa<ObjectType>(varargTuple.getElementTypes().front()))
+  auto varargTuple = mlir::dyn_cast<ContractType>(signature.getVarargType());
+  if (!varargTuple || varargTuple.getContractName() != "builtins.tuple" ||
+      varargTuple.getArguments().size() != 1 ||
+      !isPyObjectType(varargTuple.getArguments().front()))
     return false;
-  auto kwargsDict = mlir::dyn_cast<DictType>(signature.getKwargType());
-  return kwargsDict && mlir::isa<StrType>(kwargsDict.getKeyType()) &&
-         mlir::isa<ObjectType>(kwargsDict.getValueType());
+  auto kwargsDict = mlir::dyn_cast<ContractType>(signature.getKwargType());
+  return kwargsDict && kwargsDict.getContractName() == "builtins.dict" &&
+         kwargsDict.getArguments().size() == 2 &&
+         isPyStrType(kwargsDict.getArguments()[0]) &&
+         isPyObjectType(kwargsDict.getArguments()[1]);
 }
 
 namespace {
@@ -1026,24 +995,33 @@ bool isSubtypeOfImpl(mlir::Type subtype, mlir::Type supertype,
     }
   }
   if (subtypeContract && supertypeContract) {
-    if (!isContractSubclassOf(subtypeContract, supertypeContract))
-      return false;
     if (subtypeContract.getContractName() !=
-        supertypeContract.getContractName())
+        supertypeContract.getContractName()) {
+      bool subclass =
+          isContractSubclassOf(subtypeContract, supertypeContract);
+      if (!subclass && context.from) {
+        mlir::FailureOr<bool> result = type_object::isSubclassOf(
+            context.from,
+            manifestClassNameForContract(subtypeContract.getContractName()),
+            manifestClassNameForContract(supertypeContract.getContractName()));
+        subclass = mlir::succeeded(result) && *result;
+      }
+      if (!subclass)
+        return false;
       return true;
+    }
     llvm::ArrayRef<mlir::Type> subtypeArgs = subtypeContract.getArguments();
     llvm::ArrayRef<mlir::Type> supertypeArgs = supertypeContract.getArguments();
     if (subtypeArgs.size() != supertypeArgs.size())
       return false;
+    if (subtypeContract.getContractName() == "builtins.list" ||
+        subtypeContract.getContractName() == "builtins.dict")
+      return subtypeArgs == supertypeArgs;
     for (auto [subArg, superArg] : llvm::zip(subtypeArgs, supertypeArgs))
       if (!isSubtypeOfImpl(subArg, superArg, context))
         return false;
     return true;
   }
-
-  // The manifest-only object contract is the static top type.
-  if (mlir::isa<ObjectType>(supertype))
-    return isPyType(subtype);
 
   // Union membership: T <: union<...Ts> iff T in Ts, and
   // union<...Ss> <: union<...Ts> iff Ss is a subset of Ts.
@@ -1073,22 +1051,10 @@ bool isSubtypeOfImpl(mlir::Type subtype, mlir::Type supertype,
   if (supertypeOverload)
     return overloadCoversAllExpected(subtype, supertypeOverload, context);
 
-  if (mlir::isa<ExceptionType>(subtype)) {
-    auto supertypeClass = mlir::dyn_cast<ClassType>(supertype);
-    if (supertypeClass && supertypeClass.getClassName() == "BaseException")
-      return true;
-  }
-
-  auto subtypeClass = mlir::dyn_cast<ClassType>(subtype);
-  auto supertypeClass = mlir::dyn_cast<ClassType>(supertype);
-  if (subtypeClass && supertypeClass) {
-    if (!context.from)
-      return false;
-    mlir::FailureOr<bool> result =
-        type_object::isSubclassOf(context.from, subtypeClass.getClassName(),
-                                  supertypeClass.getClassName());
-    return mlir::succeeded(result) && *result;
-  }
+  if (mlir::isa<ExceptionType>(subtype) && supertypeContract &&
+      manifestClassNameForContract(supertypeContract.getContractName()) ==
+          "BaseException")
+    return true;
 
   auto subtypeMeta = mlir::dyn_cast<TypeType>(subtype);
   auto supertypeMeta = mlir::dyn_cast<TypeType>(supertype);
@@ -1112,35 +1078,6 @@ bool isSubtypeOfImpl(mlir::Type subtype, mlir::Type supertype,
       return isProtocolSubtypeOf(subtypeView, supertypeProtocol, context);
     }
   }
-
-  // Tuple covariance: !py.tuple<S> <: !py.tuple<T> if S <: T
-  auto subtypeTuple = mlir::dyn_cast<TupleType>(subtype);
-  auto supertypeTuple = mlir::dyn_cast<TupleType>(supertype);
-  if (subtypeTuple && supertypeTuple) {
-    auto subElems = subtypeTuple.getElementTypes();
-    auto superElems = supertypeTuple.getElementTypes();
-    if (subElems.size() != superElems.size())
-      return false;
-    for (auto [sub, sup] : llvm::zip(subElems, superElems)) {
-      if (!isSubtypeOfImpl(sub, sup, context))
-        return false;
-    }
-    return true;
-  }
-
-  auto subtypeDict = mlir::dyn_cast<DictType>(subtype);
-  auto supertypeDict = mlir::dyn_cast<DictType>(supertype);
-  // Mutable containers are invariant: accepting dict[K1, V1] as dict[K2, V2]
-  // would let later writes violate the original element schema.
-  if (subtypeDict && supertypeDict)
-    return subtypeDict.getKeyType() == supertypeDict.getKeyType() &&
-           subtypeDict.getValueType() == supertypeDict.getValueType();
-
-  auto subtypeList = mlir::dyn_cast<ListType>(subtype);
-  auto supertypeList = mlir::dyn_cast<ListType>(supertype);
-  // Lists are mutable, so list[Cat] is not a subtype of list[Animal].
-  if (subtypeList && supertypeList)
-    return subtypeList.getElementType() == supertypeList.getElementType();
 
   CallableType subtypeCallable = getCallableContract(subtype);
   CallableType supertypeCallable = getCallableContract(supertype);
@@ -1177,14 +1114,14 @@ bool isAssignableToImpl(mlir::Type actual, mlir::Type expected,
     return false;
   if (isSubtypeOfImpl(actual, expected, context))
     return true;
-  if (mlir::isa<IntType>(expected) &&
+  if (isPyIntType(expected) &&
       (mlir::isa<mlir::IntegerType>(actual) || actual.isIndex()))
     return true;
-  if (mlir::isa<BoolType>(expected)) {
+  if (isPyBoolType(expected)) {
     auto integer = mlir::dyn_cast<mlir::IntegerType>(actual);
     return integer && integer.getWidth() == 1;
   }
-  if (mlir::isa<FloatType>(expected) && mlir::isa<mlir::FloatType>(actual))
+  if (isPyFloatType(expected) && mlir::isa<mlir::FloatType>(actual))
     return true;
   return false;
 }

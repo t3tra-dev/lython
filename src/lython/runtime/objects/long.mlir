@@ -74,7 +74,7 @@ module attributes {ly.runtime.contracts = ["builtins.int"]} {
     func.return
   }
 
-  func.func private @__ly_long_alloc_raw(%sign: i64, %capacity: i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) {
+  func.func private @__ly_long_alloc_raw(%sign: i64, %capacity: i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0]} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %layout_int = arith.constant 1 : i64
@@ -125,7 +125,7 @@ module attributes {ly.runtime.contracts = ["builtins.int"]} {
     func.return
   }
 
-  func.func private @__ly_long_copy_with_sign(%sign: i64, %meta_in: memref<2xi64>, %digits_in: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) {
+  func.func private @__ly_long_copy_with_sign(%sign: i64, %meta_in: memref<2xi64>, %digits_in: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0]} {
     %count_slot = arith.constant 1 : index
     %count = memref.load %meta_in[%count_slot] : memref<2xi64>
     %header, %meta, %digits = func.call @__ly_long_alloc_raw(%sign, %count) : (i64, i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
@@ -140,7 +140,7 @@ module attributes {ly.runtime.contracts = ["builtins.int"]} {
     func.return %header, %meta, %digits : memref<2xi64>, memref<2xi64>, memref<?xi32>
   }
 
-  func.func private @__ly_long_copy(%meta_in: memref<2xi64>, %digits_in: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) {
+  func.func private @__ly_long_copy(%meta_in: memref<2xi64>, %digits_in: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0]} {
     %sign_slot = arith.constant 0 : index
     %sign = memref.load %meta_in[%sign_slot] : memref<2xi64>
     %header, %meta, %digits = func.call @__ly_long_copy_with_sign(%sign, %meta_in, %digits_in) : (i64, memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
@@ -185,7 +185,7 @@ module attributes {ly.runtime.contracts = ["builtins.int"]} {
     func.return %result : i64
   }
 
-  func.func private @__ly_long_add_abs(%sign: i64, %lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) {
+  func.func private @__ly_long_add_abs(%sign: i64, %lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0]} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %mask = arith.constant 1073741823 : i64
@@ -233,7 +233,7 @@ module attributes {ly.runtime.contracts = ["builtins.int"]} {
     func.return %header, %meta, %digits : memref<2xi64>, memref<2xi64>, memref<?xi32>
   }
 
-  func.func private @__ly_long_sub_abs(%sign: i64, %lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) {
+  func.func private @__ly_long_sub_abs(%sign: i64, %lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0]} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %base = arith.constant 1073741824 : i64
@@ -270,7 +270,7 @@ module attributes {ly.runtime.contracts = ["builtins.int"]} {
     func.return %header, %meta, %digits : memref<2xi64>, memref<2xi64>, memref<?xi32>
   }
 
-  func.func private @__ly_long_add_signed_general(%lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_effective_sign: i64, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) {
+  func.func private @__ly_long_add_signed_general(%lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_effective_sign: i64, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0]} {
     %zero = arith.constant 0 : i64
     %sign_slot = arith.constant 0 : index
     %lhs_sign = memref.load %lhs_meta[%sign_slot] : memref<2xi64>

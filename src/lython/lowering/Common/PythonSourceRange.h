@@ -45,10 +45,10 @@ pythonSourceI32Attr(mlir::DictionaryAttr dict, llvm::StringRef name) {
 
 inline std::optional<PythonSourceRange>
 sourceRangeFromDict(mlir::DictionaryAttr dict) {
-  auto startLine = pythonSourceI32Attr(dict, "lython.source.start_line");
-  auto startCol = pythonSourceI32Attr(dict, "lython.source.start_col");
-  auto endLine = pythonSourceI32Attr(dict, "lython.source.end_line");
-  auto endCol = pythonSourceI32Attr(dict, "lython.source.end_col");
+  auto startLine = pythonSourceI32Attr(dict, "ly.source.start_line");
+  auto startCol = pythonSourceI32Attr(dict, "ly.source.start_col");
+  auto endLine = pythonSourceI32Attr(dict, "ly.source.end_line");
+  auto endCol = pythonSourceI32Attr(dict, "ly.source.end_col");
   if (!startLine || !startCol || !endLine || !endCol)
     return std::nullopt;
   PythonSourceRange range;

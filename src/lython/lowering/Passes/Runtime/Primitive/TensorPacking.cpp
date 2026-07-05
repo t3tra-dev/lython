@@ -12,7 +12,7 @@
 
 #include <optional>
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 namespace {
 
 struct RhsPanelSlice {
@@ -368,4 +368,4 @@ bool tryPrepackFullRhsPanel(mlir::linalg::MatmulOp matmul,
   return true;
 }
 
-} // namespace py::runtime_lowering
+} // namespace py::lowering

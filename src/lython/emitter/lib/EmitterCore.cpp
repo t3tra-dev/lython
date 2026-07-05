@@ -71,16 +71,16 @@ mlir::Location ModuleEmitter::loc(const parser::Node &node) const {
   mlir::Builder attrBuilder(&context);
   llvm::SmallVector<mlir::NamedAttribute, 4> rangeAttrs;
   rangeAttrs.push_back(attrBuilder.getNamedAttr(
-      "lython.source.start_line",
+      "ly.source.start_line",
       attrBuilder.getI32IntegerAttr(node.range.start.line)));
   rangeAttrs.push_back(attrBuilder.getNamedAttr(
-      "lython.source.start_col",
+      "ly.source.start_col",
       attrBuilder.getI32IntegerAttr(node.range.start.column)));
   rangeAttrs.push_back(attrBuilder.getNamedAttr(
-      "lython.source.end_line",
+      "ly.source.end_line",
       attrBuilder.getI32IntegerAttr(node.range.end.line)));
   rangeAttrs.push_back(attrBuilder.getNamedAttr(
-      "lython.source.end_col",
+      "ly.source.end_col",
       attrBuilder.getI32IntegerAttr(node.range.end.column)));
   return mlir::FusedLoc::get(&context, {start},
                              attrBuilder.getDictionaryAttr(rangeAttrs));

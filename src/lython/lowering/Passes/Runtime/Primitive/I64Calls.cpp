@@ -4,7 +4,7 @@
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/ErrorHandling.h"
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 
 namespace {
 
@@ -37,6 +37,15 @@ mlir::Value boolConstant(mlir::OpBuilder &builder, mlir::Location loc,
                          bool value) {
   return builder.create<mlir::arith::ConstantIntOp>(loc, value ? 1 : 0, 1)
       .getResult();
+}
+
+bool isKnownTrue(mlir::Value value) {
+  auto constant = value.getDefiningOp<mlir::arith::ConstantIntOp>();
+  if (constant)
+    return constant.value() != 0;
+  if (auto andOp = value.getDefiningOp<mlir::arith::AndIOp>())
+    return isKnownTrue(andOp.getLhs()) && isKnownTrue(andOp.getRhs());
+  return false;
 }
 
 mlir::Value i64Constant(mlir::OpBuilder &builder, mlir::Location loc,
@@ -252,10 +261,34 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
   context->loadDialect<mlir::scf::SCFDialect>();
 
   auto emitFallbackYield = [&]() -> mlir::LogicalResult {
+    mlir::Block *fallbackBlock = builder.getInsertionBlock();
+    builder.setInsertionPointToEnd(fallbackBlock);
+    llvm::SmallVector<RuntimeBundle, 2> materializedSources;
+    llvm::SmallVector<const RuntimeBundle *, 2> fallbackSources;
+    materializedSources.reserve(sources.size());
+    fallbackSources.reserve(sources.size());
+    for (const RuntimeBundle *source : sources) {
+      if (!source || !RuntimeBundleLowerer::hasLazyPrimitiveI64Object(*source)) {
+        fallbackSources.push_back(source);
+        continue;
+      }
+      mlir::FailureOr<RuntimeValue> materialized =
+          RuntimeBundleLowerer::materializePrimitiveI64ObjectAtCurrentInsertion(
+              op, *source);
+      if (mlir::failed(materialized))
+        return mlir::failure();
+      RuntimeBundle updated = *source;
+      updated.contract = materialized->contract;
+      updated.objectValue = *materialized;
+      materializedSources.push_back(std::move(updated));
+      fallbackSources.push_back(&materializedSources.back());
+    }
     llvm::SmallVector<mlir::Value, 8> operands;
     if (mlir::failed(RuntimeBundleLowerer::buildRuntimeCallOperands(
-            op, *selected, sources, operands, /*allowUnusedSources=*/false)))
+            op, *selected, fallbackSources, operands,
+            /*allowUnusedSources=*/false)))
       return mlir::failure();
+    builder.setInsertionPointToEnd(fallbackBlock);
     mlir::func::CallOp call =
         RuntimeBundleLowerer::createRuntimeCall(loc, *selected, operands);
     if (mlir::failed(checkPhysicalTypes(call.getResults(), "fallback call")))
@@ -302,6 +335,14 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
   mlir::Value fastResult =
       builder.create<mlir::arith::CmpIOp>(loc, *compare, lhs.value, rhs.value)
           .getResult();
+  if (isKnownTrue(operandsValid)) {
+    RuntimeBundle result;
+    if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+            op, resultType, mlir::ValueRange{fastResult}, result)))
+      return mlir::failure();
+    valueBundles[resultValue] = std::move(result);
+    return mlir::success();
+  }
   auto ifOp = builder.create<mlir::scf::IfOp>(loc, *resultTypes, operandsValid,
                                               /*withElseRegion=*/true);
 
@@ -356,4 +397,4 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBinarySpecial(
   return mlir::success();
 }
 
-} // namespace py::runtime_lowering
+} // namespace py::lowering

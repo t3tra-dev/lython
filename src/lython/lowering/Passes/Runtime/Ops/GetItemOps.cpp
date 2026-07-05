@@ -2,7 +2,7 @@
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 
 namespace {
 
@@ -42,13 +42,16 @@ mlir::LogicalResult RuntimeBundleLowerer::bindEvidenceObjectResult(
       objectShapeMatches(resultContract, value.values))
     bundleContract = resultValue.getType();
 
-  valueBundles[resultValue] =
-      RuntimeBundle::object(bundleContract, value.values);
+  valueBundles[resultValue] = RuntimeBundle::objectWithOwnership(
+      bundleContract, value.values,
+      ownership::logicalOwnershipKind(bundleContract,
+                                              /*ownsObject=*/false));
   return mlir::success();
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::bindSelectedEvidenceObjectResult(
     mlir::Operation *op, mlir::Value resultValue, RuntimeBundle bundle) {
+  bundle.setObjectLogicalOwnership(/*ownsObject=*/false);
   valueBundles[resultValue] = std::move(bundle);
   erase.push_back(op);
   return mlir::success();
@@ -68,8 +71,15 @@ RuntimeBundleLowerer::selectEvidenceObjectByMatch(
 
   const RuntimeValue &first = candidates.front();
   if (first.values.empty()) {
-    op->emitError() << label << " evidence candidate has no physical values";
-    return mlir::failure();
+    mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> expected =
+        RuntimeBundleLowerer::runtimeValueTypesFor(op, first.contract,
+                                                   "evidence candidate ABI");
+    if (mlir::failed(expected))
+      return mlir::failure();
+    if (!expected->empty()) {
+      op->emitError() << label << " evidence candidate has no physical values";
+      return mlir::failure();
+    }
   }
 
   llvm::ArrayRef<mlir::Value> firstValues = first.values;
@@ -143,21 +153,41 @@ RuntimeBundleLowerer::selectEvidenceObjectByMatch(
   std::string resultContract = runtimeContractName(resultValue.getType());
   if (!resultContract.empty() && objectShapeMatches(resultContract, *selected))
     bundleContract = resultValue.getType();
-  return RuntimeBundle::object(bundleContract, *selected);
+  return RuntimeBundle::objectWithOwnership(
+      bundleContract, *selected,
+      ownership::logicalOwnershipKind(bundleContract,
+                                              /*ownsObject=*/false));
 }
 
 mlir::FailureOr<RuntimeBundle> RuntimeBundleLowerer::selectEvidenceObjectMiss(
     mlir::Operation *op, mlir::Value resultValue,
     llvm::ArrayRef<RuntimeValue> candidates, llvm::StringRef label,
     llvm::StringRef missingContract, llvm::StringRef missingMessage) {
+  (void)candidates;
   builder.setInsertionPoint(op);
-  mlir::Value neverMatches =
-      builder.create<mlir::arith::ConstantIntOp>(op->getLoc(), 0, 1)
-          .getResult();
-  llvm::SmallVector<mlir::Value, 8> matches(candidates.size(), neverMatches);
-  return RuntimeBundleLowerer::selectEvidenceObjectByMatch(
-      op, resultValue, candidates, matches, label, missingContract,
-      missingMessage);
+  if (mlir::failed(RuntimeBundleLowerer::emitRuntimeException(
+          op, missingContract, missingMessage)))
+    return mlir::failure();
+
+  mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> resultTypes =
+      RuntimeBundleLowerer::runtimeValueTypesFor(op, resultValue.getType(),
+                                                 label);
+  if (mlir::failed(resultTypes))
+    return mlir::failure();
+
+  llvm::SmallVector<mlir::Value, 4> deadValues;
+  deadValues.reserve(resultTypes->size());
+  for (mlir::Type resultType : *resultTypes) {
+    mlir::FailureOr<mlir::Value> dead =
+        RuntimeBundleLowerer::materializeDeadPhysicalValue(op, resultType);
+    if (mlir::failed(dead))
+      return mlir::failure();
+    deadValues.push_back(*dead);
+  }
+  return RuntimeBundle::objectWithOwnership(
+      resultValue.getType(), deadValues,
+      ownership::logicalOwnershipKind(resultValue.getType(),
+                                              /*ownsObject=*/false));
 }
 
 mlir::FailureOr<bool> RuntimeBundleLowerer::lowerSequenceEvidenceGetItem(
@@ -350,6 +380,14 @@ RuntimeBundleLowerer::lowerDictEvidenceGetItem(py::GetItemOp op,
     for (auto [position, storedKey] : llvm::enumerate(container.mappingKeys)) {
       if (storedKey != *key)
         continue;
+      if (!hasPresence && position < container.mappingValueBundles.size() &&
+          container.mappingValueBundles[position]) {
+        RuntimeBundle selected = *container.mappingValueBundles[position];
+        if (mlir::failed(bindSelectedEvidenceObjectResult(
+                op, op.getResult(), std::move(selected))))
+          return mlir::failure();
+        return true;
+      }
       const RuntimeValue &value = container.mappingValues[position];
       if (hasPresence) {
         builder.setInsertionPoint(op);
@@ -482,4 +520,4 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerGetItem(py::GetItemOp op) {
   return mlir::success();
 }
 
-} // namespace py::runtime_lowering
+} // namespace py::lowering

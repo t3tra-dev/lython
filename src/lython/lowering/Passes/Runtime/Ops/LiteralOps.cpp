@@ -1,6 +1,6 @@
 #include "Runtime/Core/Lowerer.h"
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 
 mlir::LogicalResult
 RuntimeBundleLowerer::lowerStrConstant(py::StrConstantOp op) {
@@ -35,6 +35,16 @@ bool RuntimeBundleLowerer::isStaticKeywordName(py::StrConstantOp op) const {
     for (mlir::OpOperand &packUse : pack.getResult().getUses()) {
       auto call = mlir::dyn_cast<py::CallOp>(packUse.getOwner());
       if (call && call.getKwnames() == pack.getResult()) {
+        feedsKeywordNames = true;
+        break;
+      }
+      auto init = mlir::dyn_cast<py::InitOp>(packUse.getOwner());
+      if (init && init.getKwnames() == pack.getResult()) {
+        feedsKeywordNames = true;
+        break;
+      }
+      auto newOp = mlir::dyn_cast<py::NewOp>(packUse.getOwner());
+      if (newOp && newOp.getKwnames() == pack.getResult()) {
         feedsKeywordNames = true;
         break;
       }
@@ -171,4 +181,4 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerTypeObject(py::TypeObjectOp op) {
   erase.push_back(op);
   return mlir::success();
 }
-} // namespace py::runtime_lowering
+} // namespace py::lowering

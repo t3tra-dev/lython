@@ -1,7 +1,7 @@
 #include "Runtime/Ctypes/Internal.h"
 #include "llvm/TargetParser/Triple.h"
 
-namespace py::runtime_lowering::ctypes {
+namespace py::lowering::ctypes {
 
 mlir::FailureOr<RuntimeBundle>
 materializeCtypesCell(mlir::Operation *op, mlir::OpBuilder &builder,
@@ -332,14 +332,70 @@ extractPointerAddressInteger(mlir::Operation *op, mlir::OpBuilder &builder,
   return std::nullopt;
 }
 
-mlir::FailureOr<mlir::func::FuncOp>
-getOrCreateNativeDeclaration(mlir::Operation *op, mlir::ModuleOp module,
-                             mlir::OpBuilder &builder, llvm::StringRef name,
-                             mlir::FunctionType type) {
+mlir::FailureOr<mlir::func::FuncOp> getOrCreateNativeDeclaration(
+    mlir::Operation *op, mlir::ModuleOp module, mlir::OpBuilder &builder,
+    llvm::StringRef name, mlir::FunctionType type,
+    llvm::ArrayRef<std::string> argTypes, llvm::StringRef resultType,
+    llvm::StringRef abi, bool processLibrary,
+    const TargetPlatformFacts &facts) {
+  auto nativeStringAttrMatches = [](mlir::Operation *decl,
+                                    llvm::StringRef attrName,
+                                    llvm::StringRef expected) {
+    auto attr = decl->getAttrOfType<mlir::StringAttr>(attrName);
+    return attr && attr.getValue() == expected;
+  };
+  auto nativeBoolAttrMatches = [](mlir::Operation *decl,
+                                  llvm::StringRef attrName, bool expected) {
+    auto attr = decl->getAttrOfType<mlir::BoolAttr>(attrName);
+    return attr && attr.getValue() == expected;
+  };
+  auto nativeIntAttrMatches = [](mlir::Operation *decl,
+                                 llvm::StringRef attrName,
+                                 std::uint64_t expected) {
+    auto attr = decl->getAttrOfType<mlir::IntegerAttr>(attrName);
+    return attr && attr.getInt() >= 0 &&
+           static_cast<std::uint64_t>(attr.getInt()) == expected;
+  };
+  auto nativeArgTypesMatch = [](mlir::Operation *decl,
+                                llvm::ArrayRef<std::string> expected) {
+    auto attr = decl->getAttrOfType<mlir::ArrayAttr>(
+        py::native::kNativeArgTypesAttr);
+    if (!attr || attr.size() != expected.size())
+      return false;
+    for (auto [index, raw] : llvm::enumerate(attr)) {
+      auto value = mlir::dyn_cast<mlir::StringAttr>(raw);
+      if (!value || value.getValue() != expected[index])
+        return false;
+    }
+    return true;
+  };
+
   if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(name)) {
     if (existing.getFunctionType() != type)
       return op->emitError() << "native symbol '" << name
                              << "' was already declared with incompatible type";
+    if (!nativeStringAttrMatches(existing,
+                                 py::native::kNativeSymbolAttr, name) ||
+        !nativeArgTypesMatch(existing, argTypes) ||
+        !nativeStringAttrMatches(
+            existing, py::native::kNativeResultTypeAttr, resultType) ||
+        !nativeStringAttrMatches(existing, py::native::kNativeABIAttr,
+                                 abi) ||
+        !nativeBoolAttrMatches(existing,
+                               py::native::kNativeProcessLibraryAttr,
+                               processLibrary) ||
+        !nativeStringAttrMatches(existing,
+                                 py::native::kNativeTargetTripleAttr,
+                                 facts.triple) ||
+        !nativeIntAttrMatches(existing,
+                              py::native::kNativeTargetPointerWidthAttr,
+                              facts.pointerWidth) ||
+        !nativeIntAttrMatches(existing,
+                              py::native::kNativeTargetCLongWidthAttr,
+                              facts.cLongWidth))
+      return op->emitError()
+             << "native symbol '" << name
+             << "' was already declared with incompatible static ABI contract";
     return existing;
   }
   mlir::OpBuilder::InsertionGuard guard(builder);
@@ -347,7 +403,27 @@ getOrCreateNativeDeclaration(mlir::Operation *op, mlir::ModuleOp module,
   auto function =
       builder.create<mlir::func::FuncOp>(module.getLoc(), name, type);
   function.setPrivate();
+  function->setAttr(py::native::kNativeSymbolAttr,
+                    builder.getStringAttr(name));
+  llvm::SmallVector<mlir::Attribute, 4> args;
+  args.reserve(argTypes.size());
+  for (llvm::StringRef argType : argTypes)
+    args.push_back(builder.getStringAttr(argType));
+  function->setAttr(py::native::kNativeArgTypesAttr,
+                    builder.getArrayAttr(args));
+  function->setAttr(py::native::kNativeResultTypeAttr,
+                    builder.getStringAttr(resultType));
+  function->setAttr(py::native::kNativeABIAttr,
+                    builder.getStringAttr(abi));
+  function->setAttr(py::native::kNativeProcessLibraryAttr,
+                    builder.getBoolAttr(processLibrary));
+  function->setAttr(py::native::kNativeTargetTripleAttr,
+                    builder.getStringAttr(facts.triple));
+  function->setAttr(py::native::kNativeTargetPointerWidthAttr,
+                    builder.getI64IntegerAttr(facts.pointerWidth));
+  function->setAttr(py::native::kNativeTargetCLongWidthAttr,
+                    builder.getI64IntegerAttr(facts.cLongWidth));
   return function;
 }
 
-} // namespace py::runtime_lowering::ctypes
+} // namespace py::lowering::ctypes

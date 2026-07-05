@@ -7,7 +7,7 @@
 #include <memory>
 #include <string>
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 namespace {
 
 class NoOpModulePass
@@ -37,53 +37,21 @@ makeNoOpPass(llvm::StringRef argument, llvm::StringRef description) {
 }
 
 } // namespace
-} // namespace py::runtime_lowering
+} // namespace py::lowering
 
 namespace py {
 
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createPublicationPreparationPass() {
-  return runtime_lowering::makeNoOpPass(
+  return lowering::makeNoOpPass(
       "lython-publication-preparation",
       "prepare a resolved module for runtime lowering");
 }
 
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createRefCountPairElisionPass() {
-  return runtime_lowering::makeNoOpPass(
-      "lython-refcount-elision", "elide proven redundant ownership pairs");
-}
-
-std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createPyOptimizationPass() {
-  return runtime_lowering::makeNoOpPass(
+  return lowering::makeNoOpPass(
       "lython-py-optimization", "optimize resolved Py dialect operations");
-}
-
-std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createOwnershipVerifierPass() {
-  return runtime_lowering::makeNoOpPass(
-      "lython-ownership-verifier", "verify ownership after runtime lowering");
-}
-
-std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createLLVMCallOwnershipVerifierPass() {
-  return runtime_lowering::makeNoOpPass(
-      "lython-llvm-call-ownership-verifier",
-      "verify lowered LLVM call ownership metadata");
-}
-
-std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createLLVMThreadSafetyVerifierPass() {
-  return runtime_lowering::makeNoOpPass(
-      "lython-llvm-thread-safety-verifier",
-      "verify lowered LLVM thread-safety metadata");
-}
-
-std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createNativeVerificationPass() {
-  return runtime_lowering::makeNoOpPass("lython-native-verification",
-                                        "verify native function declarations");
 }
 
 namespace lowering::runtime::cleanup {
@@ -99,22 +67,6 @@ bool llvmFuncReturns(mlir::Operation *) { return false; }
 bool finalBoundary(mlir::ModuleOp) { return false; }
 
 } // namespace lowering::runtime::cleanup
-
-void collectLoweredSafetyContracts(mlir::ModuleOp, LoweredSafetyContracts &) {}
-
-void collectLoweredSafetyContracts(mlir::ModuleOp, const PyLLVMTypeConverter &,
-                                   LoweredSafetyContracts &) {}
-
-mlir::LogicalResult
-preserveLoweredSafetyContracts(mlir::ModuleOp, const LoweredSafetyContracts &) {
-  return mlir::success();
-}
-
-mlir::LogicalResult verifyOwnership(mlir::ModuleOp) { return mlir::success(); }
-
-mlir::LogicalResult verifyLLVMCallOwnership(mlir::ModuleOp) {
-  return mlir::success();
-}
 
 namespace optimizer::publication {
 void prepare(mlir::ModuleOp) {}

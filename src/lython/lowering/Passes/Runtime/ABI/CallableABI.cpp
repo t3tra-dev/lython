@@ -1,6 +1,6 @@
 #include "Runtime/Core/Lowerer.h"
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 namespace {
 
 bool isPrimitiveOnlyCallable(py::CallableType callable) {
@@ -12,6 +12,52 @@ bool isPrimitiveOnlyCallable(py::CallableType callable) {
   return llvm::all_of(callable.getPositionalTypes(), isRuntimePrimitive) &&
          llvm::all_of(callable.getKwOnlyTypes(), isRuntimePrimitive) &&
          llvm::all_of(callable.getResultTypes(), isRuntimePrimitive);
+}
+
+bool isCoroutineLikeResultType(mlir::Type type) {
+  if (runtimeContractName(type) == "types.CoroutineType")
+    return true;
+  auto protocol = mlir::dyn_cast_if_present<py::ProtocolType>(type);
+  return protocol && protocol.getProtocolName() == "Coroutine";
+}
+
+bool isAwaitIteratorLikeResultType(mlir::Type type) {
+  std::string contract = runtimeContractName(type);
+  if (contract == "types.CoroutineAwaitIterator" ||
+      contract == "_asyncio.FutureIter" || contract == "_asyncio.TaskIter")
+    return true;
+  auto protocol = mlir::dyn_cast_if_present<py::ProtocolType>(type);
+  return protocol && protocol.getProtocolName() == "Generator";
+}
+
+mlir::Type concreteCoroutineTypeForTarget(mlir::MLIRContext *context,
+                                          mlir::func::FuncOp target) {
+  auto bodyResult =
+      target->getAttrOfType<mlir::TypeAttr>("ly.async.body_result");
+  if (!bodyResult)
+    return {};
+  mlir::Type object = runtimeContractType(context, "builtins.object");
+  return py::ContractType::get(context, "types.CoroutineType",
+                               {object, object, bodyResult.getValue()});
+}
+
+bool hasProtocolArgumentOverride(llvm::ArrayRef<mlir::Type> types) {
+  return llvm::any_of(types,
+                      [](mlir::Type type) { return static_cast<bool>(type); });
+}
+
+bool sameProtocolArgumentOverrides(llvm::ArrayRef<mlir::Type> lhs,
+                                   llvm::ArrayRef<mlir::Type> rhs) {
+  return lhs.size() == rhs.size() &&
+         llvm::all_of(llvm::zip(lhs, rhs), [](auto entry) {
+           return std::get<0>(entry) == std::get<1>(entry);
+         });
+}
+
+std::string protocolSpecializationName(llvm::StringRef originalName,
+                                       unsigned ordinal) {
+  return (llvm::Twine(originalName) + "__lyrt_proto_" + llvm::Twine(ordinal))
+      .str();
 }
 
 } // namespace
@@ -64,6 +110,26 @@ bool RuntimeBundleLowerer::classDefinesMethod(mlir::Type type,
       return true;
   }
   return false;
+}
+
+std::optional<std::string>
+RuntimeBundleLowerer::classMethodSymbol(py::ClassOp classOp,
+                                        llvm::StringRef name) const {
+  if (!classOp)
+    return std::nullopt;
+  auto methodNames = classOp->getAttrOfType<mlir::ArrayAttr>("method_names");
+  auto methodSymbols =
+      classOp->getAttrOfType<mlir::ArrayAttr>("method_symbols");
+  if (!methodNames || !methodSymbols ||
+      methodNames.size() != methodSymbols.size())
+    return std::nullopt;
+  for (auto [nameAttr, symbolAttr] : llvm::zip(methodNames, methodSymbols)) {
+    auto methodName = mlir::dyn_cast<mlir::StringAttr>(nameAttr);
+    auto symbol = mlir::dyn_cast<mlir::StringAttr>(symbolAttr);
+    if (methodName && symbol && methodName.getValue() == name)
+      return symbol.getValue().str();
+  }
+  return std::nullopt;
 }
 
 llvm::SmallVector<mlir::Type, 8>
@@ -224,6 +290,66 @@ bool RuntimeBundleLowerer::isPrimitiveI64CallableClone(
   return function && function->hasAttr(kPrimitiveI64CloneAttr);
 }
 
+bool RuntimeBundleLowerer::isCallableProtocolTemplate(
+    mlir::func::FuncOp function) const {
+  return function && function->hasAttr(kProtocolTemplateAttr);
+}
+
+std::optional<std::string>
+RuntimeBundleLowerer::callableProtocolSpecializationFor(
+    llvm::StringRef target,
+    llvm::ArrayRef<const RuntimeBundle *> sources) const {
+  auto found = callableProtocolSpecializations.find(target);
+  if (found == callableProtocolSpecializations.end())
+    return std::nullopt;
+
+  for (const CallableProtocolSpecialization &specialization :
+       found->second) {
+    bool matches = true;
+    for (auto [index, expected] :
+         llvm::enumerate(specialization.argumentTypes)) {
+      if (!expected)
+        continue;
+      if (index >= sources.size() || !sources[index]) {
+        matches = false;
+        break;
+      }
+      mlir::Type actual = sources[index]->contract;
+      if (actual == expected)
+        continue;
+      if (py::isAssignableTo(actual, expected))
+        continue;
+      matches = false;
+      break;
+    }
+    if (matches)
+      return specialization.cloneName;
+  }
+  return std::nullopt;
+}
+
+mlir::FailureOr<mlir::func::FuncOp>
+RuntimeBundleLowerer::selectCallableProtocolSpecialization(
+    py::CallOp op, mlir::func::FuncOp target, llvm::StringRef targetName,
+    llvm::ArrayRef<const RuntimeBundle *> sources) {
+  if (std::optional<std::string> cloneName =
+          RuntimeBundleLowerer::callableProtocolSpecializationFor(targetName,
+                                                                  sources)) {
+    if (mlir::func::FuncOp clone =
+            module.lookupSymbol<mlir::func::FuncOp>(*cloneName))
+      return clone;
+    return op.emitError() << "protocol specialization clone @" << *cloneName
+                          << " for callable target " << targetName
+                          << " is not defined";
+  }
+
+  if (RuntimeBundleLowerer::isCallableProtocolTemplate(target))
+    return op.emitError()
+           << "protocol-typed callable target " << targetName
+           << " has no static specialization for these argument contracts";
+  return target;
+}
+
 std::optional<std::string>
 RuntimeBundleLowerer::primitiveI64CloneFor(llvm::StringRef target) const {
   auto found = primitiveI64CallableClones.find(target);
@@ -235,7 +361,8 @@ RuntimeBundleLowerer::primitiveI64CloneFor(llvm::StringRef target) const {
 bool RuntimeBundleLowerer::isPrimitiveI64CallableEligible(
     mlir::func::FuncOp function) const {
   if (!function || function.isDeclaration() ||
-      RuntimeBundleLowerer::isPrimitiveI64CallableClone(function))
+      RuntimeBundleLowerer::isPrimitiveI64CallableClone(function) ||
+      RuntimeBundleLowerer::isCallableProtocolTemplate(function))
     return false;
   if (!RuntimeBundleLowerer::callableClosureTypes(function).empty())
     return false;
@@ -308,7 +435,10 @@ RuntimeBundleLowerer::seedPrimitiveI64CallableEntryArgumentBundles(
     mlir::BlockArgument valid = entry.addArgument(
         mlir::IntegerType::get(context, 1), logicalArg.getLoc());
 
-    RuntimeBundle bundle = RuntimeBundle::object(logicalType, {});
+    RuntimeBundle bundle = RuntimeBundle::objectWithOwnership(
+        logicalType, mlir::ValueRange{},
+        ownership::logicalOwnershipKind(logicalType,
+                                                /*ownsObject=*/false));
     bundle.primitiveI64 = RuntimePrimitiveI64Evidence{raw, valid};
     valueBundles[logicalArg] = std::move(bundle);
   }
@@ -319,8 +449,7 @@ RuntimeBundleLowerer::seedPrimitiveI64CallableEntryArgumentBundles(
 
 mlir::LogicalResult RuntimeBundleLowerer::buildCallableProtocolArgumentABIs() {
   struct Accumulator {
-    llvm::SmallVector<mlir::Type, 8> concreteTypes;
-    llvm::SmallVector<bool, 8> conflicts;
+    llvm::SmallVector<llvm::SmallVector<mlir::Type, 8>, 4> specializations;
   };
 
   llvm::StringMap<Accumulator> accumulators;
@@ -349,12 +478,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableProtocolArgumentABIs() {
     if (!sourceTypes || sourceTypes->size() > logicalTypes.size())
       return mlir::WalkResult::advance();
 
-    Accumulator &acc = accumulators[target.getSymName()];
-    if (acc.concreteTypes.empty()) {
-      acc.concreteTypes.resize(logicalTypes.size());
-      acc.conflicts.resize(logicalTypes.size());
-    }
-
+    llvm::SmallVector<mlir::Type, 8> argumentTypes(logicalTypes.size());
     for (auto [index, sourceType] : llvm::enumerate(*sourceTypes)) {
       mlir::Type logicalType = logicalTypes[index];
       if (!mlir::isa<py::ProtocolType>(logicalType) ||
@@ -364,27 +488,57 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableProtocolArgumentABIs() {
       std::string sourceContract = runtimeContractName(sourceType);
       if (sourceContract.empty())
         continue;
-
-      mlir::Type &stored = acc.concreteTypes[index];
-      if (!stored) {
-        stored = sourceType;
-        continue;
-      }
-      if (stored != sourceType)
-        acc.conflicts[index] = true;
+      argumentTypes[index] = sourceType;
     }
+    if (!hasProtocolArgumentOverride(argumentTypes))
+      return mlir::WalkResult::advance();
+
+    Accumulator &acc = accumulators[target.getSymName()];
+    if (llvm::none_of(acc.specializations, [&](llvm::ArrayRef<mlir::Type> item) {
+          return sameProtocolArgumentOverrides(item, argumentTypes);
+        }))
+      acc.specializations.push_back(std::move(argumentTypes));
     return mlir::WalkResult::advance();
   });
 
   for (auto &entry : accumulators) {
-    Accumulator &acc = entry.getValue();
-    for (auto [index, conflict] : llvm::enumerate(acc.conflicts))
-      if (conflict)
-        acc.concreteTypes[index] = {};
-    if (llvm::any_of(acc.concreteTypes,
-                     [](mlir::Type type) { return static_cast<bool>(type); }))
-      callableProtocolArgumentABIs[entry.getKey()] =
-          std::move(acc.concreteTypes);
+    mlir::func::FuncOp original =
+        module.lookupSymbol<mlir::func::FuncOp>(entry.getKey());
+    if (!original || original.isDeclaration())
+      continue;
+
+    llvm::SmallVector<CallableProtocolSpecialization, 4> &specializations =
+        callableProtocolSpecializations[entry.getKey()];
+    for (auto [ordinal, argumentTypes] :
+         llvm::enumerate(entry.getValue().specializations)) {
+      std::string cloneName =
+          protocolSpecializationName(entry.getKey(), ordinal);
+      mlir::func::FuncOp clone =
+          module.lookupSymbol<mlir::func::FuncOp>(cloneName);
+      if (!clone) {
+        mlir::OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPointAfter(original);
+        clone = original.clone();
+        clone.setSymName(cloneName);
+        clone->setAttr(kProtocolSpecializationAttr,
+                       builder.getStringAttr(original.getSymName()));
+        mlir::SymbolTable::setSymbolVisibility(
+            clone, mlir::SymbolTable::Visibility::Private);
+        builder.insert(clone);
+      }
+      callableProtocolArgumentABIs[cloneName] = argumentTypes;
+      if (auto returnedValue = returnedValueSummaries.find(entry.getKey());
+          returnedValue != returnedValueSummaries.end())
+        returnedValueSummaries[cloneName] = returnedValue->second;
+      if (auto returnedCallable =
+              returnedCallableSummaries.find(entry.getKey());
+          returnedCallable != returnedCallableSummaries.end())
+        returnedCallableSummaries[cloneName] = returnedCallable->second;
+      specializations.push_back(CallableProtocolSpecialization{
+          cloneName, llvm::SmallVector<mlir::Type, 8>(argumentTypes)});
+    }
+    if (!specializations.empty())
+      original->setAttr(kProtocolTemplateAttr, builder.getUnitAttr());
   }
   return mlir::success();
 }
@@ -402,6 +556,8 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
       result = mlir::failure();
       return mlir::WalkResult::interrupt();
     }
+    if (RuntimeBundleLowerer::isCallableProtocolTemplate(function))
+      return mlir::WalkResult::advance();
     if (isPrimitiveOnlyCallable(callable))
       return mlir::WalkResult::advance();
     llvm::SmallVector<mlir::Type, 8> logicalInputTypes =
@@ -478,6 +634,15 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
             RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(inputType,
                                                                   inputTypes);
           }
+          for (mlir::Type inputType : evidence.coroutineSourceTypes) {
+            if (mlir::failed(RuntimeBundleLowerer::appendRuntimeValueTypes(
+                    function, inputType, inputTypes))) {
+              result = mlir::failure();
+              return mlir::WalkResult::interrupt();
+            }
+            RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(inputType,
+                                                                  inputTypes);
+          }
         }
       }
     }
@@ -508,21 +673,74 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
     }
 
     llvm::SmallVector<mlir::Type, 8> resultTypes;
+    llvm::SmallVector<std::int64_t, 4> ownedResultOffsets;
+    llvm::SmallVector<mlir::Attribute, 4> ownedResultContracts;
     auto returnedCoroutine =
         returnedCoroutineSummaries.find(function.getSymName());
     auto returnedObjectEvidence =
         returnedObjectEvidenceSummaries.find(function.getSymName());
+    auto returnedStaticObject =
+        returnedStaticObjectSummaries.find(function.getSymName());
     for (auto [logicalResultIndex, resultType] :
          llvm::enumerate(callable.getResultTypes())) {
+      mlir::Type abiResultType = resultType;
+      if (returnedCoroutine != returnedCoroutineSummaries.end() &&
+          isCoroutineLikeResultType(resultType)) {
+        if (mlir::func::FuncOp target =
+                module.lookupSymbol<mlir::func::FuncOp>(
+                    returnedCoroutine->second.target)) {
+          if (mlir::Type concrete =
+                  concreteCoroutineTypeForTarget(context, target))
+            abiResultType = concrete;
+        }
+      }
+      bool protocolPrimaryOwnsResult = false;
+      if (auto protocol = mlir::dyn_cast_if_present<py::ProtocolType>(
+              resultType))
+        protocolPrimaryOwnsResult =
+            runtimeShapeContractName(resultType) == "builtins.object" &&
+            ((returnedStaticObject != returnedStaticObjectSummaries.end() &&
+              returnedStaticObject->second.resultIndex == logicalResultIndex) ||
+             protocol.getProtocolName() == "Generator");
+      if (protocolPrimaryOwnsResult) {
+        ownedResultOffsets.push_back(
+            static_cast<std::int64_t>(resultTypes.size()));
+        ownedResultContracts.push_back(builder.getStringAttr("builtins.object"));
+      }
       if (mlir::failed(RuntimeBundleLowerer::appendRuntimeValueTypes(
-              function, resultType, resultTypes))) {
+              function, abiResultType, resultTypes))) {
         result = mlir::failure();
         return mlir::WalkResult::interrupt();
       }
-      RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(resultType,
+      RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(abiResultType,
                                                             resultTypes);
+      if (returnedStaticObject != returnedStaticObjectSummaries.end() &&
+          returnedStaticObject->second.resultIndex == logicalResultIndex) {
+        mlir::Type objectContract =
+            returnedStaticObject->second.objectContract;
+        std::string objectContractName = runtimeContractName(objectContract);
+        if (objectContractName.empty()) {
+          result = function.emitError()
+                   << "static returned object evidence has no runtime "
+                      "contract: "
+                   << objectContract;
+          return mlir::WalkResult::interrupt();
+        }
+        ownedResultOffsets.push_back(
+            static_cast<std::int64_t>(resultTypes.size()));
+        ownedResultContracts.push_back(
+            builder.getStringAttr(objectContractName));
+        if (mlir::failed(RuntimeBundleLowerer::appendRuntimeValueTypes(
+                function, objectContract, resultTypes))) {
+          result = mlir::failure();
+          return mlir::WalkResult::interrupt();
+        }
+        RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(objectContract,
+                                                              resultTypes);
+      }
       if (returnedCoroutine != returnedCoroutineSummaries.end() &&
-          runtimeContractName(resultType) == "types.CoroutineType") {
+          (isCoroutineLikeResultType(resultType) ||
+           isAwaitIteratorLikeResultType(resultType))) {
         for (mlir::Type sourceType :
              returnedCoroutine->second.sourceContracts) {
           if (mlir::failed(RuntimeBundleLowerer::appendRuntimeValueTypes(
@@ -557,6 +775,13 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
     }
     function.setFunctionType(
         mlir::FunctionType::get(context, inputTypes, resultTypes));
+    if (!ownedResultOffsets.empty())
+      function->setAttr(
+          ownership::kOwnedResultsAttr,
+          mlir::DenseI64ArrayAttr::get(context, ownedResultOffsets));
+    if (!ownedResultContracts.empty())
+      function->setAttr(ownership::kOwnedResultContractsAttr,
+                        builder.getArrayAttr(ownedResultContracts));
     return mlir::WalkResult::advance();
   });
   return result;
@@ -607,7 +832,8 @@ mlir::LogicalResult RuntimeBundleLowerer::seedCallableEntryArgumentBundles(
 
     RuntimeBundle bundle;
     if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
-            function, abiType, physicalArgs, bundle)))
+            function, abiType, physicalArgs, bundle,
+            /*ownsObject=*/false)))
       return mlir::failure();
     if (mlir::failed(seedHiddenPrimitiveI64Evidence(abiType, bundle,
                                                     logicalArg.getLoc())))
@@ -629,7 +855,8 @@ mlir::LogicalResult RuntimeBundleLowerer::seedCallableEntryArgumentBundles(
 
     RuntimeBundle bundle;
     if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
-            function, logicalType, physicalArgs, bundle)))
+            function, logicalType, physicalArgs, bundle,
+            /*ownsObject=*/false)))
       return mlir::failure();
     if (mlir::failed(seedHiddenPrimitiveI64Evidence(logicalType, bundle,
                                                     function.getLoc())))
@@ -655,21 +882,46 @@ mlir::LogicalResult RuntimeBundleLowerer::seedCallableEntryArgumentBundles(
       if (evidenceSet.alternatives.size() == 1) {
         const RuntimeArgumentEvidence &evidence =
             evidenceSet.alternatives.front();
-        bundle.functionTarget = evidence.functionTarget;
+        if (!evidence.functionTarget.empty())
+          bundle.functionTarget = evidence.functionTarget;
+        if (!evidence.coroutineTarget.empty())
+          bundle.coroutineTarget = evidence.coroutineTarget;
       }
       for (const RuntimeArgumentEvidence &evidence : evidenceSet.alternatives) {
-        RuntimeCallableAlternative alternative;
-        alternative.functionTarget = evidence.functionTarget;
-        for (mlir::Type closureType : evidence.closureValueTypes) {
-          mlir::FailureOr<RuntimeValue> closure =
-              appendHiddenObject(closureType);
-          if (mlir::failed(closure))
-            return mlir::failure();
-          alternative.closureValues.push_back(*closure);
+        if (!evidence.functionTarget.empty() ||
+            !evidence.closureValueTypes.empty()) {
+          RuntimeCallableAlternative alternative;
+          alternative.functionTarget = evidence.functionTarget;
+          for (mlir::Type closureType : evidence.closureValueTypes) {
+            mlir::FailureOr<RuntimeValue> closure =
+                appendHiddenObject(closureType);
+            if (mlir::failed(closure))
+              return mlir::failure();
+            alternative.closureValues.push_back(*closure);
+          }
+          if (evidenceSet.alternatives.size() == 1)
+            bundle.closureValues = alternative.closureValues;
+          bundle.callableAlternatives.push_back(std::move(alternative));
         }
-        if (evidenceSet.alternatives.size() == 1)
-          bundle.closureValues = alternative.closureValues;
-        bundle.callableAlternatives.push_back(std::move(alternative));
+        if (!evidence.coroutineTarget.empty()) {
+          llvm::SmallVector<RuntimeValue, 4> coroutineSources;
+          llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 4>
+              coroutineSourceBundles;
+          for (mlir::Type sourceType : evidence.coroutineSourceTypes) {
+            mlir::FailureOr<RuntimeValue> source =
+                appendHiddenObject(sourceType);
+            if (mlir::failed(source))
+              return mlir::failure();
+            coroutineSources.push_back(*source);
+            coroutineSourceBundles.push_back(std::make_shared<RuntimeBundle>(
+                RuntimeBundle::object(source->contract, source->values)));
+          }
+          if (evidenceSet.alternatives.size() == 1) {
+            bundle.coroutineSources = std::move(coroutineSources);
+            bundle.coroutineSourceBundles =
+                std::move(coroutineSourceBundles);
+          }
+        }
       }
     }
   }
@@ -731,4 +983,4 @@ mlir::LogicalResult RuntimeBundleLowerer::seedCallableEntryArgumentBundles(
   return mlir::success();
 }
 
-} // namespace py::runtime_lowering
+} // namespace py::lowering

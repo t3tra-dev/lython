@@ -1,6 +1,6 @@
 #include "Runtime/Core/Lowerer.h"
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 
 mlir::LogicalResult RuntimeBundleLowerer::lowerPyOp(mlir::Operation *op) {
   return llvm::TypeSwitch<mlir::Operation *, mlir::LogicalResult>(op)
@@ -22,6 +22,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPyOp(mlir::Operation *op) {
           [&](auto typeObject) { return lowerTypeObject(typeObject); })
       .Case<py::ClassUpcastOp, py::ClassRefineOp, py::ProtocolViewOp>(
           [&](auto view) { return lowerAliasViewOp(view); })
+      .Case<py::ClassTestOp>([&](auto test) { return lowerClassTest(test); })
       .Case<py::UnionWrapOp>([&](auto wrap) { return lowerUnionWrap(wrap); })
       .Case<py::UnionTestOp>([&](auto test) { return lowerUnionTest(test); })
       .Case<py::UnionUnwrapOp>(
@@ -58,6 +59,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPyOp(mlir::Operation *op) {
       .Case<py::ContainsOp>(
           [&](auto contains) { return lowerContains(contains); })
       .Case<py::RoundOp>([&](auto round) { return lowerRound(round); })
+      .Case<py::IncRefOp>([&](auto incRef) { return lowerIncRef(incRef); })
+      .Case<py::DecRefOp>([&](auto decRef) { return lowerDecRef(decRef); })
       .Case<py::NegOp, py::PosOp, py::InvertOp>(
           [&](auto unary) { return lowerUnaryMethodOp(unary); })
       .Case<py::AddOp, py::SubOp, py::MulOp, py::DivOp, py::FloorDivOp,
@@ -75,4 +78,4 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPyOp(mlir::Operation *op) {
       });
 }
 
-} // namespace py::runtime_lowering
+} // namespace py::lowering

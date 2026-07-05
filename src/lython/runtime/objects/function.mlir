@@ -7,7 +7,7 @@
 // stable runtime handles before calling this ABI.
 
 module attributes {ly.runtime.contracts = ["builtins.function"]} {
-  func.func private @LyObject_DecRefHeader(%header: memref<2xi64, strided<[1], offset: ?>> {ly.ownership.object_header}) -> i1 attributes {ly.ownership.object_release_to_zero, ly.runtime.contract = "builtins.object", ly.runtime.primitive = "release_to_zero"}
+  func.func private @LyObject_ReleaseStorageToZero(%storage: memref<?xi64>) -> i1
 
   func.func @LyFunction_New(%target_id: i64, %defaults: i64, %kwdefaults: i64, %closure: i64, %annotations: i64, %module: i64) -> memref<8xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 6 : i64, ly.runtime.contract = "builtins.function", ly.runtime.initializer = "__new__"} {
     %one = arith.constant 1 : i64
@@ -36,9 +36,8 @@ module attributes {ly.runtime.contracts = ["builtins.function"]} {
   }
 
   func.func @LyFunction_DecRef(%storage: memref<8xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.function", ly.runtime.deallocator} {
-    %c0 = arith.constant 0 : index
-    %header = memref.subview %storage[%c0] [2] [1] : memref<8xi64> to memref<2xi64, strided<[1], offset: ?>>
-    %became_zero = func.call @LyObject_DecRefHeader(%header) : (memref<2xi64, strided<[1], offset: ?>>) -> i1
+    %dynamic_storage = memref.cast %storage : memref<8xi64> to memref<?xi64>
+    %became_zero = func.call @LyObject_ReleaseStorageToZero(%dynamic_storage) : (memref<?xi64>) -> i1
     cf.cond_br %became_zero, ^dealloc, ^done
 
   ^dealloc:

@@ -155,8 +155,11 @@ mlir::LogicalResult verifyBases(ClassOp op) {
       return op.emitOpError("unknown base class '") << baseName << "'";
   }
 
-  if (className == kBaseException && !bases->empty())
-    return op.emitOpError("BaseException must be the exception root");
+  if (className == kBaseException) {
+    if (bases->size() > 1 ||
+        (bases->size() == 1 && bases->front() != "object"))
+      return op.emitOpError("BaseException must inherit only from object");
+  }
   if (className == kException) {
     if (bases->size() != 1 || bases->front() != kBaseException)
       return op.emitOpError("Exception must inherit from BaseException");

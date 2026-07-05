@@ -21,9 +21,7 @@
 namespace py {
 
 void PyDialect::initialize() {
-  addTypes<IntType, FloatType, BoolType, StrType, NoneType, ObjectType,
-           TupleType, DictType, ListType, IteratorStateType, ClassType,
-           ContractType, LiteralType, TypeVarType, ParamSpecType,
+  addTypes<ContractType, LiteralType, TypeVarType, ParamSpecType,
            TypeVarTupleType, UnpackType, TypeType, ProtocolType, ExceptionType,
            ExceptionCellType, TracebackType, LocationType, CallableType,
            UnionType, OverloadType, SelfType>();
@@ -246,17 +244,17 @@ mlir::Type PyDialect::parseType(mlir::DialectAsmParser &parser) const {
   };
 
   if (keyword == "int")
-    return IntType::get(ctx);
+    return pyIntContractType(ctx);
   if (keyword == "float")
-    return FloatType::get(ctx);
+    return pyFloatContractType(ctx);
   if (keyword == "bool")
-    return BoolType::get(ctx);
+    return pyBoolContractType(ctx);
   if (keyword == "str")
-    return StrType::get(ctx);
+    return pyStrContractType(ctx);
   if (keyword == "none")
-    return NoneType::get(ctx);
+    return pyNoneContractType(ctx);
   if (keyword == "object")
-    return ObjectType::get(ctx);
+    return pyObjectContractType(ctx);
   if (keyword == "self")
     return SelfType::get(ctx);
   if (keyword == "contract") {
@@ -327,7 +325,7 @@ mlir::Type PyDialect::parseType(mlir::DialectAsmParser &parser) const {
       return mlir::Type();
     llvm::SmallVector<mlir::Type> elementTypes;
     if (mlir::succeeded(parser.parseOptionalGreater()))
-      return TupleType::get(ctx, elementTypes);
+      return ContractType::get(ctx, "builtins.tuple", elementTypes);
     do {
       mlir::Type element;
       if (parser.parseType(element))
@@ -336,7 +334,7 @@ mlir::Type PyDialect::parseType(mlir::DialectAsmParser &parser) const {
     } while (mlir::succeeded(parser.parseOptionalComma()));
     if (parser.parseGreater())
       return mlir::Type();
-    return TupleType::get(ctx, elementTypes);
+    return ContractType::get(ctx, "builtins.tuple", elementTypes);
   }
   if (keyword == "dict") {
     if (parser.parseLess())
@@ -345,7 +343,7 @@ mlir::Type PyDialect::parseType(mlir::DialectAsmParser &parser) const {
     if (parser.parseType(keyType) || parser.parseComma() ||
         parser.parseType(valueType) || parser.parseGreater())
       return mlir::Type();
-    return DictType::get(ctx, keyType, valueType);
+    return ContractType::get(ctx, "builtins.dict", {keyType, valueType});
   }
   if (keyword == "list") {
     if (parser.parseLess())
@@ -353,7 +351,7 @@ mlir::Type PyDialect::parseType(mlir::DialectAsmParser &parser) const {
     mlir::Type elementType;
     if (parser.parseType(elementType) || parser.parseGreater())
       return mlir::Type();
-    return ListType::get(ctx, elementType);
+    return ContractType::get(ctx, "builtins.list", {elementType});
   }
   if (keyword == "iterator_state") {
     if (parser.parseLess())
@@ -362,7 +360,8 @@ mlir::Type PyDialect::parseType(mlir::DialectAsmParser &parser) const {
     if (parser.parseType(sourceType) || parser.parseComma() ||
         parser.parseType(elementType) || parser.parseGreater())
       return mlir::Type();
-    return IteratorStateType::get(ctx, sourceType, elementType);
+    (void)sourceType;
+    return iteratorProtocolType(ctx, elementType);
   }
   if (keyword == "union") {
     if (parser.parseLess())
@@ -423,7 +422,7 @@ mlir::Type PyDialect::parseType(mlir::DialectAsmParser &parser) const {
     mlir::StringAttr classNameAttr;
     if (parser.parseAttribute(classNameAttr) || parser.parseGreater())
       return mlir::Type();
-    return ClassType::get(ctx, classNameAttr.getValue());
+    return ContractType::get(ctx, classNameAttr.getValue());
   }
   if (keyword == "type") {
     if (parser.parseLess())
@@ -485,31 +484,7 @@ void PyDialect::printType(mlir::Type type,
   };
 
   llvm::TypeSwitch<mlir::Type>(type)
-      .Case<IntType>([&](IntType) { printer << "int"; })
-      .Case<FloatType>([&](FloatType) { printer << "float"; })
-      .Case<BoolType>([&](BoolType) { printer << "bool"; })
-      .Case<StrType>([&](StrType) { printer << "str"; })
-      .Case<NoneType>([&](NoneType) { printer << "none"; })
-      .Case<ObjectType>([&](ObjectType) { printer << "object"; })
       .Case<SelfType>([&](SelfType) { printer << "self"; })
-      .Case<TupleType>([&](TupleType tupleTy) {
-        printer << "tuple<";
-        auto elements = tupleTy.getElementTypes();
-        llvm::interleaveComma(elements, printer,
-                              [&](mlir::Type element) { printer << element; });
-        printer << ">";
-      })
-      .Case<DictType>([&](DictType dictTy) {
-        printer << "dict<" << dictTy.getKeyType() << ", "
-                << dictTy.getValueType() << ">";
-      })
-      .Case<ListType>([&](ListType listTy) {
-        printer << "list<" << listTy.getElementType() << ">";
-      })
-      .Case<IteratorStateType>([&](IteratorStateType iteratorTy) {
-        printer << "iterator_state<" << iteratorTy.getSourceType() << ", "
-                << iteratorTy.getElementType() << ">";
-      })
       .Case<UnionType>([&](UnionType unionTy) {
         printer << "union<";
         llvm::interleaveComma(unionTy.getMemberTypes(), printer,
@@ -520,9 +495,6 @@ void PyDialect::printType(mlir::Type type,
         printer << "overload<";
         printTypeList(overloadTy.getCandidateTypes());
         printer << ">";
-      })
-      .Case<ClassType>([&](ClassType classTy) {
-        printer << "class<\"" << classTy.getClassName() << "\">";
       })
       .Case<ContractType>([&](ContractType contractTy) {
         printer << "contract<\"" << contractTy.getContractName() << "\"";

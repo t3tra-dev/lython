@@ -83,7 +83,7 @@ std::optional<std::string> prelinkedRuntimeIRPath() {
 
 namespace {
 
-constexpr llvm::StringLiteral kRuntimeContractsAttr{"ly.runtime.contracts"};
+constexpr llvm::StringLiteral kContractsAttr{"ly.runtime.contracts"};
 
 bool declarationsOnly() { return prelinkedRuntimeIRPath().has_value(); }
 
@@ -125,10 +125,10 @@ void importSymbol(mlir::ModuleOp target, mlir::Operation &op) {
   }
 }
 
-mlir::LogicalResult mergeRuntimeContracts(mlir::ModuleOp target,
+mlir::LogicalResult mergeContracts(mlir::ModuleOp target,
                                           mlir::ModuleOp source) {
   auto sourceContracts =
-      source->getAttrOfType<mlir::ArrayAttr>(kRuntimeContractsAttr);
+      source->getAttrOfType<mlir::ArrayAttr>(kContractsAttr);
   if (!sourceContracts)
     return mlir::success();
 
@@ -142,7 +142,7 @@ mlir::LogicalResult mergeRuntimeContracts(mlir::ModuleOp target,
       auto contract = mlir::dyn_cast<mlir::StringAttr>(attr);
       if (!contract)
         return diagnosticTarget->emitError()
-               << kRuntimeContractsAttr << " entries must be strings";
+               << kContractsAttr << " entries must be strings";
       if (seen.insert(contract.getValue()).second)
         merged.push_back(contract);
     }
@@ -150,13 +150,13 @@ mlir::LogicalResult mergeRuntimeContracts(mlir::ModuleOp target,
   };
 
   if (mlir::failed(
-          append(target->getAttrOfType<mlir::ArrayAttr>(kRuntimeContractsAttr),
+          append(target->getAttrOfType<mlir::ArrayAttr>(kContractsAttr),
                  target)))
     return mlir::failure();
   if (mlir::failed(append(sourceContracts, source)))
     return mlir::failure();
 
-  target->setAttr(kRuntimeContractsAttr,
+  target->setAttr(kContractsAttr,
                   mlir::ArrayAttr::get(target.getContext(), merged));
   return mlir::success();
 }
@@ -178,7 +178,7 @@ mlir::LogicalResult importRuntimeModule(mlir::ModuleOp target,
     return mlir::failure();
   }
 
-  if (mlir::failed(mergeRuntimeContracts(target, *source)))
+  if (mlir::failed(mergeContracts(target, *source)))
     return mlir::failure();
 
   for (mlir::Operation &op : source->getBody()->getOperations())

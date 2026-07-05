@@ -22,7 +22,7 @@
 #include <optional>
 #include <utility>
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 namespace {
 
 constexpr int64_t kMatmulConservativeMC = 64;
@@ -850,4 +850,4 @@ createMatmulVectorizationPass() {
   return std::make_unique<MatmulVectorizationPass>();
 }
 
-} // namespace py::runtime_lowering
+} // namespace py::lowering

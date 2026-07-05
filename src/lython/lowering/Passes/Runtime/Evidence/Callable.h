@@ -4,7 +4,7 @@
 
 #include "PyCallableShape.h"
 
-namespace py::runtime_lowering::callable_evidence {
+namespace py::lowering::callable_evidence {
 
 inline void sortKeywordEvidence(llvm::SmallVectorImpl<std::string> &keys,
                                 llvm::SmallVectorImpl<mlir::Type> &types) {
@@ -102,8 +102,6 @@ inline mlir::Type runtimeEvidenceType(mlir::Type type) {
     if (!contract.empty())
       return runtimeContractType(type.getContext(), contract);
   }
-  if (type && mlir::isa<py::ObjectType>(type))
-    return runtimeContractType(type.getContext(), "builtins.object");
   return type;
 }
 
@@ -136,14 +134,6 @@ inline bool containsStaticEvidenceParameter(mlir::Type type) {
                         containsStaticEvidenceParameter);
   if (auto typeType = mlir::dyn_cast_if_present<py::TypeType>(type))
     return containsStaticEvidenceParameter(typeType.getInstanceType());
-  if (auto tuple = mlir::dyn_cast_if_present<py::TupleType>(type))
-    return llvm::any_of(tuple.getElementTypes(),
-                        containsStaticEvidenceParameter);
-  if (auto list = mlir::dyn_cast_if_present<py::ListType>(type))
-    return containsStaticEvidenceParameter(list.getElementType());
-  if (auto dict = mlir::dyn_cast_if_present<py::DictType>(type))
-    return containsStaticEvidenceParameter(dict.getKeyType()) ||
-           containsStaticEvidenceParameter(dict.getValueType());
   return false;
 }
 
@@ -247,4 +237,4 @@ expectedKwargEvidenceTypes(py::CallableType callable, unsigned count) {
     types.push_back(*valueType);
   return types;
 }
-} // namespace py::runtime_lowering::callable_evidence
+} // namespace py::lowering::callable_evidence

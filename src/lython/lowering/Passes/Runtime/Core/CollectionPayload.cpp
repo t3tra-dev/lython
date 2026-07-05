@@ -1,0 +1,484 @@
+#include "Runtime/Core/Lowerer.h"
+
+#include <algorithm>
+
+namespace py::lowering {
+namespace {
+
+bool isSequenceCollection(llvm::StringRef contract) {
+  return contract == "builtins.list" || contract == "builtins.tuple";
+}
+
+bool isI64Payload(mlir::Value value) {
+  auto memref = mlir::dyn_cast<mlir::MemRefType>(value.getType());
+  return memref && memref.getRank() == 1 &&
+         mlir::isa<mlir::IntegerType>(memref.getElementType()) &&
+         mlir::cast<mlir::IntegerType>(memref.getElementType()).getWidth() ==
+             64;
+}
+
+mlir::Value constantI64(mlir::OpBuilder &builder, mlir::Location loc,
+                        std::int64_t value) {
+  return builder.create<mlir::arith::ConstantIntOp>(loc, value, 64)
+      .getResult();
+}
+
+mlir::Value constantIndex(mlir::OpBuilder &builder, mlir::Location loc,
+                          unsigned value) {
+  return builder.create<mlir::arith::ConstantIndexOp>(loc, value).getResult();
+}
+
+constexpr unsigned kPayloadHandleWords = 16;
+constexpr unsigned kPayloadValuePointerWords = 5;
+constexpr unsigned kPayloadValuePointerBase = 4;
+constexpr unsigned kPayloadValueSizeBase = 9;
+constexpr unsigned kPayloadOwnedFlagSlot = 14;
+constexpr std::uint64_t kMinimumCollectionCapacity = 64;
+
+std::uint64_t growCapacity(std::uint64_t current, std::uint64_t required) {
+  std::uint64_t capacity =
+      std::max<std::uint64_t>(current, kMinimumCollectionCapacity);
+  while (capacity < required)
+    capacity *= 2;
+  return capacity;
+}
+
+mlir::Value pointerWordForPhysicalValue(mlir::OpBuilder &builder,
+                                        mlir::Location loc, mlir::Value value,
+                                        mlir::Value zero) {
+  auto memref = mlir::dyn_cast<mlir::MemRefType>(value.getType());
+  if (!memref || memref.getRank() != 1)
+    return zero;
+  mlir::Value pointerIndex =
+      builder.create<mlir::memref::ExtractAlignedPointerAsIndexOp>(loc, value);
+  return builder
+      .create<mlir::arith::IndexCastOp>(loc, builder.getI64Type(), pointerIndex)
+      .getResult();
+}
+
+mlir::Value sizeWordForPhysicalValue(mlir::OpBuilder &builder,
+                                     mlir::Location loc, mlir::Value value,
+                                     mlir::Value zero) {
+  auto memref = mlir::dyn_cast<mlir::MemRefType>(value.getType());
+  if (!memref || memref.getRank() != 1)
+    return zero;
+  if (memref.hasStaticShape())
+    return constantI64(builder, loc, memref.getDimSize(0));
+  mlir::Value dim = builder.create<mlir::memref::DimOp>(loc, value, 0);
+  return builder.create<mlir::arith::IndexCastOp>(loc, builder.getI64Type(), dim)
+      .getResult();
+}
+
+mlir::LogicalResult storePayloadWord(mlir::Operation *op,
+                                     mlir::OpBuilder &builder,
+                                     mlir::Value payload, unsigned index,
+                                     mlir::Value word,
+                                     llvm::StringRef label) {
+  if (!payload || !isI64Payload(payload))
+    return op->emitError() << label << " payload has invalid type "
+                           << (payload ? payload.getType() : mlir::Type());
+  builder.setInsertionPoint(op);
+  mlir::Value slot = constantIndex(builder, op->getLoc(), index);
+  builder.create<mlir::memref::StoreOp>(op->getLoc(), word, payload, slot);
+  return mlir::success();
+}
+
+mlir::LogicalResult storePayloadHandle(mlir::Operation *op,
+                                       mlir::OpBuilder &builder,
+                                       mlir::Value payload, unsigned index,
+                                       llvm::ArrayRef<mlir::Value> words,
+                                       llvm::StringRef label) {
+  if (words.size() != kPayloadHandleWords)
+    return op->emitError() << label << " payload handle must have "
+                           << kPayloadHandleWords << " words";
+  unsigned base = index * kPayloadHandleWords;
+  for (auto [offset, word] : llvm::enumerate(words))
+    if (mlir::failed(storePayloadWord(op, builder, payload, base + offset,
+                                      word, label)))
+      return mlir::failure();
+  return mlir::success();
+}
+
+mlir::LogicalResult clearPayloadHandle(mlir::Operation *op,
+                                       mlir::OpBuilder &builder,
+                                       mlir::Value payload, unsigned index,
+                                       llvm::StringRef label) {
+  mlir::Value zero = constantI64(builder, op->getLoc(), 0);
+  llvm::SmallVector<mlir::Value, 4> words(kPayloadHandleWords, zero);
+  return storePayloadHandle(op, builder, payload, index, words, label);
+}
+
+} // namespace
+
+std::uint64_t
+RuntimeBundleLowerer::collectionInitialCapacity(std::uint64_t arity) const {
+  return std::max<std::uint64_t>(arity, kMinimumCollectionCapacity);
+}
+
+mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>>
+RuntimeBundleLowerer::objectPayloadHandleWords(mlir::Operation *op,
+                                               const RuntimeBundle &value,
+                                               bool ownsPayload) {
+  builder.setInsertionPoint(op);
+  mlir::Location loc = op->getLoc();
+  mlir::Value zero = constantI64(builder, loc, 0);
+  auto emptyHandle = [&]() {
+    return llvm::SmallVector<mlir::Value, 4>(kPayloadHandleWords, zero);
+  };
+
+  const RuntimeBundle *concrete =
+      RuntimeBundleLowerer::concreteObjectForOwnership(value);
+  if (!concrete || concrete->kind != RuntimeBundle::Kind::Object)
+    return op->emitError() << "collection payload element is not an object";
+  if (concrete->contractName() == "types.NoneType")
+    return emptyHandle();
+  if (concrete->physicalValues().empty())
+    return op->emitError()
+           << "collection payload element " << concrete->contract
+           << " has no physical object handle; materialize it before storing";
+
+  mlir::FailureOr<mlir::Value> header =
+      RuntimeBundleLowerer::objectPhysicalHeader(op, concrete->objectValue);
+  if (mlir::failed(header))
+    return mlir::failure();
+  mlir::Value classSlot = constantIndex(builder, loc, 1);
+  mlir::Value payloadClass =
+      builder.create<mlir::memref::LoadOp>(loc, *header, classSlot)
+          .getResult();
+  mlir::Value pointerIndex =
+      builder.create<mlir::memref::ExtractAlignedPointerAsIndexOp>(loc,
+                                                                   *header);
+  mlir::Value payloadPointer =
+      builder.create<mlir::arith::IndexCastOp>(loc, builder.getI64Type(),
+                                               pointerIndex)
+          .getResult();
+  mlir::Value refcount = constantI64(builder, loc, 1);
+  mlir::Value valueCount =
+      constantI64(builder, loc,
+                  std::min<unsigned>(concrete->physicalValues().size(),
+                                     kPayloadValuePointerWords));
+  mlir::Value owned = constantI64(builder, loc, ownsPayload ? 1 : 0);
+  llvm::SmallVector<mlir::Value, 4> words(kPayloadHandleWords, zero);
+  words[0] = refcount;
+  words[1] = payloadClass;
+  words[2] = payloadPointer;
+  words[3] = valueCount;
+  for (auto [index, physical] :
+       llvm::enumerate(concrete->physicalValues().take_front(
+           kPayloadValuePointerWords))) {
+    words[kPayloadValuePointerBase + index] =
+        pointerWordForPhysicalValue(builder, loc, physical, zero);
+    words[kPayloadValueSizeBase + index] =
+        sizeWordForPhysicalValue(builder, loc, physical, zero);
+  }
+  words[kPayloadOwnedFlagSlot] = owned;
+  return words;
+}
+
+mlir::FailureOr<RuntimeBundle>
+RuntimeBundleLowerer::materializePayloadObjectBundle(
+    mlir::Operation *op, const RuntimeBundle &value) {
+  const RuntimeBundle *concrete =
+      RuntimeBundleLowerer::concreteObjectForOwnership(value);
+  if (!concrete || concrete->kind != RuntimeBundle::Kind::Object)
+    return op->emitError()
+           << "collection payload requires an object bundle";
+  if (concrete->contractName() == "types.NoneType")
+    return *concrete;
+  if (RuntimeBundleLowerer::hasLazyPrimitiveI64Object(*concrete)) {
+    builder.setInsertionPoint(op);
+    mlir::FailureOr<RuntimeValue> object =
+        RuntimeBundleLowerer::materializePrimitiveI64Object(op, *concrete);
+    if (mlir::failed(object))
+      return mlir::failure();
+    RuntimeBundle materialized =
+        RuntimeBundle::object(concrete->objectValue.contract, object->values);
+    materialized.copyEvidenceFrom(*concrete);
+    return materialized;
+  }
+  if (concrete->physicalValues().empty())
+    return op->emitError()
+           << "collection payload element " << concrete->contract
+           << " has no physical object handle";
+  return *concrete;
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::ensureSequencePayloadCapacity(
+    mlir::Operation *op, RuntimeBundle &container, unsigned index,
+    llvm::StringRef label) {
+  if (container.sequenceCapacity && index < container.sequenceCapacity)
+    return mlir::success();
+  if (container.sequenceCapacity == 0 && index < kMinimumCollectionCapacity)
+    return mlir::success();
+
+  std::optional<RuntimeSymbol> ensure =
+      manifest.primitive(container.contractName(), "ensure_capacity");
+  if (!ensure)
+    return op->emitError()
+           << label << " payload capacity is exceeded, but the runtime "
+           << "manifest has no ensure_capacity primitive";
+
+  builder.setInsertionPoint(op);
+  mlir::Value required =
+      constantI64(builder, op->getLoc(), static_cast<std::int64_t>(index) + 1);
+  llvm::SmallVector<mlir::Value, 4> operands(container.physicalValues().begin(),
+                                             container.physicalValues().end());
+  operands.push_back(required);
+  mlir::func::CallOp call =
+      RuntimeBundleLowerer::createRuntimeCall(op->getLoc(), *ensure, operands);
+  RuntimeBundle updated;
+  if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+          op, container.objectValue.contract, call.getResults(), updated)))
+    return mlir::failure();
+  updated.copyEvidenceFrom(container);
+  std::uint64_t oldCapacity =
+      container.sequenceCapacity ? container.sequenceCapacity
+                                 : kMinimumCollectionCapacity;
+  updated.sequenceCapacity =
+      growCapacity(oldCapacity, static_cast<std::uint64_t>(index) + 1);
+  container = std::move(updated);
+  return mlir::success();
+}
+
+mlir::LogicalResult
+RuntimeBundleLowerer::ensureDictPayloadCapacity(mlir::Operation *op,
+                                                RuntimeBundle &container,
+                                                unsigned index) {
+  if (container.mappingCapacity && index < container.mappingCapacity)
+    return mlir::success();
+  if (container.mappingCapacity == 0 && index < kMinimumCollectionCapacity)
+    return mlir::success();
+
+  std::optional<RuntimeSymbol> ensure =
+      manifest.primitive("builtins.dict", "ensure_capacity");
+  if (!ensure)
+    return op->emitError()
+           << "dict payload capacity is exceeded, but the runtime manifest "
+              "has no ensure_capacity primitive";
+
+  builder.setInsertionPoint(op);
+  mlir::Value required =
+      constantI64(builder, op->getLoc(), static_cast<std::int64_t>(index) + 1);
+  llvm::SmallVector<mlir::Value, 6> operands(container.physicalValues().begin(),
+                                             container.physicalValues().end());
+  operands.push_back(required);
+  mlir::func::CallOp call =
+      RuntimeBundleLowerer::createRuntimeCall(op->getLoc(), *ensure, operands);
+  RuntimeBundle updated;
+  if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+          op, container.objectValue.contract, call.getResults(), updated)))
+    return mlir::failure();
+  updated.copyEvidenceFrom(container);
+  std::uint64_t oldCapacity =
+      container.mappingCapacity ? container.mappingCapacity
+                                : kMinimumCollectionCapacity;
+  updated.mappingCapacity =
+      growCapacity(oldCapacity, static_cast<std::uint64_t>(index) + 1);
+  container = std::move(updated);
+  return mlir::success();
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::initializeSequencePayload(
+    mlir::Operation *op, RuntimeBundle &container,
+    llvm::ArrayRef<std::shared_ptr<RuntimeBundle>> elements) {
+  if (!isSequenceCollection(container.contractName()))
+    return mlir::success();
+  if (container.physicalValues().size() < 3)
+    return op->emitError()
+           << container.contractName() << " has no physical item payload";
+  container.sequenceCapacity =
+      RuntimeBundleLowerer::collectionInitialCapacity(elements.size());
+  for (auto [index, element] : llvm::enumerate(elements)) {
+    if (!element)
+      continue;
+    mlir::FailureOr<RuntimeBundle> payload =
+        RuntimeBundleLowerer::materializePayloadObjectBundle(op, *element);
+    if (mlir::failed(payload))
+      return mlir::failure();
+    if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
+            op, *payload, "sequence.literal")))
+      return mlir::failure();
+    if (mlir::failed(RuntimeBundleLowerer::storeSequencePayloadElement(
+            op, container, static_cast<unsigned>(index), *payload)))
+      return mlir::failure();
+    RuntimeBundle stored = payload->withObjectOwnership(
+        ownership::logicalOwnershipKind(payload->objectValue.contract,
+                                                /*ownsObject=*/true));
+    if (index < container.sequenceElementBundles.size())
+      container.sequenceElementBundles[index] =
+          std::make_shared<RuntimeBundle>(stored);
+    if (index < container.sequenceElements.size())
+      container.sequenceElements[index] = stored.objectValue;
+  }
+  return mlir::success();
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::storeSequencePayloadElement(
+    mlir::Operation *op, RuntimeBundle &container, unsigned index,
+    const RuntimeBundle &element) {
+  if (!isSequenceCollection(container.contractName()))
+    return mlir::success();
+  if (container.physicalValues().size() < 3)
+    return op->emitError()
+           << container.contractName() << " has no physical item payload";
+  if (mlir::failed(RuntimeBundleLowerer::ensureSequencePayloadCapacity(
+          op, container, index, container.contractName())))
+    return mlir::failure();
+  mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
+      RuntimeBundleLowerer::objectPayloadHandleWords(op, element);
+  if (mlir::failed(words))
+    return mlir::failure();
+  return storePayloadHandle(op, builder, container.physicalValues()[2], index,
+                            *words, container.contractName());
+}
+
+mlir::LogicalResult
+RuntimeBundleLowerer::clearSequencePayloadElement(mlir::Operation *op,
+                                                  RuntimeBundle &container,
+                                                  unsigned index) {
+  if (!isSequenceCollection(container.contractName()))
+    return mlir::success();
+  if (container.physicalValues().size() < 3)
+    return op->emitError()
+           << container.contractName() << " has no physical item payload";
+  if (container.sequenceCapacity && index >= container.sequenceCapacity)
+    return op->emitError()
+           << container.contractName()
+           << " payload clear index exceeds capacity";
+  return clearPayloadHandle(op, builder, container.physicalValues()[2], index,
+                            container.contractName());
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::initializeDictPayload(
+    mlir::Operation *op, RuntimeBundle &container,
+    llvm::ArrayRef<std::shared_ptr<RuntimeBundle>> keys,
+    llvm::ArrayRef<std::shared_ptr<RuntimeBundle>> values) {
+  if (container.contractName() != "builtins.dict")
+    return mlir::success();
+  if (keys.size() != values.size())
+    return op->emitError() << "dict payload key/value count mismatch";
+  container.mappingCapacity =
+      RuntimeBundleLowerer::collectionInitialCapacity(keys.size());
+  for (auto [index, key] : llvm::enumerate(keys)) {
+    if (!key || !values[index])
+      return op->emitError() << "dict payload entry has no object evidence";
+    mlir::FailureOr<RuntimeBundle> payloadKey =
+        RuntimeBundleLowerer::materializePayloadObjectBundle(op, *key);
+    if (mlir::failed(payloadKey))
+      return mlir::failure();
+    mlir::FailureOr<RuntimeBundle> payloadValue =
+        RuntimeBundleLowerer::materializePayloadObjectBundle(op,
+                                                             *values[index]);
+    if (mlir::failed(payloadValue))
+      return mlir::failure();
+    if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
+            op, *payloadKey, "dict.literal.key")))
+      return mlir::failure();
+    if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
+            op, *payloadValue, "dict.literal.value")))
+      return mlir::failure();
+    if (mlir::failed(RuntimeBundleLowerer::storeDictKeyPayload(
+            op, container, static_cast<unsigned>(index), *payloadKey)))
+      return mlir::failure();
+    if (mlir::failed(RuntimeBundleLowerer::storeDictValuePayload(
+            op, container, static_cast<unsigned>(index), *payloadValue)))
+      return mlir::failure();
+    RuntimeBundle storedKey = payloadKey->withObjectOwnership(
+        ownership::logicalOwnershipKind(payloadKey->objectValue.contract,
+                                                /*ownsObject=*/true));
+    RuntimeBundle storedValue = payloadValue->withObjectOwnership(
+        ownership::logicalOwnershipKind(
+            payloadValue->objectValue.contract, /*ownsObject=*/true));
+    if (index < container.mappingKeyBundles.size())
+      container.mappingKeyBundles[index] =
+          std::make_shared<RuntimeBundle>(storedKey);
+    if (index < container.mappingValueBundles.size())
+      container.mappingValueBundles[index] =
+          std::make_shared<RuntimeBundle>(storedValue);
+    if (index < container.mappingValues.size())
+      container.mappingValues[index] = storedValue.objectValue;
+  }
+  return mlir::success();
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::storeDictKeyPayload(
+    mlir::Operation *op, RuntimeBundle &container, unsigned index,
+    const RuntimeBundle &key) {
+  if (container.contractName() != "builtins.dict")
+    return mlir::success();
+  if (container.physicalValues().size() < 5)
+    return op->emitError() << "dict has no physical payload arrays";
+  if (mlir::failed(
+          RuntimeBundleLowerer::ensureDictPayloadCapacity(op, container,
+                                                          index)))
+    return mlir::failure();
+  mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
+      RuntimeBundleLowerer::objectPayloadHandleWords(op, key);
+  if (mlir::failed(words))
+    return mlir::failure();
+  return storePayloadHandle(op, builder, container.physicalValues()[2], index,
+                            *words, "dict keys");
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::storeDictValuePayload(
+    mlir::Operation *op, RuntimeBundle &container, unsigned index,
+    const RuntimeBundle &value) {
+  if (container.contractName() != "builtins.dict")
+    return mlir::success();
+  if (container.physicalValues().size() < 5)
+    return op->emitError() << "dict has no physical payload arrays";
+  if (mlir::failed(
+          RuntimeBundleLowerer::ensureDictPayloadCapacity(op, container,
+                                                          index)))
+    return mlir::failure();
+  mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
+      RuntimeBundleLowerer::objectPayloadHandleWords(op, value);
+  if (mlir::failed(words))
+    return mlir::failure();
+  if (mlir::failed(storePayloadHandle(op, builder, container.physicalValues()[3],
+                                      index, *words, "dict values")))
+    return mlir::failure();
+  return storePayloadWord(op, builder, container.physicalValues()[4], index,
+                          constantI64(builder, op->getLoc(), 1),
+                          "dict present");
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::clearDictKeyPayload(
+    mlir::Operation *op, RuntimeBundle &container, unsigned index) {
+  if (container.contractName() != "builtins.dict")
+    return mlir::success();
+  if (container.physicalValues().size() < 5)
+    return op->emitError() << "dict has no physical payload arrays";
+  if (container.mappingCapacity && index >= container.mappingCapacity)
+    return op->emitError()
+           << "dict payload clear index exceeds capacity";
+  return clearPayloadHandle(op, builder, container.physicalValues()[2], index,
+                            "dict keys");
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::clearDictValuePayload(
+    mlir::Operation *op, RuntimeBundle &container, unsigned index) {
+  if (container.contractName() != "builtins.dict")
+    return mlir::success();
+  if (container.physicalValues().size() < 5)
+    return op->emitError() << "dict has no physical payload arrays";
+  if (container.mappingCapacity && index >= container.mappingCapacity)
+    return op->emitError()
+           << "dict payload clear index exceeds capacity";
+  mlir::Value zero = constantI64(builder, op->getLoc(), 0);
+  if (mlir::failed(clearPayloadHandle(op, builder, container.physicalValues()[3],
+                                      index, "dict values")))
+    return mlir::failure();
+  return storePayloadWord(op, builder, container.physicalValues()[4], index,
+                          zero, "dict present");
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::clearDictPayloadEntry(
+    mlir::Operation *op, RuntimeBundle &container, unsigned index) {
+  if (mlir::failed(
+          RuntimeBundleLowerer::clearDictKeyPayload(op, container, index)))
+    return mlir::failure();
+  return RuntimeBundleLowerer::clearDictValuePayload(op, container, index);
+}
+
+} // namespace py::lowering

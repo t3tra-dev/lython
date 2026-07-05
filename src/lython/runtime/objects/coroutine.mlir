@@ -9,7 +9,7 @@
 
 module attributes {ly.runtime.contracts = ["types.CoroutineType", "types.CoroutineAwaitIterator"]} {
   func.func private @Ly_IncRef(%header: memref<2xi64, strided<[1], offset: ?>> {ly.ownership.object_header})
-  func.func private @LyObject_DecRefHeader(%header: memref<2xi64, strided<[1], offset: ?>> {ly.ownership.object_header}) -> i1
+  func.func private @LyObject_ReleaseStorageToZero(%storage: memref<?xi64>) -> i1
 
   func.func @LyCoroutine_New(%target_id: i64) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 9 : i64, ly.runtime.contract = "types.CoroutineType", ly.runtime.initializer = "__new__"} {
     %one = arith.constant 1 : i64
@@ -26,7 +26,7 @@ module attributes {ly.runtime.contracts = ["types.CoroutineType", "types.Corouti
     memref.store %layout_coroutine, %storage[%layout_slot] : memref<5xi64>
     // State 0 = created, 1 = running, 2 = suspended, 3 = completed, 4 = closed.
     memref.store %zero, %storage[%state_slot] : memref<5xi64>
-    memref.store %target_id, %storage[%target_slot] : memref<5xi64>
+    memref.store %target_id, %storage[%target_slot] {ly.atomic.ordering = "release", ly.atomic.role = "coroutine.target.publish"} : memref<5xi64>
     // Resume index 0 is the initial entry. Future suspension points write the
     // switched-resume continuation index here before handing control to a Task.
     memref.store %zero, %storage[%resume_slot] : memref<5xi64>
@@ -105,7 +105,7 @@ module attributes {ly.runtime.contracts = ["types.CoroutineType", "types.Corouti
 
   func.func @LyCoroutine_Await(%storage: memref<5xi64> {ly.ownership.object_header}) -> (memref<3xi64>, memref<5xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "types.CoroutineType", ly.runtime.method = "__await__", ly.runtime.result_contract = "types.CoroutineAwaitIterator"} {
     %one = arith.constant 1 : i64
-    %layout_await_iter = arith.constant 10 : i64
+    %layout_await_iter = arith.constant 18 : i64
     %refcount_slot = arith.constant 0 : index
     %layout_slot = arith.constant 1 : index
     %consumed_slot = arith.constant 2 : index
@@ -132,9 +132,8 @@ module attributes {ly.runtime.contracts = ["types.CoroutineType", "types.Corouti
   }
 
   func.func @LyCoroutine_DecRef(%storage: memref<5xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "types.CoroutineType", ly.runtime.deallocator} {
-    %c0 = arith.constant 0 : index
-    %header = memref.subview %storage[%c0] [2] [1] : memref<5xi64> to memref<2xi64, strided<[1], offset: ?>>
-    %became_zero = func.call @LyObject_DecRefHeader(%header) : (memref<2xi64, strided<[1], offset: ?>>) -> i1
+    %dynamic_storage = memref.cast %storage : memref<5xi64> to memref<?xi64>
+    %became_zero = func.call @LyObject_ReleaseStorageToZero(%dynamic_storage) : (memref<?xi64>) -> i1
     cf.cond_br %became_zero, ^dealloc, ^done
 
   ^dealloc:
@@ -146,9 +145,8 @@ module attributes {ly.runtime.contracts = ["types.CoroutineType", "types.Corouti
   }
 
   func.func @LyCoroutineAwaitIterator_DecRef(%iterator: memref<3xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "types.CoroutineAwaitIterator", ly.runtime.deallocator} {
-    %c0 = arith.constant 0 : index
-    %header = memref.subview %iterator[%c0] [2] [1] : memref<3xi64> to memref<2xi64, strided<[1], offset: ?>>
-    %became_zero = func.call @LyObject_DecRefHeader(%header) : (memref<2xi64, strided<[1], offset: ?>>) -> i1
+    %dynamic_iterator = memref.cast %iterator : memref<3xi64> to memref<?xi64>
+    %became_zero = func.call @LyObject_ReleaseStorageToZero(%dynamic_iterator) : (memref<?xi64>) -> i1
     cf.cond_br %became_zero, ^dealloc, ^done
 
   ^dealloc:

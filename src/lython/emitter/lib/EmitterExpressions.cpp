@@ -9,6 +9,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "llvm/ADT/Twine.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <optional>
@@ -286,6 +287,22 @@ Value ModuleEmitter::emitCompare(const parser::Node &expr) {
     if (auto narrowed = emitNoneIdentityTest(rhs, lhs))
       return *narrowed;
   }
+  if (ast::isOperator(op, "In") || ast::isOperator(op, "NotIn")) {
+    CallInferenceResult inference =
+        types.inferMethodCallWithEvidence(rhs.type, "__contains__", {lhs.type});
+    auto contains = builder.create<py::ContainsOp>(
+        loc(expr), builder.getI1Type(),
+        mlir::FlatSymbolRefAttr::get(&context, "__contains__"),
+        callProtocolFor(inference), rhs.value, lhs.value);
+    mlir::Value bit = contains.getResult();
+    if (ast::isOperator(op, "NotIn")) {
+      auto one = builder.create<mlir::arith::ConstantIntOp>(loc(expr), 1, 1);
+      bit = builder.create<mlir::arith::XOrIOp>(loc(expr), bit, one);
+    }
+    auto pyBool =
+        builder.create<py::CastFromPrimOp>(loc(expr), types.boolType(), bit);
+    return Value{pyBool.getResult(), types.boolType()};
+  }
   if (ast::isOperator(op, "NotEq") || ast::isOperator(op, "IsNot"))
     return emitBinarySpecial<py::NeOp>(expr, "__ne__", lhs, rhs,
                                        types.boolType());
@@ -317,15 +334,108 @@ Value ModuleEmitter::emitSubscript(const parser::Node &expr) {
   return {op.getResult(), result};
 }
 
+Value ModuleEmitter::emitMethodObject(const parser::Node &anchor, Value object,
+                                      const MethodBinding &methodBinding) {
+  if (methodBinding.symbolName.empty())
+    return emitNone(anchor);
+
+  bool bindReceiver = methodBindingBindsReceiver(methodBinding);
+  if (methodBinding.kind == "instance" && mlir::isa<py::TypeType>(object.type))
+    bindReceiver = false;
+  if (!bindReceiver)
+    return emitFunctionObject(anchor, methodBinding.symbolName,
+                              methodBinding.signature.callable, {});
+
+  if (!methodBinding.method ||
+      methodBinding.signature.positionalTypes.empty() ||
+      methodBinding.signature.positionalNames.empty() ||
+      methodBinding.bodySignature.positionalTypes.empty() ||
+      methodBinding.bodySignature.positionalNames.empty())
+    return emitNone(anchor);
+
+  auto bindSignature = [&](FunctionSignature sig) {
+    sig.positionalTypes.erase(sig.positionalTypes.begin());
+    sig.positionalNames.erase(sig.positionalNames.begin());
+    if (!sig.positionalDefaults.empty())
+      sig.positionalDefaults.erase(sig.positionalDefaults.begin());
+    if (sig.positionalOnlyCount > 0)
+      --sig.positionalOnlyCount;
+    types.refreshCallable(sig);
+    return sig;
+  };
+
+  FunctionSignature boundPublicSig = bindSignature(methodBinding.signature);
+  FunctionSignature boundBodySig = bindSignature(methodBinding.bodySignature);
+
+  llvm::SmallVector<Capture, 1> captures;
+  mlir::Type preboundTypeObject;
+  if (methodBinding.kind == "class" || methodBinding.kind == "classmethod") {
+    preboundTypeObject = object.type;
+    if (auto typeObject = mlir::dyn_cast<py::TypeType>(object.type))
+      preboundTypeObject = typeObject.getInstanceType();
+  } else {
+    Value descriptorReceiver =
+        emitDescriptorReceiver(anchor, object, methodBinding);
+    captures.push_back(Capture{methodBinding.bodySignature.positionalNames.front(),
+                               descriptorReceiver});
+  }
+  std::string symbolName =
+      (llvm::Twine(methodBinding.symbolName) + "$bound$" +
+       llvm::Twine(++syntheticFunctionCounter) + "$" +
+       llvm::Twine(anchor.range.start.line) + "_" +
+       llvm::Twine(anchor.range.start.column))
+          .str();
+  emitCallableFunction(*methodBinding.method, symbolName, boundBodySig,
+                       captures, /*isLambda=*/false,
+                       /*positionalNodeOffset=*/1, preboundTypeObject);
+  return emitFunctionObject(anchor, symbolName, boundPublicSig.callable,
+                            captures);
+}
+
 Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
   Value object = emitExpr(ast::node(expr, "value"));
   mlir::Type result = types.inferExpr(&expr);
-  if (auto attr = ast::string(expr, "attr"))
-    if (std::optional<mlir::Type> field = lookupClassField(object.type, *attr))
-      result = *field;
-  auto op = builder.create<py::AttrGetOp>(loc(expr), result, object.value,
-                                          *ast::string(expr, "attr"));
-  return {op.getResult(), result};
+  auto attr = ast::string(expr, "attr");
+  if (!attr)
+    return emitNone(expr);
+  std::optional<mlir::Type> field = lookupClassField(object.type, *attr);
+  if (field)
+    result = *field;
+
+  std::optional<mlir::Type> staticAttr =
+      lookupClassStaticAttr(object.type, *attr);
+  if (staticAttr)
+    result = *staticAttr;
+
+  std::optional<MethodBinding> methodBinding =
+      lookupClassMethod(object.type, *attr);
+  if (methodBinding && !methodBinding->symbolName.empty())
+    return emitMethodObject(expr, object, *methodBinding);
+
+  auto op =
+      builder.create<py::AttrGetOp>(loc(expr), result, object.value, *attr);
+  if (field)
+    op->setAttr("ly.attr.kind", builder.getStringAttr("field"));
+  else if (staticAttr)
+    op->setAttr("ly.attr.kind", builder.getStringAttr("static"));
+  else if (methodBinding)
+    op->setAttr("ly.attr.kind", builder.getStringAttr(methodBinding->kind));
+  if (auto typeObject = mlir::dyn_cast_if_present<py::TypeType>(object.type)) {
+    if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(
+            typeObject.getInstanceType()))
+      op->setAttr("ly.attr.owner",
+                  builder.getStringAttr(contract.getContractName()));
+  } else if (auto contract =
+                 mlir::dyn_cast_if_present<py::ContractType>(object.type)) {
+    op->setAttr("ly.attr.owner",
+                builder.getStringAttr(contract.getContractName()));
+  }
+  Value value{op.getResult(), result};
+  if (methodBinding)
+    value.boundMethod =
+        std::make_shared<BoundMethodValue>(BoundMethodValue{object,
+                                                            *methodBinding});
+  return value;
 }
 
 Value ModuleEmitter::emitAwait(const parser::Node &expr) {

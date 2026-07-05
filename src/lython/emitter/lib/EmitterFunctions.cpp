@@ -1,4 +1,5 @@
 #include "EmitterCore.h"
+#include "EmitterPyOps.h"
 #include "EmitterSupport.h"
 
 #include "AstAccess.h"
@@ -27,7 +28,9 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
                                          llvm::StringRef symbolName,
                                          const FunctionSignature &sig,
                                          llvm::ArrayRef<Capture> captures,
-                                         bool isLambda) {
+                                         bool isLambda,
+                                         unsigned positionalNodeOffset,
+                                         mlir::Type preboundTypeObject) {
   mlir::OpBuilder::InsertionGuard guard(builder);
   builder.setInsertionPointToEnd(module.getBody());
 
@@ -76,17 +79,26 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
   currentReturnType = sig.resultType;
   currentFunctionPrefix = symbolName.str();
   types.bindSymbol(symbolName, sig.callable);
+  std::optional<std::string> preboundTypeObjectName;
   if (const parser::Node *arguments = ast::node(callable, "args")) {
     llvm::SmallVector<const parser::Node *, 8> positional =
         positionalArgumentNodes(*arguments);
+    if (preboundTypeObject && positionalNodeOffset > 0 && !positional.empty())
+      preboundTypeObjectName =
+          std::string(ast::nameSpelling(*positional.front()));
     for (auto [index, argument] : llvm::enumerate(positional)) {
-      if (index >= sig.positionalTypes.size() ||
-          index >= entry->getNumArguments())
+      if (index < positionalNodeOffset)
+        continue;
+      unsigned logicalIndex = static_cast<unsigned>(index) -
+                              positionalNodeOffset;
+      if (logicalIndex >= sig.positionalTypes.size() ||
+          logicalIndex >= entry->getNumArguments())
         break;
       llvm::StringRef name = ast::nameSpelling(*argument);
       values[name] =
-          Value{entry->getArgument(index), sig.positionalTypes[index]};
-      types.bindSymbol(name, sig.positionalTypes[index]);
+          Value{entry->getArgument(logicalIndex),
+                sig.positionalTypes[logicalIndex]};
+      types.bindSymbol(name, sig.positionalTypes[logicalIndex]);
     }
     if (const auto *kwonly = ast::nodeList(*arguments, "kwonlyargs")) {
       unsigned offset = static_cast<unsigned>(sig.positionalTypes.size());
@@ -128,6 +140,15 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
   }
 
   builder.setInsertionPointToStart(entry);
+  if (preboundTypeObjectName && preboundTypeObject) {
+    mlir::Type classType = types.typeObject(preboundTypeObject);
+    auto typeObject =
+        builder.create<py::TypeObjectOp>(loc(callable), classType,
+                                         preboundTypeObject);
+    values[*preboundTypeObjectName] =
+        Value{typeObject.getResult(), classType};
+    types.bindSymbol(*preboundTypeObjectName, classType);
+  }
   if (isLambda) {
     Value body = coerceValue(emitExpr(ast::node(callable, "body")),
                              currentReturnType, callable);

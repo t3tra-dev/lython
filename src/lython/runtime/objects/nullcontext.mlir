@@ -1,6 +1,6 @@
 module attributes {ly.runtime.contracts = ["contextlib.nullcontext"]} {
   func.func private @Ly_IncRef(%header: memref<2xi64, strided<[1], offset: ?>> {ly.ownership.object_header})
-  func.func private @LyObject_DecRefHeader(%header: memref<2xi64, strided<[1], offset: ?>> {ly.ownership.object_header}) -> i1
+  func.func private @LyObject_ReleaseStorageToZero(%storage: memref<?xi64>) -> i1
 
   func.func @LyNullContext_New() -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 8 : i64, ly.runtime.contract = "contextlib.nullcontext", ly.runtime.initializer = "__new__"} {
     %header = memref.alloc() {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<2xi64>
@@ -29,8 +29,8 @@ module attributes {ly.runtime.contracts = ["contextlib.nullcontext"]} {
   }
 
   func.func @LyNullContext_DecRef(%header: memref<2xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "contextlib.nullcontext", ly.runtime.deallocator} {
-    %header_view = memref.cast %header : memref<2xi64> to memref<2xi64, strided<[1], offset: ?>>
-    %became_zero = func.call @LyObject_DecRefHeader(%header_view) : (memref<2xi64, strided<[1], offset: ?>>) -> i1
+    %storage = memref.cast %header : memref<2xi64> to memref<?xi64>
+    %became_zero = func.call @LyObject_ReleaseStorageToZero(%storage) : (memref<?xi64>) -> i1
     cf.cond_br %became_zero, ^dealloc, ^done
 
   ^dealloc:

@@ -30,7 +30,17 @@ module attributes {ly.runtime.contracts = ["asyncio.AbstractEventLoop", "_asynci
   func.func private @LyAsyncio_Sleep_Builtin() -> memref<5xi64> attributes {ly.runtime.builtin = "asyncio.sleep", ly.runtime.builtin_lowering = "asyncio_sleep", ly.runtime.contract = "types.CoroutineType", ly.runtime.primitive = "builtin_sleep", ly.runtime.result_contract = "types.CoroutineType"}
 
   func.func @LyAsyncio_GetEventLoop() -> memref<8xi64> attributes {ly.runtime.builtin = "asyncio.get_event_loop", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "asyncio.AbstractEventLoop", ly.runtime.primitive = "get_event_loop", ly.runtime.result_contract = "asyncio.AbstractEventLoop"} {
+    %running_slot = arith.constant 2 : index
+    %ready_tail_slot = arith.constant 5 : index
     %loop = memref.get_global @__ly_asyncio_default_loop : memref<8xi64>
+    memref.generic_atomic_rmw %loop[%running_slot] : memref<8xi64> {
+    ^bb0(%current : i64):
+      memref.atomic_yield %current : i64
+    } {ly.atomic.ordering = "acq_rel", ly.atomic.role = "asyncio.loop.running.publish"}
+    memref.generic_atomic_rmw %loop[%ready_tail_slot] : memref<8xi64> {
+    ^bb0(%current : i64):
+      memref.atomic_yield %current : i64
+    } {ly.atomic.ordering = "acq_rel", ly.atomic.role = "asyncio.ready.tail.publish"}
     func.return %loop : memref<8xi64>
   }
 
@@ -61,7 +71,7 @@ module attributes {ly.runtime.contracts = ["asyncio.AbstractEventLoop", "_asynci
       %body_positive_next = arith.select %body_positive, %body_incremented, %current : i1, i64
       %body_next = arith.select %body_immortal_check, %current, %body_positive_next : i1, i64
       memref.atomic_yield %body_next : i64
-    } {ly.atomic.ordering = "acq_rel", ly.atomic.role = "asyncio.object.refcount.retain"}
+    } {ly.atomic.ordering = "acq_rel", ly.atomic.retain_premise = "entry-borrowed", ly.atomic.role = "asyncio.object.refcount.retain"}
     %is_immortal = arith.cmpi eq, %previous, %immortal : i64
     cf.cond_br %is_immortal, ^done, ^check_positive
 
@@ -161,10 +171,10 @@ module attributes {ly.runtime.contracts = ["asyncio.AbstractEventLoop", "_asynci
     %loop = memref.alloc() {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<8xi64>
     memref.store %one, %loop[%refcount_slot] : memref<8xi64>
     memref.store %layout, %loop[%layout_slot] : memref<8xi64>
-    memref.store %zero, %loop[%running_slot] : memref<8xi64>
+    memref.store %zero, %loop[%running_slot] {ly.atomic.ordering = "release", ly.atomic.role = "asyncio.loop.running.publish"} : memref<8xi64>
     memref.store %zero, %loop[%stopping_slot] : memref<8xi64>
     memref.store %zero, %loop[%ready_head_slot] : memref<8xi64>
-    memref.store %zero, %loop[%ready_tail_slot] : memref<8xi64>
+    memref.store %zero, %loop[%ready_tail_slot] {ly.atomic.ordering = "release", ly.atomic.role = "asyncio.ready.tail.publish"} : memref<8xi64>
     memref.store %zero, %loop[%timer_count_slot] : memref<8xi64>
     memref.store %zero, %loop[%io_watch_count_slot] : memref<8xi64>
     func.return %loop : memref<8xi64>
@@ -284,8 +294,8 @@ module attributes {ly.runtime.contracts = ["asyncio.AbstractEventLoop", "_asynci
     %future = memref.alloc() {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<10xi64>
     memref.store %one, %future[%refcount_slot] : memref<10xi64>
     memref.store %layout, %future[%layout_slot] : memref<10xi64>
-    // State 0 = pending, 1 = finished, 2 = cancelled.
-    memref.store %zero, %future[%state_slot] : memref<10xi64>
+    // State 0 = pending, 1 = finished, 2 = cancelled, 3 = publishing.
+    memref.store %zero, %future[%state_slot] {ly.atomic.ordering = "release", ly.atomic.role = "asyncio.future.state.publish"} : memref<10xi64>
     memref.store %zero, %future[%cancel_requests_slot] : memref<10xi64>
     memref.store %zero, %future[%ready_callbacks_slot] : memref<10xi64>
     memref.store %zero, %future[%loop_id_slot] : memref<10xi64>
@@ -302,9 +312,12 @@ module attributes {ly.runtime.contracts = ["asyncio.AbstractEventLoop", "_asynci
 
   func.func @LyFuture_Done(%future: memref<10xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "_asyncio.Future", ly.runtime.method = "done", ly.runtime.result_contract = "builtins.bool"} {
     %state_slot = arith.constant 2 : index
-    %pending = arith.constant 0 : i64
+    %finished = arith.constant 1 : i64
+    %cancelled_state = arith.constant 2 : i64
     %state = memref.load %future[%state_slot] {ly.atomic.ordering = "acquire", ly.atomic.role = "asyncio.future.state.load"} : memref<10xi64>
-    %done = arith.cmpi ne, %state, %pending : i64
+    %is_finished = arith.cmpi eq, %state, %finished : i64
+    %is_cancelled = arith.cmpi eq, %state, %cancelled_state : i64
+    %done = arith.ori %is_finished, %is_cancelled : i1
     func.return %done : i1
   }
 
@@ -344,6 +357,35 @@ module attributes {ly.runtime.contracts = ["asyncio.AbstractEventLoop", "_asynci
     func.return %cancelled : i1
   }
 
+  func.func private @LyFuture_ReserveFinish(%future: memref<10xi64> {ly.ownership.object_header}) -> i1 {
+    %state_slot = arith.constant 2 : index
+    %pending = arith.constant 0 : i64
+    %publishing = arith.constant 3 : i64
+    %previous = memref.generic_atomic_rmw %future[%state_slot] : memref<10xi64> {
+    ^bb0(%current : i64):
+      %is_pending = arith.cmpi eq, %current, %pending : i64
+      %next = arith.select %is_pending, %publishing, %current : i1, i64
+      memref.atomic_yield %next : i64
+    } {ly.atomic.ordering = "acq_rel", ly.atomic.role = "asyncio.future.finish.reserve"}
+    %was_pending = arith.cmpi eq, %previous, %pending : i64
+    func.return %was_pending : i1
+  }
+
+  func.func private @LyFuture_CommitFinished(%future: memref<10xi64> {ly.ownership.object_header}) {
+    %state_slot = arith.constant 2 : index
+    %publishing = arith.constant 3 : i64
+    %finished = arith.constant 1 : i64
+    %previous = memref.generic_atomic_rmw %future[%state_slot] : memref<10xi64> {
+    ^bb0(%current : i64):
+      %is_publishing = arith.cmpi eq, %current, %publishing : i64
+      %next = arith.select %is_publishing, %finished, %current : i1, i64
+      memref.atomic_yield %next : i64
+    } {ly.atomic.ordering = "acq_rel", ly.atomic.role = "asyncio.future.finish"}
+    %was_publishing = arith.cmpi eq, %previous, %publishing : i64
+    cf.assert %was_publishing, "LyFuture_CommitFinished called without a reserved future payload"
+    func.return
+  }
+
   func.func @LyFuture_MarkFinished(%future: memref<10xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "_asyncio.Future", ly.runtime.primitive = "finish.request"} {
     %state_slot = arith.constant 2 : index
     %pending = arith.constant 0 : i64
@@ -363,12 +405,13 @@ module attributes {ly.runtime.contracts = ["asyncio.AbstractEventLoop", "_asynci
     %one = arith.constant 1 : i64
     %result_token_slot = arith.constant 7 : index
     %exception_token_slot = arith.constant 8 : index
-    %finished = func.call @LyFuture_MarkFinished(%future) : (memref<10xi64>) -> i1
+    %finished = func.call @LyFuture_ReserveFinish(%future) : (memref<10xi64>) -> i1
     cf.cond_br %finished, ^record, ^invalid
 
   ^record:
     memref.store %one, %future[%result_token_slot] {ly.atomic.ordering = "release", ly.atomic.role = "asyncio.future.result.token"} : memref<10xi64>
     memref.store %zero, %future[%exception_token_slot] {ly.atomic.ordering = "release", ly.atomic.role = "asyncio.future.exception.token.clear"} : memref<10xi64>
+    func.call @LyFuture_CommitFinished(%future) : (memref<10xi64>) -> ()
     cf.br ^done
 
   ^invalid:
@@ -384,12 +427,13 @@ module attributes {ly.runtime.contracts = ["asyncio.AbstractEventLoop", "_asynci
     %one = arith.constant 1 : i64
     %result_token_slot = arith.constant 7 : index
     %exception_token_slot = arith.constant 8 : index
-    %finished = func.call @LyFuture_MarkFinished(%future) : (memref<10xi64>) -> i1
+    %finished = func.call @LyFuture_ReserveFinish(%future) : (memref<10xi64>) -> i1
     cf.cond_br %finished, ^record, ^invalid
 
   ^record:
     memref.store %zero, %future[%result_token_slot] {ly.atomic.ordering = "release", ly.atomic.role = "asyncio.future.result.token.clear"} : memref<10xi64>
     memref.store %one, %future[%exception_token_slot] {ly.atomic.ordering = "release", ly.atomic.role = "asyncio.future.exception.token"} : memref<10xi64>
+    func.call @LyFuture_CommitFinished(%future) : (memref<10xi64>) -> ()
     cf.br ^done
 
   ^invalid:
@@ -503,8 +547,8 @@ module attributes {ly.runtime.contracts = ["asyncio.AbstractEventLoop", "_asynci
     memref.store %one, %task[%refcount_slot] : memref<12xi64>
     memref.store %layout, %task[%layout_slot] : memref<12xi64>
     // Task states: 0 = pending, 1 = running, 2 = finished, 3 = cancelled.
-    memref.store %zero, %task[%state_slot] : memref<12xi64>
-    memref.store %zero, %task[%cancel_requests_slot] : memref<12xi64>
+    memref.store %zero, %task[%state_slot] {ly.atomic.ordering = "release", ly.atomic.role = "asyncio.task.state.publish"} : memref<12xi64>
+    memref.store %zero, %task[%cancel_requests_slot] {ly.atomic.ordering = "release", ly.atomic.role = "asyncio.task.cancel.requests.publish"} : memref<12xi64>
     memref.store %zero, %task[%ready_callbacks_slot] : memref<12xi64>
     memref.store %zero, %task[%loop_id_slot] : memref<12xi64>
     memref.store %zero, %task[%waiter_count_slot] : memref<12xi64>

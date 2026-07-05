@@ -8,13 +8,17 @@
 #include "llvm/ADT/StringMap.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 
 namespace lython::emitter {
 
+struct BoundMethodValue;
+
 struct Value {
   mlir::Value value;
   mlir::Type type;
+  std::shared_ptr<BoundMethodValue> boundMethod = nullptr;
 };
 
 struct Capture {
@@ -24,7 +28,16 @@ struct Capture {
 
 struct MethodBinding {
   const parser::Node *method = nullptr;
+  FunctionSignature bodySignature;
   FunctionSignature signature;
+  std::string kind = "instance";
+  std::string symbolName;
+  bool async = false;
+};
+
+struct BoundMethodValue {
+  Value receiver;
+  MethodBinding method;
 };
 
 struct WithCleanup {

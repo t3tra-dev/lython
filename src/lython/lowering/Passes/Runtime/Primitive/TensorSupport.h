@@ -11,7 +11,7 @@ class Location;
 class OpBuilder;
 } // namespace mlir
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 
 inline constexpr std::uint64_t kPrimitiveTensorPackedMinSourceElements =
     256ull * 256ull;
@@ -41,4 +41,4 @@ std::optional<int64_t> selectDivisibleVectorLanes(mlir::Type elementType,
                                                   int64_t vectorBits,
                                                   int64_t minLanes);
 
-} // namespace py::runtime_lowering
+} // namespace py::lowering

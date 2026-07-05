@@ -2,7 +2,7 @@
 
 #include <iterator>
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 namespace {
 
 mlir::func::FuncOp getOrCreatePrivateFunction(mlir::ModuleOp module,
@@ -55,12 +55,14 @@ mlir::func::FuncOp RuntimeBundleLowerer::getOrCreateTryCatchAnchor() {
 
 std::optional<std::int64_t> RuntimeBundleLowerer::currentTryHandlerId() const {
   mlir::Block *block = builder.getInsertionBlock();
-  if (!block)
-    return std::nullopt;
-  auto found = tryHandlerIds.find(block);
-  if (found == tryHandlerIds.end())
-    return std::nullopt;
-  return found->second;
+  while (block) {
+    auto found = tryHandlerIds.find(block);
+    if (found != tryHandlerIds.end())
+      return found->second;
+    mlir::Operation *parent = block->getParentOp();
+    block = parent ? parent->getBlock() : nullptr;
+  }
+  return std::nullopt;
 }
 
 void RuntimeBundleLowerer::emitTryCallSiteMarker(mlir::Location loc,
@@ -151,4 +153,4 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStructuredTryOps() {
   return mlir::success();
 }
 
-} // namespace py::runtime_lowering
+} // namespace py::lowering

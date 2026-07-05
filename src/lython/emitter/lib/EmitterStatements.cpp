@@ -151,9 +151,15 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
   }
   if (target.kind == "Attribute") {
     Value object = emitExpr(ast::node(target, "value"));
-    if (auto attr = ast::string(target, "attr"))
-      builder.create<py::AttrSetOp>(loc(target), object.value, *attr,
-                                    value.value);
+    if (auto attr = ast::string(target, "attr")) {
+      auto op = builder.create<py::AttrSetOp>(loc(target), object.value, *attr,
+                                              value.value);
+      if (lookupClassField(object.type, *attr))
+        op->setAttr("ly.attr.kind", builder.getStringAttr("field"));
+      if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(object.type))
+        op->setAttr("ly.attr.owner",
+                    builder.getStringAttr(contract.getContractName()));
+    }
     return;
   }
   if (target.kind == "Subscript") {

@@ -9,6 +9,7 @@
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Path.h"
 
@@ -28,6 +29,11 @@ struct PythonTryCallMarker {
   std::int64_t id = 0;
   llvm::CallInst *marker = nullptr;
   llvm::BasicBlock *catchBlock = nullptr;
+};
+
+struct PendingPythonTryCallMarker {
+  std::int64_t id = 0;
+  llvm::CallInst *marker = nullptr;
 };
 
 std::string tracebackFunctionName(llvm::StringRef symbolName) {
@@ -83,24 +89,22 @@ std::optional<std::int64_t> i64ConstantArgument(const llvm::CallInst &call,
   return constant->getSExtValue();
 }
 
-std::optional<PythonTryCallMarker> tryCallMarkerFor(
-    llvm::CallInst &call,
-    const llvm::DenseMap<std::int64_t, PythonCatchTarget> &catchTargets) {
-  llvm::BasicBlock *block = call.getParent();
-  auto current = call.getIterator();
-  if (current == block->begin())
-    return std::nullopt;
-  --current;
-  auto *marker = llvm::dyn_cast<llvm::CallInst>(&*current);
-  if (!marker || !isRuntimeMarkerCall(*marker, "LyEH_TryCallSiteMarker"))
-    return std::nullopt;
-  std::optional<std::int64_t> id = i64ConstantArgument(*marker, 0);
-  if (!id)
-    return std::nullopt;
-  auto target = catchTargets.find(*id);
-  if (target == catchTargets.end() || !target->second.block)
-    return std::nullopt;
-  return PythonTryCallMarker{*id, marker, target->second.block};
+bool canSkipBetweenTryMarkerAndCall(const llvm::Instruction &instruction) {
+  if (llvm::isa<llvm::DbgInfoIntrinsic>(&instruction))
+    return true;
+  if (!instruction.mayHaveSideEffects())
+    return true;
+  const auto *intrinsic = llvm::dyn_cast<llvm::IntrinsicInst>(&instruction);
+  if (!intrinsic)
+    return false;
+  switch (intrinsic->getIntrinsicID()) {
+  case llvm::Intrinsic::lifetime_start:
+  case llvm::Intrinsic::lifetime_end:
+  case llvm::Intrinsic::assume:
+    return true;
+  default:
+    return false;
+  }
 }
 
 std::string debugLocationPath(const llvm::DILocation &loc) {
@@ -429,29 +433,48 @@ bool installPythonExceptionCleanupFrames(
   llvm::SmallVector<llvm::CallInst *, 8> anchors;
   llvm::SmallVector<llvm::CallInst *, 16> callSiteMarkers;
   llvm::DenseMap<std::int64_t, PythonCatchTarget> catchTargets;
+  llvm::DenseMap<llvm::CallInst *, PendingPythonTryCallMarker> tryCallSites;
   for (llvm::Function &function : module) {
     if (!isPythonDebugFunction(&function))
       continue;
     for (llvm::BasicBlock &block : function) {
+      std::optional<PendingPythonTryCallMarker> pendingTryMarker;
       for (llvm::Instruction &instruction : block) {
         auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
-        if (!call)
+        if (!call) {
+          if (pendingTryMarker &&
+              !canSkipBetweenTryMarkerAndCall(instruction))
+            pendingTryMarker.reset();
           continue;
+        }
         if (isRuntimeMarkerCall(*call, "LyEH_TryCatchMarker")) {
           if (std::optional<std::int64_t> id = i64ConstantArgument(*call, 0))
             catchTargets[*id] = PythonCatchTarget{&block, call};
+          pendingTryMarker.reset();
           continue;
         }
         if (isRuntimeMarkerCall(*call, "LyEH_TryCallSiteMarker")) {
           callSiteMarkers.push_back(call);
+          if (std::optional<std::int64_t> id = i64ConstantArgument(*call, 0))
+            pendingTryMarker = PendingPythonTryCallMarker{*id, call};
+          else
+            pendingTryMarker.reset();
           continue;
         }
         if (isRuntimeMarkerCall(*call, "LyEH_TryCatchAnchor")) {
           anchors.push_back(call);
+          pendingTryMarker.reset();
           continue;
         }
-        if (call)
-          calls.push_back(call);
+        if (pendingTryMarker) {
+          if (mayPropagatePythonException(call->getCalledFunction())) {
+            tryCallSites[call] = *pendingTryMarker;
+            pendingTryMarker.reset();
+          } else if (!canSkipBetweenTryMarkerAndCall(*call)) {
+            pendingTryMarker.reset();
+          }
+        }
+        calls.push_back(call);
       }
     }
   }
@@ -460,10 +483,18 @@ bool installPythonExceptionCleanupFrames(
   for (llvm::CallInst *anchor : anchors)
     changed |= rewriteTryCatchAnchor(*anchor);
   for (llvm::CallInst *call : calls) {
-    if (std::optional<PythonTryCallMarker> marker =
-            tryCallMarkerFor(*call, catchTargets)) {
-      changed |= convertCallToPythonTryInvoke(*call, *marker, callSites);
-      continue;
+    auto markerInfo = tryCallSites.find(call);
+    if (markerInfo != tryCallSites.end()) {
+      auto target = catchTargets.find(markerInfo->second.id);
+      if (target != catchTargets.end() && target->second.block) {
+        PythonTryCallMarker marker{markerInfo->second.id,
+                                   markerInfo->second.marker,
+                                   target->second.block};
+        if (convertCallToPythonTryInvoke(*call, marker, callSites)) {
+          changed = true;
+          continue;
+        }
+      }
     }
     changed |= convertCallToPythonInvoke(*call, callSites);
   }

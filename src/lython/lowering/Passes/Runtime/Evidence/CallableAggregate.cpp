@@ -1,6 +1,6 @@
 #include "Runtime/Evidence/Callable.h"
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 
 using namespace callable_evidence;
 
@@ -273,4 +273,4 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableAggregateEvidenceABIs() {
   }
   return mlir::success();
 }
-} // namespace py::runtime_lowering
+} // namespace py::lowering

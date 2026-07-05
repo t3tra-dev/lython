@@ -7,7 +7,7 @@
 
 #include <cstdint>
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 
 inline constexpr int64_t kPackedPanelAlignment = 64;
 inline constexpr int64_t kPackedCopyVectorBits = 512;
@@ -36,4 +36,4 @@ bool tryPrepackFullRhsPanel(mlir::linalg::MatmulOp matmul,
                             mlir::IRRewriter &rewriter,
                             llvm::SmallVectorImpl<RhsPrepackPlan> &plans);
 
-} // namespace py::runtime_lowering
+} // namespace py::lowering

@@ -192,15 +192,16 @@ void appendStarredCallArgumentTypes(const AlgorithmM &types, mlir::Type type,
                                     llvm::SmallVectorImpl<mlir::Type> &out) {
   type = types.widenLiteral(type);
   if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(type)) {
-    if (contract.getContractName() == "builtins.tuple" &&
-        !contract.getArguments().empty()) {
-      out.push_back(contract.getArguments().front());
+    if (contract.getContractName() == "builtins.tuple") {
+      llvm::ArrayRef<mlir::Type> arguments = contract.getArguments();
+      if (arguments.empty())
+        out.push_back(types.object());
+      else if (arguments.size() == 1)
+        out.push_back(arguments.front());
+      else
+        out.append(arguments.begin(), arguments.end());
       return;
     }
-  }
-  if (auto tuple = mlir::dyn_cast_if_present<py::TupleType>(type)) {
-    out.append(tuple.getElementTypes().begin(), tuple.getElementTypes().end());
-    return;
   }
   out.push_back(types.object());
 }
@@ -251,9 +252,9 @@ std::optional<std::string> protocolAnnotationName(llvm::StringRef name) {
   name = annotationNamespaceTail(name);
   for (llvm::StringRef protocol :
        {"Awaitable", "Coroutine", "AsyncIterable", "AsyncIterator",
-        "AsyncGenerator", "Iterable", "Iterator", "Generator", "Collection",
-        "Sequence", "Mapping", "MutableMapping", "ContextManager",
-        "AsyncContextManager"})
+        "AsyncGenerator", "Sized", "Iterable", "Iterator", "Generator",
+        "Collection", "Sequence", "Mapping", "MutableMapping",
+        "ContextManager", "AsyncContextManager"})
     if (name == protocol)
       return protocol.str();
   return std::nullopt;
@@ -315,6 +316,7 @@ void bindAnnotationModuleAliases(
                                "AsyncIterable",
                                "AsyncIterator",
                                "AsyncGenerator",
+                               "Sized",
                                "Iterable",
                                "Iterator",
                                "Generator",
@@ -521,11 +523,6 @@ std::optional<std::string> staticParameterName(mlir::Type type) {
     if (name.starts_with("$"))
       return name.drop_front().str();
   }
-  if (auto classType = mlir::dyn_cast_if_present<py::ClassType>(type)) {
-    llvm::StringRef name = classType.getClassName();
-    if (name.starts_with("$"))
-      return name.drop_front().str();
-  }
   return std::nullopt;
 }
 
@@ -619,8 +616,11 @@ std::optional<std::string> unpackedTypeVarTupleName(mlir::Type type) {
 }
 
 llvm::ArrayRef<mlir::Type> typeVarTupleElements(mlir::Type type) {
-  if (auto tuple = mlir::dyn_cast_if_present<py::TupleType>(type))
-    return tuple.getElementTypes();
+  if (auto pack = mlir::dyn_cast_if_present<py::CallableType>(type))
+    return pack.getPositionalTypes();
+  if (auto tuple = mlir::dyn_cast_if_present<py::ContractType>(type))
+    if (tuple.getContractName() == "builtins.tuple")
+      return tuple.getArguments();
   return {};
 }
 
@@ -753,7 +753,8 @@ bool bindTypeVarTuplePack(const AlgorithmM &types, llvm::StringRef name,
             unpackedTypeVarTupleName(positional.front()))
       if (*forwarded == name)
         return true;
-  mlir::Type pack = py::TupleType::get(&types.getContext(), positional);
+  mlir::Type pack =
+      py::CallableType::get(&types.getContext(), positional, {}, {}, {}, {});
   auto found = bindings.find(name.str());
   if (found == bindings.end()) {
     bindings[name.str()] = pack;
@@ -1151,22 +1152,6 @@ mlir::Type substituteType(const AlgorithmM &types, mlir::Type type,
           substituteType(types, candidate, bindings, eraseUnbound));
     return py::OverloadType::get(type.getContext(), candidates);
   }
-  if (auto tuple = mlir::dyn_cast_if_present<py::TupleType>(type)) {
-    llvm::SmallVector<mlir::Type, 4> elements;
-    for (mlir::Type element : tuple.getElementTypes())
-      elements.push_back(
-          substituteType(types, element, bindings, eraseUnbound));
-    return py::TupleType::get(type.getContext(), elements);
-  }
-  if (auto list = mlir::dyn_cast_if_present<py::ListType>(type))
-    return py::ListType::get(
-        type.getContext(),
-        substituteType(types, list.getElementType(), bindings, eraseUnbound));
-  if (auto dict = mlir::dyn_cast_if_present<py::DictType>(type))
-    return py::DictType::get(
-        type.getContext(),
-        substituteType(types, dict.getKeyType(), bindings, eraseUnbound),
-        substituteType(types, dict.getValueType(), bindings, eraseUnbound));
   return type;
 }
 

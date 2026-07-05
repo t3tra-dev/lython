@@ -1,6 +1,6 @@
 #include "Runtime/Ctypes/Internal.h"
 
-namespace py::runtime_lowering::ctypes {
+namespace py::lowering::ctypes {
 
 std::string describeNativeArgumentSource(const RuntimeBundle &source) {
   std::string text;
@@ -53,4 +53,4 @@ std::string describeNativeArgumentSource(const RuntimeBundle &source) {
   return os.str();
 }
 
-} // namespace py::runtime_lowering::ctypes
+} // namespace py::lowering::ctypes

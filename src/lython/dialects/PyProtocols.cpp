@@ -4,7 +4,6 @@
 #include "CandidateSelection.h"
 #include "PyCallableShape.h"
 
-#include "mlir/Dialect/Async/IR/Async.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Interfaces/InferTypeOpInterface.h"
@@ -144,7 +143,7 @@ bool hasMarker(mlir::Operation *op, llvm::StringRef name) {
   return op && op->hasAttr(name);
 }
 
-// Type variable occurrences are class types whose name starts with '$'.
+// Type variable occurrences are manifest contracts whose name starts with '$'.
 std::optional<llvm::StringRef> typeVariableName(mlir::Type type) {
   if (auto typeVar = mlir::dyn_cast<py::TypeVarType>(type))
     return typeVar.getName();
@@ -157,10 +156,7 @@ std::optional<llvm::StringRef> typeVariableName(mlir::Type type) {
     if (name.starts_with("$"))
       return name.drop_front();
   }
-  auto classType = mlir::dyn_cast<py::ClassType>(type);
-  if (!classType || !classType.getClassName().starts_with("$"))
-    return std::nullopt;
-  return classType.getClassName().drop_front();
+  return std::nullopt;
 }
 
 bool hasBase(const ProtocolInfo &info, llvm::StringRef baseName) {
@@ -185,10 +181,6 @@ mlir::Type substitute(mlir::Type type,
     auto found = binding.find(variable->str());
     return found == binding.end() ? type : found->second;
   }
-  if (auto classType = mlir::dyn_cast<py::ClassType>(type)) {
-    auto found = binding.find(classType.getClassName().str());
-    return found == binding.end() ? type : found->second;
-  }
   if (auto contract = mlir::dyn_cast<py::ContractType>(type)) {
     llvm::SmallVector<mlir::Type> args;
     args.reserve(contract.getArguments().size());
@@ -205,27 +197,6 @@ mlir::Type substitute(mlir::Type type,
     mlir::Type packed = substitute(unpack.getPackedType(), binding);
     return packed ? py::UnpackType::get(type.getContext(), packed)
                   : mlir::Type();
-  }
-  if (auto tuple = mlir::dyn_cast<py::TupleType>(type)) {
-    llvm::SmallVector<mlir::Type> elements;
-    for (mlir::Type element : tuple.getElementTypes()) {
-      mlir::Type substituted = substitute(element, binding);
-      if (!substituted)
-        return {};
-      elements.push_back(substituted);
-    }
-    return py::TupleType::get(type.getContext(), elements);
-  }
-  if (auto list = mlir::dyn_cast<py::ListType>(type)) {
-    mlir::Type element = substitute(list.getElementType(), binding);
-    return element ? py::ListType::get(type.getContext(), element)
-                   : mlir::Type();
-  }
-  if (auto dict = mlir::dyn_cast<py::DictType>(type)) {
-    mlir::Type key = substitute(dict.getKeyType(), binding);
-    mlir::Type value = substitute(dict.getValueType(), binding);
-    return key && value ? py::DictType::get(type.getContext(), key, value)
-                        : mlir::Type();
   }
   if (auto typeType = mlir::dyn_cast<py::TypeType>(type)) {
     mlir::Type instance = substitute(typeType.getInstanceType(), binding);
@@ -277,10 +248,6 @@ mlir::Type substitute(mlir::Type type,
   }
   if (auto signature = mlir::dyn_cast<py::CallableType>(type))
     return substituteSignature(signature, binding);
-  if (auto asyncValue = mlir::dyn_cast<mlir::async::ValueType>(type)) {
-    mlir::Type value = substitute(asyncValue.getValueType(), binding);
-    return value ? mlir::async::ValueType::get(value) : mlir::Type();
-  }
   return type;
 }
 
@@ -290,7 +257,7 @@ std::optional<ProtocolMethod> callableCallContract(py::CallableType callable) {
 
   mlir::MLIRContext *context = callable.getContext();
   llvm::SmallVector<mlir::Type> positional;
-  positional.push_back(py::ClassType::get(context, "Callable"));
+  positional.push_back(py::ContractType::get(context, "builtins.function"));
   positional.append(callable.getPositionalTypes().begin(),
                     callable.getPositionalTypes().end());
   llvm::SmallVector<mlir::StringAttr> positionalNames;
@@ -474,22 +441,30 @@ py::CallableType bindReceiverCallableImpl(py::CallableType signature) {
 // Binds a concrete dialect type to its manifest class and parameter map.
 std::optional<std::pair<std::string, std::map<std::string, mlir::Type>>>
 bindConcrete(mlir::Type type) {
-  if (mlir::isa<py::ObjectType>(type))
-    return {{"object", {}}};
-  if (mlir::isa<py::BoolType>(type))
-    return {{"bool", {}}};
-  if (mlir::isa<py::IntType>(type))
-    return {{"int", {}}};
-  if (mlir::isa<py::FloatType>(type))
-    return {{"float", {}}};
-  if (auto list = mlir::dyn_cast<py::ListType>(type))
-    return {{"list", {{"T", list.getElementType()}}}};
-  if (mlir::isa<py::StrType>(type))
-    return {{"str", {}}};
-  if (auto tuple = mlir::dyn_cast<py::TupleType>(type)) {
-    llvm::ArrayRef<mlir::Type> elements = tuple.getElementTypes();
+  if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(type)) {
+    llvm::StringRef name = contract.getContractName();
+    llvm::ArrayRef<mlir::Type> arguments = contract.getArguments();
+    if (name == "builtins.object")
+      return {{"object", {}}};
+    if (name == "builtins.bool")
+      return {{"bool", {}}};
+    if (name == "builtins.int")
+      return {{"int", {}}};
+    if (name == "builtins.float")
+      return {{"float", {}}};
+    if (name == "builtins.str")
+      return {{"str", {}}};
+    if (name == "types.NoneType")
+      return {{"NoneType", {}}};
+    if (name == "builtins.list" && arguments.size() == 1)
+      return {{"list", {{"T", arguments.front()}}}};
+    if (name == "builtins.dict" && arguments.size() == 2)
+      return {{"dict", {{"K", arguments[0]}, {"V", arguments[1]}}}};
+    if (name != "builtins.tuple")
+      return std::nullopt;
+    llvm::ArrayRef<mlir::Type> elements = arguments;
     if (elements.empty())
-      return {{"tuple", {{"T", py::ObjectType::get(type.getContext())}}}};
+      return {{"tuple", {{"T", py::pyObjectContractType(type.getContext())}}}};
     mlir::Type elementType = elements.front();
     for (mlir::Type element : elements)
       if (element != elementType) {
@@ -498,12 +473,6 @@ bindConcrete(mlir::Type type) {
       }
     return {{"tuple", {{"T", elementType}}}};
   }
-  if (auto dict = mlir::dyn_cast<py::DictType>(type))
-    return {{"dict", {{"K", dict.getKeyType()}, {"V", dict.getValueType()}}}};
-  if (mlir::Type element = py::primitiveIteratorStateElementType(type))
-    return {{"Iterator", {{"T", element}}}};
-  if (auto asyncValue = mlir::dyn_cast<mlir::async::ValueType>(type))
-    return {{"Awaitable", {{"T", asyncValue.getValueType()}}}};
   return std::nullopt;
 }
 
@@ -572,16 +541,6 @@ bindReceiver(mlir::Type type,
         (*binding)["T"] = typeObject.getInstanceType();
         return {{"type", *binding}};
       }
-    }
-  }
-
-  if (auto classType = mlir::dyn_cast<py::ClassType>(type)) {
-    auto found = classes.find(classType.getClassName().str());
-    if (found != classes.end()) {
-      std::optional<std::map<std::string, mlir::Type>> binding =
-          bindProtocolInstantiation(found->second, {});
-      if (binding)
-        return {{classType.getClassName().str(), *binding}};
     }
   }
 
@@ -970,7 +929,60 @@ Table::resolveFieldContractWithEvidence(mlir::Type receiverType,
 std::optional<std::vector<mlir::Type>>
 Table::protocolArgumentsFor(mlir::Type receiverType,
                             llvm::StringRef protocolName) const {
-  return protocolArgumentsForImpl(classes, receiverType, protocolName);
+  if (std::optional<std::vector<mlir::Type>> nominal =
+          protocolArgumentsForImpl(classes, receiverType, protocolName))
+    return nominal;
+
+  auto oneConsistentPayload =
+      [](llvm::ArrayRef<mlir::Type> candidates)
+      -> std::optional<std::vector<mlir::Type>> {
+    mlir::Type selected;
+    for (mlir::Type candidate : candidates) {
+      if (!candidate)
+        continue;
+      if (!selected) {
+        selected = candidate;
+        continue;
+      }
+      if (selected != candidate)
+        return std::nullopt;
+    }
+    if (!selected)
+      return std::nullopt;
+    return std::vector<mlir::Type>{selected};
+  };
+
+  if (protocolName == "AsyncIterator") {
+    llvm::SmallVector<mlir::Type, 2> payloads;
+    for (ContractResolution candidate :
+         methodContractCandidatesWithEvidence(receiverType, "__anext__")) {
+      llvm::ArrayRef<mlir::Type> results =
+          candidate.method.signature.getResultTypes();
+      if (results.size() != 1)
+        continue;
+      if (mlir::Type payload = awaitablePayloadType(results.front()))
+        payloads.push_back(payload);
+    }
+    return oneConsistentPayload(payloads);
+  }
+
+  if (protocolName == "AsyncIterable") {
+    llvm::SmallVector<mlir::Type, 2> payloads;
+    for (ContractResolution candidate :
+         methodContractCandidatesWithEvidence(receiverType, "__aiter__")) {
+      llvm::ArrayRef<mlir::Type> results =
+          candidate.method.signature.getResultTypes();
+      if (results.size() != 1)
+        continue;
+      std::optional<std::vector<mlir::Type>> iteratorArgs =
+          protocolArgumentsFor(results.front(), "AsyncIterator");
+      if (iteratorArgs && iteratorArgs->size() == 1)
+        payloads.push_back(iteratorArgs->front());
+    }
+    return oneConsistentPayload(payloads);
+  }
+
+  return std::nullopt;
 }
 
 std::optional<std::vector<mlir::Type>>
@@ -1139,8 +1151,6 @@ Table::resolveAwaitableWithEvidence(mlir::Type type) const {
         return AwaitableResolution{payload, std::move(resolution)};
   }
 
-  if (auto asyncValue = mlir::dyn_cast<mlir::async::ValueType>(type))
-    return AwaitableResolution{asyncValue.getValueType(), std::nullopt};
   if (mlir::Type payload = awaitableDescriptorPayloadType(type))
     return AwaitableResolution{payload, std::nullopt};
 

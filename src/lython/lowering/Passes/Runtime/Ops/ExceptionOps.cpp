@@ -1,6 +1,6 @@
 #include "Runtime/Core/Lowerer.h"
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 namespace {
 
 void getLocInfo(mlir::Location loc, llvm::StringRef &filename,
@@ -252,7 +252,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerRaise(py::RaiseOp op) {
 
   RuntimeBundleLowerer::createRuntimeCall(op.getLoc(), *symbol, operands);
   createDeadContinuation(builder, op.getOperation());
-  erase.push_back(op);
+  op.erase();
   return mlir::success();
 }
 
@@ -262,7 +262,7 @@ RuntimeBundleLowerer::lowerRaiseCurrent(py::RaiseCurrentOp op) {
   builder.setInsertionPoint(op);
   builder.create<mlir::func::CallOp>(op.getLoc(), rethrow, mlir::ValueRange{});
   createDeadContinuation(builder, op.getOperation());
-  erase.push_back(op);
+  op.erase();
   return mlir::success();
 }
 
@@ -330,4 +330,4 @@ RuntimeBundleLowerer::lowerExceptCurrentMatch(py::ExceptCurrentMatchOp op) {
   return mlir::success();
 }
 
-} // namespace py::runtime_lowering
+} // namespace py::lowering

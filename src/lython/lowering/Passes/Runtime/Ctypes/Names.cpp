@@ -1,7 +1,7 @@
 #include "Runtime/Ctypes/Internal.h"
 #include "llvm/ADT/StringSwitch.h"
 
-namespace py::runtime_lowering::ctypes {
+namespace py::lowering::ctypes {
 
 struct CtypesNameMap {
   llvm::StringLiteral name;
@@ -153,4 +153,4 @@ RuntimeBundle makeCtypesModuleBundle(mlir::Type resultType,
   return bundle;
 }
 
-} // namespace py::runtime_lowering::ctypes
+} // namespace py::lowering::ctypes

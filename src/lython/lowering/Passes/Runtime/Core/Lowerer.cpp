@@ -1,6 +1,6 @@
 #include "Runtime/Core/Lowerer.h"
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 
 RuntimeBundleLowerer::RuntimeBundleLowerer(mlir::ModuleOp module)
     : module(module), context(module.getContext()), builder(context),
@@ -25,7 +25,11 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerModule() {
     return mlir::failure();
   if (mlir::failed(buildReturnedObjectEvidenceSummaries()))
     return mlir::failure();
+  if (mlir::failed(buildReturnedStaticObjectSummaries()))
+    return mlir::failure();
   if (mlir::failed(prepareCallableFunctionABIs()))
+    return mlir::failure();
+  if (mlir::failed(synthesizeSourceClassDeallocators()))
     return mlir::failure();
   if (mlir::failed(lowerStructuredTryOps()))
     return mlir::failure();
@@ -34,15 +38,22 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerModule() {
   module.walk([&](mlir::Operation *op) {
     if (!op->getDialect() || op->getDialect()->getNamespace() != "py")
       return;
+    if (RuntimeBundleLowerer::isCallableProtocolTemplate(
+            op->getParentOfType<mlir::func::FuncOp>()))
+      return;
     pyOps.push_back(op);
   });
   for (mlir::Operation *op : pyOps) {
+    if (llvm::is_contained(erase, op))
+      continue;
     if (mlir::failed(ensureOperationOperandBundles(op)))
       return mlir::failure();
     if (mlir::failed(lowerPyOp(op)))
       return mlir::failure();
   }
   if (mlir::failed(lowerFunctionReturns()))
+    return mlir::failure();
+  if (mlir::failed(eraseCallableProtocolTemplateFunctions()))
     return mlir::failure();
   if (mlir::failed(dropControlFlowLogicalBranchOperands()))
     return mlir::failure();
@@ -53,4 +64,16 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerModule() {
   return RuntimeBundleLowerer::eraseCallableLogicalEntryArgs();
 }
 
-} // namespace py::runtime_lowering
+mlir::LogicalResult
+RuntimeBundleLowerer::eraseCallableProtocolTemplateFunctions() {
+  llvm::SmallVector<mlir::func::FuncOp, 8> templates;
+  module.walk([&](mlir::func::FuncOp function) {
+    if (RuntimeBundleLowerer::isCallableProtocolTemplate(function))
+      templates.push_back(function);
+  });
+  for (mlir::func::FuncOp function : templates)
+    function.erase();
+  return mlir::success();
+}
+
+} // namespace py::lowering

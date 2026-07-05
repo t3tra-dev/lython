@@ -1,6 +1,6 @@
 #include "Runtime/Core/Lowerer.h"
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 namespace {
 
 const RuntimeCallableAlternative *
@@ -10,6 +10,28 @@ findCallableAlternative(const RuntimeBundle &callable, llvm::StringRef target) {
     if (alternative.functionTarget == target)
       return &alternative;
   return nullptr;
+}
+
+py::CallableType callableContractForDispatchMatch(mlir::func::FuncOp function,
+                                                  py::CallableType callable) {
+  auto bodyResult =
+      function->getAttrOfType<mlir::TypeAttr>("ly.async.body_result");
+  if (!bodyResult)
+    return callable;
+
+  mlir::MLIRContext *context = function.getContext();
+  mlir::Type object = runtimeContractType(context, "builtins.object");
+  mlir::Type coroutine =
+      py::ContractType::get(context, "types.CoroutineType",
+                            {object, object, bodyResult.getValue()});
+  return py::CallableType::get(
+      context, callable.getPositionalTypes(), callable.getKwOnlyTypes(),
+      callable.hasVararg() ? callable.getVarargType() : mlir::Type(),
+      callable.hasKwarg() ? callable.getKwargType() : mlir::Type(),
+      llvm::ArrayRef<mlir::Type>{coroutine}, callable.getPositionalNames(),
+      callable.getKwOnlyNames(), callable.getPositionalDefaults(),
+      callable.getKwOnlyDefaults(), callable.getVarargName(),
+      callable.getKwargName(), callable.getPositionalOnlyCount());
 }
 
 } // namespace
@@ -29,6 +51,8 @@ RuntimeBundleLowerer::collectIndirectCallableTargets(
   module.walk([&](mlir::func::FuncOp function) {
     if (function.isDeclaration() || !function->hasAttr("callable_type"))
       return;
+    if (RuntimeBundleLowerer::isCallableProtocolTemplate(function))
+      return;
 
     auto callableAttr =
         function->getAttrOfType<mlir::TypeAttr>("callable_type");
@@ -37,7 +61,17 @@ RuntimeBundleLowerer::collectIndirectCallableTargets(
     if (!callable || callable.getResultTypes().size() != 1)
       return;
 
-    if (!py::isAssignableTo(callable, expected, op.getOperation()))
+    llvm::StringRef functionName = function.getSymName();
+    if (!callableBundle.functionTarget.empty() &&
+        callableBundle.functionTarget != functionName)
+      return;
+    if (!callableBundle.callableAlternatives.empty() &&
+        !findCallableAlternative(callableBundle, functionName))
+      return;
+
+    py::CallableType matchCallable =
+        callableContractForDispatchMatch(function, callable);
+    if (!py::isAssignableTo(matchCallable, expected, op.getOperation()))
       return;
     if (!RuntimeBundleLowerer::collectCallableArgumentPlan(
             op, callable, /*emitErrors=*/false))
@@ -77,7 +111,8 @@ mlir::LogicalResult RuntimeBundleLowerer::appendBundlePhysicalOperands(
   if (values.empty() &&
       RuntimeBundleLowerer::hasLazyPrimitiveI64Object(bundle)) {
     mlir::FailureOr<RuntimeValue> value =
-        RuntimeBundleLowerer::materializePrimitiveI64Object(op, bundle);
+        RuntimeBundleLowerer::materializePrimitiveI64ObjectAtCurrentInsertion(
+            op, bundle);
     if (mlir::failed(value))
       return mlir::failure();
     materializedObject = std::move(*value);
@@ -98,14 +133,32 @@ mlir::LogicalResult RuntimeBundleLowerer::appendBundlePhysicalOperands(
   }
 
   if (expectedTypes.size() == 1 && bundle.kind == RuntimeBundle::Kind::Object &&
-      isBuiltinsObjectHeaderType(expectedTypes.front())) {
-    const RuntimeValue &objectValue =
-        materializedObject ? *materializedObject : bundle.objectValue;
-    mlir::FailureOr<mlir::Value> header =
-        RuntimeBundleLowerer::objectHeaderView(op, objectValue);
-    if (mlir::failed(header))
-      return mlir::failure();
-    operands.push_back(*header);
+      isBuiltinsObjectHandleType(expectedTypes.front())) {
+    if (!RuntimeBundleLowerer::isBuiltinsObjectContract(bundle.contract)) {
+      mlir::FailureOr<RuntimeBundle> boxed =
+          RuntimeBundleLowerer::boxRuntimeObjectAtCurrentInsertion(
+              op, bundle, /*retainPayload=*/true);
+      if (mlir::failed(boxed))
+        return mlir::failure();
+      llvm::ArrayRef<mlir::Value> values = boxed->physicalValues();
+      if (values.size() == 1 &&
+          values.front().getType() == expectedTypes.front()) {
+        operands.push_back(values.front());
+        return mlir::success();
+      }
+      return op->emitError()
+             << "boxed indirect callable result for " << bundle.contractName()
+             << " does not match expected object ABI "
+             << describeTypeSequence(expectedTypes);
+    }
+    if (values.empty())
+      return op->emitError() << "builtins.object result has no boxed handle";
+    if (values.front().getType() != expectedTypes.front())
+      return op->emitError()
+             << "builtins.object result handle " << values.front().getType()
+             << " does not match expected ABI "
+             << describeTypeSequence(expectedTypes);
+    operands.push_back(values.front());
     return mlir::success();
   }
 
@@ -121,6 +174,71 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
     return op.emitError()
            << "Python callable lowering expects exactly one Python result";
 
+  llvm::SmallVector<mlir::func::FuncOp, 8> targets =
+      RuntimeBundleLowerer::collectIndirectCallableTargets(op, callable);
+
+  if (targets.size() == 1) {
+    mlir::func::FuncOp target = targets.front();
+    llvm::StringRef targetName = target.getSymName();
+    RuntimeBundle selectedCallable = callable;
+    selectedCallable.functionTarget = targetName.str();
+    if (!callable.callableAlternatives.empty()) {
+      const RuntimeCallableAlternative *alternative =
+          findCallableAlternative(callable, targetName);
+      if (!alternative)
+        return op.emitError() << "indirect callable has no closure evidence "
+                                 "alternative for "
+                              << targetName;
+      selectedCallable.closureValues = alternative->closureValues;
+    }
+
+    builder.setInsertionPoint(op);
+    llvm::SmallVector<const RuntimeBundle *, 8> sources;
+    llvm::SmallVector<RuntimeBundle, 8> materializedDefaults;
+    llvm::SmallVector<RuntimeBundle, 4> closureSources;
+    llvm::SmallVector<RuntimeBundle, 8> argumentEvidenceSources;
+    llvm::SmallVector<RuntimeBundle, 8> aggregateEvidenceSources;
+    if (mlir::failed(RuntimeBundleLowerer::collectFunctionTargetRuntimeSources(
+            op, target, targetName, selectedCallable, sources,
+            materializedDefaults, closureSources, argumentEvidenceSources,
+            aggregateEvidenceSources)))
+      return mlir::failure();
+    RuntimeBundle result;
+    bool usedPrimitiveClone = false;
+    if (target->hasAttr("ly.async.body_result")) {
+      if (mlir::failed(RuntimeBundleLowerer::emitAsyncFunctionTargetCallResult(
+              op, target, targetName, sources, result)))
+        return mlir::failure();
+    } else if (std::optional<std::string> cloneName =
+                   RuntimeBundleLowerer::primitiveI64CloneFor(targetName)) {
+      if (RuntimeBundleLowerer::allSourcesHavePrimitiveI64Evidence(sources)) {
+        if (mlir::func::FuncOp clone =
+                module.lookupSymbol<mlir::func::FuncOp>(*cloneName)) {
+          if (mlir::failed(
+                  RuntimeBundleLowerer::emitPrimitiveI64CloneFallbackResult(
+                      op, target, targetName, clone, sources, result)))
+            return mlir::failure();
+          usedPrimitiveClone = true;
+        }
+      }
+    }
+    if (!target->hasAttr("ly.async.body_result") && !usedPrimitiveClone) {
+      mlir::FailureOr<mlir::func::CallOp> call =
+          RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(
+              op, target, targetName, sources);
+      if (mlir::failed(call))
+        return mlir::failure();
+
+      if (mlir::failed(RuntimeBundleLowerer::bundleFunctionTargetCallResult(
+              op, target, targetName, *call, sources, result)))
+        return mlir::failure();
+    }
+
+    valueBundles[op.getResult(0)] = std::move(result);
+    erase.push_back(op);
+    return mlir::success();
+  }
+
   mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> resultTypes =
       RuntimeBundleLowerer::runtimeValueTypesFor(
           op, op.getResult(0).getType(), "indirect callable result ABI");
@@ -130,9 +248,6 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
                                                      resultTypes->end());
   RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(
       op.getResult(0).getType(), continuationTypes);
-
-  llvm::SmallVector<mlir::func::FuncOp, 8> targets =
-      RuntimeBundleLowerer::collectIndirectCallableTargets(op, callable);
 
   builder.setInsertionPoint(op);
   mlir::MemRefType storageType =
@@ -219,15 +334,14 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
             materializedDefaults, closureSources, argumentEvidenceSources,
             aggregateEvidenceSources)))
       return mlir::failure();
-    if (target->hasAttr("ly.async.body_result"))
-      return op.emitError()
-             << "indirect async callable dispatch for " << targetName
-             << " requires coroutine frame evidence";
-
     RuntimeBundle targetResult;
     bool usedPrimitiveClone = false;
-    if (std::optional<std::string> cloneName =
-            RuntimeBundleLowerer::primitiveI64CloneFor(targetName)) {
+    if (target->hasAttr("ly.async.body_result")) {
+      if (mlir::failed(RuntimeBundleLowerer::emitAsyncFunctionTargetCallResult(
+              op, target, targetName, sources, targetResult)))
+        return mlir::failure();
+    } else if (std::optional<std::string> cloneName =
+                   RuntimeBundleLowerer::primitiveI64CloneFor(targetName)) {
       if (RuntimeBundleLowerer::allSourcesHavePrimitiveI64Evidence(sources)) {
         if (mlir::func::FuncOp clone =
                 module.lookupSymbol<mlir::func::FuncOp>(*cloneName)) {
@@ -239,7 +353,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
         }
       }
     }
-    if (!usedPrimitiveClone) {
+    if (!target->hasAttr("ly.async.body_result") && !usedPrimitiveClone) {
       mlir::FailureOr<mlir::func::CallOp> call =
           RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(
               op, target, targetName, sources);
@@ -321,4 +435,4 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
   return mlir::success();
 }
 
-} // namespace py::runtime_lowering
+} // namespace py::lowering

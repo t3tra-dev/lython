@@ -35,7 +35,7 @@
 #include <optional>
 #include <utility>
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 namespace {
 
 // Keep reductions at a width that lowers to efficient target vectors without
@@ -1172,13 +1172,13 @@ private:
 };
 
 } // namespace
-} // namespace py::runtime_lowering
+} // namespace py::lowering
 
 namespace py {
 
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createLinalgLoweringPass(TensorLoweringTarget target) {
-  return std::make_unique<runtime_lowering::LinalgLoweringPass>(target);
+  return std::make_unique<lowering::LinalgLoweringPass>(target);
 }
 
 } // namespace py

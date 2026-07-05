@@ -1,6 +1,6 @@
 #include "Runtime/Core/Lowerer.h"
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 
 mlir::LogicalResult RuntimeBundleLowerer::appendCallableArgumentEvidenceSources(
     py::CallOp op, llvm::StringRef targetName,
@@ -13,17 +13,26 @@ mlir::LogicalResult RuntimeBundleLowerer::appendCallableArgumentEvidenceSources(
        evidence.logicalArguments) {
     for (const RuntimeArgumentEvidence &argumentEvidence :
          evidenceSet.alternatives)
-      hiddenCount += argumentEvidence.closureValueTypes.size();
+      hiddenCount += argumentEvidence.closureValueTypes.size() +
+                     argumentEvidence.coroutineSourceTypes.size();
   }
   evidenceSources.reserve(evidenceSources.size() + hiddenCount);
   sources.reserve(sources.size() + hiddenCount);
 
-  auto appendEvidenceValue =
-      [&](const RuntimeValue &value) -> mlir::LogicalResult {
-    evidenceSources.push_back(
-        RuntimeBundle::object(value.contract, value.values));
+  auto appendEvidenceBundle =
+      [&](const RuntimeBundle &bundle) -> mlir::LogicalResult {
+    if (bundle.kind != RuntimeBundle::Kind::Object)
+      return op.emitError()
+             << "argument evidence source for " << targetName
+             << " must be an object bundle";
+    evidenceSources.push_back(bundle);
     sources.push_back(&evidenceSources.back());
     return mlir::success();
+  };
+  auto appendEvidenceValue =
+      [&](const RuntimeValue &value) -> mlir::LogicalResult {
+    return appendEvidenceBundle(RuntimeBundle::object(value.contract,
+                                                      value.values));
   };
   auto appendPlaceholder = [&](mlir::Type expected) -> mlir::LogicalResult {
     mlir::FailureOr<RuntimeValue> dead =
@@ -78,6 +87,47 @@ mlir::LogicalResult RuntimeBundleLowerer::appendCallableArgumentEvidenceSources(
          evidenceSet.alternatives) {
       if (argumentEvidence.empty())
         continue;
+
+      if (!argumentEvidence.coroutineTarget.empty()) {
+        if (source->coroutineTarget == argumentEvidence.coroutineTarget) {
+          if (source->coroutineSources.size() !=
+              argumentEvidence.coroutineSourceTypes.size())
+            return op.emitError()
+                   << "argument coroutine evidence source count mismatch for "
+                   << targetName;
+          for (auto [sourceIndex, expected] :
+               llvm::enumerate(argumentEvidence.coroutineSourceTypes)) {
+            const RuntimeValue &value = source->coroutineSources[sourceIndex];
+            if (!py::isAssignableTo(value.contract, expected,
+                                    op.getOperation()))
+              return op.emitError()
+                     << "argument coroutine evidence source " << sourceIndex
+                     << " for " << targetName << " has contract "
+                     << value.contract << ", expected " << expected;
+            if (sourceIndex < source->coroutineSourceBundles.size() &&
+                source->coroutineSourceBundles[sourceIndex]) {
+              if (mlir::failed(appendEvidenceBundle(
+                      *source->coroutineSourceBundles[sourceIndex])))
+                return mlir::failure();
+              continue;
+            }
+            if (mlir::failed(appendEvidenceValue(value)))
+              return mlir::failure();
+          }
+          continue;
+        }
+
+        if (source->coroutineTarget.empty())
+          return op.emitError()
+                 << "argument evidence source for " << targetName
+                 << " has no static coroutine target alternative '"
+                 << argumentEvidence.coroutineTarget << "'";
+
+        for (mlir::Type expected : argumentEvidence.coroutineSourceTypes)
+          if (mlir::failed(appendPlaceholder(expected)))
+            return mlir::failure();
+        continue;
+      }
 
       if (argumentEvidence.functionTarget.empty()) {
         if (mlir::failed(appendClosureEvidence(
@@ -264,4 +314,4 @@ RuntimeBundleLowerer::appendCallableAggregateEvidenceSources(
   }
   return mlir::success();
 }
-} // namespace py::runtime_lowering
+} // namespace py::lowering

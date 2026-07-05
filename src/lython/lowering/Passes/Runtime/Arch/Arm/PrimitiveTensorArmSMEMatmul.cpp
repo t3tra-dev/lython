@@ -19,7 +19,7 @@
 #include <memory>
 #include <optional>
 
-namespace py::runtime_lowering::arch::arm {
+namespace py::lowering::arch::arm {
 namespace {
 
 struct StaticMatmulMemRefs {
@@ -425,4 +425,4 @@ createMatmulSMELoweringPass() {
   return std::make_unique<MatmulSMELoweringPass>();
 }
 
-} // namespace py::runtime_lowering::arch::arm
+} // namespace py::lowering::arch::arm

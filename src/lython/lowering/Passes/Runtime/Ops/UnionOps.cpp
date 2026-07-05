@@ -1,6 +1,6 @@
 #include "Runtime/Core/Lowerer.h"
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 
 namespace {
 
@@ -69,18 +69,12 @@ mlir::LogicalResult RuntimeBundleLowerer::appendUnionRuntimeValues(
 
   auto sourceUnion = mlir::dyn_cast<py::UnionType>(sourceType);
   auto appendDeadMember = [&](mlir::Type member) -> mlir::LogicalResult {
-    mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> memberTypes =
-        RuntimeBundleLowerer::runtimeValueTypesFor(op, member,
-                                                   "union member ABI");
-    if (mlir::failed(memberTypes))
+    mlir::FailureOr<RuntimeValue> value =
+        RuntimeBundleLowerer::materializeDeadObjectValue(op, member,
+                                                         "union member ABI");
+    if (mlir::failed(value))
       return mlir::failure();
-    for (mlir::Type type : *memberTypes) {
-      mlir::FailureOr<mlir::Value> value =
-          RuntimeBundleLowerer::materializeDeadPhysicalValue(op, type);
-      if (mlir::failed(value))
-        return mlir::failure();
-      values.push_back(*value);
-    }
+    values.append(value->values.begin(), value->values.end());
     return mlir::success();
   };
 
@@ -365,4 +359,4 @@ RuntimeBundleLowerer::lowerUnionUnwrap(py::UnionUnwrapOp op) {
   return mlir::success();
 }
 
-} // namespace py::runtime_lowering
+} // namespace py::lowering

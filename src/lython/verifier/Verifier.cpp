@@ -1,8 +1,10 @@
 #include "PyDialectTypes.h"
+#include "PyTypeObject.h"
 
 #include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/OpImplementation.h"
@@ -15,6 +17,8 @@
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
+
+#include <optional>
 
 #define GET_OP_CLASSES
 #include "PyOps.h.inc"
@@ -163,6 +167,34 @@ mlir::LogicalResult verifyContractResults(mlir::Operation *op) {
   return mlir::success();
 }
 
+mlir::LogicalResult verifyOptionalStringAttr(mlir::Operation *op,
+                                             llvm::StringRef name) {
+  mlir::Attribute attr = op->getAttr(name);
+  if (!attr)
+    return mlir::success();
+  auto stringAttr = mlir::dyn_cast<mlir::StringAttr>(attr);
+  if (!stringAttr || stringAttr.getValue().empty())
+    return op->emitOpError("'") << name
+                                << "' must be a non-empty StringAttr";
+  return mlir::success();
+}
+
+mlir::LogicalResult verifyDescriptorKindAttr(mlir::Operation *op,
+                                             llvm::StringRef name,
+                                             bool allowField) {
+  mlir::Attribute attr = op->getAttr(name);
+  if (!attr)
+    return mlir::success();
+  auto stringAttr = mlir::dyn_cast<mlir::StringAttr>(attr);
+  if (!stringAttr)
+    return op->emitOpError("'") << name << "' must be a StringAttr";
+  llvm::StringRef kind = stringAttr.getValue();
+  if ((allowField && kind == "field") || kind == "instance" ||
+      kind == "static" || kind == "class" || kind == "classmethod")
+    return mlir::success();
+  return op->emitOpError("unsupported descriptor kind '") << kind << "'";
+}
+
 mlir::LogicalResult verifyBinarySpecialMethod(mlir::Operation *op) {
   auto methodName = op->getAttrOfType<mlir::StringAttr>("method_name");
   if (!methodName || methodName.getValue().empty())
@@ -191,6 +223,48 @@ bool unionContainsOrCovers(UnionType unionType, mlir::Type member) {
   return false;
 }
 
+std::optional<std::string> nominalContractName(mlir::Type type) {
+  if (auto contract = mlir::dyn_cast<ContractType>(type))
+    return contract.getContractName().str();
+  return std::nullopt;
+}
+
+std::optional<std::string> nominalClassSymbolName(mlir::Operation *op,
+                                                  mlir::Type type) {
+  std::optional<std::string> name = nominalContractName(type);
+  if (!name)
+    return std::nullopt;
+  if (type_object::lookup(op, *name))
+    return name;
+  llvm::StringRef shortName = llvm::StringRef(*name).rsplit('.').second;
+  if (!shortName.empty() && shortName != *name &&
+      type_object::lookup(op, shortName))
+    return shortName.str();
+  return name;
+}
+
+mlir::LogicalResult verifyNominalSubclass(mlir::Operation *op,
+                                          mlir::Type derivedType,
+                                          mlir::Type baseType,
+                                          llvm::StringRef relation) {
+  std::optional<std::string> derived =
+      nominalClassSymbolName(op, derivedType);
+  std::optional<std::string> base = nominalClassSymbolName(op, baseType);
+  if (!derived || !base)
+    return mlir::success();
+  if (!type_object::lookup(op, *derived) || !type_object::lookup(op, *base))
+    return mlir::success();
+  mlir::FailureOr<bool> isSubclass =
+      type_object::isSubclassOf(op, *derived, *base);
+  if (mlir::failed(isSubclass))
+    return mlir::failure();
+  if (!*isSubclass)
+    return op->emitOpError()
+           << relation << " requires " << *derived << " to inherit from "
+           << *base;
+  return mlir::success();
+}
+
 } // namespace
 
 mlir::LogicalResult ClassOp::verify() {
@@ -205,10 +279,13 @@ mlir::LogicalResult ClassOp::verify() {
   mlir::ArrayAttr methodNames = getMethodNamesAttr();
   mlir::ArrayAttr methodContracts = getMethodContractsAttr();
   mlir::ArrayAttr methodKinds = getMethodKindsAttr();
+  mlir::ArrayAttr methodSymbols =
+      op->getAttrOfType<mlir::ArrayAttr>("method_symbols");
 
   if (mlir::failed(verifyStringArray(op, getBaseNamesAttr(), "base_names")) ||
       mlir::failed(verifyStringArray(op, fieldNames, "field_names")) ||
       mlir::failed(verifyStringArray(op, methodNames, "method_names")) ||
+      mlir::failed(verifyStringArray(op, methodSymbols, "method_symbols")) ||
       mlir::failed(verifyTypeArray(op, fieldTypes, "field_types")) ||
       mlir::failed(
           verifyTypeArray(op, fieldContracts, "field_contract_types", true)) ||
@@ -224,6 +301,8 @@ mlir::LogicalResult ClassOp::verify() {
       (!methodNames || !methodContracts || !methodKinds))
     return emitOpError("'method_names', 'method_contracts', and "
                        "'method_kinds' must be provided together");
+  if (methodSymbols && !methodNames)
+    return emitOpError("'method_symbols' requires 'method_names'");
 
   if (mlir::failed(verifySameLength(op, fieldNames, "field_names", fieldTypes,
                                     "field_types")) ||
@@ -232,7 +311,9 @@ mlir::LogicalResult ClassOp::verify() {
       mlir::failed(verifySameLength(op, methodNames, "method_names",
                                     methodContracts, "method_contracts")) ||
       mlir::failed(verifySameLength(op, methodNames, "method_names",
-                                    methodKinds, "method_kinds")))
+                                    methodKinds, "method_kinds")) ||
+      mlir::failed(verifySameLength(op, methodNames, "method_names",
+                                    methodSymbols, "method_symbols")))
     return mlir::failure();
 
   llvm::StringSet<> fieldSet;
@@ -253,7 +334,10 @@ mlir::LogicalResult ClassOp::verify() {
     }
   }
 
-  return mlir::success();
+  if (mlir::ModuleOp module = getOperation()->getParentOfType<mlir::ModuleOp>())
+    if (module->hasAttr("ly.typing.module"))
+      return mlir::success();
+  return type_object::verifyBases(*this);
 }
 
 mlir::LogicalResult CallOp::verify() {
@@ -338,15 +422,29 @@ mlir::LogicalResult NewOp::verify() {
     return mlir::failure();
   if (!mlir::isa<TypeType>(getClassObject().getType()))
     return emitOpError("class object must be !py.type");
-  return requireContractTerm(getOperation(), getInstance().getType(),
-                             "instance result");
+  if (mlir::failed(requireContractTerm(getOperation(), getInstance().getType(),
+                                       "instance result")) ||
+      mlir::failed(
+          verifyOptionalStringAttr(getOperation(), "ly.constructor.owner")) ||
+      mlir::failed(verifyDescriptorKindAttr(getOperation(),
+                                            "ly.constructor.new_kind",
+                                            /*allowField=*/false)))
+    return mlir::failure();
+  return mlir::success();
 }
 
 mlir::LogicalResult InitOp::verify() {
   if (mlir::failed(requireProtocolAttr(getOperation(), "init_contract")))
     return mlir::failure();
-  return requireLiteralSpelling(getOperation(), getResult().getType(), "None",
-                                "result");
+  if (mlir::failed(requireLiteralSpelling(getOperation(), getResult().getType(),
+                                          "None", "result")) ||
+      mlir::failed(
+          verifyOptionalStringAttr(getOperation(), "ly.constructor.owner")) ||
+      mlir::failed(verifyDescriptorKindAttr(getOperation(),
+                                            "ly.constructor.init_kind",
+                                            /*allowField=*/false)))
+    return mlir::failure();
+  return mlir::success();
 }
 
 mlir::LogicalResult EnterOp::verify() {
@@ -500,11 +598,23 @@ mlir::LogicalResult TypeObjectOp::verify() {
 }
 
 mlir::LogicalResult ClassUpcastOp::verify() {
-  return requireContractTerm(getOperation(), getResult().getType(), "result");
+  if (mlir::failed(
+          requireContractTerm(getOperation(), getInput().getType(), "input")) ||
+      mlir::failed(
+          requireContractTerm(getOperation(), getResult().getType(), "result")))
+    return mlir::failure();
+  return verifyNominalSubclass(getOperation(), getInput().getType(),
+                               getResult().getType(), "class upcast");
 }
 
 mlir::LogicalResult ClassRefineOp::verify() {
-  return requireContractTerm(getOperation(), getResult().getType(), "result");
+  if (mlir::failed(
+          requireContractTerm(getOperation(), getInput().getType(), "input")) ||
+      mlir::failed(
+          requireContractTerm(getOperation(), getResult().getType(), "result")))
+    return mlir::failure();
+  return verifyNominalSubclass(getOperation(), getResult().getType(),
+                               getInput().getType(), "class refine");
 }
 
 mlir::LogicalResult ProtocolViewOp::verify() {
@@ -514,19 +624,41 @@ mlir::LogicalResult ProtocolViewOp::verify() {
 }
 
 mlir::LogicalResult ClassTestOp::verify() {
-  return requireI1(getOperation(), getResult().getType(), "result");
+  if (mlir::failed(requireI1(getOperation(), getResult().getType(), "result")) ||
+      mlir::failed(
+          requireContractTerm(getOperation(), getInput().getType(), "input")))
+    return mlir::failure();
+  std::optional<std::string> target =
+      nominalClassSymbolName(getOperation(), getTarget());
+  if (!target)
+    return emitOpError("target must be a nominal class contract");
+  if (!type_object::lookup(getOperation(), *target))
+    return emitOpError("target has no class schema '") << *target << "'";
+  return mlir::success();
 }
 
 mlir::LogicalResult AttrGetOp::verify() {
   if (getName().empty())
     return emitOpError("attribute name must not be empty");
-  return requireContractTerm(getOperation(), getResult().getType(), "result");
+  if (mlir::failed(requireContractTerm(getOperation(), getResult().getType(),
+                                       "result")) ||
+      mlir::failed(verifyOptionalStringAttr(getOperation(), "ly.attr.owner")) ||
+      mlir::failed(verifyDescriptorKindAttr(getOperation(), "ly.attr.kind",
+                                            /*allowField=*/true)))
+    return mlir::failure();
+  return mlir::success();
 }
 
 mlir::LogicalResult AttrSetOp::verify() {
   if (getName().empty())
     return emitOpError("attribute name must not be empty");
-  return requireContractTerm(getOperation(), getValue().getType(), "value");
+  if (mlir::failed(requireContractTerm(getOperation(), getValue().getType(),
+                                       "value")) ||
+      mlir::failed(verifyOptionalStringAttr(getOperation(), "ly.attr.owner")) ||
+      mlir::failed(verifyDescriptorKindAttr(getOperation(), "ly.attr.kind",
+                                            /*allowField=*/true)))
+    return mlir::failure();
+  return mlir::success();
 }
 
 mlir::LogicalResult IterOp::verify() {

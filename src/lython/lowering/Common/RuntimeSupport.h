@@ -2,7 +2,6 @@
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
-#include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
 
@@ -15,10 +14,6 @@ class Module;
 }
 
 namespace py {
-
-class PyLLVMTypeConverter;
-
-struct LoweredSafetyContracts {};
 
 enum class TensorLoweringArchitecture {
   Generic,
@@ -59,23 +54,11 @@ struct PythonCallSiteRange {
   std::int32_t endColumn = 0;
 };
 
-void collectLoweredSafetyContracts(mlir::ModuleOp module,
-                                   LoweredSafetyContracts &contracts);
-void collectLoweredSafetyContracts(mlir::ModuleOp module,
-                                   const PyLLVMTypeConverter &typeConverter,
-                                   LoweredSafetyContracts &contracts);
-mlir::LogicalResult
-preserveLoweredSafetyContracts(mlir::ModuleOp module,
-                               const LoweredSafetyContracts &contracts);
-
 void collectPythonCallSiteRanges(
     mlir::ModuleOp module,
     llvm::SmallVectorImpl<PythonCallSiteRange> &callSites);
 bool installPythonExceptionCleanupFrames(
     llvm::Module &module, llvm::ArrayRef<PythonCallSiteRange> callSites);
-
-mlir::LogicalResult verifyOwnership(mlir::ModuleOp module);
-mlir::LogicalResult verifyLLVMCallOwnership(mlir::ModuleOp module);
 
 namespace optimizer::publication {
 void prepare(mlir::ModuleOp module);
@@ -96,14 +79,6 @@ createRefCountInsertionPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createRefCountPairElisionPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createPyOptimizationPass();
-std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createOwnershipVerifierPass();
-std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createLLVMCallOwnershipVerifierPass();
-std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createLLVMThreadSafetyVerifierPass();
-std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createNativeVerificationPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createAsyncThunkLoweringPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>

@@ -31,6 +31,11 @@ module {
   llvm.mlir.global private unnamed_addr constant @".fmt_invalid"("%s: <invalid>\0A\00") {addr_space = 0 : i32, alignment = 1 : i64, dso_local}
   llvm.mlir.global private unnamed_addr constant @".fmt_unknown"("%s: <unknown>\0A\00") {addr_space = 0 : i32, alignment = 1 : i64, dso_local}
   llvm.mlir.global private unnamed_addr constant @".fmt_message"("%s: %s\0A\00") {addr_space = 0 : i32, alignment = 1 : i64, dso_local}
+  llvm.mlir.global private unnamed_addr constant @".fmt_i64"("%lld\00") {addr_space = 0 : i32, alignment = 1 : i64, dso_local}
+  llvm.mlir.global private unnamed_addr constant @".fmt_f64"("%.12g\00") {addr_space = 0 : i32, alignment = 1 : i64, dso_local}
+  llvm.mlir.global private unnamed_addr constant @".repr_none"("None\00") {addr_space = 0 : i32, alignment = 1 : i64, dso_local}
+  llvm.mlir.global private unnamed_addr constant @".repr_ellipsis"("...\00") {addr_space = 0 : i32, alignment = 1 : i64, dso_local}
+  llvm.mlir.global private unnamed_addr constant @".repr_object"("<object object>\00") {addr_space = 0 : i32, alignment = 1 : i64, dso_local}
   llvm.mlir.global private unnamed_addr constant @".native_exception"("error: uncaught native exception during Python execution\0A\00") {addr_space = 0 : i32, alignment = 1 : i64, dso_local}
   llvm.mlir.global private unnamed_addr constant @".class.BaseException"("BaseException\00") {addr_space = 0 : i32, alignment = 1 : i64, dso_local}
   llvm.mlir.global private unnamed_addr constant @".class.Exception"("Exception\00") {addr_space = 0 : i32, alignment = 1 : i64, dso_local}
@@ -80,6 +85,310 @@ module {
     llvm.call @abort() : () -> ()
     llvm.unreachable
   }
+
+  func.func private @boxed_slot_ptr(%arg0: !llvm.ptr, %arg1: i64) -> !llvm.ptr {
+    %0 = llvm.getelementptr %arg0[%arg1] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    func.return %0 : !llvm.ptr
+  }
+
+  func.func private @boxed_load_i64(%arg0: !llvm.ptr, %arg1: i64) -> i64 {
+    %0 = func.call @boxed_slot_ptr(%arg0, %arg1) : (!llvm.ptr, i64) -> !llvm.ptr
+    %1 = llvm.load %0 {alignment = 8 : i64} : !llvm.ptr -> i64
+    func.return %1 : i64
+  }
+
+  func.func private @free_raw_i64_ptr(%arg0: i64) {
+    %0 = arith.constant 0 : i64
+    %1 = arith.cmpi eq, %arg0, %0 : i64
+    cf.cond_br %1, ^bb2, ^bb1
+  ^bb1:
+    %2 = llvm.inttoptr %arg0 : i64 to !llvm.ptr
+    llvm.call @free(%2) : (!llvm.ptr) -> ()
+    cf.br ^bb2
+  ^bb2:
+    func.return
+  }
+
+  func.func private @release_storage_raw_to_zero(%arg0: i64) -> i1 {
+    %0 = arith.constant 0 : i64
+    %1 = arith.constant 1 : i64
+    %immortal = arith.constant 9223372036854775807 : i64
+    %false = arith.constant false
+    %is_null = arith.cmpi eq, %arg0, %0 : i64
+    cf.cond_br %is_null, ^bb_done, ^bb_tag
+  ^bb_tag:
+    %tag = arith.andi %arg0, %1 : i64
+    %is_tagged = arith.cmpi eq, %tag, %1 : i64
+    cf.cond_br %is_tagged, ^bb_done, ^bb_probe
+  ^bb_probe:
+    %ptr = llvm.inttoptr %arg0 : i64 to !llvm.ptr
+    %observed = llvm.load %ptr {alignment = 8 : i64} : !llvm.ptr -> i64
+    %pre_immortal = arith.cmpi eq, %observed, %immortal : i64
+    cf.cond_br %pre_immortal, ^bb_done, ^bb_positive
+  ^bb_positive:
+    %observed_positive = arith.cmpi sgt, %observed, %0 : i64
+    cf.assert %observed_positive, "release_storage_raw_to_zero observed non-positive refcount"
+    %previous = llvm.atomicrmw sub %ptr, %1 acq_rel : !llvm.ptr, i64
+    %previous_positive = arith.cmpi sgt, %previous, %0 : i64
+    cf.assert %previous_positive, "release_storage_raw_to_zero raced with non-positive refcount"
+    %became_zero = arith.cmpi eq, %previous, %1 : i64
+    func.return %became_zero : i1
+  ^bb_done:
+    func.return %false : i1
+  }
+
+  func.func private @release_unicode_raw(%arg0: i64, %arg1: i64) {
+    %0 = func.call @release_storage_raw_to_zero(%arg0) : (i64) -> i1
+    cf.cond_br %0, ^bb1, ^bb2
+  ^bb1:
+    func.call @free_raw_i64_ptr(%arg1) : (i64) -> ()
+    func.call @free_raw_i64_ptr(%arg0) : (i64) -> ()
+    cf.br ^bb2
+  ^bb2:
+    func.return
+  }
+
+  func.func private @release_single_storage_raw(%arg0: i64) {
+    %0 = func.call @release_storage_raw_to_zero(%arg0) : (i64) -> i1
+    cf.cond_br %0, ^bb1, ^bb2
+  ^bb1:
+    func.call @free_raw_i64_ptr(%arg0) : (i64) -> ()
+    cf.br ^bb2
+  ^bb2:
+    func.return
+  }
+
+  func.func private @release_task_raw(%arg0: i64, %arg1: i64) {
+    %0 = func.call @release_storage_raw_to_zero(%arg0) : (i64) -> i1
+    cf.cond_br %0, ^bb1, ^bb2
+  ^bb1:
+    func.call @release_single_storage_raw(%arg1) : (i64) -> ()
+    func.call @free_raw_i64_ptr(%arg0) : (i64) -> ()
+    cf.br ^bb2
+  ^bb2:
+    func.return
+  }
+
+  func.func private @release_sequence_payload(%arg0: i64, %arg1: i64) {
+    %0 = arith.constant 0 : i64
+    %1 = arith.constant 1 : i64
+    %2 = arith.constant 16 : i64
+    %3 = arith.cmpi eq, %arg0, %0 : i64
+    %4 = arith.cmpi eq, %arg1, %0 : i64
+    %5 = arith.ori %3, %4 : i1
+    cf.cond_br %5, ^bb3, ^bb1
+  ^bb1:
+    %6 = llvm.inttoptr %arg0 : i64 to !llvm.ptr
+    %7 = llvm.load %6 {alignment = 8 : i64} : !llvm.ptr -> i64
+    %8 = arith.index_cast %7 : i64 to index
+    %9 = llvm.inttoptr %arg1 : i64 to !llvm.ptr
+    %10 = arith.constant 0 : index
+    %11 = arith.constant 1 : index
+    scf.for %arg2 = %10 to %8 step %11 {
+      %12 = arith.index_cast %arg2 : index to i64
+      %13 = arith.muli %12, %2 : i64
+      %14 = llvm.getelementptr %9[%13] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      func.call @release_payload_slot_ptr(%14) : (!llvm.ptr) -> ()
+    }
+    cf.br ^bb3
+  ^bb3:
+    func.return
+  }
+
+  func.func private @release_dict_payload(%arg0: i64, %arg1: i64, %arg2: i64, %arg3: i64) {
+    %0 = arith.constant 0 : i64
+    %1 = arith.constant 1 : i64
+    %2 = arith.constant 16 : i64
+    %3 = arith.cmpi eq, %arg0, %0 : i64
+    %4 = arith.cmpi eq, %arg1, %0 : i64
+    %5 = arith.cmpi eq, %arg2, %0 : i64
+    %6 = arith.cmpi eq, %arg3, %0 : i64
+    %7 = arith.ori %3, %4 : i1
+    %8 = arith.ori %5, %6 : i1
+    %9 = arith.ori %7, %8 : i1
+    cf.cond_br %9, ^bb3, ^bb1
+  ^bb1:
+    %10 = llvm.inttoptr %arg0 : i64 to !llvm.ptr
+    %11 = llvm.getelementptr %10[%1] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    %12 = llvm.load %11 {alignment = 8 : i64} : !llvm.ptr -> i64
+    %13 = arith.index_cast %12 : i64 to index
+    %14 = llvm.inttoptr %arg1 : i64 to !llvm.ptr
+    %15 = llvm.inttoptr %arg2 : i64 to !llvm.ptr
+    %16 = llvm.inttoptr %arg3 : i64 to !llvm.ptr
+    %17 = arith.constant 0 : index
+    %18 = arith.constant 1 : index
+    scf.for %arg4 = %17 to %13 step %18 {
+      %19 = arith.index_cast %arg4 : index to i64
+      %20 = llvm.getelementptr %16[%19] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %21 = llvm.load %20 {alignment = 8 : i64} : !llvm.ptr -> i64
+      %22 = arith.cmpi ne, %21, %0 : i64
+      scf.if %22 {
+        %23 = arith.muli %19, %2 : i64
+        %24 = llvm.getelementptr %14[%23] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+        %25 = llvm.getelementptr %15[%23] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+        func.call @release_payload_slot_ptr(%24) : (!llvm.ptr) -> ()
+        func.call @release_payload_slot_ptr(%25) : (!llvm.ptr) -> ()
+      }
+    }
+    cf.br ^bb3
+  ^bb3:
+    func.return
+  }
+
+  func.func private @release_payload_slot_ptr(%arg0: !llvm.ptr) {
+    %0 = arith.constant 0 : i64
+    %1 = arith.constant 1 : i64
+    %2 = arith.constant 2 : i64
+    %3 = arith.constant 3 : i64
+    %4 = arith.constant 4 : i64
+    %5 = arith.constant 5 : i64
+    %6 = arith.constant 6 : i64
+    %7 = arith.constant 7 : i64
+    %8 = arith.constant 8 : i64
+    %9 = arith.constant 9 : i64
+    %10 = arith.constant 10 : i64
+    %11 = arith.constant 11 : i64
+    %12 = arith.constant 12 : i64
+    %13 = arith.constant 13 : i64
+    %14 = arith.constant 14 : i64
+    %15 = arith.constant 15 : i64
+    %16 = arith.constant 16 : i64
+    %17 = arith.constant 17 : i64
+    %c18 = arith.constant 18 : i64
+    %owned_slot = arith.constant 14 : i64
+    %18 = func.call @boxed_load_i64(%arg0, %owned_slot) : (!llvm.ptr, i64) -> i64
+    %19 = arith.cmpi eq, %18, %0 : i64
+    cf.cond_br %19, ^bb_done, ^bb_owned
+  ^bb_owned:
+    %20 = func.call @boxed_load_i64(%arg0, %2) : (!llvm.ptr, i64) -> i64
+    %21 = func.call @release_storage_raw_to_zero(%20) : (i64) -> i1
+    cf.cond_br %21, ^bb_zero, ^bb_done
+  ^bb_zero:
+    %22 = func.call @boxed_load_i64(%arg0, %1) : (!llvm.ptr, i64) -> i64
+    %23 = func.call @boxed_load_i64(%arg0, %4) : (!llvm.ptr, i64) -> i64
+    %24 = func.call @boxed_load_i64(%arg0, %5) : (!llvm.ptr, i64) -> i64
+    %25 = func.call @boxed_load_i64(%arg0, %6) : (!llvm.ptr, i64) -> i64
+    %26 = func.call @boxed_load_i64(%arg0, %7) : (!llvm.ptr, i64) -> i64
+    %27 = func.call @boxed_load_i64(%arg0, %8) : (!llvm.ptr, i64) -> i64
+    %28 = arith.cmpi eq, %22, %1 : i64
+    cf.cond_br %28, ^bb_int, ^bb_check_float
+  ^bb_check_float:
+    %29 = arith.cmpi eq, %22, %2 : i64
+    cf.cond_br %29, ^bb_float, ^bb_check_str
+  ^bb_check_str:
+    %30 = arith.cmpi eq, %22, %4 : i64
+    cf.cond_br %30, ^bb_str, ^bb_check_exc
+  ^bb_check_exc:
+    %31 = arith.cmpi eq, %22, %5 : i64
+    cf.cond_br %31, ^bb_exc, ^bb_check_list
+  ^bb_check_list:
+    %32 = arith.cmpi eq, %22, %10 : i64
+    cf.cond_br %32, ^bb_seq, ^bb_check_tuple
+  ^bb_check_tuple:
+    %33 = arith.cmpi eq, %22, %11 : i64
+    cf.cond_br %33, ^bb_seq, ^bb_check_dict
+  ^bb_check_dict:
+    %34 = arith.cmpi eq, %22, %12 : i64
+    cf.cond_br %34, ^bb_dict, ^bb_check_single6
+  ^bb_check_single6:
+    %35 = arith.cmpi eq, %22, %6 : i64
+    cf.cond_br %35, ^bb_single, ^bb_check_single8
+  ^bb_check_single8:
+    %36 = arith.cmpi eq, %22, %8 : i64
+    cf.cond_br %36, ^bb_single, ^bb_check_single9
+  ^bb_check_single9:
+    %37 = arith.cmpi eq, %22, %9 : i64
+    cf.cond_br %37, ^bb_single, ^bb_check_single13
+  ^bb_check_single13:
+    %38 = arith.cmpi eq, %22, %13 : i64
+    cf.cond_br %38, ^bb_single, ^bb_check_single14
+  ^bb_check_single14:
+    %39 = arith.cmpi eq, %22, %14 : i64
+    cf.cond_br %39, ^bb_single, ^bb_check_task
+  ^bb_check_task:
+    %task = arith.cmpi eq, %22, %15 : i64
+    cf.cond_br %task, ^bb_task, ^bb_check_future_iter
+  ^bb_check_future_iter:
+    %40 = arith.cmpi eq, %22, %16 : i64
+    cf.cond_br %40, ^bb_child_single, ^bb_check_task_iter
+  ^bb_check_task_iter:
+    %41 = arith.cmpi eq, %22, %17 : i64
+    cf.cond_br %41, ^bb_task_iter, ^bb_check_await_iter
+  ^bb_check_await_iter:
+    %await_iter = arith.cmpi eq, %22, %c18 : i64
+    cf.cond_br %await_iter, ^bb_child_single, ^bb_header_only
+  ^bb_int:
+    func.call @free_raw_i64_ptr(%25) : (i64) -> ()
+    func.call @free_raw_i64_ptr(%24) : (i64) -> ()
+    func.call @free_raw_i64_ptr(%23) : (i64) -> ()
+    cf.br ^bb_done
+  ^bb_float:
+    func.call @free_raw_i64_ptr(%24) : (i64) -> ()
+    func.call @free_raw_i64_ptr(%23) : (i64) -> ()
+    cf.br ^bb_done
+  ^bb_str:
+    func.call @free_raw_i64_ptr(%24) : (i64) -> ()
+    func.call @free_raw_i64_ptr(%23) : (i64) -> ()
+    cf.br ^bb_done
+  ^bb_exc:
+    func.call @release_unicode_raw(%24, %25) : (i64, i64) -> ()
+    func.call @free_raw_i64_ptr(%23) : (i64) -> ()
+    cf.br ^bb_done
+  ^bb_seq:
+    func.call @release_sequence_payload(%24, %25) : (i64, i64) -> ()
+    func.call @free_raw_i64_ptr(%25) : (i64) -> ()
+    func.call @free_raw_i64_ptr(%24) : (i64) -> ()
+    func.call @free_raw_i64_ptr(%23) : (i64) -> ()
+    cf.br ^bb_done
+  ^bb_dict:
+    func.call @release_dict_payload(%24, %25, %26, %27) : (i64, i64, i64, i64) -> ()
+    func.call @free_raw_i64_ptr(%27) : (i64) -> ()
+    func.call @free_raw_i64_ptr(%26) : (i64) -> ()
+    func.call @free_raw_i64_ptr(%25) : (i64) -> ()
+    func.call @free_raw_i64_ptr(%24) : (i64) -> ()
+    func.call @free_raw_i64_ptr(%23) : (i64) -> ()
+    cf.br ^bb_done
+  ^bb_single:
+    func.call @free_raw_i64_ptr(%23) : (i64) -> ()
+    cf.br ^bb_done
+  ^bb_child_single:
+    func.call @release_single_storage_raw(%24) : (i64) -> ()
+    func.call @free_raw_i64_ptr(%23) : (i64) -> ()
+    cf.br ^bb_done
+  ^bb_task:
+    func.call @release_single_storage_raw(%24) : (i64) -> ()
+    func.call @free_raw_i64_ptr(%23) : (i64) -> ()
+    cf.br ^bb_done
+  ^bb_task_iter:
+    func.call @release_task_raw(%24, %25) : (i64, i64) -> ()
+    func.call @free_raw_i64_ptr(%23) : (i64) -> ()
+    cf.br ^bb_done
+  ^bb_header_only:
+    func.call @free_raw_i64_ptr(%23) : (i64) -> ()
+    cf.br ^bb_done
+  ^bb_done:
+    func.return
+  }
+
+  func.func @LyObject_ReleaseBoxedPayloadRaw(%arg0: memref<16xi64>) {
+    %0 = memref.extract_aligned_pointer_as_index %arg0 : memref<16xi64> -> index
+    %1 = arith.index_cast %0 : index to i64
+    %2 = llvm.inttoptr %1 : i64 to !llvm.ptr
+    func.call @release_payload_slot_ptr(%2) : (!llvm.ptr) -> ()
+    func.return
+  }
+
+  func.func @LyObject_ReleaseBoxedPayloadArraySlotRaw(%arg0: memref<?xi64>, %arg1: i64) {
+    %0 = arith.constant 16 : i64
+    %1 = memref.extract_aligned_pointer_as_index %arg0 : memref<?xi64> -> index
+    %2 = arith.index_cast %1 : index to i64
+    %3 = llvm.inttoptr %2 : i64 to !llvm.ptr
+    %4 = arith.muli %arg1, %0 : i64
+    %5 = llvm.getelementptr %3[%4] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    func.call @release_payload_slot_ptr(%5) : (!llvm.ptr) -> ()
+    func.return
+  }
+
   func.func private @write_len(%arg0: i32, %arg1: !llvm.ptr, %arg2: i64) {
     %0 = arith.constant 0 : i64
     %1 = llvm.mlir.zero : !llvm.ptr
@@ -129,6 +438,318 @@ module {
   ^bb2:  // 2 preds: ^bb0, ^bb1
     func.return
   }
+
+  func.func private @write_i64(%arg0: i32, %arg1: i64) {
+    %0 = arith.constant 1 : i32
+    %1 = arith.constant 0 : i64
+    %2 = arith.constant 64 : i64
+    %3 = llvm.mlir.addressof @".fmt_i64" : !llvm.ptr
+    %4 = llvm.alloca %0 x !llvm.array<64 x i8> {alignment = 1 : i64} : (i32) -> !llvm.ptr
+    %5 = llvm.getelementptr inbounds %4[%1, %1] : (!llvm.ptr, i64, i64) -> !llvm.ptr, !llvm.array<64 x i8>
+    %6 = llvm.call @snprintf(%5, %2, %3, %arg1) vararg(!llvm.func<i32 (ptr, i64, ptr, ...)>) : (!llvm.ptr, i64, !llvm.ptr, i64) -> i32
+    func.call @write_buffered(%arg0, %5, %6) : (i32, !llvm.ptr, i32) -> ()
+    func.return
+  }
+
+  func.func private @write_f64(%arg0: i32, %arg1: f64) {
+    %0 = arith.constant 1 : i32
+    %1 = arith.constant 0 : i64
+    %2 = arith.constant 64 : i64
+    %3 = llvm.mlir.addressof @".fmt_f64" : !llvm.ptr
+    %4 = llvm.alloca %0 x !llvm.array<64 x i8> {alignment = 1 : i64} : (i32) -> !llvm.ptr
+    %5 = llvm.getelementptr inbounds %4[%1, %1] : (!llvm.ptr, i64, i64) -> !llvm.ptr, !llvm.array<64 x i8>
+    %6 = llvm.call @snprintf(%5, %2, %3, %arg1) vararg(!llvm.func<i32 (ptr, i64, ptr, ...)>) : (!llvm.ptr, i64, !llvm.ptr, f64) -> i32
+    func.call @write_buffered(%arg0, %5, %6) : (i32, !llvm.ptr, i32) -> ()
+    func.return
+  }
+
+  func.func private @write_raw_bytes(%arg0: i32, %arg1: i64, %arg2: i64) {
+    %0 = arith.constant 0 : i64
+    %1 = arith.cmpi ne, %arg1, %0 : i64
+    %2 = arith.cmpi sgt, %arg2, %0 : i64
+    %3 = arith.andi %1, %2 : i1
+    scf.if %3 {
+      %4 = llvm.inttoptr %arg1 : i64 to !llvm.ptr
+      func.call @write_len(%arg0, %4, %arg2) : (i32, !llvm.ptr, i64) -> ()
+    }
+    func.return
+  }
+
+  func.func private @print_boxed_int(%arg0: i32, %arg1: i64, %arg2: i64) {
+    %0 = arith.constant 0 : i64
+    %1 = arith.constant 1 : i64
+    %2 = arith.constant 1073741824 : i64
+    %3 = arith.cmpi eq, %arg1, %0 : i64
+    %4 = arith.cmpi eq, %arg2, %0 : i64
+    %5 = arith.ori %3, %4 : i1
+    cf.cond_br %5, ^bb_fallback, ^bb_decode
+  ^bb_decode:
+    %6 = llvm.inttoptr %arg1 : i64 to !llvm.ptr
+    %7 = llvm.inttoptr %arg2 : i64 to !llvm.ptr
+    %8 = llvm.getelementptr %6[%0] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    %9 = llvm.getelementptr %6[%1] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    %10 = llvm.load %8 {alignment = 8 : i64} : !llvm.ptr -> i64
+    %11 = llvm.load %9 {alignment = 8 : i64} : !llvm.ptr -> i64
+    %12 = arith.cmpi sle, %11, %0 : i64
+    cf.cond_br %12, ^bb_zero, ^bb_digits
+  ^bb_zero:
+    func.call @write_i64(%arg0, %0) : (i32, i64) -> ()
+    func.return
+  ^bb_digits:
+    %13 = arith.index_cast %11 : i64 to index
+    %14 = arith.constant 0 : index
+    %15 = arith.constant 1 : index
+    %16 = scf.for %arg3 = %14 to %13 step %15 iter_args(%arg4 = %0) -> (i64) {
+      %21 = arith.index_cast %arg3 : index to i64
+      %22 = arith.addi %21, %1 : i64
+      %23 = arith.subi %11, %22 : i64
+      %24 = llvm.getelementptr %7[%23] : (!llvm.ptr, i64) -> !llvm.ptr, i32
+      %25 = llvm.load %24 {alignment = 4 : i64} : !llvm.ptr -> i32
+      %26 = arith.extui %25 : i32 to i64
+      %27 = arith.muli %arg4, %2 : i64
+      %28 = arith.addi %27, %26 : i64
+      scf.yield %28 : i64
+    }
+    %17 = arith.cmpi slt, %10, %0 : i64
+    %18 = arith.subi %0, %16 : i64
+    %19 = arith.select %17, %18, %16 : i1, i64
+    func.call @write_i64(%arg0, %19) : (i32, i64) -> ()
+    func.return
+  ^bb_fallback:
+    %20 = llvm.mlir.addressof @".repr_object" : !llvm.ptr
+    func.call @write_cstr(%arg0, %20) : (i32, !llvm.ptr) -> ()
+    func.return
+  }
+
+  func.func private @print_boxed_float(%arg0: i32, %arg1: i64) {
+    %0 = arith.constant 0 : i64
+    %1 = arith.cmpi eq, %arg1, %0 : i64
+    cf.cond_br %1, ^bb_fallback, ^bb_value
+  ^bb_value:
+    %2 = llvm.inttoptr %arg1 : i64 to !llvm.ptr
+    %3 = llvm.getelementptr %2[%0] : (!llvm.ptr, i64) -> !llvm.ptr, f64
+    %4 = llvm.load %3 {alignment = 8 : i64} : !llvm.ptr -> f64
+    func.call @write_f64(%arg0, %4) : (i32, f64) -> ()
+    func.return
+  ^bb_fallback:
+    %5 = llvm.mlir.addressof @".repr_object" : !llvm.ptr
+    func.call @write_cstr(%arg0, %5) : (i32, !llvm.ptr) -> ()
+    func.return
+  }
+
+  func.func private @print_boxed_sequence(%arg0: i32, %arg1: i64, %arg2: i64, %arg3: i8, %arg4: i8, %arg5: i1, %arg6: i64) {
+    %0 = arith.constant 0 : i64
+    %1 = arith.constant 1 : i64
+    %2 = arith.constant 16 : i64
+    %3 = arith.constant 44 : i8
+    %4 = arith.constant 32 : i8
+    %5 = arith.cmpi eq, %arg1, %0 : i64
+    %6 = arith.cmpi eq, %arg2, %0 : i64
+    %7 = arith.ori %5, %6 : i1
+    cf.cond_br %7, ^bb_empty, ^bb_body
+  ^bb_empty:
+    func.call @write_char(%arg0, %arg3) : (i32, i8) -> ()
+    func.call @write_char(%arg0, %arg4) : (i32, i8) -> ()
+    func.return
+  ^bb_body:
+    %8 = llvm.inttoptr %arg1 : i64 to !llvm.ptr
+    %9 = llvm.inttoptr %arg2 : i64 to !llvm.ptr
+    %10 = llvm.getelementptr %8[%0] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    %11 = llvm.load %10 {alignment = 8 : i64} : !llvm.ptr -> i64
+    %12 = arith.subi %arg6, %1 : i64
+    func.call @write_char(%arg0, %arg3) : (i32, i8) -> ()
+    %13 = arith.cmpi sgt, %11, %0 : i64
+    scf.if %13 {
+      %14 = arith.index_cast %11 : i64 to index
+      %15 = arith.constant 0 : index
+      %16 = arith.constant 1 : index
+      scf.for %arg7 = %15 to %14 step %16 {
+        %17 = arith.index_cast %arg7 : index to i64
+        %18 = arith.cmpi ne, %17, %0 : i64
+        scf.if %18 {
+          func.call @write_char(%arg0, %3) : (i32, i8) -> ()
+          func.call @write_char(%arg0, %4) : (i32, i8) -> ()
+        }
+        %19 = arith.muli %17, %2 : i64
+        %20 = llvm.getelementptr %9[%19] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+        func.call @print_boxed_slot_ptr(%arg0, %20, %12) : (i32, !llvm.ptr, i64) -> ()
+      }
+    }
+    %21 = arith.cmpi eq, %11, %1 : i64
+    %22 = arith.andi %arg5, %21 : i1
+    scf.if %22 {
+      func.call @write_char(%arg0, %3) : (i32, i8) -> ()
+    }
+    func.call @write_char(%arg0, %arg4) : (i32, i8) -> ()
+    func.return
+  }
+
+  func.func private @print_boxed_dict(%arg0: i32, %arg1: i64, %arg2: i64, %arg3: i64, %arg4: i64, %arg5: i64) {
+    %0 = arith.constant 0 : i64
+    %1 = arith.constant 1 : i64
+    %2 = arith.constant 16 : i64
+    %3 = arith.constant 123 : i8
+    %4 = arith.constant 125 : i8
+    %5 = arith.constant 44 : i8
+    %6 = arith.constant 32 : i8
+    %7 = arith.constant 58 : i8
+    %8 = arith.cmpi eq, %arg1, %0 : i64
+    %9 = arith.cmpi eq, %arg2, %0 : i64
+    %10 = arith.cmpi eq, %arg3, %0 : i64
+    %11 = arith.cmpi eq, %arg4, %0 : i64
+    %12 = arith.ori %8, %9 : i1
+    %13 = arith.ori %10, %11 : i1
+    %14 = arith.ori %12, %13 : i1
+    cf.cond_br %14, ^bb_empty, ^bb_body
+  ^bb_empty:
+    func.call @write_char(%arg0, %3) : (i32, i8) -> ()
+    func.call @write_char(%arg0, %4) : (i32, i8) -> ()
+    func.return
+  ^bb_body:
+    %15 = llvm.inttoptr %arg1 : i64 to !llvm.ptr
+    %16 = llvm.inttoptr %arg2 : i64 to !llvm.ptr
+    %17 = llvm.inttoptr %arg3 : i64 to !llvm.ptr
+    %18 = llvm.inttoptr %arg4 : i64 to !llvm.ptr
+    %19 = llvm.getelementptr %15[%1] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    %20 = llvm.load %19 {alignment = 8 : i64} : !llvm.ptr -> i64
+    %21 = arith.subi %arg5, %1 : i64
+    func.call @write_char(%arg0, %3) : (i32, i8) -> ()
+    %22 = arith.cmpi sgt, %20, %0 : i64
+    scf.if %22 {
+      %23 = arith.index_cast %20 : i64 to index
+      %24 = arith.constant 0 : index
+      %25 = arith.constant 1 : index
+      %26 = scf.for %arg6 = %24 to %23 step %25 iter_args(%arg7 = %0) -> (i64) {
+        %27 = arith.index_cast %arg6 : index to i64
+        %28 = llvm.getelementptr %18[%27] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+        %29 = llvm.load %28 {alignment = 8 : i64} : !llvm.ptr -> i64
+        %30 = arith.cmpi ne, %29, %0 : i64
+        %31 = scf.if %30 -> (i64) {
+          %32 = arith.cmpi ne, %arg7, %0 : i64
+          scf.if %32 {
+            func.call @write_char(%arg0, %5) : (i32, i8) -> ()
+            func.call @write_char(%arg0, %6) : (i32, i8) -> ()
+          }
+          %33 = arith.muli %27, %2 : i64
+          %34 = llvm.getelementptr %16[%33] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+          %35 = llvm.getelementptr %17[%33] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+          func.call @print_boxed_slot_ptr(%arg0, %34, %21) : (i32, !llvm.ptr, i64) -> ()
+          func.call @write_char(%arg0, %7) : (i32, i8) -> ()
+          func.call @write_char(%arg0, %6) : (i32, i8) -> ()
+          func.call @print_boxed_slot_ptr(%arg0, %35, %21) : (i32, !llvm.ptr, i64) -> ()
+          %36 = arith.addi %arg7, %1 : i64
+          scf.yield %36 : i64
+        } else {
+          scf.yield %arg7 : i64
+        }
+        scf.yield %31 : i64
+      }
+    }
+    func.call @write_char(%arg0, %4) : (i32, i8) -> ()
+    func.return
+  }
+
+  func.func private @print_boxed_slot_ptr(%arg0: i32, %arg1: !llvm.ptr, %arg2: i64) {
+    %0 = arith.constant 0 : i64
+    %1 = arith.constant 1 : i64
+    %2 = arith.constant 2 : i64
+    %4 = arith.constant 4 : i64
+    %5 = arith.constant 5 : i64
+    %6 = arith.constant 6 : i64
+    %7 = arith.constant 7 : i64
+    %8 = arith.constant 8 : i64
+    %10 = arith.constant 10 : i64
+    %11 = arith.constant 11 : i64
+    %12 = arith.constant 12 : i64
+    %open_list = arith.constant 91 : i8
+    %close_list = arith.constant 93 : i8
+    %open_tuple = arith.constant 40 : i8
+    %close_tuple = arith.constant 41 : i8
+    %false = arith.constant false
+    %true = arith.constant true
+    %13 = arith.cmpi sle, %arg2, %0 : i64
+    cf.cond_br %13, ^bb_ellipsis, ^bb_probe
+  ^bb_ellipsis:
+    %14 = llvm.mlir.addressof @".repr_ellipsis" : !llvm.ptr
+    func.call @write_cstr(%arg0, %14) : (i32, !llvm.ptr) -> ()
+    func.return
+  ^bb_probe:
+    %15 = func.call @boxed_load_i64(%arg1, %0) : (!llvm.ptr, i64) -> i64
+    %16 = arith.cmpi eq, %15, %0 : i64
+    cf.cond_br %16, ^bb_none, ^bb_dispatch
+  ^bb_none:
+    %17 = llvm.mlir.addressof @".repr_none" : !llvm.ptr
+    func.call @write_cstr(%arg0, %17) : (i32, !llvm.ptr) -> ()
+    func.return
+  ^bb_dispatch:
+    %18 = func.call @boxed_load_i64(%arg1, %1) : (!llvm.ptr, i64) -> i64
+    %19 = arith.cmpi eq, %18, %1 : i64
+    cf.cond_br %19, ^bb_int, ^bb_check_float
+  ^bb_check_float:
+    %20 = arith.cmpi eq, %18, %2 : i64
+    cf.cond_br %20, ^bb_float, ^bb_check_str
+  ^bb_check_str:
+    %21 = arith.cmpi eq, %18, %4 : i64
+    cf.cond_br %21, ^bb_str, ^bb_check_list
+  ^bb_check_list:
+    %22 = arith.cmpi eq, %18, %10 : i64
+    cf.cond_br %22, ^bb_list, ^bb_check_tuple
+  ^bb_check_tuple:
+    %23 = arith.cmpi eq, %18, %11 : i64
+    cf.cond_br %23, ^bb_tuple, ^bb_check_dict
+  ^bb_check_dict:
+    %24 = arith.cmpi eq, %18, %12 : i64
+    cf.cond_br %24, ^bb_dict, ^bb_fallback
+  ^bb_int:
+    %25 = func.call @boxed_load_i64(%arg1, %5) : (!llvm.ptr, i64) -> i64
+    %26 = func.call @boxed_load_i64(%arg1, %6) : (!llvm.ptr, i64) -> i64
+    func.call @print_boxed_int(%arg0, %25, %26) : (i32, i64, i64) -> ()
+    func.return
+  ^bb_float:
+    %27 = func.call @boxed_load_i64(%arg1, %5) : (!llvm.ptr, i64) -> i64
+    func.call @print_boxed_float(%arg0, %27) : (i32, i64) -> ()
+    func.return
+  ^bb_str:
+    %28 = func.call @boxed_load_i64(%arg1, %5) : (!llvm.ptr, i64) -> i64
+    %29 = func.call @boxed_load_i64(%arg1, %10) : (!llvm.ptr, i64) -> i64
+    func.call @write_raw_bytes(%arg0, %28, %29) : (i32, i64, i64) -> ()
+    func.return
+  ^bb_list:
+    %30 = func.call @boxed_load_i64(%arg1, %5) : (!llvm.ptr, i64) -> i64
+    %31 = func.call @boxed_load_i64(%arg1, %6) : (!llvm.ptr, i64) -> i64
+    func.call @print_boxed_sequence(%arg0, %30, %31, %open_list, %close_list, %false, %arg2) : (i32, i64, i64, i8, i8, i1, i64) -> ()
+    func.return
+  ^bb_tuple:
+    %32 = func.call @boxed_load_i64(%arg1, %5) : (!llvm.ptr, i64) -> i64
+    %33 = func.call @boxed_load_i64(%arg1, %6) : (!llvm.ptr, i64) -> i64
+    func.call @print_boxed_sequence(%arg0, %32, %33, %open_tuple, %close_tuple, %true, %arg2) : (i32, i64, i64, i8, i8, i1, i64) -> ()
+    func.return
+  ^bb_dict:
+    %34 = func.call @boxed_load_i64(%arg1, %5) : (!llvm.ptr, i64) -> i64
+    %35 = func.call @boxed_load_i64(%arg1, %6) : (!llvm.ptr, i64) -> i64
+    %36 = func.call @boxed_load_i64(%arg1, %7) : (!llvm.ptr, i64) -> i64
+    %37 = func.call @boxed_load_i64(%arg1, %8) : (!llvm.ptr, i64) -> i64
+    func.call @print_boxed_dict(%arg0, %34, %35, %36, %37, %arg2) : (i32, i64, i64, i64, i64, i64) -> ()
+    func.return
+  ^bb_fallback:
+    %38 = llvm.mlir.addressof @".repr_object" : !llvm.ptr
+    func.call @write_cstr(%arg0, %38) : (i32, !llvm.ptr) -> ()
+    func.return
+  }
+
+  func.func @LyObject_PrintLine(%arg0: memref<16xi64>) {
+    %0 = memref.extract_aligned_pointer_as_index %arg0 : memref<16xi64> -> index
+    %1 = arith.index_cast %0 : index to i64
+    %2 = llvm.inttoptr %1 : i64 to !llvm.ptr
+    %3 = arith.constant 1 : i32
+    %4 = arith.constant 8 : i64
+    %5 = llvm.mlir.addressof @".newline" : !llvm.ptr
+    %6 = arith.constant 1 : i64
+    func.call @print_boxed_slot_ptr(%3, %2, %4) : (i32, !llvm.ptr, i64) -> ()
+    func.call @write_len(%3, %5, %6) : (i32, !llvm.ptr, i64) -> ()
+    func.return
+  }
+
   func.func private @copy_cstr(%arg0: !llvm.ptr) -> !llvm.ptr {
     %0 = llvm.mlir.zero : !llvm.ptr
     %1 = arith.constant 1 : i64

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Runtime/Model/Contracts.h"
+#include "Ownership.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Value.h"
@@ -15,7 +16,7 @@
 #include <optional>
 #include <string>
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 
 inline constexpr llvm::StringLiteral kFutureResultSlot{"asyncio.future.result"};
 inline constexpr llvm::StringLiteral kFutureExceptionSlot{
@@ -42,9 +43,18 @@ inline constexpr llvm::StringLiteral kAsyncioSleepLoopSlot{
 struct RuntimeValue {
   mlir::Type contract;
   llvm::SmallVector<mlir::Value, 4> values;
+  ownership::OwnershipKind ownership =
+      ownership::OwnershipKind::NonObject;
 
-  static RuntimeValue object(mlir::Type contract, mlir::ValueRange values);
+  static RuntimeValue object(mlir::Type contract, mlir::ValueRange values,
+                             bool ownsObject = true);
+  static RuntimeValue
+  objectWithOwnership(mlir::Type contract, mlir::ValueRange values,
+                      ownership::OwnershipKind ownership);
   std::string contractName() const;
+  RuntimeValue
+  withOwnership(ownership::OwnershipKind ownership) const;
+  RuntimeValue withLogicalOwnership(bool ownsObject) const;
 };
 
 struct RuntimeCallableAlternative {
@@ -153,21 +163,32 @@ struct RuntimeBundle {
   std::string functionTarget;
   llvm::SmallVector<RuntimeValue, 4> closureValues;
   llvm::SmallVector<RuntimeCallableAlternative, 4> callableAlternatives;
+  std::shared_ptr<RuntimeBundle> boundMethodReceiver;
+  std::string boundMethodName;
   std::string coroutineTarget;
   llvm::SmallVector<RuntimeValue, 8> coroutineSources;
+  llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 8> coroutineSourceBundles;
   std::optional<RuntimePrimitiveI64Evidence> primitiveI64;
   std::optional<RuntimeBufferEvidence> buffer;
   std::optional<RuntimeCtypesEvidence> ctypes;
   RuntimeObjectEvidence objectEvidence;
   llvm::StringMap<std::shared_ptr<RuntimeBundle>> fieldBundles;
+  std::shared_ptr<RuntimeBundle> boxedObject;
   llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 8> sequenceElementBundles;
   llvm::SmallVector<RuntimeValue, 8> sequenceElements;
   llvm::SmallVector<std::int64_t, 8> sequenceIndices;
+  std::uint64_t sequenceCapacity = 0;
   llvm::SmallVector<std::string, 8> mappingKeys;
+  llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 8> mappingKeyBundles;
   llvm::SmallVector<RuntimeValue, 8> mappingValues;
+  llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 8> mappingValueBundles;
   llvm::SmallVector<mlir::Value, 8> mappingPresent;
+  std::uint64_t mappingCapacity = 0;
 
   static RuntimeBundle object(mlir::Type contract, mlir::ValueRange values);
+  static RuntimeBundle
+  objectWithOwnership(mlir::Type contract, mlir::ValueRange values,
+                      ownership::OwnershipKind ownership);
   static RuntimeBundle aggregate(mlir::Type contract,
                                  mlir::ValueRange operands);
   static RuntimeBundle builtinCallable(mlir::Type contract,
@@ -178,6 +199,10 @@ struct RuntimeBundle {
   llvm::ArrayRef<mlir::Value> physicalValues() const;
   std::string contractName() const;
   std::string instanceContractName() const;
+  void setObjectOwnership(ownership::OwnershipKind ownership);
+  void setObjectLogicalOwnership(bool ownsObject);
+  RuntimeBundle
+  withObjectOwnership(ownership::OwnershipKind ownership) const;
 };
 
 inline bool hasFutureTerminalEvidence(const RuntimeBundle &future) {
@@ -200,6 +225,10 @@ struct CallableLogicalEntryArgs {
 // object types.
 inline constexpr llvm::StringLiteral kPrimitiveI64CloneAttr{
     "ly.primitive_i64_clone"};
+inline constexpr llvm::StringLiteral kProtocolTemplateAttr{
+    "ly.protocol_template"};
+inline constexpr llvm::StringLiteral kProtocolSpecializationAttr{
+    "ly.protocol_specialization_of"};
 
 struct ControlFlowLogicalBlockArgumentABI {
   mlir::BlockArgument argument;
@@ -231,6 +260,11 @@ struct ReturnedObjectEvidenceSummary {
   llvm::SmallVector<ReturnedObjectEvidenceSlot, 4> slots;
 };
 
+struct ReturnedStaticObjectSummary {
+  mlir::Type objectContract;
+  unsigned resultIndex = 0;
+};
+
 struct ReturnedValueSummary {
   llvm::SmallVector<unsigned, 4> argumentIndices;
 };
@@ -251,9 +285,12 @@ struct CallableArgumentPlan {
 struct RuntimeArgumentEvidence {
   std::string functionTarget;
   llvm::SmallVector<mlir::Type, 4> closureValueTypes;
+  std::string coroutineTarget;
+  llvm::SmallVector<mlir::Type, 4> coroutineSourceTypes;
 
   bool empty() const {
-    return functionTarget.empty() && closureValueTypes.empty();
+    return functionTarget.empty() && closureValueTypes.empty() &&
+           coroutineTarget.empty() && coroutineSourceTypes.empty();
   }
 };
 
@@ -302,4 +339,4 @@ struct CallableAggregateEvidenceABI {
   llvm::SmallVector<mlir::Type, 8> kwargValueTypes;
 };
 
-} // namespace py::runtime_lowering
+} // namespace py::lowering

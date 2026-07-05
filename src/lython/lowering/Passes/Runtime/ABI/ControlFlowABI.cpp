@@ -2,7 +2,7 @@
 
 #include <functional>
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 namespace {
 
 bool hasRuntimeControlFlowABI(mlir::Type type) {
@@ -39,10 +39,22 @@ mlir::LogicalResult RuntimeBundleLowerer::ensureValueBundle(mlir::Operation *op,
     return mlir::success();
 
   auto argument = mlir::dyn_cast<mlir::BlockArgument>(value);
-  if (!argument || !hasRuntimeControlFlowABI(argument.getType()))
-    return mlir::success();
+  if (argument) {
+    if (!hasRuntimeControlFlowABI(argument.getType()))
+      return mlir::success();
+    return RuntimeBundleLowerer::lowerControlFlowBlockArgument(op, argument);
+  }
 
-  return RuntimeBundleLowerer::lowerControlFlowBlockArgument(op, argument);
+  mlir::Operation *definition = value.getDefiningOp();
+  if (!definition || !definition->getDialect() ||
+      definition->getDialect()->getNamespace() != "py")
+    return mlir::success();
+  if (llvm::is_contained(erase, definition))
+    return mlir::success();
+  if (mlir::failed(RuntimeBundleLowerer::ensureOperationOperandBundles(
+          definition)))
+    return mlir::failure();
+  return RuntimeBundleLowerer::lowerPyOp(definition);
 }
 
 mlir::LogicalResult
@@ -83,31 +95,39 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerControlFlowBlockArgument(
     physicalArguments.push_back(physical);
   }
 
+  RuntimeBundle provisionalBundle;
+  if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+          op, argument.getType(), physicalArguments, provisionalBundle))) {
+    controlFlowBlockArgumentsInProgress.erase(argument);
+    return mlir::failure();
+  }
+  valueBundles[argument] = std::move(provisionalBundle);
+
   llvm::SmallVector<mlir::Block *, 8> predecessors(block->pred_begin(),
                                                    block->pred_end());
   llvm::SmallVector<const RuntimeBundle *, 4> sourceBundles;
 
   auto appendPhysicalBranchOperands =
-      [&](mlir::Value logicalSource,
+      [&](mlir::Operation *anchor, mlir::Value logicalSource,
           llvm::SmallVectorImpl<mlir::Value> &destOperands)
       -> mlir::LogicalResult {
     if (mlir::failed(
-            RuntimeBundleLowerer::ensureValueBundle(op, logicalSource)))
+            RuntimeBundleLowerer::ensureValueBundle(anchor, logicalSource)))
       return mlir::failure();
     const RuntimeBundle *source =
         RuntimeBundleLowerer::bundleFor(logicalSource);
     if (!source)
-      return op->emitError()
+      return anchor->emitError()
              << "control-flow branch operand has no lowered runtime bundle";
 
     llvm::SmallVector<mlir::Value, 8> physicalOperands;
     if (auto unionType = mlir::dyn_cast<py::UnionType>(argument.getType())) {
       if (mlir::failed(RuntimeBundleLowerer::appendUnionRuntimeValues(
-              op, unionType, *source, logicalSource.getType(),
+              anchor, unionType, *source, logicalSource.getType(),
               physicalOperands)))
         return mlir::failure();
     } else if (mlir::failed(RuntimeBundleLowerer::appendBundlePhysicalOperands(
-                   op, *source, *physicalTypes, physicalOperands))) {
+                   anchor, *source, *physicalTypes, physicalOperands))) {
       return mlir::failure();
     }
 
@@ -117,7 +137,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerControlFlowBlockArgument(
   };
 
   auto rewriteBranchOperands =
-      [&](mlir::Block *dest, mlir::ValueRange oldOperands,
+      [&](mlir::Operation *terminator, mlir::Block *dest,
+          mlir::ValueRange oldOperands,
           llvm::SmallVectorImpl<mlir::Value> &newOperands)
       -> mlir::LogicalResult {
     newOperands.append(oldOperands.begin(), oldOperands.end());
@@ -129,8 +150,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerControlFlowBlockArgument(
                 "destination block argument list";
 
     llvm::SmallVector<mlir::Value, 8> physicalOperands;
-    if (mlir::failed(appendPhysicalBranchOperands(newOperands[logicalIndex],
-                                                  physicalOperands)))
+    if (mlir::failed(appendPhysicalBranchOperands(
+            terminator, newOperands[logicalIndex], physicalOperands)))
       return mlir::failure();
     insertValues(newOperands, logicalIndex + 1, physicalOperands);
     return mlir::success();
@@ -141,7 +162,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerControlFlowBlockArgument(
     if (auto branch = mlir::dyn_cast<mlir::cf::BranchOp>(terminator)) {
       llvm::SmallVector<mlir::Value, 8> operands;
       if (mlir::failed(rewriteBranchOperands(
-              branch.getDest(), branch.getDestOperands(), operands))) {
+              terminator, branch.getDest(), branch.getDestOperands(),
+              operands))) {
         controlFlowBlockArgumentsInProgress.erase(argument);
         return mlir::failure();
       }
@@ -156,8 +178,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerControlFlowBlockArgument(
       llvm::SmallVector<mlir::Value, 8> trueOperands;
       llvm::SmallVector<mlir::Value, 8> falseOperands;
       if (mlir::failed(rewriteBranchOperands(
-              cond.getTrueDest(), cond.getTrueDestOperands(), trueOperands)) ||
-          mlir::failed(rewriteBranchOperands(cond.getFalseDest(),
+              terminator, cond.getTrueDest(), cond.getTrueDestOperands(),
+              trueOperands)) ||
+          mlir::failed(rewriteBranchOperands(terminator, cond.getFalseDest(),
                                              cond.getFalseDestOperands(),
                                              falseOperands))) {
         controlFlowBlockArgumentsInProgress.erase(argument);
@@ -177,19 +200,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerControlFlowBlockArgument(
               "and cf.cond_br predecessors";
   }
 
-  RuntimeBundle bundle;
-  if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
-          op, argument.getType(), physicalArguments, bundle))) {
-    controlFlowBlockArgumentsInProgress.erase(argument);
-    return mlir::failure();
-  }
   if (!sourceBundles.empty() &&
       llvm::all_of(sourceBundles, [&](const RuntimeBundle *candidate) {
         return candidate &&
                samePhysicalIdentity(*sourceBundles.front(), *candidate);
       }))
-    bundle.copyEvidenceFrom(*sourceBundles.front());
-  valueBundles[argument] = std::move(bundle);
+    valueBundles[argument].copyEvidenceFrom(*sourceBundles.front());
 
   if (controlFlowLogicalBlockArgumentSet.insert(argument).second)
     controlFlowLogicalBlockArguments.push_back(
@@ -302,4 +318,4 @@ RuntimeBundleLowerer::eraseControlFlowLogicalBlockArguments() {
   return mlir::success();
 }
 
-} // namespace py::runtime_lowering
+} // namespace py::lowering

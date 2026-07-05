@@ -1,6 +1,6 @@
 #include "Runtime/Core/Lowerer.h"
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 namespace {
 
 void clearFutureTerminalState(RuntimeBundle &future) {
@@ -18,6 +18,13 @@ RuntimeBundle noneLiteralBundle(mlir::MLIRContext *context) {
 bool isStaticZeroDelay(const RuntimeBundle &delay) {
   auto literal = mlir::dyn_cast_or_null<py::LiteralType>(delay.contract);
   return literal && literal.getSpelling() == "0";
+}
+
+mlir::Type concreteCoroutineType(mlir::MLIRContext *context,
+                                 mlir::Type resultType) {
+  mlir::Type object = runtimeContractType(context, "builtins.object");
+  return py::ContractType::get(context, "types.CoroutineType",
+                               {object, object, resultType});
 }
 
 } // namespace
@@ -259,6 +266,19 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFutureBoundMethod(
       return op.emitError()
              << "_asyncio.Future.set_result requires one Python object value";
     bool wasPending = !hasFutureTerminalEvidence(receiver);
+    std::optional<RuntimeValue> resultEvidence;
+    if (wasPending) {
+      if (RuntimeBundleLowerer::hasLazyPrimitiveI64Object(*sources[1])) {
+        mlir::FailureOr<RuntimeValue> materialized =
+            RuntimeBundleLowerer::materializePrimitiveI64Object(op,
+                                                                *sources[1]);
+        if (mlir::failed(materialized))
+          return mlir::failure();
+        resultEvidence = std::move(*materialized);
+      } else {
+        resultEvidence = sources[1]->objectValue;
+      }
+    }
     if (mlir::failed(lowerManifestMethodResult(
             op, op.getResult(0), receiver, methodName, sources,
             /*allowUnusedSources=*/false,
@@ -266,8 +286,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFutureBoundMethod(
       return mlir::failure();
     if (wasPending) {
       clearFutureTerminalState(receiver);
-      receiver.objectEvidence.setSlot(kFutureResultSlot,
-                                      sources[1]->objectValue);
+      receiver.objectEvidence.setSlot(kFutureResultSlot, *resultEvidence);
     }
     erase.push_back(op);
     return mlir::success();
@@ -396,14 +415,34 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFutureBoundMethod(
 mlir::LogicalResult RuntimeBundleLowerer::lowerAsyncFunctionTargetCall(
     py::CallOp op, mlir::func::FuncOp target, llvm::StringRef targetName,
     llvm::ArrayRef<const RuntimeBundle *> sources) {
-  std::optional<RuntimeSymbol> initializer =
-      manifest.initializer("types.CoroutineType", "__new__");
-  if (!initializer)
-    return op.emitError()
-           << "runtime manifest has no types.CoroutineType.__new__";
+  RuntimeBundle result;
+  if (mlir::failed(RuntimeBundleLowerer::emitAsyncFunctionTargetCallResult(
+          op, target, targetName, sources, result)))
+    return mlir::failure();
+  valueBundles[op.getResult(0)] = std::move(result);
+  erase.push_back(op);
+  return mlir::success();
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::emitAsyncFunctionTargetCallResult(
+    py::CallOp op, mlir::func::FuncOp target, llvm::StringRef targetName,
+    llvm::ArrayRef<const RuntimeBundle *> sources, RuntimeBundle &result) {
   if (op.getNumResults() != 1)
     return op.emitError()
            << "async function call lowering expects one coroutine result";
+  return RuntimeBundleLowerer::emitAsyncFunctionTargetCallResult(
+      op.getOperation(), op.getResult(0), target, targetName, sources, result);
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::emitAsyncFunctionTargetCallResult(
+    mlir::Operation *op, mlir::Value resultValue, mlir::func::FuncOp target,
+    llvm::StringRef targetName, llvm::ArrayRef<const RuntimeBundle *> sources,
+    RuntimeBundle &result) {
+  std::optional<RuntimeSymbol> initializer =
+      manifest.initializer("types.CoroutineType", "__new__");
+  if (!initializer)
+    return op->emitError()
+           << "runtime manifest has no types.CoroutineType.__new__";
 
   mlir::FunctionType initializerType = initializer->function.getFunctionType();
   if (initializerType.getNumInputs() != 1 ||
@@ -415,27 +454,48 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAsyncFunctionTargetCall(
   mlir::Value targetId =
       builder
           .create<mlir::arith::ConstantIntOp>(
-              op.getLoc(), RuntimeBundleLowerer::functionTargetId(targetName),
+              op->getLoc(), RuntimeBundleLowerer::functionTargetId(targetName),
               64)
           .getResult();
   mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
-      op.getLoc(), *initializer, mlir::ValueRange{targetId});
+      op->getLoc(), *initializer, mlir::ValueRange{targetId});
 
-  RuntimeBundle result;
+  mlir::Type resultContract = resultValue.getType();
+  if (auto bodyResult =
+          target->getAttrOfType<mlir::TypeAttr>("ly.async.body_result")) {
+    mlir::Type concrete = concreteCoroutineType(context, bodyResult.getValue());
+    if (resultContract != concrete &&
+        py::isAssignableTo(concrete, resultContract, op))
+      resultContract = concrete;
+  }
+
   if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
-          op, op.getResult(0).getType(), call, result)))
+          op, resultContract, call, result)))
     return mlir::failure();
   result.coroutineTarget = target.getSymName().str();
   result.coroutineSources.reserve(sources.size());
+  result.coroutineSourceBundles.reserve(sources.size());
   for (const RuntimeBundle *source : sources) {
     if (!source || source->kind != RuntimeBundle::Kind::Object)
-      return op.emitError() << "async coroutine frame source for " << targetName
-                            << " must be a lowered Python object bundle";
+      return op->emitError()
+             << "async coroutine frame source for " << targetName
+             << " must be a lowered Python object bundle";
+    auto sourceEvidence = std::make_shared<RuntimeBundle>(*source);
+    if (RuntimeBundleLowerer::hasLazyPrimitiveI64Object(*source)) {
+      mlir::FailureOr<RuntimeValue> materialized =
+          RuntimeBundleLowerer::materializePrimitiveI64Object(op, *source);
+      if (mlir::failed(materialized))
+        return mlir::failure();
+      result.coroutineSources.push_back(*materialized);
+      sourceEvidence->contract = materialized->contract;
+      sourceEvidence->objectValue = *materialized;
+      result.coroutineSourceBundles.push_back(std::move(sourceEvidence));
+      continue;
+    }
     result.coroutineSources.push_back(source->objectValue);
+    result.coroutineSourceBundles.push_back(std::move(sourceEvidence));
   }
-  valueBundles[op.getResult(0)] = std::move(result);
-  erase.push_back(op);
   return mlir::success();
 }
 
-} // namespace py::runtime_lowering
+} // namespace py::lowering

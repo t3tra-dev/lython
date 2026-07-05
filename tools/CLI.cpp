@@ -990,6 +990,47 @@ bool hasRuntimeVerifiedSafetyMetadata(llvm::Instruction &inst) {
   return version && version->getString() == kLythonRuntimeSafetyMetadataVersion;
 }
 
+void collectLinkedLLVMSafetyContracts(llvm::Module &llvmModule,
+                                      LLVMSafetyProfile &profile) {
+  for (llvm::Function &function : llvmModule) {
+    for (llvm::BasicBlock &block : function) {
+      for (llvm::Instruction &inst : block) {
+        if (hasRuntimeVerifiedSafetyMetadata(inst) ||
+            getLythonSafetyMetadataId(inst))
+          continue;
+
+        LLVMSafetyContract contract;
+        contract.id = static_cast<int64_t>(profile.contracts.size());
+        contract.functionName = function.getName().str();
+
+        if (auto *rmw = llvm::dyn_cast<llvm::AtomicRMWInst>(&inst)) {
+          contract.kind = LLVMSafetyEffectKind::AtomicRMW;
+          contract.rmwBinOp = rmw->getOperation();
+          contract.integerOperand = llvmIntegerConstant(rmw->getValOperand());
+          contract.ordering = rmw->getOrdering();
+        } else if (llvm::isa<llvm::AtomicCmpXchgInst>(inst)) {
+          contract.kind = LLVMSafetyEffectKind::AtomicCmpXchg;
+        } else if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+          if (!load->isAtomic())
+            continue;
+          contract.kind = LLVMSafetyEffectKind::AtomicLoad;
+          contract.ordering = load->getOrdering();
+        } else if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+          if (!store->isAtomic())
+            continue;
+          contract.kind = LLVMSafetyEffectKind::AtomicStore;
+          contract.ordering = store->getOrdering();
+        } else {
+          continue;
+        }
+
+        setLythonSafetyMetadataId(inst, contract.id);
+        profile.contracts.push_back(std::move(contract));
+      }
+    }
+  }
+}
+
 // Rewrites the safety metadata of every contracted instruction to the
 // runtime-verified version. Called only by the prelower generation run after
 // all verifications have passed; the resulting IR is the build-time cache.
@@ -1134,7 +1175,7 @@ void emitLLVMSafetyVerifierError(llvm::Instruction &inst, llvm::StringRef msg) {
   llvm::errs() << "  instruction: " << inst << "\n";
 }
 
-LogicalResult verifyPostCoroLLVMThreadSafety(
+LogicalResult verifyPostCoroLLVMThreadSafe(
     llvm::Module &llvmModule, const LLVMSafetyProfile &profile,
     LLVMSafetyContractCoverage coverage =
         LLVMSafetyContractCoverage::RequireEveryContract) {
@@ -1146,9 +1187,9 @@ LogicalResult verifyPostCoroLLVMThreadSafety(
 }
 
 LogicalResult
-verifyOptimizedLLVMThreadSafety(llvm::Module &llvmModule,
+verifyOptimizedLLVMThreadSafe(llvm::Module &llvmModule,
                                 const LLVMSafetyProfile &profile) {
-  return verifyPostCoroLLVMThreadSafety(
+  return verifyPostCoroLLVMThreadSafe(
       llvmModule, profile, LLVMSafetyContractCoverage::AllowOptimizerElision);
 }
 
@@ -1163,7 +1204,7 @@ LogicalResult emitObjectFile(llvm::Module &llvmModule,
   llvmModule.setTargetTriple(targetTriple);
   llvmModule.setDataLayout(targetMachine->createDataLayout());
   runLLVMCoroLowering(llvmModule, targetMachine.get());
-  if (failed(verifyOptimizedLLVMThreadSafety(llvmModule, safetyProfile)))
+  if (failed(verifyOptimizedLLVMThreadSafe(llvmModule, safetyProfile)))
     return failure();
 
   std::error_code ec;
@@ -1629,7 +1670,7 @@ LogicalResult runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
     py::installPythonExceptionCleanupFrames(*llvmModule, pythonCallSites);
     if (failed(verifyLLVMIRSafetyMetadataAttached(*llvmModule, safetyProfile)))
       return failure();
-    if (failed(verifyPostCoroLLVMThreadSafety(*llvmModule, safetyProfile)))
+    if (failed(verifyPostCoroLLVMThreadSafe(*llvmModule, safetyProfile)))
       return failure();
     for (auto &func : *llvmModule) {
       if (!func.isDeclaration())
@@ -1642,9 +1683,10 @@ LogicalResult runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
       return failure();
     if (failed(py::runtime_library::linkEmbeddedNativeRuntime(*llvmModule)))
       return failure();
+    collectLinkedLLVMSafetyContracts(*llvmModule, safetyProfile);
     runLLVMCoroLowering(*llvmModule, optimizationTargetMachine.get());
     dumpLLVMForPass(irDump, "llvm-translation", *llvmModule);
-    if (failed(verifyOptimizedLLVMThreadSafety(*llvmModule, safetyProfile)))
+    if (failed(verifyOptimizedLLVMThreadSafe(*llvmModule, safetyProfile)))
       return failure();
 
     auto &jd = jit->getMainJITDylib();
@@ -1706,6 +1748,11 @@ static llvm::cl::opt<std::string>
 static llvm::cl::opt<bool> EmitLLVMOnly(
     "emit-llvm",
     llvm::cl::desc("Stop after emitting LLVM IR to the output file"),
+    llvm::cl::init(false), llvm::cl::cat(LythonCategory));
+static llvm::cl::opt<bool> AuditRuntimeManifest(
+    "audit-runtime-manifest",
+    llvm::cl::desc("Verify typing.mlir runtime-required contracts against "
+                   "runtime ABI manifest symbols after runtime import"),
     llvm::cl::init(false), llvm::cl::cat(LythonCategory));
 static llvm::cl::opt<std::string>
     TargetOption("target",
@@ -1835,8 +1882,8 @@ int main(int argc, char **argv) {
                   linalg::LinalgDialect, memref::MemRefDialect,
                   vector::VectorDialect, bufferization::BufferizationDialect,
                   LLVM::LLVMDialect>();
-  py::runtime_lowering::arch::arm::registerSMEDialects(registry);
-  py::runtime_lowering::arch::x86::registerX86Dialects(registry);
+  py::lowering::arch::arm::registerSMEDialects(registry);
+  py::lowering::arch::x86::registerX86Dialects(registry);
   arith::registerBufferizableOpInterfaceExternalModels(registry);
   bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(
       registry);
@@ -1845,7 +1892,7 @@ int main(int argc, char **argv) {
   mlir::registerConvertFuncToLLVMInterface(registry);
   mlir::registerConvertMemRefToLLVMInterface(registry);
   mlir::registerAllToLLVMIRTranslations(registry);
-  py::runtime_lowering::arch::x86::registerX86Translations(registry);
+  py::lowering::arch::x86::registerX86Translations(registry);
   registerPySafetyLLVMIRTranslation(registry);
 
   MLIRContext context;
@@ -1879,7 +1926,8 @@ int main(int argc, char **argv) {
 
   {
     PerfScope perf("lowering");
-    if (failed(py::runLoweringPipeline(*module, tensorTarget, irDump))) {
+    if (failed(py::runLoweringPipeline(*module, tensorTarget, irDump,
+                                       AuditRuntimeManifest))) {
       llvm::errs() << "Failed to run lowering pipeline\n";
       return 1;
     }
@@ -1905,7 +1953,7 @@ int main(int argc, char **argv) {
   dumpLLVMForPass(irDump, "llvm-translation", *llvmModule);
   if (failed(verifyLLVMIRSafetyMetadataAttached(*llvmModule, safetyProfile)))
     return 1;
-  if (failed(verifyPostCoroLLVMThreadSafety(*llvmModule, safetyProfile)))
+  if (failed(verifyPostCoroLLVMThreadSafe(*llvmModule, safetyProfile)))
     return 1;
 
   llvm::InitializeAllTargets();
@@ -1929,6 +1977,9 @@ int main(int argc, char **argv) {
   if (!py::runtime_library::prelowerGenerationMode() &&
       failed(installAOTEntryPoint(*llvmModule)))
     return 1;
+
+  if (!py::runtime_library::prelowerGenerationMode())
+    collectLinkedLLVMSafetyContracts(*llvmModule, safetyProfile);
 
   if (EmitLLVMOnly)
     return failed(writeLLVMIR(*llvmModule, outputPath)) ? 1 : 0;

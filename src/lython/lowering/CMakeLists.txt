@@ -4,12 +4,17 @@ add_library(LythonRuntimeLowering STATIC
     Passes/LoweringPipeline.cpp
     Passes/Runtime/ABI/CallableABI.cpp
     Passes/Runtime/ABI/ControlFlowABI.cpp
+    Passes/Runtime/ABI/AggregateOwnership.cpp
     Passes/Runtime/ABI/Returns.cpp
     Passes/Runtime/ABI/RuntimeABI.cpp
+    ../common/Ownership.cpp
+    ../common/Contracts.cpp
+    ../common/Native.cpp
     Passes/Runtime/Calls/Builtin.cpp
     Passes/Runtime/Calls/Operands.cpp
     Passes/Runtime/Cleanup/EH.cpp
     Passes/Runtime/Core/Dispatch.cpp
+    Passes/Runtime/Core/CollectionPayload.cpp
     Passes/Runtime/Core/Lowerer.cpp
     Passes/Runtime/Core/ObjectBundles.cpp
     Passes/Runtime/Ctypes/Calls.cpp
@@ -39,12 +44,14 @@ add_library(LythonRuntimeLowering STATIC
     Passes/Runtime/Ops/IndirectCallableOps.cpp
     Passes/Runtime/Ops/LiteralOps.cpp
     Passes/Runtime/Ops/PackAndBindingOps.cpp
+    Passes/Runtime/Ops/RefCountOps.cpp
     Passes/Runtime/Ops/SpecialMethodOps.cpp
     Passes/Runtime/Ops/TryOps.cpp
     Passes/Runtime/Ops/UnionOps.cpp
     Passes/Runtime/Passes/AsyncThunk.cpp
     Passes/Runtime/Passes/Lowering.cpp
     Passes/Runtime/Passes/Ownership.cpp
+    Passes/Runtime/Passes/RefCountElision.cpp
     Passes/Runtime/Passes/Stubs.cpp
     Passes/Runtime/Primitive/I64Calls.cpp
     Passes/Runtime/Primitive/TensorGemm.cpp
@@ -55,6 +62,14 @@ add_library(LythonRuntimeLowering STATIC
     Passes/Runtime/Arch/Generic/PrimitiveTensorGenericMicroKernel.cpp
     Passes/Runtime/Primitive/TensorSupport.cpp
     Passes/Runtime/Primitive/TensorLowering.cpp
+    ../verifier/AlgorithmMEvidence.cpp
+    ../verifier/runtime/Verification.cpp
+    ../verifier/runtime/AffineOwnership.cpp
+    ../verifier/runtime/LLVMCallOwnership.cpp
+    ../verifier/runtime/Manifest.cpp
+    ../verifier/runtime/Native.cpp
+    ../verifier/runtime/ThreadSafeModel.cpp
+    ../verifier/runtime/ThreadSafe.cpp
 )
 
 add_executable(LythonRuntimeMlirBytecode
@@ -66,6 +81,7 @@ add_dependencies(LythonRuntimeMlirBytecode PyDialectIncGen)
 target_include_directories(LythonRuntimeMlirBytecode
     PRIVATE
     ${CMAKE_SOURCE_DIR}/src/lython/dialects
+    ${CMAKE_SOURCE_DIR}/src/lython/common
     ${CMAKE_BINARY_DIR}/src/lython/dialects
 )
 
@@ -133,7 +149,7 @@ set(LYTHON_RUNTIME_NATIVE_MLIR
 )
 
 set(LYTHON_RUNTIME_NATIVE_BYTECODE_DIR
-    "${CMAKE_CURRENT_BINARY_DIR}/runtime_native"
+    "${CMAKE_CURRENT_BINARY_DIR}/native"
 )
 set(LYTHON_RUNTIME_NATIVE_BYTECODE)
 foreach(native_runtime_mlir IN LISTS LYTHON_RUNTIME_NATIVE_MLIR)
@@ -165,10 +181,10 @@ add_custom_command(
     VERBATIM
 )
 
-add_custom_target(LythonRuntimeNativeBytecode
+add_custom_target(LythonNativeBytecode
     DEPENDS "${LYTHON_RUNTIME_NATIVE_BYTECODE_STAMP}"
 )
-add_dependencies(LythonRuntimeLowering LythonRuntimeNativeBytecode)
+add_dependencies(LythonRuntimeLowering LythonNativeBytecode)
 
 # Compile every runtime bytecode module directly into the binary: the
 # compiler never reads runtime MLIR from the filesystem. Runtime object MLIR is
@@ -259,7 +275,7 @@ add_custom_command(
 add_library(LythonEmbeddedRuntime STATIC "${LYTHON_EMBEDDED_RUNTIME_CPP}")
 add_dependencies(LythonEmbeddedRuntime
     LythonRuntimeObjectBytecode
-    LythonRuntimeNativeBytecode
+    LythonNativeBytecode
 )
 target_include_directories(LythonEmbeddedRuntime
     PUBLIC
@@ -271,6 +287,8 @@ target_include_directories(LythonRuntimeLowering
     PUBLIC
     ${CMAKE_SOURCE_DIR}/src/lython/dialects
     ${CMAKE_BINARY_DIR}/src/lython/dialects
+    ${CMAKE_SOURCE_DIR}/src/lython/common
+    ${CMAKE_SOURCE_DIR}/src/lython/verifier
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/Passes
 )

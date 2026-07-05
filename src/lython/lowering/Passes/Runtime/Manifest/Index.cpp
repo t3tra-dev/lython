@@ -1,6 +1,6 @@
 #include "Runtime/Manifest/Index.h"
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 
 namespace {
 
@@ -600,4 +600,4 @@ mlir::LogicalResult RuntimeManifestIndex::verifySymbol(RuntimeSymbol &symbol) {
   return verified.get();
 }
 
-} // namespace py::runtime_lowering
+} // namespace py::lowering

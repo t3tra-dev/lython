@@ -1,6 +1,6 @@
 #include "Runtime/Core/Lowerer.h"
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 namespace {
 
 bool isPrimitiveOnlyCallableFunction(mlir::func::FuncOp function) {
@@ -15,6 +15,26 @@ bool isPrimitiveOnlyCallableFunction(mlir::func::FuncOp function) {
   return llvm::all_of(callable.getPositionalTypes(), isRuntimePrimitive) &&
          llvm::all_of(callable.getKwOnlyTypes(), isRuntimePrimitive) &&
          llvm::all_of(callable.getResultTypes(), isRuntimePrimitive);
+}
+
+bool isErasedObjectResult(mlir::Type type) {
+  return runtimeContractName(type) == "builtins.object";
+}
+
+bool isCoroutineLikeResultType(mlir::Type type) {
+  if (runtimeContractName(type) == "types.CoroutineType")
+    return true;
+  auto protocol = mlir::dyn_cast_if_present<py::ProtocolType>(type);
+  return protocol && protocol.getProtocolName() == "Coroutine";
+}
+
+bool isAwaitIteratorLikeResultType(mlir::Type type) {
+  std::string contract = runtimeContractName(type);
+  if (contract == "types.CoroutineAwaitIterator" ||
+      contract == "_asyncio.FutureIter" || contract == "_asyncio.TaskIter")
+    return true;
+  auto protocol = mlir::dyn_cast_if_present<py::ProtocolType>(type);
+  return protocol && protocol.getProtocolName() == "Generator";
 }
 
 } // namespace
@@ -47,6 +67,23 @@ mlir::LogicalResult RuntimeBundleLowerer::bundleRuntimeResults(
   if (exact)
     return RuntimeBundleLowerer::makeObjectBundle(op, expectedContract, values,
                                                   result);
+  if (RuntimeBundleLowerer::hasPrimitiveI64ABI(expectedContract) &&
+      values.size() == expectedTypes->size() + 2 &&
+      values[expectedTypes->size()].getType().isInteger(64) &&
+      values[expectedTypes->size() + 1].getType().isInteger(1)) {
+    llvm::SmallVector<mlir::Value, 4> objectValues;
+    objectValues.reserve(expectedTypes->size());
+    for (unsigned index = 0, end = static_cast<unsigned>(expectedTypes->size());
+         index < end; ++index)
+      objectValues.push_back(values[index]);
+    if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+            op, expectedContract, objectValues, result)))
+      return mlir::failure();
+    result.primitiveI64 =
+        RuntimePrimitiveI64Evidence{values[expectedTypes->size()],
+                                    values[expectedTypes->size() + 1]};
+    return mlir::success();
+  }
   if (!expected.empty() &&
       mlir::succeeded(initializeObjectFromRawValues(
           op, runtimeContractType(context, expected), values, result,
@@ -114,13 +151,25 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
     auto function = op->getParentOfType<mlir::func::FuncOp>();
     if (!function || !function->hasAttr("callable_type"))
       return mlir::WalkResult::advance();
+    if (RuntimeBundleLowerer::isCallableProtocolTemplate(function))
+      return mlir::WalkResult::advance();
     if (isPrimitiveOnlyCallableFunction(function))
       return mlir::WalkResult::advance();
+
+    auto callableAttr = function->getAttrOfType<mlir::TypeAttr>("callable_type");
+    auto callable = mlir::dyn_cast_if_present<py::CallableType>(
+        callableAttr ? callableAttr.getValue() : mlir::Type());
+    llvm::SmallVector<mlir::Type, 4> logicalResultTypes;
+    if (callable)
+      logicalResultTypes.append(callable.getResultTypes().begin(),
+                                callable.getResultTypes().end());
 
     auto returnedCoroutine =
         returnedCoroutineSummaries.find(function.getSymName());
     auto returnedObjectEvidence =
         returnedObjectEvidenceSummaries.find(function.getSymName());
+    auto returnedStaticObject =
+        returnedStaticObjectSummaries.find(function.getSymName());
     mlir::FunctionType functionType = function.getFunctionType();
     llvm::SmallVector<mlir::Value, 8> operands;
     unsigned resultIndex = 0;
@@ -171,7 +220,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
         return mlir::WalkResult::interrupt();
       }
       builder.create<mlir::func::ReturnOp>(op.getLoc(), operands);
-      erase.push_back(op);
+      op.erase();
       return mlir::WalkResult::advance();
     }
     auto appendPrimitiveReturnEvidence =
@@ -196,8 +245,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
       return mlir::success();
     };
     auto appendReturnObject =
-        [&](const RuntimeBundle &bundle,
-            llvm::StringRef label) -> mlir::LogicalResult {
+        [&](const RuntimeBundle &bundle, llvm::StringRef label,
+            mlir::Type expectedLogicalType) -> mlir::LogicalResult {
       llvm::ArrayRef<mlir::Value> values = bundle.physicalValues();
       std::optional<RuntimeValue> materializedObject;
       if (values.empty() &&
@@ -208,6 +257,49 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
           return mlir::failure();
         materializedObject = std::move(*value);
         values = materializedObject->values;
+      }
+      if (isErasedObjectResult(expectedLogicalType)) {
+        if (bundle.contractName() == "builtins.object" &&
+            resultIndex + values.size() <= functionType.getNumResults()) {
+          bool exactBox = !values.empty();
+          for (auto [offset, value] : llvm::enumerate(values)) {
+            if (value.getType() != functionType.getResult(resultIndex + offset)) {
+              exactBox = false;
+              break;
+            }
+          }
+          if (exactBox) {
+            operands.append(values.begin(), values.end());
+            resultIndex += static_cast<unsigned>(values.size());
+            return mlir::success();
+          }
+        }
+        RuntimeBundle sourceForBox = bundle;
+        if (materializedObject) {
+          sourceForBox.objectValue = *materializedObject;
+          sourceForBox.contract = materializedObject->contract;
+        }
+        mlir::FailureOr<RuntimeBundle> boxed =
+            RuntimeBundleLowerer::boxRuntimeObject(op, sourceForBox,
+                                                   /*retainPayload=*/true);
+        if (mlir::failed(boxed))
+          return mlir::failure();
+        llvm::ArrayRef<mlir::Value> boxedValues = boxed->physicalValues();
+        if (resultIndex + boxedValues.size() > functionType.getNumResults())
+          return op.emitError()
+                 << "callable function '" << function.getSymName()
+                 << "' boxed object return exceeds ABI result list";
+        for (auto [offset, value] : llvm::enumerate(boxedValues)) {
+          mlir::Type expected = functionType.getResult(resultIndex + offset);
+          if (value.getType() != expected)
+            return op.emitError()
+                   << "callable function '" << function.getSymName()
+                   << "' boxed object return has type " << value.getType()
+                   << ", but ABI expects " << expected;
+        }
+        operands.append(boxedValues.begin(), boxedValues.end());
+        resultIndex += static_cast<unsigned>(boxedValues.size());
+        return mlir::success();
       }
       if (resultIndex + values.size() <= functionType.getNumResults()) {
         bool exact = true;
@@ -226,14 +318,34 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
 
       if (resultIndex < functionType.getNumResults() &&
           bundle.kind == RuntimeBundle::Kind::Object &&
-          isBuiltinsObjectHeaderType(functionType.getResult(resultIndex))) {
-        const RuntimeValue &objectValue =
-            materializedObject ? *materializedObject : bundle.objectValue;
-        mlir::FailureOr<mlir::Value> header =
-            RuntimeBundleLowerer::objectHeaderView(op, objectValue);
-        if (mlir::failed(header))
-          return mlir::failure();
-        operands.push_back(*header);
+          isBuiltinsObjectHandleType(functionType.getResult(resultIndex))) {
+        if (!RuntimeBundleLowerer::isBuiltinsObjectContract(bundle.contract)) {
+          mlir::FailureOr<RuntimeBundle> boxed =
+              RuntimeBundleLowerer::boxRuntimeObject(op, bundle,
+                                                     /*retainPayload=*/true);
+          if (mlir::failed(boxed))
+            return mlir::failure();
+          llvm::ArrayRef<mlir::Value> values = boxed->physicalValues();
+          if (values.size() == 1 &&
+              values.front().getType() == functionType.getResult(resultIndex)) {
+            operands.push_back(values.front());
+            ++resultIndex;
+            return appendPrimitiveReturnEvidence(bundle);
+          }
+          return op.emitError()
+                 << "boxed return value for " << bundle.contractName()
+                 << " does not match callable return ABI " << resultIndex
+                 << " of " << function.getSymName();
+        }
+        if (values.empty())
+          return op.emitError()
+                 << "builtins.object return value has no boxed handle";
+        if (values.front().getType() != functionType.getResult(resultIndex))
+          return op.emitError()
+                 << "builtins.object return handle " << values.front().getType()
+                 << " does not match callable return ABI " << resultIndex
+                 << " of " << function.getSymName();
+        operands.push_back(values.front());
         ++resultIndex;
         return appendPrimitiveReturnEvidence(bundle);
       }
@@ -255,12 +367,50 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
         result = mlir::failure();
         return mlir::WalkResult::interrupt();
       }
-      if (mlir::failed(appendReturnObject(*bundle, "return value"))) {
+      mlir::Type logicalResultType =
+          logicalResultIndex < logicalResultTypes.size()
+              ? logicalResultTypes[logicalResultIndex]
+              : operand.getType();
+      if (mlir::failed(
+              appendReturnObject(*bundle, "return value", logicalResultType))) {
         result = mlir::failure();
         return mlir::WalkResult::interrupt();
       }
+      if (returnedStaticObject != returnedStaticObjectSummaries.end() &&
+          returnedStaticObject->second.resultIndex == logicalResultIndex) {
+        mlir::Type objectContract =
+            returnedStaticObject->second.objectContract;
+        const RuntimeBundle *staticObject = nullptr;
+        if (bundle->kind == RuntimeBundle::Kind::Object &&
+            py::isAssignableTo(bundle->objectValue.contract, objectContract,
+                               op.getOperation())) {
+          staticObject = bundle;
+        } else if (bundle->boxedObject &&
+                   py::isAssignableTo(
+                       bundle->boxedObject->objectValue.contract,
+                       objectContract, op.getOperation())) {
+          staticObject = bundle->boxedObject.get();
+        }
+        if (!staticObject) {
+          op.emitError() << "static returned object evidence for "
+                         << function.getSymName() << " expected "
+                         << objectContract << ", but return bundle carries "
+                         << bundle->contract;
+          result = mlir::failure();
+          return mlir::WalkResult::interrupt();
+        }
+        if (mlir::failed(appendReturnObject(*staticObject,
+                                            "static returned object evidence",
+                                            objectContract))) {
+          result = mlir::failure();
+          return mlir::WalkResult::interrupt();
+        }
+      }
       if (returnedCoroutine != returnedCoroutineSummaries.end() &&
-          runtimeContractName(operand.getType()) == "types.CoroutineType") {
+          bundle->kind == RuntimeBundle::Kind::Object &&
+          !bundle->coroutineTarget.empty() &&
+          (isCoroutineLikeResultType(logicalResultType) ||
+           isAwaitIteratorLikeResultType(logicalResultType))) {
         if (bundle->coroutineTarget != returnedCoroutine->second.target) {
           op.emitError()
               << "returned coroutine target evidence does not match function "
@@ -287,9 +437,15 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
             return mlir::WalkResult::interrupt();
           }
           RuntimeBundle sourceBundle =
-              RuntimeBundle::object(source.contract, source.values);
+              index < bundle->coroutineSourceBundles.size() &&
+                      bundle->coroutineSourceBundles[index]
+                  ? *bundle->coroutineSourceBundles[index]
+                  : RuntimeBundle::object(source.contract, source.values);
+          sourceBundle.contract = source.contract;
+          sourceBundle.objectValue = source;
           if (mlir::failed(
-                  appendReturnObject(sourceBundle, "coroutine frame source"))) {
+                  appendReturnObject(sourceBundle, "coroutine frame source",
+                                     expected))) {
             result = mlir::failure();
             return mlir::WalkResult::interrupt();
           }
@@ -327,7 +483,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
           RuntimeBundle valueBundle =
               RuntimeBundle::object(value->contract, value->values);
           if (mlir::failed(appendReturnObject(
-                  valueBundle, "returned object evidence slot"))) {
+                  valueBundle, "returned object evidence slot",
+                  slot.sourceContract))) {
             result = mlir::failure();
             return mlir::WalkResult::interrupt();
           }
@@ -345,7 +502,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
     }
 
     builder.create<mlir::func::ReturnOp>(op.getLoc(), operands);
-    erase.push_back(op);
+    op.erase();
     return mlir::WalkResult::advance();
   });
   return result;
@@ -369,7 +526,10 @@ mlir::LogicalResult RuntimeBundleLowerer::eraseCallableLogicalEntryArgs() {
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::eraseLoweredPyOps() {
+  llvm::DenseSet<mlir::Operation *> erased;
   for (mlir::Operation *op : llvm::reverse(erase)) {
+    if (!erased.insert(op).second)
+      continue;
     for (mlir::Value result : op->getResults()) {
       if (!result.use_empty())
         return op->emitError()
@@ -380,4 +540,4 @@ mlir::LogicalResult RuntimeBundleLowerer::eraseLoweredPyOps() {
   return mlir::success();
 }
 
-} // namespace py::runtime_lowering
+} // namespace py::lowering

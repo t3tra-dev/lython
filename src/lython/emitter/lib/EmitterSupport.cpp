@@ -139,12 +139,6 @@ mlir::Type replaceSelfType(mlir::Type type, mlir::Type selfType) {
                ? py::UnpackType::get(context, packed)
                : type;
   }
-  if (auto list = mlir::dyn_cast<py::ListType>(type)) {
-    mlir::Type element = replaceSelfType(list.getElementType(), selfType);
-    return element != list.getElementType()
-               ? py::ListType::get(context, element)
-               : type;
-  }
   return type;
 }
 
@@ -201,15 +195,16 @@ void appendStarredArgumentTypes(mlir::Type type, AlgorithmM &types,
                                 llvm::SmallVectorImpl<mlir::Type> &out) {
   type = types.widenLiteral(type);
   if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(type)) {
-    if (contract.getContractName() == "builtins.tuple" &&
-        !contract.getArguments().empty()) {
-      out.push_back(contract.getArguments().front());
+    if (contract.getContractName() == "builtins.tuple") {
+      llvm::ArrayRef<mlir::Type> arguments = contract.getArguments();
+      if (arguments.empty())
+        out.push_back(types.object());
+      else if (arguments.size() == 1)
+        out.push_back(arguments.front());
+      else
+        out.append(arguments.begin(), arguments.end());
       return;
     }
-  }
-  if (auto tuple = mlir::dyn_cast_if_present<py::TupleType>(type)) {
-    out.append(tuple.getElementTypes().begin(), tuple.getElementTypes().end());
-    return;
   }
   out.push_back(types.object());
 }
@@ -407,8 +402,6 @@ bool containsObjectTop(mlir::Type type, const AlgorithmM &types) {
 }
 
 bool isNoneTypeLike(mlir::Type type) {
-  if (mlir::isa_and_nonnull<py::NoneType>(type))
-    return true;
   if (auto literal = mlir::dyn_cast_if_present<py::LiteralType>(type))
     return literal.getSpelling() == "None";
   if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(type))

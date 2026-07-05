@@ -10,7 +10,7 @@
 
 #include <optional>
 
-namespace py::runtime_lowering::arch::generic {
+namespace py::lowering::arch::generic {
 namespace {
 
 constexpr int64_t kMaxMicroM = 8;
@@ -319,4 +319,4 @@ mlir::LogicalResult lowerMatmulMicroKernel(mlir::linalg::MatmulOp matmul,
   return mlir::success();
 }
 
-} // namespace py::runtime_lowering::arch::generic
+} // namespace py::lowering::arch::generic

@@ -3,7 +3,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/Support/ErrorHandling.h"
 
-namespace py::runtime_lowering::ctypes {
+namespace py::lowering::ctypes {
 
 std::string targetFactsLabel(const std::optional<TargetPlatformFacts> &facts) {
   if (!facts)
@@ -615,4 +615,4 @@ mlir::FailureOr<RuntimeBundle> materializeCtypesPythonReadResult(
 
 std::string describeNativeArgumentSource(const RuntimeBundle &source);
 
-} // namespace py::runtime_lowering::ctypes
+} // namespace py::lowering::ctypes

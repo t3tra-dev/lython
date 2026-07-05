@@ -1,6 +1,6 @@
 #include "Runtime/Ctypes/Internal.h"
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 
 using namespace ctypes;
 
@@ -143,7 +143,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesNativeCall(
       builder.getFunctionType(nativeArgTypes, nativeResultTypes);
   mlir::FailureOr<mlir::func::FuncOp> declaration =
       getOrCreateNativeDeclaration(op, module, builder, evidence.symbolName,
-                                   functionType);
+                                   functionType, evidence.argTypes,
+                                   *evidence.resultType, evidence.abi,
+                                   evidence.processLibrary, *facts);
   if (mlir::failed(declaration))
     return mlir::failure();
   builder.setInsertionPoint(op);
@@ -200,4 +202,4 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesNativeCall(
   return mlir::success();
 }
 
-} // namespace py::runtime_lowering
+} // namespace py::lowering

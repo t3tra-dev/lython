@@ -8,7 +8,7 @@
 
 #include <memory>
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 namespace {
 
 class AsyncThunkLoweringPass
@@ -138,13 +138,13 @@ private:
 };
 
 } // namespace
-} // namespace py::runtime_lowering
+} // namespace py::lowering
 
 namespace py {
 
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createAsyncThunkLoweringPass() {
-  return std::make_unique<runtime_lowering::AsyncThunkLoweringPass>();
+  return std::make_unique<lowering::AsyncThunkLoweringPass>();
 }
 
 } // namespace py

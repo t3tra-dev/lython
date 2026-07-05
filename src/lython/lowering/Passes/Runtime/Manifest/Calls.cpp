@@ -1,6 +1,6 @@
 #include "Runtime/Core/Lowerer.h"
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 
 mlir::LogicalResult
 RuntimeBundleLowerer::verifySelectedRuntimeTarget(mlir::Operation *op,
@@ -122,6 +122,8 @@ mlir::LogicalResult RuntimeBundleLowerer::bindRuntimeCallResult(
              << emitted.symbol.name << " requires object receiver evidence";
     result.copyEvidenceFrom(*receiverEvidence);
   }
+  if (emitted.symbol.name == "__await__" && receiverEvidence)
+    result.copyEvidenceFrom(*receiverEvidence);
   valueBundles[resultValue] = std::move(result);
   return mlir::success();
 }
@@ -175,9 +177,17 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerNew(py::NewOp op) {
       RuntimeBundleLowerer::bundleFor(op.getClassObject());
   if (!classObject || classObject->kind != RuntimeBundle::Kind::TypeObject)
     return op.emitError() << "new class object has no lowered type bundle";
-  if (mlir::failed(requireEmptyAggregate(op, op.getKwnames(), "kw names")) ||
-      mlir::failed(requireEmptyAggregate(op, op.getKwvalues(), "kw values")))
-    return mlir::failure();
+  const RuntimeBundle *kwNames =
+      RuntimeBundleLowerer::bundleFor(op.getKwnames());
+  const RuntimeBundle *kwValues =
+      RuntimeBundleLowerer::bundleFor(op.getKwvalues());
+  if (!kwNames || kwNames->kind != RuntimeBundle::Kind::Aggregate)
+    return op.emitError() << "kw names must be a lowered aggregate bundle";
+  if (!kwValues || kwValues->kind != RuntimeBundle::Kind::Aggregate)
+    return op.emitError() << "kw values must be a lowered aggregate bundle";
+  if (kwNames->aggregateOperands.size() != kwValues->aggregateOperands.size())
+    return op.emitError() << "new keyword name/value count mismatch";
+  bool hasKeywords = !kwNames->aggregateOperands.empty();
 
   std::string contract = runtimeContractName(op.getInstance().getType());
   if (contract.empty())
@@ -187,6 +197,11 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerNew(py::NewOp op) {
                                                 "__new__");
   if (mlir::failed(methodName))
     return mlir::failure();
+  if (*methodName == "__new__" &&
+      hasKeywords &&
+      (RuntimeBundleLowerer::isErasedCtypesContract(contract) ||
+       RuntimeBundleLowerer::isStaticCtypesLibraryContract(contract)))
+    return op.emitError() << "ctypes __new__ lowering is not keyword-aware yet";
   if (*methodName == "__new__" &&
       mlir::succeeded(RuntimeBundleLowerer::bindErasedCtypesNew(op, contract)))
     return mlir::success();
@@ -199,11 +214,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerNew(py::NewOp op) {
   if (!initializer)
     if (py::ClassOp classOp = RuntimeBundleLowerer::classForContract(
             op.getInstance().getType())) {
-      (void)classOp;
       builder.setInsertionPoint(op);
       mlir::FailureOr<RuntimeValue> value =
-          RuntimeBundleLowerer::materializeDeadObjectValue(
-              op, op.getInstance().getType(), "class __new__ ABI");
+          RuntimeBundleLowerer::materializeClassObjectValue(
+              op, classOp, op.getInstance().getType(), "class __new__ ABI");
       if (mlir::failed(value))
         return mlir::failure();
       valueBundles[op.getInstance()] =
@@ -214,6 +228,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerNew(py::NewOp op) {
   if (!initializer)
     return op.emitError() << "runtime manifest has no " << contract << "."
                           << *methodName;
+  if (hasKeywords)
+    return op.emitError()
+           << "runtime manifest __new__ lowering is not keyword-aware yet";
   if (mlir::failed(verifySelectedRuntimeTarget(op, *initializer)))
     return mlir::failure();
 
@@ -275,9 +292,6 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
       RuntimeBundleLowerer::bundleFor(op.getInstance());
   if (!instance)
     return op.emitError() << "init instance has no lowered runtime bundle";
-  if (mlir::failed(requireEmptyAggregate(op, op.getKwnames(), "kw names")) ||
-      mlir::failed(requireEmptyAggregate(op, op.getKwvalues(), "kw values")))
-    return mlir::failure();
 
   llvm::SmallVector<const RuntimeBundle *, 8> sources{instance};
   llvm::SmallVector<RuntimeBundle, 8> unpackedSources;
@@ -292,11 +306,19 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
     return mlir::failure();
 
   if (*methodName == "__init__" && instance->ctypes &&
-      instance->ctypes->kind == RuntimeCtypesEvidence::Kind::Library)
+      instance->ctypes->kind == RuntimeCtypesEvidence::Kind::Library) {
+    if (mlir::failed(requireEmptyAggregate(op, op.getKwnames(), "kw names")) ||
+        mlir::failed(requireEmptyAggregate(op, op.getKwvalues(), "kw values")))
+      return mlir::failure();
     return RuntimeBundleLowerer::lowerStaticCtypesLibraryInit(op, *instance,
                                                               sources);
-  if (*methodName == "__init__" && instance->ctypes)
+  }
+  if (*methodName == "__init__" && instance->ctypes) {
+    if (mlir::failed(requireEmptyAggregate(op, op.getKwnames(), "kw names")) ||
+        mlir::failed(requireEmptyAggregate(op, op.getKwvalues(), "kw values")))
+      return mlir::failure();
     return RuntimeBundleLowerer::lowerErasedCtypesInit(op, *instance, sources);
+  }
 
   if (py::ClassOp classOp =
           RuntimeBundleLowerer::classForContract(op.getInstance().getType())) {
@@ -305,18 +327,91 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
              << "class init lowering expected __init__, got " << *methodName;
     llvm::SmallVector<mlir::Type, 8> fieldTypes =
         RuntimeBundleLowerer::classFieldContractTypes(classOp);
+    auto fieldNames = classOp->getAttrOfType<mlir::ArrayAttr>("field_names");
+    if (!fieldNames)
+      return op.emitError() << "class " << classOp.getSymName()
+                            << " has no field schema";
     if (sources.size() > fieldTypes.size() + 1)
       return op.emitError()
              << "class " << classOp.getSymName() << " initializer received "
              << (sources.size() - 1) << " positional arguments for "
              << fieldTypes.size() << " fields";
+    if (fieldNames.size() != fieldTypes.size())
+      return op.emitError() << "class " << classOp.getSymName()
+                            << " field schema is malformed";
+
+    llvm::SmallVector<const RuntimeBundle *, 8> fieldSources(fieldTypes.size(),
+                                                            nullptr);
+    for (unsigned index = 1; index < sources.size(); ++index)
+      fieldSources[index - 1] = sources[index];
+
+    const RuntimeBundle *kwNames =
+        RuntimeBundleLowerer::bundleFor(op.getKwnames());
+    const RuntimeBundle *kwValues =
+        RuntimeBundleLowerer::bundleFor(op.getKwvalues());
+    if (!kwNames || kwNames->kind != RuntimeBundle::Kind::Aggregate)
+      return op.emitError()
+             << "class initializer kw names must be a lowered aggregate bundle";
+    if (!kwValues || kwValues->kind != RuntimeBundle::Kind::Aggregate)
+      return op.emitError()
+             << "class initializer kw values must be a lowered aggregate "
+                "bundle";
+    if (kwNames->aggregateOperands.size() !=
+        kwValues->aggregateOperands.size())
+      return op.emitError()
+             << "class initializer keyword name/value count mismatch";
+    for (auto [kwIndex, nameValue] :
+         llvm::enumerate(kwNames->aggregateOperands)) {
+      std::optional<std::string> keyword =
+          RuntimeBundleLowerer::keywordNameFromValue(nameValue);
+      if (!keyword)
+        return op.emitError()
+               << "class initializer keyword name must be statically known";
+      unsigned fieldIndex = fieldTypes.size();
+      for (auto [index, fieldNameAttr] : llvm::enumerate(fieldNames)) {
+        auto fieldName = mlir::dyn_cast<mlir::StringAttr>(fieldNameAttr);
+        if (!fieldName)
+          return op.emitError() << "class field metadata is malformed for "
+                                << classOp.getSymName();
+        if (fieldName.getValue() == *keyword) {
+          fieldIndex = static_cast<unsigned>(index);
+          break;
+        }
+      }
+      if (fieldIndex >= fieldTypes.size())
+        return op.emitError()
+               << "unexpected class initializer keyword '" << *keyword << "'";
+      if (fieldSources[fieldIndex])
+        return op.emitError()
+               << "multiple values for class initializer field '" << *keyword
+               << "'";
+      const RuntimeBundle *keywordValue = RuntimeBundleLowerer::bundleFor(
+          kwValues->aggregateOperands[kwIndex]);
+      if (!keywordValue)
+        return op.emitError()
+               << "class initializer keyword value has no lowered bundle";
+      fieldSources[fieldIndex] = keywordValue;
+    }
 
     llvm::SmallVector<mlir::Value, 8> values(instance->physicalValues().begin(),
                                              instance->physicalValues().end());
+    llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 8> updatedFieldBundles;
+    updatedFieldBundles.resize(fieldTypes.size());
     for (unsigned index = 0; index < fieldTypes.size(); ++index) {
-      if (index + 1 >= sources.size())
-        continue;
-      const RuntimeBundle *fieldValue = sources[index + 1];
+      const RuntimeBundle *fieldValue = fieldSources[index];
+      if (!fieldValue) {
+        std::string fieldName = std::to_string(index);
+        if (index < fieldNames.size()) {
+          auto name = mlir::dyn_cast<mlir::StringAttr>(fieldNames[index]);
+          if (!name)
+            return op.emitError() << "class field metadata is malformed for "
+                                  << classOp.getSymName();
+          fieldName = name.getValue().str();
+        }
+        return op.emitError()
+               << "missing required class initializer field '" << fieldName
+               << "'";
+      }
       if (!fieldValue || fieldValue->kind != RuntimeBundle::Kind::Object)
         return op.emitError()
                << "class initializer field source has no object bundle";
@@ -326,16 +421,49 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
                << "class initializer argument " << index << " has type "
                << fieldValue->objectValue.contract << ", but field expects "
                << fieldTypes[index];
+      bool objectField =
+          runtimeShapeContractName(fieldTypes[index]) == "builtins.object";
+      RuntimeBundle slotValue;
+      bool newBoxOwnsSlot = false;
+      if (objectField &&
+          !(fieldValue->contractName() == "builtins.object" &&
+            fieldValue->physicalValues().size() == 1)) {
+        mlir::FailureOr<RuntimeBundle> boxed =
+            RuntimeBundleLowerer::boxRuntimeObject(op, *fieldValue,
+                                                   /*retainPayload=*/true);
+        if (mlir::failed(boxed))
+          return mlir::failure();
+        slotValue = std::move(*boxed);
+        newBoxOwnsSlot = true;
+      } else {
+        mlir::FailureOr<RuntimeBundle> storageValue =
+            RuntimeBundleLowerer::materializeObjectBundleForStorage(
+                op, *fieldValue, fieldTypes[index],
+                "class initializer argument ABI");
+        if (mlir::failed(storageValue))
+          return mlir::failure();
+        slotValue = std::move(*storageValue);
+      }
+
+      bool retainExistingObjectHandle = false;
+      if (objectField) {
+        if (slotValue.contractName() == "builtins.object" &&
+            slotValue.physicalValues().size() == 1) {
+          retainExistingObjectHandle = !newBoxOwnsSlot;
+        } else {
+          mlir::FailureOr<RuntimeBundle> boxed =
+              RuntimeBundleLowerer::boxRuntimeObject(op, slotValue,
+                                                     /*retainPayload=*/true);
+          if (mlir::failed(boxed))
+            return mlir::failure();
+          slotValue = std::move(*boxed);
+        }
+      }
       mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> fieldValueTypes =
           RuntimeBundleLowerer::runtimeValueTypesFor(op, fieldTypes[index],
                                                      "class field ABI");
       if (mlir::failed(fieldValueTypes))
         return mlir::failure();
-      if (fieldValueTypes->size() != fieldValue->physicalValues().size())
-        return op.emitError() << "class initializer argument " << index
-                              << " has " << fieldValue->physicalValues().size()
-                              << " physical values, but field ABI expects "
-                              << fieldValueTypes->size();
       mlir::FailureOr<unsigned> offset =
           RuntimeBundleLowerer::classFieldValueOffset(op, classOp, index,
                                                       "class field ABI");
@@ -343,9 +471,52 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
         return mlir::failure();
       if (*offset + fieldValueTypes->size() > values.size())
         return op.emitError() << "class field ABI exceeds object payload";
+      llvm::SmallVector<mlir::Value, 4> oldValues;
+      oldValues.reserve(fieldValueTypes->size());
+      for (unsigned fieldOffset = 0; fieldOffset < fieldValueTypes->size();
+           ++fieldOffset)
+        oldValues.push_back(values[*offset + fieldOffset]);
+      std::string slotName = "class.field";
+      if (fieldNames && index < fieldNames.size()) {
+        auto name = mlir::dyn_cast<mlir::StringAttr>(fieldNames[index]);
+        if (!name)
+          return op.emitError() << "class field metadata is malformed for "
+                                << classOp.getSymName();
+        slotName = (llvm::Twine("class.") + name.getValue()).str();
+      }
+      builder.setInsertionPoint(op);
+      const RuntimeBundle *oldSlotValue = nullptr;
+      if (fieldNames && index < fieldNames.size()) {
+        auto name = mlir::dyn_cast<mlir::StringAttr>(fieldNames[index]);
+        if (!name)
+          return op.emitError() << "class field metadata is malformed for "
+                                << classOp.getSymName();
+        auto oldField = instance->fieldBundles.find(name.getValue());
+        if (oldField != instance->fieldBundles.end())
+          oldSlotValue = oldField->second.get();
+      }
+      if (objectField) {
+        if (retainExistingObjectHandle &&
+            mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
+                op, fieldTypes[index], slotValue.physicalValues(), slotName)))
+          return mlir::failure();
+        if (oldSlotValue &&
+            mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
+                op, fieldTypes[index], oldValues, slotName)))
+          return mlir::failure();
+      } else {
+        if (mlir::failed(RuntimeBundleLowerer::replaceAggregateSlot(
+                op, fieldTypes[index], oldValues, oldSlotValue,
+                fieldTypes[index], slotValue, slotName,
+                /*releaseMissingOldObjectSlot=*/false)))
+          return mlir::failure();
+      }
       for (auto [fieldOffset, replacement] :
-           llvm::enumerate(fieldValue->physicalValues()))
+           llvm::enumerate(slotValue.physicalValues()))
         values[*offset + fieldOffset] = replacement;
+      slotValue.setObjectLogicalOwnership(/*ownsObject=*/true);
+      updatedFieldBundles[index] =
+          std::make_shared<RuntimeBundle>(std::move(slotValue));
     }
 
     RuntimeBundle updated;
@@ -353,17 +524,19 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
             op, op.getInstance().getType(), values, updated)))
       return mlir::failure();
     updated.copyEvidenceFrom(*instance);
-    auto fieldNames = classOp->getAttrOfType<mlir::ArrayAttr>("field_names");
     if (fieldNames) {
       for (unsigned index = 0; index < fieldTypes.size(); ++index) {
-        if (index + 1 >= sources.size() || index >= fieldNames.size())
+        if (!fieldSources[index] || index >= fieldNames.size())
           continue;
         auto name = mlir::dyn_cast<mlir::StringAttr>(fieldNames[index]);
         if (!name)
           return op.emitError() << "class field metadata is malformed for "
                                 << classOp.getSymName();
-        updated.fieldBundles[name.getValue()] =
-            std::make_shared<RuntimeBundle>(*sources[index + 1]);
+        if (updatedFieldBundles[index])
+          updated.fieldBundles[name.getValue()] = updatedFieldBundles[index];
+        else
+          updated.fieldBundles[name.getValue()] =
+              std::make_shared<RuntimeBundle>(*fieldSources[index]);
       }
     }
     valueBundles[op.getInstance()] = std::move(updated);
@@ -376,6 +549,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
   }
 
   std::optional<EmittedRuntimeCall> emitted;
+  if (mlir::failed(requireEmptyAggregate(op, op.getKwnames(), "kw names")) ||
+      mlir::failed(requireEmptyAggregate(op, op.getKwvalues(), "kw values")))
+    return mlir::failure();
   if (mlir::failed(emitManifestMethodCall(op, *instance, *methodName, sources,
                                           /*allowUnusedSources=*/true,
                                           emitted)))
@@ -396,4 +572,4 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
   return mlir::success();
 }
 
-} // namespace py::runtime_lowering
+} // namespace py::lowering

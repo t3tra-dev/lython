@@ -4,6 +4,7 @@
 
 #include "Runtime/Manifest/Index.h"
 #include "Runtime/Model/Bundles.h"
+#include "Ownership.h"
 
 #include "PyDialectTypes.h"
 #include "mlir/Bytecode/BytecodeOpInterface.h"
@@ -39,7 +40,7 @@
 #include <optional>
 #include <string>
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 
 class RuntimeBundleLowerer {
 public:
@@ -52,6 +53,11 @@ private:
     mlir::func::CallOp call;
   };
 
+  struct CallableProtocolSpecialization {
+    std::string cloneName;
+    llvm::SmallVector<mlir::Type, 8> argumentTypes;
+  };
+
   const RuntimeValueShape *runtimeValueShapeFor(mlir::Operation *op,
                                                 mlir::Type type,
                                                 llvm::StringRef purpose) const;
@@ -59,7 +65,14 @@ private:
   runtimeValueTypesFor(mlir::Operation *op, mlir::Type type,
                        llvm::StringRef purpose) const;
   py::ClassOp classForContract(mlir::Type type) const;
+  std::optional<std::int64_t> runtimeClassIdForClass(py::ClassOp classOp) const;
+  std::optional<std::int64_t> runtimeClassIdForContract(mlir::Type type) const;
+  mlir::FailureOr<llvm::SmallVector<std::int64_t, 8>>
+  runtimeClassIdsForNominalTarget(mlir::Operation *op,
+                                  mlir::Type targetType) const;
   bool classDefinesMethod(mlir::Type type, llvm::StringRef name) const;
+  std::optional<std::string> classMethodSymbol(py::ClassOp classOp,
+                                               llvm::StringRef name) const;
   llvm::SmallVector<mlir::Type, 8>
   classFieldContractTypes(py::ClassOp classOp) const;
   std::optional<unsigned> classFieldIndex(py::ClassOp classOp,
@@ -67,6 +80,8 @@ private:
   mlir::FailureOr<unsigned>
   classFieldValueOffset(mlir::Operation *op, py::ClassOp classOp,
                         unsigned fieldIndex, llvm::StringRef purpose) const;
+  mlir::LogicalResult writeBackFieldAlias(mlir::Operation *op,
+                                          const RuntimeBundle &updatedField);
   std::optional<unsigned> findUnionMemberIndex(py::UnionType unionType,
                                                mlir::Type member) const;
   mlir::FailureOr<unsigned>
@@ -103,11 +118,20 @@ private:
   mlir::LogicalResult buildReturnedCallableSummaries();
   mlir::LogicalResult buildReturnedCoroutineSummaries();
   mlir::LogicalResult buildReturnedObjectEvidenceSummaries();
+  mlir::LogicalResult buildReturnedStaticObjectSummaries();
   mlir::LogicalResult buildCallableProtocolArgumentABIs();
   mlir::LogicalResult buildCallableArgumentEvidenceABIs();
   mlir::LogicalResult buildCallableAggregateEvidenceABIs();
   mlir::LogicalResult buildPrimitiveI64CallableClones();
   mlir::LogicalResult prepareCallableFunctionABIs();
+  bool isCallableProtocolTemplate(mlir::func::FuncOp function) const;
+  std::optional<std::string> callableProtocolSpecializationFor(
+      llvm::StringRef target,
+      llvm::ArrayRef<const RuntimeBundle *> sources) const;
+  mlir::FailureOr<mlir::func::FuncOp> selectCallableProtocolSpecialization(
+      py::CallOp op, mlir::func::FuncOp target, llvm::StringRef targetName,
+      llvm::ArrayRef<const RuntimeBundle *> sources);
+  mlir::LogicalResult eraseCallableProtocolTemplateFunctions();
   bool isPrimitiveI64CallableClone(mlir::func::FuncOp function) const;
   bool isPrimitiveI64CallableEligible(mlir::func::FuncOp function) const;
   std::optional<std::string> primitiveI64CloneFor(llvm::StringRef target) const;
@@ -122,7 +146,11 @@ private:
                                           mlir::ValueRange values) const;
   mlir::LogicalResult makeObjectBundle(mlir::Operation *op, mlir::Type contract,
                                        mlir::ValueRange values,
-                                       RuntimeBundle &bundle) const;
+                                       RuntimeBundle &bundle,
+                                       bool ownsObject = true) const;
+  mlir::LogicalResult makeObjectBundleWithOwnership(
+      mlir::Operation *op, mlir::Type contract, mlir::ValueRange values,
+      RuntimeBundle &bundle, ownership::OwnershipKind ownership) const;
   mlir::LogicalResult makePrimitiveI64Bundle(mlir::Operation *op,
                                              mlir::Type contract,
                                              mlir::Value value,
@@ -194,12 +222,30 @@ private:
   mlir::FailureOr<RuntimeValue>
   materializePrimitiveI64Object(mlir::Operation *op,
                                 const RuntimeBundle &bundle);
+  mlir::FailureOr<RuntimeValue>
+  materializePrimitiveI64ObjectAtCurrentInsertion(
+      mlir::Operation *op, const RuntimeBundle &bundle);
+  mlir::FailureOr<RuntimeBundle>
+  materializeObjectBundleForStorage(mlir::Operation *op,
+                                    const RuntimeBundle &bundle,
+                                    mlir::Type storageContract,
+                                    llvm::StringRef purpose);
   bool objectShapeMatches(llvm::StringRef contract,
                           mlir::ValueRange values) const;
-  bool isBuiltinsObjectHeaderType(mlir::Type type) const;
+  bool isBuiltinsObjectHandleType(mlir::Type type) const;
   bool isErasedObjectStorageType(mlir::Type type) const;
-  mlir::FailureOr<mlir::Value> objectHeaderView(mlir::Operation *op,
-                                                const RuntimeValue &value);
+  bool isBuiltinsObjectContract(mlir::Type type) const;
+  const RuntimeBundle *concreteObjectForOwnership(
+      const RuntimeBundle &bundle) const;
+  mlir::FailureOr<RuntimeBundle> boxRuntimeObject(mlir::Operation *op,
+                                                  const RuntimeBundle &source,
+                                                  bool retainPayload);
+  mlir::FailureOr<RuntimeBundle>
+  boxRuntimeObjectAtCurrentInsertion(mlir::Operation *op,
+                                     const RuntimeBundle &source,
+                                     bool retainPayload);
+  mlir::FailureOr<mlir::Value>
+  objectPhysicalHeader(mlir::Operation *op, const RuntimeValue &value);
   mlir::FailureOr<mlir::Value>
   erasedObjectStorageView(mlir::Operation *op, const RuntimeValue &value,
                           mlir::Type targetType);
@@ -223,6 +269,9 @@ private:
   mlir::FailureOr<RuntimeValue>
   materializeDeadObjectValue(mlir::Operation *op, mlir::Type contract,
                              llvm::StringRef purpose);
+  mlir::FailureOr<RuntimeValue>
+  materializeClassObjectValue(mlir::Operation *op, py::ClassOp classOp,
+                              mlir::Type contract, llvm::StringRef purpose);
   mlir::LogicalResult materializeStringObject(mlir::Operation *op,
                                               llvm::StringRef text,
                                               RuntimeBundle &bundle);
@@ -230,6 +279,83 @@ private:
   mlir::LogicalResult materializeDefaultObjectRepr(mlir::Operation *op,
                                                    const RuntimeBundle &object,
                                                    RuntimeBundle &bundle);
+  mlir::func::FuncOp findRetainFunction() const;
+  mlir::LogicalResult retainAggregateSlot(mlir::Operation *op,
+                                          mlir::Type slotType,
+                                          mlir::ValueRange values,
+                                          llvm::StringRef slotName);
+  mlir::LogicalResult retainAggregateSlot(mlir::Operation *op,
+                                          const RuntimeBundle &slotValue,
+                                          llvm::StringRef slotName);
+  mlir::LogicalResult releaseAggregateSlot(mlir::Operation *op,
+                                           mlir::Type slotType,
+                                           mlir::ValueRange values,
+                                           llvm::StringRef slotName);
+  mlir::LogicalResult releaseAggregateSlot(mlir::Operation *op,
+                                           const RuntimeBundle &slotValue,
+                                           llvm::StringRef slotName);
+  mlir::LogicalResult
+  replaceAggregateSlot(mlir::Operation *op, mlir::Type oldType,
+                       mlir::ValueRange oldValues, mlir::Type newType,
+                       mlir::ValueRange newValues, llvm::StringRef slotName);
+  mlir::LogicalResult replaceAggregateSlot(
+      mlir::Operation *op, mlir::Type oldType, mlir::ValueRange oldValues,
+      const RuntimeBundle *oldSlotValue, mlir::Type newType,
+      const RuntimeBundle &newSlotValue, llvm::StringRef slotName,
+      bool releaseMissingOldObjectSlot = true);
+  mlir::LogicalResult retainAggregateSlot(mlir::Operation *op,
+                                          mlir::Type slotType,
+                                          mlir::ValueRange values,
+                                          llvm::StringRef slotName,
+                                          unsigned depth);
+  mlir::LogicalResult releaseAggregateSlot(
+      mlir::Operation *op, mlir::Type slotType, mlir::ValueRange values,
+      llvm::StringRef slotName,
+      llvm::ArrayRef<ownership::RuntimeDeallocator> deallocators,
+      unsigned depth);
+  std::uint64_t collectionInitialCapacity(std::uint64_t arity) const;
+  mlir::FailureOr<RuntimeBundle>
+  materializePayloadObjectBundle(mlir::Operation *op,
+                                 const RuntimeBundle &value);
+  mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>>
+  objectPayloadHandleWords(mlir::Operation *op, const RuntimeBundle &value,
+                           bool ownsPayload = true);
+  mlir::LogicalResult initializeSequencePayload(
+      mlir::Operation *op, RuntimeBundle &container,
+      llvm::ArrayRef<std::shared_ptr<RuntimeBundle>> elements);
+  mlir::LogicalResult ensureSequencePayloadCapacity(
+      mlir::Operation *op, RuntimeBundle &container, unsigned index,
+      llvm::StringRef label);
+  mlir::LogicalResult storeSequencePayloadElement(
+      mlir::Operation *op, RuntimeBundle &container, unsigned index,
+      const RuntimeBundle &element);
+  mlir::LogicalResult clearSequencePayloadElement(mlir::Operation *op,
+                                                  RuntimeBundle &container,
+                                                  unsigned index);
+  mlir::LogicalResult initializeDictPayload(
+      mlir::Operation *op, RuntimeBundle &container,
+      llvm::ArrayRef<std::shared_ptr<RuntimeBundle>> keys,
+      llvm::ArrayRef<std::shared_ptr<RuntimeBundle>> values);
+  mlir::LogicalResult ensureDictPayloadCapacity(mlir::Operation *op,
+                                                RuntimeBundle &container,
+                                                unsigned index);
+  mlir::LogicalResult storeDictKeyPayload(mlir::Operation *op,
+                                          RuntimeBundle &container,
+                                          unsigned index,
+                                          const RuntimeBundle &key);
+  mlir::LogicalResult storeDictValuePayload(mlir::Operation *op,
+                                            RuntimeBundle &container,
+                                            unsigned index,
+                                            const RuntimeBundle &value);
+  mlir::LogicalResult clearDictKeyPayload(mlir::Operation *op,
+                                          RuntimeBundle &container,
+                                          unsigned index);
+  mlir::LogicalResult clearDictValuePayload(mlir::Operation *op,
+                                            RuntimeBundle &container,
+                                            unsigned index);
+  mlir::LogicalResult clearDictPayloadEntry(mlir::Operation *op,
+                                            RuntimeBundle &container,
+                                            unsigned index);
   mlir::LogicalResult assignObjectBundle(mlir::Operation *op, mlir::Value value,
                                          mlir::Type contract,
                                          mlir::ValueRange values);
@@ -300,6 +426,7 @@ private:
   mlir::LogicalResult lowerUnionWrap(py::UnionWrapOp op);
   mlir::LogicalResult lowerUnionTest(py::UnionTestOp op);
   mlir::LogicalResult lowerUnionUnwrap(py::UnionUnwrapOp op);
+  mlir::LogicalResult lowerClassTest(py::ClassTestOp op);
   mlir::LogicalResult lowerTypeObject(py::TypeObjectOp op);
   mlir::LogicalResult lowerAttrGet(py::AttrGetOp op);
   mlir::LogicalResult lowerAttrSet(py::AttrSetOp op);
@@ -443,6 +570,17 @@ private:
   lowerAsyncFunctionTargetCall(py::CallOp op, mlir::func::FuncOp target,
                                llvm::StringRef targetName,
                                llvm::ArrayRef<const RuntimeBundle *> sources);
+  mlir::LogicalResult emitAsyncFunctionTargetCallResult(
+      py::CallOp op, mlir::func::FuncOp target, llvm::StringRef targetName,
+      llvm::ArrayRef<const RuntimeBundle *> sources, RuntimeBundle &result);
+  mlir::LogicalResult emitAsyncFunctionTargetCallResult(
+      mlir::Operation *op, mlir::Value resultValue, mlir::func::FuncOp target,
+      llvm::StringRef targetName,
+      llvm::ArrayRef<const RuntimeBundle *> sources, RuntimeBundle &result);
+  mlir::LogicalResult emitSourceFunctionTargetCallResult(
+      mlir::Operation *op, mlir::Type expectedResult,
+      mlir::func::FuncOp target, llvm::StringRef targetName,
+      llvm::ArrayRef<const RuntimeBundle *> sources, RuntimeBundle &result);
   std::optional<StaticCallableInvocation>
   collectStaticCallableInvocation(py::CallOp op) const;
   std::optional<CallableArgumentPlan>
@@ -494,7 +632,22 @@ private:
   mlir::LogicalResult lowerAIter(py::AIterOp op);
   mlir::LogicalResult lowerANext(py::ANextOp op);
   mlir::LogicalResult lowerAwait(py::AwaitOp op);
+  mlir::LogicalResult lowerCoroutineObjectAwait(mlir::Operation *op,
+                                                mlir::Value resultValue,
+                                                RuntimeBundle &awaitable,
+                                                llvm::StringRef label);
+  mlir::LogicalResult lowerCoroutineStorageTargetIdAwait(
+      mlir::Operation *op, mlir::Value resultValue, RuntimeBundle &awaitable,
+      llvm::StringRef label);
+  mlir::LogicalResult lowerAwaitIteratorResult(mlir::Operation *op,
+                                               mlir::Value resultValue,
+                                               RuntimeBundle &iterator,
+                                               llvm::StringRef label);
+  mlir::LogicalResult lowerGeneralAwaitableIterator(py::AwaitOp op,
+                                                    RuntimeBundle &awaitable);
   mlir::LogicalResult lowerRound(py::RoundOp op);
+  mlir::LogicalResult lowerIncRef(py::IncRefOp op);
+  mlir::LogicalResult lowerDecRef(py::DecRefOp op);
   mlir::LogicalResult lowerUnarySpecial(mlir::Operation *op, mlir::Value input,
                                         llvm::StringRef methodName,
                                         mlir::Value resultValue);
@@ -579,6 +732,7 @@ private:
                                        mlir::ValueRange operands);
   std::int64_t functionTargetId(llvm::StringRef target);
   mlir::LogicalResult lowerFunctionReturns();
+  mlir::LogicalResult synthesizeSourceClassDeallocators();
   mlir::LogicalResult eraseCallableLogicalEntryArgs();
   mlir::LogicalResult eraseLoweredPyOps();
 
@@ -592,8 +746,12 @@ private:
   llvm::StringMap<ReturnedCoroutineSummary> returnedCoroutineSummaries;
   llvm::StringMap<ReturnedObjectEvidenceSummary>
       returnedObjectEvidenceSummaries;
+  llvm::StringMap<ReturnedStaticObjectSummary>
+      returnedStaticObjectSummaries;
   llvm::StringMap<llvm::SmallVector<mlir::Type, 8>>
       callableProtocolArgumentABIs;
+  llvm::StringMap<llvm::SmallVector<CallableProtocolSpecialization, 4>>
+      callableProtocolSpecializations;
   llvm::StringMap<CallableArgumentEvidenceABI> callableArgumentEvidenceABIs;
   llvm::StringMap<CallableAggregateEvidenceABI> callableAggregateEvidenceABIs;
   llvm::StringMap<std::string> primitiveI64CallableClones;
@@ -609,4 +767,4 @@ private:
   llvm::SmallVector<mlir::Operation *, 32> erase;
 };
 
-} // namespace py::runtime_lowering
+} // namespace py::lowering

@@ -163,8 +163,11 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
               lookupClassMethod(argumentType, "__repr__")) {
         Value argument = emitExpr(args->front().get());
         llvm::StringMap<Value> emptyKeywords;
-        Value repr =
-            emitInlineMethodBody(expr, argument, *method, {}, emptyKeywords);
+        Value descriptorReceiver =
+            emitDescriptorReceiver(expr, argument, *method);
+        Value repr = emitInlineMethodBody(
+            expr, descriptorReceiver, methodBindingBindsReceiver(*method),
+            *method, {}, emptyKeywords);
         if (name == "repr")
           return repr;
         CallOperands operands =
@@ -177,6 +180,10 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
 
   if (calleeNode && calleeNode->kind == "Name") {
     llvm::StringRef name = ast::nameSpelling(*calleeNode);
+    auto local = values.find(name);
+    if (local != values.end() && local->second.boundMethod)
+      return emitInlineMethodCall(expr, local->second.boundMethod->receiver,
+                                  local->second.boundMethod->method);
     if (values.find(name) == values.end())
       if (std::optional<std::string> canonical =
               types.lookupCanonicalBinding(name))
@@ -208,6 +215,10 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
         Value receiver = emitExpr(receiverNode);
         if (std::optional<MethodBinding> method =
                 lookupClassMethod(receiver.type, *methodName)) {
+          if (method->async && !method->symbolName.empty())
+            return emitCallableDispatch(
+                expr, emitMethodObject(*calleeNode, receiver, *method),
+                emitCallOperands(expr));
           return emitInlineMethodCall(expr, receiver, *method);
         }
 

@@ -2,75 +2,37 @@
 #include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/StringSwitch.h"
 
-namespace py::runtime_lowering::ctypes {
+namespace py::lowering::ctypes {
 
 std::optional<TargetPlatformFacts> targetPlatformFacts(mlir::ModuleOp module) {
-  auto triple = module->getAttrOfType<mlir::StringAttr>("ly.target.triple");
-  auto pointerWidth =
-      module->getAttrOfType<mlir::IntegerAttr>("ly.target.pointer_width");
-  auto cLongWidth =
-      module->getAttrOfType<mlir::IntegerAttr>("ly.target.c_long_width");
-  if (!triple || !pointerWidth || !cLongWidth)
-    return std::nullopt;
-  if (pointerWidth.getInt() <= 0 || cLongWidth.getInt() <= 0)
-    return std::nullopt;
-  TargetPlatformFacts facts;
-  facts.triple = triple.getValue().str();
-  facts.pointerWidth = static_cast<std::uint64_t>(pointerWidth.getInt());
-  facts.cLongWidth = static_cast<std::uint64_t>(cLongWidth.getInt());
-  if (facts.pointerWidth == 0 || facts.pointerWidth % 8 != 0 ||
-      facts.cLongWidth == 0 || facts.cLongWidth % 8 != 0)
-    return std::nullopt;
-  return facts;
+  return py::native::readTargetPlatformFacts(module);
 }
 
 std::optional<CtypesLayout>
 ctypesLayout(llvm::StringRef contract,
              const std::optional<TargetPlatformFacts> &facts) {
-  llvm::StringRef name = stripCtypesModule(contract);
-  if (std::optional<CtypesLayout> fixed =
-          llvm::StringSwitch<std::optional<CtypesLayout>>(name)
-              .Cases("c_bool", "c_ubyte", "c_uint8",
-                     CtypesLayout{1, 1, CtypesLayout::ABIKind::UnsignedInteger})
-              .Cases("c_byte", "c_int8", "c_char",
-                     CtypesLayout{1, 1, CtypesLayout::ABIKind::SignedInteger})
-              .Cases("c_ushort", "c_uint16",
-                     CtypesLayout{2, 2, CtypesLayout::ABIKind::UnsignedInteger})
-              .Cases("c_short", "c_int16",
-                     CtypesLayout{2, 2, CtypesLayout::ABIKind::SignedInteger})
-              .Cases("c_uint", "c_uint32",
-                     CtypesLayout{4, 4, CtypesLayout::ABIKind::UnsignedInteger})
-              .Cases("c_int", "c_int32",
-                     CtypesLayout{4, 4, CtypesLayout::ABIKind::SignedInteger})
-              .Case("c_float",
-                    CtypesLayout{4, 4, CtypesLayout::ABIKind::Floating})
-              .Cases("c_ulonglong", "c_uint64",
-                     CtypesLayout{8, 8, CtypesLayout::ABIKind::UnsignedInteger})
-              .Cases("c_longlong", "c_int64",
-                     CtypesLayout{8, 8, CtypesLayout::ABIKind::SignedInteger})
-              .Case("c_double",
-                    CtypesLayout{8, 8, CtypesLayout::ABIKind::Floating})
-              .Default(std::nullopt))
-    return fixed;
-
-  if (!facts)
+  std::optional<py::native::NativeABIType> native =
+      py::native::ctypesScalarLayout(contract, facts);
+  if (!native)
     return std::nullopt;
-  return llvm::StringSwitch<std::optional<CtypesLayout>>(name)
-      .Case("c_ulong", CtypesLayout{facts->cLongBytes(), facts->cLongBytes(),
-                                    CtypesLayout::ABIKind::UnsignedInteger})
-      .Cases("c_long", "HRESULT",
-             CtypesLayout{facts->cLongBytes(), facts->cLongBytes(),
-                          CtypesLayout::ABIKind::SignedInteger})
-      .Case("c_size_t",
-            CtypesLayout{facts->pointerBytes(), facts->pointerBytes(),
-                         CtypesLayout::ABIKind::UnsignedInteger})
-      .Case("c_ssize_t",
-            CtypesLayout{facts->pointerBytes(), facts->pointerBytes(),
-                         CtypesLayout::ABIKind::SignedInteger})
-      .Cases("c_void_p", "_Pointer",
-             CtypesLayout{facts->pointerBytes(), facts->pointerBytes(),
-                          CtypesLayout::ABIKind::Pointer})
-      .Default(std::nullopt);
+  CtypesLayout layout;
+  layout.size = native->size;
+  layout.align = native->align;
+  switch (native->kind) {
+  case py::native::NativeABIKind::SignedInteger:
+    layout.kind = CtypesLayout::ABIKind::SignedInteger;
+    break;
+  case py::native::NativeABIKind::UnsignedInteger:
+    layout.kind = CtypesLayout::ABIKind::UnsignedInteger;
+    break;
+  case py::native::NativeABIKind::Floating:
+    layout.kind = CtypesLayout::ABIKind::Floating;
+    break;
+  case py::native::NativeABIKind::Pointer:
+    layout.kind = CtypesLayout::ABIKind::Pointer;
+    break;
+  }
+  return layout;
 }
 
 std::uint64_t alignTo(std::uint64_t value, std::uint64_t align) {
@@ -483,4 +445,4 @@ ctypesAggregateLayout(mlir::ModuleOp module, py::ClassOp classOp,
   return result;
 }
 
-} // namespace py::runtime_lowering::ctypes
+} // namespace py::lowering::ctypes

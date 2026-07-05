@@ -6,7 +6,7 @@
 
 #include <memory>
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 
 inline constexpr llvm::StringLiteral kMatmulZeroInitAttr{
     "ly.prim_tensor.matmul_zero_init"};
@@ -28,4 +28,4 @@ createMatmulMicroTilingPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createMatmulVectorizationPass();
 
-} // namespace py::runtime_lowering
+} // namespace py::lowering

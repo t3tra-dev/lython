@@ -1,8 +1,10 @@
 #include "Runtime/Core/Lowerer.h"
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 
 namespace {
+
+namespace own = py::ownership;
 
 bool compatibleRankOneMemRefStorage(mlir::Type source, mlir::Type target,
                                     bool targetMustBeDynamic) {
@@ -35,6 +37,24 @@ bool canAppendExactValues(mlir::FunctionType functionType, unsigned inputIndex,
   return true;
 }
 
+bool runtimeInputConsumesObject(const RuntimeSymbol &symbol,
+                                unsigned inputIndex) {
+  return symbol.function &&
+         own::functionConsumesOperandAt(symbol.function, inputIndex);
+}
+
+mlir::LogicalResult rejectConsumingObjectView(mlir::Operation *op,
+                                              const RuntimeSymbol &symbol,
+                                              unsigned inputIndex,
+                                              const RuntimeBundle &source,
+                                              llvm::StringRef viewName) {
+  return op->emitError()
+         << "cannot pass " << source.contractName() << " to consuming input "
+         << inputIndex << " of " << symbol.contract << "." << symbol.name
+         << " through a " << viewName
+         << "; object ownership requires the concrete runtime value group";
+}
+
 } // namespace
 
 bool RuntimeBundleLowerer::canAppendExactValueSequence(
@@ -50,6 +70,12 @@ mlir::LogicalResult RuntimeBundleLowerer::appendRuntimeSource(
     const RuntimeBundle &source, llvm::SmallVectorImpl<mlir::Value> &operands) {
   llvm::ArrayRef<mlir::Value> sourceValues = source.physicalValues();
   if (canAppendExactValues(functionType, inputIndex, sourceValues)) {
+    if (source.contractName() == "builtins.object" &&
+        sourceValues.size() == 1 &&
+        isBuiltinsObjectHandleType(functionType.getInput(inputIndex)) &&
+        runtimeInputConsumesObject(symbol, inputIndex))
+      return rejectConsumingObjectView(op, symbol, inputIndex, source,
+                                       "borrowed builtins.object handle");
     operands.append(sourceValues.begin(), sourceValues.end());
     inputIndex += static_cast<unsigned>(sourceValues.size());
     return mlir::success();
@@ -61,7 +87,8 @@ mlir::LogicalResult RuntimeBundleLowerer::appendRuntimeSource(
     if (materializedObject)
       return mlir::success();
     mlir::FailureOr<RuntimeValue> value =
-        RuntimeBundleLowerer::materializePrimitiveI64Object(op, source);
+        RuntimeBundleLowerer::materializePrimitiveI64ObjectAtCurrentInsertion(
+            op, source);
     if (mlir::failed(value))
       return mlir::failure();
     materializedObject = std::move(*value);
@@ -88,8 +115,23 @@ mlir::LogicalResult RuntimeBundleLowerer::appendRuntimeSource(
 
   if (source.kind == RuntimeBundle::Kind::Object &&
       isErasedObjectStorageType(expected)) {
+    std::optional<RuntimeBundle> boxedSource;
+    if (!RuntimeBundleLowerer::isBuiltinsObjectContract(source.contract)) {
+      mlir::FailureOr<RuntimeBundle> boxed =
+          RuntimeBundleLowerer::boxRuntimeObjectAtCurrentInsertion(
+              op, source, runtimeInputConsumesObject(symbol, inputIndex));
+      if (mlir::failed(boxed))
+        return mlir::failure();
+      boxedSource = std::move(*boxed);
+    }
+    const RuntimeBundle &storageSource = boxedSource ? *boxedSource : source;
+    if (runtimeInputConsumesObject(symbol, inputIndex) && !boxedSource)
+      return rejectConsumingObjectView(op, symbol, inputIndex, source,
+                                       "erased object storage view");
     const RuntimeValue &objectValue =
-        materializedObject ? *materializedObject : source.objectValue;
+        boxedSource ? boxedSource->objectValue
+                    : (materializedObject ? *materializedObject
+                                          : storageSource.objectValue);
     mlir::FailureOr<mlir::Value> storage =
         RuntimeBundleLowerer::erasedObjectStorageView(op, objectValue,
                                                       expected);
@@ -101,14 +143,30 @@ mlir::LogicalResult RuntimeBundleLowerer::appendRuntimeSource(
   }
 
   if (source.kind == RuntimeBundle::Kind::Object &&
-      isBuiltinsObjectHeaderType(expected)) {
-    const RuntimeValue &objectValue =
-        materializedObject ? *materializedObject : source.objectValue;
-    mlir::FailureOr<mlir::Value> header =
-        RuntimeBundleLowerer::objectHeaderView(op, objectValue);
-    if (mlir::failed(header))
-      return mlir::failure();
-    operands.push_back(*header);
+      isBuiltinsObjectHandleType(expected)) {
+    if (!RuntimeBundleLowerer::isBuiltinsObjectContract(source.contract))
+      return op->emitError()
+             << "cannot pass concrete object " << source.contractName()
+             << " as builtins.object runtime input " << inputIndex << " of "
+             << symbol.contract << "." << symbol.name
+             << "; box the object at the owning ABI boundary first";
+    if (runtimeInputConsumesObject(symbol, inputIndex))
+      return rejectConsumingObjectView(op, symbol, inputIndex, source,
+                                       "borrowed builtins.object handle");
+    if (sourceValues.empty())
+      return op->emitError() << "builtins.object argument has no boxed handle";
+    mlir::Value handle = sourceValues.front();
+    if (handle.getType() != expected) {
+      if (!compatibleRankOneMemRefStorage(handle.getType(), expected,
+                                          /*targetMustBeDynamic=*/false))
+        return op->emitError()
+               << "builtins.object handle " << handle.getType()
+               << " cannot be adapted to runtime input " << inputIndex
+               << " of " << symbol.contract << "." << symbol.name;
+      handle = builder.create<mlir::memref::CastOp>(op->getLoc(), expected,
+                                                    handle);
+    }
+    operands.push_back(handle);
     ++inputIndex;
     return mlir::success();
   }
@@ -231,6 +289,11 @@ bool RuntimeBundleLowerer::canAppendRuntimeSource(
     unsigned &inputIndex, const RuntimeBundle &source) const {
   llvm::ArrayRef<mlir::Value> sourceValues = source.physicalValues();
   if (canAppendExactValues(functionType, inputIndex, sourceValues)) {
+    if (source.contractName() == "builtins.object" &&
+        sourceValues.size() == 1 &&
+        isBuiltinsObjectHandleType(functionType.getInput(inputIndex)) &&
+        runtimeInputConsumesObject(symbol, inputIndex))
+      return false;
     inputIndex += static_cast<unsigned>(sourceValues.size());
     return true;
   }
@@ -257,15 +320,19 @@ bool RuntimeBundleLowerer::canAppendRuntimeSource(
         inputIndex += static_cast<unsigned>(shape->valueTypes.size());
         return true;
       }
-      if (!shape->valueTypes.empty() && isBuiltinsObjectHeaderType(expected) &&
+      if (!shape->valueTypes.empty() && isBuiltinsObjectHandleType(expected) &&
           compatibleRankOneMemRefStorage(shape->valueTypes.front(), expected,
                                          /*targetMustBeDynamic=*/false)) {
+        if (runtimeInputConsumesObject(symbol, inputIndex))
+          return false;
         ++inputIndex;
         return true;
       }
       if (!shape->valueTypes.empty() && isErasedObjectStorageType(expected) &&
           compatibleRankOneMemRefStorage(shape->valueTypes.front(), expected,
                                          /*targetMustBeDynamic=*/true)) {
+        if (runtimeInputConsumesObject(symbol, inputIndex))
+          return false;
         ++inputIndex;
         return true;
       }
@@ -275,15 +342,23 @@ bool RuntimeBundleLowerer::canAppendRuntimeSource(
       isErasedObjectStorageType(expected) && !sourceValues.empty() &&
       compatibleRankOneMemRefStorage(sourceValues.front().getType(), expected,
                                      /*targetMustBeDynamic=*/true)) {
+    if (!RuntimeBundleLowerer::isBuiltinsObjectContract(source.contract))
+      return false;
+    if (runtimeInputConsumesObject(symbol, inputIndex))
+      return false;
     ++inputIndex;
     return true;
   }
 
   if (source.kind == RuntimeBundle::Kind::Object &&
-      isBuiltinsObjectHeaderType(expected) && !sourceValues.empty() &&
+      isBuiltinsObjectHandleType(expected) && !sourceValues.empty() &&
       (sourceValues.front().getType() == expected ||
        compatibleRankOneMemRefStorage(sourceValues.front().getType(), expected,
                                       /*targetMustBeDynamic=*/false))) {
+    if (!RuntimeBundleLowerer::isBuiltinsObjectContract(source.contract))
+      return false;
+    if (runtimeInputConsumesObject(symbol, inputIndex))
+      return false;
     ++inputIndex;
     return true;
   }
@@ -423,4 +498,4 @@ mlir::LogicalResult RuntimeBundleLowerer::buildRuntimeCallOperands(
   return mlir::success();
 }
 
-} // namespace py::runtime_lowering
+} // namespace py::lowering

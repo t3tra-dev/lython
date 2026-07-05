@@ -268,6 +268,10 @@ module {
 
   py.class @tuple attributes {
     base_names = ["Sequence"], ly.typing.params = ["T"],
+    ly.runtime.contract = "builtins.tuple", ly.runtime.required,
+    ly.runtime.required_deallocator,
+    ly.runtime.required_initializers = ["__new__"],
+    ly.runtime.required_methods = ["__len__"],
     ly.typing.param_variance = ["covariant"],
     ly.typing.base_args = [[!py.contract<"$T">]],
     method_names = ["__len__", "__contains__", "__getitem__", "__iter__",
@@ -288,6 +292,11 @@ module {
 
   py.class @list attributes {
     base_names = ["MutableSequence"], ly.typing.params = ["T"],
+    ly.runtime.contract = "builtins.list", ly.runtime.required,
+    ly.runtime.required_deallocator,
+    ly.runtime.required_initializers = ["__new__"],
+    ly.runtime.required_methods = ["__len__"],
+    ly.runtime.required_primitives = ["ensure_capacity"],
     ly.typing.base_args = [[!py.contract<"$T">]],
     method_names = ["__init__", "__init__", "append", "extend", "pop",
                     "insert", "remove", "clear", "__len__", "__iter__",
@@ -317,6 +326,11 @@ module {
 
   py.class @dict attributes {
     base_names = ["MutableMapping"], ly.typing.params = ["K", "V"],
+    ly.runtime.contract = "builtins.dict", ly.runtime.required,
+    ly.runtime.required_deallocator,
+    ly.runtime.required_initializers = ["__new__"],
+    ly.runtime.required_methods = ["__len__"],
+    ly.runtime.required_primitives = ["ensure_capacity"],
     ly.typing.base_args = [[!py.contract<"$K">, !py.contract<"$V">]],
     method_names = ["__init__", "__init__", "__len__", "__iter__",
                     "__getitem__", "get", "get", "get", "__setitem__",
@@ -681,12 +695,12 @@ module {
     ly.typing.base_args = [[!py.contract<"$Y">], []],
     method_names = ["__next__", "send", "throw", "throw", "close", "__iter__"],
     method_contracts = [
-      !py.protocol<"Callable", [!py.contract<"typing.Generator">] -> [!py.contract<"$Y">]>,
-      !py.protocol<"Callable", [!py.contract<"typing.Generator">, !py.contract<"$S">] -> [!py.contract<"$Y">]>,
-      !py.protocol<"Callable", [!py.contract<"typing.Generator">, !py.type<!py.contract<"builtins.BaseException">>, !py.union<!py.contract<"builtins.BaseException">, !py.contract<"builtins.object">>, !py.union<!py.contract<"types.TracebackType">, !py.literal<None>>] -> [!py.contract<"$Y">]>,
-      !py.protocol<"Callable", [!py.contract<"typing.Generator">, !py.contract<"builtins.BaseException">, !py.literal<None>, !py.union<!py.contract<"types.TracebackType">, !py.literal<None>>] -> [!py.contract<"$Y">]>,
-      !py.protocol<"Callable", [!py.contract<"typing.Generator">] -> [!py.literal<None>]>,
-      !py.protocol<"Callable", [!py.contract<"typing.Generator">] -> [!py.protocol<"Generator", [!py.contract<"$Y">, !py.contract<"$S">, !py.contract<"$R">]>]>
+      !py.protocol<"Callable", [!py.protocol<"Generator", [!py.contract<"$Y">, !py.contract<"$S">, !py.contract<"$R">]>] -> [!py.contract<"$Y">]>,
+      !py.protocol<"Callable", [!py.protocol<"Generator", [!py.contract<"$Y">, !py.contract<"$S">, !py.contract<"$R">]>, !py.contract<"$S">] -> [!py.contract<"$Y">]>,
+      !py.protocol<"Callable", [!py.protocol<"Generator", [!py.contract<"$Y">, !py.contract<"$S">, !py.contract<"$R">]>, !py.type<!py.contract<"builtins.BaseException">>, !py.union<!py.contract<"builtins.BaseException">, !py.contract<"builtins.object">>, !py.union<!py.contract<"types.TracebackType">, !py.literal<None>>] -> [!py.contract<"$Y">]>,
+      !py.protocol<"Callable", [!py.protocol<"Generator", [!py.contract<"$Y">, !py.contract<"$S">, !py.contract<"$R">]>, !py.contract<"builtins.BaseException">, !py.literal<None>, !py.union<!py.contract<"types.TracebackType">, !py.literal<None>>] -> [!py.contract<"$Y">]>,
+      !py.protocol<"Callable", [!py.protocol<"Generator", [!py.contract<"$Y">, !py.contract<"$S">, !py.contract<"$R">]>] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.protocol<"Generator", [!py.contract<"$Y">, !py.contract<"$S">, !py.contract<"$R">]>] -> [!py.protocol<"Generator", [!py.contract<"$Y">, !py.contract<"$S">, !py.contract<"$R">]>]>
     ],
     method_kinds = ["instance", "instance", "instance", "instance",
                     "instance", "instance"]
@@ -696,7 +710,7 @@ module {
     ly.typing.params = ["T"], ly.typing.param_variance = ["covariant"],
     method_names = ["__await__"],
     method_contracts = [
-      !py.protocol<"Callable", [!py.contract<"typing.Awaitable">] -> [!py.protocol<"Generator", [!py.contract<"typing.Any">, !py.contract<"typing.Any">, !py.contract<"$T">]>]>
+      !py.protocol<"Callable", [!py.protocol<"Awaitable", [!py.contract<"$T">]>] -> [!py.protocol<"Generator", [!py.contract<"typing.Any">, !py.contract<"typing.Any">, !py.contract<"$T">]>]>
     ],
     method_kinds = ["instance"]
   } {}
@@ -707,10 +721,10 @@ module {
     ly.typing.base_args = [[!py.contract<"$R">], []],
     method_names = ["send", "throw", "throw", "close"],
     method_contracts = [
-      !py.protocol<"Callable", [!py.contract<"typing.Coroutine">, !py.contract<"$S">] -> [!py.contract<"$Y">]>,
-      !py.protocol<"Callable", [!py.contract<"typing.Coroutine">, !py.type<!py.contract<"builtins.BaseException">>, !py.union<!py.contract<"builtins.BaseException">, !py.contract<"builtins.object">>, !py.union<!py.contract<"types.TracebackType">, !py.literal<None>>] -> [!py.contract<"$Y">]>,
-      !py.protocol<"Callable", [!py.contract<"typing.Coroutine">, !py.contract<"builtins.BaseException">, !py.literal<None>, !py.union<!py.contract<"types.TracebackType">, !py.literal<None>>] -> [!py.contract<"$Y">]>,
-      !py.protocol<"Callable", [!py.contract<"typing.Coroutine">] -> [!py.literal<None>]>
+      !py.protocol<"Callable", [!py.protocol<"Coroutine", [!py.contract<"$Y">, !py.contract<"$S">, !py.contract<"$R">]>, !py.contract<"$S">] -> [!py.contract<"$Y">]>,
+      !py.protocol<"Callable", [!py.protocol<"Coroutine", [!py.contract<"$Y">, !py.contract<"$S">, !py.contract<"$R">]>, !py.type<!py.contract<"builtins.BaseException">>, !py.union<!py.contract<"builtins.BaseException">, !py.contract<"builtins.object">>, !py.union<!py.contract<"types.TracebackType">, !py.literal<None>>] -> [!py.contract<"$Y">]>,
+      !py.protocol<"Callable", [!py.protocol<"Coroutine", [!py.contract<"$Y">, !py.contract<"$S">, !py.contract<"$R">]>, !py.contract<"builtins.BaseException">, !py.literal<None>, !py.union<!py.contract<"types.TracebackType">, !py.literal<None>>] -> [!py.contract<"$Y">]>,
+      !py.protocol<"Callable", [!py.protocol<"Coroutine", [!py.contract<"$Y">, !py.contract<"$S">, !py.contract<"$R">]>] -> [!py.literal<None>]>
     ],
     method_kinds = ["instance", "instance", "instance", "instance"]
   } {}
@@ -719,7 +733,7 @@ module {
     ly.typing.base_args = [[!py.contract<"typing.Any">, !py.literal<None>, !py.contract<"$R">]],
     method_names = ["__iter__"],
     method_contracts = [
-      !py.protocol<"Callable", [!py.contract<"types.CoroutineAwaitIterator">] -> [!py.protocol<"Generator", [!py.contract<"typing.Any">, !py.literal<None>, !py.contract<"$R">]>]>
+      !py.protocol<"Callable", [!py.contract<"types.CoroutineAwaitIterator", [!py.contract<"$R">]>] -> [!py.protocol<"Generator", [!py.contract<"typing.Any">, !py.literal<None>, !py.contract<"$R">]>]>
     ],
     method_kinds = ["instance"]
   } {}
@@ -730,11 +744,11 @@ module {
     ly.typing.base_args = [[!py.contract<"$Y">, !py.contract<"$S">, !py.contract<"$R">]],
     method_names = ["__await__", "send", "throw", "throw", "close"],
     method_contracts = [
-      !py.protocol<"Callable", [!py.contract<"types.CoroutineType">] -> [!py.protocol<"Generator", [!py.contract<"typing.Any">, !py.literal<None>, !py.contract<"$R">]>]>,
-      !py.protocol<"Callable", [!py.contract<"types.CoroutineType">, !py.contract<"$S">] -> [!py.contract<"$Y">]>,
-      !py.protocol<"Callable", [!py.contract<"types.CoroutineType">, !py.type<!py.contract<"builtins.BaseException">>, !py.union<!py.contract<"builtins.BaseException">, !py.contract<"builtins.object">>, !py.union<!py.contract<"types.TracebackType">, !py.literal<None>>] -> [!py.contract<"$Y">]>,
-      !py.protocol<"Callable", [!py.contract<"types.CoroutineType">, !py.contract<"builtins.BaseException">, !py.literal<None>, !py.union<!py.contract<"types.TracebackType">, !py.literal<None>>] -> [!py.contract<"$Y">]>,
-      !py.protocol<"Callable", [!py.contract<"types.CoroutineType">] -> [!py.literal<None>]>
+      !py.protocol<"Callable", [!py.contract<"types.CoroutineType", [!py.contract<"$Y">, !py.contract<"$S">, !py.contract<"$R">]>] -> [!py.protocol<"Generator", [!py.contract<"typing.Any">, !py.literal<None>, !py.contract<"$R">]>]>,
+      !py.protocol<"Callable", [!py.contract<"types.CoroutineType", [!py.contract<"$Y">, !py.contract<"$S">, !py.contract<"$R">]>, !py.contract<"$S">] -> [!py.contract<"$Y">]>,
+      !py.protocol<"Callable", [!py.contract<"types.CoroutineType", [!py.contract<"$Y">, !py.contract<"$S">, !py.contract<"$R">]>, !py.type<!py.contract<"builtins.BaseException">>, !py.union<!py.contract<"builtins.BaseException">, !py.contract<"builtins.object">>, !py.union<!py.contract<"types.TracebackType">, !py.literal<None>>] -> [!py.contract<"$Y">]>,
+      !py.protocol<"Callable", [!py.contract<"types.CoroutineType", [!py.contract<"$Y">, !py.contract<"$S">, !py.contract<"$R">]>, !py.contract<"builtins.BaseException">, !py.literal<None>, !py.union<!py.contract<"types.TracebackType">, !py.literal<None>>] -> [!py.contract<"$Y">]>,
+      !py.protocol<"Callable", [!py.contract<"types.CoroutineType", [!py.contract<"$Y">, !py.contract<"$S">, !py.contract<"$R">]>] -> [!py.literal<None>]>
     ],
     method_kinds = ["instance", "instance", "instance", "instance",
                     "instance"]
@@ -744,7 +758,7 @@ module {
     ly.typing.params = ["T"], ly.typing.param_variance = ["covariant"],
     method_names = ["__aiter__"],
     method_contracts = [
-      !py.protocol<"Callable", [!py.contract<"typing.AsyncIterable">] -> [!py.protocol<"AsyncIterator", [!py.contract<"$T">]>]>
+      !py.protocol<"Callable", [!py.protocol<"AsyncIterable", [!py.contract<"$T">]>] -> [!py.protocol<"AsyncIterator", [!py.contract<"$T">]>]>
     ],
     method_kinds = ["instance"]
   } {}
@@ -755,8 +769,8 @@ module {
     ly.typing.base_args = [[!py.contract<"$T">], []],
     method_names = ["__aiter__", "__anext__"],
     method_contracts = [
-      !py.protocol<"Callable", [!py.contract<"typing.AsyncIterator">] -> [!py.protocol<"AsyncIterator", [!py.contract<"$T">]>]>,
-      !py.protocol<"Callable", [!py.contract<"typing.AsyncIterator">] -> [!py.protocol<"Awaitable", [!py.contract<"$T">]>]>
+      !py.protocol<"Callable", [!py.protocol<"AsyncIterator", [!py.contract<"$T">]>] -> [!py.protocol<"AsyncIterator", [!py.contract<"$T">]>]>,
+      !py.protocol<"Callable", [!py.protocol<"AsyncIterator", [!py.contract<"$T">]>] -> [!py.protocol<"Awaitable", [!py.contract<"$T">]>]>
     ],
     method_kinds = ["instance", "instance"]
   } {}
@@ -766,11 +780,11 @@ module {
     ly.typing.base_args = [[!py.contract<"$Y">], []],
     method_names = ["__anext__", "asend", "athrow", "athrow", "aclose"],
     method_contracts = [
-      !py.protocol<"Callable", [!py.contract<"typing.AsyncGenerator">] -> [!py.protocol<"Coroutine", [!py.contract<"typing.Any">, !py.contract<"typing.Any">, !py.contract<"$Y">]>]>,
-      !py.protocol<"Callable", [!py.contract<"typing.AsyncGenerator">, !py.contract<"$S">] -> [!py.protocol<"Coroutine", [!py.contract<"typing.Any">, !py.contract<"typing.Any">, !py.contract<"$Y">]>]>,
-      !py.protocol<"Callable", [!py.contract<"typing.AsyncGenerator">, !py.type<!py.contract<"builtins.BaseException">>, !py.union<!py.contract<"builtins.BaseException">, !py.contract<"builtins.object">>, !py.union<!py.contract<"types.TracebackType">, !py.literal<None>>] -> [!py.protocol<"Coroutine", [!py.contract<"typing.Any">, !py.contract<"typing.Any">, !py.contract<"$Y">]>]>,
-      !py.protocol<"Callable", [!py.contract<"typing.AsyncGenerator">, !py.contract<"builtins.BaseException">, !py.literal<None>, !py.union<!py.contract<"types.TracebackType">, !py.literal<None>>] -> [!py.protocol<"Coroutine", [!py.contract<"typing.Any">, !py.contract<"typing.Any">, !py.contract<"$Y">]>]>,
-      !py.protocol<"Callable", [!py.contract<"typing.AsyncGenerator">] -> [!py.protocol<"Coroutine", [!py.contract<"typing.Any">, !py.contract<"typing.Any">, !py.literal<None>]>]>
+      !py.protocol<"Callable", [!py.protocol<"AsyncGenerator", [!py.contract<"$Y">, !py.contract<"$S">]>] -> [!py.protocol<"Coroutine", [!py.contract<"typing.Any">, !py.contract<"typing.Any">, !py.contract<"$Y">]>]>,
+      !py.protocol<"Callable", [!py.protocol<"AsyncGenerator", [!py.contract<"$Y">, !py.contract<"$S">]>, !py.contract<"$S">] -> [!py.protocol<"Coroutine", [!py.contract<"typing.Any">, !py.contract<"typing.Any">, !py.contract<"$Y">]>]>,
+      !py.protocol<"Callable", [!py.protocol<"AsyncGenerator", [!py.contract<"$Y">, !py.contract<"$S">]>, !py.type<!py.contract<"builtins.BaseException">>, !py.union<!py.contract<"builtins.BaseException">, !py.contract<"builtins.object">>, !py.union<!py.contract<"types.TracebackType">, !py.literal<None>>] -> [!py.protocol<"Coroutine", [!py.contract<"typing.Any">, !py.contract<"typing.Any">, !py.contract<"$Y">]>]>,
+      !py.protocol<"Callable", [!py.protocol<"AsyncGenerator", [!py.contract<"$Y">, !py.contract<"$S">]>, !py.contract<"builtins.BaseException">, !py.literal<None>, !py.union<!py.contract<"types.TracebackType">, !py.literal<None>>] -> [!py.protocol<"Coroutine", [!py.contract<"typing.Any">, !py.contract<"typing.Any">, !py.contract<"$Y">]>]>,
+      !py.protocol<"Callable", [!py.protocol<"AsyncGenerator", [!py.contract<"$Y">, !py.contract<"$S">]>] -> [!py.protocol<"Coroutine", [!py.contract<"typing.Any">, !py.contract<"typing.Any">, !py.literal<None>]>]>
     ],
     method_kinds = ["instance", "instance", "instance", "instance",
                     "instance"]
@@ -808,8 +822,8 @@ module {
     ly.typing.param_defaults = [!py.union<!py.contract<"builtins.bool">, !py.literal<None>>],
     method_names = ["__aenter__", "__aexit__"],
     method_contracts = [
-      !py.protocol<"Callable", [!py.contract<"typing.AsyncContextManager">] -> [!py.protocol<"Awaitable", [!py.contract<"$T">]>]>,
-      !py.protocol<"Callable", [!py.contract<"typing.AsyncContextManager">, !py.union<!py.type<!py.contract<"builtins.BaseException">>, !py.literal<None>>, !py.union<!py.contract<"builtins.BaseException">, !py.literal<None>>, !py.union<!py.contract<"types.TracebackType">, !py.literal<None>>] -> [!py.protocol<"Awaitable", [!py.contract<"$ExitT">]>]>
+      !py.protocol<"Callable", [!py.protocol<"AsyncContextManager", [!py.contract<"$T">, !py.contract<"$ExitT">]>] -> [!py.protocol<"Awaitable", [!py.contract<"$T">]>]>,
+      !py.protocol<"Callable", [!py.protocol<"AsyncContextManager", [!py.contract<"$T">, !py.contract<"$ExitT">]>, !py.union<!py.type<!py.contract<"builtins.BaseException">>, !py.literal<None>>, !py.union<!py.contract<"builtins.BaseException">, !py.literal<None>>, !py.union<!py.contract<"types.TracebackType">, !py.literal<None>>] -> [!py.protocol<"Awaitable", [!py.contract<"$ExitT">]>]>
     ],
     method_kinds = ["instance", "instance"]
   } {}
@@ -824,20 +838,20 @@ module {
                     "add_done_callback", "remove_done_callback", "set_result",
                     "set_exception", "get_loop"],
     method_contracts = [
-      !py.protocol<"Callable", [!py.contract<"_asyncio.Future">] -> [!py.literal<None>]>,
-      !py.protocol<"Callable", [!py.contract<"_asyncio.Future">] -> [!py.protocol<"Generator", [!py.contract<"typing.Any">, !py.literal<None>, !py.contract<"$T">]>]>,
-      !py.protocol<"Callable", [!py.contract<"_asyncio.Future">] -> [!py.protocol<"Generator", [!py.contract<"typing.Any">, !py.literal<None>, !py.contract<"$T">]>]>,
-      !py.protocol<"Callable", [!py.contract<"_asyncio.Future">] -> [!py.contract<"$T">]>,
-      !py.protocol<"Callable", [!py.contract<"_asyncio.Future">] -> [!py.union<!py.contract<"builtins.BaseException">, !py.literal<None>>]>,
-      !py.protocol<"Callable", [!py.contract<"_asyncio.Future">] -> [!py.contract<"builtins.bool">]>,
-      !py.protocol<"Callable", [!py.contract<"_asyncio.Future">] -> [!py.contract<"builtins.bool">]>,
-      !py.protocol<"Callable", [!py.contract<"_asyncio.Future">] -> [!py.contract<"builtins.bool">]>,
-      !py.protocol<"Callable", [!py.contract<"_asyncio.Future">, !py.union<!py.contract<"builtins.object">, !py.literal<None>>] -> [!py.contract<"builtins.bool">]>,
-      !py.protocol<"Callable", [!py.contract<"_asyncio.Future">, !py.protocol<"Callable", [!py.self] -> [!py.contract<"builtins.object">]>] -> [!py.literal<None>]>,
-      !py.protocol<"Callable", [!py.contract<"_asyncio.Future">, !py.protocol<"Callable", [!py.self] -> [!py.contract<"builtins.object">]>] -> [!py.contract<"builtins.int">]>,
-      !py.protocol<"Callable", [!py.contract<"_asyncio.Future">, !py.contract<"$T">] -> [!py.literal<None>]>,
-      !py.protocol<"Callable", [!py.contract<"_asyncio.Future">, !py.union<!py.type<!py.contract<"builtins.BaseException">>, !py.contract<"builtins.BaseException">>] -> [!py.literal<None>]>,
-      !py.protocol<"Callable", [!py.contract<"_asyncio.Future">] -> [!py.contract<"asyncio.AbstractEventLoop">]>
+      !py.protocol<"Callable", [!py.contract<"_asyncio.Future", [!py.contract<"$T">]>] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"_asyncio.Future", [!py.contract<"$T">]>] -> [!py.protocol<"Generator", [!py.contract<"typing.Any">, !py.literal<None>, !py.contract<"$T">]>]>,
+      !py.protocol<"Callable", [!py.contract<"_asyncio.Future", [!py.contract<"$T">]>] -> [!py.protocol<"Generator", [!py.contract<"typing.Any">, !py.literal<None>, !py.contract<"$T">]>]>,
+      !py.protocol<"Callable", [!py.contract<"_asyncio.Future", [!py.contract<"$T">]>] -> [!py.contract<"$T">]>,
+      !py.protocol<"Callable", [!py.contract<"_asyncio.Future", [!py.contract<"$T">]>] -> [!py.union<!py.contract<"builtins.BaseException">, !py.literal<None>>]>,
+      !py.protocol<"Callable", [!py.contract<"_asyncio.Future", [!py.contract<"$T">]>] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"_asyncio.Future", [!py.contract<"$T">]>] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"_asyncio.Future", [!py.contract<"$T">]>] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"_asyncio.Future", [!py.contract<"$T">]>, !py.union<!py.contract<"builtins.object">, !py.literal<None>>] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"_asyncio.Future", [!py.contract<"$T">]>, !py.protocol<"Callable", [!py.self] -> [!py.contract<"builtins.object">]>] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"_asyncio.Future", [!py.contract<"$T">]>, !py.protocol<"Callable", [!py.self] -> [!py.contract<"builtins.object">]>] -> [!py.contract<"builtins.int">]>,
+      !py.protocol<"Callable", [!py.contract<"_asyncio.Future", [!py.contract<"$T">]>, !py.contract<"$T">] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"_asyncio.Future", [!py.contract<"$T">]>, !py.union<!py.type<!py.contract<"builtins.BaseException">>, !py.contract<"builtins.BaseException">>] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"_asyncio.Future", [!py.contract<"$T">]>] -> [!py.contract<"asyncio.AbstractEventLoop">]>
     ],
     method_kinds = ["instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
@@ -849,7 +863,7 @@ module {
     ly.typing.base_args = [[!py.contract<"typing.Any">, !py.literal<None>, !py.contract<"$T">]],
     method_names = ["__iter__"],
     method_contracts = [
-      !py.protocol<"Callable", [!py.contract<"_asyncio.FutureIter">] -> [!py.protocol<"Generator", [!py.contract<"typing.Any">, !py.literal<None>, !py.contract<"$T">]>]>
+      !py.protocol<"Callable", [!py.contract<"_asyncio.FutureIter", [!py.contract<"$T">]>] -> [!py.protocol<"Generator", [!py.contract<"typing.Any">, !py.literal<None>, !py.contract<"$T">]>]>
     ],
     method_kinds = ["instance"]
   } {}
@@ -863,17 +877,17 @@ module {
                     "get_stack", "print_stack", "cancelling", "uncancel"],
     method_contracts = [
       !py.protocol<"Callable", [!py.type<!py.contract<"_asyncio.Task">>, !py.protocol<"Coroutine", [!py.contract<"typing.Any">, !py.contract<"typing.Any">, !py.contract<"$T">]>] -> [!py.self]>,
-      !py.protocol<"Callable", [!py.contract<"_asyncio.Task">, !py.protocol<"Coroutine", [!py.contract<"typing.Any">, !py.contract<"typing.Any">, !py.contract<"$T">]>] -> [!py.literal<None>]>,
-      !py.protocol<"Callable", [!py.contract<"_asyncio.Task">] -> [!py.protocol<"Generator", [!py.contract<"typing.Any">, !py.literal<None>, !py.contract<"$T">]>]>,
-      !py.protocol<"Callable", [!py.contract<"_asyncio.Task">] -> [!py.protocol<"Generator", [!py.contract<"typing.Any">, !py.literal<None>, !py.contract<"$T">]>]>,
-      !py.protocol<"Callable", [!py.contract<"_asyncio.Task">] -> [!py.union<!py.protocol<"Coroutine", [!py.contract<"typing.Any">, !py.contract<"typing.Any">, !py.contract<"$T">]>, !py.literal<None>>]>,
-      !py.protocol<"Callable", [!py.contract<"_asyncio.Task">] -> [!py.contract<"builtins.str">]>,
-      !py.protocol<"Callable", [!py.contract<"_asyncio.Task">, !py.contract<"builtins.object">] -> [!py.literal<None>]>,
-      !py.protocol<"Callable", [!py.contract<"_asyncio.Task">] -> [!py.contract<"contextvars.Context">]>,
-      !py.protocol<"Callable", [!py.contract<"_asyncio.Task">, !py.union<!py.contract<"builtins.int">, !py.literal<None>>] -> [!py.contract<"builtins.list">]>,
-      !py.protocol<"Callable", [!py.contract<"_asyncio.Task">, !py.union<!py.contract<"builtins.int">, !py.literal<None>>, !py.union<!py.contract<"typing.TextIO">, !py.literal<None>>] -> [!py.literal<None>]>,
-      !py.protocol<"Callable", [!py.contract<"_asyncio.Task">] -> [!py.contract<"builtins.int">]>,
-      !py.protocol<"Callable", [!py.contract<"_asyncio.Task">] -> [!py.contract<"builtins.int">]>
+      !py.protocol<"Callable", [!py.contract<"_asyncio.Task", [!py.contract<"$T">]>, !py.protocol<"Coroutine", [!py.contract<"typing.Any">, !py.contract<"typing.Any">, !py.contract<"$T">]>] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"_asyncio.Task", [!py.contract<"$T">]>] -> [!py.protocol<"Generator", [!py.contract<"typing.Any">, !py.literal<None>, !py.contract<"$T">]>]>,
+      !py.protocol<"Callable", [!py.contract<"_asyncio.Task", [!py.contract<"$T">]>] -> [!py.protocol<"Generator", [!py.contract<"typing.Any">, !py.literal<None>, !py.contract<"$T">]>]>,
+      !py.protocol<"Callable", [!py.contract<"_asyncio.Task", [!py.contract<"$T">]>] -> [!py.union<!py.protocol<"Coroutine", [!py.contract<"typing.Any">, !py.contract<"typing.Any">, !py.contract<"$T">]>, !py.literal<None>>]>,
+      !py.protocol<"Callable", [!py.contract<"_asyncio.Task", [!py.contract<"$T">]>] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"_asyncio.Task", [!py.contract<"$T">]>, !py.contract<"builtins.object">] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"_asyncio.Task", [!py.contract<"$T">]>] -> [!py.contract<"contextvars.Context">]>,
+      !py.protocol<"Callable", [!py.contract<"_asyncio.Task", [!py.contract<"$T">]>, !py.union<!py.contract<"builtins.int">, !py.literal<None>>] -> [!py.contract<"builtins.list">]>,
+      !py.protocol<"Callable", [!py.contract<"_asyncio.Task", [!py.contract<"$T">]>, !py.union<!py.contract<"builtins.int">, !py.literal<None>>, !py.union<!py.contract<"typing.TextIO">, !py.literal<None>>] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"_asyncio.Task", [!py.contract<"$T">]>] -> [!py.contract<"builtins.int">]>,
+      !py.protocol<"Callable", [!py.contract<"_asyncio.Task", [!py.contract<"$T">]>] -> [!py.contract<"builtins.int">]>
     ],
     method_kinds = ["classmethod", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
@@ -884,7 +898,7 @@ module {
     ly.typing.base_args = [[!py.contract<"typing.Any">, !py.literal<None>, !py.contract<"$T">]],
     method_names = ["__iter__"],
     method_contracts = [
-      !py.protocol<"Callable", [!py.contract<"_asyncio.TaskIter">] -> [!py.protocol<"Generator", [!py.contract<"typing.Any">, !py.literal<None>, !py.contract<"$T">]>]>
+      !py.protocol<"Callable", [!py.contract<"_asyncio.TaskIter", [!py.contract<"$T">]>] -> [!py.protocol<"Generator", [!py.contract<"typing.Any">, !py.literal<None>, !py.contract<"$T">]>]>
     ],
     method_kinds = ["instance"]
   } {}

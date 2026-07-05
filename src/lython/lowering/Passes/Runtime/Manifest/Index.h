@@ -13,7 +13,7 @@
 #include <optional>
 #include <string>
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 
 struct RuntimeDefaultArgument {
   enum class Kind { I64, F64 };
@@ -144,4 +144,4 @@ private:
   bool malformedContractsAttr = false;
 };
 
-} // namespace py::runtime_lowering
+} // namespace py::lowering

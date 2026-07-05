@@ -35,19 +35,26 @@ private:
   void emitCallableFunction(const parser::Node &callable,
                             llvm::StringRef symbolName,
                             const FunctionSignature &sig,
-                            llvm::ArrayRef<Capture> captures, bool isLambda);
+                            llvm::ArrayRef<Capture> captures, bool isLambda,
+                            unsigned positionalNodeOffset = 0,
+                            mlir::Type preboundTypeObject = {});
   std::optional<MethodBinding>
   lookupClassMethod(mlir::Type receiverType, llvm::StringRef methodName) const;
   std::optional<mlir::Type> lookupClassField(mlir::Type receiverType,
                                              llvm::StringRef fieldName) const;
+  std::optional<mlir::Type>
+  lookupClassStaticAttr(mlir::Type receiverType,
+                        llvm::StringRef attrName) const;
   Value emitNestedFunctionDecl(const parser::Node &function);
   Value emitLambda(const parser::Node &expr, py::CallableType expected = {});
   void emitClassContract(const parser::Node &classDef);
   void collectClassFields(const parser::Node &classDef,
-                          llvm::StringMap<mlir::Type> &fields) const;
+                          llvm::SmallVectorImpl<std::string> &fieldNames,
+                          llvm::SmallVectorImpl<mlir::Type> &fieldTypes) const;
   void collectStaticClassAssignments(
       const parser::Node &classDef, llvm::SmallVectorImpl<std::string> &names,
-      llvm::SmallVectorImpl<mlir::Attribute> &values) const;
+      llvm::SmallVectorImpl<mlir::Attribute> &values,
+      llvm::SmallVectorImpl<mlir::Type> *types = nullptr) const;
   void collectStaticModuleAssignments(
       const parser::Node &moduleNode, llvm::SmallVectorImpl<std::string> &names,
       llvm::SmallVectorImpl<mlir::Attribute> &values) const;
@@ -73,9 +80,15 @@ private:
   Value emitCallableDispatch(const parser::Node &anchor, Value callee,
                              const CallOperands &operands,
                              mlir::Type resultOverride = {});
+  bool methodBindingBindsReceiver(const MethodBinding &method) const;
+  Value emitDescriptorReceiver(const parser::Node &anchor, Value receiver,
+                               const MethodBinding &method);
+  Value emitMethodObject(const parser::Node &anchor, Value receiver,
+                         const MethodBinding &method);
   Value emitInlineMethodCall(const parser::Node &expr, Value receiver,
                              const MethodBinding &method);
   Value emitInlineMethodBody(const parser::Node &anchor, Value receiver,
+                             bool bindDescriptorReceiver,
                              const MethodBinding &method,
                              llvm::ArrayRef<Value> positional,
                              const llvm::StringMap<Value> &keywords);
@@ -135,6 +148,7 @@ private:
   llvm::StringMap<Value> values;
   llvm::StringMap<PrimitiveConstant> primitiveConstants;
   llvm::StringMap<llvm::StringMap<mlir::Type>> classFieldBindings;
+  llvm::StringMap<llvm::StringMap<mlir::Type>> classStaticAttrBindings;
   llvm::StringMap<llvm::StringMap<MethodBinding>> classMethodBindings;
   mlir::Type currentReturnType;
   std::string currentFunctionPrefix;

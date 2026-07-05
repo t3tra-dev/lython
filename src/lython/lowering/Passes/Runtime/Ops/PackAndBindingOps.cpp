@@ -1,6 +1,6 @@
 #include "Runtime/Core/Lowerer.h"
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 
 namespace {
 
@@ -87,6 +87,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPack(py::PackOp op) {
 
   llvm::SmallVector<RuntimeValue, 8> elements;
   llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 8> elementBundles;
+  llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 8> dictKeyBundles;
+  llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 8> dictValueBundles;
   llvm::SmallVector<std::string, 8> keys;
   mlir::ValueRange values = op.getValues();
   if (contractName != "builtins.dict") {
@@ -124,21 +126,42 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPack(py::PackOp op) {
       return op.emitError() << "dict literal pack has an odd operand count";
     elements.reserve(values.size() / 2);
     keys.reserve(values.size() / 2);
+    dictKeyBundles.reserve(values.size() / 2);
+    dictValueBundles.reserve(values.size() / 2);
     bool allStaticStringKeys = true;
     for (unsigned index = 0, end = values.size(); index < end; index += 2) {
       std::optional<std::string> key =
           RuntimeBundleLowerer::keywordNameFromValue(values[index]);
-      if (!key) {
-        allStaticStringKeys = false;
-        break;
+      const RuntimeBundle *keyBundle =
+          RuntimeBundleLowerer::bundleFor(values[index]);
+      if (!keyBundle && key) {
+        builder.setInsertionPoint(op);
+        RuntimeBundle materializedKey;
+        if (mlir::failed(RuntimeBundleLowerer::materializeStringObject(
+                op, *key, materializedKey)))
+          return mlir::failure();
+        materializedKey.literalText = *key;
+        dictKeyBundles.push_back(
+            std::make_shared<RuntimeBundle>(std::move(materializedKey)));
+      } else {
+        if (!keyBundle || keyBundle->kind != RuntimeBundle::Kind::Object)
+          return op.emitError()
+                 << "dict literal key has no lowered object bundle";
+        dictKeyBundles.push_back(std::make_shared<RuntimeBundle>(*keyBundle));
       }
+      if (!key)
+        allStaticStringKeys = false;
+
       const RuntimeBundle *valueBundle =
           RuntimeBundleLowerer::bundleFor(values[index + 1]);
       if (!valueBundle || valueBundle->kind != RuntimeBundle::Kind::Object)
         return op.emitError()
                << "dict literal value has no lowered object bundle";
-      keys.push_back(std::move(*key));
-      elements.push_back(valueBundle->objectValue);
+      dictValueBundles.push_back(std::make_shared<RuntimeBundle>(*valueBundle));
+      if (key) {
+        keys.push_back(*key);
+        elements.push_back(valueBundle->objectValue);
+      }
     }
     if (!allStaticStringKeys) {
       keys.clear();
@@ -155,6 +178,20 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPack(py::PackOp op) {
   if (contractName != "builtins.dict")
     bundle.sequenceElementBundles.append(elementBundles.begin(),
                                          elementBundles.end());
+  if (contractName != "builtins.dict" &&
+      mlir::failed(RuntimeBundleLowerer::initializeSequencePayload(
+          op, bundle, bundle.sequenceElementBundles)))
+    return mlir::failure();
+  if (contractName == "builtins.dict") {
+    bundle.mappingKeyBundles.append(dictKeyBundles.begin(),
+                                    dictKeyBundles.end());
+    bundle.mappingValueBundles.append(dictValueBundles.begin(),
+                                      dictValueBundles.end());
+    if (!dictKeyBundles.empty() &&
+        mlir::failed(RuntimeBundleLowerer::initializeDictPayload(
+            op, bundle, dictKeyBundles, dictValueBundles)))
+      return mlir::failure();
+  }
   valueBundles[op.getResult()] = std::move(bundle);
   erase.push_back(op);
   return mlir::success();
@@ -218,6 +255,13 @@ RuntimeBundleLowerer::lowerFunctionBindingRef(py::BindingRefOp op,
     erase.push_back(op);
     return mlir::success();
   }
+
+  if (RuntimeBundleLowerer::isCallableProtocolTemplate(function))
+    return op.emitError()
+           << "protocol-typed function '" << op.getBinding()
+           << "' must be called from statically known concrete arguments; "
+              "materializing it as a runtime function object is not part of "
+              "the static callable ABI";
 
   std::optional<RuntimeSymbol> initializer =
       manifest.initializer("builtins.function", "__new__");
@@ -367,4 +411,4 @@ mlir::LogicalResult RuntimeBundleLowerer::requireEmptyAggregate(
     return op->emitError() << label << " lowering is not keyword-aware yet";
   return mlir::success();
 }
-} // namespace py::runtime_lowering
+} // namespace py::lowering

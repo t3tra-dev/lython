@@ -9,17 +9,18 @@ inline bool exactScalarEqualityLoweringSupported(mlir::Type lhs,
                                                  mlir::Type rhs) {
   if (lhs != rhs)
     return false;
-  return mlir::isa<IntType, FloatType, BoolType, StrType>(lhs);
+  return isPyIntType(lhs) || isPyFloatType(lhs) || isPyBoolType(lhs) ||
+         isPyStrType(lhs);
 }
 
 inline bool exactScalarEqualityAlwaysFalse(mlir::Type lhs, mlir::Type rhs) {
   if (lhs == rhs)
     return false;
   auto isNumeric = [](mlir::Type type) {
-    return mlir::isa<IntType, FloatType, BoolType>(type);
+    return isPyIntType(type) || isPyFloatType(type) || isPyBoolType(type);
   };
   auto isExactScalar = [&](mlir::Type type) {
-    return isNumeric(type) || mlir::isa<StrType, NoneType>(type);
+    return isNumeric(type) || isPyStrType(type) || isPyNoneType(type);
   };
   if (!isExactScalar(lhs) || !isExactScalar(rhs))
     return false;

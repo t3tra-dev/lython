@@ -104,7 +104,8 @@ def Py_ClassOp
       OptionalAttr<TypeArrayAttr>:$field_contract_types,
       OptionalAttr<StrArrayAttr>:$method_names,
       OptionalAttr<TypeArrayAttr>:$method_contracts,
-      OptionalAttr<StrArrayAttr>:$method_kinds);
+      OptionalAttr<StrArrayAttr>:$method_kinds,
+      OptionalAttr<StrArrayAttr>:$method_symbols);
 
   // A class with an empty block and no methods is a declaration: the typing
   // manifest (runtime/typing.mlir) declares the abstract container tower

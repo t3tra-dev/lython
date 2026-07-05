@@ -2,8 +2,10 @@
 
 #include "Runtime/Core/Lowerer.h"
 
-#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "Native.h"
+
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Operation.h"
@@ -19,7 +21,7 @@
 #include <string>
 #include <utility>
 
-namespace py::runtime_lowering::ctypes {
+namespace py::lowering::ctypes {
 
 struct CtypesLayout {
   enum class ABIKind {
@@ -57,14 +59,7 @@ struct CtypesArrayType {
   std::uint64_t count = 0;
 };
 
-struct TargetPlatformFacts {
-  std::string triple;
-  std::uint64_t pointerWidth = 0;
-  std::uint64_t cLongWidth = 0;
-
-  std::uint64_t pointerBytes() const { return pointerWidth / 8; }
-  std::uint64_t cLongBytes() const { return cLongWidth / 8; }
-};
+using TargetPlatformFacts = py::native::TargetPlatformFacts;
 
 llvm::StringRef stripCtypesModule(llvm::StringRef contract);
 std::optional<std::string> ctypesModuleAttrContract(llvm::StringRef moduleName,
@@ -156,8 +151,8 @@ mlir::Value
 integerToNativePointer(mlir::OpBuilder &builder, mlir::Location loc,
                        mlir::Value value,
                        const std::optional<TargetPlatformFacts> &facts);
-mlir::Value nativePointerToInteger(mlir::OpBuilder &builder,
-                                   mlir::Location loc, mlir::Value pointer);
+mlir::Value nativePointerToInteger(mlir::OpBuilder &builder, mlir::Location loc,
+                                   mlir::Value pointer);
 mlir::Value addressWithOffset(mlir::OpBuilder &builder, mlir::Location loc,
                               mlir::Value address, std::int64_t offset,
                               const std::optional<TargetPlatformFacts> &facts);
@@ -232,10 +227,11 @@ std::optional<mlir::Value>
 extractPointerAddressInteger(mlir::Operation *op, mlir::OpBuilder &builder,
                              const RuntimeBundle &source,
                              const std::optional<TargetPlatformFacts> &facts);
-mlir::FailureOr<mlir::func::FuncOp>
-getOrCreateNativeDeclaration(mlir::Operation *op, mlir::ModuleOp module,
-                             mlir::OpBuilder &builder, llvm::StringRef name,
-                             mlir::FunctionType type);
+mlir::FailureOr<mlir::func::FuncOp> getOrCreateNativeDeclaration(
+    mlir::Operation *op, mlir::ModuleOp module, mlir::OpBuilder &builder,
+    llvm::StringRef name, mlir::FunctionType type,
+    llvm::ArrayRef<std::string> argTypes, llvm::StringRef resultType,
+    llvm::StringRef abi, bool processLibrary, const TargetPlatformFacts &facts);
 std::string describeNativeArgumentSource(const RuntimeBundle &source);
 
-} // namespace py::runtime_lowering::ctypes
+} // namespace py::lowering::ctypes

@@ -1,5 +1,5 @@
 module attributes {ly.runtime.contracts = ["builtins.float"]} {
-  func.func private @LyObject_DecRefHeader(%header: memref<2xi64, strided<[1], offset: ?>> {ly.ownership.object_header}) -> i1
+  func.func private @LyObject_ReleaseStorageToZero(%storage: memref<?xi64>) -> i1
   func.func private @LyUnicode_FromF64(%value: f64) -> (memref<2xi64>, memref<?xi8>)
 
   func.func @LyFloat_FromF64(%value: f64 {ly.runtime.default_f64 = 0.0 : f64}) -> (memref<2xi64>, memref<1xf64>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 2 : i64, ly.runtime.contract = "builtins.float", ly.runtime.initializer = "__new__"} {
@@ -17,8 +17,8 @@ module attributes {ly.runtime.contracts = ["builtins.float"]} {
   }
 
   func.func @LyFloat_DecRef(%header: memref<2xi64> {ly.ownership.object_header}, %payload: memref<1xf64>) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.float", ly.runtime.deallocator} {
-    %header_view = memref.cast %header : memref<2xi64> to memref<2xi64, strided<[1], offset: ?>>
-    %became_zero = func.call @LyObject_DecRefHeader(%header_view) : (memref<2xi64, strided<[1], offset: ?>>) -> i1
+    %storage = memref.cast %header : memref<2xi64> to memref<?xi64>
+    %became_zero = func.call @LyObject_ReleaseStorageToZero(%storage) : (memref<?xi64>) -> i1
     cf.cond_br %became_zero, ^dealloc, ^done
 
   ^dealloc:

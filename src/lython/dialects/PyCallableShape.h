@@ -133,7 +133,7 @@ callableVarargShape(mlir::Type varargType) {
     mlir::Type packed = unpack.getPackedType();
     if (mlir::isa<TypeVarTupleType>(packed))
       return lython::callable::VarargShape<mlir::Type>::repeatedOf(
-          ObjectType::get(varargType.getContext()));
+          pyObjectContractType(varargType.getContext()));
     return callableVarargShape(packed);
   }
   if (auto pack = mlir::dyn_cast_if_present<CallableType>(varargType)) {
@@ -153,14 +153,7 @@ callableVarargShape(mlir::Type varargType) {
       return lython::callable::VarargShape<mlir::Type>::exactOf(arguments);
     }
   }
-  auto tuple = mlir::dyn_cast_if_present<TupleType>(varargType);
-  if (!tuple)
-    return lython::callable::VarargShape<mlir::Type>::invalid();
-  llvm::ArrayRef<mlir::Type> elements = tuple.getElementTypes();
-  if (elements.size() == 1)
-    return lython::callable::VarargShape<mlir::Type>::repeatedOf(
-        elements.front());
-  return lython::callable::VarargShape<mlir::Type>::exactOf(elements);
+  return lython::callable::VarargShape<mlir::Type>::invalid();
 }
 
 inline std::optional<mlir::Type> callableKwargValueType(mlir::Type kwargType) {
@@ -179,26 +172,21 @@ inline std::optional<mlir::Type> callableKwargValueType(mlir::Type kwargType) {
       valueTypes.push_back(*fallback);
     }
     if (valueTypes.empty())
-      return ObjectType::get(kwargType.getContext());
+      return pyObjectContractType(kwargType.getContext());
     return UnionType::getNormalized(kwargType.getContext(), valueTypes);
   }
   if (auto contract = mlir::dyn_cast_if_present<ContractType>(kwargType)) {
     if (contract.getContractName() == "builtins.dict") {
       llvm::ArrayRef<mlir::Type> arguments = contract.getArguments();
       if (arguments.size() < 2)
-        return ObjectType::get(kwargType.getContext());
+        return pyObjectContractType(kwargType.getContext());
       auto key = mlir::dyn_cast_if_present<ContractType>(arguments.front());
       if (!key || key.getContractName() != "builtins.str")
         return std::nullopt;
       return arguments[1];
     }
   }
-  auto dict = mlir::dyn_cast_if_present<DictType>(kwargType);
-  if (!dict)
-    return kwargType;
-  if (!mlir::isa<StrType>(dict.getKeyType()))
-    return std::nullopt;
-  return dict.getValueType();
+  return kwargType;
 }
 
 inline std::optional<mlir::Type>
@@ -213,15 +201,12 @@ callableUnpackedKeywordValueType(mlir::Type mappingType) {
       }
     }
   }
-  auto dict = mlir::dyn_cast_if_present<DictType>(mappingType);
-  if (dict && mlir::isa<StrType>(dict.getKeyType()))
-    return dict.getValueType();
   auto protocol = mlir::dyn_cast_if_present<ProtocolType>(mappingType);
   if (protocol &&
       (protocol.getProtocolName() == "Mapping" ||
        protocol.getProtocolName() == "MutableMapping") &&
       protocol.getArguments().size() >= 2 &&
-      mlir::isa<StrType>(protocol.getArguments().front()))
+      isPyStrType(protocol.getArguments().front()))
     return protocol.getArguments()[1];
   return std::nullopt;
 }

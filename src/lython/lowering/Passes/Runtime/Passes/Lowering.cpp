@@ -7,7 +7,7 @@
 
 #include <memory>
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 namespace {
 
 class RuntimeLoweringPass
@@ -50,13 +50,13 @@ private:
 };
 
 } // namespace
-} // namespace py::runtime_lowering
+} // namespace py::lowering
 
 namespace py {
 
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createRuntimeLoweringPass() {
-  return std::make_unique<runtime_lowering::RuntimeLoweringPass>();
+  return std::make_unique<lowering::RuntimeLoweringPass>();
 }
 
 } // namespace py

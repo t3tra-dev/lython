@@ -8,7 +8,7 @@
 
 #include <limits>
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 
 bool isPrimitiveElementType(mlir::Type type) {
   return mlir::isa<mlir::FloatType, mlir::IntegerType>(type);
@@ -130,4 +130,4 @@ std::optional<int64_t> selectDivisibleVectorLanes(mlir::Type elementType,
   return lanes;
 }
 
-} // namespace py::runtime_lowering
+} // namespace py::lowering

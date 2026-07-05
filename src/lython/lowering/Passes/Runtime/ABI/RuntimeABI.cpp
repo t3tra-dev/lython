@@ -1,8 +1,21 @@
 #include "Runtime/Core/Lowerer.h"
+#include "Ownership.h"
 
-namespace py::runtime_lowering {
+#include "PyTypeObject.h"
+#include "mlir/IR/BuiltinAttributes.h"
+
+#include <cctype>
+#include <limits>
+
+namespace py::lowering {
 
 namespace {
+
+namespace own = py::ownership;
+constexpr llvm::StringLiteral kReleaseStorageToZeroName{
+    "LyObject_ReleaseStorageToZero"};
+constexpr unsigned kPrimitiveFieldSlotBase = 4;
+constexpr unsigned kPrimitiveFieldSlotLimit = 16;
 
 bool compatibleMemRefView(mlir::Type source, mlir::Type target) {
   auto sourceMemRef = mlir::dyn_cast<mlir::MemRefType>(source);
@@ -11,6 +24,60 @@ bool compatibleMemRefView(mlir::Type source, mlir::Type target) {
          sourceMemRef.getShape() == targetMemRef.getShape() &&
          sourceMemRef.getElementType() == targetMemRef.getElementType() &&
          sourceMemRef.getMemorySpace() == targetMemRef.getMemorySpace();
+}
+
+bool isRankOneI64MemRef(mlir::Type type) {
+  auto memref = mlir::dyn_cast<mlir::MemRefType>(type);
+  if (!memref || memref.getRank() != 1)
+    return false;
+  auto element = mlir::dyn_cast<mlir::IntegerType>(memref.getElementType());
+  return element && element.getWidth() == 64;
+}
+
+mlir::FailureOr<mlir::Value>
+viewRankOneI64Prefix(mlir::Operation *op, mlir::OpBuilder &builder,
+                     mlir::Value source, mlir::Type targetType,
+                     llvm::StringRef label) {
+  if (source.getType() == targetType)
+    return source;
+  if (compatibleMemRefView(source.getType(), targetType))
+    return builder
+        .create<mlir::memref::CastOp>(op->getLoc(), targetType, source)
+        .getResult();
+
+  auto sourceMemRef = mlir::dyn_cast<mlir::MemRefType>(source.getType());
+  auto targetMemRef = mlir::dyn_cast<mlir::MemRefType>(targetType);
+  if (!sourceMemRef || !targetMemRef || sourceMemRef.getRank() != 1 ||
+      targetMemRef.getRank() != 1 ||
+      sourceMemRef.getElementType() != targetMemRef.getElementType() ||
+      sourceMemRef.getMemorySpace() != targetMemRef.getMemorySpace())
+    return op->emitError() << label << " " << source.getType()
+                           << " cannot be viewed as " << targetType;
+
+  if (sourceMemRef.hasStaticShape() && targetMemRef.hasStaticShape() &&
+      sourceMemRef.getDimSize(0) >= targetMemRef.getDimSize(0)) {
+    llvm::SmallVector<mlir::OpFoldResult, 1> offsets{builder.getIndexAttr(0)};
+    llvm::SmallVector<mlir::OpFoldResult, 1> sizes{
+        builder.getIndexAttr(targetMemRef.getDimSize(0))};
+    llvm::SmallVector<mlir::OpFoldResult, 1> strides{builder.getIndexAttr(1)};
+    llvm::SmallVector<int64_t, 1> resultShape{targetMemRef.getDimSize(0)};
+    auto inferredType = mlir::cast<mlir::MemRefType>(
+        mlir::memref::SubViewOp::inferRankReducedResultType(
+            resultShape, sourceMemRef, offsets, sizes, strides));
+    mlir::Value view =
+        builder
+            .create<mlir::memref::SubViewOp>(op->getLoc(), inferredType,
+                                             source, offsets, sizes, strides)
+            .getResult();
+    if (view.getType() == targetMemRef)
+      return view;
+    return builder
+        .create<mlir::memref::CastOp>(op->getLoc(), targetMemRef, view)
+        .getResult();
+  }
+
+  return op->emitError() << label << " " << source.getType()
+                         << " cannot be viewed as " << targetType;
 }
 
 std::string defaultReprTypeName(llvm::StringRef contract) {
@@ -26,18 +93,322 @@ std::string defaultReprTypeName(llvm::StringRef contract) {
   return contract.str();
 }
 
+bool declaredRuntimeContractMatchesClass(mlir::ModuleOp module,
+                                         llvm::StringRef className) {
+  auto contracts =
+      module->getAttrOfType<mlir::ArrayAttr>(kManifestContractsAttr);
+  if (!contracts)
+    return false;
+  for (mlir::Attribute attr : contracts) {
+    auto contract = mlir::dyn_cast<mlir::StringAttr>(attr);
+    if (!contract)
+      continue;
+    llvm::StringRef value = contract.getValue();
+    if (value == className)
+      return true;
+    llvm::StringRef shortName = value.rsplit('.').second;
+    if (!shortName.empty() && shortName == className)
+      return true;
+  }
+  return false;
+}
+
+void appendClassContractCandidate(llvm::SmallVectorImpl<std::string> &out,
+                                  llvm::StringRef candidate) {
+  if (candidate.empty())
+    return;
+  if (llvm::any_of(out, [&](llvm::StringRef existing) {
+        return existing == candidate;
+      }))
+    return;
+  out.push_back(candidate.str());
+}
+
+llvm::SmallVector<std::string, 8>
+classContractCandidates(llvm::StringRef className) {
+  llvm::SmallVector<std::string, 8> candidates;
+  appendClassContractCandidate(candidates, className);
+  if (className.contains('.'))
+    return candidates;
+  appendClassContractCandidate(candidates,
+                               (llvm::Twine("builtins.") + className).str());
+  appendClassContractCandidate(candidates,
+                               (llvm::Twine("types.") + className).str());
+  appendClassContractCandidate(candidates,
+                               (llvm::Twine("_asyncio.") + className).str());
+  appendClassContractCandidate(candidates,
+                               (llvm::Twine("asyncio.") + className).str());
+  appendClassContractCandidate(candidates,
+                               (llvm::Twine("contextlib.") + className).str());
+  return candidates;
+}
+
+std::optional<std::string> nominalClassSymbolName(mlir::Operation *op,
+                                                  mlir::Type type) {
+  std::string name = runtimeContractName(type);
+  if (name.empty())
+    return std::nullopt;
+  if (py::type_object::lookup(op, name))
+    return name;
+  llvm::StringRef shortName = llvm::StringRef(name).rsplit('.').second;
+  if (!shortName.empty() && shortName != name &&
+      py::type_object::lookup(op, shortName))
+    return shortName.str();
+  return name;
+}
+
+bool moduleHasDeallocatorForContract(mlir::ModuleOp module,
+                                     llvm::StringRef contract) {
+  bool found = false;
+  module.walk([&](mlir::func::FuncOp function) {
+    if (found || !function->hasAttr(kManifestDeallocatorAttr))
+      return;
+    auto contractAttr =
+        function->getAttrOfType<mlir::StringAttr>(kManifestContractAttr);
+    found = contractAttr && contractAttr.getValue() == contract;
+  });
+  return found;
+}
+
+std::string sourceClassDeallocatorName(llvm::StringRef className) {
+  std::string name = "__ly_dealloc_";
+  for (char ch : className) {
+    unsigned char byte = static_cast<unsigned char>(ch);
+    name.push_back(std::isalnum(byte) ? ch : '_');
+  }
+  return name;
+}
+
+own::OwnershipKind
+normalizeRuntimeValueOwnership(mlir::Type contract,
+                               own::OwnershipKind requested) {
+  if (requested == own::OwnershipKind::Borrow)
+    return own::logicalOwnershipKind(contract, /*ownsObject=*/false);
+  if (requested == own::OwnershipKind::Own)
+    return own::logicalOwnershipKind(contract, /*ownsObject=*/true);
+  return own::logicalOwnershipKind(
+      contract, /*ownsObject=*/requested == own::OwnershipKind::Own);
+}
+
+mlir::func::FuncOp findObjectStorageReleaseToZero(mlir::ModuleOp module) {
+  mlir::func::FuncOp releaseToZero =
+      module.lookupSymbol<mlir::func::FuncOp>(kReleaseStorageToZeroName);
+  if (!releaseToZero)
+    return {};
+  mlir::FunctionType type = releaseToZero.getFunctionType();
+  if (type.getNumInputs() != 1 || type.getNumResults() != 1 ||
+      !type.getResult(0).isInteger(1) || !isRankOneI64MemRef(type.getInput(0)))
+    return {};
+  return releaseToZero;
+}
+
+mlir::FailureOr<mlir::Value>
+storageForReleaseToZero(mlir::Operation *op, mlir::OpBuilder &builder,
+                        mlir::Value storage, mlir::Type targetType) {
+  if (storage.getType() == targetType)
+    return storage;
+  auto sourceMemRef = mlir::dyn_cast<mlir::MemRefType>(storage.getType());
+  auto targetMemRef = mlir::dyn_cast<mlir::MemRefType>(targetType);
+  if (!sourceMemRef || !targetMemRef || sourceMemRef.getRank() != 1 ||
+      targetMemRef.getRank() != 1 ||
+      sourceMemRef.getElementType() != targetMemRef.getElementType() ||
+      sourceMemRef.getMemorySpace() != targetMemRef.getMemorySpace())
+    return op->emitError() << "source class storage " << storage.getType()
+                           << " cannot be released through " << targetType;
+  return builder
+      .create<mlir::memref::CastOp>(op->getLoc(), targetType, storage)
+      .getResult();
+}
+
+llvm::SmallVector<mlir::Value, 4>
+entryArgumentSlice(mlir::Block &entry, unsigned offset, unsigned count) {
+  llvm::SmallVector<mlir::Value, 4> values;
+  values.reserve(count);
+  for (unsigned index = 0; index < count; ++index)
+    values.push_back(entry.getArgument(offset + index));
+  return values;
+}
+
+void initializeObjectHeader(mlir::OpBuilder &builder, mlir::Location loc,
+                            mlir::Value header, std::int64_t refcount,
+                            std::int64_t classId) {
+  auto memref = mlir::dyn_cast<mlir::MemRefType>(header.getType());
+  if (!memref || memref.getRank() != 1)
+    return;
+  auto element = mlir::dyn_cast<mlir::IntegerType>(memref.getElementType());
+  if (!element || element.getWidth() != 64)
+    return;
+  if (memref.hasStaticShape() && memref.getDimSize(0) < 2)
+    return;
+
+  mlir::Value zeroIndex = builder.create<mlir::arith::ConstantIndexOp>(loc, 0);
+  mlir::Value oneIndex = builder.create<mlir::arith::ConstantIndexOp>(loc, 1);
+  mlir::Value refcountValue =
+      builder.create<mlir::arith::ConstantIntOp>(loc, refcount, 64);
+  mlir::Value classIdValue =
+      builder.create<mlir::arith::ConstantIntOp>(loc, classId, 64);
+  builder.create<mlir::memref::StoreOp>(loc, refcountValue, header, zeroIndex);
+  builder.create<mlir::memref::StoreOp>(loc, classIdValue, header, oneIndex);
+  if (!memref.hasStaticShape() || memref.getDimSize(0) >= 4) {
+    mlir::Value zeroValue =
+        builder.create<mlir::arith::ConstantIntOp>(loc, 0, 64);
+    mlir::Value payloadHeaderIndex =
+        builder.create<mlir::arith::ConstantIndexOp>(loc, 2);
+    mlir::Value payloadClassIndex =
+        builder.create<mlir::arith::ConstantIndexOp>(loc, 3);
+    builder.create<mlir::memref::StoreOp>(loc, zeroValue, header,
+                                          payloadHeaderIndex);
+    builder.create<mlir::memref::StoreOp>(loc, zeroValue, header,
+                                          payloadClassIndex);
+  }
+}
+
 } // namespace
 
-RuntimeValue RuntimeValue::object(mlir::Type contract,
-                                  mlir::ValueRange values) {
+std::optional<std::int64_t>
+RuntimeBundleLowerer::runtimeClassIdForClass(py::ClassOp classOp) const {
+  if (!classOp)
+    return std::nullopt;
+
+  llvm::StringRef className = classOp.getSymName();
+  for (const std::string &candidate : classContractCandidates(className))
+    if (std::optional<std::int64_t> classId = manifest.classId(candidate))
+      return classId;
+
+  if (auto attr =
+          classOp->getAttrOfType<mlir::IntegerAttr>(kManifestClassIdAttr))
+    return attr.getValue().getSExtValue();
+
+  constexpr std::int64_t kSourceClassIdBase = 1LL << 32;
+  mlir::ModuleOp mutableModule =
+      const_cast<RuntimeBundleLowerer *>(this)->module;
+  std::optional<std::int64_t> result;
+  std::int64_t ordinal = 0;
+  mutableModule.walk([&](py::ClassOp current) {
+    if (result)
+      return;
+    bool hasDeclaredRuntimeId =
+        current->getAttrOfType<mlir::IntegerAttr>(kManifestClassIdAttr) !=
+        nullptr;
+    for (const std::string &candidate :
+         classContractCandidates(current.getSymName())) {
+      if (manifest.classId(candidate)) {
+        hasDeclaredRuntimeId = true;
+        break;
+      }
+    }
+
+    if (current.getOperation() == classOp.getOperation()) {
+      result = kSourceClassIdBase + ordinal;
+      return;
+    }
+    if (!hasDeclaredRuntimeId)
+      ++ordinal;
+  });
+  return result;
+}
+
+std::optional<std::int64_t>
+RuntimeBundleLowerer::runtimeClassIdForContract(mlir::Type type) const {
+  std::string contract = runtimeContractName(type);
+  if (!contract.empty())
+    if (std::optional<std::int64_t> classId = manifest.classId(contract))
+      return classId;
+  if (py::ClassOp classOp = RuntimeBundleLowerer::classForContract(type))
+    return RuntimeBundleLowerer::runtimeClassIdForClass(classOp);
+  return std::nullopt;
+}
+
+mlir::FailureOr<llvm::SmallVector<std::int64_t, 8>>
+RuntimeBundleLowerer::runtimeClassIdsForNominalTarget(
+    mlir::Operation *op, mlir::Type targetType) const {
+  std::optional<std::string> targetName =
+      nominalClassSymbolName(op, targetType);
+  if (!targetName)
+    return op->emitError() << "class test target has no nominal class: "
+                           << targetType;
+  if (!py::type_object::lookup(op, *targetName))
+    return op->emitError() << "class test target has no class schema: "
+                           << *targetName;
+
+  llvm::SmallVector<std::int64_t, 8> ids;
+  auto appendId = [&](std::int64_t id) {
+    if (!llvm::is_contained(ids, id))
+      ids.push_back(id);
+  };
+
+  if (std::optional<std::int64_t> direct =
+          RuntimeBundleLowerer::runtimeClassIdForContract(targetType))
+    appendId(*direct);
+
+  mlir::LogicalResult status = mlir::success();
+  mlir::ModuleOp mutableModule =
+      const_cast<RuntimeBundleLowerer *>(this)->module;
+  mutableModule.walk([&](py::ClassOp classOp) {
+    if (mlir::failed(status))
+      return;
+    llvm::StringRef derivedName = classOp.getSymName();
+    bool matches = derivedName == *targetName;
+    if (!matches) {
+      mlir::FailureOr<bool> subclass =
+          py::type_object::isSubclassOf(op, derivedName, *targetName);
+      if (mlir::failed(subclass)) {
+        status = mlir::failure();
+        return;
+      }
+      matches = *subclass;
+    }
+    if (!matches)
+      return;
+
+    std::optional<std::int64_t> classId =
+        RuntimeBundleLowerer::runtimeClassIdForClass(classOp);
+    if (!classId) {
+      op->emitError() << "class schema '" << classOp.getSymName()
+                      << "' has no runtime class id";
+      status = mlir::failure();
+      return;
+    }
+    appendId(*classId);
+  });
+
+  if (mlir::failed(status))
+    return mlir::failure();
+  if (ids.empty())
+    return op->emitError() << "class test target has no runtime class ids: "
+                           << *targetName;
+  return ids;
+}
+
+RuntimeValue RuntimeValue::object(mlir::Type contract, mlir::ValueRange values,
+                                  bool ownsObject) {
+  return RuntimeValue::objectWithOwnership(
+      contract, values, own::logicalOwnershipKind(contract, ownsObject));
+}
+
+RuntimeValue
+RuntimeValue::objectWithOwnership(mlir::Type contract, mlir::ValueRange values,
+                                  own::OwnershipKind ownership) {
   RuntimeValue value;
   value.contract = contract;
   value.values.append(values.begin(), values.end());
+  value.ownership = normalizeRuntimeValueOwnership(contract, ownership);
   return value;
 }
 
 std::string RuntimeValue::contractName() const {
   return runtimeContractName(contract);
+}
+
+RuntimeValue
+RuntimeValue::withOwnership(own::OwnershipKind ownership) const {
+  RuntimeValue value = *this;
+  value.ownership = normalizeRuntimeValueOwnership(contract, ownership);
+  return value;
+}
+
+RuntimeValue RuntimeValue::withLogicalOwnership(bool ownsObject) const {
+  return withOwnership(own::logicalOwnershipKind(contract, ownsObject));
 }
 
 const RuntimeValue *RuntimeObjectEvidence::slot(llvm::StringRef name) const {
@@ -70,10 +441,18 @@ void RuntimeObjectEvidence::eraseFlag(llvm::StringRef name) {
 
 RuntimeBundle RuntimeBundle::object(mlir::Type contract,
                                     mlir::ValueRange values) {
+  return RuntimeBundle::objectWithOwnership(
+      contract, values, own::logicalOwnershipKind(contract, true));
+}
+
+RuntimeBundle
+RuntimeBundle::objectWithOwnership(mlir::Type contract, mlir::ValueRange values,
+                                   own::OwnershipKind ownership) {
   RuntimeBundle bundle;
   bundle.kind = Kind::Object;
   bundle.contract = contract;
-  bundle.objectValue = RuntimeValue::object(contract, values);
+  bundle.objectValue =
+      RuntimeValue::objectWithOwnership(contract, values, ownership);
   return bundle;
 }
 
@@ -112,19 +491,27 @@ void RuntimeBundle::copyEvidenceFrom(const RuntimeBundle &source) {
   functionTarget = source.functionTarget;
   closureValues = source.closureValues;
   callableAlternatives = source.callableAlternatives;
+  boundMethodReceiver = source.boundMethodReceiver;
+  boundMethodName = source.boundMethodName;
   coroutineTarget = source.coroutineTarget;
   coroutineSources = source.coroutineSources;
+  coroutineSourceBundles = source.coroutineSourceBundles;
   primitiveI64 = source.primitiveI64;
   buffer = source.buffer;
   ctypes = source.ctypes;
   objectEvidence = source.objectEvidence;
   fieldBundles = source.fieldBundles;
+  boxedObject = source.boxedObject;
   sequenceElementBundles = source.sequenceElementBundles;
   sequenceElements = source.sequenceElements;
   sequenceIndices = source.sequenceIndices;
+  sequenceCapacity = source.sequenceCapacity;
   mappingKeys = source.mappingKeys;
+  mappingKeyBundles = source.mappingKeyBundles;
   mappingValues = source.mappingValues;
+  mappingValueBundles = source.mappingValueBundles;
   mappingPresent = source.mappingPresent;
+  mappingCapacity = source.mappingCapacity;
 }
 
 llvm::ArrayRef<mlir::Value> RuntimeBundle::physicalValues() const {
@@ -141,7 +528,25 @@ std::string RuntimeBundle::instanceContractName() const {
   return runtimeContractName(instanceContract);
 }
 
-bool RuntimeBundleLowerer::isBuiltinsObjectHeaderType(mlir::Type type) const {
+void RuntimeBundle::setObjectOwnership(own::OwnershipKind ownership) {
+  if (kind != Kind::Object)
+    return;
+  objectValue = objectValue.withOwnership(ownership);
+}
+
+void RuntimeBundle::setObjectLogicalOwnership(bool ownsObject) {
+  setObjectOwnership(own::logicalOwnershipKind(objectValue.contract,
+                                               ownsObject));
+}
+
+RuntimeBundle
+RuntimeBundle::withObjectOwnership(own::OwnershipKind ownership) const {
+  RuntimeBundle bundle = *this;
+  bundle.setObjectOwnership(ownership);
+  return bundle;
+}
+
+bool RuntimeBundleLowerer::isBuiltinsObjectHandleType(mlir::Type type) const {
   const RuntimeValueShape *shape = manifest.valueShape("builtins.object");
   return shape && shape->valueTypes.size() == 1 &&
          shape->valueTypes.front() == type;
@@ -154,6 +559,82 @@ bool RuntimeBundleLowerer::isErasedObjectStorageType(mlir::Type type) const {
     return false;
   auto integer = mlir::dyn_cast<mlir::IntegerType>(memRef.getElementType());
   return integer && integer.getWidth() == 64;
+}
+
+bool RuntimeBundleLowerer::isBuiltinsObjectContract(mlir::Type type) const {
+  return runtimeContractName(type) == "builtins.object";
+}
+
+const RuntimeBundle *RuntimeBundleLowerer::concreteObjectForOwnership(
+    const RuntimeBundle &bundle) const {
+  const RuntimeBundle *current = &bundle;
+  for (unsigned depth = 0; depth < 8; ++depth) {
+    if (!current || current->kind != RuntimeBundle::Kind::Object)
+      return current;
+    if (!RuntimeBundleLowerer::isBuiltinsObjectContract(current->contract))
+      return current;
+    if (!current->boxedObject)
+      return current;
+    current = current->boxedObject.get();
+  }
+  return current;
+}
+
+mlir::FailureOr<RuntimeBundle>
+RuntimeBundleLowerer::boxRuntimeObject(mlir::Operation *op,
+                                       const RuntimeBundle &source,
+                                       bool retainPayload) {
+  builder.setInsertionPoint(op);
+  return RuntimeBundleLowerer::boxRuntimeObjectAtCurrentInsertion(
+      op, source, retainPayload);
+}
+
+mlir::FailureOr<RuntimeBundle>
+RuntimeBundleLowerer::boxRuntimeObjectAtCurrentInsertion(
+    mlir::Operation *op, const RuntimeBundle &source, bool retainPayload) {
+  if (source.kind != RuntimeBundle::Kind::Object)
+    return op->emitError() << "only runtime object bundles can be boxed";
+  if (RuntimeBundleLowerer::isBuiltinsObjectContract(source.contract) &&
+      source.boxedObject)
+    return source;
+
+  RuntimeBundle concrete = source;
+  if (RuntimeBundleLowerer::hasLazyPrimitiveI64Object(concrete)) {
+    mlir::FailureOr<RuntimeValue> materialized =
+        RuntimeBundleLowerer::materializePrimitiveI64ObjectAtCurrentInsertion(
+            op, concrete);
+    if (mlir::failed(materialized))
+      return mlir::failure();
+    concrete.objectValue = *materialized;
+  }
+
+  mlir::Location loc = op->getLoc();
+  auto boxType = mlir::MemRefType::get({16}, builder.getI64Type());
+  mlir::Value box =
+      builder.create<mlir::memref::AllocOp>(loc, boxType).getResult();
+  box.getDefiningOp()->setAttr(own::kObjectHeaderAttr, builder.getUnitAttr());
+
+  mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
+      RuntimeBundleLowerer::objectPayloadHandleWords(op, concrete,
+                                                     retainPayload);
+  if (mlir::failed(words))
+    return mlir::failure();
+  for (auto [index, word] : llvm::enumerate(*words)) {
+    mlir::Value slot = builder.create<mlir::arith::ConstantIndexOp>(
+        loc, static_cast<std::int64_t>(index));
+    builder.create<mlir::memref::StoreOp>(loc, word, box, slot);
+  }
+  if (retainPayload &&
+      mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
+          op, concrete, "boxed.object.payload")))
+    return mlir::failure();
+  concrete.setObjectLogicalOwnership(retainPayload);
+
+  RuntimeBundle boxed = RuntimeBundle::object(
+      runtimeContractType(context, "builtins.object"),
+      mlir::ValueRange{box});
+  boxed.boxedObject = std::make_shared<RuntimeBundle>(std::move(concrete));
+  return boxed;
 }
 
 mlir::FailureOr<mlir::Value> RuntimeBundleLowerer::erasedObjectStorageView(
@@ -185,32 +666,24 @@ mlir::FailureOr<mlir::Value> RuntimeBundleLowerer::erasedObjectStorageView(
 }
 
 mlir::FailureOr<mlir::Value>
-RuntimeBundleLowerer::objectHeaderView(mlir::Operation *op,
-                                       const RuntimeValue &value) {
-  const RuntimeValueShape *shape = manifest.valueShape("builtins.object");
-  if (!shape)
-    return op->emitError()
-           << "runtime manifest has no ABI shape for builtins.object";
-  if (shape->valueTypes.size() != 1)
-    return op->emitError()
-           << "builtins.object ABI must expose exactly one header value";
+RuntimeBundleLowerer::objectPhysicalHeader(mlir::Operation *op,
+                                           const RuntimeValue &value) {
   if (value.values.empty())
     return op->emitError() << value.contractName()
                            << " runtime object has no physical header value";
 
-  mlir::Type headerType = shape->valueTypes.front();
   mlir::Value header = value.values.front();
-  if (header.getType() == headerType)
-    return header;
-  if (compatibleMemRefView(header.getType(), headerType))
-    return builder
-        .create<mlir::memref::CastOp>(op->getLoc(), headerType, header)
-        .getResult();
-
-  return op->emitError() << value.contractName() << " physical header "
-                         << header.getType()
-                         << " cannot be viewed as builtins.object header "
-                         << headerType;
+  auto headerType = mlir::dyn_cast<mlir::MemRefType>(header.getType());
+  if (!headerType || !isRankOneI64MemRef(header.getType()))
+    return op->emitError() << value.contractName()
+                           << " runtime object header has invalid type "
+                           << header.getType();
+  if (headerType.hasStaticShape() && headerType.getDimSize(0) < 2)
+    return op->emitError() << value.contractName()
+                           << " runtime object header must expose refcount "
+                              "and class-id slots, got "
+                           << header.getType();
+  return header;
 }
 
 mlir::FailureOr<mlir::Value>
@@ -271,7 +744,216 @@ mlir::FailureOr<RuntimeValue> RuntimeBundleLowerer::materializeDeadObjectValue(
       return mlir::failure();
     values.push_back(*value);
   }
+  if (!values.empty())
+    initializeObjectHeader(builder, op->getLoc(), values.front(),
+                           std::numeric_limits<std::int64_t>::max(),
+                           /*classId=*/0);
   return RuntimeValue::object(contract, values);
+}
+
+mlir::FailureOr<RuntimeValue> RuntimeBundleLowerer::materializeClassObjectValue(
+    mlir::Operation *op, py::ClassOp classOp, mlir::Type contract,
+    llvm::StringRef purpose) {
+  const RuntimeValueShape *objectShape = manifest.valueShape("builtins.object");
+  if (!objectShape || objectShape->valueTypes.size() != 1)
+    return op->emitError()
+           << "runtime manifest has no single-value builtins.object ABI shape "
+              "for "
+           << purpose;
+
+  auto headerType =
+      mlir::dyn_cast<mlir::MemRefType>(objectShape->valueTypes.front());
+  if (!headerType || headerType.getRank() != 1 ||
+      !headerType.hasStaticShape() || headerType.getDimSize(0) < 2)
+    return op->emitError() << "builtins.object ABI handle shape is invalid for "
+                           << purpose << ": "
+                           << objectShape->valueTypes.front();
+
+  mlir::Location loc = op->getLoc();
+  llvm::SmallVector<std::int64_t, 1> shape(headerType.getShape().begin(),
+                                           headerType.getShape().end());
+  mlir::MemRefType allocType = mlir::MemRefType::get(
+      shape, headerType.getElementType(), mlir::MemRefLayoutAttrInterface{},
+      headerType.getMemorySpace());
+  mlir::Value allocated =
+      builder.create<mlir::memref::AllocOp>(loc, allocType).getResult();
+  mlir::Value header = allocated;
+  if (allocated.getType() != headerType)
+    header = builder.create<mlir::memref::CastOp>(loc, headerType, allocated)
+                 .getResult();
+
+  std::optional<std::int64_t> classId =
+      RuntimeBundleLowerer::runtimeClassIdForClass(classOp);
+  if (!classId)
+    return op->emitError() << "class " << classOp.getSymName()
+                           << " has no runtime class id for " << purpose;
+  initializeObjectHeader(builder, loc, header, /*refcount=*/1,
+                         /*classId=*/ *classId);
+
+  llvm::SmallVector<mlir::Type, 8> fieldContractTypes =
+      RuntimeBundleLowerer::classFieldContractTypes(classOp);
+  mlir::Value zeroI64 = builder.create<mlir::arith::ConstantIntOp>(loc, 0, 64);
+  for (auto [fieldIndex, fieldType] : llvm::enumerate(fieldContractTypes)) {
+    if (runtimeContractName(fieldType) != "builtins.int")
+      continue;
+    unsigned slot = kPrimitiveFieldSlotBase + static_cast<unsigned>(fieldIndex);
+    if (slot >= kPrimitiveFieldSlotLimit)
+      continue;
+    mlir::Value slotIndex =
+        builder.create<mlir::arith::ConstantIndexOp>(loc, slot);
+    builder.create<mlir::memref::StoreOp>(loc, zeroI64, header, slotIndex);
+  }
+
+  llvm::SmallVector<mlir::Value, 8> values{header};
+  for (mlir::Type fieldType : fieldContractTypes) {
+    mlir::FailureOr<RuntimeValue> fieldValue =
+        RuntimeBundleLowerer::materializeDeadObjectValue(op, fieldType,
+                                                         purpose);
+    if (mlir::failed(fieldValue))
+      return mlir::failure();
+    values.append(fieldValue->values.begin(), fieldValue->values.end());
+  }
+
+  return RuntimeValue::object(contract, values);
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassDeallocators() {
+  struct Plan {
+    py::ClassOp classOp;
+    mlir::func::FuncOp function;
+    std::string contract;
+    llvm::SmallVector<mlir::Type, 8> fieldTypes;
+    llvm::SmallVector<unsigned, 8> fieldOffsets;
+  };
+
+  const RuntimeValueShape *objectShape = manifest.valueShape("builtins.object");
+  if (!objectShape || objectShape->valueTypes.size() != 1)
+    return module.emitError()
+           << "runtime manifest has no single-value builtins.object ABI shape "
+              "for source class deallocators";
+  unsigned objectHeaderValues =
+      static_cast<unsigned>(objectShape->valueTypes.size());
+
+  llvm::SmallVector<py::ClassOp, 8> classes;
+  module.walk([&](py::ClassOp classOp) { classes.push_back(classOp); });
+
+  llvm::SmallVector<Plan, 8> plans;
+  for (py::ClassOp classOp : classes) {
+    std::string contract = classOp.getSymName().str();
+    if (contract.empty())
+      continue;
+    if (declaredRuntimeContractMatchesClass(module, contract))
+      continue;
+    if (moduleHasDeallocatorForContract(module, contract))
+      continue;
+
+    mlir::Type contractType = runtimeContractType(context, contract);
+    mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> valueTypes =
+        RuntimeBundleLowerer::runtimeValueTypesFor(
+            classOp, contractType, "source class deallocator ABI");
+    if (mlir::failed(valueTypes))
+      return mlir::failure();
+    if (valueTypes->empty())
+      return classOp.emitError()
+             << "source class deallocator ABI has no object header";
+
+    llvm::SmallVector<mlir::Type, 8> fieldTypes =
+        RuntimeBundleLowerer::classFieldContractTypes(classOp);
+    llvm::SmallVector<unsigned, 8> fieldOffsets;
+    unsigned offset = objectHeaderValues;
+    fieldOffsets.reserve(fieldTypes.size());
+    for (mlir::Type fieldType : fieldTypes) {
+      fieldOffsets.push_back(offset);
+      mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> fieldValueTypes =
+          RuntimeBundleLowerer::runtimeValueTypesFor(
+              classOp, fieldType, "source class field deallocator ABI");
+      if (mlir::failed(fieldValueTypes))
+        return mlir::failure();
+      offset += static_cast<unsigned>(fieldValueTypes->size());
+    }
+    if (offset != valueTypes->size())
+      return classOp.emitError()
+             << "source class deallocator ABI field layout for " << contract
+             << " does not match class object ABI";
+
+    std::string baseName = sourceClassDeallocatorName(contract);
+    std::string functionName = baseName;
+    for (unsigned suffix = 1;
+         module.lookupSymbol<mlir::func::FuncOp>(functionName); ++suffix)
+      functionName = baseName + "_" + std::to_string(suffix);
+
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToEnd(module.getBody());
+    auto functionType = builder.getFunctionType(*valueTypes, {});
+    mlir::func::FuncOp function = builder.create<mlir::func::FuncOp>(
+        module.getLoc(), functionName, functionType);
+    function.setPrivate();
+    function->setAttr(kManifestContractAttr, builder.getStringAttr(contract));
+    function->setAttr(kManifestDeallocatorAttr, builder.getUnitAttr());
+    function->setAttr(own::kReleaseArgsAttr,
+                      mlir::DenseI64ArrayAttr::get(context, {0}));
+    function.setArgAttr(0, own::kObjectHeaderAttr, builder.getUnitAttr());
+
+    plans.push_back(Plan{classOp, function, std::move(contract),
+                         std::move(fieldTypes), std::move(fieldOffsets)});
+  }
+
+  if (plans.empty())
+    return mlir::success();
+
+  mlir::func::FuncOp releaseToZero = findObjectStorageReleaseToZero(module);
+  if (!releaseToZero)
+    return module.emitError() << "source class deallocators require a runtime "
+                                 "LyObject_ReleaseStorageToZero primitive";
+
+  llvm::SmallVector<own::RuntimeDeallocator, 8> deallocators =
+      own::collectRuntimeDeallocators(module);
+
+  for (Plan &plan : plans) {
+    mlir::Block *entry = plan.function.addEntryBlock();
+    mlir::Block *deallocBlock = plan.function.addBlock();
+    mlir::Block *doneBlock = plan.function.addBlock();
+    mlir::Location loc = plan.function.getLoc();
+
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(entry);
+    mlir::FailureOr<mlir::Value> storage =
+        storageForReleaseToZero(plan.function, builder, entry->getArgument(0),
+                                releaseToZero.getFunctionType().getInput(0));
+    if (mlir::failed(storage))
+      return mlir::failure();
+    mlir::func::CallOp releaseHeader = builder.create<mlir::func::CallOp>(
+        loc, releaseToZero, mlir::ValueRange{*storage});
+    builder.create<mlir::cf::CondBranchOp>(loc, releaseHeader.getResult(0),
+                                           deallocBlock, doneBlock);
+
+    builder.setInsertionPointToStart(deallocBlock);
+    for (auto [index, fieldType] : llvm::enumerate(plan.fieldTypes)) {
+      mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> fieldValueTypes =
+          RuntimeBundleLowerer::runtimeValueTypesFor(
+              plan.function, fieldType, "source class field deallocator ABI");
+      if (mlir::failed(fieldValueTypes))
+        return mlir::failure();
+      llvm::SmallVector<mlir::Value, 4> fieldValues =
+          entryArgumentSlice(*entry, plan.fieldOffsets[index],
+                             static_cast<unsigned>(fieldValueTypes->size()));
+      if (mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
+              plan.function, fieldType, fieldValues, "class.field",
+              deallocators, /*depth=*/0)))
+        return mlir::failure();
+    }
+
+    auto dealloc =
+        builder.create<mlir::memref::DeallocOp>(loc, entry->getArgument(0));
+    dealloc->setAttr(own::kObjectDeallocPartAttr,
+                     builder.getStringAttr("header"));
+    builder.create<mlir::cf::BranchOp>(loc, doneBlock);
+
+    builder.setInsertionPointToStart(doneBlock);
+    builder.create<mlir::func::ReturnOp>(loc);
+  }
+
+  return mlir::success();
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::materializeStringObject(
@@ -308,8 +990,17 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultObjectRepr(
 
   builder.setInsertionPoint(op);
   mlir::FailureOr<mlir::Value> header =
-      RuntimeBundleLowerer::objectHeaderView(op, object.objectValue);
+      RuntimeBundleLowerer::objectPhysicalHeader(op, object.objectValue);
   if (mlir::failed(header))
+    return mlir::failure();
+  mlir::FunctionType primitiveType = primitive->function.getFunctionType();
+  if (primitiveType.getNumInputs() < 1)
+    return primitive->function.emitError()
+           << "builtins.object default_repr primitive must accept an object "
+              "header";
+  mlir::FailureOr<mlir::Value> headerView = viewRankOneI64Prefix(
+      op, builder, *header, primitiveType.getInput(0), "default repr header");
+  if (mlir::failed(headerView))
     return mlir::failure();
 
   std::string prefix = "<";
@@ -325,9 +1016,9 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultObjectRepr(
 
   mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
       op->getLoc(), *primitive,
-      mlir::ValueRange{*header, prefixBytes, prefixLength});
+      mlir::ValueRange{*headerView, prefixBytes, prefixLength});
   return RuntimeBundleLowerer::bundleRuntimeResults(
       op, runtimeContractType(context, "builtins.str"), call, bundle);
 }
 
-} // namespace py::runtime_lowering
+} // namespace py::lowering

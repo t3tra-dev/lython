@@ -19,6 +19,7 @@ struct IRDumpConfig {
 
 mlir::LogicalResult runLoweringPipeline(mlir::ModuleOp module,
                                         TensorLoweringTarget tensorTarget,
-                                        const IRDumpConfig &irDump);
+                                        const IRDumpConfig &irDump,
+                                        bool auditRuntimeManifest = false);
 
 } // namespace py

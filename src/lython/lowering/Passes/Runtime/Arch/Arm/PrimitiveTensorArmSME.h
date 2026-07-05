@@ -9,7 +9,7 @@
 
 #include <memory>
 
-namespace py::runtime_lowering::arch::arm {
+namespace py::lowering::arch::arm {
 
 bool usesSME(const py::TensorLoweringTarget &target);
 
@@ -24,4 +24,4 @@ void addSMEPreControlFlowLLVMPrepPipeline(mlir::OpPassManager &pipeline);
 
 void addSMEPostControlFlowLLVMPrepPipeline(mlir::OpPassManager &pipeline);
 
-} // namespace py::runtime_lowering::arch::arm
+} // namespace py::lowering::arch::arm

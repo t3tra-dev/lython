@@ -2,7 +2,7 @@
 
 #include <functional>
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 
 mlir::LogicalResult RuntimeBundleLowerer::collectSingleBuiltinArgument(
     py::CallOp op, const RuntimeSymbol &symbol,
@@ -36,22 +36,26 @@ RuntimeBundleLowerer::lowerBuiltinMethodCall(py::CallOp op,
   const RuntimeBundle *argument = nullptr;
   if (mlir::failed(collectSingleBuiltinArgument(op, symbol, argument)))
     return mlir::failure();
+  const RuntimeBundle *receiver =
+      RuntimeBundleLowerer::concreteObjectForOwnership(*argument);
+  if (!receiver)
+    receiver = argument;
 
   if (symbol.builtinName == "repr" && symbol.builtinMethod == "__repr__" &&
-      RuntimeBundleLowerer::needsDefaultObjectRepr(*argument)) {
+      RuntimeBundleLowerer::needsDefaultObjectRepr(*receiver)) {
     RuntimeBundle result;
     if (mlir::failed(RuntimeBundleLowerer::materializeDefaultObjectRepr(
-            op, *argument, result)))
+            op, *receiver, result)))
       return mlir::failure();
     valueBundles[op.getResult(0)] = std::move(result);
     erase.push_back(op);
     return mlir::success();
   }
 
-  llvm::SmallVector<const RuntimeBundle *, 1> sources{argument};
+  llvm::SmallVector<const RuntimeBundle *, 1> sources{receiver};
   std::optional<EmittedRuntimeCall> emitted;
   if (mlir::failed(RuntimeBundleLowerer::emitManifestMethodCall(
-          op, *argument, symbol.builtinMethod, sources,
+          op, *receiver, symbol.builtinMethod, sources,
           /*allowUnusedSources=*/false, emitted)))
     return mlir::failure();
 
@@ -119,20 +123,59 @@ RuntimeBundleLowerer::lowerBuiltinMethodSinkCall(py::CallOp op,
   const RuntimeBundle *argument = nullptr;
   if (mlir::failed(collectSingleBuiltinArgument(op, symbol, argument)))
     return mlir::failure();
+  const RuntimeBundle *sinkArgument =
+      RuntimeBundleLowerer::concreteObjectForOwnership(*argument);
+  if (!sinkArgument)
+    sinkArgument = argument;
 
-  RuntimeBundle printable = *argument;
+  RuntimeBundle printable = *sinkArgument;
+  auto assignSinkResults = [&]() -> mlir::LogicalResult {
+    std::string resultContract =
+        symbol.resultContract.empty() ? "types.NoneType" : symbol.resultContract;
+    for (mlir::Value result : op.getResults()) {
+      if (mlir::failed(assignObjectBundle(
+              op, result, runtimeContractType(context, resultContract), {})))
+        return mlir::failure();
+    }
+    erase.push_back(op);
+    return mlir::success();
+  };
+
+  if (symbol.builtinName == "print" && symbol.builtinMethod == "__repr__" &&
+      symbol.builtinSinkContract == "builtins.str" &&
+      printable.contractName() == "builtins.object") {
+    std::optional<RuntimeSymbol> objectPrint =
+        manifest.primitive("builtins.object", "print_line");
+    if (!objectPrint)
+      return op.emitError()
+             << "runtime manifest has no builtins.object.print_line primitive";
+    llvm::SmallVector<const RuntimeBundle *, 1> sources{&printable};
+    llvm::SmallVector<mlir::Value, 1> operands;
+    builder.setInsertionPoint(op);
+    if (mlir::failed(buildRuntimeCallOperands(op, *objectPrint, sources,
+                                              operands,
+                                              /*allowUnusedSources=*/false)))
+      return mlir::failure();
+    RuntimeBundleLowerer::createRuntimeCall(op.getLoc(), *objectPrint,
+                                            operands);
+    return assignSinkResults();
+  }
+
   if (printable.contractName() != symbol.builtinSinkContract &&
       symbol.builtinMethod == "__repr__" &&
       symbol.builtinSinkContract == "builtins.str") {
     auto renderRepr =
         [&](auto &&self,
             const RuntimeBundle &bundle) -> std::optional<std::string> {
-      if (bundle.literalText && bundle.contractName() == "builtins.str")
-        return *bundle.literalText;
-      if (!bundle.sequenceElementBundles.empty()) {
+      const RuntimeBundle *resolved =
+          RuntimeBundleLowerer::concreteObjectForOwnership(bundle);
+      const RuntimeBundle &view = resolved ? *resolved : bundle;
+      if (view.literalText && view.contractName() == "builtins.str")
+        return *view.literalText;
+      if (!view.sequenceElementBundles.empty()) {
         std::string text = "[";
         for (auto [index, element] :
-             llvm::enumerate(bundle.sequenceElementBundles)) {
+             llvm::enumerate(view.sequenceElementBundles)) {
           if (index)
             text += ", ";
           if (!element)
@@ -145,17 +188,17 @@ RuntimeBundleLowerer::lowerBuiltinMethodSinkCall(py::CallOp op,
         text += "]";
         return text;
       }
-      if (!bundle.fieldBundles.empty() &&
-          RuntimeBundleLowerer::classDefinesMethod(bundle.contract,
+      if (!view.fieldBundles.empty() &&
+          RuntimeBundleLowerer::classDefinesMethod(view.contract,
                                                    "__repr__")) {
-        std::string contractName = bundle.contractName();
+        std::string contractName = view.contractName();
         llvm::StringRef contract(contractName);
         std::string text = contract.rsplit('.').second.str();
         if (text.empty())
           text = contract.str();
         text += "(";
         llvm::SmallVector<llvm::StringRef, 4> names;
-        for (const auto &entry : bundle.fieldBundles)
+        for (const auto &entry : view.fieldBundles)
           names.push_back(entry.getKey());
         llvm::sort(names);
         for (auto [index, name] : llvm::enumerate(names)) {
@@ -163,8 +206,8 @@ RuntimeBundleLowerer::lowerBuiltinMethodSinkCall(py::CallOp op,
             text += ", ";
           text += name.str();
           text += "=";
-          auto field = bundle.fieldBundles.find(name);
-          if (field == bundle.fieldBundles.end() || !field->second)
+          auto field = view.fieldBundles.find(name);
+          if (field == view.fieldBundles.end() || !field->second)
             return std::nullopt;
           std::optional<std::string> rendered = self(self, *field->second);
           if (!rendered)
@@ -224,16 +267,19 @@ RuntimeBundleLowerer::lowerBuiltinMethodSinkCall(py::CallOp op,
           renderDynamicRepr =
               [&](const RuntimeBundle &bundle,
                   RuntimeBundle &result) -> mlir::LogicalResult {
-        if (bundle.literalText && bundle.contractName() == "builtins.str")
+        const RuntimeBundle *resolved =
+            RuntimeBundleLowerer::concreteObjectForOwnership(bundle);
+        const RuntimeBundle &view = resolved ? *resolved : bundle;
+        if (view.literalText && view.contractName() == "builtins.str")
           return RuntimeBundleLowerer::materializeStringObject(
-              op, *bundle.literalText, result);
+              op, *view.literalText, result);
 
-        if (!bundle.sequenceElementBundles.empty()) {
+        if (!view.sequenceElementBundles.empty()) {
           if (mlir::failed(RuntimeBundleLowerer::materializeStringObject(
                   op, "[", result)))
             return mlir::failure();
           for (auto [index, element] :
-               llvm::enumerate(bundle.sequenceElementBundles)) {
+               llvm::enumerate(view.sequenceElementBundles)) {
             if (index && mlir::failed(appendText(result, ", ")))
               return mlir::failure();
             RuntimeBundle elementRepr;
@@ -251,14 +297,14 @@ RuntimeBundleLowerer::lowerBuiltinMethodSinkCall(py::CallOp op,
           return appendText(result, "]");
         }
 
-        if (RuntimeBundleLowerer::needsDefaultObjectRepr(bundle))
-          return RuntimeBundleLowerer::materializeDefaultObjectRepr(op, bundle,
+        if (RuntimeBundleLowerer::needsDefaultObjectRepr(view))
+          return RuntimeBundleLowerer::materializeDefaultObjectRepr(op, view,
                                                                     result);
 
-        llvm::SmallVector<const RuntimeBundle *, 1> sources{&bundle};
+        llvm::SmallVector<const RuntimeBundle *, 1> sources{&view};
         std::optional<EmittedRuntimeCall> emitted;
         if (mlir::failed(emitManifestMethodCall(
-                op, bundle, symbol.builtinMethod, sources,
+                op, view, symbol.builtinMethod, sources,
                 /*allowUnusedSources=*/false, emitted)))
           return mlir::failure();
         return bundleRuntimeResults(
@@ -274,15 +320,17 @@ RuntimeBundleLowerer::lowerBuiltinMethodSinkCall(py::CallOp op,
   }
   if (printable.contractName() != symbol.builtinSinkContract) {
     if (symbol.builtinMethod == "__repr__" &&
-        RuntimeBundleLowerer::needsDefaultObjectRepr(*argument)) {
+        RuntimeBundleLowerer::needsDefaultObjectRepr(printable)) {
+      RuntimeBundle rendered;
       if (mlir::failed(RuntimeBundleLowerer::materializeDefaultObjectRepr(
-              op, *argument, printable)))
+              op, printable, rendered)))
         return mlir::failure();
+      printable = std::move(rendered);
     } else {
-      llvm::SmallVector<const RuntimeBundle *, 1> sources{argument};
+      llvm::SmallVector<const RuntimeBundle *, 1> sources{&printable};
       std::optional<EmittedRuntimeCall> emitted;
       if (mlir::failed(emitManifestMethodCall(
-              op, *argument, symbol.builtinMethod, sources,
+              op, printable, symbol.builtinMethod, sources,
               /*allowUnusedSources=*/false, emitted)))
         return mlir::failure();
       if (mlir::failed(bundleRuntimeResults(
@@ -299,15 +347,7 @@ RuntimeBundleLowerer::lowerBuiltinMethodSinkCall(py::CallOp op,
   builder.setInsertionPoint(op);
   RuntimeBundleLowerer::createRuntimeCall(op.getLoc(), symbol,
                                           printable.physicalValues());
-  std::string resultContract =
-      symbol.resultContract.empty() ? "types.NoneType" : symbol.resultContract;
-  for (mlir::Value result : op.getResults()) {
-    if (mlir::failed(assignObjectBundle(
-            op, result, runtimeContractType(context, resultContract), {})))
-      return mlir::failure();
-  }
-  erase.push_back(op);
-  return mlir::success();
+  return assignSinkResults();
 }
 
-} // namespace py::runtime_lowering
+} // namespace py::lowering

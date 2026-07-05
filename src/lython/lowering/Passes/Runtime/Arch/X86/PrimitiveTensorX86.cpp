@@ -4,7 +4,7 @@
 #include "mlir/Target/LLVMIR/Dialect/X86Vector/X86VectorToLLVMIRTranslation.h"
 #include "mlir/Transforms/Passes.h"
 
-namespace py::runtime_lowering::arch::x86 {
+namespace py::lowering::arch::x86 {
 
 bool usesX86(const py::TensorLoweringTarget &target) {
   return target.usesX86();
@@ -34,4 +34,4 @@ void addX86LinalgPipeline(mlir::OpPassManager &pipeline) {
   pipeline.addPass(mlir::createCSEPass());
 }
 
-} // namespace py::runtime_lowering::arch::x86
+} // namespace py::lowering::arch::x86

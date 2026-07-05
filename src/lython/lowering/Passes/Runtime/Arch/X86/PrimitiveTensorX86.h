@@ -5,7 +5,7 @@
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/Pass/PassManager.h"
 
-namespace py::runtime_lowering::arch::x86 {
+namespace py::lowering::arch::x86 {
 
 bool usesX86(const py::TensorLoweringTarget &target);
 
@@ -19,4 +19,4 @@ void registerX86Translations(mlir::DialectRegistry &registry);
 
 void addX86LinalgPipeline(mlir::OpPassManager &pipeline);
 
-} // namespace py::runtime_lowering::arch::x86
+} // namespace py::lowering::arch::x86

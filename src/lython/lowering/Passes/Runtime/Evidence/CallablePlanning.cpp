@@ -1,8 +1,9 @@
 #include "Runtime/Core/Lowerer.h"
 
 #include "PyCallableShape.h"
+#include "PyProtocols.h"
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 
 namespace {
 
@@ -86,14 +87,38 @@ bool containsStaticParameter(mlir::Type type) {
            (callable.hasKwarg() &&
             containsStaticParameter(callable.getKwargType()));
   }
-  if (auto tuple = mlir::dyn_cast_if_present<py::TupleType>(type))
-    return llvm::any_of(tuple.getElementTypes(), containsStaticParameter);
-  if (auto list = mlir::dyn_cast_if_present<py::ListType>(type))
-    return containsStaticParameter(list.getElementType());
-  if (auto dict = mlir::dyn_cast_if_present<py::DictType>(type))
-    return containsStaticParameter(dict.getKeyType()) ||
-           containsStaticParameter(dict.getValueType());
   return false;
+}
+
+bool structuralProtocolArgumentAccepts(mlir::Type actual,
+                                       py::ProtocolType expected) {
+  const py::protocols::Table &table =
+      py::protocols::Table::get(*expected.getContext());
+  llvm::StringRef protocolName = expected.getProtocolName();
+  const py::protocols::ProtocolInfo *info = table.lookup(protocolName);
+  if (!info || !info->isProtocol)
+    return false;
+
+  if (std::optional<std::vector<mlir::Type>> args =
+          table.protocolArgumentsFor(actual, protocolName)) {
+    llvm::ArrayRef<mlir::Type> expectedArgs = expected.getArguments();
+    return expectedArgs.empty() || expectedArgs.size() == args->size();
+  }
+
+  return llvm::all_of(info->methods, [&](const auto &method) {
+    return !table.methodContractCandidatesWithEvidence(actual, method.first)
+                .empty();
+  });
+}
+
+bool callableArgumentAccepts(mlir::Type actual, mlir::Type expected,
+                             mlir::Operation *op, bool emitErrors) {
+  if (auto protocol = mlir::dyn_cast_if_present<py::ProtocolType>(expected))
+    if (structuralProtocolArgumentAccepts(actual, protocol))
+      return true;
+  if (emitErrors)
+    return py::isAssignableTo(actual, expected, op);
+  return py::isAssignableTo(actual, expected);
 }
 
 std::optional<CallableArgumentPlan>
@@ -124,9 +149,7 @@ buildCallableArgumentPlan(mlir::Operation *op, py::CallableType callable,
       [&](mlir::Type expected, mlir::Type actual) {
         if (containsStaticParameter(expected))
           return true;
-        if (emitErrors)
-          return py::isAssignableTo(actual, expected, op);
-        return py::isAssignableTo(actual, expected);
+        return callableArgumentAccepts(actual, expected, op, emitErrors);
       },
       [](const py::CallableKeyword &keyword) -> llvm::StringRef {
         return keyword.name;
@@ -568,6 +591,8 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeArityObject(
     if (mlir::failed(value))
       return mlir::failure();
     bundle = RuntimeBundle::object(value->contract, value->values);
+    bundle.sequenceCapacity =
+        RuntimeBundleLowerer::collectionInitialCapacity(arity);
     bundle.sequenceElements.append(elements.begin(), elements.end());
     bundle.mappingKeys.append(keys.begin(), keys.end());
     if (!keys.empty()) {
@@ -582,6 +607,8 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeArityObject(
       for (std::size_t index = 0; index < keys.size(); ++index)
         bundle.mappingPresent.push_back(present);
       bundle.sequenceElements.clear();
+      bundle.mappingCapacity =
+          RuntimeBundleLowerer::collectionInitialCapacity(keys.size());
     }
     return mlir::success();
   }
@@ -603,6 +630,8 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeArityObject(
   if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
           op, contract, call.getResults(), bundle)))
     return mlir::failure();
+  bundle.sequenceCapacity =
+      RuntimeBundleLowerer::collectionInitialCapacity(arity);
   bundle.sequenceElements.append(elements.begin(), elements.end());
   bundle.mappingKeys.append(keys.begin(), keys.end());
   if (!keys.empty()) {
@@ -616,6 +645,8 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeArityObject(
     for (std::size_t index = 0; index < keys.size(); ++index)
       bundle.mappingPresent.push_back(present);
     bundle.sequenceElements.clear();
+    bundle.mappingCapacity =
+        RuntimeBundleLowerer::collectionInitialCapacity(keys.size());
   }
   return mlir::success();
 }
@@ -627,4 +658,4 @@ RuntimeBundleLowerer::keywordNameFromValue(mlir::Value value) const {
   return std::nullopt;
 }
 
-} // namespace py::runtime_lowering
+} // namespace py::lowering

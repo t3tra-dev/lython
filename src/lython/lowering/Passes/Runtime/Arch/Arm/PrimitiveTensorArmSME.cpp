@@ -12,7 +12,7 @@
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Transforms/Passes.h"
 
-namespace py::runtime_lowering::arch::arm {
+namespace py::lowering::arch::arm {
 
 bool usesSME(const py::TensorLoweringTarget &target) {
   return target.usesArmSME();
@@ -70,4 +70,4 @@ void addSMEPostControlFlowLLVMPrepPipeline(mlir::OpPassManager &pipeline) {
   pipeline.addPass(mlir::createCSEPass());
 }
 
-} // namespace py::runtime_lowering::arch::arm
+} // namespace py::lowering::arch::arm

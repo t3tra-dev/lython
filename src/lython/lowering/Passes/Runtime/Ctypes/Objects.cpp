@@ -1,6 +1,6 @@
 #include "Runtime/Ctypes/Internal.h"
 
-namespace py::runtime_lowering {
+namespace py::lowering {
 
 using namespace ctypes;
 
@@ -554,4 +554,4 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesArrayTypeMul(
   return mlir::success();
 }
 
-} // namespace py::runtime_lowering
+} // namespace py::lowering
