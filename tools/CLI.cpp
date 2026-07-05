@@ -714,12 +714,6 @@ enum class LLVMSafetyContractCoverage {
 static constexpr llvm::StringLiteral kLythonSafetyMetadataName{"ly.safety"};
 static constexpr llvm::StringLiteral kLythonSafetyMetadataVersion{
     "ly.safety.v1"};
-// Atomics inside the pre-lowered runtime cache were verified by the full
-// pipeline when the cache was generated at build time. Their metadata is
-// sealed to this version so the per-compile verifier can recognize them
-// without confusing their stale contract ids with the current profile.
-static constexpr llvm::StringLiteral kLythonRuntimeSafetyMetadataVersion{
-    "ly.safety.runtime.v1"};
 static constexpr llvm::StringLiteral kPySafetyContractIdAttr{
     "py.safety_contract_id"};
 
@@ -982,21 +976,12 @@ std::optional<int64_t> getLythonSafetyMetadataId(llvm::Instruction &inst) {
   return intConstant->getSExtValue();
 }
 
-bool hasRuntimeVerifiedSafetyMetadata(llvm::Instruction &inst) {
-  llvm::MDNode *node = inst.getMetadata(kLythonSafetyMetadataName);
-  if (!node || node->getNumOperands() < 1)
-    return false;
-  auto *version = llvm::dyn_cast<llvm::MDString>(node->getOperand(0));
-  return version && version->getString() == kLythonRuntimeSafetyMetadataVersion;
-}
-
 void collectLinkedLLVMSafetyContracts(llvm::Module &llvmModule,
                                       LLVMSafetyProfile &profile) {
   for (llvm::Function &function : llvmModule) {
     for (llvm::BasicBlock &block : function) {
       for (llvm::Instruction &inst : block) {
-        if (hasRuntimeVerifiedSafetyMetadata(inst) ||
-            getLythonSafetyMetadataId(inst))
+        if (getLythonSafetyMetadataId(inst))
           continue;
 
         LLVMSafetyContract contract;
@@ -1029,21 +1014,6 @@ void collectLinkedLLVMSafetyContracts(llvm::Module &llvmModule,
       }
     }
   }
-}
-
-// Rewrites the safety metadata of every contracted instruction to the
-// runtime-verified version. Called only by the prelower generation run after
-// all verifications have passed; the resulting IR is the build-time cache.
-void sealRuntimeSafetyMetadata(llvm::Module &llvmModule) {
-  llvm::LLVMContext &ctx = llvmModule.getContext();
-  llvm::Metadata *operands[] = {
-      llvm::MDString::get(ctx, kLythonRuntimeSafetyMetadataVersion)};
-  llvm::MDNode *sealed = llvm::MDNode::get(ctx, operands);
-  for (llvm::Function &function : llvmModule)
-    for (llvm::BasicBlock &block : function)
-      for (llvm::Instruction &inst : block)
-        if (getLythonSafetyMetadataId(inst))
-          inst.setMetadata(kLythonSafetyMetadataName, sealed);
 }
 
 class PySafetyLLVMIRTranslationInterface final
@@ -1095,10 +1065,6 @@ LogicalResult verifyLLVMIRSafetyMetadataPreserved(
   for (llvm::Function &function : llvmModule) {
     for (llvm::BasicBlock &block : function) {
       for (llvm::Instruction &inst : block) {
-        // Instructions from the pre-lowered runtime cache carry sealed
-        // metadata: their contracts were verified when the cache was built.
-        if (hasRuntimeVerifiedSafetyMetadata(inst))
-          continue;
         auto id = getLythonSafetyMetadataId(inst);
         if (!id) {
           if (auto recovered =
@@ -1679,8 +1645,6 @@ LogicalResult runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
 
     llvmModule->setDataLayout(jit->getDataLayout());
     llvmModule->setTargetTriple(jit->getTargetTriple().getTriple());
-    if (failed(py::runtime_library::linkPrelinkedRuntime(*llvmModule)))
-      return failure();
     if (failed(py::runtime_library::linkEmbeddedNativeRuntime(*llvmModule)))
       return failure();
     collectLinkedLLVMSafetyContracts(*llvmModule, safetyProfile);
@@ -1964,22 +1928,14 @@ int main(int argc, char **argv) {
   if (failed(configureLLVMModuleCodeGenTarget(*llvmModule, tensorTarget)))
     return 1;
 
-  if (py::runtime_library::prelowerGenerationMode()) {
-    sealRuntimeSafetyMetadata(*llvmModule);
-  } else {
-    if (failed(py::runtime_library::linkPrelinkedRuntime(*llvmModule)))
-      return 1;
-    if (failed(py::runtime_library::linkEmbeddedNativeRuntime(*llvmModule)))
-      return 1;
-  }
+  if (failed(py::runtime_library::linkEmbeddedNativeRuntime(*llvmModule)))
+    return 1;
   rewriteExceptionPersonalityForTarget(*llvmModule);
 
-  if (!py::runtime_library::prelowerGenerationMode() &&
-      failed(installAOTEntryPoint(*llvmModule)))
+  if (failed(installAOTEntryPoint(*llvmModule)))
     return 1;
 
-  if (!py::runtime_library::prelowerGenerationMode())
-    collectLinkedLLVMSafetyContracts(*llvmModule, safetyProfile);
+  collectLinkedLLVMSafetyContracts(*llvmModule, safetyProfile);
 
   if (EmitLLVMOnly)
     return failed(writeLLVMIR(*llvmModule, outputPath)) ? 1 : 0;

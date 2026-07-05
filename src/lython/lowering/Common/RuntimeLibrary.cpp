@@ -30,11 +30,8 @@
 #include "mlir/Transforms/Passes.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/IR/Module.h"
-#include "llvm/IRReader/IRReader.h"
 #include "llvm/Linker/Linker.h"
-#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
-#include "llvm/Support/Process.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Triple.h"
@@ -43,60 +40,16 @@
 
 namespace py::runtime_library {
 
-bool prelowerGenerationMode() {
-  static const bool enabled = [] {
-    auto value = llvm::sys::Process::GetEnv("LYTHON_RUNTIME_PRELOWER");
-    if (!value)
-      return false;
-    llvm::StringRef text(*value);
-    return text == "1" || text.equals_insensitive("true") ||
-           text.equals_insensitive("yes") || text.equals_insensitive("on");
-  }();
-  return enabled;
-}
-
-std::optional<std::string> prelinkedRuntimeIRPath() {
-  if (prelowerGenerationMode())
-    return std::nullopt;
-  auto validPrelinkedRuntime = [](llvm::StringRef path) {
-    auto buffer = llvm::MemoryBuffer::getFile(path);
-    if (!buffer)
-      return false;
-    llvm::StringRef contents = (*buffer)->getBuffer();
-    return !contents.starts_with("; Runtime prelowering is disabled while "
-                                 "PyDialect lowering is rebuilt.");
-  };
-  if (auto env = llvm::sys::Process::GetEnv("LYTHON_RUNTIME_PRELINKED_IR")) {
-    if (env->empty())
-      return std::nullopt;
-    if (llvm::sys::fs::exists(*env) && validPrelinkedRuntime(*env))
-      return *env;
-    return std::nullopt;
-  }
-#if defined(LYTHON_RUNTIME_PRELINKED_IR)
-  if (llvm::sys::fs::exists(LYTHON_RUNTIME_PRELINKED_IR) &&
-      validPrelinkedRuntime(LYTHON_RUNTIME_PRELINKED_IR))
-    return std::string(LYTHON_RUNTIME_PRELINKED_IR);
-#endif
-  return std::nullopt;
-}
-
 namespace {
 
 constexpr llvm::StringLiteral kContractsAttr{"ly.runtime.contracts"};
-
-bool declarationsOnly() { return prelinkedRuntimeIRPath().has_value(); }
 
 bool isContractManifestModule(llvm::StringRef name) {
   return name == "typing" || name == "ctypes";
 }
 
 bool shouldImportSymbol(mlir::Operation &op) {
-  if (!mlir::isa<mlir::SymbolOpInterface>(op))
-    return false;
-  if (!declarationsOnly())
-    return true;
-  return mlir::isa<mlir::FunctionOpInterface>(op);
+  return mlir::isa<mlir::SymbolOpInterface>(op);
 }
 
 bool isFunctionDeclaration(mlir::Operation &op) {
@@ -117,11 +70,9 @@ void importSymbol(mlir::ModuleOp target, mlir::Operation &op) {
 
   mlir::OpBuilder builder(target.getContext());
   builder.setInsertionPointToEnd(target.getBody());
-  mlir::Operation *cloned =
-      declarationsOnly() ? builder.cloneWithoutRegions(op) : builder.clone(op);
+  mlir::Operation *cloned = builder.clone(op);
   if (auto clonedSymbol = mlir::dyn_cast<mlir::SymbolOpInterface>(cloned)) {
-    if (!prelowerGenerationMode())
-      clonedSymbol.setVisibility(mlir::SymbolTable::Visibility::Private);
+    clonedSymbol.setVisibility(mlir::SymbolTable::Visibility::Private);
   }
 }
 
@@ -198,28 +149,6 @@ mlir::LogicalResult embedObjectModules(mlir::ModuleOp module) {
       continue;
     if (mlir::failed(importRuntimeModule(module, entry)))
       return mlir::failure();
-  }
-  return mlir::success();
-}
-
-mlir::LogicalResult linkPrelinkedRuntime(llvm::Module &llvmModule) {
-  std::optional<std::string> path = prelinkedRuntimeIRPath();
-  if (!path)
-    return mlir::success();
-  llvm::SMDiagnostic diagnostic;
-  std::unique_ptr<llvm::Module> runtime =
-      llvm::parseIRFile(*path, diagnostic, llvmModule.getContext());
-  if (!runtime) {
-    llvm::errs() << "error: failed to load pre-lowered runtime IR from '"
-                 << *path << "': " << diagnostic.getMessage() << "\n";
-    return mlir::failure();
-  }
-  runtime->setDataLayout(llvmModule.getDataLayout());
-  runtime->setTargetTriple(llvmModule.getTargetTriple());
-  if (llvm::Linker::linkModules(llvmModule, std::move(runtime),
-                                llvm::Linker::Flags::LinkOnlyNeeded)) {
-    llvm::errs() << "error: failed to link pre-lowered runtime IR\n";
-    return mlir::failure();
   }
   return mlir::success();
 }

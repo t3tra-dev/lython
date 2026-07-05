@@ -39,21 +39,3 @@ endif()
 set_target_properties(lyc PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
-
-# Pre-lowered runtime cache: lyc compiles an empty module, which embeds and
-# fully lowers (and verifies) every runtime MLIR object; the emitted LLVM IR
-# is then linked into each subsequent compilation instead of re-lowering the
-# runtime per compile. LYTHON_RUNTIME_PRELOWER=1 keeps the embedded symbols
-# public and seals their safety metadata as build-time verified.
-set(LYTHON_RUNTIME_PRELOWERED_IR "${CMAKE_BINARY_DIR}/runtime_prelowered.ll")
-set(LYTHON_PRELOWER_INPUT "${CMAKE_BINARY_DIR}/lython_prelower_input.mlir")
-file(WRITE "${LYTHON_PRELOWER_INPUT}" "module {}\n")
-file(GLOB LYTHON_PRELOWER_RUNTIME_SOURCES CONFIGURE_DEPENDS
-    "${CMAKE_SOURCE_DIR}/src/lython/runtime/objects/*.mlir"
-)
-file(WRITE "${LYTHON_RUNTIME_PRELOWERED_IR}"
-    "; Runtime prelowering is disabled while PyDialect lowering is rebuilt.\n"
-)
-add_custom_target(LythonRuntimePrelowered ALL
-    DEPENDS "${LYTHON_RUNTIME_PRELOWERED_IR}"
-)

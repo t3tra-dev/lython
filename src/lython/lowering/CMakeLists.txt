@@ -293,11 +293,6 @@ target_include_directories(LythonRuntimeLowering
     ${CMAKE_CURRENT_SOURCE_DIR}/Passes
 )
 
-target_compile_definitions(LythonRuntimeLowering
-    PRIVATE
-    LYTHON_RUNTIME_PRELINKED_IR="${CMAKE_BINARY_DIR}/runtime_prelowered.ll"
-)
-
 target_link_libraries(LythonRuntimeLowering
     PRIVATE
     PyDialect
