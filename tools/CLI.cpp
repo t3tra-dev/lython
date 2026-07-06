@@ -48,6 +48,7 @@
 #include "llvm/ExecutionEngine/Orc/EHFrameRegistrationPlugin.h"
 #include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h"
+#include "llvm/ExecutionEngine/Orc/TargetProcess/RegisterEHFrames.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
@@ -1596,6 +1597,17 @@ LogicalResult buildExecutable(llvm::Module &llvmModule,
   return success();
 }
 
+static llvm::orc::shared::CWrapperFunctionBuffer
+noopDeregisterEHFrameSectionAllocAction(const char *argData, size_t argSize) {
+  return llvm::orc::shared::WrapperFunction<llvm::orc::shared::SPSError(
+      llvm::orc::shared::SPSExecutorAddrRange)>::
+      handle(argData, argSize,
+             [](llvm::orc::ExecutorAddrRange) {
+               return llvm::Error::success();
+             })
+          .release();
+}
+
 LogicalResult runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
                      py::TensorLoweringTarget tensorTarget) {
   llvm::Triple processTriple(llvm::sys::getDefaultTargetTriple());
@@ -1669,11 +1681,15 @@ LogicalResult runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
       auto layer = std::make_unique<llvm::orc::ObjectLinkingLayer>(session);
       const llvm::Triple &tt = session.getTargetTriple();
       if (tt.isOSBinFormatELF()) {
-        auto ehFramePlugin =
-            llvm::orc::EHFrameRegistrationPlugin::Create(session);
-        if (!ehFramePlugin)
-          return ehFramePlugin.takeError();
-        layer->addPlugin(std::move(*ehFramePlugin));
+        // GitHub Actions' Linux runner can abort in libgcc's
+        // __deregister_frame while tearing LLJIT down after successful program
+        // execution. Keep EH frame registration for Python exception unwinding,
+        // but skip deregistration for this single-shot CLI JIT lifetime.
+        layer->addPlugin(std::make_shared<llvm::orc::EHFrameRegistrationPlugin>(
+            llvm::orc::ExecutorAddr::fromPtr(
+                &llvm_orc_registerEHFrameSectionAllocAction),
+            llvm::orc::ExecutorAddr::fromPtr(
+                &noopDeregisterEHFrameSectionAllocAction)));
       }
       if (tt.isOSBinFormatCOFF()) {
         layer->setOverrideObjectFlagsWithResponsibilityFlags(true);
