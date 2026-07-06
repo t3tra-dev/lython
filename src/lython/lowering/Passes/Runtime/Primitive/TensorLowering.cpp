@@ -1,6 +1,7 @@
 #include "../Arch/Arm/PrimitiveTensorArmSME.h"
 #include "../Arch/X86/PrimitiveTensorX86.h"
 #include "Common/RuntimeSupport.h"
+#include "Ownership.h"
 #include "TensorGemm.h"
 #include "TensorSupport.h"
 
@@ -28,6 +29,7 @@
 #include "mlir/Transforms/Passes.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
 
 #include <cstddef>
 #include <limits>
@@ -42,6 +44,114 @@ namespace {
 // over-extending the reduction tree. Empirically, 256-bit reductions beat the
 // previous 512-bit width on the current matmul/sum and 3-D elementwise benches.
 constexpr int64_t kReductionVectorBits = 256;
+
+bool isPrimitiveTensorAlloc(mlir::memref::AllocOp alloc) {
+  if (alloc->hasAttr(ownership::kObjectHeaderAttr))
+    return false;
+
+  mlir::Type elementType = alloc.getType().getElementType();
+  return mlir::isa<mlir::FloatType>(elementType) || elementType.isIntOrIndex();
+}
+
+bool hasDeallocUse(mlir::Value value) {
+  llvm::SmallVector<mlir::Value, 4> worklist{value};
+  llvm::SmallPtrSet<void *, 8> visited;
+
+  while (!worklist.empty()) {
+    mlir::Value current = worklist.pop_back_val();
+    if (!visited.insert(current.getAsOpaquePointer()).second)
+      continue;
+
+    for (mlir::Operation *user : current.getUsers()) {
+      if (auto dealloc = mlir::dyn_cast<mlir::memref::DeallocOp>(user)) {
+        if (dealloc.getMemref() == current)
+          return true;
+        continue;
+      }
+
+      if (auto cast = mlir::dyn_cast<mlir::memref::CastOp>(user)) {
+        worklist.push_back(cast.getResult());
+        continue;
+      }
+
+      if (auto reinterpret =
+              mlir::dyn_cast<mlir::memref::ReinterpretCastOp>(user)) {
+        worklist.push_back(reinterpret.getResult());
+        continue;
+      }
+
+      if (auto subview = mlir::dyn_cast<mlir::memref::SubViewOp>(user))
+        worklist.push_back(subview.getResult());
+    }
+  }
+
+  return false;
+}
+
+llvm::SmallVector<mlir::Value, 8> collectAliasValues(mlir::Value value) {
+  llvm::SmallVector<mlir::Value, 8> aliases;
+  llvm::SmallVector<mlir::Value, 4> worklist{value};
+  llvm::SmallPtrSet<void *, 8> visited;
+
+  while (!worklist.empty()) {
+    mlir::Value current = worklist.pop_back_val();
+    if (!visited.insert(current.getAsOpaquePointer()).second)
+      continue;
+    aliases.push_back(current);
+
+    for (mlir::Operation *user : current.getUsers()) {
+      if (auto cast = mlir::dyn_cast<mlir::memref::CastOp>(user)) {
+        worklist.push_back(cast.getResult());
+        continue;
+      }
+
+      if (auto reinterpret =
+              mlir::dyn_cast<mlir::memref::ReinterpretCastOp>(user)) {
+        worklist.push_back(reinterpret.getResult());
+        continue;
+      }
+
+      if (auto subview = mlir::dyn_cast<mlir::memref::SubViewOp>(user))
+        worklist.push_back(subview.getResult());
+    }
+  }
+
+  return aliases;
+}
+
+std::optional<mlir::Operation *>
+findPrimitiveTensorReleaseAnchor(mlir::memref::AllocOp alloc) {
+  mlir::Operation *anchor = alloc.getOperation();
+  mlir::Block *allocBlock = anchor->getBlock();
+
+  for (mlir::Value alias : collectAliasValues(alloc.getResult())) {
+    for (mlir::Operation *user : alias.getUsers()) {
+      if (mlir::isa<mlir::memref::DeallocOp>(user))
+        continue;
+
+      if (mlir::isa<mlir::func::ReturnOp, mlir::func::CallOp>(user)) {
+        alloc.emitError()
+            << "primitive tensor allocation escapes before deallocation";
+        return std::nullopt;
+      }
+
+      mlir::Operation *topLevelUser = user;
+      while (topLevelUser && topLevelUser->getBlock() != allocBlock)
+        topLevelUser = topLevelUser->getParentOp();
+      if (!topLevelUser) {
+        alloc.emitError()
+            << "cannot prove primitive tensor allocation release point";
+        return std::nullopt;
+      }
+      if (topLevelUser == anchor)
+        continue;
+      if (anchor->isBeforeInBlock(topLevelUser))
+        anchor = topLevelUser;
+    }
+  }
+
+  return anchor;
+}
 
 bool isRankPreservingUnitStrideSubview(mlir::memref::SubViewOp subview) {
   mlir::MemRefType sourceType = subview.getSourceType();
@@ -1095,6 +1205,85 @@ public:
   }
 };
 
+class PrimitiveTensorBufferDeallocationPass
+    : public mlir::PassWrapper<PrimitiveTensorBufferDeallocationPass,
+                               mlir::OperationPass<mlir::ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
+      PrimitiveTensorBufferDeallocationPass)
+
+  llvm::StringRef getArgument() const final {
+    return "lython-primitive-tensor-buffer-deallocation";
+  }
+  llvm::StringRef getDescription() const final {
+    return "insert deallocations for local primitive tensor buffers";
+  }
+
+  void getDependentDialects(mlir::DialectRegistry &registry) const final {
+    registry.insert<mlir::memref::MemRefDialect>();
+  }
+
+  void runOnOperation() final {
+    llvm::SmallVector<mlir::memref::AllocOp, 16> allocs;
+    getOperation().walk([&](mlir::memref::AllocOp alloc) {
+      if (isPrimitiveTensorAlloc(alloc))
+        allocs.push_back(alloc);
+    });
+
+    mlir::OpBuilder builder(&getContext());
+    for (mlir::memref::AllocOp alloc : allocs) {
+      if (hasDeallocUse(alloc.getResult()))
+        continue;
+
+      std::optional<mlir::Operation *> anchor =
+          findPrimitiveTensorReleaseAnchor(alloc);
+      if (!anchor) {
+        signalPassFailure();
+        return;
+      }
+
+      builder.setInsertionPointAfter(*anchor);
+      builder.create<mlir::memref::DeallocOp>(alloc.getLoc(),
+                                              alloc.getResult());
+    }
+  }
+};
+
+class PrimitiveTensorAllocationVerifierPass
+    : public mlir::PassWrapper<PrimitiveTensorAllocationVerifierPass,
+                               mlir::OperationPass<mlir::ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
+      PrimitiveTensorAllocationVerifierPass)
+
+  llvm::StringRef getArgument() const final {
+    return "lython-primitive-tensor-allocation-verifier";
+  }
+  llvm::StringRef getDescription() const final {
+    return "verify primitive tensor allocations are released after lowering";
+  }
+
+  void getDependentDialects(mlir::DialectRegistry &registry) const final {
+    registry.insert<mlir::memref::MemRefDialect>();
+  }
+
+  void runOnOperation() final {
+    mlir::WalkResult result =
+        getOperation().walk([&](mlir::memref::AllocOp alloc) {
+          if (!isPrimitiveTensorAlloc(alloc) ||
+              hasDeallocUse(alloc.getResult()))
+            return mlir::WalkResult::advance();
+
+          alloc.emitError()
+              << "primitive tensor allocation has no matching memref.dealloc";
+          return mlir::WalkResult::interrupt();
+        });
+
+    if (result.wasInterrupted())
+      signalPassFailure();
+  }
+};
+
 class LinalgLoweringPass
     : public mlir::PassWrapper<LinalgLoweringPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -1160,8 +1349,12 @@ public:
     pipeline.addPass(mlir::createLowerAffinePass());
     pipeline.addPass(std::make_unique<RowMajorDelinearizationFoldPass>());
     pipeline.addPass(std::make_unique<StaticTransferInBoundsPass>());
+    pipeline.addPass(
+        std::make_unique<PrimitiveTensorBufferDeallocationPass>());
     pipeline.addPass(mlir::createCanonicalizerPass());
     pipeline.addPass(mlir::createCSEPass());
+    pipeline.addPass(
+        std::make_unique<PrimitiveTensorAllocationVerifierPass>());
 
     if (mlir::failed(runPipeline(pipeline, getOperation())))
       signalPassFailure();

@@ -197,7 +197,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
         return mlir::failure();
       RuntimeBundle stored = payload->withObjectOwnership(
           ownership::logicalOwnershipKind(payload->objectValue.contract,
-                                                  /*ownsObject=*/true));
+                                                  /*ownsObject=*/false));
       updated.sequenceElements.push_back(stored.objectValue);
       updated.sequenceElementBundles.push_back(
           std::make_shared<RuntimeBundle>(std::move(stored)));

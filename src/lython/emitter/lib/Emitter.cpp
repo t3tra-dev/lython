@@ -11,9 +11,9 @@ namespace lython::emitter {
 
 EmitResult emitModule(const parser::Node &moduleNode,
                       mlir::MLIRContext &context, std::string moduleName,
-                      std::string sourceName) {
+                      std::string sourceName, EmitOptions options) {
   ModuleEmitter emitter(moduleNode, context, std::move(moduleName),
-                        std::move(sourceName));
+                        std::move(sourceName), options);
   return emitter.emit();
 }
 

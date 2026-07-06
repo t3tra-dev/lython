@@ -254,7 +254,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
           return mlir::failure();
         RuntimeBundle stored = payload->withObjectOwnership(
             ownership::logicalOwnershipKind(
-                payload->objectValue.contract, /*ownsObject=*/true));
+                payload->objectValue.contract, /*ownsObject=*/false));
         if (position < updated.sequenceElements.size())
           updated.sequenceElements[position] = stored.objectValue;
         if (position < updated.sequenceElementBundles.size())
@@ -318,10 +318,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
         builder.create<mlir::memref::StoreOp>(op.getLoc(), next, meta, slot);
         RuntimeBundle storedKey = payloadKey->withObjectOwnership(
             ownership::logicalOwnershipKind(
-                payloadKey->objectValue.contract, /*ownsObject=*/true));
+                payloadKey->objectValue.contract, /*ownsObject=*/false));
         RuntimeBundle storedValue = payloadValue->withObjectOwnership(
             ownership::logicalOwnershipKind(
-                payloadValue->objectValue.contract, /*ownsObject=*/true));
+                payloadValue->objectValue.contract, /*ownsObject=*/false));
         updated.mappingKeys.push_back(*key);
         updated.mappingKeyBundles.push_back(
             std::make_shared<RuntimeBundle>(storedKey));
@@ -353,7 +353,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
           return mlir::failure();
         RuntimeBundle storedValue = payloadValue->withObjectOwnership(
             ownership::logicalOwnershipKind(
-                payloadValue->objectValue.contract, /*ownsObject=*/true));
+                payloadValue->objectValue.contract, /*ownsObject=*/false));
         if (position < updated.mappingValues.size())
           updated.mappingValues[position] = storedValue.objectValue;
         if (position < updated.mappingValueBundles.size())

@@ -220,8 +220,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerNew(py::NewOp op) {
               op, classOp, op.getInstance().getType(), "class __new__ ABI");
       if (mlir::failed(value))
         return mlir::failure();
-      valueBundles[op.getInstance()] =
-          RuntimeBundle::object(value->contract, value->values);
+      RuntimeBundle result = RuntimeBundle::object(value->contract,
+                                                   value->values);
+      if (mlir::failed(RuntimeBundleLowerer::markOwnedLocalObjectBundle(
+              op, op.getInstance(), result)))
+        return mlir::failure();
+      valueBundles[op.getInstance()] = std::move(result);
       erase.push_back(op);
       return mlir::success();
     }
@@ -520,8 +524,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
     }
 
     RuntimeBundle updated;
-    if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
-            op, op.getInstance().getType(), values, updated)))
+    if (mlir::failed(RuntimeBundleLowerer::makeObjectBundleWithOwnership(
+            op, op.getInstance().getType(), values, updated,
+            instance->objectValue.ownership)))
       return mlir::failure();
     updated.copyEvidenceFrom(*instance);
     if (fieldNames) {
@@ -539,6 +544,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
               std::make_shared<RuntimeBundle>(*fieldSources[index]);
       }
     }
+    if (mlir::failed(RuntimeBundleLowerer::markOwnedLocalObjectBundle(
+            op, op.getInstance(), updated)))
+      return mlir::failure();
     valueBundles[op.getInstance()] = std::move(updated);
     if (mlir::failed(assignObjectBundle(
             op, op.getResult(), runtimeContractType(context, "types.NoneType"),

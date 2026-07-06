@@ -17,6 +17,61 @@ constexpr llvm::StringLiteral kReleaseStorageToZeroName{
 constexpr unsigned kPrimitiveFieldSlotBase = 4;
 constexpr unsigned kPrimitiveFieldSlotLimit = 16;
 
+std::string sanitizeSymbolComponent(llvm::StringRef text) {
+  std::string result;
+  result.reserve(text.size());
+  for (char ch : text) {
+    unsigned char byte = static_cast<unsigned char>(ch);
+    result.push_back(std::isalnum(byte) ? ch : '_');
+  }
+  return result;
+}
+
+std::string typeSymbolComponent(mlir::Type type) {
+  std::string text;
+  llvm::raw_string_ostream os(text);
+  type.print(os);
+  return sanitizeSymbolComponent(os.str());
+}
+
+mlir::MemRefType concreteDeadMemRefType(mlir::MemRefType type) {
+  llvm::SmallVector<std::int64_t, 4> shape(type.getShape().begin(),
+                                           type.getShape().end());
+  for (std::int64_t &extent : shape)
+    if (extent == mlir::ShapedType::kDynamic)
+      extent = 1;
+  return mlir::MemRefType::get(shape, type.getElementType(),
+                               mlir::MemRefLayoutAttrInterface{},
+                               type.getMemorySpace());
+}
+
+mlir::Attribute deadMemRefInitialValue(mlir::OpBuilder &builder,
+                                       mlir::MemRefType type,
+                                       bool objectHeader) {
+  auto tensorType =
+      mlir::RankedTensorType::get(type.getShape(), type.getElementType());
+  mlir::Type elementType = type.getElementType();
+  if (objectHeader) {
+    auto integer = mlir::dyn_cast<mlir::IntegerType>(elementType);
+    if (type.getRank() == 1 && type.hasStaticShape() &&
+        type.getDimSize(0) >= 2 && integer && integer.getWidth() == 64) {
+      llvm::SmallVector<mlir::Attribute, 16> values;
+      values.reserve(static_cast<unsigned>(type.getDimSize(0)));
+      values.push_back(builder.getIntegerAttr(
+          integer, std::numeric_limits<std::int64_t>::max()));
+      values.push_back(builder.getIntegerAttr(integer, 0));
+      for (std::int64_t index = 2; index < type.getDimSize(0); ++index)
+        values.push_back(builder.getIntegerAttr(integer, 0));
+      return mlir::DenseElementsAttr::get(tensorType, values);
+    }
+  }
+
+  mlir::Attribute zero = builder.getZeroAttr(elementType);
+  if (!zero)
+    return {};
+  return mlir::DenseElementsAttr::get(tensorType, zero);
+}
+
 bool compatibleMemRefView(mlir::Type source, mlir::Type target) {
   auto sourceMemRef = mlir::dyn_cast<mlir::MemRefType>(source);
   auto targetMemRef = mlir::dyn_cast<mlir::MemRefType>(target);
@@ -728,8 +783,61 @@ RuntimeBundleLowerer::materializeDeadPhysicalValue(mlir::Operation *op,
                          << type;
 }
 
-mlir::FailureOr<RuntimeValue> RuntimeBundleLowerer::materializeDeadObjectValue(
-    mlir::Operation *op, mlir::Type contract, llvm::StringRef purpose) {
+static mlir::FailureOr<mlir::Value> materializeStaticDeadPhysicalValue(
+    mlir::ModuleOp module, mlir::OpBuilder &builder, mlir::Operation *op,
+    mlir::Type type, bool objectHeader) {
+  mlir::Location loc = op->getLoc();
+  if (mlir::isa<mlir::IndexType>(type))
+    return builder.create<mlir::arith::ConstantIndexOp>(loc, 0).getResult();
+  if (mlir::isa<mlir::IntegerType>(type))
+    return builder
+        .create<mlir::arith::ConstantOp>(loc, type,
+                                         builder.getIntegerAttr(type, 0))
+        .getResult();
+  if (mlir::isa<mlir::FloatType>(type))
+    return builder
+        .create<mlir::arith::ConstantOp>(loc, type,
+                                         builder.getFloatAttr(type, 0.0))
+        .getResult();
+
+  auto memrefType = mlir::dyn_cast<mlir::MemRefType>(type);
+  if (!memrefType)
+    return op->emitError()
+           << "cannot materialize a static dead runtime placeholder of "
+              "physical type "
+           << type;
+
+  mlir::MemRefType globalType = concreteDeadMemRefType(memrefType);
+  std::string name = (objectHeader ? "__ly_dead_header_"
+                                   : "__ly_dead_payload_") +
+                     typeSymbolComponent(globalType);
+  if (!module.lookupSymbol<mlir::memref::GlobalOp>(name)) {
+    mlir::Attribute initialValue =
+        deadMemRefInitialValue(builder, globalType, objectHeader);
+    if (!initialValue)
+      return op->emitError()
+             << "cannot build zero initializer for static dead placeholder "
+             << globalType;
+
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(module.getBody());
+    builder.create<mlir::memref::GlobalOp>(
+        loc, name, builder.getStringAttr("private"), globalType, initialValue,
+        /*constant=*/true, /*alignment=*/nullptr);
+  }
+
+  mlir::Value global =
+      builder.create<mlir::memref::GetGlobalOp>(loc, globalType, name)
+          .getResult();
+  if (global.getType() == type)
+    return global;
+  return builder.create<mlir::memref::CastOp>(loc, type, global).getResult();
+}
+
+mlir::FailureOr<RuntimeValue>
+RuntimeBundleLowerer::materializeDeadObjectValueImpl(
+    mlir::Operation *op, mlir::Type contract, llvm::StringRef purpose,
+    DeadObjectStorage storage) {
   mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> valueTypes =
       RuntimeBundleLowerer::runtimeValueTypesFor(op, contract, purpose);
   if (mlir::failed(valueTypes))
@@ -737,18 +845,38 @@ mlir::FailureOr<RuntimeValue> RuntimeBundleLowerer::materializeDeadObjectValue(
 
   llvm::SmallVector<mlir::Value, 4> values;
   values.reserve(valueTypes->size());
-  for (mlir::Type valueType : *valueTypes) {
+  for (auto [index, valueType] : llvm::enumerate(*valueTypes)) {
     mlir::FailureOr<mlir::Value> value =
-        RuntimeBundleLowerer::materializeDeadPhysicalValue(op, valueType);
+        storage == DeadObjectStorage::StaticNonOwning
+            ? materializeStaticDeadPhysicalValue(module, builder, op, valueType,
+                                                 /*objectHeader=*/index == 0)
+            : RuntimeBundleLowerer::materializeDeadPhysicalValue(op, valueType);
     if (mlir::failed(value))
       return mlir::failure();
     values.push_back(*value);
   }
-  if (!values.empty())
+
+  if (!values.empty() && storage == DeadObjectStorage::OwningHeap)
     initializeObjectHeader(builder, op->getLoc(), values.front(),
-                           std::numeric_limits<std::int64_t>::max(),
-                           /*classId=*/0);
-  return RuntimeValue::object(contract, values);
+                           /*refcount=*/1, /*classId=*/0);
+  return RuntimeValue::objectWithOwnership(
+      contract, values,
+      storage == DeadObjectStorage::StaticNonOwning
+          ? own::OwnershipKind::Immortal
+          : own::logicalOwnershipKind(contract, /*ownsObject=*/true));
+}
+
+mlir::FailureOr<RuntimeValue> RuntimeBundleLowerer::materializeDeadObjectValue(
+    mlir::Operation *op, mlir::Type contract, llvm::StringRef purpose) {
+  return RuntimeBundleLowerer::materializeDeadObjectValueImpl(
+      op, contract, purpose, DeadObjectStorage::OwningHeap);
+}
+
+mlir::FailureOr<RuntimeValue>
+RuntimeBundleLowerer::materializeNonOwningDeadObjectValue(
+    mlir::Operation *op, mlir::Type contract, llvm::StringRef purpose) {
+  return RuntimeBundleLowerer::materializeDeadObjectValueImpl(
+      op, contract, purpose, DeadObjectStorage::StaticNonOwning);
 }
 
 mlir::FailureOr<RuntimeValue> RuntimeBundleLowerer::materializeClassObjectValue(
@@ -812,6 +940,16 @@ mlir::FailureOr<RuntimeValue> RuntimeBundleLowerer::materializeClassObjectValue(
     if (mlir::failed(fieldValue))
       return mlir::failure();
     values.append(fieldValue->values.begin(), fieldValue->values.end());
+  }
+
+  if (headerType.hasStaticShape() && headerType.getDimSize(0) >= 3) {
+    mlir::Value valueCountSlot =
+        builder.create<mlir::arith::ConstantIndexOp>(loc, 2);
+    mlir::Value valueCount =
+        builder.create<mlir::arith::ConstantIntOp>(
+            loc, static_cast<std::int64_t>(values.size()), 64);
+    builder.create<mlir::memref::StoreOp>(loc, valueCount, header,
+                                          valueCountSlot);
   }
 
   return RuntimeValue::object(contract, values);

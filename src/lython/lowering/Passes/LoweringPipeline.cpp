@@ -207,6 +207,13 @@ LogicalResult runLoweringPipeline(ModuleOp module,
     return failure();
   dumpMLIRForPass(irDump, "refcount-elision", module);
 
+  if (failed(runLoweringPhase("pre-cleanup-llvm-call-verifier", module,
+                              [&](PassManager &pm) {
+                                pm.addPass(createLLVMCallOwnershipVerifierPass());
+                              })))
+    return failure();
+  dumpMLIRForPass(irDump, "pre-cleanup-llvm-call-verifier", module);
+
   // Phase 11: lower Lython-owned async thunks before symbol cleanup.
   if (failed(runLoweringPhase("async-thunk-lowering", module,
                               [&](PassManager &pm) {

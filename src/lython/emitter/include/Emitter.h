@@ -23,9 +23,14 @@ struct TextEmitResult {
   bool ok() const { return diagnostics.empty(); }
 };
 
+struct EmitOptions {
+  bool sanitizeUndefined = false;
+};
+
 EmitResult emitModule(const parser::Node &module, mlir::MLIRContext &context,
                       std::string moduleName = "__main__",
-                      std::string sourceName = {});
+                      std::string sourceName = {},
+                      EmitOptions options = {});
 TextEmitResult emitModuleText(const parser::Node &module,
                               std::string moduleName = "__main__",
                               std::string sourceName = {});

@@ -48,6 +48,8 @@ public:
   mlir::LogicalResult lowerModule();
 
 private:
+  enum class DeadObjectStorage { OwningHeap, StaticNonOwning };
+
   struct EmittedRuntimeCall {
     RuntimeSymbol symbol;
     mlir::func::CallOp call;
@@ -151,6 +153,9 @@ private:
   mlir::LogicalResult makeObjectBundleWithOwnership(
       mlir::Operation *op, mlir::Type contract, mlir::ValueRange values,
       RuntimeBundle &bundle, ownership::OwnershipKind ownership) const;
+  mlir::LogicalResult markOwnedLocalObjectBundle(mlir::Operation *op,
+                                                 mlir::Value logicalValue,
+                                                 const RuntimeBundle &bundle);
   mlir::LogicalResult makePrimitiveI64Bundle(mlir::Operation *op,
                                              mlir::Type contract,
                                              mlir::Value value,
@@ -269,6 +274,13 @@ private:
   mlir::FailureOr<RuntimeValue>
   materializeDeadObjectValue(mlir::Operation *op, mlir::Type contract,
                              llvm::StringRef purpose);
+  mlir::FailureOr<RuntimeValue>
+  materializeNonOwningDeadObjectValue(mlir::Operation *op, mlir::Type contract,
+                                      llvm::StringRef purpose);
+  mlir::FailureOr<RuntimeValue>
+  materializeDeadObjectValueImpl(mlir::Operation *op, mlir::Type contract,
+                                 llvm::StringRef purpose,
+                                 DeadObjectStorage storage);
   mlir::FailureOr<RuntimeValue>
   materializeClassObjectValue(mlir::Operation *op, py::ClassOp classOp,
                               mlir::Type contract, llvm::StringRef purpose);
@@ -741,6 +753,7 @@ private:
   mlir::OpBuilder builder;
   RuntimeManifestIndex manifest;
   llvm::DenseMap<mlir::Value, RuntimeBundle> valueBundles;
+  llvm::DenseMap<mlir::Value, mlir::Operation *> ownedLocalObjectMarkers;
   llvm::StringMap<ReturnedValueSummary> returnedValueSummaries;
   llvm::StringMap<ReturnedCallableSummary> returnedCallableSummaries;
   llvm::StringMap<ReturnedCoroutineSummary> returnedCoroutineSummaries;

@@ -235,6 +235,256 @@ module {
     func.return
   }
 
+  func.func private @payload_value_ptr(%arg0: !llvm.ptr, %arg1: i64) -> i64 {
+    %base = arith.constant 4 : i64
+    %slot = arith.addi %base, %arg1 : i64
+    %value = func.call @boxed_load_i64(%arg0, %slot) : (!llvm.ptr, i64) -> i64
+    func.return %value : i64
+  }
+
+  func.func private @release_payload_range_ptr(%arg0: !llvm.ptr, %arg1: i64, %arg2: i64) {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %active = arith.cmpi slt, %arg1, %arg2 : i64
+    cf.cond_br %active, ^bb_release, ^bb_done
+  ^bb_release:
+    %consumed = func.call @release_payload_group_at_ptr(%arg0, %arg1, %arg2) : (!llvm.ptr, i64, i64) -> i64
+    %non_positive = arith.cmpi sle, %consumed, %zero : i64
+    %step = arith.select %non_positive, %one, %consumed : i1, i64
+    %next = arith.addi %arg1, %step : i64
+    func.call @release_payload_range_ptr(%arg0, %next, %arg2) : (!llvm.ptr, i64, i64) -> ()
+    cf.br ^bb_done
+  ^bb_done:
+    func.return
+  }
+
+  func.func private @source_payload_value_count(%arg0: i64) -> i64 {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %is_null = arith.cmpi eq, %arg0, %zero : i64
+    cf.cond_br %is_null, ^bb_default, ^bb_load
+  ^bb_load:
+    %ptr = llvm.inttoptr %arg0 : i64 to !llvm.ptr
+    %count_ptr = llvm.getelementptr %ptr[%two] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    %count = llvm.load %count_ptr {alignment = 8 : i64} : !llvm.ptr -> i64
+    %valid = arith.cmpi sgt, %count, %zero : i64
+    cf.cond_br %valid, ^bb_count, ^bb_default
+  ^bb_count:
+    func.return %count : i64
+  ^bb_default:
+    func.return %one : i64
+  }
+
+  func.func private @release_unknown_source_payload_after_zero(%arg0: !llvm.ptr, %arg1: i64) -> i64 {
+    %one = arith.constant 1 : i64
+    %count = func.call @source_payload_value_count(%arg1) : (i64) -> i64
+    %has_fields = arith.cmpi sgt, %count, %one : i64
+    cf.cond_br %has_fields, ^bb_release_fields, ^bb_return_count
+  ^bb_release_fields:
+    func.call @release_payload_range_ptr(%arg0, %one, %count) : (!llvm.ptr, i64, i64) -> ()
+    cf.br ^bb_return_count
+  ^bb_return_count:
+    func.return %count : i64
+  }
+
+  func.func private @release_payload_group_at_ptr(%arg0: !llvm.ptr, %arg1: i64, %arg2: i64) -> i64 {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %three = arith.constant 3 : i64
+    %four = arith.constant 4 : i64
+    %five = arith.constant 5 : i64
+    %six = arith.constant 6 : i64
+    %eight = arith.constant 8 : i64
+    %nine = arith.constant 9 : i64
+    %ten = arith.constant 10 : i64
+    %eleven = arith.constant 11 : i64
+    %twelve = arith.constant 12 : i64
+    %thirteen = arith.constant 13 : i64
+    %fourteen = arith.constant 14 : i64
+    %fifteen = arith.constant 15 : i64
+    %sixteen = arith.constant 16 : i64
+    %seventeen = arith.constant 17 : i64
+    %eighteen = arith.constant 18 : i64
+    %in_range = arith.cmpi slt, %arg1, %arg2 : i64
+    cf.cond_br %in_range, ^bb_load, ^bb_default
+  ^bb_load:
+    %header = func.call @payload_value_ptr(%arg0, %arg1) : (!llvm.ptr, i64) -> i64
+    %is_null = arith.cmpi eq, %header, %zero : i64
+    cf.cond_br %is_null, ^bb_default, ^bb_class
+  ^bb_class:
+    %ptr = llvm.inttoptr %header : i64 to !llvm.ptr
+    %class_ptr = llvm.getelementptr %ptr[%one] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    %class_id = llvm.load %class_ptr {alignment = 8 : i64} : !llvm.ptr -> i64
+    %is_int = arith.cmpi eq, %class_id, %one : i64
+    cf.cond_br %is_int, ^bb_int, ^bb_check_float
+  ^bb_check_float:
+    %is_float = arith.cmpi eq, %class_id, %two : i64
+    cf.cond_br %is_float, ^bb_float, ^bb_check_str
+  ^bb_check_str:
+    %is_str = arith.cmpi eq, %class_id, %four : i64
+    cf.cond_br %is_str, ^bb_str, ^bb_check_exc
+  ^bb_check_exc:
+    %is_exc = arith.cmpi eq, %class_id, %five : i64
+    cf.cond_br %is_exc, ^bb_exc, ^bb_check_list
+  ^bb_check_list:
+    %is_list = arith.cmpi eq, %class_id, %ten : i64
+    cf.cond_br %is_list, ^bb_seq, ^bb_check_tuple
+  ^bb_check_tuple:
+    %is_tuple = arith.cmpi eq, %class_id, %eleven : i64
+    cf.cond_br %is_tuple, ^bb_seq, ^bb_check_dict
+  ^bb_check_dict:
+    %is_dict = arith.cmpi eq, %class_id, %twelve : i64
+    cf.cond_br %is_dict, ^bb_dict, ^bb_check_single6
+  ^bb_check_single6:
+    %is_single6 = arith.cmpi eq, %class_id, %six : i64
+    cf.cond_br %is_single6, ^bb_single, ^bb_check_single8
+  ^bb_check_single8:
+    %is_single8 = arith.cmpi eq, %class_id, %eight : i64
+    cf.cond_br %is_single8, ^bb_single, ^bb_check_single9
+  ^bb_check_single9:
+    %is_single9 = arith.cmpi eq, %class_id, %nine : i64
+    cf.cond_br %is_single9, ^bb_single, ^bb_check_single13
+  ^bb_check_single13:
+    %is_single13 = arith.cmpi eq, %class_id, %thirteen : i64
+    cf.cond_br %is_single13, ^bb_single, ^bb_check_single14
+  ^bb_check_single14:
+    %is_single14 = arith.cmpi eq, %class_id, %fourteen : i64
+    cf.cond_br %is_single14, ^bb_single, ^bb_check_task
+  ^bb_check_task:
+    %is_task = arith.cmpi eq, %class_id, %fifteen : i64
+    cf.cond_br %is_task, ^bb_task, ^bb_check_future_iter
+  ^bb_check_future_iter:
+    %is_future_iter = arith.cmpi eq, %class_id, %sixteen : i64
+    cf.cond_br %is_future_iter, ^bb_child_single, ^bb_check_task_iter
+  ^bb_check_task_iter:
+    %is_task_iter = arith.cmpi eq, %class_id, %seventeen : i64
+    cf.cond_br %is_task_iter, ^bb_task_iter, ^bb_check_await_iter
+  ^bb_check_await_iter:
+    %is_await_iter = arith.cmpi eq, %class_id, %eighteen : i64
+    cf.cond_br %is_await_iter, ^bb_child_single, ^bb_source
+  ^bb_int:
+    %int_meta_index = arith.addi %arg1, %one : i64
+    %int_digits_index = arith.addi %arg1, %two : i64
+    %int_meta = func.call @payload_value_ptr(%arg0, %int_meta_index) : (!llvm.ptr, i64) -> i64
+    %int_digits = func.call @payload_value_ptr(%arg0, %int_digits_index) : (!llvm.ptr, i64) -> i64
+    %int_zero = func.call @release_storage_raw_to_zero(%header) : (i64) -> i1
+    cf.cond_br %int_zero, ^bb_int_free, ^bb_return_three
+  ^bb_int_free:
+    func.call @free_raw_i64_ptr(%int_digits) : (i64) -> ()
+    func.call @free_raw_i64_ptr(%int_meta) : (i64) -> ()
+    func.call @free_raw_i64_ptr(%header) : (i64) -> ()
+    cf.br ^bb_return_three
+  ^bb_float:
+    %payload_index = arith.addi %arg1, %one : i64
+    %payload = func.call @payload_value_ptr(%arg0, %payload_index) : (!llvm.ptr, i64) -> i64
+    %float_zero = func.call @release_storage_raw_to_zero(%header) : (i64) -> i1
+    cf.cond_br %float_zero, ^bb_float_free, ^bb_return_two
+  ^bb_float_free:
+    func.call @free_raw_i64_ptr(%payload) : (i64) -> ()
+    func.call @free_raw_i64_ptr(%header) : (i64) -> ()
+    cf.br ^bb_return_two
+  ^bb_str:
+    %bytes_index = arith.addi %arg1, %one : i64
+    %bytes = func.call @payload_value_ptr(%arg0, %bytes_index) : (!llvm.ptr, i64) -> i64
+    func.call @release_unicode_raw(%header, %bytes) : (i64, i64) -> ()
+    cf.br ^bb_return_two
+  ^bb_exc:
+    %message_header_index = arith.addi %arg1, %one : i64
+    %message_bytes_index = arith.addi %arg1, %two : i64
+    %message_header = func.call @payload_value_ptr(%arg0, %message_header_index) : (!llvm.ptr, i64) -> i64
+    %message_bytes = func.call @payload_value_ptr(%arg0, %message_bytes_index) : (!llvm.ptr, i64) -> i64
+    %exc_zero = func.call @release_storage_raw_to_zero(%header) : (i64) -> i1
+    cf.cond_br %exc_zero, ^bb_exc_free, ^bb_return_three
+  ^bb_exc_free:
+    func.call @release_unicode_raw(%message_header, %message_bytes) : (i64, i64) -> ()
+    func.call @free_raw_i64_ptr(%header) : (i64) -> ()
+    cf.br ^bb_return_three
+  ^bb_seq:
+    %seq_meta_index = arith.addi %arg1, %one : i64
+    %seq_items_index = arith.addi %arg1, %two : i64
+    %seq_meta = func.call @payload_value_ptr(%arg0, %seq_meta_index) : (!llvm.ptr, i64) -> i64
+    %seq_items = func.call @payload_value_ptr(%arg0, %seq_items_index) : (!llvm.ptr, i64) -> i64
+    %seq_zero = func.call @release_storage_raw_to_zero(%header) : (i64) -> i1
+    cf.cond_br %seq_zero, ^bb_seq_free, ^bb_return_three
+  ^bb_seq_free:
+    func.call @release_sequence_payload(%seq_meta, %seq_items) : (i64, i64) -> ()
+    func.call @free_raw_i64_ptr(%seq_items) : (i64) -> ()
+    func.call @free_raw_i64_ptr(%seq_meta) : (i64) -> ()
+    func.call @free_raw_i64_ptr(%header) : (i64) -> ()
+    cf.br ^bb_return_three
+  ^bb_dict:
+    %dict_meta_index = arith.addi %arg1, %one : i64
+    %dict_keys_index = arith.addi %arg1, %two : i64
+    %dict_values_index = arith.addi %arg1, %three : i64
+    %dict_present_index = arith.addi %arg1, %four : i64
+    %dict_meta = func.call @payload_value_ptr(%arg0, %dict_meta_index) : (!llvm.ptr, i64) -> i64
+    %dict_keys = func.call @payload_value_ptr(%arg0, %dict_keys_index) : (!llvm.ptr, i64) -> i64
+    %dict_values = func.call @payload_value_ptr(%arg0, %dict_values_index) : (!llvm.ptr, i64) -> i64
+    %dict_present = func.call @payload_value_ptr(%arg0, %dict_present_index) : (!llvm.ptr, i64) -> i64
+    %dict_zero = func.call @release_storage_raw_to_zero(%header) : (i64) -> i1
+    cf.cond_br %dict_zero, ^bb_dict_free, ^bb_return_five
+  ^bb_dict_free:
+    func.call @release_dict_payload(%dict_meta, %dict_keys, %dict_values, %dict_present) : (i64, i64, i64, i64) -> ()
+    func.call @free_raw_i64_ptr(%dict_present) : (i64) -> ()
+    func.call @free_raw_i64_ptr(%dict_values) : (i64) -> ()
+    func.call @free_raw_i64_ptr(%dict_keys) : (i64) -> ()
+    func.call @free_raw_i64_ptr(%dict_meta) : (i64) -> ()
+    func.call @free_raw_i64_ptr(%header) : (i64) -> ()
+    cf.br ^bb_return_five
+  ^bb_single:
+    func.call @release_single_storage_raw(%header) : (i64) -> ()
+    cf.br ^bb_return_one
+  ^bb_child_single:
+    %child_index = arith.addi %arg1, %one : i64
+    %child = func.call @payload_value_ptr(%arg0, %child_index) : (!llvm.ptr, i64) -> i64
+    %child_zero = func.call @release_storage_raw_to_zero(%header) : (i64) -> i1
+    cf.cond_br %child_zero, ^bb_child_single_free, ^bb_return_two
+  ^bb_child_single_free:
+    func.call @release_single_storage_raw(%child) : (i64) -> ()
+    func.call @free_raw_i64_ptr(%header) : (i64) -> ()
+    cf.br ^bb_return_two
+  ^bb_task:
+    %task_coroutine_index = arith.addi %arg1, %one : i64
+    %task_coroutine = func.call @payload_value_ptr(%arg0, %task_coroutine_index) : (!llvm.ptr, i64) -> i64
+    func.call @release_task_raw(%header, %task_coroutine) : (i64, i64) -> ()
+    cf.br ^bb_return_two
+  ^bb_task_iter:
+    %task_iter_task_index = arith.addi %arg1, %one : i64
+    %task_iter_coroutine_index = arith.addi %arg1, %two : i64
+    %task_iter_task = func.call @payload_value_ptr(%arg0, %task_iter_task_index) : (!llvm.ptr, i64) -> i64
+    %task_iter_coroutine = func.call @payload_value_ptr(%arg0, %task_iter_coroutine_index) : (!llvm.ptr, i64) -> i64
+    %task_iter_zero = func.call @release_storage_raw_to_zero(%header) : (i64) -> i1
+    cf.cond_br %task_iter_zero, ^bb_task_iter_free, ^bb_return_three
+  ^bb_task_iter_free:
+    func.call @release_task_raw(%task_iter_task, %task_iter_coroutine) : (i64, i64) -> ()
+    func.call @free_raw_i64_ptr(%header) : (i64) -> ()
+    cf.br ^bb_return_three
+  ^bb_source:
+    %source_zero = func.call @release_storage_raw_to_zero(%header) : (i64) -> i1
+    cf.cond_br %source_zero, ^bb_source_free, ^bb_source_count
+  ^bb_source_free:
+    %source_count = func.call @release_unknown_source_payload_after_zero(%arg0, %header) : (!llvm.ptr, i64) -> i64
+    func.call @free_raw_i64_ptr(%header) : (i64) -> ()
+    cf.br ^bb_return_source(%source_count : i64)
+  ^bb_source_count:
+    %retained_count = func.call @source_payload_value_count(%header) : (i64) -> i64
+    cf.br ^bb_return_source(%retained_count : i64)
+  ^bb_return_five:
+    func.return %five : i64
+  ^bb_return_three:
+    func.return %three : i64
+  ^bb_return_two:
+    func.return %two : i64
+  ^bb_return_one:
+    func.return %one : i64
+  ^bb_return_source(%source_consumed: i64):
+    func.return %source_consumed : i64
+  ^bb_default:
+    func.return %one : i64
+  }
+
   func.func private @release_payload_slot_ptr(%arg0: !llvm.ptr) {
     %0 = arith.constant 0 : i64
     %1 = arith.constant 1 : i64
@@ -364,6 +614,7 @@ module {
     func.call @free_raw_i64_ptr(%23) : (i64) -> ()
     cf.br ^bb_done
   ^bb_header_only:
+    %source_count = func.call @release_unknown_source_payload_after_zero(%arg0, %23) : (!llvm.ptr, i64) -> i64
     func.call @free_raw_i64_ptr(%23) : (i64) -> ()
     cf.br ^bb_done
   ^bb_done:

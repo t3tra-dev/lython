@@ -301,9 +301,13 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeSequencePayload(
     if (mlir::failed(RuntimeBundleLowerer::storeSequencePayloadElement(
             op, container, static_cast<unsigned>(index), *payload)))
       return mlir::failure();
+    if (payload->objectValue.ownership == ownership::OwnershipKind::Own &&
+        mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
+            op, *payload, "sequence.literal.source")))
+      return mlir::failure();
     RuntimeBundle stored = payload->withObjectOwnership(
         ownership::logicalOwnershipKind(payload->objectValue.contract,
-                                                /*ownsObject=*/true));
+                                                /*ownsObject=*/false));
     if (index < container.sequenceElementBundles.size())
       container.sequenceElementBundles[index] =
           std::make_shared<RuntimeBundle>(stored);
@@ -383,12 +387,20 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeDictPayload(
     if (mlir::failed(RuntimeBundleLowerer::storeDictValuePayload(
             op, container, static_cast<unsigned>(index), *payloadValue)))
       return mlir::failure();
+    if (payloadKey->objectValue.ownership == ownership::OwnershipKind::Own &&
+        mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
+            op, *payloadKey, "dict.literal.key.source")))
+      return mlir::failure();
+    if (payloadValue->objectValue.ownership == ownership::OwnershipKind::Own &&
+        mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
+            op, *payloadValue, "dict.literal.value.source")))
+      return mlir::failure();
     RuntimeBundle storedKey = payloadKey->withObjectOwnership(
         ownership::logicalOwnershipKind(payloadKey->objectValue.contract,
-                                                /*ownsObject=*/true));
+                                                /*ownsObject=*/false));
     RuntimeBundle storedValue = payloadValue->withObjectOwnership(
         ownership::logicalOwnershipKind(
-            payloadValue->objectValue.contract, /*ownsObject=*/true));
+            payloadValue->objectValue.contract, /*ownsObject=*/false));
     if (index < container.mappingKeyBundles.size())
       container.mappingKeyBundles[index] =
           std::make_shared<RuntimeBundle>(storedKey);

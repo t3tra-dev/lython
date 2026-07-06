@@ -160,6 +160,15 @@ mlir::LogicalResult verifyOperationOwnershipShape(mlir::Operation *op) {
       return op->emitError()
              << own::kOwnedLocalObjectAttr
              << " must mark an operation producing an object header";
+    if (op->hasAttr(own::kOwnedLocalObjectContractAttr) &&
+        !mlir::isa<mlir::StringAttr>(
+            op->getAttr(own::kOwnedLocalObjectContractAttr)))
+      return op->emitError()
+             << own::kOwnedLocalObjectContractAttr
+             << " must be a string attribute";
+  } else if (op->hasAttr(own::kOwnedLocalObjectContractAttr)) {
+    return op->emitError() << own::kOwnedLocalObjectContractAttr
+                           << " requires " << own::kOwnedLocalObjectAttr;
   }
 
   auto aggregate = own::readAggregateOwnershipMarker(op);

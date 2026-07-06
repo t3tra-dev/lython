@@ -13,7 +13,8 @@ namespace lython::emitter {
 class ModuleEmitter {
 public:
   ModuleEmitter(const parser::Node &moduleNode, mlir::MLIRContext &context,
-                std::string moduleName, std::string sourceName);
+                std::string moduleName, std::string sourceName,
+                EmitOptions options = {});
 
   EmitResult emit();
 
@@ -142,6 +143,7 @@ private:
   mlir::MLIRContext &context;
   std::string moduleName;
   std::string sourceName;
+  EmitOptions options;
   mlir::OpBuilder builder;
   AlgorithmM types;
   parser::Diagnostics diagnostics;

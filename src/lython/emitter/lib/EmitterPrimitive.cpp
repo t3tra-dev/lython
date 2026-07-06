@@ -6,6 +6,7 @@
 #include "AstAccess.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -114,21 +115,153 @@ mlir::Value coerceFloatValue(mlir::OpBuilder &builder, mlir::Location loc,
   return value;
 }
 
+mlir::Value integerConstant(mlir::OpBuilder &builder, mlir::Location loc,
+                            mlir::IntegerType type, std::int64_t value) {
+  return builder
+      .create<mlir::arith::ConstantOp>(loc, type,
+                                       builder.getIntegerAttr(type, value))
+      .getResult();
+}
+
+mlir::Value boolConstant(mlir::OpBuilder &builder, mlir::Location loc,
+                         bool value) {
+  return builder.create<mlir::arith::ConstantIntOp>(loc, value ? 1 : 0, 1)
+      .getResult();
+}
+
+mlir::Value logicalAnd(mlir::OpBuilder &builder, mlir::Location loc,
+                       mlir::Value lhs, mlir::Value rhs) {
+  return builder.create<mlir::arith::AndIOp>(loc, lhs, rhs).getResult();
+}
+
+mlir::Value logicalNot(mlir::OpBuilder &builder, mlir::Location loc,
+                       mlir::Value value) {
+  return builder
+      .create<mlir::arith::XOrIOp>(loc, value, boolConstant(builder, loc, true))
+      .getResult();
+}
+
+mlir::Value signedAddOverflow(mlir::OpBuilder &builder, mlir::Location loc,
+                              mlir::Value lhs, mlir::Value rhs,
+                              mlir::Value result,
+                              mlir::IntegerType integerType) {
+  mlir::Value zero = integerConstant(builder, loc, integerType, 0);
+  mlir::Value lhsNegative =
+      builder
+          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::slt,
+                                       lhs, zero)
+          .getResult();
+  mlir::Value rhsNegative =
+      builder
+          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::slt,
+                                       rhs, zero)
+          .getResult();
+  mlir::Value resultNegative =
+      builder
+          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::slt,
+                                       result, zero)
+          .getResult();
+  mlir::Value sameSign =
+      builder
+          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::eq,
+                                       lhsNegative, rhsNegative)
+          .getResult();
+  mlir::Value signChanged =
+      builder
+          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::ne,
+                                       resultNegative, lhsNegative)
+          .getResult();
+  return logicalAnd(builder, loc, sameSign, signChanged);
+}
+
+mlir::Value signedSubOverflow(mlir::OpBuilder &builder, mlir::Location loc,
+                              mlir::Value lhs, mlir::Value rhs,
+                              mlir::Value result,
+                              mlir::IntegerType integerType) {
+  mlir::Value zero = integerConstant(builder, loc, integerType, 0);
+  mlir::Value lhsNegative =
+      builder
+          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::slt,
+                                       lhs, zero)
+          .getResult();
+  mlir::Value rhsNegative =
+      builder
+          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::slt,
+                                       rhs, zero)
+          .getResult();
+  mlir::Value resultNegative =
+      builder
+          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::slt,
+                                       result, zero)
+          .getResult();
+  mlir::Value differentSign =
+      builder
+          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::ne,
+                                       lhsNegative, rhsNegative)
+          .getResult();
+  mlir::Value signChanged =
+      builder
+          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::ne,
+                                       resultNegative, lhsNegative)
+          .getResult();
+  return logicalAnd(builder, loc, differentSign, signChanged);
+}
+
+std::optional<mlir::Value> createIntegerBinary(
+    mlir::OpBuilder &builder, mlir::Location loc, const parser::Node *op,
+    mlir::Value lhs, mlir::Value rhs, mlir::IntegerType integerType,
+    bool sanitizeUndefined) {
+  mlir::Value result;
+  mlir::Value overflow;
+  llvm::StringRef opName;
+  if (ast::isOperator(op, "Sub")) {
+    result = builder.create<mlir::arith::SubIOp>(loc, lhs, rhs).getResult();
+    overflow = signedSubOverflow(builder, loc, lhs, rhs, result, integerType);
+    opName = "subtraction";
+  } else if (ast::isOperator(op, "Mult")) {
+    if (!sanitizeUndefined)
+      return builder.create<mlir::arith::MulIOp>(loc, lhs, rhs).getResult();
+    auto extended = builder.create<mlir::arith::MulSIExtendedOp>(loc, lhs, rhs);
+    mlir::Value shift =
+        integerConstant(builder, loc, integerType, integerType.getWidth() - 1);
+    mlir::Value expectedHigh =
+        builder.create<mlir::arith::ShRSIOp>(loc, extended.getLow(), shift)
+            .getResult();
+    overflow =
+        builder
+            .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::ne,
+                                         extended.getHigh(), expectedHigh)
+            .getResult();
+    result = extended.getLow();
+    opName = "multiplication";
+  } else if (ast::isOperator(op, "Add")) {
+    result = builder.create<mlir::arith::AddIOp>(loc, lhs, rhs).getResult();
+    overflow = signedAddOverflow(builder, loc, lhs, rhs, result, integerType);
+    opName = "addition";
+  } else {
+    return std::nullopt;
+  }
+
+  if (sanitizeUndefined) {
+    mlir::Value ok = logicalNot(builder, loc, overflow);
+    builder.create<mlir::cf::AssertOp>(
+        loc, ok, (llvm::Twine("lython UBSan: signed integer ") + opName +
+                  " overflow")
+                     .str());
+  }
+  return result;
+}
+
 std::optional<mlir::Value>
 createScalarBinary(mlir::OpBuilder &builder, mlir::Location loc,
-                   const parser::Node *op, mlir::Value lhs, mlir::Value rhs) {
+                   const parser::Node *op, mlir::Value lhs, mlir::Value rhs,
+                   bool sanitizeUndefined = false) {
   mlir::Type type = lhs.getType();
   if (auto integer = mlir::dyn_cast<mlir::IntegerType>(type)) {
-    (void)integer;
     if (rhs.getType() != type)
       return std::nullopt;
-    if (ast::isOperator(op, "Sub"))
-      return builder.create<mlir::arith::SubIOp>(loc, lhs, rhs).getResult();
-    if (ast::isOperator(op, "Mult"))
-      return builder.create<mlir::arith::MulIOp>(loc, lhs, rhs).getResult();
-    if (ast::isOperator(op, "Add"))
-      return builder.create<mlir::arith::AddIOp>(loc, lhs, rhs).getResult();
-    return std::nullopt;
+    return createIntegerBinary(builder, loc, op, lhs, rhs, integer,
+                               sanitizeUndefined);
   }
   if (auto floating = mlir::dyn_cast<mlir::FloatType>(type)) {
     rhs = coerceFloatValue(builder, loc, rhs, floating);
@@ -164,7 +297,8 @@ std::optional<Value>
 emitElementwiseTensorBinary(mlir::OpBuilder &builder, mlir::Location loc,
                             const parser::Node &expr, Value lhs, Value rhs,
                             const parser::Node *op,
-                            mlir::RankedTensorType tensorType) {
+                            mlir::RankedTensorType tensorType,
+                            bool sanitizeUndefined) {
   if (rhs.value.getType() != tensorType)
     return std::nullopt;
 
@@ -178,7 +312,8 @@ emitElementwiseTensorBinary(mlir::OpBuilder &builder, mlir::Location loc,
         mlir::Value rhsElement =
             tensorExtract(builder, loc, rhs.value, indices);
         std::optional<mlir::Value> result =
-            createScalarBinary(builder, loc, op, lhsElement, rhsElement);
+            createScalarBinary(builder, loc, op, lhsElement, rhsElement,
+                               sanitizeUndefined);
         if (result)
           elements.push_back(*result);
       },
@@ -466,7 +601,7 @@ ModuleEmitter::emitPrimitiveBinary(const parser::Node &expr, Value lhs,
                               rhsTensor);
     if (lhsTensor == rhsTensor)
       return emitElementwiseTensorBinary(builder, location, expr, lhs, rhs, op,
-                                         lhsTensor);
+                                         lhsTensor, options.sanitizeUndefined);
     return std::nullopt;
   }
 
@@ -487,21 +622,10 @@ ModuleEmitter::emitPrimitiveBinary(const parser::Node &expr, Value lhs,
     return std::nullopt;
 
   rhs = coercePrimitiveInteger(rhs, lhsInt, expr);
-  if (ast::isOperator(op, "Sub")) {
-    auto result =
-        builder.create<mlir::arith::SubIOp>(loc(expr), lhs.value, rhs.value);
-    return Value{result.getResult(), lhsInt};
-  }
-  if (ast::isOperator(op, "Mult")) {
-    auto result =
-        builder.create<mlir::arith::MulIOp>(loc(expr), lhs.value, rhs.value);
-    return Value{result.getResult(), lhsInt};
-  }
-  if (ast::isOperator(op, "Add")) {
-    auto result =
-        builder.create<mlir::arith::AddIOp>(loc(expr), lhs.value, rhs.value);
-    return Value{result.getResult(), lhsInt};
-  }
+  if (std::optional<mlir::Value> result =
+          createIntegerBinary(builder, loc(expr), op, lhs.value, rhs.value,
+                              lhsInt, options.sanitizeUndefined))
+    return Value{*result, lhsInt};
   return std::nullopt;
 }
 

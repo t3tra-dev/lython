@@ -182,6 +182,75 @@ bool isOwnershipConsumingUse(mlir::ModuleOp module, mlir::OpOperand &use) {
                        callee, static_cast<unsigned>(use.getOperandNumber()));
 }
 
+bool groupMatchesOperands(mlir::OperandRange operands, unsigned offset,
+                          llvm::ArrayRef<mlir::Value> group,
+                          own::AliasAnalysis &aliases) {
+  if (offset + group.size() > operands.size())
+    return false;
+  for (auto [index, value] : llvm::enumerate(group)) {
+    if (!aliases.same(operands[offset + index], value))
+      return false;
+  }
+  return true;
+}
+
+bool callConsumesGroup(mlir::ModuleOp module, mlir::func::CallOp call,
+                       llvm::ArrayRef<mlir::Value> group,
+                       own::AliasAnalysis &aliases) {
+  mlir::func::FuncOp callee =
+      module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
+  if (!callee)
+    return false;
+  auto contract = own::readFunctionContract(callee);
+  if (mlir::failed(contract))
+    return false;
+  for (unsigned offset : contract->releaseArgs.values)
+    if (groupMatchesOperands(call.getOperands(), offset, group, aliases))
+      return true;
+  for (unsigned offset : contract->transferArgs.values)
+    if (groupMatchesOperands(call.getOperands(), offset, group, aliases))
+      return true;
+  return false;
+}
+
+bool callConsumesTrackedHeader(mlir::ModuleOp module, mlir::func::CallOp call,
+                               llvm::ArrayRef<mlir::Value> group,
+                               own::AliasAnalysis &aliases) {
+  if (group.empty())
+    return false;
+  mlir::func::FuncOp callee =
+      module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
+  if (!callee)
+    return false;
+  auto contract = own::readFunctionContract(callee);
+  if (mlir::failed(contract))
+    return false;
+  auto consumesHeaderAt = [&](unsigned offset) {
+    return offset < call.getNumOperands() &&
+           aliases.same(call.getOperand(offset), group.front());
+  };
+  for (unsigned offset : contract->releaseArgs.values)
+    if (consumesHeaderAt(offset) &&
+        !groupMatchesOperands(call.getOperands(), offset, group, aliases))
+      return true;
+  for (unsigned offset : contract->transferArgs.values)
+    if (consumesHeaderAt(offset) &&
+        !groupMatchesOperands(call.getOperands(), offset, group, aliases))
+      return true;
+  return false;
+}
+
+bool ownershipConsumingUseInvalidatesGroup(mlir::ModuleOp module,
+                                           mlir::OpOperand &use,
+                                           llvm::ArrayRef<mlir::Value> group,
+                                           own::AliasAnalysis &aliases) {
+  auto call = mlir::dyn_cast<mlir::func::CallOp>(use.getOwner());
+  if (!call)
+    return false;
+  return callConsumesGroup(module, call, group, aliases) ||
+         callConsumesTrackedHeader(module, call, group, aliases);
+}
+
 mlir::Operation *latestUserInBlock(mlir::Operation *lhs, mlir::Operation *rhs) {
   if (!lhs)
     return rhs;
@@ -257,6 +326,7 @@ unsigned skipPrimitiveReturnEvidence(mlir::ValueRange values, unsigned offset,
 struct OwnedReturnRange {
   unsigned offset = 0;
   unsigned size = 0;
+  mlir::Type type;
 };
 
 std::optional<llvm::SmallVector<OwnedReturnRange, 4>>
@@ -278,7 +348,7 @@ callableOwnedReturnRanges(
     if (!size)
       return std::nullopt;
     if (*size > 0)
-      ranges.push_back(OwnedReturnRange{offset, *size});
+      ranges.push_back(OwnedReturnRange{offset, *size, resultType});
     offset += *size;
     offset = skipPrimitiveReturnEvidence(values, offset, resultType);
   }
@@ -288,17 +358,40 @@ callableOwnedReturnRanges(
 bool groupMatchesOwnedReturnRange(mlir::ValueRange values,
                                   const OwnedReturnRange &range,
                                   llvm::ArrayRef<mlir::Value> group,
+                                  llvm::ArrayRef<own::RuntimeDeallocator>
+                                      deallocators,
                                   own::AliasAnalysis &aliases) {
-  if (group.empty() || group.size() > range.size)
+  if (group.empty())
     return false;
-  for (unsigned offset = range.offset,
-                end = range.offset + range.size -
-                      static_cast<unsigned>(group.size());
-       offset <= end; ++offset) {
-    if (groupMatchesValues(values, offset, group, aliases))
-      return true;
-  }
-  return false;
+
+  auto matchesLogicalValue = [&](auto &&self, unsigned offset, mlir::Type type)
+      -> bool {
+    if (auto unionType = mlir::dyn_cast<py::UnionType>(type)) {
+      if (group.size() == range.size &&
+          groupMatchesValues(values, range.offset, group, aliases))
+        return true;
+      if (offset >= values.size() || !values[offset].getType().isInteger(64))
+        return false;
+      unsigned memberOffset = offset + 1;
+      for (mlir::Type member : unionType.getMemberTypes()) {
+        std::optional<unsigned> memberSize =
+            logicalReturnValueCount(values, memberOffset, deallocators, member);
+        if (!memberSize)
+          return false;
+        if (*memberSize > 0 && self(self, memberOffset, member))
+          return true;
+        memberOffset += *memberSize;
+      }
+      return false;
+    }
+
+    std::optional<unsigned> size =
+        logicalReturnValueCount(values, offset, deallocators, type);
+    return size && group.size() == *size &&
+           groupMatchesValues(values, offset, group, aliases);
+  };
+
+  return matchesLogicalValue(matchesLogicalValue, range.offset, range.type);
 }
 
 bool returnTransfersGroup(mlir::func::FuncOp function,
@@ -329,7 +422,7 @@ bool returnTransfersGroup(mlir::func::FuncOp function,
   }
   for (const OwnedReturnRange &range : *ranges)
     if (groupMatchesOwnedReturnRange(returnOp.getOperands(), range, group,
-                                     aliases))
+                                     deallocators, aliases))
       return true;
   return false;
 }
@@ -428,8 +521,15 @@ bool sameExactGroup(llvm::ArrayRef<mlir::Value> lhs,
 
 struct ReleaseInsertion {
   mlir::Operation *after = nullptr;
+  mlir::Operation *before = nullptr;
   llvm::SmallVector<mlir::Value, 4> group;
 };
+
+mlir::Block *releaseInsertionBlock(const ReleaseInsertion &release) {
+  if (release.before)
+    return release.before->getBlock();
+  return release.after ? release.after->getBlock() : nullptr;
+}
 
 std::optional<ReleaseInsertion>
 mergeReleaseInsertion(std::optional<ReleaseInsertion> current,
@@ -438,8 +538,17 @@ mergeReleaseInsertion(std::optional<ReleaseInsertion> current,
     return next;
   if (!sameExactGroup(current->group, next.group))
     return std::nullopt;
-  if (current->after->getBlock() != next.after->getBlock())
+  if (releaseInsertionBlock(*current) != releaseInsertionBlock(next))
     return std::nullopt;
+  if (current->before || next.before) {
+    if (current->before && next.before && current->before != next.before)
+      return std::nullopt;
+    if (!current->before) {
+      current->before = next.before;
+      current->after = nullptr;
+    }
+    return current;
+  }
   current->after = latestUserInBlock(current->after, next.after);
   return current;
 }
@@ -457,6 +566,7 @@ findReleaseInsertion(mlir::ModuleOp module, mlir::Operation *owner,
 
   mlir::Operation *lastUser = nullptr;
   std::optional<ReleaseInsertion> forwardedRelease;
+  std::optional<ReleaseInsertion> terminalRelease;
   for (mlir::Value result : group) {
     llvm::SmallVector<mlir::Value, 8> equivalentValues;
     aliases.aliasesOf(result, equivalentValues);
@@ -468,7 +578,7 @@ findReleaseInsertion(mlir::ModuleOp module, mlir::Operation *owner,
         mlir::Operation *user = use.getOwner();
         if (user == owner)
           continue;
-        if (isOwnershipConsumingUse(module, use))
+        if (ownershipConsumingUseInvalidatesGroup(module, use, group, aliases))
           return std::nullopt;
 
         if (auto returnOp = mlir::dyn_cast<mlir::func::ReturnOp>(user)) {
@@ -478,7 +588,17 @@ findReleaseInsertion(mlir::ModuleOp module, mlir::Operation *owner,
               returnTransfersGroup(function, returnOp, group, deallocators,
                                    aliases))
             return std::nullopt;
-          return std::nullopt;
+          mlir::Operation *blockUser = ancestorInBlock(user, block);
+          if (!blockUser)
+            return std::nullopt;
+          ReleaseInsertion release;
+          release.before = blockUser;
+          release.group.append(group.begin(), group.end());
+          terminalRelease =
+              mergeReleaseInsertion(std::move(terminalRelease), release);
+          if (!terminalRelease)
+            return std::nullopt;
+          continue;
         }
 
         if (user->hasTrait<mlir::OpTrait::IsTerminator>()) {
@@ -518,6 +638,8 @@ findReleaseInsertion(mlir::ModuleOp module, mlir::Operation *owner,
 
   if (forwardedRelease)
     return forwardedRelease;
+  if (terminalRelease)
+    return terminalRelease;
 
   ReleaseInsertion release;
   release.after = lastUser ? lastUser : owner;
@@ -699,8 +821,11 @@ insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
     std::optional<ReleaseInsertion> release =
         findReleaseInsertion(module, call, group.values, deallocators, aliases);
     if (release) {
-      mlir::OpBuilder builder(release->after);
-      builder.setInsertionPointAfter(release->after);
+      mlir::OpBuilder builder(call);
+      if (release->before)
+        builder.setInsertionPoint(release->before);
+      else
+        builder.setInsertionPointAfter(release->after);
       builder.create<mlir::func::CallOp>(
           call.getLoc(), group.deallocator->function, release->group);
       continue;
@@ -722,7 +847,8 @@ insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
           if (user == call.getOperation())
             continue;
           if (user->getParentOfType<mlir::func::FuncOp>() != function ||
-              isOwnershipConsumingUse(module, use) ||
+              ownershipConsumingUseInvalidatesGroup(module, use, group.values,
+                                                    aliases) ||
               mlir::isa<mlir::func::ReturnOp>(user) ||
               branchForwardsGroupToBlockArgument(user, group.values,
                                                  aliases)) {
@@ -743,6 +869,79 @@ insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
     llvm::SmallVector<mlir::func::ReturnOp, 4> returns;
     function.walk([&](mlir::func::ReturnOp returnOp) {
       if (dominance.dominates(call.getOperation(), returnOp.getOperation()))
+        returns.push_back(returnOp);
+    });
+    for (mlir::func::ReturnOp returnOp : returns) {
+      mlir::OpBuilder builder(returnOp);
+      builder.create<mlir::func::CallOp>(returnOp.getLoc(),
+                                         group.deallocator->function,
+                                         group.values);
+    }
+  }
+  return mlir::success();
+}
+
+mlir::LogicalResult
+insertOwnedLocalObjectReleases(mlir::ModuleOp module, mlir::Operation *op,
+                               llvm::ArrayRef<own::RuntimeDeallocator>
+                                   deallocators,
+                               own::AliasAnalysis &aliases) {
+  for (own::ResourceGroup group :
+       own::collectOwnedLocalObjectGroups(op, deallocators)) {
+    if (!group.deallocator)
+      continue;
+
+    std::optional<ReleaseInsertion> release =
+        findReleaseInsertion(module, op, group.values, deallocators, aliases);
+    if (release) {
+      mlir::OpBuilder builder(op);
+      if (release->before)
+        builder.setInsertionPoint(release->before);
+      else
+        builder.setInsertionPointAfter(release->after);
+      builder.create<mlir::func::CallOp>(
+          op->getLoc(), group.deallocator->function, release->group);
+      continue;
+    }
+
+    mlir::func::FuncOp function = op->getParentOfType<mlir::func::FuncOp>();
+    if (!function)
+      continue;
+
+    bool canReleaseAtExits = true;
+    for (mlir::Value result : group.values) {
+      llvm::SmallVector<mlir::Value, 8> equivalentValues;
+      aliases.aliasesOf(result, equivalentValues);
+      if (equivalentValues.empty())
+        equivalentValues.push_back(result);
+      for (mlir::Value equivalent : equivalentValues) {
+        for (mlir::OpOperand &use : equivalent.getUses()) {
+          mlir::Operation *user = use.getOwner();
+          if (user == op)
+            continue;
+          if (user->getParentOfType<mlir::func::FuncOp>() != function ||
+              ownershipConsumingUseInvalidatesGroup(module, use, group.values,
+                                                    aliases) ||
+              mlir::isa<mlir::func::ReturnOp>(user) ||
+              branchForwardsGroupToBlockArgument(user, group.values,
+                                                 aliases)) {
+            canReleaseAtExits = false;
+            break;
+          }
+        }
+        if (!canReleaseAtExits)
+          break;
+      }
+      if (!canReleaseAtExits)
+        break;
+    }
+    if (!canReleaseAtExits)
+      continue;
+
+    mlir::DominanceInfo dominance(function);
+    llvm::SmallVector<mlir::func::ReturnOp, 4> returns;
+    function.walk([&](mlir::func::ReturnOp returnOp) {
+      if (dominance.dominates(op, returnOp.getOperation()))
         returns.push_back(returnOp);
     });
     for (mlir::func::ReturnOp returnOp : returns) {
@@ -794,6 +993,20 @@ public:
     for (mlir::func::CallOp call : calls) {
       if (mlir::failed(
               insertOwnedResultReleases(module, call, deallocators, aliases))) {
+        signalPassFailure();
+        return;
+      }
+    }
+
+    llvm::SmallVector<mlir::Operation *, 16> localObjects;
+    module.walk([&](mlir::Operation *op) {
+      if (op->hasAttr(own::kOwnedLocalObjectContractAttr))
+        localObjects.push_back(op);
+    });
+    for (mlir::Operation *op : localObjects) {
+      if (mlir::failed(
+              insertOwnedLocalObjectReleases(module, op, deallocators,
+                                             aliases))) {
         signalPassFailure();
         return;
       }

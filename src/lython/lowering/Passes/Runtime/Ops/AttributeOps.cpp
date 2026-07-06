@@ -562,6 +562,14 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
                    static_cast<unsigned>(fieldValueTypes->size()), oldValues);
   builder.setInsertionPoint(op);
   std::string slotName = (llvm::Twine("class.") + op.getName()).str();
+  bool releaseOwnedSource = false;
+  if (const RuntimeBundle *source =
+          RuntimeBundleLowerer::concreteObjectForOwnership(*value)) {
+    releaseOwnedSource =
+        source->kind == RuntimeBundle::Kind::Object &&
+        source->objectValue.ownership == ownership::OwnershipKind::Own &&
+        !source->physicalValues().empty();
+  }
   const RuntimeBundle *oldSlotValue = nullptr;
   auto oldFieldBundle = object->fieldBundles.find(op.getName());
   if (oldFieldBundle != object->fieldBundles.end())
@@ -582,17 +590,25 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
             /*releaseMissingOldObjectSlot=*/true)))
       return mlir::failure();
   }
+  if (releaseOwnedSource &&
+      mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
+          op, *value, llvm::Twine(slotName).concat(".source").str())))
+    return mlir::failure();
   for (auto [index, replacement] : llvm::enumerate(slotValue.physicalValues()))
     values[*offset + index] = replacement;
   slotValue.setObjectLogicalOwnership(/*ownsObject=*/true);
 
   RuntimeBundle updated;
-  if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
-          op, op.getObject().getType(), values, updated)))
+  if (mlir::failed(RuntimeBundleLowerer::makeObjectBundleWithOwnership(
+          op, op.getObject().getType(), values, updated,
+          object->objectValue.ownership)))
     return mlir::failure();
   updated.copyEvidenceFrom(*object);
   updated.fieldBundles[op.getName()] =
       std::make_shared<RuntimeBundle>(std::move(slotValue));
+  if (mlir::failed(RuntimeBundleLowerer::markOwnedLocalObjectBundle(
+          op, op.getObject(), updated)))
+    return mlir::failure();
   valueBundles[op.getObject()] = std::move(updated);
   erase.push_back(op);
   return mlir::success();

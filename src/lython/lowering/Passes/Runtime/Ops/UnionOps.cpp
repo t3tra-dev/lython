@@ -70,8 +70,8 @@ mlir::LogicalResult RuntimeBundleLowerer::appendUnionRuntimeValues(
   auto sourceUnion = mlir::dyn_cast<py::UnionType>(sourceType);
   auto appendDeadMember = [&](mlir::Type member) -> mlir::LogicalResult {
     mlir::FailureOr<RuntimeValue> value =
-        RuntimeBundleLowerer::materializeDeadObjectValue(op, member,
-                                                         "union member ABI");
+        RuntimeBundleLowerer::materializeNonOwningDeadObjectValue(
+            op, member, "union inactive member ABI");
     if (mlir::failed(value))
       return mlir::failure();
     values.append(value->values.begin(), value->values.end());

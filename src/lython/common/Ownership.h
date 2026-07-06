@@ -31,6 +31,8 @@ inline constexpr llvm::StringLiteral kObjectHeaderAttr{
     "ly.ownership.object_header"};
 inline constexpr llvm::StringLiteral kOwnedLocalObjectAttr{
     "ly.ownership.owned_local_object"};
+inline constexpr llvm::StringLiteral kOwnedLocalObjectContractAttr{
+    "ly.ownership.owned_local_object_contract"};
 inline constexpr llvm::StringLiteral kObjectDeallocPartAttr{
     "ly.ownership.object_dealloc_part"};
 inline constexpr llvm::StringLiteral kObjectReleaseToZeroAttr{
@@ -154,6 +156,9 @@ struct ResourceGroup {
 llvm::SmallVector<ResourceGroup, 8>
 collectRuntimeResourceGroups(mlir::ValueRange values,
                              llvm::ArrayRef<RuntimeDeallocator> deallocators);
+llvm::SmallVector<ResourceGroup, 4>
+collectOwnedLocalObjectGroups(mlir::Operation *op,
+                              llvm::ArrayRef<RuntimeDeallocator> deallocators);
 llvm::SmallVector<ResourceGroup, 8>
 collectOwnedCallResultGroups(mlir::ModuleOp module, mlir::func::CallOp call,
                              llvm::ArrayRef<RuntimeDeallocator> deallocators);

@@ -1,5 +1,6 @@
 add_executable(lyc
     CLI.cpp
+    SanitizerSupport.cpp
 )
 
 target_include_directories(lyc
@@ -24,6 +25,27 @@ target_link_libraries(lyc
     LythonEmitter
     MLIR
     LLVM
+)
+
+set(LYTHON_CLANG_RESOURCE_DIR "")
+find_program(LYTHON_CLANG_FOR_RESOURCE_DIR
+    NAMES clang
+    HINTS ${LLVM_TOOLS_BINARY_DIR}
+    NO_DEFAULT_PATH
+)
+if(LYTHON_CLANG_FOR_RESOURCE_DIR)
+    execute_process(
+        COMMAND ${LYTHON_CLANG_FOR_RESOURCE_DIR} --print-resource-dir
+        OUTPUT_VARIABLE LYTHON_CLANG_RESOURCE_DIR
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+endif()
+
+target_compile_definitions(lyc
+    PRIVATE
+    LYTHON_LLVM_TOOLS_BINARY_DIR="${LLVM_TOOLS_BINARY_DIR}"
+    LYTHON_CLANG_RESOURCE_DIR="${LYTHON_CLANG_RESOURCE_DIR}"
 )
 
 install(TARGETS lyc

@@ -42,6 +42,51 @@ mlir::LogicalResult RuntimeBundleLowerer::makeObjectBundleWithOwnership(
   return mlir::success();
 }
 
+mlir::LogicalResult
+RuntimeBundleLowerer::markOwnedLocalObjectBundle(mlir::Operation *op,
+                                                 mlir::Value logicalValue,
+                                                 const RuntimeBundle &bundle) {
+  if (!logicalValue || !logicalValue.getDefiningOp<py::NewOp>())
+    return mlir::success();
+  if (bundle.kind != RuntimeBundle::Kind::Object ||
+      bundle.objectValue.values.empty())
+    return mlir::success();
+
+  std::string contractName = bundle.contractName();
+  bool ownsObject = bundle.objectValue.ownership == ownership::OwnershipKind::Own;
+  if (py::ClassOp classOp =
+          RuntimeBundleLowerer::classForContract(bundle.objectValue.contract)) {
+    ownsObject = true;
+    if (contractName.empty())
+      contractName = classOp.getSymName().str();
+  }
+  if (!ownsObject || contractName.empty())
+    return mlir::success();
+
+  if (auto existing = ownedLocalObjectMarkers.find(logicalValue);
+      existing != ownedLocalObjectMarkers.end()) {
+    if (!existing->second->use_empty())
+      return existing->second->emitError()
+             << "owned local object marker unexpectedly has users";
+    existing->second->erase();
+    ownedLocalObjectMarkers.erase(existing);
+  }
+
+  llvm::SmallVector<mlir::Type, 8> types;
+  types.reserve(bundle.objectValue.values.size());
+  for (mlir::Value value : bundle.objectValue.values)
+    types.push_back(value.getType());
+
+  builder.setInsertionPoint(op);
+  auto marker = builder.create<mlir::UnrealizedConversionCastOp>(
+      op->getLoc(), types, bundle.objectValue.values);
+  marker->setAttr(ownership::kOwnedLocalObjectAttr, builder.getUnitAttr());
+  marker->setAttr(ownership::kOwnedLocalObjectContractAttr,
+                  builder.getStringAttr(contractName));
+  ownedLocalObjectMarkers[logicalValue] = marker;
+  return mlir::success();
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::makePrimitiveI64Bundle(
     mlir::Operation *op, mlir::Type contract, mlir::Value value,
     mlir::Value valid, RuntimeBundle &bundle) const {

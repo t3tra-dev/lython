@@ -567,6 +567,33 @@ collectRuntimeResourceGroups(mlir::ValueRange values,
   return groups;
 }
 
+llvm::SmallVector<ResourceGroup, 4>
+collectOwnedLocalObjectGroups(mlir::Operation *op,
+                              llvm::ArrayRef<RuntimeDeallocator> deallocators) {
+  llvm::SmallVector<ResourceGroup, 4> groups;
+  if (!op || !op->hasAttr(kOwnedLocalObjectAttr))
+    return groups;
+
+  auto contractAttr =
+      op->getAttrOfType<mlir::StringAttr>(kOwnedLocalObjectContractAttr);
+  if (!contractAttr || op->getNumResults() == 0)
+    return groups;
+
+  const RuntimeDeallocator *deallocator = findDeallocatorForValueGroup(
+      op->getResults(), 0, deallocators, contractAttr.getValue());
+  if (!deallocator || deallocator->inputTypes.size() != op->getNumResults())
+    return groups;
+
+  ResourceGroup group;
+  group.offset = 0;
+  group.deallocator = deallocator;
+  group.values = valueSlice(
+      op->getResults(), 0,
+      static_cast<unsigned>(deallocator->inputTypes.size()));
+  groups.push_back(std::move(group));
+  return groups;
+}
+
 static bool resourceGroupStartsAt(llvm::ArrayRef<ResourceGroup> groups,
                                   unsigned offset) {
   return llvm::any_of(groups, [&](const ResourceGroup &group) {
@@ -822,11 +849,15 @@ void AliasAnalysis::build(mlir::Operation *root) {
       track(operand);
     for (mlir::Value result : op->getResults())
       track(result);
-    if (!isOwnershipIdentityOp(op))
+    if (auto subview = mlir::dyn_cast<mlir::memref::SubViewOp>(op)) {
+      unionValues(subview.getResult(), subview.getSource());
       return;
-    if (op->getNumOperands() != 1 || op->getNumResults() != 1)
+    }
+    if (!isOwnershipIdentityOp(op) ||
+        op->getNumOperands() != op->getNumResults())
       return;
-    unionValues(op->getResult(0), op->getOperand(0));
+    for (auto [result, operand] : llvm::zip(op->getResults(), op->getOperands()))
+      unionValues(result, operand);
   });
 }
 

@@ -40,6 +40,7 @@
 #include "llvm/Support/Error.h"
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/BinaryFormat/Dwarf.h"
@@ -81,6 +82,7 @@
 #include <optional>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #if defined(__APPLE__) && defined(__aarch64__)
@@ -95,6 +97,7 @@
 #include "Parser.h"
 #include "Passes/Runtime/Arch/Arm/PrimitiveTensorArmSME.h"
 #include "Passes/Runtime/Arch/X86/PrimitiveTensorX86.h"
+#include "SanitizerSupport.h"
 
 #include "PyDialect.h.inc"
 
@@ -106,6 +109,11 @@ using namespace mlir;
 
 namespace {
 using py::PerfScope;
+using lython::driver::SanitizerConfig;
+
+#ifndef LYTHON_LLVM_TOOLS_BINARY_DIR
+#define LYTHON_LLVM_TOOLS_BINARY_DIR ""
+#endif
 
 std::string TargetTriple;
 std::string TargetCPU;
@@ -114,6 +122,7 @@ std::string TargetFloatABI;
 std::string TargetSysroot;
 std::vector<std::string> IncludeSearchPaths;
 std::vector<std::string> LibrarySearchPaths;
+lython::driver::SanitizerConfig ActiveSanitizers;
 
 std::string trimEnvToken(llvm::StringRef token) {
   token = token.trim();
@@ -560,8 +569,11 @@ LogicalResult generateModuleFromCppFrontend(StringRef pythonFile,
   lython::emitter::EmitResult emitted;
   {
     PerfScope perf("ir-generation");
+    lython::emitter::EmitOptions emitOptions;
+    emitOptions.sanitizeUndefined = ActiveSanitizers.undefined;
     emitted = lython::emitter::emitModule(*parsed.tree, context, "__main__",
-                                          pythonTracebackPath(pythonFile));
+                                          pythonTracebackPath(pythonFile),
+                                          emitOptions);
   }
   if (!emitted.ok()) {
     for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics) {
@@ -666,9 +678,8 @@ LogicalResult installAOTEntryPoint(llvm::Module &llvmModule) {
 // passes never ran SROA/mem2reg-class cleanups on the translated IR, so
 // without this the descriptor allocas of every lowered object stay in the
 // frame (~2KB per object-handling call frame) and nothing is ever inlined.
-// The O2 default pipeline already contains the coroutine lowering phases
-// (CoroEarly/CoroSplit/CoroCleanup) at their correct positions.
 void runLLVMCoroLowering(llvm::Module &llvmModule,
+                         const SanitizerConfig &sanitizers,
                          llvm::TargetMachine *targetMachine = nullptr) {
   llvm::LoopAnalysisManager loopAM;
   llvm::FunctionAnalysisManager functionAM;
@@ -683,6 +694,7 @@ void runLLVMCoroLowering(llvm::Module &llvmModule,
 
   llvm::ModulePassManager modulePM =
       passBuilder.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O2);
+  lython::driver::addSanitizerInstrumentationPasses(modulePM, sanitizers);
   modulePM.run(llvmModule, moduleAM);
 }
 
@@ -1152,15 +1164,14 @@ LogicalResult verifyPostCoroLLVMThreadSafe(
       llvmModule, profile, "post-coro LLVM safety verifier", coverage);
 }
 
-LogicalResult
-verifyOptimizedLLVMThreadSafe(llvm::Module &llvmModule,
-                                const LLVMSafetyProfile &profile) {
+LogicalResult verifyOptimizedLLVMThreadSafe(llvm::Module &llvmModule,
+                                            const LLVMSafetyProfile &profile) {
   return verifyPostCoroLLVMThreadSafe(
       llvmModule, profile, LLVMSafetyContractCoverage::AllowOptimizerElision);
 }
 
 LogicalResult emitObjectFile(llvm::Module &llvmModule,
-                             const LLVMSafetyProfile &safetyProfile,
+                             LLVMSafetyProfile &safetyProfile,
                              py::TensorLoweringTarget tensorTarget,
                              StringRef objectPath) {
   std::string targetTriple;
@@ -1169,7 +1180,8 @@ LogicalResult emitObjectFile(llvm::Module &llvmModule,
     return failure();
   llvmModule.setTargetTriple(targetTriple);
   llvmModule.setDataLayout(targetMachine->createDataLayout());
-  runLLVMCoroLowering(llvmModule, targetMachine.get());
+  runLLVMCoroLowering(llvmModule, ActiveSanitizers, targetMachine.get());
+  collectLinkedLLVMSafetyContracts(llvmModule, safetyProfile);
   if (failed(verifyOptimizedLLVMThreadSafe(llvmModule, safetyProfile)))
     return failure();
 
@@ -1244,6 +1256,17 @@ std::optional<std::string> findExecutableProgram(llvm::StringRef name) {
   return std::nullopt;
 }
 
+std::optional<std::string> findLLVMToolProgram(llvm::StringRef name) {
+  llvm::StringRef toolsDir = LYTHON_LLVM_TOOLS_BINARY_DIR;
+  if (!toolsDir.empty()) {
+    llvm::SmallString<256> path(toolsDir);
+    llvm::sys::path::append(path, name);
+    if (llvm::sys::fs::can_execute(path))
+      return path.str().str();
+  }
+  return findExecutableProgram(name);
+}
+
 std::optional<std::string> findHomebrewMinGWProgram(llvm::StringRef name) {
   const char *prefixes[] = {"/opt/homebrew/opt/mingw-w64/bin",
                             "/usr/local/opt/mingw-w64/bin"};
@@ -1278,9 +1301,9 @@ findExecutableLinkerDriver(py::TensorLoweringTarget tensorTarget) {
       return LinkerDriver{*mingw, LinkerDriverFlavor::MinGWGcc};
   }
 
-  auto clangExe = llvm::sys::findProgramByName("clang++");
+  auto clangExe = findLLVMToolProgram("clang++");
   if (!clangExe)
-    clangExe = llvm::sys::findProgramByName("clang");
+    clangExe = findLLVMToolProgram("clang");
   if (!clangExe) {
     llvm::errs() << "error: clang++/clang executable not found in PATH\n";
     return std::nullopt;
@@ -1327,6 +1350,14 @@ void appendLinkTargetArgs(std::vector<std::string> &args,
   }
 }
 
+void appendSanitizerLinkArgs(std::vector<std::string> &args,
+                             const SanitizerConfig &sanitizers) {
+  std::string sanitizerList = lython::driver::sanitizerClangList(sanitizers);
+  if (sanitizerList.empty())
+    return;
+  args.emplace_back("-fsanitize=" + sanitizerList);
+}
+
 void appendLinkTargetLibraries(std::vector<std::string> &args,
                                py::TensorLoweringTarget tensorTarget) {
   llvm::Triple targetTriple = codeGenTripleForTarget(tensorTarget);
@@ -1363,10 +1394,16 @@ LogicalResult linkExecutable(StringRef objectPath,
   std::optional<LinkerDriver> linker = findExecutableLinkerDriver(tensorTarget);
   if (!linker)
     return failure();
+  if (ActiveSanitizers.any() && linker->flavor != LinkerDriverFlavor::Clang) {
+    llvm::errs() << "error: -fsanitize is only supported with the clang linker "
+                    "driver\n";
+    return failure();
+  }
 
   std::vector<std::string> argStorage;
   argStorage.push_back(linker->program);
   appendLinkTargetArgs(argStorage, tensorTarget, linker->flavor);
+  appendSanitizerLinkArgs(argStorage, ActiveSanitizers);
   argStorage.emplace_back(objectPath.str());
   appendLinkTargetLibraries(argStorage, tensorTarget);
   argStorage.emplace_back("-O2");
@@ -1485,7 +1522,7 @@ void attachPythonDebugInfo(ModuleOp module) {
 }
 
 LogicalResult buildExecutable(llvm::Module &llvmModule,
-                              const LLVMSafetyProfile &safetyProfile,
+                              LLVMSafetyProfile &safetyProfile,
                               py::TensorLoweringTarget tensorTarget,
                               StringRef outputPath) {
   llvm::SmallString<256> objectPath;
@@ -1620,6 +1657,9 @@ LogicalResult runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
       return failure();
     }
     jit = std::move(*jitExpected);
+    if (failed(lython::driver::addJITSanitizerRuntimes(
+            *jit, ActiveSanitizers, processTriple)))
+      return failure();
 
     LLVMSafetyProfile safetyProfile;
     collectLLVMSafetyContracts(module, safetyProfile);
@@ -1648,7 +1688,9 @@ LogicalResult runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
     if (failed(py::runtime_library::linkEmbeddedNativeRuntime(*llvmModule)))
       return failure();
     collectLinkedLLVMSafetyContracts(*llvmModule, safetyProfile);
-    runLLVMCoroLowering(*llvmModule, optimizationTargetMachine.get());
+    runLLVMCoroLowering(*llvmModule, ActiveSanitizers,
+                        optimizationTargetMachine.get());
+    collectLinkedLLVMSafetyContracts(*llvmModule, safetyProfile);
     dumpLLVMForPass(irDump, "llvm-translation", *llvmModule);
     if (failed(verifyOptimizedLLVMThreadSafe(*llvmModule, safetyProfile)))
       return failure();
@@ -1693,7 +1735,12 @@ LogicalResult runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
   auto *runner = runnerAddress.toPtr<int (*)(void (*)())>();
   {
     PerfScope perf("execution");
-    if (runner(entry) != 0)
+    if (ActiveSanitizers.leak)
+      lython::driver::callLeakSanitizerHook("__lsan_enable");
+    int status = runner(entry);
+    if (ActiveSanitizers.leak)
+      lython::driver::callLeakSanitizerHook("__lsan_disable");
+    if (status != 0)
       return failure();
   }
   return success();
@@ -1751,6 +1798,23 @@ static llvm::cl::list<std::string>
                        llvm::cl::desc("Add a clang-style library search path"),
                        llvm::cl::value_desc("path"), llvm::cl::Prefix,
                        llvm::cl::ZeroOrMore, llvm::cl::cat(LythonCategory));
+static llvm::cl::list<std::string> SanitizerEnableOptions(
+    "fsanitize",
+    llvm::cl::desc("Enable runtime checks for address, leak, thread, or "
+                   "undefined behavior"),
+    llvm::cl::value_desc("checks"), llvm::cl::CommaSeparated,
+    llvm::cl::ZeroOrMore, llvm::cl::callback([](const std::string &value) {
+      lython::driver::recordSanitizerAction(/*enable=*/true, value);
+    }),
+    llvm::cl::cat(LythonCategory));
+static llvm::cl::list<std::string> SanitizerDisableOptions(
+    "fno-sanitize",
+    llvm::cl::desc("Disable previously enabled sanitizer checks"),
+    llvm::cl::value_desc("checks"), llvm::cl::CommaSeparated,
+    llvm::cl::ZeroOrMore, llvm::cl::callback([](const std::string &value) {
+      lython::driver::recordSanitizerAction(/*enable=*/false, value);
+    }),
+    llvm::cl::cat(LythonCategory));
 static llvm::cl::SubCommand JitCommand("jit", "JIT execute an input file");
 static llvm::cl::opt<std::string>
     JitInputFilename(llvm::cl::Positional, llvm::cl::desc("<input file>"),
@@ -1836,6 +1900,17 @@ int main(int argc, char **argv) {
                ? 1
                : 0;
   }
+
+  if (failed(lython::driver::buildSanitizerConfig(ActiveSanitizers)))
+    return 1;
+  if (jitMode && ActiveSanitizers.any()) {
+    llvm::Triple processTriple(llvm::sys::getDefaultTargetTriple());
+    if (failed(lython::driver::ensureJITSanitizerRuntimesPreloaded(
+            argv, ActiveSanitizers, processTriple)))
+      return 1;
+  }
+  if (jitMode && ActiveSanitizers.leak)
+    lython::driver::callLeakSanitizerHook("__lsan_disable");
 
   bool isPythonInput = llvm::sys::path::extension(inputPath) == ".py";
 
@@ -1937,8 +2012,22 @@ int main(int argc, char **argv) {
 
   collectLinkedLLVMSafetyContracts(*llvmModule, safetyProfile);
 
-  if (EmitLLVMOnly)
+  if (EmitLLVMOnly) {
+    if (ActiveSanitizers.requiresLLVMInstrumentation()) {
+      std::string targetTriple;
+      auto targetMachine =
+          createCodeGenTargetMachine(tensorTarget, &targetTriple);
+      if (!targetMachine)
+        return 1;
+      llvmModule->setTargetTriple(targetTriple);
+      llvmModule->setDataLayout(targetMachine->createDataLayout());
+      runLLVMCoroLowering(*llvmModule, ActiveSanitizers, targetMachine.get());
+      collectLinkedLLVMSafetyContracts(*llvmModule, safetyProfile);
+      if (failed(verifyOptimizedLLVMThreadSafe(*llvmModule, safetyProfile)))
+        return 1;
+    }
     return failed(writeLLVMIR(*llvmModule, outputPath)) ? 1 : 0;
+  }
 
   return failed(buildExecutable(*llvmModule, safetyProfile, tensorTarget,
                                 outputPath))
