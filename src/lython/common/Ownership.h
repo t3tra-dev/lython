@@ -174,7 +174,12 @@ public:
                  llvm::SmallVectorImpl<mlir::Value> &aliases);
 
 private:
+  void invalidateAliasBuckets();
+  void rebuildAliasBuckets();
+
   llvm::DenseMap<mlir::Value, mlir::Value> parent;
+  llvm::DenseMap<mlir::Value, llvm::SmallVector<mlir::Value, 8>> aliasBuckets;
+  bool aliasBucketsDirty = true;
 };
 
 } // namespace py::ownership

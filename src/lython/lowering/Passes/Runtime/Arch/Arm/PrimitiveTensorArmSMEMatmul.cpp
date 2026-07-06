@@ -16,6 +16,7 @@
 #include "llvm/ADT/SmallVector.h"
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 
@@ -39,6 +40,10 @@ struct SMEMatmulViews {
   mlir::Value rhs;
   mlir::Value out;
 };
+
+// SME setup and LHS panel packing dominate very small contractions. Keep those
+// on the generic scalar/vector path, which already has small-matmul handling.
+constexpr std::uint64_t kSMEMatmulMinWork = 1024;
 
 mlir::Value createIndexConstant(mlir::OpBuilder &builder, mlir::Location loc,
                                 int64_t value) {
@@ -105,6 +110,24 @@ matchStaticF32Matmul(mlir::linalg::MatmulOp matmul) {
     return std::nullopt;
 
   return StaticMatmulMemRefs{lhs, rhs, out, lhsType, rhsType, outType, m, n, k};
+}
+
+std::uint64_t saturatedMatmulWork(const StaticMatmulMemRefs &refs) {
+  constexpr std::uint64_t max = std::numeric_limits<std::uint64_t>::max();
+  std::uint64_t work = 1;
+  for (int64_t dim : {refs.m, refs.n, refs.k}) {
+    if (dim <= 0)
+      return 0;
+    std::uint64_t value = static_cast<std::uint64_t>(dim);
+    if (work > max / value)
+      return max;
+    work *= value;
+  }
+  return work;
+}
+
+bool isProfitableStaticSMEMatmul(const StaticMatmulMemRefs &refs) {
+  return saturatedMatmulWork(refs) >= kSMEMatmulMinWork;
 }
 
 mlir::Value createRemaining(mlir::OpBuilder &builder, mlir::Location loc,
@@ -290,7 +313,7 @@ mlir::Value createRhsVector(mlir::OpBuilder &builder, mlir::Location loc,
 mlir::LogicalResult lowerStaticF32MatmulToSME(mlir::linalg::MatmulOp matmul,
                                               mlir::IRRewriter &rewriter) {
   std::optional<StaticMatmulMemRefs> refs = matchStaticF32Matmul(matmul);
-  if (!refs)
+  if (!refs || !isProfitableStaticSMEMatmul(*refs))
     return mlir::failure();
 
   rewriter.setInsertionPoint(matmul);
@@ -402,7 +425,8 @@ public:
   void runOnOperation() final {
     llvm::SmallVector<mlir::linalg::MatmulOp, 16> matmuls;
     getOperation().walk([&](mlir::linalg::MatmulOp matmul) {
-      if (matchStaticF32Matmul(matmul))
+      std::optional<StaticMatmulMemRefs> refs = matchStaticF32Matmul(matmul);
+      if (refs && isProfitableStaticSMEMatmul(*refs))
         matmuls.push_back(matmul);
     });
 

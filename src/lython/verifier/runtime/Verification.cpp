@@ -1,5 +1,7 @@
 #include "runtime/Verification.h"
 
+#include "Common/Instrumentation.h"
+
 #include "Contracts.h"
 #include "Ownership.h"
 #include "runtime/Detail.h"
@@ -278,14 +280,25 @@ mlir::LogicalResult verifyOwnership(mlir::ModuleOp module) {
 }
 
 mlir::LogicalResult verifyLLVMCallOwnership(mlir::ModuleOp module) {
-  if (mlir::failed(lowering::verifyOwnershipContractShapes(module)))
-    return mlir::failure();
-  if (mlir::failed(
-          lowering::verifyLLVMOwnershipContractShapes(module)))
-    return mlir::failure();
-  if (mlir::failed(lowering::verifyLLVMCallOwnershipContracts(module)))
-    return mlir::failure();
-  return lowering::verifyFuncCallOwnershipContracts(module);
+  {
+    PerfScope perf("llvm-call-ownership.func-contract-shapes");
+    if (mlir::failed(lowering::verifyOwnershipContractShapes(module)))
+      return mlir::failure();
+  }
+  {
+    PerfScope perf("llvm-call-ownership.llvm-contract-shapes");
+    if (mlir::failed(lowering::verifyLLVMOwnershipContractShapes(module)))
+      return mlir::failure();
+  }
+  {
+    PerfScope perf("llvm-call-ownership.llvm-call-contracts");
+    if (mlir::failed(lowering::verifyLLVMCallOwnershipContracts(module)))
+      return mlir::failure();
+  }
+  {
+    PerfScope perf("llvm-call-ownership.func-call-contracts");
+    return lowering::verifyFuncCallOwnershipContracts(module);
+  }
 }
 
 } // namespace py

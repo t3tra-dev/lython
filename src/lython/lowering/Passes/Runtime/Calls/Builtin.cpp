@@ -3,6 +3,37 @@
 #include <functional>
 
 namespace py::lowering {
+namespace {
+
+bool isCollectionMetaType(mlir::Type type) {
+  auto memref = mlir::dyn_cast<mlir::MemRefType>(type);
+  if (!memref || memref.getRank() != 1)
+    return false;
+  if (memref.hasStaticShape() && memref.getDimSize(0) < 1)
+    return false;
+  auto element = mlir::dyn_cast<mlir::IntegerType>(memref.getElementType());
+  return element && element.getWidth() == 64;
+}
+
+mlir::LogicalResult keepAliveCollectionEvidenceUse(mlir::Operation *op,
+                                                   mlir::OpBuilder &builder,
+                                                   const RuntimeBundle &bundle,
+                                                   llvm::StringRef label) {
+  if (bundle.physicalValues().size() < 2)
+    return op->emitError() << label
+                           << " collection has no physical length metadata";
+  mlir::Value meta = bundle.physicalValues()[1];
+  if (!isCollectionMetaType(meta.getType()))
+    return op->emitError() << label
+                           << " collection length metadata has invalid type "
+                           << meta.getType();
+  mlir::Value slot =
+      builder.create<mlir::arith::ConstantIndexOp>(op->getLoc(), 0);
+  builder.create<mlir::memref::LoadOp>(op->getLoc(), meta, slot);
+  return mlir::success();
+}
+
+} // namespace
 
 mlir::LogicalResult RuntimeBundleLowerer::collectSingleBuiltinArgument(
     py::CallOp op, const RuntimeSymbol &symbol,
@@ -312,9 +343,23 @@ RuntimeBundleLowerer::lowerBuiltinMethodSinkCall(py::CallOp op,
             emitted->call, result);
       };
 
+      const RuntimeBundle *dynamicKeepAlive = nullptr;
+      const RuntimeBundle *resolvedPrintable =
+          RuntimeBundleLowerer::concreteObjectForOwnership(printable);
+      const RuntimeBundle &printableView =
+          resolvedPrintable ? *resolvedPrintable : printable;
+      if (!printableView.sequenceElementBundles.empty())
+        dynamicKeepAlive = &printableView;
+
       RuntimeBundle dynamic;
       if (mlir::failed(renderDynamicRepr(printable, dynamic)))
         return mlir::failure();
+      if (dynamicKeepAlive) {
+        builder.setInsertionPoint(op);
+        if (mlir::failed(keepAliveCollectionEvidenceUse(
+                op, builder, *dynamicKeepAlive, "dynamic repr")))
+          return mlir::failure();
+      }
       printable = std::move(dynamic);
     }
   }

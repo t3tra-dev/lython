@@ -1,5 +1,7 @@
 #include "runtime/Detail.h"
 
+#include "Common/Instrumentation.h"
+
 #include "Contracts.h"
 #include "Ownership.h"
 
@@ -12,6 +14,8 @@
 #include "mlir/IR/Operation.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/Twine.h"
 
 #include <algorithm>
@@ -259,6 +263,42 @@ struct BorrowedPathState {
   llvm::SmallVector<mlir::Value, 4> group;
 };
 
+struct CachedFuncContract {
+  mlir::func::FuncOp function;
+  own::FunctionContract contract;
+};
+
+class FuncContractCache {
+public:
+  explicit FuncContractCache(mlir::ModuleOp module) {
+    module.walk([&](mlir::func::FuncOp function) {
+      functions.insert({function.getSymName(), function});
+    });
+  }
+
+  mlir::FailureOr<const CachedFuncContract *> lookup(llvm::StringRef name) {
+    auto cached = contracts.find(name);
+    if (cached != contracts.end())
+      return &cached->second;
+
+    auto function = functions.find(name);
+    if (function == functions.end())
+      return static_cast<const CachedFuncContract *>(nullptr);
+
+    auto contract = own::readFunctionContract(function->second);
+    if (mlir::failed(contract))
+      return mlir::failure();
+
+    CachedFuncContract entry{function->second, *contract};
+    auto inserted = contracts.insert({name, std::move(entry)});
+    return &inserted.first->second;
+  }
+
+private:
+  llvm::StringMap<mlir::func::FuncOp> functions;
+  llvm::StringMap<CachedFuncContract> contracts;
+};
+
 bool sameValueGroup(llvm::ArrayRef<mlir::Value> lhs,
                     llvm::ArrayRef<mlir::Value> rhs) {
   if (lhs.size() != rhs.size())
@@ -345,39 +385,33 @@ bool groupHasValueDefinedInsideRegion(llvm::ArrayRef<mlir::Value> group,
   });
 }
 
-bool callConsumesGroup(mlir::ModuleOp module, mlir::func::CallOp call,
+bool callConsumesGroup(FuncContractCache &contracts, mlir::func::CallOp call,
                        llvm::ArrayRef<mlir::Value> group,
                        own::AliasAnalysis &aliases) {
-  mlir::func::FuncOp callee =
-      module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
-  if (!callee)
+  auto cached = contracts.lookup(call.getCallee());
+  if (mlir::failed(cached) || !*cached)
     return false;
-  auto contract = own::readFunctionContract(callee);
-  if (mlir::failed(contract))
-    return false;
-  for (unsigned offset : contract->releaseArgs.values)
+  for (unsigned offset : (*cached)->contract.releaseArgs.values)
     if (groupMatchesOperands(call.getOperands(), offset, group, aliases))
       return true;
-  for (unsigned offset : contract->transferArgs.values)
+  for (unsigned offset : (*cached)->contract.transferArgs.values)
     if (groupMatchesOperands(call.getOperands(), offset, group, aliases))
       return true;
   return false;
 }
 
 std::optional<llvm::SmallVector<mlir::Value, 4>>
-callTransfersGroupToOwnedResult(mlir::ModuleOp module, mlir::func::CallOp call,
+callTransfersGroupToOwnedResult(FuncContractCache &contracts,
+                                mlir::func::CallOp call,
                                 llvm::ArrayRef<mlir::Value> group,
                                 own::AliasAnalysis &aliases) {
-  mlir::func::FuncOp callee =
-      module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
-  if (!callee)
+  auto cached = contracts.lookup(call.getCallee());
+  if (mlir::failed(cached) || !*cached)
     return std::nullopt;
-  auto contract = own::readFunctionContract(callee);
-  if (mlir::failed(contract))
-    return std::nullopt;
+  const own::FunctionContract &contract = (*cached)->contract;
 
   bool transfers = false;
-  for (unsigned offset : contract->transferArgs.values) {
+  for (unsigned offset : contract.transferArgs.values) {
     if (groupMatchesOperands(call.getOperands(), offset, group, aliases)) {
       transfers = true;
       break;
@@ -386,7 +420,7 @@ callTransfersGroupToOwnedResult(mlir::ModuleOp module, mlir::func::CallOp call,
   if (!transfers)
     return std::nullopt;
 
-  for (unsigned offset : contract->ownedResults.values) {
+  for (unsigned offset : contract.ownedResults.values) {
     if (offset + group.size() > call.getNumResults())
       continue;
     bool typesMatch = true;
@@ -407,19 +441,15 @@ callTransfersGroupToOwnedResult(mlir::ModuleOp module, mlir::func::CallOp call,
   return std::nullopt;
 }
 
-bool callRetainsGroup(mlir::ModuleOp module, mlir::func::CallOp call,
+bool callRetainsGroup(FuncContractCache &contracts, mlir::func::CallOp call,
                       llvm::ArrayRef<mlir::Value> group,
                       own::AliasAnalysis &aliases) {
   if (group.empty())
     return false;
-  mlir::func::FuncOp callee =
-      module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
-  if (!callee)
+  auto cached = contracts.lookup(call.getCallee());
+  if (mlir::failed(cached) || !*cached)
     return false;
-  auto contract = own::readFunctionContract(callee);
-  if (mlir::failed(contract))
-    return false;
-  for (unsigned offset : contract->retainArgs.values) {
+  for (unsigned offset : (*cached)->contract.retainArgs.values) {
     if (offset >= call.getNumOperands())
       continue;
     if (aliases.same(call.getOperand(offset), group.front()))
@@ -428,26 +458,24 @@ bool callRetainsGroup(mlir::ModuleOp module, mlir::func::CallOp call,
   return false;
 }
 
-bool callPartiallyConsumesGroup(mlir::ModuleOp module, mlir::func::CallOp call,
+bool callPartiallyConsumesGroup(FuncContractCache &contracts,
+                                mlir::func::CallOp call,
                                 llvm::ArrayRef<mlir::Value> group,
                                 own::AliasAnalysis &aliases) {
-  mlir::func::FuncOp callee =
-      module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
-  if (!callee)
+  auto cached = contracts.lookup(call.getCallee());
+  if (mlir::failed(cached) || !*cached)
     return false;
-  auto contract = own::readFunctionContract(callee);
-  if (mlir::failed(contract))
-    return false;
+  const own::FunctionContract &contract = (*cached)->contract;
 
   auto consumesTrackedHeaderAt = [&](unsigned index) {
     return !group.empty() && index < call.getNumOperands() &&
            aliases.same(call.getOperand(index), group.front());
   };
-  for (unsigned offset : contract->releaseArgs.values)
+  for (unsigned offset : contract.releaseArgs.values)
     if (consumesTrackedHeaderAt(offset) &&
         !groupMatchesOperands(call.getOperands(), offset, group, aliases))
       return true;
-  for (unsigned offset : contract->transferArgs.values)
+  for (unsigned offset : contract.transferArgs.values)
     if (consumesTrackedHeaderAt(offset) &&
         !groupMatchesOperands(call.getOperands(), offset, group, aliases))
       return true;
@@ -501,6 +529,167 @@ bool groupContainsArgumentFromBlock(llvm::ArrayRef<mlir::Value> group,
     auto argument = mlir::dyn_cast_if_present<mlir::BlockArgument>(value);
     return argument && argument.getOwner() == block;
   });
+}
+
+mlir::Operation *ancestorInBlock(mlir::Operation *op, mlir::Block *block) {
+  while (op && op->getBlock() != block)
+    op = op->getParentOp();
+  if (!op || op->getBlock() != block)
+    return nullptr;
+  return op;
+}
+
+bool isSingleBlockStraightLineFunction(mlir::func::FuncOp function) {
+  if (!function || function.isDeclaration() ||
+      !llvm::hasSingleElement(function.getBlocks()))
+    return false;
+  for (mlir::Operation &op : function.front()) {
+    if (op.getNumRegions() != 0 || op.getNumSuccessors() != 0)
+      return false;
+    if (op.hasTrait<mlir::OpTrait::IsTerminator>() &&
+        !mlir::isa<mlir::func::ReturnOp>(op))
+      return false;
+  }
+  return true;
+}
+
+mlir::func::ReturnOp straightLineReturnOp(mlir::func::FuncOp function) {
+  if (!function || function.empty())
+    return {};
+  return mlir::dyn_cast<mlir::func::ReturnOp>(function.front().getTerminator());
+}
+
+std::optional<mlir::LogicalResult> verifyStraightLineResource(
+    FuncContractCache &contracts, TrackedResource &resource,
+    llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
+    own::AliasAnalysis &aliases) {
+  if (resource.condition || !resource.producer)
+    return std::nullopt;
+  mlir::Block *block = resource.producer->getBlock();
+  if (!block || block->getParentOp() != resource.function)
+    return std::nullopt;
+
+  llvm::SmallVector<mlir::Operation *, 16> users;
+  llvm::SmallPtrSet<mlir::Operation *, 16> seen;
+  for (mlir::Value value : resource.group) {
+    llvm::SmallVector<mlir::Value, 8> equivalentValues;
+    aliases.aliasesOf(value, equivalentValues);
+    if (equivalentValues.empty())
+      equivalentValues.push_back(value);
+    for (mlir::Value equivalent : equivalentValues) {
+      for (mlir::OpOperand &use : equivalent.getUses()) {
+        mlir::Operation *user =
+            ancestorInBlock(use.getOwner(), resource.producer->getBlock());
+        if (!user)
+          return std::nullopt;
+        if (user == resource.producer)
+          continue;
+        if (!resource.producer->isBeforeInBlock(user))
+          continue;
+        if (seen.insert(user).second)
+          users.push_back(user);
+      }
+    }
+  }
+  llvm::sort(users, [](mlir::Operation *lhs, mlir::Operation *rhs) {
+    return lhs->isBeforeInBlock(rhs);
+  });
+
+  AffineTokenState token = AffineTokenState::Owned;
+  unsigned retained = 0;
+  llvm::SmallVector<mlir::Value, 4> group = resource.group;
+  for (mlir::Operation *op : users) {
+    if (auto ret = mlir::dyn_cast<mlir::func::ReturnOp>(op)) {
+      bool consumes =
+          returnConsumesGroup(resource.function, ret, group, deallocators,
+                              aliases);
+      bool uses = groupContainsOperand(op, group, aliases);
+      if (token == AffineTokenState::Owned) {
+        if (!consumes)
+          return ret.emitError()
+                 << "owned resource from " << resource.producerLabel
+                 << " result " << resource.resultOffset
+                 << " reaches function exit without release, transfer, or "
+                    "owned return";
+        if (retained != 0)
+          return ret.emitError()
+                 << "owned resource from " << resource.producerLabel
+                 << " result " << resource.resultOffset << " is returned with "
+                 << retained << " additional retained ownership token(s)";
+        return mlir::success();
+      }
+      if (uses) {
+        if (retained > 0 &&
+            returnCarriesGroupInsideOwnedAggregate(
+                resource.function, ret, group, deallocators, aliases))
+          return mlir::success();
+        return ret.emitError() << "released owned resource from "
+                               << resource.producerLabel
+                               << " is used by function return";
+      }
+      return mlir::success();
+    }
+
+    if (auto call = mlir::dyn_cast<mlir::func::CallOp>(op)) {
+      bool consumes = callConsumesGroup(contracts, call, group, aliases);
+      bool retains = callRetainsGroup(contracts, call, group, aliases);
+      if (callPartiallyConsumesGroup(contracts, call, group, aliases))
+        return call.emitError()
+               << "ownership-consuming call only consumes part of owned "
+                  "resource group produced by "
+               << resource.producerLabel << " result " << resource.resultOffset;
+
+      if (token == AffineTokenState::Released) {
+        if (consumes) {
+          if (retained == 0)
+            return call.emitError()
+                   << "owned resource from " << resource.producerLabel
+                   << " result " << resource.resultOffset
+                   << " is released or transferred more than once on one CFG "
+                      "path";
+          --retained;
+          continue;
+        }
+        if (groupContainsOperand(op, group, aliases) && retained == 0)
+          return call.emitError()
+                 << "released owned resource from " << resource.producerLabel
+                 << " is used after release";
+        if (retains)
+          ++retained;
+        continue;
+      }
+
+      if (consumes) {
+        if (std::optional<llvm::SmallVector<mlir::Value, 4>> replacement =
+                callTransfersGroupToOwnedResult(contracts, call, group,
+                                                aliases)) {
+          // Transferring to a fresh result changes the tracked use set; the
+          // general CFG verifier already handles that case.
+          return std::nullopt;
+        }
+        token = AffineTokenState::Released;
+      }
+      if (token == AffineTokenState::Owned && retains)
+        ++retained;
+      continue;
+    }
+
+    if (token == AffineTokenState::Released &&
+        groupContainsOperand(op, group, aliases) && retained == 0)
+      return op->emitError()
+             << "released owned resource from " << resource.producerLabel
+             << " is used after release";
+  }
+
+  if (token == AffineTokenState::Released)
+    return mlir::success();
+
+  mlir::func::ReturnOp ret = straightLineReturnOp(resource.function);
+  mlir::Operation *errorSite = ret ? ret.getOperation() : resource.producer;
+  return errorSite->emitError()
+         << "owned resource from " << resource.producerLabel << " result "
+         << resource.resultOffset
+         << " reaches function exit without release, transfer, or owned return";
 }
 
 llvm::SmallVector<mlir::Type, 8>
@@ -1006,7 +1195,7 @@ mlir::LogicalResult handleBorrowedGenericRegionReturn(
 }
 
 mlir::LogicalResult verifyBorrowedEntryOnCFGPaths(
-    mlir::ModuleOp module, BorrowedEntryResource &resource,
+    FuncContractCache &contracts, BorrowedEntryResource &resource,
     llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
     own::AliasAnalysis &aliases) {
   llvm::SmallVector<BorrowedPathState, 16> worklist;
@@ -1058,14 +1247,14 @@ mlir::LogicalResult verifyBorrowedEntryOnCFGPaths(
       }
 
       if (auto call = mlir::dyn_cast<mlir::func::CallOp>(op)) {
-        if (callPartiallyConsumesGroup(module, call, state.group, aliases))
+        if (callPartiallyConsumesGroup(contracts, call, state.group, aliases))
           return call.emitError()
                  << "ownership-consuming call only consumes part of borrowed "
                     "entry argument "
                  << resource.logicalIndex << " of @"
                  << resource.function.getSymName();
 
-        if (callConsumesGroup(module, call, state.group, aliases)) {
+        if (callConsumesGroup(contracts, call, state.group, aliases)) {
           if (state.retained == 0)
             return call.emitError()
                    << "borrowed entry argument " << resource.logicalIndex
@@ -1073,12 +1262,12 @@ mlir::LogicalResult verifyBorrowedEntryOnCFGPaths(
                    << " is released or transferred without a prior retain";
           --state.retained;
           if (std::optional<llvm::SmallVector<mlir::Value, 4>> replacement =
-                  callTransfersGroupToOwnedResult(module, call, state.group,
+                  callTransfersGroupToOwnedResult(contracts, call, state.group,
                                                   aliases))
             state.group = std::move(*replacement);
         }
 
-        if (callRetainsGroup(module, call, state.group, aliases)) {
+        if (callRetainsGroup(contracts, call, state.group, aliases)) {
           if (call->hasAttr(own::kAggregateRetainAttr)) {
             op = op->getNextNode();
             continue;
@@ -1159,11 +1348,11 @@ mlir::LogicalResult verifyBorrowedEntryOnCFGPaths(
   return mlir::success();
 }
 
-mlir::LogicalResult verifyResourceOnCFGPaths(mlir::ModuleOp module,
-                                             TrackedResource &resource,
-                                             llvm::ArrayRef<own::RuntimeDeallocator>
-                                                 deallocators,
-                                             own::AliasAnalysis &aliases) {
+mlir::LogicalResult
+verifyResourceOnCFGPaths(FuncContractCache &contracts,
+                         TrackedResource &resource,
+                         llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
+                         own::AliasAnalysis &aliases) {
   llvm::SmallVector<AffinePathState, 16> worklist;
   llvm::SmallVector<AffinePathState, 32> visited;
   AffineTokenState initialToken = resource.condition
@@ -1285,9 +1474,9 @@ mlir::LogicalResult verifyResourceOnCFGPaths(mlir::ModuleOp module,
       }
 
       if (auto call = mlir::dyn_cast<mlir::func::CallOp>(op)) {
-        bool consumes = callConsumesGroup(module, call, state.group, aliases);
-        bool retains = callRetainsGroup(module, call, state.group, aliases);
-        if (callPartiallyConsumesGroup(module, call, state.group, aliases))
+        bool consumes = callConsumesGroup(contracts, call, state.group, aliases);
+        bool retains = callRetainsGroup(contracts, call, state.group, aliases);
+        if (callPartiallyConsumesGroup(contracts, call, state.group, aliases))
           return call.emitError()
                  << "ownership-consuming call only consumes part of owned "
                     "resource group produced by "
@@ -1315,7 +1504,7 @@ mlir::LogicalResult verifyResourceOnCFGPaths(mlir::ModuleOp module,
             ++state.retained;
         } else if (state.token == AffineTokenState::Owned && consumes) {
           if (std::optional<llvm::SmallVector<mlir::Value, 4>> replacement =
-                  callTransfersGroupToOwnedResult(module, call, state.group,
+                  callTransfersGroupToOwnedResult(contracts, call, state.group,
                                                   aliases)) {
             state.group = std::move(*replacement);
           } else {
@@ -1465,18 +1654,38 @@ collectTrackedResources(mlir::ModuleOp module, mlir::func::FuncOp function,
 mlir::LogicalResult verifyFunctionAffineOwnership(
     mlir::ModuleOp module, mlir::func::FuncOp function,
     llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
-    own::AliasAnalysis &aliases) {
+    own::AliasAnalysis &aliases, FuncContractCache &contracts) {
   llvm::SmallVector<TrackedResource, 16> resources =
       collectTrackedResources(module, function, deallocators);
-  for (TrackedResource &resource : resources)
-    if (mlir::failed(
-            verifyResourceOnCFGPaths(module, resource, deallocators, aliases)))
-      return mlir::failure();
-
   llvm::SmallVector<BorrowedEntryResource, 8> borrowedEntryResources =
       collectBorrowedEntryResources(function, deallocators);
+
+  if (isSingleBlockStraightLineFunction(function) &&
+      borrowedEntryResources.empty()) {
+    bool allResourcesHandled = true;
+    for (TrackedResource &resource : resources) {
+      std::optional<mlir::LogicalResult> result =
+          verifyStraightLineResource(contracts, resource, deallocators,
+                                     aliases);
+      if (!result) {
+        allResourcesHandled = false;
+        break;
+      }
+      if (mlir::failed(*result))
+        return mlir::failure();
+    }
+    if (allResourcesHandled)
+      return mlir::success();
+  }
+
+  for (TrackedResource &resource : resources)
+    if (mlir::failed(
+            verifyResourceOnCFGPaths(contracts, resource, deallocators,
+                                     aliases)))
+      return mlir::failure();
+
   for (BorrowedEntryResource &resource : borrowedEntryResources)
-    if (mlir::failed(verifyBorrowedEntryOnCFGPaths(module, resource,
+    if (mlir::failed(verifyBorrowedEntryOnCFGPaths(contracts, resource,
                                                    deallocators, aliases)))
       return mlir::failure();
 
@@ -1486,20 +1695,30 @@ mlir::LogicalResult verifyFunctionAffineOwnership(
 mlir::LogicalResult verifyPathSensitiveAffineOwnership(
     mlir::ModuleOp module, llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
     own::AliasAnalysis &aliases) {
+  FuncContractCache contracts(module);
   return walkVerify<mlir::func::FuncOp>(
       module, [&](mlir::func::FuncOp function) {
+        if (own::isRuntimeManifestFunction(function))
+          return mlir::success();
         return verifyFunctionAffineOwnership(module, function, deallocators,
-                                             aliases);
+                                             aliases, contracts);
       });
 }
 
 mlir::LogicalResult verifyFuncCallOwnershipContractsImpl(mlir::ModuleOp module) {
   own::AliasAnalysis aliases;
-  aliases.build(module);
-  llvm::SmallVector<own::RuntimeDeallocator, 8> deallocators =
-      own::collectRuntimeDeallocators(module);
+  {
+    py::PerfScope perf("func-call-ownership.alias-analysis");
+    aliases.build(module);
+  }
+  llvm::SmallVector<own::RuntimeDeallocator, 8> deallocators;
+  {
+    py::PerfScope perf("func-call-ownership.collect-deallocators");
+    deallocators = own::collectRuntimeDeallocators(module);
+  }
   if (deallocators.empty())
     return mlir::success();
+  py::PerfScope perf("func-call-ownership.path-sensitive");
   return verifyPathSensitiveAffineOwnership(module, deallocators, aliases);
 }
 

@@ -7,6 +7,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Operation.h"
+#include "llvm/ADT/StringMap.h"
 
 #include <optional>
 
@@ -103,6 +104,46 @@ bool hasLLVMOwnershipSurface(mlir::LLVM::LLVMFuncOp function,
          function->hasAttr(contracts::kManifestDeallocatorAttr);
 }
 
+struct CachedLLVMFunctionContract {
+  mlir::LLVM::LLVMFuncOp function;
+  own::FunctionContract contract;
+  bool hasOwnershipSurface = false;
+};
+
+class LLVMFunctionOwnershipCache {
+public:
+  explicit LLVMFunctionOwnershipCache(mlir::ModuleOp module) {
+    module.walk([&](mlir::LLVM::LLVMFuncOp function) {
+      functions.insert({function.getSymName(), function});
+    });
+  }
+
+  mlir::FailureOr<const CachedLLVMFunctionContract *>
+  lookup(llvm::StringRef name) {
+    auto cached = contracts.find(name);
+    if (cached != contracts.end())
+      return &cached->second;
+
+    auto function = functions.find(name);
+    if (function == functions.end())
+      return static_cast<const CachedLLVMFunctionContract *>(nullptr);
+
+    auto contract = readLLVMFunctionContract(function->second);
+    if (mlir::failed(contract))
+      return mlir::failure();
+
+    CachedLLVMFunctionContract entry{function->second, *contract,
+                                     hasLLVMOwnershipSurface(function->second,
+                                                            *contract)};
+    auto inserted = contracts.insert({name, std::move(entry)});
+    return &inserted.first->second;
+  }
+
+private:
+  llvm::StringMap<mlir::LLVM::LLVMFuncOp> functions;
+  llvm::StringMap<CachedLLVMFunctionContract> contracts;
+};
+
 mlir::LogicalResult
 verifyLLVMFunctionOwnershipShape(mlir::LLVM::LLVMFuncOp function) {
   auto contract = readLLVMFunctionContract(function);
@@ -185,20 +226,23 @@ verifyLLVMConsumedArgumentIndices(mlir::LLVM::CallOp call,
   return mlir::success();
 }
 
-mlir::LogicalResult verifyLLVMCallOwnershipContract(mlir::ModuleOp module,
-                                                    mlir::LLVM::CallOp call) {
+mlir::LogicalResult
+verifyLLVMCallOwnershipContract(LLVMFunctionOwnershipCache &cache,
+                                mlir::LLVM::CallOp call) {
   std::optional<llvm::StringRef> calleeName = call.getCallee();
   if (!calleeName)
     return mlir::success();
 
-  auto callee = module.lookupSymbol<mlir::LLVM::LLVMFuncOp>(*calleeName);
-  if (!callee)
+  mlir::FailureOr<const CachedLLVMFunctionContract *> cached =
+      cache.lookup(*calleeName);
+  if (mlir::failed(cached))
+    return mlir::failure();
+  if (!*cached)
     return mlir::success();
 
-  auto contract = readLLVMFunctionContract(callee);
-  if (mlir::failed(contract))
-    return mlir::failure();
-  if (!hasLLVMOwnershipSurface(callee, *contract))
+  mlir::LLVM::LLVMFuncOp callee = (*cached)->function;
+  const own::FunctionContract &contract = (*cached)->contract;
+  if (!(*cached)->hasOwnershipSurface)
     return mlir::success();
 
   if (mlir::failed(verifyLLVMCallArgumentCount(call, callee)))
@@ -208,21 +252,21 @@ mlir::LogicalResult verifyLLVMCallOwnershipContract(mlir::ModuleOp module,
 
   llvm::ArrayRef<mlir::Type> resultTypes = callee.getResultTypes();
   if (mlir::failed(verifyLLVMResultOwnershipIndices(
-          call, resultTypes, contract->ownedResults, own::kOwnedResultsAttr)))
+          call, resultTypes, contract.ownedResults, own::kOwnedResultsAttr)))
     return mlir::failure();
   if (mlir::failed(verifyLLVMResultOwnershipIndices(
-          call, resultTypes, contract->borrowedResults,
+          call, resultTypes, contract.borrowedResults,
           own::kBorrowedResultsAttr)))
     return mlir::failure();
 
   if (mlir::failed(verifyLLVMConsumedArgumentIndices(
-          call, contract->retainArgs, own::kRetainArgsAttr)))
+          call, contract.retainArgs, own::kRetainArgsAttr)))
     return mlir::failure();
   if (mlir::failed(verifyLLVMConsumedArgumentIndices(
-          call, contract->releaseArgs, own::kReleaseArgsAttr)))
+          call, contract.releaseArgs, own::kReleaseArgsAttr)))
     return mlir::failure();
   if (mlir::failed(verifyLLVMConsumedArgumentIndices(
-          call, contract->transferArgs, own::kTransferArgsAttr)))
+          call, contract.transferArgs, own::kTransferArgsAttr)))
     return mlir::failure();
 
   return mlir::success();
@@ -236,8 +280,9 @@ mlir::LogicalResult verifyLLVMOwnershipContractShapes(mlir::ModuleOp module) {
 }
 
 mlir::LogicalResult verifyLLVMCallOwnershipContracts(mlir::ModuleOp module) {
+  LLVMFunctionOwnershipCache cache(module);
   return walkVerify<mlir::LLVM::CallOp>(module, [&](mlir::LLVM::CallOp call) {
-    return verifyLLVMCallOwnershipContract(module, call);
+    return verifyLLVMCallOwnershipContract(cache, call);
   });
 }
 

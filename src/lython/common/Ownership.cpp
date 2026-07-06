@@ -796,8 +796,10 @@ classifyOwnershipConditionBranch(mlir::Operation *op,
 }
 
 void AliasAnalysis::track(mlir::Value value) {
-  if (value && !parent.contains(value))
+  if (value && !parent.contains(value)) {
     parent[value] = value;
+    invalidateAliasBuckets();
+  }
 }
 
 mlir::Value AliasAnalysis::find(mlir::Value value) {
@@ -815,8 +817,10 @@ void AliasAnalysis::unionValues(mlir::Value lhs, mlir::Value rhs) {
     return;
   mlir::Value lhsRoot = find(lhs);
   mlir::Value rhsRoot = find(rhs);
-  if (lhsRoot != rhsRoot)
+  if (lhsRoot != rhsRoot) {
     parent[rhsRoot] = lhsRoot;
+    invalidateAliasBuckets();
+  }
 }
 
 bool AliasAnalysis::same(mlir::Value lhs, mlir::Value rhs) {
@@ -828,10 +832,26 @@ void AliasAnalysis::aliasesOf(mlir::Value value,
   if (!value)
     return;
   mlir::Value root = find(value);
+  if (aliasBucketsDirty)
+    rebuildAliasBuckets();
+  auto found = aliasBuckets.find(root);
+  if (found == aliasBuckets.end())
+    return;
+  aliases.append(found->second.begin(), found->second.end());
+}
+
+void AliasAnalysis::invalidateAliasBuckets() {
+  aliasBuckets.clear();
+  aliasBucketsDirty = true;
+}
+
+void AliasAnalysis::rebuildAliasBuckets() {
+  aliasBuckets.clear();
   for (auto &entry : parent) {
-    if (find(entry.first) == root)
-      aliases.push_back(entry.first);
+    mlir::Value root = find(entry.first);
+    aliasBuckets[root].push_back(entry.first);
   }
+  aliasBucketsDirty = false;
 }
 
 static bool isOwnershipIdentityOp(mlir::Operation *op) {

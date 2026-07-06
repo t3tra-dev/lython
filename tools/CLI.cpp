@@ -674,13 +674,15 @@ LogicalResult installAOTEntryPoint(llvm::Module &llvmModule) {
   return success();
 }
 
-// Lowers LLVM coroutines and runs the standard O2 module pipeline. MLIR-level
+// Lowers LLVM coroutines and runs a standard LLVM module pipeline. MLIR-level
 // passes never ran SROA/mem2reg-class cleanups on the translated IR, so
 // without this the descriptor allocas of every lowered object stay in the
 // frame (~2KB per object-handling call frame) and nothing is ever inlined.
 void runLLVMCoroLowering(llvm::Module &llvmModule,
                          const SanitizerConfig &sanitizers,
-                         llvm::TargetMachine *targetMachine = nullptr) {
+                         llvm::TargetMachine *targetMachine = nullptr,
+                         llvm::OptimizationLevel optimizationLevel =
+                             llvm::OptimizationLevel::O2) {
   llvm::LoopAnalysisManager loopAM;
   llvm::FunctionAnalysisManager functionAM;
   llvm::CGSCCAnalysisManager cgsccAM;
@@ -693,7 +695,7 @@ void runLLVMCoroLowering(llvm::Module &llvmModule,
   passBuilder.crossRegisterProxies(loopAM, functionAM, cgsccAM, moduleAM);
 
   llvm::ModulePassManager modulePM =
-      passBuilder.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O2);
+      passBuilder.buildPerModuleDefaultPipeline(optimizationLevel);
   lython::driver::addSanitizerInstrumentationPasses(modulePM, sanitizers);
   modulePM.run(llvmModule, moduleAM);
 }
@@ -1578,6 +1580,8 @@ LogicalResult runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
     tmBuilder.setCPU(codeGenCPUNameForTarget(tensorTarget, processTriple));
     tmBuilder.setFeatures(
         codeGenFeaturesForTarget(tensorTarget, processTriple));
+    // JIT favors first-output latency; AOT still uses the optimized pipeline.
+    tmBuilder.setCodeGenOptLevel(llvm::CodeGenOptLevel::None);
     auto options = tmBuilder.getOptions();
     options.ExceptionModel = exceptionModelForTargetTriple(processTriple);
     options.MCOptions.EmitCompactUnwindNonCanonical = true;
@@ -1651,84 +1655,125 @@ LogicalResult runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
 #endif
           return llvm::Error::success();
         });
-    auto jitExpected = builder.create();
-    if (!jitExpected) {
-      llvm::errs() << "Failed to create LLJIT\n";
-      return failure();
+    {
+      PerfScope perf("jit-build.create-lljit");
+      auto jitExpected = builder.create();
+      if (!jitExpected) {
+        llvm::errs() << "Failed to create LLJIT\n";
+        return failure();
+      }
+      jit = std::move(*jitExpected);
+      if (failed(lython::driver::addJITSanitizerRuntimes(
+              *jit, ActiveSanitizers, processTriple)))
+        return failure();
     }
-    jit = std::move(*jitExpected);
-    if (failed(lython::driver::addJITSanitizerRuntimes(
-            *jit, ActiveSanitizers, processTriple)))
-      return failure();
 
     LLVMSafetyProfile safetyProfile;
-    collectLLVMSafetyContracts(module, safetyProfile);
     llvm::SmallVector<py::PythonCallSiteRange, 16> pythonCallSites;
-    py::collectPythonCallSiteRanges(module, pythonCallSites);
-    attachPythonDebugInfo(module);
-
-    auto llvmContext = std::make_unique<llvm::LLVMContext>();
-    auto llvmModule = mlir::translateModuleToLLVMIR(module, *llvmContext);
-    if (!llvmModule) {
-      llvm::errs() << "Failed to translate to LLVM IR\n";
-      return failure();
+    {
+      PerfScope perf("jit-build.prepare-mlir");
+      collectLLVMSafetyContracts(module, safetyProfile);
+      py::collectPythonCallSiteRanges(module, pythonCallSites);
+      attachPythonDebugInfo(module);
     }
-    py::installPythonExceptionCleanupFrames(*llvmModule, pythonCallSites);
-    if (failed(verifyLLVMIRSafetyMetadataAttached(*llvmModule, safetyProfile)))
-      return failure();
-    if (failed(verifyPostCoroLLVMThreadSafe(*llvmModule, safetyProfile)))
-      return failure();
-    for (auto &func : *llvmModule) {
-      if (!func.isDeclaration())
-        func.setUWTableKind(llvm::UWTableKind::Async);
+
+    std::unique_ptr<llvm::LLVMContext> llvmContext;
+    std::unique_ptr<llvm::Module> llvmModule;
+    {
+      PerfScope perf("jit-build.translate-to-llvm");
+      llvmContext = std::make_unique<llvm::LLVMContext>();
+      llvmModule = mlir::translateModuleToLLVMIR(module, *llvmContext);
+      if (!llvmModule) {
+        llvm::errs() << "Failed to translate to LLVM IR\n";
+        return failure();
+      }
+    }
+    {
+      PerfScope perf("jit-build.prepare-llvm");
+      py::installPythonExceptionCleanupFrames(*llvmModule, pythonCallSites);
+      if (failed(
+              verifyLLVMIRSafetyMetadataAttached(*llvmModule, safetyProfile)))
+        return failure();
+      if (failed(verifyPostCoroLLVMThreadSafe(*llvmModule, safetyProfile)))
+        return failure();
+      for (auto &func : *llvmModule) {
+        if (!func.isDeclaration())
+          func.setUWTableKind(llvm::UWTableKind::Async);
+      }
     }
 
     llvmModule->setDataLayout(jit->getDataLayout());
     llvmModule->setTargetTriple(jit->getTargetTriple().getTriple());
-    if (failed(py::runtime_library::linkEmbeddedNativeRuntime(*llvmModule)))
-      return failure();
-    collectLinkedLLVMSafetyContracts(*llvmModule, safetyProfile);
-    runLLVMCoroLowering(*llvmModule, ActiveSanitizers,
-                        optimizationTargetMachine.get());
-    collectLinkedLLVMSafetyContracts(*llvmModule, safetyProfile);
-    dumpLLVMForPass(irDump, "llvm-translation", *llvmModule);
-    if (failed(verifyOptimizedLLVMThreadSafe(*llvmModule, safetyProfile)))
-      return failure();
+    {
+      PerfScope perf("jit-build.link-runtime");
+      if (failed(py::runtime_library::linkEmbeddedNativeRuntime(*llvmModule)))
+        return failure();
+      collectLinkedLLVMSafetyContracts(*llvmModule, safetyProfile);
+    }
+    {
+      PerfScope perf("jit-build.llvm-opt");
+      runLLVMCoroLowering(*llvmModule, ActiveSanitizers,
+                          optimizationTargetMachine.get(),
+                          llvm::OptimizationLevel::O0);
+      collectLinkedLLVMSafetyContracts(*llvmModule, safetyProfile);
+      dumpLLVMForPass(irDump, "llvm-translation", *llvmModule);
+      if (failed(verifyOptimizedLLVMThreadSafe(*llvmModule, safetyProfile)))
+        return failure();
+    }
 
     auto &jd = jit->getMainJITDylib();
-    auto dlGen = llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
-        jit->getDataLayout().getGlobalPrefix());
-    if (dlGen)
-      jd.addGenerator(std::move(*dlGen));
-    llvm::orc::MangleAndInterner interner(jd.getExecutionSession(),
-                                          jit->getDataLayout());
-    auto symbolMap = buildRuntimeSymbolMap(interner);
-    cantFail(jd.define(absoluteSymbols(std::move(symbolMap))));
+    {
+      PerfScope perf("jit-build.define-runtime-symbols");
+      auto dlGen =
+          llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
+              jit->getDataLayout().getGlobalPrefix());
+      if (dlGen)
+        jd.addGenerator(std::move(*dlGen));
+      llvm::orc::MangleAndInterner interner(jd.getExecutionSession(),
+                                            jit->getDataLayout());
+      auto symbolMap = buildRuntimeSymbolMap(interner);
+      cantFail(jd.define(absoluteSymbols(std::move(symbolMap))));
+    }
 
     auto tsm = llvm::orc::ThreadSafeModule(std::move(llvmModule),
                                            std::move(llvmContext));
-    if (auto err = jit->addIRModule(std::move(tsm))) {
-      llvm::errs() << "JIT add module error: " << err << "\n";
-      return failure();
+    {
+      PerfScope perf("jit-build.add-ir-module");
+      if (auto err = jit->addIRModule(std::move(tsm))) {
+        llvm::errs() << "JIT add module error: " << err << "\n";
+        return failure();
+      }
     }
-    if (auto err = jit->initialize(jd)) {
-      llvm::errs() << "JIT initialize error: " << err << "\n";
-      return failure();
+    {
+      PerfScope perf("jit-build.initialize");
+      if (auto err = jit->initialize(jd)) {
+        llvm::errs() << "JIT initialize error: " << err << "\n";
+        return failure();
+      }
     }
 
-    auto sym = jit->lookup("__main__");
-    if (!sym) {
-      llvm::errs() << "JIT lookup failed: " << sym.takeError() << "\n";
-      return failure();
+    {
+      PerfScope perf("jit-build.lookup-entrypoints");
+      {
+        PerfScope perf("jit-build.lookup-main");
+        auto sym = jit->lookup("__main__");
+        if (!sym) {
+          llvm::errs() << "JIT lookup failed: " << sym.takeError() << "\n";
+          return failure();
+        }
+        entryAddress = *sym;
+      }
+      {
+        PerfScope perf("jit-build.lookup-runner");
+        auto runnerSym = jit->lookup("LyRunPythonMain");
+        if (!runnerSym) {
+          llvm::errs() << "JIT runtime lookup failed: " << runnerSym.takeError()
+                       << "\n";
+          return failure();
+        }
+        runnerAddress = *runnerSym;
+      }
     }
-    entryAddress = *sym;
-    auto runnerSym = jit->lookup("LyRunPythonMain");
-    if (!runnerSym) {
-      llvm::errs() << "JIT runtime lookup failed: " << runnerSym.takeError()
-                   << "\n";
-      return failure();
-    }
-    runnerAddress = *runnerSym;
   }
 
   auto *entry = entryAddress.toPtr<void (*)()>();

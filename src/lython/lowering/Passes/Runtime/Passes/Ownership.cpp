@@ -1,4 +1,5 @@
 #include "Common/RuntimeSupport.h"
+#include "Common/Instrumentation.h"
 #include "PyDialectTypes.h"
 #include "Runtime/Model/Contracts.h"
 #include "Ownership.h"
@@ -12,6 +13,7 @@
 #include "mlir/Pass/Pass.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringMap.h"
 
 #include <cstdint>
 #include <memory>
@@ -64,6 +66,49 @@ mlir::func::FuncOp findRetainFunction(mlir::ModuleOp module) {
   });
   return retained;
 }
+
+struct CachedFuncContract {
+  mlir::func::FuncOp function;
+  own::FunctionContract contract;
+};
+
+class FuncContractCache {
+public:
+  explicit FuncContractCache(mlir::ModuleOp module) {
+    module.walk([&](mlir::func::FuncOp function) {
+      functions.insert({function.getSymName(), function});
+    });
+  }
+
+  mlir::FailureOr<const CachedFuncContract *> lookup(llvm::StringRef name) {
+    auto cached = contracts.find(name);
+    if (cached != contracts.end())
+      return &cached->second;
+
+    auto function = functions.find(name);
+    if (function == functions.end())
+      return static_cast<const CachedFuncContract *>(nullptr);
+
+    auto contract = own::readFunctionContract(function->second);
+    if (mlir::failed(contract))
+      return mlir::failure();
+
+    CachedFuncContract entry{function->second, *contract};
+    auto inserted = contracts.insert({name, std::move(entry)});
+    return &inserted.first->second;
+  }
+
+  mlir::FailureOr<const CachedFuncContract *>
+  lookup(mlir::func::FuncOp function) {
+    if (!function)
+      return static_cast<const CachedFuncContract *>(nullptr);
+    return lookup(function.getSymName());
+  }
+
+private:
+  llvm::StringMap<mlir::func::FuncOp> functions;
+  llvm::StringMap<CachedFuncContract> contracts;
+};
 
 mlir::FailureOr<mlir::Value> buildRetainHeaderView(mlir::OpBuilder &builder,
                                                    mlir::Location loc,
@@ -172,14 +217,15 @@ mlir::LogicalResult insertBorrowedReturnRetains(
   return result;
 }
 
-bool isOwnershipConsumingUse(mlir::ModuleOp module, mlir::OpOperand &use) {
+bool isOwnershipConsumingUse(FuncContractCache &contracts,
+                             mlir::OpOperand &use) {
   auto call = mlir::dyn_cast<mlir::func::CallOp>(use.getOwner());
   if (!call)
     return false;
-  mlir::func::FuncOp callee =
-      module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
-  return callee && own::functionConsumesOperandAt(
-                       callee, static_cast<unsigned>(use.getOperandNumber()));
+  auto cached = contracts.lookup(call.getCallee());
+  return mlir::succeeded(cached) && *cached &&
+         (*cached)->contract.consumesArg(
+             static_cast<unsigned>(use.getOperandNumber()));
 }
 
 bool groupMatchesOperands(mlir::OperandRange operands, unsigned offset,
@@ -194,61 +240,54 @@ bool groupMatchesOperands(mlir::OperandRange operands, unsigned offset,
   return true;
 }
 
-bool callConsumesGroup(mlir::ModuleOp module, mlir::func::CallOp call,
+bool callConsumesGroup(FuncContractCache &contracts, mlir::func::CallOp call,
                        llvm::ArrayRef<mlir::Value> group,
                        own::AliasAnalysis &aliases) {
-  mlir::func::FuncOp callee =
-      module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
-  if (!callee)
+  auto cached = contracts.lookup(call.getCallee());
+  if (mlir::failed(cached) || !*cached)
     return false;
-  auto contract = own::readFunctionContract(callee);
-  if (mlir::failed(contract))
-    return false;
-  for (unsigned offset : contract->releaseArgs.values)
+  for (unsigned offset : (*cached)->contract.releaseArgs.values)
     if (groupMatchesOperands(call.getOperands(), offset, group, aliases))
       return true;
-  for (unsigned offset : contract->transferArgs.values)
+  for (unsigned offset : (*cached)->contract.transferArgs.values)
     if (groupMatchesOperands(call.getOperands(), offset, group, aliases))
       return true;
   return false;
 }
 
-bool callConsumesTrackedHeader(mlir::ModuleOp module, mlir::func::CallOp call,
+bool callConsumesTrackedHeader(FuncContractCache &contracts,
+                               mlir::func::CallOp call,
                                llvm::ArrayRef<mlir::Value> group,
                                own::AliasAnalysis &aliases) {
   if (group.empty())
     return false;
-  mlir::func::FuncOp callee =
-      module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
-  if (!callee)
-    return false;
-  auto contract = own::readFunctionContract(callee);
-  if (mlir::failed(contract))
+  auto cached = contracts.lookup(call.getCallee());
+  if (mlir::failed(cached) || !*cached)
     return false;
   auto consumesHeaderAt = [&](unsigned offset) {
     return offset < call.getNumOperands() &&
            aliases.same(call.getOperand(offset), group.front());
   };
-  for (unsigned offset : contract->releaseArgs.values)
+  for (unsigned offset : (*cached)->contract.releaseArgs.values)
     if (consumesHeaderAt(offset) &&
         !groupMatchesOperands(call.getOperands(), offset, group, aliases))
       return true;
-  for (unsigned offset : contract->transferArgs.values)
+  for (unsigned offset : (*cached)->contract.transferArgs.values)
     if (consumesHeaderAt(offset) &&
         !groupMatchesOperands(call.getOperands(), offset, group, aliases))
       return true;
   return false;
 }
 
-bool ownershipConsumingUseInvalidatesGroup(mlir::ModuleOp module,
+bool ownershipConsumingUseInvalidatesGroup(FuncContractCache &contracts,
                                            mlir::OpOperand &use,
                                            llvm::ArrayRef<mlir::Value> group,
                                            own::AliasAnalysis &aliases) {
   auto call = mlir::dyn_cast<mlir::func::CallOp>(use.getOwner());
   if (!call)
     return false;
-  return callConsumesGroup(module, call, group, aliases) ||
-         callConsumesTrackedHeader(module, call, group, aliases);
+  return callConsumesGroup(contracts, call, group, aliases) ||
+         callConsumesTrackedHeader(contracts, call, group, aliases);
 }
 
 mlir::Operation *latestUserInBlock(mlir::Operation *lhs, mlir::Operation *rhs) {
@@ -394,14 +433,15 @@ bool groupMatchesOwnedReturnRange(mlir::ValueRange values,
   return matchesLogicalValue(matchesLogicalValue, range.offset, range.type);
 }
 
-bool returnTransfersGroup(mlir::func::FuncOp function,
+bool returnTransfersGroup(FuncContractCache &contracts,
+                          mlir::func::FuncOp function,
                           mlir::func::ReturnOp returnOp,
                           llvm::ArrayRef<mlir::Value> group,
                           llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
                           own::AliasAnalysis &aliases) {
-  auto contract = own::readFunctionContract(function);
-  if (mlir::succeeded(contract)) {
-    for (unsigned offset : contract->ownedResults.values)
+  auto cached = contracts.lookup(function);
+  if (mlir::succeeded(cached) && *cached) {
+    for (unsigned offset : (*cached)->contract.ownedResults.values)
       if (groupMatchesValues(returnOp.getOperands(), offset, group, aliases))
         return true;
   }
@@ -554,7 +594,7 @@ mergeReleaseInsertion(std::optional<ReleaseInsertion> current,
 }
 
 std::optional<ReleaseInsertion>
-findReleaseInsertion(mlir::ModuleOp module, mlir::Operation *owner,
+findReleaseInsertion(FuncContractCache &contracts, mlir::Operation *owner,
                      llvm::ArrayRef<mlir::Value> group,
                      llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
                      own::AliasAnalysis &aliases, unsigned depth = 0) {
@@ -578,15 +618,16 @@ findReleaseInsertion(mlir::ModuleOp module, mlir::Operation *owner,
         mlir::Operation *user = use.getOwner();
         if (user == owner)
           continue;
-        if (ownershipConsumingUseInvalidatesGroup(module, use, group, aliases))
+        if (ownershipConsumingUseInvalidatesGroup(contracts, use, group,
+                                                  aliases))
           return std::nullopt;
 
         if (auto returnOp = mlir::dyn_cast<mlir::func::ReturnOp>(user)) {
           mlir::func::FuncOp function =
               returnOp->getParentOfType<mlir::func::FuncOp>();
           if (function &&
-              returnTransfersGroup(function, returnOp, group, deallocators,
-                                   aliases))
+              returnTransfersGroup(contracts, function, returnOp, group,
+                                   deallocators, aliases))
             return std::nullopt;
           mlir::Operation *blockUser = ancestorInBlock(user, block);
           if (!blockUser)
@@ -609,7 +650,7 @@ findReleaseInsertion(mlir::ModuleOp module, mlir::Operation *owner,
                 user->getParentRegion() ? user->getParentRegion()->getParentOp()
                                         : nullptr;
             std::optional<ReleaseInsertion> release = findReleaseInsertion(
-                module, regionOwner, *mapped, deallocators, aliases,
+                contracts, regionOwner, *mapped, deallocators, aliases,
                 depth + 1);
             if (!release)
               return std::nullopt;
@@ -704,7 +745,7 @@ std::optional<ConditionalReleaseBlocks> findConditionalBranchAfterOwner(
 }
 
 std::optional<mlir::Operation *> findLastConditionalUserInActiveBlock(
-    mlir::ModuleOp module, mlir::Operation *owner,
+    FuncContractCache &contracts, mlir::Operation *owner,
     llvm::ArrayRef<mlir::Value> group, const ConditionalReleaseBlocks &blocks,
     own::AliasAnalysis &aliases) {
   mlir::Operation *lastUser = nullptr;
@@ -713,7 +754,7 @@ std::optional<mlir::Operation *> findLastConditionalUserInActiveBlock(
       mlir::Operation *user = use.getOwner();
       if (user == owner || user == blocks.branch)
         continue;
-      if (isOwnershipConsumingUse(module, use))
+      if (isOwnershipConsumingUse(contracts, use))
         return std::nullopt;
 
       mlir::Operation *activeUser = ancestorInBlock(user, blocks.active);
@@ -769,7 +810,7 @@ insertReleaseOnActiveEdge(mlir::func::CallOp call,
 }
 
 mlir::LogicalResult insertConditionalOwnedResultRelease(
-    mlir::ModuleOp module, mlir::func::CallOp call,
+    FuncContractCache &contracts, mlir::func::CallOp call,
     const own::ResourceGroup &group, own::AliasAnalysis &aliases) {
   if (!group.condition)
     return mlir::failure();
@@ -781,7 +822,7 @@ mlir::LogicalResult insertConditionalOwnedResultRelease(
     return mlir::success();
 
   std::optional<mlir::Operation *> lastUser =
-      findLastConditionalUserInActiveBlock(module, call, group.values, *blocks,
+      findLastConditionalUserInActiveBlock(contracts, call, group.values, *blocks,
                                            aliases);
   if (!lastUser)
     return mlir::success();
@@ -801,6 +842,7 @@ mlir::LogicalResult insertConditionalOwnedResultRelease(
 
 mlir::LogicalResult
 insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
+                          FuncContractCache &contracts,
                           llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
                           own::AliasAnalysis &aliases) {
   if (call.getNumResults() == 0)
@@ -812,14 +854,15 @@ insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
       continue;
 
     if (group.condition) {
-      if (mlir::failed(insertConditionalOwnedResultRelease(module, call, group,
+      if (mlir::failed(insertConditionalOwnedResultRelease(contracts, call, group,
                                                            aliases)))
         return mlir::failure();
       continue;
     }
 
     std::optional<ReleaseInsertion> release =
-        findReleaseInsertion(module, call, group.values, deallocators, aliases);
+        findReleaseInsertion(contracts, call, group.values, deallocators,
+                             aliases);
     if (release) {
       mlir::OpBuilder builder(call);
       if (release->before)
@@ -847,7 +890,7 @@ insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
           if (user == call.getOperation())
             continue;
           if (user->getParentOfType<mlir::func::FuncOp>() != function ||
-              ownershipConsumingUseInvalidatesGroup(module, use, group.values,
+              ownershipConsumingUseInvalidatesGroup(contracts, use, group.values,
                                                     aliases) ||
               mlir::isa<mlir::func::ReturnOp>(user) ||
               branchForwardsGroupToBlockArgument(user, group.values,
@@ -883,6 +926,7 @@ insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
 
 mlir::LogicalResult
 insertOwnedLocalObjectReleases(mlir::ModuleOp module, mlir::Operation *op,
+                               FuncContractCache &contracts,
                                llvm::ArrayRef<own::RuntimeDeallocator>
                                    deallocators,
                                own::AliasAnalysis &aliases) {
@@ -892,7 +936,8 @@ insertOwnedLocalObjectReleases(mlir::ModuleOp module, mlir::Operation *op,
       continue;
 
     std::optional<ReleaseInsertion> release =
-        findReleaseInsertion(module, op, group.values, deallocators, aliases);
+        findReleaseInsertion(contracts, op, group.values, deallocators,
+                             aliases);
     if (release) {
       mlir::OpBuilder builder(op);
       if (release->before)
@@ -920,7 +965,7 @@ insertOwnedLocalObjectReleases(mlir::ModuleOp module, mlir::Operation *op,
           if (user == op)
             continue;
           if (user->getParentOfType<mlir::func::FuncOp>() != function ||
-              ownershipConsumingUseInvalidatesGroup(module, use, group.values,
+              ownershipConsumingUseInvalidatesGroup(contracts, use, group.values,
                                                     aliases) ||
               mlir::isa<mlir::func::ReturnOp>(user) ||
               branchForwardsGroupToBlockArgument(user, group.values,
@@ -969,46 +1014,67 @@ public:
 
   void runOnOperation() final {
     mlir::ModuleOp module = getOperation();
-    llvm::SmallVector<own::RuntimeDeallocator, 8> deallocators =
-        own::collectRuntimeDeallocators(module);
+    llvm::SmallVector<own::RuntimeDeallocator, 8> deallocators;
+    {
+      py::PerfScope perf("refcount-insertion.collect-deallocators");
+      deallocators = own::collectRuntimeDeallocators(module);
+    }
     if (deallocators.empty())
       return;
     own::AliasAnalysis aliases;
-    aliases.build(module);
+    {
+      py::PerfScope perf("refcount-insertion.alias-analysis");
+      aliases.build(module);
+    }
+    FuncContractCache contracts(module);
 
     mlir::func::FuncOp retain = findRetainFunction(module);
-    if (mlir::failed(
-            insertBorrowedReturnRetains(module, retain, deallocators))) {
-      signalPassFailure();
-      return;
-    }
-
-    llvm::SmallVector<mlir::func::CallOp, 32> calls;
-    module.walk([&](mlir::func::FuncOp function) {
-      if (own::isRuntimeManifestFunction(function))
-        return;
-      function.walk([&](mlir::func::CallOp call) { calls.push_back(call); });
-    });
-
-    for (mlir::func::CallOp call : calls) {
+    {
+      py::PerfScope perf("refcount-insertion.borrowed-return-retains");
       if (mlir::failed(
-              insertOwnedResultReleases(module, call, deallocators, aliases))) {
+              insertBorrowedReturnRetains(module, retain, deallocators))) {
         signalPassFailure();
         return;
       }
     }
 
+    llvm::SmallVector<mlir::func::CallOp, 32> calls;
+    {
+      py::PerfScope perf("refcount-insertion.collect-calls");
+      module.walk([&](mlir::func::FuncOp function) {
+        if (own::isRuntimeManifestFunction(function))
+          return;
+        function.walk([&](mlir::func::CallOp call) { calls.push_back(call); });
+      });
+    }
+
+    {
+      py::PerfScope perf("refcount-insertion.owned-result-releases");
+      for (mlir::func::CallOp call : calls) {
+        if (mlir::failed(insertOwnedResultReleases(
+                module, call, contracts, deallocators, aliases))) {
+          signalPassFailure();
+          return;
+        }
+      }
+    }
+
     llvm::SmallVector<mlir::Operation *, 16> localObjects;
-    module.walk([&](mlir::Operation *op) {
-      if (op->hasAttr(own::kOwnedLocalObjectContractAttr))
-        localObjects.push_back(op);
-    });
-    for (mlir::Operation *op : localObjects) {
-      if (mlir::failed(
-              insertOwnedLocalObjectReleases(module, op, deallocators,
-                                             aliases))) {
-        signalPassFailure();
-        return;
+    {
+      py::PerfScope perf("refcount-insertion.collect-local-objects");
+      module.walk([&](mlir::Operation *op) {
+        if (op->hasAttr(own::kOwnedLocalObjectContractAttr))
+          localObjects.push_back(op);
+      });
+    }
+    {
+      py::PerfScope perf("refcount-insertion.local-object-releases");
+      for (mlir::Operation *op : localObjects) {
+        if (mlir::failed(insertOwnedLocalObjectReleases(
+                module, op, contracts, deallocators, aliases))) {
+          signalPassFailure();
+          return;
+        }
       }
     }
   }
