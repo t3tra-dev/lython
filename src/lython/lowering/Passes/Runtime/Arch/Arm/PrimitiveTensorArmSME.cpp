@@ -44,8 +44,8 @@ void addSMELinalgPipeline(mlir::OpPassManager &pipeline) {
 
 void addSMEPreControlFlowLLVMPrepPipeline(mlir::OpPassManager &pipeline) {
   // Convert scalable vector outer-products to ArmSME while the vector form is
-  // still intact. Tile stores are then expanded to SCF slice loops; LLVM 20's
-  // ArmSME tile allocation expects control-flow lowering before the final
+  // still intact. Tile stores are then expanded to SCF slice loops; ArmSME
+  // tile allocation expects control-flow lowering before the final
   // ArmSME-to-LLVM conversion.
   pipeline.addPass(mlir::createArithToArmSMEConversionPass());
   pipeline.addPass(mlir::createConvertVectorToArmSMEPass());

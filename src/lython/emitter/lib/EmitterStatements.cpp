@@ -94,9 +94,9 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
   } else if (statement.kind == "Raise") {
     if (const parser::Node *exception = ast::node(statement, "exc")) {
       Value value = emitExpr(exception);
-      builder.create<py::RaiseOp>(loc(statement), value.value);
+      py::RaiseOp::create(builder, loc(statement), value.value);
     } else {
-      builder.create<py::RaiseCurrentOp>(loc(statement));
+      py::RaiseCurrentOp::create(builder, loc(statement));
     }
   } else if (statement.kind == "FunctionDef" ||
              statement.kind == "AsyncFunctionDef") {
@@ -118,14 +118,14 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
                          ? coerceValue(value, ctx.resultType, statement)
                          : value;
       emitActiveCleanups(statement);
-      builder.create<mlir::cf::BranchOp>(loc(statement), ctx.target,
-                                         result.value);
+      mlir::cf::BranchOp::create(builder, loc(statement), ctx.target,
+                                 result.value);
       return;
     }
     if (currentReturnType) {
       Value result = coerceValue(value, currentReturnType, statement);
       emitActiveCleanups(statement);
-      builder.create<mlir::func::ReturnOp>(loc(statement), result.value);
+      mlir::func::ReturnOp::create(builder, loc(statement), result.value);
     }
   } else if (statement.kind == "Pass") {
     return;
@@ -152,11 +152,12 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
   if (target.kind == "Attribute") {
     Value object = emitExpr(ast::node(target, "value"));
     if (auto attr = ast::string(target, "attr")) {
-      auto op = builder.create<py::AttrSetOp>(loc(target), object.value, *attr,
-                                              value.value);
+      auto op = py::AttrSetOp::create(builder, loc(target), object.value, *attr,
+                                      value.value);
       if (lookupClassField(object.type, *attr))
         op->setAttr("ly.attr.kind", builder.getStringAttr("field"));
-      if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(object.type))
+      if (auto contract =
+              mlir::dyn_cast_if_present<py::ContractType>(object.type))
         op->setAttr("ly.attr.owner",
                     builder.getStringAttr(contract.getContractName()));
     }
@@ -167,25 +168,25 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
     Value index = emitExpr(ast::node(target, "slice"));
     CallInferenceResult inference = types.inferMethodCallWithEvidence(
         container.type, "__setitem__", {index.type, value.type});
-    builder.create<py::SetItemOp>(
-        loc(target), mlir::FlatSymbolRefAttr::get(&context, "__setitem__"),
-        callProtocolFor(inference), container.value, index.value, value.value);
+    py::SetItemOp::create(builder, loc(target),
+                          mlir::FlatSymbolRefAttr::get(&context, "__setitem__"),
+                          callProtocolFor(inference), container.value,
+                          index.value, value.value);
     return;
   }
   if (target.kind == "Tuple" || target.kind == "List") {
     if (const auto *elts = ast::nodeList(target, "elts")) {
       for (auto [index, elt] : llvm::enumerate(*elts)) {
-        Value indexValue{builder
-                             .create<py::IntConstantOp>(
-                                 loc(*elt),
-                                 types.literal(std::to_string(index)),
-                                 builder.getStringAttr(std::to_string(index)))
+        Value indexValue{py::IntConstantOp::create(
+                             builder, loc(*elt),
+                             types.literal(std::to_string(index)),
+                             builder.getStringAttr(std::to_string(index)))
                              .getResult(),
                          types.literal(std::to_string(index))};
         CallInferenceResult inference = types.inferMethodCallWithEvidence(
             value.type, "__getitem__", {indexValue.type});
-        auto getItem = builder.create<py::GetItemOp>(
-            loc(*elt), types.object(),
+        auto getItem = py::GetItemOp::create(
+            builder, loc(*elt), types.object(),
             mlir::FlatSymbolRefAttr::get(&context, "__getitem__"),
             callProtocolFor(inference), value.value, indexValue.value);
         Value item{getItem.getResult(), types.object()};

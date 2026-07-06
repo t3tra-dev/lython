@@ -110,7 +110,7 @@ mlir::LogicalResult RuntimeBundleLowerer::appendUnionRuntimeValues(
       return op->emitError() << "source union has no runtime tag";
     mlir::Value sourceTag = source.physicalValues().front();
     mlir::Value remappedTag =
-        builder.create<mlir::arith::ConstantIntOp>(op->getLoc(), 0, 64)
+        mlir::arith::ConstantIntOp::create(builder, op->getLoc(), 0, 64)
             .getResult();
     for (auto [sourceIndex, sourceMember] :
          llvm::enumerate(sourceUnion.getMemberTypes())) {
@@ -120,22 +120,20 @@ mlir::LogicalResult RuntimeBundleLowerer::appendUnionRuntimeValues(
       if (mlir::failed(resultIndex))
         return mlir::failure();
       mlir::Value sourceIndexValue =
-          builder
-              .create<mlir::arith::ConstantIntOp>(
-                  op->getLoc(), static_cast<std::int64_t>(sourceIndex), 64)
+          mlir::arith::ConstantIntOp::create(
+              builder, op->getLoc(), static_cast<std::int64_t>(sourceIndex), 64)
               .getResult();
-      mlir::Value matches = builder.create<mlir::arith::CmpIOp>(
-          op->getLoc(), mlir::arith::CmpIPredicate::eq, sourceTag,
+      mlir::Value matches = mlir::arith::CmpIOp::create(
+          builder, op->getLoc(), mlir::arith::CmpIPredicate::eq, sourceTag,
           sourceIndexValue);
       mlir::Value resultIndexValue =
-          builder
-              .create<mlir::arith::ConstantIntOp>(
-                  op->getLoc(), static_cast<std::int64_t>(*resultIndex), 64)
+          mlir::arith::ConstantIntOp::create(
+              builder, op->getLoc(), static_cast<std::int64_t>(*resultIndex),
+              64)
               .getResult();
       remappedTag =
-          builder
-              .create<mlir::arith::SelectOp>(op->getLoc(), matches,
-                                             resultIndexValue, remappedTag)
+          mlir::arith::SelectOp::create(builder, op->getLoc(), matches,
+                                        resultIndexValue, remappedTag)
               .getResult();
     }
     values.push_back(remappedTag);
@@ -158,9 +156,8 @@ mlir::LogicalResult RuntimeBundleLowerer::appendUnionRuntimeValues(
     if (mlir::failed(activeIndex))
       return mlir::failure();
     mlir::Value tag =
-        builder
-            .create<mlir::arith::ConstantIntOp>(
-                op->getLoc(), static_cast<std::int64_t>(*activeIndex), 64)
+        mlir::arith::ConstantIntOp::create(
+            builder, op->getLoc(), static_cast<std::int64_t>(*activeIndex), 64)
             .getResult();
     values.push_back(tag);
     for (auto [index, resultMember] :
@@ -229,12 +226,11 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerUnionTest(py::UnionTestOp op) {
 
   builder.setInsertionPoint(op);
   mlir::Value testedTag =
-      builder
-          .create<mlir::arith::ConstantIntOp>(
-              op.getLoc(), static_cast<std::int64_t>(*testedIndex), 64)
+      mlir::arith::ConstantIntOp::create(
+          builder, op.getLoc(), static_cast<std::int64_t>(*testedIndex), 64)
           .getResult();
-  mlir::Value bit = builder.create<mlir::arith::CmpIOp>(
-      op.getLoc(), mlir::arith::CmpIPredicate::eq,
+  mlir::Value bit = mlir::arith::CmpIOp::create(
+      builder, op.getLoc(), mlir::arith::CmpIPredicate::eq,
       input->physicalValues().front(), testedTag);
   op.getResult().replaceAllUsesWith(bit);
   if (mlir::failed(assignObjectBundle(
@@ -263,7 +259,7 @@ RuntimeBundleLowerer::lowerUnionUnwrap(py::UnionUnwrapOp op) {
   if (resultUnion) {
     mlir::Value inputTag = input->physicalValues().front();
     mlir::Value remappedTag =
-        builder.create<mlir::arith::ConstantIntOp>(op.getLoc(), 0, 64)
+        mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 0, 64)
             .getResult();
     for (auto [resultIndex, resultMember] :
          llvm::enumerate(resultUnion.getMemberTypes())) {
@@ -273,21 +269,18 @@ RuntimeBundleLowerer::lowerUnionUnwrap(py::UnionUnwrapOp op) {
       if (mlir::failed(inputIndex))
         return mlir::failure();
       mlir::Value inputIndexValue =
-          builder
-              .create<mlir::arith::ConstantIntOp>(
-                  op.getLoc(), static_cast<std::int64_t>(*inputIndex), 64)
+          mlir::arith::ConstantIntOp::create(
+              builder, op.getLoc(), static_cast<std::int64_t>(*inputIndex), 64)
               .getResult();
-      mlir::Value matches = builder.create<mlir::arith::CmpIOp>(
-          op.getLoc(), mlir::arith::CmpIPredicate::eq, inputTag,
+      mlir::Value matches = mlir::arith::CmpIOp::create(
+          builder, op.getLoc(), mlir::arith::CmpIPredicate::eq, inputTag,
           inputIndexValue);
       mlir::Value resultIndexValue =
-          builder
-              .create<mlir::arith::ConstantIntOp>(
-                  op.getLoc(), static_cast<std::int64_t>(resultIndex), 64)
+          mlir::arith::ConstantIntOp::create(
+              builder, op.getLoc(), static_cast<std::int64_t>(resultIndex), 64)
               .getResult();
-      remappedTag = builder
-                        .create<mlir::arith::SelectOp>(
-                            op.getLoc(), matches, resultIndexValue, remappedTag)
+      remappedTag = mlir::arith::SelectOp::create(builder, op.getLoc(), matches,
+                                                  resultIndexValue, remappedTag)
                         .getResult();
     }
     values.push_back(remappedTag);

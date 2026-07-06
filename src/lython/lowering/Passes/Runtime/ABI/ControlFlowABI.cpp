@@ -51,8 +51,8 @@ mlir::LogicalResult RuntimeBundleLowerer::ensureValueBundle(mlir::Operation *op,
     return mlir::success();
   if (llvm::is_contained(erase, definition))
     return mlir::success();
-  if (mlir::failed(RuntimeBundleLowerer::ensureOperationOperandBundles(
-          definition)))
+  if (mlir::failed(
+          RuntimeBundleLowerer::ensureOperationOperandBundles(definition)))
     return mlir::failure();
   return RuntimeBundleLowerer::lowerPyOp(definition);
 }
@@ -161,15 +161,15 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerControlFlowBlockArgument(
     mlir::Operation *terminator = predecessor->getTerminator();
     if (auto branch = mlir::dyn_cast<mlir::cf::BranchOp>(terminator)) {
       llvm::SmallVector<mlir::Value, 8> operands;
-      if (mlir::failed(rewriteBranchOperands(
-              terminator, branch.getDest(), branch.getDestOperands(),
-              operands))) {
+      if (mlir::failed(rewriteBranchOperands(terminator, branch.getDest(),
+                                             branch.getDestOperands(),
+                                             operands))) {
         controlFlowBlockArgumentsInProgress.erase(argument);
         return mlir::failure();
       }
       builder.setInsertionPoint(branch);
-      builder.create<mlir::cf::BranchOp>(branch.getLoc(), branch.getDest(),
-                                         operands);
+      mlir::cf::BranchOp::create(builder, branch.getLoc(), branch.getDest(),
+                                 operands);
       branch.erase();
       continue;
     }
@@ -177,9 +177,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerControlFlowBlockArgument(
     if (auto cond = mlir::dyn_cast<mlir::cf::CondBranchOp>(terminator)) {
       llvm::SmallVector<mlir::Value, 8> trueOperands;
       llvm::SmallVector<mlir::Value, 8> falseOperands;
-      if (mlir::failed(rewriteBranchOperands(
-              terminator, cond.getTrueDest(), cond.getTrueDestOperands(),
-              trueOperands)) ||
+      if (mlir::failed(rewriteBranchOperands(terminator, cond.getTrueDest(),
+                                             cond.getTrueDestOperands(),
+                                             trueOperands)) ||
           mlir::failed(rewriteBranchOperands(terminator, cond.getFalseDest(),
                                              cond.getFalseDestOperands(),
                                              falseOperands))) {
@@ -187,9 +187,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerControlFlowBlockArgument(
         return mlir::failure();
       }
       builder.setInsertionPoint(cond);
-      builder.create<mlir::cf::CondBranchOp>(
-          cond.getLoc(), cond.getCondition(), cond.getTrueDest(), trueOperands,
-          cond.getFalseDest(), falseOperands);
+      mlir::cf::CondBranchOp::create(
+          builder, cond.getLoc(), cond.getCondition(), cond.getTrueDest(),
+          trueOperands, cond.getFalseDest(), falseOperands);
       cond.erase();
       continue;
     }
@@ -255,8 +255,8 @@ RuntimeBundleLowerer::dropControlFlowLogicalBranchOperands() {
                                      logicalIndex, operands)))
           return mlir::failure();
         builder.setInsertionPoint(branch);
-        builder.create<mlir::cf::BranchOp>(branch.getLoc(), branch.getDest(),
-                                           operands);
+        mlir::cf::BranchOp::create(builder, branch.getLoc(), branch.getDest(),
+                                   operands);
         branch.erase();
         continue;
       }
@@ -280,8 +280,8 @@ RuntimeBundleLowerer::dropControlFlowLogicalBranchOperands() {
                                cond.getFalseDestOperands().end());
 
         builder.setInsertionPoint(cond);
-        builder.create<mlir::cf::CondBranchOp>(
-            cond.getLoc(), cond.getCondition(), cond.getTrueDest(),
+        mlir::cf::CondBranchOp::create(
+            builder, cond.getLoc(), cond.getCondition(), cond.getTrueDest(),
             trueOperands, cond.getFalseDest(), falseOperands);
         cond.erase();
         continue;

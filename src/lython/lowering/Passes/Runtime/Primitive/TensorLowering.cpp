@@ -7,7 +7,7 @@
 
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
-#include "mlir/Dialect/Affine/Passes.h"
+#include "mlir/Dialect/Affine/Transforms/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Bufferization/Transforms/OneShotAnalysis.h"
@@ -182,8 +182,8 @@ addAccessIndices(mlir::OpBuilder &builder, mlir::Location loc,
                  llvm::SmallVector<mlir::Value, 4> baseIndices,
                  mlir::ValueRange accessIndices) {
   for (auto [index, accessIndex] : llvm::enumerate(accessIndices)) {
-    baseIndices[index] = builder.create<mlir::arith::AddIOp>(
-        loc, baseIndices[index], accessIndex);
+    baseIndices[index] = mlir::arith::AddIOp::create(
+        builder, loc, baseIndices[index], accessIndex);
   }
   return baseIndices;
 }
@@ -236,8 +236,8 @@ std::optional<ViewAccess> buildSubviewView(mlir::memref::SubViewOp subview,
       baseIndices.push_back(*dynamicOffset);
       ++dynamicOffset;
     } else {
-      baseIndices.push_back(builder.create<mlir::arith::ConstantIndexOp>(
-          subview.getLoc(), staticOffset));
+      baseIndices.push_back(mlir::arith::ConstantIndexOp::create(
+          builder, subview.getLoc(), staticOffset));
     }
   }
   llvm::SmallVector<mlir::Value, 4> sourceIndices = addAccessIndices(
@@ -260,8 +260,8 @@ buildReinterpretCastLinearOffset(mlir::memref::ReinterpretCastOp cast,
     return *cast.getOffsets().begin();
   }
 
-  return builder
-      .create<mlir::arith::ConstantIndexOp>(cast.getLoc(), staticOffset)
+  return mlir::arith::ConstantIndexOp::create(builder, cast.getLoc(),
+                                              staticOffset)
       .getResult();
 }
 
@@ -349,12 +349,12 @@ decomposeRank2RowMajorOffset(mlir::Value linearOffset, int64_t rowStride,
   if (rowStride == 1)
     return std::make_pair(
         linearOffset,
-        builder.create<mlir::arith::ConstantIndexOp>(loc, 0).getResult());
+        mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult());
 
   mlir::Value row;
   if (matchMulByConstant(linearOffset, rowStride, row)) {
     mlir::Value zero =
-        builder.create<mlir::arith::ConstantIndexOp>(loc, 0).getResult();
+        mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult();
     return std::make_pair(row, zero);
   }
 
@@ -452,11 +452,11 @@ delinearizeRowMajorOffset(mlir::OpBuilder &builder, mlir::Location loc,
     }
 
     mlir::Value strideValue =
-        builder.create<mlir::arith::ConstantIndexOp>(loc, stride);
+        mlir::arith::ConstantIndexOp::create(builder, loc, stride);
     indices.push_back(
-        builder.create<mlir::arith::DivUIOp>(loc, remaining, strideValue));
+        mlir::arith::DivUIOp::create(builder, loc, remaining, strideValue));
     remaining =
-        builder.create<mlir::arith::RemUIOp>(loc, remaining, strideValue);
+        mlir::arith::RemUIOp::create(builder, loc, remaining, strideValue);
   }
   return indices;
 }
@@ -602,8 +602,8 @@ bool rewriteViewLoad(mlir::memref::LoadOp load, mlir::IRRewriter &rewriter) {
     return false;
 
   rewriter.setInsertionPoint(load);
-  mlir::Value replacement = rewriter.create<mlir::memref::LoadOp>(
-      load.getLoc(), view->source, view->sourceIndices);
+  mlir::Value replacement = mlir::memref::LoadOp::create(
+      rewriter, load.getLoc(), view->source, view->sourceIndices);
   rewriter.replaceOp(load, replacement);
   return true;
 }
@@ -620,8 +620,8 @@ bool rewriteViewLoad(mlir::affine::AffineLoadOp load,
     return false;
 
   rewriter.setInsertionPoint(load);
-  mlir::Value replacement = rewriter.create<mlir::memref::LoadOp>(
-      load.getLoc(), view->source, view->sourceIndices);
+  mlir::Value replacement = mlir::memref::LoadOp::create(
+      rewriter, load.getLoc(), view->source, view->sourceIndices);
   rewriter.replaceOp(load, replacement);
   return true;
 }
@@ -634,9 +634,9 @@ bool rewriteViewStore(mlir::memref::StoreOp store, mlir::IRRewriter &rewriter) {
     return false;
 
   rewriter.setInsertionPoint(store);
-  rewriter.create<mlir::memref::StoreOp>(store.getLoc(),
-                                         store.getValueToStore(), view->source,
-                                         view->sourceIndices);
+  mlir::memref::StoreOp::create(rewriter, store.getLoc(),
+                                store.getValueToStore(), view->source,
+                                view->sourceIndices);
   rewriter.eraseOp(store);
   return true;
 }
@@ -653,8 +653,8 @@ bool rewriteViewStore(mlir::affine::AffineStoreOp store,
     return false;
 
   rewriter.setInsertionPoint(store);
-  rewriter.create<mlir::memref::StoreOp>(store.getLoc(), store.getValue(),
-                                         view->source, view->sourceIndices);
+  mlir::memref::StoreOp::create(rewriter, store.getLoc(), store.getValue(),
+                                view->source, view->sourceIndices);
   rewriter.eraseOp(store);
   return true;
 }
@@ -663,7 +663,7 @@ bool rewriteViewTransferRead(mlir::vector::TransferReadOp read,
                              mlir::IRRewriter &rewriter) {
   rewriter.setInsertionPoint(read);
   std::optional<ViewAccess> view = buildViewAccess(
-      read.getSource(), read.getIndices(), read.getPermutationMap(), rewriter);
+      read.getBase(), read.getIndices(), read.getPermutationMap(), rewriter);
   if (!view)
     return false;
 
@@ -672,11 +672,10 @@ bool rewriteViewTransferRead(mlir::vector::TransferReadOp read,
       view->permutationMap ? mlir::AffineMapAttr::get(view->permutationMap)
                            : read.getPermutationMapAttr();
   mlir::Value replacement =
-      rewriter
-          .create<mlir::vector::TransferReadOp>(
-              read.getLoc(), read.getVectorType(), view->source,
-              view->sourceIndices, permutationMapAttr, read.getPadding(),
-              read.getMask(), read.getInBoundsAttr())
+      mlir::vector::TransferReadOp::create(
+          rewriter, read.getLoc(), read.getVectorType(), view->source,
+          view->sourceIndices, permutationMapAttr, read.getPadding(),
+          read.getMask(), read.getInBoundsAttr())
           .getVector();
   rewriter.replaceOp(read, replacement);
   return true;
@@ -685,9 +684,8 @@ bool rewriteViewTransferRead(mlir::vector::TransferReadOp read,
 bool rewriteViewTransferWrite(mlir::vector::TransferWriteOp write,
                               mlir::IRRewriter &rewriter) {
   rewriter.setInsertionPoint(write);
-  std::optional<ViewAccess> view =
-      buildViewAccess(write.getSource(), write.getIndices(),
-                      write.getPermutationMap(), rewriter);
+  std::optional<ViewAccess> view = buildViewAccess(
+      write.getBase(), write.getIndices(), write.getPermutationMap(), rewriter);
   if (!view)
     return false;
 
@@ -696,11 +694,10 @@ bool rewriteViewTransferWrite(mlir::vector::TransferWriteOp write,
       view->permutationMap ? mlir::AffineMapAttr::get(view->permutationMap)
                            : write.getPermutationMapAttr();
   mlir::Operation *replacement =
-      rewriter
-          .create<mlir::vector::TransferWriteOp>(
-              write.getLoc(), write->getResultTypes(), write.getVector(),
-              view->source, view->sourceIndices, permutationMapAttr,
-              write.getMask(), write.getInBoundsAttr())
+      mlir::vector::TransferWriteOp::create(
+          rewriter, write.getLoc(), write->getResultTypes(), write.getVector(),
+          view->source, view->sourceIndices, permutationMapAttr,
+          write.getMask(), write.getInBoundsAttr())
           .getOperation();
   rewriter.replaceOp(write, replacement->getResults());
   return true;
@@ -716,10 +713,9 @@ bool rewriteViewVectorLoad(mlir::vector::LoadOp load,
 
   rewriter.setInsertionPoint(load);
   mlir::Value replacement =
-      rewriter
-          .create<mlir::vector::LoadOp>(
-              load.getLoc(), load.getResult().getType(), view->source,
-              view->sourceIndices, load.getNontemporal())
+      mlir::vector::LoadOp::create(rewriter, load.getLoc(),
+                                   load.getResult().getType(), view->source,
+                                   view->sourceIndices, load.getNontemporal())
           .getResult();
   rewriter.replaceOp(load, replacement);
   return true;
@@ -734,9 +730,9 @@ bool rewriteViewVectorStore(mlir::vector::StoreOp store,
     return false;
 
   rewriter.setInsertionPoint(store);
-  rewriter.create<mlir::vector::StoreOp>(
-      store.getLoc(), store.getValueToStore(), view->source,
-      view->sourceIndices, store.getNontemporal());
+  mlir::vector::StoreOp::create(rewriter, store.getLoc(),
+                                store.getValueToStore(), view->source,
+                                view->sourceIndices, store.getNontemporal());
   rewriter.eraseOp(store);
   return true;
 }
@@ -906,10 +902,10 @@ createPrimitiveVectorAdd(mlir::OpBuilder &builder, mlir::Location loc,
                          mlir::Type elementType,
                          mlir::arith::FastMathFlags fastMath) {
   if (mlir::isa<mlir::FloatType>(elementType))
-    return builder.create<mlir::arith::AddFOp>(loc, lhs, rhs, fastMath)
+    return mlir::arith::AddFOp::create(builder, loc, lhs, rhs, fastMath)
         .getResult();
   if (mlir::isa<mlir::IntegerType>(elementType))
-    return builder.create<mlir::arith::AddIOp>(loc, lhs, rhs).getResult();
+    return mlir::arith::AddIOp::create(builder, loc, lhs, rhs).getResult();
   return std::nullopt;
 }
 
@@ -978,14 +974,14 @@ bool vectorizeContiguousReduction(mlir::scf::ForOp loop,
     return false;
 
   mlir::Value vectorStep =
-      rewriter.create<mlir::arith::ConstantIndexOp>(loc, match.lanes);
+      mlir::arith::ConstantIndexOp::create(rewriter, loc, match.lanes);
   mlir::VectorType vectorType =
       mlir::VectorType::get({match.lanes}, elementType);
   mlir::Value initialVector =
-      rewriter.create<mlir::vector::BroadcastOp>(loc, vectorType, *padding);
+      mlir::vector::BroadcastOp::create(rewriter, loc, vectorType, *padding);
 
-  auto vectorLoop = rewriter.create<mlir::scf::ForOp>(
-      loc, loop.getLowerBound(), loop.getUpperBound(), vectorStep,
+  auto vectorLoop = mlir::scf::ForOp::create(
+      rewriter, loc, loop.getLowerBound(), loop.getUpperBound(), vectorStep,
       mlir::ValueRange{initialVector},
       [&](mlir::OpBuilder &builder, mlir::Location nestedLoc, mlir::Value iv,
           mlir::ValueRange iterArgs) {
@@ -994,21 +990,20 @@ bool vectorizeContiguousReduction(mlir::scf::ForOp loop,
         indices.back() = iv;
 
         mlir::Value vector =
-            builder
-                .create<mlir::vector::LoadOp>(nestedLoc, vectorType,
-                                              match.load.getMemRef(), indices)
+            mlir::vector::LoadOp::create(builder, nestedLoc, vectorType,
+                                         match.load.getMemRef(), indices)
                 .getResult();
         std::optional<mlir::Value> next =
             createPrimitiveVectorAdd(builder, nestedLoc, iterArgs.front(),
                                      vector, elementType, match.fastMath);
         if (!next)
           return;
-        builder.create<mlir::scf::YieldOp>(nestedLoc, *next);
+        mlir::scf::YieldOp::create(builder, nestedLoc, *next);
       });
 
   rewriter.setInsertionPointAfter(vectorLoop);
-  mlir::Value reduced = rewriter.create<mlir::vector::ReductionOp>(
-      loc, mlir::vector::CombiningKind::ADD, vectorLoop.getResult(0),
+  mlir::Value reduced = mlir::vector::ReductionOp::create(
+      rewriter, loc, mlir::vector::CombiningKind::ADD, vectorLoop.getResult(0),
       loop.getInitArgs().front(), match.fastMath);
   rewriter.replaceOp(loop, reduced);
   return true;
@@ -1144,8 +1139,7 @@ std::optional<mlir::ArrayAttr> computeStaticInBoundsAttr(
 }
 
 bool markTransferReadInBounds(mlir::vector::TransferReadOp read) {
-  auto sourceType =
-      mlir::dyn_cast<mlir::ShapedType>(read.getSource().getType());
+  auto sourceType = mlir::dyn_cast<mlir::ShapedType>(read.getBase().getType());
   if (!sourceType)
     return false;
 
@@ -1160,8 +1154,7 @@ bool markTransferReadInBounds(mlir::vector::TransferReadOp read) {
 }
 
 bool markTransferWriteInBounds(mlir::vector::TransferWriteOp write) {
-  auto sourceType =
-      mlir::dyn_cast<mlir::ShapedType>(write.getSource().getType());
+  auto sourceType = mlir::dyn_cast<mlir::ShapedType>(write.getBase().getType());
   if (!sourceType)
     return false;
 
@@ -1243,8 +1236,8 @@ public:
       }
 
       builder.setInsertionPointAfter(*anchor);
-      builder.create<mlir::memref::DeallocOp>(alloc.getLoc(),
-                                              alloc.getResult());
+      mlir::memref::DeallocOp::create(builder, alloc.getLoc(),
+                                      alloc.getResult());
     }
   }
 };
@@ -1311,7 +1304,7 @@ public:
   }
 
   void runOnOperation() final {
-    mlir::bufferization::OneShotBufferizationOptions bufferizeOptions;
+    mlir::bufferization::OneShotBufferizePassOptions bufferizeOptions;
     bufferizeOptions.allowUnknownOps = true;
 
     mlir::affine::AffineVectorizeOptions vectorizeOptions;
@@ -1349,12 +1342,10 @@ public:
     pipeline.addPass(mlir::createLowerAffinePass());
     pipeline.addPass(std::make_unique<RowMajorDelinearizationFoldPass>());
     pipeline.addPass(std::make_unique<StaticTransferInBoundsPass>());
-    pipeline.addPass(
-        std::make_unique<PrimitiveTensorBufferDeallocationPass>());
+    pipeline.addPass(std::make_unique<PrimitiveTensorBufferDeallocationPass>());
     pipeline.addPass(mlir::createCanonicalizerPass());
     pipeline.addPass(mlir::createCSEPass());
-    pipeline.addPass(
-        std::make_unique<PrimitiveTensorAllocationVerifierPass>());
+    pipeline.addPass(std::make_unique<PrimitiveTensorAllocationVerifierPass>());
 
     if (mlir::failed(runPipeline(pipeline, getOperation())))
       signalPassFailure();

@@ -23,11 +23,9 @@ mlir::LogicalResult RuntimeBundleLowerer::validateObjectShape(
   return mlir::success();
 }
 
-mlir::LogicalResult
-RuntimeBundleLowerer::makeObjectBundle(mlir::Operation *op, mlir::Type contract,
-                                       mlir::ValueRange values,
-                                       RuntimeBundle &bundle,
-                                       bool ownsObject) const {
+mlir::LogicalResult RuntimeBundleLowerer::makeObjectBundle(
+    mlir::Operation *op, mlir::Type contract, mlir::ValueRange values,
+    RuntimeBundle &bundle, bool ownsObject) const {
   return RuntimeBundleLowerer::makeObjectBundleWithOwnership(
       op, contract, values, bundle,
       ownership::logicalOwnershipKind(contract, ownsObject));
@@ -53,7 +51,8 @@ RuntimeBundleLowerer::markOwnedLocalObjectBundle(mlir::Operation *op,
     return mlir::success();
 
   std::string contractName = bundle.contractName();
-  bool ownsObject = bundle.objectValue.ownership == ownership::OwnershipKind::Own;
+  bool ownsObject =
+      bundle.objectValue.ownership == ownership::OwnershipKind::Own;
   if (py::ClassOp classOp =
           RuntimeBundleLowerer::classForContract(bundle.objectValue.contract)) {
     ownsObject = true;
@@ -78,8 +77,8 @@ RuntimeBundleLowerer::markOwnedLocalObjectBundle(mlir::Operation *op,
     types.push_back(value.getType());
 
   builder.setInsertionPoint(op);
-  auto marker = builder.create<mlir::UnrealizedConversionCastOp>(
-      op->getLoc(), types, bundle.objectValue.values);
+  auto marker = mlir::UnrealizedConversionCastOp::create(
+      builder, op->getLoc(), types, bundle.objectValue.values);
   marker->setAttr(ownership::kOwnedLocalObjectAttr, builder.getUnitAttr());
   marker->setAttr(ownership::kOwnedLocalObjectContractAttr,
                   builder.getStringAttr(contractName));
@@ -108,7 +107,7 @@ void RuntimeBundleLowerer::seedPrimitiveI64Evidence(mlir::Operation *op,
       rawValues.size() != 1 || !rawValues.front().getType().isInteger(64))
     return;
   mlir::Value valid =
-      builder.create<mlir::arith::ConstantIntOp>(op->getLoc(), 1, 1)
+      mlir::arith::ConstantIntOp::create(builder, op->getLoc(), 1, 1)
           .getResult();
   bundle.primitiveI64 = RuntimePrimitiveI64Evidence{rawValues.front(), valid};
 }
@@ -184,8 +183,8 @@ RuntimeBundleLowerer::materializePrimitiveI64ObjectAtCurrentInsertion(
 
 mlir::FailureOr<RuntimeBundle>
 RuntimeBundleLowerer::materializeObjectBundleForStorage(
-    mlir::Operation *op, const RuntimeBundle &bundle, mlir::Type storageContract,
-    llvm::StringRef purpose) {
+    mlir::Operation *op, const RuntimeBundle &bundle,
+    mlir::Type storageContract, llvm::StringRef purpose) {
   if (bundle.kind != RuntimeBundle::Kind::Object)
     return op->emitError() << purpose << " requires an object bundle";
 
@@ -283,7 +282,7 @@ mlir::LogicalResult RuntimeBundleLowerer::bundleRawObjectValues(
   if (contractName == "builtins.int" && values.size() == 1 &&
       values.front().getType().isInteger(64)) {
     mlir::Value valid =
-        builder.create<mlir::arith::ConstantIntOp>(op->getLoc(), 1, 1)
+        mlir::arith::ConstantIntOp::create(builder, op->getLoc(), 1, 1)
             .getResult();
     return RuntimeBundleLowerer::makePrimitiveI64Bundle(
         op, concreteContract, values.front(), valid, bundle);
@@ -318,7 +317,7 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultValue(
     if (!value)
       return op->emitError() << "bool default value has no payload";
     mlir::Value bit =
-        builder.create<mlir::arith::ConstantIntOp>(loc, value.getValue(), 1)
+        mlir::arith::ConstantIntOp::create(builder, loc, value.getValue(), 1)
             .getResult();
     return RuntimeBundleLowerer::bundleRawObjectValues(op, parameterType, bit,
                                                        bundle);
@@ -332,7 +331,8 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultValue(
       return op->emitError()
              << "integer default value is outside the lowered i64 path";
     mlir::Value integer =
-        builder.create<mlir::arith::ConstantIntOp>(loc, parsed, 64).getResult();
+        mlir::arith::ConstantIntOp::create(builder, loc, parsed, 64)
+            .getResult();
     return RuntimeBundleLowerer::bundleRawObjectValues(op, parameterType,
                                                        integer, bundle);
   }
@@ -340,10 +340,10 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultValue(
     auto value = dict.getAs<mlir::FloatAttr>("value");
     if (!value)
       return op->emitError() << "float default value has no payload";
-    mlir::Value number = builder
-                             .create<mlir::arith::ConstantFloatOp>(
-                                 loc, value.getValue(), builder.getF64Type())
-                             .getResult();
+    mlir::Value number =
+        mlir::arith::ConstantFloatOp::create(builder, loc, builder.getF64Type(),
+                                             value.getValue())
+            .getResult();
     return RuntimeBundleLowerer::bundleRawObjectValues(op, parameterType,
                                                        number, bundle);
   }
@@ -354,11 +354,11 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultValue(
     mlir::Value bytes =
         RuntimeBundleLowerer::materializeByteBuffer(loc, value.getValue());
     mlir::Value start =
-        builder.create<mlir::arith::ConstantIndexOp>(loc, 0).getResult();
+        mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult();
     mlir::Value length =
-        builder
-            .create<mlir::arith::ConstantIntOp>(
-                loc, static_cast<std::int64_t>(value.getValue().size()), 64)
+        mlir::arith::ConstantIntOp::create(
+            builder, loc, static_cast<std::int64_t>(value.getValue().size()),
+            64)
             .getResult();
     return RuntimeBundleLowerer::bundleRawObjectValues(
         op, parameterType, mlir::ValueRange{bytes, start, length}, bundle);

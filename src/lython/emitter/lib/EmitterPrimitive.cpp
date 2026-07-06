@@ -85,7 +85,7 @@ bool collectTensorLiteralAttrs(mlir::OpBuilder &builder,
 
 mlir::Value constantIndex(mlir::OpBuilder &builder, mlir::Location loc,
                           std::int64_t value) {
-  return builder.create<mlir::arith::ConstantIndexOp>(loc, value).getResult();
+  return mlir::arith::ConstantIndexOp::create(builder, loc, value).getResult();
 }
 
 mlir::Value tensorExtract(mlir::OpBuilder &builder, mlir::Location loc,
@@ -95,7 +95,7 @@ mlir::Value tensorExtract(mlir::OpBuilder &builder, mlir::Location loc,
   indexValues.reserve(indices.size());
   for (std::int64_t index : indices)
     indexValues.push_back(constantIndex(builder, loc, index));
-  return builder.create<mlir::tensor::ExtractOp>(loc, tensor, indexValues)
+  return mlir::tensor::ExtractOp::create(builder, loc, tensor, indexValues)
       .getResult();
 }
 
@@ -107,37 +107,36 @@ mlir::Value coerceFloatValue(mlir::OpBuilder &builder, mlir::Location loc,
   unsigned sourceWidth = sourceType.getWidth();
   unsigned targetWidth = targetType.getWidth();
   if (sourceWidth < targetWidth)
-    return builder.create<mlir::arith::ExtFOp>(loc, targetType, value)
+    return mlir::arith::ExtFOp::create(builder, loc, targetType, value)
         .getResult();
   if (sourceWidth > targetWidth)
-    return builder.create<mlir::arith::TruncFOp>(loc, targetType, value)
+    return mlir::arith::TruncFOp::create(builder, loc, targetType, value)
         .getResult();
   return value;
 }
 
 mlir::Value integerConstant(mlir::OpBuilder &builder, mlir::Location loc,
                             mlir::IntegerType type, std::int64_t value) {
-  return builder
-      .create<mlir::arith::ConstantOp>(loc, type,
-                                       builder.getIntegerAttr(type, value))
+  return mlir::arith::ConstantOp::create(builder, loc, type,
+                                         builder.getIntegerAttr(type, value))
       .getResult();
 }
 
 mlir::Value boolConstant(mlir::OpBuilder &builder, mlir::Location loc,
                          bool value) {
-  return builder.create<mlir::arith::ConstantIntOp>(loc, value ? 1 : 0, 1)
+  return mlir::arith::ConstantIntOp::create(builder, loc, value ? 1 : 0, 1)
       .getResult();
 }
 
 mlir::Value logicalAnd(mlir::OpBuilder &builder, mlir::Location loc,
                        mlir::Value lhs, mlir::Value rhs) {
-  return builder.create<mlir::arith::AndIOp>(loc, lhs, rhs).getResult();
+  return mlir::arith::AndIOp::create(builder, loc, lhs, rhs).getResult();
 }
 
 mlir::Value logicalNot(mlir::OpBuilder &builder, mlir::Location loc,
                        mlir::Value value) {
-  return builder
-      .create<mlir::arith::XOrIOp>(loc, value, boolConstant(builder, loc, true))
+  return mlir::arith::XOrIOp::create(builder, loc, value,
+                                     boolConstant(builder, loc, true))
       .getResult();
 }
 
@@ -147,29 +146,24 @@ mlir::Value signedAddOverflow(mlir::OpBuilder &builder, mlir::Location loc,
                               mlir::IntegerType integerType) {
   mlir::Value zero = integerConstant(builder, loc, integerType, 0);
   mlir::Value lhsNegative =
-      builder
-          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::slt,
-                                       lhs, zero)
+      mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::slt,
+                                  lhs, zero)
           .getResult();
   mlir::Value rhsNegative =
-      builder
-          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::slt,
-                                       rhs, zero)
+      mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::slt,
+                                  rhs, zero)
           .getResult();
   mlir::Value resultNegative =
-      builder
-          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::slt,
-                                       result, zero)
+      mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::slt,
+                                  result, zero)
           .getResult();
   mlir::Value sameSign =
-      builder
-          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::eq,
-                                       lhsNegative, rhsNegative)
+      mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::eq,
+                                  lhsNegative, rhsNegative)
           .getResult();
   mlir::Value signChanged =
-      builder
-          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::ne,
-                                       resultNegative, lhsNegative)
+      mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::ne,
+                                  resultNegative, lhsNegative)
           .getResult();
   return logicalAnd(builder, loc, sameSign, signChanged);
 }
@@ -180,62 +174,57 @@ mlir::Value signedSubOverflow(mlir::OpBuilder &builder, mlir::Location loc,
                               mlir::IntegerType integerType) {
   mlir::Value zero = integerConstant(builder, loc, integerType, 0);
   mlir::Value lhsNegative =
-      builder
-          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::slt,
-                                       lhs, zero)
+      mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::slt,
+                                  lhs, zero)
           .getResult();
   mlir::Value rhsNegative =
-      builder
-          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::slt,
-                                       rhs, zero)
+      mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::slt,
+                                  rhs, zero)
           .getResult();
   mlir::Value resultNegative =
-      builder
-          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::slt,
-                                       result, zero)
+      mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::slt,
+                                  result, zero)
           .getResult();
   mlir::Value differentSign =
-      builder
-          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::ne,
-                                       lhsNegative, rhsNegative)
+      mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::ne,
+                                  lhsNegative, rhsNegative)
           .getResult();
   mlir::Value signChanged =
-      builder
-          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::ne,
-                                       resultNegative, lhsNegative)
+      mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::ne,
+                                  resultNegative, lhsNegative)
           .getResult();
   return logicalAnd(builder, loc, differentSign, signChanged);
 }
 
-std::optional<mlir::Value> createIntegerBinary(
-    mlir::OpBuilder &builder, mlir::Location loc, const parser::Node *op,
-    mlir::Value lhs, mlir::Value rhs, mlir::IntegerType integerType,
-    bool sanitizeUndefined) {
+std::optional<mlir::Value>
+createIntegerBinary(mlir::OpBuilder &builder, mlir::Location loc,
+                    const parser::Node *op, mlir::Value lhs, mlir::Value rhs,
+                    mlir::IntegerType integerType, bool sanitizeUndefined) {
   mlir::Value result;
   mlir::Value overflow;
   llvm::StringRef opName;
   if (ast::isOperator(op, "Sub")) {
-    result = builder.create<mlir::arith::SubIOp>(loc, lhs, rhs).getResult();
+    result = mlir::arith::SubIOp::create(builder, loc, lhs, rhs).getResult();
     overflow = signedSubOverflow(builder, loc, lhs, rhs, result, integerType);
     opName = "subtraction";
   } else if (ast::isOperator(op, "Mult")) {
     if (!sanitizeUndefined)
-      return builder.create<mlir::arith::MulIOp>(loc, lhs, rhs).getResult();
-    auto extended = builder.create<mlir::arith::MulSIExtendedOp>(loc, lhs, rhs);
+      return mlir::arith::MulIOp::create(builder, loc, lhs, rhs).getResult();
+    auto extended =
+        mlir::arith::MulSIExtendedOp::create(builder, loc, lhs, rhs);
     mlir::Value shift =
         integerConstant(builder, loc, integerType, integerType.getWidth() - 1);
     mlir::Value expectedHigh =
-        builder.create<mlir::arith::ShRSIOp>(loc, extended.getLow(), shift)
+        mlir::arith::ShRSIOp::create(builder, loc, extended.getLow(), shift)
             .getResult();
-    overflow =
-        builder
-            .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::ne,
-                                         extended.getHigh(), expectedHigh)
-            .getResult();
+    overflow = mlir::arith::CmpIOp::create(builder, loc,
+                                           mlir::arith::CmpIPredicate::ne,
+                                           extended.getHigh(), expectedHigh)
+                   .getResult();
     result = extended.getLow();
     opName = "multiplication";
   } else if (ast::isOperator(op, "Add")) {
-    result = builder.create<mlir::arith::AddIOp>(loc, lhs, rhs).getResult();
+    result = mlir::arith::AddIOp::create(builder, loc, lhs, rhs).getResult();
     overflow = signedAddOverflow(builder, loc, lhs, rhs, result, integerType);
     opName = "addition";
   } else {
@@ -244,18 +233,19 @@ std::optional<mlir::Value> createIntegerBinary(
 
   if (sanitizeUndefined) {
     mlir::Value ok = logicalNot(builder, loc, overflow);
-    builder.create<mlir::cf::AssertOp>(
-        loc, ok, (llvm::Twine("lython UBSan: signed integer ") + opName +
-                  " overflow")
-                     .str());
+    mlir::cf::AssertOp::create(
+        builder, loc, ok,
+        (llvm::Twine("lython UBSan: signed integer ") + opName + " overflow")
+            .str());
   }
   return result;
 }
 
-std::optional<mlir::Value>
-createScalarBinary(mlir::OpBuilder &builder, mlir::Location loc,
-                   const parser::Node *op, mlir::Value lhs, mlir::Value rhs,
-                   bool sanitizeUndefined = false) {
+std::optional<mlir::Value> createScalarBinary(mlir::OpBuilder &builder,
+                                              mlir::Location loc,
+                                              const parser::Node *op,
+                                              mlir::Value lhs, mlir::Value rhs,
+                                              bool sanitizeUndefined = false) {
   mlir::Type type = lhs.getType();
   if (auto integer = mlir::dyn_cast<mlir::IntegerType>(type)) {
     if (rhs.getType() != type)
@@ -268,11 +258,11 @@ createScalarBinary(mlir::OpBuilder &builder, mlir::Location loc,
     if (rhs.getType() != type)
       return std::nullopt;
     if (ast::isOperator(op, "Sub"))
-      return builder.create<mlir::arith::SubFOp>(loc, lhs, rhs).getResult();
+      return mlir::arith::SubFOp::create(builder, loc, lhs, rhs).getResult();
     if (ast::isOperator(op, "Mult"))
-      return builder.create<mlir::arith::MulFOp>(loc, lhs, rhs).getResult();
+      return mlir::arith::MulFOp::create(builder, loc, lhs, rhs).getResult();
     if (ast::isOperator(op, "Add"))
-      return builder.create<mlir::arith::AddFOp>(loc, lhs, rhs).getResult();
+      return mlir::arith::AddFOp::create(builder, loc, lhs, rhs).getResult();
     return std::nullopt;
   }
   return std::nullopt;
@@ -293,12 +283,10 @@ void enumerateTensorIndices(
   }
 }
 
-std::optional<Value>
-emitElementwiseTensorBinary(mlir::OpBuilder &builder, mlir::Location loc,
-                            const parser::Node &expr, Value lhs, Value rhs,
-                            const parser::Node *op,
-                            mlir::RankedTensorType tensorType,
-                            bool sanitizeUndefined) {
+std::optional<Value> emitElementwiseTensorBinary(
+    mlir::OpBuilder &builder, mlir::Location loc, const parser::Node &expr,
+    Value lhs, Value rhs, const parser::Node *op,
+    mlir::RankedTensorType tensorType, bool sanitizeUndefined) {
   if (rhs.value.getType() != tensorType)
     return std::nullopt;
 
@@ -311,9 +299,8 @@ emitElementwiseTensorBinary(mlir::OpBuilder &builder, mlir::Location loc,
             tensorExtract(builder, loc, lhs.value, indices);
         mlir::Value rhsElement =
             tensorExtract(builder, loc, rhs.value, indices);
-        std::optional<mlir::Value> result =
-            createScalarBinary(builder, loc, op, lhsElement, rhsElement,
-                               sanitizeUndefined);
+        std::optional<mlir::Value> result = createScalarBinary(
+            builder, loc, op, lhsElement, rhsElement, sanitizeUndefined);
         if (result)
           elements.push_back(*result);
       },
@@ -322,7 +309,7 @@ emitElementwiseTensorBinary(mlir::OpBuilder &builder, mlir::Location loc,
     return std::nullopt;
 
   auto result =
-      builder.create<mlir::tensor::FromElementsOp>(loc, tensorType, elements);
+      mlir::tensor::FromElementsOp::create(builder, loc, tensorType, elements);
   return Value{result.getResult(), tensorType};
 }
 
@@ -345,14 +332,12 @@ std::optional<Value> emitMatrixMatmul(mlir::OpBuilder &builder,
   mlir::Type elementType = lhsType.getElementType();
   mlir::Value zero;
   if (auto integer = mlir::dyn_cast<mlir::IntegerType>(elementType)) {
-    zero = builder
-               .create<mlir::arith::ConstantOp>(
-                   loc, integer, builder.getIntegerAttr(integer, 0))
+    zero = mlir::arith::ConstantOp::create(builder, loc, integer,
+                                           builder.getIntegerAttr(integer, 0))
                .getResult();
   } else if (auto floating = mlir::dyn_cast<mlir::FloatType>(elementType)) {
-    zero = builder
-               .create<mlir::arith::ConstantOp>(
-                   loc, floating, builder.getFloatAttr(floating, 0.0))
+    zero = mlir::arith::ConstantOp::create(builder, loc, floating,
+                                           builder.getFloatAttr(floating, 0.0))
                .getResult();
   } else {
     return std::nullopt;
@@ -361,15 +346,16 @@ std::optional<Value> emitMatrixMatmul(mlir::OpBuilder &builder,
   // Keep matrix multiplication as a structured contraction.  Expanding it
   // here would generate O(M*N*K) scalar IR and would also hide the alias-free
   // contraction from linalg/affine/vector lowering.
-  auto init =
-      builder.create<mlir::tensor::EmptyOp>(loc, resultType, mlir::ValueRange{})
-          .getResult();
-  auto filled = builder.create<mlir::linalg::FillOp>(
-      loc, mlir::TypeRange{resultType}, mlir::ValueRange{zero},
+  auto init = mlir::tensor::EmptyOp::create(builder, loc, resultType,
+                                            mlir::ValueRange{})
+                  .getResult();
+  auto filled = mlir::linalg::FillOp::create(
+      builder, loc, mlir::TypeRange{resultType}, mlir::ValueRange{zero},
       mlir::ValueRange{init});
-  auto matmul = builder.create<mlir::linalg::MatmulOp>(
-      loc, mlir::TypeRange{resultType}, mlir::ValueRange{lhs.value, rhs.value},
-      mlir::ValueRange{filled.getResult(0)});
+  auto matmul =
+      mlir::linalg::MatmulOp::create(builder, loc, mlir::TypeRange{resultType},
+                                     mlir::ValueRange{lhs.value, rhs.value},
+                                     mlir::ValueRange{filled.getResult(0)});
   return Value{matmul.getResult(0), resultType};
 }
 
@@ -405,8 +391,8 @@ ModuleEmitter::emitPrimitiveConstructorCall(const parser::Node &expr,
     if (std::optional<double> literal =
             numericLiteralValue(args->front().get())) {
       auto attr = builder.getFloatAttr(primitiveFloat, *literal);
-      auto op = builder.create<mlir::arith::ConstantOp>(loc(expr),
-                                                        primitiveFloat, attr);
+      auto op = mlir::arith::ConstantOp::create(builder, loc(expr),
+                                                primitiveFloat, attr);
       return Value{op.getResult(), primitiveFloat};
     }
     Value value = emitExpr(args->front().get());
@@ -439,7 +425,7 @@ ModuleEmitter::emitPrimitiveConstructorCall(const parser::Node &expr,
   }
   auto dense = mlir::DenseElementsAttr::get(tensorType, attrs);
   auto op =
-      builder.create<mlir::arith::ConstantOp>(loc(expr), tensorType, dense);
+      mlir::arith::ConstantOp::create(builder, loc(expr), tensorType, dense);
   return Value{op.getResult(), tensorType};
 }
 
@@ -468,20 +454,19 @@ ModuleEmitter::emitPrimitiveRuntimeCall(const parser::Node &expr,
 
   Value input = emitExpr(args->front().get());
   if (mlir::isa<mlir::IntegerType>(input.value.getType())) {
-    auto op = builder.create<py::CastFromPrimOp>(loc(expr), types.intType(),
-                                                 input.value);
+    auto op = py::CastFromPrimOp::create(builder, loc(expr), types.intType(),
+                                         input.value);
     return Value{op.getResult(), types.intType()};
   }
   if (auto primitiveFloat =
           mlir::dyn_cast<mlir::FloatType>(input.value.getType())) {
     mlir::Value raw = input.value;
     if (!primitiveFloat.isF64())
-      raw =
-          builder
-              .create<mlir::arith::ExtFOp>(loc(expr), builder.getF64Type(), raw)
-              .getResult();
+      raw = mlir::arith::ExtFOp::create(builder, loc(expr),
+                                        builder.getF64Type(), raw)
+                .getResult();
     auto op =
-        builder.create<py::CastFromPrimOp>(loc(expr), types.floatType(), raw);
+        py::CastFromPrimOp::create(builder, loc(expr), types.floatType(), raw);
     return Value{op.getResult(), types.floatType()};
   }
   if (auto tensorType =
@@ -494,18 +479,17 @@ ModuleEmitter::emitPrimitiveRuntimeCall(const parser::Node &expr,
         mlir::Type elementType = tensorType.getElementType();
         mlir::Type resultType = primitivePythonResultType(elementType, types);
         if (mlir::isa<mlir::IntegerType>(elementType)) {
-          auto cast = builder.create<py::CastFromPrimOp>(loc(expr), resultType,
-                                                         element);
+          auto cast = py::CastFromPrimOp::create(builder, loc(expr), resultType,
+                                                 element);
           return Value{cast.getResult(), resultType};
         }
         if (auto floatType = mlir::dyn_cast<mlir::FloatType>(elementType)) {
           if (!floatType.isF64())
-            element = builder
-                          .create<mlir::arith::ExtFOp>(
-                              loc(expr), builder.getF64Type(), element)
+            element = mlir::arith::ExtFOp::create(builder, loc(expr),
+                                                  builder.getF64Type(), element)
                           .getResult();
-          auto cast = builder.create<py::CastFromPrimOp>(loc(expr), resultType,
-                                                         element);
+          auto cast = py::CastFromPrimOp::create(builder, loc(expr), resultType,
+                                                 element);
           return Value{cast.getResult(), resultType};
         }
         diagnostics.push_back(parser::Diagnostic{
@@ -528,7 +512,7 @@ ModuleEmitter::emitPrimitiveRuntimeCall(const parser::Node &expr,
       mlir::Type elementType =
           children.empty() ? types.object() : children.front().type;
       mlir::Type resultType = types.listOf(elementType);
-      auto pack = builder.create<py::PackOp>(loc(expr), resultType, operands);
+      auto pack = py::PackOp::create(builder, loc(expr), resultType, operands);
       return Value{pack.getResult(), resultType};
     };
     return emitNested(/*depth=*/0);
@@ -581,8 +565,9 @@ ModuleEmitter::emitDirectPrimitiveFunctionCall(const parser::Node &expr,
     operands.push_back(value.value);
   }
 
-  auto call = builder.create<mlir::func::CallOp>(
-      loc(expr), target.getSymName(), callable.getResultTypes(), operands);
+  auto call =
+      mlir::func::CallOp::create(builder, loc(expr), target.getSymName(),
+                                 callable.getResultTypes(), operands);
   return Value{call.getResult(0), callable.getResultTypes().front()};
 }
 
@@ -649,8 +634,8 @@ ModuleEmitter::emitPrimitiveCompare(const parser::Node &expr, Value lhs,
   else if (ast::isOperator(op, "GtE"))
     predicate = mlir::arith::CmpIPredicate::sge;
 
-  auto result = builder.create<mlir::arith::CmpIOp>(loc(expr), predicate,
-                                                    lhs.value, rhs.value);
+  auto result = mlir::arith::CmpIOp::create(builder, loc(expr), predicate,
+                                            lhs.value, rhs.value);
   return Value{result.getResult(), builder.getI1Type()};
 }
 
@@ -663,8 +648,8 @@ Value ModuleEmitter::emitPrimitiveConstant(const parser::Node &anchor,
                            "primitive constant has a non-integer type"});
     return emitNone(anchor);
   }
-  auto op = builder.create<mlir::arith::ConstantIntOp>(
-      loc(anchor), constant.integerValue, integerType.getWidth());
+  auto op = mlir::arith::ConstantIntOp::create(
+      builder, loc(anchor), constant.integerValue, integerType.getWidth());
   return {op.getResult(), integerType};
 }
 
@@ -683,13 +668,13 @@ Value ModuleEmitter::coercePrimitiveInteger(Value value,
   }
 
   if (sourceType.getWidth() < targetType.getWidth()) {
-    auto op = builder.create<mlir::arith::ExtSIOp>(loc(anchor), targetType,
-                                                   value.value);
+    auto op = mlir::arith::ExtSIOp::create(builder, loc(anchor), targetType,
+                                           value.value);
     return {op.getResult(), targetType};
   }
   if (sourceType.getWidth() > targetType.getWidth()) {
-    auto op = builder.create<mlir::arith::TruncIOp>(loc(anchor), targetType,
-                                                    value.value);
+    auto op = mlir::arith::TruncIOp::create(builder, loc(anchor), targetType,
+                                            value.value);
     return {op.getResult(), targetType};
   }
   return {value.value, targetType};

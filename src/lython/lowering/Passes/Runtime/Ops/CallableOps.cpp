@@ -29,8 +29,7 @@ bool primitiveI64EvidenceEqual(const RuntimeBundle &lhs,
                                const RuntimeBundle &rhs) {
   if (lhs.contractName() != "builtins.int" ||
       rhs.contractName() != "builtins.int" || !lhs.primitiveI64 ||
-      !rhs.primitiveI64 || !lhs.primitiveI64->value ||
-      !rhs.primitiveI64->value)
+      !rhs.primitiveI64 || !lhs.primitiveI64->value || !rhs.primitiveI64->value)
     return false;
   if (lhs.primitiveI64->value == rhs.primitiveI64->value)
     return true;
@@ -92,14 +91,14 @@ mlir::LogicalResult adjustListRuntimeLength(mlir::Operation *op,
                            << meta.getType();
 
   mlir::Location loc = op->getLoc();
-  mlir::Value slot = builder.create<mlir::arith::ConstantIndexOp>(loc, 0);
-  mlir::Value current = builder.create<mlir::memref::LoadOp>(loc, meta, slot);
-  mlir::Value one = builder.create<mlir::arith::ConstantIntOp>(loc, 1, 64);
+  mlir::Value slot = mlir::arith::ConstantIndexOp::create(builder, loc, 0);
+  mlir::Value current = mlir::memref::LoadOp::create(builder, loc, meta, slot);
+  mlir::Value one = mlir::arith::ConstantIntOp::create(builder, loc, 1, 64);
   mlir::Value next =
       delta >= 0
-          ? builder.create<mlir::arith::AddIOp>(loc, current, one).getResult()
-          : builder.create<mlir::arith::SubIOp>(loc, current, one).getResult();
-  builder.create<mlir::memref::StoreOp>(loc, next, meta, slot);
+          ? mlir::arith::AddIOp::create(builder, loc, current, one).getResult()
+          : mlir::arith::SubIOp::create(builder, loc, current, one).getResult();
+  mlir::memref::StoreOp::create(builder, loc, next, meta, slot);
   return mlir::success();
 }
 
@@ -183,8 +182,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
       if (mlir::failed(adjustListRuntimeLength(op, builder, receiver, +1)))
         return mlir::failure();
       mlir::FailureOr<RuntimeBundle> payload =
-          RuntimeBundleLowerer::materializePayloadObjectBundle(op,
-                                                               *sources[1]);
+          RuntimeBundleLowerer::materializePayloadObjectBundle(op, *sources[1]);
       if (mlir::failed(payload))
         return mlir::failure();
       if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
@@ -197,7 +195,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
         return mlir::failure();
       RuntimeBundle stored = payload->withObjectOwnership(
           ownership::logicalOwnershipKind(payload->objectValue.contract,
-                                                  /*ownsObject=*/false));
+                                          /*ownsObject=*/false));
       updated.sequenceElements.push_back(stored.objectValue);
       updated.sequenceElementBundles.push_back(
           std::make_shared<RuntimeBundle>(std::move(stored)));
@@ -294,9 +292,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
           protocol.getArguments().size() == 1)
         payload = protocol.getArguments().front();
     mlir::Type object = runtimeContractType(context, "builtins.object");
-    mlir::Type coroutineType =
-        py::ContractType::get(context, "types.CoroutineType",
-                              {object, object, payload});
+    mlir::Type coroutineType = py::ContractType::get(
+        context, "types.CoroutineType", {object, object, payload});
     RuntimeBundle concrete = receiver;
     concrete.contract = coroutineType;
     concrete.objectValue.contract = coroutineType;

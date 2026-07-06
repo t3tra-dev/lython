@@ -21,9 +21,8 @@ py::CallableType callableContractForDispatchMatch(mlir::func::FuncOp function,
 
   mlir::MLIRContext *context = function.getContext();
   mlir::Type object = runtimeContractType(context, "builtins.object");
-  mlir::Type coroutine =
-      py::ContractType::get(context, "types.CoroutineType",
-                            {object, object, bodyResult.getValue()});
+  mlir::Type coroutine = py::ContractType::get(
+      context, "types.CoroutineType", {object, object, bodyResult.getValue()});
   return py::CallableType::get(
       context, callable.getPositionalTypes(), callable.getKwOnlyTypes(),
       callable.hasVararg() ? callable.getVarargType() : mlir::Type(),
@@ -258,9 +257,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
   if (mlir::failed(storage))
     return mlir::failure();
   mlir::Value targetSlot =
-      builder.create<mlir::arith::ConstantIndexOp>(op.getLoc(), 2).getResult();
+      mlir::arith::ConstantIndexOp::create(builder, op.getLoc(), 2).getResult();
   mlir::Value targetId =
-      builder.create<mlir::memref::LoadOp>(op.getLoc(), *storage, targetSlot)
+      mlir::memref::LoadOp::create(builder, op.getLoc(), *storage, targetSlot)
           .getResult();
 
   mlir::Operation *operation = op.getOperation();
@@ -374,15 +373,15 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
         branchOperands.push_back(targetResult.primitiveI64->valid);
       } else {
         branchOperands.push_back(
-            builder.create<mlir::arith::ConstantIntOp>(op.getLoc(), 0, 64)
+            mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 0, 64)
                 .getResult());
         branchOperands.push_back(
-            builder.create<mlir::arith::ConstantIntOp>(op.getLoc(), 0, 1)
+            mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 0, 1)
                 .getResult());
       }
     }
-    builder.create<mlir::cf::BranchOp>(op.getLoc(), continuation,
-                                       branchOperands);
+    mlir::cf::BranchOp::create(builder, op.getLoc(), continuation,
+                               branchOperands);
   }
 
   builder.setInsertionPointToStart(defaultBlock);
@@ -397,35 +396,34 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
                                                dead->values.end());
   if (RuntimeBundleLowerer::hasPrimitiveI64ABI(op.getResult(0).getType())) {
     deadValues.push_back(
-        builder.create<mlir::arith::ConstantIntOp>(op.getLoc(), 0, 64)
+        mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 0, 64)
             .getResult());
     deadValues.push_back(
-        builder.create<mlir::arith::ConstantIntOp>(op.getLoc(), 0, 1)
+        mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 0, 1)
             .getResult());
   }
-  builder.create<mlir::cf::BranchOp>(op.getLoc(), continuation, deadValues);
+  mlir::cf::BranchOp::create(builder, op.getLoc(), continuation, deadValues);
 
   if (targets.empty()) {
     builder.setInsertionPointToEnd(entry);
-    builder.create<mlir::cf::BranchOp>(op.getLoc(), defaultBlock);
+    mlir::cf::BranchOp::create(builder, op.getLoc(), defaultBlock);
   } else {
     mlir::Block *testBlock = entry;
     for (auto [index, target] : llvm::enumerate(targets)) {
       builder.setInsertionPointToEnd(testBlock);
       mlir::Value expectedId =
-          builder
-              .create<mlir::arith::ConstantIntOp>(
-                  op.getLoc(),
-                  RuntimeBundleLowerer::functionTargetId(target.getSymName()),
-                  64)
+          mlir::arith::ConstantIntOp::create(
+              builder, op.getLoc(),
+              RuntimeBundleLowerer::functionTargetId(target.getSymName()), 64)
               .getResult();
-      mlir::Value matches = builder.create<mlir::arith::CmpIOp>(
-          op.getLoc(), mlir::arith::CmpIPredicate::eq, targetId, expectedId);
+      mlir::Value matches = mlir::arith::CmpIOp::create(
+          builder, op.getLoc(), mlir::arith::CmpIPredicate::eq, targetId,
+          expectedId);
       mlir::Block *nextBlock =
           index + 1 < targets.size() ? testBlocks[index] : defaultBlock;
-      builder.create<mlir::cf::CondBranchOp>(
-          op.getLoc(), matches, targetBlocks[index], mlir::ValueRange{},
-          nextBlock, mlir::ValueRange{});
+      mlir::cf::CondBranchOp::create(builder, op.getLoc(), matches,
+                                     targetBlocks[index], mlir::ValueRange{},
+                                     nextBlock, mlir::ValueRange{});
       if (index + 1 < targets.size())
         testBlock = nextBlock;
     }

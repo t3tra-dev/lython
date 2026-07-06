@@ -28,11 +28,16 @@ target_link_libraries(lyc
 )
 
 set(LYTHON_CLANG_RESOURCE_DIR "")
-find_program(LYTHON_CLANG_FOR_RESOURCE_DIR
-    NAMES clang
-    HINTS ${LLVM_TOOLS_BINARY_DIR}
-    NO_DEFAULT_PATH
-)
+lython_tool_needs_refresh(LYTHON_NEED_CLANG_FOR_RESOURCE_DIR
+    "${LYTHON_CLANG_FOR_RESOURCE_DIR}")
+if(LYTHON_NEED_CLANG_FOR_RESOURCE_DIR)
+    unset(LYTHON_CLANG_FOR_RESOURCE_DIR CACHE)
+    find_program(LYTHON_CLANG_FOR_RESOURCE_DIR
+        NAMES clang-${LYTHON_LLVM_MAJOR_VERSION} clang
+        HINTS ${LYTHON_LLVM_TOOL_HINTS}
+        NO_DEFAULT_PATH
+    )
+endif()
 if(LYTHON_CLANG_FOR_RESOURCE_DIR)
     execute_process(
         COMMAND ${LYTHON_CLANG_FOR_RESOURCE_DIR} --print-resource-dir

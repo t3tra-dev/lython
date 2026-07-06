@@ -22,17 +22,16 @@ mlir::LogicalResult RuntimeBundleLowerer::appendCallableArgumentEvidenceSources(
   auto appendEvidenceBundle =
       [&](const RuntimeBundle &bundle) -> mlir::LogicalResult {
     if (bundle.kind != RuntimeBundle::Kind::Object)
-      return op.emitError()
-             << "argument evidence source for " << targetName
-             << " must be an object bundle";
+      return op.emitError() << "argument evidence source for " << targetName
+                            << " must be an object bundle";
     evidenceSources.push_back(bundle);
     sources.push_back(&evidenceSources.back());
     return mlir::success();
   };
   auto appendEvidenceValue =
       [&](const RuntimeValue &value) -> mlir::LogicalResult {
-    return appendEvidenceBundle(RuntimeBundle::object(value.contract,
-                                                      value.values));
+    return appendEvidenceBundle(
+        RuntimeBundle::object(value.contract, value.values));
   };
   auto appendPlaceholder = [&](mlir::Type expected) -> mlir::LogicalResult {
     mlir::FailureOr<RuntimeValue> dead =
@@ -180,10 +179,9 @@ RuntimeBundleLowerer::appendCallableAggregateEvidenceSources(
     return mlir::success();
   };
   auto appendPresenceEvidenceSource = [&](bool present) -> mlir::LogicalResult {
-    mlir::Value bit =
-        builder
-            .create<mlir::arith::ConstantIntOp>(op.getLoc(), present ? 1 : 0, 1)
-            .getResult();
+    mlir::Value bit = mlir::arith::ConstantIntOp::create(builder, op.getLoc(),
+                                                         present ? 1 : 0, 1)
+                          .getResult();
     evidenceSources.push_back(RuntimeBundle::object(
         runtimeContractType(context, "builtins.bool"), bit));
     sources.push_back(&evidenceSources.back());

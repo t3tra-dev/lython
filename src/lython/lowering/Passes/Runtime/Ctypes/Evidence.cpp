@@ -14,24 +14,28 @@ std::string targetFactsLabel(const std::optional<TargetPlatformFacts> &facts) {
 bool isFixedOrTargetDependentCtypesScalar(llvm::StringRef contract) {
   llvm::StringRef name = stripCtypesModule(contract);
   return llvm::StringSwitch<bool>(name)
-      .Cases("c_bool", "c_byte", "c_ubyte", "c_short", "c_ushort", "c_int",
-             "c_uint", true)
-      .Cases("c_long", "c_ulong", "c_longlong", "c_ulonglong", true)
-      .Cases("c_int8", "c_uint8", "c_int16", "c_uint16", "c_int32", "c_uint32",
-             "c_int64", "c_uint64", true)
-      .Cases("c_ssize_t", "c_size_t", "c_void_p", true)
+      .Cases({"c_bool", "c_byte", "c_ubyte", "c_short", "c_ushort", "c_int",
+              "c_uint"},
+             true)
+      .Cases({"c_long", "c_ulong", "c_longlong", "c_ulonglong"}, true)
+      .Cases({"c_int8", "c_uint8", "c_int16", "c_uint16", "c_int32", "c_uint32",
+              "c_int64", "c_uint64"},
+             true)
+      .Cases({"c_ssize_t", "c_size_t", "c_void_p"}, true)
       .Default(false);
 }
 
 bool isCtypesIntegralLike(llvm::StringRef contract) {
   llvm::StringRef name = stripCtypesModule(contract);
   return llvm::StringSwitch<bool>(name)
-      .Cases("c_bool", "c_byte", "c_ubyte", "c_short", "c_ushort", "c_int",
-             "c_uint", true)
-      .Cases("c_long", "c_ulong", "c_longlong", "c_ulonglong", true)
-      .Cases("c_int8", "c_uint8", "c_int16", "c_uint16", "c_int32", "c_uint32",
-             "c_int64", "c_uint64", true)
-      .Cases("c_ssize_t", "c_size_t", "c_void_p", true)
+      .Cases({"c_bool", "c_byte", "c_ubyte", "c_short", "c_ushort", "c_int",
+              "c_uint"},
+             true)
+      .Cases({"c_long", "c_ulong", "c_longlong", "c_ulonglong"}, true)
+      .Cases({"c_int8", "c_uint8", "c_int16", "c_uint16", "c_int32", "c_uint32",
+              "c_int64", "c_uint64"},
+             true)
+      .Cases({"c_ssize_t", "c_size_t", "c_void_p"}, true)
       .Default(false);
 }
 
@@ -140,18 +144,19 @@ mlir::Value cdataStorageAddressValid(const RuntimeCtypesEvidence &evidence) {
 
 mlir::Value constantI1(mlir::OpBuilder &builder, mlir::Location loc,
                        bool value) {
-  return builder.create<mlir::arith::ConstantIntOp>(loc, value ? 1 : 0, 1)
+  return mlir::arith::ConstantIntOp::create(builder, loc, value ? 1 : 0, 1)
       .getResult();
 }
 
 mlir::Value constantI64(mlir::OpBuilder &builder, mlir::Location loc,
                         std::int64_t value) {
-  return builder.create<mlir::arith::ConstantIntOp>(loc, value, 64).getResult();
+  return mlir::arith::ConstantIntOp::create(builder, loc, value, 64)
+      .getResult();
 }
 
 mlir::Value constantIndex(mlir::OpBuilder &builder, mlir::Location loc,
                           std::int64_t value) {
-  return builder.create<mlir::arith::ConstantIndexOp>(loc, value).getResult();
+  return mlir::arith::ConstantIndexOp::create(builder, loc, value).getResult();
 }
 
 std::string ctypesLibraryABI(llvm::StringRef contract) {
@@ -266,9 +271,9 @@ mlir::Value coerceNativeInteger(mlir::OpBuilder &builder, mlir::Location loc,
   if (sourceType == targetType)
     return value;
   if (sourceType.getWidth() > targetType.getWidth())
-    return builder.create<mlir::arith::TruncIOp>(loc, targetType, value)
+    return mlir::arith::TruncIOp::create(builder, loc, targetType, value)
         .getResult();
-  return builder.create<mlir::arith::ExtSIOp>(loc, targetType, value)
+  return mlir::arith::ExtSIOp::create(builder, loc, targetType, value)
       .getResult();
 }
 
@@ -332,14 +337,14 @@ integerToNativePointer(mlir::OpBuilder &builder, mlir::Location loc,
                        const std::optional<TargetPlatformFacts> &facts) {
   mlir::IntegerType pointerInteger = nativePointerIntegerType(builder, facts);
   mlir::Value raw = coerceNativeInteger(builder, loc, value, pointerInteger);
-  return builder.create<mlir::LLVM::IntToPtrOp>(
-      loc, nativePointerType(builder.getContext()), raw);
+  return mlir::LLVM::IntToPtrOp::create(
+      builder, loc, nativePointerType(builder.getContext()), raw);
 }
 
 mlir::Value nativePointerToInteger(mlir::OpBuilder &builder, mlir::Location loc,
                                    mlir::Value pointer) {
-  return builder.create<mlir::LLVM::PtrToIntOp>(loc, builder.getI64Type(),
-                                                pointer);
+  return mlir::LLVM::PtrToIntOp::create(builder, loc, builder.getI64Type(),
+                                        pointer);
 }
 
 mlir::Value addressWithOffset(mlir::OpBuilder &builder, mlir::Location loc,
@@ -349,9 +354,9 @@ mlir::Value addressWithOffset(mlir::OpBuilder &builder, mlir::Location loc,
   mlir::Value base = coerceNativeInteger(builder, loc, address, pointerInteger);
   if (offset == 0)
     return base;
-  mlir::Value delta = builder.create<mlir::arith::ConstantIntOp>(
-      loc, offset, pointerInteger.getWidth());
-  return builder.create<mlir::arith::AddIOp>(loc, base, delta).getResult();
+  mlir::Value delta = mlir::arith::ConstantIntOp::create(
+      builder, loc, offset, pointerInteger.getWidth());
+  return mlir::arith::AddIOp::create(builder, loc, base, delta).getResult();
 }
 
 mlir::Value
@@ -367,15 +372,16 @@ addressOfNativeCellAlloca(mlir::OpBuilder &builder, mlir::Location loc,
                           const std::optional<TargetPlatformFacts> &facts) {
   auto nativeType = mlir::cast<mlir::IntegerType>(nativeValue.getType());
   auto bufferType = mlir::MemRefType::get({1}, nativeType);
-  mlir::Value buffer = builder.create<mlir::memref::AllocaOp>(loc, bufferType);
+  mlir::Value buffer = mlir::memref::AllocaOp::create(builder, loc, bufferType);
   mlir::Value zero = constantIndex(builder, loc, 0);
-  builder.create<mlir::memref::StoreOp>(loc, nativeValue, buffer,
-                                        mlir::ValueRange{zero});
+  mlir::memref::StoreOp::create(builder, loc, nativeValue, buffer,
+                                mlir::ValueRange{zero});
   mlir::Value pointerIndex =
-      builder.create<mlir::memref::ExtractAlignedPointerAsIndexOp>(loc, buffer);
-  return builder
-      .create<mlir::arith::IndexCastOp>(
-          loc, nativePointerIntegerType(builder, facts), pointerIndex)
+      mlir::memref::ExtractAlignedPointerAsIndexOp::create(builder, loc,
+                                                           buffer);
+  return mlir::arith::IndexCastOp::create(
+             builder, loc, nativePointerIntegerType(builder, facts),
+             pointerIndex)
       .getResult();
 }
 
@@ -386,24 +392,25 @@ mlir::Value addressOfZeroedNativeBytesAlloca(
   auto byteType = builder.getIntegerType(8);
   auto bufferType = mlir::MemRefType::get(
       {static_cast<std::int64_t>(allocationSize)}, byteType);
-  mlir::Value buffer = builder.create<mlir::memref::AllocaOp>(loc, bufferType);
+  mlir::Value buffer = mlir::memref::AllocaOp::create(builder, loc, bufferType);
   mlir::Value lower = constantIndex(builder, loc, 0);
   mlir::Value upper =
       constantIndex(builder, loc, static_cast<std::int64_t>(allocationSize));
   mlir::Value step = constantIndex(builder, loc, 1);
-  mlir::Value zero = builder.create<mlir::arith::ConstantIntOp>(loc, 0, 8);
-  auto loop = builder.create<mlir::scf::ForOp>(loc, lower, upper, step);
+  mlir::Value zero = mlir::arith::ConstantIntOp::create(builder, loc, 0, 8);
+  auto loop = mlir::scf::ForOp::create(builder, loc, lower, upper, step);
   {
     mlir::OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToStart(loop.getBody());
-    builder.create<mlir::memref::StoreOp>(
-        loc, zero, buffer, mlir::ValueRange{loop.getInductionVar()});
+    mlir::memref::StoreOp::create(builder, loc, zero, buffer,
+                                  mlir::ValueRange{loop.getInductionVar()});
   }
   mlir::Value pointerIndex =
-      builder.create<mlir::memref::ExtractAlignedPointerAsIndexOp>(loc, buffer);
-  return builder
-      .create<mlir::arith::IndexCastOp>(
-          loc, nativePointerIntegerType(builder, facts), pointerIndex)
+      mlir::memref::ExtractAlignedPointerAsIndexOp::create(builder, loc,
+                                                           buffer);
+  return mlir::arith::IndexCastOp::create(
+             builder, loc, nativePointerIntegerType(builder, facts),
+             pointerIndex)
       .getResult();
 }
 
@@ -412,7 +419,7 @@ loadNativeIntegerFromAddress(mlir::OpBuilder &builder, mlir::Location loc,
                              mlir::Value address, mlir::IntegerType nativeType,
                              const std::optional<TargetPlatformFacts> &facts) {
   mlir::Value pointer = nativePointerFromAddress(builder, loc, address, facts);
-  return builder.create<mlir::LLVM::LoadOp>(loc, nativeType, pointer)
+  return mlir::LLVM::LoadOp::create(builder, loc, nativeType, pointer)
       .getResult();
 }
 
@@ -423,7 +430,7 @@ void storeNativeIntegerToAddress(
   mlir::Value pointer = nativePointerFromAddress(builder, loc, address, facts);
   mlir::Value nativeValue =
       coerceNativeInteger(builder, loc, value, nativeType);
-  builder.create<mlir::LLVM::StoreOp>(loc, nativeValue, pointer);
+  mlir::LLVM::StoreOp::create(builder, loc, nativeValue, pointer);
 }
 
 mlir::Value widenNativeInteger(mlir::OpBuilder &builder, mlir::Location loc,
@@ -433,11 +440,11 @@ mlir::Value widenNativeInteger(mlir::OpBuilder &builder, mlir::Location loc,
   if (sourceType == i64)
     return value;
   if (sourceType.getWidth() > i64.getWidth())
-    return builder.create<mlir::arith::TruncIOp>(loc, i64, value).getResult();
+    return mlir::arith::TruncIOp::create(builder, loc, i64, value).getResult();
   if (layout.kind == CtypesLayout::ABIKind::UnsignedInteger ||
       layout.kind == CtypesLayout::ABIKind::Pointer)
-    return builder.create<mlir::arith::ExtUIOp>(loc, i64, value).getResult();
-  return builder.create<mlir::arith::ExtSIOp>(loc, i64, value).getResult();
+    return mlir::arith::ExtUIOp::create(builder, loc, i64, value).getResult();
+  return mlir::arith::ExtSIOp::create(builder, loc, i64, value).getResult();
 }
 
 std::string describeNativeArgumentSource(const RuntimeBundle &source);
@@ -458,9 +465,9 @@ void copyNativeBytes(mlir::OpBuilder &builder, mlir::Location loc,
     mlir::Value destinationPointer =
         nativePointerFromAddress(builder, loc, destinationByteAddress, facts);
     mlir::Value byte =
-        builder.create<mlir::LLVM::LoadOp>(loc, byteType, sourcePointer)
+        mlir::LLVM::LoadOp::create(builder, loc, byteType, sourcePointer)
             .getResult();
-    builder.create<mlir::LLVM::StoreOp>(loc, byte, destinationPointer);
+    mlir::LLVM::StoreOp::create(builder, loc, byte, destinationPointer);
   }
 }
 

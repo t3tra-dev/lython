@@ -45,7 +45,7 @@ mlir::LogicalResult RuntimeBundleLowerer::bindEvidenceObjectResult(
   valueBundles[resultValue] = RuntimeBundle::objectWithOwnership(
       bundleContract, value.values,
       ownership::logicalOwnershipKind(bundleContract,
-                                              /*ownsObject=*/false));
+                                      /*ownsObject=*/false));
   return mlir::success();
 }
 
@@ -110,11 +110,11 @@ RuntimeBundleLowerer::selectEvidenceObjectByMatch(
 
   auto emitChain = [&](auto &&self, unsigned position)
       -> mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> {
-    auto ifOp = builder.create<mlir::scf::IfOp>(
-        loc, resultTypes, matches[position], /*withElseRegion=*/true);
+    auto ifOp = mlir::scf::IfOp::create(
+        builder, loc, resultTypes, matches[position], /*withElseRegion=*/true);
 
     builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
-    builder.create<mlir::scf::YieldOp>(loc, candidates[position].values);
+    mlir::scf::YieldOp::create(builder, loc, candidates[position].values);
 
     builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
     if (position + 1 < candidates.size()) {
@@ -122,7 +122,7 @@ RuntimeBundleLowerer::selectEvidenceObjectByMatch(
           self(self, position + 1);
       if (mlir::failed(nested))
         return mlir::failure();
-      builder.create<mlir::scf::YieldOp>(loc, *nested);
+      mlir::scf::YieldOp::create(builder, loc, *nested);
     } else {
       if (mlir::failed(RuntimeBundleLowerer::emitRuntimeException(
               op, missingContract, missingMessage)))
@@ -136,7 +136,7 @@ RuntimeBundleLowerer::selectEvidenceObjectByMatch(
           return mlir::failure();
         deadValues.push_back(*dead);
       }
-      builder.create<mlir::scf::YieldOp>(loc, deadValues);
+      mlir::scf::YieldOp::create(builder, loc, deadValues);
     }
 
     builder.setInsertionPointAfter(ifOp);
@@ -156,7 +156,7 @@ RuntimeBundleLowerer::selectEvidenceObjectByMatch(
   return RuntimeBundle::objectWithOwnership(
       bundleContract, *selected,
       ownership::logicalOwnershipKind(bundleContract,
-                                              /*ownsObject=*/false));
+                                      /*ownsObject=*/false));
 }
 
 mlir::FailureOr<RuntimeBundle> RuntimeBundleLowerer::selectEvidenceObjectMiss(
@@ -187,7 +187,7 @@ mlir::FailureOr<RuntimeBundle> RuntimeBundleLowerer::selectEvidenceObjectMiss(
   return RuntimeBundle::objectWithOwnership(
       resultValue.getType(), deadValues,
       ownership::logicalOwnershipKind(resultValue.getType(),
-                                              /*ownsObject=*/false));
+                                      /*ownsObject=*/false));
 }
 
 mlir::FailureOr<bool> RuntimeBundleLowerer::lowerSequenceEvidenceGetItem(
@@ -314,32 +314,32 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerSequenceEvidenceGetItem(
 
   mlir::Location loc = op.getLoc();
   mlir::Value rawRuntimeIndex = indexCall.getResult(0);
-  mlir::Value zero = builder.create<mlir::arith::ConstantIntOp>(loc, 0, 64);
+  mlir::Value zero = mlir::arith::ConstantIntOp::create(builder, loc, 0, 64);
   mlir::Value runtimeSize = lenCall.getResult(0);
-  mlir::Value isNegative = builder.create<mlir::arith::CmpIOp>(
-      loc, mlir::arith::CmpIPredicate::slt, rawRuntimeIndex, zero);
+  mlir::Value isNegative = mlir::arith::CmpIOp::create(
+      builder, loc, mlir::arith::CmpIPredicate::slt, rawRuntimeIndex, zero);
   mlir::Value adjusted =
-      builder.create<mlir::arith::AddIOp>(loc, rawRuntimeIndex, runtimeSize);
-  mlir::Value normalized = builder.create<mlir::arith::SelectOp>(
-      loc, isNegative, adjusted, rawRuntimeIndex);
-  mlir::Value lowerOk = builder.create<mlir::arith::CmpIOp>(
-      loc, mlir::arith::CmpIPredicate::sge, normalized, zero);
-  mlir::Value upperOk = builder.create<mlir::arith::CmpIOp>(
-      loc, mlir::arith::CmpIPredicate::slt, normalized, runtimeSize);
+      mlir::arith::AddIOp::create(builder, loc, rawRuntimeIndex, runtimeSize);
+  mlir::Value normalized = mlir::arith::SelectOp::create(
+      builder, loc, isNegative, adjusted, rawRuntimeIndex);
+  mlir::Value lowerOk = mlir::arith::CmpIOp::create(
+      builder, loc, mlir::arith::CmpIPredicate::sge, normalized, zero);
+  mlir::Value upperOk = mlir::arith::CmpIOp::create(
+      builder, loc, mlir::arith::CmpIPredicate::slt, normalized, runtimeSize);
   mlir::Value inRange =
-      builder.create<mlir::arith::AndIOp>(loc, lowerOk, upperOk);
+      mlir::arith::AndIOp::create(builder, loc, lowerOk, upperOk);
 
   llvm::SmallVector<mlir::Value, 8> matches;
   matches.reserve(container.sequenceElements.size());
   for (unsigned position = 0,
                 end = static_cast<unsigned>(container.sequenceElements.size());
        position < end; ++position) {
-    mlir::Value expected = builder.create<mlir::arith::ConstantIntOp>(
-        loc, static_cast<std::int64_t>(position), 64);
-    mlir::Value indexMatches = builder.create<mlir::arith::CmpIOp>(
-        loc, mlir::arith::CmpIPredicate::eq, normalized, expected);
+    mlir::Value expected = mlir::arith::ConstantIntOp::create(
+        builder, loc, static_cast<std::int64_t>(position), 64);
+    mlir::Value indexMatches = mlir::arith::CmpIOp::create(
+        builder, loc, mlir::arith::CmpIPredicate::eq, normalized, expected);
     matches.push_back(
-        builder.create<mlir::arith::AndIOp>(loc, inRange, indexMatches));
+        mlir::arith::AndIOp::create(builder, loc, inRange, indexMatches));
   }
 
   mlir::FailureOr<RuntimeBundle> selected =
@@ -383,8 +383,8 @@ RuntimeBundleLowerer::lowerDictEvidenceGetItem(py::GetItemOp op,
       if (!hasPresence && position < container.mappingValueBundles.size() &&
           container.mappingValueBundles[position]) {
         RuntimeBundle selected = *container.mappingValueBundles[position];
-        if (mlir::failed(bindSelectedEvidenceObjectResult(
-                op, op.getResult(), std::move(selected))))
+        if (mlir::failed(bindSelectedEvidenceObjectResult(op, op.getResult(),
+                                                          std::move(selected))))
           return mlir::failure();
         return true;
       }
@@ -457,8 +457,8 @@ RuntimeBundleLowerer::lowerDictEvidenceGetItem(py::GetItemOp op,
     }
     mlir::Value match = eqCall.getResult(0);
     if (hasPresence)
-      match = builder.create<mlir::arith::AndIOp>(
-          op.getLoc(), match, container.mappingPresent[position]);
+      match = mlir::arith::AndIOp::create(builder, op.getLoc(), match,
+                                          container.mappingPresent[position]);
     matches.push_back(match);
   }
 

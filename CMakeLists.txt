@@ -10,35 +10,60 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-function(lython_configure_llvm20)
-    if(LLVM_DIR AND MLIR_DIR)
-        return()
+set(LYTHON_LLVM_MAJOR_VERSION 22)
+
+function(lython_configure_llvm)
+    file(GLOB LYTHON_HOMEBREW_LLVM_CMAKE_DIRS
+        /opt/homebrew/Cellar/llvm/*/lib/cmake/llvm
+        /usr/local/Cellar/llvm/*/lib/cmake/llvm
+        /opt/homebrew/Cellar/llvm@${LYTHON_LLVM_MAJOR_VERSION}/*/lib/cmake/llvm
+        /usr/local/Cellar/llvm@${LYTHON_LLVM_MAJOR_VERSION}/*/lib/cmake/llvm
+    )
+    file(GLOB LYTHON_HOMEBREW_MLIR_CMAKE_DIRS
+        /opt/homebrew/Cellar/llvm/*/lib/cmake/mlir
+        /usr/local/Cellar/llvm/*/lib/cmake/mlir
+        /opt/homebrew/Cellar/llvm@${LYTHON_LLVM_MAJOR_VERSION}/*/lib/cmake/mlir
+        /usr/local/Cellar/llvm@${LYTHON_LLVM_MAJOR_VERSION}/*/lib/cmake/mlir
+    )
+
+    set(LYTHON_NEED_LLVM_CONFIG TRUE)
+    if(LYTHON_LLVM_CONFIG AND
+       IS_ABSOLUTE "${LYTHON_LLVM_CONFIG}" AND
+       EXISTS "${LYTHON_LLVM_CONFIG}")
+        execute_process(
+            COMMAND "${LYTHON_LLVM_CONFIG}" --version
+            OUTPUT_VARIABLE LYTHON_LLVM_CONFIG_VERSION
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+        if(LYTHON_LLVM_CONFIG_VERSION MATCHES
+           "^${LYTHON_LLVM_MAJOR_VERSION}\\.")
+            set(LYTHON_NEED_LLVM_CONFIG FALSE)
+        else()
+            unset(LYTHON_LLVM_CONFIG CACHE)
+        endif()
     endif()
 
-    file(GLOB LYTHON_HOMEBREW_LLVM20_CMAKE_DIRS
-        /opt/homebrew/Cellar/llvm@20/*/lib/cmake/llvm
-        /usr/local/Cellar/llvm@20/*/lib/cmake/llvm
-    )
-    file(GLOB LYTHON_HOMEBREW_MLIR20_CMAKE_DIRS
-        /opt/homebrew/Cellar/llvm@20/*/lib/cmake/mlir
-        /usr/local/Cellar/llvm@20/*/lib/cmake/mlir
-    )
-
+    if(LYTHON_NEED_LLVM_CONFIG)
+        unset(LYTHON_LLVM_CONFIG CACHE)
+    endif()
     find_program(LYTHON_LLVM_CONFIG
-        NAMES llvm-config-20 llvm-config
+        NAMES llvm-config-${LYTHON_LLVM_MAJOR_VERSION} llvm-config
         HINTS
-            /opt/homebrew/opt/llvm@20/bin
-            /usr/local/opt/llvm@20/bin
-            /usr/lib/llvm-20/bin
+            /opt/homebrew/opt/llvm/bin
+            /usr/local/opt/llvm/bin
+            /opt/homebrew/opt/llvm@${LYTHON_LLVM_MAJOR_VERSION}/bin
+            /usr/local/opt/llvm@${LYTHON_LLVM_MAJOR_VERSION}/bin
+            /usr/lib/llvm-${LYTHON_LLVM_MAJOR_VERSION}/bin
     )
-    if(LYTHON_LLVM_CONFIG)
+    if((NOT LLVM_DIR OR NOT MLIR_DIR) AND LYTHON_LLVM_CONFIG)
         execute_process(
             COMMAND ${LYTHON_LLVM_CONFIG} --version
             OUTPUT_VARIABLE LYTHON_LLVM_CONFIG_VERSION
             OUTPUT_STRIP_TRAILING_WHITESPACE
             ERROR_QUIET
         )
-        if(LYTHON_LLVM_CONFIG_VERSION MATCHES "^20\\.")
+        if(LYTHON_LLVM_CONFIG_VERSION MATCHES "^${LYTHON_LLVM_MAJOR_VERSION}\\.")
             execute_process(
                 COMMAND ${LYTHON_LLVM_CONFIG} --cmakedir
                 OUTPUT_VARIABLE LYTHON_LLVM_CMAKE_DIR
@@ -48,18 +73,19 @@ function(lython_configure_llvm20)
             if(LYTHON_LLVM_CMAKE_DIR AND EXISTS "${LYTHON_LLVM_CMAKE_DIR}")
                 if(NOT LLVM_DIR)
                     set(LLVM_DIR "${LYTHON_LLVM_CMAKE_DIR}" CACHE PATH
-                        "LLVM 20 CMake package directory" FORCE)
+                        "LLVM ${LYTHON_LLVM_MAJOR_VERSION} CMake package directory" FORCE)
                 endif()
                 get_filename_component(LYTHON_LLVM_CMAKE_PARENT
                     "${LYTHON_LLVM_CMAKE_DIR}" DIRECTORY)
                 if(NOT MLIR_DIR AND EXISTS "${LYTHON_LLVM_CMAKE_PARENT}/mlir")
                     set(MLIR_DIR "${LYTHON_LLVM_CMAKE_PARENT}/mlir" CACHE PATH
-                        "MLIR 20 CMake package directory" FORCE)
+                        "MLIR ${LYTHON_LLVM_MAJOR_VERSION} CMake package directory" FORCE)
                 endif()
             endif()
         else()
             message(STATUS
-                "Ignoring ${LYTHON_LLVM_CONFIG}: expected LLVM 20, got "
+                "Ignoring ${LYTHON_LLVM_CONFIG}: expected LLVM "
+                "${LYTHON_LLVM_MAJOR_VERSION}, got "
                 "${LYTHON_LLVM_CONFIG_VERSION}")
         endif()
     endif()
@@ -68,38 +94,43 @@ function(lython_configure_llvm20)
         find_path(LLVM_DIR
             NAMES LLVMConfig.cmake
             PATHS
-                ${LYTHON_HOMEBREW_LLVM20_CMAKE_DIRS}
-                /opt/homebrew/opt/llvm@20/lib/cmake/llvm
-                /usr/local/opt/llvm@20/lib/cmake/llvm
-                /usr/lib/llvm-20/lib/cmake/llvm
+                ${LYTHON_HOMEBREW_LLVM_CMAKE_DIRS}
+                /opt/homebrew/opt/llvm/lib/cmake/llvm
+                /usr/local/opt/llvm/lib/cmake/llvm
+                /opt/homebrew/opt/llvm@${LYTHON_LLVM_MAJOR_VERSION}/lib/cmake/llvm
+                /usr/local/opt/llvm@${LYTHON_LLVM_MAJOR_VERSION}/lib/cmake/llvm
+                /usr/lib/llvm-${LYTHON_LLVM_MAJOR_VERSION}/lib/cmake/llvm
         )
     endif()
     if(NOT MLIR_DIR)
         find_path(MLIR_DIR
             NAMES MLIRConfig.cmake
             PATHS
-                ${LYTHON_HOMEBREW_MLIR20_CMAKE_DIRS}
-                /opt/homebrew/opt/llvm@20/lib/cmake/mlir
-                /usr/local/opt/llvm@20/lib/cmake/mlir
-                /usr/lib/llvm-20/lib/cmake/mlir
+                ${LYTHON_HOMEBREW_MLIR_CMAKE_DIRS}
+                /opt/homebrew/opt/llvm/lib/cmake/mlir
+                /usr/local/opt/llvm/lib/cmake/mlir
+                /opt/homebrew/opt/llvm@${LYTHON_LLVM_MAJOR_VERSION}/lib/cmake/mlir
+                /usr/local/opt/llvm@${LYTHON_LLVM_MAJOR_VERSION}/lib/cmake/mlir
+                /usr/lib/llvm-${LYTHON_LLVM_MAJOR_VERSION}/lib/cmake/mlir
         )
     endif()
 endfunction()
 
-lython_configure_llvm20()
+lython_configure_llvm()
 
 find_package(LLVM REQUIRED CONFIG)
 find_package(MLIR REQUIRED CONFIG)
 
-if(NOT LLVM_PACKAGE_VERSION MATCHES "^20\\.")
+if(NOT LLVM_PACKAGE_VERSION MATCHES "^${LYTHON_LLVM_MAJOR_VERSION}\\.")
     message(FATAL_ERROR
-        "Lython requires LLVM 20, found LLVM ${LLVM_PACKAGE_VERSION} "
-        "at ${LLVM_DIR}")
+        "Lython requires LLVM ${LYTHON_LLVM_MAJOR_VERSION}, found LLVM "
+        "${LLVM_PACKAGE_VERSION} at ${LLVM_DIR}")
 endif()
-if(DEFINED MLIR_PACKAGE_VERSION AND NOT MLIR_PACKAGE_VERSION MATCHES "^20\\.")
+if(DEFINED MLIR_PACKAGE_VERSION AND
+   NOT MLIR_PACKAGE_VERSION MATCHES "^${LYTHON_LLVM_MAJOR_VERSION}\\.")
     message(FATAL_ERROR
-        "Lython requires MLIR 20, found MLIR ${MLIR_PACKAGE_VERSION} "
-        "at ${MLIR_DIR}")
+        "Lython requires MLIR ${LYTHON_LLVM_MAJOR_VERSION}, found MLIR "
+        "${MLIR_PACKAGE_VERSION} at ${MLIR_DIR}")
 endif()
 if(NOT TARGET LLVM)
     message(FATAL_ERROR "Lython requires the system LLVM shared target `LLVM`")
@@ -108,56 +139,73 @@ if(NOT TARGET MLIR)
     message(FATAL_ERROR "Lython requires the system MLIR shared target `MLIR`")
 endif()
 
-set(LYTHON_LLVM20_TOOL_HINTS
+set(LYTHON_LLVM_TOOL_HINTS
     ${LLVM_TOOLS_BINARY_DIR}
     ${MLIR_TOOLS_BINARY_DIR}
-    /opt/homebrew/opt/llvm@20/bin
-    /usr/local/opt/llvm@20/bin
-    /usr/lib/llvm-20/bin
+    /opt/homebrew/opt/llvm/bin
+    /usr/local/opt/llvm/bin
+    /opt/homebrew/opt/llvm@${LYTHON_LLVM_MAJOR_VERSION}/bin
+    /usr/local/opt/llvm@${LYTHON_LLVM_MAJOR_VERSION}/bin
+    /usr/lib/llvm-${LYTHON_LLVM_MAJOR_VERSION}/bin
 )
 
-set(LYTHON_NEED_LLVM_TBLGEN FALSE)
-if(NOT LLVM_TABLEGEN_EXE)
-    set(LYTHON_NEED_LLVM_TBLGEN TRUE)
-elseif(NOT IS_ABSOLUTE "${LLVM_TABLEGEN_EXE}")
-    set(LYTHON_NEED_LLVM_TBLGEN TRUE)
-endif()
+function(lython_tool_needs_refresh OUT_VAR TOOL_PATH)
+    if(NOT TOOL_PATH)
+        set(${OUT_VAR} TRUE PARENT_SCOPE)
+        return()
+    endif()
+    if(NOT IS_ABSOLUTE "${TOOL_PATH}" OR NOT EXISTS "${TOOL_PATH}")
+        set(${OUT_VAR} TRUE PARENT_SCOPE)
+        return()
+    endif()
+    execute_process(
+        COMMAND "${TOOL_PATH}" --version
+        OUTPUT_VARIABLE LYTHON_TOOL_VERSION
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    if(NOT LYTHON_TOOL_VERSION MATCHES
+       "version ${LYTHON_LLVM_MAJOR_VERSION}\\.")
+        set(${OUT_VAR} TRUE PARENT_SCOPE)
+        return()
+    endif()
+    set(${OUT_VAR} FALSE PARENT_SCOPE)
+endfunction()
+
+lython_tool_needs_refresh(LYTHON_NEED_LLVM_TBLGEN "${LLVM_TABLEGEN_EXE}")
 if(LYTHON_NEED_LLVM_TBLGEN)
+    unset(LYTHON_LLVM_TABLEGEN_EXE CACHE)
     find_program(LYTHON_LLVM_TABLEGEN_EXE
-        NAMES llvm-tblgen-20 llvm-tblgen
-        HINTS ${LYTHON_LLVM20_TOOL_HINTS}
+        NAMES llvm-tblgen-${LYTHON_LLVM_MAJOR_VERSION} llvm-tblgen
+        HINTS ${LYTHON_LLVM_TOOL_HINTS}
         NO_DEFAULT_PATH
     )
     if(NOT LYTHON_LLVM_TABLEGEN_EXE)
         find_program(LYTHON_LLVM_TABLEGEN_EXE
-            NAMES llvm-tblgen-20 llvm-tblgen
+            NAMES llvm-tblgen-${LYTHON_LLVM_MAJOR_VERSION} llvm-tblgen
             REQUIRED
         )
     endif()
     set(LLVM_TABLEGEN_EXE "${LYTHON_LLVM_TABLEGEN_EXE}" CACHE FILEPATH
-        "LLVM 20 tablegen executable" FORCE)
+        "LLVM ${LYTHON_LLVM_MAJOR_VERSION} tablegen executable" FORCE)
 endif()
 
-set(LYTHON_NEED_MLIR_TBLGEN FALSE)
-if(NOT MLIR_TABLEGEN_EXE)
-    set(LYTHON_NEED_MLIR_TBLGEN TRUE)
-elseif(NOT IS_ABSOLUTE "${MLIR_TABLEGEN_EXE}")
-    set(LYTHON_NEED_MLIR_TBLGEN TRUE)
-endif()
+lython_tool_needs_refresh(LYTHON_NEED_MLIR_TBLGEN "${MLIR_TABLEGEN_EXE}")
 if(LYTHON_NEED_MLIR_TBLGEN)
+    unset(LYTHON_MLIR_TABLEGEN_EXE CACHE)
     find_program(LYTHON_MLIR_TABLEGEN_EXE
-        NAMES mlir-tblgen-20 mlir-tblgen
-        HINTS ${LYTHON_LLVM20_TOOL_HINTS}
+        NAMES mlir-tblgen-${LYTHON_LLVM_MAJOR_VERSION} mlir-tblgen
+        HINTS ${LYTHON_LLVM_TOOL_HINTS}
         NO_DEFAULT_PATH
     )
     if(NOT LYTHON_MLIR_TABLEGEN_EXE)
         find_program(LYTHON_MLIR_TABLEGEN_EXE
-            NAMES mlir-tblgen-20 mlir-tblgen
+            NAMES mlir-tblgen-${LYTHON_LLVM_MAJOR_VERSION} mlir-tblgen
             REQUIRED
         )
     endif()
     set(MLIR_TABLEGEN_EXE "${LYTHON_MLIR_TABLEGEN_EXE}" CACHE FILEPATH
-        "MLIR 20 tablegen executable" FORCE)
+        "MLIR ${LYTHON_LLVM_MAJOR_VERSION} tablegen executable" FORCE)
 endif()
 
 message(STATUS "Using MLIRConfig.cmake in: ${MLIR_DIR}")
@@ -176,7 +224,12 @@ include(HandleLLVMOptions)
 include_directories(SYSTEM ${LLVM_INCLUDE_DIRS})
 include_directories(SYSTEM ${MLIR_INCLUDE_DIRS})
 
-add_definitions(${LLVM_DEFINITIONS})
+set(LYTHON_LLVM_DEFINITIONS ${LLVM_DEFINITIONS})
+if(LYTHON_LLVM_DEFINITIONS MATCHES " ")
+    separate_arguments(LYTHON_LLVM_DEFINITIONS NATIVE_COMMAND
+        "${LYTHON_LLVM_DEFINITIONS}")
+endif()
+add_definitions(${LYTHON_LLVM_DEFINITIONS})
 
 add_subdirectory(src)
 add_subdirectory(tools)

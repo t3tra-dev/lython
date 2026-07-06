@@ -65,9 +65,9 @@ RuntimeBundleLowerer::lowerIntConstant(py::IntConstantOp op) {
   builder.setInsertionPoint(op);
   mlir::Location loc = op.getLoc();
   mlir::Value value =
-      builder.create<mlir::arith::ConstantIntOp>(loc, parsed, 64).getResult();
+      mlir::arith::ConstantIntOp::create(builder, loc, parsed, 64).getResult();
   mlir::Value valid =
-      builder.create<mlir::arith::ConstantIntOp>(loc, 1, 1).getResult();
+      mlir::arith::ConstantIntOp::create(builder, loc, 1, 1).getResult();
   RuntimeBundle result;
   if (mlir::failed(RuntimeBundleLowerer::makePrimitiveI64Bundle(
           op, op.getResult().getType(), value, valid, result)))
@@ -80,10 +80,10 @@ RuntimeBundleLowerer::lowerIntConstant(py::IntConstantOp op) {
 mlir::LogicalResult
 RuntimeBundleLowerer::lowerFloatConstant(py::FloatConstantOp op) {
   builder.setInsertionPoint(op);
-  mlir::Value value = builder
-                          .create<mlir::arith::ConstantFloatOp>(
-                              op.getLoc(), op.getValue(), builder.getF64Type())
-                          .getResult();
+  mlir::Value value =
+      mlir::arith::ConstantFloatOp::create(builder, op.getLoc(),
+                                           builder.getF64Type(), op.getValue())
+          .getResult();
   RuntimeBundle result;
   if (mlir::failed(initializeObjectFromRawValues(
           op, op.getResult().getType(), mlir::ValueRange{value}, result)))
@@ -96,9 +96,8 @@ RuntimeBundleLowerer::lowerFloatConstant(py::FloatConstantOp op) {
 mlir::LogicalResult
 RuntimeBundleLowerer::lowerBoolConstant(py::BoolConstantOp op) {
   builder.setInsertionPoint(op);
-  mlir::Value bit = builder
-                        .create<mlir::arith::ConstantIntOp>(
-                            op.getLoc(), op.getValue() ? 1 : 0, 1)
+  mlir::Value bit = mlir::arith::ConstantIntOp::create(builder, op.getLoc(),
+                                                       op.getValue() ? 1 : 0, 1)
                         .getResult();
   if (mlir::failed(assignObjectBundle(
           op, op.getResult(), runtimeContractType(context, "builtins.bool"),
@@ -132,17 +131,17 @@ RuntimeBundleLowerer::lowerCastFromPrim(py::CastFromPrimOp op) {
       mlir::Type i64 = builder.getI64Type();
       if (integer.getWidth() < 64) {
         if (integer.getWidth() == 1)
-          value = builder.create<mlir::arith::ExtUIOp>(op.getLoc(), i64, value)
+          value = mlir::arith::ExtUIOp::create(builder, op.getLoc(), i64, value)
                       .getResult();
         else
-          value = builder.create<mlir::arith::ExtSIOp>(op.getLoc(), i64, value)
+          value = mlir::arith::ExtSIOp::create(builder, op.getLoc(), i64, value)
                       .getResult();
       } else if (integer.getWidth() > 64) {
-        value = builder.create<mlir::arith::TruncIOp>(op.getLoc(), i64, value)
+        value = mlir::arith::TruncIOp::create(builder, op.getLoc(), i64, value)
                     .getResult();
       }
       mlir::Value valid =
-          builder.create<mlir::arith::ConstantIntOp>(op.getLoc(), 1, 1)
+          mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 1, 1)
               .getResult();
       RuntimeBundle result;
       if (mlir::failed(RuntimeBundleLowerer::makePrimitiveI64Bundle(

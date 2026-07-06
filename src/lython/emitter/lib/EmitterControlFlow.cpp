@@ -97,8 +97,8 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
     if (found != values.end()) {
       if (mlir::isa<py::UnionType>(found->second.value.getType()) &&
           found->second.value.getType() != narrowed) {
-        auto unwrap = builder.create<py::UnionUnwrapOp>(
-            loc(statement), narrowed, found->second.value);
+        auto unwrap = py::UnionUnwrapOp::create(builder, loc(statement),
+                                                narrowed, found->second.value);
         found->second.value = unwrap.getResult();
       }
       found->second.type = narrowed;
@@ -119,9 +119,9 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
               : continuation;
 
   builder.setInsertionPointToEnd(entry);
-  builder.create<mlir::cf::CondBranchOp>(loc(statement), condition, thenBlock,
-                                         mlir::ValueRange{}, elseBlock,
-                                         mlir::ValueRange{});
+  mlir::cf::CondBranchOp::create(builder, loc(statement), condition, thenBlock,
+                                 mlir::ValueRange{}, elseBlock,
+                                 mlir::ValueRange{});
 
   builder.setInsertionPointToStart(thenBlock);
   {
@@ -132,7 +132,7 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
   }
   bool thenTerminates = insertionBlockTerminated(builder);
   if (!thenTerminates)
-    builder.create<mlir::cf::BranchOp>(loc(statement), continuation);
+    mlir::cf::BranchOp::create(builder, loc(statement), continuation);
 
   bool elseTerminates = false;
   if (hasElse) {
@@ -145,7 +145,7 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
     }
     elseTerminates = insertionBlockTerminated(builder);
     if (!elseTerminates)
-      builder.create<mlir::cf::BranchOp>(loc(statement), continuation);
+      mlir::cf::BranchOp::create(builder, loc(statement), continuation);
   }
   setInsertionBeforeTerminator(builder, *continuation);
   if (narrowing && thenTerminates && !elseTerminates)
@@ -164,11 +164,11 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
     iteratorType = iterInference.resultType;
   mlir::UnitAttr returnedSelf =
       iteratorType == iterable.type ? builder.getUnitAttr() : mlir::UnitAttr();
-  auto iterator = builder.create<py::IterOp>(
-      loc(statement), iteratorType, "__iter__", callProtocolFor(iterInference),
-      iterable.value, returnedSelf);
-  auto whileOp = builder.create<mlir::scf::WhileOp>(
-      loc(statement), mlir::TypeRange{}, mlir::ValueRange{});
+  auto iterator = py::IterOp::create(builder, loc(statement), iteratorType,
+                                     "__iter__", callProtocolFor(iterInference),
+                                     iterable.value, returnedSelf);
+  auto whileOp = mlir::scf::WhileOp::create(
+      builder, loc(statement), mlir::TypeRange{}, mlir::ValueRange{});
 
   {
     mlir::OpBuilder::InsertionGuard guard(builder);
@@ -178,12 +178,12 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
         types.inferMethodCallWithEvidence(iteratorType, "__next__", {});
     if (nextInference)
       elem = nextInference.resultType;
-    auto next = builder.create<py::NextOp>(
-        loc(statement), elem, builder.getI1Type(), iteratorType, "__next__",
-        callProtocolFor(nextInference), iterator.getResult());
+    auto next = py::NextOp::create(
+        builder, loc(statement), elem, builder.getI1Type(), iteratorType,
+        "__next__", callProtocolFor(nextInference), iterator.getResult());
 
-    auto bodyIf =
-        builder.create<mlir::scf::IfOp>(loc(statement), next.getValid(), false);
+    auto bodyIf = mlir::scf::IfOp::create(builder, loc(statement),
+                                          next.getValid(), false);
     mlir::Block &thenBlock = bodyIf.getThenRegion().front();
     setInsertionBeforeTerminator(builder, thenBlock);
     {
@@ -195,15 +195,15 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
     ensureYield(builder, loc(statement), thenBlock);
 
     builder.setInsertionPointAfter(bodyIf);
-    builder.create<mlir::scf::ConditionOp>(loc(statement), next.getValid(),
-                                           mlir::ValueRange{});
+    mlir::scf::ConditionOp::create(builder, loc(statement), next.getValid(),
+                                   mlir::ValueRange{});
   }
 
   {
     mlir::OpBuilder::InsertionGuard guard(builder);
     mlir::Block *after = builder.createBlock(&whileOp.getAfter());
     builder.setInsertionPointToStart(after);
-    builder.create<mlir::scf::YieldOp>(loc(statement));
+    mlir::scf::YieldOp::create(builder, loc(statement));
   }
 
   builder.setInsertionPointAfter(whileOp);
@@ -254,8 +254,8 @@ void ModuleEmitter::emitAsyncFor(const parser::Node &statement) {
     mlir::UnitAttr returnedSelf = iteratorType == iterable.type
                                       ? builder.getUnitAttr()
                                       : mlir::UnitAttr();
-    auto iterator = builder.create<py::AIterOp>(
-        loc(statement), iteratorType, "__aiter__",
+    auto iterator = py::AIterOp::create(
+        builder, loc(statement), iteratorType, "__aiter__",
         callProtocolFor(iterInference), iterable.value, returnedSelf);
     iteratorValue = Value{iterator.getResult(), iteratorType};
   }
@@ -272,9 +272,9 @@ void ModuleEmitter::emitAsyncFor(const parser::Node &statement) {
   mlir::Block *entryBlock = builder.getInsertionBlock();
   mlir::Region *region = entryBlock ? entryBlock->getParent() : nullptr;
   if (!region) {
-    diagnostics.push_back(parser::Diagnostic{
-        parser::Severity::Error, statement.range.start,
-        "async for requires an active insertion region"});
+    diagnostics.push_back(
+        parser::Diagnostic{parser::Severity::Error, statement.range.start,
+                           "async for requires an active insertion region"});
     return;
   }
 
@@ -308,8 +308,8 @@ void ModuleEmitter::emitAsyncFor(const parser::Node &statement) {
     afterBlock->addArgument(local.type, loc(statement));
   }
   builder.setInsertionPointToEnd(entryBlock);
-  builder.create<mlir::cf::BranchOp>(loc(statement), loopBlock,
-                                     carriedInitialValues);
+  mlir::cf::BranchOp::create(builder, loc(statement), loopBlock,
+                             carriedInitialValues);
   builder.setInsertionPointToStart(loopBlock);
   for (auto [index, local] : llvm::enumerate(carriedLocals)) {
     Value loopValue{loopBlock->getArgument(index), local.type};
@@ -317,138 +317,133 @@ void ModuleEmitter::emitAsyncFor(const parser::Node &statement) {
     types.bindSymbol(local.name, local.type);
   }
 
-    mlir::OperationState tryState(loc(statement),
-                                  py::TryOp::getOperationName());
-    tryState.addTypes(types.boolType());
-    for (const CarriedLocal &local : carriedLocals)
-      tryState.addTypes(local.type);
-    tryState.addRegion();
-    tryState.addRegion();
-    tryState.addRegion();
-    auto tryOp = mlir::cast<py::TryOp>(builder.create(tryState));
+  mlir::OperationState tryState(loc(statement), py::TryOp::getOperationName());
+  tryState.addTypes(types.boolType());
+  for (const CarriedLocal &local : carriedLocals)
+    tryState.addTypes(local.type);
+  tryState.addRegion();
+  tryState.addRegion();
+  tryState.addRegion();
+  auto tryOp = mlir::cast<py::TryOp>(builder.create(tryState));
 
-    mlir::Block *tryBlock = new mlir::Block;
-    tryOp.getTryRegion().push_back(tryBlock);
-    builder.setInsertionPointToStart(tryBlock);
-    mlir::Type awaitableType = types.protocol("Awaitable", {types.object()});
-    Value awaitable;
-    if (sourceAnextMethod) {
-      if (sourceAnextMethod->async) {
-        if (sourceAnextMethod->symbolName.empty()) {
+  mlir::Block *tryBlock = new mlir::Block;
+  tryOp.getTryRegion().push_back(tryBlock);
+  builder.setInsertionPointToStart(tryBlock);
+  mlir::Type awaitableType = types.protocol("Awaitable", {types.object()});
+  Value awaitable;
+  if (sourceAnextMethod) {
+    if (sourceAnextMethod->async) {
+      if (sourceAnextMethod->symbolName.empty()) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, statement.range.start,
+            "async __anext__ method has no lowered callable symbol"});
+        awaitable = emitNone(statement);
+      } else {
+        Value sourceAnextCallable = emitMethodObject(
+            statement, sourceAnextReceiver, *sourceAnextMethod);
+        awaitable = emitCallableDispatch(
+            statement, sourceAnextCallable,
+            emitCallOperands(statement, {}, /*includeAstArguments=*/false));
+      }
+    } else {
+      awaitable = emitInlineMethodCall(statement, sourceAnextReceiver,
+                                       *sourceAnextMethod);
+    }
+    awaitableType = awaitable.type;
+  } else {
+    CallInferenceResult nextInference =
+        types.inferMethodCallWithEvidence(iteratorType, "__anext__", {});
+    if (nextInference)
+      awaitableType = nextInference.resultType;
+    auto next = py::ANextOp::create(builder, loc(statement), awaitableType,
+                                    "__anext__", callProtocolFor(nextInference),
+                                    iteratorValue.value);
+    awaitable = Value{next.getAwaitable(), awaitableType};
+  }
+  Value item = emitAwaitValue(statement, awaitable);
+  {
+    ScopedEmitterScope scope(values, types);
+    emitAssignTarget(*ast::node(statement, "target"), item);
+    emitStatements(ast::nodeList(statement, "body"));
+    if (!blockHasTerminator(*tryBlock)) {
+      mlir::Type trueType = types.literal("True");
+      Value trueValue{py::BoolConstantOp::create(builder, loc(statement),
+                                                 trueType,
+                                                 builder.getBoolAttr(true))
+                          .getResult(),
+                      trueType};
+      llvm::SmallVector<mlir::Value, 4> yieldValues;
+      yieldValues.push_back(
+          coerceValue(trueValue, types.boolType(), statement).value);
+      for (auto [index, local] : llvm::enumerate(carriedLocals)) {
+        auto found = values.find(local.name);
+        if (found == values.end()) {
           diagnostics.push_back(parser::Diagnostic{
               parser::Severity::Error, statement.range.start,
-              "async __anext__ method has no lowered callable symbol"});
-          awaitable = emitNone(statement);
-        } else {
-          Value sourceAnextCallable =
-              emitMethodObject(statement, sourceAnextReceiver,
-                               *sourceAnextMethod);
-          awaitable = emitCallableDispatch(
-              statement, sourceAnextCallable,
-              emitCallOperands(statement, {}, /*includeAstArguments=*/false));
+              "async for lost loop-carried local '" + local.name + "'"});
+          continue;
         }
-      } else {
-        awaitable =
-            emitInlineMethodCall(statement, sourceAnextReceiver,
-                                 *sourceAnextMethod);
-      }
-      awaitableType = awaitable.type;
-    } else {
-      CallInferenceResult nextInference =
-          types.inferMethodCallWithEvidence(iteratorType, "__anext__", {});
-      if (nextInference)
-        awaitableType = nextInference.resultType;
-      auto next = builder.create<py::ANextOp>(
-          loc(statement), awaitableType, "__anext__",
-          callProtocolFor(nextInference), iteratorValue.value);
-      awaitable = Value{next.getAwaitable(), awaitableType};
-    }
-    Value item = emitAwaitValue(statement, awaitable);
-    {
-      ScopedEmitterScope scope(values, types);
-      emitAssignTarget(*ast::node(statement, "target"), item);
-      emitStatements(ast::nodeList(statement, "body"));
-      if (!blockHasTerminator(*tryBlock)) {
-        mlir::Type trueType = types.literal("True");
-        Value trueValue{
-            builder
-                .create<py::BoolConstantOp>(loc(statement), trueType,
-                                            builder.getBoolAttr(true))
-                .getResult(),
-            trueType};
-        llvm::SmallVector<mlir::Value, 4> yieldValues;
+        Value carried = found->second;
+        mlir::Value previous = loopBlock->getArgument(index);
+        if (carried.value && carried.value != previous)
+          py::DecRefOp::create(builder, loc(statement), previous);
         yieldValues.push_back(
-            coerceValue(trueValue, types.boolType(), statement).value);
-        for (auto [index, local] : llvm::enumerate(carriedLocals)) {
-          auto found = values.find(local.name);
-          if (found == values.end()) {
-            diagnostics.push_back(parser::Diagnostic{
-                parser::Severity::Error, statement.range.start,
-                "async for lost loop-carried local '" + local.name + "'"});
-            continue;
-          }
-          Value carried = found->second;
-          mlir::Value previous = loopBlock->getArgument(index);
-          if (carried.value && carried.value != previous)
-            builder.create<py::DecRefOp>(loc(statement), previous);
-          yieldValues.push_back(coerceValue(carried, local.type, statement)
-                                    .value);
-        }
-        builder.create<py::TryYieldOp>(loc(statement), yieldValues);
+            coerceValue(carried, local.type, statement).value);
       }
+      py::TryYieldOp::create(builder, loc(statement), yieldValues);
     }
+  }
 
-    mlir::Block *checkBlock = new mlir::Block;
-    mlir::Block *stopBlock = new mlir::Block;
-    mlir::Block *rethrowBlock = new mlir::Block;
-    tryOp.getExceptRegion().push_back(checkBlock);
-    tryOp.getExceptRegion().push_back(stopBlock);
-    tryOp.getExceptRegion().push_back(rethrowBlock);
+  mlir::Block *checkBlock = new mlir::Block;
+  mlir::Block *stopBlock = new mlir::Block;
+  mlir::Block *rethrowBlock = new mlir::Block;
+  tryOp.getExceptRegion().push_back(checkBlock);
+  tryOp.getExceptRegion().push_back(stopBlock);
+  tryOp.getExceptRegion().push_back(rethrowBlock);
 
-    builder.setInsertionPointToStart(checkBlock);
-    mlir::Type stopAsyncIteration =
-        types.typeObject(types.contract("builtins.StopAsyncIteration"));
-    mlir::OperationState matchState(
-        loc(statement), py::ExceptCurrentMatchOp::getOperationName());
-    matchState.addTypes(builder.getI1Type());
-    matchState.addAttribute("handler", mlir::TypeAttr::get(stopAsyncIteration));
-    auto match =
-        mlir::cast<py::ExceptCurrentMatchOp>(builder.create(matchState));
-    builder.create<mlir::cf::CondBranchOp>(loc(statement), match.getResult(),
-                                           stopBlock, mlir::ValueRange{},
-                                           rethrowBlock, mlir::ValueRange{});
+  builder.setInsertionPointToStart(checkBlock);
+  mlir::Type stopAsyncIteration =
+      types.typeObject(types.contract("builtins.StopAsyncIteration"));
+  mlir::OperationState matchState(loc(statement),
+                                  py::ExceptCurrentMatchOp::getOperationName());
+  matchState.addTypes(builder.getI1Type());
+  matchState.addAttribute("handler", mlir::TypeAttr::get(stopAsyncIteration));
+  auto match = mlir::cast<py::ExceptCurrentMatchOp>(builder.create(matchState));
+  mlir::cf::CondBranchOp::create(builder, loc(statement), match.getResult(),
+                                 stopBlock, mlir::ValueRange{}, rethrowBlock,
+                                 mlir::ValueRange{});
 
-    builder.setInsertionPointToStart(stopBlock);
-    mlir::Type falseType = types.literal("False");
-    Value falseValue{builder
-                         .create<py::BoolConstantOp>(loc(statement), falseType,
-                                                     builder.getBoolAttr(false))
-                         .getResult(),
-                     falseType};
-    llvm::SmallVector<mlir::Value, 4> stopValues;
-    stopValues.push_back(coerceValue(falseValue, types.boolType(), statement)
-                             .value);
-    for (auto [index, local] : llvm::enumerate(carriedLocals))
-      stopValues.push_back(loopBlock->getArgument(index));
-    builder.create<py::ExceptYieldOp>(loc(statement), stopValues);
+  builder.setInsertionPointToStart(stopBlock);
+  mlir::Type falseType = types.literal("False");
+  Value falseValue{py::BoolConstantOp::create(builder, loc(statement),
+                                              falseType,
+                                              builder.getBoolAttr(false))
+                       .getResult(),
+                   falseType};
+  llvm::SmallVector<mlir::Value, 4> stopValues;
+  stopValues.push_back(
+      coerceValue(falseValue, types.boolType(), statement).value);
+  for (auto [index, local] : llvm::enumerate(carriedLocals))
+    stopValues.push_back(loopBlock->getArgument(index));
+  py::ExceptYieldOp::create(builder, loc(statement), stopValues);
 
-    builder.setInsertionPointToStart(rethrowBlock);
-    builder.create<py::RaiseCurrentOp>(loc(statement));
+  builder.setInsertionPointToStart(rethrowBlock);
+  py::RaiseCurrentOp::create(builder, loc(statement));
 
-    builder.setInsertionPointAfter(tryOp);
-    mlir::Value keepGoing =
-        emitBoolValue(Value{tryOp.getResult(0), types.boolType()}, statement);
-    llvm::SmallVector<mlir::Value, 4> nextCarriedValues;
-    nextCarriedValues.reserve(carriedLocals.size());
-    for (auto [index, local] : llvm::enumerate(carriedLocals)) {
-      mlir::Value result = tryOp.getResult(static_cast<unsigned>(index) + 1);
-      nextCarriedValues.push_back(result);
-      values[local.name] = Value{result, local.type};
-      types.bindSymbol(local.name, local.type);
-    }
-    builder.create<mlir::cf::CondBranchOp>(loc(statement), keepGoing,
-                                           loopBlock, nextCarriedValues,
-                                           afterBlock, nextCarriedValues);
+  builder.setInsertionPointAfter(tryOp);
+  mlir::Value keepGoing =
+      emitBoolValue(Value{tryOp.getResult(0), types.boolType()}, statement);
+  llvm::SmallVector<mlir::Value, 4> nextCarriedValues;
+  nextCarriedValues.reserve(carriedLocals.size());
+  for (auto [index, local] : llvm::enumerate(carriedLocals)) {
+    mlir::Value result = tryOp.getResult(static_cast<unsigned>(index) + 1);
+    nextCarriedValues.push_back(result);
+    values[local.name] = Value{result, local.type};
+    types.bindSymbol(local.name, local.type);
+  }
+  mlir::cf::CondBranchOp::create(builder, loc(statement), keepGoing, loopBlock,
+                                 nextCarriedValues, afterBlock,
+                                 nextCarriedValues);
 
   builder.setInsertionPointToStart(afterBlock);
   for (auto [index, local] : llvm::enumerate(carriedLocals)) {
@@ -515,7 +510,7 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
       emitStatements(ast::nodeList(statement, "body"));
     }
     if (!blockHasTerminator(*tryBlock))
-      builder.create<py::TryYieldOp>(loc(statement), mlir::ValueRange{});
+      py::TryYieldOp::create(builder, loc(statement), mlir::ValueRange{});
   }
 
   {
@@ -579,9 +574,9 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
           mlir::cast<py::ExceptCurrentMatchOp>(builder.create(matchState));
       mlir::Block *miss =
           index + 1 == handlers->size() ? rethrowBlock : checkBlocks[index + 1];
-      builder.create<mlir::cf::CondBranchOp>(
-          loc(handler), match.getResult(), bodyBlocks[index],
-          mlir::ValueRange{}, miss, mlir::ValueRange{});
+      mlir::cf::CondBranchOp::create(builder, loc(handler), match.getResult(),
+                                     bodyBlocks[index], mlir::ValueRange{},
+                                     miss, mlir::ValueRange{});
 
       builder.setInsertionPointToStart(bodyBlocks[index]);
       {
@@ -589,11 +584,11 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
         emitStatements(ast::nodeList(handler, "body"));
       }
       if (!blockHasTerminator(*bodyBlocks[index]))
-        builder.create<py::ExceptYieldOp>(loc(handler), mlir::ValueRange{});
+        py::ExceptYieldOp::create(builder, loc(handler), mlir::ValueRange{});
     }
 
     builder.setInsertionPointToStart(rethrowBlock);
-    builder.create<py::RaiseCurrentOp>(loc(statement));
+    py::RaiseCurrentOp::create(builder, loc(statement));
   }
 
   builder.setInsertionPointAfter(tryOp);

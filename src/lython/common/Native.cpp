@@ -119,22 +119,22 @@ ctypesScalarLayout(llvm::StringRef contract,
   llvm::StringRef name = stripCtypesModule(contract);
   if (std::optional<NativeABIType> fixed =
           llvm::StringSwitch<std::optional<NativeABIType>>(name)
-              .Cases("c_bool", "c_ubyte", "c_uint8",
+              .Cases({"c_bool", "c_ubyte", "c_uint8"},
                      NativeABIType{1, 1, NativeABIKind::UnsignedInteger})
-              .Cases("c_byte", "c_int8", "c_char",
+              .Cases({"c_byte", "c_int8", "c_char"},
                      NativeABIType{1, 1, NativeABIKind::SignedInteger})
-              .Cases("c_ushort", "c_uint16",
+              .Cases({"c_ushort", "c_uint16"},
                      NativeABIType{2, 2, NativeABIKind::UnsignedInteger})
-              .Cases("c_short", "c_int16",
+              .Cases({"c_short", "c_int16"},
                      NativeABIType{2, 2, NativeABIKind::SignedInteger})
-              .Cases("c_uint", "c_uint32",
+              .Cases({"c_uint", "c_uint32"},
                      NativeABIType{4, 4, NativeABIKind::UnsignedInteger})
-              .Cases("c_int", "c_int32",
+              .Cases({"c_int", "c_int32"},
                      NativeABIType{4, 4, NativeABIKind::SignedInteger})
               .Case("c_float", NativeABIType{4, 4, NativeABIKind::Floating})
-              .Cases("c_ulonglong", "c_uint64",
+              .Cases({"c_ulonglong", "c_uint64"},
                      NativeABIType{8, 8, NativeABIKind::UnsignedInteger})
-              .Cases("c_longlong", "c_int64",
+              .Cases({"c_longlong", "c_int64"},
                      NativeABIType{8, 8, NativeABIKind::SignedInteger})
               .Case("c_double", NativeABIType{8, 8, NativeABIKind::Floating})
               .Default(std::nullopt))
@@ -145,7 +145,7 @@ ctypesScalarLayout(llvm::StringRef contract,
   return llvm::StringSwitch<std::optional<NativeABIType>>(name)
       .Case("c_ulong", NativeABIType{facts->cLongBytes(), facts->cLongBytes(),
                                      NativeABIKind::UnsignedInteger})
-      .Cases("c_long", "HRESULT",
+      .Cases({"c_long", "HRESULT"},
              NativeABIType{facts->cLongBytes(), facts->cLongBytes(),
                            NativeABIKind::SignedInteger})
       .Case("c_size_t",
@@ -154,7 +154,7 @@ ctypesScalarLayout(llvm::StringRef contract,
       .Case("c_ssize_t",
             NativeABIType{facts->pointerBytes(), facts->pointerBytes(),
                           NativeABIKind::SignedInteger})
-      .Cases("c_void_p", "_Pointer",
+      .Cases({"c_void_p", "_Pointer"},
              NativeABIType{facts->pointerBytes(), facts->pointerBytes(),
                            NativeABIKind::Pointer})
       .Default(std::nullopt);

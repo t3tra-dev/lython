@@ -45,7 +45,6 @@
 #include "llvm/ADT/Twine.h"
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/ExecutionEngine/JITSymbol.h"
-#include "llvm/ExecutionEngine/JITLink/EHFrameSupport.h"
 #include "llvm/ExecutionEngine/Orc/EHFrameRegistrationPlugin.h"
 #include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h"
@@ -110,8 +109,8 @@
 using namespace mlir;
 
 namespace {
-using py::PerfScope;
 using lython::driver::SanitizerConfig;
+using py::PerfScope;
 
 #ifndef LYTHON_LLVM_TOOLS_BINARY_DIR
 #define LYTHON_LLVM_TOOLS_BINARY_DIR ""
@@ -281,14 +280,14 @@ exceptionModelForTargetTriple(const llvm::Triple &triple) {
 std::unique_ptr<llvm::TargetMachine>
 createCodeGenTargetMachine(py::TensorLoweringTarget target,
                            std::string *normalizedTriple = nullptr) {
-  llvm::Triple triple = codeGenTripleForTarget(target);
-  std::string targetTriple = triple.normalize();
+  llvm::Triple triple(codeGenTripleForTarget(target).normalize());
+  std::string targetTripleName = triple.normalize();
   if (normalizedTriple)
-    *normalizedTriple = targetTriple;
+    *normalizedTriple = targetTripleName;
 
   std::string error;
   const llvm::Target *llvmTarget =
-      llvm::TargetRegistry::lookupTarget(targetTriple, error);
+      llvm::TargetRegistry::lookupTarget(triple, error);
   if (!llvmTarget) {
     llvm::errs() << "Failed to lookup target: " << error << "\n";
     return nullptr;
@@ -303,10 +302,10 @@ createCodeGenTargetMachine(py::TensorLoweringTarget target,
     return nullptr;
   std::unique_ptr<llvm::TargetMachine> targetMachine(
       llvmTarget->createTargetMachine(
-          targetTriple, codeGenCPUNameForTarget(target, triple),
+          triple, codeGenCPUNameForTarget(target, triple),
           codeGenFeaturesForTarget(target, triple), opt, std::nullopt));
   if (!targetMachine)
-    llvm::errs() << "Failed to create target machine for " << targetTriple
+    llvm::errs() << "Failed to create target machine for " << targetTripleName
                  << "\n";
   return targetMachine;
 }
@@ -728,11 +727,10 @@ LogicalResult installAOTEntryPoint(llvm::Module &llvmModule) {
 // passes never ran SROA/mem2reg-class cleanups on the translated IR, so
 // without this the descriptor allocas of every lowered object stay in the
 // frame (~2KB per object-handling call frame) and nothing is ever inlined.
-void runLLVMCoroLowering(llvm::Module &llvmModule,
-                         const SanitizerConfig &sanitizers,
-                         llvm::TargetMachine *targetMachine = nullptr,
-                         llvm::OptimizationLevel optimizationLevel =
-                             llvm::OptimizationLevel::O2) {
+void runLLVMCoroLowering(
+    llvm::Module &llvmModule, const SanitizerConfig &sanitizers,
+    llvm::TargetMachine *targetMachine = nullptr,
+    llvm::OptimizationLevel optimizationLevel = llvm::OptimizationLevel::O2) {
   llvm::LoopAnalysisManager loopAM;
   llvm::FunctionAnalysisManager functionAM;
   llvm::CGSCCAnalysisManager cgsccAM;
@@ -829,6 +827,10 @@ mapAtomicBinOp(LLVM::AtomicBinOp op) {
     return llvm::AtomicRMWInst::FMax;
   case LLVM::AtomicBinOp::fmin:
     return llvm::AtomicRMWInst::FMin;
+  case LLVM::AtomicBinOp::fmaximum:
+    return llvm::AtomicRMWInst::FMaximum;
+  case LLVM::AtomicBinOp::fminimum:
+    return llvm::AtomicRMWInst::FMinimum;
   case LLVM::AtomicBinOp::uinc_wrap:
     return llvm::AtomicRMWInst::UIncWrap;
   case LLVM::AtomicBinOp::udec_wrap:
@@ -1230,7 +1232,7 @@ LogicalResult emitObjectFile(llvm::Module &llvmModule,
   auto targetMachine = createCodeGenTargetMachine(tensorTarget, &targetTriple);
   if (!targetMachine)
     return failure();
-  llvmModule.setTargetTriple(targetTriple);
+  llvmModule.setTargetTriple(llvm::Triple(targetTriple));
   llvmModule.setDataLayout(targetMachine->createDataLayout());
   runLLVMCoroLowering(llvmModule, ActiveSanitizers, targetMachine.get());
   if (!ReleaseMode)
@@ -1264,7 +1266,7 @@ configureLLVMModuleCodeGenTarget(llvm::Module &llvmModule,
   if (!targetMachine)
     return failure();
 
-  llvmModule.setTargetTriple(targetTriple);
+  llvmModule.setTargetTriple(llvm::Triple(targetTriple));
   llvmModule.setDataLayout(targetMachine->createDataLayout());
   return success();
 }
@@ -1430,9 +1432,8 @@ LogicalResult runLinkerCommand(StringRef clangProgram,
 
   std::string errorMessage;
   bool executionFailed = false;
-  int result =
-      llvm::sys::ExecuteAndWait(clangProgram, args, std::nullopt, std::nullopt,
-                                0, 0, &errorMessage, &executionFailed);
+  int result = llvm::sys::ExecuteAndWait(clangProgram, args, std::nullopt, {},
+                                         0, 0, &errorMessage, &executionFailed);
   if (result != 0 || executionFailed) {
     if (!errorMessage.empty())
       llvm::errs() << errorMessage << "\n";
@@ -1663,15 +1664,16 @@ LogicalResult runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
           std::move(*tmOrErr));
     };
 
-    auto objectLayerCreator =
-        [](llvm::orc::ExecutionSession &session,
-           const llvm::Triple &tt) -> std::unique_ptr<llvm::orc::ObjectLayer> {
+    auto objectLayerCreator = [](llvm::orc::ExecutionSession &session)
+        -> llvm::Expected<std::unique_ptr<llvm::orc::ObjectLayer>> {
       auto layer = std::make_unique<llvm::orc::ObjectLinkingLayer>(session);
+      const llvm::Triple &tt = session.getTargetTriple();
       if (tt.isOSBinFormatELF()) {
-        layer->addPlugin(
-            std::make_shared<llvm::orc::EHFrameRegistrationPlugin>(
-                session,
-                std::make_unique<llvm::jitlink::InProcessEHFrameRegistrar>()));
+        auto ehFramePlugin =
+            llvm::orc::EHFrameRegistrationPlugin::Create(session);
+        if (!ehFramePlugin)
+          return ehFramePlugin.takeError();
+        layer->addPlugin(std::move(*ehFramePlugin));
       }
       if (tt.isOSBinFormatCOFF()) {
         layer->setOverrideObjectFlagsWithResponsibilityFlags(true);
@@ -1721,8 +1723,8 @@ LogicalResult runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
         return failure();
       }
       jit = std::move(*jitExpected);
-      if (failed(lython::driver::addJITSanitizerRuntimes(
-              *jit, ActiveSanitizers, processTriple)))
+      if (failed(lython::driver::addJITSanitizerRuntimes(*jit, ActiveSanitizers,
+                                                         processTriple)))
         return failure();
     }
 
@@ -1750,9 +1752,8 @@ LogicalResult runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
     {
       PerfScope perf("jit-build.prepare-llvm");
       py::installPythonExceptionCleanupFrames(*llvmModule, pythonCallSites);
-      if (!ReleaseMode &&
-          failed(
-              verifyLLVMIRSafetyMetadataAttached(*llvmModule, safetyProfile)))
+      if (!ReleaseMode && failed(verifyLLVMIRSafetyMetadataAttached(
+                              *llvmModule, safetyProfile)))
         return failure();
       if (!ReleaseMode &&
           failed(verifyPostCoroLLVMThreadSafe(*llvmModule, safetyProfile)))
@@ -1764,7 +1765,7 @@ LogicalResult runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
     }
 
     llvmModule->setDataLayout(jit->getDataLayout());
-    llvmModule->setTargetTriple(jit->getTargetTriple().getTriple());
+    llvmModule->setTargetTriple(jit->getTargetTriple());
     {
       PerfScope perf("jit-build.link-runtime");
       if (failed(py::runtime_library::linkEmbeddedNativeRuntime(*llvmModule)))
@@ -2155,7 +2156,7 @@ int main(int argc, char **argv) {
           createCodeGenTargetMachine(tensorTarget, &targetTriple);
       if (!targetMachine)
         return 1;
-      llvmModule->setTargetTriple(targetTriple);
+      llvmModule->setTargetTriple(llvm::Triple(targetTriple));
       llvmModule->setDataLayout(targetMachine->createDataLayout());
       runLLVMCoroLowering(*llvmModule, ActiveSanitizers, targetMachine.get());
       if (!ReleaseMode)

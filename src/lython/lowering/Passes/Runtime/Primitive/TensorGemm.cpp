@@ -86,7 +86,7 @@ GemmSchedule defaultGemmSchedule() {
 
 mlir::Value createIndexConstant(mlir::OpBuilder &builder, mlir::Location loc,
                                 int64_t value) {
-  return builder.create<mlir::arith::ConstantIndexOp>(loc, value).getResult();
+  return mlir::arith::ConstantIndexOp::create(builder, loc, value).getResult();
 }
 
 bool hasPrimitiveStaticShape(mlir::Value value) {
@@ -217,15 +217,14 @@ mlir::Value packRhsPanel(mlir::linalg::MatmulOp matmul,
 
   rewriter.setInsertionPoint(matmul);
   mlir::Value packed =
-      rewriter
-          .create<mlir::memref::AllocOp>(
-              matmul.getLoc(), packedType, mlir::ValueRange{},
-              rewriter.getI64IntegerAttr(kPackedPanelAlignment))
+      mlir::memref::AllocOp::create(
+          rewriter, matmul.getLoc(), packedType, mlir::ValueRange{},
+          rewriter.getI64IntegerAttr(kPackedPanelAlignment))
           .getResult();
   packed.getDefiningOp()->setAttr(kPackedPanelAttr, rewriter.getUnitAttr());
-  rewriter.create<mlir::linalg::CopyOp>(
-      matmul.getLoc(), mlir::ValueRange{source}, mlir::ValueRange{packed},
-      llvm::ArrayRef<mlir::NamedAttribute>{});
+  mlir::linalg::CopyOp::create(
+      rewriter, matmul.getLoc(), mlir::ValueRange{source},
+      mlir::ValueRange{packed}, llvm::ArrayRef<mlir::NamedAttribute>{});
   operand->set(packed);
   matmul->setAttr(kPackedRhsAttr, rewriter.getUnitAttr());
   matmul->removeAttr(kPackRhsCandidateAttr);
@@ -643,25 +642,24 @@ bool lowerInnerContiguousPackedPanelCopy(mlir::linalg::CopyOp copy,
   mlir::Value colStep = createIndexConstant(rewriter, loc, *lanes);
 
   auto rowLoop =
-      rewriter.create<mlir::scf::ForOp>(loc, rowBegin, rowEnd, rowStep);
+      mlir::scf::ForOp::create(rewriter, loc, rowBegin, rowEnd, rowStep);
   {
     mlir::OpBuilder::InsertionGuard rowGuard(rewriter);
     rewriter.setInsertionPointToStart(rowLoop.getBody());
     auto colLoop =
-        rewriter.create<mlir::scf::ForOp>(loc, colBegin, colEnd, colStep);
+        mlir::scf::ForOp::create(rewriter, loc, colBegin, colEnd, colStep);
     {
       mlir::OpBuilder::InsertionGuard colGuard(rewriter);
       rewriter.setInsertionPointToStart(colLoop.getBody());
       mlir::VectorType vectorType =
           mlir::VectorType::get({*lanes}, elementType);
-      mlir::Value vector = rewriter
-                               .create<mlir::vector::LoadOp>(
-                                   loc, vectorType, source,
-                                   mlir::ValueRange{rowLoop.getInductionVar(),
-                                                    colLoop.getInductionVar()})
+      mlir::Value vector = mlir::vector::LoadOp::create(
+                               rewriter, loc, vectorType, source,
+                               mlir::ValueRange{rowLoop.getInductionVar(),
+                                                colLoop.getInductionVar()})
                                .getResult();
-      rewriter.create<mlir::vector::StoreOp>(
-          loc, vector, target,
+      mlir::vector::StoreOp::create(
+          rewriter, loc, vector, target,
           mlir::ValueRange{rowLoop.getInductionVar(),
                            colLoop.getInductionVar()});
     }

@@ -102,7 +102,7 @@ RuntimeBundleLowerer::writeBackFieldAlias(mlir::Operation *op,
   RuntimeBundle ownerBundle = owner->second;
   RuntimeBundle storedField = updatedField.withObjectOwnership(
       ownership::logicalOwnershipKind(updatedField.objectValue.contract,
-                                              /*ownsObject=*/true));
+                                      /*ownsObject=*/true));
   ownerBundle.fieldBundles[updatedField.fieldAliasName] =
       std::make_shared<RuntimeBundle>(storedField);
   if (ownerBundle.kind != RuntimeBundle::Kind::Object) {
@@ -114,13 +114,12 @@ RuntimeBundleLowerer::writeBackFieldAlias(mlir::Operation *op,
       RuntimeBundleLowerer::classForContract(ownerBundle.objectValue.contract);
   if (!classOp)
     return op->emitError() << "field alias owner has no class schema";
-  std::optional<unsigned> fieldIndex =
-      RuntimeBundleLowerer::classFieldIndex(classOp,
-                                            updatedField.fieldAliasName);
+  std::optional<unsigned> fieldIndex = RuntimeBundleLowerer::classFieldIndex(
+      classOp, updatedField.fieldAliasName);
   if (!fieldIndex)
     return op->emitError() << "class " << classOp.getSymName()
-                           << " has no field '"
-                           << updatedField.fieldAliasName << "'";
+                           << " has no field '" << updatedField.fieldAliasName
+                           << "'";
   llvm::SmallVector<mlir::Type, 8> fieldTypes =
       RuntimeBundleLowerer::classFieldContractTypes(classOp);
   if (*fieldIndex >= fieldTypes.size())
@@ -159,8 +158,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
     if (isMethodDescriptorKind(op) &&
         RuntimeBundleLowerer::classDefinesMethod(object->instanceContract,
                                                  op.getName())) {
-      RuntimeBundle result = RuntimeBundle::object(op.getResult().getType(),
-                                                   mlir::ValueRange{});
+      RuntimeBundle result =
+          RuntimeBundle::object(op.getResult().getType(), mlir::ValueRange{});
       result.boundMethodReceiver = std::make_shared<RuntimeBundle>(*object);
       result.boundMethodName = op.getName().str();
       valueBundles[op.getResult()] = std::move(result);
@@ -171,17 +170,14 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
             RuntimeBundleLowerer::classForContract(object->instanceContract)) {
       if (std::optional<mlir::Attribute> staticValue =
               classStaticValue(classOp, op.getName())) {
-        auto dict =
-            mlir::dyn_cast<mlir::DictionaryAttr>(*staticValue);
+        auto dict = mlir::dyn_cast<mlir::DictionaryAttr>(*staticValue);
         if (!dict)
-          return op.emitError()
-                 << "static class attribute metadata for '" << op.getName()
-                 << "' is malformed";
+          return op.emitError() << "static class attribute metadata for '"
+                                << op.getName() << "' is malformed";
         auto kind = dict.getAs<mlir::StringAttr>("kind");
         if (!kind)
-          return op.emitError()
-                 << "static class attribute '" << op.getName()
-                 << "' has no metadata kind";
+          return op.emitError() << "static class attribute '" << op.getName()
+                                << "' has no metadata kind";
         llvm::StringRef spelling = kind.getValue();
         llvm::StringRef defaultKind = spelling;
         if (spelling == "constant.none")
@@ -200,8 +196,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
                  << op.getName() << "'";
 
         llvm::SmallVector<mlir::NamedAttribute, 4> attrs;
-        attrs.push_back(builder.getNamedAttr(
-            "kind", builder.getStringAttr(defaultKind)));
+        attrs.push_back(
+            builder.getNamedAttr("kind", builder.getStringAttr(defaultKind)));
         if (mlir::Attribute value = dict.get("value"))
           attrs.push_back(builder.getNamedAttr("value", value));
         mlir::DictionaryAttr defaultValue = builder.getDictionaryAttr(attrs);
@@ -282,26 +278,24 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
           RuntimeBundleLowerer::objectPhysicalHeader(op, object->objectValue);
       if (mlir::failed(header))
         return mlir::failure();
-      mlir::Value slotIndex =
-          builder.create<mlir::arith::ConstantIndexOp>(op.getLoc(),
-                                                       *primitiveSlot);
+      mlir::Value slotIndex = mlir::arith::ConstantIndexOp::create(
+          builder, op.getLoc(), *primitiveSlot);
       mlir::Value raw =
-          builder.create<mlir::memref::LoadOp>(op.getLoc(), *header, slotIndex)
+          mlir::memref::LoadOp::create(builder, op.getLoc(), *header, slotIndex)
               .getResult();
       mlir::Value valid =
-          builder.create<mlir::arith::ConstantIntOp>(op.getLoc(), 1, 1)
+          mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 1, 1)
               .getResult();
       RuntimeBundle result = RuntimeBundle::objectWithOwnership(
           fieldType, mlir::ValueRange{},
           ownership::logicalOwnershipKind(fieldType,
-                                                  /*ownsObject=*/false));
+                                          /*ownsObject=*/false));
       result.primitiveI64 = RuntimePrimitiveI64Evidence{raw, valid};
       if (!py::isAssignableTo(result.objectValue.contract,
                               op.getResult().getType(), op))
-        return op.emitError() << "attribute evidence "
-                              << result.objectValue.contract
-                              << " is not assignable to result "
-                              << op.getResult().getType();
+        return op.emitError()
+               << "attribute evidence " << result.objectValue.contract
+               << " is not assignable to result " << op.getResult().getType();
       valueBundles[op.getResult()] = std::move(result);
       erase.push_back(op);
       return mlir::success();
@@ -321,8 +315,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
     if (!py::isAssignableTo(result.objectValue.contract,
                             op.getResult().getType(), op))
       return op.emitError()
-             << "attribute evidence "
-             << result.objectValue.contract
+             << "attribute evidence " << result.objectValue.contract
              << " is not assignable to result " << op.getResult().getType();
     result.setObjectLogicalOwnership(/*ownsObject=*/false);
     result.fieldAliasOwner = op.getObject();
@@ -361,7 +354,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
   RuntimeBundle result = RuntimeBundle::objectWithOwnership(
       fieldType, values,
       ownership::logicalOwnershipKind(fieldType,
-                                              /*ownsObject=*/false));
+                                      /*ownsObject=*/false));
   result.fieldAliasOwner = op.getObject();
   result.fieldAliasName = op.getName().str();
   if (!py::isAssignableTo(result.objectValue.contract, op.getResult().getType(),
@@ -392,26 +385,25 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerClassTest(py::ClassTestOp op) {
 
   mlir::Location loc = op.getLoc();
   mlir::Value storage = *header;
-  mlir::Type dynamicHeaderType = mlir::MemRefType::get(
-      {mlir::ShapedType::kDynamic}, builder.getI64Type());
+  mlir::Type dynamicHeaderType =
+      mlir::MemRefType::get({mlir::ShapedType::kDynamic}, builder.getI64Type());
   if (storage.getType() != dynamicHeaderType)
-    storage = builder.create<mlir::memref::CastOp>(loc, dynamicHeaderType,
-                                                   storage)
-                  .getResult();
+    storage =
+        mlir::memref::CastOp::create(builder, loc, dynamicHeaderType, storage)
+            .getResult();
 
   mlir::Value classIdSlot =
-      builder.create<mlir::arith::ConstantIndexOp>(loc, 1);
+      mlir::arith::ConstantIndexOp::create(builder, loc, 1);
   mlir::Value actualClassId =
-      builder.create<mlir::memref::LoadOp>(loc, storage, classIdSlot)
+      mlir::memref::LoadOp::create(builder, loc, storage, classIdSlot)
           .getResult();
-  mlir::Value result =
-      builder.create<mlir::arith::ConstantIntOp>(loc, 0, 1);
+  mlir::Value result = mlir::arith::ConstantIntOp::create(builder, loc, 0, 1);
   for (std::int64_t targetId : *targetIds) {
     mlir::Value expected =
-        builder.create<mlir::arith::ConstantIntOp>(loc, targetId, 64);
-    mlir::Value match = builder.create<mlir::arith::CmpIOp>(
-        loc, mlir::arith::CmpIPredicate::eq, actualClassId, expected);
-    result = builder.create<mlir::arith::OrIOp>(loc, result, match);
+        mlir::arith::ConstantIntOp::create(builder, loc, targetId, 64);
+    mlir::Value match = mlir::arith::CmpIOp::create(
+        builder, loc, mlir::arith::CmpIPredicate::eq, actualClassId, expected);
+    result = mlir::arith::OrIOp::create(builder, loc, result, match);
   }
 
   op.getResult().replaceAllUsesWith(result);
@@ -481,9 +473,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
                                                 unboxOperands,
                                                 /*allowUnusedSources=*/false)))
         return mlir::failure();
-      mlir::func::CallOp unboxCall =
-          RuntimeBundleLowerer::createRuntimeCall(op.getLoc(), *unbox,
-                                                  unboxOperands);
+      mlir::func::CallOp unboxCall = RuntimeBundleLowerer::createRuntimeCall(
+          op.getLoc(), *unbox, unboxOperands);
       if (unboxCall.getNumResults() != 1 ||
           !unboxCall.getResult(0).getType().isInteger(64))
         return unbox->function.emitError()
@@ -495,11 +486,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
         RuntimeBundleLowerer::objectPhysicalHeader(op, object->objectValue);
     if (mlir::failed(header))
       return mlir::failure();
-    mlir::Value slotIndex =
-        builder.create<mlir::arith::ConstantIndexOp>(op.getLoc(),
-                                                     *primitiveSlot);
-    builder.create<mlir::memref::StoreOp>(op.getLoc(), primitiveRawValue,
-                                          *header, slotIndex);
+    mlir::Value slotIndex = mlir::arith::ConstantIndexOp::create(
+        builder, op.getLoc(), *primitiveSlot);
+    mlir::memref::StoreOp::create(builder, op.getLoc(), primitiveRawValue,
+                                  *header, slotIndex);
     erase.push_back(op);
     return mlir::success();
   }
@@ -508,9 +498,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
       runtimeShapeContractName(fieldTypes[*fieldIndex]) == "builtins.object";
   RuntimeBundle slotValue;
   bool newBoxOwnsSlot = false;
-  if (objectField &&
-      !(value->contractName() == "builtins.object" &&
-        value->physicalValues().size() == 1)) {
+  if (objectField && !(value->contractName() == "builtins.object" &&
+                       value->physicalValues().size() == 1)) {
     mlir::FailureOr<RuntimeBundle> boxed =
         RuntimeBundleLowerer::boxRuntimeObject(op, *value,
                                                /*retainPayload=*/true);
@@ -577,8 +566,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
   if (objectField) {
     if (retainExistingObjectHandle &&
         mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
-            op, fieldTypes[*fieldIndex], slotValue.physicalValues(),
-            slotName)))
+            op, fieldTypes[*fieldIndex], slotValue.physicalValues(), slotName)))
       return mlir::failure();
     if (mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
             op, fieldTypes[*fieldIndex], oldValues, slotName)))

@@ -172,7 +172,7 @@ Value ModuleEmitter::emitDescriptorReceiver(const parser::Node &anchor,
     return receiver;
   mlir::Type classType = types.typeObject(receiver.type);
   auto classObject =
-      builder.create<py::TypeObjectOp>(loc(anchor), classType, receiver.type);
+      py::TypeObjectOp::create(builder, loc(anchor), classType, receiver.type);
   return {classObject.getResult(), classType};
 }
 
@@ -224,8 +224,8 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef) {
       else if (kind == "class" || kind == "classmethod")
         receiverName = "cls";
       FunctionSignature bodySig = types.functionSignature(
-          *statement, kind == "static" ? std::optional<llvm::StringRef>()
-                                       : receiverName);
+          *statement,
+          kind == "static" ? std::optional<llvm::StringRef>() : receiverName);
       if (kind == "instance")
         replaceSelfInSignature(bodySig, types.contract(*name), types);
       else if (kind == "class" || kind == "classmethod") {
@@ -237,9 +237,9 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef) {
           types.refreshCallable(bodySig);
         }
       }
-      FunctionSignature publicSig =
-          statement->kind == "AsyncFunctionDef" ? asyncPublicSignature(bodySig)
-                                                : bodySig;
+      FunctionSignature publicSig = statement->kind == "AsyncFunctionDef"
+                                        ? asyncPublicSignature(bodySig)
+                                        : bodySig;
       methodNames.push_back(std::string(*methodName));
       methodKinds.push_back(kind);
       methodContracts.push_back(publicSig.callable);
@@ -251,8 +251,9 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef) {
         emitCallableFunction(*statement, symbolName, bodySig, {},
                              /*isLambda=*/false);
       classMethodBindings[*name][*methodName] =
-          MethodBinding{statement.get(), bodySig, publicSig, kind, symbolName,
-                        statement->kind == "AsyncFunctionDef"};
+          MethodBinding{statement.get(), bodySig,
+                        publicSig,       kind,
+                        symbolName,      statement->kind == "AsyncFunctionDef"};
     }
   }
 
@@ -309,15 +310,14 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef) {
     if (auto signature =
             mlir::dyn_cast_if_present<py::CallableType>(methodContract)) {
       pushSignature(signature);
-    } else if (auto overload =
-                   mlir::dyn_cast_if_present<py::OverloadType>(
-                       methodContract)) {
+    } else if (auto overload = mlir::dyn_cast_if_present<py::OverloadType>(
+                   methodContract)) {
       for (mlir::Type candidate : overload.getCandidateTypes())
         pushSignature(mlir::dyn_cast_if_present<py::CallableType>(candidate));
     }
   }
-  py::protocols::Table::getMutable(context).registerClass(*name,
-                                                          std::move(protocolInfo));
+  py::protocols::Table::getMutable(context).registerClass(
+      *name, std::move(protocolInfo));
 }
 
 void ModuleEmitter::collectStaticClassAssignments(
@@ -354,9 +354,9 @@ void ModuleEmitter::collectStaticClassAssignments(
         const parser::Node *value = ast::node(*statement, "value");
         if (!target || target->kind != "Name" || !value)
           continue;
-        appendStaticAttr(ast::nameSpelling(*target), value,
-                         types.annotationType(
-                             ast::node(*statement, "annotation")));
+        appendStaticAttr(
+            ast::nameSpelling(*target), value,
+            types.annotationType(ast::node(*statement, "annotation")));
       }
     }
   }
@@ -382,7 +382,8 @@ void ModuleEmitter::collectStaticModuleAssignments(
 }
 
 void ModuleEmitter::collectClassFields(
-    const parser::Node &classDef, llvm::SmallVectorImpl<std::string> &fieldNames,
+    const parser::Node &classDef,
+    llvm::SmallVectorImpl<std::string> &fieldNames,
     llvm::SmallVectorImpl<mlir::Type> &fieldTypes) const {
   auto setField = [&](llvm::StringRef name, mlir::Type type,
                       bool overwriteExisting) {
@@ -520,9 +521,8 @@ Value ModuleEmitter::emitInlineMethodBody(
     const llvm::StringMap<Value> &keywords) {
   if (!method.method)
     return emitNone(anchor);
-  const FunctionSignature &sig = method.bodySignature.callable
-                                     ? method.bodySignature
-                                     : method.signature;
+  const FunctionSignature &sig =
+      method.bodySignature.callable ? method.bodySignature : method.signature;
   const auto *body = ast::nodeList(*method.method, "body");
   mlir::Type resultType = sig.resultType ? sig.resultType : types.none();
 
@@ -582,8 +582,8 @@ Value ModuleEmitter::emitInlineMethodBody(
   llvm::SmallVector<const parser::Node *, 8> positionalNodes;
   if (arguments)
     positionalNodes = positionalArgumentNodes(*arguments);
-  const auto *defaults = arguments ? ast::nodeList(*arguments, "defaults")
-                                   : nullptr;
+  const auto *defaults =
+      arguments ? ast::nodeList(*arguments, "defaults") : nullptr;
   const auto *kwDefaults =
       arguments ? ast::nodeList(*arguments, "kw_defaults") : nullptr;
   unsigned firstPositionalDefault =
@@ -599,10 +599,10 @@ Value ModuleEmitter::emitInlineMethodBody(
     return (*defaults)[defaultIndex].get();
   };
   auto reportMissing = [&](llvm::StringRef name) {
-    diagnostics.push_back(parser::Diagnostic{
-        parser::Severity::Error, anchor.range.start,
-        "missing required argument '" + name.str() +
-            "' for inlined class method"});
+    diagnostics.push_back(
+        parser::Diagnostic{parser::Severity::Error, anchor.range.start,
+                           "missing required argument '" + name.str() +
+                               "' for inlined class method"});
   };
   for (auto [index, name] : llvm::enumerate(sig.positionalNames)) {
     if (bound.contains(name))
@@ -646,7 +646,7 @@ Value ModuleEmitter::emitInlineMethodBody(
       builder.createBlock(region, continuation->getIterator());
 
   builder.setInsertionPointToEnd(entryBlock);
-  builder.create<mlir::cf::BranchOp>(loc(anchor), bodyBlock);
+  mlir::cf::BranchOp::create(builder, loc(anchor), bodyBlock);
   builder.setInsertionPointToStart(bodyBlock);
   inlineReturnContexts.push_back(InlineReturnContext{continuation, resultType});
   emitStatements(body);
@@ -659,7 +659,8 @@ Value ModuleEmitter::emitInlineMethodBody(
     }
     Value none = emitNone(anchor);
     Value result = coerceValue(none, resultType, anchor);
-    builder.create<mlir::cf::BranchOp>(loc(anchor), continuation, result.value);
+    mlir::cf::BranchOp::create(builder, loc(anchor), continuation,
+                               result.value);
   }
   builder.setInsertionPointToStart(continuation);
   return {continuation->getArgument(0), resultType};
@@ -689,9 +690,8 @@ Value ModuleEmitter::emitClassInstantiation(const parser::Node &expr,
       }
     }
   }
-  bool hasUnpackedPositional =
-      llvm::any_of(operands.positionalUnpacked,
-                   [](char value) { return value != 0; });
+  bool hasUnpackedPositional = llvm::any_of(
+      operands.positionalUnpacked, [](char value) { return value != 0; });
   if (hasUnpackedPositional) {
     if (const auto *args = ast::nodeList(expr, "args")) {
       for (const parser::NodePtr &arg : *args) {
@@ -705,18 +705,17 @@ Value ModuleEmitter::emitClassInstantiation(const parser::Node &expr,
     }
   }
 
-  mlir::Type inferredInstanceType =
-      types.inferClassInstantiation(instanceType, operands.positionalTypes,
-                                    operands.keywordTypes);
+  mlir::Type inferredInstanceType = types.inferClassInstantiation(
+      instanceType, operands.positionalTypes, operands.keywordTypes);
   mlir::Type classType = types.typeObject(inferredInstanceType);
-  auto classObject = builder.create<py::TypeObjectOp>(loc(expr), classType,
-                                                      inferredInstanceType);
+  auto classObject = py::TypeObjectOp::create(builder, loc(expr), classType,
+                                              inferredInstanceType);
   Value posPack = emitPack(operands.positional, operands.positionalUnpacked);
   Value namePack = emitPack(operands.keywordNames);
   Value valuePack = emitPack(operands.keywordValues);
 
-  auto newOp = builder.create<py::NewOp>(
-      loc(expr), inferredInstanceType,
+  auto newOp = py::NewOp::create(
+      builder, loc(expr), inferredInstanceType,
       mlir::FlatSymbolRefAttr::get(&context, "__new__"), callableProtocol(),
       classObject.getResult(), posPack.value, namePack.value, valuePack.value);
   newOp->setAttr("ly.constructor.owner", builder.getStringAttr(name));
@@ -730,8 +729,7 @@ Value ModuleEmitter::emitClassInstantiation(const parser::Node &expr,
     newOp->setAttr("ly.constructor.new_kind",
                    builder.getStringAttr(newBinding->kind));
   } else {
-    newOp->setAttr("ly.constructor.new_kind",
-                   builder.getStringAttr("class"));
+    newOp->setAttr("ly.constructor.new_kind", builder.getStringAttr("class"));
   }
   std::optional<MethodBinding> init =
       lookupClassMethod(inferredInstanceType, "__init__");
@@ -762,11 +760,11 @@ Value ModuleEmitter::emitClassInstantiation(const parser::Node &expr,
     CallInferenceResult initInference = types.inferMethodCallWithEvidence(
         inferredInstanceType, "__init__", operands.positionalTypes,
         operands.keywordTypes);
-    auto initOp = builder.create<py::InitOp>(
-        loc(expr), types.none(),
-        mlir::FlatSymbolRefAttr::get(&context, "__init__"),
-        callProtocolFor(initInference),
-        newOp.getInstance(), posPack.value, namePack.value, valuePack.value);
+    auto initOp =
+        py::InitOp::create(builder, loc(expr), types.none(),
+                           mlir::FlatSymbolRefAttr::get(&context, "__init__"),
+                           callProtocolFor(initInference), newOp.getInstance(),
+                           posPack.value, namePack.value, valuePack.value);
     initOp->setAttr("ly.constructor.owner", builder.getStringAttr(name));
     initOp->setAttr("ly.constructor.init_kind",
                     builder.getStringAttr(init ? init->kind : "instance"));

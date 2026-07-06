@@ -43,9 +43,9 @@ void createDeadContinuation(mlir::OpBuilder &builder, mlir::Operation *op) {
   mlir::Block *dead = builder.createBlock(current->getParent(),
                                           std::next(current->getIterator()));
   builder.setInsertionPoint(op);
-  builder.create<mlir::cf::BranchOp>(op->getLoc(), dead);
+  mlir::cf::BranchOp::create(builder, op->getLoc(), dead);
   builder.setInsertionPointToStart(dead);
-  builder.create<mlir::cf::BranchOp>(op->getLoc(), dead);
+  mlir::cf::BranchOp::create(builder, op->getLoc(), dead);
 }
 
 mlir::func::FuncOp getOrCreateRethrow(mlir::ModuleOp module,
@@ -57,7 +57,7 @@ mlir::func::FuncOp getOrCreateRethrow(mlir::ModuleOp module,
   builder.setInsertionPointToEnd(module.getBody());
   auto functionType = builder.getFunctionType({}, {});
   auto function =
-      builder.create<mlir::func::FuncOp>(module.getLoc(), kName, functionType);
+      mlir::func::FuncOp::create(builder, module.getLoc(), kName, functionType);
   function.setPrivate();
   return function;
 }
@@ -72,7 +72,7 @@ mlir::func::FuncOp getOrCreateClassIdMatches(mlir::ModuleOp module,
   auto functionType = builder.getFunctionType(
       {builder.getI64Type(), builder.getI64Type()}, {builder.getI1Type()});
   auto function =
-      builder.create<mlir::func::FuncOp>(module.getLoc(), kName, functionType);
+      mlir::func::FuncOp::create(builder, module.getLoc(), kName, functionType);
   function.setPrivate();
   return function;
 }
@@ -88,7 +88,7 @@ getOrCreateDiscardCurrentExceptionIfMatches(mlir::ModuleOp module,
   auto functionType =
       builder.getFunctionType({builder.getI64Type()}, {builder.getI1Type()});
   auto function =
-      builder.create<mlir::func::FuncOp>(module.getLoc(), kName, functionType);
+      mlir::func::FuncOp::create(builder, module.getLoc(), kName, functionType);
   function.setPrivate();
   return function;
 }
@@ -105,7 +105,7 @@ mlir::func::FuncOp getOrCreateTracebackPush(mlir::ModuleOp module,
   auto functionType = builder.getFunctionType(
       {bytesType, bytesType, builder.getI32Type(), builder.getI32Type()}, {});
   auto function =
-      builder.create<mlir::func::FuncOp>(module.getLoc(), kName, functionType);
+      mlir::func::FuncOp::create(builder, module.getLoc(), kName, functionType);
   function.setPrivate();
   return function;
 }
@@ -142,13 +142,13 @@ RuntimeBundleLowerer::emitTracebackFrame(mlir::Operation *op) {
   mlir::Value function =
       materializeByteBuffer(op->getLoc(), currentCallableName(op));
   mlir::Value lineValue =
-      builder.create<mlir::arith::ConstantIntOp>(op->getLoc(), line, 32)
+      mlir::arith::ConstantIntOp::create(builder, op->getLoc(), line, 32)
           .getResult();
   mlir::Value columnValue =
-      builder.create<mlir::arith::ConstantIntOp>(op->getLoc(), column, 32)
+      mlir::arith::ConstantIntOp::create(builder, op->getLoc(), column, 32)
           .getResult();
-  builder.create<mlir::func::CallOp>(
-      op->getLoc(), tracebackPush,
+  mlir::func::CallOp::create(
+      builder, op->getLoc(), tracebackPush,
       mlir::ValueRange{file, function, lineValue, columnValue});
   return mlir::success();
 }
@@ -260,7 +260,7 @@ mlir::LogicalResult
 RuntimeBundleLowerer::lowerRaiseCurrent(py::RaiseCurrentOp op) {
   mlir::func::FuncOp rethrow = getOrCreateRethrow(module, builder);
   builder.setInsertionPoint(op);
-  builder.create<mlir::func::CallOp>(op.getLoc(), rethrow, mlir::ValueRange{});
+  mlir::func::CallOp::create(builder, op.getLoc(), rethrow, mlir::ValueRange{});
   createDeadContinuation(builder, op.getOperation());
   op.erase();
   return mlir::success();
@@ -290,21 +290,19 @@ RuntimeBundleLowerer::lowerExceptMatch(py::ExceptMatchOp op) {
 
   builder.setInsertionPoint(op);
   mlir::Value classSlot =
-      builder.create<mlir::arith::ConstantIndexOp>(op.getLoc(), 2).getResult();
+      mlir::arith::ConstantIndexOp::create(builder, op.getLoc(), 2).getResult();
   mlir::Value exceptionClassId =
-      builder
-          .create<mlir::memref::LoadOp>(op.getLoc(), values.front(),
-                                        mlir::ValueRange{classSlot})
+      mlir::memref::LoadOp::create(builder, op.getLoc(), values.front(),
+                                   mlir::ValueRange{classSlot})
           .getResult();
-  mlir::Value handlerId = builder
-                              .create<mlir::arith::ConstantIntOp>(
-                                  op.getLoc(), *handlerClassIdValue, 64)
+  mlir::Value handlerId = mlir::arith::ConstantIntOp::create(
+                              builder, op.getLoc(), *handlerClassIdValue, 64)
                               .getResult();
   mlir::func::FuncOp classIdMatches =
       getOrCreateClassIdMatches(module, builder);
-  auto call = builder.create<mlir::func::CallOp>(
-      op.getLoc(), classIdMatches,
-      mlir::ValueRange{exceptionClassId, handlerId});
+  auto call =
+      mlir::func::CallOp::create(builder, op.getLoc(), classIdMatches,
+                                 mlir::ValueRange{exceptionClassId, handlerId});
   op.getResult().replaceAllUsesWith(call.getResult(0));
   erase.push_back(op);
   return mlir::success();
@@ -319,12 +317,12 @@ RuntimeBundleLowerer::lowerExceptCurrentMatch(py::ExceptCurrentMatchOp op) {
 
   builder.setInsertionPoint(op);
   mlir::Value handler =
-      builder.create<mlir::arith::ConstantIntOp>(op.getLoc(), *handlerId, 64)
+      mlir::arith::ConstantIntOp::create(builder, op.getLoc(), *handlerId, 64)
           .getResult();
   mlir::func::FuncOp discardIfMatches =
       getOrCreateDiscardCurrentExceptionIfMatches(module, builder);
-  auto call = builder.create<mlir::func::CallOp>(op.getLoc(), discardIfMatches,
-                                                 mlir::ValueRange{handler});
+  auto call = mlir::func::CallOp::create(builder, op.getLoc(), discardIfMatches,
+                                         mlir::ValueRange{handler});
   op.getResult().replaceAllUsesWith(call.getResult(0));
   erase.push_back(op);
   return mlir::success();

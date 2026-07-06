@@ -47,7 +47,7 @@ constexpr std::uint64_t kSMEMatmulMinWork = 1024;
 
 mlir::Value createIndexConstant(mlir::OpBuilder &builder, mlir::Location loc,
                                 int64_t value) {
-  return builder.create<mlir::arith::ConstantIndexOp>(loc, value).getResult();
+  return mlir::arith::ConstantIndexOp::create(builder, loc, value).getResult();
 }
 
 mlir::VectorType scalableVectorType(mlir::Type elementType) {
@@ -132,26 +132,23 @@ bool isProfitableStaticSMEMatmul(const StaticMatmulMemRefs &refs) {
 
 mlir::Value createRemaining(mlir::OpBuilder &builder, mlir::Location loc,
                             int64_t upper, mlir::Value iv) {
-  return builder
-      .create<mlir::arith::SubIOp>(loc,
-                                   createIndexConstant(builder, loc, upper), iv)
+  return mlir::arith::SubIOp::create(
+             builder, loc, createIndexConstant(builder, loc, upper), iv)
       .getResult();
 }
 
 mlir::Value createMask(mlir::OpBuilder &builder, mlir::Location loc,
                        mlir::VectorType maskType, mlir::Value extent) {
-  return builder
-      .create<mlir::vector::CreateMaskOp>(loc, maskType,
-                                          mlir::ValueRange{extent})
+  return mlir::vector::CreateMaskOp::create(builder, loc, maskType,
+                                            mlir::ValueRange{extent})
       .getResult();
 }
 
 mlir::Value createTileMask(mlir::OpBuilder &builder, mlir::Location loc,
                            mlir::VectorType maskType, mlir::Value rows,
                            mlir::Value cols) {
-  return builder
-      .create<mlir::vector::CreateMaskOp>(loc, maskType,
-                                          mlir::ValueRange{rows, cols})
+  return mlir::vector::CreateMaskOp::create(builder, loc, maskType,
+                                            mlir::ValueRange{rows, cols})
       .getResult();
 }
 
@@ -172,13 +169,13 @@ mlir::Value createDynamicRank2MemRefCast(mlir::OpBuilder &builder,
       type.getElementType(), type.getLayout(), type.getMemorySpace());
   if (dynamicType == type)
     return value;
-  return builder.create<mlir::memref::CastOp>(loc, dynamicType, value)
+  return mlir::memref::CastOp::create(builder, loc, dynamicType, value)
       .getResult();
 }
 
 mlir::Value createZeroVector(mlir::OpBuilder &builder, mlir::Location loc,
                              mlir::VectorType type, mlir::Value scalarZero) {
-  return builder.create<mlir::vector::BroadcastOp>(loc, type, scalarZero)
+  return mlir::vector::BroadcastOp::create(builder, loc, type, scalarZero)
       .getResult();
 }
 
@@ -189,10 +186,9 @@ createFirstReductionTilePredicate(mlir::OpBuilder &builder, mlir::Location loc,
       builder, loc, matmul.getDpsInputOperand(0)->get(), /*dimension=*/1);
   if (!reductionOffset)
     return std::nullopt;
-  return builder
-      .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::eq,
-                                   *reductionOffset,
-                                   createIndexConstant(builder, loc, 0))
+  return mlir::arith::CmpIOp::create(
+             builder, loc, mlir::arith::CmpIPredicate::eq, *reductionOffset,
+             createIndexConstant(builder, loc, 0))
       .getResult();
 }
 
@@ -209,10 +205,9 @@ createAccumulatorInit(mlir::linalg::MatmulOp matmul, mlir::OpBuilder &builder,
   }
 
   auto loadOut = [&]() {
-    return builder
-        .create<mlir::arm_sme::TileLoadOp>(
-            loc, tileType, views.out, mlir::ValueRange{row, col}, scalarZero,
-            tileMask, mlir::arm_sme::TileSliceLayout::Horizontal)
+    return mlir::arm_sme::TileLoadOp::create(
+               builder, loc, tileType, views.out, mlir::ValueRange{row, col},
+               scalarZero, tileMask, mlir::arm_sme::TileSliceLayout::Horizontal)
         .getResult();
   };
 
@@ -226,17 +221,17 @@ createAccumulatorInit(mlir::linalg::MatmulOp matmul, mlir::OpBuilder &builder,
   if (!firstReductionTile)
     return mlir::failure();
 
-  auto ifOp = builder.create<mlir::scf::IfOp>(
-      loc, tileType, *firstReductionTile, /*withElseRegion=*/true);
+  auto ifOp = mlir::scf::IfOp::create(
+      builder, loc, tileType, *firstReductionTile, /*withElseRegion=*/true);
   {
     mlir::OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
-    builder.create<mlir::scf::YieldOp>(loc, zeroTile);
+    mlir::scf::YieldOp::create(builder, loc, zeroTile);
   }
   {
     mlir::OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
-    builder.create<mlir::scf::YieldOp>(loc, loadOut());
+    mlir::scf::YieldOp::create(builder, loc, loadOut());
   }
 
   acc = ifOp.getResult(0);
@@ -248,33 +243,31 @@ mlir::Value createPackedLhsPanel(mlir::OpBuilder &builder, mlir::Location loc,
   mlir::MemRefType packedType = mlir::MemRefType::get(
       {refs.k, refs.m}, refs.lhsType.getElementType(),
       mlir::MemRefLayoutAttrInterface{}, refs.lhsType.getMemorySpace());
-  mlir::Value packed =
-      builder
-          .create<mlir::memref::AllocOp>(loc, packedType, mlir::ValueRange{},
-                                         builder.getI64IntegerAttr(64))
-          .getResult();
+  mlir::Value packed = mlir::memref::AllocOp::create(
+                           builder, loc, packedType, mlir::ValueRange{},
+                           builder.getI64IntegerAttr(64))
+                           .getResult();
 
   mlir::Value zero = createIndexConstant(builder, loc, 0);
   mlir::Value one = createIndexConstant(builder, loc, 1);
   mlir::Value kUpper = createIndexConstant(builder, loc, refs.k);
   mlir::Value mUpper = createIndexConstant(builder, loc, refs.m);
 
-  auto kLoop = builder.create<mlir::scf::ForOp>(loc, zero, kUpper, one);
+  auto kLoop = mlir::scf::ForOp::create(builder, loc, zero, kUpper, one);
   {
     mlir::OpBuilder::InsertionGuard kGuard(builder);
     builder.setInsertionPointToStart(kLoop.getBody());
-    auto rowLoop = builder.create<mlir::scf::ForOp>(loc, zero, mUpper, one);
+    auto rowLoop = mlir::scf::ForOp::create(builder, loc, zero, mUpper, one);
     {
       mlir::OpBuilder::InsertionGuard rowGuard(builder);
       builder.setInsertionPointToStart(rowLoop.getBody());
-      mlir::Value source = builder
-                               .create<mlir::memref::LoadOp>(
-                                   loc, refs.lhs,
-                                   mlir::ValueRange{rowLoop.getInductionVar(),
-                                                    kLoop.getInductionVar()})
+      mlir::Value source = mlir::memref::LoadOp::create(
+                               builder, loc, refs.lhs,
+                               mlir::ValueRange{rowLoop.getInductionVar(),
+                                                kLoop.getInductionVar()})
                                .getResult();
-      builder.create<mlir::memref::StoreOp>(
-          loc, source, packed,
+      mlir::memref::StoreOp::create(
+          builder, loc, source, packed,
           mlir::ValueRange{kLoop.getInductionVar(), rowLoop.getInductionVar()});
     }
   }
@@ -289,10 +282,10 @@ mlir::Value createLhsVector(mlir::OpBuilder &builder, mlir::Location loc,
                             mlir::Value rowMask) {
   mlir::AffineMap minorIdentity =
       mlir::AffineMap::getMinorIdentityMap(2, 1, builder.getContext());
-  return builder
-      .create<mlir::vector::TransferReadOp>(
-          loc, vectorType, views.lhs, mlir::ValueRange{k, row}, minorIdentity,
-          scalarZero, rowMask, transferInBoundsAttr(builder, 1))
+  return mlir::vector::TransferReadOp::create(
+             builder, loc, vectorType, views.lhs, mlir::ValueRange{k, row},
+             minorIdentity, scalarZero, rowMask,
+             transferInBoundsAttr(builder, 1))
       .getResult();
 }
 
@@ -303,10 +296,10 @@ mlir::Value createRhsVector(mlir::OpBuilder &builder, mlir::Location loc,
                             mlir::Value colMask) {
   mlir::AffineMap minorIdentity =
       mlir::AffineMap::getMinorIdentityMap(2, 1, builder.getContext());
-  return builder
-      .create<mlir::vector::TransferReadOp>(
-          loc, vectorType, views.rhs, mlir::ValueRange{k, col}, minorIdentity,
-          scalarZero, colMask, transferInBoundsAttr(builder, 1))
+  return mlir::vector::TransferReadOp::create(
+             builder, loc, vectorType, views.rhs, mlir::ValueRange{k, col},
+             minorIdentity, scalarZero, colMask,
+             transferInBoundsAttr(builder, 1))
       .getResult();
 }
 
@@ -337,9 +330,8 @@ mlir::LogicalResult lowerStaticF32MatmulToSME(mlir::linalg::MatmulOp matmul,
   mlir::Value nUpper = createIndexConstant(rewriter, loc, refs->n);
   mlir::Value kUpper = createIndexConstant(rewriter, loc, refs->k);
   mlir::Value vl =
-      rewriter
-          .create<mlir::arm_sme::StreamingVLOp>(loc, rewriter.getIndexType(),
-                                                mlir::arm_sme::TypeSize::Word)
+      mlir::arm_sme::StreamingVLOp::create(
+          rewriter, loc, rewriter.getIndexType(), mlir::arm_sme::TypeSize::Word)
           .getResult();
   mlir::Value packedLhs = createPackedLhsPanel(rewriter, loc, *refs);
   auto packedLhsType = mlir::cast<mlir::MemRefType>(packedLhs.getType());
@@ -348,7 +340,7 @@ mlir::LogicalResult lowerStaticF32MatmulToSME(mlir::linalg::MatmulOp matmul,
       createDynamicRank2MemRefCast(rewriter, loc, refs->rhs, refs->rhsType),
       createDynamicRank2MemRefCast(rewriter, loc, refs->out, refs->outType)};
 
-  auto rowLoop = rewriter.create<mlir::scf::ForOp>(loc, zero, mUpper, vl);
+  auto rowLoop = mlir::scf::ForOp::create(rewriter, loc, zero, mUpper, vl);
   {
     mlir::OpBuilder::InsertionGuard rowGuard(rewriter);
     rewriter.setInsertionPointToStart(rowLoop.getBody());
@@ -356,7 +348,7 @@ mlir::LogicalResult lowerStaticF32MatmulToSME(mlir::linalg::MatmulOp matmul,
     mlir::Value rowsRemaining = createRemaining(rewriter, loc, refs->m, row);
     mlir::Value rowMask = createMask(rewriter, loc, maskType, rowsRemaining);
 
-    auto colLoop = rewriter.create<mlir::scf::ForOp>(loc, zero, nUpper, vl);
+    auto colLoop = mlir::scf::ForOp::create(rewriter, loc, zero, nUpper, vl);
     {
       mlir::OpBuilder::InsertionGuard colGuard(rewriter);
       rewriter.setInsertionPointToStart(colLoop.getBody());
@@ -372,8 +364,8 @@ mlir::LogicalResult lowerStaticF32MatmulToSME(mlir::linalg::MatmulOp matmul,
                                              col, tileMask, initialAcc)))
         return mlir::failure();
 
-      auto kLoop = rewriter.create<mlir::scf::ForOp>(
-          loc, zero, kUpper, one, mlir::ValueRange{initialAcc},
+      auto kLoop = mlir::scf::ForOp::create(
+          rewriter, loc, zero, kUpper, one, mlir::ValueRange{initialAcc},
           [&](mlir::OpBuilder &builder, mlir::Location nestedLoc, mlir::Value k,
               mlir::ValueRange iterArgs) {
             mlir::Value lhsVector =
@@ -383,17 +375,17 @@ mlir::LogicalResult lowerStaticF32MatmulToSME(mlir::linalg::MatmulOp matmul,
                 createRhsVector(builder, nestedLoc, views, vectorType,
                                 *scalarZero, k, col, colMask);
             mlir::Value nextAcc =
-                builder
-                    .create<mlir::vector::OuterProductOp>(
-                        nestedLoc, tileType, lhsVector, rhsVector, iterArgs[0],
-                        mlir::vector::CombiningKind::ADD)
+                mlir::vector::OuterProductOp::create(
+                    builder, nestedLoc, tileType, lhsVector, rhsVector,
+                    iterArgs[0], mlir::vector::CombiningKind::ADD)
                     .getResult();
-            builder.create<mlir::scf::YieldOp>(nestedLoc, nextAcc);
+            mlir::scf::YieldOp::create(builder, nestedLoc, nextAcc);
           });
 
-      rewriter.create<mlir::arm_sme::TileStoreOp>(
-          loc, kLoop.getResult(0), views.out, mlir::ValueRange{row, col},
-          tileMask, mlir::arm_sme::TileSliceLayout::Horizontal);
+      mlir::arm_sme::TileStoreOp::create(
+          rewriter, loc, kLoop.getResult(0), views.out,
+          mlir::ValueRange{row, col}, tileMask,
+          mlir::arm_sme::TileSliceLayout::Horizontal);
     }
   }
 

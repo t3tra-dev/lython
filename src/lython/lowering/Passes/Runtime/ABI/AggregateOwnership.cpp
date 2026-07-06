@@ -8,9 +8,7 @@ namespace {
 
 namespace own = py::ownership;
 
-bool isNoneLikeType(mlir::Type type) {
-  return py::isPyNoneType(type);
-}
+bool isNoneLikeType(mlir::Type type) { return py::isPyNoneType(type); }
 
 std::string describeSlotType(mlir::Type type) {
   std::string name = runtimeContractName(type);
@@ -44,13 +42,12 @@ mlir::FailureOr<mlir::Value> buildHeaderView(mlir::Operation *op,
       targetMemRef.getRank() != 1 ||
       sourceType.getElementType() != targetMemRef.getElementType() ||
       sourceType.getMemorySpace() != targetMemRef.getMemorySpace())
-    return op->emitError() << "aggregate slot object value "
-                           << header.getType() << " cannot be viewed as "
-                           << targetType;
+    return op->emitError() << "aggregate slot object value " << header.getType()
+                           << " cannot be viewed as " << targetType;
 
   if (sourceType.getDimSize(0) == targetMemRef.getDimSize(0))
-    return builder
-        .create<mlir::memref::CastOp>(op->getLoc(), targetType, header)
+    return mlir::memref::CastOp::create(builder, op->getLoc(), targetType,
+                                        header)
         .getResult();
 
   if (sourceType.hasStaticShape() && targetMemRef.hasStaticShape() &&
@@ -64,20 +61,18 @@ mlir::FailureOr<mlir::Value> buildHeaderView(mlir::Operation *op,
         mlir::memref::SubViewOp::inferRankReducedResultType(
             resultShape, sourceType, offsets, sizes, strides));
     mlir::Value view =
-        builder
-            .create<mlir::memref::SubViewOp>(op->getLoc(), inferredType,
-                                             header, offsets, sizes, strides)
+        mlir::memref::SubViewOp::create(builder, op->getLoc(), inferredType,
+                                        header, offsets, sizes, strides)
             .getResult();
     if (view.getType() == targetMemRef)
       return view;
-    return builder
-        .create<mlir::memref::CastOp>(op->getLoc(), targetMemRef, view)
+    return mlir::memref::CastOp::create(builder, op->getLoc(), targetMemRef,
+                                        view)
         .getResult();
   }
 
-  return op->emitError() << "aggregate slot object value "
-                         << header.getType() << " cannot be viewed as "
-                         << targetType;
+  return op->emitError() << "aggregate slot object value " << header.getType()
+                         << " cannot be viewed as " << targetType;
 }
 
 } // namespace
@@ -101,9 +96,10 @@ mlir::LogicalResult RuntimeBundleLowerer::retainAggregateSlot(
                                                    slotName, /*depth=*/0);
 }
 
-mlir::LogicalResult RuntimeBundleLowerer::retainAggregateSlot(
-    mlir::Operation *op, const RuntimeBundle &slotValue,
-    llvm::StringRef slotName) {
+mlir::LogicalResult
+RuntimeBundleLowerer::retainAggregateSlot(mlir::Operation *op,
+                                          const RuntimeBundle &slotValue,
+                                          llvm::StringRef slotName) {
   const RuntimeBundle *concrete =
       RuntimeBundleLowerer::concreteObjectForOwnership(slotValue);
   if (!concrete || concrete->kind != RuntimeBundle::Kind::Object)
@@ -122,9 +118,10 @@ mlir::LogicalResult RuntimeBundleLowerer::releaseAggregateSlot(
                                                     /*depth=*/0);
 }
 
-mlir::LogicalResult RuntimeBundleLowerer::releaseAggregateSlot(
-    mlir::Operation *op, const RuntimeBundle &slotValue,
-    llvm::StringRef slotName) {
+mlir::LogicalResult
+RuntimeBundleLowerer::releaseAggregateSlot(mlir::Operation *op,
+                                           const RuntimeBundle &slotValue,
+                                           llvm::StringRef slotName) {
   const RuntimeBundle *concrete =
       RuntimeBundleLowerer::concreteObjectForOwnership(slotValue);
   if (!concrete || concrete->kind != RuntimeBundle::Kind::Object)
@@ -150,8 +147,8 @@ mlir::LogicalResult RuntimeBundleLowerer::replaceAggregateSlot(
     const RuntimeBundle &newSlotValue, llvm::StringRef slotName,
     bool releaseMissingOldObjectSlot) {
   (void)newType;
-  if (mlir::failed(
-          RuntimeBundleLowerer::retainAggregateSlot(op, newSlotValue, slotName)))
+  if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(op, newSlotValue,
+                                                             slotName)))
     return mlir::failure();
 
   if (oldSlotValue)
@@ -198,17 +195,18 @@ mlir::LogicalResult RuntimeBundleLowerer::retainAggregateSlot(
         continue;
       }
 
-      mlir::Value expected = builder.create<mlir::arith::ConstantIntOp>(
-          op->getLoc(), static_cast<std::int64_t>(memberIndex), 64);
-      mlir::Value active = builder.create<mlir::arith::CmpIOp>(
-          op->getLoc(), mlir::arith::CmpIPredicate::eq, tag, expected);
-      auto ifOp = builder.create<mlir::scf::IfOp>(
-          op->getLoc(), mlir::TypeRange{}, active, /*withElseRegion=*/false);
+      mlir::Value expected = mlir::arith::ConstantIntOp::create(
+          builder, op->getLoc(), static_cast<std::int64_t>(memberIndex), 64);
+      mlir::Value active = mlir::arith::CmpIOp::create(
+          builder, op->getLoc(), mlir::arith::CmpIPredicate::eq, tag, expected);
+      auto ifOp =
+          mlir::scf::IfOp::create(builder, op->getLoc(), mlir::TypeRange{},
+                                  active, /*withElseRegion=*/false);
       builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
       if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
               op, member, values.slice(offset, size), slotName, depth + 1)))
         return mlir::failure();
-      builder.create<mlir::scf::YieldOp>(op->getLoc());
+      mlir::scf::YieldOp::create(builder, op->getLoc());
       builder.setInsertionPointAfter(ifOp);
       offset += size;
     }
@@ -230,7 +228,8 @@ mlir::LogicalResult RuntimeBundleLowerer::retainAggregateSlot(
       op, builder, values.front(), retain.getFunctionType().getInput(0));
   if (mlir::failed(header))
     return mlir::failure();
-  auto call = builder.create<mlir::func::CallOp>(op->getLoc(), retain, *header);
+  auto call =
+      mlir::func::CallOp::create(builder, op->getLoc(), retain, *header);
   call->setAttr(own::kAggregateRetainAttr,
                 builder.getStringAttr(markerName(slotType, slotName)));
   return mlir::success();
@@ -269,18 +268,19 @@ mlir::LogicalResult RuntimeBundleLowerer::releaseAggregateSlot(
         continue;
       }
 
-      mlir::Value expected = builder.create<mlir::arith::ConstantIntOp>(
-          op->getLoc(), static_cast<std::int64_t>(memberIndex), 64);
-      mlir::Value active = builder.create<mlir::arith::CmpIOp>(
-          op->getLoc(), mlir::arith::CmpIPredicate::eq, tag, expected);
-      auto ifOp = builder.create<mlir::scf::IfOp>(
-          op->getLoc(), mlir::TypeRange{}, active, /*withElseRegion=*/false);
+      mlir::Value expected = mlir::arith::ConstantIntOp::create(
+          builder, op->getLoc(), static_cast<std::int64_t>(memberIndex), 64);
+      mlir::Value active = mlir::arith::CmpIOp::create(
+          builder, op->getLoc(), mlir::arith::CmpIPredicate::eq, tag, expected);
+      auto ifOp =
+          mlir::scf::IfOp::create(builder, op->getLoc(), mlir::TypeRange{},
+                                  active, /*withElseRegion=*/false);
       builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
       if (mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
               op, member, values.slice(offset, size), slotName, deallocators,
               depth + 1)))
         return mlir::failure();
-      builder.create<mlir::scf::YieldOp>(op->getLoc());
+      mlir::scf::YieldOp::create(builder, op->getLoc());
       builder.setInsertionPointAfter(ifOp);
       offset += size;
     }
@@ -300,8 +300,8 @@ mlir::LogicalResult RuntimeBundleLowerer::releaseAggregateSlot(
     return mlir::success();
   }
 
-  auto call = builder.create<mlir::func::CallOp>(op->getLoc(),
-                                                 deallocator->function, values);
+  auto call = mlir::func::CallOp::create(builder, op->getLoc(),
+                                         deallocator->function, values);
   call->setAttr(own::kAggregateReleaseAttr,
                 builder.getStringAttr(markerName(slotType, slotName)));
   return mlir::success();

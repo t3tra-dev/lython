@@ -47,7 +47,7 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
   auto funcType =
       builder.getFunctionType(logicalInputs, mlir::TypeRange{sig.resultType});
   auto func =
-      builder.create<mlir::func::FuncOp>(loc(callable), symbolName, funcType);
+      mlir::func::FuncOp::create(builder, loc(callable), symbolName, funcType);
   func.setPrivate();
   func->setAttr("callable_type", mlir::TypeAttr::get(sig.callable));
   if (sig.varargType)
@@ -89,15 +89,14 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
     for (auto [index, argument] : llvm::enumerate(positional)) {
       if (index < positionalNodeOffset)
         continue;
-      unsigned logicalIndex = static_cast<unsigned>(index) -
-                              positionalNodeOffset;
+      unsigned logicalIndex =
+          static_cast<unsigned>(index) - positionalNodeOffset;
       if (logicalIndex >= sig.positionalTypes.size() ||
           logicalIndex >= entry->getNumArguments())
         break;
       llvm::StringRef name = ast::nameSpelling(*argument);
-      values[name] =
-          Value{entry->getArgument(logicalIndex),
-                sig.positionalTypes[logicalIndex]};
+      values[name] = Value{entry->getArgument(logicalIndex),
+                           sig.positionalTypes[logicalIndex]};
       types.bindSymbol(name, sig.positionalTypes[logicalIndex]);
     }
     if (const auto *kwonly = ast::nodeList(*arguments, "kwonlyargs")) {
@@ -142,17 +141,15 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
   builder.setInsertionPointToStart(entry);
   if (preboundTypeObjectName && preboundTypeObject) {
     mlir::Type classType = types.typeObject(preboundTypeObject);
-    auto typeObject =
-        builder.create<py::TypeObjectOp>(loc(callable), classType,
-                                         preboundTypeObject);
-    values[*preboundTypeObjectName] =
-        Value{typeObject.getResult(), classType};
+    auto typeObject = py::TypeObjectOp::create(builder, loc(callable),
+                                               classType, preboundTypeObject);
+    values[*preboundTypeObjectName] = Value{typeObject.getResult(), classType};
     types.bindSymbol(*preboundTypeObjectName, classType);
   }
   if (isLambda) {
     Value body = coerceValue(emitExpr(ast::node(callable, "body")),
                              currentReturnType, callable);
-    builder.create<mlir::func::ReturnOp>(loc(callable), body.value);
+    mlir::func::ReturnOp::create(builder, loc(callable), body.value);
   } else {
     emitStatements(ast::nodeList(callable, "body"));
   }
@@ -161,9 +158,9 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
       if (!currentReturnType || py::isPyType(currentReturnType))
         return false;
       if (auto integer = mlir::dyn_cast<mlir::IntegerType>(currentReturnType)) {
-        auto zero = builder.create<mlir::arith::ConstantIntOp>(
-            loc(callable), 0, integer.getWidth());
-        builder.create<mlir::func::ReturnOp>(loc(callable), zero.getResult());
+        auto zero = mlir::arith::ConstantIntOp::create(builder, loc(callable),
+                                                       0, integer.getWidth());
+        mlir::func::ReturnOp::create(builder, loc(callable), zero.getResult());
         return true;
       }
       return false;
@@ -181,7 +178,7 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
     }
     Value none = emitNone(callable);
     Value result = coerceValue(none, currentReturnType, callable);
-    builder.create<mlir::func::ReturnOp>(loc(callable), result.value);
+    mlir::func::ReturnOp::create(builder, loc(callable), result.value);
   }
 }
 

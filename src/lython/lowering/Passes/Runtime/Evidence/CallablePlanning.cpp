@@ -602,7 +602,7 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeArityObject(
                << contractName;
       bundle.mappingValues.append(elements.begin(), elements.end());
       mlir::Value present =
-          builder.create<mlir::arith::ConstantIntOp>(op->getLoc(), 1, 1)
+          mlir::arith::ConstantIntOp::create(builder, op->getLoc(), 1, 1)
               .getResult();
       for (std::size_t index = 0; index < keys.size(); ++index)
         bundle.mappingPresent.push_back(present);
@@ -621,9 +621,8 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeArityObject(
 
   builder.setInsertionPoint(op);
   mlir::Value length =
-      builder
-          .create<mlir::arith::ConstantIntOp>(
-              op->getLoc(), static_cast<std::int64_t>(arity), 64)
+      mlir::arith::ConstantIntOp::create(builder, op->getLoc(),
+                                         static_cast<std::int64_t>(arity), 64)
           .getResult();
   mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
       op->getLoc(), *initializer, mlir::ValueRange{length});
@@ -640,7 +639,7 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeArityObject(
                              << contractName;
     bundle.mappingValues.append(elements.begin(), elements.end());
     mlir::Value present =
-        builder.create<mlir::arith::ConstantIntOp>(op->getLoc(), 1, 1)
+        mlir::arith::ConstantIntOp::create(builder, op->getLoc(), 1, 1)
             .getResult();
     for (std::size_t index = 0; index < keys.size(); ++index)
       bundle.mappingPresent.push_back(present);

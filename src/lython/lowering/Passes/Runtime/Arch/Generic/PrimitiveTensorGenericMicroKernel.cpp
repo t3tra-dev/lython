@@ -25,12 +25,11 @@ std::optional<mlir::Value> createPrimitiveMul(mlir::OpBuilder &builder,
   mlir::Type elementType =
       vectorType ? vectorType.getElementType() : lhs.getType();
   if (mlir::isa<mlir::FloatType>(elementType))
-    return builder
-        .create<mlir::arith::MulFOp>(loc, lhs, rhs,
-                                     mlir::arith::FastMathFlags::contract)
+    return mlir::arith::MulFOp::create(builder, loc, lhs, rhs,
+                                       mlir::arith::FastMathFlags::contract)
         .getResult();
   if (mlir::isa<mlir::IntegerType>(elementType))
-    return builder.create<mlir::arith::MulIOp>(loc, lhs, rhs).getResult();
+    return mlir::arith::MulIOp::create(builder, loc, lhs, rhs).getResult();
   return std::nullopt;
 }
 
@@ -42,12 +41,11 @@ std::optional<mlir::Value> createPrimitiveAdd(mlir::OpBuilder &builder,
   mlir::Type elementType =
       vectorType ? vectorType.getElementType() : lhs.getType();
   if (mlir::isa<mlir::FloatType>(elementType))
-    return builder
-        .create<mlir::arith::AddFOp>(loc, lhs, rhs,
-                                     mlir::arith::FastMathFlags::contract)
+    return mlir::arith::AddFOp::create(builder, loc, lhs, rhs,
+                                       mlir::arith::FastMathFlags::contract)
         .getResult();
   if (mlir::isa<mlir::IntegerType>(elementType))
-    return builder.create<mlir::arith::AddIOp>(loc, lhs, rhs).getResult();
+    return mlir::arith::AddIOp::create(builder, loc, lhs, rhs).getResult();
   return std::nullopt;
 }
 
@@ -59,7 +57,7 @@ createPrimitiveFusedMultiplyAdd(mlir::OpBuilder &builder, mlir::Location loc,
   mlir::Type elementType =
       vectorType ? vectorType.getElementType() : lhs.getType();
   if (mlir::isa<mlir::FloatType>(elementType))
-    return builder.create<mlir::vector::FMAOp>(loc, lhs, rhs, acc).getResult();
+    return mlir::vector::FMAOp::create(builder, loc, lhs, rhs, acc).getResult();
 
   std::optional<mlir::Value> product =
       createPrimitiveMul(builder, loc, lhs, rhs);
@@ -70,32 +68,31 @@ createPrimitiveFusedMultiplyAdd(mlir::OpBuilder &builder, mlir::Location loc,
 
 mlir::Value createIndexConstant(mlir::OpBuilder &builder, mlir::Location loc,
                                 int64_t value) {
-  return builder.create<mlir::arith::ConstantIndexOp>(loc, value).getResult();
+  return mlir::arith::ConstantIndexOp::create(builder, loc, value).getResult();
 }
 
 mlir::Value addIndexOffset(mlir::OpBuilder &builder, mlir::Location loc,
                            mlir::Value base, int64_t offset) {
   if (offset == 0)
     return base;
-  return builder
-      .create<mlir::arith::AddIOp>(
-          loc, base, builder.create<mlir::arith::ConstantIndexOp>(loc, offset))
+  return mlir::arith::AddIOp::create(
+             builder, loc, base,
+             mlir::arith::ConstantIndexOp::create(builder, loc, offset))
       .getResult();
 }
 
 mlir::Value createZeroVector(mlir::OpBuilder &builder, mlir::Location loc,
                              mlir::VectorType rowVectorType,
                              mlir::Value scalarZero) {
-  return builder.create<mlir::vector::BroadcastOp>(loc, rowVectorType,
-                                                   scalarZero);
+  return mlir::vector::BroadcastOp::create(builder, loc, rowVectorType,
+                                           scalarZero);
 }
 
 mlir::Value loadAccumulatorRow(mlir::OpBuilder &builder, mlir::Location loc,
                                mlir::Value out, mlir::VectorType rowVectorType,
                                mlir::Value rowIndex, mlir::Value columnIndex) {
-  return builder
-      .create<mlir::vector::LoadOp>(loc, rowVectorType, out,
-                                    mlir::ValueRange{rowIndex, columnIndex})
+  return mlir::vector::LoadOp::create(builder, loc, rowVectorType, out,
+                                      mlir::ValueRange{rowIndex, columnIndex})
       .getResult();
 }
 
@@ -119,9 +116,9 @@ createFirstReductionTilePredicate(mlir::OpBuilder &builder, mlir::Location loc,
   if (!reductionOffset)
     return std::nullopt;
   mlir::Value zero = createIndexConstant(builder, loc, 0);
-  return builder
-      .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::eq,
-                                   *reductionOffset, zero)
+  return mlir::arith::CmpIOp::create(builder, loc,
+                                     mlir::arith::CmpIPredicate::eq,
+                                     *reductionOffset, zero)
       .getResult();
 }
 
@@ -133,7 +130,7 @@ void yieldZeroAccumulatorRows(mlir::OpBuilder &builder, mlir::Location loc,
   zeros.reserve(rowIndices.size());
   for ([[maybe_unused]] mlir::Value rowIndex : rowIndices)
     zeros.push_back(createZeroVector(builder, loc, rowVectorType, padding));
-  builder.create<mlir::scf::YieldOp>(loc, zeros);
+  mlir::scf::YieldOp::create(builder, loc, zeros);
 }
 
 void yieldLoadedAccumulatorRows(mlir::OpBuilder &builder, mlir::Location loc,
@@ -141,7 +138,7 @@ void yieldLoadedAccumulatorRows(mlir::OpBuilder &builder, mlir::Location loc,
                                 llvm::ArrayRef<mlir::Value> rowIndices) {
   llvm::SmallVector<mlir::Value, 8> loaded;
   loadAccumulatorRows(builder, loc, out, rowVectorType, rowIndices, loaded);
-  builder.create<mlir::scf::YieldOp>(loc, loaded);
+  mlir::scf::YieldOp::create(builder, loc, loaded);
 }
 
 mlir::LogicalResult initializeAccumulatorRows(
@@ -163,8 +160,9 @@ mlir::LogicalResult initializeAccumulatorRows(
 
     llvm::SmallVector<mlir::Type, 8> resultTypes(rowIndices.size(),
                                                  rowVectorType);
-    auto ifOp = rewriter.create<mlir::scf::IfOp>(
-        loc, resultTypes, *firstReductionTile, /*withElseRegion=*/true);
+    auto ifOp =
+        mlir::scf::IfOp::create(rewriter, loc, resultTypes, *firstReductionTile,
+                                /*withElseRegion=*/true);
     {
       mlir::OpBuilder::InsertionGuard guard(rewriter);
       rewriter.setInsertionPointToStart(&ifOp.getThenRegion().front());
@@ -189,19 +187,17 @@ accumulateKStep(mlir::OpBuilder &builder, mlir::Location loc, mlir::Value lhs,
                 mlir::VectorType rowVectorType,
                 llvm::ArrayRef<mlir::Value> rowIndices, mlir::Value kIndex) {
   mlir::Value b =
-      builder
-          .create<mlir::vector::LoadOp>(loc, rowVectorType, rhs,
-                                        mlir::ValueRange{kIndex, rowIndices[0]})
+      mlir::vector::LoadOp::create(builder, loc, rowVectorType, rhs,
+                                   mlir::ValueRange{kIndex, rowIndices[0]})
           .getResult();
 
   for (auto [row, rowIndex] :
        llvm::enumerate(rowIndices.take_front(acc.size()))) {
-    mlir::Value a = builder
-                        .create<mlir::memref::LoadOp>(
-                            loc, lhs, mlir::ValueRange{rowIndex, kIndex})
+    mlir::Value a = mlir::memref::LoadOp::create(
+                        builder, loc, lhs, mlir::ValueRange{rowIndex, kIndex})
                         .getResult();
     mlir::Value splat =
-        builder.create<mlir::vector::BroadcastOp>(loc, rowVectorType, a);
+        mlir::vector::BroadcastOp::create(builder, loc, rowVectorType, a);
     std::optional<mlir::Value> sum =
         createPrimitiveFusedMultiplyAdd(builder, loc, splat, b, acc[row]);
     if (!sum)
@@ -286,8 +282,8 @@ mlir::LogicalResult lowerMatmulMicroKernel(mlir::linalg::MatmulOp matmul,
     mlir::Value lower = createIndexConstant(rewriter, loc, 0);
     mlir::Value upper = createIndexConstant(rewriter, loc, unrolledLimit);
     mlir::Value step = createIndexConstant(rewriter, loc, kRegisterKUnroll);
-    auto kLoop = rewriter.create<mlir::scf::ForOp>(
-        loc, lower, upper, step, acc,
+    auto kLoop = mlir::scf::ForOp::create(
+        rewriter, loc, lower, upper, step, acc,
         [&](mlir::OpBuilder &builder, mlir::Location nestedLoc, mlir::Value iv,
             mlir::ValueRange iterArgs) {
           llvm::SmallVector<mlir::Value, 8> loopAcc(iterArgs.begin(),
@@ -297,7 +293,7 @@ mlir::LogicalResult lowerMatmulMicroKernel(mlir::linalg::MatmulOp matmul,
                 builder, nestedLoc, lhs, rhs, loopAcc, rowVectorType,
                 indexConstants, addIndexOffset(builder, nestedLoc, iv, offset));
           }
-          builder.create<mlir::scf::YieldOp>(nestedLoc, loopAcc);
+          mlir::scf::YieldOp::create(builder, nestedLoc, loopAcc);
         });
 
     for (int64_t row = 0; row < microM; ++row)
@@ -310,8 +306,8 @@ mlir::LogicalResult lowerMatmulMicroKernel(mlir::linalg::MatmulOp matmul,
     return mlir::failure();
 
   for (int64_t row = 0; row < microM; ++row) {
-    rewriter.create<mlir::vector::StoreOp>(
-        loc, acc[row], out,
+    mlir::vector::StoreOp::create(
+        rewriter, loc, acc[row], out,
         mlir::ValueRange{indexConstants[row], indexConstants[0]});
   }
 

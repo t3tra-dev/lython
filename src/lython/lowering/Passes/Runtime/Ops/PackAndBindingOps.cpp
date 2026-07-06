@@ -271,16 +271,15 @@ RuntimeBundleLowerer::lowerFunctionBindingRef(py::BindingRefOp op,
 
   builder.setInsertionPoint(op);
   llvm::SmallVector<mlir::Value, 6> operands;
-  operands.push_back(builder
-                         .create<mlir::arith::ConstantIntOp>(
-                             op.getLoc(),
-                             RuntimeBundleLowerer::functionTargetId(
-                                 targetFunction.getSymName()),
-                             64)
-                         .getResult());
+  operands.push_back(
+      mlir::arith::ConstantIntOp::create(
+          builder, op.getLoc(),
+          RuntimeBundleLowerer::functionTargetId(targetFunction.getSymName()),
+          64)
+          .getResult());
   for (unsigned index = 0; index < 5; ++index)
     operands.push_back(
-        builder.create<mlir::arith::ConstantIntOp>(op.getLoc(), 0, 64)
+        mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 0, 64)
             .getResult());
 
   mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(

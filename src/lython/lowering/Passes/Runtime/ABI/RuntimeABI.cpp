@@ -1,5 +1,5 @@
-#include "Runtime/Core/Lowerer.h"
 #include "Ownership.h"
+#include "Runtime/Core/Lowerer.h"
 
 #include "PyTypeObject.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -89,30 +89,29 @@ mlir::LogicalResult zeroInitializeMemRef(mlir::OpBuilder &builder,
   if (!memrefType || memrefType.getRank() != 1)
     return mlir::failure();
 
-  auto zeroAttr =
-      mlir::dyn_cast_if_present<mlir::TypedAttr>(
-          builder.getZeroAttr(memrefType.getElementType()));
+  auto zeroAttr = mlir::dyn_cast_if_present<mlir::TypedAttr>(
+      builder.getZeroAttr(memrefType.getElementType()));
   if (!zeroAttr)
     return mlir::failure();
 
-  mlir::Value zeroIndex = builder.create<mlir::arith::ConstantIndexOp>(loc, 0);
+  mlir::Value zeroIndex = mlir::arith::ConstantIndexOp::create(builder, loc, 0);
   mlir::Value upper =
       memrefType.hasStaticShape()
-          ? builder.create<mlir::arith::ConstantIndexOp>(
-                loc, memrefType.getDimSize(0))
+          ? mlir::arith::ConstantIndexOp::create(builder, loc,
+                                                 memrefType.getDimSize(0))
                 .getResult()
-          : builder.create<mlir::memref::DimOp>(loc, memref, zeroIndex)
+          : mlir::memref::DimOp::create(builder, loc, memref, zeroIndex)
                 .getResult();
-  mlir::Value step = builder.create<mlir::arith::ConstantIndexOp>(loc, 1);
-  mlir::Value zeroValue = builder.create<mlir::arith::ConstantOp>(
-      loc, memrefType.getElementType(), zeroAttr);
+  mlir::Value step = mlir::arith::ConstantIndexOp::create(builder, loc, 1);
+  mlir::Value zeroValue = mlir::arith::ConstantOp::create(
+      builder, loc, memrefType.getElementType(), zeroAttr);
 
   mlir::scf::ForOp loop =
-      builder.create<mlir::scf::ForOp>(loc, zeroIndex, upper, step);
+      mlir::scf::ForOp::create(builder, loc, zeroIndex, upper, step);
   mlir::OpBuilder::InsertionGuard guard(builder);
   builder.setInsertionPointToStart(loop.getBody());
-  builder.create<mlir::memref::StoreOp>(loc, zeroValue, memref,
-                                        loop.getInductionVar());
+  mlir::memref::StoreOp::create(builder, loc, zeroValue, memref,
+                                loop.getInductionVar());
   return mlir::success();
 }
 
@@ -124,15 +123,16 @@ bool isRankOneI64MemRef(mlir::Type type) {
   return element && element.getWidth() == 64;
 }
 
-mlir::FailureOr<mlir::Value>
-viewRankOneI64Prefix(mlir::Operation *op, mlir::OpBuilder &builder,
-                     mlir::Value source, mlir::Type targetType,
-                     llvm::StringRef label) {
+mlir::FailureOr<mlir::Value> viewRankOneI64Prefix(mlir::Operation *op,
+                                                  mlir::OpBuilder &builder,
+                                                  mlir::Value source,
+                                                  mlir::Type targetType,
+                                                  llvm::StringRef label) {
   if (source.getType() == targetType)
     return source;
   if (compatibleMemRefView(source.getType(), targetType))
-    return builder
-        .create<mlir::memref::CastOp>(op->getLoc(), targetType, source)
+    return mlir::memref::CastOp::create(builder, op->getLoc(), targetType,
+                                        source)
         .getResult();
 
   auto sourceMemRef = mlir::dyn_cast<mlir::MemRefType>(source.getType());
@@ -155,14 +155,13 @@ viewRankOneI64Prefix(mlir::Operation *op, mlir::OpBuilder &builder,
         mlir::memref::SubViewOp::inferRankReducedResultType(
             resultShape, sourceMemRef, offsets, sizes, strides));
     mlir::Value view =
-        builder
-            .create<mlir::memref::SubViewOp>(op->getLoc(), inferredType,
-                                             source, offsets, sizes, strides)
+        mlir::memref::SubViewOp::create(builder, op->getLoc(), inferredType,
+                                        source, offsets, sizes, strides)
             .getResult();
     if (view.getType() == targetMemRef)
       return view;
-    return builder
-        .create<mlir::memref::CastOp>(op->getLoc(), targetMemRef, view)
+    return mlir::memref::CastOp::create(builder, op->getLoc(), targetMemRef,
+                                        view)
         .getResult();
   }
 
@@ -207,9 +206,8 @@ void appendClassContractCandidate(llvm::SmallVectorImpl<std::string> &out,
                                   llvm::StringRef candidate) {
   if (candidate.empty())
     return;
-  if (llvm::any_of(out, [&](llvm::StringRef existing) {
-        return existing == candidate;
-      }))
+  if (llvm::any_of(
+          out, [&](llvm::StringRef existing) { return existing == candidate; }))
     return;
   out.push_back(candidate.str());
 }
@@ -276,8 +274,8 @@ normalizeRuntimeValueOwnership(mlir::Type contract,
     return own::logicalOwnershipKind(contract, /*ownsObject=*/false);
   if (requested == own::OwnershipKind::Own)
     return own::logicalOwnershipKind(contract, /*ownsObject=*/true);
-  return own::logicalOwnershipKind(
-      contract, /*ownsObject=*/requested == own::OwnershipKind::Own);
+  return own::logicalOwnershipKind(contract, /*ownsObject=*/requested ==
+                                                 own::OwnershipKind::Own);
 }
 
 mlir::func::FuncOp findObjectStorageReleaseToZero(mlir::ModuleOp module) {
@@ -292,9 +290,10 @@ mlir::func::FuncOp findObjectStorageReleaseToZero(mlir::ModuleOp module) {
   return releaseToZero;
 }
 
-mlir::FailureOr<mlir::Value>
-storageForReleaseToZero(mlir::Operation *op, mlir::OpBuilder &builder,
-                        mlir::Value storage, mlir::Type targetType) {
+mlir::FailureOr<mlir::Value> storageForReleaseToZero(mlir::Operation *op,
+                                                     mlir::OpBuilder &builder,
+                                                     mlir::Value storage,
+                                                     mlir::Type targetType) {
   if (storage.getType() == targetType)
     return storage;
   auto sourceMemRef = mlir::dyn_cast<mlir::MemRefType>(storage.getType());
@@ -305,8 +304,8 @@ storageForReleaseToZero(mlir::Operation *op, mlir::OpBuilder &builder,
       sourceMemRef.getMemorySpace() != targetMemRef.getMemorySpace())
     return op->emitError() << "source class storage " << storage.getType()
                            << " cannot be released through " << targetType;
-  return builder
-      .create<mlir::memref::CastOp>(op->getLoc(), targetType, storage)
+  return mlir::memref::CastOp::create(builder, op->getLoc(), targetType,
+                                      storage)
       .getResult();
 }
 
@@ -331,25 +330,25 @@ void initializeObjectHeader(mlir::OpBuilder &builder, mlir::Location loc,
   if (memref.hasStaticShape() && memref.getDimSize(0) < 2)
     return;
 
-  mlir::Value zeroIndex = builder.create<mlir::arith::ConstantIndexOp>(loc, 0);
-  mlir::Value oneIndex = builder.create<mlir::arith::ConstantIndexOp>(loc, 1);
+  mlir::Value zeroIndex = mlir::arith::ConstantIndexOp::create(builder, loc, 0);
+  mlir::Value oneIndex = mlir::arith::ConstantIndexOp::create(builder, loc, 1);
   mlir::Value refcountValue =
-      builder.create<mlir::arith::ConstantIntOp>(loc, refcount, 64);
+      mlir::arith::ConstantIntOp::create(builder, loc, refcount, 64);
   mlir::Value classIdValue =
-      builder.create<mlir::arith::ConstantIntOp>(loc, classId, 64);
-  builder.create<mlir::memref::StoreOp>(loc, refcountValue, header, zeroIndex);
-  builder.create<mlir::memref::StoreOp>(loc, classIdValue, header, oneIndex);
+      mlir::arith::ConstantIntOp::create(builder, loc, classId, 64);
+  mlir::memref::StoreOp::create(builder, loc, refcountValue, header, zeroIndex);
+  mlir::memref::StoreOp::create(builder, loc, classIdValue, header, oneIndex);
   if (!memref.hasStaticShape() || memref.getDimSize(0) >= 4) {
     mlir::Value zeroValue =
-        builder.create<mlir::arith::ConstantIntOp>(loc, 0, 64);
+        mlir::arith::ConstantIntOp::create(builder, loc, 0, 64);
     mlir::Value payloadHeaderIndex =
-        builder.create<mlir::arith::ConstantIndexOp>(loc, 2);
+        mlir::arith::ConstantIndexOp::create(builder, loc, 2);
     mlir::Value payloadClassIndex =
-        builder.create<mlir::arith::ConstantIndexOp>(loc, 3);
-    builder.create<mlir::memref::StoreOp>(loc, zeroValue, header,
-                                          payloadHeaderIndex);
-    builder.create<mlir::memref::StoreOp>(loc, zeroValue, header,
-                                          payloadClassIndex);
+        mlir::arith::ConstantIndexOp::create(builder, loc, 3);
+    mlir::memref::StoreOp::create(builder, loc, zeroValue, header,
+                                  payloadHeaderIndex);
+    mlir::memref::StoreOp::create(builder, loc, zeroValue, header,
+                                  payloadClassIndex);
   }
 }
 
@@ -377,9 +376,8 @@ RuntimeBundleLowerer::runtimeClassIdForClass(py::ClassOp classOp) const {
   mutableModule.walk([&](py::ClassOp current) {
     if (result)
       return;
-    bool hasDeclaredRuntimeId =
-        current->getAttrOfType<mlir::IntegerAttr>(kManifestClassIdAttr) !=
-        nullptr;
+    bool hasDeclaredRuntimeId = current->getAttrOfType<mlir::IntegerAttr>(
+                                    kManifestClassIdAttr) != nullptr;
     for (const std::string &candidate :
          classContractCandidates(current.getSymName())) {
       if (manifest.classId(candidate)) {
@@ -476,9 +474,9 @@ RuntimeValue RuntimeValue::object(mlir::Type contract, mlir::ValueRange values,
       contract, values, own::logicalOwnershipKind(contract, ownsObject));
 }
 
-RuntimeValue
-RuntimeValue::objectWithOwnership(mlir::Type contract, mlir::ValueRange values,
-                                  own::OwnershipKind ownership) {
+RuntimeValue RuntimeValue::objectWithOwnership(mlir::Type contract,
+                                               mlir::ValueRange values,
+                                               own::OwnershipKind ownership) {
   RuntimeValue value;
   value.contract = contract;
   value.values.append(values.begin(), values.end());
@@ -490,8 +488,7 @@ std::string RuntimeValue::contractName() const {
   return runtimeContractName(contract);
 }
 
-RuntimeValue
-RuntimeValue::withOwnership(own::OwnershipKind ownership) const {
+RuntimeValue RuntimeValue::withOwnership(own::OwnershipKind ownership) const {
   RuntimeValue value = *this;
   value.ownership = normalizeRuntimeValueOwnership(contract, ownership);
   return value;
@@ -535,9 +532,9 @@ RuntimeBundle RuntimeBundle::object(mlir::Type contract,
       contract, values, own::logicalOwnershipKind(contract, true));
 }
 
-RuntimeBundle
-RuntimeBundle::objectWithOwnership(mlir::Type contract, mlir::ValueRange values,
-                                   own::OwnershipKind ownership) {
+RuntimeBundle RuntimeBundle::objectWithOwnership(mlir::Type contract,
+                                                 mlir::ValueRange values,
+                                                 own::OwnershipKind ownership) {
   RuntimeBundle bundle;
   bundle.kind = Kind::Object;
   bundle.contract = contract;
@@ -625,8 +622,8 @@ void RuntimeBundle::setObjectOwnership(own::OwnershipKind ownership) {
 }
 
 void RuntimeBundle::setObjectLogicalOwnership(bool ownsObject) {
-  setObjectOwnership(own::logicalOwnershipKind(objectValue.contract,
-                                               ownsObject));
+  setObjectOwnership(
+      own::logicalOwnershipKind(objectValue.contract, ownsObject));
 }
 
 RuntimeBundle
@@ -670,10 +667,8 @@ const RuntimeBundle *RuntimeBundleLowerer::concreteObjectForOwnership(
   return current;
 }
 
-mlir::FailureOr<RuntimeBundle>
-RuntimeBundleLowerer::boxRuntimeObject(mlir::Operation *op,
-                                       const RuntimeBundle &source,
-                                       bool retainPayload) {
+mlir::FailureOr<RuntimeBundle> RuntimeBundleLowerer::boxRuntimeObject(
+    mlir::Operation *op, const RuntimeBundle &source, bool retainPayload) {
   builder.setInsertionPoint(op);
   return RuntimeBundleLowerer::boxRuntimeObjectAtCurrentInsertion(
       op, source, retainPayload);
@@ -701,7 +696,7 @@ RuntimeBundleLowerer::boxRuntimeObjectAtCurrentInsertion(
   mlir::Location loc = op->getLoc();
   auto boxType = mlir::MemRefType::get({16}, builder.getI64Type());
   mlir::Value box =
-      builder.create<mlir::memref::AllocOp>(loc, boxType).getResult();
+      mlir::memref::AllocOp::create(builder, loc, boxType).getResult();
   box.getDefiningOp()->setAttr(own::kObjectHeaderAttr, builder.getUnitAttr());
 
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
@@ -710,19 +705,17 @@ RuntimeBundleLowerer::boxRuntimeObjectAtCurrentInsertion(
   if (mlir::failed(words))
     return mlir::failure();
   for (auto [index, word] : llvm::enumerate(*words)) {
-    mlir::Value slot = builder.create<mlir::arith::ConstantIndexOp>(
-        loc, static_cast<std::int64_t>(index));
-    builder.create<mlir::memref::StoreOp>(loc, word, box, slot);
+    mlir::Value slot = mlir::arith::ConstantIndexOp::create(
+        builder, loc, static_cast<std::int64_t>(index));
+    mlir::memref::StoreOp::create(builder, loc, word, box, slot);
   }
-  if (retainPayload &&
-      mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
-          op, concrete, "boxed.object.payload")))
+  if (retainPayload && mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
+                           op, concrete, "boxed.object.payload")))
     return mlir::failure();
   concrete.setObjectLogicalOwnership(retainPayload);
 
   RuntimeBundle boxed = RuntimeBundle::object(
-      runtimeContractType(context, "builtins.object"),
-      mlir::ValueRange{box});
+      runtimeContractType(context, "builtins.object"), mlir::ValueRange{box});
   boxed.boxedObject = std::make_shared<RuntimeBundle>(std::move(concrete));
   return boxed;
 }
@@ -750,8 +743,8 @@ mlir::FailureOr<mlir::Value> RuntimeBundleLowerer::erasedObjectStorageView(
     return op->emitError() << "erased runtime object storage target must be "
                               "dynamically sized, got "
                            << targetType;
-  return builder
-      .create<mlir::memref::CastOp>(op->getLoc(), targetMemRef, storage)
+  return mlir::memref::CastOp::create(builder, op->getLoc(), targetMemRef,
+                                      storage)
       .getResult();
 }
 
@@ -781,16 +774,14 @@ RuntimeBundleLowerer::materializeDeadPhysicalValue(mlir::Operation *op,
                                                    mlir::Type type) {
   mlir::Location loc = op->getLoc();
   if (mlir::isa<mlir::IndexType>(type))
-    return builder.create<mlir::arith::ConstantIndexOp>(loc, 0).getResult();
+    return mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult();
   if (mlir::isa<mlir::IntegerType>(type))
-    return builder
-        .create<mlir::arith::ConstantOp>(loc, type,
-                                         builder.getIntegerAttr(type, 0))
+    return mlir::arith::ConstantOp::create(builder, loc, type,
+                                           builder.getIntegerAttr(type, 0))
         .getResult();
   if (mlir::isa<mlir::FloatType>(type))
-    return builder
-        .create<mlir::arith::ConstantOp>(loc, type,
-                                         builder.getFloatAttr(type, 0.0))
+    return mlir::arith::ConstantOp::create(builder, loc, type,
+                                           builder.getFloatAttr(type, 0.0))
         .getResult();
 
   if (auto memrefType = mlir::dyn_cast<mlir::MemRefType>(type)) {
@@ -803,15 +794,15 @@ RuntimeBundleLowerer::materializeDeadPhysicalValue(mlir::Operation *op,
     for (std::int64_t extent : shape)
       if (extent == mlir::ShapedType::kDynamic)
         dynamicSizes.push_back(
-            builder.create<mlir::arith::ConstantIndexOp>(loc, 1));
+            mlir::arith::ConstantIndexOp::create(builder, loc, 1));
     mlir::Value allocated =
-        builder.create<mlir::memref::AllocOp>(loc, allocType, dynamicSizes)
+        mlir::memref::AllocOp::create(builder, loc, allocType, dynamicSizes)
             .getResult();
     if (mlir::failed(zeroInitializeMemRef(builder, loc, allocated)))
       return mlir::failure();
     if (allocated.getType() == type)
       return allocated;
-    return builder.create<mlir::memref::CastOp>(loc, type, allocated)
+    return mlir::memref::CastOp::create(builder, loc, type, allocated)
         .getResult();
   }
 
@@ -825,16 +816,14 @@ static mlir::FailureOr<mlir::Value> materializeStaticDeadPhysicalValue(
     mlir::Type type, bool objectHeader) {
   mlir::Location loc = op->getLoc();
   if (mlir::isa<mlir::IndexType>(type))
-    return builder.create<mlir::arith::ConstantIndexOp>(loc, 0).getResult();
+    return mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult();
   if (mlir::isa<mlir::IntegerType>(type))
-    return builder
-        .create<mlir::arith::ConstantOp>(loc, type,
-                                         builder.getIntegerAttr(type, 0))
+    return mlir::arith::ConstantOp::create(builder, loc, type,
+                                           builder.getIntegerAttr(type, 0))
         .getResult();
   if (mlir::isa<mlir::FloatType>(type))
-    return builder
-        .create<mlir::arith::ConstantOp>(loc, type,
-                                         builder.getFloatAttr(type, 0.0))
+    return mlir::arith::ConstantOp::create(builder, loc, type,
+                                           builder.getFloatAttr(type, 0.0))
         .getResult();
 
   auto memrefType = mlir::dyn_cast<mlir::MemRefType>(type);
@@ -845,9 +834,9 @@ static mlir::FailureOr<mlir::Value> materializeStaticDeadPhysicalValue(
            << type;
 
   mlir::MemRefType globalType = concreteDeadMemRefType(memrefType);
-  std::string name = (objectHeader ? "__ly_dead_header_"
-                                   : "__ly_dead_payload_") +
-                     typeSymbolComponent(globalType);
+  std::string name =
+      (objectHeader ? "__ly_dead_header_" : "__ly_dead_payload_") +
+      typeSymbolComponent(globalType);
   if (!module.lookupSymbol<mlir::memref::GlobalOp>(name)) {
     mlir::Attribute initialValue =
         deadMemRefInitialValue(builder, globalType, objectHeader);
@@ -858,17 +847,18 @@ static mlir::FailureOr<mlir::Value> materializeStaticDeadPhysicalValue(
 
     mlir::OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToStart(module.getBody());
-    builder.create<mlir::memref::GlobalOp>(
-        loc, name, builder.getStringAttr("private"), globalType, initialValue,
-        /*constant=*/true, /*alignment=*/nullptr);
+    mlir::memref::GlobalOp::create(builder, loc, name,
+                                   builder.getStringAttr("private"), globalType,
+                                   initialValue,
+                                   /*constant=*/true, /*alignment=*/nullptr);
   }
 
   mlir::Value global =
-      builder.create<mlir::memref::GetGlobalOp>(loc, globalType, name)
+      mlir::memref::GetGlobalOp::create(builder, loc, globalType, name)
           .getResult();
   if (global.getType() == type)
     return global;
-  return builder.create<mlir::memref::CastOp>(loc, type, global).getResult();
+  return mlir::memref::CastOp::create(builder, loc, type, global).getResult();
 }
 
 mlir::FailureOr<RuntimeValue>
@@ -941,10 +931,10 @@ mlir::FailureOr<RuntimeValue> RuntimeBundleLowerer::materializeClassObjectValue(
       shape, headerType.getElementType(), mlir::MemRefLayoutAttrInterface{},
       headerType.getMemorySpace());
   mlir::Value allocated =
-      builder.create<mlir::memref::AllocOp>(loc, allocType).getResult();
+      mlir::memref::AllocOp::create(builder, loc, allocType).getResult();
   mlir::Value header = allocated;
   if (allocated.getType() != headerType)
-    header = builder.create<mlir::memref::CastOp>(loc, headerType, allocated)
+    header = mlir::memref::CastOp::create(builder, loc, headerType, allocated)
                  .getResult();
 
   std::optional<std::int64_t> classId =
@@ -953,11 +943,11 @@ mlir::FailureOr<RuntimeValue> RuntimeBundleLowerer::materializeClassObjectValue(
     return op->emitError() << "class " << classOp.getSymName()
                            << " has no runtime class id for " << purpose;
   initializeObjectHeader(builder, loc, header, /*refcount=*/1,
-                         /*classId=*/ *classId);
+                         /*classId=*/*classId);
 
   llvm::SmallVector<mlir::Type, 8> fieldContractTypes =
       RuntimeBundleLowerer::classFieldContractTypes(classOp);
-  mlir::Value zeroI64 = builder.create<mlir::arith::ConstantIntOp>(loc, 0, 64);
+  mlir::Value zeroI64 = mlir::arith::ConstantIntOp::create(builder, loc, 0, 64);
   for (auto [fieldIndex, fieldType] : llvm::enumerate(fieldContractTypes)) {
     if (runtimeContractName(fieldType) != "builtins.int")
       continue;
@@ -965,8 +955,8 @@ mlir::FailureOr<RuntimeValue> RuntimeBundleLowerer::materializeClassObjectValue(
     if (slot >= kPrimitiveFieldSlotLimit)
       continue;
     mlir::Value slotIndex =
-        builder.create<mlir::arith::ConstantIndexOp>(loc, slot);
-    builder.create<mlir::memref::StoreOp>(loc, zeroI64, header, slotIndex);
+        mlir::arith::ConstantIndexOp::create(builder, loc, slot);
+    mlir::memref::StoreOp::create(builder, loc, zeroI64, header, slotIndex);
   }
 
   llvm::SmallVector<mlir::Value, 8> values{header};
@@ -981,12 +971,11 @@ mlir::FailureOr<RuntimeValue> RuntimeBundleLowerer::materializeClassObjectValue(
 
   if (headerType.hasStaticShape() && headerType.getDimSize(0) >= 3) {
     mlir::Value valueCountSlot =
-        builder.create<mlir::arith::ConstantIndexOp>(loc, 2);
-    mlir::Value valueCount =
-        builder.create<mlir::arith::ConstantIntOp>(
-            loc, static_cast<std::int64_t>(values.size()), 64);
-    builder.create<mlir::memref::StoreOp>(loc, valueCount, header,
-                                          valueCountSlot);
+        mlir::arith::ConstantIndexOp::create(builder, loc, 2);
+    mlir::Value valueCount = mlir::arith::ConstantIntOp::create(
+        builder, loc, static_cast<std::int64_t>(values.size()), 64);
+    mlir::memref::StoreOp::create(builder, loc, valueCount, header,
+                                  valueCountSlot);
   }
 
   return RuntimeValue::object(contract, values);
@@ -1060,8 +1049,8 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassDeallocators() {
     mlir::OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToEnd(module.getBody());
     auto functionType = builder.getFunctionType(*valueTypes, {});
-    mlir::func::FuncOp function = builder.create<mlir::func::FuncOp>(
-        module.getLoc(), functionName, functionType);
+    mlir::func::FuncOp function = mlir::func::FuncOp::create(
+        builder, module.getLoc(), functionName, functionType);
     function.setPrivate();
     function->setAttr(kManifestContractAttr, builder.getStringAttr(contract));
     function->setAttr(kManifestDeallocatorAttr, builder.getUnitAttr());
@@ -1097,10 +1086,10 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassDeallocators() {
                                 releaseToZero.getFunctionType().getInput(0));
     if (mlir::failed(storage))
       return mlir::failure();
-    mlir::func::CallOp releaseHeader = builder.create<mlir::func::CallOp>(
-        loc, releaseToZero, mlir::ValueRange{*storage});
-    builder.create<mlir::cf::CondBranchOp>(loc, releaseHeader.getResult(0),
-                                           deallocBlock, doneBlock);
+    mlir::func::CallOp releaseHeader = mlir::func::CallOp::create(
+        builder, loc, releaseToZero, mlir::ValueRange{*storage});
+    mlir::cf::CondBranchOp::create(builder, loc, releaseHeader.getResult(0),
+                                   deallocBlock, doneBlock);
 
     builder.setInsertionPointToStart(deallocBlock);
     for (auto [index, fieldType] : llvm::enumerate(plan.fieldTypes)) {
@@ -1119,13 +1108,13 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassDeallocators() {
     }
 
     auto dealloc =
-        builder.create<mlir::memref::DeallocOp>(loc, entry->getArgument(0));
+        mlir::memref::DeallocOp::create(builder, loc, entry->getArgument(0));
     dealloc->setAttr(own::kObjectDeallocPartAttr,
                      builder.getStringAttr("header"));
-    builder.create<mlir::cf::BranchOp>(loc, doneBlock);
+    mlir::cf::BranchOp::create(builder, loc, doneBlock);
 
     builder.setInsertionPointToStart(doneBlock);
-    builder.create<mlir::func::ReturnOp>(loc);
+    mlir::func::ReturnOp::create(builder, loc);
   }
 
   return mlir::success();
@@ -1136,11 +1125,11 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeStringObject(
   mlir::Location loc = op->getLoc();
   mlir::Value bytes = RuntimeBundleLowerer::materializeByteBuffer(loc, text);
   mlir::Value start =
-      builder.create<mlir::arith::ConstantIndexOp>(loc, 0).getResult();
-  mlir::Value length = builder
-                           .create<mlir::arith::ConstantIntOp>(
-                               loc, static_cast<std::int64_t>(text.size()), 64)
-                           .getResult();
+      mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult();
+  mlir::Value length =
+      mlir::arith::ConstantIntOp::create(
+          builder, loc, static_cast<std::int64_t>(text.size()), 64)
+          .getResult();
   return RuntimeBundleLowerer::initializeObjectFromRawValues(
       op, runtimeContractType(context, "builtins.str"),
       mlir::ValueRange{bytes, start, length}, bundle);
@@ -1184,9 +1173,8 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultObjectRepr(
   mlir::Value prefixBytes =
       RuntimeBundleLowerer::materializeByteBuffer(op->getLoc(), prefix);
   mlir::Value prefixLength =
-      builder
-          .create<mlir::arith::ConstantIntOp>(
-              op->getLoc(), static_cast<std::int64_t>(prefix.size()), 64)
+      mlir::arith::ConstantIntOp::create(
+          builder, op->getLoc(), static_cast<std::int64_t>(prefix.size()), 64)
           .getResult();
 
   mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(

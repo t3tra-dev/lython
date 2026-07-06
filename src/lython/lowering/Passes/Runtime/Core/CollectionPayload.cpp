@@ -19,13 +19,13 @@ bool isI64Payload(mlir::Value value) {
 
 mlir::Value constantI64(mlir::OpBuilder &builder, mlir::Location loc,
                         std::int64_t value) {
-  return builder.create<mlir::arith::ConstantIntOp>(loc, value, 64)
+  return mlir::arith::ConstantIntOp::create(builder, loc, value, 64)
       .getResult();
 }
 
 mlir::Value constantIndex(mlir::OpBuilder &builder, mlir::Location loc,
                           unsigned value) {
-  return builder.create<mlir::arith::ConstantIndexOp>(loc, value).getResult();
+  return mlir::arith::ConstantIndexOp::create(builder, loc, value).getResult();
 }
 
 constexpr unsigned kPayloadHandleWords = 16;
@@ -50,9 +50,9 @@ mlir::Value pointerWordForPhysicalValue(mlir::OpBuilder &builder,
   if (!memref || memref.getRank() != 1)
     return zero;
   mlir::Value pointerIndex =
-      builder.create<mlir::memref::ExtractAlignedPointerAsIndexOp>(loc, value);
-  return builder
-      .create<mlir::arith::IndexCastOp>(loc, builder.getI64Type(), pointerIndex)
+      mlir::memref::ExtractAlignedPointerAsIndexOp::create(builder, loc, value);
+  return mlir::arith::IndexCastOp::create(builder, loc, builder.getI64Type(),
+                                          pointerIndex)
       .getResult();
 }
 
@@ -64,22 +64,22 @@ mlir::Value sizeWordForPhysicalValue(mlir::OpBuilder &builder,
     return zero;
   if (memref.hasStaticShape())
     return constantI64(builder, loc, memref.getDimSize(0));
-  mlir::Value dim = builder.create<mlir::memref::DimOp>(loc, value, 0);
-  return builder.create<mlir::arith::IndexCastOp>(loc, builder.getI64Type(), dim)
+  mlir::Value dim = mlir::memref::DimOp::create(builder, loc, value, 0);
+  return mlir::arith::IndexCastOp::create(builder, loc, builder.getI64Type(),
+                                          dim)
       .getResult();
 }
 
 mlir::LogicalResult storePayloadWord(mlir::Operation *op,
                                      mlir::OpBuilder &builder,
                                      mlir::Value payload, unsigned index,
-                                     mlir::Value word,
-                                     llvm::StringRef label) {
+                                     mlir::Value word, llvm::StringRef label) {
   if (!payload || !isI64Payload(payload))
     return op->emitError() << label << " payload has invalid type "
                            << (payload ? payload.getType() : mlir::Type());
   builder.setInsertionPoint(op);
   mlir::Value slot = constantIndex(builder, op->getLoc(), index);
-  builder.create<mlir::memref::StoreOp>(op->getLoc(), word, payload, slot);
+  mlir::memref::StoreOp::create(builder, op->getLoc(), word, payload, slot);
   return mlir::success();
 }
 
@@ -93,8 +93,8 @@ mlir::LogicalResult storePayloadHandle(mlir::Operation *op,
                            << kPayloadHandleWords << " words";
   unsigned base = index * kPayloadHandleWords;
   for (auto [offset, word] : llvm::enumerate(words))
-    if (mlir::failed(storePayloadWord(op, builder, payload, base + offset,
-                                      word, label)))
+    if (mlir::failed(
+            storePayloadWord(op, builder, payload, base + offset, word, label)))
       return mlir::failure();
   return mlir::success();
 }
@@ -143,14 +143,14 @@ RuntimeBundleLowerer::objectPayloadHandleWords(mlir::Operation *op,
     return mlir::failure();
   mlir::Value classSlot = constantIndex(builder, loc, 1);
   mlir::Value payloadClass =
-      builder.create<mlir::memref::LoadOp>(loc, *header, classSlot)
+      mlir::memref::LoadOp::create(builder, loc, *header, classSlot)
           .getResult();
   mlir::Value pointerIndex =
-      builder.create<mlir::memref::ExtractAlignedPointerAsIndexOp>(loc,
-                                                                   *header);
+      mlir::memref::ExtractAlignedPointerAsIndexOp::create(builder, loc,
+                                                           *header);
   mlir::Value payloadPointer =
-      builder.create<mlir::arith::IndexCastOp>(loc, builder.getI64Type(),
-                                               pointerIndex)
+      mlir::arith::IndexCastOp::create(builder, loc, builder.getI64Type(),
+                                       pointerIndex)
           .getResult();
   mlir::Value refcount = constantI64(builder, loc, 1);
   mlir::Value valueCount =
@@ -163,9 +163,8 @@ RuntimeBundleLowerer::objectPayloadHandleWords(mlir::Operation *op,
   words[1] = payloadClass;
   words[2] = payloadPointer;
   words[3] = valueCount;
-  for (auto [index, physical] :
-       llvm::enumerate(concrete->physicalValues().take_front(
-           kPayloadValuePointerWords))) {
+  for (auto [index, physical] : llvm::enumerate(
+           concrete->physicalValues().take_front(kPayloadValuePointerWords))) {
     words[kPayloadValuePointerBase + index] =
         pointerWordForPhysicalValue(builder, loc, physical, zero);
     words[kPayloadValueSizeBase + index] =
@@ -181,8 +180,7 @@ RuntimeBundleLowerer::materializePayloadObjectBundle(
   const RuntimeBundle *concrete =
       RuntimeBundleLowerer::concreteObjectForOwnership(value);
   if (!concrete || concrete->kind != RuntimeBundle::Kind::Object)
-    return op->emitError()
-           << "collection payload requires an object bundle";
+    return op->emitError() << "collection payload requires an object bundle";
   if (concrete->contractName() == "types.NoneType")
     return *concrete;
   if (RuntimeBundleLowerer::hasLazyPrimitiveI64Object(*concrete)) {
@@ -197,9 +195,9 @@ RuntimeBundleLowerer::materializePayloadObjectBundle(
     return materialized;
   }
   if (concrete->physicalValues().empty())
-    return op->emitError()
-           << "collection payload element " << concrete->contract
-           << " has no physical object handle";
+    return op->emitError() << "collection payload element "
+                           << concrete->contract
+                           << " has no physical object handle";
   return *concrete;
 }
 
@@ -214,9 +212,9 @@ mlir::LogicalResult RuntimeBundleLowerer::ensureSequencePayloadCapacity(
   std::optional<RuntimeSymbol> ensure =
       manifest.primitive(container.contractName(), "ensure_capacity");
   if (!ensure)
-    return op->emitError()
-           << label << " payload capacity is exceeded, but the runtime "
-           << "manifest has no ensure_capacity primitive";
+    return op->emitError() << label
+                           << " payload capacity is exceeded, but the runtime "
+                           << "manifest has no ensure_capacity primitive";
 
   builder.setInsertionPoint(op);
   mlir::Value required =
@@ -231,19 +229,17 @@ mlir::LogicalResult RuntimeBundleLowerer::ensureSequencePayloadCapacity(
           op, container.objectValue.contract, call.getResults(), updated)))
     return mlir::failure();
   updated.copyEvidenceFrom(container);
-  std::uint64_t oldCapacity =
-      container.sequenceCapacity ? container.sequenceCapacity
-                                 : kMinimumCollectionCapacity;
+  std::uint64_t oldCapacity = container.sequenceCapacity
+                                  ? container.sequenceCapacity
+                                  : kMinimumCollectionCapacity;
   updated.sequenceCapacity =
       growCapacity(oldCapacity, static_cast<std::uint64_t>(index) + 1);
   container = std::move(updated);
   return mlir::success();
 }
 
-mlir::LogicalResult
-RuntimeBundleLowerer::ensureDictPayloadCapacity(mlir::Operation *op,
-                                                RuntimeBundle &container,
-                                                unsigned index) {
+mlir::LogicalResult RuntimeBundleLowerer::ensureDictPayloadCapacity(
+    mlir::Operation *op, RuntimeBundle &container, unsigned index) {
   if (container.mappingCapacity && index < container.mappingCapacity)
     return mlir::success();
   if (container.mappingCapacity == 0 && index < kMinimumCollectionCapacity)
@@ -269,9 +265,9 @@ RuntimeBundleLowerer::ensureDictPayloadCapacity(mlir::Operation *op,
           op, container.objectValue.contract, call.getResults(), updated)))
     return mlir::failure();
   updated.copyEvidenceFrom(container);
-  std::uint64_t oldCapacity =
-      container.mappingCapacity ? container.mappingCapacity
-                                : kMinimumCollectionCapacity;
+  std::uint64_t oldCapacity = container.mappingCapacity
+                                  ? container.mappingCapacity
+                                  : kMinimumCollectionCapacity;
   updated.mappingCapacity =
       growCapacity(oldCapacity, static_cast<std::uint64_t>(index) + 1);
   container = std::move(updated);
@@ -284,8 +280,8 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeSequencePayload(
   if (!isSequenceCollection(container.contractName()))
     return mlir::success();
   if (container.physicalValues().size() < 3)
-    return op->emitError()
-           << container.contractName() << " has no physical item payload";
+    return op->emitError() << container.contractName()
+                           << " has no physical item payload";
   container.sequenceCapacity =
       RuntimeBundleLowerer::collectionInitialCapacity(elements.size());
   for (auto [index, element] : llvm::enumerate(elements)) {
@@ -307,7 +303,7 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeSequencePayload(
       return mlir::failure();
     RuntimeBundle stored = payload->withObjectOwnership(
         ownership::logicalOwnershipKind(payload->objectValue.contract,
-                                                /*ownsObject=*/false));
+                                        /*ownsObject=*/false));
     if (index < container.sequenceElementBundles.size())
       container.sequenceElementBundles[index] =
           std::make_shared<RuntimeBundle>(stored);
@@ -323,8 +319,8 @@ mlir::LogicalResult RuntimeBundleLowerer::storeSequencePayloadElement(
   if (!isSequenceCollection(container.contractName()))
     return mlir::success();
   if (container.physicalValues().size() < 3)
-    return op->emitError()
-           << container.contractName() << " has no physical item payload";
+    return op->emitError() << container.contractName()
+                           << " has no physical item payload";
   if (mlir::failed(RuntimeBundleLowerer::ensureSequencePayloadCapacity(
           op, container, index, container.contractName())))
     return mlir::failure();
@@ -336,19 +332,16 @@ mlir::LogicalResult RuntimeBundleLowerer::storeSequencePayloadElement(
                             *words, container.contractName());
 }
 
-mlir::LogicalResult
-RuntimeBundleLowerer::clearSequencePayloadElement(mlir::Operation *op,
-                                                  RuntimeBundle &container,
-                                                  unsigned index) {
+mlir::LogicalResult RuntimeBundleLowerer::clearSequencePayloadElement(
+    mlir::Operation *op, RuntimeBundle &container, unsigned index) {
   if (!isSequenceCollection(container.contractName()))
     return mlir::success();
   if (container.physicalValues().size() < 3)
-    return op->emitError()
-           << container.contractName() << " has no physical item payload";
+    return op->emitError() << container.contractName()
+                           << " has no physical item payload";
   if (container.sequenceCapacity && index >= container.sequenceCapacity)
-    return op->emitError()
-           << container.contractName()
-           << " payload clear index exceeds capacity";
+    return op->emitError() << container.contractName()
+                           << " payload clear index exceeds capacity";
   return clearPayloadHandle(op, builder, container.physicalValues()[2], index,
                             container.contractName());
 }
@@ -397,9 +390,9 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeDictPayload(
       return mlir::failure();
     RuntimeBundle storedKey = payloadKey->withObjectOwnership(
         ownership::logicalOwnershipKind(payloadKey->objectValue.contract,
-                                                /*ownsObject=*/false));
-    RuntimeBundle storedValue = payloadValue->withObjectOwnership(
-        ownership::logicalOwnershipKind(
+                                        /*ownsObject=*/false));
+    RuntimeBundle storedValue =
+        payloadValue->withObjectOwnership(ownership::logicalOwnershipKind(
             payloadValue->objectValue.contract, /*ownsObject=*/false));
     if (index < container.mappingKeyBundles.size())
       container.mappingKeyBundles[index] =
@@ -420,9 +413,8 @@ mlir::LogicalResult RuntimeBundleLowerer::storeDictKeyPayload(
     return mlir::success();
   if (container.physicalValues().size() < 5)
     return op->emitError() << "dict has no physical payload arrays";
-  if (mlir::failed(
-          RuntimeBundleLowerer::ensureDictPayloadCapacity(op, container,
-                                                          index)))
+  if (mlir::failed(RuntimeBundleLowerer::ensureDictPayloadCapacity(
+          op, container, index)))
     return mlir::failure();
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
       RuntimeBundleLowerer::objectPayloadHandleWords(op, key);
@@ -439,16 +431,16 @@ mlir::LogicalResult RuntimeBundleLowerer::storeDictValuePayload(
     return mlir::success();
   if (container.physicalValues().size() < 5)
     return op->emitError() << "dict has no physical payload arrays";
-  if (mlir::failed(
-          RuntimeBundleLowerer::ensureDictPayloadCapacity(op, container,
-                                                          index)))
+  if (mlir::failed(RuntimeBundleLowerer::ensureDictPayloadCapacity(
+          op, container, index)))
     return mlir::failure();
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
       RuntimeBundleLowerer::objectPayloadHandleWords(op, value);
   if (mlir::failed(words))
     return mlir::failure();
-  if (mlir::failed(storePayloadHandle(op, builder, container.physicalValues()[3],
-                                      index, *words, "dict values")))
+  if (mlir::failed(storePayloadHandle(op, builder,
+                                      container.physicalValues()[3], index,
+                                      *words, "dict values")))
     return mlir::failure();
   return storePayloadWord(op, builder, container.physicalValues()[4], index,
                           constantI64(builder, op->getLoc(), 1),
@@ -462,8 +454,7 @@ mlir::LogicalResult RuntimeBundleLowerer::clearDictKeyPayload(
   if (container.physicalValues().size() < 5)
     return op->emitError() << "dict has no physical payload arrays";
   if (container.mappingCapacity && index >= container.mappingCapacity)
-    return op->emitError()
-           << "dict payload clear index exceeds capacity";
+    return op->emitError() << "dict payload clear index exceeds capacity";
   return clearPayloadHandle(op, builder, container.physicalValues()[2], index,
                             "dict keys");
 }
@@ -475,11 +466,10 @@ mlir::LogicalResult RuntimeBundleLowerer::clearDictValuePayload(
   if (container.physicalValues().size() < 5)
     return op->emitError() << "dict has no physical payload arrays";
   if (container.mappingCapacity && index >= container.mappingCapacity)
-    return op->emitError()
-           << "dict payload clear index exceeds capacity";
+    return op->emitError() << "dict payload clear index exceeds capacity";
   mlir::Value zero = constantI64(builder, op->getLoc(), 0);
-  if (mlir::failed(clearPayloadHandle(op, builder, container.physicalValues()[3],
-                                      index, "dict values")))
+  if (mlir::failed(clearPayloadHandle(
+          op, builder, container.physicalValues()[3], index, "dict values")))
     return mlir::failure();
   return storePayloadWord(op, builder, container.physicalValues()[4], index,
                           zero, "dict present");

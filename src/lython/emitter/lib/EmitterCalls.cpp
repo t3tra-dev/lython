@@ -43,8 +43,8 @@ ModuleEmitter::emitCallOperands(const parser::Node &expr,
     for (const parser::NodePtr &keyword : *keywords) {
       if (auto name = ast::string(*keyword, "arg")) {
         mlir::Type literal = types.literal("\"" + std::string(*name) + "\"");
-        auto stringOp = builder.create<py::StrConstantOp>(
-            loc(*keyword), literal, builder.getStringAttr(*name));
+        auto stringOp = py::StrConstantOp::create(
+            builder, loc(*keyword), literal, builder.getStringAttr(*name));
         operands.keywordNames.push_back({stringOp.getResult(), literal});
         Value keywordValue = emitExpr(ast::node(*keyword, "value"));
         operands.keywordValues.push_back(keywordValue);
@@ -71,10 +71,10 @@ Value ModuleEmitter::emitCallableDispatch(const parser::Node &anchor,
   mlir::Type resultType =
       resultOverride ? resultOverride
                      : (inference ? inference.resultType : types.object());
-  auto op = builder.create<py::CallOp>(loc(anchor), mlir::TypeRange{resultType},
-                                       callProtocolFor(inference, callee.type),
-                                       callee.value, posPack.value,
-                                       namePack.value, valuePack.value);
+  auto op =
+      py::CallOp::create(builder, loc(anchor), mlir::TypeRange{resultType},
+                         callProtocolFor(inference, callee.type), callee.value,
+                         posPack.value, namePack.value, valuePack.value);
   return {op.getResults().front(), resultType};
 }
 
@@ -106,10 +106,10 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
             types.inferMethodCallWithEvidence(input.type, "__len__", {});
         mlir::Type resultType =
             inference ? inference.resultType : types.intType();
-        auto op = builder.create<py::LenOp>(
-            loc(expr), resultType,
-            mlir::FlatSymbolRefAttr::get(&context, "__len__"),
-            callProtocolFor(inference), input.value);
+        auto op =
+            py::LenOp::create(builder, loc(expr), resultType,
+                              mlir::FlatSymbolRefAttr::get(&context, "__len__"),
+                              callProtocolFor(inference), input.value);
         return {op.getResult(), resultType};
       }
     }
@@ -130,8 +130,8 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
         mlir::Type resultType =
             inference ? inference.resultType : types.inferExpr(&expr);
         auto op =
-            builder.create<py::RoundOp>(loc(expr), resultType, "__round__",
-                                        callProtocolFor(inference), inputs);
+            py::RoundOp::create(builder, loc(expr), resultType, "__round__",
+                                callProtocolFor(inference), inputs);
         return {op.getResult(), resultType};
       }
     }
@@ -165,9 +165,9 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
         llvm::StringMap<Value> emptyKeywords;
         Value descriptorReceiver =
             emitDescriptorReceiver(expr, argument, *method);
-        Value repr = emitInlineMethodBody(
-            expr, descriptorReceiver, methodBindingBindsReceiver(*method),
-            *method, {}, emptyKeywords);
+        Value repr = emitInlineMethodBody(expr, descriptorReceiver,
+                                          methodBindingBindsReceiver(*method),
+                                          *method, {}, emptyKeywords);
         if (name == "repr")
           return repr;
         CallOperands operands =
@@ -232,9 +232,10 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
             operands.keywordTypes);
         mlir::Type resultType =
             inference ? inference.resultType : types.inferExpr(&expr);
-        auto op = builder.create<py::CallOp>(
-            loc(expr), mlir::TypeRange{resultType}, callProtocolFor(inference),
-            receiver.value, posPack.value, namePack.value, valuePack.value);
+        auto op =
+            py::CallOp::create(builder, loc(expr), mlir::TypeRange{resultType},
+                               callProtocolFor(inference), receiver.value,
+                               posPack.value, namePack.value, valuePack.value);
         op->setAttr("ly.bound_method", builder.getStringAttr(*methodName));
         return {op.getResults().front(), resultType};
       }

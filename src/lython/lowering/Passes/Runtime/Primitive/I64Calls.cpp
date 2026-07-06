@@ -35,7 +35,7 @@ primitiveI64ComparePredicate(llvm::StringRef methodName) {
 
 mlir::Value boolConstant(mlir::OpBuilder &builder, mlir::Location loc,
                          bool value) {
-  return builder.create<mlir::arith::ConstantIntOp>(loc, value ? 1 : 0, 1)
+  return mlir::arith::ConstantIntOp::create(builder, loc, value ? 1 : 0, 1)
       .getResult();
 }
 
@@ -50,18 +50,19 @@ bool isKnownTrue(mlir::Value value) {
 
 mlir::Value i64Constant(mlir::OpBuilder &builder, mlir::Location loc,
                         std::int64_t value) {
-  return builder.create<mlir::arith::ConstantIntOp>(loc, value, 64).getResult();
+  return mlir::arith::ConstantIntOp::create(builder, loc, value, 64)
+      .getResult();
 }
 
 mlir::Value logicalAnd(mlir::OpBuilder &builder, mlir::Location loc,
                        mlir::Value lhs, mlir::Value rhs) {
-  return builder.create<mlir::arith::AndIOp>(loc, lhs, rhs).getResult();
+  return mlir::arith::AndIOp::create(builder, loc, lhs, rhs).getResult();
 }
 
 mlir::Value logicalNot(mlir::OpBuilder &builder, mlir::Location loc,
                        mlir::Value value) {
-  return builder
-      .create<mlir::arith::XOrIOp>(loc, value, boolConstant(builder, loc, true))
+  return mlir::arith::XOrIOp::create(builder, loc, value,
+                                     boolConstant(builder, loc, true))
       .getResult();
 }
 
@@ -70,29 +71,24 @@ mlir::Value signedAddOverflow(mlir::OpBuilder &builder, mlir::Location loc,
                               mlir::Value result) {
   mlir::Value zero = i64Constant(builder, loc, 0);
   mlir::Value lhsNegative =
-      builder
-          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::slt,
-                                       lhs, zero)
+      mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::slt,
+                                  lhs, zero)
           .getResult();
   mlir::Value rhsNegative =
-      builder
-          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::slt,
-                                       rhs, zero)
+      mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::slt,
+                                  rhs, zero)
           .getResult();
   mlir::Value resultNegative =
-      builder
-          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::slt,
-                                       result, zero)
+      mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::slt,
+                                  result, zero)
           .getResult();
   mlir::Value sameSign =
-      builder
-          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::eq,
-                                       lhsNegative, rhsNegative)
+      mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::eq,
+                                  lhsNegative, rhsNegative)
           .getResult();
   mlir::Value signChanged =
-      builder
-          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::ne,
-                                       resultNegative, lhsNegative)
+      mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::ne,
+                                  resultNegative, lhsNegative)
           .getResult();
   return logicalAnd(builder, loc, sameSign, signChanged);
 }
@@ -102,29 +98,24 @@ mlir::Value signedSubOverflow(mlir::OpBuilder &builder, mlir::Location loc,
                               mlir::Value result) {
   mlir::Value zero = i64Constant(builder, loc, 0);
   mlir::Value lhsNegative =
-      builder
-          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::slt,
-                                       lhs, zero)
+      mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::slt,
+                                  lhs, zero)
           .getResult();
   mlir::Value rhsNegative =
-      builder
-          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::slt,
-                                       rhs, zero)
+      mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::slt,
+                                  rhs, zero)
           .getResult();
   mlir::Value resultNegative =
-      builder
-          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::slt,
-                                       result, zero)
+      mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::slt,
+                                  result, zero)
           .getResult();
   mlir::Value differentSign =
-      builder
-          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::ne,
-                                       lhsNegative, rhsNegative)
+      mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::ne,
+                                  lhsNegative, rhsNegative)
           .getResult();
   mlir::Value signChanged =
-      builder
-          .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::ne,
-                                       resultNegative, lhsNegative)
+      mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::ne,
+                                  resultNegative, lhsNegative)
           .getResult();
   return logicalAnd(builder, loc, differentSign, signChanged);
 }
@@ -136,25 +127,25 @@ buildPrimitiveI64Arithmetic(mlir::OpBuilder &builder, mlir::Location loc,
   switch (kind) {
   case PrimitiveI64ArithmeticKind::Add: {
     mlir::Value result =
-        builder.create<mlir::arith::AddIOp>(loc, lhs, rhs).getResult();
+        mlir::arith::AddIOp::create(builder, loc, lhs, rhs).getResult();
     return {result, signedAddOverflow(builder, loc, lhs, rhs, result)};
   }
   case PrimitiveI64ArithmeticKind::Sub: {
     mlir::Value result =
-        builder.create<mlir::arith::SubIOp>(loc, lhs, rhs).getResult();
+        mlir::arith::SubIOp::create(builder, loc, lhs, rhs).getResult();
     return {result, signedSubOverflow(builder, loc, lhs, rhs, result)};
   }
   case PrimitiveI64ArithmeticKind::Mul: {
-    auto extended = builder.create<mlir::arith::MulSIExtendedOp>(loc, lhs, rhs);
+    auto extended =
+        mlir::arith::MulSIExtendedOp::create(builder, loc, lhs, rhs);
     mlir::Value shift = i64Constant(builder, loc, 63);
     mlir::Value expectedHigh =
-        builder.create<mlir::arith::ShRSIOp>(loc, extended.getLow(), shift)
+        mlir::arith::ShRSIOp::create(builder, loc, extended.getLow(), shift)
             .getResult();
-    mlir::Value overflow =
-        builder
-            .create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::ne,
-                                         extended.getHigh(), expectedHigh)
-            .getResult();
+    mlir::Value overflow = mlir::arith::CmpIOp::create(
+                               builder, loc, mlir::arith::CmpIPredicate::ne,
+                               extended.getHigh(), expectedHigh)
+                               .getResult();
     return {extended.getLow(), overflow};
   }
   }
@@ -201,9 +192,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
       return mlir::success();
     }
 
-    mlir::Value compared =
-        builder.create<mlir::arith::CmpIOp>(loc, *compare, lhs.value, rhs.value)
-            .getResult();
+    mlir::Value compared = mlir::arith::CmpIOp::create(builder, loc, *compare,
+                                                       lhs.value, rhs.value)
+                               .getResult();
     mlir::Value fastResult = logicalAnd(builder, loc, operandsValid, compared);
     RuntimeBundle result;
     if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
@@ -268,7 +259,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
     materializedSources.reserve(sources.size());
     fallbackSources.reserve(sources.size());
     for (const RuntimeBundle *source : sources) {
-      if (!source || !RuntimeBundleLowerer::hasLazyPrimitiveI64Object(*source)) {
+      if (!source ||
+          !RuntimeBundleLowerer::hasLazyPrimitiveI64Object(*source)) {
         fallbackSources.push_back(source);
         continue;
       }
@@ -293,7 +285,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
         RuntimeBundleLowerer::createRuntimeCall(loc, *selected, operands);
     if (mlir::failed(checkPhysicalTypes(call.getResults(), "fallback call")))
       return mlir::failure();
-    builder.create<mlir::scf::YieldOp>(loc, call.getResults());
+    mlir::scf::YieldOp::create(builder, loc, call.getResults());
     return mlir::success();
   };
 
@@ -302,8 +294,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
         builder, loc, *arithmetic, lhs.value, rhs.value);
     mlir::Value fastValid = logicalAnd(builder, loc, operandsValid,
                                        logicalNot(builder, loc, overflow));
-    auto ifOp = builder.create<mlir::scf::IfOp>(loc, *resultTypes, fastValid,
-                                                /*withElseRegion=*/true);
+    auto ifOp = mlir::scf::IfOp::create(builder, loc, *resultTypes, fastValid,
+                                        /*withElseRegion=*/true);
 
     builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
     RuntimeBundle fastBundle;
@@ -313,7 +305,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
     if (mlir::failed(checkPhysicalTypes(fastBundle.physicalValues(),
                                         "primitive i64 fast path")))
       return mlir::failure();
-    builder.create<mlir::scf::YieldOp>(loc, fastBundle.physicalValues());
+    mlir::scf::YieldOp::create(builder, loc, fastBundle.physicalValues());
 
     builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
     if (mlir::failed(emitFallbackYield()))
@@ -333,7 +325,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
     return op->emitError() << "primitive i64 comparison " << methodName
                            << " expects a single i1 bool ABI result";
   mlir::Value fastResult =
-      builder.create<mlir::arith::CmpIOp>(loc, *compare, lhs.value, rhs.value)
+      mlir::arith::CmpIOp::create(builder, loc, *compare, lhs.value, rhs.value)
           .getResult();
   if (isKnownTrue(operandsValid)) {
     RuntimeBundle result;
@@ -343,11 +335,11 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
     valueBundles[resultValue] = std::move(result);
     return mlir::success();
   }
-  auto ifOp = builder.create<mlir::scf::IfOp>(loc, *resultTypes, operandsValid,
-                                              /*withElseRegion=*/true);
+  auto ifOp = mlir::scf::IfOp::create(builder, loc, *resultTypes, operandsValid,
+                                      /*withElseRegion=*/true);
 
   builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
-  builder.create<mlir::scf::YieldOp>(loc, mlir::ValueRange{fastResult});
+  mlir::scf::YieldOp::create(builder, loc, mlir::ValueRange{fastResult});
 
   builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
   if (mlir::failed(emitFallbackYield()))

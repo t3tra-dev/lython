@@ -14,9 +14,9 @@ Value ModuleEmitter::emitBinarySpecial(const parser::Node &anchor,
       types.inferMethodCallWithEvidence(lhs.type, method, {rhs.type});
   if (inference)
     resultType = inference.resultType;
-  auto op = builder.create<Op>(
-      loc(anchor), resultType, mlir::FlatSymbolRefAttr::get(&context, method),
-      method, callProtocolFor(inference), lhs.value, rhs.value);
+  auto op = Op::create(builder, loc(anchor), resultType,
+                       mlir::FlatSymbolRefAttr::get(&context, method), method,
+                       callProtocolFor(inference), lhs.value, rhs.value);
   return {op.getResult(), resultType};
 }
 
@@ -28,9 +28,9 @@ Value ModuleEmitter::emitUnarySpecial(const parser::Node &anchor,
       types.inferMethodCallWithEvidence(input.type, method, {});
   if (inference)
     resultType = inference.resultType;
-  auto op = builder.create<Op>(loc(anchor), resultType,
-                               mlir::FlatSymbolRefAttr::get(&context, method),
-                               method, callProtocolFor(inference), input.value);
+  auto op = Op::create(builder, loc(anchor), resultType,
+                       mlir::FlatSymbolRefAttr::get(&context, method), method,
+                       callProtocolFor(inference), input.value);
   return {op.getResult(), resultType};
 }
 

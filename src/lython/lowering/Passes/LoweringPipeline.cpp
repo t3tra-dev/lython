@@ -137,11 +137,10 @@ LogicalResult runLoweringPipeline(ModuleOp module,
   dumpMLIRForPass(irDump, "py-optimization", module);
 
   // Phase 4: semantic evidence verification before lowering consumes Py ops.
-  if (failed(runVerifierPhase("algorithmm-evidence-verifier",
-                              [&](PassManager &pm) {
-                                pm.addPass(
-                                    createAlgorithmMEvidenceVerifierPass());
-                              })))
+  if (failed(runVerifierPhase(
+          "algorithmm-evidence-verifier", [&](PassManager &pm) {
+            pm.addPass(createAlgorithmMEvidenceVerifierPass());
+          })))
     return failure();
   dumpMLIRForPass(irDump, "algorithmm-evidence-verifier", module);
 
@@ -210,10 +209,10 @@ LogicalResult runLoweringPipeline(ModuleOp module,
     return failure();
   dumpMLIRForPass(irDump, "refcount-elision", module);
 
-  if (failed(runVerifierPhase("pre-cleanup-llvm-call-verifier",
-                              [&](PassManager &pm) {
-                                pm.addPass(createLLVMCallOwnershipVerifierPass());
-                              })))
+  if (failed(runVerifierPhase(
+          "pre-cleanup-llvm-call-verifier", [&](PassManager &pm) {
+            pm.addPass(createLLVMCallOwnershipVerifierPass());
+          })))
     return failure();
   dumpMLIRForPass(irDump, "pre-cleanup-llvm-call-verifier", module);
 
@@ -262,39 +261,35 @@ LogicalResult runLoweringPipeline(ModuleOp module,
       PerfScope perf("lowering.collect-final-safety-contracts");
       collectLoweredSafetyContracts(module, finalSafetyContracts);
     }
-    if (failed(
-            runPhase("convert-to-llvm", [&](PassManager &pm) {
-              mlir::ConvertVectorToLLVMPassOptions vectorOptions;
-              vectorOptions.reassociateFPReductions = true;
-              vectorOptions.x86Vector = tensorTarget.usesX86();
-              mlir::VectorTransferToSCFOptions transferOptions;
-              transferOptions.setTargetRank(1);
-              pm.addPass(mlir::createLowerAffinePass());
-              pm.addPass(mlir::memref::createExpandStridedMetadataPass());
-              pm.addPass(mlir::createLowerAffinePass());
-              if (tensorTarget.usesArmSME())
-                lowering::arch::arm::
-                    addSMEPreControlFlowLLVMPrepPipeline(pm);
-              pm.addNestedPass<mlir::func::FuncOp>(
-                  mlir::vector::createLowerVectorMultiReductionPass(
-                      mlir::vector::VectorMultiReductionLowering::
-                          InnerReduction));
-              pm.addPass(mlir::createConvertVectorToSCFPass(transferOptions));
-              pm.addPass(mlir::createLowerAffinePass());
-              pm.addPass(mlir::createCanonicalizerPass());
-              pm.addPass(mlir::createConvertVectorToLLVMPass(vectorOptions));
-              pm.addPass(mlir::createConvertSCFToCFPass());
-              if (tensorTarget.usesArmSME())
-                lowering::arch::arm::
-                    addSMEPostControlFlowLLVMPrepPipeline(pm);
-              pm.addPass(mlir::createArithToLLVMConversionPass());
-              pm.addPass(mlir::createConvertControlFlowToLLVMPass());
-              pm.addPass(mlir::createConvertToLLVMPass());
-              pm.addPass(mlir::createReconcileUnrealizedCastsPass());
-              pm.addNestedPass<mlir::func::FuncOp>(
-                  mlir::createReconcileUnrealizedCastsPass());
-              pm.addPass(mlir::createCanonicalizerPass());
-            })))
+    if (failed(runPhase("convert-to-llvm", [&](PassManager &pm) {
+          mlir::ConvertVectorToLLVMPassOptions vectorOptions;
+          vectorOptions.reassociateFPReductions = true;
+          vectorOptions.x86Vector = tensorTarget.usesX86();
+          mlir::VectorTransferToSCFOptions transferOptions;
+          transferOptions.setTargetRank(1);
+          pm.addPass(mlir::createLowerAffinePass());
+          pm.addPass(mlir::memref::createExpandStridedMetadataPass());
+          pm.addPass(mlir::createLowerAffinePass());
+          if (tensorTarget.usesArmSME())
+            lowering::arch::arm::addSMEPreControlFlowLLVMPrepPipeline(pm);
+          pm.addNestedPass<mlir::func::FuncOp>(
+              mlir::vector::createLowerVectorMultiReductionPass(
+                  mlir::vector::VectorMultiReductionLowering::InnerReduction));
+          pm.addPass(mlir::createConvertVectorToSCFPass(transferOptions));
+          pm.addPass(mlir::createLowerAffinePass());
+          pm.addPass(mlir::createCanonicalizerPass());
+          pm.addPass(mlir::createConvertVectorToLLVMPass(vectorOptions));
+          pm.addPass(mlir::createSCFToControlFlowPass());
+          if (tensorTarget.usesArmSME())
+            lowering::arch::arm::addSMEPostControlFlowLLVMPrepPipeline(pm);
+          pm.addPass(mlir::createArithToLLVMConversionPass());
+          pm.addPass(mlir::createConvertControlFlowToLLVMPass());
+          pm.addPass(mlir::createConvertToLLVMPass());
+          pm.addPass(mlir::createReconcileUnrealizedCastsPass());
+          pm.addNestedPass<mlir::func::FuncOp>(
+              mlir::createReconcileUnrealizedCastsPass());
+          pm.addPass(mlir::createCanonicalizerPass());
+        })))
       return failure();
     if (options.enableVerifiers) {
       PerfScope perf("lowering.preserve-final-safety-contracts");
@@ -321,10 +316,10 @@ LogicalResult runLoweringPipeline(ModuleOp module,
     return failure();
   dumpMLIRForPass(irDump, "final-ownership-verifier", module);
 
-  if (failed(
-          runVerifierPhase("final-thread-safety-verifier", [&](PassManager &pm) {
-            pm.addPass(createLLVMThreadSafeVerifierPass());
-          })))
+  if (failed(runVerifierPhase("final-thread-safety-verifier",
+                              [&](PassManager &pm) {
+                                pm.addPass(createLLVMThreadSafeVerifierPass());
+                              })))
     return failure();
   dumpMLIRForPass(irDump, "final-thread-safety-verifier", module);
 

@@ -131,8 +131,9 @@ std::optional<std::string> ctypesQualifiedNameContract(llvm::StringRef name) {
 
 bool isStaticCtypesFunctionName(llvm::StringRef name) {
   return llvm::StringSwitch<bool>(name)
-      .Cases("sizeof", "alignment", "byref", "pointer", "POINTER", "cast",
-             "addressof", true)
+      .Cases({"sizeof", "alignment", "byref", "pointer", "POINTER", "cast",
+              "addressof"},
+             true)
       .Default(false);
 }
 

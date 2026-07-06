@@ -51,13 +51,13 @@ EmitResult ModuleEmitter::emit() {
   emitTopLevelDeclarations();
 
   auto mainType = builder.getFunctionType({}, {});
-  auto main =
-      builder.create<mlir::func::FuncOp>(loc(moduleNode), "__main__", mainType);
+  auto main = mlir::func::FuncOp::create(builder, loc(moduleNode), "__main__",
+                                         mainType);
   mlir::Block *entry = main.addEntryBlock();
   builder.setInsertionPointToStart(entry);
   emitStatements(ast::nodeList(moduleNode, "body"), /*skipDeclarations=*/true);
   if (!insertionBlockTerminated(builder))
-    builder.create<mlir::func::ReturnOp>(loc(moduleNode));
+    mlir::func::ReturnOp::create(builder, loc(moduleNode));
 
   EmitResult result;
   result.diagnostics = std::move(diagnostics);

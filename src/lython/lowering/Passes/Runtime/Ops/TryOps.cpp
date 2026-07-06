@@ -14,8 +14,8 @@ mlir::func::FuncOp getOrCreatePrivateFunction(mlir::ModuleOp module,
 
   mlir::OpBuilder::InsertionGuard guard(builder);
   builder.setInsertionPointToEnd(module.getBody());
-  auto function = builder.create<mlir::func::FuncOp>(module.getLoc(), name,
-                                                     type);
+  auto function =
+      mlir::func::FuncOp::create(builder, module.getLoc(), name, type);
   function.setPrivate();
   return function;
 }
@@ -27,8 +27,8 @@ void replaceYields(mlir::OpBuilder &builder, mlir::Region &region,
   region.walk([&](YieldOp yield) { yields.push_back(yield); });
   for (YieldOp yield : yields) {
     builder.setInsertionPoint(yield);
-    builder.create<mlir::cf::BranchOp>(yield.getLoc(), continuation,
-                                       yield.getOperands());
+    mlir::cf::BranchOp::create(builder, yield.getLoc(), continuation,
+                               yield.getOperands());
     yield.erase();
   }
 }
@@ -68,9 +68,9 @@ std::optional<std::int64_t> RuntimeBundleLowerer::currentTryHandlerId() const {
 void RuntimeBundleLowerer::emitTryCallSiteMarker(mlir::Location loc,
                                                  std::int64_t id) {
   mlir::Value idValue =
-      builder.create<mlir::arith::ConstantIntOp>(loc, id, 64).getResult();
-  builder.create<mlir::func::CallOp>(loc, getOrCreateTryCallSiteMarker(),
-                                     mlir::ValueRange{idValue});
+      mlir::arith::ConstantIntOp::create(builder, loc, id, 64).getResult();
+  mlir::func::CallOp::create(builder, loc, getOrCreateTryCallSiteMarker(),
+                             mlir::ValueRange{idValue});
 }
 
 void RuntimeBundleLowerer::emitTryCallSiteMarkerIfNeeded(mlir::Location loc) {
@@ -80,8 +80,7 @@ void RuntimeBundleLowerer::emitTryCallSiteMarkerIfNeeded(mlir::Location loc) {
 
 mlir::LogicalResult RuntimeBundleLowerer::lowerTry(py::TryOp op) {
   if (!op.getFinallyRegion().empty())
-    return op.emitError()
-           << "py.try finally lowering is not implemented yet";
+    return op.emitError() << "py.try finally lowering is not implemented yet";
   if (op.getExceptRegion().empty())
     return op.emitError() << "py.try lowering requires an except region";
   if (op.getTryRegion().empty())
@@ -111,8 +110,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerTry(py::TryOp op) {
   }
 
   replaceYields<py::TryYieldOp>(builder, op.getTryRegion(), continuation);
-  replaceYields<py::ExceptYieldOp>(builder, op.getExceptRegion(),
-                                   continuation);
+  replaceYields<py::ExceptYieldOp>(builder, op.getExceptRegion(), continuation);
 
   auto continuationIt = continuation->getIterator();
   parentRegion->getBlocks().splice(continuationIt,
@@ -124,21 +122,21 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerTry(py::TryOp op) {
     mlir::OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToStart(exceptEntry);
     mlir::Value idValue =
-        builder.create<mlir::arith::ConstantIntOp>(loc, handlerId, 64)
+        mlir::arith::ConstantIntOp::create(builder, loc, handlerId, 64)
             .getResult();
-    builder.create<mlir::func::CallOp>(loc, getOrCreateTryCatchMarker(),
-                                       mlir::ValueRange{idValue});
+    mlir::func::CallOp::create(builder, loc, getOrCreateTryCatchMarker(),
+                               mlir::ValueRange{idValue});
   }
 
   builder.setInsertionPoint(tryOperation);
   mlir::Value idValue =
-      builder.create<mlir::arith::ConstantIntOp>(loc, handlerId, 64)
+      mlir::arith::ConstantIntOp::create(builder, loc, handlerId, 64)
           .getResult();
-  auto anchor = builder.create<mlir::func::CallOp>(
-      loc, getOrCreateTryCatchAnchor(), mlir::ValueRange{idValue});
-  builder.create<mlir::cf::CondBranchOp>(
-      loc, anchor.getResult(0), exceptEntry, mlir::ValueRange{}, tryEntry,
-      mlir::ValueRange{});
+  auto anchor = mlir::func::CallOp::create(
+      builder, loc, getOrCreateTryCatchAnchor(), mlir::ValueRange{idValue});
+  mlir::cf::CondBranchOp::create(builder, loc, anchor.getResult(0), exceptEntry,
+                                 mlir::ValueRange{}, tryEntry,
+                                 mlir::ValueRange{});
   tryOperation->erase();
   return mlir::success();
 }

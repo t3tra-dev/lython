@@ -315,7 +315,7 @@ void ensureYield(mlir::OpBuilder &builder, mlir::Location loc,
                  mlir::Block &block) {
   if (!blockHasTerminator(block)) {
     builder.setInsertionPointToEnd(&block);
-    builder.create<mlir::scf::YieldOp>(loc);
+    mlir::scf::YieldOp::create(builder, loc);
   }
 }
 

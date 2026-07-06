@@ -24,9 +24,10 @@ bool RuntimeBundleLowerer::isStaticCtypesCallable(
       ctypesFromBufferCopyTarget(binding))
     return true;
   return llvm::StringSwitch<bool>(binding)
-      .Cases("ctypes.sizeof", "ctypes.alignment", "ctypes.byref",
-             "ctypes.pointer", "ctypes.POINTER", "ctypes.cast",
-             "ctypes.addressof", true)
+      .Cases({"ctypes.sizeof", "ctypes.alignment", "ctypes.byref",
+              "ctypes.pointer", "ctypes.POINTER", "ctypes.cast",
+              "ctypes.addressof"},
+             true)
       .Default(false);
 }
 

@@ -51,8 +51,12 @@ bool isPythonDebugFunction(const llvm::Function *function) {
   if (!subprogram)
     return false;
   llvm::DICompileUnit *unit = subprogram->getUnit();
-  return unit && static_cast<unsigned>(unit->getSourceLanguage()) ==
-                     llvm::dwarf::DW_LANG_Python;
+  if (!unit)
+    return false;
+  llvm::DISourceLanguageName language = unit->getSourceLanguage();
+  return language.getName() == llvm::dwarf::DW_LANG_Python ||
+         (language.hasVersionedName() &&
+          language.getName() == llvm::dwarf::DW_LNAME_Python);
 }
 
 bool mayPropagatePythonException(const llvm::Function *callee) {
@@ -442,8 +446,7 @@ bool installPythonExceptionCleanupFrames(
       for (llvm::Instruction &instruction : block) {
         auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
         if (!call) {
-          if (pendingTryMarker &&
-              !canSkipBetweenTryMarkerAndCall(instruction))
+          if (pendingTryMarker && !canSkipBetweenTryMarkerAndCall(instruction))
             pendingTryMarker.reset();
           continue;
         }

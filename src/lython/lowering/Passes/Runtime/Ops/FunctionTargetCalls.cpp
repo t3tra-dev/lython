@@ -122,8 +122,8 @@ RuntimeBundleLowerer::lowerFunctionTargetCall(py::CallOp op,
         op, target, targetName, sources);
 
   if (RuntimeBundleLowerer::isPrimitiveI64CallableClone(target))
-    return RuntimeBundleLowerer::lowerPrimitiveI64CloneCall(op, target,
-                                                           targetName, sources);
+    return RuntimeBundleLowerer::lowerPrimitiveI64CloneCall(
+        op, target, targetName, sources);
 
   if (std::optional<std::string> cloneName =
           RuntimeBundleLowerer::primitiveI64CloneFor(targetName)) {
@@ -136,8 +136,8 @@ RuntimeBundleLowerer::lowerFunctionTargetCall(py::CallOp op,
   }
 
   mlir::FailureOr<mlir::func::CallOp> call =
-      RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(
-          op, target, targetName, sources);
+      RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(op, target,
+                                                          targetName, sources);
   if (mlir::failed(call))
     return mlir::failure();
 
@@ -234,9 +234,9 @@ mlir::LogicalResult RuntimeBundleLowerer::emitPrimitiveI64CloneFallbackResult(
   ifResultTypes.push_back(mlir::IntegerType::get(context, 64));
   ifResultTypes.push_back(mlir::IntegerType::get(context, 1));
 
-  auto ifOp = builder.create<mlir::scf::IfOp>(loc, ifResultTypes,
-                                              (*cloneCall).getResult(1),
-                                              /*withElseRegion=*/true);
+  auto ifOp = mlir::scf::IfOp::create(builder, loc, ifResultTypes,
+                                      (*cloneCall).getResult(1),
+                                      /*withElseRegion=*/true);
 
   builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
   RuntimeBundle fastObject;
@@ -252,7 +252,7 @@ mlir::LogicalResult RuntimeBundleLowerer::emitPrimitiveI64CloneFallbackResult(
                           << objectTypes->size();
   fastYield.push_back((*cloneCall).getResult(0));
   fastYield.push_back((*cloneCall).getResult(1));
-  builder.create<mlir::scf::YieldOp>(loc, fastYield);
+  mlir::scf::YieldOp::create(builder, loc, fastYield);
 
   builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
   mlir::FailureOr<mlir::func::CallOp> fallbackCall =
@@ -270,7 +270,7 @@ mlir::LogicalResult RuntimeBundleLowerer::emitPrimitiveI64CloneFallbackResult(
              << "primitive i64 clone fallback result " << index << " has type "
              << value.getType() << ", expected " << ifResultTypes[index];
   }
-  builder.create<mlir::scf::YieldOp>(loc, (*fallbackCall).getResults());
+  mlir::scf::YieldOp::create(builder, loc, (*fallbackCall).getResults());
 
   builder.setInsertionPointAfter(ifOp);
   llvm::SmallVector<mlir::Value, 8> objectValues;
@@ -363,9 +363,8 @@ RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(
              functionType.getInput(inputIndex)) ||
          RuntimeBundleLowerer::isErasedObjectStorageType(
              functionType.getInput(inputIndex)))) {
-      bool consumesObjectInput =
-          ownership::functionConsumesOperandAt(targetSymbol.function,
-                                                       inputIndex);
+      bool consumesObjectInput = ownership::functionConsumesOperandAt(
+          targetSymbol.function, inputIndex);
       const RuntimeBundle *concrete =
           source ? RuntimeBundleLowerer::concreteObjectForOwnership(*source)
                  : nullptr;
@@ -385,10 +384,9 @@ RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(
                 op, *source, /*retainPayload=*/true);
         if (mlir::failed(boxed))
           return mlir::failure();
-        boxedObjectSources.push_back(
-            BoxedObjectSource{static_cast<unsigned>(sourceIndex),
-                              std::move(*boxed),
-                              /*releaseAfterCall=*/!consumesObjectInput});
+        boxedObjectSources.push_back(BoxedObjectSource{
+            static_cast<unsigned>(sourceIndex), std::move(*boxed),
+            /*releaseAfterCall=*/!consumesObjectInput});
         sourceForAppend = &boxedObjectSources.back().bundle;
       }
     }
@@ -410,9 +408,8 @@ RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(
     return op.emitError() << "missing positional args for function target "
                           << targetName;
 
-  mlir::func::CallOp call =
-      RuntimeBundleLowerer::createRuntimeCall(op.getLoc(), targetSymbol,
-                                              operands);
+  mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+      op.getLoc(), targetSymbol, operands);
   if (!boxedObjectSources.empty()) {
     builder.setInsertionPointAfter(call);
     for (BoxedObjectSource &boxed : boxedObjectSources) {
@@ -445,8 +442,7 @@ mlir::LogicalResult RuntimeBundleLowerer::bundleFunctionTargetCallResult(
   auto returnedCoroutine = returnedCoroutineSummaries.find(targetName);
   auto returnedObjectEvidence =
       returnedObjectEvidenceSummaries.find(targetName);
-  auto returnedStaticObject =
-      returnedStaticObjectSummaries.find(targetName);
+  auto returnedStaticObject = returnedStaticObjectSummaries.find(targetName);
   mlir::Type primaryResultType = expectedResult;
   if (returnedCoroutine != returnedCoroutineSummaries.end() &&
       isCoroutineLikeResultType(expectedResult)) {
@@ -523,8 +519,8 @@ mlir::LogicalResult RuntimeBundleLowerer::bundleFunctionTargetCallResult(
       return mlir::failure();
 
     bool useStaticProtocolObject = false;
-    if (auto protocol = mlir::dyn_cast_if_present<py::ProtocolType>(
-            expectedResult))
+    if (auto protocol =
+            mlir::dyn_cast_if_present<py::ProtocolType>(expectedResult))
       useStaticProtocolObject =
           runtimeContractName(expectedResult).empty() &&
           (py::isAssignableTo(objectContract, expectedResult,
@@ -688,8 +684,8 @@ mlir::LogicalResult RuntimeBundleLowerer::bundleFunctionTargetCallResult(
 
 mlir::LogicalResult RuntimeBundleLowerer::emitSourceFunctionTargetCallResult(
     mlir::Operation *op, mlir::Type expectedResult, mlir::func::FuncOp target,
-    llvm::StringRef targetName,
-    llvm::ArrayRef<const RuntimeBundle *> sources, RuntimeBundle &result) {
+    llvm::StringRef targetName, llvm::ArrayRef<const RuntimeBundle *> sources,
+    RuntimeBundle &result) {
   mlir::FunctionType functionType = target.getFunctionType();
   for (mlir::Type input : functionType.getInputs())
     if (py::isPyType(input))
@@ -711,9 +707,8 @@ mlir::LogicalResult RuntimeBundleLowerer::emitSourceFunctionTargetCallResult(
       expectedResult = callable.getResultTypes().front();
   }
   if (!expectedResult)
-    return op->emitError()
-           << "source function target " << targetName
-           << " needs a concrete expected result contract";
+    return op->emitError() << "source function target " << targetName
+                           << " needs a concrete expected result contract";
 
   RuntimeSymbol targetSymbol;
   targetSymbol.function = target;
@@ -746,15 +741,13 @@ mlir::LogicalResult RuntimeBundleLowerer::emitSourceFunctionTargetCallResult(
     return op->emitError() << "missing positional args for function target "
                            << targetName;
 
-  mlir::func::CallOp call =
-      RuntimeBundleLowerer::createRuntimeCall(op->getLoc(), targetSymbol,
-                                              operands);
+  mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+      op->getLoc(), targetSymbol, operands);
 
   auto returnedCoroutine = returnedCoroutineSummaries.find(targetName);
   auto returnedObjectEvidence =
       returnedObjectEvidenceSummaries.find(targetName);
-  auto returnedStaticObject =
-      returnedStaticObjectSummaries.find(targetName);
+  auto returnedStaticObject = returnedStaticObjectSummaries.find(targetName);
 
   mlir::Type primaryResultType = expectedResult;
   if (returnedCoroutine != returnedCoroutineSummaries.end() &&
@@ -834,8 +827,8 @@ mlir::LogicalResult RuntimeBundleLowerer::emitSourceFunctionTargetCallResult(
       return mlir::failure();
 
     bool useStaticProtocolObject = false;
-    if (auto protocol = mlir::dyn_cast_if_present<py::ProtocolType>(
-            expectedResult))
+    if (auto protocol =
+            mlir::dyn_cast_if_present<py::ProtocolType>(expectedResult))
       useStaticProtocolObject =
           runtimeContractName(expectedResult).empty() &&
           (py::isAssignableTo(objectContract, expectedResult, op) ||

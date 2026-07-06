@@ -26,12 +26,12 @@ std::optional<mlir::Value> createPrimitiveZeroValue(mlir::OpBuilder &builder,
                                                     mlir::Location loc,
                                                     mlir::Type type) {
   if (auto floatType = mlir::dyn_cast<mlir::FloatType>(type)) {
-    return builder.create<mlir::arith::ConstantOp>(
-        loc, floatType, builder.getFloatAttr(floatType, 0.0));
+    return mlir::arith::ConstantOp::create(
+        builder, loc, floatType, builder.getFloatAttr(floatType, 0.0));
   }
   if (auto intType = mlir::dyn_cast<mlir::IntegerType>(type)) {
-    return builder.create<mlir::arith::ConstantOp>(
-        loc, intType, builder.getIntegerAttr(intType, 0));
+    return mlir::arith::ConstantOp::create(builder, loc, intType,
+                                           builder.getIntegerAttr(intType, 0));
   }
   return std::nullopt;
 }
@@ -96,7 +96,7 @@ createSubviewOffsetForDimension(mlir::OpBuilder &builder, mlir::Location loc,
       return std::nullopt;
     mlir::Value localOffset = mlir::getValueOrCreateConstantIndexOp(
         builder, loc, subview.getMixedOffsets()[dimension]);
-    return builder.create<mlir::arith::AddIOp>(loc, *baseOffset, localOffset)
+    return mlir::arith::AddIOp::create(builder, loc, *baseOffset, localOffset)
         .getResult();
   }
   if (auto cast = value.getDefiningOp<mlir::memref::CastOp>())
@@ -106,7 +106,7 @@ createSubviewOffsetForDimension(mlir::OpBuilder &builder, mlir::Location loc,
   auto type = mlir::dyn_cast<mlir::MemRefType>(value.getType());
   if (!type || dimension >= type.getRank())
     return std::nullopt;
-  return builder.create<mlir::arith::ConstantIndexOp>(loc, 0).getResult();
+  return mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult();
 }
 
 std::optional<int64_t> selectDivisibleVectorLanes(mlir::Type elementType,

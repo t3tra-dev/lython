@@ -305,14 +305,12 @@ RuntimeBundleLowerer::lowerStaticCtypesCall(py::CallOp op,
     mlir::Value i64 = raw;
     auto rawType = mlir::cast<mlir::IntegerType>(raw.getType());
     if (rawType.getWidth() < 64)
-      i64 = builder
-                .create<mlir::arith::ExtUIOp>(op.getLoc(), builder.getI64Type(),
-                                              raw)
+      i64 = mlir::arith::ExtUIOp::create(builder, op.getLoc(),
+                                         builder.getI64Type(), raw)
                 .getResult();
     else if (rawType.getWidth() > 64)
-      i64 = builder
-                .create<mlir::arith::TruncIOp>(op.getLoc(),
-                                               builder.getI64Type(), raw)
+      i64 = mlir::arith::TruncIOp::create(builder, op.getLoc(),
+                                          builder.getI64Type(), raw)
                 .getResult();
     mlir::Value valid = constantI1(builder, op.getLoc(), true);
     RuntimeBundle result;

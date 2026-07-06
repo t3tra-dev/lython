@@ -216,16 +216,17 @@ stackPointerForBorrowedScalar(mlir::Operation *op, mlir::OpBuilder &builder,
   mlir::Value nativeValue = coerceNativeInteger(
       builder, loc, evidence.pointeeScalarValue, nativeType);
   auto bufferType = mlir::MemRefType::get({1}, nativeType);
-  mlir::Value buffer = builder.create<mlir::memref::AllocaOp>(loc, bufferType);
-  mlir::Value zero = builder.create<mlir::arith::ConstantIndexOp>(loc, 0);
-  builder.create<mlir::memref::StoreOp>(loc, nativeValue, buffer,
-                                        mlir::ValueRange{zero});
+  mlir::Value buffer = mlir::memref::AllocaOp::create(builder, loc, bufferType);
+  mlir::Value zero = mlir::arith::ConstantIndexOp::create(builder, loc, 0);
+  mlir::memref::StoreOp::create(builder, loc, nativeValue, buffer,
+                                mlir::ValueRange{zero});
   mlir::Value pointerIndex =
-      builder.create<mlir::memref::ExtractAlignedPointerAsIndexOp>(loc, buffer);
-  mlir::Value pointerInteger = builder.create<mlir::arith::IndexCastOp>(
-      loc, nativePointerIntegerType(builder, facts), pointerIndex);
-  return builder.create<mlir::LLVM::IntToPtrOp>(
-      loc, nativePointerType(builder.getContext()), pointerInteger);
+      mlir::memref::ExtractAlignedPointerAsIndexOp::create(builder, loc,
+                                                           buffer);
+  mlir::Value pointerInteger = mlir::arith::IndexCastOp::create(
+      builder, loc, nativePointerIntegerType(builder, facts), pointerIndex);
+  return mlir::LLVM::IntToPtrOp::create(
+      builder, loc, nativePointerType(builder.getContext()), pointerInteger);
 }
 
 std::optional<mlir::Value>
@@ -233,10 +234,10 @@ extractNativePointerArgument(mlir::Operation *op, mlir::OpBuilder &builder,
                              const RuntimeBundle &source,
                              const std::optional<TargetPlatformFacts> &facts) {
   if (isNoneBundle(source)) {
-    mlir::Value zero = builder.create<mlir::arith::ConstantIntOp>(
-        op->getLoc(), 0, nativePointerIntegerType(builder, facts));
-    return builder.create<mlir::LLVM::IntToPtrOp>(
-        op->getLoc(), nativePointerType(builder.getContext()), zero);
+    mlir::Value zero = mlir::arith::ConstantIntOp::create(
+        builder, op->getLoc(), nativePointerIntegerType(builder, facts), 0);
+    return mlir::LLVM::IntToPtrOp::create(
+        builder, op->getLoc(), nativePointerType(builder.getContext()), zero);
   }
   if (source.ctypes &&
       source.ctypes->kind == RuntimeCtypesEvidence::Kind::Pointer) {
@@ -358,8 +359,8 @@ mlir::FailureOr<mlir::func::FuncOp> getOrCreateNativeDeclaration(
   };
   auto nativeArgTypesMatch = [](mlir::Operation *decl,
                                 llvm::ArrayRef<std::string> expected) {
-    auto attr = decl->getAttrOfType<mlir::ArrayAttr>(
-        py::native::kNativeArgTypesAttr);
+    auto attr =
+        decl->getAttrOfType<mlir::ArrayAttr>(py::native::kNativeArgTypesAttr);
     if (!attr || attr.size() != expected.size())
       return false;
     for (auto [index, raw] : llvm::enumerate(attr)) {
@@ -374,24 +375,20 @@ mlir::FailureOr<mlir::func::FuncOp> getOrCreateNativeDeclaration(
     if (existing.getFunctionType() != type)
       return op->emitError() << "native symbol '" << name
                              << "' was already declared with incompatible type";
-    if (!nativeStringAttrMatches(existing,
-                                 py::native::kNativeSymbolAttr, name) ||
+    if (!nativeStringAttrMatches(existing, py::native::kNativeSymbolAttr,
+                                 name) ||
         !nativeArgTypesMatch(existing, argTypes) ||
-        !nativeStringAttrMatches(
-            existing, py::native::kNativeResultTypeAttr, resultType) ||
-        !nativeStringAttrMatches(existing, py::native::kNativeABIAttr,
-                                 abi) ||
-        !nativeBoolAttrMatches(existing,
-                               py::native::kNativeProcessLibraryAttr,
+        !nativeStringAttrMatches(existing, py::native::kNativeResultTypeAttr,
+                                 resultType) ||
+        !nativeStringAttrMatches(existing, py::native::kNativeABIAttr, abi) ||
+        !nativeBoolAttrMatches(existing, py::native::kNativeProcessLibraryAttr,
                                processLibrary) ||
-        !nativeStringAttrMatches(existing,
-                                 py::native::kNativeTargetTripleAttr,
+        !nativeStringAttrMatches(existing, py::native::kNativeTargetTripleAttr,
                                  facts.triple) ||
         !nativeIntAttrMatches(existing,
                               py::native::kNativeTargetPointerWidthAttr,
                               facts.pointerWidth) ||
-        !nativeIntAttrMatches(existing,
-                              py::native::kNativeTargetCLongWidthAttr,
+        !nativeIntAttrMatches(existing, py::native::kNativeTargetCLongWidthAttr,
                               facts.cLongWidth))
       return op->emitError()
              << "native symbol '" << name
@@ -401,10 +398,9 @@ mlir::FailureOr<mlir::func::FuncOp> getOrCreateNativeDeclaration(
   mlir::OpBuilder::InsertionGuard guard(builder);
   builder.setInsertionPointToEnd(module.getBody());
   auto function =
-      builder.create<mlir::func::FuncOp>(module.getLoc(), name, type);
+      mlir::func::FuncOp::create(builder, module.getLoc(), name, type);
   function.setPrivate();
-  function->setAttr(py::native::kNativeSymbolAttr,
-                    builder.getStringAttr(name));
+  function->setAttr(py::native::kNativeSymbolAttr, builder.getStringAttr(name));
   llvm::SmallVector<mlir::Attribute, 4> args;
   args.reserve(argTypes.size());
   for (llvm::StringRef argType : argTypes)
@@ -413,8 +409,7 @@ mlir::FailureOr<mlir::func::FuncOp> getOrCreateNativeDeclaration(
                     builder.getArrayAttr(args));
   function->setAttr(py::native::kNativeResultTypeAttr,
                     builder.getStringAttr(resultType));
-  function->setAttr(py::native::kNativeABIAttr,
-                    builder.getStringAttr(abi));
+  function->setAttr(py::native::kNativeABIAttr, builder.getStringAttr(abi));
   function->setAttr(py::native::kNativeProcessLibraryAttr,
                     builder.getBoolAttr(processLibrary));
   function->setAttr(py::native::kNativeTargetTripleAttr,

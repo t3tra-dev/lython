@@ -19,7 +19,7 @@ namespace lython::emitter {
 
 Value ModuleEmitter::emitExpr(const parser::Node *expr) {
   if (!expr)
-    return {builder.create<py::NoneOp>(builder.getUnknownLoc(), types.none())
+    return {py::NoneOp::create(builder, builder.getUnknownLoc(), types.none())
                 .getResult(),
             types.none()};
   if (expr->kind == "Constant")
@@ -35,7 +35,7 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
     mlir::Type type = types.lookupSymbol(name).value_or(types.object());
     if (auto cls = types.lookupClass(name)) {
       mlir::Type typeType = types.typeObject(*cls);
-      auto op = builder.create<py::TypeObjectOp>(loc(*expr), typeType, *cls);
+      auto op = py::TypeObjectOp::create(builder, loc(*expr), typeType, *cls);
       return {op.getResult(), typeType};
     }
     std::string binding = std::string(name);
@@ -59,7 +59,7 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
     if (!qualified.empty())
       if (auto cls = types.lookupClass(qualified)) {
         mlir::Type typeType = types.typeObject(*cls);
-        auto op = builder.create<py::TypeObjectOp>(loc(*expr), typeType, *cls);
+        auto op = py::TypeObjectOp::create(builder, loc(*expr), typeType, *cls);
         return {op.getResult(), typeType};
       }
     if (!qualified.empty())
@@ -83,20 +83,20 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
         types.join({types.inferExpr(bodyNode), types.inferExpr(elseNode)});
     mlir::Value condition =
         emitBoolValue(emitExpr(ast::node(*expr, "test")), *expr);
-    auto ifOp = builder.create<mlir::scf::IfOp>(
-        loc(*expr), mlir::TypeRange{resultType}, condition, true);
+    auto ifOp = mlir::scf::IfOp::create(
+        builder, loc(*expr), mlir::TypeRange{resultType}, condition, true);
 
     {
       mlir::OpBuilder::InsertionGuard guard(builder);
       builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
       Value body = coerceValue(emitExpr(bodyNode), resultType, *expr);
-      builder.create<mlir::scf::YieldOp>(loc(*expr), body.value);
+      mlir::scf::YieldOp::create(builder, loc(*expr), body.value);
     }
     {
       mlir::OpBuilder::InsertionGuard guard(builder);
       builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
       Value other = coerceValue(emitExpr(elseNode), resultType, *expr);
-      builder.create<mlir::scf::YieldOp>(loc(*expr), other.value);
+      mlir::scf::YieldOp::create(builder, loc(*expr), other.value);
     }
 
     builder.setInsertionPointAfter(ifOp);
@@ -112,38 +112,38 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
 
 Value ModuleEmitter::emitConstant(const parser::Node &expr) {
   if (ast::isNoneField(expr, "value")) {
-    auto op = builder.create<py::NoneOp>(loc(expr), types.none());
+    auto op = py::NoneOp::create(builder, loc(expr), types.none());
     return {op.getResult(), types.none()};
   }
   if (auto value = ast::boolean(expr, "value")) {
     mlir::Type type = types.literal(*value ? "True" : "False");
-    auto op = builder.create<py::BoolConstantOp>(loc(expr), type,
-                                                 builder.getBoolAttr(*value));
+    auto op = py::BoolConstantOp::create(builder, loc(expr), type,
+                                         builder.getBoolAttr(*value));
     return {op.getResult(), type};
   }
   if (auto value = ast::integer(expr, "value")) {
     std::string text = std::to_string(*value);
     mlir::Type type = types.literal(text);
-    auto op = builder.create<py::IntConstantOp>(loc(expr), type,
-                                                builder.getStringAttr(text));
+    auto op = py::IntConstantOp::create(builder, loc(expr), type,
+                                        builder.getStringAttr(text));
     return {op.getResult(), type};
   }
   if (auto value = ast::floating(expr, "value")) {
-    auto op = builder.create<py::FloatConstantOp>(
-        loc(expr), types.floatType(), builder.getF64FloatAttr(*value));
+    auto op = py::FloatConstantOp::create(builder, loc(expr), types.floatType(),
+                                          builder.getF64FloatAttr(*value));
     return {op.getResult(), types.floatType()};
   }
   if (auto value = ast::string(expr, "value")) {
     mlir::Type type = types.literal("\"" + std::string(*value) + "\"");
-    auto op = builder.create<py::StrConstantOp>(loc(expr), type,
-                                                builder.getStringAttr(*value));
+    auto op = py::StrConstantOp::create(builder, loc(expr), type,
+                                        builder.getStringAttr(*value));
     return {op.getResult(), type};
   }
   if (const auto *fieldValue = ast::field(expr, "value")) {
     if (const auto *big = std::get_if<parser::BigInteger>(fieldValue)) {
       mlir::Type type = types.literal(big->decimal);
-      auto op = builder.create<py::IntConstantOp>(
-          loc(expr), type, builder.getStringAttr(big->decimal));
+      auto op = py::IntConstantOp::create(builder, loc(expr), type,
+                                          builder.getStringAttr(big->decimal));
       return {op.getResult(), type};
     }
   }
@@ -162,21 +162,22 @@ Value ModuleEmitter::emitUnary(const parser::Node &expr) {
     if (auto value = ast::integer(*operandNode, "value")) {
       std::string text = "-" + std::to_string(*value);
       mlir::Type type = types.literal(text);
-      auto constOp = builder.create<py::IntConstantOp>(
-          loc(expr), type, builder.getStringAttr(text));
+      auto constOp = py::IntConstantOp::create(builder, loc(expr), type,
+                                               builder.getStringAttr(text));
       return {constOp.getResult(), type};
     }
     if (auto value = ast::floating(*operandNode, "value")) {
-      auto constOp = builder.create<py::FloatConstantOp>(
-          loc(expr), types.floatType(), builder.getF64FloatAttr(-*value));
+      auto constOp =
+          py::FloatConstantOp::create(builder, loc(expr), types.floatType(),
+                                      builder.getF64FloatAttr(-*value));
       return {constOp.getResult(), types.floatType()};
     }
     if (const auto *fieldValue = ast::field(*operandNode, "value")) {
       if (const auto *big = std::get_if<parser::BigInteger>(fieldValue)) {
         std::string text = "-" + big->decimal;
         mlir::Type type = types.literal(text);
-        auto constOp = builder.create<py::IntConstantOp>(
-            loc(expr), type, builder.getStringAttr(text));
+        auto constOp = py::IntConstantOp::create(builder, loc(expr), type,
+                                                 builder.getStringAttr(text));
         return {constOp.getResult(), type};
       }
     }
@@ -192,10 +193,10 @@ Value ModuleEmitter::emitUnary(const parser::Node &expr) {
     return emitUnarySpecial<py::InvertOp>(expr, "__invert__", operand, result);
   if (ast::isOperator(op, "Not")) {
     mlir::Value truth = emitBoolValue(operand, expr);
-    auto one = builder.create<mlir::arith::ConstantIntOp>(loc(expr), 1, 1);
-    auto inverted = builder.create<mlir::arith::XOrIOp>(loc(expr), truth, one);
-    auto pyBool = builder.create<py::CastFromPrimOp>(
-        loc(expr), types.boolType(), inverted.getResult());
+    auto one = mlir::arith::ConstantIntOp::create(builder, loc(expr), 1, 1);
+    auto inverted = mlir::arith::XOrIOp::create(builder, loc(expr), truth, one);
+    auto pyBool = py::CastFromPrimOp::create(
+        builder, loc(expr), types.boolType(), inverted.getResult());
     return {pyBool.getResult(), types.boolType()};
   }
   diagnostics.push_back(parser::Diagnostic{
@@ -254,8 +255,8 @@ Value ModuleEmitter::emitCompare(const parser::Node &expr) {
   const auto *comparators = ast::nodeList(expr, "comparators");
   const auto *ops = ast::nodeList(expr, "ops");
   if (!comparators || comparators->empty()) {
-    auto op = builder.create<py::BoolConstantOp>(
-        loc(expr), types.literal("False"), builder.getBoolAttr(false));
+    auto op = py::BoolConstantOp::create(
+        builder, loc(expr), types.literal("False"), builder.getBoolAttr(false));
     return {op.getResult(), types.literal("False")};
   }
   Value rhs = emitExpr(comparators->front().get());
@@ -269,16 +270,16 @@ Value ModuleEmitter::emitCompare(const parser::Node &expr) {
         !isNoneTypeLike(other.type))
       return std::nullopt;
 
-    auto test = builder.create<py::UnionTestOp>(
-        loc(expr), builder.getI1Type(), candidate.value,
-        mlir::TypeAttr::get(types.none()));
+    auto test = py::UnionTestOp::create(builder, loc(expr), builder.getI1Type(),
+                                        candidate.value,
+                                        mlir::TypeAttr::get(types.none()));
     mlir::Value bit = test.getResult();
     if (ast::isOperator(op, "IsNot")) {
-      auto one = builder.create<mlir::arith::ConstantIntOp>(loc(expr), 1, 1);
-      bit = builder.create<mlir::arith::XOrIOp>(loc(expr), bit, one);
+      auto one = mlir::arith::ConstantIntOp::create(builder, loc(expr), 1, 1);
+      bit = mlir::arith::XOrIOp::create(builder, loc(expr), bit, one);
     }
     auto pyBool =
-        builder.create<py::CastFromPrimOp>(loc(expr), types.boolType(), bit);
+        py::CastFromPrimOp::create(builder, loc(expr), types.boolType(), bit);
     return Value{pyBool.getResult(), types.boolType()};
   };
   if (ast::isOperator(op, "Is") || ast::isOperator(op, "IsNot")) {
@@ -290,17 +291,17 @@ Value ModuleEmitter::emitCompare(const parser::Node &expr) {
   if (ast::isOperator(op, "In") || ast::isOperator(op, "NotIn")) {
     CallInferenceResult inference =
         types.inferMethodCallWithEvidence(rhs.type, "__contains__", {lhs.type});
-    auto contains = builder.create<py::ContainsOp>(
-        loc(expr), builder.getI1Type(),
+    auto contains = py::ContainsOp::create(
+        builder, loc(expr), builder.getI1Type(),
         mlir::FlatSymbolRefAttr::get(&context, "__contains__"),
         callProtocolFor(inference), rhs.value, lhs.value);
     mlir::Value bit = contains.getResult();
     if (ast::isOperator(op, "NotIn")) {
-      auto one = builder.create<mlir::arith::ConstantIntOp>(loc(expr), 1, 1);
-      bit = builder.create<mlir::arith::XOrIOp>(loc(expr), bit, one);
+      auto one = mlir::arith::ConstantIntOp::create(builder, loc(expr), 1, 1);
+      bit = mlir::arith::XOrIOp::create(builder, loc(expr), bit, one);
     }
     auto pyBool =
-        builder.create<py::CastFromPrimOp>(loc(expr), types.boolType(), bit);
+        py::CastFromPrimOp::create(builder, loc(expr), types.boolType(), bit);
     return Value{pyBool.getResult(), types.boolType()};
   }
   if (ast::isOperator(op, "NotEq") || ast::isOperator(op, "IsNot"))
@@ -328,8 +329,9 @@ Value ModuleEmitter::emitSubscript(const parser::Node &expr) {
   CallInferenceResult inference = types.inferMethodCallWithEvidence(
       container.type, "__getitem__", {index.type});
   mlir::Type result = inference ? inference.resultType : types.inferExpr(&expr);
-  auto op = builder.create<py::GetItemOp>(
-      loc(expr), result, mlir::FlatSymbolRefAttr::get(&context, "__getitem__"),
+  auto op = py::GetItemOp::create(
+      builder, loc(expr), result,
+      mlir::FlatSymbolRefAttr::get(&context, "__getitem__"),
       callProtocolFor(inference), container.value, index.value);
   return {op.getResult(), result};
 }
@@ -376,15 +378,15 @@ Value ModuleEmitter::emitMethodObject(const parser::Node &anchor, Value object,
   } else {
     Value descriptorReceiver =
         emitDescriptorReceiver(anchor, object, methodBinding);
-    captures.push_back(Capture{methodBinding.bodySignature.positionalNames.front(),
-                               descriptorReceiver});
+    captures.push_back(
+        Capture{methodBinding.bodySignature.positionalNames.front(),
+                descriptorReceiver});
   }
-  std::string symbolName =
-      (llvm::Twine(methodBinding.symbolName) + "$bound$" +
-       llvm::Twine(++syntheticFunctionCounter) + "$" +
-       llvm::Twine(anchor.range.start.line) + "_" +
-       llvm::Twine(anchor.range.start.column))
-          .str();
+  std::string symbolName = (llvm::Twine(methodBinding.symbolName) + "$bound$" +
+                            llvm::Twine(++syntheticFunctionCounter) + "$" +
+                            llvm::Twine(anchor.range.start.line) + "_" +
+                            llvm::Twine(anchor.range.start.column))
+                               .str();
   emitCallableFunction(*methodBinding.method, symbolName, boundBodySig,
                        captures, /*isLambda=*/false,
                        /*positionalNodeOffset=*/1, preboundTypeObject);
@@ -413,7 +415,7 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
     return emitMethodObject(expr, object, *methodBinding);
 
   auto op =
-      builder.create<py::AttrGetOp>(loc(expr), result, object.value, *attr);
+      py::AttrGetOp::create(builder, loc(expr), result, object.value, *attr);
   if (field)
     op->setAttr("ly.attr.kind", builder.getStringAttr("field"));
   else if (staticAttr)
@@ -432,9 +434,8 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
   }
   Value value{op.getResult(), result};
   if (methodBinding)
-    value.boundMethod =
-        std::make_shared<BoundMethodValue>(BoundMethodValue{object,
-                                                            *methodBinding});
+    value.boundMethod = std::make_shared<BoundMethodValue>(
+        BoundMethodValue{object, *methodBinding});
   return value;
 }
 
@@ -463,8 +464,8 @@ Value ModuleEmitter::emitAwaitValue(const parser::Node &anchor,
             typeStream.str()});
   }
 
-  auto op = builder.create<py::AwaitOp>(loc(anchor), result, awaitContract,
-                                        awaitable.value);
+  auto op = py::AwaitOp::create(builder, loc(anchor), result, awaitContract,
+                                awaitable.value);
   return {op.getResult(), result};
 }
 
@@ -486,7 +487,7 @@ Value ModuleEmitter::emitContainerLiteral(const parser::Node &expr) {
   llvm::SmallVector<mlir::Value, 8> operands;
   for (Value value : valuesToPack)
     operands.push_back(value.value);
-  auto op = builder.create<py::PackOp>(loc(expr), resultType, operands);
+  auto op = py::PackOp::create(builder, loc(expr), resultType, operands);
   return {op.getResult(), resultType};
 }
 
@@ -497,8 +498,9 @@ Value ModuleEmitter::emitBindingRef(const parser::Node &anchor,
   llvm::SmallVector<mlir::Value, 4> captureValues;
   for (Value capture : captures)
     captureValues.push_back(capture.value);
-  auto op = builder.create<py::BindingRefOp>(
-      loc(anchor), resultType, builder.getStringAttr(binding), captureValues);
+  auto op =
+      py::BindingRefOp::create(builder, loc(anchor), resultType,
+                               builder.getStringAttr(binding), captureValues);
   return {op.getResult(), resultType};
 }
 
@@ -513,7 +515,7 @@ Value ModuleEmitter::emitFunctionObject(const parser::Node &anchor,
 }
 
 Value ModuleEmitter::emitNone(const parser::Node &anchor) {
-  auto op = builder.create<py::NoneOp>(loc(anchor), types.none());
+  auto op = py::NoneOp::create(builder, loc(anchor), types.none());
   return {op.getResult(), types.none()};
 }
 
@@ -528,8 +530,8 @@ Value ModuleEmitter::emitPack(mlir::ArrayRef<Value> valuesIn,
   mlir::Type element =
       elementTypes.empty() ? types.object() : types.join(elementTypes);
   mlir::Type resultType = types.tupleOf(element);
-  auto op =
-      builder.create<py::PackOp>(builder.getUnknownLoc(), resultType, operands);
+  auto op = py::PackOp::create(builder, builder.getUnknownLoc(), resultType,
+                               operands);
   if (!unpacked.empty() && anyTrue(unpacked)) {
     if (unpacked.size() != valuesIn.size()) {
       diagnostics.push_back(
@@ -549,21 +551,21 @@ Value ModuleEmitter::coerceValue(Value value, mlir::Type targetType,
     return value;
   if (auto unionType = mlir::dyn_cast<py::UnionType>(targetType)) {
     if (unionType.hasMember(value.type)) {
-      auto op =
-          builder.create<py::UnionWrapOp>(loc(anchor), targetType, value.value);
+      auto op = py::UnionWrapOp::create(builder, loc(anchor), targetType,
+                                        value.value);
       return {op.getResult(), targetType};
     }
   }
   if (mlir::isa<py::ProtocolType>(targetType)) {
-    auto op = builder.create<py::ProtocolViewOp>(loc(anchor), targetType,
-                                                 value.value);
+    auto op = py::ProtocolViewOp::create(builder, loc(anchor), targetType,
+                                         value.value);
     return {op.getResult(), targetType};
   }
   if (mlir::isa<py::ContractType, py::LiteralType, py::CallableType,
                 py::TypeType, py::SelfType, py::TypeVarType, py::ParamSpecType>(
           targetType)) {
-    auto op =
-        builder.create<py::ClassUpcastOp>(loc(anchor), targetType, value.value);
+    auto op = py::ClassUpcastOp::create(builder, loc(anchor), targetType,
+                                        value.value);
     return {op.getResult(), targetType};
   }
   return value;
@@ -575,10 +577,10 @@ mlir::Value ModuleEmitter::emitBoolValue(Value value,
     return value.value;
   CallInferenceResult inference =
       types.inferMethodCallWithEvidence(value.type, "__bool__", {});
-  auto op = builder.create<py::BoolOp>(
-      loc(anchor), builder.getI1Type(),
-      mlir::FlatSymbolRefAttr::get(&context, "__bool__"),
-      callProtocolFor(inference), value.value);
+  auto op =
+      py::BoolOp::create(builder, loc(anchor), builder.getI1Type(),
+                         mlir::FlatSymbolRefAttr::get(&context, "__bool__"),
+                         callProtocolFor(inference), value.value);
   return op.getResult();
 }
 

@@ -100,8 +100,7 @@ struct OwnedReturnRange {
   mlir::Type type;
 };
 
-std::optional<llvm::SmallVector<OwnedReturnRange, 4>>
-callableOwnedReturnRanges(
+std::optional<llvm::SmallVector<OwnedReturnRange, 4>> callableOwnedReturnRanges(
     mlir::func::FuncOp function, mlir::ValueRange values,
     llvm::ArrayRef<own::RuntimeDeallocator> deallocators) {
   auto callableAttr =
@@ -126,17 +125,16 @@ callableOwnedReturnRanges(
   return ranges;
 }
 
-bool groupMatchesOwnedReturnRange(mlir::ValueRange values,
-                                  const OwnedReturnRange &range,
-                                  llvm::ArrayRef<mlir::Value> group,
-                                  llvm::ArrayRef<own::RuntimeDeallocator>
-                                      deallocators,
-                                  own::AliasAnalysis &aliases) {
+bool groupMatchesOwnedReturnRange(
+    mlir::ValueRange values, const OwnedReturnRange &range,
+    llvm::ArrayRef<mlir::Value> group,
+    llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
+    own::AliasAnalysis &aliases) {
   if (group.empty())
     return false;
 
-  auto matchesLogicalValue = [&](auto &&self, unsigned offset, mlir::Type type)
-      -> bool {
+  auto matchesLogicalValue = [&](auto &&self, unsigned offset,
+                                 mlir::Type type) -> bool {
     if (auto unionType = mlir::dyn_cast<py::UnionType>(type)) {
       if (group.size() == range.size &&
           groupMatchesOperands(values, range.offset, group, aliases))
@@ -214,7 +212,8 @@ bool returnCarriesGroupInsideOwnedAggregate(
   for (const OwnedReturnRange &range : *ranges) {
     if (group.size() >= range.size)
       continue;
-    unsigned end = range.offset + range.size - static_cast<unsigned>(group.size());
+    unsigned end =
+        range.offset + range.size - static_cast<unsigned>(group.size());
     for (unsigned offset = range.offset; offset <= end; ++offset)
       if (groupMatchesOperands(ret.getOperands(), offset, group, aliases))
         return true;
@@ -559,10 +558,11 @@ mlir::func::ReturnOp straightLineReturnOp(mlir::func::FuncOp function) {
   return mlir::dyn_cast<mlir::func::ReturnOp>(function.front().getTerminator());
 }
 
-std::optional<mlir::LogicalResult> verifyStraightLineResource(
-    FuncContractCache &contracts, TrackedResource &resource,
-    llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
-    own::AliasAnalysis &aliases) {
+std::optional<mlir::LogicalResult>
+verifyStraightLineResource(FuncContractCache &contracts,
+                           TrackedResource &resource,
+                           llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
+                           own::AliasAnalysis &aliases) {
   if (resource.condition || !resource.producer)
     return std::nullopt;
   mlir::Block *block = resource.producer->getBlock();
@@ -600,9 +600,8 @@ std::optional<mlir::LogicalResult> verifyStraightLineResource(
   llvm::SmallVector<mlir::Value, 4> group = resource.group;
   for (mlir::Operation *op : users) {
     if (auto ret = mlir::dyn_cast<mlir::func::ReturnOp>(op)) {
-      bool consumes =
-          returnConsumesGroup(resource.function, ret, group, deallocators,
-                              aliases);
+      bool consumes = returnConsumesGroup(resource.function, ret, group,
+                                          deallocators, aliases);
       bool uses = groupContainsOperand(op, group, aliases);
       if (token == AffineTokenState::Owned) {
         if (!consumes)
@@ -623,9 +622,9 @@ std::optional<mlir::LogicalResult> verifyStraightLineResource(
             returnCarriesGroupInsideOwnedAggregate(
                 resource.function, ret, group, deallocators, aliases))
           return mlir::success();
-        return ret.emitError() << "released owned resource from "
-                               << resource.producerLabel
-                               << " is used by function return";
+        return ret.emitError()
+               << "released owned resource from " << resource.producerLabel
+               << " is used by function return";
       }
       return mlir::success();
     }
@@ -697,9 +696,8 @@ callableLogicalInputTypes(mlir::func::FuncOp function) {
   llvm::SmallVector<mlir::Type, 8> types;
   auto callableAttr =
       function->getAttrOfType<mlir::TypeAttr>(own::kCallableTypeAttr);
-  auto callable =
-      mlir::dyn_cast_if_present<py::CallableType>(
-          callableAttr ? callableAttr.getValue() : mlir::Type());
+  auto callable = mlir::dyn_cast_if_present<py::CallableType>(
+      callableAttr ? callableAttr.getValue() : mlir::Type());
   if (!callable)
     return types;
   types.append(callable.getPositionalTypes().begin(),
@@ -875,8 +873,7 @@ bool enqueueRegionEntryPaths(mlir::Operation *op, AffinePathState state,
   for (mlir::RegionSuccessor successor : successors) {
     if (successor.isParent()) {
       AffinePathState next = state;
-      mlir::OperandRange sources =
-          branch.getEntrySuccessorOperands(mlir::RegionBranchPoint(successor));
+      mlir::OperandRange sources = branch.getEntrySuccessorOperands(successor);
       next.group = remapGroupThroughValueMapping(
           sources, successor.getSuccessorInputs(), state.group, aliases);
       enqueueRegionSuccessor(op, successor, std::move(next), worklist);
@@ -891,8 +888,7 @@ bool enqueueRegionEntryPaths(mlir::Operation *op, AffinePathState state,
     }
 
     AffinePathState next = state;
-    mlir::OperandRange sources =
-        branch.getEntrySuccessorOperands(mlir::RegionBranchPoint(successor));
+    mlir::OperandRange sources = branch.getEntrySuccessorOperands(successor);
     next.group = remapGroupThroughValueMapping(
         sources, successor.getSuccessorInputs(), state.group, aliases);
     enqueueRegionSuccessor(op, successor, std::move(next), worklist);
@@ -943,8 +939,7 @@ bool enqueueBorrowedRegionEntryPaths(
   for (mlir::RegionSuccessor successor : successors) {
     if (successor.isParent()) {
       BorrowedPathState next = state;
-      mlir::OperandRange sources =
-          branch.getEntrySuccessorOperands(mlir::RegionBranchPoint(successor));
+      mlir::OperandRange sources = branch.getEntrySuccessorOperands(successor);
       next.group = remapGroupThroughValueMapping(
           sources, successor.getSuccessorInputs(), state.group, aliases);
       enqueueBorrowedRegionSuccessor(op, successor, std::move(next), worklist);
@@ -959,8 +954,7 @@ bool enqueueBorrowedRegionEntryPaths(
     }
 
     BorrowedPathState next = state;
-    mlir::OperandRange sources =
-        branch.getEntrySuccessorOperands(mlir::RegionBranchPoint(successor));
+    mlir::OperandRange sources = branch.getEntrySuccessorOperands(successor);
     next.group = remapGroupThroughValueMapping(
         sources, successor.getSuccessorInputs(), state.group, aliases);
     enqueueBorrowedRegionSuccessor(op, successor, std::move(next), worklist);
@@ -1038,8 +1032,8 @@ handleRegionTerminator(mlir::Operation *terminator, TrackedResource &resource,
   if (!enqueued) {
     if (localGroup)
       return terminator->emitError()
-             << "owned resource from " << resource.producerLabel
-             << " result " << resource.resultOffset
+             << "owned resource from " << resource.producerLabel << " result "
+             << resource.resultOffset
              << " is produced inside a region but not yielded to any "
                 "successor";
     AffinePathState next = state;
@@ -1087,8 +1081,8 @@ handleGenericRegionReturn(mlir::Operation *terminator,
 
   if (localGroup && !fullyMapped)
     return terminator->emitError()
-           << "owned resource from " << resource.producerLabel
-           << " result " << resource.resultOffset
+           << "owned resource from " << resource.producerLabel << " result "
+           << resource.resultOffset
            << " is produced inside a region but not yielded to the parent "
               "operation";
 
@@ -1142,8 +1136,7 @@ mlir::LogicalResult handleBorrowedRegionTerminator(
 
     BorrowedPathState next = state;
     next.group = std::move(mappedGroup);
-    enqueueBorrowedRegionSuccessor(owner, successor, std::move(next),
-                                   worklist);
+    enqueueBorrowedRegionSuccessor(owner, successor, std::move(next), worklist);
     enqueued = true;
   }
 
@@ -1219,9 +1212,8 @@ mlir::LogicalResult verifyBorrowedEntryOnCFGPaths(
     mlir::Operation *op = state.start;
     while (op) {
       if (auto ret = mlir::dyn_cast<mlir::func::ReturnOp>(op)) {
-        bool consumes =
-            returnConsumesGroup(resource.function, ret, state.group,
-                                deallocators, aliases);
+        bool consumes = returnConsumesGroup(resource.function, ret, state.group,
+                                            deallocators, aliases);
         if (consumes) {
           if (state.retained == 0)
             return ret.emitError()
@@ -1327,10 +1319,9 @@ mlir::LogicalResult verifyBorrowedEntryOnCFGPaths(
     if (successors == 0) {
       if (state.retained != 0)
         return op->emitError()
-               << "borrowed entry argument " << resource.logicalIndex
-               << " of @" << resource.function.getSymName()
-               << " reaches a CFG exit with " << state.retained
-               << " retained ownership token(s)";
+               << "borrowed entry argument " << resource.logicalIndex << " of @"
+               << resource.function.getSymName() << " reaches a CFG exit with "
+               << state.retained << " retained ownership token(s)";
       continue;
     }
 
@@ -1358,10 +1349,9 @@ verifyResourceOnCFGPaths(FuncContractCache &contracts,
   AffineTokenState initialToken = resource.condition
                                       ? AffineTokenState::Conditional
                                       : AffineTokenState::Owned;
-  worklist.push_back(AffinePathState{resource.producer->getBlock(),
-                                     resource.producer->getNextNode(),
-                                     initialToken, /*retained=*/0,
-                                     resource.group});
+  worklist.push_back(AffinePathState{
+      resource.producer->getBlock(), resource.producer->getNextNode(),
+      initialToken, /*retained=*/0, resource.group});
 
   constexpr unsigned kMaxAffineStates = 20000;
   while (!worklist.empty()) {
@@ -1379,13 +1369,13 @@ verifyResourceOnCFGPaths(FuncContractCache &contracts,
         continue;
       if (state.token == AffineTokenState::Owned)
         return state.start->emitError()
-               << "owned resource from " << resource.producerLabel
-               << " result " << resource.resultOffset
+               << "owned resource from " << resource.producerLabel << " result "
+               << resource.resultOffset
                << " reaches the next loop iteration without release, "
                   "transfer, or owned return";
       return state.start->emitError()
-             << "conditionally owned resource from "
-             << resource.producerLabel << " result " << resource.resultOffset
+             << "conditionally owned resource from " << resource.producerLabel
+             << " result " << resource.resultOffset
              << " reaches the next loop iteration without tag-conditioned "
                 "release, transfer, or owned return";
     }
@@ -1393,9 +1383,8 @@ verifyResourceOnCFGPaths(FuncContractCache &contracts,
     mlir::Operation *op = state.start;
     while (op) {
       if (auto ret = mlir::dyn_cast<mlir::func::ReturnOp>(op)) {
-        bool consumes =
-            returnConsumesGroup(resource.function, ret, state.group,
-                                deallocators, aliases);
+        bool consumes = returnConsumesGroup(resource.function, ret, state.group,
+                                            deallocators, aliases);
         bool uses = groupContainsOperand(op, state.group, aliases);
         if (state.token == AffineTokenState::Owned) {
           if (!consumes)
@@ -1407,8 +1396,8 @@ verifyResourceOnCFGPaths(FuncContractCache &contracts,
           if (state.retained != 0)
             return ret.emitError()
                    << "owned resource from " << resource.producerLabel
-                   << " result " << resource.resultOffset << " is returned with "
-                   << state.retained
+                   << " result " << resource.resultOffset
+                   << " is returned with " << state.retained
                    << " additional retained ownership token(s)";
           break;
         }
@@ -1434,9 +1423,9 @@ verifyResourceOnCFGPaths(FuncContractCache &contracts,
               returnCarriesGroupInsideOwnedAggregate(
                   resource.function, ret, state.group, deallocators, aliases))
             break;
-          return ret.emitError() << "released owned resource from "
-                                 << resource.producerLabel
-                                 << " is used by function return";
+          return ret.emitError()
+                 << "released owned resource from " << resource.producerLabel
+                 << " is used by function return";
         }
         break;
       }
@@ -1444,8 +1433,8 @@ verifyResourceOnCFGPaths(FuncContractCache &contracts,
       if (state.token == AffineTokenState::Conditional) {
         if (resource.condition) {
           if (std::optional<own::OwnershipConditionBranch> branch =
-                  own::classifyOwnershipConditionBranch(
-                      op, *resource.condition)) {
+                  own::classifyOwnershipConditionBranch(op,
+                                                        *resource.condition)) {
             for (auto [successorIndex, nextToken] :
                  {std::pair<unsigned, AffineTokenState>{
                       branch->activeSuccessor, AffineTokenState::Owned},
@@ -1455,10 +1444,9 @@ verifyResourceOnCFGPaths(FuncContractCache &contracts,
               llvm::SmallVector<mlir::Value, 4> mappedGroup =
                   remapGroupForSuccessor(op, successorIndex, successor,
                                          state.group, aliases);
-              worklist.push_back(
-                  AffinePathState{successor, firstOperation(successor),
-                                  nextToken, state.retained,
-                                  std::move(mappedGroup)});
+              worklist.push_back(AffinePathState{
+                  successor, firstOperation(successor), nextToken,
+                  state.retained, std::move(mappedGroup)});
             }
             op = nullptr;
             break;
@@ -1474,7 +1462,8 @@ verifyResourceOnCFGPaths(FuncContractCache &contracts,
       }
 
       if (auto call = mlir::dyn_cast<mlir::func::CallOp>(op)) {
-        bool consumes = callConsumesGroup(contracts, call, state.group, aliases);
+        bool consumes =
+            callConsumesGroup(contracts, call, state.group, aliases);
         bool retains = callRetainsGroup(contracts, call, state.group, aliases);
         if (callPartiallyConsumesGroup(contracts, call, state.group, aliases))
           return call.emitError()
@@ -1498,8 +1487,8 @@ verifyResourceOnCFGPaths(FuncContractCache &contracts,
           if (groupContainsOperand(op, state.group, aliases) &&
               state.retained == 0)
             return call.emitError()
-                   << "released owned resource from "
-                   << resource.producerLabel << " is used after release";
+                   << "released owned resource from " << resource.producerLabel
+                   << " is used after release";
           if (retains)
             ++state.retained;
         } else if (state.token == AffineTokenState::Owned && consumes) {
@@ -1567,15 +1556,14 @@ verifyResourceOnCFGPaths(FuncContractCache &contracts,
     if (successors == 0) {
       if (state.token == AffineTokenState::Owned)
         return op->emitError()
-               << "owned resource from " << resource.producerLabel
-               << " result " << resource.resultOffset
+               << "owned resource from " << resource.producerLabel << " result "
+               << resource.resultOffset
                << " reaches a CFG exit without release, transfer, or owned "
                   "return";
       if (state.token == AffineTokenState::Conditional)
         return op->emitError()
-               << "conditionally owned resource from "
-               << resource.producerLabel << " result "
-               << resource.resultOffset
+               << "conditionally owned resource from " << resource.producerLabel
+               << " result " << resource.resultOffset
                << " reaches a CFG exit without tag-conditioned release, "
                   "transfer, or owned return";
       continue;
@@ -1664,9 +1652,8 @@ mlir::LogicalResult verifyFunctionAffineOwnership(
       borrowedEntryResources.empty()) {
     bool allResourcesHandled = true;
     for (TrackedResource &resource : resources) {
-      std::optional<mlir::LogicalResult> result =
-          verifyStraightLineResource(contracts, resource, deallocators,
-                                     aliases);
+      std::optional<mlir::LogicalResult> result = verifyStraightLineResource(
+          contracts, resource, deallocators, aliases);
       if (!result) {
         allResourcesHandled = false;
         break;
@@ -1679,9 +1666,8 @@ mlir::LogicalResult verifyFunctionAffineOwnership(
   }
 
   for (TrackedResource &resource : resources)
-    if (mlir::failed(
-            verifyResourceOnCFGPaths(contracts, resource, deallocators,
-                                     aliases)))
+    if (mlir::failed(verifyResourceOnCFGPaths(contracts, resource, deallocators,
+                                              aliases)))
       return mlir::failure();
 
   for (BorrowedEntryResource &resource : borrowedEntryResources)
@@ -1705,7 +1691,8 @@ mlir::LogicalResult verifyPathSensitiveAffineOwnership(
       });
 }
 
-mlir::LogicalResult verifyFuncCallOwnershipContractsImpl(mlir::ModuleOp module) {
+mlir::LogicalResult
+verifyFuncCallOwnershipContractsImpl(mlir::ModuleOp module) {
   own::AliasAnalysis aliases;
   {
     py::PerfScope perf("func-call-ownership.alias-analysis");

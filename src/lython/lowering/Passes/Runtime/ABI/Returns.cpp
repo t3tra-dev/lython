@@ -79,9 +79,8 @@ mlir::LogicalResult RuntimeBundleLowerer::bundleRuntimeResults(
     if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
             op, expectedContract, objectValues, result)))
       return mlir::failure();
-    result.primitiveI64 =
-        RuntimePrimitiveI64Evidence{values[expectedTypes->size()],
-                                    values[expectedTypes->size() + 1]};
+    result.primitiveI64 = RuntimePrimitiveI64Evidence{
+        values[expectedTypes->size()], values[expectedTypes->size() + 1]};
     return mlir::success();
   }
   if (!expected.empty() &&
@@ -102,27 +101,25 @@ const RuntimeBundle *RuntimeBundleLowerer::bundleFor(mlir::Value value) const {
 
 mlir::Value RuntimeBundleLowerer::materializeByteBuffer(mlir::Location loc,
                                                         llvm::StringRef text) {
-  mlir::Value dynamicSize = builder
-                                .create<mlir::arith::ConstantIndexOp>(
-                                    loc, static_cast<std::int64_t>(text.size()))
-                                .getResult();
+  mlir::Value dynamicSize =
+      mlir::arith::ConstantIndexOp::create(
+          builder, loc, static_cast<std::int64_t>(text.size()))
+          .getResult();
   auto memrefType =
       mlir::MemRefType::get({mlir::ShapedType::kDynamic}, builder.getI8Type());
-  mlir::Value buffer = builder
-                           .create<mlir::memref::AllocaOp>(
-                               loc, memrefType, mlir::ValueRange{dynamicSize})
-                           .getResult();
+  mlir::Value buffer =
+      mlir::memref::AllocaOp::create(builder, loc, memrefType,
+                                     mlir::ValueRange{dynamicSize})
+          .getResult();
   for (auto [index, byte] : llvm::enumerate(text.bytes())) {
-    mlir::Value position = builder
-                               .create<mlir::arith::ConstantIndexOp>(
-                                   loc, static_cast<std::int64_t>(index))
+    mlir::Value position = mlir::arith::ConstantIndexOp::create(
+                               builder, loc, static_cast<std::int64_t>(index))
                                .getResult();
-    mlir::Value value = builder
-                            .create<mlir::arith::ConstantIntOp>(
-                                loc, static_cast<std::int64_t>(byte), 8)
+    mlir::Value value = mlir::arith::ConstantIntOp::create(
+                            builder, loc, static_cast<std::int64_t>(byte), 8)
                             .getResult();
-    builder.create<mlir::memref::StoreOp>(loc, value, buffer,
-                                          mlir::ValueRange{position});
+    mlir::memref::StoreOp::create(builder, loc, value, buffer,
+                                  mlir::ValueRange{position});
   }
   return buffer;
 }
@@ -133,9 +130,9 @@ RuntimeBundleLowerer::createRuntimeCall(mlir::Location loc,
                                         mlir::ValueRange operands) {
   mlir::func::FuncOp function = symbol.function;
   emitTryCallSiteMarkerIfNeeded(loc);
-  return builder.create<mlir::func::CallOp>(
-      loc, function.getSymName(), function.getFunctionType().getResults(),
-      operands);
+  return mlir::func::CallOp::create(builder, loc, function.getSymName(),
+                                    function.getFunctionType().getResults(),
+                                    operands);
 }
 
 std::int64_t RuntimeBundleLowerer::functionTargetId(llvm::StringRef target) {
@@ -156,7 +153,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
     if (isPrimitiveOnlyCallableFunction(function))
       return mlir::WalkResult::advance();
 
-    auto callableAttr = function->getAttrOfType<mlir::TypeAttr>("callable_type");
+    auto callableAttr =
+        function->getAttrOfType<mlir::TypeAttr>("callable_type");
     auto callable = mlir::dyn_cast_if_present<py::CallableType>(
         callableAttr ? callableAttr.getValue() : mlir::Type());
     llvm::SmallVector<mlir::Type, 4> logicalResultTypes;
@@ -203,10 +201,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
           operands.push_back(bundle->primitiveI64->valid);
         } else {
           operands.push_back(
-              builder.create<mlir::arith::ConstantIntOp>(op.getLoc(), 0, 64)
+              mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 0, 64)
                   .getResult());
           operands.push_back(
-              builder.create<mlir::arith::ConstantIntOp>(op.getLoc(), 0, 1)
+              mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 0, 1)
                   .getResult());
         }
         resultIndex += 2;
@@ -219,7 +217,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
         result = mlir::failure();
         return mlir::WalkResult::interrupt();
       }
-      builder.create<mlir::func::ReturnOp>(op.getLoc(), operands);
+      mlir::func::ReturnOp::create(builder, op.getLoc(), operands);
       op.erase();
       return mlir::WalkResult::advance();
     }
@@ -235,10 +233,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
         operands.push_back(bundle.primitiveI64->valid);
       } else {
         operands.push_back(
-            builder.create<mlir::arith::ConstantIntOp>(op.getLoc(), 0, 64)
+            mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 0, 64)
                 .getResult());
         operands.push_back(
-            builder.create<mlir::arith::ConstantIntOp>(op.getLoc(), 0, 1)
+            mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 0, 1)
                 .getResult());
       }
       resultIndex += 2;
@@ -263,7 +261,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
             resultIndex + values.size() <= functionType.getNumResults()) {
           bool exactBox = !values.empty();
           for (auto [offset, value] : llvm::enumerate(values)) {
-            if (value.getType() != functionType.getResult(resultIndex + offset)) {
+            if (value.getType() !=
+                functionType.getResult(resultIndex + offset)) {
               exactBox = false;
               break;
             }
@@ -378,17 +377,15 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
       }
       if (returnedStaticObject != returnedStaticObjectSummaries.end() &&
           returnedStaticObject->second.resultIndex == logicalResultIndex) {
-        mlir::Type objectContract =
-            returnedStaticObject->second.objectContract;
+        mlir::Type objectContract = returnedStaticObject->second.objectContract;
         const RuntimeBundle *staticObject = nullptr;
         if (bundle->kind == RuntimeBundle::Kind::Object &&
             py::isAssignableTo(bundle->objectValue.contract, objectContract,
                                op.getOperation())) {
           staticObject = bundle;
         } else if (bundle->boxedObject &&
-                   py::isAssignableTo(
-                       bundle->boxedObject->objectValue.contract,
-                       objectContract, op.getOperation())) {
+                   py::isAssignableTo(bundle->boxedObject->objectValue.contract,
+                                      objectContract, op.getOperation())) {
           staticObject = bundle->boxedObject.get();
         }
         if (!staticObject) {
@@ -443,9 +440,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
                   : RuntimeBundle::object(source.contract, source.values);
           sourceBundle.contract = source.contract;
           sourceBundle.objectValue = source;
-          if (mlir::failed(
-                  appendReturnObject(sourceBundle, "coroutine frame source",
-                                     expected))) {
+          if (mlir::failed(appendReturnObject(
+                  sourceBundle, "coroutine frame source", expected))) {
             result = mlir::failure();
             return mlir::WalkResult::interrupt();
           }
@@ -482,9 +478,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
           }
           RuntimeBundle valueBundle =
               RuntimeBundle::object(value->contract, value->values);
-          if (mlir::failed(appendReturnObject(
-                  valueBundle, "returned object evidence slot",
-                  slot.sourceContract))) {
+          if (mlir::failed(appendReturnObject(valueBundle,
+                                              "returned object evidence slot",
+                                              slot.sourceContract))) {
             result = mlir::failure();
             return mlir::WalkResult::interrupt();
           }
@@ -501,7 +497,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
       return mlir::WalkResult::interrupt();
     }
 
-    builder.create<mlir::func::ReturnOp>(op.getLoc(), operands);
+    mlir::func::ReturnOp::create(builder, op.getLoc(), operands);
     op.erase();
     return mlir::WalkResult::advance();
   });

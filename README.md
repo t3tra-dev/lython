@@ -10,7 +10,7 @@
 - CMake 3.20+
 - Ninja
 - C++17 対応コンパイラ
-- LLVM/MLIR 20 (`llvm@20` または `llvm-20-dev` / `libmlir-20-dev`)
+- LLVM/MLIR 22 (`llvm`/`llvm@22` または `llvm-22-dev` / `libmlir-22-dev`)
 - uv (Python パッケージマネージャ)
 
 ### ビルド手順
@@ -21,13 +21,13 @@ cd lython
 uv sync
 
 # macOS:
-brew install llvm@20
+brew install llvm
 
 # Ubuntu:
 # wget https://apt.llvm.org/llvm.sh
 # chmod +x llvm.sh
-# sudo ./llvm.sh 20
-# sudo apt-get install -y clang-20 lld-20 llvm-20-dev libmlir-20-dev mlir-20-tools
+# sudo ./llvm.sh 22
+# sudo apt-get install -y clang-22 lld-22 llvm-22-dev libmlir-22-dev mlir-22-tools
 
 # Lython 本体
 cmake -B build -S .

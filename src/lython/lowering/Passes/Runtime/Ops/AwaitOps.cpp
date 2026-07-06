@@ -180,8 +180,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAwait(py::AwaitOp op) {
   return RuntimeBundleLowerer::lowerGeneralAwaitableIterator(op, awaitable);
 }
 
-mlir::LogicalResult RuntimeBundleLowerer::lowerGeneralAwaitableIterator(
-    py::AwaitOp op, RuntimeBundle &awaitable) {
+mlir::LogicalResult
+RuntimeBundleLowerer::lowerGeneralAwaitableIterator(py::AwaitOp op,
+                                                    RuntimeBundle &awaitable) {
   llvm::SmallVector<const RuntimeBundle *, 1> sources{&awaitable};
   RuntimeBundle iterator;
   bool emitted = false;
@@ -193,16 +194,17 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerGeneralAwaitableIterator(
       mlir::func::FuncOp target =
           module.lookupSymbol<mlir::func::FuncOp>(*methodSymbol);
       if (!target)
-        return op.emitError() << "source class method @" << *methodSymbol
-                              << " is not defined";
+        return op.emitError()
+               << "source class method @" << *methodSymbol << " is not defined";
       if (std::optional<std::string> fieldName =
               returnedSelfFieldAwait(target)) {
         auto field = awaitable.fieldBundles.find(*fieldName);
         if (field != awaitable.fieldBundles.end() && field->second) {
           RuntimeBundle fieldAwaitable = *field->second;
           if (fieldAwaitable.boxedObject &&
-              py::isAssignableTo(fieldAwaitable.boxedObject->objectValue.contract,
-                                 fieldAwaitable.contract, op.getOperation()))
+              py::isAssignableTo(
+                  fieldAwaitable.boxedObject->objectValue.contract,
+                  fieldAwaitable.contract, op.getOperation()))
             fieldAwaitable = *fieldAwaitable.boxedObject;
           fieldAwaitable.setObjectLogicalOwnership(/*ownsObject=*/false);
           if (fieldAwaitable.contractName() == "types.CoroutineType") {
@@ -252,8 +254,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerGeneralAwaitableIterator(
             expectedResult = callable.getResultTypes().front();
       }
       if (mlir::failed(RuntimeBundleLowerer::emitSourceFunctionTargetCallResult(
-              op.getOperation(), expectedResult, target, *methodSymbol,
-              sources, iterator)))
+              op.getOperation(), expectedResult, target, *methodSymbol, sources,
+              iterator)))
         return mlir::failure();
       emitted = true;
     }
@@ -270,9 +272,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerGeneralAwaitableIterator(
     if (!emittedCall->symbol.resultContract.empty())
       resultType =
           runtimeContractType(context, emittedCall->symbol.resultContract);
-    else if (auto callable =
-                 mlir::dyn_cast_if_present<py::CallableType>(
-                     op.getAwaitContract()))
+    else if (auto callable = mlir::dyn_cast_if_present<py::CallableType>(
+                 op.getAwaitContract()))
       if (callable.getResultTypes().size() == 1)
         resultType = callable.getResultTypes().front();
     if (!resultType)
@@ -294,8 +295,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAwaitIteratorResult(
   llvm::ArrayRef<mlir::Value> values = iterator.physicalValues();
   if (iterator.contractName() == "types.CoroutineAwaitIterator") {
     if (values.size() < 2)
-      return op->emitError() << label
-                             << " has no coroutine storage evidence";
+      return op->emitError() << label << " has no coroutine storage evidence";
     mlir::Type object = runtimeContractType(context, "builtins.object");
     mlir::Type coroutineType =
         py::ContractType::get(context, "types.CoroutineType",
@@ -306,34 +306,34 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAwaitIteratorResult(
     if (coroutine.coroutineTarget.empty())
       return RuntimeBundleLowerer::lowerCoroutineStorageTargetIdAwait(
           op, resultValue, coroutine, label);
-    return RuntimeBundleLowerer::lowerCoroutineObjectAwait(
-        op, resultValue, coroutine, label);
+    return RuntimeBundleLowerer::lowerCoroutineObjectAwait(op, resultValue,
+                                                           coroutine, label);
   }
 
   if (iterator.contractName() == "_asyncio.FutureIter") {
     if (values.size() < 2)
       return op->emitError() << label << " has no Future storage evidence";
-    mlir::Type futureType = py::ContractType::get(
-        context, "_asyncio.Future", {resultValue.getType()});
+    mlir::Type futureType = py::ContractType::get(context, "_asyncio.Future",
+                                                  {resultValue.getType()});
     RuntimeBundle future =
         RuntimeBundle::object(futureType, mlir::ValueRange{values[1]});
     future.copyEvidenceFrom(iterator);
     if (hasFutureTerminalEvidence(future))
-      return RuntimeBundleLowerer::lowerFutureResultEvidence(
-          op, resultValue, future, label);
+      return RuntimeBundleLowerer::lowerFutureResultEvidence(op, resultValue,
+                                                             future, label);
   }
 
   if (iterator.contractName() == "_asyncio.TaskIter") {
     if (values.size() < 3)
       return op->emitError() << label << " has no Task storage evidence";
-    mlir::Type taskType =
-        py::ContractType::get(context, "_asyncio.Task", {resultValue.getType()});
+    mlir::Type taskType = py::ContractType::get(context, "_asyncio.Task",
+                                                {resultValue.getType()});
     RuntimeBundle task =
         RuntimeBundle::object(taskType, mlir::ValueRange{values[1], values[2]});
     task.copyEvidenceFrom(iterator);
     if (hasFutureTerminalEvidence(task))
-      return RuntimeBundleLowerer::lowerFutureResultEvidence(
-          op, resultValue, task, label);
+      return RuntimeBundleLowerer::lowerFutureResultEvidence(op, resultValue,
+                                                             task, label);
     if (hasAsyncioSleepEvidence(task))
       return RuntimeBundleLowerer::lowerAsyncioSleepEvidenceAwait(
           op, resultValue, task, label);
@@ -362,9 +362,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCoroutineStorageTargetIdAwait(
       mlir::dyn_cast<mlir::MemRefType>(coroutineValues.front().getType());
   if (!coroutineStorage || coroutineStorage.getRank() != 1 ||
       !coroutineStorage.hasStaticShape() || coroutineStorage.getDimSize(0) < 4)
-    return op->emitError()
-           << label << " coroutine storage has invalid ABI type "
-           << coroutineValues.front().getType();
+    return op->emitError() << label
+                           << " coroutine storage has invalid ABI type "
+                           << coroutineValues.front().getType();
 
   llvm::SmallVector<mlir::func::FuncOp, 8> candidates;
   llvm::SmallVector<mlir::Type, 8> expectedResults;
@@ -410,9 +410,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCoroutineStorageTargetIdAwait(
   llvm::SmallVector<const RuntimeBundle *, 1> coroutineSource{&awaitable};
   builder.setInsertionPoint(op);
   llvm::SmallVector<mlir::Value, 4> resumeBeginOperands;
-  if (mlir::failed(buildRuntimeCallOperands(
-          op, *resumeBegin, coroutineSource, resumeBeginOperands,
-          /*allowUnusedSources=*/false)))
+  if (mlir::failed(buildRuntimeCallOperands(op, *resumeBegin, coroutineSource,
+                                            resumeBeginOperands,
+                                            /*allowUnusedSources=*/false)))
     return mlir::failure();
   mlir::func::CallOp resumeBeginCall = RuntimeBundleLowerer::createRuntimeCall(
       op->getLoc(), *resumeBegin, resumeBeginOperands);
@@ -421,13 +421,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCoroutineStorageTargetIdAwait(
     return resumeBegin->function.emitError()
            << "coroutine resume.begin primitive must return one i1";
 
-  auto resumed = builder.create<mlir::scf::IfOp>(
-      op->getLoc(), expectedResults, resumeBeginCall.getResult(0),
-      /*withElseRegion=*/true);
+  auto resumed = mlir::scf::IfOp::create(builder, op->getLoc(), expectedResults,
+                                         resumeBeginCall.getResult(0),
+                                         /*withElseRegion=*/true);
 
-  auto emitDeadValues =
-      [&](llvm::StringRef message)
-          -> mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> {
+  auto emitDeadValues = [&](llvm::StringRef message)
+      -> mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> {
     if (mlir::failed(RuntimeBundleLowerer::emitRuntimeException(
             op, "builtins.RuntimeError", message)))
       return mlir::failure();
@@ -444,9 +443,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCoroutineStorageTargetIdAwait(
 
   builder.setInsertionPointToStart(&resumed.getThenRegion().front());
   mlir::Value targetSlot =
-      builder.create<mlir::arith::ConstantIndexOp>(op->getLoc(), 3);
-  mlir::Value targetId = builder.create<mlir::memref::LoadOp>(
-      op->getLoc(), coroutineValues.front(), targetSlot);
+      mlir::arith::ConstantIndexOp::create(builder, op->getLoc(), 3);
+  mlir::Value targetId = mlir::memref::LoadOp::create(
+      builder, op->getLoc(), coroutineValues.front(), targetSlot);
 
   std::function<mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>>(unsigned)>
       emitDispatch = [&](unsigned index)
@@ -454,29 +453,30 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCoroutineStorageTargetIdAwait(
     if (index >= candidates.size())
       return emitDeadValues("unknown erased coroutine target id");
     mlir::func::FuncOp target = candidates[index];
-    mlir::Value expectedId = builder.create<mlir::arith::ConstantIntOp>(
-        op->getLoc(), RuntimeBundleLowerer::functionTargetId(target.getSymName()),
-        64);
-    mlir::Value matches = builder.create<mlir::arith::CmpIOp>(
-        op->getLoc(), mlir::arith::CmpIPredicate::eq, targetId, expectedId);
-    auto selected = builder.create<mlir::scf::IfOp>(
-        op->getLoc(), expectedResults, matches, /*withElseRegion=*/true);
+    mlir::Value expectedId = mlir::arith::ConstantIntOp::create(
+        builder, op->getLoc(),
+        RuntimeBundleLowerer::functionTargetId(target.getSymName()), 64);
+    mlir::Value matches = mlir::arith::CmpIOp::create(
+        builder, op->getLoc(), mlir::arith::CmpIPredicate::eq, targetId,
+        expectedId);
+    auto selected =
+        mlir::scf::IfOp::create(builder, op->getLoc(), expectedResults, matches,
+                                /*withElseRegion=*/true);
     builder.setInsertionPointToStart(&selected.getThenRegion().front());
     RuntimeSymbol targetSymbol;
     targetSymbol.function = target;
     targetSymbol.contract = "types.CoroutineType";
     targetSymbol.role = "primitive";
     targetSymbol.name = target.getSymName();
-    mlir::func::CallOp bodyCall =
-        RuntimeBundleLowerer::createRuntimeCall(op->getLoc(), targetSymbol,
-                                                mlir::ValueRange{});
-    builder.create<mlir::scf::YieldOp>(op->getLoc(), bodyCall.getResults());
+    mlir::func::CallOp bodyCall = RuntimeBundleLowerer::createRuntimeCall(
+        op->getLoc(), targetSymbol, mlir::ValueRange{});
+    mlir::scf::YieldOp::create(builder, op->getLoc(), bodyCall.getResults());
     builder.setInsertionPointToStart(&selected.getElseRegion().front());
     mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> fallback =
         emitDispatch(index + 1);
     if (mlir::failed(fallback))
       return mlir::failure();
-    builder.create<mlir::scf::YieldOp>(op->getLoc(), *fallback);
+    mlir::scf::YieldOp::create(builder, op->getLoc(), *fallback);
     builder.setInsertionPointAfter(selected);
     llvm::SmallVector<mlir::Value, 4> results;
     results.append(selected.getResults().begin(), selected.getResults().end());
@@ -494,15 +494,14 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCoroutineStorageTargetIdAwait(
     return mlir::failure();
   RuntimeBundleLowerer::createRuntimeCall(op->getLoc(), *resumeComplete,
                                           resumeCompleteOperands);
-  builder.create<mlir::scf::YieldOp>(op->getLoc(), *dispatched);
+  mlir::scf::YieldOp::create(builder, op->getLoc(), *dispatched);
 
   builder.setInsertionPointToStart(&resumed.getElseRegion().front());
-  mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> dead =
-      emitDeadValues(
-          "cannot await a coroutine that is already running or completed");
+  mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> dead = emitDeadValues(
+      "cannot await a coroutine that is already running or completed");
   if (mlir::failed(dead))
     return mlir::failure();
-  builder.create<mlir::scf::YieldOp>(op->getLoc(), *dead);
+  mlir::scf::YieldOp::create(builder, op->getLoc(), *dead);
 
   builder.setInsertionPointAfter(resumed);
   RuntimeBundle result;
@@ -553,9 +552,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCoroutineObjectAwait(
 
   builder.setInsertionPoint(op);
   llvm::SmallVector<mlir::Value, 4> resumeBeginOperands;
-  if (mlir::failed(buildRuntimeCallOperands(
-          op, *resumeBegin, coroutineSource, resumeBeginOperands,
-          /*allowUnusedSources=*/false)))
+  if (mlir::failed(buildRuntimeCallOperands(op, *resumeBegin, coroutineSource,
+                                            resumeBeginOperands,
+                                            /*allowUnusedSources=*/false)))
     return mlir::failure();
   mlir::func::CallOp resumeBeginCall = RuntimeBundleLowerer::createRuntimeCall(
       op->getLoc(), *resumeBegin, resumeBeginOperands);
@@ -564,9 +563,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCoroutineObjectAwait(
     return resumeBegin->function.emitError()
            << "coroutine resume.begin primitive must return one i1";
 
-  auto resumed = builder.create<mlir::scf::IfOp>(
-      op->getLoc(), functionType.getResults(), resumeBeginCall.getResult(0),
-      /*withElseRegion=*/true);
+  auto resumed =
+      mlir::scf::IfOp::create(builder, op->getLoc(), functionType.getResults(),
+                              resumeBeginCall.getResult(0),
+                              /*withElseRegion=*/true);
 
   builder.setInsertionPointToStart(&resumed.getThenRegion().front());
   llvm::SmallVector<RuntimeBundle, 8> sourceBundles;
@@ -588,9 +588,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCoroutineObjectAwait(
                 awaitable.coroutineSourceBundles[sourceIndex]
             ? sourceBundles.emplace_back(
                   *awaitable.coroutineSourceBundles[sourceIndex])
-            : sourceBundles.emplace_back(
-                  RuntimeBundle::object(sourceValue.contract,
-                                        sourceValue.values));
+            : sourceBundles.emplace_back(RuntimeBundle::object(
+                  sourceValue.contract, sourceValue.values));
     source.contract = sourceValue.contract;
     source.objectValue = sourceValue;
     if (inputIndex >= functionType.getNumInputs())
@@ -623,7 +622,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCoroutineObjectAwait(
     return mlir::failure();
   RuntimeBundleLowerer::createRuntimeCall(op->getLoc(), *resumeComplete,
                                           resumeCompleteOperands);
-  builder.create<mlir::scf::YieldOp>(op->getLoc(), bodyCall.getResults());
+  mlir::scf::YieldOp::create(builder, op->getLoc(), bodyCall.getResults());
 
   builder.setInsertionPointToStart(&resumed.getElseRegion().front());
   if (mlir::failed(RuntimeBundleLowerer::emitRuntimeException(
@@ -639,7 +638,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCoroutineObjectAwait(
       return mlir::failure();
     deadValues.push_back(*dead);
   }
-  builder.create<mlir::scf::YieldOp>(op->getLoc(), deadValues);
+  mlir::scf::YieldOp::create(builder, op->getLoc(), deadValues);
 
   builder.setInsertionPointAfter(resumed);
   RuntimeBundle result;

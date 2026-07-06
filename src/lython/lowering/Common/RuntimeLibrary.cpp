@@ -77,9 +77,8 @@ void importSymbol(mlir::ModuleOp target, mlir::Operation &op) {
 }
 
 mlir::LogicalResult mergeContracts(mlir::ModuleOp target,
-                                          mlir::ModuleOp source) {
-  auto sourceContracts =
-      source->getAttrOfType<mlir::ArrayAttr>(kContractsAttr);
+                                   mlir::ModuleOp source) {
+  auto sourceContracts = source->getAttrOfType<mlir::ArrayAttr>(kContractsAttr);
   if (!sourceContracts)
     return mlir::success();
 
@@ -100,9 +99,8 @@ mlir::LogicalResult mergeContracts(mlir::ModuleOp target,
     return mlir::success();
   };
 
-  if (mlir::failed(
-          append(target->getAttrOfType<mlir::ArrayAttr>(kContractsAttr),
-                 target)))
+  if (mlir::failed(append(
+          target->getAttrOfType<mlir::ArrayAttr>(kContractsAttr), target)))
     return mlir::failure();
   if (mlir::failed(append(sourceContracts, source)))
     return mlir::failure();
@@ -198,7 +196,7 @@ mlir::LogicalResult lowerNativeRuntimeModule(mlir::ModuleOp module) {
   pm.addPass(mlir::createCanonicalizerPass());
   pm.addPass(mlir::createCSEPass());
   pm.addPass(mlir::createConvertFuncToLLVMPass());
-  pm.addPass(mlir::createConvertSCFToCFPass());
+  pm.addPass(mlir::createSCFToControlFlowPass());
   pm.addPass(mlir::memref::createExpandStridedMetadataPass());
   pm.addPass(mlir::createFinalizeMemRefToLLVMConversionPass());
   pm.addPass(mlir::createArithToLLVMConversionPass());

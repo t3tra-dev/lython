@@ -1,8 +1,8 @@
 #include "runtime/Verification.h"
 
+#include "Contracts.h"
 #include "PyDialectTypes.h"
 #include "PyProtocols.h"
-#include "Contracts.h"
 #include "Support.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
@@ -54,9 +54,11 @@ bool containsDisallowedEvidenceType(mlir::Type type) {
   }
 
   if (auto contract = mlir::dyn_cast<ContractType>(type))
-    return llvm::any_of(contract.getArguments(), containsDisallowedEvidenceType);
+    return llvm::any_of(contract.getArguments(),
+                        containsDisallowedEvidenceType);
   if (auto protocol = mlir::dyn_cast<ProtocolType>(type))
-    return llvm::any_of(protocol.getArguments(), containsDisallowedEvidenceType);
+    return llvm::any_of(protocol.getArguments(),
+                        containsDisallowedEvidenceType);
   if (auto unionType = mlir::dyn_cast<UnionType>(type))
     return llvm::any_of(unionType.getMemberTypes(),
                         containsDisallowedEvidenceType);
@@ -191,7 +193,8 @@ bool evidenceAssignable(mlir::Type actual, mlir::Type expected,
     return true;
   if (isNoneLike(actual) && isNoneLike(expected))
     return true;
-  if (auto expectedContract = mlir::dyn_cast_if_present<ContractType>(expected)) {
+  if (auto expectedContract =
+          mlir::dyn_cast_if_present<ContractType>(expected)) {
     const protocols::Table &table = protocols::Table::get(*from->getContext());
     if (table.isManifestSubclassOf(actual, expectedContract.getContractName()))
       return true;
@@ -254,8 +257,7 @@ bool callableMatchesCandidate(CallableType selected, CallableType candidate,
     return true;
   };
 
-  llvm::ArrayRef<mlir::Type> selectedPositional =
-      selected.getPositionalTypes();
+  llvm::ArrayRef<mlir::Type> selectedPositional = selected.getPositionalTypes();
   llvm::ArrayRef<mlir::Type> candidatePositional =
       candidate.getPositionalTypes();
   unsigned selectedIndex = 0;
@@ -330,9 +332,8 @@ bool evidenceMatchesCandidate(mlir::Type selected, mlir::Type candidate,
         selectedContract.getArguments().size() !=
             candidateContract.getArguments().size())
       return false;
-    for (auto [selectedArg, candidateArg] :
-         llvm::zip(selectedContract.getArguments(),
-                   candidateContract.getArguments()))
+    for (auto [selectedArg, candidateArg] : llvm::zip(
+             selectedContract.getArguments(), candidateContract.getArguments()))
       if (!evidenceMatchesCandidate(selectedArg, candidateArg, from))
         return false;
     return true;
@@ -347,18 +348,18 @@ bool evidenceMatchesCandidate(mlir::Type selected, mlir::Type candidate,
         selectedProtocol.getArguments().size() !=
             candidateProtocol.getArguments().size())
       return false;
-    for (auto [selectedArg, candidateArg] :
-         llvm::zip(selectedProtocol.getArguments(),
-                   candidateProtocol.getArguments()))
+    for (auto [selectedArg, candidateArg] : llvm::zip(
+             selectedProtocol.getArguments(), candidateProtocol.getArguments()))
       if (!evidenceMatchesCandidate(selectedArg, candidateArg, from))
         return false;
     return true;
   }
 
   if (auto candidateUnion = mlir::dyn_cast_if_present<UnionType>(candidate))
-    return llvm::any_of(candidateUnion.getMemberTypes(), [&](mlir::Type member) {
-      return evidenceMatchesCandidate(selected, member, from);
-    });
+    return llvm::any_of(
+        candidateUnion.getMemberTypes(), [&](mlir::Type member) {
+          return evidenceMatchesCandidate(selected, member, from);
+        });
 
   return false;
 }
@@ -386,8 +387,8 @@ mlir::FailureOr<CallableType> readCallableContract(mlir::Operation *op,
     return mlir::failure();
   CallableType callable = getCallableContract(attr.getValue());
   if (!callable)
-    return op->emitError()
-           << attrName << " must resolve to a Callable protocol contract";
+    return op->emitError() << attrName
+                           << " must resolve to a Callable protocol contract";
   return callable;
 }
 
@@ -397,10 +398,10 @@ llvm::StringRef opName(mlir::Operation *op) {
 
 bool isBinaryMethodOp(llvm::StringRef name) {
   return llvm::StringSwitch<bool>(name)
-      .Cases("py.add", "py.sub", "py.mul", "py.div", "py.floordiv", true)
-      .Cases("py.mod", "py.lshift", "py.rshift", "py.bitand", true)
-      .Cases("py.bitor", "py.bitxor", "py.le", "py.lt", true)
-      .Cases("py.gt", "py.ge", "py.eq", "py.ne", true)
+      .Cases({"py.add", "py.sub", "py.mul", "py.div", "py.floordiv"}, true)
+      .Cases({"py.mod", "py.lshift", "py.rshift", "py.bitand"}, true)
+      .Cases({"py.bitor", "py.bitxor", "py.le", "py.lt"}, true)
+      .Cases({"py.gt", "py.ge", "py.eq", "py.ne"}, true)
       .Default(false);
 }
 
@@ -455,7 +456,8 @@ std::optional<mlir::Type> receiverTypeFor(mlir::Operation *op) {
   return op->getOperand(0).getType();
 }
 
-llvm::SmallVector<mlir::Value, 4> explicitCallableOperands(mlir::Operation *op) {
+llvm::SmallVector<mlir::Value, 4>
+explicitCallableOperands(mlir::Operation *op) {
   llvm::SmallVector<mlir::Value, 4> operands;
   llvm::StringRef name = opName(op);
 
@@ -502,18 +504,20 @@ mlir::LogicalResult verifyCallableOperands(mlir::Operation *op,
 
   llvm::ArrayRef<mlir::Type> expected = callable.getPositionalTypes();
   if (expected.size() < actuals.size())
-    return op->emitError()
-           << "selected Callable evidence has " << expected.size()
-           << " positional operands, but op exposes " << actuals.size();
+    return op->emitError() << "selected Callable evidence has "
+                           << expected.size()
+                           << " positional operands, but op exposes "
+                           << actuals.size();
 
   for (auto [index, pair] : llvm::enumerate(llvm::zip(actuals, expected))) {
     mlir::Value actual = std::get<0>(pair);
     mlir::Type expectedType = std::get<1>(pair);
     if (evidenceAssignable(actual.getType(), expectedType, op))
       continue;
-    return op->emitError()
-           << "operand " << index << " type " << actual.getType()
-           << " does not match selected Callable evidence " << expectedType;
+    return op->emitError() << "operand " << index << " type "
+                           << actual.getType()
+                           << " does not match selected Callable evidence "
+                           << expectedType;
   }
   return mlir::success();
 }
@@ -532,19 +536,18 @@ mlir::LogicalResult verifyCallableResults(mlir::Operation *op,
   if (actuals.empty() && expected.size() == 1 && isNoneLike(expected.front()))
     return mlir::success();
   if (actuals.size() != expected.size())
-    return op->emitError()
-           << "op result surface has " << actuals.size()
-           << " values, but selected Callable evidence returns "
-           << expected.size();
+    return op->emitError() << "op result surface has " << actuals.size()
+                           << " values, but selected Callable evidence returns "
+                           << expected.size();
 
   for (auto [index, pair] : llvm::enumerate(llvm::zip(actuals, expected))) {
     mlir::Type actual = std::get<0>(pair);
     mlir::Type expectedType = std::get<1>(pair);
     if (evidenceAssignable(actual, expectedType, op))
       continue;
-    return op->emitError()
-           << "result " << index << " type " << actual
-           << " does not match selected Callable evidence " << expectedType;
+    return op->emitError() << "result " << index << " type " << actual
+                           << " does not match selected Callable evidence "
+                           << expectedType;
   }
   return mlir::success();
 }

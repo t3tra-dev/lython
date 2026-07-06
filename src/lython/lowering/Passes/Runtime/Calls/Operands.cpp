@@ -22,7 +22,7 @@ bool compatibleRankOneMemRefStorage(mlir::Type source, mlir::Type target,
 
 mlir::Value boolConstant(mlir::OpBuilder &builder, mlir::Location loc,
                          bool value) {
-  return builder.create<mlir::arith::ConstantIntOp>(loc, value ? 1 : 0, 1)
+  return mlir::arith::ConstantIntOp::create(builder, loc, value ? 1 : 0, 1)
       .getResult();
 }
 
@@ -161,10 +161,10 @@ mlir::LogicalResult RuntimeBundleLowerer::appendRuntimeSource(
                                           /*targetMustBeDynamic=*/false))
         return op->emitError()
                << "builtins.object handle " << handle.getType()
-               << " cannot be adapted to runtime input " << inputIndex
-               << " of " << symbol.contract << "." << symbol.name;
-      handle = builder.create<mlir::memref::CastOp>(op->getLoc(), expected,
-                                                    handle);
+               << " cannot be adapted to runtime input " << inputIndex << " of "
+               << symbol.contract << "." << symbol.name;
+      handle =
+          mlir::memref::CastOp::create(builder, op->getLoc(), expected, handle);
     }
     operands.push_back(handle);
     ++inputIndex;
@@ -179,7 +179,7 @@ mlir::LogicalResult RuntimeBundleLowerer::appendRuntimeSource(
       return op->emitError() << "type object has no runtime class id for "
                              << source.instanceContractName();
     mlir::Value value =
-        builder.create<mlir::arith::ConstantIntOp>(op->getLoc(), *id, 64)
+        mlir::arith::ConstantIntOp::create(builder, op->getLoc(), *id, 64)
             .getResult();
     operands.push_back(value);
     ++inputIndex;
@@ -276,7 +276,7 @@ mlir::LogicalResult RuntimeBundleLowerer::appendPrimitiveI64EvidenceOperand(
     operands.push_back(source.primitiveI64->valid);
   } else {
     operands.push_back(
-        builder.create<mlir::arith::ConstantIntOp>(op->getLoc(), 0, 64)
+        mlir::arith::ConstantIntOp::create(builder, op->getLoc(), 0, 64)
             .getResult());
     operands.push_back(boolConstant(builder, op->getLoc(), false));
   }
@@ -402,19 +402,17 @@ mlir::LogicalResult RuntimeBundleLowerer::appendImplicitRuntimeArgument(
     if (defaultArgument->kind == RuntimeDefaultArgument::Kind::I64) {
       auto integerDefault =
           mlir::cast<mlir::IntegerAttr>(defaultArgument->value);
-      operands.push_back(builder
-                             .create<mlir::arith::ConstantIntOp>(
-                                 op->getLoc(), integerDefault.getInt(), 64)
+      operands.push_back(mlir::arith::ConstantIntOp::create(
+                             builder, op->getLoc(), integerDefault.getInt(), 64)
                              .getResult());
       ++inputIndex;
       return mlir::success();
     }
     auto floatDefault = mlir::cast<mlir::FloatAttr>(defaultArgument->value);
-    operands.push_back(
-        builder
-            .create<mlir::arith::ConstantFloatOp>(
-                op->getLoc(), floatDefault.getValue(), builder.getF64Type())
-            .getResult());
+    operands.push_back(mlir::arith::ConstantFloatOp::create(
+                           builder, op->getLoc(), builder.getF64Type(),
+                           floatDefault.getValue())
+                           .getResult());
     ++inputIndex;
     return mlir::success();
   }

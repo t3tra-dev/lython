@@ -193,10 +193,9 @@ RuntimeBundleLowerer::lowerAsyncioSleepCall(py::CallOp op,
 
   builder.setInsertionPoint(op);
   mlir::Value targetId =
-      builder
-          .create<mlir::arith::ConstantIntOp>(
-              op.getLoc(),
-              RuntimeBundleLowerer::functionTargetId("asyncio.sleep"), 64)
+      mlir::arith::ConstantIntOp::create(
+          builder, op.getLoc(),
+          RuntimeBundleLowerer::functionTargetId("asyncio.sleep"), 64)
           .getResult();
   mlir::func::CallOp newCall = RuntimeBundleLowerer::createRuntimeCall(
       op.getLoc(), *initializer, mlir::ValueRange{targetId});
@@ -452,10 +451,9 @@ mlir::LogicalResult RuntimeBundleLowerer::emitAsyncFunctionTargetCallResult(
 
   builder.setInsertionPoint(op);
   mlir::Value targetId =
-      builder
-          .create<mlir::arith::ConstantIntOp>(
-              op->getLoc(), RuntimeBundleLowerer::functionTargetId(targetName),
-              64)
+      mlir::arith::ConstantIntOp::create(
+          builder, op->getLoc(),
+          RuntimeBundleLowerer::functionTargetId(targetName), 64)
           .getResult();
   mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
       op->getLoc(), *initializer, mlir::ValueRange{targetId});

@@ -31,8 +31,8 @@ mlir::FailureOr<mlir::Value> loadCollectionLength(mlir::Operation *op,
                            << " collection length metadata has invalid type "
                            << meta.getType();
   mlir::Value slot =
-      builder.create<mlir::arith::ConstantIndexOp>(op->getLoc(), 0);
-  return builder.create<mlir::memref::LoadOp>(op->getLoc(), meta, slot)
+      mlir::arith::ConstantIndexOp::create(builder, op->getLoc(), 0);
+  return mlir::memref::LoadOp::create(builder, op->getLoc(), meta, slot)
       .getResult();
 }
 
@@ -59,13 +59,14 @@ bool sameRuntimeValueIdentity(const RuntimeValue &lhs,
 
 mlir::Value constantI1(mlir::OpBuilder &builder, mlir::Location loc,
                        bool value) {
-  return builder.create<mlir::arith::ConstantIntOp>(loc, value ? 1 : 0, 1)
+  return mlir::arith::ConstantIntOp::create(builder, loc, value ? 1 : 0, 1)
       .getResult();
 }
 
-std::optional<mlir::Value>
-knownEvidenceEquality(mlir::Operation *op, mlir::OpBuilder &builder,
-                      const RuntimeBundle &lhs, const RuntimeBundle &rhs) {
+std::optional<mlir::Value> knownEvidenceEquality(mlir::Operation *op,
+                                                 mlir::OpBuilder &builder,
+                                                 const RuntimeBundle &lhs,
+                                                 const RuntimeBundle &rhs) {
   if (lhs.kind != RuntimeBundle::Kind::Object ||
       rhs.kind != RuntimeBundle::Kind::Object)
     return std::nullopt;
@@ -74,15 +75,14 @@ knownEvidenceEquality(mlir::Operation *op, mlir::OpBuilder &builder,
     return constantI1(builder, loc, *lhs.literalText == *rhs.literalText);
   if (lhs.contractName() == "builtins.int" &&
       rhs.contractName() == "builtins.int" && lhs.primitiveI64 &&
-      rhs.primitiveI64 && lhs.primitiveI64->value &&
-      rhs.primitiveI64->value && lhs.primitiveI64->valid &&
-      rhs.primitiveI64->valid) {
-    mlir::Value sameValue = builder.create<mlir::arith::CmpIOp>(
-        loc, mlir::arith::CmpIPredicate::eq, lhs.primitiveI64->value,
+      rhs.primitiveI64 && lhs.primitiveI64->value && rhs.primitiveI64->value &&
+      lhs.primitiveI64->valid && rhs.primitiveI64->valid) {
+    mlir::Value sameValue = mlir::arith::CmpIOp::create(
+        builder, loc, mlir::arith::CmpIPredicate::eq, lhs.primitiveI64->value,
         rhs.primitiveI64->value);
-    mlir::Value bothValid = builder.create<mlir::arith::AndIOp>(
-        loc, lhs.primitiveI64->valid, rhs.primitiveI64->valid);
-    return builder.create<mlir::arith::AndIOp>(loc, bothValid, sameValue)
+    mlir::Value bothValid = mlir::arith::AndIOp::create(
+        builder, loc, lhs.primitiveI64->valid, rhs.primitiveI64->valid);
+    return mlir::arith::AndIOp::create(builder, loc, bothValid, sameValue)
         .getResult();
   }
   if (sameRuntimeValueIdentity(lhs.objectValue, rhs.objectValue))
@@ -126,8 +126,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerReceiverMethodResult(
       mlir::func::FuncOp target =
           module.lookupSymbol<mlir::func::FuncOp>(*methodSymbol);
       if (!target)
-        return op->emitError() << "source class method @" << *methodSymbol
-                               << " is not defined";
+        return op->emitError()
+               << "source class method @" << *methodSymbol << " is not defined";
       if (target->hasAttr("ly.async.body_result")) {
         RuntimeBundle result;
         if (mlir::failed(
@@ -167,9 +167,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBool(py::BoolOp op) {
     if (mlir::failed(length))
       return mlir::failure();
     mlir::Value zero =
-        builder.create<mlir::arith::ConstantIntOp>(op.getLoc(), 0, 64);
-    mlir::Value nonEmpty = builder.create<mlir::arith::CmpIOp>(
-        op.getLoc(), mlir::arith::CmpIPredicate::ne, *length, zero);
+        mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 0, 64);
+    mlir::Value nonEmpty = mlir::arith::CmpIOp::create(
+        builder, op.getLoc(), mlir::arith::CmpIPredicate::ne, *length, zero);
     op.getResult().replaceAllUsesWith(nonEmpty);
     erase.push_back(op);
     return mlir::success();
@@ -252,16 +252,16 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
         if (mlir::failed(RuntimeBundleLowerer::storeSequencePayloadElement(
                 op, updated, position, *payload)))
           return mlir::failure();
-        RuntimeBundle stored = payload->withObjectOwnership(
-            ownership::logicalOwnershipKind(
+        RuntimeBundle stored =
+            payload->withObjectOwnership(ownership::logicalOwnershipKind(
                 payload->objectValue.contract, /*ownsObject=*/false));
         if (position < updated.sequenceElements.size())
           updated.sequenceElements[position] = stored.objectValue;
         if (position < updated.sequenceElementBundles.size())
           updated.sequenceElementBundles[position] =
               std::make_shared<RuntimeBundle>(std::move(stored));
-        if (mlir::failed(RuntimeBundleLowerer::writeBackFieldAlias(op,
-                                                                   updated)))
+        if (mlir::failed(
+                RuntimeBundleLowerer::writeBackFieldAlias(op, updated)))
           return mlir::failure();
         valueBundles[op.getContainer()] = std::move(updated);
       }
@@ -308,19 +308,19 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
           return mlir::failure();
         mlir::Value meta = container.physicalValues()[1];
         mlir::Value slot =
-            builder.create<mlir::arith::ConstantIndexOp>(op.getLoc(), 0);
+            mlir::arith::ConstantIndexOp::create(builder, op.getLoc(), 0);
         mlir::Value current =
-            builder.create<mlir::memref::LoadOp>(op.getLoc(), meta, slot);
+            mlir::memref::LoadOp::create(builder, op.getLoc(), meta, slot);
         mlir::Value one =
-            builder.create<mlir::arith::ConstantIntOp>(op.getLoc(), 1, 64);
+            mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 1, 64);
         mlir::Value next =
-            builder.create<mlir::arith::AddIOp>(op.getLoc(), current, one);
-        builder.create<mlir::memref::StoreOp>(op.getLoc(), next, meta, slot);
-        RuntimeBundle storedKey = payloadKey->withObjectOwnership(
-            ownership::logicalOwnershipKind(
+            mlir::arith::AddIOp::create(builder, op.getLoc(), current, one);
+        mlir::memref::StoreOp::create(builder, op.getLoc(), next, meta, slot);
+        RuntimeBundle storedKey =
+            payloadKey->withObjectOwnership(ownership::logicalOwnershipKind(
                 payloadKey->objectValue.contract, /*ownsObject=*/false));
-        RuntimeBundle storedValue = payloadValue->withObjectOwnership(
-            ownership::logicalOwnershipKind(
+        RuntimeBundle storedValue =
+            payloadValue->withObjectOwnership(ownership::logicalOwnershipKind(
                 payloadValue->objectValue.contract, /*ownsObject=*/false));
         updated.mappingKeys.push_back(*key);
         updated.mappingKeyBundles.push_back(
@@ -329,8 +329,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
         updated.mappingValueBundles.push_back(
             std::make_shared<RuntimeBundle>(std::move(storedValue)));
         if (!updated.mappingPresent.empty())
-          updated.mappingPresent.push_back(constantI1(builder, op.getLoc(),
-                                                      true));
+          updated.mappingPresent.push_back(
+              constantI1(builder, op.getLoc(), true));
       } else {
         unsigned position =
             static_cast<unsigned>(found - updated.mappingKeys.begin());
@@ -351,8 +351,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
         if (mlir::failed(RuntimeBundleLowerer::storeDictValuePayload(
                 op, updated, position, *payloadValue)))
           return mlir::failure();
-        RuntimeBundle storedValue = payloadValue->withObjectOwnership(
-            ownership::logicalOwnershipKind(
+        RuntimeBundle storedValue =
+            payloadValue->withObjectOwnership(ownership::logicalOwnershipKind(
                 payloadValue->objectValue.contract, /*ownsObject=*/false));
         if (position < updated.mappingValues.size())
           updated.mappingValues[position] = storedValue.objectValue;
@@ -365,8 +365,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
               constantI1(builder, op.getLoc(), true);
         }
       }
-      if (mlir::failed(RuntimeBundleLowerer::writeBackFieldAlias(op,
-                                                                 updated)))
+      if (mlir::failed(RuntimeBundleLowerer::writeBackFieldAlias(op, updated)))
         return mlir::failure();
       valueBundles[op.getContainer()] = std::move(updated);
       erase.push_back(op);
@@ -418,12 +417,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerDelItem(py::DelItemOp op) {
           return mlir::failure();
         mlir::Value meta = container.physicalValues()[1];
         mlir::Value slot =
-            builder.create<mlir::arith::ConstantIndexOp>(op.getLoc(), 0);
+            mlir::arith::ConstantIndexOp::create(builder, op.getLoc(), 0);
         mlir::Value one =
-            builder.create<mlir::arith::ConstantIntOp>(op.getLoc(), 1, 64);
+            mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 1, 64);
         mlir::Value next =
-            builder.create<mlir::arith::SubIOp>(op.getLoc(), *length, one);
-        builder.create<mlir::memref::StoreOp>(op.getLoc(), next, meta, slot);
+            mlir::arith::SubIOp::create(builder, op.getLoc(), *length, one);
+        mlir::memref::StoreOp::create(builder, op.getLoc(), next, meta, slot);
         unsigned position = static_cast<unsigned>(normalized);
         unsigned oldSize =
             static_cast<unsigned>(updated.sequenceElementBundles.size());
@@ -436,8 +435,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerDelItem(py::DelItemOp op) {
         } else if (position < updated.sequenceElements.size()) {
           const RuntimeValue &oldElement = updated.sequenceElements[position];
           if (mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
-                  op, oldElement.contract, oldElement.values,
-                  "list.delitem")))
+                  op, oldElement.contract, oldElement.values, "list.delitem")))
             return mlir::failure();
         }
         if (position < updated.sequenceElements.size())
@@ -460,8 +458,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerDelItem(py::DelItemOp op) {
             mlir::failed(RuntimeBundleLowerer::clearSequencePayloadElement(
                 op, updated, oldSize - 1)))
           return mlir::failure();
-        if (mlir::failed(RuntimeBundleLowerer::writeBackFieldAlias(op,
-                                                                   updated)))
+        if (mlir::failed(
+                RuntimeBundleLowerer::writeBackFieldAlias(op, updated)))
           return mlir::failure();
         valueBundles[op.getContainer()] = std::move(updated);
       }
@@ -490,12 +488,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerDelItem(py::DelItemOp op) {
           return mlir::failure();
         mlir::Value meta = container.physicalValues()[1];
         mlir::Value slot =
-            builder.create<mlir::arith::ConstantIndexOp>(op.getLoc(), 0);
+            mlir::arith::ConstantIndexOp::create(builder, op.getLoc(), 0);
         mlir::Value one =
-            builder.create<mlir::arith::ConstantIntOp>(op.getLoc(), 1, 64);
+            mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 1, 64);
         mlir::Value next =
-            builder.create<mlir::arith::SubIOp>(op.getLoc(), *length, one);
-        builder.create<mlir::memref::StoreOp>(op.getLoc(), next, meta, slot);
+            mlir::arith::SubIOp::create(builder, op.getLoc(), *length, one);
+        mlir::memref::StoreOp::create(builder, op.getLoc(), next, meta, slot);
         unsigned position =
             static_cast<unsigned>(found - updated.mappingKeys.begin());
         unsigned oldSize = static_cast<unsigned>(updated.mappingKeys.size());
@@ -532,9 +530,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerDelItem(py::DelItemOp op) {
         if (position < updated.mappingPresent.size())
           updated.mappingPresent.erase(updated.mappingPresent.begin() +
                                        position);
-        for (unsigned rewrite = position,
-                      end = static_cast<unsigned>(
-                          updated.mappingKeyBundles.size());
+        for (unsigned rewrite = position, end = static_cast<unsigned>(
+                                              updated.mappingKeyBundles.size());
              rewrite < end; ++rewrite) {
           if (rewrite >= updated.mappingValueBundles.size() ||
               !updated.mappingKeyBundles[rewrite] ||
@@ -546,16 +543,15 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerDelItem(py::DelItemOp op) {
                   op, updated, rewrite, *updated.mappingKeyBundles[rewrite])))
             return mlir::failure();
           if (mlir::failed(RuntimeBundleLowerer::storeDictValuePayload(
-                  op, updated, rewrite,
-                  *updated.mappingValueBundles[rewrite])))
+                  op, updated, rewrite, *updated.mappingValueBundles[rewrite])))
             return mlir::failure();
         }
         if (oldSize > 0 &&
             mlir::failed(RuntimeBundleLowerer::clearDictPayloadEntry(
                 op, updated, oldSize - 1)))
           return mlir::failure();
-        if (mlir::failed(RuntimeBundleLowerer::writeBackFieldAlias(op,
-                                                                   updated)))
+        if (mlir::failed(
+                RuntimeBundleLowerer::writeBackFieldAlias(op, updated)))
           return mlir::failure();
         valueBundles[op.getContainer()] = std::move(updated);
       }
@@ -602,7 +598,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerContains(py::ContainsOp op) {
           knownEvidenceEquality(op, builder, *element, item);
       if (!equal)
         return mlir::failure();
-      result = builder.create<mlir::arith::OrIOp>(loc, result, *equal);
+      result = mlir::arith::OrIOp::create(builder, loc, result, *equal);
     }
     op.getResult().replaceAllUsesWith(result);
     erase.push_back(op);
@@ -621,9 +617,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerContains(py::ContainsOp op) {
       for (auto [index, key] : llvm::enumerate(container.mappingKeys)) {
         mlir::Value match = constantI1(builder, loc, key == *item.literalText);
         if (index < container.mappingPresent.size())
-          match = builder.create<mlir::arith::AndIOp>(
-              loc, match, container.mappingPresent[index]);
-        result = builder.create<mlir::arith::OrIOp>(loc, result, match);
+          match = mlir::arith::AndIOp::create(builder, loc, match,
+                                              container.mappingPresent[index]);
+        result = mlir::arith::OrIOp::create(builder, loc, result, match);
       }
       op.getResult().replaceAllUsesWith(result);
       erase.push_back(op);
@@ -651,9 +647,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerContains(py::ContainsOp op) {
                << "str.__eq__ evidence method must return one i1";
       mlir::Value match = eqCall.getResult(0);
       if (index < container.mappingPresent.size())
-        match = builder.create<mlir::arith::AndIOp>(
-            loc, match, container.mappingPresent[index]);
-      result = builder.create<mlir::arith::OrIOp>(loc, result, match);
+        match = mlir::arith::AndIOp::create(builder, loc, match,
+                                            container.mappingPresent[index]);
+      result = mlir::arith::OrIOp::create(builder, loc, result, match);
     }
     op.getResult().replaceAllUsesWith(result);
     erase.push_back(op);

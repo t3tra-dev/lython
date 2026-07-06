@@ -149,8 +149,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesNativeCall(
   if (mlir::failed(declaration))
     return mlir::failure();
   builder.setInsertionPoint(op);
-  mlir::func::CallOp call =
-      builder.create<mlir::func::CallOp>(op.getLoc(), *declaration, nativeArgs);
+  mlir::func::CallOp call = mlir::func::CallOp::create(
+      builder, op.getLoc(), *declaration, nativeArgs);
 
   if (op.getNumResults() != 1)
     return op.emitError() << "ctypes native call expects one Python result";
@@ -164,10 +164,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesNativeCall(
     mlir::IntegerType i64 = builder.getI64Type();
     if (raw.getType() != i64) {
       if (resultLayout->kind == CtypesLayout::ABIKind::UnsignedInteger)
-        raw = builder.create<mlir::arith::ExtUIOp>(op.getLoc(), i64, raw)
+        raw = mlir::arith::ExtUIOp::create(builder, op.getLoc(), i64, raw)
                   .getResult();
       else
-        raw = builder.create<mlir::arith::ExtSIOp>(op.getLoc(), i64, raw)
+        raw = mlir::arith::ExtSIOp::create(builder, op.getLoc(), i64, raw)
                   .getResult();
     }
     mlir::Value valid = constantI1(builder, op.getLoc(), true);

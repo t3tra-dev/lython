@@ -23,12 +23,12 @@ struct RhsPanelSlice {
 
 mlir::Value createIndexConstant(mlir::OpBuilder &builder, mlir::Location loc,
                                 int64_t value) {
-  return builder.create<mlir::arith::ConstantIndexOp>(loc, value).getResult();
+  return mlir::arith::ConstantIndexOp::create(builder, loc, value).getResult();
 }
 
 mlir::Value addIndexValues(mlir::OpBuilder &builder, mlir::Location loc,
                            mlir::Value lhs, mlir::Value rhs) {
-  return builder.create<mlir::arith::AddIOp>(loc, lhs, rhs).getResult();
+  return mlir::arith::AddIOp::create(builder, loc, lhs, rhs).getResult();
 }
 
 mlir::Value multiplyIndexByConstant(mlir::OpBuilder &builder,
@@ -36,9 +36,8 @@ mlir::Value multiplyIndexByConstant(mlir::OpBuilder &builder,
                                     int64_t factor) {
   if (factor == 1)
     return value;
-  return builder
-      .create<mlir::arith::MulIOp>(loc, value,
-                                   createIndexConstant(builder, loc, factor))
+  return mlir::arith::MulIOp::create(builder, loc, value,
+                                     createIndexConstant(builder, loc, factor))
       .getResult();
 }
 
@@ -63,7 +62,7 @@ bool operationWritesToMemrefRoot(mlir::Operation *op, mlir::Value root) {
   if (auto store = mlir::dyn_cast<mlir::vector::StoreOp>(op))
     return sameMemrefRoot(store.getBase(), root);
   if (auto write = mlir::dyn_cast<mlir::vector::TransferWriteOp>(op))
-    return sameMemrefRoot(write.getSource(), root);
+    return sameMemrefRoot(write.getBase(), root);
   if (auto linalg = mlir::dyn_cast<mlir::linalg::LinalgOp>(op)) {
     for (int64_t index = 0; index < linalg.getNumDpsInits(); ++index) {
       mlir::OpOperand *init = linalg.getDpsInitOperand(index);
@@ -196,12 +195,12 @@ void buildFullRhsPrepackLoops(mlir::Value base, mlir::Value storage,
   mlir::Value lanesValue = createIndexConstant(rewriter, loc, *lanes);
 
   auto nPanelLoop =
-      rewriter.create<mlir::scf::ForOp>(loc, zero, totalNValue, panelNValue);
+      mlir::scf::ForOp::create(rewriter, loc, zero, totalNValue, panelNValue);
   {
     mlir::OpBuilder::InsertionGuard nGuard(rewriter);
     rewriter.setInsertionPointToStart(nPanelLoop.getBody());
     auto kPanelLoop =
-        rewriter.create<mlir::scf::ForOp>(loc, zero, totalKValue, panelKValue);
+        mlir::scf::ForOp::create(rewriter, loc, zero, totalKValue, panelKValue);
     {
       mlir::OpBuilder::InsertionGuard kPanelGuard(rewriter);
       rewriter.setInsertionPointToStart(kPanelLoop.getBody());
@@ -209,12 +208,12 @@ void buildFullRhsPrepackLoops(mlir::Value base, mlir::Value storage,
           linearRhsPanelOffset(rewriter, loc, kPanelLoop.getInductionVar(),
                                nPanelLoop.getInductionVar(), totalK, panelN);
       auto kLoop =
-          rewriter.create<mlir::scf::ForOp>(loc, zero, panelKValue, one);
+          mlir::scf::ForOp::create(rewriter, loc, zero, panelKValue, one);
       {
         mlir::OpBuilder::InsertionGuard kGuard(rewriter);
         rewriter.setInsertionPointToStart(kLoop.getBody());
-        auto nLoop = rewriter.create<mlir::scf::ForOp>(loc, zero, panelNValue,
-                                                       lanesValue);
+        auto nLoop = mlir::scf::ForOp::create(rewriter, loc, zero, panelNValue,
+                                              lanesValue);
         {
           mlir::OpBuilder::InsertionGuard nInnerGuard(rewriter);
           rewriter.setInsertionPointToStart(nLoop.getBody());
@@ -227,9 +226,8 @@ void buildFullRhsPrepackLoops(mlir::Value base, mlir::Value storage,
               addIndexValues(rewriter, loc, nPanelLoop.getInductionVar(),
                              nLoop.getInductionVar());
           mlir::Value vector =
-              rewriter
-                  .create<mlir::vector::LoadOp>(
-                      loc, vectorType, base, mlir::ValueRange{sourceK, sourceN})
+              mlir::vector::LoadOp::create(rewriter, loc, vectorType, base,
+                                           mlir::ValueRange{sourceK, sourceN})
                   .getResult();
           mlir::Value panelRowOffset = multiplyIndexByConstant(
               rewriter, loc, kLoop.getInductionVar(), panelN);
@@ -237,8 +235,8 @@ void buildFullRhsPrepackLoops(mlir::Value base, mlir::Value storage,
               addIndexValues(rewriter, loc, panelOffset, panelRowOffset);
           linearOffset = addIndexValues(rewriter, loc, linearOffset,
                                         nLoop.getInductionVar());
-          rewriter.create<mlir::vector::StoreOp>(
-              loc, vector, storage, mlir::ValueRange{linearOffset});
+          mlir::vector::StoreOp::create(rewriter, loc, vector, storage,
+                                        mlir::ValueRange{linearOffset});
         }
       }
     }
@@ -275,12 +273,10 @@ getOrCreateRhsPrepackPlan(llvm::SmallVectorImpl<RhsPrepackPlan> &plans,
       baseType.getElementType(), mlir::MemRefLayoutAttrInterface{},
       baseType.getMemorySpace());
   rewriter.setInsertionPoint(anchor);
-  mlir::Value storage =
-      rewriter
-          .create<mlir::memref::AllocOp>(
-              loc, storageType, mlir::ValueRange{},
-              rewriter.getI64IntegerAttr(kPackedPanelAlignment))
-          .getResult();
+  mlir::Value storage = mlir::memref::AllocOp::create(
+                            rewriter, loc, storageType, mlir::ValueRange{},
+                            rewriter.getI64IntegerAttr(kPackedPanelAlignment))
+                            .getResult();
   storage.getDefiningOp()->setAttr(kPackedPanelAttr, rewriter.getUnitAttr());
   storage.getDefiningOp()->setAttr(kPrepackedRhsAttr, rewriter.getUnitAttr());
   buildFullRhsPrepackLoops(base, storage, baseType, panelType, anchor,
@@ -354,12 +350,11 @@ bool tryPrepackFullRhsPanel(mlir::linalg::MatmulOp matmul,
       rewriter.getIndexAttr(plan->panelK), rewriter.getIndexAttr(plan->panelN)};
   llvm::SmallVector<mlir::OpFoldResult, 2> castStrides{
       rewriter.getIndexAttr(plan->panelN), rewriter.getIndexAttr(1)};
-  mlir::Value packed =
-      rewriter
-          .create<mlir::memref::ReinterpretCastOp>(
-              loc, packedType, plan->storage, mlir::OpFoldResult(linearOffset),
-              sizes, castStrides, llvm::ArrayRef<mlir::NamedAttribute>{})
-          .getResult();
+  mlir::Value packed = mlir::memref::ReinterpretCastOp::create(
+                           rewriter, loc, packedType, plan->storage,
+                           mlir::OpFoldResult(linearOffset), sizes, castStrides,
+                           llvm::ArrayRef<mlir::NamedAttribute>{})
+                           .getResult();
   packed.getDefiningOp()->setAttr(kPackedPanelAttr, rewriter.getUnitAttr());
   packed.getDefiningOp()->setAttr(kPrepackedRhsAttr, rewriter.getUnitAttr());
   operand->set(packed);

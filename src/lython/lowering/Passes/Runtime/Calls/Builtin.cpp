@@ -28,8 +28,8 @@ mlir::LogicalResult keepAliveCollectionEvidenceUse(mlir::Operation *op,
                            << " collection length metadata has invalid type "
                            << meta.getType();
   mlir::Value slot =
-      builder.create<mlir::arith::ConstantIndexOp>(op->getLoc(), 0);
-  builder.create<mlir::memref::LoadOp>(op->getLoc(), meta, slot);
+      mlir::arith::ConstantIndexOp::create(builder, op->getLoc(), 0);
+  mlir::memref::LoadOp::create(builder, op->getLoc(), meta, slot);
   return mlir::success();
 }
 
@@ -161,8 +161,9 @@ RuntimeBundleLowerer::lowerBuiltinMethodSinkCall(py::CallOp op,
 
   RuntimeBundle printable = *sinkArgument;
   auto assignSinkResults = [&]() -> mlir::LogicalResult {
-    std::string resultContract =
-        symbol.resultContract.empty() ? "types.NoneType" : symbol.resultContract;
+    std::string resultContract = symbol.resultContract.empty()
+                                     ? "types.NoneType"
+                                     : symbol.resultContract;
     for (mlir::Value result : op.getResults()) {
       if (mlir::failed(assignObjectBundle(
               op, result, runtimeContractType(context, resultContract), {})))
@@ -220,8 +221,7 @@ RuntimeBundleLowerer::lowerBuiltinMethodSinkCall(py::CallOp op,
         return text;
       }
       if (!view.fieldBundles.empty() &&
-          RuntimeBundleLowerer::classDefinesMethod(view.contract,
-                                                   "__repr__")) {
+          RuntimeBundleLowerer::classDefinesMethod(view.contract, "__repr__")) {
         std::string contractName = view.contractName();
         llvm::StringRef contract(contractName);
         std::string text = contract.rsplit('.').second.str();
@@ -334,9 +334,9 @@ RuntimeBundleLowerer::lowerBuiltinMethodSinkCall(py::CallOp op,
 
         llvm::SmallVector<const RuntimeBundle *, 1> sources{&view};
         std::optional<EmittedRuntimeCall> emitted;
-        if (mlir::failed(emitManifestMethodCall(
-                op, view, symbol.builtinMethod, sources,
-                /*allowUnusedSources=*/false, emitted)))
+        if (mlir::failed(
+                emitManifestMethodCall(op, view, symbol.builtinMethod, sources,
+                                       /*allowUnusedSources=*/false, emitted)))
           return mlir::failure();
         return bundleRuntimeResults(
             op, runtimeContractType(context, symbol.builtinSinkContract),

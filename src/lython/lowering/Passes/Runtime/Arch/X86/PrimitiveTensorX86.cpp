@@ -1,7 +1,6 @@
 #include "PrimitiveTensorX86.h"
 
 #include "mlir/Dialect/X86Vector/X86VectorDialect.h"
-#include "mlir/Target/LLVMIR/Dialect/X86Vector/X86VectorToLLVMIRTranslation.h"
 #include "mlir/Transforms/Passes.h"
 
 namespace py::lowering::arch::x86 {
@@ -23,7 +22,7 @@ void registerX86Dialects(mlir::DialectRegistry &registry) {
 }
 
 void registerX86Translations(mlir::DialectRegistry &registry) {
-  mlir::registerX86VectorDialectTranslation(registry);
+  (void)registry;
 }
 
 void addX86LinalgPipeline(mlir::OpPassManager &pipeline) {
