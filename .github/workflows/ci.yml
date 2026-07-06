@@ -53,7 +53,13 @@ jobs:
           ./build/bin/lyc jit examples/oop.py
           ./build/bin/lyc jit examples/tarai_prim.py
           ./build/bin/lyc jit examples/tensor_prim.py
-          ./build/bin/lyc jit examples/error.py || true
+          if ./build/bin/lyc jit examples/error.py 2>&1; then
+            echo "expected examples/error.py to fail" >&2
+            exit 1
+          else
+            status=$?
+            test "$status" -eq 1
+          fi
 
       - name: Benchmarks
         run: |
