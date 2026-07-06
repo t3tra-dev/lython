@@ -559,6 +559,12 @@ bool sameExactGroup(llvm::ArrayRef<mlir::Value> lhs,
   return true;
 }
 
+bool usePrecedesOwnerInBlock(mlir::Operation *owner, mlir::Operation *user,
+                             mlir::Block *ownerBlock) {
+  mlir::Operation *blockUser = ancestorInBlock(user, ownerBlock);
+  return blockUser && blockUser != owner && blockUser->isBeforeInBlock(owner);
+}
+
 struct ReleaseInsertion {
   mlir::Operation *after = nullptr;
   mlir::Operation *before = nullptr;
@@ -617,6 +623,8 @@ findReleaseInsertion(FuncContractCache &contracts, mlir::Operation *owner,
       for (mlir::OpOperand &use : equivalent.getUses()) {
         mlir::Operation *user = use.getOwner();
         if (user == owner)
+          continue;
+        if (usePrecedesOwnerInBlock(owner, user, block))
           continue;
         if (ownershipConsumingUseInvalidatesGroup(contracts, use, group,
                                                   aliases))

@@ -2,6 +2,7 @@
 #include "Ownership.h"
 
 #include "PyTypeObject.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
 
 #include <cctype>
@@ -79,6 +80,40 @@ bool compatibleMemRefView(mlir::Type source, mlir::Type target) {
          sourceMemRef.getShape() == targetMemRef.getShape() &&
          sourceMemRef.getElementType() == targetMemRef.getElementType() &&
          sourceMemRef.getMemorySpace() == targetMemRef.getMemorySpace();
+}
+
+mlir::LogicalResult zeroInitializeMemRef(mlir::OpBuilder &builder,
+                                         mlir::Location loc,
+                                         mlir::Value memref) {
+  auto memrefType = mlir::dyn_cast<mlir::MemRefType>(memref.getType());
+  if (!memrefType || memrefType.getRank() != 1)
+    return mlir::failure();
+
+  auto zeroAttr =
+      mlir::dyn_cast_if_present<mlir::TypedAttr>(
+          builder.getZeroAttr(memrefType.getElementType()));
+  if (!zeroAttr)
+    return mlir::failure();
+
+  mlir::Value zeroIndex = builder.create<mlir::arith::ConstantIndexOp>(loc, 0);
+  mlir::Value upper =
+      memrefType.hasStaticShape()
+          ? builder.create<mlir::arith::ConstantIndexOp>(
+                loc, memrefType.getDimSize(0))
+                .getResult()
+          : builder.create<mlir::memref::DimOp>(loc, memref, zeroIndex)
+                .getResult();
+  mlir::Value step = builder.create<mlir::arith::ConstantIndexOp>(loc, 1);
+  mlir::Value zeroValue = builder.create<mlir::arith::ConstantOp>(
+      loc, memrefType.getElementType(), zeroAttr);
+
+  mlir::scf::ForOp loop =
+      builder.create<mlir::scf::ForOp>(loc, zeroIndex, upper, step);
+  mlir::OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPointToStart(loop.getBody());
+  builder.create<mlir::memref::StoreOp>(loc, zeroValue, memref,
+                                        loop.getInductionVar());
+  return mlir::success();
 }
 
 bool isRankOneI64MemRef(mlir::Type type) {
@@ -772,6 +807,8 @@ RuntimeBundleLowerer::materializeDeadPhysicalValue(mlir::Operation *op,
     mlir::Value allocated =
         builder.create<mlir::memref::AllocOp>(loc, allocType, dynamicSizes)
             .getResult();
+    if (mlir::failed(zeroInitializeMemRef(builder, loc, allocated)))
+      return mlir::failure();
     if (allocated.getType() == type)
       return allocated;
     return builder.create<mlir::memref::CastOp>(loc, type, allocated)

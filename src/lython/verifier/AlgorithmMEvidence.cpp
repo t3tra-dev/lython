@@ -230,6 +230,139 @@ bool evidenceAssignable(mlir::Type actual, mlir::Type expected,
   return isAssignableTo(actual, expected, from);
 }
 
+bool evidenceMatchesCandidate(mlir::Type selected, mlir::Type candidate,
+                              mlir::Operation *from);
+
+bool callableMatchesCandidate(CallableType selected, CallableType candidate,
+                              mlir::Operation *from) {
+  if (!selected || !candidate)
+    return selected == candidate;
+  if (selected.getKwOnlyTypes().size() != candidate.getKwOnlyTypes().size() ||
+      selected.getResultTypes().size() != candidate.getResultTypes().size() ||
+      selected.hasVararg() != candidate.hasVararg() ||
+      selected.hasKwarg() != candidate.hasKwarg())
+    return false;
+
+  auto matchesRange = [&](llvm::ArrayRef<mlir::Type> selectedTypes,
+                          llvm::ArrayRef<mlir::Type> candidateTypes) {
+    if (selectedTypes.size() != candidateTypes.size())
+      return false;
+    for (auto [selectedType, candidateType] :
+         llvm::zip(selectedTypes, candidateTypes))
+      if (!evidenceMatchesCandidate(selectedType, candidateType, from))
+        return false;
+    return true;
+  };
+
+  llvm::ArrayRef<mlir::Type> selectedPositional =
+      selected.getPositionalTypes();
+  llvm::ArrayRef<mlir::Type> candidatePositional =
+      candidate.getPositionalTypes();
+  unsigned selectedIndex = 0;
+  for (unsigned candidateIndex = 0; candidateIndex < candidatePositional.size();
+       ++candidateIndex) {
+    mlir::Type candidateType = candidatePositional[candidateIndex];
+    bool isPack = mlir::isa<ParamSpecType, TypeVarTupleType>(candidateType);
+    if (auto unpack = mlir::dyn_cast<UnpackType>(candidateType))
+      isPack = mlir::isa<TypeVarTupleType>(unpack.getPackedType());
+    if (isPack) {
+      unsigned remainingCandidate =
+          candidatePositional.size() - candidateIndex - 1;
+      if (selectedPositional.size() < selectedIndex + remainingCandidate)
+        return false;
+      selectedIndex = selectedPositional.size() - remainingCandidate;
+      continue;
+    }
+    if (selectedIndex >= selectedPositional.size())
+      return false;
+    if (!evidenceMatchesCandidate(selectedPositional[selectedIndex],
+                                  candidateType, from))
+      return false;
+    ++selectedIndex;
+  }
+  if (selectedIndex != selectedPositional.size())
+    return false;
+
+  if (!matchesRange(selected.getKwOnlyTypes(), candidate.getKwOnlyTypes()) ||
+      !matchesRange(selected.getResultTypes(), candidate.getResultTypes()))
+    return false;
+  if (selected.hasVararg() &&
+      !evidenceMatchesCandidate(selected.getVarargType(),
+                                candidate.getVarargType(), from))
+    return false;
+  if (selected.hasKwarg() &&
+      !evidenceMatchesCandidate(selected.getKwargType(),
+                                candidate.getKwargType(), from))
+    return false;
+  return true;
+}
+
+bool evidenceMatchesCandidate(mlir::Type selected, mlir::Type candidate,
+                              mlir::Operation *from) {
+  if (!candidate)
+    return !selected;
+  if (mlir::isa<SelfType, TypeVarType, ParamSpecType, TypeVarTupleType>(
+          candidate))
+    return true;
+  if (auto unpack = mlir::dyn_cast<UnpackType>(candidate))
+    if (mlir::isa<TypeVarTupleType>(unpack.getPackedType()))
+      return true;
+
+  CallableType selectedCallable = getCallableContract(selected);
+  CallableType candidateCallable = getCallableContract(candidate);
+  if (selectedCallable || candidateCallable)
+    return callableMatchesCandidate(selectedCallable, candidateCallable, from);
+
+  if (evidenceAssignable(selected, candidate, from))
+    return true;
+
+  if (auto selectedType = mlir::dyn_cast_if_present<TypeType>(selected))
+    if (auto candidateType = mlir::dyn_cast_if_present<TypeType>(candidate))
+      return evidenceMatchesCandidate(selectedType.getInstanceType(),
+                                      candidateType.getInstanceType(), from);
+
+  if (auto selectedContract =
+          mlir::dyn_cast_if_present<ContractType>(selected)) {
+    auto candidateContract = mlir::dyn_cast_if_present<ContractType>(candidate);
+    if (!candidateContract ||
+        selectedContract.getContractName() !=
+            candidateContract.getContractName() ||
+        selectedContract.getArguments().size() !=
+            candidateContract.getArguments().size())
+      return false;
+    for (auto [selectedArg, candidateArg] :
+         llvm::zip(selectedContract.getArguments(),
+                   candidateContract.getArguments()))
+      if (!evidenceMatchesCandidate(selectedArg, candidateArg, from))
+        return false;
+    return true;
+  }
+
+  if (auto selectedProtocol =
+          mlir::dyn_cast_if_present<ProtocolType>(selected)) {
+    auto candidateProtocol = mlir::dyn_cast_if_present<ProtocolType>(candidate);
+    if (!candidateProtocol ||
+        selectedProtocol.getProtocolName() !=
+            candidateProtocol.getProtocolName() ||
+        selectedProtocol.getArguments().size() !=
+            candidateProtocol.getArguments().size())
+      return false;
+    for (auto [selectedArg, candidateArg] :
+         llvm::zip(selectedProtocol.getArguments(),
+                   candidateProtocol.getArguments()))
+      if (!evidenceMatchesCandidate(selectedArg, candidateArg, from))
+        return false;
+    return true;
+  }
+
+  if (auto candidateUnion = mlir::dyn_cast_if_present<UnionType>(candidate))
+    return llvm::any_of(candidateUnion.getMemberTypes(), [&](mlir::Type member) {
+      return evidenceMatchesCandidate(selected, member, from);
+    });
+
+  return false;
+}
+
 std::optional<llvm::StringRef> contractAttrName(mlir::Operation *op) {
   if (op->hasAttr("callee_contract"))
     return llvm::StringRef("callee_contract");
@@ -429,7 +562,8 @@ mlir::LogicalResult verifyManifestCandidate(mlir::Operation *op,
   std::vector<protocols::ContractResolution> candidates =
       table.methodContractCandidatesWithEvidence(*receiver, *methodName);
   for (const protocols::ContractResolution &candidate : candidates)
-    if (callableEvidenceSame(selected, candidate.method.signature))
+    if (callableEvidenceSame(selected, candidate.method.signature) ||
+        callableMatchesCandidate(selected, candidate.method.signature, op))
       return mlir::success();
 
   return op->emitError()

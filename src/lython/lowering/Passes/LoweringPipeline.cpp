@@ -50,10 +50,11 @@ void dumpMLIRForPass(const IRDumpConfig &config, llvm::StringRef passName,
 
 template <typename Populate>
 LogicalResult runLoweringPhase(llvm::StringRef name, ModuleOp module,
-                               Populate populate) {
+                               bool enableVerifier, Populate populate) {
   std::string phase = (llvm::Twine("lowering.") + name).str();
   PerfScope perf(phase);
   PassManager pm(module.getContext());
+  pm.enableVerifier(enableVerifier);
   populate(pm);
   return pm.run(module);
 }
@@ -103,34 +104,40 @@ bool IRDumpConfig::shouldDump(llvm::StringRef passName) const {
 LogicalResult runLoweringPipeline(ModuleOp module,
                                   TensorLoweringTarget tensorTarget,
                                   const IRDumpConfig &irDump,
-                                  bool auditRuntimeManifest) {
+                                  LoweringPipelineOptions options) {
   dumpMLIRForPass(irDump, "frontend", module);
+  auto runPhase = [&](llvm::StringRef name, auto populate) {
+    return runLoweringPhase(name, module, options.enableVerifiers, populate);
+  };
+  auto runVerifierPhase = [&](llvm::StringRef name, auto populate) {
+    if (!options.enableVerifiers)
+      return success();
+    return runPhase(name, populate);
+  };
 
   // Phase 1: native target and ABI facts.
-  if (failed(
-          runLoweringPhase("native-verification", module, [&](PassManager &pm) {
-            pm.addPass(createNativeVerificationPass());
-          })))
+  if (failed(runVerifierPhase("native-verification", [&](PassManager &pm) {
+        pm.addPass(createNativeVerificationPass());
+      })))
     return failure();
   dumpMLIRForPass(irDump, "native-verification", module);
 
   // Phase 2: publish high-level callable/runtime metadata before rewrites.
-  if (failed(runLoweringPhase("publication-preparation", module,
-                              [&](PassManager &pm) {
-                                pm.addPass(createPublicationPreparationPass());
-                              })))
+  if (failed(runPhase("publication-preparation", [&](PassManager &pm) {
+        pm.addPass(createPublicationPreparationPass());
+      })))
     return failure();
   dumpMLIRForPass(irDump, "publication-preparation", module);
 
   // Phase 3: high-level Py semantic optimizations before runtime import.
-  if (failed(runLoweringPhase("py-optimization", module, [&](PassManager &pm) {
+  if (failed(runPhase("py-optimization", [&](PassManager &pm) {
         pm.addPass(createPyOptimizationPass());
       })))
     return failure();
   dumpMLIRForPass(irDump, "py-optimization", module);
 
   // Phase 4: semantic evidence verification before lowering consumes Py ops.
-  if (failed(runLoweringPhase("algorithmm-evidence-verifier", module,
+  if (failed(runVerifierPhase("algorithmm-evidence-verifier",
                               [&](PassManager &pm) {
                                 pm.addPass(
                                     createAlgorithmMEvidenceVerifierPass());
@@ -139,15 +146,14 @@ LogicalResult runLoweringPipeline(ModuleOp module,
   dumpMLIRForPass(irDump, "algorithmm-evidence-verifier", module);
 
   // Phase 5: quantitative ownership verification over high-level Py IR.
-  if (failed(
-          runLoweringPhase("ownership-verifier", module, [&](PassManager &pm) {
-            pm.addPass(createOwnershipVerifierPass());
-          })))
+  if (failed(runVerifierPhase("ownership-verifier", [&](PassManager &pm) {
+        pm.addPass(createOwnershipVerifierPass());
+      })))
     return failure();
   dumpMLIRForPass(irDump, "ownership-verifier", module);
 
   // Phase 6: generic cleanup while Python-level structure is still visible.
-  if (failed(runLoweringPhase("canonicalize", module, [&](PassManager &pm) {
+  if (failed(runPhase("canonicalize", [&](PassManager &pm) {
         pm.addPass(mlir::createCanonicalizerPass());
         pm.addPass(mlir::createCSEPass());
       })))
@@ -155,7 +161,7 @@ LogicalResult runLoweringPipeline(ModuleOp module,
   dumpMLIRForPass(irDump, "canonicalize", module);
 
   // Phase 7: numeric kernel lowering before Python object lowering.
-  if (failed(runLoweringPhase("linalg-lowering", module, [&](PassManager &pm) {
+  if (failed(runPhase("linalg-lowering", [&](PassManager &pm) {
         pm.addPass(createLinalgLoweringPass(tensorTarget));
       })))
     return failure();
@@ -169,45 +175,42 @@ LogicalResult runLoweringPipeline(ModuleOp module,
   }
   dumpMLIRForPass(irDump, "runtime-objects", module);
 
-  if (auditRuntimeManifest) {
-    if (failed(runLoweringPhase("runtime-manifest-completeness", module,
-                                [&](PassManager &pm) {
-                                  pm.addPass(
-                                      createRuntimeManifestCompletenessVerifierPass());
-                                })))
+  if (options.auditRuntimeManifest && options.enableVerifiers) {
+    if (failed(runVerifierPhase(
+            "runtime-manifest-completeness", [&](PassManager &pm) {
+              pm.addPass(createRuntimeManifestCompletenessVerifierPass());
+            })))
       return failure();
     dumpMLIRForPass(irDump, "runtime-manifest-completeness", module);
   }
 
   // Phase 9: lower Py dialect values into runtime bundles and calls.
-  if (failed(runLoweringPhase("runtime-lowering", module, [&](PassManager &pm) {
+  if (failed(runPhase("runtime-lowering", [&](PassManager &pm) {
         pm.addPass(createRuntimeLoweringPass());
       })))
     return failure();
   dumpMLIRForPass(irDump, "runtime-lowering", module);
 
-  if (failed(runLoweringPhase("runtime-native-verifier", module,
-                              [&](PassManager &pm) {
-                                pm.addPass(createNativeVerificationPass());
-                              })))
+  if (failed(runVerifierPhase("runtime-native-verifier", [&](PassManager &pm) {
+        pm.addPass(createNativeVerificationPass());
+      })))
     return failure();
   dumpMLIRForPass(irDump, "runtime-native-verifier", module);
 
   // Phase 10: insert and simplify ownership operations once calls are concrete.
-  if (failed(
-          runLoweringPhase("refcount-insertion", module, [&](PassManager &pm) {
-            pm.addPass(createRefCountInsertionPass());
-          })))
+  if (failed(runPhase("refcount-insertion", [&](PassManager &pm) {
+        pm.addPass(createRefCountInsertionPass());
+      })))
     return failure();
   dumpMLIRForPass(irDump, "refcount-insertion", module);
 
-  if (failed(runLoweringPhase("refcount-elision", module, [&](PassManager &pm) {
+  if (failed(runPhase("refcount-elision", [&](PassManager &pm) {
         pm.addPass(createRefCountPairElisionPass());
       })))
     return failure();
   dumpMLIRForPass(irDump, "refcount-elision", module);
 
-  if (failed(runLoweringPhase("pre-cleanup-llvm-call-verifier", module,
+  if (failed(runVerifierPhase("pre-cleanup-llvm-call-verifier",
                               [&](PassManager &pm) {
                                 pm.addPass(createLLVMCallOwnershipVerifierPass());
                               })))
@@ -215,24 +218,22 @@ LogicalResult runLoweringPipeline(ModuleOp module,
   dumpMLIRForPass(irDump, "pre-cleanup-llvm-call-verifier", module);
 
   // Phase 11: lower Lython-owned async thunks before symbol cleanup.
-  if (failed(runLoweringPhase("async-thunk-lowering", module,
-                              [&](PassManager &pm) {
-                                pm.addPass(createAsyncThunkLoweringPass());
-                                pm.addPass(mlir::createCanonicalizerPass());
-                                pm.addPass(mlir::createCSEPass());
-                              })))
+  if (failed(runPhase("async-thunk-lowering", [&](PassManager &pm) {
+        pm.addPass(createAsyncThunkLoweringPass());
+        pm.addPass(mlir::createCanonicalizerPass());
+        pm.addPass(mlir::createCSEPass());
+      })))
     return failure();
   dumpMLIRForPass(irDump, "async-thunk-lowering", module);
   if (failed(requireNoAsyncDialectOps(module)))
     return failure();
 
   // Phase 12: remove artifacts from runtime embedding and lowering.
-  if (failed(runLoweringPhase("post-lowering-cleanup", module,
-                              [&](PassManager &pm) {
-                                pm.addPass(mlir::createCanonicalizerPass());
-                                pm.addPass(mlir::createCSEPass());
-                                pm.addPass(mlir::createSymbolDCEPass());
-                              })))
+  if (failed(runPhase("post-lowering-cleanup", [&](PassManager &pm) {
+        pm.addPass(mlir::createCanonicalizerPass());
+        pm.addPass(mlir::createCSEPass());
+        pm.addPass(mlir::createSymbolDCEPass());
+      })))
     return failure();
   {
     PerfScope perf("lowering.pointer-roundtrip-cleanup");
@@ -242,29 +243,27 @@ LogicalResult runLoweringPipeline(ModuleOp module,
   dumpMLIRForPass(irDump, "post-lowering-cleanup", module);
 
   // Phase 13: validate ownership and no-GIL contracts before final lowering.
-  if (failed(
-          runLoweringPhase("llvm-call-verifier", module, [&](PassManager &pm) {
-            pm.addPass(createLLVMCallOwnershipVerifierPass());
-          })))
+  if (failed(runVerifierPhase("llvm-call-verifier", [&](PassManager &pm) {
+        pm.addPass(createLLVMCallOwnershipVerifierPass());
+      })))
     return failure();
   dumpMLIRForPass(irDump, "llvm-call-verifier", module);
 
-  if (failed(runLoweringPhase(
-          "thread-safety-verifier", module, [&](PassManager &pm) {
-            pm.addPass(createLLVMThreadSafeVerifierPass());
-          })))
+  if (failed(runVerifierPhase("thread-safety-verifier", [&](PassManager &pm) {
+        pm.addPass(createLLVMThreadSafeVerifierPass());
+      })))
     return failure();
   dumpMLIRForPass(irDump, "thread-safety-verifier", module);
 
   // Phase 14: final lowering to LLVM dialect.
   {
     LoweredSafetyContracts finalSafetyContracts;
-    {
+    if (options.enableVerifiers) {
       PerfScope perf("lowering.collect-final-safety-contracts");
       collectLoweredSafetyContracts(module, finalSafetyContracts);
     }
     if (failed(
-            runLoweringPhase("convert-to-llvm", module, [&](PassManager &pm) {
+            runPhase("convert-to-llvm", [&](PassManager &pm) {
               mlir::ConvertVectorToLLVMPassOptions vectorOptions;
               vectorOptions.reassociateFPReductions = true;
               vectorOptions.x86Vector = tensorTarget.usesX86();
@@ -297,7 +296,7 @@ LogicalResult runLoweringPipeline(ModuleOp module,
               pm.addPass(mlir::createCanonicalizerPass());
             })))
       return failure();
-    {
+    if (options.enableVerifiers) {
       PerfScope perf("lowering.preserve-final-safety-contracts");
       if (failed(preserveLoweredSafetyContracts(module, finalSafetyContracts)))
         return failure();
@@ -310,22 +309,20 @@ LogicalResult runLoweringPipeline(ModuleOp module,
   dumpMLIRForPass(irDump, "convert-to-llvm", module);
 
   // Phase 14: re-check contracts after final conversion rewrites.
-  if (failed(runLoweringPhase("final-native-verifier", module,
-                              [&](PassManager &pm) {
-                                pm.addPass(createNativeVerificationPass());
-                              })))
+  if (failed(runVerifierPhase("final-native-verifier", [&](PassManager &pm) {
+        pm.addPass(createNativeVerificationPass());
+      })))
     return failure();
   dumpMLIRForPass(irDump, "final-native-verifier", module);
 
-  if (failed(runLoweringPhase(
-          "final-ownership-verifier", module, [&](PassManager &pm) {
-            pm.addPass(createLLVMCallOwnershipVerifierPass());
-          })))
+  if (failed(runVerifierPhase("final-ownership-verifier", [&](PassManager &pm) {
+        pm.addPass(createLLVMCallOwnershipVerifierPass());
+      })))
     return failure();
   dumpMLIRForPass(irDump, "final-ownership-verifier", module);
 
-  if (failed(runLoweringPhase(
-          "final-thread-safety-verifier", module, [&](PassManager &pm) {
+  if (failed(
+          runVerifierPhase("final-thread-safety-verifier", [&](PassManager &pm) {
             pm.addPass(createLLVMThreadSafeVerifierPass());
           })))
     return failure();

@@ -17,9 +17,14 @@ struct IRDumpConfig {
   bool shouldDump(llvm::StringRef passName) const;
 };
 
+struct LoweringPipelineOptions {
+  bool auditRuntimeManifest = false;
+  bool enableVerifiers = true;
+};
+
 mlir::LogicalResult runLoweringPipeline(mlir::ModuleOp module,
                                         TensorLoweringTarget tensorTarget,
                                         const IRDumpConfig &irDump,
-                                        bool auditRuntimeManifest = false);
+                                        LoweringPipelineOptions options = {});
 
 } // namespace py

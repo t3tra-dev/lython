@@ -45,6 +45,8 @@
 #include "llvm/ADT/Twine.h"
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/ExecutionEngine/JITSymbol.h"
+#include "llvm/ExecutionEngine/JITLink/EHFrameSupport.h"
+#include "llvm/ExecutionEngine/Orc/EHFrameRegistrationPlugin.h"
 #include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h"
 #include "llvm/IR/Constants.h"
@@ -123,6 +125,7 @@ std::string TargetSysroot;
 std::vector<std::string> IncludeSearchPaths;
 std::vector<std::string> LibrarySearchPaths;
 lython::driver::SanitizerConfig ActiveSanitizers;
+bool ReleaseMode = false;
 
 std::string trimEnvToken(llvm::StringRef token) {
   token = token.trim();
@@ -589,6 +592,53 @@ LogicalResult generateModuleFromCppFrontend(StringRef pythonFile,
 }
 
 std::string pythonTracebackPath(StringRef inputPath) {
+  if (ReleaseMode) {
+    auto dotPath = [](StringRef path) {
+      llvm::SmallString<256> result(".");
+      llvm::sys::path::append(result, path);
+      return result.str().str();
+    };
+
+    llvm::SmallString<256> absolute(inputPath);
+    if (!llvm::sys::fs::make_absolute(absolute)) {
+      llvm::sys::path::remove_dots(absolute, /*remove_dot_dot=*/true);
+
+      llvm::SmallString<256> current;
+      if (!llvm::sys::fs::current_path(current)) {
+        llvm::sys::path::remove_dots(current, /*remove_dot_dot=*/true);
+
+        llvm::SmallVector<llvm::StringRef, 16> absoluteParts;
+        llvm::SmallVector<llvm::StringRef, 16> currentParts;
+        for (auto it = llvm::sys::path::begin(absolute),
+                  end = llvm::sys::path::end(absolute);
+             it != end; ++it)
+          absoluteParts.push_back(*it);
+        for (auto it = llvm::sys::path::begin(current),
+                  end = llvm::sys::path::end(current);
+             it != end; ++it)
+          currentParts.push_back(*it);
+
+        bool underCurrent = absoluteParts.size() >= currentParts.size();
+        for (unsigned index = 0; underCurrent && index < currentParts.size();
+             ++index)
+          underCurrent = absoluteParts[index] == currentParts[index];
+
+        if (underCurrent) {
+          llvm::SmallString<256> relative(".");
+          for (unsigned index = currentParts.size();
+               index < absoluteParts.size(); ++index)
+            llvm::sys::path::append(relative, absoluteParts[index]);
+          return relative.str().str();
+        }
+      }
+    }
+
+    StringRef filename = llvm::sys::path::filename(inputPath);
+    if (filename.empty())
+      filename = "<unknown>";
+    return dotPath(filename);
+  }
+
   if (llvm::sys::path::is_absolute(inputPath))
     return inputPath.str();
   llvm::SmallString<256> current;
@@ -1183,8 +1233,10 @@ LogicalResult emitObjectFile(llvm::Module &llvmModule,
   llvmModule.setTargetTriple(targetTriple);
   llvmModule.setDataLayout(targetMachine->createDataLayout());
   runLLVMCoroLowering(llvmModule, ActiveSanitizers, targetMachine.get());
-  collectLinkedLLVMSafetyContracts(llvmModule, safetyProfile);
-  if (failed(verifyOptimizedLLVMThreadSafe(llvmModule, safetyProfile)))
+  if (!ReleaseMode)
+    collectLinkedLLVMSafetyContracts(llvmModule, safetyProfile);
+  if (!ReleaseMode &&
+      failed(verifyOptimizedLLVMThreadSafe(llvmModule, safetyProfile)))
     return failure();
 
   std::error_code ec;
@@ -1615,6 +1667,12 @@ LogicalResult runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
         [](llvm::orc::ExecutionSession &session,
            const llvm::Triple &tt) -> std::unique_ptr<llvm::orc::ObjectLayer> {
       auto layer = std::make_unique<llvm::orc::ObjectLinkingLayer>(session);
+      if (tt.isOSBinFormatELF()) {
+        layer->addPlugin(
+            std::make_shared<llvm::orc::EHFrameRegistrationPlugin>(
+                session,
+                std::make_unique<llvm::jitlink::InProcessEHFrameRegistrar>()));
+      }
       if (tt.isOSBinFormatCOFF()) {
         layer->setOverrideObjectFlagsWithResponsibilityFlags(true);
         layer->setAutoClaimResponsibilityForObjectSymbols(true);
@@ -1672,7 +1730,8 @@ LogicalResult runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
     llvm::SmallVector<py::PythonCallSiteRange, 16> pythonCallSites;
     {
       PerfScope perf("jit-build.prepare-mlir");
-      collectLLVMSafetyContracts(module, safetyProfile);
+      if (!ReleaseMode)
+        collectLLVMSafetyContracts(module, safetyProfile);
       py::collectPythonCallSiteRanges(module, pythonCallSites);
       attachPythonDebugInfo(module);
     }
@@ -1691,10 +1750,12 @@ LogicalResult runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
     {
       PerfScope perf("jit-build.prepare-llvm");
       py::installPythonExceptionCleanupFrames(*llvmModule, pythonCallSites);
-      if (failed(
+      if (!ReleaseMode &&
+          failed(
               verifyLLVMIRSafetyMetadataAttached(*llvmModule, safetyProfile)))
         return failure();
-      if (failed(verifyPostCoroLLVMThreadSafe(*llvmModule, safetyProfile)))
+      if (!ReleaseMode &&
+          failed(verifyPostCoroLLVMThreadSafe(*llvmModule, safetyProfile)))
         return failure();
       for (auto &func : *llvmModule) {
         if (!func.isDeclaration())
@@ -1708,16 +1769,19 @@ LogicalResult runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
       PerfScope perf("jit-build.link-runtime");
       if (failed(py::runtime_library::linkEmbeddedNativeRuntime(*llvmModule)))
         return failure();
-      collectLinkedLLVMSafetyContracts(*llvmModule, safetyProfile);
+      if (!ReleaseMode)
+        collectLinkedLLVMSafetyContracts(*llvmModule, safetyProfile);
     }
     {
       PerfScope perf("jit-build.llvm-opt");
       runLLVMCoroLowering(*llvmModule, ActiveSanitizers,
                           optimizationTargetMachine.get(),
                           llvm::OptimizationLevel::O0);
-      collectLinkedLLVMSafetyContracts(*llvmModule, safetyProfile);
+      if (!ReleaseMode)
+        collectLinkedLLVMSafetyContracts(*llvmModule, safetyProfile);
       dumpLLVMForPass(irDump, "llvm-translation", *llvmModule);
-      if (failed(verifyOptimizedLLVMThreadSafe(*llvmModule, safetyProfile)))
+      if (!ReleaseMode &&
+          failed(verifyOptimizedLLVMThreadSafe(*llvmModule, safetyProfile)))
         return failure();
     }
 
@@ -1810,6 +1874,11 @@ static llvm::cl::opt<bool> AuditRuntimeManifest(
     llvm::cl::desc("Verify typing.mlir runtime-required contracts against "
                    "runtime ABI manifest symbols after runtime import"),
     llvm::cl::init(false), llvm::cl::cat(LythonCategory));
+static llvm::cl::opt<bool> ReleaseModeOption(
+    "release",
+    llvm::cl::desc("Disable compiler verifier passes and hide user paths in "
+                   "Python debug locations"),
+    llvm::cl::init(false), llvm::cl::cat(LythonCategory));
 static llvm::cl::opt<std::string>
     TargetOption("target",
                  llvm::cl::desc("Generate code for the given target triple"),
@@ -1898,7 +1967,21 @@ int main(int argc, char **argv) {
   llvm::sys::PrintStackTraceOnErrorSignal(argv[0]);
   llvm::cl::SetVersionPrinter(
       [](llvm::raw_ostream &os) { os << "Lython CLI based on MLIR\n"; });
-  llvm::cl::ParseCommandLineOptions(argc, argv,
+  bool releaseModeFromArgv = false;
+  std::vector<const char *> filteredArgv;
+  filteredArgv.reserve(argc);
+  filteredArgv.push_back(argv[0]);
+  for (int index = 1; index < argc; ++index) {
+    llvm::StringRef arg(argv[index]);
+    if (arg == "--release" || arg == "-release") {
+      releaseModeFromArgv = true;
+      continue;
+    }
+    filteredArgv.push_back(argv[index]);
+  }
+
+  llvm::cl::ParseCommandLineOptions(static_cast<int>(filteredArgv.size()),
+                                    filteredArgv.data(),
                                     "Lython compiler driver (clang-style)\n");
   TargetTriple = TargetOption;
   TargetCPU = TargetCPUOption;
@@ -1909,6 +1992,7 @@ int main(int argc, char **argv) {
                             IncludePathOptions.end());
   LibrarySearchPaths.assign(LibraryPathOptions.begin(),
                             LibraryPathOptions.end());
+  ReleaseMode = releaseModeFromArgv || ReleaseModeOption;
   py::IRDumpConfig irDump = py::IRDumpConfig::fromEnv();
 
   const bool jitMode = static_cast<bool>(JitCommand);
@@ -2010,8 +2094,11 @@ int main(int argc, char **argv) {
 
   {
     PerfScope perf("lowering");
+    py::LoweringPipelineOptions loweringOptions;
+    loweringOptions.auditRuntimeManifest = AuditRuntimeManifest;
+    loweringOptions.enableVerifiers = !ReleaseMode;
     if (failed(py::runLoweringPipeline(*module, tensorTarget, irDump,
-                                       AuditRuntimeManifest))) {
+                                       loweringOptions))) {
       llvm::errs() << "Failed to run lowering pipeline\n";
       return 1;
     }
@@ -2022,7 +2109,8 @@ int main(int argc, char **argv) {
   }
 
   LLVMSafetyProfile safetyProfile;
-  collectLLVMSafetyContracts(*module, safetyProfile);
+  if (!ReleaseMode)
+    collectLLVMSafetyContracts(*module, safetyProfile);
   llvm::SmallVector<py::PythonCallSiteRange, 16> pythonCallSites;
   py::collectPythonCallSiteRanges(*module, pythonCallSites);
   attachPythonDebugInfo(*module);
@@ -2035,9 +2123,11 @@ int main(int argc, char **argv) {
   }
   py::installPythonExceptionCleanupFrames(*llvmModule, pythonCallSites);
   dumpLLVMForPass(irDump, "llvm-translation", *llvmModule);
-  if (failed(verifyLLVMIRSafetyMetadataAttached(*llvmModule, safetyProfile)))
+  if (!ReleaseMode &&
+      failed(verifyLLVMIRSafetyMetadataAttached(*llvmModule, safetyProfile)))
     return 1;
-  if (failed(verifyPostCoroLLVMThreadSafe(*llvmModule, safetyProfile)))
+  if (!ReleaseMode &&
+      failed(verifyPostCoroLLVMThreadSafe(*llvmModule, safetyProfile)))
     return 1;
 
   llvm::InitializeAllTargets();
@@ -2055,7 +2145,8 @@ int main(int argc, char **argv) {
   if (failed(installAOTEntryPoint(*llvmModule)))
     return 1;
 
-  collectLinkedLLVMSafetyContracts(*llvmModule, safetyProfile);
+  if (!ReleaseMode)
+    collectLinkedLLVMSafetyContracts(*llvmModule, safetyProfile);
 
   if (EmitLLVMOnly) {
     if (ActiveSanitizers.requiresLLVMInstrumentation()) {
@@ -2067,8 +2158,10 @@ int main(int argc, char **argv) {
       llvmModule->setTargetTriple(targetTriple);
       llvmModule->setDataLayout(targetMachine->createDataLayout());
       runLLVMCoroLowering(*llvmModule, ActiveSanitizers, targetMachine.get());
-      collectLinkedLLVMSafetyContracts(*llvmModule, safetyProfile);
-      if (failed(verifyOptimizedLLVMThreadSafe(*llvmModule, safetyProfile)))
+      if (!ReleaseMode)
+        collectLinkedLLVMSafetyContracts(*llvmModule, safetyProfile);
+      if (!ReleaseMode &&
+          failed(verifyOptimizedLLVMThreadSafe(*llvmModule, safetyProfile)))
         return 1;
     }
     return failed(writeLLVMIR(*llvmModule, outputPath)) ? 1 : 0;
