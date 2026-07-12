@@ -128,7 +128,7 @@ std::optional<mlir::Type> resolveCtypesSourceExpr(mlir::MLIRContext *context,
     if (!name)
       return std::nullopt;
     if (std::optional<std::string> contract =
-            ctypesQualifiedNameContract(*name))
+            ctypesQualifiedNameContract(*context, *name))
       return ctypesContractType(context, *contract);
     if (py::ClassOp classOp = lookupClassForContract(module, *name))
       return ctypesContractType(context, classOp.getSymName());

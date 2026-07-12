@@ -1,5 +1,7 @@
 #include "Runtime/Core/Lowerer.h"
 
+#include "mlir/Dialect/SCF/IR/SCF.h"
+
 namespace py::lowering {
 namespace {
 
@@ -9,8 +11,11 @@ bool sameRuntimeValueIdentity(const RuntimeValue &lhs,
     return false;
   if (lhs.values.empty())
     return false;
+  // Ownership rewrapping (retain markers) must not break identity: compare
+  // the values underneath any identity-cast markers.
   for (auto [left, right] : llvm::zip(lhs.values, rhs.values))
-    if (left != right)
+    if (ownership::underlyingObjectValue(left) !=
+        ownership::underlyingObjectValue(right))
       return false;
   return true;
 }
@@ -146,7 +151,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
         op, receiver, methodName);
   if (receiver.kind != RuntimeBundle::Kind::Object)
     return op.emitError() << "bound method receiver must be an object bundle";
-  if (op.getNumResults() != 1)
+  bool structuralMutation =
+      op->hasAttr("ly.structural_mutation") && op.getNumResults() == 2;
+  if (op.getNumResults() != 1 && !structuralMutation)
     return op.emitError()
            << "Python bound method lowering expects exactly one Python result";
   if (mlir::failed(requireEmptyAggregate(op, op.getKwnames(), "kw names")) ||
@@ -169,12 +176,153 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
           op, op.getPosargs(), "positional args", sources, &unpackedSources)))
     return mlir::failure();
 
+  if (receiver.contractName() == "types.GeneratorType" &&
+      !receiver.generatorTarget.empty() && methodName == "send")
+    return RuntimeBundleLowerer::lowerSourceGeneratorSend(op, receiver,
+                                                          sources);
+  if (receiver.contractName() == "types.GeneratorType" &&
+      !receiver.generatorTarget.empty() && methodName == "throw")
+    return RuntimeBundleLowerer::lowerSourceGeneratorThrow(op, receiver,
+                                                           sources);
+
+  if (receiver.kind == RuntimeBundle::Kind::Object &&
+      receiver.contractName() == "builtins.set" && methodName == "add") {
+    // Runtime set insert with dedup: box the element and let the runtime
+    // probe/insert (the rebind result carries the possibly reallocated
+    // triple). Sets are always runtime-mode (their packs carry no element
+    // evidence).
+    if (sources.size() != 2 || !sources[1] ||
+        sources[1]->kind != RuntimeBundle::Kind::Object)
+      return op.emitError() << "set.add expects one Python object argument";
+    if (!structuralMutation)
+      return op.emitError() << "set.add requires a rebindable local receiver";
+    if (receiver.physicalValues().size() < 3)
+      return op.emitError() << "set runtime object has no physical payload";
+    std::optional<RuntimeSymbol> addBox =
+        manifest.primitive("builtins.set", "add_box");
+    if (!addBox)
+      return op.emitError() << "runtime manifest has no set add_box primitive";
+    builder.setInsertionPoint(op);
+    mlir::Location loc = op.getLoc();
+    mlir::FailureOr<RuntimeBundle> payload =
+        RuntimeBundleLowerer::materializePayloadObjectBundle(op, *sources[1]);
+    if (mlir::failed(payload))
+      return mlir::failure();
+    std::string elementContract = payload->contractName();
+    if (elementContract != "builtins.int" && elementContract != "builtins.str")
+      return op.emitError()
+             << "set elements currently require int or str evidence, got "
+             << payload->objectValue.contract;
+    if (mlir::failed(
+            RuntimeBundleLowerer::retainAggregateSlot(op, *payload, "set.add")))
+      return mlir::failure();
+    auto boxType = mlir::MemRefType::get({16}, builder.getI64Type());
+    mlir::Value box =
+        mlir::memref::AllocaOp::create(builder, loc, boxType).getResult();
+    mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
+        RuntimeBundleLowerer::objectPayloadHandleWords(op, *payload,
+                                                       /*ownsPayload=*/true);
+    if (mlir::failed(words))
+      return mlir::failure();
+    for (auto [wordIndex, word] : llvm::enumerate(*words)) {
+      mlir::Value slot = mlir::arith::ConstantIndexOp::create(
+          builder, loc, static_cast<std::int64_t>(wordIndex));
+      mlir::memref::StoreOp::create(builder, loc, word, box, slot);
+    }
+    llvm::SmallVector<mlir::Value, 6> operands(
+        receiver.physicalValues().begin(), receiver.physicalValues().end());
+    operands.push_back(box);
+    mlir::func::CallOp call =
+        RuntimeBundleLowerer::createRuntimeCall(loc, *addBox, operands);
+    RuntimeBundle updated;
+    if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+            op, receiver.objectValue.contract, call.getResults(), updated)))
+      return mlir::failure();
+    valueBundles[op.getResult(1)] = std::move(updated);
+    if (mlir::failed(assignObjectBundle(
+            op, op.getResult(0),
+            runtimeContractType(context, "types.NoneType"),
+            mlir::ValueRange{})))
+      return mlir::failure();
+    erase.push_back(op);
+    return mlir::success();
+  }
+
   if (isMutableStructuralListObject(receiver) &&
       (methodName == "append" || methodName == "remove")) {
     if (sources.size() != 2 || !sources[1] ||
         sources[1]->kind != RuntimeBundle::Kind::Object)
       return op.emitError() << "sequence " << methodName
                             << " expects one Python object argument";
+
+    if (structuralMutation && !receiver.sequenceEvidenceBacked) {
+      // Runtime-mode list (e.g. loop-carried): contents are only known to the
+      // runtime, so mutate through the runtime representation. The rebind
+      // result carries the (possibly reallocated) triple; the emitter turned
+      // the mutation into an SSA reassignment of the receiver local.
+      // Non-rebind receivers (object fields) keep the static field-alias
+      // path below.
+      if (methodName != "append")
+        return op.emitError()
+               << "list." << methodName
+               << " is not supported on runtime-mode lists yet";
+      if (receiver.physicalValues().size() < 3)
+        return op.emitError() << "list runtime object has no physical payload";
+      std::optional<RuntimeSymbol> ensure =
+          manifest.primitive("builtins.list", "ensure_capacity");
+      if (!ensure)
+        return op.emitError() << "runtime manifest has no list "
+                                 "ensure_capacity primitive";
+
+      builder.setInsertionPoint(op);
+      mlir::Location loc = op.getLoc();
+      mlir::FailureOr<RuntimeBundle> payload =
+          RuntimeBundleLowerer::materializePayloadObjectBundle(op,
+                                                               *sources[1]);
+      if (mlir::failed(payload))
+        return mlir::failure();
+      if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
+              op, *payload, "list.append")))
+        return mlir::failure();
+
+      mlir::Value meta = receiver.physicalValues()[1];
+      mlir::Value lengthSlot =
+          mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult();
+      mlir::Value length =
+          mlir::memref::LoadOp::create(builder, loc, meta, lengthSlot)
+              .getResult();
+      mlir::Value one =
+          mlir::arith::ConstantIntOp::create(builder, loc, 1, 64).getResult();
+      mlir::Value required =
+          mlir::arith::AddIOp::create(builder, loc, length, one).getResult();
+
+      llvm::SmallVector<mlir::Value, 6> operands(
+          receiver.physicalValues().begin(), receiver.physicalValues().end());
+      operands.push_back(required);
+      mlir::func::CallOp grow =
+          RuntimeBundleLowerer::createRuntimeCall(loc, *ensure, operands);
+
+      RuntimeBundle updatedRuntime;
+      if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+              op, receiver.objectValue.contract, grow.getResults(),
+              updatedRuntime)))
+        return mlir::failure();
+      if (mlir::failed(RuntimeBundleLowerer::storeSequencePayloadElementAt(
+              op, updatedRuntime, length, *payload)))
+        return mlir::failure();
+      mlir::Value grownMeta = updatedRuntime.physicalValues()[1];
+      mlir::memref::StoreOp::create(builder, loc, required, grownMeta,
+                                    lengthSlot);
+
+      valueBundles[op.getResult(1)] = updatedRuntime;
+      if (mlir::failed(assignObjectBundle(
+              op, op.getResult(0),
+              runtimeContractType(context, "types.NoneType"),
+              mlir::ValueRange{})))
+        return mlir::failure();
+      erase.push_back(op);
+      return mlir::success();
+    }
 
     RuntimeBundle updated = receiver;
     if (methodName == "append") {
@@ -264,6 +412,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
     if (mlir::failed(RuntimeBundleLowerer::writeBackFieldAlias(op, updated)))
       return mlir::failure();
     valueBundles[op.getCallable()] = updated;
+    if (structuralMutation)
+      valueBundles[op.getResult(1)] = updated;
     if (mlir::failed(assignObjectBundle(
             op, op.getResult(0), runtimeContractType(context, "types.NoneType"),
             mlir::ValueRange{})))

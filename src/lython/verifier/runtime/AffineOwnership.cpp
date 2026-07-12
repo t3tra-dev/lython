@@ -42,133 +42,19 @@ bool groupMatchesOperands(mlir::ValueRange operands, unsigned offset,
   return true;
 }
 
-std::string logicalReturnObjectContract(mlir::Type type) {
-  std::string contract = contracts::runtimeContractName(type);
-  if (!contract.empty())
-    return contract;
-  if (mlir::isa<py::ProtocolType>(type))
-    return "builtins.object";
-  return "";
-}
-
-bool isNoneLikeType(mlir::Type type) { return py::isPyNoneType(type); }
-
-std::optional<unsigned>
-logicalReturnValueCount(mlir::ValueRange values, unsigned offset,
-                        llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
-                        mlir::Type type) {
-  if (isNoneLikeType(type))
-    return 0;
-
-  if (auto unionType = mlir::dyn_cast<py::UnionType>(type)) {
-    if (offset >= values.size() || !values[offset].getType().isInteger(64))
-      return std::nullopt;
-    unsigned size = 1;
-    for (mlir::Type member : unionType.getMemberTypes()) {
-      std::optional<unsigned> memberSize =
-          logicalReturnValueCount(values, offset + size, deallocators, member);
-      if (!memberSize)
-        return std::nullopt;
-      size += *memberSize;
-    }
-    return size;
-  }
-
-  std::string contract = logicalReturnObjectContract(type);
-  if (contract.empty())
-    return std::nullopt;
-  const own::RuntimeDeallocator *deallocator =
-      own::findDeallocatorForValueGroup(values, offset, deallocators, contract);
-  if (!deallocator)
-    return std::nullopt;
-  return static_cast<unsigned>(deallocator->inputTypes.size());
-}
-
-unsigned skipPrimitiveReturnEvidence(mlir::ValueRange values, unsigned offset,
-                                     mlir::Type type) {
-  if (contracts::runtimeContractName(type) != "builtins.int")
-    return offset;
-  if (offset + 2 > values.size() || !values[offset].getType().isInteger(64) ||
-      !values[offset + 1].getType().isInteger(1))
-    return offset;
-  return offset + 2;
-}
-
-struct OwnedReturnRange {
-  unsigned offset = 0;
-  unsigned size = 0;
-  mlir::Type type;
-};
-
-std::optional<llvm::SmallVector<OwnedReturnRange, 4>> callableOwnedReturnRanges(
-    mlir::func::FuncOp function, mlir::ValueRange values,
-    llvm::ArrayRef<own::RuntimeDeallocator> deallocators) {
-  auto callableAttr =
-      function->getAttrOfType<mlir::TypeAttr>(own::kCallableTypeAttr);
-  auto callable = mlir::dyn_cast_if_present<py::CallableType>(
-      callableAttr ? callableAttr.getValue() : mlir::Type());
-  if (!callable)
-    return std::nullopt;
-
-  llvm::SmallVector<OwnedReturnRange, 4> ranges;
-  unsigned offset = 0;
-  for (mlir::Type resultType : callable.getResultTypes()) {
-    std::optional<unsigned> size =
-        logicalReturnValueCount(values, offset, deallocators, resultType);
-    if (!size)
-      return std::nullopt;
-    if (*size > 0)
-      ranges.push_back(OwnedReturnRange{offset, *size, resultType});
-    offset += *size;
-    offset = skipPrimitiveReturnEvidence(values, offset, resultType);
-  }
-  return ranges;
-}
-
-bool groupMatchesOwnedReturnRange(
-    mlir::ValueRange values, const OwnedReturnRange &range,
-    llvm::ArrayRef<mlir::Value> group,
-    llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
-    own::AliasAnalysis &aliases) {
-  if (group.empty())
-    return false;
-
-  auto matchesLogicalValue = [&](auto &&self, unsigned offset,
-                                 mlir::Type type) -> bool {
-    if (auto unionType = mlir::dyn_cast<py::UnionType>(type)) {
-      if (group.size() == range.size &&
-          groupMatchesOperands(values, range.offset, group, aliases))
-        return true;
-      if (offset >= values.size() || !values[offset].getType().isInteger(64))
-        return false;
-      unsigned memberOffset = offset + 1;
-      for (mlir::Type member : unionType.getMemberTypes()) {
-        std::optional<unsigned> memberSize =
-            logicalReturnValueCount(values, memberOffset, deallocators, member);
-        if (!memberSize)
-          return false;
-        if (*memberSize > 0 && self(self, memberOffset, member))
-          return true;
-        memberOffset += *memberSize;
-      }
-      return false;
-    }
-
-    std::optional<unsigned> size =
-        logicalReturnValueCount(values, offset, deallocators, type);
-    return size && group.size() == *size &&
-           groupMatchesOperands(values, offset, group, aliases);
-  };
-
-  return matchesLogicalValue(matchesLogicalValue, range.offset, range.type);
-}
 
 bool returnTransfersGroup(mlir::func::FuncOp function, mlir::func::ReturnOp ret,
                           llvm::ArrayRef<mlir::Value> group,
                           llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
                           own::AliasAnalysis &aliases) {
+  auto contract = own::readFunctionContract(function);
+  if (mlir::succeeded(contract)) {
+    for (unsigned offset : contract->ownedResults.values)
+      if (groupMatchesOperands(ret.getOperands(), offset, group, aliases))
+        return true;
+  }
+
   if (!own::functionUsesOwnedReturnABI(function)) {
-    auto contract = own::readFunctionContract(function);
     if (mlir::failed(contract))
       return false;
     bool anyOwned = false;
@@ -179,8 +65,8 @@ bool returnTransfersGroup(mlir::func::FuncOp function, mlir::func::ReturnOp ret,
     return anyOwned;
   }
 
-  std::optional<llvm::SmallVector<OwnedReturnRange, 4>> ranges =
-      callableOwnedReturnRanges(function, ret.getOperands(), deallocators);
+  std::optional<llvm::SmallVector<own::OwnedReturnRange, 4>> ranges =
+      own::callableOwnedReturnRanges(function, ret.getOperands(), deallocators);
   if (!ranges) {
     for (unsigned offset = 0; offset + group.size() <= ret.getNumOperands();
          ++offset) {
@@ -189,9 +75,9 @@ bool returnTransfersGroup(mlir::func::FuncOp function, mlir::func::ReturnOp ret,
     }
     return false;
   }
-  for (const OwnedReturnRange &range : *ranges)
-    if (groupMatchesOwnedReturnRange(ret.getOperands(), range, group,
-                                     deallocators, aliases))
+  for (const own::OwnedReturnRange &range : *ranges)
+    if (own::groupMatchesOwnedReturnRange(ret.getOperands(), range, group,
+                                          deallocators, aliases))
       return true;
   return false;
 }
@@ -201,15 +87,42 @@ bool returnCarriesGroupInsideOwnedAggregate(
     llvm::ArrayRef<mlir::Value> group,
     llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
     own::AliasAnalysis &aliases) {
-  if (!own::functionUsesOwnedReturnABI(function) || group.empty())
+  if (group.empty())
     return false;
 
-  std::optional<llvm::SmallVector<OwnedReturnRange, 4>> ranges =
-      callableOwnedReturnRanges(function, ret.getOperands(), deallocators);
+  auto contract = own::readFunctionContract(function);
+  if (mlir::succeeded(contract)) {
+    for (auto [contractIndex, offset] :
+         llvm::enumerate(contract->ownedResults.values)) {
+      llvm::StringRef contractName;
+      if (contractIndex < contract->ownedResultContracts.size())
+        contractName = contract->ownedResultContracts[contractIndex];
+      const own::RuntimeDeallocator *deallocator =
+          contractName.empty()
+              ? own::findDeallocatorForValueGroup(ret.getOperands(), offset,
+                                                  deallocators)
+              : own::findDeallocatorForValueGroup(ret.getOperands(), offset,
+                                                  deallocators, contractName);
+      if (!deallocator || group.size() >= deallocator->shapeTypes.size())
+        continue;
+      unsigned end = offset +
+                     static_cast<unsigned>(deallocator->shapeTypes.size()) -
+                     static_cast<unsigned>(group.size());
+      for (unsigned candidate = offset; candidate <= end; ++candidate)
+        if (groupMatchesOperands(ret.getOperands(), candidate, group, aliases))
+          return true;
+    }
+  }
+
+  if (!own::functionUsesOwnedReturnABI(function))
+    return false;
+
+  std::optional<llvm::SmallVector<own::OwnedReturnRange, 4>> ranges =
+      own::callableOwnedReturnRanges(function, ret.getOperands(), deallocators);
   if (!ranges)
     return false;
 
-  for (const OwnedReturnRange &range : *ranges) {
+  for (const own::OwnedReturnRange &range : *ranges) {
     if (group.size() >= range.size)
       continue;
     unsigned end =
@@ -227,6 +140,9 @@ struct TrackedResource {
   std::string producerLabel;
   unsigned resultOffset = 0;
   llvm::SmallVector<mlir::Value, 4> group;
+  // Interior views of the same entity (canonical-shape tail beyond the
+  // release interface): their uses are entity uses, never release operands.
+  llvm::SmallVector<mlir::Value, 4> views;
   std::optional<own::OwnershipCondition> condition;
 };
 
@@ -240,12 +156,33 @@ std::string describeOwnershipProducer(mlir::Operation *op) {
 
 enum class AffineTokenState { Owned, Released, Conditional };
 
+using ExceptionEdgeMap =
+    llvm::DenseMap<mlir::Block *, llvm::SmallVector<mlir::Block *, 2>>;
+
 struct AffinePathState {
   mlir::Block *block = nullptr;
   mlir::Operation *start = nullptr;
   AffineTokenState token = AffineTokenState::Owned;
   unsigned retained = 0;
   llvm::SmallVector<mlir::Value, 4> group;
+  // Values whose token was moved by a transferring call on this path: the
+  // stale names carry no token, so releasing them again is a double free.
+  // Entries naming a block argument are dropped when the path re-enters that
+  // block (a new iteration redefines the argument).
+  llvm::SmallVector<mlir::Value, 4> stale;
+  // The group's names from before CFG renames on this path (block-argument
+  // forwards; multiple generations — nested merges rename several times per
+  // iteration). Releases through pre-rename names pair with outstanding
+  // borrow-edge retains (`borrowed`). Entries naming a block argument drop
+  // when the path re-enters that block.
+  llvm::SmallVector<mlir::Value, 4> previous;
+  // Outstanding block-arg-merge-borrow retains (identity merge edges lend the
+  // merge argument a token; the paired release targets the pre-merge name).
+  unsigned borrowed = 0;
+  // Path entered through an exceptional (unwind) edge. Unwinding performs no
+  // cleanup yet (known accepted leak, P2 residual), so Owned-at-exit is NOT
+  // reported on these paths -- only use-after-release is.
+  bool exceptional = false;
 };
 
 struct BorrowedEntryResource {
@@ -260,6 +197,10 @@ struct BorrowedPathState {
   mlir::Operation *start = nullptr;
   unsigned retained = 0;
   llvm::SmallVector<mlir::Value, 4> group;
+  // Path entered through an exceptional (unwind) edge. Unwinding performs no
+  // cleanup yet (known accepted leak, P2 residual), so retain-balance-at-exit
+  // is NOT reported on these paths.
+  bool exceptional = false;
 };
 
 struct CachedFuncContract {
@@ -309,8 +250,14 @@ bool sameValueGroup(llvm::ArrayRef<mlir::Value> lhs,
 }
 
 bool samePathState(const AffinePathState &lhs, const AffinePathState &rhs) {
+  // `stale` and `previous` are deliberately NOT compared: they only refine
+  // detections, and including them lets path-dependent sets defeat the
+  // visited dedup (nested loops explode). Skipping a state that differs only
+  // there can only miss a detection, never accept unsound IR.
   return lhs.block == rhs.block && lhs.start == rhs.start &&
          lhs.token == rhs.token && lhs.retained == rhs.retained &&
+         lhs.borrowed == rhs.borrowed &&
+         lhs.exceptional == rhs.exceptional &&
          sameValueGroup(lhs.group, rhs.group);
 }
 
@@ -324,7 +271,9 @@ bool containsPathState(llvm::ArrayRef<AffinePathState> states,
 bool sameBorrowedPathState(const BorrowedPathState &lhs,
                            const BorrowedPathState &rhs) {
   return lhs.block == rhs.block && lhs.start == rhs.start &&
-         lhs.retained == rhs.retained && sameValueGroup(lhs.group, rhs.group);
+         lhs.retained == rhs.retained &&
+         lhs.exceptional == rhs.exceptional &&
+         sameValueGroup(lhs.group, rhs.group);
 }
 
 bool containsBorrowedPathState(llvm::ArrayRef<BorrowedPathState> states,
@@ -457,6 +406,14 @@ bool callRetainsGroup(FuncContractCache &contracts, mlir::func::CallOp call,
   return false;
 }
 
+// Identity merge edges lend the merge argument a token via a retain labeled
+// kBlockArgMergeBorrowLabel; the paired release targets the pre-merge name.
+bool isBlockArgMergeBorrowRetain(mlir::func::CallOp call) {
+  auto label =
+      call->getAttrOfType<mlir::StringAttr>(own::kAggregateRetainAttr);
+  return label && label.getValue() == own::kBlockArgMergeBorrowLabel;
+}
+
 bool callPartiallyConsumesGroup(FuncContractCache &contracts,
                                 mlir::func::CallOp call,
                                 llvm::ArrayRef<mlir::Value> group,
@@ -486,6 +443,87 @@ bool returnConsumesGroup(mlir::func::FuncOp function, mlir::func::ReturnOp ret,
                          llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
                          own::AliasAnalysis &aliases) {
   return returnTransfersGroup(function, ret, group, deallocators, aliases);
+}
+
+// A release/transfer operand naming a value whose token was already moved by
+// an earlier transferring call on this path is a double free: the stale name
+// no longer carries a token. Stale values that alias the CURRENT group are
+// skipped (the live token legitimately covers them).
+mlir::Value callConsumesStaleValue(FuncContractCache &contracts,
+                                   mlir::func::CallOp call,
+                                   llvm::ArrayRef<mlir::Value> stale,
+                                   llvm::ArrayRef<mlir::Value> group,
+                                   own::AliasAnalysis &aliases) {
+  if (stale.empty())
+    return {};
+  auto cached = contracts.lookup(call.getCallee());
+  if (mlir::failed(cached) || !*cached)
+    return {};
+  const own::FunctionContract &contract = (*cached)->contract;
+  auto checkOffsets = [&](llvm::ArrayRef<unsigned> offsets) -> mlir::Value {
+    for (unsigned offset : offsets) {
+      if (offset >= call.getNumOperands())
+        continue;
+      mlir::Value operand = call.getOperand(offset);
+      for (mlir::Value value : stale) {
+        if (!aliases.same(operand, value))
+          continue;
+        bool aliasesCurrent = llvm::any_of(group, [&](mlir::Value live) {
+          return aliases.same(value, live);
+        });
+        if (!aliasesCurrent)
+          return value;
+      }
+    }
+    return {};
+  };
+  if (mlir::Value hit = checkOffsets(contract.releaseArgs.values))
+    return hit;
+  return checkOffsets(contract.transferArgs.values);
+}
+
+llvm::SmallVector<mlir::Type, 8>
+callableLogicalInputTypes(mlir::func::FuncOp function);
+
+bool callCarriesGroupInsideUnionArgument(
+    FuncContractCache &contracts, mlir::func::CallOp call,
+    llvm::ArrayRef<mlir::Value> group,
+    llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
+    own::AliasAnalysis &aliases) {
+  if (group.empty())
+    return false;
+  auto cached = contracts.lookup(call.getCallee());
+  if (mlir::failed(cached) || !*cached)
+    return false;
+
+  llvm::SmallVector<mlir::Type, 8> logicalTypes =
+      callableLogicalInputTypes((*cached)->function);
+  unsigned offset = 0;
+  for (mlir::Type logicalType : logicalTypes) {
+    std::optional<unsigned> size =
+        logicalReturnValueCount(call.getOperands(), offset, deallocators,
+                                logicalType);
+    if (!size)
+      return false;
+    if (auto unionType = mlir::dyn_cast<py::UnionType>(logicalType)) {
+      unsigned memberOffset = offset + 1;
+      for (mlir::Type member : unionType.getMemberTypes()) {
+        std::optional<unsigned> memberSize = logicalReturnValueCount(
+            call.getOperands(), memberOffset, deallocators, member);
+        if (!memberSize)
+          return false;
+        if (*memberSize > 0 &&
+            groupMatchesOperands(call.getOperands(), memberOffset, group,
+                                 aliases))
+          return true;
+        memberOffset += *memberSize;
+      }
+    }
+    offset += *size;
+    offset = own::skipPrimitiveReturnEvidence(call.getOperands(), offset,
+                                              logicalType);
+  }
+  return false;
 }
 
 llvm::SmallVector<mlir::Value, 4>
@@ -571,7 +609,10 @@ verifyStraightLineResource(FuncContractCache &contracts,
 
   llvm::SmallVector<mlir::Operation *, 16> users;
   llvm::SmallPtrSet<mlir::Operation *, 16> seen;
-  for (mlir::Value value : resource.group) {
+  llvm::SmallVector<mlir::Value, 8> trackedValues(resource.group.begin(),
+                                                  resource.group.end());
+  trackedValues.append(resource.views.begin(), resource.views.end());
+  for (mlir::Value value : trackedValues) {
     llvm::SmallVector<mlir::Value, 8> equivalentValues;
     aliases.aliasesOf(value, equivalentValues);
     if (equivalentValues.empty())
@@ -602,7 +643,8 @@ verifyStraightLineResource(FuncContractCache &contracts,
     if (auto ret = mlir::dyn_cast<mlir::func::ReturnOp>(op)) {
       bool consumes = returnConsumesGroup(resource.function, ret, group,
                                           deallocators, aliases);
-      bool uses = groupContainsOperand(op, group, aliases);
+      bool uses = groupContainsOperand(op, group, aliases) ||
+                  groupContainsOperand(op, resource.views, aliases);
       if (token == AffineTokenState::Owned) {
         if (!consumes)
           return ret.emitError()
@@ -649,10 +691,13 @@ verifyStraightLineResource(FuncContractCache &contracts,
           --retained;
           continue;
         }
-        if (groupContainsOperand(op, group, aliases) && retained == 0)
+        if ((groupContainsOperand(op, group, aliases) ||
+             groupContainsOperand(op, resource.views, aliases)) &&
+            retained == 0)
           return call.emitError()
                  << "released owned resource from " << resource.producerLabel
-                 << " is used after release";
+                 << " is used after release (by call to '" << call.getCallee()
+                 << "')";
         if (retains)
           ++retained;
         continue;
@@ -674,10 +719,12 @@ verifyStraightLineResource(FuncContractCache &contracts,
     }
 
     if (token == AffineTokenState::Released &&
-        groupContainsOperand(op, group, aliases) && retained == 0)
+        (groupContainsOperand(op, group, aliases) ||
+         groupContainsOperand(op, resource.views, aliases)) &&
+        retained == 0)
       return op->emitError()
              << "released owned resource from " << resource.producerLabel
-             << " is used after release";
+             << " is used after release (by '" << op->getName() << "')";
   }
 
   if (token == AffineTokenState::Released)
@@ -764,9 +811,10 @@ llvm::SmallVector<BorrowedEntryResource, 8> collectBorrowedEntryResources(
       if (const own::RuntimeDeallocator *deallocator =
               own::findDeallocatorForValueGroup(entry.getArguments(), offset,
                                                 deallocators, contractName)) {
-        unsigned size = static_cast<unsigned>(deallocator->inputTypes.size());
-        group = own::valueSlice(entry.getArguments(), offset, size);
-        offset += size;
+        group = own::valueSlice(
+            entry.getArguments(), offset,
+            static_cast<unsigned>(deallocator->inputTypes.size()));
+        offset += static_cast<unsigned>(deallocator->shapeTypes.size());
       } else if (own::isObjectHeaderLikeType(
                      entry.getArgument(offset).getType())) {
         group.push_back(entry.getArgument(offset));
@@ -1012,6 +1060,15 @@ handleRegionTerminator(mlir::Operation *terminator, TrackedResource &resource,
       groupHasValueDefinedInsideRegion(state.group, currentRegion);
   bool enqueued = false;
   for (mlir::RegionSuccessor successor : successors) {
+    // A group defined outside this region keeps its identity across the
+    // region exit: the yield forwards a view of the token, and releases
+    // still target the outer values (mirrors the Released-state handling).
+    if (!localGroup) {
+      enqueueRegionSuccessor(owner, successor, state, worklist);
+      enqueued = true;
+      continue;
+    }
+
     llvm::SmallVector<bool, 4> mappedMask;
     llvm::SmallVector<mlir::Value, 4> mappedGroup =
         remapGroupThroughValueMapping(terminator->getOperands(),
@@ -1020,7 +1077,7 @@ handleRegionTerminator(mlir::Operation *terminator, TrackedResource &resource,
     bool fullyMapped =
         llvm::all_of(mappedMask, [](bool mapped) { return mapped; });
 
-    if (localGroup && !fullyMapped)
+    if (!fullyMapped)
       continue;
 
     AffinePathState next = state;
@@ -1069,6 +1126,16 @@ handleGenericRegionReturn(mlir::Operation *terminator,
       next.start = owner->getNextNode();
       worklist.push_back(std::move(next));
     }
+    return mlir::success();
+  }
+
+  // A non-local group keeps its identity across the region exit (the yield
+  // only forwards a view of the token); releases target the outer values.
+  if (!localGroup) {
+    AffinePathState next = state;
+    next.block = owner->getBlock();
+    next.start = owner->getNextNode();
+    worklist.push_back(std::move(next));
     return mlir::success();
   }
 
@@ -1190,7 +1257,7 @@ mlir::LogicalResult handleBorrowedGenericRegionReturn(
 mlir::LogicalResult verifyBorrowedEntryOnCFGPaths(
     FuncContractCache &contracts, BorrowedEntryResource &resource,
     llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
-    own::AliasAnalysis &aliases) {
+    own::AliasAnalysis &aliases, const ExceptionEdgeMap &exceptionEdges) {
   llvm::SmallVector<BorrowedPathState, 16> worklist;
   llvm::SmallVector<BorrowedPathState, 32> visited;
   mlir::Block &entry = resource.function.front();
@@ -1229,16 +1296,32 @@ mlir::LogicalResult verifyBorrowedEntryOnCFGPaths(
                       "transferred";
           break;
         }
-        if (state.retained != 0)
+        if (state.retained != 0) {
+          if (state.exceptional)
+            break; // unwinding performs no cleanup yet: leak accepted
           return ret.emitError()
                  << "borrowed entry argument " << resource.logicalIndex
                  << " of @" << resource.function.getSymName()
                  << " reaches function exit with " << state.retained
                  << " retained ownership token(s)";
+        }
         break;
       }
 
       if (auto call = mlir::dyn_cast<mlir::func::CallOp>(op)) {
+        if (call.getCallee() == "LyEH_TryCallSiteMarker") {
+          if (auto found = exceptionEdges.find(op->getBlock());
+              found != exceptionEdges.end())
+            for (mlir::Block *handler : found->second) {
+              BorrowedPathState next = state;
+              next.block = handler;
+              next.start = firstOperation(handler);
+              next.exceptional = true;
+              worklist.push_back(std::move(next));
+            }
+          op = op->getNextNode();
+          continue;
+        }
         if (callPartiallyConsumesGroup(contracts, call, state.group, aliases))
           return call.emitError()
                  << "ownership-consuming call only consumes part of borrowed "
@@ -1260,7 +1343,14 @@ mlir::LogicalResult verifyBorrowedEntryOnCFGPaths(
         }
 
         if (callRetainsGroup(contracts, call, state.group, aliases)) {
-          if (call->hasAttr(own::kAggregateRetainAttr)) {
+          // Slot-absorption retains (field stores etc.) park the token in the
+          // holder and are invisible to this walk — EXCEPT merge-borrow
+          // retains: an identity merge edge lends the merge argument a token
+          // that a loop-edge decref later returns through the pre-merge name
+          // (e.g. `local = borrowed_arg` then `local = local - 1` in a loop),
+          // so it must count toward the retained balance.
+          if (call->hasAttr(own::kAggregateRetainAttr) &&
+              !isBlockArgMergeBorrowRetain(call)) {
             op = op->getNextNode();
             continue;
           }
@@ -1330,8 +1420,26 @@ mlir::LogicalResult verifyBorrowedEntryOnCFGPaths(
       BorrowedPathState next = state;
       next.block = successor;
       next.start = firstOperation(successor);
-      next.group =
-          remapGroupForSuccessor(op, index, successor, state.group, aliases);
+      llvm::SmallVector<bool, 4> mappedMask;
+      next.group = remapGroupForSuccessor(op, index, successor, state.group,
+                                          aliases, &mappedMask);
+      // A group name that is a block argument of the successor but was NOT
+      // forwarded on this edge is REDEFINED by the edge (a loop back edge
+      // rebinding the merge argument to a fresh value): the borrowed token's
+      // names die here, so tracking ends on this path. Without this, the
+      // stale name matches the next iteration's merge-lane release and
+      // reports a false double-consume.
+      bool groupRedefined = false;
+      for (auto [groupIndex, value] : llvm::enumerate(next.group)) {
+        auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(value);
+        if (blockArg && blockArg.getOwner() == successor &&
+            !mappedMask[groupIndex]) {
+          groupRedefined = true;
+          break;
+        }
+      }
+      if (groupRedefined)
+        continue;
       worklist.push_back(std::move(next));
     }
   }
@@ -1343,7 +1451,8 @@ mlir::LogicalResult
 verifyResourceOnCFGPaths(FuncContractCache &contracts,
                          TrackedResource &resource,
                          llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
-                         own::AliasAnalysis &aliases) {
+                         own::AliasAnalysis &aliases,
+                         const ExceptionEdgeMap &exceptionEdges) {
   llvm::SmallVector<AffinePathState, 16> worklist;
   llvm::SmallVector<AffinePathState, 32> visited;
   AffineTokenState initialToken = resource.condition
@@ -1362,17 +1471,23 @@ verifyResourceOnCFGPaths(FuncContractCache &contracts,
     if (visited.size() > kMaxAffineStates)
       return resource.producer->emitError()
              << "ownership CFG exploration exceeded " << kMaxAffineStates
-             << " states";
+             << " states (last: retained=" << state.retained
+             << " borrowed=" << state.borrowed << " prev=" << state.previous.size()
+             << " stale=" << state.stale.size() << " group=" << state.group.size()
+             << " token=" << static_cast<int>(state.token) << ")";
 
     if (pathReenteredBeforeTrackedDefinition(state)) {
       if (state.token == AffineTokenState::Released)
         continue;
-      if (state.token == AffineTokenState::Owned)
+      if (state.token == AffineTokenState::Owned) {
+        if (state.exceptional)
+          continue;
         return state.start->emitError()
                << "owned resource from " << resource.producerLabel << " result "
                << resource.resultOffset
                << " reaches the next loop iteration without release, "
                   "transfer, or owned return";
+      }
       return state.start->emitError()
              << "conditionally owned resource from " << resource.producerLabel
              << " result " << resource.resultOffset
@@ -1387,6 +1502,8 @@ verifyResourceOnCFGPaths(FuncContractCache &contracts,
                                             deallocators, aliases);
         bool uses = groupContainsOperand(op, state.group, aliases);
         if (state.token == AffineTokenState::Owned) {
+          if (state.exceptional)
+            break; // unwinding performs no cleanup yet: leak accepted
           if (!consumes)
             return ret.emitError()
                    << "owned resource from " << resource.producerLabel
@@ -1446,10 +1563,24 @@ verifyResourceOnCFGPaths(FuncContractCache &contracts,
                                          state.group, aliases);
               worklist.push_back(AffinePathState{
                   successor, firstOperation(successor), nextToken,
-                  state.retained, std::move(mappedGroup)});
+                  state.retained, std::move(mappedGroup),
+                  /*stale=*/{}, /*previous=*/{}, /*borrowed=*/0,
+                  state.exceptional});
             }
             op = nullptr;
             break;
+          }
+        }
+        if (auto call = mlir::dyn_cast<mlir::func::CallOp>(op)) {
+          if (callConsumesGroup(contracts, call, state.group, aliases)) {
+            state.token = AffineTokenState::Released;
+            op = op->getNextNode();
+            continue;
+          }
+          if (callCarriesGroupInsideUnionArgument(
+                  contracts, call, state.group, deallocators, aliases)) {
+            op = op->getNextNode();
+            continue;
           }
         }
         if (!op->hasTrait<mlir::OpTrait::IsTerminator>() &&
@@ -1462,8 +1593,40 @@ verifyResourceOnCFGPaths(FuncContractCache &contracts,
       }
 
       if (auto call = mlir::dyn_cast<mlir::func::CallOp>(op)) {
+        if (call.getCallee() == "LyEH_TryCallSiteMarker") {
+          // Exceptional edge: the marked call site may unwind to its
+          // handler entry with the token state AS OF THIS POINT.
+          if (auto found = exceptionEdges.find(op->getBlock());
+              found != exceptionEdges.end())
+            for (mlir::Block *handler : found->second) {
+              AffinePathState next = state;
+              next.block = handler;
+              next.start = firstOperation(handler);
+              next.exceptional = true;
+              worklist.push_back(std::move(next));
+            }
+          op = op->getNextNode();
+          continue;
+        }
+        if (callConsumesStaleValue(contracts, call, state.stale, state.group,
+                                   aliases))
+          return call.emitError()
+                 << "owned resource from " << resource.producerLabel
+                 << " result " << resource.resultOffset
+                 << " is released through a value already consumed by an "
+                    "ownership transfer";
         bool consumes =
             callConsumesGroup(contracts, call, state.group, aliases);
+        // A release through PRE-RENAME names of the current group cancels an
+        // outstanding borrow-edge retain (identity merge edge): the token
+        // continues under the current names.
+        if (!consumes && state.borrowed > 0 &&
+            callConsumesStaleValue(contracts, call, state.previous,
+                                   state.group, aliases)) {
+          --state.borrowed;
+          op = op->getNextNode();
+          continue;
+        }
         bool retains = callRetainsGroup(contracts, call, state.group, aliases);
         if (callPartiallyConsumesGroup(contracts, call, state.group, aliases))
           return call.emitError()
@@ -1474,6 +1637,10 @@ verifyResourceOnCFGPaths(FuncContractCache &contracts,
 
         if (state.token == AffineTokenState::Released) {
           if (consumes) {
+            if (state.retained == 0 && resource.condition) {
+              op = op->getNextNode();
+              continue;
+            }
             if (state.retained == 0)
               return call.emitError()
                      << "owned resource from " << resource.producerLabel
@@ -1484,24 +1651,31 @@ verifyResourceOnCFGPaths(FuncContractCache &contracts,
             op = op->getNextNode();
             continue;
           }
-          if (groupContainsOperand(op, state.group, aliases) &&
+          if ((groupContainsOperand(op, state.group, aliases) ||
+               groupContainsOperand(op, resource.views, aliases)) &&
               state.retained == 0)
             return call.emitError()
                    << "released owned resource from " << resource.producerLabel
-                   << " is used after release";
+                   << " is used after release (by call to '"
+                   << call.getCallee() << "')";
           if (retains)
             ++state.retained;
         } else if (state.token == AffineTokenState::Owned && consumes) {
           if (std::optional<llvm::SmallVector<mlir::Value, 4>> replacement =
                   callTransfersGroupToOwnedResult(contracts, call, state.group,
                                                   aliases)) {
+            state.stale.append(state.group.begin(), state.group.end());
             state.group = std::move(*replacement);
           } else {
             state.token = AffineTokenState::Released;
           }
         }
-        if (state.token == AffineTokenState::Owned && retains)
-          ++state.retained;
+        if (state.token == AffineTokenState::Owned && retains) {
+          if (isBlockArgMergeBorrowRetain(call))
+            ++state.borrowed;
+          else
+            ++state.retained;
+        }
       } else if (state.token == AffineTokenState::Released &&
                  groupContainsOperand(op, state.group, aliases) &&
                  state.retained == 0) {
@@ -1554,7 +1728,7 @@ verifyResourceOnCFGPaths(FuncContractCache &contracts,
 
     unsigned successors = op->getNumSuccessors();
     if (successors == 0) {
-      if (state.token == AffineTokenState::Owned)
+      if (state.token == AffineTokenState::Owned && !state.exceptional)
         return op->emitError()
                << "owned resource from " << resource.producerLabel << " result "
                << resource.resultOffset
@@ -1579,9 +1753,34 @@ verifyResourceOnCFGPaths(FuncContractCache &contracts,
       if (!fullyMapped && state.token == AffineTokenState::Released &&
           groupContainsArgumentFromBlock(state.group, successor))
         continue;
+      // Entering the successor redefines its block arguments: stale/previous
+      // entries naming them refer to the PREVIOUS iteration's token and drop.
+      llvm::SmallVector<mlir::Value, 4> mappedStale;
+      for (mlir::Value value : state.stale) {
+        auto argument = mlir::dyn_cast_if_present<mlir::BlockArgument>(value);
+        if (!argument || argument.getOwner() != successor)
+          mappedStale.push_back(value);
+      }
+      bool renamed = llvm::any_of(mappedMask, [](bool m) { return m; });
+      llvm::SmallVector<mlir::Value, 4> mappedPrevious;
+      auto keepPreviousName = [&](mlir::Value value) {
+        auto argument = mlir::dyn_cast_if_present<mlir::BlockArgument>(value);
+        if (argument && argument.getOwner() == successor)
+          return; // re-entering the block redefines this name
+        if (!llvm::is_contained(mappedPrevious, value))
+          mappedPrevious.push_back(value);
+      };
+      for (mlir::Value value : state.previous)
+        keepPreviousName(value);
+      if (renamed)
+        for (mlir::Value value : state.group)
+          keepPreviousName(value);
       worklist.push_back(AffinePathState{successor, firstOperation(successor),
                                          state.token, state.retained,
-                                         std::move(mappedGroup)});
+                                         std::move(mappedGroup),
+                                         std::move(mappedStale),
+                                         std::move(mappedPrevious),
+                                         state.borrowed, state.exceptional});
     }
   }
 
@@ -1592,13 +1791,15 @@ void appendTrackedResource(
     llvm::SmallVectorImpl<TrackedResource> &resources,
     mlir::func::FuncOp function, mlir::Operation *producer, unsigned offset,
     llvm::SmallVector<mlir::Value, 4> group,
-    std::optional<own::OwnershipCondition> condition = std::nullopt) {
+    std::optional<own::OwnershipCondition> condition = std::nullopt,
+    llvm::SmallVector<mlir::Value, 4> views = {}) {
   TrackedResource resource;
   resource.function = function;
   resource.producer = producer;
   resource.producerLabel = describeOwnershipProducer(producer);
   resource.resultOffset = offset;
   resource.group = std::move(group);
+  resource.views = std::move(views);
   resource.condition = condition;
   resources.push_back(std::move(resource));
 }
@@ -1614,7 +1815,8 @@ collectTrackedResources(mlir::ModuleOp module, mlir::func::FuncOp function,
     for (own::ResourceGroup group :
          own::collectOwnedLocalObjectGroups(op, deallocators)) {
       appendTrackedResource(resources, function, op, group.offset,
-                            std::move(group.values), group.condition);
+                            std::move(group.values), group.condition,
+                            std::move(group.views));
       return;
     }
     if (!op->hasAttr(own::kOwnedLocalObjectContractAttr) &&
@@ -1632,7 +1834,7 @@ collectTrackedResources(mlir::ModuleOp module, mlir::func::FuncOp function,
          own::collectOwnedCallResultGroups(module, call, deallocators)) {
       appendTrackedResource(resources, function, call.getOperation(),
                             group.offset, std::move(group.values),
-                            group.condition);
+                            group.condition, std::move(group.views));
     }
   });
 
@@ -1665,14 +1867,19 @@ mlir::LogicalResult verifyFunctionAffineOwnership(
       return mlir::success();
   }
 
+  ExceptionEdgeMap exceptionEdges =
+      function.isDeclaration()
+          ? ExceptionEdgeMap()
+          : own::collectExceptionEdges(function.getBody());
+
   for (TrackedResource &resource : resources)
     if (mlir::failed(verifyResourceOnCFGPaths(contracts, resource, deallocators,
-                                              aliases)))
+                                              aliases, exceptionEdges)))
       return mlir::failure();
 
   for (BorrowedEntryResource &resource : borrowedEntryResources)
-    if (mlir::failed(verifyBorrowedEntryOnCFGPaths(contracts, resource,
-                                                   deallocators, aliases)))
+    if (mlir::failed(verifyBorrowedEntryOnCFGPaths(
+            contracts, resource, deallocators, aliases, exceptionEdges)))
       return mlir::failure();
 
   return mlir::success();

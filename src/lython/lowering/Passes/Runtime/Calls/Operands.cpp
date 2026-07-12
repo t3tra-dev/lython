@@ -216,9 +216,16 @@ mlir::LogicalResult RuntimeBundleLowerer::appendRuntimeSource(
     }
   }
 
-  return op->emitError() << "cannot adapt " << source.contractName()
-                         << " to runtime input " << inputIndex << " of "
-                         << symbol.contract << "." << symbol.name;
+  {
+    auto diag = op->emitError()
+                << "cannot adapt " << source.contractName()
+                << " to runtime input " << inputIndex << " of "
+                << symbol.contract << "." << symbol.name << " [values:";
+    for (mlir::Value value : sourceValues)
+      diag << " " << value.getType();
+    diag << ", expected " << expected << "]";
+    return diag;
+  }
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::appendRuntimeSourceAs(

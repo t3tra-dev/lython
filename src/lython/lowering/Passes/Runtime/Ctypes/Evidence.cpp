@@ -314,6 +314,16 @@ std::optional<mlir::Value> extractNativeIntegerArgument(
       source.primitiveI64->valid && isKnownTrue(source.primitiveI64->valid)) {
     return source.primitiveI64->value;
   }
+  // A callback thunk address (CFuncPtr from CFUNCTYPE(...)(f)) passes as any
+  // pointer-typed foreign argument.
+  if (isPointerScalarLayout(layout) && source.ctypes &&
+      source.ctypes->provenance ==
+          RuntimeCtypesEvidence::Provenance::CallbackThunk &&
+      source.ctypes->scalarValue && source.ctypes->scalarValid &&
+      isKnownTrue(source.ctypes->scalarValid)) {
+    return coerceNativeInteger(builder, op->getLoc(),
+                               source.ctypes->scalarValue, nativeType);
+  }
   if (isPointerScalarLayout(layout) && source.primitiveI64 &&
       source.primitiveI64->value && source.primitiveI64->valid &&
       isKnownTrue(source.primitiveI64->valid)) {

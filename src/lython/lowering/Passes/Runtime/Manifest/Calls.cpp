@@ -106,10 +106,50 @@ mlir::LogicalResult RuntimeBundleLowerer::bindRuntimeCallResult(
                            << " needs a concrete manifest result contract";
 
   RuntimeBundle result;
-  if (mlir::failed(
-          bundleRuntimeResults(op, runtimeContractType(context, resultContract),
-                               emitted.call, result)))
+  mlir::Type resultType = runtimeContractType(context, resultContract);
+  if (mlir::failed(RuntimeBundleLowerer::bindRuntimeCallBundle(
+          op, resultType, emitted, receiverEvidence, result)))
     return mlir::failure();
+  valueBundles[resultValue] = std::move(result);
+  return mlir::success();
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::bindRuntimeCallBundle(
+    mlir::Operation *op, mlir::Type resultType,
+    const EmittedRuntimeCall &emitted, const RuntimeBundle *receiverEvidence,
+    RuntimeBundle &result) {
+  std::string resultContract = runtimeContractName(resultType);
+  if (resultContract.empty())
+    return op->emitError() << "runtime method result for "
+                           << emitted.symbol.contract << "."
+                           << emitted.symbol.name
+                           << " needs a concrete manifest result contract";
+
+  std::optional<unsigned> resultEvidenceStart;
+  mlir::func::CallOp call = emitted.call;
+  if (emitted.symbol.resultEvidenceSlots.empty()) {
+    if (mlir::failed(bundleRuntimeResults(op, resultType, call, result)))
+      return mlir::failure();
+  } else {
+    mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> resultTypes =
+        RuntimeBundleLowerer::runtimeValueTypesFor(
+            op, resultType, "runtime method result ABI");
+    if (mlir::failed(resultTypes))
+      return mlir::failure();
+    if (call.getNumResults() < resultTypes->size())
+      return op->emitError()
+             << "runtime method result for " << emitted.symbol.contract << "."
+             << emitted.symbol.name
+             << " returned too few values for primary result ABI";
+    unsigned resultIndex = 0;
+    llvm::SmallVector<mlir::Value, 4> resultValues;
+    for (unsigned end = static_cast<unsigned>(resultTypes->size());
+         resultIndex < end; ++resultIndex)
+      resultValues.push_back(call.getResult(resultIndex));
+    if (mlir::failed(bundleRuntimeResults(op, resultType, resultValues, result)))
+      return mlir::failure();
+    resultEvidenceStart = resultIndex;
+  }
   if (emitted.symbol.resultEvidence == "receiver") {
     if (!receiverEvidence)
       return op->emitError()
@@ -124,7 +164,39 @@ mlir::LogicalResult RuntimeBundleLowerer::bindRuntimeCallResult(
   }
   if (emitted.symbol.name == "__await__" && receiverEvidence)
     result.copyEvidenceFrom(*receiverEvidence);
-  valueBundles[resultValue] = std::move(result);
+  if (resultEvidenceStart) {
+    unsigned resultIndex = *resultEvidenceStart;
+    for (const RuntimeResultEvidenceSlot &slot :
+         emitted.symbol.resultEvidenceSlots) {
+      mlir::Type slotType = runtimeContractType(context, slot.contract);
+      mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> slotTypes =
+          RuntimeBundleLowerer::runtimeValueTypesFor(
+              op, slotType, "runtime method result evidence slot ABI");
+      if (mlir::failed(slotTypes))
+        return mlir::failure();
+      if (resultIndex + slotTypes->size() > call.getNumResults())
+        return op->emitError()
+               << "runtime method result for " << emitted.symbol.contract
+               << "." << emitted.symbol.name
+               << " returned too few values for result evidence slot '"
+               << slot.name << "'";
+      llvm::SmallVector<mlir::Value, 4> slotValues;
+      for (unsigned end =
+               resultIndex + static_cast<unsigned>(slotTypes->size());
+           resultIndex < end; ++resultIndex)
+        slotValues.push_back(call.getResult(resultIndex));
+      RuntimeBundle slotBundle;
+      if (mlir::failed(makeObjectBundle(op, slotType, slotValues, slotBundle)))
+        return mlir::failure();
+      result.objectEvidence.setSlot(slot.name, slotBundle.objectValue);
+    }
+    if (resultIndex != call.getNumResults())
+      return op->emitError()
+             << "runtime method result for " << emitted.symbol.contract << "."
+             << emitted.symbol.name << " returned " << call.getNumResults()
+             << " physical values, but result evidence binding consumed "
+             << resultIndex;
+  }
   return mlir::success();
 }
 
@@ -425,11 +497,14 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
                << "class initializer argument " << index << " has type "
                << fieldValue->objectValue.contract << ", but field expects "
                << fieldTypes[index];
-      bool objectField =
-          runtimeShapeContractName(fieldTypes[index]) == "builtins.object";
+      bool boxedField =
+          RuntimeBundleLowerer::classFieldStoredBoxed(fieldTypes[index]);
+      mlir::Type slotStorageType =
+          boxedField ? runtimeContractType(context, "builtins.object")
+                     : fieldTypes[index];
       RuntimeBundle slotValue;
       bool newBoxOwnsSlot = false;
-      if (objectField &&
+      if (boxedField &&
           !(fieldValue->contractName() == "builtins.object" &&
             fieldValue->physicalValues().size() == 1)) {
         mlir::FailureOr<RuntimeBundle> boxed =
@@ -450,7 +525,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
       }
 
       bool retainExistingObjectHandle = false;
-      if (objectField) {
+      if (boxedField) {
         if (slotValue.contractName() == "builtins.object" &&
             slotValue.physicalValues().size() == 1) {
           retainExistingObjectHandle = !newBoxOwnsSlot;
@@ -464,8 +539,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
         }
       }
       mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> fieldValueTypes =
-          RuntimeBundleLowerer::runtimeValueTypesFor(op, fieldTypes[index],
-                                                     "class field ABI");
+          RuntimeBundleLowerer::classFieldStorageValueTypes(
+              op, fieldTypes[index], "class field ABI");
       if (mlir::failed(fieldValueTypes))
         return mlir::failure();
       mlir::FailureOr<unsigned> offset =
@@ -499,14 +574,14 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
         if (oldField != instance->fieldBundles.end())
           oldSlotValue = oldField->second.get();
       }
-      if (objectField) {
+      if (boxedField) {
         if (retainExistingObjectHandle &&
             mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
-                op, fieldTypes[index], slotValue.physicalValues(), slotName)))
+                op, slotStorageType, slotValue.physicalValues(), slotName)))
           return mlir::failure();
         if (oldSlotValue &&
             mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
-                op, fieldTypes[index], oldValues, slotName)))
+                op, slotStorageType, oldValues, slotName)))
           return mlir::failure();
       } else {
         if (mlir::failed(RuntimeBundleLowerer::replaceAggregateSlot(

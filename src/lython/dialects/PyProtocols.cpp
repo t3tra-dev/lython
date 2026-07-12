@@ -9,6 +9,7 @@
 #include "mlir/Interfaces/InferTypeOpInterface.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Parser/Parser.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
@@ -19,6 +20,8 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <set>
+#include <tuple>
 #include <utility>
 
 #define GET_OP_CLASSES
@@ -74,6 +77,49 @@ std::vector<mlir::Type> typeArray(mlir::Operation *op, llvm::StringRef name) {
       if (auto typeAttr = mlir::dyn_cast<mlir::TypeAttr>(element))
         values.push_back(typeAttr.getValue());
   return values;
+}
+
+std::optional<std::pair<std::string, std::string>>
+splitQualifiedExport(llvm::StringRef qualifiedName) {
+  auto split = qualifiedName.rsplit('.');
+  if (split.first.empty() || split.second.empty())
+    return std::nullopt;
+  return {{split.first.str(), split.second.str()}};
+}
+
+std::optional<std::tuple<std::string, std::string, std::string>>
+parseClassExportSpec(llvm::StringRef spec) {
+  auto assignment = spec.split('=');
+  if (assignment.first.empty() || assignment.second.empty())
+    return std::nullopt;
+  std::optional<std::pair<std::string, std::string>> qualified =
+      splitQualifiedExport(assignment.first);
+  if (!qualified)
+    return std::nullopt;
+  return {{qualified->first, qualified->second, assignment.second.str()}};
+}
+
+std::optional<std::string> stringAttr(mlir::Operation *op,
+                                      llvm::StringRef name) {
+  if (auto attr = op->getAttrOfType<mlir::StringAttr>(name))
+    return attr.getValue().str();
+  return std::nullopt;
+}
+
+std::string manifestClassContractName(py::ClassOp classOp,
+                                      llvm::StringRef moduleName) {
+  if (std::optional<std::string> contract =
+          stringAttr(classOp, "ly.typing.contract"))
+    return *contract;
+  if (std::optional<std::string> contract =
+          stringAttr(classOp, "ly.runtime.contract"))
+    return *contract;
+  if (std::optional<std::string> contract =
+          stringAttr(classOp, "ly.typeshed.contract"))
+    return *contract;
+  if (!moduleName.empty())
+    return (llvm::Twine(moduleName) + "." + classOp.getSymName()).str();
+  return classOp.getSymName().str();
 }
 
 std::vector<mlir::Type> trailingTypeDefaults(mlir::Operation *op,
@@ -690,10 +736,126 @@ const Table &Table::get(mlir::MLIRContext &context) {
       continue;
     }
 
+    llvm::StringRef moduleName;
+    if (auto moduleAttr = manifest->getOperation()
+                              ->getAttrOfType<mlir::StringAttr>(
+                                  "ly.typing.module"))
+      moduleName = moduleAttr.getValue();
+
+    bool hasExplicitClassExports = false;
+    if (auto exports = manifest->getOperation()
+                           ->getAttrOfType<mlir::ArrayAttr>(
+                               "ly.typing.class_exports")) {
+      hasExplicitClassExports = true;
+      for (mlir::Attribute element : exports) {
+        auto spec = mlir::dyn_cast<mlir::StringAttr>(element);
+        if (!spec)
+          continue;
+        std::optional<std::tuple<std::string, std::string, std::string>>
+            parsed = parseClassExportSpec(spec.getValue());
+        if (!parsed) {
+          llvm::errs() << "warning: ignored malformed class export '"
+                       << spec.getValue() << "' in typing manifest '"
+                       << entry.name << "'\n";
+          continue;
+        }
+        auto &[module, exportedName, contract] = *parsed;
+        slot->classExportsByModule[module][exportedName] = contract;
+      }
+    }
+
+    if (auto exports = manifest->getOperation()
+                           ->getAttrOfType<mlir::ArrayAttr>(
+                               "ly.typing.callable_exports")) {
+      for (mlir::Attribute element : exports) {
+        auto spec = mlir::dyn_cast<mlir::StringAttr>(element);
+        if (!spec)
+          continue;
+        std::optional<std::pair<std::string, std::string>> parsed =
+            splitQualifiedExport(spec.getValue());
+        if (!parsed) {
+          llvm::errs() << "warning: ignored malformed callable export '"
+                       << spec.getValue() << "' in typing manifest '"
+                       << entry.name << "'\n";
+          continue;
+        }
+        slot->callableExportsByModule[parsed->first].push_back(parsed->second);
+      }
+    }
+
+    // Manifest-declared Callable contracts for free (module-level / builtin)
+    // functions: parallel `ly.typing.function_names` (fully-qualified string
+    // names) and `ly.typing.function_contracts` (Callable contract types). This
+    // is the manifest source for function signatures that would otherwise be
+    // synthesized by a C++ contract table.
+    if (auto functionNames =
+            manifest->getOperation()->getAttrOfType<mlir::ArrayAttr>(
+                "ly.typing.function_names")) {
+      auto functionContracts =
+          manifest->getOperation()->getAttrOfType<mlir::ArrayAttr>(
+              "ly.typing.function_contracts");
+      if (!functionContracts ||
+          functionContracts.size() != functionNames.size()) {
+        llvm::errs() << "warning: ly.typing.function_names and "
+                        "ly.typing.function_contracts must be parallel arrays "
+                        "in typing manifest '"
+                     << entry.name << "'\n";
+      } else {
+        for (auto [nameAttr, contractAttr] :
+             llvm::zip(functionNames, functionContracts)) {
+          auto name = mlir::dyn_cast<mlir::StringAttr>(nameAttr);
+          auto contract = mlir::dyn_cast<mlir::TypeAttr>(contractAttr);
+          if (!name || !contract) {
+            llvm::errs() << "warning: ignored malformed free-function contract "
+                            "in typing manifest '"
+                         << entry.name << "'\n";
+            continue;
+          }
+          slot->freeFunctionContracts[name.getValue().str()] =
+              contract.getValue();
+        }
+      }
+    }
+
+    // Manifest float constants: parallel `ly.typing.float_constant_names`
+    // (fully-qualified) and `ly.typing.float_constant_values` arrays.
+    if (auto constantNames =
+            manifest->getOperation()->getAttrOfType<mlir::ArrayAttr>(
+                "ly.typing.float_constant_names")) {
+      auto constantValues =
+          manifest->getOperation()->getAttrOfType<mlir::ArrayAttr>(
+              "ly.typing.float_constant_values");
+      if (!constantValues || constantValues.size() != constantNames.size()) {
+        llvm::errs() << "warning: ly.typing.float_constant_names and "
+                        "ly.typing.float_constant_values must be parallel "
+                        "arrays in typing manifest '"
+                     << entry.name << "'\n";
+      } else {
+        for (auto [nameAttr, valueAttr] :
+             llvm::zip(constantNames, constantValues)) {
+          auto name = mlir::dyn_cast<mlir::StringAttr>(nameAttr);
+          auto value = mlir::dyn_cast<mlir::FloatAttr>(valueAttr);
+          if (!name || !value) {
+            llvm::errs() << "warning: ignored malformed float constant in "
+                            "typing manifest '"
+                         << entry.name << "'\n";
+            continue;
+          }
+          std::string qualified = name.getValue().str();
+          slot->floatConstants[qualified] = value.getValueAsDouble();
+          auto split = name.getValue().rsplit('.');
+          slot->floatConstantsByModule[split.first.str()].push_back(
+              split.second.str());
+        }
+      }
+    }
+
     for (mlir::Operation &op : manifest->getBody()->getOperations()) {
       auto classOp = mlir::dyn_cast<py::ClassOp>(&op);
       if (!classOp)
         continue;
+      std::string symName = classOp.getSymName().str();
+      std::string contractName = manifestClassContractName(classOp, moduleName);
       ProtocolInfo classInfo;
       classInfo.params = stringArray(classOp, "ly.typing.params");
       classInfo.paramVariance =
@@ -706,6 +868,29 @@ const Table &Table::get(mlir::MLIRContext &context) {
           typeArray(classOp, "ly.typing.short_arg_defaults")};
       if (!shortForm.positions.empty())
         classInfo.shortForms.push_back(std::move(shortForm));
+      for (const std::string &mutator :
+           stringArray(classOp, "ly.typing.structural_mutators"))
+        classInfo.structuralMutators.insert(mutator);
+      classInfo.matchArgs = stringArray(classOp, "ly.typing.match_args");
+      if (auto fieldsSpec = classOp->getAttrOfType<mlir::StringAttr>(
+              "ly.typing.fields_spec")) {
+        auto [attrName, viaBase] = fieldsSpec.getValue().split(':');
+        classInfo.fieldsSpecAttrName = attrName.str();
+        classInfo.fieldsSpecViaBase = viaBase.str();
+      }
+      for (const std::string &spec :
+           stringArray(classOp, "ly.typing.field_param_bindings")) {
+        llvm::StringRef rest(spec);
+        auto [field, tail] = rest.split(':');
+        auto [param, viaBase] = tail.split(':');
+        if (field.empty() || param.empty() || viaBase.empty()) {
+          llvm::errs() << "warning: ignored malformed field param binding '"
+                       << spec << "' in class '" << symName << "'\n";
+          continue;
+        }
+        classInfo.fieldParamBindings.push_back(
+            FieldParamBinding{field.str(), param.str(), viaBase.str()});
+      }
       classInfo.isProtocol = hasMarker(classOp, "ly.typing.protocol");
       classInfo.isAbstract = hasMarker(classOp, "ly.typing.abstract");
       classInfo.isFinal = hasMarker(classOp, "ly.typing.final");
@@ -774,9 +959,43 @@ const Table &Table::get(mlir::MLIRContext &context) {
           }
         }
       }
-      slot->classes.emplace(classOp.getSymName().str(), std::move(classInfo));
+      std::set<std::string> aliases;
+      aliases.insert(symName);
+      aliases.insert(contractName);
+      if (std::optional<std::string> contract =
+              stringAttr(classOp, "ly.typing.contract"))
+        aliases.insert(*contract);
+      if (std::optional<std::string> contract =
+              stringAttr(classOp, "ly.runtime.contract"))
+        aliases.insert(*contract);
+      if (std::optional<std::string> contract =
+              stringAttr(classOp, "ly.typeshed.contract"))
+        aliases.insert(*contract);
+      if (!moduleName.empty())
+        aliases.insert((llvm::Twine(moduleName) + "." + symName).str());
+
+      for (const std::string &alias : aliases)
+        slot->classes[alias] = classInfo;
+
+      if (!moduleName.empty() && !hasExplicitClassExports)
+        slot->classExportsByModule[moduleName.str()][symName] = contractName;
     }
   }
+
+  for (const auto &[moduleName, exports] : slot->classExportsByModule) {
+    (void)moduleName;
+    for (const auto &[exportedName, contract] : exports) {
+      (void)exportedName;
+      if (slot->classes.find(contract) != slot->classes.end())
+        continue;
+      llvm::StringRef contractRef(contract);
+      llvm::StringRef shortName = contractRef.rsplit('.').second;
+      auto found = slot->classes.find(shortName.str());
+      if (found != slot->classes.end())
+        slot->classes[contract] = found->second;
+    }
+  }
+
   const ProtocolInfo *root = slot->lookup("Protocol");
   if (!root || !root->isProtocol) {
     llvm::errs() << "warning: typing manifest does not declare a Protocol "
@@ -800,6 +1019,90 @@ Table &Table::getMutable(mlir::MLIRContext &context) {
 
 void Table::registerClass(llvm::StringRef name, ProtocolInfo info) {
   classes[name.str()] = std::move(info);
+}
+
+std::optional<std::string>
+Table::moduleClassExport(llvm::StringRef moduleName,
+                         llvm::StringRef exportedName) const {
+  auto module = classExportsByModule.find(moduleName.str());
+  if (module == classExportsByModule.end())
+    return std::nullopt;
+  auto found = module->second.find(exportedName.str());
+  if (found == module->second.end())
+    return std::nullopt;
+  return found->second;
+}
+
+std::optional<std::string>
+Table::qualifiedClassExport(llvm::StringRef qualifiedName) const {
+  std::optional<std::pair<std::string, std::string>> split =
+      splitQualifiedExport(qualifiedName);
+  if (!split)
+    return std::nullopt;
+  return moduleClassExport(split->first, split->second);
+}
+
+std::optional<std::string>
+Table::bareClassExport(llvm::StringRef exportedName) const {
+  for (const auto &[moduleName, exports] : classExportsByModule) {
+    (void)moduleName;
+    auto found = exports.find(exportedName.str());
+    if (found != exports.end())
+      return found->second;
+  }
+  return std::nullopt;
+}
+
+std::vector<std::pair<std::string, std::string>>
+Table::moduleClassExports(llvm::StringRef moduleName) const {
+  std::vector<std::pair<std::string, std::string>> result;
+  auto module = classExportsByModule.find(moduleName.str());
+  if (module == classExportsByModule.end())
+    return result;
+  result.reserve(module->second.size());
+  for (const auto &[exportedName, contract] : module->second)
+    result.push_back({exportedName, contract});
+  return result;
+}
+
+bool Table::isModuleCallableExport(llvm::StringRef moduleName,
+                                   llvm::StringRef exportedName) const {
+  auto module = callableExportsByModule.find(moduleName.str());
+  if (module == callableExportsByModule.end())
+    return false;
+  return llvm::is_contained(module->second, exportedName.str());
+}
+
+std::vector<std::string>
+Table::moduleCallableExports(llvm::StringRef moduleName) const {
+  auto module = callableExportsByModule.find(moduleName.str());
+  if (module == callableExportsByModule.end())
+    return {};
+  return module->second;
+}
+
+std::optional<mlir::Type>
+Table::freeFunctionContract(llvm::StringRef qualifiedName) const {
+  auto found = freeFunctionContracts.find(qualifiedName.str());
+  if (found == freeFunctionContracts.end())
+    return std::nullopt;
+  return found->second;
+}
+
+std::optional<double>
+Table::moduleFloatConstant(llvm::StringRef qualifiedName) const {
+  auto found = floatConstants.find(qualifiedName.str());
+  if (found == floatConstants.end())
+    return std::nullopt;
+  return found->second;
+}
+
+std::vector<std::string>
+Table::moduleFloatConstantExports(llvm::StringRef moduleName) const {
+  auto found = floatConstantsByModule.find(moduleName.str());
+  if (found == floatConstantsByModule.end())
+    return {};
+  return found->second;
 }
 
 bool Table::collectMethodContractsIn(
@@ -883,11 +1186,26 @@ Table::collectReceiverMethodContracts(mlir::Type receiverType,
   }
 
   auto binding = bindReceiver(receiverType, classes);
-  if (!binding)
-    return result;
-  std::map<std::string, mlir::Type> selfBinding =
-      withSelfBinding(binding->second, receiverType);
-  collectMethodContractsIn(binding->first, selfBinding, methodName, 0, result);
+  if (binding) {
+    std::map<std::string, mlir::Type> selfBinding =
+        withSelfBinding(binding->second, receiverType);
+    collectMethodContractsIn(binding->first, selfBinding, methodName, 0, result);
+  }
+
+  // Classmethod resolution on a type object: `type[C].method(...)` also sees
+  // classmethods declared on C's own class hierarchy (their first parameter
+  // is `type[...]`, so the call-application shape binds it to the type-object
+  // receiver; instance methods there fail that bind and are filtered out).
+  if (auto typeObject = mlir::dyn_cast<py::TypeType>(receiverType)) {
+    auto instanceBinding =
+        bindReceiver(typeObject.getInstanceType(), classes);
+    if (instanceBinding) {
+      std::map<std::string, mlir::Type> selfBinding = withSelfBinding(
+          instanceBinding->second, typeObject.getInstanceType());
+      collectMethodContractsIn(instanceBinding->first, selfBinding, methodName,
+                               0, result);
+    }
+  }
   return result;
 }
 
@@ -924,6 +1242,94 @@ Table::resolveFieldContractWithEvidence(mlir::Type receiverType,
     return std::nullopt;
   resolution->receiverEvidence = std::move(receiverEvidence);
   return resolution;
+}
+
+std::optional<mlir::Type>
+Table::refineContractByFieldAssignment(mlir::Type receiverType,
+                                       llvm::StringRef fieldName,
+                                       mlir::Type valueType) const {
+  auto receiver = mlir::dyn_cast_if_present<ContractType>(receiverType);
+  if (!receiver)
+    return std::nullopt;
+  std::optional<ProtocolEvidence> evidence = evidenceFor(receiverType);
+  if (!evidence || !evidence->info)
+    return std::nullopt;
+  const ProtocolInfo &info = *evidence->info;
+  const FieldParamBinding *binding = nullptr;
+  for (const FieldParamBinding &candidate : info.fieldParamBindings)
+    if (candidate.field == fieldName) {
+      binding = &candidate;
+      break;
+    }
+  if (!binding)
+    return std::nullopt;
+  auto paramPosition =
+      llvm::find(info.params, binding->param) - info.params.begin();
+  if (paramPosition >= static_cast<std::ptrdiff_t>(info.params.size()))
+    return std::nullopt;
+
+  // The bound argument: literal None stays None; `type[C]` contributes the
+  // single argument of C's `via_base[X]` manifest base.
+  mlir::Type bound;
+  if (auto literal = mlir::dyn_cast_if_present<LiteralType>(valueType)) {
+    if (literal.getSpelling() == "None")
+      bound = literal;
+  } else if (auto typeObject =
+                 mlir::dyn_cast_if_present<TypeType>(valueType)) {
+    bound = conversionTypeViaBase(typeObject.getInstanceType(),
+                                  binding->viaBase)
+                .value_or(mlir::Type());
+  }
+  if (!bound)
+    return std::nullopt;
+
+  llvm::SmallVector<mlir::Type, 4> arguments(receiver.getArguments().begin(),
+                                             receiver.getArguments().end());
+  arguments.resize(info.params.size());
+  for (auto [index, argument] : llvm::enumerate(arguments))
+    if (!argument && index < info.paramDefaults.size())
+      argument = info.paramDefaults[index];
+  arguments[paramPosition] = bound;
+  return ContractType::get(receiverType.getContext(),
+                           receiver.getContractName(), arguments);
+}
+
+std::optional<mlir::Type>
+Table::conversionTypeViaBase(mlir::Type instanceType,
+                             llvm::StringRef viaBase) const {
+  std::optional<ProtocolEvidence> evidence = evidenceFor(instanceType);
+  if (!evidence || !evidence->info)
+    return std::nullopt;
+  for (const ProtocolBase &base : evidence->info->bases)
+    if (base.name == viaBase && base.arguments.size() == 1)
+      return base.arguments.front();
+  return std::nullopt;
+}
+
+std::optional<std::pair<std::string, std::string>>
+Table::aggregateFieldsSpec(llvm::StringRef className) const {
+  std::string resolved = className.str();
+  if (std::optional<std::string> qualified = qualifiedClassExport(className))
+    resolved = *qualified;
+  else if (std::optional<std::string> bare = bareClassExport(className))
+    resolved = *bare;
+
+  llvm::SmallVector<std::string, 8> worklist{resolved};
+  for (unsigned depth = 0; depth < 16 && !worklist.empty(); ++depth) {
+    llvm::SmallVector<std::string, 8> next;
+    for (const std::string &name : worklist) {
+      auto found = classes.find(name);
+      if (found == classes.end())
+        continue;
+      const ProtocolInfo &info = found->second;
+      if (!info.fieldsSpecAttrName.empty())
+        return std::make_pair(info.fieldsSpecAttrName, info.fieldsSpecViaBase);
+      for (const ProtocolBase &base : info.bases)
+        next.push_back(base.name);
+    }
+    worklist = std::move(next);
+  }
+  return std::nullopt;
 }
 
 std::optional<std::vector<mlir::Type>>
@@ -1076,6 +1482,22 @@ Table::evidenceFor(mlir::Type receiverType) const {
   return ProtocolEvidence{binding->first, std::move(binding->second), info};
 }
 
+bool Table::isStructuralMutator(mlir::Type receiverType,
+                                llvm::StringRef methodName) const {
+  std::optional<ProtocolEvidence> evidence = evidenceFor(receiverType);
+  if (!evidence || !evidence->info)
+    return false;
+  return evidence->info->structuralMutators.count(methodName.str()) > 0;
+}
+
+std::optional<std::vector<std::string>>
+Table::matchArgsFor(mlir::Type receiverType) const {
+  std::optional<ProtocolEvidence> evidence = evidenceFor(receiverType);
+  if (!evidence || !evidence->info || evidence->info->matchArgs.empty())
+    return std::nullopt;
+  return evidence->info->matchArgs;
+}
+
 bool Table::isManifestSubclassOf(mlir::Type receiverType,
                                  llvm::StringRef baseClassName) const {
   std::optional<ProtocolEvidence> evidence = evidenceFor(receiverType);
@@ -1101,12 +1523,19 @@ bool Table::isManifestSubclassOf(mlir::Type receiverType,
   return walk(walk, evidence->manifestClass, 0);
 }
 
-static mlir::Type awaitIteratorPayloadType(mlir::Type iteratorType) {
+static mlir::Type awaitIteratorPayloadType(const Table &table,
+                                           mlir::Type iteratorType) {
   auto generator = mlir::dyn_cast_if_present<py::ProtocolType>(iteratorType);
   if (!generator || generator.getProtocolName() != "Generator" ||
       generator.getArguments().size() != 3)
-    return {};
-  return generator.getArguments()[2];
+    if (std::optional<std::vector<mlir::Type>> arguments =
+            table.protocolArgumentsFor(iteratorType, "Generator"))
+      if (arguments->size() == 3)
+        return (*arguments)[2];
+  if (generator && generator.getProtocolName() == "Generator" &&
+      generator.getArguments().size() == 3)
+    return generator.getArguments()[2];
+  return {};
 }
 
 std::optional<AwaitableResolution>
@@ -1147,7 +1576,7 @@ Table::resolveAwaitableWithEvidence(mlir::Type type) const {
     llvm::ArrayRef<mlir::Type> results =
         resolution->method.signature.getResultTypes();
     if (results.size() == 1)
-      if (mlir::Type payload = awaitIteratorPayloadType(results.front()))
+      if (mlir::Type payload = awaitIteratorPayloadType(*this, results.front()))
         return AwaitableResolution{payload, std::move(resolution)};
   }
 

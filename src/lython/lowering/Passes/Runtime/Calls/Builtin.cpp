@@ -1,43 +1,107 @@
 #include "Runtime/Core/Lowerer.h"
 
-#include <functional>
-
 namespace py::lowering {
-namespace {
 
-bool isCollectionMetaType(mlir::Type type) {
-  auto memref = mlir::dyn_cast<mlir::MemRefType>(type);
-  if (!memref || memref.getRank() != 1)
+mlir::FailureOr<bool> RuntimeBundleLowerer::emitSourceClassReprCall(
+    mlir::Operation *op, const RuntimeBundle &object, RuntimeBundle &result) {
+  py::ClassOp classOp = RuntimeBundleLowerer::classForContract(object.contract);
+  if (!classOp)
     return false;
-  if (memref.hasStaticShape() && memref.getDimSize(0) < 1)
+  std::optional<std::string> symbol =
+      RuntimeBundleLowerer::classMethodSymbol(classOp, "__repr__");
+  if (!symbol)
     return false;
-  auto element = mlir::dyn_cast<mlir::IntegerType>(memref.getElementType());
-  return element && element.getWidth() == 64;
+  auto function = module.lookupSymbol<mlir::func::FuncOp>(*symbol);
+  if (!function || function.isExternal())
+    return false;
+  // The compiled method takes the instance's physical values (self box and
+  // field views) directly; a shape mismatch is a real ABI error, not a miss.
+  mlir::FunctionType type = function.getFunctionType();
+  llvm::ArrayRef<mlir::Value> physicals = object.physicalValues();
+  if (type.getNumInputs() != physicals.size())
+    return op->emitError() << "source class __repr__ for "
+                           << object.contractName() << " expects "
+                           << type.getNumInputs() << " values, receiver has "
+                           << physicals.size();
+  for (auto [input, physical] : llvm::zip(type.getInputs(), physicals))
+    if (physical.getType() != input)
+      return op->emitError()
+             << "source class __repr__ for " << object.contractName()
+             << " receiver value type " << physical.getType()
+             << " does not match parameter type " << input;
+  builder.setInsertionPoint(op);
+  mlir::func::CallOp call = mlir::func::CallOp::create(
+      builder, op->getLoc(), function,
+      llvm::SmallVector<mlir::Value, 4>(physicals.begin(), physicals.end()));
+  if (mlir::failed(bundleRuntimeResults(
+          op, runtimeContractType(context, "builtins.str"), call, result)))
+    return mlir::failure();
+  return true;
 }
 
-mlir::LogicalResult keepAliveCollectionEvidenceUse(mlir::Operation *op,
-                                                   mlir::OpBuilder &builder,
-                                                   const RuntimeBundle &bundle,
-                                                   llvm::StringRef label) {
-  if (bundle.physicalValues().size() < 2)
-    return op->emitError() << label
-                           << " collection has no physical length metadata";
-  mlir::Value meta = bundle.physicalValues()[1];
-  if (!isCollectionMetaType(meta.getType()))
-    return op->emitError() << label
-                           << " collection length metadata has invalid type "
-                           << meta.getType();
-  mlir::Value slot =
-      mlir::arith::ConstantIndexOp::create(builder, op->getLoc(), 0);
-  mlir::memref::LoadOp::create(builder, op->getLoc(), meta, slot);
+mlir::LogicalResult RuntimeBundleLowerer::emitBoxedReprHookCall(
+    mlir::Operation *op, const RuntimeBundle &object, RuntimeBundle &result) {
+  mlir::FailureOr<mlir::Value> header =
+      RuntimeBundleLowerer::objectPhysicalHeader(op, object.objectValue);
+  if (mlir::failed(header))
+    return mlir::failure();
+  auto headerType = mlir::cast<mlir::MemRefType>(header->getType());
+  if (!headerType.getLayout().isIdentity())
+    return op->emitError()
+           << "erased object repr requires an identity-layout box, got "
+           << header->getType();
+
+  mlir::func::FuncOp hook =
+      module.lookupSymbol<mlir::func::FuncOp>("__ly_repr_boxed_by_contract");
+  if (!hook) {
+    // Declaring the hook is what requests its generation at the end of the
+    // pass (the same declaration a merged container __repr__ carries).
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToEnd(module.getBody());
+    auto ptrType = mlir::LLVM::LLVMPointerType::get(context);
+    mlir::Type i64 = builder.getI64Type();
+    auto strHeader = mlir::MemRefType::get({2}, i64);
+    auto strBytes = mlir::MemRefType::get({mlir::ShapedType::kDynamic},
+                                          builder.getI8Type());
+    hook = mlir::func::FuncOp::create(
+        builder, module.getLoc(), "__ly_repr_boxed_by_contract",
+        builder.getFunctionType({ptrType, i64},
+                                {strHeader, strBytes, builder.getI1Type()}));
+    hook.setPrivate();
+    hook->setAttr("ly.ownership.owned_results", builder.getI64ArrayAttr({0}));
+  }
+
+  builder.setInsertionPoint(op);
+  mlir::Location loc = op->getLoc();
+  mlir::Value classSlot =
+      mlir::arith::ConstantIndexOp::create(builder, loc, 1).getResult();
+  mlir::Value classId =
+      mlir::memref::LoadOp::create(builder, loc, *header, classSlot)
+          .getResult();
+  mlir::Value pointerIndex =
+      mlir::memref::ExtractAlignedPointerAsIndexOp::create(builder, loc,
+                                                           *header);
+  mlir::Value pointerWord = mlir::arith::IndexCastOp::create(
+                                builder, loc, builder.getI64Type(),
+                                pointerIndex)
+                                .getResult();
+  mlir::Value boxPointer =
+      mlir::LLVM::IntToPtrOp::create(
+          builder, loc, mlir::LLVM::LLVMPointerType::get(context), pointerWord)
+          .getResult();
+  mlir::func::CallOp call = mlir::func::CallOp::create(
+      builder, loc, hook, mlir::ValueRange{boxPointer, classId});
+  mlir::cf::AssertOp::create(builder, loc, call.getResult(2),
+                             "repr: boxed object has no conforming __repr__");
+  result = RuntimeBundle::object(
+      runtimeContractType(context, "builtins.str"),
+      mlir::ValueRange{call.getResult(0), call.getResult(1)});
   return mlir::success();
 }
 
-} // namespace
-
 mlir::LogicalResult RuntimeBundleLowerer::collectSingleBuiltinArgument(
     py::CallOp op, const RuntimeSymbol &symbol,
-    const RuntimeBundle *&argument) const {
+    const RuntimeBundle *&argument) {
   const RuntimeBundle *posargs =
       RuntimeBundleLowerer::bundleFor(op.getPosargs());
   if (!posargs || posargs->kind != RuntimeBundle::Kind::Aggregate)
@@ -50,6 +114,11 @@ mlir::LogicalResult RuntimeBundleLowerer::collectSingleBuiltinArgument(
     return op.emitError() << "builtin callable '" << symbol.builtinName
                           << "' expects exactly one positional argument";
 
+  // The argument can be an as-yet-unlowered merge block argument (e.g. a
+  // ternary flowing straight into the call): demand its bundle first.
+  if (mlir::failed(RuntimeBundleLowerer::ensureValueBundle(
+          op, posargs->aggregateOperands[0])))
+    return mlir::failure();
   argument = RuntimeBundleLowerer::bundleFor(posargs->aggregateOperands[0]);
   if (!argument)
     return op.emitError() << "builtin callable '" << symbol.builtinName
@@ -72,15 +141,26 @@ RuntimeBundleLowerer::lowerBuiltinMethodCall(py::CallOp op,
   if (!receiver)
     receiver = argument;
 
-  if (symbol.builtinName == "repr" && symbol.builtinMethod == "__repr__" &&
-      RuntimeBundleLowerer::needsDefaultObjectRepr(*receiver)) {
-    RuntimeBundle result;
-    if (mlir::failed(RuntimeBundleLowerer::materializeDefaultObjectRepr(
-            op, *receiver, result)))
+  if (symbol.builtinName == "repr" && symbol.builtinMethod == "__repr__") {
+    RuntimeBundle rendered;
+    mlir::FailureOr<bool> sourceRepr =
+        RuntimeBundleLowerer::emitSourceClassReprCall(op, *receiver, rendered);
+    if (mlir::failed(sourceRepr))
       return mlir::failure();
-    valueBundles[op.getResult(0)] = std::move(result);
-    erase.push_back(op);
-    return mlir::success();
+    if (*sourceRepr) {
+      valueBundles[op.getResult(0)] = std::move(rendered);
+      erase.push_back(op);
+      return mlir::success();
+    }
+    if (RuntimeBundleLowerer::needsDefaultObjectRepr(*receiver)) {
+      RuntimeBundle result;
+      if (mlir::failed(RuntimeBundleLowerer::materializeDefaultObjectRepr(
+              op, *receiver, result)))
+        return mlir::failure();
+      valueBundles[op.getResult(0)] = std::move(result);
+      erase.push_back(op);
+      return mlir::success();
+    }
   }
 
   llvm::SmallVector<const RuntimeBundle *, 1> sources{receiver};
@@ -173,200 +253,29 @@ RuntimeBundleLowerer::lowerBuiltinMethodSinkCall(py::CallOp op,
     return mlir::success();
   };
 
-  if (symbol.builtinName == "print" && symbol.builtinMethod == "__repr__" &&
+  if (symbol.builtinMethod == "__repr__" &&
       symbol.builtinSinkContract == "builtins.str" &&
       printable.contractName() == "builtins.object") {
-    std::optional<RuntimeSymbol> objectPrint =
-        manifest.primitive("builtins.object", "print_line");
-    if (!objectPrint)
-      return op.emitError()
-             << "runtime manifest has no builtins.object.print_line primitive";
-    llvm::SmallVector<const RuntimeBundle *, 1> sources{&printable};
-    llvm::SmallVector<mlir::Value, 1> operands;
-    builder.setInsertionPoint(op);
-    if (mlir::failed(buildRuntimeCallOperands(op, *objectPrint, sources,
-                                              operands,
-                                              /*allowUnusedSources=*/false)))
+    RuntimeBundle rendered;
+    if (mlir::failed(RuntimeBundleLowerer::emitBoxedReprHookCall(op, printable,
+                                                                 rendered)))
       return mlir::failure();
-    RuntimeBundleLowerer::createRuntimeCall(op.getLoc(), *objectPrint,
-                                            operands);
-    return assignSinkResults();
+    printable = std::move(rendered);
   }
 
-  if (printable.contractName() != symbol.builtinSinkContract &&
-      symbol.builtinMethod == "__repr__" &&
-      symbol.builtinSinkContract == "builtins.str") {
-    auto renderRepr =
-        [&](auto &&self,
-            const RuntimeBundle &bundle) -> std::optional<std::string> {
-      const RuntimeBundle *resolved =
-          RuntimeBundleLowerer::concreteObjectForOwnership(bundle);
-      const RuntimeBundle &view = resolved ? *resolved : bundle;
-      if (view.literalText && view.contractName() == "builtins.str")
-        return *view.literalText;
-      if (!view.sequenceElementBundles.empty()) {
-        std::string text = "[";
-        for (auto [index, element] :
-             llvm::enumerate(view.sequenceElementBundles)) {
-          if (index)
-            text += ", ";
-          if (!element)
-            return std::nullopt;
-          std::optional<std::string> rendered = self(self, *element);
-          if (!rendered)
-            return std::nullopt;
-          text += *rendered;
-        }
-        text += "]";
-        return text;
-      }
-      if (!view.fieldBundles.empty() &&
-          RuntimeBundleLowerer::classDefinesMethod(view.contract, "__repr__")) {
-        std::string contractName = view.contractName();
-        llvm::StringRef contract(contractName);
-        std::string text = contract.rsplit('.').second.str();
-        if (text.empty())
-          text = contract.str();
-        text += "(";
-        llvm::SmallVector<llvm::StringRef, 4> names;
-        for (const auto &entry : view.fieldBundles)
-          names.push_back(entry.getKey());
-        llvm::sort(names);
-        for (auto [index, name] : llvm::enumerate(names)) {
-          if (index)
-            text += ", ";
-          text += name.str();
-          text += "=";
-          auto field = view.fieldBundles.find(name);
-          if (field == view.fieldBundles.end() || !field->second)
-            return std::nullopt;
-          std::optional<std::string> rendered = self(self, *field->second);
-          if (!rendered)
-            return std::nullopt;
-          text += *rendered;
-        }
-        text += ")";
-        return text;
-      }
-      return std::nullopt;
-    };
-    if (std::optional<std::string> rendered =
-            renderRepr(renderRepr, printable)) {
-      if (mlir::failed(RuntimeBundleLowerer::materializeStringObject(
-              op, *rendered, printable)))
-        return mlir::failure();
-      printable.literalText = std::move(*rendered);
-    } else {
-      auto concatStrings = [&](const RuntimeBundle &lhs,
-                               const RuntimeBundle &rhs,
-                               RuntimeBundle &result) -> mlir::LogicalResult {
-        llvm::SmallVector<const RuntimeBundle *, 2> sources{&lhs, &rhs};
-        std::optional<EmittedRuntimeCall> emitted;
-        if (mlir::failed(emitManifestMethodCall(op, lhs, "__add__", sources,
-                                                /*allowUnusedSources=*/false,
-                                                emitted)))
-          return mlir::failure();
-        return bundleRuntimeResults(
-            op, runtimeContractType(context, "builtins.str"), emitted->call,
-            result);
-      };
-
-      auto appendText = [&](RuntimeBundle &target,
-                            llvm::StringRef text) -> mlir::LogicalResult {
-        RuntimeBundle suffix;
-        if (mlir::failed(RuntimeBundleLowerer::materializeStringObject(op, text,
-                                                                       suffix)))
-          return mlir::failure();
-        RuntimeBundle combined;
-        if (mlir::failed(concatStrings(target, suffix, combined)))
-          return mlir::failure();
-        target = std::move(combined);
-        return mlir::success();
-      };
-
-      auto appendBundle =
-          [&](RuntimeBundle &target,
-              const RuntimeBundle &suffix) -> mlir::LogicalResult {
-        RuntimeBundle combined;
-        if (mlir::failed(concatStrings(target, suffix, combined)))
-          return mlir::failure();
-        target = std::move(combined);
-        return mlir::success();
-      };
-
-      std::function<mlir::LogicalResult(const RuntimeBundle &, RuntimeBundle &)>
-          renderDynamicRepr =
-              [&](const RuntimeBundle &bundle,
-                  RuntimeBundle &result) -> mlir::LogicalResult {
-        const RuntimeBundle *resolved =
-            RuntimeBundleLowerer::concreteObjectForOwnership(bundle);
-        const RuntimeBundle &view = resolved ? *resolved : bundle;
-        if (view.literalText && view.contractName() == "builtins.str")
-          return RuntimeBundleLowerer::materializeStringObject(
-              op, *view.literalText, result);
-
-        if (!view.sequenceElementBundles.empty()) {
-          if (mlir::failed(RuntimeBundleLowerer::materializeStringObject(
-                  op, "[", result)))
-            return mlir::failure();
-          for (auto [index, element] :
-               llvm::enumerate(view.sequenceElementBundles)) {
-            if (index && mlir::failed(appendText(result, ", ")))
-              return mlir::failure();
-            RuntimeBundle elementRepr;
-            if (element) {
-              if (mlir::failed(renderDynamicRepr(*element, elementRepr)))
-                return mlir::failure();
-            } else if (mlir::failed(
-                           RuntimeBundleLowerer::materializeStringObject(
-                               op, "builtins.object", elementRepr))) {
-              return mlir::failure();
-            }
-            if (mlir::failed(appendBundle(result, elementRepr)))
-              return mlir::failure();
-          }
-          return appendText(result, "]");
-        }
-
-        if (RuntimeBundleLowerer::needsDefaultObjectRepr(view))
-          return RuntimeBundleLowerer::materializeDefaultObjectRepr(op, view,
-                                                                    result);
-
-        llvm::SmallVector<const RuntimeBundle *, 1> sources{&view};
-        std::optional<EmittedRuntimeCall> emitted;
-        if (mlir::failed(
-                emitManifestMethodCall(op, view, symbol.builtinMethod, sources,
-                                       /*allowUnusedSources=*/false, emitted)))
-          return mlir::failure();
-        return bundleRuntimeResults(
-            op, runtimeContractType(context, symbol.builtinSinkContract),
-            emitted->call, result);
-      };
-
-      const RuntimeBundle *dynamicKeepAlive = nullptr;
-      const RuntimeBundle *resolvedPrintable =
-          RuntimeBundleLowerer::concreteObjectForOwnership(printable);
-      const RuntimeBundle &printableView =
-          resolvedPrintable ? *resolvedPrintable : printable;
-      if (!printableView.sequenceElementBundles.empty())
-        dynamicKeepAlive = &printableView;
-
-      RuntimeBundle dynamic;
-      if (mlir::failed(renderDynamicRepr(printable, dynamic)))
-        return mlir::failure();
-      if (dynamicKeepAlive) {
-        builder.setInsertionPoint(op);
-        if (mlir::failed(keepAliveCollectionEvidenceUse(
-                op, builder, *dynamicKeepAlive, "dynamic repr")))
-          return mlir::failure();
-      }
-      printable = std::move(dynamic);
-    }
-  }
   if (printable.contractName() != symbol.builtinSinkContract) {
-    if (symbol.builtinMethod == "__repr__" &&
-        RuntimeBundleLowerer::needsDefaultObjectRepr(printable)) {
-      RuntimeBundle rendered;
+    RuntimeBundle rendered;
+    mlir::FailureOr<bool> sourceRepr =
+        symbol.builtinMethod == "__repr__"
+            ? RuntimeBundleLowerer::emitSourceClassReprCall(op, printable,
+                                                            rendered)
+            : mlir::FailureOr<bool>(false);
+    if (mlir::failed(sourceRepr))
+      return mlir::failure();
+    if (*sourceRepr) {
+      printable = std::move(rendered);
+    } else if (symbol.builtinMethod == "__repr__" &&
+               RuntimeBundleLowerer::needsDefaultObjectRepr(printable)) {
       if (mlir::failed(RuntimeBundleLowerer::materializeDefaultObjectRepr(
               op, printable, rendered)))
         return mlir::failure();

@@ -9,7 +9,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -31,8 +33,8 @@ struct ProtocolBase {
   std::vector<mlir::Type> arguments;
 };
 
-// One required method contract. The signature's type variable occurrences are
-// spelled !py.class<"$T"> in runtime/typing.mlir.
+// One required method contract. The signature's type variable occurrences
+// are spelled !py.class<"$T"> in the module manifests.
 struct ProtocolMethod {
   py::CallableType signature;
   bool mayThrow = false;
@@ -66,6 +68,15 @@ struct ProtocolShortForm {
 // `ly.typing.protocol` and rooted at @Protocol. Concrete builtin declarations
 // (list/tuple/str/dict/range) are not protocols themselves; they bind concrete
 // dialect types to protocol base instantiations.
+// One `ly.typing.field_param_bindings` entry ("field:param:via_base"):
+// assigning `type[C]` to `field` binds the class's `param` type parameter to
+// the single argument of C's `via_base[X]` base (literal None binds None).
+struct FieldParamBinding {
+  std::string field;
+  std::string param;
+  std::string viaBase;
+};
+
 struct ProtocolInfo {
   std::vector<std::string> params;
   std::vector<std::string> paramVariance;
@@ -74,6 +85,19 @@ struct ProtocolInfo {
   std::vector<ProtocolBase> bases;
   std::map<std::string, mlir::Type> fields;
   std::map<std::string, std::vector<ProtocolMethod>> methods;
+  // Methods declared via `ly.typing.structural_mutators` that structurally
+  // mutate the receiver (may reallocate its storage). Calls to these are
+  // emitted with an extra receiver-typed result that rebinds the local.
+  std::set<std::string> structuralMutators;
+  // Ordered attribute names for positional class patterns: the class's
+  // `__match_args__` tuple (user classes) or `ly.typing.match_args` (manifest).
+  std::vector<std::string> matchArgs;
+  std::vector<FieldParamBinding> fieldParamBindings;
+  // `ly.typing.fields_spec` ("attr:via_base"): subclasses declare aggregate
+  // fields via a class assignment to `attr` (e.g. ctypes' `_fields_`); each
+  // field types as its declared class's `via_base[V]` base argument.
+  std::string fieldsSpecAttrName;
+  std::string fieldsSpecViaBase;
   bool isProtocol = false;
   bool isAbstract = false;
   bool isFinal = false;
@@ -134,6 +158,44 @@ public:
 
   void registerClass(llvm::StringRef name, ProtocolInfo info);
 
+  std::optional<std::string>
+  moduleClassExport(llvm::StringRef moduleName,
+                    llvm::StringRef exportedName) const;
+  std::optional<std::string>
+  qualifiedClassExport(llvm::StringRef qualifiedName) const;
+  std::optional<std::string>
+  bareClassExport(llvm::StringRef exportedName) const;
+  std::vector<std::pair<std::string, std::string>>
+  moduleClassExports(llvm::StringRef moduleName) const;
+  bool isModuleCallableExport(llvm::StringRef moduleName,
+                              llvm::StringRef exportedName) const;
+  std::vector<std::string>
+  moduleCallableExports(llvm::StringRef moduleName) const;
+
+  // Manifest-declared Callable contract for a free (module-level or builtin)
+  // function, keyed by fully-qualified name (e.g. "ctypes.sizeof"). This is the
+  // manifest source for module/builtin function signatures so imported and
+  // builtin callables need not be typed by a C++ contract table.
+  std::optional<mlir::Type>
+  freeFunctionContract(llvm::StringRef qualifiedName) const;
+
+  // True when the manifest declares `methodName` as a structural mutator of
+  // the receiver's class (`ly.typing.structural_mutators`).
+  bool isStructuralMutator(mlir::Type receiverType,
+                           llvm::StringRef methodName) const;
+
+  // Ordered `__match_args__` attribute names for positional class patterns on
+  // the receiver's class; nullopt when the class declares none.
+  std::optional<std::vector<std::string>>
+  matchArgsFor(mlir::Type receiverType) const;
+
+  // Manifest float constants (`ly.typing.float_constant_names`/`_values`,
+  // e.g. math.pi). Keyed by fully-qualified name; the per-module list drives
+  // import binding.
+  std::optional<double> moduleFloatConstant(llvm::StringRef qualifiedName) const;
+  std::vector<std::string>
+  moduleFloatConstantExports(llvm::StringRef moduleName) const;
+
   // Enumerates manifest method candidates on a concrete dialect type or an
   // already-erased !py.protocol receiver. Each candidate carries the receiver
   // binding/evidence used to specialize its signature; call-site selection is
@@ -144,6 +206,22 @@ public:
   std::optional<FieldResolution>
   resolveFieldContractWithEvidence(mlir::Type receiverType,
                                    llvm::StringRef fieldName) const;
+  // Manifest-driven contract refinement on field assignment
+  // (ly.typing.field_param_bindings): the refined receiver contract when the
+  // assignment binds one of the receiver class's type parameters.
+  std::optional<mlir::Type>
+  refineContractByFieldAssignment(mlir::Type receiverType,
+                                  llvm::StringRef fieldName,
+                                  mlir::Type valueType) const;
+  // The `ly.typing.fields_spec` ("attr:via_base") declared by `className` or
+  // one of its manifest bases; accepts export aliases (e.g.
+  // "ctypes.Structure").
+  std::optional<std::pair<std::string, std::string>>
+  aggregateFieldsSpec(llvm::StringRef className) const;
+  // The value type an instance of `instanceType` converts to: the single
+  // argument of its `viaBase[V]` manifest base.
+  std::optional<mlir::Type> conversionTypeViaBase(mlir::Type instanceType,
+                                                  llvm::StringRef viaBase) const;
   std::optional<std::vector<mlir::Type>>
   protocolArgumentsFor(mlir::Type receiverType,
                        llvm::StringRef protocolName) const;
@@ -181,6 +259,12 @@ private:
                            llvm::StringRef methodName, unsigned depth,
                            std::vector<ProtocolMethod> &out) const;
   std::map<std::string, ProtocolInfo> classes;
+  std::map<std::string, std::map<std::string, std::string>>
+      classExportsByModule;
+  std::map<std::string, std::vector<std::string>> callableExportsByModule;
+  std::map<std::string, mlir::Type> freeFunctionContracts;
+  std::map<std::string, double> floatConstants;
+  std::map<std::string, std::vector<std::string>> floatConstantsByModule;
 };
 
 } // namespace py::protocols

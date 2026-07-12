@@ -128,6 +128,21 @@ ModuleEmitter::lookupClassMethod(mlir::Type receiverType,
 std::optional<mlir::Type>
 ModuleEmitter::lookupClassField(mlir::Type receiverType,
                                 llvm::StringRef fieldName) const {
+  if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(receiverType)) {
+    mlir::Type common;
+    for (mlir::Type member : unionType.getMemberTypes()) {
+      std::optional<mlir::Type> field = lookupClassField(member, fieldName);
+      if (!field)
+        return std::nullopt;
+      if (!common) {
+        common = *field;
+        continue;
+      }
+      if (common != *field)
+        return std::nullopt;
+    }
+    return common ? std::optional<mlir::Type>(common) : std::nullopt;
+  }
   auto contract = mlir::dyn_cast_if_present<py::ContractType>(receiverType);
   if (!contract)
     return std::nullopt;
@@ -176,10 +191,14 @@ Value ModuleEmitter::emitDescriptorReceiver(const parser::Node &anchor,
   return {classObject.getResult(), classType};
 }
 
-void ModuleEmitter::emitClassContract(const parser::Node &classDef) {
+void ModuleEmitter::emitClassContract(const parser::Node &classDef,
+                                      llvm::StringRef symbolName) {
   auto name = ast::string(classDef, "name");
   if (!name)
     return;
+  std::string classSymbol =
+      symbolName.empty() ? std::string(*name) : symbolName.str();
+  llvm::StringRef contractName(classSymbol);
 
   llvm::SmallVector<llvm::StringRef, 4> bases;
   if (const auto *baseNodes = ast::nodeList(classDef, "bases")) {
@@ -198,8 +217,62 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef) {
   llvm::SmallVector<std::string, 8> fieldNames;
   llvm::SmallVector<mlir::Type, 8> fieldTypes;
   collectClassFields(classDef, fieldNames, fieldTypes);
-  llvm::StringMap<mlir::Type> &registeredFields = classFieldBindings[*name];
+
+  // Manifest fields_spec (ly.typing.fields_spec, e.g. ctypes
+  // Structure/Union): a class assignment named by the spec declares the
+  // aggregate's fields; each field reads/writes as its declared class's
+  // via_base value type (falling back to the declared class itself for
+  // nested aggregates). Registering them as ordinary class fields also
+  // gives the subclass its positional field constructor.
+  {
+    const py::protocols::Table &table = py::protocols::Table::get(context);
+    std::optional<std::pair<std::string, std::string>> spec;
+    for (llvm::StringRef base : bases)
+      if ((spec = table.aggregateFieldsSpec(base)))
+        break;
+    const auto *body = spec ? ast::nodeList(classDef, "body") : nullptr;
+    if (body)
+      for (const parser::NodePtr &statement : *body) {
+        if (!statement || statement->kind != "Assign")
+          continue;
+        const auto *targets = ast::nodeList(*statement, "targets");
+        if (!targets || targets->size() != 1 || !targets->front() ||
+            targets->front()->kind != "Name" ||
+            ast::nameSpelling(*targets->front()) != spec->first)
+          continue;
+        const parser::Node *value = ast::node(*statement, "value");
+        const auto *entries = value ? ast::nodeList(*value, "elts") : nullptr;
+        if (!entries)
+          continue;
+        for (const parser::NodePtr &entry : *entries) {
+          if (!entry)
+            continue;
+          const auto *pair = ast::nodeList(*entry, "elts");
+          if (!pair || pair->size() != 2 || !(*pair)[0] || !(*pair)[1])
+            continue;
+          auto fieldName = ast::string(*(*pair)[0], "value");
+          if (!fieldName)
+            continue;
+          mlir::Type declared = types.inferExpr((*pair)[1].get());
+          if (auto typeObject =
+                  mlir::dyn_cast_if_present<py::TypeType>(declared)) {
+            fieldNames.push_back(std::string(*fieldName));
+            fieldTypes.push_back(
+                table
+                    .conversionTypeViaBase(typeObject.getInstanceType(),
+                                           spec->second)
+                    .value_or(typeObject.getInstanceType()));
+          }
+        }
+      }
+  }
+
+  llvm::StringMap<mlir::Type> &registeredFields =
+      classFieldBindings[contractName];
   registeredFields.clear();
+  llvm::SmallVector<std::string, 8> &registeredOrder =
+      classFieldOrders[contractName];
+  registeredOrder.assign(fieldNames.begin(), fieldNames.end());
   for (auto [fieldName, fieldType] : llvm::zip_equal(fieldNames, fieldTypes))
     registeredFields[fieldName] = fieldType;
 
@@ -227,39 +300,36 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef) {
           *statement,
           kind == "static" ? std::optional<llvm::StringRef>() : receiverName);
       if (kind == "instance")
-        replaceSelfInSignature(bodySig, types.contract(*name), types);
+        replaceSelfInSignature(bodySig, types.contract(contractName), types);
       else if (kind == "class" || kind == "classmethod") {
-        replaceSelfInSignature(bodySig, types.typeObject(types.contract(*name)),
-                               types);
+        replaceSelfInSignature(
+            bodySig, types.typeObject(types.contract(contractName)), types);
         if (!bodySig.positionalTypes.empty()) {
           bodySig.positionalTypes.front() =
-              types.typeObject(types.contract(*name));
+              types.typeObject(types.contract(contractName));
           types.refreshCallable(bodySig);
         }
       }
-      FunctionSignature publicSig = statement->kind == "AsyncFunctionDef"
-                                        ? asyncPublicSignature(bodySig)
-                                        : bodySig;
       methodNames.push_back(std::string(*methodName));
       methodKinds.push_back(kind);
-      methodContracts.push_back(publicSig.callable);
+      methodContracts.push_back(bodySig.publicCallable);
 
       std::string symbolName =
-          sourceMethodSymbolName(*name, *methodName, *statement);
+          sourceMethodSymbolName(contractName, *methodName, *statement);
       methodSymbols.push_back(symbolName);
       if (kind != "class" && kind != "classmethod")
         emitCallableFunction(*statement, symbolName, bodySig, {},
                              /*isLambda=*/false);
-      classMethodBindings[*name][*methodName] =
+      classMethodBindings[contractName][*methodName] =
           MethodBinding{statement.get(), bodySig,
-                        publicSig,       kind,
+                        bodySig,         kind,
                         symbolName,      statement->kind == "AsyncFunctionDef"};
     }
   }
 
   mlir::OperationState state(loc(classDef), py::ClassOp::getOperationName());
   state.addAttribute(mlir::SymbolTable::getSymbolAttrName(),
-                     builder.getStringAttr(*name));
+                     builder.getStringAttr(contractName));
   state.addAttribute("base_names", stringArray(builder, bases));
   state.addAttribute("field_names", stringArray(builder, fieldNames));
   state.addAttribute("field_types", typeArray(builder, fieldTypes));
@@ -275,7 +345,7 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef) {
   collectStaticClassAssignments(classDef, staticAttrNames, staticAttrValues,
                                 &staticAttrTypes);
   llvm::StringMap<mlir::Type> &registeredStaticAttrs =
-      classStaticAttrBindings[*name];
+      classStaticAttrBindings[contractName];
   registeredStaticAttrs.clear();
   for (auto [attrName, attrType] :
        llvm::zip_equal(staticAttrNames, staticAttrTypes))
@@ -292,6 +362,38 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef) {
   op->getRegion(0).push_back(new mlir::Block);
 
   py::protocols::ProtocolInfo protocolInfo;
+  if (const auto *body = ast::nodeList(classDef, "body")) {
+    for (const parser::NodePtr &statement : *body) {
+      if (!statement || statement->kind != "Assign")
+        continue;
+      const auto *targets = ast::nodeList(*statement, "targets");
+      if (!targets || targets->size() != 1 || !targets->front() ||
+          targets->front()->kind != "Name" ||
+          ast::nameSpelling(*targets->front()) != "__match_args__")
+        continue;
+      const parser::Node *value = ast::node(*statement, "value");
+      const auto *elts =
+          value && value->kind == "Tuple" ? ast::nodeList(*value, "elts")
+                                          : nullptr;
+      std::vector<std::string> names;
+      bool wellFormed = elts != nullptr;
+      if (elts)
+        for (const parser::NodePtr &element : *elts) {
+          std::optional<std::string_view> text =
+              element && element->kind == "Constant"
+                  ? ast::string(*element, "value")
+                  : std::nullopt;
+          if (!text) {
+            wellFormed = false;
+            break;
+          }
+          names.emplace_back(*text);
+        }
+      if (wellFormed)
+        protocolInfo.matchArgs = std::move(names);
+      break;
+    }
+  }
   for (llvm::StringRef base : bases)
     protocolInfo.bases.push_back(py::protocols::ProtocolBase{base.str(), {}});
   for (auto [fieldName, fieldType] : llvm::zip_equal(fieldNames, fieldTypes))
@@ -317,24 +419,31 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef) {
     }
   }
   py::protocols::Table::getMutable(context).registerClass(
-      *name, std::move(protocolInfo));
+      contractName, std::move(protocolInfo));
 }
 
 void ModuleEmitter::collectStaticClassAssignments(
     const parser::Node &classDef, llvm::SmallVectorImpl<std::string> &names,
     llvm::SmallVectorImpl<mlir::Attribute> &values,
-    llvm::SmallVectorImpl<mlir::Type> *typesOut) const {
+    llvm::SmallVectorImpl<mlir::Type> *typesOut) {
   mlir::Builder attrBuilder(&context);
   auto appendStaticAttr = [&](llvm::StringRef name, const parser::Node *value,
                               mlir::Type annotatedType = {}) {
-    names.push_back(std::string(name));
-    values.push_back(sourceExprAttr(attrBuilder, value));
-    if (!typesOut)
-      return;
     mlir::Type valueType = annotatedType;
     if (!valueType)
       valueType = types.inferExpr(value);
-    typesOut->push_back(valueType ? valueType : types.object());
+    if (typesOut && !valueType) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error,
+          value ? value->range.start : classDef.range.start,
+          "class static attribute '" + name.str() +
+              "' requires a statically inferred type"});
+      return;
+    }
+    names.push_back(std::string(name));
+    values.push_back(sourceExprAttr(attrBuilder, value));
+    if (typesOut)
+      typesOut->push_back(valueType);
   };
   if (const auto *body = ast::nodeList(classDef, "body")) {
     for (const parser::NodePtr &statement : *body) {
@@ -381,15 +490,59 @@ void ModuleEmitter::collectStaticModuleAssignments(
   }
 }
 
+void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
+  // Opt-in: an int-annotated module-level assignment (`NAME: int = ...`)
+  // becomes a storage-backed mutable global. Plain `NAME = expr` at module
+  // scope keeps its value-binding behavior (module-scope constants).
+  const auto *body = ast::nodeList(moduleNode, "body");
+  if (!body)
+    return;
+  for (const parser::NodePtr &statement : *body) {
+    if (!statement || statement->kind != "AnnAssign")
+      continue;
+    const parser::Node *target = ast::node(*statement, "target");
+    if (!target || target->kind != "Name")
+      continue;
+    mlir::Type annotated =
+        types.annotationType(ast::node(*statement, "annotation"));
+    if (types.widenLiteral(annotated) != types.intType())
+      continue;
+    llvm::StringRef name = ast::nameSpelling(*target);
+    moduleGlobals[name] = types.intType();
+    types.bindSymbol(name, types.intType());
+  }
+}
+
+bool ModuleEmitter::isModuleGlobalRead(llvm::StringRef name) const {
+  // A read resolves to the module global unless a local (function-scope)
+  // binding shadows it.
+  return moduleGlobals.count(name) && values.find(name) == values.end();
+}
+
+bool ModuleEmitter::isModuleGlobalWrite(llvm::StringRef name) const {
+  if (!moduleGlobals.count(name))
+    return false;
+  // Module scope always writes the global; a function writes it only when it
+  // declared `global NAME` (otherwise the assignment makes a local).
+  return atModuleScope || currentGlobalDecls.count(name);
+}
+
 void ModuleEmitter::collectClassFields(
     const parser::Node &classDef,
     llvm::SmallVectorImpl<std::string> &fieldNames,
-    llvm::SmallVectorImpl<mlir::Type> &fieldTypes) const {
+    llvm::SmallVectorImpl<mlir::Type> &fieldTypes) {
   auto setField = [&](llvm::StringRef name, mlir::Type type,
-                      bool overwriteExisting) {
+                      bool overwriteExisting, const parser::Node &anchor) {
     if (name.empty())
       return;
-    mlir::Type storedType = type ? types.widenLiteral(type) : types.object();
+    if (!type) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, anchor.range.start,
+          "class field '" + name.str() +
+              "' requires a statically inferred type"});
+      return;
+    }
+    mlir::Type storedType = types.widenLiteral(type);
     for (auto [index, existing] : llvm::enumerate(fieldNames)) {
       if (existing != name)
         continue;
@@ -414,7 +567,8 @@ void ModuleEmitter::collectClassFields(
           llvm::StringRef name = ast::nameSpelling(*arg);
           if (name == "self")
             continue;
-          argTypes[name] = types.annotationType(ast::node(*arg, "annotation"));
+          if (const parser::Node *annotation = ast::node(*arg, "annotation"))
+            argTypes[name] = types.annotationType(annotation);
         }
       }
     };
@@ -429,7 +583,7 @@ void ModuleEmitter::collectClassFields(
     if (!object || !ast::isName(*object, "self"))
       return;
     if (auto attr = ast::string(target, "attr"))
-      setField(*attr, type, /*overwriteExisting=*/false);
+      setField(*attr, type, /*overwriteExisting=*/false, target);
   };
 
   if (const auto *body = ast::nodeList(classDef, "body")) {
@@ -441,7 +595,7 @@ void ModuleEmitter::collectClassFields(
         continue;
       setField(ast::nameSpelling(*target),
                types.annotationType(ast::node(*statement, "annotation")),
-               /*overwriteExisting=*/true);
+               /*overwriteExisting=*/true, *statement);
     }
 
     for (const parser::NodePtr &method : *body) {
@@ -458,11 +612,13 @@ void ModuleEmitter::collectClassFields(
                           types.annotationType(ast::node(*stmt, "annotation")));
           } else if (stmt->kind == "Assign") {
             const parser::Node *value = ast::node(*stmt, "value");
-            mlir::Type valueType = types.inferExpr(value);
+            mlir::Type valueType;
             if (value && value->kind == "Name") {
               auto found = initArgTypes.find(ast::nameSpelling(*value));
               if (found != initArgTypes.end())
                 valueType = found->second;
+            } else {
+              valueType = types.inferExpr(value);
             }
             if (const auto *targets = ast::nodeList(*stmt, "targets"))
               for (const parser::NodePtr &target : *targets)
@@ -472,6 +628,21 @@ void ModuleEmitter::collectClassFields(
       }
     }
   }
+}
+
+Value ModuleEmitter::emitInlineOperatorCall(const parser::Node &anchor,
+                                            Value receiver,
+                                            const MethodBinding &method,
+                                            llvm::ArrayRef<Value> positional) {
+  if (!method.method)
+    return emitNone(anchor);
+  Value descriptorReceiver = emitDescriptorReceiver(anchor, receiver, method);
+  bool bindReceiver = methodBindingBindsReceiver(method);
+  if (method.kind == "instance" && mlir::isa<py::TypeType>(receiver.type))
+    bindReceiver = false;
+  llvm::StringMap<Value> keywords;
+  return emitInlineMethodBody(anchor, descriptorReceiver, bindReceiver, method,
+                              positional, keywords);
 }
 
 Value ModuleEmitter::emitInlineMethodCall(const parser::Node &expr,
@@ -670,6 +841,11 @@ Value ModuleEmitter::emitClassInstantiation(const parser::Node &expr,
                                             llvm::StringRef name,
                                             mlir::Type instanceType) {
   CallOperands operands = emitCallOperands(expr);
+  if (!operands.valid) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start, operands.failureReason});
+    return emitNone(expr);
+  }
 
   llvm::StringMap<Value> keywords;
   for (auto [index, keyword] : llvm::enumerate(operands.keywordTypes)) {
@@ -707,6 +883,13 @@ Value ModuleEmitter::emitClassInstantiation(const parser::Node &expr,
 
   mlir::Type inferredInstanceType = types.inferClassInstantiation(
       instanceType, operands.positionalTypes, operands.keywordTypes);
+  if (!inferredInstanceType) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "class instantiation leaves unbound static type parameters for '" +
+            name.str() + "'"});
+    return emitNone(expr);
+  }
   mlir::Type classType = types.typeObject(inferredInstanceType);
   auto classObject = py::TypeObjectOp::create(builder, loc(expr), classType,
                                               inferredInstanceType);
@@ -760,10 +943,46 @@ Value ModuleEmitter::emitClassInstantiation(const parser::Node &expr,
     CallInferenceResult initInference = types.inferMethodCallWithEvidence(
         inferredInstanceType, "__init__", operands.positionalTypes,
         operands.keywordTypes);
+    mlir::Type initContract =
+        initInference ? callProtocolFor(initInference) : mlir::Type();
+    if (!initContract) {
+      // Field-record construction: a class without a source or manifest
+      // __init__ takes its declared fields positionally, every field
+      // optional (ctypes Structure/Union subclasses; plain field records).
+      auto order = classFieldOrders.find(name);
+      auto fields = classFieldBindings.find(name);
+      if (order != classFieldOrders.end() &&
+          fields != classFieldBindings.end() && !order->second.empty() &&
+          operands.positionalTypes.size() <= order->second.size() &&
+          operands.keywordTypes.empty()) {
+        llvm::SmallVector<mlir::Type, 8> positional{inferredInstanceType};
+        llvm::SmallVector<mlir::StringAttr, 8> positionalNames{
+            builder.getStringAttr("self")};
+        llvm::SmallVector<mlir::BoolAttr, 8> positionalDefaults{
+            builder.getBoolAttr(false)};
+        for (const std::string &fieldName : order->second) {
+          auto field = fields->second.find(fieldName);
+          positional.push_back(field == fields->second.end()
+                                   ? types.object()
+                                   : field->second);
+          positionalNames.push_back(builder.getStringAttr(fieldName));
+          positionalDefaults.push_back(builder.getBoolAttr(true));
+        }
+        llvm::SmallVector<mlir::Type, 1> results{types.none()};
+        initContract = py::CallableType::get(
+            &context, positional, {}, {}, {}, results, positionalNames, {},
+            positionalDefaults, {});
+      }
+    }
+    if (!initContract) {
+      if (!requireStaticEvidence(expr, initInference))
+        return emitNone(expr);
+      initContract = callProtocolFor(initInference);
+    }
     auto initOp =
         py::InitOp::create(builder, loc(expr), types.none(),
                            mlir::FlatSymbolRefAttr::get(&context, "__init__"),
-                           callProtocolFor(initInference), newOp.getInstance(),
+                           initContract, newOp.getInstance(),
                            posPack.value, namePack.value, valuePack.value);
     initOp->setAttr("ly.constructor.owner", builder.getStringAttr(name));
     initOp->setAttr("ly.constructor.init_kind",

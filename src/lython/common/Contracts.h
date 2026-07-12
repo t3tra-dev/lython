@@ -39,10 +39,16 @@ inline constexpr llvm::StringLiteral kManifestResultContractAttr{
     "ly.runtime.result_contract"};
 inline constexpr llvm::StringLiteral kManifestResultEvidenceAttr{
     "ly.runtime.result_evidence"};
+inline constexpr llvm::StringLiteral kManifestResultEvidenceSlotsAttr{
+    "ly.runtime.result_evidence_slots"};
+inline constexpr llvm::StringLiteral kManifestResultEvidenceContractsAttr{
+    "ly.runtime.result_evidence_contracts"};
 inline constexpr llvm::StringLiteral kManifestElementContractAttr{
     "ly.runtime.element_contract"};
 inline constexpr llvm::StringLiteral kManifestNextContractAttr{
     "ly.runtime.next_contract"};
+inline constexpr llvm::StringLiteral kManifestNextEvidenceAttr{
+    "ly.runtime.next_evidence"};
 inline constexpr llvm::StringLiteral kManifestValidResultIndexAttr{
     "ly.runtime.valid_result_index"};
 inline constexpr llvm::StringLiteral kManifestRequiredAttr{

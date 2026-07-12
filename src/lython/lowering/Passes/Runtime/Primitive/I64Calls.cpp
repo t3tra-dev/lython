@@ -154,6 +154,26 @@ buildPrimitiveI64Arithmetic(mlir::OpBuilder &builder, mlir::Location loc,
 
 } // namespace
 
+mlir::FailureOr<RuntimePrimitiveI64Evidence>
+RuntimeBundleLowerer::emitPrimitiveI64ArithmeticEvidence(
+    mlir::Operation *op, llvm::StringRef methodName,
+    const RuntimePrimitiveI64Evidence &lhs,
+    const RuntimePrimitiveI64Evidence &rhs) {
+  std::optional<PrimitiveI64ArithmeticKind> arithmetic =
+      primitiveI64ArithmeticKind(methodName);
+  if (!arithmetic)
+    return op->emitError() << "unsupported primitive i64 arithmetic method "
+                           << methodName;
+
+  mlir::Location loc = op->getLoc();
+  mlir::Value operandsValid = logicalAnd(builder, loc, lhs.valid, rhs.valid);
+  auto [rawResult, overflow] = buildPrimitiveI64Arithmetic(
+      builder, loc, *arithmetic, lhs.value, rhs.value);
+  mlir::Value valid = logicalAnd(builder, loc, operandsValid,
+                                 logicalNot(builder, loc, overflow));
+  return RuntimePrimitiveI64Evidence{rawResult, valid};
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
     mlir::Operation *op, llvm::StringRef methodName,
     llvm::ArrayRef<const RuntimeBundle *> sources, mlir::Value resultValue) {
@@ -180,13 +200,15 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
   if (RuntimeBundleLowerer::isPrimitiveI64CallableClone(
           op->getParentOfType<mlir::func::FuncOp>())) {
     if (arithmetic) {
-      auto [rawResult, overflow] = buildPrimitiveI64Arithmetic(
-          builder, loc, *arithmetic, lhs.value, rhs.value);
-      mlir::Value valid = logicalAnd(builder, loc, operandsValid,
-                                     logicalNot(builder, loc, overflow));
+      mlir::FailureOr<RuntimePrimitiveI64Evidence> fastEvidence =
+          RuntimeBundleLowerer::emitPrimitiveI64ArithmeticEvidence(
+              op, methodName, lhs, rhs);
+      if (mlir::failed(fastEvidence))
+        return mlir::failure();
       RuntimeBundle result;
       if (mlir::failed(RuntimeBundleLowerer::makePrimitiveI64Bundle(
-              op, resultValue.getType(), rawResult, valid, result)))
+              op, resultValue.getType(), fastEvidence->value,
+              fastEvidence->valid, result)))
         return mlir::failure();
       valueBundles[resultValue] = std::move(result);
       return mlir::success();
@@ -290,10 +312,13 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
   };
 
   if (arithmetic) {
-    auto [rawResult, overflow] = buildPrimitiveI64Arithmetic(
-        builder, loc, *arithmetic, lhs.value, rhs.value);
-    mlir::Value fastValid = logicalAnd(builder, loc, operandsValid,
-                                       logicalNot(builder, loc, overflow));
+    mlir::FailureOr<RuntimePrimitiveI64Evidence> fastEvidence =
+        RuntimeBundleLowerer::emitPrimitiveI64ArithmeticEvidence(
+            op, methodName, lhs, rhs);
+    if (mlir::failed(fastEvidence))
+      return mlir::failure();
+    mlir::Value rawResult = fastEvidence->value;
+    mlir::Value fastValid = fastEvidence->valid;
     auto ifOp = mlir::scf::IfOp::create(builder, loc, *resultTypes, fastValid,
                                         /*withElseRegion=*/true);
 

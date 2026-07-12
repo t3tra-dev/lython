@@ -166,7 +166,7 @@ def Py_InvokeOp : Py_Op<"invoke", [Terminator]> {
 def Py_TryOp : Py_Op<"try"> {
   let summary = "Try/Except/Finally structured control flow";
 
-  let results = (outs Variadic<Py_ContractType>:$results);
+  let results = (outs Variadic<AnyType>:$results);
   let regions = (region AnyRegion:$try_region, AnyRegion:$except_region,
       AnyRegion:$finally_region);
 
@@ -174,18 +174,59 @@ def Py_TryOp : Py_Op<"try"> {
 }
 
 def Py_TryYieldOp : Py_Op<"try.yield", [Terminator]> {
-  let arguments = (ins Variadic<Py_ContractType>:$operands);
+  let arguments = (ins Variadic<AnyType>:$operands);
   let assemblyFormat = "($operands^ `:` type($operands))? attr-dict";
 }
 
 def Py_ExceptYieldOp : Py_Op<"except.yield", [Terminator]> {
-  let arguments = (ins Variadic<Py_ContractType>:$operands);
+  let arguments = (ins Variadic<AnyType>:$operands);
   let assemblyFormat = "($operands^ `:` type($operands))? attr-dict";
 }
 
 def Py_FinallyYieldOp : Py_Op<"finally.yield", [Terminator]> {
-  let arguments = (ins Variadic<Py_ContractType>:$operands);
+  let arguments = (ins Variadic<AnyType>:$operands);
   let assemblyFormat = "($operands^ `:` type($operands))? attr-dict";
+  let hasVerifier = 1;
+}
+
+def Py_YieldValueOp : Py_Op<"yield_value"> {
+  let summary = "Suspend a source generator and publish one yielded value";
+  let description = [{
+    Represents the Python `yield value` expression inside a generator body
+    after AlgorithmM has classified the enclosing callable as
+    `Generator[Y, S, R]`. The operand is the yielded `Y` value. The result is
+    the value received when the generator is resumed through `send`, whose
+    contract is `S`.
+
+    Lowering owns the frame state machine: this op is deliberately independent
+    of the concrete `types.GeneratorType` storage layout so the frontend does
+    not duplicate runtime frame semantics.
+  }];
+
+  let arguments = (ins Py_ContractType:$value);
+  let results = (outs Py_ContractType:$sent);
+  let assemblyFormat =
+      "$value `:` type($value) attr-dict `->` type($sent)";
+}
+
+def Py_YieldFromOp : Py_Op<"yield_from"> {
+  let summary = "Delegate a source generator yield stream to a proven iterable";
+  let description = [{
+    Represents the Python `yield from value` expression after AlgorithmM has
+    proven the yielded element type from a Generator, Iterator, or Iterable
+    contract. The selected protocol evidence is carried as
+    `yield_from_contract`; the operand is the delegated source. The result is
+    the delegated iterator's completion value; the currently accepted source
+    lowering slice only materializes `None` for statement-position delegation
+    and keeps externally observable `StopIteration.value` support out of scope.
+  }];
+
+  let arguments = (ins TypeAttrOf<Py_ProtocolType>:$yield_from_contract,
+      Py_ContractType:$source);
+  let results = (outs Py_ContractType:$result);
+  let assemblyFormat =
+      "$yield_from_contract `(` $source `:` type($source) `)` "
+      "attr-dict `->` type($result)";
   let hasVerifier = 1;
 }
 
@@ -293,6 +334,22 @@ def Py_ExceptCurrentMatchOp : Py_Op<"except.current_match", []> {
   let arguments = (ins TypeAttrOf<Py_TypeType>:$handler);
   let results = (outs I1:$result);
   let assemblyFormat = "$handler attr-dict";
+  let hasVerifier = 1;
+}
+
+def Py_ExceptCurrentValueOp : Py_Op<"except.current_value", []> {
+  let summary = "Borrow the current Python EH payload as a handler value";
+  let description = [{
+    Materializes the active runtime exception as a statically typed handler
+    binding for `except T as e`. This op does not consume the current
+    exception; handler completion still owns the final discard/rethrow decision.
+    The result type must be the instance contract named by the handler type
+    object.
+  }];
+
+  let arguments = (ins TypeAttrOf<Py_TypeType>:$handler);
+  let results = (outs Py_ContractType:$result);
+  let assemblyFormat = "$handler attr-dict `->` type($result)";
   let hasVerifier = 1;
 }
 
@@ -522,9 +579,15 @@ def Py_SetItemOp : Py_Op<"setitem", []> {
       Py_ContractType:$container, Py_ContractType:$index,
       Py_ContractType:$value);
 
+  // Structural mutation (`ly.structural_mutation`): one container-typed
+  // result rebinds the receiver local so the (possibly reallocated)
+  // representation threads through SSA like any reassignment.
+  let results = (outs Variadic<Py_ContractType>:$results);
+
   let assemblyFormat =
       "$callee_contract `(` $container `[` $index `:` type($index) `]` `=` "
-      "$value `:` type($value) `:` type($container) `)` attr-dict";
+      "$value `:` type($value) `:` type($container) `)` attr-dict "
+      "(`->` type($results)^)?";
   let hasVerifier = 1;
 }
 
@@ -961,6 +1024,38 @@ def Py_AttrSetOp : Py_Op<"attr.set", []> {
   let assemblyFormat = "$object `[` $name `]` `=` $value attr-dict `:` "
                        "type($object) `,` type($value)";
   let hasVerifier = 1;
+}
+
+def Py_GlobalGetOp : Py_Op<"global.get", []> {
+  let summary = "Read a module-level global variable";
+  let description = [{
+    Reads the current value of a module-level global variable named `name`.
+    Module globals are backed by process-lifetime storage (see the runtime
+    lowering), so the read is a plain load; for an unboxed integer global the
+    load is async-signal-safe (no allocation). The declared type of the global
+    is the result contract.
+
+    Example:
+      %v = py.global.get "LIMIT" : !py.contract<"builtins.int">
+  }];
+
+  let arguments = (ins StrAttr:$name);
+  let results = (outs Py_ContractType:$result);
+  let assemblyFormat = "$name attr-dict `:` type($result)";
+}
+
+def Py_GlobalSetOp : Py_Op<"global.set", []> {
+  let summary = "Write a module-level global variable";
+  let description = [{
+    Stores `value` into the module-level global named `name`. For an unboxed
+    integer global this is an unbox-and-store; the store is async-signal-safe.
+
+    Example:
+      py.global.set "LIMIT" = %v : !py.contract<"builtins.int">
+  }];
+
+  let arguments = (ins StrAttr:$name, Py_ContractType:$value);
+  let assemblyFormat = "$name `=` $value attr-dict `:` type($value)";
 }
 
 //===----------------------------------------------------------------------===//

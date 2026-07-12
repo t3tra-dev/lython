@@ -1,8 +1,11 @@
 #include "Ownership.h"
 #include "Runtime/Core/Lowerer.h"
 
+#include "PyProtocols.h"
 #include "PyTypeObject.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
 
 #include <cctype>
@@ -583,6 +586,9 @@ void RuntimeBundle::copyEvidenceFrom(const RuntimeBundle &source) {
   coroutineTarget = source.coroutineTarget;
   coroutineSources = source.coroutineSources;
   coroutineSourceBundles = source.coroutineSourceBundles;
+  generatorTarget = source.generatorTarget;
+  generatorSources = source.generatorSources;
+  generatorSourceBundles = source.generatorSourceBundles;
   primitiveI64 = source.primitiveI64;
   buffer = source.buffer;
   ctypes = source.ctypes;
@@ -593,12 +599,14 @@ void RuntimeBundle::copyEvidenceFrom(const RuntimeBundle &source) {
   sequenceElements = source.sequenceElements;
   sequenceIndices = source.sequenceIndices;
   sequenceCapacity = source.sequenceCapacity;
+  sequenceEvidenceBacked = source.sequenceEvidenceBacked;
   mappingKeys = source.mappingKeys;
   mappingKeyBundles = source.mappingKeyBundles;
   mappingValues = source.mappingValues;
   mappingValueBundles = source.mappingValueBundles;
   mappingPresent = source.mappingPresent;
   mappingCapacity = source.mappingCapacity;
+  mappingEvidenceBacked = source.mappingEvidenceBacked;
 }
 
 llvm::ArrayRef<mlir::Value> RuntimeBundle::physicalValues() const {
@@ -961,8 +969,14 @@ mlir::FailureOr<RuntimeValue> RuntimeBundleLowerer::materializeClassObjectValue(
 
   llvm::SmallVector<mlir::Value, 8> values{header};
   for (mlir::Type fieldType : fieldContractTypes) {
+    // Box-fronted fields store a single box16 slot; materialize the dead
+    // placeholder in the STORAGE shape, not the contract's array shape.
+    mlir::Type storageType =
+        RuntimeBundleLowerer::classFieldStoredBoxed(fieldType)
+            ? runtimeContractType(context, "builtins.object")
+            : fieldType;
     mlir::FailureOr<RuntimeValue> fieldValue =
-        RuntimeBundleLowerer::materializeDeadObjectValue(op, fieldType,
+        RuntimeBundleLowerer::materializeDeadObjectValue(op, storageType,
                                                          purpose);
     if (mlir::failed(fieldValue))
       return mlir::failure();
@@ -1029,7 +1043,7 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassDeallocators() {
     for (mlir::Type fieldType : fieldTypes) {
       fieldOffsets.push_back(offset);
       mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> fieldValueTypes =
-          RuntimeBundleLowerer::runtimeValueTypesFor(
+          RuntimeBundleLowerer::classFieldStorageValueTypes(
               classOp, fieldType, "source class field deallocator ABI");
       if (mlir::failed(fieldValueTypes))
         return mlir::failure();
@@ -1094,23 +1108,28 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassDeallocators() {
     builder.setInsertionPointToStart(deallocBlock);
     for (auto [index, fieldType] : llvm::enumerate(plan.fieldTypes)) {
       mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> fieldValueTypes =
-          RuntimeBundleLowerer::runtimeValueTypesFor(
+          RuntimeBundleLowerer::classFieldStorageValueTypes(
               plan.function, fieldType, "source class field deallocator ABI");
       if (mlir::failed(fieldValueTypes))
         return mlir::failure();
       llvm::SmallVector<mlir::Value, 4> fieldValues =
           entryArgumentSlice(*entry, plan.fieldOffsets[index],
                              static_cast<unsigned>(fieldValueTypes->size()));
+      // Box-fronted fields release through the boxed route (the release hook
+      // dispatches the box's class id to the manifest deallocator); the box
+      // itself is the authoritative view of a possibly-reallocated container.
+      mlir::Type releaseType =
+          RuntimeBundleLowerer::classFieldStoredBoxed(fieldType)
+              ? runtimeContractType(context, "builtins.object")
+              : fieldType;
       if (mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
-              plan.function, fieldType, fieldValues, "class.field",
+              plan.function, releaseType, fieldValues, "class.field",
               deallocators, /*depth=*/0)))
         return mlir::failure();
     }
 
     auto dealloc =
         mlir::memref::DeallocOp::create(builder, loc, entry->getArgument(0));
-    dealloc->setAttr(own::kObjectDeallocPartAttr,
-                     builder.getStringAttr("header"));
     mlir::cf::BranchOp::create(builder, loc, doneBlock);
 
     builder.setInsertionPointToStart(doneBlock);
@@ -1137,8 +1156,20 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeStringObject(
 
 bool RuntimeBundleLowerer::needsDefaultObjectRepr(
     const RuntimeBundle &object) const {
+  // Runtime-mode sequences must not fall back to the address-based default
+  // repr (CPython prints their contents); rejecting the manifest lookup below
+  // keeps the failure explicit until a runtime sequence repr exists.
+  std::string contract = object.contractName();
+  if ((contract == "builtins.list" || contract == "builtins.tuple") &&
+      !object.sequenceEvidenceBacked && object.sequenceElementBundles.empty())
+    return false;
+  if (contract == "builtins.dict" && !object.mappingEvidenceBacked &&
+      object.mappingKeys.empty())
+    return false;
+  if (contract == "builtins.set")
+    return false;
   return object.kind == RuntimeBundle::Kind::Object &&
-         manifest.methodCandidates(object.contractName(), "__repr__").empty();
+         manifest.methodCandidates(contract, "__repr__").empty();
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultObjectRepr(
@@ -1182,6 +1213,262 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultObjectRepr(
       mlir::ValueRange{*headerView, prefixBytes, prefixLength});
   return RuntimeBundleLowerer::bundleRuntimeResults(
       op, runtimeContractType(context, "builtins.str"), call, bundle);
+}
+
+// Per-program boxed-slot release hook. The native slot dispatcher
+// (release_payload_slot_ptr in RuntimeSupportBuilder) tries this FIRST: each
+// merged contract's manifest deallocator is the single implementation of
+// decref, child releases, and the block free. The hook is generated here —
+// not in the always-loaded native library — because runtime object modules
+// are merged per contract on demand, so only the lowering knows which
+// deallocators exist (including generated source-class deallocators).
+mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHook(
+    llvm::StringRef hookName,
+    llvm::function_ref<bool(mlir::func::FuncOp)> selects,
+    mlir::TypeRange calleeResultTypes, bool shareExceptionSubclasses,
+    llvm::StringRef sourceClassMethodName) {
+  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(hookName)) {
+    // A definition already exists (idempotent); an external declaration (from a
+    // merged manifest caller) is replaced by the generated body below.
+    if (!existing.isExternal())
+      return mlir::success();
+    existing.erase();
+  }
+
+  struct HookEntry {
+    std::int64_t classId;
+    mlir::func::FuncOp callee;
+  };
+  llvm::SmallVector<HookEntry, 16> entries;
+  llvm::SmallDenseSet<std::int64_t, 16> seenIds;
+  // The callee's arguments are reconstructed uniformly from the box word
+  // layout (slot words (4+i, 9+i) hold physical value i), so every selected
+  // function must take only rank-1 memrefs and share the hook's callee result
+  // shape (no per-type special-casing).
+  auto conforms = [&](mlir::func::FuncOp function) {
+    mlir::FunctionType type = function.getFunctionType();
+    if (type.getNumResults() != calleeResultTypes.size() ||
+        type.getNumInputs() == 0 || type.getNumInputs() > 5)
+      return false;
+    for (auto [have, want] : llvm::zip(type.getResults(), calleeResultTypes))
+      if (have != want)
+        return false;
+    for (mlir::Type input : type.getInputs()) {
+      auto memref = mlir::dyn_cast<mlir::MemRefType>(input);
+      if (!memref || memref.getRank() != 1)
+        return false;
+    }
+    return true;
+  };
+  module.walk([&](mlir::func::FuncOp function) {
+    if (function.isExternal() || !selects(function))
+      return;
+    auto contractAttr = function->getAttrOfType<mlir::StringAttr>(
+        contracts::kManifestContractAttr);
+    if (!contractAttr)
+      return;
+    std::optional<std::int64_t> classId =
+        manifest.classId(contractAttr.getValue());
+    if (!classId) {
+      py::ClassOp classOp = RuntimeBundleLowerer::classForContract(
+          runtimeContractType(context, contractAttr.getValue()));
+      if (classOp)
+        classId = RuntimeBundleLowerer::runtimeClassIdForClass(classOp);
+    }
+    // Conformance decides before the id is consumed: a non-conforming
+    // candidate (e.g. bool's primitive-i1 __repr__) must not shadow a
+    // conforming boxed one for the same class.
+    if (!classId || !conforms(function) || !seenIds.insert(*classId).second)
+      return;
+    entries.push_back(HookEntry{*classId, function});
+  });
+
+  // Compiled source-class methods share the physical-value slot convention
+  // (their physicals are (self box, field views...)), so they join the same
+  // dispatch when their signature conforms.
+  if (!sourceClassMethodName.empty()) {
+    module.walk([&](py::ClassOp classOp) {
+      std::optional<std::string> symbol =
+          RuntimeBundleLowerer::classMethodSymbol(classOp,
+                                                  sourceClassMethodName);
+      if (!symbol)
+        return;
+      auto function = module.lookupSymbol<mlir::func::FuncOp>(*symbol);
+      if (!function || function.isExternal() || !conforms(function))
+        return;
+      std::optional<std::int64_t> classId =
+          RuntimeBundleLowerer::runtimeClassIdForClass(classOp);
+      if (!classId || !seenIds.insert(*classId).second)
+        return;
+      entries.push_back(HookEntry{*classId, function});
+    });
+  }
+
+  // Exception subclasses share BaseException's shape and (for release) its
+  // deallocator but carry their own class ids; without these entries a boxed
+  // subclass would miss the hook. Only used where subclasses share one callee.
+  if (shareExceptionSubclasses) {
+    mlir::func::FuncOp baseCallee;
+    for (const HookEntry &hookEntry : entries) {
+      auto contractAttr = hookEntry.callee->getAttrOfType<mlir::StringAttr>(
+          contracts::kManifestContractAttr);
+      if (contractAttr && contractAttr.getValue() == "builtins.BaseException") {
+        baseCallee = hookEntry.callee;
+        break;
+      }
+    }
+    if (baseCallee) {
+      const py::protocols::Table &table = py::protocols::Table::get(*context);
+      module.walk([&](mlir::func::FuncOp function) {
+        auto contractAttr = function->getAttrOfType<mlir::StringAttr>(
+            contracts::kManifestContractAttr);
+        auto classIdAttr = function->getAttrOfType<mlir::IntegerAttr>(
+            contracts::kManifestClassIdAttr);
+        if (!contractAttr || !classIdAttr ||
+            !seenIds.insert(classIdAttr.getInt()).second)
+          return;
+        if (!table.isManifestSubclassOf(
+                runtimeContractType(context, contractAttr.getValue()),
+                "builtins.BaseException"))
+          return;
+        entries.push_back(HookEntry{classIdAttr.getInt(), baseCallee});
+      });
+    }
+  }
+
+  mlir::OpBuilder builder(context);
+  builder.setInsertionPointToEnd(module.getBody());
+  auto ptrType = mlir::LLVM::LLVMPointerType::get(context);
+  mlir::Type i64 = builder.getI64Type();
+  mlir::Type i1 = builder.getI1Type();
+  mlir::Location loc = module.getLoc();
+  llvm::SmallVector<mlir::Type, 4> hookResultTypes(calleeResultTypes.begin(),
+                                                   calleeResultTypes.end());
+  hookResultTypes.push_back(i1);
+  auto hook = mlir::func::FuncOp::create(
+      builder, loc, hookName,
+      builder.getFunctionType({ptrType, i64}, hookResultTypes));
+
+  mlir::Block *entry = hook.addEntryBlock();
+  mlir::Value slot = entry->getArgument(0);
+  mlir::Value classValue = entry->getArgument(1);
+
+  mlir::Block *miss = hook.addBlock();
+  {
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(miss);
+    llvm::SmallVector<mlir::Value, 4> missResults;
+    for (mlir::Type resultType : calleeResultTypes)
+      missResults.push_back(
+          mlir::ub::PoisonOp::create(builder, loc, resultType, nullptr));
+    missResults.push_back(
+        mlir::arith::ConstantIntOp::create(builder, loc, 0, 1));
+    mlir::func::ReturnOp::create(builder, loc, missResults);
+  }
+
+  auto loadWord = [&](mlir::OpBuilder &b, std::int64_t index) -> mlir::Value {
+    mlir::Value gep = mlir::LLVM::GEPOp::create(
+        b, loc, ptrType, i64, slot,
+        llvm::ArrayRef<mlir::LLVM::GEPArg>{
+            mlir::LLVM::GEPArg(static_cast<std::int32_t>(index))});
+    return mlir::LLVM::LoadOp::create(b, loc, i64, gep).getResult();
+  };
+
+  mlir::Block *check = entry;
+  for (const HookEntry &hookEntry : entries) {
+    mlir::Block *handle = hook.addBlock();
+    mlir::Block *next = hook.addBlock();
+    {
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToEnd(check);
+      mlir::Value expected = mlir::arith::ConstantIntOp::create(
+          builder, loc, hookEntry.classId, 64);
+      mlir::Value matches = mlir::arith::CmpIOp::create(
+          builder, loc, mlir::arith::CmpIPredicate::eq, classValue, expected);
+      mlir::cf::CondBranchOp::create(builder, loc, matches, handle,
+                                     mlir::ValueRange{}, next,
+                                     mlir::ValueRange{});
+    }
+    {
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToStart(handle);
+      llvm::SmallVector<mlir::Value, 6> operands;
+      mlir::func::FuncOp callee = hookEntry.callee;
+      mlir::FunctionType type = callee.getFunctionType();
+      for (auto [index, input] : llvm::enumerate(type.getInputs())) {
+        auto memref = mlir::cast<mlir::MemRefType>(input);
+        mlir::Value pointerWord =
+            loadWord(builder, 4 + static_cast<std::int64_t>(index));
+        mlir::Value sizeWord =
+            loadWord(builder, 9 + static_cast<std::int64_t>(index));
+        operands.push_back(RuntimeBundleLowerer::memrefFromBoxWords(
+            builder, loc, pointerWord, sizeWord, memref));
+      }
+      mlir::func::CallOp call =
+          mlir::func::CallOp::create(builder, loc, callee, operands);
+      llvm::SmallVector<mlir::Value, 4> hitResults(call.getResults().begin(),
+                                                   call.getResults().end());
+      hitResults.push_back(
+          mlir::arith::ConstantIntOp::create(builder, loc, 1, 1));
+      mlir::func::ReturnOp::create(builder, loc, hitResults);
+    }
+    check = next;
+  }
+  {
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToEnd(check);
+    mlir::cf::BranchOp::create(builder, loc, miss);
+  }
+  return mlir::success();
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::generateBoxedReleaseHook() {
+  // Release is one instance of the uniform boxed-method dispatch: class id ->
+  // the manifest deallocator (which returns void). Exception subclasses share
+  // BaseException's deallocator.
+  return generateBoxedMethodHook(
+      "__ly_release_boxed_by_contract",
+      [](mlir::func::FuncOp function) {
+        return function->hasAttr(contracts::kManifestDeallocatorAttr);
+      },
+      /*calleeResultTypes=*/{}, /*shareExceptionSubclasses=*/true);
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::generateBoxedReprHook() {
+  // repr instance: class id -> the manifest `__repr__` (returns an owned str,
+  // as (header, bytes) memrefs). Each type carries its own __repr__, so no
+  // subclass sharing. Non-conforming __repr__ (bool's i1 receiver) are skipped
+  // by the memref-input predicate — that is a manifest-conformance gap for that
+  // type, not a special case here.
+  // Only generate the hook when a merged manifest __repr__ (a container's) has
+  // referenced it — otherwise it would be dead weight (and an unused public
+  // hook is not eliminated). Its presence as an external declaration signals
+  // the need.
+  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(
+          "__ly_repr_boxed_by_contract");
+      !existing || !existing.isExternal())
+    return mlir::success();
+  mlir::Type i64 = mlir::IntegerType::get(context, 64);
+  mlir::Type i8 = mlir::IntegerType::get(context, 8);
+  auto strHeader = mlir::MemRefType::get({2}, i64);
+  auto strBytes =
+      mlir::MemRefType::get({mlir::ShapedType::kDynamic}, i8);
+  if (mlir::failed(generateBoxedMethodHook(
+          "__ly_repr_boxed_by_contract",
+          [](mlir::func::FuncOp function) {
+            auto method = function->getAttrOfType<mlir::StringAttr>(
+                contracts::kManifestMethodAttr);
+            return method && method.getValue() == "__repr__";
+          },
+          {strHeader, strBytes}, /*shareExceptionSubclasses=*/false,
+          /*sourceClassMethodName=*/"__repr__")))
+    return mlir::failure();
+  // The hook forwards the manifest __repr__'s owned str result (header at 0).
+  if (auto hook = module.lookupSymbol<mlir::func::FuncOp>(
+          "__ly_repr_boxed_by_contract"))
+    hook->setAttr("ly.ownership.owned_results",
+                  mlir::OpBuilder(context).getI64ArrayAttr({0}));
+  return mlir::success();
 }
 
 } // namespace py::lowering

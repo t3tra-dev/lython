@@ -999,13 +999,14 @@ bool isSubtypeOfImpl(mlir::Type subtype, mlir::Type supertype,
         supertypeContract.getContractName()) {
       bool subclass =
           isContractSubclassOf(subtypeContract, supertypeContract);
-      if (!subclass && context.from) {
-        mlir::FailureOr<bool> result = type_object::isSubclassOf(
+      if (!subclass && context.from)
+        // Quiet query: this is a lattice check, not a verification site —
+        // names without py.class symbols (manifest builtins) are just not
+        // subclasses.
+        subclass = type_object::isKnownSubclassOf(
             context.from,
             manifestClassNameForContract(subtypeContract.getContractName()),
             manifestClassNameForContract(supertypeContract.getContractName()));
-        subclass = mlir::succeeded(result) && *result;
-      }
       if (!subclass)
         return false;
       return true;

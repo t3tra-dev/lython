@@ -33,14 +33,26 @@ inline constexpr llvm::StringLiteral kOwnedLocalObjectAttr{
     "ly.ownership.owned_local_object"};
 inline constexpr llvm::StringLiteral kOwnedLocalObjectContractAttr{
     "ly.ownership.owned_local_object_contract"};
-inline constexpr llvm::StringLiteral kObjectDeallocPartAttr{
-    "ly.ownership.object_dealloc_part"};
 inline constexpr llvm::StringLiteral kObjectReleaseToZeroAttr{
     "ly.ownership.object_release_to_zero"};
 inline constexpr llvm::StringLiteral kAggregateRetainAttr{
     "ly.ownership.aggregate_retain"};
 inline constexpr llvm::StringLiteral kAggregateReleaseAttr{
     "ly.ownership.aggregate_release"};
+// aggregate_retain label for the borrow-edge retains inserted at block-arg
+// merges (identity edges of replacement/mutation merges): the retain lends
+// the merge argument a token and is cancelled by the paired decref of the
+// pre-merge name (loop back-edge decref-on-replace or exit release).
+// Exceptional successor edges for the setjmp-style EH model: blocks that
+// contain `LyEH_TryCallSiteMarker(id)` may transfer control to the handler
+// entry (the true successor of the `LyEH_TryCatchAnchor(id)` cond_br). Any
+// liveness or path walk that follows only CFG successors mis-models values
+// the handler still uses after a partial try execution.
+llvm::DenseMap<mlir::Block *, llvm::SmallVector<mlir::Block *, 2>>
+collectExceptionEdges(mlir::Region &region);
+
+inline constexpr llvm::StringLiteral kBlockArgMergeBorrowLabel{
+    "block-arg-merge-borrow"};
 
 inline constexpr llvm::StringLiteral kAtomicRoleAttr{"ly.atomic.role"};
 inline constexpr llvm::StringLiteral kAtomicOrderingAttr{"ly.atomic.ordering"};
@@ -99,6 +111,11 @@ struct RuntimeDeallocator {
   mlir::func::FuncOp function;
   std::string contractName;
   llvm::SmallVector<mlir::Type, 4> inputTypes;
+  // Canonical value shape of the contract (from its ly.runtime.shape
+  // declaration when present). The release interface (inputTypes) is a
+  // prefix of this — usually just the entity root — while the remaining
+  // values are interior views whose USES still pin the entity's liveness.
+  llvm::SmallVector<mlir::Type, 4> shapeTypes;
   FunctionContract contract;
 };
 
@@ -108,6 +125,10 @@ collectRuntimeDeallocators(mlir::ModuleOp module);
 bool valueRangeMatchesTypes(mlir::ValueRange values, unsigned offset,
                             llvm::ArrayRef<mlir::Type> types);
 bool isObjectHeaderLikeType(mlir::Type type);
+// Strips identity-shaped unrealized-cast markers (owned-local-object rooting
+// and similar value-group markers keep types and arity) so SSA-identity
+// comparisons see the underlying value regardless of ownership rewrapping.
+mlir::Value underlyingObjectValue(mlir::Value value);
 const RuntimeDeallocator *
 findDeallocatorForValueGroup(mlir::ValueRange values, unsigned offset,
                              llvm::ArrayRef<RuntimeDeallocator> deallocators);
@@ -149,9 +170,51 @@ struct ResourceGroup {
   unsigned offset = 0;
   OwnershipKind ownership = OwnershipKind::Own;
   llvm::SmallVector<mlir::Value, 4> values;
+  // Interior views of the same entity (the canonical-shape tail beyond the
+  // release interface). Uses of these keep the entity live; they are not
+  // release operands.
+  llvm::SmallVector<mlir::Value, 4> views;
   const RuntimeDeallocator *deallocator = nullptr;
   std::optional<OwnershipCondition> condition;
 };
+
+class AliasAnalysis;
+
+// Owned-return ABI walking, shared by the refcount-insertion pass and the
+// affine verifier (one implementation: a divergence between the two caused
+// real bugs).
+struct OwnedReturnRange {
+  unsigned offset = 0;
+  unsigned size = 0;
+  mlir::Type type;
+};
+
+bool groupMatchesValues(mlir::ValueRange values, unsigned offset,
+                        llvm::ArrayRef<mlir::Value> group,
+                        AliasAnalysis &aliases);
+std::optional<unsigned>
+logicalReturnValueCount(mlir::ValueRange values, unsigned offset,
+                        llvm::ArrayRef<RuntimeDeallocator> deallocators,
+                        mlir::Type type);
+unsigned skipPrimitiveReturnEvidence(mlir::ValueRange values, unsigned offset,
+                                     mlir::Type type);
+std::optional<llvm::SmallVector<OwnedReturnRange, 4>>
+callableOwnedReturnRanges(mlir::func::FuncOp function, mlir::ValueRange values,
+                          llvm::ArrayRef<RuntimeDeallocator> deallocators);
+bool groupMatchesOwnedReturnRange(
+    mlir::ValueRange values, const OwnedReturnRange &range,
+    llvm::ArrayRef<mlir::Value> group,
+    llvm::ArrayRef<RuntimeDeallocator> deallocators, AliasAnalysis &aliases);
+
+// Box-word reconstructions are borrowed interior views: a memref descriptor
+// assembled from an entity's box words (memref.load -> llvm.inttoptr ->
+// llvm.insertvalue... -> unrealized cast to memref) aliases the entity's
+// storage without any direct SSA use of the entity past the load. Collect
+// those derived view values so release placement pins the entity until the
+// views' last use (a release between the load and the consuming call would
+// be a use-after-free).
+void collectBoxWordDerivedViews(llvm::ArrayRef<mlir::Value> groupValues,
+                                llvm::SmallVectorImpl<mlir::Value> &views);
 
 llvm::SmallVector<ResourceGroup, 8>
 collectRuntimeResourceGroups(mlir::ValueRange values,

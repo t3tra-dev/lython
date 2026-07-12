@@ -120,6 +120,9 @@ RuntimeBundleLowerer::lowerFunctionTargetCall(py::CallOp op,
   if (target->hasAttr("ly.async.body_result"))
     return RuntimeBundleLowerer::lowerAsyncFunctionTargetCall(
         op, target, targetName, sources);
+  if (target->hasAttr("ly.generator.body_result"))
+    return RuntimeBundleLowerer::lowerGeneratorFunctionTargetCall(
+        op, target, targetName, sources);
 
   if (RuntimeBundleLowerer::isPrimitiveI64CallableClone(target))
     return RuntimeBundleLowerer::lowerPrimitiveI64CloneCall(
@@ -147,6 +150,87 @@ RuntimeBundleLowerer::lowerFunctionTargetCall(py::CallOp op,
     return mlir::failure();
   valueBundles[op.getResult(0)] = std::move(result);
   erase.push_back(op);
+  return mlir::success();
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::lowerGeneratorFunctionTargetCall(
+    py::CallOp op, mlir::func::FuncOp target, llvm::StringRef targetName,
+    llvm::ArrayRef<const RuntimeBundle *> sources) {
+  if (op.getNumResults() != 1)
+    return op.emitError()
+           << "generator function call lowering expects one generator result";
+
+  RuntimeBundle result;
+  if (mlir::failed(RuntimeBundleLowerer::emitGeneratorFunctionTargetCallResult(
+          op.getOperation(), op.getResult(0), target, targetName, sources,
+          result)))
+    return mlir::failure();
+  valueBundles[op.getResult(0)] = std::move(result);
+  erase.push_back(op);
+  return mlir::success();
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::emitGeneratorFunctionTargetCallResult(
+    mlir::Operation *op, mlir::Value resultValue, mlir::func::FuncOp target,
+    llvm::StringRef targetName, llvm::ArrayRef<const RuntimeBundle *> sources,
+    RuntimeBundle &result) {
+  std::optional<RuntimeSymbol> initializer =
+      manifest.initializer("types.GeneratorType", "__new__");
+  if (!initializer)
+    return op->emitError()
+           << "runtime manifest has no types.GeneratorType.__new__";
+
+  mlir::FunctionType initializerType = initializer->function.getFunctionType();
+  if (initializerType.getNumInputs() != 1 ||
+      !initializerType.getInput(0).isInteger(64))
+    return initializer->function.emitError()
+           << "types.GeneratorType.__new__ must take one i64 target id";
+
+  builder.setInsertionPoint(op);
+  mlir::Value targetId =
+      mlir::arith::ConstantIntOp::create(
+          builder, op->getLoc(),
+          RuntimeBundleLowerer::functionTargetId(targetName), 64)
+          .getResult();
+  mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+      op->getLoc(), *initializer, mlir::ValueRange{targetId});
+
+  mlir::Type resultContract = resultValue.getType();
+  if (auto publicResult =
+          target->getAttrOfType<mlir::TypeAttr>("ly.generator.public_result")) {
+    mlir::Type concrete = publicResult.getValue();
+    if (resultContract != concrete &&
+        py::isAssignableTo(concrete, resultContract, op))
+      resultContract = concrete;
+  }
+
+  if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
+          op, resultContract, call, result)))
+    return mlir::failure();
+
+  result.generatorTarget = target.getSymName().str();
+  result.generatorSources.reserve(sources.size());
+  result.generatorSourceBundles.reserve(sources.size());
+  for (const RuntimeBundle *source : sources) {
+    if (!source || source->kind != RuntimeBundle::Kind::Object)
+      return op->emitError()
+             << "generator frame source for " << targetName
+             << " must be a lowered Python object bundle";
+    auto sourceEvidence = std::make_shared<RuntimeBundle>(*source);
+    if (RuntimeBundleLowerer::hasLazyPrimitiveI64Object(*source)) {
+      mlir::FailureOr<RuntimeValue> materialized =
+          RuntimeBundleLowerer::materializePrimitiveI64Object(op, *source);
+      if (mlir::failed(materialized))
+        return mlir::failure();
+      result.generatorSources.push_back(*materialized);
+      sourceEvidence->contract = materialized->contract;
+      sourceEvidence->objectValue = *materialized;
+      result.generatorSourceBundles.push_back(std::move(sourceEvidence));
+      continue;
+    }
+    result.generatorSources.push_back(source->objectValue);
+    result.generatorSourceBundles.push_back(std::move(sourceEvidence));
+  }
   return mlir::success();
 }
 
@@ -529,6 +613,22 @@ mlir::LogicalResult RuntimeBundleLowerer::bundleFunctionTargetCallResult(
             isAwaitIteratorLikeResultType(objectContract)));
     if (useStaticProtocolObject) {
       result = std::move(staticResult);
+    } else if (result.kind == RuntimeBundle::Kind::Object) {
+      bool staticAssignableToResult =
+          py::isAssignableTo(objectContract, expectedResult, op.getOperation());
+      if (!staticAssignableToResult) {
+        if (auto unionType = mlir::dyn_cast<py::UnionType>(expectedResult)) {
+          staticAssignableToResult =
+              llvm::any_of(unionType.getMemberTypes(), [&](mlir::Type member) {
+                return !py::isPyNoneType(member) &&
+                       py::isAssignableTo(objectContract, member,
+                                          op.getOperation());
+              });
+        }
+      }
+      if (staticAssignableToResult)
+        result.boxedObject =
+            std::make_shared<RuntimeBundle>(std::move(staticResult));
     }
   }
 
@@ -834,8 +934,24 @@ mlir::LogicalResult RuntimeBundleLowerer::emitSourceFunctionTargetCallResult(
           (py::isAssignableTo(objectContract, expectedResult, op) ||
            (protocol.getProtocolName() == "Generator" &&
             isAwaitIteratorLikeResultType(objectContract)));
-    if (useStaticProtocolObject)
+    if (useStaticProtocolObject) {
       result = std::move(staticResult);
+    } else if (result.kind == RuntimeBundle::Kind::Object) {
+      bool staticAssignableToResult =
+          py::isAssignableTo(objectContract, expectedResult, op);
+      if (!staticAssignableToResult) {
+        if (auto unionType = mlir::dyn_cast<py::UnionType>(expectedResult)) {
+          staticAssignableToResult =
+              llvm::any_of(unionType.getMemberTypes(), [&](mlir::Type member) {
+                return !py::isPyNoneType(member) &&
+                       py::isAssignableTo(objectContract, member, op);
+              });
+        }
+      }
+      if (staticAssignableToResult)
+        result.boxedObject =
+            std::make_shared<RuntimeBundle>(std::move(staticResult));
+    }
   }
 
   if (returnedCoroutine != returnedCoroutineSummaries.end()) {

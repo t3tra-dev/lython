@@ -37,6 +37,13 @@ bool isAwaitIteratorLikeResultType(mlir::Type type) {
   return protocol && protocol.getProtocolName() == "Generator";
 }
 
+mlir::Value integerConstant(mlir::OpBuilder &builder, mlir::Location loc,
+                            mlir::IntegerType type, std::int64_t value) {
+  return mlir::arith::ConstantOp::create(
+             builder, loc, builder.getIntegerAttr(type, value))
+      .getResult();
+}
+
 } // namespace
 
 mlir::LogicalResult RuntimeBundleLowerer::bundleRuntimeResults(
@@ -174,6 +181,15 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
     unsigned logicalResultIndex = 0;
     builder.setInsertionPoint(op);
     if (RuntimeBundleLowerer::isPrimitiveI64CallableClone(function)) {
+      auto releaseReturnedObjectIfOwned =
+          [&](const RuntimeBundle &bundle) -> mlir::LogicalResult {
+        if (bundle.kind != RuntimeBundle::Kind::Object ||
+            bundle.objectValue.ownership != ownership::OwnershipKind::Own ||
+            bundle.physicalValues().empty())
+          return mlir::success();
+        return RuntimeBundleLowerer::releaseAggregateSlot(
+            op, bundle, "primitive_i64_return");
+      };
       for (mlir::Value operand : op.getOperands()) {
         if (mlir::failed(
                 RuntimeBundleLowerer::ensureValueBundle(op, operand))) {
@@ -200,12 +216,14 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
           operands.push_back(bundle->primitiveI64->value);
           operands.push_back(bundle->primitiveI64->valid);
         } else {
-          operands.push_back(
-              mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 0, 64)
-                  .getResult());
-          operands.push_back(
-              mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 0, 1)
-                  .getResult());
+          operands.push_back(integerConstant(
+              builder, op.getLoc(), builder.getI64Type(), 0));
+          operands.push_back(integerConstant(
+              builder, op.getLoc(), builder.getI1Type(), 0));
+        }
+        if (mlir::failed(releaseReturnedObjectIfOwned(*bundle))) {
+          result = mlir::failure();
+          return mlir::WalkResult::interrupt();
         }
         resultIndex += 2;
       }
@@ -217,6 +235,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
         result = mlir::failure();
         return mlir::WalkResult::interrupt();
       }
+      // Operand bundling may lower block arguments, which rewrites (erases)
+      // predecessor terminators and dangles the saved insertion iterator:
+      // re-anchor at the return being replaced.
+      builder.setInsertionPoint(op);
       mlir::func::ReturnOp::create(builder, op.getLoc(), operands);
       op.erase();
       return mlir::WalkResult::advance();
@@ -233,11 +255,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
         operands.push_back(bundle.primitiveI64->valid);
       } else {
         operands.push_back(
-            mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 0, 64)
-                .getResult());
+            integerConstant(builder, op.getLoc(), builder.getI64Type(), 0));
         operands.push_back(
-            mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 0, 1)
-                .getResult());
+            integerConstant(builder, op.getLoc(), builder.getI1Type(), 0));
       }
       resultIndex += 2;
       return mlir::success();
@@ -359,6 +379,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
         result = mlir::failure();
         return mlir::WalkResult::interrupt();
       }
+      builder.setInsertionPoint(op);
       const RuntimeBundle *bundle = RuntimeBundleLowerer::bundleFor(operand);
       if (!bundle) {
         op.emitError() << "callable function return value has no lowered "
@@ -387,14 +408,39 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
                    py::isAssignableTo(bundle->boxedObject->objectValue.contract,
                                       objectContract, op.getOperation())) {
           staticObject = bundle->boxedObject.get();
+        } else if (const RuntimeBundle *member =
+                       bundle->unionActiveMember.get()) {
+          // Union-wrapped concrete return: the active member holds the owned
+          // token, so the owned evidence lane must alias its values. Inactive
+          // branches keep immortal dead placeholders, whose release stays a
+          // no-op in the caller.
+          if (member->kind == RuntimeBundle::Kind::Object &&
+              !py::isPyNoneType(member->objectValue.contract) &&
+              py::isAssignableTo(member->objectValue.contract, objectContract,
+                                 op.getOperation())) {
+            staticObject = member;
+          } else if (member->boxedObject &&
+                     !py::isPyNoneType(
+                         member->boxedObject->objectValue.contract) &&
+                     py::isAssignableTo(
+                         member->boxedObject->objectValue.contract,
+                         objectContract, op.getOperation())) {
+            staticObject = member->boxedObject.get();
+          }
         }
+        RuntimeBundle deadStaticObject;
         if (!staticObject) {
-          op.emitError() << "static returned object evidence for "
-                         << function.getSymName() << " expected "
-                         << objectContract << ", but return bundle carries "
-                         << bundle->contract;
-          result = mlir::failure();
-          return mlir::WalkResult::interrupt();
+          mlir::FailureOr<RuntimeValue> dead =
+              RuntimeBundleLowerer::materializeNonOwningDeadObjectValue(
+                  op.getOperation(), objectContract,
+                  "inactive static returned object evidence");
+          if (mlir::failed(dead)) {
+            result = mlir::failure();
+            return mlir::WalkResult::interrupt();
+          }
+          deadStaticObject = RuntimeBundle::objectWithOwnership(
+              objectContract, dead->values, dead->ownership);
+          staticObject = &deadStaticObject;
         }
         if (mlir::failed(appendReturnObject(*staticObject,
                                             "static returned object evidence",
@@ -497,6 +543,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
       return mlir::WalkResult::interrupt();
     }
 
+    // Same re-anchor as the primitive branch: operand bundling can rewrite
+    // predecessor terminators and dangle the saved insertion iterator.
+    builder.setInsertionPoint(op);
     mlir::func::ReturnOp::create(builder, op.getLoc(), operands);
     op.erase();
     return mlir::WalkResult::advance();
@@ -521,15 +570,116 @@ mlir::LogicalResult RuntimeBundleLowerer::eraseCallableLogicalEntryArgs() {
   return mlir::success();
 }
 
+// A py.try result lane that the program never reads leaves a py-typed
+// continuation block argument with no users; nothing registers it with the
+// logical-argument expansion, so the forwarding branch operands (often a
+// py.class.upcast emitted only for the lane) would survive to the final
+// erase check. Drop such arguments and their forwarding operands, to a
+// fixpoint (dropping a forward can make the forwarded value dead too).
+mlir::LogicalResult RuntimeBundleLowerer::dropUnusedLogicalBlockArguments() {
+  // Arguments already registered with the logical expansion are erased by
+  // eraseControlFlowLogicalBlockArguments (by saved handle) -- touching them
+  // here would double-erase.
+  llvm::SmallPtrSet<void *, 16> registered;
+  for (const ControlFlowLogicalBlockArgumentABI &abi :
+       controlFlowLogicalBlockArguments)
+    registered.insert(abi.argument.getAsOpaquePointer());
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    llvm::SmallVector<mlir::BlockArgument, 8> unused;
+    module.walk([&](mlir::func::FuncOp function) {
+      if (function.isDeclaration())
+        return;
+      for (mlir::Block &block : function.getBody()) {
+        if (block.isEntryBlock())
+          continue; // entry args follow the callable ABI machinery
+        for (mlir::BlockArgument argument : block.getArguments())
+          if (argument.use_empty() &&
+              argument.getType().getDialect().getNamespace() == "py" &&
+              !registered.contains(argument.getAsOpaquePointer()))
+            unused.push_back(argument);
+      }
+    });
+    for (mlir::BlockArgument argument : unused) {
+      mlir::Block *block = argument.getOwner();
+      if (argument.getArgNumber() >= block->getNumArguments() ||
+          block->getArgument(argument.getArgNumber()) != argument)
+        continue; // shifted by an earlier erase this round; retry next pass
+      unsigned index = argument.getArgNumber();
+      // One rewrite per predecessor terminator handles ALL its edges into
+      // the block (a dual-edge cond_br lists its predecessor twice).
+      llvm::SmallPtrSet<mlir::Operation *, 4> seen;
+      bool droppable = true;
+      llvm::SmallVector<mlir::Operation *, 4> terminators;
+      for (mlir::Block *predecessor : block->getPredecessors()) {
+        mlir::Operation *terminator = predecessor->getTerminator();
+        if (!seen.insert(terminator).second)
+          continue;
+        if (!mlir::isa<mlir::cf::BranchOp, mlir::cf::CondBranchOp>(terminator)) {
+          droppable = false;
+          break;
+        }
+        terminators.push_back(terminator);
+      }
+      if (!droppable)
+        continue;
+      for (mlir::Operation *terminator : terminators) {
+        mlir::OpBuilder rebuild(terminator);
+        if (auto branch = mlir::dyn_cast<mlir::cf::BranchOp>(terminator)) {
+          llvm::SmallVector<mlir::Value, 8> operands(
+              branch.getDestOperands().begin(), branch.getDestOperands().end());
+          operands.erase(operands.begin() + index);
+          mlir::cf::BranchOp::create(rebuild, branch.getLoc(),
+                                     branch.getDest(), operands);
+          branch.erase();
+          continue;
+        }
+        auto cond = mlir::cast<mlir::cf::CondBranchOp>(terminator);
+        llvm::SmallVector<mlir::Value, 8> trueOperands(
+            cond.getTrueDestOperands().begin(),
+            cond.getTrueDestOperands().end());
+        llvm::SmallVector<mlir::Value, 8> falseOperands(
+            cond.getFalseDestOperands().begin(),
+            cond.getFalseDestOperands().end());
+        if (cond.getTrueDest() == block)
+          trueOperands.erase(trueOperands.begin() + index);
+        if (cond.getFalseDest() == block)
+          falseOperands.erase(falseOperands.begin() + index);
+        mlir::cf::CondBranchOp::create(rebuild, cond.getLoc(),
+                                       cond.getCondition(), cond.getTrueDest(),
+                                       trueOperands, cond.getFalseDest(),
+                                       falseOperands);
+        cond.erase();
+      }
+      block->eraseArgument(index);
+      changed = true;
+    }
+  }
+  return mlir::success();
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::eraseLoweredPyOps() {
   llvm::DenseSet<mlir::Operation *> erased;
   for (mlir::Operation *op : llvm::reverse(erase)) {
     if (!erased.insert(op).second)
       continue;
-    for (mlir::Value result : op->getResults()) {
-      if (!result.use_empty())
-        return op->emitError()
-               << "lowered Py value still has non-lowered users";
+    // Class metadata (method symbols, source-class ids) feeds the boxed-method
+    // hooks generated at the end of the pass; lowerModule erases the class ops
+    // after the hooks are built.
+    if (mlir::isa<py::ClassOp>(op))
+      continue;
+    for (auto [resultIndex, result] : llvm::enumerate(op->getResults())) {
+      if (!result.use_empty()) {
+        mlir::InFlightDiagnostic diagnostic =
+            op->emitError()
+            << "lowered Py value still has non-lowered users for "
+            << op->getName() << " result #" << resultIndex << " : "
+            << result.getType();
+        for (mlir::Operation *user : result.getUsers())
+          diagnostic << " user=" << user->getName();
+        return mlir::failure();
+      }
     }
     op->erase();
   }

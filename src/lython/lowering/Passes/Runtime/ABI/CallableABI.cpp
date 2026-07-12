@@ -184,7 +184,8 @@ RuntimeBundleLowerer::runtimeValueTypesFor(mlir::Operation *op, mlir::Type type,
     for (mlir::Type fieldType :
          RuntimeBundleLowerer::classFieldContractTypes(classOp)) {
       mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> fieldTypes =
-          RuntimeBundleLowerer::runtimeValueTypesFor(op, fieldType, purpose);
+          RuntimeBundleLowerer::classFieldStorageValueTypes(op, fieldType,
+                                                            purpose);
       if (mlir::failed(fieldTypes))
         return mlir::failure();
       types.append(fieldTypes->begin(), fieldTypes->end());
@@ -378,9 +379,20 @@ bool RuntimeBundleLowerer::isPrimitiveI64CallableEligible(
     return false;
   if (runtimeContractName(callable.getResultTypes().front()) != "builtins.int")
     return false;
-  return llvm::all_of(callable.getPositionalTypes(), [](mlir::Type type) {
-    return runtimeContractName(type) == "builtins.int";
+  if (!llvm::all_of(callable.getPositionalTypes(), [](mlir::Type type) {
+        return runtimeContractName(type) == "builtins.int";
+      }))
+    return false;
+  // A return value that is a block argument comes from a control-flow merge
+  // (if/loop) and is a boxed object, which the unboxed-i64 clone return ABI
+  // cannot represent. Such functions must stay on the boxed-int path.
+  bool returnsBlockArgument = false;
+  function.walk([&](mlir::func::ReturnOp returnOp) {
+    for (mlir::Value operand : returnOp.getOperands())
+      if (mlir::isa<mlir::BlockArgument>(operand))
+        returnsBlockArgument = true;
   });
+  return !returnsBlockArgument;
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::buildPrimitiveI64CallableClones() {
@@ -574,17 +586,19 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
         RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(logicalType,
                                                               inputTypes);
       }
-      if (callable.getResultTypes().size() != 1 ||
-          runtimeContractName(callable.getResultTypes().front()) !=
-              "builtins.int") {
+      if (callable.getResultTypes().empty() ||
+          !llvm::all_of(callable.getResultTypes(), [](mlir::Type type) {
+            return runtimeContractName(type) == "builtins.int";
+          })) {
         function.emitError()
-            << "primitive i64 callable clone result must be builtins.int";
+            << "primitive i64 callable clone results must be builtins.int";
         result = mlir::failure();
         return mlir::WalkResult::interrupt();
       }
-      llvm::SmallVector<mlir::Type, 2> resultTypes;
-      RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(
-          callable.getResultTypes().front(), resultTypes);
+      llvm::SmallVector<mlir::Type, 8> resultTypes;
+      for (mlir::Type resultType : callable.getResultTypes())
+        RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(resultType,
+                                                              resultTypes);
       if (!function.isDeclaration() &&
           mlir::failed(seedPrimitiveI64CallableEntryArgumentBundles(
               function, logicalInputTypes))) {

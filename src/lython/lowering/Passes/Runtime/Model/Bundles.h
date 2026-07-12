@@ -39,6 +39,8 @@ inline constexpr llvm::StringLiteral kAsyncioSleepTimerScheduledFlag{
     "asyncio.sleep.timer_scheduled"};
 inline constexpr llvm::StringLiteral kAsyncioSleepLoopSlot{
     "asyncio.sleep.loop"};
+inline constexpr llvm::StringLiteral kCurrentExceptionBorrowFlag{
+    "exception.current.borrow"};
 
 struct RuntimeValue {
   mlir::Type contract;
@@ -168,6 +170,9 @@ struct RuntimeBundle {
   std::string coroutineTarget;
   llvm::SmallVector<RuntimeValue, 8> coroutineSources;
   llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 8> coroutineSourceBundles;
+  std::string generatorTarget;
+  llvm::SmallVector<RuntimeValue, 8> generatorSources;
+  llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 8> generatorSourceBundles;
   std::optional<RuntimePrimitiveI64Evidence> primitiveI64;
   std::optional<RuntimeBufferEvidence> buffer;
   std::optional<RuntimeCtypesEvidence> ctypes;
@@ -178,12 +183,30 @@ struct RuntimeBundle {
   llvm::SmallVector<RuntimeValue, 8> sequenceElements;
   llvm::SmallVector<std::int64_t, 8> sequenceIndices;
   std::uint64_t sequenceCapacity = 0;
+  // True when sequenceElements is COMPLETE compile-time evidence of the
+  // container's contents (literals and straight-line growth). False for
+  // runtime-mode sequences (e.g. loop-carried lists), whose length and
+  // contents are only known to the runtime.
+  bool sequenceEvidenceBacked = false;
   llvm::SmallVector<std::string, 8> mappingKeys;
   llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 8> mappingKeyBundles;
   llvm::SmallVector<RuntimeValue, 8> mappingValues;
   llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 8> mappingValueBundles;
   llvm::SmallVector<mlir::Value, 8> mappingPresent;
   std::uint64_t mappingCapacity = 0;
+  // True when the mapping evidence is COMPLETE compile-time knowledge of the
+  // dict's contents; false for runtime-mode dicts (loop-built).
+  bool mappingEvidenceBacked = false;
+  // Position cell of an evidence-backed sequence iterator (`py.iter` over a
+  // statically evidenced list). Null for every other bundle. `py.next` on a
+  // bundle carrying this cell lowers to an evidence element selection instead
+  // of a runtime `__next__` method call.
+  mlir::Value evidenceIteratorCell;
+  // The member bundle a `py.union.wrap` wrapped into this union value. Lets a
+  // union-typed return surface the concrete active object on its owned
+  // evidence lane instead of a dead placeholder. Not propagated by
+  // copyEvidenceFrom (its values are only valid where the wrap dominates).
+  std::shared_ptr<RuntimeBundle> unionActiveMember;
 
   static RuntimeBundle object(mlir::Type contract, mlir::ValueRange values);
   static RuntimeBundle

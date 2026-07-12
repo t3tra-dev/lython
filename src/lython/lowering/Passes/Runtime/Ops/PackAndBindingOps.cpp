@@ -328,6 +328,54 @@ RuntimeBundleLowerer::lowerAliasView(mlir::Operation *op, mlir::Value input,
   if (!inputBundle)
     return op->emitError()
            << "aliasing contract view input has no lowered runtime bundle";
+
+  if (inputBundle->kind == RuntimeBundle::Kind::Object &&
+      mlir::isa<py::ContractType>(resultValue.getType())) {
+    if (inputBundle->boxedObject &&
+        py::isAssignableTo(inputBundle->boxedObject->objectValue.contract,
+                           resultValue.getType(), op)) {
+      valueBundles[resultValue] = *inputBundle->boxedObject;
+      erase.push_back(op);
+      return mlir::success();
+    }
+
+    mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> expectedTypes =
+        RuntimeBundleLowerer::runtimeValueTypesFor(op, resultValue.getType(),
+                                                   "alias view ABI");
+    if (mlir::failed(expectedTypes))
+      return mlir::failure();
+    if (expectedTypes->size() <= inputBundle->physicalValues().size()) {
+      bool prefixMatches = true;
+      for (auto [index, expected] : llvm::enumerate(*expectedTypes)) {
+        if (inputBundle->physicalValues()[index].getType() == expected)
+          continue;
+        prefixMatches = false;
+        break;
+      }
+      if (prefixMatches) {
+        llvm::SmallVector<mlir::Value, 4> values;
+        values.append(inputBundle->physicalValues().begin(),
+                      inputBundle->physicalValues().begin() +
+                          expectedTypes->size());
+        RuntimeBundle result = RuntimeBundle::objectWithOwnership(
+            resultValue.getType(), values, inputBundle->objectValue.ownership);
+        result.copyEvidenceFrom(*inputBundle);
+        if (!result.boxedObject &&
+            inputBundle->objectValue.contract != resultValue.getType() &&
+            py::isAssignableTo(inputBundle->objectValue.contract,
+                               resultValue.getType(), op)) {
+          RuntimeBundle concrete = *inputBundle;
+          concrete.setObjectLogicalOwnership(/*ownsObject=*/false);
+          result.boxedObject =
+              std::make_shared<RuntimeBundle>(std::move(concrete));
+        }
+        valueBundles[resultValue] = std::move(result);
+        erase.push_back(op);
+        return mlir::success();
+      }
+    }
+  }
+
   valueBundles[resultValue] = *inputBundle;
   erase.push_back(op);
   return mlir::success();

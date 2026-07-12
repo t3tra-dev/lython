@@ -10,15 +10,40 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesNativeCall(
       callable.ctypes->kind != RuntimeCtypesEvidence::Kind::Symbol)
     return mlir::failure();
   const RuntimeCtypesEvidence &evidence = *callable.ctypes;
-  if (evidence.symbolName.empty())
-    return op.emitError() << "ctypes native call has no symbol evidence";
+  // A call target is either a named process symbol or a runtime address (a
+  // CFuncPtr built from an integer, e.g. a pre-resolved libc pointer).
+  bool callThroughAddress =
+      evidence.symbolName.empty() && evidence.addressValue &&
+      evidence.addressValid && isKnownTrue(evidence.addressValid);
+  if (evidence.symbolName.empty() && !callThroughAddress)
+    return op.emitError() << "ctypes native call has no symbol or address "
+                             "evidence";
   if (!evidence.resultType)
-    return op.emitError() << "ctypes symbol '" << evidence.symbolName
-                          << "' requires a static restype before calling";
-  if (!evidence.processLibrary || !evidence.libraryName.empty())
+    return op.emitError() << "ctypes call target requires a static restype "
+                             "before calling";
+  if (!callThroughAddress &&
+      (!evidence.processLibrary || !evidence.libraryName.empty()))
     return op.emitError()
            << "ctypes native call lowering currently supports only "
               "ctypes.CDLL(None) process symbols";
+  // The compiler itself emits declarations for the C allocator / mem
+  // primitives during LLVM lowering, so a same-named ctypes declaration would
+  // collide at link. Direct calls to these are rejected with a clear message;
+  // resolve the symbol's address (`cast(fn, c_void_p).value`) and call through
+  // it instead, or use a stack buffer.
+  if (!callThroughAddress) {
+    static constexpr llvm::StringLiteral kReserved[] = {
+        "malloc",  "calloc",  "realloc", "free",
+        "memcpy",  "memmove", "memset",  "aligned_alloc"};
+    if (llvm::is_contained(kReserved, evidence.symbolName))
+      return op.emitError()
+             << "ctypes cannot call the compiler-provided libc symbol '"
+             << evidence.symbolName
+             << "' by name (it would clash with the runtime's own "
+                "declaration); resolve its address with "
+                "ctypes.cast(fn, ctypes.c_void_p).value and call through it, "
+                "or use a stack buffer";
+  }
   if (mlir::failed(requireEmptyAggregate(op, op.getKwnames(), "kw names")) ||
       mlir::failed(requireEmptyAggregate(op, op.getKwvalues(), "kw values")))
     return mlir::failure();
@@ -30,9 +55,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesNativeCall(
                                               sources, &unpackedSources)))
     return mlir::failure();
   if (sources.size() != evidence.argTypes.size())
-    return op.emitError() << "ctypes symbol '" << evidence.symbolName
-                          << "' expects " << evidence.argTypes.size()
-                          << " arguments but got " << sources.size();
+    return op.emitError() << "ctypes call target expects "
+                          << evidence.argTypes.size() << " arguments but got "
+                          << sources.size();
 
   std::optional<TargetPlatformFacts> facts = targetPlatformFacts(module);
   if (!facts)
@@ -141,16 +166,46 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesNativeCall(
 
   mlir::FunctionType functionType =
       builder.getFunctionType(nativeArgTypes, nativeResultTypes);
-  mlir::FailureOr<mlir::func::FuncOp> declaration =
-      getOrCreateNativeDeclaration(op, module, builder, evidence.symbolName,
-                                   functionType, evidence.argTypes,
-                                   *evidence.resultType, evidence.abi,
-                                   evidence.processLibrary, *facts);
-  if (mlir::failed(declaration))
-    return mlir::failure();
   builder.setInsertionPoint(op);
-  mlir::func::CallOp call = mlir::func::CallOp::create(
-      builder, op.getLoc(), *declaration, nativeArgs);
+  mlir::Value indirectResult;
+  mlir::func::CallOp call;
+  if (callThroughAddress) {
+    // Indirect call through the target address: inttoptr + llvm.call with an
+    // explicit LLVM function type. Args are already native LLVM-compatible
+    // (iN / !llvm.ptr).
+    llvm::SmallVector<mlir::Type, 1> llvmResults;
+    if (!nativeResultTypes.empty())
+      llvmResults.push_back(nativeResultTypes.front());
+    mlir::Type llvmResult =
+        llvmResults.empty() ? mlir::Type(mlir::LLVM::LLVMVoidType::get(context))
+                            : llvmResults.front();
+    auto llvmFnType = mlir::LLVM::LLVMFunctionType::get(
+        llvmResult, nativeArgTypes, /*isVarArg=*/false);
+    mlir::Value pointer = mlir::LLVM::IntToPtrOp::create(
+        builder, op.getLoc(), nativePointerType(context),
+        evidence.addressValue);
+    llvm::SmallVector<mlir::Value, 5> operands;
+    operands.push_back(pointer);
+    operands.append(nativeArgs.begin(), nativeArgs.end());
+    auto llvmCall = mlir::LLVM::CallOp::create(builder, op.getLoc(), llvmFnType,
+                                               operands);
+    if (!nativeResultTypes.empty())
+      indirectResult = llvmCall.getResult();
+  } else {
+    mlir::FailureOr<mlir::func::FuncOp> declaration =
+        getOrCreateNativeDeclaration(op, module, builder, evidence.symbolName,
+                                     functionType, evidence.argTypes,
+                                     *evidence.resultType, evidence.abi,
+                                     evidence.processLibrary, *facts);
+    if (mlir::failed(declaration))
+      return mlir::failure();
+    builder.setInsertionPoint(op);
+    call = mlir::func::CallOp::create(builder, op.getLoc(), *declaration,
+                                      nativeArgs);
+  }
+  auto resultAt = [&](unsigned index) -> mlir::Value {
+    return callThroughAddress ? indirectResult : call.getResult(index);
+  };
 
   if (op.getNumResults() != 1)
     return op.emitError() << "ctypes native call expects one Python result";
@@ -160,7 +215,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesNativeCall(
             mlir::ValueRange{})))
       return mlir::failure();
   } else if (isIntegerScalarLayout(*resultLayout)) {
-    mlir::Value raw = call.getResult(0);
+    mlir::Value raw = resultAt(0);
     mlir::IntegerType i64 = builder.getI64Type();
     if (raw.getType() != i64) {
       if (resultLayout->kind == CtypesLayout::ABIKind::UnsignedInteger)
@@ -181,12 +236,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesNativeCall(
     RuntimeBundle result;
     if (mlir::failed(initializeObjectFromRawValues(
             op, runtimeContractType(context, "builtins.float"),
-            mlir::ValueRange{call.getResult(0)}, result)))
+            mlir::ValueRange{resultAt(0)}, result)))
       return mlir::failure();
     valueBundles[op.getResult(0)] = std::move(result);
   } else if (isPointerScalarLayout(*resultLayout)) {
     mlir::Value raw =
-        nativePointerToInteger(builder, op.getLoc(), call.getResult(0));
+        nativePointerToInteger(builder, op.getLoc(), resultAt(0));
     mlir::Value valid = constantI1(builder, op.getLoc(), true);
     RuntimeBundle result;
     if (mlir::failed(makePrimitiveI64Bundle(

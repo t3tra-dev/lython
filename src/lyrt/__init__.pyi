@@ -1,8 +1,23 @@
-from typing import Callable, Literal, TypeVar
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Generator,
+    Literal,
+    TypeVar,
+)
 
 from . import prim
 
-__all__ = ["prim", "native", "to_prim", "from_prim", "alloc", "dealloc"]
+__all__ = [
+    "prim",
+    "native",
+    "to_prim",
+    "from_prim",
+    "alloc",
+    "dealloc",
+    "ReadyIntAwaitable",
+]
 
 T = TypeVar("T")
 AllocT = TypeVar(
@@ -20,6 +35,10 @@ PrimFunc = TypeVar(
     "PrimFunc",
     bound=Callable[..., prim.Prim[prim.Int]] | Callable[..., prim.Prim[prim.Float]],
 )
+
+class ReadyIntAwaitable(Awaitable[int]):
+    def __init__(self, value: int) -> None: ...
+    def __await__(self) -> Generator[Any, Any, int]: ...
 
 def native(
     *,

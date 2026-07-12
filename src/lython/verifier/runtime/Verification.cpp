@@ -147,15 +147,6 @@ mlir::LogicalResult verifyFunctionOwnershipShape(mlir::func::FuncOp function) {
 }
 
 mlir::LogicalResult verifyOperationOwnershipShape(mlir::Operation *op) {
-  if (op->hasAttr(own::kObjectDeallocPartAttr)) {
-    if (op->getName().getStringRef() != "memref.dealloc")
-      return op->emitError() << own::kObjectDeallocPartAttr
-                             << " is only valid on memref.dealloc";
-    if (!mlir::isa<mlir::StringAttr>(op->getAttr(own::kObjectDeallocPartAttr)))
-      return op->emitError()
-             << own::kObjectDeallocPartAttr << " must be a string attribute";
-  }
-
   if (op->hasAttr(own::kOwnedLocalObjectAttr)) {
     if (op->getNumResults() == 0 ||
         !own::isObjectHeaderLikeType(op->getResult(0).getType()))

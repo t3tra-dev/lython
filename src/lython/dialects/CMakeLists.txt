@@ -13,10 +13,7 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 include_directories(${CMAKE_CURRENT_BINARY_DIR})
 
 file(GLOB LYTHON_PROTOCOL_MANIFEST_MLIR CONFIGURE_DEPENDS
-  "${CMAKE_SOURCE_DIR}/src/lython/runtime/lib/*.mlir"
-)
-list(PREPEND LYTHON_PROTOCOL_MANIFEST_MLIR
-  "${CMAKE_SOURCE_DIR}/src/lython/runtime/typing.mlir"
+  "${CMAKE_SOURCE_DIR}/src/lython/runtime/modules/*.mlir"
 )
 list(SORT LYTHON_PROTOCOL_MANIFEST_MLIR)
 

@@ -99,6 +99,39 @@ mlir::LogicalResult storePayloadHandle(mlir::Operation *op,
   return mlir::success();
 }
 
+mlir::LogicalResult storePayloadHandleAt(mlir::Operation *op,
+                                         mlir::OpBuilder &builder,
+                                         mlir::Value payload,
+                                         mlir::Value logicalIndex,
+                                         llvm::ArrayRef<mlir::Value> words,
+                                         llvm::StringRef label) {
+  if (!payload || !isI64Payload(payload))
+    return op->emitError() << label << " payload has invalid type "
+                           << (payload ? payload.getType() : mlir::Type());
+  if (words.size() != kPayloadHandleWords)
+    return op->emitError() << label << " payload handle must have "
+                           << kPayloadHandleWords << " words";
+  builder.setInsertionPoint(op);
+  mlir::Location loc = op->getLoc();
+  mlir::Value wordsPerSlot =
+      constantI64(builder, loc, static_cast<std::int64_t>(kPayloadHandleWords));
+  mlir::Value base =
+      mlir::arith::MulIOp::create(builder, loc, logicalIndex, wordsPerSlot)
+          .getResult();
+  mlir::Value baseIndex = mlir::arith::IndexCastOp::create(
+                              builder, loc, builder.getIndexType(), base)
+                              .getResult();
+  for (auto [offset, word] : llvm::enumerate(words)) {
+    mlir::Value slot =
+        mlir::arith::AddIOp::create(
+            builder, loc, baseIndex,
+            constantIndex(builder, loc, static_cast<unsigned>(offset)))
+            .getResult();
+    mlir::memref::StoreOp::create(builder, loc, word, payload, slot);
+  }
+  return mlir::success();
+}
+
 mlir::LogicalResult clearPayloadHandle(mlir::Operation *op,
                                        mlir::OpBuilder &builder,
                                        mlir::Value payload, unsigned index,
@@ -194,6 +227,23 @@ RuntimeBundleLowerer::materializePayloadObjectBundle(
     materialized.copyEvidenceFrom(*concrete);
     return materialized;
   }
+  // A contract with a `box` primitive stores its boxed form (e.g. bool: the
+  // canonical i1 boxes to an immortal singleton header) — the slot layout
+  // requires a header-fronted value group.
+  if (!concrete->physicalValues().empty() &&
+      !ownership::isObjectHeaderLikeType(
+          concrete->physicalValues().front().getType())) {
+    if (std::optional<RuntimeSymbol> box =
+            manifest.primitive(concrete->contractName(), "box")) {
+      builder.setInsertionPoint(op);
+      mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+          op->getLoc(), *box, concrete->physicalValues());
+      RuntimeBundle materialized = RuntimeBundle::object(
+          concrete->objectValue.contract, call.getResults());
+      materialized.copyEvidenceFrom(*concrete);
+      return materialized;
+    }
+  }
   if (concrete->physicalValues().empty())
     return op->emitError() << "collection payload element "
                            << concrete->contract
@@ -284,6 +334,7 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeSequencePayload(
                            << " has no physical item payload";
   container.sequenceCapacity =
       RuntimeBundleLowerer::collectionInitialCapacity(elements.size());
+  container.sequenceEvidenceBacked = true;
   for (auto [index, element] : llvm::enumerate(elements)) {
     if (!element)
       continue;
@@ -332,6 +383,23 @@ mlir::LogicalResult RuntimeBundleLowerer::storeSequencePayloadElement(
                             *words, container.contractName());
 }
 
+mlir::LogicalResult RuntimeBundleLowerer::storeSequencePayloadElementAt(
+    mlir::Operation *op, RuntimeBundle &container, mlir::Value logicalIndex,
+    const RuntimeBundle &element) {
+  if (!isSequenceCollection(container.contractName()))
+    return op->emitError() << container.contractName()
+                           << " is not a sequence collection";
+  if (container.physicalValues().size() < 3)
+    return op->emitError() << container.contractName()
+                           << " has no physical item payload";
+  mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
+      RuntimeBundleLowerer::objectPayloadHandleWords(op, element);
+  if (mlir::failed(words))
+    return mlir::failure();
+  return storePayloadHandleAt(op, builder, container.physicalValues()[2],
+                              logicalIndex, *words, container.contractName());
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::clearSequencePayloadElement(
     mlir::Operation *op, RuntimeBundle &container, unsigned index) {
   if (!isSequenceCollection(container.contractName()))
@@ -356,6 +424,7 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeDictPayload(
     return op->emitError() << "dict payload key/value count mismatch";
   container.mappingCapacity =
       RuntimeBundleLowerer::collectionInitialCapacity(keys.size());
+  container.mappingEvidenceBacked = true;
   for (auto [index, key] : llvm::enumerate(keys)) {
     if (!key || !values[index])
       return op->emitError() << "dict payload entry has no object evidence";

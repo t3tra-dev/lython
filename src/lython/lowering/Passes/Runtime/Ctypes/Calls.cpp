@@ -55,18 +55,31 @@ RuntimeBundleLowerer::lowerStaticCtypesCall(py::CallOp op,
       return op.emitError()
              << "ctypes.from_address expects one integer address";
     const RuntimeBundle *address = sources.front();
-    if (!address || !address->primitiveI64 || !address->primitiveI64->value ||
-        !address->primitiveI64->valid ||
-        !isKnownTrue(address->primitiveI64->valid))
-      return op.emitError()
-             << "ctypes.from_address requires a statically available pointer "
-                "integer address";
+    if (!address)
+      return op.emitError() << "ctypes.from_address argument has no evidence";
     std::optional<TargetPlatformFacts> facts = targetPlatformFacts(module);
     if (!facts)
       return op.emitError()
              << "ctypes.from_address requires TargetPlatformFacts before "
                 "lowering";
     builder.setInsertionPoint(op);
+    // The address may be a runtime integer (a pointer produced at runtime,
+    // e.g. from malloc or a signal handler's siginfo): unbox a boxed int if
+    // there is no in-SSA primitive value.
+    mlir::Value addressInt;
+    if (address->primitiveI64 && address->primitiveI64->value) {
+      addressInt = address->primitiveI64->value;
+    } else {
+      std::optional<RuntimeSymbol> unbox =
+          manifest.primitive(address->contractName(), "unbox.i64");
+      if (!unbox ||
+          unbox->function.getNumArguments() != address->physicalValues().size())
+        return op.emitError()
+               << "ctypes.from_address requires an integer address";
+      mlir::func::CallOp unboxCall =
+          createRuntimeCall(op.getLoc(), *unbox, address->physicalValues());
+      addressInt = unboxCall.getResult(0);
+    }
     RuntimeBundle result = RuntimeBundle::object(op.getResult(0).getType(), {});
     RuntimeCtypesEvidence evidence;
     evidence.kind = RuntimeCtypesEvidence::Kind::Cell;
@@ -74,9 +87,9 @@ RuntimeBundleLowerer::lowerStaticCtypesCall(py::CallOp op,
     evidence.lifetime = RuntimeCtypesEvidence::Lifetime::External;
     evidence.ctypeName = target->str();
     evidence.ctype = ctypesContractType(context, *target);
-    evidence.addressValue =
-        coerceNativeInteger(builder, op.getLoc(), address->primitiveI64->value,
-                            nativePointerIntegerType(builder, facts));
+    evidence.addressValue = coerceNativeInteger(
+        builder, op.getLoc(), addressInt,
+        nativePointerIntegerType(builder, facts));
     evidence.addressValid = constantI1(builder, op.getLoc(), true);
     evidence.storageAddressValue = evidence.addressValue;
     evidence.storageAddressValid = evidence.addressValid;
@@ -340,8 +353,38 @@ RuntimeBundleLowerer::lowerStaticCtypesCall(py::CallOp op,
       return op.emitError()
              << "ctypes.cast requires TargetPlatformFacts before lowering";
     builder.setInsertionPoint(op);
-    std::optional<mlir::Value> address =
-        extractPointerAddressInteger(op, builder, *source, facts);
+    std::optional<mlir::Value> address;
+    // Casting a NAMED function pointer (e.g. `libc["write"]`) to a pointer
+    // type yields its runtime function address: materialize a declaration for
+    // the symbol and take addressof + ptrtoint. This is how install-time code
+    // captures a libc function pointer as an int for later call-through.
+    if (source->ctypes &&
+        source->ctypes->kind == RuntimeCtypesEvidence::Kind::Symbol &&
+        !source->ctypes->symbolName.empty()) {
+      // The symbol's address only exists at the LLVM layer, so emit an address
+      // PLACEHOLDER (`() -> i64` declaration carrying ly.symbol_address =
+      // "name") + a call to it; phase 13c fills it with addressof+ptrtoint
+      // over the linked symbol (same mechanism as callback thunks).
+      std::string placeholder =
+          "__ly_symbol_address_" + source->ctypes->symbolName;
+      if (!module.lookupSymbol<mlir::func::FuncOp>(placeholder)) {
+        mlir::OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPointToEnd(module.getBody());
+        auto fn = mlir::func::FuncOp::create(
+            builder, op.getLoc(), placeholder,
+            builder.getFunctionType({}, {builder.getI64Type()}));
+        fn.setPrivate();
+        fn->setAttr("ly.symbol_address",
+                    builder.getStringAttr(source->ctypes->symbolName));
+      }
+      builder.setInsertionPoint(op);
+      auto call = mlir::func::CallOp::create(
+          builder, op.getLoc(), placeholder,
+          mlir::TypeRange{builder.getI64Type()}, mlir::ValueRange{});
+      address = call.getResult(0);
+    } else {
+      address = extractPointerAddressInteger(op, builder, *source, facts);
+    }
     if (!address)
       return op.emitError()
              << "ctypes.cast source requires None, primitive pointer integer, "
@@ -370,6 +413,51 @@ RuntimeBundleLowerer::lowerStaticCtypesCall(py::CallOp op,
                             << " is not a supported pointer-like ctypes type";
     }
 
+    result.ctypes = std::move(evidence);
+    valueBundles[op.getResult(0)] = std::move(result);
+    erase.push_back(op);
+    return mlir::success();
+  }
+
+  if (callable.binding == "ctypes.CFUNCTYPE") {
+    // CFUNCTYPE(restype, *argtypes): a function-pointer TYPE factory. The
+    // result is a CFuncPtr type object carrying the native signature as
+    // evidence; instantiating it with a source function builds the C-ABI
+    // callback thunk (lowerCtypesCallbackConstruction).
+    if (op.getNumResults() != 1 || sources.empty())
+      return op.emitError()
+             << "ctypes.CFUNCTYPE expects a restype and argtypes";
+    RuntimeCtypesEvidence evidence;
+    evidence.kind = RuntimeCtypesEvidence::Kind::Cell;
+    evidence.provenance = RuntimeCtypesEvidence::Provenance::CallbackThunk;
+    evidence.lifetime = RuntimeCtypesEvidence::Lifetime::Static;
+    evidence.ctypeName = "_ctypes.CFuncPtr";
+    evidence.ctype = ctypesContractType(context, "_ctypes.CFuncPtr");
+    if (!sources.front())
+      return op.emitError() << "ctypes.CFUNCTYPE restype has no evidence";
+    if (isNoneBundle(*sources.front())) {
+      // A void callback: restype None -> a native call with no result.
+      evidence.resultType = "types.NoneType";
+    } else {
+      std::string restypeName = ctypesContractFromBundle(*sources.front());
+      if (restypeName.empty())
+        return op.emitError()
+               << "ctypes.CFUNCTYPE restype must be a ctypes type or None";
+      evidence.resultType = restypeName;
+    }
+    for (const RuntimeBundle *argument :
+         llvm::ArrayRef<const RuntimeBundle *>(sources).drop_front()) {
+      if (!argument)
+        return op.emitError() << "ctypes.CFUNCTYPE argtype has no evidence";
+      std::string argName = ctypesContractFromBundle(*argument);
+      if (argName.empty())
+        return op.emitError()
+               << "ctypes.CFUNCTYPE argtypes must be ctypes types";
+      evidence.argTypes.push_back(argName);
+    }
+    RuntimeBundle result = RuntimeBundle::object(op.getResult(0).getType(), {});
+    result.kind = RuntimeBundle::Kind::TypeObject;
+    result.instanceContract = evidence.ctype;
     result.ctypes = std::move(evidence);
     valueBundles[op.getResult(0)] = std::move(result);
     erase.push_back(op);

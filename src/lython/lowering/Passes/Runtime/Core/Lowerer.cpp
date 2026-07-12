@@ -27,7 +27,11 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerModule() {
     return mlir::failure();
   if (mlir::failed(buildReturnedStaticObjectSummaries()))
     return mlir::failure();
+  if (mlir::failed(buildGeneratorResumeCloneSignatures()))
+    return mlir::failure();
   if (mlir::failed(prepareCallableFunctionABIs()))
+    return mlir::failure();
+  if (mlir::failed(buildGeneratorResumeBodies()))
     return mlir::failure();
   if (mlir::failed(synthesizeSourceClassDeallocators()))
     return mlir::failure();
@@ -38,6 +42,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerModule() {
   module.walk([&](mlir::Operation *op) {
     if (!op->getDialect() || op->getDialect()->getNamespace() != "py")
       return;
+    if (auto function = op->getParentOfType<mlir::func::FuncOp>())
+      if (function->hasAttr("ly.generator.body_result"))
+        return;
     if (RuntimeBundleLowerer::isCallableProtocolTemplate(
             op->getParentOfType<mlir::func::FuncOp>()))
       return;
@@ -48,20 +55,54 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerModule() {
       continue;
     if (mlir::failed(ensureOperationOperandBundles(op)))
       return mlir::failure();
+    if (llvm::is_contained(erase, op))
+      continue;
     if (mlir::failed(lowerPyOp(op)))
       return mlir::failure();
   }
+  if (mlir::failed(eraseSourceGeneratorBodyFunctions()))
+    return mlir::failure();
   if (mlir::failed(lowerFunctionReturns()))
     return mlir::failure();
   if (mlir::failed(eraseCallableProtocolTemplateFunctions()))
     return mlir::failure();
   if (mlir::failed(dropControlFlowLogicalBranchOperands()))
     return mlir::failure();
+  if (mlir::failed(dropUnusedLogicalBlockArguments()))
+    return mlir::failure();
   if (mlir::failed(eraseLoweredPyOps()))
     return mlir::failure();
   if (mlir::failed(eraseControlFlowLogicalBlockArguments()))
     return mlir::failure();
-  return RuntimeBundleLowerer::eraseCallableLogicalEntryArgs();
+  if (mlir::failed(RuntimeBundleLowerer::eraseCallableLogicalEntryArgs()))
+    return mlir::failure();
+  if (mlir::failed(RuntimeBundleLowerer::generateBoxedReprHook()))
+    return mlir::failure();
+  if (mlir::failed(RuntimeBundleLowerer::generateBoxedReleaseHook()))
+    return mlir::failure();
+  // Class ops survive eraseLoweredPyOps so the hooks above can resolve
+  // source-class ids and method symbols; drop them now that dispatch is built.
+  llvm::SmallVector<py::ClassOp, 8> classOps;
+  module.walk([&](py::ClassOp classOp) { classOps.push_back(classOp); });
+  for (py::ClassOp classOp : classOps)
+    classOp->erase();
+  return mlir::success();
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::eraseSourceGeneratorBodyFunctions() {
+  llvm::SmallVector<mlir::func::FuncOp, 8> generators;
+  module.walk([&](mlir::func::FuncOp function) {
+    if (function->hasAttr("ly.generator.body_result"))
+      generators.push_back(function);
+  });
+  for (mlir::func::FuncOp function : generators) {
+    llvm::erase_if(callableLogicalEntryArgCounts,
+                   [&](CallableLogicalEntryArgs entryArgs) {
+                     return entryArgs.function == function;
+                   });
+    function.erase();
+  }
+  return mlir::success();
 }
 
 mlir::LogicalResult

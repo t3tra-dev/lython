@@ -202,11 +202,12 @@ mlir::LogicalResult RuntimeBundleLowerer::retainAggregateSlot(
       auto ifOp =
           mlir::scf::IfOp::create(builder, op->getLoc(), mlir::TypeRange{},
                                   active, /*withElseRegion=*/false);
+      // Zero-result scf.if auto-inserts its scf.yield terminator; adding
+      // another would leave a mid-block yield.
       builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
       if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
               op, member, values.slice(offset, size), slotName, depth + 1)))
         return mlir::failure();
-      mlir::scf::YieldOp::create(builder, op->getLoc());
       builder.setInsertionPointAfter(ifOp);
       offset += size;
     }
@@ -275,12 +276,13 @@ mlir::LogicalResult RuntimeBundleLowerer::releaseAggregateSlot(
       auto ifOp =
           mlir::scf::IfOp::create(builder, op->getLoc(), mlir::TypeRange{},
                                   active, /*withElseRegion=*/false);
+      // Zero-result scf.if auto-inserts its scf.yield terminator; adding
+      // another would leave a mid-block yield.
       builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
       if (mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
               op, member, values.slice(offset, size), slotName, deallocators,
               depth + 1)))
         return mlir::failure();
-      mlir::scf::YieldOp::create(builder, op->getLoc());
       builder.setInsertionPointAfter(ifOp);
       offset += size;
     }
@@ -293,15 +295,17 @@ mlir::LogicalResult RuntimeBundleLowerer::releaseAggregateSlot(
   std::string contract = runtimeContractName(slotType);
   const own::RuntimeDeallocator *deallocator =
       own::findDeallocatorForValueGroup(values, 0, deallocators, contract);
-  if (!deallocator || deallocator->inputTypes.size() != values.size()) {
+  if (!deallocator || (deallocator->inputTypes.size() != values.size() &&
+                       deallocator->shapeTypes.size() != values.size())) {
     if (RuntimeBundleLowerer::classForContract(slotType))
       return op->emitError() << "aggregate slot release for " << slotType
                              << " has no matching runtime deallocator";
     return mlir::success();
   }
 
-  auto call = mlir::func::CallOp::create(builder, op->getLoc(),
-                                         deallocator->function, values);
+  auto call = mlir::func::CallOp::create(
+      builder, op->getLoc(), deallocator->function,
+      values.take_front(deallocator->inputTypes.size()));
   call->setAttr(own::kAggregateReleaseAttr,
                 builder.getStringAttr(markerName(slotType, slotName)));
   return mlir::success();

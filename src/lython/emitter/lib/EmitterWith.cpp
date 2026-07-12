@@ -13,18 +13,28 @@ void ModuleEmitter::emitWith(const parser::Node &statement, bool async) {
   if (const auto *items = ast::nodeList(statement, "items")) {
     for (const parser::NodePtr &item : *items) {
       Value contextValue = emitExpr(ast::node(*item, "context_expr"));
-      CallInferenceResult enterInference = types.inferMethodCallWithEvidence(
-          contextValue.type, async ? "__aenter__" : "__enter__", {});
-      mlir::Type enterType =
-          enterInference ? enterInference.resultType : types.object();
       Value entered;
       if (async) {
-        auto enter =
-            py::AEnterOp::create(builder, loc(*item), enterType, "__aenter__",
-                                 callProtocolFor(enterInference),
-                                 contextValue.value, mlir::UnitAttr());
-        entered = emitAwaitValue(*item, Value{enter.getResult(), enterType});
+        AsyncContextMethodInferenceResult enterInference =
+            types.inferAsyncContextEnterWithEvidence(contextValue.type);
+        if (!requireStaticEvidence(*item, enterInference))
+          return;
+        auto enter = py::AEnterOp::create(
+            builder, loc(*item), enterInference.awaitableType, "__aenter__",
+            callProtocolFor(enterInference.method), contextValue.value,
+            mlir::UnitAttr());
+        entered =
+            emitAwaitValue(*item,
+                           Value{enter.getResult(),
+                                 enterInference.awaitableType},
+                           enterInference.awaitResult);
       } else {
+        CallInferenceResult enterInference =
+            types.inferMethodCallWithEvidence(contextValue.type, "__enter__",
+                                              {});
+        if (!requireStaticEvidence(*item, enterInference))
+          return;
+        mlir::Type enterType = enterInference.resultType;
         auto enter =
             py::EnterOp::create(builder, loc(*item), enterType, "__enter__",
                                 callProtocolFor(enterInference),
@@ -51,20 +61,25 @@ void ModuleEmitter::emitWithCleanup(const parser::Node &anchor,
   auto noneOp = py::NoneOp::create(builder, loc(anchor), types.none());
   Value none{noneOp.getResult(), types.none()};
   if (cleanup.async) {
-    CallInferenceResult exitInference = types.inferMethodCallWithEvidence(
-        cleanup.manager.type, "__aexit__", {none.type, none.type, none.type});
-    mlir::Type exitType =
-        exitInference ? exitInference.resultType : types.object();
-    auto exit = py::AExitOp::create(builder, loc(anchor), exitType, "__aexit__",
-                                    callProtocolFor(exitInference),
-                                    cleanup.manager.value, none.value,
-                                    none.value, none.value, mlir::UnitAttr());
-    (void)emitAwaitValue(anchor, Value{exit.getResult(), exitType});
+    AsyncContextMethodInferenceResult exitInference =
+        types.inferAsyncContextExitWithEvidence(
+            cleanup.manager.type, {none.type, none.type, none.type});
+    if (!requireStaticEvidence(anchor, exitInference))
+      return;
+    auto exit = py::AExitOp::create(
+        builder, loc(anchor), exitInference.awaitableType, "__aexit__",
+        callProtocolFor(exitInference.method), cleanup.manager.value,
+        none.value, none.value, none.value, mlir::UnitAttr());
+    (void)emitAwaitValue(anchor,
+                         Value{exit.getResult(), exitInference.awaitableType},
+                         exitInference.awaitResult);
     return;
   }
 
   CallInferenceResult exitInference = types.inferMethodCallWithEvidence(
       cleanup.manager.type, "__exit__", {none.type, none.type, none.type});
+  if (!requireStaticEvidence(anchor, exitInference))
+    return;
   py::ExitOp::create(builder, loc(anchor), types.boolType(), "__exit__",
                      callProtocolFor(exitInference), cleanup.manager.value,
                      none.value, none.value, none.value, mlir::UnitAttr());

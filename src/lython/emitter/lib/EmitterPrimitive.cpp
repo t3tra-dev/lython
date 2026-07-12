@@ -509,8 +509,26 @@ ModuleEmitter::emitPrimitiveRuntimeCall(const parser::Node &expr,
       operands.reserve(children.size());
       for (Value child : children)
         operands.push_back(child.value);
-      mlir::Type elementType =
-          children.empty() ? types.object() : children.front().type;
+      mlir::Type elementType;
+      if (!children.empty()) {
+        elementType = children.front().type;
+      } else {
+        // A zero-length primitive dimension materializes no child, but the
+        // element type is still statically known from the tensor shape.
+        // Reconstruct the list[...] of the remaining sub-shape from the
+        // primitive scalar instead of erasing to an observable `object` top,
+        // so even the empty container carries precise static evidence.
+        auto subTensor = mlir::RankedTensorType::get(
+            tensorType.getShape().drop_front(depth + 1),
+            tensorType.getElementType());
+        elementType = primitivePythonResultType(subTensor, types);
+        if (!elementType) {
+          diagnostics.push_back(parser::Diagnostic{
+              parser::Severity::Error, expr.range.start,
+              "lyrt.from_prim tensor element type is not supported"});
+          return emitNone(expr);
+        }
+      }
       mlir::Type resultType = types.listOf(elementType);
       auto pack = py::PackOp::create(builder, loc(expr), resultType, operands);
       return Value{pack.getResult(), resultType};

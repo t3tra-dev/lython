@@ -67,6 +67,18 @@ mlir::LogicalResult RuntimeBundleLowerer::appendUnionRuntimeValues(
   if (source.kind != RuntimeBundle::Kind::Object)
     return op->emitError() << "union source must be an object bundle";
 
+  const RuntimeBundle *sourceBundle = &source;
+  RuntimeBundle materializedSource;
+  if (RuntimeBundleLowerer::hasLazyPrimitiveI64Object(source)) {
+    mlir::FailureOr<RuntimeBundle> materialized =
+        RuntimeBundleLowerer::materializeObjectBundleForStorage(
+            op, source, sourceType, "union source");
+    if (mlir::failed(materialized))
+      return mlir::failure();
+    materializedSource = std::move(*materialized);
+    sourceBundle = &materializedSource;
+  }
+
   auto sourceUnion = mlir::dyn_cast<py::UnionType>(sourceType);
   auto appendDeadMember = [&](mlir::Type member) -> mlir::LogicalResult {
     mlir::FailureOr<RuntimeValue> value =
@@ -100,15 +112,15 @@ mlir::LogicalResult RuntimeBundleLowerer::appendUnionRuntimeValues(
             op, sourceUnionType, sourceIndex, "source union member ABI");
     if (mlir::failed(offset))
       return mlir::failure();
-    appendValueSlice(source.physicalValues(), *offset,
+    appendValueSlice(sourceBundle->physicalValues(), *offset,
                      static_cast<unsigned>(sourceTypes->size()), values);
     return mlir::success();
   };
 
   if (sourceUnion) {
-    if (source.physicalValues().empty())
+    if (sourceBundle->physicalValues().empty())
       return op->emitError() << "source union has no runtime tag";
-    mlir::Value sourceTag = source.physicalValues().front();
+    mlir::Value sourceTag = sourceBundle->physicalValues().front();
     mlir::Value remappedTag =
         mlir::arith::ConstantIntOp::create(builder, op->getLoc(), 0, 64)
             .getResult();
@@ -172,12 +184,12 @@ mlir::LogicalResult RuntimeBundleLowerer::appendUnionRuntimeValues(
                                                      "union member ABI");
       if (mlir::failed(resultTypes))
         return mlir::failure();
-      if (source.physicalValues().size() != resultTypes->size())
+      if (sourceBundle->physicalValues().size() != resultTypes->size())
         return op->emitError()
-               << "union source has " << source.physicalValues().size()
+               << "union source has " << sourceBundle->physicalValues().size()
                << " physical values, but member ABI expects "
                << resultTypes->size();
-      appendValueSlice(source.physicalValues(), 0,
+      appendValueSlice(sourceBundle->physicalValues(), 0,
                        static_cast<unsigned>(resultTypes->size()), values);
     }
   }
@@ -204,6 +216,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerUnionWrap(py::UnionWrapOp op) {
           op, op.getResult().getType(), values, result)))
     return mlir::failure();
   result.copyEvidenceFrom(*input);
+  if (input->kind == RuntimeBundle::Kind::Object &&
+      !mlir::isa<py::UnionType>(op.getInput().getType()))
+    result.unionActiveMember = std::make_shared<RuntimeBundle>(*input);
   valueBundles[op.getResult()] = std::move(result);
   erase.push_back(op);
   return mlir::success();

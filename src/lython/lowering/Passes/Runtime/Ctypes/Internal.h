@@ -62,11 +62,15 @@ struct CtypesArrayType {
 using TargetPlatformFacts = py::native::TargetPlatformFacts;
 
 llvm::StringRef stripCtypesModule(llvm::StringRef contract);
-std::optional<std::string> ctypesModuleAttrContract(llvm::StringRef moduleName,
+std::optional<std::string> ctypesModuleAttrContract(mlir::MLIRContext &context,
+                                                    llvm::StringRef moduleName,
                                                     llvm::StringRef attr);
-std::optional<std::string> ctypesBareNameContract(llvm::StringRef name);
-std::optional<std::string> ctypesQualifiedNameContract(llvm::StringRef name);
-bool isStaticCtypesFunctionName(llvm::StringRef name);
+std::optional<std::string> ctypesBareNameContract(mlir::MLIRContext &context,
+                                                  llvm::StringRef name);
+std::optional<std::string>
+ctypesQualifiedNameContract(mlir::MLIRContext &context, llvm::StringRef name);
+bool isStaticCtypesFunctionName(mlir::MLIRContext &context,
+                                llvm::StringRef name);
 mlir::Type ctypesContractType(mlir::MLIRContext *context,
                               llvm::StringRef contract);
 RuntimeBundle makeCtypesModuleBundle(mlir::Type resultType,

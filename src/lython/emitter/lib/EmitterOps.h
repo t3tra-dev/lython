@@ -12,6 +12,8 @@ Value ModuleEmitter::emitBinarySpecial(const parser::Node &anchor,
                                        Value rhs, mlir::Type resultType) {
   CallInferenceResult inference =
       types.inferMethodCallWithEvidence(lhs.type, method, {rhs.type});
+  if (!requireStaticEvidence(anchor, inference))
+    return emitNone(anchor);
   if (inference)
     resultType = inference.resultType;
   auto op = Op::create(builder, loc(anchor), resultType,
@@ -26,6 +28,8 @@ Value ModuleEmitter::emitUnarySpecial(const parser::Node &anchor,
                                       mlir::Type resultType) {
   CallInferenceResult inference =
       types.inferMethodCallWithEvidence(input.type, method, {});
+  if (!requireStaticEvidence(anchor, inference))
+    return emitNone(anchor);
   if (inference)
     resultType = inference.resultType;
   auto op = Op::create(builder, loc(anchor), resultType,

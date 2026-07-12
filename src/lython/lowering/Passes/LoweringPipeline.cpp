@@ -1,3 +1,8 @@
+// Layer 3 of the transformation stack (see docs/lowering-architecture.md):
+// the global lowering stages and their order. Per-op lowerings live in
+// RuntimeBundleLowerer (layers 1-2, Passes/Runtime/); target-selected
+// schedules ship as transform-dialect strategies in the module manifests
+// (layer 4, applied at phase 8b).
 #include "Common/LoweringPipeline.h"
 
 #include "Common/Instrumentation.h"
@@ -5,10 +10,12 @@
 #include "Common/RuntimeSupport.h"
 #include "Passes/Runtime/Arch/Arm/PrimitiveTensorArmSME.h"
 #include "Passes/Runtime/Cleanup/Transforms.h"
+#include "Passes/Runtime/Ctypes/CallbackThunks.h"
 #include "runtime/Verification.h"
 
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
+#include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
 #include "mlir/Conversion/ConvertToLLVM/ToLLVMPass.h"
 #include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
@@ -174,6 +181,15 @@ LogicalResult runLoweringPipeline(ModuleOp module,
   }
   dumpMLIRForPass(irDump, "runtime-objects", module);
 
+  // Phase 8b: interpret manifest-declared lowering strategies (transform
+  // dialect) against the user module.
+  {
+    PerfScope perf("lowering.lowering-strategies");
+    if (failed(runtime_library::applyEmbeddedLoweringStrategies(module)))
+      return failure();
+  }
+  dumpMLIRForPass(irDump, "lowering-strategies", module);
+
   if (options.auditRuntimeManifest && options.enableVerifiers) {
     if (failed(runVerifierPhase(
             "runtime-manifest-completeness", [&](PassManager &pm) {
@@ -227,11 +243,12 @@ LogicalResult runLoweringPipeline(ModuleOp module,
   if (failed(requireNoAsyncDialectOps(module)))
     return failure();
 
-  // Phase 12: remove artifacts from runtime embedding and lowering.
+  // Phase 12: remove artifacts from runtime embedding and lowering. Symbol
+  // DCE runs AFTER the ownership verifiers (phase 13): manifest contract
+  // witnesses (e.g. ly.runtime.shape declarations) must outlive verification.
   if (failed(runPhase("post-lowering-cleanup", [&](PassManager &pm) {
         pm.addPass(mlir::createCanonicalizerPass());
         pm.addPass(mlir::createCSEPass());
-        pm.addPass(mlir::createSymbolDCEPass());
       })))
     return failure();
   {
@@ -253,6 +270,13 @@ LogicalResult runLoweringPipeline(ModuleOp module,
       })))
     return failure();
   dumpMLIRForPass(irDump, "thread-safety-verifier", module);
+
+  // Contract witnesses are no longer needed once verification is done.
+  if (failed(runPhase("post-verifier-symbol-dce", [&](PassManager &pm) {
+        pm.addPass(mlir::createSymbolDCEPass());
+      })))
+    return failure();
+  dumpMLIRForPass(irDump, "post-verifier-symbol-dce", module);
 
   // Phase 14: final lowering to LLVM dialect.
   {
@@ -283,6 +307,7 @@ LogicalResult runLoweringPipeline(ModuleOp module,
           if (tensorTarget.usesArmSME())
             lowering::arch::arm::addSMEPostControlFlowLLVMPrepPipeline(pm);
           pm.addPass(mlir::createArithToLLVMConversionPass());
+          pm.addPass(mlir::createUBToLLVMConversionPass());
           pm.addPass(mlir::createConvertControlFlowToLLVMPass());
           pm.addPass(mlir::createConvertToLLVMPass());
           pm.addPass(mlir::createReconcileUnrealizedCastsPass());
@@ -302,6 +327,17 @@ LogicalResult runLoweringPipeline(ModuleOp module,
     }
   }
   dumpMLIRForPass(irDump, "convert-to-llvm", module);
+
+  // Phase 13c: materialize ctypes callback thunks -- function addresses only
+  // exist at the LLVM layer (see Ctypes/CallbackThunks.h).
+  {
+    PerfScope perf("lowering.callback-thunks");
+    if (failed(lowering::ctypes::materializeCallbackThunks(module)))
+      return failure();
+    if (failed(lowering::ctypes::materializeSymbolAddresses(module)))
+      return failure();
+  }
+  dumpMLIRForPass(irDump, "callback-thunks", module);
 
   // Phase 14: re-check contracts after final conversion rewrites.
   if (failed(runVerifierPhase("final-native-verifier", [&](PassManager &pm) {

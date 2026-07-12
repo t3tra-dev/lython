@@ -276,6 +276,15 @@ extractNativePointerArgument(mlir::Operation *op, mlir::OpBuilder &builder,
       isKnownTrue(source.ctypes->scalarValid))
     return integerToNativePointer(builder, op->getLoc(),
                                   source.ctypes->scalarValue, facts);
+  // A callback thunk address (CFuncPtr built by CFUNCTYPE(...)(f)) passes as
+  // any pointer-typed foreign argument.
+  if (source.ctypes &&
+      source.ctypes->provenance ==
+          RuntimeCtypesEvidence::Provenance::CallbackThunk &&
+      source.ctypes->scalarValue && source.ctypes->scalarValid &&
+      isKnownTrue(source.ctypes->scalarValid))
+    return integerToNativePointer(builder, op->getLoc(),
+                                  source.ctypes->scalarValue, facts);
   if (source.primitiveI64 && source.primitiveI64->value &&
       source.primitiveI64->valid && isKnownTrue(source.primitiveI64->valid))
     return integerToNativePointer(builder, op->getLoc(),
@@ -289,6 +298,28 @@ extractPointerAddressInteger(mlir::Operation *op, mlir::OpBuilder &builder,
                              const std::optional<TargetPlatformFacts> &facts) {
   if (isNoneBundle(source))
     return constantI64(builder, op->getLoc(), 0);
+  // A callback thunk / call-through address CFuncPtr holds its function
+  // address as scalar evidence; casting it to a pointer yields that address.
+  if (source.ctypes &&
+      (source.ctypes->provenance ==
+           RuntimeCtypesEvidence::Provenance::CallbackThunk ||
+       source.ctypes->provenance ==
+           RuntimeCtypesEvidence::Provenance::ExternalAddress) &&
+      source.ctypes->scalarValue && source.ctypes->scalarValid &&
+      isKnownTrue(source.ctypes->scalarValid))
+    return coerceNativeInteger(builder, op->getLoc(),
+                               source.ctypes->scalarValue,
+                               nativePointerIntegerType(builder, facts));
+  if (source.ctypes &&
+      (source.ctypes->provenance ==
+           RuntimeCtypesEvidence::Provenance::CallbackThunk ||
+       source.ctypes->provenance ==
+           RuntimeCtypesEvidence::Provenance::ExternalAddress) &&
+      source.ctypes->addressValue && source.ctypes->addressValid &&
+      isKnownTrue(source.ctypes->addressValid))
+    return coerceNativeInteger(builder, op->getLoc(),
+                               source.ctypes->addressValue,
+                               nativePointerIntegerType(builder, facts));
   if (source.ctypes &&
       source.ctypes->kind == RuntimeCtypesEvidence::Kind::Cell &&
       isCtypesVoidPointer(source.ctypes->ctypeName) &&

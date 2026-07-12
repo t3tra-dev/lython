@@ -28,6 +28,22 @@ bool isPrimitiveOnlyCallable(py::CallableType callable) {
          isPrimitive(callable.getResultTypes().front());
 }
 
+bool isSourceDefinedContract(mlir::Type type) {
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
+  if (!contract)
+    return false;
+  llvm::StringRef name = contract.getContractName();
+  return !name.contains('.') && !name.starts_with("$");
+}
+
+bool isAssignableWithStaticEvidence(mlir::Type actual, mlir::Type expected,
+                                    mlir::Operation *from) {
+  if (from && isSourceDefinedContract(actual) &&
+      isSourceDefinedContract(expected))
+    return py::isAssignableTo(actual, expected, from);
+  return py::isAssignableTo(actual, expected);
+}
+
 mlir::ArrayAttr stringArray(mlir::Builder &builder,
                             llvm::ArrayRef<std::string> values) {
   llvm::SmallVector<mlir::Attribute, 8> attrs;
@@ -172,41 +188,19 @@ std::string methodKind(const parser::Node &function) {
   return "instance";
 }
 
-mlir::Type elementType(mlir::Type type, AlgorithmM &types) {
-  if (auto contract = mlir::dyn_cast_or_null<py::ContractType>(type)) {
-    if (contract.getContractName() == "builtins.str")
-      return types.strType();
-    if (!contract.getArguments().empty())
-      return contract.getArguments().front();
-  }
-  if (auto literal = mlir::dyn_cast_or_null<py::LiteralType>(type)) {
-    llvm::StringRef spelling = literal.getSpelling();
-    if (spelling.starts_with("\"") && spelling.ends_with("\""))
-      return types.strType();
-  }
-  if (auto protocol = mlir::dyn_cast_or_null<py::ProtocolType>(type)) {
-    if (!protocol.getArguments().empty())
-      return protocol.getArguments().front();
-  }
-  return types.object();
-}
-
-void appendStarredArgumentTypes(mlir::Type type, AlgorithmM &types,
+bool appendStarredArgumentTypes(mlir::Type type, AlgorithmM &types,
                                 llvm::SmallVectorImpl<mlir::Type> &out) {
   type = types.widenLiteral(type);
   if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(type)) {
     if (contract.getContractName() == "builtins.tuple") {
       llvm::ArrayRef<mlir::Type> arguments = contract.getArguments();
-      if (arguments.empty())
-        out.push_back(types.object());
-      else if (arguments.size() == 1)
-        out.push_back(arguments.front());
-      else
-        out.append(arguments.begin(), arguments.end());
-      return;
+      if (arguments.size() <= 1)
+        return false;
+      out.append(arguments.begin(), arguments.end());
+      return true;
     }
   }
-  out.push_back(types.object());
+  return false;
 }
 
 bool isTopLevelDecl(const parser::Node &node) {
@@ -331,24 +325,59 @@ bool insertionBlockTerminated(const mlir::OpBuilder &builder) {
   return previous->hasTrait<mlir::OpTrait::IsTerminator>();
 }
 
-bool containsReturnStatement(const std::vector<parser::NodePtr> *statements) {
+bool containsStatementKind(const std::vector<parser::NodePtr> *statements,
+                           llvm::ArrayRef<llvm::StringRef> kinds) {
   if (!statements)
     return false;
   for (const parser::NodePtr &statement : *statements) {
     if (!statement)
       continue;
-    if (statement->kind == "Return")
+    if (llvm::is_contained(kinds, llvm::StringRef(statement->kind)))
       return true;
     if (statement->kind == "FunctionDef" ||
         statement->kind == "AsyncFunctionDef" || statement->kind == "ClassDef")
       continue;
-    if (containsReturnStatement(ast::nodeList(*statement, "body")) ||
-        containsReturnStatement(ast::nodeList(*statement, "orelse")) ||
-        containsReturnStatement(ast::nodeList(*statement, "finalbody")))
+    if (containsStatementKind(ast::nodeList(*statement, "body"), kinds) ||
+        containsStatementKind(ast::nodeList(*statement, "orelse"), kinds) ||
+        containsStatementKind(ast::nodeList(*statement, "finalbody"), kinds))
       return true;
     if (const auto *handlers = ast::nodeList(*statement, "handlers"))
       for (const parser::NodePtr &handler : *handlers)
-        if (handler && containsReturnStatement(ast::nodeList(*handler, "body")))
+        if (handler &&
+            containsStatementKind(ast::nodeList(*handler, "body"), kinds))
+          return true;
+  }
+  return false;
+}
+
+bool containsReturnStatement(const std::vector<parser::NodePtr> *statements) {
+  llvm::StringRef kinds[] = {"Return"};
+  return containsStatementKind(statements, kinds);
+}
+
+bool containsBreakOrContinueStatement(
+    const std::vector<parser::NodePtr> *statements) {
+  if (!statements)
+    return false;
+  for (const parser::NodePtr &statement : *statements) {
+    if (!statement)
+      continue;
+    if (statement->kind == "Break" || statement->kind == "Continue")
+      return true;
+    if (statement->kind == "FunctionDef" ||
+        statement->kind == "AsyncFunctionDef" ||
+        statement->kind == "ClassDef" || statement->kind == "For" ||
+        statement->kind == "AsyncFor" || statement->kind == "While")
+      continue;
+    if (containsBreakOrContinueStatement(ast::nodeList(*statement, "body")) ||
+        containsBreakOrContinueStatement(ast::nodeList(*statement, "orelse")) ||
+        containsBreakOrContinueStatement(
+            ast::nodeList(*statement, "finalbody")))
+      return true;
+    if (const auto *handlers = ast::nodeList(*statement, "handlers"))
+      for (const parser::NodePtr &handler : *handlers)
+        if (handler &&
+            containsBreakOrContinueStatement(ast::nodeList(*handler, "body")))
           return true;
   }
   return false;
@@ -429,6 +458,153 @@ mlir::Type removeNoneFromType(mlir::Type type, AlgorithmM &types) {
   return sawNone ? types.join(payloads) : mlir::Type{};
 }
 
+std::optional<mlir::Type> isinstanceTargetType(const parser::Node *node,
+                                               AlgorithmM &types) {
+  if (!node)
+    return std::nullopt;
+  mlir::Type inferred = types.inferExpr(node);
+  auto typeObject = mlir::dyn_cast_if_present<py::TypeType>(inferred);
+  if (!typeObject)
+    return std::nullopt;
+  mlir::Type instance = types.widenLiteral(typeObject.getInstanceType());
+  if (!instance || !mlir::isa<py::ContractType>(instance))
+    return std::nullopt;
+  return instance;
+}
+
+IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
+                                     mlir::Type targetType, AlgorithmM &types,
+                                     mlir::Operation *from) {
+  IsInstanceAnalysis analysis;
+  analysis.sourceType = types.widenLiteral(sourceType);
+  analysis.targetType = types.widenLiteral(targetType);
+  if (!analysis.sourceType || !analysis.targetType ||
+      !mlir::isa<py::ContractType>(analysis.targetType)) {
+    analysis.failureReason =
+        "isinstance requires a statically resolved class target";
+    return analysis;
+  }
+
+  auto setAlwaysTrue = [&]() {
+    analysis.kind = IsInstanceAnalysis::Kind::AlwaysTrue;
+    analysis.trueType = analysis.sourceType;
+  };
+  auto setAlwaysFalse = [&]() {
+    analysis.kind = IsInstanceAnalysis::Kind::AlwaysFalse;
+    analysis.falseType = analysis.sourceType;
+  };
+
+  if (isAssignableWithStaticEvidence(analysis.sourceType, analysis.targetType,
+                                     from)) {
+    setAlwaysTrue();
+    return analysis;
+  }
+
+  if (auto unionType = mlir::dyn_cast<py::UnionType>(analysis.sourceType)) {
+    llvm::SmallVector<mlir::Type, 4> remaining;
+    llvm::SmallVector<mlir::Type, 2> runtimeClassTestMembers;
+    bool sawUnsupportedMember = false;
+    for (mlir::Type rawMember : unionType.getMemberTypes()) {
+      mlir::Type member = types.widenLiteral(rawMember);
+      if (isAssignableWithStaticEvidence(member, analysis.targetType, from)) {
+        analysis.unionMembers.push_back(rawMember);
+      } else if (containsObjectTop(member, types)) {
+        sawUnsupportedMember = true;
+      } else if (isAssignableWithStaticEvidence(analysis.targetType, member,
+                                                from)) {
+        runtimeClassTestMembers.push_back(rawMember);
+      } else {
+        remaining.push_back(rawMember);
+      }
+    }
+
+    if (analysis.unionMembers.size() == unionType.getMemberTypes().size()) {
+      setAlwaysTrue();
+      return analysis;
+    }
+    if (analysis.unionMembers.empty()) {
+      if (!sawUnsupportedMember && runtimeClassTestMembers.size() == 1) {
+        analysis.kind = IsInstanceAnalysis::Kind::UnionClassTest;
+        analysis.unionMembers.push_back(runtimeClassTestMembers.front());
+        analysis.trueType = analysis.targetType;
+        return analysis;
+      }
+      if (sawUnsupportedMember || !runtimeClassTestMembers.empty()) {
+        analysis.failureReason =
+            "isinstance over this union would require an unsupported dynamic "
+            "class test inside a union member";
+        return analysis;
+      }
+      setAlwaysFalse();
+      return analysis;
+    }
+
+    analysis.kind = IsInstanceAnalysis::Kind::UnionTest;
+    if (analysis.unionMembers.size() == 1)
+      analysis.trueType = analysis.unionMembers.front();
+    if (remaining.size() == 1 && !sawUnsupportedMember)
+      analysis.falseType = remaining.front();
+    if (!runtimeClassTestMembers.empty()) {
+      analysis.kind = IsInstanceAnalysis::Kind::Unsupported;
+      analysis.failureReason =
+          "isinstance cannot yet combine exact union member tests with dynamic "
+          "class tests";
+    }
+    return analysis;
+  }
+
+  if (containsObjectTop(analysis.sourceType, types)) {
+    analysis.failureReason =
+        "isinstance on an object-typed value requires dynamic object "
+        "inspection, which is excluded from the static evidence kernel";
+    return analysis;
+  }
+
+  if (mlir::isa<py::ContractType>(analysis.sourceType) &&
+      isAssignableWithStaticEvidence(analysis.targetType, analysis.sourceType,
+                                     from)) {
+    analysis.kind = IsInstanceAnalysis::Kind::ClassTest;
+    analysis.trueType = analysis.targetType;
+    return analysis;
+  }
+
+  setAlwaysFalse();
+  return analysis;
+}
+
+struct IsInstanceBranchAnalysis {
+  std::string name;
+  IsInstanceAnalysis analysis;
+};
+
+static std::optional<IsInstanceBranchAnalysis>
+optionalIsInstanceBranchAnalysis(const parser::Node &test, AlgorithmM &types,
+                                 mlir::Operation *from) {
+  if (test.kind != "Call")
+    return std::nullopt;
+  const parser::Node *callee = ast::node(test, "func");
+  if (!callee || callee->kind != "Name" ||
+      ast::nameSpelling(*callee) != "isinstance")
+    return std::nullopt;
+  const auto *keywords = ast::nodeList(test, "keywords");
+  if (keywords && !keywords->empty())
+    return std::nullopt;
+  const auto *args = ast::nodeList(test, "args");
+  if (!args || args->size() != 2 || !args->front() ||
+      args->front()->kind != "Name")
+    return std::nullopt;
+
+  llvm::StringRef name = ast::nameSpelling(*args->front());
+  std::optional<mlir::Type> sourceType = types.lookupSymbol(name);
+  std::optional<mlir::Type> targetType =
+      isinstanceTargetType((*args)[1].get(), types);
+  if (!sourceType || !targetType)
+    return std::nullopt;
+
+  return IsInstanceBranchAnalysis{
+      name.str(), analyzeIsInstance(*sourceType, *targetType, types, from)};
+}
+
 const parser::Node *nameComparedWithNone(const parser::Node *left,
                                          const parser::Node *right) {
   if (!left || !right)
@@ -472,6 +648,126 @@ optionalNoneComparison(const parser::Node &test, AlgorithmM &types) {
   if (!payloadType)
     return std::nullopt;
   return NoneComparisonNarrowing{spelling.str(), trueBranchIsNone, payloadType};
+}
+
+std::optional<BranchTypeNarrowing>
+optionalBranchTypeNarrowing(const parser::Node &test, AlgorithmM &types,
+                            mlir::Operation *from) {
+  if (test.kind == "UnaryOp") {
+    const parser::Node *op = ast::node(test, "op");
+    if (!ast::isOperator(op, "Not"))
+      return std::nullopt;
+    const parser::Node *operand = ast::node(test, "operand");
+    if (!operand)
+      return std::nullopt;
+    std::optional<BranchTypeNarrowing> inner =
+        optionalBranchTypeNarrowing(*operand, types, from);
+    if (!inner)
+      return std::nullopt;
+    std::swap(inner->trueType, inner->falseType);
+    std::swap(inner->trueSourceType, inner->falseSourceType);
+    return inner;
+  }
+
+  if (std::optional<NoneComparisonNarrowing> none =
+          optionalNoneComparison(test, types)) {
+    BranchTypeNarrowing narrowing;
+    narrowing.name = none->name;
+    narrowing.trueType =
+        none->trueBranchIsNone ? types.none() : none->payloadType;
+    narrowing.falseType =
+        none->trueBranchIsNone ? none->payloadType : types.none();
+    return narrowing;
+  }
+
+  std::optional<IsInstanceBranchAnalysis> analyzed =
+      optionalIsInstanceBranchAnalysis(test, types, from);
+  if (!analyzed)
+    return std::nullopt;
+
+  const IsInstanceAnalysis &analysis = analyzed->analysis;
+  if (analysis.kind == IsInstanceAnalysis::Kind::Unsupported)
+    return std::nullopt;
+
+  BranchTypeNarrowing narrowing;
+  narrowing.name = analyzed->name;
+  narrowing.trueType = analysis.trueType;
+  narrowing.falseType = analysis.falseType;
+  if (analysis.kind == IsInstanceAnalysis::Kind::UnionClassTest &&
+      analysis.unionMembers.size() == 1)
+    narrowing.trueSourceType = analysis.unionMembers.front();
+  if (!narrowing.trueType && !narrowing.falseType)
+    return std::nullopt;
+  return narrowing;
+}
+
+std::optional<bool> optionalStaticBranchTruth(const parser::Node &test,
+                                              AlgorithmM &types,
+                                              mlir::Operation *from) {
+  if (test.kind == "Constant") {
+    if (std::optional<bool> value = ast::boolean(test, "value"))
+      return *value;
+  }
+
+  if (test.kind == "UnaryOp") {
+    const parser::Node *op = ast::node(test, "op");
+    if (!ast::isOperator(op, "Not"))
+      return std::nullopt;
+    const parser::Node *operand = ast::node(test, "operand");
+    if (!operand)
+      return std::nullopt;
+    if (std::optional<bool> value =
+            optionalStaticBranchTruth(*operand, types, from))
+      return !*value;
+    return std::nullopt;
+  }
+
+  // `<string literal> == <string literal>` (and !=) folds statically: the
+  // platform constants (sys.platform, os.name, platform.system()) type as
+  // string literals, so this is the compile-time platform switch idiom --
+  // runtime lib modules rely on it so foreign platforms' libc symbols
+  // never reach the artifact.
+  if (test.kind == "Compare") {
+    const auto *comparators = ast::nodeList(test, "comparators");
+    const auto *ops = ast::nodeList(test, "ops");
+    if (comparators && comparators->size() == 1 && ops && ops->size() == 1) {
+      const parser::Node *op = ops->front().get();
+      bool isEq = ast::isOperator(op, "Eq");
+      bool isNe = ast::isOperator(op, "NotEq");
+      if (isEq || isNe) {
+        auto stringLiteralSpelling =
+            [&](const parser::Node *node) -> std::optional<std::string> {
+          if (!node)
+            return std::nullopt;
+          auto literal = mlir::dyn_cast_if_present<py::LiteralType>(
+              types.inferExpr(node));
+          if (!literal)
+            return std::nullopt;
+          llvm::StringRef spelling = literal.getSpelling();
+          if (spelling.size() >= 2 && spelling.front() == '"' &&
+              spelling.back() == '"')
+            return spelling.str();
+          return std::nullopt;
+        };
+        std::optional<std::string> left =
+            stringLiteralSpelling(ast::node(test, "left"));
+        std::optional<std::string> right =
+            stringLiteralSpelling(comparators->front().get());
+        if (left && right)
+          return isEq ? (*left == *right) : (*left != *right);
+      }
+    }
+  }
+
+  std::optional<IsInstanceBranchAnalysis> analyzed =
+      optionalIsInstanceBranchAnalysis(test, types, from);
+  if (!analyzed)
+    return std::nullopt;
+  if (analyzed->analysis.kind == IsInstanceAnalysis::Kind::AlwaysTrue)
+    return true;
+  if (analyzed->analysis.kind == IsInstanceAnalysis::Kind::AlwaysFalse)
+    return false;
+  return std::nullopt;
 }
 
 mlir::Type widenInferredLiterals(mlir::Type type, const AlgorithmM &types) {

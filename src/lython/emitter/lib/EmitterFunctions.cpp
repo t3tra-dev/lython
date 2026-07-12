@@ -9,19 +9,77 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/Twine.h"
 
 namespace lython::emitter {
+namespace {
+
+bool diagnoseUnsupportedGeneratorFunction(parser::Diagnostics &diagnostics,
+                                          const parser::Node &function,
+                                          const FunctionSignature &sig) {
+  bool unsupported = false;
+  if (sig.generatorAnnotationIncompatible) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, function.range.start,
+        "generator function return annotation is incompatible with inferred "
+        "Generator or AsyncGenerator contract"});
+    unsupported = true;
+  }
+  for (const std::string &reason : sig.generatorAnalysisFailures) {
+    diagnostics.push_back(parser::Diagnostic{parser::Severity::Error,
+                                             function.range.start, reason});
+    unsupported = true;
+  }
+  if (sig.asyncGeneratorReturnsValue) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, function.range.start,
+        "async generator functions cannot return a value"});
+    unsupported = true;
+  }
+  if (sig.isAsyncGeneratorFunction) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, function.range.start,
+        "async generator function lowering is not implemented yet"});
+    unsupported = true;
+  }
+  return unsupported;
+}
+
+bool diagnoseUnsupportedFunctionSignature(parser::Diagnostics &diagnostics,
+                                          const parser::Node &function,
+                                          const FunctionSignature &sig) {
+  bool unsupported =
+      diagnoseUnsupportedGeneratorFunction(diagnostics, function, sig);
+  for (const std::string &name : sig.missingParameterAnnotations) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, function.range.start,
+        "function parameter '" + name + "' requires an annotation"});
+    unsupported = true;
+  }
+  for (const std::string &message : sig.invalidParameterAnnotations) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, function.range.start, message});
+    unsupported = true;
+  }
+  for (const std::string &reason : sig.bodyInferenceFailures) {
+    diagnostics.push_back(parser::Diagnostic{parser::Severity::Error,
+                                             function.range.start, reason});
+    unsupported = true;
+  }
+  return unsupported;
+}
+
+} // namespace
 
 void ModuleEmitter::emitFunctionDecl(const parser::Node &function) {
   auto name = ast::string(function, "name");
   if (!name)
     return;
   FunctionSignature sig = types.functionSignature(function);
-  emitCallableFunction(function, *name, sig, {}, /*isLambda=*/false);
-  FunctionSignature publicSig =
-      function.kind == "AsyncFunctionDef" ? asyncPublicSignature(sig) : sig;
-  types.bindSymbol(*name, publicSig.callable);
+  if (!diagnoseUnsupportedFunctionSignature(diagnostics, function, sig))
+    emitCallableFunction(function, *name, sig, {}, /*isLambda=*/false);
+  types.bindSymbol(*name, sig.publicCallable);
 }
 
 void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
@@ -31,6 +89,9 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
                                          bool isLambda,
                                          unsigned positionalNodeOffset,
                                          mlir::Type preboundTypeObject) {
+  if (diagnoseUnsupportedFunctionSignature(diagnostics, callable, sig))
+    return;
+
   mlir::OpBuilder::InsertionGuard guard(builder);
   builder.setInsertionPointToEnd(module.getBody());
 
@@ -60,6 +121,12 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
                 callableDefaultValues(builder, callable, sig));
   if (callable.kind == "AsyncFunctionDef")
     func->setAttr("ly.async.body_result", mlir::TypeAttr::get(sig.resultType));
+  if (sig.isGeneratorFunction)
+    func->setAttr("ly.generator.body_result",
+                  mlir::TypeAttr::get(sig.generatorReturnType));
+  if (sig.isGeneratorFunction)
+    func->setAttr("ly.generator.public_result",
+                  mlir::TypeAttr::get(sig.inferredGeneratorType));
   if (!captures.empty()) {
     llvm::SmallVector<std::string, 4> captureNames;
     llvm::SmallVector<mlir::Type, 4> captureTypes;
@@ -72,11 +139,24 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
   }
 
   ScopedCallableEmission emissionScope(values, currentReturnType,
-                                       currentFunctionPrefix, types);
+                                       currentFunctionPrefix,
+                                       currentGeneratorSendType, types);
 
   mlir::Block *entry = func.addEntryBlock();
   values.clear();
+  llvm::StringSet<> savedGlobalDecls = std::move(currentGlobalDecls);
+  currentGlobalDecls.clear();
+  bool savedModuleScope = atModuleScope;
+  atModuleScope = false;
+  auto restoreGlobalScope = llvm::make_scope_exit([&] {
+    currentGlobalDecls = std::move(savedGlobalDecls);
+    atModuleScope = savedModuleScope;
+  });
   currentReturnType = sig.resultType;
+  currentGeneratorSendType =
+      sig.isGeneratorFunction || sig.isAsyncGeneratorFunction
+          ? sig.generatorSendType
+          : mlir::Type();
   currentFunctionPrefix = symbolName.str();
   types.bindSymbol(symbolName, sig.callable);
   std::optional<std::string> preboundTypeObjectName;
@@ -195,8 +275,6 @@ Value ModuleEmitter::emitNestedFunctionDecl(const parser::Node &function) {
   }
 
   FunctionSignature sig = types.functionSignature(function);
-  FunctionSignature publicSig =
-      function.kind == "AsyncFunctionDef" ? asyncPublicSignature(sig) : sig;
   std::string symbolName =
       (llvm::Twine(currentFunctionPrefix.empty() ? "__main__"
                                                  : currentFunctionPrefix) +
@@ -205,8 +283,10 @@ Value ModuleEmitter::emitNestedFunctionDecl(const parser::Node &function) {
        llvm::Twine(function.range.start.line) + "_" +
        llvm::Twine(function.range.start.column))
           .str();
+  if (diagnoseUnsupportedGeneratorFunction(diagnostics, function, sig))
+    return emitNone(function);
   emitCallableFunction(function, symbolName, sig, captures, /*isLambda=*/false);
-  return emitFunctionObject(function, symbolName, publicSig.callable, captures);
+  return emitFunctionObject(function, symbolName, sig.publicCallable, captures);
 }
 
 Value ModuleEmitter::emitLambda(const parser::Node &expr,

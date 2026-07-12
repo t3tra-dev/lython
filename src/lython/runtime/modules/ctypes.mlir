@@ -12,7 +12,110 @@
 // as static proof/evidence terms (`ly.ctypes.*`) so erased ctypes values can
 // lower to native cells, pointers, and calls without allocating Python objects.
 
-module attributes {ly.typing.module = "ctypes"} {
+module attributes {
+  ly.typing.module = "ctypes",
+  ly.typing.class_exports = [
+    "ctypes.CDLL=ctypes.CDLL",
+    "ctypes.WinDLL=ctypes.WinDLL",
+    "ctypes.OleDLL=ctypes.OleDLL",
+    "ctypes.PyDLL=ctypes.PyDLL",
+    "ctypes.LibraryLoader=ctypes.LibraryLoader",
+    "ctypes.ArgumentError=ctypes.ArgumentError",
+    "ctypes.Structure=_ctypes.Structure",
+    "ctypes.Union=_ctypes.Union",
+    "ctypes.Array=_ctypes.Array",
+    "ctypes._CData=_ctypes._CData",
+    "ctypes._SimpleCData=_ctypes._SimpleCData",
+    "ctypes._Pointer=_ctypes._Pointer",
+    "ctypes._CArgObject=_ctypes._CArgObject",
+    "ctypes.CFuncPtr=_ctypes.CFuncPtr",
+    "ctypes.CField=_ctypes.CField",
+    "ctypes.py_object=ctypes.py_object",
+    "ctypes.c_bool=ctypes.c_bool",
+    "ctypes.c_byte=ctypes.c_byte",
+    "ctypes.c_ubyte=ctypes.c_ubyte",
+    "ctypes.c_short=ctypes.c_short",
+    "ctypes.c_ushort=ctypes.c_ushort",
+    "ctypes.c_int=ctypes.c_int",
+    "ctypes.c_uint=ctypes.c_uint",
+    "ctypes.c_long=ctypes.c_long",
+    "ctypes.c_ulong=ctypes.c_ulong",
+    "ctypes.c_longlong=ctypes.c_longlong",
+    "ctypes.c_ulonglong=ctypes.c_ulonglong",
+    "ctypes.c_int8=ctypes.c_int8",
+    "ctypes.c_uint8=ctypes.c_uint8",
+    "ctypes.c_int16=ctypes.c_int16",
+    "ctypes.c_uint16=ctypes.c_uint16",
+    "ctypes.c_int32=ctypes.c_int32",
+    "ctypes.c_uint32=ctypes.c_uint32",
+    "ctypes.c_int64=ctypes.c_int64",
+    "ctypes.c_uint64=ctypes.c_uint64",
+    "ctypes.c_ssize_t=ctypes.c_ssize_t",
+    "ctypes.c_size_t=ctypes.c_size_t",
+    "ctypes.c_float=ctypes.c_float",
+    "ctypes.c_double=ctypes.c_double",
+    "ctypes.c_longdouble=ctypes.c_longdouble",
+    "ctypes.c_char=ctypes.c_char",
+    "ctypes.c_wchar=ctypes.c_wchar",
+    "ctypes.c_void_p=ctypes.c_void_p",
+    "ctypes.c_voidp=ctypes.c_void_p",
+    "ctypes.c_char_p=ctypes.c_char_p",
+    "ctypes.c_wchar_p=ctypes.c_wchar_p",
+    "ctypes.HRESULT=ctypes.HRESULT",
+    "ctypes.c_time_t=ctypes.c_time_t",
+    "_ctypes._CData=_ctypes._CData",
+    "_ctypes._CanCastTo=_ctypes._CanCastTo",
+    "_ctypes._PointerLike=_ctypes._PointerLike",
+    "_ctypes._CArgObject=_ctypes._CArgObject",
+    "_ctypes._SimpleCData=_ctypes._SimpleCData",
+    "_ctypes._Pointer=_ctypes._Pointer",
+    "_ctypes.Array=_ctypes.Array",
+    "_ctypes.CFuncPtr=_ctypes.CFuncPtr",
+    "_ctypes.CField=_ctypes.CField",
+    "_ctypes.Structure=_ctypes.Structure",
+    "_ctypes.Union=_ctypes.Union",
+    "ctypes.wintypes.DWORD=ctypes.c_ulong",
+    "ctypes.wintypes.WORD=ctypes.c_ushort",
+    "ctypes.wintypes.BYTE=ctypes.c_ubyte",
+    "ctypes.wintypes.BOOL=ctypes.c_long",
+    "ctypes.wintypes.HANDLE=ctypes.c_void_p",
+    "ctypes.wintypes.LPVOID=ctypes.c_void_p",
+    "ctypes.wintypes.LPCVOID=ctypes.c_void_p"
+  ],
+  ly.typing.callable_exports = [
+    "ctypes.sizeof",
+    "ctypes.alignment",
+    "ctypes.byref",
+    "ctypes.pointer",
+    "ctypes.POINTER",
+    "ctypes.cast",
+    "ctypes.addressof",
+    "ctypes.CFUNCTYPE"
+  ],
+  // Manifest Callable contracts for ctypes free functions. These replace the
+  // C++ ctypesStaticCallableFactory signatures so imported ctypes callables are
+  // typed from the manifest. Names not listed here still fall back to the C++
+  // factory (byref/pointer/POINTER/cast remain generic function objects).
+  ly.typing.function_names = [
+    "ctypes.sizeof",
+    "ctypes.alignment",
+    "ctypes.addressof",
+    "ctypes.byref",
+    "ctypes.CFUNCTYPE",
+    "ctypes.cast"
+  ],
+  ly.typing.function_contracts = [
+    !py.callable<[!py.union<!py.contract<"_ctypes._CData">, !py.type<!py.contract<"_ctypes._CData">>>], arg_names = ["obj"], arg_defaults = [false], returns = [!py.contract<"builtins.int">]>,
+    !py.callable<[!py.union<!py.contract<"_ctypes._CData">, !py.type<!py.contract<"_ctypes._CData">>>], arg_names = ["obj"], arg_defaults = [false], returns = [!py.contract<"builtins.int">]>,
+    !py.callable<[!py.contract<"_ctypes._CData">], arg_names = ["obj"], arg_defaults = [false], returns = [!py.contract<"builtins.int">]>,
+    !py.callable<[!py.contract<"typing.Any">], arg_names = ["obj"], arg_defaults = [false], returns = [!py.contract<"_ctypes._CArgObject">]>,
+    !py.overload<[
+      !py.callable<[!py.type<!py.typevar<"R">>], vararg = !py.contract<"builtins.tuple", [!py.contract<"typing.Any">]>, arg_names = ["restype"], arg_defaults = [false], returns = [!py.type<!py.contract<"_ctypes.CFuncPtr", [!py.typevar<"R">]>>]>,
+      !py.callable<[!py.literal<None>], vararg = !py.contract<"builtins.tuple", [!py.contract<"typing.Any">]>, arg_names = ["restype"], arg_defaults = [false], returns = [!py.type<!py.contract<"_ctypes.CFuncPtr", [!py.literal<None>]>>]>
+    ]>,
+    !py.callable<[!py.contract<"typing.Any">, !py.type<!py.typevar<"T">>], arg_names = ["obj", "typ"], arg_defaults = [false, false], returns = [!py.typevar<"T">]>
+  ]
+} {
   py.class @ReadableBuffer attributes {
     base_names = ["object"],
     ly.typing.abstract,
@@ -26,7 +129,7 @@ module attributes {ly.typing.module = "ctypes"} {
   } {}
 
   py.class @_CData attributes {
-    base_names = ["object", "WriteableBuffer"],
+    base_names = ["WriteableBuffer"],
     ly.typing.abstract,
     ly.ctypes.proof_root,
     field_names = ["_b_base_", "_b_needsfree_", "_objects"],
@@ -132,18 +235,26 @@ module attributes {ly.typing.module = "ctypes"} {
     base_names = ["_PointerLike", "_CData"],
     ly.typing.base_args = [[], []],
     ly.ctypes.kind = "function_pointer",
+    // T = the Python type calls of this pointer return. `fn.restype = c_X`
+    // refines it via field_param_bindings ("field:param:via_base"): the
+    // assigned scalar's `_SimpleCData[V]` base argument becomes T, so
+    // `__call__` (returning $T below) types concretely instead of Any.
+    ly.typing.params = ["T"],
+    ly.typing.param_defaults = [!py.contract<"typing.Any">],
+    ly.typing.field_param_bindings = ["restype:T:_SimpleCData"],
     field_names = ["restype", "argtypes", "errcheck"],
     field_contract_types = [
       !py.union<!py.type<!py.contract<"_ctypes._CData">>, !py.protocol<"Callable", [!py.contract<"builtins.int">] -> [!py.contract<"typing.Any">]>, !py.literal<None>>,
       !py.protocol<"Sequence", [!py.type<!py.contract<"_ctypes._CData">>]>,
       !py.contract<"typing.Any">
     ],
-    method_names = ["__call__", "__bool__"],
+    method_names = ["__init__", "__call__", "__bool__"],
     method_contracts = [
-      !py.protocol<"Callable", [!py.contract<"_ctypes.CFuncPtr">, !py.paramspec<"P">] -> [!py.contract<"typing.Any">]>,
+      !py.protocol<"Callable", [!py.contract<"_ctypes.CFuncPtr">, !py.contract<"typing.Any">] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"_ctypes.CFuncPtr">, !py.paramspec<"P">] -> [!py.contract<"$T">]>,
       !py.protocol<"Callable", [!py.contract<"_ctypes.CFuncPtr">] -> [!py.contract<"builtins.bool">]>
     ],
-    method_kinds = ["instance", "instance"]
+    method_kinds = ["instance", "instance", "instance"]
   } {}
 
   py.class @CField attributes {
@@ -177,6 +288,11 @@ module attributes {ly.typing.module = "ctypes"} {
 
   py.class @Structure attributes {
     base_names = ["_CData"], ly.ctypes.kind = "struct",
+    // Subclasses declare their layout via a `_fields_` class assignment;
+    // each field READS/WRITES as the ctype's Python value type (the
+    // `_SimpleCData[V]` base argument). "attr:via_base" -- the emitter's
+    // generic aggregate-fields rule consumes this.
+    ly.typing.fields_spec = "_fields_:_SimpleCData",
     field_names = ["_fields_", "_pack_", "_anonymous_", "_align_", "_layout_"],
     field_contract_types = [
       !py.protocol<"Sequence", [!py.contract<"builtins.tuple">]>,
@@ -196,6 +312,7 @@ module attributes {ly.typing.module = "ctypes"} {
 
   py.class @Union attributes {
     base_names = ["_CData"], ly.ctypes.kind = "union",
+    ly.typing.fields_spec = "_fields_:_SimpleCData",
     field_names = ["_fields_", "_pack_", "_anonymous_", "_align_"],
     field_contract_types = [
       !py.protocol<"Sequence", [!py.contract<"builtins.tuple">]>,

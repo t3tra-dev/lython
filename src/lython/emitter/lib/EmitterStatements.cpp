@@ -85,6 +85,8 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
     emitIf(statement);
   } else if (statement.kind == "For") {
     emitFor(statement);
+  } else if (statement.kind == "While") {
+    emitWhile(statement);
   } else if (statement.kind == "AsyncFor") {
     emitAsyncFor(statement);
   } else if (statement.kind == "With") {
@@ -114,12 +116,16 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
                       : emitExpr(returnValue);
     if (!inlineReturnContexts.empty()) {
       InlineReturnContext &ctx = inlineReturnContexts.back();
-      Value result = ctx.resultType
-                         ? coerceValue(value, ctx.resultType, statement)
-                         : value;
       emitActiveCleanups(statement);
-      mlir::cf::BranchOp::create(builder, loc(statement), ctx.target,
-                                 result.value);
+      if (ctx.carryResult) {
+        Value result = ctx.resultType
+                           ? coerceValue(value, ctx.resultType, statement)
+                           : value;
+        mlir::cf::BranchOp::create(builder, loc(statement), ctx.target,
+                                   result.value);
+      } else {
+        mlir::cf::BranchOp::create(builder, loc(statement), ctx.target);
+      }
       return;
     }
     if (currentReturnType) {
@@ -127,8 +133,44 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
       emitActiveCleanups(statement);
       mlir::func::ReturnOp::create(builder, loc(statement), result.value);
     }
+  } else if (statement.kind == "Break") {
+    if (loopControlContexts.empty() ||
+        !loopControlContexts.back().breakTarget) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, statement.range.start,
+          "break outside a supported loop is not implemented yet"});
+      return;
+    }
+    emitActiveCleanups(statement);
+    const LoopControlContext &loop = loopControlContexts.back();
+    mlir::cf::BranchOp::create(
+        builder, loc(statement), loop.breakTarget,
+        loopCarriedBranchOperands(statement, loop, loop.breakTarget));
+  } else if (statement.kind == "Continue") {
+    if (loopControlContexts.empty() ||
+        !loopControlContexts.back().continueTarget) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, statement.range.start,
+          "continue outside a supported loop is not implemented yet"});
+      return;
+    }
+    emitActiveCleanups(statement);
+    const LoopControlContext &loop = loopControlContexts.back();
+    mlir::cf::BranchOp::create(
+        builder, loc(statement), loop.continueTarget,
+        loopCarriedBranchOperands(statement, loop, loop.continueTarget));
+  } else if (statement.kind == "Global") {
+    // `global NAME, ...`: writes to these names in the current function target
+    // the module global. Only module globals we track (int-annotated) are
+    // storable; others are accepted silently (no local storage change).
+    if (const auto *names = ast::stringList(statement, "names"))
+      for (const std::string &name : *names)
+        currentGlobalDecls.insert(name);
+    return;
   } else if (statement.kind == "Pass") {
     return;
+  } else if (statement.kind == "Match") {
+    emitMatch(statement);
   } else if (statement.kind == "Try") {
     emitTry(statement);
   } else if (statement.kind == "TryStar") {
@@ -145,12 +187,20 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
 void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
   if (target.kind == "Name") {
     llvm::StringRef name = ast::nameSpelling(target);
+    if (isModuleGlobalWrite(name)) {
+      mlir::Type type = moduleGlobals.lookup(name);
+      Value coerced = coerceValue(value, type, target);
+      py::GlobalSetOp::create(builder, loc(target),
+                              builder.getStringAttr(name), coerced.value);
+      return;
+    }
     values[name] = value;
     types.bindSymbol(name, value.type);
     return;
   }
   if (target.kind == "Attribute") {
-    Value object = emitExpr(ast::node(target, "value"));
+    const parser::Node *objectNode = ast::node(target, "value");
+    Value object = emitExpr(objectNode);
     if (auto attr = ast::string(target, "attr")) {
       auto op = py::AttrSetOp::create(builder, loc(target), object.value, *attr,
                                       value.value);
@@ -160,15 +210,59 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
               mlir::dyn_cast_if_present<py::ContractType>(object.type))
         op->setAttr("ly.attr.owner",
                     builder.getStringAttr(contract.getContractName()));
+      // Manifest-declared field assignments may refine the receiver's
+      // contract parameters (ly.typing.field_param_bindings -- e.g. ctypes'
+      // `fn.restype = c_int` binds CFuncPtr's T so `__call__` types as int):
+      // rebind the local to the refined type. The attr.set op above stays --
+      // lowering reads the same assignment as evidence.
+      if (objectNode && objectNode->kind == "Name") {
+        if (std::optional<mlir::Type> refined =
+                types.fieldAssignmentRefinement(object.type, *attr,
+                                                value.type)) {
+          llvm::StringRef name = ast::nameSpelling(*objectNode);
+          auto bound = values.find(name);
+          if (bound != values.end() && bound->second.value == object.value) {
+            bound->second.type = *refined;
+            types.bindSymbol(name, *refined);
+          }
+        }
+      }
     }
     return;
   }
   if (target.kind == "Subscript") {
-    Value container = emitExpr(ast::node(target, "value"));
+    const parser::Node *containerNode = ast::node(target, "value");
+    Value container = emitExpr(containerNode);
     Value index = emitExpr(ast::node(target, "slice"));
+    if (std::optional<MethodBinding> method =
+            lookupClassMethod(container.type, "__setitem__")) {
+      emitInlineOperatorCall(target, container, *method, {index, value});
+      return;
+    }
     CallInferenceResult inference = types.inferMethodCallWithEvidence(
         container.type, "__setitem__", {index.type, value.type});
-    py::SetItemOp::create(builder, loc(target),
+    if (!requireStaticEvidence(target, inference))
+      return;
+    // Manifest-declared structural mutators may reallocate the container's
+    // storage: the op carries an extra container-typed result that rebinds
+    // the local (same channel as mutating bound-method calls).
+    if (containerNode && containerNode->kind == "Name" &&
+        types.isStructuralMutatorMethod(container.type, "__setitem__")) {
+      llvm::StringRef containerName = ast::nameSpelling(*containerNode);
+      auto bound = values.find(containerName);
+      if (bound != values.end() && bound->second.value == container.value) {
+        auto op = py::SetItemOp::create(
+            builder, loc(target),
+            mlir::TypeRange{container.value.getType()},
+            mlir::FlatSymbolRefAttr::get(&context, "__setitem__"),
+            callProtocolFor(inference), container.value, index.value,
+            value.value);
+        op->setAttr("ly.structural_mutation", builder.getUnitAttr());
+        values[containerName] = Value{op.getResult(0), container.type};
+        return;
+      }
+    }
+    py::SetItemOp::create(builder, loc(target), mlir::TypeRange{},
                           mlir::FlatSymbolRefAttr::get(&context, "__setitem__"),
                           callProtocolFor(inference), container.value,
                           index.value, value.value);
@@ -185,11 +279,14 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
                          types.literal(std::to_string(index))};
         CallInferenceResult inference = types.inferMethodCallWithEvidence(
             value.type, "__getitem__", {indexValue.type});
+        if (!requireStaticEvidence(*elt, inference))
+          return;
+        mlir::Type itemType = inference.resultType;
         auto getItem = py::GetItemOp::create(
-            builder, loc(*elt), types.object(),
+            builder, loc(*elt), itemType,
             mlir::FlatSymbolRefAttr::get(&context, "__getitem__"),
             callProtocolFor(inference), value.value, indexValue.value);
-        Value item{getItem.getResult(), types.object()};
+        Value item{getItem.getResult(), itemType};
         emitAssignTarget(*elt, item);
       }
     }

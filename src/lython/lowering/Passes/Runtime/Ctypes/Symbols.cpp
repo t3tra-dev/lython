@@ -4,6 +4,50 @@ namespace py::lowering {
 
 using namespace ctypes;
 
+// `lib["symbol"]`: the subscript form of library symbol access — identical
+// evidence to the attribute form below, keyed by a static string index.
+mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesLibraryGetItem(
+    py::GetItemOp op, const RuntimeBundle &object) {
+  if (!object.ctypes ||
+      object.ctypes->kind != RuntimeCtypesEvidence::Kind::Library)
+    return mlir::failure();
+  std::optional<std::string> symbol =
+      RuntimeBundleLowerer::keywordNameFromValue(op.getIndex());
+  if (!symbol)
+    return op.emitError() << "ctypes library subscript requires a static "
+                             "string symbol name";
+
+  auto existing = object.fieldBundles.find(*symbol);
+  if (existing != object.fieldBundles.end()) {
+    if (!existing->second)
+      return op.emitError()
+             << "ctypes symbol evidence for '" << *symbol << "' is empty";
+    RuntimeBundle result = *existing->second;
+    result.fieldAliasOwner = op.getContainer();
+    result.fieldAliasName = *symbol;
+    valueBundles[op.getResult()] = std::move(result);
+    erase.push_back(op);
+    return mlir::success();
+  }
+
+  RuntimeBundle result = RuntimeBundle::object(op.getResult().getType(), {});
+  RuntimeCtypesEvidence evidence;
+  evidence.kind = RuntimeCtypesEvidence::Kind::Symbol;
+  evidence.lifetime = RuntimeCtypesEvidence::Lifetime::Static;
+  evidence.ctypeName = "_ctypes.CFuncPtr";
+  evidence.ctype = op.getResult().getType();
+  evidence.libraryName = object.ctypes->libraryName;
+  evidence.abi = object.ctypes->abi;
+  evidence.processLibrary = object.ctypes->processLibrary;
+  evidence.symbolName = *symbol;
+  result.ctypes = std::move(evidence);
+  result.fieldAliasOwner = op.getContainer();
+  result.fieldAliasName = *symbol;
+  valueBundles[op.getResult()] = std::move(result);
+  erase.push_back(op);
+  return mlir::success();
+}
+
 mlir::LogicalResult
 RuntimeBundleLowerer::lowerStaticCtypesAttrGet(py::AttrGetOp op,
                                                const RuntimeBundle &object) {

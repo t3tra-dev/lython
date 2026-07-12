@@ -1,31 +1,39 @@
-// CPython-shaped asyncio runtime state objects.
-//
-// The structural type contracts live in runtime/typing.mlir.  This file only
-// owns the physical state ABI needed by the scheduler: event loops, futures and
-// tasks are all ordinary Python objects with a shared refcount/layout header and
-// atomic state transitions.  Generic result payloads and callback arguments are
-// deliberately not specialized here; they must flow through the common erased
-// Python object handle/evidence path so Future[T], callback queues and await
-// lowering do not grow type-specific fast paths.
+// Contract manifest AND module-level runtime for stdlib `asyncio` public
+// classes, re-exports, and free functions.
 
-module attributes {ly.runtime.contracts = ["asyncio.AbstractEventLoop", "_asyncio.Future", "_asyncio.FutureIter", "_asyncio.Task", "_asyncio.TaskIter"]} {
-  func.func private @LyCoroutine_ResumeBegin(%storage: memref<5xi64> {ly.ownership.object_header}) -> i1
-  func.func private @LyCoroutine_ResumeComplete(%storage: memref<5xi64> {ly.ownership.object_header})
-  func.func private @LyCoroutine_DecRef(%storage: memref<5xi64> {ly.ownership.object_header})
-  func.func private @LyLong_FromI64(%value: i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0]}
-  func.func private @LyBaseException_New(%class_id: i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
-  func.func private @LyBaseException_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
-  func.func private @LyEH_ThrowException(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>)
-  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]}
-
-  memref.global "private" constant @__ly_task_msg_set_result_unsupported : memref<42xi8> = dense<[84, 97, 115, 107, 32, 100, 111, 101, 115, 32, 110, 111, 116, 32, 115, 117, 112, 112, 111, 114, 116, 32, 115, 101, 116, 95, 114, 101, 115, 117, 108, 116, 32, 111, 112, 101, 114, 97, 116, 105, 111, 110]>
-  memref.global "private" constant @__ly_task_msg_set_exception_unsupported : memref<45xi8> = dense<[84, 97, 115, 107, 32, 100, 111, 101, 115, 32, 110, 111, 116, 32, 115, 117, 112, 112, 111, 114, 116, 32, 115, 101, 116, 95, 101, 120, 99, 101, 112, 116, 105, 111, 110, 32, 111, 112, 101, 114, 97, 116, 105, 111, 110]>
-  memref.global "private" constant @__ly_asyncio_msg_invalid_state : memref<13xi8> = dense<[105, 110, 118, 97, 108, 105, 100, 32, 115, 116, 97, 116, 101]>
+module attributes {
+  ly.runtime.contracts = ["asyncio.AbstractEventLoop", "_asyncio.Future", "_asyncio.FutureIter", "_asyncio.Task", "_asyncio.TaskIter"],
+  ly.typing.module = "asyncio",
+  ly.typing.class_exports = [
+    "asyncio.AbstractEventLoop=asyncio.AbstractEventLoop",
+    "asyncio.CancelledError=asyncio.CancelledError",
+    "asyncio.Handle=asyncio.Handle",
+    "asyncio.TimerHandle=asyncio.TimerHandle",
+    "asyncio.Future=_asyncio.Future",
+    "asyncio.Task=_asyncio.Task",
+    "asyncio.events.AbstractEventLoop=asyncio.AbstractEventLoop",
+    "asyncio.exceptions.CancelledError=asyncio.CancelledError"
+  ],
+  // Manifest Callable contracts for asyncio free functions, replacing the C++
+  // makeAsyncioSleepCallable / makeAsyncioGetEventLoopCallable factories so
+  // imported asyncio callables are typed from the manifest.
+  // Callable exports drive import binding (AlgorithmM reads these tables;
+  // no C++ import-table entries needed) and pair with the contracts below.
+  ly.typing.callable_exports = [
+    "asyncio.sleep",
+    "asyncio.get_event_loop",
+    "asyncio.run"
+  ],
+  ly.typing.function_names = ["asyncio.sleep", "asyncio.get_event_loop", "asyncio.run"],
+  ly.typing.function_contracts = [
+    !py.callable<[!py.contract<"typing.Any">, !py.contract<"typing.Any">], arg_names = ["delay", "result"], arg_defaults = [false, true], returns = [!py.contract<"types.CoroutineType", [!py.contract<"typing.Any">, !py.contract<"typing.Any">, !py.contract<"typing.Any">]>]>,
+    !py.callable<[], returns = [!py.contract<"asyncio.AbstractEventLoop">]>,
+    !py.callable<[!py.contract<"types.CoroutineType", [!py.contract<"typing.Any">, !py.contract<"typing.Any">, !py.contract<"typing.Any">]>], arg_names = ["main"], arg_defaults = [false], kwonly = [!py.union<!py.contract<"builtins.bool">, !py.literal<None>>], kw_names = ["debug"], kw_defaults = [true], returns = [!py.contract<"typing.Any">]>
+  ]
+} {
+  // Module-level runtime: asyncio's free functions live with the module
+  // manifest.
   memref.global "private" @__ly_asyncio_default_loop : memref<8xi64> = dense<[9223372036854775807, 13, 0, 0, 0, 0, 0, 0]>
-
-  func.func private @LyEventLoop_Shape() -> memref<8xi64> attributes {ly.runtime.contract = "asyncio.AbstractEventLoop", ly.runtime.shape}
-
-  func.func private @LyFuture_Shape() -> memref<10xi64> attributes {ly.runtime.contract = "_asyncio.Future", ly.runtime.shape}
 
   func.func private @LyAsyncio_Sleep_Builtin() -> memref<5xi64> attributes {ly.runtime.builtin = "asyncio.sleep", ly.runtime.builtin_lowering = "asyncio_sleep", ly.runtime.contract = "types.CoroutineType", ly.runtime.primitive = "builtin_sleep", ly.runtime.result_contract = "types.CoroutineType"}
 
@@ -43,6 +51,69 @@ module attributes {ly.runtime.contracts = ["asyncio.AbstractEventLoop", "_asynci
     } {ly.atomic.ordering = "acq_rel", ly.atomic.role = "asyncio.ready.tail.publish"}
     func.return %loop : memref<8xi64>
   }
+
+  py.class @CancelledError attributes {base_names = ["BaseException"]} {}
+
+  py.class @Handle attributes {
+    base_names = ["object"],
+    method_names = ["__init__", "cancel", "_run", "cancelled"],
+    method_contracts = [
+      !py.protocol<"Callable", [!py.contract<"asyncio.Handle">, !py.callable<[], vararg = !py.unpack<!py.typevartuple<"Ts">>, returns = [!py.contract<"builtins.object">]>, !py.protocol<"Sequence", [!py.contract<"typing.Any">]>, !py.contract<"asyncio.AbstractEventLoop">], kwonly = [!py.union<!py.contract<"contextvars.Context">, !py.literal<None>>], kw_names = ["context"], kw_defaults = [true] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"asyncio.Handle">] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"asyncio.Handle">] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"asyncio.Handle">] -> [!py.contract<"builtins.bool">]>
+    ],
+    method_kinds = ["instance", "instance", "instance", "instance"]
+  } {}
+
+  py.class @TimerHandle attributes {
+    base_names = ["Handle"],
+    method_names = ["__init__", "when"],
+    method_contracts = [
+      !py.protocol<"Callable", [!py.contract<"asyncio.TimerHandle">, !py.contract<"builtins.float">, !py.callable<[], vararg = !py.unpack<!py.typevartuple<"Ts">>, returns = [!py.contract<"builtins.object">]>, !py.protocol<"Sequence", [!py.contract<"typing.Any">]>, !py.contract<"asyncio.AbstractEventLoop">], kwonly = [!py.union<!py.contract<"contextvars.Context">, !py.literal<None>>], kw_names = ["context"], kw_defaults = [true] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"asyncio.TimerHandle">] -> [!py.contract<"builtins.float">]>
+    ],
+    method_kinds = ["instance", "instance"]
+  } {}
+
+  py.class @AbstractEventLoop attributes {
+    base_names = ["object"], ly.typing.abstract,
+    method_names = ["is_running", "stop", "call_soon", "call_later",
+                    "call_at"],
+    method_contracts = [
+      !py.protocol<"Callable", [!py.contract<"asyncio.AbstractEventLoop">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"asyncio.AbstractEventLoop">] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"asyncio.AbstractEventLoop">, !py.callable<[], vararg = !py.unpack<!py.typevartuple<"Ts">>, returns = [!py.contract<"builtins.object">]>], vararg = !py.unpack<!py.typevartuple<"Ts">>, kwonly = [!py.union<!py.contract<"contextvars.Context">, !py.literal<None>>], kw_names = ["context"], kw_defaults = [true], vararg_name = "args" -> [!py.contract<"asyncio.Handle">]>,
+      !py.protocol<"Callable", [!py.contract<"asyncio.AbstractEventLoop">, !py.contract<"builtins.float">, !py.callable<[], vararg = !py.unpack<!py.typevartuple<"Ts">>, returns = [!py.contract<"builtins.object">]>], vararg = !py.unpack<!py.typevartuple<"Ts">>, kwonly = [!py.union<!py.contract<"contextvars.Context">, !py.literal<None>>], kw_names = ["context"], kw_defaults = [true], vararg_name = "args" -> [!py.contract<"asyncio.TimerHandle">]>,
+      !py.protocol<"Callable", [!py.contract<"asyncio.AbstractEventLoop">, !py.contract<"builtins.float">, !py.callable<[], vararg = !py.unpack<!py.typevartuple<"Ts">>, returns = [!py.contract<"builtins.object">]>], vararg = !py.unpack<!py.typevartuple<"Ts">>, kwonly = [!py.union<!py.contract<"contextvars.Context">, !py.literal<None>>], kw_names = ["context"], kw_defaults = [true], vararg_name = "args" -> [!py.contract<"asyncio.TimerHandle">]>
+    ],
+    method_kinds = ["instance", "instance", "instance", "instance",
+                    "instance"]
+  } {}
+
+  // ===========================================================
+  // Runtime implementations (event loop, futures, tasks).
+  // ===========================================================
+
+  // ===== impls: asyncio =====
+  func.func private @LyCoroutine_ResumeBegin(%storage: memref<5xi64> {ly.ownership.object_header}) -> i1
+  func.func private @LyCoroutine_ResumeComplete(%storage: memref<5xi64> {ly.ownership.object_header})
+  func.func private @LyCoroutine_DecRef(%storage: memref<5xi64> {ly.ownership.object_header})
+  func.func private @LyLong_FromI64(%value: i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0]}
+  func.func private @LyBaseException_New(%class_id: i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func private @LyBaseException_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func private @LyEH_ThrowException(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>)
+  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]}
+
+  memref.global "private" constant @__ly_task_msg_set_result_unsupported : memref<42xi8> = dense<[84, 97, 115, 107, 32, 100, 111, 101, 115, 32, 110, 111, 116, 32, 115, 117, 112, 112, 111, 114, 116, 32, 115, 101, 116, 95, 114, 101, 115, 117, 108, 116, 32, 111, 112, 101, 114, 97, 116, 105, 111, 110]>
+  memref.global "private" constant @__ly_task_msg_set_exception_unsupported : memref<45xi8> = dense<[84, 97, 115, 107, 32, 100, 111, 101, 115, 32, 110, 111, 116, 32, 115, 117, 112, 112, 111, 114, 116, 32, 115, 101, 116, 95, 101, 120, 99, 101, 112, 116, 105, 111, 110, 32, 111, 112, 101, 114, 97, 116, 105, 111, 110]>
+  memref.global "private" constant @__ly_asyncio_msg_invalid_state : memref<13xi8> = dense<[105, 110, 118, 97, 108, 105, 100, 32, 115, 116, 97, 116, 101]>
+
+  func.func private @LyEventLoop_Shape() -> memref<8xi64> attributes {ly.runtime.contract = "asyncio.AbstractEventLoop", ly.runtime.shape}
+
+  func.func private @LyFuture_Shape() -> memref<10xi64> attributes {ly.runtime.contract = "_asyncio.Future", ly.runtime.shape}
+
+
 
   func.func private @LyFutureIter_Shape() -> (memref<3xi64>, memref<10xi64>) attributes {ly.runtime.contract = "_asyncio.FutureIter", ly.runtime.shape}
 
@@ -269,7 +340,7 @@ module attributes {ly.runtime.contracts = ["asyncio.AbstractEventLoop", "_asynci
     cf.cond_br %became_zero, ^dealloc, ^done
 
   ^dealloc:
-    memref.dealloc %loop {ly.ownership.object_dealloc_part = "loop"} : memref<8xi64>
+    memref.dealloc %loop : memref<8xi64>
     cf.br ^done
 
   ^done:
@@ -503,7 +574,7 @@ module attributes {ly.runtime.contracts = ["asyncio.AbstractEventLoop", "_asynci
     cf.cond_br %became_zero, ^dealloc, ^done
 
   ^dealloc:
-    memref.dealloc %future {ly.ownership.object_dealloc_part = "future"} : memref<10xi64>
+    memref.dealloc %future : memref<10xi64>
     cf.br ^done
 
   ^done:
@@ -517,7 +588,7 @@ module attributes {ly.runtime.contracts = ["asyncio.AbstractEventLoop", "_asynci
 
   ^dealloc:
     func.call @LyFuture_DecRef(%future) : (memref<10xi64>) -> ()
-    memref.dealloc %iterator {ly.ownership.object_dealloc_part = "future_iter"} : memref<3xi64>
+    memref.dealloc %iterator : memref<3xi64>
     cf.br ^done
 
   ^done:
@@ -776,7 +847,7 @@ module attributes {ly.runtime.contracts = ["asyncio.AbstractEventLoop", "_asynci
 
   ^dealloc:
     func.call @LyCoroutine_DecRef(%coroutine) : (memref<5xi64>) -> ()
-    memref.dealloc %task {ly.ownership.object_dealloc_part = "task"} : memref<12xi64>
+    memref.dealloc %task : memref<12xi64>
     cf.br ^done
 
   ^done:
@@ -790,7 +861,7 @@ module attributes {ly.runtime.contracts = ["asyncio.AbstractEventLoop", "_asynci
 
   ^dealloc:
     func.call @LyTask_DecRef(%task, %coroutine) : (memref<12xi64>, memref<5xi64>) -> ()
-    memref.dealloc %iterator {ly.ownership.object_dealloc_part = "task_iter"} : memref<3xi64>
+    memref.dealloc %iterator : memref<3xi64>
     cf.br ^done
 
   ^done:

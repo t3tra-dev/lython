@@ -23,6 +23,11 @@ struct RuntimeDefaultArgument {
   mlir::Attribute value;
 };
 
+struct RuntimeResultEvidenceSlot {
+  std::string name;
+  std::string contract;
+};
+
 struct RuntimeSymbol {
   mlir::func::FuncOp function;
   std::string contract;
@@ -32,10 +37,12 @@ struct RuntimeSymbol {
   std::string resultEvidence;
   std::string elementContract;
   std::string nextContract;
+  std::string nextEvidence;
   std::string builtinName;
   std::string builtinLowering;
   std::string builtinMethod;
   std::string builtinSinkContract;
+  llvm::SmallVector<RuntimeResultEvidenceSlot, 2> resultEvidenceSlots;
   llvm::SmallVector<unsigned, 1> classIdArgumentIndices;
   llvm::SmallVector<RuntimeDefaultArgument, 2> defaultArguments;
   std::optional<unsigned> validResultIndex;
@@ -54,6 +61,11 @@ struct RuntimeShapeDefinition {
   std::string contract;
   llvm::SmallVector<mlir::Type, 4> valueTypes;
   std::string source;
+  // Release interfaces (deallocators) take the entity root — a non-empty
+  // PREFIX of the canonical value shape (usually just the header) — rather
+  // than the full shape: the object is one entity and interior views add no
+  // information to its release.
+  bool prefixOfShape = false;
 };
 
 struct RuntimeClassIdDefinition {

@@ -2,8 +2,19 @@
 
 #include "Contracts.h"
 #include "PyDialectTypes.h"
+#include "PyTypeObject.h"
 #include "PyProtocols.h"
 #include "Support.h"
+
+#include "mlir/Bytecode/BytecodeOpInterface.h"
+#include "mlir/IR/SymbolTable.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
+#include "mlir/Interfaces/InferTypeOpInterface.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
+
+#define GET_OP_CLASSES
+#include "PyOps.h.inc"
+#undef GET_OP_CLASSES
 
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -493,6 +504,11 @@ llvm::SmallVector<mlir::Type, 2> callableResultSurface(mlir::Operation *op) {
   }
   for (mlir::Type type : op->getResultTypes())
     results.push_back(type);
+  // A structural-mutation call (`ly.structural_mutation`) carries one extra
+  // receiver-typed result that rebinds the receiver local; it is not part of
+  // the Callable contract's result surface and is checked separately.
+  if (op->hasAttr("ly.structural_mutation") && !results.empty())
+    results.pop_back();
   return results;
 }
 
@@ -527,6 +543,17 @@ mlir::LogicalResult verifyCallableResults(mlir::Operation *op,
   llvm::StringRef name = opName(op);
   if (name == "py.invoke" || name == "py.await")
     return mlir::success();
+
+  if (op->hasAttr("ly.structural_mutation")) {
+    // The rebind result is always last; ops whose contract yields no value
+    // surface (e.g. py.setitem) carry exactly the rebind result.
+    if (op->getNumResults() < 1 || op->getNumOperands() < 1 ||
+        op->getResult(op->getNumResults() - 1).getType() !=
+            op->getOperand(0).getType())
+      return op->emitError()
+             << "structural-mutation op must expose one extra result whose "
+                "type matches the receiver operand";
+  }
 
   llvm::SmallVector<mlir::Type, 2> actuals = callableResultSurface(op);
   llvm::ArrayRef<mlir::Type> expected = callable.getResultTypes();
@@ -569,15 +596,93 @@ mlir::LogicalResult verifyManifestCandidate(mlir::Operation *op,
         callableMatchesCandidate(selected, candidate.method.signature, op))
       return mlir::success();
 
+  // Field-record constructor: a SOURCE class accepts its declared fields
+  // positionally (all optional) when no source __init__ exists. The
+  // synthesized contract validates against the py.class field schema instead
+  // of a manifest candidate.
+  if (*methodName == "__init__") {
+    auto contract = mlir::dyn_cast<ContractType>(*receiver);
+    py::ClassOp classOp =
+        contract ? type_object::lookup(op, contract.getContractName())
+                 : py::ClassOp{};
+    auto fieldTypes =
+        classOp ? classOp->getAttrOfType<mlir::ArrayAttr>("field_contract_types")
+                : mlir::ArrayAttr{};
+    if (fieldTypes) {
+      llvm::ArrayRef<mlir::Type> positional = selected.getPositionalTypes();
+      llvm::ArrayRef<mlir::Type> results = selected.getResultTypes();
+      bool matches = positional.size() == fieldTypes.size() + 1 &&
+                     !positional.empty() && positional.front() == *receiver &&
+                     results.size() == 1 && isNoneLike(results.front());
+      if (matches)
+        for (auto [index, attr] : llvm::enumerate(fieldTypes)) {
+          auto fieldType = mlir::dyn_cast<mlir::TypeAttr>(attr);
+          if (!fieldType || fieldType.getValue() != positional[index + 1]) {
+            matches = false;
+            break;
+          }
+        }
+      if (matches)
+        return mlir::success();
+    }
+  }
+
   return op->emitError()
          << "selected " << *methodName
          << " Callable evidence is not a manifest candidate for receiver type "
          << *receiver;
 }
 
+mlir::LogicalResult verifyYieldFromEvidenceOp(mlir::Operation *op) {
+  if (opName(op) != "py.yield_from")
+    return mlir::success();
+
+  auto attr = op->getAttrOfType<mlir::TypeAttr>("yield_from_contract");
+  if (!attr)
+    return op->emitError() << "missing yield_from_contract evidence";
+  mlir::Type selected = attr.getValue();
+  if (mlir::failed(
+          verifyStableEvidenceType(op, selected, "yield_from_contract")))
+    return mlir::failure();
+  auto protocol = mlir::dyn_cast<ProtocolType>(selected);
+  if (!protocol)
+    return op->emitError()
+           << "yield_from_contract must resolve to a protocol contract";
+  llvm::StringRef name = protocol.getProtocolName();
+  if (name != "Generator" && name != "Iterator" && name != "Iterable")
+    return op->emitError()
+           << "yield_from_contract must be Generator, Iterator, or Iterable";
+  if (op->getNumOperands() != 1 || op->getNumResults() != 1)
+    return op->emitError()
+           << "yield_from evidence verifier expects one source and one result";
+
+  VerificationResult result;
+  mlir::Type sourceType = op->getOperand(0).getType();
+  result.check(verifyStableEvidenceType(op, sourceType, "source type"));
+  result.check(
+      verifyStableEvidenceType(op, op->getResult(0).getType(), "result type"));
+  if (!evidenceAssignable(sourceType, selected, op))
+    result.check(op->emitError()
+                 << "yield_from_contract " << selected
+                 << " is not satisfied by source type " << sourceType);
+  return result.get();
+}
+
 mlir::LogicalResult verifyEvidenceOp(mlir::Operation *op) {
+  if (opName(op) == "py.yield_from")
+    return verifyYieldFromEvidenceOp(op);
+
   std::optional<llvm::StringRef> attrName = contractAttrName(op);
   if (!attrName)
+    // P0 verifier gate: every Python operation op that invokes user-visible
+    // behavior already carries its selected callable/protocol contract as a
+    // *mandatory* dialect attribute (call/invoke/new/init/await and every
+    // special-method op declare `*_contract` as a required `TypeAttrOf`), so
+    // the operation verifier rejects a dropped-evidence op before this pass
+    // runs. Static attribute access is gated separately by `py.attr.get` /
+    // `py.attr.set`'s own field-declaration verifier. Reaching this branch
+    // therefore means the op is not a behavior-invoking op (constants, packs,
+    // binding refs, ref-count and control-flow ops), which needs no contract.
     return mlir::success();
 
   if (opName(op) == "py.new") {

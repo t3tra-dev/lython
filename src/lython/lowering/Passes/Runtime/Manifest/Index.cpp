@@ -1,5 +1,7 @@
 #include "Runtime/Manifest/Index.h"
 
+#include "llvm/ADT/STLExtras.h"
+
 namespace py::lowering {
 
 namespace {
@@ -126,6 +128,33 @@ mlir::LogicalResult RuntimeManifestIndex::verify() {
     const RuntimeValueShape *shape = valueShape(definition.contract);
     if (!shape)
       continue;
+    if (definition.prefixOfShape) {
+      auto isPrefixOf = [&](llvm::ArrayRef<mlir::Type> whole) {
+        return !definition.valueTypes.empty() &&
+               definition.valueTypes.size() <= whole.size() &&
+               sameTypeSequence(definition.valueTypes,
+                                whole.take_front(definition.valueTypes.size()));
+      };
+      bool prefix = isPrefixOf(shape->valueTypes);
+      // A contract with a `box` primitive has a second, boxed ABI form (its
+      // container-slot representation); release interfaces may target it.
+      if (!prefix) {
+        if (std::optional<RuntimeSymbol> box =
+                primitive(definition.contract, "box"))
+          prefix = isPrefixOf(box->function.getFunctionType().getResults());
+      }
+      if (prefix)
+        continue;
+      definition.function.emitError()
+          << "release interface for " << definition.contract << " from "
+          << definition.source << " is "
+          << describeTypeSequence(definition.valueTypes)
+          << ", which is not a non-empty prefix of the canonical shape from "
+          << shape->source << " "
+          << describeTypeSequence(shape->valueTypes);
+      verified.fail();
+      continue;
+    }
     if (sameTypeSequence(definition.valueTypes, shape->valueTypes))
       continue;
     definition.function.emitError()
@@ -186,9 +215,11 @@ void RuntimeManifestIndex::recordDeallocatorShape(mlir::func::FuncOp function,
   llvm::SmallVector<mlir::Type, 4> types;
   types.append(function.getFunctionType().getInputs().begin(),
                function.getFunctionType().getInputs().end());
+  // A deallocator declares the RELEASE interface (the entity root prefix),
+  // not the canonical value shape; shape/initializer sources define shapes.
   shapeDefinitions.push_back(RuntimeShapeDefinition{
-      function, contract.str(), types, function.getSymName().str()});
-  recordValueShape(contract, types, function.getSymName());
+      function, contract.str(), types, function.getSymName().str(),
+      /*prefixOfShape=*/true});
 }
 
 void RuntimeManifestIndex::recordResultShape(mlir::func::FuncOp function,
@@ -222,6 +253,30 @@ void RuntimeManifestIndex::record(mlir::func::FuncOp function,
       return attr.getValue().str();
     return "";
   };
+  auto stringArrayAttr =
+      [&](llvm::StringLiteral attrName) -> llvm::SmallVector<std::string, 4> {
+    llvm::SmallVector<std::string, 4> result;
+    mlir::Attribute raw = function->getAttr(attrName);
+    if (!raw)
+      return result;
+    auto array = mlir::dyn_cast<mlir::ArrayAttr>(raw);
+    if (!array) {
+      function.emitError() << attrName << " must be an array of strings";
+      malformedContractsAttr = true;
+      return result;
+    }
+    for (mlir::Attribute entry : array) {
+      auto string = mlir::dyn_cast<mlir::StringAttr>(entry);
+      if (!string) {
+        function.emitError() << attrName << " entries must be strings";
+        malformedContractsAttr = true;
+        result.clear();
+        return result;
+      }
+      result.push_back(string.getValue().str());
+    }
+    return result;
+  };
 
   std::optional<unsigned> validResultIndex;
   if (auto attr = function->getAttrOfType<mlir::IntegerAttr>(
@@ -244,6 +299,24 @@ void RuntimeManifestIndex::record(mlir::func::FuncOp function,
           index, RuntimeDefaultArgument::Kind::F64, attr});
   }
 
+  llvm::SmallVector<std::string, 4> evidenceSlotNames =
+      stringArrayAttr(kManifestResultEvidenceSlotsAttr);
+  llvm::SmallVector<std::string, 4> evidenceSlotContracts =
+      stringArrayAttr(kManifestResultEvidenceContractsAttr);
+  llvm::SmallVector<RuntimeResultEvidenceSlot, 2> resultEvidenceSlots;
+  if (evidenceSlotNames.size() != evidenceSlotContracts.size()) {
+    function.emitError() << kManifestResultEvidenceSlotsAttr << " has "
+                         << evidenceSlotNames.size() << " entries, but "
+                         << kManifestResultEvidenceContractsAttr << " has "
+                         << evidenceSlotContracts.size();
+    malformedContractsAttr = true;
+  } else {
+    for (auto [name, contract] :
+         llvm::zip(evidenceSlotNames, evidenceSlotContracts))
+      resultEvidenceSlots.push_back(
+          RuntimeResultEvidenceSlot{name, contract});
+  }
+
   RuntimeSymbol symbol{function,
                        contract.str(),
                        role.str(),
@@ -252,10 +325,12 @@ void RuntimeManifestIndex::record(mlir::func::FuncOp function,
                        stringAttr(kManifestResultEvidenceAttr),
                        stringAttr(kManifestElementContractAttr),
                        stringAttr(kManifestNextContractAttr),
+                       stringAttr(kManifestNextEvidenceAttr),
                        stringAttr(kManifestBuiltinAttr),
                        stringAttr(kManifestBuiltinLoweringAttr),
                        stringAttr(kManifestBuiltinMethodAttr),
                        stringAttr(kManifestBuiltinSinkContractAttr),
+                       std::move(resultEvidenceSlots),
                        std::move(classIdArgumentIndices),
                        std::move(defaultArguments),
                        validResultIndex};
@@ -313,6 +388,16 @@ void RuntimeManifestIndex::build(mlir::ModuleOp module) {
       recordDeallocatorShape(function, contract.getValue());
     recordClassId(function, contract.getValue());
   });
+
+  // Contracts whose only shape witness is the deallocator (no shape function
+  // or initializer): fall back to the release interface as the canonical
+  // shape. The prefix check against itself is then trivially satisfied.
+  for (RuntimeShapeDefinition &definition : shapeDefinitions) {
+    if (!definition.prefixOfShape || valueShape(definition.contract))
+      continue;
+    recordValueShape(definition.contract, definition.valueTypes,
+                     definition.source);
+  }
 }
 
 const RuntimeValueShape *
@@ -347,6 +432,16 @@ RuntimeManifestIndex::verifyReceiverShape(RuntimeSymbol &symbol) {
   if (!shape)
     return mlir::failure();
   mlir::FunctionType functionType = symbol.function.getFunctionType();
+  // A contract with a `box` primitive has a second, boxed ABI form (its
+  // container-slot representation); methods may receive either form.
+  if (std::optional<RuntimeSymbol> box = primitive(symbol.contract, "box")) {
+    llvm::ArrayRef<mlir::Type> boxed =
+        box->function.getFunctionType().getResults();
+    if (functionType.getNumInputs() >= boxed.size() &&
+        sameTypeSequence(takePrefix(functionType.getInputs(), boxed.size()),
+                         boxed))
+      return mlir::success();
+  }
   if (functionType.getNumInputs() < shape->valueTypes.size())
     return symbol.function.emitError()
            << "runtime manifest method receiver for " << symbol.contract << "."
@@ -367,9 +462,23 @@ RuntimeManifestIndex::verifyResultShape(RuntimeSymbol &symbol,
       requireShape(symbol.function, resultContract, label);
   if (!shape)
     return mlir::failure();
+  RuntimeValueShape expected;
+  expected.valueTypes.append(shape->valueTypes.begin(),
+                             shape->valueTypes.end());
+  expected.source = shape->source;
+  for (const RuntimeResultEvidenceSlot &slot : symbol.resultEvidenceSlots) {
+    const RuntimeValueShape *slotShape = requireShape(
+        symbol.function, slot.contract, "result evidence slot");
+    if (!slotShape)
+      return mlir::failure();
+    expected.valueTypes.append(slotShape->valueTypes.begin(),
+                               slotShape->valueTypes.end());
+    expected.source += "+";
+    expected.source += slot.name;
+  }
   mlir::FunctionType functionType = symbol.function.getFunctionType();
   return verifyTypeSequence(symbol.function, label, resultContract,
-                            functionType.getResults(), *shape);
+                            functionType.getResults(), expected);
 }
 
 mlir::LogicalResult
@@ -582,6 +691,12 @@ mlir::LogicalResult RuntimeManifestIndex::verifySymbol(RuntimeSymbol &symbol) {
   if (!symbol.resultContract.empty())
     verified.check(verifyResultShape(symbol, symbol.resultContract,
                                      "declared result_contract"));
+  if (!symbol.resultEvidenceSlots.empty() && symbol.resultContract.empty()) {
+    symbol.function.emitError()
+        << kManifestResultEvidenceSlotsAttr
+        << " requires ly.runtime.result_contract";
+    verified.fail();
+  }
   if (!symbol.resultEvidence.empty()) {
     if (symbol.resultEvidence != "receiver") {
       symbol.function.emitError() << kManifestResultEvidenceAttr
@@ -591,6 +706,30 @@ mlir::LogicalResult RuntimeManifestIndex::verifySymbol(RuntimeSymbol &symbol) {
       symbol.function.emitError()
           << kManifestResultEvidenceAttr
           << " = \"receiver\" is only valid for runtime methods";
+      verified.fail();
+    }
+  }
+  if (!symbol.nextEvidence.empty()) {
+    if (symbol.nextEvidence != "receiver") {
+      symbol.function.emitError() << kManifestNextEvidenceAttr
+                                  << " must currently be empty or "
+                                     "\"receiver\"";
+      verified.fail();
+    } else if (symbol.role != "method" || !symbol.validResultIndex) {
+      symbol.function.emitError()
+          << kManifestNextEvidenceAttr
+          << " = \"receiver\" is only valid for runtime __next__ methods";
+      verified.fail();
+    } else if (symbol.nextContract.empty()) {
+      symbol.function.emitError()
+          << kManifestNextEvidenceAttr
+          << " requires ly.runtime.next_contract";
+      verified.fail();
+    } else if (symbol.nextContract != symbol.contract) {
+      symbol.function.emitError()
+          << kManifestNextEvidenceAttr
+          << " = \"receiver\" requires ly.runtime.next_contract to match "
+             "the receiver contract";
       verified.fail();
     }
   }

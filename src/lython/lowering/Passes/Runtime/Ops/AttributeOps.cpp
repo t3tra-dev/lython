@@ -81,13 +81,36 @@ mlir::FailureOr<unsigned> RuntimeBundleLowerer::classFieldValueOffset(
   unsigned offset = static_cast<unsigned>(objectShape->valueTypes.size());
   for (unsigned index = 0; index < fieldIndex; ++index) {
     mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> valueTypes =
-        RuntimeBundleLowerer::runtimeValueTypesFor(op, fieldTypes[index],
-                                                   purpose);
+        RuntimeBundleLowerer::classFieldStorageValueTypes(op, fieldTypes[index],
+                                                          purpose);
     if (mlir::failed(valueTypes))
       return mlir::failure();
     offset += static_cast<unsigned>(valueTypes->size());
   }
   return offset;
+}
+
+bool RuntimeBundleLowerer::classFieldStoredBoxed(
+    mlir::Type fieldContract) const {
+  llvm::StringRef contractName = runtimeShapeContractName(fieldContract);
+  return contractName == "builtins.object" || contractName == "builtins.dict";
+}
+
+mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>>
+RuntimeBundleLowerer::classFieldStorageValueTypes(
+    mlir::Operation *op, mlir::Type fieldContract,
+    llvm::StringRef purpose) const {
+  if (classFieldStoredBoxed(fieldContract)) {
+    const RuntimeValueShape *objectShape =
+        manifest.valueShape("builtins.object");
+    if (!objectShape)
+      return op->emitError()
+             << "runtime manifest has no builtins.object ABI shape for "
+             << purpose;
+    return llvm::SmallVector<mlir::Type, 8>(objectShape->valueTypes.begin(),
+                                            objectShape->valueTypes.end());
+  }
+  return RuntimeBundleLowerer::runtimeValueTypesFor(op, fieldContract, purpose);
 }
 
 mlir::LogicalResult
@@ -145,6 +168,48 @@ RuntimeBundleLowerer::writeBackFieldAlias(mlir::Operation *op,
   for (auto [index, replacement] :
        llvm::enumerate(updatedField.physicalValues()))
     ownerBundle.objectValue.values[*offset + index] = replacement;
+
+  // An owned local's release must see the updated representation (a mutation
+  // may have reallocated the field's storage): re-root the owned-local marker
+  // over the new value set. The old marker keeps flowing as a plain identity
+  // cast; the ownership attributes move so the local roots exactly once.
+  if (!ownerBundle.objectValue.values.empty()) {
+    mlir::Value front = ownerBundle.objectValue.values.front();
+    // The owned-local marker is a PARALLEL view: the bundle may hold the raw
+    // construction values while the marker cast wraps them for the release
+    // machinery. Find it as the front value's marked user (or defining op).
+    mlir::UnrealizedConversionCastOp oldRoot =
+        front.getDefiningOp<mlir::UnrealizedConversionCastOp>();
+    if (!oldRoot || !oldRoot->hasAttr(ownership::kOwnedLocalObjectAttr)) {
+      oldRoot = nullptr;
+      for (mlir::Operation *user : front.getUsers()) {
+        auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(user);
+        if (cast && cast->hasAttr(ownership::kOwnedLocalObjectAttr) &&
+            cast.getInputs().size() == ownerBundle.objectValue.values.size() &&
+            cast.getInputs().front() == front) {
+          oldRoot = cast;
+          break;
+        }
+      }
+    }
+    if (oldRoot && oldRoot->hasAttr(ownership::kOwnedLocalObjectAttr)) {
+      builder.setInsertionPoint(op);
+      llvm::SmallVector<mlir::Type, 8> resultTypes;
+      for (mlir::Value value : ownerBundle.objectValue.values)
+        resultTypes.push_back(value.getType());
+      auto rooted = mlir::UnrealizedConversionCastOp::create(
+          builder, op->getLoc(), resultTypes, ownerBundle.objectValue.values);
+      rooted->setAttr(ownership::kOwnedLocalObjectAttr,
+                      builder.getUnitAttr());
+      if (mlir::Attribute contract =
+              oldRoot->getAttr(ownership::kOwnedLocalObjectContractAttr))
+        rooted->setAttr(ownership::kOwnedLocalObjectContractAttr, contract);
+      oldRoot->removeAttr(ownership::kOwnedLocalObjectAttr);
+      oldRoot->removeAttr(ownership::kOwnedLocalObjectContractAttr);
+      ownerBundle.objectValue.values.assign(rooted.getResults().begin(),
+                                            rooted.getResults().end());
+    }
+  }
 
   valueBundles[updatedField.fieldAliasOwner] = std::move(ownerBundle);
   return mlir::success();
@@ -246,6 +311,30 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
       op.getName() == "value")
     return RuntimeBundleLowerer::lowerStaticCtypesValueAttrGet(op, *object);
 
+  if (object->kind == RuntimeBundle::Kind::Object &&
+      runtimeContractName(op.getObject().getType()) ==
+          "builtins.StopIteration" &&
+      op.getName() == "value") {
+    if (object->physicalValues().size() < 3)
+      return op.emitError()
+             << "StopIteration.value requires exception message storage";
+    mlir::Type stringType = runtimeContractType(context, "builtins.str");
+    RuntimeBundle result = RuntimeBundle::objectWithOwnership(
+        stringType,
+        mlir::ValueRange{object->physicalValues()[1],
+                         object->physicalValues()[2]},
+        ownership::logicalOwnershipKind(stringType, /*ownsObject=*/false));
+    if (!py::isAssignableTo(result.objectValue.contract,
+                            op.getResult().getType(), op))
+      return op.emitError() << "attribute evidence "
+                            << result.objectValue.contract
+                            << " is not assignable to result "
+                            << op.getResult().getType();
+    valueBundles[op.getResult()] = std::move(result);
+    erase.push_back(op);
+    return mlir::success();
+  }
+
   if (isMethodDescriptorKind(op) &&
       RuntimeBundleLowerer::classDefinesMethod(op.getObject().getType(),
                                                op.getName())) {
@@ -302,8 +391,16 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
     }
   }
 
+  // Box-fronted container fields: the box is the source of truth (a runtime
+  // mutation may have reallocated the arrays), so compile-time field evidence
+  // must not short-circuit the load — always reconstruct from the box words.
+  bool boxedContainerField =
+      fieldIndex && *fieldIndex < fieldTypes.size() &&
+      RuntimeBundleLowerer::classFieldStoredBoxed(fieldTypes[*fieldIndex]) &&
+      runtimeShapeContractName(fieldTypes[*fieldIndex]) != "builtins.object";
+
   auto fieldBundle = object->fieldBundles.find(op.getName());
-  if (fieldBundle != object->fieldBundles.end()) {
+  if (!boxedContainerField && fieldBundle != object->fieldBundles.end()) {
     if (!fieldBundle->second)
       return op.emitError()
              << "attribute evidence for '" << op.getName() << "' is empty";
@@ -325,6 +422,106 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
     return mlir::success();
   }
 
+  if (auto unionType = mlir::dyn_cast<py::UnionType>(op.getObject().getType())) {
+    if (object->physicalValues().empty())
+      return op.emitError() << "union attribute input has no runtime tag";
+
+    mlir::Type commonFieldType;
+    llvm::SmallVector<mlir::Type, 8> commonValueTypes;
+    llvm::SmallVector<mlir::Value, 4> selectedValues;
+    mlir::Value inputTag = object->physicalValues().front();
+
+    builder.setInsertionPoint(op);
+    for (auto [memberIndex, memberType] :
+         llvm::enumerate(unionType.getMemberTypes())) {
+      py::ClassOp memberClass =
+          RuntimeBundleLowerer::classForContract(memberType);
+      if (!memberClass)
+        return op.emitError() << "union member " << memberType
+                              << " has no class schema for attribute '"
+                              << op.getName() << "'";
+      std::optional<unsigned> memberFieldIndex =
+          RuntimeBundleLowerer::classFieldIndex(memberClass, op.getName());
+      if (!memberFieldIndex)
+        return op.emitError() << "class " << memberClass.getSymName()
+                              << " has no field '" << op.getName()
+                              << "' for union attribute access";
+      llvm::SmallVector<mlir::Type, 8> memberFieldTypes =
+          RuntimeBundleLowerer::classFieldContractTypes(memberClass);
+      if (*memberFieldIndex >= memberFieldTypes.size())
+        return op.emitError()
+               << "class field metadata is malformed for "
+               << memberClass.getSymName();
+      mlir::Type memberFieldType = memberFieldTypes[*memberFieldIndex];
+      if (primitiveI64FieldSlot(memberFieldType, *memberFieldIndex))
+        return op.emitError()
+               << "primitive union field attribute access is not supported";
+
+      mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> memberValueTypes =
+          RuntimeBundleLowerer::runtimeValueTypesFor(op, memberFieldType,
+                                                     "union field ABI");
+      if (mlir::failed(memberValueTypes))
+        return mlir::failure();
+      if (!commonFieldType) {
+        commonFieldType = memberFieldType;
+        commonValueTypes = *memberValueTypes;
+      } else if (commonFieldType != memberFieldType ||
+                 commonValueTypes != *memberValueTypes) {
+        return op.emitError()
+               << "union field '" << op.getName()
+               << "' has incompatible member field types";
+      }
+
+      mlir::FailureOr<unsigned> memberOffset =
+          RuntimeBundleLowerer::unionMemberValueOffset(
+              op, unionType, static_cast<unsigned>(memberIndex),
+              "union field member ABI");
+      if (mlir::failed(memberOffset))
+        return mlir::failure();
+      mlir::FailureOr<unsigned> fieldOffset =
+          RuntimeBundleLowerer::classFieldValueOffset(
+              op, memberClass, *memberFieldIndex, "union field ABI");
+      if (mlir::failed(fieldOffset))
+        return mlir::failure();
+      unsigned offset = *memberOffset + *fieldOffset;
+      if (offset + commonValueTypes.size() > object->physicalValues().size())
+        return op.emitError() << "union field ABI exceeds object payload";
+
+      llvm::SmallVector<mlir::Value, 4> memberValues;
+      appendValueSlice(object->physicalValues(), offset,
+                       static_cast<unsigned>(commonValueTypes.size()),
+                       memberValues);
+      if (selectedValues.empty()) {
+        selectedValues = memberValues;
+        continue;
+      }
+
+      mlir::Value tag = mlir::arith::ConstantIntOp::create(
+          builder, op.getLoc(), static_cast<std::int64_t>(memberIndex), 64);
+      mlir::Value active = mlir::arith::CmpIOp::create(
+          builder, op.getLoc(), mlir::arith::CmpIPredicate::eq, inputTag, tag);
+      for (auto [index, memberValue] : llvm::enumerate(memberValues))
+        selectedValues[index] =
+            mlir::arith::SelectOp::create(builder, op.getLoc(), active,
+                                          memberValue, selectedValues[index])
+                .getResult();
+    }
+
+    RuntimeBundle result = RuntimeBundle::objectWithOwnership(
+        commonFieldType, selectedValues,
+        ownership::logicalOwnershipKind(commonFieldType,
+                                        /*ownsObject=*/false));
+    if (!py::isAssignableTo(result.objectValue.contract,
+                            op.getResult().getType(), op))
+      return op.emitError() << "attribute evidence "
+                            << result.objectValue.contract
+                            << " is not assignable to result "
+                            << op.getResult().getType();
+    valueBundles[op.getResult()] = std::move(result);
+    erase.push_back(op);
+    return mlir::success();
+  }
+
   if (!classOp)
     return op.emitError() << "attr.get object type has no class schema";
   if (!fieldIndex)
@@ -336,8 +533,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
 
   mlir::Type fieldType = fieldTypes[*fieldIndex];
   mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> valueTypes =
-      RuntimeBundleLowerer::runtimeValueTypesFor(op, fieldType,
-                                                 "class field ABI");
+      RuntimeBundleLowerer::classFieldStorageValueTypes(op, fieldType,
+                                                        "class field ABI");
   if (mlir::failed(valueTypes))
     return mlir::failure();
   mlir::FailureOr<unsigned> offset =
@@ -351,6 +548,38 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
   llvm::SmallVector<mlir::Value, 4> values;
   appendValueSlice(object->physicalValues(), *offset,
                    static_cast<unsigned>(valueTypes->size()), values);
+  if (boxedContainerField) {
+    mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> arrayTypes =
+        RuntimeBundleLowerer::runtimeValueTypesFor(op, fieldType,
+                                                   "class field ABI");
+    if (mlir::failed(arrayTypes))
+      return mlir::failure();
+    if (values.empty())
+      return op.emitError() << "box-fronted field has no box slot";
+    builder.setInsertionPoint(op);
+    mlir::Value box = values.front();
+    llvm::SmallVector<mlir::Value, 4> rebuilt;
+    for (auto [index, type] : llvm::enumerate(*arrayTypes)) {
+      auto memrefType = mlir::dyn_cast<mlir::MemRefType>(type);
+      if (!memrefType)
+        return op.emitError()
+               << "box-fronted field '" << op.getName()
+               << "' expects memref physical values, got " << type;
+      mlir::Value ptrIndex = mlir::arith::ConstantIndexOp::create(
+          builder, op.getLoc(), static_cast<std::int64_t>(4 + index));
+      mlir::Value sizeIndex = mlir::arith::ConstantIndexOp::create(
+          builder, op.getLoc(), static_cast<std::int64_t>(9 + index));
+      mlir::Value ptrWord =
+          mlir::memref::LoadOp::create(builder, op.getLoc(), box, ptrIndex)
+              .getResult();
+      mlir::Value sizeWord =
+          mlir::memref::LoadOp::create(builder, op.getLoc(), box, sizeIndex)
+              .getResult();
+      rebuilt.push_back(RuntimeBundleLowerer::memrefFromBoxWords(
+          builder, op.getLoc(), ptrWord, sizeWord, memrefType));
+    }
+    values = std::move(rebuilt);
+  }
   RuntimeBundle result = RuntimeBundle::objectWithOwnership(
       fieldType, values,
       ownership::logicalOwnershipKind(fieldType,
@@ -429,6 +658,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
         RuntimeBundleLowerer::lowerStaticCtypesFieldAttrSet(op, *object, value);
     if (mlir::succeeded(fieldResult))
       return mlir::success();
+    if (op.getName() == "value")
+      return RuntimeBundleLowerer::lowerStaticCtypesValueAttrSet(op, *object,
+                                                                 value);
   }
   if (!value || value->kind != RuntimeBundle::Kind::Object)
     return op.emitError() << "attr.set value has no lowered runtime bundle";
@@ -494,12 +726,15 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
     return mlir::success();
   }
 
-  bool objectField =
-      runtimeShapeContractName(fieldTypes[*fieldIndex]) == "builtins.object";
+  bool boxedField =
+      RuntimeBundleLowerer::classFieldStoredBoxed(fieldTypes[*fieldIndex]);
+  mlir::Type slotStorageType =
+      boxedField ? runtimeContractType(context, "builtins.object")
+                 : fieldTypes[*fieldIndex];
   RuntimeBundle slotValue;
   bool newBoxOwnsSlot = false;
-  if (objectField && !(value->contractName() == "builtins.object" &&
-                       value->physicalValues().size() == 1)) {
+  if (boxedField && !(value->contractName() == "builtins.object" &&
+                      value->physicalValues().size() == 1)) {
     mlir::FailureOr<RuntimeBundle> boxed =
         RuntimeBundleLowerer::boxRuntimeObject(op, *value,
                                                /*retainPayload=*/true);
@@ -517,7 +752,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
   }
 
   bool retainExistingObjectHandle = false;
-  if (objectField) {
+  if (boxedField) {
     if (slotValue.contractName() == "builtins.object" &&
         slotValue.physicalValues().size() == 1) {
       retainExistingObjectHandle = !newBoxOwnsSlot;
@@ -532,8 +767,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
   }
 
   mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> fieldValueTypes =
-      RuntimeBundleLowerer::runtimeValueTypesFor(op, fieldTypes[*fieldIndex],
-                                                 "class field ABI");
+      RuntimeBundleLowerer::classFieldStorageValueTypes(
+          op, fieldTypes[*fieldIndex], "class field ABI");
   if (mlir::failed(fieldValueTypes))
     return mlir::failure();
   mlir::FailureOr<unsigned> offset =
@@ -563,13 +798,13 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
   auto oldFieldBundle = object->fieldBundles.find(op.getName());
   if (oldFieldBundle != object->fieldBundles.end())
     oldSlotValue = oldFieldBundle->second.get();
-  if (objectField) {
+  if (boxedField) {
     if (retainExistingObjectHandle &&
         mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
-            op, fieldTypes[*fieldIndex], slotValue.physicalValues(), slotName)))
+            op, slotStorageType, slotValue.physicalValues(), slotName)))
       return mlir::failure();
     if (mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
-            op, fieldTypes[*fieldIndex], oldValues, slotName)))
+            op, slotStorageType, oldValues, slotName)))
       return mlir::failure();
   } else {
     if (mlir::failed(RuntimeBundleLowerer::replaceAggregateSlot(

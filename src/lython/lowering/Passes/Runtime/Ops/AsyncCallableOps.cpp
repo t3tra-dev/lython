@@ -17,7 +17,11 @@ RuntimeBundle noneLiteralBundle(mlir::MLIRContext *context) {
 
 bool isStaticZeroDelay(const RuntimeBundle &delay) {
   auto literal = mlir::dyn_cast_or_null<py::LiteralType>(delay.contract);
-  return literal && literal.getSpelling() == "0";
+  if (!literal)
+    return false;
+  // Accept any numeric-zero spelling ("0", "0.0", ...).
+  double value = 0.0;
+  return !literal.getSpelling().getAsDouble(value) && value == 0.0;
 }
 
 mlir::Type concreteCoroutineType(mlir::MLIRContext *context,
@@ -177,6 +181,11 @@ RuntimeBundleLowerer::lowerAsyncioSleepCall(py::CallOp op,
     result = &defaultResult;
   if (result->kind != RuntimeBundle::Kind::Object)
     return op.emitError() << "asyncio.sleep result must be a Python object";
+  mlir::FailureOr<RuntimeValue> resultEvidence =
+      RuntimeBundleLowerer::materializeObjectEvidenceValue(
+          op, *result, "asyncio.sleep result evidence");
+  if (mlir::failed(resultEvidence))
+    return mlir::failure();
 
   std::optional<RuntimeSymbol> initializer =
       manifest.initializer("types.CoroutineType", "__new__");
@@ -244,8 +253,7 @@ RuntimeBundleLowerer::lowerAsyncioSleepCall(py::CallOp op,
     coroutine.objectEvidence.setSlot(kAsyncioSleepLoopSlot, loop.objectValue);
   }
   coroutine.objectEvidence.setSlot(kAsyncioSleepDelaySlot, delay->objectValue);
-  coroutine.objectEvidence.setSlot(kAsyncioSleepResultSlot,
-                                   result->objectValue);
+  coroutine.objectEvidence.setSlot(kAsyncioSleepResultSlot, *resultEvidence);
   valueBundles[op.getResult(0)] = std::move(coroutine);
   erase.push_back(op);
   return mlir::success();
@@ -267,16 +275,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFutureBoundMethod(
     bool wasPending = !hasFutureTerminalEvidence(receiver);
     std::optional<RuntimeValue> resultEvidence;
     if (wasPending) {
-      if (RuntimeBundleLowerer::hasLazyPrimitiveI64Object(*sources[1])) {
-        mlir::FailureOr<RuntimeValue> materialized =
-            RuntimeBundleLowerer::materializePrimitiveI64Object(op,
-                                                                *sources[1]);
-        if (mlir::failed(materialized))
-          return mlir::failure();
-        resultEvidence = std::move(*materialized);
-      } else {
-        resultEvidence = sources[1]->objectValue;
-      }
+      mlir::FailureOr<RuntimeValue> materialized =
+          RuntimeBundleLowerer::materializeObjectEvidenceValue(
+              op, *sources[1], "_asyncio.Future.set_result evidence");
+      if (mlir::failed(materialized))
+        return mlir::failure();
+      resultEvidence = std::move(*materialized);
     }
     if (mlir::failed(lowerManifestMethodResult(
             op, op.getResult(0), receiver, methodName, sources,

@@ -70,6 +70,11 @@ inline bool isNoneField(const parser::Node &owner, std::string_view name) {
   return value && std::holds_alternative<std::monostate>(*value);
 }
 
+inline bool isEllipsisField(const parser::Node &owner, std::string_view name) {
+  const parser::FieldValue *value = field(owner, name);
+  return value && std::holds_alternative<parser::Ellipsis>(*value);
+}
+
 inline bool isName(const parser::Node &node, std::string_view spelling) {
   auto id = string(node, "id");
   return node.kind == "Name" && id && *id == spelling;

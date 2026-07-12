@@ -1,3 +1,6 @@
+// Layer-1 dispatch (docs/lowering-architecture.md): one `lower*` method per
+// py op, selected by TypeSwitch. Add new op lowerings here, not as rewrite
+// patterns -- they need the RuntimeBundle evidence state.
 #include "Runtime/Core/Lowerer.h"
 
 namespace py::lowering {
@@ -29,6 +32,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPyOp(mlir::Operation *op) {
           [&](auto unwrap) { return lowerUnionUnwrap(unwrap); })
       .Case<py::AttrGetOp>([&](auto attr) { return lowerAttrGet(attr); })
       .Case<py::AttrSetOp>([&](auto attr) { return lowerAttrSet(attr); })
+      .Case<py::GlobalGetOp>([&](auto get) { return lowerGlobalGet(get); })
+      .Case<py::GlobalSetOp>([&](auto set) { return lowerGlobalSet(set); })
       .Case<py::PackOp>([&](auto pack) { return lowerPack(pack); })
       .Case<py::BindingRefOp>(
           [&](auto binding) { return lowerBindingRef(binding); })
@@ -41,6 +46,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPyOp(mlir::Operation *op) {
           [&](auto match) { return lowerExceptMatch(match); })
       .Case<py::ExceptCurrentMatchOp>(
           [&](auto match) { return lowerExceptCurrentMatch(match); })
+      .Case<py::ExceptCurrentValueOp>(
+          [&](auto value) { return lowerExceptCurrentValue(value); })
       .Case<py::CallOp>([&](auto call) { return lowerCall(call); })
       .Case<py::BoolOp>([&](auto boolean) { return lowerBool(boolean); })
       .Case<py::LenOp>([&](auto len) { return lowerLen(len); })
@@ -54,6 +61,16 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPyOp(mlir::Operation *op) {
       .Case<py::AIterOp>([&](auto iter) { return lowerAIter(iter); })
       .Case<py::ANextOp>([&](auto next) { return lowerANext(next); })
       .Case<py::AwaitOp>([&](auto await) { return lowerAwait(await); })
+      .Case<py::YieldValueOp>([&](auto yield) {
+        yield.emitError() << "generator function lowering is not implemented "
+                             "yet";
+        return mlir::failure();
+      })
+      .Case<py::YieldFromOp>([&](auto yieldFrom) {
+        yieldFrom.emitError()
+            << "generator yield-from lowering is not implemented yet";
+        return mlir::failure();
+      })
       .Case<py::SetItemOp>([&](auto setItem) { return lowerSetItem(setItem); })
       .Case<py::DelItemOp>([&](auto delItem) { return lowerDelItem(delItem); })
       .Case<py::ContainsOp>(

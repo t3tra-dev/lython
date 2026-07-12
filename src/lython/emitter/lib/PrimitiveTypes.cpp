@@ -237,9 +237,11 @@ mlir::Type primitivePythonResultType(mlir::Type primitiveType,
           mlir::dyn_cast_if_present<mlir::RankedTensorType>(primitiveType)) {
     mlir::Type element =
         primitivePythonResultType(tensor.getElementType(), types);
+    if (!element)
+      return {};
     return nestedListType(element, tensor.getShape(), types);
   }
-  return types.object();
+  return {};
 }
 
 } // namespace lython::emitter

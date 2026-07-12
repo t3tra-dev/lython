@@ -9,7 +9,7 @@ bool RuntimeBundleLowerer::isStaticCtypesBinding(
   if (RuntimeBundleLowerer::isStaticCtypesModuleBinding(binding) ||
       RuntimeBundleLowerer::isStaticCtypesCallable(binding))
     return true;
-  return ctypesQualifiedNameContract(binding).has_value();
+  return ctypesQualifiedNameContract(*context, binding).has_value();
 }
 
 bool RuntimeBundleLowerer::isStaticCtypesModuleBinding(
@@ -23,12 +23,7 @@ bool RuntimeBundleLowerer::isStaticCtypesCallable(
   if (ctypesFromAddressTarget(binding) || ctypesFromBufferTarget(binding) ||
       ctypesFromBufferCopyTarget(binding))
     return true;
-  return llvm::StringSwitch<bool>(binding)
-      .Cases({"ctypes.sizeof", "ctypes.alignment", "ctypes.byref",
-              "ctypes.pointer", "ctypes.POINTER", "ctypes.cast",
-              "ctypes.addressof"},
-             true)
-      .Default(false);
+  return isStaticCtypesFunctionName(*context, binding);
 }
 
 mlir::LogicalResult
@@ -42,7 +37,7 @@ RuntimeBundleLowerer::lowerStaticCtypesBindingRef(py::BindingRefOp op) {
     return mlir::success();
   }
   if (std::optional<std::string> contract =
-          ctypesQualifiedNameContract(op.getBinding())) {
+          ctypesQualifiedNameContract(*context, op.getBinding())) {
     valueBundles[op.getResult()] = RuntimeBundle::typeObject(
         op.getResult().getType(), ctypesContractType(context, *contract));
     erase.push_back(op);
@@ -72,13 +67,14 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesModuleAttrGet(
     return mlir::success();
   }
   if (std::optional<std::string> contract =
-          ctypesModuleAttrContract(moduleName, op.getName())) {
+          ctypesModuleAttrContract(*context, moduleName, op.getName())) {
     valueBundles[op.getResult()] = RuntimeBundle::typeObject(
         op.getResult().getType(), ctypesContractType(context, *contract));
     erase.push_back(op);
     return mlir::success();
   }
-  if (moduleName == "ctypes" && isStaticCtypesFunctionName(op.getName())) {
+  if (moduleName == "ctypes" &&
+      isStaticCtypesFunctionName(*context, op.getName())) {
     valueBundles[op.getResult()] = RuntimeBundle::builtinCallable(
         op.getResult().getType(),
         (llvm::Twine("ctypes.") + op.getName()).str());
@@ -94,14 +90,117 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesValueAttrGet(
   if (!object.ctypes ||
       object.ctypes->kind != RuntimeCtypesEvidence::Kind::Cell)
     return mlir::failure();
-  if (!object.ctypes->scalarValue || !object.ctypes->scalarValid)
-    return op.emitError() << "ctypes value attribute requires scalar evidence";
+
+  mlir::Value scalar = object.ctypes->scalarValue;
+  mlir::Value valid = object.ctypes->scalarValid;
+  // A cell with no in-SSA scalar (e.g. `from_address(addr)`) reads its value
+  // from native storage. This load is async-signal-safe.
+  if (!scalar || !valid) {
+    mlir::Value address = cdataStorageAddress(*object.ctypes);
+    mlir::Value addressValid = cdataStorageAddressValid(*object.ctypes);
+    if (!address || !addressValid || !isKnownTrue(addressValid))
+      return op.emitError() << "ctypes value attribute requires scalar or "
+                               "materialized storage evidence";
+    std::optional<TargetPlatformFacts> facts = targetPlatformFacts(module);
+    std::optional<CtypesLayout> layout = ctypesStaticLayoutForType(
+        module, object.ctypes->ctype, facts);
+    if (!layout)
+      layout = ctypesStaticLayout(module, object.ctypes->ctypeName, facts);
+    if (!layout || !(isIntegerScalarLayout(*layout) ||
+                     isPointerScalarLayout(*layout)))
+      return op.emitError() << "ctypes value read requires a scalar integer "
+                               "layout for "
+                            << object.ctypes->ctypeName;
+    builder.setInsertionPoint(op);
+    mlir::Value loaded = loadNativeIntegerFromAddress(
+        builder, op.getLoc(), address, nativeIntegerType(builder, *layout),
+        facts);
+    scalar = widenNativeInteger(builder, op.getLoc(), loaded, *layout);
+    valid = constantI1(builder, op.getLoc(), true);
+  }
   RuntimeBundle result;
   if (mlir::failed(RuntimeBundleLowerer::makePrimitiveI64Bundle(
-          op, runtimeContractType(context, "builtins.int"),
-          object.ctypes->scalarValue, object.ctypes->scalarValid, result)))
+          op, runtimeContractType(context, "builtins.int"), scalar, valid,
+          result)))
     return mlir::failure();
   valueBundles[op.getResult()] = std::move(result);
+  erase.push_back(op);
+  return mlir::success();
+}
+
+// `cell.value = v`: scalar cells carry their value both as SSA evidence
+// (scalarValue) and, when materialized, in native storage -- update both so
+// later reads and byref/native-call uses agree.
+mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesValueAttrSet(
+    py::AttrSetOp op, const RuntimeBundle &object, const RuntimeBundle *value) {
+  if (!object.ctypes ||
+      object.ctypes->kind != RuntimeCtypesEvidence::Kind::Cell)
+    return mlir::failure();
+  if (!value)
+    return op.emitError() << "ctypes value assignment has no value evidence";
+
+  builder.setInsertionPoint(op);
+  RuntimeCtypesEvidence evidence = *object.ctypes;
+  if (value->primitiveI64 && value->primitiveI64->value &&
+      value->primitiveI64->valid &&
+      isKnownTrue(value->primitiveI64->valid)) {
+    evidence.scalarValue = value->primitiveI64->value;
+    evidence.scalarValid = value->primitiveI64->valid;
+  } else if (value->ctypes && value->ctypes->scalarValue &&
+             value->ctypes->scalarValid &&
+             isKnownTrue(value->ctypes->scalarValid)) {
+    evidence.scalarValue = value->ctypes->scalarValue;
+    evidence.scalarValid = value->ctypes->scalarValid;
+  } else {
+    // Runtime-computed ints (dynamic fits-i64 flag) normalize through the
+    // manifest unbox primitive.
+    std::optional<RuntimeSymbol> unbox =
+        manifest.primitive(value->contractName(), "unbox.i64");
+    if (!unbox ||
+        unbox->function.getNumArguments() != value->physicalValues().size())
+      return op.emitError()
+             << "ctypes value assignment requires primitive integer evidence";
+    mlir::func::CallOp unboxCall = RuntimeBundleLowerer::createRuntimeCall(
+        op.getLoc(), *unbox, value->physicalValues());
+    evidence.scalarValue = unboxCall.getResult(0);
+    evidence.scalarValid = constantI1(builder, op.getLoc(), true);
+  }
+
+  mlir::Value storageAddress = cdataStorageAddress(evidence);
+  mlir::Value storageValid = cdataStorageAddressValid(evidence);
+  if (storageAddress && storageValid && isKnownTrue(storageValid)) {
+    std::optional<TargetPlatformFacts> facts = targetPlatformFacts(module);
+    std::optional<CtypesLayout> layout =
+        ctypesStaticLayoutForType(module, evidence.ctype, facts);
+    if (!layout)
+      layout = ctypesStaticLayout(module, evidence.ctypeName, facts);
+    if (!layout)
+      return op.emitError() << "ctypes value assignment requires a static "
+                               "layout for "
+                            << evidence.ctypeName;
+    // The normalized scalar evidence (known-valid i64) is what stores; the
+    // original bundle may only carry a dynamic fits-i64 flag.
+    RuntimeBundle scalarSource =
+        RuntimeBundle::object(evidence.ctype ? evidence.ctype
+                                             : op.getValue().getType(),
+                              {});
+    RuntimeCtypesEvidence scalarEvidence;
+    scalarEvidence.kind = RuntimeCtypesEvidence::Kind::Cell;
+    scalarEvidence.lifetime = RuntimeCtypesEvidence::Lifetime::Static;
+    scalarEvidence.ctypeName = evidence.ctypeName;
+    scalarEvidence.ctype = evidence.ctype;
+    scalarEvidence.scalarValue = evidence.scalarValue;
+    scalarEvidence.scalarValid = constantI1(builder, op.getLoc(), true);
+    scalarSource.ctypes = std::move(scalarEvidence);
+    if (mlir::failed(storeCtypesValueToAddress(
+            op, builder, module, storageAddress, evidence.ctype,
+            evidence.ctypeName, *layout, scalarSource, facts)))
+      return mlir::failure();
+  }
+
+  RuntimeBundle updated = object;
+  updated.ctypes = std::move(evidence);
+  valueBundles[op.getObject()] = std::move(updated);
   erase.push_back(op);
   return mlir::success();
 }
@@ -265,9 +364,33 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesFieldAttrSet(
   mlir::Value fieldAddress =
       addressWithOffset(builder, op.getLoc(), storageAddress,
                         static_cast<std::int64_t>(field->offset), facts);
+  // A scalar/pointer field assigned a RUNTIME int (dynamic fits-i64 flag)
+  // needs a known-valid primitive: normalize via unbox so the store accepts
+  // it (extractNativeInteger/PointerArgument require statically-valid scalars).
+  RuntimeBundle normalized = *value;
+  if ((isIntegerScalarLayout(field->layout) ||
+       isPointerScalarLayout(field->layout)) &&
+      value->contractName() == "builtins.int" &&
+      !(value->primitiveI64 && value->primitiveI64->valid &&
+        isKnownTrue(value->primitiveI64->valid))) {
+    mlir::Value raw;
+    if (value->primitiveI64 && value->primitiveI64->value) {
+      raw = value->primitiveI64->value;
+    } else if (std::optional<RuntimeSymbol> unbox = manifest.primitive(
+                   value->contractName(), "unbox.i64")) {
+      raw = RuntimeBundleLowerer::createRuntimeCall(op.getLoc(), *unbox,
+                                                    value->physicalValues())
+                .getResult(0);
+    }
+    if (raw) {
+      normalized.primitiveI64 =
+          RuntimePrimitiveI64Evidence{raw, constantI1(builder, op.getLoc(),
+                                                      true)};
+    }
+  }
   if (mlir::failed(storeCtypesValueToAddress(op, builder, module, fieldAddress,
                                              field->type, field->contract,
-                                             field->layout, *value, facts)))
+                                             field->layout, normalized, facts)))
     return mlir::failure();
 
   valueBundles[op.getObject()] = object;
@@ -369,16 +492,16 @@ RuntimeBundleLowerer::bindErasedCtypesNew(py::NewOp op,
   if (!scalar && !aggregate)
     return mlir::failure();
 
-  RuntimeBundle bundle = RuntimeBundle::object(op.getInstance().getType(), {});
-  RuntimeCtypesEvidence evidence;
-  evidence.kind = RuntimeCtypesEvidence::Kind::Cell;
-  evidence.provenance = RuntimeCtypesEvidence::Provenance::NativeCell;
-  evidence.lifetime = RuntimeCtypesEvidence::Lifetime::Owner;
-  evidence.ctypeName = contract.str();
-  evidence.ctype = op.getInstance().getType();
-  evidence.ownsNativeStorage = true;
-  bundle.ctypes = std::move(evidence);
-  valueBundles[op.getInstance()] = std::move(bundle);
+  // Materialize the zero-initialized storage HERE: classes without a source
+  // __init__ (the common Structure-subclass shape) never emit py.init, so
+  // the cell must be usable straight from construction. A following
+  // lowerErasedCtypesInit simply re-materializes with its arguments.
+  builder.setInsertionPoint(op);
+  mlir::FailureOr<RuntimeBundle> materialized = materializeCtypesCell(
+      op, builder, module, op.getInstance().getType(), contract, {});
+  if (mlir::failed(materialized))
+    return mlir::failure();
+  valueBundles[op.getInstance()] = std::move(*materialized);
   erase.push_back(op);
   return mlir::success();
 }
@@ -453,6 +576,153 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesLibraryInit(
   return mlir::success();
 }
 
+// `HANDLER(f)` where HANDLER came from ctypes.CFUNCTYPE: wrap the compiled
+// function in a C-ABI callback. The thunk itself can only exist at the LLVM
+// layer (a func.func has no takeable address before conversion), so this
+// step records the request as an ADDRESS PLACEHOLDER: a declared
+// `() -> i64` function carrying the native signature and the primitive-ABI
+// clone target as attributes; the callback-thunk materialization phase
+// (after convert-to-llvm) generates the thunk and fills the body with
+// addressof + ptrtoint.
+mlir::LogicalResult RuntimeBundleLowerer::lowerCtypesCallbackConstruction(
+    py::CallOp op, const RuntimeBundle &callable,
+    llvm::ArrayRef<const RuntimeBundle *> sources) {
+  if (op.getNumResults() != 1 || sources.size() != 1 || !sources.front())
+    return op.emitError()
+           << "ctypes callback construction expects one function argument";
+  const RuntimeBundle &target = *sources.front();
+
+  // CALL-THROUGH-ADDRESS: `PROTO(addr)` where addr is a runtime integer builds
+  // a CFuncPtr whose target is a foreign function at that address (the inverse
+  // of the callback thunk). Calling it emits an INDIRECT native call through
+  // the address (see lowerStaticCtypesNativeCall). This is how signal-safe
+  // code invokes a pre-resolved libc function pointer.
+  if (target.functionTarget.empty() && target.primitiveI64 &&
+      target.primitiveI64->value && target.primitiveI64->valid &&
+      isKnownTrue(target.primitiveI64->valid)) {
+    RuntimeBundle result = RuntimeBundle::object(op.getResult(0).getType(), {});
+    RuntimeCtypesEvidence evidence;
+    evidence.kind = RuntimeCtypesEvidence::Kind::Symbol;
+    evidence.provenance = RuntimeCtypesEvidence::Provenance::ExternalAddress;
+    evidence.lifetime = RuntimeCtypesEvidence::Lifetime::Static;
+    evidence.ctypeName = "_ctypes.CFuncPtr";
+    evidence.ctype = ctypesContractType(context, "_ctypes.CFuncPtr");
+    evidence.argTypes = callable.ctypes->argTypes;
+    evidence.resultType = callable.ctypes->resultType;
+    evidence.addressValue = target.primitiveI64->value;
+    evidence.addressValid = target.primitiveI64->valid;
+    result.ctypes = std::move(evidence);
+    valueBundles[op.getResult(0)] = std::move(result);
+    erase.push_back(op);
+    return mlir::success();
+  }
+
+  if (target.functionTarget.empty())
+    return op.emitError()
+           << "ctypes callback requires a direct reference to a module-level "
+              "function or a runtime integer address";
+  std::optional<std::string> clone =
+      RuntimeBundleLowerer::primitiveI64CloneFor(target.functionTarget);
+  if (!clone)
+    return op.emitError()
+           << "ctypes callback target '" << target.functionTarget
+           << "' must take only int parameters and return int so its "
+              "primitive ABI clone exists";
+
+  std::optional<TargetPlatformFacts> facts = targetPlatformFacts(module);
+  auto nativeCode =
+      [&](llvm::StringRef contractName) -> std::optional<std::string> {
+    std::optional<CtypesLayout> layout =
+        ctypesStaticLayout(module, contractName, facts);
+    if (!layout)
+      return std::nullopt;
+    if (isPointerScalarLayout(*layout))
+      return std::string("p");
+    if (layout->kind == CtypesLayout::ABIKind::SignedInteger)
+      return "s" + std::to_string(layout->size * 8);
+    if (layout->kind == CtypesLayout::ABIKind::UnsignedInteger)
+      return "u" + std::to_string(layout->size * 8);
+    return std::nullopt;
+  };
+
+  llvm::SmallVector<mlir::Attribute, 4> argCodes;
+  for (const std::string &argContract : callable.ctypes->argTypes) {
+    std::optional<std::string> code = nativeCode(argContract);
+    if (!code)
+      return op.emitError() << "ctypes callback argument type " << argContract
+                            << " has no scalar native ABI";
+    argCodes.push_back(builder.getStringAttr(*code));
+  }
+  std::string resultCode = "void";
+  if (callable.ctypes->resultType &&
+      *callable.ctypes->resultType != "types.NoneType") {
+    std::optional<std::string> code = nativeCode(*callable.ctypes->resultType);
+    if (!code)
+      return op.emitError() << "ctypes callback result type "
+                            << *callable.ctypes->resultType
+                            << " has no scalar native ABI";
+    resultCode = *code;
+  }
+
+  // The clone takes one logical int per callback parameter.
+  if (mlir::func::FuncOp cloneFunction =
+          module.lookupSymbol<mlir::func::FuncOp>(*clone)) {
+    auto callableAttr =
+        cloneFunction->getAttrOfType<mlir::TypeAttr>("callable_type");
+    auto callableType = mlir::dyn_cast_if_present<py::CallableType>(
+        callableAttr ? callableAttr.getValue() : mlir::Type());
+    if (!callableType ||
+        callableType.getPositionalTypes().size() != argCodes.size())
+      return op.emitError()
+             << "ctypes callback signature has " << argCodes.size()
+             << " parameters, but '" << target.functionTarget << "' takes "
+             << (callableType ? callableType.getPositionalTypes().size() : 0);
+  }
+
+  std::string suffix = std::to_string(callbackThunkCounter++);
+  std::string addressSymbol = "__ly_callback_address_" + suffix;
+  std::string thunkSymbol = "__ly_callback_thunk_" + suffix;
+  {
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToEnd(module.getBody());
+    auto addressFunction = mlir::func::FuncOp::create(
+        builder, op.getLoc(), addressSymbol,
+        builder.getFunctionType({}, {builder.getI64Type()}));
+    addressFunction.setPrivate();
+    addressFunction->setAttr("ly.callback.thunk",
+                             builder.getStringAttr(thunkSymbol));
+    // A SymbolRef (not a plain string) so symbol DCE sees the clone as used.
+    addressFunction->setAttr(
+        "ly.callback.target",
+        mlir::FlatSymbolRefAttr::get(builder.getContext(), *clone));
+    addressFunction->setAttr("ly.callback.args",
+                             builder.getArrayAttr(argCodes));
+    addressFunction->setAttr("ly.callback.result",
+                             builder.getStringAttr(resultCode));
+  }
+
+  builder.setInsertionPoint(op);
+  auto addressCall = mlir::func::CallOp::create(
+      builder, op.getLoc(), addressSymbol,
+      mlir::TypeRange{builder.getI64Type()}, mlir::ValueRange{});
+
+  RuntimeBundle result = RuntimeBundle::object(op.getResult(0).getType(), {});
+  RuntimeCtypesEvidence evidence;
+  evidence.kind = RuntimeCtypesEvidence::Kind::Cell;
+  evidence.provenance = RuntimeCtypesEvidence::Provenance::CallbackThunk;
+  evidence.lifetime = RuntimeCtypesEvidence::Lifetime::Static;
+  evidence.ctypeName = "_ctypes.CFuncPtr";
+  evidence.ctype = ctypesContractType(context, "_ctypes.CFuncPtr");
+  evidence.argTypes = callable.ctypes->argTypes;
+  evidence.resultType = callable.ctypes->resultType;
+  evidence.scalarValue = addressCall.getResult(0);
+  evidence.scalarValid = constantI1(builder, op.getLoc(), true);
+  result.ctypes = std::move(evidence);
+  valueBundles[op.getResult(0)] = std::move(result);
+  erase.push_back(op);
+  return mlir::success();
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesTypeObjectCall(
     py::CallOp op, const RuntimeBundle &callable) {
   if (op.getNumResults() != 1)
@@ -471,6 +741,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesTypeObjectCall(
                                               "ctypes constructor arguments",
                                               sources, &unpackedSources)))
     return mlir::failure();
+
+  if (*contract == "_ctypes.CFuncPtr" && callable.ctypes &&
+      callable.ctypes->provenance ==
+          RuntimeCtypesEvidence::Provenance::CallbackThunk)
+    return RuntimeBundleLowerer::lowerCtypesCallbackConstruction(op, callable,
+                                                                 sources);
 
   mlir::Type ctype = callable.instanceContract
                          ? callable.instanceContract
@@ -493,14 +769,15 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesModuleCall(
       receiver.ctypes->kind != RuntimeCtypesEvidence::Kind::Module)
     return mlir::failure();
   llvm::StringRef moduleName = receiver.ctypes->ctypeName;
-  if (moduleName == "ctypes" && isStaticCtypesFunctionName(methodName)) {
+  if (moduleName == "ctypes" &&
+      isStaticCtypesFunctionName(*context, methodName)) {
     RuntimeBundle callable = RuntimeBundle::builtinCallable(
         op.getCallable().getType(),
         (llvm::Twine("ctypes.") + methodName).str());
     return RuntimeBundleLowerer::lowerStaticCtypesCall(op, callable);
   }
   if (std::optional<std::string> contract =
-          ctypesModuleAttrContract(moduleName, methodName)) {
+          ctypesModuleAttrContract(*context, moduleName, methodName)) {
     RuntimeBundle typeObject = RuntimeBundle::typeObject(
         op.getCallable().getType(), ctypesContractType(context, *contract));
     return RuntimeBundleLowerer::lowerStaticCtypesTypeObjectCall(op,

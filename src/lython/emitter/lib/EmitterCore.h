@@ -7,6 +7,7 @@
 #include "mlir/IR/Builders.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
 
 namespace lython::emitter {
 
@@ -24,14 +25,43 @@ private:
   mlir::Type callProtocolFor(mlir::Type calleeType) const;
   mlir::Type callProtocolFor(const CallInferenceResult &inference,
                              mlir::Type fallback = {}) const;
+  bool requireStaticEvidence(const parser::Node &anchor,
+                             const CallInferenceResult &inference);
+  bool requireStaticEvidence(const parser::Node &anchor,
+                             const AwaitInferenceResult &inference);
+  bool requireStaticEvidence(const parser::Node &anchor,
+                             const YieldFromInferenceResult &inference);
+  bool requireStaticEvidence(const parser::Node &anchor,
+                             const AsyncIterationInferenceResult &inference);
+  bool
+  requireStaticEvidence(const parser::Node &anchor,
+                        const AsyncContextMethodInferenceResult &inference);
   mlir::Type boolProtocol() const;
-  mlir::Type coroutineType(mlir::Type resultType) const;
-  FunctionSignature asyncPublicSignature(FunctionSignature sig) const;
 
   void predeclareTopLevel();
+  void predeclareSourceModules();
   void emitTopLevelDeclarations();
+  void emitSourceModuleDeclarations();
+  void bindSourceModuleLocals(llvm::StringRef moduleName,
+                              const parser::Node &sourceModule, bool isStub);
+  void bindModuleImportScope(const parser::Node &sourceModule,
+                             bool diagnoseUnsupported);
   bool bindImportStatement(const parser::Node &statement,
                            bool diagnoseUnsupported);
+  const EmitOptions::SourceModule *
+  lookupSourceModule(llvm::StringRef module) const;
+  bool isStubSourceModuleSymbol(llvm::StringRef symbol) const;
+  bool bindSourceModuleNamespace(llvm::StringRef module,
+                                 llvm::StringRef localName);
+  bool bindSourceModuleName(llvm::StringRef module,
+                            llvm::StringRef exportedName,
+                            llvm::StringRef localName);
+  bool bindSourceModuleReexport(const EmitOptions::SourceModule &source,
+                                llvm::StringRef exportedName,
+                                llvm::StringRef localName);
+  bool bindSourceModuleStar(llvm::StringRef module,
+                            const parser::Node &anchor,
+                            bool diagnoseUnsupported);
   void emitFunctionDecl(const parser::Node &function);
   void emitCallableFunction(const parser::Node &callable,
                             llvm::StringRef symbolName,
@@ -48,25 +78,36 @@ private:
                         llvm::StringRef attrName) const;
   Value emitNestedFunctionDecl(const parser::Node &function);
   Value emitLambda(const parser::Node &expr, py::CallableType expected = {});
-  void emitClassContract(const parser::Node &classDef);
+  void emitClassContract(const parser::Node &classDef,
+                         llvm::StringRef symbolName = {});
   void collectClassFields(const parser::Node &classDef,
                           llvm::SmallVectorImpl<std::string> &fieldNames,
-                          llvm::SmallVectorImpl<mlir::Type> &fieldTypes) const;
+                          llvm::SmallVectorImpl<mlir::Type> &fieldTypes);
   void collectStaticClassAssignments(
       const parser::Node &classDef, llvm::SmallVectorImpl<std::string> &names,
       llvm::SmallVectorImpl<mlir::Attribute> &values,
-      llvm::SmallVectorImpl<mlir::Type> *types = nullptr) const;
+      llvm::SmallVectorImpl<mlir::Type> *types = nullptr);
   void collectStaticModuleAssignments(
       const parser::Node &moduleNode, llvm::SmallVectorImpl<std::string> &names,
       llvm::SmallVectorImpl<mlir::Attribute> &values) const;
+  void collectModuleGlobals(const parser::Node &moduleNode);
+  bool isModuleGlobalRead(llvm::StringRef name) const;
+  bool isModuleGlobalWrite(llvm::StringRef name) const;
 
   void emitStatements(const std::vector<parser::NodePtr> *statements,
                       bool skipDeclarations = false);
   void emitStatement(const parser::Node &statement);
   void emitAssignTarget(const parser::Node &target, Value value);
   void emitIf(const parser::Node &statement);
+  void emitMatch(const parser::Node &statement);
   void emitFor(const parser::Node &statement);
+  void emitGeneratorExpFor(const parser::Node &statement,
+                           const parser::Node &genexpr);
+  void emitWhile(const parser::Node &statement);
   void emitAsyncFor(const parser::Node &statement);
+  llvm::SmallVector<mlir::Value, 4>
+  loopCarriedBranchOperands(const parser::Node &anchor,
+                            const LoopControlContext &loop, mlir::Block *target);
   void emitTry(const parser::Node &statement);
   void emitWith(const parser::Node &statement, bool async);
   void emitWithCleanup(const parser::Node &anchor, const WithCleanup &cleanup);
@@ -86,6 +127,12 @@ private:
                                const MethodBinding &method);
   Value emitMethodObject(const parser::Node &anchor, Value receiver,
                          const MethodBinding &method);
+  // Operator protocol on a source-class receiver (x[i], x[i]=v, len(x),
+  // i in x): the class method inlines with pre-built arguments, the same
+  // dispatch as an explicit x.__getitem__(i) call.
+  Value emitInlineOperatorCall(const parser::Node &anchor, Value receiver,
+                               const MethodBinding &method,
+                               llvm::ArrayRef<Value> positional);
   Value emitInlineMethodCall(const parser::Node &expr, Value receiver,
                              const MethodBinding &method);
   Value emitInlineMethodBody(const parser::Node &anchor, Value receiver,
@@ -98,13 +145,39 @@ private:
   Value emitUnary(const parser::Node &expr);
   Value emitBinary(const parser::Node &expr);
   Value emitCompare(const parser::Node &expr);
+  // Scalar (non-Optional) comparison dispatch: primitive path, bool-vs-bool
+  // truth compare, None-identity narrowing, membership, then the manifest
+  // rich-comparison special ops. Shared by emitCompare and the Optional
+  // member branch.
+  Value emitScalarCompare(const parser::Node &expr, Value lhs, Value rhs,
+                          const parser::Node *op);
+  // `Optional[T] ==/!= x` (and the commuted form): dispatches on the union's
+  // active member — a None member compares unequal to any concrete value, a
+  // present member re-enters emitScalarCompare. Returns nullopt when neither
+  // operand is an `Optional` of a single concrete member.
+  std::optional<Value> emitOptionalCompare(const parser::Node &expr, Value lhs,
+                                           Value rhs, const parser::Node *op);
   Value emitSubscript(const parser::Node &expr);
   Value emitAttribute(const parser::Node &expr);
   Value emitAwait(const parser::Node &expr);
+  Value emitAsyncioRunCall(const parser::Node &expr);
   Value emitAwaitValue(const parser::Node &anchor, Value awaitable);
+  Value emitAwaitValue(const parser::Node &anchor, Value awaitable,
+                       const AwaitInferenceResult &inference);
   Value emitContainerLiteral(const parser::Node &expr);
+  Value emitListComp(const parser::Node &expr);
+  Value emitDictComp(const parser::Node &expr);
+  Value emitComprehension(const parser::Node &expr, bool isDict,
+                          bool isSet = false);
   Value emitBindingRef(const parser::Node &anchor, llvm::StringRef binding,
                        mlir::Type type, llvm::ArrayRef<Value> captures = {});
+  std::optional<Value> emitManifestFloatConstant(const parser::Node &anchor,
+                                                 llvm::StringRef binding);
+  std::optional<Value> emitStaticStringConstant(const parser::Node &anchor,
+                                                llvm::StringRef binding,
+                                                bool allowCallable = false);
+  std::optional<Value> emitLiteralTypeConstant(const parser::Node &anchor,
+                                               mlir::Type type);
   Value emitFunctionObject(const parser::Node &anchor,
                            llvm::StringRef symbolName, mlir::Type type,
                            llvm::ArrayRef<Capture> captures);
@@ -143,6 +216,7 @@ private:
   mlir::MLIRContext &context;
   std::string moduleName;
   std::string sourceName;
+  std::string activePackageName;
   EmitOptions options;
   mlir::OpBuilder builder;
   AlgorithmM types;
@@ -150,13 +224,29 @@ private:
   llvm::StringMap<Value> values;
   llvm::StringMap<PrimitiveConstant> primitiveConstants;
   llvm::StringMap<llvm::StringMap<mlir::Type>> classFieldBindings;
+  // Declaration order of each class's fields (classFieldBindings is
+  // unordered); drives the synthesized field-record constructor.
+  llvm::StringMap<llvm::SmallVector<std::string, 8>> classFieldOrders;
   llvm::StringMap<llvm::StringMap<mlir::Type>> classStaticAttrBindings;
   llvm::StringMap<llvm::StringMap<MethodBinding>> classMethodBindings;
+  // Module-level mutable globals, opted in by an int annotation at module
+  // scope (`NAME: int = ...`). Backed by process-lifetime storage so reads
+  // are async-signal-safe (see py.global.get/set); referenced from any scope,
+  // written from module scope or a `global NAME` declaration in a function.
+  llvm::StringMap<mlir::Type> moduleGlobals;
+  // Names declared `global` in the function currently being emitted (writes
+  // to them target the module global instead of a new local). Saved/restored
+  // around each callable body.
+  llvm::StringSet<> currentGlobalDecls;
+  bool atModuleScope = false;
   mlir::Type currentReturnType;
+  mlir::Type currentGeneratorSendType;
   std::string currentFunctionPrefix;
   unsigned syntheticFunctionCounter = 0;
+  unsigned listCompCounter = 0;
   llvm::SmallVector<WithCleanup, 8> activeWithCleanups;
   llvm::SmallVector<InlineReturnContext, 4> inlineReturnContexts;
+  llvm::SmallVector<LoopControlContext, 4> loopControlContexts;
 };
 
 } // namespace lython::emitter

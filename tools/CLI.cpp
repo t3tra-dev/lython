@@ -1,4 +1,5 @@
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
+#include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -12,6 +13,9 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/Transform/IR/TransformDialect.h"
+#include "mlir/Transforms/Passes.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/BufferizableOpInterfaceImpl.h"
@@ -81,7 +85,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <functional>
 #include <optional>
+#include <set>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -95,6 +101,7 @@
 #include "Common/LoweringPipeline.h"
 #include "Common/RuntimeLibrary.h"
 #include "Common/RuntimeSupport.h"
+#include "embedded.h"
 #include "Emitter.h"
 #include "Parser.h"
 #include "Passes/Runtime/Arch/Arm/PrimitiveTensorArmSME.h"
@@ -543,6 +550,418 @@ LogicalResult runCppParserDump(StringRef inputPath, bool typeComments,
 
 std::string pythonTracebackPath(StringRef inputPath);
 
+const std::vector<lython::parser::NodePtr> *
+nodeListField(const lython::parser::Node &node, StringRef name) {
+  const lython::parser::Field *field =
+      lython::parser::findField(node, name.str());
+  if (!field)
+    return nullptr;
+  return std::get_if<std::vector<lython::parser::NodePtr>>(&field->value);
+}
+
+std::optional<std::string> stringField(const lython::parser::Node &node,
+                                       StringRef name) {
+  const lython::parser::Field *field =
+      lython::parser::findField(node, name.str());
+  if (!field)
+    return std::nullopt;
+  if (const auto *value = std::get_if<std::string>(&field->value))
+    return *value;
+  return std::nullopt;
+}
+
+std::int64_t integerField(const lython::parser::Node &node, StringRef name,
+                          std::int64_t fallback = 0) {
+  const lython::parser::Field *field =
+      lython::parser::findField(node, name.str());
+  if (!field)
+    return fallback;
+  if (const auto *value = std::get_if<std::int64_t>(&field->value))
+    return *value;
+  return fallback;
+}
+
+std::string joinModuleName(StringRef prefix, StringRef suffix) {
+  if (prefix.empty())
+    return suffix.str();
+  if (suffix.empty())
+    return prefix.str();
+  return (Twine(prefix) + "." + suffix).str();
+}
+
+struct LocalSourceModulePath {
+  std::string path;
+  bool isStub = false;
+  bool isPackage = false;
+  bool isEmbedded = false;
+};
+
+const py::runtime_library::embedded::StdlibSourceModule *
+embeddedStdlibSource(StringRef moduleName) {
+  namespace embedded = py::runtime_library::embedded;
+  for (std::size_t index = 0; index < embedded::stdlibSourceModuleCount();
+       ++index) {
+    const embedded::StdlibSourceModule &entry =
+        embedded::stdlibSourceModules()[index];
+    if (moduleName == entry.name)
+      return &entry;
+  }
+  return nullptr;
+}
+
+std::optional<LocalSourceModulePath> localSourceModulePath(StringRef baseDir,
+                                                           StringRef moduleName) {
+  llvm::SmallVector<StringRef, 8> parts;
+  moduleName.split(parts, '.');
+  if (parts.empty())
+    return std::nullopt;
+  llvm::SmallString<256> path(baseDir.empty() ? "." : baseDir);
+  for (StringRef part : parts) {
+    if (part.empty())
+      return std::nullopt;
+    llvm::sys::path::append(path, part);
+  }
+  llvm::SmallString<256> sourcePath(path);
+  sourcePath += ".py";
+  if (llvm::sys::fs::exists(sourcePath))
+    return LocalSourceModulePath{sourcePath.str().str(), false, false};
+
+  llvm::SmallString<256> stubPath(path);
+  stubPath += ".pyi";
+  if (llvm::sys::fs::exists(stubPath))
+    return LocalSourceModulePath{stubPath.str().str(), true, false};
+
+  llvm::SmallString<256> packageSourcePath(path);
+  llvm::sys::path::append(packageSourcePath, "__init__.py");
+  if (llvm::sys::fs::exists(packageSourcePath))
+    return LocalSourceModulePath{packageSourcePath.str().str(), false, true};
+
+  llvm::SmallString<256> packageStubPath(path);
+  llvm::sys::path::append(packageStubPath, "__init__.pyi");
+  if (llvm::sys::fs::exists(packageStubPath))
+    return LocalSourceModulePath{packageStubPath.str().str(), true, true};
+
+  // Embedded stdlib source (runtime/lib/*.py): resolved after user files,
+  // before module manifests; compiled with the program like any source module.
+  if (embeddedStdlibSource(moduleName))
+    return LocalSourceModulePath{("<stdlib>/" + moduleName + ".py").str(),
+                                 false, false, /*isEmbedded=*/true};
+  return std::nullopt;
+}
+
+bool packageInitExists(StringRef directory) {
+  if (directory.empty())
+    return false;
+  llvm::SmallString<256> initPath(directory);
+  llvm::sys::path::append(initPath, "__init__.py");
+  if (llvm::sys::fs::exists(initPath))
+    return true;
+  llvm::SmallString<256> stubPath(directory);
+  llvm::sys::path::append(stubPath, "__init__.pyi");
+  return llvm::sys::fs::exists(stubPath);
+}
+
+std::string staticPackageNameForSourcePath(StringRef sourcePath) {
+  llvm::SmallVector<std::string, 8> reversedParts;
+  llvm::SmallString<256> directory(llvm::sys::path::parent_path(sourcePath));
+  while (!directory.empty() && packageInitExists(directory)) {
+    reversedParts.push_back(llvm::sys::path::filename(directory).str());
+    std::string parent = llvm::sys::path::parent_path(directory).str();
+    directory = parent;
+  }
+
+  std::string packageName;
+  for (auto it = reversedParts.rbegin(), end = reversedParts.rend(); it != end;
+       ++it)
+    packageName = joinModuleName(packageName, *it);
+  return packageName;
+}
+
+std::string packageNameForModuleName(StringRef moduleName) {
+  std::pair<StringRef, StringRef> split = moduleName.rsplit('.');
+  if (split.second.empty())
+    return {};
+  return split.first.str();
+}
+
+std::optional<std::string> relativeBasePackage(StringRef packageName,
+                                               std::int64_t level) {
+  if (level <= 0)
+    return packageName.str();
+  if (packageName.empty())
+    return std::nullopt;
+  llvm::SmallVector<StringRef, 8> parts;
+  packageName.split(parts, '.');
+  if (level > static_cast<std::int64_t>(parts.size()))
+    return std::nullopt;
+
+  std::string resolved;
+  std::size_t keep = parts.size() - static_cast<std::size_t>(level - 1);
+  for (std::size_t index = 0; index < keep; ++index)
+    resolved = joinModuleName(resolved, parts[index]);
+  return resolved;
+}
+
+std::optional<std::string> relativeBaseDirectory(StringRef baseDir,
+                                                 std::int64_t level) {
+  llvm::SmallString<256> directory(baseDir.empty() ? "." : baseDir);
+  for (std::int64_t index = 1; index < level; ++index) {
+    std::string parent = llvm::sys::path::parent_path(directory).str();
+    if (parent.empty())
+      return std::nullopt;
+    directory = parent;
+  }
+  return directory.str().str();
+}
+
+struct SourceImportRequest {
+  std::string moduleName;
+  std::string sourcePath;
+  bool isStub = false;
+  bool isPackage = false;
+  bool isEmbedded = false;
+};
+
+bool appendLocalSourceRequest(
+    llvm::SmallVectorImpl<SourceImportRequest> &requests,
+    StringRef moduleName, std::optional<LocalSourceModulePath> sourcePath,
+    std::set<std::string> *requestedModules = nullptr) {
+  if (!sourcePath)
+    return false;
+  std::string moduleNameText = moduleName.str();
+  if (requestedModules && !requestedModules->insert(moduleNameText).second)
+    return false;
+  requests.push_back(SourceImportRequest{std::move(moduleNameText),
+                                         sourcePath->path,
+                                         sourcePath->isStub,
+                                         sourcePath->isPackage,
+                                         sourcePath->isEmbedded});
+  return true;
+}
+
+void appendDottedImportSourceRequests(
+    llvm::SmallVectorImpl<SourceImportRequest> &requests, StringRef baseDir,
+    StringRef moduleName, std::set<std::string> *requestedModules = nullptr) {
+  llvm::SmallVector<StringRef, 8> parts;
+  moduleName.split(parts, '.');
+  if (parts.empty())
+    return;
+
+  std::string prefix;
+  for (std::size_t index = 0; index + 1 < parts.size(); ++index) {
+    prefix = joinModuleName(prefix, parts[index]);
+    std::optional<LocalSourceModulePath> sourcePath =
+        localSourceModulePath(baseDir, prefix);
+    if (sourcePath && sourcePath->isPackage)
+      appendLocalSourceRequest(requests, prefix, sourcePath, requestedModules);
+  }
+
+  appendLocalSourceRequest(requests, moduleName,
+                           localSourceModulePath(baseDir, moduleName),
+                           requestedModules);
+}
+
+void collectImportedModuleRequests(
+    const lython::parser::Node &module, StringRef baseDir,
+    StringRef packageName,
+    llvm::SmallVectorImpl<SourceImportRequest> &requests) {
+  std::set<std::string> requestedModules;
+  auto appendIfLocal = [&](StringRef moduleName,
+                           std::optional<LocalSourceModulePath> sourcePath) {
+    appendLocalSourceRequest(requests, moduleName, std::move(sourcePath),
+                             &requestedModules);
+  };
+
+  const auto *body = nodeListField(module, "body");
+  if (!body)
+    return;
+  // Module-level `if` bodies participate (the platform-switch idiom, e.g.
+  // `if os.name == "posix": from posix import *`). Discovery collects BOTH
+  // branches: the emitter later folds the test and binds only the taken one,
+  // and dead modules cost only their (DCE-able) compilation.
+  std::vector<const lython::parser::Node *> statements;
+  std::function<void(const std::vector<lython::parser::NodePtr> &)> flatten =
+      [&](const std::vector<lython::parser::NodePtr> &list) {
+        for (const lython::parser::NodePtr &statement : list) {
+          if (!statement)
+            continue;
+          if (statement->kind == "If") {
+            if (const auto *thenBody = nodeListField(*statement, "body"))
+              flatten(*thenBody);
+            if (const auto *elseBody = nodeListField(*statement, "orelse"))
+              flatten(*elseBody);
+            continue;
+          }
+          statements.push_back(statement.get());
+        }
+      };
+  flatten(*body);
+  for (const lython::parser::Node *statementPtr : statements) {
+    const lython::parser::Node *statement = statementPtr;
+    if (statement->kind == "Import") {
+      const auto *aliases = nodeListField(*statement, "names");
+      if (!aliases)
+        continue;
+      for (const lython::parser::NodePtr &alias : *aliases) {
+        if (!alias)
+          continue;
+        if (std::optional<std::string> name = stringField(*alias, "name"))
+          appendDottedImportSourceRequests(requests, baseDir, *name,
+                                           &requestedModules);
+      }
+      continue;
+    }
+    if (statement->kind == "ImportFrom") {
+      std::int64_t level = integerField(*statement, "level");
+      std::optional<std::string> moduleName = stringField(*statement, "module");
+      if (level == 0) {
+        if (moduleName) {
+          appendIfLocal(*moduleName,
+                        localSourceModulePath(baseDir, *moduleName));
+          const auto *aliases = nodeListField(*statement, "names");
+          if (!aliases)
+            continue;
+          for (const lython::parser::NodePtr &alias : *aliases) {
+            if (!alias)
+              continue;
+            std::optional<std::string> name = stringField(*alias, "name");
+            if (!name || *name == "*")
+              continue;
+            std::string submodule = joinModuleName(*moduleName, *name);
+            appendIfLocal(submodule, localSourceModulePath(baseDir, submodule));
+          }
+        }
+        continue;
+      }
+
+      std::optional<std::string> relativePackage =
+          relativeBasePackage(packageName, level);
+      std::optional<std::string> relativeDirectory =
+          relativeBaseDirectory(baseDir, level);
+      if (!relativePackage || !relativeDirectory)
+        continue;
+      if (moduleName) {
+        appendIfLocal(joinModuleName(*relativePackage, *moduleName),
+                      localSourceModulePath(*relativeDirectory, *moduleName));
+        const auto *aliases = nodeListField(*statement, "names");
+        if (!aliases)
+          continue;
+        for (const lython::parser::NodePtr &alias : *aliases) {
+          if (!alias)
+            continue;
+          std::optional<std::string> name = stringField(*alias, "name");
+          if (!name || *name == "*")
+            continue;
+          std::string relativeSubmodule = joinModuleName(*moduleName, *name);
+          appendIfLocal(joinModuleName(*relativePackage, relativeSubmodule),
+                        localSourceModulePath(*relativeDirectory,
+                                              relativeSubmodule));
+        }
+        continue;
+      }
+
+      const auto *aliases = nodeListField(*statement, "names");
+      if (!aliases)
+        continue;
+      for (const lython::parser::NodePtr &alias : *aliases) {
+        if (!alias)
+          continue;
+        std::optional<std::string> name = stringField(*alias, "name");
+        if (!name || *name == "*")
+          continue;
+        appendIfLocal(joinModuleName(*relativePackage, *name),
+                      localSourceModulePath(*relativeDirectory, *name));
+      }
+    }
+  }
+}
+
+struct ParsedLocalSourceModule {
+  std::string moduleName;
+  std::string packageName;
+  std::string sourceName;
+  lython::parser::ParseResult parsed;
+  bool isStub = false;
+  bool isPackage = false;
+};
+
+LogicalResult
+collectLocalSourceModules(const lython::parser::Node &module, StringRef baseDir,
+                          StringRef packageName, StringRef mainPath,
+                          std::vector<ParsedLocalSourceModule> &sources,
+                          std::set<std::string> &seen,
+                          std::set<std::string> &visiting) {
+  llvm::SmallVector<SourceImportRequest, 8> imports;
+  collectImportedModuleRequests(module, baseDir, packageName, imports);
+  for (const SourceImportRequest &request : imports) {
+    if (llvm::StringRef(request.sourcePath) == mainPath)
+      continue;
+    if (seen.find(request.moduleName) != seen.end())
+      continue;
+    if (visiting.find(request.moduleName) != visiting.end()) {
+      llvm::errs() << request.sourcePath
+                   << ": emit error: local source import cycle "
+                   << "involving module '" << request.moduleName << "'\n";
+      return failure();
+    }
+
+    std::unique_ptr<llvm::MemoryBuffer> buffer;
+    if (request.isEmbedded) {
+      const py::runtime_library::embedded::StdlibSourceModule *entry =
+          embeddedStdlibSource(request.moduleName);
+      if (!entry) {
+        llvm::errs() << "error: embedded stdlib module '" << request.moduleName
+                     << "' disappeared from the registry\n";
+        return failure();
+      }
+      buffer = llvm::MemoryBuffer::getMemBuffer(
+          StringRef(reinterpret_cast<const char *>(entry->source),
+                    entry->size),
+          request.sourcePath, /*RequiresNullTerminator=*/false);
+    } else {
+      auto file = llvm::MemoryBuffer::getFile(request.sourcePath);
+      if (!file) {
+        llvm::errs() << "error: could not open input file '"
+                     << request.sourcePath << "'\n";
+        return failure();
+      }
+      buffer = std::move(*file);
+    }
+
+    lython::parser::ParseOptions options;
+    options.typeComments = true;
+    lython::parser::ParseResult parsed = lython::parser::parse(
+        buffer->getBuffer(), request.sourcePath, options);
+    if (!parsed.ok()) {
+      for (const lython::parser::Diagnostic &diagnostic : parsed.diagnostics) {
+        llvm::errs() << request.sourcePath << ':' << diagnostic.location.line
+                     << ':' << diagnostic.location.column
+                     << ": parse error: " << diagnostic.message << "\n";
+      }
+      return failure();
+    }
+
+    visiting.insert(request.moduleName);
+    std::string nestedBaseDir =
+        llvm::sys::path::parent_path(request.sourcePath).str();
+    std::string nestedPackageName = request.isPackage
+                                        ? request.moduleName
+                                        : packageNameForModuleName(
+                                              request.moduleName);
+    if (failed(collectLocalSourceModules(*parsed.tree, nestedBaseDir,
+                                         nestedPackageName, mainPath, sources,
+                                         seen, visiting)))
+      return failure();
+    visiting.erase(request.moduleName);
+    seen.insert(request.moduleName);
+    sources.push_back(ParsedLocalSourceModule{
+        request.moduleName, nestedPackageName,
+        pythonTracebackPath(request.sourcePath), std::move(parsed),
+        request.isStub, request.isPackage});
+  }
+  return success();
+}
+
 LogicalResult generateModuleFromCppFrontend(StringRef pythonFile,
                                             MLIRContext &context,
                                             OwningOpRef<ModuleOp> &module) {
@@ -569,18 +988,39 @@ LogicalResult generateModuleFromCppFrontend(StringRef pythonFile,
     return failure();
   }
 
+  std::vector<ParsedLocalSourceModule> localSources;
+  std::set<std::string> seenSourceModules;
+  std::set<std::string> visitingSourceModules;
+  llvm::StringRef baseDir = llvm::sys::path::parent_path(pythonFile);
+  std::string mainPackageName = staticPackageNameForSourcePath(pythonFile);
+  if (failed(collectLocalSourceModules(
+          *parsed.tree, baseDir, mainPackageName, pythonFile, localSources,
+          seenSourceModules, visitingSourceModules)))
+    return failure();
+
   lython::emitter::EmitResult emitted;
   {
     PerfScope perf("ir-generation");
     lython::emitter::EmitOptions emitOptions;
     emitOptions.sanitizeUndefined = ActiveSanitizers.undefined;
+    emitOptions.mainPackageName = mainPackageName;
+    emitOptions.targetTriple = codeGenTripleForTarget({}).normalize();
+    emitOptions.sourceModules.reserve(localSources.size());
+    for (const ParsedLocalSourceModule &source : localSources) {
+      emitOptions.sourceModules.push_back(
+          lython::emitter::EmitOptions::SourceModule{
+              source.moduleName, source.packageName, source.sourceName,
+              source.parsed.tree.get(), source.isStub});
+    }
     emitted = lython::emitter::emitModule(*parsed.tree, context, "__main__",
                                           pythonTracebackPath(pythonFile),
                                           emitOptions);
   }
   if (!emitted.ok()) {
     for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics) {
-      llvm::errs() << pythonFile << ':' << diagnostic.location.line << ':'
+      StringRef diagnosticFile =
+          diagnostic.filename.empty() ? pythonFile : diagnostic.filename;
+      llvm::errs() << diagnosticFile << ':' << diagnostic.location.line << ':'
                    << diagnostic.location.column
                    << ": emit error: " << diagnostic.message << "\n";
     }
@@ -1888,8 +2328,8 @@ static llvm::cl::opt<bool> EmitLLVMOnly(
     llvm::cl::init(false), llvm::cl::cat(LythonCategory));
 static llvm::cl::opt<bool> AuditRuntimeManifest(
     "audit-runtime-manifest",
-    llvm::cl::desc("Verify typing.mlir runtime-required contracts against "
-                   "runtime ABI manifest symbols after runtime import"),
+    llvm::cl::desc("Verify manifest runtime-required contracts against "
+                   "runtime ABI symbols after runtime import"),
     llvm::cl::init(false), llvm::cl::cat(LythonCategory));
 static llvm::cl::opt<bool> ReleaseModeOption(
     "release",
@@ -1982,6 +2422,9 @@ static llvm::cl::opt<bool> ParseFunctionTypeMode(
 
 int main(int argc, char **argv) {
   llvm::sys::PrintStackTraceOnErrorSignal(argv[0]);
+  // Pre-lowered runtime-internal lib modules (generated
+  // embedded_lib_internal.cpp) join the native runtime link set.
+  py::runtime_library::embedded::registerPyRuntimeEmbeddedModules();
   llvm::cl::SetVersionPrinter(
       [](llvm::raw_ostream &os) { os << "Lython CLI based on MLIR\n"; });
   bool releaseModeFromArgv = false;
@@ -2060,13 +2503,18 @@ int main(int argc, char **argv) {
 
   bool isPythonInput = llvm::sys::path::extension(inputPath) == ".py";
 
+  // apply_registered_pass in manifest lowering strategies resolves through
+  // the global pass registry.
+  mlir::registerTransformsPasses();
+
   DialectRegistry registry;
   registry.insert<py::PyDialect, affine::AffineDialect, async::AsyncDialect,
                   func::FuncDialect, arith::ArithDialect, scf::SCFDialect,
                   mlir::cf::ControlFlowDialect, tensor::TensorDialect,
                   linalg::LinalgDialect, memref::MemRefDialect,
                   vector::VectorDialect, bufferization::BufferizationDialect,
-                  LLVM::LLVMDialect>();
+                  LLVM::LLVMDialect, math::MathDialect,
+                  transform::TransformDialect>();
   py::lowering::arch::arm::registerSMEDialects(registry);
   py::lowering::arch::x86::registerX86Dialects(registry);
   arith::registerBufferizableOpInterfaceExternalModels(registry);
@@ -2076,6 +2524,7 @@ int main(int argc, char **argv) {
   tensor::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::registerConvertFuncToLLVMInterface(registry);
   mlir::registerConvertMemRefToLLVMInterface(registry);
+  mlir::registerConvertMathToLLVMInterface(registry);
   mlir::registerAllToLLVMIRTranslations(registry);
   py::lowering::arch::x86::registerX86Translations(registry);
   registerPySafetyLLVMIRTranslation(registry);

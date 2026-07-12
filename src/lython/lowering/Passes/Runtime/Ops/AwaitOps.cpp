@@ -72,6 +72,18 @@ std::optional<std::string> returnedSelfFieldAwait(mlir::func::FuncOp target) {
 
 } // namespace
 
+mlir::LogicalResult RuntimeBundleLowerer::bundleCoroutineBodyResults(
+    mlir::Operation *op, mlir::Value resultValue, mlir::ValueRange values,
+    RuntimeBundle &result) {
+  if (RuntimeBundleLowerer::hasPrimitiveI64ABI(resultValue.getType()) &&
+      values.size() == 2 && values[0].getType().isInteger(64) &&
+      values[1].getType().isInteger(1))
+    return RuntimeBundleLowerer::makePrimitiveI64Bundle(
+        op, resultValue.getType(), values[0], values[1], result);
+  return RuntimeBundleLowerer::bundleRuntimeResults(
+      op, resultValue.getType(), values, result);
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::lowerAsyncioSleepEvidenceAwait(
     mlir::Operation *op, mlir::Value resultValue, RuntimeBundle &awaitable,
     llvm::StringRef label) {
@@ -279,10 +291,10 @@ RuntimeBundleLowerer::lowerGeneralAwaitableIterator(py::AwaitOp op,
     if (!resultType)
       return op.emitError() << "__await__ result needs a concrete contract";
 
-    if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
-            op.getOperation(), resultType, emittedCall->call, iterator)))
+    if (mlir::failed(RuntimeBundleLowerer::bindRuntimeCallBundle(
+            op.getOperation(), resultType, *emittedCall, &awaitable,
+            iterator)))
       return mlir::failure();
-    iterator.copyEvidenceFrom(awaitable);
   }
 
   return RuntimeBundleLowerer::lowerAwaitIteratorResult(
@@ -318,9 +330,13 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAwaitIteratorResult(
     RuntimeBundle future =
         RuntimeBundle::object(futureType, mlir::ValueRange{values[1]});
     future.copyEvidenceFrom(iterator);
-    if (hasFutureTerminalEvidence(future))
-      return RuntimeBundleLowerer::lowerFutureResultEvidence(op, resultValue,
-                                                             future, label);
+    if (hasFutureTerminalEvidence(future)) {
+      if (mlir::failed(RuntimeBundleLowerer::lowerFutureResultEvidence(
+              op, resultValue, future, label)))
+        return mlir::failure();
+      erase.push_back(op);
+      return mlir::success();
+    }
   }
 
   if (iterator.contractName() == "_asyncio.TaskIter") {
@@ -331,9 +347,13 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAwaitIteratorResult(
     RuntimeBundle task =
         RuntimeBundle::object(taskType, mlir::ValueRange{values[1], values[2]});
     task.copyEvidenceFrom(iterator);
-    if (hasFutureTerminalEvidence(task))
-      return RuntimeBundleLowerer::lowerFutureResultEvidence(op, resultValue,
-                                                             task, label);
+    if (hasFutureTerminalEvidence(task)) {
+      if (mlir::failed(RuntimeBundleLowerer::lowerFutureResultEvidence(
+              op, resultValue, task, label)))
+        return mlir::failure();
+      erase.push_back(op);
+      return mlir::success();
+    }
     if (hasAsyncioSleepEvidence(task))
       return RuntimeBundleLowerer::lowerAsyncioSleepEvidenceAwait(
           op, resultValue, task, label);
@@ -424,6 +444,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCoroutineStorageTargetIdAwait(
   auto resumed = mlir::scf::IfOp::create(builder, op->getLoc(), expectedResults,
                                          resumeBeginCall.getResult(0),
                                          /*withElseRegion=*/true);
+  // A zero-result scf.if already received auto-inserted empty terminators at
+  // build time; adding manual yields would leave two per block.
+  bool needsYields = !expectedResults.empty();
 
   auto emitDeadValues = [&](llvm::StringRef message)
       -> mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> {
@@ -470,13 +493,15 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCoroutineStorageTargetIdAwait(
     targetSymbol.name = target.getSymName();
     mlir::func::CallOp bodyCall = RuntimeBundleLowerer::createRuntimeCall(
         op->getLoc(), targetSymbol, mlir::ValueRange{});
-    mlir::scf::YieldOp::create(builder, op->getLoc(), bodyCall.getResults());
+    if (needsYields)
+      mlir::scf::YieldOp::create(builder, op->getLoc(), bodyCall.getResults());
     builder.setInsertionPointToStart(&selected.getElseRegion().front());
     mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> fallback =
         emitDispatch(index + 1);
     if (mlir::failed(fallback))
       return mlir::failure();
-    mlir::scf::YieldOp::create(builder, op->getLoc(), *fallback);
+    if (needsYields)
+      mlir::scf::YieldOp::create(builder, op->getLoc(), *fallback);
     builder.setInsertionPointAfter(selected);
     llvm::SmallVector<mlir::Value, 4> results;
     results.append(selected.getResults().begin(), selected.getResults().end());
@@ -494,19 +519,21 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCoroutineStorageTargetIdAwait(
     return mlir::failure();
   RuntimeBundleLowerer::createRuntimeCall(op->getLoc(), *resumeComplete,
                                           resumeCompleteOperands);
-  mlir::scf::YieldOp::create(builder, op->getLoc(), *dispatched);
+  if (needsYields)
+    mlir::scf::YieldOp::create(builder, op->getLoc(), *dispatched);
 
   builder.setInsertionPointToStart(&resumed.getElseRegion().front());
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> dead = emitDeadValues(
       "cannot await a coroutine that is already running or completed");
   if (mlir::failed(dead))
     return mlir::failure();
-  mlir::scf::YieldOp::create(builder, op->getLoc(), *dead);
+  if (needsYields)
+    mlir::scf::YieldOp::create(builder, op->getLoc(), *dead);
 
   builder.setInsertionPointAfter(resumed);
   RuntimeBundle result;
-  if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
-          op, resultValue.getType(), resumed.getResults(), result)))
+  if (mlir::failed(RuntimeBundleLowerer::bundleCoroutineBodyResults(
+          op, resultValue, resumed.getResults(), result)))
     return mlir::failure();
   valueBundles[resultValue] = std::move(result);
   erase.push_back(op);
@@ -622,7 +649,11 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCoroutineObjectAwait(
     return mlir::failure();
   RuntimeBundleLowerer::createRuntimeCall(op->getLoc(), *resumeComplete,
                                           resumeCompleteOperands);
-  mlir::scf::YieldOp::create(builder, op->getLoc(), bodyCall.getResults());
+  // A zero-result scf.if already received auto-inserted empty terminators at
+  // build time; adding manual yields would leave two per block.
+  bool needsYields = functionType.getNumResults() != 0;
+  if (needsYields)
+    mlir::scf::YieldOp::create(builder, op->getLoc(), bodyCall.getResults());
 
   builder.setInsertionPointToStart(&resumed.getElseRegion().front());
   if (mlir::failed(RuntimeBundleLowerer::emitRuntimeException(
@@ -638,12 +669,13 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCoroutineObjectAwait(
       return mlir::failure();
     deadValues.push_back(*dead);
   }
-  mlir::scf::YieldOp::create(builder, op->getLoc(), deadValues);
+  if (needsYields)
+    mlir::scf::YieldOp::create(builder, op->getLoc(), deadValues);
 
   builder.setInsertionPointAfter(resumed);
   RuntimeBundle result;
-  if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
-          op, resultValue.getType(), resumed.getResults(), result)))
+  if (mlir::failed(RuntimeBundleLowerer::bundleCoroutineBodyResults(
+          op, resultValue, resumed.getResults(), result)))
     return mlir::failure();
   valueBundles[resultValue] = std::move(result);
   erase.push_back(op);

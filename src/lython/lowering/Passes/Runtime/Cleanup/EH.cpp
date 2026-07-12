@@ -78,6 +78,18 @@ bool mayPropagatePythonException(const llvm::Function *callee) {
   return name.starts_with("Ly");
 }
 
+bool isPythonRuntimeRaiseCall(const llvm::Function *callee) {
+  if (!callee)
+    return false;
+  llvm::StringRef name = callee->getName();
+  return name == "LyEH_ThrowException" || name == "LyEH_RethrowCurrent" ||
+         name.ends_with("_Raise");
+}
+
+bool mayTransferToPythonTryHandler(const llvm::Function *callee) {
+  return isPythonRuntimeRaiseCall(callee) || mayPropagatePythonException(callee);
+}
+
 bool isRuntimeMarkerCall(const llvm::CallInst &call, llvm::StringRef name) {
   const llvm::Function *callee = call.getCalledFunction();
   return callee && callee->getName() == name;
@@ -294,7 +306,7 @@ bool convertCallToPythonInvoke(llvm::CallInst &call,
   if (call.isInlineAsm() || call.getNumOperandBundles() != 0)
     return false;
   llvm::Function *callee = call.getCalledFunction();
-  if (!mayPropagatePythonException(callee))
+  if (!mayTransferToPythonTryHandler(callee))
     return false;
   llvm::DebugLoc debugLocation = call.getDebugLoc();
   auto *debugLoc =
@@ -363,7 +375,7 @@ bool convertCallToPythonTryInvoke(
   if (call.isInlineAsm() || call.getNumOperandBundles() != 0)
     return false;
   llvm::Function *callee = call.getCalledFunction();
-  if (!mayPropagatePythonException(callee))
+  if (!mayTransferToPythonTryHandler(callee))
     return false;
   llvm::DebugLoc debugLocation = call.getDebugLoc();
   auto *debugLoc =
@@ -470,7 +482,7 @@ bool installPythonExceptionCleanupFrames(
           continue;
         }
         if (pendingTryMarker) {
-          if (mayPropagatePythonException(call->getCalledFunction())) {
+          if (mayTransferToPythonTryHandler(call->getCalledFunction())) {
             tryCallSites[call] = *pendingTryMarker;
             pendingTryMarker.reset();
           } else if (!canSkipBetweenTryMarkerAndCall(*call)) {

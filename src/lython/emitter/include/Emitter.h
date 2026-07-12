@@ -6,6 +6,7 @@
 #include "mlir/IR/MLIRContext.h"
 
 #include <string>
+#include <vector>
 
 namespace lython::emitter {
 
@@ -24,13 +25,23 @@ struct TextEmitResult {
 };
 
 struct EmitOptions {
+  struct SourceModule {
+    std::string moduleName;
+    std::string packageName;
+    std::string sourceName;
+    const parser::Node *moduleNode = nullptr;
+    bool isStub = false;
+  };
+
   bool sanitizeUndefined = false;
+  std::string mainPackageName;
+  std::string targetTriple;
+  std::vector<SourceModule> sourceModules;
 };
 
 EmitResult emitModule(const parser::Node &module, mlir::MLIRContext &context,
                       std::string moduleName = "__main__",
-                      std::string sourceName = {},
-                      EmitOptions options = {});
+                      std::string sourceName = {}, EmitOptions options = {});
 TextEmitResult emitModuleText(const parser::Node &module,
                               std::string moduleName = "__main__",
                               std::string sourceName = {});

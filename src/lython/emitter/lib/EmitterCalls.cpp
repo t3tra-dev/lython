@@ -1,15 +1,55 @@
 #include "EmitterCore.h"
 #include "EmitterPyOps.h"
 #include "EmitterSupport.h"
+#include "PlatformConstants.h"
 
 #include "AstAccess.h"
+#include "EmitterOps.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <optional>
 #include <string>
 
 namespace lython::emitter {
+namespace {
+
+mlir::Value constantI1(mlir::OpBuilder &builder, mlir::Location loc,
+                       bool value) {
+  return mlir::arith::ConstantIntOp::create(builder, loc, value ? 1 : 0, 1)
+      .getResult();
+}
+
+Value boxedBool(mlir::OpBuilder &builder, mlir::Location loc, AlgorithmM &types,
+                mlir::Value bit) {
+  auto pyBool = py::CastFromPrimOp::create(builder, loc, types.boolType(), bit);
+  return {pyBool.getResult(), types.boolType()};
+}
+
+std::string typeText(mlir::Type type) {
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  stream << type;
+  return text;
+}
+
+bool callHasNoArguments(const parser::Node &expr) {
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  return (!args || args->empty()) && (!keywords || keywords->empty());
+}
+
+std::optional<llvm::StringRef> contractName(mlir::Type type) {
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
+  if (!contract)
+    return std::nullopt;
+  return contract.getContractName();
+}
+
+} // namespace
 
 CallOperands
 ModuleEmitter::emitCallOperands(const parser::Node &expr,
@@ -32,10 +72,16 @@ ModuleEmitter::emitCallOperands(const parser::Node &expr,
       Value value = emitExpr(valueNode);
       operands.positional.push_back(value);
       operands.positionalUnpacked.push_back(unpacked ? 1 : 0);
-      if (unpacked)
-        appendStarredArgumentTypes(value.type, types, operands.positionalTypes);
-      else
+      if (unpacked) {
+        if (!appendStarredArgumentTypes(value.type, types,
+                                        operands.positionalTypes)) {
+          operands.valid = false;
+          operands.failureReason =
+              "starred call arguments require a statically sized tuple";
+        }
+      } else {
         operands.positionalTypes.push_back(value.type);
+      }
     }
   }
 
@@ -63,14 +109,19 @@ Value ModuleEmitter::emitCallableDispatch(const parser::Node &anchor,
                                           Value callee,
                                           const CallOperands &operands,
                                           mlir::Type resultOverride) {
+  if (!operands.valid) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, anchor.range.start, operands.failureReason});
+    return emitNone(anchor);
+  }
   Value posPack = emitPack(operands.positional, operands.positionalUnpacked);
   Value namePack = emitPack(operands.keywordNames);
   Value valuePack = emitPack(operands.keywordValues);
   CallInferenceResult inference = types.inferCallWithEvidence(
       callee.type, operands.positionalTypes, operands.keywordTypes);
-  mlir::Type resultType =
-      resultOverride ? resultOverride
-                     : (inference ? inference.resultType : types.object());
+  if (!requireStaticEvidence(anchor, inference))
+    return emitNone(anchor);
+  mlir::Type resultType = resultOverride ? resultOverride : inference.resultType;
   auto op =
       py::CallOp::create(builder, loc(anchor), mlir::TypeRange{resultType},
                          callProtocolFor(inference, callee.type), callee.value,
@@ -89,21 +140,657 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
           emitPrimitiveRuntimeCall(expr, calleeNode))
     return *primitive;
 
+  if (calleeNode && calleeNode->kind == "Name" &&
+      ast::nameSpelling(*calleeNode) == "isinstance" &&
+      values.find("isinstance") == values.end()) {
+    const auto *keywords = ast::nodeList(expr, "keywords");
+    const auto *args = ast::nodeList(expr, "args");
+    if ((keywords && !keywords->empty()) || !args || args->size() != 2 ||
+        !args->front() || args->front()->kind == "Starred" || !(*args)[1] ||
+        (*args)[1]->kind == "Starred") {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, expr.range.start,
+          "isinstance requires exactly two positional arguments"});
+      return emitNone(expr);
+    }
+
+    std::optional<mlir::Type> target =
+        isinstanceTargetType((*args)[1].get(), types);
+    if (!target) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, expr.range.start,
+          "second argument to isinstance must be a statically resolved class "
+          "type"});
+      return emitNone(expr);
+    }
+
+    Value input = emitExpr(args->front().get());
+    IsInstanceAnalysis analysis =
+        analyzeIsInstance(input.type, *target, types, module);
+    if (analysis.kind == IsInstanceAnalysis::Kind::Unsupported) {
+      std::string reason = analysis.failureReason.empty()
+                               ? "unsupported isinstance evidence"
+                               : analysis.failureReason;
+      diagnostics.push_back(parser::Diagnostic{parser::Severity::Error,
+                                               expr.range.start, reason});
+      return emitNone(expr);
+    }
+
+    mlir::Value bit;
+    if (analysis.kind == IsInstanceAnalysis::Kind::AlwaysTrue) {
+      bit = constantI1(builder, loc(expr), true);
+    } else if (analysis.kind == IsInstanceAnalysis::Kind::AlwaysFalse) {
+      bit = constantI1(builder, loc(expr), false);
+    } else if (analysis.kind == IsInstanceAnalysis::Kind::UnionTest) {
+      if (!mlir::isa<py::UnionType>(input.value.getType())) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, expr.range.start,
+            "isinstance union evidence expected a union-typed value, got " +
+                typeText(input.value.getType())});
+        return emitNone(expr);
+      }
+      for (mlir::Type member : analysis.unionMembers) {
+        auto test =
+            py::UnionTestOp::create(builder, loc(expr), builder.getI1Type(),
+                                    input.value, mlir::TypeAttr::get(member));
+        bit = bit ? mlir::arith::OrIOp::create(builder, loc(expr), bit,
+                                               test.getResult())
+                        .getResult()
+                  : test.getResult();
+      }
+      if (!bit)
+        bit = constantI1(builder, loc(expr), false);
+    } else if (analysis.kind == IsInstanceAnalysis::Kind::UnionClassTest) {
+      if (!mlir::isa<py::UnionType>(input.value.getType()) ||
+          analysis.unionMembers.size() != 1) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, expr.range.start,
+            "isinstance union class evidence expected one union member"});
+        return emitNone(expr);
+      }
+      mlir::Type member = analysis.unionMembers.front();
+      auto unionTest =
+          py::UnionTestOp::create(builder, loc(expr), builder.getI1Type(),
+                                  input.value, mlir::TypeAttr::get(member));
+      auto unwrap =
+          py::UnionUnwrapOp::create(builder, loc(expr), member, input.value);
+      auto classTest = py::ClassTestOp::create(
+          builder, loc(expr), builder.getI1Type(), unwrap.getResult(),
+          mlir::TypeAttr::get(analysis.targetType));
+      bit =
+          mlir::arith::AndIOp::create(builder, loc(expr), unionTest.getResult(),
+                                      classTest.getResult())
+              .getResult();
+    } else if (analysis.kind == IsInstanceAnalysis::Kind::ClassTest) {
+      auto test = py::ClassTestOp::create(
+          builder, loc(expr), builder.getI1Type(), input.value,
+          mlir::TypeAttr::get(analysis.targetType));
+      bit = test.getResult();
+    }
+    return boxedBool(builder, loc(expr), types, bit);
+  }
+
+  // str(x) is __str__ dispatch (CPython semantics), not construction —
+  // intercept before the class-instantiation paths claim builtins.str.
+  if (calleeNode && calleeNode->kind == "Name" &&
+      ast::nameSpelling(*calleeNode) == "str" &&
+      values.find("str") == values.end()) {
+    const auto *strArgs = ast::nodeList(expr, "args");
+    const auto *strKeywords = ast::nodeList(expr, "keywords");
+    auto strClass = types.lookupClass("str");
+    std::optional<llvm::StringRef> strSymbol =
+        strClass ? contractName(*strClass) : std::nullopt;
+    if (strSymbol && *strSymbol == "builtins.str" && strArgs &&
+        strArgs->size() == 1 && (!strKeywords || strKeywords->empty())) {
+      mlir::Type argumentType =
+          types.widenLiteral(types.inferExpr(strArgs->front().get()));
+      if (std::optional<MethodBinding> method =
+              lookupClassMethod(argumentType, "__str__")) {
+        Value argument = emitExpr(strArgs->front().get());
+        llvm::StringMap<Value> emptyKeywords;
+        Value descriptorReceiver =
+            emitDescriptorReceiver(expr, argument, *method);
+        return emitInlineMethodBody(expr, descriptorReceiver,
+                                    methodBindingBindsReceiver(*method),
+                                    *method, {}, emptyKeywords);
+      }
+      if (CallInferenceResult inference = types.inferMethodCallWithEvidence(
+              argumentType, "__str__", {})) {
+        Value argument =
+            coerceValue(emitExpr(strArgs->front().get()), argumentType, expr);
+        mlir::Type resultType = types.contract("builtins.str");
+        auto op = py::StrOp::create(
+            builder, loc(expr), resultType,
+            mlir::FlatSymbolRefAttr::get(&context, "__str__"),
+            mlir::TypeAttr::get(callProtocolFor(inference)), argument.value);
+        return {op.getResult(), resultType};
+      }
+      // No __str__ evidence: fall through to the instantiation path's
+      // explicit rejection.
+    }
+  }
+
+  // list(<genexpr>) is the list comprehension over the same element/generator
+  // chain — route to the comprehension emitter before the class-instantiation
+  // paths claim builtins.list.
+  if (calleeNode && calleeNode->kind == "Name" &&
+      ast::nameSpelling(*calleeNode) == "list" &&
+      values.find("list") == values.end()) {
+    const auto *listArgs = ast::nodeList(expr, "args");
+    const auto *listKeywords = ast::nodeList(expr, "keywords");
+    if (listArgs && listArgs->size() == 1 && listArgs->front() &&
+        listArgs->front()->kind == "GeneratorExp" &&
+        (!listKeywords || listKeywords->empty()))
+      return emitComprehension(*listArgs->front(), /*isDict=*/false);
+  }
+
+  // Multi-argument print desugars to one write of the space-joined
+  // stringified arguments (CPython's sep=" " default): the unified print
+  // resolver stays single-argument.
+  if (calleeNode && calleeNode->kind == "Name" &&
+      ast::nameSpelling(*calleeNode) == "print" &&
+      values.find("print") == values.end()) {
+    const auto *printArgs = ast::nodeList(expr, "args");
+    const auto *printKeywords = ast::nodeList(expr, "keywords");
+    bool plainArguments = printArgs && printArgs->size() >= 2 &&
+                          (!printKeywords || printKeywords->empty());
+    if (plainArguments)
+      for (const parser::NodePtr &argument : *printArgs)
+        if (!argument || argument->kind == "Starred")
+          plainArguments = false;
+    if (plainArguments) {
+      mlir::Type strType = types.contract("builtins.str");
+      auto stringify = [&](const parser::Node *argNode) -> std::optional<Value> {
+        mlir::Type argumentType = types.widenLiteral(types.inferExpr(argNode));
+        if (argumentType == strType)
+          return coerceValue(emitExpr(argNode), strType, expr);
+        if (std::optional<MethodBinding> method =
+                lookupClassMethod(argumentType, "__str__")) {
+          Value argument = emitExpr(argNode);
+          llvm::StringMap<Value> emptyKeywords;
+          Value receiver = emitDescriptorReceiver(expr, argument, *method);
+          return emitInlineMethodBody(expr, receiver,
+                                      methodBindingBindsReceiver(*method),
+                                      *method, {}, emptyKeywords);
+        }
+        // Non-str builtins render via __repr__ (CPython's str(x) equals
+        // repr(x) for every non-str builtin, containers included; the
+        // runtime manifest has no container __str__).
+        if (CallInferenceResult inference =
+                types.inferMethodCallWithEvidence(argumentType, "__repr__",
+                                                  {})) {
+          Value argument = coerceValue(emitExpr(argNode), argumentType, expr);
+          auto op = py::ReprOp::create(
+              builder, loc(expr), strType,
+              mlir::FlatSymbolRefAttr::get(&context, "__repr__"),
+              mlir::TypeAttr::get(callProtocolFor(inference)), argument.value);
+          return Value{op.getResult(), strType};
+        }
+        return std::nullopt;
+      };
+      bool allConverted = true;
+      Value joined;
+      for (auto [index, argument] : llvm::enumerate(*printArgs)) {
+        std::optional<Value> piece = stringify(argument.get());
+        if (!piece) {
+          allConverted = false;
+          break;
+        }
+        if (index == 0) {
+          joined = *piece;
+          continue;
+        }
+        mlir::Type separatorType = types.literal("\" \"");
+        auto separator = py::StrConstantOp::create(
+            builder, loc(expr), separatorType, builder.getStringAttr(" "));
+        joined = emitBinarySpecial<py::AddOp>(
+            expr, "__add__", joined,
+            Value{separator.getResult(), separatorType}, strType);
+        joined = emitBinarySpecial<py::AddOp>(expr, "__add__", joined, *piece,
+                                              strType);
+      }
+      if (allConverted) {
+        Value printCallee = emitExpr(calleeNode);
+        CallOperands operands =
+            emitCallOperands(expr, {joined}, /*includeAstArguments=*/false);
+        return emitCallableDispatch(expr, printCallee, operands);
+      }
+      // Fall through: the lowering reports the single-argument restriction
+      // for arguments without __str__ evidence.
+    }
+  }
+
+  // sum/any/all/max/min over an iterable desugar to accumulator loops
+  // (any/all with an early-exit break, preserving CPython short-circuiting;
+  // max/min carry a seen-flag and raise ValueError when the iterable is
+  // empty); generator expression arguments fuse through the emitFor path.
+  if (calleeNode && calleeNode->kind == "Name") {
+    llvm::StringRef reducer = ast::nameSpelling(*calleeNode);
+    if ((reducer == "sum" || reducer == "any" || reducer == "all" ||
+         reducer == "max" || reducer == "min") &&
+        values.find(reducer) == values.end()) {
+      const auto *reducerArgs = ast::nodeList(expr, "args");
+      const auto *reducerKeywords = ast::nodeList(expr, "keywords");
+      // The element type of the reducer's iterable: genexpr arguments infer
+      // their element expression under progressively bound chain targets
+      // (like emitComprehension); plain iterables go through __iter__/__next__.
+      auto reducerElementType = [&]() -> mlir::Type {
+        const parser::Node *arg = reducerArgs->front().get();
+        auto iterationElement = [&](const parser::Node *iterable) -> mlir::Type {
+          mlir::Type iterableType = types.inferExpr(iterable);
+          if (!iterableType)
+            return {};
+          CallInferenceResult iterInference = types.inferMethodCallWithEvidence(
+              types.widenLiteral(iterableType), "__iter__", {});
+          if (!iterInference)
+            return {};
+          CallInferenceResult nextInference = types.inferMethodCallWithEvidence(
+              iterInference.resultType, "__next__", {});
+          if (!nextInference)
+            return {};
+          return types.widenLiteral(nextInference.resultType);
+        };
+        if (arg->kind != "GeneratorExp")
+          return iterationElement(arg);
+        const parser::Field *eltField = parser::findField(*arg, "elt");
+        const auto *gens = ast::nodeList(*arg, "generators");
+        if (!eltField ||
+            !std::holds_alternative<parser::NodePtr>(eltField->value) || !gens)
+          return {};
+        auto scope = types.pushScope();
+        for (const parser::NodePtr &gen : *gens) {
+          if (!gen)
+            return {};
+          const parser::Node *target = ast::node(*gen, "target");
+          const parser::Node *iter = ast::node(*gen, "iter");
+          if (!target || target->kind != "Name" || !iter)
+            return {};
+          mlir::Type elementType = iterationElement(iter);
+          if (!elementType)
+            return {};
+          types.bindLocalSymbol(ast::nameSpelling(*target), elementType);
+        }
+        return types.widenLiteral(types.inferExpr(
+            std::get<parser::NodePtr>(eltField->value).get()));
+      };
+      // Two-scalar form `min(a, b)` / `max(a, b)`: evaluate both operands
+      // once, compare, and merge through the same cf-block pattern as IfExp
+      // (`min(a, b)` keeps `a` on ties, matching CPython's first-minimal
+      // rule). The non-selected operand's edge gets its release from the
+      // partial-forward placement.
+      if (reducerArgs && reducerArgs->size() == 2 && reducerArgs->front() &&
+          (*reducerArgs)[1] && (!reducerKeywords || reducerKeywords->empty()) &&
+          (reducer == "max" || reducer == "min")) {
+        Value lhs = emitExpr(reducerArgs->front().get());
+        Value rhs = emitExpr((*reducerArgs)[1].get());
+        mlir::Type resultType = types.join(
+            {types.widenLiteral(lhs.type), types.widenLiteral(rhs.type)});
+        if (resultType) {
+          // Literal-vs-literal selects statically (a constant-condition
+          // merge would strand the unselected literal's materialized object
+          // without a release).
+          auto lhsLiteral = mlir::dyn_cast<py::LiteralType>(lhs.type);
+          auto rhsLiteral = mlir::dyn_cast<py::LiteralType>(rhs.type);
+          if (lhsLiteral && rhsLiteral) {
+            llvm::StringRef lhsSpelling = lhsLiteral.getSpelling();
+            llvm::StringRef rhsSpelling = rhsLiteral.getSpelling();
+            long long lhsInt = 0, rhsInt = 0;
+            std::optional<bool> pickRhs;
+            if (!lhsSpelling.getAsInteger(10, lhsInt) &&
+                !rhsSpelling.getAsInteger(10, rhsInt))
+              pickRhs = reducer == "min" ? rhsInt < lhsInt : rhsInt > lhsInt;
+            else if (lhsSpelling.size() >= 2 && rhsSpelling.size() >= 2 &&
+                     lhsSpelling.front() == '"' && rhsSpelling.front() == '"') {
+              llvm::StringRef lhsText = lhsSpelling.drop_front().drop_back();
+              llvm::StringRef rhsText = rhsSpelling.drop_front().drop_back();
+              pickRhs = reducer == "min" ? rhsText < lhsText : rhsText > lhsText;
+            }
+            if (pickRhs)
+              return coerceValue(*pickRhs ? rhs : lhs, resultType, expr);
+          }
+          parser::Node comparisonOp(reducer == "min" ? "Lt" : "Gt");
+          comparisonOp.range = expr.range;
+          Value comparison =
+              emitScalarCompare(expr, rhs, lhs, &comparisonOp);
+          mlir::Value condition = emitBoolValue(comparison, expr);
+          // Literal-vs-literal comparisons fold at emit time: select the
+          // operand statically instead of emitting a constant-condition
+          // merge (whose dead arm would strand the unselected literal's
+          // materialized object without a release).
+          if (auto constantCondition =
+                  condition.getDefiningOp<mlir::arith::ConstantIntOp>())
+            return coerceValue(constantCondition.value() != 0 ? rhs : lhs,
+                               resultType, expr);
+          if (auto constantBool =
+                  comparison.value.getDefiningOp<py::BoolConstantOp>())
+            return coerceValue(constantBool.getValue() ? rhs : lhs, resultType,
+                               expr);
+
+          mlir::Block *origin = builder.getInsertionBlock();
+          mlir::Region *region = origin->getParent();
+          mlir::Block *thenBlock =
+              builder.createBlock(region, std::next(origin->getIterator()));
+          mlir::Block *elseBlock =
+              builder.createBlock(region, std::next(thenBlock->getIterator()));
+          mlir::Block *merge =
+              builder.createBlock(region, std::next(elseBlock->getIterator()));
+          mlir::BlockArgument result =
+              merge->addArgument(resultType, loc(expr));
+
+          builder.setInsertionPointToEnd(origin);
+          mlir::cf::CondBranchOp::create(builder, loc(expr), condition,
+                                         thenBlock, mlir::ValueRange{},
+                                         elseBlock, mlir::ValueRange{});
+          builder.setInsertionPointToStart(thenBlock);
+          Value picked = coerceValue(rhs, resultType, expr);
+          mlir::cf::BranchOp::create(builder, loc(expr), merge,
+                                     mlir::ValueRange{picked.value});
+          builder.setInsertionPointToStart(elseBlock);
+          Value kept = coerceValue(lhs, resultType, expr);
+          mlir::cf::BranchOp::create(builder, loc(expr), merge,
+                                     mlir::ValueRange{kept.value});
+
+          builder.setInsertionPointToStart(merge);
+          return {mlir::Value(result), resultType};
+        }
+      }
+      if (reducerArgs && reducerArgs->size() == 1 && reducerArgs->front() &&
+          (!reducerKeywords || reducerKeywords->empty()) &&
+          (reducer == "max" || reducer == "min")) {
+        mlir::Type elementType = reducerElementType();
+        auto contract =
+            mlir::dyn_cast_if_present<py::ContractType>(elementType);
+        llvm::StringRef contractName =
+            contract ? contract.getContractName() : llvm::StringRef();
+        mlir::Value placeholder;
+        if (contractName == "builtins.int") {
+          placeholder = py::IntConstantOp::create(builder, loc(expr),
+                                                  types.literal("0"),
+                                                  builder.getStringAttr("0"))
+                            .getResult();
+        } else if (contractName == "builtins.str") {
+          placeholder =
+              py::StrConstantOp::create(builder, loc(expr),
+                                        types.literal("\"\""),
+                                        builder.getStringAttr(""))
+                  .getResult();
+        } else if (contractName == "builtins.float") {
+          placeholder = py::FloatConstantOp::create(
+                            builder, loc(expr), elementType,
+                            builder.getF64FloatAttr(0.0))
+                            .getResult();
+        }
+        if (!placeholder) {
+          // max()/min() over an EMPTY literal always raises: emit the
+          // ValueError directly (there is no element type to desugar with).
+          const parser::Node *arg = reducerArgs->front().get();
+          bool emptyLiteral =
+              (arg->kind == "List" || arg->kind == "Tuple") &&
+              [&] {
+                const auto *elts = ast::nodeList(*arg, "elts");
+                return !elts || elts->empty();
+              }();
+          if (emptyLiteral) {
+            parser::NodePtr errorName = parser::makeNode("Name", expr.range);
+            parser::addField(*errorName, "id", std::string("ValueError"));
+            parser::NodePtr message = parser::makeNode("Constant", expr.range);
+            parser::addField(*message, "value",
+                             reducer.str() + "() iterable argument is empty");
+            parser::NodePtr errorCall = parser::makeNode("Call", expr.range);
+            parser::addField(*errorCall, "func", errorName);
+            parser::addField(*errorCall, "args",
+                             std::vector<parser::NodePtr>{message});
+            parser::addField(*errorCall, "keywords",
+                             std::vector<parser::NodePtr>{});
+            parser::NodePtr raiseNode = parser::makeNode("Raise", expr.range);
+            parser::addField(*raiseNode, "exc", errorCall);
+            emitStatement(*raiseNode);
+            // py.raise terminates the block; park the (unreachable) rest of
+            // the enclosing expression in a fresh block.
+            mlir::Block *dead = builder.createBlock(
+                builder.getInsertionBlock()->getParent(),
+                std::next(builder.getInsertionBlock()->getIterator()));
+            builder.setInsertionPointToStart(dead);
+            return emitNone(expr);
+          }
+          diagnostics.push_back(parser::Diagnostic{
+              parser::Severity::Error, expr.range.start,
+              reducer.str() +
+                  "() requires int/str/float iterable element evidence"});
+          return emitNone(expr);
+        }
+        std::string tmp =
+            "__" + reducer.str() + std::to_string(++listCompCounter);
+        std::string flag =
+            "__" + reducer.str() + "seen" + std::to_string(listCompCounter);
+        std::string element =
+            "__" + reducer.str() + "el" + std::to_string(listCompCounter);
+        values[tmp] = Value{placeholder,
+                            placeholder.getType()};
+        types.bindSymbol(tmp, placeholder.getType());
+        // The seen-flag is an INT (0/1): loop-carried bool contract block
+        // arguments have no boxed physical form yet.
+        mlir::Type flagType = types.literal("0");
+        auto flagInit = py::IntConstantOp::create(builder, loc(expr), flagType,
+                                                  builder.getStringAttr("0"));
+        values[flag] = Value{flagInit.getResult(), flagType};
+        types.bindSymbol(flag, flagType);
+        auto nameNode = [&](const std::string &id) {
+          parser::NodePtr node = parser::makeNode("Name", expr.range);
+          parser::addField(*node, "id", id);
+          return node;
+        };
+        parser::NodePtr tmpName = nameNode(tmp);
+        parser::NodePtr flagName = nameNode(flag);
+        parser::NodePtr elementName = nameNode(element);
+        // if __seen: (if el >/< __acc: __acc = el) else: __acc = el; __seen = True
+        parser::NodePtr assignAcc = parser::makeNode("Assign", expr.range);
+        parser::addField(*assignAcc, "targets",
+                         std::vector<parser::NodePtr>{tmpName});
+        parser::addField(*assignAcc, "value", elementName);
+        parser::NodePtr cmpOp = parser::makeNode(
+            reducer == "max" ? "Gt" : "Lt", expr.range);
+        parser::NodePtr compare = parser::makeNode("Compare", expr.range);
+        parser::addField(*compare, "left", elementName);
+        parser::addField(*compare, "ops", std::vector<parser::NodePtr>{cmpOp});
+        parser::addField(*compare, "comparators",
+                         std::vector<parser::NodePtr>{tmpName});
+        parser::NodePtr better = parser::makeNode("If", expr.range);
+        parser::addField(*better, "test", compare);
+        parser::addField(*better, "body",
+                         std::vector<parser::NodePtr>{assignAcc});
+        parser::addField(*better, "orelse", std::vector<parser::NodePtr>{});
+        parser::NodePtr trueValue = parser::makeNode("Constant", expr.range);
+        parser::addField(*trueValue, "value", std::int64_t{1});
+        parser::NodePtr markSeen = parser::makeNode("Assign", expr.range);
+        parser::addField(*markSeen, "targets",
+                         std::vector<parser::NodePtr>{flagName});
+        parser::addField(*markSeen, "value", trueValue);
+        parser::NodePtr seenSwitch = parser::makeNode("If", expr.range);
+        parser::addField(*seenSwitch, "test", flagName);
+        parser::addField(*seenSwitch, "body",
+                         std::vector<parser::NodePtr>{better});
+        parser::addField(*seenSwitch, "orelse",
+                         std::vector<parser::NodePtr>{assignAcc, markSeen});
+        parser::NodePtr loop = parser::makeNode("For", expr.range);
+        parser::addField(*loop, "target", elementName);
+        parser::addField(*loop, "iter", reducerArgs->front());
+        parser::addField(*loop, "body",
+                         std::vector<parser::NodePtr>{seenSwitch});
+        parser::addField(*loop, "orelse", std::vector<parser::NodePtr>{});
+        // if not __seen: raise ValueError("max()/min() iterable argument is empty")
+        parser::NodePtr notSeenOp = parser::makeNode("Not", expr.range);
+        parser::NodePtr notSeen = parser::makeNode("UnaryOp", expr.range);
+        parser::addField(*notSeen, "op", notSeenOp);
+        parser::addField(*notSeen, "operand", flagName);
+        parser::NodePtr message = parser::makeNode("Constant", expr.range);
+        parser::addField(*message, "value",
+                         reducer.str() + "() iterable argument is empty");
+        parser::NodePtr errorCall = parser::makeNode("Call", expr.range);
+        parser::addField(*errorCall, "func", nameNode("ValueError"));
+        parser::addField(*errorCall, "args",
+                         std::vector<parser::NodePtr>{message});
+        parser::addField(*errorCall, "keywords",
+                         std::vector<parser::NodePtr>{});
+        parser::NodePtr raiseNode = parser::makeNode("Raise", expr.range);
+        parser::addField(*raiseNode, "exc", errorCall);
+        parser::NodePtr emptyGuard = parser::makeNode("If", expr.range);
+        parser::addField(*emptyGuard, "test", notSeen);
+        parser::addField(*emptyGuard, "body",
+                         std::vector<parser::NodePtr>{raiseNode});
+        parser::addField(*emptyGuard, "orelse",
+                         std::vector<parser::NodePtr>{});
+        std::optional<Value> priorElement;
+        if (auto found = values.find(element); found != values.end())
+          priorElement = found->second;
+        emitFor(*loop);
+        emitStatement(*emptyGuard);
+        auto built = values.find(tmp);
+        if (built == values.end() || !built->second.value) {
+          diagnostics.push_back(parser::Diagnostic{
+              parser::Severity::Error, expr.range.start,
+              "cannot lower " + reducer.str() + "() over this iterable"});
+          return emitNone(expr);
+        }
+        Value result = built->second;
+        values.erase(tmp);
+        values.erase(flag);
+        if (priorElement)
+          values[element] = *priorElement;
+        else
+          values.erase(element);
+        return result;
+      }
+      if (reducerArgs && reducerArgs->size() == 1 && reducerArgs->front() &&
+          (!reducerKeywords || reducerKeywords->empty()) &&
+          (reducer == "sum" || reducer == "any" || reducer == "all")) {
+        std::string tmp =
+            "__" + reducer.str() + std::to_string(++listCompCounter);
+        std::string element = "__" + reducer.str() + "el" +
+                              std::to_string(listCompCounter);
+        if (reducer == "sum") {
+          mlir::Type zeroType = types.literal("0");
+          auto zero = py::IntConstantOp::create(builder, loc(expr), zeroType,
+                                                builder.getStringAttr("0"));
+          values[tmp] = Value{zero.getResult(), zeroType};
+          types.bindSymbol(tmp, zeroType);
+        } else {
+          bool initial = reducer == "all";
+          mlir::Type initType = types.literal(initial ? "True" : "False");
+          auto init = py::BoolConstantOp::create(
+              builder, loc(expr), initType, builder.getBoolAttr(initial));
+          values[tmp] = Value{init.getResult(), initType};
+          types.bindSymbol(tmp, initType);
+        }
+        parser::NodePtr tmpName = parser::makeNode("Name", expr.range);
+        parser::addField(*tmpName, "id", tmp);
+        parser::NodePtr elementName = parser::makeNode("Name", expr.range);
+        parser::addField(*elementName, "id", element);
+        std::vector<parser::NodePtr> body;
+        if (reducer == "sum") {
+          // <tmp> = <tmp> + <element>
+          parser::NodePtr addOp = parser::makeNode("Add", expr.range);
+          parser::NodePtr add = parser::makeNode("BinOp", expr.range);
+          parser::addField(*add, "left", tmpName);
+          parser::addField(*add, "op", addOp);
+          parser::addField(*add, "right", elementName);
+          parser::NodePtr assign = parser::makeNode("Assign", expr.range);
+          parser::addField(*assign, "targets",
+                           std::vector<parser::NodePtr>{tmpName});
+          parser::addField(*assign, "value", add);
+          body.push_back(assign);
+        } else {
+          // any: if <element>: <tmp> = True; break
+          // all: if not <element>: <tmp> = False; break
+          bool flipped = reducer == "any";
+          parser::NodePtr flippedValue =
+              parser::makeNode("Constant", expr.range);
+          parser::addField(*flippedValue, "value", flipped);
+          parser::NodePtr assign = parser::makeNode("Assign", expr.range);
+          parser::addField(*assign, "targets",
+                           std::vector<parser::NodePtr>{tmpName});
+          parser::addField(*assign, "value", flippedValue);
+          parser::NodePtr breakNode = parser::makeNode("Break", expr.range);
+          parser::NodePtr test = elementName;
+          if (reducer == "all") {
+            parser::NodePtr notOp = parser::makeNode("Not", expr.range);
+            parser::NodePtr negated = parser::makeNode("UnaryOp", expr.range);
+            parser::addField(*negated, "op", notOp);
+            parser::addField(*negated, "operand", elementName);
+            test = negated;
+          }
+          parser::NodePtr guard = parser::makeNode("If", expr.range);
+          parser::addField(*guard, "test", test);
+          parser::addField(*guard, "body",
+                           std::vector<parser::NodePtr>{assign, breakNode});
+          parser::addField(*guard, "orelse", std::vector<parser::NodePtr>{});
+          body.push_back(guard);
+        }
+        parser::NodePtr loop = parser::makeNode("For", expr.range);
+        parser::addField(*loop, "target", elementName);
+        parser::addField(*loop, "iter", reducerArgs->front());
+        parser::addField(*loop, "body", body);
+        parser::addField(*loop, "orelse", std::vector<parser::NodePtr>{});
+        std::optional<Value> priorElement;
+        if (auto found = values.find(element); found != values.end())
+          priorElement = found->second;
+        emitFor(*loop);
+        auto built = values.find(tmp);
+        if (built == values.end() || !built->second.value) {
+          diagnostics.push_back(parser::Diagnostic{
+              parser::Severity::Error, expr.range.start,
+              "cannot lower " + reducer.str() + "() over this iterable"});
+          return emitNone(expr);
+        }
+        Value result = built->second;
+        values.erase(tmp);
+        if (priorElement)
+          values[element] = *priorElement;
+        else
+          values.erase(element);
+        return result;
+      }
+    }
+  }
+
   if (!calleeQualified.empty())
-    if (auto cls = types.lookupClass(calleeQualified))
+    if (auto cls = types.lookupClass(calleeQualified)) {
+      if (std::optional<llvm::StringRef> symbol = contractName(*cls))
+        if (isStubSourceModuleSymbol(*symbol)) {
+          diagnostics.push_back(parser::Diagnostic{
+              parser::Severity::Error, expr.range.start,
+              "cannot instantiate stub-only import '" + symbol->str() +
+                  "' at runtime"});
+          return emitNone(expr);
+        }
       return emitClassInstantiation(expr, llvm::StringRef(calleeQualified),
                                     *cls);
+    }
 
   if (calleeNode && calleeNode->kind == "Name") {
     llvm::StringRef name = ast::nameSpelling(*calleeNode);
-    if (auto cls = types.lookupClass(name))
+    if (auto cls = types.lookupClass(name)) {
+      if (std::optional<llvm::StringRef> symbol = contractName(*cls))
+        if (isStubSourceModuleSymbol(*symbol)) {
+          diagnostics.push_back(parser::Diagnostic{
+              parser::Severity::Error, expr.range.start,
+              "cannot instantiate stub-only import '" + symbol->str() +
+                  "' at runtime"});
+          return emitNone(expr);
+        }
       return emitClassInstantiation(expr, name, *cls);
+    }
     if (name == "len") {
       const auto *args = ast::nodeList(expr, "args");
       if (args && args->size() == 1) {
         Value input = emitExpr(args->front().get());
+        if (std::optional<MethodBinding> method =
+                lookupClassMethod(input.type, "__len__"))
+          return emitInlineOperatorCall(expr, input, *method, {});
         CallInferenceResult inference =
             types.inferMethodCallWithEvidence(input.type, "__len__", {});
+        if (!requireStaticEvidence(expr, inference))
+          return emitNone(expr);
         mlir::Type resultType =
             inference ? inference.resultType : types.intType();
         auto op =
@@ -127,6 +814,8 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
         }
         CallInferenceResult inference = types.inferMethodCallWithEvidence(
             receiver.type, "__round__", extraTypes);
+        if (!requireStaticEvidence(expr, inference))
+          return emitNone(expr);
         mlir::Type resultType =
             inference ? inference.resultType : types.inferExpr(&expr);
         auto op =
@@ -137,13 +826,19 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     }
   }
 
-  auto emitBuiltinBinding = [&](llvm::StringRef name) -> Value {
-    mlir::Type type = types.lookupSymbol(name).value_or(types.object());
+  auto emitBuiltinBinding = [&](llvm::StringRef name) -> std::optional<Value> {
+    std::optional<mlir::Type> type = types.lookupSymbol(name);
+    if (!type) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, expr.range.start,
+          "unresolved builtin '" + name.str() + "'"});
+      return std::nullopt;
+    }
     std::string binding = name.str();
     if (std::optional<std::string> canonical =
             types.lookupCanonicalBinding(name))
       binding = *canonical;
-    return emitBindingRef(*calleeNode, binding, type);
+    return emitBindingRef(*calleeNode, binding, *type);
   };
 
   if (std::optional<Value> primitiveCall =
@@ -158,22 +853,46 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     bool hasKeywords = keywords && !keywords->empty();
     if (builtinVisible && args && args->size() == 1 && !hasKeywords &&
         (name == "repr" || name == "print")) {
-      mlir::Type argumentType = types.inferExpr(args->front().get());
+      // Widen literals to their contract (`repr(5)` sees `builtins.int`, not
+      // `literal<5>`) so the manifest `__repr__` resolves.
+      mlir::Type argumentType =
+          types.widenLiteral(types.inferExpr(args->front().get()));
+      std::optional<Value> repr;
       if (std::optional<MethodBinding> method =
               lookupClassMethod(argumentType, "__repr__")) {
+        // Source-class __repr__: inline the method body.
         Value argument = emitExpr(args->front().get());
         llvm::StringMap<Value> emptyKeywords;
         Value descriptorReceiver =
             emitDescriptorReceiver(expr, argument, *method);
-        Value repr = emitInlineMethodBody(expr, descriptorReceiver,
-                                          methodBindingBindsReceiver(*method),
-                                          *method, {}, emptyKeywords);
+        repr = emitInlineMethodBody(expr, descriptorReceiver,
+                                    methodBindingBindsReceiver(*method), *method,
+                                    {}, emptyKeywords);
+      } else if (name == "repr") {
+        // Manifest-typed receiver (int/str/...): emit py.repr dispatch, the
+        // same manifest path `str()` uses (avoid altering `print`'s existing
+        // function-binding lowering, which this special case only optimizes).
+        if (CallInferenceResult inference = types.inferMethodCallWithEvidence(
+                argumentType, "__repr__", {})) {
+          Value argument = coerceValue(emitExpr(args->front().get()),
+                                       argumentType, expr);
+          mlir::Type resultType = types.contract("builtins.str");
+          auto op = py::ReprOp::create(
+              builder, loc(expr), resultType,
+              mlir::FlatSymbolRefAttr::get(&context, "__repr__"),
+              mlir::TypeAttr::get(callProtocolFor(inference)), argument.value);
+          repr = Value{op.getResult(), resultType};
+        }
+      }
+      if (repr) {
         if (name == "repr")
-          return repr;
+          return *repr;
         CallOperands operands =
-            emitCallOperands(expr, {repr}, /*includeAstArguments=*/false);
-        return emitCallableDispatch(expr, emitBuiltinBinding(name), operands,
-                                    types.none());
+            emitCallOperands(expr, {*repr}, /*includeAstArguments=*/false);
+        std::optional<Value> builtin = emitBuiltinBinding(name);
+        if (!builtin)
+          return emitNone(expr);
+        return emitCallableDispatch(expr, *builtin, operands, types.none());
       }
     }
   }
@@ -186,12 +905,28 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
                                   local->second.boundMethod->method);
     if (values.find(name) == values.end())
       if (std::optional<std::string> canonical =
-              types.lookupCanonicalBinding(name))
+              types.lookupCanonicalBinding(name)) {
+        if (isStubSourceModuleSymbol(*canonical)) {
+          diagnostics.push_back(parser::Diagnostic{
+              parser::Severity::Error, expr.range.start,
+              "cannot call stub-only import '" + *canonical +
+                  "' at runtime"});
+          return emitNone(expr);
+        }
+        if (py::platform_constants::isStaticStringCallable(*canonical) &&
+            callHasNoArguments(expr))
+          if (std::optional<Value> constant =
+                  emitStaticStringConstant(expr, *canonical,
+                                           /*allowCallable=*/true))
+            return *constant;
         if (*canonical == "asyncio.sleep")
           if (auto symbol = types.lookupSymbol(name))
             return emitCallableDispatch(
                 expr, emitBindingRef(*calleeNode, *canonical, *symbol),
                 emitCallOperands(expr), types.inferExpr(&expr));
+        if (*canonical == "asyncio.run")
+          return emitAsyncioRunCall(expr);
+      }
   }
 
   if (calleeNode && calleeNode->kind == "Attribute" &&
@@ -201,6 +936,20 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
       if (std::optional<std::string> canonical =
               types.lookupCanonicalBinding(calleeQualified))
         binding = *canonical;
+      if (isStubSourceModuleSymbol(binding)) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, expr.range.start,
+            "cannot call stub-only import '" + binding + "' at runtime"});
+        return emitNone(expr);
+      }
+      if (py::platform_constants::isStaticStringCallable(binding) &&
+          callHasNoArguments(expr))
+        if (std::optional<Value> constant =
+                emitStaticStringConstant(expr, binding,
+                                         /*allowCallable=*/true))
+          return *constant;
+      if (binding == "asyncio.run")
+        return emitAsyncioRunCall(expr);
       mlir::Type resultOverride =
           binding == "asyncio.sleep" ? types.inferExpr(&expr) : mlir::Type();
       return emitCallableDispatch(expr,
@@ -223,6 +972,12 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
         }
 
         CallOperands operands = emitCallOperands(expr);
+        if (!operands.valid) {
+          diagnostics.push_back(parser::Diagnostic{
+              parser::Severity::Error, expr.range.start,
+              operands.failureReason});
+          return emitNone(expr);
+        }
         Value posPack =
             emitPack(operands.positional, operands.positionalUnpacked);
         Value namePack = emitPack(operands.keywordNames);
@@ -230,8 +985,31 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
         CallInferenceResult inference = types.inferMethodCallWithEvidence(
             receiver.type, *methodName, operands.positionalTypes,
             operands.keywordTypes);
+        if (!requireStaticEvidence(expr, inference))
+          return emitNone(expr);
         mlir::Type resultType =
             inference ? inference.resultType : types.inferExpr(&expr);
+        // Manifest-declared structural mutators (`ly.typing.structural_mutators`)
+        // may reallocate the receiver's storage, so the call carries an extra
+        // receiver-typed result that rebinds the local — the mutation becomes
+        // an ordinary SSA reassignment and loop-carried threading forwards the
+        // (possibly grown) representation across back-edges.
+        if (receiverNode->kind == "Name" &&
+            types.isStructuralMutatorMethod(receiver.type, *methodName)) {
+          llvm::StringRef receiverName = ast::nameSpelling(*receiverNode);
+          auto bound = values.find(receiverName);
+          if (bound != values.end() && bound->second.value == receiver.value) {
+            auto op = py::CallOp::create(
+                builder, loc(expr),
+                mlir::TypeRange{resultType, receiver.value.getType()},
+                callProtocolFor(inference), receiver.value, posPack.value,
+                namePack.value, valuePack.value);
+            op->setAttr("ly.bound_method", builder.getStringAttr(*methodName));
+            op->setAttr("ly.structural_mutation", builder.getUnitAttr());
+            values[receiverName] = Value{op.getResult(1), receiver.type};
+            return {op.getResults().front(), resultType};
+          }
+        }
         auto op =
             py::CallOp::create(builder, loc(expr), mlir::TypeRange{resultType},
                                callProtocolFor(inference), receiver.value,
@@ -239,6 +1017,16 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
         op->setAttr("ly.bound_method", builder.getStringAttr(*methodName));
         return {op.getResults().front(), resultType};
       }
+      }
+  }
+
+  if (calleeNode && calleeNode->kind == "Name") {
+    llvm::StringRef name = ast::nameSpelling(*calleeNode);
+    if (!types.lookupSymbol(name) && !types.lookupClass(name)) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, calleeNode->range.start,
+          "unresolved name '" + name.str() + "'"});
+      return emitNone(expr);
     }
   }
 

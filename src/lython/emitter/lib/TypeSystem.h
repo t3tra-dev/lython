@@ -14,12 +14,16 @@ namespace lython::emitter {
 
 struct FunctionSignature {
   py::CallableType callable;
+  py::CallableType publicCallable;
   llvm::SmallVector<std::string, 8> positionalNames;
   llvm::SmallVector<mlir::Type, 8> positionalTypes;
   llvm::SmallVector<std::string, 4> kwOnlyNames;
   llvm::SmallVector<mlir::Type, 4> kwOnlyTypes;
   llvm::SmallVector<bool, 8> positionalDefaults;
   llvm::SmallVector<bool, 4> kwOnlyDefaults;
+  llvm::SmallVector<std::string, 4> missingParameterAnnotations;
+  llvm::SmallVector<std::string, 4> invalidParameterAnnotations;
+  llvm::SmallVector<std::string, 4> bodyInferenceFailures;
   // Runtime-local type of the `args` variable. For `*args: Unpack[Ts]` this is
   // a tuple object; the Callable contract tail is kept separately below.
   mlir::Type varargType;
@@ -29,6 +33,17 @@ struct FunctionSignature {
   std::optional<std::string> kwargName;
   unsigned positionalOnlyCount = 0;
   mlir::Type resultType;
+  mlir::Type publicResultType;
+  bool isAsyncFunction = false;
+  bool isGeneratorFunction = false;
+  bool isAsyncGeneratorFunction = false;
+  bool generatorAnnotationIncompatible = false;
+  bool asyncGeneratorReturnsValue = false;
+  llvm::SmallVector<std::string, 4> generatorAnalysisFailures;
+  mlir::Type inferredGeneratorType;
+  mlir::Type generatorYieldType;
+  mlir::Type generatorSendType;
+  mlir::Type generatorReturnType;
 };
 
 struct CallKeywordType {
@@ -46,9 +61,65 @@ struct CallInferenceResult {
   mlir::Type resultType;
   CallInferenceEvidence evidence;
   bool resolved = false;
+  std::string failureReason;
 
   explicit operator bool() const {
     return resolved && static_cast<bool>(resultType);
+  }
+};
+
+struct AwaitInferenceResult {
+  mlir::Type resultType;
+  mlir::Type awaitContract;
+  bool resolved = false;
+  std::string failureReason;
+
+  explicit operator bool() const {
+    return resolved && static_cast<bool>(resultType);
+  }
+};
+
+struct YieldFromInferenceResult {
+  mlir::Type elementType;
+  mlir::Type completionType;
+  mlir::Type protocolContract;
+  bool resolved = false;
+  std::string failureReason;
+
+  explicit operator bool() const {
+    return resolved && static_cast<bool>(elementType) &&
+           static_cast<bool>(completionType) &&
+           static_cast<bool>(protocolContract);
+  }
+};
+
+struct AsyncIterationInferenceResult {
+  mlir::Type iteratorType;
+  mlir::Type nextAwaitableType;
+  mlir::Type itemType;
+  CallInferenceResult aiter;
+  CallInferenceResult anext;
+  AwaitInferenceResult awaitNext;
+  bool resolved = false;
+  std::string failureReason;
+
+  explicit operator bool() const {
+    return resolved && static_cast<bool>(iteratorType) &&
+           static_cast<bool>(itemType);
+  }
+};
+
+struct AsyncContextMethodInferenceResult {
+  mlir::Type awaitableType;
+  mlir::Type resultType;
+  CallInferenceResult method;
+  AwaitInferenceResult awaitResult;
+  bool resolved = false;
+  std::string failureReason;
+
+  explicit operator bool() const {
+    return resolved && static_cast<bool>(awaitableType) &&
+           static_cast<bool>(resultType);
   }
 };
 
@@ -77,6 +148,7 @@ public:
   void seedBuiltins();
 
   mlir::Type object() const;
+  mlir::Type any() const;
   mlir::Type none() const;
   mlir::Type boolType() const;
   mlir::Type intType() const;
@@ -92,9 +164,25 @@ public:
   mlir::Type listOf(mlir::Type elementType) const;
   mlir::Type dictOf(mlir::Type keyType, mlir::Type valueType) const;
   mlir::Type iteratorOf(mlir::Type elementType) const;
+  mlir::Type coroutineOf(mlir::Type resultType) const;
+  // Manifest-driven contract refinement on field assignment
+  // (ly.typing.field_param_bindings): the refined receiver type when
+  // `receiver.field = value` binds one of the receiver class's type
+  // parameters, nullopt otherwise. Pure kernel rule -- which classes/fields
+  // participate is declared entirely in the module manifests.
+  std::optional<mlir::Type>
+  fieldAssignmentRefinement(mlir::Type receiverType, llvm::StringRef fieldName,
+                            mlir::Type valueType) const;
+
+  // Target triple for platform-constant typing (sys.platform / os.name /
+  // platform.system() infer as string literals of THIS target).
+  void setTargetTriple(std::string triple) { targetTriple = std::move(triple); }
 
   Scope pushScope() const;
+  void bindLocalSymbol(llvm::StringRef name, mlir::Type type) const;
   void bindSymbol(llvm::StringRef name, mlir::Type type);
+  void bindCanonicalSymbol(llvm::StringRef name, llvm::StringRef canonical,
+                           mlir::Type type);
   std::optional<mlir::Type> lookupSymbol(llvm::StringRef name) const;
   std::optional<std::string> lookupCanonicalBinding(llvm::StringRef name) const;
   void bindClass(llvm::StringRef name, mlir::Type instanceType);
@@ -113,6 +201,24 @@ public:
       mlir::Type receiverType, llvm::StringRef methodName,
       mlir::ArrayRef<mlir::Type> positional,
       mlir::ArrayRef<CallKeywordType> keywords = {}) const;
+  // Manifest fact (`ly.typing.structural_mutators`): the method structurally
+  // mutates the receiver, so its call rebinds the receiver local through an
+  // extra receiver-typed call result.
+  bool isStructuralMutatorMethod(mlir::Type receiverType,
+                                 llvm::StringRef methodName) const;
+  // Ordered `__match_args__` attribute names for positional class patterns on
+  // the receiver's class; nullopt when the class declares none.
+  std::optional<std::vector<std::string>>
+  classMatchArgs(mlir::Type receiverType) const;
+  AwaitInferenceResult inferAwaitWithEvidence(mlir::Type awaitableType) const;
+  YieldFromInferenceResult
+  inferYieldFromWithEvidence(mlir::Type sourceType) const;
+  AsyncIterationInferenceResult
+  inferAsyncIterationWithEvidence(mlir::Type iterableType) const;
+  AsyncContextMethodInferenceResult
+  inferAsyncContextEnterWithEvidence(mlir::Type managerType) const;
+  AsyncContextMethodInferenceResult inferAsyncContextExitWithEvidence(
+      mlir::Type managerType, mlir::ArrayRef<mlir::Type> exceptionTypes) const;
   mlir::Type inferCall(mlir::Type calleeType,
                        mlir::ArrayRef<mlir::Type> positional,
                        mlir::ArrayRef<CallKeywordType> keywords) const;
@@ -131,18 +237,19 @@ public:
 
 private:
   void popScope() const;
-  void bindLocalSymbol(llvm::StringRef name, mlir::Type type) const;
-  void bindCanonicalSymbol(llvm::StringRef name, llvm::StringRef canonical,
-                           mlir::Type type);
   void bindAnnotationAlias(llvm::StringRef name, llvm::StringRef target);
   std::string resolveAnnotationName(llvm::StringRef name) const;
 
   mlir::MLIRContext &context;
+  std::string targetTriple;
   llvm::StringMap<mlir::Type> symbols;
   llvm::StringMap<mlir::Type> classes;
   llvm::StringMap<std::string> canonicalBindings;
   llvm::StringMap<std::string> annotationAliases;
   mutable llvm::SmallVector<llvm::StringMap<mlir::Type>, 8> scopes;
+  mutable llvm::SmallVector<llvm::StringMap<std::string>, 8>
+      scopedCanonicalBindings;
+  mutable llvm::SmallVector<llvm::StringMap<mlir::Type>, 8> scopedClasses;
 };
 
 } // namespace lython::emitter

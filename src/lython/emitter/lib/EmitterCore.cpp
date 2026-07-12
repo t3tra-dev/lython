@@ -22,7 +22,9 @@ ModuleEmitter::ModuleEmitter(const parser::Node &moduleNode,
                              std::string sourceName, EmitOptions options)
     : moduleNode(moduleNode), context(context),
       moduleName(std::move(moduleName)), sourceName(std::move(sourceName)),
-      options(options), builder(&context), types(context) {
+      activePackageName(options.mainPackageName), options(options),
+      builder(&context), types(context) {
+  types.setTargetTriple(this->options.targetTriple);
   if (this->sourceName.empty())
     this->sourceName = this->moduleName;
 }
@@ -47,7 +49,23 @@ EmitResult ModuleEmitter::emit() {
   }
   builder.setInsertionPointToEnd(module.getBody());
 
+  // Register module globals before any function body is emitted so their
+  // reads resolve. Publish their names/types for runtime storage lowering.
+  collectModuleGlobals(moduleNode);
+  if (!moduleGlobals.empty()) {
+    llvm::SmallVector<std::string, 4> globalNames;
+    llvm::SmallVector<mlir::Type, 4> globalTypes;
+    for (const auto &entry : moduleGlobals) {
+      globalNames.push_back(entry.first().str());
+      globalTypes.push_back(entry.second);
+    }
+    module->setAttr("ly.module_global_names", stringArray(builder, globalNames));
+    module->setAttr("ly.module_global_types", typeArray(builder, globalTypes));
+  }
+
+  predeclareSourceModules();
   predeclareTopLevel();
+  emitSourceModuleDeclarations();
   emitTopLevelDeclarations();
 
   auto mainType = builder.getFunctionType({}, {});
@@ -55,7 +73,9 @@ EmitResult ModuleEmitter::emit() {
                                          mainType);
   mlir::Block *entry = main.addEntryBlock();
   builder.setInsertionPointToStart(entry);
+  atModuleScope = true;
   emitStatements(ast::nodeList(moduleNode, "body"), /*skipDeclarations=*/true);
+  atModuleScope = false;
   if (!insertionBlockTerminated(builder))
     mlir::func::ReturnOp::create(builder, loc(moduleNode));
 
@@ -104,21 +124,70 @@ mlir::Type ModuleEmitter::callProtocolFor(const CallInferenceResult &inference,
   return callProtocolFor(fallback);
 }
 
+bool ModuleEmitter::requireStaticEvidence(
+    const parser::Node &anchor, const CallInferenceResult &inference) {
+  if (inference)
+    return true;
+  diagnostics.push_back(parser::Diagnostic{
+      parser::Severity::Error, anchor.range.start,
+      inference.failureReason.empty()
+          ? "operation requires manifest-backed static evidence"
+          : inference.failureReason});
+  return false;
+}
+
+bool ModuleEmitter::requireStaticEvidence(
+    const parser::Node &anchor, const AwaitInferenceResult &inference) {
+  if (inference)
+    return true;
+  diagnostics.push_back(parser::Diagnostic{
+      parser::Severity::Error, anchor.range.start,
+      inference.failureReason.empty()
+          ? "await expression requires manifest-backed Awaitable evidence"
+          : inference.failureReason});
+  return false;
+}
+
+bool ModuleEmitter::requireStaticEvidence(
+    const parser::Node &anchor, const YieldFromInferenceResult &inference) {
+  if (inference)
+    return true;
+  diagnostics.push_back(parser::Diagnostic{
+      parser::Severity::Error, anchor.range.start,
+      inference.failureReason.empty()
+          ? "yield from requires manifest-backed iterable evidence"
+          : inference.failureReason});
+  return false;
+}
+
+bool ModuleEmitter::requireStaticEvidence(
+    const parser::Node &anchor,
+    const AsyncIterationInferenceResult &inference) {
+  if (inference)
+    return true;
+  diagnostics.push_back(parser::Diagnostic{
+      parser::Severity::Error, anchor.range.start,
+      inference.failureReason.empty()
+          ? "async for requires manifest-backed AsyncIterable evidence"
+          : inference.failureReason});
+  return false;
+}
+
+bool ModuleEmitter::requireStaticEvidence(
+    const parser::Node &anchor,
+    const AsyncContextMethodInferenceResult &inference) {
+  if (inference)
+    return true;
+  diagnostics.push_back(parser::Diagnostic{
+      parser::Severity::Error, anchor.range.start,
+      inference.failureReason.empty()
+          ? "async context manager operation requires manifest-backed evidence"
+          : inference.failureReason});
+  return false;
+}
+
 mlir::Type ModuleEmitter::boolProtocol() const {
   return types.protocol("Callable");
-}
-
-mlir::Type ModuleEmitter::coroutineType(mlir::Type resultType) const {
-  return types.contract("types.CoroutineType",
-                        {types.object(), types.object(),
-                         resultType ? resultType : types.object()});
-}
-
-FunctionSignature
-ModuleEmitter::asyncPublicSignature(FunctionSignature sig) const {
-  sig.resultType = coroutineType(sig.resultType);
-  types.refreshCallable(sig);
-  return sig;
 }
 
 } // namespace lython::emitter

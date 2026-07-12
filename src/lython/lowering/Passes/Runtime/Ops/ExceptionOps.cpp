@@ -62,6 +62,21 @@ mlir::func::FuncOp getOrCreateRethrow(mlir::ModuleOp module,
   return function;
 }
 
+mlir::func::FuncOp
+getOrCreateDiscardCurrentException(mlir::ModuleOp module,
+                                   mlir::OpBuilder &builder) {
+  constexpr llvm::StringLiteral kName{"LyEH_DiscardCurrentException"};
+  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(kName))
+    return existing;
+  mlir::OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPointToEnd(module.getBody());
+  auto functionType = builder.getFunctionType({}, {});
+  auto function =
+      mlir::func::FuncOp::create(builder, module.getLoc(), kName, functionType);
+  function.setPrivate();
+  return function;
+}
+
 mlir::func::FuncOp getOrCreateClassIdMatches(mlir::ModuleOp module,
                                              mlir::OpBuilder &builder) {
   constexpr llvm::StringLiteral kName{"LyEH_ClassIdMatches"};
@@ -78,9 +93,9 @@ mlir::func::FuncOp getOrCreateClassIdMatches(mlir::ModuleOp module,
 }
 
 mlir::func::FuncOp
-getOrCreateDiscardCurrentExceptionIfMatches(mlir::ModuleOp module,
-                                            mlir::OpBuilder &builder) {
-  constexpr llvm::StringLiteral kName{"LyEH_DiscardCurrentExceptionIfMatches"};
+getOrCreateCurrentExceptionMatches(mlir::ModuleOp module,
+                                   mlir::OpBuilder &builder) {
+  constexpr llvm::StringLiteral kName{"LyEH_CurrentExceptionMatches"};
   if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(kName))
     return existing;
   mlir::OpBuilder::InsertionGuard guard(builder);
@@ -235,24 +250,50 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerRaise(py::RaiseOp op) {
   if (!exception)
     return op.emitError() << "raised exception has no lowered runtime bundle";
 
-  std::optional<RuntimeSymbol> symbol =
-      manifest.primitive(exception->contractName(), "raise");
-  if (!symbol)
-    return op.emitError() << "runtime manifest has no "
-                          << exception->contractName() << ".raise primitive";
+  if (exception->objectEvidence.hasFlag(kCurrentExceptionBorrowFlag)) {
+    mlir::func::FuncOp rethrow = getOrCreateRethrow(module, builder);
+    builder.setInsertionPoint(op);
+    if (mlir::failed(emitTracebackFrame(op.getOperation())))
+      return mlir::failure();
+    emitTryCallSiteMarkerIfNeeded(op.getLoc());
+    mlir::func::CallOp::create(builder, op.getLoc(), rethrow,
+                               mlir::ValueRange{});
+    createDeadContinuation(builder, op.getOperation());
+    op.erase();
+    return mlir::success();
+  }
 
-  llvm::SmallVector<const RuntimeBundle *, 1> sources{exception};
+  if (mlir::failed(RuntimeBundleLowerer::emitRaiseExceptionBundle(
+          op.getOperation(), *exception, /*discardCurrentException=*/true)))
+    return mlir::failure();
+  createDeadContinuation(builder, op.getOperation());
+  op.erase();
+  return mlir::success();
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::emitRaiseExceptionBundle(
+    mlir::Operation *op, const RuntimeBundle &exception,
+    bool discardCurrentException) {
+  std::optional<RuntimeSymbol> symbol =
+      manifest.primitive(exception.contractName(), "raise");
+  if (!symbol)
+    return op->emitError() << "runtime manifest has no "
+                           << exception.contractName() << ".raise primitive";
+
+  llvm::SmallVector<const RuntimeBundle *, 1> sources{&exception};
   llvm::SmallVector<mlir::Value, 8> operands;
   builder.setInsertionPoint(op);
-  if (mlir::failed(emitTracebackFrame(op.getOperation())))
+  if (discardCurrentException)
+    mlir::func::CallOp::create(
+        builder, op->getLoc(), getOrCreateDiscardCurrentException(module, builder),
+        mlir::ValueRange{});
+  if (mlir::failed(emitTracebackFrame(op)))
     return mlir::failure();
   if (mlir::failed(buildRuntimeCallOperands(op, *symbol, sources, operands,
                                             /*allowUnusedSources=*/false)))
     return mlir::failure();
 
-  RuntimeBundleLowerer::createRuntimeCall(op.getLoc(), *symbol, operands);
-  createDeadContinuation(builder, op.getOperation());
-  op.erase();
+  RuntimeBundleLowerer::createRuntimeCall(op->getLoc(), *symbol, operands);
   return mlir::success();
 }
 
@@ -260,6 +301,7 @@ mlir::LogicalResult
 RuntimeBundleLowerer::lowerRaiseCurrent(py::RaiseCurrentOp op) {
   mlir::func::FuncOp rethrow = getOrCreateRethrow(module, builder);
   builder.setInsertionPoint(op);
+  emitTryCallSiteMarkerIfNeeded(op.getLoc());
   mlir::func::CallOp::create(builder, op.getLoc(), rethrow, mlir::ValueRange{});
   createDeadContinuation(builder, op.getOperation());
   op.erase();
@@ -319,11 +361,39 @@ RuntimeBundleLowerer::lowerExceptCurrentMatch(py::ExceptCurrentMatchOp op) {
   mlir::Value handler =
       mlir::arith::ConstantIntOp::create(builder, op.getLoc(), *handlerId, 64)
           .getResult();
-  mlir::func::FuncOp discardIfMatches =
-      getOrCreateDiscardCurrentExceptionIfMatches(module, builder);
-  auto call = mlir::func::CallOp::create(builder, op.getLoc(), discardIfMatches,
+  mlir::func::FuncOp currentMatches =
+      getOrCreateCurrentExceptionMatches(module, builder);
+  auto call = mlir::func::CallOp::create(builder, op.getLoc(), currentMatches,
                                          mlir::ValueRange{handler});
   op.getResult().replaceAllUsesWith(call.getResult(0));
+  erase.push_back(op);
+  return mlir::success();
+}
+
+mlir::LogicalResult
+RuntimeBundleLowerer::lowerExceptCurrentValue(py::ExceptCurrentValueOp op) {
+  mlir::FailureOr<std::int64_t> handlerId =
+      handlerClassId(op.getOperation(), op.getHandler(), manifest);
+  if (mlir::failed(handlerId))
+    return mlir::failure();
+
+  std::optional<RuntimeSymbol> borrow =
+      manifest.primitive("builtins.BaseException", "borrow_current");
+  if (!borrow)
+    return op.emitError()
+           << "runtime manifest has no builtins.BaseException.borrow_current "
+              "primitive";
+
+  builder.setInsertionPoint(op);
+  mlir::func::CallOp call =
+      RuntimeBundleLowerer::createRuntimeCall(op.getLoc(), *borrow, {});
+  RuntimeBundle result;
+  if (mlir::failed(RuntimeBundleLowerer::makeObjectBundleWithOwnership(
+          op.getOperation(), op.getResult().getType(), call.getResults(),
+          result, ownership::OwnershipKind::Borrow)))
+    return mlir::failure();
+  result.objectEvidence.setFlag(kCurrentExceptionBorrowFlag);
+  valueBundles[op.getResult()] = std::move(result);
   erase.push_back(op);
   return mlir::success();
 }

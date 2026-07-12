@@ -1,4 +1,5 @@
 #include "PyTypeObject.h"
+#include "PyProtocols.h"
 
 #include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/IR/SymbolTable.h"
@@ -15,6 +16,16 @@
 
 namespace py::type_object {
 namespace {
+
+// Typing manifests are not imported as py.class symbols; the protocols table
+// is their registry. Source classes may inherit from them (e.g. ctypes
+// Structure subclasses).
+bool isManifestDeclaredClass(mlir::Operation *from, llvm::StringRef name) {
+  const protocols::Table &table = protocols::Table::get(*from->getContext());
+  return table.lookup(name) != nullptr ||
+         table.qualifiedClassExport(name).has_value() ||
+         table.bareClassExport(name).has_value();
+}
 
 mlir::FailureOr<llvm::SmallVector<llvm::StringRef, 4>>
 basesOf(mlir::Operation *diagnostic, ClassOp op) {
@@ -87,6 +98,12 @@ computeMro(mlir::Operation *from, llvm::StringRef name,
   }
   ClassOp classOp = lookup(from, name);
   if (!classOp) {
+    // Manifest-declared classes (typing manifests are not imported as
+    // py.class symbols) are MRO leaves for source classes.
+    if (isManifestDeclaredClass(from, name)) {
+      visiting.erase(name);
+      return llvm::SmallVector<llvm::StringRef, 8>{name};
+    }
     from->emitOpError("unknown class '") << name << "'";
     return mlir::failure();
   }
@@ -151,7 +168,8 @@ mlir::LogicalResult verifyBases(ClassOp op) {
       return op.emitOpError("class cannot inherit from itself");
     if (!seen.insert(baseName).second)
       return op.emitOpError("duplicate base class '") << baseName << "'";
-    if (!lookup(op, baseName))
+    if (!lookup(op, baseName) &&
+        !isManifestDeclaredClass(op.getOperation(), baseName))
       return op.emitOpError("unknown base class '") << baseName << "'";
   }
 
@@ -168,6 +186,17 @@ mlir::LogicalResult verifyBases(ClassOp op) {
   mlir::FailureOr<llvm::SmallVector<llvm::StringRef, 8>> mro =
       mroNames(op, className);
   return mlir::failed(mro) ? mlir::failure() : mlir::success();
+}
+
+bool isKnownSubclassOf(mlir::Operation *from, llvm::StringRef derived,
+                       llvm::StringRef base) {
+  // Quiet subtype QUERY: names that are not py.class symbols (e.g. manifest
+  // builtins) are simply not subclasses here — never a diagnostic.
+  if (!lookup(from, derived) || !lookup(from, base))
+    return false;
+  mlir::FailureOr<llvm::SmallVector<llvm::StringRef, 8>> mro =
+      mroNames(from, derived);
+  return mlir::succeeded(mro) && llvm::is_contained(*mro, base);
 }
 
 mlir::FailureOr<bool> isSubclassOf(mlir::Operation *from,

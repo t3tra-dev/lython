@@ -2,6 +2,8 @@
 
 #include "Common/RuntimeSupport.h"
 
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 
@@ -18,6 +20,12 @@ public:
 
   llvm::StringRef getArgument() const final {
     return "lython-runtime-lowering";
+  }
+  void getDependentDialects(mlir::DialectRegistry &registry) const final {
+    // Inline descriptor assembly (payload box word → memref view) emits
+    // llvm-dialect ops directly; the boxed-method dispatch hooks emit ub.poison
+    // for their miss arm.
+    registry.insert<mlir::LLVM::LLVMDialect, mlir::ub::UBDialect>();
   }
   llvm::StringRef getDescription() const final {
     return "lower resolved Py dialect operations to the runtime ABI";

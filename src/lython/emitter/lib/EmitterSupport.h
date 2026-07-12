@@ -36,8 +36,7 @@ void replaceSelfInSignature(FunctionSignature &sig, mlir::Type selfType,
                             AlgorithmM &types);
 bool anyTrue(llvm::ArrayRef<char> values);
 std::string methodKind(const parser::Node &function);
-mlir::Type elementType(mlir::Type type, AlgorithmM &types);
-void appendStarredArgumentTypes(mlir::Type type, AlgorithmM &types,
+bool appendStarredArgumentTypes(mlir::Type type, AlgorithmM &types,
                                 llvm::SmallVectorImpl<mlir::Type> &out);
 bool isTopLevelDecl(const parser::Node &node);
 std::string importBindingName(std::string_view module,
@@ -57,6 +56,8 @@ void ensureYield(mlir::OpBuilder &builder, mlir::Location loc,
                  mlir::Block &block);
 bool insertionBlockTerminated(const mlir::OpBuilder &builder);
 bool containsReturnStatement(const std::vector<parser::NodePtr> *statements);
+bool containsBreakOrContinueStatement(
+    const std::vector<parser::NodePtr> *statements);
 
 bool containsObjectTop(mlir::Type type, const AlgorithmM &types);
 bool isNoneTypeLike(mlir::Type type);
@@ -68,10 +69,50 @@ struct NoneComparisonNarrowing {
   mlir::Type payloadType;
 };
 
+struct BranchTypeNarrowing {
+  std::string name;
+  mlir::Type trueType;
+  mlir::Type falseType;
+  mlir::Type trueSourceType;
+  mlir::Type falseSourceType;
+};
+
+struct IsInstanceAnalysis {
+  enum class Kind {
+    AlwaysTrue,
+    AlwaysFalse,
+    UnionTest,
+    UnionClassTest,
+    ClassTest,
+    Unsupported
+  };
+
+  mlir::Type sourceType;
+  mlir::Type targetType;
+  Kind kind = Kind::Unsupported;
+  llvm::SmallVector<mlir::Type, 4> unionMembers;
+  mlir::Type trueType;
+  mlir::Type falseType;
+  std::string failureReason;
+};
+
 const parser::Node *nameComparedWithNone(const parser::Node *left,
                                          const parser::Node *right);
 std::optional<NoneComparisonNarrowing>
 optionalNoneComparison(const parser::Node &test, AlgorithmM &types);
+std::optional<BranchTypeNarrowing>
+optionalBranchTypeNarrowing(const parser::Node &test, AlgorithmM &types,
+                            mlir::Operation *from);
+std::optional<bool> optionalStaticBranchTruth(const parser::Node &test,
+                                              AlgorithmM &types,
+                                              mlir::Operation *from);
+std::optional<mlir::Type> isinstanceTargetType(const parser::Node *node,
+                                               AlgorithmM &types);
+bool isAssignableWithStaticEvidence(mlir::Type actual, mlir::Type expected,
+                                    mlir::Operation *from);
+IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
+                                     mlir::Type targetType, AlgorithmM &types,
+                                     mlir::Operation *from);
 mlir::Type widenInferredLiterals(mlir::Type type, const AlgorithmM &types);
 bool hasUnexpectedObjectTop(mlir::Type actual, mlir::Type expected,
                             const AlgorithmM &types);

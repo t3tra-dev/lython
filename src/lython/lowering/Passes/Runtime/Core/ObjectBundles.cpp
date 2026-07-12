@@ -181,6 +181,28 @@ RuntimeBundleLowerer::materializePrimitiveI64ObjectAtCurrentInsertion(
   return RuntimeValue::object(bundle.objectValue.contract, objectValues);
 }
 
+mlir::FailureOr<RuntimeValue>
+RuntimeBundleLowerer::materializeObjectEvidenceValue(
+    mlir::Operation *op, const RuntimeBundle &bundle,
+    llvm::StringRef purpose) {
+  if (bundle.kind != RuntimeBundle::Kind::Object)
+    return op->emitError() << purpose << " requires an object bundle";
+  if (RuntimeBundleLowerer::hasLazyPrimitiveI64Object(bundle))
+    return RuntimeBundleLowerer::materializePrimitiveI64Object(op, bundle);
+
+  mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> expected =
+      RuntimeBundleLowerer::runtimeValueTypesFor(op, bundle.objectValue.contract,
+                                                 purpose);
+  if (mlir::failed(expected))
+    return mlir::failure();
+  if (bundle.objectValue.values.size() != expected->size())
+    return op->emitError() << purpose << " has "
+                           << bundle.objectValue.values.size()
+                           << " physical values, but contract expects "
+                           << expected->size();
+  return bundle.objectValue;
+}
+
 mlir::FailureOr<RuntimeBundle>
 RuntimeBundleLowerer::materializeObjectBundleForStorage(
     mlir::Operation *op, const RuntimeBundle &bundle,

@@ -5,10 +5,13 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallSet.h"
 
+#include <algorithm>
 #include <cstdint>
 
 namespace py::ownership {
@@ -265,6 +268,26 @@ collectRuntimeDeallocators(mlir::ModuleOp module) {
         function.getFunctionType().getInputs().end());
     deallocators.push_back(std::move(deallocator));
   });
+  // Canonical shapes: ly.runtime.shape declarations extend the release
+  // interface with the entity's interior-view types.
+  module.walk([&](mlir::func::FuncOp function) {
+    if (!function->hasAttr(contracts::kManifestShapeAttr))
+      return;
+    auto contractAttr = function->getAttrOfType<mlir::StringAttr>(
+        contracts::kManifestContractAttr);
+    if (!contractAttr)
+      return;
+    for (RuntimeDeallocator &deallocator : deallocators) {
+      if (deallocator.contractName != contractAttr.getValue())
+        continue;
+      deallocator.shapeTypes.assign(
+          function.getFunctionType().getResults().begin(),
+          function.getFunctionType().getResults().end());
+    }
+  });
+  for (RuntimeDeallocator &deallocator : deallocators)
+    if (deallocator.shapeTypes.empty())
+      deallocator.shapeTypes = deallocator.inputTypes;
   return deallocators;
 }
 
@@ -293,21 +316,49 @@ bool isObjectHeaderLikeType(mlir::Type type) {
   return memref.isDynamicDim(0) || memref.getDimSize(0) >= 2;
 }
 
+mlir::Value underlyingObjectValue(mlir::Value value) {
+  while (auto cast = value.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+    if (cast.getInputs().size() != cast.getOutputs().size())
+      break;
+    unsigned index = mlir::cast<mlir::OpResult>(value).getResultNumber();
+    mlir::Value input = cast.getInputs()[index];
+    if (input.getType() != value.getType())
+      break;
+    value = input;
+  }
+  return value;
+}
+
 const RuntimeDeallocator *
 findDeallocatorForValueGroup(mlir::ValueRange values, unsigned offset,
                              llvm::ArrayRef<RuntimeDeallocator> deallocators) {
+  // Release interfaces are entity-root prefixes, so several contracts share
+  // the same inputTypes; disambiguate by the longest canonical-shape match
+  // (the interior-view tail differs per contract).
   const RuntimeDeallocator *matched = nullptr;
   bool ambiguous = false;
+  auto shapeMatch = [&](const RuntimeDeallocator &deallocator) -> unsigned {
+    if (deallocator.shapeTypes.size() <= deallocator.inputTypes.size())
+      return 0;
+    return valueRangeMatchesTypes(values, offset, deallocator.shapeTypes)
+               ? static_cast<unsigned>(deallocator.shapeTypes.size())
+               : 0;
+  };
+  unsigned matchedShape = 0;
   for (const RuntimeDeallocator &deallocator : deallocators) {
     if (!valueRangeMatchesTypes(values, offset, deallocator.inputTypes))
       continue;
-    if (!matched ||
-        deallocator.inputTypes.size() > matched->inputTypes.size()) {
+    unsigned shape = shapeMatch(deallocator);
+    if (!matched || deallocator.inputTypes.size() > matched->inputTypes.size() ||
+        (deallocator.inputTypes.size() == matched->inputTypes.size() &&
+         shape > matchedShape)) {
       matched = &deallocator;
+      matchedShape = shape;
       ambiguous = false;
       continue;
     }
-    if (deallocator.inputTypes.size() == matched->inputTypes.size())
+    if (deallocator.inputTypes.size() == matched->inputTypes.size() &&
+        shape == matchedShape)
       ambiguous = true;
   }
   if (ambiguous)
@@ -351,6 +402,58 @@ llvm::SmallVector<mlir::Value, 4> valueSlice(mlir::ValueRange values,
   for (unsigned index = 0; index < size; ++index)
     slice.push_back(values[offset + index]);
   return slice;
+}
+
+// Extend a group with the entity's interior views: the canonical-shape tail
+// beyond the release interface. Their uses pin the entity's liveness; they
+// are never release operands.
+static void appendEntityViews(ResourceGroup &group, mlir::ValueRange values,
+                              unsigned offset) {
+  if (!group.deallocator)
+    return;
+  unsigned tokenSize =
+      static_cast<unsigned>(group.deallocator->inputTypes.size());
+  llvm::ArrayRef<mlir::Type> shape = group.deallocator->shapeTypes;
+  if (shape.size() <= tokenSize)
+    return;
+  llvm::ArrayRef<mlir::Type> tail = shape.drop_front(tokenSize);
+  if (!valueRangeMatchesTypes(values, offset + tokenSize, tail))
+    return;
+  group.views = valueSlice(values, offset + tokenSize,
+                           static_cast<unsigned>(tail.size()));
+}
+
+void collectBoxWordDerivedViews(llvm::ArrayRef<mlir::Value> groupValues,
+                                llvm::SmallVectorImpl<mlir::Value> &views) {
+  llvm::SmallDenseSet<mlir::Value, 8> known(views.begin(), views.end());
+  llvm::SmallVector<mlir::Value, 8> worklist;
+  for (mlir::Value value : groupValues)
+    for (mlir::Operation *user : value.getUsers())
+      if (auto load = mlir::dyn_cast<mlir::memref::LoadOp>(user))
+        if (load.getMemRef() == value)
+          worklist.push_back(load.getResult());
+  // Follow the descriptor-assembly chain only (matched by op name so the
+  // common layer stays free of an LLVM-dialect dependency); any other use of
+  // a loaded word (arithmetic, comparisons) terminates the walk.
+  llvm::SmallDenseSet<mlir::Value, 16> visited;
+  while (!worklist.empty()) {
+    mlir::Value current = worklist.pop_back_val();
+    if (!visited.insert(current).second)
+      continue;
+    for (mlir::Operation *user : current.getUsers()) {
+      llvm::StringRef opName = user->getName().getStringRef();
+      if (opName == "llvm.inttoptr" || opName == "llvm.insertvalue") {
+        if (user->getNumResults() == 1)
+          worklist.push_back(user->getResult(0));
+        continue;
+      }
+      if (auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(user))
+        for (mlir::Value result : cast.getResults())
+          if (mlir::isa<mlir::MemRefType>(result.getType()) &&
+              known.insert(result).second)
+            views.push_back(result);
+    }
+  }
 }
 
 bool valueGroupEqualsEntryArgumentGroup(mlir::func::FuncOp function,
@@ -471,6 +574,7 @@ collectContractOwnedResultGroups(mlir::func::FuncOp callee,
     group.values =
         valueSlice(call.getResults(), offset,
                    static_cast<unsigned>(deallocator->inputTypes.size()));
+    appendEntityViews(group, call.getResults(), offset);
     groups.push_back(std::move(group));
   }
   return groups;
@@ -487,7 +591,9 @@ deallocatorValueCountForType(mlir::ValueRange values, unsigned offset,
       findDeallocatorForValueGroup(values, offset, deallocators, contract);
   if (!deallocator)
     return std::nullopt;
-  return static_cast<unsigned>(deallocator->inputTypes.size());
+  // Physical value span of the contract: the canonical shape, not the
+  // (possibly narrower) release interface.
+  return static_cast<unsigned>(deallocator->shapeTypes.size());
 }
 
 static void
@@ -501,11 +607,14 @@ collectTypedResourceGroups(mlir::Type type, mlir::ValueRange values,
   std::string contract = contracts::runtimeContractName(type);
   if (const RuntimeDeallocator *deallocator =
           findDeallocatorForValueGroup(values, 0, deallocators, contract)) {
-    if (deallocator->inputTypes.size() == values.size()) {
+    if (deallocator->inputTypes.size() == values.size() ||
+        deallocator->shapeTypes.size() == values.size()) {
       ResourceGroup group;
       group.offset = baseOffset;
       group.deallocator = deallocator;
-      group.values = valueSlice(values, 0, values.size());
+      group.values = valueSlice(
+          values, 0, static_cast<unsigned>(deallocator->inputTypes.size()));
+      appendEntityViews(group, values, 0);
       groups.push_back(std::move(group));
       return;
     }
@@ -544,6 +653,133 @@ collectTypedResourceGroups(mlir::Type type, mlir::ValueRange values,
   }
 }
 
+bool groupMatchesValues(mlir::ValueRange values, unsigned offset,
+                        llvm::ArrayRef<mlir::Value> group,
+                        AliasAnalysis &aliases) {
+  if (offset + group.size() > values.size())
+    return false;
+  for (auto [index, value] : llvm::enumerate(group)) {
+    if (!aliases.same(values[offset + index], value))
+      return false;
+  }
+  return true;
+}
+
+static std::string logicalReturnObjectContract(mlir::Type type) {
+  std::string contract = contracts::runtimeContractName(type);
+  if (!contract.empty())
+    return contract;
+  if (mlir::isa<py::ProtocolType>(type))
+    return "builtins.object";
+  return "";
+}
+
+std::optional<unsigned>
+logicalReturnValueCount(mlir::ValueRange values, unsigned offset,
+                        llvm::ArrayRef<RuntimeDeallocator> deallocators,
+                        mlir::Type type) {
+  if (isNoneLikeType(type))
+    return 0;
+
+  if (auto unionType = mlir::dyn_cast<py::UnionType>(type)) {
+    if (offset >= values.size() || !values[offset].getType().isInteger(64))
+      return std::nullopt;
+    unsigned size = 1;
+    for (mlir::Type member : unionType.getMemberTypes()) {
+      std::optional<unsigned> memberSize =
+          logicalReturnValueCount(values, offset + size, deallocators, member);
+      if (!memberSize)
+        return std::nullopt;
+      size += *memberSize;
+    }
+    return size;
+  }
+
+  std::string contract = logicalReturnObjectContract(type);
+  if (contract.empty())
+    return std::nullopt;
+  const RuntimeDeallocator *deallocator =
+      findDeallocatorForValueGroup(values, offset, deallocators, contract);
+  if (!deallocator)
+    return std::nullopt;
+  // Physical span = canonical shape (the release interface may be narrower).
+  return static_cast<unsigned>(deallocator->shapeTypes.size());
+}
+
+unsigned skipPrimitiveReturnEvidence(mlir::ValueRange values, unsigned offset,
+                                     mlir::Type type) {
+  if (contracts::runtimeContractName(type) != "builtins.int")
+    return offset;
+  if (offset + 2 > values.size() || !values[offset].getType().isInteger(64) ||
+      !values[offset + 1].getType().isInteger(1))
+    return offset;
+  return offset + 2;
+}
+
+std::optional<llvm::SmallVector<OwnedReturnRange, 4>>
+callableOwnedReturnRanges(mlir::func::FuncOp function, mlir::ValueRange values,
+                          llvm::ArrayRef<RuntimeDeallocator> deallocators) {
+  auto callableAttr =
+      function->getAttrOfType<mlir::TypeAttr>(kCallableTypeAttr);
+  auto callable = mlir::dyn_cast_if_present<py::CallableType>(
+      callableAttr ? callableAttr.getValue() : mlir::Type());
+  if (!callable)
+    return std::nullopt;
+
+  llvm::SmallVector<OwnedReturnRange, 4> ranges;
+  unsigned offset = 0;
+  for (mlir::Type resultType : callable.getResultTypes()) {
+    std::optional<unsigned> size =
+        logicalReturnValueCount(values, offset, deallocators, resultType);
+    if (!size)
+      return std::nullopt;
+    if (*size > 0)
+      ranges.push_back(OwnedReturnRange{offset, *size, resultType});
+    offset += *size;
+    offset = skipPrimitiveReturnEvidence(values, offset, resultType);
+  }
+  return ranges;
+}
+
+bool groupMatchesOwnedReturnRange(
+    mlir::ValueRange values, const OwnedReturnRange &range,
+    llvm::ArrayRef<mlir::Value> group,
+    llvm::ArrayRef<RuntimeDeallocator> deallocators, AliasAnalysis &aliases) {
+  if (group.empty())
+    return false;
+
+  // The group is a release interface: a non-empty PREFIX of the logical
+  // value span (usually just the entity root).
+  auto matchesLogicalValue = [&](auto &&self, unsigned offset,
+                                 mlir::Type type) -> bool {
+    if (auto unionType = mlir::dyn_cast<py::UnionType>(type)) {
+      if (group.size() <= range.size &&
+          groupMatchesValues(values, range.offset, group, aliases))
+        return true;
+      if (offset >= values.size() || !values[offset].getType().isInteger(64))
+        return false;
+      unsigned memberOffset = offset + 1;
+      for (mlir::Type member : unionType.getMemberTypes()) {
+        std::optional<unsigned> memberSize =
+            logicalReturnValueCount(values, memberOffset, deallocators, member);
+        if (!memberSize)
+          return false;
+        if (*memberSize > 0 && self(self, memberOffset, member))
+          return true;
+        memberOffset += *memberSize;
+      }
+      return false;
+    }
+
+    std::optional<unsigned> size =
+        logicalReturnValueCount(values, offset, deallocators, type);
+    return size && group.size() <= *size &&
+           groupMatchesValues(values, offset, group, aliases);
+  };
+
+  return matchesLogicalValue(matchesLogicalValue, range.offset, range.type);
+}
+
 llvm::SmallVector<ResourceGroup, 8>
 collectRuntimeResourceGroups(mlir::ValueRange values,
                              llvm::ArrayRef<RuntimeDeallocator> deallocators) {
@@ -561,8 +797,10 @@ collectRuntimeResourceGroups(mlir::ValueRange values,
     group.offset = offset;
     group.deallocator = deallocator;
     group.values = valueSlice(values, offset, size);
+    appendEntityViews(group, values, offset);
+    unsigned span = size + static_cast<unsigned>(group.views.size());
     groups.push_back(std::move(group));
-    offset += size;
+    offset += span;
   }
   return groups;
 }
@@ -581,7 +819,8 @@ collectOwnedLocalObjectGroups(mlir::Operation *op,
 
   const RuntimeDeallocator *deallocator = findDeallocatorForValueGroup(
       op->getResults(), 0, deallocators, contractAttr.getValue());
-  if (!deallocator || deallocator->inputTypes.size() != op->getNumResults())
+  if (!deallocator || (deallocator->inputTypes.size() != op->getNumResults() &&
+                       deallocator->shapeTypes.size() != op->getNumResults()))
     return groups;
 
   ResourceGroup group;
@@ -590,6 +829,7 @@ collectOwnedLocalObjectGroups(mlir::Operation *op,
   group.values = valueSlice(
       op->getResults(), 0,
       static_cast<unsigned>(deallocator->inputTypes.size()));
+  appendEntityViews(group, op->getResults(), 0);
   groups.push_back(std::move(group));
   return groups;
 }
@@ -615,6 +855,60 @@ static void appendUnresolvedOwnedResultRoot(
   groups.push_back(std::move(group));
 }
 
+static std::optional<unsigned>
+logicalPayloadOffsetCoveredByStaticEvidence(mlir::func::FuncOp callee,
+                                            llvm::StringRef evidenceContract) {
+  if (!callee || evidenceContract.empty())
+    return std::nullopt;
+
+  auto callableAttr = callee->getAttrOfType<mlir::TypeAttr>(kCallableTypeAttr);
+  auto callable = mlir::dyn_cast_if_present<py::CallableType>(
+      callableAttr ? callableAttr.getValue() : mlir::Type());
+  if (!callable || callable.getResultTypes().size() != 1)
+    return std::nullopt;
+
+  mlir::Type resultType = callable.getResultTypes().front();
+  std::string resultContract = contracts::runtimeContractName(resultType);
+  if (!resultContract.empty())
+    return resultContract == evidenceContract ? std::optional<unsigned>(0)
+                                              : std::nullopt;
+
+  auto unionType = mlir::dyn_cast<py::UnionType>(resultType);
+  if (!unionType || unionType.getMemberTypes().size() != 2)
+    return std::nullopt;
+
+  std::optional<mlir::Type> payloadType;
+  for (mlir::Type member : unionType.getMemberTypes()) {
+    if (py::isPyNoneType(member))
+      continue;
+    if (payloadType)
+      return std::nullopt;
+    payloadType = member;
+  }
+  if (!payloadType)
+    return std::nullopt;
+
+  return contracts::runtimeContractName(*payloadType).empty()
+             ? std::nullopt
+             : std::optional<unsigned>(1);
+}
+
+static llvm::SmallSet<unsigned, 4> staticEvidenceCoveredLogicalOffsets(
+    mlir::func::FuncOp callee, const FunctionContract &contract) {
+  llvm::SmallSet<unsigned, 4> covered;
+  for (auto [contractIndex, offset] :
+       llvm::enumerate(contract.ownedResults.values)) {
+    if (contractIndex >= contract.ownedResultContracts.size())
+      continue;
+    std::optional<unsigned> logicalOffset =
+        logicalPayloadOffsetCoveredByStaticEvidence(
+            callee, contract.ownedResultContracts[contractIndex]);
+    if (logicalOffset && offset > *logicalOffset)
+      covered.insert(*logicalOffset);
+  }
+  return covered;
+}
+
 llvm::SmallVector<ResourceGroup, 8>
 collectOwnedCallResultGroups(mlir::ModuleOp module, mlir::func::CallOp call,
                              llvm::ArrayRef<RuntimeDeallocator> deallocators) {
@@ -623,6 +917,13 @@ collectOwnedCallResultGroups(mlir::ModuleOp module, mlir::func::CallOp call,
       module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
   if (!callee || call.getNumResults() == 0)
     return ownedGroups;
+
+  mlir::FailureOr<FunctionContract> functionContract =
+      readFunctionContract(callee);
+  llvm::SmallSet<unsigned, 4> staticEvidenceCoveredOffsets;
+  if (mlir::succeeded(functionContract))
+    staticEvidenceCoveredOffsets =
+        staticEvidenceCoveredLogicalOffsets(callee, *functionContract);
 
   llvm::SmallVector<ResourceGroup, 4> contractGroups =
       collectContractOwnedResultGroups(callee, call, deallocators);
@@ -643,6 +944,8 @@ collectOwnedCallResultGroups(mlir::ModuleOp module, mlir::func::CallOp call,
                                  /*baseOffset=*/0, typedGroups);
       if (!typedGroups.empty()) {
         for (ResourceGroup &group : typedGroups) {
+          if (staticEvidenceCoveredOffsets.contains(group.offset))
+            continue;
           if (callResultGroupIsOwned(callee, group.offset) || group.condition) {
             ownedGroups.push_back(std::move(group));
           }
@@ -651,14 +954,14 @@ collectOwnedCallResultGroups(mlir::ModuleOp module, mlir::func::CallOp call,
     }
   }
 
-  if (auto contract = readFunctionContract(callee); mlir::succeeded(contract)) {
+  if (mlir::succeeded(functionContract)) {
     for (auto [contractIndex, offset] :
-         llvm::enumerate(contract->ownedResults.values)) {
+         llvm::enumerate(functionContract->ownedResults.values)) {
       if (resourceGroupStartsAt(ownedGroups, offset))
         continue;
       llvm::StringRef contractName;
-      if (contractIndex < contract->ownedResultContracts.size())
-        contractName = contract->ownedResultContracts[contractIndex];
+      if (contractIndex < functionContract->ownedResultContracts.size())
+        contractName = functionContract->ownedResultContracts[contractIndex];
       const RuntimeDeallocator *deallocator =
           contractName.empty()
               ? findDeallocatorForValueGroup(call.getResults(), offset,
@@ -673,6 +976,7 @@ collectOwnedCallResultGroups(mlir::ModuleOp module, mlir::func::CallOp call,
       group.values = valueSlice(
           call.getResults(), offset,
           static_cast<unsigned>(deallocator->inputTypes.size()));
+      appendEntityViews(group, call.getResults(), offset);
       ownedGroups.push_back(std::move(group));
     }
   }
@@ -680,6 +984,8 @@ collectOwnedCallResultGroups(mlir::ModuleOp module, mlir::func::CallOp call,
   for (ResourceGroup group :
        collectRuntimeResourceGroups(call.getResults(), deallocators)) {
     if (resourceGroupStartsAt(ownedGroups, group.offset))
+      continue;
+    if (staticEvidenceCoveredOffsets.contains(group.offset))
       continue;
     if (callResultGroupIsOwned(callee, group.offset)) {
       ownedGroups.push_back(std::move(group));
@@ -693,9 +999,8 @@ collectOwnedCallResultGroups(mlir::ModuleOp module, mlir::func::CallOp call,
     }
   }
 
-  auto contract = readFunctionContract(callee);
-  if (mlir::succeeded(contract)) {
-    for (unsigned offset : contract->ownedResults.values)
+  if (mlir::succeeded(functionContract)) {
+    for (unsigned offset : functionContract->ownedResults.values)
       appendUnresolvedOwnedResultRoot(call, offset, ownedGroups);
   }
   if (functionUsesOwnedReturnABI(callee))
@@ -863,14 +1168,58 @@ static bool isOwnershipIdentityOp(mlir::Operation *op) {
          name == "builtin.unrealized_conversion_cast";
 }
 
+static void unionStaticEvidenceCallResultAliases(AliasAnalysis &aliases,
+                                                 mlir::func::CallOp call) {
+  mlir::ModuleOp module = call->getParentOfType<mlir::ModuleOp>();
+  if (!module)
+    return;
+  mlir::func::FuncOp callee =
+      module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
+  if (!callee)
+    return;
+
+  mlir::FailureOr<FunctionContract> contract = readFunctionContract(callee);
+  if (mlir::failed(contract))
+    return;
+
+  for (auto [contractIndex, staticOffset] :
+       llvm::enumerate(contract->ownedResults.values)) {
+    if (contractIndex >= contract->ownedResultContracts.size())
+      continue;
+    std::optional<unsigned> logicalOffset =
+        logicalPayloadOffsetCoveredByStaticEvidence(
+            callee, contract->ownedResultContracts[contractIndex]);
+    if (!logicalOffset || staticOffset <= *logicalOffset ||
+        staticOffset >= call.getNumResults())
+      continue;
+
+    unsigned logicalCount = staticOffset - *logicalOffset;
+    unsigned staticCount = call.getNumResults() - staticOffset;
+    unsigned count = std::min(logicalCount, staticCount);
+    for (unsigned index = 0; index < count; ++index) {
+      aliases.unionValues(call.getResult(*logicalOffset + index),
+                          call.getResult(staticOffset + index));
+    }
+  }
+}
+
 void AliasAnalysis::build(mlir::Operation *root) {
   root->walk([&](mlir::Operation *op) {
     for (mlir::Value operand : op->getOperands())
       track(operand);
     for (mlir::Value result : op->getResults())
       track(result);
+    if (auto call = mlir::dyn_cast<mlir::func::CallOp>(op))
+      unionStaticEvidenceCallResultAliases(*this, call);
     if (auto subview = mlir::dyn_cast<mlir::memref::SubViewOp>(op)) {
       unionValues(subview.getResult(), subview.getSource());
+      return;
+    }
+    if (auto select = mlir::dyn_cast<mlir::arith::SelectOp>(op)) {
+      // A select result is a borrow of whichever operand was picked: alias it
+      // with BOTH so the sources stay live for as long as the result does.
+      unionValues(select.getResult(), select.getTrueValue());
+      unionValues(select.getResult(), select.getFalseValue());
       return;
     }
     if (!isOwnershipIdentityOp(op) ||
@@ -879,6 +1228,60 @@ void AliasAnalysis::build(mlir::Operation *root) {
     for (auto [result, operand] : llvm::zip(op->getResults(), op->getOperands()))
       unionValues(result, operand);
   });
+}
+
+// Exceptional successor edges for the setjmp-style EH model: the anchor
+// cond_br (`%c = call @LyEH_TryCatchAnchor(id); cf.cond_br %c, ^handler,
+// ^try`) presents the try and handler paths as EXCLUSIVE, but at runtime the
+// handler runs AFTER the try executed up to a raising call site. Any block
+// containing `LyEH_TryCallSiteMarker(id)` may therefore transfer control to
+// the handler entry of `id`; liveness that ignores these edges releases
+// values on the try path that the handler still uses (use-after-free).
+llvm::DenseMap<mlir::Block *, llvm::SmallVector<mlir::Block *, 2>>
+collectExceptionEdges(mlir::Region &region) {
+  llvm::DenseMap<mlir::Block *, llvm::SmallVector<mlir::Block *, 2>> edges;
+  llvm::DenseMap<std::int64_t, mlir::Block *> handlerEntries;
+  auto markerId = [](mlir::func::CallOp call) -> std::optional<std::int64_t> {
+    if (call.getNumOperands() != 1)
+      return std::nullopt;
+    auto constant =
+        call.getOperand(0).getDefiningOp<mlir::arith::ConstantIntOp>();
+    if (!constant)
+      return std::nullopt;
+    return constant.value();
+  };
+  for (mlir::Block &block : region) {
+    for (mlir::Operation &op : block) {
+      auto call = mlir::dyn_cast<mlir::func::CallOp>(&op);
+      if (!call || call.getCallee() != "LyEH_TryCatchAnchor")
+        continue;
+      std::optional<std::int64_t> id = markerId(call);
+      auto cond =
+          mlir::dyn_cast<mlir::cf::CondBranchOp>(block.getTerminator());
+      if (!id || !cond || cond.getCondition() != call.getResult(0))
+        continue;
+      handlerEntries[*id] = cond.getTrueDest();
+    }
+  }
+  if (handlerEntries.empty())
+    return edges;
+  for (mlir::Block &block : region) {
+    for (mlir::Operation &op : block) {
+      auto call = mlir::dyn_cast<mlir::func::CallOp>(&op);
+      if (!call || call.getCallee() != "LyEH_TryCallSiteMarker")
+        continue;
+      std::optional<std::int64_t> id = markerId(call);
+      if (!id)
+        continue;
+      auto found = handlerEntries.find(*id);
+      if (found == handlerEntries.end())
+        continue;
+      auto &list = edges[&block];
+      if (!llvm::is_contained(list, found->second))
+        list.push_back(found->second);
+    }
+  }
+  return edges;
 }
 
 } // namespace py::ownership
