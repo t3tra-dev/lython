@@ -181,7 +181,7 @@ mlir::LogicalResult embedObjectModules(mlir::ModuleOp module) {
   return mlir::success();
 }
 
-// Layer 4 of the transformation stack (docs/lowering-architecture.md):
+// Layer 4 of the transformation stack:
 // applies the lowering strategies carried by the embedded module manifests:
 // each modules/<name>.mlir may nest a strategy-library module marked
 // `transform.with_named_sequence` whose `__lython_strategy_*` named sequences

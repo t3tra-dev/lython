@@ -1,4 +1,4 @@
-// Layer-1 dispatch (docs/lowering-architecture.md): one `lower*` method per
+// Layer-1 dispatch: one `lower*` method per
 // py op, selected by TypeSwitch. Add new op lowerings here, not as rewrite
 // patterns -- they need the RuntimeBundle evidence state.
 #include "Runtime/Core/Lowerer.h"

@@ -1,4 +1,4 @@
-// Layer 3 of the transformation stack (see docs/lowering-architecture.md):
+// Layer 3 of the transformation stack:
 // the global lowering stages and their order. Per-op lowerings live in
 // RuntimeBundleLowerer (layers 1-2, Passes/Runtime/); target-selected
 // schedules ship as transform-dialect strategies in the module manifests

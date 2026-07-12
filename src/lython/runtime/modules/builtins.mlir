@@ -515,7 +515,7 @@ module attributes {
 
   // ===========================================================
   // Lowering strategies (transform dialect carrier) -- layer 4 of the
-  // transformation stack (docs/lowering-architecture.md): target-selected,
+  // transformation stack: target-selected,
   // schedule-shaped transformations that ship WITH the module instead of in
   // C++. Per-op lowerings stay in RuntimeBundleLowerer (layers 1-2); stage
   // ordering stays in LoweringPipeline.cpp (layer 3).
@@ -705,7 +705,7 @@ module attributes {
     %zero = arith.constant 0 : i64
     %immortal = arith.constant 9223372036854775807 : i64
     // Tagged fast path: a header whose aligned pointer has bit 0 set is an
-    // inline tagged long (rfc/tagged-long.md). It owns no memory and must
+    // inline tagged long. It owns no memory and must
     // not be dereferenced at all.
     %ptr_index = memref.extract_aligned_pointer_as_index %header : memref<2xi64, strided<[1], offset: ?>> -> index
     %ptr_bits = arith.index_cast %ptr_index : index to i64

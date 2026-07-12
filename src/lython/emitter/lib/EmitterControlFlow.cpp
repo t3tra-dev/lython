@@ -648,7 +648,7 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
 
     // A nullopt condition means the pattern is irrefutable; unsupported
     // pattern kinds are rejected below with a diagnostic instead of silently
-    // falling through (the accepted surface is docs/support-matrix.md's).
+    // falling through.
     std::optional<mlir::Value> condition;
     bool unsupported = false;
     bool staticallyFalse = false;

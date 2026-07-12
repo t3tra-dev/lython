@@ -2,7 +2,7 @@
 
 // Internal implementation surface for the runtime bundle lowering pass.
 //
-// Layers 1-2 of the transformation stack (see docs/lowering-architecture.md),
+// Layers 1-2 of the transformation stack,
 // as a DELIBERATE deviation from DialectConversion: per-op `lower*` methods
 // (dispatched in Core/Dispatch.cpp) play the conversion-pattern role, and the
 // physical ABI mapping (runtimeValueTypesFor + the RuntimeBundle expansion +

@@ -5,7 +5,7 @@ namespace py::lowering {
 // Module-level int globals are backed by a single process-lifetime i64 cell.
 // Reads/writes are a plain llvm.load/llvm.store, so accessing a module global
 // never allocates -- an async-signal-safe channel for signal handlers to
-// exchange primitive state (see docs/lowering-architecture.md). The stored
+// exchange primitive state. The stored
 // representation is the UNBOXED i64 value; the boxed int object is
 // reconstructed on demand at each read (box-on-read), and the value is
 // unboxed at each write (unbox-on-write).

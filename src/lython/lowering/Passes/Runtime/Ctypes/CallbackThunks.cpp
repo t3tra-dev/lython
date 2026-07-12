@@ -157,7 +157,7 @@ mlir::LogicalResult materializeCallbackThunks(mlir::ModuleOp module) {
              << "callback target '" << targetName.getValue()
              << "' was not lowered to an LLVM function";
 
-    // SIGNAL-SAFETY POLICY (see docs/lowering-architecture.md): a ctypes
+    // SIGNAL-SAFETY POLICY: a ctypes
     // callback may fire in an async-signal context, so its body must be
     // async-signal-safe -- it must NOT allocate or touch the garbage-collected
     // heap. The transitive closure of the callback body must contain no call
