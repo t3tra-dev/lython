@@ -241,6 +241,11 @@ mlir::Attribute defaultValueAttr(mlir::Builder &builder,
     return dict("float", builder.getF64FloatAttr(*value));
   if (auto value = ast::string(*node, "value"))
     return dict("str", builder.getStringAttr(*value));
+  if (const auto *value = ast::bytes(*node, "value"))
+    return dict("bytes",
+                builder.getStringAttr(llvm::StringRef(
+                    reinterpret_cast<const char *>(value->data()),
+                    value->size())));
   if (const auto *fieldValue = ast::field(*node, "value"))
     if (const auto *big = std::get_if<parser::BigInteger>(fieldValue))
       return dict("int", builder.getStringAttr(big->decimal));

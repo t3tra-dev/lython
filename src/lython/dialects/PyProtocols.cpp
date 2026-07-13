@@ -854,6 +854,72 @@ const Table &Table::get(mlir::MLIRContext &context) {
       }
     }
 
+    // Manifest int constants: parallel `ly.typing.int_constant_names`
+    // (fully-qualified) and `ly.typing.int_constant_values` arrays.
+    if (auto constantNames =
+            manifest->getOperation()->getAttrOfType<mlir::ArrayAttr>(
+                "ly.typing.int_constant_names")) {
+      auto constantValues =
+          manifest->getOperation()->getAttrOfType<mlir::ArrayAttr>(
+              "ly.typing.int_constant_values");
+      if (!constantValues || constantValues.size() != constantNames.size()) {
+        llvm::errs() << "warning: ly.typing.int_constant_names and "
+                        "ly.typing.int_constant_values must be parallel "
+                        "arrays in typing manifest '"
+                     << entry.name << "'\n";
+      } else {
+        for (auto [nameAttr, valueAttr] :
+             llvm::zip(constantNames, constantValues)) {
+          auto name = mlir::dyn_cast<mlir::StringAttr>(nameAttr);
+          auto value = mlir::dyn_cast<mlir::IntegerAttr>(valueAttr);
+          if (!name || !value) {
+            llvm::errs() << "warning: ignored malformed int constant in "
+                            "typing manifest '"
+                         << entry.name << "'\n";
+            continue;
+          }
+          std::string qualified = name.getValue().str();
+          slot->intConstants[qualified] = value.getValue().getSExtValue();
+          auto split = name.getValue().rsplit('.');
+          slot->intConstantsByModule[split.first.str()].push_back(
+              split.second.str());
+        }
+      }
+    }
+
+    // Manifest str constants: parallel `ly.typing.str_constant_names`
+    // (fully-qualified) and `ly.typing.str_constant_values` arrays.
+    if (auto constantNames =
+            manifest->getOperation()->getAttrOfType<mlir::ArrayAttr>(
+                "ly.typing.str_constant_names")) {
+      auto constantValues =
+          manifest->getOperation()->getAttrOfType<mlir::ArrayAttr>(
+              "ly.typing.str_constant_values");
+      if (!constantValues || constantValues.size() != constantNames.size()) {
+        llvm::errs() << "warning: ly.typing.str_constant_names and "
+                        "ly.typing.str_constant_values must be parallel "
+                        "arrays in typing manifest '"
+                     << entry.name << "'\n";
+      } else {
+        for (auto [nameAttr, valueAttr] :
+             llvm::zip(constantNames, constantValues)) {
+          auto name = mlir::dyn_cast<mlir::StringAttr>(nameAttr);
+          auto value = mlir::dyn_cast<mlir::StringAttr>(valueAttr);
+          if (!name || !value) {
+            llvm::errs() << "warning: ignored malformed str constant in "
+                            "typing manifest '"
+                         << entry.name << "'\n";
+            continue;
+          }
+          std::string qualified = name.getValue().str();
+          slot->strConstants[qualified] = value.getValue().str();
+          auto split = name.getValue().rsplit('.');
+          slot->strConstantsByModule[split.first.str()].push_back(
+              split.second.str());
+        }
+      }
+    }
+
     for (mlir::Operation &op : manifest->getBody()->getOperations()) {
       auto classOp = mlir::dyn_cast<py::ClassOp>(&op);
       if (!classOp)
@@ -1106,6 +1172,38 @@ std::vector<std::string>
 Table::moduleFloatConstantExports(llvm::StringRef moduleName) const {
   auto found = floatConstantsByModule.find(moduleName.str());
   if (found == floatConstantsByModule.end())
+    return {};
+  return found->second;
+}
+
+std::optional<long long>
+Table::moduleIntConstant(llvm::StringRef qualifiedName) const {
+  auto found = intConstants.find(qualifiedName.str());
+  if (found == intConstants.end())
+    return std::nullopt;
+  return found->second;
+}
+
+std::vector<std::string>
+Table::moduleIntConstantExports(llvm::StringRef moduleName) const {
+  auto found = intConstantsByModule.find(moduleName.str());
+  if (found == intConstantsByModule.end())
+    return {};
+  return found->second;
+}
+
+std::optional<std::string>
+Table::moduleStrConstant(llvm::StringRef qualifiedName) const {
+  auto found = strConstants.find(qualifiedName.str());
+  if (found == strConstants.end())
+    return std::nullopt;
+  return found->second;
+}
+
+std::vector<std::string>
+Table::moduleStrConstantExports(llvm::StringRef moduleName) const {
+  auto found = strConstantsByModule.find(moduleName.str());
+  if (found == strConstantsByModule.end())
     return {};
   return found->second;
 }

@@ -331,9 +331,14 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultValue(
 
   mlir::Location loc = op->getLoc();
   llvm::StringRef spelling = kind.getValue();
-  if (spelling == "none")
+  if (spelling == "none") {
+    // A None default's payload is always the NoneType singleton even when
+    // the parameter is an optional union (the union has no contract name of
+    // its own for bundleRawObjectValues to resolve).
     return RuntimeBundleLowerer::bundleRawObjectValues(
-        op, parameterType, mlir::ValueRange{}, bundle);
+        op, runtimeContractType(context, "types.NoneType"), mlir::ValueRange{},
+        bundle);
+  }
   if (spelling == "bool") {
     auto value = dict.getAs<mlir::BoolAttr>("value");
     if (!value)
@@ -384,6 +389,62 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultValue(
             .getResult();
     return RuntimeBundleLowerer::bundleRawObjectValues(
         op, parameterType, mlir::ValueRange{bytes, start, length}, bundle);
+  }
+  if (spelling == "bytes") {
+    auto value = dict.getAs<mlir::StringAttr>("value");
+    if (!value)
+      return op->emitError() << "bytes default value has no payload";
+    mlir::Value bytes =
+        RuntimeBundleLowerer::materializeByteBuffer(loc, value.getValue());
+    mlir::Value start =
+        mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult();
+    mlir::Value length =
+        mlir::arith::ConstantIntOp::create(
+            builder, loc, static_cast<std::int64_t>(value.getValue().size()),
+            64)
+            .getResult();
+    return RuntimeBundleLowerer::bundleRawObjectValues(
+        op, parameterType, mlir::ValueRange{bytes, start, length}, bundle);
+  }
+  if (spelling == "provider") {
+    // Expression defaults (user-type constructors etc.) evaluate through a
+    // zero-argument provider function synthesized at the def site.
+    auto value = dict.getAs<mlir::StringAttr>("value");
+    if (!value)
+      return op->emitError() << "provider default value has no symbol";
+    auto provider =
+        module.lookupSymbol<mlir::func::FuncOp>(value.getValue());
+    if (!provider)
+      return op->emitError() << "default provider '" << value.getValue()
+                             << "' is missing from the module";
+    auto callOp = mlir::dyn_cast<py::CallOp>(op);
+    if (!callOp)
+      return op->emitError()
+             << "expression default requires a direct call site";
+    mlir::FailureOr<mlir::func::CallOp> call =
+        RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(
+            callOp, provider, value.getValue(), {});
+    if (mlir::failed(call))
+      return mlir::failure();
+    mlir::Type resultType = parameterType;
+    if (runtimeContractName(resultType).empty()) {
+      auto callableAttr =
+          provider->getAttrOfType<mlir::TypeAttr>("callable_type");
+      if (auto callable = mlir::dyn_cast_if_present<py::CallableType>(
+              callableAttr ? callableAttr.getValue() : mlir::Type()))
+        if (callable.getResultTypes().size() == 1)
+          resultType = callable.getResultTypes().front();
+    }
+    if (RuntimeBundleLowerer::hasPrimitiveI64ABI(resultType) &&
+        call->getNumResults() == 2 &&
+        call->getResult(0).getType().isInteger(64) &&
+        call->getResult(1).getType().isInteger(1))
+      return RuntimeBundleLowerer::makePrimitiveI64Bundle(
+          op, runtimeContractType(context, runtimeContractName(resultType)),
+          call->getResult(0), call->getResult(1), bundle);
+    return RuntimeBundleLowerer::makeObjectBundle(
+        op, runtimeContractType(context, runtimeContractName(resultType)),
+        call->getResults(), bundle);
   }
   if (spelling == "unsupported") {
     auto value = dict.getAs<mlir::StringAttr>("value");

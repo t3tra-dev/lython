@@ -1153,6 +1153,21 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeStringObject(
       mlir::ValueRange{bytes, start, length}, bundle);
 }
 
+mlir::LogicalResult RuntimeBundleLowerer::materializeBytesObject(
+    mlir::Operation *op, llvm::StringRef data, RuntimeBundle &bundle) {
+  mlir::Location loc = op->getLoc();
+  mlir::Value bytes = RuntimeBundleLowerer::materializeByteBuffer(loc, data);
+  mlir::Value start =
+      mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult();
+  mlir::Value length =
+      mlir::arith::ConstantIntOp::create(
+          builder, loc, static_cast<std::int64_t>(data.size()), 64)
+          .getResult();
+  return RuntimeBundleLowerer::initializeObjectFromRawValues(
+      op, runtimeContractType(context, "builtins.bytes"),
+      mlir::ValueRange{bytes, start, length}, bundle);
+}
+
 bool RuntimeBundleLowerer::needsDefaultObjectRepr(
     const RuntimeBundle &object) const {
   // Runtime-mode sequences must not fall back to the address-based default

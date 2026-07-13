@@ -4323,15 +4323,22 @@ private:
     return false;
   }
 
+  // \xNN denotes a raw byte in bytes literals but the CODEPOINT U+00NN in
+  // str literals (which lands as its UTF-8 encoding in the str payload).
   static bool appendHexEscape(std::string &out, const std::string &literal,
-                              std::size_t &index, std::size_t contentEnd) {
+                              std::size_t &index, std::size_t contentEnd,
+                              bool bytesLiteral) {
     if (index + 2 >= contentEnd)
       return false;
     int high = hexValue(literal[index + 1]);
     int low = hexValue(literal[index + 2]);
     if (high < 0 || low < 0)
       return false;
-    out.push_back(static_cast<char>((high << 4) | low));
+    std::uint32_t value = static_cast<std::uint32_t>((high << 4) | low);
+    if (bytesLiteral)
+      out.push_back(static_cast<char>(value));
+    else
+      appendUtf8(out, value);
     index += 2;
     return true;
   }
@@ -4503,7 +4510,7 @@ private:
       decoded.push_back('"');
       break;
     case 'x':
-      if (!appendHexEscape(decoded, literal, i, contentEnd))
+      if (!appendHexEscape(decoded, literal, i, contentEnd, bytesLiteral))
         appendUnknownEscape(decoded, escaped);
       break;
     case 'u':
@@ -4531,7 +4538,12 @@ private:
           ++i;
           ++consumed;
         }
-        decoded.push_back(static_cast<char>(value & 0xff));
+        // Octal escapes follow the same split as \xNN: raw byte in bytes
+        // literals, codepoint (up to \777 = U+01FF) in str literals.
+        if (bytesLiteral)
+          decoded.push_back(static_cast<char>(value & 0xff));
+        else
+          appendUtf8(decoded, static_cast<std::uint32_t>(value));
         break;
       }
       appendUnknownEscape(decoded, escaped);

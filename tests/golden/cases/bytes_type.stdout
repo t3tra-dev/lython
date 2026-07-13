@@ -1,0 +1,20 @@
+5
+104
+111
+b'hello'
+b'hello world\x00\t!'
+True
+True
+empty falsy
+non-empty truthy
+text
+b'round trip'
+round trip
+index caught
+4
+b'raw payload'
+raw payload
+True
+b'raw payload'
+True
+closed caught

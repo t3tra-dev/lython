@@ -928,12 +928,57 @@ struct NameStringConstantImport {
   const char *canonicalName;
 };
 
+struct ModuleIntConstantImport {
+  const char *module;
+  const char *localAttr;
+  const char *canonicalName;
+};
+
+struct NameIntConstantImport {
+  const char *module;
+  const char *exportedName;
+  const char *canonicalName;
+};
+
+// Module attributes that bind to a RUNTIME value (materialized by a lowering
+// hook on the canonical binding), not a folded constant: sys.argv.
+struct ModuleStrListImport {
+  const char *module;
+  const char *localAttr;
+  const char *canonicalName;
+};
+
+struct NameStrListImport {
+  const char *module;
+  const char *exportedName;
+  const char *canonicalName;
+};
+
+// Runtime module attributes typed by a manifest contract: sys.stdout/stderr.
+struct ModuleContractValueImport {
+  const char *module;
+  const char *localAttr;
+  const char *canonicalName;
+  const char *contract;
+};
+
+struct NameContractValueImport {
+  const char *module;
+  const char *exportedName;
+  const char *canonicalName;
+  const char *contract;
+};
+
 constexpr ModuleCallableImport kModuleCallableImports[] = {
     // Manifest-declared callables (ly.typing.callable_exports +
     // ly.typing.function_contracts, e.g. asyncio.*, os.getpid, ctypes.*)
     // bind through bindManifestModuleCallableExports -- ONLY names without a
     // manifest contract belong here (C++ factory-typed).
     {"platform", "system", "platform.system",
+     ImportCallableFactory::StaticZeroArgStr},
+    {"sys", "getdefaultencoding", "sys.getdefaultencoding",
+     ImportCallableFactory::StaticZeroArgStr},
+    {"sys", "getfilesystemencoding", "sys.getfilesystemencoding",
      ImportCallableFactory::StaticZeroArgStr},
     {"lyrt", "from_prim", "lyrt.from_prim",
      ImportCallableFactory::BuiltinsFunction},
@@ -958,6 +1003,10 @@ constexpr NameCallableImport kNameCallableImports[] = {
     // channel in bindImportedName -- ONLY factory-typed names belong here.
     {"platform", "system", "platform.system",
      ImportCallableFactory::StaticZeroArgStr},
+    {"sys", "getdefaultencoding", "sys.getdefaultencoding",
+     ImportCallableFactory::StaticZeroArgStr},
+    {"sys", "getfilesystemencoding", "sys.getfilesystemencoding",
+     ImportCallableFactory::StaticZeroArgStr},
     {"lyrt", "from_prim", "lyrt.from_prim",
      ImportCallableFactory::BuiltinsFunction},
     {"lyrt", "native", "lyrt.native", ImportCallableFactory::BuiltinsFunction},
@@ -973,12 +1022,40 @@ constexpr NameAliasImport kNameAliasImports[] = {
 
 constexpr ModuleStringConstantImport kModuleStringConstantImports[] = {
     {"sys", "platform", "sys.platform"},
+    {"sys", "byteorder", "sys.byteorder"},
     {"os", "name", "os.name"},
 };
 
 constexpr NameStringConstantImport kNameStringConstantImports[] = {
     {"sys", "platform", "sys.platform"},
+    {"sys", "byteorder", "sys.byteorder"},
     {"os", "name", "os.name"},
+};
+
+constexpr ModuleIntConstantImport kModuleIntConstantImports[] = {
+    {"sys", "maxsize", "sys.maxsize"},
+};
+
+constexpr NameIntConstantImport kNameIntConstantImports[] = {
+    {"sys", "maxsize", "sys.maxsize"},
+};
+
+constexpr ModuleStrListImport kModuleStrListImports[] = {
+    {"sys", "argv", "sys.argv"},
+};
+
+constexpr NameStrListImport kNameStrListImports[] = {
+    {"sys", "argv", "sys.argv"},
+};
+
+constexpr ModuleContractValueImport kModuleContractValueImports[] = {
+    {"sys", "stdout", "sys.stdout", "_io.TextIOWrapper"},
+    {"sys", "stderr", "sys.stderr", "_io.TextIOWrapper"},
+};
+
+constexpr NameContractValueImport kNameContractValueImports[] = {
+    {"sys", "stdout", "sys.stdout", "_io.TextIOWrapper"},
+    {"sys", "stderr", "sys.stderr", "_io.TextIOWrapper"},
 };
 
 std::string importedAttribute(llvm::StringRef localName, llvm::StringRef attr) {
@@ -1087,6 +1164,42 @@ bool bindManifestModuleFloatConstants(AlgorithmM &types,
     types.bindCanonicalSymbol(
         importedManifestModuleAttribute(module, localName, exportedName),
         canonical, types.floatType());
+  }
+  return handled;
+}
+
+bool bindManifestModuleIntConstants(AlgorithmM &types, llvm::StringRef module,
+                                    llvm::StringRef localName) {
+  const py::protocols::Table &table =
+      py::protocols::Table::get(types.getContext());
+  bool handled = false;
+  for (const std::string &exportedName :
+       table.moduleIntConstantExports(module)) {
+    if (!handled)
+      bindManifestModuleObject(types, module, localName);
+    handled = true;
+    std::string canonical = (llvm::Twine(module) + "." + exportedName).str();
+    types.bindCanonicalSymbol(
+        importedManifestModuleAttribute(module, localName, exportedName),
+        canonical, types.intType());
+  }
+  return handled;
+}
+
+bool bindManifestModuleStrConstants(AlgorithmM &types, llvm::StringRef module,
+                                    llvm::StringRef localName) {
+  const py::protocols::Table &table =
+      py::protocols::Table::get(types.getContext());
+  bool handled = false;
+  for (const std::string &exportedName :
+       table.moduleStrConstantExports(module)) {
+    if (!handled)
+      bindManifestModuleObject(types, module, localName);
+    handled = true;
+    std::string canonical = (llvm::Twine(module) + "." + exportedName).str();
+    types.bindCanonicalSymbol(
+        importedManifestModuleAttribute(module, localName, exportedName),
+        canonical, types.strType());
   }
   return handled;
 }
@@ -2179,6 +2292,7 @@ void AlgorithmM::seedBuiltins() {
   bindClass("int", intType());
   bindClass("float", floatType());
   bindClass("str", strType());
+  bindClass("bytes", contract("builtins.bytes"));
   bindClass("BaseException", contract("builtins.BaseException"));
   bindClass("Exception", contract("builtins.Exception"));
   bindClass("RuntimeError", contract("builtins.RuntimeError"));
@@ -2192,6 +2306,15 @@ void AlgorithmM::seedBuiltins() {
   bindClass("AssertionError", contract("builtins.AssertionError"));
   bindClass("StopIteration", contract("builtins.StopIteration"));
   bindClass("StopAsyncIteration", contract("builtins.StopAsyncIteration"));
+  bindClass("SystemExit", contract("builtins.SystemExit"));
+  bindClass("OSError", contract("builtins.OSError"));
+  bindClass("FileNotFoundError", contract("builtins.FileNotFoundError"));
+  // open is io.open (CPython aliases the builtin to the io module's opener);
+  // the contract and the runtime implementation live in the _io manifest.
+  bindCanonicalSymbol(
+      "open", "_io.open",
+      table.freeFunctionContract("_io.open")
+          .value_or(contract("builtins.function")));
   bindClass("nullcontext", contract("contextlib.nullcontext"));
   bindClass("range", contract("builtins.range"));
 }
@@ -2429,6 +2552,30 @@ bool AlgorithmM::bindImportedModule(llvm::StringRef module,
                         entry.canonicalName, strType());
   }
 
+  for (const ModuleIntConstantImport &entry : kModuleIntConstantImports) {
+    if (module != entry.module)
+      continue;
+    bindModuleObject();
+    bindCanonicalSymbol(importedAttribute(localName, entry.localAttr),
+                        entry.canonicalName, intType());
+  }
+
+  for (const ModuleStrListImport &entry : kModuleStrListImports) {
+    if (module != entry.module)
+      continue;
+    bindModuleObject();
+    bindCanonicalSymbol(importedAttribute(localName, entry.localAttr),
+                        entry.canonicalName, listOf(strType()));
+  }
+
+  for (const ModuleContractValueImport &entry : kModuleContractValueImports) {
+    if (module != entry.module)
+      continue;
+    bindModuleObject();
+    bindCanonicalSymbol(importedAttribute(localName, entry.localAttr),
+                        entry.canonicalName, contract(entry.contract));
+  }
+
   if (std::optional<AnnotationModuleStyle> style =
           annotationModuleStyle(module)) {
     bindModuleObject();
@@ -2443,6 +2590,10 @@ bool AlgorithmM::bindImportedModule(llvm::StringRef module,
   if (bindManifestModuleCallableExports(*this, module, localName))
     handled = true;
   if (bindManifestModuleFloatConstants(*this, module, localName))
+    handled = true;
+  if (bindManifestModuleIntConstants(*this, module, localName))
+    handled = true;
+  if (bindManifestModuleStrConstants(*this, module, localName))
     handled = true;
 
   return handled;
@@ -2484,6 +2635,28 @@ bool AlgorithmM::bindImportedName(llvm::StringRef module,
     return true;
   }
 
+  for (const NameIntConstantImport &entry : kNameIntConstantImports) {
+    if (module != entry.module || exportedName != entry.exportedName)
+      continue;
+    bindCanonicalSymbol(localName, entry.canonicalName, intType());
+    return true;
+  }
+
+  for (const NameStrListImport &entry : kNameStrListImports) {
+    if (module != entry.module || exportedName != entry.exportedName)
+      continue;
+    bindCanonicalSymbol(localName, entry.canonicalName, listOf(strType()));
+    return true;
+  }
+
+  for (const NameContractValueImport &entry : kNameContractValueImports) {
+    if (module != entry.module || exportedName != entry.exportedName)
+      continue;
+    bindCanonicalSymbol(localName, entry.canonicalName,
+                        contract(entry.contract));
+    return true;
+  }
+
   const py::protocols::Table &table =
       py::protocols::Table::get(getContext());
   if (std::optional<std::string> contract =
@@ -2505,6 +2678,14 @@ bool AlgorithmM::bindImportedName(llvm::StringRef module,
     std::string canonical = (llvm::Twine(module) + "." + exportedName).str();
     if (table.moduleFloatConstant(canonical)) {
       bindCanonicalSymbol(localName, canonical, floatType());
+      return true;
+    }
+    if (table.moduleIntConstant(canonical)) {
+      bindCanonicalSymbol(localName, canonical, intType());
+      return true;
+    }
+    if (table.moduleStrConstant(canonical)) {
+      bindCanonicalSymbol(localName, canonical, strType());
       return true;
     }
   }
@@ -2732,6 +2913,8 @@ mlir::Type AlgorithmM::inferExpr(const parser::Node *node) const {
       return floatType();
     if (auto value = ast::string(*node, "value"))
       return literal("\"" + std::string(*value) + "\"");
+    if (ast::bytes(*node, "value"))
+      return contract("builtins.bytes");
     if (const auto *fieldValue = ast::field(*node, "value"))
       if (const auto *big = std::get_if<parser::BigInteger>(fieldValue))
         return literal(big->decimal);

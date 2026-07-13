@@ -35,6 +35,10 @@ inline constexpr llvm::StringLiteral kManifestDefaultI64Attr{
     "ly.runtime.default_i64"};
 inline constexpr llvm::StringLiteral kManifestDefaultF64Attr{
     "ly.runtime.default_f64"};
+inline constexpr llvm::StringLiteral kManifestDefaultStrAttr{
+    "ly.runtime.default_str"};
+inline constexpr llvm::StringLiteral kManifestDefaultBytesAttr{
+    "ly.runtime.default_bytes"};
 inline constexpr llvm::StringLiteral kManifestResultContractAttr{
     "ly.runtime.result_contract"};
 inline constexpr llvm::StringLiteral kManifestResultEvidenceAttr{

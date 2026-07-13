@@ -56,6 +56,28 @@ bool RuntimeBundleLowerer::isStaticKeywordName(py::StrConstantOp op) const {
 }
 
 mlir::LogicalResult
+RuntimeBundleLowerer::lowerBytesConstant(py::BytesConstantOp op) {
+  builder.setInsertionPoint(op);
+  mlir::Location loc = op.getLoc();
+  mlir::Value buffer =
+      RuntimeBundleLowerer::materializeByteBuffer(loc, op.getValue());
+  mlir::Value start =
+      mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult();
+  mlir::Value length =
+      mlir::arith::ConstantIntOp::create(
+          builder, loc, static_cast<std::int64_t>(op.getValue().size()), 64)
+          .getResult();
+  RuntimeBundle result;
+  if (mlir::failed(RuntimeBundleLowerer::initializeObjectFromRawValues(
+          op, runtimeContractType(context, "builtins.bytes"),
+          mlir::ValueRange{buffer, start, length}, result)))
+    return mlir::failure();
+  valueBundles[op.getResult()] = std::move(result);
+  erase.push_back(op);
+  return mlir::success();
+}
+
+mlir::LogicalResult
 RuntimeBundleLowerer::lowerIntConstant(py::IntConstantOp op) {
   std::int64_t parsed = 0;
   if (op.getValue().getAsInteger(10, parsed))

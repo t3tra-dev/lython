@@ -94,11 +94,15 @@ LogicalResult installAOTEntryPoint(llvm::Module &llvmModule,
   thunkBuilder.CreateRetVoid();
 
   llvm::FunctionType *mainType =
-      llvm::FunctionType::get(i32, /*isVarArg=*/false);
+      llvm::FunctionType::get(i32, {i32, ptr}, /*isVarArg=*/false);
   llvm::Function *main = llvm::Function::Create(
       mainType, llvm::GlobalValue::ExternalLinkage, "main", llvmModule);
   main->setUWTableKind(llvm::UWTableKind::Async);
 
+  llvm::FunctionType *initArgsType =
+      llvm::FunctionType::get(voidTy, {i32, ptr}, /*isVarArg=*/false);
+  llvm::FunctionCallee initArgs =
+      llvmModule.getOrInsertFunction("LyHost_InitArgs", initArgsType);
   llvm::FunctionType *runnerType =
       llvm::FunctionType::get(i32, {ptr}, /*isVarArg=*/false);
   llvm::FunctionCallee runner =
@@ -106,6 +110,7 @@ LogicalResult installAOTEntryPoint(llvm::Module &llvmModule,
 
   llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", main);
   llvm::IRBuilder<> builder(entry);
+  builder.CreateCall(initArgs, {main->getArg(0), main->getArg(1)});
   llvm::CallInst *status = builder.CreateCall(runner, {entryThunk});
   builder.CreateRet(status);
   return success();

@@ -415,6 +415,27 @@ mlir::LogicalResult RuntimeBundleLowerer::appendImplicitRuntimeArgument(
       ++inputIndex;
       return mlir::success();
     }
+    if (defaultArgument->kind == RuntimeDefaultArgument::Kind::Str ||
+        defaultArgument->kind == RuntimeDefaultArgument::Kind::Bytes) {
+      // The default is a whole str/bytes object; its physical values fill
+      // the header + payload inputs. The materialized temporary is an
+      // ordinary owned call result, so the refcount insertion releases it
+      // after this call like any other.
+      auto text = mlir::cast<mlir::StringAttr>(defaultArgument->value);
+      RuntimeBundle materialized;
+      mlir::LogicalResult built =
+          defaultArgument->kind == RuntimeDefaultArgument::Kind::Str
+              ? RuntimeBundleLowerer::materializeStringObject(
+                    op, text.getValue(), materialized)
+              : RuntimeBundleLowerer::materializeBytesObject(
+                    op, text.getValue(), materialized);
+      if (mlir::failed(built))
+        return mlir::failure();
+      for (mlir::Value value : materialized.physicalValues())
+        operands.push_back(value);
+      inputIndex += static_cast<unsigned>(materialized.physicalValues().size());
+      return mlir::success();
+    }
     auto floatDefault = mlir::cast<mlir::FloatAttr>(defaultArgument->value);
     operands.push_back(mlir::arith::ConstantFloatOp::create(
                            builder, op->getLoc(), builder.getF64Type(),
@@ -429,8 +450,16 @@ mlir::LogicalResult RuntimeBundleLowerer::appendImplicitRuntimeArgument(
 
 bool RuntimeBundleLowerer::canAppendImplicitRuntimeArgument(
     const RuntimeSymbol &symbol, unsigned &inputIndex) const {
-  if (!symbol.defaultArgument(inputIndex))
+  const RuntimeDefaultArgument *defaultArgument =
+      symbol.defaultArgument(inputIndex);
+  if (!defaultArgument)
     return false;
+  if (defaultArgument->kind == RuntimeDefaultArgument::Kind::Str ||
+      defaultArgument->kind == RuntimeDefaultArgument::Kind::Bytes) {
+    // Header + payload views of the materialized object.
+    inputIndex += 2;
+    return true;
+  }
   ++inputIndex;
   return true;
 }

@@ -201,6 +201,52 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBindingRef(py::BindingRefOp op) {
   if (RuntimeBundleLowerer::isStaticCtypesBinding(op.getBinding()))
     return RuntimeBundleLowerer::lowerStaticCtypesBindingRef(op);
 
+  // sys.argv is a runtime module attribute, not a folded constant or a
+  // callable: each reference materializes the list[str] through the manifest
+  // accessor (mutation through the temporary is rejected upstream by the
+  // structural-mutation receiver check, so the fresh list cannot silently
+  // drop writes).
+  if (op.getBinding() == "sys.argv") {
+    std::optional<RuntimeSymbol> accessor =
+        manifest.primitive("builtins.list", "sys_argv");
+    if (!accessor)
+      return op.emitError()
+             << "runtime manifest has no builtins.list sys_argv primitive";
+    builder.setInsertionPoint(op);
+    mlir::func::CallOp call =
+        RuntimeBundleLowerer::createRuntimeCall(op.getLoc(), *accessor, {});
+    RuntimeBundle result;
+    if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
+            op, op.getResult().getType(), call, result)))
+      return mlir::failure();
+    valueBundles[op.getResult()] = std::move(result);
+    erase.push_back(op);
+    return mlir::success();
+  }
+
+  // sys.stdout/stderr resolve to the immortal _io.TextIOWrapper singletons
+  // through their manifest accessors; the borrowed handle needs no refcount
+  // traffic.
+  if (op.getBinding() == "sys.stdout" || op.getBinding() == "sys.stderr") {
+    std::optional<RuntimeSymbol> accessor = manifest.primitive(
+        "_io.TextIOWrapper",
+        op.getBinding() == "sys.stdout" ? "sys_stdout" : "sys_stderr");
+    if (!accessor)
+      return op.emitError() << "runtime manifest has no _io.TextIOWrapper "
+                            << "accessor for " << op.getBinding();
+    builder.setInsertionPoint(op);
+    mlir::func::CallOp call =
+        RuntimeBundleLowerer::createRuntimeCall(op.getLoc(), *accessor, {});
+    RuntimeBundle result;
+    if (mlir::failed(RuntimeBundleLowerer::makeObjectBundleWithOwnership(
+            op.getOperation(), op.getResult().getType(), call.getResults(),
+            result, ownership::OwnershipKind::Borrow)))
+      return mlir::failure();
+    valueBundles[op.getResult()] = std::move(result);
+    erase.push_back(op);
+    return mlir::success();
+  }
+
   std::optional<RuntimeSymbol> builtin =
       manifest.builtinCallable(op.getBinding());
   if (builtin) {

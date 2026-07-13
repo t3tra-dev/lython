@@ -12,6 +12,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPyOp(mlir::Operation *op) {
         return mlir::success();
       })
       .Case<py::StrConstantOp>([&](auto str) { return lowerStrConstant(str); })
+      .Case<py::BytesConstantOp>(
+          [&](auto bytes) { return lowerBytesConstant(bytes); })
       .Case<py::IntConstantOp>(
           [&](auto integer) { return lowerIntConstant(integer); })
       .Case<py::FloatConstantOp>(

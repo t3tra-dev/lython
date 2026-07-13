@@ -77,6 +77,9 @@ private:
   lookupClassStaticAttr(mlir::Type receiverType,
                         llvm::StringRef attrName) const;
   Value emitNestedFunctionDecl(const parser::Node &function);
+  mlir::ArrayAttr emitCallableDefaultValues(const parser::Node &function,
+                                            const FunctionSignature &sig,
+                                            llvm::StringRef symbolName);
   Value emitLambda(const parser::Node &expr, py::CallableType expected = {});
   void emitClassContract(const parser::Node &classDef,
                          llvm::StringRef symbolName = {});
@@ -173,9 +176,15 @@ private:
                        mlir::Type type, llvm::ArrayRef<Value> captures = {});
   std::optional<Value> emitManifestFloatConstant(const parser::Node &anchor,
                                                  llvm::StringRef binding);
+  std::optional<Value> emitManifestIntConstant(const parser::Node &anchor,
+                                               llvm::StringRef binding);
+  std::optional<Value> emitManifestStrConstant(const parser::Node &anchor,
+                                               llvm::StringRef binding);
   std::optional<Value> emitStaticStringConstant(const parser::Node &anchor,
                                                 llvm::StringRef binding,
                                                 bool allowCallable = false);
+  std::optional<Value> emitStaticIntConstant(const parser::Node &anchor,
+                                             llvm::StringRef binding);
   std::optional<Value> emitLiteralTypeConstant(const parser::Node &anchor,
                                                mlir::Type type);
   Value emitFunctionObject(const parser::Node &anchor,
@@ -242,6 +251,7 @@ private:
   mlir::Type currentReturnType;
   mlir::Type currentGeneratorSendType;
   std::string currentFunctionPrefix;
+  std::vector<parser::NodePtr> synthesizedDefaultProviders;
   unsigned syntheticFunctionCounter = 0;
   unsigned listCompCounter = 0;
   llvm::SmallVector<WithCleanup, 8> activeWithCleanups;

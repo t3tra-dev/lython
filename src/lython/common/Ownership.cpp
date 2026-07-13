@@ -962,6 +962,13 @@ collectOwnedCallResultGroups(mlir::ModuleOp module, mlir::func::CallOp call,
       llvm::StringRef contractName;
       if (contractIndex < functionContract->ownedResultContracts.size())
         contractName = functionContract->ownedResultContracts[contractIndex];
+      // Type-only matching cannot tell physical twins apart (str and bytes
+      // share the (header, byte payload) shape), so a declared result
+      // contract names the entity before the structural fallback runs.
+      if (contractName.empty())
+        if (auto resultContract = callee->getAttrOfType<mlir::StringAttr>(
+                contracts::kManifestResultContractAttr))
+          contractName = resultContract.getValue();
       const RuntimeDeallocator *deallocator =
           contractName.empty()
               ? findDeallocatorForValueGroup(call.getResults(), offset,

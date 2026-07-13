@@ -88,17 +88,19 @@ static llvm::StringRef contractLeafName(llvm::StringRef contract) {
 }
 
 static llvm::StringRef builtinExceptionBase(llvm::StringRef name) {
-  if (name == "Exception")
+  if (name == "Exception" || name == "SystemExit")
     return "BaseException";
   if (name == "RuntimeError" || name == "TypeError" || name == "ValueError" ||
       name == "ArithmeticError" || name == "LookupError" ||
       name == "AssertionError" || name == "StopIteration" ||
-      name == "StopAsyncIteration")
+      name == "StopAsyncIteration" || name == "OSError")
     return "Exception";
   if (name == "ZeroDivisionError")
     return "ArithmeticError";
   if (name == "KeyError" || name == "IndexError")
     return "LookupError";
+  if (name == "FileNotFoundError" || name == "UnsupportedOperation")
+    return "OSError";
   return {};
 }
 

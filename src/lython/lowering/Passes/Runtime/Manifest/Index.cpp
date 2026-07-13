@@ -297,6 +297,14 @@ void RuntimeManifestIndex::record(mlir::func::FuncOp function,
             function.getArgAttr(index, kManifestDefaultF64Attr))
       defaultArguments.push_back(RuntimeDefaultArgument{
           index, RuntimeDefaultArgument::Kind::F64, attr});
+    if (mlir::Attribute attr =
+            function.getArgAttr(index, kManifestDefaultStrAttr))
+      defaultArguments.push_back(RuntimeDefaultArgument{
+          index, RuntimeDefaultArgument::Kind::Str, attr});
+    if (mlir::Attribute attr =
+            function.getArgAttr(index, kManifestDefaultBytesAttr))
+      defaultArguments.push_back(RuntimeDefaultArgument{
+          index, RuntimeDefaultArgument::Kind::Bytes, attr});
   }
 
   llvm::SmallVector<std::string, 4> evidenceSlotNames =
@@ -602,6 +610,20 @@ RuntimeManifestIndex::verifyDefaultArguments(RuntimeSymbol &symbol) {
                                     << inputIndex << " must be a FloatAttr";
         verified.fail();
       }
+    }
+    mlir::Attribute defaultStr =
+        symbol.function.getArgAttr(inputIndex, kManifestDefaultStrAttr);
+    mlir::Attribute defaultBytes =
+        symbol.function.getArgAttr(inputIndex, kManifestDefaultBytesAttr);
+    if (defaultStr && !mlir::isa<mlir::StringAttr>(defaultStr)) {
+      symbol.function.emitError() << "runtime default_str input " << inputIndex
+                                  << " must be a StringAttr";
+      verified.fail();
+    }
+    if (defaultBytes && !mlir::isa<mlir::StringAttr>(defaultBytes)) {
+      symbol.function.emitError() << "runtime default_bytes input "
+                                  << inputIndex << " must be a StringAttr";
+      verified.fail();
     }
   }
   return verified.get();

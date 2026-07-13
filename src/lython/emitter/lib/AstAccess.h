@@ -44,6 +44,11 @@ inline std::optional<std::string_view> string(const parser::Node &owner,
   return std::nullopt;
 }
 
+inline const std::vector<std::uint8_t> *bytes(const parser::Node &owner,
+                                              std::string_view name) {
+  return as<std::vector<std::uint8_t>>(field(owner, name));
+}
+
 inline std::optional<std::int64_t> integer(const parser::Node &owner,
                                            std::string_view name) {
   if (const auto *value = as<std::int64_t>(field(owner, name)))

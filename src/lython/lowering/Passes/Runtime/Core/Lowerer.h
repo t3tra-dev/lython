@@ -340,6 +340,9 @@ private:
   mlir::LogicalResult materializeStringObject(mlir::Operation *op,
                                               llvm::StringRef text,
                                               RuntimeBundle &bundle);
+  mlir::LogicalResult materializeBytesObject(mlir::Operation *op,
+                                             llvm::StringRef data,
+                                             RuntimeBundle &bundle);
   bool needsDefaultObjectRepr(const RuntimeBundle &object) const;
   mlir::LogicalResult materializeDefaultObjectRepr(mlir::Operation *op,
                                                    const RuntimeBundle &object,
@@ -594,6 +597,7 @@ private:
   mlir::LogicalResult lowerTry(py::TryOp op);
   mlir::LogicalResult lowerStrConstant(py::StrConstantOp op);
   bool isStaticKeywordName(py::StrConstantOp op) const;
+  mlir::LogicalResult lowerBytesConstant(py::BytesConstantOp op);
   mlir::LogicalResult lowerIntConstant(py::IntConstantOp op);
   mlir::LogicalResult lowerFloatConstant(py::FloatConstantOp op);
   mlir::LogicalResult lowerBoolConstant(py::BoolConstantOp op);

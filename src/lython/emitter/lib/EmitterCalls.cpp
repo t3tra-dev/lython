@@ -286,14 +286,28 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
 
   // Multi-argument print desugars to one write of the space-joined
   // stringified arguments (CPython's sep=" " default): the unified print
-  // resolver stays single-argument.
+  // resolver stays single-argument. Zero-argument print desugars to one
+  // empty-string write (builtin_print_impl with objects_length == 0 emits
+  // only the end="\n" terminator).
   if (calleeNode && calleeNode->kind == "Name" &&
       ast::nameSpelling(*calleeNode) == "print" &&
       values.find("print") == values.end()) {
     const auto *printArgs = ast::nodeList(expr, "args");
     const auto *printKeywords = ast::nodeList(expr, "keywords");
+    bool noPrintKeywords = !printKeywords || printKeywords->empty();
+    if (noPrintKeywords && (!printArgs || printArgs->empty())) {
+      mlir::Type emptyType = types.literal("\"\"");
+      auto empty = py::StrConstantOp::create(builder, loc(expr), emptyType,
+                                             builder.getStringAttr(""));
+      Value piece = coerceValue(Value{empty.getResult(), emptyType},
+                                types.contract("builtins.str"), expr);
+      Value printCallee = emitExpr(calleeNode);
+      CallOperands operands =
+          emitCallOperands(expr, {piece}, /*includeAstArguments=*/false);
+      return emitCallableDispatch(expr, printCallee, operands);
+    }
     bool plainArguments = printArgs && printArgs->size() >= 2 &&
-                          (!printKeywords || printKeywords->empty());
+                          noPrintKeywords;
     if (plainArguments)
       for (const parser::NodePtr &argument : *printArgs)
         if (!argument || argument->kind == "Starred")

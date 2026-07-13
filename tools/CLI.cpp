@@ -467,8 +467,9 @@ noopDeregisterEHFrameSectionAllocAction(const char *argData, size_t argSize) {
           .release();
 }
 
-LogicalResult runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
-                     py::TensorLoweringTarget tensorTarget) {
+FailureOr<int> runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
+                      py::TensorLoweringTarget tensorTarget,
+                      llvm::ArrayRef<std::string> programArgs) {
   llvm::Triple processTriple(llvm::sys::getDefaultTargetTriple());
   if (tensorTarget.usesX86() &&
       processTriple.getArch() != llvm::Triple::x86_64) {
@@ -488,6 +489,7 @@ LogicalResult runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
   std::unique_ptr<llvm::orc::LLJIT> jit;
   llvm::orc::ExecutorAddr entryAddress;
   llvm::orc::ExecutorAddr runnerAddress;
+  llvm::orc::ExecutorAddr initArgsAddress;
 
   {
     PerfScope perf("jit-build");
@@ -717,22 +719,40 @@ LogicalResult runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
         }
         runnerAddress = *runnerSym;
       }
+      {
+        PerfScope perf("jit-build.lookup-init-args");
+        auto initArgsSym = jit->lookup("LyHost_InitArgs");
+        if (!initArgsSym) {
+          llvm::errs() << "JIT runtime lookup failed: "
+                       << initArgsSym.takeError() << "\n";
+          return failure();
+        }
+        initArgsAddress = *initArgsSym;
+      }
     }
   }
 
   auto *entry = entryAddress.toPtr<void (*)()>();
   auto *runner = runnerAddress.toPtr<int (*)(void (*)())>();
+  auto *initArgs = initArgsAddress.toPtr<void (*)(int, char **)>();
+  // sys.argv is [script path, program args...] like CPython's; the storage
+  // must outlive the run because LySys_GetArgv reads the raw vector lazily.
+  std::vector<std::string> argvStorage(programArgs.begin(), programArgs.end());
+  std::vector<char *> argvPointers;
+  argvPointers.reserve(argvStorage.size());
+  for (std::string &arg : argvStorage)
+    argvPointers.push_back(arg.data());
+  initArgs(static_cast<int>(argvPointers.size()), argvPointers.data());
+  int status = 0;
   {
     PerfScope perf("execution");
     if (Options.sanitizers.leak)
       lython::driver::callLeakSanitizerHook("__lsan_enable");
-    int status = runner(entry);
+    status = runner(entry);
     if (Options.sanitizers.leak)
       lython::driver::callLeakSanitizerHook("__lsan_disable");
-    if (status != 0)
-      return failure();
   }
-  return success();
+  return status;
 }
 } // namespace
 
@@ -812,6 +832,10 @@ static llvm::cl::SubCommand JitCommand("jit", "JIT execute an input file");
 static llvm::cl::opt<std::string>
     JitInputFilename(llvm::cl::Positional, llvm::cl::desc("<input file>"),
                      llvm::cl::Required, llvm::cl::sub(JitCommand));
+static llvm::cl::list<std::string>
+    JitProgramArgs(llvm::cl::ConsumeAfter,
+                   llvm::cl::desc("<program arguments>..."),
+                   llvm::cl::sub(JitCommand));
 static llvm::cl::SubCommand ParseCommand(
     "parse",
     "Parse Python source with the vendored CPython 3.14 PEG/ASDL C++ frontend");
@@ -972,7 +996,12 @@ int main(int argc, char **argv) {
   }
 
   if (jitMode) {
-    return failed(runJIT(*module, irDump, tensorTarget)) ? 1 : 0;
+    std::vector<std::string> programArgs;
+    programArgs.push_back(JitInputFilename);
+    programArgs.insert(programArgs.end(), JitProgramArgs.begin(),
+                       JitProgramArgs.end());
+    FailureOr<int> status = runJIT(*module, irDump, tensorTarget, programArgs);
+    return failed(status) ? 1 : *status;
   }
 
   lython::driver::VerifiedLLVMModule verified;

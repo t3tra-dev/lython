@@ -493,10 +493,11 @@ void buildExceptionBaseClassId(SupportBuilder &b) {
     mlir::func::ReturnOp::create(b.builder, b.loc, b.iconst(value));
     return block;
   };
-  mlir::Block *toException = returnBlock(5);        // 50/62 -> Exception
+  mlir::Block *toException = returnBlock(5);        // 50/62/64 -> BaseException
   mlir::Block *toBaseException = returnBlock(50);   // most concrete -> Exception
   mlir::Block *toLookupError = returnBlock(60);     // 54/55 -> LookupError
   mlir::Block *toArithmeticError = returnBlock(59); // 61 -> ArithmeticError
+  mlir::Block *toOSError = returnBlock(66);         // 67/69 -> OSError
   mlir::Block *toRoot = returnBlock(0);             // default -> root
 
   struct Case {
@@ -505,12 +506,15 @@ void buildExceptionBaseClassId(SupportBuilder &b) {
   };
   const Case cases[] = {
       {50, toException},        {62, toException},
+      {64, toException},
       {51, toBaseException},    {52, toBaseException},
       {53, toBaseException},    {56, toBaseException},
       {57, toBaseException},    {58, toBaseException},
       {59, toBaseException},    {60, toBaseException},
+      {66, toBaseException},
       {54, toLookupError},      {55, toLookupError},
       {61, toArithmeticError},
+      {67, toOSError},          {69, toOSError},
   };
   llvm::SmallVector<llvm::APInt, 16> caseValues;
   llvm::SmallVector<mlir::Block *, 16> caseDests;
@@ -1177,30 +1181,403 @@ void buildReleaseBoxedPayloadArraySlotRaw(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
-// LyHost_Print/LyHost_PrintLine(memref<?xi8> descriptor, i64 len) at the
-// lowered ABI (alloc ptr, aligned ptr, offset, size, stride, len): stdout
-// writes through print_bytes; PrintLine appends the newline byte.
-void buildHostPrint(SupportBuilder &b, llvm::StringRef name, bool newline) {
+// LyHost_WriteBytes(i32 fd, memref<?xi8> descriptor, i64 len) at the lowered
+// ABI (fd, alloc ptr, aligned ptr, offset, size, stride, len): the raw
+// pointer extraction from the descriptor is the irreducibly-llvm part of the
+// print path; everything above it (print semantics, the end="\n"
+// terminator) lives in builtins.mlir.
+void buildHostWriteBytes(SupportBuilder &b) {
   auto fn = b.beginFunction(
-      name, b.builder.getFunctionType(
-                {b.ptr(), b.ptr(), b.i64(), b.i64(), b.i64(), b.i64()}, {}));
+      "LyHost_WriteBytes",
+      b.builder.getFunctionType({b.i32(), b.ptr(), b.ptr(), b.i64(), b.i64(),
+                                 b.i64(), b.i64()},
+                                {}));
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
-  mlir::Value stdoutFd = mlir::arith::ConstantIntOp::create(b.builder, b.loc,
-                                                            b.i32(), 1);
   mlir::func::CallOp::create(
       b.builder, b.loc, "print_bytes", mlir::TypeRange{},
-      mlir::ValueRange{stdoutFd, entry->getArgument(1), entry->getArgument(2),
+      mlir::ValueRange{entry->getArgument(0), entry->getArgument(2),
                        entry->getArgument(3), entry->getArgument(4),
-                       entry->getArgument(5)});
-  if (newline) {
-    mlir::Value newlineByte = mlir::arith::ConstantIntOp::create(
-        b.builder, b.loc, b.i8(), 10);
-    mlir::func::CallOp::create(b.builder, b.loc, "write_char",
-                               mlir::TypeRange{},
-                               mlir::ValueRange{stdoutFd, newlineByte});
-  }
+                       entry->getArgument(5), entry->getArgument(6)});
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
+// void LyHost_SetExitStatus(i64 status): records the sys.exit status in
+// g_sys_exit_status. LyRunPythonMain reads it back when a SystemExit reaches
+// the top level; a global (not an exception payload) because the exception
+// object layout has no slot beyond the message string.
+void buildHostSetExitStatus(SupportBuilder &b) {
+  {
+    mlir::OpBuilder::InsertionGuard guard(b.builder);
+    b.builder.setInsertionPointToEnd(b.module.getBody());
+    mlir::LLVM::GlobalOp::create(b.builder, b.loc, b.i64(),
+                                 /*isConstant=*/false,
+                                 mlir::LLVM::Linkage::Internal,
+                                 "g_sys_exit_status",
+                                 b.builder.getIntegerAttr(b.i64(), 0),
+                                 /*alignment=*/8);
+  }
+  auto fn = b.beginFunction(
+      "LyHost_SetExitStatus", b.builder.getFunctionType({b.i64()}, {}));
+  mlir::Block *entry = fn.addEntryBlock();
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, entry->getArgument(0),
+                              b.addrOf("g_sys_exit_status"), /*alignment=*/8);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
+// argv cluster: LyHost_InitArgs records the process argc/argv (called by the
+// AOT main shim and the JIT driver before the program body runs); the
+// LyHost_Argv* accessors hand the raw C strings to sys.mlir's LySys_GetArgv,
+// which builds the Python list[str]. The raw char** walk is the
+// irreducibly-llvm part; everything above it lives in the manifest.
+void buildHostArgvSupport(SupportBuilder &b) {
+  {
+    mlir::OpBuilder::InsertionGuard guard(b.builder);
+    b.builder.setInsertionPointToEnd(b.module.getBody());
+    mlir::LLVM::GlobalOp::create(b.builder, b.loc, b.i64(),
+                                 /*isConstant=*/false,
+                                 mlir::LLVM::Linkage::Internal, "g_argv_count",
+                                 b.builder.getIntegerAttr(b.i64(), 0),
+                                 /*alignment=*/8);
+    auto vector = mlir::LLVM::GlobalOp::create(
+        b.builder, b.loc, b.ptr(), /*isConstant=*/false,
+        mlir::LLVM::Linkage::Internal, "g_argv_vector", mlir::Attribute(),
+        /*alignment=*/8);
+    mlir::Block *init = b.builder.createBlock(&vector.getInitializerRegion());
+    b.builder.setInsertionPointToEnd(init);
+    mlir::Value null = mlir::LLVM::ZeroOp::create(b.builder, b.loc, b.ptr());
+    mlir::LLVM::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{null});
+  }
+
+  {
+    auto fn = b.beginFunction(
+        "LyHost_InitArgs", b.builder.getFunctionType({b.i32(), b.ptr()}, {}));
+    mlir::Block *entry = fn.addEntryBlock();
+    b.builder.setInsertionPointToEnd(entry);
+    mlir::Value count = mlir::arith::ExtSIOp::create(
+        b.builder, b.loc, b.i64(), entry->getArgument(0));
+    mlir::LLVM::StoreOp::create(b.builder, b.loc, count,
+                                b.addrOf("g_argv_count"), /*alignment=*/8);
+    mlir::LLVM::StoreOp::create(b.builder, b.loc, entry->getArgument(1),
+                                b.addrOf("g_argv_vector"), /*alignment=*/8);
+    mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+  }
+
+  {
+    auto fn = b.beginFunction("LyHost_ArgvCount",
+                              b.builder.getFunctionType({}, {b.i64()}));
+    mlir::Block *entry = fn.addEntryBlock();
+    b.builder.setInsertionPointToEnd(entry);
+    mlir::Value count = mlir::LLVM::LoadOp::create(
+        b.builder, b.loc, b.i64(), b.addrOf("g_argv_count"), /*alignment=*/8);
+    mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{count});
+  }
+
+  {
+    auto fn = b.beginFunction("LyHost_ArgvLen",
+                              b.builder.getFunctionType({b.i64()}, {b.i64()}));
+    mlir::Block *entry = fn.addEntryBlock();
+    b.builder.setInsertionPointToEnd(entry);
+    mlir::Value vector = b.loadPtrVal(b.addrOf("g_argv_vector"));
+    // char** elements have i64 width; gepI64 walks them.
+    mlir::Value argument =
+        b.loadPtrVal(b.gepI64(vector, entry->getArgument(0)));
+    mlir::Value length =
+        b.call("strlen", b.i64(), mlir::ValueRange{argument}).front();
+    mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{length});
+  }
+
+  {
+    // LyHost_ArgvCopy(i64 index, memref<?xi8> dest, i64 len) at the lowered
+    // ABI (index, alloc, aligned, offset, size, stride, len).
+    auto fn = b.beginFunction(
+        "LyHost_ArgvCopy",
+        b.builder.getFunctionType({b.i64(), b.ptr(), b.ptr(), b.i64(),
+                                   b.i64(), b.i64(), b.i64()},
+                                  {}));
+    mlir::Block *entry = fn.addEntryBlock();
+    b.builder.setInsertionPointToEnd(entry);
+    mlir::Value vector = b.loadPtrVal(b.addrOf("g_argv_vector"));
+    mlir::Value source =
+        b.loadPtrVal(b.gepI64(vector, entry->getArgument(0)));
+    mlir::Value dest = b.gepI8(entry->getArgument(2), entry->getArgument(3));
+    mlir::LLVM::MemcpyOp::create(b.builder, b.loc, dest, source,
+                                 entry->getArgument(6), /*isVolatile=*/false);
+    mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+  }
+}
+
+// FILE* cluster: the host boundary for _io.mlir's file-backed streams. libc
+// FILE* (fopen family) rather than raw open(2) because the O_* flag values
+// are target-dependent while the fopen mode strings are portable, and the
+// manifest bytecode is embedded target-independently. Handles cross the
+// boundary as i64 (ptrtoint of the FILE*).
+void buildHostFileSupport(SupportBuilder &b) {
+  {
+    // i64 LyHost_FOpen(memref<?xi8> path, i64 path_len, memref<?xi8> mode,
+    // i64 mode_len): NUL-terminate both views, fopen, 0 on failure.
+    auto fn = b.beginFunction(
+        "LyHost_FOpen",
+        b.builder.getFunctionType({b.ptr(), b.ptr(), b.i64(), b.i64(),
+                                   b.i64(), b.i64(), b.ptr(), b.ptr(),
+                                   b.i64(), b.i64(), b.i64(), b.i64()},
+                                  {b.i64()}));
+    mlir::Block *entry = fn.addEntryBlock();
+    b.builder.setInsertionPointToEnd(entry);
+    mlir::Value pathCStr =
+        b.call("copy_i8_memref", b.ptr(),
+               mlir::ValueRange{entry->getArgument(1), entry->getArgument(2),
+                                entry->getArgument(5), entry->getArgument(4)})
+            .front();
+    mlir::Value modeCStr =
+        b.call("copy_i8_memref", b.ptr(),
+               mlir::ValueRange{entry->getArgument(7), entry->getArgument(8),
+                                entry->getArgument(11),
+                                entry->getArgument(10)})
+            .front();
+    mlir::Value file =
+        b.call("fopen", b.ptr(), mlir::ValueRange{pathCStr, modeCStr})
+            .front();
+    b.call("free", mlir::TypeRange{}, mlir::ValueRange{pathCStr});
+    b.call("free", mlir::TypeRange{}, mlir::ValueRange{modeCStr});
+    mlir::Value handle =
+        mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), file);
+    mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{handle});
+  }
+
+  {
+    // i64 LyHost_FRead(i64 file, memref<?xi8> dest, i64 offset, i64 max):
+    // fread into dest[offset..offset+max); returns the byte count.
+    auto fn = b.beginFunction(
+        "LyHost_FRead",
+        b.builder.getFunctionType({b.i64(), b.ptr(), b.ptr(), b.i64(),
+                                   b.i64(), b.i64(), b.i64(), b.i64()},
+                                  {b.i64()}));
+    mlir::Block *entry = fn.addEntryBlock();
+    b.builder.setInsertionPointToEnd(entry);
+    mlir::Value file = b.intToPtr(entry->getArgument(0));
+    mlir::Value base = b.gepI8(entry->getArgument(2), entry->getArgument(3));
+    mlir::Value dest = b.gepI8(base, entry->getArgument(6));
+    mlir::Value one = b.iconst(1);
+    mlir::Value count =
+        b.call("fread", b.i64(),
+               mlir::ValueRange{dest, one, entry->getArgument(7), file})
+            .front();
+    mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{count});
+  }
+
+  {
+    // i32 LyHost_FGetc(i64 file): fgetc (-1 on EOF).
+    auto fn = b.beginFunction(
+        "LyHost_FGetc", b.builder.getFunctionType({b.i64()}, {b.i32()}));
+    mlir::Block *entry = fn.addEntryBlock();
+    b.builder.setInsertionPointToEnd(entry);
+    mlir::Value file = b.intToPtr(entry->getArgument(0));
+    mlir::Value ch = b.call("fgetc", b.i32(), mlir::ValueRange{file}).front();
+    mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{ch});
+  }
+
+  {
+    // i64 LyHost_FWrite(i64 file, memref<?xi8> bytes, i64 len).
+    auto fn = b.beginFunction(
+        "LyHost_FWrite",
+        b.builder.getFunctionType({b.i64(), b.ptr(), b.ptr(), b.i64(),
+                                   b.i64(), b.i64(), b.i64()},
+                                  {b.i64()}));
+    mlir::Block *entry = fn.addEntryBlock();
+    b.builder.setInsertionPointToEnd(entry);
+    mlir::Value file = b.intToPtr(entry->getArgument(0));
+    mlir::Value src = b.gepI8(entry->getArgument(2), entry->getArgument(3));
+    mlir::Value one = b.iconst(1);
+    mlir::Value count =
+        b.call("fwrite", b.i64(),
+               mlir::ValueRange{src, one, entry->getArgument(6), file})
+            .front();
+    mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{count});
+  }
+
+  {
+    // i32 LyHost_FClose(i64 file).
+    auto fn = b.beginFunction(
+        "LyHost_FClose", b.builder.getFunctionType({b.i64()}, {b.i32()}));
+    mlir::Block *entry = fn.addEntryBlock();
+    b.builder.setInsertionPointToEnd(entry);
+    mlir::Value file = b.intToPtr(entry->getArgument(0));
+    mlir::Value status =
+        b.call("fclose", b.i32(), mlir::ValueRange{file}).front();
+    mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{status});
+  }
+
+  {
+    // i32 LyHost_FFlush(i64 file).
+    auto fn = b.beginFunction(
+        "LyHost_FFlush", b.builder.getFunctionType({b.i64()}, {b.i32()}));
+    mlir::Block *entry = fn.addEntryBlock();
+    b.builder.setInsertionPointToEnd(entry);
+    mlir::Value file = b.intToPtr(entry->getArgument(0));
+    mlir::Value status =
+        b.call("fflush", b.i32(), mlir::ValueRange{file}).front();
+    mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{status});
+  }
+
+  {
+    // i32 LyHost_Fileno(i64 file).
+    auto fn = b.beginFunction(
+        "LyHost_Fileno", b.builder.getFunctionType({b.i64()}, {b.i32()}));
+    mlir::Block *entry = fn.addEntryBlock();
+    b.builder.setInsertionPointToEnd(entry);
+    mlir::Value file = b.intToPtr(entry->getArgument(0));
+    mlir::Value fd = b.call("fileno", b.i32(), mlir::ValueRange{file}).front();
+    mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{fd});
+  }
+
+  {
+    // i32 LyHost_FSeek(i64 file, i64 offset, i32 whence): fseek (the C
+    // SEEK_SET/CUR/END values equal Python's 0/1/2 on every libc).
+    auto fn = b.beginFunction(
+        "LyHost_FSeek",
+        b.builder.getFunctionType({b.i64(), b.i64(), b.i32()}, {b.i32()}));
+    mlir::Block *entry = fn.addEntryBlock();
+    b.builder.setInsertionPointToEnd(entry);
+    mlir::Value file = b.intToPtr(entry->getArgument(0));
+    mlir::Value status =
+        b.call("fseek", b.i32(),
+               mlir::ValueRange{file, entry->getArgument(1),
+                                entry->getArgument(2)})
+            .front();
+    mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{status});
+  }
+
+  {
+    // i64 LyHost_FTell(i64 file).
+    auto fn = b.beginFunction(
+        "LyHost_FTell", b.builder.getFunctionType({b.i64()}, {b.i64()}));
+    mlir::Block *entry = fn.addEntryBlock();
+    b.builder.setInsertionPointToEnd(entry);
+    mlir::Value file = b.intToPtr(entry->getArgument(0));
+    mlir::Value where =
+        b.call("ftell", b.i64(), mlir::ValueRange{file}).front();
+    mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{where});
+  }
+
+  {
+    // i32 LyHost_FUngetc(i64 file, i32 ch): push one byte back so the
+    // character-limited text read can stop exactly on the next lead byte.
+    auto fn = b.beginFunction(
+        "LyHost_FUngetc",
+        b.builder.getFunctionType({b.i64(), b.i32()}, {b.i32()}));
+    mlir::Block *entry = fn.addEntryBlock();
+    b.builder.setInsertionPointToEnd(entry);
+    mlir::Value file = b.intToPtr(entry->getArgument(0));
+    mlir::Value pushed =
+        b.call("ungetc", b.i32(),
+               mlir::ValueRange{entry->getArgument(1), file})
+            .front();
+    mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{pushed});
+  }
+
+  {
+    // i32 LyHost_FTruncate(i64 file, i64 size): flush the FILE* buffer so
+    // ftruncate sees the written bytes, then truncate through the fd.
+    auto fn = b.beginFunction(
+        "LyHost_FTruncate",
+        b.builder.getFunctionType({b.i64(), b.i64()}, {b.i32()}));
+    mlir::Block *entry = fn.addEntryBlock();
+    b.builder.setInsertionPointToEnd(entry);
+    mlir::Value file = b.intToPtr(entry->getArgument(0));
+    mlir::Value flushed =
+        b.call("fflush", b.i32(), mlir::ValueRange{file}).front();
+    (void)flushed;
+    mlir::Value fd = b.call("fileno", b.i32(), mlir::ValueRange{file}).front();
+    mlir::Value status =
+        b.call("ftruncate", b.i32(),
+               mlir::ValueRange{fd, entry->getArgument(1)})
+            .front();
+    mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{status});
+  }
+}
+
+// raw-buffer cluster: the host boundary for _io.mlir's in-memory streams
+// (StringIO/BytesIO). The stream object stores the malloc'd payload as an
+// i64 pointer INSIDE its header words, so growth updates the header in
+// place and the object's physical values never change (the same indirection
+// trick as the FILE* handle); memref-world code cannot dereference a raw
+// pointer, so the copies cross this boundary.
+void buildHostBufferSupport(SupportBuilder &b) {
+  {
+    // i64 LyHost_BufferGrow(i64 buffer, i64 new_capacity): realloc (NULL in
+    // -> malloc); aborts on exhaustion like the runtime's other allocators.
+    auto fn = b.beginFunction(
+        "LyHost_BufferGrow",
+        b.builder.getFunctionType({b.i64(), b.i64()}, {b.i64()}));
+    mlir::Block *entry = fn.addEntryBlock();
+    mlir::Region &body = fn.getBody();
+    mlir::Block *ok = b.builder.createBlock(&body);
+    mlir::Block *trap = b.builder.createBlock(&body);
+    b.builder.setInsertionPointToEnd(entry);
+    mlir::Value buffer = b.intToPtr(entry->getArgument(0));
+    mlir::Value grown =
+        b.call("realloc", b.ptr(),
+               mlir::ValueRange{buffer, entry->getArgument(1)})
+            .front();
+    mlir::Value failed = b.ptrEq(grown, b.nullPtr());
+    mlir::cf::CondBranchOp::create(b.builder, b.loc, failed, trap,
+                                   mlir::ValueRange{}, ok, mlir::ValueRange{});
+    b.builder.setInsertionPointToEnd(ok);
+    mlir::Value handle =
+        mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), grown);
+    mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{handle});
+    b.builder.setInsertionPointToEnd(trap);
+    b.emitTrap(b.i64());
+  }
+
+  {
+    // void LyHost_BufferCopyIn(i64 buffer, i64 at, memref<?xi8> src, i64 len).
+    auto fn = b.beginFunction(
+        "LyHost_BufferCopyIn",
+        b.builder.getFunctionType({b.i64(), b.i64(), b.ptr(), b.ptr(),
+                                   b.i64(), b.i64(), b.i64(), b.i64()},
+                                  {}));
+    mlir::Block *entry = fn.addEntryBlock();
+    b.builder.setInsertionPointToEnd(entry);
+    mlir::Value dest =
+        b.gepI8(b.intToPtr(entry->getArgument(0)), entry->getArgument(1));
+    mlir::Value source =
+        b.gepI8(entry->getArgument(3), entry->getArgument(4));
+    mlir::LLVM::MemcpyOp::create(b.builder, b.loc, dest, source,
+                                 entry->getArgument(7), /*isVolatile=*/false);
+    mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+  }
+
+  {
+    // void LyHost_BufferCopyOut(i64 buffer, i64 at, memref<?xi8> dest,
+    // i64 len).
+    auto fn = b.beginFunction(
+        "LyHost_BufferCopyOut",
+        b.builder.getFunctionType({b.i64(), b.i64(), b.ptr(), b.ptr(),
+                                   b.i64(), b.i64(), b.i64(), b.i64()},
+                                  {}));
+    mlir::Block *entry = fn.addEntryBlock();
+    b.builder.setInsertionPointToEnd(entry);
+    mlir::Value source =
+        b.gepI8(b.intToPtr(entry->getArgument(0)), entry->getArgument(1));
+    mlir::Value dest = b.gepI8(entry->getArgument(3), entry->getArgument(4));
+    mlir::LLVM::MemcpyOp::create(b.builder, b.loc, dest, source,
+                                 entry->getArgument(7), /*isVolatile=*/false);
+    mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+  }
+
+  {
+    // void LyHost_BufferFree(i64 buffer): free(NULL) is a no-op.
+    auto fn = b.beginFunction("LyHost_BufferFree",
+                              b.builder.getFunctionType({b.i64()}, {}));
+    mlir::Block *entry = fn.addEntryBlock();
+    b.builder.setInsertionPointToEnd(entry);
+    mlir::Value buffer = b.intToPtr(entry->getArgument(0));
+    b.call("free", mlir::TypeRange{}, mlir::ValueRange{buffer});
+    mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1276,7 +1653,8 @@ void declareTracebackSupport(SupportBuilder &b) {
        {"BaseException", "Exception", "RuntimeError", "TypeError",
         "ValueError", "KeyError", "IndexError", "AssertionError",
         "StopIteration", "StopAsyncIteration", "ArithmeticError",
-        "LookupError", "ZeroDivisionError", "CancelledError"})
+        "LookupError", "ZeroDivisionError", "CancelledError", "SystemExit",
+        "OSError", "FileNotFoundError", "UnsupportedOperation"})
     b.stringGlobal((".tb_class." + name).str(), name);
 }
 
@@ -1780,6 +2158,9 @@ void buildExceptionClassName(SupportBuilder &b) {
       {57, ".tb_class.StopIteration"},  {58, ".tb_class.StopAsyncIteration"},
       {59, ".tb_class.ArithmeticError"}, {60, ".tb_class.LookupError"},
       {61, ".tb_class.ZeroDivisionError"}, {62, ".tb_class.CancelledError"},
+      {64, ".tb_class.SystemExit"},        {66, ".tb_class.OSError"},
+      {67, ".tb_class.FileNotFoundError"},
+      {69, ".tb_class.UnsupportedOperation"},
   };
   mlir::Value name = b.addrOf(".tb_class.Exception");
   for (const auto &[id, global] : table) {
@@ -2839,6 +3220,10 @@ void buildRunPythonMain(SupportBuilder &b) {
   mlir::Block *landing = b.builder.createBlock(&body);
   mlir::Block *native = b.builder.createBlock(&body);
   mlir::Block *python = b.builder.createBlock(&body);
+  mlir::Block *printTraceback = b.builder.createBlock(&body);
+  mlir::Block *systemExit = b.builder.createBlock(&body);
+  mlir::Block *exitWithStatus = b.builder.createBlock(&body);
+  mlir::Block *exitWithMessage = b.builder.createBlock(&body);
 
   b.builder.setInsertionPointToEnd(entry);
   mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{},
@@ -2919,12 +3304,57 @@ void buildRunPythonMain(SupportBuilder &b) {
   mlir::Value messageStride = mlir::LLVM::LoadOp::create(
       b.builder, b.loc, b.i64(), partsField(b, descriptor, 2, 4),
       /*alignment=*/8);
+  mlir::Value isSystemExit =
+      b.cmpi(mlir::arith::CmpIPredicate::eq, classId, b.iconst(64));
+  mlir::LLVM::CondBrOp::create(b.builder, b.loc, isSystemExit, systemExit,
+                               printTraceback);
+
+  b.builder.setInsertionPointToEnd(printTraceback);
   mlir::func::CallOp::create(
       b.builder, b.loc, "LyTraceback_PrintMessage", mlir::TypeRange{},
       mlir::ValueRange{classId, b.nullPtr(), messageData, messageOffset,
                        messageLen, messageStride});
   mlir::func::CallOp::create(b.builder, b.loc, "LyTraceback_Clear",
                              mlir::TypeRange{}, mlir::ValueRange{});
+  mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{},
+                             "__cxa_end_catch", mlir::ValueRange{});
+  mlir::LLVM::ReturnOp::create(b.builder, b.loc,
+                               mlir::ValueRange{b.iconst32(1)});
+
+  // SystemExit never prints a traceback (CPython semantics): an empty
+  // message reports the last LyHost_SetExitStatus value, a non-empty message
+  // goes to stderr with exit status 1 (the non-int `SystemExit(code)` path).
+  b.builder.setInsertionPointToEnd(systemExit);
+  mlir::func::CallOp::create(b.builder, b.loc, "LyTraceback_Clear",
+                             mlir::TypeRange{}, mlir::ValueRange{});
+  mlir::Value messageEmpty =
+      b.cmpi(mlir::arith::CmpIPredicate::eq, messageLen, b.iconst(0));
+  mlir::LLVM::CondBrOp::create(b.builder, b.loc, messageEmpty, exitWithStatus,
+                               exitWithMessage);
+
+  b.builder.setInsertionPointToEnd(exitWithStatus);
+  mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{},
+                             "__cxa_end_catch", mlir::ValueRange{});
+  mlir::Value status = mlir::LLVM::LoadOp::create(
+      b.builder, b.loc, b.i64(), b.addrOf("g_sys_exit_status"),
+      /*alignment=*/8);
+  mlir::Value status32 =
+      mlir::arith::TruncIOp::create(b.builder, b.loc, b.i32(), status);
+  mlir::LLVM::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{status32});
+
+  b.builder.setInsertionPointToEnd(exitWithMessage);
+  mlir::Value messageCStr =
+      mlir::func::CallOp::create(
+          b.builder, b.loc, "copy_i8_memref", mlir::TypeRange{b.ptr()},
+          mlir::ValueRange{messageData, messageOffset, messageLen,
+                           messageStride})
+          .getResult(0);
+  mlir::func::CallOp::create(b.builder, b.loc, "write_cstr", mlir::TypeRange{},
+                             mlir::ValueRange{b.iconst32(2), messageCStr});
+  mlir::func::CallOp::create(
+      b.builder, b.loc, "write_char", mlir::TypeRange{},
+      mlir::ValueRange{b.iconst32(2), b.iconst8(10)});
+  b.call("free", mlir::TypeRange{}, mlir::ValueRange{messageCStr});
   mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{},
                              "__cxa_end_catch", mlir::ValueRange{});
   mlir::LLVM::ReturnOp::create(b.builder, b.loc,
@@ -2950,6 +3380,42 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context) {
   support.declareExternal(
       "strlen",
       builder.getFunctionType({support.ptr()}, {support.i64()}));
+  support.declareExternal(
+      "realloc", builder.getFunctionType({support.ptr(), support.i64()},
+                                         {support.ptr()}));
+  support.declareExternal(
+      "fopen", builder.getFunctionType({support.ptr(), support.ptr()},
+                                       {support.ptr()}));
+  support.declareExternal(
+      "fread",
+      builder.getFunctionType(
+          {support.ptr(), support.i64(), support.i64(), support.ptr()},
+          {support.i64()}));
+  support.declareExternal(
+      "fgetc", builder.getFunctionType({support.ptr()}, {support.i32()}));
+  support.declareExternal(
+      "fwrite",
+      builder.getFunctionType(
+          {support.ptr(), support.i64(), support.i64(), support.ptr()},
+          {support.i64()}));
+  support.declareExternal(
+      "fclose", builder.getFunctionType({support.ptr()}, {support.i32()}));
+  support.declareExternal(
+      "fflush", builder.getFunctionType({support.ptr()}, {support.i32()}));
+  support.declareExternal(
+      "fileno", builder.getFunctionType({support.ptr()}, {support.i32()}));
+  support.declareExternal(
+      "fseek",
+      builder.getFunctionType({support.ptr(), support.i64(), support.i32()},
+                              {support.i32()}));
+  support.declareExternal(
+      "ftell", builder.getFunctionType({support.ptr()}, {support.i64()}));
+  support.declareExternal(
+      "ungetc", builder.getFunctionType({support.i32(), support.ptr()},
+                                        {support.i32()}));
+  support.declareExternal(
+      "ftruncate", builder.getFunctionType({support.i32(), support.i64()},
+                                           {support.i32()}));
   // Generated per program in the user module (the manifest deallocators);
   // resolved at link time.
   support.declareExternal(
@@ -2973,8 +3439,11 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context) {
   buildWriteBuffered(support);
   buildBoxedIntValue(support);
   buildPrintBytes(support);
-  buildHostPrint(support, "LyHost_Print", /*newline=*/false);
-  buildHostPrint(support, "LyHost_PrintLine", /*newline=*/true);
+  buildHostWriteBytes(support);
+  buildHostSetExitStatus(support);
+  buildHostArgvSupport(support);
+  buildHostFileSupport(support);
+  buildHostBufferSupport(support);
   buildReleasePayloadSlotPtr(support);
   buildReleaseBoxedPayloadRaw(support);
   buildReleaseBoxedPayloadArraySlotRaw(support);

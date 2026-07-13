@@ -118,7 +118,7 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
     func->setAttr(kCallableKwargValueTypeAttr,
                   mlir::TypeAttr::get(sig.kwargType));
   func->setAttr("callable_default_values",
-                callableDefaultValues(builder, callable, sig));
+                emitCallableDefaultValues(callable, sig, symbolName));
   if (callable.kind == "AsyncFunctionDef")
     func->setAttr("ly.async.body_result", mlir::TypeAttr::get(sig.resultType));
   if (sig.isGeneratorFunction)
@@ -287,6 +287,100 @@ Value ModuleEmitter::emitNestedFunctionDecl(const parser::Node &function) {
     return emitNone(function);
   emitCallableFunction(function, symbolName, sig, captures, /*isLambda=*/false);
   return emitFunctionObject(function, symbolName, sig.publicCallable, captures);
+}
+
+// Defaults that are not literal constants (user-type constructors and other
+// expressions) compile into a zero-argument PROVIDER function whose body is
+// the default expression, synthesized as a lambda at the def site. Call
+// sites that omit the argument invoke the provider, so the default is
+// re-evaluated per call (documented deviation from CPython's once-per-def
+// evaluation; the difference is observable only through identity or
+// mutation of the default object).
+mlir::ArrayAttr ModuleEmitter::emitCallableDefaultValues(
+    const parser::Node &function, const FunctionSignature &sig,
+    llvm::StringRef symbolName) {
+  unsigned positionalCount = static_cast<unsigned>(sig.positionalTypes.size());
+  llvm::SmallVector<mlir::Attribute, 8> slots(
+      positionalCount + sig.kwOnlyTypes.size(), builder.getUnitAttr());
+
+  auto emitProvider = [&](const parser::NodePtr &expr,
+                          unsigned slot) -> mlir::Attribute {
+    parser::NodePtr lambda = parser::makeNode("Lambda", expr->range);
+    parser::NodePtr argumentsNode =
+        parser::makeNode("arguments", expr->range);
+    parser::addField(*argumentsNode, "posonlyargs",
+                     std::vector<parser::NodePtr>{});
+    parser::addField(*argumentsNode, "args", std::vector<parser::NodePtr>{});
+    parser::addField(*argumentsNode, "kwonlyargs",
+                     std::vector<parser::NodePtr>{});
+    parser::addField(*argumentsNode, "kw_defaults",
+                     std::vector<parser::NodePtr>{});
+    parser::addField(*argumentsNode, "defaults",
+                     std::vector<parser::NodePtr>{});
+    parser::addField(*lambda, "args", argumentsNode);
+    parser::addField(*lambda, "body", expr);
+    synthesizedDefaultProviders.push_back(lambda);
+
+    // The provider is called without a closure environment, so a default
+    // expression must not capture enclosing locals (module-scope classes,
+    // functions and constants resolve without captures, like in emitLambda).
+    for (const std::string &captureName : lexicalCaptureNames(*lambda)) {
+      if (values.find(captureName) == values.end())
+        continue;
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, expr->range.start,
+          "default expression must not capture enclosing local variable '" +
+              captureName + "'"});
+      return builder.getDictionaryAttr({builder.getNamedAttr(
+          "kind", builder.getStringAttr("unsupported"))});
+    }
+
+    FunctionSignature providerSig = types.functionSignature(*lambda);
+    std::string providerName =
+        (llvm::Twine("__ly.default.") + symbolName + "." +
+         llvm::Twine(slot))
+            .str();
+    emitCallableFunction(*lambda, providerName, providerSig, {},
+                         /*isLambda=*/true);
+    llvm::SmallVector<mlir::NamedAttribute, 2> attrs;
+    attrs.push_back(
+        builder.getNamedAttr("kind", builder.getStringAttr("provider")));
+    attrs.push_back(builder.getNamedAttr(
+        "value", builder.getStringAttr(providerName)));
+    return builder.getDictionaryAttr(attrs);
+  };
+
+  auto attrFor = [&](const parser::NodePtr &node,
+                     unsigned slot) -> mlir::Attribute {
+    mlir::Attribute literal = defaultValueAttr(builder, node.get());
+    auto dict = mlir::dyn_cast_or_null<mlir::DictionaryAttr>(literal);
+    auto kind = dict ? dict.getAs<mlir::StringAttr>("kind")
+                     : mlir::StringAttr();
+    if (node && kind && kind.getValue() == "unsupported")
+      return emitProvider(node, slot);
+    return literal;
+  };
+
+  const parser::Node *arguments = ast::node(function, "args");
+  const auto *defaults =
+      arguments ? ast::nodeList(*arguments, "defaults") : nullptr;
+  if (defaults && !defaults->empty()) {
+    unsigned firstDefault = positionalCount - defaults->size();
+    for (auto [index, value] : llvm::enumerate(*defaults))
+      if (firstDefault + index < slots.size())
+        slots[firstDefault + index] =
+            attrFor(value, firstDefault + static_cast<unsigned>(index));
+  }
+  const auto *kwDefaults =
+      arguments ? ast::nodeList(*arguments, "kw_defaults") : nullptr;
+  if (kwDefaults) {
+    for (auto [index, value] : llvm::enumerate(*kwDefaults)) {
+      unsigned slot = positionalCount + static_cast<unsigned>(index);
+      if (slot < slots.size())
+        slots[slot] = attrFor(value, slot);
+    }
+  }
+  return builder.getArrayAttr(slots);
 }
 
 Value ModuleEmitter::emitLambda(const parser::Node &expr,

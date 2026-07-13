@@ -1,0 +1,12 @@
+preset text
+0
+preset text
+0
+b'preset bytes'
+7
+b'bytes'
+default mode roundtrip
+
+True
+8
+b'mode roundtrip\n'

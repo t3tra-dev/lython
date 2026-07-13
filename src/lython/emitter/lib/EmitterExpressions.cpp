@@ -58,8 +58,16 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
     if (std::optional<Value> constant =
             emitStaticStringConstant(*expr, binding))
       return *constant;
+    if (std::optional<Value> constant = emitStaticIntConstant(*expr, binding))
+      return *constant;
     if (std::optional<Value> constant =
             emitManifestFloatConstant(*expr, binding))
+      return *constant;
+    if (std::optional<Value> constant =
+            emitManifestIntConstant(*expr, binding))
+      return *constant;
+    if (std::optional<Value> constant =
+            emitManifestStrConstant(*expr, binding))
       return *constant;
     if (std::optional<Value> literal =
             emitLiteralTypeConstant(*expr, *symbolType))
@@ -96,7 +104,16 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
         return *constant;
       if (auto symbol = types.lookupSymbol(qualified)) {
         if (std::optional<Value> constant =
+                emitStaticIntConstant(*expr, binding))
+          return *constant;
+        if (std::optional<Value> constant =
                 emitManifestFloatConstant(*expr, binding))
+          return *constant;
+        if (std::optional<Value> constant =
+                emitManifestIntConstant(*expr, binding))
+          return *constant;
+        if (std::optional<Value> constant =
+                emitManifestStrConstant(*expr, binding))
           return *constant;
         if (std::optional<Value> literal =
                 emitLiteralTypeConstant(*expr, *symbol))
@@ -297,6 +314,14 @@ Value ModuleEmitter::emitConstant(const parser::Node &expr) {
     mlir::Type type = types.literal("\"" + std::string(*value) + "\"");
     auto op = py::StrConstantOp::create(builder, loc(expr), type,
                                         builder.getStringAttr(*value));
+    return {op.getResult(), type};
+  }
+  if (const auto *value = ast::bytes(expr, "value")) {
+    mlir::Type type = types.contract("builtins.bytes");
+    auto op = py::BytesConstantOp::create(
+        builder, loc(expr), type,
+        builder.getStringAttr(llvm::StringRef(
+            reinterpret_cast<const char *>(value->data()), value->size())));
     return {op.getResult(), type};
   }
   if (const auto *fieldValue = ast::field(expr, "value")) {
@@ -1089,6 +1114,53 @@ std::optional<Value> ModuleEmitter::emitManifestFloatConstant(
   mlir::Type type = types.floatType();
   auto op = py::FloatConstantOp::create(builder, loc(anchor), type,
                                         builder.getF64FloatAttr(*value));
+  return Value{op.getResult(), type};
+}
+
+std::optional<Value> ModuleEmitter::emitManifestIntConstant(
+    const parser::Node &anchor, llvm::StringRef binding) {
+  const py::protocols::Table &table =
+      py::protocols::Table::get(context);
+  std::optional<long long> value = table.moduleIntConstant(binding);
+  if (!value)
+    return std::nullopt;
+  std::string spelling = std::to_string(*value);
+  mlir::Type type = types.literal(spelling);
+  auto op = py::IntConstantOp::create(builder, loc(anchor), type,
+                                      builder.getStringAttr(spelling));
+  return Value{op.getResult(), type};
+}
+
+std::optional<Value> ModuleEmitter::emitManifestStrConstant(
+    const parser::Node &anchor, llvm::StringRef binding) {
+  const py::protocols::Table &table =
+      py::protocols::Table::get(context);
+  std::optional<std::string> value = table.moduleStrConstant(binding);
+  if (!value)
+    return std::nullopt;
+  mlir::Type type = types.literal("\"" + *value + "\"");
+  auto op = py::StrConstantOp::create(builder, loc(anchor), type,
+                                      builder.getStringAttr(*value));
+  return Value{op.getResult(), type};
+}
+
+std::optional<Value> ModuleEmitter::emitStaticIntConstant(
+    const parser::Node &anchor, llvm::StringRef binding) {
+  if (!py::platform_constants::isStaticIntBinding(binding))
+    return std::nullopt;
+  std::optional<long long> value =
+      py::platform_constants::staticIntValue(binding, options.targetTriple);
+  if (!value) {
+    diagnostics.push_back(
+        parser::Diagnostic{parser::Severity::Error, anchor.range.start,
+                           "unsupported target platform for static constant '" +
+                               std::string(binding) + "'"});
+    return emitNone(anchor);
+  }
+  std::string spelling = std::to_string(*value);
+  mlir::Type type = types.literal(spelling);
+  auto op = py::IntConstantOp::create(builder, loc(anchor), type,
+                                      builder.getStringAttr(spelling));
   return Value{op.getResult(), type};
 }
 

@@ -728,6 +728,22 @@ def Py_FloatConstantOp : Py_Op<"float.constant", []> {
   let hasVerifier = 1;
 }
 
+def Py_BytesConstantOp : Py_Op<"bytes.constant", []> {
+  let summary = "Create a Python bytes literal";
+  let description = [{
+    Produces a `builtins.bytes` contract value from a compile-time byte
+    string attribute (the StrAttr holds the raw bytes, NULs included).
+    `typing.Literal` does support bytes, but the static surface tracks
+    bytes non-literally (no bytes-driven branch folding), so the result is
+    the manifest contract like the float literal.
+  }];
+
+  let arguments = (ins StrAttr:$value);
+  let results = (outs Py_ContractType:$result);
+
+  let assemblyFormat = "$value attr-dict `:` type($result)";
+}
+
 //===----------------------------------------------------------------------===//
 // Type casting operations
 //===----------------------------------------------------------------------===//

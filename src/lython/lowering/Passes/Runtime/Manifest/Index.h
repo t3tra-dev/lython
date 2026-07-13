@@ -16,7 +16,9 @@
 namespace py::lowering {
 
 struct RuntimeDefaultArgument {
-  enum class Kind { I64, F64 };
+  // Str/Bytes defaults materialize a whole object (header + payload), so
+  // they cover several physical inputs starting at inputIndex.
+  enum class Kind { I64, F64, Str, Bytes };
 
   unsigned inputIndex = 0;
   Kind kind = Kind::I64;

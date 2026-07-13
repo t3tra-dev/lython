@@ -216,6 +216,23 @@ public:
   std::vector<std::string>
   moduleFloatConstantExports(llvm::StringRef moduleName) const;
 
+  // Manifest int constants (`ly.typing.int_constant_names`/`_values`,
+  // e.g. sys.hexversion). Same key/list scheme as the float channel. Values
+  // are target-independent; target-dependent int constants (sys.maxsize)
+  // resolve through platform_constants instead.
+  std::optional<long long> moduleIntConstant(llvm::StringRef qualifiedName) const;
+  std::vector<std::string>
+  moduleIntConstantExports(llvm::StringRef moduleName) const;
+
+  // Manifest str constants (`ly.typing.str_constant_names`/`_values`,
+  // e.g. sys.version). Same key/list scheme as the float channel. Values are
+  // target-independent; target-dependent str constants (sys.platform,
+  // sys.byteorder) resolve through platform_constants instead.
+  std::optional<std::string>
+  moduleStrConstant(llvm::StringRef qualifiedName) const;
+  std::vector<std::string>
+  moduleStrConstantExports(llvm::StringRef moduleName) const;
+
   // Enumerates manifest method candidates on a concrete dialect type or an
   // already-erased !py.protocol receiver. Each candidate carries the receiver
   // binding/evidence used to specialize its signature; call-site selection is
@@ -285,6 +302,10 @@ private:
   std::map<std::string, mlir::Type> freeFunctionContracts;
   std::map<std::string, double> floatConstants;
   std::map<std::string, std::vector<std::string>> floatConstantsByModule;
+  std::map<std::string, long long> intConstants;
+  std::map<std::string, std::vector<std::string>> intConstantsByModule;
+  std::map<std::string, std::string> strConstants;
+  std::map<std::string, std::vector<std::string>> strConstantsByModule;
 };
 
 } // namespace py::protocols
