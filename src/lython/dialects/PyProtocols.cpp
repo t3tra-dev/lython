@@ -24,6 +24,8 @@
 #include <tuple>
 #include <utility>
 
+#include "PyDialect.h.inc"
+
 #define GET_OP_CLASSES
 #include "PyOps.h.inc"
 #undef GET_OP_CLASSES
@@ -693,23 +695,25 @@ py::CallableType bindReceiverCallable(py::CallableType signature) {
   return bindReceiverCallableImpl(signature);
 }
 
+TableCache::TableCache(mlir::Dialect *dialect) : Base(dialect) {}
+
+TableCache::~TableCache() = default;
+
 namespace {
 
-std::mutex &tableMutex() {
-  static std::mutex mutex;
-  return mutex;
-}
-
-std::map<mlir::MLIRContext *, std::unique_ptr<Table>> &tableSlots() {
-  static std::map<mlir::MLIRContext *, std::unique_ptr<Table>> tables;
-  return tables;
+TableCache &tableCacheFor(mlir::MLIRContext &context) {
+  auto *dialect = context.getOrLoadDialect<py::PyDialect>();
+  auto *cache = dialect->getRegisteredInterface<TableCache>();
+  assert(cache && "PyDialect::initialize must register protocols::TableCache");
+  return *cache;
 }
 
 } // namespace
 
 const Table &Table::get(mlir::MLIRContext &context) {
-  std::lock_guard<std::mutex> lock(tableMutex());
-  std::unique_ptr<Table> &slot = tableSlots()[&context];
+  TableCache &cache = tableCacheFor(context);
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  std::unique_ptr<Table> &slot = cache.table;
   if (slot)
     return *slot;
   slot = std::make_unique<Table>();
@@ -1013,8 +1017,9 @@ const Table &Table::get(mlir::MLIRContext &context) {
 
 Table &Table::getMutable(mlir::MLIRContext &context) {
   (void)get(context);
-  std::lock_guard<std::mutex> lock(tableMutex());
-  return *tableSlots()[&context];
+  TableCache &cache = tableCacheFor(context);
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  return *cache.table;
 }
 
 void Table::registerClass(llvm::StringRef name, ProtocolInfo info) {

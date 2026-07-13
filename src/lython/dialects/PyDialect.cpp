@@ -1,4 +1,5 @@
 #include "PyDialectTypes.h"
+#include "PyProtocols.h"
 
 #include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/IR/Builders.h"
@@ -30,6 +31,8 @@ void PyDialect::initialize() {
 #define GET_OP_LIST
 #include "PyOps.cpp.inc"
       >();
+
+  addInterfaces<protocols::TableCache>();
 }
 
 mlir::Type PyDialect::parseType(mlir::DialectAsmParser &parser) const {

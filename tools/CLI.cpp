@@ -106,6 +106,8 @@
 #include "Parser.h"
 #include "Passes/Runtime/Arch/Arm/PrimitiveTensorArmSME.h"
 #include "Passes/Runtime/Arch/X86/PrimitiveTensorX86.h"
+#include "Driver.h"
+#include "DriverCodeGen.h"
 #include "SanitizerSupport.h"
 
 #include "PyDialect.h.inc"
@@ -115,336 +117,18 @@
 #undef GET_OP_CLASSES
 
 using namespace mlir;
+using namespace lython::driver;
 
 namespace {
-using lython::driver::SanitizerConfig;
 using py::PerfScope;
 
 #ifndef LYTHON_LLVM_TOOLS_BINARY_DIR
 #define LYTHON_LLVM_TOOLS_BINARY_DIR ""
 #endif
 
-std::string TargetTriple;
-std::string TargetCPU;
-std::string TargetFPU;
-std::string TargetFloatABI;
-std::string TargetSysroot;
+lython::driver::DriverOptions Options;
 std::vector<std::string> IncludeSearchPaths;
 std::vector<std::string> LibrarySearchPaths;
-lython::driver::SanitizerConfig ActiveSanitizers;
-bool ReleaseMode = false;
-
-std::string trimEnvToken(llvm::StringRef token) {
-  token = token.trim();
-  return token.str();
-}
-
-std::string configuredTargetTripleOverride() {
-  return trimEnvToken(TargetTriple);
-}
-
-std::string configuredTargetSysrootOverride() {
-  return trimEnvToken(TargetSysroot);
-}
-
-bool parseConfiguredFloatABI(llvm::FloatABI::ABIType &result) {
-  llvm::StringRef value = TargetFloatABI;
-  value = value.trim();
-  if (value.empty() || value == "default") {
-    result = llvm::FloatABI::Default;
-    return true;
-  }
-  if (value == "soft" || value == "softfp") {
-    result = llvm::FloatABI::Soft;
-    return true;
-  }
-  if (value == "hard") {
-    result = llvm::FloatABI::Hard;
-    return true;
-  }
-  llvm::errs() << "error: unsupported -mfloat-abi value '" << value
-               << "'; expected default, soft, softfp, or hard\n";
-  return false;
-}
-
-std::string hostCPUNameForCodeGen() {
-  llvm::StringRef cpu = llvm::sys::getHostCPUName();
-  if (cpu.empty())
-    return "generic";
-  return cpu.str();
-}
-
-std::string hostCPUFeaturesForCodeGen() {
-  llvm::SubtargetFeatures features;
-  for (const auto &entry : llvm::sys::getHostCPUFeatures())
-    features.AddFeature(entry.getKey(), entry.getValue());
-#if defined(__APPLE__) && defined(__aarch64__)
-  auto addDarwinArmFeature = [&](llvm::StringRef sysctlName,
-                                 llvm::StringRef featureName) {
-    int enabled = 0;
-    size_t size = sizeof(enabled);
-    if (sysctlbyname(sysctlName.str().c_str(), &enabled, &size, nullptr, 0) ==
-            0 &&
-        enabled != 0)
-      features.AddFeature(featureName);
-  };
-  addDarwinArmFeature("hw.optional.arm.FEAT_SME", "sme");
-  addDarwinArmFeature("hw.optional.arm.FEAT_SME2", "sme2");
-#endif
-  return features.getString();
-}
-
-llvm::Triple codeGenTripleForTarget(py::TensorLoweringTarget target) {
-  (void)target;
-  std::string override = configuredTargetTripleOverride();
-  return llvm::Triple(override.empty() ? llvm::sys::getDefaultTargetTriple()
-                                       : override);
-}
-
-bool targetFeatureEnabled(const llvm::Triple &triple, llvm::StringRef feature);
-
-bool targetFeatureStringContains(llvm::StringRef features,
-                                 llvm::StringRef feature) {
-  llvm::SmallVector<llvm::StringRef, 32> tokens;
-  features.split(tokens, ",", /*MaxSplit=*/-1, /*KeepEmpty=*/false);
-  for (llvm::StringRef token : tokens) {
-    token = token.trim();
-    token.consume_front("+");
-    token.consume_front("-");
-    if (token == feature)
-      return true;
-  }
-  return false;
-}
-
-void appendTargetFeature(std::string &features, llvm::StringRef feature) {
-  if (targetFeatureStringContains(features, feature))
-    return;
-  if (!features.empty())
-    features += ",";
-  features += "+";
-  features += feature;
-}
-
-std::string configuredCPUNameForCodeGen(const llvm::Triple &triple) {
-  llvm::StringRef cpu = TargetCPU;
-  if (cpu.empty())
-    return "";
-  if (cpu != "native")
-    return cpu.str();
-
-  llvm::Triple hostTriple(llvm::sys::getDefaultTargetTriple());
-  if (triple.getArch() == hostTriple.getArch())
-    return hostCPUNameForCodeGen();
-  return "";
-}
-
-std::string codeGenCPUNameForTarget(py::TensorLoweringTarget target,
-                                    const llvm::Triple &triple) {
-  std::string configuredCPU = configuredCPUNameForCodeGen(triple);
-  if (!configuredCPU.empty())
-    return configuredCPU;
-  if (target.usesX86AVX2FMA())
-    return "haswell";
-  if (target.usesX86SSE42())
-    return "nehalem";
-  llvm::Triple hostTriple(llvm::sys::getDefaultTargetTriple());
-  if (triple.getArch() == hostTriple.getArch())
-    return hostCPUNameForCodeGen();
-  if (triple.getArch() == llvm::Triple::x86_64)
-    return "x86-64";
-  return "";
-}
-
-std::string codeGenFeaturesForTarget(py::TensorLoweringTarget target,
-                                     const llvm::Triple &triple) {
-  if (target.usesX86AVX2FMA())
-    return "+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+fma";
-  if (target.usesX86SSE42())
-    return "+sse2,+sse3,+ssse3,+sse4.1,+sse4.2";
-  if (target.usesArmSME()) {
-    std::string features;
-    llvm::Triple hostTriple(llvm::sys::getDefaultTargetTriple());
-    if (triple.getArch() == hostTriple.getArch())
-      features = hostCPUFeaturesForCodeGen();
-    appendTargetFeature(features, "sme");
-    if (targetFeatureEnabled(triple, "sme2"))
-      appendTargetFeature(features, "sme2");
-    return features;
-  }
-  llvm::Triple hostTriple(llvm::sys::getDefaultTargetTriple());
-  if (triple.getArch() != hostTriple.getArch())
-    return "";
-  return hostCPUFeaturesForCodeGen();
-}
-
-llvm::ExceptionHandling
-exceptionModelForTargetTriple(const llvm::Triple &triple) {
-  if (triple.isOSWindows())
-    return llvm::ExceptionHandling::WinEH;
-  return llvm::ExceptionHandling::DwarfCFI;
-}
-
-std::unique_ptr<llvm::TargetMachine>
-createCodeGenTargetMachine(py::TensorLoweringTarget target,
-                           std::string *normalizedTriple = nullptr) {
-  llvm::Triple triple(codeGenTripleForTarget(target).normalize());
-  std::string targetTripleName = triple.normalize();
-  if (normalizedTriple)
-    *normalizedTriple = targetTripleName;
-
-  std::string error;
-  const llvm::Target *llvmTarget =
-      llvm::TargetRegistry::lookupTarget(triple, error);
-  if (!llvmTarget) {
-    llvm::errs() << "Failed to lookup target: " << error << "\n";
-    return nullptr;
-  }
-
-  llvm::TargetOptions opt;
-  opt.ExceptionModel = exceptionModelForTargetTriple(triple);
-  opt.MCOptions.EmitCompactUnwindNonCanonical = true;
-  opt.ForceDwarfFrameSection = true;
-  opt.MCOptions.EmitDwarfUnwind = llvm::EmitDwarfUnwindType::Always;
-  if (!parseConfiguredFloatABI(opt.FloatABIType))
-    return nullptr;
-  std::unique_ptr<llvm::TargetMachine> targetMachine(
-      llvmTarget->createTargetMachine(
-          triple, codeGenCPUNameForTarget(target, triple),
-          codeGenFeaturesForTarget(target, triple), opt, std::nullopt));
-  if (!targetMachine)
-    llvm::errs() << "Failed to create target machine for " << targetTripleName
-                 << "\n";
-  return targetMachine;
-}
-
-bool hostFeatureEnabled(llvm::StringRef feature) {
-  auto features = llvm::sys::getHostCPUFeatures();
-  auto found = features.find(feature);
-  if (found != features.end() && found->second)
-    return true;
-
-#if defined(__APPLE__) && defined(__aarch64__)
-  llvm::StringRef sysctlName;
-  if (feature == "sme")
-    sysctlName = "hw.optional.arm.FEAT_SME";
-  else if (feature == "sme2")
-    sysctlName = "hw.optional.arm.FEAT_SME2";
-  if (!sysctlName.empty()) {
-    int enabled = 0;
-    size_t size = sizeof(enabled);
-    return sysctlbyname(sysctlName.str().c_str(), &enabled, &size, nullptr,
-                        0) == 0 &&
-           enabled != 0;
-  }
-#endif
-
-  return false;
-}
-
-bool isHostCodeGenTriple(const llvm::Triple &triple) {
-  return triple.normalize() ==
-         llvm::Triple(llvm::sys::getDefaultTargetTriple()).normalize();
-}
-
-bool featureNameMatches(llvm::StringRef value, llvm::StringRef feature) {
-  value.consume_front("+");
-  return value == feature;
-}
-
-bool x86CPUFeatureEnabled(llvm::StringRef cpu, llvm::StringRef feature) {
-  llvm::SmallVector<llvm::StringRef, 64> features;
-  llvm::X86::getFeaturesForCPU(cpu, features, /*NeedPlus=*/false);
-  return llvm::is_contained(features, feature);
-}
-
-bool aarch64CPUFeatureEnabled(llvm::StringRef cpu, llvm::StringRef feature) {
-  std::optional<llvm::AArch64::CpuInfo> parsed = llvm::AArch64::parseCpu(cpu);
-  if (!parsed)
-    return false;
-  llvm::AArch64::ExtensionSet extensions;
-  extensions.addCPUDefaults(*parsed);
-  std::vector<std::string> features;
-  extensions.toLLVMFeatureList(features);
-  return llvm::any_of(features, [&](llvm::StringRef value) {
-    return featureNameMatches(value, feature);
-  });
-}
-
-bool targetFeatureEnabled(const llvm::Triple &triple, llvm::StringRef feature) {
-  llvm::StringRef cpu = TargetCPU;
-  if (!cpu.empty() && cpu != "native") {
-    if (triple.getArch() == llvm::Triple::x86_64)
-      return x86CPUFeatureEnabled(cpu, feature);
-    if (triple.isAArch64())
-      return aarch64CPUFeatureEnabled(cpu, feature);
-    return false;
-  }
-
-  if (!isHostCodeGenTriple(triple) && cpu != "native")
-    return false;
-  return hostFeatureEnabled(feature);
-}
-
-py::TensorLoweringTarget detectTensorLoweringTarget(llvm::Triple triple) {
-  py::TensorLoweringTarget target;
-  if (triple.isAArch64() && (targetFeatureEnabled(triple, "sme") ||
-                             targetFeatureEnabled(triple, "sme2")))
-    target.architecture = py::TensorLoweringArchitecture::ArmSME;
-  if (triple.getArch() == llvm::Triple::x86_64) {
-    if (targetFeatureEnabled(triple, "avx2") &&
-        targetFeatureEnabled(triple, "fma"))
-      target.architecture = py::TensorLoweringArchitecture::X86AVX2FMA;
-    else if (targetFeatureEnabled(triple, "sse4.2"))
-      target.architecture = py::TensorLoweringArchitecture::X86SSE42;
-  }
-  return target;
-}
-
-std::uint64_t pointerWidthForTarget(const llvm::Triple &triple) {
-  if (triple.isArch64Bit())
-    return 64;
-  if (triple.isArch32Bit())
-    return 32;
-  return 0;
-}
-
-std::uint64_t cLongWidthForTarget(const llvm::Triple &triple,
-                                  std::uint64_t pointerWidth) {
-  if (triple.isOSWindows())
-    return 32;
-  return pointerWidth == 64 ? 64 : 32;
-}
-
-LogicalResult stampTargetPlatformFacts(ModuleOp module,
-                                       py::TensorLoweringTarget tensorTarget) {
-  llvm::Triple triple = codeGenTripleForTarget(tensorTarget);
-  std::uint64_t pointerWidth = pointerWidthForTarget(triple);
-  if (pointerWidth == 0) {
-    llvm::errs() << "error: cannot derive pointer width for target triple '"
-                 << triple.normalize() << "'\n";
-    return failure();
-  }
-
-  Builder builder(module.getContext());
-  module->setAttr("ly.target.triple",
-                  builder.getStringAttr(triple.normalize()));
-  module->setAttr("ly.target.pointer_width",
-                  builder.getI64IntegerAttr(pointerWidth));
-  module->setAttr(
-      "ly.target.c_long_width",
-      builder.getI64IntegerAttr(cLongWidthForTarget(triple, pointerWidth)));
-  return success();
-}
-
-void dumpLLVMForPass(const py::IRDumpConfig &config, llvm::StringRef passName,
-                     llvm::Module &module) {
-  if (!config.shouldDump(passName))
-    return;
-  llvm::errs() << "\n=== [LYTHON_IR_DUMP:" << passName << " LLVM] ===\n";
-  module.print(llvm::errs(), nullptr);
-  llvm::errs() << "\n";
-}
 
 void *armStreamingCompatibleMemcpy(void *dest, const void *src,
                                    std::size_t count) {
@@ -503,14 +187,6 @@ buildRuntimeSymbolMap(llvm::orc::MangleAndInterner interner) {
   return symbolMap;
 }
 
-OwningOpRef<ModuleOp> parseModuleFromBuffer(StringRef buffer,
-                                            MLIRContext &context) {
-  auto module = parseSourceString<ModuleOp>(buffer, &context);
-  if (!module)
-    llvm::errs() << "error: failed to parse MLIR source\n";
-  return module;
-}
-
 LogicalResult runCppParserDump(StringRef inputPath, bool typeComments,
                                bool includeAttributes, bool interactiveMode,
                                bool expressionMode, bool functionTypeMode) {
@@ -548,1138 +224,23 @@ LogicalResult runCppParserDump(StringRef inputPath, bool typeComments,
   return success();
 }
 
-std::string pythonTracebackPath(StringRef inputPath);
-
-const std::vector<lython::parser::NodePtr> *
-nodeListField(const lython::parser::Node &node, StringRef name) {
-  const lython::parser::Field *field =
-      lython::parser::findField(node, name.str());
-  if (!field)
-    return nullptr;
-  return std::get_if<std::vector<lython::parser::NodePtr>>(&field->value);
-}
-
-std::optional<std::string> stringField(const lython::parser::Node &node,
-                                       StringRef name) {
-  const lython::parser::Field *field =
-      lython::parser::findField(node, name.str());
-  if (!field)
-    return std::nullopt;
-  if (const auto *value = std::get_if<std::string>(&field->value))
-    return *value;
-  return std::nullopt;
-}
-
-std::int64_t integerField(const lython::parser::Node &node, StringRef name,
-                          std::int64_t fallback = 0) {
-  const lython::parser::Field *field =
-      lython::parser::findField(node, name.str());
-  if (!field)
-    return fallback;
-  if (const auto *value = std::get_if<std::int64_t>(&field->value))
-    return *value;
-  return fallback;
-}
-
-std::string joinModuleName(StringRef prefix, StringRef suffix) {
-  if (prefix.empty())
-    return suffix.str();
-  if (suffix.empty())
-    return prefix.str();
-  return (Twine(prefix) + "." + suffix).str();
-}
-
-struct LocalSourceModulePath {
-  std::string path;
-  bool isStub = false;
-  bool isPackage = false;
-  bool isEmbedded = false;
-};
-
-const py::runtime_library::embedded::StdlibSourceModule *
-embeddedStdlibSource(StringRef moduleName) {
-  namespace embedded = py::runtime_library::embedded;
-  for (std::size_t index = 0; index < embedded::stdlibSourceModuleCount();
-       ++index) {
-    const embedded::StdlibSourceModule &entry =
-        embedded::stdlibSourceModules()[index];
-    if (moduleName == entry.name)
-      return &entry;
-  }
-  return nullptr;
-}
-
-std::optional<LocalSourceModulePath> localSourceModulePath(StringRef baseDir,
-                                                           StringRef moduleName) {
-  llvm::SmallVector<StringRef, 8> parts;
-  moduleName.split(parts, '.');
-  if (parts.empty())
-    return std::nullopt;
-  llvm::SmallString<256> path(baseDir.empty() ? "." : baseDir);
-  for (StringRef part : parts) {
-    if (part.empty())
-      return std::nullopt;
-    llvm::sys::path::append(path, part);
-  }
-  llvm::SmallString<256> sourcePath(path);
-  sourcePath += ".py";
-  if (llvm::sys::fs::exists(sourcePath))
-    return LocalSourceModulePath{sourcePath.str().str(), false, false};
-
-  llvm::SmallString<256> stubPath(path);
-  stubPath += ".pyi";
-  if (llvm::sys::fs::exists(stubPath))
-    return LocalSourceModulePath{stubPath.str().str(), true, false};
-
-  llvm::SmallString<256> packageSourcePath(path);
-  llvm::sys::path::append(packageSourcePath, "__init__.py");
-  if (llvm::sys::fs::exists(packageSourcePath))
-    return LocalSourceModulePath{packageSourcePath.str().str(), false, true};
-
-  llvm::SmallString<256> packageStubPath(path);
-  llvm::sys::path::append(packageStubPath, "__init__.pyi");
-  if (llvm::sys::fs::exists(packageStubPath))
-    return LocalSourceModulePath{packageStubPath.str().str(), true, true};
-
-  // Embedded stdlib source (runtime/lib/*.py): resolved after user files,
-  // before module manifests; compiled with the program like any source module.
-  if (embeddedStdlibSource(moduleName))
-    return LocalSourceModulePath{("<stdlib>/" + moduleName + ".py").str(),
-                                 false, false, /*isEmbedded=*/true};
-  return std::nullopt;
-}
-
-bool packageInitExists(StringRef directory) {
-  if (directory.empty())
-    return false;
-  llvm::SmallString<256> initPath(directory);
-  llvm::sys::path::append(initPath, "__init__.py");
-  if (llvm::sys::fs::exists(initPath))
-    return true;
-  llvm::SmallString<256> stubPath(directory);
-  llvm::sys::path::append(stubPath, "__init__.pyi");
-  return llvm::sys::fs::exists(stubPath);
-}
-
-std::string staticPackageNameForSourcePath(StringRef sourcePath) {
-  llvm::SmallVector<std::string, 8> reversedParts;
-  llvm::SmallString<256> directory(llvm::sys::path::parent_path(sourcePath));
-  while (!directory.empty() && packageInitExists(directory)) {
-    reversedParts.push_back(llvm::sys::path::filename(directory).str());
-    std::string parent = llvm::sys::path::parent_path(directory).str();
-    directory = parent;
-  }
-
-  std::string packageName;
-  for (auto it = reversedParts.rbegin(), end = reversedParts.rend(); it != end;
-       ++it)
-    packageName = joinModuleName(packageName, *it);
-  return packageName;
-}
-
-std::string packageNameForModuleName(StringRef moduleName) {
-  std::pair<StringRef, StringRef> split = moduleName.rsplit('.');
-  if (split.second.empty())
-    return {};
-  return split.first.str();
-}
-
-std::optional<std::string> relativeBasePackage(StringRef packageName,
-                                               std::int64_t level) {
-  if (level <= 0)
-    return packageName.str();
-  if (packageName.empty())
-    return std::nullopt;
-  llvm::SmallVector<StringRef, 8> parts;
-  packageName.split(parts, '.');
-  if (level > static_cast<std::int64_t>(parts.size()))
-    return std::nullopt;
-
-  std::string resolved;
-  std::size_t keep = parts.size() - static_cast<std::size_t>(level - 1);
-  for (std::size_t index = 0; index < keep; ++index)
-    resolved = joinModuleName(resolved, parts[index]);
-  return resolved;
-}
-
-std::optional<std::string> relativeBaseDirectory(StringRef baseDir,
-                                                 std::int64_t level) {
-  llvm::SmallString<256> directory(baseDir.empty() ? "." : baseDir);
-  for (std::int64_t index = 1; index < level; ++index) {
-    std::string parent = llvm::sys::path::parent_path(directory).str();
-    if (parent.empty())
-      return std::nullopt;
-    directory = parent;
-  }
-  return directory.str().str();
-}
-
-struct SourceImportRequest {
-  std::string moduleName;
-  std::string sourcePath;
-  bool isStub = false;
-  bool isPackage = false;
-  bool isEmbedded = false;
-};
-
-bool appendLocalSourceRequest(
-    llvm::SmallVectorImpl<SourceImportRequest> &requests,
-    StringRef moduleName, std::optional<LocalSourceModulePath> sourcePath,
-    std::set<std::string> *requestedModules = nullptr) {
-  if (!sourcePath)
-    return false;
-  std::string moduleNameText = moduleName.str();
-  if (requestedModules && !requestedModules->insert(moduleNameText).second)
-    return false;
-  requests.push_back(SourceImportRequest{std::move(moduleNameText),
-                                         sourcePath->path,
-                                         sourcePath->isStub,
-                                         sourcePath->isPackage,
-                                         sourcePath->isEmbedded});
-  return true;
-}
-
-void appendDottedImportSourceRequests(
-    llvm::SmallVectorImpl<SourceImportRequest> &requests, StringRef baseDir,
-    StringRef moduleName, std::set<std::string> *requestedModules = nullptr) {
-  llvm::SmallVector<StringRef, 8> parts;
-  moduleName.split(parts, '.');
-  if (parts.empty())
-    return;
-
-  std::string prefix;
-  for (std::size_t index = 0; index + 1 < parts.size(); ++index) {
-    prefix = joinModuleName(prefix, parts[index]);
-    std::optional<LocalSourceModulePath> sourcePath =
-        localSourceModulePath(baseDir, prefix);
-    if (sourcePath && sourcePath->isPackage)
-      appendLocalSourceRequest(requests, prefix, sourcePath, requestedModules);
-  }
-
-  appendLocalSourceRequest(requests, moduleName,
-                           localSourceModulePath(baseDir, moduleName),
-                           requestedModules);
-}
-
-void collectImportedModuleRequests(
-    const lython::parser::Node &module, StringRef baseDir,
-    StringRef packageName,
-    llvm::SmallVectorImpl<SourceImportRequest> &requests) {
-  std::set<std::string> requestedModules;
-  auto appendIfLocal = [&](StringRef moduleName,
-                           std::optional<LocalSourceModulePath> sourcePath) {
-    appendLocalSourceRequest(requests, moduleName, std::move(sourcePath),
-                             &requestedModules);
-  };
-
-  const auto *body = nodeListField(module, "body");
-  if (!body)
-    return;
-  // Module-level `if` bodies participate (the platform-switch idiom, e.g.
-  // `if os.name == "posix": from posix import *`). Discovery collects BOTH
-  // branches: the emitter later folds the test and binds only the taken one,
-  // and dead modules cost only their (DCE-able) compilation.
-  std::vector<const lython::parser::Node *> statements;
-  std::function<void(const std::vector<lython::parser::NodePtr> &)> flatten =
-      [&](const std::vector<lython::parser::NodePtr> &list) {
-        for (const lython::parser::NodePtr &statement : list) {
-          if (!statement)
-            continue;
-          if (statement->kind == "If") {
-            if (const auto *thenBody = nodeListField(*statement, "body"))
-              flatten(*thenBody);
-            if (const auto *elseBody = nodeListField(*statement, "orelse"))
-              flatten(*elseBody);
-            continue;
-          }
-          statements.push_back(statement.get());
-        }
-      };
-  flatten(*body);
-  for (const lython::parser::Node *statementPtr : statements) {
-    const lython::parser::Node *statement = statementPtr;
-    if (statement->kind == "Import") {
-      const auto *aliases = nodeListField(*statement, "names");
-      if (!aliases)
-        continue;
-      for (const lython::parser::NodePtr &alias : *aliases) {
-        if (!alias)
-          continue;
-        if (std::optional<std::string> name = stringField(*alias, "name"))
-          appendDottedImportSourceRequests(requests, baseDir, *name,
-                                           &requestedModules);
-      }
-      continue;
-    }
-    if (statement->kind == "ImportFrom") {
-      std::int64_t level = integerField(*statement, "level");
-      std::optional<std::string> moduleName = stringField(*statement, "module");
-      if (level == 0) {
-        if (moduleName) {
-          appendIfLocal(*moduleName,
-                        localSourceModulePath(baseDir, *moduleName));
-          const auto *aliases = nodeListField(*statement, "names");
-          if (!aliases)
-            continue;
-          for (const lython::parser::NodePtr &alias : *aliases) {
-            if (!alias)
-              continue;
-            std::optional<std::string> name = stringField(*alias, "name");
-            if (!name || *name == "*")
-              continue;
-            std::string submodule = joinModuleName(*moduleName, *name);
-            appendIfLocal(submodule, localSourceModulePath(baseDir, submodule));
-          }
-        }
-        continue;
-      }
-
-      std::optional<std::string> relativePackage =
-          relativeBasePackage(packageName, level);
-      std::optional<std::string> relativeDirectory =
-          relativeBaseDirectory(baseDir, level);
-      if (!relativePackage || !relativeDirectory)
-        continue;
-      if (moduleName) {
-        appendIfLocal(joinModuleName(*relativePackage, *moduleName),
-                      localSourceModulePath(*relativeDirectory, *moduleName));
-        const auto *aliases = nodeListField(*statement, "names");
-        if (!aliases)
-          continue;
-        for (const lython::parser::NodePtr &alias : *aliases) {
-          if (!alias)
-            continue;
-          std::optional<std::string> name = stringField(*alias, "name");
-          if (!name || *name == "*")
-            continue;
-          std::string relativeSubmodule = joinModuleName(*moduleName, *name);
-          appendIfLocal(joinModuleName(*relativePackage, relativeSubmodule),
-                        localSourceModulePath(*relativeDirectory,
-                                              relativeSubmodule));
-        }
-        continue;
-      }
-
-      const auto *aliases = nodeListField(*statement, "names");
-      if (!aliases)
-        continue;
-      for (const lython::parser::NodePtr &alias : *aliases) {
-        if (!alias)
-          continue;
-        std::optional<std::string> name = stringField(*alias, "name");
-        if (!name || *name == "*")
-          continue;
-        appendIfLocal(joinModuleName(*relativePackage, *name),
-                      localSourceModulePath(*relativeDirectory, *name));
-      }
-    }
-  }
-}
-
-struct ParsedLocalSourceModule {
-  std::string moduleName;
-  std::string packageName;
-  std::string sourceName;
-  lython::parser::ParseResult parsed;
-  bool isStub = false;
-  bool isPackage = false;
-};
-
-LogicalResult
-collectLocalSourceModules(const lython::parser::Node &module, StringRef baseDir,
-                          StringRef packageName, StringRef mainPath,
-                          std::vector<ParsedLocalSourceModule> &sources,
-                          std::set<std::string> &seen,
-                          std::set<std::string> &visiting) {
-  llvm::SmallVector<SourceImportRequest, 8> imports;
-  collectImportedModuleRequests(module, baseDir, packageName, imports);
-  for (const SourceImportRequest &request : imports) {
-    if (llvm::StringRef(request.sourcePath) == mainPath)
-      continue;
-    if (seen.find(request.moduleName) != seen.end())
-      continue;
-    if (visiting.find(request.moduleName) != visiting.end()) {
-      llvm::errs() << request.sourcePath
-                   << ": emit error: local source import cycle "
-                   << "involving module '" << request.moduleName << "'\n";
-      return failure();
-    }
-
-    std::unique_ptr<llvm::MemoryBuffer> buffer;
-    if (request.isEmbedded) {
-      const py::runtime_library::embedded::StdlibSourceModule *entry =
-          embeddedStdlibSource(request.moduleName);
-      if (!entry) {
-        llvm::errs() << "error: embedded stdlib module '" << request.moduleName
-                     << "' disappeared from the registry\n";
-        return failure();
-      }
-      buffer = llvm::MemoryBuffer::getMemBuffer(
-          StringRef(reinterpret_cast<const char *>(entry->source),
-                    entry->size),
-          request.sourcePath, /*RequiresNullTerminator=*/false);
-    } else {
-      auto file = llvm::MemoryBuffer::getFile(request.sourcePath);
-      if (!file) {
-        llvm::errs() << "error: could not open input file '"
-                     << request.sourcePath << "'\n";
-        return failure();
-      }
-      buffer = std::move(*file);
-    }
-
-    lython::parser::ParseOptions options;
-    options.typeComments = true;
-    lython::parser::ParseResult parsed = lython::parser::parse(
-        buffer->getBuffer(), request.sourcePath, options);
-    if (!parsed.ok()) {
-      for (const lython::parser::Diagnostic &diagnostic : parsed.diagnostics) {
-        llvm::errs() << request.sourcePath << ':' << diagnostic.location.line
-                     << ':' << diagnostic.location.column
-                     << ": parse error: " << diagnostic.message << "\n";
-      }
-      return failure();
-    }
-
-    visiting.insert(request.moduleName);
-    std::string nestedBaseDir =
-        llvm::sys::path::parent_path(request.sourcePath).str();
-    std::string nestedPackageName = request.isPackage
-                                        ? request.moduleName
-                                        : packageNameForModuleName(
-                                              request.moduleName);
-    if (failed(collectLocalSourceModules(*parsed.tree, nestedBaseDir,
-                                         nestedPackageName, mainPath, sources,
-                                         seen, visiting)))
-      return failure();
-    visiting.erase(request.moduleName);
-    seen.insert(request.moduleName);
-    sources.push_back(ParsedLocalSourceModule{
-        request.moduleName, nestedPackageName,
-        pythonTracebackPath(request.sourcePath), std::move(parsed),
-        request.isStub, request.isPackage});
-  }
-  return success();
-}
-
-LogicalResult generateModuleFromCppFrontend(StringRef pythonFile,
-                                            MLIRContext &context,
-                                            OwningOpRef<ModuleOp> &module) {
-  auto file = llvm::MemoryBuffer::getFile(pythonFile);
-  if (!file) {
-    llvm::errs() << "error: could not open input file '" << pythonFile << "'\n";
-    return failure();
-  }
-
-  lython::parser::ParseOptions options;
-  options.typeComments = true;
-  lython::parser::ParseResult parsed;
-  {
-    PerfScope perf("parse");
-    parsed = lython::parser::parse(file->get()->getBuffer(), pythonFile.str(),
-                                   options);
-  }
-  if (!parsed.ok()) {
-    for (const lython::parser::Diagnostic &diagnostic : parsed.diagnostics) {
-      llvm::errs() << pythonFile << ':' << diagnostic.location.line << ':'
-                   << diagnostic.location.column
-                   << ": parse error: " << diagnostic.message << "\n";
-    }
-    return failure();
-  }
-
-  std::vector<ParsedLocalSourceModule> localSources;
-  std::set<std::string> seenSourceModules;
-  std::set<std::string> visitingSourceModules;
-  llvm::StringRef baseDir = llvm::sys::path::parent_path(pythonFile);
-  std::string mainPackageName = staticPackageNameForSourcePath(pythonFile);
-  if (failed(collectLocalSourceModules(
-          *parsed.tree, baseDir, mainPackageName, pythonFile, localSources,
-          seenSourceModules, visitingSourceModules)))
-    return failure();
-
-  lython::emitter::EmitResult emitted;
-  {
-    PerfScope perf("ir-generation");
-    lython::emitter::EmitOptions emitOptions;
-    emitOptions.sanitizeUndefined = ActiveSanitizers.undefined;
-    emitOptions.mainPackageName = mainPackageName;
-    emitOptions.targetTriple = codeGenTripleForTarget({}).normalize();
-    emitOptions.sourceModules.reserve(localSources.size());
-    for (const ParsedLocalSourceModule &source : localSources) {
-      emitOptions.sourceModules.push_back(
-          lython::emitter::EmitOptions::SourceModule{
-              source.moduleName, source.packageName, source.sourceName,
-              source.parsed.tree.get(), source.isStub});
-    }
-    emitted = lython::emitter::emitModule(*parsed.tree, context, "__main__",
-                                          pythonTracebackPath(pythonFile),
-                                          emitOptions);
-  }
-  if (!emitted.ok()) {
-    for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics) {
-      StringRef diagnosticFile =
-          diagnostic.filename.empty() ? pythonFile : diagnostic.filename;
-      llvm::errs() << diagnosticFile << ':' << diagnostic.location.line << ':'
-                   << diagnostic.location.column
-                   << ": emit error: " << diagnostic.message << "\n";
-    }
-    return failure();
-  }
-
-  module = std::move(emitted.module);
-  return success();
-}
-
-std::string pythonTracebackPath(StringRef inputPath) {
-  if (ReleaseMode) {
-    auto dotPath = [](StringRef path) {
-      llvm::SmallString<256> result(".");
-      llvm::sys::path::append(result, path);
-      return result.str().str();
-    };
-
-    llvm::SmallString<256> absolute(inputPath);
-    if (!llvm::sys::fs::make_absolute(absolute)) {
-      llvm::sys::path::remove_dots(absolute, /*remove_dot_dot=*/true);
-
-      llvm::SmallString<256> current;
-      if (!llvm::sys::fs::current_path(current)) {
-        llvm::sys::path::remove_dots(current, /*remove_dot_dot=*/true);
-
-        llvm::SmallVector<llvm::StringRef, 16> absoluteParts;
-        llvm::SmallVector<llvm::StringRef, 16> currentParts;
-        for (auto it = llvm::sys::path::begin(absolute),
-                  end = llvm::sys::path::end(absolute);
-             it != end; ++it)
-          absoluteParts.push_back(*it);
-        for (auto it = llvm::sys::path::begin(current),
-                  end = llvm::sys::path::end(current);
-             it != end; ++it)
-          currentParts.push_back(*it);
-
-        bool underCurrent = absoluteParts.size() >= currentParts.size();
-        for (unsigned index = 0; underCurrent && index < currentParts.size();
-             ++index)
-          underCurrent = absoluteParts[index] == currentParts[index];
-
-        if (underCurrent) {
-          llvm::SmallString<256> relative(".");
-          for (unsigned index = currentParts.size();
-               index < absoluteParts.size(); ++index)
-            llvm::sys::path::append(relative, absoluteParts[index]);
-          return relative.str().str();
-        }
-      }
-    }
-
-    StringRef filename = llvm::sys::path::filename(inputPath);
-    if (filename.empty())
-      filename = "<unknown>";
-    return dotPath(filename);
-  }
-
-  if (llvm::sys::path::is_absolute(inputPath))
-    return inputPath.str();
-  llvm::SmallString<256> current;
-  if (llvm::sys::fs::current_path(current))
-    return inputPath.str();
-  llvm::sys::path::append(current, inputPath);
-  return current.str().str();
-}
-
-LogicalResult writeLLVMIR(llvm::Module &llvmModule, StringRef outputPath) {
-  std::error_code ec;
-  llvm::raw_fd_ostream out(outputPath, ec, llvm::sys::fs::OF_None);
-  if (ec) {
-    llvm::errs() << "Failed to open output file: " << ec.message() << "\n";
-    return failure();
-  }
-  llvmModule.print(out, nullptr);
-  return success();
-}
-
-LogicalResult installAOTEntryPoint(llvm::Module &llvmModule) {
-  llvm::Function *pythonMain = llvmModule.getFunction("__main__");
-  if (!pythonMain) {
-    llvm::errs() << "error: cannot build executable: missing __main__ entry\n";
-    return failure();
-  }
-  if (!pythonMain->arg_empty() || pythonMain->isVarArg()) {
-    llvm::errs() << "error: cannot build executable: __main__ must not take "
-                    "arguments\n";
-    return failure();
-  }
-
-  if (llvm::Function *existing = llvmModule.getFunction("main")) {
-    if (!existing->isDeclaration()) {
-      llvm::errs()
-          << "error: cannot build executable: symbol 'main' already exists\n";
-      return failure();
-    }
-    existing->eraseFromParent();
-  }
-  constexpr llvm::StringLiteral kAOTEntryThunkName = "__lython_aot_entry";
-  if (llvm::Function *existing = llvmModule.getFunction(kAOTEntryThunkName)) {
-    if (!existing->isDeclaration()) {
-      llvm::errs() << "error: cannot build executable: symbol '"
-                   << kAOTEntryThunkName << "' already exists\n";
-      return failure();
-    }
-    existing->eraseFromParent();
-  }
-
-  llvm::LLVMContext &context = llvmModule.getContext();
-  llvm::Type *voidTy = llvm::Type::getVoidTy(context);
-  llvm::Type *i32 = llvm::Type::getInt32Ty(context);
-  llvm::Type *ptr = llvm::PointerType::getUnqual(context);
-  llvm::FunctionType *entryThunkType =
-      llvm::FunctionType::get(voidTy, /*isVarArg=*/false);
-  llvm::Function *entryThunk =
-      llvm::Function::Create(entryThunkType, llvm::GlobalValue::InternalLinkage,
-                             kAOTEntryThunkName, llvmModule);
-  entryThunk->setUWTableKind(llvm::UWTableKind::Async);
-
-  llvm::BasicBlock *thunkBlock =
-      llvm::BasicBlock::Create(context, "entry", entryThunk);
-  llvm::IRBuilder<> thunkBuilder(thunkBlock);
-  thunkBuilder.CreateCall(pythonMain->getFunctionType(), pythonMain, {});
-  thunkBuilder.CreateRetVoid();
-
-  llvm::FunctionType *mainType =
-      llvm::FunctionType::get(i32, /*isVarArg=*/false);
-  llvm::Function *main = llvm::Function::Create(
-      mainType, llvm::GlobalValue::ExternalLinkage, "main", llvmModule);
-  main->setUWTableKind(llvm::UWTableKind::Async);
-
-  llvm::FunctionType *runnerType =
-      llvm::FunctionType::get(i32, {ptr}, /*isVarArg=*/false);
-  llvm::FunctionCallee runner =
-      llvmModule.getOrInsertFunction("LyRunPythonMain", runnerType);
-
-  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", main);
-  llvm::IRBuilder<> builder(entry);
-  llvm::CallInst *status = builder.CreateCall(runner, {entryThunk});
-  builder.CreateRet(status);
-  return success();
-}
-
-// Lowers LLVM coroutines and runs a standard LLVM module pipeline. MLIR-level
-// passes never ran SROA/mem2reg-class cleanups on the translated IR, so
-// without this the descriptor allocas of every lowered object stay in the
-// frame (~2KB per object-handling call frame) and nothing is ever inlined.
-void runLLVMCoroLowering(
-    llvm::Module &llvmModule, const SanitizerConfig &sanitizers,
-    llvm::TargetMachine *targetMachine = nullptr,
-    llvm::OptimizationLevel optimizationLevel = llvm::OptimizationLevel::O2) {
-  llvm::LoopAnalysisManager loopAM;
-  llvm::FunctionAnalysisManager functionAM;
-  llvm::CGSCCAnalysisManager cgsccAM;
-  llvm::ModuleAnalysisManager moduleAM;
-  llvm::PassBuilder passBuilder(targetMachine);
-  passBuilder.registerModuleAnalyses(moduleAM);
-  passBuilder.registerCGSCCAnalyses(cgsccAM);
-  passBuilder.registerFunctionAnalyses(functionAM);
-  passBuilder.registerLoopAnalyses(loopAM);
-  passBuilder.crossRegisterProxies(loopAM, functionAM, cgsccAM, moduleAM);
-
-  llvm::ModulePassManager modulePM =
-      passBuilder.buildPerModuleDefaultPipeline(optimizationLevel);
-  lython::driver::addSanitizerInstrumentationPasses(modulePM, sanitizers);
-  modulePM.run(llvmModule, moduleAM);
-}
-
-enum class LLVMSafetyEffectKind {
-  AtomicRMW,
-  AtomicCmpXchg,
-  AtomicLoad,
-  AtomicStore,
-};
-
-struct LLVMSafetyContract {
-  int64_t id = -1;
-  std::string functionName;
-  LLVMSafetyEffectKind kind;
-  std::optional<llvm::AtomicRMWInst::BinOp> rmwBinOp;
-  std::optional<int64_t> integerOperand;
-  std::optional<llvm::AtomicOrdering> ordering;
-};
-
-struct LLVMSafetyProfile {
-  llvm::SmallVector<LLVMSafetyContract, 64> contracts;
-};
-
-enum class LLVMSafetyContractCoverage {
-  RequireEveryContract,
-  AllowOptimizerElision,
-};
-
-static constexpr llvm::StringLiteral kLythonSafetyMetadataName{"ly.safety"};
-static constexpr llvm::StringLiteral kLythonSafetyMetadataVersion{
-    "ly.safety.v1"};
-static constexpr llvm::StringLiteral kPySafetyContractIdAttr{
-    "py.safety_contract_id"};
-
-std::optional<LLVMSafetyEffectKind>
-getStructuralSafetyEffectKind(llvm::Instruction &inst) {
-  if (llvm::isa<llvm::AtomicRMWInst>(inst))
-    return LLVMSafetyEffectKind::AtomicRMW;
-  if (llvm::isa<llvm::AtomicCmpXchgInst>(inst))
-    return LLVMSafetyEffectKind::AtomicCmpXchg;
-  if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst))
-    if (load->isAtomic())
-      return LLVMSafetyEffectKind::AtomicLoad;
-  if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst))
-    if (store->isAtomic())
-      return LLVMSafetyEffectKind::AtomicStore;
-  return std::nullopt;
-}
-
-static std::optional<llvm::AtomicRMWInst::BinOp>
-mapAtomicBinOp(LLVM::AtomicBinOp op) {
-  switch (op) {
-  case LLVM::AtomicBinOp::xchg:
-    return llvm::AtomicRMWInst::Xchg;
-  case LLVM::AtomicBinOp::add:
-    return llvm::AtomicRMWInst::Add;
-  case LLVM::AtomicBinOp::sub:
-    return llvm::AtomicRMWInst::Sub;
-  case LLVM::AtomicBinOp::_and:
-    return llvm::AtomicRMWInst::And;
-  case LLVM::AtomicBinOp::nand:
-    return llvm::AtomicRMWInst::Nand;
-  case LLVM::AtomicBinOp::_or:
-    return llvm::AtomicRMWInst::Or;
-  case LLVM::AtomicBinOp::_xor:
-    return llvm::AtomicRMWInst::Xor;
-  case LLVM::AtomicBinOp::max:
-    return llvm::AtomicRMWInst::Max;
-  case LLVM::AtomicBinOp::min:
-    return llvm::AtomicRMWInst::Min;
-  case LLVM::AtomicBinOp::umax:
-    return llvm::AtomicRMWInst::UMax;
-  case LLVM::AtomicBinOp::umin:
-    return llvm::AtomicRMWInst::UMin;
-  case LLVM::AtomicBinOp::fadd:
-    return llvm::AtomicRMWInst::FAdd;
-  case LLVM::AtomicBinOp::fsub:
-    return llvm::AtomicRMWInst::FSub;
-  case LLVM::AtomicBinOp::fmax:
-    return llvm::AtomicRMWInst::FMax;
-  case LLVM::AtomicBinOp::fmin:
-    return llvm::AtomicRMWInst::FMin;
-  case LLVM::AtomicBinOp::fmaximum:
-    return llvm::AtomicRMWInst::FMaximum;
-  case LLVM::AtomicBinOp::fminimum:
-    return llvm::AtomicRMWInst::FMinimum;
-  case LLVM::AtomicBinOp::uinc_wrap:
-    return llvm::AtomicRMWInst::UIncWrap;
-  case LLVM::AtomicBinOp::udec_wrap:
-    return llvm::AtomicRMWInst::UDecWrap;
-  case LLVM::AtomicBinOp::usub_cond:
-    return llvm::AtomicRMWInst::USubCond;
-  case LLVM::AtomicBinOp::usub_sat:
-    return llvm::AtomicRMWInst::USubSat;
-  }
-  return std::nullopt;
-}
-
-static std::optional<llvm::AtomicOrdering>
-mapAtomicOrdering(LLVM::AtomicOrdering ordering) {
-  switch (ordering) {
-  case LLVM::AtomicOrdering::not_atomic:
-    return llvm::AtomicOrdering::NotAtomic;
-  case LLVM::AtomicOrdering::unordered:
-    return llvm::AtomicOrdering::Unordered;
-  case LLVM::AtomicOrdering::monotonic:
-    return llvm::AtomicOrdering::Monotonic;
-  case LLVM::AtomicOrdering::acquire:
-    return llvm::AtomicOrdering::Acquire;
-  case LLVM::AtomicOrdering::release:
-    return llvm::AtomicOrdering::Release;
-  case LLVM::AtomicOrdering::acq_rel:
-    return llvm::AtomicOrdering::AcquireRelease;
-  case LLVM::AtomicOrdering::seq_cst:
-    return llvm::AtomicOrdering::SequentiallyConsistent;
-  }
-  return std::nullopt;
-}
-
-static std::optional<int64_t> mlirIntegerConstant(Value value) {
-  if (auto constant = value.getDefiningOp<LLVM::ConstantOp>())
-    if (auto attr = dyn_cast<IntegerAttr>(constant.getValue()))
-      return attr.getValue().getSExtValue();
-  return std::nullopt;
-}
-
-static std::optional<int64_t> llvmIntegerConstant(llvm::Value *value) {
-  auto *constant = llvm::dyn_cast_or_null<llvm::ConstantInt>(value);
-  if (!constant)
-    return std::nullopt;
-  return constant->getSExtValue();
-}
-
-static bool sameAtomicRMWBinOp(llvm::AtomicRMWInst::BinOp actual,
-                               const LLVMSafetyContract &contract) {
-  if (!contract.rmwBinOp)
-    return true;
-  if (actual == *contract.rmwBinOp)
-    return true;
-
-  // LLVM's O2 pipeline canonicalizes no-op integer atomic reads in some
-  // inlined helpers from `atomicrmw add 0` to `atomicrmw or 0`. The MLIR
-  // thread-safety verifier has already validated the source contract, so keep
-  // the post-optimization metadata check semantic for this one no-op shape.
-  if (contract.integerOperand && *contract.integerOperand == 0 &&
-      *contract.rmwBinOp == llvm::AtomicRMWInst::Add &&
-      actual == llvm::AtomicRMWInst::Or)
-    return true;
-
-  return false;
-}
-
-static bool instructionMatchesContract(llvm::Instruction &inst,
-                                       const LLVMSafetyContract &contract) {
-  switch (contract.kind) {
-  case LLVMSafetyEffectKind::AtomicRMW: {
-    auto *rmw = llvm::dyn_cast<llvm::AtomicRMWInst>(&inst);
-    if (!rmw)
-      return false;
-    if (!sameAtomicRMWBinOp(rmw->getOperation(), contract))
-      return false;
-    if (contract.integerOperand) {
-      std::optional<int64_t> actual = llvmIntegerConstant(rmw->getValOperand());
-      if (!actual || *actual != *contract.integerOperand)
-        return false;
-    }
-    if (contract.ordering && rmw->getOrdering() != *contract.ordering)
-      return false;
-    return true;
-  }
-  case LLVMSafetyEffectKind::AtomicCmpXchg:
-    return llvm::isa<llvm::AtomicCmpXchgInst>(inst);
-  case LLVMSafetyEffectKind::AtomicLoad: {
-    auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst);
-    return load && load->isAtomic() &&
-           (!contract.ordering || load->getOrdering() == *contract.ordering);
-  }
-  case LLVMSafetyEffectKind::AtomicStore: {
-    auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
-    return store && store->isAtomic() &&
-           (!contract.ordering || store->getOrdering() == *contract.ordering);
-  }
-  }
-  return false;
-}
-
-static std::optional<int64_t>
-recoverDroppedAtomicRMWContract(llvm::Instruction &inst,
-                                const LLVMSafetyProfile &profile,
-                                llvm::ArrayRef<unsigned> reserved) {
-  if (!llvm::isa<llvm::AtomicRMWInst>(&inst))
-    return std::nullopt;
-
-  llvm::Function *function = inst.getFunction();
-  if (!function)
-    return std::nullopt;
-  std::optional<int64_t> fallback;
-  for (const LLVMSafetyContract &contract : profile.contracts) {
-    if (contract.functionName != function->getName())
-      continue;
-    if (contract.kind != LLVMSafetyEffectKind::AtomicRMW)
-      continue;
-    if (!instructionMatchesContract(inst, contract))
-      continue;
-    if (contract.id >= 0 &&
-        static_cast<size_t>(contract.id) < reserved.size() &&
-        reserved[static_cast<size_t>(contract.id)] == 0)
-      return contract.id;
-    if (!fallback)
-      fallback = contract.id;
-  }
-  return fallback;
-}
-
-static std::optional<int64_t>
-recoverDroppedSafetyContract(llvm::Instruction &inst,
-                             const LLVMSafetyProfile &profile,
-                             llvm::ArrayRef<unsigned> reserved) {
-  return recoverDroppedAtomicRMWContract(inst, profile, reserved);
-}
-
-void collectLLVMSafetyContracts(ModuleOp module, LLVMSafetyProfile &profile) {
-  module.walk([&](LLVM::LLVMFuncOp func) {
-    for (Block &block : func.getBody()) {
-      for (Operation &op : block) {
-        LLVMSafetyContract contract;
-        contract.id = static_cast<int64_t>(profile.contracts.size());
-        contract.functionName = func.getName().str();
-        auto markContract = [&] {
-          op.setAttr(kPySafetyContractIdAttr,
-                     IntegerAttr::get(IntegerType::get(op.getContext(), 64),
-                                      contract.id));
-          profile.contracts.push_back(std::move(contract));
-        };
-
-        if (auto atomic = dyn_cast<LLVM::AtomicRMWOp>(&op)) {
-          contract.kind = LLVMSafetyEffectKind::AtomicRMW;
-          contract.rmwBinOp = mapAtomicBinOp(atomic.getBinOp());
-          contract.integerOperand = mlirIntegerConstant(atomic.getVal());
-          contract.ordering = mapAtomicOrdering(atomic.getOrdering());
-          markContract();
-          continue;
-        }
-
-        if (auto cmpxchg = dyn_cast<LLVM::AtomicCmpXchgOp>(&op)) {
-          contract.kind = LLVMSafetyEffectKind::AtomicCmpXchg;
-          markContract();
-          continue;
-        }
-
-        if (auto load = dyn_cast<LLVM::LoadOp>(&op)) {
-          if (load.getOrdering() == LLVM::AtomicOrdering::not_atomic)
-            continue;
-          contract.kind = LLVMSafetyEffectKind::AtomicLoad;
-          contract.ordering = mapAtomicOrdering(load.getOrdering());
-          markContract();
-          continue;
-        }
-
-        if (auto store = dyn_cast<LLVM::StoreOp>(&op)) {
-          if (store.getOrdering() == LLVM::AtomicOrdering::not_atomic)
-            continue;
-          contract.kind = LLVMSafetyEffectKind::AtomicStore;
-          contract.ordering = mapAtomicOrdering(store.getOrdering());
-          markContract();
-        }
-      }
-    }
-  });
-}
-
-void setLythonSafetyMetadataId(llvm::Instruction &inst, int64_t id) {
-  llvm::LLVMContext &ctx = inst.getContext();
-  llvm::Metadata *operands[] = {
-      llvm::MDString::get(ctx, kLythonSafetyMetadataVersion),
-      llvm::ConstantAsMetadata::get(
-          llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx), id))};
-  inst.setMetadata(kLythonSafetyMetadataName, llvm::MDNode::get(ctx, operands));
-}
-
-std::optional<int64_t> getLythonSafetyMetadataId(llvm::Instruction &inst) {
-  llvm::MDNode *node = inst.getMetadata(kLythonSafetyMetadataName);
-  if (!node || node->getNumOperands() != 2)
-    return std::nullopt;
-  auto *version = llvm::dyn_cast<llvm::MDString>(node->getOperand(0));
-  if (!version || version->getString() != kLythonSafetyMetadataVersion)
-    return std::nullopt;
-  auto *constant =
-      llvm::dyn_cast<llvm::ConstantAsMetadata>(node->getOperand(1));
-  if (!constant)
-    return std::nullopt;
-  auto *intConstant = llvm::dyn_cast<llvm::ConstantInt>(constant->getValue());
-  if (!intConstant)
-    return std::nullopt;
-  return intConstant->getSExtValue();
-}
-
-void collectLinkedLLVMSafetyContracts(llvm::Module &llvmModule,
-                                      LLVMSafetyProfile &profile) {
-  for (llvm::Function &function : llvmModule) {
-    for (llvm::BasicBlock &block : function) {
-      for (llvm::Instruction &inst : block) {
-        if (getLythonSafetyMetadataId(inst))
-          continue;
-
-        LLVMSafetyContract contract;
-        contract.id = static_cast<int64_t>(profile.contracts.size());
-        contract.functionName = function.getName().str();
-
-        if (auto *rmw = llvm::dyn_cast<llvm::AtomicRMWInst>(&inst)) {
-          contract.kind = LLVMSafetyEffectKind::AtomicRMW;
-          contract.rmwBinOp = rmw->getOperation();
-          contract.integerOperand = llvmIntegerConstant(rmw->getValOperand());
-          contract.ordering = rmw->getOrdering();
-        } else if (llvm::isa<llvm::AtomicCmpXchgInst>(inst)) {
-          contract.kind = LLVMSafetyEffectKind::AtomicCmpXchg;
-        } else if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
-          if (!load->isAtomic())
-            continue;
-          contract.kind = LLVMSafetyEffectKind::AtomicLoad;
-          contract.ordering = load->getOrdering();
-        } else if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
-          if (!store->isAtomic())
-            continue;
-          contract.kind = LLVMSafetyEffectKind::AtomicStore;
-          contract.ordering = store->getOrdering();
-        } else {
-          continue;
-        }
-
-        setLythonSafetyMetadataId(inst, contract.id);
-        profile.contracts.push_back(std::move(contract));
-      }
-    }
-  }
-}
-
-class PySafetyLLVMIRTranslationInterface final
-    : public LLVMTranslationDialectInterface {
-public:
-  using LLVMTranslationDialectInterface::LLVMTranslationDialectInterface;
-
-  LogicalResult amendOperation(Operation *op,
-                               ArrayRef<llvm::Instruction *> instructions,
-                               NamedAttribute attribute,
-                               LLVM::ModuleTranslation &) const final {
-    if (attribute.getName() != kPySafetyContractIdAttr)
-      return success();
-    auto idAttr = dyn_cast<IntegerAttr>(attribute.getValue());
-    if (!idAttr)
-      return op->emitOpError("py.safety_contract_id must be an integer");
-    int64_t id = idAttr.getInt();
-    for (llvm::Instruction *instruction : instructions)
-      setLythonSafetyMetadataId(*instruction, id);
-    return success();
-  }
-};
-
-void registerPySafetyLLVMIRTranslation(DialectRegistry &registry) {
-  registry.addExtension(+[](MLIRContext *, py::PyDialect *dialect) {
-    dialect->addInterfaces<PySafetyLLVMIRTranslationInterface>();
-  });
-}
-
-void emitLLVMSafetyVerifierError(llvm::Instruction &inst, llvm::StringRef msg);
-
-LogicalResult verifyLLVMIRSafetyMetadataPreserved(
-    llvm::Module &llvmModule, const LLVMSafetyProfile &profile,
-    llvm::StringRef label, LLVMSafetyContractCoverage coverage) {
-  std::vector<unsigned> used(profile.contracts.size(), 0);
-  std::vector<unsigned> reserved(profile.contracts.size(), 0);
-  bool failedAny = false;
-
-  for (llvm::Function &function : llvmModule) {
-    for (llvm::BasicBlock &block : function) {
-      for (llvm::Instruction &inst : block) {
-        if (auto id = getLythonSafetyMetadataId(inst))
-          if (*id >= 0 && static_cast<size_t>(*id) < reserved.size())
-            ++reserved[static_cast<size_t>(*id)];
-      }
-    }
-  }
-
-  for (llvm::Function &function : llvmModule) {
-    for (llvm::BasicBlock &block : function) {
-      for (llvm::Instruction &inst : block) {
-        auto id = getLythonSafetyMetadataId(inst);
-        if (!id) {
-          if (auto recovered =
-                  recoverDroppedSafetyContract(inst, profile, reserved)) {
-            setLythonSafetyMetadataId(inst, *recovered);
-            id = recovered;
-            if (*recovered >= 0 &&
-                static_cast<size_t>(*recovered) < reserved.size())
-              ++reserved[static_cast<size_t>(*recovered)];
-          } else if (getStructuralSafetyEffectKind(inst)) {
-            emitLLVMSafetyVerifierError(
-                inst, "LLVM atomic safety effect has no preserved MLIR "
-                      "contract id");
-            failedAny = true;
-          }
-          if (!id)
-            continue;
-        }
-        if (*id < 0 || static_cast<size_t>(*id) >= profile.contracts.size()) {
-          emitLLVMSafetyVerifierError(
-              inst, "LLVM IR safety effect has no preserved MLIR contract id");
-          failedAny = true;
-          continue;
-        }
-
-        const LLVMSafetyContract &contract =
-            profile.contracts[static_cast<size_t>(*id)];
-        if (!instructionMatchesContract(inst, contract)) {
-          emitLLVMSafetyVerifierError(
-              inst, "LLVM IR safety effect shape differs from MLIR contract "
-                    "id");
-          failedAny = true;
-          continue;
-        }
-        ++used[static_cast<size_t>(*id)];
-      }
-    }
-  }
-
-  if (coverage == LLVMSafetyContractCoverage::RequireEveryContract) {
-    for (auto indexed : llvm::enumerate(used)) {
-      if (indexed.value() != 0)
-        continue;
-      const LLVMSafetyContract &contract = profile.contracts[indexed.index()];
-      llvm::errs() << "error: " << label << ": MLIR safety contract for @"
-                   << contract.functionName << " was not preserved"
-                   << " (kind=" << static_cast<int>(contract.kind);
-      if (contract.rmwBinOp)
-        llvm::errs() << ", rmw=" << static_cast<int>(*contract.rmwBinOp);
-      if (contract.integerOperand)
-        llvm::errs() << ", value=" << *contract.integerOperand;
-      if (contract.ordering)
-        llvm::errs() << ", ordering=" << static_cast<int>(*contract.ordering);
-      llvm::errs() << ")\n";
-      failedAny = true;
-    }
-  }
-
-  return failure(failedAny);
-}
-
-LogicalResult
-verifyLLVMIRSafetyMetadataAttached(llvm::Module &llvmModule,
-                                   const LLVMSafetyProfile &profile) {
-  return verifyLLVMIRSafetyMetadataPreserved(
-      llvmModule, profile, "LLVM IR safety metadata verifier",
-      LLVMSafetyContractCoverage::RequireEveryContract);
-}
-
-void emitLLVMSafetyVerifierError(llvm::Instruction &inst, llvm::StringRef msg) {
-  llvm::errs() << "error: LLVM safety verifier: " << msg << "\n";
-  if (llvm::Function *function = inst.getFunction())
-    llvm::errs() << "  in function: " << function->getName() << "\n";
-  llvm::errs() << "  instruction: " << inst << "\n";
-}
-
-LogicalResult verifyPostCoroLLVMThreadSafe(
-    llvm::Module &llvmModule, const LLVMSafetyProfile &profile,
-    LLVMSafetyContractCoverage coverage =
-        LLVMSafetyContractCoverage::RequireEveryContract) {
-  if (llvm::verifyModule(llvmModule, &llvm::errs()))
-    return failure();
-
-  return verifyLLVMIRSafetyMetadataPreserved(
-      llvmModule, profile, "post-coro LLVM safety verifier", coverage);
-}
-
-LogicalResult verifyOptimizedLLVMThreadSafe(llvm::Module &llvmModule,
-                                            const LLVMSafetyProfile &profile) {
-  return verifyPostCoroLLVMThreadSafe(
-      llvmModule, profile, LLVMSafetyContractCoverage::AllowOptimizerElision);
-}
-
 LogicalResult emitObjectFile(llvm::Module &llvmModule,
                              LLVMSafetyProfile &safetyProfile,
                              py::TensorLoweringTarget tensorTarget,
                              StringRef objectPath) {
   std::string targetTriple;
-  auto targetMachine = createCodeGenTargetMachine(tensorTarget, &targetTriple);
+  auto targetMachine = createCodeGenTargetMachine(tensorTarget, Options,
+                                                  &targetTriple, llvm::errs());
   if (!targetMachine)
     return failure();
   llvmModule.setTargetTriple(llvm::Triple(targetTriple));
   llvmModule.setDataLayout(targetMachine->createDataLayout());
-  runLLVMCoroLowering(llvmModule, ActiveSanitizers, targetMachine.get());
-  if (!ReleaseMode)
+  runLLVMCoroLowering(llvmModule, Options.sanitizers, targetMachine.get());
+  if (!Options.releaseMode)
     collectLinkedLLVMSafetyContracts(llvmModule, safetyProfile);
-  if (!ReleaseMode &&
-      failed(verifyOptimizedLLVMThreadSafe(llvmModule, safetyProfile)))
+  if (!Options.releaseMode &&
+      failed(verifyOptimizedLLVMThreadSafe(llvmModule, safetyProfile,
+                                           llvm::errs())))
     return failure();
 
   std::error_code ec;
@@ -1697,44 +258,6 @@ LogicalResult emitObjectFile(llvm::Module &llvmModule,
   }
   pass.run(llvmModule);
   return success();
-}
-
-LogicalResult
-configureLLVMModuleCodeGenTarget(llvm::Module &llvmModule,
-                                 py::TensorLoweringTarget tensorTarget) {
-  std::string targetTriple;
-  auto targetMachine = createCodeGenTargetMachine(tensorTarget, &targetTriple);
-  if (!targetMachine)
-    return failure();
-
-  llvmModule.setTargetTriple(llvm::Triple(targetTriple));
-  llvmModule.setDataLayout(targetMachine->createDataLayout());
-  return success();
-}
-
-llvm::StringRef exceptionPersonalityForTarget(const llvm::Triple &triple) {
-  if (triple.isWindowsGNUEnvironment())
-    return "__gxx_personality_seh0";
-  return "__gxx_personality_v0";
-}
-
-void rewriteExceptionPersonalityForTarget(llvm::Module &llvmModule) {
-  llvm::Triple triple(llvmModule.getTargetTriple());
-  llvm::StringRef personalityName = exceptionPersonalityForTarget(triple);
-  if (personalityName == "__gxx_personality_v0")
-    return;
-
-  llvm::LLVMContext &context = llvmModule.getContext();
-  llvm::FunctionType *personalityType = llvm::FunctionType::get(
-      llvm::Type::getInt32Ty(context), /*isVarArg=*/true);
-  llvm::Function *personalityFn = llvmModule.getFunction(personalityName);
-  if (!personalityFn)
-    personalityFn = llvm::Function::Create(personalityType,
-                                           llvm::GlobalValue::ExternalLinkage,
-                                           personalityName, llvmModule);
-
-  if (llvm::Function *itanium = llvmModule.getFunction("__gxx_personality_v0"))
-    itanium->replaceAllUsesWith(personalityFn);
 }
 
 enum class LinkerDriverFlavor {
@@ -1792,7 +315,7 @@ std::optional<std::string> findMinGWLinkerDriver(const llvm::Triple &triple) {
 
 std::optional<LinkerDriver>
 findExecutableLinkerDriver(py::TensorLoweringTarget tensorTarget) {
-  llvm::Triple targetTriple = codeGenTripleForTarget(tensorTarget);
+  llvm::Triple targetTriple = codeGenTripleForTarget(tensorTarget, Options);
   if (targetTriple.isWindowsGNUEnvironment()) {
     if (auto mingw = findMinGWLinkerDriver(targetTriple))
       return LinkerDriver{*mingw, LinkerDriverFlavor::MinGWGcc};
@@ -1811,9 +334,9 @@ findExecutableLinkerDriver(py::TensorLoweringTarget tensorTarget) {
 void appendLinkTargetArgs(std::vector<std::string> &args,
                           py::TensorLoweringTarget tensorTarget,
                           LinkerDriverFlavor driverFlavor) {
-  llvm::Triple targetTriple = codeGenTripleForTarget(tensorTarget);
+  llvm::Triple targetTriple = codeGenTripleForTarget(tensorTarget, Options);
   llvm::Triple hostTriple(llvm::sys::getDefaultTargetTriple());
-  std::string sysroot = configuredTargetSysrootOverride();
+  std::string sysroot = configuredTargetSysrootOverride(Options);
   if (driverFlavor == LinkerDriverFlavor::Clang &&
       targetTriple.normalize() != hostTriple.normalize()) {
     args.emplace_back("-target");
@@ -1821,12 +344,13 @@ void appendLinkTargetArgs(std::vector<std::string> &args,
   }
   if (!sysroot.empty())
     args.emplace_back("--sysroot=" + sysroot);
-  if (driverFlavor == LinkerDriverFlavor::Clang && !TargetCPU.empty())
-    args.emplace_back("-mcpu=" + TargetCPU);
-  if (driverFlavor == LinkerDriverFlavor::Clang && !TargetFPU.empty())
-    args.emplace_back("-mfpu=" + TargetFPU);
-  if (driverFlavor == LinkerDriverFlavor::Clang && !TargetFloatABI.empty())
-    args.emplace_back("-mfloat-abi=" + TargetFloatABI);
+  if (driverFlavor == LinkerDriverFlavor::Clang && !Options.targetCPU.empty())
+    args.emplace_back("-mcpu=" + Options.targetCPU);
+  if (driverFlavor == LinkerDriverFlavor::Clang && !Options.targetFPU.empty())
+    args.emplace_back("-mfpu=" + Options.targetFPU);
+  if (driverFlavor == LinkerDriverFlavor::Clang &&
+      !Options.targetFloatABI.empty())
+    args.emplace_back("-mfloat-abi=" + Options.targetFloatABI);
   for (const std::string &path : IncludeSearchPaths)
     args.emplace_back("-I" + path);
   for (const std::string &path : LibrarySearchPaths)
@@ -1857,7 +381,7 @@ void appendSanitizerLinkArgs(std::vector<std::string> &args,
 
 void appendLinkTargetLibraries(std::vector<std::string> &args,
                                py::TensorLoweringTarget tensorTarget) {
-  llvm::Triple targetTriple = codeGenTripleForTarget(tensorTarget);
+  llvm::Triple targetTriple = codeGenTripleForTarget(tensorTarget, Options);
   if (!targetTriple.isWindowsGNUEnvironment())
     return;
   args.emplace_back("-Wl,-Bstatic");
@@ -1890,7 +414,8 @@ LogicalResult linkExecutable(StringRef objectPath,
   std::optional<LinkerDriver> linker = findExecutableLinkerDriver(tensorTarget);
   if (!linker)
     return failure();
-  if (ActiveSanitizers.any() && linker->flavor != LinkerDriverFlavor::Clang) {
+  if (Options.sanitizers.any() &&
+      linker->flavor != LinkerDriverFlavor::Clang) {
     llvm::errs() << "error: -fsanitize is only supported with the clang linker "
                     "driver\n";
     return failure();
@@ -1899,122 +424,16 @@ LogicalResult linkExecutable(StringRef objectPath,
   std::vector<std::string> argStorage;
   argStorage.push_back(linker->program);
   appendLinkTargetArgs(argStorage, tensorTarget, linker->flavor);
-  appendSanitizerLinkArgs(argStorage, ActiveSanitizers);
+  appendSanitizerLinkArgs(argStorage, Options.sanitizers);
   argStorage.emplace_back(objectPath.str());
   appendLinkTargetLibraries(argStorage, tensorTarget);
   argStorage.emplace_back("-O2");
-  if (codeGenTripleForTarget(tensorTarget).isOSLinux())
+  if (codeGenTripleForTarget(tensorTarget, Options).isOSLinux())
     argStorage.emplace_back("-no-pie");
   argStorage.emplace_back("-o");
   argStorage.emplace_back(outputPath.str());
 
   return runLinkerCommand(linker->program, argStorage, "error: linking failed");
-}
-
-std::optional<FileLineColLoc> findPythonSourceLoc(Location loc) {
-  if (auto fileLoc = dyn_cast<FileLineColLoc>(loc)) {
-    if (fileLoc.getFilename().getValue().ends_with(".py"))
-      return fileLoc;
-    return std::nullopt;
-  }
-  if (auto nameLoc = dyn_cast<NameLoc>(loc))
-    return findPythonSourceLoc(nameLoc.getChildLoc());
-  if (auto fused = dyn_cast<FusedLoc>(loc)) {
-    for (Location child : fused.getLocations())
-      if (auto found = findPythonSourceLoc(child))
-        return found;
-  }
-  return std::nullopt;
-}
-
-struct PythonDebugScopeCache {
-  MLIRContext *context;
-  llvm::StringMap<LLVM::DIFileAttr> files;
-  llvm::StringMap<LLVM::DICompileUnitAttr> compileUnits;
-
-  explicit PythonDebugScopeCache(MLIRContext *context) : context(context) {}
-
-  LLVM::DIFileAttr fileFor(StringRef sourcePath) {
-    if (auto found = files.find(sourcePath); found != files.end())
-      return found->second;
-
-    StringRef directory = llvm::sys::path::parent_path(sourcePath);
-    StringRef basename = llvm::sys::path::filename(sourcePath);
-    if (directory.empty())
-      directory = ".";
-    LLVM::DIFileAttr file = LLVM::DIFileAttr::get(context, basename, directory);
-    files[sourcePath] = file;
-    return file;
-  }
-
-  LLVM::DICompileUnitAttr compileUnitFor(StringRef sourcePath) {
-    if (auto found = compileUnits.find(sourcePath); found != compileUnits.end())
-      return found->second;
-
-    LLVM::DICompileUnitAttr unit = LLVM::DICompileUnitAttr::get(
-        DistinctAttr::create(UnitAttr::get(context)),
-        llvm::dwarf::DW_LANG_Python, fileFor(sourcePath),
-        StringAttr::get(context, "lython"),
-        /*isOptimized=*/true, LLVM::DIEmissionKind::LineTablesOnly);
-    compileUnits[sourcePath] = unit;
-    return unit;
-  }
-};
-
-Location scopedPythonDebugLoc(Location loc, LLVM::DISubprogramAttr scope) {
-  if (loc->findInstanceOf<FusedLocWith<LLVM::DILocalScopeAttr>>())
-    return loc;
-  return FusedLoc::get(loc.getContext(), {loc}, scope);
-}
-
-void attachPythonDebugInfo(ModuleOp module) {
-  PythonDebugScopeCache cache(module.getContext());
-  LLVM::DINullTypeAttr voidType =
-      LLVM::DINullTypeAttr::get(module.getContext());
-  LLVM::DISubroutineTypeAttr subroutineType = LLVM::DISubroutineTypeAttr::get(
-      module.getContext(), ArrayRef<LLVM::DITypeAttr>{voidType});
-
-  module.walk([&](LLVM::LLVMFuncOp function) {
-    if (function.getLoc()
-            ->findInstanceOf<FusedLocWith<LLVM::DISubprogramAttr>>())
-      return;
-
-    std::optional<FileLineColLoc> sourceLoc =
-        findPythonSourceLoc(function.getLoc());
-    if (!sourceLoc)
-      return;
-
-    StringRef sourcePath = sourceLoc->getFilename().getValue();
-    LLVM::DIFileAttr file = cache.fileFor(sourcePath);
-    LLVM::DICompileUnitAttr compileUnit = cache.compileUnitFor(sourcePath);
-    StringRef linkageName = function.getSymName();
-    StringRef displayName =
-        linkageName == "__main__" ? "<module>" : linkageName;
-    uint32_t flagBits =
-        static_cast<uint32_t>(LLVM::DISubprogramFlags::Definition) |
-        static_cast<uint32_t>(LLVM::DISubprogramFlags::Optimized);
-    if (linkageName == "__main__")
-      flagBits |=
-          static_cast<uint32_t>(LLVM::DISubprogramFlags::MainSubprogram);
-    auto flags = static_cast<LLVM::DISubprogramFlags>(flagBits);
-
-    LLVM::DISubprogramAttr subprogram = LLVM::DISubprogramAttr::get(
-        module.getContext(),
-        DistinctAttr::create(UnitAttr::get(module.getContext())), compileUnit,
-        compileUnit, StringAttr::get(module.getContext(), displayName),
-        StringAttr::get(module.getContext(), linkageName), file,
-        sourceLoc->getLine(), sourceLoc->getLine(), flags, subroutineType,
-        ArrayRef<LLVM::DINodeAttr>{}, ArrayRef<LLVM::DINodeAttr>{});
-
-    function->setLoc(scopedPythonDebugLoc(function.getLoc(), subprogram));
-    function.walk([&](Operation *op) {
-      if (op == function.getOperation())
-        return;
-      if (!findPythonSourceLoc(op->getLoc()))
-        return;
-      op->setLoc(scopedPythonDebugLoc(op->getLoc(), subprogram));
-    });
-  });
 }
 
 LogicalResult buildExecutable(llvm::Module &llvmModule,
@@ -2082,9 +501,10 @@ LogicalResult runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
       return failure();
     }
     auto tmBuilder = std::move(*tmBuilderOrErr);
-    tmBuilder.setCPU(codeGenCPUNameForTarget(tensorTarget, processTriple));
+    tmBuilder.setCPU(
+        codeGenCPUNameForTarget(tensorTarget, processTriple, Options));
     tmBuilder.setFeatures(
-        codeGenFeaturesForTarget(tensorTarget, processTriple));
+        codeGenFeaturesForTarget(tensorTarget, processTriple, Options));
     // JIT favors first-output latency; AOT still uses the optimized pipeline.
     tmBuilder.setCodeGenOptLevel(llvm::CodeGenOptLevel::None);
     auto options = tmBuilder.getOptions();
@@ -2179,8 +599,8 @@ LogicalResult runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
         return failure();
       }
       jit = std::move(*jitExpected);
-      if (failed(lython::driver::addJITSanitizerRuntimes(*jit, ActiveSanitizers,
-                                                         processTriple)))
+      if (failed(lython::driver::addJITSanitizerRuntimes(
+              *jit, Options.sanitizers, processTriple)))
         return failure();
     }
 
@@ -2188,7 +608,7 @@ LogicalResult runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
     llvm::SmallVector<py::PythonCallSiteRange, 16> pythonCallSites;
     {
       PerfScope perf("jit-build.prepare-mlir");
-      if (!ReleaseMode)
+      if (!Options.releaseMode)
         collectLLVMSafetyContracts(module, safetyProfile);
       py::collectPythonCallSiteRanges(module, pythonCallSites);
       attachPythonDebugInfo(module);
@@ -2208,11 +628,13 @@ LogicalResult runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
     {
       PerfScope perf("jit-build.prepare-llvm");
       py::installPythonExceptionCleanupFrames(*llvmModule, pythonCallSites);
-      if (!ReleaseMode && failed(verifyLLVMIRSafetyMetadataAttached(
-                              *llvmModule, safetyProfile)))
+      if (!Options.releaseMode &&
+          failed(verifyLLVMIRSafetyMetadataAttached(*llvmModule, safetyProfile,
+                                                    llvm::errs())))
         return failure();
-      if (!ReleaseMode &&
-          failed(verifyPostCoroLLVMThreadSafe(*llvmModule, safetyProfile)))
+      if (!Options.releaseMode &&
+          failed(verifyPostCoroLLVMThreadSafe(*llvmModule, safetyProfile,
+                                              llvm::errs())))
         return failure();
       for (auto &func : *llvmModule) {
         if (!func.isDeclaration())
@@ -2226,19 +648,20 @@ LogicalResult runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
       PerfScope perf("jit-build.link-runtime");
       if (failed(py::runtime_library::linkEmbeddedNativeRuntime(*llvmModule)))
         return failure();
-      if (!ReleaseMode)
+      if (!Options.releaseMode)
         collectLinkedLLVMSafetyContracts(*llvmModule, safetyProfile);
     }
     {
       PerfScope perf("jit-build.llvm-opt");
-      runLLVMCoroLowering(*llvmModule, ActiveSanitizers,
+      runLLVMCoroLowering(*llvmModule, Options.sanitizers,
                           optimizationTargetMachine.get(),
                           llvm::OptimizationLevel::O0);
-      if (!ReleaseMode)
+      if (!Options.releaseMode)
         collectLinkedLLVMSafetyContracts(*llvmModule, safetyProfile);
       dumpLLVMForPass(irDump, "llvm-translation", *llvmModule);
-      if (!ReleaseMode &&
-          failed(verifyOptimizedLLVMThreadSafe(*llvmModule, safetyProfile)))
+      if (!Options.releaseMode &&
+          failed(verifyOptimizedLLVMThreadSafe(*llvmModule, safetyProfile,
+                                               llvm::errs())))
         return failure();
     }
 
@@ -2301,17 +724,16 @@ LogicalResult runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
   auto *runner = runnerAddress.toPtr<int (*)(void (*)())>();
   {
     PerfScope perf("execution");
-    if (ActiveSanitizers.leak)
+    if (Options.sanitizers.leak)
       lython::driver::callLeakSanitizerHook("__lsan_enable");
     int status = runner(entry);
-    if (ActiveSanitizers.leak)
+    if (Options.sanitizers.leak)
       lython::driver::callLeakSanitizerHook("__lsan_disable");
     if (status != 0)
       return failure();
   }
   return success();
 }
-
 } // namespace
 
 static llvm::cl::OptionCategory LythonCategory("lython options");
@@ -2443,16 +865,17 @@ int main(int argc, char **argv) {
   llvm::cl::ParseCommandLineOptions(static_cast<int>(filteredArgv.size()),
                                     filteredArgv.data(),
                                     "Lython compiler driver (clang-style)\n");
-  TargetTriple = TargetOption;
-  TargetCPU = TargetCPUOption;
-  TargetFPU = TargetFPUOption;
-  TargetFloatABI = TargetFloatABIOption;
-  TargetSysroot = TargetSysrootOption;
+  Options.targetTriple = TargetOption;
+  Options.targetCPU = TargetCPUOption;
+  Options.targetFPU = TargetFPUOption;
+  Options.targetFloatABI = TargetFloatABIOption;
+  Options.targetSysroot = TargetSysrootOption;
   IncludeSearchPaths.assign(IncludePathOptions.begin(),
                             IncludePathOptions.end());
   LibrarySearchPaths.assign(LibraryPathOptions.begin(),
                             LibraryPathOptions.end());
-  ReleaseMode = releaseModeFromArgv || ReleaseModeOption;
+  Options.releaseMode = releaseModeFromArgv || ReleaseModeOption;
+  Options.auditRuntimeManifest = AuditRuntimeManifest;
   py::IRDumpConfig irDump = py::IRDumpConfig::fromEnv();
 
   const bool jitMode = static_cast<bool>(JitCommand);
@@ -2490,44 +913,21 @@ int main(int argc, char **argv) {
                : 0;
   }
 
-  if (failed(lython::driver::buildSanitizerConfig(ActiveSanitizers)))
+  if (failed(lython::driver::buildSanitizerConfig(Options.sanitizers)))
     return 1;
-  if (jitMode && ActiveSanitizers.any()) {
+  if (jitMode && Options.sanitizers.any()) {
     llvm::Triple processTriple(llvm::sys::getDefaultTargetTriple());
     if (failed(lython::driver::ensureJITSanitizerRuntimesPreloaded(
-            argv, ActiveSanitizers, processTriple)))
+            argv, Options.sanitizers, processTriple)))
       return 1;
   }
-  if (jitMode && ActiveSanitizers.leak)
+  if (jitMode && Options.sanitizers.leak)
     lython::driver::callLeakSanitizerHook("__lsan_disable");
 
   bool isPythonInput = llvm::sys::path::extension(inputPath) == ".py";
 
-  // apply_registered_pass in manifest lowering strategies resolves through
-  // the global pass registry.
-  mlir::registerTransformsPasses();
-
   DialectRegistry registry;
-  registry.insert<py::PyDialect, affine::AffineDialect, async::AsyncDialect,
-                  func::FuncDialect, arith::ArithDialect, scf::SCFDialect,
-                  mlir::cf::ControlFlowDialect, tensor::TensorDialect,
-                  linalg::LinalgDialect, memref::MemRefDialect,
-                  vector::VectorDialect, bufferization::BufferizationDialect,
-                  LLVM::LLVMDialect, math::MathDialect,
-                  transform::TransformDialect>();
-  py::lowering::arch::arm::registerSMEDialects(registry);
-  py::lowering::arch::x86::registerX86Dialects(registry);
-  arith::registerBufferizableOpInterfaceExternalModels(registry);
-  bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(
-      registry);
-  linalg::registerBufferizableOpInterfaceExternalModels(registry);
-  tensor::registerBufferizableOpInterfaceExternalModels(registry);
-  mlir::registerConvertFuncToLLVMInterface(registry);
-  mlir::registerConvertMemRefToLLVMInterface(registry);
-  mlir::registerConvertMathToLLVMInterface(registry);
-  mlir::registerAllToLLVMIRTranslations(registry);
-  py::lowering::arch::x86::registerX86Translations(registry);
-  registerPySafetyLLVMIRTranslation(registry);
+  lython::driver::registerLythonDialects(registry);
 
   MLIRContext context;
   context.appendDialectRegistry(registry);
@@ -2536,7 +936,8 @@ int main(int argc, char **argv) {
   OwningOpRef<ModuleOp> module;
 
   if (isPythonInput) {
-    if (failed(generateModuleFromCppFrontend(inputPath, context, module)))
+    if (failed(emitMLIRFromFile(inputPath, Options, context, module,
+                                llvm::errs())))
       return 1;
   } else {
     auto file = mlir::openInputFile(inputPath);
@@ -2549,20 +950,20 @@ int main(int argc, char **argv) {
   }
 
   if (!module)
-    module = parseModuleFromBuffer(mlirSource, context);
+    module = parseModuleFromBuffer(mlirSource, context, llvm::errs());
   if (!module)
     return 1;
 
-  py::TensorLoweringTarget tensorTarget =
-      detectTensorLoweringTarget(codeGenTripleForTarget({}));
-  if (failed(stampTargetPlatformFacts(*module, tensorTarget)))
+  py::TensorLoweringTarget tensorTarget = detectTensorLoweringTarget(Options);
+  if (failed(stampTargetPlatformFacts(*module, tensorTarget, Options,
+                                      llvm::errs())))
     return 1;
 
   {
     PerfScope perf("lowering");
     py::LoweringPipelineOptions loweringOptions;
-    loweringOptions.auditRuntimeManifest = AuditRuntimeManifest;
-    loweringOptions.enableVerifiers = !ReleaseMode;
+    loweringOptions.auditRuntimeManifest = Options.auditRuntimeManifest;
+    loweringOptions.enableVerifiers = !Options.releaseMode;
     if (failed(py::runLoweringPipeline(*module, tensorTarget, irDump,
                                        loweringOptions))) {
       llvm::errs() << "Failed to run lowering pipeline\n";
@@ -2574,66 +975,53 @@ int main(int argc, char **argv) {
     return failed(runJIT(*module, irDump, tensorTarget)) ? 1 : 0;
   }
 
-  LLVMSafetyProfile safetyProfile;
-  if (!ReleaseMode)
-    collectLLVMSafetyContracts(*module, safetyProfile);
-  llvm::SmallVector<py::PythonCallSiteRange, 16> pythonCallSites;
-  py::collectPythonCallSiteRanges(*module, pythonCallSites);
-  attachPythonDebugInfo(*module);
-
-  llvm::LLVMContext llvmContext;
-  auto llvmModule = mlir::translateModuleToLLVMIR(*module, llvmContext);
-  if (!llvmModule) {
-    llvm::errs() << "Failed to translate to LLVM IR\n";
+  lython::driver::VerifiedLLVMModule verified;
+  if (failed(translateToVerifiedLLVMIR(*module, Options, irDump, verified,
+                                       llvm::errs())))
     return 1;
-  }
-  py::installPythonExceptionCleanupFrames(*llvmModule, pythonCallSites);
-  dumpLLVMForPass(irDump, "llvm-translation", *llvmModule);
-  if (!ReleaseMode &&
-      failed(verifyLLVMIRSafetyMetadataAttached(*llvmModule, safetyProfile)))
-    return 1;
-  if (!ReleaseMode &&
-      failed(verifyPostCoroLLVMThreadSafe(*llvmModule, safetyProfile)))
-    return 1;
+  llvm::Module &llvmModule = *verified.llvmModule;
+  LLVMSafetyProfile &safetyProfile = verified.safetyProfile;
 
   llvm::InitializeAllTargets();
   llvm::InitializeAllTargetMCs();
   llvm::InitializeAllAsmPrinters();
   llvm::InitializeAllAsmParsers();
 
-  if (failed(configureLLVMModuleCodeGenTarget(*llvmModule, tensorTarget)))
+  if (failed(configureLLVMModuleCodeGenTarget(llvmModule, tensorTarget,
+                                              Options, llvm::errs())))
     return 1;
 
-  if (failed(py::runtime_library::linkEmbeddedNativeRuntime(*llvmModule)))
+  if (failed(py::runtime_library::linkEmbeddedNativeRuntime(llvmModule)))
     return 1;
-  rewriteExceptionPersonalityForTarget(*llvmModule);
+  rewriteExceptionPersonalityForTarget(llvmModule);
 
-  if (failed(installAOTEntryPoint(*llvmModule)))
+  if (failed(installAOTEntryPoint(llvmModule, llvm::errs())))
     return 1;
 
-  if (!ReleaseMode)
-    collectLinkedLLVMSafetyContracts(*llvmModule, safetyProfile);
+  if (!Options.releaseMode)
+    collectLinkedLLVMSafetyContracts(llvmModule, safetyProfile);
 
   if (EmitLLVMOnly) {
-    if (ActiveSanitizers.requiresLLVMInstrumentation()) {
+    if (Options.sanitizers.requiresLLVMInstrumentation()) {
       std::string targetTriple;
-      auto targetMachine =
-          createCodeGenTargetMachine(tensorTarget, &targetTriple);
+      auto targetMachine = createCodeGenTargetMachine(
+          tensorTarget, Options, &targetTriple, llvm::errs());
       if (!targetMachine)
         return 1;
-      llvmModule->setTargetTriple(llvm::Triple(targetTriple));
-      llvmModule->setDataLayout(targetMachine->createDataLayout());
-      runLLVMCoroLowering(*llvmModule, ActiveSanitizers, targetMachine.get());
-      if (!ReleaseMode)
-        collectLinkedLLVMSafetyContracts(*llvmModule, safetyProfile);
-      if (!ReleaseMode &&
-          failed(verifyOptimizedLLVMThreadSafe(*llvmModule, safetyProfile)))
+      llvmModule.setTargetTriple(llvm::Triple(targetTriple));
+      llvmModule.setDataLayout(targetMachine->createDataLayout());
+      runLLVMCoroLowering(llvmModule, Options.sanitizers, targetMachine.get());
+      if (!Options.releaseMode)
+        collectLinkedLLVMSafetyContracts(llvmModule, safetyProfile);
+      if (!Options.releaseMode &&
+          failed(verifyOptimizedLLVMThreadSafe(llvmModule, safetyProfile,
+                                               llvm::errs())))
         return 1;
     }
-    return failed(writeLLVMIR(*llvmModule, outputPath)) ? 1 : 0;
+    return failed(writeLLVMIR(llvmModule, outputPath, llvm::errs())) ? 1 : 0;
   }
 
-  return failed(buildExecutable(*llvmModule, safetyProfile, tensorTarget,
+  return failed(buildExecutable(llvmModule, safetyProfile, tensorTarget,
                                 outputPath))
              ? 1
              : 0;

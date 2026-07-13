@@ -1458,9 +1458,13 @@ verifyResourceOnCFGPaths(FuncContractCache &contracts,
   AffineTokenState initialToken = resource.condition
                                       ? AffineTokenState::Conditional
                                       : AffineTokenState::Owned;
-  worklist.push_back(AffinePathState{
-      resource.producer->getBlock(), resource.producer->getNextNode(),
-      initialToken, /*retained=*/0, resource.group});
+  AffinePathState initial;
+  initial.block = resource.producer->getBlock();
+  initial.start = resource.producer->getNextNode();
+  initial.token = initialToken;
+  initial.retained = 0;
+  initial.group = resource.group;
+  worklist.push_back(std::move(initial));
 
   constexpr unsigned kMaxAffineStates = 20000;
   while (!worklist.empty()) {

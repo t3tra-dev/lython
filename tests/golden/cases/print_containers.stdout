@@ -1,0 +1,13 @@
+[]
+['a', "b'c"]
+[0, 10, 20]
+{'alpha': 1, 'beta': 2}
+(1,)
+(2.5, 'x', 7)
+[[1, 2], [3]]
+User(name=Zoe)
+User(name=Zoe)
+[User(name=u0), User(name=u1)]
+User(name=u1)
+u0
+u1

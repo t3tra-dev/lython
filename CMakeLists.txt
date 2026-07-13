@@ -1,5 +1,51 @@
 cmake_minimum_required(VERSION 3.20)
 
+set(LYTHON_LLVM_MAJOR_VERSION 22)
+
+# Compiler selection must precede project(): that call locks in the toolchain.
+# AppleClang cannot build against this project's Homebrew LLVM/MLIR, so on
+# macOS default to the matching Homebrew clang when the user has not picked a
+# compiler explicitly (-DCMAKE_CXX_COMPILER / $CXX, or an existing build-dir
+# cache). Linux CI passes its own clang and the macOS-only hint paths below
+# simply do not resolve there.
+if(NOT DEFINED CMAKE_CXX_COMPILER AND NOT DEFINED ENV{CXX})
+    find_program(LYTHON_BOOTSTRAP_CLANGXX
+        NAMES clang++
+        NO_DEFAULT_PATH
+        HINTS
+            /opt/homebrew/opt/llvm@${LYTHON_LLVM_MAJOR_VERSION}/bin
+            /usr/local/opt/llvm@${LYTHON_LLVM_MAJOR_VERSION}/bin
+            /opt/homebrew/opt/llvm/bin
+            /usr/local/opt/llvm/bin
+    )
+    find_program(LYTHON_BOOTSTRAP_CLANG
+        NAMES clang
+        NO_DEFAULT_PATH
+        HINTS
+            /opt/homebrew/opt/llvm@${LYTHON_LLVM_MAJOR_VERSION}/bin
+            /usr/local/opt/llvm@${LYTHON_LLVM_MAJOR_VERSION}/bin
+            /opt/homebrew/opt/llvm/bin
+            /usr/local/opt/llvm/bin
+    )
+    if(LYTHON_BOOTSTRAP_CLANGXX AND LYTHON_BOOTSTRAP_CLANG)
+        execute_process(
+            COMMAND "${LYTHON_BOOTSTRAP_CLANGXX}" --version
+            OUTPUT_VARIABLE LYTHON_BOOTSTRAP_CLANG_VERSION
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+        # A bare "llvm" keg can be a newer major; require an exact match.
+        if(LYTHON_BOOTSTRAP_CLANG_VERSION MATCHES
+           "clang version ${LYTHON_LLVM_MAJOR_VERSION}\\.")
+            set(CMAKE_C_COMPILER "${LYTHON_BOOTSTRAP_CLANG}")
+            set(CMAKE_CXX_COMPILER "${LYTHON_BOOTSTRAP_CLANGXX}")
+            message(STATUS
+                "Lython: using Homebrew LLVM ${LYTHON_LLVM_MAJOR_VERSION} clang "
+                "at ${LYTHON_BOOTSTRAP_CLANGXX}")
+        endif()
+    endif()
+endif()
+
 project(lython VERSION 0.1.0
                DESCRIPTION "Python compiler toolchain based on LLVM"
                LANGUAGES CXX C)
@@ -9,8 +55,6 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-
-set(LYTHON_LLVM_MAJOR_VERSION 22)
 
 function(lython_configure_llvm)
     file(GLOB LYTHON_HOMEBREW_LLVM_CMAKE_DIRS
@@ -231,5 +275,45 @@ if(LYTHON_LLVM_DEFINITIONS MATCHES " ")
 endif()
 add_definitions(${LYTHON_LLVM_DEFINITIONS})
 
+option(LYTHON_BUILD_TESTS "Build the ctest unit and golden test suites" ON)
+option(LYTHON_ENABLE_FUZZERS
+    "Build the libFuzzer harnesses (requires clang; use a dedicated build \
+directory: the whole tree is instrumented with ASan + fuzzer coverage)" OFF)
+
+if(LYTHON_ENABLE_FUZZERS)
+    # AppleClang does not ship the libFuzzer runtime; require upstream clang.
+    if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        message(FATAL_ERROR "LYTHON_ENABLE_FUZZERS requires upstream clang "
+            "(on macOS use Homebrew LLVM clang++, not AppleClang)")
+    endif()
+    # fuzzer-no-link instruments every Lython static library with libFuzzer
+    # coverage so the harnesses see edges beyond their own translation unit;
+    # only the fuzz executables link the libFuzzer runtime itself.
+    add_compile_options(-fsanitize=fuzzer-no-link,address
+        -fno-omit-frame-pointer -gline-tables-only)
+    add_link_options(-fsanitize=address)
+
+    # The build-time codegen tools (spec/bytecode/pre-lowering) are now ASan
+    # instrumented too, and they abort during the build: the instrumented LLVM
+    # allocators linked into them poison memory that the uninstrumented system
+    # libMLIR.dylib then reads (use-after-poison), plus LeakSanitizer trips on
+    # their one-shot allocations. Neither is a real defect. Run those tool
+    # invocations (see LYTHON_HOST_TOOL_LAUNCHER below) with the matching
+    # ASAN_OPTIONS so `cmake --build` works without a per-shell env var.
+    set(LYTHON_HOST_TOOL_LAUNCHER ${CMAKE_COMMAND} -E env
+        "ASAN_OPTIONS=detect_leaks=0:detect_container_overflow=0:allow_user_poisoning=0"
+        --)
+endif()
+
 add_subdirectory(src)
 add_subdirectory(tools)
+
+if(LYTHON_BUILD_TESTS OR LYTHON_ENABLE_FUZZERS)
+    enable_testing()
+endif()
+if(LYTHON_BUILD_TESTS)
+    add_subdirectory(tests)
+endif()
+if(LYTHON_ENABLE_FUZZERS)
+    add_subdirectory(fuzz)
+endif()

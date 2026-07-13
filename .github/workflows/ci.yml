@@ -42,27 +42,84 @@ jobs:
             -DCMAKE_C_COMPILER=clang-22 \
             -DCMAKE_CXX_COMPILER=clang++-22 \
             -DLLVM_DIR=/usr/lib/llvm-22/lib/cmake/llvm \
-            -DMLIR_DIR=/usr/lib/llvm-22/lib/cmake/mlir
+            -DMLIR_DIR=/usr/lib/llvm-22/lib/cmake/mlir \
+            -DLYTHON_BUILD_TESTS=ON
           cmake --build build -j$(nproc)
 
       - name: Test
         env:
           LLVM_SYMBOLIZER_PATH: /usr/bin/llvm-symbolizer-22
-        run: |
-          ./build/bin/lyc jit examples/hello.py
-          ./build/bin/lyc jit examples/oop.py
-          ./build/bin/lyc jit examples/tarai_prim.py
-          ./build/bin/lyc jit examples/tensor_prim.py
-          if ./build/bin/lyc jit examples/error.py 2>&1; then
-            echo "expected examples/error.py to fail" >&2
-            exit 1
-          else
-            status=$?
-            test "$status" -eq 1
-          fi
+        run: ctest --test-dir build -j"$(nproc)" --output-on-failure
 
       - name: Benchmarks
         run: |
           ./build/bin/lyc examples/fib.py -o fib_aot
           ./build/bin/lyc examples/fib_prim.py -o fib_prim_aot
           hyperfine -w 1 -r 5 "python3 examples/fib.py" "./build/bin/lyc jit examples/fib.py" "./fib_aot" "./fib_prim_aot"
+
+  fuzz-smoke:
+    name: Fuzz smoke
+    runs-on: ubuntu-latest
+    env:
+      # Leak checking off: harnesses intentionally leak one-time registries,
+      # and build-time codegen tools also run ASan-instrumented. Container
+      # overflow / user poisoning off: system LLVM/MLIR dylibs are
+      # uninstrumented, while LLVM inline allocators compiled into our objects
+      # poison memory the dylib then touches (use-after-poison false
+      # positives).
+      ASAN_OPTIONS: detect_leaks=0:detect_container_overflow=0:allow_user_poisoning=0
+      LLVM_SYMBOLIZER_PATH: /usr/bin/llvm-symbolizer-22
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build wget lsb-release software-properties-common gnupg
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 22
+          sudo apt-get install -y clang-22 lld-22 llvm-22-dev libmlir-22-dev mlir-22-tools
+
+      - name: Build fuzzers
+        run: |
+          cmake -B build-fuzz -S . -G Ninja \
+            -DCMAKE_C_COMPILER=clang-22 \
+            -DCMAKE_CXX_COMPILER=clang++-22 \
+            -DLLVM_DIR=/usr/lib/llvm-22/lib/cmake/llvm \
+            -DMLIR_DIR=/usr/lib/llvm-22/lib/cmake/mlir \
+            -DLYTHON_ENABLE_FUZZERS=ON \
+            -DLYTHON_BUILD_TESTS=OFF \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build build-fuzz -j$(nproc) --target fuzz_parser fuzz_emitter fuzz_pipeline
+
+      - name: Corpus regression
+        run: ctest --test-dir build-fuzz -j"$(nproc)" --output-on-failure
+
+      - name: Short fuzz
+        continue-on-error: true
+        run: |
+          fuzz_one() {
+            ./build-fuzz/bin/$1 -max_total_time=$2 -timeout=10 \
+              -rss_limit_mb=4096 -dict=fuzz/dictionaries/python.dict \
+              "fuzz/corpora/$1" tests/golden/cases
+          }
+          fuzz_one fuzz_parser 30
+          fuzz_one fuzz_emitter 150
+          fuzz_one fuzz_pipeline 240
+
+      - name: Upload crash artifacts
+        # short fuzz は continue-on-error なので failure() では拾えない
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: |
+            crash-*
+            leak-*
+            timeout-*
+            oom-*
+          if-no-files-found: ignore

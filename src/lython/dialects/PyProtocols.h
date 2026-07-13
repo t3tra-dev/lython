@@ -1,6 +1,7 @@
 #pragma once
 
 #include "PyDialectTypes.h"
+#include "mlir/IR/DialectInterface.h"
 #include "mlir/IR/MLIRContext.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/FunctionExtras.h"
@@ -10,6 +11,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -141,6 +144,23 @@ struct FieldResolution {
 struct AwaitableResolution {
   mlir::Type payloadType;
   std::optional<ContractResolution> awaitContract;
+};
+
+class Table;
+
+// Owns the lazily-built typing manifest Table with dialect (= context)
+// lifetime. Not a process-global cache keyed by MLIRContext*: a destroyed
+// context's address can be reused by a new context, which would resurrect a
+// table full of types uniqued in the dead context.
+class TableCache : public mlir::DialectInterface::Base<TableCache> {
+public:
+  explicit TableCache(mlir::Dialect *dialect);
+  ~TableCache();
+
+private:
+  friend class Table;
+  std::mutex mutex;
+  std::unique_ptr<Table> table;
 };
 
 // The loaded manifest. The dialect (TableGen) keeps only value-level runtime

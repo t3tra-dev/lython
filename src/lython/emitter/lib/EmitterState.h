@@ -52,6 +52,14 @@ struct InlineReturnContext {
 };
 
 struct LoopControlContext {
+  LoopControlContext() = default;
+  // Two-target form used by every loop site; carriedLocals / headerBlock keep
+  // their defaults and are assigned afterwards where needed. A constructor
+  // (not aggregate init) so partially-braced sites do not trip
+  // -Wmissing-field-initializers.
+  LoopControlContext(mlir::Block *breakTarget, mlir::Block *continueTarget)
+      : breakTarget(breakTarget), continueTarget(continueTarget) {}
+
   mlir::Block *breakTarget = nullptr;
   mlir::Block *continueTarget = nullptr;
   // Loop-carried local names, in the block-argument order of breakTarget /

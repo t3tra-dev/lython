@@ -117,7 +117,8 @@ foreach(runtime_module_mlir IN LISTS LYTHON_RUNTIME_MODULE_MLIR)
     add_custom_command(
         OUTPUT "${runtime_module_bc}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${LYTHON_RUNTIME_MODULE_BYTECODE_DIR}"
-        COMMAND $<TARGET_FILE:LythonRuntimeMlirBytecode> "${runtime_module_mlir}" -o "${runtime_module_bc}"
+        COMMAND ${LYTHON_HOST_TOOL_LAUNCHER}
+            $<TARGET_FILE:LythonRuntimeMlirBytecode> "${runtime_module_mlir}" -o "${runtime_module_bc}"
         DEPENDS LythonRuntimeMlirBytecode "${runtime_module_mlir}"
         COMMENT "Generating runtime MLIR bytecode ${runtime_module_name}.mlirbc"
         VERBATIM

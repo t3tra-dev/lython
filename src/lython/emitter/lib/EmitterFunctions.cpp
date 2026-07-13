@@ -148,7 +148,7 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
   currentGlobalDecls.clear();
   bool savedModuleScope = atModuleScope;
   atModuleScope = false;
-  auto restoreGlobalScope = llvm::make_scope_exit([&] {
+  llvm::scope_exit restoreGlobalScope([&] {
     currentGlobalDecls = std::move(savedGlobalDecls);
     atModuleScope = savedModuleScope;
   });

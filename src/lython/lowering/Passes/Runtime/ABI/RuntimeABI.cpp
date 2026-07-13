@@ -1128,8 +1128,7 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassDeallocators() {
         return mlir::failure();
     }
 
-    auto dealloc =
-        mlir::memref::DeallocOp::create(builder, loc, entry->getArgument(0));
+    mlir::memref::DeallocOp::create(builder, loc, entry->getArgument(0));
     mlir::cf::BranchOp::create(builder, loc, doneBlock);
 
     builder.setInsertionPointToStart(doneBlock);

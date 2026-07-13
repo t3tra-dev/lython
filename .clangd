@@ -1,0 +1,4 @@
+If:
+  PathMatch: fuzz/.*
+CompileFlags:
+  CompilationDatabase: build-fuzz

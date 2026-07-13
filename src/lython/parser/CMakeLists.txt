@@ -20,7 +20,8 @@ set(LYTHON_CPYTHON_SPEC_SNAPSHOT
 
 add_custom_command(
     OUTPUT "${LYTHON_CPYTHON_SPEC_SNAPSHOT}"
-    COMMAND LythonCpythonSpecGen "${LYTHON_CPYTHON_SPEC_SNAPSHOT}"
+    COMMAND ${LYTHON_HOST_TOOL_LAUNCHER}
+        $<TARGET_FILE:LythonCpythonSpecGen> "${LYTHON_CPYTHON_SPEC_SNAPSHOT}"
     DEPENDS
         LythonCpythonSpecGen
         "${CMAKE_CURRENT_SOURCE_DIR}/Tokens"
@@ -55,6 +56,14 @@ add_dependencies(LythonParser LythonCpythonSpecSnapshot)
 set_source_files_properties(parser.c PROPERTIES
     COMPILE_OPTIONS "-Wno-unused-but-set-variable;-Wno-incompatible-pointer-types-discards-qualifiers"
 )
+if(LYTHON_ENABLE_FUZZERS)
+    # CpythonSpec.cpp は ~800KB の生成スナップショット (静的初期化子) を
+    # include しており、ASan + カバレッジ計装との組み合わせでコンパイルが
+    # 数十分オーダーになる。データ表なので計装を外しても探索価値は失わない。
+    set_source_files_properties(lib/CpythonSpec.cpp PROPERTIES
+        COMPILE_OPTIONS "-fno-sanitize=fuzzer-no-link,address;-O0"
+    )
+endif()
 set_source_files_properties(PegenShim.c PROPERTIES
     COMPILE_OPTIONS "-Wno-cast-qual"
 )

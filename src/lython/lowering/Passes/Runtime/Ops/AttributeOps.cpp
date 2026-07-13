@@ -92,7 +92,9 @@ mlir::FailureOr<unsigned> RuntimeBundleLowerer::classFieldValueOffset(
 
 bool RuntimeBundleLowerer::classFieldStoredBoxed(
     mlir::Type fieldContract) const {
-  llvm::StringRef contractName = runtimeShapeContractName(fieldContract);
+  // runtimeShapeContractName returns by value; a StringRef binding would
+  // dangle past this declaration statement.
+  std::string contractName = runtimeShapeContractName(fieldContract);
   return contractName == "builtins.object" || contractName == "builtins.dict";
 }
 

@@ -434,16 +434,19 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
   // keeps the old scoped behavior.
   llvm::SmallVector<unsigned, 2> threadedMutationIndices;
   for (auto [index, name] : llvm::enumerate(mutationCandidates)) {
+    // Capturing the structured binding `index` directly is a C++20 extension;
+    // bind a plain local for the lambda.
+    const std::size_t idx = index;
     const Value &outer = mutationOuterValues[index];
     auto edgeAcceptable = [&](llvm::ArrayRef<Value> branchExitValues,
                               mlir::Block *exitBlock) {
       if (!exitBlock)
         return true;
-      if (index >= branchExitValues.size() || !branchExitValues[index].value)
+      if (idx >= branchExitValues.size() || !branchExitValues[idx].value)
         return false;
-      mlir::Value incoming = branchExitValues[index].value;
+      mlir::Value incoming = branchExitValues[idx].value;
       return incoming == outer.value ||
-             (branchExitValues[index].type == outer.type &&
+             (branchExitValues[idx].type == outer.type &&
               derivesViaStructuralMutation(incoming, outer.value));
     };
     bool mutatedSomewhere =
