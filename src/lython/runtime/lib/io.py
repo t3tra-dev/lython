@@ -17,8 +17,11 @@ Deviations from CPython, pending language surface:
     Constructors take no buffer_size argument, peek()/read1() are absent,
     and open(file, 'rb') does not construct them implicitly (binary opens
     go through FileIO / BufferedReader directly).
-  - open(file, mode='r') accepts text modes only ('b' raises ValueError:
-    binary streams go through FileIO). TextIOWrapper.seek()/tell() follow
+  - open(file, mode='r') returns TextIOWrapper for text modes; a mode that
+    is a str LITERAL containing 'b' statically selects the binary arm and
+    returns the raw FileIO (CPython returns a Buffered* wrapper; the
+    wrappers below delegate to FileIO 1:1). A non-literal binary mode
+    cannot be typed statically and raises ValueError at runtime. TextIOWrapper.seek()/tell() follow
     the cookie discipline (relative seeks only accept offset 0), and the
     cookie degenerates to the byte offset because this wrapper keeps no
     incremental decoder state; read(size) counts characters, and

@@ -3117,6 +3117,19 @@ mlir::Type AlgorithmM::inferExpr(const parser::Node *node) const {
       llvm::StringRef name = ast::nameSpelling(*callee);
       if (name == "isinstance")
         return boolType();
+      // open()'s return type depends on the MODE: a str literal containing
+      // 'b' selects the binary arm statically (FileIO); everything else is
+      // the text wrapper. A non-literal binary mode cannot type as FileIO
+      // and is rejected at runtime by the text arm's mode parser.
+      if (lookupCanonicalBinding(name) == std::optional<std::string>("_io.open")) {
+        if (const auto *args = ast::nodeList(*node, "args"))
+          if (args->size() >= 2 && (*args)[1]) {
+            auto mode = ast::string(*(*args)[1], "value");
+            if (mode && mode->find('b') != std::string_view::npos)
+              return contract("_io.FileIO");
+          }
+        return contract("_io.TextIOWrapper");
+      }
       if (name == "len") {
         if (!positional.empty())
           if (std::optional<CallSolution> result = tryManifestMethod(

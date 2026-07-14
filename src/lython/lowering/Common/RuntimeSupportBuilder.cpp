@@ -3205,6 +3205,46 @@ void buildTakeCurrentDescriptor(SupportBuilder &b) {
               .getResult()});
 }
 
+// __ly_global_view_*(i64 ptr, i64 size): reassemble a rank-1 memref
+// descriptor from the raw pointer/size words a module-global object cell
+// stores (allocated == aligned, offset 0, stride 1 -- the runtime's
+// single-allocation entity convention). One wrapper per element type so the
+// func-level signature type-checks against the caller's memref world;
+// static shapes narrow through memref.cast at the call site.
+void buildGlobalViewFunction(SupportBuilder &b, llvm::StringRef name) {
+  auto fn = beginLLVMFunction(b, name, memRef1DType(b), {b.i64(), b.i64()});
+  mlir::Block *entry = fn.addEntryBlock(b.builder);
+  b.builder.setInsertionPointToEnd(entry);
+  auto arrayOne = mlir::LLVM::LLVMArrayType::get(b.i64(), 1);
+  mlir::Value pointer = b.intToPtr(entry->getArgument(0));
+  mlir::Value size = entry->getArgument(1);
+  mlir::Value zero = b.iconst(0);
+  mlir::Value one = b.iconst(1);
+  mlir::Value sizeArray = mlir::LLVM::InsertValueOp::create(
+      b.builder, b.loc,
+      mlir::LLVM::UndefOp::create(b.builder, b.loc, arrayOne).getResult(),
+      size, llvm::ArrayRef<std::int64_t>{0});
+  mlir::Value strideArray = mlir::LLVM::InsertValueOp::create(
+      b.builder, b.loc,
+      mlir::LLVM::UndefOp::create(b.builder, b.loc, arrayOne).getResult(),
+      one, llvm::ArrayRef<std::int64_t>{0});
+  mlir::Value descriptor =
+      mlir::LLVM::UndefOp::create(b.builder, b.loc, memRef1DType(b));
+  descriptor = mlir::LLVM::InsertValueOp::create(
+      b.builder, b.loc, descriptor, pointer, llvm::ArrayRef<std::int64_t>{0});
+  descriptor = mlir::LLVM::InsertValueOp::create(
+      b.builder, b.loc, descriptor, pointer, llvm::ArrayRef<std::int64_t>{1});
+  descriptor = mlir::LLVM::InsertValueOp::create(
+      b.builder, b.loc, descriptor, zero, llvm::ArrayRef<std::int64_t>{2});
+  descriptor = mlir::LLVM::InsertValueOp::create(
+      b.builder, b.loc, descriptor, sizeArray,
+      llvm::ArrayRef<std::int64_t>{3});
+  descriptor = mlir::LLVM::InsertValueOp::create(
+      b.builder, b.loc, descriptor, strideArray,
+      llvm::ArrayRef<std::int64_t>{4});
+  mlir::LLVM::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{descriptor});
+}
+
 // i32 LyRunPythonMain(ptr entry): installs the stack guard, invokes the
 // program body under the C++ personality, and prints the Python traceback (or
 // the native-exception notice) for anything that unwinds out.
@@ -3444,6 +3484,10 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context) {
   buildHostArgvSupport(support);
   buildHostFileSupport(support);
   buildHostBufferSupport(support);
+  buildGlobalViewFunction(support, "__ly_global_view_i8");
+  buildGlobalViewFunction(support, "__ly_global_view_i32");
+  buildGlobalViewFunction(support, "__ly_global_view_i64");
+  buildGlobalViewFunction(support, "__ly_global_view_f64");
   buildReleasePayloadSlotPtr(support);
   buildReleaseBoxedPayloadRaw(support);
   buildReleaseBoxedPayloadArraySlotRaw(support);

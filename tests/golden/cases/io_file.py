@@ -23,7 +23,8 @@ def run() -> None:
     print(h.readline() == "")
     h.close()
 
-    # The _io exception surface: missing file, wrong direction, binary mode.
+    # The _io exception surface (missing file, wrong direction) and the
+    # statically selected binary arm of open().
     try:
         open("io_file_missing.tmp", "r")
     except FileNotFoundError:
@@ -33,10 +34,9 @@ def run() -> None:
         k.write("nope")
     except UnsupportedOperation:
         print("unsupported")
-    try:
-        open("io_file_case.tmp", "rb")
-    except ValueError:
-        print("binary rejected")
+    binary = open("io_file_case.tmp", "rb")
+    print(binary.read(5))
+    binary.close()
 
     # StringIO (the Lib/io.py pure-Python implementation).
     s = StringIO()

@@ -491,9 +491,11 @@ void ModuleEmitter::collectStaticModuleAssignments(
 }
 
 void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
-  // Opt-in: an int-annotated module-level assignment (`NAME: int = ...`)
-  // becomes a storage-backed mutable global. Plain `NAME = expr` at module
-  // scope keeps its value-binding behavior (module-scope constants).
+  // Opt-in: an annotated module-level assignment (`NAME: T = ...`) becomes
+  // a storage-backed mutable global (int keeps its unboxed i64 cell for the
+  // signal-safe channel; other contracts store their physical value words).
+  // Plain `NAME = expr` at module scope keeps its value-binding behavior
+  // (module-scope constants).
   const auto *body = ast::nodeList(moduleNode, "body");
   if (!body)
     return;
@@ -503,13 +505,31 @@ void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
     const parser::Node *target = ast::node(*statement, "target");
     if (!target || target->kind != "Name")
       continue;
-    mlir::Type annotated =
-        types.annotationType(ast::node(*statement, "annotation"));
-    if (types.widenLiteral(annotated) != types.intType())
+    mlir::Type annotated = types.widenLiteral(
+        types.annotationType(ast::node(*statement, "annotation")));
+    if (!annotated)
+      continue;
+    // Storage-backed globals cover the immutable scalars plus user classes
+    // (whose mutation happens in place on the heap). Containers stay
+    // value-bound: their structural mutations reallocate the interior
+    // arrays through SSA rebinding, which a storage cell would go stale
+    // against; unions stay value-bound so isinstance narrowing keeps
+    // working on the module flow.
+    bool storageBacked =
+        annotated == types.intType() || annotated == types.strType() ||
+        annotated == types.floatType() || annotated == types.boolType();
+    if (!storageBacked) {
+      if (auto contract = mlir::dyn_cast<py::ContractType>(annotated)) {
+        llvm::StringRef contractName = contract.getContractName();
+        storageBacked = contractName == "builtins.bytes" ||
+                        !contractName.contains('.');
+      }
+    }
+    if (!storageBacked)
       continue;
     llvm::StringRef name = ast::nameSpelling(*target);
-    moduleGlobals[name] = types.intType();
-    types.bindSymbol(name, types.intType());
+    moduleGlobals[name] = annotated;
+    types.bindSymbol(name, annotated);
   }
 }
 

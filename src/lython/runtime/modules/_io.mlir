@@ -48,10 +48,11 @@ module attributes {
     "_io.BytesIO=_io.BytesIO",
     "_io.FileIO=_io.FileIO"
   ],
-  ly.typing.callable_exports = ["_io.open"],
-  ly.typing.function_names = ["_io.open"],
+  ly.typing.callable_exports = ["_io.open", "_io.open_binary"],
+  ly.typing.function_names = ["_io.open", "_io.open_binary"],
   ly.typing.function_contracts = [
-    !py.callable<[!py.contract<"builtins.str">, !py.contract<"builtins.str">], arg_names = ["file", "mode"], arg_defaults = [false, true], returns = [!py.contract<"_io.TextIOWrapper">]>
+    !py.callable<[!py.contract<"builtins.str">, !py.contract<"builtins.str">], arg_names = ["file", "mode"], arg_defaults = [false, true], returns = [!py.contract<"_io.TextIOWrapper">]>,
+    !py.callable<[!py.contract<"builtins.str">, !py.contract<"builtins.str">], arg_names = ["file", "mode"], arg_defaults = [false, false], returns = [!py.contract<"_io.FileIO">]>
   ],
   ly.typing.int_constant_names = ["_io.DEFAULT_BUFFER_SIZE"],
   ly.typing.int_constant_values = [131072 : i64]
@@ -1592,6 +1593,40 @@ module attributes {
     %closed_slot = arith.constant 6 : index
     %reserved_slot = arith.constant 7 : index
     %class_id = arith.constant 65 : i64
+    memref.store %one, %wrapper[%refcount_slot] : memref<8xi64>
+    memref.store %class_id, %wrapper[%class_slot] : memref<8xi64>
+    memref.store %handle, %wrapper[%handle_slot] : memref<8xi64>
+    memref.store %one, %wrapper[%kind_slot] : memref<8xi64>
+    memref.store %readable, %wrapper[%readable_slot] : memref<8xi64>
+    memref.store %writable, %wrapper[%writable_slot] : memref<8xi64>
+    memref.store %zero, %wrapper[%closed_slot] : memref<8xi64>
+    memref.store %zero, %wrapper[%reserved_slot] : memref<8xi64>
+    func.return %wrapper : memref<8xi64>
+  }
+
+  // open(file, mode) with a 'b' mode: the binary arm the emitter selects
+  // STATICALLY when the mode is a str literal containing 'b' (the return
+  // type depends on the mode, which a runtime value cannot express in the
+  // static surface). Returns the raw FileIO; CPython returns a Buffered*
+  // wrapper, whose Lib/io.py port delegates to FileIO 1:1 here.
+  func.func @LyIO_OpenBinary(%path_header: memref<2xi64> {ly.ownership.object_header}, %path_bytes: memref<?xi8>, %mode_header: memref<2xi64> {ly.ownership.object_header}, %mode_bytes: memref<?xi8>) -> memref<8xi64> attributes {ly.ownership.owned_result_contracts = ["_io.FileIO"], ly.ownership.owned_results = [0], ly.runtime.builtin = "_io.open_binary", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.str", ly.runtime.primitive = "io_open_binary", ly.runtime.result_contract = "_io.FileIO"} {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %true_bit = arith.constant true
+    %base, %plus = func.call @__ly_io_parse_mode(%mode_header, %mode_bytes, %true_bit) : (memref<2xi64>, memref<?xi8>, i1) -> (i64, i64)
+    %handle = func.call @__ly_io_fopen(%path_header, %path_bytes, %base, %plus, %true_bit) : (memref<2xi64>, memref<?xi8>, i64, i64, i1) -> i64
+    %readable, %writable = func.call @__ly_io_mode_readable(%base, %plus) : (i64, i64) -> (i64, i64)
+
+    %wrapper = memref.alloc() {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<8xi64>
+    %refcount_slot = arith.constant 0 : index
+    %class_slot = arith.constant 1 : index
+    %handle_slot = arith.constant 2 : index
+    %kind_slot = arith.constant 3 : index
+    %readable_slot = arith.constant 4 : index
+    %writable_slot = arith.constant 5 : index
+    %closed_slot = arith.constant 6 : index
+    %reserved_slot = arith.constant 7 : index
+    %class_id = arith.constant 72 : i64
     memref.store %one, %wrapper[%refcount_slot] : memref<8xi64>
     memref.store %class_id, %wrapper[%class_slot] : memref<8xi64>
     memref.store %handle, %wrapper[%handle_slot] : memref<8xi64>

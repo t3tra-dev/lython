@@ -230,6 +230,21 @@ private:
                                                     const RuntimeBundle &object,
                                                     const RuntimeBundle *value);
   mlir::LogicalResult lowerGlobalGet(py::GlobalGetOp op);
+  mlir::LogicalResult lowerObjectGlobalGet(py::GlobalGetOp op);
+  mlir::LogicalResult lowerObjectGlobalSet(py::GlobalSetOp op);
+  mlir::LLVM::GlobalOp moduleObjectGlobalCell(mlir::Operation *op,
+                                              llvm::StringRef name,
+                                              llvm::StringRef suffix);
+  mlir::func::FuncOp globalViewFunction(mlir::Operation *op,
+                                        mlir::Type element);
+  mlir::Value loadObjectGlobalWord(mlir::Operation *op, llvm::StringRef name,
+                                   llvm::StringRef suffix);
+  void storeObjectGlobalWord(mlir::Operation *op, llvm::StringRef name,
+                             llvm::StringRef suffix, mlir::Value word);
+  mlir::LogicalResult
+  loadObjectGlobalValues(mlir::Operation *op, llvm::StringRef name,
+                         llvm::ArrayRef<mlir::Type> valueTypes,
+                         llvm::SmallVectorImpl<mlir::Value> &values);
   mlir::LogicalResult lowerGlobalSet(py::GlobalSetOp op);
   // Process-lifetime i64 storage for a module-level int global, created on
   // first use. Reads/writes are plain load/store (async-signal-safe).

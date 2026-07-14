@@ -196,10 +196,10 @@ bool declaredRuntimeContractMatchesClass(mlir::ModuleOp module,
     if (!contract)
       continue;
     llvm::StringRef value = contract.getValue();
+    // Exact matches only: a short-name match would also catch USER classes
+    // that merely share a manifest contract's leaf name (a user `Counter`
+    // vs lyrt.Counter), silently skipping their deallocator synthesis.
     if (value == className)
-      return true;
-    llvm::StringRef shortName = value.rsplit('.').second;
-    if (!shortName.empty() && shortName == className)
       return true;
   }
   return false;

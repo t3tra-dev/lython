@@ -297,9 +297,24 @@ mlir::LogicalResult RuntimeBundleLowerer::releaseAggregateSlot(
       own::findDeallocatorForValueGroup(values, 0, deallocators, contract);
   if (!deallocator || (deallocator->inputTypes.size() != values.size() &&
                        deallocator->shapeTypes.size() != values.size())) {
-    if (RuntimeBundleLowerer::classForContract(slotType))
-      return op->emitError() << "aggregate slot release for " << slotType
-                             << " has no matching runtime deallocator";
+    if (RuntimeBundleLowerer::classForContract(slotType)) {
+      mlir::InFlightDiagnostic diag =
+          op->emitError() << "aggregate slot release for " << slotType
+                          << " has no matching runtime deallocator (value "
+                          << "group:";
+      for (mlir::Value value : values)
+        diag << " " << value.getType();
+      diag << "; candidates:";
+      for (const own::RuntimeDeallocator &candidate : deallocators) {
+        diag << " [" << candidate.contractName << "="
+             << mlir::func::FuncOp(candidate.function).getName() << ":";
+        for (mlir::Type inputType : candidate.inputTypes)
+          diag << " " << inputType;
+        diag << "]";
+      }
+      diag << ")";
+      return diag;
+    }
     return mlir::success();
   }
 

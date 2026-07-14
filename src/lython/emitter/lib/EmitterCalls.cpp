@@ -2,6 +2,7 @@
 #include "EmitterPyOps.h"
 #include "EmitterSupport.h"
 #include "PlatformConstants.h"
+#include "PyProtocols.h"
 
 #include "AstAccess.h"
 #include "EmitterOps.h"
@@ -933,6 +934,26 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
                   emitStaticStringConstant(expr, *canonical,
                                            /*allowCallable=*/true))
             return *constant;
+        // open() with a literal 'b' mode dispatches to the binary arm
+        // (FileIO result); see the matching special case in inferExpr.
+        if (*canonical == "_io.open") {
+          const auto *openArgs = ast::nodeList(expr, "args");
+          if (openArgs && openArgs->size() >= 2 && (*openArgs)[1]) {
+            auto mode = ast::string(*(*openArgs)[1], "value");
+            if (mode && mode->find('b') != std::string_view::npos) {
+              const py::protocols::Table &table =
+                  py::protocols::Table::get(context);
+              mlir::Type calleeType =
+                  table.freeFunctionContract("_io.open_binary")
+                      .value_or(types.contract("builtins.function"));
+              Value binaryCallee = emitBindingRef(*calleeNode,
+                                                  "_io.open_binary",
+                                                  calleeType);
+              return emitCallableDispatch(expr, binaryCallee,
+                                          emitCallOperands(expr));
+            }
+          }
+        }
         if (*canonical == "asyncio.sleep")
           if (auto symbol = types.lookupSymbol(name))
             return emitCallableDispatch(

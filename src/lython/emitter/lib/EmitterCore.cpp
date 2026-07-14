@@ -49,8 +49,13 @@ EmitResult ModuleEmitter::emit() {
   }
   builder.setInsertionPointToEnd(module.getBody());
 
-  // Register module globals before any function body is emitted so their
-  // reads resolve. Publish their names/types for runtime storage lowering.
+  predeclareSourceModules();
+  predeclareTopLevel();
+
+  // Register module globals after the top-level classes are predeclared (a
+  // global's annotation may name a user class) but before any function body
+  // is emitted so their reads resolve. Publish their names/types for
+  // runtime storage lowering.
   collectModuleGlobals(moduleNode);
   if (!moduleGlobals.empty()) {
     llvm::SmallVector<std::string, 4> globalNames;
@@ -63,8 +68,6 @@ EmitResult ModuleEmitter::emit() {
     module->setAttr("ly.module_global_types", typeArray(builder, globalTypes));
   }
 
-  predeclareSourceModules();
-  predeclareTopLevel();
   emitSourceModuleDeclarations();
   emitTopLevelDeclarations();
 
