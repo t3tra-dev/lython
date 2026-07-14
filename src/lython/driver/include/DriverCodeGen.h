@@ -69,6 +69,11 @@ std::string codeGenFeaturesForTarget(py::TensorLoweringTarget target,
 llvm::ExceptionHandling
 exceptionModelForTargetTriple(const llvm::Triple &triple);
 
+// Exception-unwind codegen options shared by the JIT and AOT target machine
+// setup; the JIT/AOT split must not change unwind behavior.
+void applyExceptionUnwindOptions(llvm::TargetOptions &options,
+                                 const llvm::Triple &triple);
+
 std::unique_ptr<llvm::TargetMachine>
 createCodeGenTargetMachine(py::TensorLoweringTarget target,
                            const DriverOptions &options,

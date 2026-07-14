@@ -594,62 +594,26 @@ py::CallableType substituteCallable(const AlgorithmM &types,
 
 mlir::Type substituteType(const AlgorithmM &types, mlir::Type type,
                           const TypeBindingMap &bindings, bool eraseUnbound) {
-  if (!type)
-    return type;
-  if (std::optional<std::string> name = staticParameterName(type)) {
-    auto found = bindings.find(*name);
-    if (found != bindings.end())
-      return found->second;
-    // An unbound type parameter with eraseUnbound set becomes an `object` top
-    // (e.g. an unspecialized generic call result or storage crossing). This is
-    // not an invalid-operation fallback: the erased top carries no protocol
-    // contract, so any later observation of the value requires fresh evidence
-    // it cannot obtain and is rejected at the static boundary rather than
-    // silently dispatched.
-    return eraseUnbound ? types.object() : type;
-  }
-  if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(type)) {
-    llvm::SmallVector<mlir::Type, 4> args;
-    for (mlir::Type arg : contract.getArguments())
-      args.push_back(substituteType(types, arg, bindings, eraseUnbound));
-    return py::ContractType::get(type.getContext(), contract.getContractName(),
-                                 args);
-  }
-  if (auto protocol = mlir::dyn_cast_if_present<py::ProtocolType>(type)) {
-    llvm::SmallVector<mlir::Type, 4> args;
-    for (mlir::Type arg : protocol.getArguments())
-      args.push_back(substituteType(types, arg, bindings, eraseUnbound));
-    return py::ProtocolType::get(type.getContext(), protocol.getProtocolName(),
-                                 args);
-  }
-  if (auto typeType = mlir::dyn_cast_if_present<py::TypeType>(type)) {
-    mlir::Type instance = substituteType(types, typeType.getInstanceType(),
-                                         bindings, eraseUnbound);
-    return instance ? py::TypeType::get(type.getContext(), instance)
-                    : mlir::Type();
-  }
-  if (auto unpack = mlir::dyn_cast_if_present<py::UnpackType>(type)) {
-    mlir::Type packed =
-        substituteType(types, unpack.getPackedType(), bindings, eraseUnbound);
-    return packed ? py::UnpackType::get(type.getContext(), packed)
-                  : mlir::Type();
-  }
-  if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(type)) {
-    llvm::SmallVector<mlir::Type, 4> members;
-    for (mlir::Type member : unionType.getMemberTypes())
-      members.push_back(substituteType(types, member, bindings, eraseUnbound));
-    return py::UnionType::getNormalized(type.getContext(), members);
-  }
-  if (auto callable = mlir::dyn_cast_if_present<py::CallableType>(type))
-    return substituteCallable(types, callable, bindings, eraseUnbound);
-  if (auto overload = mlir::dyn_cast_if_present<py::OverloadType>(type)) {
-    llvm::SmallVector<mlir::Type, 4> candidates;
-    for (mlir::Type candidate : overload.getCandidateTypes())
-      candidates.push_back(
-          substituteType(types, candidate, bindings, eraseUnbound));
-    return py::OverloadType::get(type.getContext(), candidates);
-  }
-  return type;
+  return py::mapPyTypeStructure(
+      type, [&](mlir::Type node) -> std::optional<mlir::Type> {
+        if (std::optional<std::string> name = staticParameterName(node)) {
+          auto found = bindings.find(*name);
+          if (found != bindings.end())
+            return found->second;
+          // An unbound type parameter with eraseUnbound set becomes an
+          // `object` top (e.g. an unspecialized generic call result or
+          // storage crossing). This is not an invalid-operation fallback:
+          // the erased top carries no protocol contract, so any later
+          // observation of the value requires fresh evidence it cannot
+          // obtain and is rejected at the static boundary rather than
+          // silently dispatched.
+          return eraseUnbound ? types.object() : node;
+        }
+        if (auto callable = mlir::dyn_cast<py::CallableType>(node))
+          return mlir::Type(
+              substituteCallable(types, callable, bindings, eraseUnbound));
+        return std::nullopt;
+      });
 }
 
 mlir::Type callableResultType(const AlgorithmM &types,

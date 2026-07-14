@@ -1303,6 +1303,11 @@ public:
       arch::x86::registerX86Dialects(registry);
   }
 
+  // The pass ordering and target selection below are schedule decisions that
+  // per docs/lowering-architecture.md belong in a layer-4 transform strategy
+  // (__lython_strategy_*), not in C++. They stay here because primitive
+  // tensors are builtins with no owning manifest in runtime/modules/ to hold
+  // such a strategy; move them once that receptacle exists.
   void runOnOperation() final {
     mlir::bufferization::OneShotBufferizePassOptions bufferizeOptions;
     bufferizeOptions.allowUnknownOps = true;

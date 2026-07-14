@@ -14,22 +14,6 @@ bool isPrimitiveOnlyCallable(py::CallableType callable) {
          llvm::all_of(callable.getResultTypes(), isRuntimePrimitive);
 }
 
-bool isCoroutineLikeResultType(mlir::Type type) {
-  if (runtimeContractName(type) == "types.CoroutineType")
-    return true;
-  auto protocol = mlir::dyn_cast_if_present<py::ProtocolType>(type);
-  return protocol && protocol.getProtocolName() == "Coroutine";
-}
-
-bool isAwaitIteratorLikeResultType(mlir::Type type) {
-  std::string contract = runtimeContractName(type);
-  if (contract == "types.CoroutineAwaitIterator" ||
-      contract == "_asyncio.FutureIter" || contract == "_asyncio.TaskIter")
-    return true;
-  auto protocol = mlir::dyn_cast_if_present<py::ProtocolType>(type);
-  return protocol && protocol.getProtocolName() == "Generator";
-}
-
 mlir::Type concreteCoroutineTypeForTarget(mlir::MLIRContext *context,
                                           mlir::func::FuncOp target) {
   auto bodyResult =
@@ -368,9 +352,7 @@ bool RuntimeBundleLowerer::isPrimitiveI64CallableEligible(
   if (!RuntimeBundleLowerer::callableClosureTypes(function).empty())
     return false;
 
-  auto callableAttr = function->getAttrOfType<mlir::TypeAttr>("callable_type");
-  auto callable = mlir::dyn_cast_if_present<py::CallableType>(
-      callableAttr ? callableAttr.getValue() : mlir::Type());
+  py::CallableType callable = callableTypeOf(function);
   if (!callable || callable.getResultTypes().size() != 1 ||
       callable.hasVararg() || callable.hasKwarg() ||
       !callable.getKwOnlyTypes().empty() ||
@@ -476,9 +458,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableProtocolArgumentABIs() {
     if (!target || target.isDeclaration())
       return mlir::WalkResult::advance();
 
-    auto callableAttr = target->getAttrOfType<mlir::TypeAttr>("callable_type");
-    auto callable = mlir::dyn_cast_if_present<py::CallableType>(
-        callableAttr ? callableAttr.getValue() : mlir::Type());
+    py::CallableType callable = callableTypeOf(target);
     if (!callable)
       return mlir::WalkResult::advance();
 

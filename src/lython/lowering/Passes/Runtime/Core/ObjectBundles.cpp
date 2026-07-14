@@ -428,10 +428,7 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultValue(
       return mlir::failure();
     mlir::Type resultType = parameterType;
     if (runtimeContractName(resultType).empty()) {
-      auto callableAttr =
-          provider->getAttrOfType<mlir::TypeAttr>("callable_type");
-      if (auto callable = mlir::dyn_cast_if_present<py::CallableType>(
-              callableAttr ? callableAttr.getValue() : mlir::Type()))
+      if (py::CallableType callable = callableTypeOf(provider))
         if (callable.getResultTypes().size() == 1)
           resultType = callable.getResultTypes().front();
     }

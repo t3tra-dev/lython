@@ -19,17 +19,6 @@ bool isOperationName(mlir::Operation *op, llvm::StringRef name) {
   return op && op->getName().getStringRef() == name;
 }
 
-std::optional<std::int64_t> constantIntValue(mlir::Value value) {
-  auto constant = value ? value.getDefiningOp<mlir::arith::ConstantOp>()
-                        : nullptr;
-  if (!constant)
-    return std::nullopt;
-  auto integer = mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue());
-  if (!integer)
-    return std::nullopt;
-  return integer.getValue().getSExtValue();
-}
-
 bool isEntryBlockArgument(mlir::Value value) {
   auto argument = mlir::dyn_cast_if_present<mlir::BlockArgument>(value);
   if (!argument)
@@ -202,14 +191,30 @@ llvm::StringRef retainPremiseSourceName(RetainPremiseSourceKind source) {
   return "unknown";
 }
 
-AtomicOperationKind classifyAtomicOperation(mlir::Operation *op) {
-  if (isOperationName(op, "memref.load"))
+std::optional<std::int64_t> constantIntValue(mlir::Value value) {
+  auto constant = value ? value.getDefiningOp<mlir::arith::ConstantOp>()
+                        : nullptr;
+  if (!constant)
+    return std::nullopt;
+  auto integer = mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue());
+  if (!integer)
+    return std::nullopt;
+  return integer.getValue().getSExtValue();
+}
+
+AtomicOperationKind classifyAtomicOperationName(llvm::StringRef name) {
+  if (name == "memref.load")
     return AtomicOperationKind::Load;
-  if (isOperationName(op, "memref.store"))
+  if (name == "memref.store")
     return AtomicOperationKind::Store;
-  if (isOperationName(op, "memref.generic_atomic_rmw"))
+  if (name == "memref.generic_atomic_rmw")
     return AtomicOperationKind::RMW;
   return AtomicOperationKind::Unsupported;
+}
+
+AtomicOperationKind classifyAtomicOperation(mlir::Operation *op) {
+  return op ? classifyAtomicOperationName(op->getName().getStringRef())
+            : AtomicOperationKind::Unsupported;
 }
 
 AtomicRoleKind classifyAtomicRole(llvm::StringRef role,

@@ -1,5 +1,6 @@
 #include "PyDialectTypes.h"
 
+#include "Contracts.h"
 #include "ExceptionTaxonomy.h"
 
 #include "CallableArgumentMatcher.h"
@@ -18,6 +19,9 @@
 #include <string>
 
 namespace py {
+
+using contracts::isIntegerLiteralSpelling;
+using contracts::manifestClassNameForContract;
 
 namespace detail {
 
@@ -112,15 +116,6 @@ static bool isContractSubclassOf(ContractType subtype, ContractType supertype) {
                                       supertype.getContractName());
 }
 
-static bool isIntegerLiteralSpelling(llvm::StringRef spelling) {
-  if (spelling.empty())
-    return false;
-  if (spelling.front() == '-')
-    spelling = spelling.drop_front();
-  return !spelling.empty() &&
-         llvm::all_of(spelling, [](char ch) { return ch >= '0' && ch <= '9'; });
-}
-
 static std::optional<llvm::StringRef> literalContractName(LiteralType literal) {
   llvm::StringRef spelling = literal.getSpelling();
   if (spelling == "True" || spelling == "False")
@@ -132,16 +127,6 @@ static std::optional<llvm::StringRef> literalContractName(LiteralType literal) {
   if (isIntegerLiteralSpelling(spelling))
     return llvm::StringRef("builtins.int");
   return std::nullopt;
-}
-
-static std::string manifestClassNameForContract(llvm::StringRef name) {
-  for (llvm::StringRef prefix :
-       {"builtins.", "typing.", "types.", "contextlib.", "_asyncio.",
-        "asyncio.", "contextvars.", "ctypes.", "_ctypes.", "_typeshed."}) {
-    if (name.consume_front(prefix))
-      return name.str();
-  }
-  return name.str();
 }
 
 static bool isLiteralBool(LiteralType literal) {
@@ -624,82 +609,135 @@ bool isStaticTypeParameter(mlir::Type type) {
   return false;
 }
 
-mlir::Type eraseStaticTypeParameters(mlir::Type type) {
+CallableType rebuildCallableWith(
+    CallableType callable,
+    llvm::function_ref<mlir::Type(mlir::Type)> mapChild) {
+  bool changed = false;
+  bool failed = false;
+  auto mapOne = [&](mlir::Type child) -> mlir::Type {
+    mlir::Type mapped = mapChild(child);
+    if (child && !mapped)
+      failed = true;
+    changed |= mapped != child;
+    return mapped;
+  };
+  llvm::SmallVector<mlir::Type, 8> positional;
+  positional.reserve(callable.getPositionalTypes().size());
+  for (mlir::Type argument : callable.getPositionalTypes())
+    positional.push_back(mapOne(argument));
+  llvm::SmallVector<mlir::Type, 4> kwonly;
+  kwonly.reserve(callable.getKwOnlyTypes().size());
+  for (mlir::Type argument : callable.getKwOnlyTypes())
+    kwonly.push_back(mapOne(argument));
+  llvm::SmallVector<mlir::Type, 1> results;
+  results.reserve(callable.getResultTypes().size());
+  for (mlir::Type result : callable.getResultTypes())
+    results.push_back(mapOne(result));
+  mlir::Type vararg;
+  if (callable.hasVararg())
+    vararg = mapOne(callable.getVarargType());
+  mlir::Type kwarg;
+  if (callable.hasKwarg())
+    kwarg = mapOne(callable.getKwargType());
+  if (failed)
+    return {};
+  if (!changed)
+    return callable;
+  return CallableType::get(
+      callable.getContext(), positional, kwonly, vararg, kwarg, results,
+      callable.getPositionalNames(), callable.getKwOnlyNames(),
+      callable.getPositionalDefaults(), callable.getKwOnlyDefaults(),
+      callable.getVarargName(), callable.getKwargName(),
+      callable.getPositionalOnlyCount());
+}
+
+mlir::Type mapPyTypeStructure(
+    mlir::Type type,
+    llvm::function_ref<std::optional<mlir::Type>(mlir::Type)> transform) {
   if (!type)
     return type;
-  if (!isPyType(type))
-    return type;
+  if (std::optional<mlir::Type> replaced = transform(type))
+    return *replaced;
 
   mlir::MLIRContext *context = type.getContext();
-  if (auto unpack = mlir::dyn_cast<UnpackType>(type))
-    return UnpackType::get(context,
-                           eraseStaticTypeParameters(unpack.getPackedType()));
+  bool failed = false;
+  bool changed = false;
+  auto mapChild = [&](mlir::Type child) -> mlir::Type {
+    mlir::Type mapped = mapPyTypeStructure(child, transform);
+    if (child && !mapped)
+      failed = true;
+    changed |= mapped != child;
+    return mapped;
+  };
+  auto mapList = [&](llvm::ArrayRef<mlir::Type> children,
+                     llvm::SmallVectorImpl<mlir::Type> &out) {
+    out.reserve(children.size());
+    for (mlir::Type child : children)
+      out.push_back(mapChild(child));
+  };
 
-  if (isStaticTypeParameter(type))
-    return pyObjectContractType(context);
-  if (auto typeType = mlir::dyn_cast<TypeType>(type)) {
-    return TypeType::get(context,
-                         eraseStaticTypeParameters(typeType.getInstanceType()));
+  if (auto unpack = mlir::dyn_cast<UnpackType>(type)) {
+    mlir::Type packed = mapChild(unpack.getPackedType());
+    if (failed)
+      return {};
+    return changed ? UnpackType::get(context, packed) : type;
   }
-  if (auto protocol = mlir::dyn_cast<ProtocolType>(type)) {
-    llvm::SmallVector<mlir::Type> arguments;
-    arguments.reserve(protocol.getArguments().size());
-    for (mlir::Type argument : protocol.getArguments())
-      arguments.push_back(eraseStaticTypeParameters(argument));
-    return ProtocolType::get(context, protocol.getProtocolName(), arguments);
+  if (auto typeType = mlir::dyn_cast<TypeType>(type)) {
+    mlir::Type instance = mapChild(typeType.getInstanceType());
+    if (failed)
+      return {};
+    return changed ? TypeType::get(context, instance) : type;
   }
   if (auto contract = mlir::dyn_cast<ContractType>(type)) {
-    llvm::SmallVector<mlir::Type> arguments;
-    arguments.reserve(contract.getArguments().size());
-    for (mlir::Type argument : contract.getArguments())
-      arguments.push_back(eraseStaticTypeParameters(argument));
-    return ContractType::get(context, contract.getContractName(), arguments);
+    llvm::SmallVector<mlir::Type, 4> arguments;
+    mapList(contract.getArguments(), arguments);
+    if (failed)
+      return {};
+    return changed
+               ? ContractType::get(context, contract.getContractName(),
+                                   arguments)
+               : type;
+  }
+  if (auto protocol = mlir::dyn_cast<ProtocolType>(type)) {
+    llvm::SmallVector<mlir::Type, 4> arguments;
+    mapList(protocol.getArguments(), arguments);
+    if (failed)
+      return {};
+    return changed
+               ? ProtocolType::get(context, protocol.getProtocolName(),
+                                   arguments)
+               : type;
   }
   if (auto unionType = mlir::dyn_cast<UnionType>(type)) {
-    llvm::SmallVector<mlir::Type> members;
-    members.reserve(unionType.getMemberTypes().size());
-    for (mlir::Type member : unionType.getMemberTypes())
-      members.push_back(eraseStaticTypeParameters(member));
-    return UnionType::getNormalized(context, members);
+    llvm::SmallVector<mlir::Type, 4> members;
+    mapList(unionType.getMemberTypes(), members);
+    if (failed)
+      return {};
+    return changed ? UnionType::getNormalized(context, members) : type;
   }
-  if (auto signature = mlir::dyn_cast<CallableType>(type)) {
-    llvm::SmallVector<mlir::Type> positional;
-    positional.reserve(signature.getPositionalTypes().size());
-    for (mlir::Type argument : signature.getPositionalTypes())
-      positional.push_back(eraseStaticTypeParameters(argument));
-
-    llvm::SmallVector<mlir::Type> kwonly;
-    kwonly.reserve(signature.getKwOnlyTypes().size());
-    for (mlir::Type argument : signature.getKwOnlyTypes())
-      kwonly.push_back(eraseStaticTypeParameters(argument));
-
-    llvm::SmallVector<mlir::Type> results;
-    results.reserve(signature.getResultTypes().size());
-    for (mlir::Type result : signature.getResultTypes())
-      results.push_back(eraseStaticTypeParameters(result));
-
-    mlir::Type vararg;
-    if (signature.hasVararg())
-      vararg = eraseStaticTypeParameters(signature.getVarargType());
-    mlir::Type kwarg;
-    if (signature.hasKwarg())
-      kwarg = eraseStaticTypeParameters(signature.getKwargType());
-
-    return CallableType::get(
-        context, positional, kwonly, vararg, kwarg, results,
-        signature.getPositionalNames(), signature.getKwOnlyNames(),
-        signature.getPositionalDefaults(), signature.getKwOnlyDefaults(),
-        signature.getVarargName(), signature.getKwargName(),
-        signature.getPositionalOnlyCount());
-  }
+  if (auto callable = mlir::dyn_cast<CallableType>(type))
+    return rebuildCallableWith(callable, [&](mlir::Type child) {
+      return mapPyTypeStructure(child, transform);
+    });
   if (auto overload = mlir::dyn_cast<OverloadType>(type)) {
-    llvm::SmallVector<mlir::Type> candidates;
-    candidates.reserve(overload.getCandidateTypes().size());
-    for (mlir::Type candidate : overload.getCandidateTypes())
-      candidates.push_back(eraseStaticTypeParameters(candidate));
-    return OverloadType::get(context, candidates);
+    llvm::SmallVector<mlir::Type, 4> candidates;
+    mapList(overload.getCandidateTypes(), candidates);
+    if (failed)
+      return {};
+    return changed ? OverloadType::get(context, candidates) : type;
   }
   return type;
+}
+
+mlir::Type eraseStaticTypeParameters(mlir::Type type) {
+  return mapPyTypeStructure(
+      type, [](mlir::Type node) -> std::optional<mlir::Type> {
+        if (!isPyType(node))
+          return node;
+        if (isStaticTypeParameter(node))
+          return pyObjectContractType(node.getContext());
+        return std::nullopt;
+      });
 }
 
 mlir::Type awaitableProtocolType(mlir::MLIRContext *ctx,

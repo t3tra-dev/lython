@@ -6,14 +6,7 @@
 
 namespace py::contracts {
 
-bool isIntegerLiteralSpelling(llvm::StringRef spelling) {
-  if (spelling.empty())
-    return false;
-  if (spelling.front() == '-')
-    spelling = spelling.drop_front();
-  return !spelling.empty() &&
-         llvm::all_of(spelling, [](char ch) { return ch >= '0' && ch <= '9'; });
-}
+
 
 std::string runtimeContractName(mlir::Type type) {
   if (auto contract = mlir::dyn_cast<py::ContractType>(type))

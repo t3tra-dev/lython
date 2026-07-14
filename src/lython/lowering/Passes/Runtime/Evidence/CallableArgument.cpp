@@ -67,15 +67,6 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableArgumentEvidenceABIs() {
     return {};
   };
 
-  auto callableTypeFor = [](mlir::func::FuncOp function) -> py::CallableType {
-    if (!function || function.isDeclaration())
-      return {};
-    auto callableAttr =
-        function->getAttrOfType<mlir::TypeAttr>("callable_type");
-    return mlir::dyn_cast_if_present<py::CallableType>(
-        callableAttr ? callableAttr.getValue() : mlir::Type());
-  };
-
   auto isCoroutineLikeType = [](mlir::Type type) {
     if (runtimeContractName(type) == "types.CoroutineType")
       return true;
@@ -100,7 +91,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableArgumentEvidenceABIs() {
         !target->hasAttr("ly.async.body_result"))
       return std::nullopt;
 
-    py::CallableType callable = callableTypeFor(target);
+    py::CallableType callable = callableTypeOf(target);
     if (!callable)
       return std::nullopt;
 
@@ -176,10 +167,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableArgumentEvidenceABIs() {
         module.lookupSymbol<mlir::func::FuncOp>(binding.getBinding());
     if (!producer || producer.isDeclaration())
       return std::nullopt;
-    auto callableAttr =
-        producer->getAttrOfType<mlir::TypeAttr>("callable_type");
-    auto callable = mlir::dyn_cast_if_present<py::CallableType>(
-        callableAttr ? callableAttr.getValue() : mlir::Type());
+    py::CallableType callable = callableTypeOf(producer);
     if (!callable)
       return std::nullopt;
     std::optional<StaticCallableInvocation> invocation =
@@ -210,11 +198,8 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableArgumentEvidenceABIs() {
 
   llvm::StringMap<llvm::SmallVector<char, 8>> requirements;
   module.walk([&](mlir::func::FuncOp function) {
-    auto callableAttr =
-        function->getAttrOfType<mlir::TypeAttr>("callable_type");
-    auto callable = mlir::dyn_cast_if_present<py::CallableType>(
-        callableAttr ? callableAttr.getValue() : mlir::Type());
-    if (!callable || function.isDeclaration())
+    py::CallableType callable = callableTypeOf(function);
+    if (!callable)
       return;
     llvm::SmallVector<mlir::Type, 8> logicalTypes =
         RuntimeBundleLowerer::callableLogicalInputTypes(function, callable);
@@ -251,7 +236,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableArgumentEvidenceABIs() {
 
   auto ensureRequirement =
       [&](mlir::func::FuncOp function) -> llvm::SmallVector<char, 8> * {
-    py::CallableType callable = callableTypeFor(function);
+    py::CallableType callable = callableTypeOf(function);
     if (!callable)
       return nullptr;
     llvm::SmallVector<mlir::Type, 8> logicalTypes =
@@ -275,7 +260,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableArgumentEvidenceABIs() {
 
       mlir::func::FuncOp target =
           module.lookupSymbol<mlir::func::FuncOp>(binding.getBinding());
-      py::CallableType callable = callableTypeFor(target);
+      py::CallableType callable = callableTypeOf(target);
       if (!callable)
         return mlir::WalkResult::advance();
 
@@ -382,7 +367,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableArgumentEvidenceABIs() {
 
       mlir::func::FuncOp target =
           module.lookupSymbol<mlir::func::FuncOp>(binding.getBinding());
-      py::CallableType callable = callableTypeFor(target);
+      py::CallableType callable = callableTypeOf(target);
       if (!callable)
         return mlir::WalkResult::advance();
       auto required = requirements.find(target.getSymName());

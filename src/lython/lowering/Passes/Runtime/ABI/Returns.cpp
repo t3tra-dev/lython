@@ -4,9 +4,7 @@ namespace py::lowering {
 namespace {
 
 bool isPrimitiveOnlyCallableFunction(mlir::func::FuncOp function) {
-  auto callableAttr = function->getAttrOfType<mlir::TypeAttr>("callable_type");
-  auto callable = mlir::dyn_cast_if_present<py::CallableType>(
-      callableAttr ? callableAttr.getValue() : mlir::Type());
+  py::CallableType callable = callableTypeOf(function);
   if (!callable || callable.hasVararg() || callable.hasKwarg())
     return false;
   auto isRuntimePrimitive = [](mlir::Type type) {
@@ -19,22 +17,6 @@ bool isPrimitiveOnlyCallableFunction(mlir::func::FuncOp function) {
 
 bool isErasedObjectResult(mlir::Type type) {
   return runtimeContractName(type) == "builtins.object";
-}
-
-bool isCoroutineLikeResultType(mlir::Type type) {
-  if (runtimeContractName(type) == "types.CoroutineType")
-    return true;
-  auto protocol = mlir::dyn_cast_if_present<py::ProtocolType>(type);
-  return protocol && protocol.getProtocolName() == "Coroutine";
-}
-
-bool isAwaitIteratorLikeResultType(mlir::Type type) {
-  std::string contract = runtimeContractName(type);
-  if (contract == "types.CoroutineAwaitIterator" ||
-      contract == "_asyncio.FutureIter" || contract == "_asyncio.TaskIter")
-    return true;
-  auto protocol = mlir::dyn_cast_if_present<py::ProtocolType>(type);
-  return protocol && protocol.getProtocolName() == "Generator";
 }
 
 mlir::Value integerConstant(mlir::OpBuilder &builder, mlir::Location loc,
@@ -160,10 +142,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
     if (isPrimitiveOnlyCallableFunction(function))
       return mlir::WalkResult::advance();
 
-    auto callableAttr =
-        function->getAttrOfType<mlir::TypeAttr>("callable_type");
-    auto callable = mlir::dyn_cast_if_present<py::CallableType>(
-        callableAttr ? callableAttr.getValue() : mlir::Type());
+    py::CallableType callable = callableTypeOf(function);
     llvm::SmallVector<mlir::Type, 4> logicalResultTypes;
     if (callable)
       logicalResultTypes.append(callable.getResultTypes().begin(),

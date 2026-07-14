@@ -29,15 +29,7 @@ namespace ts = py::threadsafe;
 inline constexpr llvm::StringLiteral kLoweredSafetyContractsAttr{
     "ly.lowered_safety_contracts"};
 
-std::optional<int64_t> constantIntValue(mlir::Value value) {
-  auto constant = value.getDefiningOp<mlir::arith::ConstantOp>();
-  if (!constant)
-    return std::nullopt;
-  auto integer = mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue());
-  if (!integer)
-    return std::nullopt;
-  return integer.getValue().getSExtValue();
-}
+using ts::constantIntValue;
 
 bool isConstant(mlir::Value value, int64_t expected) {
   std::optional<int64_t> actual = constantIntValue(value);
@@ -172,18 +164,6 @@ mlir::LogicalResult verifyRefcountAtomicBody(mlir::Operation *op, bool retain) {
   return mlir::success();
 }
 
-struct HappensBeforeResourceUse {
-  mlir::Operation *op = nullptr;
-};
-
-ts::AtomicOperationKind operationKindFromName(llvm::StringRef name) {
-  return llvm::StringSwitch<ts::AtomicOperationKind>(name)
-      .Case("memref.load", ts::AtomicOperationKind::Load)
-      .Case("memref.store", ts::AtomicOperationKind::Store)
-      .Case("memref.generic_atomic_rmw", ts::AtomicOperationKind::RMW)
-      .Default(ts::AtomicOperationKind::Unsupported);
-}
-
 bool isFuturePayloadRole(llvm::StringRef role) {
   return role == "asyncio.future.result.token" ||
          role == "asyncio.future.result.token.clear" ||
@@ -271,8 +251,7 @@ mlir::LogicalResult verifyAtomicContract(mlir::Operation *op) {
 
 mlir::LogicalResult verifySchedulerHappensBeforeContracts(
     mlir::ModuleOp module) {
-  llvm::StringSet<> published;
-  llvm::StringMap<HappensBeforeResourceUse> firstAcquire;
+  ts::HappensBeforeLedger<mlir::Operation *> ledger;
   VerificationResult verified;
 
   module.walk([&](mlir::Operation *op) {
@@ -286,27 +265,15 @@ mlir::LogicalResult verifySchedulerHappensBeforeContracts(
     }
     if (!*contract)
       return;
-    for (const ts::HappensBeforeEdge &edge :
-         ts::schedulerHappensBeforeEdges(**contract)) {
-      if (edge.effect == ts::HappensBeforeEffect::Publish) {
-        published.insert(edge.resource);
-        continue;
-      }
-      if (!firstAcquire.contains(edge.resource))
-        firstAcquire[edge.resource] = {op};
-    }
+    ledger.record(**contract, op);
   });
   if (verified.failed())
     return mlir::failure();
 
-  for (const auto &entry : firstAcquire) {
-    if (published.contains(entry.getKey()))
-      continue;
-    mlir::Operation *op = entry.getValue().op;
-    return op->emitError()
+  if (auto unmatched = ledger.firstUnmatchedAcquire())
+    return unmatched->second->emitError()
            << "scheduler happens-before acquire for resource '"
-           << entry.getKey() << "' has no matching runtime publisher";
-  }
+           << unmatched->first << "' has no matching runtime publisher";
 
   return mlir::success();
 }
@@ -463,119 +430,87 @@ mlir::LogicalResult
 verifyPreservedSafetyContract(mlir::ModuleOp module,
                               const PreservedSafetyContract &contract,
                               unsigned index) {
+  auto contractError = [&]() {
+    return module.emitError()
+           << kLoweredSafetyContractsAttr << " entry " << index << " ";
+  };
   std::optional<ts::AtomicOrderingRank> ordering =
       ts::parseAtomicOrdering(contract.ordering);
   if (!ordering)
-    return module.emitError()
-           << kLoweredSafetyContractsAttr << " entry " << index
-           << " has unknown atomic ordering " << contract.ordering;
+    return contractError()
+           << "has unknown atomic ordering " << contract.ordering;
   std::optional<ts::RetainPremiseKind> retainPremise =
       ts::parseRetainPremise(contract.retainPremise);
   if (!retainPremise)
-    return module.emitError()
-           << kLoweredSafetyContractsAttr << " entry " << index
-           << " has unknown retain premise " << contract.retainPremise;
+    return contractError()
+           << "has unknown retain premise " << contract.retainPremise;
   std::optional<ts::RetainPremiseSourceKind> retainPremiseSource =
       ts::parseRetainPremiseSource(contract.retainPremiseSource);
   if (!retainPremiseSource)
-    return module.emitError()
-           << kLoweredSafetyContractsAttr << " entry " << index
-           << " has unknown retain premise source "
-           << contract.retainPremiseSource;
+    return contractError() << "has unknown retain premise source "
+                           << contract.retainPremiseSource;
 
-  bool isLoad = contract.operationName == "memref.load";
-  bool isStore = contract.operationName == "memref.store";
-  bool isRmw = contract.operationName == "memref.generic_atomic_rmw";
+  ts::AtomicOperationKind operationKind =
+      ts::classifyAtomicOperationName(contract.operationName);
+  if (operationKind == ts::AtomicOperationKind::Unsupported)
+    return contractError()
+           << "must originate from memref load/store/RMW operation";
+  ts::AtomicRoleKind roleKind =
+      ts::classifyAtomicRole(contract.role, operationKind);
 
   if (std::optional<std::int64_t> expected =
           ts::expectedAtomicSlot(contract.role)) {
     if (contract.slot < 0)
-      return module.emitError()
-             << kLoweredSafetyContractsAttr << " entry " << index
-             << " role " << contract.role
-             << " requires preserved atomic slot " << *expected;
+      return contractError() << "role " << contract.role
+                             << " requires preserved atomic slot " << *expected;
     if (contract.slot != *expected)
-      return module.emitError()
-             << kLoweredSafetyContractsAttr << " entry " << index
-             << " role " << contract.role << " preserves slot "
-             << contract.slot << " but requires slot " << *expected;
+      return contractError()
+             << "role " << contract.role << " preserves slot " << contract.slot
+             << " but requires slot " << *expected;
   }
 
-  if (contract.role.contains("refcount.retain")) {
-    if (!isRmw)
-      return module.emitError()
-             << kLoweredSafetyContractsAttr << " entry " << index
-             << " refcount retain contract must originate from "
-                "memref.generic_atomic_rmw";
-    if (!ts::orderingAtLeast(*ordering, ts::AtomicOrderingRank::Monotonic))
-      return module.emitError()
-             << kLoweredSafetyContractsAttr << " entry " << index
-             << " refcount retain requires monotonic ordering";
+  if ((roleKind == ts::AtomicRoleKind::RefcountRetain ||
+       roleKind == ts::AtomicRoleKind::RefcountRelease) &&
+      operationKind != ts::AtomicOperationKind::RMW)
+    return contractError() << "refcount " << contract.role
+                           << " contract must originate from "
+                              "memref.generic_atomic_rmw";
+  if ((roleKind == ts::AtomicRoleKind::RefcountLoad ||
+       roleKind == ts::AtomicRoleKind::SharedLoad) &&
+      operationKind != ts::AtomicOperationKind::Load)
+    return contractError()
+           << "load atomic role must originate from memref.load";
+
+  ts::AtomicOrderingRank required =
+      ts::requiredOrdering(roleKind, operationKind);
+  if (required == ts::AtomicOrderingRank::Invalid)
+    return contractError() << "atomic role " << contract.role
+                           << " has no no-GIL ordering rule";
+  if (!ts::orderingAtLeast(*ordering, required))
+    return contractError()
+           << "atomic role " << contract.role << " requires at least "
+           << ts::atomicOrderingName(required) << " ordering";
+
+  if (roleKind == ts::AtomicRoleKind::RefcountRetain) {
     if (*retainPremise == ts::RetainPremiseKind::None)
-      return module.emitError()
-             << kLoweredSafetyContractsAttr << " entry " << index
-             << " refcount retain requires a preserved valid "
-             << own::kAtomicRetainPremiseAttr;
+      return contractError() << "refcount retain requires a preserved valid "
+                             << own::kAtomicRetainPremiseAttr;
     if (contract.retainPremiseSource.empty() ||
         contract.retainPremiseSource == "unknown")
-      return module.emitError()
-             << kLoweredSafetyContractsAttr << " entry " << index
-             << " refcount retain requires a preserved inferred live-token "
+      return contractError()
+             << "refcount retain requires a preserved inferred live-token "
                 "source";
-    if (!ts::retainPremiseAllowsSource(*retainPremise,
-                                       *retainPremiseSource))
-      return module.emitError()
-             << kLoweredSafetyContractsAttr << " entry " << index
-             << " refcount retain premise " << contract.retainPremise
+    if (!ts::retainPremiseAllowsSource(*retainPremise, *retainPremiseSource))
+      return contractError()
+             << "refcount retain premise " << contract.retainPremise
              << " does not match preserved live-token source "
              << contract.retainPremiseSource;
-    return mlir::success();
+  } else if (*retainPremise != ts::RetainPremiseKind::None) {
+    return contractError() << own::kAtomicRetainPremiseAttr
+                           << " is only valid on refcount retain RMW";
   }
 
-  if (contract.role.contains("refcount.release")) {
-    if (!isRmw)
-      return module.emitError()
-             << kLoweredSafetyContractsAttr << " entry " << index
-             << " refcount release contract must originate from "
-                "memref.generic_atomic_rmw";
-    if (!ts::orderingAtLeast(*ordering, ts::AtomicOrderingRank::AcqRel))
-      return module.emitError()
-             << kLoweredSafetyContractsAttr << " entry " << index
-             << " refcount release requires acq_rel ordering";
-    return mlir::success();
-  }
-
-  if (contract.role.contains(".load")) {
-    if (!isLoad)
-      return module.emitError()
-             << kLoweredSafetyContractsAttr << " entry " << index
-             << " load atomic role must originate from memref.load";
-    if (!ts::orderingAtLeast(*ordering, ts::AtomicOrderingRank::Acquire))
-      return module.emitError()
-             << kLoweredSafetyContractsAttr << " entry " << index
-             << " shared load requires acquire ordering";
-    return mlir::success();
-  }
-
-  if (isStore) {
-    if (!ts::orderingAtLeast(*ordering, ts::AtomicOrderingRank::Release))
-      return module.emitError()
-             << kLoweredSafetyContractsAttr << " entry " << index
-             << " shared store requires release ordering";
-    return mlir::success();
-  }
-
-  if (isRmw) {
-    if (!ts::orderingAtLeast(*ordering, ts::AtomicOrderingRank::AcqRel))
-      return module.emitError()
-             << kLoweredSafetyContractsAttr << " entry " << index
-             << " synchronizing RMW requires acq_rel ordering";
-    return mlir::success();
-  }
-
-  return module.emitError()
-         << kLoweredSafetyContractsAttr << " entry " << index
-         << " must originate from memref load/store/RMW operation";
+  return mlir::success();
 }
 
 mlir::LogicalResult
@@ -586,8 +521,7 @@ verifyPreservedLoweredSafetyContracts(mlir::ModuleOp module) {
     return mlir::success();
 
   std::optional<std::int64_t> previousOrdinal;
-  llvm::StringSet<> published;
-  llvm::StringMap<unsigned> firstAcquire;
+  ts::HappensBeforeLedger<unsigned> ledger;
   for (auto [index, raw] : llvm::enumerate(contractsAttr)) {
     auto contract =
         readPreservedSafetyContract(module, raw, static_cast<unsigned>(index));
@@ -606,28 +540,16 @@ verifyPreservedLoweredSafetyContracts(mlir::ModuleOp module) {
 
     ts::AtomicContract atomic;
     atomic.role = contract->role.str();
-    atomic.operationKind = operationKindFromName(contract->operationName);
-    for (const ts::HappensBeforeEdge &edge :
-         ts::schedulerHappensBeforeEdges(atomic)) {
-      if (edge.effect == ts::HappensBeforeEffect::Publish) {
-        published.insert(edge.resource);
-        continue;
-      }
-      if (!firstAcquire.contains(edge.resource))
-        firstAcquire[edge.resource] = static_cast<unsigned>(index);
-    }
+    atomic.operationKind = ts::classifyAtomicOperationName(contract->operationName);
+    ledger.record(atomic, static_cast<unsigned>(index));
   }
 
-  for (const auto &entry : firstAcquire) {
-    if (published.contains(entry.getKey()))
-      continue;
+  if (auto unmatched = ledger.firstUnmatchedAcquire())
     return module.emitError()
-           << kLoweredSafetyContractsAttr << " entry "
-           << entry.getValue()
+           << kLoweredSafetyContractsAttr << " entry " << unmatched->second
            << " scheduler happens-before acquire for resource '"
-           << entry.getKey()
+           << unmatched->first
            << "' has no preserved matching runtime publisher";
-  }
 
   return mlir::success();
 }

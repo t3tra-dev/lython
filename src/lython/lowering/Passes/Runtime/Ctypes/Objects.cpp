@@ -667,10 +667,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCtypesCallbackConstruction(
   // The clone takes one logical int per callback parameter.
   if (mlir::func::FuncOp cloneFunction =
           module.lookupSymbol<mlir::func::FuncOp>(*clone)) {
-    auto callableAttr =
-        cloneFunction->getAttrOfType<mlir::TypeAttr>("callable_type");
-    auto callableType = mlir::dyn_cast_if_present<py::CallableType>(
-        callableAttr ? callableAttr.getValue() : mlir::Type());
+    py::CallableType callableType = callableTypeOf(cloneFunction);
     if (!callableType ||
         callableType.getPositionalTypes().size() != argCodes.size())
       return op.emitError()

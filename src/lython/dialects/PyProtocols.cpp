@@ -1,5 +1,7 @@
 #include "PyProtocols.h"
 
+#include "Contracts.h"
+
 #include "CallableArgumentMatcher.h"
 #include "CandidateSelection.h"
 #include "PyCallableShape.h"
@@ -49,6 +51,9 @@ std::optional<std::int64_t> normalizeFiniteTupleIndex(std::int64_t index,
 }
 
 namespace {
+
+using py::contracts::isIntegerLiteralSpelling;
+using py::contracts::manifestClassNameForContract;
 
 std::vector<std::string> stringArray(mlir::Operation *op,
                                      llvm::StringRef name) {
@@ -221,58 +226,19 @@ mlir::Type substitute(mlir::Type type,
                       const std::map<std::string, mlir::Type> &binding) {
   if (!type)
     return type;
-  if (mlir::isa<py::SelfType>(type)) {
-    auto found = binding.find("Self");
-    return found == binding.end() ? type : found->second;
-  }
-  if (std::optional<llvm::StringRef> variable = typeVariableName(type)) {
-    auto found = binding.find(variable->str());
-    return found == binding.end() ? type : found->second;
-  }
-  if (auto contract = mlir::dyn_cast<py::ContractType>(type)) {
-    llvm::SmallVector<mlir::Type> args;
-    args.reserve(contract.getArguments().size());
-    for (mlir::Type arg : contract.getArguments()) {
-      mlir::Type substituted = substitute(arg, binding);
-      if (!substituted)
-        return {};
-      args.push_back(substituted);
-    }
-    return py::ContractType::get(type.getContext(), contract.getContractName(),
-                                 args);
-  }
-  if (auto unpack = mlir::dyn_cast<py::UnpackType>(type)) {
-    mlir::Type packed = substitute(unpack.getPackedType(), binding);
-    return packed ? py::UnpackType::get(type.getContext(), packed)
-                  : mlir::Type();
-  }
-  if (auto typeType = mlir::dyn_cast<py::TypeType>(type)) {
-    mlir::Type instance = substitute(typeType.getInstanceType(), binding);
-    return instance ? py::TypeType::get(type.getContext(), instance)
-                    : mlir::Type();
-  }
-  if (auto protocol = mlir::dyn_cast<py::ProtocolType>(type)) {
-    llvm::SmallVector<mlir::Type> args;
-    for (mlir::Type arg : protocol.getArguments()) {
-      mlir::Type substituted = substitute(arg, binding);
-      if (!substituted)
-        return {};
-      args.push_back(substituted);
-    }
-    return py::ProtocolType::get(type.getContext(), protocol.getProtocolName(),
-                                 args);
-  }
-  if (auto unionType = mlir::dyn_cast<py::UnionType>(type)) {
-    llvm::SmallVector<mlir::Type> members;
-    for (mlir::Type member : unionType.getMemberTypes()) {
-      mlir::Type substituted = substitute(member, binding);
-      if (!substituted)
-        return {};
-      members.push_back(substituted);
-    }
-    return py::UnionType::getNormalized(type.getContext(), members);
-  }
-  if (auto overload = mlir::dyn_cast<py::OverloadType>(type)) {
+  return py::mapPyTypeStructure(
+      type, [&](mlir::Type node) -> std::optional<mlir::Type> {
+        if (mlir::isa<py::SelfType>(node)) {
+          auto found = binding.find("Self");
+          return found == binding.end() ? node : found->second;
+        }
+        if (std::optional<llvm::StringRef> variable = typeVariableName(node)) {
+          auto found = binding.find(variable->str());
+          return found == binding.end() ? node : found->second;
+        }
+        if (auto signature = mlir::dyn_cast<py::CallableType>(node))
+          return mlir::Type(substituteSignature(signature, binding));
+      if (auto overload = mlir::dyn_cast<py::OverloadType>(node)) {
     llvm::SmallVector<mlir::Type> candidates;
     for (mlir::Type candidate : overload.getCandidateTypes()) {
       mlir::Type substituted = substitute(candidate, binding);
@@ -294,9 +260,8 @@ mlir::Type substitute(mlir::Type type,
       return candidates.front();
     return py::OverloadType::get(type.getContext(), candidates);
   }
-  if (auto signature = mlir::dyn_cast<py::CallableType>(type))
-    return substituteSignature(signature, binding);
-  return type;
+        return std::nullopt;
+      });
 }
 
 std::optional<ProtocolMethod> callableCallContract(py::CallableType callable) {
@@ -404,45 +369,9 @@ bindBaseInstantiation(const std::map<std::string, ProtocolInfo> &classes,
 py::CallableType
 substituteSignature(py::CallableType signature,
                     const std::map<std::string, mlir::Type> &binding) {
-  llvm::SmallVector<mlir::Type> positional;
-  for (mlir::Type type : signature.getPositionalTypes()) {
-    mlir::Type substituted = substitute(type, binding);
-    if (!substituted)
-      return {};
-    positional.push_back(substituted);
-  }
-  llvm::SmallVector<mlir::Type> results;
-  for (mlir::Type type : signature.getResultTypes()) {
-    mlir::Type substituted = substitute(type, binding);
-    if (!substituted)
-      return {};
-    results.push_back(substituted);
-  }
-  llvm::SmallVector<mlir::Type> kwonly;
-  for (mlir::Type type : signature.getKwOnlyTypes()) {
-    mlir::Type substituted = substitute(type, binding);
-    if (!substituted)
-      return {};
-    kwonly.push_back(substituted);
-  }
-  mlir::Type vararg;
-  if (signature.hasVararg()) {
-    vararg = substitute(signature.getVarargType(), binding);
-    if (!vararg)
-      return {};
-  }
-  mlir::Type kwarg;
-  if (signature.hasKwarg()) {
-    kwarg = substitute(signature.getKwargType(), binding);
-    if (!kwarg)
-      return {};
-  }
-  return py::CallableType::get(
-      signature.getContext(), positional, kwonly, vararg, kwarg, results,
-      signature.getPositionalNames(), signature.getKwOnlyNames(),
-      signature.getPositionalDefaults(), signature.getKwOnlyDefaults(),
-      signature.getVarargName(), signature.getKwargName(),
-      signature.getPositionalOnlyCount());
+  return py::rebuildCallableWith(signature, [&](mlir::Type child) {
+    return substitute(child, binding);
+  });
 }
 
 py::CallableType bindReceiverCallableImpl(py::CallableType signature) {
@@ -524,15 +453,6 @@ bindConcrete(mlir::Type type) {
   return std::nullopt;
 }
 
-bool isIntegerLiteralSpelling(llvm::StringRef spelling) {
-  if (spelling.empty())
-    return false;
-  if (spelling.front() == '-')
-    spelling = spelling.drop_front();
-  return !spelling.empty() &&
-         llvm::all_of(spelling, [](char ch) { return ch >= '0' && ch <= '9'; });
-}
-
 std::optional<std::string> manifestClassNameForLiteral(py::LiteralType literal) {
   llvm::StringRef spelling = literal.getSpelling();
   if (spelling == "True" || spelling == "False")
@@ -544,16 +464,6 @@ std::optional<std::string> manifestClassNameForLiteral(py::LiteralType literal) 
   if (isIntegerLiteralSpelling(spelling))
     return std::string("int");
   return std::nullopt;
-}
-
-std::string manifestClassNameForContract(llvm::StringRef name) {
-  for (llvm::StringRef prefix :
-       {"builtins.", "typing.", "types.", "contextlib.", "_asyncio.",
-        "asyncio.", "contextvars.", "ctypes.", "_ctypes.", "_typeshed."}) {
-    if (name.consume_front(prefix))
-      return name.str();
-  }
-  return name.str();
 }
 
 std::optional<std::pair<std::string, std::map<std::string, mlir::Type>>>

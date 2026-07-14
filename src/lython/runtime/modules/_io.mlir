@@ -195,7 +195,7 @@ module attributes {
     func.return %message_header, %message_bytes : memref<2xi64>, memref<?xi8>
   }
 
-  func.func private @Ly_IncRef(memref<2xi64, strided<[1], offset: ?>>)
+  func.func private @Ly_IncRef(%header: memref<2xi64, strided<[1], offset: ?>> {ly.ownership.object_header})
 
   // ===== raise helpers =====
   memref.global "private" constant @__ly_io_msg_closed : memref<29xi8> = dense<[73, 47, 79, 32, 111, 112, 101, 114, 97, 116, 105, 111, 110, 32, 111, 110, 32, 99, 108, 111, 115, 101, 100, 32, 102, 105, 108, 101, 46]>

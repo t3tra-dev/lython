@@ -2,6 +2,7 @@
 
 #include "mlir/IR/BuiltinTypes.h"
 
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <string>
@@ -66,7 +67,27 @@ inline constexpr llvm::StringLiteral kManifestRequiredPrimitivesAttr{
 inline constexpr llvm::StringLiteral kManifestRequiredDeallocatorAttr{
     "ly.runtime.required_deallocator"};
 
-bool isIntegerLiteralSpelling(llvm::StringRef spelling);
+inline bool isIntegerLiteralSpelling(llvm::StringRef spelling) {
+  if (spelling.empty())
+    return false;
+  if (spelling.front() == '-')
+    spelling = spelling.drop_front();
+  return !spelling.empty() &&
+         llvm::all_of(spelling, [](char c) { return c >= '0' && c <= '9'; });
+}
+
+// Strips the manifest module namespace off a contract name ("builtins.int"
+// -> "int"); the prefix list must match the modules that publish manifest
+// classes.
+inline std::string manifestClassNameForContract(llvm::StringRef name) {
+  for (llvm::StringRef prefix :
+       {"builtins.", "typing.", "types.", "contextlib.", "_asyncio.",
+        "asyncio.", "contextvars.", "ctypes.", "_ctypes.", "_typeshed."}) {
+    if (name.consume_front(prefix))
+      return name.str();
+  }
+  return name.str();
+}
 std::string runtimeContractName(mlir::Type type);
 
 } // namespace py::contracts

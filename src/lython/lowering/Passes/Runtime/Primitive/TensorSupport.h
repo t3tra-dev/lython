@@ -18,6 +18,10 @@ inline constexpr std::uint64_t kPrimitiveTensorPackedMinSourceElements =
 
 bool isPrimitiveElementType(mlir::Type type);
 
+mlir::Value createIndexConstant(mlir::OpBuilder &builder, mlir::Location loc,
+                                std::int64_t value);
+bool isBlockArgumentDefinedInside(mlir::Value value, mlir::Operation *scope);
+
 std::optional<int64_t> primitiveElementBitWidth(mlir::Type type);
 
 std::optional<mlir::Value> createPrimitiveZeroValue(mlir::OpBuilder &builder,

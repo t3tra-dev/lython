@@ -1,26 +1,13 @@
 #include "Runtime/Core/Lowerer.h"
 
+#include "Runtime/Model/Contracts.h"
+
 #include "llvm/ADT/STLExtras.h"
 
 #include <iterator>
 
 namespace py::lowering {
 namespace {
-
-mlir::func::FuncOp getOrCreatePrivateFunction(mlir::ModuleOp module,
-                                              mlir::OpBuilder &builder,
-                                              llvm::StringRef name,
-                                              mlir::FunctionType type) {
-  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(name))
-    return existing;
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToEnd(module.getBody());
-  auto function =
-      mlir::func::FuncOp::create(builder, module.getLoc(), name, type);
-  function.setPrivate();
-  return function;
-}
 
 template <typename YieldOp>
 void replaceYields(mlir::OpBuilder &builder, mlir::Region &region,
@@ -33,14 +20,6 @@ void replaceYields(mlir::OpBuilder &builder, mlir::Region &region,
                                yield.getOperands());
     yield.erase();
   }
-}
-
-mlir::func::FuncOp
-getOrCreateDiscardCurrentException(mlir::ModuleOp module,
-                                   mlir::OpBuilder &builder) {
-  return getOrCreatePrivateFunction(module, builder,
-                                    "LyEH_DiscardCurrentException",
-                                    builder.getFunctionType({}, {}));
 }
 
 void replaceExceptYields(mlir::OpBuilder &builder, mlir::Region &region,
@@ -62,15 +41,6 @@ mlir::Value boolConstant(mlir::OpBuilder &builder, mlir::Location loc,
                          bool value) {
   return mlir::arith::ConstantIntOp::create(builder, loc, value ? 1 : 0, 1)
       .getResult();
-}
-
-bool isIntegerLiteralSpelling(llvm::StringRef spelling) {
-  if (spelling.empty())
-    return false;
-  if (spelling.front() == '-')
-    spelling = spelling.drop_front();
-  return !spelling.empty() &&
-         llvm::all_of(spelling, [](char c) { return c >= '0' && c <= '9'; });
 }
 
 mlir::FailureOr<mlir::Value> pythonDefault(mlir::OpBuilder &builder,
@@ -251,12 +221,6 @@ mlir::func::FuncOp RuntimeBundleLowerer::getOrCreateTryCatchAnchor() {
   return getOrCreatePrivateFunction(
       module, builder, "LyEH_TryCatchAnchor",
       builder.getFunctionType({builder.getI64Type()}, {builder.getI1Type()}));
-}
-
-static mlir::func::FuncOp getOrCreateRethrowCurrent(mlir::ModuleOp module,
-                                                    mlir::OpBuilder &builder) {
-  return getOrCreatePrivateFunction(module, builder, "LyEH_RethrowCurrent",
-                                    builder.getFunctionType({}, {}));
 }
 
 std::optional<std::int64_t> RuntimeBundleLowerer::currentTryHandlerId() const {

@@ -3,6 +3,7 @@
 #include "EmitterSupport.h"
 
 #include "AstAccess.h"
+#include "Contracts.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
@@ -17,21 +18,14 @@ namespace lython::emitter {
 
 namespace {
 
+using py::contracts::isIntegerLiteralSpelling;
+
 enum class FinallyCompletion {
   Fallthrough,
   Return,
   Break,
   Continue,
 };
-
-bool isIntegerLiteralSpelling(llvm::StringRef spelling) {
-  if (spelling.empty())
-    return false;
-  if (spelling.front() == '-')
-    spelling = spelling.drop_front();
-  return !spelling.empty() &&
-         llvm::all_of(spelling, [](char c) { return c >= '0' && c <= '9'; });
-}
 
 bool isSupportedFinallyReturnCarrierType(mlir::Type type) {
   if (!type)

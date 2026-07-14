@@ -1,5 +1,7 @@
 #include "Runtime/Core/Lowerer.h"
 
+#include "Runtime/ABI/BoxLayout.h"
+
 #include <algorithm>
 
 namespace py::lowering {
@@ -28,11 +30,16 @@ mlir::Value constantIndex(mlir::OpBuilder &builder, mlir::Location loc,
   return mlir::arith::ConstantIndexOp::create(builder, loc, value).getResult();
 }
 
-constexpr unsigned kPayloadHandleWords = 16;
-constexpr unsigned kPayloadValuePointerWords = 5;
-constexpr unsigned kPayloadValuePointerBase = 4;
-constexpr unsigned kPayloadValueSizeBase = 9;
-constexpr unsigned kPayloadOwnedFlagSlot = 14;
+constexpr unsigned kPayloadHandleWords =
+    static_cast<unsigned>(box_abi::kWordsPerBox);
+constexpr unsigned kPayloadValuePointerWords =
+    static_cast<unsigned>(box_abi::kPointerWordCount);
+constexpr unsigned kPayloadValuePointerBase =
+    static_cast<unsigned>(box_abi::kPointerWordBase);
+constexpr unsigned kPayloadValueSizeBase =
+    static_cast<unsigned>(box_abi::kSizeWordBase);
+constexpr unsigned kPayloadOwnedFlagSlot =
+    static_cast<unsigned>(box_abi::kOwnedFlagWord);
 constexpr std::uint64_t kMinimumCollectionCapacity = 64;
 
 std::uint64_t growCapacity(std::uint64_t current, std::uint64_t required) {

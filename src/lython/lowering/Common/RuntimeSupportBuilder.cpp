@@ -958,7 +958,7 @@ void buildReleasePayloadSlotPtr(SupportBuilder &b) {
   mlir::Value zero = b.iconst(0);
   auto ownedWord = mlir::func::CallOp::create(
       b.builder, b.loc, "boxed_load_i64", b.i64(),
-      mlir::ValueRange{slot, b.iconst(14)});
+      mlir::ValueRange{slot, b.iconst(py::lowering::box_abi::kOwnedFlagWord)});
   mlir::Value notOwned = b.cmpi(mlir::arith::CmpIPredicate::eq,
                                 ownedWord.getResult(0), zero);
   mlir::cf::CondBranchOp::create(b.builder, b.loc, notOwned, done,

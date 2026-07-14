@@ -224,6 +224,26 @@ LogicalResult runCppParserDump(StringRef inputPath, bool typeComments,
   return success();
 }
 
+// Coro lowering, linked-contract collection, and the optimized thread-safety
+// check are identical on every codegen exit (JIT, object file, --emit-llvm);
+// splitting them per exit is how the safety checks drifted historically.
+LogicalResult finalizeLoweredLLVMModule(llvm::Module &llvmModule,
+                                        LLVMSafetyProfile &safetyProfile,
+                                        llvm::TargetMachine *targetMachine,
+                                        llvm::OptimizationLevel optLevel,
+                                        const py::IRDumpConfig *irDump) {
+  runLLVMCoroLowering(llvmModule, Options.sanitizers, targetMachine, optLevel);
+  if (!Options.releaseMode)
+    collectLinkedLLVMSafetyContracts(llvmModule, safetyProfile);
+  if (irDump)
+    dumpLLVMForPass(*irDump, "llvm-translation", llvmModule);
+  if (!Options.releaseMode &&
+      failed(verifyOptimizedLLVMThreadSafe(llvmModule, safetyProfile,
+                                           llvm::errs())))
+    return failure();
+  return success();
+}
+
 LogicalResult emitObjectFile(llvm::Module &llvmModule,
                              LLVMSafetyProfile &safetyProfile,
                              py::TensorLoweringTarget tensorTarget,
@@ -235,12 +255,10 @@ LogicalResult emitObjectFile(llvm::Module &llvmModule,
     return failure();
   llvmModule.setTargetTriple(llvm::Triple(targetTriple));
   llvmModule.setDataLayout(targetMachine->createDataLayout());
-  runLLVMCoroLowering(llvmModule, Options.sanitizers, targetMachine.get());
-  if (!Options.releaseMode)
-    collectLinkedLLVMSafetyContracts(llvmModule, safetyProfile);
-  if (!Options.releaseMode &&
-      failed(verifyOptimizedLLVMThreadSafe(llvmModule, safetyProfile,
-                                           llvm::errs())))
+  if (failed(finalizeLoweredLLVMModule(llvmModule, safetyProfile,
+                                       targetMachine.get(),
+                                       llvm::OptimizationLevel::O2,
+                                       /*irDump=*/nullptr)))
     return failure();
 
   std::error_code ec;
@@ -510,10 +528,7 @@ FailureOr<int> runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
     // JIT favors first-output latency; AOT still uses the optimized pipeline.
     tmBuilder.setCodeGenOptLevel(llvm::CodeGenOptLevel::None);
     auto options = tmBuilder.getOptions();
-    options.ExceptionModel = exceptionModelForTargetTriple(processTriple);
-    options.MCOptions.EmitCompactUnwindNonCanonical = true;
-    options.ForceDwarfFrameSection = true;
-    options.MCOptions.EmitDwarfUnwind = llvm::EmitDwarfUnwindType::Always;
+    lython::driver::applyExceptionUnwindOptions(options, processTriple);
     tmBuilder.setOptions(options);
 
     auto optimizationTMBuilder = tmBuilder;
@@ -606,42 +621,20 @@ FailureOr<int> runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
         return failure();
     }
 
-    LLVMSafetyProfile safetyProfile;
-    llvm::SmallVector<py::PythonCallSiteRange, 16> pythonCallSites;
-    {
-      PerfScope perf("jit-build.prepare-mlir");
-      if (!Options.releaseMode)
-        collectLLVMSafetyContracts(module, safetyProfile);
-      py::collectPythonCallSiteRanges(module, pythonCallSites);
-      attachPythonDebugInfo(module);
-    }
-
-    std::unique_ptr<llvm::LLVMContext> llvmContext;
-    std::unique_ptr<llvm::Module> llvmModule;
+    lython::driver::VerifiedLLVMModule verified;
     {
       PerfScope perf("jit-build.translate-to-llvm");
-      llvmContext = std::make_unique<llvm::LLVMContext>();
-      llvmModule = mlir::translateModuleToLLVMIR(module, *llvmContext);
-      if (!llvmModule) {
-        llvm::errs() << "Failed to translate to LLVM IR\n";
+      if (failed(lython::driver::translateToVerifiedLLVMIR(
+              module, Options, irDump, verified, llvm::errs())))
         return failure();
-      }
     }
-    {
-      PerfScope perf("jit-build.prepare-llvm");
-      py::installPythonExceptionCleanupFrames(*llvmModule, pythonCallSites);
-      if (!Options.releaseMode &&
-          failed(verifyLLVMIRSafetyMetadataAttached(*llvmModule, safetyProfile,
-                                                    llvm::errs())))
-        return failure();
-      if (!Options.releaseMode &&
-          failed(verifyPostCoroLLVMThreadSafe(*llvmModule, safetyProfile,
-                                              llvm::errs())))
-        return failure();
-      for (auto &func : *llvmModule) {
-        if (!func.isDeclaration())
-          func.setUWTableKind(llvm::UWTableKind::Async);
-      }
+    std::unique_ptr<llvm::LLVMContext> llvmContext =
+        std::move(verified.llvmContext);
+    std::unique_ptr<llvm::Module> llvmModule = std::move(verified.llvmModule);
+    LLVMSafetyProfile safetyProfile = std::move(verified.safetyProfile);
+    for (auto &func : *llvmModule) {
+      if (!func.isDeclaration())
+        func.setUWTableKind(llvm::UWTableKind::Async);
     }
 
     llvmModule->setDataLayout(jit->getDataLayout());
@@ -655,15 +648,10 @@ FailureOr<int> runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
     }
     {
       PerfScope perf("jit-build.llvm-opt");
-      runLLVMCoroLowering(*llvmModule, Options.sanitizers,
-                          optimizationTargetMachine.get(),
-                          llvm::OptimizationLevel::O0);
-      if (!Options.releaseMode)
-        collectLinkedLLVMSafetyContracts(*llvmModule, safetyProfile);
-      dumpLLVMForPass(irDump, "llvm-translation", *llvmModule);
-      if (!Options.releaseMode &&
-          failed(verifyOptimizedLLVMThreadSafe(*llvmModule, safetyProfile,
-                                               llvm::errs())))
+      if (failed(finalizeLoweredLLVMModule(*llvmModule, safetyProfile,
+                                           optimizationTargetMachine.get(),
+                                           llvm::OptimizationLevel::O0,
+                                           &irDump)))
         return failure();
     }
 
@@ -1039,12 +1027,10 @@ int main(int argc, char **argv) {
         return 1;
       llvmModule.setTargetTriple(llvm::Triple(targetTriple));
       llvmModule.setDataLayout(targetMachine->createDataLayout());
-      runLLVMCoroLowering(llvmModule, Options.sanitizers, targetMachine.get());
-      if (!Options.releaseMode)
-        collectLinkedLLVMSafetyContracts(llvmModule, safetyProfile);
-      if (!Options.releaseMode &&
-          failed(verifyOptimizedLLVMThreadSafe(llvmModule, safetyProfile,
-                                               llvm::errs())))
+      if (failed(finalizeLoweredLLVMModule(llvmModule, safetyProfile,
+                                           targetMachine.get(),
+                                           llvm::OptimizationLevel::O2,
+                                           /*irDump=*/nullptr)))
         return 1;
     }
     return failed(writeLLVMIR(llvmModule, outputPath, llvm::errs())) ? 1 : 0;

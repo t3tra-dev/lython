@@ -499,6 +499,25 @@ bool isPyType(mlir::Type type);
 bool isStaticTypeParameter(mlir::Type type);
 mlir::Type eraseStaticTypeParameters(mlir::Type type);
 
+// Structural map over the py type tree. `transform` runs on every node
+// first: an engaged non-null result replaces the node without recursing into
+// it, an engaged null result aborts the whole map ({}), and nullopt recurses
+// into container arguments (Contract / Protocol / Union / Callable /
+// Overload / Unpack / TypeObject) and rebuilds only when a child changed.
+// Every bespoke recursive walk over these containers must be a callback on
+// this mapper — six hand-rolled copies drifted apart (one skipped
+// OverloadType entirely) before it existed.
+mlir::Type mapPyTypeStructure(
+    mlir::Type type,
+    llvm::function_ref<std::optional<mlir::Type>(mlir::Type)> transform);
+
+// Rebuilds a Callable with each child type passed through `mapChild`
+// (12-argument reconstruction with null propagation); the shared shape
+// under mapPyTypeStructure and the protocol-table signature substitution.
+CallableType rebuildCallableWith(
+    CallableType callable,
+    llvm::function_ref<mlir::Type(mlir::Type)> mapChild);
+
 // Protocol descriptor helpers. Manifest protocol instantiations can be queried
 // through their base graph without adding a dedicated dialect type for each
 // high-level typing contract.

@@ -53,10 +53,7 @@ RuntimeBundleLowerer::collectIndirectCallableTargets(
     if (RuntimeBundleLowerer::isCallableProtocolTemplate(function))
       return;
 
-    auto callableAttr =
-        function->getAttrOfType<mlir::TypeAttr>("callable_type");
-    auto callable = mlir::dyn_cast_if_present<py::CallableType>(
-        callableAttr ? callableAttr.getValue() : mlir::Type());
+    py::CallableType callable = callableTypeOf(function);
     if (!callable || callable.getResultTypes().size() != 1)
       return;
 

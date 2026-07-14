@@ -189,6 +189,14 @@ exceptionModelForTargetTriple(const llvm::Triple &triple) {
   return llvm::ExceptionHandling::DwarfCFI;
 }
 
+void applyExceptionUnwindOptions(llvm::TargetOptions &options,
+                                 const llvm::Triple &triple) {
+  options.ExceptionModel = exceptionModelForTargetTriple(triple);
+  options.MCOptions.EmitCompactUnwindNonCanonical = true;
+  options.ForceDwarfFrameSection = true;
+  options.MCOptions.EmitDwarfUnwind = llvm::EmitDwarfUnwindType::Always;
+}
+
 std::unique_ptr<llvm::TargetMachine>
 createCodeGenTargetMachine(py::TensorLoweringTarget target,
                            const DriverOptions &options,
@@ -208,10 +216,7 @@ createCodeGenTargetMachine(py::TensorLoweringTarget target,
   }
 
   llvm::TargetOptions opt;
-  opt.ExceptionModel = exceptionModelForTargetTriple(triple);
-  opt.MCOptions.EmitCompactUnwindNonCanonical = true;
-  opt.ForceDwarfFrameSection = true;
-  opt.MCOptions.EmitDwarfUnwind = llvm::EmitDwarfUnwindType::Always;
+  applyExceptionUnwindOptions(opt, triple);
   if (!parseConfiguredFloatABI(opt.FloatABIType, options, diag))
     return nullptr;
   std::unique_ptr<llvm::TargetMachine> targetMachine(

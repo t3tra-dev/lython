@@ -26,6 +26,14 @@ namespace {
 
 namespace own = py::ownership;
 
+using own::CachedFuncContract;
+using own::FuncContractCache;
+using own::ancestorInBlock;
+using own::callConsumesGroup;
+using own::groupContainsOperand;
+using own::remapGroupThroughValueMapping;
+using own::returnTransfersGroup;
+
 std::optional<std::string> callableResultContractAtOffset(
     mlir::func::FuncOp function, unsigned resultOffset,
     llvm::ArrayRef<own::RuntimeDeallocator> deallocators) {
@@ -68,49 +76,6 @@ mlir::func::FuncOp findRetainFunction(mlir::ModuleOp module) {
   });
   return retained;
 }
-
-struct CachedFuncContract {
-  mlir::func::FuncOp function;
-  own::FunctionContract contract;
-};
-
-class FuncContractCache {
-public:
-  explicit FuncContractCache(mlir::ModuleOp module) {
-    module.walk([&](mlir::func::FuncOp function) {
-      functions.insert({function.getSymName(), function});
-    });
-  }
-
-  mlir::FailureOr<const CachedFuncContract *> lookup(llvm::StringRef name) {
-    auto cached = contracts.find(name);
-    if (cached != contracts.end())
-      return &cached->second;
-
-    auto function = functions.find(name);
-    if (function == functions.end())
-      return static_cast<const CachedFuncContract *>(nullptr);
-
-    auto contract = own::readFunctionContract(function->second);
-    if (mlir::failed(contract))
-      return mlir::failure();
-
-    CachedFuncContract entry{function->second, *contract};
-    auto inserted = contracts.insert({name, std::move(entry)});
-    return &inserted.first->second;
-  }
-
-  mlir::FailureOr<const CachedFuncContract *>
-  lookup(mlir::func::FuncOp function) {
-    if (!function)
-      return static_cast<const CachedFuncContract *>(nullptr);
-    return lookup(function.getSymName());
-  }
-
-private:
-  llvm::StringMap<mlir::func::FuncOp> functions;
-  llvm::StringMap<CachedFuncContract> contracts;
-};
 
 mlir::FailureOr<mlir::Value> buildRetainHeaderView(mlir::OpBuilder &builder,
                                                    mlir::Location loc,
@@ -269,33 +234,6 @@ bool isOwnershipConsumingUse(FuncContractCache &contracts,
              static_cast<unsigned>(use.getOperandNumber()));
 }
 
-bool groupMatchesOperands(mlir::OperandRange operands, unsigned offset,
-                          llvm::ArrayRef<mlir::Value> group,
-                          own::AliasAnalysis &aliases) {
-  if (offset + group.size() > operands.size())
-    return false;
-  for (auto [index, value] : llvm::enumerate(group)) {
-    if (!aliases.same(operands[offset + index], value))
-      return false;
-  }
-  return true;
-}
-
-bool callConsumesGroup(FuncContractCache &contracts, mlir::func::CallOp call,
-                       llvm::ArrayRef<mlir::Value> group,
-                       own::AliasAnalysis &aliases) {
-  auto cached = contracts.lookup(call.getCallee());
-  if (mlir::failed(cached) || !*cached)
-    return false;
-  for (unsigned offset : (*cached)->contract.releaseArgs.values)
-    if (groupMatchesOperands(call.getOperands(), offset, group, aliases))
-      return true;
-  for (unsigned offset : (*cached)->contract.transferArgs.values)
-    if (groupMatchesOperands(call.getOperands(), offset, group, aliases))
-      return true;
-  return false;
-}
-
 bool callConsumesTrackedHeader(FuncContractCache &contracts,
                                mlir::func::CallOp call,
                                llvm::ArrayRef<mlir::Value> group,
@@ -311,11 +249,11 @@ bool callConsumesTrackedHeader(FuncContractCache &contracts,
   };
   for (unsigned offset : (*cached)->contract.releaseArgs.values)
     if (consumesHeaderAt(offset) &&
-        !groupMatchesOperands(call.getOperands(), offset, group, aliases))
+        !own::groupMatchesValues(call.getOperands(), offset, group, aliases))
       return true;
   for (unsigned offset : (*cached)->contract.transferArgs.values)
     if (consumesHeaderAt(offset) &&
-        !groupMatchesOperands(call.getOperands(), offset, group, aliases))
+        !own::groupMatchesValues(call.getOperands(), offset, group, aliases))
       return true;
   return false;
 }
@@ -337,48 +275,6 @@ mlir::Operation *latestUserInBlock(mlir::Operation *lhs, mlir::Operation *rhs) {
   return lhs->isBeforeInBlock(rhs) ? rhs : lhs;
 }
 
-bool returnTransfersGroup(FuncContractCache &contracts,
-                          mlir::func::FuncOp function,
-                          mlir::func::ReturnOp returnOp,
-                          llvm::ArrayRef<mlir::Value> group,
-                          llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
-                          own::AliasAnalysis &aliases) {
-  auto cached = contracts.lookup(function);
-  if (mlir::succeeded(cached) && *cached) {
-    for (unsigned offset : (*cached)->contract.ownedResults.values)
-      if (own::groupMatchesValues(returnOp.getOperands(), offset, group,
-                                  aliases))
-        return true;
-  }
-
-  if (!own::functionUsesOwnedReturnABI(function)) {
-    return false;
-  }
-
-  std::optional<llvm::SmallVector<own::OwnedReturnRange, 4>> ranges =
-      own::callableOwnedReturnRanges(function, returnOp.getOperands(),
-                                     deallocators);
-  if (!ranges) {
-    for (unsigned offset = 0;
-         offset + group.size() <= returnOp.getNumOperands(); ++offset)
-      if (own::groupMatchesValues(returnOp.getOperands(), offset, group,
-                                  aliases))
-        return true;
-    return false;
-  }
-  for (const own::OwnedReturnRange &range : *ranges)
-    if (own::groupMatchesOwnedReturnRange(returnOp.getOperands(), range, group,
-                                          deallocators, aliases))
-      return true;
-  return false;
-}
-
-mlir::Operation *ancestorInBlock(mlir::Operation *op, mlir::Block *block) {
-  while (op && op->getBlock() != block)
-    op = op->getParentOp();
-  return op && op->getBlock() == block ? op : nullptr;
-}
-
 // The ancestor operation whose block belongs directly to `region` (the op
 // itself when already top-level there); null when `op` is not nested inside
 // the region at all.
@@ -388,31 +284,6 @@ mlir::Operation *ancestorInRegion(mlir::Operation *op, mlir::Region *region) {
   return op && op->getBlock() && op->getBlock()->getParent() == region
              ? op
              : nullptr;
-}
-
-llvm::SmallVector<mlir::Value, 4> remapGroupThroughValueMapping(
-    mlir::ValueRange sources, mlir::ValueRange targets,
-    llvm::ArrayRef<mlir::Value> group, own::AliasAnalysis &aliases,
-    llvm::SmallVectorImpl<bool> *mappedMask = nullptr) {
-  llvm::SmallVector<mlir::Value, 4> mapped(group.begin(), group.end());
-  if (mappedMask) {
-    mappedMask->clear();
-    mappedMask->append(group.size(), false);
-  }
-
-  unsigned count = std::min<unsigned>(sources.size(), targets.size());
-  for (auto [groupIndex, value] : llvm::enumerate(group)) {
-    for (unsigned index = 0; index < count; ++index) {
-      if (!sources[index] || !targets[index] ||
-          !aliases.same(sources[index], value))
-        continue;
-      mapped[groupIndex] = targets[index];
-      if (mappedMask)
-        (*mappedMask)[groupIndex] = true;
-      break;
-    }
-  }
-  return mapped;
 }
 
 std::optional<llvm::SmallVector<mlir::Value, 4>>
@@ -467,16 +338,6 @@ bool branchForwardsGroupToBlockArgument(mlir::Operation *terminator,
   return false;
 }
 
-bool sameExactGroup(llvm::ArrayRef<mlir::Value> lhs,
-                    llvm::ArrayRef<mlir::Value> rhs) {
-  if (lhs.size() != rhs.size())
-    return false;
-  for (auto [left, right] : llvm::zip(lhs, rhs))
-    if (left != right)
-      return false;
-  return true;
-}
-
 bool usePrecedesOwnerInBlock(mlir::Operation *owner, mlir::Operation *user,
                              mlir::Block *ownerBlock) {
   mlir::Operation *blockUser = ancestorInBlock(user, ownerBlock);
@@ -500,7 +361,7 @@ mergeReleaseInsertion(std::optional<ReleaseInsertion> current,
                       ReleaseInsertion next) {
   if (!current)
     return next;
-  if (!sameExactGroup(current->group, next.group))
+  if (!own::sameValueGroup(current->group, next.group))
     return std::nullopt;
   if (releaseInsertionBlock(*current) != releaseInsertionBlock(next))
     return std::nullopt;
@@ -661,16 +522,6 @@ findReleaseInsertion(FuncContractCache &contracts, mlir::Operation *owner,
   release.after = lastUser ? lastUser : owner;
   release.group.append(group.begin(), group.end());
   return release;
-}
-
-bool groupContainsOperand(mlir::Operation *op,
-                          llvm::ArrayRef<mlir::Value> group,
-                          own::AliasAnalysis &aliases) {
-  for (mlir::Value operand : op->getOperands())
-    for (mlir::Value value : group)
-      if (aliases.same(operand, value))
-        return true;
-  return false;
 }
 
 struct ConditionalReleaseBlocks {

@@ -1,6 +1,8 @@
 #include "runtime/Verification.h"
 
 #include "Contracts.h"
+
+#include "Contracts.h"
 #include "PyDialectTypes.h"
 #include "PyTypeObject.h"
 #include "PyProtocols.h"
@@ -31,6 +33,8 @@
 
 namespace py {
 namespace {
+
+using py::contracts::manifestClassNameForContract;
 
 namespace contracts = py::contracts;
 using verifier::VerificationResult;
@@ -118,16 +122,6 @@ bool isBoolLike(mlir::Type type) {
 bool isPrimitiveBool(mlir::Type type) {
   auto integer = mlir::dyn_cast_if_present<mlir::IntegerType>(type);
   return integer && integer.getWidth() == 1;
-}
-
-std::string manifestClassNameForContract(llvm::StringRef name) {
-  for (llvm::StringRef prefix :
-       {"builtins.", "typing.", "types.", "contextlib.", "_asyncio.",
-        "asyncio.", "contextvars.", "ctypes.", "_ctypes.", "_typeshed."}) {
-    if (name.consume_front(prefix))
-      return name.str();
-  }
-  return name.str();
 }
 
 bool evidenceTypeSame(mlir::Type lhs, mlir::Type rhs);

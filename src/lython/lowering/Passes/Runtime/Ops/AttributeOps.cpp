@@ -1,11 +1,15 @@
 #include "Runtime/Core/Lowerer.h"
 
+#include "Runtime/ABI/BoxLayout.h"
+
 namespace py::lowering {
 
 namespace {
 
-constexpr unsigned kPrimitiveFieldSlotBase = 4;
-constexpr unsigned kPrimitiveFieldSlotLimit = 16;
+constexpr unsigned kPrimitiveFieldSlotBase =
+    static_cast<unsigned>(box_abi::kPointerWordBase);
+constexpr unsigned kPrimitiveFieldSlotLimit =
+    static_cast<unsigned>(box_abi::kWordsPerBox);
 
 void appendValueSlice(mlir::ValueRange values, unsigned begin, unsigned count,
                       llvm::SmallVectorImpl<mlir::Value> &out) {
@@ -568,9 +572,11 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
                << "box-fronted field '" << op.getName()
                << "' expects memref physical values, got " << type;
       mlir::Value ptrIndex = mlir::arith::ConstantIndexOp::create(
-          builder, op.getLoc(), static_cast<std::int64_t>(4 + index));
+          builder, op.getLoc(),
+          box_abi::kPointerWordBase + static_cast<std::int64_t>(index));
       mlir::Value sizeIndex = mlir::arith::ConstantIndexOp::create(
-          builder, op.getLoc(), static_cast<std::int64_t>(9 + index));
+          builder, op.getLoc(),
+          box_abi::kSizeWordBase + static_cast<std::int64_t>(index));
       mlir::Value ptrWord =
           mlir::memref::LoadOp::create(builder, op.getLoc(), box, ptrIndex)
               .getResult();

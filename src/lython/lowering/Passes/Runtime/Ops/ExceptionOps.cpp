@@ -48,81 +48,31 @@ void createDeadContinuation(mlir::OpBuilder &builder, mlir::Operation *op) {
   mlir::cf::BranchOp::create(builder, op->getLoc(), dead);
 }
 
-mlir::func::FuncOp getOrCreateRethrow(mlir::ModuleOp module,
-                                      mlir::OpBuilder &builder) {
-  constexpr llvm::StringLiteral kName{"LyEH_RethrowCurrent"};
-  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(kName))
-    return existing;
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToEnd(module.getBody());
-  auto functionType = builder.getFunctionType({}, {});
-  auto function =
-      mlir::func::FuncOp::create(builder, module.getLoc(), kName, functionType);
-  function.setPrivate();
-  return function;
-}
-
-mlir::func::FuncOp
-getOrCreateDiscardCurrentException(mlir::ModuleOp module,
-                                   mlir::OpBuilder &builder) {
-  constexpr llvm::StringLiteral kName{"LyEH_DiscardCurrentException"};
-  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(kName))
-    return existing;
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToEnd(module.getBody());
-  auto functionType = builder.getFunctionType({}, {});
-  auto function =
-      mlir::func::FuncOp::create(builder, module.getLoc(), kName, functionType);
-  function.setPrivate();
-  return function;
-}
-
 mlir::func::FuncOp getOrCreateClassIdMatches(mlir::ModuleOp module,
                                              mlir::OpBuilder &builder) {
-  constexpr llvm::StringLiteral kName{"LyEH_ClassIdMatches"};
-  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(kName))
-    return existing;
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToEnd(module.getBody());
-  auto functionType = builder.getFunctionType(
-      {builder.getI64Type(), builder.getI64Type()}, {builder.getI1Type()});
-  auto function =
-      mlir::func::FuncOp::create(builder, module.getLoc(), kName, functionType);
-  function.setPrivate();
-  return function;
+  return getOrCreatePrivateFunction(
+      module, builder, "LyEH_ClassIdMatches",
+      builder.getFunctionType({builder.getI64Type(), builder.getI64Type()},
+                              {builder.getI1Type()}));
 }
 
 mlir::func::FuncOp
 getOrCreateCurrentExceptionMatches(mlir::ModuleOp module,
                                    mlir::OpBuilder &builder) {
-  constexpr llvm::StringLiteral kName{"LyEH_CurrentExceptionMatches"};
-  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(kName))
-    return existing;
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToEnd(module.getBody());
-  auto functionType =
-      builder.getFunctionType({builder.getI64Type()}, {builder.getI1Type()});
-  auto function =
-      mlir::func::FuncOp::create(builder, module.getLoc(), kName, functionType);
-  function.setPrivate();
-  return function;
+  return getOrCreatePrivateFunction(
+      module, builder, "LyEH_CurrentExceptionMatches",
+      builder.getFunctionType({builder.getI64Type()}, {builder.getI1Type()}));
 }
 
 mlir::func::FuncOp getOrCreateTracebackPush(mlir::ModuleOp module,
                                             mlir::OpBuilder &builder) {
-  constexpr llvm::StringLiteral kName{"LyTraceback_Push"};
-  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(kName))
-    return existing;
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToEnd(module.getBody());
   auto bytesType =
       mlir::MemRefType::get({mlir::ShapedType::kDynamic}, builder.getI8Type());
-  auto functionType = builder.getFunctionType(
-      {bytesType, bytesType, builder.getI32Type(), builder.getI32Type()}, {});
-  auto function =
-      mlir::func::FuncOp::create(builder, module.getLoc(), kName, functionType);
-  function.setPrivate();
-  return function;
+  return getOrCreatePrivateFunction(
+      module, builder, "LyTraceback_Push",
+      builder.getFunctionType(
+          {bytesType, bytesType, builder.getI32Type(), builder.getI32Type()},
+          {}));
 }
 
 mlir::FailureOr<std::int64_t>
@@ -251,7 +201,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerRaise(py::RaiseOp op) {
     return op.emitError() << "raised exception has no lowered runtime bundle";
 
   if (exception->objectEvidence.hasFlag(kCurrentExceptionBorrowFlag)) {
-    mlir::func::FuncOp rethrow = getOrCreateRethrow(module, builder);
+    mlir::func::FuncOp rethrow = getOrCreateRethrowCurrent(module, builder);
     builder.setInsertionPoint(op);
     if (mlir::failed(emitTracebackFrame(op.getOperation())))
       return mlir::failure();
@@ -299,7 +249,7 @@ mlir::LogicalResult RuntimeBundleLowerer::emitRaiseExceptionBundle(
 
 mlir::LogicalResult
 RuntimeBundleLowerer::lowerRaiseCurrent(py::RaiseCurrentOp op) {
-  mlir::func::FuncOp rethrow = getOrCreateRethrow(module, builder);
+  mlir::func::FuncOp rethrow = getOrCreateRethrowCurrent(module, builder);
   builder.setInsertionPoint(op);
   emitTryCallSiteMarkerIfNeeded(op.getLoc());
   mlir::func::CallOp::create(builder, op.getLoc(), rethrow, mlir::ValueRange{});

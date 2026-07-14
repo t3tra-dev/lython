@@ -8,20 +8,6 @@
 namespace py::lowering {
 namespace {
 
-mlir::Value stripObjectView(mlir::Value value) {
-  while (value) {
-    mlir::Operation *def = value.getDefiningOp();
-    if (!def || def->getNumOperands() != 1 || def->getNumResults() != 1)
-      return value;
-    llvm::StringRef name = def->getName().getStringRef();
-    if (name != "py.class.upcast" && name != "py.class.refine" &&
-        name != "py.protocol.view")
-      return value;
-    value = def->getOperand(0);
-  }
-  return value;
-}
-
 std::optional<std::string> returnedSelfFieldAwait(mlir::func::FuncOp target) {
   if (!target || target.empty())
     return std::nullopt;
@@ -35,7 +21,7 @@ std::optional<std::string> returnedSelfFieldAwait(mlir::func::FuncOp target) {
       invalid = true;
       return;
     }
-    mlir::Value returned = stripObjectView(ret.getOperand(0));
+    mlir::Value returned = stripReturnedObjectView(ret.getOperand(0));
     auto call = returned.getDefiningOp<py::CallOp>();
     if (!call || call.getNumResults() != 1) {
       invalid = true;
@@ -46,7 +32,7 @@ std::optional<std::string> returnedSelfFieldAwait(mlir::func::FuncOp target) {
       invalid = true;
       return;
     }
-    mlir::Value receiver = stripObjectView(call.getCallable());
+    mlir::Value receiver = stripReturnedObjectView(call.getCallable());
     auto attr = receiver.getDefiningOp<py::AttrGetOp>();
     if (!attr) {
       invalid = true;
@@ -258,13 +244,9 @@ RuntimeBundleLowerer::lowerGeneralAwaitableIterator(py::AwaitOp op,
                << "__await__ must return an iterator, not a coroutine";
 
       mlir::Type expectedResult;
-      if (auto callableAttr =
-              target->getAttrOfType<mlir::TypeAttr>("callable_type")) {
-        if (auto callable = mlir::dyn_cast_if_present<py::CallableType>(
-                callableAttr.getValue()))
-          if (callable.getResultTypes().size() == 1)
-            expectedResult = callable.getResultTypes().front();
-      }
+      if (py::CallableType callable = callableTypeOf(target))
+        if (callable.getResultTypes().size() == 1)
+          expectedResult = callable.getResultTypes().front();
       if (mlir::failed(RuntimeBundleLowerer::emitSourceFunctionTargetCallResult(
               op.getOperation(), expectedResult, target, *methodSymbol, sources,
               iterator)))
@@ -391,10 +373,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCoroutineStorageTargetIdAwait(
   module.walk([&](mlir::func::FuncOp function) {
     if (!function->hasAttr("ly.async.body_result") || function.isDeclaration())
       return;
-    auto callableAttr =
-        function->getAttrOfType<mlir::TypeAttr>("callable_type");
-    auto callable = mlir::dyn_cast_if_present<py::CallableType>(
-        callableAttr ? callableAttr.getValue() : mlir::Type());
+    py::CallableType callable = callableTypeOf(function);
     if (!callable)
       return;
     if (!RuntimeBundleLowerer::callableLogicalInputTypes(function, callable)
@@ -600,13 +579,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCoroutineObjectAwait(
   sourceBundles.reserve(awaitable.coroutineSources.size());
   llvm::SmallVector<mlir::Value, 8> operands;
   llvm::SmallVector<mlir::Type, 8> logicalInputTypes;
-  if (auto callableAttr =
-          target->getAttrOfType<mlir::TypeAttr>("callable_type")) {
-    if (auto callable = mlir::dyn_cast_if_present<py::CallableType>(
-            callableAttr.getValue()))
-      logicalInputTypes =
-          RuntimeBundleLowerer::callableLogicalInputTypes(target, callable);
-  }
+  if (py::CallableType callable = callableTypeOf(target))
+    logicalInputTypes =
+        RuntimeBundleLowerer::callableLogicalInputTypes(target, callable);
   unsigned inputIndex = 0;
   for (auto [sourceIndex, sourceValue] :
        llvm::enumerate(awaitable.coroutineSources)) {

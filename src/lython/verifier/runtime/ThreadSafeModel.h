@@ -5,6 +5,8 @@
 #include "mlir/IR/Value.h"
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <cstdint>
@@ -92,6 +94,8 @@ llvm::StringRef retainPremiseName(RetainPremiseKind premise);
 llvm::StringRef retainPremiseSourceName(RetainPremiseSourceKind source);
 
 AtomicOperationKind classifyAtomicOperation(mlir::Operation *op);
+AtomicOperationKind classifyAtomicOperationName(llvm::StringRef name);
+std::optional<std::int64_t> constantIntValue(mlir::Value value);
 AtomicRoleKind classifyAtomicRole(llvm::StringRef role,
                                   AtomicOperationKind operationKind);
 AtomicOrderingRank requiredOrdering(AtomicRoleKind roleKind,
@@ -99,6 +103,33 @@ AtomicOrderingRank requiredOrdering(AtomicRoleKind roleKind,
 llvm::SmallVector<HappensBeforeEdge, 4>
 schedulerHappensBeforeEdges(const AtomicContract &contract);
 std::optional<std::int64_t> expectedAtomicSlot(llvm::StringRef role);
+
+// Publish/acquire bookkeeping over scheduler happens-before edges — one rule
+// for the live-op walk and the preserved-contract replay (the edge derivation
+// itself lives in schedulerHappensBeforeEdges).
+template <typename Tag> struct HappensBeforeLedger {
+  llvm::StringSet<> published;
+  llvm::StringMap<Tag> firstAcquire;
+
+  void record(const AtomicContract &contract, Tag tag) {
+    for (const HappensBeforeEdge &edge : schedulerHappensBeforeEdges(contract)) {
+      if (edge.effect == HappensBeforeEffect::Publish) {
+        published.insert(edge.resource);
+        continue;
+      }
+      if (!firstAcquire.contains(edge.resource))
+        firstAcquire[edge.resource] = tag;
+    }
+  }
+
+  // First acquire whose resource never saw a publish; nullopt when balanced.
+  std::optional<std::pair<llvm::StringRef, Tag>> firstUnmatchedAcquire() const {
+    for (const auto &entry : firstAcquire)
+      if (!published.contains(entry.getKey()))
+        return std::make_pair(entry.getKey(), entry.getValue());
+    return std::nullopt;
+  }
+};
 
 mlir::FailureOr<std::optional<AtomicContract>>
 readAtomicContract(mlir::Operation *op);

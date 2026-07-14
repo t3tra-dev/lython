@@ -140,7 +140,6 @@ private:
   llvm::SmallVector<mlir::Type, 8>
   callableLogicalInputTypes(mlir::func::FuncOp function,
                             py::CallableType callable) const;
-  static mlir::Value stripReturnedObjectView(mlir::Value value);
   mlir::LogicalResult buildReturnedValueSummaries();
   mlir::LogicalResult buildReturnedCallableSummaries();
   mlir::LogicalResult buildReturnedCoroutineSummaries();
@@ -479,8 +478,14 @@ private:
   std::optional<RuntimeValue> retainEvidenceElement(mlir::Operation *op,
                                                     const RuntimeValue &value,
                                                     bool atOperation = false);
+  mlir::LogicalResult forEachActiveUnionMember(
+      mlir::Operation *op, py::UnionType unionType, mlir::ValueRange values,
+      llvm::StringRef abiLabel,
+      llvm::function_ref<mlir::LogicalResult(mlir::Type, mlir::ValueRange)>
+          emitMember);
   mlir::LogicalResult pinContainerLiveness(mlir::Operation *op,
-                                           const RuntimeBundle &container);
+                                           const RuntimeBundle &container,
+                                           bool insertAfterOp = false);
   mlir::FailureOr<std::optional<RuntimeValue>>
   retainEvidenceElementWithFallback(mlir::Operation *op,
                                     const RuntimeValue &value,
@@ -766,6 +771,11 @@ private:
   emitFunctionTargetRuntimeCall(py::CallOp op, mlir::func::FuncOp target,
                                 llvm::StringRef targetName,
                                 llvm::ArrayRef<const RuntimeBundle *> sources);
+  mlir::LogicalResult consumeFunctionTargetCallResult(
+      mlir::Operation *op, llvm::StringRef targetName, mlir::func::CallOp call,
+      mlir::Type expectedResult, llvm::ArrayRef<const RuntimeBundle *> sources,
+      bool applyReturnedSummaries, llvm::StringRef abiLabel,
+      RuntimeBundle &result);
   mlir::LogicalResult bundleFunctionTargetCallResult(
       py::CallOp op, mlir::func::FuncOp target, llvm::StringRef targetName,
       mlir::func::CallOp call, llvm::ArrayRef<const RuntimeBundle *> sources,
@@ -999,6 +1009,87 @@ private:
   std::int64_t nextTryHandlerId = 1;
   llvm::SmallVector<mlir::Operation *, 32> erase;
 };
+
+// Peels class-upcast / refine / protocol-view wrappers off a value: summary
+// and await lowering must see the underlying object identity.
+inline mlir::Value stripReturnedObjectView(mlir::Value value) {
+  while (value) {
+    mlir::Operation *def = value.getDefiningOp();
+    if (!def || def->getNumOperands() != 1 || def->getNumResults() != 1)
+      return value;
+    llvm::StringRef name = def->getName().getStringRef();
+    if (name != "py.class.upcast" && name != "py.class.refine" &&
+        name != "py.protocol.view")
+      return value;
+    value = def->getOperand(0);
+  }
+  return value;
+}
+
+// The Callable contract a lowered function carries; null for declarations
+// and non-callable functions. Dozens of walks used to re-spell this
+// attribute lookup inline.
+inline py::CallableType callableTypeOf(mlir::func::FuncOp function) {
+  if (!function || function.isDeclaration())
+    return {};
+  auto callableAttr = function->getAttrOfType<mlir::TypeAttr>("callable_type");
+  return mlir::dyn_cast_if_present<py::CallableType>(
+      callableAttr ? callableAttr.getValue() : mlir::Type());
+}
+
+// Iterates `step` until it stops reporting changes — the driver behind every
+// returned-* summary computation (they refine each other through the summary
+// maps, so a single pass under-approximates).
+template <typename Step> inline void runToFixpoint(Step &&step) {
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    step(changed);
+  }
+}
+
+inline bool isCoroutineLikeResultType(mlir::Type type) {
+  if (runtimeContractName(type) == "types.CoroutineType")
+    return true;
+  auto protocol = mlir::dyn_cast_if_present<py::ProtocolType>(type);
+  return protocol && protocol.getProtocolName() == "Coroutine";
+}
+
+inline bool isAwaitIteratorLikeResultType(mlir::Type type) {
+  std::string contract = runtimeContractName(type);
+  if (contract == "types.CoroutineAwaitIterator" ||
+      contract == "_asyncio.FutureIter" || contract == "_asyncio.TaskIter")
+    return true;
+  auto protocol = mlir::dyn_cast_if_present<py::ProtocolType>(type);
+  return protocol && protocol.getProtocolName() == "Generator";
+}
+
+inline mlir::func::FuncOp
+getOrCreatePrivateFunction(mlir::ModuleOp module, mlir::OpBuilder &builder,
+                           llvm::StringRef name, mlir::FunctionType type) {
+  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(name))
+    return existing;
+  mlir::OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPointToEnd(module.getBody());
+  auto function =
+      mlir::func::FuncOp::create(builder, module.getLoc(), name, type);
+  function.setPrivate();
+  return function;
+}
+
+inline mlir::func::FuncOp
+getOrCreateDiscardCurrentException(mlir::ModuleOp module,
+                                   mlir::OpBuilder &builder) {
+  return getOrCreatePrivateFunction(module, builder,
+                                    "LyEH_DiscardCurrentException",
+                                    builder.getFunctionType({}, {}));
+}
+
+inline mlir::func::FuncOp
+getOrCreateRethrowCurrent(mlir::ModuleOp module, mlir::OpBuilder &builder) {
+  return getOrCreatePrivateFunction(module, builder, "LyEH_RethrowCurrent",
+                                    builder.getFunctionType({}, {}));
+}
 
 inline mlir::Value constantI1(mlir::OpBuilder &builder, mlir::Location loc,
                               bool value) {

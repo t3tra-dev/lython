@@ -33,12 +33,8 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableAggregateEvidenceABIs() {
 
   llvm::StringMap<Requirements> requirements;
   module.walk([&](mlir::func::FuncOp function) {
-    auto callableAttr =
-        function->getAttrOfType<mlir::TypeAttr>("callable_type");
-    auto callable = mlir::dyn_cast_if_present<py::CallableType>(
-        callableAttr ? callableAttr.getValue() : mlir::Type());
-    if (!callable || function.isDeclaration() ||
-        (!callable.hasVararg() && !callable.hasKwarg()))
+    py::CallableType callable = callableTypeOf(function);
+    if (!callable || (!callable.hasVararg() && !callable.hasKwarg()))
       return;
 
     mlir::Block &entry = function.getBody().front();
@@ -126,9 +122,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableAggregateEvidenceABIs() {
     if (required == requirements.end())
       return mlir::WalkResult::advance();
 
-    auto callableAttr = target->getAttrOfType<mlir::TypeAttr>("callable_type");
-    auto callable = mlir::dyn_cast_if_present<py::CallableType>(
-        callableAttr ? callableAttr.getValue() : mlir::Type());
+    py::CallableType callable = callableTypeOf(target);
     if (!callable || (!callable.hasVararg() && !callable.hasKwarg()))
       return mlir::WalkResult::advance();
 

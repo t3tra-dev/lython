@@ -2,31 +2,10 @@
 
 namespace py::lowering {
 
-mlir::Value RuntimeBundleLowerer::stripReturnedObjectView(mlir::Value value) {
-  while (value) {
-    mlir::Operation *def = value.getDefiningOp();
-    if (!def || def->getNumOperands() != 1 || def->getNumResults() != 1)
-      return value;
-    llvm::StringRef name = def->getName().getStringRef();
-    if (name != "py.class.upcast" && name != "py.class.refine" &&
-        name != "py.protocol.view")
-      return value;
-    value = def->getOperand(0);
-  }
-  return value;
-}
-
 static bool sameReturnedCoroutineSummary(const ReturnedCoroutineSummary &lhs,
                                          const ReturnedCoroutineSummary &rhs) {
   return lhs.target == rhs.target &&
          sameTypeSequence(lhs.sourceContracts, rhs.sourceContracts);
-}
-
-static bool isCoroutineLikeResultType(mlir::Type type) {
-  if (runtimeContractName(type) == "types.CoroutineType")
-    return true;
-  auto protocol = mlir::dyn_cast_if_present<py::ProtocolType>(type);
-  return protocol && protocol.getProtocolName() == "Coroutine";
 }
 
 static bool isAwaitIteratorContract(llvm::StringRef contract) {
@@ -69,23 +48,9 @@ staticPackValues(mlir::Value value) {
   return values;
 }
 
-static mlir::Value stripObjectViewForSummary(mlir::Value value) {
-  while (value) {
-    mlir::Operation *def = value.getDefiningOp();
-    if (!def || def->getNumOperands() != 1 || def->getNumResults() != 1)
-      return value;
-    llvm::StringRef name = def->getName().getStringRef();
-    if (name != "py.class.upcast" && name != "py.class.refine" &&
-        name != "py.protocol.view")
-      return value;
-    value = def->getOperand(0);
-  }
-  return value;
-}
-
 static std::optional<ReturnedObjectEvidenceSummary>
 summarizeFutureTerminalCall(py::CallOp call, mlir::Value returnedFuture) {
-  if (stripObjectViewForSummary(call.getCallable()) != returnedFuture)
+  if (stripReturnedObjectView(call.getCallable()) != returnedFuture)
     return std::nullopt;
   auto method = call->getAttrOfType<mlir::StringAttr>("ly.bound_method");
   if (!method)
@@ -144,15 +109,6 @@ mlir::LogicalResult RuntimeBundleLowerer::buildReturnedValueSummaries() {
       functions.push_back(function);
   });
 
-  auto callableTypeFor = [](mlir::func::FuncOp function) -> py::CallableType {
-    if (!function || function.isDeclaration())
-      return {};
-    auto callableAttr =
-        function->getAttrOfType<mlir::TypeAttr>("callable_type");
-    return mlir::dyn_cast_if_present<py::CallableType>(
-        callableAttr ? callableAttr.getValue() : mlir::Type());
-  };
-
   auto entryArgumentIndex = [](mlir::func::FuncOp function,
                                mlir::Value value) -> std::optional<unsigned> {
     auto argument = mlir::dyn_cast<mlir::BlockArgument>(value);
@@ -179,7 +135,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildReturnedValueSummaries() {
 
     mlir::func::FuncOp target =
         module.lookupSymbol<mlir::func::FuncOp>(binding.getBinding());
-    py::CallableType callable = callableTypeFor(target);
+    py::CallableType callable = callableTypeOf(target);
     if (!callable)
       return std::nullopt;
     auto returnedSummary = returnedValueSummaries.find(target.getSymName());
@@ -238,9 +194,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildReturnedValueSummaries() {
     return summary;
   };
 
-  bool changed = true;
-  while (changed) {
-    changed = false;
+  runToFixpoint([&](bool &changed) {
     for (mlir::func::FuncOp function : functions) {
       std::optional<ReturnedValueSummary> summary =
           summarizeFunction(function);
@@ -253,7 +207,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildReturnedValueSummaries() {
       returnedValueSummaries[function.getSymName()] = std::move(*summary);
       changed = true;
     }
-  }
+  });
   return mlir::success();
 }
 
@@ -339,7 +293,7 @@ RuntimeBundleLowerer::buildReturnedObjectEvidenceSummaries() {
         return;
       }
       mlir::Value returned =
-          RuntimeBundleLowerer::stripReturnedObjectView(ret.getOperand(0));
+          stripReturnedObjectView(ret.getOperand(0));
       if (runtimeContractName(returned.getType()).empty()) {
         valid = false;
         return;
@@ -362,7 +316,7 @@ RuntimeBundleLowerer::buildReturnedObjectEvidenceSummaries() {
     if (!call || call.getNumResults() != 1)
       return std::nullopt;
     mlir::Value callee =
-        RuntimeBundleLowerer::stripReturnedObjectView(call.getCallable());
+        stripReturnedObjectView(call.getCallable());
     auto binding = callee.getDefiningOp<py::BindingRefOp>();
     if (!binding)
       return std::nullopt;
@@ -413,9 +367,7 @@ RuntimeBundleLowerer::buildReturnedObjectEvidenceSummaries() {
     return summarizeNestedCall(*returnedObject);
   };
 
-  bool changed = true;
-  while (changed) {
-    changed = false;
+  runToFixpoint([&](bool &changed) {
     for (mlir::func::FuncOp function : functions) {
       std::optional<ReturnedObjectEvidenceSummary> summary =
           summarizeFunction(function);
@@ -429,7 +381,7 @@ RuntimeBundleLowerer::buildReturnedObjectEvidenceSummaries() {
           std::move(*summary);
       changed = true;
     }
-  }
+  });
 
   return mlir::success();
 }
@@ -443,15 +395,6 @@ mlir::LogicalResult RuntimeBundleLowerer::buildReturnedStaticObjectSummaries() {
       return;
     functions.push_back(function);
   });
-
-  auto callableTypeFor = [](mlir::func::FuncOp function) -> py::CallableType {
-    if (!function || function.isDeclaration())
-      return {};
-    auto callableAttr =
-        function->getAttrOfType<mlir::TypeAttr>("callable_type");
-    return mlir::dyn_cast_if_present<py::CallableType>(
-        callableAttr ? callableAttr.getValue() : mlir::Type());
-  };
 
   auto concreteObjectContract = [&](mlir::Value value,
                                     mlir::Type expectedResult)
@@ -496,14 +439,14 @@ mlir::LogicalResult RuntimeBundleLowerer::buildReturnedStaticObjectSummaries() {
   auto directStaticObjectCandidate =
       [&](mlir::Value value,
           mlir::Type expectedResult) -> std::optional<StaticObjectCandidate> {
-    mlir::Value stripped = RuntimeBundleLowerer::stripReturnedObjectView(value);
+    mlir::Value stripped = stripReturnedObjectView(value);
     if (py::isPyNoneType(stripped.getType()))
       return emptyStaticObjectCandidate(expectedResult);
     if (auto direct = concreteObjectContract(stripped, expectedResult))
       return StaticObjectCandidate{/*hasObject=*/true, *direct};
     if (auto wrap = stripped.getDefiningOp<py::UnionWrapOp>()) {
       mlir::Value input =
-          RuntimeBundleLowerer::stripReturnedObjectView(wrap.getInput());
+          stripReturnedObjectView(wrap.getInput());
       if (py::isPyNoneType(input.getType()))
         return emptyStaticObjectCandidate(expectedResult);
       if (auto wrapped = concreteObjectContract(input, expectedResult))
@@ -572,7 +515,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildReturnedStaticObjectSummaries() {
     if (actualIndex >= invocation->actualValues.size())
       return std::nullopt;
     mlir::Value actual =
-        RuntimeBundleLowerer::stripReturnedObjectView(
+        stripReturnedObjectView(
             invocation->actualValues[actualIndex]);
     if (auto argument = mlir::dyn_cast<mlir::BlockArgument>(actual))
       if (!function.empty() && argument.getOwner() == &function.getBody().front())
@@ -585,7 +528,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildReturnedStaticObjectSummaries() {
   auto summarizeOperand = [&](mlir::func::FuncOp function, mlir::Value operand,
                               mlir::Type expectedResult)
       -> std::optional<StaticObjectCandidate> {
-    mlir::Value stripped = RuntimeBundleLowerer::stripReturnedObjectView(operand);
+    mlir::Value stripped = stripReturnedObjectView(operand);
     if (auto argument = mlir::dyn_cast<mlir::BlockArgument>(stripped))
       if (!function.empty() && argument.getOwner() == &function.getBody().front())
         return std::nullopt;
@@ -594,14 +537,14 @@ mlir::LogicalResult RuntimeBundleLowerer::buildReturnedStaticObjectSummaries() {
 
     mlir::Value returned = stripped;
     if (auto wrap = returned.getDefiningOp<py::UnionWrapOp>())
-      returned = RuntimeBundleLowerer::stripReturnedObjectView(wrap.getInput());
+      returned = stripReturnedObjectView(wrap.getInput());
     auto call = returned.getDefiningOp<py::CallOp>();
     if (!call || call.getNumResults() != 1)
       return std::nullopt;
 
     if (auto method = call->getAttrOfType<mlir::StringAttr>("ly.bound_method")) {
       mlir::Value receiver =
-          RuntimeBundleLowerer::stripReturnedObjectView(call.getCallable());
+          stripReturnedObjectView(call.getCallable());
       std::string receiverContract = runtimeContractName(receiver.getType());
       if (!receiverContract.empty()) {
         for (const RuntimeSymbol &symbol :
@@ -621,7 +564,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildReturnedStaticObjectSummaries() {
       }
     }
 
-    mlir::Value callee = RuntimeBundleLowerer::stripReturnedObjectView(
+    mlir::Value callee = stripReturnedObjectView(
         call.getCallable());
     auto binding = callee.getDefiningOp<py::BindingRefOp>();
     if (!binding)
@@ -629,7 +572,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildReturnedStaticObjectSummaries() {
 
     mlir::func::FuncOp target =
         module.lookupSymbol<mlir::func::FuncOp>(binding.getBinding());
-    py::CallableType callable = callableTypeFor(target);
+    py::CallableType callable = callableTypeOf(target);
     if (!callable)
       return std::nullopt;
 
@@ -653,7 +596,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildReturnedStaticObjectSummaries() {
   auto summarizeFunction =
       [&](mlir::func::FuncOp function)
       -> std::optional<ReturnedStaticObjectSummary> {
-    py::CallableType callable = callableTypeFor(function);
+    py::CallableType callable = callableTypeOf(function);
     if (!callable || callable.getResultTypes().size() != 1)
       return std::nullopt;
     mlir::Type resultType = callable.getResultTypes().front();
@@ -695,9 +638,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildReturnedStaticObjectSummaries() {
     return summary;
   };
 
-  bool changed = true;
-  while (changed) {
-    changed = false;
+  runToFixpoint([&](bool &changed) {
     for (mlir::func::FuncOp function : functions) {
       std::optional<ReturnedStaticObjectSummary> summary =
           summarizeFunction(function);
@@ -710,7 +651,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildReturnedStaticObjectSummaries() {
       returnedStaticObjectSummaries[function.getSymName()] = std::move(*summary);
       changed = true;
     }
-  }
+  });
 
   return mlir::success();
 }
@@ -744,9 +685,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildReturnedCoroutineSummaries() {
       [&](py::CallOp call, mlir::func::FuncOp target,
           llvm::ArrayRef<mlir::Type> closureSourceTypes)
       -> std::optional<llvm::SmallVector<mlir::Type, 4>> {
-    auto callableAttr = target->getAttrOfType<mlir::TypeAttr>("callable_type");
-    auto callable = mlir::dyn_cast_if_present<py::CallableType>(
-        callableAttr ? callableAttr.getValue() : mlir::Type());
+    py::CallableType callable = callableTypeOf(target);
     if (!callable)
       return std::nullopt;
 
@@ -922,9 +861,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildReturnedCoroutineSummaries() {
     return summary;
   };
 
-  bool changed = true;
-  while (changed) {
-    changed = false;
+  runToFixpoint([&](bool &changed) {
     for (mlir::func::FuncOp function : functions) {
       std::optional<ReturnedCoroutineSummary> summary =
           summarizeFunction(function);
@@ -937,7 +874,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildReturnedCoroutineSummaries() {
       returnedCoroutineSummaries[function.getSymName()] = std::move(*summary);
       changed = true;
     }
-  }
+  });
 
   return mlir::success();
 }

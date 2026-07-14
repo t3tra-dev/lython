@@ -66,11 +66,6 @@ createPrimitiveFusedMultiplyAdd(mlir::OpBuilder &builder, mlir::Location loc,
   return createPrimitiveAdd(builder, loc, acc, *product);
 }
 
-mlir::Value createIndexConstant(mlir::OpBuilder &builder, mlir::Location loc,
-                                int64_t value) {
-  return mlir::arith::ConstantIndexOp::create(builder, loc, value).getResult();
-}
-
 mlir::Value addIndexOffset(mlir::OpBuilder &builder, mlir::Location loc,
                            mlir::Value base, int64_t offset) {
   if (offset == 0)

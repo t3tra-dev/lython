@@ -1413,10 +1413,10 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHook(
       mlir::FunctionType type = callee.getFunctionType();
       for (auto [index, input] : llvm::enumerate(type.getInputs())) {
         auto memref = mlir::cast<mlir::MemRefType>(input);
-        mlir::Value pointerWord =
-            loadWord(builder, 4 + static_cast<std::int64_t>(index));
-        mlir::Value sizeWord =
-            loadWord(builder, 9 + static_cast<std::int64_t>(index));
+        mlir::Value pointerWord = loadWord(
+            builder, box_abi::kPointerWordBase + static_cast<std::int64_t>(index));
+        mlir::Value sizeWord = loadWord(
+            builder, box_abi::kSizeWordBase + static_cast<std::int64_t>(index));
         operands.push_back(RuntimeBundleLowerer::memrefFromBoxWords(
             builder, loc, pointerWord, sizeWord, memref));
       }

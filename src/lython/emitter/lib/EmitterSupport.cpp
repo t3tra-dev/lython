@@ -81,83 +81,12 @@ mlir::ArrayAttr boolArray(mlir::Builder &builder, llvm::ArrayRef<char> values) {
 mlir::Type replaceSelfType(mlir::Type type, mlir::Type selfType) {
   if (!type || !selfType)
     return type;
-  mlir::MLIRContext *context = type.getContext();
-  if (mlir::isa<py::SelfType>(type))
-    return selfType;
-  if (auto contract = mlir::dyn_cast<py::ContractType>(type)) {
-    llvm::SmallVector<mlir::Type, 4> arguments;
-    bool changed = false;
-    for (mlir::Type argument : contract.getArguments()) {
-      mlir::Type replaced = replaceSelfType(argument, selfType);
-      changed |= replaced != argument;
-      arguments.push_back(replaced);
-    }
-    if (changed)
-      return py::ContractType::get(context, contract.getContractName(),
-                                   arguments);
-    return type;
-  }
-  if (auto protocol = mlir::dyn_cast<py::ProtocolType>(type)) {
-    llvm::SmallVector<mlir::Type, 4> arguments;
-    bool changed = false;
-    for (mlir::Type argument : protocol.getArguments()) {
-      mlir::Type replaced = replaceSelfType(argument, selfType);
-      changed |= replaced != argument;
-      arguments.push_back(replaced);
-    }
-    if (changed)
-      return py::ProtocolType::get(context, protocol.getProtocolName(),
-                                   arguments);
-    return type;
-  }
-  if (auto callable = mlir::dyn_cast<py::CallableType>(type)) {
-    llvm::SmallVector<mlir::Type, 8> positional;
-    llvm::SmallVector<mlir::Type, 4> kwonly;
-    llvm::SmallVector<mlir::Type, 1> results;
-    for (mlir::Type argument : callable.getPositionalTypes())
-      positional.push_back(replaceSelfType(argument, selfType));
-    for (mlir::Type argument : callable.getKwOnlyTypes())
-      kwonly.push_back(replaceSelfType(argument, selfType));
-    for (mlir::Type result : callable.getResultTypes())
-      results.push_back(replaceSelfType(result, selfType));
-    mlir::Type vararg =
-        callable.hasVararg()
-            ? replaceSelfType(callable.getVarargType(), selfType)
-            : mlir::Type();
-    mlir::Type kwarg = callable.hasKwarg()
-                           ? replaceSelfType(callable.getKwargType(), selfType)
-                           : mlir::Type();
-    return py::CallableType::get(
-        context, positional, kwonly, vararg, kwarg, results,
-        callable.getPositionalNames(), callable.getKwOnlyNames(),
-        callable.getPositionalDefaults(), callable.getKwOnlyDefaults(),
-        callable.getVarargName(), callable.getKwargName(),
-        callable.getPositionalOnlyCount());
-  }
-  if (auto unionType = mlir::dyn_cast<py::UnionType>(type)) {
-    llvm::SmallVector<mlir::Type, 4> members;
-    bool changed = false;
-    for (mlir::Type member : unionType.getMemberTypes()) {
-      mlir::Type replaced = replaceSelfType(member, selfType);
-      changed |= replaced != member;
-      members.push_back(replaced);
-    }
-    return changed ? py::UnionType::getNormalized(context, members) : type;
-  }
-  if (auto typeObject = mlir::dyn_cast<py::TypeType>(type)) {
-    mlir::Type instance =
-        replaceSelfType(typeObject.getInstanceType(), selfType);
-    return instance != typeObject.getInstanceType()
-               ? py::TypeType::get(context, instance)
-               : type;
-  }
-  if (auto unpack = mlir::dyn_cast<py::UnpackType>(type)) {
-    mlir::Type packed = replaceSelfType(unpack.getPackedType(), selfType);
-    return packed != unpack.getPackedType()
-               ? py::UnpackType::get(context, packed)
-               : type;
-  }
-  return type;
+  return py::mapPyTypeStructure(
+      type, [&](mlir::Type node) -> std::optional<mlir::Type> {
+        if (mlir::isa<py::SelfType>(node))
+          return selfType;
+        return std::nullopt;
+      });
 }
 
 void replaceSelfInSignature(FunctionSignature &sig, mlir::Type selfType,
@@ -778,62 +707,13 @@ std::optional<bool> optionalStaticBranchTruth(const parser::Node &test,
 }
 
 mlir::Type widenInferredLiterals(mlir::Type type, const AlgorithmM &types) {
-  if (!type)
-    return type;
-  mlir::Type widened = types.widenLiteral(type);
-  if (widened != type)
-    return widened;
-  if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(type)) {
-    llvm::SmallVector<mlir::Type, 4> args;
-    for (mlir::Type arg : contract.getArguments())
-      args.push_back(widenInferredLiterals(arg, types));
-    return py::ContractType::get(type.getContext(), contract.getContractName(),
-                                 args);
-  }
-  if (auto protocol = mlir::dyn_cast_if_present<py::ProtocolType>(type)) {
-    llvm::SmallVector<mlir::Type, 4> args;
-    for (mlir::Type arg : protocol.getArguments())
-      args.push_back(widenInferredLiterals(arg, types));
-    return py::ProtocolType::get(type.getContext(), protocol.getProtocolName(),
-                                 args);
-  }
-  if (auto typeType = mlir::dyn_cast_if_present<py::TypeType>(type)) {
-    return py::TypeType::get(
-        type.getContext(),
-        widenInferredLiterals(typeType.getInstanceType(), types));
-  }
-  if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(type)) {
-    llvm::SmallVector<mlir::Type, 4> members;
-    for (mlir::Type member : unionType.getMemberTypes())
-      members.push_back(widenInferredLiterals(member, types));
-    return py::UnionType::getNormalized(type.getContext(), members);
-  }
-  if (auto callable = mlir::dyn_cast_if_present<py::CallableType>(type)) {
-    llvm::SmallVector<mlir::Type, 8> positional;
-    llvm::SmallVector<mlir::Type, 4> kwonly;
-    llvm::SmallVector<mlir::Type, 1> results;
-    for (mlir::Type arg : callable.getPositionalTypes())
-      positional.push_back(widenInferredLiterals(arg, types));
-    for (mlir::Type arg : callable.getKwOnlyTypes())
-      kwonly.push_back(widenInferredLiterals(arg, types));
-    for (mlir::Type result : callable.getResultTypes())
-      results.push_back(widenInferredLiterals(result, types));
-    mlir::Type vararg =
-        callable.hasVararg()
-            ? widenInferredLiterals(callable.getVarargType(), types)
-            : mlir::Type();
-    mlir::Type kwarg =
-        callable.hasKwarg()
-            ? widenInferredLiterals(callable.getKwargType(), types)
-            : mlir::Type();
-    return py::CallableType::get(
-        type.getContext(), positional, kwonly, vararg, kwarg, results,
-        callable.getPositionalNames(), callable.getKwOnlyNames(),
-        callable.getPositionalDefaults(), callable.getKwOnlyDefaults(),
-        callable.getVarargName(), callable.getKwargName(),
-        callable.getPositionalOnlyCount());
-  }
-  return type;
+  return py::mapPyTypeStructure(
+      type, [&](mlir::Type node) -> std::optional<mlir::Type> {
+        mlir::Type widened = types.widenLiteral(node);
+        if (widened != node)
+          return widened;
+        return std::nullopt;
+      });
 }
 
 bool hasUnexpectedObjectTop(mlir::Type actual, mlir::Type expected,

@@ -21,11 +21,6 @@ struct RhsPanelSlice {
   mlir::OpFoldResult nOffset;
 };
 
-mlir::Value createIndexConstant(mlir::OpBuilder &builder, mlir::Location loc,
-                                int64_t value) {
-  return mlir::arith::ConstantIndexOp::create(builder, loc, value).getResult();
-}
-
 mlir::Value addIndexValues(mlir::OpBuilder &builder, mlir::Location loc,
                            mlir::Value lhs, mlir::Value rhs) {
   return mlir::arith::AddIOp::create(builder, loc, lhs, rhs).getResult();
@@ -45,15 +40,6 @@ std::optional<int64_t> selectPackedCopyVectorLanes(mlir::Type elementType,
                                                    int64_t columns) {
   return selectDivisibleVectorLanes(elementType, columns, kPackedCopyVectorBits,
                                     /*minLanes=*/1);
-}
-
-bool isBlockArgumentDefinedInside(mlir::Value value, mlir::Operation *scope) {
-  auto argument = mlir::dyn_cast<mlir::BlockArgument>(value);
-  if (!argument)
-    return false;
-
-  mlir::Operation *owner = argument.getOwner()->getParentOp();
-  return owner && scope->isProperAncestor(owner);
 }
 
 bool operationWritesToMemrefRoot(mlir::Operation *op, mlir::Value root) {

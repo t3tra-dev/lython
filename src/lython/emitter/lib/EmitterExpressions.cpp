@@ -18,6 +18,41 @@
 
 namespace lython::emitter {
 
+// origin -> then/else -> merge(block argument) with cf branches: the one
+// shape every two-armed value merge in the emitter uses (a conditional whose
+// arms may themselves open new blocks, so each arm branches from wherever
+// its value became available).
+mlir::Value ModuleEmitter::emitValueDiamond(
+    mlir::Location location, mlir::Value condition, mlir::Type resultType,
+    llvm::function_ref<mlir::Value()> emitThen,
+    llvm::function_ref<mlir::Value()> emitElse) {
+  mlir::Block *origin = builder.getInsertionBlock();
+  mlir::Region *region = origin->getParent();
+  mlir::Block *thenBlock =
+      builder.createBlock(region, std::next(origin->getIterator()));
+  mlir::Block *elseBlock =
+      builder.createBlock(region, std::next(thenBlock->getIterator()));
+  mlir::Block *merge =
+      builder.createBlock(region, std::next(elseBlock->getIterator()));
+  mlir::BlockArgument result = merge->addArgument(resultType, location);
+
+  builder.setInsertionPointToEnd(origin);
+  mlir::cf::CondBranchOp::create(builder, location, condition, thenBlock,
+                                 mlir::ValueRange{}, elseBlock,
+                                 mlir::ValueRange{});
+  builder.setInsertionPointToStart(thenBlock);
+  mlir::Value thenValue = emitThen();
+  mlir::cf::BranchOp::create(builder, location, merge,
+                             mlir::ValueRange{thenValue});
+  builder.setInsertionPointToStart(elseBlock);
+  mlir::Value elseValue = emitElse();
+  mlir::cf::BranchOp::create(builder, location, merge,
+                             mlir::ValueRange{elseValue});
+
+  builder.setInsertionPointToStart(merge);
+  return result;
+}
+
 Value ModuleEmitter::emitExpr(const parser::Node *expr) {
   if (!expr)
     return {py::NoneOp::create(builder, builder.getUnknownLoc(), types.none())
@@ -181,33 +216,13 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
     mlir::Value condition =
         emitBoolValue(emitExpr(ast::node(*expr, "test")), *expr);
 
-    mlir::Block *origin = builder.getInsertionBlock();
-    mlir::Region *region = origin->getParent();
-    mlir::Block *thenBlock =
-        builder.createBlock(region, std::next(origin->getIterator()));
-    mlir::Block *elseBlock =
-        builder.createBlock(region, std::next(thenBlock->getIterator()));
-    mlir::Block *merge =
-        builder.createBlock(region, std::next(elseBlock->getIterator()));
-    mlir::BlockArgument result = merge->addArgument(resultType, loc(*expr));
-
-    builder.setInsertionPointToEnd(origin);
-    mlir::cf::CondBranchOp::create(builder, loc(*expr), condition, thenBlock,
-                                   mlir::ValueRange{}, elseBlock,
-                                   mlir::ValueRange{});
-    builder.setInsertionPointToStart(thenBlock);
-    Value body = coerceValue(emitExpr(bodyNode), resultType, *expr);
-    // Nested expressions may have moved emission into a new block; branch
-    // from wherever the arm's value became available.
-    mlir::cf::BranchOp::create(builder, loc(*expr), merge,
-                               mlir::ValueRange{body.value});
-    builder.setInsertionPointToStart(elseBlock);
-    Value other = coerceValue(emitExpr(elseNode), resultType, *expr);
-    mlir::cf::BranchOp::create(builder, loc(*expr), merge,
-                               mlir::ValueRange{other.value});
-
-    builder.setInsertionPointToStart(merge);
-    return {mlir::Value(result), resultType};
+    mlir::Value result = emitValueDiamond(
+        loc(*expr), condition, resultType,
+        [&] { return coerceValue(emitExpr(bodyNode), resultType, *expr).value; },
+        [&] {
+          return coerceValue(emitExpr(elseNode), resultType, *expr).value;
+        });
+    return {result, resultType};
   }
   if (expr->kind == "BoolOp") {
     // Short-circuit `and`/`or` over BOOL-typed operands via the same
@@ -633,43 +648,28 @@ std::optional<Value> ModuleEmitter::emitOptionalCompare(
 
   // cf-block merge, mirroring the IfExp lowering (region-based scf.if results
   // are invisible to the runtime bundle machinery and the ownership verifier).
-  mlir::Block *origin = builder.getInsertionBlock();
-  mlir::Region *region = origin->getParent();
-  mlir::Block *presentBlock =
-      builder.createBlock(region, std::next(origin->getIterator()));
-  mlir::Block *absentBlock =
-      builder.createBlock(region, std::next(presentBlock->getIterator()));
-  mlir::Block *merge =
-      builder.createBlock(region, std::next(absentBlock->getIterator()));
-  mlir::BlockArgument result = merge->addArgument(resultType, location);
-
-  builder.setInsertionPointToEnd(origin);
-  mlir::cf::CondBranchOp::create(builder, location, present, presentBlock,
-                                 mlir::ValueRange{}, absentBlock,
-                                 mlir::ValueRange{});
-
-  // Present branch: project the concrete member(s) and re-enter scalar dispatch.
-  builder.setInsertionPointToStart(presentBlock);
-  auto unwrap = [&](Value value, mlir::Type member) -> Value {
-    auto op = py::UnionUnwrapOp::create(builder, location, member, value.value);
-    return Value{op.getResult(), member};
-  };
-  Value presentLhs = lhsMember ? unwrap(lhs, lhsMember) : lhs;
-  Value presentRhs = rhsMember ? unwrap(rhs, rhsMember) : rhs;
-  Value compared = emitScalarCompare(expr, presentLhs, presentRhs, op);
-  Value comparedBool = coerceValue(compared, resultType, expr);
-  mlir::cf::BranchOp::create(builder, location, merge,
-                             mlir::ValueRange{comparedBool.value});
-
-  // Absent branch: the statically known equality bit for the None case(s).
-  builder.setInsertionPointToStart(absentBlock);
-  auto absentBool =
-      py::CastFromPrimOp::create(builder, location, resultType, absentBit);
-  mlir::cf::BranchOp::create(builder, location, merge,
-                             mlir::ValueRange{absentBool.getResult()});
-
-  builder.setInsertionPointToStart(merge);
-  return Value{mlir::Value(result), resultType};
+  mlir::Value result = emitValueDiamond(
+      location, present, resultType,
+      // Present branch: project the concrete member(s) and re-enter scalar
+      // dispatch.
+      [&] {
+        auto unwrap = [&](Value value, mlir::Type member) -> Value {
+          auto op =
+              py::UnionUnwrapOp::create(builder, location, member, value.value);
+          return Value{op.getResult(), member};
+        };
+        Value presentLhs = lhsMember ? unwrap(lhs, lhsMember) : lhs;
+        Value presentRhs = rhsMember ? unwrap(rhs, rhsMember) : rhs;
+        Value compared = emitScalarCompare(expr, presentLhs, presentRhs, op);
+        return coerceValue(compared, resultType, expr).value;
+      },
+      // Absent branch: the statically known equality bit for the None case(s).
+      [&] {
+        return py::CastFromPrimOp::create(builder, location, resultType,
+                                          absentBit)
+            .getResult();
+      });
+  return Value{result, resultType};
 }
 
 Value ModuleEmitter::emitSubscript(const parser::Node &expr) {

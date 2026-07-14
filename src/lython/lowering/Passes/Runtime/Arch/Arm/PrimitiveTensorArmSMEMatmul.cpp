@@ -45,11 +45,6 @@ struct SMEMatmulViews {
 // on the generic scalar/vector path, which already has small-matmul handling.
 constexpr std::uint64_t kSMEMatmulMinWork = 1024;
 
-mlir::Value createIndexConstant(mlir::OpBuilder &builder, mlir::Location loc,
-                                int64_t value) {
-  return mlir::arith::ConstantIndexOp::create(builder, loc, value).getResult();
-}
-
 mlir::VectorType scalableVectorType(mlir::Type elementType) {
   return mlir::VectorType::get({4}, elementType, {true});
 }

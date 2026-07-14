@@ -326,10 +326,7 @@ RuntimeBundleLowerer::emitSourceGeneratorResumeDispatch(
           return yieldFrom.emitError()
                  << "source generator yield from call delegation requires a "
                     "source generator target";
-        auto callableAttr =
-            callTarget->getAttrOfType<mlir::TypeAttr>("callable_type");
-        auto callableType = mlir::dyn_cast_if_present<py::CallableType>(
-            callableAttr ? callableAttr.getValue() : mlir::Type());
+        py::CallableType callableType = callableTypeOf(callTarget);
         if (!callableType || callableType.hasVararg() ||
             callableType.hasKwarg() || !callableType.getKwOnlyTypes().empty())
           return yieldFrom.emitError()

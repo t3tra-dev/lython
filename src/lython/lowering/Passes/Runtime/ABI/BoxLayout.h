@@ -17,6 +17,12 @@ namespace py::lowering::box_abi {
 inline constexpr std::int64_t kWordsPerBox = 16;
 inline constexpr std::int64_t kPointerWordBase = 4;
 inline constexpr std::int64_t kSizeWordBase = 9;
+// Up to five physical memrefs per boxed entity (pointer words [4, 9), size
+// words [9, 14)); word 14 is the owned flag the deallocators consult.
+inline constexpr std::int64_t kPointerWordCount =
+    kSizeWordBase - kPointerWordBase;
+inline constexpr std::int64_t kOwnedFlagWord =
+    kSizeWordBase + kPointerWordCount;
 
 inline mlir::MemRefType boxWordsType(mlir::Builder &builder) {
   return mlir::MemRefType::get({kWordsPerBox}, builder.getI64Type());

@@ -89,6 +89,52 @@ mlir::func::FuncOp RuntimeBundleLowerer::findRetainFunction() const {
   return retained;
 }
 
+// Emits the union tag dispatch shared by aggregate retain and release: one
+// zero-result scf.if per member whose body receives that member's value
+// slice. Retain/release must stay symmetric — a divergence here silently
+// unbalances the ownership tokens of the inactive members.
+mlir::LogicalResult RuntimeBundleLowerer::forEachActiveUnionMember(
+    mlir::Operation *op, py::UnionType unionType, mlir::ValueRange values,
+    llvm::StringRef abiLabel,
+    llvm::function_ref<mlir::LogicalResult(mlir::Type, mlir::ValueRange)>
+        emitMember) {
+  if (values.empty())
+    return op->emitError() << abiLabel << " value has no tag";
+  context->loadDialect<mlir::scf::SCFDialect>();
+  mlir::Value tag = values.front();
+  unsigned offset = 1;
+  for (auto [memberIndex, member] :
+       llvm::enumerate(unionType.getMemberTypes())) {
+    mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> memberTypes =
+        RuntimeBundleLowerer::runtimeValueTypesFor(op, member, abiLabel);
+    if (mlir::failed(memberTypes))
+      return mlir::failure();
+    unsigned size = static_cast<unsigned>(memberTypes->size());
+    if (offset + size > values.size())
+      return op->emitError() << abiLabel << " member exceeds value group";
+    if (size == 0) {
+      offset += size;
+      continue;
+    }
+
+    mlir::Value expected = mlir::arith::ConstantIntOp::create(
+        builder, op->getLoc(), static_cast<std::int64_t>(memberIndex), 64);
+    mlir::Value active = mlir::arith::CmpIOp::create(
+        builder, op->getLoc(), mlir::arith::CmpIPredicate::eq, tag, expected);
+    auto ifOp = mlir::scf::IfOp::create(builder, op->getLoc(),
+                                        mlir::TypeRange{}, active,
+                                        /*withElseRegion=*/false);
+    // Zero-result scf.if auto-inserts its scf.yield terminator; adding
+    // another would leave a mid-block yield.
+    builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+    if (mlir::failed(emitMember(member, values.slice(offset, size))))
+      return mlir::failure();
+    builder.setInsertionPointAfter(ifOp);
+    offset += size;
+  }
+  return mlir::success();
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::retainAggregateSlot(
     mlir::Operation *op, mlir::Type slotType, mlir::ValueRange values,
     llvm::StringRef slotName) {
@@ -173,46 +219,13 @@ mlir::LogicalResult RuntimeBundleLowerer::retainAggregateSlot(
   if (values.empty() || isNoneLikeType(slotType))
     return mlir::success();
 
-  if (auto unionType = mlir::dyn_cast<py::UnionType>(slotType)) {
-    if (values.empty())
-      return op->emitError() << "union aggregate retain value has no tag";
-    context->loadDialect<mlir::scf::SCFDialect>();
-    mlir::Value tag = values.front();
-    unsigned offset = 1;
-    for (auto [memberIndex, member] :
-         llvm::enumerate(unionType.getMemberTypes())) {
-      mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> memberTypes =
-          RuntimeBundleLowerer::runtimeValueTypesFor(
-              op, member, "union aggregate retain ABI");
-      if (mlir::failed(memberTypes))
-        return mlir::failure();
-      unsigned size = static_cast<unsigned>(memberTypes->size());
-      if (offset + size > values.size())
-        return op->emitError()
-               << "union aggregate retain member exceeds value group";
-      if (size == 0) {
-        offset += size;
-        continue;
-      }
-
-      mlir::Value expected = mlir::arith::ConstantIntOp::create(
-          builder, op->getLoc(), static_cast<std::int64_t>(memberIndex), 64);
-      mlir::Value active = mlir::arith::CmpIOp::create(
-          builder, op->getLoc(), mlir::arith::CmpIPredicate::eq, tag, expected);
-      auto ifOp =
-          mlir::scf::IfOp::create(builder, op->getLoc(), mlir::TypeRange{},
-                                  active, /*withElseRegion=*/false);
-      // Zero-result scf.if auto-inserts its scf.yield terminator; adding
-      // another would leave a mid-block yield.
-      builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
-      if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
-              op, member, values.slice(offset, size), slotName, depth + 1)))
-        return mlir::failure();
-      builder.setInsertionPointAfter(ifOp);
-      offset += size;
-    }
-    return mlir::success();
-  }
+  if (auto unionType = mlir::dyn_cast<py::UnionType>(slotType))
+    return forEachActiveUnionMember(
+        op, unionType, values, "union aggregate retain ABI",
+        [&](mlir::Type member, mlir::ValueRange memberValues) {
+          return RuntimeBundleLowerer::retainAggregateSlot(
+              op, member, memberValues, slotName, depth + 1);
+        });
 
   if (!own::isObjectHeaderLikeType(values.front().getType()))
     return mlir::success();
@@ -247,47 +260,13 @@ mlir::LogicalResult RuntimeBundleLowerer::releaseAggregateSlot(
   if (values.empty() || isNoneLikeType(slotType))
     return mlir::success();
 
-  if (auto unionType = mlir::dyn_cast<py::UnionType>(slotType)) {
-    if (values.empty())
-      return op->emitError() << "union aggregate release value has no tag";
-    context->loadDialect<mlir::scf::SCFDialect>();
-    mlir::Value tag = values.front();
-    unsigned offset = 1;
-    for (auto [memberIndex, member] :
-         llvm::enumerate(unionType.getMemberTypes())) {
-      mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> memberTypes =
-          RuntimeBundleLowerer::runtimeValueTypesFor(
-              op, member, "union aggregate release ABI");
-      if (mlir::failed(memberTypes))
-        return mlir::failure();
-      unsigned size = static_cast<unsigned>(memberTypes->size());
-      if (offset + size > values.size())
-        return op->emitError()
-               << "union aggregate release member exceeds value group";
-      if (size == 0) {
-        offset += size;
-        continue;
-      }
-
-      mlir::Value expected = mlir::arith::ConstantIntOp::create(
-          builder, op->getLoc(), static_cast<std::int64_t>(memberIndex), 64);
-      mlir::Value active = mlir::arith::CmpIOp::create(
-          builder, op->getLoc(), mlir::arith::CmpIPredicate::eq, tag, expected);
-      auto ifOp =
-          mlir::scf::IfOp::create(builder, op->getLoc(), mlir::TypeRange{},
-                                  active, /*withElseRegion=*/false);
-      // Zero-result scf.if auto-inserts its scf.yield terminator; adding
-      // another would leave a mid-block yield.
-      builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
-      if (mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
-              op, member, values.slice(offset, size), slotName, deallocators,
-              depth + 1)))
-        return mlir::failure();
-      builder.setInsertionPointAfter(ifOp);
-      offset += size;
-    }
-    return mlir::success();
-  }
+  if (auto unionType = mlir::dyn_cast<py::UnionType>(slotType))
+    return forEachActiveUnionMember(
+        op, unionType, values, "union aggregate release ABI",
+        [&](mlir::Type member, mlir::ValueRange memberValues) {
+          return RuntimeBundleLowerer::releaseAggregateSlot(
+              op, member, memberValues, slotName, deallocators, depth + 1);
+        });
 
   if (!own::isObjectHeaderLikeType(values.front().getType()))
     return mlir::success();

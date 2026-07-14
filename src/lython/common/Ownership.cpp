@@ -1291,4 +1291,106 @@ collectExceptionEdges(mlir::Region &region) {
   return edges;
 }
 
+bool returnTransfersGroup(FuncContractCache &contracts,
+                          mlir::func::FuncOp function,
+                          mlir::func::ReturnOp returnOp,
+                          llvm::ArrayRef<mlir::Value> group,
+                          llvm::ArrayRef<RuntimeDeallocator> deallocators,
+                          AliasAnalysis &aliases) {
+  auto cached = contracts.lookup(function);
+  if (mlir::succeeded(cached) && *cached) {
+    for (unsigned offset : (*cached)->contract.ownedResults.values)
+      if (groupMatchesValues(returnOp.getOperands(), offset, group, aliases))
+        return true;
+  }
+
+  // Without the owned-return ABI the contract loop above is the only
+  // transfer surface; re-scanning the contract here (as one caller
+  // historically did) can never match again and just reads as a divergence.
+  if (!functionUsesOwnedReturnABI(function))
+    return false;
+
+  std::optional<llvm::SmallVector<OwnedReturnRange, 4>> ranges =
+      callableOwnedReturnRanges(function, returnOp.getOperands(),
+                                deallocators);
+  if (!ranges) {
+    for (unsigned offset = 0;
+         offset + group.size() <= returnOp.getNumOperands(); ++offset)
+      if (groupMatchesValues(returnOp.getOperands(), offset, group, aliases))
+        return true;
+    return false;
+  }
+  for (const OwnedReturnRange &range : *ranges)
+    if (groupMatchesOwnedReturnRange(returnOp.getOperands(), range, group,
+                                     deallocators, aliases))
+      return true;
+  return false;
+}
+
+bool callConsumesGroup(FuncContractCache &contracts, mlir::func::CallOp call,
+                       llvm::ArrayRef<mlir::Value> group,
+                       AliasAnalysis &aliases) {
+  auto cached = contracts.lookup(call.getCallee());
+  if (mlir::failed(cached) || !*cached)
+    return false;
+  for (unsigned offset : (*cached)->contract.releaseArgs.values)
+    if (groupMatchesValues(call.getOperands(), offset, group, aliases))
+      return true;
+  for (unsigned offset : (*cached)->contract.transferArgs.values)
+    if (groupMatchesValues(call.getOperands(), offset, group, aliases))
+      return true;
+  return false;
+}
+
+bool groupContainsOperand(mlir::Operation *op,
+                          llvm::ArrayRef<mlir::Value> group,
+                          AliasAnalysis &aliases) {
+  for (mlir::Value operand : op->getOperands())
+    for (mlir::Value value : group)
+      if (aliases.same(operand, value))
+        return true;
+  return false;
+}
+
+llvm::SmallVector<mlir::Value, 4> remapGroupThroughValueMapping(
+    mlir::ValueRange sources, mlir::ValueRange targets,
+    llvm::ArrayRef<mlir::Value> group, AliasAnalysis &aliases,
+    llvm::SmallVectorImpl<bool> *mappedMask) {
+  llvm::SmallVector<mlir::Value, 4> mapped(group.begin(), group.end());
+  if (mappedMask) {
+    mappedMask->clear();
+    mappedMask->append(group.size(), false);
+  }
+
+  unsigned count = std::min<unsigned>(sources.size(), targets.size());
+  for (auto [groupIndex, value] : llvm::enumerate(group)) {
+    for (unsigned index = 0; index < count; ++index) {
+      if (!sources[index] || !targets[index] ||
+          !aliases.same(sources[index], value))
+        continue;
+      mapped[groupIndex] = targets[index];
+      if (mappedMask)
+        (*mappedMask)[groupIndex] = true;
+      break;
+    }
+  }
+  return mapped;
+}
+
+mlir::Operation *ancestorInBlock(mlir::Operation *op, mlir::Block *block) {
+  while (op && op->getBlock() != block)
+    op = op->getParentOp();
+  return op && op->getBlock() == block ? op : nullptr;
+}
+
+bool sameValueGroup(llvm::ArrayRef<mlir::Value> lhs,
+                    llvm::ArrayRef<mlir::Value> rhs) {
+  if (lhs.size() != rhs.size())
+    return false;
+  for (auto [left, right] : llvm::zip(lhs, rhs))
+    if (left != right)
+      return false;
+  return true;
+}
+
 } // namespace py::ownership

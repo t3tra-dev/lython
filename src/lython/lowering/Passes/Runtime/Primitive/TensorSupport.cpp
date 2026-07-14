@@ -130,4 +130,19 @@ std::optional<int64_t> selectDivisibleVectorLanes(mlir::Type elementType,
   return lanes;
 }
 
+
+mlir::Value createIndexConstant(mlir::OpBuilder &builder, mlir::Location loc,
+                                std::int64_t value) {
+  return mlir::arith::ConstantIndexOp::create(builder, loc, value).getResult();
+}
+
+bool isBlockArgumentDefinedInside(mlir::Value value, mlir::Operation *scope) {
+  auto argument = mlir::dyn_cast<mlir::BlockArgument>(value);
+  if (!argument)
+    return false;
+
+  mlir::Operation *owner = argument.getOwner()->getParentOp();
+  return owner && scope->isProperAncestor(owner);
+}
+
 } // namespace py::lowering

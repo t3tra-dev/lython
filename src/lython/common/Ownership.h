@@ -7,6 +7,7 @@
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <cstdint>
@@ -244,5 +245,72 @@ private:
   llvm::DenseMap<mlir::Value, llvm::SmallVector<mlir::Value, 8>> aliasBuckets;
   bool aliasBucketsDirty = true;
 };
+
+// Group predicates shared by release insertion (lowering) and the affine
+// ownership verifier — like the owned-return walking above, these must have
+// exactly one implementation or insert/verify silently drift apart.
+
+struct CachedFuncContract {
+  mlir::func::FuncOp function;
+  FunctionContract contract;
+};
+
+class FuncContractCache {
+public:
+  explicit FuncContractCache(mlir::ModuleOp module) {
+    module.walk([&](mlir::func::FuncOp function) {
+      functions.insert({function.getSymName(), function});
+    });
+  }
+
+  mlir::FailureOr<const CachedFuncContract *> lookup(llvm::StringRef name) {
+    auto cached = contracts.find(name);
+    if (cached != contracts.end())
+      return &cached->second;
+
+    auto function = functions.find(name);
+    if (function == functions.end())
+      return static_cast<const CachedFuncContract *>(nullptr);
+
+    auto contract = readFunctionContract(function->second);
+    if (mlir::failed(contract))
+      return mlir::failure();
+
+    CachedFuncContract entry{function->second, *contract};
+    auto inserted = contracts.insert({name, std::move(entry)});
+    return &inserted.first->second;
+  }
+
+  mlir::FailureOr<const CachedFuncContract *>
+  lookup(mlir::func::FuncOp function) {
+    if (!function)
+      return static_cast<const CachedFuncContract *>(nullptr);
+    return lookup(function.getSymName());
+  }
+
+private:
+  llvm::StringMap<mlir::func::FuncOp> functions;
+  llvm::StringMap<CachedFuncContract> contracts;
+};
+
+bool returnTransfersGroup(FuncContractCache &contracts,
+                          mlir::func::FuncOp function,
+                          mlir::func::ReturnOp returnOp,
+                          llvm::ArrayRef<mlir::Value> group,
+                          llvm::ArrayRef<RuntimeDeallocator> deallocators,
+                          AliasAnalysis &aliases);
+bool callConsumesGroup(FuncContractCache &contracts, mlir::func::CallOp call,
+                       llvm::ArrayRef<mlir::Value> group,
+                       AliasAnalysis &aliases);
+bool groupContainsOperand(mlir::Operation *op,
+                          llvm::ArrayRef<mlir::Value> group,
+                          AliasAnalysis &aliases);
+llvm::SmallVector<mlir::Value, 4> remapGroupThroughValueMapping(
+    mlir::ValueRange sources, mlir::ValueRange targets,
+    llvm::ArrayRef<mlir::Value> group, AliasAnalysis &aliases,
+    llvm::SmallVectorImpl<bool> *mappedMask = nullptr);
+mlir::Operation *ancestorInBlock(mlir::Operation *op, mlir::Block *block);
+bool sameValueGroup(llvm::ArrayRef<mlir::Value> lhs,
+                    llvm::ArrayRef<mlir::Value> rhs);
 
 } // namespace py::ownership

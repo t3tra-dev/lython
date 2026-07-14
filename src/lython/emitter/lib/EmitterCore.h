@@ -126,6 +126,10 @@ private:
   void emitWithCleanup(const parser::Node &anchor, const WithCleanup &cleanup);
   void emitActiveCleanups(const parser::Node &anchor);
 
+  mlir::Value emitValueDiamond(mlir::Location location, mlir::Value condition,
+                               mlir::Type resultType,
+                               llvm::function_ref<mlir::Value()> emitThen,
+                               llvm::function_ref<mlir::Value()> emitElse);
   Value emitExpr(const parser::Node *expr);
   Value emitConstant(const parser::Node &expr);
   Value emitCall(const parser::Node &expr);
@@ -135,6 +139,25 @@ private:
   Value emitCallableDispatch(const parser::Node &anchor, Value callee,
                              const CallOperands &operands,
                              mlir::Type resultOverride = {});
+  std::optional<Value> tryEmitIsInstanceCall(const parser::Node &expr,
+                                             const parser::Node *calleeNode);
+  std::optional<Value> tryEmitStrCall(const parser::Node &expr,
+                                      const parser::Node *calleeNode);
+  std::optional<Value> tryEmitListCall(const parser::Node &expr,
+                                       const parser::Node *calleeNode);
+  std::optional<Value> tryEmitPrintCall(const parser::Node &expr,
+                                        const parser::Node *calleeNode);
+  std::optional<Value> tryEmitReducerCall(const parser::Node &expr,
+                                          const parser::Node *calleeNode);
+  std::optional<Value> tryEmitLenCall(const parser::Node &expr,
+                                      const parser::Node *calleeNode);
+  std::optional<Value> tryEmitRoundCall(const parser::Node &expr,
+                                        const parser::Node *calleeNode);
+  std::optional<Value> tryEmitReprCall(const parser::Node &expr,
+                                       const parser::Node *calleeNode);
+  std::optional<Value> rejectStubSourceCall(const parser::Node &expr,
+                                            llvm::StringRef symbol,
+                                            bool instantiation);
   bool methodBindingBindsReceiver(const MethodBinding &method) const;
   Value emitDescriptorReceiver(const parser::Node &anchor, Value receiver,
                                const MethodBinding &method);

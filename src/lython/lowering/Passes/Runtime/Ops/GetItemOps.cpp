@@ -201,7 +201,8 @@ RuntimeBundleLowerer::unboxSlotElementValues(mlir::Operation *op,
 // device the dynamic-index selection uses).
 mlir::LogicalResult
 RuntimeBundleLowerer::pinContainerLiveness(mlir::Operation *op,
-                                           const RuntimeBundle &container) {
+                                           const RuntimeBundle &container,
+                                           bool insertAfterOp) {
   std::optional<RuntimeSymbol> lenMethod =
       manifest.method(container.contractName(), "__len__");
   if (!lenMethod)
@@ -214,7 +215,7 @@ RuntimeBundleLowerer::pinContainerLiveness(mlir::Operation *op,
                                             lenOperands,
                                             /*allowUnusedSources=*/false)))
     return mlir::failure();
-  builder.setInsertionPoint(op);
+  builder.setInsertionPoint(insertAfterOp ? op->getNextNode() : op);
   RuntimeBundleLowerer::createRuntimeCall(op->getLoc(), *lenMethod,
                                           lenOperands);
   return mlir::success();
@@ -610,8 +611,8 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerSequenceEvidenceGetItem(
                    << chainElement.contract << " selected by a dynamic index";
     return mlir::failure();
   }
-  builder.setInsertionPoint(op);
-  RuntimeBundleLowerer::createRuntimeCall(op.getLoc(), *lenMethod, lenOperands);
+  if (mlir::failed(pinContainerLiveness(op, container)))
+    return mlir::failure();
   RuntimeBundle rebuilt = RuntimeBundle::objectWithOwnership(
       (*selected).objectValue.contract, retained->values,
       ownership::logicalOwnershipKind((*selected).objectValue.contract,
@@ -773,21 +774,8 @@ RuntimeBundleLowerer::lowerDictEvidenceGetItem(py::GetItemOp op,
                    << chainValue.contract << " selected by a dynamic key";
     return mlir::failure();
   }
-  std::optional<RuntimeSymbol> dictLen =
-      manifest.method(container.contractName(), "__len__");
-  if (!dictLen) {
-    op.emitError() << "dict evidence dynamic key needs a runtime __len__ to "
-                      "pin the container";
+  if (mlir::failed(pinContainerLiveness(op, container)))
     return mlir::failure();
-  }
-  llvm::SmallVector<const RuntimeBundle *, 1> lenSources{&container};
-  llvm::SmallVector<mlir::Value, 4> lenOperands;
-  if (mlir::failed(buildRuntimeCallOperands(op, *dictLen, lenSources,
-                                            lenOperands,
-                                            /*allowUnusedSources=*/false)))
-    return mlir::failure();
-  builder.setInsertionPoint(op);
-  RuntimeBundleLowerer::createRuntimeCall(op.getLoc(), *dictLen, lenOperands);
   RuntimeBundle rebuilt = RuntimeBundle::objectWithOwnership(
       (*selected).objectValue.contract, retained->values,
       ownership::logicalOwnershipKind((*selected).objectValue.contract,
@@ -928,20 +916,9 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeSequenceGetItem(
                                              "runtime sequence __getitem__",
                                              element)))
     return mlir::failure();
-  std::optional<RuntimeSymbol> lenMethod =
-      manifest.method(container.contractName(), "__len__");
-  if (!lenMethod) {
-    op.emitError() << "runtime sequence getitem needs a runtime __len__";
+  if (mlir::failed(pinContainerLiveness(op, container,
+                                        /*insertAfterOp=*/true)))
     return mlir::failure();
-  }
-  llvm::SmallVector<const RuntimeBundle *, 1> lenSources{&container};
-  llvm::SmallVector<mlir::Value, 4> lenOperands;
-  if (mlir::failed(buildRuntimeCallOperands(op, *lenMethod, lenSources,
-                                            lenOperands,
-                                            /*allowUnusedSources=*/false)))
-    return mlir::failure();
-  builder.setInsertionPoint(op->getNextNode());
-  RuntimeBundleLowerer::createRuntimeCall(loc, *lenMethod, lenOperands);
   return true;
 }
 
@@ -1061,20 +1038,9 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeDictGetItem(
                                              "runtime dict __getitem__",
                                              value)))
     return mlir::failure();
-  std::optional<RuntimeSymbol> lenMethod =
-      manifest.method(container.contractName(), "__len__");
-  if (!lenMethod) {
-    op.emitError() << "runtime dict getitem needs a runtime __len__";
+  if (mlir::failed(pinContainerLiveness(op, container,
+                                        /*insertAfterOp=*/true)))
     return mlir::failure();
-  }
-  llvm::SmallVector<const RuntimeBundle *, 1> lenSources{&container};
-  llvm::SmallVector<mlir::Value, 4> lenOperands;
-  if (mlir::failed(buildRuntimeCallOperands(op, *lenMethod, lenSources,
-                                            lenOperands,
-                                            /*allowUnusedSources=*/false)))
-    return mlir::failure();
-  builder.setInsertionPoint(op->getNextNode());
-  RuntimeBundleLowerer::createRuntimeCall(loc, *lenMethod, lenOperands);
   return true;
 }
 

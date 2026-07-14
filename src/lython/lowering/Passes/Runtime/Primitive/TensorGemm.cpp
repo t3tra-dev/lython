@@ -84,11 +84,6 @@ GemmSchedule defaultGemmSchedule() {
                       {}};
 }
 
-mlir::Value createIndexConstant(mlir::OpBuilder &builder, mlir::Location loc,
-                                int64_t value) {
-  return mlir::arith::ConstantIndexOp::create(builder, loc, value).getResult();
-}
-
 bool hasPrimitiveStaticShape(mlir::Value value) {
   auto shapedType = mlir::dyn_cast<mlir::ShapedType>(value.getType());
   if (!shapedType || !shapedType.hasStaticShape())
@@ -101,8 +96,6 @@ bool hasPrimitiveMatmulContract(mlir::linalg::MatmulOp matmul) {
          hasPrimitiveStaticShape(matmul.getDpsInputOperand(1)->get()) &&
          hasPrimitiveStaticShape(matmul.getDpsInitOperand(0)->get());
 }
-
-bool isBlockArgumentDefinedInside(mlir::Value value, mlir::Operation *scope);
 
 std::optional<MatmulTileShape>
 staticMatmulShape(mlir::linalg::MatmulOp matmul) {
@@ -529,15 +522,6 @@ bool isPackedPanel(mlir::Value value) {
 bool copiesIntoPackedPanel(mlir::linalg::CopyOp copy) {
   return copy.getNumDpsInits() == 1 &&
          isPackedPanel(copy.getDpsInitOperand(0)->get());
-}
-
-bool isBlockArgumentDefinedInside(mlir::Value value, mlir::Operation *scope) {
-  auto argument = mlir::dyn_cast<mlir::BlockArgument>(value);
-  if (!argument)
-    return false;
-
-  mlir::Operation *owner = argument.getOwner()->getParentOp();
-  return owner && scope->isProperAncestor(owner);
 }
 
 bool collectLoopInvariantDefs(
