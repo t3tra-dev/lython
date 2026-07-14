@@ -17,7 +17,7 @@ module attributes {
   // Manifest Callable contracts for asyncio free functions, replacing the C++
   // makeAsyncioSleepCallable / makeAsyncioGetEventLoopCallable factories so
   // imported asyncio callables are typed from the manifest.
-  // Callable exports drive import binding (AlgorithmM reads these tables;
+  // Callable exports drive import binding (TypeSystem reads these tables;
   // no C++ import-table entries needed) and pair with the contracts below.
   ly.typing.callable_exports = [
     "asyncio.sleep",

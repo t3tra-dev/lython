@@ -31,7 +31,7 @@ std::string sourceModuleClassSymbol(llvm::StringRef module,
 }
 
 void bindSourceClassLocals(
-    AlgorithmM &types, llvm::StringRef moduleName,
+    TypeSystem &types, llvm::StringRef moduleName,
     const std::vector<parser::NodePtr> &body) {
   for (const parser::NodePtr &statement : body) {
     if (!statement || !isTopLevelClass(*statement))
@@ -45,7 +45,7 @@ void bindSourceClassLocals(
 }
 
 FunctionSignature sourceModuleFunctionSignature(
-    AlgorithmM &types, llvm::StringRef moduleName,
+    TypeSystem &types, llvm::StringRef moduleName,
     const std::vector<parser::NodePtr> &body, const parser::Node &function,
     bool isStub) {
   (void)isStub;
@@ -137,7 +137,7 @@ resolveRelativeModule(llvm::StringRef packageName, std::int64_t level,
 // Lib modules use, e.g. `if name == 'posix': from posix import *`).
 // Unfoldable module-level ifs contribute no static bindings.
 std::vector<parser::NodePtr>
-staticModuleStatements(AlgorithmM &types,
+staticModuleStatements(TypeSystem &types,
                        const std::vector<parser::NodePtr> &body) {
   std::vector<parser::NodePtr> out;
   out.reserve(body.size());
@@ -184,7 +184,7 @@ bool ModuleEmitter::isStubSourceModuleSymbol(llvm::StringRef symbol) const {
 }
 
 static std::optional<mlir::Type>
-sourceModuleLiteralConstant(AlgorithmM &types,
+sourceModuleLiteralConstant(TypeSystem &types,
                             const std::vector<parser::NodePtr> &body,
                             llvm::StringRef exportedName);
 
@@ -300,7 +300,7 @@ bool ModuleEmitter::bindSourceModuleNamespace(llvm::StringRef module,
 // in a source module is a static literal constant: its literal type fully
 // determines the value, so importers materialize it without module state.
 static std::optional<mlir::Type>
-sourceModuleLiteralConstant(AlgorithmM &types,
+sourceModuleLiteralConstant(TypeSystem &types,
                             const std::vector<parser::NodePtr> &body,
                             llvm::StringRef exportedName) {
   const parser::Node *constantNode = nullptr;

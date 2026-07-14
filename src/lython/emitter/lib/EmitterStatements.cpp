@@ -62,11 +62,7 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
     mlir::Type annotated =
         types.annotationType(ast::node(statement, "annotation"));
     if (const parser::Node *rhs = ast::node(statement, "value")) {
-      Value raw =
-          rhs->kind == "Lambda"
-              ? emitLambda(*rhs, mlir::dyn_cast_if_present<py::CallableType>(
-                                     annotated))
-              : emitExpr(rhs);
+      Value raw = emitExprExpected(rhs, annotated);
       Value value = coerceValue(raw, annotated, statement);
       emitAssignTarget(*ast::node(statement, "target"), value);
       return;
@@ -109,10 +105,8 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
     }
   } else if (statement.kind == "Return") {
     const parser::Node *returnValue = ast::node(statement, "value");
-    Value value = returnValue && returnValue->kind == "Lambda"
-                      ? emitLambda(*returnValue,
-                                   mlir::dyn_cast_if_present<py::CallableType>(
-                                       currentReturnType))
+    Value value = returnValue
+                      ? emitExprExpected(returnValue, currentReturnType)
                       : emitExpr(returnValue);
     if (!inlineReturnContexts.empty()) {
       InlineReturnContext &ctx = inlineReturnContexts.back();

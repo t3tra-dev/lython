@@ -24,7 +24,7 @@ mlir::Value constantI1(mlir::OpBuilder &builder, mlir::Location loc,
       .getResult();
 }
 
-Value boxedBool(mlir::OpBuilder &builder, mlir::Location loc, AlgorithmM &types,
+Value boxedBool(mlir::OpBuilder &builder, mlir::Location loc, TypeSystem &types,
                 mlir::Value bit) {
   auto pyBool = py::CastFromPrimOp::create(builder, loc, types.boolType(), bit);
   return {pyBool.getResult(), types.boolType()};
@@ -55,7 +55,8 @@ std::optional<llvm::StringRef> contractName(mlir::Type type) {
 CallOperands
 ModuleEmitter::emitCallOperands(const parser::Node &expr,
                                 llvm::ArrayRef<Value> leadingPositional,
-                                bool includeAstArguments) {
+                                bool includeAstArguments,
+                                py::CallableType expectedContract) {
   CallOperands operands;
   for (Value value : leadingPositional) {
     operands.positional.push_back(value);
@@ -65,12 +66,34 @@ ModuleEmitter::emitCallOperands(const parser::Node &expr,
   if (!includeAstArguments)
     return operands;
 
+  llvm::ArrayRef<mlir::Type> expectedPositional =
+      expectedContract ? expectedContract.getPositionalTypes()
+                       : llvm::ArrayRef<mlir::Type>();
+  // A static type parameter as formal means the expectation is the CALL's
+  // output (the argument determines it), not an input to distribute; a
+  // starred argument breaks positional alignment for everything after it.
+  auto expectedFor = [&](std::size_t index) -> mlir::Type {
+    if (index >= expectedPositional.size())
+      return {};
+    mlir::Type formal = expectedPositional[index];
+    if (formal && py::isStaticTypeParameter(formal))
+      return {};
+    return formal;
+  };
+
   if (const auto *args = ast::nodeList(expr, "args")) {
+    bool positionalAligned = true;
     for (const parser::NodePtr &arg : *args) {
       bool unpacked = arg && arg->kind == "Starred";
+      if (unpacked)
+        positionalAligned = false;
       const parser::Node *valueNode =
           unpacked ? ast::node(*arg, "value") : arg.get();
-      Value value = emitExpr(valueNode);
+      Value value = positionalAligned
+                        ? emitExprExpected(
+                              valueNode,
+                              expectedFor(operands.positionalTypes.size()))
+                        : emitExpr(valueNode);
       operands.positional.push_back(value);
       operands.positionalUnpacked.push_back(unpacked ? 1 : 0);
       if (unpacked) {
@@ -253,9 +276,13 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
         return emitAsyncioRunCall(expr);
       mlir::Type resultOverride =
           binding == "asyncio.sleep" ? types.inferExpr(&expr) : mlir::Type();
-      return emitCallableDispatch(expr,
-                                  emitBindingRef(*calleeNode, binding, *symbol),
-                                  emitCallOperands(expr), resultOverride);
+      Value callee = emitBindingRef(*calleeNode, binding, *symbol);
+      return emitCallableDispatch(
+          expr, callee,
+          emitCallOperands(expr, {}, /*includeAstArguments=*/true,
+                           mlir::dyn_cast_if_present<py::CallableType>(
+                               callee.type)),
+          resultOverride);
     }
   }
 
@@ -323,6 +350,11 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
 
   if (calleeNode && calleeNode->kind == "Name") {
     llvm::StringRef name = ast::nameSpelling(*calleeNode);
+    if (values.find(name) == values.end()) {
+      auto generic = genericFunctions.find(name);
+      if (generic != genericFunctions.end())
+        return emitGenericCall(expr, *calleeNode, generic->second);
+    }
     if (!types.lookupSymbol(name) && !types.lookupClass(name)) {
       diagnostics.push_back(parser::Diagnostic{
           parser::Severity::Error, calleeNode->range.start,
@@ -331,8 +363,50 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     }
   }
 
-  return emitCallableDispatch(expr, emitExpr(calleeNode),
-                              emitCallOperands(expr));
+  // The callee is emitted before the operands on purpose: Python evaluates
+  // the callee first, and its Callable contract is the expectation the
+  // argument emission distributes (lambda parameters, empty literals).
+  Value callee = emitExpr(calleeNode);
+  return emitCallableDispatch(
+      expr, callee,
+      emitCallOperands(expr, {}, /*includeAstArguments=*/true,
+                       mlir::dyn_cast_if_present<py::CallableType>(
+                           callee.type)));
+}
+
+Value ModuleEmitter::emitGenericCall(const parser::Node &expr,
+                                     const parser::Node &calleeNode,
+                                     GenericFunctionInfo &generic) {
+  // The generic contract still distributes as the argument expectation: its
+  // ground formals propagate, and expectedFor skips the type-parameter ones.
+  CallOperands operands =
+      emitCallOperands(expr, {}, /*includeAstArguments=*/true,
+                       generic.signature.publicCallable);
+  if (!operands.valid) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start, operands.failureReason});
+    return emitNone(expr);
+  }
+  CallInferenceResult inference = types.inferCallWithEvidence(
+      generic.signature.publicCallable, operands.positionalTypes,
+      operands.keywordTypes);
+  if (!requireStaticEvidence(expr, inference))
+    return emitNone(expr);
+  auto resolved = mlir::dyn_cast_if_present<py::CallableType>(
+      inference.evidence.callableContract);
+  if (!resolved) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "generic call did not resolve to a Callable contract"});
+    return emitNone(expr);
+  }
+  std::optional<std::pair<std::string, py::CallableType>> specialization =
+      ensureGenericSpecialization(expr, generic, resolved);
+  if (!specialization)
+    return emitNone(expr);
+  Value callee = emitBindingRef(calleeNode, specialization->first,
+                                specialization->second);
+  return emitCallableDispatch(expr, callee, operands);
 }
 
 std::optional<Value>

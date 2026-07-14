@@ -46,6 +46,11 @@ ClassTypeStorage::construct(mlir::TypeStorageAllocator &allocator,
       ClassTypeStorage(allocator.copyInto(key));
 }
 
+IdTypeStorage *IdTypeStorage::construct(mlir::TypeStorageAllocator &allocator,
+                                        const KeyTy &key) {
+  return new (allocator.allocate<IdTypeStorage>()) IdTypeStorage(key);
+}
+
 CallableTypeStorage *
 CallableTypeStorage::construct(mlir::TypeStorageAllocator &allocator,
                                const KeyTy &key) {
@@ -170,6 +175,12 @@ TypeVarTupleType TypeVarTupleType::get(mlir::MLIRContext *ctx,
 ::llvm::StringRef TypeVarTupleType::getName() const {
   return getImpl()->className;
 }
+
+InferVarType InferVarType::get(mlir::MLIRContext *ctx, unsigned id) {
+  return Base::get(ctx, id);
+}
+
+unsigned InferVarType::getId() const { return getImpl()->id; }
 
 UnpackType UnpackType::get(mlir::MLIRContext *ctx, mlir::Type packedType) {
   return Base::get(ctx, packedType);
@@ -562,6 +573,22 @@ bool isPyTypeVarTupleType(mlir::Type type) {
 }
 
 bool isPyUnpackType(mlir::Type type) { return mlir::isa<UnpackType>(type); }
+
+bool isPyInferVarType(mlir::Type type) {
+  return mlir::isa_and_present<InferVarType>(type);
+}
+
+bool containsPyInferVar(mlir::Type type) {
+  bool found = false;
+  mapPyTypeStructure(type, [&](mlir::Type node) -> std::optional<mlir::Type> {
+    if (mlir::isa<InferVarType>(node)) {
+      found = true;
+      return node;
+    }
+    return std::nullopt;
+  });
+  return found;
+}
 
 bool isPyExceptionType(mlir::Type type) {
   return mlir::isa<ExceptionType>(type);

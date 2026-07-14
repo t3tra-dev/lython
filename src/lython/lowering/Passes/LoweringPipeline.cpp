@@ -145,11 +145,11 @@ LogicalResult runLoweringPipeline(ModuleOp module,
 
   // Phase 4: semantic evidence verification before lowering consumes Py ops.
   if (failed(runVerifierPhase(
-          "algorithmm-evidence-verifier", [&](PassManager &pm) {
-            pm.addPass(createAlgorithmMEvidenceVerifierPass());
+          "type-evidence-verifier", [&](PassManager &pm) {
+            pm.addPass(createTypeEvidenceVerifierPass());
           })))
     return failure();
-  dumpMLIRForPass(irDump, "algorithmm-evidence-verifier", module);
+  dumpMLIRForPass(irDump, "type-evidence-verifier", module);
 
   // Phase 5: quantitative ownership verification over high-level Py IR.
   if (failed(runVerifierPhase("ownership-verifier", [&](PassManager &pm) {

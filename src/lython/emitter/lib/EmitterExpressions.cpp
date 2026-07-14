@@ -3,6 +3,7 @@
 #include "EmitterPyOps.h"
 #include "EmitterSupport.h"
 #include "PlatformConstants.h"
+#include "TypeSystemSolver.h"
 
 #include "AstAccess.h"
 #include "PyProtocols.h"
@@ -107,6 +108,18 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
     if (std::optional<Value> literal =
             emitLiteralTypeConstant(*expr, *symbolType))
       return *literal;
+    if (genericFunctions.count(name)) {
+      // No ground context reached this reference (calls and expected-typed
+      // uses are intercepted earlier), so there is no instantiation to
+      // materialize; emitting the type-parameterized contract would only
+      // defer the failure to the ABI check.
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, expr->range.start,
+          "reference to generic function '" + std::string(name) +
+              "' requires a call or an annotated Callable context to "
+              "determine its type arguments"});
+      return emitNone(*expr);
+    }
     return emitBindingRef(*expr, binding, *symbolType);
   }
   if (expr->kind == "Call")
@@ -1018,21 +1031,107 @@ Value ModuleEmitter::emitComprehension(const parser::Node &expr,
   return result;
 }
 
-Value ModuleEmitter::emitContainerLiteral(const parser::Node &expr) {
-  llvm::SmallVector<Value, 8> valuesToPack;
-  if (const auto *elts = ast::nodeList(expr, "elts"))
-    for (const parser::NodePtr &elt : *elts)
-      valuesToPack.push_back(emitExpr(elt.get()));
-  if (const auto *keys = ast::nodeList(expr, "keys")) {
-    const auto *vals = ast::nodeList(expr, "values");
-    for (auto [index, key] : llvm::enumerate(*keys)) {
-      if (key)
-        valuesToPack.push_back(emitExpr(key.get()));
-      if (vals && index < vals->size())
-        valuesToPack.push_back(emitExpr((*vals)[index].get()));
+Value ModuleEmitter::emitExprExpected(const parser::Node *expr,
+                                      mlir::Type expected) {
+  if (!expr || !expected)
+    return emitExpr(expr);
+  if (expr->kind == "Lambda")
+    if (auto expectedCallable =
+            mlir::dyn_cast_if_present<py::CallableType>(expected))
+      return emitLambda(*expr, expectedCallable);
+  if (expr->kind == "List" || expr->kind == "Tuple" || expr->kind == "Dict")
+    return emitContainerLiteral(*expr, expected);
+  if (expr->kind == "Name") {
+    llvm::StringRef name = ast::nameSpelling(*expr);
+    if (values.find(name) == values.end()) {
+      auto generic = genericFunctions.find(name);
+      if (generic != genericFunctions.end()) {
+        // A ground expected callable determines the instantiation, so a
+        // first-class reference to a generic function materializes as a
+        // reference to the matching specialization.
+        auto expectedCallable =
+            mlir::dyn_cast_if_present<py::CallableType>(expected);
+        if (!expectedCallable ||
+            unboundStaticParameterCount(expectedCallable) != 0)
+          return emitExpr(expr);
+        std::optional<std::pair<std::string, py::CallableType>>
+            specialization = ensureGenericSpecialization(
+                *expr, generic->second, expectedCallable);
+        if (!specialization)
+          return emitNone(*expr);
+        return emitBindingRef(*expr, specialization->first,
+                              specialization->second);
+      }
     }
   }
-  mlir::Type resultType = types.inferExpr(&expr);
+  return emitExpr(expr);
+}
+
+Value ModuleEmitter::emitContainerLiteral(const parser::Node &expr,
+                                          mlir::Type expected) {
+  // The expectation only distributes when its container class matches the
+  // literal's node kind; a mismatched expectation falls back to synthesis so
+  // the caller's contract check reports it at the right place.
+  auto expectedContract = mlir::dyn_cast_if_present<py::ContractType>(expected);
+  llvm::StringRef expectedName =
+      expectedContract ? expectedContract.getContractName() : llvm::StringRef();
+  llvm::ArrayRef<mlir::Type> expectedArgs =
+      expectedContract ? expectedContract.getArguments()
+                       : llvm::ArrayRef<mlir::Type>();
+  bool container = false;
+
+  llvm::SmallVector<Value, 8> valuesToPack;
+  bool empty = true;
+  if (const auto *elts = ast::nodeList(expr, "elts")) {
+    mlir::Type elementExpected;
+    llvm::ArrayRef<mlir::Type> positionalExpected;
+    if (expr.kind == "List" && expectedName == "builtins.list" &&
+        expectedArgs.size() == 1) {
+      container = true;
+      elementExpected = expectedArgs.front();
+    } else if (expr.kind == "Tuple" && expectedName == "builtins.tuple") {
+      if (expectedArgs.size() == elts->size()) {
+        container = true;
+        positionalExpected = expectedArgs;
+      } else if (expectedArgs.size() == 1) {
+        container = true;
+        elementExpected = expectedArgs.front();
+      }
+    }
+    for (auto [index, elt] : llvm::enumerate(*elts)) {
+      empty = false;
+      mlir::Type eltExpected = index < positionalExpected.size()
+                                   ? positionalExpected[index]
+                                   : elementExpected;
+      valuesToPack.push_back(emitExprExpected(elt.get(), eltExpected));
+    }
+  }
+  if (const auto *keys = ast::nodeList(expr, "keys")) {
+    mlir::Type keyExpected;
+    mlir::Type valueExpected;
+    if (expr.kind == "Dict" && expectedName == "builtins.dict" &&
+        expectedArgs.size() == 2) {
+      container = true;
+      keyExpected = expectedArgs[0];
+      valueExpected = expectedArgs[1];
+    }
+    const auto *vals = ast::nodeList(expr, "values");
+    for (auto [index, key] : llvm::enumerate(*keys)) {
+      empty = false;
+      if (key)
+        valuesToPack.push_back(emitExprExpected(key.get(), keyExpected));
+      if (vals && index < vals->size())
+        valuesToPack.push_back(
+            emitExprExpected((*vals)[index].get(), valueExpected));
+    }
+  }
+  // An empty literal synthesizes its top-erased element type, which the
+  // stricter lowering contract match later rejects against a concrete
+  // formal; adopting the expectation types the pack correctly from the
+  // start. Non-empty literals keep the synthesized type: their elements
+  // determine it, and the caller's coercion validates the expectation.
+  mlir::Type resultType =
+      (empty && container) ? expected : types.inferExpr(&expr);
   llvm::SmallVector<mlir::Value, 8> operands;
   for (Value value : valuesToPack)
     operands.push_back(value.value);

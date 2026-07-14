@@ -70,7 +70,7 @@ add_library(LythonRuntimeLowering STATIC
     Passes/Runtime/Arch/Generic/PrimitiveTensorGenericMicroKernel.cpp
     Passes/Runtime/Primitive/TensorSupport.cpp
     Passes/Runtime/Primitive/TensorLowering.cpp
-    ../verifier/AlgorithmMEvidence.cpp
+    ../verifier/TypeEvidence.cpp
     ../verifier/runtime/Verification.cpp
     ../verifier/runtime/AffineOwnership.cpp
     ../verifier/runtime/LLVMCallOwnership.cpp

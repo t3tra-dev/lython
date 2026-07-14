@@ -51,6 +51,9 @@ EmitResult ModuleEmitter::emit() {
 
   predeclareSourceModules();
   predeclareTopLevel();
+  // After class/import predeclaration (signatures may reference user classes
+  // and imported names), before any body is typed or emitted.
+  types.registerModule(moduleNode);
 
   // Register module globals after the top-level classes are predeclared (a
   // global's annotation may name a user class) but before any function body

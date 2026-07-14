@@ -12,7 +12,7 @@
 
 namespace lython::emitter {
 
-class AlgorithmM;
+class TypeSystem;
 
 enum class PrimitiveTypeKind { Int, Float, Vector, Matrix, Tensor };
 
@@ -32,17 +32,17 @@ std::optional<std::int64_t> integerLiteralValue(const parser::Node *node);
 
 std::optional<PrimitiveTypeSpec>
 primitiveTypeSpecFromSubscript(const parser::Node *node,
-                               const AlgorithmM &types);
+                               const TypeSystem &types);
 std::optional<unsigned> primitiveIntWidthFromSubscript(const parser::Node *node,
-                                                       const AlgorithmM &types);
+                                                       const TypeSystem &types);
 std::optional<mlir::IntegerType>
 primitiveIntTypeFromSubscript(const parser::Node *node,
-                              const AlgorithmM &types);
+                              const TypeSystem &types);
 std::optional<std::pair<mlir::IntegerType, std::int64_t>>
 primitiveIntegerConstantConstructor(const parser::Node *node,
-                                    const AlgorithmM &types);
+                                    const TypeSystem &types);
 mlir::Type primitivePythonResultType(mlir::Type primitiveType,
-                                     const AlgorithmM &types);
+                                     const TypeSystem &types);
 
 std::optional<mlir::Type> primitiveBinaryResultType(mlir::Type left,
                                                     mlir::Type right,

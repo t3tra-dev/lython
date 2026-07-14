@@ -12,7 +12,7 @@ namespace lython::emitter {
 namespace {
 
 std::string canonicalPrimitiveName(const parser::Node *node,
-                                   const AlgorithmM &types) {
+                                   const TypeSystem &types) {
   if (!node)
     return {};
   std::string qualified = ast::qualifiedName(node);
@@ -68,7 +68,7 @@ std::optional<mlir::FloatType> floatTypeForWidth(mlir::MLIRContext *context,
 }
 
 std::optional<PrimitiveTypeSpec> scalarPrimitiveSpecFromSubscript(
-    const parser::Node *node, const AlgorithmM &types, PrimitiveTypeKind kind) {
+    const parser::Node *node, const TypeSystem &types, PrimitiveTypeKind kind) {
   const parser::Node *slice = ast::node(*node, "slice");
   std::optional<unsigned> width = positiveWidth(slice);
   if (!width)
@@ -88,7 +88,7 @@ std::optional<PrimitiveTypeSpec> scalarPrimitiveSpecFromSubscript(
 }
 
 std::optional<PrimitiveTypeSpec> shapedPrimitiveSpecFromSubscript(
-    const parser::Node *node, const AlgorithmM &types, PrimitiveTypeKind kind) {
+    const parser::Node *node, const TypeSystem &types, PrimitiveTypeKind kind) {
   const parser::Node *slice = ast::node(*node, "slice");
   if (!slice || slice->kind != "Tuple")
     return std::nullopt;
@@ -136,7 +136,7 @@ std::optional<PrimitiveTypeSpec> shapedPrimitiveSpecFromSubscript(
 
 mlir::Type nestedListType(mlir::Type elementType,
                           llvm::ArrayRef<std::int64_t> shape,
-                          const AlgorithmM &types) {
+                          const TypeSystem &types) {
   mlir::Type result = elementType;
   for (std::int64_t ignored : llvm::reverse(shape)) {
     (void)ignored;
@@ -175,7 +175,7 @@ std::optional<std::int64_t> integerLiteralValue(const parser::Node *node) {
 
 std::optional<PrimitiveTypeSpec>
 primitiveTypeSpecFromSubscript(const parser::Node *node,
-                               const AlgorithmM &types) {
+                               const TypeSystem &types) {
   if (!node || node->kind != "Subscript")
     return std::nullopt;
   std::string canonical =
@@ -190,7 +190,7 @@ primitiveTypeSpecFromSubscript(const parser::Node *node,
 
 std::optional<unsigned>
 primitiveIntWidthFromSubscript(const parser::Node *node,
-                               const AlgorithmM &types) {
+                               const TypeSystem &types) {
   std::optional<PrimitiveTypeSpec> spec =
       primitiveTypeSpecFromSubscript(node, types);
   if (!spec || spec->kind != PrimitiveTypeKind::Int)
@@ -200,7 +200,7 @@ primitiveIntWidthFromSubscript(const parser::Node *node,
 
 std::optional<mlir::IntegerType>
 primitiveIntTypeFromSubscript(const parser::Node *node,
-                              const AlgorithmM &types) {
+                              const TypeSystem &types) {
   std::optional<PrimitiveTypeSpec> spec =
       primitiveTypeSpecFromSubscript(node, types);
   if (!spec || spec->kind != PrimitiveTypeKind::Int)
@@ -210,7 +210,7 @@ primitiveIntTypeFromSubscript(const parser::Node *node,
 
 std::optional<std::pair<mlir::IntegerType, std::int64_t>>
 primitiveIntegerConstantConstructor(const parser::Node *node,
-                                    const AlgorithmM &types) {
+                                    const TypeSystem &types) {
   if (!node || node->kind != "Call")
     return std::nullopt;
   std::optional<mlir::IntegerType> type =
@@ -228,7 +228,7 @@ primitiveIntegerConstantConstructor(const parser::Node *node,
 }
 
 mlir::Type primitivePythonResultType(mlir::Type primitiveType,
-                                     const AlgorithmM &types) {
+                                     const TypeSystem &types) {
   if (mlir::isa<mlir::IntegerType>(primitiveType))
     return types.intType();
   if (mlir::isa<mlir::FloatType>(primitiveType))

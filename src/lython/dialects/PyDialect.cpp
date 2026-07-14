@@ -23,9 +23,9 @@ namespace py {
 
 void PyDialect::initialize() {
   addTypes<ContractType, LiteralType, TypeVarType, ParamSpecType,
-           TypeVarTupleType, UnpackType, TypeType, ProtocolType, ExceptionType,
-           ExceptionCellType, TracebackType, LocationType, CallableType,
-           UnionType, OverloadType, SelfType>();
+           TypeVarTupleType, UnpackType, InferVarType, TypeType, ProtocolType,
+           ExceptionType, ExceptionCellType, TracebackType, LocationType,
+           CallableType, UnionType, OverloadType, SelfType>();
 
   addOperations<
 #define GET_OP_LIST
@@ -323,6 +323,14 @@ mlir::Type PyDialect::parseType(mlir::DialectAsmParser &parser) const {
       return mlir::Type();
     return UnpackType::get(ctx, packedType);
   }
+  if (keyword == "infervar") {
+    if (parser.parseLess())
+      return mlir::Type();
+    unsigned id = 0;
+    if (parser.parseInteger(id) || parser.parseGreater())
+      return mlir::Type();
+    return InferVarType::get(ctx, id);
+  }
   if (keyword == "tuple") {
     if (parser.parseLess())
       return mlir::Type();
@@ -521,6 +529,9 @@ void PyDialect::printType(mlir::Type type,
       })
       .Case<UnpackType>([&](UnpackType unpackTy) {
         printer << "unpack<" << unpackTy.getPackedType() << ">";
+      })
+      .Case<InferVarType>([&](InferVarType inferVarTy) {
+        printer << "infervar<" << inferVarTy.getId() << ">";
       })
       .Case<TypeType>([&](TypeType typeTy) {
         printer << "type<" << typeTy.getInstanceType() << ">";

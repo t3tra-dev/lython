@@ -1,6 +1,7 @@
 #include "EmitterCore.h"
 #include "EmitterPyOps.h"
 #include "EmitterSupport.h"
+#include "TypeSystemSolver.h"
 
 #include "AstAccess.h"
 #include "ClosureAnalysis.h"
@@ -77,9 +78,109 @@ void ModuleEmitter::emitFunctionDecl(const parser::Node &function) {
   if (!name)
     return;
   FunctionSignature sig = types.functionSignature(function);
-  if (!diagnoseUnsupportedFunctionSignature(diagnostics, function, sig))
-    emitCallableFunction(function, *name, sig, {}, /*isLambda=*/false);
+  if (!diagnoseUnsupportedFunctionSignature(diagnostics, function, sig)) {
+    if (unboundStaticParameterCount(sig.publicCallable) != 0) {
+      bool packParameterized = false;
+      py::mapPyTypeStructure(
+          sig.publicCallable, [&](mlir::Type node) -> std::optional<mlir::Type> {
+            if (py::isPyParamSpecType(node) || py::isPyTypeVarTupleType(node))
+              packParameterized = true;
+            return std::nullopt;
+          });
+      if (packParameterized) {
+        // A pack parameter is a parameter-LIST unknown; one specialization
+        // per instantiated arity would need per-call-shape mangling and
+        // pack-aware body emission, which the specializer does not do.
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, function.range.start,
+            "generic function '" + std::string(*name) +
+                "' uses ParamSpec or TypeVarTuple parameters, which cannot "
+                "be specialized yet"});
+      } else {
+        GenericFunctionInfo &info = genericFunctions[*name];
+        info.node = &function;
+        info.signature = sig;
+      }
+    } else {
+      emitCallableFunction(function, *name, sig, {}, /*isLambda=*/false);
+    }
+  }
   types.bindSymbol(*name, sig.publicCallable);
+}
+
+std::optional<std::pair<std::string, py::CallableType>>
+ModuleEmitter::ensureGenericSpecialization(const parser::Node &anchor,
+                                           GenericFunctionInfo &generic,
+                                           py::CallableType target) {
+  auto name = ast::string(*generic.node, "name");
+  auto fail = [&](llvm::StringRef detail) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, anchor.range.start,
+        "cannot specialize generic function '" +
+            std::string(name.value_or("<lambda>")) + "': " + detail.str()});
+    return std::nullopt;
+  };
+  if (!name)
+    return fail("missing function name");
+
+  TypeBindingMap bindings;
+  if (!target ||
+      !bindExpectedType(types, generic.signature.publicCallable, target,
+                        bindings))
+    return fail("the use site does not determine its type arguments");
+
+  FunctionSignature specialized = generic.signature;
+  auto substitute = [&](mlir::Type type) {
+    return type ? substituteType(types, type, bindings) : type;
+  };
+  for (mlir::Type &type : specialized.positionalTypes)
+    type = substitute(type);
+  for (mlir::Type &type : specialized.kwOnlyTypes)
+    type = substitute(type);
+  specialized.varargType = substitute(specialized.varargType);
+  specialized.callableVarargType = substitute(specialized.callableVarargType);
+  specialized.kwargType = substitute(specialized.kwargType);
+  specialized.resultType = substitute(specialized.resultType);
+  specialized.inferredGeneratorType =
+      substitute(specialized.inferredGeneratorType);
+  specialized.generatorYieldType = substitute(specialized.generatorYieldType);
+  specialized.generatorSendType = substitute(specialized.generatorSendType);
+  specialized.generatorReturnType =
+      substitute(specialized.generatorReturnType);
+  types.refreshCallable(specialized);
+  if (unboundStaticParameterCount(specialized.publicCallable) != 0 ||
+      unboundStaticParameterCount(specialized.callable) != 0)
+    return fail("the use site leaves type parameters unbound; annotate the "
+                "surrounding context");
+
+  auto memoized = generic.specializations.find(specialized.publicCallable);
+  if (memoized != generic.specializations.end())
+    return std::make_pair(memoized->second, specialized.publicCallable);
+  // Divergence backstop for polymorphic recursion: every recursive
+  // instantiation at a NEW ground type re-enters here before its body
+  // finishes emitting, so an unbounded chain would otherwise recurse
+  // forever.
+  if (generic.specializations.size() >= 32)
+    return fail("too many distinct instantiations (polymorphic recursion?)");
+
+  std::string symbol =
+      (llvm::Twine(*name) + "$spec" +
+       llvm::Twine(static_cast<unsigned>(generic.specializations.size())))
+          .str();
+  // Memoize BEFORE emitting the body: monomorphic recursion inside the
+  // specialized body must resolve to this same symbol instead of
+  // re-specializing.
+  generic.specializations[specialized.publicCallable] = symbol;
+
+  // Body annotations spell the type parameters by name (x: T); bind each
+  // solved parameter to its ground type for the emission scope, shadowing
+  // the generic TypeVar binding the signature pass installed.
+  auto scope = types.pushScope();
+  for (const auto &binding : bindings)
+    types.bindLocalSymbol(binding.first, binding.second);
+  emitCallableFunction(*generic.node, symbol, specialized, {},
+                       /*isLambda=*/false);
+  return std::make_pair(symbol, specialized.publicCallable);
 }
 
 void ModuleEmitter::emitCallableFunction(const parser::Node &callable,

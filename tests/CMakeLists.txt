@@ -23,12 +23,27 @@ endforeach()
 add_executable(lython_unit_tests
     unit/DriverTests.cpp
     unit/EmitterTests.cpp
+    unit/EvidenceVerifierTests.cpp
     unit/ParserTests.cpp
+    unit/TypeInferenceTests.cpp
+    unit/TypeSystemTests.cpp
 )
 add_dependencies(lython_unit_tests PyDialectIncGen)
+# TypeSystemTests exercises the TypeSystem facade directly; its header lives
+# in emitter/lib (not a public include dir) on purpose -- the tests pin the
+# inference engine's behavior across the Algorithm J migration.
+target_include_directories(lython_unit_tests
+    PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/lython/emitter/lib
+    ${CMAKE_SOURCE_DIR}/src/lython/common
+    ${CMAKE_SOURCE_DIR}/src/lython/dialects
+    ${CMAKE_SOURCE_DIR}/src/lython/verifier
+    ${CMAKE_BINARY_DIR}/src/lython/dialects
+)
 target_link_libraries(lython_unit_tests
     PRIVATE
     LythonDriver
+    PyDialect
     gtest
     gtest_main
 )

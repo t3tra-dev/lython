@@ -52,7 +52,7 @@ std::string typeText(mlir::Type type) {
   return stream.str();
 }
 
-CallInferenceResult unresolvedMethodCall(const AlgorithmM &types,
+CallInferenceResult unresolvedMethodCall(const TypeSystem &types,
                                          mlir::Type receiverType,
                                          llvm::StringRef methodName) {
   return CallInferenceResult{
@@ -90,13 +90,13 @@ bool hasDefault(std::size_t index, std::size_t total, std::size_t defaults) {
   return defaults != 0 && index + defaults >= total;
 }
 
-py::CallableType makeZeroArgStrCallable(const AlgorithmM &types) {
+py::CallableType makeZeroArgStrCallable(const TypeSystem &types) {
   mlir::MLIRContext *context = &types.getContext();
   llvm::SmallVector<mlir::Type, 1> results{types.strType()};
   return py::CallableType::get(context, {}, {}, {}, {}, results);
 }
 
-mlir::Type inferAsyncioSleepResult(const AlgorithmM &types,
+mlir::Type inferAsyncioSleepResult(const TypeSystem &types,
                                    mlir::ArrayRef<mlir::Type> positional,
                                    mlir::ArrayRef<CallKeywordType> keywords) {
   mlir::Type payload = types.none();
@@ -109,7 +109,7 @@ mlir::Type inferAsyncioSleepResult(const AlgorithmM &types,
                                                 types.widenLiteral(payload)});
 }
 
-bool appendStarredCallArgumentTypes(const AlgorithmM &types, mlir::Type type,
+bool appendStarredCallArgumentTypes(const TypeSystem &types, mlir::Type type,
                                     llvm::SmallVectorImpl<mlir::Type> &out);
 
 void recordInferenceFailure(
@@ -119,7 +119,7 @@ void recordInferenceFailure(
 }
 
 mlir::Type inferExprWithLocalCallables(
-    const AlgorithmM &types, const parser::Node *node,
+    const TypeSystem &types, const parser::Node *node,
     const llvm::StringMap<mlir::Type> &localCallables,
     llvm::SmallVectorImpl<std::string> *failureReasons = nullptr,
     const llvm::StringMap<mlir::Type> *localSymbols = nullptr) {
@@ -128,7 +128,7 @@ mlir::Type inferExprWithLocalCallables(
                                                     localSymbols});
 }
 
-mlir::Type inferReturnExpr(const AlgorithmM &types, const parser::Node *node,
+mlir::Type inferReturnExpr(const TypeSystem &types, const parser::Node *node,
                            const llvm::StringMap<mlir::Type> &localCallables,
                            llvm::SmallVectorImpl<std::string> *failureReasons,
                            const llvm::StringMap<mlir::Type> *localSymbols =
@@ -138,7 +138,7 @@ mlir::Type inferReturnExpr(const AlgorithmM &types, const parser::Node *node,
 }
 
 llvm::StringMap<mlir::Type>
-localCallableTypesInFunction(const AlgorithmM &types,
+localCallableTypesInFunction(const TypeSystem &types,
                              const parser::Node &function) {
   llvm::StringMap<mlir::Type> localCallables;
   if (const auto *body = ast::nodeList(function, "body")) {
@@ -154,7 +154,7 @@ localCallableTypesInFunction(const AlgorithmM &types,
   return localCallables;
 }
 
-void collectReturnTypes(const AlgorithmM &types, const parser::Node *node,
+void collectReturnTypes(const TypeSystem &types, const parser::Node *node,
                         const llvm::StringMap<mlir::Type> &localCallables,
                         llvm::SmallVectorImpl<mlir::Type> &results,
                         llvm::SmallVectorImpl<std::string> *failureReasons,
@@ -186,7 +186,7 @@ void collectReturnTypes(const AlgorithmM &types, const parser::Node *node,
   }
 }
 
-mlir::Type inferredFunctionResult(const AlgorithmM &types,
+mlir::Type inferredFunctionResult(const TypeSystem &types,
                                   const parser::Node &function,
                                   llvm::SmallVectorImpl<std::string>
                                       *failureReasons = nullptr,
@@ -217,7 +217,7 @@ struct GeneratorFunctionAnalysis {
 };
 
 std::optional<mlir::Type> generatorYieldFromElementType(
-    const AlgorithmM &types, const parser::Node *value,
+    const TypeSystem &types, const parser::Node *value,
     const llvm::StringMap<mlir::Type> &localCallables,
     llvm::SmallVectorImpl<std::string> &failureReasons,
     const llvm::StringMap<mlir::Type> *localSymbols) {
@@ -243,7 +243,7 @@ const llvm::StringMap<mlir::Type> &noLocalCallables() {
 
 // Lenient inference during the body walk: object() fallbacks, but reads the
 // locals bound so far.
-mlir::Type lenientWalkInfer(const AlgorithmM &types, const parser::Node *node,
+mlir::Type lenientWalkInfer(const TypeSystem &types, const parser::Node *node,
                             const GeneratorFunctionAnalysis &analysis) {
   return types.inferExpr(
       node, ExprInferenceContext{noLocalCallables(), nullptr,
@@ -251,7 +251,7 @@ mlir::Type lenientWalkInfer(const AlgorithmM &types, const parser::Node *node,
 }
 
 void collectGeneratorFunctionAnalysis(
-    const AlgorithmM &types, const parser::Node *node,
+    const TypeSystem &types, const parser::Node *node,
     const llvm::StringMap<mlir::Type> &localCallables,
     mlir::Type generatorSendHint, GeneratorFunctionAnalysis &analysis) {
   if (!node)
@@ -378,7 +378,7 @@ void collectGeneratorFunctionAnalysis(
 }
 
 GeneratorFunctionAnalysis
-analyzeGeneratorFunction(const AlgorithmM &types, const parser::Node &function,
+analyzeGeneratorFunction(const TypeSystem &types, const parser::Node &function,
                          mlir::Type generatorSendHint = {}) {
   GeneratorFunctionAnalysis analysis;
   llvm::StringMap<mlir::Type> localCallables =
@@ -391,7 +391,7 @@ analyzeGeneratorFunction(const AlgorithmM &types, const parser::Node &function,
 }
 
 std::optional<mlir::Type>
-generatorSendTypeFromAnnotation(const AlgorithmM &types, mlir::Type annotation,
+generatorSendTypeFromAnnotation(const TypeSystem &types, mlir::Type annotation,
                                 llvm::StringRef protocolName) {
   if (!annotation)
     return std::nullopt;
@@ -410,7 +410,7 @@ generatorSendTypeFromAnnotation(const AlgorithmM &types, mlir::Type annotation,
 // manifest uses for dict.items()'s `tuple[$K, $V]` and starred call
 // arguments). Literal-index `__getitem__` resolves positional tuples to the
 // indexed member's type, so heterogeneous elements never need a union.
-mlir::Type tupleOfMembers(const AlgorithmM &types,
+mlir::Type tupleOfMembers(const TypeSystem &types,
                           llvm::ArrayRef<mlir::Type> members) {
   if (members.empty())
     return types.tupleOf(types.object());
@@ -421,7 +421,7 @@ mlir::Type tupleOfMembers(const AlgorithmM &types,
   return types.contract("builtins.tuple", members);
 }
 
-bool appendStarredCallArgumentTypes(const AlgorithmM &types, mlir::Type type,
+bool appendStarredCallArgumentTypes(const TypeSystem &types, mlir::Type type,
                                     llvm::SmallVectorImpl<mlir::Type> &out) {
   type = types.widenLiteral(type);
   if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(type)) {
@@ -436,7 +436,7 @@ bool appendStarredCallArgumentTypes(const AlgorithmM &types, mlir::Type type,
   return false;
 }
 
-bool bindManifestClassImport(AlgorithmM &types, llvm::StringRef localName,
+bool bindManifestClassImport(TypeSystem &types, llvm::StringRef localName,
                              llvm::StringRef contractName) {
   const py::protocols::Table &table =
       py::protocols::Table::get(types.getContext());
@@ -446,7 +446,7 @@ bool bindManifestClassImport(AlgorithmM &types, llvm::StringRef localName,
   return true;
 }
 
-mlir::Type genericClassTemplate(const AlgorithmM &types,
+mlir::Type genericClassTemplate(const TypeSystem &types,
                                 mlir::Type instanceType) {
   auto contract = mlir::dyn_cast_if_present<py::ContractType>(instanceType);
   if (!contract || !contract.getArguments().empty())
@@ -578,7 +578,7 @@ enum class ImportCallableFactory {
   StaticZeroArgStr,
 };
 
-mlir::Type importCallableType(const AlgorithmM &types,
+mlir::Type importCallableType(const TypeSystem &types,
                               ImportCallableFactory factory) {
   switch (factory) {
   case ImportCallableFactory::BuiltinsFunction:
@@ -814,7 +814,7 @@ std::string importedManifestModuleAttribute(llvm::StringRef module,
       localName, (llvm::Twine(root.second) + "." + attr).str());
 }
 
-bool bindManifestModuleObject(AlgorithmM &types, llvm::StringRef module,
+bool bindManifestModuleObject(TypeSystem &types, llvm::StringRef module,
                               llvm::StringRef localName) {
   // Module and submodule namespace symbols are lookup roots, not runtime
   // receivers. Their `object` top is an AGENTS.md namespace placeholder:
@@ -832,7 +832,7 @@ bool bindManifestModuleObject(AlgorithmM &types, llvm::StringRef module,
   return true;
 }
 
-bool bindManifestModuleClassExports(AlgorithmM &types, llvm::StringRef module,
+bool bindManifestModuleClassExports(TypeSystem &types, llvm::StringRef module,
                                     llvm::StringRef localName) {
   const py::protocols::Table &table =
       py::protocols::Table::get(types.getContext());
@@ -850,7 +850,7 @@ bool bindManifestModuleClassExports(AlgorithmM &types, llvm::StringRef module,
   return handled;
 }
 
-bool bindManifestModuleFloatConstants(AlgorithmM &types,
+bool bindManifestModuleFloatConstants(TypeSystem &types,
                                       llvm::StringRef module,
                                       llvm::StringRef localName) {
   const py::protocols::Table &table =
@@ -869,7 +869,7 @@ bool bindManifestModuleFloatConstants(AlgorithmM &types,
   return handled;
 }
 
-bool bindManifestModuleIntConstants(AlgorithmM &types, llvm::StringRef module,
+bool bindManifestModuleIntConstants(TypeSystem &types, llvm::StringRef module,
                                     llvm::StringRef localName) {
   const py::protocols::Table &table =
       py::protocols::Table::get(types.getContext());
@@ -887,7 +887,7 @@ bool bindManifestModuleIntConstants(AlgorithmM &types, llvm::StringRef module,
   return handled;
 }
 
-bool bindManifestModuleStrConstants(AlgorithmM &types, llvm::StringRef module,
+bool bindManifestModuleStrConstants(TypeSystem &types, llvm::StringRef module,
                                     llvm::StringRef localName) {
   const py::protocols::Table &table =
       py::protocols::Table::get(types.getContext());
@@ -905,7 +905,7 @@ bool bindManifestModuleStrConstants(AlgorithmM &types, llvm::StringRef module,
   return handled;
 }
 
-bool bindManifestModuleCallableExports(AlgorithmM &types,
+bool bindManifestModuleCallableExports(TypeSystem &types,
                                        llvm::StringRef module,
                                        llvm::StringRef localName) {
   const py::protocols::Table &table =
@@ -931,13 +931,14 @@ bool bindManifestModuleCallableExports(AlgorithmM &types,
 
 } // namespace
 
-AlgorithmM::AlgorithmM(mlir::MLIRContext &context) : context(context) {}
+TypeSystem::TypeSystem(mlir::MLIRContext &context)
+    : context(context), inferenceState(context) {}
 
-AlgorithmM::Scope::Scope(Scope &&other) noexcept : owner(other.owner) {
+TypeSystem::Scope::Scope(Scope &&other) noexcept : owner(other.owner) {
   other.owner = nullptr;
 }
 
-AlgorithmM::Scope &AlgorithmM::Scope::operator=(Scope &&other) noexcept {
+TypeSystem::Scope &TypeSystem::Scope::operator=(Scope &&other) noexcept {
   if (this == &other)
     return *this;
   reset();
@@ -946,16 +947,16 @@ AlgorithmM::Scope &AlgorithmM::Scope::operator=(Scope &&other) noexcept {
   return *this;
 }
 
-AlgorithmM::Scope::~Scope() { reset(); }
+TypeSystem::Scope::~Scope() { reset(); }
 
-void AlgorithmM::Scope::reset() {
+void TypeSystem::Scope::reset() {
   if (!owner)
     return;
   owner->popScope();
   owner = nullptr;
 }
 
-void AlgorithmM::seedBuiltins() {
+void TypeSystem::seedBuiltins() {
   bindSymbol("None", none());
   bindSymbol("True", literal("True"));
   bindSymbol("False", literal("False"));
@@ -1003,47 +1004,47 @@ void AlgorithmM::seedBuiltins() {
   bindClass("range", contract("builtins.range"));
 }
 
-mlir::Type AlgorithmM::object() const { return contract("builtins.object"); }
-mlir::Type AlgorithmM::any() const { return contract("typing.Any"); }
-mlir::Type AlgorithmM::none() const { return literal("None"); }
-mlir::Type AlgorithmM::boolType() const { return contract("builtins.bool"); }
-mlir::Type AlgorithmM::intType() const { return contract("builtins.int"); }
-mlir::Type AlgorithmM::strType() const { return contract("builtins.str"); }
-mlir::Type AlgorithmM::floatType() const { return contract("builtins.float"); }
+mlir::Type TypeSystem::object() const { return contract("builtins.object"); }
+mlir::Type TypeSystem::any() const { return contract("typing.Any"); }
+mlir::Type TypeSystem::none() const { return literal("None"); }
+mlir::Type TypeSystem::boolType() const { return contract("builtins.bool"); }
+mlir::Type TypeSystem::intType() const { return contract("builtins.int"); }
+mlir::Type TypeSystem::strType() const { return contract("builtins.str"); }
+mlir::Type TypeSystem::floatType() const { return contract("builtins.float"); }
 
-mlir::Type AlgorithmM::contract(llvm::StringRef name,
+mlir::Type TypeSystem::contract(llvm::StringRef name,
                                 mlir::ArrayRef<mlir::Type> arguments) const {
   return py::ContractType::get(&context, name, arguments);
 }
 
-mlir::Type AlgorithmM::protocol(llvm::StringRef name,
+mlir::Type TypeSystem::protocol(llvm::StringRef name,
                                 mlir::ArrayRef<mlir::Type> arguments) const {
   return py::ProtocolType::get(&context, name, arguments);
 }
 
-mlir::Type AlgorithmM::literal(llvm::StringRef spelling) const {
+mlir::Type TypeSystem::literal(llvm::StringRef spelling) const {
   return py::LiteralType::get(&context, spelling);
 }
 
-mlir::Type AlgorithmM::typeObject(mlir::Type instanceType) const {
+mlir::Type TypeSystem::typeObject(mlir::Type instanceType) const {
   return py::TypeType::get(&context, instanceType);
 }
 
-mlir::Type AlgorithmM::tupleOf(mlir::Type elementType) const {
+mlir::Type TypeSystem::tupleOf(mlir::Type elementType) const {
   llvm::SmallVector<mlir::Type, 1> args;
   if (elementType)
     args.push_back(elementType);
   return contract("builtins.tuple", args);
 }
 
-mlir::Type AlgorithmM::listOf(mlir::Type elementType) const {
+mlir::Type TypeSystem::listOf(mlir::Type elementType) const {
   llvm::SmallVector<mlir::Type, 1> args;
   if (elementType)
     args.push_back(elementType);
   return contract("builtins.list", args);
 }
 
-mlir::Type AlgorithmM::dictOf(mlir::Type keyType, mlir::Type valueType) const {
+mlir::Type TypeSystem::dictOf(mlir::Type keyType, mlir::Type valueType) const {
   llvm::SmallVector<mlir::Type, 2> args;
   if (keyType)
     args.push_back(keyType);
@@ -1052,26 +1053,252 @@ mlir::Type AlgorithmM::dictOf(mlir::Type keyType, mlir::Type valueType) const {
   return contract("builtins.dict", args);
 }
 
-mlir::Type AlgorithmM::iteratorOf(mlir::Type elementType) const {
+mlir::Type TypeSystem::iteratorOf(mlir::Type elementType) const {
   llvm::SmallVector<mlir::Type, 1> args;
   if (elementType)
     args.push_back(elementType);
   return protocol("Iterator", args);
 }
 
-mlir::Type AlgorithmM::coroutineOf(mlir::Type resultType) const {
+mlir::Type TypeSystem::coroutineOf(mlir::Type resultType) const {
   return contract("types.CoroutineType",
                   {any(), any(), resultType ? resultType : any()});
 }
 
-AlgorithmM::Scope AlgorithmM::pushScope() const {
+namespace {
+
+void collectNameReferences(const parser::Node *node, llvm::StringSet<> &out) {
+  if (!node)
+    return;
+  if (node->kind == "Name") {
+    if (auto id = ast::string(*node, "id"))
+      out.insert(*id);
+  }
+  for (const parser::Field &field : node->fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      collectNameReferences(child->get(), out);
+      continue;
+    }
+    if (const auto *children =
+            std::get_if<std::vector<parser::NodePtr>>(&field.value))
+      for (const parser::NodePtr &nested : *children)
+        collectNameReferences(nested.get(), out);
+  }
+}
+
+// Call sites in module-level statement position, used by the inference
+// fixpoint to constrain unannotated parameters. Function, lambda, and class
+// subtrees are excluded: their expressions type under scopes this walk does
+// not know, and a lenient mis-typing here would pollute the union-find store
+// with wrong parameter bindings.
+void collectModuleCallNodes(const parser::Node *node,
+                            std::vector<const parser::Node *> &out) {
+  if (!node)
+    return;
+  if (node->kind == "FunctionDef" || node->kind == "AsyncFunctionDef" ||
+      node->kind == "Lambda" || node->kind == "ClassDef")
+    return;
+  if (node->kind == "Call")
+    out.push_back(node);
+  for (const parser::Field &field : node->fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      collectModuleCallNodes(child->get(), out);
+      continue;
+    }
+    if (const auto *children =
+            std::get_if<std::vector<parser::NodePtr>>(&field.value))
+      for (const parser::NodePtr &nested : *children)
+        collectModuleCallNodes(nested.get(), out);
+  }
+}
+
+} // namespace
+
+void TypeSystem::registerModule(const parser::Node &moduleNode) {
+  const auto *body = ast::nodeList(moduleNode, "body");
+  if (!body)
+    return;
+
+  struct TopLevelFunction {
+    const parser::Node *node;
+    std::string name;
+    llvm::SmallVector<unsigned, 4> callees;
+  };
+  std::vector<TopLevelFunction> functions;
+  llvm::StringMap<unsigned> indexByName;
+  for (const parser::NodePtr &statement : *body) {
+    if (!statement || (statement->kind != "FunctionDef" &&
+                       statement->kind != "AsyncFunctionDef"))
+      continue;
+    auto name = ast::string(*statement, "name");
+    if (!name)
+      continue;
+    indexByName[*name] = static_cast<unsigned>(functions.size());
+    functions.push_back(
+        TopLevelFunction{statement.get(), std::string(*name), {}});
+  }
+  if (functions.empty())
+    return;
+
+  // Reference edges are name-based over the whole function subtree. Local
+  // shadowing can produce a false edge, but an edge only influences the
+  // processing order, never the inferred types, so precision is not worth a
+  // scope-aware walk here.
+  for (TopLevelFunction &function : functions) {
+    llvm::StringSet<> referenced;
+    collectNameReferences(function.node, referenced);
+    for (const auto &entry : referenced) {
+      auto found = indexByName.find(entry.getKey());
+      if (found != indexByName.end() &&
+          functions[found->second].node != function.node)
+        function.callees.push_back(found->second);
+    }
+  }
+
+  // Tarjan emits each SCC after all SCCs it points to, so processing SCCs in
+  // emission order binds callees before the callers whose unannotated
+  // returns need them. Members inside one SCC keep source order: annotated
+  // signatures are order-independent, and unannotated mutual recursion is
+  // diagnosed (monomorphic-recursion inference lands with the body walk).
+  struct TarjanState {
+    llvm::SmallVector<int> index, lowlink;
+    llvm::SmallVector<bool> onStack;
+    llvm::SmallVector<unsigned> stack;
+    llvm::SmallVector<llvm::SmallVector<unsigned, 2>> components;
+    int counter = 0;
+  } state;
+  state.index.assign(functions.size(), -1);
+  state.lowlink.assign(functions.size(), 0);
+  state.onStack.assign(functions.size(), false);
+
+  auto strongConnect = [&](auto &&self, unsigned v) -> void {
+    state.index[v] = state.lowlink[v] = state.counter++;
+    state.stack.push_back(v);
+    state.onStack[v] = true;
+    for (unsigned w : functions[v].callees) {
+      if (state.index[w] < 0) {
+        self(self, w);
+        state.lowlink[v] = std::min(state.lowlink[v], state.lowlink[w]);
+      } else if (state.onStack[w]) {
+        state.lowlink[v] = std::min(state.lowlink[v], state.index[w]);
+      }
+    }
+    if (state.lowlink[v] == state.index[v]) {
+      llvm::SmallVector<unsigned, 2> component;
+      unsigned w;
+      do {
+        w = state.stack.pop_back_val();
+        state.onStack[w] = false;
+        component.push_back(w);
+      } while (w != v);
+      llvm::sort(component);
+      state.components.push_back(std::move(component));
+    }
+  };
+  for (unsigned v = 0; v < functions.size(); ++v)
+    if (state.index[v] < 0)
+      strongConnect(strongConnect, v);
+
+  llvm::SmallVector<unsigned, 8> ordered;
+  for (const llvm::SmallVector<unsigned, 2> &component : state.components)
+    ordered.append(component.begin(), component.end());
+
+  auto sweep = [&](bool memoize) {
+    for (unsigned index : ordered) {
+      const TopLevelFunction &function = functions[index];
+      FunctionSignature sig = functionSignature(*function.node);
+      if (memoize)
+        signatureMemo[function.node] = sig;
+      bindSymbol(function.name, sig.publicCallable);
+    }
+  };
+
+  // Assign inference variables to every unannotated parameter, plus a result
+  // variable so callers typed during the fixpoint below can consume a
+  // function's result before its own body walk succeeds.
+  bool anyInference = false;
+  for (unsigned index : ordered) {
+    const TopLevelFunction &function = functions[index];
+    const parser::Node *arguments = ast::node(*function.node, "args");
+    if (!arguments)
+      continue;
+    bool assigned = false;
+    auto assignParameters = [&](const std::vector<parser::NodePtr> *args) {
+      if (!args)
+        return;
+      for (const parser::NodePtr &arg : *args) {
+        if (!arg || ast::node(*arg, "annotation"))
+          continue;
+        std::string role = ("parameter '" + llvm::Twine(ast::nameSpelling(*arg)) +
+                            "' of '" + function.name + "'")
+                               .str();
+        parameterTypeOverrides[arg.get()] = inferenceState.freshVar(
+            InferenceContext::VarKind::Inference, arg.get(), role);
+        assigned = true;
+      }
+    };
+    assignParameters(ast::nodeList(*arguments, "posonlyargs"));
+    assignParameters(ast::nodeList(*arguments, "args"));
+    assignParameters(ast::nodeList(*arguments, "kwonlyargs"));
+    if (!assigned)
+      continue;
+    anyInference = true;
+    if (!ast::node(*function.node, "returns") && function.name != "__init__")
+      resultTypeOverrides[function.node] = inferenceState.freshVar(
+          InferenceContext::VarKind::Inference, function.node,
+          "return type of '" + function.name + "'");
+  }
+
+  if (!anyInference) {
+    sweep(/*memoize=*/true);
+    return;
+  }
+
+  std::vector<const parser::Node *> moduleCalls;
+  if (const auto *statements = ast::nodeList(moduleNode, "body"))
+    for (const parser::NodePtr &statement : *statements)
+      collectModuleCallNodes(statement.get(), moduleCalls);
+
+  // Module-wide fixpoint: signature sweeps propagate constraints through
+  // function bodies (returns), module-level call sites constrain parameters
+  // through the P2 unify bridge in bindExpectedType. Progress is compared on
+  // the resolved override types, not the store's generation counter, because
+  // speculative candidate exploration bumps the counter even when nothing
+  // committed. The iteration cap is a divergence backstop; resolution is
+  // monotonic, so a genuine fixpoint is reached in a handful of rounds.
+  auto resolvedOverrides = [&]() {
+    std::vector<mlir::Type> snapshot;
+    snapshot.reserve(parameterTypeOverrides.size() +
+                     resultTypeOverrides.size());
+    for (const auto &entry : parameterTypeOverrides)
+      snapshot.push_back(inferenceState.zonk(entry.second));
+    for (const auto &entry : resultTypeOverrides)
+      snapshot.push_back(inferenceState.zonk(entry.second));
+    return snapshot;
+  };
+  static const llvm::StringMap<mlir::Type> kNoLocalCallables;
+  for (unsigned iteration = 0; iteration < 8; ++iteration) {
+    std::vector<mlir::Type> before = resolvedOverrides();
+    sweep(/*memoize=*/false);
+    ExprInferenceContext moduleCallContext{kNoLocalCallables, nullptr, nullptr,
+                                           /*strict=*/true};
+    for (const parser::Node *call : moduleCalls)
+      (void)inferExpr(call, moduleCallContext);
+    if (resolvedOverrides() == before)
+      break;
+  }
+
+  sweep(/*memoize=*/true);
+}
+
+TypeSystem::Scope TypeSystem::pushScope() const {
   scopes.emplace_back();
   scopedCanonicalBindings.emplace_back();
   scopedClasses.emplace_back();
   return Scope(*this);
 }
 
-void AlgorithmM::popScope() const {
+void TypeSystem::popScope() const {
   if (!scopes.empty()) {
     scopes.pop_back();
     scopedCanonicalBindings.pop_back();
@@ -1080,19 +1307,19 @@ void AlgorithmM::popScope() const {
 }
 
 // The `type ? type : object()` guards below defend an internal solver
-// invariant: every symbol binding produced by AlgorithmM carries a resolved
+// invariant: every symbol binding produced by TypeSystem carries a resolved
 // type. A null type would be a solver gap, not a language feature. The `object`
 // top used as the guard value carries no protocol contract, so if such a gap
 // ever reached lowering the erased binding would be rejected for lack of
 // evidence rather than dispatched dynamically. The guard is never exercised by
 // the accepted example suite (verified via null-binding instrumentation).
-void AlgorithmM::bindLocalSymbol(llvm::StringRef name, mlir::Type type) const {
+void TypeSystem::bindLocalSymbol(llvm::StringRef name, mlir::Type type) const {
   if (scopes.empty())
     return;
   scopes.back()[name] = type ? type : object();
 }
 
-void AlgorithmM::bindSymbol(llvm::StringRef name, mlir::Type type) {
+void TypeSystem::bindSymbol(llvm::StringRef name, mlir::Type type) {
   if (!scopes.empty()) {
     scopes.back()[name] = type ? type : object();
     scopedCanonicalBindings.back().erase(name);
@@ -1102,7 +1329,7 @@ void AlgorithmM::bindSymbol(llvm::StringRef name, mlir::Type type) {
   canonicalBindings.erase(name);
 }
 
-void AlgorithmM::bindCanonicalSymbol(llvm::StringRef name,
+void TypeSystem::bindCanonicalSymbol(llvm::StringRef name,
                                      llvm::StringRef canonical,
                                      mlir::Type type) {
   bindSymbol(name, type);
@@ -1112,19 +1339,19 @@ void AlgorithmM::bindCanonicalSymbol(llvm::StringRef name,
     canonicalBindings[name] = canonical.str();
 }
 
-void AlgorithmM::bindAnnotationAlias(llvm::StringRef name,
+void TypeSystem::bindAnnotationAlias(llvm::StringRef name,
                                      llvm::StringRef target) {
   annotationAliases[name] = target.str();
 }
 
-std::string AlgorithmM::resolveAnnotationName(llvm::StringRef name) const {
+std::string TypeSystem::resolveAnnotationName(llvm::StringRef name) const {
   auto found = annotationAliases.find(name);
   if (found != annotationAliases.end())
     return found->second;
   return name.str();
 }
 
-std::optional<mlir::Type> AlgorithmM::lookupSymbol(llvm::StringRef name) const {
+std::optional<mlir::Type> TypeSystem::lookupSymbol(llvm::StringRef name) const {
   for (auto it = scopes.rbegin(), e = scopes.rend(); it != e; ++it) {
     auto found = it->find(name);
     if (found != it->end())
@@ -1137,7 +1364,7 @@ std::optional<mlir::Type> AlgorithmM::lookupSymbol(llvm::StringRef name) const {
 }
 
 std::optional<std::string>
-AlgorithmM::lookupCanonicalBinding(llvm::StringRef name) const {
+TypeSystem::lookupCanonicalBinding(llvm::StringRef name) const {
   llvm::StringRef root = name.split('.').first;
   auto canonicalIt = scopedCanonicalBindings.rbegin();
   for (auto scopeIt = scopes.rbegin(), scopeEnd = scopes.rend();
@@ -1155,7 +1382,7 @@ AlgorithmM::lookupCanonicalBinding(llvm::StringRef name) const {
   return found->second;
 }
 
-void AlgorithmM::bindClass(llvm::StringRef name, mlir::Type instanceType) {
+void TypeSystem::bindClass(llvm::StringRef name, mlir::Type instanceType) {
   mlir::Type resolved = instanceType ? instanceType : contract(name);
   if (!scopes.empty()) {
     scopedClasses.back()[name] = resolved;
@@ -1168,7 +1395,7 @@ void AlgorithmM::bindClass(llvm::StringRef name, mlir::Type instanceType) {
   canonicalBindings.erase(name);
 }
 
-std::optional<mlir::Type> AlgorithmM::lookupClass(llvm::StringRef name) const {
+std::optional<mlir::Type> TypeSystem::lookupClass(llvm::StringRef name) const {
   for (auto it = scopedClasses.rbegin(), e = scopedClasses.rend(); it != e;
        ++it) {
     auto found = it->find(name);
@@ -1181,7 +1408,7 @@ std::optional<mlir::Type> AlgorithmM::lookupClass(llvm::StringRef name) const {
   return found->second;
 }
 
-bool AlgorithmM::bindImportedModule(llvm::StringRef module,
+bool TypeSystem::bindImportedModule(llvm::StringRef module,
                                     llvm::StringRef localName) {
   std::string localStorage;
   if (localName.empty()) {
@@ -1283,7 +1510,7 @@ bool AlgorithmM::bindImportedModule(llvm::StringRef module,
   return handled;
 }
 
-bool AlgorithmM::bindImportedName(llvm::StringRef module,
+bool TypeSystem::bindImportedName(llvm::StringRef module,
                                   llvm::StringRef exportedName,
                                   llvm::StringRef localName) {
   if (localName.empty())
@@ -1396,7 +1623,7 @@ bool AlgorithmM::bindImportedName(llvm::StringRef module,
   return false;
 }
 
-mlir::Type AlgorithmM::annotationType(const parser::Node *node) const {
+mlir::Type TypeSystem::annotationType(const parser::Node *node) const {
   if (!node)
     return object();
   if (node->kind == "Name") {
@@ -1583,20 +1810,20 @@ mlir::Type AlgorithmM::annotationType(const parser::Node *node) const {
   return object();
 }
 
-mlir::Type AlgorithmM::inferExpr(const parser::Node *node) const {
-  return inferExprImpl(node, nullptr);
+mlir::Type TypeSystem::inferExpr(const parser::Node *node) const {
+  return inferenceState.zonk(inferExprImpl(node, nullptr));
 }
 
-mlir::Type AlgorithmM::inferExpr(const parser::Node *node,
+mlir::Type TypeSystem::inferExpr(const parser::Node *node,
                                  const ExprInferenceContext &ctx) const {
-  return inferExprImpl(node, &ctx);
+  return inferenceState.zonk(inferExprImpl(node, &ctx));
 }
 
 // Lenient and strict inference share one walk. Without a context every
 // unresolved construct falls back to object(); with one (unannotated-body
 // return/generator inference) local callables shadow the symbol table and
 // failures propagate as a null type with a recorded reason.
-mlir::Type AlgorithmM::inferExprImpl(const parser::Node *node,
+mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
                                      const ExprInferenceContext *ctx) const {
   if (!node)
     return object();
@@ -2075,7 +2302,7 @@ mlir::Type AlgorithmM::inferExprImpl(const parser::Node *node,
 }
 
 mlir::Type
-AlgorithmM::inferCall(mlir::Type calleeType,
+TypeSystem::inferCall(mlir::Type calleeType,
                       mlir::ArrayRef<mlir::Type> positional,
                       mlir::ArrayRef<CallKeywordType> keywords) const {
   CallInferenceResult inference =
@@ -2083,7 +2310,7 @@ AlgorithmM::inferCall(mlir::Type calleeType,
   return inference ? inference.resultType : object();
 }
 
-mlir::Type AlgorithmM::inferClassInstantiation(
+mlir::Type TypeSystem::inferClassInstantiation(
     mlir::Type instanceType, mlir::ArrayRef<mlir::Type> positional,
     mlir::ArrayRef<CallKeywordType> keywords) const {
   // Type parameters the constructor leaves unbound fall back to their
@@ -2126,7 +2353,7 @@ mlir::Type AlgorithmM::inferClassInstantiation(
   return complete(instanceType);
 }
 
-CallInferenceResult AlgorithmM::inferMethodCallWithEvidence(
+CallInferenceResult TypeSystem::inferMethodCallWithEvidence(
     mlir::Type receiverType, llvm::StringRef methodName,
     mlir::ArrayRef<mlir::Type> positional,
     mlir::ArrayRef<CallKeywordType> keywords) const {
@@ -2142,7 +2369,7 @@ CallInferenceResult AlgorithmM::inferMethodCallWithEvidence(
   return unresolvedMethodCall(*this, receiverType, methodName);
 }
 
-bool AlgorithmM::isStructuralMutatorMethod(mlir::Type receiverType,
+bool TypeSystem::isStructuralMutatorMethod(mlir::Type receiverType,
                                            llvm::StringRef methodName) const {
   if (!receiverType)
     return false;
@@ -2151,7 +2378,7 @@ bool AlgorithmM::isStructuralMutatorMethod(mlir::Type receiverType,
 }
 
 std::optional<std::vector<std::string>>
-AlgorithmM::classMatchArgs(mlir::Type receiverType) const {
+TypeSystem::classMatchArgs(mlir::Type receiverType) const {
   if (!receiverType)
     return std::nullopt;
   const py::protocols::Table &table = py::protocols::Table::get(context);
@@ -2159,7 +2386,7 @@ AlgorithmM::classMatchArgs(mlir::Type receiverType) const {
 }
 
 AwaitInferenceResult
-AlgorithmM::inferAwaitWithEvidence(mlir::Type awaitableType) const {
+TypeSystem::inferAwaitWithEvidence(mlir::Type awaitableType) const {
   mlir::Type awaitable = widenLiteral(awaitableType);
   const py::protocols::Table &table = py::protocols::Table::get(context);
   std::optional<py::protocols::AwaitableResolution> resolution =
@@ -2180,7 +2407,7 @@ AlgorithmM::inferAwaitWithEvidence(mlir::Type awaitableType) const {
 }
 
 YieldFromInferenceResult
-AlgorithmM::inferYieldFromWithEvidence(mlir::Type sourceType) const {
+TypeSystem::inferYieldFromWithEvidence(mlir::Type sourceType) const {
   mlir::Type source = widenLiteral(sourceType);
   const py::protocols::Table &table = py::protocols::Table::get(context);
 
@@ -2215,7 +2442,7 @@ AlgorithmM::inferYieldFromWithEvidence(mlir::Type sourceType) const {
 }
 
 AsyncIterationInferenceResult
-AlgorithmM::inferAsyncIterationWithEvidence(mlir::Type iterableType) const {
+TypeSystem::inferAsyncIterationWithEvidence(mlir::Type iterableType) const {
   mlir::Type iterable = widenLiteral(iterableType);
   AsyncIterationInferenceResult result;
   result.aiter = inferMethodCallWithEvidence(iterable, "__aiter__", {});
@@ -2256,7 +2483,7 @@ AlgorithmM::inferAsyncIterationWithEvidence(mlir::Type iterableType) const {
 }
 
 static AsyncContextMethodInferenceResult
-inferAsyncContextMethod(const AlgorithmM &types, mlir::Type managerType,
+inferAsyncContextMethod(const TypeSystem &types, mlir::Type managerType,
                         llvm::StringRef methodName,
                         mlir::ArrayRef<mlir::Type> positional) {
   AsyncContextMethodInferenceResult result;
@@ -2282,17 +2509,17 @@ inferAsyncContextMethod(const AlgorithmM &types, mlir::Type managerType,
 }
 
 AsyncContextMethodInferenceResult
-AlgorithmM::inferAsyncContextEnterWithEvidence(mlir::Type managerType) const {
+TypeSystem::inferAsyncContextEnterWithEvidence(mlir::Type managerType) const {
   return inferAsyncContextMethod(*this, managerType, "__aenter__", {});
 }
 
-AsyncContextMethodInferenceResult AlgorithmM::inferAsyncContextExitWithEvidence(
+AsyncContextMethodInferenceResult TypeSystem::inferAsyncContextExitWithEvidence(
     mlir::Type managerType, mlir::ArrayRef<mlir::Type> exceptionTypes) const {
   return inferAsyncContextMethod(*this, managerType, "__aexit__",
                                  exceptionTypes);
 }
 
-CallInferenceResult AlgorithmM::inferCallWithEvidence(
+CallInferenceResult TypeSystem::inferCallWithEvidence(
     mlir::Type calleeType, mlir::ArrayRef<mlir::Type> positional,
     mlir::ArrayRef<CallKeywordType> keywords) const {
   if (!calleeType)
@@ -2368,7 +2595,7 @@ CallInferenceResult AlgorithmM::inferCallWithEvidence(
 }
 
 std::optional<mlir::Type>
-AlgorithmM::fieldAssignmentRefinement(mlir::Type receiverType,
+TypeSystem::fieldAssignmentRefinement(mlir::Type receiverType,
                                       llvm::StringRef fieldName,
                                       mlir::Type valueType) const {
   const py::protocols::Table &table = py::protocols::Table::get(context);
@@ -2376,7 +2603,7 @@ AlgorithmM::fieldAssignmentRefinement(mlir::Type receiverType,
                                                fieldName, valueType);
 }
 
-mlir::Type AlgorithmM::join(mlir::ArrayRef<mlir::Type> types) const {
+mlir::Type TypeSystem::join(mlir::ArrayRef<mlir::Type> types) const {
   llvm::SmallVector<mlir::Type, 4> present;
   llvm::SmallVector<mlir::Type, 8> worklist(types.begin(), types.end());
   while (!worklist.empty()) {
@@ -2405,7 +2632,7 @@ mlir::Type AlgorithmM::join(mlir::ArrayRef<mlir::Type> types) const {
   return py::UnionType::getNormalized(&context, present);
 }
 
-mlir::Type AlgorithmM::widenLiteral(mlir::Type type) const {
+mlir::Type TypeSystem::widenLiteral(mlir::Type type) const {
   auto literalType = mlir::dyn_cast_or_null<py::LiteralType>(type);
   if (!literalType)
     return type ? type : object();
@@ -2420,9 +2647,14 @@ mlir::Type AlgorithmM::widenLiteral(mlir::Type type) const {
 }
 
 FunctionSignature
-AlgorithmM::functionSignature(const parser::Node &function,
+TypeSystem::functionSignature(const parser::Node &function,
                               std::optional<llvm::StringRef> selfName,
                               py::CallableType expectedCallable) const {
+  if (!selfName && !expectedCallable) {
+    auto memoized = signatureMemo.find(&function);
+    if (memoized != signatureMemo.end())
+      return memoized->second;
+  }
   FunctionSignature sig;
   sig.isAsyncFunction = function.kind == "AsyncFunctionDef";
   auto typeParamScope = pushScope();
@@ -2444,6 +2676,17 @@ AlgorithmM::functionSignature(const parser::Node &function,
   }
   const parser::Node *arguments = ast::node(function, "args");
   if (arguments) {
+    // An unannotated parameter with a registered inference variable takes
+    // its (partially) resolved type instead of a missing-annotation record;
+    // if the module fixpoint left it unresolved, the record comes back so
+    // the emit boundary still refuses the function explicitly.
+    auto overriddenParameterType =
+        [&](const parser::Node &arg) -> std::optional<mlir::Type> {
+      auto found = parameterTypeOverrides.find(&arg);
+      if (found == parameterTypeOverrides.end())
+        return std::nullopt;
+      return inferenceState.zonk(found->second);
+    };
     auto recordAnnotationIssue = [&](const parser::Node *annotation,
                                      llvm::StringRef parameterName) {
       if (!annotation) {
@@ -2485,12 +2728,21 @@ AlgorithmM::functionSignature(const parser::Node &function,
       bool isSelfParameter = selfName && index == 0 && name == *selfName;
       bool fromExpectedCallable =
           function.kind == "Lambda" && index < expectedPositional.size();
+      std::optional<mlir::Type> overridden =
+          !annotation && !isSelfParameter && !fromExpectedCallable
+              ? overriddenParameterType(*arg)
+              : std::nullopt;
       if (isSelfParameter)
         type = py::SelfType::get(&context);
       if (fromExpectedCallable)
         type = expectedPositional[index];
-      if (!isSelfParameter && !fromExpectedCallable)
+      if (overridden) {
+        type = *overridden;
+        if (py::containsPyInferVar(type))
+          sig.missingParameterAnnotations.push_back(name);
+      } else if (!isSelfParameter && !fromExpectedCallable) {
         recordAnnotationIssue(annotation, name);
+      }
       sig.positionalNames.push_back(std::move(name));
       sig.positionalTypes.push_back(type);
       sig.positionalDefaults.push_back(
@@ -2506,10 +2758,18 @@ AlgorithmM::functionSignature(const parser::Node &function,
         mlir::Type type = annotationType(annotation);
         bool fromExpectedCallable =
             function.kind == "Lambda" && index < expectedKwOnly.size();
+        std::optional<mlir::Type> overridden =
+            !annotation && !fromExpectedCallable ? overriddenParameterType(*arg)
+                                                 : std::nullopt;
         if (fromExpectedCallable)
           type = expectedKwOnly[index];
-        if (!fromExpectedCallable)
+        if (overridden) {
+          type = *overridden;
+          if (py::containsPyInferVar(type))
+            sig.missingParameterAnnotations.push_back(name);
+        } else if (!fromExpectedCallable) {
           recordAnnotationIssue(annotation, name);
+        }
         sig.kwOnlyTypes.push_back(type);
         bool hasKwDefault = false;
         if (const auto *kwDefaults = ast::nodeList(*arguments, "kw_defaults"))
@@ -2585,18 +2845,51 @@ AlgorithmM::functionSignature(const parser::Node &function,
     sig.resultType = inferExpr(ast::node(function, "body"));
   } else if (returns) {
     sig.resultType = annotationType(returns);
+  } else if (ast::nameSpelling(function) == "__init__") {
+    sig.resultType = none();
   } else {
-    sig.resultType = ast::nameSpelling(function) == "__init__"
-                         ? none()
-                         : inferredFunctionResult(*this, function,
-                                                  &sig.bodyInferenceFailures,
-                                                  &generator.localSymbols);
+    mlir::Type walked = inferredFunctionResult(*this, function,
+                                               &sig.bodyInferenceFailures,
+                                               &generator.localSymbols);
+    auto overridden = resultTypeOverrides.find(&function);
+    if (overridden == resultTypeOverrides.end()) {
+      sig.resultType = walked;
+    } else {
+      // The result variable exists so callers typed during the module
+      // fixpoint can consume this function's result before its body walk
+      // succeeds. Only a fully resolved walk binds it: partially resolved
+      // results would freeze a stale type into the union-find store. The
+      // walk result is literal-widened (member-wise through unions) before
+      // binding — successive fixpoint rounds join a recursive function's
+      // literal base case with its widened recursive case, and an equational
+      // variable cannot hold both spellings of the same contract.
+      if (walked) {
+        mlir::Type resolved = inferenceState.zonk(walked);
+        if (!py::containsPyInferVar(resolved)) {
+          mlir::Type widened;
+          if (auto unionType =
+                  mlir::dyn_cast_if_present<py::UnionType>(resolved)) {
+            llvm::SmallVector<mlir::Type, 4> members;
+            for (mlir::Type member : unionType.getMemberTypes())
+              members.push_back(widenLiteral(member));
+            widened = join(members);
+          } else {
+            widened = widenLiteral(resolved);
+          }
+          if (InferenceContext::UnifyResult bound =
+                  inferenceState.unify(overridden->second, widened);
+              !bound)
+            sig.bodyInferenceFailures.push_back(bound.reason);
+        }
+      }
+      sig.resultType = inferenceState.zonk(overridden->second);
+    }
   }
   refreshCallable(sig);
   return sig;
 }
 
-void AlgorithmM::refreshCallable(FunctionSignature &sig) const {
+void TypeSystem::refreshCallable(FunctionSignature &sig) const {
   llvm::SmallVector<mlir::StringAttr, 8> posNames;
   llvm::SmallVector<mlir::StringAttr, 4> kwNames;
   llvm::SmallVector<mlir::BoolAttr, 8> posDefaults;

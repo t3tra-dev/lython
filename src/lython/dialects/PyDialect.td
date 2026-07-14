@@ -193,7 +193,7 @@ def Py_YieldValueOp : Py_Op<"yield_value"> {
   let summary = "Suspend a source generator and publish one yielded value";
   let description = [{
     Represents the Python `yield value` expression inside a generator body
-    after AlgorithmM has classified the enclosing callable as
+    after TypeSystem has classified the enclosing callable as
     `Generator[Y, S, R]`. The operand is the yielded `Y` value. The result is
     the value received when the generator is resumed through `send`, whose
     contract is `S`.
@@ -212,7 +212,7 @@ def Py_YieldValueOp : Py_Op<"yield_value"> {
 def Py_YieldFromOp : Py_Op<"yield_from"> {
   let summary = "Delegate a source generator yield stream to a proven iterable";
   let description = [{
-    Represents the Python `yield from value` expression after AlgorithmM has
+    Represents the Python `yield from value` expression after TypeSystem has
     proven the yielded element type from a Generator, Iterator, or Iterable
     contract. The selected protocol evidence is carried as
     `yield_from_contract`; the operand is the delegated source. The result is

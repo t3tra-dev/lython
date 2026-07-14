@@ -34,10 +34,10 @@ mlir::ArrayAttr boolArray(mlir::Builder &builder, llvm::ArrayRef<char> values);
 
 mlir::Type replaceSelfType(mlir::Type type, mlir::Type selfType);
 void replaceSelfInSignature(FunctionSignature &sig, mlir::Type selfType,
-                            AlgorithmM &types);
+                            TypeSystem &types);
 bool anyTrue(llvm::ArrayRef<char> values);
 std::string methodKind(const parser::Node &function);
-bool appendStarredArgumentTypes(mlir::Type type, AlgorithmM &types,
+bool appendStarredArgumentTypes(mlir::Type type, TypeSystem &types,
                                 llvm::SmallVectorImpl<mlir::Type> &out);
 bool isTopLevelDecl(const parser::Node &node);
 std::string importBindingName(std::string_view module,
@@ -66,9 +66,9 @@ void collectAssignedNames(const std::vector<parser::NodePtr> *statements,
                           llvm::StringSet<> &names);
 bool derivesViaStructuralMutation(mlir::Value current, mlir::Value previous);
 
-bool containsObjectTop(mlir::Type type, const AlgorithmM &types);
+bool containsObjectTop(mlir::Type type, const TypeSystem &types);
 bool isNoneTypeLike(mlir::Type type);
-mlir::Type removeNoneFromType(mlir::Type type, AlgorithmM &types);
+mlir::Type removeNoneFromType(mlir::Type type, TypeSystem &types);
 
 struct NoneComparisonNarrowing {
   std::string name;
@@ -106,22 +106,22 @@ struct IsInstanceAnalysis {
 const parser::Node *nameComparedWithNone(const parser::Node *left,
                                          const parser::Node *right);
 std::optional<NoneComparisonNarrowing>
-optionalNoneComparison(const parser::Node &test, AlgorithmM &types);
+optionalNoneComparison(const parser::Node &test, TypeSystem &types);
 std::optional<BranchTypeNarrowing>
-optionalBranchTypeNarrowing(const parser::Node &test, AlgorithmM &types,
+optionalBranchTypeNarrowing(const parser::Node &test, TypeSystem &types,
                             mlir::Operation *from);
 std::optional<bool> optionalStaticBranchTruth(const parser::Node &test,
-                                              AlgorithmM &types,
+                                              TypeSystem &types,
                                               mlir::Operation *from);
 std::optional<mlir::Type> isinstanceTargetType(const parser::Node *node,
-                                               AlgorithmM &types);
+                                               TypeSystem &types);
 bool isAssignableWithStaticEvidence(mlir::Type actual, mlir::Type expected,
                                     mlir::Operation *from);
 IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
-                                     mlir::Type targetType, AlgorithmM &types,
+                                     mlir::Type targetType, TypeSystem &types,
                                      mlir::Operation *from);
-mlir::Type widenInferredLiterals(mlir::Type type, const AlgorithmM &types);
+mlir::Type widenInferredLiterals(mlir::Type type, const TypeSystem &types);
 bool hasUnexpectedObjectTop(mlir::Type actual, mlir::Type expected,
-                            const AlgorithmM &types);
+                            const TypeSystem &types);
 
 } // namespace lython::emitter

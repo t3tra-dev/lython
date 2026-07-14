@@ -98,7 +98,7 @@ struct CallOperands {
 
 class ScopedEmitterScope {
 public:
-  ScopedEmitterScope(llvm::StringMap<Value> &values, const AlgorithmM &types)
+  ScopedEmitterScope(llvm::StringMap<Value> &values, const TypeSystem &types)
       : values(values), savedValues(values), typeScope(types.pushScope()) {}
 
   ScopedEmitterScope(const ScopedEmitterScope &) = delete;
@@ -109,7 +109,7 @@ public:
 private:
   llvm::StringMap<Value> &values;
   llvm::StringMap<Value> savedValues;
-  AlgorithmM::Scope typeScope;
+  TypeSystem::Scope typeScope;
 };
 
 class ScopedCallableEmission {
@@ -118,7 +118,7 @@ public:
                          mlir::Type &currentReturnType,
                          std::string &currentFunctionPrefix,
                          mlir::Type &currentGeneratorSendType,
-                         const AlgorithmM &types)
+                         const TypeSystem &types)
       : values(values), savedValues(values),
         currentReturnType(currentReturnType),
         savedReturnType(currentReturnType),
@@ -147,7 +147,7 @@ private:
   std::string savedFunctionPrefix;
   mlir::Type &currentGeneratorSendType;
   mlir::Type savedGeneratorSendType;
-  AlgorithmM::Scope typeScope;
+  TypeSystem::Scope typeScope;
 };
 
 } // namespace lython::emitter

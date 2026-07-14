@@ -50,7 +50,8 @@ enum class TypeKind : unsigned {
   TypeVar,
   ParamSpec,
   TypeVarTuple,
-  Unpack
+  Unpack,
+  InferVar
 };
 
 namespace detail {
@@ -94,6 +95,19 @@ struct ClassTypeStorage : public mlir::TypeStorage {
                                      const KeyTy &key);
 
   ::llvm::StringRef className;
+};
+
+struct IdTypeStorage : public mlir::TypeStorage {
+  using KeyTy = unsigned;
+
+  explicit IdTypeStorage(unsigned id) : id(id) {}
+
+  bool operator==(const KeyTy &key) const { return key == id; }
+
+  static IdTypeStorage *construct(mlir::TypeStorageAllocator &allocator,
+                                  const KeyTy &key);
+
+  unsigned id;
 };
 
 struct CallableTypeStorage : public mlir::TypeStorage {
@@ -300,6 +314,27 @@ public:
   ::llvm::StringRef getName() const;
 };
 
+// Unification variable owned by the emitter's type-inference engine. Not a
+// user-denotable type: a TypeVarType would conflate "implicitly universally
+// quantified manifest parameter" (instantiated fresh per call) with "engine
+// variable bound once by unification", so this is a distinct kind. It is
+// deliberately excluded from isPyContractType/isPyType — a variable leaking
+// past the inference boundary must fail op verification at the first
+// materialization point rather than flow on silently.
+class InferVarType : public mlir::Type::TypeBase<InferVarType, mlir::Type,
+                                                 detail::IdTypeStorage> {
+public:
+  using Base::Base;
+  static constexpr ::llvm::StringLiteral name{"py.infervar"};
+
+  static InferVarType get(mlir::MLIRContext *ctx, unsigned id);
+  static bool kindof(unsigned kind) {
+    return kind == static_cast<unsigned>(TypeKind::InferVar);
+  }
+
+  unsigned getId() const;
+};
+
 class UnpackType : public mlir::Type::TypeBase<UnpackType, mlir::Type,
                                                detail::UnaryTypeStorage> {
 public:
@@ -475,6 +510,11 @@ bool isPyTypeVarType(mlir::Type type);
 bool isPyParamSpecType(mlir::Type type);
 bool isPyTypeVarTupleType(mlir::Type type);
 bool isPyUnpackType(mlir::Type type);
+bool isPyInferVarType(mlir::Type type);
+// True when an inference variable occurs anywhere in the type tree,
+// including nested container arguments. The escape check for the inference
+// boundary (facade zonk, evidence verifier).
+bool containsPyInferVar(mlir::Type type);
 bool isPyExceptionType(mlir::Type type);
 bool isPyExceptionCellType(mlir::Type type);
 bool isPyTracebackType(mlir::Type type);

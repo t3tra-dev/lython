@@ -90,7 +90,7 @@ mlir::Type replaceSelfType(mlir::Type type, mlir::Type selfType) {
 }
 
 void replaceSelfInSignature(FunctionSignature &sig, mlir::Type selfType,
-                            AlgorithmM &types) {
+                            TypeSystem &types) {
   for (mlir::Type &type : sig.positionalTypes)
     type = replaceSelfType(type, selfType);
   for (mlir::Type &type : sig.kwOnlyTypes)
@@ -119,7 +119,7 @@ std::string methodKind(const parser::Node &function) {
   return "instance";
 }
 
-bool appendStarredArgumentTypes(mlir::Type type, AlgorithmM &types,
+bool appendStarredArgumentTypes(mlir::Type type, TypeSystem &types,
                                 llvm::SmallVectorImpl<mlir::Type> &out) {
   type = types.widenLiteral(type);
   if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(type)) {
@@ -319,7 +319,7 @@ bool containsBreakOrContinueStatement(
   return false;
 }
 
-bool containsObjectTop(mlir::Type type, const AlgorithmM &types) {
+bool containsObjectTop(mlir::Type type, const TypeSystem &types) {
   if (!type)
     return true;
   if (type == types.object())
@@ -374,7 +374,7 @@ bool isNoneTypeLike(mlir::Type type) {
   return false;
 }
 
-mlir::Type removeNoneFromType(mlir::Type type, AlgorithmM &types) {
+mlir::Type removeNoneFromType(mlir::Type type, TypeSystem &types) {
   if (!type || isNoneTypeLike(type))
     return {};
   auto unionType = mlir::dyn_cast_if_present<py::UnionType>(type);
@@ -395,7 +395,7 @@ mlir::Type removeNoneFromType(mlir::Type type, AlgorithmM &types) {
 }
 
 std::optional<mlir::Type> isinstanceTargetType(const parser::Node *node,
-                                               AlgorithmM &types) {
+                                               TypeSystem &types) {
   if (!node)
     return std::nullopt;
   mlir::Type inferred = types.inferExpr(node);
@@ -409,7 +409,7 @@ std::optional<mlir::Type> isinstanceTargetType(const parser::Node *node,
 }
 
 IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
-                                     mlir::Type targetType, AlgorithmM &types,
+                                     mlir::Type targetType, TypeSystem &types,
                                      mlir::Operation *from) {
   IsInstanceAnalysis analysis;
   analysis.sourceType = types.widenLiteral(sourceType);
@@ -514,7 +514,7 @@ struct IsInstanceBranchAnalysis {
 };
 
 static std::optional<IsInstanceBranchAnalysis>
-optionalIsInstanceBranchAnalysis(const parser::Node &test, AlgorithmM &types,
+optionalIsInstanceBranchAnalysis(const parser::Node &test, TypeSystem &types,
                                  mlir::Operation *from) {
   if (test.kind != "Call")
     return std::nullopt;
@@ -555,7 +555,7 @@ const parser::Node *nameComparedWithNone(const parser::Node *left,
 }
 
 std::optional<NoneComparisonNarrowing>
-optionalNoneComparison(const parser::Node &test, AlgorithmM &types) {
+optionalNoneComparison(const parser::Node &test, TypeSystem &types) {
   if (test.kind != "Compare")
     return std::nullopt;
   const auto *comparators = ast::nodeList(test, "comparators");
@@ -587,7 +587,7 @@ optionalNoneComparison(const parser::Node &test, AlgorithmM &types) {
 }
 
 std::optional<BranchTypeNarrowing>
-optionalBranchTypeNarrowing(const parser::Node &test, AlgorithmM &types,
+optionalBranchTypeNarrowing(const parser::Node &test, TypeSystem &types,
                             mlir::Operation *from) {
   if (test.kind == "UnaryOp") {
     const parser::Node *op = ast::node(test, "op");
@@ -638,7 +638,7 @@ optionalBranchTypeNarrowing(const parser::Node &test, AlgorithmM &types,
 }
 
 std::optional<bool> optionalStaticBranchTruth(const parser::Node &test,
-                                              AlgorithmM &types,
+                                              TypeSystem &types,
                                               mlir::Operation *from) {
   if (test.kind == "Constant") {
     if (std::optional<bool> value = ast::boolean(test, "value"))
@@ -706,7 +706,7 @@ std::optional<bool> optionalStaticBranchTruth(const parser::Node &test,
   return std::nullopt;
 }
 
-mlir::Type widenInferredLiterals(mlir::Type type, const AlgorithmM &types) {
+mlir::Type widenInferredLiterals(mlir::Type type, const TypeSystem &types) {
   return py::mapPyTypeStructure(
       type, [&](mlir::Type node) -> std::optional<mlir::Type> {
         mlir::Type widened = types.widenLiteral(node);
@@ -717,7 +717,7 @@ mlir::Type widenInferredLiterals(mlir::Type type, const AlgorithmM &types) {
 }
 
 bool hasUnexpectedObjectTop(mlir::Type actual, mlir::Type expected,
-                            const AlgorithmM &types) {
+                            const TypeSystem &types) {
   if (!actual)
     return true;
   if (actual == types.object()) {

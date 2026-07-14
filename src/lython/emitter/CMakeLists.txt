@@ -17,6 +17,7 @@ add_library(LythonEmitter STATIC
     lib/PrimitiveTypes.cpp
     lib/Emitter.cpp
     lib/TypeConstraintSolver.cpp
+    lib/TypeInference.cpp
     lib/TypeSystem.cpp
 )
 

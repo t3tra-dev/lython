@@ -49,6 +49,11 @@ bool containsDisallowedEvidenceType(mlir::Type type) {
   if (!type)
     return false;
 
+  // Unification variables are inference-engine internal; one reaching
+  // evidence means the TypeSystem facade's zonk boundary was bypassed.
+  if (mlir::isa<InferVarType>(type))
+    return true;
+
   if (auto callable = mlir::dyn_cast<CallableType>(type)) {
     for (mlir::Type nested : callable.getPositionalTypes())
       if (containsDisallowedEvidenceType(nested))
@@ -93,13 +98,18 @@ mlir::LogicalResult verifyStableEvidenceType(mlir::Operation *op,
   if (isTypingAny(type))
     return op->emitError()
            << what
-           << " is erased typing.Any evidence; AlgorithmM must resolve stable "
+           << " is erased typing.Any evidence; TypeSystem must resolve stable "
               "lowering boundaries to a concrete manifest contract";
+  if (containsPyInferVar(type))
+    return op->emitError()
+           << what
+           << " contains an unresolved inference variable that escaped "
+              "TypeSystem; inference must zonk evidence before emit";
   if (!containsDisallowedEvidenceType(type))
     return mlir::success();
   return op->emitError()
          << what
-         << " contains erased or legacy dialect evidence; AlgorithmM must "
+         << " contains erased or legacy dialect evidence; TypeSystem must "
             "resolve it to manifest contracts before lowering";
 }
 
@@ -662,7 +672,49 @@ mlir::LogicalResult verifyYieldFromEvidenceOp(mlir::Operation *op) {
   return result.get();
 }
 
+// Escape check for py.infervar across the whole op surface, including ops
+// that carry no contract attribute: contract-typed operands/results are
+// already rejected by op verifiers (InferVarType is not a Py_ContractType),
+// but a variable nested inside a container argument or inside a type-bearing
+// attribute (callable_type, ly.generator.*, closure_types) passes those
+// predicates and must be caught here.
+mlir::LogicalResult verifyNoEscapedInferenceVariable(mlir::Operation *op) {
+  VerificationResult result;
+  auto check = [&](mlir::Type type, llvm::StringRef what) {
+    if (auto function = mlir::dyn_cast_if_present<mlir::FunctionType>(type)) {
+      bool contaminated =
+          llvm::any_of(function.getInputs(), containsPyInferVar) ||
+          llvm::any_of(function.getResults(), containsPyInferVar);
+      if (!contaminated)
+        return;
+    } else if (!containsPyInferVar(type)) {
+      return;
+    }
+    result.check(op->emitError()
+                 << what << " contains an unresolved inference variable that "
+                 << "escaped TypeSystem; inference must zonk types before "
+                 << "emit");
+  };
+  for (mlir::Type type : op->getResultTypes())
+    check(type, "result type");
+  for (mlir::Type type : op->getOperandTypes())
+    check(type, "operand type");
+  for (mlir::NamedAttribute attr : op->getAttrs()) {
+    if (auto typeAttr = mlir::dyn_cast<mlir::TypeAttr>(attr.getValue())) {
+      check(typeAttr.getValue(), attr.getName().strref());
+      continue;
+    }
+    if (auto arrayAttr = mlir::dyn_cast<mlir::ArrayAttr>(attr.getValue()))
+      for (mlir::Attribute element : arrayAttr)
+        if (auto typeAttr = mlir::dyn_cast<mlir::TypeAttr>(element))
+          check(typeAttr.getValue(), attr.getName().strref());
+  }
+  return result.get();
+}
+
 mlir::LogicalResult verifyEvidenceOp(mlir::Operation *op) {
+  if (mlir::failed(verifyNoEscapedInferenceVariable(op)))
+    return mlir::failure();
   if (opName(op) == "py.yield_from")
     return verifyYieldFromEvidenceOp(op);
 
@@ -701,38 +753,38 @@ mlir::LogicalResult verifyEvidenceOp(mlir::Operation *op) {
   return result.get();
 }
 
-mlir::LogicalResult verifyAlgorithmMEvidenceImpl(mlir::ModuleOp module) {
+mlir::LogicalResult verifyTypeEvidenceImpl(mlir::ModuleOp module) {
   return walkVerifyOperations(module, verifyEvidenceOp);
 }
 
-class AlgorithmMEvidenceVerifierPass
-    : public mlir::PassWrapper<AlgorithmMEvidenceVerifierPass,
+class TypeEvidenceVerifierPass
+    : public mlir::PassWrapper<TypeEvidenceVerifierPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(AlgorithmMEvidenceVerifierPass)
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(TypeEvidenceVerifierPass)
 
   llvm::StringRef getArgument() const final {
-    return "lython-algorithmm-evidence-verifier";
+    return "lython-type-evidence-verifier";
   }
   llvm::StringRef getDescription() const final {
-    return "verify AlgorithmM-selected Callable evidence before Py lowering";
+    return "verify TypeSystem-selected Callable evidence before Py lowering";
   }
 
   void runOnOperation() final {
-    if (mlir::failed(verifyAlgorithmMEvidenceImpl(getOperation())))
+    if (mlir::failed(verifyTypeEvidenceImpl(getOperation())))
       signalPassFailure();
   }
 };
 
 } // namespace
 
-mlir::LogicalResult verifyAlgorithmMEvidence(mlir::ModuleOp module) {
-  return verifyAlgorithmMEvidenceImpl(module);
+mlir::LogicalResult verifyTypeEvidence(mlir::ModuleOp module) {
+  return verifyTypeEvidenceImpl(module);
 }
 
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createAlgorithmMEvidenceVerifierPass() {
-  return std::make_unique<AlgorithmMEvidenceVerifierPass>();
+createTypeEvidenceVerifierPass() {
+  return std::make_unique<TypeEvidenceVerifierPass>();
 }
 
 } // namespace py

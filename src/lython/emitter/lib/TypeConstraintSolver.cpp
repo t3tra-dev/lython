@@ -13,11 +13,11 @@
 
 namespace lython::emitter {
 
-bool bindExpectedType(const AlgorithmM &types, mlir::Type expected,
+bool bindExpectedType(const TypeSystem &types, mlir::Type expected,
                       mlir::Type actual, TypeBindingMap &bindings);
 
 std::optional<py::CallableType>
-expandParamSpecForInvocation(const AlgorithmM &types, py::CallableType callable,
+expandParamSpecForInvocation(const TypeSystem &types, py::CallableType callable,
                              mlir::ArrayRef<mlir::Type> positional,
                              mlir::ArrayRef<CallKeywordType> keywords,
                              TypeBindingMap &bindings,
@@ -40,7 +40,7 @@ std::optional<std::string> staticParameterName(mlir::Type type) {
   return std::nullopt;
 }
 
-bool structuralProtocolAccepts(const AlgorithmM &types,
+bool structuralProtocolAccepts(const TypeSystem &types,
                                py::ContractType expected, mlir::Type actual) {
   const py::protocols::Table &table =
       py::protocols::Table::get(types.getContext());
@@ -63,8 +63,15 @@ bool structuralProtocolAccepts(const AlgorithmM &types,
   });
 }
 
-bool typeAccepts(const AlgorithmM &types, mlir::Type expected,
+bool typeAccepts(const TypeSystem &types, mlir::Type expected,
                  mlir::Type actual) {
+  // Zonk only; never unify here. typeAccepts is called speculatively (both
+  // directions in bindTypeParameter, per-member in union trials), so a
+  // binding side effect would corrupt the store on the rejected branch. An
+  // unbound variable that survives zonk therefore falls through to the
+  // ground checks and is rejected -- the sound default.
+  expected = types.inference().zonk(expected);
+  actual = types.inference().zonk(actual);
   expected = types.widenLiteral(expected);
   actual = types.widenLiteral(actual);
   if (!expected || !actual)
@@ -187,7 +194,7 @@ paramSpecPackKeywords(py::CallableType pack) {
   return keywords;
 }
 
-bool bindParamSpecPack(const AlgorithmM &types, llvm::StringRef name,
+bool bindParamSpecPack(const TypeSystem &types, llvm::StringRef name,
                        mlir::ArrayRef<mlir::Type> positional,
                        mlir::ArrayRef<CallKeywordType> keywords,
                        TypeBindingMap &bindings, bool merge = false) {
@@ -234,7 +241,7 @@ bool bindParamSpecPack(const AlgorithmM &types, llvm::StringRef name,
   return true;
 }
 
-bool bindTypeVarTuplePack(const AlgorithmM &types, llvm::StringRef name,
+bool bindTypeVarTuplePack(const TypeSystem &types, llvm::StringRef name,
                           mlir::ArrayRef<mlir::Type> positional,
                           TypeBindingMap &bindings) {
   if (positional.size() == 1)
@@ -252,7 +259,7 @@ bool bindTypeVarTuplePack(const AlgorithmM &types, llvm::StringRef name,
   return found->second == pack;
 }
 
-bool bindTypeParameter(const AlgorithmM &types, llvm::StringRef name,
+bool bindTypeParameter(const TypeSystem &types, llvm::StringRef name,
                        mlir::Type actual, TypeBindingMap &bindings) {
   actual = types.widenLiteral(actual);
   if (!actual)
@@ -276,7 +283,7 @@ bool bindTypeParameter(const AlgorithmM &types, llvm::StringRef name,
   return false;
 }
 
-bool bindTypeList(const AlgorithmM &types, mlir::ArrayRef<mlir::Type> expected,
+bool bindTypeList(const TypeSystem &types, mlir::ArrayRef<mlir::Type> expected,
                   mlir::ArrayRef<mlir::Type> actual, TypeBindingMap &bindings) {
   if (expected.size() != actual.size())
     return false;
@@ -286,11 +293,13 @@ bool bindTypeList(const AlgorithmM &types, mlir::ArrayRef<mlir::Type> expected,
   return true;
 }
 
-bool bindUnionMember(const AlgorithmM &types, py::UnionType expected,
+bool bindUnionMember(const TypeSystem &types, py::UnionType expected,
                      mlir::Type actual, TypeBindingMap &bindings) {
   for (mlir::Type member : expected.getMemberTypes()) {
     TypeBindingMap candidate = bindings;
+    InferenceContext::Speculation attempt(types.inference());
     if (bindExpectedType(types, member, actual, candidate)) {
+      attempt.commit();
       bindings = std::move(candidate);
       return true;
     }
@@ -298,7 +307,7 @@ bool bindUnionMember(const AlgorithmM &types, py::UnionType expected,
   return false;
 }
 
-bool bindProtocolView(const AlgorithmM &types, py::ProtocolType expected,
+bool bindProtocolView(const TypeSystem &types, py::ProtocolType expected,
                       mlir::Type actual, TypeBindingMap &bindings) {
   const py::protocols::Table &table =
       py::protocols::Table::get(types.getContext());
@@ -318,7 +327,7 @@ bool bindProtocolView(const AlgorithmM &types, py::ProtocolType expected,
   return bindTypeList(types, expectedArgs, *actualArgs, bindings);
 }
 
-bool bindContractView(const AlgorithmM &types, py::ContractType expected,
+bool bindContractView(const TypeSystem &types, py::ContractType expected,
                       mlir::Type actual, TypeBindingMap &bindings) {
   if (auto actualContract = mlir::dyn_cast_if_present<py::ContractType>(actual))
     if (actualContract.getContractName() == expected.getContractName())
@@ -331,7 +340,7 @@ bool bindContractView(const AlgorithmM &types, py::ContractType expected,
   return typeAccepts(types, expected, actual);
 }
 
-bool bindCallableView(const AlgorithmM &types, py::CallableType expected,
+bool bindCallableView(const TypeSystem &types, py::CallableType expected,
                       py::CallableType actual, TypeBindingMap &bindings) {
   llvm::SmallVector<CallKeywordType, 4> actualKeywords;
   llvm::ArrayRef<mlir::StringAttr> actualKwNames = actual.getKwOnlyNames();
@@ -373,9 +382,11 @@ bool bindCallableView(const AlgorithmM &types, py::CallableType expected,
   return true;
 }
 
-bool bindExpectedType(const AlgorithmM &types, mlir::Type expected,
+bool bindExpectedType(const TypeSystem &types, mlir::Type expected,
                       mlir::Type actual, TypeBindingMap &bindings) {
   expected = substituteType(types, expected, bindings);
+  expected = types.inference().zonk(expected);
+  actual = types.inference().zonk(actual);
   actual = types.widenLiteral(actual);
 
   if (!expected || !actual)
@@ -386,6 +397,13 @@ bool bindExpectedType(const AlgorithmM &types, mlir::Type expected,
     return true;
   if (isObjectTop(types, expected) || isObjectTop(types, actual))
     return true;
+  // A variable heading either side after zonk is an engine-owned unknown;
+  // binding it is unify's job (occurs check included), not the name-keyed
+  // manifest map's. Checked after the object-top acceptors on purpose: a
+  // match against the top type carries no information, so the variable must
+  // stay free rather than get polluted with object().
+  if (py::isPyInferVarType(expected) || py::isPyInferVarType(actual))
+    return static_cast<bool>(types.inference().unify(expected, actual));
 
   if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(expected))
     return bindUnionMember(types, unionType, actual, bindings);
@@ -410,7 +428,7 @@ bool bindExpectedType(const AlgorithmM &types, mlir::Type expected,
   return typeAccepts(types, expected, actual);
 }
 
-py::CallableType substituteCallable(const AlgorithmM &types,
+py::CallableType substituteCallable(const TypeSystem &types,
                                     py::CallableType callable,
                                     const TypeBindingMap &bindings,
                                     bool eraseUnbound) {
@@ -592,7 +610,7 @@ py::CallableType substituteCallable(const AlgorithmM &types,
       callable.getPositionalOnlyCount());
 }
 
-mlir::Type substituteType(const AlgorithmM &types, mlir::Type type,
+mlir::Type substituteType(const TypeSystem &types, mlir::Type type,
                           const TypeBindingMap &bindings, bool eraseUnbound) {
   return py::mapPyTypeStructure(
       type, [&](mlir::Type node) -> std::optional<mlir::Type> {
@@ -616,7 +634,7 @@ mlir::Type substituteType(const AlgorithmM &types, mlir::Type type,
       });
 }
 
-mlir::Type callableResultType(const AlgorithmM &types,
+mlir::Type callableResultType(const TypeSystem &types,
                               py::CallableType callable,
                               const TypeBindingMap &bindings) {
   llvm::ArrayRef<mlir::Type> results = callable.getResultTypes();
@@ -634,7 +652,7 @@ mlir::Type callableResultType(const AlgorithmM &types,
 }
 
 std::optional<py::CallableType>
-expandParamSpecForInvocation(const AlgorithmM &types, py::CallableType callable,
+expandParamSpecForInvocation(const TypeSystem &types, py::CallableType callable,
                              mlir::ArrayRef<mlir::Type> positional,
                              mlir::ArrayRef<CallKeywordType> keywords,
                              TypeBindingMap &bindings,
@@ -769,7 +787,7 @@ int unboundStaticParameterCount(mlir::Type type) {
   return 0;
 }
 
-int matchSpecificity(const AlgorithmM &types, mlir::Type expected,
+int matchSpecificity(const TypeSystem &types, mlir::Type expected,
                      mlir::Type actual) {
   expected = types.widenLiteral(expected);
   actual = types.widenLiteral(actual);
@@ -790,7 +808,7 @@ int matchSpecificity(const AlgorithmM &types, mlir::Type expected,
   return 0;
 }
 
-int callableSpecificity(const AlgorithmM &types, py::CallableType callable,
+int callableSpecificity(const TypeSystem &types, py::CallableType callable,
                         std::size_t firstParameter) {
   if (!callable)
     return 0;
@@ -820,10 +838,14 @@ int callableSpecificity(const AlgorithmM &types, py::CallableType callable,
 }
 
 std::optional<CallSolution>
-tryCallableApplication(const AlgorithmM &types, py::CallableType callable,
+tryCallableApplication(const TypeSystem &types, py::CallableType callable,
                        mlir::ArrayRef<mlir::Type> positional,
                        mlir::ArrayRef<CallKeywordType> keywords,
                        TypeBindingMap bindings, std::size_t firstParameter) {
+  // The name-keyed bindings map is call-local, but inference-variable
+  // bindings made through bindExpectedType land in the shared union-find
+  // store; a failed application must not leave them behind.
+  InferenceContext::Speculation speculation(types.inference());
   std::optional<py::CallableType> expanded = expandParamSpecForInvocation(
       types, callable, positional, keywords, bindings, firstParameter);
   if (!expanded)
@@ -856,6 +878,7 @@ tryCallableApplication(const AlgorithmM &types, py::CallableType callable,
   mlir::Type result = callableResultType(types, *expanded, bindings);
   if (!result || unboundStaticParameterCount(result) != 0)
     return std::nullopt;
+  speculation.commit();
   return CallSolution{result,
                       std::move(bindings),
                       resolvedEvidence,
@@ -872,23 +895,37 @@ bool sameCallSolution(const CallSolution &lhs, const CallSolution &rhs) {
 }
 
 std::optional<CallSolution> selectCallableApplication(
-    const AlgorithmM &types, llvm::ArrayRef<py::CallableType> candidates,
+    const TypeSystem &types, llvm::ArrayRef<py::CallableType> candidates,
     mlir::ArrayRef<mlir::Type> positional,
     mlir::ArrayRef<CallKeywordType> keywords, TypeBindingMap bindings,
     std::size_t firstParameter) {
-  auto selection = lython::selection::bestCandidate<CallSolution>(
-      [](const CallSolution &solution) { return solution.score; },
-      sameCallSolution);
+  struct RankedCandidate {
+    CallSolution solution;
+    py::CallableType candidate;
+  };
+  auto selection = lython::selection::bestCandidate<RankedCandidate>(
+      [](const RankedCandidate &ranked) { return ranked.solution.score; },
+      [](const RankedCandidate &lhs, const RankedCandidate &rhs) {
+        return sameCallSolution(lhs.solution, rhs.solution);
+      });
+  // Every candidate ranks against the same store state and only the winner
+  // re-applies for real afterwards: a losing candidate's inference-variable
+  // bindings must not skew (or outlive) the other attempts.
   for (py::CallableType candidate : candidates) {
+    InferenceContext::Speculation attempt(types.inference());
     if (std::optional<CallSolution> solution = tryCallableApplication(
             types, candidate, positional, keywords, bindings, firstParameter))
-      selection.consider(std::move(*solution));
+      selection.consider(RankedCandidate{std::move(*solution), candidate});
   }
-  return std::move(selection).finish();
+  std::optional<RankedCandidate> best = std::move(selection).finish();
+  if (!best)
+    return std::nullopt;
+  return tryCallableApplication(types, best->candidate, positional, keywords,
+                                std::move(bindings), firstParameter);
 }
 
 std::optional<CallSolution>
-tryManifestMethod(const AlgorithmM &types, mlir::Type receiverType,
+tryManifestMethod(const TypeSystem &types, mlir::Type receiverType,
                   llvm::StringRef methodName,
                   mlir::ArrayRef<mlir::Type> positional,
                   mlir::ArrayRef<CallKeywordType> keywords) {
@@ -924,32 +961,51 @@ tryManifestMethod(const AlgorithmM &types, mlir::Type receiverType,
 
   const py::protocols::Table &table =
       py::protocols::Table::get(types.getContext());
-  auto selection = lython::selection::bestCandidate<CallSolution>(
-      [](const CallSolution &solution) { return solution.score; },
-      sameCallSolution);
+  struct RankedResolution {
+    CallSolution solution;
+    py::protocols::ContractResolution candidate;
+  };
+  auto selection = lython::selection::bestCandidate<RankedResolution>(
+      [](const RankedResolution &ranked) { return ranked.solution.score; },
+      [](const RankedResolution &lhs, const RankedResolution &rhs) {
+        return sameCallSolution(lhs.solution, rhs.solution);
+      });
 
-  for (py::protocols::ContractResolution candidate :
-       table.methodContractCandidatesWithEvidence(receiverType, methodName)) {
+  auto apply = [&](const py::protocols::ContractResolution &candidate)
+      -> std::optional<CallSolution> {
     py::CallableType signature = candidate.method.signature;
-    TypeBindingMap bindings = std::move(candidate.typeBindings);
     if (signature.getPositionalTypes().empty())
-      continue;
+      return std::nullopt;
+    TypeBindingMap bindings = candidate.typeBindings;
     if (!bindExpectedType(types, signature.getPositionalTypes().front(),
                           receiverType, bindings))
-      continue;
+      return std::nullopt;
     std::optional<CallSolution> solution = tryCallableApplication(
         types, signature, positional, keywords, std::move(bindings),
         /*firstParameter=*/1);
     if (!solution)
-      continue;
+      return std::nullopt;
     solution->score += candidate.score;
     solution->methodName = methodName.str();
     if (candidate.receiverEvidence)
       solution->receiverManifestClass =
           candidate.receiverEvidence->manifestClass;
-    selection.consider(std::move(*solution));
+    return solution;
+  };
+
+  // Same explore-then-reapply shape as selectCallableApplication: candidate
+  // ranking must not leave inference-variable bindings behind.
+  for (py::protocols::ContractResolution candidate :
+       table.methodContractCandidatesWithEvidence(receiverType, methodName)) {
+    InferenceContext::Speculation attempt(types.inference());
+    if (std::optional<CallSolution> solution = apply(candidate))
+      selection.consider(
+          RankedResolution{std::move(*solution), std::move(candidate)});
   }
-  return std::move(selection).finish();
+  std::optional<RankedResolution> best = std::move(selection).finish();
+  if (!best)
+    return std::nullopt;
+  return apply(best->candidate);
 }
 
 } // namespace lython::emitter

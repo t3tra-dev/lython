@@ -39,7 +39,7 @@ preserveLoweredSafetyContracts(mlir::ModuleOp module,
 
 mlir::LogicalResult verifyOwnership(mlir::ModuleOp module);
 mlir::LogicalResult verifyLLVMCallOwnership(mlir::ModuleOp module);
-mlir::LogicalResult verifyAlgorithmMEvidence(mlir::ModuleOp module);
+mlir::LogicalResult verifyTypeEvidence(mlir::ModuleOp module);
 mlir::LogicalResult verifyRuntimeManifestCompleteness(mlir::ModuleOp module);
 
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
@@ -49,7 +49,7 @@ createLLVMCallOwnershipVerifierPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createLLVMThreadSafeVerifierPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createAlgorithmMEvidenceVerifierPass();
+createTypeEvidenceVerifierPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createRuntimeManifestCompletenessVerifierPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>

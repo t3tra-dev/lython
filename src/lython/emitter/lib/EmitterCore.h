@@ -131,11 +131,34 @@ private:
                                llvm::function_ref<mlir::Value()> emitThen,
                                llvm::function_ref<mlir::Value()> emitElse);
   Value emitExpr(const parser::Node *expr);
+  // Algorithm M checking mode: emits expr against a downward expected type.
+  // Only node kinds whose emitted TYPE depends on the expectation (lambda,
+  // container literals) dispatch specially; everything else synthesizes via
+  // emitExpr and the caller's coercion/contract check keeps the boundary.
+  Value emitExprExpected(const parser::Node *expr, mlir::Type expected);
   Value emitConstant(const parser::Node &expr);
   Value emitCall(const parser::Node &expr);
+  // Monomorphization: generic (statically type-parameterized) top-level
+  // functions have no direct emission — the py ABI has no runtime
+  // representation for a type parameter. Each ground instantiation demanded
+  // by a call site or a ground-typed reference emits one specialized copy,
+  // deduplicated by instantiated public callable.
+  struct GenericFunctionInfo {
+    const parser::Node *node = nullptr;
+    FunctionSignature signature;
+    llvm::DenseMap<mlir::Type, std::string> specializations;
+  };
+  std::optional<std::pair<std::string, py::CallableType>>
+  ensureGenericSpecialization(const parser::Node &anchor,
+                              GenericFunctionInfo &generic,
+                              py::CallableType target);
+  Value emitGenericCall(const parser::Node &expr,
+                        const parser::Node &calleeNode,
+                        GenericFunctionInfo &generic);
   CallOperands emitCallOperands(const parser::Node &expr,
                                 llvm::ArrayRef<Value> leadingPositional = {},
-                                bool includeAstArguments = true);
+                                bool includeAstArguments = true,
+                                py::CallableType expectedContract = {});
   Value emitCallableDispatch(const parser::Node &anchor, Value callee,
                              const CallOperands &operands,
                              mlir::Type resultOverride = {});
@@ -200,7 +223,8 @@ private:
   Value emitAwaitValue(const parser::Node &anchor, Value awaitable);
   Value emitAwaitValue(const parser::Node &anchor, Value awaitable,
                        const AwaitInferenceResult &inference);
-  Value emitContainerLiteral(const parser::Node &expr);
+  Value emitContainerLiteral(const parser::Node &expr,
+                             mlir::Type expected = {});
   Value emitListComp(const parser::Node &expr);
   Value emitDictComp(const parser::Node &expr);
   Value emitComprehension(const parser::Node &expr, bool isDict,
@@ -261,7 +285,8 @@ private:
   std::string activePackageName;
   EmitOptions options;
   mlir::OpBuilder builder;
-  AlgorithmM types;
+  TypeSystem types;
+  llvm::StringMap<GenericFunctionInfo> genericFunctions;
   parser::Diagnostics diagnostics;
   llvm::StringMap<Value> values;
   llvm::StringMap<PrimitiveConstant> primitiveConstants;

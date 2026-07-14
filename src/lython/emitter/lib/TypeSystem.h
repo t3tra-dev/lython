@@ -2,8 +2,10 @@
 
 #include "Ast.h"
 #include "PyDialectTypes.h"
+#include "TypeInference.h"
 
 #include "mlir/IR/Builders.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 
@@ -137,7 +139,7 @@ struct AsyncContextMethodInferenceResult {
   }
 };
 
-class AlgorithmM {
+class TypeSystem {
 public:
   class Scope {
   public:
@@ -149,17 +151,22 @@ public:
     ~Scope();
 
   private:
-    friend class AlgorithmM;
-    explicit Scope(const AlgorithmM &owner) : owner(&owner) {}
+    friend class TypeSystem;
+    explicit Scope(const TypeSystem &owner) : owner(&owner) {}
     void reset();
 
-    const AlgorithmM *owner = nullptr;
+    const TypeSystem *owner = nullptr;
   };
 
-  explicit AlgorithmM(mlir::MLIRContext &context);
+  explicit TypeSystem(mlir::MLIRContext &context);
 
   mlir::MLIRContext &getContext() const { return context; }
   void seedBuiltins();
+
+  // Algorithm J unification store. Mutable through const methods for the
+  // same reason the scope stacks are: inference state is monotonic engine
+  // bookkeeping, not part of the facade's logical constness.
+  InferenceContext &inference() const { return inferenceState; }
 
   mlir::Type object() const;
   mlir::Type any() const;
@@ -191,6 +198,13 @@ public:
   // Target triple for platform-constant typing (sys.platform / os.name /
   // platform.system() infer as string literals of THIS target).
   void setTargetTriple(std::string triple) { targetTriple = std::move(triple); }
+
+  // Module pre-pass: resolves the signatures of all top-level functions in
+  // callee-first (SCC topological) order, memoizes them, and binds their
+  // public callables so forward references and mutual recursion type-check
+  // regardless of declaration order. Emit stays declaration-ordered; it hits
+  // the memo through functionSignature.
+  void registerModule(const parser::Node &moduleNode);
 
   Scope pushScope() const;
   void bindLocalSymbol(llvm::StringRef name, mlir::Type type) const;
@@ -259,6 +273,19 @@ private:
   std::string resolveAnnotationName(llvm::StringRef name) const;
 
   mlir::MLIRContext &context;
+  mutable InferenceContext inferenceState;
+  // Signatures resolved by registerModule's pre-pass, keyed by function
+  // node. Only module top-level functions are memoized: nested defs,
+  // lambdas, and imported source modules run under caller-specific scope
+  // contexts a node-keyed cache would conflate.
+  llvm::DenseMap<const parser::Node *, FunctionSignature> signatureMemo;
+  // Inference variables standing in for missing annotations, assigned by
+  // registerModule's pre-pass and resolved by its module-wide fixpoint.
+  // Keyed by arg node (parameters) / function node (result). functionSignature
+  // reads them through zonk, so provisional and final signature computation
+  // share one code path.
+  llvm::DenseMap<const parser::Node *, mlir::Type> parameterTypeOverrides;
+  llvm::DenseMap<const parser::Node *, mlir::Type> resultTypeOverrides;
   std::string targetTriple;
   llvm::StringMap<mlir::Type> symbols;
   llvm::StringMap<mlir::Type> classes;
