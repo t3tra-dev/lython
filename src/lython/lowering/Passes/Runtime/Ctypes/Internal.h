@@ -122,8 +122,6 @@ void keepAliveBufferSource(RuntimeBufferEvidence &evidence,
                            const RuntimeBundle &source);
 mlir::Value cdataStorageAddress(const RuntimeCtypesEvidence &evidence);
 mlir::Value cdataStorageAddressValid(const RuntimeCtypesEvidence &evidence);
-mlir::Value constantI1(mlir::OpBuilder &builder, mlir::Location loc,
-                       bool value);
 mlir::Value constantI64(mlir::OpBuilder &builder, mlir::Location loc,
                         std::int64_t value);
 mlir::Value constantIndex(mlir::OpBuilder &builder, mlir::Location loc,

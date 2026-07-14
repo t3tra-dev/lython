@@ -1,24 +1,11 @@
 #include "Runtime/Core/Lowerer.h"
 
+#include "Runtime/ABI/BoxLayout.h"
+
 #include "mlir/Dialect/SCF/IR/SCF.h"
 
 namespace py::lowering {
 namespace {
-
-bool sameRuntimeValueIdentity(const RuntimeValue &lhs,
-                              const RuntimeValue &rhs) {
-  if (lhs.values.size() != rhs.values.size())
-    return false;
-  if (lhs.values.empty())
-    return false;
-  // Ownership rewrapping (retain markers) must not break identity: compare
-  // the values underneath any identity-cast markers.
-  for (auto [left, right] : llvm::zip(lhs.values, rhs.values))
-    if (ownership::underlyingObjectValue(left) !=
-        ownership::underlyingObjectValue(right))
-      return false;
-  return true;
-}
 
 std::optional<std::int64_t> constantI64Value(mlir::Value value) {
   auto constant = value.getDefiningOp<mlir::arith::ConstantOp>();
@@ -216,7 +203,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
     if (mlir::failed(
             RuntimeBundleLowerer::retainAggregateSlot(op, *payload, "set.add")))
       return mlir::failure();
-    auto boxType = mlir::MemRefType::get({16}, builder.getI64Type());
+    mlir::MemRefType boxType = box_abi::boxWordsType(builder);
     mlir::Value box =
         mlir::memref::AllocaOp::create(builder, loc, boxType).getResult();
     mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =

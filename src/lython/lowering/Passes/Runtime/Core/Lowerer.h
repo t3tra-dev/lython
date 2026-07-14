@@ -1000,4 +1000,25 @@ private:
   llvm::SmallVector<mlir::Operation *, 32> erase;
 };
 
+inline mlir::Value constantI1(mlir::OpBuilder &builder, mlir::Location loc,
+                              bool value) {
+  return mlir::arith::ConstantIntOp::create(builder, loc, value ? 1 : 0, 1)
+      .getResult();
+}
+
+inline bool sameRuntimeValueIdentity(const RuntimeValue &lhs,
+                                     const RuntimeValue &rhs) {
+  if (lhs.values.size() != rhs.values.size())
+    return false;
+  if (lhs.values.empty())
+    return false;
+  // Ownership rewrapping (retain markers) must not break identity: compare
+  // the values underneath any identity-cast markers.
+  for (auto [left, right] : llvm::zip(lhs.values, rhs.values))
+    if (ownership::underlyingObjectValue(left) !=
+        ownership::underlyingObjectValue(right))
+      return false;
+  return true;
+}
+
 } // namespace py::lowering

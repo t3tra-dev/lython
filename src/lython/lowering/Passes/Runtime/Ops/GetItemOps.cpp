@@ -1,5 +1,8 @@
 #include "Runtime/Core/Lowerer.h"
 
+#include "Runtime/Evidence/Callable.h"
+#include "Runtime/ABI/BoxLayout.h"
+
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 
@@ -7,15 +10,7 @@ namespace py::lowering {
 
 namespace {
 
-std::optional<std::int64_t> integerLiteralFromValue(mlir::Value value) {
-  auto constant = value.getDefiningOp<py::IntConstantOp>();
-  if (!constant)
-    return std::nullopt;
-  std::int64_t parsed = 0;
-  if (constant.getValue().getAsInteger(10, parsed))
-    return std::nullopt;
-  return parsed;
-}
+using callable_evidence::integerLiteralFromValue;
 
 bool sameValueTypes(llvm::ArrayRef<mlir::Value> lhs,
                     llvm::ArrayRef<mlir::Value> rhs) {
@@ -904,7 +899,8 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeSequenceGetItem(
       mlir::arith::SelectOp::create(builder, loc, inRange, normalized, zero)
           .getResult();
   mlir::Value wordsPerSlot =
-      mlir::arith::ConstantIntOp::create(builder, loc, 16, 64);
+      mlir::arith::ConstantIntOp::create(builder, loc, box_abi::kWordsPerBox,
+                                         64);
   mlir::Value base =
       mlir::arith::MulIOp::create(builder, loc, safe, wordsPerSlot)
           .getResult();
@@ -912,10 +908,10 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeSequenceGetItem(
   for (auto [position, shape] : llvm::enumerate(*shapes)) {
     mlir::Value pointerWord = loadContainerBoxWord(
         builder, loc, container.physicalValues()[2], base,
-        4 + static_cast<std::int64_t>(position));
+        box_abi::kPointerWordBase + static_cast<std::int64_t>(position));
     mlir::Value sizeWord = loadContainerBoxWord(
         builder, loc, container.physicalValues()[2], base,
-        9 + static_cast<std::int64_t>(position));
+        box_abi::kSizeWordBase + static_cast<std::int64_t>(position));
     elementValues.push_back(RuntimeBundleLowerer::memrefFromBoxWords(
         builder, loc, pointerWord, sizeWord,
         mlir::cast<mlir::MemRefType>(shape)));
@@ -1036,7 +1032,8 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeDictGetItem(
       mlir::arith::SelectOp::create(builder, loc, missing, zero, found)
           .getResult();
   mlir::Value wordsPerSlot =
-      mlir::arith::ConstantIntOp::create(builder, loc, 16, 64);
+      mlir::arith::ConstantIntOp::create(builder, loc, box_abi::kWordsPerBox,
+                                         64);
   mlir::Value base =
       mlir::arith::MulIOp::create(builder, loc, safe, wordsPerSlot)
           .getResult();
@@ -1044,10 +1041,10 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeDictGetItem(
   for (auto [position, shape] : llvm::enumerate(*shapes)) {
     mlir::Value pointerWord = loadContainerBoxWord(
         builder, loc, container.physicalValues()[3], base,
-        4 + static_cast<std::int64_t>(position));
+        box_abi::kPointerWordBase + static_cast<std::int64_t>(position));
     mlir::Value sizeWord = loadContainerBoxWord(
         builder, loc, container.physicalValues()[3], base,
-        9 + static_cast<std::int64_t>(position));
+        box_abi::kSizeWordBase + static_cast<std::int64_t>(position));
     resultValues.push_back(RuntimeBundleLowerer::memrefFromBoxWords(
         builder, loc, pointerWord, sizeWord,
         mlir::cast<mlir::MemRefType>(shape)));

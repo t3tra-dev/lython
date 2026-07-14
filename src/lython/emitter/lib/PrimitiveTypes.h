@@ -44,4 +44,8 @@ primitiveIntegerConstantConstructor(const parser::Node *node,
 mlir::Type primitivePythonResultType(mlir::Type primitiveType,
                                      const AlgorithmM &types);
 
+std::optional<mlir::Type> primitiveBinaryResultType(mlir::Type left,
+                                                    mlir::Type right,
+                                                    const parser::Node *op);
+
 } // namespace lython::emitter

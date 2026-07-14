@@ -2,9 +2,11 @@
 
 #include "AstAccess.h"
 
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Block.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
 
 #include <utility>
 
@@ -939,6 +941,158 @@ bool hasUnexpectedObjectTop(mlir::Type actual, mlir::Type expected,
   }
 
   return false;
+}
+
+
+namespace {
+
+// The carried local was replaced through a structural-mutation call chain
+// (`ly.structural_mutation`), which already CONSUMED (transferred) the
+// previous representation into the call; releasing the previous value again
+// would double-consume the ownership token.
+bool derivesViaStructuralMutationImpl(
+    mlir::Value current, mlir::Value previous,
+    llvm::SmallPtrSetImpl<void *> &visited, unsigned depth) {
+  if (depth > 32)
+    return false;
+  while (current && current != previous) {
+    // Any structural-mutation op (py.call append, py.setitem, ...) exposes
+    // the rebound receiver as its LAST result and the receiver as operand 0.
+    if (mlir::Operation *definition = current.getDefiningOp()) {
+      if (!definition->hasAttr("ly.structural_mutation") ||
+          definition->getNumResults() < 1 ||
+          current != definition->getResult(definition->getNumResults() - 1) ||
+          definition->getNumOperands() < 1)
+        return false;
+      current = definition->getOperand(0);
+      continue;
+    }
+    // A merge or loop-header block argument derives via structural mutation
+    // when EVERY incoming edge forwards the previous value itself (identity
+    // path: the token is forwarded, not consumed), a mutation chain over it,
+    // or — coinductively — a chain rooted at an already-visited argument
+    // (loop back-edges: assume the invariant holds and check the remaining
+    // edges). Skipping the replacement release is sound on all path kinds.
+    auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(current);
+    if (!blockArg)
+      return false;
+    if (!visited.insert(current.getAsOpaquePointer()).second)
+      return true;
+    mlir::Block *block = blockArg.getOwner();
+    if (block->hasNoPredecessors())
+      return false;
+    for (mlir::Block *pred : block->getPredecessors()) {
+      mlir::Operation *terminator = pred->getTerminator();
+      auto branch = mlir::dyn_cast<mlir::BranchOpInterface>(terminator);
+      if (!branch)
+        return false;
+      for (auto [index, successor] :
+           llvm::enumerate(terminator->getSuccessors())) {
+        if (successor != block)
+          continue;
+        mlir::SuccessorOperands operands = branch.getSuccessorOperands(
+            static_cast<unsigned>(index));
+        mlir::Value incoming = operands[blockArg.getArgNumber()];
+        if (!incoming)
+          return false;
+        if (incoming != previous &&
+            !derivesViaStructuralMutationImpl(incoming, previous, visited,
+                                              depth + 1))
+          return false;
+      }
+    }
+    return true;
+  }
+  return current == previous;
+}
+
+} // namespace
+
+void collectAssignedNameTargets(const parser::Node *node,
+                                llvm::StringSet<> &names) {
+  if (!node)
+    return;
+  if (node->kind == "Name") {
+    names.insert(ast::nameSpelling(*node));
+    return;
+  }
+  if (node->kind == "Tuple" || node->kind == "List") {
+    if (const auto *elts = ast::nodeList(*node, "elts"))
+      for (const parser::NodePtr &elt : *elts)
+        collectAssignedNameTargets(elt.get(), names);
+  }
+}
+
+bool derivesViaStructuralMutation(mlir::Value current, mlir::Value previous) {
+  llvm::SmallPtrSet<void *, 8> visited;
+  return derivesViaStructuralMutationImpl(current, previous, visited,
+                                          /*depth=*/0);
+}
+
+void collectAssignedNames(const parser::Node *node, llvm::StringSet<> &names) {
+  if (!node)
+    return;
+  if (node->kind == "FunctionDef" || node->kind == "AsyncFunctionDef" ||
+      node->kind == "ClassDef" || node->kind == "Lambda")
+    return;
+  if (node->kind == "Call") {
+    // Structural-mutation candidates (`x.append(...)`) rebind `x` at the
+    // emitter when the manifest declares the method a structural mutator.
+    // This syntactic pre-pass only over-approximates which locals may be
+    // reassigned; threading a local that ends up not reassigned is a benign
+    // identity forward.
+    if (const parser::Node *func = ast::node(*node, "func")) {
+      if (func->kind == "Attribute") {
+        if (auto attr = ast::string(*func, "attr");
+            attr && (*attr == "append" || *attr == "add")) {
+          if (const parser::Node *value = ast::node(*func, "value"))
+            if (value->kind == "Name")
+              names.insert(ast::nameSpelling(*value));
+        }
+      }
+    }
+  }
+  if (node->kind == "Assign") {
+    if (const auto *targets = ast::nodeList(*node, "targets"))
+      for (const parser::NodePtr &target : *targets) {
+        collectAssignedNameTargets(target.get(), names);
+        // `x[k] = v` may structurally mutate (and rebind) `x`; threading a
+        // local that ends up not reassigned is a benign identity forward.
+        if (target && target->kind == "Subscript")
+          if (const parser::Node *container = ast::node(*target, "value"))
+            if (container->kind == "Name")
+              names.insert(ast::nameSpelling(*container));
+      }
+  } else if (node->kind == "AnnAssign" || node->kind == "AugAssign" ||
+             node->kind == "NamedExpr") {
+    collectAssignedNameTargets(ast::node(*node, "target"), names);
+  } else if (node->kind == "For" || node->kind == "AsyncFor") {
+    collectAssignedNameTargets(ast::node(*node, "target"), names);
+  } else if (node->kind == "With" || node->kind == "AsyncWith") {
+    if (const auto *items = ast::nodeList(*node, "items"))
+      for (const parser::NodePtr &item : *items)
+        collectAssignedNameTargets(ast::node(*item, "optional_vars"), names);
+  }
+
+  for (const parser::Field &field : node->fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (*child)
+        collectAssignedNames(child->get(), names);
+    } else if (const auto *children =
+                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
+      for (const parser::NodePtr &child : *children)
+        if (child)
+          collectAssignedNames(child.get(), names);
+    }
+  }
+}
+
+void collectAssignedNames(const std::vector<parser::NodePtr> *statements,
+                          llvm::StringSet<> &names) {
+  if (!statements)
+    return;
+  for (const parser::NodePtr &statement : *statements)
+    collectAssignedNames(statement.get(), names);
 }
 
 } // namespace lython::emitter

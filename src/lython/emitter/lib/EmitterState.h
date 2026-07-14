@@ -51,6 +51,13 @@ struct InlineReturnContext {
   bool carryResult = true;
 };
 
+// One loop-carried local: a pre-existing local reassigned in a loop body,
+// threaded as a loop-header / after-block argument in this order.
+struct CarriedLoopLocal {
+  std::string name;
+  mlir::Type type;
+};
+
 struct LoopControlContext {
   LoopControlContext() = default;
   // Two-target form used by every loop site; carriedLocals / headerBlock keep
@@ -66,7 +73,7 @@ struct LoopControlContext {
   // continueTarget. Empty when those blocks take no arguments. When non-empty,
   // `break` / `continue` forward the current values of these locals as branch
   // operands and release the replaced loop-header value.
-  llvm::SmallVector<std::string, 4> carriedLocals;
+  llvm::SmallVector<CarriedLoopLocal, 4> carriedLocals;
   // The loop-header block whose arguments hold the current-iteration carried
   // values (used to detect replacement for the decref-on-replace on
   // break/continue edges).

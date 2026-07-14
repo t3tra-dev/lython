@@ -68,6 +68,20 @@ struct CallInferenceResult {
   }
 };
 
+// Strict expression-inference context: names resolve against the enclosing
+// function's local callables first, and inference failures propagate as a
+// null type with a recorded reason instead of falling back to object().
+struct ExprInferenceContext {
+  const llvm::StringMap<mlir::Type> &localCallables;
+  llvm::SmallVectorImpl<std::string> *failureReasons = nullptr;
+  // Locals bound so far by a body walk (assignments, loop targets); shadows
+  // the symbol table without mutating it.
+  const llvm::StringMap<mlir::Type> *localSymbols = nullptr;
+  // Non-strict contexts keep the object() fallbacks but still see
+  // localCallables/localSymbols.
+  bool strict = true;
+};
+
 struct AwaitInferenceResult {
   mlir::Type resultType;
   mlir::Type awaitContract;
@@ -193,6 +207,8 @@ public:
 
   mlir::Type annotationType(const parser::Node *node) const;
   mlir::Type inferExpr(const parser::Node *node) const;
+  mlir::Type inferExpr(const parser::Node *node,
+                       const ExprInferenceContext &ctx) const;
   CallInferenceResult
   inferCallWithEvidence(mlir::Type calleeType,
                         mlir::ArrayRef<mlir::Type> positional,
@@ -236,6 +252,8 @@ public:
   void refreshCallable(FunctionSignature &sig) const;
 
 private:
+  mlir::Type inferExprImpl(const parser::Node *node,
+                           const ExprInferenceContext *ctx) const;
   void popScope() const;
   void bindAnnotationAlias(llvm::StringRef name, llvm::StringRef target);
   std::string resolveAnnotationName(llvm::StringRef name) const;

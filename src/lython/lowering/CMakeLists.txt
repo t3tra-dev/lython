@@ -1,8 +1,11 @@
 add_library(LythonRuntimeLowering STATIC
     Common/Instrumentation.cpp
     Common/RuntimeLibrary.cpp
+    Common/HostSupportBuilder.cpp
     Common/RuntimeSupportBuilder.cpp
+    Common/TracebackSupportBuilder.cpp
     Passes/LoweringPipeline.cpp
+    Passes/Runtime/ABI/BoxLayout.cpp
     Passes/Runtime/ABI/CallableABI.cpp
     Passes/Runtime/ABI/ControlFlowABI.cpp
     Passes/Runtime/ABI/AggregateOwnership.cpp
@@ -49,6 +52,7 @@ add_library(LythonRuntimeLowering STATIC
     Passes/Runtime/Ops/PackAndBindingOps.cpp
     Passes/Runtime/Ops/RefCountOps.cpp
     Passes/Runtime/Ops/GeneratorStateMachine.cpp
+    Passes/Runtime/Ops/SourceGenerator.cpp
     Passes/Runtime/Ops/SpecialMethodOps.cpp
     Passes/Runtime/Ops/TryOps.cpp
     Passes/Runtime/Ops/UnionOps.cpp

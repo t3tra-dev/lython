@@ -244,4 +244,30 @@ mlir::Type primitivePythonResultType(mlir::Type primitiveType,
   return {};
 }
 
+std::optional<mlir::Type> primitiveBinaryResultType(mlir::Type left,
+                                                    mlir::Type right,
+                                                    const parser::Node *op) {
+  if (!left || !right)
+    return std::nullopt;
+  if (ast::isOperator(op, "Add") || ast::isOperator(op, "Sub") ||
+      ast::isOperator(op, "Mult")) {
+    if (left == right && (mlir::isa<mlir::IntegerType, mlir::FloatType>(left) ||
+                          mlir::isa<mlir::RankedTensorType>(left)))
+      return left;
+  }
+  if (!ast::isOperator(op, "MatMult"))
+    return std::nullopt;
+
+  auto lhsTensor = mlir::dyn_cast<mlir::RankedTensorType>(left);
+  auto rhsTensor = mlir::dyn_cast<mlir::RankedTensorType>(right);
+  if (!lhsTensor || !rhsTensor || lhsTensor.getRank() != 2 ||
+      rhsTensor.getRank() != 2 ||
+      lhsTensor.getElementType() != rhsTensor.getElementType() ||
+      lhsTensor.getDimSize(1) != rhsTensor.getDimSize(0))
+    return std::nullopt;
+  llvm::SmallVector<std::int64_t, 2> shape{lhsTensor.getDimSize(0),
+                                           rhsTensor.getDimSize(1)};
+  return mlir::RankedTensorType::get(shape, lhsTensor.getElementType());
+}
+
 } // namespace lython::emitter

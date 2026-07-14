@@ -108,6 +108,16 @@ private:
                            const parser::Node &genexpr);
   void emitWhile(const parser::Node &statement);
   void emitAsyncFor(const parser::Node &statement);
+  llvm::SmallVector<CarriedLoopLocal, 4>
+  collectCarriedLoopLocals(const parser::Node &statement,
+                           const llvm::StringSet<> *excludedNames,
+                           llvm::SmallVectorImpl<mlir::Value> &initialValues);
+  void bindCarriedLoopLocals(llvm::ArrayRef<CarriedLoopLocal> carried,
+                             mlir::Block *block);
+  llvm::SmallVector<mlir::Value, 4>
+  carriedLoopEdgeOperands(const parser::Node &anchor,
+                          llvm::ArrayRef<CarriedLoopLocal> carried,
+                          mlir::Block *headerBlock);
   llvm::SmallVector<mlir::Value, 4>
   loopCarriedBranchOperands(const parser::Node &anchor,
                             const LoopControlContext &loop, mlir::Block *target);

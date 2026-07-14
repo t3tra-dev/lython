@@ -4,15 +4,19 @@ add_library(LythonEmitter STATIC
     lib/EmitterClasses.cpp
     lib/EmitterControlFlow.cpp
     lib/EmitterCore.cpp
+    lib/EmitterExceptions.cpp
     lib/EmitterExpressions.cpp
     lib/EmitterFunctions.cpp
     lib/EmitterImports.cpp
+    lib/EmitterLoops.cpp
+    lib/EmitterMatch.cpp
     lib/EmitterPrimitive.cpp
     lib/EmitterStatements.cpp
     lib/EmitterSupport.cpp
     lib/EmitterWith.cpp
     lib/PrimitiveTypes.cpp
     lib/Emitter.cpp
+    lib/TypeConstraintSolver.cpp
     lib/TypeSystem.cpp
 )
 

@@ -1,5 +1,7 @@
 #include "TypeSystem.h"
 
+#include "TypeSystemSolver.h"
+
 #include "AstAccess.h"
 #include "CandidateSelection.h"
 #include "PlatformConstants.h"
@@ -119,287 +121,20 @@ void recordInferenceFailure(
 mlir::Type inferExprWithLocalCallables(
     const AlgorithmM &types, const parser::Node *node,
     const llvm::StringMap<mlir::Type> &localCallables,
-    llvm::SmallVectorImpl<std::string> *failureReasons = nullptr) {
-  if (!node)
-    return types.inferExpr(node);
-  auto fail = [&](std::string reason) -> mlir::Type {
-    recordInferenceFailure(failureReasons, std::move(reason));
-    return {};
-  };
-  auto inferCallArguments =
-      [&](llvm::SmallVectorImpl<mlir::Type> &positional,
-          llvm::SmallVectorImpl<CallKeywordType> &keywords) -> bool {
-    if (const auto *args = ast::nodeList(*node, "args")) {
-      for (const parser::NodePtr &arg : *args) {
-        if (arg && arg->kind == "Starred") {
-          mlir::Type starredType = inferExprWithLocalCallables(
-              types, ast::node(*arg, "value"), localCallables, failureReasons);
-          if (!starredType)
-            return false;
-          if (!appendStarredCallArgumentTypes(types, starredType, positional)) {
-            recordInferenceFailure(
-                failureReasons,
-                "starred call arguments require a statically sized tuple");
-            return false;
-          }
-          continue;
-        }
-        mlir::Type argType = inferExprWithLocalCallables(
-            types, arg.get(), localCallables, failureReasons);
-        if (!argType)
-          return false;
-        positional.push_back(argType);
-      }
-    }
-
-    if (const auto *keywordNodes = ast::nodeList(*node, "keywords")) {
-      for (const parser::NodePtr &keyword : *keywordNodes) {
-        auto name = ast::string(*keyword, "arg");
-        if (!name) {
-          recordInferenceFailure(
-              failureReasons,
-              "keyword splat call arguments require static keyword names");
-          return false;
-        }
-        mlir::Type keywordType = inferExprWithLocalCallables(
-            types, ast::node(*keyword, "value"), localCallables, failureReasons);
-        if (!keywordType)
-          return false;
-        keywords.push_back(CallKeywordType{std::string(*name), keywordType});
-      }
-    }
-    return true;
-  };
-  if (node && node->kind == "Name") {
-    auto found = localCallables.find(ast::nameSpelling(*node));
-    if (found != localCallables.end())
-      return found->second;
-  }
-  if (node->kind == "List" || node->kind == "Tuple") {
-    llvm::SmallVector<mlir::Type, 8> elementTypes;
-    if (const auto *elements = ast::nodeList(*node, "elts")) {
-      elementTypes.reserve(elements->size());
-      for (const parser::NodePtr &element : *elements) {
-        mlir::Type elementType = inferExprWithLocalCallables(
-            types, element.get(), localCallables, failureReasons);
-        if (!elementType)
-          return {};
-        elementTypes.push_back(types.widenLiteral(elementType));
-      }
-    }
-    mlir::Type joined = types.join(elementTypes);
-    return node->kind == "List" ? types.listOf(joined) : types.tupleOf(joined);
-  }
-  if (node->kind == "Dict") {
-    const auto *keys = ast::nodeList(*node, "keys");
-    const auto *values = ast::nodeList(*node, "values");
-    if (!keys || !values)
-      return types.inferExpr(node);
-    llvm::SmallVector<mlir::Type, 8> keyTypes;
-    llvm::SmallVector<mlir::Type, 8> valueTypes;
-    for (auto [index, key] : llvm::enumerate(*keys)) {
-      if (!key)
-        return types.inferExpr(node);
-      mlir::Type keyType = inferExprWithLocalCallables(
-          types, key.get(), localCallables, failureReasons);
-      if (!keyType)
-        return {};
-      keyTypes.push_back(types.widenLiteral(keyType));
-      if (index < values->size()) {
-        mlir::Type valueType = inferExprWithLocalCallables(
-            types, (*values)[index].get(), localCallables, failureReasons);
-        if (!valueType)
-          return {};
-        valueTypes.push_back(types.widenLiteral(valueType));
-      }
-    }
-    return types.dictOf(types.join(keyTypes), types.join(valueTypes));
-  }
-  if (node->kind == "Subscript") {
-    if (std::optional<PrimitiveTypeSpec> primitive =
-            primitiveTypeSpecFromSubscript(node, types))
-      return types.typeObject(primitive->type);
-    mlir::Type container = inferExprWithLocalCallables(
-        types, ast::node(*node, "value"), localCallables, failureReasons);
-    mlir::Type index = inferExprWithLocalCallables(
-        types, ast::node(*node, "slice"), localCallables, failureReasons);
-    if (!container || !index)
-      return {};
-    CallInferenceResult inference = types.inferMethodCallWithEvidence(
-        types.widenLiteral(container), "__getitem__", {index});
-    if (inference)
-      return inference.resultType;
-    return fail(inference.failureReason);
-  }
-  if (node->kind == "Await") {
-    mlir::Type awaitable = inferExprWithLocalCallables(
-        types, ast::node(*node, "value"), localCallables, failureReasons);
-    if (!awaitable)
-      return {};
-    AwaitInferenceResult inference =
-        types.inferAwaitWithEvidence(types.widenLiteral(awaitable));
-    if (inference)
-      return inference.resultType;
-    return fail(inference.failureReason);
-  }
-  if (node->kind == "Call") {
-    const parser::Node *callee = ast::node(*node, "func");
-    if (std::optional<PrimitiveTypeSpec> primitive =
-            primitiveTypeSpecFromSubscript(callee, types))
-      return primitive->type;
-
-    llvm::SmallVector<mlir::Type, 8> positional;
-    llvm::SmallVector<CallKeywordType, 4> keywords;
-    if (!inferCallArguments(positional, keywords))
-      return {};
-
-    if (callee && callee->kind == "Name") {
-      auto found = localCallables.find(ast::nameSpelling(*callee));
-      if (found != localCallables.end()) {
-        CallInferenceResult inference =
-            types.inferCallWithEvidence(found->second, positional, keywords);
-        if (inference)
-          return inference.resultType;
-        return fail(inference.failureReason);
-      }
-      llvm::StringRef name = ast::nameSpelling(*callee);
-      if (name == "isinstance")
-        return types.boolType();
-      if (name == "len") {
-        if (positional.empty())
-          return fail("len expects one positional argument");
-        CallInferenceResult inference = types.inferMethodCallWithEvidence(
-            types.widenLiteral(positional.front()), "__len__", {});
-        if (inference)
-          return inference.resultType;
-        return fail(inference.failureReason);
-      }
-      if (name == "round") {
-        if (positional.empty())
-          return fail("round expects at least one positional argument");
-        llvm::SmallVector<mlir::Type, 1> extra;
-        if (positional.size() > 1)
-          extra.push_back(positional[1]);
-        mlir::Type input = types.widenLiteral(positional.front());
-        CallInferenceResult inference =
-            types.inferMethodCallWithEvidence(input, "__round__", extra);
-        if (inference)
-          return inference.resultType;
-        if (input == types.intType())
-          return types.intType();
-        return fail(inference.failureReason);
-      }
-      if (name == "range")
-        return types.contract("builtins.range");
-      if (auto cls = types.lookupClass(name)) {
-        mlir::Type instance =
-            types.inferClassInstantiation(*cls, positional, keywords);
-        if (instance)
-          return instance;
-        return fail("class instantiation leaves unbound static type "
-                    "parameters for '" +
-                    name.str() + "'");
-      }
-      if (std::optional<std::string> canonical =
-              types.lookupCanonicalBinding(name)) {
-        if (*canonical == "lyrt.from_prim" && positional.size() == 1 &&
-            keywords.empty()) {
-          mlir::Type result = primitivePythonResultType(positional.front(), types);
-          if (result)
-            return result;
-          return fail(
-              "lyrt.from_prim expects a primitive scalar or shaped primitive value");
-        }
-        if (*canonical == "asyncio.sleep")
-          return inferAsyncioSleepResult(types, positional, keywords);
-      }
-      if (auto symbol = types.lookupSymbol(name)) {
-        CallInferenceResult inference =
-            types.inferCallWithEvidence(*symbol, positional, keywords);
-        if (inference)
-          return inference.resultType;
-        return fail(inference.failureReason);
-      }
-    }
-    if (callee && callee->kind == "Attribute") {
-      std::string qualified = ast::qualifiedName(callee);
-      if (std::optional<std::string> canonical =
-              types.lookupCanonicalBinding(qualified)) {
-        if (*canonical == "lyrt.from_prim" && positional.size() == 1 &&
-            keywords.empty()) {
-          mlir::Type result = primitivePythonResultType(positional.front(), types);
-          if (result)
-            return result;
-          return fail(
-              "lyrt.from_prim expects a primitive scalar or shaped primitive value");
-        }
-        if (*canonical == "asyncio.sleep")
-          return inferAsyncioSleepResult(types, positional, keywords);
-      }
-      if (auto symbol = types.lookupSymbol(qualified)) {
-        CallInferenceResult inference =
-            types.inferCallWithEvidence(*symbol, positional, keywords);
-        if (inference)
-          return inference.resultType;
-        return fail(inference.failureReason);
-      }
-      if (const parser::Node *receiverNode = ast::node(*callee, "value")) {
-        if (auto methodName = ast::string(*callee, "attr")) {
-          mlir::Type receiver = inferExprWithLocalCallables(
-              types, receiverNode, localCallables, failureReasons);
-          if (!receiver)
-            return {};
-          CallInferenceResult inference = types.inferMethodCallWithEvidence(
-              types.widenLiteral(receiver), *methodName, positional, keywords);
-          if (inference)
-            return inference.resultType;
-          return fail(inference.failureReason);
-        }
-      }
-    }
-    if (callee) {
-      mlir::Type calleeType = inferExprWithLocalCallables(
-          types, callee, localCallables, failureReasons);
-      if (!calleeType)
-        return {};
-      CallInferenceResult inference =
-          types.inferCallWithEvidence(calleeType, positional, keywords);
-      if (inference)
-        return inference.resultType;
-      return fail(inference.failureReason);
-    }
-    return fail("call expression is missing a callee");
-  }
-  if (node->kind == "Lambda") {
-    return types.functionSignature(*node).callable;
-  }
-  if (node->kind == "UnaryOp") {
-    const parser::Node *operandNode = ast::node(*node, "operand");
-    mlir::Type operand =
-        inferExprWithLocalCallables(types, operandNode, localCallables,
-                                    failureReasons);
-    if (!operand)
-      return {};
-    return types.inferExpr(node);
-  }
-  if (node->kind == "BinOp") {
-    const parser::Node *leftNode = ast::node(*node, "left");
-    const parser::Node *rightNode = ast::node(*node, "right");
-    if (!inferExprWithLocalCallables(types, leftNode, localCallables,
-                                     failureReasons))
-      return {};
-    if (!inferExprWithLocalCallables(types, rightNode, localCallables,
-                                     failureReasons))
-      return {};
-  }
-  return types.inferExpr(node);
+    llvm::SmallVectorImpl<std::string> *failureReasons = nullptr,
+    const llvm::StringMap<mlir::Type> *localSymbols = nullptr) {
+  return types.inferExpr(node, ExprInferenceContext{localCallables,
+                                                    failureReasons,
+                                                    localSymbols});
 }
 
 mlir::Type inferReturnExpr(const AlgorithmM &types, const parser::Node *node,
                            const llvm::StringMap<mlir::Type> &localCallables,
-                           llvm::SmallVectorImpl<std::string> *failureReasons) {
+                           llvm::SmallVectorImpl<std::string> *failureReasons,
+                           const llvm::StringMap<mlir::Type> *localSymbols =
+                               nullptr) {
   return inferExprWithLocalCallables(types, node, localCallables,
-                                     failureReasons);
+                                     failureReasons, localSymbols);
 }
 
 llvm::StringMap<mlir::Type>
@@ -422,7 +157,8 @@ localCallableTypesInFunction(const AlgorithmM &types,
 void collectReturnTypes(const AlgorithmM &types, const parser::Node *node,
                         const llvm::StringMap<mlir::Type> &localCallables,
                         llvm::SmallVectorImpl<mlir::Type> &results,
-                        llvm::SmallVectorImpl<std::string> *failureReasons) {
+                        llvm::SmallVectorImpl<std::string> *failureReasons,
+                        const llvm::StringMap<mlir::Type> *localSymbols) {
   if (!node)
     return;
   if (node->kind == "FunctionDef" || node->kind == "AsyncFunctionDef" ||
@@ -431,7 +167,7 @@ void collectReturnTypes(const AlgorithmM &types, const parser::Node *node,
   if (node->kind == "Return") {
     mlir::Type type =
         inferReturnExpr(types, ast::node(*node, "value"), localCallables,
-                        failureReasons);
+                        failureReasons, localSymbols);
     if (type)
       results.push_back(type);
     return;
@@ -440,12 +176,12 @@ void collectReturnTypes(const AlgorithmM &types, const parser::Node *node,
     if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
       if (*child)
         collectReturnTypes(types, child->get(), localCallables, results,
-                           failureReasons);
+                           failureReasons, localSymbols);
     } else if (const auto *children =
                    std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
       for (const parser::NodePtr &child : *children)
         collectReturnTypes(types, child.get(), localCallables, results,
-                           failureReasons);
+                           failureReasons, localSymbols);
     }
   }
 }
@@ -453,7 +189,9 @@ void collectReturnTypes(const AlgorithmM &types, const parser::Node *node,
 mlir::Type inferredFunctionResult(const AlgorithmM &types,
                                   const parser::Node &function,
                                   llvm::SmallVectorImpl<std::string>
-                                      *failureReasons = nullptr) {
+                                      *failureReasons = nullptr,
+                                  const llvm::StringMap<mlir::Type>
+                                      *localSymbols = nullptr) {
   llvm::StringMap<mlir::Type> localCallables =
       localCallableTypesInFunction(types, function);
 
@@ -461,12 +199,16 @@ mlir::Type inferredFunctionResult(const AlgorithmM &types,
   if (const auto *body = ast::nodeList(function, "body"))
     for (const parser::NodePtr &statement : *body)
       collectReturnTypes(types, statement.get(), localCallables, results,
-                         failureReasons);
+                         failureReasons, localSymbols);
   return results.empty() ? types.none() : types.join(results);
 }
 
 struct GeneratorFunctionAnalysis {
   bool hasYield = false;
+  // Locals bound by the walk in statement order; replaces the former
+  // bindLocalSymbol side effect on the shared symbol-table scope, and is
+  // reused by the return-type inference that runs after the walk.
+  llvm::StringMap<mlir::Type> localSymbols;
   bool sawYieldFrom = false;
   bool hasReturnValue = false;
   llvm::SmallVector<mlir::Type, 4> yieldTypes;
@@ -477,9 +219,10 @@ struct GeneratorFunctionAnalysis {
 std::optional<mlir::Type> generatorYieldFromElementType(
     const AlgorithmM &types, const parser::Node *value,
     const llvm::StringMap<mlir::Type> &localCallables,
-    llvm::SmallVectorImpl<std::string> &failureReasons) {
-  mlir::Type rawSource =
-      inferExprWithLocalCallables(types, value, localCallables, &failureReasons);
+    llvm::SmallVectorImpl<std::string> &failureReasons,
+    const llvm::StringMap<mlir::Type> *localSymbols) {
+  mlir::Type rawSource = inferExprWithLocalCallables(
+      types, value, localCallables, &failureReasons, localSymbols);
   if (!rawSource)
     return std::nullopt;
   mlir::Type source = types.widenLiteral(rawSource);
@@ -491,6 +234,20 @@ std::optional<mlir::Type> generatorYieldFromElementType(
           ? std::string("yield from requires manifest-backed iterable evidence")
           : inference.failureReason);
   return std::nullopt;
+}
+
+const llvm::StringMap<mlir::Type> &noLocalCallables() {
+  static const llvm::StringMap<mlir::Type> empty;
+  return empty;
+}
+
+// Lenient inference during the body walk: object() fallbacks, but reads the
+// locals bound so far.
+mlir::Type lenientWalkInfer(const AlgorithmM &types, const parser::Node *node,
+                            const GeneratorFunctionAnalysis &analysis) {
+  return types.inferExpr(
+      node, ExprInferenceContext{noLocalCallables(), nullptr,
+                                 &analysis.localSymbols, /*strict=*/false});
 }
 
 void collectGeneratorFunctionAnalysis(
@@ -509,8 +266,10 @@ void collectGeneratorFunctionAnalysis(
       analysis.yieldTypes.push_back(types.none());
       return;
     }
-    mlir::Type valueType = inferExprWithLocalCallables(
-        types, value, localCallables, &analysis.failureReasons);
+    mlir::Type valueType =
+        inferExprWithLocalCallables(types, value, localCallables,
+                                    &analysis.failureReasons,
+                                    &analysis.localSymbols);
     if (valueType)
       analysis.yieldTypes.push_back(types.widenLiteral(valueType));
     return;
@@ -520,7 +279,7 @@ void collectGeneratorFunctionAnalysis(
     analysis.sawYieldFrom = true;
     if (std::optional<mlir::Type> element = generatorYieldFromElementType(
             types, ast::node(*node, "value"), localCallables,
-            analysis.failureReasons))
+            analysis.failureReasons, &analysis.localSymbols))
       analysis.yieldTypes.push_back(*element);
     return;
   }
@@ -530,7 +289,8 @@ void collectGeneratorFunctionAnalysis(
       analysis.hasReturnValue = true;
     analysis.returnTypes.push_back(
         value ? inferReturnExpr(types, value, localCallables,
-                                &analysis.failureReasons)
+                                &analysis.failureReasons,
+                                &analysis.localSymbols)
               : types.none());
     return;
   }
@@ -540,11 +300,12 @@ void collectGeneratorFunctionAnalysis(
                                      generatorSendHint, analysis);
     mlir::Type valueType = value && value->kind == "Yield" && generatorSendHint
                                ? generatorSendHint
-                               : types.inferExpr(value);
+                               : lenientWalkInfer(types, value, analysis);
     if (const auto *targets = ast::nodeList(*node, "targets")) {
       for (const parser::NodePtr &target : *targets) {
         if (target && target->kind == "Name")
-          types.bindLocalSymbol(ast::nameSpelling(*target), valueType);
+          analysis.localSymbols[ast::nameSpelling(*target)] =
+              valueType ? valueType : types.object();
       }
     }
     return;
@@ -557,9 +318,9 @@ void collectGeneratorFunctionAnalysis(
     if (target && target->kind == "Name") {
       mlir::Type type = types.annotationType(ast::node(*node, "annotation"));
       if (!type && value)
-        type = types.inferExpr(value);
+        type = lenientWalkInfer(types, value, analysis);
       if (type)
-        types.bindLocalSymbol(ast::nameSpelling(*target), type);
+        analysis.localSymbols[ast::nameSpelling(*target)] = type;
     }
     return;
   }
@@ -569,10 +330,11 @@ void collectGeneratorFunctionAnalysis(
     collectGeneratorFunctionAnalysis(types, value, localCallables,
                                      generatorSendHint, analysis);
     if (target && target->kind == "Name") {
-      mlir::Type lhs = types.widenLiteral(types.inferExpr(target));
-      mlir::Type rhs = types.widenLiteral(types.inferExpr(value));
-      types.bindLocalSymbol(ast::nameSpelling(*target),
-                            types.widenLiteral(types.join({lhs, rhs})));
+      mlir::Type lhs = types.widenLiteral(lenientWalkInfer(types, target, analysis));
+      mlir::Type rhs = types.widenLiteral(lenientWalkInfer(types, value, analysis));
+      mlir::Type joined = types.widenLiteral(types.join({lhs, rhs}));
+      analysis.localSymbols[ast::nameSpelling(*target)] =
+          joined ? joined : types.object();
     }
     return;
   }
@@ -582,8 +344,10 @@ void collectGeneratorFunctionAnalysis(
     const parser::Node *target = ast::node(*node, "target");
     const parser::Node *iter = ast::node(*node, "iter");
     if (target && target->kind == "Name" && iter) {
-      mlir::Type iterableType = inferExprWithLocalCallables(
-          types, iter, localCallables, &analysis.failureReasons);
+      mlir::Type iterableType =
+          inferExprWithLocalCallables(types, iter, localCallables,
+                                      &analysis.failureReasons,
+                                      &analysis.localSymbols);
       if (iterableType) {
         CallInferenceResult iterInference = types.inferMethodCallWithEvidence(
             types.widenLiteral(iterableType), "__iter__", {});
@@ -591,9 +355,11 @@ void collectGeneratorFunctionAnalysis(
             iterInference ? types.inferMethodCallWithEvidence(
                                 iterInference.resultType, "__next__", {})
                           : CallInferenceResult{};
-        if (nextInference)
-          types.bindLocalSymbol(ast::nameSpelling(*target),
-                                types.widenLiteral(nextInference.resultType));
+        if (nextInference) {
+          mlir::Type element = types.widenLiteral(nextInference.resultType);
+          analysis.localSymbols[ast::nameSpelling(*target)] =
+              element ? element : types.object();
+        }
       }
     }
   }
@@ -655,61 +421,6 @@ mlir::Type tupleOfMembers(const AlgorithmM &types,
   return types.contract("builtins.tuple", members);
 }
 
-std::optional<std::int64_t> literalIntegerFromType(mlir::Type type) {
-  auto literal = mlir::dyn_cast_if_present<py::LiteralType>(type);
-  if (!literal)
-    return std::nullopt;
-  std::int64_t value = 0;
-  if (literal.getSpelling().getAsInteger(10, value))
-    return std::nullopt;
-  return value;
-}
-
-mlir::Type joinedLiteralElementType(const AlgorithmM &types,
-                                    const parser::Node &node,
-                                    llvm::StringRef fieldName) {
-  llvm::SmallVector<mlir::Type, 8> elementTypes;
-  if (const auto *elements = ast::nodeList(node, fieldName)) {
-    elementTypes.reserve(elements->size());
-    for (const parser::NodePtr &element : *elements)
-      elementTypes.push_back(
-          types.widenLiteral(types.inferExpr(element.get())));
-  }
-  return types.join(elementTypes);
-}
-
-std::optional<std::pair<mlir::Type, mlir::Type>>
-joinedDictLiteralTypes(const AlgorithmM &types, const parser::Node &node) {
-  const auto *keys = ast::nodeList(node, "keys");
-  const auto *values = ast::nodeList(node, "values");
-  if (!keys || !values)
-    return std::nullopt;
-
-  llvm::SmallVector<mlir::Type, 8> keyTypes;
-  llvm::SmallVector<mlir::Type, 8> valueTypes;
-  keyTypes.reserve(keys->size());
-  valueTypes.reserve(values->size());
-  for (auto [index, key] : llvm::enumerate(*keys)) {
-    if (!key)
-      return std::nullopt;
-    keyTypes.push_back(types.widenLiteral(types.inferExpr(key.get())));
-    if (index < values->size())
-      valueTypes.push_back(
-          types.widenLiteral(types.inferExpr((*values)[index].get())));
-  }
-  return std::make_pair(types.join(keyTypes), types.join(valueTypes));
-}
-
-bool isObjectTop(const AlgorithmM &types, mlir::Type type) {
-  if (!type)
-    return false;
-  if (type == types.object())
-    return true;
-  if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(type))
-    return contract.getContractName() == "typing.Any";
-  return false;
-}
-
 bool appendStarredCallArgumentTypes(const AlgorithmM &types, mlir::Type type,
                                     llvm::SmallVectorImpl<mlir::Type> &out) {
   type = types.widenLiteral(type);
@@ -723,16 +434,6 @@ bool appendStarredCallArgumentTypes(const AlgorithmM &types, mlir::Type type,
     }
   }
   return false;
-}
-
-std::string manifestNameForContract(llvm::StringRef name) {
-  for (llvm::StringRef prefix :
-       {"builtins.", "typing.", "types.", "contextlib.", "_asyncio.",
-        "asyncio.", "contextvars."}) {
-    if (name.consume_front(prefix))
-      return name.str();
-  }
-  return name.str();
 }
 
 bool bindManifestClassImport(AlgorithmM &types, llvm::StringRef localName,
@@ -1226,1023 +927,6 @@ bool bindManifestModuleCallableExports(AlgorithmM &types,
         canonical, contract);
   }
   return handled;
-}
-
-std::optional<std::string> staticParameterName(mlir::Type type) {
-  if (mlir::isa<py::SelfType>(type))
-    return std::string("Self");
-  if (auto typeVar = mlir::dyn_cast_if_present<py::TypeVarType>(type))
-    return typeVar.getName().str();
-  if (auto paramSpec = mlir::dyn_cast_if_present<py::ParamSpecType>(type))
-    return paramSpec.getName().str();
-  if (auto typeVarTuple = mlir::dyn_cast_if_present<py::TypeVarTupleType>(type))
-    return typeVarTuple.getName().str();
-  if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(type)) {
-    llvm::StringRef name = contract.getContractName();
-    if (name.starts_with("$"))
-      return name.drop_front().str();
-  }
-  return std::nullopt;
-}
-
-bool structuralProtocolAccepts(const AlgorithmM &types,
-                               py::ContractType expected, mlir::Type actual) {
-  const py::protocols::Table &table =
-      py::protocols::Table::get(types.getContext());
-  std::string protocolName =
-      manifestNameForContract(expected.getContractName());
-  const py::protocols::ProtocolInfo *info = table.lookup(protocolName);
-  if (!info || !info->isProtocol)
-    return false;
-
-  if (std::optional<std::vector<mlir::Type>> args =
-          table.protocolArgumentsFor(actual, protocolName)) {
-    llvm::ArrayRef<mlir::Type> expectedArgs = expected.getArguments();
-    if (expectedArgs.empty() || expectedArgs.size() == args->size())
-      return true;
-  }
-
-  return llvm::all_of(info->methods, [&](const auto &method) {
-    return !table.methodContractCandidatesWithEvidence(actual, method.first)
-                .empty();
-  });
-}
-
-bool typeAccepts(const AlgorithmM &types, mlir::Type expected,
-                 mlir::Type actual) {
-  expected = types.widenLiteral(expected);
-  actual = types.widenLiteral(actual);
-  if (!expected || !actual)
-    return true;
-  if (expected == actual)
-    return true;
-  if (isObjectTop(types, expected) || isObjectTop(types, actual))
-    return true;
-  if (auto expectedContract =
-          mlir::dyn_cast_if_present<py::ContractType>(expected)) {
-    const py::protocols::Table &table =
-        py::protocols::Table::get(types.getContext());
-    if (table.isManifestSubclassOf(actual, expectedContract.getContractName()))
-      return true;
-    if (structuralProtocolAccepts(types, expectedContract, actual))
-      return true;
-  }
-  return py::isAssignableTo(actual, expected);
-}
-
-using TypeBindingMap = std::map<std::string, mlir::Type>;
-
-struct CallSolution {
-  mlir::Type result;
-  TypeBindingMap bindings;
-  py::CallableType callableContract;
-  std::string methodName;
-  std::optional<std::string> receiverManifestClass;
-  int score = 0;
-};
-
-mlir::Type substituteType(const AlgorithmM &types, mlir::Type type,
-                          const TypeBindingMap &bindings,
-                          bool eraseUnbound = false);
-
-bool bindExpectedType(const AlgorithmM &types, mlir::Type expected,
-                      mlir::Type actual, TypeBindingMap &bindings);
-
-std::optional<py::CallableType>
-expandParamSpecForInvocation(const AlgorithmM &types, py::CallableType callable,
-                             mlir::ArrayRef<mlir::Type> positional,
-                             mlir::ArrayRef<CallKeywordType> keywords,
-                             TypeBindingMap &bindings,
-                             std::size_t firstParameter = 0);
-
-std::optional<std::string> paramSpecName(mlir::Type type) {
-  if (auto paramSpec = mlir::dyn_cast_if_present<py::ParamSpecType>(type))
-    return paramSpec.getName().str();
-  return std::nullopt;
-}
-
-std::optional<std::string> typeVarTupleName(mlir::Type type) {
-  if (auto typeVarTuple = mlir::dyn_cast_if_present<py::TypeVarTupleType>(type))
-    return typeVarTuple.getName().str();
-  return std::nullopt;
-}
-
-std::optional<std::string> unpackedTypeVarTupleName(mlir::Type type) {
-  auto unpack = mlir::dyn_cast_if_present<py::UnpackType>(type);
-  if (!unpack)
-    return std::nullopt;
-  return typeVarTupleName(unpack.getPackedType());
-}
-
-llvm::ArrayRef<mlir::Type> typeVarTupleElements(mlir::Type type) {
-  if (auto pack = mlir::dyn_cast_if_present<py::CallableType>(type))
-    return pack.getPositionalTypes();
-  if (auto tuple = mlir::dyn_cast_if_present<py::ContractType>(type))
-    if (tuple.getContractName() == "builtins.tuple")
-      return tuple.getArguments();
-  return {};
-}
-
-bool sameKeywords(mlir::ArrayRef<CallKeywordType> lhs,
-                  mlir::ArrayRef<CallKeywordType> rhs) {
-  if (lhs.size() != rhs.size())
-    return false;
-  for (auto [left, right] : llvm::zip(lhs, rhs))
-    if (left.name != right.name || left.type != right.type)
-      return false;
-  return true;
-}
-
-void collectExplicitKeywordFormalNames(
-    py::CallableType callable, std::size_t firstParameter,
-    std::optional<std::size_t> paramSpecIndex, llvm::StringSet<> &names) {
-  llvm::ArrayRef<mlir::StringAttr> positionalNames =
-      callable.getPositionalNames();
-  for (auto [index, name] : llvm::enumerate(positionalNames)) {
-    if (!name || index < firstParameter ||
-        (paramSpecIndex && index == *paramSpecIndex) ||
-        index >= callable.getPositionalTypes().size() ||
-        index < callable.getPositionalOnlyCount())
-      continue;
-    names.insert(name.getValue());
-  }
-
-  for (mlir::StringAttr name : callable.getKwOnlyNames())
-    if (name)
-      names.insert(name.getValue());
-}
-
-llvm::SmallVector<CallKeywordType, 4>
-captureParamSpecKeywords(py::CallableType callable, std::size_t firstParameter,
-                         std::optional<std::size_t> paramSpecIndex,
-                         mlir::ArrayRef<CallKeywordType> keywords) {
-  llvm::StringSet<> explicitNames;
-  collectExplicitKeywordFormalNames(callable, firstParameter, paramSpecIndex,
-                                    explicitNames);
-
-  llvm::SmallVector<CallKeywordType, 4> captured;
-  captured.reserve(keywords.size());
-  for (const CallKeywordType &keyword : keywords) {
-    if (!keyword.name.empty() && explicitNames.contains(keyword.name))
-      continue;
-    captured.push_back(keyword);
-  }
-  return captured;
-}
-
-py::CallableType makeParamSpecPack(mlir::MLIRContext *context,
-                                   mlir::ArrayRef<mlir::Type> positional,
-                                   mlir::ArrayRef<CallKeywordType> keywords) {
-  llvm::SmallVector<mlir::Type, 4> kwonly;
-  llvm::SmallVector<mlir::StringAttr, 4> kwonlyNames;
-  kwonly.reserve(keywords.size());
-  kwonlyNames.reserve(keywords.size());
-  for (const CallKeywordType &keyword : keywords) {
-    kwonly.push_back(keyword.type);
-    kwonlyNames.push_back(mlir::StringAttr::get(context, keyword.name));
-  }
-  return py::CallableType::get(context, positional, kwonly, {}, {}, {}, {},
-                               kwonlyNames, {}, {});
-}
-
-std::optional<llvm::SmallVector<CallKeywordType, 4>>
-paramSpecPackKeywords(py::CallableType pack) {
-  llvm::SmallVector<CallKeywordType, 4> keywords;
-  llvm::ArrayRef<mlir::StringAttr> names = pack.getKwOnlyNames();
-  for (auto [index, kwType] : llvm::enumerate(pack.getKwOnlyTypes())) {
-    if (index >= names.size())
-      return std::nullopt;
-    keywords.push_back(CallKeywordType{names[index].getValue().str(), kwType});
-  }
-  return keywords;
-}
-
-bool bindParamSpecPack(const AlgorithmM &types, llvm::StringRef name,
-                       mlir::ArrayRef<mlir::Type> positional,
-                       mlir::ArrayRef<CallKeywordType> keywords,
-                       TypeBindingMap &bindings, bool merge = false) {
-  py::CallableType pack =
-      makeParamSpecPack(&types.getContext(), positional, keywords);
-  auto found = bindings.find(name.str());
-  if (found == bindings.end()) {
-    bindings[name.str()] = pack;
-    return true;
-  }
-  auto existing = mlir::dyn_cast_if_present<py::CallableType>(found->second);
-  if (!existing)
-    return false;
-  std::optional<llvm::SmallVector<CallKeywordType, 4>> existingKeywords =
-      paramSpecPackKeywords(existing);
-  if (!existingKeywords)
-    return false;
-  if (!merge) {
-    return existing.getPositionalTypes() == positional &&
-           sameKeywords(*existingKeywords, keywords);
-  }
-
-  llvm::ArrayRef<mlir::Type> existingPositionals =
-      existing.getPositionalTypes();
-  llvm::SmallVector<mlir::Type, 4> mergedPositionals;
-  if (!existingPositionals.empty() && !positional.empty() &&
-      existingPositionals != positional)
-    return false;
-  llvm::ArrayRef<mlir::Type> selectedPositionals =
-      !positional.empty() ? positional : existingPositionals;
-  mergedPositionals.append(selectedPositionals.begin(),
-                           selectedPositionals.end());
-
-  llvm::SmallVector<CallKeywordType, 4> mergedKeywords;
-  if (!existingKeywords->empty() && !keywords.empty() &&
-      !sameKeywords(*existingKeywords, keywords))
-    return false;
-  llvm::ArrayRef<CallKeywordType> selectedKeywords =
-      !keywords.empty() ? keywords : *existingKeywords;
-  mergedKeywords.append(selectedKeywords.begin(), selectedKeywords.end());
-
-  found->second =
-      makeParamSpecPack(&types.getContext(), mergedPositionals, mergedKeywords);
-  return true;
-}
-
-bool bindTypeVarTuplePack(const AlgorithmM &types, llvm::StringRef name,
-                          mlir::ArrayRef<mlir::Type> positional,
-                          TypeBindingMap &bindings) {
-  if (positional.size() == 1)
-    if (std::optional<std::string> forwarded =
-            unpackedTypeVarTupleName(positional.front()))
-      if (*forwarded == name)
-        return true;
-  mlir::Type pack =
-      py::CallableType::get(&types.getContext(), positional, {}, {}, {}, {});
-  auto found = bindings.find(name.str());
-  if (found == bindings.end()) {
-    bindings[name.str()] = pack;
-    return true;
-  }
-  return found->second == pack;
-}
-
-bool bindTypeParameter(const AlgorithmM &types, llvm::StringRef name,
-                       mlir::Type actual, TypeBindingMap &bindings) {
-  actual = types.widenLiteral(actual);
-  if (!actual)
-    return false;
-  auto found = bindings.find(name.str());
-  if (found == bindings.end()) {
-    bindings[name.str()] = actual;
-    return true;
-  }
-  if (std::optional<std::string> existing = staticParameterName(found->second))
-    if (*existing == name) {
-      found->second = actual;
-      return true;
-    }
-  if (typeAccepts(types, found->second, actual))
-    return true;
-  if (typeAccepts(types, actual, found->second)) {
-    found->second = actual;
-    return true;
-  }
-  return false;
-}
-
-bool bindTypeList(const AlgorithmM &types, mlir::ArrayRef<mlir::Type> expected,
-                  mlir::ArrayRef<mlir::Type> actual, TypeBindingMap &bindings) {
-  if (expected.size() != actual.size())
-    return false;
-  for (auto [expectedType, actualType] : llvm::zip(expected, actual))
-    if (!bindExpectedType(types, expectedType, actualType, bindings))
-      return false;
-  return true;
-}
-
-bool bindUnionMember(const AlgorithmM &types, py::UnionType expected,
-                     mlir::Type actual, TypeBindingMap &bindings) {
-  for (mlir::Type member : expected.getMemberTypes()) {
-    TypeBindingMap candidate = bindings;
-    if (bindExpectedType(types, member, actual, candidate)) {
-      bindings = std::move(candidate);
-      return true;
-    }
-  }
-  return false;
-}
-
-bool bindProtocolView(const AlgorithmM &types, py::ProtocolType expected,
-                      mlir::Type actual, TypeBindingMap &bindings) {
-  const py::protocols::Table &table =
-      py::protocols::Table::get(types.getContext());
-  llvm::ArrayRef<mlir::Type> expectedArgs = expected.getArguments();
-  if (auto actualProtocol = mlir::dyn_cast_if_present<py::ProtocolType>(actual))
-    if (actualProtocol.getProtocolName() == expected.getProtocolName())
-      return expectedArgs.empty() ||
-             bindTypeList(types, expectedArgs, actualProtocol.getArguments(),
-                          bindings);
-
-  std::optional<std::vector<mlir::Type>> actualArgs =
-      table.protocolArgumentsFor(actual, expected.getProtocolName());
-  if (!actualArgs)
-    return typeAccepts(types, expected, actual);
-  if (expectedArgs.empty())
-    return true;
-  return bindTypeList(types, expectedArgs, *actualArgs, bindings);
-}
-
-bool bindContractView(const AlgorithmM &types, py::ContractType expected,
-                      mlir::Type actual, TypeBindingMap &bindings) {
-  if (auto actualContract = mlir::dyn_cast_if_present<py::ContractType>(actual))
-    if (actualContract.getContractName() == expected.getContractName())
-      return expected.getArguments().empty() ||
-             bindTypeList(types, expected.getArguments(),
-                          actualContract.getArguments(), bindings);
-
-  if (structuralProtocolAccepts(types, expected, actual))
-    return true;
-  return typeAccepts(types, expected, actual);
-}
-
-bool bindCallableView(const AlgorithmM &types, py::CallableType expected,
-                      py::CallableType actual, TypeBindingMap &bindings) {
-  llvm::SmallVector<CallKeywordType, 4> actualKeywords;
-  llvm::ArrayRef<mlir::StringAttr> actualKwNames = actual.getKwOnlyNames();
-  for (auto [index, type] : llvm::enumerate(actual.getKwOnlyTypes())) {
-    std::string name;
-    if (index < actualKwNames.size() && actualKwNames[index])
-      name = actualKwNames[index].getValue().str();
-    actualKeywords.push_back(CallKeywordType{std::move(name), type});
-  }
-
-  TypeBindingMap candidateBindings = bindings;
-  std::optional<py::CallableType> expandedExpected =
-      expandParamSpecForInvocation(types, expected, actual.getPositionalTypes(),
-                                   actualKeywords, candidateBindings);
-  if (!expandedExpected)
-    return typeAccepts(types, expected, actual);
-  expected = *expandedExpected;
-
-  if (expected.getPositionalTypes().size() !=
-          actual.getPositionalTypes().size() ||
-      expected.getKwOnlyTypes().size() != actual.getKwOnlyTypes().size() ||
-      expected.getResultTypes().size() != actual.getResultTypes().size())
-    return typeAccepts(types, expected, actual);
-
-  for (auto [expectedArg, actualArg] :
-       llvm::zip(expected.getPositionalTypes(), actual.getPositionalTypes()))
-    if (!bindExpectedType(types, expectedArg, actualArg, candidateBindings))
-      return false;
-  for (auto [expectedArg, actualArg] :
-       llvm::zip(expected.getKwOnlyTypes(), actual.getKwOnlyTypes()))
-    if (!bindExpectedType(types, expectedArg, actualArg, candidateBindings))
-      return false;
-  for (auto [expectedResult, actualResult] :
-       llvm::zip(expected.getResultTypes(), actual.getResultTypes()))
-    if (!bindExpectedType(types, expectedResult, actualResult,
-                          candidateBindings))
-      return false;
-  bindings = std::move(candidateBindings);
-  return true;
-}
-
-bool bindExpectedType(const AlgorithmM &types, mlir::Type expected,
-                      mlir::Type actual, TypeBindingMap &bindings) {
-  expected = substituteType(types, expected, bindings);
-  actual = types.widenLiteral(actual);
-
-  if (!expected || !actual)
-    return true;
-  if (std::optional<std::string> name = staticParameterName(expected))
-    return bindTypeParameter(types, *name, actual, bindings);
-  if (expected == actual)
-    return true;
-  if (isObjectTop(types, expected) || isObjectTop(types, actual))
-    return true;
-
-  if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(expected))
-    return bindUnionMember(types, unionType, actual, bindings);
-  if (auto expectedType = mlir::dyn_cast_if_present<py::TypeType>(expected)) {
-    if (auto actualType = mlir::dyn_cast_if_present<py::TypeType>(actual))
-      return bindExpectedType(types, expectedType.getInstanceType(),
-                              actualType.getInstanceType(), bindings);
-  }
-  if (auto expectedProtocol =
-          mlir::dyn_cast_if_present<py::ProtocolType>(expected))
-    return bindProtocolView(types, expectedProtocol, actual, bindings);
-  if (auto expectedContract =
-          mlir::dyn_cast_if_present<py::ContractType>(expected))
-    return bindContractView(types, expectedContract, actual, bindings);
-  if (auto expectedCallable =
-          mlir::dyn_cast_if_present<py::CallableType>(expected))
-    if (auto actualCallable =
-            mlir::dyn_cast_if_present<py::CallableType>(actual))
-      return bindCallableView(types, expectedCallable, actualCallable,
-                              bindings);
-
-  return typeAccepts(types, expected, actual);
-}
-
-py::CallableType substituteCallable(const AlgorithmM &types,
-                                    py::CallableType callable,
-                                    const TypeBindingMap &bindings,
-                                    bool eraseUnbound) {
-  if (!callable)
-    return {};
-
-  auto boundParamSpecPack = [&](llvm::StringRef name) -> py::CallableType {
-    auto found = bindings.find(name.str());
-    if (found == bindings.end())
-      return {};
-    return mlir::dyn_cast_if_present<py::CallableType>(found->second);
-  };
-  auto boundTypeVarTuplePack =
-      [&](llvm::StringRef name) -> std::optional<llvm::ArrayRef<mlir::Type>> {
-    auto found = bindings.find(name.str());
-    if (found == bindings.end())
-      return std::nullopt;
-    return typeVarTupleElements(found->second);
-  };
-
-  llvm::SmallVector<mlir::Type, 8> positional;
-  llvm::SmallVector<mlir::StringAttr, 8> positionalNames;
-  llvm::SmallVector<mlir::BoolAttr, 8> positionalDefaults;
-  bool hasPositionalNames = !callable.getPositionalNames().empty();
-  bool hasPositionalDefaults = !callable.getPositionalDefaults().empty();
-  for (auto [index, arg] : llvm::enumerate(callable.getPositionalTypes())) {
-    if (std::optional<std::string> name = paramSpecName(arg)) {
-      py::CallableType pack = boundParamSpecPack(*name);
-      if (pack) {
-        for (mlir::Type packArg : pack.getPositionalTypes()) {
-          positional.push_back(
-              substituteType(types, packArg, bindings, eraseUnbound));
-          if (hasPositionalNames)
-            positionalNames.push_back(mlir::StringAttr());
-          if (hasPositionalDefaults)
-            positionalDefaults.push_back(
-                mlir::BoolAttr::get(callable.getContext(), false));
-        }
-        continue;
-      }
-    }
-    if (std::optional<std::string> name = unpackedTypeVarTupleName(arg)) {
-      std::optional<llvm::ArrayRef<mlir::Type>> pack =
-          boundTypeVarTuplePack(*name);
-      if (pack) {
-        for (mlir::Type packArg : *pack) {
-          positional.push_back(
-              substituteType(types, packArg, bindings, eraseUnbound));
-          if (hasPositionalNames)
-            positionalNames.push_back(mlir::StringAttr());
-          if (hasPositionalDefaults)
-            positionalDefaults.push_back(
-                mlir::BoolAttr::get(callable.getContext(), false));
-        }
-        continue;
-      }
-    }
-    positional.push_back(substituteType(types, arg, bindings, eraseUnbound));
-    if (hasPositionalNames) {
-      llvm::ArrayRef<mlir::StringAttr> names = callable.getPositionalNames();
-      positionalNames.push_back(index < names.size() ? names[index]
-                                                     : mlir::StringAttr());
-    }
-    if (hasPositionalDefaults) {
-      llvm::ArrayRef<mlir::BoolAttr> defaults =
-          callable.getPositionalDefaults();
-      positionalDefaults.push_back(
-          index < defaults.size()
-              ? defaults[index]
-              : mlir::BoolAttr::get(callable.getContext(), false));
-    }
-  }
-
-  mlir::Type vararg;
-  if (callable.hasVararg()) {
-    mlir::Type varargType = callable.getVarargType();
-    std::optional<std::string> name = paramSpecName(varargType);
-    py::CallableType pack =
-        name ? boundParamSpecPack(*name) : py::CallableType();
-    if (pack) {
-      for (mlir::Type packArg : pack.getPositionalTypes()) {
-        positional.push_back(
-            substituteType(types, packArg, bindings, eraseUnbound));
-        if (hasPositionalNames)
-          positionalNames.push_back(mlir::StringAttr());
-        if (hasPositionalDefaults)
-          positionalDefaults.push_back(
-              mlir::BoolAttr::get(callable.getContext(), false));
-      }
-    } else if (std::optional<std::string> tupleName =
-                   unpackedTypeVarTupleName(varargType)) {
-      std::optional<llvm::ArrayRef<mlir::Type>> tuplePack =
-          boundTypeVarTuplePack(*tupleName);
-      if (tuplePack) {
-        for (mlir::Type packArg : *tuplePack) {
-          positional.push_back(
-              substituteType(types, packArg, bindings, eraseUnbound));
-          if (hasPositionalNames)
-            positionalNames.push_back(mlir::StringAttr());
-          if (hasPositionalDefaults)
-            positionalDefaults.push_back(
-                mlir::BoolAttr::get(callable.getContext(), false));
-        }
-      } else {
-        vararg = substituteType(types, varargType, bindings, eraseUnbound);
-      }
-    } else {
-      vararg = substituteType(types, varargType, bindings, eraseUnbound);
-    }
-  }
-
-  llvm::SmallVector<mlir::Type, 4> kwonly;
-  llvm::SmallVector<mlir::StringAttr, 4> kwonlyNames;
-  llvm::SmallVector<mlir::BoolAttr, 4> kwonlyDefaults;
-  for (mlir::Type arg : callable.getKwOnlyTypes())
-    kwonly.push_back(substituteType(types, arg, bindings, eraseUnbound));
-  kwonlyNames.append(callable.getKwOnlyNames().begin(),
-                     callable.getKwOnlyNames().end());
-  kwonlyDefaults.append(callable.getKwOnlyDefaults().begin(),
-                        callable.getKwOnlyDefaults().end());
-
-  llvm::StringSet<> expandedKeywordParamSpecs;
-  auto appendParamSpecKeywords = [&](llvm::StringRef name) {
-    if (!expandedKeywordParamSpecs.insert(name).second)
-      return;
-    py::CallableType pack = boundParamSpecPack(name);
-    if (!pack)
-      return;
-    if (!pack.getKwOnlyTypes().empty() && kwonlyNames.empty() &&
-        !kwonly.empty()) {
-      for (std::size_t index = 0, end = kwonly.size(); index < end; ++index)
-        kwonlyNames.push_back(mlir::StringAttr());
-    }
-    if (!pack.getKwOnlyTypes().empty() && kwonlyDefaults.empty() &&
-        !kwonly.empty()) {
-      for (std::size_t index = 0, end = kwonly.size(); index < end; ++index)
-        kwonlyDefaults.push_back(
-            mlir::BoolAttr::get(callable.getContext(), false));
-    }
-    for (auto [index, kwType] : llvm::enumerate(pack.getKwOnlyTypes())) {
-      kwonly.push_back(substituteType(types, kwType, bindings, eraseUnbound));
-      llvm::ArrayRef<mlir::StringAttr> names = pack.getKwOnlyNames();
-      kwonlyNames.push_back(index < names.size() ? names[index]
-                                                 : mlir::StringAttr());
-      kwonlyDefaults.push_back(
-          mlir::BoolAttr::get(callable.getContext(), false));
-    }
-  };
-
-  for (mlir::Type arg : callable.getPositionalTypes())
-    if (std::optional<std::string> name = paramSpecName(arg))
-      appendParamSpecKeywords(*name);
-  if (callable.hasVararg())
-    if (std::optional<std::string> name =
-            paramSpecName(callable.getVarargType()))
-      appendParamSpecKeywords(*name);
-  if (callable.hasKwarg())
-    if (std::optional<std::string> name =
-            paramSpecName(callable.getKwargType()))
-      appendParamSpecKeywords(*name);
-
-  llvm::SmallVector<mlir::Type, 1> results;
-  for (mlir::Type result : callable.getResultTypes())
-    results.push_back(substituteType(types, result, bindings, eraseUnbound));
-
-  mlir::Type kwarg;
-  if (callable.hasKwarg()) {
-    mlir::Type kwargType = callable.getKwargType();
-    std::optional<std::string> name = paramSpecName(kwargType);
-    if (!name || !boundParamSpecPack(*name))
-      kwarg = substituteType(types, kwargType, bindings, eraseUnbound);
-  }
-
-  return py::CallableType::get(
-      callable.getContext(), positional, kwonly, vararg, kwarg, results,
-      positionalNames, kwonlyNames, positionalDefaults, kwonlyDefaults,
-      vararg ? callable.getVarargName() : mlir::StringAttr(),
-      kwarg ? callable.getKwargName() : mlir::StringAttr(),
-      callable.getPositionalOnlyCount());
-}
-
-mlir::Type substituteType(const AlgorithmM &types, mlir::Type type,
-                          const TypeBindingMap &bindings, bool eraseUnbound) {
-  if (!type)
-    return type;
-  if (std::optional<std::string> name = staticParameterName(type)) {
-    auto found = bindings.find(*name);
-    if (found != bindings.end())
-      return found->second;
-    // An unbound type parameter with eraseUnbound set becomes an `object` top
-    // (e.g. an unspecialized generic call result or storage crossing). This is
-    // not an invalid-operation fallback: the erased top carries no protocol
-    // contract, so any later observation of the value requires fresh evidence
-    // it cannot obtain and is rejected at the static boundary rather than
-    // silently dispatched.
-    return eraseUnbound ? types.object() : type;
-  }
-  if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(type)) {
-    llvm::SmallVector<mlir::Type, 4> args;
-    for (mlir::Type arg : contract.getArguments())
-      args.push_back(substituteType(types, arg, bindings, eraseUnbound));
-    return py::ContractType::get(type.getContext(), contract.getContractName(),
-                                 args);
-  }
-  if (auto protocol = mlir::dyn_cast_if_present<py::ProtocolType>(type)) {
-    llvm::SmallVector<mlir::Type, 4> args;
-    for (mlir::Type arg : protocol.getArguments())
-      args.push_back(substituteType(types, arg, bindings, eraseUnbound));
-    return py::ProtocolType::get(type.getContext(), protocol.getProtocolName(),
-                                 args);
-  }
-  if (auto typeType = mlir::dyn_cast_if_present<py::TypeType>(type)) {
-    mlir::Type instance = substituteType(types, typeType.getInstanceType(),
-                                         bindings, eraseUnbound);
-    return instance ? py::TypeType::get(type.getContext(), instance)
-                    : mlir::Type();
-  }
-  if (auto unpack = mlir::dyn_cast_if_present<py::UnpackType>(type)) {
-    mlir::Type packed =
-        substituteType(types, unpack.getPackedType(), bindings, eraseUnbound);
-    return packed ? py::UnpackType::get(type.getContext(), packed)
-                  : mlir::Type();
-  }
-  if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(type)) {
-    llvm::SmallVector<mlir::Type, 4> members;
-    for (mlir::Type member : unionType.getMemberTypes())
-      members.push_back(substituteType(types, member, bindings, eraseUnbound));
-    return py::UnionType::getNormalized(type.getContext(), members);
-  }
-  if (auto callable = mlir::dyn_cast_if_present<py::CallableType>(type))
-    return substituteCallable(types, callable, bindings, eraseUnbound);
-  if (auto overload = mlir::dyn_cast_if_present<py::OverloadType>(type)) {
-    llvm::SmallVector<mlir::Type, 4> candidates;
-    for (mlir::Type candidate : overload.getCandidateTypes())
-      candidates.push_back(
-          substituteType(types, candidate, bindings, eraseUnbound));
-    return py::OverloadType::get(type.getContext(), candidates);
-  }
-  return type;
-}
-
-mlir::Type callableResultType(const AlgorithmM &types,
-                              py::CallableType callable,
-                              const TypeBindingMap &bindings) {
-  llvm::ArrayRef<mlir::Type> results = callable.getResultTypes();
-  if (results.size() == 1)
-    return substituteType(types, results.front(), bindings,
-                          /*eraseUnbound=*/true);
-  if (!results.empty()) {
-    llvm::SmallVector<mlir::Type, 4> substituted;
-    for (mlir::Type result : results)
-      substituted.push_back(
-          substituteType(types, result, bindings, /*eraseUnbound=*/true));
-    return types.tupleOf(types.join(substituted));
-  }
-  return mlir::Type();
-}
-
-std::optional<py::CallableType>
-expandParamSpecForInvocation(const AlgorithmM &types, py::CallableType callable,
-                             mlir::ArrayRef<mlir::Type> positional,
-                             mlir::ArrayRef<CallKeywordType> keywords,
-                             TypeBindingMap &bindings,
-                             std::size_t firstParameter) {
-  llvm::ArrayRef<mlir::Type> formals = callable.getPositionalTypes();
-  std::optional<std::size_t> paramSpecIndex;
-  std::optional<std::size_t> typeVarTupleIndex;
-  for (std::size_t index = firstParameter, end = formals.size(); index < end;
-       ++index) {
-    bool isParamSpec = static_cast<bool>(paramSpecName(formals[index]));
-    bool isTypeVarTuple =
-        static_cast<bool>(unpackedTypeVarTupleName(formals[index]));
-    if (!isParamSpec && !isTypeVarTuple)
-      continue;
-    if (isParamSpec && (paramSpecIndex || typeVarTupleIndex))
-      return std::nullopt;
-    if (isTypeVarTuple && (paramSpecIndex || typeVarTupleIndex))
-      return std::nullopt;
-    if (isParamSpec)
-      paramSpecIndex = index;
-    else
-      typeVarTupleIndex = index;
-  }
-
-  if (paramSpecIndex) {
-    std::size_t visibleBefore = *paramSpecIndex - firstParameter;
-    std::size_t trailing = formals.size() - *paramSpecIndex - 1;
-    if (positional.size() < visibleBefore + trailing)
-      return std::nullopt;
-
-    std::size_t capturedCount = positional.size() - visibleBefore - trailing;
-    llvm::ArrayRef<mlir::Type> captured =
-        positional.slice(visibleBefore, capturedCount);
-    std::optional<std::string> name = paramSpecName(formals[*paramSpecIndex]);
-    llvm::SmallVector<CallKeywordType, 4> capturedKeywords =
-        captureParamSpecKeywords(callable, firstParameter, paramSpecIndex,
-                                 keywords);
-    if (!name ||
-        !bindParamSpecPack(types, *name, captured, capturedKeywords, bindings))
-      return std::nullopt;
-  } else if (typeVarTupleIndex) {
-    std::size_t visibleBefore = *typeVarTupleIndex - firstParameter;
-    std::size_t trailing = formals.size() - *typeVarTupleIndex - 1;
-    if (positional.size() < visibleBefore + trailing)
-      return std::nullopt;
-
-    std::size_t capturedCount = positional.size() - visibleBefore - trailing;
-    llvm::ArrayRef<mlir::Type> captured =
-        positional.slice(visibleBefore, capturedCount);
-    std::optional<std::string> name =
-        unpackedTypeVarTupleName(formals[*typeVarTupleIndex]);
-    if (!name || !bindTypeVarTuplePack(types, *name, captured, bindings))
-      return std::nullopt;
-  } else if (callable.hasVararg()) {
-    if (std::optional<std::string> name =
-            paramSpecName(callable.getVarargType())) {
-      std::size_t fixedVisible = formals.size() - firstParameter;
-      llvm::ArrayRef<mlir::Type> captured;
-      if (positional.size() > fixedVisible)
-        captured = positional.drop_front(fixedVisible);
-      if (!bindParamSpecPack(types, *name, captured, {}, bindings,
-                             /*merge=*/true))
-        return std::nullopt;
-    } else if (std::optional<std::string> tupleName =
-                   unpackedTypeVarTupleName(callable.getVarargType())) {
-      std::size_t fixedVisible = formals.size() - firstParameter;
-      llvm::ArrayRef<mlir::Type> captured;
-      if (positional.size() > fixedVisible)
-        captured = positional.drop_front(fixedVisible);
-      if (!bindTypeVarTuplePack(types, *tupleName, captured, bindings))
-        return std::nullopt;
-    }
-  }
-
-  if (callable.hasKwarg()) {
-    if (std::optional<std::string> name =
-            paramSpecName(callable.getKwargType())) {
-      llvm::SmallVector<CallKeywordType, 4> capturedKeywords =
-          captureParamSpecKeywords(callable, firstParameter, paramSpecIndex,
-                                   keywords);
-      if (!bindParamSpecPack(types, *name, {}, capturedKeywords, bindings,
-                             /*merge=*/true))
-        return std::nullopt;
-    }
-  }
-
-  return substituteCallable(types, callable, bindings,
-                            /*eraseUnbound=*/false);
-}
-
-int unboundStaticParameterCount(mlir::Type type) {
-  if (!type)
-    return 0;
-  if (staticParameterName(type))
-    return 1;
-  if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(type)) {
-    int count = 0;
-    for (mlir::Type arg : contract.getArguments())
-      count += unboundStaticParameterCount(arg);
-    return count;
-  }
-  if (auto protocol = mlir::dyn_cast_if_present<py::ProtocolType>(type)) {
-    int count = 0;
-    for (mlir::Type arg : protocol.getArguments())
-      count += unboundStaticParameterCount(arg);
-    return count;
-  }
-  if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(type)) {
-    int count = 0;
-    for (mlir::Type member : unionType.getMemberTypes())
-      count += unboundStaticParameterCount(member);
-    return count;
-  }
-  if (auto typeType = mlir::dyn_cast_if_present<py::TypeType>(type))
-    return unboundStaticParameterCount(typeType.getInstanceType());
-  if (auto unpack = mlir::dyn_cast_if_present<py::UnpackType>(type))
-    return unboundStaticParameterCount(unpack.getPackedType());
-  if (auto callable = mlir::dyn_cast_if_present<py::CallableType>(type)) {
-    int count = 0;
-    for (mlir::Type arg : callable.getPositionalTypes())
-      count += unboundStaticParameterCount(arg);
-    for (mlir::Type arg : callable.getKwOnlyTypes())
-      count += unboundStaticParameterCount(arg);
-    for (mlir::Type result : callable.getResultTypes())
-      count += unboundStaticParameterCount(result);
-    if (callable.hasVararg())
-      count += unboundStaticParameterCount(callable.getVarargType());
-    if (callable.hasKwarg())
-      count += unboundStaticParameterCount(callable.getKwargType());
-    return count;
-  }
-  return 0;
-}
-
-int matchSpecificity(const AlgorithmM &types, mlir::Type expected,
-                     mlir::Type actual) {
-  expected = types.widenLiteral(expected);
-  actual = types.widenLiteral(actual);
-  if (!expected || !actual)
-    return 0;
-  if (expected == actual)
-    return 12;
-  if (isObjectTop(types, expected))
-    return 0;
-  if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(expected)) {
-    int best = 0;
-    for (mlir::Type member : unionType.getMemberTypes())
-      best = std::max(best, matchSpecificity(types, member, actual));
-    return best > 0 ? best - 1 : 0;
-  }
-  if (typeAccepts(types, expected, actual))
-    return 4;
-  return 0;
-}
-
-int callableSpecificity(const AlgorithmM &types, py::CallableType callable,
-                        std::size_t firstParameter) {
-  if (!callable)
-    return 0;
-  int score = 0;
-  llvm::ArrayRef<mlir::Type> positional = callable.getPositionalTypes();
-  for (std::size_t index = firstParameter, end = positional.size(); index < end;
-       ++index) {
-    if (!isObjectTop(types, positional[index]))
-      score += 2;
-    score -= 4 * unboundStaticParameterCount(positional[index]);
-  }
-  for (mlir::Type arg : callable.getKwOnlyTypes()) {
-    if (!isObjectTop(types, arg))
-      score += 2;
-    score -= 4 * unboundStaticParameterCount(arg);
-  }
-  for (mlir::Type result : callable.getResultTypes()) {
-    if (!isObjectTop(types, result))
-      score += 3;
-    score -= 8 * unboundStaticParameterCount(result);
-  }
-  if (!callable.hasVararg())
-    score += 2;
-  if (!callable.hasKwarg())
-    score += 2;
-  return score;
-}
-
-std::optional<CallSolution>
-tryCallableApplication(const AlgorithmM &types, py::CallableType callable,
-                       mlir::ArrayRef<mlir::Type> positional,
-                       mlir::ArrayRef<CallKeywordType> keywords,
-                       TypeBindingMap bindings = {},
-                       std::size_t firstParameter = 0) {
-  std::optional<py::CallableType> expanded = expandParamSpecForInvocation(
-      types, callable, positional, keywords, bindings, firstParameter);
-  if (!expanded)
-    return std::nullopt;
-
-  py::CallableApplicationShapeOptions opts;
-  opts.firstParameter = firstParameter;
-  int specificity = callableSpecificity(types, *expanded, firstParameter);
-  auto resolved = py::resolveCallableApplicationShape(
-      *expanded, positional, keywords, opts,
-      [&](mlir::Type expected, mlir::Type actual) {
-        if (!bindExpectedType(types, expected, actual, bindings))
-          return false;
-        specificity += matchSpecificity(
-            types,
-            substituteType(types, expected, bindings, /*eraseUnbound=*/true),
-            actual);
-        return true;
-      },
-      [](const CallKeywordType &keyword) -> llvm::StringRef {
-        return keyword.name;
-      },
-      [](const CallKeywordType &keyword) { return keyword.type; });
-  if (!resolved)
-    return std::nullopt;
-  py::CallableType resolvedEvidence =
-      substituteCallable(types, *expanded, bindings, /*eraseUnbound=*/false);
-  if (!resolvedEvidence || unboundStaticParameterCount(resolvedEvidence) != 0)
-    return std::nullopt;
-  mlir::Type result = callableResultType(types, *expanded, bindings);
-  if (!result || unboundStaticParameterCount(result) != 0)
-    return std::nullopt;
-  return CallSolution{result,
-                      std::move(bindings),
-                      resolvedEvidence,
-                      {},
-                      std::nullopt,
-                      resolved->score + specificity};
-}
-
-bool sameCallSolution(const CallSolution &lhs, const CallSolution &rhs) {
-  return lhs.result == rhs.result &&
-         lhs.callableContract == rhs.callableContract &&
-         lhs.methodName == rhs.methodName &&
-         lhs.receiverManifestClass == rhs.receiverManifestClass;
-}
-
-std::optional<CallSolution> selectCallableApplication(
-    const AlgorithmM &types, llvm::ArrayRef<py::CallableType> candidates,
-    mlir::ArrayRef<mlir::Type> positional,
-    mlir::ArrayRef<CallKeywordType> keywords, TypeBindingMap bindings = {},
-    std::size_t firstParameter = 0) {
-  auto selection = lython::selection::bestCandidate<CallSolution>(
-      [](const CallSolution &solution) { return solution.score; },
-      sameCallSolution);
-  for (py::CallableType candidate : candidates) {
-    if (std::optional<CallSolution> solution = tryCallableApplication(
-            types, candidate, positional, keywords, bindings, firstParameter))
-      selection.consider(std::move(*solution));
-  }
-  return std::move(selection).finish();
-}
-
-std::optional<CallSolution>
-tryManifestMethod(const AlgorithmM &types, mlir::Type receiverType,
-                  llvm::StringRef methodName,
-                  mlir::ArrayRef<mlir::Type> positional,
-                  mlir::ArrayRef<CallKeywordType> keywords = {}) {
-  // Positional tuple typing: a tuple contract carrying one argument PER
-  // POSITION (heterogeneous annotations/literals, dict.items()'s
-  // tuple[$K,$V]) types a literal-index __getitem__ as that position's
-  // member. The homogeneous view (joined members) instantiates the manifest
-  // contract; only the RESULT narrows to the indexed member.
-  if (methodName == "__getitem__" && positional.size() == 1 &&
-      keywords.empty()) {
-    auto tuple = mlir::dyn_cast_if_present<py::ContractType>(
-        types.widenLiteral(receiverType));
-    if (tuple && tuple.getContractName() == "builtins.tuple" &&
-        tuple.getArguments().size() > 1) {
-      if (std::optional<std::int64_t> index =
-              literalIntegerFromType(positional.front())) {
-        llvm::ArrayRef<mlir::Type> members = tuple.getArguments();
-        std::int64_t position =
-            *index < 0 ? *index + static_cast<std::int64_t>(members.size())
-                       : *index;
-        if (position >= 0 &&
-            position < static_cast<std::int64_t>(members.size())) {
-          mlir::Type joinedView = types.tupleOf(types.join(members));
-          if (std::optional<CallSolution> solution = tryManifestMethod(
-                  types, joinedView, methodName, positional, keywords)) {
-            solution->result = members[position];
-            return solution;
-          }
-        }
-      }
-    }
-  }
-
-  const py::protocols::Table &table =
-      py::protocols::Table::get(types.getContext());
-  auto selection = lython::selection::bestCandidate<CallSolution>(
-      [](const CallSolution &solution) { return solution.score; },
-      sameCallSolution);
-
-  for (py::protocols::ContractResolution candidate :
-       table.methodContractCandidatesWithEvidence(receiverType, methodName)) {
-    py::CallableType signature = candidate.method.signature;
-    TypeBindingMap bindings = std::move(candidate.typeBindings);
-    if (signature.getPositionalTypes().empty())
-      continue;
-    if (!bindExpectedType(types, signature.getPositionalTypes().front(),
-                          receiverType, bindings))
-      continue;
-    std::optional<CallSolution> solution = tryCallableApplication(
-        types, signature, positional, keywords, std::move(bindings),
-        /*firstParameter=*/1);
-    if (!solution)
-      continue;
-    solution->score += candidate.score;
-    solution->methodName = methodName.str();
-    if (candidate.receiverEvidence)
-      solution->receiverManifestClass =
-          candidate.receiverEvidence->manifestClass;
-    selection.consider(std::move(*solution));
-  }
-  return std::move(selection).finish();
-}
-
-std::optional<mlir::Type> primitiveBinaryResultType(mlir::Type left,
-                                                    mlir::Type right,
-                                                    const parser::Node *op) {
-  if (!left || !right)
-    return std::nullopt;
-  if (ast::isOperator(op, "Add") || ast::isOperator(op, "Sub") ||
-      ast::isOperator(op, "Mult")) {
-    if (left == right && (mlir::isa<mlir::IntegerType, mlir::FloatType>(left) ||
-                          mlir::isa<mlir::RankedTensorType>(left)))
-      return left;
-  }
-  if (!ast::isOperator(op, "MatMult"))
-    return std::nullopt;
-
-  auto lhsTensor = mlir::dyn_cast<mlir::RankedTensorType>(left);
-  auto rhsTensor = mlir::dyn_cast<mlir::RankedTensorType>(right);
-  if (!lhsTensor || !rhsTensor || lhsTensor.getRank() != 2 ||
-      rhsTensor.getRank() != 2 ||
-      lhsTensor.getElementType() != rhsTensor.getElementType() ||
-      lhsTensor.getDimSize(1) != rhsTensor.getDimSize(0))
-    return std::nullopt;
-  llvm::SmallVector<std::int64_t, 2> shape{lhsTensor.getDimSize(0),
-                                           rhsTensor.getDimSize(1)};
-  return mlir::RankedTensorType::get(shape, lhsTensor.getElementType());
 }
 
 } // namespace
@@ -2900,8 +1584,42 @@ mlir::Type AlgorithmM::annotationType(const parser::Node *node) const {
 }
 
 mlir::Type AlgorithmM::inferExpr(const parser::Node *node) const {
+  return inferExprImpl(node, nullptr);
+}
+
+mlir::Type AlgorithmM::inferExpr(const parser::Node *node,
+                                 const ExprInferenceContext &ctx) const {
+  return inferExprImpl(node, &ctx);
+}
+
+// Lenient and strict inference share one walk. Without a context every
+// unresolved construct falls back to object(); with one (unannotated-body
+// return/generator inference) local callables shadow the symbol table and
+// failures propagate as a null type with a recorded reason.
+mlir::Type AlgorithmM::inferExprImpl(const parser::Node *node,
+                                     const ExprInferenceContext *ctx) const {
   if (!node)
     return object();
+  const bool strict = ctx && ctx->strict;
+  auto fail = [&](std::string reason) -> mlir::Type {
+    if (ctx)
+      recordInferenceFailure(ctx->failureReasons, std::move(reason));
+    return {};
+  };
+  auto recurse = [&](const parser::Node *child) {
+    return inferExprImpl(child, ctx);
+  };
+  // Lenient re-inference of a subexpression. The walk-bound locals stay
+  // visible (they used to live on the scope), but local callables and strict
+  // failure propagation do not — the historical lenient view.
+  auto lenientRecurse = [&](const parser::Node *child) -> mlir::Type {
+    if (!ctx)
+      return inferExprImpl(child, nullptr);
+    static const llvm::StringMap<mlir::Type> kNoCallables;
+    ExprInferenceContext lenient{kNoCallables, nullptr, ctx->localSymbols,
+                                 /*strict=*/false};
+    return inferExprImpl(child, &lenient);
+  };
   if (node->kind == "Constant") {
     if (ast::isNoneField(*node, "value"))
       return none();
@@ -2936,6 +1654,16 @@ mlir::Type AlgorithmM::inferExpr(const parser::Node *node) const {
   };
   if (node->kind == "Name") {
     llvm::StringRef name = ast::nameSpelling(*node);
+    if (ctx) {
+      auto found = ctx->localCallables.find(name);
+      if (found != ctx->localCallables.end())
+        return found->second;
+      if (ctx->localSymbols) {
+        auto local = ctx->localSymbols->find(name);
+        if (local != ctx->localSymbols->end())
+          return local->second;
+      }
+    }
     if (auto found = lookupSymbol(name))
       return *found;
     if (std::optional<mlir::Type> constant = staticStringLiteral(name))
@@ -2952,7 +1680,7 @@ mlir::Type AlgorithmM::inferExpr(const parser::Node *node) const {
       if (auto found = lookupSymbol(qualified))
         return *found;
     }
-    if (mlir::Type objectType = inferExpr(ast::node(*node, "value"))) {
+    if (mlir::Type objectType = lenientRecurse(ast::node(*node, "value"))) {
       const py::protocols::Table &table = py::protocols::Table::get(context);
       if (auto attr = ast::string(*node, "attr")) {
         if (std::optional<py::protocols::FieldResolution> field =
@@ -2966,32 +1694,66 @@ mlir::Type AlgorithmM::inferExpr(const parser::Node *node) const {
       return object();
     }
   }
-  if (node->kind == "List")
-    return listOf(joinedLiteralElementType(*this, *node, "elts"));
-  if (node->kind == "Tuple") {
-    llvm::SmallVector<mlir::Type, 8> memberTypes;
+  if (node->kind == "List" || node->kind == "Tuple") {
+    llvm::SmallVector<mlir::Type, 8> elementTypes;
     if (const auto *elements = ast::nodeList(*node, "elts")) {
-      memberTypes.reserve(elements->size());
-      for (const parser::NodePtr &element : *elements)
-        memberTypes.push_back(widenLiteral(inferExpr(element.get())));
+      elementTypes.reserve(elements->size());
+      for (const parser::NodePtr &element : *elements) {
+        mlir::Type elementType = recurse(element.get());
+        if (strict && !elementType)
+          return {};
+        elementTypes.push_back(widenLiteral(elementType));
+      }
     }
-    return tupleOfMembers(*this, memberTypes);
+    if (node->kind == "List")
+      return listOf(join(elementTypes));
+    // The strict path keeps the historical joined (homogeneous) tuple view;
+    // the lenient path types heterogeneous tuples positionally.
+    return strict ? tupleOf(join(elementTypes))
+                  : tupleOfMembers(*this, elementTypes);
   }
   if (node->kind == "Dict") {
-    std::optional<std::pair<mlir::Type, mlir::Type>> keyValueTypes =
-        joinedDictLiteralTypes(*this, *node);
-    if (!keyValueTypes)
+    const auto *keys = ast::nodeList(*node, "keys");
+    const auto *values = ast::nodeList(*node, "values");
+    if (!keys || !values)
       return dictOf(object(), object());
-    return dictOf(keyValueTypes->first, keyValueTypes->second);
+    llvm::SmallVector<mlir::Type, 8> keyTypes;
+    llvm::SmallVector<mlir::Type, 8> valueTypes;
+    keyTypes.reserve(keys->size());
+    valueTypes.reserve(values->size());
+    for (auto [index, key] : llvm::enumerate(*keys)) {
+      if (!key)
+        return dictOf(object(), object());
+      mlir::Type keyType = recurse(key.get());
+      if (strict && !keyType)
+        return {};
+      keyTypes.push_back(widenLiteral(keyType));
+      if (index < values->size()) {
+        mlir::Type valueType = recurse((*values)[index].get());
+        if (strict && !valueType)
+          return {};
+        valueTypes.push_back(widenLiteral(valueType));
+      }
+    }
+    return dictOf(join(keyTypes), join(valueTypes));
   }
   if (node->kind == "Subscript") {
     if (std::optional<PrimitiveTypeSpec> primitive =
             primitiveTypeSpecFromSubscript(node, *this))
       return typeObject(primitive->type);
-    mlir::Type container = widenLiteral(inferExpr(ast::node(*node, "value")));
-    mlir::Type index = inferExpr(ast::node(*node, "slice"));
-    if (std::optional<CallSolution> result =
-            tryManifestMethod(*this, container, "__getitem__", {index}))
+    mlir::Type container = recurse(ast::node(*node, "value"));
+    mlir::Type index = recurse(ast::node(*node, "slice"));
+    if (strict) {
+      if (!container || !index)
+        return {};
+      CallInferenceResult inference = inferMethodCallWithEvidence(
+          widenLiteral(container), "__getitem__", {index});
+      if (inference)
+        return inference.resultType;
+      return fail(inference.failureReason);
+    }
+    if (std::optional<CallSolution> result = tryManifestMethod(
+            *this, widenLiteral(container), "__getitem__", {index}))
       return result->result;
     return object();
   }
@@ -3002,11 +1764,13 @@ mlir::Type AlgorithmM::inferExpr(const parser::Node *node) const {
   if (node->kind == "IfExp")
     // Mirrors the emitter: literal arms widen to their contracts (CPython
     // types a ternary of two literals by the common class).
-    return join({widenLiteral(inferExpr(ast::node(*node, "body"))),
-                 widenLiteral(inferExpr(ast::node(*node, "orelse")))});
+    return join({widenLiteral(lenientRecurse(ast::node(*node, "body"))),
+                 widenLiteral(lenientRecurse(ast::node(*node, "orelse")))});
   if (node->kind == "UnaryOp") {
+    if (strict && !recurse(ast::node(*node, "operand")))
+      return {};
     const parser::Node *op = ast::node(*node, "op");
-    mlir::Type operand = inferExpr(ast::node(*node, "operand"));
+    mlir::Type operand = lenientRecurse(ast::node(*node, "operand"));
     if (ast::isOperator(op, "Not"))
       return boolType();
     if (ast::isOperator(op, "USub")) {
@@ -3033,9 +1797,15 @@ mlir::Type AlgorithmM::inferExpr(const parser::Node *node) const {
     return widenLiteral(operand);
   }
   if (node->kind == "BinOp") {
+    if (strict) {
+      if (!recurse(ast::node(*node, "left")))
+        return {};
+      if (!recurse(ast::node(*node, "right")))
+        return {};
+    }
     const parser::Node *op = ast::node(*node, "op");
-    mlir::Type rawLeft = inferExpr(ast::node(*node, "left"));
-    mlir::Type rawRight = inferExpr(ast::node(*node, "right"));
+    mlir::Type rawLeft = lenientRecurse(ast::node(*node, "left"));
+    mlir::Type rawRight = lenientRecurse(ast::node(*node, "right"));
     mlir::Type left = widenLiteral(rawLeft);
     mlir::Type right = widenLiteral(rawRight);
     llvm::StringRef method = "__add__";
@@ -3078,10 +1848,14 @@ mlir::Type AlgorithmM::inferExpr(const parser::Node *node) const {
     return join({left, right});
   }
   if (node->kind == "Await") {
-    mlir::Type awaitable = widenLiteral(inferExpr(ast::node(*node, "value")));
-    if (AwaitInferenceResult inference = inferAwaitWithEvidence(awaitable))
+    mlir::Type awaitable = recurse(ast::node(*node, "value"));
+    if (strict && !awaitable)
+      return {};
+    AwaitInferenceResult inference =
+        inferAwaitWithEvidence(widenLiteral(awaitable));
+    if (inference)
       return inference.resultType;
-    return object();
+    return strict ? fail(inference.failureReason) : object();
   }
   if (node->kind == "Call") {
     const parser::Node *callee = ast::node(*node, "func");
@@ -3093,12 +1867,19 @@ mlir::Type AlgorithmM::inferExpr(const parser::Node *node) const {
     if (const auto *args = ast::nodeList(*node, "args")) {
       for (const parser::NodePtr &arg : *args) {
         if (arg && arg->kind == "Starred") {
-          if (!appendStarredCallArgumentTypes(
-                  *this, inferExpr(ast::node(*arg, "value")), positional))
-            return object();
+          mlir::Type starredType = recurse(ast::node(*arg, "value"));
+          if (strict && !starredType)
+            return {};
+          if (!appendStarredCallArgumentTypes(*this, starredType, positional))
+            return strict ? fail("starred call arguments require a "
+                                 "statically sized tuple")
+                          : object();
           continue;
         }
-        positional.push_back(inferExpr(arg.get()));
+        mlir::Type argType = recurse(arg.get());
+        if (strict && !argType)
+          return {};
+        positional.push_back(argType);
       }
     }
 
@@ -3106,22 +1887,39 @@ mlir::Type AlgorithmM::inferExpr(const parser::Node *node) const {
     if (const auto *keywordNodes = ast::nodeList(*node, "keywords")) {
       for (const parser::NodePtr &keyword : *keywordNodes) {
         auto name = ast::string(*keyword, "arg");
-        if (!name)
+        if (!name) {
+          if (strict)
+            return fail(
+                "keyword splat call arguments require static keyword names");
           continue;
-        keywords.push_back(CallKeywordType{
-            std::string(*name), inferExpr(ast::node(*keyword, "value"))});
+        }
+        mlir::Type keywordType = recurse(ast::node(*keyword, "value"));
+        if (strict && !keywordType)
+          return {};
+        keywords.push_back(CallKeywordType{std::string(*name), keywordType});
       }
     }
 
     if (callee && callee->kind == "Name") {
       llvm::StringRef name = ast::nameSpelling(*callee);
+      if (ctx) {
+        auto found = ctx->localCallables.find(name);
+        if (found != ctx->localCallables.end()) {
+          CallInferenceResult inference =
+              inferCallWithEvidence(found->second, positional, keywords);
+          if (inference)
+            return inference.resultType;
+          return fail(inference.failureReason);
+        }
+      }
       if (name == "isinstance")
         return boolType();
       // open()'s return type depends on the MODE: a str literal containing
       // 'b' selects the binary arm statically (FileIO); everything else is
       // the text wrapper. A non-literal binary mode cannot type as FileIO
       // and is rejected at runtime by the text arm's mode parser.
-      if (lookupCanonicalBinding(name) == std::optional<std::string>("_io.open")) {
+      if (!strict && lookupCanonicalBinding(name) ==
+                         std::optional<std::string>("_io.open")) {
         if (const auto *args = ast::nodeList(*node, "args"))
           if (args->size() >= 2 && (*args)[1]) {
             auto mode = ast::string(*(*args)[1], "value");
@@ -3131,6 +1929,15 @@ mlir::Type AlgorithmM::inferExpr(const parser::Node *node) const {
         return contract("_io.TextIOWrapper");
       }
       if (name == "len") {
+        if (strict) {
+          if (positional.empty())
+            return fail("len expects one positional argument");
+          CallInferenceResult inference = inferMethodCallWithEvidence(
+              widenLiteral(positional.front()), "__len__", {});
+          if (inference)
+            return inference.resultType;
+          return fail(inference.failureReason);
+        }
         if (!positional.empty())
           if (std::optional<CallSolution> result = tryManifestMethod(
                   *this, widenLiteral(positional.front()), "__len__", {}))
@@ -3138,12 +1945,27 @@ mlir::Type AlgorithmM::inferExpr(const parser::Node *node) const {
         return object();
       }
       if (name == "round") {
+        if (strict) {
+          if (positional.empty())
+            return fail("round expects at least one positional argument");
+          llvm::SmallVector<mlir::Type, 1> extra;
+          if (positional.size() > 1)
+            extra.push_back(positional[1]);
+          mlir::Type input = widenLiteral(positional.front());
+          CallInferenceResult inference =
+              inferMethodCallWithEvidence(input, "__round__", extra);
+          if (inference)
+            return inference.resultType;
+          if (input == intType())
+            return intType();
+          return fail(inference.failureReason);
+        }
         const auto *args = ast::nodeList(*node, "args");
         if (args && !args->empty()) {
-          mlir::Type input = widenLiteral(inferExpr(args->front().get()));
+          mlir::Type input = widenLiteral(lenientRecurse(args->front().get()));
           llvm::SmallVector<mlir::Type, 1> extra;
           if (args->size() > 1)
-            extra.push_back(inferExpr((*args)[1].get()));
+            extra.push_back(lenientRecurse((*args)[1].get()));
           if (std::optional<CallSolution> result =
                   tryManifestMethod(*this, input, "__round__", extra))
             return result->result;
@@ -3154,42 +1976,97 @@ mlir::Type AlgorithmM::inferExpr(const parser::Node *node) const {
       }
       if (name == "range")
         return contract("builtins.range");
-      if (auto cls = lookupClass(name))
-        return inferClassInstantiation(*cls, positional, keywords);
+      if (auto cls = lookupClass(name)) {
+        mlir::Type instance = inferClassInstantiation(*cls, positional, keywords);
+        if (!strict || instance)
+          return instance;
+        return fail("class instantiation leaves unbound static type "
+                    "parameters for '" +
+                    name.str() + "'");
+      }
       if (std::optional<std::string> canonical = lookupCanonicalBinding(name)) {
         if (*canonical == "lyrt.from_prim" && positional.size() == 1 &&
-            keywords.empty())
-          return primitivePythonResultType(positional.front(), *this);
+            keywords.empty()) {
+          mlir::Type result = primitivePythonResultType(positional.front(), *this);
+          if (!strict || result)
+            return result;
+          return fail("lyrt.from_prim expects a primitive scalar or shaped "
+                      "primitive value");
+        }
         if (*canonical == "asyncio.sleep")
           return inferAsyncioSleepResult(*this, positional, keywords);
       }
-      if (auto symbol = lookupSymbol(name))
+      std::optional<mlir::Type> symbol;
+      if (ctx && ctx->localSymbols) {
+        auto local = ctx->localSymbols->find(name);
+        if (local != ctx->localSymbols->end())
+          symbol = local->second;
+      }
+      if (!symbol)
+        symbol = lookupSymbol(name);
+      if (symbol) {
+        if (strict) {
+          CallInferenceResult inference =
+              inferCallWithEvidence(*symbol, positional, keywords);
+          if (inference)
+            return inference.resultType;
+          return fail(inference.failureReason);
+        }
         return inferCall(*symbol, positional, keywords);
+      }
     }
     if (callee && callee->kind == "Attribute") {
       std::string qualified = ast::qualifiedName(callee);
       if (std::optional<std::string> canonical =
               lookupCanonicalBinding(qualified)) {
         if (*canonical == "lyrt.from_prim" && positional.size() == 1 &&
-            keywords.empty())
-          return primitivePythonResultType(positional.front(), *this);
+            keywords.empty()) {
+          mlir::Type result = primitivePythonResultType(positional.front(), *this);
+          if (!strict || result)
+            return result;
+          return fail("lyrt.from_prim expects a primitive scalar or shaped "
+                      "primitive value");
+        }
         if (*canonical == "asyncio.sleep")
           return inferAsyncioSleepResult(*this, positional, keywords);
       }
-      if (auto symbol = lookupSymbol(qualified))
+      if (auto symbol = lookupSymbol(qualified)) {
+        if (strict) {
+          CallInferenceResult inference =
+              inferCallWithEvidence(*symbol, positional, keywords);
+          if (inference)
+            return inference.resultType;
+          return fail(inference.failureReason);
+        }
         return inferCall(*symbol, positional, keywords);
+      }
       if (const parser::Node *receiverNode = ast::node(*callee, "value")) {
         if (auto methodName = ast::string(*callee, "attr")) {
-          mlir::Type receiver = widenLiteral(inferExpr(receiverNode));
+          mlir::Type receiver = recurse(receiverNode);
+          if (strict && !receiver)
+            return {};
           CallInferenceResult inference = inferMethodCallWithEvidence(
-              receiver, *methodName, positional, keywords);
-          return inference ? inference.resultType : object();
+              widenLiteral(receiver), *methodName, positional, keywords);
+          if (inference)
+            return inference.resultType;
+          return strict ? fail(inference.failureReason) : object();
         }
       }
     }
-    if (callee)
-      return inferCall(inferExpr(callee), positional, keywords);
-    return object();
+    if (callee) {
+      mlir::Type calleeType = recurse(callee);
+      if (strict) {
+        if (!calleeType)
+          return {};
+        CallInferenceResult inference =
+            inferCallWithEvidence(calleeType, positional, keywords);
+        if (inference)
+          return inference.resultType;
+        return fail(inference.failureReason);
+      }
+      return inferCall(calleeType, positional, keywords);
+    }
+    return strict ? fail("call expression is missing a callee") : object();
   }
   if (node->kind == "Lambda") {
     return functionSignature(*node).callable;
@@ -3712,7 +2589,8 @@ AlgorithmM::functionSignature(const parser::Node &function,
     sig.resultType = ast::nameSpelling(function) == "__init__"
                          ? none()
                          : inferredFunctionResult(*this, function,
-                                                  &sig.bodyInferenceFailures);
+                                                  &sig.bodyInferenceFailures,
+                                                  &generator.localSymbols);
   }
   refreshCallable(sig);
   return sig;

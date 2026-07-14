@@ -1,6 +1,8 @@
 #include "Ownership.h"
 #include "Runtime/Core/Lowerer.h"
 
+#include "Runtime/ABI/BoxLayout.h"
+
 #include "PyProtocols.h"
 #include "PyTypeObject.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -702,7 +704,7 @@ RuntimeBundleLowerer::boxRuntimeObjectAtCurrentInsertion(
   }
 
   mlir::Location loc = op->getLoc();
-  auto boxType = mlir::MemRefType::get({16}, builder.getI64Type());
+  mlir::MemRefType boxType = box_abi::boxWordsType(builder);
   mlir::Value box =
       mlir::memref::AllocOp::create(builder, loc, boxType).getResult();
   box.getDefiningOp()->setAttr(own::kObjectHeaderAttr, builder.getUnitAttr());

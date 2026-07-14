@@ -142,12 +142,6 @@ mlir::Value cdataStorageAddressValid(const RuntimeCtypesEvidence &evidence) {
   return evidence.storageAddressValid;
 }
 
-mlir::Value constantI1(mlir::OpBuilder &builder, mlir::Location loc,
-                       bool value) {
-  return mlir::arith::ConstantIntOp::create(builder, loc, value ? 1 : 0, 1)
-      .getResult();
-}
-
 mlir::Value constantI64(mlir::OpBuilder &builder, mlir::Location loc,
                         std::int64_t value) {
   return mlir::arith::ConstantIntOp::create(builder, loc, value, 64)

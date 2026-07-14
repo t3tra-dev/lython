@@ -380,7 +380,10 @@ RuntimeBundleLowerer::lowerAliasView(mlir::Operation *op, mlir::Value input,
     if (inputBundle->boxedObject &&
         py::isAssignableTo(inputBundle->boxedObject->objectValue.contract,
                            resultValue.getType(), op)) {
-      valueBundles[resultValue] = *inputBundle->boxedObject;
+      // Copy before inserting: operator[] can rehash valueBundles and
+      // invalidate inputBundle (which points into it).
+      RuntimeBundle boxed = *inputBundle->boxedObject;
+      valueBundles[resultValue] = std::move(boxed);
       erase.push_back(op);
       return mlir::success();
     }
@@ -422,7 +425,10 @@ RuntimeBundleLowerer::lowerAliasView(mlir::Operation *op, mlir::Value input,
     }
   }
 
-  valueBundles[resultValue] = *inputBundle;
+  // Copy before inserting: operator[] can rehash valueBundles and invalidate
+  // inputBundle (which points into it).
+  RuntimeBundle aliased = *inputBundle;
+  valueBundles[resultValue] = std::move(aliased);
   erase.push_back(op);
   return mlir::success();
 }

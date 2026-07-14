@@ -7,6 +7,7 @@
 #include "mlir/IR/Builders.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 
 #include <cstdint>
 #include <optional>
@@ -58,6 +59,12 @@ bool insertionBlockTerminated(const mlir::OpBuilder &builder);
 bool containsReturnStatement(const std::vector<parser::NodePtr> *statements);
 bool containsBreakOrContinueStatement(
     const std::vector<parser::NodePtr> *statements);
+void collectAssignedNameTargets(const parser::Node *node,
+                                llvm::StringSet<> &names);
+void collectAssignedNames(const parser::Node *node, llvm::StringSet<> &names);
+void collectAssignedNames(const std::vector<parser::NodePtr> *statements,
+                          llvm::StringSet<> &names);
+bool derivesViaStructuralMutation(mlir::Value current, mlir::Value previous);
 
 bool containsObjectTop(mlir::Type type, const AlgorithmM &types);
 bool isNoneTypeLike(mlir::Type type);
