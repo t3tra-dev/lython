@@ -188,6 +188,7 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
                               builder.getStringAttr(name), coerced.value);
       return;
     }
+    value = pinLoopCarriedTensor(name, value, target);
     values[name] = value;
     types.bindSymbol(name, value.type);
     return;
@@ -251,7 +252,8 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
       if (std::optional<Value> updated = emitPrimitiveTensorSetItem(
               target, container, ast::node(target, "slice"), value)) {
         if (updated->value)
-          values[containerName] = *updated;
+          values[containerName] =
+              pinLoopCarriedTensor(containerName, *updated, target);
         return;
       }
       return;

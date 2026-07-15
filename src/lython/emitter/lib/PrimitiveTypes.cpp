@@ -255,19 +255,56 @@ std::optional<mlir::Type> primitiveBinaryResultType(mlir::Type left,
                           mlir::isa<mlir::RankedTensorType>(left)))
       return left;
   }
+  if (ast::isOperator(op, "Div")) {
+    // Float-only, mirroring the scalar surface: Int has no __truediv__
+    // because Python's `/` on int yields float and a silent dtype change
+    // contradicts the width-explicit primitive design.
+    mlir::Type element = left;
+    if (auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(left))
+      element = tensor.getElementType();
+    if (left == right && mlir::isa<mlir::FloatType>(element))
+      return left;
+  }
   if (!ast::isOperator(op, "MatMult"))
     return std::nullopt;
 
   auto lhsTensor = mlir::dyn_cast<mlir::RankedTensorType>(left);
   auto rhsTensor = mlir::dyn_cast<mlir::RankedTensorType>(right);
-  if (!lhsTensor || !rhsTensor || lhsTensor.getRank() != 2 ||
-      rhsTensor.getRank() != 2 ||
-      lhsTensor.getElementType() != rhsTensor.getElementType() ||
-      lhsTensor.getDimSize(1) != rhsTensor.getDimSize(0))
+  if (!lhsTensor || !rhsTensor ||
+      lhsTensor.getElementType() != rhsTensor.getElementType())
     return std::nullopt;
-  llvm::SmallVector<std::int64_t, 2> shape{lhsTensor.getDimSize(0),
-                                           rhsTensor.getDimSize(1)};
-  return mlir::RankedTensorType::get(shape, lhsTensor.getElementType());
+  // Rank combinations mirror numpy's `@`: 2x2 -> matrix, 2x1/1x2 -> vector,
+  // 1x1 -> scalar. The scalar result is the bare element type, not a 0-d
+  // tensor -- shaped primitives always carry at least one dimension.
+  std::int64_t lhsRank = lhsTensor.getRank();
+  std::int64_t rhsRank = rhsTensor.getRank();
+  if (lhsRank == 2 && rhsRank == 2 &&
+      lhsTensor.getDimSize(1) == rhsTensor.getDimSize(0))
+    return mlir::RankedTensorType::get(
+        {lhsTensor.getDimSize(0), rhsTensor.getDimSize(1)},
+        lhsTensor.getElementType());
+  if (lhsRank == 2 && rhsRank == 1 &&
+      lhsTensor.getDimSize(1) == rhsTensor.getDimSize(0))
+    return mlir::RankedTensorType::get({lhsTensor.getDimSize(0)},
+                                       lhsTensor.getElementType());
+  if (lhsRank == 1 && rhsRank == 2 &&
+      lhsTensor.getDimSize(0) == rhsTensor.getDimSize(0))
+    return mlir::RankedTensorType::get({rhsTensor.getDimSize(1)},
+                                       lhsTensor.getElementType());
+  if (lhsRank == 1 && rhsRank == 1 &&
+      lhsTensor.getDimSize(0) == rhsTensor.getDimSize(0))
+    return lhsTensor.getElementType();
+  // Batched: equal ranks >= 3, leading dimensions equal (no numpy-style
+  // batch broadcast), last two dimensions contract.
+  if (lhsRank == rhsRank && lhsRank >= 3 &&
+      lhsTensor.getShape().drop_back(2) == rhsTensor.getShape().drop_back(2) &&
+      lhsTensor.getDimSize(lhsRank - 1) == rhsTensor.getDimSize(rhsRank - 2)) {
+    llvm::SmallVector<std::int64_t, 4> shape(
+        lhsTensor.getShape().drop_back(1));
+    shape.push_back(rhsTensor.getDimSize(rhsRank - 1));
+    return mlir::RankedTensorType::get(shape, lhsTensor.getElementType());
+  }
+  return std::nullopt;
 }
 
 } // namespace lython::emitter

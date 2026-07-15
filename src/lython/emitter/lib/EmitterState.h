@@ -56,6 +56,12 @@ struct InlineReturnContext {
 struct CarriedLoopLocal {
   std::string name;
   mlir::Type type;
+  // Shaped primitives only: the pre-loop buffer every rebinding of this local
+  // is copied into (a bufferization.alloc_tensor dominating the loop). A
+  // pre-loop destination keeps the block arguments' buffer types inferable --
+  // pinning into the header argument itself leaves nested loops with no
+  // cycle-free incoming edge to infer from.
+  mlir::Value pinBuffer;
 };
 
 struct LoopControlContext {

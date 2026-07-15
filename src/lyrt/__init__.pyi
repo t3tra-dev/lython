@@ -25,7 +25,10 @@ AllocT = TypeVar(
     "AllocT",
     bound=prim.Int | prim.Float | prim.Vector | prim.Matrix | prim.Tensor,
 )
-PrimT = TypeVar("PrimT", bound=prim.Int | prim.Float)
+PrimT = TypeVar(
+    "PrimT",
+    bound=prim.Int | prim.Float | prim.Vector | prim.Matrix | prim.Tensor,
+)
 PrimFunc = TypeVar(
     "PrimFunc",
     bound=Callable[..., prim.Int] | Callable[..., prim.Float],

@@ -683,6 +683,8 @@ constexpr ModuleCallableImport kModuleCallableImports[] = {
      ImportCallableFactory::StaticZeroArgStr},
     {"lyrt", "from_prim", "lyrt.from_prim",
      ImportCallableFactory::BuiltinsFunction},
+    {"lyrt", "to_prim", "lyrt.to_prim",
+     ImportCallableFactory::BuiltinsFunction},
     {"lyrt", "native", "lyrt.native", ImportCallableFactory::BuiltinsFunction},
 };
 
@@ -709,6 +711,8 @@ constexpr NameCallableImport kNameCallableImports[] = {
     {"sys", "getfilesystemencoding", "sys.getfilesystemencoding",
      ImportCallableFactory::StaticZeroArgStr},
     {"lyrt", "from_prim", "lyrt.from_prim",
+     ImportCallableFactory::BuiltinsFunction},
+    {"lyrt", "to_prim", "lyrt.to_prim",
      ImportCallableFactory::BuiltinsFunction},
     {"lyrt", "native", "lyrt.native", ImportCallableFactory::BuiltinsFunction},
 };
@@ -2060,8 +2064,36 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
       method = "__or__";
     else if (ast::isOperator(op, "BitXor"))
       method = "__xor__";
+    // Tensor-scalar broadcast types as the tensor operand (the emitter splats
+    // the scalar). Not for MatMult -- promoting the scalar there would type
+    // `m @ 2.0` as a contraction of equal shapes -- and a float scalar never
+    // broadcasts into an integer tensor (no silent element dtype change).
+    mlir::Type primLeft = left;
+    mlir::Type primRight = right;
+    if (!ast::isOperator(op, "MatMult")) {
+      auto broadcastable = [&](mlir::RankedTensorType tensor,
+                               mlir::Type scalar) {
+        if (mlir::isa_and_present<mlir::IntegerType>(scalar) ||
+            scalar == intType())
+          return true;
+        if (mlir::isa_and_present<mlir::FloatType>(scalar) ||
+            scalar == floatType())
+          return mlir::isa<mlir::FloatType>(tensor.getElementType());
+        return false;
+      };
+      if (auto tensor =
+              mlir::dyn_cast_if_present<mlir::RankedTensorType>(left)) {
+        if (broadcastable(tensor, right))
+          primRight = left;
+      } else if (auto tensor =
+                     mlir::dyn_cast_if_present<mlir::RankedTensorType>(
+                         right)) {
+        if (broadcastable(tensor, left))
+          primLeft = right;
+      }
+    }
     if (std::optional<mlir::Type> primitive =
-            primitiveBinaryResultType(left, right, op))
+            primitiveBinaryResultType(primLeft, primRight, op))
       return *primitive;
     if (std::optional<CallSolution> result =
             tryManifestMethod(*this, left, method, {right}))
@@ -2224,6 +2256,19 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
           return fail("lyrt.from_prim expects a primitive scalar or shaped "
                       "primitive value");
         }
+        if (*canonical == "lyrt.to_prim" && positional.size() == 2 &&
+            keywords.empty()) {
+          if (auto typeObject = mlir::dyn_cast_if_present<py::TypeType>(
+                  positional.back()))
+            if (mlir::isa<mlir::IntegerType, mlir::FloatType,
+                          mlir::RankedTensorType>(
+                    typeObject.getInstanceType()))
+              return typeObject.getInstanceType();
+          if (strict)
+            return fail(
+                "lyrt.to_prim expects a lyrt.prim type as its second "
+                "argument");
+        }
         if (*canonical == "asyncio.sleep")
           return inferAsyncioSleepResult(*this, positional, keywords);
       }
@@ -2257,6 +2302,19 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
             return result;
           return fail("lyrt.from_prim expects a primitive scalar or shaped "
                       "primitive value");
+        }
+        if (*canonical == "lyrt.to_prim" && positional.size() == 2 &&
+            keywords.empty()) {
+          if (auto typeObject = mlir::dyn_cast_if_present<py::TypeType>(
+                  positional.back()))
+            if (mlir::isa<mlir::IntegerType, mlir::FloatType,
+                          mlir::RankedTensorType>(
+                    typeObject.getInstanceType()))
+              return typeObject.getInstanceType();
+          if (strict)
+            return fail(
+                "lyrt.to_prim expects a lyrt.prim type as its second "
+                "argument");
         }
         if (*canonical == "asyncio.sleep")
           return inferAsyncioSleepResult(*this, positional, keywords);

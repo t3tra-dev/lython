@@ -1,1 +1,0 @@
-emit error: primitive tensor local 'a' cannot be reassigned inside a loop

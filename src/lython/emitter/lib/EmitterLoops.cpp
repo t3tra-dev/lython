@@ -5,7 +5,9 @@
 #include "AstAccess.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Block.h"
@@ -24,6 +26,44 @@ Value stripLocalProtocolView(Value value) {
   if (!view)
     return value;
   return Value{view.getInput(), view.getInput().getType()};
+}
+
+} // namespace
+
+namespace {
+
+// Break statements that target this loop, not one nested inside it.
+bool containsLoopLevelBreak(const parser::Node *node) {
+  if (!node)
+    return false;
+  if (node->kind == "Break")
+    return true;
+  if (node->kind == "For" || node->kind == "While" ||
+      node->kind == "AsyncFor" || node->kind == "FunctionDef" ||
+      node->kind == "AsyncFunctionDef" || node->kind == "ClassDef" ||
+      node->kind == "Lambda")
+    return false;
+  for (const parser::Field &field : node->fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (containsLoopLevelBreak(child->get()))
+        return true;
+    } else if (const auto *children =
+                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
+      for (const parser::NodePtr &item : *children)
+        if (containsLoopLevelBreak(item.get()))
+          return true;
+    }
+  }
+  return false;
+}
+
+bool containsLoopLevelBreak(const std::vector<parser::NodePtr> *body) {
+  if (!body)
+    return false;
+  for (const parser::NodePtr &item : *body)
+    if (containsLoopLevelBreak(item.get()))
+      return true;
+  return false;
 }
 
 } // namespace
@@ -48,22 +88,82 @@ llvm::SmallVector<CarriedLoopLocal, 4> ModuleEmitter::collectCarriedLoopLocals(
   for (const std::string &name : names) {
     Value initial = values.find(name)->second;
     mlir::Type carriedType = types.widenLiteral(initial.type);
-    // Bufferization does not cross the cf edges loops emit as, so a shaped
-    // primitive reaching one survives to the LLVM conversion and only reports
-    // there, as a cf.br on a tensor. Reject it here, where the local can still
-    // be named.
-    if (mlir::isa<mlir::RankedTensorType>(carriedType)) {
-      diagnostics.push_back(parser::Diagnostic{
-          parser::Severity::Error, statement.range.start,
-          "primitive tensor local '" + name +
-              "' cannot be reassigned inside a loop: shaped primitives are not "
-              "loop-carried values"});
-      continue;
+    mlir::Value initialValue =
+        coerceValue(initial, carriedType, statement).value;
+    mlir::Value pinBuffer;
+    if (auto tensorType =
+            mlir::dyn_cast<mlir::RankedTensorType>(carriedType)) {
+      // A break edge hands the carried buffer to the after-block while later
+      // iterations keep rewriting it; the bufferization analysis on
+      // unstructured control flow cannot separate those paths and rejects
+      // the whole function. Diagnose here, where the local can still be
+      // named.
+      if (containsLoopLevelBreak(ast::nodeList(statement, "body"))) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, statement.range.start,
+            "primitive tensor local '" + name +
+                "' cannot be reassigned inside a loop that breaks: break "
+                "would hand the carried buffer out of the loop"});
+        continue;
+      }
+      // A nested loop must keep writing the enclosing loop's buffer; a
+      // second allocation would make the outer back-edge forward a buffer
+      // that is not equivalent to the outer entry's.
+      for (auto context = loopControlContexts.rbegin();
+           !pinBuffer && context != loopControlContexts.rend(); ++context)
+        for (const CarriedLoopLocal &enclosing : context->carriedLocals)
+          if (enclosing.name == name && enclosing.pinBuffer) {
+            pinBuffer = enclosing.pinBuffer;
+            break;
+          }
+      if (!pinBuffer) {
+        auto alloc = mlir::bufferization::AllocTensorOp::create(
+            builder, loc(statement), tensorType, mlir::ValueRange{},
+            initialValue);
+        pinBuffer = alloc.getResult();
+        initialValue = pinBuffer;
+      }
     }
-    carried.push_back(CarriedLoopLocal{name, carriedType});
-    initialValues.push_back(coerceValue(initial, carriedType, statement).value);
+    carried.push_back(CarriedLoopLocal{name, carriedType, pinBuffer});
+    initialValues.push_back(initialValue);
   }
   return carried;
+}
+
+Value ModuleEmitter::pinLoopCarriedTensor(llvm::StringRef name, Value value,
+                                          const parser::Node &anchor) {
+  if (!value.value ||
+      !mlir::isa<mlir::RankedTensorType>(value.value.getType()))
+    return value;
+  for (auto context = loopControlContexts.rbegin();
+       context != loopControlContexts.rend(); ++context) {
+    for (const CarriedLoopLocal &local : context->carriedLocals) {
+      if (local.name != name)
+        continue;
+      if (!local.pinBuffer ||
+          local.pinBuffer.getType() != value.value.getType())
+        return value;
+      // A rebound shaped primitive is copied into the loop's pre-loop buffer
+      // at the assignment instead of being forwarded fresh at each loop
+      // edge: forwarding would allocate per iteration and hand ownership
+      // through block arguments, which the static release plan cannot
+      // follow. Pinning at the (single) assignment also keeps every loop
+      // edge forwarding values of one equivalent buffer.
+      if (value.value == local.pinBuffer)
+        return value;
+      if (auto materialize =
+              value.value.getDefiningOp<
+                  mlir::bufferization::MaterializeInDestinationOp>())
+        if (materialize.getDest() == local.pinBuffer)
+          return value;
+      mlir::Value pinned =
+          mlir::bufferization::MaterializeInDestinationOp::create(
+              builder, loc(anchor), value.value, local.pinBuffer)
+              ->getResult(0);
+      return Value{pinned, value.type};
+    }
+  }
+  return value;
 }
 
 void ModuleEmitter::bindCarriedLoopLocals(
@@ -282,9 +382,17 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
       builder.createBlock(region, afterBlock->getIterator());
   mlir::Block *bodyBlock =
       builder.createBlock(region, afterBlock->getIterator());
+  // Without a break the after-block's one predecessor is the header, whose
+  // arguments dominate it: forwarding them again through after-block
+  // arguments would give those arguments a single incoming edge that sits on
+  // the bufferization inference stack whenever the header is being resolved,
+  // making shaped-primitive buffer types order-dependent.
+  bool breakForwardsCarried =
+      containsLoopLevelBreak(ast::nodeList(statement, "body"));
   for (const CarriedLoopLocal &local : carried) {
     checkBlock->addArgument(local.type, loc(statement));
-    afterBlock->addArgument(local.type, loc(statement));
+    if (breakForwardsCarried)
+      afterBlock->addArgument(local.type, loc(statement));
   }
 
   builder.setInsertionPointToEnd(entry);
@@ -293,8 +401,9 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
   builder.setInsertionPointToStart(checkBlock);
   bindCarriedLoopLocals(carried, checkBlock);
   llvm::SmallVector<mlir::Value, 4> checkArgs;
-  for (unsigned index = 0; index < carried.size(); ++index)
-    checkArgs.push_back(checkBlock->getArgument(index));
+  if (breakForwardsCarried)
+    for (unsigned index = 0; index < carried.size(); ++index)
+      checkArgs.push_back(checkBlock->getArgument(index));
   auto next = py::NextOp::create(
       builder, loc(statement), elem, builder.getI1Type(), iteratorType,
       "__next__", callProtocolFor(nextInference), iterator.getResult());
@@ -321,7 +430,8 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
   }
 
   builder.setInsertionPointToStart(afterBlock);
-  bindCarriedLoopLocals(carried, afterBlock);
+  bindCarriedLoopLocals(carried,
+                        breakForwardsCarried ? afterBlock : checkBlock);
 }
 
 void ModuleEmitter::emitWhile(const parser::Node &statement) {
@@ -357,9 +467,17 @@ void ModuleEmitter::emitWhile(const parser::Node &statement) {
       builder.createBlock(region, afterBlock->getIterator());
   mlir::Block *bodyBlock =
       builder.createBlock(region, afterBlock->getIterator());
+  // Without a break the after-block's one predecessor is the header, whose
+  // arguments dominate it: forwarding them again through after-block
+  // arguments would give those arguments a single incoming edge that sits on
+  // the bufferization inference stack whenever the header is being resolved,
+  // making shaped-primitive buffer types order-dependent.
+  bool breakForwardsCarried =
+      containsLoopLevelBreak(ast::nodeList(statement, "body"));
   for (const CarriedLoopLocal &local : carried) {
     headerBlock->addArgument(local.type, loc(statement));
-    afterBlock->addArgument(local.type, loc(statement));
+    if (breakForwardsCarried)
+      afterBlock->addArgument(local.type, loc(statement));
   }
 
   builder.setInsertionPointToEnd(entry);
@@ -371,8 +489,9 @@ void ModuleEmitter::emitWhile(const parser::Node &statement) {
   builder.setInsertionPointToStart(headerBlock);
   bindCarriedLoopLocals(carried, headerBlock);
   llvm::SmallVector<mlir::Value, 4> headerArgs;
-  for (unsigned index = 0; index < carried.size(); ++index)
-    headerArgs.push_back(headerBlock->getArgument(index));
+  if (breakForwardsCarried)
+    for (unsigned index = 0; index < carried.size(); ++index)
+      headerArgs.push_back(headerBlock->getArgument(index));
   mlir::Value condition = emitBoolValue(emitExpr(test), statement);
   mlir::cf::CondBranchOp::create(builder, loc(statement), condition, bodyBlock,
                                  mlir::ValueRange{}, afterBlock, headerArgs);
@@ -394,7 +513,8 @@ void ModuleEmitter::emitWhile(const parser::Node &statement) {
   }
 
   builder.setInsertionPointToStart(afterBlock);
-  bindCarriedLoopLocals(carried, afterBlock);
+  bindCarriedLoopLocals(carried,
+                        breakForwardsCarried ? afterBlock : headerBlock);
 }
 
 void ModuleEmitter::emitAsyncFor(const parser::Node &statement) {

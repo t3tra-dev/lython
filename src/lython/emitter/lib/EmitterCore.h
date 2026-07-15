@@ -112,6 +112,8 @@ private:
   collectCarriedLoopLocals(const parser::Node &statement,
                            const llvm::StringSet<> *excludedNames,
                            llvm::SmallVectorImpl<mlir::Value> &initialValues);
+  Value pinLoopCarriedTensor(llvm::StringRef name, Value value,
+                             const parser::Node &anchor);
   void bindCarriedLoopLocals(llvm::ArrayRef<CarriedLoopLocal> carried,
                              mlir::Block *block);
   llvm::SmallVector<mlir::Value, 4>
@@ -254,6 +256,7 @@ private:
                                                 const parser::Node *calleeNode);
   std::optional<Value> emitPrimitiveRuntimeCall(const parser::Node &expr,
                                                 const parser::Node *calleeNode);
+  Value emitToPrimCall(const parser::Node &expr);
   std::optional<Value>
   emitDirectPrimitiveFunctionCall(const parser::Node &expr,
                                   const parser::Node *calleeNode);

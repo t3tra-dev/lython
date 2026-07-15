@@ -10,6 +10,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Utils/ReshapeOpsUtils.h"
 #include "llvm/ADT/STLExtras.h"
 
 #include <functional>
@@ -263,6 +264,8 @@ std::optional<mlir::Value> createScalarBinary(mlir::OpBuilder &builder,
       return mlir::arith::MulFOp::create(builder, loc, lhs, rhs).getResult();
     if (ast::isOperator(op, "Add"))
       return mlir::arith::AddFOp::create(builder, loc, lhs, rhs).getResult();
+    if (ast::isOperator(op, "Div"))
+      return mlir::arith::DivFOp::create(builder, loc, lhs, rhs).getResult();
     return std::nullopt;
   }
   return std::nullopt;
@@ -302,8 +305,8 @@ std::optional<Value> emitElementwiseTensorBinary(
   if (!requiresUnrolledAsserts) {
     auto init = mlir::tensor::EmptyOp::create(builder, loc, tensorType,
                                               mlir::ValueRange{});
-    mlir::ValueRange inputs{lhs.value, rhs.value};
-    mlir::ValueRange outputs{init.getResult()};
+    llvm::SmallVector<mlir::Value, 2> inputs{lhs.value, rhs.value};
+    llvm::SmallVector<mlir::Value, 1> outputs{init.getResult()};
     mlir::Operation *elementwise = nullptr;
     if (ast::isOperator(op, "Add"))
       elementwise = mlir::linalg::AddOp::create(
@@ -313,6 +316,14 @@ std::optional<Value> emitElementwiseTensorBinary(
           builder, loc, mlir::TypeRange{tensorType}, inputs, outputs);
     else if (ast::isOperator(op, "Mult"))
       elementwise = mlir::linalg::MulOp::create(
+          builder, loc, mlir::TypeRange{tensorType}, inputs, outputs);
+    // Div stays float-only: scalar Int provides no __truediv__ (Python's `/`
+    // on int yields float, and changing the element dtype silently would
+    // contradict the width-explicit primitive design), so the shaped form
+    // must not accept what the scalar form rejects.
+    else if (ast::isOperator(op, "Div") &&
+             mlir::isa<mlir::FloatType>(tensorType.getElementType()))
+      elementwise = mlir::linalg::DivOp::create(
           builder, loc, mlir::TypeRange{tensorType}, inputs, outputs);
     if (!elementwise) {
       init->erase();
@@ -344,35 +355,133 @@ std::optional<Value> emitElementwiseTensorBinary(
   return Value{result.getResult(), tensorType};
 }
 
+mlir::Value primitiveZeroConstant(mlir::OpBuilder &builder, mlir::Location loc,
+                                  mlir::Type elementType) {
+  if (auto integer = mlir::dyn_cast<mlir::IntegerType>(elementType))
+    return mlir::arith::ConstantOp::create(builder, loc, integer,
+                                           builder.getIntegerAttr(integer, 0))
+        .getResult();
+  if (auto floating = mlir::dyn_cast<mlir::FloatType>(elementType))
+    return mlir::arith::ConstantOp::create(builder, loc, floating,
+                                           builder.getFloatAttr(floating, 0.0))
+        .getResult();
+  return {};
+}
+
+// Batched `@` for equal-rank operands of rank >= 3: leading dimensions must
+// match exactly (no numpy-style broadcast of batch dimensions -- silently
+// replicating an operand would hide an O(batch) cost the source never wrote),
+// the last two dimensions contract. Ranks above 3 collapse their leading
+// dimensions into the single linalg.batch_matmul batch dimension and expand
+// back afterwards, so every rank shares one contraction the lowering already
+// schedules.
+std::optional<Value> emitBatchedMatmul(mlir::OpBuilder &builder,
+                                       mlir::Location loc, Value lhs, Value rhs,
+                                       mlir::RankedTensorType lhsType,
+                                       mlir::RankedTensorType rhsType) {
+  std::int64_t rank = lhsType.getRank();
+  llvm::ArrayRef<std::int64_t> lhsShape = lhsType.getShape();
+  llvm::ArrayRef<std::int64_t> rhsShape = rhsType.getShape();
+  if (lhsShape.drop_back(2) != rhsShape.drop_back(2) ||
+      lhsShape[rank - 1] != rhsShape[rank - 2])
+    return std::nullopt;
+
+  mlir::Type elementType = lhsType.getElementType();
+  mlir::Value zero = primitiveZeroConstant(builder, loc, elementType);
+  if (!zero)
+    return std::nullopt;
+
+  std::int64_t batch = 1;
+  for (std::int64_t dim : lhsShape.drop_back(2))
+    batch *= dim;
+  std::int64_t m = lhsShape[rank - 2];
+  std::int64_t k = lhsShape[rank - 1];
+  std::int64_t n = rhsShape[rank - 1];
+
+  llvm::SmallVector<mlir::ReassociationIndices, 3> reassociation(3);
+  for (std::int64_t dim = 0; dim < rank - 2; ++dim)
+    reassociation[0].push_back(dim);
+  reassociation[1].push_back(rank - 2);
+  reassociation[2].push_back(rank - 1);
+
+  auto collapseTo3 = [&](mlir::Value value, std::int64_t rows,
+                         std::int64_t columns) -> mlir::Value {
+    if (rank == 3)
+      return value;
+    auto collapsedType =
+        mlir::RankedTensorType::get({batch, rows, columns}, elementType);
+    return mlir::tensor::CollapseShapeOp::create(builder, loc, collapsedType,
+                                                 value, reassociation)
+        .getResult();
+  };
+  mlir::Value lhs3 = collapseTo3(lhs.value, m, k);
+  mlir::Value rhs3 = collapseTo3(rhs.value, k, n);
+
+  auto contractionType =
+      mlir::RankedTensorType::get({batch, m, n}, elementType);
+  auto init = mlir::tensor::EmptyOp::create(builder, loc, contractionType,
+                                            mlir::ValueRange{})
+                  .getResult();
+  auto filled = mlir::linalg::FillOp::create(
+      builder, loc, mlir::TypeRange{contractionType}, mlir::ValueRange{zero},
+      mlir::ValueRange{init});
+  llvm::SmallVector<mlir::Value, 2> inputs{lhs3, rhs3};
+  llvm::SmallVector<mlir::Value, 1> outputs{filled.getResult(0)};
+  auto contraction = mlir::linalg::BatchMatmulOp::create(
+      builder, loc, mlir::TypeRange{contractionType}, inputs, outputs);
+
+  llvm::SmallVector<std::int64_t, 4> resultShape(lhsShape.drop_back(1));
+  resultShape.push_back(n);
+  auto resultType = mlir::RankedTensorType::get(resultShape, elementType);
+  if (rank == 3)
+    return Value{contraction.getResult(0), resultType};
+  auto expanded = mlir::tensor::ExpandShapeOp::create(
+      builder, loc, resultType, contraction.getResult(0), reassociation);
+  return Value{expanded.getResult(), resultType};
+}
+
 std::optional<Value> emitMatrixMatmul(mlir::OpBuilder &builder,
                                       mlir::Location loc,
                                       const parser::Node &expr, Value lhs,
                                       Value rhs, mlir::RankedTensorType lhsType,
                                       mlir::RankedTensorType rhsType) {
   (void)expr;
-  if (lhsType.getRank() != 2 || rhsType.getRank() != 2 ||
-      lhsType.getElementType() != rhsType.getElementType() ||
-      lhsType.getDimSize(1) != rhsType.getDimSize(0))
+  if (lhsType.getElementType() != rhsType.getElementType())
     return std::nullopt;
 
-  llvm::SmallVector<std::int64_t, 2> resultShape{lhsType.getDimSize(0),
-                                                 rhsType.getDimSize(1)};
+  // `@` selects the linalg contraction by operand ranks, mirroring numpy:
+  // 2x2 -> matmul, 2x1 -> matvec, 1x2 -> vecmat, 1x1 -> dot (scalar result).
+  std::int64_t lhsRank = lhsType.getRank();
+  std::int64_t rhsRank = rhsType.getRank();
+  llvm::SmallVector<std::int64_t, 2> resultShape;
+  if (lhsRank == 2 && rhsRank == 2) {
+    if (lhsType.getDimSize(1) != rhsType.getDimSize(0))
+      return std::nullopt;
+    resultShape = {lhsType.getDimSize(0), rhsType.getDimSize(1)};
+  } else if (lhsRank == 2 && rhsRank == 1) {
+    if (lhsType.getDimSize(1) != rhsType.getDimSize(0))
+      return std::nullopt;
+    resultShape = {lhsType.getDimSize(0)};
+  } else if (lhsRank == 1 && rhsRank == 2) {
+    if (lhsType.getDimSize(0) != rhsType.getDimSize(0))
+      return std::nullopt;
+    resultShape = {rhsType.getDimSize(1)};
+  } else if (lhsRank == 1 && rhsRank == 1) {
+    if (lhsType.getDimSize(0) != rhsType.getDimSize(0))
+      return std::nullopt;
+    // 0-d accumulator; the scalar is extracted below.
+  } else if (lhsRank == rhsRank && lhsRank >= 3) {
+    return emitBatchedMatmul(builder, loc, lhs, rhs, lhsType, rhsType);
+  } else {
+    return std::nullopt;
+  }
   auto resultType =
       mlir::RankedTensorType::get(resultShape, lhsType.getElementType());
 
   mlir::Type elementType = lhsType.getElementType();
-  mlir::Value zero;
-  if (auto integer = mlir::dyn_cast<mlir::IntegerType>(elementType)) {
-    zero = mlir::arith::ConstantOp::create(builder, loc, integer,
-                                           builder.getIntegerAttr(integer, 0))
-               .getResult();
-  } else if (auto floating = mlir::dyn_cast<mlir::FloatType>(elementType)) {
-    zero = mlir::arith::ConstantOp::create(builder, loc, floating,
-                                           builder.getFloatAttr(floating, 0.0))
-               .getResult();
-  } else {
+  mlir::Value zero = primitiveZeroConstant(builder, loc, elementType);
+  if (!zero)
     return std::nullopt;
-  }
 
   // Keep matrix multiplication as a structured contraction.  Expanding it
   // here would generate O(M*N*K) scalar IR and would also hide the alias-free
@@ -383,11 +492,28 @@ std::optional<Value> emitMatrixMatmul(mlir::OpBuilder &builder,
   auto filled = mlir::linalg::FillOp::create(
       builder, loc, mlir::TypeRange{resultType}, mlir::ValueRange{zero},
       mlir::ValueRange{init});
-  auto matmul =
-      mlir::linalg::MatmulOp::create(builder, loc, mlir::TypeRange{resultType},
-                                     mlir::ValueRange{lhs.value, rhs.value},
-                                     mlir::ValueRange{filled.getResult(0)});
-  return Value{matmul.getResult(0), resultType};
+  llvm::SmallVector<mlir::Value, 2> inputs{lhs.value, rhs.value};
+  llvm::SmallVector<mlir::Value, 1> outputs{filled.getResult(0)};
+  mlir::Operation *contraction = nullptr;
+  if (lhsRank == 2 && rhsRank == 2)
+    contraction = mlir::linalg::MatmulOp::create(
+        builder, loc, mlir::TypeRange{resultType}, inputs, outputs);
+  else if (lhsRank == 2 && rhsRank == 1)
+    contraction = mlir::linalg::MatvecOp::create(
+        builder, loc, mlir::TypeRange{resultType}, inputs, outputs);
+  else if (lhsRank == 1 && rhsRank == 2)
+    contraction = mlir::linalg::VecmatOp::create(
+        builder, loc, mlir::TypeRange{resultType}, inputs, outputs);
+  else
+    contraction = mlir::linalg::DotOp::create(
+        builder, loc, mlir::TypeRange{resultType}, inputs, outputs);
+
+  if (lhsRank == 1 && rhsRank == 1) {
+    auto extract = mlir::tensor::ExtractOp::create(
+        builder, loc, contraction->getResult(0), mlir::ValueRange{});
+    return Value{extract.getResult(), elementType};
+  }
+  return Value{contraction->getResult(0), resultType};
 }
 
 } // namespace
@@ -650,8 +776,11 @@ ModuleEmitter::emitPrimitiveRuntimeCall(const parser::Node &expr,
                              ? llvm::StringRef(ast::nameSpelling(*calleeNode))
                              : llvm::StringRef(qualified);
   std::optional<std::string> canonical = types.lookupCanonicalBinding(name);
-  if (!canonical || *canonical != "lyrt.from_prim")
+  if (!canonical ||
+      (*canonical != "lyrt.from_prim" && *canonical != "lyrt.to_prim"))
     return std::nullopt;
+  if (*canonical == "lyrt.to_prim")
+    return emitToPrimCall(expr);
 
   const auto *args = ast::nodeList(expr, "args");
   const auto *keywords = ast::nodeList(expr, "keywords");
@@ -799,6 +928,75 @@ ModuleEmitter::emitDirectPrimitiveFunctionCall(const parser::Node &expr,
   return Value{call.getResult(0), callable.getResultTypes().front()};
 }
 
+Value ModuleEmitter::emitToPrimCall(const parser::Node &expr) {
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  if (!args || args->size() != 2 || (keywords && !keywords->empty())) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "lyrt.to_prim expects exactly two positional arguments"});
+    return emitNone(expr);
+  }
+
+  std::optional<PrimitiveTypeSpec> target =
+      primitiveTypeSpecFromSubscript(args->back().get(), types);
+  if (!target) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "lyrt.to_prim expects a lyrt.prim type as its second argument"});
+    return emitNone(expr);
+  }
+
+  Value input = emitExpr(args->front().get());
+  if (!input.value)
+    return emitNone(expr);
+  mlir::Location location = loc(expr);
+
+  if (auto targetTensor =
+          mlir::dyn_cast<mlir::RankedTensorType>(target->type)) {
+    auto sourceTensor =
+        mlir::dyn_cast<mlir::RankedTensorType>(input.value.getType());
+    if (!sourceTensor ||
+        sourceTensor.getShape() != targetTensor.getShape()) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, expr.range.start,
+          "lyrt.to_prim tensor cast expects a shaped primitive source with "
+          "the same shape"});
+      return emitNone(expr);
+    }
+    mlir::Type sourceElement = sourceTensor.getElementType();
+    mlir::Type targetElement = targetTensor.getElementType();
+    if (sourceElement == targetElement)
+      return Value{input.value, targetTensor};
+    // Casts that cannot round-trip a value must not run element-blind:
+    // linalg's cast body cannot trap per element the way the scalar "exact"
+    // cast does, so float -> int (UB on out-of-range) and int narrowing
+    // (silent wrap) are rejected instead of mis-executing.
+    if (auto targetInt = mlir::dyn_cast<mlir::IntegerType>(targetElement)) {
+      auto sourceInt = mlir::dyn_cast<mlir::IntegerType>(sourceElement);
+      if (!sourceInt || sourceInt.getWidth() > targetInt.getWidth()) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, expr.range.start,
+            "lyrt.to_prim tensor cast supports float <-> float, int -> "
+            "float, and int widening only"});
+        return emitNone(expr);
+      }
+    }
+    auto init = mlir::tensor::EmptyOp::create(builder, location, targetTensor,
+                                              mlir::ValueRange{});
+    llvm::SmallVector<mlir::Value, 1> inputs{input.value};
+    llvm::SmallVector<mlir::Value, 1> outputs{init.getResult()};
+    auto copy = mlir::linalg::CopyOp::create(
+        builder, location, mlir::TypeRange{targetTensor}, inputs, outputs);
+    return Value{copy.getResult(0), targetTensor};
+  }
+
+  mlir::Value scalar = coerceToPrimitiveScalar(input, target->type, expr);
+  if (!scalar)
+    return emitNone(expr);
+  return Value{scalar, target->type};
+}
+
 llvm::SmallVector<mlir::Value, 4>
 ModuleEmitter::emitPrimitiveTensorIndices(const parser::Node &expr,
                                           mlir::RankedTensorType tensorType,
@@ -824,28 +1022,100 @@ ModuleEmitter::emitPrimitiveTensorIndices(const parser::Node &expr,
   llvm::SmallVector<mlir::Value, 4> indices;
   indices.reserve(axes.size());
   for (auto [axis, node] : llvm::enumerate(axes)) {
-    // Why literals only: the shape is static, so an out-of-range index is a
-    // static error rather than a runtime one, and shaped primitives carry no
-    // runtime bound to check a computed index against.
-    std::optional<double> literal = numericLiteralValue(node);
-    if (!literal || *literal != std::floor(*literal)) {
-      diagnostics.push_back(parser::Diagnostic{
-          parser::Severity::Error, expr.range.start,
-          "shaped primitive index must be an integer literal"});
-      return {};
-    }
     int64_t extent = tensorType.getDimSize(static_cast<int64_t>(axis));
-    auto written = static_cast<int64_t>(*literal);
-    int64_t index = written < 0 ? written + extent : written;
-    if (index < 0 || index >= extent) {
+    std::optional<double> literal = numericLiteralValue(node);
+    if (literal) {
+      if (*literal != std::floor(*literal)) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, expr.range.start,
+            "shaped primitive index must be an integer"});
+        return {};
+      }
+      auto written = static_cast<int64_t>(*literal);
+      int64_t index = written < 0 ? written + extent : written;
+      if (index < 0 || index >= extent) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, expr.range.start,
+            "shaped primitive index " + std::to_string(written) +
+                " is out of range for axis " + std::to_string(axis) +
+                " of extent " + std::to_string(extent)});
+        return {};
+      }
+      indices.push_back(constantIndex(builder, loc(expr), index));
+      continue;
+    }
+
+    // Computed index: the static shape is the bound, so the range check
+    // becomes a runtime trap instead of a static error. Why not clamp or
+    // wrap: silently reading a different element would mis-execute.
+    Value computed = emitExpr(node);
+    if (!computed.value)
+      return {};
+    mlir::Location location = loc(expr);
+    mlir::Value raw;
+    if (auto integer =
+            mlir::dyn_cast<mlir::IntegerType>(computed.value.getType())) {
+      // Int[1] is excluded: sign-extending its `1` yields -1, which the
+      // negative-index normalization below would silently wrap in range.
+      if (integer.getWidth() == 1) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, expr.range.start,
+            "shaped primitive index must be an integer literal, a primitive "
+            "integer, or a Python int value"});
+        return {};
+      }
+      raw = computed.value;
+      if (integer.getWidth() < 64)
+        raw = mlir::arith::ExtSIOp::create(builder, location,
+                                           builder.getI64Type(), raw)
+                  .getResult();
+    } else if (types.widenLiteral(computed.type) == types.intType()) {
+      raw = py::CastToPrimOp::create(builder, location, builder.getI64Type(),
+                                     computed.value,
+                                     builder.getStringAttr("exact"))
+                .getResult();
+    } else {
       diagnostics.push_back(parser::Diagnostic{
           parser::Severity::Error, expr.range.start,
-          "shaped primitive index " + std::to_string(written) +
-              " is out of range for axis " + std::to_string(axis) +
-              " of extent " + std::to_string(extent)});
+          "shaped primitive index must be an integer literal, a primitive "
+          "integer, or a Python int value"});
       return {};
     }
-    indices.push_back(constantIndex(builder, loc(expr), index));
+
+    mlir::Value zero =
+        mlir::arith::ConstantIntOp::create(builder, location, 0, 64)
+            .getResult();
+    mlir::Value extentValue =
+        mlir::arith::ConstantIntOp::create(builder, location, extent, 64)
+            .getResult();
+    mlir::Value negative =
+        mlir::arith::CmpIOp::create(builder, location,
+                                    mlir::arith::CmpIPredicate::slt, raw, zero)
+            .getResult();
+    mlir::Value wrapped =
+        mlir::arith::AddIOp::create(builder, location, raw, extentValue)
+            .getResult();
+    mlir::Value adjusted = mlir::arith::SelectOp::create(
+                               builder, location, negative, wrapped, raw)
+                               .getResult();
+    mlir::Value lowerOk =
+        mlir::arith::CmpIOp::create(builder, location,
+                                    mlir::arith::CmpIPredicate::sge, adjusted,
+                                    zero)
+            .getResult();
+    mlir::Value upperOk = mlir::arith::CmpIOp::create(
+                              builder, location,
+                              mlir::arith::CmpIPredicate::slt, adjusted,
+                              extentValue)
+                              .getResult();
+    mlir::Value inBounds =
+        mlir::arith::AndIOp::create(builder, location, lowerOk, upperOk)
+            .getResult();
+    mlir::cf::AssertOp::create(builder, location, inBounds,
+                               "lython: shaped primitive index out of range");
+    indices.push_back(mlir::arith::IndexCastOp::create(
+                          builder, location, builder.getIndexType(), adjusted)
+                          .getResult());
   }
   return indices;
 }
@@ -904,18 +1174,60 @@ std::optional<Value>
 ModuleEmitter::emitPrimitiveBinary(const parser::Node &expr, Value lhs,
                                    Value rhs, const parser::Node *op) {
   mlir::Location location = loc(expr);
+  // A scalar operand broadcasts by splatting to the tensor operand's shape and
+  // reusing the elementwise path. Not for MatMult (promoting the scalar would
+  // read `m @ 2.0` as a contraction), and a float scalar never broadcasts into
+  // an integer tensor -- the element dtype must not change silently.
+  auto broadcastScalar = [&](mlir::RankedTensorType tensorType,
+                             Value scalar) -> mlir::Value {
+    if (ast::isOperator(op, "MatMult"))
+      return {};
+    mlir::Type scalarType = scalar.value.getType();
+    bool intScalar = mlir::isa<mlir::IntegerType>(scalarType) ||
+                     types.widenLiteral(scalar.type) == types.intType();
+    bool floatScalar = mlir::isa<mlir::FloatType>(scalarType) ||
+                       types.widenLiteral(scalar.type) == types.floatType();
+    if (!intScalar && !floatScalar)
+      return {};
+    if (!intScalar &&
+        !mlir::isa<mlir::FloatType>(tensorType.getElementType()))
+      return {};
+    mlir::Value element =
+        coerceToPrimitiveScalar(scalar, tensorType.getElementType(), expr);
+    if (!element)
+      return {};
+    return mlir::tensor::SplatOp::create(builder, location, tensorType,
+                                         element)
+        .getResult();
+  };
+
   if (auto lhsTensor =
           mlir::dyn_cast<mlir::RankedTensorType>(lhs.value.getType())) {
     auto rhsTensor =
         mlir::dyn_cast<mlir::RankedTensorType>(rhs.value.getType());
-    if (!rhsTensor)
+    if (!rhsTensor) {
+      if (mlir::Value splat = broadcastScalar(lhsTensor, rhs))
+        return emitElementwiseTensorBinary(builder, location, expr, lhs,
+                                           Value{splat, lhsTensor}, op,
+                                           lhsTensor,
+                                           options.sanitizeUndefined);
       return std::nullopt;
+    }
     if (ast::isOperator(op, "MatMult"))
       return emitMatrixMatmul(builder, location, expr, lhs, rhs, lhsTensor,
                               rhsTensor);
     if (lhsTensor == rhsTensor)
       return emitElementwiseTensorBinary(builder, location, expr, lhs, rhs, op,
                                          lhsTensor, options.sanitizeUndefined);
+    return std::nullopt;
+  }
+
+  if (auto rhsTensor =
+          mlir::dyn_cast<mlir::RankedTensorType>(rhs.value.getType())) {
+    if (mlir::Value splat = broadcastScalar(rhsTensor, lhs))
+      return emitElementwiseTensorBinary(builder, location, expr,
+                                         Value{splat, rhsTensor}, rhs, op,
+                                         rhsTensor, options.sanitizeUndefined);
     return std::nullopt;
   }
 

@@ -1,0 +1,1 @@
+emit error: shaped primitive index must be an integer literal, a primitive integer, or a Python int value

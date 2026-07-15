@@ -4,6 +4,7 @@
 #include "AstAccess.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h" // IWYU pragma: keep
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h" // IWYU pragma: keep
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -31,6 +32,7 @@ ModuleEmitter::ModuleEmitter(const parser::Node &moduleNode,
 
 EmitResult ModuleEmitter::emit() {
   context.loadDialect<py::PyDialect, mlir::arith::ArithDialect,
+                      mlir::bufferization::BufferizationDialect,
                       mlir::cf::ControlFlowDialect, mlir::func::FuncDialect,
                       mlir::linalg::LinalgDialect, mlir::scf::SCFDialect,
                       mlir::tensor::TensorDialect>();
