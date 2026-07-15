@@ -23,6 +23,14 @@
 namespace py::lowering::arch::arm {
 namespace {
 
+// A ZA tile is SVL x SVL bits, so the lane count per scalable vector — and with
+// it the tile shape and the unit the streaming vector length is measured in —
+// follows the element width.
+struct SMEElementLayout {
+  int64_t minLanes;
+  mlir::arm_sme::TypeSize streamingVLUnit;
+};
+
 struct StaticMatmulMemRefs {
   mlir::Value lhs;
   mlir::Value rhs;
@@ -33,6 +41,7 @@ struct StaticMatmulMemRefs {
   int64_t m;
   int64_t n;
   int64_t k;
+  SMEElementLayout layout;
 };
 
 struct SMEMatmulViews {
@@ -45,16 +54,40 @@ struct SMEMatmulViews {
 // on the generic scalar/vector path, which already has small-matmul handling.
 constexpr std::uint64_t kSMEMatmulMinWork = 1024;
 
-mlir::VectorType scalableVectorType(mlir::Type elementType) {
-  return mlir::VectorType::get({4}, elementType, {true});
+std::optional<SMEElementLayout>
+smeElementLayout(mlir::Type elementType, const py::TensorLoweringTarget &target) {
+  if (elementType.isF32())
+    return SMEElementLayout{4, mlir::arm_sme::TypeSize::Word};
+  if (elementType.isF64() && target.usesArmSMEF64())
+    return SMEElementLayout{2, mlir::arm_sme::TypeSize::Double};
+  // Why not integers: SME has no non-widening integer outer product, so an
+  // i32 x i32 -> i32 linalg.matmul has no single-instruction ZA form. Widening
+  // (SMOPA i8->i32) changes the contraction's operand types, which the generic
+  // vector path already covers without a shape-changing rewrite.
+  return std::nullopt;
 }
 
-mlir::VectorType scalableTileType(mlir::Type elementType) {
-  return mlir::VectorType::get({4, 4}, elementType, {true, true});
+mlir::VectorType scalableVectorType(mlir::Type elementType,
+                                    const SMEElementLayout &layout) {
+  return mlir::VectorType::get({layout.minLanes}, elementType, {true});
 }
 
-mlir::VectorType scalableTileMaskType(mlir::MLIRContext *context) {
-  return mlir::VectorType::get({4, 4}, mlir::IntegerType::get(context, 1),
+mlir::VectorType scalableTileType(mlir::Type elementType,
+                                  const SMEElementLayout &layout) {
+  return mlir::VectorType::get({layout.minLanes, layout.minLanes}, elementType,
+                               {true, true});
+}
+
+mlir::VectorType scalableMaskType(mlir::MLIRContext *context,
+                                  const SMEElementLayout &layout) {
+  return mlir::VectorType::get({layout.minLanes},
+                               mlir::IntegerType::get(context, 1), {true});
+}
+
+mlir::VectorType scalableTileMaskType(mlir::MLIRContext *context,
+                                      const SMEElementLayout &layout) {
+  return mlir::VectorType::get({layout.minLanes, layout.minLanes},
+                               mlir::IntegerType::get(context, 1),
                                {true, true});
 }
 
@@ -69,7 +102,8 @@ std::optional<int64_t> staticStride(mlir::MemRefType type, unsigned dimension) {
 }
 
 std::optional<StaticMatmulMemRefs>
-matchStaticF32Matmul(mlir::linalg::MatmulOp matmul) {
+matchStaticSMEMatmul(mlir::linalg::MatmulOp matmul,
+                     const py::TensorLoweringTarget &target) {
   if (matmul->getNumResults() != 0 || matmul.getNumDpsInputs() != 2 ||
       matmul.getNumDpsInits() != 1)
     return std::nullopt;
@@ -87,8 +121,12 @@ matchStaticF32Matmul(mlir::linalg::MatmulOp matmul) {
     return std::nullopt;
 
   mlir::Type elementType = outType.getElementType();
-  if (!elementType.isF32() || lhsType.getElementType() != elementType ||
+  if (lhsType.getElementType() != elementType ||
       rhsType.getElementType() != elementType)
+    return std::nullopt;
+  std::optional<SMEElementLayout> layout =
+      smeElementLayout(elementType, target);
+  if (!layout)
     return std::nullopt;
 
   int64_t m = outType.getDimSize(0);
@@ -104,7 +142,8 @@ matchStaticF32Matmul(mlir::linalg::MatmulOp matmul) {
       *outInnerStride != 1)
     return std::nullopt;
 
-  return StaticMatmulMemRefs{lhs, rhs, out, lhsType, rhsType, outType, m, n, k};
+  return StaticMatmulMemRefs{lhs,     rhs, out, lhsType, rhsType,
+                             outType, m,   n,   k,       *layout};
 }
 
 std::uint64_t saturatedMatmulWork(const StaticMatmulMemRefs &refs) {
@@ -298,9 +337,10 @@ mlir::Value createRhsVector(mlir::OpBuilder &builder, mlir::Location loc,
       .getResult();
 }
 
-mlir::LogicalResult lowerStaticF32MatmulToSME(mlir::linalg::MatmulOp matmul,
-                                              mlir::IRRewriter &rewriter) {
-  std::optional<StaticMatmulMemRefs> refs = matchStaticF32Matmul(matmul);
+mlir::LogicalResult lowerStaticMatmulToSME(mlir::linalg::MatmulOp matmul,
+                                           mlir::IRRewriter &rewriter,
+                                           const py::TensorLoweringTarget &target) {
+  std::optional<StaticMatmulMemRefs> refs = matchStaticSMEMatmul(matmul, target);
   if (!refs || !isProfitableStaticSMEMatmul(*refs))
     return mlir::failure();
 
@@ -308,11 +348,10 @@ mlir::LogicalResult lowerStaticF32MatmulToSME(mlir::linalg::MatmulOp matmul,
   mlir::Location loc = matmul.getLoc();
   mlir::MLIRContext *context = matmul.getContext();
   mlir::Type elementType = refs->outType.getElementType();
-  mlir::VectorType vectorType = scalableVectorType(elementType);
-  mlir::VectorType tileType = scalableTileType(elementType);
-  mlir::VectorType maskType =
-      mlir::VectorType::get({4}, rewriter.getI1Type(), {true});
-  mlir::VectorType tileMaskType = scalableTileMaskType(context);
+  mlir::VectorType vectorType = scalableVectorType(elementType, refs->layout);
+  mlir::VectorType tileType = scalableTileType(elementType, refs->layout);
+  mlir::VectorType maskType = scalableMaskType(context, refs->layout);
+  mlir::VectorType tileMaskType = scalableTileMaskType(context, refs->layout);
 
   std::optional<mlir::Value> scalarZero =
       createPrimitiveZeroValue(rewriter, loc, elementType);
@@ -324,10 +363,10 @@ mlir::LogicalResult lowerStaticF32MatmulToSME(mlir::linalg::MatmulOp matmul,
   mlir::Value mUpper = createIndexConstant(rewriter, loc, refs->m);
   mlir::Value nUpper = createIndexConstant(rewriter, loc, refs->n);
   mlir::Value kUpper = createIndexConstant(rewriter, loc, refs->k);
-  mlir::Value vl =
-      mlir::arm_sme::StreamingVLOp::create(
-          rewriter, loc, rewriter.getIndexType(), mlir::arm_sme::TypeSize::Word)
-          .getResult();
+  mlir::Value vl = mlir::arm_sme::StreamingVLOp::create(
+                       rewriter, loc, rewriter.getIndexType(),
+                       refs->layout.streamingVLUnit)
+                       .getResult();
   mlir::Value packedLhs = createPackedLhsPanel(rewriter, loc, *refs);
   auto packedLhsType = mlir::cast<mlir::MemRefType>(packedLhs.getType());
   SMEMatmulViews views{
@@ -394,6 +433,9 @@ class MatmulSMELoweringPass
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(MatmulSMELoweringPass)
 
+  explicit MatmulSMELoweringPass(py::TensorLoweringTarget target = {})
+      : target(target) {}
+
   llvm::StringRef getArgument() const final {
     return "lython-arm-sme-matmul-lowering";
   }
@@ -412,7 +454,8 @@ public:
   void runOnOperation() final {
     llvm::SmallVector<mlir::linalg::MatmulOp, 16> matmuls;
     getOperation().walk([&](mlir::linalg::MatmulOp matmul) {
-      std::optional<StaticMatmulMemRefs> refs = matchStaticF32Matmul(matmul);
+      std::optional<StaticMatmulMemRefs> refs =
+          matchStaticSMEMatmul(matmul, target);
       if (refs && isProfitableStaticSMEMatmul(*refs))
         matmuls.push_back(matmul);
     });
@@ -421,19 +464,22 @@ public:
     for (mlir::linalg::MatmulOp matmul : matmuls) {
       if (!matmul->getBlock())
         continue;
-      if (mlir::failed(lowerStaticF32MatmulToSME(matmul, rewriter))) {
+      if (mlir::failed(lowerStaticMatmulToSME(matmul, rewriter, target))) {
         signalPassFailure();
         return;
       }
     }
   }
+
+private:
+  py::TensorLoweringTarget target;
 };
 
 } // namespace
 
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createMatmulSMELoweringPass() {
-  return std::make_unique<MatmulSMELoweringPass>();
+createMatmulSMELoweringPass(py::TensorLoweringTarget target) {
+  return std::make_unique<MatmulSMELoweringPass>(target);
 }
 
 } // namespace py::lowering::arch::arm

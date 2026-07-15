@@ -250,11 +250,24 @@ private:
   std::optional<Value>
   emitPrimitiveConstructorCall(const parser::Node &expr,
                                const parser::Node *calleeNode);
+  std::optional<Value> emitPrimitiveFactoryCall(const parser::Node &expr,
+                                                const parser::Node *calleeNode);
   std::optional<Value> emitPrimitiveRuntimeCall(const parser::Node &expr,
                                                 const parser::Node *calleeNode);
   std::optional<Value>
   emitDirectPrimitiveFunctionCall(const parser::Node &expr,
                                   const parser::Node *calleeNode);
+  llvm::SmallVector<mlir::Value, 4>
+  emitPrimitiveTensorIndices(const parser::Node &expr,
+                             mlir::RankedTensorType tensorType,
+                             const parser::Node *slice);
+  std::optional<Value> emitPrimitiveTensorGetItem(const parser::Node &expr,
+                                                  Value container,
+                                                  const parser::Node *slice);
+  std::optional<Value> emitPrimitiveTensorSetItem(const parser::Node &expr,
+                                                  Value container,
+                                                  const parser::Node *slice,
+                                                  Value element);
   std::optional<Value> emitPrimitiveBinary(const parser::Node &expr, Value lhs,
                                            Value rhs, const parser::Node *op);
   std::optional<Value> emitPrimitiveCompare(const parser::Node &expr, Value lhs,

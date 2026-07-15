@@ -1969,6 +1969,10 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
             primitiveTypeSpecFromSubscript(node, *this))
       return typeObject(primitive->type);
     mlir::Type container = recurse(ast::node(*node, "value"));
+    // A shaped primitive indexes down to its element type; there is no
+    // manifest __getitem__ behind it to infer through.
+    if (auto tensor = mlir::dyn_cast_or_null<mlir::RankedTensorType>(container))
+      return tensor.getElementType();
     mlir::Type index = recurse(ast::node(*node, "slice"));
     if (strict) {
       if (!container || !index)

@@ -430,6 +430,102 @@ ModuleEmitter::emitPrimitiveConstructorCall(const parser::Node &expr,
 }
 
 std::optional<Value>
+ModuleEmitter::emitPrimitiveFactoryCall(const parser::Node &expr,
+                                        const parser::Node *calleeNode) {
+  if (!calleeNode || calleeNode->kind != "Attribute")
+    return std::nullopt;
+  auto attribute = ast::string(*calleeNode, "attr");
+  if (!attribute)
+    return std::nullopt;
+  std::optional<PrimitiveTypeSpec> primitive =
+      primitiveTypeSpecFromSubscript(ast::node(*calleeNode, "value"), types);
+  if (!primitive)
+    return std::nullopt;
+
+  // The receiver is a lyrt.prim type, so an unrecognized name is answered here
+  // rather than left to the manifest lookup, which would report the type
+  // parameters as a failed __getitem__ and name neither the type nor the call.
+  llvm::StringRef factory = *attribute;
+  if (factory != "zeros" && factory != "ones" && factory != "full") {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "lyrt.prim types provide no method '" + factory.str() +
+            "'; shaped primitives provide zeros, ones and full"});
+    return emitNone(expr);
+  }
+
+  auto tensorType = mlir::dyn_cast<mlir::RankedTensorType>(primitive->type);
+  if (!tensorType) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "lyrt.prim." + factory.str() +
+            " is only available on shaped primitives"});
+    return emitNone(expr);
+  }
+
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  std::size_t expected = factory == "full" ? 1 : 0;
+  if ((args ? args->size() : 0) != expected || (keywords && !keywords->empty())) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "lyrt.prim." + factory.str() + " expects exactly " +
+            std::to_string(expected) + " positional argument" +
+            (expected == 1 ? "" : "s")});
+    return emitNone(expr);
+  }
+
+  mlir::Location location = loc(expr);
+  mlir::Type elementType = tensorType.getElementType();
+  const parser::Node *valueNode = expected == 1 ? args->front().get() : nullptr;
+
+  // zeros/ones are constants by construction, and a literal fill folds to the
+  // same dense form the constructor builds. Only a computed fill needs a splat.
+  std::optional<mlir::Attribute> element;
+  if (factory == "zeros" || factory == "ones") {
+    double magnitude = factory == "ones" ? 1.0 : 0.0;
+    if (auto intType = mlir::dyn_cast<mlir::IntegerType>(elementType))
+      element = builder.getIntegerAttr(intType, static_cast<int64_t>(magnitude));
+    else if (auto floatType = mlir::dyn_cast<mlir::FloatType>(elementType))
+      element = builder.getFloatAttr(floatType, magnitude);
+  } else {
+    element = primitiveElementAttr(builder, elementType, valueNode);
+  }
+  if (element) {
+    auto dense = mlir::DenseElementsAttr::get(tensorType, *element);
+    auto op =
+        mlir::arith::ConstantOp::create(builder, location, tensorType, dense);
+    return Value{op.getResult(), tensorType};
+  }
+
+  Value fill = emitExpr(valueNode);
+  if (!fill.value)
+    return emitNone(expr);
+  mlir::Value scalar = fill.value;
+  if (auto targetFloat = mlir::dyn_cast<mlir::FloatType>(elementType)) {
+    if (mlir::isa<mlir::FloatType>(scalar.getType()))
+      scalar = coerceFloatValue(builder, location, scalar, targetFloat);
+  } else if (auto targetInt = mlir::dyn_cast<mlir::IntegerType>(elementType)) {
+    if (mlir::isa<mlir::IntegerType>(scalar.getType()))
+      scalar =
+          coercePrimitiveInteger(Value{scalar, scalar.getType()}, targetInt,
+                                 expr)
+              .value;
+  }
+  if (scalar.getType() != elementType) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "lyrt.prim.full expects a numeric literal or a primitive scalar "
+        "matching the element type"});
+    return emitNone(expr);
+  }
+
+  auto splat = mlir::tensor::SplatOp::create(builder, location, tensorType,
+                                             scalar, mlir::ValueRange{});
+  return Value{splat.getResult(), tensorType};
+}
+
+std::optional<Value>
 ModuleEmitter::emitPrimitiveRuntimeCall(const parser::Node &expr,
                                         const parser::Node *calleeNode) {
   if (!calleeNode)
@@ -587,6 +683,121 @@ ModuleEmitter::emitDirectPrimitiveFunctionCall(const parser::Node &expr,
       mlir::func::CallOp::create(builder, loc(expr), target.getSymName(),
                                  callable.getResultTypes(), operands);
   return Value{call.getResult(0), callable.getResultTypes().front()};
+}
+
+llvm::SmallVector<mlir::Value, 4>
+ModuleEmitter::emitPrimitiveTensorIndices(const parser::Node &expr,
+                                          mlir::RankedTensorType tensorType,
+                                          const parser::Node *slice) {
+  llvm::SmallVector<const parser::Node *, 4> axes;
+  if (slice && slice->kind == "Tuple") {
+    if (const auto *elts = ast::nodeList(*slice, "elts"))
+      for (const parser::NodePtr &elt : *elts)
+        axes.push_back(elt.get());
+  } else {
+    axes.push_back(slice);
+  }
+
+  int64_t rank = tensorType.getRank();
+  if (axes.size() != static_cast<std::size_t>(rank)) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "shaped primitive of rank " + std::to_string(rank) + " indexed with " +
+            std::to_string(axes.size()) + " indices"});
+    return {};
+  }
+
+  llvm::SmallVector<mlir::Value, 4> indices;
+  indices.reserve(axes.size());
+  for (auto [axis, node] : llvm::enumerate(axes)) {
+    // Why literals only: the shape is static, so an out-of-range index is a
+    // static error rather than a runtime one, and shaped primitives carry no
+    // runtime bound to check a computed index against.
+    std::optional<double> literal = numericLiteralValue(node);
+    if (!literal || *literal != std::floor(*literal)) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, expr.range.start,
+          "shaped primitive index must be an integer literal"});
+      return {};
+    }
+    int64_t extent = tensorType.getDimSize(static_cast<int64_t>(axis));
+    auto written = static_cast<int64_t>(*literal);
+    int64_t index = written < 0 ? written + extent : written;
+    if (index < 0 || index >= extent) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, expr.range.start,
+          "shaped primitive index " + std::to_string(written) +
+              " is out of range for axis " + std::to_string(axis) +
+              " of extent " + std::to_string(extent)});
+      return {};
+    }
+    indices.push_back(constantIndex(builder, loc(expr), index));
+  }
+  return indices;
+}
+
+std::optional<Value>
+ModuleEmitter::emitPrimitiveTensorGetItem(const parser::Node &expr,
+                                          Value container,
+                                          const parser::Node *slice) {
+  auto tensorType =
+      mlir::dyn_cast<mlir::RankedTensorType>(container.value.getType());
+  if (!tensorType)
+    return std::nullopt;
+
+  llvm::SmallVector<mlir::Value, 4> indices =
+      emitPrimitiveTensorIndices(expr, tensorType, slice);
+  if (indices.empty())
+    return Value{};
+
+  auto extract = mlir::tensor::ExtractOp::create(builder, loc(expr),
+                                                 container.value, indices);
+  return Value{extract.getResult(), tensorType.getElementType()};
+}
+
+std::optional<Value>
+ModuleEmitter::emitPrimitiveTensorSetItem(const parser::Node &expr,
+                                          Value container,
+                                          const parser::Node *slice,
+                                          Value element) {
+  auto tensorType =
+      mlir::dyn_cast<mlir::RankedTensorType>(container.value.getType());
+  if (!tensorType)
+    return std::nullopt;
+
+  llvm::SmallVector<mlir::Value, 4> indices =
+      emitPrimitiveTensorIndices(expr, tensorType, slice);
+  if (indices.empty())
+    return Value{};
+
+  mlir::Location location = loc(expr);
+  mlir::Type elementType = tensorType.getElementType();
+  mlir::Value scalar = element.value;
+  if (!scalar) {
+    return Value{};
+  }
+  if (auto targetFloat = mlir::dyn_cast<mlir::FloatType>(elementType)) {
+    if (mlir::isa<mlir::FloatType>(scalar.getType()))
+      scalar = coerceFloatValue(builder, location, scalar, targetFloat);
+  } else if (auto targetInt = mlir::dyn_cast<mlir::IntegerType>(elementType)) {
+    if (mlir::isa<mlir::IntegerType>(scalar.getType()))
+      scalar = coercePrimitiveInteger(Value{scalar, scalar.getType()},
+                                      targetInt, expr)
+                   .value;
+  }
+  if (scalar.getType() != elementType) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "shaped primitive element assignment expects a matching primitive "
+        "scalar"});
+    return Value{};
+  }
+
+  // tensor.insert yields a new value rather than mutating in place; the caller
+  // rebinds the target so the local's later reads observe the assignment.
+  auto insert = mlir::tensor::InsertOp::create(builder, location, scalar,
+                                               container.value, indices);
+  return Value{insert.getResult(), tensorType};
 }
 
 std::optional<Value>

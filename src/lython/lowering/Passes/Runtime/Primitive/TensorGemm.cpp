@@ -9,6 +9,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
@@ -226,6 +227,34 @@ mlir::Value packRhsPanel(mlir::linalg::MatmulOp matmul,
 
 void setMicroTileAttrs(mlir::Operation *op, MatmulTileShape tile);
 
+bool loopHasPartialTile(mlir::scf::ForOp forOp) {
+  std::optional<int64_t> lower =
+      mlir::getConstantIntValue(forOp.getLowerBound());
+  std::optional<int64_t> upper =
+      mlir::getConstantIntValue(forOp.getUpperBound());
+  std::optional<int64_t> step = mlir::getConstantIntValue(forOp.getStep());
+  if (!lower || !upper || !step || *step <= 0 || *upper <= *lower)
+    return false;
+  return (*upper - *lower) % *step != 0;
+}
+
+// A tile that does not divide its extent leaves the trailing iteration with an
+// affine.min extent, which makes the tiled matmul read as dynamically shaped.
+// staticMatmulShape then declines it, classifyMatmulLowering calls it
+// Conservative, so neither the micro-kernel nor the vectorizer claims it, and
+// the affine loop conversion finally rejects the affine.min as a bound
+// operand. Peeling splits the extent so both the main and the trailing nest
+// carry static tiles. Innermost first: peeling a loop clones the loops nested
+// inside it, and those clones are not in `loops`.
+void peelPartialTileLoops(llvm::ArrayRef<mlir::Operation *> loops,
+                          mlir::IRRewriter &rewriter) {
+  for (mlir::Operation *loop : llvm::reverse(loops)) {
+    auto forOp = mlir::dyn_cast_or_null<mlir::scf::ForOp>(loop);
+    if (forOp && loopHasPartialTile(forOp))
+      mlir::linalg::peelLoop(rewriter, forOp);
+  }
+}
+
 mlir::LogicalResult
 tileMatmul(mlir::linalg::MatmulOp matmul, MatmulTileShape tile,
            mlir::IRRewriter &rewriter, bool packRhs = false,
@@ -264,6 +293,7 @@ tileMatmul(mlir::linalg::MatmulOp matmul, MatmulTileShape tile,
     setMicroTileAttrs(tiled->op.getOperation(), *nextMicroTile);
 
   rewriter.replaceOp(matmul, tiled->tensorResults);
+  peelPartialTileLoops(tiled->loops, rewriter);
   return mlir::success();
 }
 

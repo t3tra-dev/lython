@@ -130,63 +130,6 @@ lython::driver::DriverOptions Options;
 std::vector<std::string> IncludeSearchPaths;
 std::vector<std::string> LibrarySearchPaths;
 
-void *armStreamingCompatibleMemcpy(void *dest, const void *src,
-                                   std::size_t count) {
-  auto *out = static_cast<volatile unsigned char *>(dest);
-  const auto *in = static_cast<const volatile unsigned char *>(src);
-  for (std::size_t index = 0; index < count; ++index)
-    out[index] = in[index];
-  return dest;
-}
-
-void *armStreamingCompatibleMemmove(void *dest, const void *src,
-                                    std::size_t count) {
-  auto *out = static_cast<volatile unsigned char *>(dest);
-  const auto *in = static_cast<const volatile unsigned char *>(src);
-  if (reinterpret_cast<std::uintptr_t>(dest) <=
-      reinterpret_cast<std::uintptr_t>(src)) {
-    for (std::size_t index = 0; index < count; ++index)
-      out[index] = in[index];
-  } else {
-    for (std::size_t index = count; index > 0; --index)
-      out[index - 1] = in[index - 1];
-  }
-  return dest;
-}
-
-void *armStreamingCompatibleMemset(void *dest, int value, std::size_t count) {
-  auto *out = static_cast<volatile unsigned char *>(dest);
-  auto byte = static_cast<unsigned char>(value);
-  for (std::size_t index = 0; index < count; ++index)
-    out[index] = byte;
-  return dest;
-}
-
-void *armStreamingCompatibleMemchr(void *ptr, int value, std::size_t count) {
-  auto *bytes = static_cast<unsigned char *>(ptr);
-  auto needle = static_cast<unsigned char>(value);
-  for (std::size_t index = 0; index < count; ++index) {
-    volatile unsigned char current = bytes[index];
-    if (current == needle)
-      return bytes + index;
-  }
-  return nullptr;
-}
-
-llvm::orc::SymbolMap
-buildRuntimeSymbolMap(llvm::orc::MangleAndInterner interner) {
-  llvm::orc::SymbolMap symbolMap;
-  auto add = [&](llvm::StringRef name, auto *ptr) {
-    symbolMap[interner(name)] = {llvm::orc::ExecutorAddr::fromPtr(ptr),
-                                 llvm::JITSymbolFlags::Exported};
-  };
-  add("__arm_sc_memcpy", &armStreamingCompatibleMemcpy);
-  add("__arm_sc_memmove", &armStreamingCompatibleMemmove);
-  add("__arm_sc_memset", &armStreamingCompatibleMemset);
-  add("__arm_sc_memchr", &armStreamingCompatibleMemchr);
-  return symbolMap;
-}
-
 LogicalResult runCppParserDump(StringRef inputPath, bool typeComments,
                                bool includeAttributes, bool interactiveMode,
                                bool expressionMode, bool functionTypeMode) {
@@ -663,10 +606,6 @@ FailureOr<int> runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
               jit->getDataLayout().getGlobalPrefix());
       if (dlGen)
         jd.addGenerator(std::move(*dlGen));
-      llvm::orc::MangleAndInterner interner(jd.getExecutionSession(),
-                                            jit->getDataLayout());
-      auto symbolMap = buildRuntimeSymbolMap(interner);
-      cantFail(jd.define(absoluteSymbols(std::move(symbolMap))));
     }
 
     auto tsm = llvm::orc::ThreadSafeModule(std::move(llvmModule),

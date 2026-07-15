@@ -227,6 +227,35 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
   if (target.kind == "Subscript") {
     const parser::Node *containerNode = ast::node(target, "value");
     Value container = emitExpr(containerNode);
+    if (container.value &&
+        mlir::isa<mlir::RankedTensorType>(container.value.getType())) {
+      // Shaped primitives are values, so the element write produces a new
+      // one. Only a named local can observe it; anything else would drop the
+      // result on the floor.
+      if (!containerNode || containerNode->kind != "Name") {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, target.range.start,
+            "shaped primitive element assignment requires a named local "
+            "target"});
+        return;
+      }
+      llvm::StringRef containerName = ast::nameSpelling(*containerNode);
+      auto bound = values.find(containerName);
+      if (bound == values.end() || bound->second.value != container.value) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, target.range.start,
+            "shaped primitive element assignment requires a named local "
+            "target"});
+        return;
+      }
+      if (std::optional<Value> updated = emitPrimitiveTensorSetItem(
+              target, container, ast::node(target, "slice"), value)) {
+        if (updated->value)
+          values[containerName] = *updated;
+        return;
+      }
+      return;
+    }
     Value index = emitExpr(ast::node(target, "slice"));
     if (std::optional<MethodBinding> method =
             lookupClassMethod(container.type, "__setitem__")) {

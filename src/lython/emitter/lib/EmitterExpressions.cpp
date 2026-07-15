@@ -687,6 +687,14 @@ std::optional<Value> ModuleEmitter::emitOptionalCompare(
 
 Value ModuleEmitter::emitSubscript(const parser::Node &expr) {
   Value container = emitExpr(ast::node(expr, "value"));
+  // Shaped primitives are indexed before the slice is emitted: their indices
+  // are static shape coordinates, not values a manifest __getitem__ receives.
+  if (container.value &&
+      mlir::isa<mlir::RankedTensorType>(container.value.getType())) {
+    if (std::optional<Value> element = emitPrimitiveTensorGetItem(
+            expr, container, ast::node(expr, "slice")))
+      return element->value ? *element : emitNone(expr);
+  }
   Value index = emitExpr(ast::node(expr, "slice"));
   if (std::optional<MethodBinding> method =
           lookupClassMethod(container.type, "__getitem__"))

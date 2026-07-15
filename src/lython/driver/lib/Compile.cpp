@@ -40,6 +40,7 @@ LogicalResult translateToVerifiedLLVMIR(ModuleOp module,
     return failure();
   }
   py::installPythonExceptionCleanupFrames(*llvmModule, pythonCallSites);
+  py::installArmStreamingCompatibleMemoryRoutines(*llvmModule);
   dumpLLVMForPass(irDump, "llvm-translation", *llvmModule);
   if (!options.releaseMode &&
       failed(verifyLLVMIRSafetyMetadataAttached(*llvmModule, safetyProfile,

@@ -48,6 +48,18 @@ llvm::SmallVector<CarriedLoopLocal, 4> ModuleEmitter::collectCarriedLoopLocals(
   for (const std::string &name : names) {
     Value initial = values.find(name)->second;
     mlir::Type carriedType = types.widenLiteral(initial.type);
+    // Bufferization does not cross the cf edges loops emit as, so a shaped
+    // primitive reaching one survives to the LLVM conversion and only reports
+    // there, as a cf.br on a tensor. Reject it here, where the local can still
+    // be named.
+    if (mlir::isa<mlir::RankedTensorType>(carriedType)) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, statement.range.start,
+          "primitive tensor local '" + name +
+              "' cannot be reassigned inside a loop: shaped primitives are not "
+              "loop-carried values"});
+      continue;
+    }
     carried.push_back(CarriedLoopLocal{name, carriedType});
     initialValues.push_back(coerceValue(initial, carriedType, statement).value);
   }
@@ -79,7 +91,10 @@ llvm::SmallVector<mlir::Value, 4> ModuleEmitter::carriedLoopEdgeOperands(
     // Release the current-iteration header value when the body replaced it, so
     // the loop-carried ownership token stays balanced on every edge that
     // leaves the body (back-edge, break, continue, async-for try yield).
-    if (headerBlock && index < headerBlock->getNumArguments()) {
+    // Locals that are not contract terms (primitive scalars and tensors) carry
+    // no token to balance, and py.decref does not accept them.
+    if (headerBlock && index < headerBlock->getNumArguments() &&
+        py::isPyContractType(local.type)) {
       mlir::Value previous = headerBlock->getArgument(index);
       if (value != previous && !derivesViaStructuralMutation(value, previous))
         py::DecRefOp::create(builder, loc(anchor), previous);

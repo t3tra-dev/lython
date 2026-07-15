@@ -160,6 +160,8 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
   if (std::optional<Value> primitive =
           emitPrimitiveConstructorCall(expr, calleeNode))
     return *primitive;
+  if (std::optional<Value> primitive = emitPrimitiveFactoryCall(expr, calleeNode))
+    return *primitive;
   if (std::optional<Value> primitive =
           emitPrimitiveRuntimeCall(expr, calleeNode))
     return *primitive;

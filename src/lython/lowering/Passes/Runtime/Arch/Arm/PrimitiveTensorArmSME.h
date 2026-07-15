@@ -16,7 +16,7 @@ bool usesSME(const py::TensorLoweringTarget &target);
 void registerSMEDialects(mlir::DialectRegistry &registry);
 
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createMatmulSMELoweringPass();
+createMatmulSMELoweringPass(py::TensorLoweringTarget target = {});
 
 void addSMELinalgPipeline(mlir::OpPassManager &pipeline);
 

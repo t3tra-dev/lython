@@ -1321,7 +1321,7 @@ public:
     pipeline.addPass(
         mlir::bufferization::createOneShotBufferizePass(bufferizeOptions));
     if (arch::arm::usesSME(target))
-      pipeline.addPass(arch::arm::createMatmulSMELoweringPass());
+      pipeline.addPass(arch::arm::createMatmulSMELoweringPass(target));
     pipeline.addPass(createMatmulTilingPass());
     pipeline.addPass(createMatmulPackingPass());
     pipeline.addPass(createPackedPanelHoistingPass());
@@ -1335,6 +1335,12 @@ public:
       arch::arm::addSMELinalgPipeline(pipeline);
     if (arch::x86::usesX86(target))
       arch::x86::addX86LinalgPipeline(pipeline);
+    // Tiling a dimension by a larger tile leaves the partial-tile extent as an
+    // affine.min the affine loop conversion below cannot take as a bound. Why
+    // not leave this to the arch pipelines: they only ran it by accident of
+    // ending in canonicalization, which left the generic path unable to compile
+    // any matmul with such a dimension.
+    pipeline.addPass(mlir::createCanonicalizerPass());
     pipeline.addPass(mlir::createLoopInvariantCodeMotionPass());
     pipeline.addPass(mlir::createCSEPass());
     pipeline.addPass(std::make_unique<ViewAccessLoweringPass>());

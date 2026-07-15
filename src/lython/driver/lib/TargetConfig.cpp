@@ -174,6 +174,8 @@ std::string codeGenFeaturesForTarget(py::TensorLoweringTarget target,
     appendTargetFeature(features, "sme");
     if (targetFeatureEnabled(triple, "sme2", options))
       appendTargetFeature(features, "sme2");
+    if (targetFeatureEnabled(triple, "sme-f64f64", options))
+      appendTargetFeature(features, "sme-f64f64");
     return features;
   }
   llvm::Triple hostTriple(llvm::sys::getDefaultTargetTriple());
@@ -241,6 +243,8 @@ static bool hostFeatureEnabled(llvm::StringRef feature) {
     sysctlName = "hw.optional.arm.FEAT_SME";
   else if (feature == "sme2")
     sysctlName = "hw.optional.arm.FEAT_SME2";
+  else if (feature == "sme-f64f64")
+    sysctlName = "hw.optional.arm.FEAT_SME_F64F64";
   if (!sysctlName.empty()) {
     int enabled = 0;
     size_t size = sizeof(enabled);
@@ -307,8 +311,10 @@ detectTensorLoweringTarget(const DriverOptions &options) {
   llvm::Triple triple = codeGenTripleForTarget({}, options);
   py::TensorLoweringTarget target;
   if (triple.isAArch64() && (targetFeatureEnabled(triple, "sme", options) ||
-                             targetFeatureEnabled(triple, "sme2", options)))
+                             targetFeatureEnabled(triple, "sme2", options))) {
     target.architecture = py::TensorLoweringArchitecture::ArmSME;
+    target.armSMEF64F64 = targetFeatureEnabled(triple, "sme-f64f64", options);
+  }
   if (triple.getArch() == llvm::Triple::x86_64) {
     if (targetFeatureEnabled(triple, "avx2", options) &&
         targetFeatureEnabled(triple, "fma", options))

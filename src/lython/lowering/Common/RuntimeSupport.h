@@ -25,9 +25,16 @@ enum class TensorLoweringArchitecture {
 struct TensorLoweringTarget {
   TensorLoweringArchitecture architecture = TensorLoweringArchitecture::Generic;
 
+  // FEAT_SME_F64F64 is optional on top of SME: without it the ZA double-word
+  // tiles the f64 outer product needs do not exist, and codegen would fail to
+  // select FMOPA.D rather than degrade.
+  bool armSMEF64F64 = false;
+
   bool usesArmSME() const {
     return architecture == TensorLoweringArchitecture::ArmSME;
   }
+
+  bool usesArmSMEF64() const { return usesArmSME() && armSMEF64F64; }
 
   bool usesX86() const {
     return architecture == TensorLoweringArchitecture::X86SSE42 ||
@@ -59,6 +66,7 @@ void collectPythonCallSiteRanges(
     llvm::SmallVectorImpl<PythonCallSiteRange> &callSites);
 bool installPythonExceptionCleanupFrames(
     llvm::Module &module, llvm::ArrayRef<PythonCallSiteRange> callSites);
+void installArmStreamingCompatibleMemoryRoutines(llvm::Module &module);
 
 namespace optimizer::publication {
 void prepare(mlir::ModuleOp module);
