@@ -196,6 +196,135 @@ RuntimeBundleLowerer::lowerCastFromPrim(py::CastFromPrimOp op) {
                         << " has no manifest-driven runtime lowering yet";
 }
 
+mlir::LogicalResult RuntimeBundleLowerer::lowerCastToPrim(py::CastToPrimOp op) {
+  builder.setInsertionPoint(op);
+  if (mlir::failed(ensureValueBundle(op, op.getInput())))
+    return mlir::failure();
+  const RuntimeBundle *source = bundleFor(op.getInput());
+  if (!source)
+    return op.emitError() << "cast.to_prim input has no lowered runtime bundle";
+
+  mlir::Location loc = op.getLoc();
+  mlir::Type resultType = op.getResult().getType();
+  llvm::StringRef mode = op.getMode();
+
+  auto finish = [&](mlir::Value value) {
+    op.getResult().replaceAllUsesWith(value);
+    erase.push_back(op);
+    return mlir::success();
+  };
+
+  // The i64 payload of an int-like source. The evidence lane carries a valid
+  // bit because arithmetic may overflow into the boxed representation; using
+  // the lane value while it is invalid would be a silent mis-execution, so it
+  // is asserted rather than branched around (the boxed fallback has no
+  // statically known shape here).
+  auto materializeI64 = [&]() -> mlir::FailureOr<mlir::Value> {
+    if (source->primitiveI64) {
+      mlir::cf::AssertOp::create(
+          builder, loc, source->primitiveI64->valid,
+          "lython: int value left the primitive i64 range before a "
+          "primitive cast");
+      return source->primitiveI64->value;
+    }
+    std::optional<RuntimeSymbol> unbox =
+        manifest.primitive(source->contractName(), "unbox.i64");
+    if (!unbox || unbox->function.getNumArguments() !=
+                      source->physicalValues().size())
+      return op.emitError()
+             << "cast.to_prim from " << source->contractName()
+             << " has no i64 unbox primitive";
+    mlir::func::CallOp call =
+        createRuntimeCall(loc, *unbox, source->physicalValues());
+    if (call.getNumResults() != 1 ||
+        !call.getResult(0).getType().isInteger(64))
+      return op.emitError()
+             << "cast.to_prim i64 unbox primitive must return i64";
+    return call.getResult(0);
+  };
+
+  if (auto floatType = mlir::dyn_cast<mlir::FloatType>(resultType)) {
+    mlir::Value raw;
+    if (source->primitiveI64) {
+      mlir::FailureOr<mlir::Value> payload = materializeI64();
+      if (mlir::failed(payload))
+        return mlir::failure();
+      raw = mlir::arith::SIToFPOp::create(builder, loc, floatType, *payload)
+                .getResult();
+      return finish(raw);
+    }
+    std::optional<RuntimeSymbol> unbox =
+        manifest.primitive(source->contractName(), "unbox.f64");
+    if (!unbox || unbox->function.getNumArguments() !=
+                      source->physicalValues().size())
+      return op.emitError()
+             << "cast.to_prim from " << source->contractName()
+             << " has no f64 unbox primitive";
+    mlir::func::CallOp call =
+        createRuntimeCall(loc, *unbox, source->physicalValues());
+    if (call.getNumResults() != 1 || !call.getResult(0).getType().isF64())
+      return op.emitError()
+             << "cast.to_prim f64 unbox primitive must return f64";
+    raw = call.getResult(0);
+    unsigned width = floatType.getWidth();
+    if (width < 64)
+      raw = mlir::arith::TruncFOp::create(builder, loc, floatType, raw)
+                .getResult();
+    return finish(raw);
+  }
+
+  if (auto intType = mlir::dyn_cast<mlir::IntegerType>(resultType)) {
+    mlir::FailureOr<mlir::Value> payload = materializeI64();
+    if (mlir::failed(payload))
+      return mlir::failure();
+    mlir::Value value = *payload;
+    unsigned width = intType.getWidth();
+    if (width > 64)
+      return finish(
+          mlir::arith::ExtSIOp::create(builder, loc, intType, value)
+              .getResult());
+    if (width == 64)
+      return finish(value);
+
+    mlir::Type i64 = builder.getI64Type();
+    if (mode == "saturate") {
+      std::int64_t max = (std::int64_t(1) << (width - 1)) - 1;
+      std::int64_t min = -(std::int64_t(1) << (width - 1));
+      mlir::Value maxValue =
+          mlir::arith::ConstantIntOp::create(builder, loc, max, 64)
+              .getResult();
+      mlir::Value minValue =
+          mlir::arith::ConstantIntOp::create(builder, loc, min, 64)
+              .getResult();
+      value = mlir::arith::MinSIOp::create(builder, loc, value, maxValue)
+                  .getResult();
+      value = mlir::arith::MaxSIOp::create(builder, loc, value, minValue)
+                  .getResult();
+    }
+    mlir::Value narrowed =
+        mlir::arith::TruncIOp::create(builder, loc, intType, value)
+            .getResult();
+    if (mode == "exact") {
+      mlir::Value widened =
+          mlir::arith::ExtSIOp::create(builder, loc, i64, narrowed)
+              .getResult();
+      mlir::Value fits =
+          mlir::arith::CmpIOp::create(builder, loc,
+                                      mlir::arith::CmpIPredicate::eq, widened,
+                                      value)
+              .getResult();
+      mlir::cf::AssertOp::create(
+          builder, loc, fits,
+          "lython: int value is out of range for the primitive integer "
+          "width");
+    }
+    return finish(narrowed);
+  }
+
+  return op.emitError() << "cast.to_prim result type is not a primitive "
+                           "integer or float";
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::lowerTypeObject(py::TypeObjectOp op) {
   valueBundles[op.getResult()] = RuntimeBundle::typeObject(
       op.getResult().getType(), op.getInstanceContract());

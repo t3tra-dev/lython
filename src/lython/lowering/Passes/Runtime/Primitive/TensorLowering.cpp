@@ -23,6 +23,7 @@
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
@@ -119,17 +120,33 @@ llvm::SmallVector<mlir::Value, 8> collectAliasValues(mlir::Value value) {
   return aliases;
 }
 
-std::optional<mlir::Operation *>
-findPrimitiveTensorReleaseAnchor(mlir::memref::AllocOp alloc) {
-  mlir::Operation *anchor = alloc.getOperation();
-  mlir::Block *allocBlock = anchor->getBlock();
+// Where a primitive tensor allocation is released: right after its last use
+// when every use stays in the allocation's block, or on every function exit
+// when uses cross into other blocks of the same function (a CFG loop body
+// reading a buffer allocated in the entry block). Function-exit release is
+// only sound when the allocation dominates each return, which the caller
+// verifies before inserting.
+struct PrimitiveTensorReleasePlan {
+  mlir::Operation *anchor = nullptr;
+  bool atFunctionExit = false;
+};
+
+std::optional<PrimitiveTensorReleasePlan>
+findPrimitiveTensorReleasePlan(mlir::memref::AllocOp alloc) {
+  PrimitiveTensorReleasePlan plan;
+  plan.anchor = alloc.getOperation();
+  mlir::Block *allocBlock = plan.anchor->getBlock();
+  auto function = alloc->getParentOfType<mlir::func::FuncOp>();
 
   for (mlir::Value alias : collectAliasValues(alloc.getResult())) {
     for (mlir::Operation *user : alias.getUsers()) {
       if (mlir::isa<mlir::memref::DeallocOp>(user))
         continue;
 
-      if (mlir::isa<mlir::func::ReturnOp, mlir::func::CallOp>(user)) {
+      // A func.call is not an escape: shaped-primitive callees only ever
+      // borrow their buffer parameters (results travel through out-params
+      // the caller allocates), so the call site is an ordinary last use.
+      if (mlir::isa<mlir::func::ReturnOp>(user)) {
         alloc.emitError()
             << "primitive tensor allocation escapes before deallocation";
         return std::nullopt;
@@ -138,19 +155,23 @@ findPrimitiveTensorReleaseAnchor(mlir::memref::AllocOp alloc) {
       mlir::Operation *topLevelUser = user;
       while (topLevelUser && topLevelUser->getBlock() != allocBlock)
         topLevelUser = topLevelUser->getParentOp();
-      if (!topLevelUser) {
+      if (!topLevelUser || topLevelUser->hasTrait<mlir::OpTrait::IsTerminator>()) {
+        if (function && user->getParentOfType<mlir::func::FuncOp>() == function) {
+          plan.atFunctionExit = true;
+          continue;
+        }
         alloc.emitError()
             << "cannot prove primitive tensor allocation release point";
         return std::nullopt;
       }
-      if (topLevelUser == anchor)
+      if (topLevelUser == plan.anchor)
         continue;
-      if (anchor->isBeforeInBlock(topLevelUser))
-        anchor = topLevelUser;
+      if (plan.anchor->isBeforeInBlock(topLevelUser))
+        plan.anchor = topLevelUser;
     }
   }
 
-  return anchor;
+  return plan;
 }
 
 bool isRankPreservingUnitStrideSubview(mlir::memref::SubViewOp subview) {
@@ -1228,16 +1249,43 @@ public:
       if (hasDeallocUse(alloc.getResult()))
         continue;
 
-      std::optional<mlir::Operation *> anchor =
-          findPrimitiveTensorReleaseAnchor(alloc);
-      if (!anchor) {
+      std::optional<PrimitiveTensorReleasePlan> plan =
+          findPrimitiveTensorReleasePlan(alloc);
+      if (!plan) {
         signalPassFailure();
         return;
       }
 
-      builder.setInsertionPointAfter(*anchor);
-      mlir::memref::DeallocOp::create(builder, alloc.getLoc(),
-                                      alloc.getResult());
+      if (!plan->atFunctionExit) {
+        builder.setInsertionPointAfter(plan->anchor);
+        mlir::memref::DeallocOp::create(builder, alloc.getLoc(),
+                                        alloc.getResult());
+        continue;
+      }
+
+      auto function = alloc->getParentOfType<mlir::func::FuncOp>();
+      mlir::DominanceInfo dominance(function);
+      llvm::SmallVector<mlir::func::ReturnOp, 4> returns;
+      function.walk(
+          [&](mlir::func::ReturnOp ret) { returns.push_back(ret); });
+      if (returns.empty()) {
+        alloc.emitError() << "primitive tensor allocation is used across "
+                             "blocks of a function without a return";
+        signalPassFailure();
+        return;
+      }
+      for (mlir::func::ReturnOp ret : returns) {
+        if (!dominance.dominates(alloc.getOperation(), ret)) {
+          alloc.emitError()
+              << "primitive tensor allocation does not dominate every "
+                 "function exit it must be released on";
+          signalPassFailure();
+          return;
+        }
+        builder.setInsertionPoint(ret);
+        mlir::memref::DeallocOp::create(builder, alloc.getLoc(),
+                                        alloc.getResult());
+      }
     }
   }
 };
@@ -1311,6 +1359,28 @@ public:
   void runOnOperation() final {
     mlir::bufferization::OneShotBufferizePassOptions bufferizeOptions;
     bufferizeOptions.allowUnknownOps = true;
+    // Without boundary bufferization a shaped-primitive func argument reaches
+    // the vectorizer as a fully-dynamic-strided to_buffer view, which
+    // vector.load rejects; identity layout is sound because every shaped
+    // primitive buffer is a dense row-major allocation.
+    bufferizeOptions.bufferizeFunctionBoundaries = true;
+    bufferizeOptions.functionBoundaryTypeConversion =
+        mlir::bufferization::LayoutMapOption::IdentityLayoutMap;
+    // Boundary analysis insists every analyzed function has a func.return, so
+    // functions that only raise (their control flow never rejoins a return)
+    // would be rejected outright. They carry no shaped-primitive signature to
+    // analyze; skipping them keeps them out of the boundary analysis without
+    // changing how their bodies bufferize.
+    llvm::SmallVector<std::string> noReturnFuncs;
+    getOperation().walk([&](mlir::func::FuncOp func) {
+      if (func.getBody().empty())
+        return;
+      bool hasReturn = false;
+      func.walk([&](mlir::func::ReturnOp) { hasReturn = true; });
+      if (!hasReturn)
+        noReturnFuncs.push_back(func.getSymName().str());
+    });
+    bufferizeOptions.noAnalysisFuncFilter = std::move(noReturnFuncs);
 
     mlir::affine::AffineVectorizeOptions vectorizeOptions;
     vectorizeOptions.vectorSizes = {4};
@@ -1320,6 +1390,13 @@ public:
     pipeline.addPass(createMatmulZeroInitElisionPass());
     pipeline.addPass(
         mlir::bufferization::createOneShotBufferizePass(bufferizeOptions));
+    // Returning a buffer would leave the callee's allocation escaping through
+    // the return edge, which the deallocation pass below refuses; out-params
+    // keep every shaped-primitive allocation owned by the frame that frees it.
+    mlir::bufferization::BufferResultsToOutParamsPassOptions outParamsOptions;
+    outParamsOptions.hoistStaticAllocs = true;
+    pipeline.addPass(mlir::bufferization::createBufferResultsToOutParamsPass(
+        outParamsOptions));
     if (arch::arm::usesSME(target))
       pipeline.addPass(arch::arm::createMatmulSMELoweringPass(target));
     pipeline.addPass(createMatmulTilingPass());

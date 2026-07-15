@@ -23,6 +23,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPyOp(mlir::Operation *op) {
       .Case<py::NoneOp>([&](auto none) { return lowerNone(none); })
       .Case<py::CastFromPrimOp>(
           [&](auto cast) { return lowerCastFromPrim(cast); })
+      .Case<py::CastToPrimOp>(
+          [&](auto cast) { return lowerCastToPrim(cast); })
       .Case<py::TypeObjectOp>(
           [&](auto typeObject) { return lowerTypeObject(typeObject); })
       .Case<py::ClassUpcastOp, py::ClassRefineOp, py::ProtocolViewOp>(

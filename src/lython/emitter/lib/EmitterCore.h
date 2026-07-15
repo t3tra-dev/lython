@@ -276,6 +276,16 @@ private:
                               const PrimitiveConstant &constant);
   Value coercePrimitiveInteger(Value value, mlir::IntegerType targetType,
                                const parser::Node &anchor);
+  // Adapt an already-emitted value to a primitive scalar type: primitive
+  // scalars coerce by width, Python int/float values unbox through
+  // py.cast.to_prim. Null value on failure (with a diagnostic).
+  mlir::Value coerceToPrimitiveScalar(Value value, mlir::Type elementType,
+                                      const parser::Node &anchor);
+  // Emit one element of a shaped-primitive constructor: numeric literals fold
+  // to constants, everything else goes through coerceToPrimitiveScalar.
+  mlir::Value emitPrimitiveElementValue(const parser::Node *node,
+                                        mlir::Type elementType,
+                                        const parser::Node &anchor);
   Value emitNone(const parser::Node &anchor);
   Value emitPack(mlir::ArrayRef<Value> values,
                  llvm::ArrayRef<char> unpacked = {});

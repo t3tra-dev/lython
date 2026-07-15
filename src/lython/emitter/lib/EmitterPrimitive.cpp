@@ -290,6 +290,37 @@ std::optional<Value> emitElementwiseTensorBinary(
   if (rhs.value.getType() != tensorType)
     return std::nullopt;
 
+  // Keep the elementwise product as a structured linalg op rather than
+  // unrolling to per-element scalar IR: unrolled constants fold away entirely
+  // (the op never reaches the runtime) and the unrolled form hides the
+  // parallel loop nest from the affine/vector lowering. The exception is the
+  // UBSan integer path, whose per-element cf.assert cannot live inside a
+  // linalg region.
+  bool requiresUnrolledAsserts =
+      sanitizeUndefined &&
+      mlir::isa<mlir::IntegerType>(tensorType.getElementType());
+  if (!requiresUnrolledAsserts) {
+    auto init = mlir::tensor::EmptyOp::create(builder, loc, tensorType,
+                                              mlir::ValueRange{});
+    mlir::ValueRange inputs{lhs.value, rhs.value};
+    mlir::ValueRange outputs{init.getResult()};
+    mlir::Operation *elementwise = nullptr;
+    if (ast::isOperator(op, "Add"))
+      elementwise = mlir::linalg::AddOp::create(
+          builder, loc, mlir::TypeRange{tensorType}, inputs, outputs);
+    else if (ast::isOperator(op, "Sub"))
+      elementwise = mlir::linalg::SubOp::create(
+          builder, loc, mlir::TypeRange{tensorType}, inputs, outputs);
+    else if (ast::isOperator(op, "Mult"))
+      elementwise = mlir::linalg::MulOp::create(
+          builder, loc, mlir::TypeRange{tensorType}, inputs, outputs);
+    if (!elementwise) {
+      init->erase();
+      return std::nullopt;
+    }
+    return Value{elementwise->getResult(0), tensorType};
+  }
+
   llvm::SmallVector<mlir::Value, 8> elements;
   llvm::SmallVector<std::int64_t, 4> current;
   enumerateTensorIndices(
@@ -361,6 +392,70 @@ std::optional<Value> emitMatrixMatmul(mlir::OpBuilder &builder,
 
 } // namespace
 
+mlir::Value ModuleEmitter::coerceToPrimitiveScalar(Value value,
+                                                   mlir::Type elementType,
+                                                   const parser::Node &anchor) {
+  if (!value.value)
+    return {};
+  mlir::Location location = loc(anchor);
+
+  if (auto targetInt = mlir::dyn_cast<mlir::IntegerType>(elementType)) {
+    if (mlir::isa<mlir::IntegerType>(value.value.getType()))
+      return coercePrimitiveInteger(value, targetInt, anchor).value;
+    if (types.widenLiteral(value.type) == types.intType()) {
+      // "exact" so an out-of-range runtime int traps instead of silently
+      // wrapping into the narrower width.
+      auto cast = py::CastToPrimOp::create(builder, location, targetInt,
+                                           value.value,
+                                           builder.getStringAttr("exact"));
+      return cast.getResult();
+    }
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, anchor.range.start,
+        "primitive integer conversion expects an integer literal, a primitive "
+        "integer, or a Python int value"});
+    return {};
+  }
+
+  if (auto targetFloat = mlir::dyn_cast<mlir::FloatType>(elementType)) {
+    if (mlir::isa<mlir::FloatType>(value.value.getType()))
+      return coerceFloatValue(builder, location, value.value, targetFloat);
+    if (mlir::isa<mlir::IntegerType>(value.value.getType()))
+      return mlir::arith::SIToFPOp::create(builder, location, targetFloat,
+                                           value.value)
+          .getResult();
+    mlir::Type widened = types.widenLiteral(value.type);
+    if (widened == types.floatType() || widened == types.intType()) {
+      auto cast = py::CastToPrimOp::create(builder, location, targetFloat,
+                                           value.value,
+                                           builder.getStringAttr("truncate"));
+      return cast.getResult();
+    }
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, anchor.range.start,
+        "primitive float conversion expects a numeric literal, a primitive "
+        "scalar, or a Python int/float value"});
+    return {};
+  }
+
+  diagnostics.push_back(
+      parser::Diagnostic{parser::Severity::Error, anchor.range.start,
+                         "primitive conversion target is not a scalar type"});
+  return {};
+}
+
+mlir::Value ModuleEmitter::emitPrimitiveElementValue(const parser::Node *node,
+                                                     mlir::Type elementType,
+                                                     const parser::Node &anchor) {
+  if (std::optional<mlir::Attribute> attr =
+          primitiveElementAttr(builder, elementType, node)) {
+    auto constant = mlir::arith::ConstantOp::create(
+        builder, loc(anchor), elementType, mlir::cast<mlir::TypedAttr>(*attr));
+    return constant.getResult();
+  }
+  return coerceToPrimitiveScalar(emitExpr(node), elementType, anchor);
+}
+
 std::optional<Value>
 ModuleEmitter::emitPrimitiveConstructorCall(const parser::Node &expr,
                                             const parser::Node *calleeNode) {
@@ -383,8 +478,11 @@ ModuleEmitter::emitPrimitiveConstructorCall(const parser::Node &expr,
             integerLiteralValue(args->front().get()))
       return emitPrimitiveConstant(expr,
                                    PrimitiveConstant{primitiveInt, *literal});
-    return coercePrimitiveInteger(emitExpr(args->front().get()), primitiveInt,
-                                  expr);
+    mlir::Value scalar = coerceToPrimitiveScalar(
+        emitExpr(args->front().get()), primitiveInt, expr);
+    if (!scalar)
+      return emitNone(expr);
+    return Value{scalar, primitiveInt};
   }
 
   if (auto primitiveFloat = mlir::dyn_cast<mlir::FloatType>(primitive->type)) {
@@ -395,19 +493,11 @@ ModuleEmitter::emitPrimitiveConstructorCall(const parser::Node &expr,
                                                 primitiveFloat, attr);
       return Value{op.getResult(), primitiveFloat};
     }
-    Value value = emitExpr(args->front().get());
-    if (auto sourceFloat =
-            mlir::dyn_cast<mlir::FloatType>(value.value.getType())) {
-      (void)sourceFloat;
-      mlir::Value coerced =
-          coerceFloatValue(builder, loc(expr), value.value, primitiveFloat);
-      return Value{coerced, primitiveFloat};
-    }
-    diagnostics.push_back(parser::Diagnostic{
-        parser::Severity::Error, expr.range.start,
-        "lyrt.prim.Float constructor currently requires a numeric literal or "
-        "primitive float value"});
-    return emitNone(expr);
+    mlir::Value scalar = coerceToPrimitiveScalar(
+        emitExpr(args->front().get()), primitiveFloat, expr);
+    if (!scalar)
+      return emitNone(expr);
+    return Value{scalar, primitiveFloat};
   }
 
   auto tensorType = mlir::dyn_cast<mlir::RankedTensorType>(primitive->type);
@@ -415,18 +505,59 @@ ModuleEmitter::emitPrimitiveConstructorCall(const parser::Node &expr,
     return std::nullopt;
 
   llvm::SmallVector<mlir::Attribute, 16> attrs;
-  if (!collectTensorLiteralAttrs(builder, tensorType, args->front().get(),
-                                 /*depth=*/0, attrs)) {
-    diagnostics.push_back(parser::Diagnostic{
-        parser::Severity::Error, expr.range.start,
-        "lyrt.prim tensor constructor requires a nested numeric literal whose "
-        "shape matches the type parameters"});
-    return emitNone(expr);
+  if (collectTensorLiteralAttrs(builder, tensorType, args->front().get(),
+                                /*depth=*/0, attrs)) {
+    auto dense = mlir::DenseElementsAttr::get(tensorType, attrs);
+    auto op =
+        mlir::arith::ConstantOp::create(builder, loc(expr), tensorType, dense);
+    return Value{op.getResult(), tensorType};
   }
-  auto dense = mlir::DenseElementsAttr::get(tensorType, attrs);
-  auto op =
-      mlir::arith::ConstantOp::create(builder, loc(expr), tensorType, dense);
-  return Value{op.getResult(), tensorType};
+
+  // Runtime-leaf fallback: the nesting must still be list/tuple literals whose
+  // extents match the static shape (the shape is a type parameter, not data),
+  // but each leaf may be an arbitrary expression that converts to the element
+  // type -- including Python int/float values, which unbox at runtime. This is
+  // the sanctioned way to feed runtime data into a shaped primitive.
+  llvm::SmallVector<mlir::Value, 16> elements;
+  std::function<bool(const parser::Node *, unsigned)> collectElements =
+      [&](const parser::Node *node, unsigned depth) -> bool {
+    if (depth == static_cast<unsigned>(tensorType.getRank())) {
+      mlir::Value element = emitPrimitiveElementValue(
+          node, tensorType.getElementType(), expr);
+      if (!element)
+        return false;
+      elements.push_back(element);
+      return true;
+    }
+    if (!node || (node->kind != "List" && node->kind != "Tuple")) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, expr.range.start,
+          "lyrt.prim tensor constructor requires nested list/tuple literals "
+          "matching the static shape; only the leaf elements may be runtime "
+          "values"});
+      return false;
+    }
+    const auto *elts = ast::nodeList(*node, "elts");
+    std::size_t extent =
+        static_cast<std::size_t>(tensorType.getDimSize(depth));
+    if (!elts || elts->size() != extent) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, expr.range.start,
+          "lyrt.prim tensor constructor dimension " + std::to_string(depth) +
+              " expects " + std::to_string(extent) + " elements"});
+      return false;
+    }
+    for (const parser::NodePtr &elt : *elts)
+      if (!collectElements(elt.get(), depth + 1))
+        return false;
+    return true;
+  };
+  if (!collectElements(args->front().get(), /*depth=*/0))
+    return emitNone(expr);
+
+  auto fromElements = mlir::tensor::FromElementsOp::create(
+      builder, loc(expr), tensorType, elements);
+  return Value{fromElements.getResult(), tensorType};
 }
 
 std::optional<Value>
@@ -498,27 +629,10 @@ ModuleEmitter::emitPrimitiveFactoryCall(const parser::Node &expr,
     return Value{op.getResult(), tensorType};
   }
 
-  Value fill = emitExpr(valueNode);
-  if (!fill.value)
+  mlir::Value scalar =
+      coerceToPrimitiveScalar(emitExpr(valueNode), elementType, expr);
+  if (!scalar)
     return emitNone(expr);
-  mlir::Value scalar = fill.value;
-  if (auto targetFloat = mlir::dyn_cast<mlir::FloatType>(elementType)) {
-    if (mlir::isa<mlir::FloatType>(scalar.getType()))
-      scalar = coerceFloatValue(builder, location, scalar, targetFloat);
-  } else if (auto targetInt = mlir::dyn_cast<mlir::IntegerType>(elementType)) {
-    if (mlir::isa<mlir::IntegerType>(scalar.getType()))
-      scalar =
-          coercePrimitiveInteger(Value{scalar, scalar.getType()}, targetInt,
-                                 expr)
-              .value;
-  }
-  if (scalar.getType() != elementType) {
-    diagnostics.push_back(parser::Diagnostic{
-        parser::Severity::Error, expr.range.start,
-        "lyrt.prim.full expects a numeric literal or a primitive scalar "
-        "matching the element type"});
-    return emitNone(expr);
-  }
 
   auto splat = mlir::tensor::SplatOp::create(builder, location, tensorType,
                                              scalar, mlir::ValueRange{});
@@ -772,26 +886,12 @@ ModuleEmitter::emitPrimitiveTensorSetItem(const parser::Node &expr,
 
   mlir::Location location = loc(expr);
   mlir::Type elementType = tensorType.getElementType();
-  mlir::Value scalar = element.value;
-  if (!scalar) {
+  if (!element.value) {
     return Value{};
   }
-  if (auto targetFloat = mlir::dyn_cast<mlir::FloatType>(elementType)) {
-    if (mlir::isa<mlir::FloatType>(scalar.getType()))
-      scalar = coerceFloatValue(builder, location, scalar, targetFloat);
-  } else if (auto targetInt = mlir::dyn_cast<mlir::IntegerType>(elementType)) {
-    if (mlir::isa<mlir::IntegerType>(scalar.getType()))
-      scalar = coercePrimitiveInteger(Value{scalar, scalar.getType()},
-                                      targetInt, expr)
-                   .value;
-  }
-  if (scalar.getType() != elementType) {
-    diagnostics.push_back(parser::Diagnostic{
-        parser::Severity::Error, expr.range.start,
-        "shaped primitive element assignment expects a matching primitive "
-        "scalar"});
+  mlir::Value scalar = coerceToPrimitiveScalar(element, elementType, expr);
+  if (!scalar)
     return Value{};
-  }
 
   // tensor.insert yields a new value rather than mutating in place; the caller
   // rebinds the target so the local's later reads observe the assignment.

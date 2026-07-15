@@ -5,6 +5,7 @@ from typing import (
     Generator,
     Literal,
     TypeVar,
+    overload,
 )
 
 from . import prim
@@ -22,19 +23,15 @@ __all__ = [
 T = TypeVar("T")
 AllocT = TypeVar(
     "AllocT",
-    bound=(
-        prim.Prim[prim.Int]
-        | prim.Prim[prim.Float]
-        | prim.Vector
-        | prim.Matrix
-        | prim.Tensor
-    ),
+    bound=prim.Int | prim.Float | prim.Vector | prim.Matrix | prim.Tensor,
 )
-PrimT = TypeVar("PrimT", bound=prim.Prim[prim.Int] | prim.Prim[prim.Float])
+PrimT = TypeVar("PrimT", bound=prim.Int | prim.Float)
 PrimFunc = TypeVar(
     "PrimFunc",
-    bound=Callable[..., prim.Prim[prim.Int]] | Callable[..., prim.Prim[prim.Float]],
+    bound=Callable[..., prim.Int] | Callable[..., prim.Float],
 )
+
+type _NestedNumber = int | float | list[_NestedNumber]
 
 class ReadyIntAwaitable(Awaitable[int]):
     def __init__(self, value: int) -> None: ...
@@ -45,22 +42,17 @@ def native(
     gc: Literal["none", "shadow-stack", "rc"] = "none",
 ) -> Callable[[PrimFunc], PrimFunc]: ...
 def to_prim(value: object, prim_type: type[PrimT]) -> PrimT: ...
-def from_prim(
-    prim_value: (
-        prim.Prim[prim.Int]
-        | prim.Prim[prim.Float]
-        | prim.Vector
-        | prim.Matrix
-        | prim.Tensor
-    ),
-) -> object: ...
+@overload
+def from_prim(prim_value: prim.Int) -> int: ...
+@overload
+def from_prim(prim_value: prim.Float) -> float: ...
+@overload
+def from_prim(prim_value: prim.Vector) -> list[int | float]: ...
+@overload
+def from_prim(prim_value: prim.Matrix) -> list[list[int | float]]: ...
+@overload
+def from_prim(prim_value: prim.Tensor) -> list[_NestedNumber]: ...
 def alloc(value: AllocT) -> AllocT: ...
 def dealloc(
-    value: (
-        prim.Prim[prim.Int]
-        | prim.Prim[prim.Float]
-        | prim.Vector
-        | prim.Matrix
-        | prim.Tensor
-    ),
+    value: prim.Int | prim.Float | prim.Vector | prim.Matrix | prim.Tensor,
 ) -> None: ...
