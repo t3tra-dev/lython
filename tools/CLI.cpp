@@ -130,6 +130,31 @@ lython::driver::DriverOptions Options;
 std::vector<std::string> IncludeSearchPaths;
 std::vector<std::string> LibrarySearchPaths;
 
+} // namespace
+
+static llvm::cl::OptionCategory LythonCategory("lython options");
+
+namespace {
+
+// Declared here rather than with the other options so runJIT (defined before
+// the option block) can read it.
+llvm::cl::opt<llvm::CodeGenOptLevel> JitCodeGenOptOption(
+    "jit-codegen-opt",
+    llvm::cl::desc("Instruction selection quality for JIT execution. The "
+                   "default favors first-output latency; kernels dominated by "
+                   "compute want 'aggressive' (matches AOT code quality)"),
+    llvm::cl::values(
+        clEnumValN(llvm::CodeGenOptLevel::None, "none",
+                   "Fastest compilation, unoptimized code (default)"),
+        clEnumValN(llvm::CodeGenOptLevel::Less, "less",
+                   "Light codegen optimization"),
+        clEnumValN(llvm::CodeGenOptLevel::Default, "default",
+                   "Standard codegen optimization"),
+        clEnumValN(llvm::CodeGenOptLevel::Aggressive, "aggressive",
+                   "Full codegen optimization, like AOT")),
+    llvm::cl::init(llvm::CodeGenOptLevel::None),
+    llvm::cl::cat(LythonCategory));
+
 LogicalResult runCppParserDump(StringRef inputPath, bool typeComments,
                                bool includeAttributes, bool interactiveMode,
                                bool expressionMode, bool functionTypeMode) {
@@ -389,6 +414,9 @@ LogicalResult linkExecutable(StringRef objectPath,
   argStorage.emplace_back(objectPath.str());
   appendLinkTargetLibraries(argStorage, tensorTarget);
   argStorage.emplace_back("-O2");
+  // Parallel kernel dispatch calls pthread_create; Darwin ships it in
+  // libSystem, but Linux toolchains still want the explicit flag.
+  argStorage.emplace_back("-pthread");
   if (codeGenTripleForTarget(tensorTarget, Options).isOSLinux())
     argStorage.emplace_back("-no-pie");
   argStorage.emplace_back("-o");
@@ -468,8 +496,9 @@ FailureOr<int> runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
         codeGenCPUNameForTarget(tensorTarget, processTriple, Options));
     tmBuilder.setFeatures(
         codeGenFeaturesForTarget(tensorTarget, processTriple, Options));
-    // JIT favors first-output latency; AOT still uses the optimized pipeline.
-    tmBuilder.setCodeGenOptLevel(llvm::CodeGenOptLevel::None);
+    // Default None favors first-output latency; compute-bound programs opt
+    // into AOT-grade instruction selection with -jit-codegen-opt.
+    tmBuilder.setCodeGenOptLevel(JitCodeGenOptOption);
     auto options = tmBuilder.getOptions();
     lython::driver::applyExceptionUnwindOptions(options, processTriple);
     tmBuilder.setOptions(options);
@@ -683,7 +712,6 @@ FailureOr<int> runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
 }
 } // namespace
 
-static llvm::cl::OptionCategory LythonCategory("lython options");
 static llvm::cl::opt<std::string> InputFilename(llvm::cl::Positional,
                                                 llvm::cl::desc("<input file>"),
                                                 llvm::cl::cat(LythonCategory));

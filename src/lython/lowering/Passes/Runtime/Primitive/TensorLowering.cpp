@@ -3,6 +3,7 @@
 #include "Common/RuntimeSupport.h"
 #include "Ownership.h"
 #include "TensorGemm.h"
+#include "TensorParallel.h"
 #include "TensorSupport.h"
 
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
@@ -1219,6 +1220,68 @@ public:
   }
 };
 
+// Loop-carried shaped primitives compute into a tensor.empty and then copy
+// into the carried buffer (materialize_in_destination). For elementwise
+// producers the computation can write the carried buffer directly, dropping
+// one full pass over the data per iteration -- decisive for bandwidth-bound
+// elementwise loops. Why not the generic empty-tensor-elimination pass:
+// it also rewrites contractions, whose read of the carried value then
+// conflicts with the in-place write, and the copy One-Shot Bufferize would
+// need to recover lands on a cf edge where it cannot insert one. Elementwise
+// ops read and write each element at the same index, so writing the read
+// buffer in place is sound.
+class CarriedElementwiseWriteElisionPass
+    : public mlir::PassWrapper<CarriedElementwiseWriteElisionPass,
+                               mlir::OperationPass<mlir::ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
+      CarriedElementwiseWriteElisionPass)
+
+  llvm::StringRef getArgument() const final {
+    return "lython-carried-elementwise-write-elision";
+  }
+  llvm::StringRef getDescription() const final {
+    return "write elementwise results directly into the loop-carried buffer";
+  }
+
+  void runOnOperation() final {
+    mlir::DominanceInfo dominance(getOperation());
+    llvm::SmallVector<mlir::bufferization::MaterializeInDestinationOp, 8>
+        candidates;
+    getOperation().walk(
+        [&](mlir::bufferization::MaterializeInDestinationOp materialize) {
+          candidates.push_back(materialize);
+        });
+    for (auto materialize : candidates) {
+      mlir::Value source = materialize.getSource();
+      if (!source.hasOneUse())
+        continue;
+      mlir::Operation *producer = source.getDefiningOp();
+      if (!producer ||
+          !mlir::isa<mlir::linalg::AddOp, mlir::linalg::SubOp,
+                     mlir::linalg::MulOp, mlir::linalg::DivOp,
+                     mlir::linalg::CopyOp>(producer))
+        continue;
+      auto linalgOp = mlir::cast<mlir::linalg::LinalgOp>(producer);
+      mlir::OpOperand *init = linalgOp.getDpsInitOperand(0);
+      auto empty = init->get().getDefiningOp<mlir::tensor::EmptyOp>();
+      if (!empty || !empty->hasOneUse())
+        continue;
+      mlir::Value dest = materialize.getDest();
+      if (mlir::isa<mlir::OpResult>(dest) &&
+          !dominance.properlyDominates(dest.getDefiningOp(), producer))
+        continue;
+      if (auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(dest))
+        if (!dominance.dominates(blockArg.getOwner(), producer->getBlock()))
+          continue;
+      init->set(dest);
+      materialize->getResult(0).replaceAllUsesWith(producer->getResult(0));
+      materialize.erase();
+      empty.erase();
+    }
+  }
+};
+
 class PrimitiveTensorBufferDeallocationPass
     : public mlir::PassWrapper<PrimitiveTensorBufferDeallocationPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -1388,6 +1451,7 @@ public:
 
     mlir::OpPassManager pipeline(mlir::ModuleOp::getOperationName());
     pipeline.addPass(createMatmulZeroInitElisionPass());
+    pipeline.addPass(std::make_unique<CarriedElementwiseWriteElisionPass>());
     pipeline.addPass(
         mlir::bufferization::createOneShotBufferizePass(bufferizeOptions));
     // Returning a buffer would leave the callee's allocation escaping through
@@ -1397,6 +1461,12 @@ public:
     outParamsOptions.hoistStaticAllocs = true;
     pipeline.addPass(mlir::bufferization::createBufferResultsToOutParamsPass(
         outParamsOptions));
+    // Chunk + outline before any matmul specialization: every downstream
+    // pass (SME, tiling, packing, panel hoisting) then specializes the
+    // per-worker body, and hoisted packed panels land at the body's entry --
+    // one panel per worker invocation instead of one shared across threads.
+    pipeline.addPass(createMatmulParallelChunkPass());
+    pipeline.addPass(createParallelLoopOutliningPass());
     if (arch::arm::usesSME(target))
       pipeline.addPass(arch::arm::createMatmulSMELoweringPass(target));
     pipeline.addPass(createMatmulTilingPass());

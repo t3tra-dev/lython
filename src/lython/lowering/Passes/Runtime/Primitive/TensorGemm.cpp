@@ -33,11 +33,16 @@ constexpr int64_t kMatmulPackedMC = 128;
 constexpr int64_t kMatmulPackedNC = 64;
 // Keep the packed panels below the point where a 512-wide reduction panel hurts
 // locality on Apple Silicon, while still allowing 768-wide reductions to use
-// two 384 panels instead of three 256 panels.
+// two 384 panels instead of three 256 panels. KC=512 re-measured 2026-07 on
+// apple-m1 NEON f32 512^3/1024^3: 15-18% slower than 384.
 constexpr int64_t kMatmulPackedKCMax = 384;
 constexpr int64_t kMatmulConservativeMR = 4;
 constexpr int64_t kMatmulConservativeNR = 8;
 constexpr int64_t kMatmulWideNR = 16;
+// Why not MR=4 x NR=16 (same accumulator budget, half the B-vector loads):
+// measured 2026-07 on apple-m1 NEON f32, 512^3 was 2% slower and 1024^3 flat
+// -- the wide-NR shape keeps the fewer, longer B streams the prefetcher
+// prefers.
 constexpr int64_t kMatmulPackedMR = 2;
 constexpr int64_t kMatmulPackedNR = 32;
 constexpr int64_t kMatmulScalarVectorKLimit = 4;

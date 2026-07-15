@@ -11,6 +11,7 @@
 #include "Passes/Runtime/Arch/Arm/PrimitiveTensorArmSME.h"
 #include "Passes/Runtime/Cleanup/Transforms.h"
 #include "Passes/Runtime/Ctypes/CallbackThunks.h"
+#include "Passes/Runtime/Primitive/TensorParallel.h"
 #include "runtime/Verification.h"
 
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
@@ -60,10 +61,30 @@ LogicalResult runLoweringPhase(llvm::StringRef name, ModuleOp module,
                                bool enableVerifier, Populate populate) {
   std::string phase = (llvm::Twine("lowering.") + name).str();
   PerfScope perf(phase);
+  // A pattern inside a greedy rewrite can emit an error diagnostic without
+  // failing its pass (the driver only skips the pattern), which would let a
+  // known-broken op flow on and mis-execute silently. Count error
+  // diagnostics and refuse a phase that emitted any while reporting success.
+  unsigned emittedErrors = 0;
+  ScopedDiagnosticHandler diagnosticGuard(
+      module.getContext(), [&](Diagnostic &diag) {
+        if (diag.getSeverity() == DiagnosticSeverity::Error)
+          ++emittedErrors;
+        return failure();
+      });
   PassManager pm(module.getContext());
   pm.enableVerifier(enableVerifier);
   populate(pm);
-  return pm.run(module);
+  if (failed(pm.run(module)))
+    return failure();
+  if (emittedErrors != 0) {
+    module.emitError() << "lowering phase '" << name << "' emitted "
+                       << emittedErrors
+                       << " error(s) but reported success; refusing to "
+                          "continue with potentially mis-lowered IR";
+    return failure();
+  }
+  return success();
 }
 
 LogicalResult requireNoAsyncDialectOps(ModuleOp module) {
@@ -338,6 +359,16 @@ LogicalResult runLoweringPipeline(ModuleOp module,
       return failure();
   }
   dumpMLIRForPass(irDump, "callback-thunks", module);
+
+  // Phase 13d: materialize parallel kernel dispatch -- context struct layouts
+  // and function addresses only exist at the LLVM layer (see
+  // Primitive/TensorParallel.h).
+  {
+    PerfScope perf("lowering.parallel-dispatch");
+    if (failed(lowering::materializeParallelDispatch(module)))
+      return failure();
+  }
+  dumpMLIRForPass(irDump, "parallel-dispatch", module);
 
   // Phase 14: re-check contracts after final conversion rewrites.
   if (failed(runVerifierPhase("final-native-verifier", [&](PassManager &pm) {

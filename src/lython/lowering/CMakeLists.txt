@@ -64,6 +64,7 @@ add_library(LythonRuntimeLowering STATIC
     Passes/Runtime/Primitive/I64Calls.cpp
     Passes/Runtime/Primitive/TensorGemm.cpp
     Passes/Runtime/Primitive/TensorPacking.cpp
+    Passes/Runtime/Primitive/TensorParallel.cpp
     Passes/Runtime/Arch/Arm/ArmStreamingRoutines.cpp
     Passes/Runtime/Arch/Arm/PrimitiveTensorArmSME.cpp
     Passes/Runtime/Arch/Arm/PrimitiveTensorArmSMEMatmul.cpp

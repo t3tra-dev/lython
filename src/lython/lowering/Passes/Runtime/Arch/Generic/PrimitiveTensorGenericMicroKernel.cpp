@@ -15,6 +15,9 @@ namespace {
 
 constexpr int64_t kMaxMicroM = 8;
 constexpr int64_t kMaxMicroN = 32;
+// Why not 8: measured 2026-07 on apple-m1 NEON f32 512^3, unroll 8 was 9%
+// slower (icache pressure without added ILP -- the 8 row accumulators already
+// saturate the FMA pipes).
 constexpr int64_t kRegisterKUnroll = 4;
 
 std::optional<mlir::Value> createPrimitiveMul(mlir::OpBuilder &builder,
