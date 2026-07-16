@@ -9,10 +9,6 @@ namespace py::lowering::arch::x86 {
 
 bool usesX86(const py::TensorLoweringTarget &target);
 
-bool usesSSE42(const py::TensorLoweringTarget &target);
-
-bool usesAVX2FMA(const py::TensorLoweringTarget &target);
-
 void registerX86Dialects(mlir::DialectRegistry &registry);
 
 void registerX86Translations(mlir::DialectRegistry &registry);

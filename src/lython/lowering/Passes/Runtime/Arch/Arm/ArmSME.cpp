@@ -1,4 +1,4 @@
-#include "PrimitiveTensorArmSME.h"
+#include "ArmSME.h"
 
 #include "mlir/Conversion/ArithToArmSME/ArithToArmSME.h"
 #include "mlir/Conversion/ArmSMEToLLVM/ArmSMEToLLVM.h"

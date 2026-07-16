@@ -66,10 +66,11 @@ add_library(LythonRuntimeLowering STATIC
     Passes/Runtime/Primitive/TensorPacking.cpp
     Passes/Runtime/Primitive/TensorParallel.cpp
     Passes/Runtime/Arch/Arm/ArmStreamingRoutines.cpp
-    Passes/Runtime/Arch/Arm/PrimitiveTensorArmSME.cpp
-    Passes/Runtime/Arch/Arm/PrimitiveTensorArmSMEMatmul.cpp
-    Passes/Runtime/Arch/X86/PrimitiveTensorX86.cpp
-    Passes/Runtime/Arch/Generic/PrimitiveTensorGenericMicroKernel.cpp
+    Passes/Runtime/Arch/Arm/ArmSME.cpp
+    Passes/Runtime/Arch/Arm/ArmSMEMatmul.cpp
+    Passes/Runtime/Arch/Arm/AppleAMX.cpp
+    Passes/Runtime/Arch/X86/X86.cpp
+    Passes/Runtime/Arch/Generic/MicroKernel.cpp
     Passes/Runtime/Primitive/TensorSupport.cpp
     Passes/Runtime/Primitive/TensorLowering.cpp
     ../verifier/TypeEvidence.cpp

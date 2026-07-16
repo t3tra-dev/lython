@@ -1,5 +1,6 @@
-#include "../Arch/Arm/PrimitiveTensorArmSME.h"
-#include "../Arch/X86/PrimitiveTensorX86.h"
+#include "../Arch/Arm/AppleAMX.h"
+#include "../Arch/Arm/ArmSME.h"
+#include "../Arch/X86/X86.h"
 #include "Common/RuntimeSupport.h"
 #include "Ownership.h"
 #include "TensorGemm.h"
@@ -1450,7 +1451,12 @@ public:
     vectorizeOptions.vectorizeReductions = true;
 
     mlir::OpPassManager pipeline(mlir::ModuleOp::getOperationName());
-    pipeline.addPass(createMatmulZeroInitElisionPass());
+    pipeline.addPass(createMatmulZeroInitElisionPass(target));
+    // After the elision (which reads the default maps) and before
+    // bufferization, where tensors are still values and the transpose can be
+    // anchored at A's definition.
+    if (arch::arm::usesSME(target))
+      pipeline.addPass(arch::arm::createMatmulLhsTransposePass(target));
     pipeline.addPass(std::make_unique<CarriedElementwiseWriteElisionPass>());
     pipeline.addPass(
         mlir::bufferization::createOneShotBufferizePass(bufferizeOptions));
@@ -1465,19 +1471,34 @@ public:
     // pass (SME, tiling, packing, panel hoisting) then specializes the
     // per-worker body, and hoisted packed panels land at the body's entry --
     // one panel per worker invocation instead of one shared across threads.
+    if (arch::apple::usesAMX(target))
+      pipeline.addPass(arch::apple::createMatmulAMXLoweringPass(target));
+    // The rhs pack runs before the chunker because B is shared across chunks
+    // and would otherwise be re-copied per chunk (measured 1134 against 1620
+    // GFLOP/s at 512^3 1T). The reduction blocker stays after the outline,
+    // where the default path has always run it -- moving it ahead of the
+    // chunker put the fork-join inside the K loop and measured 1243 against
+    // 1411 at 2000^3 1T. A matmul the pack marked skips the blocker entirely
+    // (tiling would subview the disguised panel buffer): packed mode runs the
+    // full reduction per block, which is also the shape Accelerate's own
+    // kernel takes.
+    if (arch::arm::usesSME(target))
+      pipeline.addPass(arch::arm::createMatmulSMERhsPackPass(target));
     pipeline.addPass(createMatmulParallelChunkPass());
     pipeline.addPass(createParallelLoopOutliningPass());
-    if (arch::arm::usesSME(target))
+    if (arch::arm::usesSME(target)) {
+      pipeline.addPass(arch::arm::createMatmulSMEReductionBlockPass(target));
       pipeline.addPass(arch::arm::createMatmulSMELoweringPass(target));
-    pipeline.addPass(createMatmulTilingPass());
+    }
+    pipeline.addPass(createMatmulTilingPass(target));
     pipeline.addPass(createMatmulPackingPass());
     pipeline.addPass(createPackedPanelHoistingPass());
     pipeline.addPass(createPackedPanelCopyHoistingPass());
     pipeline.addPass(createPackedPanelCopyVectorizationPass());
     pipeline.addPass(mlir::createLoopInvariantCodeMotionPass());
     pipeline.addPass(mlir::createCSEPass());
-    pipeline.addPass(createMatmulMicroTilingPass());
-    pipeline.addPass(createMatmulVectorizationPass());
+    pipeline.addPass(createMatmulMicroTilingPass(target));
+    pipeline.addPass(createMatmulVectorizationPass(target));
     if (arch::arm::usesSME(target))
       arch::arm::addSMELinalgPipeline(pipeline);
     if (arch::x86::usesX86(target))

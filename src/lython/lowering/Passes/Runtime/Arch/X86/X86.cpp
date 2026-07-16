@@ -1,4 +1,4 @@
-#include "PrimitiveTensorX86.h"
+#include "X86.h"
 
 #include "mlir/Dialect/X86Vector/X86VectorDialect.h"
 #include "mlir/Transforms/Passes.h"
@@ -7,14 +7,6 @@ namespace py::lowering::arch::x86 {
 
 bool usesX86(const py::TensorLoweringTarget &target) {
   return target.usesX86();
-}
-
-bool usesSSE42(const py::TensorLoweringTarget &target) {
-  return target.usesX86SSE42();
-}
-
-bool usesAVX2FMA(const py::TensorLoweringTarget &target) {
-  return target.usesX86AVX2FMA();
 }
 
 void registerX86Dialects(mlir::DialectRegistry &registry) {
@@ -26,9 +18,11 @@ void registerX86Translations(mlir::DialectRegistry &registry) {
 }
 
 void addX86LinalgPipeline(mlir::OpPassManager &pipeline) {
-  // X86 SSE/AVX2 fast paths are expressed through the standard vector dialect
-  // first. Architecture-specific matmul passes can be inserted here without
-  // teaching the generic lowering path about x86 variants.
+  // Nothing x86-specific yet: SSE/AVX2 reach the vector dialect through the
+  // generic path, and the one place the target's shape shows through -- the
+  // register tile, which SSE4.2's 16-register file cannot hold at the default
+  // width -- is solved there from the file's capacity rather than from the ISA
+  // (see selectRegisterTile). A pass that only x86 can run belongs here.
   pipeline.addPass(mlir::createCanonicalizerPass());
   pipeline.addPass(mlir::createCSEPass());
 }

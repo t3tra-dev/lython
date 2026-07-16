@@ -8,7 +8,8 @@
 #include "Common/Instrumentation.h"
 #include "Common/RuntimeLibrary.h"
 #include "Common/RuntimeSupport.h"
-#include "Passes/Runtime/Arch/Arm/PrimitiveTensorArmSME.h"
+#include "Passes/Runtime/Arch/Arm/AppleAMX.h"
+#include "Passes/Runtime/Arch/Arm/ArmSME.h"
 #include "Passes/Runtime/Cleanup/Transforms.h"
 #include "Passes/Runtime/Ctypes/CallbackThunks.h"
 #include "Passes/Runtime/Primitive/TensorParallel.h"
@@ -359,6 +360,15 @@ LogicalResult runLoweringPipeline(ModuleOp module,
       return failure();
   }
   dumpMLIRForPass(irDump, "callback-thunks", module);
+
+  // Phase 13c2: define the AMX run-time engine probe -- libc calls and
+  // reserved instruction words only exist at the LLVM layer.
+  {
+    PerfScope perf("lowering.matrix-backend-probe");
+    if (failed(lowering::arch::apple::materializeMatrixBackendProbe(module)))
+      return failure();
+  }
+  dumpMLIRForPass(irDump, "matrix-backend-probe", module);
 
   // Phase 13d: materialize parallel kernel dispatch -- context struct layouts
   // and function addresses only exist at the LLVM layer (see

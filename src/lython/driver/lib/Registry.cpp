@@ -1,8 +1,8 @@
 #include "Driver.h"
 #include "DriverCodeGen.h"
 
-#include "Passes/Runtime/Arch/Arm/PrimitiveTensorArmSME.h"
-#include "Passes/Runtime/Arch/X86/PrimitiveTensorX86.h"
+#include "Passes/Runtime/Arch/Arm/ArmSME.h"
+#include "Passes/Runtime/Arch/X86/X86.h"
 
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
 #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"

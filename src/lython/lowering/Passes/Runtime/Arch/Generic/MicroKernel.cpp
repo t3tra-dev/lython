@@ -224,7 +224,8 @@ mlir::LogicalResult accumulateStaticKRange(
 
 mlir::LogicalResult lowerMatmulMicroKernel(mlir::linalg::MatmulOp matmul,
                                            mlir::IRRewriter &rewriter) {
-  if (matmul->getNumResults() != 0)
+  // This kernel indexes A as [M][K]; a transposed LHS is not its shape.
+  if (matmul->getNumResults() != 0 || !hasDefaultMatmulMaps(matmul))
     return mlir::failure();
 
   auto lhsType = mlir::dyn_cast<mlir::MemRefType>(

@@ -104,8 +104,8 @@
 #include "embedded.h"
 #include "Emitter.h"
 #include "Parser.h"
-#include "Passes/Runtime/Arch/Arm/PrimitiveTensorArmSME.h"
-#include "Passes/Runtime/Arch/X86/PrimitiveTensorX86.h"
+#include "Passes/Runtime/Arch/Arm/ArmSME.h"
+#include "Passes/Runtime/Arch/X86/X86.h"
 #include "Driver.h"
 #include "DriverCodeGen.h"
 #include "SanitizerSupport.h"
@@ -484,6 +484,10 @@ FailureOr<int> runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
     PerfScope perf("jit-build");
     llvm::InitializeNativeTarget();
     llvm::InitializeNativeTargetAsmPrinter();
+    // The AMX kernel is spelled as `.word` inline asm, which the object
+    // streamer can only emit through an asm parser. main() registers the
+    // parsers for the AOT path, but that happens after runJIT returns.
+    llvm::InitializeNativeTargetAsmParser();
 
     auto tmBuilderOrErr = llvm::orc::JITTargetMachineBuilder::detectHost();
     if (!tmBuilderOrErr) {

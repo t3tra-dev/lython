@@ -91,12 +91,31 @@ static std::string hostCPUFeaturesForCodeGen() {
   return features.getString();
 }
 
+// A Mach-O object carries its platform in LC_BUILD_VERSION, which the MachO
+// writer only emits when the triple names an OS version. `-target
+// x86_64-apple-darwin` names none, so the object comes out without the load
+// command and the linker falls back to guessing the platform ("assuming:
+// macOS"). Borrow the version from the host, which is the only place a
+// correct one exists when cross-compiling between Darwin architectures.
+static void fillDarwinOSVersionFromHost(llvm::Triple &triple) {
+  if (!triple.isOSDarwin() || !triple.getOSVersion().empty())
+    return;
+  llvm::Triple host(llvm::sys::getDefaultTargetTriple());
+  if (!host.isOSDarwin() || host.getOSVersion().empty())
+    return;
+  triple.setOSName(
+      (triple.getOSName() + host.getOSVersion().getAsString()).str());
+}
+
 llvm::Triple codeGenTripleForTarget(py::TensorLoweringTarget target,
                                     const DriverOptions &options) {
   (void)target;
   std::string override = configuredTargetTripleOverride(options);
-  return llvm::Triple(override.empty() ? llvm::sys::getDefaultTargetTriple()
-                                       : override);
+  if (override.empty())
+    return llvm::Triple(llvm::sys::getDefaultTargetTriple());
+  llvm::Triple triple(override);
+  fillDarwinOSVersionFromHost(triple);
+  return triple;
 }
 
 static bool targetFeatureEnabled(const llvm::Triple &triple,
@@ -306,14 +325,32 @@ static bool targetFeatureEnabled(const llvm::Triple &triple,
   return hostFeatureEnabled(feature);
 }
 
+// AMX has no capability bit and no target feature: it is a property of the
+// Apple Silicon SoC, resolved at run time. Compile-time all we can ask is
+// whether the binary could ever meet one.
+static bool couldTargetAppleAMX(const llvm::Triple &triple) {
+  return triple.isAArch64() && triple.isOSDarwin() &&
+         !triple.isSimulatorEnvironment() &&
+         !triple.isMacCatalystEnvironment();
+}
+
 py::TensorLoweringTarget
 detectTensorLoweringTarget(const DriverOptions &options) {
   llvm::Triple triple = codeGenTripleForTarget({}, options);
   py::TensorLoweringTarget target;
-  if (triple.isAArch64() && (targetFeatureEnabled(triple, "sme", options) ||
-                             targetFeatureEnabled(triple, "sme2", options))) {
+
+  bool smeAvailable =
+      triple.isAArch64() && (targetFeatureEnabled(triple, "sme", options) ||
+                             targetFeatureEnabled(triple, "sme2", options));
+
+  // Prefer the documented ISA. Apple's AMX only fills the gap on Apple Silicon
+  // without SME (M1-M3), where the alternative is plain NEON.
+  if (smeAvailable) {
     target.architecture = py::TensorLoweringArchitecture::ArmSME;
     target.armSMEF64F64 = targetFeatureEnabled(triple, "sme-f64f64", options);
+    target.armSME2 = targetFeatureEnabled(triple, "sme2", options);
+  } else if (couldTargetAppleAMX(triple)) {
+    target.architecture = py::TensorLoweringArchitecture::AppleAMX;
   }
   if (triple.getArch() == llvm::Triple::x86_64) {
     if (targetFeatureEnabled(triple, "avx2", options) &&

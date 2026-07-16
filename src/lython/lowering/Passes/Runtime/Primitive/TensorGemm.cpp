@@ -24,6 +24,30 @@
 #include <utility>
 
 namespace py::lowering {
+
+bool hasDefaultMatmulMaps(mlir::linalg::MatmulOp matmul) {
+  return !matmul.hasUserDefinedMaps();
+}
+
+bool hasTransposedLhsMatmulMaps(mlir::linalg::MatmulOp matmul) {
+  if (!matmul.hasUserDefinedMaps())
+    return false;
+  llvm::SmallVector<mlir::AffineMap, 3> maps = matmul.getIndexingMapsArray();
+  if (maps.size() != 3)
+    return false;
+  mlir::MLIRContext *context = matmul.getContext();
+  llvm::SmallVector<mlir::AffineMap> defaults =
+      mlir::linalg::MatmulOp::getDefaultIndexingMaps(context);
+  // Only the LHS map may differ, and only by swapping its two results:
+  // (m, n, k) -> (k, m) instead of (m, n, k) -> (m, k).
+  mlir::AffineExpr m, n, k;
+  mlir::bindDims(context, m, n, k);
+  mlir::AffineMap transposedLhs =
+      mlir::AffineMap::get(3, 0, {k, m}, context);
+  return maps[0] == transposedLhs && maps[1] == defaults[1] &&
+         maps[2] == defaults[2];
+}
+
 namespace {
 
 constexpr int64_t kMatmulConservativeMC = 64;
@@ -45,6 +69,20 @@ constexpr int64_t kMatmulWideNR = 16;
 // prefers.
 constexpr int64_t kMatmulPackedMR = 2;
 constexpr int64_t kMatmulPackedNR = 32;
+// The register tile must fit the target's vector register file. It holds
+// MR*(NR/lanes) accumulators, plus NR/lanes B vectors and MR broadcast
+// scalars, so the peak live count is MR*(NR/lanes) + NR/lanes + MR.
+//
+// NR=32 is sized for a 32-register file at 4 f32 lanes (Arm NEON: peak 26/32).
+// It survives AVX2 only because 8 lanes per register quarter the accumulator
+// count (peak 14/16), but on SSE4.2 -- 16 registers at 4 lanes, like NEON's
+// lane count with half its registers -- it needs 26 and spills. MR/NR stay
+// powers of two: selectPackedMTile picks MC from the divisors of M, and on the
+// power-of-two shapes this pipeline targets no divisor is a multiple of 6, so
+// a BLIS-style MR=6 would always leave a peeled remainder tile (and, on the
+// strided views the parallel chunker cuts, hit the vectorizer's non-identity
+// layout rejection).
+constexpr int64_t kMatmulPackedNRNarrowRegisterFile = 16;
 constexpr int64_t kMatmulScalarVectorKLimit = 4;
 constexpr int64_t kMatmulKeepKC = 0;
 // Packing starts paying off for the current single-threaded RHS-prepack path at
@@ -90,6 +128,30 @@ GemmSchedule defaultGemmSchedule() {
                       {}};
 }
 
+// Widest register tile whose live values still fit the target's vector register
+// file. An MR x NR f32 tile keeps MR*(NR/lanes) accumulators, NR/lanes B
+// vectors and MR broadcast scalars live at its peak; overflowing that spills
+// the accumulators, which is the whole point of holding them in registers.
+//
+// Why not name the ISA: the shape follows from the file's capacity and width,
+// and only one combination in reach is tight -- SSE4.2 pairs NEON's 4 f32 lanes
+// with half its register file, so the default NR needs 26 of 16. AVX2 survives
+// the same NR only because 8 lanes per register quarter the accumulator count
+// (14 of 16). Solving it keeps that reasoning where it can be checked, instead
+// of leaving a bare ISA test whose answer nothing here explains.
+MatmulTileShape selectRegisterTile(const TensorLoweringTarget &target) {
+  int64_t lanes = target.vectorRegisterBits() / 32;
+  auto peakLiveVectors = [&](int64_t nr) {
+    int64_t vectors = nr / lanes;
+    return kMatmulPackedMR * vectors + vectors + kMatmulPackedMR;
+  };
+  int64_t nr = kMatmulPackedNR;
+  while (nr > kMatmulPackedNRNarrowRegisterFile &&
+         peakLiveVectors(nr) > target.vectorRegisterCount())
+    nr /= 2;
+  return MatmulTileShape{kMatmulPackedMR, nr, kMatmulKeepKC};
+}
+
 bool hasPrimitiveStaticShape(mlir::Value value) {
   auto shapedType = mlir::dyn_cast<mlir::ShapedType>(value.getType());
   if (!shapedType || !shapedType.hasStaticShape())
@@ -98,11 +160,20 @@ bool hasPrimitiveStaticShape(mlir::Value value) {
 }
 
 bool hasPrimitiveMatmulContract(mlir::linalg::MatmulOp matmul) {
-  return hasPrimitiveStaticShape(matmul.getDpsInputOperand(0)->get()) &&
+  // Every schedule below reads A as [M][K]; a transposed-LHS matmul is the
+  // SME kernel's business alone.
+  return hasDefaultMatmulMaps(matmul) &&
+         hasPrimitiveStaticShape(matmul.getDpsInputOperand(0)->get()) &&
          hasPrimitiveStaticShape(matmul.getDpsInputOperand(1)->get()) &&
          hasPrimitiveStaticShape(matmul.getDpsInitOperand(0)->get());
 }
 
+// Why not read M and K off A: the LHS is the one operand whose layout the
+// indexing maps move, so [M][K] and [K][M] disagree on what its dimensions
+// mean. C is [M][N] and B is [K][N] either way, which pins all three extents
+// without ever asking A. Reading A instead answers with confident nonsense on a
+// transposed LHS -- and on a non-square one it stays plausible, so nothing
+// downstream would notice.
 std::optional<MatmulTileShape>
 staticMatmulShape(mlir::linalg::MatmulOp matmul) {
   if (matmul.getNumDpsInputs() != 2 || matmul.getNumDpsInits() != 1)
@@ -121,8 +192,8 @@ staticMatmulShape(mlir::linalg::MatmulOp matmul) {
       initType.getRank() != 2)
     return std::nullopt;
 
-  return MatmulTileShape{lhsType.getDimSize(0), rhsType.getDimSize(1),
-                         lhsType.getDimSize(1)};
+  return MatmulTileShape{initType.getDimSize(0), initType.getDimSize(1),
+                         rhsType.getDimSize(0)};
 }
 
 std::uint64_t saturatedMatmulWork(MatmulTileShape shape) {
@@ -137,6 +208,19 @@ std::uint64_t saturatedMatmulWork(MatmulTileShape shape) {
     work *= value;
   }
   return work;
+}
+
+// Clamp the macro M tile to a divisor of the actual extent. A tile wider than
+// M leaves the nest with nothing but a peeled remainder, and on a strided
+// operand (the row chunks the parallel dispatch cuts) the partial-tile path
+// reaches the vector lowering as a non-trivial layout map it rejects. An exact
+// tile also lets the zero-init elision cover every output tile.
+int64_t selectPackedMTile(MatmulTileShape shape) {
+  int64_t candidate =
+      shape.m < kMatmulPackedMC ? shape.m : kMatmulPackedMC;
+  while (candidate > 1 && shape.m % candidate != 0)
+    --candidate;
+  return candidate;
 }
 
 int64_t selectPackedKTile(MatmulTileShape shape) {
@@ -168,17 +252,19 @@ MatmulLoweringPlan classifyMatmulLowering(mlir::linalg::MatmulOp matmul) {
   return MatmulLoweringPlan::TiledVector;
 }
 
-MatmulLoweringPolicy selectMatmulLoweringPolicy(mlir::linalg::MatmulOp matmul) {
+MatmulLoweringPolicy
+selectMatmulLoweringPolicy(mlir::linalg::MatmulOp matmul,
+                          const TensorLoweringTarget &target) {
   MatmulLoweringPlan plan = classifyMatmulLowering(matmul);
   GemmSchedule schedule = defaultGemmSchedule();
   std::optional<MatmulTileShape> shape = staticMatmulShape(matmul);
 
   if (plan == MatmulLoweringPlan::TiledPackedVector) {
     schedule.macroTile =
-        MatmulTileShape{kMatmulPackedMC, kMatmulPackedNC,
+        MatmulTileShape{shape ? selectPackedMTile(*shape) : kMatmulPackedMC,
+                        kMatmulPackedNC,
                         shape ? selectPackedKTile(*shape) : kMatmulPackedKCMax};
-    schedule.registerTile =
-        MatmulTileShape{kMatmulPackedMR, kMatmulPackedNR, kMatmulKeepKC};
+    schedule.registerTile = selectRegisterTile(target);
     schedule.packRhs = true;
     // BLAS-style loop ordering: keep the RHS B panel scoped by (N, K) and reuse
     // it for all M tiles. A-side packing is intentionally absent from this
@@ -325,7 +411,8 @@ std::optional<MatmulTileShape> microTileAttr(mlir::Operation *op) {
   return MatmulTileShape{*m, *n, *k};
 }
 
-MatmulTileShape selectMicroTile(mlir::linalg::MatmulOp matmul) {
+MatmulTileShape selectMicroTile(mlir::linalg::MatmulOp matmul,
+                                const TensorLoweringTarget &target) {
   if (std::optional<MatmulTileShape> tile =
           microTileAttr(matmul.getOperation()))
     return *tile;
@@ -333,7 +420,7 @@ MatmulTileShape selectMicroTile(mlir::linalg::MatmulOp matmul) {
   std::optional<MatmulTileShape> shape = staticMatmulShape(matmul);
   if (shape && shape->n >= kMatmulPackedNC && shape->m >= kMatmulConservativeMC)
     return MatmulTileShape{kMatmulConservativeMR, kMatmulWideNR, kMatmulKeepKC};
-  return defaultGemmSchedule().registerTile;
+  return selectRegisterTile(target);
 }
 
 bool isPrimitiveZeroConstant(mlir::Value value) {
@@ -352,17 +439,18 @@ bool evenlyTiled(int64_t extent, int64_t tile) {
   return tile <= 0 || (extent > 0 && extent % tile == 0);
 }
 
-bool zeroInitElisionCoversAllOutputTiles(mlir::linalg::MatmulOp matmul) {
+bool zeroInitElisionCoversAllOutputTiles(mlir::linalg::MatmulOp matmul,
+                                        const TensorLoweringTarget &target) {
   std::optional<MatmulTileShape> shape = staticMatmulShape(matmul);
   if (!shape)
     return false;
 
-  MatmulLoweringPolicy policy = selectMatmulLoweringPolicy(matmul);
+  MatmulLoweringPolicy policy = selectMatmulLoweringPolicy(matmul, target);
   if (policy.plan == MatmulLoweringPlan::Conservative)
     return false;
 
   if (!usesTiledMatmulPath(policy.plan)) {
-    MatmulTileShape microTile = defaultGemmSchedule().registerTile;
+    MatmulTileShape microTile = selectRegisterTile(target);
     return shape->m <= microTile.m && shape->n <= microTile.n &&
            shape->k <= kMatmulScalarVectorKLimit;
   }
@@ -378,10 +466,11 @@ bool zeroInitElisionCoversAllOutputTiles(mlir::linalg::MatmulOp matmul) {
 }
 
 bool canAbsorbZeroFill(mlir::linalg::MatmulOp matmul,
-                       mlir::linalg::FillOp fill) {
+                       mlir::linalg::FillOp fill,
+                       const TensorLoweringTarget &target) {
   if (!hasPrimitiveMatmulContract(matmul) || fill->getNumResults() != 1 ||
       fill.getNumDpsInputs() != 1 || fill.getNumDpsInits() != 1 ||
-      !zeroInitElisionCoversAllOutputTiles(matmul))
+      !zeroInitElisionCoversAllOutputTiles(matmul, target))
     return false;
 
   mlir::Value fillResult = fill->getResult(0);
@@ -397,6 +486,9 @@ class MatmulZeroInitElisionPass
                                mlir::OperationPass<mlir::ModuleOp>> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(MatmulZeroInitElisionPass)
+
+  explicit MatmulZeroInitElisionPass(TensorLoweringTarget target = {})
+      : target(target) {}
 
   llvm::StringRef getArgument() const final {
     return "lython-matmul-zero-init-elision";
@@ -415,7 +507,7 @@ public:
     getOperation().walk([&](mlir::linalg::MatmulOp matmul) {
       mlir::Value init = matmul.getDpsInitOperand(0)->get();
       auto fill = init.getDefiningOp<mlir::linalg::FillOp>();
-      if (fill && canAbsorbZeroFill(matmul, fill))
+      if (fill && canAbsorbZeroFill(matmul, fill, target))
         matmuls.push_back(matmul);
     });
 
@@ -425,7 +517,7 @@ public:
       auto fill = matmul.getDpsInitOperand(0)
                       ->get()
                       .getDefiningOp<mlir::linalg::FillOp>();
-      if (!fill || !canAbsorbZeroFill(matmul, fill))
+      if (!fill || !canAbsorbZeroFill(matmul, fill, target))
         continue;
       matmul->setAttr(kMatmulZeroInitAttr,
                       mlir::UnitAttr::get(matmul.getContext()));
@@ -433,6 +525,9 @@ public:
       fill.erase();
     }
   }
+
+private:
+  TensorLoweringTarget target;
 };
 
 class MatmulTilingPass
@@ -440,6 +535,9 @@ class MatmulTilingPass
                                mlir::OperationPass<mlir::ModuleOp>> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(MatmulTilingPass)
+
+  explicit MatmulTilingPass(TensorLoweringTarget target = {})
+      : target(target) {}
 
   llvm::StringRef getArgument() const final { return "lython-matmul-tiling"; }
   llvm::StringRef getDescription() const final {
@@ -459,7 +557,8 @@ public:
 
     llvm::SmallVector<TilingTarget, 8> matmuls;
     getOperation().walk([&](mlir::linalg::MatmulOp matmul) {
-      MatmulLoweringPolicy policy = selectMatmulLoweringPolicy(matmul);
+      MatmulLoweringPolicy policy =
+          selectMatmulLoweringPolicy(matmul, target);
       if (usesTiledMatmulPath(policy.plan) &&
           hasStaticShapeLargerThanTile(matmul, policy.schedule.macroTile))
         matmuls.push_back(TilingTarget{matmul, policy});
@@ -479,6 +578,9 @@ public:
       }
     }
   }
+
+private:
+  TensorLoweringTarget target;
 };
 
 class MatmulPackingPass
@@ -749,6 +851,9 @@ class MatmulMicroTilingPass
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(MatmulMicroTilingPass)
 
+  explicit MatmulMicroTilingPass(TensorLoweringTarget target = {})
+      : target(target) {}
+
   llvm::StringRef getArgument() const final {
     return "lython-matmul-micro-tiling";
   }
@@ -764,7 +869,7 @@ public:
   void runOnOperation() final {
     llvm::SmallVector<mlir::linalg::MatmulOp, 16> matmuls;
     getOperation().walk([&](mlir::linalg::MatmulOp matmul) {
-      MatmulTileShape microTile = selectMicroTile(matmul);
+      MatmulTileShape microTile = selectMicroTile(matmul, target);
       if (classifyMatmulLowering(matmul) != MatmulLoweringPlan::Conservative &&
           hasStaticShapeLargerThanTile(matmul, microTile))
         matmuls.push_back(matmul);
@@ -774,13 +879,16 @@ public:
     for (mlir::linalg::MatmulOp matmul : matmuls) {
       if (!matmul->getBlock())
         continue;
-      MatmulTileShape microTile = selectMicroTile(matmul);
+      MatmulTileShape microTile = selectMicroTile(matmul, target);
       if (mlir::failed(tileMatmul(matmul, microTile, rewriter))) {
         signalPassFailure();
         return;
       }
     }
   }
+
+private:
+  TensorLoweringTarget target;
 };
 
 class MatmulVectorizationPass
@@ -788,6 +896,9 @@ class MatmulVectorizationPass
                                mlir::OperationPass<mlir::ModuleOp>> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(MatmulVectorizationPass)
+
+  explicit MatmulVectorizationPass(TensorLoweringTarget target = {})
+      : target(target) {}
 
   llvm::StringRef getArgument() const final {
     return "lython-matmul-vectorization";
@@ -804,7 +915,7 @@ public:
   void runOnOperation() final {
     llvm::SmallVector<mlir::linalg::MatmulOp, 32> matmuls;
     getOperation().walk([&](mlir::linalg::MatmulOp matmul) {
-      MatmulTileShape microTile = selectMicroTile(matmul);
+      MatmulTileShape microTile = selectMicroTile(matmul, target);
       if (classifyMatmulLowering(matmul) != MatmulLoweringPlan::Conservative &&
           !hasStaticShapeLargerThanTile(matmul, microTile))
         matmuls.push_back(matmul);
@@ -825,17 +936,53 @@ public:
       }
     }
   }
+
+private:
+  TensorLoweringTarget target;
 };
 
 } // namespace
 
-std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createMatmulZeroInitElisionPass() {
-  return std::make_unique<MatmulZeroInitElisionPass>();
+// The divisor of `extent` nearest `target`, preferring the larger on a tie.
+// `extent` itself is always a candidate, which is how a shape whose divisors all
+// sit far from the target opts out of being tiled at all.
+//
+// Why an exact divisor rather than the target itself: a partial tile reaches the
+// vector lowering as a non-identity layout map on the strided operands the
+// parallel chunker cuts, which it rejects. Why nearest rather than the largest
+// that fits: K's divisors can leave a wide gap below the target (1280 jumps from
+// 320 to 640), and landing far under it costs more than overshooting -- at
+// K=1280, N=2048 the 320 tile measured 0.87 of what 640 did.
+int64_t divisorNearest(int64_t extent, int64_t target) {
+  int64_t best = extent;
+  for (int64_t low = 1; low * low <= extent; ++low) {
+    if (extent % low != 0)
+      continue;
+    for (int64_t candidate : {low, extent / low}) {
+      int64_t delta = std::abs(candidate - target);
+      int64_t bestDelta = std::abs(best - target);
+      if (delta < bestDelta || (delta == bestDelta && candidate > best))
+        best = candidate;
+    }
+  }
+  return best;
 }
 
-std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createMatmulTilingPass() {
-  return std::make_unique<MatmulTilingPass>();
+std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
+createMatmulZeroInitElisionPass(TensorLoweringTarget target) {
+  return std::make_unique<MatmulZeroInitElisionPass>(target);
+}
+
+
+mlir::LogicalResult tileMatmulReduction(mlir::linalg::MatmulOp matmul,
+                                        int64_t kc,
+                                        mlir::IRRewriter &rewriter) {
+  return tileMatmul(matmul, MatmulTileShape{0, 0, kc}, rewriter);
+}
+
+std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
+createMatmulTilingPass(TensorLoweringTarget target) {
+  return std::make_unique<MatmulTilingPass>(target);
 }
 
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createMatmulPackingPass() {
@@ -858,13 +1005,13 @@ createPackedPanelCopyVectorizationPass() {
 }
 
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createMatmulMicroTilingPass() {
-  return std::make_unique<MatmulMicroTilingPass>();
+createMatmulMicroTilingPass(TensorLoweringTarget target) {
+  return std::make_unique<MatmulMicroTilingPass>(target);
 }
 
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createMatmulVectorizationPass() {
-  return std::make_unique<MatmulVectorizationPass>();
+createMatmulVectorizationPass(TensorLoweringTarget target) {
+  return std::make_unique<MatmulVectorizationPass>(target);
 }
 
 } // namespace py::lowering
