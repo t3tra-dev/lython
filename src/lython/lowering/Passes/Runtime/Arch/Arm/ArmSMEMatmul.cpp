@@ -61,6 +61,20 @@ struct SMEMatmulViews {
 // on the generic scalar/vector path, which already has small-matmul handling.
 constexpr std::uint64_t kSMEMatmulMinWork = 1024;
 
+// Marks a matmul whose rhs operand is already the panel buffer, disguised as
+// [K][N] by a reinterpret_cast. Only the SME kernel may consume such a matmul:
+// any other reader would take the panels for rows and silently mis-execute,
+// which is why MatmulSMELoweringPass refuses loudly when it cannot take one.
+constexpr llvm::StringLiteral kSMERhsPanelsAttr{
+    "ly.prim_tensor.sme_rhs_panels"};
+// The lhs twin: A's panels were materialised chunk-relative at A's definition
+// (hoisted out of any loop that merely re-reads A), and the operand is the
+// panel buffer behind a [K][M] reinterpret_cast. Same commitment as the rhs
+// mark: only the SME kernel may read it.
+constexpr llvm::StringLiteral kSMELhsPanelsAttr{
+    "ly.prim_tensor.sme_lhs_panels"};
+
+
 // Register-block the ZA accumulator: each (row, col) macro step drives a
 // rows x cols grid of ZA tiles, loading (rows + cols) scalable vectors and
 // issuing (rows * cols) outer products per K step. f32 has exactly four ZA.S
@@ -86,14 +100,16 @@ constexpr SMETileGrid kSMETileGrid{2, 2};
 
 // Panel-pack engages when B reaches this size. Below it the strided kernel is
 // simply faster and the pack is pure overhead; at and above it the panels win
-// single-threaded and hold parity multi-threaded. Measured on M4 Max f32
-// against the strided kernel (1T / MT):
-//   1536^2 B=9.4MB:  1659 vs 1785 / 2984 vs 3356  -- strided
-//   2000^2 B=16MB:   1499 vs 1356 / 2906 vs 2870  -- packed
-//   2560^2 B=26MB:   1637 vs 1342 / 3255 vs 3343  -- packed 1T, MT a wash
-// The line sits where B stops fitting the 16MB L2 a P-cluster owns, which is
-// exactly where the strided kernel's re-streaming starts paying full price.
-constexpr std::uint64_t kSMEPanelMinRhsBytes = 16u << 20;
+// on both thread counts. Measured on M4 Max f32 against the strided kernel
+// (1T / MT), with A's panels hoisted to its definition:
+//   1536^2 B=9.4MB:  1722 vs 1791 / 3264 vs 3349  -- strided
+//   2000^2 B=15.3MB: 1540 vs 1431 / 2962 vs 2689  -- packed
+//   2048^2 B=16MB:   1650 vs 1469 / 3191 vs 2841  -- packed
+//   2560^2 B=26MB:   1675 vs 1438 / 3200 vs 2769  -- packed
+// The line sits between the measured points; 12MB splits them. It tracks the
+// 16MB L2 a P-cluster owns: once B stops fitting, the strided kernel's
+// re-streaming pays full price and the panels' contiguity starts earning.
+constexpr std::uint64_t kSMEPanelMinRhsBytes = 12u << 20;
 
 std::optional<SMEElementLayout>
 smeElementLayout(mlir::Type elementType, const py::TensorLoweringTarget &target) {
@@ -539,12 +555,6 @@ void createMultiVectorStore(mlir::OpBuilder &builder, mlir::Location loc,
                                       mlir::LLVM::FastmathFlagsAttr{});
 }
 
-// Marks a matmul whose rhs operand is already the panel buffer, disguised as
-// [K][N] by a reinterpret_cast. Only the SME kernel may consume such a matmul:
-// any other reader would take the panels for rows and silently mis-execute,
-// which is why MatmulSMELoweringPass refuses loudly when it cannot take one.
-constexpr llvm::StringLiteral kSMERhsPanelsAttr{
-    "ly.prim_tensor.sme_rhs_panels"};
 
 // Streaming vector length in f32 lanes, readable outside streaming mode: the
 // intrinsic wraps RDSVL, which is specified to work in either mode. The
@@ -573,25 +583,24 @@ mlir::Value createStreamingLaneCount(mlir::OpBuilder &builder,
 // and zero-filled past N. Runs in the caller, outside any streaming region, so
 // it sticks to fixed-width vectors: Apple silicon has no non-streaming SVE to
 // reach for, and packing is memory-bound anyway.
-mlir::Value createRhsPanels(mlir::OpBuilder &builder, mlir::Location loc,
-                            mlir::Value rhs, int64_t k, int64_t n,
-                            mlir::Value width) {
+// Pack `source` ([K][X], non-streaming caller) as panels of `width` columns
+// into `dest` starting at element `destBase`. Factored from the rhs pack so
+// the hoisted lhs pack can lay several chunks' panels into one buffer.
+void createPanelBufferInto(mlir::OpBuilder &builder, mlir::Location loc,
+                           mlir::Value dest, mlir::Value destBase,
+                           mlir::Value source, int64_t k, int64_t x,
+                           mlir::Value width) {
   auto f32 = builder.getF32Type();
   auto vec4 = mlir::VectorType::get({4}, f32);
   mlir::Value zero = createIndexConstant(builder, loc, 0);
   mlir::Value one = createIndexConstant(builder, loc, 1);
   mlir::Value four = createIndexConstant(builder, loc, 4);
   mlir::Value kValue = createIndexConstant(builder, loc, k);
-  mlir::Value nValue = createIndexConstant(builder, loc, n);
+  mlir::Value nValue = createIndexConstant(builder, loc, x);
+  mlir::Value rhs = source;
+  mlir::Value packed = dest;
   mlir::Value panels =
       mlir::arith::CeilDivSIOp::create(builder, loc, nValue, width);
-  mlir::Value total = mlir::arith::MulIOp::create(
-      builder, loc, mlir::arith::MulIOp::create(builder, loc, panels, kValue),
-      width);
-  auto packedType =
-      mlir::MemRefType::get({mlir::ShapedType::kDynamic}, f32);
-  mlir::Value packed = mlir::memref::AllocOp::create(builder, loc, packedType,
-                                                     mlir::ValueRange{total});
 
   auto panelLoop = mlir::scf::ForOp::create(builder, loc, zero, panels, one);
   // Panels are disjoint, so the copy forks like the kernel does. Serial, this
@@ -636,10 +645,12 @@ mlir::Value createRhsPanels(mlir::OpBuilder &builder, mlir::Location loc,
         auto kLoop = mlir::scf::ForOp::create(builder, loc, zero, kValue, one);
         builder.setInsertionPointToStart(kLoop.getBody());
         mlir::Value step = kLoop.getInductionVar();
-        mlir::Value dstRow = mlir::arith::MulIOp::create(
-            builder, loc,
-            mlir::arith::AddIOp::create(builder, loc, panelTimesK, step),
-            width);
+        mlir::Value dstRow = mlir::arith::AddIOp::create(
+            builder, loc, destBase,
+            mlir::arith::MulIOp::create(
+                builder, loc,
+                mlir::arith::AddIOp::create(builder, loc, panelTimesK, step),
+                width));
         // A few rows ahead, clamped: PRFM cannot fault, but keep the index
         // arithmetic in bounds anyway.
         mlir::Value ahead = mlir::arith::MinSIOp::create(
@@ -672,10 +683,12 @@ mlir::Value createRhsPanels(mlir::OpBuilder &builder, mlir::Location loc,
         auto kLoop = mlir::scf::ForOp::create(builder, loc, zero, kValue, one);
         builder.setInsertionPointToStart(kLoop.getBody());
         mlir::Value step = kLoop.getInductionVar();
-        mlir::Value dstRow = mlir::arith::MulIOp::create(
-            builder, loc,
-            mlir::arith::AddIOp::create(builder, loc, panelTimesK, step),
-            width);
+        mlir::Value dstRow = mlir::arith::AddIOp::create(
+            builder, loc, destBase,
+            mlir::arith::MulIOp::create(
+                builder, loc,
+                mlir::arith::AddIOp::create(builder, loc, panelTimesK, step),
+                width));
         auto jLoop = mlir::scf::ForOp::create(builder, loc, zero, width, four);
         builder.setInsertionPointToStart(jLoop.getBody());
         mlir::Value j = jLoop.getInductionVar();
@@ -698,9 +711,12 @@ mlir::Value createRhsPanels(mlir::OpBuilder &builder, mlir::Location loc,
       auto kLoop = mlir::scf::ForOp::create(builder, loc, zero, kValue, one);
       builder.setInsertionPointToStart(kLoop.getBody());
       mlir::Value step = kLoop.getInductionVar();
-      mlir::Value dstRow = mlir::arith::MulIOp::create(
-          builder, loc,
-          mlir::arith::AddIOp::create(builder, loc, panelTimesK, step), width);
+      mlir::Value dstRow = mlir::arith::AddIOp::create(
+          builder, loc, destBase,
+          mlir::arith::MulIOp::create(
+              builder, loc,
+              mlir::arith::AddIOp::create(builder, loc, panelTimesK, step),
+              width));
       auto jLoop = mlir::scf::ForOp::create(builder, loc, zero, width, one);
       builder.setInsertionPointToStart(jLoop.getBody());
       mlir::Value j = jLoop.getInductionVar();
@@ -724,6 +740,25 @@ mlir::Value createRhsPanels(mlir::OpBuilder &builder, mlir::Location loc,
               mlir::arith::AddIOp::create(builder, loc, dstRow, j)});
     }
   }
+}
+
+mlir::Value createRhsPanels(mlir::OpBuilder &builder, mlir::Location loc,
+                            mlir::Value rhs, int64_t k, int64_t n,
+                            mlir::Value width) {
+  auto f32 = builder.getF32Type();
+  mlir::Value kValue = createIndexConstant(builder, loc, k);
+  mlir::Value nValue = createIndexConstant(builder, loc, n);
+  mlir::Value panels =
+      mlir::arith::CeilDivSIOp::create(builder, loc, nValue, width);
+  mlir::Value total = mlir::arith::MulIOp::create(
+      builder, loc, mlir::arith::MulIOp::create(builder, loc, panels, kValue),
+      width);
+  auto packedType = mlir::MemRefType::get({mlir::ShapedType::kDynamic}, f32);
+  mlir::Value packed = mlir::memref::AllocOp::create(builder, loc, packedType,
+                                                     mlir::ValueRange{total});
+  createPanelBufferInto(builder, loc, packed,
+                        createIndexConstant(builder, loc, 0), rhs, k, n,
+                        width);
   return packed;
 }
 
@@ -872,6 +907,7 @@ mlir::LogicalResult lowerStaticMatmulToSME(mlir::linalg::MatmulOp matmul,
   // pays. Without the mark this kernel reads both operands strided, exactly as
   // before packing existed.
   bool rhsPrePacked = matmul->hasAttr(kSMERhsPanelsAttr);
+  bool lhsPrePacked = matmul->hasAttr(kSMELhsPanelsAttr);
   bool packOperands = rhsPrePacked;
 
   // An already-transposed LHS is the packed panel: nothing to do.
@@ -886,14 +922,43 @@ mlir::LogicalResult lowerStaticMatmulToSME(mlir::linalg::MatmulOp matmul,
     // A is chunked, so each worker packs its own disjoint slice here. B is
     // shared by every chunk, which is why MatmulSMERhsPackPass packs it once
     // in the caller instead: inline it re-copied the whole of B per chunk.
-    panelLhs = createPanelPack(rewriter, loc, packedLhs, packedLhsType,
-                               vectorType, refs->k, refs->m, rowBlock,
-                               grid.rows);
+    panelLhs = lhsPrePacked
+                   ? refs->lhs
+                   : createPanelPack(rewriter, loc, packedLhs, packedLhsType,
+                                     vectorType, refs->k, refs->m, rowBlock,
+                                     grid.rows);
     panelRhs = rhsPrePacked
                    ? refs->rhs
                    : createPanelPack(rewriter, loc, refs->rhs, refs->rhsType,
                                      vectorType, refs->k, refs->n, colBlock,
                                      grid.cols);
+  }
+  // Where this kernel's rows sit in the hoisted panel buffer. The buffer is
+  // chunk-relative ([chunk][panels][K][W]); the chunk index falls out of the
+  // output subview's row offset and the (static) chunk height m. The lhs
+  // operand itself is a subview of the disguised [K][M] type -- taken only so
+  // linalg.matmul's shape inference holds -- and reads deliberately go through
+  // ExtractAlignedPointerAsIndexOp, which returns the allocation base and
+  // ignores subview offsets: the very footgun that once freed these buffers
+  // early is what lets one chunk-relative buffer serve every chunk.
+  mlir::Value lhsPanelBase;
+  if (lhsPrePacked) {
+    std::optional<mlir::Value> outRow = createSubviewOffsetForDimension(
+        rewriter, loc, refs->out, /*dimension=*/0);
+    mlir::Value rowOffset =
+        outRow ? *outRow : createIndexConstant(rewriter, loc, 0);
+    mlir::Value chunk = mlir::arith::DivSIOp::create(
+        rewriter, loc, rowOffset, createIndexConstant(rewriter, loc, refs->m));
+    mlir::Value panelsPerChunk = mlir::arith::CeilDivSIOp::create(
+        rewriter, loc, createIndexConstant(rewriter, loc, refs->m), rowBlock);
+    mlir::Value chunkStride = mlir::arith::MulIOp::create(
+        rewriter, loc,
+        mlir::arith::MulIOp::create(rewriter, loc, panelsPerChunk,
+                                    createIndexConstant(rewriter, loc,
+                                                        refs->k)),
+        rowBlock);
+    lhsPanelBase =
+        mlir::arith::MulIOp::create(rewriter, loc, chunk, chunkStride);
   }
   SMEMatmulViews views{
       createDynamicRank2MemRefCast(rewriter, loc, packedLhs, packedLhsType),
@@ -1037,9 +1102,12 @@ mlir::LogicalResult lowerStaticMatmulToSME(mlir::linalg::MatmulOp matmul,
         };
         llvm::SmallVector<mlir::Value, 4> lhsVectors;
         if (packOperands) {
-          lhsVectors = createMultiVectorLoad(
-              builder, nestedLoc, panelLhs, vectorType,
-              panelIndex(rows.front(), rowBlock), grid.rows);
+          mlir::Value lhsLinear = panelIndex(rows.front(), rowBlock);
+          if (lhsPrePacked)
+            lhsLinear = mlir::arith::AddIOp::create(builder, nestedLoc,
+                                                    lhsPanelBase, lhsLinear);
+          lhsVectors = createMultiVectorLoad(builder, nestedLoc, panelLhs,
+                                             vectorType, lhsLinear, grid.rows);
         } else if (multiVector && grid.rows > 1) {
           lhsVectors = createMultiVectorLoad(
               builder, nestedLoc, packedLhs, vectorType,
@@ -1168,7 +1236,8 @@ mlir::LogicalResult lowerStaticMatmulToSME(mlir::linalg::MatmulOp matmul,
   // explicit dealloc is a memref use at the right point, and the deallocation
   // pass skips allocs that already have one.
   if (packOperands) {
-    mlir::memref::DeallocOp::create(rewriter, loc, panelLhs);
+    if (!lhsPrePacked)
+      mlir::memref::DeallocOp::create(rewriter, loc, panelLhs);
     if (!rhsPrePacked)
       mlir::memref::DeallocOp::create(rewriter, loc, panelRhs);
   }
@@ -1329,7 +1398,8 @@ private:
     // Safety net, not policy: the pipeline runs this pass before the rhs pack,
     // so a marked matmul here means the order was broken. Tiling one would
     // subview the disguised panel buffer, which addresses garbage.
-    if (matmul->hasAttr(kSMERhsPanelsAttr))
+    if (matmul->hasAttr(kSMERhsPanelsAttr) ||
+        matmul->hasAttr(kSMELhsPanelsAttr))
       return std::nullopt;
     auto rhsType = mlir::dyn_cast<mlir::ShapedType>(
         matmul.getDpsInputOperand(1)->get().getType());
@@ -1448,10 +1518,108 @@ public:
       matmul->setAttr(kSMERhsPanelsAttr, builder.getUnitAttr());
       builder.setInsertionPointAfter(matmul);
       mlir::memref::DeallocOp::create(builder, loc, packed);
+
+      // A's panels, hoisted. B changes per call, so its pack just ran here;
+      // A usually does not -- in an `x = A @ x` chain it never does -- so its
+      // panels are materialised right after the transpose that defines A_T,
+      // which MatmulLhsTransposePass already anchored at A's definition,
+      // outside any loop that merely re-reads it. Accelerate re-packs A on
+      // every sgemm call (measured 4.5% of a 2000^3 run); a compiler that can
+      // see the loop pays once.
+      //
+      // The layout is chunk-relative -- chunk c's rows start a fresh panel
+      // group -- because the parallel chunker's equal-height cuts need not be
+      // multiples of the runtime panel width, and a panel straddling a chunk
+      // boundary could not be read contiguously by either side. The kernel
+      // recovers c from its output subview's row offset.
+      //
+      // No dealloc on purpose: the panels outlive every reader of A_T, and
+      // the deallocation pass frees function-exit-lived buffers itself.
+      packLhsPanels(builder, matmul, *refs, width);
     }
   }
 
 private:
+  // Emits the hoisted pack when A_T's defining write is visible; a matmul
+  // whose lhs has no traceable transpose keeps the kernel's inline pack.
+  void packLhsPanels(mlir::OpBuilder &builder, mlir::linalg::MatmulOp matmul,
+                     const StaticMatmulMemRefs &refs, mlir::Value width) {
+    mlir::Value root = refs.lhs;
+    while (auto cast = root.getDefiningOp<mlir::memref::CastOp>())
+      root = cast.getSource();
+    mlir::linalg::TransposeOp writer;
+    for (mlir::Operation *user : root.getUsers()) {
+      auto transpose = mlir::dyn_cast<mlir::linalg::TransposeOp>(user);
+      if (transpose && transpose.getDpsInitOperand(0)->get() == root) {
+        writer = transpose;
+        break;
+      }
+    }
+    if (!writer)
+      return;
+
+    int64_t chunks =
+        selectSMEMatmulChunkCount(refs.m, refs.n, refs.k).value_or(1);
+    int64_t rows = refs.m / chunks;
+    mlir::Location loc = writer.getLoc();
+    builder.setInsertionPointAfter(writer);
+    // The pass entry point computed `width` next to the matmul; the pack
+    // lives at A_T's definition, so it derives its own.
+    mlir::Value lanes = createStreamingLaneCount(builder, loc);
+    mlir::Value panelWidth = mlir::arith::MulIOp::create(
+        builder, loc, lanes,
+        createIndexConstant(builder, loc, kSMETileGrid.cols));
+    mlir::Value rowsValue = createIndexConstant(builder, loc, rows);
+    mlir::Value kValue = createIndexConstant(builder, loc, refs.k);
+    mlir::Value chunksValue = createIndexConstant(builder, loc, chunks);
+    mlir::Value panelsPerChunk = mlir::arith::CeilDivSIOp::create(
+        builder, loc, rowsValue, panelWidth);
+    mlir::Value chunkStride = mlir::arith::MulIOp::create(
+        builder, loc,
+        mlir::arith::MulIOp::create(builder, loc, panelsPerChunk, kValue),
+        panelWidth);
+    mlir::Value total =
+        mlir::arith::MulIOp::create(builder, loc, chunksValue, chunkStride);
+    auto packedType = mlir::MemRefType::get({mlir::ShapedType::kDynamic},
+                                            builder.getF32Type());
+    mlir::Value panels = mlir::memref::AllocOp::create(
+        builder, loc, packedType, mlir::ValueRange{total});
+
+    mlir::Value zero = createIndexConstant(builder, loc, 0);
+    mlir::Value one = createIndexConstant(builder, loc, 1);
+    auto chunkLoop =
+        mlir::scf::ForOp::create(builder, loc, zero, chunksValue, one);
+    {
+      mlir::OpBuilder::InsertionGuard g(builder);
+      builder.setInsertionPointToStart(chunkLoop.getBody());
+      mlir::Value c = chunkLoop.getInductionVar();
+      mlir::Value rowStart =
+          mlir::arith::MulIOp::create(builder, loc, c, rowsValue);
+      mlir::Value destBase =
+          mlir::arith::MulIOp::create(builder, loc, c, chunkStride);
+      mlir::Value source = mlir::memref::SubViewOp::create(
+          builder, loc, root,
+          llvm::ArrayRef<mlir::OpFoldResult>{builder.getIndexAttr(0),
+                                             mlir::OpFoldResult(rowStart)},
+          llvm::ArrayRef<mlir::OpFoldResult>{builder.getIndexAttr(refs.k),
+                                             builder.getIndexAttr(rows)},
+          llvm::ArrayRef<mlir::OpFoldResult>{builder.getIndexAttr(1),
+                                             builder.getIndexAttr(1)});
+      createPanelBufferInto(builder, loc, panels, destBase, source, refs.k,
+                            rows, panelWidth);
+    }
+
+    builder.setInsertionPoint(matmul);
+    auto lieType = mlir::MemRefType::get({refs.k, refs.m},
+                                         refs.lhsType.getElementType());
+    mlir::Value lie = mlir::memref::ReinterpretCastOp::create(
+        builder, matmul.getLoc(), lieType, panels, /*offset=*/0,
+        llvm::ArrayRef<int64_t>{refs.k, refs.m},
+        llvm::ArrayRef<int64_t>{refs.m, 1});
+    matmul.getDpsInputOperand(0)->set(lie);
+    matmul->setAttr(kSMELhsPanelsAttr, builder.getUnitAttr());
+  }
+
   py::TensorLoweringTarget target;
 };
 

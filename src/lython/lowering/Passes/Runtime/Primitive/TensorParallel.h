@@ -7,6 +7,7 @@
 #include "llvm/ADT/StringRef.h"
 
 #include <memory>
+#include <optional>
 
 namespace py::lowering {
 
@@ -16,6 +17,14 @@ namespace py::lowering {
 // tag their own loops with it.
 inline constexpr llvm::StringLiteral kParallelDispatchAttrName{
     "ly.parallel.dispatch"};
+
+// The M split the parallel chunker will choose for an SME-bound (transposed
+// LHS) matmul, or nullopt when it stays whole -- including the work gate, so
+// this is the whole decision. Exposed because the operand-panel pass lays A's
+// panels out chunk-relative and the two decisions must never drift apart; the
+// chunk pass itself calls this for transposed matmuls.
+std::optional<int64_t> selectSMEMatmulChunkCount(int64_t m, int64_t n,
+                                                 int64_t k);
 
 // Splits large primitive matmuls into equal static row chunks inside a loop
 // tagged for parallel dispatch. Runs on bufferized linalg, before the arch
