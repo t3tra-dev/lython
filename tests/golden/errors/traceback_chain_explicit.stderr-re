@@ -1,0 +1,14 @@
+Traceback\ \(most\ recent\ call\ last\):\
+\ \ File\ ".*traceback_chain_explicit\.py",\ line\ 5,\ in\ f\
+\ \ \ \ raise\ ValueError\("first"\)\
+ValueError:\ first\
+\
+The\ above\ exception\ was\ the\ direct\ cause\ of\ the\ following\ exception:\
+\
+Traceback\ \(most\ recent\ call\ last\):\
+\ \ File\ ".*traceback_chain_explicit\.py",\ line\ 10,\ in\ <module>\
+\ \ \ \ f\(\)\
+\ \ \ \ \~\^\^\
+\ \ File\ ".*traceback_chain_explicit\.py",\ line\ 7,\ in\ f\
+\ \ \ \ raise\ RuntimeError\("second"\)\ from\ e\
+RuntimeError:\ second

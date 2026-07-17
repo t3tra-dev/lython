@@ -1,0 +1,4 @@
+Traceback\ \(most\ recent\ call\ last\):\
+\ \ File\ ".*traceback_chain_from_none\.py",\ line\ 5,\ in\ <module>\
+\ \ \ \ raise\ RuntimeError\("visible"\)\ from\ None\
+RuntimeError:\ visible
