@@ -101,7 +101,8 @@ private:
                          llvm::StringRef symbolName = {});
   void collectClassFields(const parser::Node &classDef,
                           llvm::SmallVectorImpl<std::string> &fieldNames,
-                          llvm::SmallVectorImpl<mlir::Type> &fieldTypes);
+                          llvm::SmallVectorImpl<mlir::Type> &fieldTypes,
+                          bool includeAnnAssignDefaults = false);
   void collectStaticClassAssignments(
       const parser::Node &classDef, llvm::SmallVectorImpl<std::string> &names,
       llvm::SmallVectorImpl<mlir::Attribute> &values,
@@ -371,6 +372,12 @@ private:
   // per class (classStaticAttrBindings holds the merged types).
   llvm::StringMap<llvm::SmallVector<std::string, 8>> classStaticAttrOrders;
   llvm::StringMap<llvm::StringMap<mlir::Attribute>> classStaticAttrValues;
+  // Dataclass field default expressions (AnnAssign values), per class; MRO
+  // walks reuse a base dataclass's defaults for inherited fields.
+  llvm::StringMap<llvm::StringMap<parser::NodePtr>> classFieldDefaultNodes;
+  // Synthesized dataclass method ASTs (__init__/__repr__/__eq__): owned here
+  // because the parse tree does not contain them.
+  std::vector<parser::NodePtr> synthesizedClassMethods;
   // Module-level mutable globals, opted in by an int annotation at module
   // scope (`NAME: int = ...`). Backed by process-lifetime storage so reads
   // are async-signal-safe (see py.global.get/set); referenced from any scope,

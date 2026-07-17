@@ -250,6 +250,77 @@ llvm::StringSet<> classPropertyNames(const parser::Node &classDef) {
   return names;
 }
 
+// --- synthesized-AST builders (dataclass methods) ---
+
+parser::NodePtr synthName(llvm::StringRef id, parser::SourceRange range) {
+  parser::NodePtr node = parser::makeNode("Name", range);
+  parser::addField(*node, "id", std::string(id));
+  return node;
+}
+
+parser::NodePtr synthSelfAttr(llvm::StringRef self, llvm::StringRef attr,
+                              parser::SourceRange range) {
+  parser::NodePtr node = parser::makeNode("Attribute", range);
+  parser::addField(*node, "value", synthName(self, range));
+  parser::addField(*node, "attr", std::string(attr));
+  return node;
+}
+
+parser::NodePtr synthStrConstant(llvm::StringRef text,
+                                 parser::SourceRange range) {
+  parser::NodePtr node = parser::makeNode("Constant", range);
+  parser::addField(*node, "value", std::string(text));
+  return node;
+}
+
+parser::NodePtr synthAdd(parser::NodePtr lhs, parser::NodePtr rhs,
+                         parser::SourceRange range) {
+  parser::NodePtr node = parser::makeNode("BinOp", range);
+  parser::NodePtr op = parser::makeNode("Add", range);
+  parser::addField(*node, "left", std::move(lhs));
+  parser::addField(*node, "op", std::move(op));
+  parser::addField(*node, "right", std::move(rhs));
+  return node;
+}
+
+parser::NodePtr synthReprCall(parser::NodePtr argument,
+                              parser::SourceRange range) {
+  parser::NodePtr node = parser::makeNode("Call", range);
+  parser::addField(*node, "func", synthName("repr", range));
+  parser::addField(*node, "args", std::vector<parser::NodePtr>{argument});
+  parser::addField(*node, "keywords", std::vector<parser::NodePtr>{});
+  return node;
+}
+
+parser::NodePtr synthArg(llvm::StringRef name, parser::SourceRange range) {
+  parser::NodePtr node = parser::makeNode("arg", range);
+  parser::addField(*node, "arg", std::string(name));
+  return node;
+}
+
+parser::NodePtr
+synthFunctionDef(llvm::StringRef name, llvm::ArrayRef<std::string> paramNames,
+                 std::vector<parser::NodePtr> defaults,
+                 std::vector<parser::NodePtr> body,
+                 parser::SourceRange range) {
+  parser::NodePtr arguments = parser::makeNode("arguments", range);
+  std::vector<parser::NodePtr> args;
+  for (const std::string &param : paramNames)
+    args.push_back(synthArg(param, range));
+  parser::addField(*arguments, "posonlyargs", std::vector<parser::NodePtr>{});
+  parser::addField(*arguments, "args", std::move(args));
+  parser::addField(*arguments, "kwonlyargs", std::vector<parser::NodePtr>{});
+  parser::addField(*arguments, "kw_defaults", std::vector<parser::NodePtr>{});
+  parser::addField(*arguments, "defaults", std::move(defaults));
+
+  parser::NodePtr node = parser::makeNode("FunctionDef", range);
+  parser::addField(*node, "name", std::string(name));
+  parser::addField(*node, "args", std::move(arguments));
+  parser::addField(*node, "body", std::move(body));
+  parser::addField(*node, "decorator_list", std::vector<parser::NodePtr>{});
+  return node;
+}
+
 } // namespace
 
 void ModuleEmitter::checkDecorators(const parser::Node &node,
@@ -442,6 +513,60 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
   llvm::StringRef contractName(classSymbol);
   checkDecorators(classDef, DecoratorRole::Class);
 
+  // @dataclass: init/repr/eq synthesize below (default True); frozen/order
+  // are accepted only as explicit False.
+  bool isDataclass = false;
+  bool dataclassInit = true;
+  bool dataclassRepr = true;
+  bool dataclassEq = true;
+  if (const auto *decorators = ast::nodeList(classDef, "decorator_list")) {
+    for (const parser::NodePtr &decorator : *decorators) {
+      if (!decorator)
+        continue;
+      auto [callee, spelling] = decoratorCallee(*decorator);
+      if (decoratorLeafName(spelling) != "dataclass")
+        continue;
+      isDataclass = true;
+      if (decorator->kind != "Call")
+        continue;
+      if (const auto *args = ast::nodeList(*decorator, "args"))
+        if (!args->empty())
+          diagnostics.push_back(parser::Diagnostic{
+              parser::Severity::Error, decorator->range.start,
+              "dataclass() takes keyword arguments only"});
+      if (const auto *keywords = ast::nodeList(*decorator, "keywords")) {
+        for (const parser::NodePtr &keyword : *keywords) {
+          if (!keyword)
+            continue;
+          auto keywordName = ast::string(*keyword, "arg");
+          const parser::Node *value = ast::node(*keyword, "value");
+          std::optional<bool> flag =
+              value ? ast::boolean(*value, "value") : std::nullopt;
+          if (!keywordName || !flag) {
+            diagnostics.push_back(parser::Diagnostic{
+                parser::Severity::Error, keyword->range.start,
+                "dataclass() arguments must be literal True/False keywords"});
+            continue;
+          }
+          if (*keywordName == "init")
+            dataclassInit = *flag;
+          else if (*keywordName == "repr")
+            dataclassRepr = *flag;
+          else if (*keywordName == "eq")
+            dataclassEq = *flag;
+          else if ((*keywordName == "frozen" || *keywordName == "order") &&
+                   !*flag)
+            ; // explicit False matches the synthesized behavior
+          else
+            diagnostics.push_back(parser::Diagnostic{
+                parser::Severity::Error, keyword->range.start,
+                "dataclass argument '" + std::string(*keywordName) +
+                    "' is not supported"});
+        }
+      }
+    }
+  }
+
   llvm::SmallVector<llvm::StringRef, 4> bases;
   if (const auto *baseNodes = ast::nodeList(classDef, "bases")) {
     for (const parser::NodePtr &base : *baseNodes) {
@@ -509,7 +634,41 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
 
   llvm::SmallVector<std::string, 8> fieldNames;
   llvm::SmallVector<mlir::Type, 8> fieldTypes;
-  collectClassFields(classDef, fieldNames, fieldTypes);
+  collectClassFields(classDef, fieldNames, fieldTypes,
+                     /*includeAnnAssignDefaults=*/isDataclass);
+
+  // Dataclass field defaults (AnnAssign initializers). dataclasses.field()
+  // machinery (default_factory etc.) is not modeled.
+  llvm::StringMap<parser::NodePtr> &fieldDefaults =
+      classFieldDefaultNodes[contractName];
+  fieldDefaults.clear();
+  if (isDataclass) {
+    if (const auto *body = ast::nodeList(classDef, "body")) {
+      for (const parser::NodePtr &statement : *body) {
+        if (!statement || statement->kind != "AnnAssign")
+          continue;
+        const parser::Node *target = ast::node(*statement, "target");
+        const parser::Field *valueField =
+            target ? parser::findField(*statement, "value") : nullptr;
+        if (!target || target->kind != "Name" || !valueField ||
+            !std::holds_alternative<parser::NodePtr>(valueField->value))
+          continue;
+        parser::NodePtr value = std::get<parser::NodePtr>(valueField->value);
+        if (!value)
+          continue;
+        if (value->kind == "Call") {
+          auto [callee, spelling] = decoratorCallee(*value);
+          if (decoratorLeafName(spelling) == "field") {
+            diagnostics.push_back(parser::Diagnostic{
+                parser::Severity::Error, value->range.start,
+                "dataclasses.field(...) defaults are not supported yet"});
+            continue;
+          }
+        }
+        fieldDefaults[ast::nameSpelling(*target)] = value;
+      }
+    }
+  }
 
   // Manifest fields_spec (ly.typing.fields_spec, e.g. ctypes
   // Structure/Union): a class assignment named by the spec declares the
@@ -714,6 +873,173 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
                         std::string(contractName)};
     }
   }
+  if (isDataclass) {
+    // Synthesize __init__/__repr__/__eq__ from the MRO-merged field list
+    // (CPython composes base dataclass fields the same way); an explicit
+    // user definition wins, as in dataclasses._set_new_attribute.
+    llvm::ArrayRef<std::string> order = classFieldOrders[contractName];
+    const llvm::StringMap<mlir::Type> &fieldTypeMap =
+        classFieldBindings[contractName];
+    auto defaultNodeFor = [&](llvm::StringRef field) -> parser::NodePtr {
+      for (const std::string &cls : classMros[contractName]) {
+        auto perClass = classFieldDefaultNodes.find(cls);
+        if (perClass == classFieldDefaultNodes.end())
+          continue;
+        auto found = perClass->second.find(field);
+        if (found != perClass->second.end())
+          return found->second;
+      }
+      return nullptr;
+    };
+    bool sawDefault = false;
+    for (const std::string &field : order) {
+      parser::NodePtr defaultNode = defaultNodeFor(field);
+      if (defaultNode) {
+        sawDefault = true;
+      } else if (sawDefault) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, classDef.range.start,
+            "non-default argument '" + field +
+                "' follows default argument in dataclass field order"});
+      }
+    }
+    auto userDefines = [&](llvm::StringRef method) {
+      auto ownMethods = classMethodBindings.find(contractName);
+      return ownMethods != classMethodBindings.end() &&
+             ownMethods->second.count(method);
+    };
+    parser::SourceRange range = classDef.range;
+    auto registerSynthesized = [&](parser::NodePtr fn,
+                                   FunctionSignature bodySig) {
+      auto fnName = ast::string(*fn, "name");
+      types.refreshCallable(bodySig);
+      std::string symbolName =
+          sourceMethodSymbolName(contractName, *fnName, *fn);
+      methodNames.push_back(std::string(*fnName));
+      methodKinds.push_back("instance");
+      methodContracts.push_back(bodySig.publicCallable
+                                    ? bodySig.publicCallable
+                                    : bodySig.callable);
+      methodSymbols.push_back(symbolName);
+      pendingBodies.push_back(fn.get());
+      pendingBodySigs.push_back(bodySig);
+      pendingBodySymbols.push_back(symbolName);
+      pendingBodyKinds.push_back("instance");
+      classMethodBindings[contractName][*fnName] =
+          MethodBinding{fn.get(),   bodySig, bodySig,
+                        "instance", symbolName, /*async=*/false,
+                        std::string(contractName)};
+      synthesizedClassMethods.push_back(std::move(fn));
+    };
+    auto fieldType = [&](llvm::StringRef field) {
+      auto found = fieldTypeMap.find(field);
+      return found != fieldTypeMap.end() ? found->second : types.object();
+    };
+
+    if (dataclassInit && !userDefines("__init__")) {
+      llvm::SmallVector<std::string, 8> paramNames{"self"};
+      std::vector<parser::NodePtr> defaults;
+      std::vector<parser::NodePtr> body;
+      FunctionSignature sig;
+      sig.positionalNames.push_back("self");
+      sig.positionalTypes.push_back(types.contract(contractName));
+      sig.positionalDefaults.push_back(false);
+      for (const std::string &field : order) {
+        paramNames.push_back(field);
+        sig.positionalNames.push_back(field);
+        sig.positionalTypes.push_back(fieldType(field));
+        parser::NodePtr defaultNode = defaultNodeFor(field);
+        sig.positionalDefaults.push_back(defaultNode != nullptr);
+        if (defaultNode)
+          defaults.push_back(defaultNode);
+        parser::NodePtr assign = parser::makeNode("Assign", range);
+        parser::addField(*assign, "targets",
+                         std::vector<parser::NodePtr>{
+                             synthSelfAttr("self", field, range)});
+        parser::addField(*assign, "value", synthName(field, range));
+        body.push_back(std::move(assign));
+      }
+      if (body.empty())
+        body.push_back(parser::makeNode("Pass", range));
+      sig.resultType = types.none();
+      registerSynthesized(
+          synthFunctionDef("__init__", paramNames, std::move(defaults),
+                           std::move(body), range),
+          std::move(sig));
+    }
+    if (dataclassRepr && !userDefines("__repr__")) {
+      std::string className =
+          py::contracts::manifestClassNameForContract(contractName);
+      parser::NodePtr expr;
+      if (order.empty()) {
+        expr = synthStrConstant(className + "()", range);
+      } else {
+        expr = synthStrConstant(className + "(", range);
+        for (auto [index, field] : llvm::enumerate(order)) {
+          std::string label = (index ? ", " : "") + field + "=";
+          expr = synthAdd(std::move(expr), synthStrConstant(label, range),
+                          range);
+          expr = synthAdd(
+              std::move(expr),
+              synthReprCall(synthSelfAttr("self", field, range), range),
+              range);
+        }
+        expr = synthAdd(std::move(expr), synthStrConstant(")", range), range);
+      }
+      parser::NodePtr returnNode = parser::makeNode("Return", range);
+      parser::addField(*returnNode, "value", std::move(expr));
+      FunctionSignature sig;
+      sig.positionalNames.push_back("self");
+      sig.positionalTypes.push_back(types.contract(contractName));
+      sig.positionalDefaults.push_back(false);
+      sig.resultType = types.strType();
+      registerSynthesized(
+          synthFunctionDef("__repr__", {"self"}, {},
+                           {std::move(returnNode)}, range),
+          std::move(sig));
+    }
+    if (dataclassEq && !userDefines("__eq__")) {
+      parser::NodePtr expr;
+      llvm::SmallVector<parser::NodePtr, 8> comparisons;
+      for (const std::string &field : order) {
+        parser::NodePtr compare = parser::makeNode("Compare", range);
+        parser::addField(*compare, "left", synthSelfAttr("self", field, range));
+        parser::addField(*compare, "ops",
+                         std::vector<parser::NodePtr>{
+                             parser::makeNode("Eq", range)});
+        parser::addField(*compare, "comparators",
+                         std::vector<parser::NodePtr>{
+                             synthSelfAttr("other", field, range)});
+        comparisons.push_back(std::move(compare));
+      }
+      if (comparisons.empty()) {
+        expr = parser::makeNode("Constant", range);
+        parser::addField(*expr, "value", true);
+      } else if (comparisons.size() == 1) {
+        expr = std::move(comparisons.front());
+      } else {
+        expr = parser::makeNode("BoolOp", range);
+        parser::addField(*expr, "op", parser::makeNode("And", range));
+        parser::addField(
+            *expr, "values",
+            std::vector<parser::NodePtr>(comparisons.begin(),
+                                         comparisons.end()));
+      }
+      parser::NodePtr returnNode = parser::makeNode("Return", range);
+      parser::addField(*returnNode, "value", std::move(expr));
+      FunctionSignature sig;
+      sig.positionalNames.append({"self", "other"});
+      sig.positionalTypes.push_back(types.contract(contractName));
+      sig.positionalTypes.push_back(types.contract(contractName));
+      sig.positionalDefaults.append({false, false});
+      sig.resultType = types.boolType();
+      registerSynthesized(
+          synthFunctionDef("__eq__", {"self", "other"}, {},
+                           {std::move(returnNode)}, range),
+          std::move(sig));
+    }
+  }
+
   for (auto [statement, bodySig, symbolName, kind] :
        llvm::zip_equal(pendingBodies, pendingBodySigs, pendingBodySymbols,
                        pendingBodyKinds)) {
@@ -983,7 +1309,8 @@ bool ModuleEmitter::isModuleGlobalWrite(llvm::StringRef name) const {
 void ModuleEmitter::collectClassFields(
     const parser::Node &classDef,
     llvm::SmallVectorImpl<std::string> &fieldNames,
-    llvm::SmallVectorImpl<mlir::Type> &fieldTypes) {
+    llvm::SmallVectorImpl<mlir::Type> &fieldTypes,
+    bool includeAnnAssignDefaults) {
   auto setField = [&](llvm::StringRef name, mlir::Type type,
                       bool overwriteExisting, const parser::Node &anchor) {
     if (name.empty())
@@ -1049,7 +1376,8 @@ void ModuleEmitter::collectClassFields(
       if (!statement || statement->kind != "AnnAssign")
         continue;
       const parser::Node *target = ast::node(*statement, "target");
-      if (!target || target->kind != "Name" || ast::node(*statement, "value"))
+      if (!target || target->kind != "Name" ||
+          (ast::node(*statement, "value") && !includeAnnAssignDefaults))
         continue;
       setField(ast::nameSpelling(*target),
                types.annotationType(ast::node(*statement, "annotation")),

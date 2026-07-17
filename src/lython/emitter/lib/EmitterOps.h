@@ -10,6 +10,12 @@ template <typename Op>
 Value ModuleEmitter::emitBinarySpecial(const parser::Node &anchor,
                                        llvm::StringRef method, Value lhs,
                                        Value rhs, mlir::Type resultType) {
+  // Source-class operator methods (including MRO-inherited and dataclass-
+  // synthesized ones) inline like any other source method call.
+  if (std::optional<MethodBinding> binding =
+          lookupClassMethod(lhs.type, method);
+      binding && binding->method)
+    return emitInlineOperatorCall(anchor, lhs, *binding, {rhs});
   CallInferenceResult inference =
       types.inferMethodCallWithEvidence(lhs.type, method, {rhs.type});
   if (!requireStaticEvidence(anchor, inference))
