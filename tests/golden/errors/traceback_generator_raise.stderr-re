@@ -1,0 +1,7 @@
+Traceback\ \(most\ recent\ call\ last\):\
+\ \ File\ ".*traceback_generator_raise\.py",\ line\ 9,\ in\ <module>\
+\ \ \ \ for\ v\ in\ g\(\):\
+\ \ \ \ \ \ \ \ \ \ \ \ \ \~\^\^\
+\ \ File\ ".*traceback_generator_raise\.py",\ line\ 6,\ in\ g\
+\ \ \ \ raise\ ValueError\("in\ gen"\)\
+ValueError:\ in\ gen

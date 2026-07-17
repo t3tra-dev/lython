@@ -404,8 +404,14 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
   if (breakForwardsCarried)
     for (unsigned index = 0; index < carried.size(); ++index)
       checkArgs.push_back(checkBlock->getArgument(index));
+  // The next op carries the iterator expression's location, not the whole
+  // for statement: an exception surfacing from the iterator anchors the
+  // traceback carets under that expression, matching CPython's FOR_ITER
+  // instruction position.
+  const parser::Node *iterLocNode = ast::node(statement, "iter");
+  mlir::Location nextLoc = iterLocNode ? loc(*iterLocNode) : loc(statement);
   auto next = py::NextOp::create(
-      builder, loc(statement), elem, builder.getI1Type(), iteratorType,
+      builder, nextLoc, elem, builder.getI1Type(), iteratorType,
       "__next__", callProtocolFor(nextInference), iterator.getResult());
   mlir::cf::CondBranchOp::create(builder, loc(statement), next.getValid(),
                                  bodyBlock, mlir::ValueRange{}, afterBlock,

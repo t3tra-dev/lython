@@ -36,11 +36,13 @@ llvm::StringRef currentCallableName(mlir::Operation *op) {
     llvm::StringRef name = function.getName();
     if (name == "__main__")
       return "<module>";
-    // Specialization clones carry an ABI suffix; the traceback shows the
-    // Python-level name.
-    std::size_t suffix = name.find("__lyrt_prim");
-    if (suffix != llvm::StringRef::npos)
-      name = name.take_front(suffix);
+    // Specialization and generator state-machine clones carry ABI suffixes;
+    // the traceback shows the Python-level name.
+    for (llvm::StringRef marker : {"__lyrt_prim", "__lyrt_gen"}) {
+      std::size_t suffix = name.find(marker);
+      if (suffix != llvm::StringRef::npos)
+        name = name.take_front(suffix);
+    }
     return name;
   }
   return "<unknown>";

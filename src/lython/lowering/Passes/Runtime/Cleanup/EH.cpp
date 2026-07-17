@@ -39,12 +39,29 @@ struct PendingPythonTryCallMarker {
 std::string tracebackFunctionName(llvm::StringRef symbolName) {
   if (symbolName == "__main__")
     return "<module>";
-  // Specialization clones carry an ABI suffix; the traceback shows the
-  // Python-level name.
-  std::size_t suffix = symbolName.find("__lyrt_prim");
-  if (suffix != llvm::StringRef::npos)
-    symbolName = symbolName.take_front(suffix);
+  // Specialization and generator state-machine clones carry ABI suffixes;
+  // the traceback shows the Python-level name.
+  for (llvm::StringRef marker : {"__lyrt_prim", "__lyrt_gen"}) {
+    std::size_t suffix = symbolName.find(marker);
+    if (suffix != llvm::StringRef::npos)
+      symbolName = symbolName.take_front(suffix);
+  }
   return symbolName.str();
+}
+
+// The generator machinery splits one Python generator into a clone family
+// (`g__lyrt_gen_resume`, `g__lyrt_gen_resume__step`); an unwind edge between
+// members of the same family is state-machine plumbing, not a Python frame.
+bool isGeneratorInternalEdge(const llvm::CallInst &call) {
+  const llvm::Function *callee = call.getCalledFunction();
+  if (!callee)
+    return false;
+  llvm::StringRef callerName = call.getFunction()->getName();
+  llvm::StringRef calleeName = callee->getName();
+  if (!callerName.contains("__lyrt_gen") || !calleeName.contains("__lyrt_gen"))
+    return false;
+  return callerName.starts_with(calleeName) ||
+         calleeName.starts_with(callerName);
 }
 
 bool isPythonFunction(mlir::LLVM::LLVMFuncOp function) {
@@ -274,7 +291,8 @@ void buildPythonCleanupBlock(llvm::CallInst &call, llvm::BasicBlock *unwindDest,
   // A raise primitive already pushed its own raise-site frame during MLIR
   // lowering; pushing the invoke site again would duplicate the frame (and
   // CPython shows no caret anchors on raise lines).
-  if (!isPythonRuntimeRaiseCall(call.getCalledFunction()))
+  if (!isPythonRuntimeRaiseCall(call.getCalledFunction()) &&
+      !isGeneratorInternalEdge(call))
     emitTracebackPush(builder, *module, site, debugLoc);
   builder.CreateResume(landingPad);
 }
@@ -308,7 +326,8 @@ buildPythonCatchDispatchBlock(llvm::CallInst &call, llvm::BasicBlock *catchDest,
   builder.CreateCall(beginPythonCatch(*module), {exceptionObject});
   // Same rule as the cleanup pads: raise primitives already recorded their
   // raise-site frame during MLIR lowering.
-  if (!isPythonRuntimeRaiseCall(call.getCalledFunction()))
+  if (!isPythonRuntimeRaiseCall(call.getCalledFunction()) &&
+      !isGeneratorInternalEdge(call))
     emitTracebackPush(builder, *module, site, debugLoc);
   builder.CreateBr(catchDest);
   return landing;
