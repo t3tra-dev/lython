@@ -10,9 +10,11 @@
 #include "PyProtocols.h"
 
 #include "mlir/IR/BuiltinTypes.h"
+#include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/Support/Error.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -2100,6 +2102,26 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
       method = "__xor__";
     else if (ast::isOperator(op, "Pow"))
       method = "__pow__";
+    // int ** compile-time negative int types as float (CPython; the emitter
+    // desugars it to float(base) ** float(exponent)). Exponents beyond the
+    // double range keep the int path, matching the emitter's fallback.
+    if (ast::isOperator(op, "Pow") && left == intType()) {
+      auto rightLiteral = mlir::dyn_cast_if_present<py::LiteralType>(rawRight);
+      llvm::StringRef spelling =
+          rightLiteral ? rightLiteral.getSpelling() : llvm::StringRef();
+      if (spelling.size() > 1 && spelling.front() == '-' &&
+          llvm::all_of(spelling.drop_front(),
+                       [](char c) { return c >= '0' && c <= '9'; })) {
+        llvm::APFloat exponent(llvm::APFloat::IEEEdouble());
+        llvm::Expected<llvm::APFloat::opStatus> status =
+            exponent.convertFromString(spelling,
+                                       llvm::APFloat::rmNearestTiesToEven);
+        if (!status)
+          llvm::consumeError(status.takeError());
+        else if (!exponent.isInfinity())
+          return floatType();
+      }
+    }
     // Tensor-scalar broadcast types as the tensor operand (the emitter splats
     // the scalar). Not for MatMult -- promoting the scalar there would type
     // `m @ 2.0` as a contraction of equal shapes -- and a float scalar never
@@ -2278,6 +2300,16 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
           if (argument == intType() || argument == floatType() ||
               argument == strType())
             return intType();
+        }
+      }
+      if (name == "float") {
+        // float(x) is conversion (emitter: tryEmitFloatCall) for the types
+        // the runtime __float__ methods cover; other shapes stay on the
+        // instantiation path and its diagnostics.
+        if (positional.size() == 1) {
+          mlir::Type argument = widenLiteral(positional.front());
+          if (argument == intType() || argument == floatType())
+            return floatType();
         }
       }
       if (name == "round") {

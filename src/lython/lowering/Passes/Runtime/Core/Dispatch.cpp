@@ -95,6 +95,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPyOp(mlir::Operation *op) {
           [&](auto str) { return lowerNamedUnaryMethodOp(str, "__str__"); })
       .Case<py::IntOp>(
           [&](auto conv) { return lowerNamedUnaryMethodOp(conv, "__int__"); })
+      .Case<py::FloatOp>(
+          [&](auto conv) { return lowerNamedUnaryMethodOp(conv, "__float__"); })
       .Default([&](mlir::Operation *unknown) {
         unknown->emitError()
             << "resolved Py op has no runtime lowering rule yet";
