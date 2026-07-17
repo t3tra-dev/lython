@@ -109,7 +109,11 @@ RuntimeBundleLowerer::lowerIntConstant(py::IntConstantOp op) {
   unsigned digitCount = (magnitude.getActiveBits() + 29) / 30;
   if (digitCount == 0)
     digitCount = 1;
-  magnitude = magnitude.zext(digitCount * 30);
+  // zextOrTrunc, not zext: getAsInteger sizes the APInt at 4 bits per
+  // decimal digit, so for long literals its width exceeds the 30-bit limb
+  // target and a plain zext (which requires a wider target) is UB. The
+  // truncation is lossless: digitCount * 30 >= getActiveBits().
+  magnitude = magnitude.zextOrTrunc(digitCount * 30);
 
   mlir::Value dynamicSize =
       mlir::arith::ConstantIndexOp::create(builder, loc, digitCount)

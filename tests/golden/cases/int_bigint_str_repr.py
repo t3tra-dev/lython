@@ -13,3 +13,8 @@ print(len(str(2 ** 100)))
 print(str(0), str(-1), str(9223372036854775808))
 print(repr("Ω" + str(big)))
 print("value: " + str(big))
+# Literals long enough that the 4-bits-per-digit parse width exceeds the
+# 30-bit limb target (the zextOrTrunc regression the fuzz corpus caught).
+long_lit = 10000000000000000000000000000000000000000000000000000000000000000000000123456789
+print(long_lit)
+print(str(-10000000000000000000000000000000000000000000000000000000000000000000000123456789))
