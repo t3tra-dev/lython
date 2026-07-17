@@ -656,6 +656,12 @@ private:
     bool closed = false;
     bool rejectedNewline = false;
     int replacementDepth = 0;
+    // Format-spec state of the outermost replacement field: after its
+    // top-level ':' the remainder is literal spec text, where '#' and
+    // quotes are ordinary characters ('{x:#x}', '{x:"^7}'). Bracket depth
+    // keeps slice colons ('{a[1:2]}') from starting the spec early.
+    bool fieldSawColon = false;
+    int fieldGroupDepth = 0;
     while (!eof()) {
       if (!triple && replacementDepth == 0 &&
           (peek() == '\n' || peek() == '\r')) {
@@ -668,16 +674,43 @@ private:
       text.push_back(ch);
 
       if (formattedString && replacementDepth > 0) {
-        if (ch == '\'' || ch == '"') {
+        bool inSpec = fieldSawColon && replacementDepth == 1;
+        if (ch == ':' && replacementDepth == 1 && fieldGroupDepth == 0)
+          fieldSawColon = true;
+        if ((ch == '\'' || ch == '"') && !inSpec) {
           consumeQuotedTextInFormattedField(text, ch);
+          continue;
+        }
+        // Spec text treats the other quote kind as literal, but the outer
+        // quote still terminates the literal exactly like CPython (only a
+        // full triple closes a triple-quoted f-string).
+        if (inSpec && ch == quote) {
+          if (!triple) {
+            closed = true;
+            break;
+          }
+          if (peek() == quote && peek(1) == quote) {
+            text.push_back(advance());
+            text.push_back(advance());
+            closed = true;
+            break;
+          }
           continue;
         }
         if (ch == '\\') {
           appendEscapedStringChar(text);
           continue;
         }
-        if (ch == '#') {
+        if (ch == '#' && !inSpec) {
           consumeFormattedFieldComment(text);
+          continue;
+        }
+        if ((ch == '(' || ch == '[') && !inSpec) {
+          ++fieldGroupDepth;
+          continue;
+        }
+        if ((ch == ')' || ch == ']') && !inSpec) {
+          --fieldGroupDepth;
           continue;
         }
         if (ch == '{') {
@@ -686,6 +719,10 @@ private:
         }
         if (ch == '}') {
           --replacementDepth;
+          if (replacementDepth == 0) {
+            fieldSawColon = false;
+            fieldGroupDepth = 0;
+          }
           continue;
         }
         continue;

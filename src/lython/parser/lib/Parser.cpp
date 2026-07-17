@@ -4949,14 +4949,35 @@ private:
 
   std::size_t findFStringFieldEnd(std::string_view text, std::size_t start) {
     int depth = 0;
+    // After the top-level ':' the remainder is the format spec: literal
+    // text where '#' and quotes are ordinary characters ('{x:#x}',
+    // '{x:"^7}'), not comments or nested strings. Bracket depth keeps
+    // slice colons ('{a[1:2]}') from starting the spec early.
+    int groupDepth = 0;
+    bool inSpec = false;
     for (std::size_t i = start; i < text.size();) {
       char ch = text[i];
-      if (ch == '#') {
+      if (ch == '#' && !inSpec) {
         i = skipFStringComment(text, i, text.size());
         continue;
       }
-      if (ch == '\'' || ch == '"') {
+      if ((ch == '\'' || ch == '"') && !inSpec) {
         i = skipQuotedText(text, i);
+        continue;
+      }
+      if ((ch == '(' || ch == '[') && !inSpec) {
+        ++groupDepth;
+        ++i;
+        continue;
+      }
+      if ((ch == ')' || ch == ']') && !inSpec) {
+        --groupDepth;
+        ++i;
+        continue;
+      }
+      if (ch == ':' && depth == 0 && groupDepth == 0) {
+        inSpec = true;
+        ++i;
         continue;
       }
       if (ch == '{') {
@@ -5005,6 +5026,10 @@ private:
         }
         return i;
       }
+      // A top-level ':' starts the format spec; a '!' beyond it would be
+      // spec text, never a conversion marker.
+      if (depth == 0 && ch == ':' && delimiter == '!')
+        return std::string_view::npos;
       ++i;
     }
     return std::string_view::npos;
