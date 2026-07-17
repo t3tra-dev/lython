@@ -79,6 +79,21 @@ mlir::func::CallOp precedingTryCallSiteMarker(mlir::Operation *call);
 // unless a preceding try call-site marker wires it to a local handler.
 bool isRaisePrimitiveFunction(mlir::func::FuncOp function);
 
+// Raise primitives PLUS the contract-less lowering support raises
+// (`LyEH_RethrowCurrent`, `LyEH_ThrowException`): every call that never
+// returns and always unwinds. Ownership walks must treat these uniformly --
+// modeling only manifest raise primitives left rethrows (finally re-raise,
+// bare `raise`) outside the unwind-cleanup model entirely.
+bool isRaiseLikeFunction(mlir::func::FuncOp function);
+
+// May a call to `function` unwind with a Python exception? Func-dialect
+// mirror of the final EH phase's classification (Cleanup/EH.cpp): raise-like
+// calls, Python-level callables, and runtime `Ly*` entry points minus the
+// known non-raising EH/refcount/traceback bookkeeping. Used to model the
+// unwind-out edge of calls in frames WITHOUT a local handler; an unmarked
+// may-raise call in such a frame exits the function with every held token.
+bool mayRaisePythonException(mlir::func::FuncOp function);
+
 // For `%c = call @LyEH_TryCatchAnchor(id); cf.cond_br %c, ^handler, ^tail`
 // where ^tail leads with a same-id call-site marker: the marker's guarded
 // call. The anchor's true edge is never taken at runtime -- control reaches
@@ -96,6 +111,16 @@ inline constexpr llvm::StringLiteral kAtomicRetainPremiseAttr{
     "ly.atomic.retain_premise"};
 
 inline constexpr llvm::StringLiteral kCallableTypeAttr{"callable_type"};
+
+// Module marker for the build-time pre-lowering of runtime-internal Python
+// modules (runtime/lib/*.py compiled by RuntimePyLowering). Their artifacts
+// are linked into the final LLVM module AFTER the EH phase that wires and
+// erases `LyEH_Try*` markers, so no marker-based unwind cleanup can be
+// materialized for them: insertion skips the wiring and the verifier skips
+// the may-raise unwind-exit model in such modules (documented residual --
+// leftover markers are rejected loudly at packaging instead).
+inline constexpr llvm::StringLiteral kRuntimeInternalLoweringAttr{
+    "ly.lowering.runtime_internal"};
 
 struct IndexSet {
   llvm::SmallVector<unsigned, 8> values;

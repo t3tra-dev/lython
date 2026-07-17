@@ -294,6 +294,16 @@ LogicalResult runLoweringPipeline(ModuleOp module,
   }
   dumpMLIRForPass(irDump, "post-lowering-cleanup", module);
 
+  // Phase 12b: canonicalization above folds statically-decided region ops
+  // and hoists their calls to the top level, where the phase-10 unwind
+  // model could not see them; re-run only the unwind-cleanup step so the
+  // phase-13 verifier checks obligations the pipeline can still discharge.
+  if (failed(runPhase("post-cleanup-unwind-insertion", [&](PassManager &pm) {
+        pm.addPass(createPostCleanupUnwindInsertionPass());
+      })))
+    return failure();
+  dumpMLIRForPass(irDump, "post-cleanup-unwind-insertion", module);
+
   // Phase 13: validate ownership and no-GIL contracts before final lowering.
   if (failed(runVerifierPhase("llvm-call-verifier", [&](PassManager &pm) {
         pm.addPass(createLLVMCallOwnershipVerifierPass());

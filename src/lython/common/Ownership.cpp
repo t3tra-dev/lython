@@ -1376,6 +1376,48 @@ bool isRaisePrimitiveFunction(mlir::func::FuncOp function) {
   return primitive && primitive.getValue() == "raise";
 }
 
+bool isRaiseLikeFunction(mlir::func::FuncOp function) {
+  if (!function)
+    return false;
+  // Not folded into isRaisePrimitiveFunction: these two are lowering-created
+  // support declarations without a manifest contract, so the manifest
+  // attribute can never carry the fact -- and stamping the attribute onto
+  // them would make manifest audits report primitives no manifest declares.
+  llvm::StringRef name = function.getName();
+  if (name == "LyEH_RethrowCurrent" || name == "LyEH_ThrowException")
+    return true;
+  return isRaisePrimitiveFunction(function);
+}
+
+bool mayRaisePythonException(mlir::func::FuncOp function) {
+  if (!function)
+    return false;
+  if (isRaiseLikeFunction(function))
+    return true;
+  // Python-level callables can always raise (any call inside them can).
+  if (function->hasAttr(kCallableTypeAttr) && !function.isDeclaration())
+    return true;
+  llvm::StringRef name = function.getName();
+  if (!name.starts_with("Ly"))
+    return false;
+  // Mirror of the final EH phase's non-raising runtime set
+  // (Cleanup/EH.cpp): EH bookkeeping, refcount maintenance, and traceback
+  // writes never throw, so classifying them as may-raise here would demand
+  // cleanup edges the EH phase never materializes.
+  if (name == "LyEH_BeginCatch" || name == "LyEH_ClassIdMatches" ||
+      name == "LyEH_CurrentExceptionClassId" ||
+      name == "LyEH_CurrentExceptionMatches" ||
+      name == "LyEH_DiscardCurrentExceptionIfMatches" ||
+      name == "LyEH_DiscardCurrentException" ||
+      name == "LyEH_TryCallSiteMarker" || name == "LyEH_TryCatchMarker" ||
+      name == "LyEH_TryCatchAnchor" || name.starts_with("LyTraceback_"))
+    return false;
+  if (name == "Ly_IncRef" || name == "Ly_DecRef" || name.ends_with("_DecRef") ||
+      name == "LyObject_ReleaseStorageToZero")
+    return false;
+  return true;
+}
+
 bool returnTransfersGroup(FuncContractCache &contracts,
                           mlir::func::FuncOp function,
                           mlir::func::ReturnOp returnOp,
