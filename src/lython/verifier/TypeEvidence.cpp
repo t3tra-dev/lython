@@ -415,7 +415,7 @@ bool isBinaryMethodOp(llvm::StringRef name) {
   return llvm::StringSwitch<bool>(name)
       .Cases({"py.add", "py.sub", "py.mul", "py.div", "py.floordiv"}, true)
       .Cases({"py.mod", "py.lshift", "py.rshift", "py.bitand"}, true)
-      .Cases({"py.bitor", "py.bitxor", "py.le", "py.lt"}, true)
+      .Cases({"py.bitor", "py.bitxor", "py.pow", "py.le", "py.lt"}, true)
       .Cases({"py.gt", "py.ge", "py.eq", "py.ne"}, true)
       .Default(false);
 }

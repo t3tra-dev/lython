@@ -1006,6 +1006,9 @@ void TypeSystem::seedBuiltins() {
   bindSymbol("len", table.freeFunctionContract("builtins.len")
                         .value_or(py::CallableType::get(&context, {object()}, {},
                                                         {}, {}, {intType()})));
+  bindSymbol("hash", table.freeFunctionContract("builtins.hash")
+                         .value_or(py::CallableType::get(
+                             &context, {object()}, {}, {}, {}, {intType()})));
   bindClass("object", object());
   bindClass("bool", boolType());
   bindClass("int", intType());
@@ -2095,6 +2098,8 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
       method = "__or__";
     else if (ast::isOperator(op, "BitXor"))
       method = "__xor__";
+    else if (ast::isOperator(op, "Pow"))
+      method = "__pow__";
     // Tensor-scalar broadcast types as the tensor operand (the emitter splats
     // the scalar). Not for MatMult -- promoting the scalar there would type
     // `m @ 2.0` as a contraction of equal shapes -- and a float scalar never
@@ -2253,6 +2258,18 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
                   *this, widenLiteral(positional.front()), "__len__", {}))
             return result->result;
         return object();
+      }
+      if (name == "int") {
+        // int(x) is conversion (emitter: tryEmitIntCall), not construction,
+        // for the argument types the runtime __int__ methods cover. Other
+        // shapes (zero args, unsupported types) stay on the instantiation
+        // path and its diagnostics.
+        if (positional.size() == 1) {
+          mlir::Type argument = widenLiteral(positional.front());
+          if (argument == intType() || argument == floatType() ||
+              argument == strType())
+            return intType();
+        }
       }
       if (name == "round") {
         if (strict) {

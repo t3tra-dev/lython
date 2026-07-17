@@ -869,6 +869,7 @@ def Py_RShiftOp : Py_BinaryMethodOp<"rshift">;
 def Py_BitAndOp : Py_BinaryMethodOp<"bitand">;
 def Py_BitOrOp : Py_BinaryMethodOp<"bitor">;
 def Py_BitXorOp : Py_BinaryMethodOp<"bitxor">;
+def Py_PowOp : Py_BinaryMethodOp<"pow">;
 
 def Py_LeOp : Py_BinaryMethodOp<"le", Py_ContractType, [Pure]>;
 def Py_LtOp : Py_BinaryMethodOp<"lt", Py_ContractType, [Pure]>;
@@ -884,6 +885,27 @@ def Py_ReprOp : Py_Op<"repr", []> {
     the `__repr__` contract. When `target` is present it names the statically
     resolved method implementation. The result contract must instantiate
     `builtins.str`.
+  }];
+
+  let arguments = (ins OptionalAttr<FlatSymbolRefAttr>:$target,
+      TypeAttrOf<Py_ProtocolType>:$callee_contract, Py_ContractType:$input);
+
+  let results = (outs Py_ContractType:$result);
+
+  let assemblyFormat =
+      "$callee_contract `(` $input `:` type($input) `)` attr-dict `->` "
+      "type($result)";
+  let hasVerifier = 1;
+}
+
+def Py_IntOp : Py_Op<"int", []> {
+  let summary = "Python integer conversion operation";
+  let description = [{
+    Represents Python `int(value)` semantics after the frontend has selected
+    the `__int__` contract (str parsing and float truncation are the manifest
+    `__int__` runtime methods of those contracts). When `target` is present it
+    names the statically resolved method implementation. The result contract
+    must instantiate `builtins.int`.
   }];
 
   let arguments = (ins OptionalAttr<FlatSymbolRefAttr>:$target,

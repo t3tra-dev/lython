@@ -86,12 +86,15 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPyOp(mlir::Operation *op) {
           [&](auto unary) { return lowerUnaryMethodOp(unary); })
       .Case<py::AddOp, py::SubOp, py::MulOp, py::DivOp, py::FloorDivOp,
             py::ModOp, py::LShiftOp, py::RShiftOp, py::BitAndOp, py::BitOrOp,
-            py::BitXorOp, py::EqOp, py::NeOp, py::LtOp, py::LeOp, py::GtOp,
+            py::BitXorOp, py::PowOp, py::EqOp, py::NeOp, py::LtOp, py::LeOp,
+            py::GtOp,
             py::GeOp>([&](auto binary) { return lowerBinaryMethodOp(binary); })
       .Case<py::ReprOp>(
           [&](auto repr) { return lowerNamedUnaryMethodOp(repr, "__repr__"); })
       .Case<py::StrOp>(
           [&](auto str) { return lowerNamedUnaryMethodOp(str, "__str__"); })
+      .Case<py::IntOp>(
+          [&](auto conv) { return lowerNamedUnaryMethodOp(conv, "__int__"); })
       .Default([&](mlir::Operation *unknown) {
         unknown->emitError()
             << "resolved Py op has no runtime lowering rule yet";

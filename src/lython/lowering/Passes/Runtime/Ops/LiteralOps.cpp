@@ -80,19 +80,70 @@ RuntimeBundleLowerer::lowerBytesConstant(py::BytesConstantOp op) {
 mlir::LogicalResult
 RuntimeBundleLowerer::lowerIntConstant(py::IntConstantOp op) {
   std::int64_t parsed = 0;
-  if (op.getValue().getAsInteger(10, parsed))
-    return op.emitError()
-           << "integer literal is outside the currently lowered i64 path";
-
   builder.setInsertionPoint(op);
   mlir::Location loc = op.getLoc();
-  mlir::Value value =
-      mlir::arith::ConstantIntOp::create(builder, loc, parsed, 64).getResult();
-  mlir::Value valid =
-      mlir::arith::ConstantIntOp::create(builder, loc, 1, 1).getResult();
+  if (!op.getValue().getAsInteger(10, parsed)) {
+    mlir::Value value =
+        mlir::arith::ConstantIntOp::create(builder, loc, parsed, 64)
+            .getResult();
+    mlir::Value valid =
+        mlir::arith::ConstantIntOp::create(builder, loc, 1, 1).getResult();
+    RuntimeBundle result;
+    if (mlir::failed(RuntimeBundleLowerer::makePrimitiveI64Bundle(
+            op, op.getResult().getType(), value, valid, result)))
+      return mlir::failure();
+    valueBundles[op.getResult()] = std::move(result);
+    erase.push_back(op);
+    return mlir::success();
+  }
+
+  // Beyond i64: split the decimal text into 30-bit limbs at compile time and
+  // construct the boxed digit form. No primitiveI64 evidence lane is attached,
+  // so downstream arithmetic takes the manifest (digit) path for this value.
+  llvm::StringRef text = op.getValue();
+  bool negative = text.consume_front("-");
+  llvm::APInt magnitude;
+  if (text.empty() || text.getAsInteger(10, magnitude))
+    return op.emitError() << "invalid integer literal '" << op.getValue()
+                          << "'";
+  unsigned digitCount = (magnitude.getActiveBits() + 29) / 30;
+  if (digitCount == 0)
+    digitCount = 1;
+  magnitude = magnitude.zext(digitCount * 30);
+
+  mlir::Value dynamicSize =
+      mlir::arith::ConstantIndexOp::create(builder, loc, digitCount)
+          .getResult();
+  auto memrefType =
+      mlir::MemRefType::get({mlir::ShapedType::kDynamic}, builder.getI32Type());
+  mlir::Value buffer =
+      mlir::memref::AllocaOp::create(builder, loc, memrefType,
+                                     mlir::ValueRange{dynamicSize})
+          .getResult();
+  for (unsigned index = 0; index < digitCount; ++index) {
+    std::uint64_t digit = magnitude.extractBitsAsZExtValue(30, index * 30);
+    mlir::Value position =
+        mlir::arith::ConstantIndexOp::create(builder, loc, index).getResult();
+    mlir::Value value = mlir::arith::ConstantIntOp::create(
+                            builder, loc, static_cast<std::int64_t>(digit), 32)
+                            .getResult();
+    mlir::memref::StoreOp::create(builder, loc, value, buffer,
+                                  mlir::ValueRange{position});
+  }
+  mlir::Value sign =
+      mlir::arith::ConstantIntOp::create(builder, loc, negative ? -1 : 1, 64)
+          .getResult();
+
+  std::optional<RuntimeSymbol> fromDigits =
+      manifest.primitive("builtins.int", "from_digits");
+  if (!fromDigits)
+    return op.emitError()
+           << "runtime manifest has no builtins.int from_digits primitive";
+  mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+      loc, *fromDigits, mlir::ValueRange{sign, buffer});
   RuntimeBundle result;
-  if (mlir::failed(RuntimeBundleLowerer::makePrimitiveI64Bundle(
-          op, op.getResult().getType(), value, valid, result)))
+  if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
+          op, op.getResult().getType(), call, result)))
     return mlir::failure();
   valueBundles[op.getResult()] = std::move(result);
   erase.push_back(op);
