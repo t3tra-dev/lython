@@ -157,6 +157,9 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
   const parser::Node *calleeNode = ast::node(expr, "func");
   std::string calleeQualified = ast::qualifiedName(calleeNode);
 
+  if (std::optional<Value> v = tryEmitSuperCall(expr, calleeNode))
+    return *v;
+
   if (std::optional<Value> primitive =
           emitPrimitiveConstructorCall(expr, calleeNode))
     return *primitive;

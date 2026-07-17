@@ -226,6 +226,15 @@ private:
                              const llvm::StringMap<Value> &keywords);
   Value emitClassInstantiation(const parser::Node &expr, llvm::StringRef name,
                                mlir::Type instanceType);
+  // `super().m(...)` / `super(C, obj).m(...)`: compile-time expansion to the
+  // MRO-next provider's method, inlined with the current receiver. Returns
+  // nullopt when the call is not super-shaped.
+  std::optional<Value> tryEmitSuperCall(const parser::Node &expr,
+                                        const parser::Node *calleeNode);
+  // super().__init__(...) resolving onto a builtin exception base: binds the
+  // runtime exception message of an exception-backed instance.
+  Value emitSuperExceptionInit(const parser::Node &expr, Value receiver,
+                               llvm::StringRef baseContract);
   Value emitUnary(const parser::Node &expr);
   Value emitBinary(const parser::Node &expr);
   Value emitCompare(const parser::Node &expr);
@@ -375,6 +384,14 @@ private:
   llvm::SmallVector<WithCleanup, 8> activeWithCleanups;
   llvm::SmallVector<InlineReturnContext, 4> inlineReturnContexts;
   llvm::SmallVector<LoopControlContext, 4> loopControlContexts;
+  // Innermost = the class method body currently being emitted (inline or
+  // standalone); zero-argument super() reads the defining class and the
+  // receiver parameter name from here.
+  struct SuperContext {
+    std::string definingClass;
+    std::string selfName;
+  };
+  llvm::SmallVector<SuperContext, 4> superContexts;
 };
 
 } // namespace lython::emitter

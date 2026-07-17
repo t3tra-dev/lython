@@ -500,6 +500,7 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
   llvm::SmallVector<const parser::Node *, 8> pendingBodies;
   llvm::SmallVector<FunctionSignature, 8> pendingBodySigs;
   llvm::SmallVector<std::string, 8> pendingBodySymbols;
+  llvm::SmallVector<std::string, 8> pendingBodyKinds;
   if (const auto *body = ast::nodeList(classDef, "body")) {
     for (const parser::NodePtr &statement : *body) {
       if (!statement || (statement->kind != "FunctionDef" &&
@@ -541,6 +542,7 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
         pendingBodies.push_back(statement.get());
         pendingBodySigs.push_back(bodySig);
         pendingBodySymbols.push_back(symbolName);
+        pendingBodyKinds.push_back(kind);
       }
       classMethodBindings[contractName][*methodName] =
           MethodBinding{statement.get(),
@@ -552,10 +554,18 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
                         std::string(contractName)};
     }
   }
-  for (auto [statement, bodySig, symbolName] :
-       llvm::zip_equal(pendingBodies, pendingBodySigs, pendingBodySymbols))
+  for (auto [statement, bodySig, symbolName, kind] :
+       llvm::zip_equal(pendingBodies, pendingBodySigs, pendingBodySymbols,
+                       pendingBodyKinds)) {
+    bool instanceBody = kind == "instance" && !bodySig.positionalNames.empty();
+    if (instanceBody)
+      superContexts.push_back(SuperContext{std::string(contractName),
+                                           bodySig.positionalNames.front()});
     emitCallableFunction(*statement, symbolName, bodySig, {},
                          /*isLambda=*/false);
+    if (instanceBody)
+      superContexts.pop_back();
+  }
 
   mlir::OperationState state(loc(classDef), py::ClassOp::getOperationName());
   state.addAttribute(mlir::SymbolTable::getSymbolAttrName(),
@@ -913,6 +923,123 @@ void ModuleEmitter::collectClassFields(
   }
 }
 
+Value ModuleEmitter::emitSuperExceptionInit(const parser::Node &expr,
+                                            Value receiver,
+                                            llvm::StringRef baseContract) {
+  (void)receiver;
+  (void)baseContract;
+  diagnostics.push_back(parser::Diagnostic{
+      parser::Severity::Error, expr.range.start,
+      "super().__init__ on a builtin exception base is not supported yet"});
+  return emitNone(expr);
+}
+
+std::optional<Value>
+ModuleEmitter::tryEmitSuperCall(const parser::Node &expr,
+                                const parser::Node *calleeNode) {
+  auto isSuperName = [&](const parser::Node *node) {
+    return node && node->kind == "Name" && ast::nameSpelling(*node) == "super";
+  };
+  auto reject = [&](const std::string &message) -> std::optional<Value> {
+    diagnostics.push_back(
+        parser::Diagnostic{parser::Severity::Error, expr.range.start, message});
+    return emitNone(expr);
+  };
+
+  if (isSuperName(calleeNode))
+    return reject("super() is only supported as a method-call receiver "
+                  "(super().method(...))");
+  if (!calleeNode || calleeNode->kind != "Attribute")
+    return std::nullopt;
+  const parser::Node *superCall = ast::node(*calleeNode, "value");
+  if (!superCall || superCall->kind != "Call" ||
+      !isSuperName(ast::node(*superCall, "func")))
+    return std::nullopt;
+
+  std::optional<std::string_view> methodName = ast::string(*calleeNode, "attr");
+  if (!methodName)
+    return reject("super() attribute must be a plain method name");
+
+  // Resolve the start-class and receiver: the zero-argument form reads the
+  // enclosing method's defining class and receiver parameter; the two-argument
+  // form must name a statically known class and receiver expression.
+  std::string startClass;
+  Value receiver;
+  const auto *superArgs = ast::nodeList(*superCall, "args");
+  std::size_t superArgCount = superArgs ? superArgs->size() : 0;
+  if (superArgCount == 0) {
+    if (superContexts.empty())
+      return reject("zero-argument super() requires an enclosing class "
+                    "method body");
+    const SuperContext &context = superContexts.back();
+    startClass = context.definingClass;
+    auto self = values.find(context.selfName);
+    if (self == values.end() || !self->second.value)
+      return reject("zero-argument super() requires the enclosing method's "
+                    "receiver parameter to be in scope");
+    receiver = self->second;
+  } else if (superArgCount == 2) {
+    const parser::Node *classArg = (*superArgs)[0].get();
+    std::string classSpelling = ast::qualifiedName(classArg);
+    if (classSpelling.empty() && classArg && classArg->kind == "Name")
+      classSpelling = std::string(ast::nameSpelling(*classArg));
+    startClass = canonicalClassName(classSpelling);
+    if (startClass.empty() || !classMros.count(startClass))
+      return reject("super(C, obj) requires C to name a statically known "
+                    "source class");
+    receiver = emitExpr((*superArgs)[1].get());
+  } else {
+    return reject("super() takes zero or two arguments");
+  }
+
+  auto receiverContract =
+      mlir::dyn_cast_if_present<py::ContractType>(receiver.type);
+  if (!receiverContract)
+    return reject("super() receiver must be a class instance (classmethod "
+                  "super() is not supported yet)");
+  llvm::StringRef receiverClass = receiverContract.getContractName();
+  llvm::ArrayRef<std::string> mro = classMro(receiverClass);
+  if (mro.empty())
+    return reject("super() receiver class has no static MRO");
+  if (!llvm::is_contained(mro, startClass))
+    return reject("super(): class '" +
+                  py::contracts::manifestClassNameForContract(startClass) +
+                  "' is not in the receiver's MRO");
+
+  if (std::optional<MethodBinding> method =
+          resolveMroMethod(receiverClass, *methodName, startClass)) {
+    if (method->kind != "instance")
+      return reject("super() only resolves instance methods yet");
+    return emitInlineMethodCall(expr, receiver, *method);
+  }
+
+  // No source-class provider after startClass: the next provider is a
+  // manifest class. object.__init__ is a no-op; anything else is loud.
+  bool active = false;
+  for (const std::string &cls : mro) {
+    if (!active) {
+      active = cls == startClass;
+      continue;
+    }
+    if (classMros.count(cls))
+      continue;
+    if (cls == "builtins.object" && *methodName == "__init__") {
+      const auto *callArgs = ast::nodeList(expr, "args");
+      if (callArgs && !callArgs->empty())
+        return reject("object.__init__() takes no arguments");
+      return emitNone(expr);
+    }
+    if (taxonomyEntryForContract(cls) && *methodName == "__init__")
+      return emitSuperExceptionInit(expr, receiver, cls);
+    return reject("super(): '" + std::string(*methodName) +
+                  "' resolves to builtin base '" +
+                  py::contracts::manifestClassNameForContract(cls) +
+                  "', which super() cannot call yet");
+  }
+  return reject("'super' object has no attribute '" +
+                std::string(*methodName) + "'");
+}
+
 Value ModuleEmitter::emitInlineOperatorCall(const parser::Node &anchor,
                                             Value receiver,
                                             const MethodBinding &method,
@@ -1103,7 +1230,16 @@ Value ModuleEmitter::emitInlineMethodBody(
   mlir::cf::BranchOp::create(builder, loc(anchor), bodyBlock);
   builder.setInsertionPointToStart(bodyBlock);
   inlineReturnContexts.push_back(InlineReturnContext{continuation, resultType});
+  bool pushedSuperContext = bindDescriptorReceiver &&
+                            method.kind == "instance" &&
+                            !method.definingClass.empty() &&
+                            !sig.positionalNames.empty();
+  if (pushedSuperContext)
+    superContexts.push_back(
+        SuperContext{method.definingClass, sig.positionalNames.front()});
   emitStatements(body);
+  if (pushedSuperContext)
+    superContexts.pop_back();
   inlineReturnContexts.pop_back();
   if (!insertionBlockTerminated(builder)) {
     if (resultType != types.none()) {

@@ -808,9 +808,18 @@ Value ModuleEmitter::emitMethodObject(const parser::Node &anchor, Value object,
                             llvm::Twine(anchor.range.start.line) + "_" +
                             llvm::Twine(anchor.range.start.column))
                                .str();
+  bool pushedSuperContext = methodBinding.kind == "instance" &&
+                            !methodBinding.definingClass.empty() &&
+                            !methodBinding.bodySignature.positionalNames.empty();
+  if (pushedSuperContext)
+    superContexts.push_back(
+        {methodBinding.definingClass,
+         methodBinding.bodySignature.positionalNames.front()});
   emitCallableFunction(*methodBinding.method, symbolName, boundBodySig,
                        captures, /*isLambda=*/false,
                        /*positionalNodeOffset=*/1, preboundTypeObject);
+  if (pushedSuperContext)
+    superContexts.pop_back();
   return emitFunctionObject(anchor, symbolName, boundPublicSig.publicCallable,
                             captures);
 }
