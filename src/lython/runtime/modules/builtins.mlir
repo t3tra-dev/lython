@@ -17,7 +17,7 @@
 
 module attributes {
   ly.typing.manifest,
-  ly.runtime.contracts = ["types.NoneType", "builtins.object", "builtins.bool", "builtins.BaseException", "builtins.int", "builtins.str", "builtins.Exception", "builtins.RuntimeError", "builtins.TypeError", "builtins.ValueError", "builtins.ArithmeticError", "builtins.LookupError", "builtins.ZeroDivisionError", "builtins.KeyError", "builtins.IndexError", "builtins.AssertionError", "builtins.StopIteration", "builtins.StopAsyncIteration", "builtins.SystemExit", "builtins.OSError", "builtins.FileNotFoundError", "asyncio.CancelledError", "builtins.float", "builtins.bytes", "builtins.list", "builtins.tuple", "builtins.dict", "builtins.set", "builtins.range", "builtins.range_iterator", "builtins.str_iterator"],
+  ly.runtime.contracts = ["types.NoneType", "builtins.object", "builtins.bool", "builtins.BaseException", "builtins.int", "builtins.str", "builtins.Exception", "builtins.RuntimeError", "builtins.TypeError", "builtins.ValueError", "builtins.ArithmeticError", "builtins.LookupError", "builtins.ZeroDivisionError", "builtins.KeyError", "builtins.IndexError", "builtins.AssertionError", "builtins.StopIteration", "builtins.StopAsyncIteration", "builtins.SystemExit", "builtins.GeneratorExit", "builtins.OSError", "builtins.FileNotFoundError", "asyncio.CancelledError", "builtins.float", "builtins.bytes", "builtins.list", "builtins.tuple", "builtins.dict", "builtins.set", "builtins.range", "builtins.range_iterator", "builtins.str_iterator"],
   // Manifest Callable contracts for builtin free functions. These are the
   // single trusted source for these signatures; the emitter's seedBuiltins
   // reads them here instead of constructing the contracts in C++.
@@ -537,6 +537,10 @@ module attributes {
   // `except Exception`); the top-level runner converts it to the process
   // exit status instead of printing a traceback.
   py.class @SystemExit attributes {base_names = ["BaseException"]} {}
+  // GeneratorExit derives from BaseException directly (never caught by
+  // `except Exception`); generator.close() injects it at the suspension
+  // point so the body's finally blocks run.
+  py.class @GeneratorExit attributes {base_names = ["BaseException"]} {}
   py.class @OSError attributes {base_names = ["Exception"]} {}
   py.class @FileNotFoundError attributes {base_names = ["OSError"]} {}
 
@@ -873,6 +877,7 @@ module attributes {
   func.func private @LyStopIteration_Shape() -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.runtime.contract = "builtins.StopIteration", ly.runtime.shape}
   func.func private @LyStopAsyncIteration_Shape() -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.runtime.contract = "builtins.StopAsyncIteration", ly.runtime.shape}
   func.func private @LySystemExit_Shape() -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.runtime.contract = "builtins.SystemExit", ly.runtime.shape}
+  func.func private @LyGeneratorExit_Shape() -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.runtime.contract = "builtins.GeneratorExit", ly.runtime.shape}
   func.func private @LyOSError_Shape() -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.runtime.contract = "builtins.OSError", ly.runtime.shape}
   func.func private @LyFileNotFoundError_Shape() -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.runtime.contract = "builtins.FileNotFoundError", ly.runtime.shape}
   func.func private @LyCancelledError_Shape() -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.runtime.contract = "asyncio.CancelledError", ly.runtime.shape}
@@ -943,6 +948,10 @@ module attributes {
   }
 
   func.func @LySystemExit_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0, 3], ly.runtime.contract = "builtins.SystemExit", ly.runtime.method = "__init__", ly.runtime.result_evidence = "receiver"} {
+    %result:3 = func.call @LyBaseException_Init(%header, %old_message_header, %old_message_bytes, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
+  }
+  func.func @LyGeneratorExit_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0, 3], ly.runtime.contract = "builtins.GeneratorExit", ly.runtime.method = "__init__", ly.runtime.result_evidence = "receiver"} {
     %result:3 = func.call @LyBaseException_Init(%header, %old_message_header, %old_message_bytes, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
@@ -1046,6 +1055,10 @@ module attributes {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
+  func.func @LyGeneratorExit_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 68 : i64, ly.runtime.contract = "builtins.GeneratorExit", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
+  }
 
   func.func @LyOSError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 66 : i64, ly.runtime.contract = "builtins.OSError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
@@ -1123,6 +1136,10 @@ module attributes {
   }
 
   func.func private @LySystemExit_Raise(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) attributes {ly.ownership.transfer_args = [0, 1], ly.runtime.contract = "builtins.SystemExit", ly.runtime.primitive = "raise"} {
+    func.call @LyEH_ThrowException(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    func.return
+  }
+  func.func private @LyGeneratorExit_Raise(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) attributes {ly.ownership.transfer_args = [0, 1], ly.runtime.contract = "builtins.GeneratorExit", ly.runtime.primitive = "raise"} {
     func.call @LyEH_ThrowException(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
     func.return
   }
@@ -1326,6 +1343,18 @@ module attributes {
   }
 
   func.func @LySystemExit_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.SystemExit", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
+    %view = memref.cast %message_header : memref<2xi64> to memref<2xi64, strided<[1], offset: ?>>
+    func.call @Ly_IncRef(%view) : (memref<2xi64, strided<[1], offset: ?>>) -> ()
+    func.return %message_header, %message_bytes : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LyGeneratorExit_Str(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.GeneratorExit", ly.runtime.method = "__str__", ly.runtime.result_contract = "builtins.str"} {
+    %view = memref.cast %message_header : memref<2xi64> to memref<2xi64, strided<[1], offset: ?>>
+    func.call @Ly_IncRef(%view) : (memref<2xi64, strided<[1], offset: ?>>) -> ()
+    func.return %message_header, %message_bytes : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LyGeneratorExit_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.GeneratorExit", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
     %view = memref.cast %message_header : memref<2xi64> to memref<2xi64, strided<[1], offset: ?>>
     func.call @Ly_IncRef(%view) : (memref<2xi64, strided<[1], offset: ?>>) -> ()
     func.return %message_header, %message_bytes : memref<2xi64>, memref<?xi8>

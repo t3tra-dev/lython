@@ -59,6 +59,19 @@ bool isPythonDebugFunction(const llvm::Function *function) {
           language.getName() == llvm::dwarf::DW_LNAME_Python);
 }
 
+// Refcount maintenance can never raise a Python exception; the ownership
+// inserter is free to place these between a try call-site marker and the
+// call it marks, so the EH pass must neither invoke-convert them nor let
+// them break the marker/call adjacency.
+bool isNonUnwindingRefcountHelper(const llvm::Function *callee) {
+  if (!callee)
+    return false;
+  llvm::StringRef name = callee->getName();
+  return name == "Ly_IncRef" || name == "Ly_DecRef" ||
+         name.ends_with("_DecRef") ||
+         name == "LyObject_ReleaseStorageToZero";
+}
+
 bool mayPropagatePythonException(const llvm::Function *callee) {
   if (isPythonDebugFunction(callee))
     return true;
@@ -74,6 +87,8 @@ bool mayPropagatePythonException(const llvm::Function *callee) {
       name == "LyEH_DiscardCurrentException" ||
       name == "LyEH_TryCallSiteMarker" || name == "LyEH_TryCatchMarker" ||
       name == "LyEH_TryCatchAnchor" || name.starts_with("LyTraceback_"))
+    return false;
+  if (isNonUnwindingRefcountHelper(callee))
     return false;
   return name.starts_with("Ly");
 }
@@ -485,6 +500,11 @@ bool installPythonExceptionCleanupFrames(
           if (mayTransferToPythonTryHandler(call->getCalledFunction())) {
             tryCallSites[call] = *pendingTryMarker;
             pendingTryMarker.reset();
+          } else if (isNonUnwindingRefcountHelper(call->getCalledFunction()) ||
+                     isRuntimeMarkerCall(*call, "LyTraceback_Push")) {
+            // Ownership insertion may schedule releases (and the raise path
+            // its traceback frame) between the marker and the marked call;
+            // they cannot unwind, so the marker stays pending.
           } else if (!canSkipBetweenTryMarkerAndCall(*call)) {
             pendingTryMarker.reset();
           }

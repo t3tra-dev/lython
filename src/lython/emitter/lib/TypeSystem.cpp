@@ -2191,6 +2191,22 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
           }
         return contract("_io.TextIOWrapper");
       }
+      if (name == "next") {
+        if (strict) {
+          if (positional.size() != 1)
+            return fail("next expects one positional argument");
+          CallInferenceResult inference = inferMethodCallWithEvidence(
+              widenLiteral(positional.front()), "__next__", {});
+          if (inference)
+            return inference.resultType;
+          return fail(inference.failureReason);
+        }
+        if (positional.size() == 1)
+          if (std::optional<CallSolution> result = tryManifestMethod(
+                  *this, widenLiteral(positional.front()), "__next__", {}))
+            return result->result;
+        return object();
+      }
       if (name == "len") {
         if (strict) {
           if (positional.empty())

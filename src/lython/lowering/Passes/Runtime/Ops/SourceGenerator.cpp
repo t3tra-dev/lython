@@ -1121,10 +1121,6 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSourceGeneratorSend(
     llvm::ArrayRef<const RuntimeBundle *> sources) {
   if (sources.size() != 2 || !sources[1])
     return op.emitError() << "source generator send expects exactly one value";
-  if (op.getNumResults() != 1 ||
-      runtimeContractName(op.getResult(0).getType()) != "builtins.int")
-    return op.emitError()
-           << "source generator send currently supports int yield results";
 
   std::optional<RuntimePrimitiveI64Evidence> sentI64Evidence;
   bool releaseIgnoredSentObject = false;
@@ -1137,6 +1133,32 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSourceGeneratorSend(
     releaseIgnoredSentObject = true;
   }
 
+  if (releaseIgnoredSentObject &&
+      mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
+          op, *sources[1], "source generator send ignored value")))
+    return mlir::failure();
+
+  return RuntimeBundleLowerer::lowerSourceGeneratorAdvance(op, receiver,
+                                                           sentI64Evidence);
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::lowerSourceGeneratorDunderNext(
+    py::CallOp op, const RuntimeBundle &receiver,
+    llvm::ArrayRef<const RuntimeBundle *> sources) {
+  if (sources.size() != 1)
+    return op.emitError() << "generator __next__ expects no arguments";
+  return RuntimeBundleLowerer::lowerSourceGeneratorAdvance(op, receiver,
+                                                           std::nullopt);
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::lowerSourceGeneratorAdvance(
+    py::CallOp op, const RuntimeBundle &receiver,
+    std::optional<RuntimePrimitiveI64Evidence> sentI64Evidence) {
+  if (op.getNumResults() != 1 ||
+      runtimeContractName(op.getResult(0).getType()) != "builtins.int")
+    return op.emitError()
+           << "source generator resume currently supports int yield results";
+
   auto sendResumeInfo = generatorResumeClones.find(receiver.generatorTarget);
   mlir::FailureOr<SourceGeneratorResumeResult> yieldedOr =
       sendResumeInfo != generatorResumeClones.end()
@@ -1148,11 +1170,6 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSourceGeneratorSend(
   if (mlir::failed(yieldedOr))
     return mlir::failure();
   SourceGeneratorResumeResult yielded = *yieldedOr;
-
-  if (releaseIgnoredSentObject &&
-      mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
-          op, *sources[1], "source generator send ignored value")))
-    return mlir::failure();
 
   mlir::Location loc = op.getLoc();
   mlir::Value trueValue =
@@ -1192,6 +1209,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSourceGeneratorThrow(
                           << exception.contractName()
                           << " has no raise primitive";
 
+  // The raise must carry the throw call site's try handler marker, so the
+  // builder has to sit at the op's block (not wherever the previous lowering
+  // left it).
+  builder.setInsertionPoint(op);
   llvm::SmallVector<const RuntimeBundle *, 1> closeSources{&receiver};
   if (mlir::failed(lowerManifestVoidMethod(op, receiver, "close", closeSources,
                                            /*allowUnusedSources=*/false)))

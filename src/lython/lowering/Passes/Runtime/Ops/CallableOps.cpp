@@ -168,6 +168,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
     return RuntimeBundleLowerer::lowerSourceGeneratorSend(op, receiver,
                                                           sources);
   if (receiver.contractName() == "types.GeneratorType" &&
+      !receiver.generatorTarget.empty() && methodName == "__next__")
+    return RuntimeBundleLowerer::lowerSourceGeneratorDunderNext(op, receiver,
+                                                                sources);
+  if (receiver.contractName() == "types.GeneratorType" &&
       !receiver.generatorTarget.empty() && methodName == "throw")
     return RuntimeBundleLowerer::lowerSourceGeneratorThrow(op, receiver,
                                                            sources);

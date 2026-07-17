@@ -863,6 +863,14 @@ private:
   lowerSourceGeneratorSend(py::CallOp op, const RuntimeBundle &receiver,
                            llvm::ArrayRef<const RuntimeBundle *> sources);
   mlir::LogicalResult
+  lowerSourceGeneratorDunderNext(py::CallOp op, const RuntimeBundle &receiver,
+                                 llvm::ArrayRef<const RuntimeBundle *> sources);
+  // Shared tail of send/__next__: resume once, raise StopIteration when the
+  // body finished, and bind the yielded int as the call result.
+  mlir::LogicalResult lowerSourceGeneratorAdvance(
+      py::CallOp op, const RuntimeBundle &receiver,
+      std::optional<RuntimePrimitiveI64Evidence> sentI64Evidence);
+  mlir::LogicalResult
   lowerSourceGeneratorThrow(py::CallOp op, const RuntimeBundle &receiver,
                             llvm::ArrayRef<const RuntimeBundle *> sources);
   mlir::LogicalResult lowerEnter(py::EnterOp op);

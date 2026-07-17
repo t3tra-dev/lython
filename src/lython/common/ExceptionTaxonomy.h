@@ -58,6 +58,8 @@ inline constexpr BuiltinExceptionInfo kBuiltinExceptions[] = {
      llvm::StringLiteral("asyncio.CancelledError")},
     {64, llvm::StringLiteral("SystemExit"), 5,
      llvm::StringLiteral("builtins.SystemExit")},
+    {68, llvm::StringLiteral("GeneratorExit"), 5,
+     llvm::StringLiteral("builtins.GeneratorExit")},
     {66, llvm::StringLiteral("OSError"), 50,
      llvm::StringLiteral("builtins.OSError")},
     {67, llvm::StringLiteral("FileNotFoundError"), 66,
