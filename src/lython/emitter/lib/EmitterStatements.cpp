@@ -181,6 +181,8 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
       for (const std::string &name : *names)
         currentGlobalDecls.insert(name);
     return;
+  } else if (statement.kind == "Delete") {
+    emitDelete(statement);
   } else if (statement.kind == "Pass") {
     return;
   } else if (statement.kind == "Match") {
@@ -195,6 +197,57 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
     diagnostics.push_back(parser::Diagnostic{
         parser::Severity::Error, statement.range.start,
         "unsupported statement kind '" + statement.kind + "'"});
+  }
+}
+
+// `del` (R6): only subscript deletion is representable — variables live in
+// static SSA scopes (released at scope exit), and instance attributes are
+// fixed storage slots, so both are rejected with an explanation instead of a
+// generic unsupported-statement error.
+void ModuleEmitter::emitDelete(const parser::Node &statement) {
+  const auto *targets = ast::nodeList(statement, "targets");
+  if (!targets)
+    return;
+  for (const parser::NodePtr &target : *targets) {
+    if (!target)
+      continue;
+    if (target->kind == "Subscript") {
+      Value container = emitExpr(ast::node(*target, "value"));
+      Value index = emitExpr(ast::node(*target, "slice"));
+      if (std::optional<MethodBinding> method =
+              lookupClassMethod(container.type, "__delitem__")) {
+        emitInlineOperatorCall(*target, container, *method, {index});
+        continue;
+      }
+      CallInferenceResult inference = types.inferMethodCallWithEvidence(
+          container.type, "__delitem__", {index.type});
+      if (!requireStaticEvidence(*target, inference))
+        continue;
+      py::DelItemOp::create(
+          builder, loc(*target),
+          mlir::FlatSymbolRefAttr::get(&context, "__delitem__"),
+          callProtocolFor(inference), container.value, index.value);
+      continue;
+    }
+    if (target->kind == "Name") {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, target->range.start,
+          "`del " + std::string(ast::nameSpelling(*target)) +
+              "` is rejected (Lython deviation from CPython): locals are "
+              "released when their scope ends, so deleting a variable is "
+              "unnecessary"});
+      continue;
+    }
+    if (target->kind == "Attribute") {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, target->range.start,
+          "`del` on an attribute is not supported: instance attributes are "
+          "fixed storage slots in Lython's static object layout"});
+      continue;
+    }
+    diagnostics.push_back(
+        parser::Diagnostic{parser::Severity::Error, target->range.start,
+                           "unsupported del target '" + target->kind + "'"});
   }
 }
 

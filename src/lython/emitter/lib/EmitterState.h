@@ -84,6 +84,12 @@ struct LoopControlContext {
   // values (used to detect replacement for the decref-on-replace on
   // break/continue edges).
   mlir::Block *headerBlock = nullptr;
+  // Per-iteration baseline values of the carried locals when they differ from
+  // the header arguments — a walrus in a while condition rebinds a carried
+  // local before the body runs, and the header already released the replaced
+  // argument, so break/continue/back edges must compare against (and release)
+  // the post-condition value instead.
+  llvm::SmallVector<mlir::Value, 4> baselineValues;
 };
 
 struct PrimitiveConstant {

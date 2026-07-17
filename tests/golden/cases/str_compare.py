@@ -20,7 +20,7 @@ picked2 = 0
 for i in range(3):
     for j in range(3):
         if i < j:
-            if picked2:
+            if picked2 != 0:
                 if i * 3 + j > picked2:
                     picked2 = i * 3 + j
             else:

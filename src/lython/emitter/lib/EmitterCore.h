@@ -100,6 +100,7 @@ private:
   void emitStatements(const std::vector<parser::NodePtr> *statements,
                       bool skipDeclarations = false);
   void emitStatement(const parser::Node &statement);
+  void emitDelete(const parser::Node &statement);
   void emitAssignTarget(const parser::Node &target, Value value);
   void emitIf(const parser::Node &statement);
   void emitMatch(const parser::Node &statement);
@@ -119,7 +120,8 @@ private:
   llvm::SmallVector<mlir::Value, 4>
   carriedLoopEdgeOperands(const parser::Node &anchor,
                           llvm::ArrayRef<CarriedLoopLocal> carried,
-                          mlir::Block *headerBlock);
+                          mlir::Block *headerBlock,
+                          llvm::ArrayRef<mlir::Value> baselineValues = {});
   llvm::SmallVector<mlir::Value, 4>
   loopCarriedBranchOperands(const parser::Node &anchor,
                             const LoopControlContext &loop, mlir::Block *target);
@@ -234,6 +236,12 @@ private:
                        const AwaitInferenceResult &inference);
   Value emitContainerLiteral(const parser::Node &expr,
                              mlir::Type expected = {});
+  Value emitSetLiteral(const parser::Node &expr, mlir::Type expected = {});
+  // `and`/`or` over non-bool operands: CPython's operand-value result,
+  // restricted to operand combinations whose join is statically representable
+  // (R1). The all-bool fast path stays in emitExpr.
+  Value emitBoolOpValue(const parser::Node &expr, bool isAnd,
+                        const std::vector<parser::NodePtr> &operands);
   Value emitListComp(const parser::Node &expr);
   Value emitDictComp(const parser::Node &expr);
   Value emitComprehension(const parser::Node &expr, bool isDict,
