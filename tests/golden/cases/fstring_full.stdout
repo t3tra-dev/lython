@@ -1,0 +1,32 @@
+hello world
+42 + 42 = 84
+        42|
+     3.142
+    a|
+42
+'world'
+world
+'world'
+'h\xe9llo'
+'\u3042'
+'\U0001f40d'
+x=42
+x = 42
+pi=3.14
+pi=3.14159
+        42|
+
+a1b2.5csdTrueeNonef
+{escaped} 42
+[1, 2, 3]
+(1, 'a')
+{'k': 1}
+<0090 deg>
+<+90 deg>
+plain!
+plain!
+3.142e+00
+42
+  world  |
+True
+0xff
