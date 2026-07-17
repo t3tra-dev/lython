@@ -92,6 +92,14 @@ private:
   // True when the class (by contract name) linearizes onto a manifest
   // exception class (its instances use the runtime exception representation).
   bool isExceptionBackedClass(llvm::StringRef className) const;
+  // Defining class + storage type of a slot-backed (mutable) class attribute
+  // reachable from `className` along its MRO.
+  std::optional<std::pair<llvm::StringRef, mlir::Type>>
+  resolveClassAttrSlot(llvm::StringRef className,
+                       llvm::StringRef attrName) const;
+  // Evaluates the class body's attribute initializers into their global
+  // slots; runs at the ClassDef statement position in module flow.
+  void emitClassAttrInitializers(const parser::Node &classDef);
   Value emitNestedFunctionDecl(const parser::Node &function);
   mlir::ArrayAttr emitCallableDefaultValues(const parser::Node &function,
                                             const FunctionSignature &sig,
@@ -375,6 +383,13 @@ private:
   // Dataclass field default expressions (AnnAssign values), per class; MRO
   // walks reuse a base dataclass's defaults for inherited fields.
   llvm::StringMap<llvm::StringMap<parser::NodePtr>> classFieldDefaultNodes;
+  // Mutable (slot-backed) class attributes, keyed by the DEFINING class:
+  // attribute -> widened storage type. They live in module-global object
+  // cells named "<class>.<attr>", initialized at the class statement's
+  // position in module flow; subclass reads resolve to the defining class's
+  // cell along the MRO (CPython shares the base's attribute until a write
+  // creates a subclass shadow -- shadow-creating writes are diagnosed).
+  llvm::StringMap<llvm::StringMap<mlir::Type>> classAttrSlots;
   // Synthesized dataclass method ASTs (__init__/__repr__/__eq__): owned here
   // because the parse tree does not contain them.
   std::vector<parser::NodePtr> synthesizedClassMethods;

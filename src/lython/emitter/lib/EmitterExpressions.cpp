@@ -848,8 +848,29 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
   if (field)
     result = *field;
 
+  // Mutable class attributes read from the defining class's global cell
+  // (instance receivers too, unless an instance field shadows the name).
+  if (!field) {
+    mlir::Type receiverInstance = object.type;
+    if (auto typeObject =
+            mlir::dyn_cast_if_present<py::TypeType>(receiverInstance))
+      receiverInstance = typeObject.getInstanceType();
+    if (auto contract =
+            mlir::dyn_cast_if_present<py::ContractType>(receiverInstance)) {
+      if (std::optional<std::pair<llvm::StringRef, mlir::Type>> slot =
+              resolveClassAttrSlot(contract.getContractName(), *attr)) {
+        std::string cellName =
+            (llvm::Twine(slot->first) + "." + *attr).str();
+        auto op = py::GlobalGetOp::create(builder, loc(expr), slot->second,
+                                          builder.getStringAttr(cellName));
+        return {op.getResult(), slot->second};
+      }
+    }
+  }
+
+  // An instance field shadows the class attribute of the same name.
   std::optional<mlir::Type> staticAttr =
-      lookupClassStaticAttr(object.type, *attr);
+      field ? std::nullopt : lookupClassStaticAttr(object.type, *attr);
   if (staticAttr)
     result = *staticAttr;
 

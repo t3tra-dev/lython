@@ -426,6 +426,74 @@ bool ModuleEmitter::isExceptionBackedClass(llvm::StringRef className) const {
   return false;
 }
 
+std::optional<std::pair<llvm::StringRef, mlir::Type>>
+ModuleEmitter::resolveClassAttrSlot(llvm::StringRef className,
+                                    llvm::StringRef attrName) const {
+  llvm::ArrayRef<std::string> mro = classMro(className);
+  if (mro.empty()) {
+    auto slots = classAttrSlots.find(className);
+    if (slots == classAttrSlots.end())
+      return std::nullopt;
+    auto slot = slots->second.find(attrName);
+    if (slot == slots->second.end())
+      return std::nullopt;
+    return std::make_pair(slots->first(), slot->second);
+  }
+  for (const std::string &cls : mro) {
+    auto slots = classAttrSlots.find(cls);
+    if (slots == classAttrSlots.end())
+      continue;
+    auto slot = slots->second.find(attrName);
+    if (slot != slots->second.end())
+      return std::make_pair(slots->first(), slot->second);
+  }
+  return std::nullopt;
+}
+
+void ModuleEmitter::emitClassAttrInitializers(const parser::Node &classDef) {
+  auto name = ast::string(classDef, "name");
+  if (!name)
+    return;
+  auto slots = classAttrSlots.find(*name);
+  if (slots == classAttrSlots.end() || slots->second.empty())
+    return;
+  const auto *body = ast::nodeList(classDef, "body");
+  if (!body)
+    return;
+  for (const parser::NodePtr &statement : *body) {
+    if (!statement)
+      continue;
+    const parser::Node *target = nullptr;
+    const parser::Node *value = nullptr;
+    if (statement->kind == "Assign") {
+      const auto *targets = ast::nodeList(*statement, "targets");
+      if (!targets || targets->size() != 1 || !targets->front() ||
+          targets->front()->kind != "Name")
+        continue;
+      target = targets->front().get();
+      value = ast::node(*statement, "value");
+    } else if (statement->kind == "AnnAssign") {
+      target = ast::node(*statement, "target");
+      value = ast::node(*statement, "value");
+      if (!target || target->kind != "Name")
+        continue;
+    } else {
+      continue;
+    }
+    if (!value)
+      continue;
+    llvm::StringRef attrName = ast::nameSpelling(*target);
+    auto slot = slots->second.find(attrName);
+    if (slot == slots->second.end())
+      continue;
+    Value initial = emitExprExpected(value, slot->second);
+    Value coerced = coerceValue(initial, slot->second, *statement);
+    std::string cellName = (llvm::Twine(*name) + "." + attrName).str();
+    py::GlobalSetOp::create(builder, loc(*statement),
+                            builder.getStringAttr(cellName), coerced.value);
+  }
+}
+
 std::optional<MethodBinding>
 ModuleEmitter::lookupClassMethod(mlir::Type receiverType,
                                  llvm::StringRef methodName) const {
@@ -768,6 +836,78 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
   for (auto [fieldName, fieldType] : llvm::zip_equal(fieldNames, fieldTypes))
     registeredFields[fieldName] = fieldType;
 
+  // Class attributes register BEFORE any method body is emitted: method
+  // bodies read them (Counter.count += 1) through the very lookups being
+  // registered here.
+  llvm::SmallVector<std::string, 8> staticAttrNames;
+  llvm::SmallVector<mlir::Attribute, 8> staticAttrValues;
+  llvm::SmallVector<mlir::Type, 8> staticAttrTypes;
+  collectStaticClassAssignments(classDef, staticAttrNames, staticAttrValues,
+                                &staticAttrTypes);
+  // Mutable class attributes: attributes of main-module classes whose
+  // widened type has module-global cell storage become slot-backed (reads
+  // and writes go through the cells; the initializer expression is no
+  // longer restricted to constants). Container-typed attributes stay on the
+  // constant channel: their storage cells would go stale against
+  // reallocation, the same reason collectModuleGlobals excludes them.
+  if (symbolName.empty()) {
+    llvm::StringMap<mlir::Type> &slots = classAttrSlots[contractName];
+    slots.clear();
+    for (auto [attrName, attrType] :
+         llvm::zip_equal(staticAttrNames, staticAttrTypes)) {
+      mlir::Type widened = types.widenLiteral(attrType);
+      bool storable =
+          widened == types.intType() || widened == types.strType() ||
+          widened == types.floatType() || widened == types.boolType();
+      if (!storable) {
+        if (auto attrContract =
+                mlir::dyn_cast_if_present<py::ContractType>(widened)) {
+          llvm::StringRef attrContractName = attrContract.getContractName();
+          storable = attrContractName == "builtins.bytes" ||
+                     !attrContractName.contains('.');
+        }
+      }
+      if (storable)
+        slots[attrName] = widened;
+    }
+  }
+  // Inherit base class attributes MRO-forward (own declarations win): a
+  // subclass reads its bases' class attributes through its own type object.
+  for (const std::string &cls : llvm::ArrayRef<std::string>(mro).drop_front()) {
+    auto baseOrder = classStaticAttrOrders.find(cls);
+    auto baseValues = classStaticAttrValues.find(cls);
+    auto baseTypes = classStaticAttrBindings.find(cls);
+    if (baseOrder == classStaticAttrOrders.end() ||
+        baseValues == classStaticAttrValues.end() ||
+        baseTypes == classStaticAttrBindings.end())
+      continue;
+    for (const std::string &name : baseOrder->second) {
+      if (llvm::is_contained(staticAttrNames, name))
+        continue;
+      auto value = baseValues->second.find(name);
+      auto type = baseTypes->second.find(name);
+      if (value == baseValues->second.end() ||
+          type == baseTypes->second.end())
+        continue;
+      staticAttrNames.push_back(name);
+      staticAttrValues.push_back(value->second);
+      staticAttrTypes.push_back(type->second);
+    }
+  }
+  llvm::StringMap<mlir::Type> &registeredStaticAttrs =
+      classStaticAttrBindings[contractName];
+  registeredStaticAttrs.clear();
+  llvm::StringMap<mlir::Attribute> &registeredStaticValues =
+      classStaticAttrValues[contractName];
+  registeredStaticValues.clear();
+  classStaticAttrOrders[contractName].assign(staticAttrNames.begin(),
+                                             staticAttrNames.end());
+  for (auto [attrName, attrValue, attrType] :
+       llvm::zip_equal(staticAttrNames, staticAttrValues, staticAttrTypes)) {
+    registeredStaticAttrs[attrName] = attrType;
+    registeredStaticValues[attrName] = attrValue;
+  }
+
   llvm::SmallVector<std::string, 8> methodNames;
   llvm::SmallVector<std::string, 8> methodKinds;
   llvm::SmallVector<std::string, 8> methodSymbols;
@@ -1065,47 +1205,6 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
   state.addAttribute("method_kinds", stringArray(builder, methodKinds));
   state.addAttribute("method_symbols", stringArray(builder, methodSymbols));
 
-  llvm::SmallVector<std::string, 8> staticAttrNames;
-  llvm::SmallVector<mlir::Attribute, 8> staticAttrValues;
-  llvm::SmallVector<mlir::Type, 8> staticAttrTypes;
-  collectStaticClassAssignments(classDef, staticAttrNames, staticAttrValues,
-                                &staticAttrTypes);
-  // Inherit base class attributes MRO-forward (own declarations win): a
-  // subclass reads its bases' class attributes through its own type object.
-  for (const std::string &cls : llvm::ArrayRef<std::string>(mro).drop_front()) {
-    auto baseOrder = classStaticAttrOrders.find(cls);
-    auto baseValues = classStaticAttrValues.find(cls);
-    auto baseTypes = classStaticAttrBindings.find(cls);
-    if (baseOrder == classStaticAttrOrders.end() ||
-        baseValues == classStaticAttrValues.end() ||
-        baseTypes == classStaticAttrBindings.end())
-      continue;
-    for (const std::string &name : baseOrder->second) {
-      if (llvm::is_contained(staticAttrNames, name))
-        continue;
-      auto value = baseValues->second.find(name);
-      auto type = baseTypes->second.find(name);
-      if (value == baseValues->second.end() ||
-          type == baseTypes->second.end())
-        continue;
-      staticAttrNames.push_back(name);
-      staticAttrValues.push_back(value->second);
-      staticAttrTypes.push_back(type->second);
-    }
-  }
-  llvm::StringMap<mlir::Type> &registeredStaticAttrs =
-      classStaticAttrBindings[contractName];
-  registeredStaticAttrs.clear();
-  llvm::StringMap<mlir::Attribute> &registeredStaticValues =
-      classStaticAttrValues[contractName];
-  registeredStaticValues.clear();
-  classStaticAttrOrders[contractName].assign(staticAttrNames.begin(),
-                                             staticAttrNames.end());
-  for (auto [attrName, attrValue, attrType] :
-       llvm::zip_equal(staticAttrNames, staticAttrValues, staticAttrTypes)) {
-    registeredStaticAttrs[attrName] = attrType;
-    registeredStaticValues[attrName] = attrValue;
-  }
   if (!staticAttrNames.empty()) {
     state.addAttribute("class_static_attr_names",
                        stringArray(builder, staticAttrNames));
