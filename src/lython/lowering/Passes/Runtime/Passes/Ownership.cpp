@@ -2017,12 +2017,6 @@ TokenAtPoint groupTokenAtPoint(UnwindCleanupAnalysis &analysis,
   return result;
 }
 
-// The ancestor operation whose block belongs directly to the function's
-// top-level region; null when the op is outside that region tree.
-mlir::Operation *topLevelAncestor(mlir::Operation *op, mlir::Region *region) {
-  return ancestorInRegion(op, region);
-}
-
 void collectUnwindGroupSites(FuncContractCache &contracts,
                              own::AliasAnalysis &aliases, mlir::Region *region,
                              mlir::DominanceInfo &dominance,
@@ -2063,7 +2057,7 @@ void collectUnwindGroupSites(FuncContractCache &contracts,
         mlir::Operation *user = use.getOwner();
         if (precedesProduction(user))
           continue;
-        mlir::Operation *top = topLevelAncestor(user, region);
+        mlir::Operation *top = ancestorInRegion(user, region);
         if (!top) {
           group.skip = true;
           return;
