@@ -1035,6 +1035,11 @@ RuntimeBundleLowerer::emitSourceGeneratorResumeDispatch(
 mlir::LogicalResult
 RuntimeBundleLowerer::lowerSourceGeneratorNext(py::NextOp op,
                                                const RuntimeBundle &iterator) {
+  // The receiver reference aliases valueBundles storage, and the element
+  // bundle insertions below can rehash the map out from under it; the copy
+  // that must survive them is taken up front (a re-lookup would need the
+  // receiver's key value, which this function never sees).
+  RuntimeBundle iteratorState = iterator;
   auto resumeInfo = generatorResumeClones.find(iterator.generatorTarget);
   mlir::FailureOr<SourceGeneratorResumeResult> yieldedOr =
       resumeInfo != generatorResumeClones.end()
@@ -1162,7 +1167,7 @@ RuntimeBundleLowerer::lowerSourceGeneratorNext(py::NextOp op,
   }
   valueBundles[op.getElement()] = std::move(element);
 
-  RuntimeBundle next = iterator;
+  RuntimeBundle next = std::move(iteratorState);
   next.setObjectLogicalOwnership(/*ownsObject=*/false);
   valueBundles[op.getNext()] = std::move(next);
   erase.push_back(op);
