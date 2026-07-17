@@ -116,6 +116,8 @@ std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createRefCountInsertionPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createRefCountPairElisionPass();
+std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
+createPostCleanupUnwindInsertionPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createPyOptimizationPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createAsyncThunkLoweringPass();

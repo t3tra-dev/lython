@@ -23,6 +23,8 @@
 #include "Common/LoweringPipeline.h"
 #include "Common/RuntimeSupport.h"
 
+#include "Ownership.h"
+
 #include "Emitter.h"
 #include "Parser.h"
 
@@ -209,6 +211,12 @@ int main(int argc, char **argv) {
 
   if (mlir::failed(stampTargetFacts(module, triple)))
     return 1;
+  // This artifact links into the final LLVM module AFTER the EH phase that
+  // wires and erases LyEH_Try* markers: mark the module so ownership
+  // insertion/verification use the wiring-free model (see kRuntimeInternal-
+  // LoweringAttr in Common/Ownership.h).
+  module->setAttr(py::ownership::kRuntimeInternalLoweringAttr,
+                  mlir::UnitAttr::get(module.getContext()));
 
   py::TensorLoweringTarget tensorTarget;
   py::LoweringPipelineOptions options;
@@ -218,6 +226,27 @@ int main(int argc, char **argv) {
     llvm::errs() << "error: runtime pre-lowering pipeline failed for '"
                  << input << "'\n";
     return 1;
+  }
+
+  // The final EH phase never touches this artifact, so a surviving marker
+  // call would surface as an unresolved `LyEH_Try*` symbol at program link
+  // -- reject it here where the offending module is still identifiable.
+  {
+    bool leftoverMarkers = false;
+    module.walk([&](mlir::LLVM::CallOp call) {
+      auto callee = call.getCallee();
+      if (!callee)
+        return;
+      if (*callee == "LyEH_TryCatchAnchor" || *callee == "LyEH_TryCatchMarker" ||
+          *callee == "LyEH_TryCallSiteMarker") {
+        call.emitError() << "runtime-internal module must not carry EH try "
+                            "markers; the final EH phase never processes "
+                            "pre-lowered artifacts";
+        leftoverMarkers = true;
+      }
+    });
+    if (leftoverMarkers)
+      return 1;
   }
 
   // Drop the (empty) module entry point from the artifact.
