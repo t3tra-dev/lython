@@ -330,7 +330,9 @@ void buildIntRound(SupportBuilder &b) {
 
 // i64 exception_base_class_id(i64 class_id): one step up the builtin exception
 // hierarchy (class id -> its base class id), 0 for a root/unknown id. Pure
-// `cf.switch` over the fixed builtin exception class-id table.
+// `cf.switch` over the fixed builtin exception class-id table; ids outside it
+// consult the per-program user-exception hook (source class ids live above
+// 2^32 and cannot be known when this module is built).
 void buildExceptionBaseClassId(SupportBuilder &b) {
   auto fn = b.beginFunction("exception_base_class_id",
                             b.builder.getFunctionType({b.i64()}, {b.i64()}),
@@ -340,7 +342,8 @@ void buildExceptionBaseClassId(SupportBuilder &b) {
   mlir::Value classId = entry->getArgument(0);
 
   // One return block per distinct base class id in the shared taxonomy;
-  // the root (BaseException's base, 0) is the switch default.
+  // unknown ids (the switch default) ask the user-exception hook, which
+  // returns the root (0) for anything it does not own.
   llvm::SmallDenseMap<std::int64_t, mlir::Block *, 8> returnBlocks;
   auto returnBlockFor = [&](std::int64_t value) {
     mlir::Block *&block = returnBlocks[value];
@@ -351,7 +354,15 @@ void buildExceptionBaseClassId(SupportBuilder &b) {
     }
     return block;
   };
-  mlir::Block *toRoot = returnBlockFor(py::exceptions::kRootClassId);
+  mlir::Block *toRoot;
+  {
+    toRoot = b.builder.createBlock(&body);
+    b.builder.setInsertionPointToEnd(toRoot);
+    auto userBase = mlir::func::CallOp::create(
+        b.builder, b.loc, "__ly_user_exception_base_class_id", b.i64(),
+        mlir::ValueRange{classId});
+    mlir::func::ReturnOp::create(b.builder, b.loc, userBase.getResult(0));
+  }
 
   llvm::SmallVector<llvm::APInt, 16> caseValues;
   llvm::SmallVector<mlir::Block *, 16> caseDests;
@@ -2172,6 +2183,14 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context) {
   support.declareExternal(
       "__ly_release_boxed_by_contract",
       builder.getFunctionType({support.ptr(), support.i64()}, {support.i1()}));
+  // Per-program user-exception hooks (source-class exception hierarchy and
+  // names); same link-time resolution scheme.
+  support.declareExternal(
+      "__ly_user_exception_base_class_id",
+      builder.getFunctionType({support.i64()}, {support.i64()}));
+  support.declareExternal(
+      "__ly_user_exception_class_name",
+      builder.getFunctionType({support.i64()}, {support.ptr()}));
 
   buildFloatRoundToI64(support);
   buildFloatRound(support);

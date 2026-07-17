@@ -827,6 +827,18 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
     fieldTypes = std::move(mergedTypes);
   }
 
+  // Exception-backed classes use the runtime exception object (header with
+  // this class's id + message); it has no field storage, so declared
+  // instance fields are rejected rather than silently dropped.
+  if (isExceptionBackedClass(contractName) && !fieldNames.empty()) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, classDef.range.start,
+        "user exception class '" + classSymbol +
+            "' cannot declare instance fields yet (field '" +
+            fieldNames.front() + "'); use the exception message instead"});
+    return;
+  }
+
   llvm::StringMap<mlir::Type> &registeredFields =
       classFieldBindings[contractName];
   registeredFields.clear();
@@ -997,7 +1009,12 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       std::string symbolName =
           sourceMethodSymbolName(contractName, *methodName, *statement);
       methodSymbols.push_back(symbolName);
-      if (kind != "class" && kind != "classmethod") {
+      // Exception-backed classes get no standalone method symbols: their
+      // bodies inline at call sites, and a standalone copy would transfer
+      // the borrowed receiver's header through the runtime exception
+      // __init__ (an ownership violation the verifier rejects).
+      if (kind != "class" && kind != "classmethod" &&
+          !isExceptionBackedClass(contractName)) {
         pendingBodies.push_back(statement.get());
         pendingBodySigs.push_back(bodySig);
         pendingBodySymbols.push_back(symbolName);
@@ -1180,44 +1197,9 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
     }
   }
 
-  for (auto [statement, bodySig, symbolName, kind] :
-       llvm::zip_equal(pendingBodies, pendingBodySigs, pendingBodySymbols,
-                       pendingBodyKinds)) {
-    bool instanceBody = kind == "instance" && !bodySig.positionalNames.empty();
-    if (instanceBody)
-      superContexts.push_back(SuperContext{std::string(contractName),
-                                           bodySig.positionalNames.front()});
-    emitCallableFunction(*statement, symbolName, bodySig, {},
-                         /*isLambda=*/false);
-    if (instanceBody)
-      superContexts.pop_back();
-  }
-
-  mlir::OperationState state(loc(classDef), py::ClassOp::getOperationName());
-  state.addAttribute(mlir::SymbolTable::getSymbolAttrName(),
-                     builder.getStringAttr(contractName));
-  state.addAttribute("base_names", stringArray(builder, bases));
-  state.addAttribute("field_names", stringArray(builder, fieldNames));
-  state.addAttribute("field_types", typeArray(builder, fieldTypes));
-  state.addAttribute("field_contract_types", typeArray(builder, fieldTypes));
-  state.addAttribute("method_names", stringArray(builder, methodNames));
-  state.addAttribute("method_contracts", typeArray(builder, methodContracts));
-  state.addAttribute("method_kinds", stringArray(builder, methodKinds));
-  state.addAttribute("method_symbols", stringArray(builder, methodSymbols));
-
-  if (!staticAttrNames.empty()) {
-    state.addAttribute("class_static_attr_names",
-                       stringArray(builder, staticAttrNames));
-    state.addAttribute("class_static_attr_values",
-                       builder.getArrayAttr(staticAttrValues));
-  }
-  state.addAttribute("mro_names",
-                     stringArray(builder, llvm::ArrayRef<std::string>(mro)));
-
-  state.addRegion();
-  mlir::Operation *op = builder.create(state);
-  op->getRegion(0).push_back(new mlir::Block);
-
+  // The class's protocol-table entry registers BEFORE its method bodies
+  // emit: a body may resolve the class's own manifest evidence (its own
+  // __init__ through super(), factory methods instantiating the class).
   py::protocols::ProtocolInfo protocolInfo;
   if (const auto *body = ast::nodeList(classDef, "body")) {
     for (const parser::NodePtr &statement : *body) {
@@ -1278,6 +1260,45 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
   }
   py::protocols::Table::getMutable(context).registerClass(
       contractName, std::move(protocolInfo));
+
+  for (auto [statement, bodySig, symbolName, kind] :
+       llvm::zip_equal(pendingBodies, pendingBodySigs, pendingBodySymbols,
+                       pendingBodyKinds)) {
+    bool instanceBody = kind == "instance" && !bodySig.positionalNames.empty();
+    if (instanceBody)
+      superContexts.push_back(SuperContext{std::string(contractName),
+                                           bodySig.positionalNames.front()});
+    emitCallableFunction(*statement, symbolName, bodySig, {},
+                         /*isLambda=*/false);
+    if (instanceBody)
+      superContexts.pop_back();
+  }
+
+  mlir::OperationState state(loc(classDef), py::ClassOp::getOperationName());
+  state.addAttribute(mlir::SymbolTable::getSymbolAttrName(),
+                     builder.getStringAttr(contractName));
+  state.addAttribute("base_names", stringArray(builder, bases));
+  state.addAttribute("field_names", stringArray(builder, fieldNames));
+  state.addAttribute("field_types", typeArray(builder, fieldTypes));
+  state.addAttribute("field_contract_types", typeArray(builder, fieldTypes));
+  state.addAttribute("method_names", stringArray(builder, methodNames));
+  state.addAttribute("method_contracts", typeArray(builder, methodContracts));
+  state.addAttribute("method_kinds", stringArray(builder, methodKinds));
+  state.addAttribute("method_symbols", stringArray(builder, methodSymbols));
+
+  if (!staticAttrNames.empty()) {
+    state.addAttribute("class_static_attr_names",
+                       stringArray(builder, staticAttrNames));
+    state.addAttribute("class_static_attr_values",
+                       builder.getArrayAttr(staticAttrValues));
+  }
+  state.addAttribute("mro_names",
+                     stringArray(builder, llvm::ArrayRef<std::string>(mro)));
+
+  state.addRegion();
+  mlir::Operation *op = builder.create(state);
+  op->getRegion(0).push_back(new mlir::Block);
+
 }
 
 void ModuleEmitter::collectStaticClassAssignments(
@@ -1518,11 +1539,57 @@ void ModuleEmitter::collectClassFields(
 Value ModuleEmitter::emitSuperExceptionInit(const parser::Node &expr,
                                             Value receiver,
                                             llvm::StringRef baseContract) {
-  (void)receiver;
+  llvm::SmallVector<Value, 2> positional;
+  llvm::SmallVector<mlir::Type, 2> positionalTypes;
+  if (const auto *args = ast::nodeList(expr, "args")) {
+    for (const parser::NodePtr &arg : *args) {
+      if (arg && arg->kind == "Starred") {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, arg->range.start,
+            "starred arguments are not supported for exception __init__"});
+        return emitNone(expr);
+      }
+      positional.push_back(emitExpr(arg.get()));
+      positionalTypes.push_back(positional.back().type);
+    }
+  }
+  if (const auto *keywords = ast::nodeList(expr, "keywords");
+      keywords && !keywords->empty()) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "keyword arguments are not supported for exception __init__"});
+    return emitNone(expr);
+  }
+  // Zero arguments: __new__ already made the empty message (the same
+  // shortcut instantiation takes for no-arg builtin exceptions).
+  if (positional.empty())
+    return emitNone(expr);
+  if (positional.size() > 1) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "exception __init__ supports at most one message argument yet"});
+    return emitNone(expr);
+  }
+  // Inference runs against the receiver type: the protocol table resolves
+  // __init__ through the class's bases anyway, and the evidence verifier
+  // checks the selected contract against the receiver.
   (void)baseContract;
-  diagnostics.push_back(parser::Diagnostic{
-      parser::Severity::Error, expr.range.start,
-      "super().__init__ on a builtin exception base is not supported yet"});
+  CallInferenceResult inference = types.inferMethodCallWithEvidence(
+      receiver.type, "__init__", positionalTypes);
+  if (!requireStaticEvidence(expr, inference))
+    return emitNone(expr);
+  Value posPack = emitPack(positional);
+  Value namePack = emitPack({});
+  Value valuePack = emitPack({});
+  auto initOp = py::InitOp::create(
+      builder, loc(expr), types.none(),
+      mlir::FlatSymbolRefAttr::get(&context, "__init__"),
+      callProtocolFor(inference), receiver.value, posPack.value,
+      namePack.value, valuePack.value);
+  initOp->setAttr("ly.constructor.init_kind", builder.getStringAttr("instance"));
+  if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(receiver.type))
+    initOp->setAttr("ly.constructor.owner",
+                    builder.getStringAttr(contract.getContractName()));
   return emitNone(expr);
 }
 

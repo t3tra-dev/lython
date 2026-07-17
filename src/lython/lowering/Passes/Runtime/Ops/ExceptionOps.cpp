@@ -85,9 +85,11 @@ mlir::func::FuncOp getOrCreateTracebackPush(mlir::ModuleOp module,
                               {}));
 }
 
+} // namespace
+
 mlir::FailureOr<std::int64_t>
-handlerClassId(mlir::Operation *op, mlir::Type handler,
-               const RuntimeManifestIndex &manifest) {
+RuntimeBundleLowerer::handlerClassId(mlir::Operation *op,
+                                     mlir::Type handler) const {
   auto handlerType = mlir::dyn_cast<py::TypeType>(handler);
   if (!handlerType)
     return op->emitError() << "exception handler must be type[T]";
@@ -95,15 +97,15 @@ handlerClassId(mlir::Operation *op, mlir::Type handler,
       mlir::dyn_cast<py::ContractType>(handlerType.getInstanceType());
   if (!handlerContract)
     return op->emitError() << "exception handler must name a manifest contract";
+  // Manifest exceptions and source exception classes both resolve here (the
+  // latter through their compiler-assigned ids).
   std::optional<std::int64_t> classId =
-      manifest.classId(handlerContract.getContractName());
+      RuntimeBundleLowerer::runtimeClassIdForContract(handlerContract);
   if (!classId)
     return op->emitError() << "runtime manifest has no class id for exception "
                            << "handler " << handlerContract.getContractName();
   return *classId;
 }
-
-} // namespace
 
 mlir::LogicalResult
 RuntimeBundleLowerer::emitTracebackFrame(mlir::Operation *op,
@@ -334,6 +336,13 @@ mlir::LogicalResult RuntimeBundleLowerer::emitRaiseExceptionBundle(
   std::optional<RuntimeSymbol> symbol =
       manifest.primitive(exception.contractName(), "raise");
   if (!symbol)
+    // User exception classes raise through the builtin ancestor: the object
+    // already carries the source class's id in its header.
+    if (std::optional<std::string> ancestor =
+            RuntimeBundleLowerer::exceptionAncestorContractFor(
+                exception.contract))
+      symbol = manifest.primitive(*ancestor, "raise");
+  if (!symbol)
     return op->emitError() << "runtime manifest has no "
                            << exception.contractName() << ".raise primitive";
 
@@ -369,7 +378,7 @@ RuntimeBundleLowerer::lowerExceptMatch(py::ExceptMatchOp op) {
                              "bundle";
 
   mlir::FailureOr<std::int64_t> handlerClassIdValue =
-      handlerClassId(op.getOperation(), op.getHandler(), manifest);
+      handlerClassId(op.getOperation(), op.getHandler());
   if (mlir::failed(handlerClassIdValue))
     return mlir::failure();
 
@@ -406,7 +415,7 @@ RuntimeBundleLowerer::lowerExceptMatch(py::ExceptMatchOp op) {
 mlir::LogicalResult
 RuntimeBundleLowerer::lowerExceptCurrentMatch(py::ExceptCurrentMatchOp op) {
   mlir::FailureOr<std::int64_t> handlerId =
-      handlerClassId(op.getOperation(), op.getHandler(), manifest);
+      handlerClassId(op.getOperation(), op.getHandler());
   if (mlir::failed(handlerId))
     return mlir::failure();
 
@@ -426,7 +435,7 @@ RuntimeBundleLowerer::lowerExceptCurrentMatch(py::ExceptCurrentMatchOp op) {
 mlir::LogicalResult
 RuntimeBundleLowerer::lowerExceptCurrentValue(py::ExceptCurrentValueOp op) {
   mlir::FailureOr<std::int64_t> handlerId =
-      handlerClassId(op.getOperation(), op.getHandler(), manifest);
+      handlerClassId(op.getOperation(), op.getHandler());
   if (mlir::failed(handlerId))
     return mlir::failure();
 

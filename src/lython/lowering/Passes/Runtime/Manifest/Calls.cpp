@@ -36,6 +36,15 @@ mlir::FailureOr<RuntimeSymbol> RuntimeBundleLowerer::selectManifestMethod(
 
   llvm::ArrayRef<RuntimeSymbol> methods =
       manifest.methodCandidates(receiverContract, methodName);
+  if (methods.empty()) {
+    // User exception receivers share their builtin ancestor's methods
+    // (__init__/__str__/...): same physical shape, subclass-specific
+    // identity only in the header's class id.
+    if (std::optional<std::string> ancestor =
+            RuntimeBundleLowerer::exceptionAncestorContractFor(
+                runtimeContractType(context, receiverContract)))
+      methods = manifest.methodCandidates(*ancestor, methodName);
+  }
   if (methods.empty())
     return op->emitError() << "runtime manifest has no " << receiverContract
                            << "." << methodName << " method";
@@ -286,6 +295,16 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerNew(py::NewOp op) {
   if (!initializer)
     if (py::ClassOp classOp = RuntimeBundleLowerer::classForContract(
             op.getInstance().getType())) {
+      // User exception classes construct through the builtin exception
+      // ancestor's initializer; the class-id argument channel stamps the
+      // source class's own id into the header.
+      if (std::optional<std::string> ancestor =
+              RuntimeBundleLowerer::exceptionAncestorContract(classOp))
+        initializer = manifest.initializer(*ancestor, *methodName);
+    }
+  if (!initializer)
+    if (py::ClassOp classOp = RuntimeBundleLowerer::classForContract(
+            op.getInstance().getType())) {
       builder.setInsertionPoint(op);
       mlir::FailureOr<RuntimeValue> value =
           RuntimeBundleLowerer::materializeClassObjectValue(
@@ -396,8 +415,17 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
     return RuntimeBundleLowerer::lowerErasedCtypesInit(op, *instance, sources);
   }
 
+  // Exception-backed classes skip the field-record path: their __init__ is
+  // the builtin exception ancestor's (message binding), reached through the
+  // generic manifest method call below.
+  py::ClassOp instanceClassOp =
+      RuntimeBundleLowerer::classForContract(op.getInstance().getType());
   if (py::ClassOp classOp =
-          RuntimeBundleLowerer::classForContract(op.getInstance().getType())) {
+          instanceClassOp &&
+                  !RuntimeBundleLowerer::exceptionAncestorContract(
+                      instanceClassOp)
+              ? instanceClassOp
+              : py::ClassOp()) {
     if (*methodName != "__init__")
       return op.emitError()
              << "class init lowering expected __init__, got " << *methodName;

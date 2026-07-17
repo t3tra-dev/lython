@@ -359,6 +359,151 @@ void initializeObjectHeader(mlir::OpBuilder &builder, mlir::Location loc,
 
 } // namespace
 
+std::optional<std::string>
+RuntimeBundleLowerer::exceptionAncestorContract(py::ClassOp classOp) const {
+  if (!classOp)
+    return std::nullopt;
+  auto mroNames = classOp->getAttrOfType<mlir::ArrayAttr>("mro_names");
+  if (!mroNames)
+    return std::nullopt;
+  for (mlir::Attribute attr : llvm::drop_begin(mroNames.getValue())) {
+    auto name = mlir::dyn_cast<mlir::StringAttr>(attr);
+    if (!name)
+      continue;
+    if (RuntimeBundleLowerer::classForContract(
+            runtimeContractType(context, name.getValue())))
+      continue; // source base: keep walking to the manifest ancestor
+    if (manifest.primitive(name.getValue(), "raise"))
+      return name.getValue().str();
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string>
+RuntimeBundleLowerer::exceptionAncestorContractFor(mlir::Type type) const {
+  return RuntimeBundleLowerer::exceptionAncestorContract(
+      RuntimeBundleLowerer::classForContract(type));
+}
+
+std::optional<std::int64_t>
+RuntimeBundleLowerer::userExceptionParentClassId(py::ClassOp classOp) const {
+  if (!classOp)
+    return std::nullopt;
+  auto mroNames = classOp->getAttrOfType<mlir::ArrayAttr>("mro_names");
+  if (!mroNames)
+    return std::nullopt;
+  for (mlir::Attribute attr : llvm::drop_begin(mroNames.getValue())) {
+    auto name = mlir::dyn_cast<mlir::StringAttr>(attr);
+    if (!name)
+      continue;
+    if (py::ClassOp baseOp = RuntimeBundleLowerer::classForContract(
+            runtimeContractType(context, name.getValue()))) {
+      if (RuntimeBundleLowerer::exceptionAncestorContract(baseOp))
+        return RuntimeBundleLowerer::runtimeClassIdForClass(baseOp);
+      continue;
+    }
+    if (manifest.primitive(name.getValue(), "raise"))
+      return manifest.classId(name.getValue());
+  }
+  return std::nullopt;
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::synthesizeUserExceptionHooks() {
+  struct Entry {
+    std::int64_t classId;
+    std::int64_t parentId;
+    std::string name;
+  };
+  llvm::SmallVector<Entry, 8> entries;
+  mlir::LogicalResult collected = mlir::success();
+  module.walk([&](py::ClassOp classOp) {
+    if (mlir::failed(collected))
+      return;
+    if (!RuntimeBundleLowerer::exceptionAncestorContract(classOp))
+      return;
+    std::optional<std::int64_t> classId =
+        RuntimeBundleLowerer::runtimeClassIdForClass(classOp);
+    std::optional<std::int64_t> parentId =
+        RuntimeBundleLowerer::userExceptionParentClassId(classOp);
+    if (!classId || !parentId) {
+      classOp.emitError() << "user exception class has no resolvable class "
+                             "id chain";
+      collected = mlir::failure();
+      return;
+    }
+    entries.push_back(Entry{
+        *classId, *parentId,
+        py::contracts::manifestClassNameForContract(classOp.getSymName())});
+  });
+  if (mlir::failed(collected))
+    return mlir::failure();
+
+  mlir::OpBuilder builder(context);
+  builder.setInsertionPointToEnd(module.getBody());
+  mlir::Location loc = module.getLoc();
+  mlir::Type i64 = builder.getI64Type();
+
+  {
+    auto fn = mlir::func::FuncOp::create(
+        builder, loc, "__ly_user_exception_base_class_id",
+        builder.getFunctionType({i64}, {i64}));
+    mlir::Block *entry = fn.addEntryBlock();
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(entry);
+    mlir::Value classId = entry->getArgument(0);
+    mlir::Value result =
+        mlir::arith::ConstantIntOp::create(builder, loc, 0, 64);
+    for (const Entry &hookEntry : entries) {
+      mlir::Value expected = mlir::arith::ConstantIntOp::create(
+          builder, loc, hookEntry.classId, 64);
+      mlir::Value parent = mlir::arith::ConstantIntOp::create(
+          builder, loc, hookEntry.parentId, 64);
+      mlir::Value matches = mlir::arith::CmpIOp::create(
+          builder, loc, mlir::arith::CmpIPredicate::eq, classId, expected);
+      result = mlir::arith::SelectOp::create(builder, loc, matches, parent,
+                                             result);
+    }
+    mlir::func::ReturnOp::create(builder, loc, mlir::ValueRange{result});
+  }
+
+  {
+    auto ptrType = mlir::LLVM::LLVMPointerType::get(context);
+    auto fn = mlir::func::FuncOp::create(
+        builder, loc, "__ly_user_exception_class_name",
+        builder.getFunctionType({i64}, {ptrType}));
+    mlir::Block *entry = fn.addEntryBlock();
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(entry);
+    mlir::Value classId = entry->getArgument(0);
+    mlir::Value result = mlir::LLVM::ZeroOp::create(builder, loc, ptrType);
+    for (auto [index, hookEntry] : llvm::enumerate(entries)) {
+      std::string text = hookEntry.name + '\0';
+      std::string symbol =
+          ".ly_user_exc_name." + std::to_string(hookEntry.classId);
+      if (!module.lookupSymbol(symbol)) {
+        mlir::OpBuilder::InsertionGuard globalGuard(builder);
+        builder.setInsertionPointToEnd(module.getBody());
+        auto arrayType = mlir::LLVM::LLVMArrayType::get(
+            mlir::IntegerType::get(context, 8), text.size());
+        mlir::LLVM::GlobalOp::create(builder, loc, arrayType,
+                                     /*isConstant=*/true,
+                                     mlir::LLVM::Linkage::Private, symbol,
+                                     builder.getStringAttr(text));
+      }
+      mlir::Value address = mlir::LLVM::AddressOfOp::create(
+          builder, loc, ptrType, mlir::FlatSymbolRefAttr::get(context, symbol));
+      mlir::Value expected = mlir::arith::ConstantIntOp::create(
+          builder, loc, hookEntry.classId, 64);
+      mlir::Value matches = mlir::arith::CmpIOp::create(
+          builder, loc, mlir::arith::CmpIPredicate::eq, classId, expected);
+      result = mlir::arith::SelectOp::create(builder, loc, matches, address,
+                                             result);
+    }
+    mlir::func::ReturnOp::create(builder, loc, mlir::ValueRange{result});
+  }
+  return mlir::success();
+}
+
 std::optional<std::int64_t>
 RuntimeBundleLowerer::runtimeClassIdForClass(py::ClassOp classOp) const {
   if (!classOp)
@@ -1026,6 +1171,10 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassDeallocators() {
       continue;
     if (moduleHasDeallocatorForContract(module, contract))
       continue;
+    // Exception-backed classes share the runtime exception object; its
+    // BaseException deallocator releases them (shape-matched fallback).
+    if (RuntimeBundleLowerer::exceptionAncestorContract(classOp))
+      continue;
 
     mlir::Type contractType = runtimeContractType(context, contract);
     mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> valueTypes =
@@ -1348,6 +1497,16 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHook(
                 "builtins.BaseException"))
           return;
         entries.push_back(HookEntry{classIdAttr.getInt(), baseCallee});
+      });
+      // Source exception classes: same shared callee, compiler-assigned ids.
+      module.walk([&](py::ClassOp classOp) {
+        if (!RuntimeBundleLowerer::exceptionAncestorContract(classOp))
+          return;
+        std::optional<std::int64_t> classId =
+            RuntimeBundleLowerer::runtimeClassIdForClass(classOp);
+        if (!classId || !seenIds.insert(*classId).second)
+          return;
+        entries.push_back(HookEntry{*classId, baseCallee});
       });
     }
   }
