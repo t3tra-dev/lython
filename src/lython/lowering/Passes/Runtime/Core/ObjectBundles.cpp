@@ -439,9 +439,14 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultValue(
       return RuntimeBundleLowerer::makePrimitiveI64Bundle(
           op, runtimeContractType(context, runtimeContractName(resultType)),
           call->getResult(0), call->getResult(1), bundle);
-    return RuntimeBundleLowerer::makeObjectBundle(
-        op, runtimeContractType(context, runtimeContractName(resultType)),
-        call->getResults(), bundle);
+    // The provider returns through the ordinary function-target ABI, which
+    // may append primitive-i64 evidence lanes after the object values (the
+    // int hybrid): consume it exactly like any other call result instead of
+    // assuming the raw result list IS the object shape.
+    return RuntimeBundleLowerer::consumeFunctionTargetCallResult(
+        op, value.getValue(), *call, resultType, {},
+        /*applyReturnedSummaries=*/false, "default provider result ABI",
+        bundle);
   }
   if (spelling == "unsupported") {
     auto value = dict.getAs<mlir::StringAttr>("value");
