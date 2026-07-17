@@ -3274,29 +3274,37 @@ module attributes {
     func.return %header, %bytes : memref<2xi64>, memref<?xi8>
   }
 
+  // Printability query implemented beside the UCD tables
+  // (runtime/modules/unicodedata.mlir).
+  func.func private @__ly_ucd_is_printable(%cp: i64) -> i1
+
   // Repr expansion width in characters for a code point that is neither the
-  // chosen quote nor a backslash: 1 = pass through, 2 = \t \n \r, 4 = \xNN.
-  // Non-ASCII code points pass through for now (the UCD printability upgrade
-  // swaps this helper's body, not its callers).
+  // chosen quote nor a backslash: 1 = pass through (UCD-printable, matching
+  // CPython's unicode_repr), 2 = \t \n \r, 4/6/10 = \xNN / \uNNNN /
+  // \U00NNNNNN for non-printable code points by magnitude.
   func.func private @__ly_unicode_repr_class(%cp: i64) -> i64 {
     %one = arith.constant 1 : i64
     %two = arith.constant 2 : i64
     %four = arith.constant 4 : i64
+    %six = arith.constant 6 : i64
+    %ten = arith.constant 10 : i64
     %tab = arith.constant 9 : i64
     %nl = arith.constant 10 : i64
     %cr = arith.constant 13 : i64
-    %space = arith.constant 32 : i64
-    %del = arith.constant 127 : i64
+    %latin1_limit = arith.constant 256 : i64
+    %ucs2_limit = arith.constant 65536 : i64
     %is_tab = arith.cmpi eq, %cp, %tab : i64
     %is_nl = arith.cmpi eq, %cp, %nl : i64
     %is_cr = arith.cmpi eq, %cp, %cr : i64
     %tn = arith.ori %is_tab, %is_nl : i1
     %is_tnr = arith.ori %tn, %is_cr : i1
-    %lt_space = arith.cmpi ult, %cp, %space : i64
-    %is_del = arith.cmpi eq, %cp, %del : i64
-    %is_hex = arith.ori %lt_space, %is_del : i1
-    %hex_or_pass = arith.select %is_hex, %four, %one : i64
-    %class = arith.select %is_tnr, %two, %hex_or_pass : i64
+    %printable = func.call @__ly_ucd_is_printable(%cp) : (i64) -> i1
+    %fits1 = arith.cmpi ult, %cp, %latin1_limit : i64
+    %fits2 = arith.cmpi ult, %cp, %ucs2_limit : i64
+    %six_or_ten = arith.select %fits2, %six, %ten : i64
+    %escape = arith.select %fits1, %four, %six_or_ten : i64
+    %escape_or_pass = arith.select %printable, %one, %escape : i64
+    %class = arith.select %is_tnr, %two, %escape_or_pass : i64
     func.return %class : i64
   }
 

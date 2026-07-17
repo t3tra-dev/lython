@@ -231,3 +231,4 @@ Mkfile.old
 dkms.conf
 
 # --- End of C.gitignore ---
+tools/.ucd-cache/

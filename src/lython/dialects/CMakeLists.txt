@@ -15,6 +15,12 @@ include_directories(${CMAKE_CURRENT_BINARY_DIR})
 file(GLOB LYTHON_PROTOCOL_MANIFEST_MLIR CONFIGURE_DEPENDS
   "${CMAKE_SOURCE_DIR}/src/lython/runtime/modules/*.mlir"
 )
+# _ucd.mlir carries no typing metadata, only the generated Unicode tables;
+# embedding it here would re-parse ~300KB of dense attributes as text in
+# every compiler process for nothing (the runtime import path embeds it as
+# bytecode separately).
+list(REMOVE_ITEM LYTHON_PROTOCOL_MANIFEST_MLIR
+  "${CMAKE_SOURCE_DIR}/src/lython/runtime/modules/_ucd.mlir")
 list(SORT LYTHON_PROTOCOL_MANIFEST_MLIR)
 
 set(LYTHON_PROTOCOL_MANIFEST_SOURCES_CPP
