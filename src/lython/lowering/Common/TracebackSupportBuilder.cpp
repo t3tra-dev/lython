@@ -1038,17 +1038,20 @@ void buildLeadingWhitespace(SupportBuilder &b) {
                                mlir::ValueRange{done->getArgument(0)});
 }
 
-// void print_marker(ptr line, i32 col, i32 endCol): the CPython-style anchor
-// underline for the failing range on stderr. Mirrors CPython 3.14's display
-// heuristics on the source text alone (the runtime has no instruction
-// anchors): a call/subscript range splits at its first `(`/`[` into
-// `~~~^^^`, an operator range puts `^` over the operator run, and a range
-// with no anchor renders all carets — unless it covers the whole line, which
-// CPython suppresses entirely.
+// void print_marker(ptr line, i32 col, i32 endCol, i32 mode): the
+// CPython-style anchor underline for the failing range on stderr. Mirrors
+// CPython 3.14's display heuristics on the source text alone (the runtime
+// has no instruction anchors): a call/subscript range splits at its first
+// `(`/`[` into `~~~^^^`, an operator range puts `^` over the operator run,
+// and a range with no anchor renders all carets — unless it covers the
+// whole line, which CPython suppresses entirely. Mode 2 skips the segment
+// heuristics (plain range carets only): CPython extracts anchors only from
+// call/binop/subscript nodes, so a yield delivered by throw() must not
+// split at a `(` its operand happens to contain.
 void buildPrintMarker(SupportBuilder &b) {
   auto fn = b.beginFunction(
       "print_marker",
-      b.builder.getFunctionType({b.ptr(), b.i32(), b.i32()}, {}),
+      b.builder.getFunctionType({b.ptr(), b.i32(), b.i32(), b.i32()}, {}),
       /*isPrivate=*/true);
   mlir::Block *entry = fn.addEntryBlock();
   mlir::Region &body = fn.getBody();
@@ -1163,8 +1166,11 @@ void buildPrintMarker(SupportBuilder &b) {
       b.builder, b.loc, plusOneOver, length, startPlusOne);
   mlir::Value markerEnd = mlir::arith::SelectOp::create(
       b.builder, b.loc, endTooSmall, plusOneClamped, endOrLength);
-  mlir::cf::BranchOp::create(b.builder, b.loc, splitHead,
-                             mlir::ValueRange{start});
+  mlir::Value plainRange = b.cmpi(mlir::arith::CmpIPredicate::eq,
+                                  entry->getArgument(3), b.iconst32(2));
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, plainRange, noAnchor,
+                                 mlir::ValueRange{}, splitHead,
+                                 mlir::ValueRange{start});
 
   // Anchor pass 1: a call/subscript splits at its first `(` / `[`; the head
   // renders as tildes, the trailer as carets.
@@ -1400,7 +1406,7 @@ void buildPrintTraceFrame(SupportBuilder &b) {
   mlir::Value endAdjusted = mlir::arith::SelectOp::create(
       b.builder, b.loc, endPast, endShift, b.iconst32(0));
   b.call("print_marker", mlir::TypeRange{},
-         mlir::ValueRange{trimmed, colAdjusted, endAdjusted});
+         mlir::ValueRange{trimmed, colAdjusted, endAdjusted, hasMarker});
   mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(done);

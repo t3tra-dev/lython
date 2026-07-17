@@ -126,7 +126,11 @@ RuntimeBundleLowerer::emitTracebackFrame(mlir::Operation *op,
       if (range->endLine == range->line && range->endColumn > range->column) {
         endLine = range->endLine;
         endColumn = range->endColumn;
-        hasMarker = 1;
+        // Marker 2 = plain range carets: CPython extracts `~`/`^` anchors
+        // only from call/binop/subscript nodes, so a suspension frame
+        // (throw() delivery at a yield) must not split at punctuation its
+        // operand happens to contain.
+        hasMarker = mlir::isa<py::YieldValueOp>(op) ? 2 : 1;
       }
     }
   }

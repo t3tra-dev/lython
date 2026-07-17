@@ -1387,6 +1387,12 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeBodies() {
                                                 /*withElseRegion=*/false);
         builder.setInsertionPoint(
             injectIf.getThenRegion().front().getTerminator());
+        // CPython materializes the suspended frame in the delivered
+        // exception's traceback (the yield line); the pending token IS the
+        // delivery, so it must not be stashed as its own context.
+        if (mlir::failed(emitTracebackFrame(yield.getOperation(),
+                                            /*stashCurrentException=*/false)))
+          return mlir::failure();
         emitTryCallSiteMarkerIfNeeded(loc);
         mlir::func::CallOp::create(builder, loc,
                                    getOrCreateRethrowCurrent(module, builder),
@@ -2877,8 +2883,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStateMachineGeneratorThrow(
 
   builder.setInsertionPoint(op);
   mlir::Location loc = op.getLoc();
-  if (mlir::failed(emitTracebackFrame(op.getOperation())))
-    return mlir::failure();
+  // No traceback frame or context stash here: the throw-site frame is
+  // pushed by the caller's unwind pad only if the exception actually comes
+  // back out (a throw the body catches shows no traceback), and the
+  // caller's handled exception is parked/reconciled by the driver's own
+  // stash — stashing it as __context__ up front would strand it in the
+  // chain globals when the throw returns normally.
   llvm::SmallVector<mlir::Value, 16> operands;
   operands.push_back(receiver.physicalValues().front());
   if (receiver.generatorSourceBundles.size() != info.argumentCount)

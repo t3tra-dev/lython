@@ -58,10 +58,17 @@ bool isGeneratorInternalEdge(const llvm::CallInst &call) {
     return false;
   llvm::StringRef callerName = call.getFunction()->getName();
   llvm::StringRef calleeName = callee->getName();
-  if (!callerName.contains("__lyrt_gen") || !calleeName.contains("__lyrt_gen"))
+  std::size_t callerMark = callerName.find("__lyrt_gen");
+  std::size_t calleeMark = calleeName.find("__lyrt_gen");
+  if (callerMark == llvm::StringRef::npos ||
+      calleeMark == llvm::StringRef::npos)
     return false;
-  return callerName.starts_with(calleeName) ||
-         calleeName.starts_with(callerName);
+  // Why family-root comparison instead of caller/callee prefixing: sibling
+  // drivers (`__throw` calling `__advance` calling `__step`) share the root
+  // but neither name prefixes the other, and their edges are exactly the
+  // plumbing this predicate must hide.
+  return callerName.take_front(callerMark) ==
+         calleeName.take_front(calleeMark);
 }
 
 bool isPythonFunction(mlir::LLVM::LLVMFuncOp function) {
