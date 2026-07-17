@@ -1,0 +1,7 @@
+10
+15
+22
+1
+2
+304
+TypeError: can't send non-None value to a just-started generator

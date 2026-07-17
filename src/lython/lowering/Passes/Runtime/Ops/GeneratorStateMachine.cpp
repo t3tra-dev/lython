@@ -210,6 +210,9 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
       clone->removeAttr(kGeneratorPublicResultAttr);
       clone->setAttr(kPrimitiveI64CloneAttr,
                      builder.getStringAttr(body.getSymName()));
+      // The affine-ownership verifier keys its generator-frame rule
+      // (suspension boundaries carry NonObject lanes only) on this marker.
+      clone->setAttr("ly.generator.resume", builder.getUnitAttr());
       mlir::SymbolTable::setSymbolVisibility(
           clone, mlir::SymbolTable::Visibility::Private);
       builder.insert(clone);
