@@ -1481,9 +1481,13 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedReprHook() {
     return mlir::failure();
   // The hook forwards the manifest __repr__'s owned str result (header at 0).
   if (auto hook = module.lookupSymbol<mlir::func::FuncOp>(
-          "__ly_repr_boxed_by_contract"))
+          "__ly_repr_boxed_by_contract")) {
+    mlir::OpBuilder attrBuilder(context);
     hook->setAttr("ly.ownership.owned_results",
-                  mlir::OpBuilder(context).getI64ArrayAttr({0}));
+                  attrBuilder.getI64ArrayAttr({0}));
+    hook->setAttr("ly.runtime.result_contract",
+                  attrBuilder.getStringAttr("builtins.str"));
+  }
   return mlir::success();
 }
 

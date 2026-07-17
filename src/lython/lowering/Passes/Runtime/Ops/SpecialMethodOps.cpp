@@ -228,11 +228,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
   if ((structuralMutation || op.getNumResults() == 0) && runtimeDictInsert) {
     // Runtime-mode dict (loop-built): contents are only known to the
     // runtime. Insert through the runtime probe; the rebind result carries
-    // the (possibly reallocated) representation.
-    if (index.contractName() != "builtins.str")
-      return op.emitError()
-             << "runtime-mode dict assignment requires str keys, got "
-             << index.objectValue.contract;
+    // the (possibly reallocated) representation. Keys may be any hashable
+    // class — the probe hashes the transient box and raises TypeError for
+    // unhashable ones.
     std::optional<RuntimeSymbol> setItemBox =
         manifest.primitive("builtins.dict", "setitem_box");
     if (!setItemBox)
@@ -485,6 +483,57 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerDelItem(py::DelItemOp op) {
   const RuntimeBundle &container = *sources[0];
   const RuntimeBundle &index = *sources[1];
   if (container.kind == RuntimeBundle::Kind::Object &&
+      container.contractName() == "builtins.dict" &&
+      !container.mappingEvidenceBacked && container.mappingKeys.empty() &&
+      container.physicalValues().size() >= 5 &&
+      index.kind == RuntimeBundle::Kind::Object) {
+    // Runtime-mode dict delete: hash probe with a BORROWED transient key
+    // box; the runtime raises KeyError (with the key's repr) on a miss and
+    // compacts the dense entries in place, so the container's SSA
+    // representation is unchanged.
+    std::optional<RuntimeSymbol> delItemBox =
+        manifest.primitive("builtins.dict", "delitem_box");
+    if (!delItemBox)
+      return op.emitError()
+             << "runtime manifest has no dict delitem_box primitive";
+    builder.setInsertionPoint(op);
+    mlir::Location loc = op.getLoc();
+    mlir::FailureOr<RuntimeBundle> payload =
+        RuntimeBundleLowerer::materializePayloadObjectBundle(op, index);
+    if (mlir::failed(payload))
+      return mlir::failure();
+    mlir::MemRefType boxType = box_abi::boxWordsType(builder);
+    mlir::Value box =
+        mlir::memref::AllocaOp::create(builder, loc, boxType).getResult();
+    mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
+        RuntimeBundleLowerer::objectPayloadHandleWords(op, *payload,
+                                                       /*ownsPayload=*/false);
+    if (mlir::failed(words))
+      return mlir::failure();
+    for (auto [wordIndex, word] : llvm::enumerate(*words)) {
+      mlir::Value slot = mlir::arith::ConstantIndexOp::create(
+          builder, loc, static_cast<std::int64_t>(wordIndex));
+      mlir::memref::StoreOp::create(builder, loc, word, box, slot);
+    }
+    bool ownsProbeKey =
+        payload->objectValue.ownership == ownership::OwnershipKind::Own;
+    if (!ownsProbeKey &&
+        mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
+            op, *payload, "dict.delitem.key")))
+      return mlir::failure();
+    llvm::SmallVector<mlir::Value, 8> operands(
+        container.physicalValues().begin(), container.physicalValues().end());
+    operands.push_back(box);
+    RuntimeBundleLowerer::createRuntimeCall(loc, *delItemBox, operands);
+    if (mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
+            op, *payload, "dict.delitem.key")))
+      return mlir::failure();
+    for (mlir::Value result : op->getResults())
+      valueBundles[result] = container;
+    erase.push_back(op);
+    return mlir::success();
+  }
+  if (container.kind == RuntimeBundle::Kind::Object &&
       container.contractName() == "builtins.list") {
     std::optional<std::int64_t> rawIndex =
         integerLiteralFromValue(op.getIndex());
@@ -671,23 +720,26 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerContains(py::ContainsOp op) {
     return mlir::failure();
   const RuntimeBundle container = *sources.front();
   const RuntimeBundle item = *sources.back();
-  if (container.kind == RuntimeBundle::Kind::Object &&
-      container.contractName() == "builtins.set" &&
-      container.physicalValues().size() >= 3 &&
+  bool runtimeSetProbe = container.kind == RuntimeBundle::Kind::Object &&
+                         container.contractName() == "builtins.set" &&
+                         container.physicalValues().size() >= 3;
+  bool runtimeDictProbe = container.kind == RuntimeBundle::Kind::Object &&
+                          container.contractName() == "builtins.dict" &&
+                          !container.mappingEvidenceBacked &&
+                          container.mappingKeys.empty() &&
+                          container.physicalValues().size() >= 5;
+  if ((runtimeSetProbe || runtimeDictProbe) &&
       item.kind == RuntimeBundle::Kind::Object) {
-    // Runtime set membership: probe with a BORROWED transient element box,
-    // then pin both the container and the probed item past the call (the box
-    // holds raw pointer words the liveness cannot see).
-    std::string elementContract = item.contractName();
-    if (elementContract != "builtins.int" && elementContract != "builtins.str")
-      return op.emitError()
-             << "set membership currently requires int or str evidence, got "
-             << item.objectValue.contract;
+    // Runtime set/dict membership: hash probe with a BORROWED transient
+    // element box (any hashable class; unhashable probes raise TypeError in
+    // the runtime), then pin both the container and the probed item past the
+    // call (the box holds raw pointer words the liveness cannot see).
     std::optional<RuntimeSymbol> containsBox =
-        manifest.primitive("builtins.set", "contains_box");
+        manifest.primitive(container.contractName(), "contains_box");
     if (!containsBox)
-      return op.emitError()
-             << "runtime manifest has no set contains_box primitive";
+      return op.emitError() << "runtime manifest has no "
+                            << container.contractName()
+                            << " contains_box primitive";
     builder.setInsertionPoint(op);
     mlir::Location loc = op.getLoc();
     mlir::FailureOr<RuntimeBundle> payload =
@@ -707,18 +759,28 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerContains(py::ContainsOp op) {
           builder, loc, static_cast<std::int64_t>(wordIndex));
       mlir::memref::StoreOp::create(builder, loc, word, box, slot);
     }
-    llvm::SmallVector<mlir::Value, 6> operands(
+    bool ownsProbeItem =
+        payload->objectValue.ownership == ownership::OwnershipKind::Own;
+    if (!ownsProbeItem &&
+        mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
+            op, *payload, "contains.probe")))
+      return mlir::failure();
+    llvm::SmallVector<mlir::Value, 8> operands(
         container.physicalValues().begin(), container.physicalValues().end());
     operands.push_back(box);
     mlir::func::CallOp call =
         RuntimeBundleLowerer::createRuntimeCall(loc, *containsBox, operands);
+    if (mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
+            op, *payload, "contains.probe")))
+      return mlir::failure();
     auto pinObject = [&](const RuntimeBundle &object,
                          llvm::StringRef pinMethod) -> mlir::LogicalResult {
       std::optional<RuntimeSymbol> method =
           manifest.method(object.contractName(), pinMethod);
       if (!method)
-        return op.emitError() << "set membership needs " << object.contractName()
-                              << "." << pinMethod << " to pin its operand";
+        return op.emitError() << "membership probe needs "
+                              << object.contractName() << "." << pinMethod
+                              << " to pin its operand";
       llvm::SmallVector<const RuntimeBundle *, 1> pinSources{&object};
       llvm::SmallVector<mlir::Value, 4> pinOperands;
       if (mlir::failed(buildRuntimeCallOperands(op, *method, pinSources,
@@ -729,10 +791,6 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerContains(py::ContainsOp op) {
       return mlir::success();
     };
     if (mlir::failed(pinObject(container, "__len__")))
-      return mlir::failure();
-    if (mlir::failed(pinObject(
-            *payload,
-            elementContract == "builtins.str" ? "__len__" : "__int__")))
       return mlir::failure();
     op.getResult().replaceAllUsesWith(call.getResult(0));
     erase.push_back(op);
@@ -869,13 +927,19 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIter(py::IterOp op) {
       mlir::func::FuncOp function = op->getParentOfType<mlir::func::FuncOp>();
       if (!function)
         return op.emitError() << "list iteration requires a function context";
+      // dict/set iterators additionally remember the container's size at
+      // creation (cell word 1): CPython raises RuntimeError when the size
+      // changes during iteration, while list iteration legally re-checks the
+      // live length each step.
+      bool guardsMutation = runtimeDictIterable || runtimeSetIterable;
       mlir::Value cell;
       {
         mlir::OpBuilder::InsertionGuard guard(builder);
         builder.setInsertionPointToStart(&function.getBody().front());
         cell = mlir::memref::AllocaOp::create(
                    builder, op.getLoc(),
-                   mlir::MemRefType::get({1}, builder.getI64Type()))
+                   mlir::MemRefType::get({guardsMutation ? 2 : 1},
+                                         builder.getI64Type()))
                    .getResult();
       }
       builder.setInsertionPoint(op);
@@ -884,6 +948,16 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIter(py::IterOp op) {
       mlir::Value slot =
           mlir::arith::ConstantIndexOp::create(builder, op.getLoc(), 0);
       mlir::memref::StoreOp::create(builder, op.getLoc(), zero, cell, slot);
+      if (guardsMutation) {
+        mlir::Value meta = iterable->physicalValues()[1];
+        mlir::Value initial =
+            mlir::memref::LoadOp::create(builder, op.getLoc(), meta, slot)
+                .getResult();
+        mlir::Value initialSlot =
+            mlir::arith::ConstantIndexOp::create(builder, op.getLoc(), 1);
+        mlir::memref::StoreOp::create(builder, op.getLoc(), initial, cell,
+                                      initialSlot);
+      }
       RuntimeBundle iterator = *iterable;
       iterator.evidenceIteratorCell = cell;
       valueBundles[op.getResult()] = std::move(iterator);
@@ -1001,6 +1075,34 @@ RuntimeBundleLowerer::lowerListRuntimeNext(py::NextOp op,
   mlir::Value meta = iterator.physicalValues()[1];
   mlir::Value length =
       mlir::memref::LoadOp::create(builder, loc, meta, slot).getResult();
+  // dict/set iteration: raise RuntimeError when the container's size changed
+  // since the iterator was created (CPython's mutation-during-iteration
+  // guard; the size at creation sits in cell word 1).
+  bool guardsMutation = iterator.contractName() == "builtins.dict" ||
+                        iterator.contractName() == "builtins.set";
+  if (guardsMutation) {
+    mlir::Value initialSlot =
+        mlir::arith::ConstantIndexOp::create(builder, loc, 1);
+    mlir::Value initial =
+        mlir::memref::LoadOp::create(builder, loc, cell, initialSlot)
+            .getResult();
+    mlir::Value changed = mlir::arith::CmpIOp::create(
+        builder, loc, mlir::arith::CmpIPredicate::ne, length, initial);
+    auto changedGuard = mlir::scf::IfOp::create(
+        builder, loc, mlir::TypeRange{}, changed, /*withElseRegion=*/false);
+    {
+      mlir::OpBuilder::InsertionGuard insertionGuard(builder);
+      builder.setInsertionPointToStart(&changedGuard.getThenRegion().front());
+      llvm::StringRef message =
+          iterator.contractName() == "builtins.dict"
+              ? "dictionary changed size during iteration"
+              : "Set changed size during iteration";
+      if (mlir::failed(
+              emitRuntimeException(op, "builtins.RuntimeError", message)))
+        return mlir::failure();
+    }
+    builder.setInsertionPointAfter(changedGuard);
+  }
   mlir::Value valid = mlir::arith::CmpIOp::create(
       builder, loc, mlir::arith::CmpIPredicate::slt, position, length);
   mlir::Value one = mlir::arith::ConstantIntOp::create(builder, loc, 1, 64);
@@ -1016,6 +1118,44 @@ RuntimeBundleLowerer::lowerListRuntimeNext(py::NextOp op,
   mlir::Value safe =
       mlir::arith::SelectOp::create(builder, loc, valid, position, zero64)
           .getResult();
+
+  if (runtimeContractName(elementContract) == "builtins.object") {
+    // Erased read lane: box the slot's canonical payload handle; the
+    // exhausted branch yields the None handle inside the primitive, so no
+    // dead placeholder machinery is needed.
+    std::optional<RuntimeSymbol> fromSlot =
+        manifest.primitive("builtins.object", "from_slot");
+    if (!fromSlot)
+      return op.emitError()
+             << "runtime manifest has no object from_slot primitive";
+    mlir::func::CallOp boxed = RuntimeBundleLowerer::createRuntimeCall(
+        loc, *fromSlot,
+        mlir::ValueRange{iterator.physicalValues()[2], safe, valid});
+    RuntimeValue element{elementContract,
+                         {boxed.getResult(0)},
+                         ownership::logicalOwnershipKind(elementContract,
+                                                         /*ownsObject=*/false)};
+    if (mlir::failed(bindEvidenceObjectResult(op, op.getElement(),
+                                              "runtime list element", element)))
+      return mlir::failure();
+    std::optional<RuntimeSymbol> lenPin =
+        manifest.method(iterator.contractName(), "__len__");
+    if (!lenPin)
+      return op.emitError()
+             << "list iteration needs a runtime __len__ to pin the container";
+    llvm::SmallVector<const RuntimeBundle *, 1> pinSources{&iterator};
+    llvm::SmallVector<mlir::Value, 4> pinOperands;
+    if (mlir::failed(buildRuntimeCallOperands(op, *lenPin, pinSources,
+                                              pinOperands,
+                                              /*allowUnusedSources=*/false)))
+      return mlir::failure();
+    builder.setInsertionPoint(op);
+    RuntimeBundleLowerer::createRuntimeCall(loc, *lenPin, pinOperands);
+    op.getValid().replaceAllUsesWith(valid);
+    valueBundles[op.getNext()] = iterator;
+    erase.push_back(op);
+    return mlir::success();
+  }
 
   mlir::FailureOr<RuntimeValue> dead =
       RuntimeBundleLowerer::materializeNonOwningDeadObjectValue(

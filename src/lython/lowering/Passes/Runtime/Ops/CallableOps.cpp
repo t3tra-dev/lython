@@ -211,11 +211,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
         RuntimeBundleLowerer::materializePayloadObjectBundle(op, *sources[1]);
     if (mlir::failed(payload))
       return mlir::failure();
-    std::string elementContract = payload->contractName();
-    if (elementContract != "builtins.int" && elementContract != "builtins.str")
-      return op.emitError()
-             << "set elements currently require int or str evidence, got "
-             << payload->objectValue.contract;
+    // Any hashable class boxes: the runtime add hashes the box and raises
+    // TypeError for unhashable elements.
     if (mlir::failed(
             RuntimeBundleLowerer::retainAggregateSlot(op, *payload, "set.add")))
       return mlir::failure();

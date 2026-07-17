@@ -616,6 +616,62 @@ module attributes {
 
   func.func private @LyObject_ReleaseBoxedPayloadRaw(%box: memref<16xi64>)
 
+  // Liveness pin: a no-op call whose operand keeps a box alive past calls
+  // that consumed only its raw pointer words (the same device the container
+  // paths use with __len__).
+  func.func @LyObject_Touch(%box: memref<16xi64>) attributes {ly.runtime.contract = "builtins.object", ly.runtime.primitive = "touch"} {
+    func.return
+  }
+
+  // "<object object at 0x"
+  memref.global "private" constant @__ly_object_repr_prefix : memref<20xi8> = dense<[60, 111, 98, 106, 101, 99, 116, 32, 111, 98, 106, 101, 99, 116, 32, 97, 116, 32, 48, 120]>
+  // "None"
+  memref.global "private" constant @__ly_object_repr_none : memref<4xi8> = dense<[78, 111, 110, 101]>
+
+  // repr of an erased object box: dispatch the payload class through the
+  // boxed-repr hook; the None handle prints "None"; anything unhandled gets
+  // the CPython default `<object object at 0x...>` form.
+  func.func @LyObject_BoxedRepr(%box: memref<16xi64>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %zero = arith.constant 0 : i64
+    %class_id = memref.load %box[%c1] : memref<16xi64>
+    %entity = memref.load %box[%c2] : memref<16xi64>
+    %class_zero = arith.cmpi eq, %class_id, %zero : i64
+    cf.cond_br %class_zero, ^zero_class, ^try_hook
+
+  ^zero_class:
+    %entity_zero = arith.cmpi eq, %entity, %zero : i64
+    cf.cond_br %entity_zero, ^none, ^default
+
+  ^none:
+    %none_static = memref.get_global @__ly_object_repr_none : memref<4xi8>
+    %none_bytes = memref.cast %none_static : memref<4xi8> to memref<?xi8>
+    %none_len = arith.constant 4 : i64
+    %nh, %nb = func.call @LyUnicode_FromBytes(%none_bytes, %c0, %none_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    cf.br ^done(%nh, %nb : memref<2xi64>, memref<?xi8>)
+
+  ^try_hook:
+    %box_idx = memref.extract_aligned_pointer_as_index %box : memref<16xi64> -> index
+    %box_i64 = arith.index_cast %box_idx : index to i64
+    %box_ptr = llvm.inttoptr %box_i64 : i64 to !llvm.ptr
+    %hooked:3 = func.call @__ly_repr_boxed_by_contract(%box_ptr, %class_id) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>, i1)
+    cf.cond_br %hooked#2, ^done(%hooked#0, %hooked#1 : memref<2xi64>, memref<?xi8>), ^default
+
+  ^default:
+    %prefix_static = memref.get_global @__ly_object_repr_prefix : memref<20xi8>
+    %prefix = memref.cast %prefix_static : memref<20xi8> to memref<?xi8>
+    %prefix_len = arith.constant 20 : i64
+    %header_sub = memref.subview %box[0] [2] [1] : memref<16xi64> to memref<2xi64, strided<[1]>>
+    %header_view = memref.cast %header_sub : memref<2xi64, strided<[1]>> to memref<2xi64, strided<[1], offset: ?>>
+    %dh, %db = func.call @LyObject_DefaultRepr(%header_view, %prefix, %prefix_len) : (memref<2xi64, strided<[1], offset: ?>>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    cf.br ^done(%dh, %db : memref<2xi64>, memref<?xi8>)
+
+  ^done(%rh: memref<2xi64>, %rb: memref<?xi8>):
+    func.return %rh, %rb : memref<2xi64>, memref<?xi8>
+  }
+
   func.func @LyObject_DecRef(%box: memref<16xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.object", ly.runtime.deallocator} {
     %storage = memref.cast %box : memref<16xi64> to memref<?xi64>
     %became_zero = func.call @LyObject_ReleaseStorageToZero(%storage) : (memref<?xi64>) -> i1
@@ -6467,6 +6523,70 @@ module attributes {
   // ===== impls: collection =====
   func.func private @LyObject_ReleaseBoxedPayloadArraySlotRaw(%payload: memref<?xi64>, %logical_index: i64)
 
+  // Retain an arbitrary payload entity through its raw address (slot word 2).
+  // Mirrors Ly_IncRef's null/tagged/immortal rules; erased slots have no
+  // memref descriptor to hand the ordinary retain.
+  func.func private @__ly_handle_retain_raw(%entity: i64) {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %immortal = arith.constant 9223372036854775807 : i64
+    %is_null = arith.cmpi eq, %entity, %zero : i64
+    %tag = arith.andi %entity, %one : i64
+    %is_tagged = arith.cmpi eq, %tag, %one : i64
+    %skip = arith.ori %is_null, %is_tagged : i1
+    scf.if %skip {
+    } else {
+      %ptr = llvm.inttoptr %entity : i64 to !llvm.ptr
+      %observed = llvm.load %ptr atomic acquire {alignment = 8 : i64} : !llvm.ptr -> i64
+      %is_immortal = arith.cmpi eq, %observed, %immortal : i64
+      scf.if %is_immortal {
+      } else {
+        %prev = llvm.atomicrmw add %ptr, %one acq_rel : !llvm.ptr, i64
+        %positive = arith.cmpi sgt, %prev, %zero : i64
+        cf.assert %positive, "__ly_handle_retain_raw observed non-positive refcount"
+      }
+    }
+    func.return
+  }
+
+  // Box the canonical payload handle stored at a collection slot into a
+  // fresh owned `builtins.object` box (the erased read lane): the box adopts
+  // one new reference to the payload entity. An invalid slot (exhausted
+  // iteration) yields the all-zero None handle without touching the array.
+  func.func @LyObject_FromSlot(%items: memref<?xi64>, %slot: i64, %valid: i1) -> memref<16xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "from_slot", ly.runtime.result_contract = "builtins.object"} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c16 = arith.constant 16 : index
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %box = memref.alloc() {alignment = 16 : i64, ly.ownership.object_header, ly.ownership.owned_local_object} : memref<16xi64>
+    scf.if %valid {
+      %slot_index = arith.index_cast %slot : i64 to index
+      %base = arith.muli %slot_index, %c16 : index
+      scf.for %w = %c0 to %c16 step %c1 {
+        %src = arith.addi %base, %w : index
+        %word = memref.load %items[%src] : memref<?xi64>
+        memref.store %word, %box[%w] : memref<16xi64>
+      }
+      %refcount_slot = arith.constant 0 : index
+      %owned_slot = arith.constant 14 : index
+      %hash_slot = arith.constant 15 : index
+      memref.store %one, %box[%refcount_slot] : memref<16xi64>
+      memref.store %one, %box[%owned_slot] : memref<16xi64>
+      memref.store %zero, %box[%hash_slot] : memref<16xi64>
+      %entity_slot = arith.constant 2 : index
+      %entity = memref.load %box[%entity_slot] : memref<16xi64>
+      func.call @__ly_handle_retain_raw(%entity) : (i64) -> ()
+    } else {
+      scf.for %w = %c0 to %c16 step %c1 {
+        memref.store %zero, %box[%w] : memref<16xi64>
+      }
+      %refcount_slot = arith.constant 0 : index
+      memref.store %one, %box[%refcount_slot] : memref<16xi64>
+    }
+    func.return %box : memref<16xi64>
+  }
+
   func.func private @LyList_Shape() -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.runtime.contract = "builtins.list", ly.runtime.shape}
 
   func.func private @LyTuple_Shape() -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.runtime.contract = "builtins.tuple", ly.runtime.shape}
@@ -6670,59 +6790,163 @@ module attributes {
 
   func.func private @raw_bytes_equal(%p1: i64, %n1: i64, %p2: i64, %n2: i64) -> i1
 
-  // Probe for a str key among the occupied slots (0..len-1; no deletion
-  // surface). Returns the slot index or -1.
-  // The probe key arrives as raw (pointer, byte length) words from the
-  // C++ lowering, so unlike the set matcher this cannot also compare the
-  // adaptive-width character width: two strings of different widths with
-  // identical code-unit bytes (latin-1 "\x01\x01" vs UCS-2 U+0101)
-  // collide here. Fixing this needs the find_slot ABI to carry the probe
-  // header (planned with the Wave 1 hash-based dict rework).
-  func.func @LyDict_FindSlot(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %keys: memref<?xi64>, %values: memref<?xi64>, %present: memref<?xi64>, %key_ptr: i64, %key_len: i64) -> i64 attributes {ly.runtime.contract = "builtins.dict", ly.runtime.primitive = "find_slot"} {
-    %one = arith.constant 1 : i64
+  // Hash-first probe among the present entries: an entry matches when its
+  // cached hash (key box word 15; 0 = not yet computed, filled lazily so
+  // evidence-written entries join the scheme) equals the probe hash and
+  // __ly_box_equal accepts the pair. Returns the slot index or -1. Dense
+  // slot order is insertion order, so iteration/repr keep the R6 guarantee.
+  func.func private @__ly_dict_probe(%meta: memref<2xi64>, %keys: memref<?xi64>, %present: memref<?xi64>, %key_box: !llvm.ptr, %key_hash: i64) -> i64 {
     %minus_one = arith.constant -1 : i64
-    %handle_words = arith.constant 16 : i64
-    %length_slot = arith.constant 0 : index
+    %zero = arith.constant 0 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %len = memref.load %meta[%length_slot] : memref<2xi64>
+    %c15 = arith.constant 15 : i64
+    %c16 = arith.constant 16 : i64
+    %len = memref.load %meta[%c0] : memref<2xi64>
     %len_index = arith.index_cast %len : i64 to index
+    %keys_idx = memref.extract_aligned_pointer_as_index %keys : memref<?xi64> -> index
+    %keys_i64 = arith.index_cast %keys_idx : index to i64
+    %keys_ptr = llvm.inttoptr %keys_i64 : i64 to !llvm.ptr
     %found = scf.for %i = %c0 to %len_index step %c1 iter_args(%acc = %minus_one) -> (i64) {
-      %ii = arith.index_cast %i : index to i64
-      %base = arith.muli %ii, %handle_words : i64
-      %c5_i64 = arith.constant 5 : i64
-      %c10_i64 = arith.constant 10 : i64
-      %kp_index_i64 = arith.addi %base, %c5_i64 : i64
-      %kl_index_i64 = arith.addi %base, %c10_i64 : i64
-      %kp_index = arith.index_cast %kp_index_i64 : i64 to index
-      %kl_index = arith.index_cast %kl_index_i64 : i64 to index
-      %kp = memref.load %keys[%kp_index] : memref<?xi64>
-      %kl = memref.load %keys[%kl_index] : memref<?xi64>
-      %eq = func.call @raw_bytes_equal(%kp, %kl, %key_ptr, %key_len) : (i64, i64, i64, i64) -> i1
       %not_yet = arith.cmpi eq, %acc, %minus_one : i64
-      %take = arith.andi %eq, %not_yet : i1
-      %next = arith.select %take, %ii, %acc : i1, i64
+      %next = scf.if %not_yet -> (i64) {
+        %flag = memref.load %present[%i] : memref<?xi64>
+        %is_present = arith.cmpi ne, %flag, %zero : i64
+        %probe = scf.if %is_present -> (i64) {
+          %ii = arith.index_cast %i : index to i64
+          %base = arith.muli %ii, %c16 : i64
+          %entry = llvm.getelementptr %keys_ptr[%base] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+          %hash_slot_i64 = arith.addi %base, %c15 : i64
+          %hash_slot = arith.index_cast %hash_slot_i64 : i64 to index
+          %cached = memref.load %keys[%hash_slot] : memref<?xi64>
+          %unknown = arith.cmpi eq, %cached, %zero : i64
+          %entry_hash = scf.if %unknown -> (i64) {
+            %computed = func.call @__ly_box_hash(%entry) : (!llvm.ptr) -> i64
+            memref.store %computed, %keys[%hash_slot] : memref<?xi64>
+            scf.yield %computed : i64
+          } else {
+            scf.yield %cached : i64
+          }
+          %hash_matches = arith.cmpi eq, %entry_hash, %key_hash : i64
+          %matched = scf.if %hash_matches -> (i64) {
+            %eq = func.call @__ly_box_equal(%entry, %key_box) : (!llvm.ptr, !llvm.ptr) -> i1
+            %slot_or = arith.select %eq, %ii, %minus_one : i1, i64
+            scf.yield %slot_or : i64
+          } else {
+            scf.yield %minus_one : i64
+          }
+          scf.yield %matched : i64
+        } else {
+          scf.yield %minus_one : i64
+        }
+        scf.yield %probe : i64
+      } else {
+        scf.yield %acc : i64
+      }
       scf.yield %next : i64
     }
     func.return %found : i64
   }
 
-  // `key in d` for runtime dicts (str keys): a present slot with equal bytes.
-  func.func @LyDict_Contains(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %keys: memref<?xi64>, %values: memref<?xi64>, %present: memref<?xi64>, %key_header: memref<2xi64> {ly.ownership.object_header}, %key_bytes: memref<?xi8>) -> i1 attributes {ly.runtime.contract = "builtins.dict", ly.runtime.method = "__contains__", ly.runtime.result_contract = "builtins.bool"} {
-    %c0 = arith.constant 0 : index
+  // Raise KeyError whose message is the missing key's repr (CPython prints
+  // the repr of the key for a dict miss).
+  func.func private @__ly_dict_raise_missing_key(%key_box: !llvm.ptr) attributes {ly.runtime.contract = "builtins.dict", ly.runtime.primitive = "raise_missing_key_ptr"} {
+    %c1 = arith.constant 1 : i64
+    %class_gep = llvm.getelementptr %key_box[%c1] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    %class_id = llvm.load %class_gep : !llvm.ptr -> i64
+    %rh, %rb, %ok = func.call @__ly_repr_boxed_by_contract(%key_box, %class_id) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>, i1)
+    cf.assert %ok, "KeyError: missing key has no conforming __repr__"
+    %key_error = arith.constant 54 : i64
+    %exception:3 = func.call @LyBaseException_New(%key_error) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %rh, %rb) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    func.call @LyEH_ThrowException(%initialized#0, %initialized#1, %initialized#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    func.return
+  }
+
+  // Boxed variant callable from the C++ getitem path (borrowed key box).
+  func.func @LyDict_RaiseMissingKey(%key_box: memref<16xi64>) attributes {ly.runtime.contract = "builtins.dict", ly.runtime.primitive = "raise_missing_key"} {
+    %box_idx = memref.extract_aligned_pointer_as_index %key_box : memref<16xi64> -> index
+    %box_i64 = arith.index_cast %box_idx : index to i64
+    %box_ptr = llvm.inttoptr %box_i64 : i64 to !llvm.ptr
+    func.call @__ly_dict_raise_missing_key(%box_ptr) : (!llvm.ptr) -> ()
+    func.return
+  }
+
+  // Probe with a BORROWED transient key box (any hashable class; raises
+  // TypeError for unhashable keys). Returns the slot index or -1.
+  func.func @LyDict_LookupBox(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %keys: memref<?xi64>, %values: memref<?xi64>, %present: memref<?xi64>, %key_box: memref<16xi64>) -> i64 attributes {ly.runtime.contract = "builtins.dict", ly.runtime.primitive = "lookup_box"} {
+    %box_idx = memref.extract_aligned_pointer_as_index %key_box : memref<16xi64> -> index
+    %box_i64 = arith.index_cast %box_idx : index to i64
+    %box_ptr = llvm.inttoptr %box_i64 : i64 to !llvm.ptr
+    %hash = func.call @__ly_box_hash(%box_ptr) : (!llvm.ptr) -> i64
+    %slot = func.call @__ly_dict_probe(%meta, %keys, %present, %box_ptr, %hash) : (memref<2xi64>, memref<?xi64>, memref<?xi64>, !llvm.ptr, i64) -> i64
+    func.return %slot : i64
+  }
+
+  // `key in d` with a BORROWED transient key box.
+  func.func @LyDict_ContainsBox(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %keys: memref<?xi64>, %values: memref<?xi64>, %present: memref<?xi64>, %key_box: memref<16xi64>) -> i1 attributes {ly.runtime.contract = "builtins.dict", ly.runtime.primitive = "contains_box"} {
     %c0_i64 = arith.constant 0 : i64
-    %ptr_index = memref.extract_aligned_pointer_as_index %key_bytes : memref<?xi8> -> index
-    %ptr = arith.index_cast %ptr_index : index to i64
-    %dim = memref.dim %key_bytes, %c0 : memref<?xi8>
-    %len = arith.index_cast %dim : index to i64
-    %slot = func.call @LyDict_FindSlot(%header, %meta, %keys, %values, %present, %ptr, %len) : (memref<2xi64>, memref<2xi64>, memref<?xi64>, memref<?xi64>, memref<?xi64>, i64, i64) -> i64
+    %slot = func.call @LyDict_LookupBox(%header, %meta, %keys, %values, %present, %key_box) : (memref<2xi64>, memref<2xi64>, memref<?xi64>, memref<?xi64>, memref<?xi64>, memref<16xi64>) -> i64
     %found = arith.cmpi sge, %slot, %c0_i64 : i64
     func.return %found : i1
   }
 
-  // Runtime dict insert/replace with a boxed str key and boxed value. The
-  // caller retained both boxes; on key replacement the duplicate key box is
-  // consumed here. Slots 0..len-1 are always present (no deletion surface).
+  // Delete with a BORROWED transient key box: KeyError(repr) on a miss;
+  // otherwise release the entry and compact the dense tail so slot order
+  // stays the insertion order the iteration paths walk.
+  func.func @LyDict_DelItemBox(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %keys: memref<?xi64>, %values: memref<?xi64>, %present: memref<?xi64>, %key_box: memref<16xi64>) attributes {ly.runtime.contract = "builtins.dict", ly.runtime.primitive = "delitem_box"} {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %minus_one = arith.constant -1 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c16 = arith.constant 16 : index
+    %length_slot = arith.constant 0 : index
+    %slot = func.call @LyDict_LookupBox(%header, %meta, %keys, %values, %present, %key_box) : (memref<2xi64>, memref<2xi64>, memref<?xi64>, memref<?xi64>, memref<?xi64>, memref<16xi64>) -> i64
+    %missing = arith.cmpi eq, %slot, %minus_one : i64
+    scf.if %missing {
+      %box_idx = memref.extract_aligned_pointer_as_index %key_box : memref<16xi64> -> index
+      %box_i64 = arith.index_cast %box_idx : index to i64
+      %box_ptr = llvm.inttoptr %box_i64 : i64 to !llvm.ptr
+      func.call @__ly_dict_raise_missing_key(%box_ptr) : (!llvm.ptr) -> ()
+    }
+    %len = memref.load %meta[%length_slot] : memref<2xi64>
+    func.call @LyObject_ReleaseBoxedPayloadArraySlotRaw(%keys, %slot) : (memref<?xi64>, i64) -> ()
+    func.call @LyObject_ReleaseBoxedPayloadArraySlotRaw(%values, %slot) : (memref<?xi64>, i64) -> ()
+    // Shift the dense tail down one entry (16 words per box).
+    %slot_index = arith.index_cast %slot : i64 to index
+    %from = arith.addi %slot_index, %c1 : index
+    %len_index = arith.index_cast %len : i64 to index
+    scf.for %j = %from to %len_index step %c1 {
+      %dst_entry = arith.subi %j, %c1 : index
+      %src_base = arith.muli %j, %c16 : index
+      %dst_base = arith.muli %dst_entry, %c16 : index
+      scf.for %w = %c0 to %c16 step %c1 {
+        %src = arith.addi %src_base, %w : index
+        %dst = arith.addi %dst_base, %w : index
+        %kw = memref.load %keys[%src] : memref<?xi64>
+        %vw = memref.load %values[%src] : memref<?xi64>
+        memref.store %kw, %keys[%dst] : memref<?xi64>
+        memref.store %vw, %values[%dst] : memref<?xi64>
+      }
+    }
+    %new_len = arith.subi %len, %one : i64
+    %last = arith.index_cast %new_len : i64 to index
+    %last_base = arith.muli %last, %c16 : index
+    scf.for %w = %c0 to %c16 step %c1 {
+      %dst = arith.addi %last_base, %w : index
+      memref.store %zero, %keys[%dst] : memref<?xi64>
+      memref.store %zero, %values[%dst] : memref<?xi64>
+    }
+    memref.store %zero, %present[%last] : memref<?xi64>
+    memref.store %new_len, %meta[%length_slot] : memref<2xi64>
+    func.return
+  }
+
+  // Runtime dict insert/replace with boxed key and value (any hashable key
+  // class). The caller retained both boxes; on key replacement the duplicate
+  // key box is consumed here. The computed hash is cached in key box word 15
+  // before the copy so the stored entry carries it.
   func.func @LyDict_SetItemBox(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %keys: memref<?xi64>, %values: memref<?xi64>, %present: memref<?xi64>, %key_box: memref<16xi64>, %value_box: memref<16xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>, memref<?xi64>, memref<?xi64>) attributes {ly.ownership.transfer_args = [0], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.dict", ly.runtime.primitive = "setitem_box"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
@@ -6731,14 +6955,15 @@ module attributes {
     %length_slot = arith.constant 0 : index
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c5 = arith.constant 5 : index
-    %c10 = arith.constant 10 : index
+    %c15 = arith.constant 15 : index
 
     %len = memref.load %meta[%length_slot] : memref<2xi64>
-    %new_ptr = memref.load %key_box[%c5] : memref<16xi64>
-    %new_len = memref.load %key_box[%c10] : memref<16xi64>
-
-    %found = func.call @LyDict_FindSlot(%header, %meta, %keys, %values, %present, %new_ptr, %new_len) : (memref<2xi64>, memref<2xi64>, memref<?xi64>, memref<?xi64>, memref<?xi64>, i64, i64) -> i64
+    %box_idx = memref.extract_aligned_pointer_as_index %key_box : memref<16xi64> -> index
+    %box_i64 = arith.index_cast %box_idx : index to i64
+    %box_ptr = llvm.inttoptr %box_i64 : i64 to !llvm.ptr
+    %hash = func.call @__ly_box_hash(%box_ptr) : (!llvm.ptr) -> i64
+    memref.store %hash, %key_box[%c15] : memref<16xi64>
+    %found = func.call @__ly_dict_probe(%meta, %keys, %present, %box_ptr, %hash) : (memref<2xi64>, memref<?xi64>, memref<?xi64>, !llvm.ptr, i64) -> i64
 
     %missing = arith.cmpi eq, %found, %minus_one : i64
     %out:5 = scf.if %missing -> (memref<2xi64>, memref<2xi64>, memref<?xi64>, memref<?xi64>, memref<?xi64>) {
@@ -7092,99 +7317,57 @@ module attributes {
     func.return %length : i64
   }
 
-  // Boxed equality between the slot at `slot` in `items` and `box`: class ids
-  // must match; ints compare by decoded value, strs by bytes. Other element
-  // classes conservatively compare unequal (the lowering restricts set
-  // elements to int/str evidence).
-  func.func private @__ly_set_slot_matches(%items: memref<?xi64>, %slot: i64, %box: memref<16xi64>) -> i1 {
-    %handle_words = arith.constant 16 : i64
-    %c1 = arith.constant 1 : index
-    %c5 = arith.constant 5 : index
-    %c6 = arith.constant 6 : index
-    %c10 = arith.constant 10 : index
-    %int_class = arith.constant 1 : i64
-    %str_class = arith.constant 4 : i64
-    %false = arith.constant false
-    %base_i64 = arith.muli %slot, %handle_words : i64
-    %base = arith.index_cast %base_i64 : i64 to index
-    %class_index = arith.addi %base, %c1 : index
-    %slot_class = memref.load %items[%class_index] : memref<?xi64>
-    %box_class = memref.load %box[%c1] : memref<16xi64>
-    %same_class = arith.cmpi eq, %slot_class, %box_class : i64
-    %result = scf.if %same_class -> (i1) {
-      %is_int = arith.cmpi eq, %slot_class, %int_class : i64
-      %inner = scf.if %is_int -> (i1) {
-        %slot_meta_index = arith.addi %base, %c5 : index
-        %slot_digits_index = arith.addi %base, %c6 : index
-        %slot_meta = memref.load %items[%slot_meta_index] : memref<?xi64>
-        %slot_digits = memref.load %items[%slot_digits_index] : memref<?xi64>
-        %box_meta = memref.load %box[%c5] : memref<16xi64>
-        %box_digits = memref.load %box[%c6] : memref<16xi64>
-        %slot_value = func.call @boxed_int_value(%slot_meta, %slot_digits) : (i64, i64) -> i64
-        %box_value = func.call @boxed_int_value(%box_meta, %box_digits) : (i64, i64) -> i64
-        %eq = arith.cmpi eq, %slot_value, %box_value : i64
-        scf.yield %eq : i1
-      } else {
-        %is_str = arith.cmpi eq, %slot_class, %str_class : i64
-        %str_eq = scf.if %is_str -> (i1) {
-          %slot_ptr_index = arith.addi %base, %c5 : index
-          %slot_len_index = arith.addi %base, %c10 : index
-          %slot_ptr = memref.load %items[%slot_ptr_index] : memref<?xi64>
-          %slot_len = memref.load %items[%slot_len_index] : memref<?xi64>
-          %box_ptr = memref.load %box[%c5] : memref<16xi64>
-          %box_len = memref.load %box[%c10] : memref<16xi64>
-          // Adaptive-width strs must also match character width: distinct
-          // strings of different widths can share the same code-unit bytes
-          // (latin-1 "\x00\x01" vs UCS-2 U+0100). The width word sits at
-          // header+16; both handles carry the header pointer at word 2.
-          %c2_slot = arith.constant 2 : index
-          %slot_header_index = arith.addi %base, %c2_slot : index
-          %slot_header_ptr = memref.load %items[%slot_header_index] : memref<?xi64>
-          %box_header_ptr = memref.load %box[%c2_slot] : memref<16xi64>
-          %sixteen = arith.constant 16 : i64
-          %slot_width_addr = arith.addi %slot_header_ptr, %sixteen : i64
-          %box_width_addr = arith.addi %box_header_ptr, %sixteen : i64
-          %slot_width_ptr = llvm.inttoptr %slot_width_addr : i64 to !llvm.ptr
-          %box_width_ptr = llvm.inttoptr %box_width_addr : i64 to !llvm.ptr
-          %slot_width = llvm.load %slot_width_ptr : !llvm.ptr -> i64
-          %box_width = llvm.load %box_width_ptr : !llvm.ptr -> i64
-          %width_eq = arith.cmpi eq, %slot_width, %box_width : i64
-          %bytes_eq = func.call @raw_bytes_equal(%slot_ptr, %slot_len, %box_ptr, %box_len) : (i64, i64, i64, i64) -> i1
-          %eq = arith.andi %width_eq, %bytes_eq : i1
-          scf.yield %eq : i1
-        } else {
-          scf.yield %false : i1
-        }
-        scf.yield %str_eq : i1
-      }
-      scf.yield %inner : i1
-    } else {
-      scf.yield %false : i1
-    }
-    func.return %result : i1
-  }
-
-  // Probe for an equal element among slots 0..len-1. Returns the slot index
-  // or -1.
-  func.func private @__ly_set_find_slot(%meta: memref<2xi64>, %items: memref<?xi64>, %box: memref<16xi64>) -> i64 {
+  // Hash-first probe among slots 0..len-1 (dense insertion order; the cached
+  // hash lives in box word 15 with lazy refill, same scheme as the dict).
+  // Returns the slot index or -1.
+  func.func private @__ly_set_probe(%meta: memref<2xi64>, %items: memref<?xi64>, %elem_box: !llvm.ptr, %elem_hash: i64) -> i64 {
     %minus_one = arith.constant -1 : i64
-    %length_slot = arith.constant 0 : index
+    %zero = arith.constant 0 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %len = memref.load %meta[%length_slot] : memref<2xi64>
+    %c15 = arith.constant 15 : i64
+    %c16 = arith.constant 16 : i64
+    %len = memref.load %meta[%c0] : memref<2xi64>
     %len_index = arith.index_cast %len : i64 to index
+    %items_idx = memref.extract_aligned_pointer_as_index %items : memref<?xi64> -> index
+    %items_i64 = arith.index_cast %items_idx : index to i64
+    %items_ptr = llvm.inttoptr %items_i64 : i64 to !llvm.ptr
     %found = scf.for %i = %c0 to %len_index step %c1 iter_args(%acc = %minus_one) -> (i64) {
-      %ii = arith.index_cast %i : index to i64
-      %eq = func.call @__ly_set_slot_matches(%items, %ii, %box) : (memref<?xi64>, i64, memref<16xi64>) -> i1
       %not_yet = arith.cmpi eq, %acc, %minus_one : i64
-      %take = arith.andi %eq, %not_yet : i1
-      %next = arith.select %take, %ii, %acc : i1, i64
+      %next = scf.if %not_yet -> (i64) {
+        %ii = arith.index_cast %i : index to i64
+        %base = arith.muli %ii, %c16 : i64
+        %entry = llvm.getelementptr %items_ptr[%base] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+        %hash_slot_i64 = arith.addi %base, %c15 : i64
+        %hash_slot = arith.index_cast %hash_slot_i64 : i64 to index
+        %cached = memref.load %items[%hash_slot] : memref<?xi64>
+        %unknown = arith.cmpi eq, %cached, %zero : i64
+        %entry_hash = scf.if %unknown -> (i64) {
+          %computed = func.call @__ly_box_hash(%entry) : (!llvm.ptr) -> i64
+          memref.store %computed, %items[%hash_slot] : memref<?xi64>
+          scf.yield %computed : i64
+        } else {
+          scf.yield %cached : i64
+        }
+        %hash_matches = arith.cmpi eq, %entry_hash, %elem_hash : i64
+        %matched = scf.if %hash_matches -> (i64) {
+          %eq = func.call @__ly_box_equal(%entry, %elem_box) : (!llvm.ptr, !llvm.ptr) -> i1
+          %slot_or = arith.select %eq, %ii, %minus_one : i1, i64
+          scf.yield %slot_or : i64
+        } else {
+          scf.yield %minus_one : i64
+        }
+        scf.yield %matched : i64
+      } else {
+        scf.yield %acc : i64
+      }
       scf.yield %next : i64
     }
     func.return %found : i64
   }
 
-  // Runtime set insert with a boxed element. The caller retained the box; a
+  // Runtime set insert with a boxed element (any hashable class; raises
+  // TypeError for unhashable elements). The caller retained the box; a
   // duplicate element consumes it here.
   func.func @LySet_AddBox(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>, %elem_box: memref<16xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.transfer_args = [0], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.set", ly.runtime.primitive = "add_box"} {
     %one = arith.constant 1 : i64
@@ -7193,8 +7376,14 @@ module attributes {
     %length_slot = arith.constant 0 : index
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
+    %c15 = arith.constant 15 : index
     %len = memref.load %meta[%length_slot] : memref<2xi64>
-    %found = func.call @__ly_set_find_slot(%meta, %items, %elem_box) : (memref<2xi64>, memref<?xi64>, memref<16xi64>) -> i64
+    %box_idx = memref.extract_aligned_pointer_as_index %elem_box : memref<16xi64> -> index
+    %box_i64 = arith.index_cast %box_idx : index to i64
+    %box_ptr = llvm.inttoptr %box_i64 : i64 to !llvm.ptr
+    %hash = func.call @__ly_box_hash(%box_ptr) : (!llvm.ptr) -> i64
+    memref.store %hash, %elem_box[%c15] : memref<16xi64>
+    %found = func.call @__ly_set_probe(%meta, %items, %box_ptr, %hash) : (memref<2xi64>, memref<?xi64>, !llvm.ptr, i64) -> i64
     %missing = arith.cmpi eq, %found, %minus_one : i64
     %out:3 = scf.if %missing -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) {
       %required = arith.addi %len, %one : i64
@@ -7220,7 +7409,11 @@ module attributes {
   // Membership probe with a BORROWED transient box (not consumed).
   func.func @LySet_ContainsBox(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>, %elem_box: memref<16xi64>) -> i1 attributes {ly.runtime.contract = "builtins.set", ly.runtime.primitive = "contains_box"} {
     %minus_one = arith.constant -1 : i64
-    %found = func.call @__ly_set_find_slot(%meta, %items, %elem_box) : (memref<2xi64>, memref<?xi64>, memref<16xi64>) -> i64
+    %box_idx = memref.extract_aligned_pointer_as_index %elem_box : memref<16xi64> -> index
+    %box_i64 = arith.index_cast %box_idx : index to i64
+    %box_ptr = llvm.inttoptr %box_i64 : i64 to !llvm.ptr
+    %hash = func.call @__ly_box_hash(%box_ptr) : (!llvm.ptr) -> i64
+    %found = func.call @__ly_set_probe(%meta, %items, %box_ptr, %hash) : (memref<2xi64>, memref<?xi64>, !llvm.ptr, i64) -> i64
     %result = arith.cmpi ne, %found, %minus_one : i64
     func.return %result : i1
   }
