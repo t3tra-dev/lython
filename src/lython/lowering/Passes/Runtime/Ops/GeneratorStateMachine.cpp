@@ -48,9 +48,10 @@ namespace py::lowering {
 namespace {
 
 constexpr unsigned kGeneratorFrameSlotBase = 8;
-// Words [48, 64) hold the suspended body's stashed EH token (flag word +
-// ExceptionParts payload): a body suspended inside an exception handler
-// must not keep the process's single TLS token occupied between
+// Words [48, 64) are the suspended body's EH stash area (word 48 holds the
+// parked exception chain-node address, the rest stays reserved): a body
+// suspended inside an exception handler must not keep the process's single
+// TLS token — nor its traceback/chain globals — occupied between
 // resumptions. Frame lanes must fit below this region.
 constexpr unsigned kGeneratorEHStashWordBase = 48;
 constexpr unsigned kGeneratorFrameSlotLimit = 64;
@@ -1681,7 +1682,7 @@ RuntimeBundleLowerer::getOrCreateGeneratorStepFunction(
   };
   mlir::func::FuncOp stashFn = ehVoidFn("LyEH_StashCurrentException");
   mlir::func::FuncOp unstashFn = ehVoidFn("LyEH_UnstashException");
-  mlir::func::FuncOp releaseStashFn = ehVoidFn("LyEH_ReleaseStashedException");
+  mlir::func::FuncOp adoptStashFn = ehVoidFn("LyEH_AdoptStashedAsContext");
   auto wordAddress = [&](mlir::Value memrefValue,
                          unsigned wordOffset) -> mlir::Value {
     mlir::Value pointerIndex =
@@ -1763,9 +1764,10 @@ RuntimeBundleLowerer::getOrCreateGeneratorStepFunction(
   // Normal resume. First swap the EH token: on a plain resume the caller's
   // pending token (if any) moves to the local stash and the body's stashed
   // handler token (if any) returns to the slot; on an injection the staged
-  // exception IS the slot content to deliver, and it replaces the body's
-  // stashed handler context (CPython: throw() into a generator suspended in
-  // a handler supersedes the exception being handled).
+  // exception IS the slot content to deliver, and the body's stashed
+  // handler context becomes its __context__ (CPython: throw() into a
+  // generator suspended in a handler raises at the yield inside that
+  // handler, so the exception being handled chains under the injected one).
   builder.setInsertionPointToEnd(callBlock);
   {
     mlir::Value zeroInject =
@@ -1781,7 +1783,7 @@ RuntimeBundleLowerer::getOrCreateGeneratorStepFunction(
     mlir::func::CallOp::create(builder, loc, unstashFn,
                                mlir::ValueRange{stashAddress});
     builder.setInsertionPoint(swapIf.getElseRegion().front().getTerminator());
-    mlir::func::CallOp::create(builder, loc, releaseStashFn,
+    mlir::func::CallOp::create(builder, loc, adoptStashFn,
                                mlir::ValueRange{stashAddress});
   }
   mlir::Value trueValue =
@@ -1901,10 +1903,11 @@ RuntimeBundleLowerer::getOrCreateGeneratorStepFunction(
                                 slotIndex(4));
   mlir::memref::StoreOp::create(builder, loc, i64Const(3), generator,
                                 slotIndex(2));
-  // The body escaped with an exception, which replaces the resumer's
-  // stashed context (chaining it is the traceback track's __context__
-  // work); releasing here keeps the token count exact.
-  mlir::func::CallOp::create(builder, loc, releaseStashFn,
+  // The body escaped with an exception raised above the resumer's parked
+  // context on CPython's per-frame exc stack, so the parked state chains
+  // under it — displayed as "During handling of ..." and popped back into
+  // the slot when a handler downstream completes.
+  mlir::func::CallOp::create(builder, loc, adoptStashFn,
                              mlir::ValueRange{outerAddress});
   auto currentMatches = getOrCreatePrivateFunction(
       module, builder, "LyEH_CurrentExceptionMatches",
@@ -2164,8 +2167,8 @@ RuntimeBundleLowerer::getOrCreateGeneratorThrowFunction(
   };
   mlir::func::FuncOp throwStashFn = throwEHFn("LyEH_StashCurrentException");
   mlir::func::FuncOp throwUnstashFn = throwEHFn("LyEH_UnstashException");
-  mlir::func::FuncOp throwReleaseStashFn =
-      throwEHFn("LyEH_ReleaseStashedException");
+  mlir::func::FuncOp throwAdoptStashFn =
+      throwEHFn("LyEH_AdoptStashedAsContext");
   mlir::Value throwOuterArea =
       mlir::memref::AllocaOp::create(builder, loc,
                                      mlir::MemRefType::get({16}, i64))
@@ -2229,7 +2232,22 @@ RuntimeBundleLowerer::getOrCreateGeneratorThrowFunction(
                                  mlir::ValueRange{}, directBlock,
                                  mlir::ValueRange{});
 
+  // The body may re-raise (or raise anew) out of the resume: without a
+  // handler here the caller's parked context would be stranded in this
+  // frame's dead stash area, so the escape path adopts it into the
+  // outgoing exception's __context__ chain before rethrowing.
   builder.setInsertionPointToEnd(injectBlock);
+  std::int64_t resumeHandlerId = nextTryHandlerId++;
+  mlir::Block *resumeCallBlock = builder.createBlock(&body);
+  mlir::Block *resumeEscapeBlock = builder.createBlock(&body);
+  builder.setInsertionPointToEnd(injectBlock);
+  auto resumeAnchor = mlir::func::CallOp::create(
+      builder, loc, getOrCreateTryCatchAnchor(),
+      mlir::ValueRange{i64Const(resumeHandlerId)});
+  mlir::cf::CondBranchOp::create(builder, loc, resumeAnchor.getResult(0),
+                                 resumeEscapeBlock, mlir::ValueRange{},
+                                 resumeCallBlock, mlir::ValueRange{});
+  builder.setInsertionPointToEnd(resumeCallBlock);
   llvm::SmallVector<mlir::Value, 16> advanceOperands;
   advanceOperands.push_back(generator);
   for (unsigned index = 0; index < info.argumentCount; ++index) {
@@ -2239,11 +2257,26 @@ RuntimeBundleLowerer::getOrCreateGeneratorThrowFunction(
   advanceOperands.push_back(i64Const(0));
   advanceOperands.push_back(constantI1(builder, loc, false));
   advanceOperands.push_back(i64Const(1)); // inject
+  mlir::func::CallOp::create(builder, loc, getOrCreateTryCallSiteMarker(),
+                             mlir::ValueRange{i64Const(resumeHandlerId)});
   mlir::func::CallOp resumed =
       mlir::func::CallOp::create(builder, loc, *advance, advanceOperands);
   mlir::func::CallOp::create(builder, loc, throwUnstashFn,
                              mlir::ValueRange{throwOuterAddress});
   mlir::func::ReturnOp::create(builder, loc, resumed.getResults());
+  builder.setInsertionPointToEnd(resumeEscapeBlock);
+  mlir::func::CallOp::create(builder, loc, getOrCreateTryCatchMarker(),
+                             mlir::ValueRange{i64Const(resumeHandlerId)});
+  mlir::func::CallOp::create(builder, loc, throwAdoptStashFn,
+                             mlir::ValueRange{throwOuterAddress});
+  mlir::func::CallOp::create(builder, loc,
+                             getOrCreateRethrowCurrent(module, builder),
+                             mlir::ValueRange{});
+  mlir::Block *escapeDeadBlock = builder.createBlock(&body);
+  builder.setInsertionPointToEnd(resumeEscapeBlock);
+  mlir::cf::BranchOp::create(builder, loc, escapeDeadBlock);
+  builder.setInsertionPointToEnd(escapeDeadBlock);
+  mlir::cf::BranchOp::create(builder, loc, escapeDeadBlock);
 
   // Not suspended: the body never sees the exception. CPython closes a
   // just-started generator and raises the thrown exception as-is.
@@ -2258,7 +2291,7 @@ RuntimeBundleLowerer::getOrCreateGeneratorThrowFunction(
     mlir::memref::StoreOp::create(builder, loc, i64Const(4), generator,
                                   slotIndex(2));
   }
-  mlir::func::CallOp::create(builder, loc, throwReleaseStashFn,
+  mlir::func::CallOp::create(builder, loc, throwAdoptStashFn,
                              mlir::ValueRange{throwOuterAddress});
   mlir::func::CallOp::create(builder, loc,
                              getOrCreateRethrowCurrent(module, builder),
@@ -2335,8 +2368,11 @@ RuntimeBundleLowerer::getOrCreateGeneratorCloseFunction(
   };
   mlir::func::FuncOp closeStashFn = closeEHFn("LyEH_StashCurrentException");
   mlir::func::FuncOp closeUnstashFn = closeEHFn("LyEH_UnstashException");
-  mlir::func::FuncOp closeReleaseStashFn =
-      closeEHFn("LyEH_ReleaseStashedException");
+  mlir::func::FuncOp closeAdoptStashFn =
+      closeEHFn("LyEH_AdoptStashedAsContext");
+  mlir::func::FuncOp releaseCurrentFn = getOrCreatePrivateFunction(
+      module, builder, "LyEH_ReleaseCurrentException",
+      builder.getFunctionType({}, {}));
   mlir::Value closeOuterArea =
       mlir::memref::AllocaOp::create(
           builder, loc, mlir::MemRefType::get({16}, closeI64))
@@ -2452,14 +2488,17 @@ RuntimeBundleLowerer::getOrCreateGeneratorCloseFunction(
     builder.setInsertionPoint(
         ignoredIf.getThenRegion().front().getTerminator());
     // The staged GeneratorExit may still be the pending current exception
-    // (the body can be suspended inside its own handler); the EH TLS slot is
-    // single-token, so raising without discarding would trap. The
-    // RuntimeError leaves this function, so the caller's parked context is
-    // superseded by it (chaining is the traceback track's __context__ work).
-    mlir::func::CallOp::create(
-        builder, loc, getOrCreateDiscardCurrentException(module, builder),
-        mlir::ValueRange{});
-    mlir::func::CallOp::create(builder, loc, closeReleaseStashFn,
+    // (the body can be suspended inside its own handler); the EH TLS slot
+    // is single-token, so raising without clearing it would trap. Why not
+    // LyEH_DiscardCurrentException: the GeneratorExit can carry the
+    // generator-side handler context adopted at injection, and Discard
+    // would restore that as the CALLER's pending exception — the whole
+    // generator-side identity dies with the swallow instead. The caller's
+    // own parked context returns to the slot first so the RuntimeError
+    // chains onto it like any raise during handling.
+    mlir::func::CallOp::create(builder, loc, releaseCurrentFn,
+                               mlir::ValueRange{});
+    mlir::func::CallOp::create(builder, loc, closeUnstashFn,
                                mlir::ValueRange{closeOuterAddress});
     if (mlir::failed(RuntimeBundleLowerer::emitRuntimeException(
             op, "builtins.RuntimeError", "generator ignored GeneratorExit")))
@@ -2485,12 +2524,14 @@ RuntimeBundleLowerer::getOrCreateGeneratorCloseFunction(
                                  discardBlock, mlir::ValueRange{},
                                  rethrowBlock, mlir::ValueRange{});
   builder.setInsertionPointToEnd(discardBlock);
-  mlir::func::CallOp::create(
-      builder, loc, getOrCreateDiscardCurrentException(module, builder),
-      mlir::ValueRange{});
+  // The swallowed GeneratorExit's whole identity (payload + any
+  // generator-side context adopted at injection) dies here; Discard's
+  // __context__ restore would leak it into the caller's pending state.
+  mlir::func::CallOp::create(builder, loc, releaseCurrentFn,
+                             mlir::ValueRange{});
   mlir::cf::BranchOp::create(builder, loc, markClosed);
   builder.setInsertionPointToEnd(rethrowBlock);
-  mlir::func::CallOp::create(builder, loc, closeReleaseStashFn,
+  mlir::func::CallOp::create(builder, loc, closeAdoptStashFn,
                              mlir::ValueRange{closeOuterAddress});
   mlir::func::CallOp::create(builder, loc,
                              getOrCreateRethrowCurrent(module, builder),
@@ -2609,12 +2650,17 @@ RuntimeBundleLowerer::getOrCreateGeneratorFinalizeFunction(
 
   // Finalization swallows whatever the close raised (an ignored
   // GeneratorExit becomes RuntimeError, a finally may raise): there is no
-  // propagation context inside a deallocator.
+  // propagation context inside a deallocator. Why not Discard: its
+  // __context__ restore would resurrect the swallowed exception's chain as
+  // a pending token in whatever context triggered the drop.
   builder.setInsertionPointToEnd(caughtBlock);
   mlir::func::CallOp::create(builder, loc, getOrCreateTryCatchMarker(),
                              mlir::ValueRange{i64Const(handlerId)});
   mlir::func::CallOp::create(
-      builder, loc, getOrCreateDiscardCurrentException(module, builder),
+      builder, loc,
+      getOrCreatePrivateFunction(module, builder,
+                                 "LyEH_ReleaseCurrentException",
+                                 builder.getFunctionType({}, {})),
       mlir::ValueRange{});
   mlir::cf::BranchOp::create(builder, loc, releaseBlock);
 
