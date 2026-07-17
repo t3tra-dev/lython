@@ -1,0 +1,11 @@
+h:t-x
+keep!
+caught one
+keep!
+finally log-0
+v:t-x
+finally log-1
+recovered 1
+ok p0
+skip 1
+skip 2
