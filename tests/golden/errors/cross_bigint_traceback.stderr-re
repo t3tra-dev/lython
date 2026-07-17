@@ -1,0 +1,4 @@
+Traceback\ \(most\ recent\ call\ last\):\
+\ \ File\ ".*cross_bigint_traceback\.py",\ line\ 8,\ in\ <module>\
+\ \ \ \ raise\ ValueError\("big\ value\ "\ \+\ str\(big\ \+\ 7\)\)\
+ValueError:\ big\ value\ 1000000000000000000000000000007

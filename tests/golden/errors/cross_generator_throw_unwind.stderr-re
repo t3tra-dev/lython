@@ -1,0 +1,7 @@
+Traceback\ \(most\ recent\ call\ last\):\
+\ \ File\ ".*cross_generator_throw_unwind\.py",\ line\ 23,\ in\ <module>\
+\ \ \ \ g\.throw\(ValueError\("injected"\)\)\
+\ \ \ \ \~\~\~\~\~\~\~\^\^\^\^\^\^\^\^\^\^\^\^\^\^\^\^\^\^\^\^\^\^\^\^\
+\ \ File\ ".*cross_generator_throw_unwind\.py",\ line\ 15,\ in\ worker\
+\ \ \ \ yield\ len\(held\)\
+ValueError:\ injected

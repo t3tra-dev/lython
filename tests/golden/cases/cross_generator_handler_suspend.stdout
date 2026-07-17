@@ -1,0 +1,4 @@
+1
+handled unrelated
+caught RuntimeError: third
+done

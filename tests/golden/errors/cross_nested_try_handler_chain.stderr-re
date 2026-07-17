@@ -1,0 +1,14 @@
+Traceback\ \(most\ recent\ call\ last\):\
+\ \ File\ ".*cross_nested_try_handler_chain\.py",\ line\ 8,\ in\ f\
+\ \ \ \ raise\ ValueError\("first"\)\
+ValueError:\ first\
+\
+During\ handling\ of\ the\ above\ exception,\ another\ exception\ occurred:\
+\
+Traceback\ \(most\ recent\ call\ last\):\
+\ \ File\ ".*cross_nested_try_handler_chain\.py",\ line\ 17,\ in\ <module>\
+\ \ \ \ f\(\)\
+\ \ \ \ \~\^\^\
+\ \ File\ ".*cross_nested_try_handler_chain\.py",\ line\ 14,\ in\ f\
+\ \ \ \ raise\ RuntimeError\("second"\)\
+RuntimeError:\ second

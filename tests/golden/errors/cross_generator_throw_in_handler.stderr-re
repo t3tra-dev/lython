@@ -1,0 +1,14 @@
+Traceback\ \(most\ recent\ call\ last\):\
+\ \ File\ ".*cross_generator_throw_in_handler\.py",\ line\ 10,\ in\ gen\
+\ \ \ \ raise\ ValueError\("handler\ exc"\)\
+ValueError:\ handler\ exc\
+\
+During\ handling\ of\ the\ above\ exception,\ another\ exception\ occurred:\
+\
+Traceback\ \(most\ recent\ call\ last\):\
+\ \ File\ ".*cross_generator_throw_in_handler\.py",\ line\ 17,\ in\ <module>\
+\ \ \ \ g\.throw\(RuntimeError\("injected"\)\)\
+\ \ \ \ \~\~\~\~\~\~\~\^\^\^\^\^\^\^\^\^\^\^\^\^\^\^\^\^\^\^\^\^\^\^\^\^\^\
+\ \ File\ ".*cross_generator_throw_in_handler\.py",\ line\ 12,\ in\ gen\
+\ \ \ \ yield\ 1\
+RuntimeError:\ injected

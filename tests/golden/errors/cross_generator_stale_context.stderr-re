@@ -1,0 +1,4 @@
+Traceback\ \(most\ recent\ call\ last\):\
+\ \ File\ ".*cross_generator_stale_context\.py",\ line\ 26,\ in\ <module>\
+\ \ \ \ raise\ IndexError\("final"\)\
+IndexError:\ final
