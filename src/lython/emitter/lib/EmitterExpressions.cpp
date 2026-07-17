@@ -12,7 +12,10 @@
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/Support/Error.h"
 
 #include <optional>
 #include <string>
@@ -423,6 +426,38 @@ Value ModuleEmitter::emitBinary(const parser::Node &expr) {
   const parser::Node *op = ast::node(expr, "op");
   if (std::optional<Value> primitive = emitPrimitiveBinary(expr, lhs, rhs, op))
     return *primitive;
+  // int ** compile-time negative int is a float in CPython (decision log):
+  // desugar to float(base) ** float(exponent) so the manifest float.__pow__
+  // carries the runtime semantics (0 ** -n raises ZeroDivisionError there).
+  if (ast::isOperator(op, "Pow")) {
+    auto literalType = mlir::dyn_cast_if_present<py::LiteralType>(rhs.type);
+    llvm::StringRef spelling =
+        literalType ? literalType.getSpelling() : llvm::StringRef();
+    bool negativeIntLiteral =
+        spelling.size() > 1 && spelling.front() == '-' &&
+        llvm::all_of(spelling.drop_front(),
+                     [](char c) { return c >= '0' && c <= '9'; });
+    if (negativeIntLiteral &&
+        types.widenLiteral(lhs.type) == types.intType()) {
+      llvm::APFloat exponent(llvm::APFloat::IEEEdouble());
+      llvm::Expected<llvm::APFloat::opStatus> status =
+          exponent.convertFromString(spelling,
+                                     llvm::APFloat::rmNearestTiesToEven);
+      if (!status) {
+        llvm::consumeError(status.takeError());
+      } else if (!exponent.isInfinity()) {
+        // Exponents beyond the double range stay on the int path; its
+        // runtime rejection mirrors CPython's OverflowError there.
+        Value baseFloat = emitFloatFromInt(expr, lhs);
+        auto exponentConst = py::FloatConstantOp::create(
+            builder, loc(expr), types.floatType(),
+            builder.getF64FloatAttr(exponent.convertToDouble()));
+        Value exponentValue{exponentConst.getResult(), types.floatType()};
+        return emitBinarySpecial<py::PowOp>(expr, "__pow__", baseFloat,
+                                            exponentValue, types.floatType());
+      }
+    }
+  }
   mlir::Type left = types.widenLiteral(lhs.type);
   mlir::Type right = types.widenLiteral(rhs.type);
   mlir::Type result = types.join({left, right});

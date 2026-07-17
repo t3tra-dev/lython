@@ -170,6 +170,8 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     return *v;
   if (std::optional<Value> v = tryEmitIntCall(expr, calleeNode))
     return *v;
+  if (std::optional<Value> v = tryEmitFloatCall(expr, calleeNode))
+    return *v;
   if (std::optional<Value> v = tryEmitStrCall(expr, calleeNode))
     return *v;
   if (std::optional<Value> v = tryEmitListCall(expr, calleeNode))
@@ -550,6 +552,54 @@ ModuleEmitter::tryEmitIntCall(const parser::Node &expr,
         mlir::FlatSymbolRefAttr::get(&context, "__int__"),
         mlir::TypeAttr::get(contract), argument.value);
     return Value{op.getResult(), resultType};
+  }
+  return std::nullopt;
+}
+
+Value ModuleEmitter::emitFloatFromInt(const parser::Node &anchor,
+                                      Value argument) {
+  // The correctly rounded conversion is the runtime-level __float__ of
+  // builtins.int (not on the typed manifest surface, like str.__int__), so
+  // the contract is built here instead of going through method inference.
+  argument = coerceValue(argument, types.intType(), anchor);
+  mlir::Type resultType = types.floatType();
+  mlir::Type contract = py::CallableType::get(&context, {types.intType()}, {},
+                                              {}, {}, {resultType});
+  auto op = py::FloatOp::create(
+      builder, loc(anchor), resultType,
+      mlir::FlatSymbolRefAttr::get(&context, "__float__"),
+      mlir::TypeAttr::get(contract), argument.value);
+  return Value{op.getResult(), resultType};
+}
+
+std::optional<Value>
+ModuleEmitter::tryEmitFloatCall(const parser::Node &expr,
+                                const parser::Node *calleeNode) {
+  // float(x) is __float__ dispatch (CPython semantics), not construction —
+  // intercept before the class-instantiation paths claim builtins.float.
+  if (!calleeNode || calleeNode->kind != "Name" ||
+      ast::nameSpelling(*calleeNode) != "float" ||
+      values.find("float") != values.end())
+    return std::nullopt;
+  const auto *floatArgs = ast::nodeList(expr, "args");
+  const auto *floatKeywords = ast::nodeList(expr, "keywords");
+  auto floatClass = types.lookupClass("float");
+  std::optional<llvm::StringRef> floatSymbol =
+      floatClass ? contractName(*floatClass) : std::nullopt;
+  if (!floatSymbol || *floatSymbol != "builtins.float" || !floatArgs ||
+      floatArgs->size() != 1 || (floatKeywords && !floatKeywords->empty()) ||
+      !floatArgs->front() || floatArgs->front()->kind == "Starred")
+    return std::nullopt;
+  mlir::Type argumentType =
+      types.widenLiteral(types.inferExpr(floatArgs->front().get()));
+  if (argumentType == types.floatType()) {
+    // float is immutable, so float(x) is the identity (CPython returns x).
+    Value argument = emitExpr(floatArgs->front().get());
+    return coerceValue(argument, types.floatType(), expr);
+  }
+  if (argumentType == types.intType()) {
+    Value argument = emitExpr(floatArgs->front().get());
+    return emitFloatFromInt(expr, argument);
   }
   return std::nullopt;
 }
@@ -1167,6 +1217,11 @@ ModuleEmitter::tryEmitRoundCall(const parser::Node &expr,
     llvm::SmallVector<mlir::Value, 2> inputs;
     llvm::SmallVector<mlir::Type, 1> extraTypes;
     Value receiver = emitExpr(args->front().get());
+    // round(int) is the identity (CPython); skipping the runtime call also
+    // keeps the manifest __round__ contract at a fixed two-argument arity.
+    if (args->size() == 1 &&
+        types.widenLiteral(receiver.type) == types.intType())
+      return coerceValue(receiver, types.intType(), expr);
     inputs.push_back(receiver.value);
     if (args->size() == 2) {
       Value ndigits = emitExpr((*args)[1].get());

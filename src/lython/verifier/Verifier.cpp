@@ -629,6 +629,10 @@ mlir::LogicalResult IntOp::verify() {
   return verifyResolvedProtocolCall(getOperation(), "callee_contract");
 }
 
+mlir::LogicalResult FloatOp::verify() {
+  return verifyResolvedProtocolCall(getOperation(), "callee_contract");
+}
+
 mlir::LogicalResult TypeObjectOp::verify() {
   auto resultType = mlir::dyn_cast<TypeType>(getResult().getType());
   if (!resultType)

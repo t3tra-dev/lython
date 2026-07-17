@@ -926,6 +926,27 @@ def Py_IntOp : Py_Op<"int", []> {
   let hasVerifier = 1;
 }
 
+def Py_FloatOp : Py_Op<"float", []> {
+  let summary = "Python float conversion operation";
+  let description = [{
+    Represents Python `float(value)` semantics after the frontend has selected
+    the `__float__` contract (the correctly rounded int conversion is the
+    manifest `__float__` runtime method of `builtins.int`). When `target` is
+    present it names the statically resolved method implementation. The result
+    contract must instantiate `builtins.float`.
+  }];
+
+  let arguments = (ins OptionalAttr<FlatSymbolRefAttr>:$target,
+      TypeAttrOf<Py_ProtocolType>:$callee_contract, Py_ContractType:$input);
+
+  let results = (outs Py_ContractType:$result);
+
+  let assemblyFormat =
+      "$callee_contract `(` $input `:` type($input) `)` attr-dict `->` "
+      "type($result)";
+  let hasVerifier = 1;
+}
+
 def Py_StrOp : Py_Op<"str", []> {
   let summary = "Python string conversion operation";
   let description = [{
