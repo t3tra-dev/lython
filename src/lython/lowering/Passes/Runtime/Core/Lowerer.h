@@ -70,6 +70,11 @@ private:
     mlir::Value value;
     mlir::Value valid;
     mlir::Value hasValue;
+    // Object-family yield lanes: the full physical span of the yielded value
+    // (concrete contract parts, plus the trailing (i64, i1) evidence pair for
+    // builtins.int). Empty for the legacy pure-pair int tier, where `value` /
+    // `valid` alone carry the yield.
+    llvm::SmallVector<mlir::Value, 6> lanePhysicals;
   };
 
   struct CallableProtocolSpecialization {
@@ -550,10 +555,41 @@ private:
   mlir::LogicalResult lowerListEvidenceNext(py::NextOp op,
                                             RuntimeBundle iterator);
   // Loop-body generator state-machine transform (GeneratorStateMachine.cpp).
+  //
+  // Suspension lane ABI (rfc/stdlib-semantics.md R3): a lane is one logical
+  // value crossing the suspension boundary. Control lanes (state, inject,
+  // has, hasret, arguments, frame slots in the int tier) ride the raw
+  // (i64, i1) evidence pair. Value-bearing lanes may instead carry an
+  // object-family value: its concrete physical span (runtimeValueTypesFor),
+  // plus the trailing (i64, i1) evidence pair when the contract is
+  // builtins.int. Ownership crosses the boundary through materialized
+  // contracts (ly.ownership.owned_results on suspend results,
+  // ly.ownership.transfer_args on resume arguments), which is what the
+  // affine-ownership verifier's generator-frame rule consumes.
+  struct GeneratorResumeLane {
+    // Runtime contract name; empty for a control lane (pure (i64, i1) pair).
+    std::string contract;
+    // builtins.int value lane: physical span + trailing evidence pair.
+    bool isInt = false;
+    // types.NoneType lane: dead immortal placeholders cross the boundary.
+    bool isNone = false;
+    unsigned physicalCount = 0;
+    bool isControl() const { return contract.empty(); }
+  };
   struct GeneratorResumeInfo {
     std::string cloneName;
     unsigned frameWidth = 0;
     unsigned argumentCount = 0;
+    // The yielded-value lane (result index 2 of the resume clone). Control
+    // lane in the legacy int tier; object-family for boxed yields.
+    GeneratorResumeLane valueLane;
+    // Values live across a yield, one lane each. Lanes are grouped per
+    // contract (lexicographic order) sized by the maximum same-contract live
+    // count over all yields, so every suspension state maps its live values
+    // onto type-stable lanes. The generator object absorbs each lane's
+    // ownership between suspensions (frame words in its storage), which the
+    // frame store/load helpers transfer in and out.
+    llvm::SmallVector<GeneratorResumeLane, 8> frameLanes;
     // Lazily synthesized driver functions (see GeneratorStateMachine.cpp):
     // step resumes once and reports (has, value, ret); advance additionally
     // raises StopIteration on exhaustion; throw/close inject exceptions at
@@ -562,8 +598,74 @@ private:
     std::string advanceName;
     std::string throwName;
     std::string closeName;
+    // Drop finalizer (RAII): runs close semantics (GeneratorExit into the
+    // body so finally blocks execute) and releases surviving frame lanes
+    // when the generator's refcount reaches zero without an explicit
+    // close(). Dispatched per target id by the module drop hook.
+    std::string finalizeName;
   };
   llvm::StringMap<GeneratorResumeInfo> generatorResumeClones;
+  // Lane ABI helpers (GeneratorStateMachine.cpp). The resume-clone lookup
+  // maps a clone function back to its GeneratorResumeInfo through the
+  // kPrimitiveI64CloneAttr original-name attribute.
+  GeneratorResumeInfo *generatorResumeInfoForClone(mlir::func::FuncOp clone);
+  mlir::FailureOr<GeneratorResumeLane>
+  computeGeneratorResumeLane(mlir::Operation *op, mlir::Type type);
+  llvm::SmallVector<mlir::Type, 6>
+  generatorLanePhysicalTypes(const GeneratorResumeLane &lane) const;
+  // Immortal dead placeholders for a lane's physical span: release-safe
+  // (immortal refcount) values that cross non-yield suspend exits so the
+  // owned-result contract stays dischargeable on every path.
+  mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>>
+  materializeGeneratorDeadLaneValues(mlir::Operation *op,
+                                     const GeneratorResumeLane &lane);
+  // Append the physical return operands for one suspend lane (Returns.cpp
+  // generator branch). Emits the pair-only materialization guard for int
+  // lanes and dead placeholders for None-typed operands on object lanes.
+  // `forceRetain` adds a reference even for owned bundles — used when the
+  // same SSA value crosses in two lanes (yielded AND live across the yield),
+  // where each lane must carry its own token.
+  mlir::LogicalResult appendGeneratorLaneReturnOperands(
+      mlir::func::ReturnOp op, const GeneratorResumeLane &lane,
+      const RuntimeBundle &bundle, llvm::SmallVectorImpl<mlir::Value> &operands,
+      bool forceRetain = false);
+  // Frame words a lane occupies in the generator storage: (raw, valid) for
+  // int lanes, then (pointer, size) per physical part.
+  unsigned generatorLaneFrameWords(const GeneratorResumeLane &lane) const;
+  // Identity function with an owned-results contract: roots a frame lane's
+  // incoming ownership at a call so the refcount inserter and the affine
+  // verifier track it like any produced resource (continuation block
+  // arguments alone are invisible to both).
+  mlir::FailureOr<mlir::func::FuncOp>
+  getOrCreateGeneratorClaimFunction(mlir::Operation *op,
+                                    const GeneratorResumeLane &lane);
+  // Store/load one frame lane's physical span to/from the generator
+  // storage words. Store consumes the span (ly.ownership.transfer_args);
+  // load produces it (ly.ownership.owned_results) and zeroes the slot, so
+  // ownership lives in exactly one place at any time.
+  mlir::FailureOr<mlir::func::FuncOp>
+  getOrCreateGeneratorFrameStoreFunction(mlir::Operation *op,
+                                         const GeneratorResumeLane &lane);
+  mlir::FailureOr<mlir::func::FuncOp>
+  getOrCreateGeneratorFrameLoadFunction(mlir::Operation *op,
+                                        const GeneratorResumeLane &lane);
+  // Entry seeding for a resume clone with mixed lanes: control lanes ride
+  // (i64, i1) pairs, frame lanes their physical spans (+ pair for int).
+  mlir::LogicalResult
+  seedGeneratorResumeCloneEntry(mlir::func::FuncOp function,
+                                mlir::ArrayRef<mlir::Type> logicalTypes,
+                                GeneratorResumeInfo &info);
+  // Storage word offset of each frame lane (after the header words and the
+  // argument pairs stored at creation for the drop finalizer).
+  llvm::SmallVector<unsigned, 8>
+  generatorFrameLaneWordOffsets(const GeneratorResumeInfo &info) const;
+  mlir::FailureOr<mlir::func::FuncOp>
+  getOrCreateGeneratorFinalizeFunction(GeneratorResumeInfo &info);
+  // Per-program drop hook: patches the generator deallocator so a
+  // release-to-zero dispatches the storage's target id to the matching
+  // finalizer before the storage is freed (rfc/stdlib-semantics.md R3:
+  // drop/close releases the absorbed frame values; CPython: __del__ closes).
+  mlir::LogicalResult generateGeneratorDropHook();
   mlir::LogicalResult buildGeneratorResumeCloneSignatures();
   mlir::LogicalResult buildGeneratorResumeBodies();
   // Inline statically-bound `yield from inner(...)` delegations into the

@@ -1933,16 +1933,22 @@ mlir::LogicalResult verifyPathSensitiveAffineOwnership(
 }
 
 // Generator frames (rfc/stdlib-semantics.md R3): an Own(rho) crossing a
-// yield is absorbed by the generator object, which must release it on
-// drop/close. The current resume tier instantiates that judgment
-// degenerately — the suspension ABI is NonObject-only (raw i64/i1 lanes),
-// so the frame provably holds no owned resource and the drop/close release
-// obligation is vacuously discharged. This rule pins the invariant: an
-// object-family type on a resume clone boundary would be an Own smuggled
-// across a suspension with no phase inserting its frame release, so it is
-// rejected here rather than silently leaked. Widening the frame to owned
-// values requires materializing a frame release contract on the generator
-// deallocator/close path first, then relaxing this check to consume it.
+// yield is absorbed by the generator object (frame lanes) or transferred to
+// the resumer (value lanes); both are ownership effects and must cross the
+// suspension boundary through materialized contracts, never as raw words.
+// The judgment this rule pins (rfc/memory-safety-proof.md, Boundary
+// Contracts): a resource may be introduced across the resume boundary only
+// by a verifier-visible lane contract. Concretely, a resume clone's
+// signature may contain non-NonObject lanes only when
+//   (a) the clone materializes `ly.generator.suspend_lanes` describing each
+//       object-family result range (contract, begin, size), and
+//   (b) every such range's begin offset is declared in the clone's
+//       ly.ownership.owned_results contract — the transfer(rho, resumer)
+//       effect the refcount inserter and this verifier both consume.
+// Anything else would be an Own smuggled across a suspension with no phase
+// inserting its release, so it is rejected here rather than silently
+// leaked. Argument lanes remain NonObject-only until the frame-absorption
+// (drop/close release) contract lands for resume arguments.
 mlir::LogicalResult verifyGeneratorResumeFrames(mlir::ModuleOp module) {
   return walkVerify<mlir::func::FuncOp>(
       module, [&](mlir::func::FuncOp function) {
@@ -1951,26 +1957,96 @@ mlir::LogicalResult verifyGeneratorResumeFrames(mlir::ModuleOp module) {
         auto isNonObjectLane = [](mlir::Type type) {
           return type.isInteger(64) || type.isInteger(1) || type.isIndex();
         };
+        mlir::FailureOr<own::FunctionContract> contract =
+            own::readFunctionContract(function);
+        if (mlir::failed(contract))
+          return mlir::failure();
+
+        // Lane contract reader: each object-family range must name its
+        // contract and be anchored by the given ownership index set (the
+        // transfer effect the refcount inserter consumes on the same side).
+        auto collectLanes =
+            [&](llvm::StringRef attrName, const own::IndexSet &anchors,
+                llvm::StringRef anchorLabel,
+                llvm::SmallVectorImpl<std::pair<std::int64_t, std::int64_t>>
+                    &ranges) -> mlir::LogicalResult {
+          auto lanes = function->getAttrOfType<mlir::ArrayAttr>(attrName);
+          if (!lanes)
+            return mlir::success();
+          for (mlir::Attribute entry : lanes) {
+            auto dict = mlir::dyn_cast<mlir::DictionaryAttr>(entry);
+            if (!dict) {
+              function.emitError() << "generator lane contract entry in "
+                                   << attrName << " is not a dictionary";
+              return mlir::failure();
+            }
+            auto laneContract = dict.getAs<mlir::StringAttr>("contract");
+            auto begin = dict.getAs<mlir::IntegerAttr>("begin");
+            auto size = dict.getAs<mlir::IntegerAttr>("size");
+            if (!laneContract || laneContract.getValue().empty() || !begin ||
+                !size) {
+              function.emitError() << "generator lane contract entry in "
+                                   << attrName
+                                   << " is missing contract/begin/size";
+              return mlir::failure();
+            }
+            ranges.push_back(
+                {begin.getInt(), begin.getInt() + size.getInt()});
+            if (size.getInt() > 0 &&
+                laneContract.getValue() != "types.NoneType" &&
+                !anchors.contains(static_cast<unsigned>(begin.getInt()))) {
+              function.emitError()
+                  << "generator lane at " << attrName << " offset "
+                  << begin.getInt() << " is not covered by the "
+                  << anchorLabel << " ownership contract";
+              return mlir::failure();
+            }
+          }
+          return mlir::success();
+        };
+        auto checkCoverage =
+            [&](llvm::ArrayRef<mlir::Type> types,
+                llvm::ArrayRef<std::pair<std::int64_t, std::int64_t>> ranges,
+                llvm::StringRef label) -> mlir::LogicalResult {
+          for (auto [index, laneType] : llvm::enumerate(types)) {
+            if (isNonObjectLane(laneType))
+              continue;
+            std::int64_t position = static_cast<std::int64_t>(index);
+            bool covered = llvm::any_of(
+                ranges, [&](std::pair<std::int64_t, std::int64_t> range) {
+                  return position >= range.first && position < range.second;
+                });
+            if (!covered) {
+              function.emitError()
+                  << "generator resume " << label << " type " << laneType
+                  << " is not a NonObject lane; an owned value may not "
+                     "cross a suspension boundary without a generator "
+                     "frame release contract";
+              return mlir::failure();
+            }
+          }
+          return mlir::success();
+        };
+
         mlir::FunctionType type = function.getFunctionType();
-        for (mlir::Type input : type.getInputs())
-          if (!isNonObjectLane(input)) {
-            function.emitError()
-                << "generator resume frame argument type " << input
-                << " is not a NonObject lane; an owned value may not "
-                   "cross a suspension boundary without a generator "
-                   "frame release contract";
-            return mlir::failure();
-          }
-        for (mlir::Type result : type.getResults())
-          if (!isNonObjectLane(result)) {
-            function.emitError()
-                << "generator resume suspend result type " << result
-                << " is not a NonObject lane; an owned value may not "
-                   "cross a suspension boundary without a generator "
-                   "frame release contract";
-            return mlir::failure();
-          }
-        return mlir::success();
+        // Resume arguments: frame lanes transfer INTO the clone
+        // (transfer_args); suspend results transfer OUT (owned_results).
+        llvm::SmallVector<std::pair<std::int64_t, std::int64_t>, 4> argRanges;
+        if (mlir::failed(collectLanes("ly.generator.resume_args",
+                                      contract->transferArgs, "transfer-args",
+                                      argRanges)))
+          return mlir::failure();
+        if (mlir::failed(
+                checkCoverage(type.getInputs(), argRanges, "frame argument")))
+          return mlir::failure();
+        llvm::SmallVector<std::pair<std::int64_t, std::int64_t>, 4>
+            resultRanges;
+        if (mlir::failed(collectLanes("ly.generator.suspend_lanes",
+                                      contract->ownedResults, "owned-results",
+                                      resultRanges)))
+          return mlir::failure();
+        return checkCoverage(type.getResults(), resultRanges,
+                             "suspend result");
       });
 }
 

@@ -80,6 +80,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerModule() {
     return mlir::failure();
   if (mlir::failed(RuntimeBundleLowerer::generateBoxedReleaseHook()))
     return mlir::failure();
+  if (mlir::failed(RuntimeBundleLowerer::generateGeneratorDropHook()))
+    return mlir::failure();
   // Class ops survive eraseLoweredPyOps so the hooks above can resolve
   // source-class ids and method symbols; drop them now that dispatch is built.
   llvm::SmallVector<py::ClassOp, 8> classOps;

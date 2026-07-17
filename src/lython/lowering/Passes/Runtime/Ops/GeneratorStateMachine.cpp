@@ -5,6 +5,8 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
 
+#include <cctype>
+
 // Loop-body generators: transform an int-pure generator body into a
 // primitive-i64 RESUME state machine (pure SSA — no in-body memory):
 //
@@ -46,17 +48,50 @@ namespace py::lowering {
 namespace {
 
 constexpr unsigned kGeneratorFrameSlotBase = 8;
-constexpr unsigned kGeneratorFrameSlotLimit = 24;
+// Words [48, 64) hold the suspended body's stashed EH token (flag word +
+// ExceptionParts payload): a body suspended inside an exception handler
+// must not keep the process's single TLS token occupied between
+// resumptions. Frame lanes must fit below this region.
+constexpr unsigned kGeneratorEHStashWordBase = 48;
+constexpr unsigned kGeneratorFrameSlotLimit = 64;
 constexpr llvm::StringLiteral kGeneratorBodyResultAttr{
     "ly.generator.body_result"};
 constexpr llvm::StringLiteral kGeneratorPublicResultAttr{
     "ly.generator.public_result"};
 
+// Exception successors for the generator liveness: a block whose ops sit
+// inside a registered try scope can transfer control to that scope's
+// handler entry (the block carrying the matching catch marker). Plain CFG
+// liveness misses those edges, so a value used only by a handler (e.g. a
+// local read in a finally) would silently not ride the frame across a
+// suspension inside the try.
+llvm::DenseMap<mlir::Block *, llvm::SmallVector<mlir::Block *, 2>>
+generatorExceptionEdges(
+    mlir::Region &region,
+    const llvm::DenseMap<mlir::Block *, std::int64_t> &tryHandlerIds) {
+  llvm::DenseMap<mlir::Block *, llvm::SmallVector<mlir::Block *, 2>> edges;
+  llvm::DenseMap<std::int64_t, mlir::Block *> handlers =
+      py::ownership::collectExceptionHandlerEntries(region);
+  for (mlir::Block &block : region) {
+    auto id = tryHandlerIds.find(&block);
+    if (id == tryHandlerIds.end())
+      continue;
+    auto handler = handlers.find(id->second);
+    if (handler != handlers.end() && handler->second != &block)
+      edges[&block].push_back(handler->second);
+  }
+  return edges;
+}
+
 // Backward liveness over a function region: liveIn(B) = values used in B or
-// live into a successor, minus values B itself defines (op results and block
-// arguments). Deterministic (SetVector, block/op order).
+// live into a successor (CFG or exception edge), minus values B itself
+// defines (op results and block arguments). Deterministic (SetVector,
+// block/op order).
 llvm::DenseMap<mlir::Block *, llvm::SetVector<mlir::Value>>
-computeLiveIns(mlir::Region &region) {
+computeLiveIns(mlir::Region &region,
+               const llvm::DenseMap<mlir::Block *,
+                                    llvm::SmallVector<mlir::Block *, 2>>
+                   &exceptionEdges) {
   llvm::DenseMap<mlir::Block *, llvm::SetVector<mlir::Value>> liveIns;
   bool changed = true;
   while (changed) {
@@ -67,6 +102,11 @@ computeLiveIns(mlir::Region &region) {
       for (mlir::Block *successor : block->getSuccessors())
         for (mlir::Value value : liveIns[successor])
           live.insert(value);
+      if (auto extra = exceptionEdges.find(block);
+          extra != exceptionEdges.end())
+        for (mlir::Block *successor : extra->second)
+          for (mlir::Value value : liveIns[successor])
+            live.insert(value);
       for (mlir::Operation &op : llvm::reverse(*block)) {
         for (mlir::Value result : op.getResults())
           live.remove(result);
@@ -94,12 +134,18 @@ computeLiveIns(mlir::Region &region) {
 llvm::SetVector<mlir::Value> liveAfterYield(
     py::YieldValueOp yield,
     llvm::DenseMap<mlir::Block *, llvm::SetVector<mlir::Value>> &liveIns,
+    const llvm::DenseMap<mlir::Block *, llvm::SmallVector<mlir::Block *, 2>>
+        &exceptionEdges,
     mlir::Block *entry) {
   mlir::Block *block = yield->getBlock();
   llvm::SetVector<mlir::Value> live;
   for (mlir::Block *successor : block->getSuccessors())
     for (mlir::Value value : liveIns[successor])
       live.insert(value);
+  if (auto extra = exceptionEdges.find(block); extra != exceptionEdges.end())
+    for (mlir::Block *successor : extra->second)
+      for (mlir::Value value : liveIns[successor])
+        live.insert(value);
   for (mlir::Operation &op : llvm::reverse(*block)) {
     if (&op == yield.getOperation())
       break;
@@ -146,8 +192,507 @@ constexpr unsigned kResumeControlLanes = 3;
 // Number of logical result lanes before the frame slots:
 // state', has, value, ret, hasret.
 constexpr unsigned kResumeResultLanes = 5;
+// Logical result index of the yielded-value lane.
+constexpr unsigned kResumeValueLaneIndex = 2;
 
 } // namespace
+
+// Map a resume clone back to its GeneratorResumeInfo: the clone carries the
+// original function's name in kPrimitiveI64CloneAttr, which keys the map.
+RuntimeBundleLowerer::GeneratorResumeInfo *
+RuntimeBundleLowerer::generatorResumeInfoForClone(mlir::func::FuncOp clone) {
+  if (!clone || !clone->hasAttr("ly.generator.resume"))
+    return nullptr;
+  auto original =
+      clone->getAttrOfType<mlir::StringAttr>(kPrimitiveI64CloneAttr);
+  if (!original)
+    return nullptr;
+  auto found = generatorResumeClones.find(original.getValue());
+  if (found == generatorResumeClones.end())
+    return nullptr;
+  return &found->second;
+}
+
+mlir::FailureOr<RuntimeBundleLowerer::GeneratorResumeLane>
+RuntimeBundleLowerer::computeGeneratorResumeLane(mlir::Operation *op,
+                                                 mlir::Type type) {
+  GeneratorResumeLane lane;
+  if (isNoneLike(type)) {
+    lane.contract = "types.NoneType";
+    lane.isNone = true;
+    lane.physicalCount = 0;
+    return lane;
+  }
+  std::string contract = runtimeContractName(type);
+  if (contract.empty())
+    return op->emitError()
+           << "generator suspension lane has no concrete runtime contract: "
+           << type;
+  const RuntimeValueShape *shape = manifest.valueShape(contract);
+  if (!shape)
+    return op->emitError()
+           << "generator suspension lane contract " << contract
+           << " has no runtime ABI shape";
+  lane.contract = contract;
+  lane.isInt = contract == "builtins.int";
+  lane.physicalCount = static_cast<unsigned>(shape->valueTypes.size());
+  return lane;
+}
+
+llvm::SmallVector<mlir::Type, 6> RuntimeBundleLowerer::generatorLanePhysicalTypes(
+    const GeneratorResumeLane &lane) const {
+  llvm::SmallVector<mlir::Type, 6> types;
+  mlir::Type i64 = mlir::IntegerType::get(context, 64);
+  mlir::Type i1 = mlir::IntegerType::get(context, 1);
+  if (lane.isControl()) {
+    types.push_back(i64);
+    types.push_back(i1);
+    return types;
+  }
+  if (const RuntimeValueShape *shape = manifest.valueShape(lane.contract))
+    types.append(shape->valueTypes.begin(), shape->valueTypes.end());
+  if (lane.isInt) {
+    types.push_back(i64);
+    types.push_back(i1);
+  }
+  return types;
+}
+
+// Release-safe placeholders for a value-bearing lane on non-yield exits:
+// immortal static globals, so the consumer's owned-result release obligation
+// stays dischargeable (a no-op) on paths where no value was yielded.
+mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>>
+RuntimeBundleLowerer::materializeGeneratorDeadLaneValues(
+    mlir::Operation *op, const GeneratorResumeLane &lane) {
+  llvm::SmallVector<mlir::Value, 4> values;
+  if (lane.isControl() || lane.isNone)
+    return values;
+  mlir::FailureOr<RuntimeValue> dead =
+      RuntimeBundleLowerer::materializeNonOwningDeadObjectValue(
+          op, runtimeContractType(context, lane.contract),
+          "generator suspend placeholder");
+  if (mlir::failed(dead))
+    return mlir::failure();
+  values.append(dead->values.begin(), dead->values.end());
+  if (lane.isInt) {
+    mlir::Location loc = op->getLoc();
+    values.push_back(
+        mlir::arith::ConstantIntOp::create(builder, loc, 0, 64).getResult());
+    values.push_back(
+        mlir::arith::ConstantIntOp::create(builder, loc, 0, 1).getResult());
+  }
+  return values;
+}
+
+// One suspend lane's physical return operands. Ownership: the suspend result
+// range is covered by the clone's owned-results contract, so appending an
+// OWNED bundle transfers its token to the resumer; borrowed/immortal sources
+// are retained first (CPython: the caller of next() receives a new
+// reference). Pair-only ints materialize their object once, at the boundary
+// (never silently mis-execute: an invalid pair here means the value left the
+// i64 lane without a boxed representation, which is a loud runtime error).
+mlir::LogicalResult RuntimeBundleLowerer::appendGeneratorLaneReturnOperands(
+    mlir::func::ReturnOp op, const GeneratorResumeLane &lane,
+    const RuntimeBundle &bundle, llvm::SmallVectorImpl<mlir::Value> &operands,
+    bool forceRetain) {
+  mlir::Location loc = op.getLoc();
+  builder.setInsertionPoint(op);
+  if (lane.isControl())
+    return op.emitError()
+           << "generator control lanes do not take object return operands";
+  if (lane.isNone)
+    return mlir::success();
+
+  bool bundleIsNone = bundle.contractName() == "types.NoneType";
+  if (bundleIsNone) {
+    mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> dead =
+        RuntimeBundleLowerer::materializeGeneratorDeadLaneValues(
+            op.getOperation(), lane);
+    if (mlir::failed(dead))
+      return mlir::failure();
+    operands.append(dead->begin(), dead->end());
+    return mlir::success();
+  }
+
+  if (lane.isInt) {
+    if (bundle.contractName() != "builtins.int")
+      return op.emitError() << "generator yield lane expects builtins.int, got "
+                            << bundle.contract;
+    if (!bundle.physicalValues().empty()) {
+      if (bundle.physicalValues().size() != lane.physicalCount)
+        return op.emitError()
+               << "generator int yield lane has "
+               << bundle.physicalValues().size()
+               << " physical values, but the lane ABI expects "
+               << lane.physicalCount;
+      if ((forceRetain ||
+           bundle.objectValue.ownership != ownership::OwnershipKind::Own) &&
+          mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
+              op, bundle, "generator yield lane")))
+        return mlir::failure();
+      operands.append(bundle.physicalValues().begin(),
+                      bundle.physicalValues().end());
+      if (bundle.primitiveI64) {
+        operands.push_back(bundle.primitiveI64->value);
+        operands.push_back(bundle.primitiveI64->valid);
+      } else {
+        operands.push_back(
+            mlir::arith::ConstantIntOp::create(builder, loc, 0, 64)
+                .getResult());
+        operands.push_back(
+            mlir::arith::ConstantIntOp::create(builder, loc, 0, 1)
+                .getResult());
+      }
+      return mlir::success();
+    }
+    if (!bundle.primitiveI64)
+      return op.emitError()
+             << "generator int yield lane has neither physical values nor "
+                "primitive evidence";
+    // Pair-only: the raw lane is authoritative only while valid. Reject an
+    // invalid pair loudly before materializing.
+    mlir::Value valid = bundle.primitiveI64->valid;
+    mlir::Value trueValue =
+        mlir::arith::ConstantIntOp::create(builder, loc, 1, 1);
+    mlir::Value invalid =
+        mlir::arith::XOrIOp::create(builder, loc, valid, trueValue);
+    auto guard = mlir::scf::IfOp::create(builder, loc, invalid,
+                                         /*withElseRegion=*/false);
+    {
+      mlir::OpBuilder::InsertionGuard guardScope(builder);
+      builder.setInsertionPoint(guard.getThenRegion().front().getTerminator());
+      if (mlir::failed(RuntimeBundleLowerer::emitRuntimeException(
+              op.getOperation(), "builtins.ValueError",
+              "int too large to convert to a native 64-bit integer")))
+        return mlir::failure();
+    }
+    builder.setInsertionPoint(op);
+    std::optional<RuntimeSymbol> initializer =
+        manifest.initializer("builtins.int", "__new__");
+    if (!initializer)
+      return op.emitError() << "runtime manifest has no builtins.int.__new__ "
+                               "for the generator yield lane";
+    mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+        loc, *initializer, mlir::ValueRange{bundle.primitiveI64->value});
+    if (call.getNumResults() != lane.physicalCount)
+      return op.emitError() << "builtins.int.__new__ does not match the "
+                               "generator yield lane ABI";
+    operands.append(call.getResults().begin(), call.getResults().end());
+    operands.push_back(bundle.primitiveI64->value);
+    operands.push_back(trueValue);
+    return mlir::success();
+  }
+
+  if (bundle.contractName() != lane.contract)
+    return op.emitError() << "generator yield lane expects " << lane.contract
+                          << ", got " << bundle.contract;
+  if (bundle.physicalValues().size() != lane.physicalCount)
+    return op.emitError() << "generator yield lane for " << lane.contract
+                          << " has " << bundle.physicalValues().size()
+                          << " physical values, but the lane ABI expects "
+                          << lane.physicalCount;
+  if ((forceRetain ||
+       bundle.objectValue.ownership != ownership::OwnershipKind::Own) &&
+      mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
+          op, bundle, "generator yield lane")))
+    return mlir::failure();
+  operands.append(bundle.physicalValues().begin(),
+                  bundle.physicalValues().end());
+  return mlir::success();
+}
+
+unsigned RuntimeBundleLowerer::generatorLaneFrameWords(
+    const GeneratorResumeLane &lane) const {
+  if (lane.isControl() || lane.isNone)
+    return lane.isControl() ? 2 : 0;
+  return (lane.isInt ? 2 : 0) + 2 * lane.physicalCount;
+}
+
+// Storage layout: header words 0..7, then one (raw, valid) pair per
+// generator argument (stored at creation so the drop finalizer can resume
+// the body without call-site evidence), then the frame lanes.
+llvm::SmallVector<unsigned, 8>
+RuntimeBundleLowerer::generatorFrameLaneWordOffsets(
+    const GeneratorResumeInfo &info) const {
+  llvm::SmallVector<unsigned, 8> offsets;
+  unsigned frameWord = kGeneratorFrameSlotBase + 2 * info.argumentCount;
+  for (const GeneratorResumeLane &lane : info.frameLanes) {
+    offsets.push_back(frameWord);
+    frameWord += RuntimeBundleLowerer::generatorLaneFrameWords(lane);
+  }
+  return offsets;
+}
+
+namespace {
+
+std::string generatorLaneSymbolComponent(llvm::StringRef contract) {
+  std::string text;
+  text.reserve(contract.size());
+  for (char ch : contract)
+    text.push_back(std::isalnum(static_cast<unsigned char>(ch)) ? ch : '_');
+  return text;
+}
+
+} // namespace
+
+mlir::FailureOr<mlir::func::FuncOp>
+RuntimeBundleLowerer::getOrCreateGeneratorClaimFunction(
+    mlir::Operation *op, const GeneratorResumeLane &lane) {
+  std::string name =
+      "__ly_generator_claim_" + generatorLaneSymbolComponent(lane.contract);
+  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(name))
+    return existing;
+  mlir::OpBuilder::InsertionGuard guard(builder);
+  mlir::Location loc = op->getLoc();
+  llvm::SmallVector<mlir::Type, 6> types =
+      RuntimeBundleLowerer::generatorLanePhysicalTypes(lane);
+  builder.setInsertionPointToEnd(module.getBody());
+  auto function = mlir::func::FuncOp::create(
+      builder, loc, name, builder.getFunctionType(types, types));
+  function.setPrivate();
+  function->setAttr(ownership::kOwnedResultsAttr,
+                    mlir::DenseI64ArrayAttr::get(
+                        context, llvm::ArrayRef<std::int64_t>{0}));
+  function->setAttr(
+      ownership::kOwnedResultContractsAttr,
+      builder.getArrayAttr({builder.getStringAttr(lane.contract)}));
+  mlir::Block *entry = function.addEntryBlock();
+  builder.setInsertionPointToStart(entry);
+  mlir::func::ReturnOp::create(builder, loc, entry->getArguments());
+  return function;
+}
+
+mlir::FailureOr<mlir::func::FuncOp>
+RuntimeBundleLowerer::getOrCreateGeneratorFrameStoreFunction(
+    mlir::Operation *op, const GeneratorResumeLane &lane) {
+  std::string name = "__ly_generator_frame_store_" +
+                     generatorLaneSymbolComponent(lane.contract);
+  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(name))
+    return existing;
+  mlir::OpBuilder::InsertionGuard guard(builder);
+  mlir::Location loc = op->getLoc();
+  mlir::Type i64 = builder.getI64Type();
+  llvm::SmallVector<mlir::Type, 8> laneTypes =
+      RuntimeBundleLowerer::generatorLanePhysicalTypes(lane);
+  llvm::SmallVector<mlir::Type, 10> inputs;
+  inputs.push_back(generatorStorageType(builder));
+  inputs.push_back(i64); // frame word base
+  inputs.append(laneTypes.begin(), laneTypes.end());
+  builder.setInsertionPointToEnd(module.getBody());
+  auto function = mlir::func::FuncOp::create(
+      builder, loc, name, builder.getFunctionType(inputs, {}));
+  function.setPrivate();
+  // The frame absorbs the span's token: callers hand it over for good. The
+  // transfer anchors at the lane's header (operand 2); the remaining parts
+  // are interior views of the same entity.
+  if (lane.physicalCount > 0) {
+    function->setAttr(ownership::kTransferArgsAttr,
+                      builder.getI64ArrayAttr({2}));
+    function.setArgAttr(2, ownership::kObjectHeaderAttr, builder.getUnitAttr());
+  }
+
+  mlir::Block *entry = function.addEntryBlock();
+  builder.setInsertionPointToStart(entry);
+  mlir::Value storage = entry->getArgument(0);
+  mlir::Value base = entry->getArgument(1);
+  auto wordIndex = [&](unsigned offset) -> mlir::Value {
+    mlir::Value word = mlir::arith::AddIOp::create(
+        builder, loc, base,
+        mlir::arith::ConstantIntOp::create(builder, loc, offset, 64)
+            .getResult());
+    return mlir::arith::IndexCastOp::create(builder, loc,
+                                            builder.getIndexType(), word)
+        .getResult();
+  };
+  unsigned word = 0;
+  if (lane.isInt) {
+    mlir::Value raw = entry->getArgument(2 + lane.physicalCount);
+    mlir::Value valid = entry->getArgument(2 + lane.physicalCount + 1);
+    mlir::Value validWord =
+        mlir::arith::ExtUIOp::create(builder, loc, i64, valid).getResult();
+    mlir::memref::StoreOp::create(builder, loc, raw, storage, wordIndex(0));
+    mlir::memref::StoreOp::create(builder, loc, validWord, storage,
+                                  wordIndex(1));
+    word = 2;
+  }
+  mlir::Value zero =
+      mlir::arith::ConstantIntOp::create(builder, loc, 0, 64).getResult();
+  for (unsigned part = 0; part < lane.physicalCount; ++part) {
+    mlir::Value value = entry->getArgument(2 + part);
+    auto memref = mlir::dyn_cast<mlir::MemRefType>(value.getType());
+    mlir::Value pointerWord = zero;
+    mlir::Value sizeWord = zero;
+    if (memref && memref.getRank() == 1) {
+      mlir::Value pointerIndex =
+          mlir::memref::ExtractAlignedPointerAsIndexOp::create(builder, loc,
+                                                               value);
+      pointerWord = mlir::arith::IndexCastOp::create(builder, loc, i64,
+                                                     pointerIndex)
+                        .getResult();
+      if (memref.hasStaticShape()) {
+        sizeWord = mlir::arith::ConstantIntOp::create(
+                       builder, loc, memref.getDimSize(0), 64)
+                       .getResult();
+      } else {
+        mlir::Value dim =
+            mlir::memref::DimOp::create(builder, loc, value, 0).getResult();
+        sizeWord =
+            mlir::arith::IndexCastOp::create(builder, loc, i64, dim)
+                .getResult();
+      }
+    }
+    mlir::memref::StoreOp::create(builder, loc, pointerWord, storage,
+                                  wordIndex(word));
+    mlir::memref::StoreOp::create(builder, loc, sizeWord, storage,
+                                  wordIndex(word + 1));
+    word += 2;
+  }
+  mlir::func::ReturnOp::create(builder, loc);
+  return function;
+}
+
+mlir::FailureOr<mlir::func::FuncOp>
+RuntimeBundleLowerer::getOrCreateGeneratorFrameLoadFunction(
+    mlir::Operation *op, const GeneratorResumeLane &lane) {
+  std::string name = "__ly_generator_frame_load_" +
+                     generatorLaneSymbolComponent(lane.contract);
+  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(name))
+    return existing;
+  mlir::OpBuilder::InsertionGuard guard(builder);
+  mlir::Location loc = op->getLoc();
+  mlir::Type i64 = builder.getI64Type();
+  llvm::SmallVector<mlir::Type, 8> laneTypes =
+      RuntimeBundleLowerer::generatorLanePhysicalTypes(lane);
+  builder.setInsertionPointToEnd(module.getBody());
+  auto function = mlir::func::FuncOp::create(
+      builder, loc, name,
+      builder.getFunctionType({generatorStorageType(builder), i64},
+                              laneTypes));
+  function.setPrivate();
+  function->setAttr(ownership::kOwnedResultsAttr,
+                    mlir::DenseI64ArrayAttr::get(
+                        context, llvm::ArrayRef<std::int64_t>{0}));
+  function->setAttr(
+      ownership::kOwnedResultContractsAttr,
+      builder.getArrayAttr({builder.getStringAttr(lane.contract)}));
+
+  mlir::Block *entry = function.addEntryBlock();
+  builder.setInsertionPointToStart(entry);
+  mlir::Value storage = entry->getArgument(0);
+  mlir::Value base = entry->getArgument(1);
+  auto wordIndex = [&](unsigned offset) -> mlir::Value {
+    mlir::Value word = mlir::arith::AddIOp::create(
+        builder, loc, base,
+        mlir::arith::ConstantIntOp::create(builder, loc, offset, 64)
+            .getResult());
+    return mlir::arith::IndexCastOp::create(builder, loc,
+                                            builder.getIndexType(), word)
+        .getResult();
+  };
+  mlir::Value zero =
+      mlir::arith::ConstantIntOp::create(builder, loc, 0, 64).getResult();
+  unsigned word = 0;
+  mlir::Value raw;
+  mlir::Value valid;
+  if (lane.isInt) {
+    raw = mlir::memref::LoadOp::create(builder, loc, storage, wordIndex(0))
+              .getResult();
+    mlir::Value validWord =
+        mlir::memref::LoadOp::create(builder, loc, storage, wordIndex(1))
+            .getResult();
+    valid = mlir::arith::CmpIOp::create(
+                builder, loc, mlir::arith::CmpIPredicate::ne, validWord, zero)
+                .getResult();
+    word = 2;
+  }
+  llvm::SmallVector<mlir::Value, 6> results;
+  for (unsigned part = 0; part < lane.physicalCount; ++part) {
+    mlir::Value pointerWord =
+        mlir::memref::LoadOp::create(builder, loc, storage, wordIndex(word))
+            .getResult();
+    mlir::Value sizeWord =
+        mlir::memref::LoadOp::create(builder, loc, storage,
+                                     wordIndex(word + 1))
+            .getResult();
+    results.push_back(RuntimeBundleLowerer::memrefFromBoxWords(
+        builder, loc, pointerWord, sizeWord,
+        mlir::cast<mlir::MemRefType>(laneTypes[part])));
+    word += 2;
+  }
+  // Ownership moves out with the loaded span: zero the slot so a later
+  // drop/close finalization releases only what the frame still holds.
+  for (unsigned index = 0; index < word; ++index)
+    mlir::memref::StoreOp::create(builder, loc, zero, storage,
+                                  wordIndex(index));
+  if (lane.isInt) {
+    results.push_back(raw);
+    results.push_back(valid);
+  }
+  mlir::func::ReturnOp::create(builder, loc, results);
+  return function;
+}
+
+// Entry seeding for the resume clone's mixed lane ABI: control lanes get
+// raw (i64, i1) pair arguments and pair-only bundles; frame lanes get their
+// physical span (+ trailing pair for int) and borrowed object bundles — the
+// entry arguments only feed the resume dispatch, which forwards them into
+// the continuations where the claim calls take ownership.
+mlir::LogicalResult RuntimeBundleLowerer::seedGeneratorResumeCloneEntry(
+    mlir::func::FuncOp function, mlir::ArrayRef<mlir::Type> logicalTypes,
+    GeneratorResumeInfo &info) {
+  if (function.isDeclaration())
+    return mlir::success();
+  mlir::Block &entry = function.getBody().front();
+  if (entry.getNumArguments() != logicalTypes.size())
+    return function.emitError()
+           << "generator resume clone entry argument count does not match "
+              "callable_type";
+
+  unsigned logicalArgCount = entry.getNumArguments();
+  unsigned controlCount = info.argumentCount + kResumeControlLanes;
+  for (auto [index, logicalType] : llvm::enumerate(logicalTypes)) {
+    mlir::BlockArgument logicalArg = entry.getArgument(index);
+    const GeneratorResumeLane *lane = nullptr;
+    if (index >= controlCount && index - controlCount < info.frameLanes.size())
+      lane = &info.frameLanes[index - controlCount];
+    if (!lane || lane->isControl()) {
+      if (runtimeContractName(logicalType) != "builtins.int")
+        return function.emitError()
+               << "generator resume clone control lane " << index
+               << " must be builtins.int, got " << logicalType;
+      mlir::BlockArgument raw = entry.addArgument(
+          mlir::IntegerType::get(context, 64), logicalArg.getLoc());
+      mlir::BlockArgument valid = entry.addArgument(
+          mlir::IntegerType::get(context, 1), logicalArg.getLoc());
+      RuntimeBundle bundle = RuntimeBundle::objectWithOwnership(
+          logicalType, mlir::ValueRange{},
+          ownership::logicalOwnershipKind(logicalType,
+                                          /*ownsObject=*/false));
+      bundle.primitiveI64 = RuntimePrimitiveI64Evidence{raw, valid};
+      valueBundles[logicalArg] = std::move(bundle);
+      continue;
+    }
+    llvm::SmallVector<mlir::Type, 6> laneTypes =
+        RuntimeBundleLowerer::generatorLanePhysicalTypes(*lane);
+    llvm::SmallVector<mlir::Value, 6> physicalArgs;
+    for (mlir::Type laneType : laneTypes)
+      physicalArgs.push_back(entry.addArgument(laneType, logicalArg.getLoc()));
+    RuntimeBundle bundle;
+    llvm::ArrayRef<mlir::Value> parts(physicalArgs);
+    if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+            function, logicalType, parts.take_front(lane->physicalCount),
+            bundle, /*ownsObject=*/false)))
+      return mlir::failure();
+    if (lane->isInt)
+      bundle.primitiveI64 = RuntimePrimitiveI64Evidence{
+          physicalArgs[lane->physicalCount],
+          physicalArgs[lane->physicalCount + 1]};
+    valueBundles[logicalArg] = std::move(bundle);
+  }
+  callableLogicalEntryArgCounts.push_back(
+      CallableLogicalEntryArgs{function, logicalArgCount});
+  return mlir::success();
+}
 
 // Phase 1 (before prepareCallableFunctionABIs): decide eligibility, compute
 // the frame width K, and create the resume clone with its extended logical
@@ -229,14 +774,32 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
       }
     }
 
-    // Eligibility on the (possibly delegation-inlined) clone: yields, sent
-    // values and returns all ride primitive int lanes in this tier.
+    // Eligibility on the (possibly delegation-inlined) clone: yielded values
+    // may ride any manifest-shaped object lane (they cross the suspension
+    // boundary through the owned-result lane contract); sent values and
+    // returns still ride primitive int lanes in this tier. All yields must
+    // agree on one lane contract — mixed-type yields would need a union
+    // lane, which has no suspension ABI yet.
     bool eligible = true;
+    std::string valueContract;
+    auto laneEligibleContract = [&](mlir::Type type) -> std::string {
+      if (isIntContract(type))
+        return "builtins.int";
+      std::string contract = runtimeContractName(type);
+      if (contract.empty() || !manifest.valueShape(contract))
+        return std::string();
+      return contract;
+    };
     llvm::SmallVector<py::YieldValueOp, 8> yields;
     clone.walk([&](mlir::Operation *op) {
       if (auto yield = mlir::dyn_cast<py::YieldValueOp>(op)) {
         yields.push_back(yield);
-        if (!isIntContract(yield.getValue().getType()))
+        std::string contract = laneEligibleContract(yield.getValue().getType());
+        if (contract.empty())
+          eligible = false;
+        else if (valueContract.empty())
+          valueContract = contract;
+        else if (valueContract != contract)
           eligible = false;
         if (!yield.getSent().use_empty() &&
             !isIntContract(yield.getSent().getType()))
@@ -274,33 +837,75 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
           return mlir::failure();
     }
 
-    // Frame width: max live-across-yield count, from backward liveness on
+    // Frame lanes: values live across a yield, from backward liveness on
     // the flattened clone CFG (phase 2 recomputes on the same clone; the
     // sent alias inserted there replaces the yield result one-for-one, so
-    // widths agree).
-    unsigned frameWidth = 0;
+    // the live sets agree). Lanes are grouped per contract — sized by the
+    // maximum same-contract live count over all yields — so every
+    // suspension state maps its live values onto type-stable lanes.
     bool livesEligible = true;
+    llvm::StringMap<unsigned> laneCounts;
     {
       llvm::SmallVector<py::YieldValueOp, 8> cloneYields;
       clone.walk(
           [&](py::YieldValueOp yield) { cloneYields.push_back(yield); });
       mlir::Block &cloneEntry = clone.getBody().front();
-      auto liveIns = computeLiveIns(clone.getBody());
+      auto exceptionEdges =
+          generatorExceptionEdges(clone.getBody(), tryHandlerIds);
+      auto liveIns = computeLiveIns(clone.getBody(), exceptionEdges);
       for (py::YieldValueOp yield : cloneYields) {
         llvm::SetVector<mlir::Value> lives =
-            liveAfterYield(yield, liveIns, &cloneEntry);
-        for (mlir::Value live : lives)
-          if (!isIntContract(live.getType()))
+            liveAfterYield(yield, liveIns, exceptionEdges, &cloneEntry);
+        llvm::StringMap<unsigned> counts;
+        for (mlir::Value live : lives) {
+          std::string contract = laneEligibleContract(live.getType());
+          if (contract.empty()) {
             livesEligible = false;
-        frameWidth =
-            std::max(frameWidth, static_cast<unsigned>(lives.size()));
+            break;
+          }
+          ++counts[contract];
+        }
+        for (auto &entry : counts) {
+          unsigned &lanes = laneCounts[entry.getKey()];
+          lanes = std::max(lanes, entry.getValue());
+        }
       }
     }
-    if (!livesEligible ||
-        kGeneratorFrameSlotBase + frameWidth > kGeneratorFrameSlotLimit) {
+    llvm::SmallVector<GeneratorResumeLane, 8> frameLanes;
+    unsigned frameWords = 0;
+    if (livesEligible) {
+      llvm::SmallVector<llvm::StringRef, 8> laneContracts;
+      for (auto &entry : laneCounts)
+        laneContracts.push_back(entry.getKey());
+      llvm::sort(laneContracts);
+      for (llvm::StringRef contract : laneContracts) {
+        mlir::FailureOr<GeneratorResumeLane> lane =
+            RuntimeBundleLowerer::computeGeneratorResumeLane(
+                clone.getOperation(),
+                runtimeContractType(context, contract.str()));
+        if (mlir::failed(lane))
+          return mlir::failure();
+        for (unsigned count = 0; count < laneCounts[contract]; ++count) {
+          frameLanes.push_back(*lane);
+          frameWords += RuntimeBundleLowerer::generatorLaneFrameWords(*lane);
+        }
+      }
+    }
+    unsigned frameWidth = static_cast<unsigned>(frameLanes.size());
+    unsigned argumentWords =
+        2 * static_cast<unsigned>(callable.getPositionalTypes().size());
+    if (!livesEligible || kGeneratorFrameSlotBase + argumentWords + frameWords >
+                              kGeneratorEHStashWordBase) {
       clone.erase();
       continue;
     }
+
+    mlir::FailureOr<GeneratorResumeLane> valueLane =
+        RuntimeBundleLowerer::computeGeneratorResumeLane(
+            clone.getOperation(),
+            runtimeContractType(context, valueContract));
+    if (mlir::failed(valueLane))
+      return mlir::failure();
 
     mlir::Type intContract = runtimeContractType(context, "builtins.int");
     llvm::SmallVector<mlir::Type, 8> argTypes(
@@ -308,13 +913,16 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
         callable.getPositionalTypes().end());
     for (unsigned lane = 0; lane < kResumeControlLanes; ++lane)
       argTypes.push_back(intContract); // state, sent, inject
-    for (unsigned slot = 0; slot < frameWidth; ++slot)
-      argTypes.push_back(intContract);
+    for (const GeneratorResumeLane &lane : frameLanes)
+      argTypes.push_back(runtimeContractType(context, lane.contract));
     llvm::SmallVector<mlir::Type, 8> resultTypes;
     for (unsigned lane = 0; lane < kResumeResultLanes; ++lane)
-      resultTypes.push_back(intContract); // state', has, value, ret, hasret
-    for (unsigned slot = 0; slot < frameWidth; ++slot)
-      resultTypes.push_back(intContract);
+      resultTypes.push_back(
+          lane == kResumeValueLaneIndex
+              ? runtimeContractType(context, valueContract)
+              : intContract); // state', has, value, ret, hasret
+    for (const GeneratorResumeLane &lane : frameLanes)
+      resultTypes.push_back(runtimeContractType(context, lane.contract));
 
     auto newCallable = py::CallableType::get(
         context, argTypes, /*kwonly=*/{}, /*varargType=*/mlir::Type(),
@@ -324,14 +932,19 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
     clone.setFunctionType(
         mlir::FunctionType::get(context, argTypes, resultTypes));
     mlir::Block &cloneEntry = clone.getBody().front();
-    for (unsigned extra = 0; extra < kResumeControlLanes + frameWidth; ++extra)
+    for (unsigned extra = 0; extra < kResumeControlLanes; ++extra)
       cloneEntry.addArgument(intContract, clone.getLoc());
+    for (const GeneratorResumeLane &lane : frameLanes)
+      cloneEntry.addArgument(runtimeContractType(context, lane.contract),
+                             clone.getLoc());
 
     GeneratorResumeInfo info;
     info.cloneName = cloneName;
     info.frameWidth = frameWidth;
     info.argumentCount = static_cast<unsigned>(
         callable.getPositionalTypes().size());
+    info.valueLane = *valueLane;
+    info.frameLanes = frameLanes;
     generatorResumeClones[body.getSymName().str()] = info;
   }
   return mlir::success();
@@ -522,9 +1135,22 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeBodies() {
              << "generator resume clone " << info.cloneName << " is missing";
     unsigned argumentCount = info.argumentCount;
     unsigned frameWidth = info.frameWidth;
-    unsigned logicalCount = argumentCount + kResumeControlLanes + frameWidth;
+    unsigned controlCount = argumentCount + kResumeControlLanes;
+    unsigned logicalCount = controlCount + frameWidth;
     mlir::Block &entryBlock = clone.getBody().front();
-    if (entryBlock.getNumArguments() != logicalCount + 2 * logicalCount)
+    // Per-logical-lane physical widths: control lanes ride the (i64, i1)
+    // pair, frame lanes their physical span (+ pair for int).
+    llvm::SmallVector<unsigned, 16> laneWidths(logicalCount, 2);
+    for (auto [index, lane] : llvm::enumerate(info.frameLanes))
+      laneWidths[controlCount + index] = static_cast<unsigned>(
+          RuntimeBundleLowerer::generatorLanePhysicalTypes(lane).size());
+    llvm::SmallVector<unsigned, 16> laneOffsets(logicalCount, 0);
+    unsigned physicalTotal = 0;
+    for (unsigned index = 0; index < logicalCount; ++index) {
+      laneOffsets[index] = logicalCount + physicalTotal;
+      physicalTotal += laneWidths[index];
+    }
+    if (entryBlock.getNumArguments() != logicalCount + physicalTotal)
       return clone.emitError()
              << "generator resume clone entry was not seeded as a "
                 "primitive-i64 callable";
@@ -532,15 +1158,51 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeBodies() {
     mlir::Type intContract = runtimeContractType(context, "builtins.int");
 
     auto rawOf = [&](unsigned logicalIndex) {
-      return entryBlock.getArgument(logicalCount + 2 * logicalIndex);
+      return entryBlock.getArgument(laneOffsets[logicalIndex]);
     };
     auto validOf = [&](unsigned logicalIndex) {
-      return entryBlock.getArgument(logicalCount + 2 * logicalIndex + 1);
+      return entryBlock.getArgument(laneOffsets[logicalIndex] + 1);
     };
     unsigned stateIndex = argumentCount;
     unsigned sentIndex = argumentCount + 1;
     unsigned injectIndex = argumentCount + 2;
     mlir::Value rawState = rawOf(stateIndex);
+
+    // Frame lane assignment: lanes are grouped per contract (phase 1
+    // ordering); a live value maps onto lane (start of its contract group +
+    // its ordinal among same-contract lives, in live-set order).
+    llvm::StringMap<unsigned> laneStarts;
+    for (auto [index, lane] : llvm::enumerate(info.frameLanes))
+      laneStarts.try_emplace(lane.contract, static_cast<unsigned>(index));
+    auto liveContract = [&](mlir::Value value) -> std::string {
+      if (isIntContract(value.getType()))
+        return "builtins.int";
+      if (isNoneLike(value.getType()))
+        return "types.NoneType";
+      return runtimeContractName(value.getType());
+    };
+    auto assignFrameLanes =
+        [&](llvm::ArrayRef<mlir::Value> lives,
+            llvm::SmallVectorImpl<unsigned> &liveLanes,
+            llvm::SmallVectorImpl<mlir::Value> &laneValues)
+        -> mlir::LogicalResult {
+      laneValues.assign(frameWidth, mlir::Value());
+      llvm::StringMap<unsigned> counts;
+      for (mlir::Value live : lives) {
+        std::string contract = liveContract(live);
+        auto start = laneStarts.find(contract);
+        unsigned lane =
+            start == laneStarts.end() ? frameWidth : start->second + counts[contract];
+        if (lane >= frameWidth || info.frameLanes[lane].contract != contract)
+          return clone.emitError()
+                 << "generator resume live value of contract " << contract
+                 << " exceeds the computed frame lanes";
+        ++counts[contract];
+        liveLanes.push_back(lane);
+        laneValues[lane] = live;
+      }
+      return mlir::success();
+    };
 
     // Logical int constant with primitive evidence: an unbound py constant
     // would need the full py lowering chain; instead reuse the entry's own
@@ -556,6 +1218,22 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeBodies() {
               .getResult();
       return py::ClassUpcastOp::create(b, loc, intContract, literal)
           .getResult();
+    };
+    // Placeholder for the yielded-value lane on non-yield exits: a None
+    // literal, which the generator return lowering maps to immortal dead
+    // placeholders (release-safe on the consumer's owned-result contract).
+    auto deadValueLaneOperand = [&](mlir::OpBuilder &b) -> mlir::Value {
+      return py::NoneOp::create(b, loc, py::LiteralType::get(context, "None"))
+          .getResult();
+    };
+    // Placeholder operand for a frame lane with no live value in a given
+    // state: int lanes reuse the zero literal (its materialization is the
+    // cached-zero singleton); object lanes cross dead immortal placeholders.
+    auto framePlaceholderOperand = [&](mlir::OpBuilder &b,
+                                       unsigned lane) -> mlir::Value {
+      if (info.frameLanes[lane].isInt)
+        return intLiteral(b, 0);
+      return deadValueLaneOperand(b);
     };
 
     // Collect yields in deterministic order and the original returns.
@@ -597,25 +1275,29 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeBodies() {
       llvm::SmallVector<mlir::Value, 8> operands;
       operands.push_back(intLiteral(b, doneState));
       operands.push_back(intLiteral(b, 0)); // has
-      operands.push_back(intLiteral(b, 0)); // value
+      operands.push_back(deadValueLaneOperand(b)); // value
       operands.push_back(returnedValue ? returnedValue : intLiteral(b, 0));
       operands.push_back(intLiteral(b, returnedValue ? 1 : 0));
       for (unsigned slot = 0; slot < frameWidth; ++slot)
-        operands.push_back(intLiteral(b, 0));
+        operands.push_back(framePlaceholderOperand(b, slot));
       mlir::func::ReturnOp::create(b, ret.getLoc(), operands);
       ret.erase();
     }
 
-    // Live sets from backward liveness on the still-unsplit body, so the
-    // frame covers uses reached through successor blocks (joins, loop
-    // headers), not just the block suffix.
-    auto liveIns = computeLiveIns(clone.getBody());
+    // Live sets from backward liveness, so the frame covers uses reached
+    // through successor blocks (joins, loop headers), not just the block
+    // suffix. Recomputed per yield below: a split re-homes later yields
+    // into fresh continuation blocks the stale map has no entries for,
+    // which would silently drop their successor live-ins (values used only
+    // past the NEXT suspension, e.g. in a shared finally).
 
     // Split at each yield; the yield's live-across set becomes the
     // continuation's logical block arguments and the suspend payload.
     struct Continuation {
       mlir::Block *block = nullptr;
       unsigned liveCount = 0;
+      // Frame lane index per live position (contract-grouped assignment).
+      llvm::SmallVector<unsigned, 8> liveLanes;
     };
     llvm::SmallVector<Continuation, 8> continuations;
     llvm::DenseSet<mlir::Block *> continuationBlocks;
@@ -624,11 +1306,19 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeBodies() {
     for (auto [index, yield] : llvm::enumerate(yields)) {
       std::int64_t state = static_cast<std::int64_t>(index) + 1;
       mlir::Block *block = yield->getBlock();
+      auto exceptionEdges =
+          generatorExceptionEdges(clone.getBody(), tryHandlerIds);
+      auto liveIns = computeLiveIns(clone.getBody(), exceptionEdges);
       llvm::SetVector<mlir::Value> lives =
-          liveAfterYield(yield, liveIns, &entryBlock);
+          liveAfterYield(yield, liveIns, exceptionEdges, &entryBlock);
       if (lives.size() > frameWidth)
         return yield.emitError()
                << "generator resume live set exceeds the computed frame";
+      llvm::SmallVector<unsigned, 8> liveLanes;
+      llvm::SmallVector<mlir::Value, 8> laneValues;
+      if (mlir::failed(
+              assignFrameLanes(lives.getArrayRef(), liveLanes, laneValues)))
+        return mlir::failure();
       mlir::Block *cont = block->splitBlock(
           std::next(mlir::Block::iterator(yield.getOperation())));
       // A suspension point inside a (flattened) try keeps its handler scope:
@@ -659,8 +1349,10 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeBodies() {
       auto aliasIt = sentAliases.find(yield.getOperation());
       if (aliasIt != sentAliases.end())
         aliasIt->second->setOperand(0, entryBlock.getArgument(sentIndex));
-      // The suspend: return (state, 1, value, 0, 0, lives...). External live
-      // operands are rethreaded by the normalization pass below.
+      // The suspend: return (state, 1, value, 0, 0, frame lanes...). Frame
+      // operands ride LANE order (contract-grouped); lanes with no live
+      // value in this state cross placeholders. External live operands are
+      // rethreaded by the normalization pass below.
       {
         mlir::OpBuilder b = mlir::OpBuilder::atBlockEnd(block);
         llvm::SmallVector<mlir::Value, 8> operands;
@@ -669,11 +1361,10 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeBodies() {
         operands.push_back(yield.getValue());
         operands.push_back(intLiteral(b, 0));
         operands.push_back(intLiteral(b, 0));
-        for (mlir::Value live : liveValues)
-          operands.push_back(live);
-        for (unsigned slot = static_cast<unsigned>(liveValues.size());
-             slot < frameWidth; ++slot)
-          operands.push_back(intLiteral(b, 0));
+        for (unsigned slot = 0; slot < frameWidth; ++slot)
+          operands.push_back(laneValues[slot]
+                                 ? laneValues[slot]
+                                 : framePlaceholderOperand(b, slot));
         mlir::func::ReturnOp::create(b, loc, operands);
       }
       // Continuation entry guards, in order: (1) an injected exception
@@ -718,8 +1409,8 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeBodies() {
       }
       yield.erase();
       continuationBlocks.insert(cont);
-      continuations.push_back(
-          Continuation{cont, static_cast<unsigned>(liveValues.size())});
+      continuations.push_back(Continuation{
+          cont, static_cast<unsigned>(liveValues.size()), liveLanes});
     }
 
     // Detach the original first block from the entry so the entry can become
@@ -755,9 +1446,14 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeBodies() {
           }
         if (external.empty())
           continue;
-        if (continuationBlocks.contains(block))
-          return clone.emitError()
-                 << "generator resume continuation live closure violated";
+        if (continuationBlocks.contains(block)) {
+          mlir::InFlightDiagnostic diagnostic =
+              clone.emitError()
+              << "generator resume continuation live closure violated:";
+          for (mlir::Value value : external)
+            diagnostic << " value=" << value << ";";
+          return diagnostic;
+        }
         normalizing = true;
         for (mlir::Value value : external) {
           mlir::BlockArgument arg = block->addArgument(value.getType(), loc);
@@ -788,19 +1484,62 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeBodies() {
       }
     }
 
-    // Raw evidence pairs for the logical continuation arguments, and bundles
-    // so the py ops in the continuations lower on the primitive lane.
+    // Physical spans for the logical continuation arguments, and bundles so
+    // the py ops in the continuations lower on them. Each lane's incoming
+    // ownership is re-rooted at a claim call (identity + owned-results
+    // contract): continuation block arguments alone are invisible to the
+    // refcount inserter and the affine verifier, so without the claim the
+    // frame's token would silently leak on paths where the value dies
+    // before the next suspension.
     for (Continuation &continuation : continuations) {
       mlir::Block *cont = continuation.block;
+      llvm::SmallVector<llvm::SmallVector<mlir::Value, 6>, 8> lanePhysicals;
       for (unsigned position = 0; position < continuation.liveCount;
            ++position) {
-        mlir::BlockArgument raw = cont->addArgument(builder.getI64Type(), loc);
-        mlir::BlockArgument valid = cont->addArgument(builder.getI1Type(), loc);
-        RuntimeBundle bundle = RuntimeBundle::objectWithOwnership(
-            intContract, mlir::ValueRange{},
-            ownership::logicalOwnershipKind(intContract,
-                                            /*ownsObject=*/false));
-        bundle.primitiveI64 = RuntimePrimitiveI64Evidence{raw, valid};
+        const GeneratorResumeLane &lane =
+            info.frameLanes[continuation.liveLanes[position]];
+        llvm::SmallVector<mlir::Type, 6> laneTypes =
+            RuntimeBundleLowerer::generatorLanePhysicalTypes(lane);
+        llvm::SmallVector<mlir::Value, 6> physicals;
+        for (mlir::Type laneType : laneTypes)
+          physicals.push_back(cont->addArgument(laneType, loc));
+        lanePhysicals.push_back(std::move(physicals));
+      }
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToStart(cont);
+      for (unsigned position = 0; position < continuation.liveCount;
+           ++position) {
+        const GeneratorResumeLane &lane =
+            info.frameLanes[continuation.liveLanes[position]];
+        llvm::ArrayRef<mlir::Value> physicals = lanePhysicals[position];
+        RuntimeBundle bundle;
+        if (lane.physicalCount == 0) {
+          if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+                  clone.getOperation(),
+                  runtimeContractType(context, lane.contract), physicals,
+                  bundle)))
+            return mlir::failure();
+        } else {
+          mlir::FailureOr<mlir::func::FuncOp> claim =
+              RuntimeBundleLowerer::getOrCreateGeneratorClaimFunction(
+                  clone.getOperation(), lane);
+          if (mlir::failed(claim))
+            return mlir::failure();
+          mlir::func::CallOp claimed =
+              mlir::func::CallOp::create(builder, loc, *claim, physicals);
+          llvm::SmallVector<mlir::Value, 6> owned(
+              claimed.getResults().begin(), claimed.getResults().end());
+          llvm::ArrayRef<mlir::Value> parts(owned);
+          if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+                  clone.getOperation(),
+                  runtimeContractType(context, lane.contract),
+                  parts.take_front(lane.physicalCount), bundle,
+                  /*ownsObject=*/true)))
+            return mlir::failure();
+          if (lane.isInt)
+            bundle.primitiveI64 = RuntimePrimitiveI64Evidence{
+                owned[lane.physicalCount], owned[lane.physicalCount + 1]};
+        }
         valueBundles[cont->getArgument(position)] = std::move(bundle);
       }
     }
@@ -821,13 +1560,14 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeBodies() {
       for (unsigned position = 0; position < continuation.liveCount;
            ++position)
         destOperands.push_back(entryBlock.getArgument(
-            argumentCount + kResumeControlLanes + position));
+            controlCount + continuation.liveLanes[position]));
       for (unsigned position = 0; position < continuation.liveCount;
            ++position) {
-        destOperands.push_back(
-            rawOf(argumentCount + kResumeControlLanes + position));
-        destOperands.push_back(
-            validOf(argumentCount + kResumeControlLanes + position));
+        unsigned logicalIndex =
+            controlCount + continuation.liveLanes[position];
+        for (unsigned part = 0; part < laneWidths[logicalIndex]; ++part)
+          destOperands.push_back(
+              entryBlock.getArgument(laneOffsets[logicalIndex] + part));
       }
       mlir::cf::CondBranchOp::create(b, loc, matches, continuation.block,
                                      destOperands, next, mlir::ValueRange{});
@@ -847,9 +1587,11 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeBodies() {
       llvm::SmallVector<mlir::Value, 8> operands;
       operands.push_back(intLiteral(b, doneState));
       for (unsigned lane = 1; lane < kResumeResultLanes; ++lane)
-        operands.push_back(intLiteral(b, 0));
+        operands.push_back(lane == kResumeValueLaneIndex
+                               ? deadValueLaneOperand(b)
+                               : intLiteral(b, 0));
       for (unsigned slot = 0; slot < frameWidth; ++slot)
-        operands.push_back(intLiteral(b, 0));
+        operands.push_back(framePlaceholderOperand(b, slot));
       mlir::func::ReturnOp::create(b, loc, operands);
     }
   }
@@ -888,13 +1630,30 @@ RuntimeBundleLowerer::getOrCreateGeneratorStepFunction(
   inputs.push_back(i64); // sent
   inputs.push_back(i1);  // sent valid
   inputs.push_back(i64); // inject
-  llvm::SmallVector<mlir::Type, 5> results{i1, i64, i1, i64, i1};
+  llvm::SmallVector<mlir::Type, 6> valueLaneTypes =
+      RuntimeBundleLowerer::generatorLanePhysicalTypes(info.valueLane);
+  unsigned valueLaneWidth = static_cast<unsigned>(valueLaneTypes.size());
+  llvm::SmallVector<mlir::Type, 8> results;
+  results.push_back(i1); // has
+  results.append(valueLaneTypes.begin(), valueLaneTypes.end());
+  results.push_back(i64); // ret
+  results.push_back(i1);  // hasret
 
   std::string name = info.cloneName + "__step";
   builder.setInsertionPointToEnd(module.getBody());
   auto function = mlir::func::FuncOp::create(
       builder, loc, name, builder.getFunctionType(inputs, results));
   function.setPrivate();
+  // The yielded value crosses the driver as an owned object span (the clone
+  // transferred it through its own owned-results contract).
+  if (!info.valueLane.isControl() && !info.valueLane.isNone) {
+    function->setAttr(ownership::kOwnedResultsAttr,
+                      mlir::DenseI64ArrayAttr::get(
+                          context, llvm::ArrayRef<std::int64_t>{1}));
+    function->setAttr(
+        ownership::kOwnedResultContractsAttr,
+        builder.getArrayAttr({builder.getStringAttr(info.valueLane.contract)}));
+  }
   info.stepName = name;
 
   mlir::Block *entry = function.addEntryBlock();
@@ -910,6 +1669,49 @@ RuntimeBundleLowerer::getOrCreateGeneratorStepFunction(
     return mlir::arith::ConstantIntOp::create(builder, loc, value, 64)
         .getResult();
   };
+
+  // EH token swap areas (single-token TLS): the generator storage words
+  // [48, 64) stash the suspended body's in-flight handler token; the local
+  // area stashes the RESUMER's context while the body runs. Addresses are
+  // raw i64 words into the respective allocations.
+  mlir::Type i64Type = builder.getI64Type();
+  auto ehVoidFn = [&](llvm::StringRef name) {
+    return getOrCreatePrivateFunction(
+        module, builder, name, builder.getFunctionType({i64Type}, {}));
+  };
+  mlir::func::FuncOp stashFn = ehVoidFn("LyEH_StashCurrentException");
+  mlir::func::FuncOp unstashFn = ehVoidFn("LyEH_UnstashException");
+  mlir::func::FuncOp releaseStashFn = ehVoidFn("LyEH_ReleaseStashedException");
+  auto wordAddress = [&](mlir::Value memrefValue,
+                         unsigned wordOffset) -> mlir::Value {
+    mlir::Value pointerIndex =
+        mlir::memref::ExtractAlignedPointerAsIndexOp::create(builder, loc,
+                                                             memrefValue);
+    mlir::Value address =
+        mlir::arith::IndexCastOp::create(builder, loc, i64Type, pointerIndex)
+            .getResult();
+    if (wordOffset == 0)
+      return address;
+    return mlir::arith::AddIOp::create(
+               builder, loc, address,
+               mlir::arith::ConstantIntOp::create(builder, loc,
+                                                  8 * wordOffset, 64)
+                   .getResult())
+        .getResult();
+  };
+  mlir::Value outerArea =
+      mlir::memref::AllocaOp::create(
+          builder, loc, mlir::MemRefType::get({16}, i64Type))
+          .getResult();
+  mlir::Value outerFlagSlot =
+      mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult();
+  mlir::memref::StoreOp::create(
+      builder, loc,
+      mlir::arith::ConstantIntOp::create(builder, loc, 0, 64).getResult(),
+      outerArea, outerFlagSlot);
+  mlir::Value outerAddress = wordAddress(outerArea, 0);
+  mlir::Value stashAddress =
+      wordAddress(generator, kGeneratorEHStashWordBase);
 
   mlir::Value lifecycle =
       mlir::memref::LoadOp::create(builder, loc, generator, slotIndex(2))
@@ -958,8 +1760,30 @@ RuntimeBundleLowerer::getOrCreateGeneratorStepFunction(
                                  mlir::ValueRange{}, callBlock,
                                  mlir::ValueRange{});
 
-  // Normal resume.
+  // Normal resume. First swap the EH token: on a plain resume the caller's
+  // pending token (if any) moves to the local stash and the body's stashed
+  // handler token (if any) returns to the slot; on an injection the staged
+  // exception IS the slot content to deliver, and it replaces the body's
+  // stashed handler context (CPython: throw() into a generator suspended in
+  // a handler supersedes the exception being handled).
   builder.setInsertionPointToEnd(callBlock);
+  {
+    mlir::Value zeroInject =
+        mlir::arith::CmpIOp::create(builder, loc,
+                                    mlir::arith::CmpIPredicate::eq, inject,
+                                    i64Const(0));
+    auto swapIf = mlir::scf::IfOp::create(builder, loc, zeroInject,
+                                          /*withElseRegion=*/true);
+    mlir::OpBuilder::InsertionGuard swapGuard(builder);
+    builder.setInsertionPoint(swapIf.getThenRegion().front().getTerminator());
+    mlir::func::CallOp::create(builder, loc, stashFn,
+                               mlir::ValueRange{outerAddress});
+    mlir::func::CallOp::create(builder, loc, unstashFn,
+                               mlir::ValueRange{stashAddress});
+    builder.setInsertionPoint(swapIf.getElseRegion().front().getTerminator());
+    mlir::func::CallOp::create(builder, loc, releaseStashFn,
+                               mlir::ValueRange{stashAddress});
+  }
   mlir::Value trueValue =
       mlir::arith::ConstantIntOp::create(builder, loc, 1, 1);
   llvm::SmallVector<mlir::Value, 24> operands;
@@ -973,33 +1797,70 @@ RuntimeBundleLowerer::getOrCreateGeneratorStepFunction(
   operands.push_back(sentValid);
   operands.push_back(inject);
   operands.push_back(trueValue);
-  for (unsigned slot = 0; slot < info.frameWidth; ++slot) {
-    mlir::Value live = mlir::memref::LoadOp::create(
-                           builder, loc, generator,
-                           slotIndex(kGeneratorFrameSlotBase + slot))
-                           .getResult();
-    operands.push_back(live);
-    operands.push_back(trueValue);
+  // Frame lanes: load each lane's span out of the generator storage. The
+  // load transfers the frame's token into the clone (and zeroes the slot),
+  // so ownership lives in exactly one place while the body runs.
+  llvm::SmallVector<unsigned, 8> laneWordOffsets =
+      RuntimeBundleLowerer::generatorFrameLaneWordOffsets(info);
+  llvm::SmallVector<unsigned, 8> laneResultWidths;
+  for (const GeneratorResumeLane &lane : info.frameLanes) {
+    laneResultWidths.push_back(static_cast<unsigned>(
+        RuntimeBundleLowerer::generatorLanePhysicalTypes(lane).size()));
+  }
+  for (auto [slot, lane] : llvm::enumerate(info.frameLanes)) {
+    mlir::FailureOr<mlir::func::FuncOp> load =
+        RuntimeBundleLowerer::getOrCreateGeneratorFrameLoadFunction(op, lane);
+    if (mlir::failed(load))
+      return mlir::failure();
+    mlir::func::CallOp loaded = mlir::func::CallOp::create(
+        builder, loc, *load,
+        mlir::ValueRange{generator, i64Const(laneWordOffsets[slot])});
+    operands.append(loaded.getResults().begin(), loaded.getResults().end());
   }
   mlir::func::CallOp::create(builder, loc, getOrCreateTryCallSiteMarker(),
                              mlir::ValueRange{i64Const(handlerId)});
   mlir::func::CallOp call =
       mlir::func::CallOp::create(builder, loc, clone, operands);
-  unsigned expectedResults = 2 * (kResumeResultLanes + info.frameWidth);
+  // Clone result layout: control lanes are (i64, i1) pairs; the value lane
+  // (logical result 2) and the frame lanes are their physical spans.
+  unsigned frameResultWidth = 0;
+  for (unsigned width : laneResultWidths)
+    frameResultWidth += width;
+  unsigned expectedResults =
+      2 * (kResumeResultLanes - 1) + valueLaneWidth + frameResultWidth;
   if (call.getNumResults() != expectedResults)
     return op->emitError() << "generator resume clone ABI mismatch";
+  unsigned valueSpanBegin = 4;
+  unsigned retRawIndex = valueSpanBegin + valueLaneWidth;
+  unsigned hasretRawIndex = retRawIndex + 2;
+  unsigned frameBaseIndex = hasretRawIndex + 2;
   mlir::Value newState = call.getResult(0);
   mlir::Value hasRaw = call.getResult(2);
-  mlir::Value value = call.getResult(4);
-  mlir::Value valueValid = call.getResult(5);
-  mlir::Value returnedValue = call.getResult(6);
-  mlir::Value returnedRaw = call.getResult(8);
+  llvm::SmallVector<mlir::Value, 6> valueSpan;
+  for (unsigned lane = 0; lane < valueLaneWidth; ++lane)
+    valueSpan.push_back(call.getResult(valueSpanBegin + lane));
+  mlir::Value returnedValue = call.getResult(retRawIndex);
+  mlir::Value returnedRaw = call.getResult(hasretRawIndex);
   mlir::memref::StoreOp::create(builder, loc, newState, generator,
                                 slotIndex(4));
-  for (unsigned slot = 0; slot < info.frameWidth; ++slot)
-    mlir::memref::StoreOp::create(
-        builder, loc, call.getResult(2 * kResumeResultLanes + 2 * slot),
-        generator, slotIndex(kGeneratorFrameSlotBase + slot));
+  // The frame absorbs each lane's token (rfc/stdlib-semantics.md R3): the
+  // store helper consumes the span into the generator storage words.
+  {
+    unsigned resultOffset = frameBaseIndex;
+    for (auto [slot, lane] : llvm::enumerate(info.frameLanes)) {
+      mlir::FailureOr<mlir::func::FuncOp> store =
+          RuntimeBundleLowerer::getOrCreateGeneratorFrameStoreFunction(op,
+                                                                       lane);
+      if (mlir::failed(store))
+        return mlir::failure();
+      llvm::SmallVector<mlir::Value, 10> storeOperands{
+          generator, i64Const(laneWordOffsets[slot])};
+      for (unsigned part = 0; part < laneResultWidths[slot]; ++part)
+        storeOperands.push_back(call.getResult(resultOffset + part));
+      mlir::func::CallOp::create(builder, loc, *store, storeOperands);
+      resultOffset += laneResultWidths[slot];
+    }
+  }
   mlir::Value hasValue = mlir::arith::CmpIOp::create(
       builder, loc, mlir::arith::CmpIPredicate::ne, hasRaw, i64Const(0));
   mlir::Value hasReturned = mlir::arith::CmpIOp::create(
@@ -1016,10 +1877,19 @@ RuntimeBundleLowerer::getOrCreateGeneratorStepFunction(
           .getResult();
   mlir::memref::StoreOp::create(builder, loc, nextLifecycle, generator,
                                 slotIndex(2));
-  mlir::func::ReturnOp::create(
-      builder, loc,
-      mlir::ValueRange{hasValue, value, valueValid, returnedValue,
-                       hasReturned});
+  // Swap the EH token back: a body that suspended inside a handler leaves
+  // its token pending — stash it with the generator; then the resumer's
+  // context returns to the slot.
+  mlir::func::CallOp::create(builder, loc, stashFn,
+                             mlir::ValueRange{stashAddress});
+  mlir::func::CallOp::create(builder, loc, unstashFn,
+                             mlir::ValueRange{outerAddress});
+  llvm::SmallVector<mlir::Value, 8> stepResults;
+  stepResults.push_back(hasValue);
+  stepResults.append(valueSpan.begin(), valueSpan.end());
+  stepResults.push_back(returnedValue);
+  stepResults.push_back(hasReturned);
+  mlir::func::ReturnOp::create(builder, loc, stepResults);
 
   // Body escaped with an exception: the generator is finished for good, and
   // PEP 479 turns an escaping StopIteration into RuntimeError. Everything
@@ -1031,6 +1901,11 @@ RuntimeBundleLowerer::getOrCreateGeneratorStepFunction(
                                 slotIndex(4));
   mlir::memref::StoreOp::create(builder, loc, i64Const(3), generator,
                                 slotIndex(2));
+  // The body escaped with an exception, which replaces the resumer's
+  // stashed context (chaining it is the traceback track's __context__
+  // work); releasing here keeps the token count exact.
+  mlir::func::CallOp::create(builder, loc, releaseStashFn,
+                             mlir::ValueRange{outerAddress});
   auto currentMatches = getOrCreatePrivateFunction(
       module, builder, "LyEH_CurrentExceptionMatches",
       builder.getFunctionType({builder.getI64Type()}, {builder.getI1Type()}));
@@ -1085,16 +1960,25 @@ RuntimeBundleLowerer::getOrCreateGeneratorAdvanceFunction(
     return mlir::failure();
   mlir::Location loc = step->getLoc();
   mlir::OpBuilder::InsertionGuard guard(builder);
-  mlir::Type i64 = builder.getI64Type();
-  mlir::Type i1 = builder.getI1Type();
 
+  llvm::SmallVector<mlir::Type, 6> valueLaneTypes =
+      RuntimeBundleLowerer::generatorLanePhysicalTypes(info.valueLane);
+  unsigned valueLaneWidth = static_cast<unsigned>(valueLaneTypes.size());
   std::string name = info.cloneName + "__advance";
   builder.setInsertionPointToEnd(module.getBody());
   auto function = mlir::func::FuncOp::create(
       builder, loc, name,
       builder.getFunctionType(step->getFunctionType().getInputs(),
-                              {i64, i1}));
+                              valueLaneTypes));
   function.setPrivate();
+  if (!info.valueLane.isControl() && !info.valueLane.isNone) {
+    function->setAttr(ownership::kOwnedResultsAttr,
+                      mlir::DenseI64ArrayAttr::get(
+                          context, llvm::ArrayRef<std::int64_t>{0}));
+    function->setAttr(
+        ownership::kOwnedResultContractsAttr,
+        builder.getArrayAttr({builder.getStringAttr(info.valueLane.contract)}));
+  }
   info.advanceName = name;
 
   mlir::Block *entry = function.addEntryBlock();
@@ -1102,6 +1986,8 @@ RuntimeBundleLowerer::getOrCreateGeneratorAdvanceFunction(
   builder.setInsertionPointToStart(entry);
   mlir::func::CallOp call = mlir::func::CallOp::create(
       builder, loc, *step, entry->getArguments());
+  unsigned retIndex = 1 + valueLaneWidth;
+  unsigned hasretIndex = retIndex + 1;
   mlir::Block *yieldedBlock = builder.createBlock(&body);
   mlir::Block *stoppedBlock = builder.createBlock(&body);
   builder.setInsertionPointToEnd(entry);
@@ -1109,15 +1995,33 @@ RuntimeBundleLowerer::getOrCreateGeneratorAdvanceFunction(
                                  mlir::ValueRange{}, stoppedBlock,
                                  mlir::ValueRange{});
   builder.setInsertionPointToEnd(yieldedBlock);
-  mlir::func::ReturnOp::create(
-      builder, loc, mlir::ValueRange{call.getResult(1), call.getResult(2)});
+  llvm::SmallVector<mlir::Value, 6> yieldedSpan;
+  for (unsigned lane = 0; lane < valueLaneWidth; ++lane)
+    yieldedSpan.push_back(call.getResult(1 + lane));
+  mlir::func::ReturnOp::create(builder, loc, yieldedSpan);
 
   builder.setInsertionPointToEnd(stoppedBlock);
+  // The exhausted path raises; its value span holds immortal dead
+  // placeholders, whose release discharges the step call's owned-result
+  // contract as a no-op before the raise.
+  if (!info.valueLane.isControl() && !info.valueLane.isNone) {
+    llvm::SmallVector<mlir::Value, 4> placeholderValues;
+    for (unsigned lane = 0; lane < info.valueLane.physicalCount; ++lane)
+      placeholderValues.push_back(call.getResult(1 + lane));
+    RuntimeBundle placeholder;
+    if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+            op, runtimeContractType(context, info.valueLane.contract),
+            placeholderValues, placeholder, /*ownsObject=*/true)))
+      return mlir::failure();
+    if (mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
+            op, placeholder, "generator exhausted value lane")))
+      return mlir::failure();
+  }
   mlir::Block *valueBlock = builder.createBlock(&body);
   mlir::Block *plainBlock = builder.createBlock(&body);
   builder.setInsertionPointToEnd(stoppedBlock);
-  mlir::cf::CondBranchOp::create(builder, loc, call.getResult(4), valueBlock,
-                                 mlir::ValueRange{}, plainBlock,
+  mlir::cf::CondBranchOp::create(builder, loc, call.getResult(hasretIndex),
+                                 valueBlock, mlir::ValueRange{}, plainBlock,
                                  mlir::ValueRange{});
 
   // return X → StopIteration whose message is str(X). Exhaustion can be
@@ -1137,7 +2041,7 @@ RuntimeBundleLowerer::getOrCreateGeneratorAdvanceFunction(
       return op->emitError() << "runtime manifest cannot render the generator "
                                 "return value (builtins.int __new__/__str__)";
     mlir::func::CallOp boxed = RuntimeBundleLowerer::createRuntimeCall(
-        loc, *intNew, mlir::ValueRange{call.getResult(3)});
+        loc, *intNew, mlir::ValueRange{call.getResult(retIndex)});
     mlir::func::CallOp text = RuntimeBundleLowerer::createRuntimeCall(
         loc, *intStr, boxed.getResults());
     // The boxed int is only a rendering temporary; drop it through the
@@ -1218,11 +2122,21 @@ RuntimeBundleLowerer::getOrCreateGeneratorThrowFunction(
   inputs.push_back(messageType);
   inputs.push_back(bytesType);
 
+  llvm::SmallVector<mlir::Type, 6> valueLaneTypes =
+      RuntimeBundleLowerer::generatorLanePhysicalTypes(info.valueLane);
   std::string name = info.cloneName + "__throw";
   builder.setInsertionPointToEnd(module.getBody());
   auto function = mlir::func::FuncOp::create(
-      builder, loc, name, builder.getFunctionType(inputs, {i64, i1}));
+      builder, loc, name, builder.getFunctionType(inputs, valueLaneTypes));
   function.setPrivate();
+  if (!info.valueLane.isControl() && !info.valueLane.isNone) {
+    function->setAttr(ownership::kOwnedResultsAttr,
+                      mlir::DenseI64ArrayAttr::get(
+                          context, llvm::ArrayRef<std::int64_t>{0}));
+    function->setAttr(
+        ownership::kOwnedResultContractsAttr,
+        builder.getArrayAttr({builder.getStringAttr(info.valueLane.contract)}));
+  }
   // The caller hands the exception over for good — like the *_Raise
   // primitives (the TLS slot takes it).
   function->setAttr(
@@ -1242,6 +2156,31 @@ RuntimeBundleLowerer::getOrCreateGeneratorThrowFunction(
     return mlir::arith::ConstantIntOp::create(builder, loc, value, 64)
         .getResult();
   };
+  // throw() may run inside the caller's exception handler: park the pending
+  // token so the staging below finds the single TLS slot free.
+  auto throwEHFn = [&](llvm::StringRef name) {
+    return getOrCreatePrivateFunction(
+        module, builder, name, builder.getFunctionType({i64}, {}));
+  };
+  mlir::func::FuncOp throwStashFn = throwEHFn("LyEH_StashCurrentException");
+  mlir::func::FuncOp throwUnstashFn = throwEHFn("LyEH_UnstashException");
+  mlir::func::FuncOp throwReleaseStashFn =
+      throwEHFn("LyEH_ReleaseStashedException");
+  mlir::Value throwOuterArea =
+      mlir::memref::AllocaOp::create(builder, loc,
+                                     mlir::MemRefType::get({16}, i64))
+          .getResult();
+  mlir::Value throwOuterPointer =
+      mlir::memref::ExtractAlignedPointerAsIndexOp::create(builder, loc,
+                                                           throwOuterArea);
+  mlir::Value throwOuterAddress =
+      mlir::arith::IndexCastOp::create(builder, loc, i64, throwOuterPointer)
+          .getResult();
+  mlir::memref::StoreOp::create(
+      builder, loc, i64Const(0), throwOuterArea,
+      mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult());
+  mlir::func::CallOp::create(builder, loc, throwStashFn,
+                             mlir::ValueRange{throwOuterAddress});
   auto throwException = getOrCreatePrivateFunction(
       module, builder, "LyEH_ThrowException",
       builder.getFunctionType({headerType, messageType, bytesType}, {}));
@@ -1302,6 +2241,8 @@ RuntimeBundleLowerer::getOrCreateGeneratorThrowFunction(
   advanceOperands.push_back(i64Const(1)); // inject
   mlir::func::CallOp resumed =
       mlir::func::CallOp::create(builder, loc, *advance, advanceOperands);
+  mlir::func::CallOp::create(builder, loc, throwUnstashFn,
+                             mlir::ValueRange{throwOuterAddress});
   mlir::func::ReturnOp::create(builder, loc, resumed.getResults());
 
   // Not suspended: the body never sees the exception. CPython closes a
@@ -1317,6 +2258,8 @@ RuntimeBundleLowerer::getOrCreateGeneratorThrowFunction(
     mlir::memref::StoreOp::create(builder, loc, i64Const(4), generator,
                                   slotIndex(2));
   }
+  mlir::func::CallOp::create(builder, loc, throwReleaseStashFn,
+                             mlir::ValueRange{throwOuterAddress});
   mlir::func::CallOp::create(builder, loc,
                              getOrCreateRethrowCurrent(module, builder),
                              mlir::ValueRange{});
@@ -1381,6 +2324,35 @@ RuntimeBundleLowerer::getOrCreateGeneratorCloseFunction(
     return mlir::arith::ConstantIndexOp::create(builder, loc, slot)
         .getResult();
   };
+  // close() may run while the caller holds the pending TLS token (close
+  // inside an except block, or the drop finalizer during unwinding); the
+  // GeneratorExit staging below needs the single slot free, so the caller
+  // context parks in a local stash for the duration.
+  mlir::Type closeI64 = builder.getI64Type();
+  auto closeEHFn = [&](llvm::StringRef name) {
+    return getOrCreatePrivateFunction(
+        module, builder, name, builder.getFunctionType({closeI64}, {}));
+  };
+  mlir::func::FuncOp closeStashFn = closeEHFn("LyEH_StashCurrentException");
+  mlir::func::FuncOp closeUnstashFn = closeEHFn("LyEH_UnstashException");
+  mlir::func::FuncOp closeReleaseStashFn =
+      closeEHFn("LyEH_ReleaseStashedException");
+  mlir::Value closeOuterArea =
+      mlir::memref::AllocaOp::create(
+          builder, loc, mlir::MemRefType::get({16}, closeI64))
+          .getResult();
+  mlir::Value closeOuterPointer =
+      mlir::memref::ExtractAlignedPointerAsIndexOp::create(builder, loc,
+                                                           closeOuterArea);
+  mlir::Value closeOuterAddress =
+      mlir::arith::IndexCastOp::create(builder, loc, closeI64,
+                                       closeOuterPointer)
+          .getResult();
+  mlir::memref::StoreOp::create(
+      builder, loc, i64Const(0), closeOuterArea,
+      mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult());
+  mlir::func::CallOp::create(builder, loc, closeStashFn,
+                             mlir::ValueRange{closeOuterAddress});
 
   mlir::Block *checkFinished = builder.createBlock(&body);
   mlir::Block *injectBlock = builder.createBlock(&body);
@@ -1457,6 +2429,22 @@ RuntimeBundleLowerer::getOrCreateGeneratorCloseFunction(
                              mlir::ValueRange{i64Const(resumeId)});
   mlir::func::CallOp resumed =
       mlir::func::CallOp::create(builder, loc, *step, stepOperands);
+  // Discharge the step call's owned value lane on both outcomes: immortal
+  // dead placeholders when the body finished (release is a no-op), the
+  // ignored yielded value when the body kept yielding.
+  if (!info.valueLane.isControl() && !info.valueLane.isNone) {
+    llvm::SmallVector<mlir::Value, 4> laneValues;
+    for (unsigned lane = 0; lane < info.valueLane.physicalCount; ++lane)
+      laneValues.push_back(resumed.getResult(1 + lane));
+    RuntimeBundle laneBundle;
+    if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+            op, runtimeContractType(context, info.valueLane.contract),
+            laneValues, laneBundle, /*ownsObject=*/true)))
+      return mlir::failure();
+    if (mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
+            op, laneBundle, "generator close ignored value lane")))
+      return mlir::failure();
+  }
   auto ignoredIf = mlir::scf::IfOp::create(builder, loc, resumed.getResult(0),
                                            /*withElseRegion=*/false);
   {
@@ -1465,10 +2453,14 @@ RuntimeBundleLowerer::getOrCreateGeneratorCloseFunction(
         ignoredIf.getThenRegion().front().getTerminator());
     // The staged GeneratorExit may still be the pending current exception
     // (the body can be suspended inside its own handler); the EH TLS slot is
-    // single-token, so raising without discarding would trap.
+    // single-token, so raising without discarding would trap. The
+    // RuntimeError leaves this function, so the caller's parked context is
+    // superseded by it (chaining is the traceback track's __context__ work).
     mlir::func::CallOp::create(
         builder, loc, getOrCreateDiscardCurrentException(module, builder),
         mlir::ValueRange{});
+    mlir::func::CallOp::create(builder, loc, closeReleaseStashFn,
+                               mlir::ValueRange{closeOuterAddress});
     if (mlir::failed(RuntimeBundleLowerer::emitRuntimeException(
             op, "builtins.RuntimeError", "generator ignored GeneratorExit")))
       return mlir::failure();
@@ -1498,6 +2490,8 @@ RuntimeBundleLowerer::getOrCreateGeneratorCloseFunction(
       mlir::ValueRange{});
   mlir::cf::BranchOp::create(builder, loc, markClosed);
   builder.setInsertionPointToEnd(rethrowBlock);
+  mlir::func::CallOp::create(builder, loc, closeReleaseStashFn,
+                             mlir::ValueRange{closeOuterAddress});
   mlir::func::CallOp::create(builder, loc,
                              getOrCreateRethrowCurrent(module, builder),
                              mlir::ValueRange{});
@@ -1512,8 +2506,232 @@ RuntimeBundleLowerer::getOrCreateGeneratorCloseFunction(
                                 slotIndex(2));
   mlir::cf::BranchOp::create(builder, loc, returnBlock);
   builder.setInsertionPointToEnd(returnBlock);
+  mlir::func::CallOp::create(builder, loc, closeUnstashFn,
+                             mlir::ValueRange{closeOuterAddress});
   mlir::func::ReturnOp::create(builder, loc);
   return function;
+}
+
+// Drop finalizer (rfc/stdlib-semantics.md R3, CPython gen.__del__): a
+// generator abandoned mid-suspension must run its finally blocks and
+// release the frame's absorbed values. The finalizer resumes the body with
+// the close protocol (GeneratorExit injection) using the argument pairs the
+// creation site persisted into the storage words, swallows anything the
+// close raises (finalization has no propagation context), and then releases
+// whatever the frame still holds (the close path zeroes slots it consumed;
+// placeholders are immortal, so their release is a no-op).
+mlir::FailureOr<mlir::func::FuncOp>
+RuntimeBundleLowerer::getOrCreateGeneratorFinalizeFunction(
+    GeneratorResumeInfo &info) {
+  if (!info.finalizeName.empty()) {
+    if (auto existing =
+            module.lookupSymbol<mlir::func::FuncOp>(info.finalizeName))
+      return existing;
+  }
+  mlir::func::FuncOp clone =
+      module.lookupSymbol<mlir::func::FuncOp>(info.cloneName);
+  if (!clone)
+    return module.emitError()
+           << "generator resume clone " << info.cloneName << " is missing";
+  mlir::Operation *op = clone.getOperation();
+  mlir::FailureOr<mlir::func::FuncOp> close =
+      RuntimeBundleLowerer::getOrCreateGeneratorCloseFunction(op, info);
+  if (mlir::failed(close))
+    return mlir::failure();
+
+  mlir::Location loc = clone.getLoc();
+  mlir::OpBuilder::InsertionGuard guard(builder);
+  std::string name = info.cloneName + "__finalize";
+  builder.setInsertionPointToEnd(module.getBody());
+  auto function = mlir::func::FuncOp::create(
+      builder, loc, name,
+      builder.getFunctionType({generatorStorageType(builder)}, {}));
+  function.setPrivate();
+  info.finalizeName = name;
+
+  mlir::Block *entry = function.addEntryBlock();
+  mlir::Region &body = function.getBody();
+  mlir::Value storage = entry->getArgument(0);
+  builder.setInsertionPointToStart(entry);
+  auto i64Const = [&](std::int64_t value) {
+    return mlir::arith::ConstantIntOp::create(builder, loc, value, 64)
+        .getResult();
+  };
+  auto slotIndex = [&](std::int64_t slot) {
+    return mlir::arith::ConstantIndexOp::create(builder, loc, slot)
+        .getResult();
+  };
+
+  mlir::Block *closeBlock = builder.createBlock(&body);
+  mlir::Block *caughtBlock = builder.createBlock(&body);
+  mlir::Block *releaseBlock = builder.createBlock(&body);
+
+  builder.setInsertionPointToEnd(entry);
+  mlir::Value state =
+      mlir::memref::LoadOp::create(builder, loc, storage, slotIndex(2))
+          .getResult();
+  mlir::Value suspended = mlir::arith::CmpIOp::create(
+      builder, loc, mlir::arith::CmpIPredicate::eq, state, i64Const(2));
+  std::int64_t handlerId = nextTryHandlerId++;
+  mlir::Block *anchorBlock = builder.createBlock(&body);
+  builder.setInsertionPointToEnd(entry);
+  mlir::cf::CondBranchOp::create(builder, loc, suspended, anchorBlock,
+                                 mlir::ValueRange{}, releaseBlock,
+                                 mlir::ValueRange{});
+  builder.setInsertionPointToEnd(anchorBlock);
+  auto anchor = mlir::func::CallOp::create(
+      builder, loc, getOrCreateTryCatchAnchor(),
+      mlir::ValueRange{i64Const(handlerId)});
+  mlir::cf::CondBranchOp::create(builder, loc, anchor.getResult(0),
+                                 caughtBlock, mlir::ValueRange{}, closeBlock,
+                                 mlir::ValueRange{});
+
+  builder.setInsertionPointToEnd(closeBlock);
+  llvm::SmallVector<mlir::Value, 10> closeOperands;
+  closeOperands.push_back(storage);
+  for (unsigned index = 0; index < info.argumentCount; ++index) {
+    mlir::Value raw = mlir::memref::LoadOp::create(
+                          builder, loc, storage, slotIndex(8 + 2 * index))
+                          .getResult();
+    mlir::Value validWord =
+        mlir::memref::LoadOp::create(builder, loc, storage,
+                                     slotIndex(8 + 2 * index + 1))
+            .getResult();
+    mlir::Value valid = mlir::arith::CmpIOp::create(
+        builder, loc, mlir::arith::CmpIPredicate::ne, validWord, i64Const(0));
+    closeOperands.push_back(raw);
+    closeOperands.push_back(valid);
+  }
+  mlir::func::CallOp::create(builder, loc, getOrCreateTryCallSiteMarker(),
+                             mlir::ValueRange{i64Const(handlerId)});
+  mlir::func::CallOp::create(builder, loc, *close, closeOperands);
+  mlir::cf::BranchOp::create(builder, loc, releaseBlock);
+
+  // Finalization swallows whatever the close raised (an ignored
+  // GeneratorExit becomes RuntimeError, a finally may raise): there is no
+  // propagation context inside a deallocator.
+  builder.setInsertionPointToEnd(caughtBlock);
+  mlir::func::CallOp::create(builder, loc, getOrCreateTryCatchMarker(),
+                             mlir::ValueRange{i64Const(handlerId)});
+  mlir::func::CallOp::create(
+      builder, loc, getOrCreateDiscardCurrentException(module, builder),
+      mlir::ValueRange{});
+  mlir::cf::BranchOp::create(builder, loc, releaseBlock);
+
+  builder.setInsertionPointToEnd(releaseBlock);
+  llvm::SmallVector<unsigned, 8> laneWordOffsets =
+      RuntimeBundleLowerer::generatorFrameLaneWordOffsets(info);
+  for (auto [slot, lane] : llvm::enumerate(info.frameLanes)) {
+    if (lane.physicalCount == 0)
+      continue;
+    unsigned headerWord = laneWordOffsets[slot] + (lane.isInt ? 2u : 0u);
+    mlir::Value headerPtr =
+        mlir::memref::LoadOp::create(builder, loc, storage,
+                                     slotIndex(headerWord))
+            .getResult();
+    mlir::Value held = mlir::arith::CmpIOp::create(
+        builder, loc, mlir::arith::CmpIPredicate::ne, headerPtr, i64Const(0));
+    auto heldIf = mlir::scf::IfOp::create(builder, loc, held,
+                                          /*withElseRegion=*/false);
+    {
+      mlir::OpBuilder::InsertionGuard heldGuard(builder);
+      builder.setInsertionPoint(heldIf.getThenRegion().front().getTerminator());
+      mlir::FailureOr<mlir::func::FuncOp> load =
+          RuntimeBundleLowerer::getOrCreateGeneratorFrameLoadFunction(op, lane);
+      if (mlir::failed(load))
+        return mlir::failure();
+      mlir::func::CallOp loaded = mlir::func::CallOp::create(
+          builder, loc, *load,
+          mlir::ValueRange{storage, i64Const(laneWordOffsets[slot])});
+      llvm::SmallVector<mlir::Value, 4> physicals;
+      for (unsigned part = 0; part < lane.physicalCount; ++part)
+        physicals.push_back(loaded.getResult(part));
+      RuntimeBundle heldBundle;
+      if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+              op, runtimeContractType(context, lane.contract), physicals,
+              heldBundle, /*ownsObject=*/true)))
+        return mlir::failure();
+      if (mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
+              op, heldBundle, "generator drop frame lane")))
+        return mlir::failure();
+    }
+    builder.setInsertionPointAfter(heldIf);
+  }
+  mlir::func::ReturnOp::create(builder, loc);
+  return function;
+}
+
+// The module drop hook: LyGenerator_DecRef's release-to-zero path calls
+// this dispatcher, which routes the storage's target id (word 3) to the
+// matching per-target finalizer before the storage is freed.
+mlir::LogicalResult RuntimeBundleLowerer::generateGeneratorDropHook() {
+  if (generatorResumeClones.empty())
+    return mlir::success();
+  auto decref = module.lookupSymbol<mlir::func::FuncOp>("LyGenerator_DecRef");
+  if (!decref || decref.isDeclaration())
+    return mlir::success();
+
+  llvm::SmallVector<llvm::StringRef, 8> targets;
+  for (auto &entry : generatorResumeClones)
+    targets.push_back(entry.getKey());
+  llvm::sort(targets);
+
+  mlir::OpBuilder::InsertionGuard guard(builder);
+  mlir::Location loc = decref.getLoc();
+  builder.setInsertionPointToEnd(module.getBody());
+  auto hook = mlir::func::FuncOp::create(
+      builder, loc, "__ly_generator_drop_dispatch",
+      builder.getFunctionType({generatorStorageType(builder)}, {}));
+  hook.setPrivate();
+  mlir::Block *entry = hook.addEntryBlock();
+  mlir::Region &body = hook.getBody();
+  mlir::Value storage = entry->getArgument(0);
+  builder.setInsertionPointToStart(entry);
+  mlir::Value targetSlot =
+      mlir::arith::ConstantIndexOp::create(builder, loc, 3).getResult();
+  mlir::Value targetId =
+      mlir::memref::LoadOp::create(builder, loc, storage, targetSlot)
+          .getResult();
+  mlir::Block *current = entry;
+  for (llvm::StringRef target : targets) {
+    GeneratorResumeInfo &info = generatorResumeClones[target];
+    mlir::FailureOr<mlir::func::FuncOp> finalize =
+        RuntimeBundleLowerer::getOrCreateGeneratorFinalizeFunction(info);
+    if (mlir::failed(finalize))
+      return mlir::failure();
+    mlir::Block *match = builder.createBlock(&body);
+    mlir::Block *next = builder.createBlock(&body);
+    builder.setInsertionPointToEnd(current);
+    mlir::Value expected = mlir::arith::ConstantIntOp::create(
+        builder, loc, RuntimeBundleLowerer::functionTargetId(target), 64);
+    mlir::Value matches = mlir::arith::CmpIOp::create(
+        builder, loc, mlir::arith::CmpIPredicate::eq, targetId, expected);
+    mlir::cf::CondBranchOp::create(builder, loc, matches, match,
+                                   mlir::ValueRange{}, next,
+                                   mlir::ValueRange{});
+    builder.setInsertionPointToEnd(match);
+    mlir::func::CallOp::create(builder, loc, *finalize,
+                               mlir::ValueRange{storage});
+    mlir::func::ReturnOp::create(builder, loc);
+    current = next;
+  }
+  builder.setInsertionPointToEnd(current);
+  mlir::func::ReturnOp::create(builder, loc);
+
+  // Patch the manifest deallocator: the unique release-to-zero transition
+  // finalizes before it frees. (The deallocator body remains the same lemma
+  // otherwise; the finalizer runs while the storage is still valid.)
+  bool patched = false;
+  decref.walk([&](mlir::memref::DeallocOp dealloc) {
+    builder.setInsertionPoint(dealloc);
+    mlir::func::CallOp::create(builder, loc, hook,
+                               mlir::ValueRange{dealloc.getMemref()});
+    patched = true;
+  });
+  if (!patched)
+    return decref.emitError()
+           << "generator deallocator has no release-to-zero dealloc to patch";
+  return mlir::success();
 }
 
 // Resume over a state-machine generator: collect the generator storage and
@@ -1564,11 +2782,25 @@ RuntimeBundleLowerer::emitStateMachineGeneratorResume(
   emitTryCallSiteMarkerIfNeeded(loc);
   mlir::func::CallOp call =
       mlir::func::CallOp::create(builder, loc, *driver, operands);
-  if (raiseWhenExhausted)
-    return SourceGeneratorResumeResult{call.getResult(0), call.getResult(1),
-                                       constantI1(builder, loc, true)};
-  return SourceGeneratorResumeResult{call.getResult(1), call.getResult(2),
-                                     call.getResult(0)};
+  unsigned spanBegin = raiseWhenExhausted ? 0 : 1;
+  unsigned spanWidth = static_cast<unsigned>(
+      RuntimeBundleLowerer::generatorLanePhysicalTypes(info.valueLane).size());
+  SourceGeneratorResumeResult result;
+  result.hasValue = raiseWhenExhausted ? constantI1(builder, loc, true)
+                                       : call.getResult(0);
+  for (unsigned lane = 0; lane < spanWidth; ++lane)
+    result.lanePhysicals.push_back(call.getResult(spanBegin + lane));
+  if (info.valueLane.isInt && spanWidth >= 2) {
+    // The trailing evidence pair doubles as the legacy (value, valid) view
+    // for pure-int consumers (yield-from delegation, for-loop rewiring).
+    result.value = result.lanePhysicals[spanWidth - 2];
+    result.valid = result.lanePhysicals[spanWidth - 1];
+  } else {
+    result.value =
+        mlir::arith::ConstantIntOp::create(builder, loc, 0, 64).getResult();
+    result.valid = constantI1(builder, loc, false);
+  }
+  return result;
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::lowerStateMachineGeneratorThrow(
@@ -1578,9 +2810,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStateMachineGeneratorThrow(
     return op.emitError()
            << "generator throw expects exactly one exception value";
   if (op.getNumResults() != 1 ||
-      runtimeContractName(op.getResult(0).getType()) != "builtins.int")
+      runtimeContractName(op.getResult(0).getType()) != info.valueLane.contract)
     return op.emitError()
-           << "generator throw currently supports int yield results";
+           << "generator throw result must match the yield lane contract "
+           << info.valueLane.contract;
   const RuntimeBundle &exception = *sources[1];
   if (exception.physicalValues().size() != 3)
     return op.emitError()
@@ -1620,10 +2853,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStateMachineGeneratorThrow(
       mlir::func::CallOp::create(builder, loc, *throwFn, operands);
 
   RuntimeBundle result;
-  if (mlir::failed(RuntimeBundleLowerer::makePrimitiveI64Bundle(
-          op, op.getResult(0).getType(), call.getResult(0), call.getResult(1),
-          result)))
+  if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
+          op.getOperation(), op.getResult(0).getType(), call, result)))
     return mlir::failure();
+  result.setObjectLogicalOwnership(/*ownsObject=*/true);
   valueBundles[op.getResult(0)] = std::move(result);
   erase.push_back(op);
   return mlir::success();

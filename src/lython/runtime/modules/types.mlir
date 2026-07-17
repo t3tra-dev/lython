@@ -87,7 +87,7 @@ module attributes {
   func.func private @Ly_IncRef(%header: memref<2xi64, strided<[1], offset: ?>> {ly.ownership.object_header})
   func.func private @LyObject_ReleaseStorageToZero(%storage: memref<?xi64>) -> i1
 
-  func.func @LyGenerator_New(%target_id: i64) -> memref<24xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 63 : i64, ly.runtime.contract = "types.GeneratorType", ly.runtime.initializer = "__new__"} {
+  func.func @LyGenerator_New(%target_id: i64) -> memref<64xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 63 : i64, ly.runtime.contract = "types.GeneratorType", ly.runtime.initializer = "__new__"} {
     %one = arith.constant 1 : i64
     %zero = arith.constant 0 : i64
     %layout_generator = arith.constant 63 : i64
@@ -100,32 +100,32 @@ module attributes {
     %thrown_valid_slot = arith.constant 6 : index
     %close_requested_slot = arith.constant 7 : index
 
-    %storage = memref.alloc() {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<24xi64>
-    memref.store %one, %storage[%refcount_slot] : memref<24xi64>
-    memref.store %layout_generator, %storage[%layout_slot] : memref<24xi64>
+    %storage = memref.alloc() {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<64xi64>
+    memref.store %one, %storage[%refcount_slot] : memref<64xi64>
+    memref.store %layout_generator, %storage[%layout_slot] : memref<64xi64>
     // State 0 = created, 1 = running, 2 = suspended, 3 = exhausted, 4 = closed.
-    memref.store %zero, %storage[%state_slot] : memref<24xi64>
-    memref.store %target_id, %storage[%target_slot] {ly.atomic.ordering = "release", ly.atomic.role = "generator.target.publish"} : memref<24xi64>
-    memref.store %zero, %storage[%resume_slot] : memref<24xi64>
-    memref.store %zero, %storage[%sent_valid_slot] : memref<24xi64>
-    memref.store %zero, %storage[%thrown_valid_slot] : memref<24xi64>
-    memref.store %zero, %storage[%close_requested_slot] : memref<24xi64>
+    memref.store %zero, %storage[%state_slot] : memref<64xi64>
+    memref.store %target_id, %storage[%target_slot] {ly.atomic.ordering = "release", ly.atomic.role = "generator.target.publish"} : memref<64xi64>
+    memref.store %zero, %storage[%resume_slot] : memref<64xi64>
+    memref.store %zero, %storage[%sent_valid_slot] : memref<64xi64>
+    memref.store %zero, %storage[%thrown_valid_slot] : memref<64xi64>
+    memref.store %zero, %storage[%close_requested_slot] : memref<64xi64>
     // Frame slots (words 8..23): resume state-machine live values.
     %frame_lower = arith.constant 8 : index
-    %frame_upper = arith.constant 24 : index
+    %frame_upper = arith.constant 64 : index
     %frame_step = arith.constant 1 : index
     scf.for %slot = %frame_lower to %frame_upper step %frame_step {
-      memref.store %zero, %storage[%slot] : memref<24xi64>
+      memref.store %zero, %storage[%slot] : memref<64xi64>
     }
-    func.return %storage : memref<24xi64>
+    func.return %storage : memref<64xi64>
   }
 
-  func.func @LyGenerator_ResumeBegin(%storage: memref<24xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "types.GeneratorType", ly.runtime.primitive = "resume.begin"} {
+  func.func @LyGenerator_ResumeBegin(%storage: memref<64xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "types.GeneratorType", ly.runtime.primitive = "resume.begin"} {
     %state_slot = arith.constant 2 : index
     %created = arith.constant 0 : i64
     %running = arith.constant 1 : i64
     %suspended = arith.constant 2 : i64
-    %previous = memref.generic_atomic_rmw %storage[%state_slot] : memref<24xi64> {
+    %previous = memref.generic_atomic_rmw %storage[%state_slot] : memref<64xi64> {
     ^bb0(%current : i64):
       %is_created = arith.cmpi eq, %current, %created : i64
       %is_suspended = arith.cmpi eq, %current, %suspended : i64
@@ -139,11 +139,11 @@ module attributes {
     func.return %can_resume : i1
   }
 
-  func.func @LyGenerator_ResumeComplete(%storage: memref<24xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "types.GeneratorType", ly.runtime.primitive = "resume.complete"} {
+  func.func @LyGenerator_ResumeComplete(%storage: memref<64xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "types.GeneratorType", ly.runtime.primitive = "resume.complete"} {
     %state_slot = arith.constant 2 : index
     %running = arith.constant 1 : i64
     %exhausted = arith.constant 3 : i64
-    %previous = memref.generic_atomic_rmw %storage[%state_slot] : memref<24xi64> {
+    %previous = memref.generic_atomic_rmw %storage[%state_slot] : memref<64xi64> {
     ^bb0(%current : i64):
       %is_running = arith.cmpi eq, %current, %running : i64
       %next = arith.select %is_running, %exhausted, %current : i1, i64
@@ -154,14 +154,14 @@ module attributes {
     func.return
   }
 
-  func.func @LyGenerator_Suspend(%storage: memref<24xi64> {ly.ownership.object_header}, %resume_index: i64) attributes {ly.runtime.contract = "types.GeneratorType", ly.runtime.primitive = "resume.suspend"} {
+  func.func @LyGenerator_Suspend(%storage: memref<64xi64> {ly.ownership.object_header}, %resume_index: i64) attributes {ly.runtime.contract = "types.GeneratorType", ly.runtime.primitive = "resume.suspend"} {
     %state_slot = arith.constant 2 : index
     %resume_slot = arith.constant 4 : index
     %running = arith.constant 1 : i64
     %suspended = arith.constant 2 : i64
 
-    memref.store %resume_index, %storage[%resume_slot] : memref<24xi64>
-    %previous = memref.generic_atomic_rmw %storage[%state_slot] : memref<24xi64> {
+    memref.store %resume_index, %storage[%resume_slot] : memref<64xi64>
+    %previous = memref.generic_atomic_rmw %storage[%state_slot] : memref<64xi64> {
     ^bb0(%current : i64):
       %is_running = arith.cmpi eq, %current, %running : i64
       %next = arith.select %is_running, %suspended, %current : i1, i64
@@ -172,20 +172,20 @@ module attributes {
     func.return
   }
 
-  func.func @LyGenerator_Iter(%storage: memref<24xi64> {ly.ownership.object_header}) -> memref<24xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "types.GeneratorType", ly.runtime.method = "__iter__", ly.runtime.result_contract = "types.GeneratorType"} {
+  func.func @LyGenerator_Iter(%storage: memref<64xi64> {ly.ownership.object_header}) -> memref<64xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "types.GeneratorType", ly.runtime.method = "__iter__", ly.runtime.result_contract = "types.GeneratorType"} {
     %c0 = arith.constant 0 : index
-    %header = memref.subview %storage[%c0] [2] [1] : memref<24xi64> to memref<2xi64, strided<[1], offset: ?>>
+    %header = memref.subview %storage[%c0] [2] [1] : memref<64xi64> to memref<2xi64, strided<[1], offset: ?>>
     func.call @Ly_IncRef(%header) : (memref<2xi64, strided<[1], offset: ?>>) -> ()
-    func.return %storage : memref<24xi64>
+    func.return %storage : memref<64xi64>
   }
 
-  func.func @LyGenerator_Close(%storage: memref<24xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "types.GeneratorType", ly.runtime.method = "close", ly.runtime.result_contract = "types.NoneType"} {
+  func.func @LyGenerator_Close(%storage: memref<64xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "types.GeneratorType", ly.runtime.method = "close", ly.runtime.result_contract = "types.NoneType"} {
     %state_slot = arith.constant 2 : index
     %close_requested_slot = arith.constant 7 : index
     %running = arith.constant 1 : i64
     %closed = arith.constant 4 : i64
 
-    %previous = memref.generic_atomic_rmw %storage[%state_slot] : memref<24xi64> {
+    %previous = memref.generic_atomic_rmw %storage[%state_slot] : memref<64xi64> {
     ^bb0(%current : i64):
       %is_running = arith.cmpi eq, %current, %running : i64
       %next = arith.select %is_running, %current, %closed : i1, i64
@@ -196,17 +196,17 @@ module attributes {
     %can_close = arith.xori %was_running, %true : i1
     cf.assert %can_close, "cannot close a running generator"
     %one = arith.constant 1 : i64
-    memref.store %one, %storage[%close_requested_slot] : memref<24xi64>
+    memref.store %one, %storage[%close_requested_slot] : memref<64xi64>
     func.return
   }
 
-  func.func @LyGenerator_DecRef(%storage: memref<24xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "types.GeneratorType", ly.runtime.deallocator} {
-    %dynamic_storage = memref.cast %storage : memref<24xi64> to memref<?xi64>
+  func.func @LyGenerator_DecRef(%storage: memref<64xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "types.GeneratorType", ly.runtime.deallocator} {
+    %dynamic_storage = memref.cast %storage : memref<64xi64> to memref<?xi64>
     %became_zero = func.call @LyObject_ReleaseStorageToZero(%dynamic_storage) : (memref<?xi64>) -> i1
     cf.cond_br %became_zero, ^dealloc, ^done
 
   ^dealloc:
-    memref.dealloc %storage : memref<24xi64>
+    memref.dealloc %storage : memref<64xi64>
     cf.br ^done
 
   ^done:
