@@ -37,7 +37,14 @@ struct PendingPythonTryCallMarker {
 };
 
 std::string tracebackFunctionName(llvm::StringRef symbolName) {
-  return symbolName == "__main__" ? std::string("<module>") : symbolName.str();
+  if (symbolName == "__main__")
+    return "<module>";
+  // Specialization clones carry an ABI suffix; the traceback shows the
+  // Python-level name.
+  std::size_t suffix = symbolName.find("__lyrt_prim");
+  if (suffix != llvm::StringRef::npos)
+    symbolName = symbolName.take_front(suffix);
+  return symbolName.str();
 }
 
 bool isPythonFunction(mlir::LLVM::LLVMFuncOp function) {
@@ -151,10 +158,10 @@ std::string debugLocationFunctionName(const llvm::DILocation &loc) {
     if (llvm::DISubprogram *subprogram = scope->getSubprogram()) {
       llvm::StringRef name = subprogram->getName();
       if (!name.empty())
-        return name.str();
+        return tracebackFunctionName(name);
       llvm::StringRef linkage = subprogram->getLinkageName();
       if (!linkage.empty())
-        return linkage.str();
+        return tracebackFunctionName(linkage);
     }
   return "<unknown>";
 }

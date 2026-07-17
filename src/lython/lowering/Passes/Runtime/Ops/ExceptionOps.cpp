@@ -1,3 +1,4 @@
+#include "Common/PythonSourceRange.h"
 #include "Runtime/Core/Lowerer.h"
 
 namespace py::lowering {
@@ -33,7 +34,14 @@ llvm::StringRef currentCallableName(mlir::Operation *op) {
     return "<unknown>";
   if (auto function = op->getParentOfType<mlir::func::FuncOp>()) {
     llvm::StringRef name = function.getName();
-    return name == "__main__" ? "<module>" : name;
+    if (name == "__main__")
+      return "<module>";
+    // Specialization clones carry an ABI suffix; the traceback shows the
+    // Python-level name.
+    std::size_t suffix = name.find("__lyrt_prim");
+    if (suffix != llvm::StringRef::npos)
+      name = name.take_front(suffix);
+    return name;
   }
   return "<unknown>";
 }
@@ -68,11 +76,11 @@ mlir::func::FuncOp getOrCreateTracebackPush(mlir::ModuleOp module,
                                             mlir::OpBuilder &builder) {
   auto bytesType =
       mlir::MemRefType::get({mlir::ShapedType::kDynamic}, builder.getI8Type());
+  mlir::Type i32 = builder.getI32Type();
   return getOrCreatePrivateFunction(
       module, builder, "LyTraceback_Push",
-      builder.getFunctionType(
-          {bytesType, bytesType, builder.getI32Type(), builder.getI32Type()},
-          {}));
+      builder.getFunctionType({bytesType, bytesType, i32, i32, i32, i32, i32},
+                              {}));
 }
 
 mlir::FailureOr<std::int64_t>
@@ -103,6 +111,24 @@ RuntimeBundleLowerer::emitTracebackFrame(mlir::Operation *op,
   std::int64_t column = 0;
   getLocInfo(op->getLoc(), filename, line, column);
 
+  // Sub-line source ranges become caret anchors (`d[k]` -> `~^^^`). Raise
+  // statements never carry anchors: CPython only extracts anchors from
+  // expression segments (calls, subscripts, operators), and a raise
+  // statement's position is the whole statement.
+  std::int64_t endLine = line;
+  std::int64_t endColumn = 0;
+  std::int64_t hasMarker = 0;
+  if (!mlir::isa<py::RaiseOp, py::RaiseCurrentOp>(op)) {
+    if (std::optional<PythonSourceRange> range =
+            pythonSourceRange(op->getLoc())) {
+      if (range->endLine == range->line && range->endColumn > range->column) {
+        endLine = range->endLine;
+        endColumn = range->endColumn;
+        hasMarker = 1;
+      }
+    }
+  }
+
   // A frame push announces a fresh raise. If another exception is still being
   // handled here, it becomes the new exception's implicit __context__; the
   // stash must run before the push so the handled exception's traceback
@@ -118,15 +144,15 @@ RuntimeBundleLowerer::emitTracebackFrame(mlir::Operation *op,
   mlir::Value file = materializeByteBuffer(op->getLoc(), filename);
   mlir::Value function =
       materializeByteBuffer(op->getLoc(), currentCallableName(op));
-  mlir::Value lineValue =
-      mlir::arith::ConstantIntOp::create(builder, op->getLoc(), line, 32)
-          .getResult();
-  mlir::Value columnValue =
-      mlir::arith::ConstantIntOp::create(builder, op->getLoc(), column, 32)
-          .getResult();
+  auto i32Const = [&](std::int64_t value) {
+    return mlir::arith::ConstantIntOp::create(builder, op->getLoc(), value, 32)
+        .getResult();
+  };
   mlir::func::CallOp::create(
       builder, op->getLoc(), tracebackPush,
-      mlir::ValueRange{file, function, lineValue, columnValue});
+      mlir::ValueRange{file, function, i32Const(line), i32Const(column),
+                       i32Const(endLine), i32Const(endColumn),
+                       i32Const(hasMarker)});
   return mlir::success();
 }
 

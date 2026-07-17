@@ -325,13 +325,14 @@ mlir::Value loadTracebackSize(SupportBuilder &b) {
 }
 
 // LyTraceback_Push(file view: ptr/offset/size/stride via two descriptor arg
-// groups, i32 line, i32 col): pushes a frame with copied names.
+// groups, i32 line, i32 col, i32 endLine, i32 endCol, i32 hasMarker): pushes
+// a frame with copied names and an optional caret range.
 void buildTracebackPush(SupportBuilder &b) {
   auto fn = b.beginFunction(
       "LyTraceback_Push",
       b.builder.getFunctionType({b.ptr(), b.ptr(), b.i64(), b.i64(), b.i64(),
                                  b.ptr(), b.ptr(), b.i64(), b.i64(), b.i64(),
-                                 b.i32(), b.i32()},
+                                 b.i32(), b.i32(), b.i32(), b.i32(), b.i32()},
                                 {}));
   mlir::Block *entry = fn.addEntryBlock();
   mlir::Region &body = fn.getBody();
@@ -357,10 +358,10 @@ void buildTracebackPush(SupportBuilder &b) {
              mlir::ValueRange{entry->getArgument(6), entry->getArgument(7),
                               entry->getArgument(8), entry->getArgument(9)})
           .front();
-  mlir::Value zero32 = b.iconst32(0);
   emitFramePush(b, size, fileCopy, functionCopy,
-                {entry->getArgument(10), entry->getArgument(11), zero32,
-                 zero32, zero32});
+                {entry->getArgument(10), entry->getArgument(11),
+                 entry->getArgument(12), entry->getArgument(13),
+                 entry->getArgument(14)});
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(trap);
@@ -1764,7 +1765,27 @@ void buildPrintExceptionSummary(SupportBuilder &b) {
   b.stringGlobal(".tb_colon_space", ": ");
   b.call("write_cstr", mlir::TypeRange{},
          mlir::ValueRange{stderrFd, b.addrOf(".tb_colon_space")});
+  // str(KeyError(x)) is repr(x) in CPython; approximate with single quotes
+  // around the stored message.
+  std::int64_t keyErrorClassId = 0;
+  for (const py::exceptions::BuiltinExceptionInfo &info :
+       py::exceptions::kBuiltinExceptions)
+    if (info.name == "KeyError")
+      keyErrorClassId = info.classId;
+  mlir::Value isKeyError = b.cmpi(mlir::arith::CmpIPredicate::eq, classId,
+                                  b.iconst(keyErrorClassId));
+  auto writeQuoteIf = [&]() {
+    auto quoteIf = mlir::scf::IfOp::create(b.builder, b.loc, mlir::TypeRange{},
+                                           isKeyError,
+                                           /*withElseRegion=*/false);
+    mlir::OpBuilder::InsertionGuard guard(b.builder);
+    b.builder.setInsertionPointToStart(&quoteIf.getThenRegion().front());
+    b.call("write_char", mlir::TypeRange{},
+           mlir::ValueRange{b.iconst32(2), b.iconst8('\'')});
+  };
+  writeQuoteIf();
   b.call("write_cstr", mlir::TypeRange{}, mlir::ValueRange{stderrFd, message});
+  writeQuoteIf();
   b.call("write_len", mlir::TypeRange{},
          mlir::ValueRange{stderrFd, b.addrOf(".tb_newline"), b.iconst(1)});
   b.call("free", mlir::TypeRange{}, mlir::ValueRange{message});
