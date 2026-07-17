@@ -175,6 +175,18 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
       !receiver.generatorTarget.empty() && methodName == "throw")
     return RuntimeBundleLowerer::lowerSourceGeneratorThrow(op, receiver,
                                                            sources);
+  if (receiver.contractName() == "types.GeneratorType" &&
+      !receiver.generatorTarget.empty() && methodName == "close") {
+    // State-machine generators run their close protocol (GeneratorExit
+    // injection, so finally blocks execute); inline-dispatch generators
+    // have straight-line bodies without handlers, so the manifest close
+    // (mark closed) below is already exact for them.
+    auto closeResumeInfo =
+        generatorResumeClones.find(receiver.generatorTarget);
+    if (closeResumeInfo != generatorResumeClones.end())
+      return RuntimeBundleLowerer::lowerStateMachineGeneratorClose(
+          op, receiver, closeResumeInfo->second);
+  }
 
   if (receiver.kind == RuntimeBundle::Kind::Object &&
       receiver.contractName() == "builtins.set" && methodName == "add") {

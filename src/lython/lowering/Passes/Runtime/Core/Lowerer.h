@@ -554,15 +554,42 @@ private:
     std::string cloneName;
     unsigned frameWidth = 0;
     unsigned argumentCount = 0;
+    // Lazily synthesized driver functions (see GeneratorStateMachine.cpp):
+    // step resumes once and reports (has, value, ret); advance additionally
+    // raises StopIteration on exhaustion; throw/close inject exceptions at
+    // the suspension point through the EH TLS slot.
+    std::string stepName;
+    std::string advanceName;
+    std::string throwName;
+    std::string closeName;
   };
   llvm::StringMap<GeneratorResumeInfo> generatorResumeClones;
   mlir::LogicalResult buildGeneratorResumeCloneSignatures();
   mlir::LogicalResult buildGeneratorResumeBodies();
-  mlir::FailureOr<SourceGeneratorResumeResult>
-  emitStateMachineGeneratorResume(mlir::Operation *op,
-                                  const RuntimeBundle &iterator,
-                                  const GeneratorResumeInfo &info,
-                                  bool useCurrentInsertionPoint = false);
+  mlir::FailureOr<mlir::func::FuncOp>
+  getOrCreateGeneratorStepFunction(mlir::Operation *op,
+                                   GeneratorResumeInfo &info);
+  mlir::FailureOr<mlir::func::FuncOp>
+  getOrCreateGeneratorAdvanceFunction(mlir::Operation *op,
+                                      GeneratorResumeInfo &info);
+  mlir::FailureOr<mlir::func::FuncOp>
+  getOrCreateGeneratorThrowFunction(mlir::Operation *op,
+                                    GeneratorResumeInfo &info);
+  mlir::FailureOr<mlir::func::FuncOp>
+  getOrCreateGeneratorCloseFunction(mlir::Operation *op,
+                                    GeneratorResumeInfo &info);
+  mlir::FailureOr<SourceGeneratorResumeResult> emitStateMachineGeneratorResume(
+      mlir::Operation *op, const RuntimeBundle &iterator,
+      GeneratorResumeInfo &info, bool useCurrentInsertionPoint = false,
+      std::optional<RuntimePrimitiveI64Evidence> sentI64Evidence = std::nullopt,
+      bool raiseWhenExhausted = false);
+  mlir::LogicalResult
+  lowerStateMachineGeneratorThrow(py::CallOp op, const RuntimeBundle &receiver,
+                                  GeneratorResumeInfo &info,
+                                  llvm::ArrayRef<const RuntimeBundle *> sources);
+  mlir::LogicalResult
+  lowerStateMachineGeneratorClose(py::CallOp op, const RuntimeBundle &receiver,
+                                  GeneratorResumeInfo &info);
   mlir::LogicalResult lowerListRuntimeNext(py::NextOp op,
                                            RuntimeBundle iterator);
   mlir::FailureOr<bool> lowerRuntimeSequenceGetItem(py::GetItemOp op,
