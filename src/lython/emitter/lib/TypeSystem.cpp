@@ -1905,6 +1905,10 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
         return literal(big->decimal);
     return object();
   }
+  // f-strings always evaluate to str; the emitter enforces that each
+  // interpolation is statically formattable.
+  if (node->kind == "JoinedStr" || node->kind == "FormattedValue")
+    return contract("builtins.str");
   // Platform constants type as string literals of the CURRENT TARGET, so
   // `sys.platform == "win32"` branches fold statically (the platform switch
   // idiom runtime lib modules rely on).
@@ -2272,6 +2276,13 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
         // unreachable receivers themselves. Falling through to object() here
         // made multi-argument print re-repr the already-rendered string.
         if (positional.size() == 1)
+          return strType();
+      }
+      if (name == "format") {
+        // Same shape as repr: every __format__ contract returns str, and the
+        // emitter's dispatch rejects receivers without a resolvable
+        // __format__ itself.
+        if (positional.size() == 1 || positional.size() == 2)
           return strType();
       }
       if (name == "len") {

@@ -187,6 +187,26 @@ private:
                                         const parser::Node *calleeNode);
   std::optional<Value> tryEmitReprCall(const parser::Node &expr,
                                        const parser::Node *calleeNode);
+  std::optional<Value> tryEmitFormatCall(const parser::Node &expr,
+                                         const parser::Node *calleeNode);
+  // f-string machinery: JoinedStr folds stringified pieces with str.__add__;
+  // FormattedValue applies !r/!s/!a and dispatches __format__ statically.
+  Value emitJoinedStr(const parser::Node &expr);
+  Value emitFormattedValue(const parser::Node &expr);
+  // str(value) semantics on an already-emitted value (str kept, source-class
+  // __str__ inlined, manifest __str__, then __repr__) — print's stringify
+  // for values instead of AST nodes.
+  std::optional<Value> emitStringifyValue(const parser::Node &anchor,
+                                          Value value);
+  // !r / !s / !a conversion of an already-emitted value to str.
+  std::optional<Value> emitConversionValue(const parser::Node &anchor,
+                                           Value value, int64_t conversion);
+  // format(value, spec) core: source-class __format__ first, manifest
+  // __format__ second, str()-fallback for an absent/empty spec (CPython's
+  // object.__format__ rule), diagnostic otherwise.
+  Value emitFormatValue(const parser::Node &anchor, Value value,
+                        std::optional<Value> spec, bool specKnownEmpty);
+  Value emitEmptyStrConstant(const parser::Node &anchor);
   std::optional<Value> rejectStubSourceCall(const parser::Node &expr,
                                             llvm::StringRef symbol,
                                             bool instantiation);

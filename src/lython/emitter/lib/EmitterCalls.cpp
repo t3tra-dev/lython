@@ -215,6 +215,8 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
 
   if (std::optional<Value> v = tryEmitReprCall(expr, calleeNode))
     return *v;
+  if (std::optional<Value> v = tryEmitFormatCall(expr, calleeNode))
+    return *v;
 
   if (calleeNode && calleeNode->kind == "Name") {
     llvm::StringRef name = ast::nameSpelling(*calleeNode);
@@ -1311,6 +1313,249 @@ ModuleEmitter::tryEmitReprCall(const parser::Node &expr,
     }
   }
   return std::nullopt;
+}
+
+Value ModuleEmitter::emitEmptyStrConstant(const parser::Node &anchor) {
+  mlir::Type literalType = types.literal("\"\"");
+  auto op = py::StrConstantOp::create(builder, loc(anchor), literalType,
+                                      builder.getStringAttr(""));
+  return coerceValue(Value{op.getResult(), literalType},
+                     types.contract("builtins.str"), anchor);
+}
+
+std::optional<Value> ModuleEmitter::emitStringifyValue(const parser::Node &anchor,
+                                                       Value value) {
+  mlir::Type strType = types.contract("builtins.str");
+  mlir::Type valueType = types.widenLiteral(value.type);
+  if (valueType == strType)
+    return coerceValue(value, strType, anchor);
+  if (std::optional<MethodBinding> method =
+          lookupClassMethod(valueType, "__str__")) {
+    llvm::StringMap<Value> emptyKeywords;
+    Value receiver = emitDescriptorReceiver(anchor, value, *method);
+    return emitInlineMethodBody(anchor, receiver,
+                                methodBindingBindsReceiver(*method), *method,
+                                {}, emptyKeywords);
+  }
+  // Non-str builtins render via __repr__ (str(x) == repr(x) for every
+  // non-str builtin; __str__ evidence resolves for containers through the
+  // object contract but the manifest only implements their __repr__).
+  if (CallInferenceResult inference =
+          types.inferMethodCallWithEvidence(valueType, "__repr__", {})) {
+    Value receiver = coerceValue(value, valueType, anchor);
+    auto op = py::ReprOp::create(
+        builder, loc(anchor), strType,
+        mlir::FlatSymbolRefAttr::get(&context, "__repr__"),
+        mlir::TypeAttr::get(callProtocolFor(inference)), receiver.value);
+    return Value{op.getResult(), strType};
+  }
+  return std::nullopt;
+}
+
+std::optional<Value>
+ModuleEmitter::emitConversionValue(const parser::Node &anchor, Value value,
+                                   int64_t conversion) {
+  mlir::Type strType = types.contract("builtins.str");
+  if (conversion == 's')
+    return emitStringifyValue(anchor, value);
+  // 'r' and 'a' both start from __repr__.
+  mlir::Type valueType = types.widenLiteral(value.type);
+  std::optional<Value> repr;
+  if (std::optional<MethodBinding> method =
+          lookupClassMethod(valueType, "__repr__")) {
+    llvm::StringMap<Value> emptyKeywords;
+    Value receiver = emitDescriptorReceiver(anchor, value, *method);
+    repr = emitInlineMethodBody(anchor, receiver,
+                                methodBindingBindsReceiver(*method), *method,
+                                {}, emptyKeywords);
+  } else if (CallInferenceResult inference =
+                 types.inferMethodCallWithEvidence(valueType, "__repr__", {})) {
+    Value receiver = coerceValue(value, valueType, anchor);
+    auto op = py::ReprOp::create(
+        builder, loc(anchor), strType,
+        mlir::FlatSymbolRefAttr::get(&context, "__repr__"),
+        mlir::TypeAttr::get(callProtocolFor(inference)), receiver.value);
+    repr = Value{op.getResult(), strType};
+  }
+  if (!repr)
+    return std::nullopt;
+  if (conversion != 'a')
+    return repr;
+  // ascii(): repr with non-ASCII code points escaped, a manifest primitive
+  // on str.
+  CallInferenceResult ascii =
+      types.inferMethodCallWithEvidence(strType, "__ascii__", {});
+  if (!ascii)
+    return std::nullopt;
+  Value receiver = coerceValue(*repr, strType, anchor);
+  Value posPack = emitPack({});
+  Value namePack = emitPack({});
+  Value valuePack = emitPack({});
+  auto op = py::CallOp::create(builder, loc(anchor), mlir::TypeRange{strType},
+                               callProtocolFor(ascii), receiver.value,
+                               posPack.value, namePack.value, valuePack.value);
+  op->setAttr("ly.bound_method", builder.getStringAttr("__ascii__"));
+  return Value{op.getResults().front(), strType};
+}
+
+Value ModuleEmitter::emitFormatValue(const parser::Node &anchor, Value value,
+                                     std::optional<Value> spec,
+                                     bool specKnownEmpty) {
+  mlir::Type strType = types.contract("builtins.str");
+  mlir::Type valueType = types.widenLiteral(value.type);
+  if (std::optional<MethodBinding> method =
+          lookupClassMethod(valueType, "__format__")) {
+    Value specValue =
+        spec ? coerceValue(*spec, strType, anchor) : emitEmptyStrConstant(anchor);
+    return emitInlineOperatorCall(anchor, value, *method, {specValue});
+  }
+  if (CallInferenceResult inference =
+          types.inferMethodCallWithEvidence(valueType, "__format__",
+                                            {strType})) {
+    Value receiver = coerceValue(value, valueType, anchor);
+    Value specValue =
+        spec ? coerceValue(*spec, strType, anchor) : emitEmptyStrConstant(anchor);
+    Value posPack = emitPack({specValue});
+    Value namePack = emitPack({});
+    Value valuePack = emitPack({});
+    mlir::Type resultType = inference.resultType ? inference.resultType
+                                                 : strType;
+    auto op = py::CallOp::create(
+        builder, loc(anchor), mlir::TypeRange{resultType},
+        callProtocolFor(inference), receiver.value, posPack.value,
+        namePack.value, valuePack.value);
+    op->setAttr("ly.bound_method", builder.getStringAttr("__format__"));
+    return {op.getResults().front(), resultType};
+  }
+  // CPython's object.__format__: str(self) for an empty spec, TypeError
+  // otherwise. The TypeError side is a static boundary here.
+  if (!spec || specKnownEmpty) {
+    if (std::optional<Value> text = emitStringifyValue(anchor, value))
+      return *text;
+  }
+  diagnostics.push_back(parser::Diagnostic{
+      parser::Severity::Error, anchor.range.start,
+      "static type does not provide '__format__' (a non-empty format "
+      "specification needs a manifest or source-class __format__)"});
+  return emitNone(anchor);
+}
+
+Value ModuleEmitter::emitFormattedValue(const parser::Node &expr) {
+  const parser::Node *valueNode = ast::node(expr, "value");
+  if (!valueNode || valueNode->kind == "Error") {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "malformed f-string interpolation"});
+    return emitNone(expr);
+  }
+  int64_t conversion = ast::integer(expr, "conversion").value_or(-1);
+  const parser::Node *specNode = ast::node(expr, "format_spec");
+
+  Value inner = emitExpr(valueNode);
+  std::optional<Value> spec;
+  bool specKnownEmpty = false;
+  if (specNode) {
+    // A literal-only spec is inspectable now: empty text keeps the
+    // str()-fallback available (CPython: format(x, '') == str(x)).
+    bool allLiteral = true;
+    std::string literalText;
+    if (const auto *parts = ast::nodeList(*specNode, "values")) {
+      for (const parser::NodePtr &part : *parts) {
+        if (part && part->kind == "Constant") {
+          if (auto text = ast::string(*part, "value"))
+            literalText += std::string(*text);
+          continue;
+        }
+        allLiteral = false;
+      }
+    }
+    specKnownEmpty = allLiteral && literalText.empty();
+    if (!specKnownEmpty)
+      spec = emitJoinedStr(*specNode);
+  }
+
+  Value subject = inner;
+  if (conversion == 'r' || conversion == 's' || conversion == 'a') {
+    std::optional<Value> converted =
+        emitConversionValue(expr, inner, conversion);
+    if (!converted) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, expr.range.start,
+          "f-string conversion is not statically resolvable for this "
+          "operand type"});
+      return emitNone(expr);
+    }
+    subject = *converted;
+  }
+  return emitFormatValue(expr, subject, spec, specKnownEmpty);
+}
+
+Value ModuleEmitter::emitJoinedStr(const parser::Node &expr) {
+  mlir::Type strType = types.contract("builtins.str");
+  const auto *parts = ast::nodeList(expr, "values");
+  std::optional<Value> accumulated;
+  auto append = [&](Value piece) {
+    Value coerced = coerceValue(piece, strType, expr);
+    if (!accumulated) {
+      accumulated = coerced;
+      return;
+    }
+    accumulated = emitBinarySpecial<py::AddOp>(expr, "__add__", *accumulated,
+                                               coerced, strType);
+  };
+  if (parts) {
+    for (const parser::NodePtr &part : *parts) {
+      if (!part)
+        continue;
+      if (part->kind == "Constant") {
+        append(emitConstant(*part));
+        continue;
+      }
+      if (part->kind == "FormattedValue") {
+        append(emitFormattedValue(*part));
+        continue;
+      }
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, part->range.start,
+          "unsupported f-string component '" + part->kind + "'"});
+    }
+  }
+  if (!accumulated)
+    return emitEmptyStrConstant(expr);
+  return *accumulated;
+}
+
+std::optional<Value>
+ModuleEmitter::tryEmitFormatCall(const parser::Node &expr,
+                                 const parser::Node *calleeNode) {
+  if (!calleeNode || calleeNode->kind != "Name" ||
+      ast::nameSpelling(*calleeNode) != "format" ||
+      values.find("format") != values.end())
+    return std::nullopt;
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  if (!args || args->empty() || args->size() > 2 ||
+      (keywords && !keywords->empty()))
+    return std::nullopt;
+  Value value = emitExpr(args->front().get());
+  std::optional<Value> spec;
+  bool specKnownEmpty = false;
+  if (args->size() == 2) {
+    const parser::Node *specNode = (*args)[1].get();
+    mlir::Type specType = types.widenLiteral(types.inferExpr(specNode));
+    if (specType != types.contract("builtins.str")) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, specNode->range.start,
+          "format() format_spec must be statically typed str"});
+      return emitNone(expr);
+    }
+    if (specNode->kind == "Constant") {
+      if (auto text = ast::string(*specNode, "value"))
+        specKnownEmpty = text->empty();
+    }
+    spec = emitExpr(specNode);
+  }
+  return emitFormatValue(expr, value, spec, specKnownEmpty);
 }
 
 std::optional<Value>

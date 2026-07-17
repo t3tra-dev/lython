@@ -312,6 +312,10 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
   }
   if (expr->kind == "Lambda")
     return emitLambda(*expr);
+  if (expr->kind == "JoinedStr")
+    return emitJoinedStr(*expr);
+  if (expr->kind == "FormattedValue")
+    return emitFormattedValue(*expr);
   diagnostics.push_back(
       parser::Diagnostic{parser::Severity::Error, expr->range.start,
                          "unsupported expression kind '" + expr->kind + "'"});
