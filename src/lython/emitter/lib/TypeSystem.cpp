@@ -976,6 +976,9 @@ void TypeSystem::seedBuiltins() {
   bindSymbol("len", table.freeFunctionContract("builtins.len")
                         .value_or(py::CallableType::get(&context, {object()}, {},
                                                         {}, {}, {intType()})));
+  bindSymbol("hash", table.freeFunctionContract("builtins.hash")
+                         .value_or(py::CallableType::get(
+                             &context, {object()}, {}, {}, {}, {intType()})));
   bindClass("object", object());
   bindClass("bool", boolType());
   bindClass("int", intType());
