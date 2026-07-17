@@ -1,0 +1,10 @@
+Traceback\ \(most\ recent\ call\ last\):\
+\ \ File\ ".*traceback_nested_call\.py",\ line\ 12,\ in\ <module>\
+\ \ \ \ outer\(\)\
+\ \ \ \ \~\~\~\~\~\^\^\
+\ \ File\ ".*traceback_nested_call\.py",\ line\ 9,\ in\ outer\
+\ \ \ \ inner\(\)\
+\ \ \ \ \~\~\~\~\~\^\^\
+\ \ File\ ".*traceback_nested_call\.py",\ line\ 5,\ in\ inner\
+\ \ \ \ raise\ ValueError\("boom"\)\
+ValueError:\ boom

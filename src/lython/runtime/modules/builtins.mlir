@@ -1740,20 +1740,23 @@ module attributes {
     func.return
   }
 
+  // CPython 3.14 unified the /, //, and % zero-divisor message to
+  // "division by zero" (gh-87999), so the historic per-operator texts are
+  // not used.
   func.func private @__ly_long_raise_floor_div_zero() {
     %class_id = arith.constant 61 : i64
-    %length = arith.constant 34 : i64
-    %message_static = memref.get_global @__ly_long_msg_integer_division_or_modulo_by_zero : memref<34xi8>
-    %message = memref.cast %message_static : memref<34xi8> to memref<?xi8>
+    %length = arith.constant 16 : i64
+    %message_static = memref.get_global @__ly_long_msg_division_by_zero : memref<16xi8>
+    %message = memref.cast %message_static : memref<16xi8> to memref<?xi8>
     func.call @__ly_long_raise_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
   func.func private @__ly_long_raise_mod_zero() {
     %class_id = arith.constant 61 : i64
-    %length = arith.constant 22 : i64
-    %message_static = memref.get_global @__ly_long_msg_integer_modulo_by_zero : memref<22xi8>
-    %message = memref.cast %message_static : memref<22xi8> to memref<?xi8>
+    %length = arith.constant 16 : i64
+    %message_static = memref.get_global @__ly_long_msg_division_by_zero : memref<16xi8>
+    %message = memref.cast %message_static : memref<16xi8> to memref<?xi8>
     func.call @__ly_long_raise_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }

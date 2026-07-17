@@ -1,0 +1,14 @@
+Traceback\ \(most\ recent\ call\ last\):\
+\ \ File\ ".*traceback_chain_implicit\.py",\ line\ 5,\ in\ f\
+\ \ \ \ raise\ ValueError\("first"\)\
+ValueError:\ first\
+\
+During\ handling\ of\ the\ above\ exception,\ another\ exception\ occurred:\
+\
+Traceback\ \(most\ recent\ call\ last\):\
+\ \ File\ ".*traceback_chain_implicit\.py",\ line\ 10,\ in\ <module>\
+\ \ \ \ f\(\)\
+\ \ \ \ \~\^\^\
+\ \ File\ ".*traceback_chain_implicit\.py",\ line\ 7,\ in\ f\
+\ \ \ \ raise\ RuntimeError\("second"\)\
+RuntimeError:\ second

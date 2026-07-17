@@ -394,8 +394,15 @@ mlir::LogicalResult FinallyYieldOp::verify() {
 }
 
 mlir::LogicalResult RaiseOp::verify() {
-  return requireContractTerm(getOperation(), getException().getType(),
-                             "exception operand");
+  if (mlir::failed(requireContractTerm(getOperation(), getException().getType(),
+                                       "exception operand")))
+    return mlir::failure();
+  if (getCause() && getFromNone())
+    return emitOpError("cannot carry both a cause operand and from_none");
+  if (getCause())
+    return requireContractTerm(getOperation(), getCause().getType(),
+                               "cause operand");
+  return mlir::success();
 }
 
 mlir::LogicalResult RaiseCurrentOp::verify() { return mlir::success(); }

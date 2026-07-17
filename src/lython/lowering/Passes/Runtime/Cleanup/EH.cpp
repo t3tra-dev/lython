@@ -37,7 +37,31 @@ struct PendingPythonTryCallMarker {
 };
 
 std::string tracebackFunctionName(llvm::StringRef symbolName) {
-  return symbolName == "__main__" ? std::string("<module>") : symbolName.str();
+  if (symbolName == "__main__")
+    return "<module>";
+  // Specialization and generator state-machine clones carry ABI suffixes;
+  // the traceback shows the Python-level name.
+  for (llvm::StringRef marker : {"__lyrt_prim", "__lyrt_gen"}) {
+    std::size_t suffix = symbolName.find(marker);
+    if (suffix != llvm::StringRef::npos)
+      symbolName = symbolName.take_front(suffix);
+  }
+  return symbolName.str();
+}
+
+// The generator machinery splits one Python generator into a clone family
+// (`g__lyrt_gen_resume`, `g__lyrt_gen_resume__step`); an unwind edge between
+// members of the same family is state-machine plumbing, not a Python frame.
+bool isGeneratorInternalEdge(const llvm::CallInst &call) {
+  const llvm::Function *callee = call.getCalledFunction();
+  if (!callee)
+    return false;
+  llvm::StringRef callerName = call.getFunction()->getName();
+  llvm::StringRef calleeName = callee->getName();
+  if (!callerName.contains("__lyrt_gen") || !calleeName.contains("__lyrt_gen"))
+    return false;
+  return callerName.starts_with(calleeName) ||
+         calleeName.starts_with(callerName);
 }
 
 bool isPythonFunction(mlir::LLVM::LLVMFuncOp function) {
@@ -85,6 +109,8 @@ bool mayPropagatePythonException(const llvm::Function *callee) {
       name == "LyEH_CurrentExceptionMatches" ||
       name == "LyEH_DiscardCurrentExceptionIfMatches" ||
       name == "LyEH_DiscardCurrentException" ||
+      name == "LyEH_StashCurrentAsContext" ||
+      name == "LyEH_SetCurrentCause" || name == "LyEH_SetCurrentSuppress" ||
       name == "LyEH_TryCallSiteMarker" || name == "LyEH_TryCatchMarker" ||
       name == "LyEH_TryCatchAnchor" || name.starts_with("LyTraceback_"))
     return false;
@@ -149,10 +175,10 @@ std::string debugLocationFunctionName(const llvm::DILocation &loc) {
     if (llvm::DISubprogram *subprogram = scope->getSubprogram()) {
       llvm::StringRef name = subprogram->getName();
       if (!name.empty())
-        return name.str();
+        return tracebackFunctionName(name);
       llvm::StringRef linkage = subprogram->getLinkageName();
       if (!linkage.empty())
-        return linkage.str();
+        return tracebackFunctionName(linkage);
     }
   return "<unknown>";
 }
@@ -223,55 +249,6 @@ llvm::Value *i32Constant(llvm::IRBuilder<> &builder, std::int32_t value) {
                                 static_cast<std::uint32_t>(value));
 }
 
-void buildPythonCleanupBlock(llvm::CallInst &call, llvm::BasicBlock *unwindDest,
-                             llvm::DILocation &debugLoc,
-                             const PythonCallSiteRange *site) {
-  llvm::Function *function = call.getFunction();
-  llvm::Module *module = function->getParent();
-  llvm::LLVMContext &context = module->getContext();
-  llvm::BasicBlock *cleanup = llvm::BasicBlock::Create(
-      context, "py.traceback.cleanup", function, unwindDest);
-  llvm::IRBuilder<> builder(cleanup);
-  llvm::StructType *landingPadType = llvm::StructType::get(
-      llvm::PointerType::getUnqual(context), llvm::Type::getInt32Ty(context));
-  llvm::LandingPadInst *landingPad =
-      builder.CreateLandingPad(landingPadType, 0, "py.lpad");
-  landingPad->setCleanup(true);
-
-  std::string fallbackFile = debugLocationPath(debugLoc);
-  std::string fallbackFunction = debugLocationFunctionName(debugLoc);
-  llvm::StringRef fileName =
-      site ? llvm::StringRef(site->filename) : llvm::StringRef(fallbackFile);
-  llvm::StringRef functionName = site ? llvm::StringRef(site->functionName)
-                                      : llvm::StringRef(fallbackFunction);
-  std::int32_t line =
-      site ? site->line : static_cast<std::int32_t>(debugLoc.getLine());
-  std::int32_t column =
-      site ? site->column : static_cast<std::int32_t>(debugLoc.getColumn());
-  std::int32_t endLine = site ? site->endLine : line;
-  std::int32_t endColumn = site ? site->endColumn : 0;
-
-  llvm::Value *file = globalCStringPtr(builder, fileName, "py.tb.file");
-  llvm::Value *name = globalCStringPtr(builder, functionName, "py.tb.func");
-  builder.CreateCall(
-      tracebackPushCStringRange(*module),
-      {file, name, i32Constant(builder, line), i32Constant(builder, column),
-       i32Constant(builder, endLine), i32Constant(builder, endColumn)});
-  builder.CreateResume(landingPad);
-}
-
-llvm::LandingPadInst *createCatchAllLandingPad(llvm::IRBuilder<> &builder,
-                                               llvm::StringRef name) {
-  llvm::LLVMContext &context = builder.getContext();
-  llvm::StructType *landingPadType = llvm::StructType::get(
-      llvm::PointerType::getUnqual(context), llvm::Type::getInt32Ty(context));
-  llvm::LandingPadInst *landingPad =
-      builder.CreateLandingPad(landingPadType, 1, name);
-  landingPad->addClause(
-      llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(context)));
-  return landingPad;
-}
-
 void emitTracebackPush(llvm::IRBuilder<> &builder, llvm::Module &module,
                        const PythonCallSiteRange *site,
                        llvm::DILocation &debugLoc) {
@@ -296,6 +273,42 @@ void emitTracebackPush(llvm::IRBuilder<> &builder, llvm::Module &module,
        i32Constant(builder, endLine), i32Constant(builder, endColumn)});
 }
 
+void buildPythonCleanupBlock(llvm::CallInst &call, llvm::BasicBlock *unwindDest,
+                             llvm::DILocation &debugLoc,
+                             const PythonCallSiteRange *site) {
+  llvm::Function *function = call.getFunction();
+  llvm::Module *module = function->getParent();
+  llvm::LLVMContext &context = module->getContext();
+  llvm::BasicBlock *cleanup = llvm::BasicBlock::Create(
+      context, "py.traceback.cleanup", function, unwindDest);
+  llvm::IRBuilder<> builder(cleanup);
+  llvm::StructType *landingPadType = llvm::StructType::get(
+      llvm::PointerType::getUnqual(context), llvm::Type::getInt32Ty(context));
+  llvm::LandingPadInst *landingPad =
+      builder.CreateLandingPad(landingPadType, 0, "py.lpad");
+  landingPad->setCleanup(true);
+
+  // A raise primitive already pushed its own raise-site frame during MLIR
+  // lowering; pushing the invoke site again would duplicate the frame (and
+  // CPython shows no caret anchors on raise lines).
+  if (!isPythonRuntimeRaiseCall(call.getCalledFunction()) &&
+      !isGeneratorInternalEdge(call))
+    emitTracebackPush(builder, *module, site, debugLoc);
+  builder.CreateResume(landingPad);
+}
+
+llvm::LandingPadInst *createCatchAllLandingPad(llvm::IRBuilder<> &builder,
+                                               llvm::StringRef name) {
+  llvm::LLVMContext &context = builder.getContext();
+  llvm::StructType *landingPadType = llvm::StructType::get(
+      llvm::PointerType::getUnqual(context), llvm::Type::getInt32Ty(context));
+  llvm::LandingPadInst *landingPad =
+      builder.CreateLandingPad(landingPadType, 1, name);
+  landingPad->addClause(
+      llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(context)));
+  return landingPad;
+}
+
 llvm::BasicBlock *
 buildPythonCatchDispatchBlock(llvm::CallInst &call, llvm::BasicBlock *catchDest,
                               llvm::DILocation &debugLoc,
@@ -311,7 +324,11 @@ buildPythonCatchDispatchBlock(llvm::CallInst &call, llvm::BasicBlock *catchDest,
   llvm::Value *exceptionObject =
       builder.CreateExtractValue(landingPad, {0}, "py.catch.exception");
   builder.CreateCall(beginPythonCatch(*module), {exceptionObject});
-  emitTracebackPush(builder, *module, site, debugLoc);
+  // Same rule as the cleanup pads: raise primitives already recorded their
+  // raise-site frame during MLIR lowering.
+  if (!isPythonRuntimeRaiseCall(call.getCalledFunction()) &&
+      !isGeneratorInternalEdge(call))
+    emitTracebackPush(builder, *module, site, debugLoc);
   builder.CreateBr(catchDest);
   return landing;
 }

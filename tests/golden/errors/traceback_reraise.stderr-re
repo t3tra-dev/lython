@@ -1,0 +1,6 @@
+Traceback\ \(most\ recent\ call\ last\):\
+\ \ File\ ".*traceback_reraise\.py",\ line\ 6,\ in\ <module>\
+\ \ \ \ raise\ e\
+\ \ File\ ".*traceback_reraise\.py",\ line\ 4,\ in\ <module>\
+\ \ \ \ raise\ ValueError\("original"\)\
+ValueError:\ original

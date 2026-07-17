@@ -1,3 +1,4 @@
+#include "Common/PythonSourceRange.h"
 #include "Runtime/Core/Lowerer.h"
 
 namespace py::lowering {
@@ -33,7 +34,16 @@ llvm::StringRef currentCallableName(mlir::Operation *op) {
     return "<unknown>";
   if (auto function = op->getParentOfType<mlir::func::FuncOp>()) {
     llvm::StringRef name = function.getName();
-    return name == "__main__" ? "<module>" : name;
+    if (name == "__main__")
+      return "<module>";
+    // Specialization and generator state-machine clones carry ABI suffixes;
+    // the traceback shows the Python-level name.
+    for (llvm::StringRef marker : {"__lyrt_prim", "__lyrt_gen"}) {
+      std::size_t suffix = name.find(marker);
+      if (suffix != llvm::StringRef::npos)
+        name = name.take_front(suffix);
+    }
+    return name;
   }
   return "<unknown>";
 }
@@ -68,11 +78,11 @@ mlir::func::FuncOp getOrCreateTracebackPush(mlir::ModuleOp module,
                                             mlir::OpBuilder &builder) {
   auto bytesType =
       mlir::MemRefType::get({mlir::ShapedType::kDynamic}, builder.getI8Type());
+  mlir::Type i32 = builder.getI32Type();
   return getOrCreatePrivateFunction(
       module, builder, "LyTraceback_Push",
-      builder.getFunctionType(
-          {bytesType, bytesType, builder.getI32Type(), builder.getI32Type()},
-          {}));
+      builder.getFunctionType({bytesType, bytesType, i32, i32, i32, i32, i32},
+                              {}));
 }
 
 mlir::FailureOr<std::int64_t>
@@ -96,25 +106,55 @@ handlerClassId(mlir::Operation *op, mlir::Type handler,
 } // namespace
 
 mlir::LogicalResult
-RuntimeBundleLowerer::emitTracebackFrame(mlir::Operation *op) {
+RuntimeBundleLowerer::emitTracebackFrame(mlir::Operation *op,
+                                         bool stashCurrentException) {
   llvm::StringRef filename;
   std::int64_t line = 0;
   std::int64_t column = 0;
   getLocInfo(op->getLoc(), filename, line, column);
 
+  // Sub-line source ranges become caret anchors (`d[k]` -> `~^^^`). Raise
+  // statements never carry anchors: CPython only extracts anchors from
+  // expression segments (calls, subscripts, operators), and a raise
+  // statement's position is the whole statement.
+  std::int64_t endLine = line;
+  std::int64_t endColumn = 0;
+  std::int64_t hasMarker = 0;
+  if (!mlir::isa<py::RaiseOp, py::RaiseCurrentOp>(op)) {
+    if (std::optional<PythonSourceRange> range =
+            pythonSourceRange(op->getLoc())) {
+      if (range->endLine == range->line && range->endColumn > range->column) {
+        endLine = range->endLine;
+        endColumn = range->endColumn;
+        hasMarker = 1;
+      }
+    }
+  }
+
+  // A frame push announces a fresh raise. If another exception is still being
+  // handled here, it becomes the new exception's implicit __context__; the
+  // stash must run before the push so the handled exception's traceback
+  // snapshot does not swallow the new raise-site frame. Re-raises of the
+  // current exception skip this (their traceback must stay in place).
+  if (stashCurrentException)
+    mlir::func::CallOp::create(builder, op->getLoc(),
+                               getOrCreateStashCurrentAsContext(module,
+                                                                builder),
+                               mlir::ValueRange{});
+
   mlir::func::FuncOp tracebackPush = getOrCreateTracebackPush(module, builder);
   mlir::Value file = materializeByteBuffer(op->getLoc(), filename);
   mlir::Value function =
       materializeByteBuffer(op->getLoc(), currentCallableName(op));
-  mlir::Value lineValue =
-      mlir::arith::ConstantIntOp::create(builder, op->getLoc(), line, 32)
-          .getResult();
-  mlir::Value columnValue =
-      mlir::arith::ConstantIntOp::create(builder, op->getLoc(), column, 32)
-          .getResult();
+  auto i32Const = [&](std::int64_t value) {
+    return mlir::arith::ConstantIntOp::create(builder, op->getLoc(), value, 32)
+        .getResult();
+  };
   mlir::func::CallOp::create(
       builder, op->getLoc(), tracebackPush,
-      mlir::ValueRange{file, function, lineValue, columnValue});
+      mlir::ValueRange{file, function, i32Const(line), i32Const(column),
+                       i32Const(endLine), i32Const(endColumn),
+                       i32Const(hasMarker)});
   return mlir::success();
 }
 
@@ -195,15 +235,60 @@ mlir::LogicalResult RuntimeBundleLowerer::emitRuntimeExceptionFromMessageObject(
   return mlir::success();
 }
 
+// LyEH_SetCurrentCause(exception triple): records the raised exception's
+// explicit `__cause__` (raise ... from <expr>). The runtime borrows the
+// operands and retains what it stores, so the call is a plain use for the
+// ownership machinery.
+mlir::LogicalResult
+RuntimeBundleLowerer::emitSetCurrentCause(mlir::Operation *op,
+                                          const RuntimeBundle &cause) {
+  llvm::ArrayRef<mlir::Value> values = cause.physicalValues();
+  auto headerType = values.empty()
+                        ? mlir::MemRefType()
+                        : mlir::dyn_cast<mlir::MemRefType>(
+                              values.front().getType());
+  if (values.size() != 3 || !headerType || headerType.getRank() != 1 ||
+      !headerType.getElementType().isInteger(64) ||
+      !manifest.classId(cause.contractName()))
+    return op->emitError()
+           << "raise ... from cause must be a runtime exception instance, got "
+           << cause.contractName();
+  mlir::func::FuncOp setCause = getOrCreatePrivateFunction(
+      module, builder, "LyEH_SetCurrentCause",
+      builder.getFunctionType({values[0].getType(), values[1].getType(),
+                               values[2].getType()},
+                              {}));
+  mlir::func::CallOp::create(builder, op->getLoc(), setCause, values);
+  return mlir::success();
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::lowerRaise(py::RaiseOp op) {
   const RuntimeBundle *exception = bundleFor(op.getException());
   if (!exception)
     return op.emitError() << "raised exception has no lowered runtime bundle";
 
+  const RuntimeBundle *cause = nullptr;
+  if (mlir::Value causeValue = op.getCause()) {
+    cause = bundleFor(causeValue);
+    if (!cause)
+      return op.emitError() << "raise cause has no lowered runtime bundle";
+  }
+
   if (exception->objectEvidence.hasFlag(kCurrentExceptionBorrowFlag)) {
+    // Re-raise of the exception being handled: its traceback and context stay
+    // in place; only an explicit cause / from None annotation is recorded.
     mlir::func::FuncOp rethrow = getOrCreateRethrowCurrent(module, builder);
     builder.setInsertionPoint(op);
-    if (mlir::failed(emitTracebackFrame(op.getOperation())))
+    if (cause) {
+      if (mlir::failed(emitSetCurrentCause(op.getOperation(), *cause)))
+        return mlir::failure();
+    } else if (op.getFromNone()) {
+      mlir::func::CallOp::create(builder, op.getLoc(),
+                                 getOrCreateSetCurrentSuppress(module, builder),
+                                 mlir::ValueRange{});
+    }
+    if (mlir::failed(emitTracebackFrame(op.getOperation(),
+                                        /*stashCurrentException=*/false)))
       return mlir::failure();
     emitTryCallSiteMarkerIfNeeded(op.getLoc());
     mlir::func::CallOp::create(builder, op.getLoc(), rethrow,
@@ -213,8 +298,27 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerRaise(py::RaiseOp op) {
     return mlir::success();
   }
 
+  if (cause || op.getFromNone()) {
+    // The stash must precede the cause annotation: `raise X from e` where `e`
+    // is the exception being handled shares the freshly stashed context node
+    // as the cause instead of building a second reference chain.
+    builder.setInsertionPoint(op);
+    mlir::func::CallOp::create(builder, op.getLoc(),
+                               getOrCreateStashCurrentAsContext(module,
+                                                                builder),
+                               mlir::ValueRange{});
+    if (cause) {
+      if (mlir::failed(emitSetCurrentCause(op.getOperation(), *cause)))
+        return mlir::failure();
+    } else {
+      mlir::func::CallOp::create(builder, op.getLoc(),
+                                 getOrCreateSetCurrentSuppress(module, builder),
+                                 mlir::ValueRange{});
+    }
+  }
+
   if (mlir::failed(RuntimeBundleLowerer::emitRaiseExceptionBundle(
-          op.getOperation(), *exception, /*discardCurrentException=*/true)))
+          op.getOperation(), *exception)))
     return mlir::failure();
   createDeadContinuation(builder, op.getOperation());
   op.erase();
@@ -222,8 +326,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerRaise(py::RaiseOp op) {
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::emitRaiseExceptionBundle(
-    mlir::Operation *op, const RuntimeBundle &exception,
-    bool discardCurrentException) {
+    mlir::Operation *op, const RuntimeBundle &exception) {
   std::optional<RuntimeSymbol> symbol =
       manifest.primitive(exception.contractName(), "raise");
   if (!symbol)
@@ -233,10 +336,6 @@ mlir::LogicalResult RuntimeBundleLowerer::emitRaiseExceptionBundle(
   llvm::SmallVector<const RuntimeBundle *, 1> sources{&exception};
   llvm::SmallVector<mlir::Value, 8> operands;
   builder.setInsertionPoint(op);
-  if (discardCurrentException)
-    mlir::func::CallOp::create(
-        builder, op->getLoc(), getOrCreateDiscardCurrentException(module, builder),
-        mlir::ValueRange{});
   if (mlir::failed(emitTracebackFrame(op)))
     return mlir::failure();
   if (mlir::failed(buildRuntimeCallOperands(op, *symbol, sources, operands,
