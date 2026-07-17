@@ -1332,6 +1332,10 @@ std::optional<Value> ModuleEmitter::emitStringifyValue(const parser::Node &ancho
   mlir::Type valueType = types.widenLiteral(value.type);
   if (valueType == strType)
     return coerceValue(value, strType, anchor);
+  // None has no physical header for a __repr__ dispatch to receive; its
+  // text is a compile-time constant anyway.
+  if (valueType == types.none())
+    return emitStrLiteralPiece(anchor, "None");
   if (std::optional<MethodBinding> method =
           lookupClassMethod(valueType, "__str__")) {
     llvm::StringMap<Value> emptyKeywords;
@@ -1363,6 +1367,8 @@ ModuleEmitter::emitConversionValue(const parser::Node &anchor, Value value,
     return emitStringifyValue(anchor, value);
   // 'r' and 'a' both start from __repr__.
   mlir::Type valueType = types.widenLiteral(value.type);
+  if (valueType == types.none())
+    return emitStrLiteralPiece(anchor, "None");
   std::optional<Value> repr;
   if (std::optional<MethodBinding> method =
           lookupClassMethod(valueType, "__repr__")) {
@@ -1741,11 +1747,105 @@ ModuleEmitter::tryEmitStrFormatCall(const parser::Node &expr,
   if (receiverNode->kind == "Constant")
     if (auto text = ast::string(*receiverNode, "value"))
       tpl = std::string(*text);
-  if (!tpl)
-    return diag(
-        "str.format requires a compile-time template string here (runtime "
-        "templates are limited to the statically-typed forms, which are not "
-        "implemented for this call shape yet)");
+  if (!tpl) {
+    // Runtime template (R4): the field/argument matching that a literal
+    // template gets at compile time moves into the __fmt_* scanners, which
+    // only accept auto-numbered fields — anything needing runtime argument
+    // selection stays a loud error.
+    if (keywords && !keywords->empty())
+      return diag("str.format with a runtime template supports positional "
+                  "arguments only (named fields need a literal template)");
+    Value receiver =
+        coerceValue(emitExpr(receiverNode), strType, expr);
+    llvm::SmallVector<Value, 4> runtimeArgs;
+    if (args)
+      for (const parser::NodePtr &argument : *args)
+        runtimeArgs.push_back(emitExpr(argument.get()));
+    auto callStrMethod = [&](llvm::StringRef method, Value self,
+                             llvm::ArrayRef<Value> extra)
+        -> std::optional<Value> {
+      llvm::SmallVector<mlir::Type, 4> argTypes;
+      for (const Value &argument : extra)
+        argTypes.push_back(types.widenLiteral(argument.type));
+      CallInferenceResult inference = types.inferMethodCallWithEvidence(
+          types.widenLiteral(self.type), method, argTypes);
+      if (!inference)
+        return std::nullopt;
+      Value posPack = emitPack(extra);
+      Value namePack = emitPack({});
+      Value valuePack = emitPack({});
+      auto op = py::CallOp::create(
+          builder, loc(expr), mlir::TypeRange{inference.resultType},
+          callProtocolFor(inference), self.value, posPack.value,
+          namePack.value, valuePack.value);
+      op->setAttr("ly.bound_method", builder.getStringAttr(method));
+      return Value{op.getResults().front(), inference.resultType};
+    };
+    mlir::Type zeroLiteral = types.literal("0");
+    auto zeroOp = py::IntConstantOp::create(builder, loc(expr), zeroLiteral,
+                                            builder.getStringAttr("0"));
+    Value cursor = coerceValue(Value{zeroOp.getResult(), zeroLiteral},
+                               types.intType(), expr);
+    std::optional<Value> acc;
+    auto append = [&](Value piece) {
+      Value coerced = coerceValue(piece, strType, expr);
+      if (!acc) {
+        acc = coerced;
+        return;
+      }
+      acc = emitBinarySpecial<py::AddOp>(expr, "__add__", *acc, coerced,
+                                         strType);
+    };
+    for (Value &argument : runtimeArgs) {
+      std::optional<Value> prefix =
+          callStrMethod("__fmt_prefix__", receiver, {cursor});
+      std::optional<Value> pos =
+          callStrMethod("__fmt_next__", receiver, {cursor});
+      if (!prefix || !pos)
+        return diag("runtime str.format scanners are missing from the "
+                    "runtime manifest");
+      std::optional<Value> conv =
+          callStrMethod("__fmt_conv__", receiver, {*pos});
+      std::optional<Value> spec =
+          callStrMethod("__fmt_spec__", receiver, {*pos});
+      std::optional<Value> next =
+          callStrMethod("__fmt_end__", receiver, {*pos});
+      if (!conv || !spec || !next)
+        return diag("runtime str.format scanners are missing from the "
+                    "runtime manifest");
+      cursor = *next;
+      // The conversion character is runtime data, so every variant is
+      // formatted eagerly and __fmt_pick__ selects; formatting is pure, so
+      // the extra work is the price of static dispatch.
+      Value plain = emitFormatValue(expr, argument, spec, false);
+      std::optional<Value> reprText =
+          emitConversionValue(expr, argument, 'r');
+      std::optional<Value> strText = emitStringifyValue(expr, argument);
+      std::optional<Value> asciiText =
+          emitConversionValue(expr, argument, 'a');
+      if (!reprText || !strText || !asciiText)
+        return diag("runtime str.format arguments must support repr/str/"
+                    "ascii conversions statically");
+      Value reprFmt = emitFormatValue(expr, *reprText, spec, false);
+      Value strFmt = emitFormatValue(expr, *strText, spec, false);
+      Value asciiFmt = emitFormatValue(expr, *asciiText, spec, false);
+      std::optional<Value> picked = callStrMethod(
+          "__fmt_pick__", coerceValue(plain, strType, expr),
+          {*conv, reprFmt, strFmt, asciiFmt});
+      if (!picked)
+        return diag("runtime str.format scanners are missing from the "
+                    "runtime manifest");
+      append(*prefix);
+      append(*picked);
+    }
+    std::optional<Value> tail =
+        callStrMethod("__fmt_tail__", receiver, {cursor});
+    if (!tail)
+      return diag("runtime str.format scanners are missing from the runtime "
+                  "manifest");
+    append(*tail);
+    return acc ? *acc : emitEmptyStrConstant(expr);
+  }
 
   llvm::SmallVector<std::pair<std::string, std::optional<TemplateField>>, 8>
       parts;

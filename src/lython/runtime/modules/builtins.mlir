@@ -206,7 +206,9 @@ module attributes {
     method_names = ["__new__", "__len__", "__iter__", "__getitem__", "__add__",
                     "__contains__", "__eq__", "__lt__", "__le__", "__gt__",
                     "__ge__", "join", "startswith", "endswith", "__repr__", "__str__", "__ne__",
-                    "encode", "__format__", "__ascii__"],
+                    "encode", "__format__", "__ascii__", "__fmt_next__",
+                    "__fmt_prefix__", "__fmt_tail__", "__fmt_conv__",
+                    "__fmt_spec__", "__fmt_end__", "__fmt_pick__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.str">>, !py.contract<"builtins.object">] -> [!py.self]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.int">]>,
@@ -227,13 +229,21 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.object">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.bytes">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.int">, !py.contract<"builtins.str">, !py.contract<"builtins.str">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>
     ],
     method_kinds = ["classmethod", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance",
-                    "instance", "instance", "instance"]
+                    "instance", "instance", "instance", "instance", "instance",
+                    "instance", "instance", "instance", "instance", "instance"]
   } {}
 
   py.class @str_iterator attributes {
@@ -8088,6 +8098,400 @@ module attributes {
     %rh, %rb = func.call @__ly_fmt_str_from_cps(%buf, %total) : (memref<?xi32>, i64) -> (memref<2xi64>, memref<?xi8>)
     memref.dealloc %buf : memref<?xi32>
     func.return %rh, %rb : memref<2xi64>, memref<?xi8>
+  }
+
+  // ===== impls: runtime str.format templates =====
+  // A runtime (non-literal) template cannot be matched against the argument
+  // list statically, so the emitter chains these scanners per argument:
+  // prefix/next/conv/spec/end walk the template, pick selects the variant
+  // the runtime conversion character asks for. Only auto-numbered fields
+  // are accepted -- manual/named fields would need runtime argument
+  // selection, which the static ABI deliberately avoids (R4).
+
+  // "Single '}' encountered in format string"
+  memref.global "private" constant @__ly_fmtrt_msg_single_rbrace : memref<39xi8> = dense<[83, 105, 110, 103, 108, 101, 32, 39, 125, 39, 32, 101, 110, 99, 111, 117, 110, 116, 101, 114, 101, 100, 32, 105, 110, 32, 102, 111, 114, 109, 97, 116, 32, 115, 116, 114, 105, 110, 103]>
+  // "Single '{' encountered in format string"
+  memref.global "private" constant @__ly_fmtrt_msg_single_lbrace : memref<39xi8> = dense<[83, 105, 110, 103, 108, 101, 32, 39, 123, 39, 32, 101, 110, 99, 111, 117, 110, 116, 101, 114, 101, 100, 32, 105, 110, 32, 102, 111, 114, 109, 97, 116, 32, 115, 116, 114, 105, 110, 103]>
+  // "too many positional arguments for the runtime format template"
+  memref.global "private" constant @__ly_fmtrt_msg_too_many_args : memref<61xi8> = dense<[116, 111, 111, 32, 109, 97, 110, 121, 32, 112, 111, 115, 105, 116, 105, 111, 110, 97, 108, 32, 97, 114, 103, 117, 109, 101, 110, 116, 115, 32, 102, 111, 114, 32, 116, 104, 101, 32, 114, 117, 110, 116, 105, 109, 101, 32, 102, 111, 114, 109, 97, 116, 32, 116, 101, 109, 112, 108, 97, 116, 101]>
+  // "Replacement index out of range for positional args tuple"
+  memref.global "private" constant @__ly_fmtrt_msg_index_range : memref<56xi8> = dense<[82, 101, 112, 108, 97, 99, 101, 109, 101, 110, 116, 32, 105, 110, 100, 101, 120, 32, 111, 117, 116, 32, 111, 102, 32, 114, 97, 110, 103, 101, 32, 102, 111, 114, 32, 112, 111, 115, 105, 116, 105, 111, 110, 97, 108, 32, 97, 114, 103, 115, 32, 116, 117, 112, 108, 101]>
+  // "runtime str.format templates support only auto-numbered fields ('{}')"
+  memref.global "private" constant @__ly_fmtrt_msg_auto_only : memref<69xi8> = dense<[114, 117, 110, 116, 105, 109, 101, 32, 115, 116, 114, 46, 102, 111, 114, 109, 97, 116, 32, 116, 101, 109, 112, 108, 97, 116, 101, 115, 32, 115, 117, 112, 112, 111, 114, 116, 32, 111, 110, 108, 121, 32, 97, 117, 116, 111, 45, 110, 117, 109, 98, 101, 114, 101, 100, 32, 102, 105, 101, 108, 100, 115, 32, 40, 39, 123, 125, 39, 41]>
+  // "runtime str.format templates do not support nested replacement fields"
+  memref.global "private" constant @__ly_fmtrt_msg_nested_spec : memref<69xi8> = dense<[114, 117, 110, 116, 105, 109, 101, 32, 115, 116, 114, 46, 102, 111, 114, 109, 97, 116, 32, 116, 101, 109, 112, 108, 97, 116, 101, 115, 32, 100, 111, 32, 110, 111, 116, 32, 115, 117, 112, 112, 111, 114, 116, 32, 110, 101, 115, 116, 101, 100, 32, 114, 101, 112, 108, 97, 99, 101, 109, 101, 110, 116, 32, 102, 105, 101, 108, 100, 115]>
+  // "invalid conversion character; expected 's', 'r', or 'a'"
+  memref.global "private" constant @__ly_fmtrt_msg_bad_conv : memref<55xi8> = dense<[105, 110, 118, 97, 108, 105, 100, 32, 99, 111, 110, 118, 101, 114, 115, 105, 111, 110, 32, 99, 104, 97, 114, 97, 99, 116, 101, 114, 59, 32, 101, 120, 112, 101, 99, 116, 101, 100, 32, 39, 115, 39, 44, 32, 39, 114, 39, 44, 32, 111, 114, 32, 39, 97, 39]>
+
+  func.func private @__ly_fmtrt_raise(%message: memref<?xi8>, %length: i64) {
+    %value_error = arith.constant 53 : i64
+    func.call @__ly_long_raise_message(%value_error, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.return
+  }
+
+  func.func private @__ly_fmtrt_raise_single_rbrace() {
+    %ms = memref.get_global @__ly_fmtrt_msg_single_rbrace : memref<39xi8>
+    %m = memref.cast %ms : memref<39xi8> to memref<?xi8>
+    %l = arith.constant 39 : i64
+    func.call @__ly_fmtrt_raise(%m, %l) : (memref<?xi8>, i64) -> ()
+    func.return
+  }
+
+  func.func private @__ly_fmtrt_raise_single_lbrace() {
+    %ms = memref.get_global @__ly_fmtrt_msg_single_lbrace : memref<39xi8>
+    %m = memref.cast %ms : memref<39xi8> to memref<?xi8>
+    %l = arith.constant 39 : i64
+    func.call @__ly_fmtrt_raise(%m, %l) : (memref<?xi8>, i64) -> ()
+    func.return
+  }
+
+  // Shared walk from a cursor to the next replacement field: returns the
+  // field's '{' position or -1 at end. Raises on stray '}'.
+  func.func private @__ly_fmtrt_scan_to_field(%header: memref<2xi64>, %bytes: memref<?xi8>, %cursor: i64) -> i64 {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %minus_one = arith.constant -1 : i64
+    %lb = arith.constant 123 : i64
+    %rb = arith.constant 125 : i64
+    %wid = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %n = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %res:2 = scf.while (%i = %cursor, %found = %minus_one) : (i64, i64) -> (i64, i64) {
+      %in = arith.cmpi slt, %i, %n : i64
+      %not_found = arith.cmpi eq, %found, %minus_one : i64
+      %continue = arith.andi %in, %not_found : i1
+      scf.condition(%continue) %i, %found : i64, i64
+    } do {
+    ^bb0(%i: i64, %found: i64):
+      %ix = arith.index_cast %i : i64 to index
+      %c = func.call @__ly_unicode_get(%bytes, %wid, %ix) : (memref<?xi8>, i64, index) -> i64
+      %ip1 = arith.addi %i, %one : i64
+      %has_next = arith.cmpi slt, %ip1, %n : i64
+      %cn = scf.if %has_next -> (i64) {
+        %ix1 = arith.index_cast %ip1 : i64 to index
+        %v = func.call @__ly_unicode_get(%bytes, %wid, %ix1) : (memref<?xi8>, i64, index) -> i64
+        scf.yield %v : i64
+      } else {
+        scf.yield %zero : i64
+      }
+      %is_lb = arith.cmpi eq, %c, %lb : i64
+      %is_rb = arith.cmpi eq, %c, %rb : i64
+      %next_lb = arith.cmpi eq, %cn, %lb : i64
+      %next_rb = arith.cmpi eq, %cn, %rb : i64
+      %esc_lb = arith.andi %is_lb, %next_lb : i1
+      %esc_rb = arith.andi %is_rb, %next_rb : i1
+      %esc = arith.ori %esc_lb, %esc_rb : i1
+      %ni:2 = scf.if %esc -> (i64, i64) {
+        %skip = arith.addi %i, %two : i64
+        scf.yield %skip, %minus_one : i64, i64
+      } else {
+        %r:2 = scf.if %is_lb -> (i64, i64) {
+          scf.yield %i, %i : i64, i64
+        } else {
+          scf.if %is_rb {
+            func.call @__ly_fmtrt_raise_single_rbrace() : () -> ()
+          }
+          scf.yield %ip1, %minus_one : i64, i64
+        }
+        scf.yield %r#0, %r#1 : i64, i64
+      }
+      scf.yield %ni#0, %ni#1 : i64, i64
+    }
+    func.return %res#1 : i64
+  }
+
+  // Decoded literal text from the cursor to the next field (or the end).
+  func.func private @__ly_fmtrt_literal_until_field(%header: memref<2xi64>, %bytes: memref<?xi8>, %cursor: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %minus_one = arith.constant -1 : i64
+    %lb = arith.constant 123 : i64
+    %rb = arith.constant 125 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %wid = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %n = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %cap0 = arith.subi %n, %cursor : i64
+    %cap = arith.maxsi %cap0, %one : i64
+    %cap_idx = arith.index_cast %cap : i64 to index
+    %buf = memref.alloc(%cap_idx) : memref<?xi32>
+    %res:3 = scf.while (%i = %cursor, %o = %zero, %stop = %zero) : (i64, i64, i64) -> (i64, i64, i64) {
+      %in = arith.cmpi slt, %i, %n : i64
+      %going = arith.cmpi eq, %stop, %zero : i64
+      %continue = arith.andi %in, %going : i1
+      scf.condition(%continue) %i, %o, %stop : i64, i64, i64
+    } do {
+    ^bb0(%i: i64, %o: i64, %stop: i64):
+      %ix = arith.index_cast %i : i64 to index
+      %c = func.call @__ly_unicode_get(%bytes, %wid, %ix) : (memref<?xi8>, i64, index) -> i64
+      %ip1 = arith.addi %i, %one : i64
+      %has_next = arith.cmpi slt, %ip1, %n : i64
+      %cn = scf.if %has_next -> (i64) {
+        %ix1 = arith.index_cast %ip1 : i64 to index
+        %v = func.call @__ly_unicode_get(%bytes, %wid, %ix1) : (memref<?xi8>, i64, index) -> i64
+        scf.yield %v : i64
+      } else {
+        scf.yield %zero : i64
+      }
+      %is_lb = arith.cmpi eq, %c, %lb : i64
+      %is_rb = arith.cmpi eq, %c, %rb : i64
+      %next_lb = arith.cmpi eq, %cn, %lb : i64
+      %next_rb = arith.cmpi eq, %cn, %rb : i64
+      %esc_lb = arith.andi %is_lb, %next_lb : i1
+      %esc_rb = arith.andi %is_rb, %next_rb : i1
+      %esc = arith.ori %esc_lb, %esc_rb : i1
+      %r:3 = scf.if %esc -> (i64, i64, i64) {
+        %o_idx = arith.index_cast %o : i64 to index
+        %c32 = arith.trunci %c : i64 to i32
+        memref.store %c32, %buf[%o_idx] : memref<?xi32>
+        %no = arith.addi %o, %one : i64
+        %skip = arith.addi %i, %two : i64
+        scf.yield %skip, %no, %zero : i64, i64, i64
+      } else {
+        %r2:3 = scf.if %is_lb -> (i64, i64, i64) {
+          scf.yield %i, %o, %one : i64, i64, i64
+        } else {
+          scf.if %is_rb {
+            func.call @__ly_fmtrt_raise_single_rbrace() : () -> ()
+          }
+          %o_idx = arith.index_cast %o : i64 to index
+          %c32 = arith.trunci %c : i64 to i32
+          memref.store %c32, %buf[%o_idx] : memref<?xi32>
+          %no = arith.addi %o, %one : i64
+          scf.yield %ip1, %no, %zero : i64, i64, i64
+        }
+        scf.yield %r2#0, %r2#1, %r2#2 : i64, i64, i64
+      }
+      scf.yield %r#0, %r#1, %r#2 : i64, i64, i64
+    }
+    %h, %b = func.call @__ly_fmt_str_from_cps(%buf, %res#1) : (memref<?xi32>, i64) -> (memref<2xi64>, memref<?xi8>)
+    memref.dealloc %buf : memref<?xi32>
+    func.return %h, %b : memref<2xi64>, memref<?xi8>
+  }
+
+  // Field structure at '{' position: (name_len, conv 0/1/2/3, spec_start,
+  // spec_end, end-after-'}'). Raises on malformed fields.
+  func.func private @__ly_fmtrt_field_parts(%header: memref<2xi64>, %bytes: memref<?xi8>, %pos: i64) -> (i64, i64, i64, i64, i64) {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %true_frt = arith.constant true
+    %minus_one = arith.constant -1 : i64
+    %lb = arith.constant 123 : i64
+    %rb = arith.constant 125 : i64
+    %colon_ch = arith.constant 58 : i64
+    %bang_ch = arith.constant 33 : i64
+    %wid = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %n = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %start = arith.addi %pos, %one : i64
+    %scan:4 = scf.while (%j = %start, %depth = %one, %colon = %minus_one, %bang = %minus_one) : (i64, i64, i64, i64) -> (i64, i64, i64, i64) {
+      %in = arith.cmpi slt, %j, %n : i64
+      %open = arith.cmpi sgt, %depth, %zero : i64
+      %continue = arith.andi %in, %open : i1
+      scf.condition(%continue) %j, %depth, %colon, %bang : i64, i64, i64, i64
+    } do {
+    ^bb0(%j: i64, %depth: i64, %colon: i64, %bang: i64):
+      %jx = arith.index_cast %j : i64 to index
+      %c = func.call @__ly_unicode_get(%bytes, %wid, %jx) : (memref<?xi8>, i64, index) -> i64
+      %is_lb = arith.cmpi eq, %c, %lb : i64
+      %is_rb = arith.cmpi eq, %c, %rb : i64
+      %inc = arith.select %is_lb, %one, %zero : i64
+      %dec = arith.select %is_rb, %one, %zero : i64
+      %d1 = arith.addi %depth, %inc : i64
+      %nd = arith.subi %d1, %dec : i64
+      %at1 = arith.cmpi eq, %depth, %one : i64
+      %no_colon = arith.cmpi eq, %colon, %minus_one : i64
+      %is_colon = arith.cmpi eq, %c, %colon_ch : i64
+      %set_colon0 = arith.andi %at1, %no_colon : i1
+      %set_colon = arith.andi %set_colon0, %is_colon : i1
+      %ncolon = arith.select %set_colon, %j, %colon : i64
+      %no_bang = arith.cmpi eq, %bang, %minus_one : i64
+      %is_bang = arith.cmpi eq, %c, %bang_ch : i64
+      %set_bang0 = arith.andi %at1, %no_bang : i1
+      %set_bang1 = arith.andi %set_bang0, %no_colon : i1
+      %set_bang = arith.andi %set_bang1, %is_bang : i1
+      %nbang = arith.select %set_bang, %j, %bang : i64
+      %closed = arith.cmpi eq, %nd, %zero : i64
+      %jp1 = arith.addi %j, %one : i64
+      %nj = arith.select %closed, %j, %jp1 : i64
+      scf.yield %nj, %nd, %ncolon, %nbang : i64, i64, i64, i64
+    }
+    %unterminated = arith.cmpi ne, %scan#1, %zero : i64
+    scf.if %unterminated {
+      func.call @__ly_fmtrt_raise_single_lbrace() : () -> ()
+    }
+    %end = arith.maxsi %scan#0, %start : i64
+    %has_bang = arith.cmpi ne, %scan#3, %minus_one : i64
+    %has_colon = arith.cmpi ne, %scan#2, %minus_one : i64
+    %colon_or_end = arith.select %has_colon, %scan#2, %end : i64
+    %name_end = arith.select %has_bang, %scan#3, %colon_or_end : i64
+    %name_len = arith.subi %name_end, %start : i64
+    %conv = scf.if %has_bang -> (i64) {
+      %conv_pos = arith.addi %scan#3, %one : i64
+      %expected_end = arith.addi %scan#3, %one : i64
+      %expected_end2 = arith.addi %expected_end, %one : i64
+      %conv_end = arith.select %has_colon, %scan#2, %end : i64
+      %well_formed = arith.cmpi eq, %conv_end, %expected_end2 : i64
+      %bad_shape = arith.xori %well_formed, %true_frt : i1
+      scf.if %bad_shape {
+        %ms = memref.get_global @__ly_fmtrt_msg_bad_conv : memref<55xi8>
+        %m = memref.cast %ms : memref<55xi8> to memref<?xi8>
+        %l = arith.constant 55 : i64
+        func.call @__ly_fmtrt_raise(%m, %l) : (memref<?xi8>, i64) -> ()
+      }
+      %cx = arith.index_cast %conv_pos : i64 to index
+      %cc = func.call @__ly_unicode_get(%bytes, %wid, %cx) : (memref<?xi8>, i64, index) -> i64
+      %cr = arith.constant 114 : i64
+      %cs = arith.constant 115 : i64
+      %ca = arith.constant 97 : i64
+      %is_r = arith.cmpi eq, %cc, %cr : i64
+      %is_s = arith.cmpi eq, %cc, %cs : i64
+      %is_a = arith.cmpi eq, %cc, %ca : i64
+      %some0 = arith.ori %is_r, %is_s : i1
+      %some = arith.ori %some0, %is_a : i1
+      %bad = arith.xori %some, %true_frt : i1
+      scf.if %bad {
+        %ms = memref.get_global @__ly_fmtrt_msg_bad_conv : memref<55xi8>
+        %m = memref.cast %ms : memref<55xi8> to memref<?xi8>
+        %l = arith.constant 55 : i64
+        func.call @__ly_fmtrt_raise(%m, %l) : (memref<?xi8>, i64) -> ()
+      }
+      %three = arith.constant 3 : i64
+      %two_c = arith.constant 2 : i64
+      %v_a = arith.select %is_a, %three, %zero : i64
+      %v_s = arith.select %is_s, %two_c, %v_a : i64
+      %v = arith.select %is_r, %one, %v_s : i64
+      scf.yield %v : i64
+    } else {
+      scf.yield %zero : i64
+    }
+    %spec_start = scf.if %has_colon -> (i64) {
+      %ss = arith.addi %scan#2, %one : i64
+      scf.yield %ss : i64
+    } else {
+      scf.yield %end : i64
+    }
+    %after = arith.addi %end, %one : i64
+    func.return %name_len, %conv, %spec_start, %end, %after : i64, i64, i64, i64, i64
+  }
+
+  func.func @LyUnicode_FmtNext(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %cursor: i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__fmt_next__", ly.runtime.result_contract = "builtins.int"} {
+    %pos = func.call @__ly_fmtrt_scan_to_field(%header, %bytes, %cursor) : (memref<2xi64>, memref<?xi8>, i64) -> i64
+    %minus_one = arith.constant -1 : i64
+    %missing = arith.cmpi eq, %pos, %minus_one : i64
+    scf.if %missing {
+      %ms = memref.get_global @__ly_fmtrt_msg_too_many_args : memref<61xi8>
+      %m = memref.cast %ms : memref<61xi8> to memref<?xi8>
+      %l = arith.constant 61 : i64
+      func.call @__ly_fmtrt_raise(%m, %l) : (memref<?xi8>, i64) -> ()
+    }
+    %h, %meta, %digits = func.call @LyLong_FromI64(%pos) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    func.return %h, %meta, %digits : memref<2xi64>, memref<2xi64>, memref<?xi32>
+  }
+
+  func.func @LyUnicode_FmtPrefix(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %cursor: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__fmt_prefix__", ly.runtime.result_contract = "builtins.str"} {
+    %h, %b = func.call @__ly_fmtrt_literal_until_field(%header, %bytes, %cursor) : (memref<2xi64>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %h, %b : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LyUnicode_FmtTail(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %cursor: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__fmt_tail__", ly.runtime.result_contract = "builtins.str"} {
+    %pos = func.call @__ly_fmtrt_scan_to_field(%header, %bytes, %cursor) : (memref<2xi64>, memref<?xi8>, i64) -> i64
+    %minus_one = arith.constant -1 : i64
+    %extra = arith.cmpi ne, %pos, %minus_one : i64
+    scf.if %extra {
+      %ms = memref.get_global @__ly_fmtrt_msg_index_range : memref<56xi8>
+      %m = memref.cast %ms : memref<56xi8> to memref<?xi8>
+      %l = arith.constant 56 : i64
+      func.call @__ly_fmtrt_raise(%m, %l) : (memref<?xi8>, i64) -> ()
+    }
+    %h, %b = func.call @__ly_fmtrt_literal_until_field(%header, %bytes, %cursor) : (memref<2xi64>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %h, %b : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LyUnicode_FmtConv(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %pos: i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__fmt_conv__", ly.runtime.result_contract = "builtins.int"} {
+    %zero = arith.constant 0 : i64
+    %parts:5 = func.call @__ly_fmtrt_field_parts(%header, %bytes, %pos) : (memref<2xi64>, memref<?xi8>, i64) -> (i64, i64, i64, i64, i64)
+    %named = arith.cmpi ne, %parts#0, %zero : i64
+    scf.if %named {
+      %ms = memref.get_global @__ly_fmtrt_msg_auto_only : memref<69xi8>
+      %m = memref.cast %ms : memref<69xi8> to memref<?xi8>
+      %l = arith.constant 69 : i64
+      func.call @__ly_fmtrt_raise(%m, %l) : (memref<?xi8>, i64) -> ()
+    }
+    %h, %meta, %digits = func.call @LyLong_FromI64(%parts#1) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    func.return %h, %meta, %digits : memref<2xi64>, memref<2xi64>, memref<?xi32>
+  }
+
+  func.func @LyUnicode_FmtSpec(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %pos: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__fmt_spec__", ly.runtime.result_contract = "builtins.str"} {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %lb = arith.constant 123 : i64
+    %parts:5 = func.call @__ly_fmtrt_field_parts(%header, %bytes, %pos) : (memref<2xi64>, memref<?xi8>, i64) -> (i64, i64, i64, i64, i64)
+    %wid = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %len0 = arith.subi %parts#3, %parts#2 : i64
+    %len = arith.maxsi %len0, %zero : i64
+    %cap = arith.maxsi %len, %one : i64
+    %cap_idx = arith.index_cast %cap : i64 to index
+    %buf = memref.alloc(%cap_idx) : memref<?xi32>
+    %len_idx = arith.index_cast %len : i64 to index
+    scf.for %i = %c0 to %len_idx step %c1 {
+      %i_i64 = arith.index_cast %i : index to i64
+      %src = arith.addi %parts#2, %i_i64 : i64
+      %sx = arith.index_cast %src : i64 to index
+      %c = func.call @__ly_unicode_get(%bytes, %wid, %sx) : (memref<?xi8>, i64, index) -> i64
+      %nested = arith.cmpi eq, %c, %lb : i64
+      scf.if %nested {
+        %ms = memref.get_global @__ly_fmtrt_msg_nested_spec : memref<69xi8>
+        %m = memref.cast %ms : memref<69xi8> to memref<?xi8>
+        %l = arith.constant 69 : i64
+        func.call @__ly_fmtrt_raise(%m, %l) : (memref<?xi8>, i64) -> ()
+      }
+      %c32 = arith.trunci %c : i64 to i32
+      memref.store %c32, %buf[%i] : memref<?xi32>
+    }
+    %h, %b = func.call @__ly_fmt_str_from_cps(%buf, %len) : (memref<?xi32>, i64) -> (memref<2xi64>, memref<?xi8>)
+    memref.dealloc %buf : memref<?xi32>
+    func.return %h, %b : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LyUnicode_FmtEnd(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %pos: i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__fmt_end__", ly.runtime.result_contract = "builtins.int"} {
+    %parts:5 = func.call @__ly_fmtrt_field_parts(%header, %bytes, %pos) : (memref<2xi64>, memref<?xi8>, i64) -> (i64, i64, i64, i64, i64)
+    %h, %meta, %digits = func.call @LyLong_FromI64(%parts#4) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    func.return %h, %meta, %digits : memref<2xi64>, memref<2xi64>, memref<?xi32>
+  }
+
+  // Selects among the pre-formatted conversion variants (0 plain, 1 !r,
+  // 2 !s, 3 !a); the emitter evaluates all four because the conversion
+  // character is runtime data while dispatch must stay static.
+  func.func @LyUnicode_FmtPick(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %conv: i64, %r_header: memref<2xi64> {ly.ownership.object_header}, %r_bytes: memref<?xi8>, %s_header: memref<2xi64> {ly.ownership.object_header}, %s_bytes: memref<?xi8>, %a_header: memref<2xi64> {ly.ownership.object_header}, %a_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__fmt_pick__", ly.runtime.result_contract = "builtins.str"} {
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %three = arith.constant 3 : i64
+    %is_r = arith.cmpi eq, %conv, %one : i64
+    %is_s = arith.cmpi eq, %conv, %two : i64
+    %is_a = arith.cmpi eq, %conv, %three : i64
+    %res:2 = scf.if %is_r -> (memref<2xi64>, memref<?xi8>) {
+      %h, %b = func.call @LyUnicode_Copy(%r_header, %r_bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      scf.yield %h, %b : memref<2xi64>, memref<?xi8>
+    } else {
+      %r2:2 = scf.if %is_s -> (memref<2xi64>, memref<?xi8>) {
+        %h, %b = func.call @LyUnicode_Copy(%s_header, %s_bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+        scf.yield %h, %b : memref<2xi64>, memref<?xi8>
+      } else {
+        %r3:2 = scf.if %is_a -> (memref<2xi64>, memref<?xi8>) {
+          %h, %b = func.call @LyUnicode_Copy(%a_header, %a_bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+          scf.yield %h, %b : memref<2xi64>, memref<?xi8>
+        } else {
+          %h, %b = func.call @LyUnicode_Copy(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+          scf.yield %h, %b : memref<2xi64>, memref<?xi8>
+        }
+        scf.yield %r3#0, %r3#1 : memref<2xi64>, memref<?xi8>
+      }
+      scf.yield %r2#0, %r2#1 : memref<2xi64>, memref<?xi8>
+    }
+    func.return %res#0, %res#1 : memref<2xi64>, memref<?xi8>
   }
 
   // ascii()'s escape step: ASCII code points pass through, the rest become
