@@ -62,6 +62,12 @@ private:
   bool bindSourceModuleStar(llvm::StringRef module,
                             const parser::Node &anchor,
                             bool diagnoseUnsupported);
+  // `from <native manifest module> import *`: expands to the manifest's
+  // public exports (callables, classes, constants) — the manifest declares
+  // no __all__, so the public-name convention (no leading underscore) is the
+  // export list.
+  bool bindNativeModuleStar(llvm::StringRef module, const parser::Node &anchor,
+                            bool diagnoseUnsupported);
   void emitFunctionDecl(const parser::Node &function);
   void emitCallableFunction(const parser::Node &callable,
                             llvm::StringRef symbolName,
