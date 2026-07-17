@@ -583,6 +583,13 @@ private:
     // The yielded-value lane (result index 2 of the resume clone). Control
     // lane in the legacy int tier; object-family for boxed yields.
     GeneratorResumeLane valueLane;
+    // Values live across a yield, one lane each. Lanes are grouped per
+    // contract (lexicographic order) sized by the maximum same-contract live
+    // count over all yields, so every suspension state maps its live values
+    // onto type-stable lanes. The generator object absorbs each lane's
+    // ownership between suspensions (frame words in its storage), which the
+    // frame store/load helpers transfer in and out.
+    llvm::SmallVector<GeneratorResumeLane, 8> frameLanes;
     // Lazily synthesized driver functions (see GeneratorStateMachine.cpp):
     // step resumes once and reports (has, value, ret); advance additionally
     // raises StopIteration on exhaustion; throw/close inject exceptions at
@@ -610,9 +617,39 @@ private:
   // Append the physical return operands for one suspend lane (Returns.cpp
   // generator branch). Emits the pair-only materialization guard for int
   // lanes and dead placeholders for None-typed operands on object lanes.
+  // `forceRetain` adds a reference even for owned bundles — used when the
+  // same SSA value crosses in two lanes (yielded AND live across the yield),
+  // where each lane must carry its own token.
   mlir::LogicalResult appendGeneratorLaneReturnOperands(
       mlir::func::ReturnOp op, const GeneratorResumeLane &lane,
-      const RuntimeBundle &bundle, llvm::SmallVectorImpl<mlir::Value> &operands);
+      const RuntimeBundle &bundle, llvm::SmallVectorImpl<mlir::Value> &operands,
+      bool forceRetain = false);
+  // Frame words a lane occupies in the generator storage: (raw, valid) for
+  // int lanes, then (pointer, size) per physical part.
+  unsigned generatorLaneFrameWords(const GeneratorResumeLane &lane) const;
+  // Identity function with an owned-results contract: roots a frame lane's
+  // incoming ownership at a call so the refcount inserter and the affine
+  // verifier track it like any produced resource (continuation block
+  // arguments alone are invisible to both).
+  mlir::FailureOr<mlir::func::FuncOp>
+  getOrCreateGeneratorClaimFunction(mlir::Operation *op,
+                                    const GeneratorResumeLane &lane);
+  // Store/load one frame lane's physical span to/from the generator
+  // storage words. Store consumes the span (ly.ownership.transfer_args);
+  // load produces it (ly.ownership.owned_results) and zeroes the slot, so
+  // ownership lives in exactly one place at any time.
+  mlir::FailureOr<mlir::func::FuncOp>
+  getOrCreateGeneratorFrameStoreFunction(mlir::Operation *op,
+                                         const GeneratorResumeLane &lane);
+  mlir::FailureOr<mlir::func::FuncOp>
+  getOrCreateGeneratorFrameLoadFunction(mlir::Operation *op,
+                                        const GeneratorResumeLane &lane);
+  // Entry seeding for a resume clone with mixed lanes: control lanes ride
+  // (i64, i1) pairs, frame lanes their physical spans (+ pair for int).
+  mlir::LogicalResult
+  seedGeneratorResumeCloneEntry(mlir::func::FuncOp function,
+                                mlir::ArrayRef<mlir::Type> logicalTypes,
+                                GeneratorResumeInfo &info);
   mlir::LogicalResult buildGeneratorResumeCloneSignatures();
   mlir::LogicalResult buildGeneratorResumeBodies();
   // Inline statically-bound `yield from inner(...)` delegations into the

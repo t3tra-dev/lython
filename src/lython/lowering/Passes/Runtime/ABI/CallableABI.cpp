@@ -555,8 +555,44 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
     llvm::SmallVector<mlir::Type, 8> logicalInputTypes =
         callableLogicalInputTypes(function, callable);
     if (RuntimeBundleLowerer::isPrimitiveI64CallableClone(function)) {
+      GeneratorResumeInfo *generatorArgInfo =
+          RuntimeBundleLowerer::generatorResumeInfoForClone(function);
+      unsigned generatorControlCount =
+          generatorArgInfo ? generatorArgInfo->argumentCount + 3 : 0;
       llvm::SmallVector<mlir::Type, 8> inputTypes;
-      for (mlir::Type logicalType : logicalInputTypes) {
+      llvm::SmallVector<std::int64_t, 8> generatorTransferArgs;
+      llvm::SmallVector<mlir::Attribute, 8> generatorResumeArgLanes;
+      for (auto [inputIndex, logicalType] :
+           llvm::enumerate(logicalInputTypes)) {
+        // Generator frame lanes carry their object-family span; the frame's
+        // token transfers INTO the clone (ly.ownership.transfer_args), which
+        // the continuation claims re-root as tracked resources.
+        if (generatorArgInfo && inputIndex >= generatorControlCount &&
+            inputIndex - generatorControlCount <
+                generatorArgInfo->frameLanes.size()) {
+          const GeneratorResumeLane &lane =
+              generatorArgInfo->frameLanes[inputIndex - generatorControlCount];
+          if (!lane.isControl()) {
+            std::int64_t begin = static_cast<std::int64_t>(inputTypes.size());
+            llvm::SmallVector<mlir::Type, 6> laneTypes =
+                RuntimeBundleLowerer::generatorLanePhysicalTypes(lane);
+            // The transfer is anchored at the lane's header (group offset);
+            // the remaining parts are the entity's interior views.
+            if (lane.physicalCount > 0)
+              generatorTransferArgs.push_back(begin);
+            generatorResumeArgLanes.push_back(builder.getDictionaryAttr({
+                builder.getNamedAttr("contract",
+                                     builder.getStringAttr(lane.contract)),
+                builder.getNamedAttr("begin",
+                                     builder.getI64IntegerAttr(begin)),
+                builder.getNamedAttr(
+                    "size", builder.getI64IntegerAttr(
+                                static_cast<std::int64_t>(laneTypes.size()))),
+            }));
+            inputTypes.append(laneTypes.begin(), laneTypes.end());
+            continue;
+          }
+        }
         if (runtimeContractName(logicalType) != "builtins.int") {
           function.emitError()
               << "primitive i64 callable clone parameter must be builtins.int";
@@ -566,6 +602,14 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
         RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(logicalType,
                                                               inputTypes);
       }
+      if (!generatorTransferArgs.empty())
+        function->setAttr(ownership::kTransferArgsAttr,
+                          builder.getI64ArrayAttr(generatorTransferArgs));
+      if (!generatorResumeArgLanes.empty())
+        function->setAttr("ly.generator.resume_args",
+                          builder.getArrayAttr(generatorResumeArgLanes));
+      llvm::SmallVector<std::int64_t, 8> generatorHeaderArgs =
+          generatorTransferArgs;
       // Generator resume clones widen the yielded-value result lane to an
       // object-family span; every other lane stays on the primitive pair.
       // The lane's ownership crosses the suspension boundary through the
@@ -576,7 +620,10 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
       if (callable.getResultTypes().empty() ||
           !llvm::all_of(
               llvm::enumerate(callable.getResultTypes()), [&](auto indexed) {
-                if (generatorInfo && indexed.index() == 2)
+                if (generatorInfo &&
+                    (indexed.index() == 2 ||
+                     (indexed.index() >= 5 &&
+                      indexed.index() - 5 < generatorInfo->frameLanes.size())))
                   return true;
                 return runtimeContractName(indexed.value()) == "builtins.int";
               })) {
@@ -591,9 +638,16 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
       llvm::SmallVector<mlir::Attribute, 2> generatorSuspendLanes;
       for (auto [resultIndex, resultType] :
            llvm::enumerate(callable.getResultTypes())) {
+        const GeneratorResumeLane *suspendLane = nullptr;
         if (generatorInfo && resultIndex == 2 &&
-            !generatorInfo->valueLane.isControl()) {
-          const GeneratorResumeLane &lane = generatorInfo->valueLane;
+            !generatorInfo->valueLane.isControl())
+          suspendLane = &generatorInfo->valueLane;
+        else if (generatorInfo && resultIndex >= 5 &&
+                 resultIndex - 5 < generatorInfo->frameLanes.size() &&
+                 !generatorInfo->frameLanes[resultIndex - 5].isControl())
+          suspendLane = &generatorInfo->frameLanes[resultIndex - 5];
+        if (suspendLane) {
+          const GeneratorResumeLane &lane = *suspendLane;
           llvm::SmallVector<mlir::Type, 6> laneTypes =
               RuntimeBundleLowerer::generatorLanePhysicalTypes(lane);
           std::int64_t begin = static_cast<std::int64_t>(resultTypes.size());
@@ -626,14 +680,27 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
       if (!generatorSuspendLanes.empty())
         function->setAttr("ly.generator.suspend_lanes",
                           builder.getArrayAttr(generatorSuspendLanes));
-      if (!function.isDeclaration() &&
-          mlir::failed(seedPrimitiveI64CallableEntryArgumentBundles(
-              function, logicalInputTypes))) {
-        result = mlir::failure();
-        return mlir::WalkResult::interrupt();
+      if (!function.isDeclaration()) {
+        mlir::LogicalResult seeded =
+            generatorInfo
+                ? seedGeneratorResumeCloneEntry(function, logicalInputTypes,
+                                                *generatorInfo)
+                : seedPrimitiveI64CallableEntryArgumentBundles(
+                      function, logicalInputTypes);
+        if (mlir::failed(seeded)) {
+          result = mlir::failure();
+          return mlir::WalkResult::interrupt();
+        }
       }
       function.setFunctionType(
           mlir::FunctionType::get(context, inputTypes, resultTypes));
+      // Header arg markers for the transferred frame lanes (the transfer
+      // verifier requires the anchor to be an object header). Set after the
+      // final function type so the indices are in range.
+      for (std::int64_t headerIndex : generatorHeaderArgs)
+        function.setArgAttr(static_cast<unsigned>(headerIndex),
+                            ownership::kObjectHeaderAttr,
+                            builder.getUnitAttr());
       return mlir::WalkResult::advance();
     }
 
