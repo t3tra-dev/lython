@@ -46,7 +46,7 @@ namespace py::lowering {
 namespace {
 
 constexpr unsigned kGeneratorFrameSlotBase = 8;
-constexpr unsigned kGeneratorFrameSlotLimit = 24;
+constexpr unsigned kGeneratorFrameSlotLimit = 64;
 constexpr llvm::StringLiteral kGeneratorBodyResultAttr{
     "ly.generator.body_result"};
 constexpr llvm::StringLiteral kGeneratorPublicResultAttr{
