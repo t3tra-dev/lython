@@ -235,10 +235,17 @@ def Py_RaiseOp : Py_Op<"raise", [Terminator]> {
     Raises a Python value proven by the manifest to be compatible with
     `builtins.BaseException`. `BaseException` is a typeshed contract, not a
     dialect exception type.
+
+    `cause` carries the `raise ... from <expr>` operand (the raised value's
+    `__cause__`); the `from_none` attribute records `raise ... from None`,
+    which suppresses implicit `__context__` display without a cause object.
   }];
 
-  let arguments = (ins Py_ContractType:$exception);
-  let assemblyFormat = "$exception `:` type($exception) attr-dict";
+  let arguments = (ins Py_ContractType:$exception,
+                       Optional<Py_ContractType>:$cause,
+                       UnitAttr:$from_none);
+  let assemblyFormat = "$exception `:` type($exception) "
+                       "(`from` $cause^ `:` type($cause))? attr-dict";
   let hasVerifier = 1;
 }
 

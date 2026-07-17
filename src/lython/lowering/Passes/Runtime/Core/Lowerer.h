@@ -730,14 +730,16 @@ private:
                                         llvm::StringRef contract,
                                         const RuntimeBundle &messageObject);
   mlir::LogicalResult emitRaiseExceptionBundle(mlir::Operation *op,
-                                               const RuntimeBundle &exception,
-                                               bool discardCurrentException);
+                                               const RuntimeBundle &exception);
+  mlir::LogicalResult emitSetCurrentCause(mlir::Operation *op,
+                                          const RuntimeBundle &cause);
   mlir::LogicalResult lowerRaise(py::RaiseOp op);
   mlir::LogicalResult lowerRaiseCurrent(py::RaiseCurrentOp op);
   mlir::LogicalResult lowerExceptMatch(py::ExceptMatchOp op);
   mlir::LogicalResult lowerExceptCurrentMatch(py::ExceptCurrentMatchOp op);
   mlir::LogicalResult lowerExceptCurrentValue(py::ExceptCurrentValueOp op);
-  mlir::LogicalResult emitTracebackFrame(mlir::Operation *op);
+  mlir::LogicalResult emitTracebackFrame(mlir::Operation *op,
+                                         bool stashCurrentException = true);
   mlir::LogicalResult lowerCall(py::CallOp op);
   mlir::LogicalResult lowerBoundMethodCall(py::CallOp op,
                                            const RuntimeBundle &receiver,
@@ -1129,6 +1131,23 @@ getOrCreateDiscardCurrentException(mlir::ModuleOp module,
 inline mlir::func::FuncOp
 getOrCreateRethrowCurrent(mlir::ModuleOp module, mlir::OpBuilder &builder) {
   return getOrCreatePrivateFunction(module, builder, "LyEH_RethrowCurrent",
+                                    builder.getFunctionType({}, {}));
+}
+
+// A raise that happens while another exception is being handled moves the
+// handled exception into the raised exception's __context__ chain instead of
+// releasing it (CPython implicit exception chaining).
+inline mlir::func::FuncOp
+getOrCreateStashCurrentAsContext(mlir::ModuleOp module,
+                                 mlir::OpBuilder &builder) {
+  return getOrCreatePrivateFunction(module, builder,
+                                    "LyEH_StashCurrentAsContext",
+                                    builder.getFunctionType({}, {}));
+}
+
+inline mlir::func::FuncOp
+getOrCreateSetCurrentSuppress(mlir::ModuleOp module, mlir::OpBuilder &builder) {
+  return getOrCreatePrivateFunction(module, builder, "LyEH_SetCurrentSuppress",
                                     builder.getFunctionType({}, {}));
 }
 

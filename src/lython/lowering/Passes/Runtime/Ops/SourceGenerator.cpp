@@ -1245,7 +1245,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSourceGeneratorThrow(
                                            /*allowUnusedSources=*/false)))
     return mlir::failure();
   if (mlir::failed(RuntimeBundleLowerer::emitRaiseExceptionBundle(
-          op.getOperation(), exception, /*discardCurrentException=*/true)))
+          op.getOperation(), exception)))
     return mlir::failure();
 
   mlir::Value zero =

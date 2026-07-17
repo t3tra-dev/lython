@@ -92,7 +92,27 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
   } else if (statement.kind == "Raise") {
     if (const parser::Node *exception = ast::node(statement, "exc")) {
       Value value = emitExpr(exception);
-      py::RaiseOp::create(builder, loc(statement), value.value);
+      mlir::Value cause;
+      bool fromNone = false;
+      if (const parser::Node *causeNode = ast::node(statement, "cause")) {
+        Value causeValue = emitExpr(causeNode);
+        auto literal =
+            mlir::dyn_cast_if_present<py::LiteralType>(causeValue.type);
+        if (literal && literal.getSpelling() == "None") {
+          // `raise X from None` suppresses implicit __context__ display;
+          // there is no cause object to carry.
+          fromNone = true;
+        } else if (literal || !causeValue.value) {
+          diagnostics.push_back(parser::Diagnostic{
+              parser::Severity::Error, causeNode->range.start,
+              "raise ... from cause must be an exception instance or None"});
+          return;
+        } else {
+          cause = causeValue.value;
+        }
+      }
+      py::RaiseOp::create(builder, loc(statement), value.value, cause,
+                          fromNone);
     } else {
       py::RaiseCurrentOp::create(builder, loc(statement));
     }

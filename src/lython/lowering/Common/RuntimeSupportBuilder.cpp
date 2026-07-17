@@ -608,6 +608,57 @@ void buildReleaseStorageRawToZero(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc, falseVal);
 }
 
+// void retain_storage_raw(i64 address): atomically increment the refcount
+// word at address. Mirror of release_storage_raw_to_zero: skips null, tagged
+// (odd), and immortal (INT64_MAX) storages.
+void buildRetainStorageRaw(SupportBuilder &b) {
+  auto fn = b.beginFunction("retain_storage_raw",
+                            b.builder.getFunctionType({b.i64()}, {}));
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::Region &body = fn.getBody();
+  mlir::Value address = entry->getArgument(0);
+
+  mlir::Block *tagCheck = b.builder.createBlock(&body);
+  mlir::Block *probe = b.builder.createBlock(&body);
+  mlir::Block *bump = b.builder.createBlock(&body);
+  mlir::Block *done = b.builder.createBlock(&body);
+
+  mlir::Value zero = b.iconst(0);
+  mlir::Value one = b.iconst(1);
+  mlir::Value immortal = b.iconst(9223372036854775807LL);
+
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value isNull = b.cmpi(mlir::arith::CmpIPredicate::eq, address, zero);
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, isNull, done,
+                                 mlir::ValueRange{}, tagCheck,
+                                 mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(tagCheck);
+  mlir::Value tag = mlir::arith::AndIOp::create(b.builder, b.loc, address, one);
+  mlir::Value isTagged = b.cmpi(mlir::arith::CmpIPredicate::eq, tag, one);
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, isTagged, done,
+                                 mlir::ValueRange{}, probe,
+                                 mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(probe);
+  mlir::Value pointer = b.intToPtr(address);
+  mlir::Value observed = b.loadI64(pointer);
+  mlir::Value preImmortal =
+      b.cmpi(mlir::arith::CmpIPredicate::eq, observed, immortal);
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, preImmortal, done,
+                                 mlir::ValueRange{}, bump,
+                                 mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(bump);
+  mlir::LLVM::AtomicRMWOp::create(b.builder, b.loc,
+                                  mlir::LLVM::AtomicBinOp::add, pointer, one,
+                                  mlir::LLVM::AtomicOrdering::acq_rel);
+  mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(done);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
 // Shared shape: release a single-allocation storage rooted at `address`,
 // freeing it if the refcount hit zero. `release_unicode_raw`'s second argument
 // (an interior bytes view) needs no separate free.
@@ -1238,6 +1289,9 @@ void buildEndNativeCatchIfActive(SupportBuilder &b) {
 
 // LyEH_ThrowException(exception view words x5, message header x5, bytes x5):
 // stores the payload in the process slot, then throws the 1-byte C++ carrier.
+// A still-pending exception (a raise while another exception is handled that
+// did not go through the lowering's explicit stash — e.g. a runtime-internal
+// raise) becomes the new exception's implicit __context__.
 void buildThrowException(SupportBuilder &b) {
   llvm::SmallVector<mlir::Type, 15> inputs;
   for (int section = 0; section < 3; ++section) {
@@ -1250,13 +1304,17 @@ void buildThrowException(SupportBuilder &b) {
   auto fn = beginLLVMFunction(b, "LyEH_ThrowException", {}, inputs);
   mlir::Block *entry = fn.addEntryBlock(b.builder);
   mlir::Region &body = fn.getBody();
+  mlir::Block *stash = b.builder.createBlock(&body);
   mlir::Block *store = b.builder.createBlock(&body);
-  mlir::Block *trap = b.builder.createBlock(&body);
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value flagSlot = b.addrOf("g_current_exception");
   mlir::Value pending = mlir::LLVM::LoadOp::create(b.builder, b.loc, b.i1(),
                                                    flagSlot, /*alignment=*/4);
-  mlir::LLVM::CondBrOp::create(b.builder, b.loc, pending, trap, store);
+  mlir::LLVM::CondBrOp::create(b.builder, b.loc, pending, stash, store);
+  b.builder.setInsertionPointToEnd(stash);
+  mlir::func::CallOp::create(b.builder, b.loc, "LyEH_StashCurrentAsContext",
+                             mlir::TypeRange{}, mlir::ValueRange{});
+  mlir::LLVM::BrOp::create(b.builder, b.loc, store);
   b.builder.setInsertionPointToEnd(store);
   mlir::Value parts = b.addrOf("g_current_parts");
   for (int section = 0; section < 3; ++section)
@@ -1277,8 +1335,6 @@ void buildThrowException(SupportBuilder &b) {
       mlir::ValueRange{carrier.getResult(),
                        b.addrOf("_ZTI17LyPythonException"), b.nullPtr()});
   mlir::LLVM::UnreachableOp::create(b.builder, b.loc);
-  b.builder.setInsertionPointToEnd(trap);
-  emitLLVMTrap(b);
 }
 
 // LyEH_BeginCatch(ptr exceptionObject): opens the __cxa catch scope for a
@@ -1418,6 +1474,11 @@ void buildCurrentExceptionMatches(SupportBuilder &b) {
 // (refcount decrement; frees message + header at zero), clears the slot and
 // the traceback. An escaping handler binding was retained by the
 // borrowed-return machinery, so its token survives this release.
+//
+// Chaining: the discarded exception's __cause__ node is released with it; a
+// __context__ node is *restored* as the pending exception instead — handler
+// completion returns to handling the outer exception (CPython's exception
+// stack pop), so a bare `raise` after a nested try re-raises the right one.
 void buildDiscardCurrentException(SupportBuilder &b) {
   auto fn = b.beginFunction("LyEH_DiscardCurrentException",
                             b.builder.getFunctionType({}, {}));
@@ -1426,8 +1487,15 @@ void buildDiscardCurrentException(SupportBuilder &b) {
   mlir::Block *release = b.builder.createBlock(&body);
   mlir::Block *freeBlocks = b.builder.createBlock(&body);
   mlir::Block *clear = b.builder.createBlock(&body);
+  mlir::Block *restore = b.builder.createBlock(&body);
+  mlir::Block *finish = b.builder.createBlock(&body);
   b.builder.setInsertionPointToEnd(entry);
   b.call("end_native_catch_if_active", mlir::TypeRange{}, {});
+  mlir::Value causeSlot = b.addrOf("g_exc_cause_node");
+  b.call("release_chain_node", mlir::TypeRange{},
+         mlir::ValueRange{b.loadI64(causeSlot)});
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0), causeSlot,
+                              /*alignment=*/8);
   mlir::Value flagSlot = b.addrOf("g_current_exception");
   mlir::Value parts = b.addrOf("g_current_parts");
   mlir::Value pending = mlir::LLVM::LoadOp::create(b.builder, b.loc, b.i1(),
@@ -1464,6 +1532,61 @@ void buildDiscardCurrentException(SupportBuilder &b) {
   mlir::LLVM::MemsetOp::create(b.builder, b.loc, parts, b.iconst8(0),
                                b.iconst(120), /*isVolatile=*/false);
   b.call("LyTraceback_Clear", mlir::TypeRange{}, {});
+  mlir::Value contextSlot = b.addrOf("g_exc_context_node");
+  mlir::Value context64 = b.loadI64(contextSlot);
+  mlir::Value haveContext =
+      b.cmpi(mlir::arith::CmpIPredicate::ne, context64, b.iconst(0));
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, haveContext, restore,
+                                 mlir::ValueRange{}, finish,
+                                 mlir::ValueRange{});
+
+  // Destructive restore: after the cause release above the node has exactly
+  // one owner (only the discarded exception could have shared it), so its
+  // members move back into the globals and only the shell is freed.
+  b.builder.setInsertionPointToEnd(restore);
+  mlir::Value node = b.intToPtr(context64);
+  auto nodeSlotAt = [&](std::int64_t slot) {
+    return b.gepI64(node, b.iconst(slot));
+  };
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.loadI64(nodeSlotAt(18)),
+                              causeSlot, /*alignment=*/8);
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.loadI64(nodeSlotAt(19)),
+                              contextSlot, /*alignment=*/8);
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.loadI64(nodeSlotAt(20)),
+                              b.addrOf("g_exc_suppress_context"),
+                              /*alignment=*/8);
+  mlir::LLVM::MemcpyOp::create(b.builder, b.loc, parts, nodeSlotAt(1),
+                               b.iconst(120), /*isVolatile=*/false);
+  mlir::LLVM::StoreOp::create(
+      b.builder, b.loc,
+      mlir::arith::ConstantIntOp::create(b.builder, b.loc, 1, 1).getResult(),
+      flagSlot, /*alignment=*/4);
+  mlir::Value frames64 = b.loadI64(nodeSlotAt(16));
+  mlir::Value count = b.loadI64(nodeSlotAt(17));
+  mlir::Value haveFrames =
+      b.cmpi(mlir::arith::CmpIPredicate::sgt, count, b.iconst(0));
+  auto framesIf = mlir::scf::IfOp::create(b.builder, b.loc, mlir::TypeRange{},
+                                          haveFrames, /*withElseRegion=*/false);
+  {
+    mlir::OpBuilder::InsertionGuard guard(b.builder);
+    b.builder.setInsertionPointToStart(&framesIf.getThenRegion().front());
+    mlir::Value bytes =
+        mlir::arith::MulIOp::create(b.builder, b.loc, count, b.iconst(40));
+    mlir::LLVM::MemcpyOp::create(b.builder, b.loc,
+                                 b.addrOf("g_traceback_stack"),
+                                 b.intToPtr(frames64), bytes,
+                                 /*isVolatile=*/false);
+    mlir::LLVM::StoreOp::create(b.builder, b.loc, count,
+                                b.addrOf("g_traceback_size"), /*alignment=*/8);
+  }
+  b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{frames64});
+  b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{context64});
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(finish);
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0),
+                              b.addrOf("g_exc_suppress_context"),
+                              /*alignment=*/8);
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
@@ -1664,6 +1787,8 @@ void buildRunPythonMain(SupportBuilder &b) {
   mlir::func::CallOp::create(
       b.builder, b.loc, "write_cstr", mlir::TypeRange{},
       mlir::ValueRange{b.iconst32(2), b.addrOf(".native_exception")});
+  mlir::func::CallOp::create(b.builder, b.loc, "release_current_chain",
+                             mlir::TypeRange{}, mlir::ValueRange{});
   mlir::func::CallOp::create(b.builder, b.loc, "LyTraceback_Clear",
                              mlir::TypeRange{}, mlir::ValueRange{});
   mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{},
@@ -1684,6 +1809,7 @@ void buildRunPythonMain(SupportBuilder &b) {
   mlir::Value classIndex =
       mlir::LLVM::AddOp::create(b.builder, b.loc, offset, scaled);
   mlir::Value classId = b.loadI64(b.gepI64(aligned, classIndex));
+  mlir::Value messageHeader = b.loadPtrVal(partsField(b, descriptor, 1, 1));
   mlir::Value messageData = b.loadPtrVal(partsField(b, descriptor, 2, 1));
   mlir::Value messageOffset = mlir::LLVM::LoadOp::create(
       b.builder, b.loc, b.i64(), partsField(b, descriptor, 2, 2),
@@ -1702,8 +1828,10 @@ void buildRunPythonMain(SupportBuilder &b) {
   b.builder.setInsertionPointToEnd(printTraceback);
   mlir::func::CallOp::create(
       b.builder, b.loc, "LyTraceback_PrintMessage", mlir::TypeRange{},
-      mlir::ValueRange{classId, b.nullPtr(), messageData, messageOffset,
+      mlir::ValueRange{classId, messageHeader, messageData, messageOffset,
                        messageLen, messageStride});
+  mlir::func::CallOp::create(b.builder, b.loc, "release_current_chain",
+                             mlir::TypeRange{}, mlir::ValueRange{});
   mlir::func::CallOp::create(b.builder, b.loc, "LyTraceback_Clear",
                              mlir::TypeRange{}, mlir::ValueRange{});
   mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{},
@@ -1715,6 +1843,8 @@ void buildRunPythonMain(SupportBuilder &b) {
   // message reports the last LyHost_SetExitStatus value, a non-empty message
   // goes to stderr with exit status 1 (the non-int `SystemExit(code)` path).
   b.builder.setInsertionPointToEnd(systemExit);
+  mlir::func::CallOp::create(b.builder, b.loc, "release_current_chain",
+                             mlir::TypeRange{}, mlir::ValueRange{});
   mlir::func::CallOp::create(b.builder, b.loc, "LyTraceback_Clear",
                              mlir::TypeRange{}, mlir::ValueRange{});
   mlir::Value messageEmpty =
@@ -1735,9 +1865,9 @@ void buildRunPythonMain(SupportBuilder &b) {
   b.builder.setInsertionPointToEnd(exitWithMessage);
   mlir::Value messageCStr =
       mlir::func::CallOp::create(
-          b.builder, b.loc, "copy_i8_memref", mlir::TypeRange{b.ptr()},
-          mlir::ValueRange{messageData, messageOffset, messageLen,
-                           messageStride})
+          b.builder, b.loc, "utf8_message_cstr", mlir::TypeRange{b.ptr()},
+          mlir::ValueRange{messageHeader, messageData, messageOffset,
+                           messageLen, messageStride})
           .getResult(0);
   mlir::func::CallOp::create(b.builder, b.loc, "write_cstr", mlir::TypeRange{},
                              mlir::ValueRange{b.iconst32(2), messageCStr});
@@ -1822,6 +1952,7 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context) {
   buildBoxedLoadI64(support);
   buildFreeRawI64Ptr(support);
   buildReleaseStorageRawToZero(support);
+  buildRetainStorageRaw(support);
   buildReleaseSingleAllocation(support, "release_unicode_raw", /*twoArgs=*/true);
   buildWriteLen(support);
   buildWriteCStr(support);
