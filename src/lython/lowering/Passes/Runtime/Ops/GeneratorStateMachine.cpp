@@ -166,13 +166,16 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
         yields.push_back(yield);
         return;
       }
+      // py.try is fine: the clone's tries are flattened to CFG below,
+      // before the yield split, so suspension points inside try/finally
+      // stay inside their (by then block-registered) handler scopes.
       if (mlir::isa<py::YieldFromOp>(op) ||
-          (op != body.getOperation() && op->getNumRegions() != 0))
+          (op != body.getOperation() && op->getNumRegions() != 0 &&
+           !mlir::isa<py::TryOp>(op)))
         unsupported = true;
     });
     if (unsupported || yields.empty())
       continue;
-    mlir::Block &entry = body.getBody().front();
     // Straight-line int bodies also take the state machine: the inline
     // re-dispatch raises its exhaustion StopIteration inside an scf.if that
     // falls through, and an unwind that starts after the caller's releases
@@ -204,16 +207,50 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
     if (!eligible)
       continue;
 
+    std::string cloneName = (body.getSymName() + "__lyrt_gen_resume").str();
+    mlir::func::FuncOp clone;
+    {
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointAfter(body);
+      clone = body.clone();
+      clone.setSymName(cloneName);
+      clone->removeAttr(kGeneratorBodyResultAttr);
+      clone->removeAttr(kGeneratorPublicResultAttr);
+      clone->setAttr(kPrimitiveI64CloneAttr,
+                     builder.getStringAttr(body.getSymName()));
+      mlir::SymbolTable::setSymbolVisibility(
+          clone, mlir::SymbolTable::Visibility::Private);
+      builder.insert(clone);
+    }
+
+    // Flatten the clone's structured tries before anything looks at the
+    // CFG: the yield split can only place suspends in function-level blocks
+    // (func.return is illegal inside a py.try region), and the flattening
+    // registers the try blocks' handler ids — which the split continuations
+    // inherit, so injected exceptions unwind into the body's handlers.
+    {
+      llvm::SmallVector<py::TryOp, 4> tries;
+      clone.walk([&](py::TryOp tryOp) { tries.push_back(tryOp); });
+      for (py::TryOp tryOp : llvm::reverse(tries))
+        if (mlir::failed(lowerTry(tryOp)))
+          return mlir::failure();
+    }
+
     // Frame width: max live-across-yield count, from backward liveness on
-    // the whole body CFG (matches phase 2 exactly; the sent alias inserted
-    // there replaces the yield result one-for-one, so widths agree).
+    // the flattened clone CFG (phase 2 recomputes on the same clone; the
+    // sent alias inserted there replaces the yield result one-for-one, so
+    // widths agree).
     unsigned frameWidth = 0;
     bool livesEligible = true;
     {
-      auto liveIns = computeLiveIns(body.getBody());
-      for (py::YieldValueOp yield : yields) {
+      llvm::SmallVector<py::YieldValueOp, 8> cloneYields;
+      clone.walk(
+          [&](py::YieldValueOp yield) { cloneYields.push_back(yield); });
+      mlir::Block &cloneEntry = clone.getBody().front();
+      auto liveIns = computeLiveIns(clone.getBody());
+      for (py::YieldValueOp yield : cloneYields) {
         llvm::SetVector<mlir::Value> lives =
-            liveAfterYield(yield, liveIns, &entry);
+            liveAfterYield(yield, liveIns, &cloneEntry);
         for (mlir::Value live : lives)
           if (!isIntContract(live.getType()))
             livesEligible = false;
@@ -222,8 +259,10 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
       }
     }
     if (!livesEligible ||
-        kGeneratorFrameSlotBase + frameWidth > kGeneratorFrameSlotLimit)
+        kGeneratorFrameSlotBase + frameWidth > kGeneratorFrameSlotLimit) {
+      clone.erase();
       continue;
+    }
 
     mlir::Type intContract = runtimeContractType(context, "builtins.int");
     llvm::SmallVector<mlir::Type, 8> argTypes(
@@ -239,15 +278,6 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
     for (unsigned slot = 0; slot < frameWidth; ++slot)
       resultTypes.push_back(intContract);
 
-    std::string cloneName = (body.getSymName() + "__lyrt_gen_resume").str();
-    mlir::OpBuilder::InsertionGuard guard(builder);
-    builder.setInsertionPointAfter(body);
-    mlir::func::FuncOp clone = body.clone();
-    clone.setSymName(cloneName);
-    clone->removeAttr(kGeneratorBodyResultAttr);
-    clone->removeAttr(kGeneratorPublicResultAttr);
-    clone->setAttr(kPrimitiveI64CloneAttr,
-                   builder.getStringAttr(body.getSymName()));
     auto newCallable = py::CallableType::get(
         context, argTypes, /*kwonly=*/{}, /*varargType=*/mlir::Type(),
         /*kwargsType=*/mlir::Type(), resultTypes);
@@ -258,9 +288,6 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
     mlir::Block &cloneEntry = clone.getBody().front();
     for (unsigned extra = 0; extra < kResumeControlLanes + frameWidth; ++extra)
       cloneEntry.addArgument(intContract, clone.getLoc());
-    mlir::SymbolTable::setSymbolVisibility(
-        clone, mlir::SymbolTable::Visibility::Private);
-    builder.insert(clone);
 
     GeneratorResumeInfo info;
     info.cloneName = cloneName;
@@ -392,6 +419,14 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeBodies() {
                << "generator resume live set exceeds the computed frame";
       mlir::Block *cont = block->splitBlock(
           std::next(mlir::Block::iterator(yield.getOperation())));
+      // A suspension point inside a (flattened) try keeps its handler scope:
+      // the continuation inherits the block's handler id so the injected
+      // rethrow and the continuation's calls unwind into the body handlers.
+      {
+        auto handlerIt = tryHandlerIds.find(block);
+        if (handlerIt != tryHandlerIds.end())
+          tryHandlerIds.try_emplace(cont, handlerIt->second);
+      }
       llvm::SmallVector<mlir::Value, 8> liveValues(lives.begin(), lives.end());
       for (mlir::Value live : liveValues) {
         mlir::BlockArgument arg = cont->addArgument(live.getType(), loc);
@@ -873,8 +908,14 @@ RuntimeBundleLowerer::getOrCreateGeneratorAdvanceFunction(
                                  mlir::ValueRange{}, plainBlock,
                                  mlir::ValueRange{});
 
-  // return X → StopIteration whose message is str(X).
+  // return X → StopIteration whose message is str(X). Exhaustion can be
+  // observed while another exception is the pending current one (next()
+  // inside an except handler); the single-token TLS slot requires the same
+  // discard-before-raise that py.raise lowering performs.
   builder.setInsertionPointToEnd(valueBlock);
+  mlir::func::CallOp::create(
+      builder, loc, getOrCreateDiscardCurrentException(module, builder),
+      mlir::ValueRange{});
   {
     std::optional<RuntimeSymbol> intNew =
         manifest.initializer("builtins.int", "__new__");
@@ -914,6 +955,9 @@ RuntimeBundleLowerer::getOrCreateGeneratorAdvanceFunction(
   mlir::cf::BranchOp::create(builder, loc, deadBlock);
 
   builder.setInsertionPointToEnd(plainBlock);
+  mlir::func::CallOp::create(
+      builder, loc, getOrCreateDiscardCurrentException(module, builder),
+      mlir::ValueRange{});
   if (mlir::failed(RuntimeBundleLowerer::emitRuntimeException(
           op, "builtins.StopIteration", "")))
     return mlir::failure();
@@ -1207,6 +1251,12 @@ RuntimeBundleLowerer::getOrCreateGeneratorCloseFunction(
     mlir::OpBuilder::InsertionGuard ignoredGuard(builder);
     builder.setInsertionPoint(
         ignoredIf.getThenRegion().front().getTerminator());
+    // The staged GeneratorExit may still be the pending current exception
+    // (the body can be suspended inside its own handler); the EH TLS slot is
+    // single-token, so raising without discarding would trap.
+    mlir::func::CallOp::create(
+        builder, loc, getOrCreateDiscardCurrentException(module, builder),
+        mlir::ValueRange{});
     if (mlir::failed(RuntimeBundleLowerer::emitRuntimeException(
             op, "builtins.RuntimeError", "generator ignored GeneratorExit")))
       return mlir::failure();

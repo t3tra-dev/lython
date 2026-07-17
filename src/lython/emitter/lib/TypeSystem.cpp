@@ -996,6 +996,7 @@ void TypeSystem::seedBuiltins() {
   bindClass("StopIteration", contract("builtins.StopIteration"));
   bindClass("StopAsyncIteration", contract("builtins.StopAsyncIteration"));
   bindClass("SystemExit", contract("builtins.SystemExit"));
+  bindClass("GeneratorExit", contract("builtins.GeneratorExit"));
   bindClass("OSError", contract("builtins.OSError"));
   bindClass("FileNotFoundError", contract("builtins.FileNotFoundError"));
   // open is io.open (CPython aliases the builtin to the io module's opener);
