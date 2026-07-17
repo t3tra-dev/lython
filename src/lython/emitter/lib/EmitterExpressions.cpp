@@ -1034,7 +1034,8 @@ Value ModuleEmitter::emitComprehension(const parser::Node &expr,
     parser::NodePtr target;
     parser::NodePtr iter;
     llvm::SmallVector<parser::NodePtr, 2> filters;
-    llvm::StringRef targetName;
+    llvm::SmallVector<llvm::StringRef, 2> targetNames;
+    bool tupleTarget = false;
   };
   llvm::SmallVector<CompGenerator, 2> chain;
   for (const parser::NodePtr &generator : *generators) {
@@ -1052,9 +1053,25 @@ Value ModuleEmitter::emitComprehension(const parser::Node &expr,
     CompGenerator entry;
     entry.target = std::get<parser::NodePtr>(targetField->value);
     entry.iter = std::get<parser::NodePtr>(iterField->value);
-    if (!entry.target || entry.target->kind != "Name" || !entry.iter)
+    if (!entry.target || !entry.iter)
       return reject("list comprehension target must be a simple name");
-    entry.targetName = ast::nameSpelling(*entry.target);
+    if (entry.target->kind == "Name") {
+      entry.targetNames.push_back(ast::nameSpelling(*entry.target));
+    } else if (entry.target->kind == "Tuple") {
+      // `for k, v in ...`: names only (nested unpack stays rejected).
+      entry.tupleTarget = true;
+      const auto *elts = ast::nodeList(*entry.target, "elts");
+      if (!elts || elts->empty())
+        return reject("malformed comprehension tuple target");
+      for (const parser::NodePtr &element : *elts) {
+        if (!element || element->kind != "Name")
+          return reject(
+              "comprehension tuple targets must unpack to simple names");
+        entry.targetNames.push_back(ast::nameSpelling(*element));
+      }
+    } else {
+      return reject("list comprehension target must be a simple name");
+    }
     if (const auto *ifs = ast::nodeList(*generator, "ifs"))
       entry.filters.append(ifs->begin(), ifs->end());
     chain.push_back(std::move(entry));
@@ -1076,8 +1093,23 @@ Value ModuleEmitter::emitComprehension(const parser::Node &expr,
           iterInference.resultType, "__next__", {});
       if (!requireStaticEvidence(expr, nextInference))
         return emitNone(expr);
-      types.bindLocalSymbol(entry.targetName,
-                            types.widenLiteral(nextInference.resultType));
+      mlir::Type iterationElement =
+          types.widenLiteral(nextInference.resultType);
+      if (!entry.tupleTarget) {
+        types.bindLocalSymbol(entry.targetNames.front(), iterationElement);
+      } else {
+        for (auto [position, name] : llvm::enumerate(entry.targetNames)) {
+          CallInferenceResult itemInference =
+              types.inferMethodCallWithEvidence(
+                  iterationElement, "__getitem__",
+                  {types.literal(std::to_string(position))});
+          if (!itemInference)
+            return reject(
+                "cannot infer the comprehension tuple target element types");
+          types.bindLocalSymbol(name,
+                                types.widenLiteral(itemInference.resultType));
+        }
+      }
     }
     if (isDict) {
       keyType = types.widenLiteral(types.inferExpr(keyExpr.get()));
@@ -1149,12 +1181,13 @@ Value ModuleEmitter::emitComprehension(const parser::Node &expr,
 
   llvm::SmallVector<std::pair<llvm::StringRef, std::optional<Value>>, 2>
       priorTargets;
-  for (const CompGenerator &entry : chain) {
-    std::optional<Value> prior;
-    if (auto found = values.find(entry.targetName); found != values.end())
-      prior = found->second;
-    priorTargets.push_back({entry.targetName, prior});
-  }
+  for (const CompGenerator &entry : chain)
+    for (llvm::StringRef name : entry.targetNames) {
+      std::optional<Value> prior;
+      if (auto found = values.find(name); found != values.end())
+        prior = found->second;
+      priorTargets.push_back({name, prior});
+    }
   emitFor(*statement);
 
   auto built = values.find(tmp);
