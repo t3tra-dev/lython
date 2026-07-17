@@ -1046,6 +1046,29 @@ RuntimeBundleLowerer::lowerSourceGeneratorNext(py::NextOp op,
     return mlir::failure();
   SourceGeneratorResumeResult yielded = *yieldedOr;
 
+  // The object-lane element ABI: the yielded value's physical span (plus the
+  // trailing evidence pair for int). Legacy pure-pair resumes synthesize the
+  // same shape from (value, valid) so one binding path serves both.
+  llvm::SmallVector<mlir::Value, 6> elementValues = yielded.lanePhysicals;
+  bool laneElement = !elementValues.empty();
+
+  auto bindElementBundle =
+      [&](mlir::ValueRange values,
+          RuntimeBundle &bundle) -> mlir::LogicalResult {
+    if (!laneElement)
+      return RuntimeBundleLowerer::makePrimitiveI64Bundle(
+          op, op.getElement().getType(), values[0], values[1], bundle);
+    if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
+            op.getOperation(), op.getElement().getType(), values, bundle)))
+      return mlir::failure();
+    bundle.setObjectLogicalOwnership(/*ownsObject=*/true);
+    return mlir::success();
+  };
+  if (!laneElement) {
+    elementValues.push_back(yielded.value);
+    elementValues.push_back(yielded.valid);
+  }
+
   if (auto condition = mlir::dyn_cast<mlir::scf::ConditionOp>(
           op->getBlock()->getTerminator())) {
     if (llvm::is_contained(condition.getArgs(), op.getElement())) {
@@ -1069,22 +1092,47 @@ RuntimeBundleLowerer::lowerSourceGeneratorNext(py::NextOp op,
                << "source generator for-loop lowering does not support users "
                   "of the scf.while result yet";
 
-      mlir::BlockArgument bodyElement =
-          whileOp.getAfter().front().getArgument(0);
-      whileOp.getResult(0).setType(builder.getI64Type());
-      bodyElement.setType(builder.getI64Type());
-      condition.getConditionMutable().set(yielded.hasValue);
-      condition.getArgsMutable().assign(mlir::ValueRange{yielded.value});
+      // The loop carries the element's physical span instead of the single
+      // logical value. scf.while pins its result arity at construction, so
+      // the widened loop is a fresh op that adopts the original regions; the
+      // original results are unused (checked above), so nothing re-targets.
+      llvm::SmallVector<mlir::Type, 6> carriedTypes;
+      carriedTypes.reserve(elementValues.size());
+      for (mlir::Value value : elementValues)
+        carriedTypes.push_back(value.getType());
 
       mlir::OpBuilder::InsertionGuard guard(builder);
-      builder.setInsertionPointToStart(&whileOp.getAfter().front());
-      mlir::Value bodyValid =
-          mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 1, 1);
+      builder.setInsertionPoint(whileOp);
+      auto widened = mlir::scf::WhileOp::create(
+          builder, whileOp.getLoc(), carriedTypes, mlir::ValueRange{});
+      widened.getBefore().takeBody(whileOp.getBefore());
+      widened.getAfter().takeBody(whileOp.getAfter());
+      whileOp.erase();
+
+      condition.getConditionMutable().set(yielded.hasValue);
+      condition.getArgsMutable().assign(elementValues);
+
+      mlir::Block &after = widened.getAfter().front();
+      mlir::BlockArgument bodyElement = after.getArgument(0);
+      bodyElement.setType(carriedTypes.front());
+      llvm::SmallVector<mlir::Value, 6> bodyValues{bodyElement};
+      for (unsigned index = 1; index < carriedTypes.size(); ++index)
+        bodyValues.push_back(
+            after.addArgument(carriedTypes[index], op.getLoc()));
+
+      builder.setInsertionPointToStart(&after);
       RuntimeBundle bodyElementBundle;
-      if (mlir::failed(RuntimeBundleLowerer::makePrimitiveI64Bundle(
-              op, op.getElement().getType(), bodyElement, bodyValid,
-              bodyElementBundle)))
-        return mlir::failure();
+      if (laneElement) {
+        if (mlir::failed(bindElementBundle(bodyValues, bodyElementBundle)))
+          return mlir::failure();
+      } else {
+        mlir::Value bodyValid =
+            mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 1, 1);
+        if (mlir::failed(RuntimeBundleLowerer::makePrimitiveI64Bundle(
+                op, op.getElement().getType(), bodyValues[0], bodyValid,
+                bodyElementBundle)))
+          return mlir::failure();
+      }
       valueBundles[bodyElement] = std::move(bodyElementBundle);
     }
   }
@@ -1102,11 +1150,16 @@ RuntimeBundleLowerer::lowerSourceGeneratorNext(py::NextOp op,
   for (mlir::OpOperand *use : validUses)
     use->set(yielded.hasValue);
 
+  builder.setInsertionPoint(op);
   RuntimeBundle element;
-  if (mlir::failed(RuntimeBundleLowerer::makePrimitiveI64Bundle(
-          op, op.getElement().getType(), yielded.value, yielded.valid,
-          element)))
+  if (laneElement) {
+    if (mlir::failed(bindElementBundle(elementValues, element)))
+      return mlir::failure();
+  } else if (mlir::failed(RuntimeBundleLowerer::makePrimitiveI64Bundle(
+                 op, op.getElement().getType(), yielded.value, yielded.valid,
+                 element))) {
     return mlir::failure();
+  }
   valueBundles[op.getElement()] = std::move(element);
 
   RuntimeBundle next = iterator;
@@ -1154,10 +1207,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSourceGeneratorDunderNext(
 mlir::LogicalResult RuntimeBundleLowerer::lowerSourceGeneratorAdvance(
     py::CallOp op, const RuntimeBundle &receiver,
     std::optional<RuntimePrimitiveI64Evidence> sentI64Evidence) {
-  if (op.getNumResults() != 1 ||
-      runtimeContractName(op.getResult(0).getType()) != "builtins.int")
-    return op.emitError()
-           << "source generator resume currently supports int yield results";
+  if (op.getNumResults() != 1)
+    return op.emitError() << "source generator resume expects one result";
 
   auto sendResumeInfo = generatorResumeClones.find(receiver.generatorTarget);
   if (sendResumeInfo != generatorResumeClones.end()) {
@@ -1173,14 +1224,18 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSourceGeneratorAdvance(
     if (mlir::failed(yieldedOr))
       return mlir::failure();
     RuntimeBundle result;
-    if (mlir::failed(RuntimeBundleLowerer::makePrimitiveI64Bundle(
-            op, op.getResult(0).getType(), yieldedOr->value, yieldedOr->valid,
-            result)))
+    if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
+            op.getOperation(), op.getResult(0).getType(),
+            mlir::ValueRange(yieldedOr->lanePhysicals), result)))
       return mlir::failure();
+    result.setObjectLogicalOwnership(/*ownsObject=*/true);
     valueBundles[op.getResult(0)] = std::move(result);
     erase.push_back(op);
     return mlir::success();
   }
+  if (runtimeContractName(op.getResult(0).getType()) != "builtins.int")
+    return op.emitError()
+           << "source generator resume currently supports int yield results";
 
   mlir::FailureOr<SourceGeneratorResumeResult> yieldedOr =
       RuntimeBundleLowerer::emitSourceGeneratorResumeDispatch(

@@ -566,19 +566,66 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
         RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(logicalType,
                                                               inputTypes);
       }
+      // Generator resume clones widen the yielded-value result lane to an
+      // object-family span; every other lane stays on the primitive pair.
+      // The lane's ownership crosses the suspension boundary through the
+      // materialized owned-results contract (consumed by the affine
+      // verifier's generator-frame rule and the refcount inserter).
+      GeneratorResumeInfo *generatorInfo =
+          RuntimeBundleLowerer::generatorResumeInfoForClone(function);
       if (callable.getResultTypes().empty() ||
-          !llvm::all_of(callable.getResultTypes(), [](mlir::Type type) {
-            return runtimeContractName(type) == "builtins.int";
-          })) {
+          !llvm::all_of(
+              llvm::enumerate(callable.getResultTypes()), [&](auto indexed) {
+                if (generatorInfo && indexed.index() == 2)
+                  return true;
+                return runtimeContractName(indexed.value()) == "builtins.int";
+              })) {
         function.emitError()
             << "primitive i64 callable clone results must be builtins.int";
         result = mlir::failure();
         return mlir::WalkResult::interrupt();
       }
       llvm::SmallVector<mlir::Type, 8> resultTypes;
-      for (mlir::Type resultType : callable.getResultTypes())
+      llvm::SmallVector<std::int64_t, 2> generatorOwnedOffsets;
+      llvm::SmallVector<mlir::Attribute, 2> generatorOwnedContracts;
+      llvm::SmallVector<mlir::Attribute, 2> generatorSuspendLanes;
+      for (auto [resultIndex, resultType] :
+           llvm::enumerate(callable.getResultTypes())) {
+        if (generatorInfo && resultIndex == 2 &&
+            !generatorInfo->valueLane.isControl()) {
+          const GeneratorResumeLane &lane = generatorInfo->valueLane;
+          llvm::SmallVector<mlir::Type, 6> laneTypes =
+              RuntimeBundleLowerer::generatorLanePhysicalTypes(lane);
+          std::int64_t begin = static_cast<std::int64_t>(resultTypes.size());
+          if (!lane.isNone) {
+            generatorOwnedOffsets.push_back(begin);
+            generatorOwnedContracts.push_back(
+                builder.getStringAttr(lane.contract));
+          }
+          generatorSuspendLanes.push_back(builder.getDictionaryAttr({
+              builder.getNamedAttr("contract",
+                                   builder.getStringAttr(lane.contract)),
+              builder.getNamedAttr("begin", builder.getI64IntegerAttr(begin)),
+              builder.getNamedAttr(
+                  "size", builder.getI64IntegerAttr(
+                              static_cast<std::int64_t>(laneTypes.size()))),
+          }));
+          resultTypes.append(laneTypes.begin(), laneTypes.end());
+          continue;
+        }
         RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(resultType,
                                                               resultTypes);
+      }
+      if (!generatorOwnedOffsets.empty()) {
+        function->setAttr(
+            ownership::kOwnedResultsAttr,
+            mlir::DenseI64ArrayAttr::get(context, generatorOwnedOffsets));
+        function->setAttr(ownership::kOwnedResultContractsAttr,
+                          builder.getArrayAttr(generatorOwnedContracts));
+      }
+      if (!generatorSuspendLanes.empty())
+        function->setAttr("ly.generator.suspend_lanes",
+                          builder.getArrayAttr(generatorSuspendLanes));
       if (!function.isDeclaration() &&
           mlir::failed(seedPrimitiveI64CallableEntryArgumentBundles(
               function, logicalInputTypes))) {

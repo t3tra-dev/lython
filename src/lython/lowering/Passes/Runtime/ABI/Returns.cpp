@@ -160,6 +160,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
     unsigned logicalResultIndex = 0;
     builder.setInsertionPoint(op);
     if (RuntimeBundleLowerer::isPrimitiveI64CallableClone(function)) {
+      GeneratorResumeInfo *generatorInfo =
+          RuntimeBundleLowerer::generatorResumeInfoForClone(function);
       auto releaseReturnedObjectIfOwned =
           [&](const RuntimeBundle &bundle) -> mlir::LogicalResult {
         if (bundle.kind != RuntimeBundle::Kind::Object ||
@@ -169,13 +171,34 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
         return RuntimeBundleLowerer::releaseAggregateSlot(
             op, bundle, "primitive_i64_return");
       };
-      for (mlir::Value operand : op.getOperands()) {
+      for (auto [operandIndex, operand] : llvm::enumerate(op.getOperands())) {
         if (mlir::failed(
                 RuntimeBundleLowerer::ensureValueBundle(op, operand))) {
           result = mlir::failure();
           return mlir::WalkResult::interrupt();
         }
         const RuntimeBundle *bundle = RuntimeBundleLowerer::bundleFor(operand);
+        // The generator yielded-value lane (logical result 2) carries its
+        // object-family span; ownership transfers to the resumer through the
+        // clone's owned-results contract, so no release is emitted here.
+        if (generatorInfo && operandIndex == 2 &&
+            !generatorInfo->valueLane.isControl()) {
+          if (!bundle) {
+            op.emitError() << "generator yield lane return value has no "
+                              "lowered runtime bundle";
+            result = mlir::failure();
+            return mlir::WalkResult::interrupt();
+          }
+          unsigned before = static_cast<unsigned>(operands.size());
+          if (mlir::failed(
+                  RuntimeBundleLowerer::appendGeneratorLaneReturnOperands(
+                      op, generatorInfo->valueLane, *bundle, operands))) {
+            result = mlir::failure();
+            return mlir::WalkResult::interrupt();
+          }
+          resultIndex += static_cast<unsigned>(operands.size()) - before;
+          continue;
+        }
         if (!bundle || bundle->kind != RuntimeBundle::Kind::Object ||
             bundle->contractName() != "builtins.int") {
           op.emitError()
