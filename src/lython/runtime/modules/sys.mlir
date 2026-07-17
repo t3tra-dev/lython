@@ -159,7 +159,12 @@ module attributes {
       memref.store %two, %items[%slot9] : memref<?xi64>
       %c10 = arith.constant 10 : index
       %slot10 = arith.addi %base, %c10 : index
-      memref.store %len, %items[%slot10] : memref<?xi64>
+      // The size word must be the code-unit buffer's own length: the
+      // adaptive-width payload is narrower than the UTF-8 input whenever the
+      // argument is non-ASCII.
+      %str_dim = memref.dim %str_bytes, %c0 : memref<?xi8>
+      %str_len = arith.index_cast %str_dim : index to i64
+      memref.store %str_len, %items[%slot10] : memref<?xi64>
       %c14 = arith.constant 14 : index
       %slot14 = arith.addi %base, %c14 : index
       memref.store %one, %items[%slot14] : memref<?xi64>

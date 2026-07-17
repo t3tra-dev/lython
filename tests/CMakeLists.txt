@@ -27,6 +27,7 @@ add_executable(lython_unit_tests
     unit/ParserTests.cpp
     unit/TypeInferenceTests.cpp
     unit/TypeSystemTests.cpp
+    unit/UnicodeTablesTests.cpp
 )
 add_dependencies(lython_unit_tests PyDialectIncGen)
 # TypeSystemTests exercises the TypeSystem facade directly; its header lives

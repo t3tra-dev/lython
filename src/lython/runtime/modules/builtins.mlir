@@ -1649,9 +1649,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  // decode() with the default encoding (the str representation IS UTF-8
-  // bytes). Invalid UTF-8 is not diagnosed yet (CPython raises
-  // UnicodeDecodeError); the bytes land in the str payload unchanged.
+  // decode() with the default encoding: LyUnicode_FromBytes decodes the
+  // UTF-8 into the adaptive-width payload and raises on invalid input.
   func.func @LyBytes_Decode(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "decode", ly.runtime.result_contract = "builtins.str"} {
     %c0 = arith.constant 0 : index
     %dim = memref.dim %bytes, %c0 : memref<?xi8>
@@ -1660,12 +1659,16 @@ module attributes {
     func.return %result_header, %result_bytes : memref<2xi64>, memref<?xi8>
   }
 
-  // str.encode() with the default encoding: the payload is already UTF-8.
+  // str.encode() with the default encoding: re-encode the adaptive-width
+  // code units to UTF-8.
   func.func @LyUnicode_Encode(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "encode", ly.runtime.result_contract = "builtins.bytes"} {
     %c0 = arith.constant 0 : index
-    %dim = memref.dim %bytes, %c0 : memref<?xi8>
-    %length = arith.index_cast %dim : index to i64
-    %result_header, %result_bytes = func.call @LyBytes_FromBytes(%bytes, %c0, %length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %length = func.call @__ly_unicode_utf8_length(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %length_index = arith.index_cast %length : i64 to index
+    %buffer = memref.alloc(%length_index) : memref<?xi8>
+    func.call @__ly_unicode_utf8_fill(%header, %bytes, %buffer) : (memref<2xi64>, memref<?xi8>, memref<?xi8>) -> ()
+    %result_header, %result_bytes = func.call @LyBytes_FromBytes(%buffer, %c0, %length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    memref.dealloc %buffer : memref<?xi8>
     func.return %result_header, %result_bytes : memref<2xi64>, memref<?xi8>
   }
 
@@ -3930,87 +3933,343 @@ module attributes {
     func.return
   }
 
-  func.func private @__ly_unicode_alloc(%len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.primitive = "alloc"} {
-    // One entity, one allocation: [0,16) header, [16,..) bytes. The header
-    // view carries the allocation; bytes is an interior view.
-    %byte_count = arith.index_cast %len : i64 to index
-    %block_prefix = arith.constant 16 : index
+  // "invalid utf-8 sequence"
+  memref.global "private" constant @__ly_unicode_msg_invalid_utf8 : memref<22xi8> = dense<[105, 110, 118, 97, 108, 105, 100, 32, 117, 116, 102, 45, 56, 32, 115, 101, 113, 117, 101, 110, 99, 101]>
+
+  // ValueError, not UnicodeDecodeError: the Unicode exception taxonomy lands
+  // with the Wave 1 exception-hierarchy work, and raising the parent class
+  // now keeps `except ValueError` semantics compatible with that upgrade.
+  func.func private @__ly_unicode_raise_decode_error() {
+    %class_id = arith.constant 53 : i64
+    %length = arith.constant 22 : i64
+    %start = arith.constant 0 : index
+    %message_static = memref.get_global @__ly_unicode_msg_invalid_utf8 : memref<22xi8>
+    %message = memref.cast %message_static : memref<22xi8> to memref<?xi8>
+    %exception:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%message, %start, %length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    func.call @LyEH_ThrowException(%initialized#0, %initialized#1, %initialized#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    func.return
+  }
+
+  // PEP 393-style adaptive-width representation. One entity, one allocation:
+  //   [0,16)               header [refcount, class id = 4]
+  //   [16,24)              character width word: 1 (latin-1) / 2 (UCS-2) / 4 (UCS-4)
+  //   [24, 24+len*width)   little-endian code units
+  // The width word lives OUTSIDE the two-word header (rather than in spare
+  // bits of header[1]) because header[1] is the class id that boxed payload
+  // handles, repr dispatch and the release hook compare by equality.
+  // Canonical-form invariant: every constructor picks the smallest width that
+  // fits the widest code point, so equal strings always have identical width
+  // and identical code-unit bytes (equality can stay bytewise).
+  func.func private @__ly_unicode_alloc(%count: i64, %width: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.primitive = "alloc"} {
+    %data_bytes = arith.muli %count, %width : i64
+    %byte_count = arith.index_cast %data_bytes : i64 to index
+    %block_prefix = arith.constant 24 : index
     %block_bytes = arith.addi %byte_count, %block_prefix : index
     %block = memref.alloc(%block_bytes) {alignment = 16 : i64} : memref<?xi8>
     %header_offset = arith.constant 0 : index
-    %bytes_offset = arith.constant 16 : index
+    %width_offset = arith.constant 16 : index
+    %bytes_offset = arith.constant 24 : index
     %header = memref.view %block[%header_offset][] {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<?xi8> to memref<2xi64>
+    %width_view = memref.view %block[%width_offset][] : memref<?xi8> to memref<1xi64>
     %bytes = memref.view %block[%bytes_offset][%byte_count] : memref<?xi8> to memref<?xi8>
     %one = arith.constant 1 : i64
     %layout_str = arith.constant 4 : i64
     %refcount_slot = arith.constant 0 : index
     %layout_slot = arith.constant 1 : index
+    %width_slot = arith.constant 0 : index
     memref.store %one, %header[%refcount_slot] : memref<2xi64>
     memref.store %layout_str, %header[%layout_slot] : memref<2xi64>
+    memref.store %width, %width_view[%width_slot] : memref<1xi64>
     func.return %header, %bytes : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 4 : i64, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"} {
-    %header, %result_bytes = func.call @__ly_unicode_alloc(%len) : (i64) -> (memref<2xi64>, memref<?xi8>)
-    %byte_count = arith.index_cast %len : i64 to index
-    %lower = arith.constant 0 : index
-    %step = arith.constant 1 : index
-    scf.for %index = %lower to %byte_count step %step {
-      %source_index = arith.addi %start, %index : index
-      %byte = memref.load %bytes[%source_index] : memref<?xi8>
-      memref.store %byte, %result_bytes[%index] : memref<?xi8>
-    }
-    func.return %header, %result_bytes : memref<2xi64>, memref<?xi8>
+  // Character width of an existing str. Read through the header pointer: the
+  // width word sits between the two public views, reachable from neither, and
+  // every str header view is anchored at the block base by construction.
+  func.func private @__ly_unicode_width(%header: memref<2xi64>) -> i64 {
+    %ptr_index = memref.extract_aligned_pointer_as_index %header : memref<2xi64> -> index
+    %ptr = arith.index_cast %ptr_index : index to i64
+    %sixteen = arith.constant 16 : i64
+    %addr = arith.addi %ptr, %sixteen : i64
+    %llptr = llvm.inttoptr %addr : i64 to !llvm.ptr
+    %width = llvm.load %llptr : !llvm.ptr -> i64
+    func.return %width : i64
   }
 
-  func.func @LyUnicode_Length(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> i64 attributes {ly.runtime.contract = "builtins.str", ly.runtime.primitive = "byte_length"} {
+  func.func private @__ly_unicode_count(%header: memref<2xi64>, %bytes: memref<?xi8>) -> i64 {
     %c0 = arith.constant 0 : index
-    %length_index = memref.dim %bytes, %c0 : memref<?xi8>
-    %length = arith.index_cast %length_index : index to i64
-    func.return %length : i64
+    %dim = memref.dim %bytes, %c0 : memref<?xi8>
+    %data_bytes = arith.index_cast %dim : index to i64
+    %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %count = arith.divsi %data_bytes, %width : i64
+    func.return %count : i64
+  }
+
+  func.func private @__ly_unicode_width_for(%cp: i64) -> i64 {
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %four = arith.constant 4 : i64
+    %latin1_limit = arith.constant 256 : i64
+    %ucs2_limit = arith.constant 65536 : i64
+    %fits1 = arith.cmpi ult, %cp, %latin1_limit : i64
+    %fits2 = arith.cmpi ult, %cp, %ucs2_limit : i64
+    %wide = arith.select %fits2, %two, %four : i64
+    %width = arith.select %fits1, %one, %wide : i64
+    func.return %width : i64
+  }
+
+  // Code point at code-point index %i of a %width-wide code-unit buffer.
+  func.func private @__ly_unicode_get(%bytes: memref<?xi8>, %width: i64, %i: index) -> i64 {
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+    %eight = arith.constant 8 : i64
+    %sixteen = arith.constant 16 : i64
+    %twenty_four = arith.constant 24 : i64
+    %width_index = arith.index_cast %width : i64 to index
+    %off = arith.muli %i, %width_index : index
+    %is1 = arith.cmpi eq, %width, %one : i64
+    %cp = scf.if %is1 -> (i64) {
+      %b0 = memref.load %bytes[%off] : memref<?xi8>
+      %v = arith.extui %b0 : i8 to i64
+      scf.yield %v : i64
+    } else {
+      %off1 = arith.addi %off, %c1 : index
+      %b0 = memref.load %bytes[%off] : memref<?xi8>
+      %b1 = memref.load %bytes[%off1] : memref<?xi8>
+      %v0 = arith.extui %b0 : i8 to i64
+      %v1 = arith.extui %b1 : i8 to i64
+      %v1s = arith.shli %v1, %eight : i64
+      %lo = arith.ori %v0, %v1s : i64
+      %is2 = arith.cmpi eq, %width, %two : i64
+      %inner = scf.if %is2 -> (i64) {
+        scf.yield %lo : i64
+      } else {
+        %off2 = arith.addi %off, %c2 : index
+        %off3 = arith.addi %off, %c3 : index
+        %b2 = memref.load %bytes[%off2] : memref<?xi8>
+        %b3 = memref.load %bytes[%off3] : memref<?xi8>
+        %v2 = arith.extui %b2 : i8 to i64
+        %v3 = arith.extui %b3 : i8 to i64
+        %v2s = arith.shli %v2, %sixteen : i64
+        %v3s = arith.shli %v3, %twenty_four : i64
+        %hi = arith.ori %v2s, %v3s : i64
+        %full = arith.ori %lo, %hi : i64
+        scf.yield %full : i64
+      }
+      scf.yield %inner : i64
+    }
+    func.return %cp : i64
+  }
+
+  func.func private @__ly_unicode_put(%bytes: memref<?xi8>, %width: i64, %i: index, %cp: i64) {
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+    %eight = arith.constant 8 : i64
+    %sixteen = arith.constant 16 : i64
+    %twenty_four = arith.constant 24 : i64
+    %width_index = arith.index_cast %width : i64 to index
+    %off = arith.muli %i, %width_index : index
+    %b0 = arith.trunci %cp : i64 to i8
+    memref.store %b0, %bytes[%off] : memref<?xi8>
+    %is_wide = arith.cmpi ne, %width, %one : i64
+    scf.if %is_wide {
+      %off1 = arith.addi %off, %c1 : index
+      %s1 = arith.shrui %cp, %eight : i64
+      %b1 = arith.trunci %s1 : i64 to i8
+      memref.store %b1, %bytes[%off1] : memref<?xi8>
+      %is_widest = arith.cmpi ne, %width, %two : i64
+      scf.if %is_widest {
+        %off2 = arith.addi %off, %c2 : index
+        %off3 = arith.addi %off, %c3 : index
+        %s2 = arith.shrui %cp, %sixteen : i64
+        %s3 = arith.shrui %cp, %twenty_four : i64
+        %b2 = arith.trunci %s2 : i64 to i8
+        %b3 = arith.trunci %s3 : i64 to i8
+        memref.store %b2, %bytes[%off2] : memref<?xi8>
+        memref.store %b3, %bytes[%off3] : memref<?xi8>
+      }
+    }
+    func.return
+  }
+
+  // Decode one UTF-8 sequence at byte offset %i (relative to %start) of a
+  // %len-byte input. Returns (code point, next offset, ok). Strict: truncated
+  // sequences, stray continuation bytes, overlong forms, surrogates and
+  // values above U+10FFFF are rejected (ok = false).
+  func.func private @__ly_utf8_step(%bytes: memref<?xi8>, %start: index, %len: i64, %i: i64) -> (i64, i64, i1) {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %three = arith.constant 3 : i64
+    %four = arith.constant 4 : i64
+    %six = arith.constant 6 : i64
+    %c1 = arith.constant 1 : index
+    %true_bit = arith.constant true
+    %false_bit = arith.constant false
+    %i_index = arith.index_cast %i : i64 to index
+    %pos0 = arith.addi %start, %i_index : index
+    %b0_i8 = memref.load %bytes[%pos0] : memref<?xi8>
+    %b0 = arith.extui %b0_i8 : i8 to i64
+    %ascii_limit = arith.constant 128 : i64
+    %is_ascii = arith.cmpi ult, %b0, %ascii_limit : i64
+    %result:3 = scf.if %is_ascii -> (i64, i64, i1) {
+      %next = arith.addi %i, %one : i64
+      scf.yield %b0, %next, %true_bit : i64, i64, i1
+    } else {
+      %lead2_lo = arith.constant 194 : i64
+      %lead2_hi = arith.constant 223 : i64
+      %lead3_lo = arith.constant 224 : i64
+      %lead3_hi = arith.constant 239 : i64
+      %lead4_lo = arith.constant 240 : i64
+      %lead4_hi = arith.constant 244 : i64
+      %ge2 = arith.cmpi uge, %b0, %lead2_lo : i64
+      %le2 = arith.cmpi ule, %b0, %lead2_hi : i64
+      %is2 = arith.andi %ge2, %le2 : i1
+      %ge3 = arith.cmpi uge, %b0, %lead3_lo : i64
+      %le3 = arith.cmpi ule, %b0, %lead3_hi : i64
+      %is3 = arith.andi %ge3, %le3 : i1
+      %ge4 = arith.cmpi uge, %b0, %lead4_lo : i64
+      %le4 = arith.cmpi ule, %b0, %lead4_hi : i64
+      %is4 = arith.andi %ge4, %le4 : i1
+      %n34 = arith.select %is4, %four, %zero : i64
+      %n3 = arith.select %is3, %three, %n34 : i64
+      %n = arith.select %is2, %two, %n3 : i64
+      %lead_ok = arith.cmpi ne, %n, %zero : i64
+      %end = arith.addi %i, %n : i64
+      %enough = arith.cmpi sle, %end, %len : i64
+      %head_ok = arith.andi %lead_ok, %enough : i1
+      %decoded:3 = scf.if %head_ok -> (i64, i64, i1) {
+        %mask2 = arith.constant 31 : i64
+        %mask3 = arith.constant 15 : i64
+        %mask4 = arith.constant 7 : i64
+        %init4 = arith.andi %b0, %mask4 : i64
+        %init3_raw = arith.andi %b0, %mask3 : i64
+        %init2_raw = arith.andi %b0, %mask2 : i64
+        %init34 = arith.select %is3, %init3_raw, %init4 : i64
+        %init = arith.select %is2, %init2_raw, %init34 : i64
+        %n_index = arith.index_cast %n : i64 to index
+        %tail:2 = scf.for %j = %c1 to %n_index step %c1 iter_args(%acc = %init, %ok = %true_bit) -> (i64, i1) {
+          %pos = arith.addi %pos0, %j : index
+          %cj_i8 = memref.load %bytes[%pos] : memref<?xi8>
+          %cj = arith.extui %cj_i8 : i8 to i64
+          %cont_mask = arith.constant 192 : i64
+          %cont_tag = arith.constant 128 : i64
+          %tag = arith.andi %cj, %cont_mask : i64
+          %is_cont = arith.cmpi eq, %tag, %cont_tag : i64
+          %payload_mask = arith.constant 63 : i64
+          %payload = arith.andi %cj, %payload_mask : i64
+          %shifted = arith.shli %acc, %six : i64
+          %next_acc = arith.ori %shifted, %payload : i64
+          %next_ok = arith.andi %ok, %is_cont : i1
+          scf.yield %next_acc, %next_ok : i64, i1
+        }
+        // Range checks per sequence length. 2-byte overlongs are already
+        // impossible (lead >= 0xC2).
+        %min3 = arith.constant 2048 : i64
+        %surrogate_lo = arith.constant 55296 : i64
+        %surrogate_hi = arith.constant 57343 : i64
+        %min4 = arith.constant 65536 : i64
+        %max_cp = arith.constant 1114111 : i64
+        %ge_min3 = arith.cmpi uge, %tail#0, %min3 : i64
+        %ge_slo = arith.cmpi uge, %tail#0, %surrogate_lo : i64
+        %le_shi = arith.cmpi ule, %tail#0, %surrogate_hi : i64
+        %is_surrogate = arith.andi %ge_slo, %le_shi : i1
+        %not_surrogate = arith.xori %is_surrogate, %true_bit : i1
+        %ok3 = arith.andi %ge_min3, %not_surrogate : i1
+        %ge_min4 = arith.cmpi uge, %tail#0, %min4 : i64
+        %le_max = arith.cmpi ule, %tail#0, %max_cp : i64
+        %ok4 = arith.andi %ge_min4, %le_max : i1
+        %range34 = arith.select %is4, %ok4, %true_bit : i1
+        %range_ok = arith.select %is3, %ok3, %range34 : i1
+        %all_ok = arith.andi %tail#1, %range_ok : i1
+        scf.yield %tail#0, %end, %all_ok : i64, i64, i1
+      } else {
+        %stop = arith.addi %i, %one : i64
+        scf.yield %zero, %stop, %false_bit : i64, i64, i1
+      }
+      scf.yield %decoded#0, %decoded#1, %decoded#2 : i64, i64, i1
+    }
+    func.return %result#0, %result#1, %result#2 : i64, i64, i1
+  }
+
+  // str construction from UTF-8 bytes (literals, bytes.decode, host text).
+  // Pass 1 validates and finds the widest code point; pass 2 decodes into the
+  // smallest fitting width. Invalid UTF-8 raises (CPython raises
+  // UnicodeDecodeError; the byte previously landed in the payload unchanged).
+  func.func @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 4 : i64, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"} {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %true_bit = arith.constant true
+    %scan:3 = scf.while (%i = %zero, %count = %zero, %maxcp = %zero) : (i64, i64, i64) -> (i64, i64, i64) {
+      %more = arith.cmpi slt, %i, %len : i64
+      scf.condition(%more) %i, %count, %maxcp : i64, i64, i64
+    } do {
+    ^bb0(%i: i64, %count: i64, %maxcp: i64):
+      %cp, %next, %ok = func.call @__ly_utf8_step(%bytes, %start, %len, %i) : (memref<?xi8>, index, i64, i64) -> (i64, i64, i1)
+      %bad = arith.xori %ok, %true_bit : i1
+      scf.if %bad {
+        func.call @__ly_unicode_raise_decode_error() : () -> ()
+      }
+      %bigger = arith.cmpi ugt, %cp, %maxcp : i64
+      %new_max = arith.select %bigger, %cp, %maxcp : i64
+      %new_count = arith.addi %count, %one : i64
+      scf.yield %next, %new_count, %new_max : i64, i64, i64
+    }
+    %width = func.call @__ly_unicode_width_for(%scan#2) : (i64) -> i64
+    %header, %out = func.call @__ly_unicode_alloc(%scan#1, %width) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
+    %count_index = arith.index_cast %scan#1 : i64 to index
+    %fill:2 = scf.while (%i = %zero, %k = %c0) : (i64, index) -> (i64, index) {
+      %more = arith.cmpi slt, %k, %count_index : index
+      scf.condition(%more) %i, %k : i64, index
+    } do {
+    ^bb0(%i: i64, %k: index):
+      %cp, %next, %ok = func.call @__ly_utf8_step(%bytes, %start, %len, %i) : (memref<?xi8>, index, i64, i64) -> (i64, i64, i1)
+      func.call @__ly_unicode_put(%out, %width, %k, %cp) : (memref<?xi8>, i64, index, i64) -> ()
+      %next_k = arith.addi %k, %c1 : index
+      scf.yield %next, %next_k : i64, index
+    }
+    func.return %header, %out : memref<2xi64>, memref<?xi8>
   }
 
   func.func @LyUnicode_CodepointLength(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> i64 attributes {ly.runtime.contract = "builtins.str", ly.runtime.method = "__len__"} {
-    %c0 = arith.constant 0 : index
-    %c1 = arith.constant 1 : index
-    %byte_count = memref.dim %bytes, %c0 : memref<?xi8>
-    %zero = arith.constant 0 : i64
-    %one = arith.constant 1 : i64
-    %continuation_mask = arith.constant 192 : i64
-    %continuation_tag = arith.constant 128 : i64
-    %count = scf.for %index = %c0 to %byte_count step %c1 iter_args(%current = %zero) -> (i64) {
-      %byte = memref.load %bytes[%index] : memref<?xi8>
-      %byte_i64 = arith.extui %byte : i8 to i64
-      %tag = arith.andi %byte_i64, %continuation_mask : i64
-      %is_continuation = arith.cmpi eq, %tag, %continuation_tag : i64
-      %next = scf.if %is_continuation -> (i64) {
-        scf.yield %current : i64
-      } else {
-        %incremented = arith.addi %current, %one : i64
-        scf.yield %incremented : i64
-      }
-      scf.yield %next : i64
-    }
+    %count = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
     func.return %count : i64
   }
 
   func.func @LyUnicode_Bool(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> i1 attributes {ly.runtime.contract = "builtins.str", ly.runtime.method = "__bool__"} {
-    %length = func.call @LyUnicode_Length(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
-    %zero = arith.constant 0 : i64
-    %result = arith.cmpi ne, %length, %zero : i64
+    %c0 = arith.constant 0 : index
+    %dim = memref.dim %bytes, %c0 : memref<?xi8>
+    %zero = arith.constant 0 : index
+    %result = arith.cmpi ne, %dim, %zero : index
     func.return %result : i1
   }
 
+  // Canonical form makes equality bytewise: equal strings share width, and
+  // the width check also rejects the cross-width byte collisions (for
+  // example latin-1 "\x00\x01" vs UCS-2 U+0100).
   func.func @LyUnicode_EqBool(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_bytes: memref<?xi8>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_bytes: memref<?xi8>) -> i1 attributes {ly.runtime.contract = "builtins.str", ly.runtime.method = "__eq__"} {
-    %lhs_len = func.call @LyUnicode_Length(%lhs_header, %lhs_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
-    %rhs_len = func.call @LyUnicode_Length(%rhs_header, %rhs_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
-    %same_len = arith.cmpi eq, %lhs_len, %rhs_len : i64
-    %result = scf.if %same_len -> (i1) {
-      %lower = arith.constant 0 : index
-      %upper = arith.index_cast %lhs_len : i64 to index
+    %c0 = arith.constant 0 : index
+    %lhs_dim = memref.dim %lhs_bytes, %c0 : memref<?xi8>
+    %rhs_dim = memref.dim %rhs_bytes, %c0 : memref<?xi8>
+    %lhs_width = func.call @__ly_unicode_width(%lhs_header) : (memref<2xi64>) -> i64
+    %rhs_width = func.call @__ly_unicode_width(%rhs_header) : (memref<2xi64>) -> i64
+    %same_len = arith.cmpi eq, %lhs_dim, %rhs_dim : index
+    %same_width = arith.cmpi eq, %lhs_width, %rhs_width : i64
+    %comparable = arith.andi %same_len, %same_width : i1
+    %result = scf.if %comparable -> (i1) {
       %step = arith.constant 1 : index
       %true = arith.constant true
-      %all_equal = scf.for %index = %lower to %upper step %step iter_args(%current = %true) -> (i1) {
+      %all_equal = scf.for %index = %c0 to %lhs_dim step %step iter_args(%current = %true) -> (i1) {
         %lhs_byte = memref.load %lhs_bytes[%index] : memref<?xi8>
         %rhs_byte = memref.load %rhs_bytes[%index] : memref<?xi8>
         %byte_equal = arith.cmpi eq, %lhs_byte, %rhs_byte : i8
@@ -4033,12 +4292,14 @@ module attributes {
     func.return %result : i1
   }
 
-  // Lexicographic byte comparison (-1/0/1): first differing byte decides
-  // (unsigned, matching CPython's bytewise UTF-8 ordering), else the shorter
+  // Lexicographic code-point comparison (-1/0/1): the first differing code
+  // point decides (matching CPython's code-point ordering), else the shorter
   // string orders first.
   func.func private @LyUnicode_Compare(%lhs_header: memref<2xi64>, %lhs_bytes: memref<?xi8>, %rhs_header: memref<2xi64>, %rhs_bytes: memref<?xi8>) -> i64 {
-    %lhs_len = func.call @LyUnicode_Length(%lhs_header, %lhs_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
-    %rhs_len = func.call @LyUnicode_Length(%rhs_header, %rhs_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %lhs_width = func.call @__ly_unicode_width(%lhs_header) : (memref<2xi64>) -> i64
+    %rhs_width = func.call @__ly_unicode_width(%rhs_header) : (memref<2xi64>) -> i64
+    %lhs_len = func.call @__ly_unicode_count(%lhs_header, %lhs_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %rhs_len = func.call @__ly_unicode_count(%rhs_header, %rhs_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
     %min_len = arith.minsi %lhs_len, %rhs_len : i64
     %zero = arith.constant 0 : i64
     %minus_one = arith.constant -1 : i64
@@ -4046,13 +4307,11 @@ module attributes {
     %lower = arith.constant 0 : index
     %upper = arith.index_cast %min_len : i64 to index
     %step = arith.constant 1 : index
-    %byte_cmp = scf.for %index = %lower to %upper step %step iter_args(%acc = %zero) -> (i64) {
-      %lhs_byte = memref.load %lhs_bytes[%index] : memref<?xi8>
-      %rhs_byte = memref.load %rhs_bytes[%index] : memref<?xi8>
-      %lhs_u = arith.extui %lhs_byte : i8 to i64
-      %rhs_u = arith.extui %rhs_byte : i8 to i64
-      %lt = arith.cmpi ult, %lhs_u, %rhs_u : i64
-      %gt = arith.cmpi ugt, %lhs_u, %rhs_u : i64
+    %cp_cmp = scf.for %index = %lower to %upper step %step iter_args(%acc = %zero) -> (i64) {
+      %lhs_cp = func.call @__ly_unicode_get(%lhs_bytes, %lhs_width, %index) : (memref<?xi8>, i64, index) -> i64
+      %rhs_cp = func.call @__ly_unicode_get(%rhs_bytes, %rhs_width, %index) : (memref<?xi8>, i64, index) -> i64
+      %lt = arith.cmpi ult, %lhs_cp, %rhs_cp : i64
+      %gt = arith.cmpi ugt, %lhs_cp, %rhs_cp : i64
       %gt_val = arith.select %gt, %plus_one, %zero : i64
       %this = arith.select %lt, %minus_one, %gt_val : i64
       %decided = arith.cmpi ne, %acc, %zero : i64
@@ -4063,8 +4322,8 @@ module attributes {
     %len_gt = arith.cmpi sgt, %lhs_len, %rhs_len : i64
     %len_gt_val = arith.select %len_gt, %plus_one, %zero : i64
     %len_cmp = arith.select %len_lt, %minus_one, %len_gt_val : i64
-    %prefix_equal = arith.cmpi eq, %byte_cmp, %zero : i64
-    %result = arith.select %prefix_equal, %len_cmp, %byte_cmp : i64
+    %prefix_equal = arith.cmpi eq, %cp_cmp, %zero : i64
+    %result = arith.select %prefix_equal, %len_cmp, %cp_cmp : i64
     func.return %result : i64
   }
 
@@ -4096,61 +4355,48 @@ module attributes {
     func.return %result : i1
   }
 
+  // O(1) code-point indexing: fixed-width code units make the scan-free load
+  // possible; the result re-canonicalizes to the smallest width for that one
+  // code point.
   func.func @LyUnicode_GetItem(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %raw_index: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__getitem__"} {
-    %codepoints = func.call @LyUnicode_CodepointLength(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %codepoints = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
+    %c0 = arith.constant 0 : index
     %is_negative = arith.cmpi slt, %raw_index, %zero : i64
     %from_end = arith.addi %raw_index, %codepoints : i64
-    %index = arith.select %is_negative, %from_end, %raw_index : i1, i64
+    %index = arith.select %is_negative, %from_end, %raw_index : i64
     %lower_ok = arith.cmpi sge, %index, %zero : i64
     %upper_ok = arith.cmpi slt, %index, %codepoints : i64
     %valid = arith.andi %lower_ok, %upper_ok : i1
     %result:2 = scf.if %valid -> (memref<2xi64>, memref<?xi8>) {
-      %c0 = arith.constant 0 : index
-      %c1 = arith.constant 1 : index
-      %byte_count = memref.dim %bytes, %c0 : memref<?xi8>
-      %false = arith.constant false
-      %continuation_mask = arith.constant 192 : i64
-      %continuation_tag = arith.constant 128 : i64
-      %scan:5 = scf.for %i = %c0 to %byte_count step %c1 iter_args(%ordinal = %zero, %start = %c0, %end = %byte_count, %found = %false, %done = %false) -> (i64, index, index, i1, i1) {
-        %byte = memref.load %bytes[%i] : memref<?xi8>
-        %byte_i64 = arith.extui %byte : i8 to i64
-        %tag = arith.andi %byte_i64, %continuation_mask : i64
-        %is_start = arith.cmpi ne, %tag, %continuation_tag : i64
-        %ordinal_matches = arith.cmpi eq, %ordinal, %index : i64
-        %not_found = arith.cmpi eq, %found, %false : i1
-        %not_done = arith.cmpi eq, %done, %false : i1
-        %start_candidate = arith.andi %is_start, %ordinal_matches : i1
-        %take_start_base = arith.andi %start_candidate, %not_found : i1
-        %take_start = arith.andi %take_start_base, %not_done : i1
-        %next_start = arith.select %take_start, %i, %start : i1, index
-        %next_found = arith.ori %found, %take_start : i1
-        %end_candidate = arith.andi %found, %is_start : i1
-        %take_end = arith.andi %end_candidate, %not_done : i1
-        %next_end = arith.select %take_end, %i, %end : i1, index
-        %next_done = arith.ori %done, %take_end : i1
-        %incremented = arith.addi %ordinal, %one : i64
-        %next_ordinal = arith.select %is_start, %incremented, %ordinal : i1, i64
-        scf.yield %next_ordinal, %next_start, %next_end, %next_found, %next_done : i64, index, index, i1, i1
-      }
-      %length_index = arith.subi %scan#2, %scan#1 : index
-      %length = arith.index_cast %length_index : index to i64
-      %result_header, %result_bytes = func.call @LyUnicode_FromBytes(%bytes, %scan#1, %length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+      %index_index = arith.index_cast %index : i64 to index
+      %cp = func.call @__ly_unicode_get(%bytes, %width, %index_index) : (memref<?xi8>, i64, index) -> i64
+      %new_width = func.call @__ly_unicode_width_for(%cp) : (i64) -> i64
+      %result_header, %result_bytes = func.call @__ly_unicode_alloc(%one, %new_width) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
+      func.call @__ly_unicode_put(%result_bytes, %new_width, %c0, %cp) : (memref<?xi8>, i64, index, i64) -> ()
       scf.yield %result_header, %result_bytes : memref<2xi64>, memref<?xi8>
     } else {
       func.call @__ly_unicode_raise_index_error() : () -> ()
-      %c0 = arith.constant 0 : index
-      %result_header, %result_bytes = func.call @LyUnicode_FromBytes(%bytes, %c0, %zero) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %empty_width = arith.constant 1 : i64
+      %result_header, %result_bytes = func.call @__ly_unicode_alloc(%zero, %empty_width) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
       scf.yield %result_header, %result_bytes : memref<2xi64>, memref<?xi8>
     }
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
   func.func @LyUnicode_Copy(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.primitive = "copy"} {
-    %start = arith.constant 0 : index
-    %length = func.call @LyUnicode_Length(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
-    %new_header, %new_bytes = func.call @LyUnicode_FromBytes(%bytes, %start, %length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %count = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %new_header, %new_bytes = func.call @__ly_unicode_alloc(%count, %width) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
+    %dim = memref.dim %bytes, %c0 : memref<?xi8>
+    scf.for %i = %c0 to %dim step %c1 {
+      %byte = memref.load %bytes[%i] : memref<?xi8>
+      memref.store %byte, %new_bytes[%i] : memref<?xi8>
+    }
     func.return %new_header, %new_bytes : memref<2xi64>, memref<?xi8>
   }
 
@@ -4161,161 +4407,343 @@ module attributes {
     func.return %header, %bytes : memref<2xi64>, memref<?xi8>
   }
 
+  // Printability query implemented beside the UCD tables
+  // (runtime/modules/unicodedata.mlir).
+  func.func private @__ly_ucd_is_printable(%cp: i64) -> i1
+
+  // Repr expansion width in characters for a code point that is neither the
+  // chosen quote nor a backslash: 1 = pass through (UCD-printable, matching
+  // CPython's unicode_repr), 2 = \t \n \r, 4/6/10 = \xNN / \uNNNN /
+  // \U00NNNNNN for non-printable code points by magnitude.
+  func.func private @__ly_unicode_repr_class(%cp: i64) -> i64 {
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %four = arith.constant 4 : i64
+    %six = arith.constant 6 : i64
+    %ten = arith.constant 10 : i64
+    %tab = arith.constant 9 : i64
+    %nl = arith.constant 10 : i64
+    %cr = arith.constant 13 : i64
+    %latin1_limit = arith.constant 256 : i64
+    %ucs2_limit = arith.constant 65536 : i64
+    %is_tab = arith.cmpi eq, %cp, %tab : i64
+    %is_nl = arith.cmpi eq, %cp, %nl : i64
+    %is_cr = arith.cmpi eq, %cp, %cr : i64
+    %tn = arith.ori %is_tab, %is_nl : i1
+    %is_tnr = arith.ori %tn, %is_cr : i1
+    %printable = func.call @__ly_ucd_is_printable(%cp) : (i64) -> i1
+    %fits1 = arith.cmpi ult, %cp, %latin1_limit : i64
+    %fits2 = arith.cmpi ult, %cp, %ucs2_limit : i64
+    %six_or_ten = arith.select %fits2, %six, %ten : i64
+    %escape = arith.select %fits1, %four, %six_or_ten : i64
+    %escape_or_pass = arith.select %printable, %one, %escape : i64
+    %class = arith.select %is_tnr, %two, %escape_or_pass : i64
+    func.return %class : i64
+  }
+
+  // %digits lowercase hex digits of %value, most significant first, written
+  // at code-point positions [%pos, %pos+%digits).
+  func.func private @__ly_unicode_put_hex(%bytes: memref<?xi8>, %width: i64, %pos: index, %value: i64, %digits: index) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %four = arith.constant 4 : i64
+    %fifteen = arith.constant 15 : i64
+    %ten = arith.constant 10 : i64
+    %ascii_zero = arith.constant 48 : i64
+    %ascii_a_minus_ten = arith.constant 87 : i64
+    scf.for %d = %c0 to %digits step %c1 {
+      %last = arith.subi %digits, %c1 : index
+      %rev = arith.subi %last, %d : index
+      %rev_i64 = arith.index_cast %rev : index to i64
+      %shift = arith.muli %rev_i64, %four : i64
+      %shifted = arith.shrui %value, %shift : i64
+      %nibble = arith.andi %shifted, %fifteen : i64
+      %is_decimal = arith.cmpi ult, %nibble, %ten : i64
+      %base = arith.select %is_decimal, %ascii_zero, %ascii_a_minus_ten : i64
+      %ch = arith.addi %nibble, %base : i64
+      %dst = arith.addi %pos, %d : index
+      func.call @__ly_unicode_put(%bytes, %width, %dst, %ch) : (memref<?xi8>, i64, index, i64) -> ()
+    }
+    func.return
+  }
+
   // CPython `str.__repr__`: wrap in quotes and escape. The quote is `'` unless
   // the string contains `'` and no `"` (then `"`), matching unicode_repr.
-  // Escapes: \\ , the chosen quote, \t \n \r, and \xNN for other bytes < 0x20
-  // or 0x7f. Printable ASCII and UTF-8 continuation bytes (>= 0x80) pass
-  // through (non-ASCII printability tables are out of scope). Byte-oriented.
+  // Escapes: \\ , the chosen quote, \t \n \r, and \xNN per
+  // __ly_unicode_repr_class. Code-point oriented; the output re-canonicalizes
+  // to the smallest width that fits what is actually emitted.
   func.func @LyUnicode_Repr(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c2 = arith.constant 2 : index
-    %c3 = arith.constant 3 : index
     %c4 = arith.constant 4 : index
-    %n = memref.dim %bytes, %c0 : memref<?xi8>
-    %true_i1 = arith.constant true
-    %bs = arith.constant 92 : i8
-    %sq = arith.constant 39 : i8
-    %dq = arith.constant 34 : i8
-    %tab = arith.constant 9 : i8
-    %nl = arith.constant 10 : i8
-    %cr = arith.constant 13 : i8
-    %sp = arith.constant 32 : i8
-    %del = arith.constant 127 : i8
-    %four_i8 = arith.constant 4 : i8
-    %fifteen8 = arith.constant 15 : i8
-    %ten8 = arith.constant 10 : i8
-    %x_char = arith.constant 120 : i8
-    %t_char = arith.constant 116 : i8
-    %n_char = arith.constant 110 : i8
-    %r_char = arith.constant 114 : i8
-    %ascii0 = arith.constant 48 : i8
-    %ascii_a = arith.constant 87 : i8
+    %c8 = arith.constant 8 : index
     %zero64 = arith.constant 0 : i64
     %one64 = arith.constant 1 : i64
     %two64 = arith.constant 2 : i64
     %four64 = arith.constant 4 : i64
+    %six64 = arith.constant 6 : i64
+    %ten64 = arith.constant 10 : i64
+    %sq = arith.constant 39 : i64
+    %dq = arith.constant 34 : i64
+    %bs = arith.constant 92 : i64
+    %tab = arith.constant 9 : i64
+    %nl = arith.constant 10 : i64
+    %t_char = arith.constant 116 : i64
+    %n_char = arith.constant 110 : i64
+    %r_char = arith.constant 114 : i64
+    %x_char = arith.constant 120 : i64
+    %u_char = arith.constant 117 : i64
+    %cap_u_char = arith.constant 85 : i64
+    %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %count = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %count_index = arith.index_cast %count : i64 to index
 
-    // Pass 1: count `'`/`"` and the escaped body length (quotes counted as 1).
-    %scan:3 = scf.for %i = %c0 to %n step %c1
-        iter_args(%csq = %zero64, %cdq = %zero64, %common = %zero64)
-        -> (i64, i64, i64) {
-      %b = memref.load %bytes[%i] : memref<?xi8>
-      %is_sq = arith.cmpi eq, %b, %sq : i8
-      %is_dq = arith.cmpi eq, %b, %dq : i8
-      %is_bs = arith.cmpi eq, %b, %bs : i8
-      %is_tab = arith.cmpi eq, %b, %tab : i8
-      %is_nl = arith.cmpi eq, %b, %nl : i8
-      %is_cr = arith.cmpi eq, %b, %cr : i8
-      %nr = arith.ori %is_nl, %is_cr : i1
-      %is_tnr = arith.ori %is_tab, %nr : i1
-      %is_two = arith.ori %is_bs, %is_tnr : i1
-      %lt_sp = arith.cmpi ult, %b, %sp : i8
-      %not_tnr = arith.xori %is_tnr, %true_i1 : i1
-      %ctrl_low = arith.andi %lt_sp, %not_tnr : i1
-      %is_del = arith.cmpi eq, %b, %del : i8
-      %is_four = arith.ori %ctrl_low, %is_del : i1
-      %len_two_one = arith.select %is_two, %two64, %one64 : i64
-      %contrib = arith.select %is_four, %four64, %len_two_one : i64
+    // Pass 1: count `'`/`"`, the escaped body length (quotes counted as 1)
+    // and the widest pass-through code point.
+    %scan:4 = scf.for %i = %c0 to %count_index step %c1
+        iter_args(%csq = %zero64, %cdq = %zero64, %common = %zero64, %maxcp = %zero64)
+        -> (i64, i64, i64, i64) {
+      %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
+      %is_sq = arith.cmpi eq, %cp, %sq : i64
+      %is_dq = arith.cmpi eq, %cp, %dq : i64
+      %is_bs = arith.cmpi eq, %cp, %bs : i64
+      %is_quote = arith.ori %is_sq, %is_dq : i1
+      %class = func.call @__ly_unicode_repr_class(%cp) : (i64) -> i64
+      %quote_or_class = arith.select %is_quote, %one64, %class : i64
+      %contrib = arith.select %is_bs, %two64, %quote_or_class : i64
+      %passes = arith.cmpi eq, %contrib, %one64 : i64
+      %candidate = arith.select %passes, %cp, %zero64 : i64
+      %bigger = arith.cmpi ugt, %candidate, %maxcp : i64
+      %new_max = arith.select %bigger, %candidate, %maxcp : i64
       %add_sq = arith.select %is_sq, %one64, %zero64 : i64
       %add_dq = arith.select %is_dq, %one64, %zero64 : i64
       %csq2 = arith.addi %csq, %add_sq : i64
       %cdq2 = arith.addi %cdq, %add_dq : i64
       %common2 = arith.addi %common, %contrib : i64
-      scf.yield %csq2, %cdq2, %common2 : i64, i64, i64
+      scf.yield %csq2, %cdq2, %common2, %new_max : i64, i64, i64, i64
     }
 
     %sq_present = arith.cmpi ne, %scan#0, %zero64 : i64
     %dq_absent = arith.cmpi eq, %scan#1, %zero64 : i64
     %use_double = arith.andi %sq_present, %dq_absent : i1
-    %quote = arith.select %use_double, %dq, %sq : i8
+    %quote = arith.select %use_double, %dq, %sq : i64
     %count_q = arith.select %use_double, %scan#1, %scan#0 : i64
     %body = arith.addi %scan#2, %count_q : i64
     %total = arith.addi %body, %two64 : i64
+    %out_width = func.call @__ly_unicode_width_for(%scan#3) : (i64) -> i64
+    %out_header, %out_bytes = func.call @__ly_unicode_alloc(%total, %out_width) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.call @__ly_unicode_put(%out_bytes, %out_width, %c0, %quote) : (memref<?xi8>, i64, index, i64) -> ()
 
-    %out_header, %out_bytes = func.call @__ly_unicode_alloc(%total) : (i64) -> (memref<2xi64>, memref<?xi8>)
-    memref.store %quote, %out_bytes[%c0] : memref<?xi8>
-
-    // Pass 2: fill escaped bytes starting at position 1.
-    scf.for %i = %c0 to %n step %c1 iter_args(%pos = %c1) -> (index) {
-      %b = memref.load %bytes[%i] : memref<?xi8>
-      %is_q = arith.cmpi eq, %b, %quote : i8
-      %is_bs = arith.cmpi eq, %b, %bs : i8
-      %is_tab = arith.cmpi eq, %b, %tab : i8
-      %is_nl = arith.cmpi eq, %b, %nl : i8
-      %is_cr = arith.cmpi eq, %b, %cr : i8
-      %nr = arith.ori %is_nl, %is_cr : i1
-      %is_tnr = arith.ori %is_tab, %nr : i1
-      %two_bsq = arith.ori %is_bs, %is_q : i1
-      %is_two = arith.ori %two_bsq, %is_tnr : i1
-      %lt_sp = arith.cmpi ult, %b, %sp : i8
-      %not_tnr = arith.xori %is_tnr, %true_i1 : i1
-      %ctrl_low = arith.andi %lt_sp, %not_tnr : i1
-      %is_del = arith.cmpi eq, %b, %del : i8
-      %is_four = arith.ori %ctrl_low, %is_del : i1
-      %is_escaped = arith.ori %is_two, %is_four : i1
-
-      // second byte for 2-byte escapes: \\ -> '\', quote -> quote, \t\n\r.
-      %sec_bs = arith.select %is_bs, %bs, %quote : i8
-      %sec_q = arith.select %is_q, %quote, %sec_bs : i8
-      %sec_t = arith.select %is_tab, %t_char, %sec_q : i8
-      %sec_n = arith.select %is_nl, %n_char, %sec_t : i8
-      %second = arith.select %is_cr, %r_char, %sec_n : i8
-
-      %byte0 = arith.select %is_escaped, %bs, %b : i8
-      %byte1 = arith.select %is_four, %x_char, %second : i8
-      memref.store %byte0, %out_bytes[%pos] : memref<?xi8>
-      %pos1 = arith.addi %pos, %c1 : index
-      scf.if %is_escaped {
-        memref.store %byte1, %out_bytes[%pos1] : memref<?xi8>
+    // Pass 2: fill the escaped body starting at position 1.
+    scf.for %i = %c0 to %count_index step %c1 iter_args(%pos = %c1) -> (index) {
+      %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
+      %is_bs = arith.cmpi eq, %cp, %bs : i64
+      %is_quote = arith.cmpi eq, %cp, %quote : i64
+      %two_char = arith.ori %is_bs, %is_quote : i1
+      %next_pos = scf.if %two_char -> (index) {
+        func.call @__ly_unicode_put(%out_bytes, %out_width, %pos, %bs) : (memref<?xi8>, i64, index, i64) -> ()
+        %pos1 = arith.addi %pos, %c1 : index
+        func.call @__ly_unicode_put(%out_bytes, %out_width, %pos1, %cp) : (memref<?xi8>, i64, index, i64) -> ()
+        %advanced = arith.addi %pos, %c2 : index
+        scf.yield %advanced : index
+      } else {
+        %class = func.call @__ly_unicode_repr_class(%cp) : (i64) -> i64
+        %is_pass = arith.cmpi eq, %class, %one64 : i64
+        %inner = scf.if %is_pass -> (index) {
+          func.call @__ly_unicode_put(%out_bytes, %out_width, %pos, %cp) : (memref<?xi8>, i64, index, i64) -> ()
+          %advanced = arith.addi %pos, %c1 : index
+          scf.yield %advanced : index
+        } else {
+          func.call @__ly_unicode_put(%out_bytes, %out_width, %pos, %bs) : (memref<?xi8>, i64, index, i64) -> ()
+          %pos1 = arith.addi %pos, %c1 : index
+          %is_two = arith.cmpi eq, %class, %two64 : i64
+          %escaped = scf.if %is_two -> (index) {
+            %is_tab = arith.cmpi eq, %cp, %tab : i64
+            %is_nl = arith.cmpi eq, %cp, %nl : i64
+            %nr_char = arith.select %is_nl, %n_char, %r_char : i64
+            %second = arith.select %is_tab, %t_char, %nr_char : i64
+            func.call @__ly_unicode_put(%out_bytes, %out_width, %pos1, %second) : (memref<?xi8>, i64, index, i64) -> ()
+            %advanced = arith.addi %pos, %c2 : index
+            scf.yield %advanced : index
+          } else {
+            %is_four = arith.cmpi eq, %class, %four64 : i64
+            %is_six = arith.cmpi eq, %class, %six64 : i64
+            %ubig_marker = arith.select %is_six, %u_char, %cap_u_char : i64
+            %marker = arith.select %is_four, %x_char, %ubig_marker : i64
+            func.call @__ly_unicode_put(%out_bytes, %out_width, %pos1, %marker) : (memref<?xi8>, i64, index, i64) -> ()
+            %digits8 = arith.select %is_six, %c4, %c8 : index
+            %digits = arith.select %is_four, %c2, %digits8 : index
+            %pos2 = arith.addi %pos, %c2 : index
+            func.call @__ly_unicode_put_hex(%out_bytes, %out_width, %pos2, %cp, %digits) : (memref<?xi8>, i64, index, i64, index) -> ()
+            %class_index = arith.index_cast %class : i64 to index
+            %advanced = arith.addi %pos, %class_index : index
+            scf.yield %advanced : index
+          }
+          scf.yield %escaped : index
+        }
+        scf.yield %inner : index
       }
-      // 4-byte \xNN: high and low nibble as lowercase hex.
-      %hi = arith.shrui %b, %four_i8 : i8
-      %lo = arith.andi %b, %fifteen8 : i8
-      %hi_lt = arith.cmpi ult, %hi, %ten8 : i8
-      %hi_off = arith.select %hi_lt, %ascii0, %ascii_a : i8
-      %hi_char = arith.addi %hi, %hi_off : i8
-      %lo_lt = arith.cmpi ult, %lo, %ten8 : i8
-      %lo_off = arith.select %lo_lt, %ascii0, %ascii_a : i8
-      %lo_char = arith.addi %lo, %lo_off : i8
-      %pos2 = arith.addi %pos, %c2 : index
-      %pos3 = arith.addi %pos, %c3 : index
-      scf.if %is_four {
-        memref.store %hi_char, %out_bytes[%pos2] : memref<?xi8>
-        memref.store %lo_char, %out_bytes[%pos3] : memref<?xi8>
-      }
-      %step_two_one = arith.select %is_two, %c2, %c1 : index
-      %step = arith.select %is_four, %c4, %step_two_one : index
-      %next_pos = arith.addi %pos, %step : index
       scf.yield %next_pos : index
     }
 
     %total_idx = arith.index_cast %total : i64 to index
     %last = arith.subi %total_idx, %c1 : index
-    memref.store %quote, %out_bytes[%last] : memref<?xi8>
+    func.call @__ly_unicode_put(%out_bytes, %out_width, %last, %quote) : (memref<?xi8>, i64, index, i64) -> ()
     func.return %out_header, %out_bytes : memref<2xi64>, memref<?xi8>
   }
 
   func.func @LyUnicode_Concat(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_bytes: memref<?xi8>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__add__"} {
-    %lhs_len = func.call @LyUnicode_Length(%lhs_header, %lhs_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
-    %rhs_len = func.call @LyUnicode_Length(%rhs_header, %rhs_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %lhs_width = func.call @__ly_unicode_width(%lhs_header) : (memref<2xi64>) -> i64
+    %rhs_width = func.call @__ly_unicode_width(%rhs_header) : (memref<2xi64>) -> i64
+    %lhs_len = func.call @__ly_unicode_count(%lhs_header, %lhs_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %rhs_len = func.call @__ly_unicode_count(%rhs_header, %rhs_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    // Operands are canonical (smallest fitting width), so the wider operand
+    // width IS the smallest width that fits the concatenation.
+    %width = arith.maxsi %lhs_width, %rhs_width : i64
     %total_len = arith.addi %lhs_len, %rhs_len : i64
-    %header, %bytes = func.call @__ly_unicode_alloc(%total_len) : (i64) -> (memref<2xi64>, memref<?xi8>)
-    %zero = arith.constant 0 : index
+    %header, %bytes = func.call @__ly_unicode_alloc(%total_len, %width) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
     %lhs_upper = arith.index_cast %lhs_len : i64 to index
     %rhs_upper = arith.index_cast %rhs_len : i64 to index
-    %lhs_offset = arith.index_cast %lhs_len : i64 to index
-    %step = arith.constant 1 : index
-    scf.for %index = %zero to %lhs_upper step %step {
-      %byte = memref.load %lhs_bytes[%index] : memref<?xi8>
-      memref.store %byte, %bytes[%index] : memref<?xi8>
+    scf.for %index = %c0 to %lhs_upper step %c1 {
+      %cp = func.call @__ly_unicode_get(%lhs_bytes, %lhs_width, %index) : (memref<?xi8>, i64, index) -> i64
+      func.call @__ly_unicode_put(%bytes, %width, %index, %cp) : (memref<?xi8>, i64, index, i64) -> ()
     }
-    scf.for %index = %zero to %rhs_upper step %step {
-      %byte = memref.load %rhs_bytes[%index] : memref<?xi8>
-      %dest = arith.addi %lhs_offset, %index : index
-      memref.store %byte, %bytes[%dest] : memref<?xi8>
+    scf.for %index = %c0 to %rhs_upper step %c1 {
+      %cp = func.call @__ly_unicode_get(%rhs_bytes, %rhs_width, %index) : (memref<?xi8>, i64, index) -> i64
+      %dest = arith.addi %lhs_upper, %index : index
+      func.call @__ly_unicode_put(%bytes, %width, %dest, %cp) : (memref<?xi8>, i64, index, i64) -> ()
     }
     func.return %header, %bytes : memref<2xi64>, memref<?xi8>
+  }
+
+  // UTF-8 byte length of the encoded form (encode / print paths).
+  func.func private @__ly_unicode_utf8_length(%header: memref<2xi64>, %bytes: memref<?xi8>) -> i64 {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %three = arith.constant 3 : i64
+    %four = arith.constant 4 : i64
+    %lim1 = arith.constant 128 : i64
+    %lim2 = arith.constant 2048 : i64
+    %lim3 = arith.constant 65536 : i64
+    %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %count = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %count_index = arith.index_cast %count : i64 to index
+    %total = scf.for %i = %c0 to %count_index step %c1 iter_args(%acc = %zero) -> (i64) {
+      %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
+      %fits1 = arith.cmpi ult, %cp, %lim1 : i64
+      %fits2 = arith.cmpi ult, %cp, %lim2 : i64
+      %fits3 = arith.cmpi ult, %cp, %lim3 : i64
+      %three_or_four = arith.select %fits3, %three, %four : i64
+      %two_plus = arith.select %fits2, %two, %three_or_four : i64
+      %contrib = arith.select %fits1, %one, %two_plus : i64
+      %next = arith.addi %acc, %contrib : i64
+      scf.yield %next : i64
+    }
+    func.return %total : i64
+  }
+
+  // Encode into a caller-provided UTF-8 buffer of exactly
+  // __ly_unicode_utf8_length bytes.
+  func.func private @__ly_unicode_utf8_fill(%header: memref<2xi64>, %bytes: memref<?xi8>, %out: memref<?xi8>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+    %c4 = arith.constant 4 : index
+    %six = arith.constant 6 : i64
+    %twelve = arith.constant 12 : i64
+    %eighteen = arith.constant 18 : i64
+    %lim1 = arith.constant 128 : i64
+    %lim2 = arith.constant 2048 : i64
+    %lim3 = arith.constant 65536 : i64
+    %cont_tag = arith.constant 128 : i64
+    %payload_mask = arith.constant 63 : i64
+    %lead2_tag = arith.constant 192 : i64
+    %lead3_tag = arith.constant 224 : i64
+    %lead4_tag = arith.constant 240 : i64
+    %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %count = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %count_index = arith.index_cast %count : i64 to index
+    scf.for %i = %c0 to %count_index step %c1 iter_args(%pos = %c0) -> (index) {
+      %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
+      %fits1 = arith.cmpi ult, %cp, %lim1 : i64
+      %next = scf.if %fits1 -> (index) {
+        %b0 = arith.trunci %cp : i64 to i8
+        memref.store %b0, %out[%pos] : memref<?xi8>
+        %advanced = arith.addi %pos, %c1 : index
+        scf.yield %advanced : index
+      } else {
+        %fits2 = arith.cmpi ult, %cp, %lim2 : i64
+        %inner2 = scf.if %fits2 -> (index) {
+          %hi = arith.shrui %cp, %six : i64
+          %b0v = arith.ori %hi, %lead2_tag : i64
+          %lo = arith.andi %cp, %payload_mask : i64
+          %b1v = arith.ori %lo, %cont_tag : i64
+          %b0 = arith.trunci %b0v : i64 to i8
+          %b1 = arith.trunci %b1v : i64 to i8
+          %pos1 = arith.addi %pos, %c1 : index
+          memref.store %b0, %out[%pos] : memref<?xi8>
+          memref.store %b1, %out[%pos1] : memref<?xi8>
+          %advanced = arith.addi %pos, %c2 : index
+          scf.yield %advanced : index
+        } else {
+          %fits3 = arith.cmpi ult, %cp, %lim3 : i64
+          %inner3 = scf.if %fits3 -> (index) {
+            %hi = arith.shrui %cp, %twelve : i64
+            %b0v = arith.ori %hi, %lead3_tag : i64
+            %mid_raw = arith.shrui %cp, %six : i64
+            %mid = arith.andi %mid_raw, %payload_mask : i64
+            %b1v = arith.ori %mid, %cont_tag : i64
+            %lo = arith.andi %cp, %payload_mask : i64
+            %b2v = arith.ori %lo, %cont_tag : i64
+            %b0 = arith.trunci %b0v : i64 to i8
+            %b1 = arith.trunci %b1v : i64 to i8
+            %b2 = arith.trunci %b2v : i64 to i8
+            %pos1 = arith.addi %pos, %c1 : index
+            %pos2 = arith.addi %pos, %c2 : index
+            memref.store %b0, %out[%pos] : memref<?xi8>
+            memref.store %b1, %out[%pos1] : memref<?xi8>
+            memref.store %b2, %out[%pos2] : memref<?xi8>
+            %advanced = arith.addi %pos, %c3 : index
+            scf.yield %advanced : index
+          } else {
+            %hi = arith.shrui %cp, %eighteen : i64
+            %b0v = arith.ori %hi, %lead4_tag : i64
+            %mid1_raw = arith.shrui %cp, %twelve : i64
+            %mid1 = arith.andi %mid1_raw, %payload_mask : i64
+            %b1v = arith.ori %mid1, %cont_tag : i64
+            %mid2_raw = arith.shrui %cp, %six : i64
+            %mid2 = arith.andi %mid2_raw, %payload_mask : i64
+            %b2v = arith.ori %mid2, %cont_tag : i64
+            %lo = arith.andi %cp, %payload_mask : i64
+            %b3v = arith.ori %lo, %cont_tag : i64
+            %b0 = arith.trunci %b0v : i64 to i8
+            %b1 = arith.trunci %b1v : i64 to i8
+            %b2 = arith.trunci %b2v : i64 to i8
+            %b3 = arith.trunci %b3v : i64 to i8
+            %pos1 = arith.addi %pos, %c1 : index
+            %pos2 = arith.addi %pos, %c2 : index
+            %pos3 = arith.addi %pos, %c3 : index
+            memref.store %b0, %out[%pos] : memref<?xi8>
+            memref.store %b1, %out[%pos1] : memref<?xi8>
+            memref.store %b2, %out[%pos2] : memref<?xi8>
+            memref.store %b3, %out[%pos3] : memref<?xi8>
+            %advanced = arith.addi %pos, %c4 : index
+            scf.yield %advanced : index
+          }
+          scf.yield %inner3 : index
+        }
+        scf.yield %inner2 : index
+      }
+      scf.yield %next : index
+    }
+    func.return
   }
 
   memref.global "private" constant @__ly_print_end : memref<1xi8> = dense<[10]>
@@ -4327,8 +4755,7 @@ module attributes {
   // dispatch / emitter desugar) because it needs per-value evidence.
   func.func @LyUnicode_PrintLine(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) attributes {ly.runtime.builtin = "print", ly.runtime.builtin_lowering = "method_sink", ly.runtime.builtin_method = "__repr__", ly.runtime.builtin_sink_contract = "builtins.str", ly.runtime.contract = "builtins.str", ly.runtime.primitive = "print_line", ly.runtime.result_contract = "types.NoneType"} {
     %stdout = arith.constant 1 : i32
-    %length = func.call @LyUnicode_Length(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
-    func.call @LyHost_WriteBytes(%stdout, %bytes, %length) : (i32, memref<?xi8>, i64) -> ()
+    func.call @LyUnicode_Print(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> ()
     %end_static = memref.get_global @__ly_print_end : memref<1xi8>
     %end = memref.cast %end_static : memref<1xi8> to memref<?xi8>
     %end_length = arith.constant 1 : i64
@@ -4338,8 +4765,12 @@ module attributes {
 
   func.func @LyUnicode_Print(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) attributes {ly.runtime.contract = "builtins.str", ly.runtime.primitive = "print"} {
     %stdout = arith.constant 1 : i32
-    %length = func.call @LyUnicode_Length(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
-    func.call @LyHost_WriteBytes(%stdout, %bytes, %length) : (i32, memref<?xi8>, i64) -> ()
+    %length = func.call @__ly_unicode_utf8_length(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %length_index = arith.index_cast %length : i64 to index
+    %buffer = memref.alloc(%length_index) : memref<?xi8>
+    func.call @__ly_unicode_utf8_fill(%header, %bytes, %buffer) : (memref<2xi64>, memref<?xi8>, memref<?xi8>) -> ()
+    func.call @LyHost_WriteBytes(%stdout, %buffer, %length) : (i32, memref<?xi8>, i64) -> ()
+    memref.dealloc %buffer : memref<?xi8>
     func.return
   }
 
@@ -4857,6 +5288,12 @@ module attributes {
 
   // Probe for a str key among the occupied slots (0..len-1; no deletion
   // surface). Returns the slot index or -1.
+  // The probe key arrives as raw (pointer, byte length) words from the
+  // C++ lowering, so unlike the set matcher this cannot also compare the
+  // adaptive-width character width: two strings of different widths with
+  // identical code-unit bytes (latin-1 "\x01\x01" vs UCS-2 U+0101)
+  // collide here. Fixing this needs the find_slot ABI to carry the probe
+  // header (planned with the Wave 1 hash-based dict rework).
   func.func @LyDict_FindSlot(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %keys: memref<?xi64>, %values: memref<?xi64>, %present: memref<?xi64>, %key_ptr: i64, %key_len: i64) -> i64 attributes {ly.runtime.contract = "builtins.dict", ly.runtime.primitive = "find_slot"} {
     %one = arith.constant 1 : i64
     %minus_one = arith.constant -1 : i64
@@ -5312,7 +5749,24 @@ module attributes {
           %slot_len = memref.load %items[%slot_len_index] : memref<?xi64>
           %box_ptr = memref.load %box[%c5] : memref<16xi64>
           %box_len = memref.load %box[%c10] : memref<16xi64>
-          %eq = func.call @raw_bytes_equal(%slot_ptr, %slot_len, %box_ptr, %box_len) : (i64, i64, i64, i64) -> i1
+          // Adaptive-width strs must also match character width: distinct
+          // strings of different widths can share the same code-unit bytes
+          // (latin-1 "\x00\x01" vs UCS-2 U+0100). The width word sits at
+          // header+16; both handles carry the header pointer at word 2.
+          %c2_slot = arith.constant 2 : index
+          %slot_header_index = arith.addi %base, %c2_slot : index
+          %slot_header_ptr = memref.load %items[%slot_header_index] : memref<?xi64>
+          %box_header_ptr = memref.load %box[%c2_slot] : memref<16xi64>
+          %sixteen = arith.constant 16 : i64
+          %slot_width_addr = arith.addi %slot_header_ptr, %sixteen : i64
+          %box_width_addr = arith.addi %box_header_ptr, %sixteen : i64
+          %slot_width_ptr = llvm.inttoptr %slot_width_addr : i64 to !llvm.ptr
+          %box_width_ptr = llvm.inttoptr %box_width_addr : i64 to !llvm.ptr
+          %slot_width = llvm.load %slot_width_ptr : !llvm.ptr -> i64
+          %box_width = llvm.load %box_width_ptr : !llvm.ptr -> i64
+          %width_eq = arith.cmpi eq, %slot_width, %box_width : i64
+          %bytes_eq = func.call @raw_bytes_equal(%slot_ptr, %slot_len, %box_ptr, %box_len) : (i64, i64, i64, i64) -> i1
+          %eq = arith.andi %width_eq, %bytes_eq : i1
           scf.yield %eq : i1
         } else {
           scf.yield %false : i1
