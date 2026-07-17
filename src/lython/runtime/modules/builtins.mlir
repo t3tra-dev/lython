@@ -201,13 +201,21 @@ module attributes {
     ly.typing.base_args = [[!py.contract<"builtins.str">], []],
     method_names = ["__new__", "__len__", "__iter__", "__getitem__", "__add__",
                     "__contains__", "__eq__", "__lt__", "__le__", "__gt__",
-                    "__ge__", "join", "startswith", "endswith", "__repr__", "__str__", "__ne__",
-                    "encode",
-                    "upper", "lower", "casefold", "title", "capitalize",
-                    "swapcase",
-                    "isalpha", "isspace", "isdecimal", "isdigit", "isnumeric",
-                    "isupper", "islower", "isprintable", "istitle", "isalnum",
-                    "isidentifier", "isascii"],
+                    "__ge__", "join", "startswith", "startswith", "startswith",
+                    "endswith", "endswith", "endswith", "__repr__", "__str__",
+                    "__ne__", "encode", "upper", "lower", "casefold", "title",
+                    "capitalize", "swapcase", "isalpha", "isspace", "isdecimal",
+                    "isdigit", "isnumeric", "isupper", "islower", "isprintable",
+                    "istitle", "isalnum", "isidentifier", "isascii", "find",
+                    "find", "find", "rfind", "rfind", "rfind", "index", "index",
+                    "index", "rindex", "rindex", "rindex", "count", "count",
+                    "count", "replace", "replace", "strip", "strip", "lstrip",
+                    "lstrip", "rstrip", "rstrip", "removeprefix",
+                    "removesuffix", "center", "center", "ljust", "ljust",
+                    "rjust", "rjust", "zfill", "expandtabs", "expandtabs",
+                    "__mul__", "split", "split", "split", "rsplit", "rsplit",
+                    "rsplit", "splitlines", "splitlines", "partition",
+                    "rpartition"],
     method_contracts = [
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.str">>, !py.contract<"builtins.object">] -> [!py.self]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.int">]>,
@@ -222,7 +230,11 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.protocol<"Iterable", [!py.contract<"builtins.str">]>] -> [!py.contract<"builtins.str">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">, !py.contract<"builtins.int">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">, !py.contract<"builtins.int">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.object">] -> [!py.contract<"builtins.bool">]>,
@@ -244,18 +256,71 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.bool">]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.bool">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.int">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">, !py.contract<"builtins.int">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.int">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">, !py.contract<"builtins.int">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.int">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">, !py.contract<"builtins.int">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.int">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">, !py.contract<"builtins.int">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.int">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">, !py.contract<"builtins.int">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">, !py.contract<"builtins.str">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.int">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.int">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.int">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.list", [!py.contract<"builtins.str">]>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.list", [!py.contract<"builtins.str">]>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.list", [!py.contract<"builtins.str">]>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.list", [!py.contract<"builtins.str">]>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.list", [!py.contract<"builtins.str">]>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.list", [!py.contract<"builtins.str">]>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.list", [!py.contract<"builtins.str">]>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.bool">] -> [!py.contract<"builtins.list", [!py.contract<"builtins.str">]>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.tuple", [!py.contract<"builtins.str">, !py.contract<"builtins.str">, !py.contract<"builtins.str">]>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.tuple", [!py.contract<"builtins.str">, !py.contract<"builtins.str">, !py.contract<"builtins.str">]>]>
     ],
     method_kinds = ["classmethod", "instance", "instance", "instance",
-                    "instance", "instance", "instance", "instance",
-                    "instance", "instance", "instance", "instance",
-                    "instance", "instance", "instance", "instance", "instance",
-                    "instance",
-                    "instance", "instance", "instance", "instance", "instance",
-                    "instance",
                     "instance", "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance",
-                    "instance", "instance"]
+                    "instance", "instance", "instance", "instance", "instance",
+                    "instance", "instance", "instance", "instance", "instance",
+                    "instance", "instance", "instance", "instance", "instance",
+                    "instance", "instance", "instance", "instance", "instance",
+                    "instance", "instance", "instance", "instance", "instance",
+                    "instance", "instance", "instance", "instance", "instance",
+                    "instance", "instance", "instance", "instance", "instance",
+                    "instance", "instance", "instance", "instance", "instance",
+                    "instance", "instance", "instance", "instance", "instance",
+                    "instance", "instance", "instance", "instance", "instance",
+                    "instance", "instance", "instance", "instance", "instance",
+                    "instance", "instance", "instance", "instance", "instance",
+                    "instance", "instance", "instance", "instance", "instance",
+                    "instance", "instance", "instance", "instance", "instance",
+                    "instance"]
   } {}
 
   py.class @str_iterator attributes {
@@ -5210,6 +5275,845 @@ module attributes {
       func.call @__ly_unicode_put(%bytes, %width, %dest, %cp) : (memref<?xi8>, i64, index, i64) -> ()
     }
     func.return %header, %bytes : memref<2xi64>, memref<?xi8>
+  }
+
+
+  // ===== str search / comparison methods (Wave 1) =====
+
+  // 7-field UCD ctype accessor (defined in the generated _ucd.mlir).
+  func.func private @__ly_ucd_ctype(%cp: i64) -> (i64, i64, i64, i64, i64, i64, i64)
+
+  func.func private @__ly_unicode_cp_is_space(%cp: i64) -> i1 {
+    %zero = arith.constant 0 : i64
+    %space_bit = arith.constant 16 : i64
+    %u, %l, %f, %t, %dec, %dig, %flags = func.call @__ly_ucd_ctype(%cp) : (i64) -> (i64, i64, i64, i64, i64, i64, i64)
+    %masked = arith.andi %flags, %space_bit : i64
+    %is_space = arith.cmpi ne, %masked, %zero : i64
+    func.return %is_space : i1
+  }
+
+  // "substring not found"
+  memref.global "private" constant @__ly_unicode_msg_substring_not_found : memref<19xi8> = dense<[115, 117, 98, 115, 116, 114, 105, 110, 103, 32, 110, 111, 116, 32, 102, 111, 117, 110, 100]>
+  // "The fill character must be exactly one character long"
+  memref.global "private" constant @__ly_unicode_msg_bad_fill : memref<53xi8> = dense<[84, 104, 101, 32, 102, 105, 108, 108, 32, 99, 104, 97, 114, 97, 99, 116, 101, 114, 32, 109, 117, 115, 116, 32, 98, 101, 32, 101, 120, 97, 99, 116, 108, 121, 32, 111, 110, 101, 32, 99, 104, 97, 114, 97, 99, 116, 101, 114, 32, 108, 111, 110, 103]>
+
+  func.func private @__ly_unicode_raise(%class_id: i64, %message: memref<?xi8>, %length: i64) {
+    %start = arith.constant 0 : index
+    %exception:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%message, %start, %length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    func.call @LyEH_ThrowException(%initialized#0, %initialized#1, %initialized#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    func.return
+  }
+
+  // CPython ADJUST_INDICES: negative indices count from the end (clamped to
+  // 0), the end clamps to the length, and the start deliberately does NOT
+  // clamp downward to the length -- find("", past-the-end) must miss.
+  func.func private @__ly_unicode_adjust_range(%len: i64, %start_raw: i64, %end_raw: i64) -> (i64, i64) {
+    %zero = arith.constant 0 : i64
+    %start_neg = arith.cmpi slt, %start_raw, %zero : i64
+    %start_shift = arith.addi %start_raw, %len : i64
+    %start_from_end = arith.maxsi %start_shift, %zero : i64
+    %start = arith.select %start_neg, %start_from_end, %start_raw : i64
+    %end_over = arith.cmpi sgt, %end_raw, %len : i64
+    %end_neg = arith.cmpi slt, %end_raw, %zero : i64
+    %end_shift = arith.addi %end_raw, %len : i64
+    %end_from_end = arith.maxsi %end_shift, %zero : i64
+    %end_in = arith.select %end_neg, %end_from_end, %end_raw : i64
+    %end = arith.select %end_over, %len, %end_in : i64
+    func.return %start, %end : i64, i64
+  }
+
+  // s[si .. si+n) == t[ti .. ti+n), by code point.
+  func.func private @__ly_unicode_match_at(%s_bytes: memref<?xi8>, %s_width: i64, %si: index, %t_bytes: memref<?xi8>, %t_width: i64, %ti: index, %n: index) -> i1 {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %true_bit = arith.constant true
+    %all = scf.for %j = %c0 to %n step %c1 iter_args(%acc = %true_bit) -> (i1) {
+      %sj = arith.addi %si, %j : index
+      %tj = arith.addi %ti, %j : index
+      %scp = func.call @__ly_unicode_get(%s_bytes, %s_width, %sj) : (memref<?xi8>, i64, index) -> i64
+      %tcp = func.call @__ly_unicode_get(%t_bytes, %t_width, %tj) : (memref<?xi8>, i64, index) -> i64
+      %eq = arith.cmpi eq, %scp, %tcp : i64
+      %next = arith.andi %acc, %eq : i1
+      scf.yield %next : i1
+    }
+    func.return %all : i1
+  }
+
+  // First (or, %reverse, last) index in [start, end-n] where the needle
+  // matches; -1 when the window is empty or nothing matches. Indices are
+  // pre-adjusted code-point positions.
+  func.func private @__ly_unicode_find_core(%s_bytes: memref<?xi8>, %s_width: i64, %t_bytes: memref<?xi8>, %t_width: i64, %start: i64, %end: i64, %n: i64, %reverse: i1) -> i64 {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %minus_one = arith.constant -1 : i64
+    %limit = arith.subi %end, %n : i64
+    %viable = arith.cmpi sle, %start, %limit : i64
+    %found = scf.if %viable -> (i64) {
+      %n_index = arith.index_cast %n : i64 to index
+      %span = arith.subi %limit, %start : i64
+      %positions_i64 = arith.addi %span, %one : i64
+      %positions = arith.index_cast %positions_i64 : i64 to index
+      %scan = scf.for %k = %c0 to %positions step %c1 iter_args(%acc = %minus_one) -> (i64) {
+        %k_i64 = arith.index_cast %k : index to i64
+        %fwd = arith.addi %start, %k_i64 : i64
+        %rev = arith.subi %limit, %k_i64 : i64
+        %pos = arith.select %reverse, %rev, %fwd : i64
+        %pos_index = arith.index_cast %pos : i64 to index
+        %ti = arith.constant 0 : index
+        %eq = func.call @__ly_unicode_match_at(%s_bytes, %s_width, %pos_index, %t_bytes, %t_width, %ti, %n_index) : (memref<?xi8>, i64, index, memref<?xi8>, i64, index, index) -> i1
+        %not_yet = arith.cmpi eq, %acc, %minus_one : i64
+        %take = arith.andi %eq, %not_yet : i1
+        %next = arith.select %take, %pos, %acc : i64
+        scf.yield %next : i64
+      }
+      scf.yield %scan : i64
+    } else {
+      scf.yield %minus_one : i64
+    }
+    func.return %found : i64
+  }
+
+  func.func @LyUnicode_StartsWith(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %prefix_header: memref<2xi64> {ly.ownership.object_header}, %prefix_bytes: memref<?xi8>, %start_raw: i64 {ly.runtime.default_i64 = 0 : i64}, %end_raw: i64 {ly.runtime.default_i64 = 9223372036854775807 : i64}) -> i1 attributes {ly.runtime.contract = "builtins.str", ly.runtime.method = "startswith"} {
+    %len = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %start, %end = func.call @__ly_unicode_adjust_range(%len, %start_raw, %end_raw) : (i64, i64, i64) -> (i64, i64)
+    %n = func.call @__ly_unicode_count(%prefix_header, %prefix_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %tail = arith.addi %start, %n : i64
+    %fits = arith.cmpi sle, %tail, %end : i64
+    %result = scf.if %fits -> (i1) {
+      %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+      %prefix_width = func.call @__ly_unicode_width(%prefix_header) : (memref<2xi64>) -> i64
+      %si = arith.index_cast %start : i64 to index
+      %ti = arith.constant 0 : index
+      %n_index = arith.index_cast %n : i64 to index
+      %eq = func.call @__ly_unicode_match_at(%bytes, %width, %si, %prefix_bytes, %prefix_width, %ti, %n_index) : (memref<?xi8>, i64, index, memref<?xi8>, i64, index, index) -> i1
+      scf.yield %eq : i1
+    } else {
+      %false_bit = arith.constant false
+      scf.yield %false_bit : i1
+    }
+    func.return %result : i1
+  }
+
+  func.func @LyUnicode_EndsWith(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %suffix_header: memref<2xi64> {ly.ownership.object_header}, %suffix_bytes: memref<?xi8>, %start_raw: i64 {ly.runtime.default_i64 = 0 : i64}, %end_raw: i64 {ly.runtime.default_i64 = 9223372036854775807 : i64}) -> i1 attributes {ly.runtime.contract = "builtins.str", ly.runtime.method = "endswith"} {
+    %len = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %start, %end = func.call @__ly_unicode_adjust_range(%len, %start_raw, %end_raw) : (i64, i64, i64) -> (i64, i64)
+    %n = func.call @__ly_unicode_count(%suffix_header, %suffix_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %pos = arith.subi %end, %n : i64
+    %fits = arith.cmpi sge, %pos, %start : i64
+    %result = scf.if %fits -> (i1) {
+      %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+      %suffix_width = func.call @__ly_unicode_width(%suffix_header) : (memref<2xi64>) -> i64
+      %si = arith.index_cast %pos : i64 to index
+      %ti = arith.constant 0 : index
+      %n_index = arith.index_cast %n : i64 to index
+      %eq = func.call @__ly_unicode_match_at(%bytes, %width, %si, %suffix_bytes, %suffix_width, %ti, %n_index) : (memref<?xi8>, i64, index, memref<?xi8>, i64, index, index) -> i1
+      scf.yield %eq : i1
+    } else {
+      %false_bit = arith.constant false
+      scf.yield %false_bit : i1
+    }
+    func.return %result : i1
+  }
+
+  // Shared find/rfind entry: adjusted range, then the linear core scan.
+  func.func private @__ly_unicode_find_method(%header: memref<2xi64>, %bytes: memref<?xi8>, %sub_header: memref<2xi64>, %sub_bytes: memref<?xi8>, %start_raw: i64, %end_raw: i64, %reverse: i1) -> i64 {
+    %len = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %start, %end = func.call @__ly_unicode_adjust_range(%len, %start_raw, %end_raw) : (i64, i64, i64) -> (i64, i64)
+    %n = func.call @__ly_unicode_count(%sub_header, %sub_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %sub_width = func.call @__ly_unicode_width(%sub_header) : (memref<2xi64>) -> i64
+    %found = func.call @__ly_unicode_find_core(%bytes, %width, %sub_bytes, %sub_width, %start, %end, %n, %reverse) : (memref<?xi8>, i64, memref<?xi8>, i64, i64, i64, i64, i1) -> i64
+    func.return %found : i64
+  }
+
+  func.func @LyUnicode_Find(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %sub_header: memref<2xi64> {ly.ownership.object_header}, %sub_bytes: memref<?xi8>, %start_raw: i64 {ly.runtime.default_i64 = 0 : i64}, %end_raw: i64 {ly.runtime.default_i64 = 9223372036854775807 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "find", ly.runtime.result_contract = "builtins.int"} {
+    %false_bit = arith.constant false
+    %found = func.call @__ly_unicode_find_method(%header, %bytes, %sub_header, %sub_bytes, %start_raw, %end_raw, %false_bit) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>, i64, i64, i1) -> i64
+    %result:3 = func.call @LyLong_FromI64(%found) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi32>
+  }
+
+  func.func @LyUnicode_RFind(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %sub_header: memref<2xi64> {ly.ownership.object_header}, %sub_bytes: memref<?xi8>, %start_raw: i64 {ly.runtime.default_i64 = 0 : i64}, %end_raw: i64 {ly.runtime.default_i64 = 9223372036854775807 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "rfind", ly.runtime.result_contract = "builtins.int"} {
+    %true_bit = arith.constant true
+    %found = func.call @__ly_unicode_find_method(%header, %bytes, %sub_header, %sub_bytes, %start_raw, %end_raw, %true_bit) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>, i64, i64, i1) -> i64
+    %result:3 = func.call @LyLong_FromI64(%found) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi32>
+  }
+
+  func.func private @__ly_unicode_index_method(%header: memref<2xi64>, %bytes: memref<?xi8>, %sub_header: memref<2xi64>, %sub_bytes: memref<?xi8>, %start_raw: i64, %end_raw: i64, %reverse: i1) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0]} {
+    %zero = arith.constant 0 : i64
+    %found = func.call @__ly_unicode_find_method(%header, %bytes, %sub_header, %sub_bytes, %start_raw, %end_raw, %reverse) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>, i64, i64, i1) -> i64
+    %missing = arith.cmpi slt, %found, %zero : i64
+    scf.if %missing {
+      %class_id = arith.constant 53 : i64
+      %length = arith.constant 19 : i64
+      %static = memref.get_global @__ly_unicode_msg_substring_not_found : memref<19xi8>
+      %message = memref.cast %static : memref<19xi8> to memref<?xi8>
+      func.call @__ly_unicode_raise(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    }
+    %result:3 = func.call @LyLong_FromI64(%found) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi32>
+  }
+
+  func.func @LyUnicode_Index(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %sub_header: memref<2xi64> {ly.ownership.object_header}, %sub_bytes: memref<?xi8>, %start_raw: i64 {ly.runtime.default_i64 = 0 : i64}, %end_raw: i64 {ly.runtime.default_i64 = 9223372036854775807 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "index", ly.runtime.result_contract = "builtins.int"} {
+    %false_bit = arith.constant false
+    %result:3 = func.call @__ly_unicode_index_method(%header, %bytes, %sub_header, %sub_bytes, %start_raw, %end_raw, %false_bit) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>, i64, i64, i1) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi32>
+  }
+
+  func.func @LyUnicode_RIndex(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %sub_header: memref<2xi64> {ly.ownership.object_header}, %sub_bytes: memref<?xi8>, %start_raw: i64 {ly.runtime.default_i64 = 0 : i64}, %end_raw: i64 {ly.runtime.default_i64 = 9223372036854775807 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "rindex", ly.runtime.result_contract = "builtins.int"} {
+    %true_bit = arith.constant true
+    %result:3 = func.call @__ly_unicode_index_method(%header, %bytes, %sub_header, %sub_bytes, %start_raw, %end_raw, %true_bit) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>, i64, i64, i1) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi32>
+  }
+
+  // Non-overlapping occurrence count in [start, end).
+  func.func @LyUnicode_CountSub(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %sub_header: memref<2xi64> {ly.ownership.object_header}, %sub_bytes: memref<?xi8>, %start_raw: i64 {ly.runtime.default_i64 = 0 : i64}, %end_raw: i64 {ly.runtime.default_i64 = 9223372036854775807 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "count", ly.runtime.result_contract = "builtins.int"} {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %len = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %start, %end = func.call @__ly_unicode_adjust_range(%len, %start_raw, %end_raw) : (i64, i64, i64) -> (i64, i64)
+    %n = func.call @__ly_unicode_count(%sub_header, %sub_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %is_empty = arith.cmpi eq, %n, %zero : i64
+    %total = scf.if %is_empty -> (i64) {
+      %span = arith.subi %end, %start : i64
+      %viable = arith.cmpi sge, %span, %zero : i64
+      %hits = arith.addi %span, %one : i64
+      %count = arith.select %viable, %hits, %zero : i64
+      scf.yield %count : i64
+    } else {
+      %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+      %sub_width = func.call @__ly_unicode_width(%sub_header) : (memref<2xi64>) -> i64
+      %n_index = arith.index_cast %n : i64 to index
+      %scan:2 = scf.while (%pos = %start, %count = %zero) : (i64, i64) -> (i64, i64) {
+        %tail = arith.addi %pos, %n : i64
+        %more = arith.cmpi sle, %tail, %end : i64
+        scf.condition(%more) %pos, %count : i64, i64
+      } do {
+      ^bb0(%pos: i64, %count: i64):
+        %pos_index = arith.index_cast %pos : i64 to index
+        %ti = arith.constant 0 : index
+        %eq = func.call @__ly_unicode_match_at(%bytes, %width, %pos_index, %sub_bytes, %sub_width, %ti, %n_index) : (memref<?xi8>, i64, index, memref<?xi8>, i64, index, index) -> i1
+        %skip = arith.select %eq, %n, %one : i64
+        %bump = arith.select %eq, %one, %zero : i64
+        %next_pos = arith.addi %pos, %skip : i64
+        %next_count = arith.addi %count, %bump : i64
+        scf.yield %next_pos, %next_count : i64, i64
+      }
+      scf.yield %scan#1 : i64
+    }
+    %result:3 = func.call @LyLong_FromI64(%total) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi32>
+  }
+
+
+  // ===== str slicing / transform methods (Wave 1) =====
+
+  // Copy of the code points [start, end). Every producer must re-scan for
+  // the widest code point: a canonical substring of a wide string can be
+  // narrower than its source (equality stays bytewise only if slices
+  // re-canonicalize).
+  func.func private @__ly_unicode_slice(%header: memref<2xi64>, %bytes: memref<?xi8>, %start: index, %end: index) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+    %c1 = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
+    %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %maxcp = scf.for %i = %start to %end step %c1 iter_args(%acc = %zero) -> (i64) {
+      %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
+      %bigger = arith.cmpi ugt, %cp, %acc : i64
+      %next = arith.select %bigger, %cp, %acc : i64
+      scf.yield %next : i64
+    }
+    %span = arith.subi %end, %start : index
+    %count = arith.index_cast %span : index to i64
+    %out_width = func.call @__ly_unicode_width_for(%maxcp) : (i64) -> i64
+    %out_header, %out_bytes = func.call @__ly_unicode_alloc(%count, %out_width) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
+    scf.for %i = %start to %end step %c1 {
+      %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
+      %dst = arith.subi %i, %start : index
+      func.call @__ly_unicode_put(%out_bytes, %out_width, %dst, %cp) : (memref<?xi8>, i64, index, i64) -> ()
+    }
+    func.return %out_header, %out_bytes : memref<2xi64>, memref<?xi8>
+  }
+
+  // Retained self, the CPython identity-return fast path (strip() with
+  // nothing to strip etc. still copies; only methods documented to return
+  // the receiver unchanged use this).
+  func.func private @__ly_unicode_retain_self(%header: memref<2xi64>, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+    %view = memref.cast %header : memref<2xi64> to memref<2xi64, strided<[1], offset: ?>>
+    func.call @Ly_IncRef(%view) : (memref<2xi64, strided<[1], offset: ?>>) -> ()
+    func.return %header, %bytes : memref<2xi64>, memref<?xi8>
+  }
+
+  // Membership of %cp in the chars string (linear: strip char sets are tiny).
+  func.func private @__ly_unicode_cp_in_str(%cp: i64, %t_bytes: memref<?xi8>, %t_width: i64, %t_count: index) -> i1 {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %false_bit = arith.constant false
+    %found = scf.for %j = %c0 to %t_count step %c1 iter_args(%acc = %false_bit) -> (i1) {
+      %tcp = func.call @__ly_unicode_get(%t_bytes, %t_width, %j) : (memref<?xi8>, i64, index) -> i64
+      %eq = arith.cmpi eq, %cp, %tcp : i64
+      %next = arith.ori %acc, %eq : i1
+      scf.yield %next : i1
+    }
+    func.return %found : i1
+  }
+
+  // Shared strip walk. %mode bit 1 = strip left, bit 2 = strip right.
+  // %use_chars false = Unicode whitespace (str.strip()); true = membership
+  // in the chars operand.
+  func.func private @__ly_unicode_strip_core(%header: memref<2xi64>, %bytes: memref<?xi8>, %mode: i64, %use_chars: i1, %ch_bytes: memref<?xi8>, %ch_width: i64, %ch_count: index) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %zero = arith.constant 0 : i64
+    %true_bit = arith.constant true
+    %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %count = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %count_index = arith.index_cast %count : i64 to index
+
+    %left_mask = arith.andi %mode, %one : i64
+    %strip_left = arith.cmpi ne, %left_mask, %zero : i64
+    %begin = scf.if %strip_left -> (index) {
+      %scan:2 = scf.while (%i = %c0, %go = %true_bit) : (index, i1) -> (index, i1) {
+        %more = arith.cmpi ult, %i, %count_index : index
+        %continue = arith.andi %more, %go : i1
+        scf.condition(%continue) %i, %go : index, i1
+      } do {
+      ^bb0(%i: index, %go: i1):
+        %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
+        %stripped = scf.if %use_chars -> (i1) {
+          %in = func.call @__ly_unicode_cp_in_str(%cp, %ch_bytes, %ch_width, %ch_count) : (i64, memref<?xi8>, i64, index) -> i1
+          scf.yield %in : i1
+        } else {
+          %sp = func.call @__ly_unicode_cp_is_space(%cp) : (i64) -> i1
+          scf.yield %sp : i1
+        }
+        %next = arith.addi %i, %c1 : index
+        %keep = arith.select %stripped, %next, %i : index
+        scf.yield %keep, %stripped : index, i1
+      }
+      scf.yield %scan#0 : index
+    } else {
+      scf.yield %c0 : index
+    }
+
+    %right_mask = arith.andi %mode, %two : i64
+    %strip_right = arith.cmpi ne, %right_mask, %zero : i64
+    %finish = scf.if %strip_right -> (index) {
+      %scan:2 = scf.while (%i = %count_index, %go = %true_bit) : (index, i1) -> (index, i1) {
+        %more = arith.cmpi ugt, %i, %begin : index
+        %continue = arith.andi %more, %go : i1
+        scf.condition(%continue) %i, %go : index, i1
+      } do {
+      ^bb0(%i: index, %go: i1):
+        %prev = arith.subi %i, %c1 : index
+        %cp = func.call @__ly_unicode_get(%bytes, %width, %prev) : (memref<?xi8>, i64, index) -> i64
+        %stripped = scf.if %use_chars -> (i1) {
+          %in = func.call @__ly_unicode_cp_in_str(%cp, %ch_bytes, %ch_width, %ch_count) : (i64, memref<?xi8>, i64, index) -> i1
+          scf.yield %in : i1
+        } else {
+          %sp = func.call @__ly_unicode_cp_is_space(%cp) : (i64) -> i1
+          scf.yield %sp : i1
+        }
+        %keep = arith.select %stripped, %prev, %i : index
+        scf.yield %keep, %stripped : index, i1
+      }
+      scf.yield %scan#0 : index
+    } else {
+      scf.yield %count_index : index
+    }
+
+    %out:2 = func.call @__ly_unicode_slice(%header, %bytes, %begin, %finish) : (memref<2xi64>, memref<?xi8>, index, index) -> (memref<2xi64>, memref<?xi8>)
+    func.return %out#0, %out#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func private @__ly_unicode_strip_ws(%header: memref<2xi64>, %bytes: memref<?xi8>, %mode: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+    %false_bit = arith.constant false
+    %one = arith.constant 1 : i64
+    %c0 = arith.constant 0 : index
+    %result:2 = func.call @__ly_unicode_strip_core(%header, %bytes, %mode, %false_bit, %bytes, %one, %c0) : (memref<2xi64>, memref<?xi8>, i64, i1, memref<?xi8>, i64, index) -> (memref<2xi64>, memref<?xi8>)
+    func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func private @__ly_unicode_strip_chars(%header: memref<2xi64>, %bytes: memref<?xi8>, %chars_header: memref<2xi64>, %chars_bytes: memref<?xi8>, %mode: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+    %true_bit = arith.constant true
+    %ch_width = func.call @__ly_unicode_width(%chars_header) : (memref<2xi64>) -> i64
+    %ch_count = func.call @__ly_unicode_count(%chars_header, %chars_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %ch_count_index = arith.index_cast %ch_count : i64 to index
+    %result:2 = func.call @__ly_unicode_strip_core(%header, %bytes, %mode, %true_bit, %chars_bytes, %ch_width, %ch_count_index) : (memref<2xi64>, memref<?xi8>, i64, i1, memref<?xi8>, i64, index) -> (memref<2xi64>, memref<?xi8>)
+    func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LyUnicode_Strip(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "strip", ly.runtime.result_contract = "builtins.str"} {
+    %mode = arith.constant 3 : i64
+    %result:2 = func.call @__ly_unicode_strip_ws(%header, %bytes, %mode) : (memref<2xi64>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LyUnicode_LStrip(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "lstrip", ly.runtime.result_contract = "builtins.str"} {
+    %mode = arith.constant 1 : i64
+    %result:2 = func.call @__ly_unicode_strip_ws(%header, %bytes, %mode) : (memref<2xi64>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LyUnicode_RStrip(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "rstrip", ly.runtime.result_contract = "builtins.str"} {
+    %mode = arith.constant 2 : i64
+    %result:2 = func.call @__ly_unicode_strip_ws(%header, %bytes, %mode) : (memref<2xi64>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LyUnicode_StripChars(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %chars_header: memref<2xi64> {ly.ownership.object_header}, %chars_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "strip", ly.runtime.result_contract = "builtins.str"} {
+    %mode = arith.constant 3 : i64
+    %result:2 = func.call @__ly_unicode_strip_chars(%header, %bytes, %chars_header, %chars_bytes, %mode) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LyUnicode_LStripChars(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %chars_header: memref<2xi64> {ly.ownership.object_header}, %chars_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "lstrip", ly.runtime.result_contract = "builtins.str"} {
+    %mode = arith.constant 1 : i64
+    %result:2 = func.call @__ly_unicode_strip_chars(%header, %bytes, %chars_header, %chars_bytes, %mode) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LyUnicode_RStripChars(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %chars_header: memref<2xi64> {ly.ownership.object_header}, %chars_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "rstrip", ly.runtime.result_contract = "builtins.str"} {
+    %mode = arith.constant 2 : i64
+    %result:2 = func.call @__ly_unicode_strip_chars(%header, %bytes, %chars_header, %chars_bytes, %mode) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LyUnicode_RemovePrefix(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %prefix_header: memref<2xi64> {ly.ownership.object_header}, %prefix_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "removeprefix", ly.runtime.result_contract = "builtins.str"} {
+    %c0 = arith.constant 0 : index
+    %len = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %n = func.call @__ly_unicode_count(%prefix_header, %prefix_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %fits = arith.cmpi sle, %n, %len : i64
+    %matched = scf.if %fits -> (i1) {
+      %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+      %pwidth = func.call @__ly_unicode_width(%prefix_header) : (memref<2xi64>) -> i64
+      %n_index = arith.index_cast %n : i64 to index
+      %eq = func.call @__ly_unicode_match_at(%bytes, %width, %c0, %prefix_bytes, %pwidth, %c0, %n_index) : (memref<?xi8>, i64, index, memref<?xi8>, i64, index, index) -> i1
+      scf.yield %eq : i1
+    } else {
+      %false_bit = arith.constant false
+      scf.yield %false_bit : i1
+    }
+    %result:2 = scf.if %matched -> (memref<2xi64>, memref<?xi8>) {
+      %n_index = arith.index_cast %n : i64 to index
+      %len_index = arith.index_cast %len : i64 to index
+      %sliced:2 = func.call @__ly_unicode_slice(%header, %bytes, %n_index, %len_index) : (memref<2xi64>, memref<?xi8>, index, index) -> (memref<2xi64>, memref<?xi8>)
+      scf.yield %sliced#0, %sliced#1 : memref<2xi64>, memref<?xi8>
+    } else {
+      %kept:2 = func.call @__ly_unicode_retain_self(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      scf.yield %kept#0, %kept#1 : memref<2xi64>, memref<?xi8>
+    }
+    func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LyUnicode_RemoveSuffix(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %suffix_header: memref<2xi64> {ly.ownership.object_header}, %suffix_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "removesuffix", ly.runtime.result_contract = "builtins.str"} {
+    %c0 = arith.constant 0 : index
+    %zero = arith.constant 0 : i64
+    %len = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %n = func.call @__ly_unicode_count(%suffix_header, %suffix_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %pos = arith.subi %len, %n : i64
+    %nonempty = arith.cmpi sgt, %n, %zero : i64
+    %fits = arith.cmpi sge, %pos, %zero : i64
+    %check = arith.andi %nonempty, %fits : i1
+    %matched = scf.if %check -> (i1) {
+      %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+      %swidth = func.call @__ly_unicode_width(%suffix_header) : (memref<2xi64>) -> i64
+      %n_index = arith.index_cast %n : i64 to index
+      %pos_index = arith.index_cast %pos : i64 to index
+      %eq = func.call @__ly_unicode_match_at(%bytes, %width, %pos_index, %suffix_bytes, %swidth, %c0, %n_index) : (memref<?xi8>, i64, index, memref<?xi8>, i64, index, index) -> i1
+      scf.yield %eq : i1
+    } else {
+      %false_bit = arith.constant false
+      scf.yield %false_bit : i1
+    }
+    %result:2 = scf.if %matched -> (memref<2xi64>, memref<?xi8>) {
+      %pos_index = arith.index_cast %pos : i64 to index
+      %sliced:2 = func.call @__ly_unicode_slice(%header, %bytes, %c0, %pos_index) : (memref<2xi64>, memref<?xi8>, index, index) -> (memref<2xi64>, memref<?xi8>)
+      scf.yield %sliced#0, %sliced#1 : memref<2xi64>, memref<?xi8>
+    } else {
+      %kept:2 = func.call @__ly_unicode_retain_self(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      scf.yield %kept#0, %kept#1 : memref<2xi64>, memref<?xi8>
+    }
+    func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  // str.replace via the unified walk (i <= len when old is empty, so the
+  // trailing insertion happens; a match consumes old and suppresses the
+  // char emit). Pass 1 measures (count, widest); pass 2 writes.
+  func.func @LyUnicode_Replace(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %old_header: memref<2xi64> {ly.ownership.object_header}, %old_bytes: memref<?xi8>, %new_header: memref<2xi64> {ly.ownership.object_header}, %new_bytes: memref<?xi8>, %limit: i64 {ly.runtime.default_i64 = -1 : i64}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "replace", ly.runtime.result_contract = "builtins.str"} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %old_width = func.call @__ly_unicode_width(%old_header) : (memref<2xi64>) -> i64
+    %new_width = func.call @__ly_unicode_width(%new_header) : (memref<2xi64>) -> i64
+    %len = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %old_n = func.call @__ly_unicode_count(%old_header, %old_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %new_n = func.call @__ly_unicode_count(%new_header, %new_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %len_index = arith.index_cast %len : i64 to index
+    %old_n_index = arith.index_cast %old_n : i64 to index
+    %new_n_index = arith.index_cast %new_n : i64 to index
+    %new_max = scf.for %j = %c0 to %new_n_index step %c1 iter_args(%acc = %zero) -> (i64) {
+      %cp = func.call @__ly_unicode_get(%new_bytes, %new_width, %j) : (memref<?xi8>, i64, index) -> i64
+      %bigger = arith.cmpi ugt, %cp, %acc : i64
+      %next = arith.select %bigger, %cp, %acc : i64
+      scf.yield %next : i64
+    }
+    %old_empty = arith.cmpi eq, %old_n, %zero : i64
+    %bound = scf.if %old_empty -> (i64) {
+      %plus = arith.addi %len, %one : i64
+      scf.yield %plus : i64
+    } else {
+      scf.yield %len : i64
+    }
+
+    %measure:4 = scf.while (%i = %zero, %rem = %limit, %total = %zero, %maxcp = %zero) : (i64, i64, i64, i64) -> (i64, i64, i64, i64) {
+      %more = arith.cmpi slt, %i, %bound : i64
+      scf.condition(%more) %i, %rem, %total, %maxcp : i64, i64, i64, i64
+    } do {
+    ^bb0(%i: i64, %rem: i64, %total: i64, %maxcp: i64):
+      %has_budget = arith.cmpi ne, %rem, %zero : i64
+      %tail = arith.addi %i, %old_n : i64
+      %in_range = arith.cmpi sle, %tail, %len : i64
+      %viable = arith.andi %has_budget, %in_range : i1
+      %matched = scf.if %viable -> (i1) {
+        %i_index = arith.index_cast %i : i64 to index
+        %eq = func.call @__ly_unicode_match_at(%bytes, %width, %i_index, %old_bytes, %old_width, %c0, %old_n_index) : (memref<?xi8>, i64, index, memref<?xi8>, i64, index, index) -> i1
+        scf.yield %eq : i1
+      } else {
+        %false_bit = arith.constant false
+        scf.yield %false_bit : i1
+      }
+      %old_nonempty = arith.cmpi sgt, %old_n, %zero : i64
+      %skip_char = arith.andi %matched, %old_nonempty : i1
+      %in_str = arith.cmpi slt, %i, %len : i64
+      %true_a = arith.constant true
+      %not_skip = arith.xori %skip_char, %true_a : i1
+      %emit_char = arith.andi %in_str, %not_skip : i1
+      %new_contrib = arith.select %matched, %new_n, %zero : i64
+      %char_contrib = arith.select %emit_char, %one, %zero : i64
+      %next_total_a = arith.addi %total, %new_contrib : i64
+      %next_total = arith.addi %next_total_a, %char_contrib : i64
+      %match_max = arith.select %matched, %new_max, %zero : i64
+      %cp = scf.if %emit_char -> (i64) {
+        %i_index = arith.index_cast %i : i64 to index
+        %value = func.call @__ly_unicode_get(%bytes, %width, %i_index) : (memref<?xi8>, i64, index) -> i64
+        scf.yield %value : i64
+      } else {
+        scf.yield %zero : i64
+      }
+      %m1 = arith.maxui %maxcp, %match_max : i64
+      %next_max = arith.maxui %m1, %cp : i64
+      %stride = arith.select %skip_char, %old_n, %one : i64
+      %next_i = arith.addi %i, %stride : i64
+      %dec = arith.select %matched, %one, %zero : i64
+      %next_rem = arith.subi %rem, %dec : i64
+      scf.yield %next_i, %next_rem, %next_total, %next_max : i64, i64, i64, i64
+    }
+
+    %out_width = func.call @__ly_unicode_width_for(%measure#3) : (i64) -> i64
+    %out_header, %out_bytes = func.call @__ly_unicode_alloc(%measure#2, %out_width) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
+
+    %write:3 = scf.while (%i = %zero, %rem = %limit, %pos = %c0) : (i64, i64, index) -> (i64, i64, index) {
+      %more = arith.cmpi slt, %i, %bound : i64
+      scf.condition(%more) %i, %rem, %pos : i64, i64, index
+    } do {
+    ^bb0(%i: i64, %rem: i64, %pos: index):
+      %has_budget = arith.cmpi ne, %rem, %zero : i64
+      %tail = arith.addi %i, %old_n : i64
+      %in_range = arith.cmpi sle, %tail, %len : i64
+      %viable = arith.andi %has_budget, %in_range : i1
+      %matched = scf.if %viable -> (i1) {
+        %i_index = arith.index_cast %i : i64 to index
+        %eq = func.call @__ly_unicode_match_at(%bytes, %width, %i_index, %old_bytes, %old_width, %c0, %old_n_index) : (memref<?xi8>, i64, index, memref<?xi8>, i64, index, index) -> i1
+        scf.yield %eq : i1
+      } else {
+        %false_bit = arith.constant false
+        scf.yield %false_bit : i1
+      }
+      %after_new = scf.if %matched -> (index) {
+        scf.for %j = %c0 to %new_n_index step %c1 {
+          %cp = func.call @__ly_unicode_get(%new_bytes, %new_width, %j) : (memref<?xi8>, i64, index) -> i64
+          %dst = arith.addi %pos, %j : index
+          func.call @__ly_unicode_put(%out_bytes, %out_width, %dst, %cp) : (memref<?xi8>, i64, index, i64) -> ()
+        }
+        %advanced = arith.addi %pos, %new_n_index : index
+        scf.yield %advanced : index
+      } else {
+        scf.yield %pos : index
+      }
+      %old_nonempty = arith.cmpi sgt, %old_n, %zero : i64
+      %skip_char = arith.andi %matched, %old_nonempty : i1
+      %in_str = arith.cmpi slt, %i, %len : i64
+      %true_b = arith.constant true
+      %not_skip = arith.xori %skip_char, %true_b : i1
+      %emit_char = arith.andi %in_str, %not_skip : i1
+      %after_char = scf.if %emit_char -> (index) {
+        %i_index = arith.index_cast %i : i64 to index
+        %cp = func.call @__ly_unicode_get(%bytes, %width, %i_index) : (memref<?xi8>, i64, index) -> i64
+        func.call @__ly_unicode_put(%out_bytes, %out_width, %after_new, %cp) : (memref<?xi8>, i64, index, i64) -> ()
+        %advanced = arith.addi %after_new, %c1 : index
+        scf.yield %advanced : index
+      } else {
+        scf.yield %after_new : index
+      }
+      %stride = arith.select %skip_char, %old_n, %one : i64
+      %next_i = arith.addi %i, %stride : i64
+      %dec = arith.select %matched, %one, %zero : i64
+      %next_rem = arith.subi %rem, %dec : i64
+      scf.yield %next_i, %next_rem, %after_char : i64, i64, index
+    }
+    func.return %out_header, %out_bytes : memref<2xi64>, memref<?xi8>
+  }
+
+  // center/ljust/rjust core: %place 0 = pad left (rjust), 1 = pad right
+  // (ljust), 2 = center with CPython's left = marg/2 + (marg & width & 1).
+  func.func private @__ly_unicode_pad(%header: memref<2xi64>, %bytes: memref<?xi8>, %target: i64, %fill_header: memref<2xi64>, %fill_bytes: memref<?xi8>, %place: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %fill_n = func.call @__ly_unicode_count(%fill_header, %fill_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %single = arith.cmpi eq, %fill_n, %one : i64
+    %true_bit = arith.constant true
+    %bad = arith.xori %single, %true_bit : i1
+    scf.if %bad {
+      %class_id = arith.constant 52 : i64
+      %length = arith.constant 53 : i64
+      %static = memref.get_global @__ly_unicode_msg_bad_fill : memref<53xi8>
+      %message = memref.cast %static : memref<53xi8> to memref<?xi8>
+      func.call @__ly_unicode_raise(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    }
+    %len = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %len_index_bound = arith.index_cast %len : i64 to index
+    %no_pad = arith.cmpi sle, %target, %len : i64
+    %result:2 = scf.if %no_pad -> (memref<2xi64>, memref<?xi8>) {
+      %kept:2 = func.call @__ly_unicode_retain_self(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      scf.yield %kept#0, %kept#1 : memref<2xi64>, memref<?xi8>
+    } else {
+      %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+      %fill_width = func.call @__ly_unicode_width(%fill_header) : (memref<2xi64>) -> i64
+      %fill_cp = func.call @__ly_unicode_get(%fill_bytes, %fill_width, %c0) : (memref<?xi8>, i64, index) -> i64
+      %self_max = scf.for %i = %c0 to %len_index_bound step %c1 iter_args(%acc = %zero) -> (i64) {
+        %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
+        %bigger = arith.cmpi ugt, %cp, %acc : i64
+        %next = arith.select %bigger, %cp, %acc : i64
+        scf.yield %next : i64
+      }
+      %maxcp = arith.maxui %self_max, %fill_cp : i64
+      %out_width = func.call @__ly_unicode_width_for(%maxcp) : (i64) -> i64
+      %out_header, %out_bytes = func.call @__ly_unicode_alloc(%target, %out_width) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
+      %margin = arith.subi %target, %len : i64
+      %half = arith.divsi %margin, %two : i64
+      %mw = arith.andi %margin, %target : i64
+      %mw1 = arith.andi %mw, %one : i64
+      %center_left = arith.addi %half, %mw1 : i64
+      %is_left = arith.cmpi eq, %place, %zero : i64
+      %is_right = arith.cmpi eq, %place, %one : i64
+      %center_or = arith.select %is_right, %zero, %center_left : i64
+      %left = arith.select %is_left, %margin, %center_or : i64
+      %left_index = arith.index_cast %left : i64 to index
+      %target_index = arith.index_cast %target : i64 to index
+      scf.for %i = %c0 to %target_index step %c1 {
+        func.call @__ly_unicode_put(%out_bytes, %out_width, %i, %fill_cp) : (memref<?xi8>, i64, index, i64) -> ()
+      }
+      scf.for %i = %c0 to %len_index_bound step %c1 {
+        %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
+        %dst = arith.addi %left_index, %i : index
+        func.call @__ly_unicode_put(%out_bytes, %out_width, %dst, %cp) : (memref<?xi8>, i64, index, i64) -> ()
+      }
+      scf.yield %out_header, %out_bytes : memref<2xi64>, memref<?xi8>
+    }
+    func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LyUnicode_RJust(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %target: i64, %fill_header: memref<2xi64> {ly.ownership.object_header, ly.runtime.default_str = " "}, %fill_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "rjust", ly.runtime.result_contract = "builtins.str"} {
+    %place = arith.constant 0 : i64
+    %result:2 = func.call @__ly_unicode_pad(%header, %bytes, %target, %fill_header, %fill_bytes, %place) : (memref<2xi64>, memref<?xi8>, i64, memref<2xi64>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LyUnicode_LJust(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %target: i64, %fill_header: memref<2xi64> {ly.ownership.object_header, ly.runtime.default_str = " "}, %fill_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "ljust", ly.runtime.result_contract = "builtins.str"} {
+    %place = arith.constant 1 : i64
+    %result:2 = func.call @__ly_unicode_pad(%header, %bytes, %target, %fill_header, %fill_bytes, %place) : (memref<2xi64>, memref<?xi8>, i64, memref<2xi64>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LyUnicode_Center(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %target: i64, %fill_header: memref<2xi64> {ly.ownership.object_header, ly.runtime.default_str = " "}, %fill_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "center", ly.runtime.result_contract = "builtins.str"} {
+    %place = arith.constant 2 : i64
+    %result:2 = func.call @__ly_unicode_pad(%header, %bytes, %target, %fill_header, %fill_bytes, %place) : (memref<2xi64>, memref<?xi8>, i64, memref<2xi64>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  // str.zfill: zero-pad on the left, keeping a leading sign in front.
+  func.func @LyUnicode_ZFill(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %target: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "zfill", ly.runtime.result_contract = "builtins.str"} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
+    %ascii_zero = arith.constant 48 : i64
+    %plus = arith.constant 43 : i64
+    %minus = arith.constant 45 : i64
+    %len = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %no_pad = arith.cmpi sle, %target, %len : i64
+    %result:2 = scf.if %no_pad -> (memref<2xi64>, memref<?xi8>) {
+      %kept:2 = func.call @__ly_unicode_retain_self(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      scf.yield %kept#0, %kept#1 : memref<2xi64>, memref<?xi8>
+    } else {
+      %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+      %len_index = arith.index_cast %len : i64 to index
+      %self_max = scf.for %i = %c0 to %len_index step %c1 iter_args(%acc = %zero) -> (i64) {
+        %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
+        %bigger = arith.cmpi ugt, %cp, %acc : i64
+        %next = arith.select %bigger, %cp, %acc : i64
+        scf.yield %next : i64
+      }
+      %maxcp = arith.maxui %self_max, %ascii_zero : i64
+      %out_width = func.call @__ly_unicode_width_for(%maxcp) : (i64) -> i64
+      %out_header, %out_bytes = func.call @__ly_unicode_alloc(%target, %out_width) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
+      %has_any = arith.cmpi sgt, %len, %zero : i64
+      %first = scf.if %has_any -> (i64) {
+        %cp = func.call @__ly_unicode_get(%bytes, %width, %c0) : (memref<?xi8>, i64, index) -> i64
+        scf.yield %cp : i64
+      } else {
+        scf.yield %zero : i64
+      }
+      %is_plus = arith.cmpi eq, %first, %plus : i64
+      %is_minus = arith.cmpi eq, %first, %minus : i64
+      %signed = arith.ori %is_plus, %is_minus : i1
+      %sign_len = arith.select %signed, %c1, %c0 : index
+      scf.if %signed {
+        func.call @__ly_unicode_put(%out_bytes, %out_width, %c0, %first) : (memref<?xi8>, i64, index, i64) -> ()
+      }
+      %margin = arith.subi %target, %len : i64
+      %margin_index = arith.index_cast %margin : i64 to index
+      %zeros_end = arith.addi %sign_len, %margin_index : index
+      scf.for %i = %sign_len to %zeros_end step %c1 {
+        func.call @__ly_unicode_put(%out_bytes, %out_width, %i, %ascii_zero) : (memref<?xi8>, i64, index, i64) -> ()
+      }
+      scf.for %i = %sign_len to %len_index step %c1 {
+        %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
+        %dst = arith.addi %margin_index, %i : index
+        func.call @__ly_unicode_put(%out_bytes, %out_width, %dst, %cp) : (memref<?xi8>, i64, index, i64) -> ()
+      }
+      scf.yield %out_header, %out_bytes : memref<2xi64>, memref<?xi8>
+    }
+    func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  // str.expandtabs: a tab advances to the next multiple of tabsize within
+  // the current line (\n and \r reset the column); tabsize <= 0 deletes
+  // tabs, matching CPython.
+  func.func @LyUnicode_ExpandTabs(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %tabsize: i64 {ly.runtime.default_i64 = 8 : i64}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "expandtabs", ly.runtime.result_contract = "builtins.str"} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %tab = arith.constant 9 : i64
+    %nl = arith.constant 10 : i64
+    %cr = arith.constant 13 : i64
+    %space = arith.constant 32 : i64
+    %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %len = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %len_index = arith.index_cast %len : i64 to index
+    %positive = arith.cmpi sgt, %tabsize, %zero : i64
+
+    %measure:3 = scf.for %i = %c0 to %len_index step %c1 iter_args(%total = %zero, %col = %zero, %maxcp = %zero) -> (i64, i64, i64) {
+      %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
+      %is_tab = arith.cmpi eq, %cp, %tab : i64
+      %step:3 = scf.if %is_tab -> (i64, i64, i64) {
+        %rem = scf.if %positive -> (i64) {
+          %m = arith.remsi %col, %tabsize : i64
+          %incr = arith.subi %tabsize, %m : i64
+          scf.yield %incr : i64
+        } else {
+          scf.yield %zero : i64
+        }
+        %fill_max = arith.cmpi sgt, %rem, %zero : i64
+        %contrib_max = arith.select %fill_max, %space, %zero : i64
+        %next_col = arith.addi %col, %rem : i64
+        scf.yield %rem, %next_col, %contrib_max : i64, i64, i64
+      } else {
+        %is_nl = arith.cmpi eq, %cp, %nl : i64
+        %is_cr = arith.cmpi eq, %cp, %cr : i64
+        %resets = arith.ori %is_nl, %is_cr : i1
+        %bumped = arith.addi %col, %one : i64
+        %next_col = arith.select %resets, %zero, %bumped : i64
+        scf.yield %one, %next_col, %cp : i64, i64, i64
+      }
+      %next_total = arith.addi %total, %step#0 : i64
+      %next_max = arith.maxui %maxcp, %step#2 : i64
+      scf.yield %next_total, %step#1, %next_max : i64, i64, i64
+    }
+
+    %out_width = func.call @__ly_unicode_width_for(%measure#2) : (i64) -> i64
+    %out_header, %out_bytes = func.call @__ly_unicode_alloc(%measure#0, %out_width) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
+
+    scf.for %i = %c0 to %len_index step %c1 iter_args(%pos = %c0, %col = %zero) -> (index, i64) {
+      %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
+      %is_tab = arith.cmpi eq, %cp, %tab : i64
+      %step:2 = scf.if %is_tab -> (index, i64) {
+        %rem = scf.if %positive -> (i64) {
+          %m = arith.remsi %col, %tabsize : i64
+          %incr = arith.subi %tabsize, %m : i64
+          scf.yield %incr : i64
+        } else {
+          scf.yield %zero : i64
+        }
+        %rem_index = arith.index_cast %rem : i64 to index
+        scf.for %j = %c0 to %rem_index step %c1 {
+          %dst = arith.addi %pos, %j : index
+          func.call @__ly_unicode_put(%out_bytes, %out_width, %dst, %space) : (memref<?xi8>, i64, index, i64) -> ()
+        }
+        %next_pos = arith.addi %pos, %rem_index : index
+        %next_col = arith.addi %col, %rem : i64
+        scf.yield %next_pos, %next_col : index, i64
+      } else {
+        func.call @__ly_unicode_put(%out_bytes, %out_width, %pos, %cp) : (memref<?xi8>, i64, index, i64) -> ()
+        %next_pos = arith.addi %pos, %c1 : index
+        %is_nl = arith.cmpi eq, %cp, %nl : i64
+        %is_cr = arith.cmpi eq, %cp, %cr : i64
+        %resets = arith.ori %is_nl, %is_cr : i1
+        %bumped = arith.addi %col, %one : i64
+        %next_col = arith.select %resets, %zero, %bumped : i64
+        scf.yield %next_pos, %next_col : index, i64
+      }
+      scf.yield %step#0, %step#1 : index, i64
+    }
+    func.return %out_header, %out_bytes : memref<2xi64>, memref<?xi8>
+  }
+
+  // str * int (left str only; negative repeats give the empty string).
+  func.func @LyUnicode_Mul(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %repeat: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__mul__", ly.runtime.result_contract = "builtins.str"} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %len = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %n = arith.maxsi %repeat, %zero : i64
+    %total = arith.muli %len, %n : i64
+    %is_empty = arith.cmpi eq, %total, %zero : i64
+    %out_width = arith.select %is_empty, %one, %width : i64
+    %out_header, %out_bytes = func.call @__ly_unicode_alloc(%total, %out_width) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
+    %len_index = arith.index_cast %len : i64 to index
+    %n_index = arith.index_cast %n : i64 to index
+    scf.for %k = %c0 to %n_index step %c1 {
+      %base = arith.muli %k, %len_index : index
+      scf.for %i = %c0 to %len_index step %c1 {
+        %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
+        %dst = arith.addi %base, %i : index
+        func.call @__ly_unicode_put(%out_bytes, %out_width, %dst, %cp) : (memref<?xi8>, i64, index, i64) -> ()
+      }
+    }
+    func.return %out_header, %out_bytes : memref<2xi64>, memref<?xi8>
   }
 
   // UTF-8 byte length of the encoded form (encode / print paths).
