@@ -166,6 +166,8 @@ private:
                              mlir::Type resultOverride = {});
   std::optional<Value> tryEmitIsInstanceCall(const parser::Node &expr,
                                              const parser::Node *calleeNode);
+  std::optional<Value> tryEmitIntCall(const parser::Node &expr,
+                                      const parser::Node *calleeNode);
   std::optional<Value> tryEmitStrCall(const parser::Node &expr,
                                       const parser::Node *calleeNode);
   std::optional<Value> tryEmitListCall(const parser::Node &expr,

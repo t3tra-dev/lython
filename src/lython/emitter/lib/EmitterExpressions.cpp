@@ -460,7 +460,18 @@ Value ModuleEmitter::emitBinary(const parser::Node &expr) {
     return emitBinarySpecial<py::BitOrOp>(expr, "__or__", lhs, rhs, result);
   if (ast::isOperator(op, "BitXor"))
     return emitBinarySpecial<py::BitXorOp>(expr, "__xor__", lhs, rhs, result);
-  return emitBinarySpecial<py::AddOp>(expr, "__add__", lhs, rhs, result);
+  if (ast::isOperator(op, "Pow"))
+    return emitBinarySpecial<py::PowOp>(expr, "__pow__", lhs, rhs, result);
+  if (ast::isOperator(op, "Add"))
+    return emitBinarySpecial<py::AddOp>(expr, "__add__", lhs, rhs, result);
+  // A fall-through to __add__ here would silently mis-execute unhandled
+  // operators (`a @ b` on non-tensors used to become an addition).
+  std::string spelling = op ? op->kind : std::string("<missing>");
+  diagnostics.push_back(parser::Diagnostic{
+      parser::Severity::Error, expr.range.start,
+      "binary operator '" + spelling + "' is not supported for these operand "
+      "types yet"});
+  return emitNone(expr);
 }
 
 Value ModuleEmitter::emitCompare(const parser::Node &expr) {

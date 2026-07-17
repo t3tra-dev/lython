@@ -168,6 +168,8 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
 
   if (std::optional<Value> v = tryEmitIsInstanceCall(expr, calleeNode))
     return *v;
+  if (std::optional<Value> v = tryEmitIntCall(expr, calleeNode))
+    return *v;
   if (std::optional<Value> v = tryEmitStrCall(expr, calleeNode))
     return *v;
   if (std::optional<Value> v = tryEmitListCall(expr, calleeNode))
@@ -503,6 +505,51 @@ ModuleEmitter::tryEmitIsInstanceCall(const parser::Node &expr,
     bit = test.getResult();
   }
   return boxedBool(builder, loc(expr), types, bit);
+}
+
+std::optional<Value>
+ModuleEmitter::tryEmitIntCall(const parser::Node &expr,
+                              const parser::Node *calleeNode) {
+  // int(x) is __int__ dispatch / literal parsing (CPython semantics), not
+  // construction — intercept before the class-instantiation paths claim
+  // builtins.int. Zero-argument int() stays on the instantiation path.
+  if (!calleeNode || calleeNode->kind != "Name" ||
+      ast::nameSpelling(*calleeNode) != "int" ||
+      values.find("int") != values.end())
+    return std::nullopt;
+  const auto *intArgs = ast::nodeList(expr, "args");
+  const auto *intKeywords = ast::nodeList(expr, "keywords");
+  auto intClass = types.lookupClass("int");
+  std::optional<llvm::StringRef> intSymbol =
+      intClass ? contractName(*intClass) : std::nullopt;
+  if (!intSymbol || *intSymbol != "builtins.int" || !intArgs ||
+      intArgs->size() != 1 || (intKeywords && !intKeywords->empty()) ||
+      !intArgs->front() || intArgs->front()->kind == "Starred")
+    return std::nullopt;
+  mlir::Type argumentType =
+      types.widenLiteral(types.inferExpr(intArgs->front().get()));
+  if (argumentType == types.intType()) {
+    // int is immutable, so int(n) is the identity (CPython returns n).
+    Value argument = emitExpr(intArgs->front().get());
+    return coerceValue(argument, types.intType(), expr);
+  }
+  if (argumentType == types.strType() || argumentType == types.floatType()) {
+    // The runtime-level __int__ methods of str (base-10 parse) and float
+    // (truncation) are deliberately not part of the typed manifest surface —
+    // CPython has no str.__int__ — so the contract is built here instead of
+    // going through method inference.
+    Value argument =
+        coerceValue(emitExpr(intArgs->front().get()), argumentType, expr);
+    mlir::Type resultType = types.intType();
+    mlir::Type contract = py::CallableType::get(&context, {argumentType}, {},
+                                                {}, {}, {resultType});
+    auto op = py::IntOp::create(
+        builder, loc(expr), resultType,
+        mlir::FlatSymbolRefAttr::get(&context, "__int__"),
+        mlir::TypeAttr::get(contract), argument.value);
+    return Value{op.getResult(), resultType};
+  }
+  return std::nullopt;
 }
 
 std::optional<Value>

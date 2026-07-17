@@ -588,6 +588,9 @@ mlir::LogicalResult BitOrOp::verify() {
 mlir::LogicalResult BitXorOp::verify() {
   return verifyBinarySpecialMethod(getOperation());
 }
+mlir::LogicalResult PowOp::verify() {
+  return verifyBinarySpecialMethod(getOperation());
+}
 mlir::LogicalResult LeOp::verify() {
   return verifyBinarySpecialMethod(getOperation());
 }
@@ -612,6 +615,10 @@ mlir::LogicalResult ReprOp::verify() {
 }
 
 mlir::LogicalResult StrOp::verify() {
+  return verifyResolvedProtocolCall(getOperation(), "callee_contract");
+}
+
+mlir::LogicalResult IntOp::verify() {
   return verifyResolvedProtocolCall(getOperation(), "callee_contract");
 }
 
