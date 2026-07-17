@@ -42,20 +42,28 @@ digits memref<?xi32>)`。CPython の longobject と同じ 30-bit digit
 「evidence の valid が落ちた瞬間に manifest 呼び出しへ折り返す」ことで起こる。
 この設計を維持し、以下のギャップだけを埋める。
 
-## ギャップ (M1 調査で確認した誤動作・未実装)
+## ギャップ (M1 調査で確認した誤動作・未実装) — 全項目実装済み ✅
 
-| 項目 | 現状 | 方針 |
+| 項目 | 調査時の現状 | 実装 (wave0/bigint) |
 | --- | --- | --- |
-| `**` (Pow) | emitter が未知の BinOp を `__add__` に **フォールスルー** し `2**3 == 5` | Py_PowOp を追加し `__pow__` へ。未知 op は診断 (never silently mis-execute) |
-| 大整数リテラル | lowering が明示拒否 | コンパイル時に 30-bit digits へ分解し memref.global + `from_digits` primitive で構築 |
-| `//` `%` (>i64) | `LyLong_AsI64` で **無言切り捨て** (30! // 10^6 が負値) | 一般 divmod (digit 長除算) を実装 |
-| `INT64_MIN // -1` | i64 divsi の UB (INT64_MIN を返す) | 小径路のガードに除外条件を追加 |
-| `<<` `>>` | i64 のみ。`1 << 100` が **無言 wrap** (2^36) | digit shift + 端数 bit shift の一般実装 |
-| `& \| ^` (>i64) | `AsI64` 切り捨て | 2 の補数 digit 演算 (CPython longobject 方式) |
-| `/` (>i64) | `AsI64` 経由で誤値 | `AsF64` を digit 累積に一般化 |
-| `__hash__` | manifest 宣言のみで実装なし。`hash()` builtin も未配線 | CPython 準拠 (2^61-1 modular reduction、-1 → -2)。float 側が将来 `hash(1.0)` を同じ値に合わせられる形 |
-| `int(str)` | 未実装 (診断) | 10 進 (符号 + underscore) の任意長パース |
-| `round(big, -n)` | `AsI64` 切り捨て | fits ガード + 一般 divmod 経由 |
+| `**` (Pow) | emitter が未知の BinOp を `__add__` に **フォールスルー** し `2**3 == 5` | Py_PowOp → `__pow__` (`LyLong_Pow`, 再帰 square-and-multiply)。未知 op は診断 ✅ |
+| 大整数リテラル | lowering が明示拒否 | `lowerIntConstant` がコンパイル時に 30-bit limbs へ分解し `from_digits` primitive で構築 ✅ |
+| `//` `%` (>i64) | `LyLong_AsI64` で **無言切り捨て** (30! // 10^6 が負値) | `__ly_long_divmod_abs` (shift-subtract 長除算) + floor 符号補正 ✅ |
+| `INT64_MIN // -1` | i64 divsi の poison (INT64_MIN を返す) | 小径路ガードで digits 経路へ ✅ |
+| `<<` `>>` | i64 のみ。`1 << 100` が **無言 wrap** (2^36) | digit shift + 端数 bit shift。負数 `>>` は sticky bit で floor ✅ |
+| `& \| ^` (>i64) | `AsI64` 切り捨て | `__ly_long_bitop_general` (2 の補数 limb ストリーム) ✅ |
+| `/` (>i64) | `AsI64` 経由で誤値 | `__ly_long_view_as_f64` (digit 累積) ✅ |
+| `__hash__` | manifest 宣言のみで実装なし。`hash()` builtin も未配線 | `LyLong_Hash` (2^61-1 reduction、-1 → -2) + `hash()` builtin (len パターン) ✅ |
+| `int(str)` | 未実装 (診断) | `LyLong_FromStr` 任意長 10 進パース + `py.int` (`__int__` dispatch)。`int(float)` 切り捨て、`int(int)` 恒等 ✅ |
+| `round(big, -n)` | `AsI64` 切り捨て | `ndigits >= 0` は恒等コピー、負 ndigits の >i64 は明示 raise (残作業) ✅ |
+
+## 残作業 (明示 raise / 未配線で倒してある)
+
+- `int(float)` の |x| >= 2^63 (CPython は正確変換; 現状 ValueError raise)
+- `round(big, 負のndigits)` (ValueError raise; pow/divmod ができたので実装可能)
+- `divmod()` builtin、3 引数 `pow()`、`int(bool)` — Wave 1 builtins の範囲
+- OverflowError 相当は例外タクソノミ移植 (R2, Wave 1) まで ValueError で代用
+- Unicode 数字の `int(str)` (UCD テーブル同梱後)
 
 floor 除算の負数丸めは **i64 範囲内では既に CPython 準拠** (`-7 // 2 == -4`,
 `-7 % 2 == 1`; sdiv/srem に符号補正を挿入済み) — golden テストで固定する。
