@@ -202,7 +202,12 @@ module attributes {
     method_names = ["__new__", "__len__", "__iter__", "__getitem__", "__add__",
                     "__contains__", "__eq__", "__lt__", "__le__", "__gt__",
                     "__ge__", "join", "startswith", "endswith", "__repr__", "__str__", "__ne__",
-                    "encode"],
+                    "encode",
+                    "upper", "lower", "casefold", "title", "capitalize",
+                    "swapcase",
+                    "isalpha", "isspace", "isdecimal", "isdigit", "isnumeric",
+                    "isupper", "islower", "isprintable", "istitle", "isalnum",
+                    "isidentifier", "isascii"],
     method_contracts = [
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.str">>, !py.contract<"builtins.object">] -> [!py.self]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.int">]>,
@@ -221,13 +226,36 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.object">] -> [!py.contract<"builtins.bool">]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.bytes">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.bytes">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.bool">]>
     ],
     method_kinds = ["classmethod", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance",
-                    "instance"]
+                    "instance",
+                    "instance", "instance", "instance", "instance", "instance",
+                    "instance",
+                    "instance", "instance", "instance", "instance", "instance",
+                    "instance", "instance", "instance", "instance", "instance",
+                    "instance", "instance"]
   } {}
 
   py.class @str_iterator attributes {

@@ -21,6 +21,7 @@ struct CType {
   std::int64_t upper;
   std::int64_t lower;
   std::int64_t fold;
+  std::int64_t title;
   std::int64_t decimal;
   std::int64_t digit;
   std::int64_t flags;
@@ -37,9 +38,9 @@ CType ctypeOf(char32_t cp) {
   const int record = cp < 0x110000
                          ? twoStage(kCTypeIndex1, kCTypeIndex2, cp)
                          : kDefaultCType;
-  const std::int32_t *fields = &kCTypeRecords[record * 6];
+  const std::int32_t *fields = &kCTypeRecords[record * 7];
   return CType{fields[0], fields[1], fields[2], fields[3], fields[4],
-               fields[5]};
+               fields[5], fields[6]};
 }
 
 std::string categoryOf(char32_t cp) {
@@ -82,6 +83,11 @@ std::vector<char32_t> fullFold(char32_t cp) {
   return expand(cp, record.fold, record.flags & kFlagExtFold);
 }
 
+std::vector<char32_t> fullTitle(char32_t cp) {
+  const CType record = ctypeOf(cp);
+  return expand(cp, record.title, record.flags & kFlagExtTitle);
+}
+
 using U32 = std::vector<char32_t>;
 
 TEST(UnicodeTablesTest, FullSpecialCasingUppercasesSharpS) {
@@ -106,6 +112,30 @@ TEST(UnicodeTablesTest, CaseFoldingIsFull) {
   EXPECT_EQ(fullFold(U'A'), (U32{U'a'}));
   // U+FB03 LATIN SMALL LIGATURE FFI folds to "ffi".
   EXPECT_EQ(fullFold(0xFB03), (U32{U'f', U'f', U'i'}));
+}
+
+TEST(UnicodeTablesTest, TitleMappingsMatchCPython) {
+  // Simple fallback-to-upper (a -> A), digraph middle forms, SpecialCasing
+  // full title mappings, and Lt self-mapping.
+  EXPECT_EQ(fullTitle(U'a'), (U32{U'A'}));
+  EXPECT_EQ(fullTitle(0x01C6), (U32{0x01C5}));  // dž -> Dž
+  EXPECT_EQ(fullTitle(0x01C4), (U32{0x01C5}));  // DŽ -> Dž
+  EXPECT_EQ(fullTitle(0x01C5), (U32{0x01C5}));  // Dž -> itself
+  EXPECT_EQ(fullTitle(U'ß'), (U32{U'S', U's'}));  // title("ß") == "Ss"
+  EXPECT_EQ(fullTitle(0x0149), (U32{0x02BC, 0x004E}));  // ʼn -> ʼN
+  EXPECT_EQ(fullTitle(0x1FB3), (U32{0x1FBC}));  // ᾳ -> ᾼ (not 0391 0399)
+  EXPECT_EQ(fullTitle(0xFB01), (U32{U'F', U'i'}));  // fi ligature -> Fi
+}
+
+TEST(UnicodeTablesTest, XidFlagsMatchIsidentifier) {
+  EXPECT_TRUE(ctypeOf(U'a').flags & kFlagXidStart);
+  EXPECT_TRUE(ctypeOf(U'_').flags & kFlagXidContinue);
+  EXPECT_FALSE(ctypeOf(U'_').flags & kFlagXidStart);  // '_' special-cased
+  EXPECT_TRUE(ctypeOf(U'1').flags & kFlagXidContinue);
+  EXPECT_FALSE(ctypeOf(U'1').flags & kFlagXidStart);
+  EXPECT_TRUE(ctypeOf(0x6F22).flags & kFlagXidStart);  // 漢
+  EXPECT_FALSE(ctypeOf(U' ').flags & kFlagXidContinue);
+  EXPECT_FALSE(ctypeOf(0x1F600).flags & kFlagXidContinue);  // emoji
 }
 
 TEST(UnicodeTablesTest, CategoriesMatchCPython) {
@@ -163,13 +193,13 @@ TEST(UnicodeTablesTest, ClassificationFlags) {
 TEST(UnicodeTablesTest, EveryExtendedReferenceStaysInPool) {
   const std::size_t poolSize = sizeof(kExtCase) / sizeof(kExtCase[0]);
   const std::size_t recordCount =
-      sizeof(kCTypeRecords) / sizeof(kCTypeRecords[0]) / 6;
+      sizeof(kCTypeRecords) / sizeof(kCTypeRecords[0]) / 7;
   for (std::size_t record = 0; record < recordCount; ++record) {
-    const std::int32_t *fields = &kCTypeRecords[record * 6];
-    const std::int32_t flags = fields[5];
+    const std::int32_t *fields = &kCTypeRecords[record * 7];
+    const std::int32_t flags = fields[6];
     const std::int32_t extFlags[] = {kFlagExtUpper, kFlagExtLower,
-                                     kFlagExtFold};
-    for (int field = 0; field < 3; ++field) {
+                                     kFlagExtFold, kFlagExtTitle};
+    for (int field = 0; field < 4; ++field) {
       if (!(flags & extFlags[field]))
         continue;
       const std::int32_t packed = fields[field];
@@ -188,7 +218,7 @@ TEST(UnicodeTablesTest, EveryExtendedReferenceStaysInPool) {
 TEST(UnicodeTablesTest, IndexTablesCoverEveryCodePoint) {
   const std::size_t index2Size = sizeof(kCTypeIndex2) / sizeof(std::uint16_t);
   const std::size_t recordCount =
-      sizeof(kCTypeRecords) / sizeof(kCTypeRecords[0]) / 6;
+      sizeof(kCTypeRecords) / sizeof(kCTypeRecords[0]) / 7;
   for (char32_t cp = 0; cp < 0x110000; cp += 97) {  // stride keeps it fast
     const std::uint16_t block = kCTypeIndex1[cp >> kShift];
     const std::size_t row = (static_cast<std::size_t>(block) << kShift) +

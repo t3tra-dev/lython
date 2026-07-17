@@ -21,10 +21,12 @@ tools/.ucd-cache/<version>/ (downloaded on first run, or supply --ucd-dir).
 Encoding scheme (mirrors CPython's Tools/unicode/makeunicodedata.py two-stage
 compression, re-derived here rather than copied):
 
-  * ctype records: (upper, lower, fold, decimal, digit, flags). Case fields
-    hold a signed code-point delta, or -- when the matching EXT_* flag bit is
-    set -- (offset << 8) | length into the extended-case code-point pool for
-    multi-character full mappings ("ss" -> "SS" etc.).
+  * ctype records: (upper, lower, fold, title, decimal, digit, flags). Case
+    fields hold a signed code-point delta, or -- when the matching EXT_* flag
+    bit is set -- (offset << 8) | length into the extended-case code-point
+    pool for multi-character full mappings ("ss" -> "SS" etc.). The title
+    field materializes UnicodeData field 14's fall-back-to-upper rule, so a
+    zero delta genuinely means identity (Lt digraphs pin themselves).
   * info records: (category, numeric_index). numeric_index points into the
     f64 numeric-value pool, -1 when the character has no numeric value.
   * Each record kind gets its own two-stage index: index1[cp >> 7] names a
@@ -36,6 +38,8 @@ Flag bits (keep in sync with unicodedata.mlir and UnicodeTablesTests.cpp):
   2 UPPER (DCP Uppercase)               7 EXT_UPPER
   3 TITLE (category Lt)                 8 EXT_LOWER
   4 SPACE (Zs or bidi WS/B/S)           9 EXT_FOLD
+  10 EXT_TITLE                          12 XID_CONTINUE (DCP)
+  11 XID_START (DCP)
 
 Category enum order matches CPython's _PyUnicode_CategoryNames so indices
 stay recognizable: Cn=0 ... Co=29.
@@ -78,6 +82,9 @@ FLAG_CASE_IGNORABLE = 1 << 6
 FLAG_EXT_UPPER = 1 << 7
 FLAG_EXT_LOWER = 1 << 8
 FLAG_EXT_FOLD = 1 << 9
+FLAG_EXT_TITLE = 1 << 10
+FLAG_XID_START = 1 << 11
+FLAG_XID_CONTINUE = 1 << 12
 
 ALPHA_CATEGORIES = {"Lu", "Ll", "Lt", "Lm", "Lo"}
 SPACE_BIDI = {"WS", "B", "S"}
@@ -120,7 +127,7 @@ def parse_ranges(lines: list[str], wanted: set[str]) -> dict[str, set[int]]:
 class CharData:
     __slots__ = (
         "category", "bidi", "decimal", "digit", "numeric",
-        "upper", "lower", "fold",
+        "upper", "lower", "fold", "title",
     )
 
     def __init__(self) -> None:
@@ -132,6 +139,9 @@ class CharData:
         self.upper: list[int] | None = None  # None = identity
         self.lower: list[int] | None = None
         self.fold: list[int] | None = None
+        # None = fall back to the upper mapping (UnicodeData field 14
+        # semantics); an explicit [cp] pins identity (Lt digraphs).
+        self.title: list[int] | None = None
 
 
 def parse_unicode_data(lines: list[str]) -> list[CharData]:
@@ -179,6 +189,8 @@ def make_char(fields: list[str], cp: int, in_range: bool) -> CharData:
             entry.upper = [int(fields[12], 16)]
         if fields[13]:
             entry.lower = [int(fields[13], 16)]
+        if len(fields) > 14 and fields[14].strip():
+            entry.title = [int(fields[14], 16)]
     return entry
 
 
@@ -197,10 +209,14 @@ def apply_special_casing(table: list[CharData], lines: list[str]) -> None:
             continue
         cp = int(fields[0], 16)
         lower = [int(part, 16) for part in fields[1].split()]
+        title = [int(part, 16) for part in fields[2].split()]
         upper = [int(part, 16) for part in fields[3].split()]
         entry = table[cp]
         entry.lower = lower if lower != [cp] else None
         entry.upper = upper if upper != [cp] else None
+        # Always explicit: SpecialCasing title must not fall back to the
+        # (possibly multi-char) upper mapping.
+        entry.title = title
 
 
 def apply_case_folding(table: list[CharData], lines: list[str]) -> None:
@@ -275,7 +291,8 @@ def build() -> dict:
     apply_case_folding(table, sources["CaseFolding.txt"])
     core = parse_ranges(
         sources["DerivedCoreProperties.txt"],
-        {"Lowercase", "Uppercase", "Cased", "Case_Ignorable"},
+        {"Lowercase", "Uppercase", "Cased", "Case_Ignorable",
+         "XID_Start", "XID_Continue"},
     )
 
     pool = ExtendedCasePool()
@@ -304,13 +321,23 @@ def build() -> dict:
             flags |= FLAG_CASED
         if cp in core["Case_Ignorable"]:
             flags |= FLAG_CASE_IGNORABLE
+        if cp in core["XID_Start"]:
+            flags |= FLAG_XID_START
+        if cp in core["XID_Continue"]:
+            flags |= FLAG_XID_CONTINUE
+
+        title_mapping = entry.title if entry.title is not None else entry.upper
+        if title_mapping == [cp]:
+            title_mapping = None
 
         upper, upper_flag = encode_case(cp, entry.upper, pool, FLAG_EXT_UPPER)
         lower, lower_flag = encode_case(cp, entry.lower, pool, FLAG_EXT_LOWER)
         fold, fold_flag = encode_case(cp, entry.fold, pool, FLAG_EXT_FOLD)
-        flags |= upper_flag | lower_flag | fold_flag
+        title, title_flag = encode_case(cp, title_mapping, pool,
+                                        FLAG_EXT_TITLE)
+        flags |= upper_flag | lower_flag | fold_flag | title_flag
 
-        ctype = (upper, lower, fold, entry.decimal, entry.digit, flags)
+        ctype = (upper, lower, fold, title, entry.decimal, entry.digit, flags)
         record_id = ctype_index.get(ctype)
         if record_id is None:
             record_id = len(ctype_records)
@@ -339,7 +366,7 @@ def build() -> dict:
     # exactly that.
     default_ctype = ctype_ids[0x10FFFF]
     default_info = info_ids[0x10FFFF]
-    assert ctype_records[default_ctype] == (0, 0, 0, -1, -1, 0)
+    assert ctype_records[default_ctype] == (0, 0, 0, 0, -1, -1, 0)
     assert info_records[default_info] == (0, -1)
 
     ctype_index1, ctype_index2 = two_stage(ctype_ids)
@@ -471,14 +498,15 @@ def emit_mlir(data: dict, path: Path) -> None:
         mlir_f64_global("__ly_ucd_numeric_values", numeric_values),
         mlir_global("__ly_ucd_category_names", category_chars, "i8"),
         "\n",
-        "  // (upper, lower, fold, decimal, digit, flags) for a code point;\n",
-        "  // out-of-range values resolve to the unassigned (Cn) record.\n",
+        "  // (upper, lower, fold, title, decimal, digit, flags) for a code\n",
+        "  // point; out-of-range values resolve to the unassigned (Cn)\n",
+        "  // record.\n",
         two_stage_accessor(
             "__ly_ucd_ctype",
             "__ly_ucd_ctype_index1", len(data["ctype_index1"]),
             "__ly_ucd_ctype_index2", len(data["ctype_index2"]),
             "__ly_ucd_ctype_records", len(ctype_flat),
-            6, data["default_ctype"],
+            7, data["default_ctype"],
         ),
         "\n",
         "  // (category enum, numeric-value index or -1) for a code point.\n",
@@ -570,6 +598,9 @@ def emit_cpp(data: dict, path: Path) -> None:
         "inline constexpr std::int32_t kFlagExtUpper = 1 << 7;\n",
         "inline constexpr std::int32_t kFlagExtLower = 1 << 8;\n",
         "inline constexpr std::int32_t kFlagExtFold = 1 << 9;\n",
+        "inline constexpr std::int32_t kFlagExtTitle = 1 << 10;\n",
+        "inline constexpr std::int32_t kFlagXidStart = 1 << 11;\n",
+        "inline constexpr std::int32_t kFlagXidContinue = 1 << 12;\n",
         f"inline const char *const kCategoryNames[] = {{{category_names}}};\n",
         "\n",
         cpp_array("kCTypeIndex1", "std::uint16_t", data["ctype_index1"]),

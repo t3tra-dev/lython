@@ -41,7 +41,7 @@ module attributes {
   func.func private @__ly_unicode_get(%bytes: memref<?xi8>, %width: i64, %i: index) -> i64
   func.func private @__ly_unicode_put(%bytes: memref<?xi8>, %width: i64, %i: index, %cp: i64)
   func.func private @__ly_unicode_width_for(%cp: i64) -> i64
-  func.func private @__ly_ucd_ctype(%cp: i64) -> (i64, i64, i64, i64, i64, i64)
+  func.func private @__ly_ucd_ctype(%cp: i64) -> (i64, i64, i64, i64, i64, i64, i64)
   func.func private @__ly_ucd_info(%cp: i64) -> (i64, i64)
   func.func private @__ly_ucd_ext_cp(%packed: i64, %j: i64) -> i64
   func.func private @__ly_ucd_numeric_value(%idx: i64) -> f64
@@ -55,7 +55,8 @@ module attributes {
 
   // Flag bits, kept in sync with tools/gen_unicode_tables.py:
   // 1 ALPHA, 2 LOWER, 4 UPPER, 8 TITLE, 16 SPACE, 32 CASED,
-  // 64 CASE_IGNORABLE, 128 EXT_UPPER, 256 EXT_LOWER, 512 EXT_FOLD.
+  // 64 CASE_IGNORABLE, 128 EXT_UPPER, 256 EXT_LOWER, 512 EXT_FOLD,
+  // 1024 EXT_TITLE, 2048 XID_START, 4096 XID_CONTINUE.
 
   // "argument must be a unicode character"
   memref.global "private" constant @__ly_ucd_msg_not_single : memref<36xi8> = dense<[97, 114, 103, 117, 109, 101, 110, 116, 32, 109, 117, 115, 116, 32, 98, 101, 32, 97, 32, 117, 110, 105, 99, 111, 100, 101, 32, 99, 104, 97, 114, 97, 99, 116, 101, 114]>
@@ -138,7 +139,7 @@ module attributes {
   func.func @LyUnicodeData_Decimal(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "unicodedata.decimal", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.str", ly.runtime.primitive = "ucd_decimal", ly.runtime.result_contract = "builtins.int"} {
     %minus_one = arith.constant -1 : i64
     %cp = func.call @__ly_ucd_single_cp(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
-    %upper, %lower, %fold, %decimal, %digit, %flags = func.call @__ly_ucd_ctype(%cp) : (i64) -> (i64, i64, i64, i64, i64, i64)
+    %upper, %lower, %fold, %title, %decimal, %digit, %flags = func.call @__ly_ucd_ctype(%cp) : (i64) -> (i64, i64, i64, i64, i64, i64, i64)
     %missing = arith.cmpi eq, %decimal, %minus_one : i64
     scf.if %missing {
       %class_id = arith.constant 53 : i64
@@ -154,7 +155,7 @@ module attributes {
   func.func @LyUnicodeData_Digit(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "unicodedata.digit", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.str", ly.runtime.primitive = "ucd_digit", ly.runtime.result_contract = "builtins.int"} {
     %minus_one = arith.constant -1 : i64
     %cp = func.call @__ly_ucd_single_cp(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
-    %upper, %lower, %fold, %decimal, %digit, %flags = func.call @__ly_ucd_ctype(%cp) : (i64) -> (i64, i64, i64, i64, i64, i64)
+    %upper, %lower, %fold, %title, %decimal, %digit, %flags = func.call @__ly_ucd_ctype(%cp) : (i64) -> (i64, i64, i64, i64, i64, i64, i64)
     %missing = arith.cmpi eq, %digit, %minus_one : i64
     scf.if %missing {
       %class_id = arith.constant 53 : i64
@@ -170,20 +171,25 @@ module attributes {
   // ---- full case mapping helpers ----
 
   // (field value, is-extended) of the mapping selected by %which:
-  // 0 = uppercase, 1 = lowercase, 2 = case fold.
+  // 0 = uppercase, 1 = lowercase, 2 = case fold, 3 = title case.
   func.func private @__ly_ucd_select_map(%which: i64, %cp: i64) -> (i64, i1) {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
     %ext_upper = arith.constant 128 : i64
     %ext_lower = arith.constant 256 : i64
     %ext_fold = arith.constant 512 : i64
-    %upper, %lower, %fold, %decimal, %digit, %flags = func.call @__ly_ucd_ctype(%cp) : (i64) -> (i64, i64, i64, i64, i64, i64)
+    %ext_title = arith.constant 1024 : i64
+    %upper, %lower, %fold, %title, %decimal, %digit, %flags = func.call @__ly_ucd_ctype(%cp) : (i64) -> (i64, i64, i64, i64, i64, i64, i64)
     %is_upper = arith.cmpi eq, %which, %zero : i64
     %is_lower = arith.cmpi eq, %which, %one : i64
-    %lower_or_fold = arith.select %is_lower, %lower, %fold : i64
-    %value = arith.select %is_upper, %upper, %lower_or_fold : i64
-    %lower_or_fold_bit = arith.select %is_lower, %ext_lower, %ext_fold : i64
-    %bit = arith.select %is_upper, %ext_upper, %lower_or_fold_bit : i64
+    %is_fold = arith.cmpi eq, %which, %two : i64
+    %fold_or_title = arith.select %is_fold, %fold, %title : i64
+    %lower_or_rest = arith.select %is_lower, %lower, %fold_or_title : i64
+    %value = arith.select %is_upper, %upper, %lower_or_rest : i64
+    %fold_or_title_bit = arith.select %is_fold, %ext_fold, %ext_title : i64
+    %lower_or_rest_bit = arith.select %is_lower, %ext_lower, %fold_or_title_bit : i64
+    %bit = arith.select %is_upper, %ext_upper, %lower_or_rest_bit : i64
     %masked = arith.andi %flags, %bit : i64
     %is_ext = arith.cmpi ne, %masked, %zero : i64
     func.return %value, %is_ext : i64, i1
@@ -229,7 +235,7 @@ module attributes {
     ^bb0(%j: index, %found: i1, %cased: i1):
       %prev = arith.subi %j, %c1 : index
       %cp = func.call @__ly_unicode_get(%bytes, %width, %prev) : (memref<?xi8>, i64, index) -> i64
-      %upper, %lower, %fold, %decimal, %digit, %flags = func.call @__ly_ucd_ctype(%cp) : (i64) -> (i64, i64, i64, i64, i64, i64)
+      %upper, %lower, %fold, %title, %decimal, %digit, %flags = func.call @__ly_ucd_ctype(%cp) : (i64) -> (i64, i64, i64, i64, i64, i64, i64)
       %ig_masked = arith.andi %flags, %ignorable_bit : i64
       %ignorable = arith.cmpi ne, %ig_masked, %zero : i64
       %cased_masked = arith.andi %flags, %cased_bit : i64
@@ -249,7 +255,7 @@ module attributes {
     } do {
     ^bb0(%j: index, %found: i1, %cased: i1):
       %cp = func.call @__ly_unicode_get(%bytes, %width, %j) : (memref<?xi8>, i64, index) -> i64
-      %upper, %lower, %fold, %decimal, %digit, %flags = func.call @__ly_ucd_ctype(%cp) : (i64) -> (i64, i64, i64, i64, i64, i64)
+      %upper, %lower, %fold, %title, %decimal, %digit, %flags = func.call @__ly_ucd_ctype(%cp) : (i64) -> (i64, i64, i64, i64, i64, i64, i64)
       %ig_masked = arith.andi %flags, %ignorable_bit : i64
       %ignorable = arith.cmpi ne, %ig_masked, %zero : i64
       %cased_masked = arith.andi %flags, %cased_bit : i64
@@ -358,6 +364,165 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
+  // Mapping mode at position %i for the word-sensitive transforms.
+  // %mode selects the CPython do_title / do_capitalize / do_swapcase
+  // position rule; the result is a __ly_ucd_select_map selector
+  // (0 upper / 1 lower / 3 title) or -1 (copy the character unchanged).
+  func.func private @__ly_unicode_which_at(%bytes: memref<?xi8>, %width: i64, %i: index, %mode: i64) -> i64 {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %three = arith.constant 3 : i64
+    %minus_one = arith.constant -1 : i64
+    %cased_bit = arith.constant 32 : i64
+    %upper_bit = arith.constant 4 : i64
+    %lower_bit = arith.constant 2 : i64
+    %is_swap = arith.cmpi eq, %mode, %two : i64
+    %which = scf.if %is_swap -> (i64) {
+      %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
+      %u, %l, %f, %t, %dec, %dig, %flags = func.call @__ly_ucd_ctype(%cp) : (i64) -> (i64, i64, i64, i64, i64, i64, i64)
+      %um = arith.andi %flags, %upper_bit : i64
+      %is_up = arith.cmpi ne, %um, %zero : i64
+      %lm = arith.andi %flags, %lower_bit : i64
+      %is_lo = arith.cmpi ne, %lm, %zero : i64
+      %lo_or_copy = arith.select %is_lo, %zero, %minus_one : i64
+      %sel = arith.select %is_up, %one, %lo_or_copy : i64
+      scf.yield %sel : i64
+    } else {
+      %is_first = arith.cmpi eq, %i, %c0 : index
+      %sel = scf.if %is_first -> (i64) {
+        scf.yield %three : i64
+      } else {
+        %is_cap = arith.cmpi eq, %mode, %one : i64
+        %inner = scf.if %is_cap -> (i64) {
+          scf.yield %one : i64
+        } else {
+          %prev = arith.subi %i, %c1 : index
+          %pcp = func.call @__ly_unicode_get(%bytes, %width, %prev) : (memref<?xi8>, i64, index) -> i64
+          %u, %l, %f, %t, %dec, %dig, %flags = func.call @__ly_ucd_ctype(%pcp) : (i64) -> (i64, i64, i64, i64, i64, i64, i64)
+          %cm = arith.andi %flags, %cased_bit : i64
+          %prev_cased = arith.cmpi ne, %cm, %zero : i64
+          %chosen = arith.select %prev_cased, %one, %three : i64
+          scf.yield %chosen : i64
+        }
+        scf.yield %inner : i64
+      }
+      scf.yield %sel : i64
+    }
+    func.return %which : i64
+  }
+
+  // Word-sensitive two-pass transform (%mode: 0 title, 1 capitalize,
+  // 2 swapcase), the same measure-then-fill shape as
+  // __ly_unicode_case_transform. Positions that lower a capital sigma go
+  // through the Final_Sigma rule.
+  func.func private @__ly_unicode_word_case_transform(%header: memref<2xi64>, %bytes: memref<?xi8>, %mode: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %sigma = arith.constant 931 : i64
+    %small_sigma = arith.constant 963 : i64
+    %final_sigma = arith.constant 962 : i64
+    %minus_one = arith.constant -1 : i64
+    %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %count = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %count_index = arith.index_cast %count : i64 to index
+
+    %scan:2 = scf.for %i = %c0 to %count_index step %c1 iter_args(%total = %zero, %maxcp = %zero) -> (i64, i64) {
+      %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
+      %which = func.call @__ly_unicode_which_at(%bytes, %width, %i, %mode) : (memref<?xi8>, i64, index, i64) -> i64
+      %is_copy = arith.cmpi eq, %which, %minus_one : i64
+      %step:2 = scf.if %is_copy -> (i64, i64) {
+        scf.yield %one, %cp : i64, i64
+      } else {
+        %lower_mode = arith.cmpi eq, %which, %one : i64
+        %is_sigma_cp = arith.cmpi eq, %cp, %sigma : i64
+        %is_sigma = arith.andi %is_sigma_cp, %lower_mode : i1
+        %inner:2 = scf.if %is_sigma -> (i64, i64) {
+          scf.yield %one, %small_sigma : i64, i64
+        } else {
+          %value, %is_ext = func.call @__ly_ucd_select_map(%which, %cp) : (i64, i64) -> (i64, i1)
+          %len = func.call @__ly_ucd_map_len(%value, %is_ext) : (i64, i1) -> i64
+          %len_index = arith.index_cast %len : i64 to index
+          %widest = scf.for %j = %c0 to %len_index step %c1 iter_args(%acc = %zero) -> (i64) {
+            %j_i64 = arith.index_cast %j : index to i64
+            %mapped = func.call @__ly_ucd_map_cp(%cp, %value, %is_ext, %j_i64) : (i64, i64, i1, i64) -> i64
+            %bigger = arith.cmpi ugt, %mapped, %acc : i64
+            %next = arith.select %bigger, %mapped, %acc : i64
+            scf.yield %next : i64
+          }
+          scf.yield %len, %widest : i64, i64
+        }
+        scf.yield %inner#0, %inner#1 : i64, i64
+      }
+      %new_total = arith.addi %total, %step#0 : i64
+      %bigger = arith.cmpi ugt, %step#1, %maxcp : i64
+      %new_max = arith.select %bigger, %step#1, %maxcp : i64
+      scf.yield %new_total, %new_max : i64, i64
+    }
+
+    %out_width = func.call @__ly_unicode_width_for(%scan#1) : (i64) -> i64
+    %out_header, %out_bytes = func.call @__ly_unicode_alloc(%scan#0, %out_width) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
+
+    scf.for %i = %c0 to %count_index step %c1 iter_args(%pos = %c0) -> (index) {
+      %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
+      %which = func.call @__ly_unicode_which_at(%bytes, %width, %i, %mode) : (memref<?xi8>, i64, index, i64) -> i64
+      %is_copy = arith.cmpi eq, %which, %minus_one : i64
+      %next_pos = scf.if %is_copy -> (index) {
+        func.call @__ly_unicode_put(%out_bytes, %out_width, %pos, %cp) : (memref<?xi8>, i64, index, i64) -> ()
+        %advanced = arith.addi %pos, %c1 : index
+        scf.yield %advanced : index
+      } else {
+        %lower_mode = arith.cmpi eq, %which, %one : i64
+        %is_sigma_cp = arith.cmpi eq, %cp, %sigma : i64
+        %is_sigma = arith.andi %is_sigma_cp, %lower_mode : i1
+        %written = scf.if %is_sigma -> (index) {
+          %final = func.call @__ly_ucd_sigma_final(%bytes, %width, %count_index, %i) : (memref<?xi8>, i64, index, index) -> i1
+          %mapped = arith.select %final, %final_sigma, %small_sigma : i64
+          func.call @__ly_unicode_put(%out_bytes, %out_width, %pos, %mapped) : (memref<?xi8>, i64, index, i64) -> ()
+          %advanced = arith.addi %pos, %c1 : index
+          scf.yield %advanced : index
+        } else {
+          %value, %is_ext = func.call @__ly_ucd_select_map(%which, %cp) : (i64, i64) -> (i64, i1)
+          %len = func.call @__ly_ucd_map_len(%value, %is_ext) : (i64, i1) -> i64
+          %len_index = arith.index_cast %len : i64 to index
+          scf.for %j = %c0 to %len_index step %c1 {
+            %j_i64 = arith.index_cast %j : index to i64
+            %mapped = func.call @__ly_ucd_map_cp(%cp, %value, %is_ext, %j_i64) : (i64, i64, i1, i64) -> i64
+            %dst = arith.addi %pos, %j : index
+            func.call @__ly_unicode_put(%out_bytes, %out_width, %dst, %mapped) : (memref<?xi8>, i64, index, i64) -> ()
+          }
+          %advanced = arith.addi %pos, %len_index : index
+          scf.yield %advanced : index
+        }
+        scf.yield %written : index
+      }
+      scf.yield %next_pos : index
+    }
+    func.return %out_header, %out_bytes : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LyUnicode_Title(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "title", ly.runtime.result_contract = "builtins.str"} {
+    %mode = arith.constant 0 : i64
+    %result:2 = func.call @__ly_unicode_word_case_transform(%header, %bytes, %mode) : (memref<2xi64>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LyUnicode_Capitalize(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "capitalize", ly.runtime.result_contract = "builtins.str"} {
+    %mode = arith.constant 1 : i64
+    %result:2 = func.call @__ly_unicode_word_case_transform(%header, %bytes, %mode) : (memref<2xi64>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LyUnicode_SwapCase(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "swapcase", ly.runtime.result_contract = "builtins.str"} {
+    %mode = arith.constant 2 : i64
+    %result:2 = func.call @__ly_unicode_word_case_transform(%header, %bytes, %mode) : (memref<2xi64>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
+  }
+
   // ---- str classification runtime methods ----
 
   func.func private @__ly_unicode_all_flagged(%header: memref<2xi64>, %bytes: memref<?xi8>, %mask: i64) -> i1 {
@@ -370,7 +535,7 @@ module attributes {
     %count_index = arith.index_cast %count : i64 to index
     %all = scf.for %i = %c0 to %count_index step %c1 iter_args(%acc = %true_bit) -> (i1) {
       %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
-      %upper, %lower, %fold, %decimal, %digit, %flags = func.call @__ly_ucd_ctype(%cp) : (i64) -> (i64, i64, i64, i64, i64, i64)
+      %upper, %lower, %fold, %title, %decimal, %digit, %flags = func.call @__ly_ucd_ctype(%cp) : (i64) -> (i64, i64, i64, i64, i64, i64, i64)
       %masked = arith.andi %flags, %mask : i64
       %has = arith.cmpi ne, %masked, %zero : i64
       %next = arith.andi %acc, %has : i1
@@ -407,7 +572,7 @@ module attributes {
     %is_decimal_mode = arith.cmpi eq, %which, %zero : i64
     %all = scf.for %i = %c0 to %count_index step %c1 iter_args(%acc = %true_bit) -> (i1) {
       %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
-      %upper, %lower, %fold, %decimal, %digit, %flags = func.call @__ly_ucd_ctype(%cp) : (i64) -> (i64, i64, i64, i64, i64, i64)
+      %upper, %lower, %fold, %title, %decimal, %digit, %flags = func.call @__ly_ucd_ctype(%cp) : (i64) -> (i64, i64, i64, i64, i64, i64, i64)
       %value = arith.select %is_decimal_mode, %decimal, %digit : i64
       %has = arith.cmpi ne, %value, %minus_one : i64
       %next = arith.andi %acc, %has : i1
@@ -465,7 +630,7 @@ module attributes {
     %count_index = arith.index_cast %count : i64 to index
     %scan:2 = scf.for %i = %c0 to %count_index step %c1 iter_args(%ok = %true_bit, %cased = %false_bit) -> (i1, i1) {
       %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
-      %upper, %lower, %fold, %decimal, %digit, %flags = func.call @__ly_ucd_ctype(%cp) : (i64) -> (i64, i64, i64, i64, i64, i64)
+      %upper, %lower, %fold, %title, %decimal, %digit, %flags = func.call @__ly_ucd_ctype(%cp) : (i64) -> (i64, i64, i64, i64, i64, i64, i64)
       %fail_masked = arith.andi %flags, %fail_mask : i64
       %fails = arith.cmpi ne, %fail_masked, %zero : i64
       %not_fails = arith.xori %fails, %true_bit : i1
@@ -524,6 +689,120 @@ module attributes {
       %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
       %printable = func.call @__ly_ucd_is_printable(%cp) : (i64) -> i1
       %next = arith.andi %acc, %printable : i1
+      scf.yield %next : i1
+    }
+    func.return %all : i1
+  }
+
+  // CPython unicode_istitle: upper/title-case characters may only follow
+  // uncased ones, lowercase only cased ones, and at least one cased
+  // character must appear.
+  func.func @LyUnicode_IsTitle(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> i1 attributes {ly.runtime.contract = "builtins.str", ly.runtime.method = "istitle"} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
+    %upper_or_title = arith.constant 12 : i64  // UPPER | TITLE
+    %lower_bit = arith.constant 2 : i64
+    %true_bit = arith.constant true
+    %false_bit = arith.constant false
+    %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %count = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %count_index = arith.index_cast %count : i64 to index
+    %scan:3 = scf.for %i = %c0 to %count_index step %c1 iter_args(%ok = %true_bit, %prev_cased = %false_bit, %cased = %false_bit) -> (i1, i1, i1) {
+      %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
+      %u, %l, %f, %t, %dec, %dig, %flags = func.call @__ly_ucd_ctype(%cp) : (i64) -> (i64, i64, i64, i64, i64, i64, i64)
+      %utm = arith.andi %flags, %upper_or_title : i64
+      %is_ut = arith.cmpi ne, %utm, %zero : i64
+      %lm = arith.andi %flags, %lower_bit : i64
+      %is_lo = arith.cmpi ne, %lm, %zero : i64
+      %not_prev = arith.xori %prev_cased, %true_bit : i1
+      %viol_ut = arith.andi %is_ut, %prev_cased : i1
+      %viol_lo = arith.andi %is_lo, %not_prev : i1
+      %viol = arith.ori %viol_ut, %viol_lo : i1
+      %not_viol = arith.xori %viol, %true_bit : i1
+      %next_ok = arith.andi %ok, %not_viol : i1
+      %cased_ch = arith.ori %is_ut, %is_lo : i1
+      %next_cased = arith.ori %cased, %cased_ch : i1
+      scf.yield %next_ok, %cased_ch, %next_cased : i1, i1, i1
+    }
+    %result = arith.andi %scan#0, %scan#2 : i1
+    func.return %result : i1
+  }
+
+  // CPython unicode_isalnum: alpha, decimal, digit, or numeric -- nonempty.
+  func.func @LyUnicode_IsAlnum(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> i1 attributes {ly.runtime.contract = "builtins.str", ly.runtime.method = "isalnum"} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
+    %minus_one = arith.constant -1 : i64
+    %alpha_bit = arith.constant 1 : i64
+    %true_bit = arith.constant true
+    %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %count = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %count_index = arith.index_cast %count : i64 to index
+    %all = scf.for %i = %c0 to %count_index step %c1 iter_args(%acc = %true_bit) -> (i1) {
+      %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
+      %u, %l, %f, %t, %dec, %dig, %flags = func.call @__ly_ucd_ctype(%cp) : (i64) -> (i64, i64, i64, i64, i64, i64, i64)
+      %am = arith.andi %flags, %alpha_bit : i64
+      %is_alpha = arith.cmpi ne, %am, %zero : i64
+      %has_dec = arith.cmpi ne, %dec, %minus_one : i64
+      %has_dig = arith.cmpi ne, %dig, %minus_one : i64
+      %cat, %numeric = func.call @__ly_ucd_info(%cp) : (i64) -> (i64, i64)
+      %has_num = arith.cmpi ne, %numeric, %minus_one : i64
+      %n1 = arith.ori %is_alpha, %has_dec : i1
+      %n2 = arith.ori %has_dig, %has_num : i1
+      %is_alnum = arith.ori %n1, %n2 : i1
+      %next = arith.andi %acc, %is_alnum : i1
+      scf.yield %next : i1
+    }
+    %nonempty = arith.cmpi sgt, %count, %zero : i64
+    %result = arith.andi %nonempty, %all : i1
+    func.return %result : i1
+  }
+
+  // PyUnicode_IsIdentifier: XID_Start (or '_') then XID_Continue.
+  func.func @LyUnicode_IsIdentifier(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> i1 attributes {ly.runtime.contract = "builtins.str", ly.runtime.method = "isidentifier"} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
+    %underscore = arith.constant 95 : i64
+    %xid_start_bit = arith.constant 2048 : i64
+    %xid_continue_bit = arith.constant 4096 : i64
+    %true_bit = arith.constant true
+    %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %count = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %count_index = arith.index_cast %count : i64 to index
+    %all = scf.for %i = %c0 to %count_index step %c1 iter_args(%acc = %true_bit) -> (i1) {
+      %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
+      %u, %l, %f, %t, %dec, %dig, %flags = func.call @__ly_ucd_ctype(%cp) : (i64) -> (i64, i64, i64, i64, i64, i64, i64)
+      %is_first = arith.cmpi eq, %i, %c0 : index
+      %bit = arith.select %is_first, %xid_start_bit, %xid_continue_bit : i64
+      %masked = arith.andi %flags, %bit : i64
+      %has = arith.cmpi ne, %masked, %zero : i64
+      %is_underscore = arith.cmpi eq, %cp, %underscore : i64
+      %first_underscore = arith.andi %is_first, %is_underscore : i1
+      %valid = arith.ori %has, %first_underscore : i1
+      %next = arith.andi %acc, %valid : i1
+      scf.yield %next : i1
+    }
+    %nonempty = arith.cmpi sgt, %count, %zero : i64
+    %result = arith.andi %nonempty, %all : i1
+    func.return %result : i1
+  }
+
+  // str.isascii: every code point below U+0080; True for the empty string.
+  func.func @LyUnicode_IsAscii(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> i1 attributes {ly.runtime.contract = "builtins.str", ly.runtime.method = "isascii"} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %limit = arith.constant 128 : i64
+    %true_bit = arith.constant true
+    %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %count = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %count_index = arith.index_cast %count : i64 to index
+    %all = scf.for %i = %c0 to %count_index step %c1 iter_args(%acc = %true_bit) -> (i1) {
+      %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
+      %ascii = arith.cmpi ult, %cp, %limit : i64
+      %next = arith.andi %acc, %ascii : i1
       scf.yield %next : i1
     }
     func.return %all : i1
