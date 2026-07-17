@@ -194,6 +194,27 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
         if (bundle->primitiveI64) {
           operands.push_back(bundle->primitiveI64->value);
           operands.push_back(bundle->primitiveI64->valid);
+        } else if (function->hasAttr("ly.generator.resume") &&
+                   !bundle->physicalValues().empty()) {
+          // Generator suspend lanes are the ONLY carrier of the yielded
+          // value (the object lane does not ride the resume ABI), so a
+          // boxed-only int (unary ops box without primitive evidence) must
+          // be unboxed here — the plain-clone fallback below would silently
+          // yield 0.
+          std::optional<RuntimeSymbol> unbox =
+              manifest.primitive("builtins.int", "unbox.i64");
+          if (!unbox) {
+            op.emitError()
+                << "runtime manifest has no builtins.int.unbox.i64 primitive "
+                   "for a boxed generator suspend value";
+            result = mlir::failure();
+            return mlir::WalkResult::interrupt();
+          }
+          mlir::func::CallOp unboxCall = RuntimeBundleLowerer::createRuntimeCall(
+              op.getLoc(), *unbox, bundle->physicalValues());
+          operands.push_back(unboxCall.getResult(0));
+          operands.push_back(integerConstant(
+              builder, op.getLoc(), builder.getI1Type(), 1));
         } else {
           operands.push_back(integerConstant(
               builder, op.getLoc(), builder.getI64Type(), 0));

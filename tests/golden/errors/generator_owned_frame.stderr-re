@@ -1,0 +1,1 @@
+error: source generator next lowering currently supports only straight-line pure int yield bodies

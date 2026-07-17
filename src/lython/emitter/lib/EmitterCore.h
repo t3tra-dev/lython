@@ -176,6 +176,8 @@ private:
                                           const parser::Node *calleeNode);
   std::optional<Value> tryEmitLenCall(const parser::Node &expr,
                                       const parser::Node *calleeNode);
+  std::optional<Value> tryEmitNextCall(const parser::Node &expr,
+                                       const parser::Node *calleeNode);
   std::optional<Value> tryEmitRoundCall(const parser::Node &expr,
                                         const parser::Node *calleeNode);
   std::optional<Value> tryEmitReprCall(const parser::Node &expr,

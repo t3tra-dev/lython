@@ -40,12 +40,16 @@ module attributes {
     ly.runtime.required_initializers = ["__new__"],
     ly.runtime.required_methods = ["__iter__", "close"],
     ly.runtime.required_primitives = ["resume.begin", "resume.complete", "resume.suspend"],
-    method_names = ["__iter__", "close"],
+    method_names = ["__iter__", "__next__", "send", "throw", "close"],
     method_contracts = [
       !py.protocol<"Callable", [!py.contract<"types.GeneratorType", [!py.contract<"$Y">, !py.contract<"$S">, !py.contract<"$R">]>] -> [!py.contract<"types.GeneratorType", [!py.contract<"$Y">, !py.contract<"$S">, !py.contract<"$R">]>]>,
+      !py.protocol<"Callable", [!py.contract<"types.GeneratorType", [!py.contract<"$Y">, !py.contract<"$S">, !py.contract<"$R">]>] -> [!py.contract<"$Y">]>,
+      !py.protocol<"Callable", [!py.contract<"types.GeneratorType", [!py.contract<"$Y">, !py.contract<"$S">, !py.contract<"$R">]>, !py.contract<"$S">] -> [!py.contract<"$Y">]>,
+      !py.protocol<"Callable", [!py.contract<"types.GeneratorType", [!py.contract<"$Y">, !py.contract<"$S">, !py.contract<"$R">]>, !py.contract<"builtins.BaseException">] -> [!py.contract<"$Y">]>,
       !py.protocol<"Callable", [!py.contract<"types.GeneratorType", [!py.contract<"$Y">, !py.contract<"$S">, !py.contract<"$R">]>] -> [!py.literal<None>]>
     ],
-    method_kinds = ["instance", "instance"]
+    method_kinds = ["instance", "instance", "instance", "instance",
+                    "instance"]
   } {}
 
   py.class @CoroutineAwaitIterator attributes {

@@ -200,6 +200,8 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
 
   if (std::optional<Value> v = tryEmitLenCall(expr, calleeNode))
     return *v;
+  if (std::optional<Value> v = tryEmitNextCall(expr, calleeNode))
+    return *v;
   if (std::optional<Value> v = tryEmitRoundCall(expr, calleeNode))
     return *v;
 
@@ -1066,6 +1068,45 @@ ModuleEmitter::tryEmitLenCall(const parser::Node &expr,
     return Value{op.getResult(), resultType};
   }
   return std::nullopt;
+}
+
+std::optional<Value>
+ModuleEmitter::tryEmitNextCall(const parser::Node &expr,
+                               const parser::Node *calleeNode) {
+  if (!calleeNode || calleeNode->kind != "Name" ||
+      ast::nameSpelling(*calleeNode) != "next")
+    return std::nullopt;
+  // A local binding named `next` shadows the builtin.
+  if (values.find("next") != values.end())
+    return std::nullopt;
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  if (keywords && !keywords->empty())
+    return std::nullopt;
+  // Only the one-argument form; `next(it, default)` needs a union result
+  // and StopIteration interception, which the static surface does not
+  // provide yet.
+  if (!args || args->size() != 1) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "next() currently supports exactly one iterator argument"});
+    return emitNone(expr);
+  }
+  Value receiver = emitExpr(args->front().get());
+  CallInferenceResult inference =
+      types.inferMethodCallWithEvidence(receiver.type, "__next__", {});
+  if (!requireStaticEvidence(expr, inference))
+    return emitNone(expr);
+  mlir::Type resultType = inference ? inference.resultType : types.object();
+  Value posPack = emitPack({});
+  Value namePack = emitPack({});
+  Value valuePack = emitPack({});
+  auto op =
+      py::CallOp::create(builder, loc(expr), mlir::TypeRange{resultType},
+                         callProtocolFor(inference), receiver.value,
+                         posPack.value, namePack.value, valuePack.value);
+  op->setAttr("ly.bound_method", builder.getStringAttr("__next__"));
+  return Value{op.getResults().front(), resultType};
 }
 
 std::optional<Value>

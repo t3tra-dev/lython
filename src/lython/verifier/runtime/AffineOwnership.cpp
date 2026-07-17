@@ -1796,8 +1796,55 @@ mlir::LogicalResult verifyPathSensitiveAffineOwnership(
       });
 }
 
+// Generator frames (rfc/stdlib-semantics.md R3): an Own(rho) crossing a
+// yield is absorbed by the generator object, which must release it on
+// drop/close. The current resume tier instantiates that judgment
+// degenerately — the suspension ABI is NonObject-only (raw i64/i1 lanes),
+// so the frame provably holds no owned resource and the drop/close release
+// obligation is vacuously discharged. This rule pins the invariant: an
+// object-family type on a resume clone boundary would be an Own smuggled
+// across a suspension with no phase inserting its frame release, so it is
+// rejected here rather than silently leaked. Widening the frame to owned
+// values requires materializing a frame release contract on the generator
+// deallocator/close path first, then relaxing this check to consume it.
+mlir::LogicalResult verifyGeneratorResumeFrames(mlir::ModuleOp module) {
+  return walkVerify<mlir::func::FuncOp>(
+      module, [&](mlir::func::FuncOp function) {
+        if (!function->hasAttr("ly.generator.resume"))
+          return mlir::success();
+        auto isNonObjectLane = [](mlir::Type type) {
+          return type.isInteger(64) || type.isInteger(1) || type.isIndex();
+        };
+        mlir::FunctionType type = function.getFunctionType();
+        for (mlir::Type input : type.getInputs())
+          if (!isNonObjectLane(input)) {
+            function.emitError()
+                << "generator resume frame argument type " << input
+                << " is not a NonObject lane; an owned value may not "
+                   "cross a suspension boundary without a generator "
+                   "frame release contract";
+            return mlir::failure();
+          }
+        for (mlir::Type result : type.getResults())
+          if (!isNonObjectLane(result)) {
+            function.emitError()
+                << "generator resume suspend result type " << result
+                << " is not a NonObject lane; an owned value may not "
+                   "cross a suspension boundary without a generator "
+                   "frame release contract";
+            return mlir::failure();
+          }
+        return mlir::success();
+      });
+}
+
 mlir::LogicalResult
 verifyFuncCallOwnershipContractsImpl(mlir::ModuleOp module) {
+  {
+    py::PerfScope perf("func-call-ownership.generator-frames");
+    if (mlir::failed(verifyGeneratorResumeFrames(module)))
+      return mlir::failure();
+  }
   own::AliasAnalysis aliases;
   {
     py::PerfScope perf("func-call-ownership.alias-analysis");

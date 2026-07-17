@@ -1,0 +1,13 @@
+1
+cleanup
+closed twice ok
+fresh close ok
+1
+swallowed
+swallow close ok
+1
+RuntimeError: generator ignored GeneratorExit
+1
+2
+drained
+done
