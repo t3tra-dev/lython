@@ -133,9 +133,50 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCall(py::CallOp op) {
 
 mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
     py::CallOp op, const RuntimeBundle &receiver, llvm::StringRef methodName) {
-  if (receiver.kind == RuntimeBundle::Kind::TypeObject)
+  if (receiver.kind == RuntimeBundle::Kind::TypeObject) {
+    // Builtin classmethods (bytes.fromhex, ...) are manifest initializers
+    // named after the method; the ctypes type-object surface keeps its own
+    // dispatch below because its callables are synthesized, not manifest
+    // symbols.
+    std::string contract = receiver.instanceContractName();
+    if (std::optional<RuntimeSymbol> initializer =
+            manifest.initializer(contract, methodName)) {
+      if (op.getNumResults() != 1)
+        return op.emitError() << "builtin classmethod lowering expects "
+                                 "exactly one Python result";
+      if (mlir::failed(
+              requireEmptyAggregate(op, op.getKwnames(), "kw names")) ||
+          mlir::failed(
+              requireEmptyAggregate(op, op.getKwvalues(), "kw values")))
+        return mlir::failure();
+      if (mlir::failed(verifySelectedRuntimeTarget(op, *initializer)))
+        return mlir::failure();
+      llvm::SmallVector<const RuntimeBundle *, 8> sources;
+      llvm::SmallVector<RuntimeBundle, 8> unpackedSources;
+      if (mlir::failed(collectPackedObjectSources(op, op.getPosargs(),
+                                                  "positional args", sources,
+                                                  &unpackedSources)))
+        return mlir::failure();
+      llvm::SmallVector<mlir::Value, 8> operands;
+      builder.setInsertionPoint(op);
+      if (mlir::failed(buildRuntimeCallOperands(op, *initializer, sources,
+                                                operands,
+                                                /*allowUnusedSources=*/true,
+                                                &receiver)))
+        return mlir::failure();
+      mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+          op.getLoc(), *initializer, operands);
+      RuntimeBundle result;
+      if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
+              op, op.getResult(0).getType(), call, result)))
+        return mlir::failure();
+      valueBundles[op.getResult(0)] = std::move(result);
+      erase.push_back(op);
+      return mlir::success();
+    }
     return RuntimeBundleLowerer::lowerStaticCtypesTypeObjectMethodCall(
         op, receiver, methodName);
+  }
   if (receiver.kind != RuntimeBundle::Kind::Object)
     return op.emitError() << "bound method receiver must be an object bundle";
   bool structuralMutation =
