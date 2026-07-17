@@ -1,0 +1,32 @@
+4
+-1
+2
+20
+True
+True
+True
+b'spam'
+b'spam'
+[b'a', b'b', b'', b'c']
+[b'one', b'two']
+[b'a', b'b,c']
+b'two two'
+b'two one'
+6465616442454546
+00ff10
+b'\xde\xad\xbe\xef'
+b'.\xf0\xf1\xf2'
+b''
+b'a, bb, ccc'
+b''
+b'ababab'
+b''
+hello
+hello
+héllo
+b'a'
+b'b'
+b'c'
+fromhex: non-hexadecimal number found in fromhex() arg at position 2
+odd: non-hexadecimal number found in fromhex() arg at position 3
+split: empty separator

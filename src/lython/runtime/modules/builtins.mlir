@@ -14,6 +14,23 @@
 //   - Method contracts are Callable terms in `method_contracts`; hand-written
 //     manifests may use the typeshed-shaped `!py.protocol<"Callable", ...>`
 //     spelling with `!py.callable<...>` for nested/variadic terms.
+//
+// Deviations from CPython (per project convention, recorded here):
+//   - Exceptions carry at most one str argument: `X(a, b)` is not
+//     constructible, `e.args` is `()` or a 1-tuple, and `repr(X(''))`
+//     renders as `X()` (an empty message and no message share one payload).
+//     ExceptionGroup accepts a single message (no exception list yet);
+//     UnicodeDecodeError/UnicodeEncodeError take a message instead of
+//     CPython's 5-argument form, and decode failures carry a simplified
+//     message ("invalid utf-8 sequence").
+//   - str.split(None, maxsplit) is not accepted; only the no-argument form
+//     selects whitespace splitting. str/bytes `.join` accepts list/tuple
+//     operands (no arbitrary-iterable protocol dispatch yet).
+//   - str.translate / str.maketrans are absent until the hash-based dict
+//     rework lands (they need int-keyed runtime dicts).
+//   - bytes.decode accepts only utf-8/strict and validates the arguments
+//     eagerly (CPython's codec lookup is lazy); unknown encodings raise
+//     LookupError up front.
 
 module attributes {
   ly.typing.manifest,

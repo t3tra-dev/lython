@@ -1,0 +1,21 @@
+arith: too big
+runtime: later
+recursion: deep
+import: no mod
+name: no local
+conn: pipe
+os: refused
+indent: bad tab
+syntax: bad tab 2
+warning: old
+value: uni
+base: stop
+exc: eof
+right handler: denied
+ValueError('boom')
+OverflowError()
+TimeoutError('late')
+attr
+('range',)
+1
+()

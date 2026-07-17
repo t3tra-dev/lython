@@ -1,0 +1,28 @@
+['a', 'b', '', 'c']
+['a', 'b,c']
+['a,b,c']
+['one', 'two', 'three']
+[]
+[]
+['', 'a']
+['a', '']
+['a,b', 'c']
+['one', 'two', 'three']
+['ab c', '', 'de fg', 'kl']
+['ab c\n', '\n', 'de fg\r', 'kl\r\n']
+['line1', 'line2']
+[]
+('key', '=', 'value=rest')
+('key=value', '=', 'rest')
+('plain', '', '')
+('', '', 'plain')
+one, two, three
+sp-m
+abc
+
+あ・い
+3
+2026 07 17
+6
+split: empty separator
+partition: empty separator
