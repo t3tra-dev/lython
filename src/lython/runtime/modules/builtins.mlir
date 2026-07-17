@@ -6116,6 +6116,645 @@ module attributes {
     func.return %out_header, %out_bytes : memref<2xi64>, memref<?xi8>
   }
 
+
+  // ===== str splitting / joining (Wave 1) =====
+
+  // "empty separator"
+  memref.global "private" constant @__ly_unicode_msg_empty_separator : memref<15xi8> = dense<[101, 109, 112, 116, 121, 32, 115, 101, 112, 97, 114, 97, 116, 111, 114]>
+
+  // Pack an owned str into payload box slot %slot. The layout mirrors
+  // objectPayloadHandleWords (BoxLayout.h): [0] refcount word, [1] class id,
+  // [2] entity root, [3] value count, [4,9) physical pointers, [9,14)
+  // physical sizes, [14] owned flag. The reference transfers to the
+  // container; the deallocator releases it through the boxed-release hook.
+  func.func private @__ly_unicode_store_item(%items: memref<?xi64>, %slot: i64, %eh: memref<2xi64> {ly.ownership.object_header}, %eb: memref<?xi8>) attributes {ly.ownership.transfer_args = [2]} {
+    %c0 = arith.constant 0 : index
+    %handle_words = arith.constant 16 : i64
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %str_class = arith.constant 4 : i64
+    %base_i64 = arith.muli %slot, %handle_words : i64
+    %base = arith.index_cast %base_i64 : i64 to index
+    %hdr_ptr_index = memref.extract_aligned_pointer_as_index %eh : memref<2xi64> -> index
+    %hdr_ptr = arith.index_cast %hdr_ptr_index : index to i64
+    %bytes_ptr_index = memref.extract_aligned_pointer_as_index %eb : memref<?xi8> -> index
+    %bytes_ptr = arith.index_cast %bytes_ptr_index : index to i64
+    %dim = memref.dim %eb, %c0 : memref<?xi8>
+    %byte_len = arith.index_cast %dim : index to i64
+    %w0 = arith.constant 0 : index
+    %w1 = arith.constant 1 : index
+    %w2 = arith.constant 2 : index
+    %w3 = arith.constant 3 : index
+    %w4 = arith.constant 4 : index
+    %w5 = arith.constant 5 : index
+    %w6 = arith.constant 6 : index
+    %w7 = arith.constant 7 : index
+    %w8 = arith.constant 8 : index
+    %w9 = arith.constant 9 : index
+    %w10 = arith.constant 10 : index
+    %w11 = arith.constant 11 : index
+    %w12 = arith.constant 12 : index
+    %w13 = arith.constant 13 : index
+    %w14 = arith.constant 14 : index
+    %w15 = arith.constant 15 : index
+    %s0 = arith.addi %base, %w0 : index
+    %s1 = arith.addi %base, %w1 : index
+    %s2 = arith.addi %base, %w2 : index
+    %s3 = arith.addi %base, %w3 : index
+    %s4 = arith.addi %base, %w4 : index
+    %s5 = arith.addi %base, %w5 : index
+    %s6 = arith.addi %base, %w6 : index
+    %s7 = arith.addi %base, %w7 : index
+    %s8 = arith.addi %base, %w8 : index
+    %s9 = arith.addi %base, %w9 : index
+    %s10 = arith.addi %base, %w10 : index
+    %s11 = arith.addi %base, %w11 : index
+    %s12 = arith.addi %base, %w12 : index
+    %s13 = arith.addi %base, %w13 : index
+    %s14 = arith.addi %base, %w14 : index
+    %s15 = arith.addi %base, %w15 : index
+    memref.store %one, %items[%s0] : memref<?xi64>
+    memref.store %str_class, %items[%s1] : memref<?xi64>
+    memref.store %hdr_ptr, %items[%s2] : memref<?xi64>
+    memref.store %two, %items[%s3] : memref<?xi64>
+    memref.store %hdr_ptr, %items[%s4] : memref<?xi64>
+    memref.store %bytes_ptr, %items[%s5] : memref<?xi64>
+    memref.store %zero, %items[%s6] : memref<?xi64>
+    memref.store %zero, %items[%s7] : memref<?xi64>
+    memref.store %zero, %items[%s8] : memref<?xi64>
+    memref.store %two, %items[%s9] : memref<?xi64>
+    memref.store %byte_len, %items[%s10] : memref<?xi64>
+    memref.store %zero, %items[%s11] : memref<?xi64>
+    memref.store %zero, %items[%s12] : memref<?xi64>
+    memref.store %zero, %items[%s13] : memref<?xi64>
+    memref.store %one, %items[%s14] : memref<?xi64>
+    memref.store %zero, %items[%s15] : memref<?xi64>
+    func.return
+  }
+
+  // Store a freshly sliced [start, end) segment into box slot %slot.
+  func.func private @__ly_unicode_store_slice(%items: memref<?xi64>, %slot: i64, %header: memref<2xi64>, %bytes: memref<?xi8>, %start: index, %end: index) {
+    %piece:2 = func.call @__ly_unicode_slice(%header, %bytes, %start, %end) : (memref<2xi64>, memref<?xi8>, index, index) -> (memref<2xi64>, memref<?xi8>)
+    func.call @__ly_unicode_store_item(%items, %slot, %piece#0, %piece#1) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>) -> ()
+    func.return
+  }
+
+  // str.split(sep[, maxsplit]) -- explicit separator form. The empty
+  // separator raises like CPython.
+  func.func @LyUnicode_Split(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %sep_header: memref<2xi64> {ly.ownership.object_header}, %sep_bytes: memref<?xi8>, %maxsplit: i64 {ly.runtime.default_i64 = -1 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "split", ly.runtime.result_contract = "builtins.list", ly.runtime.element_contract = "builtins.str"} {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %minus_one = arith.constant -1 : i64
+    %false_bit = arith.constant false
+    %len = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %sep_n = func.call @__ly_unicode_count(%sep_header, %sep_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %sep_width = func.call @__ly_unicode_width(%sep_header) : (memref<2xi64>) -> i64
+    %sep_empty = arith.cmpi eq, %sep_n, %zero : i64
+    scf.if %sep_empty {
+      %class_id = arith.constant 53 : i64
+      %length = arith.constant 15 : i64
+      %static = memref.get_global @__ly_unicode_msg_empty_separator : memref<15xi8>
+      %message = memref.cast %static : memref<15xi8> to memref<?xi8>
+      func.call @__ly_unicode_raise(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    }
+
+    // Pass 1: number of separators actually used.
+    %true_split1 = arith.constant true
+    %count:3 = scf.while (%pos = %zero, %used = %zero, %go = %true_split1) : (i64, i64, i1) -> (i64, i64, i1) {
+      scf.condition(%go) %pos, %used, %go : i64, i64, i1
+    } do {
+    ^bb0(%pos: i64, %used: i64, %go: i1):
+      %budget_left = arith.cmpi ne, %used, %maxsplit : i64
+      %hit = scf.if %budget_left -> (i64) {
+        %found = func.call @__ly_unicode_find_core(%bytes, %width, %sep_bytes, %sep_width, %pos, %len, %sep_n, %false_bit) : (memref<?xi8>, i64, memref<?xi8>, i64, i64, i64, i64, i1) -> i64
+        scf.yield %found : i64
+      } else {
+        scf.yield %minus_one : i64
+      }
+      %matched = arith.cmpi sge, %hit, %zero : i64
+      %next_pos_hit = arith.addi %hit, %sep_n : i64
+      %next_pos = arith.select %matched, %next_pos_hit, %pos : i64
+      %bump = arith.select %matched, %one, %zero : i64
+      %next_used = arith.addi %used, %bump : i64
+      scf.yield %next_pos, %next_used, %matched : i64, i64, i1
+    }
+
+    %segments = arith.addi %count#1, %one : i64
+    %list:3 = func.call @LyList_FromLength(%segments) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+
+    // Pass 2: emit the segments.
+    %true_split2 = arith.constant true
+    %emit:3 = scf.while (%pos = %zero, %slot = %zero, %go = %true_split2) : (i64, i64, i1) -> (i64, i64, i1) {
+      scf.condition(%go) %pos, %slot, %go : i64, i64, i1
+    } do {
+    ^bb0(%pos: i64, %slot: i64, %go: i1):
+      %remaining = arith.subi %segments, %one : i64
+      %budget_left = arith.cmpi slt, %slot, %remaining : i64
+      %hit = scf.if %budget_left -> (i64) {
+        %found = func.call @__ly_unicode_find_core(%bytes, %width, %sep_bytes, %sep_width, %pos, %len, %sep_n, %false_bit) : (memref<?xi8>, i64, memref<?xi8>, i64, i64, i64, i64, i1) -> i64
+        scf.yield %found : i64
+      } else {
+        scf.yield %minus_one : i64
+      }
+      %matched = arith.cmpi sge, %hit, %zero : i64
+      scf.if %matched {
+        %pos_index = arith.index_cast %pos : i64 to index
+        %hit_index = arith.index_cast %hit : i64 to index
+        func.call @__ly_unicode_store_slice(%list#2, %slot, %header, %bytes, %pos_index, %hit_index) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>, index, index) -> ()
+      }
+      %next_pos_hit = arith.addi %hit, %sep_n : i64
+      %next_pos = arith.select %matched, %next_pos_hit, %pos : i64
+      %bump = arith.select %matched, %one, %zero : i64
+      %next_slot = arith.addi %slot, %bump : i64
+      scf.yield %next_pos, %next_slot, %matched : i64, i64, i1
+    }
+    %tail_start = arith.index_cast %emit#0 : i64 to index
+    %len_index = arith.index_cast %len : i64 to index
+    func.call @__ly_unicode_store_slice(%list#2, %emit#1, %header, %bytes, %tail_start, %len_index) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>, index, index) -> ()
+    func.return %list#0, %list#1, %list#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  }
+
+  // str.rsplit(sep[, maxsplit]): scans right-to-left (a left scan with a
+  // skip count is wrong when candidate matches overlap: "aaa".rsplit("aa")
+  // is ['a', ''], not ['', 'a']), filling slots from the back.
+  func.func @LyUnicode_RSplit(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %sep_header: memref<2xi64> {ly.ownership.object_header}, %sep_bytes: memref<?xi8>, %maxsplit: i64 {ly.runtime.default_i64 = -1 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "rsplit", ly.runtime.result_contract = "builtins.list", ly.runtime.element_contract = "builtins.str"} {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %minus_one = arith.constant -1 : i64
+    %true_bit = arith.constant true
+    %len = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %sep_n = func.call @__ly_unicode_count(%sep_header, %sep_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %sep_width = func.call @__ly_unicode_width(%sep_header) : (memref<2xi64>) -> i64
+    %sep_empty = arith.cmpi eq, %sep_n, %zero : i64
+    scf.if %sep_empty {
+      %class_id = arith.constant 53 : i64
+      %length = arith.constant 15 : i64
+      %static = memref.get_global @__ly_unicode_msg_empty_separator : memref<15xi8>
+      %message = memref.cast %static : memref<15xi8> to memref<?xi8>
+      func.call @__ly_unicode_raise(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    }
+
+    %true_rsplit1 = arith.constant true
+    %count:3 = scf.while (%end = %len, %used = %zero, %go = %true_rsplit1) : (i64, i64, i1) -> (i64, i64, i1) {
+      scf.condition(%go) %end, %used, %go : i64, i64, i1
+    } do {
+    ^bb0(%end: i64, %used: i64, %go: i1):
+      %budget_left = arith.cmpi ne, %used, %maxsplit : i64
+      %hit = scf.if %budget_left -> (i64) {
+        %found = func.call @__ly_unicode_find_core(%bytes, %width, %sep_bytes, %sep_width, %zero, %end, %sep_n, %true_bit) : (memref<?xi8>, i64, memref<?xi8>, i64, i64, i64, i64, i1) -> i64
+        scf.yield %found : i64
+      } else {
+        scf.yield %minus_one : i64
+      }
+      %matched = arith.cmpi sge, %hit, %zero : i64
+      %next_end = arith.select %matched, %hit, %end : i64
+      %bump = arith.select %matched, %one, %zero : i64
+      %next_used = arith.addi %used, %bump : i64
+      scf.yield %next_end, %next_used, %matched : i64, i64, i1
+    }
+
+    %segments = arith.addi %count#1, %one : i64
+    %list:3 = func.call @LyList_FromLength(%segments) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+
+    %true_rsplit2 = arith.constant true
+    %emit:3 = scf.while (%end = %len, %slot = %count#1, %go = %true_rsplit2) : (i64, i64, i1) -> (i64, i64, i1) {
+      scf.condition(%go) %end, %slot, %go : i64, i64, i1
+    } do {
+    ^bb0(%end: i64, %slot: i64, %go: i1):
+      %budget_left = arith.cmpi sgt, %slot, %zero : i64
+      %hit = scf.if %budget_left -> (i64) {
+        %found = func.call @__ly_unicode_find_core(%bytes, %width, %sep_bytes, %sep_width, %zero, %end, %sep_n, %true_bit) : (memref<?xi8>, i64, memref<?xi8>, i64, i64, i64, i64, i1) -> i64
+        scf.yield %found : i64
+      } else {
+        scf.yield %minus_one : i64
+      }
+      %matched = arith.cmpi sge, %hit, %zero : i64
+      scf.if %matched {
+        %seg_start = arith.addi %hit, %sep_n : i64
+        %seg_start_index = arith.index_cast %seg_start : i64 to index
+        %end_index = arith.index_cast %end : i64 to index
+        func.call @__ly_unicode_store_slice(%list#2, %slot, %header, %bytes, %seg_start_index, %end_index) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>, index, index) -> ()
+      }
+      %next_end = arith.select %matched, %hit, %end : i64
+      %bump = arith.select %matched, %one, %zero : i64
+      %next_slot = arith.subi %slot, %bump : i64
+      scf.yield %next_end, %next_slot, %matched : i64, i64, i1
+    }
+    %c0 = arith.constant 0 : index
+    %head_end = arith.index_cast %emit#0 : i64 to index
+    func.call @__ly_unicode_store_slice(%list#2, %zero, %header, %bytes, %c0, %head_end) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>, index, index) -> ()
+    func.return %list#0, %list#1, %list#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  }
+
+  // Whitespace split (str.split() / str.rsplit() with no separator): runs
+  // of Unicode whitespace delimit; leading/trailing whitespace produces no
+  // empty segments. Unlimited maxsplit makes the two directions agree, so
+  // one forward implementation serves both names.
+  func.func private @__ly_unicode_split_ws_core(%header: memref<2xi64>, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0]} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %len = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %len_index = arith.index_cast %len : i64 to index
+
+    // Pass 1: segment count = number of non-space runs.
+    %false_ws1 = arith.constant false
+    %count:2 = scf.for %i = %c0 to %len_index step %c1 iter_args(%segs = %zero, %in_run = %false_ws1) -> (i64, i1) {
+      %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
+      %is_space = func.call @__ly_unicode_cp_is_space(%cp) : (i64) -> i1
+      %true_w = arith.constant true
+      %non_space = arith.xori %is_space, %true_w : i1
+      %not_in_run = arith.xori %in_run, %true_w : i1
+      %starts = arith.andi %non_space, %not_in_run : i1
+      %bump = arith.select %starts, %one, %zero : i64
+      %next_segs = arith.addi %segs, %bump : i64
+      scf.yield %next_segs, %non_space : i64, i1
+    }
+
+    %list:3 = func.call @LyList_FromLength(%count#0) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+
+    // Pass 2: emit each run.
+    %false_ws2 = arith.constant false
+    scf.for %i = %c0 to %len_index step %c1 iter_args(%slot = %zero, %run_start = %len_index, %in_run = %false_ws2) -> (i64, index, i1) {
+      %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
+      %is_space = func.call @__ly_unicode_cp_is_space(%cp) : (i64) -> i1
+      %true_w = arith.constant true
+      %non_space = arith.xori %is_space, %true_w : i1
+      %not_in_run = arith.xori %in_run, %true_w : i1
+      %starts = arith.andi %non_space, %not_in_run : i1
+      %ends = arith.andi %is_space, %in_run : i1
+      %new_start = arith.select %starts, %i, %run_start : index
+      scf.if %ends {
+        func.call @__ly_unicode_store_slice(%list#2, %slot, %header, %bytes, %run_start, %i) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>, index, index) -> ()
+      }
+      %bump = arith.select %ends, %one, %zero : i64
+      %next_slot = arith.addi %slot, %bump : i64
+      %last = arith.subi %len_index, %c1 : index
+      %is_last = arith.cmpi eq, %i, %last : index
+      %closes = arith.andi %is_last, %non_space : i1
+      scf.if %closes {
+        func.call @__ly_unicode_store_slice(%list#2, %next_slot, %header, %bytes, %new_start, %len_index) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>, index, index) -> ()
+      }
+      scf.yield %next_slot, %new_start, %non_space : i64, index, i1
+    }
+    func.return %list#0, %list#1, %list#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  }
+
+  func.func @LyUnicode_SplitWS(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "split", ly.runtime.result_contract = "builtins.list", ly.runtime.element_contract = "builtins.str"} {
+    %result:3 = func.call @__ly_unicode_split_ws_core(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  }
+
+  func.func @LyUnicode_RSplitWS(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "rsplit", ly.runtime.result_contract = "builtins.list", ly.runtime.element_contract = "builtins.str"} {
+    %result:3 = func.call @__ly_unicode_split_ws_core(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  }
+
+  // Unicode line boundaries per CPython str.splitlines: \n \v \f \r \x1c
+  // \x1d \x1e \x85 \u2028 \u2029, with \r\n as one boundary.
+  func.func private @__ly_unicode_cp_is_linebreak(%cp: i64) -> i1 {
+    %nl = arith.constant 10 : i64
+    %vt = arith.constant 11 : i64
+    %ff = arith.constant 12 : i64
+    %cr = arith.constant 13 : i64
+    %fs = arith.constant 28 : i64
+    %gs = arith.constant 29 : i64
+    %rs = arith.constant 30 : i64
+    %nel = arith.constant 133 : i64
+    %ls = arith.constant 8232 : i64
+    %ps = arith.constant 8233 : i64
+    %in_c0 = arith.cmpi sge, %cp, %nl : i64
+    %le_cr = arith.cmpi sle, %cp, %cr : i64
+    %ctl = arith.andi %in_c0, %le_cr : i1
+    %ge_fs = arith.cmpi sge, %cp, %fs : i64
+    %le_rs = arith.cmpi sle, %cp, %rs : i64
+    %seps = arith.andi %ge_fs, %le_rs : i1
+    %is_nel = arith.cmpi eq, %cp, %nel : i64
+    %is_ls = arith.cmpi eq, %cp, %ls : i64
+    %is_ps = arith.cmpi eq, %cp, %ps : i64
+    %a = arith.ori %ctl, %seps : i1
+    %b = arith.ori %is_nel, %is_ls : i1
+    %c = arith.ori %b, %is_ps : i1
+    %result = arith.ori %a, %c : i1
+    func.return %result : i1
+  }
+
+  func.func private @__ly_unicode_splitlines_core(%header: memref<2xi64>, %bytes: memref<?xi8>, %keepends: i1) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0]} {
+    %c1i = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %cr = arith.constant 13 : i64
+    %nl = arith.constant 10 : i64
+    %len = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+
+    // Pass 1: line count.
+    %count:2 = scf.while (%i = %zero, %lines = %zero) : (i64, i64) -> (i64, i64) {
+      %more = arith.cmpi slt, %i, %len : i64
+      scf.condition(%more) %i, %lines : i64, i64
+    } do {
+    ^bb0(%i: i64, %lines: i64):
+      // Scan to the end of this line's content.
+      %true_lines1 = arith.constant true
+      %scan:2 = scf.while (%j = %i, %go = %true_lines1) : (i64, i1) -> (i64, i1) {
+        %in_bounds = arith.cmpi slt, %j, %len : i64
+        %continue = arith.andi %in_bounds, %go : i1
+        scf.condition(%continue) %j, %go : i64, i1
+      } do {
+      ^bb1(%j: i64, %go: i1):
+        %j_index = arith.index_cast %j : i64 to index
+        %cp = func.call @__ly_unicode_get(%bytes, %width, %j_index) : (memref<?xi8>, i64, index) -> i64
+        %brk = func.call @__ly_unicode_cp_is_linebreak(%cp) : (i64) -> i1
+        %true_x = arith.constant true
+        %not_brk = arith.xori %brk, %true_x : i1
+        %next = arith.addi %j, %one : i64
+        %sel = arith.select %brk, %j, %next : i64
+        scf.yield %sel, %not_brk : i64, i1
+      }
+      %ended = arith.cmpi slt, %scan#0, %len : i64
+      %skip = scf.if %ended -> (i64) {
+        %eol_index = arith.index_cast %scan#0 : i64 to index
+        %cp = func.call @__ly_unicode_get(%bytes, %width, %eol_index) : (memref<?xi8>, i64, index) -> i64
+        %is_cr = arith.cmpi eq, %cp, %cr : i64
+        %next_pos = arith.addi %scan#0, %one : i64
+        %has_next = arith.cmpi slt, %next_pos, %len : i64
+        %pair = arith.andi %is_cr, %has_next : i1
+        %crlf = scf.if %pair -> (i1) {
+          %next_index = arith.index_cast %next_pos : i64 to index
+          %cp2 = func.call @__ly_unicode_get(%bytes, %width, %next_index) : (memref<?xi8>, i64, index) -> i64
+          %is_nl = arith.cmpi eq, %cp2, %nl : i64
+          scf.yield %is_nl : i1
+        } else {
+          %false_x = arith.constant false
+          scf.yield %false_x : i1
+        }
+        %stride = arith.select %crlf, %two, %one : i64
+        scf.yield %stride : i64
+      } else {
+        scf.yield %zero : i64
+      }
+      %next_i = arith.addi %scan#0, %skip : i64
+      %next_lines = arith.addi %lines, %one : i64
+      scf.yield %next_i, %next_lines : i64, i64
+    }
+
+    %list:3 = func.call @LyList_FromLength(%count#1) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+
+    // Pass 2: emit each line ([start, eol) or [start, eol+break)).
+    %emitted:2 = scf.while (%i = %zero, %slot = %zero) : (i64, i64) -> (i64, i64) {
+      %more = arith.cmpi slt, %i, %len : i64
+      scf.condition(%more) %i, %slot : i64, i64
+    } do {
+    ^bb0(%i: i64, %slot: i64):
+      %true_lines2 = arith.constant true
+      %scan:2 = scf.while (%j = %i, %go = %true_lines2) : (i64, i1) -> (i64, i1) {
+        %in_bounds = arith.cmpi slt, %j, %len : i64
+        %continue = arith.andi %in_bounds, %go : i1
+        scf.condition(%continue) %j, %go : i64, i1
+      } do {
+      ^bb1(%j: i64, %go: i1):
+        %j_index = arith.index_cast %j : i64 to index
+        %cp = func.call @__ly_unicode_get(%bytes, %width, %j_index) : (memref<?xi8>, i64, index) -> i64
+        %brk = func.call @__ly_unicode_cp_is_linebreak(%cp) : (i64) -> i1
+        %true_x = arith.constant true
+        %not_brk = arith.xori %brk, %true_x : i1
+        %next = arith.addi %j, %one : i64
+        %sel = arith.select %brk, %j, %next : i64
+        scf.yield %sel, %not_brk : i64, i1
+      }
+      %ended = arith.cmpi slt, %scan#0, %len : i64
+      %skip = scf.if %ended -> (i64) {
+        %eol_index = arith.index_cast %scan#0 : i64 to index
+        %cp = func.call @__ly_unicode_get(%bytes, %width, %eol_index) : (memref<?xi8>, i64, index) -> i64
+        %is_cr = arith.cmpi eq, %cp, %cr : i64
+        %next_pos = arith.addi %scan#0, %one : i64
+        %has_next = arith.cmpi slt, %next_pos, %len : i64
+        %pair = arith.andi %is_cr, %has_next : i1
+        %crlf = scf.if %pair -> (i1) {
+          %next_index = arith.index_cast %next_pos : i64 to index
+          %cp2 = func.call @__ly_unicode_get(%bytes, %width, %next_index) : (memref<?xi8>, i64, index) -> i64
+          %is_nl = arith.cmpi eq, %cp2, %nl : i64
+          scf.yield %is_nl : i1
+        } else {
+          %false_x = arith.constant false
+          scf.yield %false_x : i1
+        }
+        %stride = arith.select %crlf, %two, %one : i64
+        scf.yield %stride : i64
+      } else {
+        scf.yield %zero : i64
+      }
+      %with_break = arith.addi %scan#0, %skip : i64
+      %seg_end = arith.select %keepends, %with_break, %scan#0 : i64
+      %i_index = arith.index_cast %i : i64 to index
+      %seg_end_index = arith.index_cast %seg_end : i64 to index
+      func.call @__ly_unicode_store_slice(%list#2, %slot, %header, %bytes, %i_index, %seg_end_index) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>, index, index) -> ()
+      %next_i = arith.addi %scan#0, %skip : i64
+      %next_slot = arith.addi %slot, %one : i64
+      scf.yield %next_i, %next_slot : i64, i64
+    }
+    func.return %list#0, %list#1, %list#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  }
+
+  func.func @LyUnicode_SplitLines(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "splitlines", ly.runtime.result_contract = "builtins.list", ly.runtime.element_contract = "builtins.str"} {
+    %false_bit = arith.constant false
+    %result:3 = func.call @__ly_unicode_splitlines_core(%header, %bytes, %false_bit) : (memref<2xi64>, memref<?xi8>, i1) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  }
+
+  func.func @LyUnicode_SplitLinesKeep(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %keepends: i1) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "splitlines", ly.runtime.result_contract = "builtins.list", ly.runtime.element_contract = "builtins.str"} {
+    %result:3 = func.call @__ly_unicode_splitlines_core(%header, %bytes, %keepends) : (memref<2xi64>, memref<?xi8>, i1) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  }
+
+  // str.partition / str.rpartition: a 3-tuple of fresh strs (the separator
+  // element is a retained reference to the operand, transferred to the
+  // tuple).
+  func.func private @__ly_unicode_partition_core(%header: memref<2xi64>, %bytes: memref<?xi8>, %sep_header: memref<2xi64>, %sep_bytes: memref<?xi8>, %reverse: i1) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0]} {
+    %c0 = arith.constant 0 : index
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %three = arith.constant 3 : i64
+    %len = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %sep_n = func.call @__ly_unicode_count(%sep_header, %sep_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %sep_width = func.call @__ly_unicode_width(%sep_header) : (memref<2xi64>) -> i64
+    %sep_empty = arith.cmpi eq, %sep_n, %zero : i64
+    scf.if %sep_empty {
+      %class_id = arith.constant 53 : i64
+      %length = arith.constant 15 : i64
+      %static = memref.get_global @__ly_unicode_msg_empty_separator : memref<15xi8>
+      %message = memref.cast %static : memref<15xi8> to memref<?xi8>
+      func.call @__ly_unicode_raise(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    }
+    %tuple:3 = func.call @LyTuple_FromLength(%three) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    %hit = func.call @__ly_unicode_find_core(%bytes, %width, %sep_bytes, %sep_width, %zero, %len, %sep_n, %reverse) : (memref<?xi8>, i64, memref<?xi8>, i64, i64, i64, i64, i1) -> i64
+    %matched = arith.cmpi sge, %hit, %zero : i64
+    scf.if %matched {
+      %hit_index = arith.index_cast %hit : i64 to index
+      %after = arith.addi %hit, %sep_n : i64
+      %after_index = arith.index_cast %after : i64 to index
+      %len_index = arith.index_cast %len : i64 to index
+      func.call @__ly_unicode_store_slice(%tuple#2, %zero, %header, %bytes, %c0, %hit_index) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>, index, index) -> ()
+      %sep_copy:2 = func.call @__ly_unicode_retain_self(%sep_header, %sep_bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      func.call @__ly_unicode_store_item(%tuple#2, %one, %sep_copy#0, %sep_copy#1) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>) -> ()
+      func.call @__ly_unicode_store_slice(%tuple#2, %two, %header, %bytes, %after_index, %len_index) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>, index, index) -> ()
+    } else {
+      %len_index = arith.index_cast %len : i64 to index
+      %whole:2 = func.call @__ly_unicode_retain_self(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      %empty1:2 = func.call @__ly_unicode_alloc(%zero, %one) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
+      %empty2:2 = func.call @__ly_unicode_alloc(%zero, %one) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
+      %whole_slot = arith.select %reverse, %two, %zero : i64
+      %e1_slot = arith.select %reverse, %zero, %one : i64
+      %e2_slot = arith.select %reverse, %one, %two : i64
+      func.call @__ly_unicode_store_item(%tuple#2, %whole_slot, %whole#0, %whole#1) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>) -> ()
+      func.call @__ly_unicode_store_item(%tuple#2, %e1_slot, %empty1#0, %empty1#1) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>) -> ()
+      func.call @__ly_unicode_store_item(%tuple#2, %e2_slot, %empty2#0, %empty2#1) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>) -> ()
+    }
+    func.return %tuple#0, %tuple#1, %tuple#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  }
+
+  func.func @LyUnicode_Partition(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %sep_header: memref<2xi64> {ly.ownership.object_header}, %sep_bytes: memref<?xi8>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "partition", ly.runtime.result_contract = "builtins.tuple", ly.runtime.element_contract = "builtins.str"} {
+    %false_bit = arith.constant false
+    %result:3 = func.call @__ly_unicode_partition_core(%header, %bytes, %sep_header, %sep_bytes, %false_bit) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>, i1) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  }
+
+  func.func @LyUnicode_RPartition(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %sep_header: memref<2xi64> {ly.ownership.object_header}, %sep_bytes: memref<?xi8>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "rpartition", ly.runtime.result_contract = "builtins.tuple", ly.runtime.element_contract = "builtins.str"} {
+    %true_bit = arith.constant true
+    %result:3 = func.call @__ly_unicode_partition_core(%header, %bytes, %sep_header, %sep_bytes, %true_bit) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>, i1) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  }
+
+  // Code point %i of a boxed element's code-unit buffer, addressed by the
+  // raw pointer words a payload box carries (native container elements have
+  // no memref views to reconstruct in manifest code).
+  func.func private @__ly_unicode_get_raw(%ptr: i64, %width: i64, %i: index) -> i64 {
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %i_i64 = arith.index_cast %i : index to i64
+    %off = arith.muli %i_i64, %width : i64
+    %addr = arith.addi %ptr, %off : i64
+    %llptr = llvm.inttoptr %addr : i64 to !llvm.ptr
+    %is1 = arith.cmpi eq, %width, %one : i64
+    %cp = scf.if %is1 -> (i64) {
+      %b = llvm.load %llptr : !llvm.ptr -> i8
+      %v = arith.extui %b : i8 to i64
+      scf.yield %v : i64
+    } else {
+      %is2 = arith.cmpi eq, %width, %two : i64
+      %inner = scf.if %is2 -> (i64) {
+        %h = llvm.load %llptr : !llvm.ptr -> i16
+        %v = arith.extui %h : i16 to i64
+        scf.yield %v : i64
+      } else {
+        %w = llvm.load %llptr : !llvm.ptr -> i32
+        %v = arith.extui %w : i32 to i64
+        scf.yield %v : i64
+      }
+      scf.yield %inner : i64
+    }
+    func.return %cp : i64
+  }
+
+  // (header ptr, code-unit ptr, byte length) words of element %slot.
+  func.func private @__ly_unicode_item_words(%items: memref<?xi64>, %slot: index) -> (i64, i64, i64) {
+    %c2 = arith.constant 2 : index
+    %c5 = arith.constant 5 : index
+    %c10 = arith.constant 10 : index
+    %c16 = arith.constant 16 : index
+    %base = arith.muli %slot, %c16 : index
+    %hdr_slot = arith.addi %base, %c2 : index
+    %ptr_slot = arith.addi %base, %c5 : index
+    %len_slot = arith.addi %base, %c10 : index
+    %hdr = memref.load %items[%hdr_slot] : memref<?xi64>
+    %ptr = memref.load %items[%ptr_slot] : memref<?xi64>
+    %blen = memref.load %items[%len_slot] : memref<?xi64>
+    func.return %hdr, %ptr, %blen : i64, i64, i64
+  }
+
+  // Character width of a boxed str element (the width word at header+16).
+  func.func private @__ly_unicode_raw_width(%hdr_ptr: i64) -> i64 {
+    %sixteen = arith.constant 16 : i64
+    %addr = arith.addi %hdr_ptr, %sixteen : i64
+    %llptr = llvm.inttoptr %addr : i64 to !llvm.ptr
+    %width = llvm.load %llptr : !llvm.ptr -> i64
+    func.return %width : i64
+  }
+
+  // str.join over a runtime list/tuple of strs (identical physical layout).
+  func.func @LyUnicode_Join(%sep_header: memref<2xi64> {ly.ownership.object_header}, %sep_bytes: memref<?xi8>, %seq_header: memref<2xi64> {ly.ownership.object_header}, %seq_meta: memref<2xi64>, %seq_items: memref<?xi64>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "join", ly.runtime.result_contract = "builtins.str"} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %sep_n = func.call @__ly_unicode_count(%sep_header, %sep_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %sep_width = func.call @__ly_unicode_width(%sep_header) : (memref<2xi64>) -> i64
+    %n = memref.load %seq_meta[%c0] : memref<2xi64>
+    %n_index = arith.index_cast %n : i64 to index
+
+    // Pass 1: total code points and widest element (operands are canonical,
+    // so widths bound the widest code point exactly).
+    %measure:2 = scf.for %k = %c0 to %n_index step %c1 iter_args(%total = %zero, %wmax = %one) -> (i64, i64) {
+      %hdr, %ptr, %blen = func.call @__ly_unicode_item_words(%seq_items, %k) : (memref<?xi64>, index) -> (i64, i64, i64)
+      %w = func.call @__ly_unicode_raw_width(%hdr) : (i64) -> i64
+      %count = arith.divsi %blen, %w : i64
+      %next_total = arith.addi %total, %count : i64
+      %wider = arith.cmpi sgt, %w, %wmax : i64
+      %next_wmax = arith.select %wider, %w, %wmax : i64
+      scf.yield %next_total, %next_wmax : i64, i64
+    }
+    %has_seps = arith.cmpi sgt, %n, %one : i64
+    %sep_uses_i64 = arith.subi %n, %one : i64
+    %sep_uses = arith.select %has_seps, %sep_uses_i64, %zero : i64
+    %sep_total = arith.muli %sep_uses, %sep_n : i64
+    %total = arith.addi %measure#0, %sep_total : i64
+    %true_j = arith.constant true
+    %sep_matters = arith.andi %has_seps, %true_j : i1
+    %wmax_with_sep = arith.maxsi %measure#1, %sep_width : i64
+    %out_width = arith.select %sep_matters, %wmax_with_sep, %measure#1 : i64
+
+    %out_header, %out_bytes = func.call @__ly_unicode_alloc(%total, %out_width) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
+
+    // Pass 2: elements with separators between them.
+    scf.for %k = %c0 to %n_index step %c1 iter_args(%pos = %c0) -> (index) {
+      %is_first = arith.cmpi eq, %k, %c0 : index
+      %true_k = arith.constant true
+      %needs_sep = arith.xori %is_first, %true_k : i1
+      %after_sep = scf.if %needs_sep -> (index) {
+        %sep_n_index = arith.index_cast %sep_n : i64 to index
+        scf.for %j = %c0 to %sep_n_index step %c1 {
+          %cp = func.call @__ly_unicode_get(%sep_bytes, %sep_width, %j) : (memref<?xi8>, i64, index) -> i64
+          %dst = arith.addi %pos, %j : index
+          func.call @__ly_unicode_put(%out_bytes, %out_width, %dst, %cp) : (memref<?xi8>, i64, index, i64) -> ()
+        }
+        %advanced = arith.addi %pos, %sep_n_index : index
+        scf.yield %advanced : index
+      } else {
+        scf.yield %pos : index
+      }
+      %hdr, %ptr, %blen = func.call @__ly_unicode_item_words(%seq_items, %k) : (memref<?xi64>, index) -> (i64, i64, i64)
+      %w = func.call @__ly_unicode_raw_width(%hdr) : (i64) -> i64
+      %count = arith.divsi %blen, %w : i64
+      %count_index = arith.index_cast %count : i64 to index
+      scf.for %j = %c0 to %count_index step %c1 {
+        %cp = func.call @__ly_unicode_get_raw(%ptr, %w, %j) : (i64, i64, index) -> i64
+        %dst = arith.addi %after_sep, %j : index
+        func.call @__ly_unicode_put(%out_bytes, %out_width, %dst, %cp) : (memref<?xi8>, i64, index, i64) -> ()
+      }
+      %next_pos = arith.addi %after_sep, %count_index : index
+      scf.yield %next_pos : index
+    }
+    func.return %out_header, %out_bytes : memref<2xi64>, memref<?xi8>
+  }
+
   // UTF-8 byte length of the encoded form (encode / print paths).
   func.func private @__ly_unicode_utf8_length(%header: memref<2xi64>, %bytes: memref<?xi8>) -> i64 {
     %c0 = arith.constant 0 : index
