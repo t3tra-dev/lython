@@ -481,6 +481,16 @@ bool canAbsorbZeroFill(mlir::linalg::MatmulOp matmul,
   return isPrimitiveZeroConstant(fill.getDpsInputOperand(0)->get());
 }
 
+// Why no matmul-plus-bias fusion: it measured a net loss and was removed. The
+// only place the SME kernel can absorb a bias is the accumulator seed --
+// arm_sme has no add-to-tile, and a ZA result is a virtual tile arith.addf
+// rejects, so there is no store-time add. Seeding ZA from the bias goes
+// through arm_sme.tile_load, which measured 5-9% slower on M4 Max f32
+// (2048^3/2560^3 A@x+b chains) than the separate streaming epilogue it would
+// replace. That epilogue is bandwidth-cheap and overlaps the next call; even
+// Accelerate leaves the bias separate (vDSP_vadd). A vector (row) bias, or an
+// SME2 add-to-tile, could change the arithmetic -- neither exists here.
+
 class MatmulZeroInitElisionPass
     : public mlir::PassWrapper<MatmulZeroInitElisionPass,
                                mlir::OperationPass<mlir::ModuleOp>> {

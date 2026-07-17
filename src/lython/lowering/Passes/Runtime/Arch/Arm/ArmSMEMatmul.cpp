@@ -1464,13 +1464,6 @@ public:
   void runOnOperation() final {
     if (!target.usesArmSME2())
       return;
-    // Automatic: packs when B is big enough to win (kSMEPanelMinRhsBytes).
-    // LY_SME_PACK=1 forces it everywhere, =0 disables it -- measurement
-    // overrides, not configuration.
-    const char *mode = getenv("LY_SME_PACK");
-    if (mode && mode[0] == '0')
-      return;
-    bool force = mode && mode[0] == '1';
     llvm::SmallVector<mlir::linalg::MatmulOp, 8> targets;
     getOperation().walk([&](mlir::linalg::MatmulOp matmul) {
       std::optional<StaticMatmulMemRefs> refs =
@@ -1489,9 +1482,11 @@ public:
       };
       if (!contiguous(refs->lhsType) || !contiguous(refs->rhsType))
         return;
+      // Packs only once B outgrows the L2 it would otherwise re-stream from;
+      // below that the strided kernel is faster (see kSMEPanelMinRhsBytes).
       std::uint64_t rhsBytes = static_cast<std::uint64_t>(refs->k) *
                                static_cast<std::uint64_t>(refs->n) * 4;
-      if (!force && rhsBytes < kSMEPanelMinRhsBytes)
+      if (rhsBytes < kSMEPanelMinRhsBytes)
         return;
       targets.push_back(matmul);
     });

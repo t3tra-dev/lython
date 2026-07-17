@@ -324,7 +324,6 @@ constexpr llvm::StringLiteral kPoolNName{"__lython_pool_n"};
 constexpr llvm::StringLiteral kPoolSlicesName{"__lython_pool_slices"};
 constexpr llvm::StringLiteral kPoolEpochName{"__lython_pool_epoch"};
 constexpr llvm::StringLiteral kPoolDoneName{"__lython_pool_done"};
-constexpr llvm::StringLiteral kPoolModeName{"__lython_pool_mode"};
 constexpr llvm::StringLiteral kPoolParkedName{"__lython_pool_parked"};
 constexpr llvm::StringLiteral kPoolPubParkedName{"__lython_pool_pub_parked"};
 constexpr llvm::StringLiteral kOsWaitPtrName{"__lython_os_wait_fn"};
@@ -850,8 +849,7 @@ void buildPoolGlobals(mlir::ModuleOp module, mlir::OpBuilder &builder) {
   };
   for (llvm::StringRef name :
        {kPoolStateName, kPoolWorkersName, kPoolNName, kPoolSlicesName,
-        kPoolEpochName, kPoolDoneName, kPoolParkedName, kPoolPubParkedName,
-        kPoolModeName})
+        kPoolEpochName, kPoolDoneName, kPoolParkedName, kPoolPubParkedName})
     makeI64(name);
   for (llvm::StringRef name :
        {kPoolFnName, kPoolCtxName, kOsWaitPtrName, kOsWakePtrName})
@@ -866,12 +864,11 @@ void buildPoolGlobals(mlir::ModuleOp module, mlir::OpBuilder &builder) {
 // single-unit rate, against 3628 for attr-placed workers.
 //
 // Why the publisher never computes a slice, even though a publisher-computed
-// slice starts with zero latency and measured +14% at 512^3 (LY_POOL_RAW=1/2
-// below reproduce this): the publisher is the program's main thread, and no
-// public interface places it. At 1024^3 the scheduler reliably parks it on a
-// worker's cluster -- 1654 GFLOP/s again, whether the worker was a plain
-// pthread, a USER_INITIATED pthread, or an attr-placed apply iteration. The
-// raw modes are kept as measurement instruments for exactly this question.
+// slice starts with zero latency and measured +14% at 512^3: the publisher is
+// the program's main thread, and no public interface places it. At 1024^3 the
+// scheduler reliably parks it on a worker's cluster -- 1654 GFLOP/s, the exact
+// single-SME rate, regardless of how the worker was created. So the workers
+// own the clusters and the publisher only publishes (see LyPoolEnsure).
 void buildPoolWorker(mlir::ModuleOp module, mlir::OpBuilder &builder) {
   mlir::MLIRContext *context = module.getContext();
   auto ptr = LLVM::LLVMPointerType::get(context);
@@ -913,14 +910,7 @@ void buildPoolWorker(mlir::ModuleOp module, mlir::OpBuilder &builder) {
   builder.setInsertionPointToStart(entry);
   mlir::Value zero = constI64(builder, loc, 0);
   mlir::Value one = constI64(builder, loc, 1);
-  // In publisher-computes mode the publisher owns slice 0, so every worker
-  // shifts up one.
-  mlir::Value modeShift = LLVM::LoadOp::create(
-      builder, loc, i64,
-      LLVM::AddressOfOp::create(
-          builder, loc, module.lookupSymbol<LLVM::GlobalOp>(kPoolModeName)));
-  mlir::Value myIndex =
-      LLVM::AddOp::create(builder, loc, entry->getArgument(1), modeShift);
+  mlir::Value myIndex = entry->getArgument(1);
   LLVM::BrOp::create(builder, loc, mlir::ValueRange{zero}, waitHead);
 
   builder.setInsertionPointToStart(waitHead);
@@ -1090,27 +1080,6 @@ void buildPoolMother(mlir::ModuleOp module, mlir::OpBuilder &builder) {
   LLVM::ReturnOp::create(builder, loc, nullPtr);
 }
 
-// LyPoolRawEntry(ptr) -> ptr: pthread signature shim for the experimental raw
-// mode (LY_POOL_RAW=1): one plain worker at USER_INITIATED QoS taking slice 1
-// while the publisher computes slice 0.
-void buildPoolRawEntry(mlir::ModuleOp module, mlir::OpBuilder &builder) {
-  mlir::MLIRContext *context = module.getContext();
-  auto ptr = LLVM::LLVMPointerType::get(context);
-  mlir::Location loc = builder.getUnknownLoc();
-  builder.setInsertionPointToEnd(module.getBody());
-  auto fn = LLVM::LLVMFuncOp::create(builder, loc, "LyPoolRawEntry",
-                                     LLVM::LLVMFunctionType::get(ptr, {ptr}),
-                                     LLVM::Linkage::Internal);
-  mlir::Block *entry = fn.addEntryBlock(builder);
-  builder.setInsertionPointToStart(entry);
-  auto workerFn = module.lookupSymbol<LLVM::LLVMFuncOp>(kPoolWorkerFnName);
-  mlir::Value nullPtr = LLVM::ZeroOp::create(builder, loc, ptr);
-  LLVM::CallOp::create(builder, loc, workerFn,
-                       mlir::ValueRange{nullPtr, constI64(builder, loc, 0),
-                                        constI64(builder, loc, 2)});
-  LLVM::ReturnOp::create(builder, loc, nullPtr);
-}
-
 // LyPoolEnsure() -> i64 (1 = ready): resolve os_sync, size from the cluster
 // count, spawn the workers. Only the publishing thread calls this, so the
 // state global needs no synchronisation.
@@ -1137,7 +1106,6 @@ void buildPoolEnsure(mlir::ModuleOp module, mlir::OpBuilder &builder) {
                                      LLVM::Linkage::Internal);
   mlir::Block *entry = fn.addEntryBlock(builder);
   mlir::Block *resolve = fn.addBlock();
-  mlir::Block *spawnHead = fn.addBlock();
   mlir::Block *spawnBody = fn.addBlock();
   mlir::Block *good = fn.addBlock();
   mlir::Block *bad = fn.addBlock();
@@ -1193,107 +1161,16 @@ void buildPoolEnsure(mlir::ModuleOp module, mlir::OpBuilder &builder) {
       haveClusters);
   LLVM::StoreOp::create(builder, loc, waitPtr, addrOf(kOsWaitPtrName));
   LLVM::StoreOp::create(builder, loc, wakePtr, addrOf(kOsWakePtrName));
-  LLVM::CondBrOp::create(builder, loc, usable, spawnHead, mlir::ValueRange{},
+  LLVM::CondBrOp::create(builder, loc, usable, spawnBody, mlir::ValueRange{},
                          bad, mlir::ValueRange{});
 
-  // EXPERIMENT GATE (LY_POOL_RAW=1): publisher-computes mode with one plain
-  // QoS-pinned worker, kept to measure the placement question; the default is
-  // the mother/attr mode, whose placement libdispatch guarantees.
-  builder.setInsertionPointToStart(spawnHead);
-  mlir::Value rawEnvName =
-      LLVM::AddressOfOp::create(builder, loc,
-                                ensureCString(module, builder,
-                                              "__ly_str_pool_raw",
-                                              "LY_POOL_RAW"));
-  auto getenvFn = ensureFuncDecl(module, builder, "getenv",
-                                 LLVM::LLVMFunctionType::get(ptr, {ptr}));
-  mlir::Value rawEnv =
-      LLVM::CallOp::create(builder, loc, getenvFn,
-                           mlir::ValueRange{rawEnvName})
-          .getResult();
-  mlir::Value rawSet = LLVM::ICmpOp::create(
-      builder, loc, LLVM::ICmpPredicate::ne, rawEnv,
-      LLVM::ZeroOp::create(builder, loc, ptr));
-  mlir::Block *rawSpawn = fn.addBlock();
-  LLVM::CondBrOp::create(builder, loc, rawSet, rawSpawn, mlir::ValueRange{},
-                         spawnBody, mlir::ValueRange{});
-
-  builder.setInsertionPointToStart(rawSpawn);
-  {
-    // "2": publisher-computes with an attr-placed worker (mother applies one
-    // iteration). "1": plain pthread at USER_INITIATED.
-    mlir::Value firstChar = LLVM::LoadOp::create(
-        builder, loc, builder.getI8Type(), rawEnv);
-    mlir::Value isTwo = LLVM::ICmpOp::create(
-        builder, loc, LLVM::ICmpPredicate::eq, firstChar,
-        LLVM::ConstantOp::create(builder, loc, builder.getI8Type(),
-                                 builder.getI8IntegerAttr('2')));
-    mlir::Block *viaMother = fn.addBlock();
-    mlir::Block *viaPthread = fn.addBlock();
-    LLVM::CondBrOp::create(builder, loc, isTwo, viaMother, mlir::ValueRange{},
-                           viaPthread, mlir::ValueRange{});
-
-    builder.setInsertionPointToStart(viaMother);
-    {
-      LLVM::StoreOp::create(builder, loc, one, addrOf(kPoolWorkersName));
-      LLVM::StoreOp::create(builder, loc, one, addrOf(kPoolModeName));
-      mlir::Value tid2 = LLVM::AllocaOp::create(builder, loc, ptr, i64, one);
-      mlir::Value mother2 =
-          LLVM::AddressOfOp::create(builder, loc, ptr, "LyPoolMother");
-      mlir::Value rc2 =
-          LLVM::CallOp::create(builder, loc, pthreadCreate,
-                               mlir::ValueRange{tid2, nullPtr, mother2,
-                                                nullPtr})
-              .getResult();
-      mlir::Value ok2 = LLVM::ICmpOp::create(
-          builder, loc, LLVM::ICmpPredicate::eq, rc2,
-          LLVM::ConstantOp::create(builder, loc, i32,
-                                   builder.getI32IntegerAttr(0)));
-      LLVM::CondBrOp::create(builder, loc, ok2, good, mlir::ValueRange{}, bad,
-                             mlir::ValueRange{});
-    }
-
-    builder.setInsertionPointToStart(viaPthread);
-    auto qosInit = ensureFuncDecl(
-        module, builder, "pthread_attr_init",
-        LLVM::LLVMFunctionType::get(i32, {ptr}));
-    auto qosSet = ensureFuncDecl(
-        module, builder, "pthread_attr_set_qos_class_np",
-        LLVM::LLVMFunctionType::get(i32, {ptr, i32, i32}));
-    auto attrType = LLVM::LLVMArrayType::get(builder.getI8Type(), 64);
-    mlir::Value pattr =
-        LLVM::AllocaOp::create(builder, loc, ptr, attrType, one);
-    LLVM::CallOp::create(builder, loc, qosInit, mlir::ValueRange{pattr});
-    // QOS_CLASS_USER_INITIATED = 0x19
-    LLVM::CallOp::create(
-        builder, loc, qosSet,
-        mlir::ValueRange{pattr,
-                         LLVM::ConstantOp::create(
-                             builder, loc, i32,
-                             builder.getI32IntegerAttr(0x19)),
-                         LLVM::ConstantOp::create(
-                             builder, loc, i32,
-                             builder.getI32IntegerAttr(0))});
-    mlir::Value tid = LLVM::AllocaOp::create(builder, loc, ptr, i64, one);
-    mlir::Value entryFn =
-        LLVM::AddressOfOp::create(builder, loc, ptr, "LyPoolRawEntry");
-    mlir::Value rc0 =
-        LLVM::CallOp::create(builder, loc, pthreadCreate,
-                             mlir::ValueRange{tid, pattr, entryFn, nullPtr})
-            .getResult();
-    mlir::Value ok0 = LLVM::ICmpOp::create(
-        builder, loc, LLVM::ICmpPredicate::eq, rc0,
-        LLVM::ConstantOp::create(builder, loc, i32,
-                                 builder.getI32IntegerAttr(0)));
-    LLVM::StoreOp::create(builder, loc, one, addrOf(kPoolWorkersName));
-    LLVM::StoreOp::create(builder, loc, one, addrOf(kPoolModeName));
-    LLVM::CondBrOp::create(builder, loc, ok0, good, mlir::ValueRange{}, bad,
-                           mlir::ValueRange{});
-  }
-
   builder.setInsertionPointToStart(spawnBody);
-  // Every cluster gets a worker; the publisher only publishes. That keeps a
-  // spinning publisher from displacing a worker on its own cluster.
+  // Every cluster gets a worker; the publisher only publishes. A busy
+  // publisher on a worker's cluster would fight the very placement the attr
+  // gives, and no public interface pins the publisher (it is the main thread):
+  // measured 1654 GFLOP/s at 1024^3 whenever it computed a slice, the exact
+  // single-SME rate, whether the worker was a plain pthread, a USER_INITIATED
+  // pthread, or an attr-placed apply iteration.
   LLVM::StoreOp::create(builder, loc, clusters, addrOf(kPoolWorkersName));
   mlir::Value tidSlot = LLVM::AllocaOp::create(builder, loc, ptr, i64, one);
   mlir::Value motherFn =
@@ -1508,24 +1385,8 @@ void buildParallelForDispatch(mlir::ModuleOp module, mlir::OpBuilder &builder) {
                              builder.getI32IntegerAttr(0))});
     LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, pubGo);
     builder.setInsertionPointToStart(pubGo);
-    // In the default (attr) mode the publisher does not compute: the workers
-    // own the clusters, and a busy publisher would fight the placement. The
-    // raw experiment computes slice 0 here instead.
-    mlir::Value mode =
-        LLVM::LoadOp::create(builder, loc, i64, addrOf(kPoolModeName));
-    mlir::Value rawMode = LLVM::ICmpOp::create(
-        builder, loc, LLVM::ICmpPredicate::eq, mode, one);
-    mlir::Block *pubCompute = fn.addBlock();
-    mlir::Block *pubWait = fn.addBlock();
-    LLVM::CondBrOp::create(builder, loc, rawMode, pubCompute,
-                           mlir::ValueRange{}, pubWait, mlir::ValueRange{});
-    builder.setInsertionPointToStart(pubCompute);
-    mlir::Value end0 = LLVM::SDivOp::create(builder, loc, nArg, slices);
-    LLVM::CallOp::create(
-        builder, loc, bodyFnType(context),
-        llvm::SmallVector<mlir::Value, 4>{fnArg, zero, end0, ctxArg});
-    LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, pubWait);
-    builder.setInsertionPointToStart(pubWait);
+    // The publisher does not compute -- the workers own the clusters -- so it
+    // goes straight to waiting for them.
     LLVM::BrOp::create(builder, loc, mlir::ValueRange{zero}, poolSpin);
   }
 
@@ -1926,7 +1787,6 @@ mlir::LogicalResult materializeParallelDispatch(mlir::ModuleOp module) {
     buildParallelApplyAttr(module, builder);
     buildPoolGlobals(module, builder);
     buildPoolWorker(module, builder);
-    buildPoolRawEntry(module, builder);
     buildPoolMother(module, builder);
     buildPoolEnsure(module, builder);
     buildParallelForDispatch(module, builder);
