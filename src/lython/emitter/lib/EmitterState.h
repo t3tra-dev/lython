@@ -33,6 +33,10 @@ struct MethodBinding {
   std::string kind = "instance";
   std::string symbolName;
   bool async = false;
+  // Class whose body declared this method. Inherited lookups return the
+  // base's binding with definingClass still naming the base -- super()
+  // positions itself after definingClass in the receiver's MRO.
+  std::string definingClass;
 };
 
 struct BoundMethodValue {

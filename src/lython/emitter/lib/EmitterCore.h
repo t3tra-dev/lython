@@ -76,6 +76,22 @@ private:
   std::optional<mlir::Type>
   lookupClassStaticAttr(mlir::Type receiverType,
                         llvm::StringRef attrName) const;
+  // Canonical contract name for a base-class spelling (resolves import
+  // aliases through the class binding; manifest classes resolve to their
+  // builtins.* contract). Falls back to the raw spelling.
+  std::string canonicalClassName(llvm::StringRef spelling) const;
+  // The class's C3 linearization (contract names, self first). Computed and
+  // cached by emitClassContract; empty for unknown classes.
+  llvm::ArrayRef<std::string> classMro(llvm::StringRef className) const;
+  // First class at or after `startAfter` (exclusive when set) in
+  // receiverClass's MRO that declares `methodName`; the binding's
+  // definingClass names the provider.
+  std::optional<MethodBinding>
+  resolveMroMethod(llvm::StringRef receiverClass, llvm::StringRef methodName,
+                   llvm::StringRef startAfter = {}) const;
+  // True when the class (by contract name) linearizes onto a manifest
+  // exception class (its instances use the runtime exception representation).
+  bool isExceptionBackedClass(llvm::StringRef className) const;
   Value emitNestedFunctionDecl(const parser::Node &function);
   mlir::ArrayAttr emitCallableDefaultValues(const parser::Node &function,
                                             const FunctionSignature &sig,
@@ -329,6 +345,17 @@ private:
   llvm::StringMap<llvm::SmallVector<std::string, 8>> classFieldOrders;
   llvm::StringMap<llvm::StringMap<mlir::Type>> classStaticAttrBindings;
   llvm::StringMap<llvm::StringMap<MethodBinding>> classMethodBindings;
+  // Canonical (resolved) base contract names per class, in declaration order.
+  llvm::StringMap<llvm::SmallVector<std::string, 4>> classBaseNames;
+  // C3 linearization per class (self first, canonical contract names).
+  llvm::StringMap<llvm::SmallVector<std::string, 8>> classMros;
+  // Fields declared by the class body itself (classFieldOrders holds the
+  // MRO-merged instance layout).
+  llvm::StringMap<llvm::SmallVector<std::string, 8>> classOwnFieldOrders;
+  // MRO-merged class attribute declaration order and initializer expression
+  // per class (classStaticAttrBindings holds the merged types).
+  llvm::StringMap<llvm::SmallVector<std::string, 8>> classStaticAttrOrders;
+  llvm::StringMap<llvm::StringMap<mlir::Attribute>> classStaticAttrValues;
   // Module-level mutable globals, opted in by an int annotation at module
   // scope (`NAME: int = ...`). Backed by process-lifetime storage so reads
   // are async-signal-safe (see py.global.get/set); referenced from any scope,

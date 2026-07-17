@@ -4,6 +4,8 @@
 
 #include "AstAccess.h"
 #include "ClosureAnalysis.h"
+#include "Contracts.h"
+#include "ExceptionTaxonomy.h"
 #include "PyProtocols.h"
 
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
@@ -106,7 +108,134 @@ std::string sourceMethodSymbolName(llvm::StringRef className,
       .str();
 }
 
+// The builtin exception taxonomy entry for a contract name, matched by the
+// manifest contract ("builtins.ValueError") or its leaf name.
+const py::exceptions::BuiltinExceptionInfo *
+taxonomyEntryForContract(llvm::StringRef contractName) {
+  for (const py::exceptions::BuiltinExceptionInfo &entry :
+       py::exceptions::kBuiltinExceptions)
+    if (entry.contract == contractName)
+      return &entry;
+  return py::exceptions::findByName(
+      py::contracts::manifestClassNameForContract(contractName));
+}
+
+// Linearization of a manifest (non-source) class: builtin exceptions chain
+// through the shared taxonomy so mixed-base C3 merges see their common
+// ancestors; every chain terminates at builtins.object.
+llvm::SmallVector<std::string, 8>
+manifestLinearization(llvm::StringRef contractName) {
+  llvm::SmallVector<std::string, 8> chain;
+  chain.push_back(contractName.str());
+  const py::exceptions::BuiltinExceptionInfo *entry =
+      taxonomyEntryForContract(contractName);
+  while (entry && entry->baseClassId != py::exceptions::kRootClassId) {
+    entry = py::exceptions::findByClassId(entry->baseClassId);
+    if (!entry)
+      break;
+    chain.push_back(std::string(entry->contract));
+  }
+  if (chain.back() != "builtins.object")
+    chain.push_back("builtins.object");
+  return chain;
+}
+
+// C3 merge over contract-name sequences. Nullopt when no linearization
+// exists (the CPython TypeError case); the caller owns the diagnostic.
+std::optional<llvm::SmallVector<std::string, 8>>
+c3MergeNames(llvm::SmallVector<llvm::SmallVector<std::string, 8>, 8> sequences) {
+  llvm::SmallVector<std::string, 8> result;
+  auto compact = [&]() {
+    llvm::SmallVector<llvm::SmallVector<std::string, 8>, 8> next;
+    for (auto &sequence : sequences)
+      if (!sequence.empty())
+        next.push_back(std::move(sequence));
+    sequences = std::move(next);
+  };
+  compact();
+  while (!sequences.empty()) {
+    std::optional<std::string> candidate;
+    for (const auto &sequence : sequences) {
+      const std::string &head = sequence.front();
+      bool appearsInTail = false;
+      for (const auto &other : sequences) {
+        if (llvm::is_contained(
+                llvm::ArrayRef<std::string>(other).drop_front(), head)) {
+          appearsInTail = true;
+          break;
+        }
+      }
+      if (!appearsInTail) {
+        candidate = head;
+        break;
+      }
+    }
+    if (!candidate)
+      return std::nullopt;
+    result.push_back(*candidate);
+    for (auto &sequence : sequences)
+      if (!sequence.empty() && sequence.front() == *candidate)
+        sequence.erase(sequence.begin());
+    compact();
+  }
+  return result;
+}
+
 } // namespace
+
+std::string ModuleEmitter::canonicalClassName(llvm::StringRef spelling) const {
+  if (std::optional<mlir::Type> bound = types.lookupClass(spelling))
+    if (auto contract = mlir::dyn_cast<py::ContractType>(*bound))
+      return contract.getContractName().str();
+  return spelling.str();
+}
+
+llvm::ArrayRef<std::string>
+ModuleEmitter::classMro(llvm::StringRef className) const {
+  auto found = classMros.find(className);
+  if (found == classMros.end())
+    return {};
+  return found->second;
+}
+
+std::optional<MethodBinding>
+ModuleEmitter::resolveMroMethod(llvm::StringRef receiverClass,
+                                llvm::StringRef methodName,
+                                llvm::StringRef startAfter) const {
+  llvm::ArrayRef<std::string> mro = classMro(receiverClass);
+  if (mro.empty()) {
+    // No linearization record (manifest receiver): direct lookup only.
+    auto classMethods = classMethodBindings.find(receiverClass);
+    if (classMethods == classMethodBindings.end() || !startAfter.empty())
+      return std::nullopt;
+    auto method = classMethods->second.find(methodName);
+    if (method == classMethods->second.end())
+      return std::nullopt;
+    return method->second;
+  }
+  bool active = startAfter.empty();
+  for (const std::string &cls : mro) {
+    if (!active) {
+      if (cls == startAfter)
+        active = true;
+      continue;
+    }
+    auto classMethods = classMethodBindings.find(cls);
+    if (classMethods == classMethodBindings.end())
+      continue;
+    auto method = classMethods->second.find(methodName);
+    if (method != classMethods->second.end())
+      return method->second;
+  }
+  return std::nullopt;
+}
+
+bool ModuleEmitter::isExceptionBackedClass(llvm::StringRef className) const {
+  for (const std::string &cls : classMro(className))
+    if (!classMros.count(cls) && taxonomyEntryForContract(cls))
+      return true;
+  return false;
+}
 
 std::optional<MethodBinding>
 ModuleEmitter::lookupClassMethod(mlir::Type receiverType,
@@ -116,13 +245,7 @@ ModuleEmitter::lookupClassMethod(mlir::Type receiverType,
   auto contract = mlir::dyn_cast_if_present<py::ContractType>(receiverType);
   if (!contract)
     return std::nullopt;
-  auto classMethods = classMethodBindings.find(contract.getContractName());
-  if (classMethods == classMethodBindings.end())
-    return std::nullopt;
-  auto method = classMethods->second.find(methodName);
-  if (method == classMethods->second.end())
-    return std::nullopt;
-  return method->second;
+  return resolveMroMethod(contract.getContractName(), methodName);
 }
 
 std::optional<mlir::Type>
@@ -214,6 +337,57 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
     }
   }
 
+  // C3 linearization over canonical contract names. Bases must already be
+  // linearized (Python requires bases defined before the class statement);
+  // manifest bases contribute their builtin-exception chains so mixed-base
+  // merges see the shared ancestors.
+  llvm::SmallVector<std::string, 4> canonicalBases;
+  for (llvm::StringRef base : bases) {
+    std::string canonical = canonicalClassName(base);
+    if (llvm::is_contained(canonicalBases, canonical)) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, classDef.range.start,
+          "duplicate base class '" + base.str() + "'"});
+      return;
+    }
+    canonicalBases.push_back(std::move(canonical));
+  }
+  llvm::SmallVector<std::string, 8> mro;
+  mro.push_back(contractName.str());
+  {
+    llvm::SmallVector<llvm::SmallVector<std::string, 8>, 8> sequences;
+    for (const std::string &base : canonicalBases) {
+      auto baseMro = classMros.find(base);
+      if (baseMro != classMros.end()) {
+        sequences.emplace_back(baseMro->second.begin(), baseMro->second.end());
+        continue;
+      }
+      sequences.push_back(manifestLinearization(base));
+    }
+    sequences.emplace_back(canonicalBases.begin(), canonicalBases.end());
+    std::optional<llvm::SmallVector<std::string, 8>> merged =
+        c3MergeNames(std::move(sequences));
+    if (!merged) {
+      std::string baseList;
+      for (const std::string &base : canonicalBases) {
+        if (!baseList.empty())
+          baseList += ", ";
+        baseList += py::contracts::manifestClassNameForContract(base);
+      }
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, classDef.range.start,
+          "Cannot create a consistent method resolution order (MRO) for "
+          "bases " +
+              baseList});
+      return;
+    }
+    mro.append(merged->begin(), merged->end());
+    if (mro.back() != "builtins.object")
+      mro.push_back("builtins.object");
+  }
+  classBaseNames[contractName] = canonicalBases;
+  classMros[contractName] = mro;
+
   llvm::SmallVector<std::string, 8> fieldNames;
   llvm::SmallVector<mlir::Type, 8> fieldTypes;
   collectClassFields(classDef, fieldNames, fieldTypes);
@@ -267,6 +441,46 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       }
   }
 
+  // Instance layout composes the MRO's per-class field declarations with the
+  // base chain first (a derived object's value list extends its bases'
+  // prefix), deduplicated by name -- a subclass redeclaration refines the
+  // type but keeps the base slot position.
+  classOwnFieldOrders[contractName].assign(fieldNames.begin(),
+                                           fieldNames.end());
+  {
+    llvm::SmallVector<std::string, 8> mergedNames;
+    llvm::SmallVector<mlir::Type, 8> mergedTypes;
+    auto appendField = [&](llvm::StringRef name, mlir::Type type) {
+      for (auto [index, existing] : llvm::enumerate(mergedNames)) {
+        if (existing == name) {
+          mergedTypes[index] = type;
+          return;
+        }
+      }
+      mergedNames.push_back(name.str());
+      mergedTypes.push_back(type);
+    };
+    llvm::ArrayRef<std::string> linearization = classMros[contractName];
+    for (const std::string &cls : llvm::reverse(linearization)) {
+      if (cls == contractName)
+        continue;
+      auto ownOrder = classOwnFieldOrders.find(cls);
+      auto ownTypes = classFieldBindings.find(cls);
+      if (ownOrder == classOwnFieldOrders.end() ||
+          ownTypes == classFieldBindings.end())
+        continue;
+      for (const std::string &name : ownOrder->second) {
+        auto type = ownTypes->second.find(name);
+        if (type != ownTypes->second.end())
+          appendField(name, type->second);
+      }
+    }
+    for (auto [fieldName, fieldType] : llvm::zip_equal(fieldNames, fieldTypes))
+      appendField(fieldName, fieldType);
+    fieldNames = std::move(mergedNames);
+    fieldTypes = std::move(mergedTypes);
+  }
+
   llvm::StringMap<mlir::Type> &registeredFields =
       classFieldBindings[contractName];
   registeredFields.clear();
@@ -280,6 +494,12 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
   llvm::SmallVector<std::string, 8> methodKinds;
   llvm::SmallVector<std::string, 8> methodSymbols;
   llvm::SmallVector<mlir::Type, 8> methodContracts;
+  // Pass 1 registers every method binding before pass 2 emits any body:
+  // a method body may call a sibling declared later in the class (and MRO
+  // lookups during emission must already see the full method set).
+  llvm::SmallVector<const parser::Node *, 8> pendingBodies;
+  llvm::SmallVector<FunctionSignature, 8> pendingBodySigs;
+  llvm::SmallVector<std::string, 8> pendingBodySymbols;
   if (const auto *body = ast::nodeList(classDef, "body")) {
     for (const parser::NodePtr &statement : *body) {
       if (!statement || (statement->kind != "FunctionDef" &&
@@ -317,15 +537,25 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       std::string symbolName =
           sourceMethodSymbolName(contractName, *methodName, *statement);
       methodSymbols.push_back(symbolName);
-      if (kind != "class" && kind != "classmethod")
-        emitCallableFunction(*statement, symbolName, bodySig, {},
-                             /*isLambda=*/false);
+      if (kind != "class" && kind != "classmethod") {
+        pendingBodies.push_back(statement.get());
+        pendingBodySigs.push_back(bodySig);
+        pendingBodySymbols.push_back(symbolName);
+      }
       classMethodBindings[contractName][*methodName] =
-          MethodBinding{statement.get(), bodySig,
-                        bodySig,         kind,
-                        symbolName,      statement->kind == "AsyncFunctionDef"};
+          MethodBinding{statement.get(),
+                        bodySig,
+                        bodySig,
+                        kind,
+                        symbolName,
+                        statement->kind == "AsyncFunctionDef",
+                        std::string(contractName)};
     }
   }
+  for (auto [statement, bodySig, symbolName] :
+       llvm::zip_equal(pendingBodies, pendingBodySigs, pendingBodySymbols))
+    emitCallableFunction(*statement, symbolName, bodySig, {},
+                         /*isLambda=*/false);
 
   mlir::OperationState state(loc(classDef), py::ClassOp::getOperationName());
   state.addAttribute(mlir::SymbolTable::getSymbolAttrName(),
@@ -344,18 +574,50 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
   llvm::SmallVector<mlir::Type, 8> staticAttrTypes;
   collectStaticClassAssignments(classDef, staticAttrNames, staticAttrValues,
                                 &staticAttrTypes);
+  // Inherit base class attributes MRO-forward (own declarations win): a
+  // subclass reads its bases' class attributes through its own type object.
+  for (const std::string &cls : llvm::ArrayRef<std::string>(mro).drop_front()) {
+    auto baseOrder = classStaticAttrOrders.find(cls);
+    auto baseValues = classStaticAttrValues.find(cls);
+    auto baseTypes = classStaticAttrBindings.find(cls);
+    if (baseOrder == classStaticAttrOrders.end() ||
+        baseValues == classStaticAttrValues.end() ||
+        baseTypes == classStaticAttrBindings.end())
+      continue;
+    for (const std::string &name : baseOrder->second) {
+      if (llvm::is_contained(staticAttrNames, name))
+        continue;
+      auto value = baseValues->second.find(name);
+      auto type = baseTypes->second.find(name);
+      if (value == baseValues->second.end() ||
+          type == baseTypes->second.end())
+        continue;
+      staticAttrNames.push_back(name);
+      staticAttrValues.push_back(value->second);
+      staticAttrTypes.push_back(type->second);
+    }
+  }
   llvm::StringMap<mlir::Type> &registeredStaticAttrs =
       classStaticAttrBindings[contractName];
   registeredStaticAttrs.clear();
-  for (auto [attrName, attrType] :
-       llvm::zip_equal(staticAttrNames, staticAttrTypes))
+  llvm::StringMap<mlir::Attribute> &registeredStaticValues =
+      classStaticAttrValues[contractName];
+  registeredStaticValues.clear();
+  classStaticAttrOrders[contractName].assign(staticAttrNames.begin(),
+                                             staticAttrNames.end());
+  for (auto [attrName, attrValue, attrType] :
+       llvm::zip_equal(staticAttrNames, staticAttrValues, staticAttrTypes)) {
     registeredStaticAttrs[attrName] = attrType;
+    registeredStaticValues[attrName] = attrValue;
+  }
   if (!staticAttrNames.empty()) {
     state.addAttribute("class_static_attr_names",
                        stringArray(builder, staticAttrNames));
     state.addAttribute("class_static_attr_values",
                        builder.getArrayAttr(staticAttrValues));
   }
+  state.addAttribute("mro_names",
+                     stringArray(builder, llvm::ArrayRef<std::string>(mro)));
 
   state.addRegion();
   mlir::Operation *op = builder.create(state);
@@ -394,8 +656,9 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       break;
     }
   }
-  for (llvm::StringRef base : bases)
-    protocolInfo.bases.push_back(py::protocols::ProtocolBase{base.str(), {}});
+  for (const std::string &base : canonicalBases)
+    protocolInfo.bases.push_back(py::protocols::ProtocolBase{
+        py::contracts::manifestClassNameForContract(base), {}});
   for (auto [fieldName, fieldType] : llvm::zip_equal(fieldNames, fieldTypes))
     protocolInfo.fields[fieldName] = fieldType;
   for (auto [methodName, methodContract] :
