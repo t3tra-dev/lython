@@ -212,6 +212,13 @@ void ModuleEmitter::emitDelete(const parser::Node &statement) {
     if (!target)
       continue;
     if (target->kind == "Subscript") {
+      if (const parser::Node *sliceNode = ast::node(*target, "slice");
+          sliceNode && sliceNode->kind == "Slice") {
+        diagnostics.push_back(
+            parser::Diagnostic{parser::Severity::Error, target->range.start,
+                               "slice deletion is not supported yet"});
+        continue;
+      }
       Value container = emitExpr(ast::node(*target, "value"));
       Value index = emitExpr(ast::node(*target, "slice"));
       if (std::optional<MethodBinding> method =
@@ -329,6 +336,13 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
               pinLoopCarriedTensor(containerName, *updated, target);
         return;
       }
+      return;
+    }
+    if (const parser::Node *sliceNode = ast::node(target, "slice");
+        sliceNode && sliceNode->kind == "Slice") {
+      diagnostics.push_back(
+          parser::Diagnostic{parser::Severity::Error, target.range.start,
+                             "slice assignment is not supported yet"});
       return;
     }
     Value index = emitExpr(ast::node(target, "slice"));

@@ -228,6 +228,12 @@ private:
   std::optional<Value> emitOptionalCompare(const parser::Node &expr, Value lhs,
                                            Value rhs, const parser::Node *op);
   Value emitSubscript(const parser::Node &expr);
+  // `a[i:j:k]` dispatches to the sequence's `__getslice__` manifest method
+  // (start, stop, step, mask) — mask bit0/bit1 mark an explicit start/stop,
+  // because the runtime defaults depend on the step's sign (R6: CPython
+  // normalization, new copy).
+  Value emitSliceSubscript(const parser::Node &expr, Value container,
+                           const parser::Node &sliceNode);
   Value emitAttribute(const parser::Node &expr);
   Value emitAwait(const parser::Node &expr);
   Value emitAsyncioRunCall(const parser::Node &expr);

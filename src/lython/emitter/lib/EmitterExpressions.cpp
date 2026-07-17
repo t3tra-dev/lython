@@ -778,6 +778,9 @@ Value ModuleEmitter::emitSubscript(const parser::Node &expr) {
             expr, container, ast::node(expr, "slice")))
       return element->value ? *element : emitNone(expr);
   }
+  if (const parser::Node *sliceNode = ast::node(expr, "slice");
+      sliceNode && sliceNode->kind == "Slice")
+    return emitSliceSubscript(expr, container, *sliceNode);
   Value index = emitExpr(ast::node(expr, "slice"));
   if (std::optional<MethodBinding> method =
           lookupClassMethod(container.type, "__getitem__"))
@@ -792,6 +795,52 @@ Value ModuleEmitter::emitSubscript(const parser::Node &expr) {
       mlir::FlatSymbolRefAttr::get(&context, "__getitem__"),
       callProtocolFor(inference), container.value, index.value);
   return {op.getResult(), result};
+}
+
+Value ModuleEmitter::emitSliceSubscript(const parser::Node &expr,
+                                        Value container,
+                                        const parser::Node &sliceNode) {
+  const parser::Node *lower = ast::node(sliceNode, "lower");
+  const parser::Node *upper = ast::node(sliceNode, "upper");
+  const parser::Node *step = ast::node(sliceNode, "step");
+
+  auto intConstant = [&](long long value) -> Value {
+    std::string text = std::to_string(value);
+    mlir::Type type = types.literal(text);
+    auto op = py::IntConstantOp::create(builder, loc(expr), type,
+                                        builder.getStringAttr(text));
+    return {op.getResult(), type};
+  };
+  // Absent bounds keep placeholder zeros; the mask tells the runtime which
+  // ones are real (their defaults depend on the step's sign at runtime).
+  Value startValue = lower ? emitExpr(lower) : intConstant(0);
+  Value stopValue = upper ? emitExpr(upper) : intConstant(0);
+  Value stepValue = step ? emitExpr(step) : intConstant(1);
+  long long maskBits = (lower ? 1 : 0) | (upper ? 2 : 0);
+  Value maskValue = intConstant(maskBits);
+
+  CallInferenceResult inference = types.inferMethodCallWithEvidence(
+      container.type, "__getslice__",
+      {startValue.type, stopValue.type, stepValue.type, maskValue.type});
+  if (!inference) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "slicing is not supported for this receiver type (str/list/tuple/"
+        "bytes provide `__getslice__`)"});
+    return emitNone(expr);
+  }
+  if (!requireStaticEvidence(expr, inference))
+    return emitNone(expr);
+  Value posPack =
+      emitPack({startValue, stopValue, stepValue, maskValue});
+  Value namePack = emitPack({});
+  Value valuePack = emitPack({});
+  mlir::Type resultType = inference.resultType;
+  auto op = py::CallOp::create(builder, loc(expr), mlir::TypeRange{resultType},
+                               callProtocolFor(inference), container.value,
+                               posPack.value, namePack.value, valuePack.value);
+  op->setAttr("ly.bound_method", builder.getStringAttr("__getslice__"));
+  return {op.getResults().front(), resultType};
 }
 
 Value ModuleEmitter::emitMethodObject(const parser::Node &anchor, Value object,
