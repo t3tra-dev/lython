@@ -9,11 +9,26 @@
 namespace py::lowering {
 namespace {
 
+// Region walks below must not touch yields/rethrows that belong to a py.try
+// NESTED inside `region`: tries lower outermost-first (handler ids must exist
+// before inner constructs look up their enclosing handler), so at this point
+// nested py.try ops are still structured. Rewriting their terminators here
+// would wire the inner construct's exits straight to the outer targets — a
+// nested try/finally's normal path would branch past its own finally region.
+template <typename OpT>
+void collectOwnedOps(mlir::Region &region, llvm::SmallVectorImpl<OpT> &ops) {
+  mlir::Operation *owner = region.getParentOp();
+  region.walk([&](OpT op) {
+    if (op->template getParentOfType<py::TryOp>() == owner)
+      ops.push_back(op);
+  });
+}
+
 template <typename YieldOp>
 void replaceYields(mlir::OpBuilder &builder, mlir::Region &region,
                    mlir::Block *continuation) {
   llvm::SmallVector<YieldOp, 8> yields;
-  region.walk([&](YieldOp yield) { yields.push_back(yield); });
+  collectOwnedOps(region, yields);
   for (YieldOp yield : yields) {
     builder.setInsertionPoint(yield);
     mlir::cf::BranchOp::create(builder, yield.getLoc(), continuation,
@@ -26,7 +41,7 @@ void replaceExceptYields(mlir::OpBuilder &builder, mlir::Region &region,
                          mlir::Block *continuation,
                          mlir::func::FuncOp discardCurrentException) {
   llvm::SmallVector<py::ExceptYieldOp, 8> yields;
-  region.walk([&](py::ExceptYieldOp yield) { yields.push_back(yield); });
+  collectOwnedOps(region, yields);
   for (py::ExceptYieldOp yield : yields) {
     builder.setInsertionPoint(yield);
     mlir::func::CallOp::create(builder, yield.getLoc(), discardCurrentException,
@@ -134,7 +149,7 @@ void replaceYieldsWithFinallyEntry(mlir::OpBuilder &builder,
                                    mlir::Block *finallyEntry,
                                    bool exceptional) {
   llvm::SmallVector<YieldOp, 8> yields;
-  region.walk([&](YieldOp yield) { yields.push_back(yield); });
+  collectOwnedOps(region, yields);
   for (YieldOp yield : yields) {
     builder.setInsertionPoint(yield);
     llvm::SmallVector<mlir::Value, 4> operands;
@@ -150,7 +165,7 @@ void replaceExceptYieldsWithFinallyEntry(
     mlir::OpBuilder &builder, mlir::Region &region, mlir::Block *finallyEntry,
     mlir::func::FuncOp discardCurrentException) {
   llvm::SmallVector<py::ExceptYieldOp, 8> yields;
-  region.walk([&](py::ExceptYieldOp yield) { yields.push_back(yield); });
+  collectOwnedOps(region, yields);
   for (py::ExceptYieldOp yield : yields) {
     builder.setInsertionPoint(yield);
     mlir::func::CallOp::create(builder, yield.getLoc(), discardCurrentException,
@@ -169,7 +184,7 @@ replaceRaiseCurrentWithFinallyEntry(mlir::OpBuilder &builder,
                                     mlir::Region &region,
                                     mlir::Block *finallyEntry, py::TryOp op) {
   llvm::SmallVector<py::RaiseCurrentOp, 4> raises;
-  region.walk([&](py::RaiseCurrentOp raise) { raises.push_back(raise); });
+  collectOwnedOps(region, raises);
   for (py::RaiseCurrentOp raise : raises) {
     builder.setInsertionPoint(raise);
     mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> operands =
@@ -187,7 +202,7 @@ void replaceFinallyYields(mlir::OpBuilder &builder, mlir::Region &region,
                           mlir::Value mode, mlir::ValueRange carriedValues,
                           mlir::Block *dispatch) {
   llvm::SmallVector<py::FinallyYieldOp, 8> yields;
-  region.walk([&](py::FinallyYieldOp yield) { yields.push_back(yield); });
+  collectOwnedOps(region, yields);
   for (py::FinallyYieldOp yield : yields) {
     builder.setInsertionPoint(yield);
     llvm::SmallVector<mlir::Value, 4> operands;

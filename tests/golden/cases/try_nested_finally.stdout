@@ -1,0 +1,12 @@
+normal body
+normal finally
+raising finally
+raising handler
+handler-nest body
+handler-nest caught
+handler-nest finally
+ef body
+ef outer finally
+inner caught
+outer caught b
+done
