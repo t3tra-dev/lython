@@ -1555,6 +1555,139 @@ void buildTakeCurrentDescriptor(SupportBuilder &b) {
               .getResult()});
 }
 
+// Generator suspension EH stash (rfc/stdlib-semantics.md R3 / item: TLS
+// token save/restore). The process exception slot is a single token; a
+// generator body suspended INSIDE an exception handler still owns its
+// in-flight token, which must not occupy the slot while unrelated code runs
+// between resumptions. A stash area is 16 i64 words: word 0 is the
+// occupancy flag, words 1..15 hold the ExceptionParts payload (the same
+// 120-byte layout as g_current_parts). Areas live in the generator storage
+// (words 48..63) for the suspended body's token, and in a resume driver's
+// stack frame for the resumer's own context.
+
+// void LyEH_StashCurrentException(i64 area): move the pending token (if
+// any) out of the process slot into the area; records occupancy in word 0.
+// Closes the native catch scope like any other slot consumer.
+void buildStashCurrentException(SupportBuilder &b) {
+  auto fn = b.beginFunction("LyEH_StashCurrentException",
+                            b.builder.getFunctionType({b.i64()}, {}));
+  mlir::Block *entry = fn.addEntryBlock();
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value area = entry->getArgument(0);
+  mlir::Value partsAddress = mlir::arith::AddIOp::create(
+      b.builder, b.loc, area, b.iconst(8));
+  mlir::Value partsPtr = b.intToPtr(partsAddress);
+  mlir::Value taken = b.call("LyEH_TakeCurrentDescriptor", b.i1(),
+                             mlir::ValueRange{partsPtr})
+                          .front();
+  mlir::Value flagWord =
+      mlir::arith::ExtUIOp::create(b.builder, b.loc, b.i64(), taken);
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, flagWord, b.intToPtr(area),
+                              /*alignment=*/8);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
+// void LyEH_UnstashException(i64 area): move a stashed token back into the
+// process slot. Restoring over a pending token would silently drop one of
+// the two, so that is a trap (the resume drivers order their stash/unstash
+// calls so it cannot happen).
+void buildUnstashException(SupportBuilder &b) {
+  auto fn = beginLLVMFunction(b, "LyEH_UnstashException", {}, {b.i64()});
+  mlir::Block *entry = fn.addEntryBlock(b.builder);
+  mlir::Region &body = fn.getBody();
+  mlir::Block *check = b.builder.createBlock(&body);
+  mlir::Block *restore = b.builder.createBlock(&body);
+  mlir::Block *done = b.builder.createBlock(&body);
+  mlir::Block *trap = b.builder.createBlock(&body);
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value area = entry->getArgument(0);
+  mlir::Value areaPtr = b.intToPtr(area);
+  mlir::Value flagWord = mlir::LLVM::LoadOp::create(b.builder, b.loc, b.i64(),
+                                                    areaPtr, /*alignment=*/8);
+  mlir::Value stashed =
+      b.cmpi(mlir::arith::CmpIPredicate::ne, flagWord, b.iconst(0));
+  mlir::LLVM::CondBrOp::create(b.builder, b.loc, stashed, check, done);
+  b.builder.setInsertionPointToEnd(check);
+  mlir::Value pending = mlir::LLVM::LoadOp::create(
+      b.builder, b.loc, b.i1(), b.addrOf("g_current_exception"),
+      /*alignment=*/4);
+  mlir::LLVM::CondBrOp::create(b.builder, b.loc, pending, trap, restore);
+  b.builder.setInsertionPointToEnd(restore);
+  mlir::Value partsAddress = mlir::arith::AddIOp::create(
+      b.builder, b.loc, area, b.iconst(8));
+  mlir::LLVM::MemcpyOp::create(b.builder, b.loc, b.addrOf("g_current_parts"),
+                               b.intToPtr(partsAddress), b.iconst(120),
+                               /*isVolatile=*/false);
+  mlir::LLVM::StoreOp::create(
+      b.builder, b.loc,
+      mlir::arith::ConstantIntOp::create(b.builder, b.loc, 1, 1).getResult(),
+      b.addrOf("g_current_exception"), /*alignment=*/4);
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0), areaPtr,
+                              /*alignment=*/8);
+  mlir::LLVM::BrOp::create(b.builder, b.loc, mlir::ValueRange{}, done);
+  b.builder.setInsertionPointToEnd(done);
+  mlir::LLVM::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+  b.builder.setInsertionPointToEnd(trap);
+  emitLLVMTrap(b);
+}
+
+// void LyEH_ReleaseStashedException(i64 area): consume a stashed token
+// without restoring it (the suspended handler context it belonged to is
+// being replaced by an injected exception, or discarded with the
+// generator). Mirrors LyEH_DiscardCurrentException's release, minus the
+// slot/traceback bookkeeping that only applies to the active token.
+void buildReleaseStashedException(SupportBuilder &b) {
+  auto fn = b.beginFunction("LyEH_ReleaseStashedException",
+                            b.builder.getFunctionType({b.i64()}, {}));
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::Region &body = fn.getBody();
+  mlir::Block *release = b.builder.createBlock(&body);
+  mlir::Block *freeBlocks = b.builder.createBlock(&body);
+  mlir::Block *clear = b.builder.createBlock(&body);
+  mlir::Block *done = b.builder.createBlock(&body);
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value area = entry->getArgument(0);
+  mlir::Value areaPtr = b.intToPtr(area);
+  mlir::Value flagWord = mlir::LLVM::LoadOp::create(b.builder, b.loc, b.i64(),
+                                                    areaPtr, /*alignment=*/8);
+  mlir::Value stashed =
+      b.cmpi(mlir::arith::CmpIPredicate::ne, flagWord, b.iconst(0));
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, stashed, release,
+                                 mlir::ValueRange{}, done, mlir::ValueRange{});
+  b.builder.setInsertionPointToEnd(release);
+  mlir::Value partsAddress = mlir::arith::AddIOp::create(
+      b.builder, b.loc, area, b.iconst(8));
+  mlir::Value parts = b.intToPtr(partsAddress);
+  mlir::Value exceptionAligned = b.loadPtrVal(partsField(b, parts, 0, 1));
+  mlir::Value messageHeader = b.loadPtrVal(partsField(b, parts, 1, 1));
+  mlir::Value messageBytes = b.loadPtrVal(partsField(b, parts, 2, 1));
+  mlir::Value exceptionWord = mlir::LLVM::PtrToIntOp::create(
+      b.builder, b.loc, b.i64(), exceptionAligned);
+  mlir::Value becameZero = b.call("release_storage_raw_to_zero", b.i1(),
+                                  mlir::ValueRange{exceptionWord})
+                               .front();
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, becameZero, freeBlocks,
+                                 mlir::ValueRange{}, clear, mlir::ValueRange{});
+  b.builder.setInsertionPointToEnd(freeBlocks);
+  mlir::Value headerWord =
+      mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), messageHeader);
+  mlir::Value bytesWord =
+      mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), messageBytes);
+  b.call("release_unicode_raw", mlir::TypeRange{},
+         mlir::ValueRange{headerWord, bytesWord});
+  b.call("free_raw_i64_ptr", mlir::TypeRange{},
+         mlir::ValueRange{exceptionWord});
+  mlir::cf::BranchOp::create(b.builder, b.loc, clear, mlir::ValueRange{});
+  b.builder.setInsertionPointToEnd(clear);
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0), areaPtr,
+                              /*alignment=*/8);
+  mlir::LLVM::MemsetOp::create(b.builder, b.loc, parts, b.iconst8(0),
+                               b.iconst(120), /*isVolatile=*/false);
+  mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
+  b.builder.setInsertionPointToEnd(done);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
 // __ly_global_view_*(i64 ptr, i64 size): reassemble a rank-1 memref
 // descriptor from the raw pointer/size words a module-global object cell
 // stores (allocated == aligned, offset 0, stride 1 -- the runtime's
@@ -1850,6 +1983,9 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context) {
   buildDiscardCurrentExceptionIfMatches(support);
   buildRethrowCurrent(support);
   buildTakeCurrentDescriptor(support);
+  buildStashCurrentException(support);
+  buildUnstashException(support);
+  buildReleaseStashedException(support);
   buildRunPythonMain(support);
 
   return module;

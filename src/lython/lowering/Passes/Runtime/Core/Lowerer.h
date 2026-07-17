@@ -598,6 +598,11 @@ private:
     std::string advanceName;
     std::string throwName;
     std::string closeName;
+    // Drop finalizer (RAII): runs close semantics (GeneratorExit into the
+    // body so finally blocks execute) and releases surviving frame lanes
+    // when the generator's refcount reaches zero without an explicit
+    // close(). Dispatched per target id by the module drop hook.
+    std::string finalizeName;
   };
   llvm::StringMap<GeneratorResumeInfo> generatorResumeClones;
   // Lane ABI helpers (GeneratorStateMachine.cpp). The resume-clone lookup
@@ -650,6 +655,17 @@ private:
   seedGeneratorResumeCloneEntry(mlir::func::FuncOp function,
                                 mlir::ArrayRef<mlir::Type> logicalTypes,
                                 GeneratorResumeInfo &info);
+  // Storage word offset of each frame lane (after the header words and the
+  // argument pairs stored at creation for the drop finalizer).
+  llvm::SmallVector<unsigned, 8>
+  generatorFrameLaneWordOffsets(const GeneratorResumeInfo &info) const;
+  mlir::FailureOr<mlir::func::FuncOp>
+  getOrCreateGeneratorFinalizeFunction(GeneratorResumeInfo &info);
+  // Per-program drop hook: patches the generator deallocator so a
+  // release-to-zero dispatches the storage's target id to the matching
+  // finalizer before the storage is freed (rfc/stdlib-semantics.md R3:
+  // drop/close releases the absorbed frame values; CPython: __del__ closes).
+  mlir::LogicalResult generateGeneratorDropHook();
   mlir::LogicalResult buildGeneratorResumeCloneSignatures();
   mlir::LogicalResult buildGeneratorResumeBodies();
   // Inline statically-bound `yield from inner(...)` delegations into the

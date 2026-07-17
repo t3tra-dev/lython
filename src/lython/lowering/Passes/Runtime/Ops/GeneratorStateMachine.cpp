@@ -48,17 +48,50 @@ namespace py::lowering {
 namespace {
 
 constexpr unsigned kGeneratorFrameSlotBase = 8;
+// Words [48, 64) hold the suspended body's stashed EH token (flag word +
+// ExceptionParts payload): a body suspended inside an exception handler
+// must not keep the process's single TLS token occupied between
+// resumptions. Frame lanes must fit below this region.
+constexpr unsigned kGeneratorEHStashWordBase = 48;
 constexpr unsigned kGeneratorFrameSlotLimit = 64;
 constexpr llvm::StringLiteral kGeneratorBodyResultAttr{
     "ly.generator.body_result"};
 constexpr llvm::StringLiteral kGeneratorPublicResultAttr{
     "ly.generator.public_result"};
 
+// Exception successors for the generator liveness: a block whose ops sit
+// inside a registered try scope can transfer control to that scope's
+// handler entry (the block carrying the matching catch marker). Plain CFG
+// liveness misses those edges, so a value used only by a handler (e.g. a
+// local read in a finally) would silently not ride the frame across a
+// suspension inside the try.
+llvm::DenseMap<mlir::Block *, llvm::SmallVector<mlir::Block *, 2>>
+generatorExceptionEdges(
+    mlir::Region &region,
+    const llvm::DenseMap<mlir::Block *, std::int64_t> &tryHandlerIds) {
+  llvm::DenseMap<mlir::Block *, llvm::SmallVector<mlir::Block *, 2>> edges;
+  llvm::DenseMap<std::int64_t, mlir::Block *> handlers =
+      py::ownership::collectExceptionHandlerEntries(region);
+  for (mlir::Block &block : region) {
+    auto id = tryHandlerIds.find(&block);
+    if (id == tryHandlerIds.end())
+      continue;
+    auto handler = handlers.find(id->second);
+    if (handler != handlers.end() && handler->second != &block)
+      edges[&block].push_back(handler->second);
+  }
+  return edges;
+}
+
 // Backward liveness over a function region: liveIn(B) = values used in B or
-// live into a successor, minus values B itself defines (op results and block
-// arguments). Deterministic (SetVector, block/op order).
+// live into a successor (CFG or exception edge), minus values B itself
+// defines (op results and block arguments). Deterministic (SetVector,
+// block/op order).
 llvm::DenseMap<mlir::Block *, llvm::SetVector<mlir::Value>>
-computeLiveIns(mlir::Region &region) {
+computeLiveIns(mlir::Region &region,
+               const llvm::DenseMap<mlir::Block *,
+                                    llvm::SmallVector<mlir::Block *, 2>>
+                   &exceptionEdges) {
   llvm::DenseMap<mlir::Block *, llvm::SetVector<mlir::Value>> liveIns;
   bool changed = true;
   while (changed) {
@@ -69,6 +102,11 @@ computeLiveIns(mlir::Region &region) {
       for (mlir::Block *successor : block->getSuccessors())
         for (mlir::Value value : liveIns[successor])
           live.insert(value);
+      if (auto extra = exceptionEdges.find(block);
+          extra != exceptionEdges.end())
+        for (mlir::Block *successor : extra->second)
+          for (mlir::Value value : liveIns[successor])
+            live.insert(value);
       for (mlir::Operation &op : llvm::reverse(*block)) {
         for (mlir::Value result : op.getResults())
           live.remove(result);
@@ -96,12 +134,18 @@ computeLiveIns(mlir::Region &region) {
 llvm::SetVector<mlir::Value> liveAfterYield(
     py::YieldValueOp yield,
     llvm::DenseMap<mlir::Block *, llvm::SetVector<mlir::Value>> &liveIns,
+    const llvm::DenseMap<mlir::Block *, llvm::SmallVector<mlir::Block *, 2>>
+        &exceptionEdges,
     mlir::Block *entry) {
   mlir::Block *block = yield->getBlock();
   llvm::SetVector<mlir::Value> live;
   for (mlir::Block *successor : block->getSuccessors())
     for (mlir::Value value : liveIns[successor])
       live.insert(value);
+  if (auto extra = exceptionEdges.find(block); extra != exceptionEdges.end())
+    for (mlir::Block *successor : extra->second)
+      for (mlir::Value value : liveIns[successor])
+        live.insert(value);
   for (mlir::Operation &op : llvm::reverse(*block)) {
     if (&op == yield.getOperation())
       break;
@@ -362,6 +406,21 @@ unsigned RuntimeBundleLowerer::generatorLaneFrameWords(
   if (lane.isControl() || lane.isNone)
     return lane.isControl() ? 2 : 0;
   return (lane.isInt ? 2 : 0) + 2 * lane.physicalCount;
+}
+
+// Storage layout: header words 0..7, then one (raw, valid) pair per
+// generator argument (stored at creation so the drop finalizer can resume
+// the body without call-site evidence), then the frame lanes.
+llvm::SmallVector<unsigned, 8>
+RuntimeBundleLowerer::generatorFrameLaneWordOffsets(
+    const GeneratorResumeInfo &info) const {
+  llvm::SmallVector<unsigned, 8> offsets;
+  unsigned frameWord = kGeneratorFrameSlotBase + 2 * info.argumentCount;
+  for (const GeneratorResumeLane &lane : info.frameLanes) {
+    offsets.push_back(frameWord);
+    frameWord += RuntimeBundleLowerer::generatorLaneFrameWords(lane);
+  }
+  return offsets;
 }
 
 namespace {
@@ -791,10 +850,12 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
       clone.walk(
           [&](py::YieldValueOp yield) { cloneYields.push_back(yield); });
       mlir::Block &cloneEntry = clone.getBody().front();
-      auto liveIns = computeLiveIns(clone.getBody());
+      auto exceptionEdges =
+          generatorExceptionEdges(clone.getBody(), tryHandlerIds);
+      auto liveIns = computeLiveIns(clone.getBody(), exceptionEdges);
       for (py::YieldValueOp yield : cloneYields) {
         llvm::SetVector<mlir::Value> lives =
-            liveAfterYield(yield, liveIns, &cloneEntry);
+            liveAfterYield(yield, liveIns, exceptionEdges, &cloneEntry);
         llvm::StringMap<unsigned> counts;
         for (mlir::Value live : lives) {
           std::string contract = laneEligibleContract(live.getType());
@@ -831,8 +892,10 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
       }
     }
     unsigned frameWidth = static_cast<unsigned>(frameLanes.size());
-    if (!livesEligible ||
-        kGeneratorFrameSlotBase + frameWords > kGeneratorFrameSlotLimit) {
+    unsigned argumentWords =
+        2 * static_cast<unsigned>(callable.getPositionalTypes().size());
+    if (!livesEligible || kGeneratorFrameSlotBase + argumentWords + frameWords >
+                              kGeneratorEHStashWordBase) {
       clone.erase();
       continue;
     }
@@ -1221,10 +1284,12 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeBodies() {
       ret.erase();
     }
 
-    // Live sets from backward liveness on the still-unsplit body, so the
-    // frame covers uses reached through successor blocks (joins, loop
-    // headers), not just the block suffix.
-    auto liveIns = computeLiveIns(clone.getBody());
+    // Live sets from backward liveness, so the frame covers uses reached
+    // through successor blocks (joins, loop headers), not just the block
+    // suffix. Recomputed per yield below: a split re-homes later yields
+    // into fresh continuation blocks the stale map has no entries for,
+    // which would silently drop their successor live-ins (values used only
+    // past the NEXT suspension, e.g. in a shared finally).
 
     // Split at each yield; the yield's live-across set becomes the
     // continuation's logical block arguments and the suspend payload.
@@ -1241,8 +1306,11 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeBodies() {
     for (auto [index, yield] : llvm::enumerate(yields)) {
       std::int64_t state = static_cast<std::int64_t>(index) + 1;
       mlir::Block *block = yield->getBlock();
+      auto exceptionEdges =
+          generatorExceptionEdges(clone.getBody(), tryHandlerIds);
+      auto liveIns = computeLiveIns(clone.getBody(), exceptionEdges);
       llvm::SetVector<mlir::Value> lives =
-          liveAfterYield(yield, liveIns, &entryBlock);
+          liveAfterYield(yield, liveIns, exceptionEdges, &entryBlock);
       if (lives.size() > frameWidth)
         return yield.emitError()
                << "generator resume live set exceeds the computed frame";
@@ -1378,9 +1446,14 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeBodies() {
           }
         if (external.empty())
           continue;
-        if (continuationBlocks.contains(block))
-          return clone.emitError()
-                 << "generator resume continuation live closure violated";
+        if (continuationBlocks.contains(block)) {
+          mlir::InFlightDiagnostic diagnostic =
+              clone.emitError()
+              << "generator resume continuation live closure violated:";
+          for (mlir::Value value : external)
+            diagnostic << " value=" << value << ";";
+          return diagnostic;
+        }
         normalizing = true;
         for (mlir::Value value : external) {
           mlir::BlockArgument arg = block->addArgument(value.getType(), loc);
@@ -1597,6 +1670,49 @@ RuntimeBundleLowerer::getOrCreateGeneratorStepFunction(
         .getResult();
   };
 
+  // EH token swap areas (single-token TLS): the generator storage words
+  // [48, 64) stash the suspended body's in-flight handler token; the local
+  // area stashes the RESUMER's context while the body runs. Addresses are
+  // raw i64 words into the respective allocations.
+  mlir::Type i64Type = builder.getI64Type();
+  auto ehVoidFn = [&](llvm::StringRef name) {
+    return getOrCreatePrivateFunction(
+        module, builder, name, builder.getFunctionType({i64Type}, {}));
+  };
+  mlir::func::FuncOp stashFn = ehVoidFn("LyEH_StashCurrentException");
+  mlir::func::FuncOp unstashFn = ehVoidFn("LyEH_UnstashException");
+  mlir::func::FuncOp releaseStashFn = ehVoidFn("LyEH_ReleaseStashedException");
+  auto wordAddress = [&](mlir::Value memrefValue,
+                         unsigned wordOffset) -> mlir::Value {
+    mlir::Value pointerIndex =
+        mlir::memref::ExtractAlignedPointerAsIndexOp::create(builder, loc,
+                                                             memrefValue);
+    mlir::Value address =
+        mlir::arith::IndexCastOp::create(builder, loc, i64Type, pointerIndex)
+            .getResult();
+    if (wordOffset == 0)
+      return address;
+    return mlir::arith::AddIOp::create(
+               builder, loc, address,
+               mlir::arith::ConstantIntOp::create(builder, loc,
+                                                  8 * wordOffset, 64)
+                   .getResult())
+        .getResult();
+  };
+  mlir::Value outerArea =
+      mlir::memref::AllocaOp::create(
+          builder, loc, mlir::MemRefType::get({16}, i64Type))
+          .getResult();
+  mlir::Value outerFlagSlot =
+      mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult();
+  mlir::memref::StoreOp::create(
+      builder, loc,
+      mlir::arith::ConstantIntOp::create(builder, loc, 0, 64).getResult(),
+      outerArea, outerFlagSlot);
+  mlir::Value outerAddress = wordAddress(outerArea, 0);
+  mlir::Value stashAddress =
+      wordAddress(generator, kGeneratorEHStashWordBase);
+
   mlir::Value lifecycle =
       mlir::memref::LoadOp::create(builder, loc, generator, slotIndex(2))
           .getResult();
@@ -1644,8 +1760,30 @@ RuntimeBundleLowerer::getOrCreateGeneratorStepFunction(
                                  mlir::ValueRange{}, callBlock,
                                  mlir::ValueRange{});
 
-  // Normal resume.
+  // Normal resume. First swap the EH token: on a plain resume the caller's
+  // pending token (if any) moves to the local stash and the body's stashed
+  // handler token (if any) returns to the slot; on an injection the staged
+  // exception IS the slot content to deliver, and it replaces the body's
+  // stashed handler context (CPython: throw() into a generator suspended in
+  // a handler supersedes the exception being handled).
   builder.setInsertionPointToEnd(callBlock);
+  {
+    mlir::Value zeroInject =
+        mlir::arith::CmpIOp::create(builder, loc,
+                                    mlir::arith::CmpIPredicate::eq, inject,
+                                    i64Const(0));
+    auto swapIf = mlir::scf::IfOp::create(builder, loc, zeroInject,
+                                          /*withElseRegion=*/true);
+    mlir::OpBuilder::InsertionGuard swapGuard(builder);
+    builder.setInsertionPoint(swapIf.getThenRegion().front().getTerminator());
+    mlir::func::CallOp::create(builder, loc, stashFn,
+                               mlir::ValueRange{outerAddress});
+    mlir::func::CallOp::create(builder, loc, unstashFn,
+                               mlir::ValueRange{stashAddress});
+    builder.setInsertionPoint(swapIf.getElseRegion().front().getTerminator());
+    mlir::func::CallOp::create(builder, loc, releaseStashFn,
+                               mlir::ValueRange{stashAddress});
+  }
   mlir::Value trueValue =
       mlir::arith::ConstantIntOp::create(builder, loc, 1, 1);
   llvm::SmallVector<mlir::Value, 24> operands;
@@ -1662,14 +1800,8 @@ RuntimeBundleLowerer::getOrCreateGeneratorStepFunction(
   // Frame lanes: load each lane's span out of the generator storage. The
   // load transfers the frame's token into the clone (and zeroes the slot),
   // so ownership lives in exactly one place while the body runs.
-  llvm::SmallVector<unsigned, 8> laneWordOffsets;
-  {
-    unsigned frameWord = kGeneratorFrameSlotBase;
-    for (const GeneratorResumeLane &lane : info.frameLanes) {
-      laneWordOffsets.push_back(frameWord);
-      frameWord += RuntimeBundleLowerer::generatorLaneFrameWords(lane);
-    }
-  }
+  llvm::SmallVector<unsigned, 8> laneWordOffsets =
+      RuntimeBundleLowerer::generatorFrameLaneWordOffsets(info);
   llvm::SmallVector<unsigned, 8> laneResultWidths;
   for (const GeneratorResumeLane &lane : info.frameLanes) {
     laneResultWidths.push_back(static_cast<unsigned>(
@@ -1745,6 +1877,13 @@ RuntimeBundleLowerer::getOrCreateGeneratorStepFunction(
           .getResult();
   mlir::memref::StoreOp::create(builder, loc, nextLifecycle, generator,
                                 slotIndex(2));
+  // Swap the EH token back: a body that suspended inside a handler leaves
+  // its token pending — stash it with the generator; then the resumer's
+  // context returns to the slot.
+  mlir::func::CallOp::create(builder, loc, stashFn,
+                             mlir::ValueRange{stashAddress});
+  mlir::func::CallOp::create(builder, loc, unstashFn,
+                             mlir::ValueRange{outerAddress});
   llvm::SmallVector<mlir::Value, 8> stepResults;
   stepResults.push_back(hasValue);
   stepResults.append(valueSpan.begin(), valueSpan.end());
@@ -1762,6 +1901,11 @@ RuntimeBundleLowerer::getOrCreateGeneratorStepFunction(
                                 slotIndex(4));
   mlir::memref::StoreOp::create(builder, loc, i64Const(3), generator,
                                 slotIndex(2));
+  // The body escaped with an exception, which replaces the resumer's
+  // stashed context (chaining it is the traceback track's __context__
+  // work); releasing here keeps the token count exact.
+  mlir::func::CallOp::create(builder, loc, releaseStashFn,
+                             mlir::ValueRange{outerAddress});
   auto currentMatches = getOrCreatePrivateFunction(
       module, builder, "LyEH_CurrentExceptionMatches",
       builder.getFunctionType({builder.getI64Type()}, {builder.getI1Type()}));
@@ -2012,6 +2156,31 @@ RuntimeBundleLowerer::getOrCreateGeneratorThrowFunction(
     return mlir::arith::ConstantIntOp::create(builder, loc, value, 64)
         .getResult();
   };
+  // throw() may run inside the caller's exception handler: park the pending
+  // token so the staging below finds the single TLS slot free.
+  auto throwEHFn = [&](llvm::StringRef name) {
+    return getOrCreatePrivateFunction(
+        module, builder, name, builder.getFunctionType({i64}, {}));
+  };
+  mlir::func::FuncOp throwStashFn = throwEHFn("LyEH_StashCurrentException");
+  mlir::func::FuncOp throwUnstashFn = throwEHFn("LyEH_UnstashException");
+  mlir::func::FuncOp throwReleaseStashFn =
+      throwEHFn("LyEH_ReleaseStashedException");
+  mlir::Value throwOuterArea =
+      mlir::memref::AllocaOp::create(builder, loc,
+                                     mlir::MemRefType::get({16}, i64))
+          .getResult();
+  mlir::Value throwOuterPointer =
+      mlir::memref::ExtractAlignedPointerAsIndexOp::create(builder, loc,
+                                                           throwOuterArea);
+  mlir::Value throwOuterAddress =
+      mlir::arith::IndexCastOp::create(builder, loc, i64, throwOuterPointer)
+          .getResult();
+  mlir::memref::StoreOp::create(
+      builder, loc, i64Const(0), throwOuterArea,
+      mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult());
+  mlir::func::CallOp::create(builder, loc, throwStashFn,
+                             mlir::ValueRange{throwOuterAddress});
   auto throwException = getOrCreatePrivateFunction(
       module, builder, "LyEH_ThrowException",
       builder.getFunctionType({headerType, messageType, bytesType}, {}));
@@ -2072,6 +2241,8 @@ RuntimeBundleLowerer::getOrCreateGeneratorThrowFunction(
   advanceOperands.push_back(i64Const(1)); // inject
   mlir::func::CallOp resumed =
       mlir::func::CallOp::create(builder, loc, *advance, advanceOperands);
+  mlir::func::CallOp::create(builder, loc, throwUnstashFn,
+                             mlir::ValueRange{throwOuterAddress});
   mlir::func::ReturnOp::create(builder, loc, resumed.getResults());
 
   // Not suspended: the body never sees the exception. CPython closes a
@@ -2087,6 +2258,8 @@ RuntimeBundleLowerer::getOrCreateGeneratorThrowFunction(
     mlir::memref::StoreOp::create(builder, loc, i64Const(4), generator,
                                   slotIndex(2));
   }
+  mlir::func::CallOp::create(builder, loc, throwReleaseStashFn,
+                             mlir::ValueRange{throwOuterAddress});
   mlir::func::CallOp::create(builder, loc,
                              getOrCreateRethrowCurrent(module, builder),
                              mlir::ValueRange{});
@@ -2151,6 +2324,35 @@ RuntimeBundleLowerer::getOrCreateGeneratorCloseFunction(
     return mlir::arith::ConstantIndexOp::create(builder, loc, slot)
         .getResult();
   };
+  // close() may run while the caller holds the pending TLS token (close
+  // inside an except block, or the drop finalizer during unwinding); the
+  // GeneratorExit staging below needs the single slot free, so the caller
+  // context parks in a local stash for the duration.
+  mlir::Type closeI64 = builder.getI64Type();
+  auto closeEHFn = [&](llvm::StringRef name) {
+    return getOrCreatePrivateFunction(
+        module, builder, name, builder.getFunctionType({closeI64}, {}));
+  };
+  mlir::func::FuncOp closeStashFn = closeEHFn("LyEH_StashCurrentException");
+  mlir::func::FuncOp closeUnstashFn = closeEHFn("LyEH_UnstashException");
+  mlir::func::FuncOp closeReleaseStashFn =
+      closeEHFn("LyEH_ReleaseStashedException");
+  mlir::Value closeOuterArea =
+      mlir::memref::AllocaOp::create(
+          builder, loc, mlir::MemRefType::get({16}, closeI64))
+          .getResult();
+  mlir::Value closeOuterPointer =
+      mlir::memref::ExtractAlignedPointerAsIndexOp::create(builder, loc,
+                                                           closeOuterArea);
+  mlir::Value closeOuterAddress =
+      mlir::arith::IndexCastOp::create(builder, loc, closeI64,
+                                       closeOuterPointer)
+          .getResult();
+  mlir::memref::StoreOp::create(
+      builder, loc, i64Const(0), closeOuterArea,
+      mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult());
+  mlir::func::CallOp::create(builder, loc, closeStashFn,
+                             mlir::ValueRange{closeOuterAddress});
 
   mlir::Block *checkFinished = builder.createBlock(&body);
   mlir::Block *injectBlock = builder.createBlock(&body);
@@ -2251,10 +2453,14 @@ RuntimeBundleLowerer::getOrCreateGeneratorCloseFunction(
         ignoredIf.getThenRegion().front().getTerminator());
     // The staged GeneratorExit may still be the pending current exception
     // (the body can be suspended inside its own handler); the EH TLS slot is
-    // single-token, so raising without discarding would trap.
+    // single-token, so raising without discarding would trap. The
+    // RuntimeError leaves this function, so the caller's parked context is
+    // superseded by it (chaining is the traceback track's __context__ work).
     mlir::func::CallOp::create(
         builder, loc, getOrCreateDiscardCurrentException(module, builder),
         mlir::ValueRange{});
+    mlir::func::CallOp::create(builder, loc, closeReleaseStashFn,
+                               mlir::ValueRange{closeOuterAddress});
     if (mlir::failed(RuntimeBundleLowerer::emitRuntimeException(
             op, "builtins.RuntimeError", "generator ignored GeneratorExit")))
       return mlir::failure();
@@ -2284,6 +2490,8 @@ RuntimeBundleLowerer::getOrCreateGeneratorCloseFunction(
       mlir::ValueRange{});
   mlir::cf::BranchOp::create(builder, loc, markClosed);
   builder.setInsertionPointToEnd(rethrowBlock);
+  mlir::func::CallOp::create(builder, loc, closeReleaseStashFn,
+                             mlir::ValueRange{closeOuterAddress});
   mlir::func::CallOp::create(builder, loc,
                              getOrCreateRethrowCurrent(module, builder),
                              mlir::ValueRange{});
@@ -2298,8 +2506,232 @@ RuntimeBundleLowerer::getOrCreateGeneratorCloseFunction(
                                 slotIndex(2));
   mlir::cf::BranchOp::create(builder, loc, returnBlock);
   builder.setInsertionPointToEnd(returnBlock);
+  mlir::func::CallOp::create(builder, loc, closeUnstashFn,
+                             mlir::ValueRange{closeOuterAddress});
   mlir::func::ReturnOp::create(builder, loc);
   return function;
+}
+
+// Drop finalizer (rfc/stdlib-semantics.md R3, CPython gen.__del__): a
+// generator abandoned mid-suspension must run its finally blocks and
+// release the frame's absorbed values. The finalizer resumes the body with
+// the close protocol (GeneratorExit injection) using the argument pairs the
+// creation site persisted into the storage words, swallows anything the
+// close raises (finalization has no propagation context), and then releases
+// whatever the frame still holds (the close path zeroes slots it consumed;
+// placeholders are immortal, so their release is a no-op).
+mlir::FailureOr<mlir::func::FuncOp>
+RuntimeBundleLowerer::getOrCreateGeneratorFinalizeFunction(
+    GeneratorResumeInfo &info) {
+  if (!info.finalizeName.empty()) {
+    if (auto existing =
+            module.lookupSymbol<mlir::func::FuncOp>(info.finalizeName))
+      return existing;
+  }
+  mlir::func::FuncOp clone =
+      module.lookupSymbol<mlir::func::FuncOp>(info.cloneName);
+  if (!clone)
+    return module.emitError()
+           << "generator resume clone " << info.cloneName << " is missing";
+  mlir::Operation *op = clone.getOperation();
+  mlir::FailureOr<mlir::func::FuncOp> close =
+      RuntimeBundleLowerer::getOrCreateGeneratorCloseFunction(op, info);
+  if (mlir::failed(close))
+    return mlir::failure();
+
+  mlir::Location loc = clone.getLoc();
+  mlir::OpBuilder::InsertionGuard guard(builder);
+  std::string name = info.cloneName + "__finalize";
+  builder.setInsertionPointToEnd(module.getBody());
+  auto function = mlir::func::FuncOp::create(
+      builder, loc, name,
+      builder.getFunctionType({generatorStorageType(builder)}, {}));
+  function.setPrivate();
+  info.finalizeName = name;
+
+  mlir::Block *entry = function.addEntryBlock();
+  mlir::Region &body = function.getBody();
+  mlir::Value storage = entry->getArgument(0);
+  builder.setInsertionPointToStart(entry);
+  auto i64Const = [&](std::int64_t value) {
+    return mlir::arith::ConstantIntOp::create(builder, loc, value, 64)
+        .getResult();
+  };
+  auto slotIndex = [&](std::int64_t slot) {
+    return mlir::arith::ConstantIndexOp::create(builder, loc, slot)
+        .getResult();
+  };
+
+  mlir::Block *closeBlock = builder.createBlock(&body);
+  mlir::Block *caughtBlock = builder.createBlock(&body);
+  mlir::Block *releaseBlock = builder.createBlock(&body);
+
+  builder.setInsertionPointToEnd(entry);
+  mlir::Value state =
+      mlir::memref::LoadOp::create(builder, loc, storage, slotIndex(2))
+          .getResult();
+  mlir::Value suspended = mlir::arith::CmpIOp::create(
+      builder, loc, mlir::arith::CmpIPredicate::eq, state, i64Const(2));
+  std::int64_t handlerId = nextTryHandlerId++;
+  mlir::Block *anchorBlock = builder.createBlock(&body);
+  builder.setInsertionPointToEnd(entry);
+  mlir::cf::CondBranchOp::create(builder, loc, suspended, anchorBlock,
+                                 mlir::ValueRange{}, releaseBlock,
+                                 mlir::ValueRange{});
+  builder.setInsertionPointToEnd(anchorBlock);
+  auto anchor = mlir::func::CallOp::create(
+      builder, loc, getOrCreateTryCatchAnchor(),
+      mlir::ValueRange{i64Const(handlerId)});
+  mlir::cf::CondBranchOp::create(builder, loc, anchor.getResult(0),
+                                 caughtBlock, mlir::ValueRange{}, closeBlock,
+                                 mlir::ValueRange{});
+
+  builder.setInsertionPointToEnd(closeBlock);
+  llvm::SmallVector<mlir::Value, 10> closeOperands;
+  closeOperands.push_back(storage);
+  for (unsigned index = 0; index < info.argumentCount; ++index) {
+    mlir::Value raw = mlir::memref::LoadOp::create(
+                          builder, loc, storage, slotIndex(8 + 2 * index))
+                          .getResult();
+    mlir::Value validWord =
+        mlir::memref::LoadOp::create(builder, loc, storage,
+                                     slotIndex(8 + 2 * index + 1))
+            .getResult();
+    mlir::Value valid = mlir::arith::CmpIOp::create(
+        builder, loc, mlir::arith::CmpIPredicate::ne, validWord, i64Const(0));
+    closeOperands.push_back(raw);
+    closeOperands.push_back(valid);
+  }
+  mlir::func::CallOp::create(builder, loc, getOrCreateTryCallSiteMarker(),
+                             mlir::ValueRange{i64Const(handlerId)});
+  mlir::func::CallOp::create(builder, loc, *close, closeOperands);
+  mlir::cf::BranchOp::create(builder, loc, releaseBlock);
+
+  // Finalization swallows whatever the close raised (an ignored
+  // GeneratorExit becomes RuntimeError, a finally may raise): there is no
+  // propagation context inside a deallocator.
+  builder.setInsertionPointToEnd(caughtBlock);
+  mlir::func::CallOp::create(builder, loc, getOrCreateTryCatchMarker(),
+                             mlir::ValueRange{i64Const(handlerId)});
+  mlir::func::CallOp::create(
+      builder, loc, getOrCreateDiscardCurrentException(module, builder),
+      mlir::ValueRange{});
+  mlir::cf::BranchOp::create(builder, loc, releaseBlock);
+
+  builder.setInsertionPointToEnd(releaseBlock);
+  llvm::SmallVector<unsigned, 8> laneWordOffsets =
+      RuntimeBundleLowerer::generatorFrameLaneWordOffsets(info);
+  for (auto [slot, lane] : llvm::enumerate(info.frameLanes)) {
+    if (lane.physicalCount == 0)
+      continue;
+    unsigned headerWord = laneWordOffsets[slot] + (lane.isInt ? 2u : 0u);
+    mlir::Value headerPtr =
+        mlir::memref::LoadOp::create(builder, loc, storage,
+                                     slotIndex(headerWord))
+            .getResult();
+    mlir::Value held = mlir::arith::CmpIOp::create(
+        builder, loc, mlir::arith::CmpIPredicate::ne, headerPtr, i64Const(0));
+    auto heldIf = mlir::scf::IfOp::create(builder, loc, held,
+                                          /*withElseRegion=*/false);
+    {
+      mlir::OpBuilder::InsertionGuard heldGuard(builder);
+      builder.setInsertionPoint(heldIf.getThenRegion().front().getTerminator());
+      mlir::FailureOr<mlir::func::FuncOp> load =
+          RuntimeBundleLowerer::getOrCreateGeneratorFrameLoadFunction(op, lane);
+      if (mlir::failed(load))
+        return mlir::failure();
+      mlir::func::CallOp loaded = mlir::func::CallOp::create(
+          builder, loc, *load,
+          mlir::ValueRange{storage, i64Const(laneWordOffsets[slot])});
+      llvm::SmallVector<mlir::Value, 4> physicals;
+      for (unsigned part = 0; part < lane.physicalCount; ++part)
+        physicals.push_back(loaded.getResult(part));
+      RuntimeBundle heldBundle;
+      if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+              op, runtimeContractType(context, lane.contract), physicals,
+              heldBundle, /*ownsObject=*/true)))
+        return mlir::failure();
+      if (mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
+              op, heldBundle, "generator drop frame lane")))
+        return mlir::failure();
+    }
+    builder.setInsertionPointAfter(heldIf);
+  }
+  mlir::func::ReturnOp::create(builder, loc);
+  return function;
+}
+
+// The module drop hook: LyGenerator_DecRef's release-to-zero path calls
+// this dispatcher, which routes the storage's target id (word 3) to the
+// matching per-target finalizer before the storage is freed.
+mlir::LogicalResult RuntimeBundleLowerer::generateGeneratorDropHook() {
+  if (generatorResumeClones.empty())
+    return mlir::success();
+  auto decref = module.lookupSymbol<mlir::func::FuncOp>("LyGenerator_DecRef");
+  if (!decref || decref.isDeclaration())
+    return mlir::success();
+
+  llvm::SmallVector<llvm::StringRef, 8> targets;
+  for (auto &entry : generatorResumeClones)
+    targets.push_back(entry.getKey());
+  llvm::sort(targets);
+
+  mlir::OpBuilder::InsertionGuard guard(builder);
+  mlir::Location loc = decref.getLoc();
+  builder.setInsertionPointToEnd(module.getBody());
+  auto hook = mlir::func::FuncOp::create(
+      builder, loc, "__ly_generator_drop_dispatch",
+      builder.getFunctionType({generatorStorageType(builder)}, {}));
+  hook.setPrivate();
+  mlir::Block *entry = hook.addEntryBlock();
+  mlir::Region &body = hook.getBody();
+  mlir::Value storage = entry->getArgument(0);
+  builder.setInsertionPointToStart(entry);
+  mlir::Value targetSlot =
+      mlir::arith::ConstantIndexOp::create(builder, loc, 3).getResult();
+  mlir::Value targetId =
+      mlir::memref::LoadOp::create(builder, loc, storage, targetSlot)
+          .getResult();
+  mlir::Block *current = entry;
+  for (llvm::StringRef target : targets) {
+    GeneratorResumeInfo &info = generatorResumeClones[target];
+    mlir::FailureOr<mlir::func::FuncOp> finalize =
+        RuntimeBundleLowerer::getOrCreateGeneratorFinalizeFunction(info);
+    if (mlir::failed(finalize))
+      return mlir::failure();
+    mlir::Block *match = builder.createBlock(&body);
+    mlir::Block *next = builder.createBlock(&body);
+    builder.setInsertionPointToEnd(current);
+    mlir::Value expected = mlir::arith::ConstantIntOp::create(
+        builder, loc, RuntimeBundleLowerer::functionTargetId(target), 64);
+    mlir::Value matches = mlir::arith::CmpIOp::create(
+        builder, loc, mlir::arith::CmpIPredicate::eq, targetId, expected);
+    mlir::cf::CondBranchOp::create(builder, loc, matches, match,
+                                   mlir::ValueRange{}, next,
+                                   mlir::ValueRange{});
+    builder.setInsertionPointToEnd(match);
+    mlir::func::CallOp::create(builder, loc, *finalize,
+                               mlir::ValueRange{storage});
+    mlir::func::ReturnOp::create(builder, loc);
+    current = next;
+  }
+  builder.setInsertionPointToEnd(current);
+  mlir::func::ReturnOp::create(builder, loc);
+
+  // Patch the manifest deallocator: the unique release-to-zero transition
+  // finalizes before it frees. (The deallocator body remains the same lemma
+  // otherwise; the finalizer runs while the storage is still valid.)
+  bool patched = false;
+  decref.walk([&](mlir::memref::DeallocOp dealloc) {
+    builder.setInsertionPoint(dealloc);
+    mlir::func::CallOp::create(builder, loc, hook,
+                               mlir::ValueRange{dealloc.getMemref()});
+    patched = true;
+  });
+  if (!patched)
+    return decref.emitError()
+           << "generator deallocator has no release-to-zero dealloc to patch";
+  return mlir::success();
 }
 
 // Resume over a state-machine generator: collect the generator storage and

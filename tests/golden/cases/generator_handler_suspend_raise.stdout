@@ -1,0 +1,4 @@
+1
+RuntimeError: generator ignored GeneratorExit
+caught: after handler suspend
+done

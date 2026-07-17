@@ -215,6 +215,41 @@ mlir::LogicalResult RuntimeBundleLowerer::emitGeneratorFunctionTargetCallResult(
     result.generatorSources.push_back(source->objectValue);
     result.generatorSourceBundles.push_back(std::move(sourceEvidence));
   }
+
+  // State-machine targets: persist the argument evidence pairs into the
+  // storage words (after the header) so the drop finalizer can resume the
+  // body for its close semantics without any call-site evidence.
+  auto resumeInfo = generatorResumeClones.find(target.getSymName());
+  if (resumeInfo != generatorResumeClones.end() &&
+      !result.physicalValues().empty()) {
+    mlir::Location loc = op->getLoc();
+    mlir::Value storage = result.physicalValues().front();
+    mlir::Value zero64 =
+        mlir::arith::ConstantIntOp::create(builder, loc, 0, 64).getResult();
+    for (auto [index, source] :
+         llvm::enumerate(result.generatorSourceBundles)) {
+      if (index >= resumeInfo->second.argumentCount)
+        break;
+      mlir::Value raw = zero64;
+      mlir::Value valid = zero64;
+      if (source && source->primitiveI64) {
+        raw = source->primitiveI64->value;
+        valid = mlir::arith::ExtUIOp::create(builder, loc,
+                                             builder.getI64Type(),
+                                             source->primitiveI64->valid)
+                    .getResult();
+      }
+      unsigned base = 8 + 2 * static_cast<unsigned>(index);
+      mlir::memref::StoreOp::create(
+          builder, loc, raw, storage,
+          mlir::arith::ConstantIndexOp::create(builder, loc, base)
+              .getResult());
+      mlir::memref::StoreOp::create(
+          builder, loc, valid, storage,
+          mlir::arith::ConstantIndexOp::create(builder, loc, base + 1)
+              .getResult());
+    }
+  }
   return mlir::success();
 }
 
