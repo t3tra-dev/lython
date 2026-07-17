@@ -566,6 +566,11 @@ private:
   llvm::StringMap<GeneratorResumeInfo> generatorResumeClones;
   mlir::LogicalResult buildGeneratorResumeCloneSignatures();
   mlir::LogicalResult buildGeneratorResumeBodies();
+  // Inline statically-bound `yield from inner(...)` delegations into the
+  // resume clone (PEP 380 by frame merging). Returns false when a delegation
+  // shape is not inlinable and the body must fall back to the legacy inline
+  // dispatch.
+  mlir::FailureOr<bool> inlineDelegatedYieldFroms(mlir::func::FuncOp clone);
   mlir::FailureOr<mlir::func::FuncOp>
   getOrCreateGeneratorStepFunction(mlir::Operation *op,
                                    GeneratorResumeInfo &info);

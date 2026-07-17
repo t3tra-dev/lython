@@ -3,6 +3,7 @@
 #include "ExceptionTaxonomy.h"
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/IRMapping.h"
 
 // Loop-body generators: transform an int-pure generator body into a
 // primitive-i64 RESUME state machine (pure SSA — no in-body memory):
@@ -159,28 +160,35 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
   });
 
   for (mlir::func::FuncOp body : bodies) {
-    llvm::SmallVector<py::YieldValueOp, 8> yields;
+    bool hasYield = false;
+    bool hasYieldFrom = false;
     bool unsupported = false;
     body.walk([&](mlir::Operation *op) {
-      if (auto yield = mlir::dyn_cast<py::YieldValueOp>(op)) {
-        yields.push_back(yield);
+      if (mlir::isa<py::YieldValueOp>(op)) {
+        hasYield = true;
+        return;
+      }
+      if (mlir::isa<py::YieldFromOp>(op)) {
+        // Statically-bound `yield from inner(...)` is inlined into the
+        // clone below; other delegation shapes fall back to the legacy
+        // inline dispatch.
+        hasYieldFrom = true;
         return;
       }
       // py.try is fine: the clone's tries are flattened to CFG below,
       // before the yield split, so suspension points inside try/finally
       // stay inside their (by then block-registered) handler scopes.
-      if (mlir::isa<py::YieldFromOp>(op) ||
-          (op != body.getOperation() && op->getNumRegions() != 0 &&
-           !mlir::isa<py::TryOp>(op)))
+      if (op != body.getOperation() && op->getNumRegions() != 0 &&
+          !mlir::isa<py::TryOp>(op))
         unsupported = true;
     });
-    if (unsupported || yields.empty())
+    if (unsupported || (!hasYield && !hasYieldFrom))
       continue;
     // Straight-line int bodies also take the state machine: the inline
     // re-dispatch raises its exhaustion StopIteration inside an scf.if that
     // falls through, and an unwind that starts after the caller's releases
     // double-frees at the catch entry's compensating release. Ineligible
-    // bodies (non-int surface, yield from) still fall back to it.
+    // bodies (non-int surface, non-static delegation) still fall back to it.
 
     auto callableAttr =
         body->getAttrOfType<mlir::TypeAttr>(ownership::kCallableTypeAttr);
@@ -188,23 +196,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
         callableAttr ? callableAttr.getValue() : mlir::Type());
     if (!callable || callable.hasVararg() || callable.hasKwarg())
       continue;
-    bool eligible = llvm::all_of(callable.getPositionalTypes(), isIntContract);
-    for (py::YieldValueOp yield : yields) {
-      if (!isIntContract(yield.getValue().getType()))
-        eligible = false;
-      if (!yield.getSent().use_empty() &&
-          !isIntContract(yield.getSent().getType()))
-        eligible = false;
-    }
-    // The return value rides the int ret lane; anything else would be
-    // silently dropped from StopIteration.value, so reject it here and let
-    // the inline path emit its diagnostic.
-    body.walk([&](mlir::func::ReturnOp ret) {
-      for (mlir::Value operand : ret.getOperands())
-        if (!isIntContract(operand.getType()) && !isNoneLike(operand.getType()))
-          eligible = false;
-    });
-    if (!eligible)
+    if (!llvm::all_of(callable.getPositionalTypes(), isIntContract))
       continue;
 
     std::string cloneName = (body.getSymName() + "__lyrt_gen_resume").str();
@@ -221,6 +213,49 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
       mlir::SymbolTable::setSymbolVisibility(
           clone, mlir::SymbolTable::Visibility::Private);
       builder.insert(clone);
+    }
+
+    if (hasYieldFrom) {
+      mlir::FailureOr<bool> inlined =
+          RuntimeBundleLowerer::inlineDelegatedYieldFroms(clone);
+      if (mlir::failed(inlined))
+        return mlir::failure();
+      if (!*inlined) {
+        clone.erase();
+        continue;
+      }
+    }
+
+    // Eligibility on the (possibly delegation-inlined) clone: yields, sent
+    // values and returns all ride primitive int lanes in this tier.
+    bool eligible = true;
+    llvm::SmallVector<py::YieldValueOp, 8> yields;
+    clone.walk([&](mlir::Operation *op) {
+      if (auto yield = mlir::dyn_cast<py::YieldValueOp>(op)) {
+        yields.push_back(yield);
+        if (!isIntContract(yield.getValue().getType()))
+          eligible = false;
+        if (!yield.getSent().use_empty() &&
+            !isIntContract(yield.getSent().getType()))
+          eligible = false;
+        return;
+      }
+      if (mlir::isa<py::YieldFromOp>(op) ||
+          (op != clone.getOperation() && op->getNumRegions() != 0 &&
+           !mlir::isa<py::TryOp>(op)))
+        eligible = false;
+      // The return value rides the int ret lane; anything else would be
+      // silently dropped from StopIteration.value, so reject it here and
+      // let the inline path emit its diagnostic.
+      if (auto ret = mlir::dyn_cast<mlir::func::ReturnOp>(op))
+        for (mlir::Value operand : ret.getOperands())
+          if (!isIntContract(operand.getType()) &&
+              !isNoneLike(operand.getType()))
+            eligible = false;
+    });
+    if (!eligible || yields.empty()) {
+      clone.erase();
+      continue;
     }
 
     // Flatten the clone's structured tries before anything looks at the
@@ -297,6 +332,180 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
     generatorResumeClones[body.getSymName().str()] = info;
   }
   return mlir::success();
+}
+
+// PEP 380 delegation by frame merging: a statically-bound
+// `yield from inner(...)` clones inner's py-level body into the outer resume
+// clone. The inner yields become outer suspension points, so send() values
+// flow to whichever yield is active, throw()/close() injections unwind
+// through inner handlers first, and the delegate's return value is simply
+// the SSA value flowing into the yield-from result — no StopIteration
+// transport is involved. Runs to fixpoint so an inlined body's own
+// delegations inline too; the budget bounds (mutually) recursive delegation,
+// which has no static expansion.
+mlir::FailureOr<bool>
+RuntimeBundleLowerer::inlineDelegatedYieldFroms(mlir::func::FuncOp clone) {
+  for (unsigned round = 0; round < 64; ++round) {
+    py::YieldFromOp yieldFrom;
+    clone.walk([&](py::YieldFromOp op) {
+      yieldFrom = op;
+      return mlir::WalkResult::interrupt();
+    });
+    if (!yieldFrom)
+      return true;
+
+    auto call = yieldFrom.getSource().getDefiningOp<py::CallOp>();
+    if (!call)
+      return false;
+    auto binding = call.getCallable().getDefiningOp<py::BindingRefOp>();
+    if (!binding)
+      return false;
+    auto target =
+        module.lookupSymbol<mlir::func::FuncOp>(binding.getBinding());
+    if (!target || target.isDeclaration() ||
+        !target->hasAttr(kGeneratorBodyResultAttr))
+      return false;
+    py::CallableType callableType = callableTypeOf(target);
+    if (!callableType || callableType.hasVararg() || callableType.hasKwarg() ||
+        !callableType.getKwOnlyTypes().empty())
+      return false;
+    std::optional<StaticCallableInvocation> invocation =
+        RuntimeBundleLowerer::collectStaticCallableInvocation(call);
+    if (!invocation)
+      return false;
+    std::optional<CallableArgumentPlan> plan =
+        RuntimeBundleLowerer::collectCallableArgumentPlan(call, callableType,
+                                                          /*emitErrors=*/false);
+    if (!plan || !plan->defaultedFixed.empty() ||
+        !plan->varargActuals.empty() || !plan->kwargActuals.empty())
+      return false;
+    llvm::ArrayRef<mlir::Type> positionalTypes =
+        callableType.getPositionalTypes();
+    if (plan->fixedActuals.size() != positionalTypes.size())
+      return false;
+    llvm::SmallVector<mlir::Value, 8> mappedArgs;
+    for (std::optional<unsigned> actualIndex : plan->fixedActuals) {
+      if (!actualIndex || *actualIndex >= invocation->actualValues.size())
+        return false;
+      mappedArgs.push_back(invocation->actualValues[*actualIndex]);
+    }
+    llvm::SmallVector<mlir::Type, 4> closureTypes =
+        RuntimeBundleLowerer::callableClosureTypes(target);
+    if (closureTypes.size() != binding.getCaptures().size())
+      return false;
+    for (mlir::Value capture : binding.getCaptures())
+      mappedArgs.push_back(capture);
+    mlir::Block &targetEntry = target.getBody().front();
+    if (targetEntry.getNumArguments() != mappedArgs.size())
+      return false;
+
+    mlir::Value completion = yieldFrom.getResult();
+    bool completionUsed = !completion.use_empty();
+    bool completionIsInt = isIntContract(completion.getType());
+    if (completionUsed && !completionIsInt && !isNoneLike(completion.getType()))
+      return false;
+    if (completionUsed && completionIsInt) {
+      bool everyReturnCarriesInt = true;
+      target.walk([&](mlir::func::ReturnOp ret) {
+        if (llvm::none_of(ret.getOperands(), [](mlir::Value v) {
+              return isIntContract(v.getType());
+            }))
+          everyReturnCarriesInt = false;
+      });
+      if (!everyReturnCarriesInt)
+        return false;
+    }
+    for (auto [index, value] : llvm::enumerate(mappedArgs)) {
+      mlir::Type expected = targetEntry.getArgument(index).getType();
+      if (value.getType() != expected &&
+          !py::isAssignableTo(value.getType(), expected, call))
+        return false;
+    }
+
+    mlir::Location loc = yieldFrom.getLoc();
+    mlir::Block *block = yieldFrom->getBlock();
+    mlir::Block *after = block->splitBlock(
+        std::next(mlir::Block::iterator(yieldFrom.getOperation())));
+    // Coerce actuals whose type is narrower than the inner parameter.
+    {
+      mlir::OpBuilder b(yieldFrom);
+      for (auto [index, value] : llvm::enumerate(mappedArgs)) {
+        mlir::Type expected = targetEntry.getArgument(index).getType();
+        if (value.getType() != expected)
+          mappedArgs[index] =
+              py::ClassUpcastOp::create(b, loc, expected, value).getResult();
+      }
+    }
+    if (completionUsed) {
+      if (completionIsInt) {
+        mlir::BlockArgument arg =
+            after->addArgument(completion.getType(), loc);
+        completion.replaceAllUsesWith(arg);
+      } else {
+        mlir::OpBuilder b = mlir::OpBuilder::atBlockBegin(after);
+        mlir::Value none =
+            py::NoneOp::create(b, loc,
+                               py::LiteralType::get(context, "None"))
+                .getResult();
+        if (none.getType() != completion.getType())
+          none = py::ClassUpcastOp::create(b, loc, completion.getType(), none)
+                     .getResult();
+        completion.replaceAllUsesWith(none);
+      }
+    }
+
+    mlir::IRMapping mapping;
+    target.getBody().cloneInto(&clone.getBody(), after->getIterator(),
+                               mapping);
+    mlir::Block *innerEntry = mapping.lookup(&targetEntry);
+    for (auto [index, value] : llvm::enumerate(mappedArgs))
+      innerEntry->getArgument(static_cast<unsigned>(index))
+          .replaceAllUsesWith(value);
+    innerEntry->eraseArguments(0, innerEntry->getNumArguments());
+
+    llvm::SmallVector<mlir::func::ReturnOp, 4> innerReturns;
+    for (mlir::Block &targetBlock : target.getBody())
+      if (mlir::Block *mapped = mapping.lookupOrNull(&targetBlock))
+        for (mlir::Operation &op : *mapped)
+          if (auto ret = mlir::dyn_cast<mlir::func::ReturnOp>(op))
+            innerReturns.push_back(ret);
+    for (mlir::func::ReturnOp ret : innerReturns) {
+      mlir::OpBuilder b(ret);
+      llvm::SmallVector<mlir::Value, 1> operands;
+      if (completionUsed && completionIsInt) {
+        mlir::Value returned;
+        for (mlir::Value operand : ret.getOperands())
+          if (isIntContract(operand.getType()))
+            returned = operand;
+        operands.push_back(returned);
+      }
+      mlir::cf::BranchOp::create(b, ret.getLoc(), after, operands);
+      ret.erase();
+    }
+
+    {
+      mlir::OpBuilder b(yieldFrom);
+      mlir::cf::BranchOp::create(b, loc, innerEntry);
+    }
+    yieldFrom.erase();
+    if (llvm::all_of(call->getResults(),
+                     [](mlir::Value v) { return v.use_empty(); })) {
+      llvm::SmallVector<mlir::Operation *, 4> packs;
+      for (mlir::Value operand :
+           {call.getPosargs(), call.getKwnames(), call.getKwvalues()})
+        if (mlir::Operation *pack = operand.getDefiningOp())
+          packs.push_back(pack);
+      call.erase();
+      for (mlir::Operation *pack : packs)
+        if (pack->use_empty())
+          pack->erase();
+      if (binding->use_empty())
+        binding->erase();
+    }
+  }
+  return clone.emitError()
+         << "yield from delegation exceeded the static inlining budget "
+            "(recursive delegation has no static expansion)";
 }
 
 // Phase 2 (after ABI seeding): CFG surgery on the seeded clone.

@@ -213,6 +213,10 @@ struct GeneratorFunctionAnalysis {
   bool hasReturnValue = false;
   llvm::SmallVector<mlir::Type, 4> yieldTypes;
   llvm::SmallVector<mlir::Type, 4> returnTypes;
+  // Send types of `yield from` delegates: PEP 380 forwards send() into the
+  // active delegate, so an unannotated outer generator's send channel is
+  // the join of its delegates'.
+  llvm::SmallVector<mlir::Type, 2> delegatedSendTypes;
   llvm::SmallVector<std::string, 4> failureReasons;
 };
 
@@ -281,6 +285,17 @@ void collectGeneratorFunctionAnalysis(
             types, ast::node(*node, "value"), localCallables,
             analysis.failureReasons, &analysis.localSymbols))
       analysis.yieldTypes.push_back(*element);
+    if (mlir::Type rawSource = inferExprWithLocalCallables(
+            types, ast::node(*node, "value"), localCallables, nullptr,
+            &analysis.localSymbols)) {
+      const py::protocols::Table &table = py::protocols::Table::get(
+          types.getContext());
+      if (std::optional<std::vector<mlir::Type>> generator =
+              table.protocolArgumentsFor(types.widenLiteral(rawSource),
+                                         "Generator"))
+        if (generator->size() >= 2)
+          analysis.delegatedSendTypes.push_back((*generator)[1]);
+    }
     return;
   }
   if (node->kind == "Return") {
@@ -298,9 +313,24 @@ void collectGeneratorFunctionAnalysis(
     const parser::Node *value = ast::node(*node, "value");
     collectGeneratorFunctionAnalysis(types, value, localCallables,
                                      generatorSendHint, analysis);
-    mlir::Type valueType = value && value->kind == "Yield" && generatorSendHint
-                               ? generatorSendHint
-                               : lenientWalkInfer(types, value, analysis);
+    mlir::Type valueType;
+    if (value && value->kind == "Yield" && generatorSendHint) {
+      valueType = generatorSendHint;
+    } else if (value && value->kind == "YieldFrom") {
+      // `x = yield from g()` binds the delegate's COMPLETION type (its
+      // return value), not the yielded element type the generic walk sees.
+      mlir::Type rawSource = inferExprWithLocalCallables(
+          types, ast::node(*value, "value"), localCallables, nullptr,
+          &analysis.localSymbols);
+      if (rawSource) {
+        YieldFromInferenceResult inference =
+            types.inferYieldFromWithEvidence(types.widenLiteral(rawSource));
+        if (inference)
+          valueType = inference.completionType;
+      }
+    }
+    if (!valueType)
+      valueType = lenientWalkInfer(types, value, analysis);
     if (const auto *targets = ast::nodeList(*node, "targets")) {
       for (const parser::NodePtr &target : *targets) {
         if (target && target->kind == "Name")
@@ -2499,8 +2529,13 @@ TypeSystem::inferYieldFromWithEvidence(mlir::Type sourceType) const {
           std::string("yield from ") + typeText(source) + " has no " +
               name.str() +
               " element type evidence"};
+    // A generator delegate completes with its return type R; plain
+    // iterators/iterables complete with None (PEP 380).
+    mlir::Type completion = name == "Generator" && arguments.size() >= 3
+                                ? arguments[2]
+                                : none();
     return YieldFromInferenceResult{
-        arguments.front(), none(), protocol(name, arguments), true, {}};
+        arguments.front(), completion, protocol(name, arguments), true, {}};
   };
 
   if (std::optional<std::vector<mlir::Type>> generator =
@@ -2900,7 +2935,12 @@ TypeSystem::functionSignature(const parser::Node &function,
                                          generator.failureReasons.end());
     sig.generatorYieldType =
         generator.yieldTypes.empty() ? none() : join(generator.yieldTypes);
-    sig.generatorSendType = annotatedGeneratorSendType.value_or(none());
+    // Without an annotation, the send channel is what the delegates accept:
+    // PEP 380 forwards send() into the active `yield from` delegate.
+    sig.generatorSendType = annotatedGeneratorSendType.value_or(
+        generator.delegatedSendTypes.empty()
+            ? none()
+            : join(generator.delegatedSendTypes));
     sig.generatorReturnType =
         generator.returnTypes.empty() ? none() : join(generator.returnTypes);
     if (function.kind == "AsyncFunctionDef") {
