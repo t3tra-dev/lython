@@ -2243,6 +2243,15 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
             return result->result;
         return object();
       }
+      if (name == "repr") {
+        // Not evidence-gated like next/len: repr's contract fixes the result
+        // to str for every receiver (manifest __repr__, source-class
+        // __repr__, default object repr), and the emitter's repr paths reject
+        // unreachable receivers themselves. Falling through to object() here
+        // made multi-argument print re-repr the already-rendered string.
+        if (positional.size() == 1)
+          return strType();
+      }
       if (name == "len") {
         if (strict) {
           if (positional.empty())
