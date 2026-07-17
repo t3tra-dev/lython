@@ -100,7 +100,7 @@ module attributes {
                     "__invert__", "__round__", "__int__", "__float__",
                     "__bool__", "__index__", "__hash__", "__lt__", "__le__",
                     "__gt__", "__ge__", "__repr__", "__str__", "__eq__", "__ne__",
-                    "__pow__"],
+                    "__pow__", "__format__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.int">>, !py.union<!py.contract<"typing.SupportsInt">, !py.contract<"typing.SupportsIndex">, !py.contract<"builtins.str">, !py.contract<"builtins.bytes">, !py.contract<"builtins.bytearray">>] -> [!py.self]>,
       !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>,
@@ -131,7 +131,8 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.int">] -> [!py.contract<"builtins.str">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.object">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.object">] -> [!py.contract<"builtins.bool">]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>
     ],
     method_kinds = ["classmethod", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
@@ -140,13 +141,13 @@ module attributes {
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance",
-                    "instance"]
+                    "instance", "instance"]
   } {}
 
   py.class @bool attributes {
     base_names = ["int"], ly.typing.final,
     method_names = ["__new__", "__repr__", "__str__", "__bool__", "__and__",
-                    "__or__", "__xor__"],
+                    "__or__", "__xor__", "__format__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.bool">>, !py.contract<"builtins.object">] -> [!py.self]>,
       !py.protocol<"Callable", [!py.contract<"builtins.bool">] -> [!py.contract<"builtins.str">]>,
@@ -154,10 +155,11 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.bool">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.bool">, !py.contract<"builtins.bool">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.bool">, !py.contract<"builtins.bool">] -> [!py.contract<"builtins.bool">]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.bool">, !py.contract<"builtins.bool">] -> [!py.contract<"builtins.bool">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.bool">, !py.contract<"builtins.bool">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bool">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>
     ],
     method_kinds = ["classmethod", "instance", "instance", "instance",
-                    "instance", "instance", "instance"]
+                    "instance", "instance", "instance", "instance"]
   } {}
 
   py.class @float attributes {
@@ -165,7 +167,8 @@ module attributes {
     method_names = ["__new__", "__repr__", "__add__", "__sub__", "__mul__",
                     "__truediv__", "__floordiv__", "__mod__", "__float__",
                     "__bool__", "__round__", "__lt__", "__le__", "__gt__",
-                    "__ge__", "__str__", "__eq__", "__ne__", "__pow__"],
+                    "__ge__", "__str__", "__eq__", "__ne__", "__pow__",
+                    "__format__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.float">>, !py.contract<"typing.SupportsFloat">] -> [!py.self]>,
       !py.protocol<"Callable", [!py.contract<"builtins.float">] -> [!py.contract<"builtins.str">]>,
@@ -185,13 +188,14 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.float">] -> [!py.contract<"builtins.str">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.float">, !py.contract<"builtins.object">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.float">, !py.contract<"builtins.object">] -> [!py.contract<"builtins.bool">]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.float">, !py.contract<"builtins.float">] -> [!py.contract<"builtins.float">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.float">, !py.contract<"builtins.float">] -> [!py.contract<"builtins.float">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.float">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>
     ],
     method_kinds = ["classmethod", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance", "instance",
-                    "instance"]
+                    "instance", "instance"]
   } {}
 
   py.class @complex attributes {base_names = ["object"], ly.typing.final} {}
@@ -202,7 +206,7 @@ module attributes {
     method_names = ["__new__", "__len__", "__iter__", "__getitem__", "__add__",
                     "__contains__", "__eq__", "__lt__", "__le__", "__gt__",
                     "__ge__", "join", "startswith", "endswith", "__repr__", "__str__", "__ne__",
-                    "encode"],
+                    "encode", "__format__", "__ascii__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.str">>, !py.contract<"builtins.object">] -> [!py.self]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.int">]>,
@@ -221,13 +225,15 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.object">] -> [!py.contract<"builtins.bool">]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.bytes">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.bytes">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>
     ],
     method_kinds = ["classmethod", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance",
-                    "instance"]
+                    "instance", "instance", "instance"]
   } {}
 
   py.class @str_iterator attributes {
@@ -6341,6 +6347,1831 @@ module attributes {
     %p7 = arith.addi %p6, %c1 : index
     %len_exp = arith.index_cast %p7 : index to i64
     func.return %len_exp : i64
+  }
+
+  // ===== impls: format spec mini-language =====
+  // Shared runtime for str/int/float/bool __format__. The parsed spec
+  // travels as a 10-slot i64 record: [0] fill cp (-1 unset), [1] align cp
+  // (0 unset), [2] sign cp (0 unset), [3] '#' flag, [4] '0' flag,
+  // [5] width (-1 unset), [6] grouping cp (0 none), [7] precision
+  // (-1 unset), [8] type cp (0 none), [9] 'z' flag. Formatting works on
+  // code-point buffers (i32) because fills and 'c' bodies are arbitrary
+  // code points; the ASCII digit machinery widens into them for free.
+
+  memref.global "private" constant @__ly_fmt_msg_invalid_spec_prefix : memref<26xi8> = dense<[73, 110, 118, 97, 108, 105, 100, 32, 102, 111, 114, 109, 97, 116, 32, 115, 112, 101, 99, 105, 102, 105, 101, 114, 32, 39]>
+  memref.global "private" constant @__ly_fmt_msg_for_object_of_type : memref<22xi8> = dense<[39, 32, 102, 111, 114, 32, 111, 98, 106, 101, 99, 116, 32, 111, 102, 32, 116, 121, 112, 101, 32, 39]>
+  memref.global "private" constant @__ly_fmt_msg_quote : memref<1xi8> = dense<[39]>
+  memref.global "private" constant @__ly_fmt_msg_unknown_code_prefix : memref<21xi8> = dense<[85, 110, 107, 110, 111, 119, 110, 32, 102, 111, 114, 109, 97, 116, 32, 99, 111, 100, 101, 32, 39]>
+  memref.global "private" constant @__ly_fmt_msg_sign_str : memref<43xi8> = dense<[83, 105, 103, 110, 32, 110, 111, 116, 32, 97, 108, 108, 111, 119, 101, 100, 32, 105, 110, 32, 115, 116, 114, 105, 110, 103, 32, 102, 111, 114, 109, 97, 116, 32, 115, 112, 101, 99, 105, 102, 105, 101, 114]>
+  memref.global "private" constant @__ly_fmt_msg_eq_align_str : memref<52xi8> = dense<[39, 61, 39, 32, 97, 108, 105, 103, 110, 109, 101, 110, 116, 32, 110, 111, 116, 32, 97, 108, 108, 111, 119, 101, 100, 32, 105, 110, 32, 115, 116, 114, 105, 110, 103, 32, 102, 111, 114, 109, 97, 116, 32, 115, 112, 101, 99, 105, 102, 105, 101, 114]>
+  memref.global "private" constant @__ly_fmt_msg_alt_str : memref<57xi8> = dense<[65, 108, 116, 101, 114, 110, 97, 116, 101, 32, 102, 111, 114, 109, 32, 40, 35, 41, 32, 110, 111, 116, 32, 97, 108, 108, 111, 119, 101, 100, 32, 105, 110, 32, 115, 116, 114, 105, 110, 103, 32, 102, 111, 114, 109, 97, 116, 32, 115, 112, 101, 99, 105, 102, 105, 101, 114]>
+  memref.global "private" constant @__ly_fmt_msg_cannot_specify_prefix : memref<16xi8> = dense<[67, 97, 110, 110, 111, 116, 32, 115, 112, 101, 99, 105, 102, 121, 32, 39]>
+  memref.global "private" constant @__ly_fmt_msg_with_mid : memref<8xi8> = dense<[39, 32, 119, 105, 116, 104, 32, 39]>
+  memref.global "private" constant @__ly_fmt_msg_dot_tail : memref<2xi8> = dense<[39, 46]>
+  memref.global "private" constant @__ly_fmt_msg_both_groupings : memref<32xi8> = dense<[67, 97, 110, 110, 111, 116, 32, 115, 112, 101, 99, 105, 102, 121, 32, 98, 111, 116, 104, 32, 39, 44, 39, 32, 97, 110, 100, 32, 39, 95, 39, 46]>
+  memref.global "private" constant @__ly_fmt_msg_missing_precision : memref<34xi8> = dense<[70, 111, 114, 109, 97, 116, 32, 115, 112, 101, 99, 105, 102, 105, 101, 114, 32, 109, 105, 115, 115, 105, 110, 103, 32, 112, 114, 101, 99, 105, 115, 105, 111, 110]>
+  memref.global "private" constant @__ly_fmt_msg_int_precision : memref<49xi8> = dense<[80, 114, 101, 99, 105, 115, 105, 111, 110, 32, 110, 111, 116, 32, 97, 108, 108, 111, 119, 101, 100, 32, 105, 110, 32, 105, 110, 116, 101, 103, 101, 114, 32, 102, 111, 114, 109, 97, 116, 32, 115, 112, 101, 99, 105, 102, 105, 101, 114]>
+  memref.global "private" constant @__ly_fmt_msg_sign_c : memref<50xi8> = dense<[83, 105, 103, 110, 32, 110, 111, 116, 32, 97, 108, 108, 111, 119, 101, 100, 32, 119, 105, 116, 104, 32, 105, 110, 116, 101, 103, 101, 114, 32, 102, 111, 114, 109, 97, 116, 32, 115, 112, 101, 99, 105, 102, 105, 101, 114, 32, 39, 99, 39]>
+  memref.global "private" constant @__ly_fmt_msg_alt_c : memref<64xi8> = dense<[65, 108, 116, 101, 114, 110, 97, 116, 101, 32, 102, 111, 114, 109, 32, 40, 35, 41, 32, 110, 111, 116, 32, 97, 108, 108, 111, 119, 101, 100, 32, 119, 105, 116, 104, 32, 105, 110, 116, 101, 103, 101, 114, 32, 102, 111, 114, 109, 97, 116, 32, 115, 112, 101, 99, 105, 102, 105, 101, 114, 32, 39, 99, 39]>
+  memref.global "private" constant @__ly_fmt_msg_z_int : memref<66xi8> = dense<[78, 101, 103, 97, 116, 105, 118, 101, 32, 122, 101, 114, 111, 32, 99, 111, 101, 114, 99, 105, 111, 110, 32, 40, 122, 41, 32, 110, 111, 116, 32, 97, 108, 108, 111, 119, 101, 100, 32, 105, 110, 32, 105, 110, 116, 101, 103, 101, 114, 32, 102, 111, 114, 109, 97, 116, 32, 115, 112, 101, 99, 105, 102, 105, 101, 114]>
+  memref.global "private" constant @__ly_fmt_msg_c_range : memref<29xi8> = dense<[37, 99, 32, 97, 114, 103, 32, 110, 111, 116, 32, 105, 110, 32, 114, 97, 110, 103, 101, 40, 48, 120, 49, 49, 48, 48, 48, 48, 41]>
+  memref.global "private" constant @__ly_fmt_msg_name_int : memref<3xi8> = dense<[105, 110, 116]>
+  memref.global "private" constant @__ly_fmt_msg_name_float : memref<5xi8> = dense<[102, 108, 111, 97, 116]>
+  memref.global "private" constant @__ly_fmt_msg_name_str : memref<3xi8> = dense<[115, 116, 114]>
+  memref.global "private" constant @__ly_fmt_msg_name_bool : memref<4xi8> = dense<[98, 111, 111, 108]>
+
+  func.func private @__ly_fmt_copy_bytes(%dst: memref<?xi8>, %dpos: i64, %src: memref<?xi8>, %len: i64) -> i64 {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %n = arith.index_cast %len : i64 to index
+    %base = arith.index_cast %dpos : i64 to index
+    scf.for %i = %c0 to %n step %c1 {
+      %b = memref.load %src[%i] : memref<?xi8>
+      %o = arith.addi %base, %i : index
+      memref.store %b, %dst[%o] : memref<?xi8>
+    }
+    %res = arith.addi %dpos, %len : i64
+    func.return %res : i64
+  }
+
+  // UTF-8 encode one code point at byte position; returns the new position.
+  func.func private @__ly_fmt_utf8_put(%buf: memref<?xi8>, %pos: i64, %cp: i64) -> i64 {
+    %c0_1 = arith.constant 1 : index
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %three = arith.constant 3 : i64
+    %four = arith.constant 4 : i64
+    %c6 = arith.constant 6 : i64
+    %c12 = arith.constant 12 : i64
+    %c18 = arith.constant 18 : i64
+    %mask6 = arith.constant 63 : i64
+    %cont = arith.constant 128 : i64
+    %lim1 = arith.constant 128 : i64
+    %lim2 = arith.constant 2048 : i64
+    %lim3 = arith.constant 65536 : i64
+    %is1 = arith.cmpi ult, %cp, %lim1 : i64
+    %is2 = arith.cmpi ult, %cp, %lim2 : i64
+    %is3 = arith.cmpi ult, %cp, %lim3 : i64
+    %p_idx = arith.index_cast %pos : i64 to index
+    %res = scf.if %is1 -> (i64) {
+      %b = arith.trunci %cp : i64 to i8
+      memref.store %b, %buf[%p_idx] : memref<?xi8>
+      %np = arith.addi %pos, %one : i64
+      scf.yield %np : i64
+    } else {
+      %r2 = scf.if %is2 -> (i64) {
+        %hi = arith.shrui %cp, %c6 : i64
+        %h192 = arith.constant 192 : i64
+        %hb0 = arith.andi %hi, %mask6 : i64
+        %hb = arith.ori %hb0, %h192 : i64
+        %lo0 = arith.andi %cp, %mask6 : i64
+        %lo = arith.ori %lo0, %cont : i64
+        %hb8 = arith.trunci %hb : i64 to i8
+        %lo8 = arith.trunci %lo : i64 to i8
+        memref.store %hb8, %buf[%p_idx] : memref<?xi8>
+        %p1 = arith.addi %p_idx, %c0_1 : index
+        memref.store %lo8, %buf[%p1] : memref<?xi8>
+        %np = arith.addi %pos, %two : i64
+        scf.yield %np : i64
+      } else {
+        %r3 = scf.if %is3 -> (i64) {
+          %h224 = arith.constant 224 : i64
+          %b0s = arith.shrui %cp, %c12 : i64
+          %b0m = arith.andi %b0s, %mask6 : i64
+          %b0 = arith.ori %b0m, %h224 : i64
+          %b1s = arith.shrui %cp, %c6 : i64
+          %b1m = arith.andi %b1s, %mask6 : i64
+          %b1 = arith.ori %b1m, %cont : i64
+          %b2m = arith.andi %cp, %mask6 : i64
+          %b2 = arith.ori %b2m, %cont : i64
+          %b0_8 = arith.trunci %b0 : i64 to i8
+          %b1_8 = arith.trunci %b1 : i64 to i8
+          %b2_8 = arith.trunci %b2 : i64 to i8
+          memref.store %b0_8, %buf[%p_idx] : memref<?xi8>
+          %p1a = arith.addi %p_idx, %c0_1 : index
+          memref.store %b1_8, %buf[%p1a] : memref<?xi8>
+          %p2a = arith.addi %p1a, %c0_1 : index
+          memref.store %b2_8, %buf[%p2a] : memref<?xi8>
+          %np = arith.addi %pos, %three : i64
+          scf.yield %np : i64
+        } else {
+          %h240 = arith.constant 240 : i64
+          %b0s = arith.shrui %cp, %c18 : i64
+          %b0m = arith.andi %b0s, %mask6 : i64
+          %b0 = arith.ori %b0m, %h240 : i64
+          %b1s = arith.shrui %cp, %c12 : i64
+          %b1m = arith.andi %b1s, %mask6 : i64
+          %b1 = arith.ori %b1m, %cont : i64
+          %b2s = arith.shrui %cp, %c6 : i64
+          %b2m = arith.andi %b2s, %mask6 : i64
+          %b2 = arith.ori %b2m, %cont : i64
+          %b3m = arith.andi %cp, %mask6 : i64
+          %b3 = arith.ori %b3m, %cont : i64
+          %b0_8 = arith.trunci %b0 : i64 to i8
+          %b1_8 = arith.trunci %b1 : i64 to i8
+          %b2_8 = arith.trunci %b2 : i64 to i8
+          %b3_8 = arith.trunci %b3 : i64 to i8
+          memref.store %b0_8, %buf[%p_idx] : memref<?xi8>
+          %p1b = arith.addi %p_idx, %c0_1 : index
+          memref.store %b1_8, %buf[%p1b] : memref<?xi8>
+          %p2b = arith.addi %p1b, %c0_1 : index
+          memref.store %b2_8, %buf[%p2b] : memref<?xi8>
+          %p3b = arith.addi %p2b, %c0_1 : index
+          memref.store %b3_8, %buf[%p3b] : memref<?xi8>
+          %np = arith.addi %pos, %four : i64
+          scf.yield %np : i64
+        }
+        scf.yield %r3 : i64
+      }
+      scf.yield %r2 : i64
+    }
+    func.return %res : i64
+  }
+
+  func.func private @__ly_fmt_raise_bytes(%message: memref<?xi8>, %length: i64) {
+    %value_error = arith.constant 53 : i64
+    func.call @__ly_long_raise_message(%value_error, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.return
+  }
+
+  // "Unknown format code 'C' for object of type 'T'"
+  func.func private @__ly_fmt_raise_unknown_code(%code: i64, %name: memref<?xi8>, %name_len: i64) {
+    %buf_s = memref.alloca() : memref<64xi8>
+    %buf = memref.cast %buf_s : memref<64xi8> to memref<?xi8>
+    %zero = arith.constant 0 : i64
+    %p0s = memref.get_global @__ly_fmt_msg_unknown_code_prefix : memref<21xi8>
+    %p0 = memref.cast %p0s : memref<21xi8> to memref<?xi8>
+    %l21 = arith.constant 21 : i64
+    %a = func.call @__ly_fmt_copy_bytes(%buf, %zero, %p0, %l21) : (memref<?xi8>, i64, memref<?xi8>, i64) -> i64
+    %b = func.call @__ly_fmt_utf8_put(%buf, %a, %code) : (memref<?xi8>, i64, i64) -> i64
+    %p1s = memref.get_global @__ly_fmt_msg_for_object_of_type : memref<22xi8>
+    %p1 = memref.cast %p1s : memref<22xi8> to memref<?xi8>
+    %l22 = arith.constant 22 : i64
+    %c = func.call @__ly_fmt_copy_bytes(%buf, %b, %p1, %l22) : (memref<?xi8>, i64, memref<?xi8>, i64) -> i64
+    %d = func.call @__ly_fmt_copy_bytes(%buf, %c, %name, %name_len) : (memref<?xi8>, i64, memref<?xi8>, i64) -> i64
+    %qs = memref.get_global @__ly_fmt_msg_quote : memref<1xi8>
+    %q = memref.cast %qs : memref<1xi8> to memref<?xi8>
+    %l1 = arith.constant 1 : i64
+    %e = func.call @__ly_fmt_copy_bytes(%buf, %d, %q, %l1) : (memref<?xi8>, i64, memref<?xi8>, i64) -> i64
+    func.call @__ly_fmt_raise_bytes(%buf, %e) : (memref<?xi8>, i64) -> ()
+    func.return
+  }
+
+  // "Invalid format specifier 'SPEC' for object of type 'T'"
+  func.func private @__ly_fmt_raise_invalid_spec(%spec_h: memref<2xi64>, %spec_b: memref<?xi8>, %name: memref<?xi8>, %name_len: i64) {
+    %zero = arith.constant 0 : i64
+    %spec_len = func.call @__ly_unicode_utf8_length(%spec_h, %spec_b) : (memref<2xi64>, memref<?xi8>) -> i64
+    %fixed = arith.constant 64 : i64
+    %total = arith.addi %spec_len, %fixed : i64
+    %total_idx = arith.index_cast %total : i64 to index
+    %buf = memref.alloc(%total_idx) : memref<?xi8>
+    %spec_len_idx = arith.index_cast %spec_len : i64 to index
+    %tmp = memref.alloc(%spec_len_idx) : memref<?xi8>
+    func.call @__ly_unicode_utf8_fill(%spec_h, %spec_b, %tmp) : (memref<2xi64>, memref<?xi8>, memref<?xi8>) -> ()
+    %p0s = memref.get_global @__ly_fmt_msg_invalid_spec_prefix : memref<26xi8>
+    %p0 = memref.cast %p0s : memref<26xi8> to memref<?xi8>
+    %l26 = arith.constant 26 : i64
+    %a = func.call @__ly_fmt_copy_bytes(%buf, %zero, %p0, %l26) : (memref<?xi8>, i64, memref<?xi8>, i64) -> i64
+    %b = func.call @__ly_fmt_copy_bytes(%buf, %a, %tmp, %spec_len) : (memref<?xi8>, i64, memref<?xi8>, i64) -> i64
+    %p1s = memref.get_global @__ly_fmt_msg_for_object_of_type : memref<22xi8>
+    %p1 = memref.cast %p1s : memref<22xi8> to memref<?xi8>
+    %l22 = arith.constant 22 : i64
+    %c = func.call @__ly_fmt_copy_bytes(%buf, %b, %p1, %l22) : (memref<?xi8>, i64, memref<?xi8>, i64) -> i64
+    %d = func.call @__ly_fmt_copy_bytes(%buf, %c, %name, %name_len) : (memref<?xi8>, i64, memref<?xi8>, i64) -> i64
+    %qs = memref.get_global @__ly_fmt_msg_quote : memref<1xi8>
+    %q = memref.cast %qs : memref<1xi8> to memref<?xi8>
+    %l1 = arith.constant 1 : i64
+    %e = func.call @__ly_fmt_copy_bytes(%buf, %d, %q, %l1) : (memref<?xi8>, i64, memref<?xi8>, i64) -> i64
+    memref.dealloc %tmp : memref<?xi8>
+    func.call @__ly_fmt_raise_bytes(%buf, %e) : (memref<?xi8>, i64) -> ()
+    memref.dealloc %buf : memref<?xi8>
+    func.return
+  }
+
+  // "Cannot specify 'G' with 'C'."
+  func.func private @__ly_fmt_raise_cannot_group(%gcp: i64, %wcp: i64) {
+    %buf_s = memref.alloca() : memref<48xi8>
+    %buf = memref.cast %buf_s : memref<48xi8> to memref<?xi8>
+    %zero = arith.constant 0 : i64
+    %p0s = memref.get_global @__ly_fmt_msg_cannot_specify_prefix : memref<16xi8>
+    %p0 = memref.cast %p0s : memref<16xi8> to memref<?xi8>
+    %l16 = arith.constant 16 : i64
+    %a = func.call @__ly_fmt_copy_bytes(%buf, %zero, %p0, %l16) : (memref<?xi8>, i64, memref<?xi8>, i64) -> i64
+    %b = func.call @__ly_fmt_utf8_put(%buf, %a, %gcp) : (memref<?xi8>, i64, i64) -> i64
+    %p1s = memref.get_global @__ly_fmt_msg_with_mid : memref<8xi8>
+    %p1 = memref.cast %p1s : memref<8xi8> to memref<?xi8>
+    %l8 = arith.constant 8 : i64
+    %c = func.call @__ly_fmt_copy_bytes(%buf, %b, %p1, %l8) : (memref<?xi8>, i64, memref<?xi8>, i64) -> i64
+    %d = func.call @__ly_fmt_utf8_put(%buf, %c, %wcp) : (memref<?xi8>, i64, i64) -> i64
+    %p2s = memref.get_global @__ly_fmt_msg_dot_tail : memref<2xi8>
+    %p2 = memref.cast %p2s : memref<2xi8> to memref<?xi8>
+    %l2 = arith.constant 2 : i64
+    %e = func.call @__ly_fmt_copy_bytes(%buf, %d, %p2, %l2) : (memref<?xi8>, i64, memref<?xi8>, i64) -> i64
+    func.call @__ly_fmt_raise_bytes(%buf, %e) : (memref<?xi8>, i64) -> ()
+    func.return
+  }
+
+  func.func private @__ly_fmt_raise_sign_str() {
+    %ms = memref.get_global @__ly_fmt_msg_sign_str : memref<43xi8>
+    %m = memref.cast %ms : memref<43xi8> to memref<?xi8>
+    %l = arith.constant 43 : i64
+    func.call @__ly_fmt_raise_bytes(%m, %l) : (memref<?xi8>, i64) -> ()
+    func.return
+  }
+
+  func.func private @__ly_fmt_raise_eq_align_str() {
+    %ms = memref.get_global @__ly_fmt_msg_eq_align_str : memref<52xi8>
+    %m = memref.cast %ms : memref<52xi8> to memref<?xi8>
+    %l = arith.constant 52 : i64
+    func.call @__ly_fmt_raise_bytes(%m, %l) : (memref<?xi8>, i64) -> ()
+    func.return
+  }
+
+  func.func private @__ly_fmt_raise_alt_str() {
+    %ms = memref.get_global @__ly_fmt_msg_alt_str : memref<57xi8>
+    %m = memref.cast %ms : memref<57xi8> to memref<?xi8>
+    %l = arith.constant 57 : i64
+    func.call @__ly_fmt_raise_bytes(%m, %l) : (memref<?xi8>, i64) -> ()
+    func.return
+  }
+
+  func.func private @__ly_fmt_raise_both_groupings() {
+    %ms = memref.get_global @__ly_fmt_msg_both_groupings : memref<32xi8>
+    %m = memref.cast %ms : memref<32xi8> to memref<?xi8>
+    %l = arith.constant 32 : i64
+    func.call @__ly_fmt_raise_bytes(%m, %l) : (memref<?xi8>, i64) -> ()
+    func.return
+  }
+
+  func.func private @__ly_fmt_raise_missing_precision() {
+    %ms = memref.get_global @__ly_fmt_msg_missing_precision : memref<34xi8>
+    %m = memref.cast %ms : memref<34xi8> to memref<?xi8>
+    %l = arith.constant 34 : i64
+    func.call @__ly_fmt_raise_bytes(%m, %l) : (memref<?xi8>, i64) -> ()
+    func.return
+  }
+
+  func.func private @__ly_fmt_raise_int_precision() {
+    %ms = memref.get_global @__ly_fmt_msg_int_precision : memref<49xi8>
+    %m = memref.cast %ms : memref<49xi8> to memref<?xi8>
+    %l = arith.constant 49 : i64
+    func.call @__ly_fmt_raise_bytes(%m, %l) : (memref<?xi8>, i64) -> ()
+    func.return
+  }
+
+  func.func private @__ly_fmt_raise_sign_c() {
+    %ms = memref.get_global @__ly_fmt_msg_sign_c : memref<50xi8>
+    %m = memref.cast %ms : memref<50xi8> to memref<?xi8>
+    %l = arith.constant 50 : i64
+    func.call @__ly_fmt_raise_bytes(%m, %l) : (memref<?xi8>, i64) -> ()
+    func.return
+  }
+
+  func.func private @__ly_fmt_raise_alt_c() {
+    %ms = memref.get_global @__ly_fmt_msg_alt_c : memref<64xi8>
+    %m = memref.cast %ms : memref<64xi8> to memref<?xi8>
+    %l = arith.constant 64 : i64
+    func.call @__ly_fmt_raise_bytes(%m, %l) : (memref<?xi8>, i64) -> ()
+    func.return
+  }
+
+  func.func private @__ly_fmt_raise_z_int() {
+    %ms = memref.get_global @__ly_fmt_msg_z_int : memref<66xi8>
+    %m = memref.cast %ms : memref<66xi8> to memref<?xi8>
+    %l = arith.constant 66 : i64
+    func.call @__ly_fmt_raise_bytes(%m, %l) : (memref<?xi8>, i64) -> ()
+    func.return
+  }
+
+  // OverflowError in CPython; ValueError until the R2 taxonomy port lands.
+  func.func private @__ly_fmt_raise_c_range() {
+    %ms = memref.get_global @__ly_fmt_msg_c_range : memref<29xi8>
+    %m = memref.cast %ms : memref<29xi8> to memref<?xi8>
+    %l = arith.constant 29 : i64
+    func.call @__ly_fmt_raise_bytes(%m, %l) : (memref<?xi8>, i64) -> ()
+    func.return
+  }
+
+  // Parses the CPython format-spec mini-language into the 10-slot record.
+  // Returns false when trailing characters remain (the caller raises with
+  // its own type name); the shared shape errors raise here directly.
+  func.func private @__ly_fmt_parse_spec(%spec_h: memref<2xi64>, %spec_b: memref<?xi8>, %out: memref<?xi64>) -> i1 {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %minus_one = arith.constant -1 : i64
+    %ten = arith.constant 10 : i64
+    %cap = arith.constant 1000000000000000 : i64
+    %s0 = arith.constant 0 : index
+    %s1 = arith.constant 1 : index
+    %s2 = arith.constant 2 : index
+    %s3 = arith.constant 3 : index
+    %s4 = arith.constant 4 : index
+    %s5 = arith.constant 5 : index
+    %s6 = arith.constant 6 : index
+    %s7 = arith.constant 7 : index
+    %s8 = arith.constant 8 : index
+    %s9 = arith.constant 9 : index
+    memref.store %minus_one, %out[%s0] : memref<?xi64>
+    memref.store %zero, %out[%s1] : memref<?xi64>
+    memref.store %zero, %out[%s2] : memref<?xi64>
+    memref.store %zero, %out[%s3] : memref<?xi64>
+    memref.store %zero, %out[%s4] : memref<?xi64>
+    memref.store %minus_one, %out[%s5] : memref<?xi64>
+    memref.store %zero, %out[%s6] : memref<?xi64>
+    memref.store %minus_one, %out[%s7] : memref<?xi64>
+    memref.store %zero, %out[%s8] : memref<?xi64>
+    memref.store %zero, %out[%s9] : memref<?xi64>
+    %wid = func.call @__ly_unicode_width(%spec_h) : (memref<2xi64>) -> i64
+    %n = func.call @__ly_unicode_count(%spec_h, %spec_b) : (memref<2xi64>, memref<?xi8>) -> i64
+
+    // fill+align (two-char), else align (one-char)
+    %has2 = arith.cmpi sge, %n, %two : i64
+    %c1v = scf.if %has2 -> (i64) {
+      %i1x = arith.constant 1 : index
+      %v = func.call @__ly_unicode_get(%spec_b, %wid, %i1x) : (memref<?xi8>, i64, index) -> i64
+      scf.yield %v : i64
+    } else {
+      scf.yield %zero : i64
+    }
+    %lt = arith.constant 60 : i64
+    %gt = arith.constant 62 : i64
+    %caret = arith.constant 94 : i64
+    %eq = arith.constant 61 : i64
+    %c1_lt = arith.cmpi eq, %c1v, %lt : i64
+    %c1_gt = arith.cmpi eq, %c1v, %gt : i64
+    %c1_ca = arith.cmpi eq, %c1v, %caret : i64
+    %c1_eq = arith.cmpi eq, %c1v, %eq : i64
+    %c1_a = arith.ori %c1_lt, %c1_gt : i1
+    %c1_b = arith.ori %c1_ca, %c1_eq : i1
+    %c1_align = arith.ori %c1_a, %c1_b : i1
+    %two_char = arith.andi %has2, %c1_align : i1
+    %pos_align = scf.if %two_char -> (i64) {
+      %i0x = arith.constant 0 : index
+      %fillv = func.call @__ly_unicode_get(%spec_b, %wid, %i0x) : (memref<?xi8>, i64, index) -> i64
+      memref.store %fillv, %out[%s0] : memref<?xi64>
+      memref.store %c1v, %out[%s1] : memref<?xi64>
+      scf.yield %two : i64
+    } else {
+      %has1 = arith.cmpi sge, %n, %one : i64
+      %c0v = scf.if %has1 -> (i64) {
+        %i0y = arith.constant 0 : index
+        %v = func.call @__ly_unicode_get(%spec_b, %wid, %i0y) : (memref<?xi8>, i64, index) -> i64
+        scf.yield %v : i64
+      } else {
+        scf.yield %zero : i64
+      }
+      %c0_lt = arith.cmpi eq, %c0v, %lt : i64
+      %c0_gt = arith.cmpi eq, %c0v, %gt : i64
+      %c0_ca = arith.cmpi eq, %c0v, %caret : i64
+      %c0_eq = arith.cmpi eq, %c0v, %eq : i64
+      %c0_a = arith.ori %c0_lt, %c0_gt : i1
+      %c0_b = arith.ori %c0_ca, %c0_eq : i1
+      %c0_align0 = arith.ori %c0_a, %c0_b : i1
+      %c0_align = arith.andi %has1, %c0_align0 : i1
+      %p = scf.if %c0_align -> (i64) {
+        memref.store %c0v, %out[%s1] : memref<?xi64>
+        scf.yield %one : i64
+      } else {
+        scf.yield %zero : i64
+      }
+      scf.yield %p : i64
+    }
+
+    // helper closure equivalent: current char or 0
+    %plus = arith.constant 43 : i64
+    %minus_ch = arith.constant 45 : i64
+    %space = arith.constant 32 : i64
+    %in_sign = arith.cmpi slt, %pos_align, %n : i64
+    %sc = scf.if %in_sign -> (i64) {
+      %ix = arith.index_cast %pos_align : i64 to index
+      %v = func.call @__ly_unicode_get(%spec_b, %wid, %ix) : (memref<?xi8>, i64, index) -> i64
+      scf.yield %v : i64
+    } else {
+      scf.yield %zero : i64
+    }
+    %is_plus = arith.cmpi eq, %sc, %plus : i64
+    %is_minus = arith.cmpi eq, %sc, %minus_ch : i64
+    %is_space = arith.cmpi eq, %sc, %space : i64
+    %is_sign0 = arith.ori %is_plus, %is_minus : i1
+    %is_sign = arith.ori %is_sign0, %is_space : i1
+    %pos_sign = scf.if %is_sign -> (i64) {
+      memref.store %sc, %out[%s2] : memref<?xi64>
+      %np = arith.addi %pos_align, %one : i64
+      scf.yield %np : i64
+    } else {
+      scf.yield %pos_align : i64
+    }
+
+    // 'z'
+    %zch = arith.constant 122 : i64
+    %in_z = arith.cmpi slt, %pos_sign, %n : i64
+    %zc = scf.if %in_z -> (i64) {
+      %ix = arith.index_cast %pos_sign : i64 to index
+      %v = func.call @__ly_unicode_get(%spec_b, %wid, %ix) : (memref<?xi8>, i64, index) -> i64
+      scf.yield %v : i64
+    } else {
+      scf.yield %zero : i64
+    }
+    %is_z = arith.cmpi eq, %zc, %zch : i64
+    %pos_z = scf.if %is_z -> (i64) {
+      memref.store %one, %out[%s9] : memref<?xi64>
+      %np = arith.addi %pos_sign, %one : i64
+      scf.yield %np : i64
+    } else {
+      scf.yield %pos_sign : i64
+    }
+
+    // '#'
+    %hash = arith.constant 35 : i64
+    %in_h = arith.cmpi slt, %pos_z, %n : i64
+    %hc = scf.if %in_h -> (i64) {
+      %ix = arith.index_cast %pos_z : i64 to index
+      %v = func.call @__ly_unicode_get(%spec_b, %wid, %ix) : (memref<?xi8>, i64, index) -> i64
+      scf.yield %v : i64
+    } else {
+      scf.yield %zero : i64
+    }
+    %is_h = arith.cmpi eq, %hc, %hash : i64
+    %pos_h = scf.if %is_h -> (i64) {
+      memref.store %one, %out[%s3] : memref<?xi64>
+      %np = arith.addi %pos_z, %one : i64
+      scf.yield %np : i64
+    } else {
+      scf.yield %pos_z : i64
+    }
+
+    // '0' flag
+    %zero_ch = arith.constant 48 : i64
+    %in_0 = arith.cmpi slt, %pos_h, %n : i64
+    %zc0 = scf.if %in_0 -> (i64) {
+      %ix = arith.index_cast %pos_h : i64 to index
+      %v = func.call @__ly_unicode_get(%spec_b, %wid, %ix) : (memref<?xi8>, i64, index) -> i64
+      scf.yield %v : i64
+    } else {
+      scf.yield %zero : i64
+    }
+    %is_0 = arith.cmpi eq, %zc0, %zero_ch : i64
+    %pos_0 = scf.if %is_0 -> (i64) {
+      memref.store %one, %out[%s4] : memref<?xi64>
+      %np = arith.addi %pos_h, %one : i64
+      scf.yield %np : i64
+    } else {
+      scf.yield %pos_h : i64
+    }
+
+    // width digits
+    %nine_ch = arith.constant 57 : i64
+    %w:3 = scf.while (%p = %pos_0, %acc = %zero, %any = %zero) : (i64, i64, i64) -> (i64, i64, i64) {
+      %in = arith.cmpi slt, %p, %n : i64
+      %ch = scf.if %in -> (i64) {
+        %ix = arith.index_cast %p : i64 to index
+        %v = func.call @__ly_unicode_get(%spec_b, %wid, %ix) : (memref<?xi8>, i64, index) -> i64
+        scf.yield %v : i64
+      } else {
+        scf.yield %zero : i64
+      }
+      %ge0 = arith.cmpi sge, %ch, %zero_ch : i64
+      %le9 = arith.cmpi sle, %ch, %nine_ch : i64
+      %digit0 = arith.andi %ge0, %le9 : i1
+      %isdigit = arith.andi %in, %digit0 : i1
+      scf.condition(%isdigit) %p, %acc, %any : i64, i64, i64
+    } do {
+    ^bb0(%p: i64, %acc: i64, %any: i64):
+      %ix = arith.index_cast %p : i64 to index
+      %ch = func.call @__ly_unicode_get(%spec_b, %wid, %ix) : (memref<?xi8>, i64, index) -> i64
+      %d = arith.subi %ch, %zero_ch : i64
+      %acc10 = arith.muli %acc, %ten : i64
+      %nacc0 = arith.addi %acc10, %d : i64
+      %over = arith.cmpi sgt, %nacc0, %cap : i64
+      %nacc = arith.select %over, %cap, %nacc0 : i64
+      %np = arith.addi %p, %one : i64
+      scf.yield %np, %nacc, %one : i64, i64, i64
+    }
+    %had_width = arith.cmpi ne, %w#2, %zero : i64
+    scf.if %had_width {
+      memref.store %w#1, %out[%s5] : memref<?xi64>
+    }
+
+    // grouping
+    %comma = arith.constant 44 : i64
+    %under = arith.constant 95 : i64
+    %in_g = arith.cmpi slt, %w#0, %n : i64
+    %gc = scf.if %in_g -> (i64) {
+      %ix = arith.index_cast %w#0 : i64 to index
+      %v = func.call @__ly_unicode_get(%spec_b, %wid, %ix) : (memref<?xi8>, i64, index) -> i64
+      scf.yield %v : i64
+    } else {
+      scf.yield %zero : i64
+    }
+    %g_comma = arith.cmpi eq, %gc, %comma : i64
+    %g_under = arith.cmpi eq, %gc, %under : i64
+    %is_g = arith.ori %g_comma, %g_under : i1
+    %pos_g = scf.if %is_g -> (i64) {
+      memref.store %gc, %out[%s6] : memref<?xi64>
+      %np = arith.addi %w#0, %one : i64
+      // a second grouping char right after is the dedicated error
+      %in2 = arith.cmpi slt, %np, %n : i64
+      %g2 = scf.if %in2 -> (i64) {
+        %ix2 = arith.index_cast %np : i64 to index
+        %v2 = func.call @__ly_unicode_get(%spec_b, %wid, %ix2) : (memref<?xi8>, i64, index) -> i64
+        scf.yield %v2 : i64
+      } else {
+        scf.yield %zero : i64
+      }
+      %g2_comma = arith.cmpi eq, %g2, %comma : i64
+      %g2_under = arith.cmpi eq, %g2, %under : i64
+      %g2_is = arith.ori %g2_comma, %g2_under : i1
+      scf.if %g2_is {
+        func.call @__ly_fmt_raise_both_groupings() : () -> ()
+      }
+      scf.yield %np : i64
+    } else {
+      scf.yield %w#0 : i64
+    }
+
+    // '.' precision
+    %dot = arith.constant 46 : i64
+    %in_p = arith.cmpi slt, %pos_g, %n : i64
+    %pc = scf.if %in_p -> (i64) {
+      %ix = arith.index_cast %pos_g : i64 to index
+      %v = func.call @__ly_unicode_get(%spec_b, %wid, %ix) : (memref<?xi8>, i64, index) -> i64
+      scf.yield %v : i64
+    } else {
+      scf.yield %zero : i64
+    }
+    %is_dot = arith.cmpi eq, %pc, %dot : i64
+    %pos_p = scf.if %is_dot -> (i64) {
+      %pstart = arith.addi %pos_g, %one : i64
+      %pw:3 = scf.while (%p = %pstart, %acc = %zero, %any = %zero) : (i64, i64, i64) -> (i64, i64, i64) {
+        %in = arith.cmpi slt, %p, %n : i64
+        %ch = scf.if %in -> (i64) {
+          %ix = arith.index_cast %p : i64 to index
+          %v = func.call @__ly_unicode_get(%spec_b, %wid, %ix) : (memref<?xi8>, i64, index) -> i64
+          scf.yield %v : i64
+        } else {
+          scf.yield %zero : i64
+        }
+        %ge0 = arith.cmpi sge, %ch, %zero_ch : i64
+        %le9 = arith.cmpi sle, %ch, %nine_ch : i64
+        %digit0 = arith.andi %ge0, %le9 : i1
+        %isdigit = arith.andi %in, %digit0 : i1
+        scf.condition(%isdigit) %p, %acc, %any : i64, i64, i64
+      } do {
+      ^bb0(%p: i64, %acc: i64, %any: i64):
+        %ix = arith.index_cast %p : i64 to index
+        %ch = func.call @__ly_unicode_get(%spec_b, %wid, %ix) : (memref<?xi8>, i64, index) -> i64
+        %d = arith.subi %ch, %zero_ch : i64
+        %acc10 = arith.muli %acc, %ten : i64
+        %nacc0 = arith.addi %acc10, %d : i64
+        %over = arith.cmpi sgt, %nacc0, %cap : i64
+        %nacc = arith.select %over, %cap, %nacc0 : i64
+        %np = arith.addi %p, %one : i64
+        scf.yield %np, %nacc, %one : i64, i64, i64
+      }
+      %had_prec = arith.cmpi ne, %pw#2, %zero : i64
+      %none = arith.cmpi eq, %pw#2, %zero : i64
+      scf.if %none {
+        func.call @__ly_fmt_raise_missing_precision() : () -> ()
+      }
+      scf.if %had_prec {
+        memref.store %pw#1, %out[%s7] : memref<?xi64>
+      }
+      scf.yield %pw#0 : i64
+    } else {
+      scf.yield %pos_g : i64
+    }
+
+    // type char
+    %in_t = arith.cmpi slt, %pos_p, %n : i64
+    %pos_t = scf.if %in_t -> (i64) {
+      %ix = arith.index_cast %pos_p : i64 to index
+      %v = func.call @__ly_unicode_get(%spec_b, %wid, %ix) : (memref<?xi8>, i64, index) -> i64
+      memref.store %v, %out[%s8] : memref<?xi64>
+      %np = arith.addi %pos_p, %one : i64
+      scf.yield %np : i64
+    } else {
+      scf.yield %pos_p : i64
+    }
+    %ok = arith.cmpi eq, %pos_t, %n : i64
+    func.return %ok : i1
+  }
+
+  // Materialize a code-point buffer as a canonical str.
+  func.func private @__ly_fmt_str_from_cps(%cps: memref<?xi32>, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
+    %n = arith.index_cast %len : i64 to index
+    %maxcp = scf.for %i = %c0 to %n step %c1 iter_args(%acc = %zero) -> (i64) {
+      %v32 = memref.load %cps[%i] : memref<?xi32>
+      %v = arith.extui %v32 : i32 to i64
+      %bigger = arith.cmpi ugt, %v, %acc : i64
+      %next = arith.select %bigger, %v, %acc : i64
+      scf.yield %next : i64
+    }
+    %width = func.call @__ly_unicode_width_for(%maxcp) : (i64) -> i64
+    %header, %bytes = func.call @__ly_unicode_alloc(%len, %width) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
+    scf.for %i = %c0 to %n step %c1 {
+      %v32 = memref.load %cps[%i] : memref<?xi32>
+      %v = arith.extui %v32 : i32 to i64
+      func.call @__ly_unicode_put(%bytes, %width, %i, %v) : (memref<?xi8>, i64, index, i64) -> ()
+    }
+    func.return %header, %bytes : memref<2xi64>, memref<?xi8>
+  }
+
+  // Assemble a formatted number: sign, prefix, grouped integer digits, the
+  // untouched rest (fraction/exponent/'%'), then width padding. '0'-fill
+  // with '=' alignment refills *through* the grouping (CPython's regroup
+  // rule), any other fill pads flat.
+  func.func private @__ly_fmt_render_number(%sign_cp: i64, %pre0: i64, %pre1: i64, %body: memref<?xi32>, %body_len: i64, %int_len: i64, %group_cp: i64, %group_size: i64, %fill_cp: i64, %align_cp: i64, %width_in: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %width = arith.maxsi %width_in, %zero : i64
+    %has_sign = arith.cmpi ne, %sign_cp, %zero : i64
+    %sign_len = arith.select %has_sign, %one, %zero : i64
+    %has_p0 = arith.cmpi ne, %pre0, %zero : i64
+    %p0_len = arith.select %has_p0, %one, %zero : i64
+    %has_p1 = arith.cmpi ne, %pre1, %zero : i64
+    %p1_len = arith.select %has_p1, %one, %zero : i64
+    %pre_len = arith.addi %p0_len, %p1_len : i64
+    %rest_len = arith.subi %body_len, %int_len : i64
+    %fixed0 = arith.addi %sign_len, %pre_len : i64
+    %fixed = arith.addi %fixed0, %rest_len : i64
+    %grouped = arith.cmpi ne, %group_cp, %zero : i64
+
+    %eq_align = arith.constant 61 : i64
+    %zero_fill = arith.constant 48 : i64
+    %is_eq = arith.cmpi eq, %align_cp, %eq_align : i64
+    %is_zero_fill = arith.cmpi eq, %fill_cp, %zero_fill : i64
+    %regroup0 = arith.andi %is_eq, %is_zero_fill : i1
+    %regroup1 = arith.andi %regroup0, %grouped : i1
+    %has_width = arith.cmpi sgt, %width, %zero : i64
+    %regroup = arith.andi %regroup1, %has_width : i1
+
+    // m = padded integer digit count
+    %m = scf.if %regroup -> (i64) {
+      %mres = scf.while (%mi = %int_len) : (i64) -> i64 {
+        %mm1 = arith.subi %mi, %one : i64
+        %mm1c = arith.maxsi %mm1, %zero : i64
+        %seps = arith.divui %mm1c, %group_size : i64
+        %glen = arith.addi %mi, %seps : i64
+        %tot = arith.addi %glen, %fixed : i64
+        %need_more = arith.cmpi slt, %tot, %width : i64
+        scf.condition(%need_more) %mi : i64
+      } do {
+      ^bb0(%mi: i64):
+        %nmi = arith.addi %mi, %one : i64
+        scf.yield %nmi : i64
+      }
+      scf.yield %mres : i64
+    } else {
+      scf.yield %int_len : i64
+    }
+
+    %mm1 = arith.subi %m, %one : i64
+    %mm1c = arith.maxsi %mm1, %zero : i64
+    %seps0 = arith.divui %mm1c, %group_size : i64
+    %seps = arith.select %grouped, %seps0, %zero : i64
+    %m_pos = arith.cmpi sgt, %m, %zero : i64
+    %seps_eff = arith.select %m_pos, %seps, %zero : i64
+    %gint = arith.addi %m, %seps_eff : i64
+    %core = arith.addi %fixed, %gint : i64
+    %pad_raw = arith.subi %width, %core : i64
+    %pad = arith.maxsi %pad_raw, %zero : i64
+    %total = arith.addi %core, %pad : i64
+
+    %lt_align = arith.constant 60 : i64
+    %caret_align = arith.constant 94 : i64
+    %is_lt = arith.cmpi eq, %align_cp, %lt_align : i64
+    %is_caret = arith.cmpi eq, %align_cp, %caret_align : i64
+    %half = arith.divui %pad, %two : i64
+    %left_pad = scf.if %is_lt -> (i64) {
+      scf.yield %zero : i64
+    } else {
+      %lp = scf.if %is_caret -> (i64) {
+        scf.yield %half : i64
+      } else {
+        %lp2 = scf.if %is_eq -> (i64) {
+          scf.yield %zero : i64
+        } else {
+          scf.yield %pad : i64
+        }
+        scf.yield %lp2 : i64
+      }
+      scf.yield %lp : i64
+    }
+    %mid_pad = scf.if %is_eq -> (i64) {
+      scf.yield %pad : i64
+    } else {
+      scf.yield %zero : i64
+    }
+    %used = arith.addi %left_pad, %mid_pad : i64
+    %right_pad = arith.subi %pad, %used : i64
+
+    %total_idx = arith.index_cast %total : i64 to index
+    %buf = memref.alloc(%total_idx) : memref<?xi32>
+    %fill32 = arith.trunci %fill_cp : i64 to i32
+    %lp_idx = arith.index_cast %left_pad : i64 to index
+    scf.for %i = %c0 to %lp_idx step %c1 {
+      memref.store %fill32, %buf[%i] : memref<?xi32>
+    }
+    // sign
+    %pos1 = scf.if %has_sign -> (index) {
+      %s32 = arith.trunci %sign_cp : i64 to i32
+      memref.store %s32, %buf[%lp_idx] : memref<?xi32>
+      %np = arith.addi %lp_idx, %c1 : index
+      scf.yield %np : index
+    } else {
+      scf.yield %lp_idx : index
+    }
+    %pos2 = scf.if %has_p0 -> (index) {
+      %v32 = arith.trunci %pre0 : i64 to i32
+      memref.store %v32, %buf[%pos1] : memref<?xi32>
+      %np = arith.addi %pos1, %c1 : index
+      scf.yield %np : index
+    } else {
+      scf.yield %pos1 : index
+    }
+    %pos3 = scf.if %has_p1 -> (index) {
+      %v32 = arith.trunci %pre1 : i64 to i32
+      memref.store %v32, %buf[%pos2] : memref<?xi32>
+      %np = arith.addi %pos2, %c1 : index
+      scf.yield %np : index
+    } else {
+      scf.yield %pos2 : index
+    }
+    %mp_idx = arith.index_cast %mid_pad : i64 to index
+    %pos4 = scf.for %i = %c0 to %mp_idx step %c1 iter_args(%p = %pos3) -> (index) {
+      memref.store %fill32, %buf[%p] : memref<?xi32>
+      %np = arith.addi %p, %c1 : index
+      scf.yield %np : index
+    }
+    // grouped integer digits: m digits, zeros pad the front
+    %pad_zeros = arith.subi %m, %int_len : i64
+    %m_idx = arith.index_cast %m : i64 to index
+    %g32 = arith.trunci %group_cp : i64 to i32
+    %zero32 = arith.constant 48 : i32
+    %pos5 = scf.for %i = %c0 to %m_idx step %c1 iter_args(%p = %pos4) -> (index) {
+      %i_i64 = arith.index_cast %i : index to i64
+      %not_first = arith.cmpi sgt, %i_i64, %zero : i64
+      %remaining = arith.subi %m, %i_i64 : i64
+      %rem_mod = arith.remui %remaining, %group_size : i64
+      %at_sep0 = arith.cmpi eq, %rem_mod, %zero : i64
+      %at_sep1 = arith.andi %not_first, %at_sep0 : i1
+      %at_sep = arith.andi %at_sep1, %grouped : i1
+      %p_sep = scf.if %at_sep -> (index) {
+        memref.store %g32, %buf[%p] : memref<?xi32>
+        %np = arith.addi %p, %c1 : index
+        scf.yield %np : index
+      } else {
+        scf.yield %p : index
+      }
+      %is_pad = arith.cmpi slt, %i_i64, %pad_zeros : i64
+      %digit = scf.if %is_pad -> (i32) {
+        scf.yield %zero32 : i32
+      } else {
+        %src_i64 = arith.subi %i_i64, %pad_zeros : i64
+        %src = arith.index_cast %src_i64 : i64 to index
+        %v = memref.load %body[%src] : memref<?xi32>
+        scf.yield %v : i32
+      }
+      memref.store %digit, %buf[%p_sep] : memref<?xi32>
+      %np2 = arith.addi %p_sep, %c1 : index
+      scf.yield %np2 : index
+    }
+    // rest
+    %int_idx = arith.index_cast %int_len : i64 to index
+    %body_idx = arith.index_cast %body_len : i64 to index
+    %pos6 = scf.for %i = %int_idx to %body_idx step %c1 iter_args(%p = %pos5) -> (index) {
+      %v = memref.load %body[%i] : memref<?xi32>
+      memref.store %v, %buf[%p] : memref<?xi32>
+      %np = arith.addi %p, %c1 : index
+      scf.yield %np : index
+    }
+    %rp_idx = arith.index_cast %right_pad : i64 to index
+    %pos7 = scf.for %i = %c0 to %rp_idx step %c1 iter_args(%p = %pos6) -> (index) {
+      memref.store %fill32, %buf[%p] : memref<?xi32>
+      %np = arith.addi %p, %c1 : index
+      scf.yield %np : index
+    }
+    %header, %bytes = func.call @__ly_fmt_str_from_cps(%buf, %total) : (memref<?xi32>, i64) -> (memref<2xi64>, memref<?xi8>)
+    memref.dealloc %buf : memref<?xi32>
+    func.return %header, %bytes : memref<2xi64>, memref<?xi8>
+  }
+
+  // Fixed-notation body: integer digits, optional '.', fraction digits.
+  // frac_len -1 means the natural fraction (digits past the point, at least
+  // min_frac); a non-negative frac_len pads/truncates to exactly that many.
+  // Returns (body length, integer digit count).
+  func.func private @__ly_fmt_body_fixed(%out: memref<?xi32>, %digits: memref<?xi8>, %count: i64, %decpt: i64, %frac_len: i64, %min_frac: i64, %force_dot: i1) -> (i64, i64) {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero_ch = arith.constant 48 : i32
+    %dot_ch = arith.constant 46 : i32
+    %int_len = arith.maxsi %decpt, %one : i64
+    %natural0 = arith.subi %count, %decpt : i64
+    %natural1 = arith.maxsi %natural0, %zero : i64
+    %natural = arith.maxsi %natural1, %min_frac : i64
+    %frac_given = arith.cmpi sge, %frac_len, %zero : i64
+    %frac = arith.select %frac_given, %frac_len, %natural : i64
+    %int_idx = arith.index_cast %int_len : i64 to index
+    %count_idx = arith.index_cast %count : i64 to index
+    %dec_pos = arith.cmpi sgt, %decpt, %zero : i64
+    // integer digits
+    %p1 = scf.if %dec_pos -> (index) {
+      %p = scf.for %i = %c0 to %int_idx step %c1 iter_args(%q = %c0) -> (index) {
+        %in = arith.cmpi ult, %i, %count_idx : index
+        %ch = scf.if %in -> (i32) {
+          %b = memref.load %digits[%i] : memref<?xi8>
+          %w = arith.extui %b : i8 to i32
+          scf.yield %w : i32
+        } else {
+          scf.yield %zero_ch : i32
+        }
+        memref.store %ch, %out[%q] : memref<?xi32>
+        %nq = arith.addi %q, %c1 : index
+        scf.yield %nq : index
+      }
+      scf.yield %p : index
+    } else {
+      memref.store %zero_ch, %out[%c0] : memref<?xi32>
+      scf.yield %c1 : index
+    }
+    %int_written_i64 = arith.index_cast %p1 : index to i64
+    %frac_pos = arith.cmpi sgt, %frac, %zero : i64
+    %need_dot = arith.ori %frac_pos, %force_dot : i1
+    %p2 = scf.if %need_dot -> (index) {
+      memref.store %dot_ch, %out[%p1] : memref<?xi32>
+      %np = arith.addi %p1, %c1 : index
+      scf.yield %np : index
+    } else {
+      scf.yield %p1 : index
+    }
+    %frac_idx = arith.index_cast %frac : i64 to index
+    %p3 = scf.for %i = %c0 to %frac_idx step %c1 iter_args(%q = %p2) -> (index) {
+      %j = arith.index_cast %i : index to i64
+      %src = arith.addi %decpt, %j : i64
+      %ge0 = arith.cmpi sge, %src, %zero : i64
+      %ltc = arith.cmpi slt, %src, %count : i64
+      %in = arith.andi %ge0, %ltc : i1
+      %ch = scf.if %in -> (i32) {
+        %si = arith.index_cast %src : i64 to index
+        %b = memref.load %digits[%si] : memref<?xi8>
+        %w = arith.extui %b : i8 to i32
+        scf.yield %w : i32
+      } else {
+        scf.yield %zero_ch : i32
+      }
+      memref.store %ch, %out[%q] : memref<?xi32>
+      %nq = arith.addi %q, %c1 : index
+      scf.yield %nq : index
+    }
+    %body_len = arith.index_cast %p3 : index to i64
+    func.return %body_len, %int_written_i64 : i64, i64
+  }
+
+  // Exponent-notation body: d0[.frac]e(sign)XX. mant_frac -1 keeps the natural
+  // count-1 mantissa fraction. Returns (body length, integer digit count=1).
+  func.func private @__ly_fmt_body_exp(%out: memref<?xi32>, %digits: memref<?xi8>, %count: i64, %decpt: i64, %mant_frac: i64, %force_dot: i1, %e_cp: i64) -> (i64, i64) {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %ten = arith.constant 10 : i64
+    %hundred = arith.constant 100 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero_ch = arith.constant 48 : i32
+    %dot_ch = arith.constant 46 : i32
+    %plus_ch = arith.constant 43 : i32
+    %minus_ch = arith.constant 45 : i32
+    %count_idx = arith.index_cast %count : i64 to index
+    %has_digit = arith.cmpi sgt, %count, %zero : i64
+    %d0 = scf.if %has_digit -> (i32) {
+      %b = memref.load %digits[%c0] : memref<?xi8>
+      %w = arith.extui %b : i8 to i32
+      scf.yield %w : i32
+    } else {
+      scf.yield %zero_ch : i32
+    }
+    memref.store %d0, %out[%c0] : memref<?xi32>
+    %natural = arith.subi %count, %one : i64
+    %natural_c = arith.maxsi %natural, %zero : i64
+    %frac_given = arith.cmpi sge, %mant_frac, %zero : i64
+    %frac = arith.select %frac_given, %mant_frac, %natural_c : i64
+    %frac_pos = arith.cmpi sgt, %frac, %zero : i64
+    %need_dot = arith.ori %frac_pos, %force_dot : i1
+    %p1 = scf.if %need_dot -> (index) {
+      memref.store %dot_ch, %out[%c1] : memref<?xi32>
+      %np = arith.addi %c1, %c1 : index
+      scf.yield %np : index
+    } else {
+      scf.yield %c1 : index
+    }
+    %frac_idx = arith.index_cast %frac : i64 to index
+    %p2 = scf.for %i = %c0 to %frac_idx step %c1 iter_args(%q = %p1) -> (index) {
+      %ip1 = arith.addi %i, %c1 : index
+      %in = arith.cmpi ult, %ip1, %count_idx : index
+      %ch = scf.if %in -> (i32) {
+        %b = memref.load %digits[%ip1] : memref<?xi8>
+        %w = arith.extui %b : i8 to i32
+        scf.yield %w : i32
+      } else {
+        scf.yield %zero_ch : i32
+      }
+      memref.store %ch, %out[%q] : memref<?xi32>
+      %nq = arith.addi %q, %c1 : index
+      scf.yield %nq : index
+    }
+    %e32 = arith.trunci %e_cp : i64 to i32
+    memref.store %e32, %out[%p2] : memref<?xi32>
+    %p3 = arith.addi %p2, %c1 : index
+    %exp = arith.subi %decpt, %one : i64
+    %neg = arith.cmpi slt, %exp, %zero : i64
+    %sign32 = arith.select %neg, %minus_ch, %plus_ch : i32
+    memref.store %sign32, %out[%p3] : memref<?xi32>
+    %p4 = arith.addi %p3, %c1 : index
+    %negated = arith.subi %zero, %exp : i64
+    %eabs = arith.select %neg, %negated, %exp : i64
+    %ge100 = arith.cmpi sge, %eabs, %hundred : i64
+    %p5 = scf.if %ge100 -> (index) {
+      %h = arith.divui %eabs, %hundred : i64
+      %hch = arith.addi %h, %zero : i64
+      %h48 = arith.constant 48 : i64
+      %hc = arith.addi %hch, %h48 : i64
+      %hc32 = arith.trunci %hc : i64 to i32
+      memref.store %hc32, %out[%p4] : memref<?xi32>
+      %np = arith.addi %p4, %c1 : index
+      scf.yield %np : index
+    } else {
+      scf.yield %p4 : index
+    }
+    %rem = arith.remui %eabs, %hundred : i64
+    %tens = arith.divui %rem, %ten : i64
+    %c48 = arith.constant 48 : i64
+    %tch = arith.addi %tens, %c48 : i64
+    %tch32 = arith.trunci %tch : i64 to i32
+    memref.store %tch32, %out[%p5] : memref<?xi32>
+    %p6 = arith.addi %p5, %c1 : index
+    %units = arith.remui %rem, %ten : i64
+    %uch = arith.addi %units, %c48 : i64
+    %uch32 = arith.trunci %uch : i64 to i32
+    memref.store %uch32, %out[%p6] : memref<?xi32>
+    %p7 = arith.addi %p6, %c1 : index
+    %body_len = arith.index_cast %p7 : index to i64
+    func.return %body_len, %one : i64, i64
+  }
+
+  // The shared float presentation core (types e/E/f/F/g/G/n/%/none over a
+  // parsed spec record); int and bool delegate here for float type codes.
+  func.func private @__ly_float_format_core(%value: f64, %spec: memref<?xi64>, %tname: memref<?xi8>, %tname_len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %minus_one = arith.constant -1 : i64
+    %six = arith.constant 6 : i64
+    %zero_f = arith.constant 0.0 : f64
+    %true_core = arith.constant true
+    %c16_core = arith.constant 16 : i64
+    %s0 = arith.constant 0 : index
+    %s1 = arith.constant 1 : index
+    %s2 = arith.constant 2 : index
+    %s3 = arith.constant 3 : index
+    %s4_core = arith.constant 4 : index
+    %s5 = arith.constant 5 : index
+    %s6 = arith.constant 6 : index
+    %s7 = arith.constant 7 : index
+    %s8 = arith.constant 8 : index
+    %s9 = arith.constant 9 : index
+    %fill_rec = memref.load %spec[%s0] : memref<?xi64>
+    %align_rec = memref.load %spec[%s1] : memref<?xi64>
+    %sign_rec = memref.load %spec[%s2] : memref<?xi64>
+    %alt_rec = memref.load %spec[%s3] : memref<?xi64>
+    %zero_rec = memref.load %spec[%s4_core] : memref<?xi64>
+    %width_rec = memref.load %spec[%s5] : memref<?xi64>
+    %group_rec = memref.load %spec[%s6] : memref<?xi64>
+    %prec_rec = memref.load %spec[%s7] : memref<?xi64>
+    %type_rec = memref.load %spec[%s8] : memref<?xi64>
+    %z_rec = memref.load %spec[%s9] : memref<?xi64>
+
+    // type resolution
+    %cE = arith.constant 69 : i64
+    %cF = arith.constant 70 : i64
+    %cG = arith.constant 71 : i64
+    %ce = arith.constant 101 : i64
+    %cf = arith.constant 102 : i64
+    %cg = arith.constant 103 : i64
+    %cn = arith.constant 110 : i64
+    %cr = arith.constant 114 : i64
+    %cpct = arith.constant 37 : i64
+    %is_E = arith.cmpi eq, %type_rec, %cE : i64
+    %is_F = arith.cmpi eq, %type_rec, %cF : i64
+    %is_G = arith.cmpi eq, %type_rec, %cG : i64
+    %up0 = arith.ori %is_E, %is_F : i1
+    %upper = arith.ori %up0, %is_G : i1
+    %c32add = arith.constant 32 : i64
+    %lowered = arith.addi %type_rec, %c32add : i64
+    %tl0 = arith.select %upper, %lowered, %type_rec : i64
+    %is_pct = arith.cmpi eq, %tl0, %cpct : i64
+    %tl1 = arith.select %is_pct, %cf, %tl0 : i64
+    %is_n = arith.cmpi eq, %tl1, %cn : i64
+    %tl2 = arith.select %is_n, %cg, %tl1 : i64
+    %no_type = arith.cmpi eq, %tl2, %zero : i64
+    %no_prec = arith.cmpi eq, %prec_rec, %minus_one : i64
+    %repr_mode0 = arith.andi %no_type, %no_prec : i1
+    %gdot_mode = scf.if %no_type -> (i1) {
+      %has_prec = arith.cmpi ne, %prec_rec, %minus_one : i64
+      scf.yield %has_prec : i1
+    } else {
+      %f0 = arith.constant false
+      scf.yield %f0 : i1
+    }
+    %tl3 = arith.select %repr_mode0, %cr, %tl2 : i64
+    %tl = arith.select %gdot_mode, %cg, %tl3 : i64
+    %is_e_t = arith.cmpi eq, %tl, %ce : i64
+    %is_f_t = arith.cmpi eq, %tl, %cf : i64
+    %is_g_t = arith.cmpi eq, %tl, %cg : i64
+    %is_r_t = arith.cmpi eq, %tl, %cr : i64
+    %v0 = arith.ori %is_e_t, %is_f_t : i1
+    %v1 = arith.ori %v0, %is_g_t : i1
+    %valid = arith.ori %v1, %is_r_t : i1
+    %invalid = arith.xori %valid, %true_core : i1
+    scf.if %invalid {
+      func.call @__ly_fmt_raise_unknown_code(%type_rec, %tname, %tname_len) : (i64, memref<?xi8>, i64) -> ()
+    }
+    // ',' or '_' with 'n' is rejected like CPython
+    %grouped_in = arith.cmpi ne, %group_rec, %zero : i64
+    %n_and_group = arith.andi %is_n, %grouped_in : i1
+    scf.if %n_and_group {
+      func.call @__ly_fmt_raise_cannot_group(%group_rec, %cn) : (i64, i64) -> ()
+    }
+
+    %hundred_f = arith.constant 100.0 : f64
+    %scaled = arith.mulf %value, %hundred_f : f64
+    %value2 = arith.select %is_pct, %scaled, %value : f64
+    %bits = arith.bitcast %value2 : f64 to i64
+    %isnan = arith.cmpf uno, %value2, %value2 : f64
+    %neg_bit = arith.cmpi slt, %bits, %zero : i64
+    %not_nan = arith.xori %isnan, %true_core : i1
+    %negative0 = arith.andi %neg_bit, %not_nan : i1
+    %abs = math.absf %value2 : f64
+    %inf_c = arith.constant 0x7FF0000000000000 : f64
+    %isinf = arith.cmpf oeq, %abs, %inf_c : f64
+    %special = arith.ori %isnan, %isinf : i1
+
+    // precision resolution
+    %prec_or6 = arith.select %no_prec, %six, %prec_rec : i64
+    %g_p = arith.maxsi %prec_or6, %one : i64
+    %gdot_dec = arith.select %gdot_mode, %one, %zero : i64
+    %g_thr = arith.subi %g_p, %gdot_dec : i64
+
+    cf.cond_br %special, ^special_case, ^finite_case
+
+  ^special_case:
+    // 3 letters + optional '%'
+    %sp_cap = arith.constant 4 : index
+    %sp = memref.alloc(%sp_cap) : memref<?xi32>
+    %l_n = arith.constant 110 : i32
+    %l_a = arith.constant 97 : i32
+    %l_i = arith.constant 105 : i32
+    %l_f = arith.constant 102 : i32
+    %u_n = arith.constant 78 : i32
+    %u_a = arith.constant 65 : i32
+    %u_i = arith.constant 73 : i32
+    %u_f = arith.constant 70 : i32
+    %pct32 = arith.constant 37 : i32
+    %ch0 = scf.if %isnan -> (i32) {
+      %r = arith.select %upper, %u_n, %l_n : i32
+      scf.yield %r : i32
+    } else {
+      %r = arith.select %upper, %u_i, %l_i : i32
+      scf.yield %r : i32
+    }
+    %ch1 = scf.if %isnan -> (i32) {
+      %r = arith.select %upper, %u_a, %l_a : i32
+      scf.yield %r : i32
+    } else {
+      %r = arith.select %upper, %u_n, %l_n : i32
+      scf.yield %r : i32
+    }
+    %ch2 = scf.if %isnan -> (i32) {
+      %r = arith.select %upper, %u_n, %l_n : i32
+      scf.yield %r : i32
+    } else {
+      %r = arith.select %upper, %u_f, %l_f : i32
+      scf.yield %r : i32
+    }
+    memref.store %ch0, %sp[%s0] : memref<?xi32>
+    memref.store %ch1, %sp[%s1] : memref<?xi32>
+    memref.store %ch2, %sp[%s2] : memref<?xi32>
+    %three_sp = arith.constant 3 : i64
+    %four_sp = arith.constant 4 : i64
+    %sp_len = scf.if %is_pct -> (i64) {
+      memref.store %pct32, %sp[%s3] : memref<?xi32>
+      scf.yield %four_sp : i64
+    } else {
+      scf.yield %three_sp : i64
+    }
+    // nan never shows a bit sign; inf keeps it
+    %neg_sp = arith.andi %negative0, %isinf : i1
+    cf.br ^assemble(%sp, %sp_len, %zero, %neg_sp : memref<?xi32>, i64, i64, i1)
+
+  ^finite_case:
+    %dig_cap_idx = arith.constant 800 : index
+    %dig_store = memref.alloc(%dig_cap_idx) : memref<?xi8>
+    %is_zero_v = arith.cmpf oeq, %abs, %zero_f : f64
+    %dtoa:2 = scf.if %is_zero_v -> (i64, i64) {
+      %zc8 = arith.constant 48 : i8
+      memref.store %zc8, %dig_store[%s0] : memref<?xi8>
+      scf.yield %one, %one : i64, i64
+    } else {
+      %r:2 = scf.if %is_r_t -> (i64, i64) {
+        %sh:2 = func.call @__ly_dtoa_shortest(%abs, %dig_store) : (f64, memref<?xi8>) -> (i64, i64)
+        scf.yield %sh#0, %sh#1 : i64, i64
+      } else {
+        %fixed_req = arith.select %is_f_t, %prec_or6, %zero : i64
+        %e_req = arith.addi %prec_or6, %one : i64
+        %sig_req0 = arith.select %is_e_t, %e_req, %g_p : i64
+        %req = arith.select %is_f_t, %fixed_req, %sig_req0 : i64
+        %ct:2 = func.call @__ly_dtoa_counted(%abs, %is_f_t, %req, %dig_store) : (f64, i1, i64, memref<?xi8>) -> (i64, i64)
+        scf.yield %ct#0, %ct#1 : i64, i64
+      }
+      scf.yield %r#0, %r#1 : i64, i64
+    }
+
+    // 'z': a rounded-to-zero result drops the negative sign
+    %z_on = arith.cmpi ne, %z_rec, %zero : i64
+    %count_zero = arith.cmpi eq, %dtoa#0, %zero : i64
+    %single = arith.cmpi eq, %dtoa#0, %one : i64
+    %zc8b = arith.constant 48 : i8
+    %first_ch = memref.load %dig_store[%s0] : memref<?xi8>
+    %first_zero = arith.cmpi eq, %first_ch, %zc8b : i8
+    %single_zero = arith.andi %single, %first_zero : i1
+    %is_zero_res = arith.ori %count_zero, %single_zero : i1
+    %z_apply = arith.andi %z_on, %is_zero_res : i1
+    %not_z = arith.xori %z_apply, %true_core : i1
+    %negative = arith.andi %negative0, %not_z : i1
+
+    // body sizing: integer digits + dot + fraction + exponent + '%'
+    %dec_c = arith.maxsi %dtoa#1, %one : i64
+    %neg_dec = arith.subi %zero, %dtoa#1 : i64
+    %neg_dec_c = arith.maxsi %neg_dec, %zero : i64
+    %margin = arith.constant 40 : i64
+    %cap0 = arith.addi %dec_c, %dtoa#0 : i64
+    %cap1 = arith.addi %cap0, %prec_or6 : i64
+    %cap2 = arith.addi %cap1, %neg_dec_c : i64
+    %body_cap = arith.addi %cap2, %margin : i64
+    %body_cap_idx = arith.index_cast %body_cap : i64 to index
+    %body = memref.alloc(%body_cap_idx) : memref<?xi32>
+
+    %alt_on = arith.cmpi ne, %alt_rec, %zero : i64
+    %e_upper = arith.constant 69 : i64
+    %e_lower = arith.constant 101 : i64
+    %e_cp = arith.select %upper, %e_upper, %e_lower : i64
+
+    %bl:2 = scf.if %is_f_t -> (i64, i64) {
+      %r:2 = func.call @__ly_fmt_body_fixed(%body, %dig_store, %dtoa#0, %dtoa#1, %prec_or6, %zero, %alt_on) : (memref<?xi32>, memref<?xi8>, i64, i64, i64, i64, i1) -> (i64, i64)
+      scf.yield %r#0, %r#1 : i64, i64
+    } else {
+      %r2:2 = scf.if %is_e_t -> (i64, i64) {
+        %r:2 = func.call @__ly_fmt_body_exp(%body, %dig_store, %dtoa#0, %dtoa#1, %prec_or6, %alt_on, %e_cp) : (memref<?xi32>, memref<?xi8>, i64, i64, i64, i1, i64) -> (i64, i64)
+        scf.yield %r#0, %r#1 : i64, i64
+      } else {
+        // g and repr: pick the form from the decimal exponent
+        %thr = arith.select %is_r_t, %c16_core, %g_thr : i64
+        %low_thr = arith.constant -3 : i64
+        %too_small = arith.cmpi slt, %dtoa#1, %low_thr : i64
+        %too_big = arith.cmpi sgt, %dtoa#1, %thr : i64
+        %use_exp = arith.ori %too_small, %too_big : i1
+        %min_frac = scf.if %is_r_t -> (i64) {
+          scf.yield %one : i64
+        } else {
+          %gm = scf.if %gdot_mode -> (i64) {
+            scf.yield %one : i64
+          } else {
+            scf.yield %zero : i64
+          }
+          scf.yield %gm : i64
+        }
+        %r3:2 = scf.if %use_exp -> (i64, i64) {
+          %mant_nat = arith.constant -1 : i64
+          %alt_mant = arith.subi %g_p, %one : i64
+          %use_alt_mant = arith.andi %alt_on, %is_g_t : i1
+          %mant = arith.select %use_alt_mant, %alt_mant, %mant_nat : i64
+          %force = arith.andi %alt_on, %true_core : i1
+          %r:2 = func.call @__ly_fmt_body_exp(%body, %dig_store, %dtoa#0, %dtoa#1, %mant, %force, %e_cp) : (memref<?xi32>, memref<?xi8>, i64, i64, i64, i1, i64) -> (i64, i64)
+          scf.yield %r#0, %r#1 : i64, i64
+        } else {
+          %nat = arith.constant -1 : i64
+          %alt_frac = arith.subi %g_p, %dtoa#1 : i64
+          %alt_frac_c = arith.maxsi %alt_frac, %zero : i64
+          %use_alt_frac = arith.andi %alt_on, %is_g_t : i1
+          %frac = arith.select %use_alt_frac, %alt_frac_c, %nat : i64
+          %force = arith.andi %alt_on, %true_core : i1
+          %r:2 = func.call @__ly_fmt_body_fixed(%body, %dig_store, %dtoa#0, %dtoa#1, %frac, %min_frac, %force) : (memref<?xi32>, memref<?xi8>, i64, i64, i64, i64, i1) -> (i64, i64)
+          scf.yield %r#0, %r#1 : i64, i64
+        }
+        scf.yield %r3#0, %r3#1 : i64, i64
+      }
+      scf.yield %r2#0, %r2#1 : i64, i64
+    }
+    %bl_pct = scf.if %is_pct -> (i64) {
+      %pos = arith.index_cast %bl#0 : i64 to index
+      %pc32 = arith.constant 37 : i32
+      memref.store %pc32, %body[%pos] : memref<?xi32>
+      %nl = arith.addi %bl#0, %one : i64
+      scf.yield %nl : i64
+    } else {
+      scf.yield %bl#0 : i64
+    }
+    memref.dealloc %dig_store : memref<?xi8>
+    cf.br ^assemble(%body, %bl_pct, %bl#1, %negative : memref<?xi32>, i64, i64, i1)
+
+  ^assemble(%body_a: memref<?xi32>, %body_len_a: i64, %int_len_a: i64, %neg_a: i1):
+    %plus_c = arith.constant 43 : i64
+    %minus_c = arith.constant 45 : i64
+    %space_c = arith.constant 32 : i64
+    %is_plus_s = arith.cmpi eq, %sign_rec, %plus_c : i64
+    %is_space_s = arith.cmpi eq, %sign_rec, %space_c : i64
+    %pos_sign0 = arith.select %is_plus_s, %plus_c, %zero : i64
+    %pos_sign = scf.if %is_space_s -> (i64) {
+      scf.yield %space_c : i64
+    } else {
+      scf.yield %pos_sign0 : i64
+    }
+    %sign_cp = arith.select %neg_a, %minus_c, %pos_sign : i64
+    %zero_flag = arith.cmpi ne, %zero_rec, %zero : i64
+    %fill_unset = arith.cmpi eq, %fill_rec, %minus_one : i64
+    %fill_zero = arith.constant 48 : i64
+    %fill_space = arith.constant 32 : i64
+    %fill_def = arith.select %zero_flag, %fill_zero, %fill_space : i64
+    %fill_cp = arith.select %fill_unset, %fill_def, %fill_rec : i64
+    %align_unset = arith.cmpi eq, %align_rec, %zero : i64
+    %align_eq = arith.constant 61 : i64
+    %align_gt = arith.constant 62 : i64
+    %align_def = arith.select %zero_flag, %align_eq, %align_gt : i64
+    %align_cp = arith.select %align_unset, %align_def, %align_rec : i64
+    %gs3 = arith.constant 3 : i64
+    %header, %bytes = func.call @__ly_fmt_render_number(%sign_cp, %zero, %zero, %body_a, %body_len_a, %int_len_a, %group_rec, %gs3, %fill_cp, %align_cp, %width_rec) : (i64, i64, i64, memref<?xi32>, i64, i64, i64, i64, i64, i64, i64) -> (memref<2xi64>, memref<?xi8>)
+    memref.dealloc %body_a : memref<?xi32>
+    func.return %header, %bytes : memref<2xi64>, memref<?xi8>
+  }
+
+  // Base-2^shift digits (bin/oct/hex) straight off the 2^30 limbs, most
+  // significant first. Returns the digit count.
+  func.func private @__ly_fmt_int_base2k(%meta: memref<2xi64>, %digits: memref<?xi32>, %shift: i64, %upper: i1, %out: memref<?xi32>) -> i64 {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %ten = arith.constant 10 : i64
+    %thirty = arith.constant 30 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %count_slot = arith.constant 1 : index
+    %count = memref.load %meta[%count_slot] : memref<2xi64>
+    %bits = func.call @__ly_long_bit_length(%meta, %digits) : (memref<2xi64>, memref<?xi32>) -> i64
+    %bits_m1 = arith.addi %bits, %shift : i64
+    %bits_adj = arith.subi %bits_m1, %one : i64
+    %nd0 = arith.divui %bits_adj, %shift : i64
+    %nd = arith.maxsi %nd0, %one : i64
+    %nd_idx = arith.index_cast %nd : i64 to index
+    %shift_idx = arith.index_cast %shift : i64 to index
+    scf.for %di = %c0 to %nd_idx step %c1 {
+      %di_i64 = arith.index_cast %di : index to i64
+      %rev = arith.subi %nd, %di_i64 : i64
+      %rev_m1 = arith.subi %rev, %one : i64
+      %base_bit = arith.muli %rev_m1, %shift : i64
+      %v = scf.for %b = %c0 to %shift_idx step %c1 iter_args(%acc = %zero) -> (i64) {
+        %b_i64 = arith.index_cast %b : index to i64
+        %j = arith.addi %base_bit, %b_i64 : i64
+        %limb_i = arith.divui %j, %thirty : i64
+        %bit_i = arith.remui %j, %thirty : i64
+        %in = arith.cmpi slt, %limb_i, %count : i64
+        %bit = scf.if %in -> (i64) {
+          %li = arith.index_cast %limb_i : i64 to index
+          %limb32 = memref.load %digits[%li] : memref<?xi32>
+          %limb = arith.extui %limb32 : i32 to i64
+          %shifted = arith.shrui %limb, %bit_i : i64
+          %m = arith.andi %shifted, %one : i64
+          scf.yield %m : i64
+        } else {
+          scf.yield %zero : i64
+        }
+        %sh = arith.shli %bit, %b_i64 : i64
+        %nacc = arith.ori %acc, %sh : i64
+        scf.yield %nacc : i64
+      }
+      %lt10 = arith.cmpi slt, %v, %ten : i64
+      %d48 = arith.constant 48 : i64
+      %num_ch = arith.addi %v, %d48 : i64
+      %a_lower = arith.constant 87 : i64
+      %a_upper = arith.constant 55 : i64
+      %a_base = arith.select %upper, %a_upper, %a_lower : i64
+      %alpha_ch = arith.addi %v, %a_base : i64
+      %ch = arith.select %lt10, %num_ch, %alpha_ch : i64
+      %ch32 = arith.trunci %ch : i64 to i32
+      memref.store %ch32, %out[%di] : memref<?xi32>
+    }
+    func.return %nd : i64
+  }
+
+  // Integer presentation over a parsed spec; bool delegates here with its
+  // own type name so error texts match CPython's.
+  func.func private @__ly_long_format_impl(%header: memref<2xi64>, %meta_raw: memref<2xi64>, %digits_raw: memref<?xi32>, %spec: memref<?xi64>, %tname: memref<?xi8>, %tname_len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %minus_one = arith.constant -1 : i64
+    %true_i = arith.constant true
+    %s0 = arith.constant 0 : index
+    %s1 = arith.constant 1 : index
+    %s2 = arith.constant 2 : index
+    %s3 = arith.constant 3 : index
+    %s4 = arith.constant 4 : index
+    %s5 = arith.constant 5 : index
+    %s6 = arith.constant 6 : index
+    %s7 = arith.constant 7 : index
+    %s8 = arith.constant 8 : index
+    %s9 = arith.constant 9 : index
+    %fill_rec = memref.load %spec[%s0] : memref<?xi64>
+    %align_rec = memref.load %spec[%s1] : memref<?xi64>
+    %sign_rec = memref.load %spec[%s2] : memref<?xi64>
+    %alt_rec = memref.load %spec[%s3] : memref<?xi64>
+    %zero_rec = memref.load %spec[%s4] : memref<?xi64>
+    %width_rec = memref.load %spec[%s5] : memref<?xi64>
+    %group_rec = memref.load %spec[%s6] : memref<?xi64>
+    %prec_rec = memref.load %spec[%s7] : memref<?xi64>
+    %type_rec = memref.load %spec[%s8] : memref<?xi64>
+    %z_rec = memref.load %spec[%s9] : memref<?xi64>
+    %meta, %digits = func.call @__ly_long_operand_view(%meta_raw, %digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
+
+    %ce = arith.constant 101 : i64
+    %cE = arith.constant 69 : i64
+    %cf = arith.constant 102 : i64
+    %cF = arith.constant 70 : i64
+    %cg = arith.constant 103 : i64
+    %cG = arith.constant 71 : i64
+    %cpct = arith.constant 37 : i64
+    %f0 = arith.cmpi eq, %type_rec, %ce : i64
+    %f1 = arith.cmpi eq, %type_rec, %cE : i64
+    %f2 = arith.cmpi eq, %type_rec, %cf : i64
+    %f3 = arith.cmpi eq, %type_rec, %cF : i64
+    %f4 = arith.cmpi eq, %type_rec, %cg : i64
+    %f5 = arith.cmpi eq, %type_rec, %cG : i64
+    %f6 = arith.cmpi eq, %type_rec, %cpct : i64
+    %fa = arith.ori %f0, %f1 : i1
+    %fb = arith.ori %f2, %f3 : i1
+    %fc = arith.ori %f4, %f5 : i1
+    %fd = arith.ori %fa, %fb : i1
+    %fe = arith.ori %fc, %f6 : i1
+    %is_float_code = arith.ori %fd, %fe : i1
+    cf.cond_br %is_float_code, ^float_path, ^int_path
+
+  ^float_path:
+    %fv:2 = func.call @__ly_long_view_as_f64_checked(%meta, %digits) : (memref<2xi64>, memref<?xi32>) -> (f64, i1)
+    %bad = arith.xori %fv#1, %true_i : i1
+    scf.if %bad {
+      func.call @__ly_long_raise_too_large_for_float() : () -> ()
+    }
+    %fh, %fb2 = func.call @__ly_float_format_core(%fv#0, %spec, %tname, %tname_len) : (f64, memref<?xi64>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %fh, %fb2 : memref<2xi64>, memref<?xi8>
+
+  ^int_path:
+    %z_on = arith.cmpi ne, %z_rec, %zero : i64
+    scf.if %z_on {
+      func.call @__ly_fmt_raise_z_int() : () -> ()
+    }
+    %has_prec = arith.cmpi ne, %prec_rec, %minus_one : i64
+    scf.if %has_prec {
+      func.call @__ly_fmt_raise_int_precision() : () -> ()
+    }
+    %cd = arith.constant 100 : i64
+    %t_unset = arith.cmpi eq, %type_rec, %zero : i64
+    %t = arith.select %t_unset, %cd, %type_rec : i64
+    %cn = arith.constant 110 : i64
+    %cb = arith.constant 98 : i64
+    %co = arith.constant 111 : i64
+    %cx = arith.constant 120 : i64
+    %cX = arith.constant 88 : i64
+    %cc = arith.constant 99 : i64
+    %t_d = arith.cmpi eq, %t, %cd : i64
+    %t_n = arith.cmpi eq, %t, %cn : i64
+    %t_b = arith.cmpi eq, %t, %cb : i64
+    %t_o = arith.cmpi eq, %t, %co : i64
+    %t_x = arith.cmpi eq, %t, %cx : i64
+    %t_X = arith.cmpi eq, %t, %cX : i64
+    %t_c = arith.cmpi eq, %t, %cc : i64
+    %va = arith.ori %t_d, %t_n : i1
+    %vb = arith.ori %t_b, %t_o : i1
+    %vc = arith.ori %t_x, %t_X : i1
+    %vd = arith.ori %va, %vb : i1
+    %ve = arith.ori %vc, %t_c : i1
+    %t_valid = arith.ori %vd, %ve : i1
+    %t_invalid = arith.xori %t_valid, %true_i : i1
+    scf.if %t_invalid {
+      func.call @__ly_fmt_raise_unknown_code(%t, %tname, %tname_len) : (i64, memref<?xi8>, i64) -> ()
+    }
+    // grouping legality: ',' only with 'd'; '_' with d/b/o/x/X
+    %comma = arith.constant 44 : i64
+    %under = arith.constant 95 : i64
+    %g_comma = arith.cmpi eq, %group_rec, %comma : i64
+    %g_under = arith.cmpi eq, %group_rec, %under : i64
+    %not_d = arith.xori %t_d, %true_i : i1
+    %bad_comma = arith.andi %g_comma, %not_d : i1
+    %under_ok0 = arith.ori %t_d, %vb : i1
+    %under_ok = arith.ori %under_ok0, %vc : i1
+    %not_under_ok = arith.xori %under_ok, %true_i : i1
+    %bad_under = arith.andi %g_under, %not_under_ok : i1
+    %bad_group = arith.ori %bad_comma, %bad_under : i1
+    scf.if %bad_group {
+      func.call @__ly_fmt_raise_cannot_group(%group_rec, %t) : (i64, i64) -> ()
+    }
+    cf.cond_br %t_c, ^char_path, ^digits_path
+
+  ^char_path:
+    %sign_set = arith.cmpi ne, %sign_rec, %zero : i64
+    scf.if %sign_set {
+      func.call @__ly_fmt_raise_sign_c() : () -> ()
+    }
+    %alt_set = arith.cmpi ne, %alt_rec, %zero : i64
+    scf.if %alt_set {
+      func.call @__ly_fmt_raise_alt_c() : () -> ()
+    }
+    %fits = func.call @__ly_long_view_fits_i64(%meta, %digits) : (memref<2xi64>, memref<?xi32>) -> i1
+    %cp_max = arith.constant 1114111 : i64
+    %cval = scf.if %fits -> (i64) {
+      %v = func.call @__ly_long_view_as_i64(%meta, %digits) : (memref<2xi64>, memref<?xi32>) -> i64
+      scf.yield %v : i64
+    } else {
+      scf.yield %minus_one : i64
+    }
+    %too_low = arith.cmpi slt, %cval, %zero : i64
+    %too_high = arith.cmpi sgt, %cval, %cp_max : i64
+    %out_of_range = arith.ori %too_low, %too_high : i1
+    scf.if %out_of_range {
+      func.call @__ly_fmt_raise_c_range() : () -> ()
+    }
+    %cbuf_cap = arith.constant 1 : index
+    %cbuf = memref.alloc(%cbuf_cap) : memref<?xi32>
+    %cval32 = arith.trunci %cval : i64 to i32
+    memref.store %cval32, %cbuf[%s0] : memref<?xi32>
+    cf.br ^render(%cbuf, %one, %one, %zero, %zero, %zero, %zero : memref<?xi32>, i64, i64, i64, i64, i64, i64)
+
+  ^digits_path:
+    %sign_slot = arith.constant 0 : index
+    %sgn = memref.load %meta[%sign_slot] : memref<2xi64>
+    %negative = arith.cmpi slt, %sgn, %zero : i64
+    %is_dec = arith.ori %t_d, %t_n : i1
+    %nb:2 = scf.if %is_dec -> (memref<?xi32>, i64) {
+      %rh, %rb = func.call @LyLong_Repr(%header, %meta_raw, %digits_raw) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi8>)
+      %c0i = arith.constant 0 : index
+      %rdim = memref.dim %rb, %c0i : memref<?xi8>
+      %rlen = arith.index_cast %rdim : index to i64
+      %skip = arith.select %negative, %one, %zero : i64
+      %ndig = arith.subi %rlen, %skip : i64
+      %ndig_idx = arith.index_cast %ndig : i64 to index
+      %buf = memref.alloc(%ndig_idx) : memref<?xi32>
+      %skip_idx = arith.index_cast %skip : i64 to index
+      %c1i = arith.constant 1 : index
+      scf.for %i = %c0i to %ndig_idx step %c1i {
+        %src = arith.addi %i, %skip_idx : index
+        %b = memref.load %rb[%src] : memref<?xi8>
+        %w = arith.extui %b : i8 to i32
+        memref.store %w, %buf[%i] : memref<?xi32>
+      }
+      func.call @LyUnicode_DecRef(%rh) : (memref<2xi64>) -> ()
+      scf.yield %buf, %ndig : memref<?xi32>, i64
+    } else {
+      %shift1 = arith.constant 1 : i64
+      %shift3 = arith.constant 3 : i64
+      %shift4 = arith.constant 4 : i64
+      %sh0 = arith.select %t_b, %shift1, %shift4 : i64
+      %sh = arith.select %t_o, %shift3, %sh0 : i64
+      %bits = func.call @__ly_long_bit_length(%meta, %digits) : (memref<2xi64>, memref<?xi32>) -> i64
+      %cap0 = arith.divui %bits, %sh : i64
+      %cap1 = arith.constant 2 : i64
+      %cap2 = arith.addi %cap0, %cap1 : i64
+      %cap_idx = arith.index_cast %cap2 : i64 to index
+      %buf = memref.alloc(%cap_idx) : memref<?xi32>
+      %nd = func.call @__ly_fmt_int_base2k(%meta, %digits, %sh, %t_X, %buf) : (memref<2xi64>, memref<?xi32>, i64, i1, memref<?xi32>) -> i64
+      scf.yield %buf, %nd : memref<?xi32>, i64
+    }
+    %plus = arith.constant 43 : i64
+    %space = arith.constant 32 : i64
+    %minus_cp = arith.constant 45 : i64
+    %sp_plus = arith.cmpi eq, %sign_rec, %plus : i64
+    %sp_space = arith.cmpi eq, %sign_rec, %space : i64
+    %pos_sign0 = arith.select %sp_plus, %plus, %zero : i64
+    %pos_sign = arith.select %sp_space, %space, %pos_sign0 : i64
+    %sign_cp = arith.select %negative, %minus_cp, %pos_sign : i64
+    %alt_on = arith.cmpi ne, %alt_rec, %zero : i64
+    %need_prefix0 = arith.ori %vb, %vc : i1
+    %need_prefix = arith.andi %alt_on, %need_prefix0 : i1
+    %zero48 = arith.constant 48 : i64
+    %pre0 = arith.select %need_prefix, %zero48, %zero : i64
+    %pre1 = arith.select %need_prefix, %t, %zero : i64
+    %gs4 = arith.constant 4 : i64
+    %gs3 = arith.constant 3 : i64
+    %gs = arith.select %is_dec, %gs3, %gs4 : i64
+    cf.br ^render(%nb#0, %nb#1, %nb#1, %sign_cp, %pre0, %pre1, %gs : memref<?xi32>, i64, i64, i64, i64, i64, i64)
+
+  ^render(%body_r: memref<?xi32>, %blen_r: i64, %ilen_r: i64, %sign_r: i64, %pre0_r: i64, %pre1_r: i64, %gs_r: i64):
+    %gs_eff = arith.maxsi %gs_r, %one : i64
+    %zero_flag = arith.cmpi ne, %zero_rec, %zero : i64
+    %fill_unset = arith.cmpi eq, %fill_rec, %minus_one : i64
+    %fill_zero = arith.constant 48 : i64
+    %fill_space = arith.constant 32 : i64
+    %fill_def = arith.select %zero_flag, %fill_zero, %fill_space : i64
+    %fill_cp = arith.select %fill_unset, %fill_def, %fill_rec : i64
+    %align_unset = arith.cmpi eq, %align_rec, %zero : i64
+    %align_eq = arith.constant 61 : i64
+    %align_gt = arith.constant 62 : i64
+    %align_def = arith.select %zero_flag, %align_eq, %align_gt : i64
+    %align_cp = arith.select %align_unset, %align_def, %align_rec : i64
+    %group_eff = scf.if %t_c -> (i64) {
+      scf.yield %zero : i64
+    } else {
+      scf.yield %group_rec : i64
+    }
+    %header_r, %bytes_r = func.call @__ly_fmt_render_number(%sign_r, %pre0_r, %pre1_r, %body_r, %blen_r, %ilen_r, %group_eff, %gs_eff, %fill_cp, %align_cp, %width_rec) : (i64, i64, i64, memref<?xi32>, i64, i64, i64, i64, i64, i64, i64) -> (memref<2xi64>, memref<?xi8>)
+    memref.dealloc %body_r : memref<?xi32>
+    func.return %header_r, %bytes_r : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LyLong_Format(%header: memref<2xi64> {ly.ownership.object_header}, %meta_raw: memref<2xi64>, %digits_raw: memref<?xi32>, %spec_header: memref<2xi64> {ly.ownership.object_header}, %spec_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__format__", ly.runtime.result_contract = "builtins.str"} {
+    %spec_store = memref.alloca() : memref<10xi64>
+    %spec = memref.cast %spec_store : memref<10xi64> to memref<?xi64>
+    %ok = func.call @__ly_fmt_parse_spec(%spec_header, %spec_bytes, %spec) : (memref<2xi64>, memref<?xi8>, memref<?xi64>) -> i1
+    %true_lf = arith.constant true
+    %bad = arith.xori %ok, %true_lf : i1
+    scf.if %bad {
+      %names = memref.get_global @__ly_fmt_msg_name_int : memref<3xi8>
+      %name = memref.cast %names : memref<3xi8> to memref<?xi8>
+      %nlen = arith.constant 3 : i64
+      func.call @__ly_fmt_raise_invalid_spec(%spec_header, %spec_bytes, %name, %nlen) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> ()
+    }
+    %names2 = memref.get_global @__ly_fmt_msg_name_int : memref<3xi8>
+    %name2 = memref.cast %names2 : memref<3xi8> to memref<?xi8>
+    %nlen2 = arith.constant 3 : i64
+    %h, %b = func.call @__ly_long_format_impl(%header, %meta_raw, %digits_raw, %spec, %name2, %nlen2) : (memref<2xi64>, memref<2xi64>, memref<?xi32>, memref<?xi64>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %h, %b : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LyFloat_Format(%header: memref<2xi64> {ly.ownership.object_header}, %payload: memref<1xf64>, %spec_header: memref<2xi64> {ly.ownership.object_header}, %spec_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.float", ly.runtime.method = "__format__", ly.runtime.result_contract = "builtins.str"} {
+    %value = func.call @LyFloat_AsF64(%header, %payload) : (memref<2xi64>, memref<1xf64>) -> f64
+    %spec_store = memref.alloca() : memref<10xi64>
+    %spec = memref.cast %spec_store : memref<10xi64> to memref<?xi64>
+    %ok = func.call @__ly_fmt_parse_spec(%spec_header, %spec_bytes, %spec) : (memref<2xi64>, memref<?xi8>, memref<?xi64>) -> i1
+    %true_ff = arith.constant true
+    %bad = arith.xori %ok, %true_ff : i1
+    scf.if %bad {
+      %names = memref.get_global @__ly_fmt_msg_name_float : memref<5xi8>
+      %name = memref.cast %names : memref<5xi8> to memref<?xi8>
+      %nlen = arith.constant 5 : i64
+      func.call @__ly_fmt_raise_invalid_spec(%spec_header, %spec_bytes, %name, %nlen) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> ()
+    }
+    %names2 = memref.get_global @__ly_fmt_msg_name_float : memref<5xi8>
+    %name2 = memref.cast %names2 : memref<5xi8> to memref<?xi8>
+    %nlen2 = arith.constant 5 : i64
+    %h, %b = func.call @__ly_float_format_core(%value, %spec, %name2, %nlen2) : (f64, memref<?xi64>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %h, %b : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LyBool_Format(%value: i1, %spec_header: memref<2xi64> {ly.ownership.object_header}, %spec_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bool", ly.runtime.method = "__format__", ly.runtime.result_contract = "builtins.str"} {
+    %n = func.call @__ly_unicode_count(%spec_header, %spec_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %zero = arith.constant 0 : i64
+    %empty = arith.cmpi eq, %n, %zero : i64
+    cf.cond_br %empty, ^as_str, ^as_int
+
+  ^as_str:
+    %sh, %sb = func.call @LyBool_Str(%value) : (i1) -> (memref<2xi64>, memref<?xi8>)
+    func.return %sh, %sb : memref<2xi64>, memref<?xi8>
+
+  ^as_int:
+    %one = arith.constant 1 : i64
+    %iv = arith.select %value, %one, %zero : i64
+    %ih, %im, %id = func.call @LyLong_FromI64(%iv) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    %spec_store = memref.alloca() : memref<10xi64>
+    %spec = memref.cast %spec_store : memref<10xi64> to memref<?xi64>
+    %ok = func.call @__ly_fmt_parse_spec(%spec_header, %spec_bytes, %spec) : (memref<2xi64>, memref<?xi8>, memref<?xi64>) -> i1
+    %true_bf = arith.constant true
+    %bad = arith.xori %ok, %true_bf : i1
+    scf.if %bad {
+      %names = memref.get_global @__ly_fmt_msg_name_bool : memref<4xi8>
+      %name = memref.cast %names : memref<4xi8> to memref<?xi8>
+      %nlen = arith.constant 4 : i64
+      func.call @__ly_fmt_raise_invalid_spec(%spec_header, %spec_bytes, %name, %nlen) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> ()
+    }
+    %names2 = memref.get_global @__ly_fmt_msg_name_bool : memref<4xi8>
+    %name2 = memref.cast %names2 : memref<4xi8> to memref<?xi8>
+    %nlen2 = arith.constant 4 : i64
+    %h, %b = func.call @__ly_long_format_impl(%ih, %im, %id, %spec, %name2, %nlen2) : (memref<2xi64>, memref<2xi64>, memref<?xi32>, memref<?xi64>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.call @LyLong_DecRef(%ih) : (memref<2xi64>) -> ()
+    func.return %h, %b : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LyUnicode_Format(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %spec_header: memref<2xi64> {ly.ownership.object_header}, %spec_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__format__", ly.runtime.result_contract = "builtins.str"} {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %minus_one = arith.constant -1 : i64
+    %true_uf = arith.constant true
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %s0 = arith.constant 0 : index
+    %s1 = arith.constant 1 : index
+    %s2 = arith.constant 2 : index
+    %s3 = arith.constant 3 : index
+    %s4 = arith.constant 4 : index
+    %s5 = arith.constant 5 : index
+    %s6 = arith.constant 6 : index
+    %s7 = arith.constant 7 : index
+    %s8 = arith.constant 8 : index
+    %spec_store = memref.alloca() : memref<10xi64>
+    %spec = memref.cast %spec_store : memref<10xi64> to memref<?xi64>
+    %ok = func.call @__ly_fmt_parse_spec(%spec_header, %spec_bytes, %spec) : (memref<2xi64>, memref<?xi8>, memref<?xi64>) -> i1
+    %names = memref.get_global @__ly_fmt_msg_name_str : memref<3xi8>
+    %name = memref.cast %names : memref<3xi8> to memref<?xi8>
+    %nlen = arith.constant 3 : i64
+    %bad = arith.xori %ok, %true_uf : i1
+    scf.if %bad {
+      func.call @__ly_fmt_raise_invalid_spec(%spec_header, %spec_bytes, %name, %nlen) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> ()
+    }
+    %fill_rec = memref.load %spec[%s0] : memref<?xi64>
+    %align_rec = memref.load %spec[%s1] : memref<?xi64>
+    %sign_rec = memref.load %spec[%s2] : memref<?xi64>
+    %alt_rec = memref.load %spec[%s3] : memref<?xi64>
+    %zero_rec = memref.load %spec[%s4] : memref<?xi64>
+    %width_rec = memref.load %spec[%s5] : memref<?xi64>
+    %group_rec = memref.load %spec[%s6] : memref<?xi64>
+    %prec_rec = memref.load %spec[%s7] : memref<?xi64>
+    %type_rec = memref.load %spec[%s8] : memref<?xi64>
+    // grouping first (CPython reports the type char with it), then the
+    // string-specific shape restrictions
+    %grouped = arith.cmpi ne, %group_rec, %zero : i64
+    scf.if %grouped {
+      %cs = arith.constant 115 : i64
+      %tz = arith.cmpi eq, %type_rec, %zero : i64
+      %wcp = arith.select %tz, %cs, %type_rec : i64
+      func.call @__ly_fmt_raise_cannot_group(%group_rec, %wcp) : (i64, i64) -> ()
+    }
+    %signed = arith.cmpi ne, %sign_rec, %zero : i64
+    scf.if %signed {
+      func.call @__ly_fmt_raise_sign_str() : () -> ()
+    }
+    %eq_cp = arith.constant 61 : i64
+    %eq_align = arith.cmpi eq, %align_rec, %eq_cp : i64
+    scf.if %eq_align {
+      func.call @__ly_fmt_raise_eq_align_str() : () -> ()
+    }
+    %alt_on = arith.cmpi ne, %alt_rec, %zero : i64
+    scf.if %alt_on {
+      func.call @__ly_fmt_raise_alt_str() : () -> ()
+    }
+    %cs2 = arith.constant 115 : i64
+    %t_ok0 = arith.cmpi eq, %type_rec, %zero : i64
+    %t_ok1 = arith.cmpi eq, %type_rec, %cs2 : i64
+    %t_ok = arith.ori %t_ok0, %t_ok1 : i1
+    %t_bad = arith.xori %t_ok, %true_uf : i1
+    scf.if %t_bad {
+      func.call @__ly_fmt_raise_unknown_code(%type_rec, %name, %nlen) : (i64, memref<?xi8>, i64) -> ()
+    }
+
+    %wid = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %n = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %has_prec = arith.cmpi sge, %prec_rec, %zero : i64
+    %clamped = arith.minsi %n, %prec_rec : i64
+    %shown = arith.select %has_prec, %clamped, %n : i64
+    %width_c = arith.maxsi %width_rec, %zero : i64
+    %pad_raw = arith.subi %width_c, %shown : i64
+    %pad = arith.maxsi %pad_raw, %zero : i64
+    %total = arith.addi %shown, %pad : i64
+    %zero_flag = arith.cmpi ne, %zero_rec, %zero : i64
+    %fill_unset = arith.cmpi eq, %fill_rec, %minus_one : i64
+    %fill_zero = arith.constant 48 : i64
+    %fill_space = arith.constant 32 : i64
+    %fill_def = arith.select %zero_flag, %fill_zero, %fill_space : i64
+    %fill_cp = arith.select %fill_unset, %fill_def, %fill_rec : i64
+    %lt_cp = arith.constant 60 : i64
+    %gt_cp = arith.constant 62 : i64
+    %caret_cp = arith.constant 94 : i64
+    %align_unset = arith.cmpi eq, %align_rec, %zero : i64
+    %align_cp = arith.select %align_unset, %lt_cp, %align_rec : i64
+    %is_gt = arith.cmpi eq, %align_cp, %gt_cp : i64
+    %is_caret = arith.cmpi eq, %align_cp, %caret_cp : i64
+    %half = arith.divui %pad, %two : i64
+    %left0 = arith.select %is_gt, %pad, %zero : i64
+    %left = arith.select %is_caret, %half, %left0 : i64
+    %right = arith.subi %pad, %left : i64
+
+    %total_idx = arith.index_cast %total : i64 to index
+    %buf = memref.alloc(%total_idx) : memref<?xi32>
+    %fill32 = arith.trunci %fill_cp : i64 to i32
+    %left_idx = arith.index_cast %left : i64 to index
+    scf.for %i = %c0 to %left_idx step %c1 {
+      memref.store %fill32, %buf[%i] : memref<?xi32>
+    }
+    %shown_idx = arith.index_cast %shown : i64 to index
+    scf.for %i = %c0 to %shown_idx step %c1 {
+      %cp = func.call @__ly_unicode_get(%bytes, %wid, %i) : (memref<?xi8>, i64, index) -> i64
+      %cp32 = arith.trunci %cp : i64 to i32
+      %o = arith.addi %left_idx, %i : index
+      memref.store %cp32, %buf[%o] : memref<?xi32>
+    }
+    %base2 = arith.addi %left_idx, %shown_idx : index
+    %right_idx = arith.index_cast %right : i64 to index
+    scf.for %i = %c0 to %right_idx step %c1 {
+      %o = arith.addi %base2, %i : index
+      memref.store %fill32, %buf[%o] : memref<?xi32>
+    }
+    %rh, %rb = func.call @__ly_fmt_str_from_cps(%buf, %total) : (memref<?xi32>, i64) -> (memref<2xi64>, memref<?xi8>)
+    memref.dealloc %buf : memref<?xi32>
+    func.return %rh, %rb : memref<2xi64>, memref<?xi8>
+  }
+
+  // ascii()'s escape step: ASCII code points pass through, the rest become
+  // \xhh / \uhhhh / \Uhhhhhhhh (lowercase hex, like CPython). The receiver
+  // is an already-repr'd string, so quoting is not re-applied here.
+  func.func @LyUnicode_AsciiEscape(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__ascii__", ly.runtime.result_contract = "builtins.str"} {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %four = arith.constant 4 : i64
+    %six = arith.constant 6 : i64
+    %ten2 = arith.constant 10 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %ascii_lim = arith.constant 128 : i64
+    %xff = arith.constant 256 : i64
+    %xffff = arith.constant 65536 : i64
+    %wid = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %n = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %n_idx = arith.index_cast %n : i64 to index
+    %out_len = scf.for %i = %c0 to %n_idx step %c1 iter_args(%acc = %zero) -> (i64) {
+      %cp = func.call @__ly_unicode_get(%bytes, %wid, %i) : (memref<?xi8>, i64, index) -> i64
+      %is_ascii = arith.cmpi ult, %cp, %ascii_lim : i64
+      %is_xx = arith.cmpi ult, %cp, %xff : i64
+      %is_u4 = arith.cmpi ult, %cp, %xffff : i64
+      %w_u4 = arith.select %is_u4, %six, %ten2 : i64
+      %w_xx = arith.select %is_xx, %four, %w_u4 : i64
+      %w = arith.select %is_ascii, %one, %w_xx : i64
+      %nacc = arith.addi %acc, %w : i64
+      scf.yield %nacc : i64
+    }
+    %out_idx = arith.index_cast %out_len : i64 to index
+    %buf = memref.alloc(%out_idx) : memref<?xi8>
+    %bs = arith.constant 92 : i8
+    %x_ch = arith.constant 120 : i8
+    %u_ch = arith.constant 117 : i8
+    %U_ch = arith.constant 85 : i8
+    %eight_ae = arith.constant 8 : i64
+    %final = scf.for %i = %c0 to %n_idx step %c1 iter_args(%p = %c0) -> (index) {
+      %cp = func.call @__ly_unicode_get(%bytes, %wid, %i) : (memref<?xi8>, i64, index) -> i64
+      %is_ascii = arith.cmpi ult, %cp, %ascii_lim : i64
+      %np = scf.if %is_ascii -> (index) {
+        %b = arith.trunci %cp : i64 to i8
+        memref.store %b, %buf[%p] : memref<?xi8>
+        %q = arith.addi %p, %c1 : index
+        scf.yield %q : index
+      } else {
+        %is_xx = arith.cmpi ult, %cp, %xff : i64
+        %is_u4 = arith.cmpi ult, %cp, %xffff : i64
+        %digits_u4 = arith.select %is_u4, %four, %eight_ae : i64
+        %two_ae = arith.constant 2 : i64
+        %ndigits = arith.select %is_xx, %two_ae, %digits_u4 : i64
+        %esc_u4 = arith.select %is_u4, %u_ch, %U_ch : i8
+        %esc = arith.select %is_xx, %x_ch, %esc_u4 : i8
+        memref.store %bs, %buf[%p] : memref<?xi8>
+        %q1 = arith.addi %p, %c1 : index
+        memref.store %esc, %buf[%q1] : memref<?xi8>
+        %q2 = arith.addi %q1, %c1 : index
+        %nd_idx = arith.index_cast %ndigits : i64 to index
+        %q3 = scf.for %d = %c0 to %nd_idx step %c1 iter_args(%q = %q2) -> (index) {
+          %d_i64 = arith.index_cast %d : index to i64
+          %rev = arith.subi %ndigits, %d_i64 : i64
+          %rev_m1 = arith.subi %rev, %one : i64
+          %shift_amt = arith.muli %rev_m1, %four : i64
+          %shifted = arith.shrui %cp, %shift_amt : i64
+          %fifteen = arith.constant 15 : i64
+          %nib = arith.andi %shifted, %fifteen : i64
+          %lt10 = arith.cmpi ult, %nib, %ten2 : i64
+          %c48a = arith.constant 48 : i64
+          %c87a = arith.constant 87 : i64
+          %numc = arith.addi %nib, %c48a : i64
+          %alpc = arith.addi %nib, %c87a : i64
+          %ch = arith.select %lt10, %numc, %alpc : i64
+          %ch8 = arith.trunci %ch : i64 to i8
+          memref.store %ch8, %buf[%q] : memref<?xi8>
+          %nq = arith.addi %q, %c1 : index
+          scf.yield %nq : index
+        }
+        scf.yield %q3 : index
+      }
+      scf.yield %np : index
+    }
+    %rh, %rb = func.call @LyUnicode_FromBytes(%buf, %c0, %out_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    memref.dealloc %buf : memref<?xi8>
+    func.return %rh, %rb : memref<2xi64>, memref<?xi8>
   }
 
   // ===== impls: float =====
