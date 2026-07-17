@@ -552,6 +552,21 @@ private:
   // repr instance of the uniform dispatch: class id -> the manifest `__repr__`
   // returning a `builtins.str`, for container __repr__ over erased elements.
   mlir::LogicalResult generateBoxedReprHook();
+  // hash instance of the uniform dispatch: class id -> the manifest
+  // `__hash__` returning the i64 hash word (dict/set probing over erased
+  // keys).
+  mlir::LogicalResult generateBoxedHashHook();
+  // Binary (same-class two-receiver) variant of the uniform dispatch:
+  // `(ptr lhs, ptr rhs, i64 class_id) -> (results..., i1 handled)`; callees
+  // take their self shape twice.
+  mlir::LogicalResult generateBoxedBinaryMethodHook(
+      llvm::StringRef hookName,
+      llvm::function_ref<bool(mlir::func::FuncOp)> selects,
+      mlir::TypeRange calleeResultTypes,
+      llvm::StringRef sourceClassMethodName = "");
+  // eq instance of the binary dispatch (dict/set key equality over erased
+  // keys).
+  mlir::LogicalResult generateBoxedEqHook();
   mlir::LogicalResult lowerListEvidenceNext(py::NextOp op,
                                             RuntimeBundle iterator);
   // Loop-body generator state-machine transform (GeneratorStateMachine.cpp).

@@ -146,7 +146,7 @@ module attributes {
   py.class @bool attributes {
     base_names = ["int"], ly.typing.final,
     method_names = ["__new__", "__repr__", "__str__", "__bool__", "__and__",
-                    "__or__", "__xor__"],
+                    "__or__", "__xor__", "__hash__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.bool">>, !py.contract<"builtins.object">] -> [!py.self]>,
       !py.protocol<"Callable", [!py.contract<"builtins.bool">] -> [!py.contract<"builtins.str">]>,
@@ -154,10 +154,11 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.bool">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.bool">, !py.contract<"builtins.bool">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.bool">, !py.contract<"builtins.bool">] -> [!py.contract<"builtins.bool">]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.bool">, !py.contract<"builtins.bool">] -> [!py.contract<"builtins.bool">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.bool">, !py.contract<"builtins.bool">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bool">] -> [!py.contract<"builtins.int">]>
     ],
     method_kinds = ["classmethod", "instance", "instance", "instance",
-                    "instance", "instance", "instance"]
+                    "instance", "instance", "instance", "instance"]
   } {}
 
   py.class @float attributes {
@@ -165,7 +166,8 @@ module attributes {
     method_names = ["__new__", "__repr__", "__add__", "__sub__", "__mul__",
                     "__truediv__", "__floordiv__", "__mod__", "__float__",
                     "__bool__", "__round__", "__lt__", "__le__", "__gt__",
-                    "__ge__", "__str__", "__eq__", "__ne__", "__pow__"],
+                    "__ge__", "__str__", "__eq__", "__ne__", "__pow__",
+                    "__hash__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.float">>, !py.contract<"typing.SupportsFloat">] -> [!py.self]>,
       !py.protocol<"Callable", [!py.contract<"builtins.float">] -> [!py.contract<"builtins.str">]>,
@@ -185,13 +187,14 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.float">] -> [!py.contract<"builtins.str">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.float">, !py.contract<"builtins.object">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.float">, !py.contract<"builtins.object">] -> [!py.contract<"builtins.bool">]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.float">, !py.contract<"builtins.float">] -> [!py.contract<"builtins.float">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.float">, !py.contract<"builtins.float">] -> [!py.contract<"builtins.float">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.float">] -> [!py.contract<"builtins.int">]>
     ],
     method_kinds = ["classmethod", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance", "instance",
-                    "instance"]
+                    "instance", "instance"]
   } {}
 
   py.class @complex attributes {base_names = ["object"], ly.typing.final} {}
@@ -202,7 +205,7 @@ module attributes {
     method_names = ["__new__", "__len__", "__iter__", "__getitem__", "__add__",
                     "__contains__", "__eq__", "__lt__", "__le__", "__gt__",
                     "__ge__", "join", "startswith", "endswith", "__repr__", "__str__", "__ne__",
-                    "encode"],
+                    "encode", "__hash__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.str">>, !py.contract<"builtins.object">] -> [!py.self]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.int">]>,
@@ -221,13 +224,14 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.object">] -> [!py.contract<"builtins.bool">]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.bytes">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.bytes">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.int">]>
     ],
     method_kinds = ["classmethod", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance",
-                    "instance"]
+                    "instance", "instance"]
   } {}
 
   py.class @str_iterator attributes {
@@ -246,7 +250,7 @@ module attributes {
     ly.typing.base_args = [[!py.contract<"builtins.int">], []],
     ly.typing.final,
     method_names = ["__len__", "__getitem__", "__add__", "__eq__", "__ne__",
-                    "__bool__", "__repr__", "__str__", "decode"],
+                    "__bool__", "__repr__", "__str__", "decode", "__hash__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.int">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"typing.SupportsIndex">] -> [!py.contract<"builtins.int">]>,
@@ -256,11 +260,12 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.str">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.str">]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.str">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.int">]>
     ],
     method_kinds = ["instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
-                    "instance"]
+                    "instance", "instance"]
   } {}
   py.class @bytearray attributes {base_names = ["MutableSequence"],
                                  ly.typing.base_args = [[!py.contract<"builtins.int">]],
@@ -287,7 +292,8 @@ module attributes {
     ly.typing.param_variance = ["covariant"],
     ly.typing.base_args = [[!py.contract<"$T">]],
     method_names = ["__len__", "__contains__", "__getitem__", "__iter__",
-                    "__add__", "__mul__", "count", "index", "__repr__"],
+                    "__add__", "__mul__", "count", "index", "__repr__",
+                    "__hash__", "__eq__", "__ne__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.contract<"builtins.tuple">] -> [!py.contract<"builtins.int">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.tuple">, !py.contract<"builtins.object">] -> [!py.contract<"builtins.bool">]>,
@@ -297,10 +303,14 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.tuple">, !py.contract<"typing.SupportsIndex">] -> [!py.contract<"builtins.tuple">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.tuple">, !py.contract<"typing.Any">] -> [!py.contract<"builtins.int">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.tuple">, !py.contract<"typing.Any">, !py.contract<"typing.SupportsIndex">, !py.contract<"typing.SupportsIndex">] -> [!py.contract<"builtins.int">]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.tuple">] -> [!py.contract<"builtins.str">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.tuple">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.tuple">] -> [!py.contract<"builtins.int">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.tuple">, !py.contract<"builtins.object">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.tuple">, !py.contract<"builtins.object">] -> [!py.contract<"builtins.bool">]>
     ],
     method_kinds = ["instance", "instance", "instance", "instance",
-                    "instance", "instance", "instance", "instance", "instance"]
+                    "instance", "instance", "instance", "instance", "instance",
+                    "instance", "instance", "instance"]
   } {}
 
   py.class @list attributes {
@@ -5681,6 +5691,777 @@ module attributes {
     %value = func.call @LyFloat_AsF64(%header, %payload) : (memref<2xi64>, memref<1xf64>) -> f64
     %str_header, %str_bytes = func.call @LyUnicode_FromF64(%value) : (f64) -> (memref<2xi64>, memref<?xi8>)
     func.return %str_header, %str_bytes : memref<2xi64>, memref<?xi8>
+  }
+
+  // ===== impls: hash =====
+  // Runtime hash state: [k0, k1, initialized]. Filled once, lazily, from the
+  // OS entropy pool (CPython randomizes str/bytes hashes per process; int and
+  // float hashes stay unrandomized, matching CPython).
+  memref.global "private" @__ly_hash_secret : memref<3xi64> = dense<0>
+
+  // OS entropy (macOS libSystem / glibc >= 2.25).
+  func.func private @getentropy(%buffer: !llvm.ptr, %length: i64) -> i32
+
+  func.func private @__ly_hash_secret_keys() -> (i64, i64) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %secret = memref.get_global @__ly_hash_secret : memref<3xi64>
+    %flag = memref.load %secret[%c2] : memref<3xi64>
+    %needs_init = arith.cmpi eq, %flag, %zero : i64
+    scf.if %needs_init {
+      %ptr_index = memref.extract_aligned_pointer_as_index %secret : memref<3xi64> -> index
+      %ptr_i64 = arith.index_cast %ptr_index : index to i64
+      %ptr = llvm.inttoptr %ptr_i64 : i64 to !llvm.ptr
+      %sixteen = arith.constant 16 : i64
+      %rc = func.call @getentropy(%ptr, %sixteen) : (!llvm.ptr, i64) -> i32
+      // On the (never-expected) entropy failure keep zero keys rather than
+      // aborting: hashes stay internally consistent either way.
+      %k0 = memref.load %secret[%c0] : memref<3xi64>
+      %k1 = memref.load %secret[%c1] : memref<3xi64>
+      %both_zero0 = arith.cmpi eq, %k0, %zero : i64
+      %both_zero1 = arith.cmpi eq, %k1, %zero : i64
+      %both_zero = arith.andi %both_zero0, %both_zero1 : i1
+      scf.if %both_zero {
+        // Degenerate zero keys weaken the mix; substitute fixed odd words.
+        %fb0 = arith.constant 7266447313870364031 : i64
+        %fb1 = arith.constant 4946485549665804864 : i64
+        memref.store %fb0, %secret[%c0] : memref<3xi64>
+        memref.store %fb1, %secret[%c1] : memref<3xi64>
+      }
+      memref.store %one, %secret[%c2] : memref<3xi64>
+    }
+    %out0 = memref.load %secret[%c0] : memref<3xi64>
+    %out1 = memref.load %secret[%c1] : memref<3xi64>
+    func.return %out0, %out1 : i64, i64
+  }
+
+  // One full SipHash round on the 4-lane state.
+  func.func private @__ly_siphash_round(%v0_in: i64, %v1_in: i64, %v2_in: i64, %v3_in: i64) -> (i64, i64, i64, i64) {
+    %c13 = arith.constant 13 : i64
+    %c51 = arith.constant 51 : i64
+    %c16 = arith.constant 16 : i64
+    %c48 = arith.constant 48 : i64
+    %c32 = arith.constant 32 : i64
+    %c21 = arith.constant 21 : i64
+    %c43 = arith.constant 43 : i64
+    %c17 = arith.constant 17 : i64
+    %c47 = arith.constant 47 : i64
+    %a0 = arith.addi %v0_in, %v1_in : i64
+    %r1a = arith.shli %v1_in, %c13 : i64
+    %r1b = arith.shrui %v1_in, %c51 : i64
+    %r1 = arith.ori %r1a, %r1b : i64
+    %x1 = arith.xori %r1, %a0 : i64
+    %r0a = arith.shli %a0, %c32 : i64
+    %r0b = arith.shrui %a0, %c32 : i64
+    %r0 = arith.ori %r0a, %r0b : i64
+    %a2 = arith.addi %v2_in, %v3_in : i64
+    %r3a = arith.shli %v3_in, %c16 : i64
+    %r3b = arith.shrui %v3_in, %c48 : i64
+    %r3 = arith.ori %r3a, %r3b : i64
+    %x3 = arith.xori %r3, %a2 : i64
+    %a0b = arith.addi %r0, %x3 : i64
+    %r3c = arith.shli %x3, %c21 : i64
+    %r3d = arith.shrui %x3, %c43 : i64
+    %r3e = arith.ori %r3c, %r3d : i64
+    %x3b = arith.xori %r3e, %a0b : i64
+    %a2b = arith.addi %a2, %x1 : i64
+    %r1c = arith.shli %x1, %c17 : i64
+    %r1d = arith.shrui %x1, %c47 : i64
+    %r1e = arith.ori %r1c, %r1d : i64
+    %x1b = arith.xori %r1e, %a2b : i64
+    %r2a = arith.shli %a2b, %c32 : i64
+    %r2b = arith.shrui %a2b, %c32 : i64
+    %r2 = arith.ori %r2a, %r2b : i64
+    func.return %a0b, %x1b, %r2, %x3b : i64, i64, i64, i64
+  }
+
+  // SipHash-1-3 over raw bytes with the process-random keys (the CPython
+  // default str/bytes hash since 3.11). -1 is remapped to -2 by callers.
+  func.func private @__ly_hash_bytes(%ptr: i64, %len: i64) -> i64 {
+    %zero = arith.constant 0 : i64
+    %c8 = arith.constant 8 : i64
+    %c56 = arith.constant 56 : i64
+    %k0, %k1 = func.call @__ly_hash_secret_keys() : () -> (i64, i64)
+    %iv0 = arith.constant 8317987319222330741 : i64
+    %iv1 = arith.constant 7237128888997146477 : i64
+    %iv2 = arith.constant 7816392313619706465 : i64
+    %iv3 = arith.constant 8387220255154660723 : i64
+    %v0_init = arith.xori %iv0, %k0 : i64
+    %v1_init = arith.xori %iv1, %k1 : i64
+    %v2_init = arith.xori %iv2, %k0 : i64
+    %v3_init = arith.xori %iv3, %k1 : i64
+    %base = llvm.inttoptr %ptr : i64 to !llvm.ptr
+    %full_blocks = arith.divui %len, %c8 : i64
+    %block_bytes = arith.muli %full_blocks, %c8 : i64
+    %loop:5 = scf.while (%i = %zero, %v0 = %v0_init, %v1 = %v1_init, %v2 = %v2_init, %v3 = %v3_init) : (i64, i64, i64, i64, i64) -> (i64, i64, i64, i64, i64) {
+      %more = arith.cmpi slt, %i, %block_bytes : i64
+      scf.condition(%more) %i, %v0, %v1, %v2, %v3 : i64, i64, i64, i64, i64
+    } do {
+    ^bb0(%i: i64, %v0: i64, %v1: i64, %v2: i64, %v3: i64):
+      %chunk_ptr = llvm.getelementptr %base[%i] : (!llvm.ptr, i64) -> !llvm.ptr, i8
+      %m = llvm.load %chunk_ptr {alignment = 1 : i64} : !llvm.ptr -> i64
+      %v3x = arith.xori %v3, %m : i64
+      %s:4 = func.call @__ly_siphash_round(%v0, %v1, %v2, %v3x) : (i64, i64, i64, i64) -> (i64, i64, i64, i64)
+      %v0x = arith.xori %s#0, %m : i64
+      %next = arith.addi %i, %c8 : i64
+      scf.yield %next, %v0x, %s#1, %s#2, %s#3 : i64, i64, i64, i64, i64
+    }
+    // Tail block: remaining bytes little-endian, length byte on top.
+    %len_byte = arith.shli %len, %c56 : i64
+    %tail_start = arith.index_cast %block_bytes : i64 to index
+    %len_index = arith.index_cast %len : i64 to index
+    %c1_index = arith.constant 1 : index
+    %assembled = scf.for %bi = %tail_start to %len_index step %c1_index iter_args(%acc = %len_byte) -> (i64) {
+      %bi_i64 = arith.index_cast %bi : index to i64
+      %byte_ptr = llvm.getelementptr %base[%bi_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i8
+      %byte = llvm.load %byte_ptr : !llvm.ptr -> i8
+      %byte_i64 = arith.extui %byte : i8 to i64
+      %rel = arith.subi %bi_i64, %block_bytes : i64
+      %shift = arith.muli %rel, %c8 : i64
+      %shifted = arith.shli %byte_i64, %shift : i64
+      %next = arith.ori %acc, %shifted : i64
+      scf.yield %next : i64
+    }
+    %v3t = arith.xori %loop#4, %assembled : i64
+    %t:4 = func.call @__ly_siphash_round(%loop#1, %loop#2, %loop#3, %v3t) : (i64, i64, i64, i64) -> (i64, i64, i64, i64)
+    %v0t = arith.xori %t#0, %assembled : i64
+    %ff = arith.constant 255 : i64
+    %v2f = arith.xori %t#2, %ff : i64
+    %f1:4 = func.call @__ly_siphash_round(%v0t, %t#1, %v2f, %t#3) : (i64, i64, i64, i64) -> (i64, i64, i64, i64)
+    %f2:4 = func.call @__ly_siphash_round(%f1#0, %f1#1, %f1#2, %f1#3) : (i64, i64, i64, i64) -> (i64, i64, i64, i64)
+    %f3:4 = func.call @__ly_siphash_round(%f2#0, %f2#1, %f2#2, %f2#3) : (i64, i64, i64, i64) -> (i64, i64, i64, i64)
+    %h01 = arith.xori %f3#0, %f3#1 : i64
+    %h23 = arith.xori %f3#2, %f3#3 : i64
+    %h = arith.xori %h01, %h23 : i64
+    func.return %h : i64
+  }
+
+  // Shared -1 -> -2 remap (CPython reserves -1 as the C-level error return).
+  func.func private @__ly_hash_fixup(%h: i64) -> i64 {
+    %neg_one = arith.constant -1 : i64
+    %neg_two = arith.constant -2 : i64
+    %is_neg_one = arith.cmpi eq, %h, %neg_one : i64
+    %fixed = arith.select %is_neg_one, %neg_two, %h : i1, i64
+    func.return %fixed : i64
+  }
+
+  // str.__hash__: SipHash-1-3 of the canonical code-unit bytes. Canonical
+  // adaptive-width storage means equal strings share width and bytes, so the
+  // byte hash is well-defined; the empty string hashes to 0 (CPython).
+  func.func @LyUnicode_Hash(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> i64 attributes {ly.runtime.contract = "builtins.str", ly.runtime.method = "__hash__"} {
+    %c0 = arith.constant 0 : index
+    %zero = arith.constant 0 : i64
+    %dim = memref.dim %bytes, %c0 : memref<?xi8>
+    %len = arith.index_cast %dim : index to i64
+    %is_empty = arith.cmpi eq, %len, %zero : i64
+    %result = scf.if %is_empty -> (i64) {
+      scf.yield %zero : i64
+    } else {
+      %ptr_index = memref.extract_aligned_pointer_as_index %bytes : memref<?xi8> -> index
+      %ptr = arith.index_cast %ptr_index : index to i64
+      %h = func.call @__ly_hash_bytes(%ptr, %len) : (i64, i64) -> i64
+      %fixed = func.call @__ly_hash_fixup(%h) : (i64) -> i64
+      scf.yield %fixed : i64
+    }
+    func.return %result : i64
+  }
+
+  func.func @LyBytes_Hash(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> i64 attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__hash__"} {
+    %h = func.call @LyUnicode_Hash(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    func.return %h : i64
+  }
+
+  // float.__hash__: CPython's modular reduction over the Mersenne prime
+  // 2^61-1, computed on the IEEE-754 fields directly (value = mant * 2^exp;
+  // multiplying by 2^k mod 2^61-1 is a 61-bit rotation), so hash(1.0) ==
+  // hash(1) holds against LyLong_Hash's digit rotation.
+  func.func @LyFloat_Hash(%header: memref<2xi64> {ly.ownership.object_header}, %payload: memref<1xf64>) -> i64 attributes {ly.runtime.contract = "builtins.float", ly.runtime.method = "__hash__"} {
+    %c0 = arith.constant 0 : index
+    %zero = arith.constant 0 : i64
+    %value = memref.load %payload[%c0] : memref<1xf64>
+    %bits = arith.bitcast %value : f64 to i64
+    %c52 = arith.constant 52 : i64
+    %c63 = arith.constant 63 : i64
+    %exp_mask = arith.constant 2047 : i64
+    %mant_mask = arith.constant 4503599627370495 : i64
+    %implicit_bit = arith.constant 4503599627370496 : i64
+    %exp_field = arith.shrui %bits, %c52 : i64
+    %exp_bits = arith.andi %exp_field, %exp_mask : i64
+    %mant_bits = arith.andi %bits, %mant_mask : i64
+    %sign_bit = arith.shrui %bits, %c63 : i64
+    %is_special = arith.cmpi eq, %exp_bits, %exp_mask : i64
+    %result = scf.if %is_special -> (i64) {
+      %is_nan = arith.cmpi ne, %mant_bits, %zero : i64
+      %special = scf.if %is_nan -> (i64) {
+        // NaN: identity hash of the boxed object (CPython 3.10+).
+        %ptr_index = memref.extract_aligned_pointer_as_index %header : memref<2xi64> -> index
+        %p = arith.index_cast %ptr_index : index to i64
+        %c4 = arith.constant 4 : i64
+        %c60 = arith.constant 60 : i64
+        %lo = arith.shrui %p, %c4 : i64
+        %hi = arith.shli %p, %c60 : i64
+        %rot = arith.ori %lo, %hi : i64
+        scf.yield %rot : i64
+      } else {
+        %inf_hash = arith.constant 314159 : i64
+        %neg_inf_hash = arith.constant -314159 : i64
+        %is_neg = arith.cmpi ne, %sign_bit, %zero : i64
+        %sel = arith.select %is_neg, %neg_inf_hash, %inf_hash : i1, i64
+        scf.yield %sel : i64
+      }
+      scf.yield %special : i64
+    } else {
+      %is_zero_mag = arith.cmpi eq, %exp_bits, %zero : i64
+      %mant_zero = arith.cmpi eq, %mant_bits, %zero : i64
+      %is_zero = arith.andi %is_zero_mag, %mant_zero : i1
+      %finite = scf.if %is_zero -> (i64) {
+        scf.yield %zero : i64
+      } else {
+        %one = arith.constant 1 : i64
+        %bias = arith.constant 1075 : i64
+        %subnormal = arith.cmpi eq, %exp_bits, %zero : i64
+        %norm_mant = arith.ori %mant_bits, %implicit_bit : i64
+        %mant = arith.select %subnormal, %mant_bits, %norm_mant : i1, i64
+        %norm_exp = arith.subi %exp_bits, %bias : i64
+        %sub_exp = arith.subi %one, %bias : i64
+        %exp = arith.select %subnormal, %sub_exp, %norm_exp : i1, i64
+        // rot = exp mod 61 (Euclidean).
+        %c61 = arith.constant 61 : i64
+        %rem = arith.remsi %exp, %c61 : i64
+        %rem_neg = arith.cmpi slt, %rem, %zero : i64
+        %rem_adj = arith.addi %rem, %c61 : i64
+        %rot = arith.select %rem_neg, %rem_adj, %rem : i1, i64
+        %modulus = arith.constant 2305843009213693951 : i64
+        %no_rot = arith.cmpi eq, %rot, %zero : i64
+        %rotated = scf.if %no_rot -> (i64) {
+          scf.yield %mant : i64
+        } else {
+          %up = arith.shli %mant, %rot : i64
+          %up_masked = arith.andi %up, %modulus : i64
+          %down_by = arith.subi %c61, %rot : i64
+          %down = arith.shrui %mant, %down_by : i64
+          %r = arith.ori %up_masked, %down : i64
+          // One conditional reduction keeps the value inside [0, 2^61-1).
+          %needs = arith.cmpi uge, %r, %modulus : i64
+          %reduced = arith.subi %r, %modulus : i64
+          %out = arith.select %needs, %reduced, %r : i1, i64
+          scf.yield %out : i64
+        }
+        %negated = arith.subi %zero, %rotated : i64
+        %is_neg = arith.cmpi ne, %sign_bit, %zero : i64
+        %signed = arith.select %is_neg, %negated, %rotated : i1, i64
+        scf.yield %signed : i64
+      }
+      scf.yield %finite : i64
+    }
+    %fixed = func.call @__ly_hash_fixup(%result) : (i64) -> i64
+    func.return %fixed : i64
+  }
+
+  // bool.__hash__ (canonical i1 receiver and boxed-conforming variants):
+  // hash(False) == 0, hash(True) == 1 == hash(1).
+  func.func @LyBool_Hash(%value: i1) -> i64 attributes {ly.runtime.contract = "builtins.bool", ly.runtime.method = "__hash__"} {
+    %h = arith.extui %value : i1 to i64
+    func.return %h : i64
+  }
+
+  func.func @LyBool_BoxedHash(%header: memref<3xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.bool", ly.runtime.method = "__hash__"} {
+    %value = func.call @LyBool_Unbox(%header) : (memref<3xi64>) -> i1
+    %h = arith.extui %value : i1 to i64
+    func.return %h : i64
+  }
+
+  // Uniform per-element hash/eq dispatch, generated per program by the
+  // lowering (class id -> the manifest __hash__ / __eq__); resolved at link.
+  func.func private @__ly_hash_boxed_by_contract(%box: !llvm.ptr, %class_id: i64) -> (i64, i1)
+  func.func private @__ly_eq_boxed_by_contract(%lhs: !llvm.ptr, %rhs: !llvm.ptr, %class_id: i64) -> (i1, i1)
+
+  // "unhashable type: '<name>'"
+  memref.global "private" constant @__ly_hash_msg_unhashable_list : memref<23xi8> = dense<[117, 110, 104, 97, 115, 104, 97, 98, 108, 101, 32, 116, 121, 112, 101, 58, 32, 39, 108, 105, 115, 116, 39]>
+  memref.global "private" constant @__ly_hash_msg_unhashable_dict : memref<23xi8> = dense<[117, 110, 104, 97, 115, 104, 97, 98, 108, 101, 32, 116, 121, 112, 101, 58, 32, 39, 100, 105, 99, 116, 39]>
+  memref.global "private" constant @__ly_hash_msg_unhashable_set : memref<22xi8> = dense<[117, 110, 104, 97, 115, 104, 97, 98, 108, 101, 32, 116, 121, 112, 101, 58, 32, 39, 115, 101, 116, 39]>
+
+  func.func private @__ly_hash_raise_unhashable(%class_id: i64) {
+    %type_error = arith.constant 52 : i64
+    %c10 = arith.constant 10 : i64
+    %c12 = arith.constant 12 : i64
+    %is_list = arith.cmpi eq, %class_id, %c10 : i64
+    %is_dict = arith.cmpi eq, %class_id, %c12 : i64
+    scf.if %is_list {
+      %msg_static = memref.get_global @__ly_hash_msg_unhashable_list : memref<23xi8>
+      %msg = memref.cast %msg_static : memref<23xi8> to memref<?xi8>
+      %len = arith.constant 23 : i64
+      func.call @__ly_long_raise_message(%type_error, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
+    } else {
+      scf.if %is_dict {
+        %msg_static = memref.get_global @__ly_hash_msg_unhashable_dict : memref<23xi8>
+        %msg = memref.cast %msg_static : memref<23xi8> to memref<?xi8>
+        %len = arith.constant 23 : i64
+        func.call @__ly_long_raise_message(%type_error, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
+      } else {
+        %msg_static = memref.get_global @__ly_hash_msg_unhashable_set : memref<22xi8>
+        %msg = memref.cast %msg_static : memref<22xi8> to memref<?xi8>
+        %len = arith.constant 22 : i64
+        func.call @__ly_long_raise_message(%type_error, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
+      }
+    }
+    func.return
+  }
+
+  // Hash of an arbitrary boxed value (16-word payload handle). Dispatches on
+  // the class id: singletons inline, manifest/user `__hash__` through the
+  // generated hook, identity hash for classes without `__hash__` (R6), and a
+  // TypeError for the builtin mutable containers.
+  func.func private @__ly_box_hash(%box: !llvm.ptr) -> i64 {
+    %zero = arith.constant 0 : i64
+    %c1_i64 = arith.constant 1 : i64
+    %c2_i64 = arith.constant 2 : i64
+    %class_gep = llvm.getelementptr %box[%c1_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    %class_id = llvm.load %class_gep : !llvm.ptr -> i64
+    %is_none = arith.cmpi eq, %class_id, %zero : i64
+    %result = scf.if %is_none -> (i64) {
+      // hash(None): the CPython 3.12+ constant.
+      %none_hash = arith.constant 4238894112 : i64
+      scf.yield %none_hash : i64
+    } else {
+      %c10 = arith.constant 10 : i64
+      %c12 = arith.constant 12 : i64
+      %c21 = arith.constant 21 : i64
+      %is_list = arith.cmpi eq, %class_id, %c10 : i64
+      %is_dict = arith.cmpi eq, %class_id, %c12 : i64
+      %is_set = arith.cmpi eq, %class_id, %c21 : i64
+      %mut0 = arith.ori %is_list, %is_dict : i1
+      %unhashable = arith.ori %mut0, %is_set : i1
+      scf.if %unhashable {
+        func.call @__ly_hash_raise_unhashable(%class_id) : (i64) -> ()
+      }
+      %h, %handled = func.call @__ly_hash_boxed_by_contract(%box, %class_id) : (!llvm.ptr, i64) -> (i64, i1)
+      %dispatched = scf.if %handled -> (i64) {
+        %fixed = func.call @__ly_hash_fixup(%h) : (i64) -> i64
+        scf.yield %fixed : i64
+      } else {
+        // Identity hash: the CPython pointer hash (rotate right by 4).
+        %entity_gep = llvm.getelementptr %box[%c2_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+        %p = llvm.load %entity_gep : !llvm.ptr -> i64
+        %c4 = arith.constant 4 : i64
+        %c60 = arith.constant 60 : i64
+        %lo = arith.shrui %p, %c4 : i64
+        %hi = arith.shli %p, %c60 : i64
+        %rot = arith.ori %lo, %hi : i64
+        %fixed = func.call @__ly_hash_fixup(%rot) : (i64) -> i64
+        scf.yield %fixed : i64
+      }
+      scf.yield %dispatched : i64
+    }
+    func.return %result : i64
+  }
+
+  // Raw bigint view words of a boxed int: (sign, digit count, digits ptr).
+  func.func private @__ly_boxed_long_view(%box: !llvm.ptr) -> (i64, i64, i64) {
+    %c5 = arith.constant 5 : i64
+    %c6 = arith.constant 6 : i64
+    %c1 = arith.constant 1 : i64
+    %meta_gep = llvm.getelementptr %box[%c5] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    %digits_gep = llvm.getelementptr %box[%c6] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    %meta_word = llvm.load %meta_gep : !llvm.ptr -> i64
+    %digits_word = llvm.load %digits_gep : !llvm.ptr -> i64
+    %meta_ptr = llvm.inttoptr %meta_word : i64 to !llvm.ptr
+    %sign = llvm.load %meta_ptr : !llvm.ptr -> i64
+    %count_gep = llvm.getelementptr %meta_ptr[%c1] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    %count = llvm.load %count_gep : !llvm.ptr -> i64
+    func.return %sign, %count, %digits_word : i64, i64, i64
+  }
+
+  // Exact equality of a raw bigint view against an f64 (CPython's mixed
+  // int/float comparison semantics: exact, no rounding).
+  func.func private @__ly_boxed_long_eq_f64(%sign: i64, %count: i64, %digits_word: i64, %value: f64) -> i1 {
+    %zero = arith.constant 0 : i64
+    %false = arith.constant false
+    %bits = arith.bitcast %value : f64 to i64
+    %c52 = arith.constant 52 : i64
+    %c63 = arith.constant 63 : i64
+    %exp_mask = arith.constant 2047 : i64
+    %mant_mask = arith.constant 4503599627370495 : i64
+    %implicit_bit = arith.constant 4503599627370496 : i64
+    %exp_field = arith.shrui %bits, %c52 : i64
+    %exp_bits = arith.andi %exp_field, %exp_mask : i64
+    %mant_bits = arith.andi %bits, %mant_mask : i64
+    %sign_bit = arith.shrui %bits, %c63 : i64
+    // NaN / inf never equal an int.
+    %is_special = arith.cmpi eq, %exp_bits, %exp_mask : i64
+    %result = scf.if %is_special -> (i1) {
+      scf.yield %false : i1
+    } else {
+      %mant_zero = arith.cmpi eq, %mant_bits, %zero : i64
+      %exp_zero = arith.cmpi eq, %exp_bits, %zero : i64
+      %is_zero = arith.andi %exp_zero, %mant_zero : i1
+      %zero_case = scf.if %is_zero -> (i1) {
+        %int_zero = arith.cmpi eq, %sign, %zero : i64
+        scf.yield %int_zero : i1
+      } else {
+        // Sign must match a nonzero float.
+        %float_neg = arith.cmpi ne, %sign_bit, %zero : i64
+        %neg_one = arith.constant -1 : i64
+        %one = arith.constant 1 : i64
+        %expected_sign = arith.select %float_neg, %neg_one, %one : i1, i64
+        %sign_matches = arith.cmpi eq, %sign, %expected_sign : i64
+        %signed_case = scf.if %sign_matches -> (i1) {
+          // Normalize to mant * 2^exp with mant integral (53 bits max).
+          %bias = arith.constant 1075 : i64
+          %subnormal = arith.cmpi eq, %exp_bits, %zero : i64
+          %norm_mant = arith.ori %mant_bits, %implicit_bit : i64
+          %mant0 = arith.select %subnormal, %mant_bits, %norm_mant : i1, i64
+          %norm_exp = arith.subi %exp_bits, %bias : i64
+          %sub_exp = arith.subi %one, %bias : i64
+          %exp0 = arith.subi %norm_exp, %zero : i64
+          %exp1 = arith.select %subnormal, %sub_exp, %exp0 : i1, i64
+          // Strip trailing zero bits of the mantissa into the exponent so
+          // (mant, exp) is canonical: mant odd.
+          %canon:2 = scf.while (%m = %mant0, %e = %exp1) : (i64, i64) -> (i64, i64) {
+            %one_bit = arith.andi %m, %one : i64
+            %even = arith.cmpi eq, %one_bit, %zero : i64
+            scf.condition(%even) %m, %e : i64, i64
+          } do {
+          ^bb0(%m: i64, %e: i64):
+            %half = arith.shrui %m, %one : i64
+            %inc = arith.addi %e, %one : i64
+            scf.yield %half, %inc : i64, i64
+          }
+          // A negative exponent means a fractional value: never an int.
+          %exp_neg = arith.cmpi slt, %canon#1, %zero : i64
+          %int_case = scf.if %exp_neg -> (i1) {
+            scf.yield %false : i1
+          } else {
+            // Compare mant << exp against the digit magnitude exactly:
+            // walk the 30-bit limbs from most significant, matching the
+            // corresponding float bits (the float value has at most 53
+            // significant bits; everything below them must be zero).
+            // bit_length(int) must equal bit_length(mant) + exp.
+            %c30 = arith.constant 30 : i64
+            %digits_ptr = llvm.inttoptr %digits_word : i64 to !llvm.ptr
+            %count_minus_one = arith.subi %count, %one : i64
+            %top_gep = llvm.getelementptr %digits_ptr[%count_minus_one] : (!llvm.ptr, i64) -> !llvm.ptr, i32
+            %top_i32 = llvm.load %top_gep : !llvm.ptr -> i32
+            %top = arith.extui %top_i32 : i32 to i64
+            // bit width of the top limb.
+            %top_bits = scf.while (%w = %zero) : (i64) -> i64 {
+              %shifted = arith.shrui %top, %w : i64
+              %nonzero = arith.cmpi ne, %shifted, %zero : i64
+              scf.condition(%nonzero) %w : i64
+            } do {
+            ^bb0(%w: i64):
+              %next = arith.addi %w, %one : i64
+              scf.yield %next : i64
+            }
+            %lower_limbs = arith.subi %count, %one : i64
+            %lower_bits = arith.muli %lower_limbs, %c30 : i64
+            %int_bl = arith.addi %top_bits, %lower_bits : i64
+            // bit width of mant.
+            %mant_bl = scf.while (%w = %zero) : (i64) -> i64 {
+              %shifted = arith.shrui %canon#0, %w : i64
+              %nonzero = arith.cmpi ne, %shifted, %zero : i64
+              scf.condition(%nonzero) %w : i64
+            } do {
+            ^bb0(%w: i64):
+              %next = arith.addi %w, %one : i64
+              scf.yield %next : i64
+            }
+            %float_bl = arith.addi %mant_bl, %canon#1 : i64
+            %bl_matches = arith.cmpi eq, %int_bl, %float_bl : i64
+            %bl_case = scf.if %bl_matches -> (i1) {
+              // Walk limbs from most significant: each limb must equal the
+              // matching 30-bit window of mant << exp. Window position of
+              // limb i (0-based from least significant): bits [30i, 30i+30).
+              // mant occupies bits [exp, exp+mant_bl).
+              %true = arith.constant true
+              %c0_index = arith.constant 0 : index
+              %count_index = arith.index_cast %count : i64 to index
+              %c1_index = arith.constant 1 : index
+              %all_match = scf.for %li = %c0_index to %count_index step %c1_index iter_args(%ok = %true) -> (i1) {
+                %li_i64 = arith.index_cast %li : index to i64
+                %limb_gep = llvm.getelementptr %digits_ptr[%li_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i32
+                %limb_i32 = llvm.load %limb_gep : !llvm.ptr -> i32
+                %limb = arith.extui %limb_i32 : i32 to i64
+                %win_lo = arith.muli %li_i64, %c30 : i64
+                // expected = (mant << exp) >> win_lo, masked to 30 bits =
+                // mant >> (win_lo - exp) when win_lo >= exp, else
+                // mant << (exp - win_lo).
+                %sh = arith.subi %win_lo, %canon#1 : i64
+                %sh_neg = arith.cmpi slt, %sh, %zero : i64
+                %c64 = arith.constant 64 : i64
+                %sh_big = arith.cmpi sge, %sh, %c64 : i64
+                %sh_safe = arith.select %sh_big, %c63, %sh : i1, i64
+                %down = arith.shrui %canon#0, %sh_safe : i64
+                %neg_sh = arith.subi %zero, %sh : i64
+                %neg_big = arith.cmpi sge, %neg_sh, %c64 : i64
+                %neg_safe = arith.select %neg_big, %c63, %neg_sh : i1, i64
+                %up = arith.shli %canon#0, %neg_safe : i64
+                %up_sel = arith.select %neg_big, %zero, %up : i1, i64
+                %down_sel = arith.select %sh_big, %zero, %down : i1, i64
+                %shifted = arith.select %sh_neg, %up_sel, %down_sel : i1, i64
+                %window_mask = arith.constant 1073741823 : i64
+                %expected = arith.andi %shifted, %window_mask : i64
+                %limb_matches = arith.cmpi eq, %limb, %expected : i64
+                %next = arith.andi %ok, %limb_matches : i1
+                scf.yield %next : i1
+              }
+              scf.yield %all_match : i1
+            } else {
+              scf.yield %false : i1
+            }
+            scf.yield %bl_case : i1
+          }
+          scf.yield %int_case : i1
+        } else {
+          scf.yield %false : i1
+        }
+        scf.yield %signed_case : i1
+      }
+      scf.yield %zero_case : i1
+    }
+    func.return %result : i1
+  }
+
+  // Equality of two arbitrary boxed values with CPython's dict/set probe
+  // semantics: identity implies equality (NaN keys), then the numeric tower
+  // compares across int/bool/float, then same-class `__eq__` through the
+  // generated hook. Distinct classes outside the tower compare unequal.
+  func.func private @__ly_box_equal(%lhs: !llvm.ptr, %rhs: !llvm.ptr) -> i1 {
+    %zero = arith.constant 0 : i64
+    %true = arith.constant true
+    %false = arith.constant false
+    %c1_i64 = arith.constant 1 : i64
+    %c2_i64 = arith.constant 2 : i64
+    %lhs_class_gep = llvm.getelementptr %lhs[%c1_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    %rhs_class_gep = llvm.getelementptr %rhs[%c1_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    %lhs_class = llvm.load %lhs_class_gep : !llvm.ptr -> i64
+    %rhs_class = llvm.load %rhs_class_gep : !llvm.ptr -> i64
+    %lhs_ptr_gep = llvm.getelementptr %lhs[%c2_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    %rhs_ptr_gep = llvm.getelementptr %rhs[%c2_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    %lhs_ptr = llvm.load %lhs_ptr_gep : !llvm.ptr -> i64
+    %rhs_ptr = llvm.load %rhs_ptr_gep : !llvm.ptr -> i64
+    %same_ptr = arith.cmpi eq, %lhs_ptr, %rhs_ptr : i64
+    %ptr_nonzero = arith.cmpi ne, %lhs_ptr, %zero : i64
+    %same_class = arith.cmpi eq, %lhs_class, %rhs_class : i64
+    %identical0 = arith.andi %same_ptr, %ptr_nonzero : i1
+    %identical = arith.andi %identical0, %same_class : i1
+    %result = scf.if %identical -> (i1) {
+      scf.yield %true : i1
+    } else {
+      %lhs_none = arith.cmpi eq, %lhs_class, %zero : i64
+      %rhs_none = arith.cmpi eq, %rhs_class, %zero : i64
+      %either_none = arith.ori %lhs_none, %rhs_none : i1
+      %outer = scf.if %either_none -> (i1) {
+        %both_none = arith.andi %lhs_none, %rhs_none : i1
+        scf.yield %both_none : i1
+      } else {
+        %int_class = arith.constant 1 : i64
+        %float_class = arith.constant 2 : i64
+        %bool_class = arith.constant 22 : i64
+        %lhs_int = arith.cmpi eq, %lhs_class, %int_class : i64
+        %lhs_float = arith.cmpi eq, %lhs_class, %float_class : i64
+        %lhs_bool = arith.cmpi eq, %lhs_class, %bool_class : i64
+        %rhs_int = arith.cmpi eq, %rhs_class, %int_class : i64
+        %rhs_float = arith.cmpi eq, %rhs_class, %float_class : i64
+        %rhs_bool = arith.cmpi eq, %rhs_class, %bool_class : i64
+        %lhs_num0 = arith.ori %lhs_int, %lhs_float : i1
+        %lhs_num = arith.ori %lhs_num0, %lhs_bool : i1
+        %rhs_num0 = arith.ori %rhs_int, %rhs_float : i1
+        %rhs_num = arith.ori %rhs_num0, %rhs_bool : i1
+        %both_num = arith.andi %lhs_num, %rhs_num : i1
+        %mixed_class = arith.cmpi ne, %lhs_class, %rhs_class : i64
+        %numeric_mixed = arith.andi %both_num, %mixed_class : i1
+        %same = arith.cmpi eq, %lhs_class, %rhs_class : i64
+        %num_result = scf.if %numeric_mixed -> (i1) {
+          %r = func.call @__ly_box_equal_numeric(%lhs, %lhs_class, %rhs, %rhs_class) : (!llvm.ptr, i64, !llvm.ptr, i64) -> i1
+          scf.yield %r : i1
+        } else {
+          %same_result = scf.if %same -> (i1) {
+            %eq, %handled = func.call @__ly_eq_boxed_by_contract(%lhs, %rhs, %lhs_class) : (!llvm.ptr, !llvm.ptr, i64) -> (i1, i1)
+            %r = arith.andi %eq, %handled : i1
+            scf.yield %r : i1
+          } else {
+            scf.yield %false : i1
+          }
+          scf.yield %same_result : i1
+        }
+        scf.yield %num_result : i1
+      }
+      scf.yield %outer : i1
+    }
+    func.return %result : i1
+  }
+
+  // Boxed bool as an i64 value (0/1) via the singleton's value word.
+  func.func private @__ly_boxed_bool_value(%box: !llvm.ptr) -> i64 {
+    %c2_i64 = arith.constant 2 : i64
+    %entity_gep = llvm.getelementptr %box[%c2_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    %entity_word = llvm.load %entity_gep : !llvm.ptr -> i64
+    %entity = llvm.inttoptr %entity_word : i64 to !llvm.ptr
+    %value_gep = llvm.getelementptr %entity[%c2_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    %value = llvm.load %value_gep : !llvm.ptr -> i64
+    func.return %value : i64
+  }
+
+  // Boxed float payload (pointer word 5 is the f64 cell).
+  func.func private @__ly_boxed_float_value(%box: !llvm.ptr) -> f64 {
+    %c5 = arith.constant 5 : i64
+    %cell_gep = llvm.getelementptr %box[%c5] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    %cell_word = llvm.load %cell_gep : !llvm.ptr -> i64
+    %cell = llvm.inttoptr %cell_word : i64 to !llvm.ptr
+    %value = llvm.load %cell : !llvm.ptr -> f64
+    func.return %value : f64
+  }
+
+  // Mixed-class numeric equality across int/bool/float boxes.
+  func.func private @__ly_box_equal_numeric(%lhs: !llvm.ptr, %lhs_class: i64, %rhs: !llvm.ptr, %rhs_class: i64) -> i1 {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %false = arith.constant false
+    %int_class = arith.constant 1 : i64
+    %float_class = arith.constant 2 : i64
+    %bool_class = arith.constant 22 : i64
+    %lhs_is_float = arith.cmpi eq, %lhs_class, %float_class : i64
+    %rhs_is_float = arith.cmpi eq, %rhs_class, %float_class : i64
+    %either_float = arith.ori %lhs_is_float, %rhs_is_float : i1
+    %result = scf.if %either_float -> (i1) {
+      // Exactly one side is a float here (float/float is same-class).
+      %fv = scf.if %lhs_is_float -> (f64) {
+        %v = func.call @__ly_boxed_float_value(%lhs) : (!llvm.ptr) -> f64
+        scf.yield %v : f64
+      } else {
+        %v = func.call @__ly_boxed_float_value(%rhs) : (!llvm.ptr) -> f64
+        scf.yield %v : f64
+      }
+      %other = arith.select %lhs_is_float, %rhs, %lhs : i1, !llvm.ptr
+      %other_class = arith.select %lhs_is_float, %rhs_class, %lhs_class : i1, i64
+      %other_is_bool = arith.cmpi eq, %other_class, %bool_class : i64
+      %cmp = scf.if %other_is_bool -> (i1) {
+        %bv = func.call @__ly_boxed_bool_value(%other) : (!llvm.ptr) -> i64
+        %bf = arith.sitofp %bv : i64 to f64
+        %eq = arith.cmpf oeq, %bf, %fv : f64
+        scf.yield %eq : i1
+      } else {
+        %sign, %count, %digits = func.call @__ly_boxed_long_view(%other) : (!llvm.ptr) -> (i64, i64, i64)
+        %eq = func.call @__ly_boxed_long_eq_f64(%sign, %count, %digits, %fv) : (i64, i64, i64, f64) -> i1
+        scf.yield %eq : i1
+      }
+      scf.yield %cmp : i1
+    } else {
+      // int/bool (mixed): bool value 0 -> int zero; 1 -> int one.
+      %lhs_is_bool = arith.cmpi eq, %lhs_class, %bool_class : i64
+      %bool_box = arith.select %lhs_is_bool, %lhs, %rhs : i1, !llvm.ptr
+      %int_box = arith.select %lhs_is_bool, %rhs, %lhs : i1, !llvm.ptr
+      %bv = func.call @__ly_boxed_bool_value(%bool_box) : (!llvm.ptr) -> i64
+      %sign, %count, %digits = func.call @__ly_boxed_long_view(%int_box) : (!llvm.ptr) -> (i64, i64, i64)
+      %bool_false = arith.cmpi eq, %bv, %zero : i64
+      %cmp = scf.if %bool_false -> (i1) {
+        %int_zero = arith.cmpi eq, %sign, %zero : i64
+        scf.yield %int_zero : i1
+      } else {
+        %sign_one = arith.cmpi eq, %sign, %one : i64
+        %count_one = arith.cmpi eq, %count, %one : i64
+        %digits_ptr = llvm.inttoptr %digits : i64 to !llvm.ptr
+        %d0_i32 = llvm.load %digits_ptr : !llvm.ptr -> i32
+        %d0 = arith.extui %d0_i32 : i32 to i64
+        %d0_one = arith.cmpi eq, %d0, %one : i64
+        %m0 = arith.andi %sign_one, %count_one : i1
+        %m1 = arith.andi %m0, %d0_one : i1
+        scf.yield %m1 : i1
+      }
+      scf.yield %cmp : i1
+    }
+    func.return %result : i1
+  }
+
+  // tuple.__hash__: CPython's xxHash-based combiner (tuples of equal elements
+  // hash equal; unhashable elements raise through __ly_box_hash).
+  func.func @LyTuple_Hash(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>) -> i64 attributes {ly.runtime.contract = "builtins.tuple", ly.runtime.method = "__hash__"} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c16_i64 = arith.constant 16 : i64
+    %len = memref.load %meta[%c0] : memref<2xi64>
+    %len_index = arith.index_cast %len : i64 to index
+    %items_idx = memref.extract_aligned_pointer_as_index %items : memref<?xi64> -> index
+    %items_i64 = arith.index_cast %items_idx : index to i64
+    %items_ptr = llvm.inttoptr %items_i64 : i64 to !llvm.ptr
+    %prime1 = arith.constant -7046029288634856825 : i64
+    %prime2 = arith.constant -4417276706812531889 : i64
+    %prime5 = arith.constant 2870177450012600261 : i64
+    %acc_init = arith.constant 2870177450012600261 : i64
+    %c31 = arith.constant 31 : i64
+    %c33 = arith.constant 33 : i64
+    %acc = scf.for %i = %c0 to %len_index step %c1 iter_args(%a = %acc_init) -> (i64) {
+      %i_i64 = arith.index_cast %i : index to i64
+      %off = arith.muli %i_i64, %c16_i64 : i64
+      %box_ptr = llvm.getelementptr %items_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %lane = func.call @__ly_box_hash(%box_ptr) : (!llvm.ptr) -> i64
+      %scaled = arith.muli %lane, %prime2 : i64
+      %added = arith.addi %a, %scaled : i64
+      %rot_hi = arith.shli %added, %c31 : i64
+      %rot_lo = arith.shrui %added, %c33 : i64
+      %rotated = arith.ori %rot_hi, %rot_lo : i64
+      %next = arith.muli %rotated, %prime1 : i64
+      scf.yield %next : i64
+    }
+    // acc += len ^ (XXPRIME_5 ^ 3527539)
+    %salt = arith.constant 3527539 : i64
+    %mix0 = arith.xori %prime5, %salt : i64
+    %mix1 = arith.xori %len, %mix0 : i64
+    %final = arith.addi %acc, %mix1 : i64
+    %sentinel = arith.constant -1 : i64
+    %replacement = arith.constant 1546275796 : i64
+    %is_sentinel = arith.cmpi eq, %final, %sentinel : i64
+    %result = arith.select %is_sentinel, %replacement, %final : i1, i64
+    func.return %result : i64
+  }
+
+  // tuple.__eq__: element-wise recursive equality over the boxed payloads.
+  func.func @LyTuple_EqBool(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_meta: memref<2xi64>, %lhs_items: memref<?xi64>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_meta: memref<2xi64>, %rhs_items: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.tuple", ly.runtime.method = "__eq__"} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c16_i64 = arith.constant 16 : i64
+    %false = arith.constant false
+    %true = arith.constant true
+    %lhs_len = memref.load %lhs_meta[%c0] : memref<2xi64>
+    %rhs_len = memref.load %rhs_meta[%c0] : memref<2xi64>
+    %same_len = arith.cmpi eq, %lhs_len, %rhs_len : i64
+    %result = scf.if %same_len -> (i1) {
+      %len_index = arith.index_cast %lhs_len : i64 to index
+      %lhs_idx = memref.extract_aligned_pointer_as_index %lhs_items : memref<?xi64> -> index
+      %rhs_idx = memref.extract_aligned_pointer_as_index %rhs_items : memref<?xi64> -> index
+      %lhs_i64 = arith.index_cast %lhs_idx : index to i64
+      %rhs_i64 = arith.index_cast %rhs_idx : index to i64
+      %lhs_ptr = llvm.inttoptr %lhs_i64 : i64 to !llvm.ptr
+      %rhs_ptr = llvm.inttoptr %rhs_i64 : i64 to !llvm.ptr
+      %all = scf.for %i = %c0 to %len_index step %c1 iter_args(%ok = %true) -> (i1) {
+        %next = scf.if %ok -> (i1) {
+          %i_i64 = arith.index_cast %i : index to i64
+          %off = arith.muli %i_i64, %c16_i64 : i64
+          %lbox = llvm.getelementptr %lhs_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+          %rbox = llvm.getelementptr %rhs_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+          %eq = func.call @__ly_box_equal(%lbox, %rbox) : (!llvm.ptr, !llvm.ptr) -> i1
+          scf.yield %eq : i1
+        } else {
+          scf.yield %false : i1
+        }
+        scf.yield %next : i1
+      }
+      scf.yield %all : i1
+    } else {
+      scf.yield %false : i1
+    }
+    func.return %result : i1
+  }
+
+  func.func @LyTuple_NeBool(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_meta: memref<2xi64>, %lhs_items: memref<?xi64>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_meta: memref<2xi64>, %rhs_items: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.tuple", ly.runtime.method = "__ne__"} {
+    %eq = func.call @LyTuple_EqBool(%lhs_header, %lhs_meta, %lhs_items, %rhs_header, %rhs_meta, %rhs_items) : (memref<2xi64>, memref<2xi64>, memref<?xi64>, memref<2xi64>, memref<2xi64>, memref<?xi64>) -> i1
+    %true = arith.constant true
+    %ne = arith.xori %eq, %true : i1
+    func.return %ne : i1
   }
 
   // ===== impls: collection =====

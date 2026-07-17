@@ -78,6 +78,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerModule() {
     return mlir::failure();
   if (mlir::failed(RuntimeBundleLowerer::generateBoxedReprHook()))
     return mlir::failure();
+  if (mlir::failed(RuntimeBundleLowerer::generateBoxedHashHook()))
+    return mlir::failure();
+  if (mlir::failed(RuntimeBundleLowerer::generateBoxedEqHook()))
+    return mlir::failure();
   if (mlir::failed(RuntimeBundleLowerer::generateBoxedReleaseHook()))
     return mlir::failure();
   if (mlir::failed(RuntimeBundleLowerer::generateGeneratorDropHook()))

@@ -1487,4 +1487,212 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedReprHook() {
   return mlir::success();
 }
 
+mlir::LogicalResult RuntimeBundleLowerer::generateBoxedHashHook() {
+  // hash instance: class id -> the manifest `__hash__` (returns the i64 hash
+  // word). Same demand-driven generation as the repr hook: the external
+  // declaration merged in from builtins.mlir requests the definition.
+  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(
+          "__ly_hash_boxed_by_contract");
+      !existing || !existing.isExternal())
+    return mlir::success();
+  mlir::Type i64 = mlir::IntegerType::get(context, 64);
+  return generateBoxedMethodHook(
+      "__ly_hash_boxed_by_contract",
+      [](mlir::func::FuncOp function) {
+        auto method = function->getAttrOfType<mlir::StringAttr>(
+            contracts::kManifestMethodAttr);
+        return method && method.getValue() == "__hash__";
+      },
+      {i64}, /*shareExceptionSubclasses=*/false,
+      /*sourceClassMethodName=*/"__hash__");
+}
+
+// Binary variant of the uniform boxed-method dispatch, for same-class binary
+// methods (`__eq__`): `(ptr lhs, ptr rhs, i64 class_id) -> (results..., i1
+// handled)`. A callee conforms when its inputs are 2N rank-1 memrefs whose
+// second half repeats the first (self shape twice); the first half is
+// reconstructed from the lhs box words, the second from the rhs box words.
+mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
+    llvm::StringRef hookName,
+    llvm::function_ref<bool(mlir::func::FuncOp)> selects,
+    mlir::TypeRange calleeResultTypes, llvm::StringRef sourceClassMethodName) {
+  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(hookName)) {
+    if (!existing.isExternal())
+      return mlir::success();
+    existing.erase();
+  }
+
+  struct HookEntry {
+    std::int64_t classId;
+    mlir::func::FuncOp callee;
+  };
+  llvm::SmallVector<HookEntry, 16> entries;
+  llvm::SmallDenseSet<std::int64_t, 16> seenIds;
+  auto conforms = [&](mlir::func::FuncOp function) {
+    mlir::FunctionType type = function.getFunctionType();
+    unsigned inputs = type.getNumInputs();
+    if (type.getNumResults() != calleeResultTypes.size() || inputs == 0 ||
+        inputs % 2 != 0 || inputs > 10)
+      return false;
+    for (auto [have, want] : llvm::zip(type.getResults(), calleeResultTypes))
+      if (have != want)
+        return false;
+    unsigned half = inputs / 2;
+    for (unsigned index = 0; index < inputs; ++index) {
+      auto memref = mlir::dyn_cast<mlir::MemRefType>(type.getInput(index));
+      if (!memref || memref.getRank() != 1)
+        return false;
+      if (index >= half && type.getInput(index) != type.getInput(index - half))
+        return false;
+    }
+    return true;
+  };
+  module.walk([&](mlir::func::FuncOp function) {
+    if (function.isExternal() || !selects(function))
+      return;
+    auto contractAttr = function->getAttrOfType<mlir::StringAttr>(
+        contracts::kManifestContractAttr);
+    if (!contractAttr)
+      return;
+    std::optional<std::int64_t> classId =
+        manifest.classId(contractAttr.getValue());
+    if (!classId) {
+      py::ClassOp classOp = RuntimeBundleLowerer::classForContract(
+          runtimeContractType(context, contractAttr.getValue()));
+      if (classOp)
+        classId = RuntimeBundleLowerer::runtimeClassIdForClass(classOp);
+    }
+    if (!classId || !conforms(function) || !seenIds.insert(*classId).second)
+      return;
+    entries.push_back(HookEntry{*classId, function});
+  });
+  if (!sourceClassMethodName.empty()) {
+    module.walk([&](py::ClassOp classOp) {
+      std::optional<std::string> symbol =
+          RuntimeBundleLowerer::classMethodSymbol(classOp,
+                                                  sourceClassMethodName);
+      if (!symbol)
+        return;
+      auto function = module.lookupSymbol<mlir::func::FuncOp>(*symbol);
+      if (!function || function.isExternal() || !conforms(function))
+        return;
+      std::optional<std::int64_t> classId =
+          RuntimeBundleLowerer::runtimeClassIdForClass(classOp);
+      if (!classId || !seenIds.insert(*classId).second)
+        return;
+      entries.push_back(HookEntry{*classId, function});
+    });
+  }
+
+  mlir::OpBuilder builder(context);
+  builder.setInsertionPointToEnd(module.getBody());
+  auto ptrType = mlir::LLVM::LLVMPointerType::get(context);
+  mlir::Type i64 = builder.getI64Type();
+  mlir::Type i1 = builder.getI1Type();
+  mlir::Location loc = module.getLoc();
+  llvm::SmallVector<mlir::Type, 4> hookResultTypes(calleeResultTypes.begin(),
+                                                   calleeResultTypes.end());
+  hookResultTypes.push_back(i1);
+  auto hook = mlir::func::FuncOp::create(
+      builder, loc, hookName,
+      builder.getFunctionType({ptrType, ptrType, i64}, hookResultTypes));
+
+  mlir::Block *entry = hook.addEntryBlock();
+  mlir::Value lhsSlot = entry->getArgument(0);
+  mlir::Value rhsSlot = entry->getArgument(1);
+  mlir::Value classValue = entry->getArgument(2);
+
+  mlir::Block *miss = hook.addBlock();
+  {
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(miss);
+    llvm::SmallVector<mlir::Value, 4> missResults;
+    for (mlir::Type resultType : calleeResultTypes)
+      missResults.push_back(
+          mlir::ub::PoisonOp::create(builder, loc, resultType, nullptr));
+    missResults.push_back(
+        mlir::arith::ConstantIntOp::create(builder, loc, 0, 1));
+    mlir::func::ReturnOp::create(builder, loc, missResults);
+  }
+
+  auto loadWord = [&](mlir::OpBuilder &b, mlir::Value slot,
+                      std::int64_t index) -> mlir::Value {
+    mlir::Value gep = mlir::LLVM::GEPOp::create(
+        b, loc, ptrType, i64, slot,
+        llvm::ArrayRef<mlir::LLVM::GEPArg>{
+            mlir::LLVM::GEPArg(static_cast<std::int32_t>(index))});
+    return mlir::LLVM::LoadOp::create(b, loc, i64, gep).getResult();
+  };
+
+  mlir::Block *check = entry;
+  for (const HookEntry &hookEntry : entries) {
+    mlir::Block *handle = hook.addBlock();
+    mlir::Block *next = hook.addBlock();
+    {
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToEnd(check);
+      mlir::Value expected = mlir::arith::ConstantIntOp::create(
+          builder, loc, hookEntry.classId, 64);
+      mlir::Value matches = mlir::arith::CmpIOp::create(
+          builder, loc, mlir::arith::CmpIPredicate::eq, classValue, expected);
+      mlir::cf::CondBranchOp::create(builder, loc, matches, handle,
+                                     mlir::ValueRange{}, next,
+                                     mlir::ValueRange{});
+    }
+    {
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToStart(handle);
+      llvm::SmallVector<mlir::Value, 8> operands;
+      mlir::func::FuncOp callee = hookEntry.callee;
+      mlir::FunctionType type = callee.getFunctionType();
+      unsigned half = type.getNumInputs() / 2;
+      for (auto [index, input] : llvm::enumerate(type.getInputs())) {
+        auto memref = mlir::cast<mlir::MemRefType>(input);
+        mlir::Value slot = index < half ? lhsSlot : rhsSlot;
+        std::int64_t position =
+            static_cast<std::int64_t>(index < half ? index : index - half);
+        mlir::Value pointerWord =
+            loadWord(builder, slot, box_abi::kPointerWordBase + position);
+        mlir::Value sizeWord =
+            loadWord(builder, slot, box_abi::kSizeWordBase + position);
+        operands.push_back(RuntimeBundleLowerer::memrefFromBoxWords(
+            builder, loc, pointerWord, sizeWord, memref));
+      }
+      mlir::func::CallOp call =
+          mlir::func::CallOp::create(builder, loc, callee, operands);
+      llvm::SmallVector<mlir::Value, 4> hitResults(call.getResults().begin(),
+                                                   call.getResults().end());
+      hitResults.push_back(
+          mlir::arith::ConstantIntOp::create(builder, loc, 1, 1));
+      mlir::func::ReturnOp::create(builder, loc, hitResults);
+    }
+    check = next;
+  }
+  {
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToEnd(check);
+    mlir::cf::BranchOp::create(builder, loc, miss);
+  }
+  return mlir::success();
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::generateBoxedEqHook() {
+  // eq instance of the binary dispatch: class id -> the manifest `__eq__`
+  // taking (self shape, self shape) and returning one i1. Demand-driven like
+  // the repr/hash hooks.
+  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(
+          "__ly_eq_boxed_by_contract");
+      !existing || !existing.isExternal())
+    return mlir::success();
+  mlir::Type i1 = mlir::IntegerType::get(context, 1);
+  return generateBoxedBinaryMethodHook(
+      "__ly_eq_boxed_by_contract",
+      [](mlir::func::FuncOp function) {
+        auto method = function->getAttrOfType<mlir::StringAttr>(
+            contracts::kManifestMethodAttr);
+        return method && method.getValue() == "__eq__";
+      },
+      {i1}, /*sourceClassMethodName=*/"__eq__");
+}
+
 } // namespace py::lowering
