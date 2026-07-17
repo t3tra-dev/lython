@@ -2112,11 +2112,22 @@ void collectUnwindGroupSites(FuncContractCache &contracts,
 bool groupUsedOnHandlerPath(UnwindCleanupAnalysis &analysis,
                             const UnwindTrackedGroup &group,
                             mlir::Block *handler) {
-  const llvm::SmallPtrSet<mlir::Block *, 16> &reachable =
-      analysis.reachableFrom(handler);
+  if (group.values.empty())
+    return true;
+  mlir::Value root = group.values.front();
+  mlir::Operation *producer = root.getDefiningOp();
+  mlir::Block *defBlock = producer
+                              ? producer->getBlock()
+                              : mlir::cast<mlir::BlockArgument>(root).getOwner();
   for (mlir::Operation *use : group.useSites) {
     mlir::Block *block = use->getBlock();
-    if (block == handler || reachable.count(block))
+    if (block == handler)
+      return true;
+    // A use only counts when the handler reaches it WITHOUT re-entering the
+    // defining block: a path through defBlock re-arms the token, so the use
+    // belongs to the next incarnation, not the one unwinding now (try
+    // inside a loop).
+    if (analysis.reachesAvoiding(handler, block, defBlock))
       return true;
   }
   return false;
