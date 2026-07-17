@@ -1,0 +1,4 @@
+app: app-level
+config: bad config
+value: parse failed: line 3
+exc: caught as Exception
