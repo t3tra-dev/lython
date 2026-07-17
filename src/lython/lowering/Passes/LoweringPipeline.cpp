@@ -251,8 +251,11 @@ LogicalResult runLoweringPipeline(ModuleOp module,
   // Phase 10: insert and simplify ownership operations once calls are concrete.
   if (failed(runPhase("refcount-insertion", [&](PassManager &pm) {
         pm.addPass(createRefCountInsertionPass());
-      })))
+      }))) {
+    if (::getenv("LYTHON_DUMP_ON_FAILURE"))
+      module.dump();
     return failure();
+  }
   dumpMLIRForPass(irDump, "refcount-insertion", module);
 
   if (failed(runPhase("refcount-elision", [&](PassManager &pm) {
