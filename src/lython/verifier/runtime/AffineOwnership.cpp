@@ -114,8 +114,30 @@ std::string describeOwnershipProducer(mlir::Operation *op) {
 
 enum class AffineTokenState { Owned, Released, Conditional };
 
-using ExceptionEdgeMap =
-    llvm::DenseMap<mlir::Block *, llvm::SmallVector<mlir::Block *, 2>>;
+// Handler entries by try id: exceptional successors are resolved PER MARKER
+// (this marker's id -> its handler), not per block. A block may carry
+// markers of several ids (nested tries, per-call-site cleanup handlers), and
+// a block-level edge set would pair one marker's token state with another
+// marker's handler -- a path that cannot happen at runtime and mis-verifies.
+using ExceptionHandlerMap = llvm::DenseMap<std::int64_t, mlir::Block *>;
+
+mlir::Block *markerHandlerEntry(const ExceptionHandlerMap &handlers,
+                                mlir::func::CallOp marker) {
+  // Only markers in the function's top-level region model an exceptional
+  // edge here. Markers nested in single-block regions (scf.if arms etc.)
+  // cannot host the anchor/cond_br cleanup wiring the refcount-insertion
+  // pass emits, so modeling their edges without matching cleanup would
+  // reject every nested slow path; they stay outside the model, as they
+  // were for the block-level edge map (known residual, not a new one).
+  mlir::Region *region = marker->getParentRegion();
+  if (!region || !region->getParentOp() ||
+      !mlir::isa<mlir::func::FuncOp>(region->getParentOp()))
+    return nullptr;
+  std::optional<std::int64_t> id = own::exceptionMarkerId(marker);
+  if (!id)
+    return nullptr;
+  return handlers.lookup(*id);
+}
 
 struct AffinePathState {
   mlir::Block *block = nullptr;
@@ -137,9 +159,10 @@ struct AffinePathState {
   // Outstanding block-arg-merge-borrow retains (identity merge edges lend the
   // merge argument a token; the paired release targets the pre-merge name).
   unsigned borrowed = 0;
-  // Path entered through an exceptional (unwind) edge. Unwinding performs no
-  // cleanup yet (known accepted leak, P2 residual), so Owned-at-exit is NOT
-  // reported on these paths -- only use-after-release is.
+  // Path entered through an exceptional (unwind) edge. The affine invariant
+  // holds on these paths like any other (rfc/stdlib-semantics.md R2: unwind
+  // cleanup is inserted, no leak is accepted); the flag only disambiguates
+  // path-state dedup.
   bool exceptional = false;
 };
 
@@ -155,9 +178,8 @@ struct BorrowedPathState {
   mlir::Operation *start = nullptr;
   unsigned retained = 0;
   llvm::SmallVector<mlir::Value, 4> group;
-  // Path entered through an exceptional (unwind) edge. Unwinding performs no
-  // cleanup yet (known accepted leak, P2 residual), so retain-balance-at-exit
-  // is NOT reported on these paths.
+  // Path entered through an exceptional (unwind) edge. Retain balance is
+  // required on these paths like any other (rfc/stdlib-semantics.md R2).
   bool exceptional = false;
 };
 
@@ -276,54 +298,9 @@ callTransfersGroupToOwnedResult(FuncContractCache &contracts,
   return std::nullopt;
 }
 
-bool callRetainsGroup(FuncContractCache &contracts, mlir::func::CallOp call,
-                      llvm::ArrayRef<mlir::Value> group,
-                      own::AliasAnalysis &aliases) {
-  if (group.empty())
-    return false;
-  auto cached = contracts.lookup(call.getCallee());
-  if (mlir::failed(cached) || !*cached)
-    return false;
-  for (unsigned offset : (*cached)->contract.retainArgs.values) {
-    if (offset >= call.getNumOperands())
-      continue;
-    if (aliases.same(call.getOperand(offset), group.front()))
-      return true;
-  }
-  return false;
-}
-
-// Identity merge edges lend the merge argument a token via a retain labeled
-// kBlockArgMergeBorrowLabel; the paired release targets the pre-merge name.
-bool isBlockArgMergeBorrowRetain(mlir::func::CallOp call) {
-  auto label =
-      call->getAttrOfType<mlir::StringAttr>(own::kAggregateRetainAttr);
-  return label && label.getValue() == own::kBlockArgMergeBorrowLabel;
-}
-
-bool callPartiallyConsumesGroup(FuncContractCache &contracts,
-                                mlir::func::CallOp call,
-                                llvm::ArrayRef<mlir::Value> group,
-                                own::AliasAnalysis &aliases) {
-  auto cached = contracts.lookup(call.getCallee());
-  if (mlir::failed(cached) || !*cached)
-    return false;
-  const own::FunctionContract &contract = (*cached)->contract;
-
-  auto consumesTrackedHeaderAt = [&](unsigned index) {
-    return !group.empty() && index < call.getNumOperands() &&
-           aliases.same(call.getOperand(index), group.front());
-  };
-  for (unsigned offset : contract.releaseArgs.values)
-    if (consumesTrackedHeaderAt(offset) &&
-        !own::groupMatchesValues(call.getOperands(), offset, group, aliases))
-      return true;
-  for (unsigned offset : contract.transferArgs.values)
-    if (consumesTrackedHeaderAt(offset) &&
-        !own::groupMatchesValues(call.getOperands(), offset, group, aliases))
-      return true;
-  return false;
-}
+using own::callPartiallyConsumesGroup;
+using own::callRetainsGroup;
+using own::isBlockArgMergeBorrowRetain;
 
 bool returnConsumesGroup(FuncContractCache &contracts,
                          mlir::func::FuncOp function, mlir::func::ReturnOp ret,
@@ -1113,7 +1090,7 @@ mlir::LogicalResult handleBorrowedGenericRegionReturn(
 mlir::LogicalResult verifyBorrowedEntryOnCFGPaths(
     FuncContractCache &contracts, BorrowedEntryResource &resource,
     llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
-    own::AliasAnalysis &aliases, const ExceptionEdgeMap &exceptionEdges) {
+    own::AliasAnalysis &aliases, const ExceptionHandlerMap &handlerEntries) {
   llvm::SmallVector<BorrowedPathState, 16> worklist;
   llvm::SmallVector<BorrowedPathState, 32> visited;
   mlir::Block &entry = resource.function.front();
@@ -1152,29 +1129,30 @@ mlir::LogicalResult verifyBorrowedEntryOnCFGPaths(
                       "transferred";
           break;
         }
-        if (state.retained != 0) {
-          if (state.exceptional)
-            break; // unwinding performs no cleanup yet: leak accepted
+        if (state.retained != 0)
           return ret.emitError()
                  << "borrowed entry argument " << resource.logicalIndex
                  << " of @" << resource.function.getSymName()
                  << " reaches function exit with " << state.retained
                  << " retained ownership token(s)";
-        }
         break;
       }
 
       if (auto call = mlir::dyn_cast<mlir::func::CallOp>(op)) {
         if (call.getCallee() == "LyEH_TryCallSiteMarker") {
-          if (auto found = exceptionEdges.find(op->getBlock());
-              found != exceptionEdges.end())
-            for (mlir::Block *handler : found->second) {
-              BorrowedPathState next = state;
-              next.block = handler;
-              next.start = firstOperation(handler);
-              next.exceptional = true;
-              worklist.push_back(std::move(next));
-            }
+          if (mlir::Block *handler = markerHandlerEntry(handlerEntries, call)) {
+            BorrowedPathState next = state;
+            // The unwind transfer happens DURING the guarded call: its
+            // consume effect applies on the exceptional edge.
+            if (mlir::func::CallOp guarded = own::guardedCallAfterMarker(op))
+              if (callConsumesGroup(contracts, guarded, next.group, aliases) &&
+                  next.retained > 0)
+                --next.retained;
+            next.block = handler;
+            next.start = firstOperation(handler);
+            next.exceptional = true;
+            worklist.push_back(std::move(next));
+          }
           op = op->getNextNode();
           continue;
         }
@@ -1216,6 +1194,15 @@ mlir::LogicalResult verifyBorrowedEntryOnCFGPaths(
                    << " of @" << resource.function.getSymName()
                    << " retain balance exceeded " << kMaxRetainedBalance;
           ++state.retained;
+        }
+
+        auto raiseCandidate = contracts.lookup(call.getCallee());
+        if (mlir::succeeded(raiseCandidate) && *raiseCandidate &&
+            own::isRaisePrimitiveFunction((*raiseCandidate)->function)) {
+          // A raise primitive never returns; the syntactic continuation is
+          // dead code, so walking it would verify a path that cannot run.
+          op = nullptr;
+          break;
         }
       }
 
@@ -1271,9 +1258,17 @@ mlir::LogicalResult verifyBorrowedEntryOnCFGPaths(
       continue;
     }
 
+    // Mirror the runtime unwind state on the anchor's virtual true edge
+    // (see the affine walk above).
+    mlir::func::CallOp anchorGuarded = own::anchorTrueEdgeGuardedCall(op);
+    bool anchorEdgeConsumes =
+        anchorGuarded &&
+        callConsumesGroup(contracts, anchorGuarded, state.group, aliases);
     for (unsigned index = 0; index < successors; ++index) {
       mlir::Block *successor = op->getSuccessor(index);
       BorrowedPathState next = state;
+      if (anchorEdgeConsumes && index == 0 && next.retained > 0)
+        --next.retained;
       next.block = successor;
       next.start = firstOperation(successor);
       llvm::SmallVector<bool, 4> mappedMask;
@@ -1308,7 +1303,7 @@ verifyResourceOnCFGPaths(FuncContractCache &contracts,
                          TrackedResource &resource,
                          llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
                          own::AliasAnalysis &aliases,
-                         const ExceptionEdgeMap &exceptionEdges) {
+                         const ExceptionHandlerMap &handlerEntries) {
   llvm::SmallVector<AffinePathState, 16> worklist;
   llvm::SmallVector<AffinePathState, 32> visited;
   AffineTokenState initialToken = resource.condition
@@ -1340,8 +1335,6 @@ verifyResourceOnCFGPaths(FuncContractCache &contracts,
       if (state.token == AffineTokenState::Released)
         continue;
       if (state.token == AffineTokenState::Owned) {
-        if (state.exceptional)
-          continue;
         return state.start->emitError()
                << "owned resource from " << resource.producerLabel << " result "
                << resource.resultOffset
@@ -1362,8 +1355,6 @@ verifyResourceOnCFGPaths(FuncContractCache &contracts,
                                             deallocators, aliases);
         bool uses = groupContainsOperand(op, state.group, aliases);
         if (state.token == AffineTokenState::Owned) {
-          if (state.exceptional)
-            break; // unwinding performs no cleanup yet: leak accepted
           if (!consumes)
             return ret.emitError()
                    << "owned resource from " << resource.producerLabel
@@ -1454,17 +1445,27 @@ verifyResourceOnCFGPaths(FuncContractCache &contracts,
 
       if (auto call = mlir::dyn_cast<mlir::func::CallOp>(op)) {
         if (call.getCallee() == "LyEH_TryCallSiteMarker") {
-          // Exceptional edge: the marked call site may unwind to its
-          // handler entry with the token state AS OF THIS POINT.
-          if (auto found = exceptionEdges.find(op->getBlock());
-              found != exceptionEdges.end())
-            for (mlir::Block *handler : found->second) {
-              AffinePathState next = state;
-              next.block = handler;
-              next.start = firstOperation(handler);
-              next.exceptional = true;
-              worklist.push_back(std::move(next));
+          // Exceptional edge: the marked call site may unwind to ITS
+          // handler entry with the token state as of this point, except
+          // that the unwind happens DURING the guarded call -- consume
+          // effects of the guarded call apply on the edge, and its results
+          // never materialize (a transfer is a plain release here).
+          if (mlir::Block *handler = markerHandlerEntry(handlerEntries, call)) {
+            AffinePathState next = state;
+            if (mlir::func::CallOp guarded = own::guardedCallAfterMarker(op)) {
+              if (callConsumesGroup(contracts, guarded, next.group, aliases)) {
+                if (next.token == AffineTokenState::Owned ||
+                    next.token == AffineTokenState::Conditional)
+                  next.token = AffineTokenState::Released;
+                else if (next.retained > 0)
+                  --next.retained;
+              }
             }
+            next.block = handler;
+            next.start = firstOperation(handler);
+            next.exceptional = true;
+            worklist.push_back(std::move(next));
+          }
           op = op->getNextNode();
           continue;
         }
@@ -1536,6 +1537,27 @@ verifyResourceOnCFGPaths(FuncContractCache &contracts,
           else
             ++state.retained;
         }
+        auto raiseCandidate = contracts.lookup(call.getCallee());
+        if (mlir::succeeded(raiseCandidate) && *raiseCandidate &&
+            own::isRaisePrimitiveFunction((*raiseCandidate)->function)) {
+          // An unguarded raise primitive (no preceding call-site marker
+          // wiring it to an in-function handler) unwinds OUT of the
+          // function: a token still owned here escapes with no path left to
+          // release it. A guarded raise reaches its handler through the
+          // marker edge enqueued above.
+          if (state.token == AffineTokenState::Owned &&
+              !own::precedingTryCallSiteMarker(call))
+            return call.emitError()
+                   << "owned resource from " << resource.producerLabel
+                   << " result " << resource.resultOffset
+                   << " is still owned when '" << call.getCallee()
+                   << "' unwinds out of the function; the exception path "
+                      "must release, transfer, or return it";
+          // A raise primitive never returns; the syntactic continuation is
+          // dead code, so walking it would verify a path that cannot run.
+          op = nullptr;
+          break;
+        }
       } else if (state.token == AffineTokenState::Released &&
                  groupContainsOperand(op, state.group, aliases) &&
                  state.retained == 0) {
@@ -1588,7 +1610,7 @@ verifyResourceOnCFGPaths(FuncContractCache &contracts,
 
     unsigned successors = op->getNumSuccessors();
     if (successors == 0) {
-      if (state.token == AffineTokenState::Owned && !state.exceptional)
+      if (state.token == AffineTokenState::Owned)
         return op->emitError()
                << "owned resource from " << resource.producerLabel << " result "
                << resource.resultOffset
@@ -1603,14 +1625,30 @@ verifyResourceOnCFGPaths(FuncContractCache &contracts,
       continue;
     }
 
+    // An anchor cond_br's true edge is the virtual spelling of "the guarded
+    // call unwound": apply the guarded call's consume effect there so the
+    // virtual path carries the same token state the runtime unwind does.
+    mlir::func::CallOp anchorGuarded = own::anchorTrueEdgeGuardedCall(op);
+    bool anchorEdgeConsumes =
+        anchorGuarded &&
+        callConsumesGroup(contracts, anchorGuarded, state.group, aliases);
     for (unsigned index = 0; index < successors; ++index) {
       mlir::Block *successor = op->getSuccessor(index);
+      AffineTokenState nextToken = state.token;
+      unsigned nextRetained = state.retained;
+      if (anchorEdgeConsumes && index == 0) {
+        if (nextToken == AffineTokenState::Owned ||
+            nextToken == AffineTokenState::Conditional)
+          nextToken = AffineTokenState::Released;
+        else if (nextRetained > 0)
+          --nextRetained;
+      }
       llvm::SmallVector<bool, 4> mappedMask;
       llvm::SmallVector<mlir::Value, 4> mappedGroup = remapGroupForSuccessor(
           op, index, successor, state.group, aliases, &mappedMask);
       bool fullyMapped =
           llvm::all_of(mappedMask, [](bool mapped) { return mapped; });
-      if (!fullyMapped && state.token == AffineTokenState::Released &&
+      if (!fullyMapped && nextToken == AffineTokenState::Released &&
           groupContainsArgumentFromBlock(state.group, successor))
         continue;
       // Entering the successor redefines its block arguments: stale/previous
@@ -1636,7 +1674,7 @@ verifyResourceOnCFGPaths(FuncContractCache &contracts,
         for (mlir::Value value : state.group)
           keepPreviousName(value);
       worklist.push_back(AffinePathState{successor, firstOperation(successor),
-                                         state.token, state.retained,
+                                         nextToken, nextRetained,
                                          std::move(mappedGroup),
                                          std::move(mappedStale),
                                          std::move(mappedPrevious),
@@ -1727,19 +1765,19 @@ mlir::LogicalResult verifyFunctionAffineOwnership(
       return mlir::success();
   }
 
-  ExceptionEdgeMap exceptionEdges =
+  ExceptionHandlerMap handlerEntries =
       function.isDeclaration()
-          ? ExceptionEdgeMap()
-          : own::collectExceptionEdges(function.getBody());
+          ? ExceptionHandlerMap()
+          : own::collectExceptionHandlerEntries(function.getBody());
 
   for (TrackedResource &resource : resources)
     if (mlir::failed(verifyResourceOnCFGPaths(contracts, resource, deallocators,
-                                              aliases, exceptionEdges)))
+                                              aliases, handlerEntries)))
       return mlir::failure();
 
   for (BorrowedEntryResource &resource : borrowedEntryResources)
     if (mlir::failed(verifyBorrowedEntryOnCFGPaths(
-            contracts, resource, deallocators, aliases, exceptionEdges)))
+            contracts, resource, deallocators, aliases, handlerEntries)))
       return mlir::failure();
 
   return mlir::success();

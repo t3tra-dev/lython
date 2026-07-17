@@ -88,6 +88,20 @@ LogicalResult runLoweringPhase(llvm::StringRef name, ModuleOp module,
   return success();
 }
 
+// Canonicalization for phases where the lowered EH skeleton exists (runtime
+// lowering onward). Not the plain createCanonicalizerPass(): its default
+// AGGRESSIVE region simplification merges structurally identical blocks by
+// promoting differing operands to block arguments, and a merged pair of
+// exception-handler entries carries its `LyEH_TryCatchMarker` id as a block
+// argument. The final EH phase can only wire invokes to handlers with
+// CONSTANT marker ids, and it erases the anchor edges that fed the merged
+// block's arguments, so the merge leaves unwirable, phi-broken handlers.
+std::unique_ptr<Pass> createEHSafeCanonicalizerPass() {
+  GreedyRewriteConfig config;
+  config.setRegionSimplificationLevel(GreedySimplifyRegionLevel::Normal);
+  return mlir::createCanonicalizerPass(config);
+}
+
 LogicalResult requireNoAsyncDialectOps(ModuleOp module) {
   LogicalResult result = success();
   module.walk([&](Operation *op) {
@@ -257,7 +271,7 @@ LogicalResult runLoweringPipeline(ModuleOp module,
   // Phase 11: lower Lython-owned async thunks before symbol cleanup.
   if (failed(runPhase("async-thunk-lowering", [&](PassManager &pm) {
         pm.addPass(createAsyncThunkLoweringPass());
-        pm.addPass(mlir::createCanonicalizerPass());
+        pm.addPass(createEHSafeCanonicalizerPass());
         pm.addPass(mlir::createCSEPass());
       })))
     return failure();
@@ -269,7 +283,7 @@ LogicalResult runLoweringPipeline(ModuleOp module,
   // DCE runs AFTER the ownership verifiers (phase 13): manifest contract
   // witnesses (e.g. ly.runtime.shape declarations) must outlive verification.
   if (failed(runPhase("post-lowering-cleanup", [&](PassManager &pm) {
-        pm.addPass(mlir::createCanonicalizerPass());
+        pm.addPass(createEHSafeCanonicalizerPass());
         pm.addPass(mlir::createCSEPass());
       })))
     return failure();
@@ -323,7 +337,7 @@ LogicalResult runLoweringPipeline(ModuleOp module,
                   mlir::vector::VectorMultiReductionLowering::InnerReduction));
           pm.addPass(mlir::createConvertVectorToSCFPass(transferOptions));
           pm.addPass(mlir::createLowerAffinePass());
-          pm.addPass(mlir::createCanonicalizerPass());
+          pm.addPass(createEHSafeCanonicalizerPass());
           pm.addPass(mlir::createConvertVectorToLLVMPass(vectorOptions));
           pm.addPass(mlir::createSCFToControlFlowPass());
           if (tensorTarget.usesArmSME())
@@ -335,7 +349,7 @@ LogicalResult runLoweringPipeline(ModuleOp module,
           pm.addPass(mlir::createReconcileUnrealizedCastsPass());
           pm.addNestedPass<mlir::func::FuncOp>(
               mlir::createReconcileUnrealizedCastsPass());
-          pm.addPass(mlir::createCanonicalizerPass());
+          pm.addPass(createEHSafeCanonicalizerPass());
         })))
       return failure();
     if (options.enableVerifiers) {
