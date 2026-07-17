@@ -7730,8 +7730,8 @@ module attributes {
 
   ^float_path:
     %fv:2 = func.call @__ly_long_view_as_f64_checked(%meta, %digits) : (memref<2xi64>, memref<?xi32>) -> (f64, i1)
-    %bad = arith.xori %fv#1, %true_i : i1
-    scf.if %bad {
+    // fv#1 is the overflow flag (true = |value| too large for a double).
+    scf.if %fv#1 {
       func.call @__ly_long_raise_too_large_for_float() : () -> ()
     }
     %fh, %fb2 = func.call @__ly_float_format_core(%fv#0, %spec, %tname, %tname_len) : (f64, memref<?xi64>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)

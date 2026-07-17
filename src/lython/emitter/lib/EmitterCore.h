@@ -207,6 +207,19 @@ private:
   Value emitFormatValue(const parser::Node &anchor, Value value,
                         std::optional<Value> spec, bool specKnownEmpty);
   Value emitEmptyStrConstant(const parser::Node &anchor);
+  Value emitStrLiteralPiece(const parser::Node &anchor, llvm::StringRef text);
+  // str.format with a compile-time template: fields are matched against the
+  // call arguments during emission (R4: literal templates are checked here).
+  std::optional<Value> tryEmitStrFormatCall(const parser::Node &expr,
+                                            const parser::Node *calleeNode);
+  // printf-style % formatting on a str left operand.
+  Value emitPercentFormat(const parser::Node &expr);
+  // Attribute/index accessors inside str.format replacement fields
+  // ({0.attr} / {0[i]}), applied to an already-emitted value.
+  std::optional<Value> emitValueAttribute(const parser::Node &anchor,
+                                          Value object, llvm::StringRef attr);
+  std::optional<Value> emitValueIndex(const parser::Node &anchor, Value object,
+                                      llvm::StringRef indexText);
   std::optional<Value> rejectStubSourceCall(const parser::Node &expr,
                                             llvm::StringRef symbol,
                                             bool instantiation);

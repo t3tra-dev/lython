@@ -296,6 +296,9 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     }
   }
 
+  if (std::optional<Value> v = tryEmitStrFormatCall(expr, calleeNode))
+    return *v;
+
   if (calleeNode && calleeNode->kind == "Attribute") {
     if (const parser::Node *receiverNode = ast::node(*calleeNode, "value")) {
       if (auto methodName = ast::string(*calleeNode, "attr")) {
@@ -1523,6 +1526,625 @@ Value ModuleEmitter::emitJoinedStr(const parser::Node &expr) {
   if (!accumulated)
     return emitEmptyStrConstant(expr);
   return *accumulated;
+}
+
+Value ModuleEmitter::emitStrLiteralPiece(const parser::Node &anchor,
+                                         llvm::StringRef text) {
+  mlir::Type literalType = types.literal("\"" + text.str() + "\"");
+  auto op = py::StrConstantOp::create(builder, loc(anchor), literalType,
+                                      builder.getStringAttr(text));
+  return coerceValue(Value{op.getResult(), literalType},
+                     types.contract("builtins.str"), anchor);
+}
+
+std::optional<Value>
+ModuleEmitter::emitValueAttribute(const parser::Node &anchor, Value object,
+                                  llvm::StringRef attr) {
+  std::optional<mlir::Type> field = lookupClassField(object.type, attr);
+  if (!field)
+    return std::nullopt;
+  auto op = py::AttrGetOp::create(builder, loc(anchor), *field, object.value,
+                                  attr);
+  op->setAttr("ly.attr.kind", builder.getStringAttr("field"));
+  if (auto contract =
+          mlir::dyn_cast_if_present<py::ContractType>(object.type))
+    op->setAttr("ly.attr.owner",
+                builder.getStringAttr(contract.getContractName()));
+  return Value{op.getResult(), *field};
+}
+
+std::optional<Value> ModuleEmitter::emitValueIndex(const parser::Node &anchor,
+                                                   Value object,
+                                                   llvm::StringRef indexText) {
+  bool numeric = !indexText.empty() &&
+                 llvm::all_of(indexText, [](char c) { return c >= '0' && c <= '9'; });
+  Value index;
+  if (numeric) {
+    mlir::Type literalType = types.literal(indexText.str());
+    auto op = py::IntConstantOp::create(builder, loc(anchor), literalType,
+                                        builder.getStringAttr(indexText));
+    index = Value{op.getResult(), literalType};
+  } else {
+    index = emitStrLiteralPiece(anchor, indexText);
+  }
+  mlir::Type containerType = types.widenLiteral(object.type);
+  CallInferenceResult inference = types.inferMethodCallWithEvidence(
+      containerType, "__getitem__", {types.widenLiteral(index.type)});
+  if (!inference)
+    return std::nullopt;
+  Value receiver = coerceValue(object, containerType, anchor);
+  auto op = py::GetItemOp::create(
+      builder, loc(anchor), inference.resultType,
+      mlir::FlatSymbolRefAttr::get(&context, "__getitem__"),
+      callProtocolFor(inference), receiver.value, index.value);
+  return Value{op.getResult(), inference.resultType};
+}
+
+namespace {
+// One replacement field of a compile-time template: {name.path[i]!c:spec}.
+struct TemplateField {
+  std::string name;
+  // Accessor chain after the name: (true, "attr") or (false, "index").
+  llvm::SmallVector<std::pair<bool, std::string>, 2> path;
+  int conversion = -1;
+  std::string spec;
+  bool hasSpec = false;
+};
+
+// Splits `text` into literal chunks (first) and fields (second non-null).
+// Returns false on a malformed template.
+bool parseFormatTemplate(
+    llvm::StringRef text,
+    llvm::SmallVectorImpl<std::pair<std::string, std::optional<TemplateField>>>
+        &out,
+    std::string &error) {
+  std::string literal;
+  size_t i = 0, n = text.size();
+  auto flushLiteral = [&]() {
+    if (!literal.empty()) {
+      out.push_back({literal, std::nullopt});
+      literal.clear();
+    }
+  };
+  while (i < n) {
+    char c = text[i];
+    if (c == '{') {
+      if (i + 1 < n && text[i + 1] == '{') {
+        literal += '{';
+        i += 2;
+        continue;
+      }
+      // replacement field
+      size_t j = i + 1;
+      int depth = 1;
+      size_t colon = std::string::npos, bang = std::string::npos;
+      while (j < n && depth > 0) {
+        char d = text[j];
+        if (d == '{')
+          ++depth;
+        else if (d == '}')
+          --depth;
+        else if (d == ':' && depth == 1 && colon == std::string::npos)
+          colon = j;
+        else if (d == '!' && depth == 1 && colon == std::string::npos &&
+                 bang == std::string::npos && j + 1 < n && text[j + 1] != '=' &&
+                 text[j + 1] != '}')
+          bang = j;
+        if (depth > 0)
+          ++j;
+      }
+      if (depth != 0) {
+        error = "Single '{' encountered in format string";
+        return false;
+      }
+      size_t end = j; // position of matching '}'
+      TemplateField field;
+      size_t nameEnd = bang != std::string::npos    ? bang
+                       : colon != std::string::npos ? colon
+                                                    : end;
+      std::string nameText = text.substr(i + 1, nameEnd - i - 1).str();
+      // split accessors
+      size_t p = 0;
+      while (p < nameText.size() && nameText[p] != '.' && nameText[p] != '[')
+        ++p;
+      field.name = nameText.substr(0, p);
+      while (p < nameText.size()) {
+        if (nameText[p] == '.') {
+          size_t q = p + 1;
+          while (q < nameText.size() && nameText[q] != '.' &&
+                 nameText[q] != '[')
+            ++q;
+          field.path.push_back({true, nameText.substr(p + 1, q - p - 1)});
+          p = q;
+        } else if (nameText[p] == '[') {
+          size_t q = nameText.find(']', p + 1);
+          if (q == std::string::npos) {
+            error = "Missing ']' in format string";
+            return false;
+          }
+          field.path.push_back({false, nameText.substr(p + 1, q - p - 1)});
+          p = q + 1;
+        } else {
+          error = "invalid replacement field name";
+          return false;
+        }
+      }
+      if (bang != std::string::npos) {
+        size_t convEnd = colon != std::string::npos ? colon : end;
+        if (convEnd != bang + 2) {
+          error = "invalid conversion specifier";
+          return false;
+        }
+        char conv = text[bang + 1];
+        if (conv != 'r' && conv != 's' && conv != 'a') {
+          error = std::string("invalid conversion character '") + conv +
+                  "'; expected 's', 'r', or 'a'";
+          return false;
+        }
+        field.conversion = conv;
+      }
+      if (colon != std::string::npos) {
+        field.hasSpec = true;
+        field.spec = text.substr(colon + 1, end - colon - 1).str();
+      }
+      flushLiteral();
+      out.push_back({std::string(), field});
+      i = end + 1;
+      continue;
+    }
+    if (c == '}') {
+      if (i + 1 < n && text[i + 1] == '}') {
+        literal += '}';
+        i += 2;
+        continue;
+      }
+      error = "Single '}' encountered in format string";
+      return false;
+    }
+    literal += c;
+    ++i;
+  }
+  flushLiteral();
+  return true;
+}
+} // namespace
+
+std::optional<Value>
+ModuleEmitter::tryEmitStrFormatCall(const parser::Node &expr,
+                                    const parser::Node *calleeNode) {
+  if (!calleeNode || calleeNode->kind != "Attribute")
+    return std::nullopt;
+  auto methodName = ast::string(*calleeNode, "attr");
+  if (!methodName || *methodName != "format")
+    return std::nullopt;
+  const parser::Node *receiverNode = ast::node(*calleeNode, "value");
+  if (!receiverNode)
+    return std::nullopt;
+  mlir::Type strType = types.contract("builtins.str");
+  if (types.widenLiteral(types.inferExpr(receiverNode)) != strType)
+    return std::nullopt;
+
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  auto diag = [&](std::string message) -> std::optional<Value> {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start, std::move(message)});
+    return emitNone(expr);
+  };
+  if (args)
+    for (const parser::NodePtr &argument : *args)
+      if (argument && argument->kind == "Starred")
+        return diag("str.format does not support * unpacking (pass the "
+                    "arguments explicitly)");
+
+  std::optional<std::string> tpl;
+  if (receiverNode->kind == "Constant")
+    if (auto text = ast::string(*receiverNode, "value"))
+      tpl = std::string(*text);
+  if (!tpl)
+    return diag(
+        "str.format requires a compile-time template string here (runtime "
+        "templates are limited to the statically-typed forms, which are not "
+        "implemented for this call shape yet)");
+
+  llvm::SmallVector<std::pair<std::string, std::optional<TemplateField>>, 8>
+      parts;
+  std::string parseError;
+  if (!parseFormatTemplate(*tpl, parts, parseError))
+    return diag(parseError);
+
+  // Evaluate every argument once, in source order (CPython evaluates the
+  // arguments before formatting; repeated field references reuse values).
+  llvm::SmallVector<Value, 4> positional;
+  llvm::StringMap<Value> named;
+  if (args)
+    for (const parser::NodePtr &argument : *args)
+      positional.push_back(emitExpr(argument.get()));
+  if (keywords)
+    for (const parser::NodePtr &keyword : *keywords) {
+      if (!keyword)
+        continue;
+      auto name = ast::string(*keyword, "arg");
+      const parser::Node *valueNode = ast::node(*keyword, "value");
+      if (!name || !valueNode)
+        return diag("str.format does not support ** unpacking");
+      named[*name] = emitExpr(valueNode);
+    }
+
+  int autoIndex = 0;
+  bool sawManual = false, sawAuto = false;
+  auto resolveField = [&](const TemplateField &field)
+      -> std::optional<Value> {
+    Value base;
+    if (field.name.empty()) {
+      if (sawManual) {
+        diag("cannot switch from manual field specification to automatic "
+             "field numbering");
+        return std::nullopt;
+      }
+      sawAuto = true;
+      if (autoIndex >= static_cast<int>(positional.size())) {
+        diag("Replacement index " + std::to_string(autoIndex) +
+             " out of range for positional args tuple");
+        return std::nullopt;
+      }
+      base = positional[autoIndex++];
+    } else if (llvm::all_of(field.name,
+                            [](char c) { return c >= '0' && c <= '9'; })) {
+      if (sawAuto) {
+        diag("cannot switch from automatic field numbering to manual field "
+             "specification");
+        return std::nullopt;
+      }
+      sawManual = true;
+      unsigned index = 0;
+      (void)llvm::StringRef(field.name).getAsInteger(10, index);
+      if (index >= positional.size()) {
+        diag("Replacement index " + field.name +
+             " out of range for positional args tuple");
+        return std::nullopt;
+      }
+      base = positional[index];
+    } else {
+      auto hit = named.find(field.name);
+      if (hit == named.end()) {
+        diag("str.format has no keyword argument '" + field.name + "'");
+        return std::nullopt;
+      }
+      base = hit->second;
+    }
+    for (const auto &accessor : field.path) {
+      std::optional<Value> next =
+          accessor.first ? emitValueAttribute(expr, base, accessor.second)
+                         : emitValueIndex(expr, base, accessor.second);
+      if (!next) {
+        diag("cannot statically resolve accessor '" +
+             std::string(accessor.first ? "." : "[") + accessor.second +
+             std::string(accessor.first ? "" : "]") +
+             "' in str.format replacement field");
+        return std::nullopt;
+      }
+      base = *next;
+    }
+    return base;
+  };
+
+  // A spec may itself contain replacement fields ({0:>{1}}); they resolve
+  // against the same argument list and auto-numbering sequence.
+  auto emitSpecValue = [&](const TemplateField &field)
+      -> std::optional<std::pair<std::optional<Value>, bool>> {
+    if (!field.hasSpec)
+      return std::make_pair(std::optional<Value>(), false);
+    if (field.spec.find('{') == std::string::npos) {
+      if (field.spec.empty())
+        return std::make_pair(std::optional<Value>(), true);
+      return std::make_pair(
+          std::optional<Value>(emitStrLiteralPiece(expr, field.spec)), false);
+    }
+    llvm::SmallVector<std::pair<std::string, std::optional<TemplateField>>, 4>
+        specParts;
+    std::string specError;
+    if (!parseFormatTemplate(field.spec, specParts, specError)) {
+      diag(specError);
+      return std::nullopt;
+    }
+    std::optional<Value> acc;
+    auto append = [&](Value piece) {
+      Value coerced = coerceValue(piece, strType, expr);
+      if (!acc) {
+        acc = coerced;
+        return;
+      }
+      acc = emitBinarySpecial<py::AddOp>(expr, "__add__", *acc, coerced,
+                                         strType);
+    };
+    for (const auto &part : specParts) {
+      if (!part.second) {
+        append(emitStrLiteralPiece(expr, part.first));
+        continue;
+      }
+      if (part.second->hasSpec || part.second->conversion != -1) {
+        diag("nested replacement fields in a format spec cannot themselves "
+             "carry conversions or specs");
+        return std::nullopt;
+      }
+      std::optional<Value> nested = resolveField(*part.second);
+      if (!nested)
+        return std::nullopt;
+      std::optional<Value> text = emitStringifyValue(expr, *nested);
+      if (!text) {
+        diag("nested format-spec field is not statically stringifiable");
+        return std::nullopt;
+      }
+      append(*text);
+    }
+    if (!acc)
+      return std::make_pair(std::optional<Value>(), true);
+    return std::make_pair(acc, false);
+  };
+
+  std::optional<Value> result;
+  auto appendResult = [&](Value piece) {
+    Value coerced = coerceValue(piece, strType, expr);
+    if (!result) {
+      result = coerced;
+      return;
+    }
+    result = emitBinarySpecial<py::AddOp>(expr, "__add__", *result, coerced,
+                                          strType);
+  };
+  for (const auto &part : parts) {
+    if (!part.second) {
+      appendResult(emitStrLiteralPiece(expr, part.first));
+      continue;
+    }
+    std::optional<Value> subject = resolveField(*part.second);
+    if (!subject)
+      return emitNone(expr);
+    if (part.second->conversion != -1) {
+      std::optional<Value> converted =
+          emitConversionValue(expr, *subject, part.second->conversion);
+      if (!converted)
+        return diag("str.format conversion is not statically resolvable for "
+                    "this operand type");
+      subject = converted;
+    }
+    auto spec = emitSpecValue(*part.second);
+    if (!spec)
+      return emitNone(expr);
+    appendResult(emitFormatValue(expr, *subject, spec->first, spec->second));
+  }
+  if (!result)
+    return emitEmptyStrConstant(expr);
+  return *result;
+}
+
+Value ModuleEmitter::emitPercentFormat(const parser::Node &expr) {
+  mlir::Type strType = types.contract("builtins.str");
+  const parser::Node *leftNode = ast::node(expr, "left");
+  const parser::Node *rightNode = ast::node(expr, "right");
+  auto diag = [&](std::string message) -> Value {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start, std::move(message)});
+    return emitNone(expr);
+  };
+  std::optional<std::string> tpl;
+  if (leftNode && leftNode->kind == "Constant")
+    if (auto text = ast::string(*leftNode, "value"))
+      tpl = std::string(*text);
+  if (!tpl)
+    return diag("%-formatting requires a compile-time format string here "
+                "(runtime templates are limited to statically-typed forms, "
+                "which are not implemented for this call shape yet)");
+
+  // Argument list: a tuple literal supplies its elements, anything else is
+  // the single argument. Values are emitted once, in order.
+  llvm::SmallVector<Value, 4> arguments;
+  if (rightNode && rightNode->kind == "Tuple") {
+    if (const auto *elements = ast::nodeList(*rightNode, "elts"))
+      for (const parser::NodePtr &element : *elements) {
+        if (element && element->kind == "Starred")
+          return diag("%-formatting does not support * unpacking");
+        arguments.push_back(emitExpr(element.get()));
+      }
+  } else if (rightNode) {
+    arguments.push_back(emitExpr(rightNode));
+  }
+
+  std::optional<Value> result;
+  auto appendResult = [&](Value piece) {
+    Value coerced = coerceValue(piece, strType, expr);
+    if (!result) {
+      result = coerced;
+      return;
+    }
+    result = emitBinarySpecial<py::AddOp>(expr, "__add__", *result, coerced,
+                                          strType);
+  };
+
+  const std::string &text = *tpl;
+  std::string literal;
+  size_t i = 0, n = text.size(), argIndex = 0;
+  auto flushLiteral = [&]() {
+    if (!literal.empty()) {
+      appendResult(emitStrLiteralPiece(expr, literal));
+      literal.clear();
+    }
+  };
+  auto nextArgument = [&](char type) -> std::optional<Value> {
+    if (argIndex >= arguments.size()) {
+      diag("not enough arguments for format string");
+      return std::nullopt;
+    }
+    (void)type;
+    return arguments[argIndex++];
+  };
+  while (i < n) {
+    char c = text[i];
+    if (c != '%') {
+      literal += c;
+      ++i;
+      continue;
+    }
+    if (i + 1 < n && text[i + 1] == '%') {
+      literal += '%';
+      i += 2;
+      continue;
+    }
+    size_t j = i + 1;
+    if (j < n && text[j] == '(')
+      return diag("%-formatting with a mapping key ('%(name)s') needs a dict "
+                  "argument, which is not statically supported; use "
+                  "str.format or an f-string");
+    std::string flags;
+    while (j < n && (text[j] == '#' || text[j] == '0' || text[j] == '-' ||
+                     text[j] == ' ' || text[j] == '+'))
+      flags += text[j++];
+    if (j < n && text[j] == '*')
+      return diag("%-formatting with '*' width is not supported; interpolate "
+                  "the width into the format string instead");
+    std::string width;
+    while (j < n && text[j] >= '0' && text[j] <= '9')
+      width += text[j++];
+    std::string precision;
+    bool hasPrecision = false;
+    if (j < n && text[j] == '.') {
+      hasPrecision = true;
+      ++j;
+      if (j < n && text[j] == '*')
+        return diag("%-formatting with '*' precision is not supported; "
+                    "interpolate the precision into the format string "
+                    "instead");
+      while (j < n && text[j] >= '0' && text[j] <= '9')
+        precision += text[j++];
+      if (precision.empty())
+        precision = "0";
+    }
+    while (j < n && (text[j] == 'h' || text[j] == 'l' || text[j] == 'L'))
+      ++j; // length modifiers are accepted and ignored, like CPython
+    if (j >= n)
+      return diag("incomplete format specifier at end of format string");
+    char type = text[j];
+    ++j;
+
+    bool minus = flags.find('-') != std::string::npos;
+    bool zero = flags.find('0') != std::string::npos && !minus;
+    bool alt = flags.find('#') != std::string::npos;
+    char sign = flags.find('+') != std::string::npos    ? '+'
+                : flags.find(' ') != std::string::npos ? ' '
+                                                       : '\0';
+    auto numericSpec = [&](char specType, bool wantPrecision) {
+      std::string spec;
+      if (minus)
+        spec += '<';
+      if (sign)
+        spec += sign;
+      if (alt && (specType == 'o' || specType == 'x' || specType == 'X' ||
+                  specType == 'e' || specType == 'E' || specType == 'f' ||
+                  specType == 'F' || specType == 'g' || specType == 'G'))
+        spec += '#';
+      if (zero)
+        spec += '0';
+      spec += width;
+      if (wantPrecision && hasPrecision)
+        spec += "." + precision;
+      spec += specType;
+      return spec;
+    };
+
+    flushLiteral();
+    switch (type) {
+    case 'd':
+    case 'i':
+    case 'u': {
+      if (hasPrecision)
+        return diag("%-formatting precision on integer conversions is not "
+                    "supported; use zero padding ('%0Nd') instead");
+      std::optional<Value> argument = nextArgument(type);
+      if (!argument)
+        return emitNone(expr);
+      // Always pass the 'd' spec: with an empty spec a bool would render
+      // through str() as True/False, but %d must print 1/0.
+      std::string spec = numericSpec('d', false);
+      appendResult(emitFormatValue(
+          expr, *argument,
+          std::optional<Value>(emitStrLiteralPiece(expr, spec)), false));
+      break;
+    }
+    case 'o':
+    case 'x':
+    case 'X':
+    case 'e':
+    case 'E':
+    case 'f':
+    case 'F':
+    case 'g':
+    case 'G': {
+      std::optional<Value> argument = nextArgument(type);
+      if (!argument)
+        return emitNone(expr);
+      bool isFloatType = type == 'e' || type == 'E' || type == 'f' ||
+                         type == 'F' || type == 'g' || type == 'G';
+      std::string spec = numericSpec(type, isFloatType);
+      appendResult(emitFormatValue(
+          expr, *argument,
+          std::optional<Value>(emitStrLiteralPiece(expr, spec)), false));
+      break;
+    }
+    case 'c': {
+      std::optional<Value> argument = nextArgument(type);
+      if (!argument)
+        return emitNone(expr);
+      mlir::Type argType = types.widenLiteral(argument->type);
+      if (argType == strType) {
+        // CPython requires a length-1 str; a literal is checkable now.
+        appendResult(coerceValue(*argument, strType, expr));
+      } else {
+        std::string spec = numericSpec('c', false);
+        appendResult(emitFormatValue(
+            expr, *argument,
+            std::optional<Value>(emitStrLiteralPiece(expr, spec)), false));
+      }
+      break;
+    }
+    case 's':
+    case 'r':
+    case 'a': {
+      std::optional<Value> argument = nextArgument(type);
+      if (!argument)
+        return emitNone(expr);
+      std::optional<Value> textValue =
+          type == 's' ? emitStringifyValue(expr, *argument)
+                      : emitConversionValue(expr, *argument, type);
+      if (!textValue)
+        return diag("%-formatting conversion is not statically resolvable "
+                    "for this operand type");
+      if (width.empty() && !hasPrecision) {
+        appendResult(*textValue);
+        break;
+      }
+      std::string spec;
+      spec += minus ? '<' : '>';
+      spec += width;
+      if (hasPrecision)
+        spec += "." + precision;
+      appendResult(emitFormatValue(
+          expr, *textValue,
+          std::optional<Value>(emitStrLiteralPiece(expr, spec)), false));
+      break;
+    }
+    default:
+      return diag(std::string("unsupported format character '") + type +
+                  "' in %-format string");
+    }
+    i = j;
+  }
+  flushLiteral();
+  if (argIndex != arguments.size())
+    return diag("not all arguments converted during string formatting");
+  if (!result)
+    return emitEmptyStrConstant(expr);
+  return *result;
 }
 
 std::optional<Value>

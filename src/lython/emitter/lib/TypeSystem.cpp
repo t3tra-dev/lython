@@ -2083,6 +2083,10 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
     mlir::Type rawRight = lenientRecurse(ast::node(*node, "right"));
     mlir::Type left = widenLiteral(rawLeft);
     mlir::Type right = widenLiteral(rawRight);
+    // str % args is printf-style formatting (the emitter expands it); the
+    // result is always str regardless of the right operand.
+    if (ast::isOperator(op, "Mod") && left == strType())
+      return strType();
     llvm::StringRef method = "__add__";
     if (ast::isOperator(op, "Sub"))
       method = "__sub__";
@@ -2450,6 +2454,11 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
           mlir::Type receiver = recurse(receiverNode);
           if (strict && !receiver)
             return {};
+          // str.format is expanded by the emitter (no manifest method); its
+          // result is always str.
+          if (*methodName == "format" &&
+              widenLiteral(receiver) == strType())
+            return strType();
           CallInferenceResult inference = inferMethodCallWithEvidence(
               widenLiteral(receiver), *methodName, positional, keywords);
           if (inference)
