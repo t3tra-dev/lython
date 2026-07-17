@@ -1,1 +1,1 @@
-ValueError: integer division result too large for a float
+OverflowError: integer division result too large for a float

@@ -1,5 +1,6 @@
 #include "Runtime/Core/Lowerer.h"
 
+#include "ExceptionTaxonomy.h"
 #include "Runtime/ABI/BoxLayout.h"
 
 namespace py::lowering {
@@ -339,6 +340,40 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
     valueBundles[op.getResult()] = std::move(result);
     erase.push_back(op);
     return mlir::success();
+  }
+
+  // exception.args materializes from the message payload through the
+  // BaseException manifest primitive: builtin exceptions have no field
+  // storage to read (a 3-word header plus the message pair).
+  if (object->kind == RuntimeBundle::Kind::Object && op.getName() == "args") {
+    std::string contract = runtimeContractName(op.getObject().getType());
+    llvm::StringRef leaf = llvm::StringRef(contract).rsplit('.').second;
+    if (leaf.empty())
+      leaf = contract;
+    if (py::exceptions::findByName(leaf) &&
+        object->physicalValues().size() == 3) {
+      std::optional<RuntimeSymbol> argsPrimitive =
+          manifest.primitive("builtins.BaseException", "args");
+      if (!argsPrimitive)
+        return op.emitError()
+               << "runtime manifest has no BaseException args primitive";
+      llvm::SmallVector<const RuntimeBundle *, 1> sources{object};
+      llvm::SmallVector<mlir::Value, 4> operands;
+      builder.setInsertionPoint(op);
+      if (mlir::failed(buildRuntimeCallOperands(op, *argsPrimitive, sources,
+                                                operands,
+                                                /*allowUnusedSources=*/false)))
+        return mlir::failure();
+      mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+          op.getLoc(), *argsPrimitive, operands);
+      RuntimeBundle result;
+      if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
+              op, op.getResult().getType(), call, result)))
+        return mlir::failure();
+      valueBundles[op.getResult()] = std::move(result);
+      erase.push_back(op);
+      return mlir::success();
+    }
   }
 
   if (isMethodDescriptorKind(op) &&

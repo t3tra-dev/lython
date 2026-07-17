@@ -1,6 +1,7 @@
 #include "EmitterCore.h"
 #include "EmitterPyOps.h"
 #include "EmitterSupport.h"
+#include "ExceptionTaxonomy.h"
 #include "PlatformConstants.h"
 #include "PyProtocols.h"
 
@@ -715,9 +716,32 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
                                     methodBindingBindsReceiver(*method),
                                     *method, {}, emptyKeywords);
       }
-      // Non-str builtins render via __repr__ (CPython's str(x) equals
-      // repr(x) for every non-str builtin, containers included; the
-      // runtime manifest has no container __str__).
+      // CPython print() renders via str(). The only builtin contracts where
+      // str(x) != repr(x) are str itself (handled above) and the exception
+      // taxonomy (str is the message, repr is ClassName(...)); inference
+      // alone over-accepts __str__ for containers whose manifest only
+      // implements __repr__, so gate on the taxonomy.
+      auto isBuiltinExceptionContract = [&](mlir::Type type) {
+        auto contractType = mlir::dyn_cast<py::ContractType>(type);
+        if (!contractType)
+          return false;
+        llvm::StringRef leaf = contractType.getContractName().rsplit('.').second;
+        if (leaf.empty())
+          leaf = contractType.getContractName();
+        return py::exceptions::findByName(leaf) != nullptr;
+      };
+      if (CallInferenceResult inference =
+              isBuiltinExceptionContract(argumentType)
+                  ? types.inferMethodCallWithEvidence(argumentType, "__str__",
+                                                      {})
+                  : CallInferenceResult()) {
+        Value argument = coerceValue(emitExpr(argNode), argumentType, expr);
+        auto op = py::StrOp::create(
+            builder, loc(expr), strType,
+            mlir::FlatSymbolRefAttr::get(&context, "__str__"),
+            mlir::TypeAttr::get(callProtocolFor(inference)), argument.value);
+        return Value{op.getResult(), strType};
+      }
       if (CallInferenceResult inference =
               types.inferMethodCallWithEvidence(argumentType, "__repr__",
                                                 {})) {

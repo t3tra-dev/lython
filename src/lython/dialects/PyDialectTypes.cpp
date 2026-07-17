@@ -98,20 +98,15 @@ static llvm::StringRef contractLeafName(llvm::StringRef contract) {
   return split.second.empty() ? split.first : split.second;
 }
 
-static llvm::StringRef builtinExceptionBase(llvm::StringRef name) {
-  return py::exceptions::builtinExceptionBaseName(name);
-}
-
 static bool isBuiltinExceptionSubclassOf(llvm::StringRef subtype,
                                          llvm::StringRef supertype) {
   subtype = contractLeafName(subtype);
   supertype = contractLeafName(supertype);
-  for (unsigned depth = 0; depth < 8 && !subtype.empty(); ++depth) {
-    if (subtype == supertype)
-      return true;
-    subtype = builtinExceptionBase(subtype);
-  }
-  return false;
+  if (subtype == supertype)
+    return true;
+  // The shared taxonomy walk covers the primary chain and the
+  // multiple-inheritance extra edges (ExceptionGroup -> Exception).
+  return py::exceptions::isBuiltinExceptionSubclassName(subtype, supertype);
 }
 
 static bool isContractSubclassOf(ContractType subtype, ContractType supertype) {

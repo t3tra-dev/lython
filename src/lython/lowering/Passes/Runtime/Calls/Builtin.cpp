@@ -281,10 +281,18 @@ RuntimeBundleLowerer::lowerBuiltinMethodSinkCall(py::CallOp op,
         return mlir::failure();
       printable = std::move(rendered);
     } else {
+      // CPython print() renders through str(); __repr__ is only the
+      // fallback for contracts without a __str__ (containers). The two were
+      // indistinguishable until exception __repr__ gained its
+      // ClassName(...) form.
+      llvm::StringRef sinkMethod = symbol.builtinMethod;
+      if (sinkMethod == "__repr__" &&
+          manifest.method(printable.contractName(), "__str__"))
+        sinkMethod = "__str__";
       llvm::SmallVector<const RuntimeBundle *, 1> sources{&printable};
       std::optional<EmittedRuntimeCall> emitted;
       if (mlir::failed(emitManifestMethodCall(
-              op, printable, symbol.builtinMethod, sources,
+              op, printable, sinkMethod, sources,
               /*allowUnusedSources=*/false, emitted)))
         return mlir::failure();
       if (mlir::failed(bundleRuntimeResults(

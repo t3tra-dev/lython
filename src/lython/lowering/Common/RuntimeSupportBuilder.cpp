@@ -404,6 +404,25 @@ void buildEHClassIdMatches(SupportBuilder &b) {
   b.builder.setInsertionPointToEnd(checkHandler);
   mlir::Value hit =
       b.cmpi(mlir::arith::CmpIPredicate::eq, current, handler);
+  // Multiple-inheritance extra edges (ExceptionGroup -> Exception): the
+  // chain walk only follows the primary base, so accept `handler` being any
+  // ancestor of an extra base when the walk passes through the edge's owner.
+  for (const py::exceptions::BuiltinExceptionExtraEdge &edge :
+       py::exceptions::kBuiltinExceptionExtraEdges) {
+    mlir::Value atEdgeOwner =
+        b.cmpi(mlir::arith::CmpIPredicate::eq, current, b.iconst(edge.classId));
+    std::int64_t ancestor = edge.extraBaseClassId;
+    while (ancestor != py::exceptions::kRootClassId) {
+      mlir::Value handlerIsAncestor = b.cmpi(mlir::arith::CmpIPredicate::eq,
+                                             handler, b.iconst(ancestor));
+      mlir::Value viaEdge = mlir::arith::AndIOp::create(
+          b.builder, b.loc, atEdgeOwner, handlerIsAncestor);
+      hit = mlir::arith::OrIOp::create(b.builder, b.loc, hit, viaEdge);
+      const py::exceptions::BuiltinExceptionInfo *info =
+          py::exceptions::findByClassId(ancestor);
+      ancestor = info ? info->baseClassId : py::exceptions::kRootClassId;
+    }
+  }
   mlir::cf::CondBranchOp::create(b.builder, b.loc, hit, matched,
                                  mlir::ValueRange{}, stepUp,
                                  mlir::ValueRange{});

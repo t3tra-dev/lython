@@ -4,6 +4,7 @@
 
 #include "AstAccess.h"
 #include "CandidateSelection.h"
+#include "ExceptionTaxonomy.h"
 #include "PlatformConstants.h"
 #include "PrimitiveTypes.h"
 #include "PyCallableShape.h"
@@ -1017,23 +1018,19 @@ void TypeSystem::seedBuiltins() {
   bindClass("float", floatType());
   bindClass("str", strType());
   bindClass("bytes", contract("builtins.bytes"));
-  bindClass("BaseException", contract("builtins.BaseException"));
-  bindClass("Exception", contract("builtins.Exception"));
-  bindClass("RuntimeError", contract("builtins.RuntimeError"));
-  bindClass("TypeError", contract("builtins.TypeError"));
-  bindClass("ValueError", contract("builtins.ValueError"));
-  bindClass("ArithmeticError", contract("builtins.ArithmeticError"));
-  bindClass("LookupError", contract("builtins.LookupError"));
-  bindClass("ZeroDivisionError", contract("builtins.ZeroDivisionError"));
-  bindClass("KeyError", contract("builtins.KeyError"));
-  bindClass("IndexError", contract("builtins.IndexError"));
-  bindClass("AssertionError", contract("builtins.AssertionError"));
-  bindClass("StopIteration", contract("builtins.StopIteration"));
-  bindClass("StopAsyncIteration", contract("builtins.StopAsyncIteration"));
-  bindClass("SystemExit", contract("builtins.SystemExit"));
-  bindClass("GeneratorExit", contract("builtins.GeneratorExit"));
-  bindClass("OSError", contract("builtins.OSError"));
-  bindClass("FileNotFoundError", contract("builtins.FileNotFoundError"));
+  // The whole builtin exception taxonomy binds from the shared table so the
+  // emitter's name surface cannot drift from the class-id hierarchy the
+  // runtime matches against. Non-builtins members (asyncio.CancelledError,
+  // _io.UnsupportedOperation) bind through their module imports instead.
+  for (const py::exceptions::BuiltinExceptionInfo &info :
+       py::exceptions::kBuiltinExceptions) {
+    llvm::StringRef contractName(info.contract);
+    if (contractName.starts_with("builtins."))
+      bindClass(info.name, contract(contractName));
+  }
+  // CPython-compatible aliases of OSError.
+  bindClass("IOError", contract("builtins.OSError"));
+  bindClass("EnvironmentError", contract("builtins.OSError"));
   // open is io.open (CPython aliases the builtin to the io module's opener);
   // the contract and the runtime implementation live in the _io manifest.
   bindCanonicalSymbol(
