@@ -52,6 +52,41 @@ inline constexpr llvm::StringLiteral kAggregateReleaseAttr{
 llvm::DenseMap<mlir::Block *, llvm::SmallVector<mlir::Block *, 2>>
 collectExceptionEdges(mlir::Region &region);
 
+// Handler-entry blocks by try id: the block containing
+// `LyEH_TryCatchMarker(id)`, exactly the catch target the final LLVM EH
+// phase wires unwinding invokes to. Shared by exception-edge collection,
+// the unwind-cleanup insertion, and the affine verifier so all three agree
+// on where an unwinding call site transfers control.
+llvm::DenseMap<std::int64_t, mlir::Block *>
+collectExceptionHandlerEntries(mlir::Region &region);
+
+// The i64 constant id of an EH marker/anchor call, when it has one.
+std::optional<std::int64_t> exceptionMarkerId(mlir::func::CallOp call);
+
+// The call whose unwind a `LyEH_TryCallSiteMarker` guards: the first
+// following non-marker call in the block (mirrors the marker/invoke pairing
+// the final LLVM EH phase performs). Null when the block ends, another
+// EH anchor/catch marker intervenes, or no call follows.
+mlir::func::CallOp guardedCallAfterMarker(mlir::Operation *marker);
+
+// The `LyEH_TryCallSiteMarker` pairing with `call`, i.e. the preceding
+// marker with no other call in between. Null for unguarded calls: their
+// unwind leaves the function instead of reaching an in-function handler.
+mlir::func::CallOp precedingTryCallSiteMarker(mlir::Operation *call);
+
+// True for runtime raise primitives (manifest `ly.runtime.primitive =
+// "raise"` contract): calling one transfers control out of the function
+// unless a preceding try call-site marker wires it to a local handler.
+bool isRaisePrimitiveFunction(mlir::func::FuncOp function);
+
+// For `%c = call @LyEH_TryCatchAnchor(id); cf.cond_br %c, ^handler, ^tail`
+// where ^tail leads with a same-id call-site marker: the marker's guarded
+// call. The anchor's true edge is never taken at runtime -- control reaches
+// ^handler only by unwinding OUT OF the guarded call -- so a path walk of
+// the true edge must apply the guarded call's consume effects to mirror the
+// state the real unwind edge carries. Null when the pattern does not match.
+mlir::func::CallOp anchorTrueEdgeGuardedCall(mlir::Operation *terminator);
+
 inline constexpr llvm::StringLiteral kBlockArgMergeBorrowLabel{
     "block-arg-merge-borrow"};
 
@@ -302,6 +337,16 @@ bool returnTransfersGroup(FuncContractCache &contracts,
 bool callConsumesGroup(FuncContractCache &contracts, mlir::func::CallOp call,
                        llvm::ArrayRef<mlir::Value> group,
                        AliasAnalysis &aliases);
+bool callRetainsGroup(FuncContractCache &contracts, mlir::func::CallOp call,
+                      llvm::ArrayRef<mlir::Value> group,
+                      AliasAnalysis &aliases);
+bool callPartiallyConsumesGroup(FuncContractCache &contracts,
+                                mlir::func::CallOp call,
+                                llvm::ArrayRef<mlir::Value> group,
+                                AliasAnalysis &aliases);
+// Identity merge edges lend the merge argument a token via a retain labeled
+// kBlockArgMergeBorrowLabel; the paired release targets the pre-merge name.
+bool isBlockArgMergeBorrowRetain(mlir::func::CallOp call);
 bool groupContainsOperand(mlir::Operation *op,
                           llvm::ArrayRef<mlir::Value> group,
                           AliasAnalysis &aliases);

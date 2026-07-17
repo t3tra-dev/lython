@@ -8,6 +8,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallSet.h"
 
@@ -1244,32 +1245,41 @@ void AliasAnalysis::build(mlir::Operation *root) {
 // containing `LyEH_TryCallSiteMarker(id)` may therefore transfer control to
 // the handler entry of `id`; liveness that ignores these edges releases
 // values on the try path that the handler still uses (use-after-free).
-llvm::DenseMap<mlir::Block *, llvm::SmallVector<mlir::Block *, 2>>
-collectExceptionEdges(mlir::Region &region) {
-  llvm::DenseMap<mlir::Block *, llvm::SmallVector<mlir::Block *, 2>> edges;
+std::optional<std::int64_t> exceptionMarkerId(mlir::func::CallOp call) {
+  if (call.getNumOperands() != 1)
+    return std::nullopt;
+  auto constant =
+      call.getOperand(0).getDefiningOp<mlir::arith::ConstantIntOp>();
+  if (!constant)
+    return std::nullopt;
+  return constant.value();
+}
+
+llvm::DenseMap<std::int64_t, mlir::Block *>
+collectExceptionHandlerEntries(mlir::Region &region) {
+  // Resolution is by `LyEH_TryCatchMarker(id)` -- the block the final LLVM
+  // EH phase wires each unwinding invoke to -- and NOT by the anchor
+  // cond_br's true successor: release insertion may split blocks on the
+  // anchor's (never-taken-at-runtime) true edge, after which the anchor
+  // successor and the runtime catch target are different blocks.
   llvm::DenseMap<std::int64_t, mlir::Block *> handlerEntries;
-  auto markerId = [](mlir::func::CallOp call) -> std::optional<std::int64_t> {
-    if (call.getNumOperands() != 1)
-      return std::nullopt;
-    auto constant =
-        call.getOperand(0).getDefiningOp<mlir::arith::ConstantIntOp>();
-    if (!constant)
-      return std::nullopt;
-    return constant.value();
-  };
   for (mlir::Block &block : region) {
     for (mlir::Operation &op : block) {
       auto call = mlir::dyn_cast<mlir::func::CallOp>(&op);
-      if (!call || call.getCallee() != "LyEH_TryCatchAnchor")
+      if (!call || call.getCallee() != "LyEH_TryCatchMarker")
         continue;
-      std::optional<std::int64_t> id = markerId(call);
-      auto cond =
-          mlir::dyn_cast<mlir::cf::CondBranchOp>(block.getTerminator());
-      if (!id || !cond || cond.getCondition() != call.getResult(0))
-        continue;
-      handlerEntries[*id] = cond.getTrueDest();
+      if (std::optional<std::int64_t> id = exceptionMarkerId(call))
+        handlerEntries[*id] = &block;
     }
   }
+  return handlerEntries;
+}
+
+llvm::DenseMap<mlir::Block *, llvm::SmallVector<mlir::Block *, 2>>
+collectExceptionEdges(mlir::Region &region) {
+  llvm::DenseMap<mlir::Block *, llvm::SmallVector<mlir::Block *, 2>> edges;
+  llvm::DenseMap<std::int64_t, mlir::Block *> handlerEntries =
+      collectExceptionHandlerEntries(region);
   if (handlerEntries.empty())
     return edges;
   for (mlir::Block &block : region) {
@@ -1277,7 +1287,7 @@ collectExceptionEdges(mlir::Region &region) {
       auto call = mlir::dyn_cast<mlir::func::CallOp>(&op);
       if (!call || call.getCallee() != "LyEH_TryCallSiteMarker")
         continue;
-      std::optional<std::int64_t> id = markerId(call);
+      std::optional<std::int64_t> id = exceptionMarkerId(call);
       if (!id)
         continue;
       auto found = handlerEntries.find(*id);
@@ -1289,6 +1299,81 @@ collectExceptionEdges(mlir::Region &region) {
     }
   }
   return edges;
+}
+
+mlir::func::CallOp guardedCallAfterMarker(mlir::Operation *marker) {
+  if (!marker)
+    return {};
+  for (mlir::Operation *op = marker->getNextNode(); op;
+       op = op->getNextNode()) {
+    auto call = mlir::dyn_cast<mlir::func::CallOp>(op);
+    if (!call) {
+      // Mirror the final EH phase's pairing scan: a side-effecting
+      // non-call between marker and call breaks the pairing there, so a
+      // pairing claimed across one here would model an edge that never
+      // materializes.
+      if (op->hasTrait<mlir::OpTrait::IsTerminator>() ||
+          !mlir::isMemoryEffectFree(op))
+        return {};
+      continue;
+    }
+    llvm::StringRef callee = call.getCallee();
+    if (callee == "LyEH_TryCallSiteMarker")
+      continue; // a later marker takes over the pairing
+    if (callee == "LyEH_TryCatchAnchor" || callee == "LyEH_TryCatchMarker")
+      return {};
+    return call;
+  }
+  return {};
+}
+
+mlir::func::CallOp precedingTryCallSiteMarker(mlir::Operation *call) {
+  if (!call)
+    return {};
+  for (mlir::Operation *op = call->getPrevNode(); op; op = op->getPrevNode()) {
+    auto candidate = mlir::dyn_cast<mlir::func::CallOp>(op);
+    if (!candidate) {
+      if (!mlir::isMemoryEffectFree(op))
+        return {};
+      continue;
+    }
+    if (candidate.getCallee() == "LyEH_TryCallSiteMarker")
+      return candidate;
+    return {};
+  }
+  return {};
+}
+
+mlir::func::CallOp anchorTrueEdgeGuardedCall(mlir::Operation *terminator) {
+  auto cond = mlir::dyn_cast_if_present<mlir::cf::CondBranchOp>(terminator);
+  if (!cond)
+    return {};
+  auto anchor = cond.getCondition().getDefiningOp<mlir::func::CallOp>();
+  if (!anchor || anchor.getCallee() != "LyEH_TryCatchAnchor")
+    return {};
+  std::optional<std::int64_t> id = exceptionMarkerId(anchor);
+  if (!id)
+    return {};
+  for (mlir::Operation &op : *cond.getFalseDest()) {
+    auto call = mlir::dyn_cast<mlir::func::CallOp>(&op);
+    if (!call)
+      continue;
+    if (call.getCallee() != "LyEH_TryCallSiteMarker")
+      continue;
+    std::optional<std::int64_t> markerId = exceptionMarkerId(call);
+    if (markerId && *markerId == *id)
+      return guardedCallAfterMarker(call);
+    return {};
+  }
+  return {};
+}
+
+bool isRaisePrimitiveFunction(mlir::func::FuncOp function) {
+  if (!function)
+    return false;
+  auto primitive =
+      function->getAttrOfType<mlir::StringAttr>(contracts::kManifestPrimitiveAttr);
+  return primitive && primitive.getValue() == "raise";
 }
 
 bool returnTransfersGroup(FuncContractCache &contracts,
@@ -1340,6 +1425,52 @@ bool callConsumesGroup(FuncContractCache &contracts, mlir::func::CallOp call,
     if (groupMatchesValues(call.getOperands(), offset, group, aliases))
       return true;
   return false;
+}
+
+bool callRetainsGroup(FuncContractCache &contracts, mlir::func::CallOp call,
+                      llvm::ArrayRef<mlir::Value> group,
+                      AliasAnalysis &aliases) {
+  if (group.empty())
+    return false;
+  auto cached = contracts.lookup(call.getCallee());
+  if (mlir::failed(cached) || !*cached)
+    return false;
+  for (unsigned offset : (*cached)->contract.retainArgs.values) {
+    if (offset >= call.getNumOperands())
+      continue;
+    if (aliases.same(call.getOperand(offset), group.front()))
+      return true;
+  }
+  return false;
+}
+
+bool callPartiallyConsumesGroup(FuncContractCache &contracts,
+                                mlir::func::CallOp call,
+                                llvm::ArrayRef<mlir::Value> group,
+                                AliasAnalysis &aliases) {
+  auto cached = contracts.lookup(call.getCallee());
+  if (mlir::failed(cached) || !*cached)
+    return false;
+  const FunctionContract &contract = (*cached)->contract;
+
+  auto consumesTrackedHeaderAt = [&](unsigned index) {
+    return !group.empty() && index < call.getNumOperands() &&
+           aliases.same(call.getOperand(index), group.front());
+  };
+  for (unsigned offset : contract.releaseArgs.values)
+    if (consumesTrackedHeaderAt(offset) &&
+        !groupMatchesValues(call.getOperands(), offset, group, aliases))
+      return true;
+  for (unsigned offset : contract.transferArgs.values)
+    if (consumesTrackedHeaderAt(offset) &&
+        !groupMatchesValues(call.getOperands(), offset, group, aliases))
+      return true;
+  return false;
+}
+
+bool isBlockArgMergeBorrowRetain(mlir::func::CallOp call) {
+  auto label = call->getAttrOfType<mlir::StringAttr>(kAggregateRetainAttr);
+  return label && label.getValue() == kBlockArgMergeBorrowLabel;
 }
 
 bool groupContainsOperand(mlir::Operation *op,
