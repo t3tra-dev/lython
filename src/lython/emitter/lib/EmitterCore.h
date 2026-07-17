@@ -235,6 +235,12 @@ private:
   // runtime exception message of an exception-backed instance.
   Value emitSuperExceptionInit(const parser::Node &expr, Value receiver,
                                llvm::StringRef baseContract);
+  // Unknown decorators are rejected (never silently ignored). The role
+  // selects the recognized set; propertyNames lets method checks accept
+  // `<prop>.setter` only for a property declared in the same class body.
+  enum class DecoratorRole { Function, Method, Class };
+  void checkDecorators(const parser::Node &node, DecoratorRole role,
+                       const llvm::StringSet<> *propertyNames = nullptr);
   Value emitUnary(const parser::Node &expr);
   Value emitBinary(const parser::Node &expr);
   Value emitCompare(const parser::Node &expr);

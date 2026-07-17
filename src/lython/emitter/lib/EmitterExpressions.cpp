@@ -826,10 +826,24 @@ Value ModuleEmitter::emitMethodObject(const parser::Node &anchor, Value object,
 
 Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
   Value object = emitExpr(ast::node(expr, "value"));
-  mlir::Type result = types.inferExpr(&expr);
   auto attr = ast::string(expr, "attr");
   if (!attr)
     return emitNone(expr);
+  // Property reads inline the getter (before general attribute inference,
+  // which knows nothing about accessor bindings).
+  if (std::optional<MethodBinding> property =
+          lookupClassMethod(object.type, *attr);
+      property && property->kind == "property") {
+    if (mlir::isa<py::TypeType>(object.type)) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, expr.range.start,
+          "accessing a property object through the class is not supported"});
+      return emitNone(expr);
+    }
+    return emitInlineMethodBody(expr, object, /*bindDescriptorReceiver=*/true,
+                                *property, {}, {});
+  }
+  mlir::Type result = types.inferExpr(&expr);
   std::optional<mlir::Type> field = lookupClassField(object.type, *attr);
   if (field)
     result = *field;

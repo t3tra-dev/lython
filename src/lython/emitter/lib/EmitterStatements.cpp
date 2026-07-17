@@ -217,6 +217,24 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
     const parser::Node *objectNode = ast::node(target, "value");
     Value object = emitExpr(objectNode);
     if (auto attr = ast::string(target, "attr")) {
+      // Property writes inline the setter; a getter without a setter is the
+      // CPython AttributeError, surfaced statically.
+      if (std::optional<MethodBinding> setter = lookupClassMethod(
+              object.type, (llvm::Twine(*attr) + ".setter").str())) {
+        if (setter->kind == "property_setter") {
+          emitInlineMethodBody(target, object, /*bindDescriptorReceiver=*/true,
+                               *setter, {value}, {});
+          return;
+        }
+      }
+      if (std::optional<MethodBinding> getter =
+              lookupClassMethod(object.type, *attr);
+          getter && getter->kind == "property") {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, target.range.start,
+            "property '" + std::string(*attr) + "' has no setter"});
+        return;
+      }
       auto op = py::AttrSetOp::create(builder, loc(target), object.value, *attr,
                                       value.value);
       if (lookupClassField(object.type, *attr))

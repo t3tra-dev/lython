@@ -181,7 +181,125 @@ c3MergeNames(llvm::SmallVector<llvm::SmallVector<std::string, 8>, 8> sequences) 
   return result;
 }
 
+// The callee expression of a decorator (a Call decorator's func, otherwise
+// the decorator itself) and its dotted spelling.
+std::pair<const parser::Node *, std::string>
+decoratorCallee(const parser::Node &decorator) {
+  const parser::Node *callee = &decorator;
+  if (decorator.kind == "Call")
+    callee = ast::node(decorator, "func");
+  std::string spelling;
+  if (callee) {
+    spelling = ast::qualifiedName(callee);
+    if (spelling.empty())
+      spelling = std::string(ast::nameSpelling(*callee));
+  }
+  return {callee, std::move(spelling)};
+}
+
+llvm::StringRef decoratorLeafName(llvm::StringRef spelling) {
+  std::size_t dot = spelling.rfind('.');
+  return dot == llvm::StringRef::npos ? spelling : spelling.drop_front(dot + 1);
+}
+
+// A `<prop>.setter` accessor decorator: Attribute whose attr is `setter`
+// over a plain name. Returns the property name, empty otherwise.
+llvm::StringRef propertySetterTarget(const parser::Node &decorator) {
+  if (decorator.kind != "Attribute")
+    return {};
+  auto attr = ast::string(decorator, "attr");
+  if (!attr || *attr != "setter")
+    return {};
+  const parser::Node *base = ast::node(decorator, "value");
+  if (!base || base->kind != "Name")
+    return {};
+  return ast::nameSpelling(*base);
+}
+
+// Property accessor names declared by a class body (getter or setter):
+// collectClassFields must not turn `self.<prop> = ...` into a field, and
+// setter recognition is scoped to these names.
+llvm::StringSet<> classPropertyNames(const parser::Node &classDef) {
+  llvm::StringSet<> names;
+  const auto *body = ast::nodeList(classDef, "body");
+  if (!body)
+    return names;
+  for (const parser::NodePtr &statement : *body) {
+    if (!statement || (statement->kind != "FunctionDef" &&
+                       statement->kind != "AsyncFunctionDef"))
+      continue;
+    auto methodName = ast::string(*statement, "name");
+    if (!methodName)
+      continue;
+    const auto *decorators = ast::nodeList(*statement, "decorator_list");
+    if (!decorators)
+      continue;
+    for (const parser::NodePtr &decorator : *decorators) {
+      if (!decorator)
+        continue;
+      if (decorator->kind == "Name" &&
+          ast::nameSpelling(*decorator) == "property") {
+        names.insert(*methodName);
+        continue;
+      }
+      llvm::StringRef target = propertySetterTarget(*decorator);
+      if (!target.empty())
+        names.insert(target);
+    }
+  }
+  return names;
+}
+
 } // namespace
+
+void ModuleEmitter::checkDecorators(const parser::Node &node,
+                                    DecoratorRole role,
+                                    const llvm::StringSet<> *propertyNames) {
+  const auto *decorators = ast::nodeList(node, "decorator_list");
+  if (!decorators)
+    return;
+  // Recognized-and-ignored typing markers: they constrain the checker, not
+  // the emitted code.
+  auto isTypingMarker = [](llvm::StringRef leaf) {
+    return leaf == "overload" || leaf == "override" || leaf == "final" ||
+           leaf == "runtime_checkable";
+  };
+  for (const parser::NodePtr &decorator : *decorators) {
+    if (!decorator)
+      continue;
+    auto [callee, spelling] = decoratorCallee(*decorator);
+    llvm::StringRef leaf = decoratorLeafName(spelling);
+    bool recognized = false;
+    switch (role) {
+    case DecoratorRole::Method:
+      recognized = leaf == "staticmethod" || leaf == "classmethod" ||
+                   leaf == "property" || leaf == "abstractmethod" ||
+                   isTypingMarker(leaf);
+      if (!recognized) {
+        llvm::StringRef target = propertySetterTarget(*decorator);
+        recognized = !target.empty() && propertyNames &&
+                     propertyNames->contains(target);
+        if (recognized)
+          spelling = (target + ".setter").str();
+      }
+      break;
+    case DecoratorRole::Function:
+      recognized = leaf == "native" || isTypingMarker(leaf);
+      break;
+    case DecoratorRole::Class:
+      recognized = leaf == "dataclass" || isTypingMarker(leaf);
+      break;
+    }
+    if (recognized)
+      continue;
+    if (spelling.empty())
+      spelling = "<expression>";
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, decorator->range.start,
+        "decorator '" + spelling + "' is not supported (unrecognized "
+        "decorators are rejected instead of silently ignored)"});
+  }
+}
 
 std::string ModuleEmitter::canonicalClassName(llvm::StringRef spelling) const {
   if (std::optional<mlir::Type> bound = types.lookupClass(spelling))
@@ -322,6 +440,7 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
   std::string classSymbol =
       symbolName.empty() ? std::string(*name) : symbolName.str();
   llvm::StringRef contractName(classSymbol);
+  checkDecorators(classDef, DecoratorRole::Class);
 
   llvm::SmallVector<llvm::StringRef, 4> bases;
   if (const auto *baseNodes = ast::nodeList(classDef, "bases")) {
@@ -501,6 +620,7 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
   llvm::SmallVector<FunctionSignature, 8> pendingBodySigs;
   llvm::SmallVector<std::string, 8> pendingBodySymbols;
   llvm::SmallVector<std::string, 8> pendingBodyKinds;
+  llvm::StringSet<> propertyNames = classPropertyNames(classDef);
   if (const auto *body = ast::nodeList(classDef, "body")) {
     for (const parser::NodePtr &statement : *body) {
       if (!statement || (statement->kind != "FunctionDef" &&
@@ -509,18 +629,37 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       auto methodName = ast::string(*statement, "name");
       if (!methodName)
         continue;
+      checkDecorators(*statement, DecoratorRole::Method, &propertyNames);
       std::string kind = methodKind(*statement);
+      std::string bindingName(*methodName);
+      if (const auto *decorators = ast::nodeList(*statement, "decorator_list"))
+        for (const parser::NodePtr &decorator : *decorators) {
+          if (!decorator)
+            continue;
+          if (decorator->kind == "Name" &&
+              ast::nameSpelling(*decorator) == "property") {
+            kind = "property";
+            break;
+          }
+          llvm::StringRef setterTarget = propertySetterTarget(*decorator);
+          if (!setterTarget.empty() && propertyNames.contains(setterTarget)) {
+            kind = "property_setter";
+            bindingName = (setterTarget + ".setter").str();
+            break;
+          }
+        }
       if (*methodName == "__new__" && kind == "instance")
         kind = "class";
+      bool propertyAccessor = kind == "property" || kind == "property_setter";
       std::optional<llvm::StringRef> receiverName;
-      if (kind == "instance")
+      if (kind == "instance" || propertyAccessor)
         receiverName = "self";
       else if (kind == "class" || kind == "classmethod")
         receiverName = "cls";
       FunctionSignature bodySig = types.functionSignature(
           *statement,
           kind == "static" ? std::optional<llvm::StringRef>() : receiverName);
-      if (kind == "instance")
+      if (kind == "instance" || propertyAccessor)
         replaceSelfInSignature(bodySig, types.contract(contractName), types);
       else if (kind == "class" || kind == "classmethod") {
         replaceSelfInSignature(
@@ -530,6 +669,27 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
               types.typeObject(types.contract(contractName));
           types.refreshCallable(bodySig);
         }
+      }
+      if (propertyAccessor) {
+        // Accessors inline at attribute-access sites only: no standalone
+        // symbol, no method-table entry.
+        unsigned expectedArity = kind == "property" ? 1 : 2;
+        if (bodySig.positionalNames.size() != expectedArity)
+          diagnostics.push_back(parser::Diagnostic{
+              parser::Severity::Error, statement->range.start,
+              "property " +
+                  std::string(kind == "property" ? "getter" : "setter") +
+                  " takes " + std::to_string(expectedArity) +
+                  " parameters (including self)"});
+        classMethodBindings[contractName][bindingName] =
+            MethodBinding{statement.get(),
+                          bodySig,
+                          bodySig,
+                          kind,
+                          std::string(),
+                          statement->kind == "AsyncFunctionDef",
+                          std::string(contractName)};
+        continue;
       }
       methodNames.push_back(std::string(*methodName));
       methodKinds.push_back(kind);
@@ -869,14 +1029,19 @@ void ModuleEmitter::collectClassFields(
     collectArgs("args");
   };
 
+  llvm::StringSet<> propertyNames = classPropertyNames(classDef);
   auto collectTarget = [&](const parser::Node &target, mlir::Type type) {
     if (target.kind != "Attribute")
       return;
     const parser::Node *object = ast::node(target, "value");
     if (!object || !ast::isName(*object, "self"))
       return;
-    if (auto attr = ast::string(target, "attr"))
+    if (auto attr = ast::string(target, "attr")) {
+      // `self.<prop> = ...` runs the property setter; it declares no field.
+      if (propertyNames.contains(*attr))
+        return;
       setField(*attr, type, /*overwriteExisting=*/false, target);
+    }
   };
 
   if (const auto *body = ast::nodeList(classDef, "body")) {
