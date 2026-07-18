@@ -1329,24 +1329,51 @@ module attributes {
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_BaseException : memref<13xi8> = dense<[66, 97, 115, 101, 69, 120, 99, 101, 112, 116, 105, 111, 110]>
-  memref.global "private" constant @__ly_excname_Exception : memref<9xi8> = dense<[69, 120, 99, 101, 112, 116, 105, 111, 110]>
-  memref.global "private" constant @__ly_excname_RuntimeError : memref<12xi8> = dense<[82, 117, 110, 116, 105, 109, 101, 69, 114, 114, 111, 114]>
-  memref.global "private" constant @__ly_excname_TypeError : memref<9xi8> = dense<[84, 121, 112, 101, 69, 114, 114, 111, 114]>
-  memref.global "private" constant @__ly_excname_ValueError : memref<10xi8> = dense<[86, 97, 108, 117, 101, 69, 114, 114, 111, 114]>
-  memref.global "private" constant @__ly_excname_ArithmeticError : memref<15xi8> = dense<[65, 114, 105, 116, 104, 109, 101, 116, 105, 99, 69, 114, 114, 111, 114]>
-  memref.global "private" constant @__ly_excname_LookupError : memref<11xi8> = dense<[76, 111, 111, 107, 117, 112, 69, 114, 114, 111, 114]>
-  memref.global "private" constant @__ly_excname_ZeroDivisionError : memref<17xi8> = dense<[90, 101, 114, 111, 68, 105, 118, 105, 115, 105, 111, 110, 69, 114, 114, 111, 114]>
-  memref.global "private" constant @__ly_excname_KeyError : memref<8xi8> = dense<[75, 101, 121, 69, 114, 114, 111, 114]>
-  memref.global "private" constant @__ly_excname_IndexError : memref<10xi8> = dense<[73, 110, 100, 101, 120, 69, 114, 114, 111, 114]>
-  memref.global "private" constant @__ly_excname_AssertionError : memref<14xi8> = dense<[65, 115, 115, 101, 114, 116, 105, 111, 110, 69, 114, 114, 111, 114]>
-  memref.global "private" constant @__ly_excname_StopIteration : memref<13xi8> = dense<[83, 116, 111, 112, 73, 116, 101, 114, 97, 116, 105, 111, 110]>
-  memref.global "private" constant @__ly_excname_StopAsyncIteration : memref<18xi8> = dense<[83, 116, 111, 112, 65, 115, 121, 110, 99, 73, 116, 101, 114, 97, 116, 105, 111, 110]>
-  memref.global "private" constant @__ly_excname_SystemExit : memref<10xi8> = dense<[83, 121, 115, 116, 101, 109, 69, 120, 105, 116]>
-  memref.global "private" constant @__ly_excname_GeneratorExit : memref<13xi8> = dense<[71, 101, 110, 101, 114, 97, 116, 111, 114, 69, 120, 105, 116]>
-  memref.global "private" constant @__ly_excname_OSError : memref<7xi8> = dense<[79, 83, 69, 114, 114, 111, 114]>
-  memref.global "private" constant @__ly_excname_FileNotFoundError : memref<17xi8> = dense<[70, 105, 108, 101, 78, 111, 116, 70, 111, 117, 110, 100, 69, 114, 114, 111, 114]>
-  memref.global "private" constant @__ly_excname_CancelledError : memref<14xi8> = dense<[67, 97, 110, 99, 101, 108, 108, 101, 100, 69, 114, 114, 111, 114]>
+
+  // Per-program builtin/user exception-class name table (synthesized by the
+  // lowering's support builder; user-defined ids resolve through its
+  // fallback hook). Returns a NUL-terminated ASCII name.
+  func.func private @exception_class_name(%class_id: i64) -> !llvm.ptr
+
+  // repr(e) keyed by the DYNAMIC class id in the exception header, so an
+  // instance caught through a base-class handler (or a user subclass, once
+  // the class hook resolves it) still renders its own class name.
+  func.func private @__ly_exception_repr_by_id(%header: memref<3xi64>, %message_header: memref<2xi64>, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %zero_i8 = arith.constant 0 : i8
+    %cap = arith.constant 64 : index
+    %class_id = memref.load %header[%c2] : memref<3xi64>
+    %name_ptr = func.call @exception_class_name(%class_id) : (i64) -> !llvm.ptr
+    // Copy the NUL-terminated name into a bounded local buffer (taxonomy
+    // names are short ASCII; 64 caps runaway pointers, not real names).
+    %buffer = memref.alloca() : memref<64xi8>
+    %true_scan = arith.constant true
+    %scan:2 = scf.while (%i = %c0, %go = %true_scan) : (index, i1) -> (index, i1) {
+      %in_bounds = arith.cmpi ult, %i, %cap : index
+      %continue = arith.andi %in_bounds, %go : i1
+      scf.condition(%continue) %i, %go : index, i1
+    } do {
+    ^bb0(%i: index, %go: i1):
+      %i_i64 = arith.index_cast %i : index to i64
+      %slot = llvm.getelementptr %name_ptr[%i_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i8
+      %byte = llvm.load %slot : !llvm.ptr -> i8
+      %is_nul = arith.cmpi eq, %byte, %zero_i8 : i8
+      %true_x = arith.constant true
+      %not_nul = arith.xori %is_nul, %true_x : i1
+      scf.if %not_nul {
+        memref.store %byte, %buffer[%i] : memref<64xi8>
+      }
+      %next = arith.addi %i, %c1 : index
+      %kept = arith.select %is_nul, %i, %next : index
+      scf.yield %kept, %not_nul : index, i1
+    }
+    %name_len = arith.index_cast %scan#0 : index to i64
+    %name_dyn = memref.cast %buffer : memref<64xi8> to memref<?xi8>
+    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
+  }
 
   // CPython repr(e): ClassName(<repr of the message>) -- ClassName() when
   // the message is empty. A no-argument construction and an explicit empty
@@ -1407,7 +1434,6 @@ module attributes {
     func.return %tuple#0, %tuple#1, %tuple#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
   }
 
-  memref.global "private" constant @__ly_excname_KeyboardInterrupt : memref<17xi8> = dense<[75, 101, 121, 98, 111, 97, 114, 100, 73, 110, 116, 101, 114, 114, 117, 112, 116]>
   func.func @LyKeyboardInterrupt_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 100 : i64, ly.runtime.contract = "builtins.KeyboardInterrupt", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -1425,14 +1451,10 @@ module attributes {
   }
 
   func.func @LyKeyboardInterrupt_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.KeyboardInterrupt", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_KeyboardInterrupt : memref<17xi8>
-    %name_dyn = memref.cast %name_ref : memref<17xi8> to memref<?xi8>
-    %name_len = arith.constant 17 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_BaseExceptionGroup : memref<18xi8> = dense<[66, 97, 115, 101, 69, 120, 99, 101, 112, 116, 105, 111, 110, 71, 114, 111, 117, 112]>
   func.func @LyBaseExceptionGroup_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 101 : i64, ly.runtime.contract = "builtins.BaseExceptionGroup", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -1450,14 +1472,10 @@ module attributes {
   }
 
   func.func @LyBaseExceptionGroup_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.BaseExceptionGroup", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_BaseExceptionGroup : memref<18xi8>
-    %name_dyn = memref.cast %name_ref : memref<18xi8> to memref<?xi8>
-    %name_len = arith.constant 18 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_ExceptionGroup : memref<14xi8> = dense<[69, 120, 99, 101, 112, 116, 105, 111, 110, 71, 114, 111, 117, 112]>
   func.func @LyExceptionGroup_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 102 : i64, ly.runtime.contract = "builtins.ExceptionGroup", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -1475,14 +1493,10 @@ module attributes {
   }
 
   func.func @LyExceptionGroup_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.ExceptionGroup", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_ExceptionGroup : memref<14xi8>
-    %name_dyn = memref.cast %name_ref : memref<14xi8> to memref<?xi8>
-    %name_len = arith.constant 14 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_FloatingPointError : memref<18xi8> = dense<[70, 108, 111, 97, 116, 105, 110, 103, 80, 111, 105, 110, 116, 69, 114, 114, 111, 114]>
   func.func @LyFloatingPointError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 103 : i64, ly.runtime.contract = "builtins.FloatingPointError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -1500,14 +1514,10 @@ module attributes {
   }
 
   func.func @LyFloatingPointError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.FloatingPointError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_FloatingPointError : memref<18xi8>
-    %name_dyn = memref.cast %name_ref : memref<18xi8> to memref<?xi8>
-    %name_len = arith.constant 18 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_OverflowError : memref<13xi8> = dense<[79, 118, 101, 114, 102, 108, 111, 119, 69, 114, 114, 111, 114]>
   func.func @LyOverflowError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 104 : i64, ly.runtime.contract = "builtins.OverflowError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -1525,14 +1535,10 @@ module attributes {
   }
 
   func.func @LyOverflowError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.OverflowError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_OverflowError : memref<13xi8>
-    %name_dyn = memref.cast %name_ref : memref<13xi8> to memref<?xi8>
-    %name_len = arith.constant 13 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_BufferError : memref<11xi8> = dense<[66, 117, 102, 102, 101, 114, 69, 114, 114, 111, 114]>
   func.func @LyBufferError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 105 : i64, ly.runtime.contract = "builtins.BufferError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -1550,14 +1556,10 @@ module attributes {
   }
 
   func.func @LyBufferError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.BufferError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_BufferError : memref<11xi8>
-    %name_dyn = memref.cast %name_ref : memref<11xi8> to memref<?xi8>
-    %name_len = arith.constant 11 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_EOFError : memref<8xi8> = dense<[69, 79, 70, 69, 114, 114, 111, 114]>
   func.func @LyEOFError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 106 : i64, ly.runtime.contract = "builtins.EOFError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -1575,14 +1577,10 @@ module attributes {
   }
 
   func.func @LyEOFError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.EOFError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_EOFError : memref<8xi8>
-    %name_dyn = memref.cast %name_ref : memref<8xi8> to memref<?xi8>
-    %name_len = arith.constant 8 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_ImportError : memref<11xi8> = dense<[73, 109, 112, 111, 114, 116, 69, 114, 114, 111, 114]>
   func.func @LyImportError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 107 : i64, ly.runtime.contract = "builtins.ImportError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -1600,14 +1598,10 @@ module attributes {
   }
 
   func.func @LyImportError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.ImportError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_ImportError : memref<11xi8>
-    %name_dyn = memref.cast %name_ref : memref<11xi8> to memref<?xi8>
-    %name_len = arith.constant 11 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_ModuleNotFoundError : memref<19xi8> = dense<[77, 111, 100, 117, 108, 101, 78, 111, 116, 70, 111, 117, 110, 100, 69, 114, 114, 111, 114]>
   func.func @LyModuleNotFoundError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 108 : i64, ly.runtime.contract = "builtins.ModuleNotFoundError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -1625,14 +1619,10 @@ module attributes {
   }
 
   func.func @LyModuleNotFoundError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.ModuleNotFoundError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_ModuleNotFoundError : memref<19xi8>
-    %name_dyn = memref.cast %name_ref : memref<19xi8> to memref<?xi8>
-    %name_len = arith.constant 19 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_MemoryError : memref<11xi8> = dense<[77, 101, 109, 111, 114, 121, 69, 114, 114, 111, 114]>
   func.func @LyMemoryError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 109 : i64, ly.runtime.contract = "builtins.MemoryError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -1650,14 +1640,10 @@ module attributes {
   }
 
   func.func @LyMemoryError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.MemoryError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_MemoryError : memref<11xi8>
-    %name_dyn = memref.cast %name_ref : memref<11xi8> to memref<?xi8>
-    %name_len = arith.constant 11 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_NameError : memref<9xi8> = dense<[78, 97, 109, 101, 69, 114, 114, 111, 114]>
   func.func @LyNameError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 110 : i64, ly.runtime.contract = "builtins.NameError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -1675,14 +1661,10 @@ module attributes {
   }
 
   func.func @LyNameError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.NameError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_NameError : memref<9xi8>
-    %name_dyn = memref.cast %name_ref : memref<9xi8> to memref<?xi8>
-    %name_len = arith.constant 9 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_UnboundLocalError : memref<17xi8> = dense<[85, 110, 98, 111, 117, 110, 100, 76, 111, 99, 97, 108, 69, 114, 114, 111, 114]>
   func.func @LyUnboundLocalError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 111 : i64, ly.runtime.contract = "builtins.UnboundLocalError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -1700,14 +1682,10 @@ module attributes {
   }
 
   func.func @LyUnboundLocalError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.UnboundLocalError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_UnboundLocalError : memref<17xi8>
-    %name_dyn = memref.cast %name_ref : memref<17xi8> to memref<?xi8>
-    %name_len = arith.constant 17 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_AttributeError : memref<14xi8> = dense<[65, 116, 116, 114, 105, 98, 117, 116, 101, 69, 114, 114, 111, 114]>
   func.func @LyAttributeError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 112 : i64, ly.runtime.contract = "builtins.AttributeError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -1725,14 +1703,10 @@ module attributes {
   }
 
   func.func @LyAttributeError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.AttributeError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_AttributeError : memref<14xi8>
-    %name_dyn = memref.cast %name_ref : memref<14xi8> to memref<?xi8>
-    %name_len = arith.constant 14 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_ReferenceError : memref<14xi8> = dense<[82, 101, 102, 101, 114, 101, 110, 99, 101, 69, 114, 114, 111, 114]>
   func.func @LyReferenceError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 113 : i64, ly.runtime.contract = "builtins.ReferenceError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -1750,14 +1724,10 @@ module attributes {
   }
 
   func.func @LyReferenceError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.ReferenceError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_ReferenceError : memref<14xi8>
-    %name_dyn = memref.cast %name_ref : memref<14xi8> to memref<?xi8>
-    %name_len = arith.constant 14 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_NotImplementedError : memref<19xi8> = dense<[78, 111, 116, 73, 109, 112, 108, 101, 109, 101, 110, 116, 101, 100, 69, 114, 114, 111, 114]>
   func.func @LyNotImplementedError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 114 : i64, ly.runtime.contract = "builtins.NotImplementedError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -1775,14 +1745,10 @@ module attributes {
   }
 
   func.func @LyNotImplementedError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.NotImplementedError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_NotImplementedError : memref<19xi8>
-    %name_dyn = memref.cast %name_ref : memref<19xi8> to memref<?xi8>
-    %name_len = arith.constant 19 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_RecursionError : memref<14xi8> = dense<[82, 101, 99, 117, 114, 115, 105, 111, 110, 69, 114, 114, 111, 114]>
   func.func @LyRecursionError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 115 : i64, ly.runtime.contract = "builtins.RecursionError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -1800,14 +1766,10 @@ module attributes {
   }
 
   func.func @LyRecursionError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.RecursionError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_RecursionError : memref<14xi8>
-    %name_dyn = memref.cast %name_ref : memref<14xi8> to memref<?xi8>
-    %name_len = arith.constant 14 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_PythonFinalizationError : memref<23xi8> = dense<[80, 121, 116, 104, 111, 110, 70, 105, 110, 97, 108, 105, 122, 97, 116, 105, 111, 110, 69, 114, 114, 111, 114]>
   func.func @LyPythonFinalizationError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 116 : i64, ly.runtime.contract = "builtins.PythonFinalizationError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -1825,14 +1787,10 @@ module attributes {
   }
 
   func.func @LyPythonFinalizationError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.PythonFinalizationError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_PythonFinalizationError : memref<23xi8>
-    %name_dyn = memref.cast %name_ref : memref<23xi8> to memref<?xi8>
-    %name_len = arith.constant 23 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_SyntaxError : memref<11xi8> = dense<[83, 121, 110, 116, 97, 120, 69, 114, 114, 111, 114]>
   func.func @LySyntaxError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 117 : i64, ly.runtime.contract = "builtins.SyntaxError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -1850,14 +1808,10 @@ module attributes {
   }
 
   func.func @LySyntaxError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.SyntaxError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_SyntaxError : memref<11xi8>
-    %name_dyn = memref.cast %name_ref : memref<11xi8> to memref<?xi8>
-    %name_len = arith.constant 11 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_IndentationError : memref<16xi8> = dense<[73, 110, 100, 101, 110, 116, 97, 116, 105, 111, 110, 69, 114, 114, 111, 114]>
   func.func @LyIndentationError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 118 : i64, ly.runtime.contract = "builtins.IndentationError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -1875,14 +1829,10 @@ module attributes {
   }
 
   func.func @LyIndentationError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.IndentationError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_IndentationError : memref<16xi8>
-    %name_dyn = memref.cast %name_ref : memref<16xi8> to memref<?xi8>
-    %name_len = arith.constant 16 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_TabError : memref<8xi8> = dense<[84, 97, 98, 69, 114, 114, 111, 114]>
   func.func @LyTabError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 119 : i64, ly.runtime.contract = "builtins.TabError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -1900,14 +1850,10 @@ module attributes {
   }
 
   func.func @LyTabError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.TabError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_TabError : memref<8xi8>
-    %name_dyn = memref.cast %name_ref : memref<8xi8> to memref<?xi8>
-    %name_len = arith.constant 8 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_SystemError : memref<11xi8> = dense<[83, 121, 115, 116, 101, 109, 69, 114, 114, 111, 114]>
   func.func @LySystemError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 120 : i64, ly.runtime.contract = "builtins.SystemError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -1925,14 +1871,10 @@ module attributes {
   }
 
   func.func @LySystemError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.SystemError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_SystemError : memref<11xi8>
-    %name_dyn = memref.cast %name_ref : memref<11xi8> to memref<?xi8>
-    %name_len = arith.constant 11 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_UnicodeError : memref<12xi8> = dense<[85, 110, 105, 99, 111, 100, 101, 69, 114, 114, 111, 114]>
   func.func @LyUnicodeError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 121 : i64, ly.runtime.contract = "builtins.UnicodeError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -1950,14 +1892,10 @@ module attributes {
   }
 
   func.func @LyUnicodeError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.UnicodeError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_UnicodeError : memref<12xi8>
-    %name_dyn = memref.cast %name_ref : memref<12xi8> to memref<?xi8>
-    %name_len = arith.constant 12 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_UnicodeDecodeError : memref<18xi8> = dense<[85, 110, 105, 99, 111, 100, 101, 68, 101, 99, 111, 100, 101, 69, 114, 114, 111, 114]>
   func.func @LyUnicodeDecodeError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 122 : i64, ly.runtime.contract = "builtins.UnicodeDecodeError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -1975,14 +1913,10 @@ module attributes {
   }
 
   func.func @LyUnicodeDecodeError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.UnicodeDecodeError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_UnicodeDecodeError : memref<18xi8>
-    %name_dyn = memref.cast %name_ref : memref<18xi8> to memref<?xi8>
-    %name_len = arith.constant 18 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_UnicodeEncodeError : memref<18xi8> = dense<[85, 110, 105, 99, 111, 100, 101, 69, 110, 99, 111, 100, 101, 69, 114, 114, 111, 114]>
   func.func @LyUnicodeEncodeError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 123 : i64, ly.runtime.contract = "builtins.UnicodeEncodeError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -2000,14 +1934,10 @@ module attributes {
   }
 
   func.func @LyUnicodeEncodeError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.UnicodeEncodeError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_UnicodeEncodeError : memref<18xi8>
-    %name_dyn = memref.cast %name_ref : memref<18xi8> to memref<?xi8>
-    %name_len = arith.constant 18 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_UnicodeTranslateError : memref<21xi8> = dense<[85, 110, 105, 99, 111, 100, 101, 84, 114, 97, 110, 115, 108, 97, 116, 101, 69, 114, 114, 111, 114]>
   func.func @LyUnicodeTranslateError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 124 : i64, ly.runtime.contract = "builtins.UnicodeTranslateError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -2025,14 +1955,10 @@ module attributes {
   }
 
   func.func @LyUnicodeTranslateError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.UnicodeTranslateError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_UnicodeTranslateError : memref<21xi8>
-    %name_dyn = memref.cast %name_ref : memref<21xi8> to memref<?xi8>
-    %name_len = arith.constant 21 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_Warning : memref<7xi8> = dense<[87, 97, 114, 110, 105, 110, 103]>
   func.func @LyWarning_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 125 : i64, ly.runtime.contract = "builtins.Warning", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -2050,14 +1976,10 @@ module attributes {
   }
 
   func.func @LyWarning_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.Warning", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_Warning : memref<7xi8>
-    %name_dyn = memref.cast %name_ref : memref<7xi8> to memref<?xi8>
-    %name_len = arith.constant 7 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_BytesWarning : memref<12xi8> = dense<[66, 121, 116, 101, 115, 87, 97, 114, 110, 105, 110, 103]>
   func.func @LyBytesWarning_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 126 : i64, ly.runtime.contract = "builtins.BytesWarning", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -2075,14 +1997,10 @@ module attributes {
   }
 
   func.func @LyBytesWarning_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.BytesWarning", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_BytesWarning : memref<12xi8>
-    %name_dyn = memref.cast %name_ref : memref<12xi8> to memref<?xi8>
-    %name_len = arith.constant 12 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_DeprecationWarning : memref<18xi8> = dense<[68, 101, 112, 114, 101, 99, 97, 116, 105, 111, 110, 87, 97, 114, 110, 105, 110, 103]>
   func.func @LyDeprecationWarning_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 127 : i64, ly.runtime.contract = "builtins.DeprecationWarning", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -2100,14 +2018,10 @@ module attributes {
   }
 
   func.func @LyDeprecationWarning_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.DeprecationWarning", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_DeprecationWarning : memref<18xi8>
-    %name_dyn = memref.cast %name_ref : memref<18xi8> to memref<?xi8>
-    %name_len = arith.constant 18 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_EncodingWarning : memref<15xi8> = dense<[69, 110, 99, 111, 100, 105, 110, 103, 87, 97, 114, 110, 105, 110, 103]>
   func.func @LyEncodingWarning_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 128 : i64, ly.runtime.contract = "builtins.EncodingWarning", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -2125,14 +2039,10 @@ module attributes {
   }
 
   func.func @LyEncodingWarning_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.EncodingWarning", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_EncodingWarning : memref<15xi8>
-    %name_dyn = memref.cast %name_ref : memref<15xi8> to memref<?xi8>
-    %name_len = arith.constant 15 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_FutureWarning : memref<13xi8> = dense<[70, 117, 116, 117, 114, 101, 87, 97, 114, 110, 105, 110, 103]>
   func.func @LyFutureWarning_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 129 : i64, ly.runtime.contract = "builtins.FutureWarning", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -2150,14 +2060,10 @@ module attributes {
   }
 
   func.func @LyFutureWarning_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.FutureWarning", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_FutureWarning : memref<13xi8>
-    %name_dyn = memref.cast %name_ref : memref<13xi8> to memref<?xi8>
-    %name_len = arith.constant 13 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_ImportWarning : memref<13xi8> = dense<[73, 109, 112, 111, 114, 116, 87, 97, 114, 110, 105, 110, 103]>
   func.func @LyImportWarning_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 130 : i64, ly.runtime.contract = "builtins.ImportWarning", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -2175,14 +2081,10 @@ module attributes {
   }
 
   func.func @LyImportWarning_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.ImportWarning", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_ImportWarning : memref<13xi8>
-    %name_dyn = memref.cast %name_ref : memref<13xi8> to memref<?xi8>
-    %name_len = arith.constant 13 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_PendingDeprecationWarning : memref<25xi8> = dense<[80, 101, 110, 100, 105, 110, 103, 68, 101, 112, 114, 101, 99, 97, 116, 105, 111, 110, 87, 97, 114, 110, 105, 110, 103]>
   func.func @LyPendingDeprecationWarning_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 131 : i64, ly.runtime.contract = "builtins.PendingDeprecationWarning", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -2200,14 +2102,10 @@ module attributes {
   }
 
   func.func @LyPendingDeprecationWarning_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.PendingDeprecationWarning", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_PendingDeprecationWarning : memref<25xi8>
-    %name_dyn = memref.cast %name_ref : memref<25xi8> to memref<?xi8>
-    %name_len = arith.constant 25 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_ResourceWarning : memref<15xi8> = dense<[82, 101, 115, 111, 117, 114, 99, 101, 87, 97, 114, 110, 105, 110, 103]>
   func.func @LyResourceWarning_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 132 : i64, ly.runtime.contract = "builtins.ResourceWarning", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -2225,14 +2123,10 @@ module attributes {
   }
 
   func.func @LyResourceWarning_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.ResourceWarning", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_ResourceWarning : memref<15xi8>
-    %name_dyn = memref.cast %name_ref : memref<15xi8> to memref<?xi8>
-    %name_len = arith.constant 15 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_RuntimeWarning : memref<14xi8> = dense<[82, 117, 110, 116, 105, 109, 101, 87, 97, 114, 110, 105, 110, 103]>
   func.func @LyRuntimeWarning_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 133 : i64, ly.runtime.contract = "builtins.RuntimeWarning", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -2250,14 +2144,10 @@ module attributes {
   }
 
   func.func @LyRuntimeWarning_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.RuntimeWarning", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_RuntimeWarning : memref<14xi8>
-    %name_dyn = memref.cast %name_ref : memref<14xi8> to memref<?xi8>
-    %name_len = arith.constant 14 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_SyntaxWarning : memref<13xi8> = dense<[83, 121, 110, 116, 97, 120, 87, 97, 114, 110, 105, 110, 103]>
   func.func @LySyntaxWarning_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 134 : i64, ly.runtime.contract = "builtins.SyntaxWarning", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -2275,14 +2165,10 @@ module attributes {
   }
 
   func.func @LySyntaxWarning_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.SyntaxWarning", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_SyntaxWarning : memref<13xi8>
-    %name_dyn = memref.cast %name_ref : memref<13xi8> to memref<?xi8>
-    %name_len = arith.constant 13 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_UnicodeWarning : memref<14xi8> = dense<[85, 110, 105, 99, 111, 100, 101, 87, 97, 114, 110, 105, 110, 103]>
   func.func @LyUnicodeWarning_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 135 : i64, ly.runtime.contract = "builtins.UnicodeWarning", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -2300,14 +2186,10 @@ module attributes {
   }
 
   func.func @LyUnicodeWarning_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.UnicodeWarning", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_UnicodeWarning : memref<14xi8>
-    %name_dyn = memref.cast %name_ref : memref<14xi8> to memref<?xi8>
-    %name_len = arith.constant 14 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_UserWarning : memref<11xi8> = dense<[85, 115, 101, 114, 87, 97, 114, 110, 105, 110, 103]>
   func.func @LyUserWarning_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 136 : i64, ly.runtime.contract = "builtins.UserWarning", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -2325,14 +2207,10 @@ module attributes {
   }
 
   func.func @LyUserWarning_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.UserWarning", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_UserWarning : memref<11xi8>
-    %name_dyn = memref.cast %name_ref : memref<11xi8> to memref<?xi8>
-    %name_len = arith.constant 11 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_BlockingIOError : memref<15xi8> = dense<[66, 108, 111, 99, 107, 105, 110, 103, 73, 79, 69, 114, 114, 111, 114]>
   func.func @LyBlockingIOError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 137 : i64, ly.runtime.contract = "builtins.BlockingIOError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -2350,14 +2228,10 @@ module attributes {
   }
 
   func.func @LyBlockingIOError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.BlockingIOError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_BlockingIOError : memref<15xi8>
-    %name_dyn = memref.cast %name_ref : memref<15xi8> to memref<?xi8>
-    %name_len = arith.constant 15 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_ChildProcessError : memref<17xi8> = dense<[67, 104, 105, 108, 100, 80, 114, 111, 99, 101, 115, 115, 69, 114, 114, 111, 114]>
   func.func @LyChildProcessError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 138 : i64, ly.runtime.contract = "builtins.ChildProcessError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -2375,14 +2249,10 @@ module attributes {
   }
 
   func.func @LyChildProcessError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.ChildProcessError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_ChildProcessError : memref<17xi8>
-    %name_dyn = memref.cast %name_ref : memref<17xi8> to memref<?xi8>
-    %name_len = arith.constant 17 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_ConnectionError : memref<15xi8> = dense<[67, 111, 110, 110, 101, 99, 116, 105, 111, 110, 69, 114, 114, 111, 114]>
   func.func @LyConnectionError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 139 : i64, ly.runtime.contract = "builtins.ConnectionError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -2400,14 +2270,10 @@ module attributes {
   }
 
   func.func @LyConnectionError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.ConnectionError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_ConnectionError : memref<15xi8>
-    %name_dyn = memref.cast %name_ref : memref<15xi8> to memref<?xi8>
-    %name_len = arith.constant 15 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_BrokenPipeError : memref<15xi8> = dense<[66, 114, 111, 107, 101, 110, 80, 105, 112, 101, 69, 114, 114, 111, 114]>
   func.func @LyBrokenPipeError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 140 : i64, ly.runtime.contract = "builtins.BrokenPipeError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -2425,14 +2291,10 @@ module attributes {
   }
 
   func.func @LyBrokenPipeError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.BrokenPipeError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_BrokenPipeError : memref<15xi8>
-    %name_dyn = memref.cast %name_ref : memref<15xi8> to memref<?xi8>
-    %name_len = arith.constant 15 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_ConnectionAbortedError : memref<22xi8> = dense<[67, 111, 110, 110, 101, 99, 116, 105, 111, 110, 65, 98, 111, 114, 116, 101, 100, 69, 114, 114, 111, 114]>
   func.func @LyConnectionAbortedError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 141 : i64, ly.runtime.contract = "builtins.ConnectionAbortedError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -2450,14 +2312,10 @@ module attributes {
   }
 
   func.func @LyConnectionAbortedError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.ConnectionAbortedError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_ConnectionAbortedError : memref<22xi8>
-    %name_dyn = memref.cast %name_ref : memref<22xi8> to memref<?xi8>
-    %name_len = arith.constant 22 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_ConnectionRefusedError : memref<22xi8> = dense<[67, 111, 110, 110, 101, 99, 116, 105, 111, 110, 82, 101, 102, 117, 115, 101, 100, 69, 114, 114, 111, 114]>
   func.func @LyConnectionRefusedError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 142 : i64, ly.runtime.contract = "builtins.ConnectionRefusedError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -2475,14 +2333,10 @@ module attributes {
   }
 
   func.func @LyConnectionRefusedError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.ConnectionRefusedError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_ConnectionRefusedError : memref<22xi8>
-    %name_dyn = memref.cast %name_ref : memref<22xi8> to memref<?xi8>
-    %name_len = arith.constant 22 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_ConnectionResetError : memref<20xi8> = dense<[67, 111, 110, 110, 101, 99, 116, 105, 111, 110, 82, 101, 115, 101, 116, 69, 114, 114, 111, 114]>
   func.func @LyConnectionResetError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 143 : i64, ly.runtime.contract = "builtins.ConnectionResetError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -2500,14 +2354,10 @@ module attributes {
   }
 
   func.func @LyConnectionResetError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.ConnectionResetError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_ConnectionResetError : memref<20xi8>
-    %name_dyn = memref.cast %name_ref : memref<20xi8> to memref<?xi8>
-    %name_len = arith.constant 20 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_FileExistsError : memref<15xi8> = dense<[70, 105, 108, 101, 69, 120, 105, 115, 116, 115, 69, 114, 114, 111, 114]>
   func.func @LyFileExistsError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 144 : i64, ly.runtime.contract = "builtins.FileExistsError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -2525,14 +2375,10 @@ module attributes {
   }
 
   func.func @LyFileExistsError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.FileExistsError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_FileExistsError : memref<15xi8>
-    %name_dyn = memref.cast %name_ref : memref<15xi8> to memref<?xi8>
-    %name_len = arith.constant 15 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_InterruptedError : memref<16xi8> = dense<[73, 110, 116, 101, 114, 114, 117, 112, 116, 101, 100, 69, 114, 114, 111, 114]>
   func.func @LyInterruptedError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 145 : i64, ly.runtime.contract = "builtins.InterruptedError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -2550,14 +2396,10 @@ module attributes {
   }
 
   func.func @LyInterruptedError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.InterruptedError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_InterruptedError : memref<16xi8>
-    %name_dyn = memref.cast %name_ref : memref<16xi8> to memref<?xi8>
-    %name_len = arith.constant 16 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_IsADirectoryError : memref<17xi8> = dense<[73, 115, 65, 68, 105, 114, 101, 99, 116, 111, 114, 121, 69, 114, 114, 111, 114]>
   func.func @LyIsADirectoryError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 146 : i64, ly.runtime.contract = "builtins.IsADirectoryError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -2575,14 +2417,10 @@ module attributes {
   }
 
   func.func @LyIsADirectoryError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.IsADirectoryError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_IsADirectoryError : memref<17xi8>
-    %name_dyn = memref.cast %name_ref : memref<17xi8> to memref<?xi8>
-    %name_len = arith.constant 17 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_NotADirectoryError : memref<18xi8> = dense<[78, 111, 116, 65, 68, 105, 114, 101, 99, 116, 111, 114, 121, 69, 114, 114, 111, 114]>
   func.func @LyNotADirectoryError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 147 : i64, ly.runtime.contract = "builtins.NotADirectoryError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -2600,14 +2438,10 @@ module attributes {
   }
 
   func.func @LyNotADirectoryError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.NotADirectoryError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_NotADirectoryError : memref<18xi8>
-    %name_dyn = memref.cast %name_ref : memref<18xi8> to memref<?xi8>
-    %name_len = arith.constant 18 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_PermissionError : memref<15xi8> = dense<[80, 101, 114, 109, 105, 115, 115, 105, 111, 110, 69, 114, 114, 111, 114]>
   func.func @LyPermissionError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 148 : i64, ly.runtime.contract = "builtins.PermissionError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -2625,14 +2459,10 @@ module attributes {
   }
 
   func.func @LyPermissionError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.PermissionError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_PermissionError : memref<15xi8>
-    %name_dyn = memref.cast %name_ref : memref<15xi8> to memref<?xi8>
-    %name_len = arith.constant 15 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_ProcessLookupError : memref<18xi8> = dense<[80, 114, 111, 99, 101, 115, 115, 76, 111, 111, 107, 117, 112, 69, 114, 114, 111, 114]>
   func.func @LyProcessLookupError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 149 : i64, ly.runtime.contract = "builtins.ProcessLookupError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -2650,14 +2480,10 @@ module attributes {
   }
 
   func.func @LyProcessLookupError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.ProcessLookupError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_ProcessLookupError : memref<18xi8>
-    %name_dyn = memref.cast %name_ref : memref<18xi8> to memref<?xi8>
-    %name_len = arith.constant 18 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  memref.global "private" constant @__ly_excname_TimeoutError : memref<12xi8> = dense<[84, 105, 109, 101, 111, 117, 116, 69, 114, 114, 111, 114]>
   func.func @LyTimeoutError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 150 : i64, ly.runtime.contract = "builtins.TimeoutError", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
@@ -2675,10 +2501,7 @@ module attributes {
   }
 
   func.func @LyTimeoutError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.TimeoutError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_TimeoutError : memref<12xi8>
-    %name_dyn = memref.cast %name_ref : memref<12xi8> to memref<?xi8>
-    %name_len = arith.constant 12 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
@@ -2987,10 +2810,7 @@ module attributes {
   }
 
   func.func @LyBaseException_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.BaseException", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_BaseException : memref<13xi8>
-    %name_dyn = memref.cast %name_ref : memref<13xi8> to memref<?xi8>
-    %name_len = arith.constant 13 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
@@ -3001,10 +2821,7 @@ module attributes {
   }
 
   func.func @LyException_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.Exception", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_Exception : memref<9xi8>
-    %name_dyn = memref.cast %name_ref : memref<9xi8> to memref<?xi8>
-    %name_len = arith.constant 9 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
@@ -3015,10 +2832,7 @@ module attributes {
   }
 
   func.func @LyRuntimeError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.RuntimeError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_RuntimeError : memref<12xi8>
-    %name_dyn = memref.cast %name_ref : memref<12xi8> to memref<?xi8>
-    %name_len = arith.constant 12 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
@@ -3029,10 +2843,7 @@ module attributes {
   }
 
   func.func @LyTypeError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.TypeError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_TypeError : memref<9xi8>
-    %name_dyn = memref.cast %name_ref : memref<9xi8> to memref<?xi8>
-    %name_len = arith.constant 9 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
@@ -3043,10 +2854,7 @@ module attributes {
   }
 
   func.func @LyValueError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.ValueError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_ValueError : memref<10xi8>
-    %name_dyn = memref.cast %name_ref : memref<10xi8> to memref<?xi8>
-    %name_len = arith.constant 10 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
@@ -3057,10 +2865,7 @@ module attributes {
   }
 
   func.func @LyArithmeticError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.ArithmeticError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_ArithmeticError : memref<15xi8>
-    %name_dyn = memref.cast %name_ref : memref<15xi8> to memref<?xi8>
-    %name_len = arith.constant 15 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
@@ -3071,10 +2876,7 @@ module attributes {
   }
 
   func.func @LyLookupError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.LookupError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_LookupError : memref<11xi8>
-    %name_dyn = memref.cast %name_ref : memref<11xi8> to memref<?xi8>
-    %name_len = arith.constant 11 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
@@ -3085,10 +2887,7 @@ module attributes {
   }
 
   func.func @LyZeroDivisionError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.ZeroDivisionError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_ZeroDivisionError : memref<17xi8>
-    %name_dyn = memref.cast %name_ref : memref<17xi8> to memref<?xi8>
-    %name_len = arith.constant 17 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
@@ -3099,10 +2898,7 @@ module attributes {
   }
 
   func.func @LyKeyError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.KeyError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_KeyError : memref<8xi8>
-    %name_dyn = memref.cast %name_ref : memref<8xi8> to memref<?xi8>
-    %name_len = arith.constant 8 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
@@ -3113,10 +2909,7 @@ module attributes {
   }
 
   func.func @LyIndexError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.IndexError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_IndexError : memref<10xi8>
-    %name_dyn = memref.cast %name_ref : memref<10xi8> to memref<?xi8>
-    %name_len = arith.constant 10 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
@@ -3127,10 +2920,7 @@ module attributes {
   }
 
   func.func @LyAssertionError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.AssertionError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_AssertionError : memref<14xi8>
-    %name_dyn = memref.cast %name_ref : memref<14xi8> to memref<?xi8>
-    %name_len = arith.constant 14 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
@@ -3141,10 +2931,7 @@ module attributes {
   }
 
   func.func @LyStopIteration_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.StopIteration", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_StopIteration : memref<13xi8>
-    %name_dyn = memref.cast %name_ref : memref<13xi8> to memref<?xi8>
-    %name_len = arith.constant 13 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
@@ -3155,10 +2942,7 @@ module attributes {
   }
 
   func.func @LyStopAsyncIteration_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.StopAsyncIteration", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_StopAsyncIteration : memref<18xi8>
-    %name_dyn = memref.cast %name_ref : memref<18xi8> to memref<?xi8>
-    %name_len = arith.constant 18 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
@@ -3169,10 +2953,7 @@ module attributes {
   }
 
   func.func @LyCancelledError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "asyncio.CancelledError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_CancelledError : memref<14xi8>
-    %name_dyn = memref.cast %name_ref : memref<14xi8> to memref<?xi8>
-    %name_len = arith.constant 14 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
@@ -3183,10 +2964,7 @@ module attributes {
   }
 
   func.func @LySystemExit_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.SystemExit", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_SystemExit : memref<10xi8>
-    %name_dyn = memref.cast %name_ref : memref<10xi8> to memref<?xi8>
-    %name_len = arith.constant 10 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
@@ -3197,10 +2975,7 @@ module attributes {
   }
 
   func.func @LyGeneratorExit_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.GeneratorExit", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_GeneratorExit : memref<13xi8>
-    %name_dyn = memref.cast %name_ref : memref<13xi8> to memref<?xi8>
-    %name_len = arith.constant 13 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
@@ -3211,10 +2986,7 @@ module attributes {
   }
 
   func.func @LyOSError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.OSError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_OSError : memref<7xi8>
-    %name_dyn = memref.cast %name_ref : memref<7xi8> to memref<?xi8>
-    %name_len = arith.constant 7 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
@@ -3225,10 +2997,7 @@ module attributes {
   }
 
   func.func @LyFileNotFoundError_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.FileNotFoundError", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
-    %name_ref = memref.get_global @__ly_excname_FileNotFoundError : memref<17xi8>
-    %name_dyn = memref.cast %name_ref : memref<17xi8> to memref<?xi8>
-    %name_len = arith.constant 17 : i64
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
