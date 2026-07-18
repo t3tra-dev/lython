@@ -6383,6 +6383,7 @@ module attributes {
   memref.global "private" constant @__ly_fmt_msg_int_precision : memref<49xi8> = dense<[80, 114, 101, 99, 105, 115, 105, 111, 110, 32, 110, 111, 116, 32, 97, 108, 108, 111, 119, 101, 100, 32, 105, 110, 32, 105, 110, 116, 101, 103, 101, 114, 32, 102, 111, 114, 109, 97, 116, 32, 115, 112, 101, 99, 105, 102, 105, 101, 114]>
   memref.global "private" constant @__ly_fmt_msg_sign_c : memref<50xi8> = dense<[83, 105, 103, 110, 32, 110, 111, 116, 32, 97, 108, 108, 111, 119, 101, 100, 32, 119, 105, 116, 104, 32, 105, 110, 116, 101, 103, 101, 114, 32, 102, 111, 114, 109, 97, 116, 32, 115, 112, 101, 99, 105, 102, 105, 101, 114, 32, 39, 99, 39]>
   memref.global "private" constant @__ly_fmt_msg_alt_c : memref<64xi8> = dense<[65, 108, 116, 101, 114, 110, 97, 116, 101, 32, 102, 111, 114, 109, 32, 40, 35, 41, 32, 110, 111, 116, 32, 97, 108, 108, 111, 119, 101, 100, 32, 119, 105, 116, 104, 32, 105, 110, 116, 101, 103, 101, 114, 32, 102, 111, 114, 109, 97, 116, 32, 115, 112, 101, 99, 105, 102, 105, 101, 114, 32, 39, 99, 39]>
+  memref.global "private" constant @__ly_fmt_msg_z_str : memref<65xi8> = dense<[78, 101, 103, 97, 116, 105, 118, 101, 32, 122, 101, 114, 111, 32, 99, 111, 101, 114, 99, 105, 111, 110, 32, 40, 122, 41, 32, 110, 111, 116, 32, 97, 108, 108, 111, 119, 101, 100, 32, 105, 110, 32, 115, 116, 114, 105, 110, 103, 32, 102, 111, 114, 109, 97, 116, 32, 115, 112, 101, 99, 105, 102, 105, 101, 114]>
   memref.global "private" constant @__ly_fmt_msg_z_int : memref<66xi8> = dense<[78, 101, 103, 97, 116, 105, 118, 101, 32, 122, 101, 114, 111, 32, 99, 111, 101, 114, 99, 105, 111, 110, 32, 40, 122, 41, 32, 110, 111, 116, 32, 97, 108, 108, 111, 119, 101, 100, 32, 105, 110, 32, 105, 110, 116, 101, 103, 101, 114, 32, 102, 111, 114, 109, 97, 116, 32, 115, 112, 101, 99, 105, 102, 105, 101, 114]>
   memref.global "private" constant @__ly_fmt_msg_c_range : memref<29xi8> = dense<[37, 99, 32, 97, 114, 103, 32, 110, 111, 116, 32, 105, 110, 32, 114, 97, 110, 103, 101, 40, 48, 120, 49, 49, 48, 48, 48, 48, 41]>
   memref.global "private" constant @__ly_fmt_msg_name_int : memref<3xi8> = dense<[105, 110, 116]>
@@ -8046,6 +8047,16 @@ module attributes {
     %t_bad = arith.xori %t_ok, %true_uf : i1
     scf.if %t_bad {
       func.call @__ly_fmt_raise_unknown_code(%type_rec, %name, %nlen) : (i64, memref<?xi8>, i64) -> ()
+    }
+    // 'z' after the type check, like CPython ('zd' reports the unknown code)
+    %s9z = arith.constant 9 : index
+    %z_rec = memref.load %spec[%s9z] : memref<?xi64>
+    %z_on = arith.cmpi ne, %z_rec, %zero : i64
+    scf.if %z_on {
+      %zms = memref.get_global @__ly_fmt_msg_z_str : memref<65xi8>
+      %zm = memref.cast %zms : memref<65xi8> to memref<?xi8>
+      %zl = arith.constant 65 : i64
+      func.call @__ly_fmt_raise_bytes(%zm, %zl) : (memref<?xi8>, i64) -> ()
     }
 
     %wid = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
