@@ -183,6 +183,13 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
     return;
   } else if (statement.kind == "Delete") {
     emitDelete(statement);
+  } else if (statement.kind == "Nonlocal") {
+    // R6 wants a refcounted shared box; the closure machinery currently
+    // captures by value only, so an honest rejection beats a silent copy.
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, statement.range.start,
+        "nonlocal is not implemented yet (closures capture by value; the R6 "
+        "shared-box cell representation is pending)"});
   } else if (statement.kind == "Pass") {
     return;
   } else if (statement.kind == "Match") {
