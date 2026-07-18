@@ -5077,10 +5077,10 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  // s[i:j:k] -- slice over CODEPOINT ordinals (indexing is codepoint-based
-  // while storage is UTF-8): a start-offset table maps each ordinal to its
-  // byte range, then the selected codepoints are copied in iteration order
-  // (which reverses the text for negative steps).
+  // s[i:j:k] -- slice over code point ordinals. The adaptive-width storage
+  // gives O(1) indexing; the copy re-canonicalizes the width (pass 1 finds
+  // the widest selected code point) so equal strings keep identical
+  // representations, and a negative step reverses in iteration order.
   func.func @LyUnicode_GetSlice(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %start_raw: i64, %stop_raw: i64, %step_raw: i64, %mask: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__getslice__"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
@@ -5092,76 +5092,33 @@ module attributes {
     }
     // The throw does not return; the substitute keeps the IR division-safe.
     %step = arith.select %step_zero, %one, %step_raw : i1, i64
-    %cp_count = func.call @LyUnicode_CodepointLength(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
-    %adj:2 = func.call @__ly_slice_adjust(%cp_count, %start_raw, %stop_raw, %step, %mask) : (i64, i64, i64, i64, i64) -> (i64, i64)
+    %count = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %adj:2 = func.call @__ly_slice_adjust(%count, %start_raw, %stop_raw, %step, %mask) : (i64, i64, i64, i64, i64) -> (i64, i64)
+    %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %take = arith.index_cast %adj#1 : i64 to index
 
-    // Codepoint -> byte-offset table (one extra slot for the end sentinel).
-    %table_size64 = arith.addi %cp_count, %one : i64
-    %table_size = arith.index_cast %table_size64 : i64 to index
-    %table = memref.alloc(%table_size) : memref<?xi64>
-    %byte_dim = memref.dim %bytes, %c0 : memref<?xi8>
-    %continuation_mask = arith.constant 192 : i64
-    %continuation_tag = arith.constant 128 : i64
-    %final_ord = scf.for %i = %c0 to %byte_dim step %c1 iter_args(%ordinal = %zero) -> (i64) {
-      %byte = memref.load %bytes[%i] : memref<?xi8>
-      %byte_i64 = arith.extui %byte : i8 to i64
-      %tag = arith.andi %byte_i64, %continuation_mask : i64
-      %is_start = arith.cmpi ne, %tag, %continuation_tag : i64
-      %next = scf.if %is_start -> (i64) {
-        %slot = arith.index_cast %ordinal : i64 to index
-        %offset = arith.index_cast %i : index to i64
-        memref.store %offset, %table[%slot] : memref<?xi64>
-        %incremented = arith.addi %ordinal, %one : i64
-        scf.yield %incremented : i64
-      } else {
-        scf.yield %ordinal : i64
-      }
+    // Pass 1: canonical width of the selected code points.
+    %max_width = scf.for %k = %c0 to %take step %c1 iter_args(%acc = %one) -> (i64) {
+      %k64 = arith.index_cast %k : index to i64
+      %offset = arith.muli %k64, %step : i64
+      %ordinal = arith.addi %adj#0, %offset : i64
+      %ordinal_index = arith.index_cast %ordinal : i64 to index
+      %cp = func.call @__ly_unicode_get(%bytes, %width, %ordinal_index) : (memref<?xi8>, i64, index) -> i64
+      %cp_width = func.call @__ly_unicode_width_for(%cp) : (i64) -> i64
+      %wider = arith.cmpi sgt, %cp_width, %acc : i64
+      %next = arith.select %wider, %cp_width, %acc : i1, i64
       scf.yield %next : i64
     }
-    %sentinel_slot = arith.index_cast %final_ord : i64 to index
-    %byte_count64 = arith.index_cast %byte_dim : index to i64
-    memref.store %byte_count64, %table[%sentinel_slot] : memref<?xi64>
 
-    // Pass 1: total UTF-8 bytes of the selected codepoints.
-    %count_index = arith.index_cast %adj#1 : i64 to index
-    %total = scf.for %k = %c0 to %count_index step %c1 iter_args(%acc = %zero) -> (i64) {
+    %out_header, %out_bytes = func.call @__ly_unicode_alloc(%adj#1, %max_width) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
+    scf.for %k = %c0 to %take step %c1 {
       %k64 = arith.index_cast %k : index to i64
       %offset = arith.muli %k64, %step : i64
       %ordinal = arith.addi %adj#0, %offset : i64
-      %slot = arith.index_cast %ordinal : i64 to index
-      %next_slot = arith.addi %slot, %c1 : index
-      %b0 = memref.load %table[%slot] : memref<?xi64>
-      %b1 = memref.load %table[%next_slot] : memref<?xi64>
-      %width = arith.subi %b1, %b0 : i64
-      %grown = arith.addi %acc, %width : i64
-      scf.yield %grown : i64
+      %ordinal_index = arith.index_cast %ordinal : i64 to index
+      %cp = func.call @__ly_unicode_get(%bytes, %width, %ordinal_index) : (memref<?xi8>, i64, index) -> i64
+      func.call @__ly_unicode_put(%out_bytes, %max_width, %k, %cp) : (memref<?xi8>, i64, index, i64) -> ()
     }
-    %out_header, %out_bytes = func.call @__ly_unicode_alloc(%total) : (i64) -> (memref<2xi64>, memref<?xi8>)
-
-    // Pass 2: copy each selected codepoint's byte range.
-    %final_off = scf.for %k = %c0 to %count_index step %c1 iter_args(%out_off = %zero) -> (i64) {
-      %k64 = arith.index_cast %k : index to i64
-      %offset = arith.muli %k64, %step : i64
-      %ordinal = arith.addi %adj#0, %offset : i64
-      %slot = arith.index_cast %ordinal : i64 to index
-      %next_slot = arith.addi %slot, %c1 : index
-      %b0 = memref.load %table[%slot] : memref<?xi64>
-      %b1 = memref.load %table[%next_slot] : memref<?xi64>
-      %b0_index = arith.index_cast %b0 : i64 to index
-      %b1_index = arith.index_cast %b1 : i64 to index
-      scf.for %j = %b0_index to %b1_index step %c1 {
-        %j64 = arith.index_cast %j : index to i64
-        %rel = arith.subi %j64, %b0 : i64
-        %dst64 = arith.addi %out_off, %rel : i64
-        %dst = arith.index_cast %dst64 : i64 to index
-        %byte = memref.load %bytes[%j] : memref<?xi8>
-        memref.store %byte, %out_bytes[%dst] : memref<?xi8>
-      }
-      %width = arith.subi %b1, %b0 : i64
-      %advanced = arith.addi %out_off, %width : i64
-      scf.yield %advanced : i64
-    }
-    memref.dealloc %table : memref<?xi64>
     func.return %out_header, %out_bytes : memref<2xi64>, memref<?xi8>
   }
 
