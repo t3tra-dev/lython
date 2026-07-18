@@ -17,6 +17,7 @@
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/Error.h"
 
+#include <complex>
 #include <functional>
 #include <optional>
 #include <string>
@@ -369,6 +370,15 @@ Value ModuleEmitter::emitConstant(const parser::Node &expr) {
                                           builder.getStringAttr(big->decimal));
       return {op.getResult(), type};
     }
+    if (const auto *complexValue =
+            std::get_if<std::complex<double>>(fieldValue)) {
+      mlir::Type type = types.contract("builtins.complex");
+      auto op = py::ComplexConstantOp::create(
+          builder, loc(expr), type,
+          builder.getF64FloatAttr(complexValue->real()),
+          builder.getF64FloatAttr(complexValue->imag()));
+      return {op.getResult(), type};
+    }
   }
   diagnostics.push_back(parser::Diagnostic{parser::Severity::Error,
                                            expr.range.start,
@@ -403,11 +413,25 @@ Value ModuleEmitter::emitUnary(const parser::Node &expr) {
                                                  builder.getStringAttr(text));
         return {constOp.getResult(), type};
       }
+      if (const auto *complexValue =
+              std::get_if<std::complex<double>>(fieldValue)) {
+        mlir::Type type = types.contract("builtins.complex");
+        auto constOp = py::ComplexConstantOp::create(
+            builder, loc(expr), type,
+            builder.getF64FloatAttr(-complexValue->real()),
+            builder.getF64FloatAttr(-complexValue->imag()));
+        return {constOp.getResult(), type};
+      }
     }
   }
 
   Value operand = emitExpr(operandNode);
   mlir::Type result = types.widenLiteral(types.inferExpr(&expr));
+  // Complex unary results stay complex regardless of the (complex-unaware)
+  // expression inference.
+  if (types.widenLiteral(operand.type) == types.contract("builtins.complex") &&
+      (ast::isOperator(op, "USub") || ast::isOperator(op, "UAdd")))
+    result = types.contract("builtins.complex");
   if (ast::isOperator(op, "USub"))
     return emitUnarySpecial<py::NegOp>(expr, "__neg__", operand, result);
   if (ast::isOperator(op, "UAdd"))
@@ -465,6 +489,8 @@ Value ModuleEmitter::emitBinary(const parser::Node &expr) {
       }
     }
   }
+  if (std::optional<Value> complexResult = emitComplexBinary(expr, lhs, rhs, op))
+    return *complexResult;
   mlir::Type left = types.widenLiteral(lhs.type);
   mlir::Type right = types.widenLiteral(rhs.type);
   mlir::Type result = types.join({left, right});
@@ -514,6 +540,98 @@ Value ModuleEmitter::emitBinary(const parser::Node &expr) {
       "binary operator '" + spelling + "' is not supported for these operand "
       "types yet"});
   return emitNone(expr);
+}
+
+std::optional<Value> ModuleEmitter::emitComplexBinary(const parser::Node &expr,
+                                                      Value lhs, Value rhs,
+                                                      const parser::Node *op) {
+  mlir::Type complexType = types.contract("builtins.complex");
+  auto isComplex = [&](const Value &value) {
+    return types.widenLiteral(value.type) == complexType;
+  };
+  if (!isComplex(lhs) && !isComplex(rhs))
+    return std::nullopt;
+
+  bool isAdd = ast::isOperator(op, "Add");
+  bool isSub = ast::isOperator(op, "Sub");
+  bool isMul = ast::isOperator(op, "Mult");
+  bool isDiv = ast::isOperator(op, "Div");
+  if (!isAdd && !isSub && !isMul && !isDiv) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "complex supports only +, -, *, / (CPython raises TypeError for the "
+        "other operators)"});
+    return emitNone(expr);
+  }
+
+  // Compile-time parts of a constant operand (complex, float, or small int).
+  auto constantParts =
+      [&](const Value &value) -> std::optional<std::complex<double>> {
+    if (!value.value)
+      return std::nullopt;
+    if (auto constant = value.value.getDefiningOp<py::ComplexConstantOp>())
+      return std::complex<double>(constant.getReal().convertToDouble(),
+                                  constant.getImag().convertToDouble());
+    if (auto constant = value.value.getDefiningOp<py::FloatConstantOp>())
+      return std::complex<double>(constant.getValue().convertToDouble(), 0.0);
+    if (auto constant = value.value.getDefiningOp<py::IntConstantOp>()) {
+      long long parsed = 0;
+      if (!llvm::StringRef(constant.getValue()).getAsInteger(10, parsed))
+        return std::complex<double>(static_cast<double>(parsed), 0.0);
+    }
+    return std::nullopt;
+  };
+  std::optional<std::complex<double>> lhsParts = constantParts(lhs);
+  std::optional<std::complex<double>> rhsParts = constantParts(rhs);
+
+  auto materialize = [&](std::complex<double> parts) -> Value {
+    auto constant = py::ComplexConstantOp::create(
+        builder, loc(expr), complexType, builder.getF64FloatAttr(parts.real()),
+        builder.getF64FloatAttr(parts.imag()));
+    return {constant.getResult(), complexType};
+  };
+
+  // Both constant: fold (`1 + 2j` IS a BinOp over two constants). Constant
+  // division by zero stays a runtime raise.
+  if (lhsParts && rhsParts &&
+      !(isDiv && rhsParts->real() == 0.0 && rhsParts->imag() == 0.0)) {
+    std::complex<double> folded =
+        isAdd   ? *lhsParts + *rhsParts
+        : isSub ? *lhsParts - *rhsParts
+        : isMul ? *lhsParts * *rhsParts
+                : *lhsParts / *rhsParts;
+    return materialize(folded);
+  }
+
+  auto promote = [&](Value value,
+                     std::optional<std::complex<double>> parts)
+      -> std::optional<Value> {
+    if (isComplex(value))
+      return value;
+    if (parts)
+      return materialize(*parts);
+    return std::nullopt;
+  };
+  std::optional<Value> promotedLhs = promote(lhs, lhsParts);
+  std::optional<Value> promotedRhs = promote(rhs, rhsParts);
+  if (!promotedLhs || !promotedRhs) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "complex arithmetic with a non-constant int/float operand is not "
+        "supported yet; both operands must be complex (or numeric constants)"});
+    return emitNone(expr);
+  }
+  if (isAdd)
+    return emitBinarySpecial<py::AddOp>(expr, "__add__", *promotedLhs,
+                                        *promotedRhs, complexType);
+  if (isSub)
+    return emitBinarySpecial<py::SubOp>(expr, "__sub__", *promotedLhs,
+                                        *promotedRhs, complexType);
+  if (isMul)
+    return emitBinarySpecial<py::MulOp>(expr, "__mul__", *promotedLhs,
+                                        *promotedRhs, complexType);
+  return emitBinarySpecial<py::DivOp>(expr, "__truediv__", *promotedLhs,
+                                      *promotedRhs, complexType);
 }
 
 Value ModuleEmitter::emitCompare(const parser::Node &expr) {

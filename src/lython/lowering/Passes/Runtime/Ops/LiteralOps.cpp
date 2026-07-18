@@ -171,6 +171,26 @@ RuntimeBundleLowerer::lowerFloatConstant(py::FloatConstantOp op) {
 }
 
 mlir::LogicalResult
+RuntimeBundleLowerer::lowerComplexConstant(py::ComplexConstantOp op) {
+  builder.setInsertionPoint(op);
+  mlir::Value real =
+      mlir::arith::ConstantFloatOp::create(builder, op.getLoc(),
+                                           builder.getF64Type(), op.getReal())
+          .getResult();
+  mlir::Value imag =
+      mlir::arith::ConstantFloatOp::create(builder, op.getLoc(),
+                                           builder.getF64Type(), op.getImag())
+          .getResult();
+  RuntimeBundle result;
+  if (mlir::failed(initializeObjectFromRawValues(
+          op, op.getResult().getType(), mlir::ValueRange{real, imag}, result)))
+    return mlir::failure();
+  valueBundles[op.getResult()] = std::move(result);
+  erase.push_back(op);
+  return mlir::success();
+}
+
+mlir::LogicalResult
 RuntimeBundleLowerer::lowerBoolConstant(py::BoolConstantOp op) {
   builder.setInsertionPoint(op);
   mlir::Value bit = mlir::arith::ConstantIntOp::create(builder, op.getLoc(),

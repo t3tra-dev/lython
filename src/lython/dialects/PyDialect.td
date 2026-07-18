@@ -735,6 +735,22 @@ def Py_FloatConstantOp : Py_Op<"float.constant", []> {
   let hasVerifier = 1;
 }
 
+def Py_ComplexConstantOp : Py_Op<"complex.constant", []> {
+  let summary = "Create a Python complex literal";
+  let description = [{
+    Produces a `builtins.complex` contract value (a 2xf64 value type, R6)
+    from compile-time real/imaginary parts. Imaginary literals and
+    constant-folded complex arithmetic (`1 + 2j`) materialize through this
+    op; runtime complex arithmetic dispatches through the manifest special
+    methods like any other contract value.
+  }];
+
+  let arguments = (ins F64Attr:$real, F64Attr:$imag);
+  let results = (outs Py_ContractType:$result);
+
+  let assemblyFormat = "$real `,` $imag attr-dict `:` type($result)";
+}
+
 def Py_BytesConstantOp : Py_Op<"bytes.constant", []> {
   let summary = "Create a Python bytes literal";
   let description = [{

@@ -220,6 +220,12 @@ private:
                                mlir::Type instanceType);
   Value emitUnary(const parser::Node &expr);
   Value emitBinary(const parser::Node &expr);
+  // Complex arithmetic (R6 value type): folds constant operands, promotes
+  // constant real operands to complex, and dispatches +,-,*,/ through the
+  // complex manifest methods. Returns nullopt when neither operand is
+  // complex.
+  std::optional<Value> emitComplexBinary(const parser::Node &expr, Value lhs,
+                                         Value rhs, const parser::Node *op);
   Value emitCompare(const parser::Node &expr);
   // Scalar (non-Optional) comparison dispatch: primitive path, bool-vs-bool
   // truth compare, None-identity narrowing, membership, then the manifest

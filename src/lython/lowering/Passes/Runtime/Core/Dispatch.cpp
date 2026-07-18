@@ -18,6 +18,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPyOp(mlir::Operation *op) {
           [&](auto integer) { return lowerIntConstant(integer); })
       .Case<py::FloatConstantOp>(
           [&](auto floating) { return lowerFloatConstant(floating); })
+      .Case<py::ComplexConstantOp>(
+          [&](auto complexValue) { return lowerComplexConstant(complexValue); })
       .Case<py::BoolConstantOp>(
           [&](auto boolean) { return lowerBoolConstant(boolean); })
       .Case<py::NoneOp>([&](auto none) { return lowerNone(none); })
