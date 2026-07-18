@@ -433,12 +433,13 @@ module attributes {
     ly.runtime.required_initializers = ["__new__"],
     ly.runtime.required_methods = ["__len__"],
     ly.runtime.required_primitives = ["ensure_capacity"],
-    ly.typing.structural_mutators = ["__setitem__"],
+    ly.typing.structural_mutators = ["__setitem__", "update"],
     ly.typing.base_args = [[!py.contract<"$K">, !py.contract<"$V">]],
     method_names = ["__init__", "__init__", "__len__", "__iter__",
                     "__getitem__", "get", "get", "get", "__setitem__",
                     "__delitem__", "__contains__", "keys", "values", "items",
-                    "__repr__"],
+                    "__repr__", "clear", "copy", "update", "__or__",
+                    "__eq__", "__ne__", "pop", "pop"],
     method_contracts = [
       !py.protocol<"Callable", [!py.contract<"builtins.dict">] -> [!py.literal<None>]>,
       !py.protocol<"Callable", [!py.contract<"builtins.dict">, !py.protocol<"Iterable", [!py.contract<"builtins.tuple", [!py.contract<"$K">, !py.contract<"$V">]>]>] -> [!py.literal<None>]>,
@@ -454,9 +455,19 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.dict">] -> [!py.contract<"builtins.dict_keys", [!py.contract<"$K">, !py.contract<"$V">]>]>,
       !py.protocol<"Callable", [!py.contract<"builtins.dict">] -> [!py.contract<"builtins.dict_values", [!py.contract<"$K">, !py.contract<"$V">]>]>,
       !py.protocol<"Callable", [!py.contract<"builtins.dict">] -> [!py.contract<"builtins.dict_items", [!py.contract<"$K">, !py.contract<"$V">]>]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.dict">] -> [!py.contract<"builtins.str">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.dict">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.dict">] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.dict">] -> [!py.contract<"builtins.dict", [!py.contract<"$K">, !py.contract<"$V">]>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.dict">, !py.contract<"builtins.dict", [!py.contract<"$K">, !py.contract<"$V">]>] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.dict">, !py.contract<"builtins.dict", [!py.contract<"$K">, !py.contract<"$V">]>] -> [!py.contract<"builtins.dict", [!py.contract<"$K">, !py.contract<"$V">]>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.dict">, !py.contract<"builtins.object">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.dict">, !py.contract<"builtins.object">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.dict">, !py.contract<"$K">] -> [!py.contract<"$V">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.dict">, !py.contract<"$K">, !py.contract<"$V">] -> [!py.contract<"$V">]>
     ],
     method_kinds = ["instance", "instance", "instance", "instance",
+                    "instance", "instance", "instance", "instance",
+                    "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance"]
@@ -7923,6 +7934,13 @@ module attributes {
     %true = arith.constant true
     %ne = arith.xori %eq, %true : i1
     func.return %ne : i1
+  }
+
+  // Release the reference parked at a values-array slot (dict.pop's caller
+  // side runs this AFTER retaining the popped value into its own binding).
+  func.func @LyDict_ReleaseParked(%values: memref<?xi64>, %slot: i64) attributes {ly.runtime.contract = "builtins.dict", ly.runtime.primitive = "release_parked"} {
+    func.call @LyObject_ReleaseBoxedPayloadArraySlotRaw(%values, %slot) : (memref<?xi64>, i64) -> ()
+    func.return
   }
 
   // dict.pop support: remove the probed entry WITHOUT releasing its value;
