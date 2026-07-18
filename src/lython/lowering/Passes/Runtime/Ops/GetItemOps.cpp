@@ -994,22 +994,16 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeDictGetItem(
         builder, loc, static_cast<std::int64_t>(wordIndex));
     mlir::memref::StoreOp::create(builder, loc, word, keyBox, slot);
   }
-  // The probe consumes only raw pointer words: a retain/release pair around
-  // it keeps the key object alive through the call for any key class.
-  bool ownsProbeKey =
-      payloadKey->objectValue.ownership == ownership::OwnershipKind::Own;
-  if (!ownsProbeKey &&
-      mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
-          op, *payloadKey, "dict.getitem.key")))
-    return mlir::failure();
   llvm::SmallVector<mlir::Value, 8> findOperands(
       container.physicalValues().begin(), container.physicalValues().end());
   findOperands.push_back(keyBox);
   mlir::func::CallOp findCall =
       RuntimeBundleLowerer::createRuntimeCall(loc, *lookupBox, findOperands);
   mlir::Value found = findCall.getResult(0);
-  if (mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
-          op, *payloadKey, "dict.getitem.key")))
+  // The probe consumed only raw pointer words: pin the key past the call
+  // (owned keys are consumed by the release inside the pin).
+  if (mlir::failed(RuntimeBundleLowerer::pinProbeOperandLiveness(op,
+                                                                 *payloadKey)))
     return mlir::failure();
   mlir::Value zero = mlir::arith::ConstantIntOp::create(builder, loc, 0, 64);
   mlir::Value missing = mlir::arith::CmpIOp::create(

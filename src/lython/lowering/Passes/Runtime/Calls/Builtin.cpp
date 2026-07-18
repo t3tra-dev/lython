@@ -271,11 +271,30 @@ RuntimeBundleLowerer::lowerBuiltinMethodSinkCall(py::CallOp op,
   if (symbol.builtinMethod == "__repr__" &&
       symbol.builtinSinkContract == "builtins.str" &&
       printable.contractName() == "builtins.object") {
-    RuntimeBundle rendered;
-    if (mlir::failed(RuntimeBundleLowerer::emitBoxedReprHookCall(op, printable,
-                                                                 rendered)))
-      return mlir::failure();
-    printable = std::move(rendered);
+    // print converts with str(), not repr() (an erased str prints without
+    // quotes); the manifest object __str__ dispatches the payload class and
+    // falls back to the repr form exactly where CPython's str(x) does.
+    if (manifest.method("builtins.object", "__str__")) {
+      llvm::SmallVector<const RuntimeBundle *, 1> strSources{&printable};
+      std::optional<EmittedRuntimeCall> emitted;
+      if (mlir::failed(emitManifestMethodCall(op, printable, "__str__",
+                                              strSources,
+                                              /*allowUnusedSources=*/false,
+                                              emitted)))
+        return mlir::failure();
+      RuntimeBundle rendered;
+      if (mlir::failed(bundleRuntimeResults(
+              op, runtimeContractType(context, "builtins.str"), emitted->call,
+              rendered)))
+        return mlir::failure();
+      printable = std::move(rendered);
+    } else {
+      RuntimeBundle rendered;
+      if (mlir::failed(RuntimeBundleLowerer::emitBoxedReprHookCall(
+              op, printable, rendered)))
+        return mlir::failure();
+      printable = std::move(rendered);
+    }
   }
 
   if (printable.contractName() != symbol.builtinSinkContract) {

@@ -188,6 +188,117 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
           op, receiver, closeResumeInfo->second);
   }
 
+  // Runtime container methods over one boxed argument (count/index/remove on
+  // lists, discard/remove on sets): each resolves through a `<name>_box`
+  // manifest primitive taking (receiver physicals..., box). Mutators demote
+  // the receiver's compile-time element evidence afterwards - the runtime
+  // reordering/removal invalidates it, and the published payload carries the
+  // authoritative contents.
+  if (receiver.kind == RuntimeBundle::Kind::Object) {
+    llvm::StringRef receiverContract = receiver.contractName();
+    bool listBoxMethod = receiverContract == "builtins.list" &&
+                         (methodName == "count" || methodName == "index" ||
+                          methodName == "remove") &&
+                         receiver.physicalValues().size() >= 3;
+    bool setBoxMethod = receiverContract == "builtins.set" &&
+                        (methodName == "discard" || methodName == "remove") &&
+                        receiver.physicalValues().size() >= 3;
+    if (listBoxMethod || setBoxMethod) {
+      if (sources.size() != 2 || !sources[1] ||
+          sources[1]->kind != RuntimeBundle::Kind::Object)
+        return op.emitError() << receiverContract << "." << methodName
+                              << " expects one Python object argument";
+      std::string primitiveName = (methodName + llvm::Twine("_box")).str();
+      std::optional<RuntimeSymbol> primitive =
+          manifest.primitive(receiverContract, primitiveName);
+      if (!primitive)
+        return op.emitError() << "runtime manifest has no " << receiverContract
+                              << " " << primitiveName << " primitive";
+      builder.setInsertionPoint(op);
+      mlir::Location loc = op.getLoc();
+      mlir::FailureOr<RuntimeBundle> payload =
+          RuntimeBundleLowerer::materializePayloadObjectBundle(op, *sources[1]);
+      if (mlir::failed(payload))
+        return mlir::failure();
+      mlir::MemRefType boxType = box_abi::boxWordsType(builder);
+      mlir::Value box =
+          mlir::memref::AllocaOp::create(builder, loc, boxType).getResult();
+      mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
+          RuntimeBundleLowerer::objectPayloadHandleWords(op, *payload,
+                                                         /*ownsPayload=*/false);
+      if (mlir::failed(words))
+        return mlir::failure();
+      for (auto [wordIndex, word] : llvm::enumerate(*words)) {
+        mlir::Value slot = mlir::arith::ConstantIndexOp::create(
+            builder, loc, static_cast<std::int64_t>(wordIndex));
+        mlir::memref::StoreOp::create(builder, loc, word, box, slot);
+      }
+      llvm::SmallVector<mlir::Value, 8> operands(
+          receiver.physicalValues().begin(), receiver.physicalValues().end());
+      operands.push_back(box);
+      mlir::func::CallOp call =
+          RuntimeBundleLowerer::createRuntimeCall(loc, *primitive, operands);
+      if (mlir::failed(RuntimeBundleLowerer::pinProbeOperandLiveness(
+              op, *payload)))
+        return mlir::failure();
+      // Pin the receiver past the raw-word call.
+      if (std::optional<RuntimeSymbol> lenPin =
+              manifest.method(receiverContract, "__len__")) {
+        llvm::SmallVector<const RuntimeBundle *, 1> pinSources{&receiver};
+        llvm::SmallVector<mlir::Value, 4> pinOperands;
+        if (mlir::failed(buildRuntimeCallOperands(op, *lenPin, pinSources,
+                                                  pinOperands,
+                                                  /*allowUnusedSources=*/false)))
+          return mlir::failure();
+        RuntimeBundleLowerer::createRuntimeCall(loc, *lenPin, pinOperands);
+      }
+      if (methodName == "remove" || methodName == "discard") {
+        RuntimeBundle demoted = receiver;
+        demoted.sequenceElements.clear();
+        demoted.sequenceElementBundles.clear();
+        demoted.sequenceIndices.clear();
+        demoted.sequenceEvidenceBacked = false;
+        valueBundles[op.getCallable()] = std::move(demoted);
+      }
+      if (call.getNumResults() == 0) {
+        for (mlir::Value result : op.getResults())
+          if (mlir::failed(assignObjectBundle(
+                  op, result, runtimeContractType(context, "types.NoneType"),
+                  mlir::ValueRange{})))
+            return mlir::failure();
+      } else {
+        RuntimeBundle result;
+        if (mlir::failed(bundleRuntimeResults(
+                op, runtimeContractType(context, primitive->resultContract),
+                call, result)))
+          return mlir::failure();
+        valueBundles[op.getResult(0)] = std::move(result);
+      }
+      erase.push_back(op);
+      return mlir::success();
+    }
+    // In-place permutations (sort/reverse) go through the plain manifest
+    // method; only the evidence demotion is special.
+    bool permutesInPlace = receiverContract == "builtins.list" &&
+                           (methodName == "sort" || methodName == "reverse") &&
+                           receiver.physicalValues().size() >= 3;
+    if (permutesInPlace) {
+      if (mlir::failed(lowerManifestMethodResult(
+              op, op.getResult(0), receiver, methodName, sources,
+              /*allowUnusedSources=*/false,
+              /*preferManifestObjectResult=*/true)))
+        return mlir::failure();
+      RuntimeBundle demoted = receiver;
+      demoted.sequenceElements.clear();
+      demoted.sequenceElementBundles.clear();
+      demoted.sequenceIndices.clear();
+      demoted.sequenceEvidenceBacked = false;
+      valueBundles[op.getCallable()] = std::move(demoted);
+      erase.push_back(op);
+      return mlir::success();
+    }
+  }
+
   if (receiver.kind == RuntimeBundle::Kind::Object &&
       receiver.contractName() == "builtins.set" && methodName == "add") {
     // Runtime set insert with dedup: box the element and let the runtime

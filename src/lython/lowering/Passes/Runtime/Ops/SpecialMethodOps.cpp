@@ -49,6 +49,44 @@ std::optional<mlir::Value> knownEvidenceEquality(mlir::Operation *op,
 
 } // namespace
 
+mlir::LogicalResult RuntimeBundleLowerer::pinProbeOperandLiveness(
+    mlir::Operation *op, const RuntimeBundle &payload) {
+  if (payload.objectValue.ownership == ownership::OwnershipKind::Own)
+    return RuntimeBundleLowerer::releaseAggregateSlot(op, payload,
+                                                      "probe.operand");
+  const RuntimeBundle *concrete =
+      RuntimeBundleLowerer::concreteObjectForOwnership(payload);
+  if (!concrete || concrete->kind != RuntimeBundle::Kind::Object)
+    return mlir::success();
+  for (llvm::StringRef candidate :
+       {llvm::StringRef("__len__"), llvm::StringRef("__hash__"),
+        llvm::StringRef("__int__"), llvm::StringRef("__bool__")}) {
+    for (RuntimeSymbol symbol :
+         manifest.methodCandidates(concrete->contractName(), candidate)) {
+      mlir::FunctionType type = symbol.function.getFunctionType();
+      llvm::ArrayRef<mlir::Value> physicals = concrete->physicalValues();
+      if (type.getNumInputs() != physicals.size())
+        continue;
+      bool matches = true;
+      for (auto [input, physical] : llvm::zip(type.getInputs(), physicals))
+        if (physical.getType() != input) {
+          matches = false;
+          break;
+        }
+      if (!matches)
+        continue;
+      RuntimeBundleLowerer::createRuntimeCall(
+          op->getLoc(), symbol,
+          llvm::SmallVector<mlir::Value, 4>(physicals.begin(),
+                                            physicals.end()));
+      return mlir::success();
+    }
+  }
+  // No conforming neutral use: borrowed payloads reaching here are entry
+  // arguments or rooted evidence, both of which outlive the statement.
+  return mlir::success();
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::lowerReceiverMethodResult(
     mlir::Operation *op, mlir::Value receiverValue, mlir::Value resultValue,
     llvm::StringRef missingSubject, llvm::StringRef methodName,
@@ -515,18 +553,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerDelItem(py::DelItemOp op) {
           builder, loc, static_cast<std::int64_t>(wordIndex));
       mlir::memref::StoreOp::create(builder, loc, word, box, slot);
     }
-    bool ownsProbeKey =
-        payload->objectValue.ownership == ownership::OwnershipKind::Own;
-    if (!ownsProbeKey &&
-        mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
-            op, *payload, "dict.delitem.key")))
-      return mlir::failure();
     llvm::SmallVector<mlir::Value, 8> operands(
         container.physicalValues().begin(), container.physicalValues().end());
     operands.push_back(box);
     RuntimeBundleLowerer::createRuntimeCall(loc, *delItemBox, operands);
-    if (mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
-            op, *payload, "dict.delitem.key")))
+    if (mlir::failed(RuntimeBundleLowerer::pinProbeOperandLiveness(op,
+                                                                   *payload)))
       return mlir::failure();
     for (mlir::Value result : op->getResults())
       valueBundles[result] = container;
@@ -728,12 +760,11 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerContains(py::ContainsOp op) {
                           !container.mappingEvidenceBacked &&
                           container.mappingKeys.empty() &&
                           container.physicalValues().size() >= 5;
-  if ((runtimeSetProbe || runtimeDictProbe) &&
-      item.kind == RuntimeBundle::Kind::Object) {
-    // Runtime set/dict membership: hash probe with a BORROWED transient
-    // element box (any hashable class; unhashable probes raise TypeError in
-    // the runtime), then pin both the container and the probed item past the
-    // call (the box holds raw pointer words the liveness cannot see).
+  // Membership probe with a BORROWED transient element box (hash-based for
+  // set/dict, identity-or-equality scan for list/tuple), then pin both the
+  // container and the probed item past the call (the box holds raw pointer
+  // words the liveness cannot see).
+  auto emitBoxProbe = [&]() -> mlir::LogicalResult {
     std::optional<RuntimeSymbol> containsBox =
         manifest.primitive(container.contractName(), "contains_box");
     if (!containsBox)
@@ -759,19 +790,13 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerContains(py::ContainsOp op) {
           builder, loc, static_cast<std::int64_t>(wordIndex));
       mlir::memref::StoreOp::create(builder, loc, word, box, slot);
     }
-    bool ownsProbeItem =
-        payload->objectValue.ownership == ownership::OwnershipKind::Own;
-    if (!ownsProbeItem &&
-        mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
-            op, *payload, "contains.probe")))
-      return mlir::failure();
     llvm::SmallVector<mlir::Value, 8> operands(
         container.physicalValues().begin(), container.physicalValues().end());
     operands.push_back(box);
     mlir::func::CallOp call =
         RuntimeBundleLowerer::createRuntimeCall(loc, *containsBox, operands);
-    if (mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
-            op, *payload, "contains.probe")))
+    if (mlir::failed(RuntimeBundleLowerer::pinProbeOperandLiveness(op,
+                                                                   *payload)))
       return mlir::failure();
     auto pinObject = [&](const RuntimeBundle &object,
                          llvm::StringRef pinMethod) -> mlir::LogicalResult {
@@ -795,31 +820,56 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerContains(py::ContainsOp op) {
     op.getResult().replaceAllUsesWith(call.getResult(0));
     erase.push_back(op);
     return mlir::success();
-  }
-  if (container.kind == RuntimeBundle::Kind::Object &&
-      (container.contractName() == "builtins.list" ||
-       container.contractName() == "builtins.tuple") &&
-      !container.sequenceElementBundles.empty()) {
-    builder.setInsertionPoint(op);
-    if (mlir::failed(touchCollectionEvidenceUse(op, builder, container,
-                                                "sequence contains")))
-      return mlir::failure();
-    mlir::Location loc = op.getLoc();
-    mlir::Value result = constantI1(builder, loc, false);
-    for (const std::shared_ptr<RuntimeBundle> &element :
-         container.sequenceElementBundles) {
-      if (!element)
-        return mlir::failure();
-      std::optional<mlir::Value> equal =
-          knownEvidenceEquality(op, builder, *element, item);
-      if (!equal)
-        return mlir::failure();
-      result = mlir::arith::OrIOp::create(builder, loc, result, *equal);
+  };
+  if ((runtimeSetProbe || runtimeDictProbe) &&
+      item.kind == RuntimeBundle::Kind::Object)
+    return emitBoxProbe();
+  bool sequenceContainer = container.kind == RuntimeBundle::Kind::Object &&
+                           (container.contractName() == "builtins.list" ||
+                            container.contractName() == "builtins.tuple");
+  if (sequenceContainer && !container.sequenceElementBundles.empty()) {
+    // Constant-fold evidence membership when every element compares
+    // statically; otherwise probe the published payload at runtime.
+    bool allKnown = true;
+    {
+      mlir::OpBuilder::InsertionGuard probeGuard(builder);
+      builder.setInsertionPoint(op);
+      mlir::Block *scratch = new mlir::Block();
+      builder.setInsertionPointToStart(scratch);
+      for (const std::shared_ptr<RuntimeBundle> &element :
+           container.sequenceElementBundles) {
+        if (!element ||
+            !knownEvidenceEquality(op, builder, *element, item)) {
+          allKnown = false;
+          break;
+        }
+      }
+      scratch->dropAllReferences();
+      delete scratch;
     }
-    op.getResult().replaceAllUsesWith(result);
-    erase.push_back(op);
-    return mlir::success();
+    if (allKnown) {
+      builder.setInsertionPoint(op);
+      if (mlir::failed(touchCollectionEvidenceUse(op, builder, container,
+                                                  "sequence contains")))
+        return mlir::failure();
+      mlir::Location loc = op.getLoc();
+      mlir::Value result = constantI1(builder, loc, false);
+      for (const std::shared_ptr<RuntimeBundle> &element :
+           container.sequenceElementBundles) {
+        std::optional<mlir::Value> equal =
+            knownEvidenceEquality(op, builder, *element, item);
+        if (!equal)
+          return mlir::failure();
+        result = mlir::arith::OrIOp::create(builder, loc, result, *equal);
+      }
+      op.getResult().replaceAllUsesWith(result);
+      erase.push_back(op);
+      return mlir::success();
+    }
   }
+  if (sequenceContainer && container.physicalValues().size() >= 3 &&
+      item.kind == RuntimeBundle::Kind::Object)
+    return emitBoxProbe();
   if (container.kind == RuntimeBundle::Kind::Object &&
       container.contractName() == "builtins.dict" &&
       !container.mappingKeys.empty() && item.contractName() == "builtins.str") {

@@ -1491,6 +1491,44 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedReprHook() {
   return mlir::success();
 }
 
+mlir::LogicalResult RuntimeBundleLowerer::generateBoxedStrHook() {
+  // str instance of the uniform dispatch (print's conversion): class id ->
+  // the manifest `__str__` returning a `builtins.str`. Demand-driven like
+  // the repr hook.
+  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(
+          "__ly_str_boxed_by_contract");
+      !existing || !existing.isExternal())
+    return mlir::success();
+  mlir::Type i64 = mlir::IntegerType::get(context, 64);
+  mlir::Type i8 = mlir::IntegerType::get(context, 8);
+  auto strHeader = mlir::MemRefType::get({2}, i64);
+  auto strBytes = mlir::MemRefType::get({mlir::ShapedType::kDynamic}, i8);
+  if (mlir::failed(generateBoxedMethodHook(
+          "__ly_str_boxed_by_contract",
+          [](mlir::func::FuncOp function) {
+            auto method = function->getAttrOfType<mlir::StringAttr>(
+                contracts::kManifestMethodAttr);
+            if (!method || method.getValue() != "__str__")
+              return false;
+            // The object-level fallback itself must not join the dispatch
+            // (class 0 handles are the None/plain-object fallback path).
+            return mlir::SymbolTable::getSymbolName(function).getValue() !=
+                   "LyObject_BoxedStr";
+          },
+          {strHeader, strBytes}, /*shareExceptionSubclasses=*/false,
+          /*sourceClassMethodName=*/"__str__")))
+    return mlir::failure();
+  if (auto hook = module.lookupSymbol<mlir::func::FuncOp>(
+          "__ly_str_boxed_by_contract")) {
+    mlir::OpBuilder attrBuilder(context);
+    hook->setAttr("ly.ownership.owned_results",
+                  attrBuilder.getI64ArrayAttr({0}));
+    hook->setAttr("ly.runtime.result_contract",
+                  attrBuilder.getStringAttr("builtins.str"));
+  }
+  return mlir::success();
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::generateBoxedHashHook() {
   // hash instance: class id -> the manifest `__hash__` (returns the i64 hash
   // word). Same demand-driven generation as the repr hook: the external
@@ -1678,6 +1716,23 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
     mlir::cf::BranchOp::create(builder, loc, miss);
   }
   return mlir::success();
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::generateBoxedLtHook() {
+  // lt instance of the binary dispatch (sort/ordering over erased values).
+  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(
+          "__ly_lt_boxed_by_contract");
+      !existing || !existing.isExternal())
+    return mlir::success();
+  mlir::Type i1 = mlir::IntegerType::get(context, 1);
+  return generateBoxedBinaryMethodHook(
+      "__ly_lt_boxed_by_contract",
+      [](mlir::func::FuncOp function) {
+        auto method = function->getAttrOfType<mlir::StringAttr>(
+            contracts::kManifestMethodAttr);
+        return method && method.getValue() == "__lt__";
+      },
+      {i1}, /*sourceClassMethodName=*/"__lt__");
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::generateBoxedEqHook() {

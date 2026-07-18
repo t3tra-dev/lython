@@ -1011,6 +1011,9 @@ void TypeSystem::seedBuiltins() {
   bindSymbol("hash", table.freeFunctionContract("builtins.hash")
                          .value_or(py::CallableType::get(
                              &context, {object()}, {}, {}, {}, {intType()})));
+  if (std::optional<mlir::Type> sortedContract =
+          table.freeFunctionContract("builtins.sorted"))
+    bindSymbol("sorted", *sortedContract);
   bindClass("object", object());
   bindClass("bool", boolType());
   bindClass("int", intType());
