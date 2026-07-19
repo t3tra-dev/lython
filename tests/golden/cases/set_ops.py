@@ -25,3 +25,15 @@ st = {(x % 2, x % 3) for x in range(12)}
 print(len(st), (1, 2) in st, (2, 1) in st)
 fs = {x / 2 for x in range(4)}
 print(sorted(fs), 1.5 in fs, 1 in fs)
+u1 = {x for x in range(5)}
+u1.update({x for x in range(3, 8)})
+print(sorted(u1))
+u2 = {x for x in range(6)}
+u2.intersection_update({x for x in range(2, 9)})
+print(sorted(u2))
+u3 = {x for x in range(6)}
+u3.difference_update({x for x in range(2, 4)})
+print(sorted(u3))
+u4 = {x for x in range(5)}
+u4.symmetric_difference_update({x for x in range(3, 8)})
+print(sorted(u4))

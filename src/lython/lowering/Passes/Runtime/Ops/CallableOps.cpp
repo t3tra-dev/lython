@@ -384,18 +384,30 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
     }
   }
 
-  // Structural dict.update: the manifest method consumes the receiver's
-  // storage token and returns the (possibly reallocated) representation the
-  // rebind result carries.
-  if (runtimeDictReceiver && structuralMutation && methodName == "update" &&
-      sources.size() == 2 && sources[1] &&
-      sources[1]->kind == RuntimeBundle::Kind::Object &&
-      sources[1]->contractName() == "builtins.dict" &&
-      sources[1]->physicalValues().size() >= 5) {
+  // Structural update family (dict.update, set.update and the in-place set
+  // filters): the manifest method consumes the receiver's storage token and
+  // returns the (possibly reallocated) representation the rebind result
+  // carries.
+  bool runtimeSetReceiver = receiver.kind == RuntimeBundle::Kind::Object &&
+                            receiver.contractName() == "builtins.set" &&
+                            receiver.physicalValues().size() >= 3;
+  bool structuralUpdate =
+      (runtimeDictReceiver && methodName == "update") ||
+      (runtimeSetReceiver &&
+       (methodName == "update" || methodName == "intersection_update" ||
+        methodName == "difference_update" ||
+        methodName == "symmetric_difference_update"));
+  if (structuralUpdate && structuralMutation && sources.size() == 2 &&
+      sources[1] && sources[1]->kind == RuntimeBundle::Kind::Object &&
+      sources[1]->contractName() == receiver.contractName() &&
+      sources[1]->physicalValues().size() ==
+          receiver.physicalValues().size()) {
     std::optional<RuntimeSymbol> update =
-        manifest.method("builtins.dict", "update");
+        manifest.method(receiver.contractName(), methodName);
     if (!update)
-      return op.emitError() << "runtime manifest has no dict update method";
+      return op.emitError() << "runtime manifest has no "
+                            << receiver.contractName() << "." << methodName
+                            << " method";
     builder.setInsertionPoint(op);
     mlir::Location loc = op.getLoc();
     llvm::SmallVector<mlir::Value, 10> operands(

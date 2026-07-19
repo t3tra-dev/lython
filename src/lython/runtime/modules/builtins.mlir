@@ -391,9 +391,13 @@ module attributes {
     ly.runtime.required_deallocator,
     ly.runtime.required_initializers = ["__new__"],
     ly.runtime.required_methods = ["__len__"],
-    ly.typing.structural_mutators = ["add"],
+    ly.typing.structural_mutators = ["add", "update", "intersection_update",
+                                     "difference_update",
+                                     "symmetric_difference_update"],
     method_names = ["__init__", "add", "__len__", "__iter__",
                     "__contains__", "discard", "remove", "clear", "copy",
+                    "update", "intersection_update", "difference_update",
+                    "symmetric_difference_update",
                     "union", "intersection", "difference",
                     "symmetric_difference", "issubset", "issuperset",
                     "isdisjoint", "__eq__", "__ne__", "__or__", "__and__",
@@ -409,6 +413,10 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.set">, !py.contract<"$T">] -> [!py.literal<None>]>,
       !py.protocol<"Callable", [!py.contract<"builtins.set">] -> [!py.literal<None>]>,
       !py.protocol<"Callable", [!py.contract<"builtins.set">] -> [!py.contract<"builtins.set", [!py.contract<"$T">]>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.set">, !py.contract<"builtins.set", [!py.contract<"$T">]>] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.set">, !py.contract<"builtins.set", [!py.contract<"$T">]>] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.set">, !py.contract<"builtins.set", [!py.contract<"$T">]>] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.set">, !py.contract<"builtins.set", [!py.contract<"$T">]>] -> [!py.literal<None>]>,
       !py.protocol<"Callable", [!py.contract<"builtins.set">, !py.contract<"builtins.set", [!py.contract<"$T">]>] -> [!py.contract<"builtins.set", [!py.contract<"$T">]>]>,
       !py.protocol<"Callable", [!py.contract<"builtins.set">, !py.contract<"builtins.set", [!py.contract<"$T">]>] -> [!py.contract<"builtins.set", [!py.contract<"$T">]>]>,
       !py.protocol<"Callable", [!py.contract<"builtins.set">, !py.contract<"builtins.set", [!py.contract<"$T">]>] -> [!py.contract<"builtins.set", [!py.contract<"$T">]>]>,
@@ -428,6 +436,7 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.set">, !py.contract<"builtins.set">] -> [!py.contract<"builtins.bool">]>
     ],
     method_kinds = ["instance", "instance", "instance", "instance",
+                    "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
@@ -9219,6 +9228,142 @@ module attributes {
     %proper = arith.cmpi ne, %llen, %rlen : i64
     %r = arith.andi %sub, %proper : i1
     func.return %r : i1
+  }
+
+  // In-place update family (structural rebind carries the possibly
+  // reallocated triple; the filters compact in place).
+  func.func @LySet_UpdateM(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>, %oh: memref<2xi64> {ly.ownership.object_header}, %om: memref<2xi64>, %oi: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.transfer_args = [0], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.set", ly.runtime.method = "update", ly.runtime.result_contract = "builtins.set"} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %olen = memref.load %om[%c0] : memref<2xi64>
+    %olen_index = arith.index_cast %olen : i64 to index
+    %merged:3 = scf.for %i = %c0 to %olen_index step %c1 iter_args(%h = %header, %m = %meta, %it = %items) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) {
+      %next:3 = func.call @__ly_set_insert_slot(%h, %m, %it, %oi, %i) : (memref<2xi64>, memref<2xi64>, memref<?xi64>, memref<?xi64>, index) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+      scf.yield %next#0, %next#1, %next#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+    }
+    func.return %merged#0, %merged#1, %merged#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  }
+
+  // Keep/drop filter core: keep receiver entries whose membership in
+  // (om, oi) equals %keep_present; dropped entries are released and the
+  // dense prefix compacted.
+  func.func private @__ly_set_filter_in_place(%meta: memref<2xi64>, %items: memref<?xi64>, %om: memref<2xi64>, %oi: memref<?xi64>, %keep_present: i1, %scan_limit: i64) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c16 = arith.constant 16 : index
+    %c16_i64 = arith.constant 16 : i64
+    %minus_one = arith.constant -1 : i64
+    %zero = arith.constant 0 : i64
+    %len = memref.load %meta[%c0] : memref<2xi64>
+    %len_index = arith.index_cast %len : i64 to index
+    %limit_index = arith.index_cast %scan_limit : i64 to index
+    %items_idx = memref.extract_aligned_pointer_as_index %items : memref<?xi64> -> index
+    %items_i64 = arith.index_cast %items_idx : index to i64
+    %items_ptr = llvm.inttoptr %items_i64 : i64 to !llvm.ptr
+    %kept = scf.for %i = %c0 to %len_index step %c1 iter_args(%next = %c0) -> (index) {
+      %ii = arith.index_cast %i : index to i64
+      %off = arith.muli %ii, %c16_i64 : i64
+      %entry = llvm.getelementptr %items_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %beyond_limit = arith.cmpi sge, %i, %limit_index : index
+      %matches = scf.if %beyond_limit -> (i1) {
+        %true_k = arith.constant true
+        scf.yield %true_k : i1
+      } else {
+        %entry_hash = func.call @__ly_box_hash(%entry) : (!llvm.ptr) -> i64
+        %in_other = func.call @__ly_set_probe(%om, %oi, %entry, %entry_hash) : (memref<2xi64>, memref<?xi64>, !llvm.ptr, i64) -> i64
+        %present = arith.cmpi ne, %in_other, %minus_one : i64
+        %k = arith.cmpi eq, %present, %keep_present : i1
+        scf.yield %k : i1
+      }
+      %advanced = scf.if %matches -> (index) {
+        %same = arith.cmpi eq, %next, %i : index
+        scf.if %same {
+        } else {
+          %src_base = arith.muli %i, %c16 : index
+          %dst_base = arith.muli %next, %c16 : index
+          scf.for %w = %c0 to %c16 step %c1 {
+            %src = arith.addi %src_base, %w : index
+            %dst = arith.addi %dst_base, %w : index
+            %word = memref.load %items[%src] : memref<?xi64>
+            memref.store %word, %items[%dst] : memref<?xi64>
+          }
+        }
+        %inc = arith.addi %next, %c1 : index
+        scf.yield %inc : index
+      } else {
+        func.call @LyObject_ReleaseBoxedPayloadArraySlotRaw(%items, %ii) : (memref<?xi64>, i64) -> ()
+        scf.yield %next : index
+      }
+      scf.yield %advanced : index
+    }
+    // Zero the vacated tail so stale handles never look live.
+    %kept_i64 = arith.index_cast %kept : index to i64
+    %kept_words = arith.muli %kept, %c16 : index
+    %len_words = arith.muli %len_index, %c16 : index
+    scf.for %w = %kept_words to %len_words step %c1 {
+      memref.store %zero, %items[%w] : memref<?xi64>
+    }
+    memref.store %kept_i64, %meta[%c0] : memref<2xi64>
+    func.return
+  }
+
+  func.func @LySet_IntersectionUpdate(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>, %oh: memref<2xi64> {ly.ownership.object_header}, %om: memref<2xi64>, %oi: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.transfer_args = [0], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.set", ly.runtime.method = "intersection_update", ly.runtime.result_contract = "builtins.set"} {
+    %true = arith.constant true
+    %c0_len = arith.constant 0 : index
+    %len_now = memref.load %meta[%c0_len] : memref<2xi64>
+    func.call @__ly_set_filter_in_place(%meta, %items, %om, %oi, %true, %len_now) : (memref<2xi64>, memref<?xi64>, memref<2xi64>, memref<?xi64>, i1, i64) -> ()
+    func.return %header, %meta, %items : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  }
+
+  func.func @LySet_DifferenceUpdate(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>, %oh: memref<2xi64> {ly.ownership.object_header}, %om: memref<2xi64>, %oi: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.transfer_args = [0], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.set", ly.runtime.method = "difference_update", ly.runtime.result_contract = "builtins.set"} {
+    %false = arith.constant false
+    %c0_len = arith.constant 0 : index
+    %len_now = memref.load %meta[%c0_len] : memref<2xi64>
+    func.call @__ly_set_filter_in_place(%meta, %items, %om, %oi, %false, %len_now) : (memref<2xi64>, memref<?xi64>, memref<2xi64>, memref<?xi64>, i1, i64) -> ()
+    func.return %header, %meta, %items : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  }
+
+  func.func @LySet_SymmetricDifferenceUpdate(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>, %oh: memref<2xi64> {ly.ownership.object_header}, %om: memref<2xi64>, %oi: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.transfer_args = [0], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.set", ly.runtime.method = "symmetric_difference_update", ly.runtime.result_contract = "builtins.set"} {
+    // other-only elements first (from a snapshot of the ORIGINAL receiver
+    // membership: drop the common part after collecting), then drop common.
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c16_i64 = arith.constant 16 : i64
+    %minus_one = arith.constant -1 : i64
+    %olen = memref.load %om[%c0] : memref<2xi64>
+    %olen_index = arith.index_cast %olen : i64 to index
+    %oi_idx = memref.extract_aligned_pointer_as_index %oi : memref<?xi64> -> index
+    %oi_i64 = arith.index_cast %oi_idx : index to i64
+    %oi_ptr = llvm.inttoptr %oi_i64 : i64 to !llvm.ptr
+    // Original receiver length: additions land past it, so the common-drop
+    // filter below only scans the original prefix.
+    %orig_len = memref.load %meta[%c0] : memref<2xi64>
+    %added:3 = scf.for %i = %c0 to %olen_index step %c1 iter_args(%h = %header, %m = %meta, %it = %items) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) {
+      %ii = arith.index_cast %i : index to i64
+      %off = arith.muli %ii, %c16_i64 : i64
+      %entry = llvm.getelementptr %oi_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %entry_hash = func.call @__ly_box_hash(%entry) : (!llvm.ptr) -> i64
+      // Probe only the ORIGINAL prefix so freshly added other-elements do
+      // not mask membership.
+      %saved_len = memref.load %m[%c0] : memref<2xi64>
+      memref.store %orig_len, %m[%c0] : memref<2xi64>
+      %in_orig = func.call @__ly_set_probe(%m, %it, %entry, %entry_hash) : (memref<2xi64>, memref<?xi64>, !llvm.ptr, i64) -> i64
+      memref.store %saved_len, %m[%c0] : memref<2xi64>
+      %absent = arith.cmpi eq, %in_orig, %minus_one : i64
+      %next:3 = scf.if %absent -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) {
+        %ins:3 = func.call @__ly_set_insert_slot(%h, %m, %it, %oi, %i) : (memref<2xi64>, memref<2xi64>, memref<?xi64>, memref<?xi64>, index) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+        scf.yield %ins#0, %ins#1, %ins#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+      } else {
+        scf.yield %h, %m, %it : memref<2xi64>, memref<2xi64>, memref<?xi64>
+      }
+      scf.yield %next#0, %next#1, %next#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+    }
+    // Drop the common part from the ORIGINAL prefix only: the appended
+    // entries came from `other`, so an unbounded filter would delete them
+    // right back.
+    %false = arith.constant false
+    func.call @__ly_set_filter_in_place(%added#1, %added#2, %om, %oi, %false, %orig_len) : (memref<2xi64>, memref<?xi64>, memref<2xi64>, memref<?xi64>, i1, i64) -> ()
+    func.return %added#0, %added#1, %added#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
   }
 
   func.func @LySet_DecRef(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.set", ly.runtime.deallocator} {
