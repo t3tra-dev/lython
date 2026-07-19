@@ -1430,7 +1430,8 @@ Value ModuleEmitter::emitBoolOpValue(const parser::Node &expr, bool isAnd,
     llvm::StringRef name = contract.getContractName();
     return name == "builtins.list" || name == "builtins.dict" ||
            name == "builtins.set" || name == "builtins.tuple" ||
-           name == "builtins.str" || name == "builtins.bytes";
+           name == "builtins.str" || name == "builtins.bytes" ||
+           name == "builtins.int" || name == "builtins.float";
   };
 
   llvm::SmallVector<mlir::Type, 4> parts;
@@ -1898,19 +1899,8 @@ mlir::Value ModuleEmitter::emitBoolValue(Value value,
         }
         member = candidate;
       }
-      mlir::Type widenedMember = member ? types.widenLiteral(member) : member;
-      if (widenedMember == types.intType() ||
-          widenedMember == types.floatType()) {
-        // The `is not None` desugar would call a present 0 truthy — reject
-        // instead of silently mis-executing (same R1 rule as bare numerics).
-        diagnostics.push_back(parser::Diagnostic{
-            parser::Severity::Error, anchor.range.start,
-            "implicit truthiness of an Optional numeric conflates None with "
-            "0; write explicit comparisons (`x is not None`, `x != 0`)"});
-        return mlir::arith::ConstantIntOp::create(builder, loc(anchor), 1, 1)
-            .getResult();
-      }
       if (member) {
+        mlir::Type widenedMember = types.widenLiteral(member);
         auto isNone = py::UnionTestOp::create(builder, loc(anchor),
                                               builder.getI1Type(), value.value,
                                               mlir::TypeAttr::get(types.none()));
@@ -1923,7 +1913,32 @@ mlir::Value ModuleEmitter::emitBoolValue(Value value,
             [&]() -> mlir::Value {
               auto unwrap = py::UnionUnwrapOp::create(builder, loc(anchor),
                                                       member, value.value);
-              return emitBoolValue(Value{unwrap.getResult(), member}, anchor);
+              Value unwrapped{unwrap.getResult(), member};
+              // A numeric member re-enters truthiness as the explicit
+              // comparison R1 demands of BARE numerics: under the not-None
+              // guard, `opt != 0` is exactly CPython's bool(opt).
+              if (widenedMember == types.intType() ||
+                  widenedMember == types.floatType()) {
+                Value zero;
+                if (widenedMember == types.intType()) {
+                  mlir::Type zeroType = types.literal("0");
+                  zero = Value{py::IntConstantOp::create(
+                                   builder, loc(anchor), zeroType,
+                                   builder.getStringAttr("0"))
+                                   .getResult(),
+                               zeroType};
+                } else {
+                  zero = Value{py::FloatConstantOp::create(
+                                   builder, loc(anchor), types.floatType(),
+                                   builder.getF64FloatAttr(0.0))
+                                   .getResult(),
+                               types.floatType()};
+                }
+                Value nonzero = emitBinarySpecial<py::NeOp>(
+                    anchor, "__ne__", unwrapped, zero, types.boolType());
+                return emitBoolValue(nonzero, anchor);
+              }
+              return emitBoolValue(unwrapped, anchor);
             },
             [&]() -> mlir::Value {
               return mlir::arith::ConstantIntOp::create(builder, loc(anchor),

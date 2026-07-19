@@ -23,6 +23,24 @@ void ModuleEmitter::emitStatements(
       break;
     if (statement && (!skipDeclarations || !isTopLevelDecl(*statement)))
       emitStatement(*statement);
+    else if (statement && skipDeclarations)
+      // A skipped module-level def still EXECUTES here in CPython terms:
+      // its non-constant defaults evaluate at this spot, once, into their
+      // module-lifetime cells (R6).
+      emitPendingDefaultCells(*statement);
+  }
+}
+
+void ModuleEmitter::emitPendingDefaultCells(const parser::Node &statement) {
+  auto pending = pendingDefaultCells.find(&statement);
+  if (pending == pendingDefaultCells.end())
+    return;
+  for (const PendingDefaultCell &cell : pending->second) {
+    Value value = emitExprExpected(cell.expr.get(), cell.declaredType);
+    Value coerced = coerceValue(value, cell.declaredType, statement);
+    py::GlobalSetOp::create(builder, loc(statement),
+                            builder.getStringAttr(cell.cellName),
+                            coerced.value);
   }
 }
 
@@ -255,8 +273,9 @@ void ModuleEmitter::emitDelete(const parser::Node &statement) {
     if (target->kind == "Attribute") {
       diagnostics.push_back(parser::Diagnostic{
           parser::Severity::Error, target->range.start,
-          "`del` on an attribute is not supported: instance attributes are "
-          "fixed storage slots in Lython's static object layout"});
+          "`del` on an attribute is rejected (Lython deviation from CPython): "
+          "instance attributes are fixed storage slots in the static object "
+          "layout"});
       continue;
     }
     diagnostics.push_back(
