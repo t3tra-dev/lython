@@ -390,8 +390,14 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
   if (object->kind == RuntimeBundle::Kind::Object &&
       (op.getName() == "message" || op.getName() == "exceptions")) {
     std::string contract = runtimeContractName(op.getObject().getType());
+    // BaseException/Exception join in: a group member read back through
+    // .exceptions is statically the tuple's BaseException element type while
+    // the dynamic class stays the group's. Non-exception contracts still
+    // fall through to the class-schema diagnostic.
     bool groupShaped = contract == "builtins.BaseExceptionGroup" ||
-                       contract == "builtins.ExceptionGroup";
+                       contract == "builtins.ExceptionGroup" ||
+                       contract == "builtins.BaseException" ||
+                       contract == "builtins.Exception";
     if (groupShaped && object->physicalValues().size() == 3) {
       std::optional<RuntimeSymbol> primitive =
           manifest.primitive(contract, op.getName());

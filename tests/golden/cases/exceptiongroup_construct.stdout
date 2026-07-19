@@ -1,0 +1,11 @@
+boom (2 sub-exceptions)
+ExceptionGroup('boom', [ValueError('a'), TypeError('b')])
+boom
+2
+ValueError('a')
+TypeError('b')
+one (1 sub-exception)
+ExceptionGroup('one', [KeyError('k')])
+outer (2 sub-exceptions)
+ExceptionGroup('outer', [ExceptionGroup('inner', [ValueError('v'), KeyError('k')]), TypeError('t')])
+2

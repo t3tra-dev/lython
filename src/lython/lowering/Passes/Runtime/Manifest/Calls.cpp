@@ -714,6 +714,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
         context, initContract == "builtins.ExceptionGroup"
                      ? "builtins.Exception"
                      : "builtins.BaseException");
+    mlir::Type exceptionBase =
+        runtimeContractType(context, "builtins.Exception");
+    bool allMembersAreExceptions = true;
     for (auto [memberIndex, member] : llvm::enumerate(groupMembers)) {
       bool exceptionShaped =
           member.values.size() == 3 &&
@@ -725,6 +728,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
                << initContract << " member " << memberIndex << " has type "
                << member.contract << ", which is not derived from "
                << requiredBase;
+      allMembersAreExceptions =
+          allMembersAreExceptions &&
+          py::isAssignableTo(member.contract, exceptionBase, op);
     }
 
     std::optional<EmittedRuntimeCall> messageInit;
@@ -799,6 +805,30 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
             adaptOperand(member.values[index], storeInputs[index + 2]));
       RuntimeBundleLowerer::createRuntimeCall(loc, *memberStore,
                                               storeOperands);
+    }
+    // CPython's BaseExceptionGroup.__new__ returns an ExceptionGroup when
+    // every member is an Exception; the dynamic class word follows suit so
+    // repr/except-matching see the derived class.
+    if (initContract == "builtins.BaseExceptionGroup" &&
+        allMembersAreExceptions) {
+      std::optional<RuntimeSymbol> extSet =
+          manifest.primitive("builtins.BaseException", "ext_set");
+      if (!extSet)
+        return op.emitError()
+               << "runtime manifest has no BaseException ext_set primitive";
+      mlir::Value classSlot =
+          mlir::arith::ConstantIntOp::create(builder, loc, 2, 64).getResult();
+      mlir::Value exceptionGroupId =
+          mlir::arith::ConstantIntOp::create(builder, loc, 102, 64)
+              .getResult();
+      llvm::ArrayRef<mlir::Type> extInputs =
+          extSet->function.getFunctionType().getInputs();
+      if (extInputs.size() != 3)
+        return op.emitError() << "BaseException ext_set ABI mismatch";
+      RuntimeBundleLowerer::createRuntimeCall(
+          loc, *extSet,
+          {adaptOperand(updatedInstance.physicalValues()[0], extInputs[0]),
+           classSlot, exceptionGroupId});
     }
     // A materialized member sequence must stay alive until every member has
     // been retained into the block — without a use here the refcount pass

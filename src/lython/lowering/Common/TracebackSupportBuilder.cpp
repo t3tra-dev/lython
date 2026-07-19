@@ -74,6 +74,15 @@ void declareTracebackSupport(SupportBuilder &b) {
                                    mlir::LLVM::Linkage::Internal, name,
                                    b.builder.getIntegerAttr(b.i64(), 0),
                                    /*alignment=*/8);
+    // ExceptionGroup display margin: every stderr line the printers start
+    // while this is >= 0 gets that many spaces plus "| " (CPython's group
+    // traceback gutter). -1 = plain display.
+    mlir::LLVM::GlobalOp::create(b.builder, b.loc, b.i64(),
+                                 /*isConstant=*/false,
+                                 mlir::LLVM::Linkage::Internal,
+                                 "g_tb_prefix_spaces",
+                                 b.builder.getIntegerAttr(b.i64(), -1),
+                                 /*alignment=*/8);
     auto stack = mlir::LLVM::GlobalOp::create(
         b.builder, b.loc, tracebackStackType(b), /*isConstant=*/false,
         mlir::LLVM::Linkage::Internal, "g_traceback_stack", mlir::Attribute(),
@@ -96,6 +105,16 @@ void declareTracebackSupport(SupportBuilder &b) {
                  "\nThe above exception was the direct cause of the following "
                  "exception:\n\n");
   b.stringGlobal(".tb_fmt_frame", "  File \"%s\", line %d, in %s\n");
+  b.stringGlobal(".tb_group_header",
+                 "  + Exception Group Traceback (most recent call last):\n");
+  b.stringGlobal(".tb_bar", "| ");
+  b.stringGlobal(".tb_fmt_sep_first",
+                 "+-+---------------- %lld ----------------\n");
+  b.stringGlobal(".tb_fmt_sep_next",
+                 "+---------------- %lld ----------------\n");
+  b.stringGlobal(".tb_sep_close", "+------------------------------------\n");
+  b.stringGlobal(".tb_fmt_group_one", " (%lld sub-exception)\n");
+  b.stringGlobal(".tb_fmt_group_many", " (%lld sub-exceptions)\n");
   b.stringGlobal(".tb_fmt_class", "%s\n");
   b.stringGlobal(".tb_fmt_invalid", "%s: <invalid>\n");
   b.stringGlobal(".tb_fmt_unknown", "%s: <unknown>\n");
@@ -1271,6 +1290,7 @@ void buildPrintMarker(SupportBuilder &b) {
 
   b.builder.setInsertionPointToEnd(emit);
   mlir::Value stderrFd = b.iconst32(2);
+  b.call("write_prefix", mlir::TypeRange{}, mlir::ValueRange{stderrFd});
   b.call("write_cstr", mlir::TypeRange{},
          mlir::ValueRange{stderrFd, b.addrOf(".tb_indent")});
   mlir::cf::BranchOp::create(b.builder, b.loc, padHead,
@@ -1334,6 +1354,223 @@ void buildPrintMarker(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
+// void write_spaces(i32 fd, i64 count): margin padding for the group display.
+void buildWriteSpaces(SupportBuilder &b) {
+  auto fn = b.beginFunction("write_spaces",
+                            b.builder.getFunctionType({b.i32(), b.i64()}, {}),
+                            /*isPrivate=*/true);
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::Region &body = fn.getBody();
+  mlir::Block *head =
+      b.builder.createBlock(&body, body.end(), {b.i64()}, {b.loc});
+  mlir::Block *one = b.builder.createBlock(&body);
+  mlir::Block *done = b.builder.createBlock(&body);
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::cf::BranchOp::create(b.builder, b.loc, head,
+                             mlir::ValueRange{b.iconst(0)});
+  b.builder.setInsertionPointToEnd(head);
+  mlir::Value index = head->getArgument(0);
+  mlir::Value finished =
+      b.cmpi(mlir::arith::CmpIPredicate::sge, index, entry->getArgument(1));
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, finished, done,
+                                 mlir::ValueRange{}, one, mlir::ValueRange{});
+  b.builder.setInsertionPointToEnd(one);
+  b.call("write_char", mlir::TypeRange{},
+         mlir::ValueRange{entry->getArgument(0), b.iconst8(32)});
+  mlir::Value next =
+      mlir::arith::AddIOp::create(b.builder, b.loc, index, b.iconst(1));
+  mlir::cf::BranchOp::create(b.builder, b.loc, head, mlir::ValueRange{next});
+  b.builder.setInsertionPointToEnd(done);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
+// void write_prefix(i32 fd): the group-display gutter (margin spaces + "| ")
+// when g_tb_prefix_spaces >= 0; a no-op for the plain display, so the
+// printers call it unconditionally at every line start.
+void buildWritePrefix(SupportBuilder &b) {
+  auto fn = b.beginFunction("write_prefix",
+                            b.builder.getFunctionType({b.i32()}, {}),
+                            /*isPrivate=*/true);
+  mlir::Block *entry = fn.addEntryBlock();
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value spaces = b.loadI64(b.addrOf("g_tb_prefix_spaces"));
+  mlir::Value active =
+      b.cmpi(mlir::arith::CmpIPredicate::sge, spaces, b.iconst(0));
+  auto activeIf = mlir::scf::IfOp::create(b.builder, b.loc, mlir::TypeRange{},
+                                          active, /*withElseRegion=*/false);
+  {
+    mlir::OpBuilder::InsertionGuard guard(b.builder);
+    b.builder.setInsertionPointToStart(&activeIf.getThenRegion().front());
+    b.call("write_spaces", mlir::TypeRange{},
+           mlir::ValueRange{entry->getArgument(0), spaces});
+    b.call("write_cstr", mlir::TypeRange{},
+           mlir::ValueRange{entry->getArgument(0), b.addrOf(".tb_bar")});
+  }
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
+// i64 exception_group_member_count(i64 excPtr): the member-block count of an
+// exception's extended word 3 (0 for a plain exception or a null pointer).
+void buildExceptionGroupMemberCount(SupportBuilder &b) {
+  auto fn = b.beginFunction("exception_group_member_count",
+                            b.builder.getFunctionType({b.i64()}, {b.i64()}),
+                            /*isPrivate=*/true);
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::Region &body = fn.getBody();
+  mlir::Block *load = b.builder.createBlock(&body);
+  mlir::Block *blockLoad = b.builder.createBlock(&body);
+  mlir::Block *zero = b.builder.createBlock(&body);
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value excNull = b.cmpi(mlir::arith::CmpIPredicate::eq,
+                               entry->getArgument(0), b.iconst(0));
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, excNull, zero,
+                                 mlir::ValueRange{}, load, mlir::ValueRange{});
+  b.builder.setInsertionPointToEnd(load);
+  mlir::Value blockWord = b.loadI64(
+      b.gepI64(b.intToPtr(entry->getArgument(0)), b.iconst(3)));
+  mlir::Value blockNull =
+      b.cmpi(mlir::arith::CmpIPredicate::eq, blockWord, b.iconst(0));
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, blockNull, zero,
+                                 mlir::ValueRange{}, blockLoad,
+                                 mlir::ValueRange{});
+  b.builder.setInsertionPointToEnd(blockLoad);
+  mlir::Value count = b.loadI64(b.intToPtr(blockWord));
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{count});
+  b.builder.setInsertionPointToEnd(zero);
+  mlir::func::ReturnOp::create(b.builder, b.loc,
+                               mlir::ValueRange{b.iconst(0)});
+}
+
+// void print_group_members(i64 excPtr, i64 margin): CPython's numbered member
+// sections for an exception group, recursing into nested groups two spaces
+// deeper. The member summaries reuse print_exception_summary through the
+// prefix gutter.
+void buildPrintGroupMembers(SupportBuilder &b) {
+  auto fn = b.beginFunction("print_group_members",
+                            b.builder.getFunctionType({b.i64(), b.i64()}, {}),
+                            /*isPrivate=*/true);
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::Region &body = fn.getBody();
+  mlir::Block *walk = b.builder.createBlock(&body);
+  mlir::Block *done = b.builder.createBlock(&body);
+  mlir::Value margin = entry->getArgument(1);
+
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value count = b.call("exception_group_member_count", b.i64(),
+                             mlir::ValueRange{entry->getArgument(0)})
+                          .front();
+  mlir::Value none = b.cmpi(mlir::arith::CmpIPredicate::sle, count,
+                            b.iconst(0));
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, none, done,
+                                 mlir::ValueRange{}, walk, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(walk);
+  mlir::Value stderrFd = b.iconst32(2);
+  mlir::Value childMargin =
+      mlir::arith::AddIOp::create(b.builder, b.loc, margin, b.iconst(2));
+  mlir::Value blockWord = b.loadI64(
+      b.gepI64(b.intToPtr(entry->getArgument(0)), b.iconst(3)));
+  mlir::Value blockPtr = b.intToPtr(blockWord);
+  auto bufferType = mlir::LLVM::LLVMArrayType::get(b.i8(), 128);
+  mlir::Value bufferSlot = mlir::LLVM::AllocaOp::create(
+      b.builder, b.loc, b.ptr(), bufferType, b.iconst32(1), /*alignment=*/1);
+  mlir::Value buffer = mlir::LLVM::GEPOp::create(
+      b.builder, b.loc, b.ptr(), bufferType, bufferSlot,
+      llvm::ArrayRef<mlir::LLVM::GEPArg>{mlir::LLVM::GEPArg(0),
+                                         mlir::LLVM::GEPArg(0)},
+      mlir::LLVM::GEPNoWrapFlags::inbounds);
+  auto snprintfType = mlir::LLVM::LLVMFunctionType::get(
+      b.i32(), {b.ptr(), b.i64(), b.ptr()}, /*isVarArg=*/true);
+  mlir::Value zeroIndex =
+      mlir::arith::ConstantIndexOp::create(b.builder, b.loc, 0);
+  mlir::Value oneIndex =
+      mlir::arith::ConstantIndexOp::create(b.builder, b.loc, 1);
+  mlir::Value countIndex = mlir::arith::IndexCastOp::create(
+      b.builder, b.loc, b.builder.getIndexType(), count);
+  auto loop = mlir::scf::ForOp::create(b.builder, b.loc, zeroIndex, countIndex,
+                                       oneIndex);
+  {
+    mlir::OpBuilder::InsertionGuard guard(b.builder);
+    b.builder.setInsertionPointToStart(loop.getBody());
+    mlir::Value position = mlir::arith::IndexCastOp::create(
+        b.builder, b.loc, b.i64(), loop.getInductionVar());
+    mlir::Value ordinal =
+        mlir::arith::AddIOp::create(b.builder, b.loc, position, b.iconst(1));
+    mlir::Value boxWords = mlir::arith::MulIOp::create(b.builder, b.loc,
+                                                       position, b.iconst(16));
+    mlir::Value boxBase =
+        mlir::arith::AddIOp::create(b.builder, b.loc, boxWords, b.iconst(1));
+    mlir::Value boxPtr = b.gepI64(blockPtr, boxBase);
+    mlir::Value ehWord = b.loadI64(b.gepI64(boxPtr, b.iconst(4)));
+    mlir::Value mhWord = b.loadI64(b.gepI64(boxPtr, b.iconst(5)));
+    mlir::Value mbWord = b.loadI64(b.gepI64(boxPtr, b.iconst(6)));
+    mlir::Value mbLen = b.loadI64(b.gepI64(boxPtr, b.iconst(11)));
+    mlir::Value classId =
+        b.loadI64(b.gepI64(b.intToPtr(ehWord), b.iconst(2)));
+
+    // Separator: the first section carries the parent connector ("+-+" at
+    // the parent margin), later sections sit at the member margin.
+    mlir::Value isFirst =
+        b.cmpi(mlir::arith::CmpIPredicate::eq, position, b.iconst(0));
+    auto sepIf = mlir::scf::IfOp::create(b.builder, b.loc, mlir::TypeRange{},
+                                         isFirst, /*withElseRegion=*/true);
+    {
+      mlir::OpBuilder::InsertionGuard sepGuard(b.builder);
+      b.builder.setInsertionPointToStart(&sepIf.getThenRegion().front());
+      b.call("write_spaces", mlir::TypeRange{},
+             mlir::ValueRange{stderrFd, margin});
+      auto formatted = mlir::LLVM::CallOp::create(
+          b.builder, b.loc, snprintfType, "snprintf",
+          mlir::ValueRange{buffer, b.iconst(128),
+                           b.addrOf(".tb_fmt_sep_first"), ordinal});
+      b.call("write_buffered", mlir::TypeRange{},
+             mlir::ValueRange{stderrFd, buffer, formatted.getResult()});
+      b.builder.setInsertionPointToStart(&sepIf.getElseRegion().front());
+      b.call("write_spaces", mlir::TypeRange{},
+             mlir::ValueRange{stderrFd, childMargin});
+      auto formattedNext = mlir::LLVM::CallOp::create(
+          b.builder, b.loc, snprintfType, "snprintf",
+          mlir::ValueRange{buffer, b.iconst(128),
+                           b.addrOf(".tb_fmt_sep_next"), ordinal});
+      b.call("write_buffered", mlir::TypeRange{},
+             mlir::ValueRange{stderrFd, buffer, formattedNext.getResult()});
+    }
+
+    // Member summary behind the gutter, then nested members.
+    mlir::Value prefixSlot = b.addrOf("g_tb_prefix_spaces");
+    mlir::LLVM::StoreOp::create(b.builder, b.loc, childMargin, prefixSlot,
+                                /*alignment=*/8);
+    b.call("print_exception_summary", mlir::TypeRange{},
+           mlir::ValueRange{classId, ehWord, b.intToPtr(mhWord),
+                            b.intToPtr(mbWord), b.iconst(0), mbLen,
+                            b.iconst(1)});
+    mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(-1), prefixSlot,
+                                /*alignment=*/8);
+    mlir::Value memberCount = b.call("exception_group_member_count", b.i64(),
+                                     mlir::ValueRange{ehWord})
+                                  .front();
+    mlir::Value nested =
+        b.cmpi(mlir::arith::CmpIPredicate::sgt, memberCount, b.iconst(0));
+    auto nestedIf = mlir::scf::IfOp::create(b.builder, b.loc,
+                                            mlir::TypeRange{}, nested,
+                                            /*withElseRegion=*/false);
+    {
+      mlir::OpBuilder::InsertionGuard nestedGuard(b.builder);
+      b.builder.setInsertionPointToStart(&nestedIf.getThenRegion().front());
+      b.call("print_group_members", mlir::TypeRange{},
+             mlir::ValueRange{ehWord, childMargin});
+    }
+  }
+  b.call("write_spaces", mlir::TypeRange{},
+         mlir::ValueRange{stderrFd, childMargin});
+  b.call("write_cstr", mlir::TypeRange{},
+         mlir::ValueRange{stderrFd, b.addrOf(".tb_sep_close")});
+  mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(done);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
 // void print_trace_frame(ptr frame): "  File ..., line N, in fn" + the source
 // line + optional marker, on stderr.
 void buildPrintTraceFrame(SupportBuilder &b) {
@@ -1369,6 +1606,7 @@ void buildPrintTraceFrame(SupportBuilder &b) {
       b.builder, b.loc, snprintfType, "snprintf",
       mlir::ValueRange{buffer, b.iconst(1024), b.addrOf(".tb_fmt_frame"),
                        file, lineNo, function});
+  b.call("write_prefix", mlir::TypeRange{}, mlir::ValueRange{b.iconst32(2)});
   b.call("write_buffered", mlir::TypeRange{},
          mlir::ValueRange{b.iconst32(2), buffer, formatted.getResult()});
   mlir::Value sourceLine =
@@ -1389,6 +1627,7 @@ void buildPrintTraceFrame(SupportBuilder &b) {
   mlir::Value trimmed = b.gepI8(sourceLine, indentWidth);
   mlir::Value trimmedLength =
       b.call("strlen", b.i64(), mlir::ValueRange{trimmed}).front();
+  b.call("write_prefix", mlir::TypeRange{}, mlir::ValueRange{b.iconst32(2)});
   b.call("write_cstr", mlir::TypeRange{},
          mlir::ValueRange{b.iconst32(2), b.addrOf(".tb_indent")});
   b.call("write_len", mlir::TypeRange{},
@@ -1704,14 +1943,17 @@ void buildUtf8MessageCStr(SupportBuilder &b) {
   b.emitTrap(b.ptr());
 }
 
-// void print_exception_summary(i64 class_id, ptr msg_header, message view):
-// the final "Class: message" line (or the class-only / invalid / unknown
-// forms). The message is re-encoded from code units to UTF-8 for display.
+// void print_exception_summary(i64 class_id, i64 exc_ptr, ptr msg_header,
+// message view): the final "Class: message" line (or the class-only /
+// invalid / unknown forms). The message is re-encoded from code units to
+// UTF-8 for display. An exception group appends CPython's
+// " (N sub-exception[s])" count read through exc_ptr (0 = no payload known).
 void buildPrintExceptionSummary(SupportBuilder &b) {
   auto fn = b.beginFunction(
       "print_exception_summary",
       b.builder.getFunctionType(
-          {b.i64(), b.ptr(), b.ptr(), b.i64(), b.i64(), b.i64()}, {}),
+          {b.i64(), b.i64(), b.ptr(), b.ptr(), b.i64(), b.i64(), b.i64()},
+          {}),
       /*isPrivate=*/true);
   mlir::Block *entry = fn.addEntryBlock();
   mlir::Region &body = fn.getBody();
@@ -1722,11 +1964,12 @@ void buildPrintExceptionSummary(SupportBuilder &b) {
   mlir::Block *invalid = b.builder.createBlock(&body);
   mlir::Block *unknown = b.builder.createBlock(&body);
   mlir::Value classId = entry->getArgument(0);
-  mlir::Value msgHeader = entry->getArgument(1);
-  mlir::Value data = entry->getArgument(2);
-  mlir::Value offset = entry->getArgument(3);
-  mlir::Value len = entry->getArgument(4);
-  mlir::Value stride = entry->getArgument(5);
+  mlir::Value excPtr = entry->getArgument(1);
+  mlir::Value msgHeader = entry->getArgument(2);
+  mlir::Value data = entry->getArgument(3);
+  mlir::Value offset = entry->getArgument(4);
+  mlir::Value len = entry->getArgument(5);
+  mlir::Value stride = entry->getArgument(6);
 
   b.builder.setInsertionPointToEnd(entry);
   auto bufferType = mlir::LLVM::LLVMArrayType::get(b.i8(), 1024);
@@ -1740,9 +1983,19 @@ void buildPrintExceptionSummary(SupportBuilder &b) {
   mlir::Value className =
       b.call("exception_class_name", b.ptr(), mlir::ValueRange{classId})
           .front();
+  mlir::Value memberCount = b.call("exception_group_member_count", b.i64(),
+                                   mlir::ValueRange{excPtr})
+                                .front();
+  mlir::Value isGroupClass = b.call("LyEH_ClassIdMatches", b.i1(),
+                                    mlir::ValueRange{classId, b.iconst(101)})
+                                 .front();
+  mlir::Value groupSuffix = mlir::arith::AndIOp::create(
+      b.builder, b.loc, isGroupClass,
+      b.cmpi(mlir::arith::CmpIPredicate::sgt, memberCount, b.iconst(0)));
   auto snprintfType = mlir::LLVM::LLVMFunctionType::get(
       b.i32(), {b.ptr(), b.i64(), b.ptr()}, /*isVarArg=*/true);
   auto emitBuffered = [&](mlir::Value formattedLength) {
+    b.call("write_prefix", mlir::TypeRange{}, mlir::ValueRange{b.iconst32(2)});
     b.call("write_buffered", mlir::TypeRange{},
            mlir::ValueRange{b.iconst32(2), buffer, formattedLength});
     mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
@@ -1779,6 +2032,7 @@ void buildPrintExceptionSummary(SupportBuilder &b) {
              mlir::ValueRange{msgHeader, data, offset, len, stride})
           .front();
   mlir::Value stderrFd = b.iconst32(2);
+  b.call("write_prefix", mlir::TypeRange{}, mlir::ValueRange{stderrFd});
   b.call("write_cstr", mlir::TypeRange{},
          mlir::ValueRange{stderrFd, className});
   b.stringGlobal(".tb_colon_space", ": ");
@@ -1787,8 +2041,26 @@ void buildPrintExceptionSummary(SupportBuilder &b) {
   // KeyError stores repr(key) as its message (LyKeyError_Init and the
   // runtime missing-key raises), so the display prints it verbatim.
   b.call("write_cstr", mlir::TypeRange{}, mlir::ValueRange{stderrFd, message});
-  b.call("write_len", mlir::TypeRange{},
-         mlir::ValueRange{stderrFd, b.addrOf(".tb_newline"), b.iconst(1)});
+  auto suffixIf = mlir::scf::IfOp::create(b.builder, b.loc, mlir::TypeRange{},
+                                          groupSuffix,
+                                          /*withElseRegion=*/true);
+  {
+    mlir::OpBuilder::InsertionGuard guard(b.builder);
+    b.builder.setInsertionPointToStart(&suffixIf.getThenRegion().front());
+    mlir::Value plural = b.cmpi(mlir::arith::CmpIPredicate::sgt, memberCount,
+                                b.iconst(1));
+    mlir::Value format = mlir::LLVM::SelectOp::create(
+        b.builder, b.loc, plural, b.addrOf(".tb_fmt_group_many"),
+        b.addrOf(".tb_fmt_group_one"));
+    auto formatted = mlir::LLVM::CallOp::create(
+        b.builder, b.loc, snprintfType, "snprintf",
+        mlir::ValueRange{buffer, b.iconst(1024), format, memberCount});
+    b.call("write_buffered", mlir::TypeRange{},
+           mlir::ValueRange{stderrFd, buffer, formatted.getResult()});
+    b.builder.setInsertionPointToStart(&suffixIf.getElseRegion().front());
+    b.call("write_len", mlir::TypeRange{},
+           mlir::ValueRange{stderrFd, b.addrOf(".tb_newline"), b.iconst(1)});
+  }
   b.call("free", mlir::TypeRange{}, mlir::ValueRange{message});
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 
@@ -1925,33 +2197,42 @@ void buildPrintChainNode(SupportBuilder &b) {
   mlir::Value msgOffset = b.loadI64(nodeSlot(b, node, 13));
   mlir::Value msgLen = b.loadI64(nodeSlot(b, node, 14));
   mlir::Value msgStride = b.loadI64(nodeSlot(b, node, 15));
+  mlir::Value excWord =
+      mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), aligned);
   b.call("print_exception_summary", mlir::TypeRange{},
-         mlir::ValueRange{classId, msgHeader, msgData, msgOffset, msgLen,
-                          msgStride});
+         mlir::ValueRange{classId, excWord, msgHeader, msgData, msgOffset,
+                          msgLen, msgStride});
   mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(done);
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
-// LyTraceback_PrintMessage(i64 class_id, ptr msg_header, message view):
-// chained sections (cause/context, innermost first) + header + frames (most
-// recent last, printed from the top of the stack downwards) + summary line,
-// on stderr.
+// LyTraceback_PrintMessage(i64 class_id, i64 exc_ptr, ptr msg_header,
+// message view): chained sections (cause/context, innermost first) + header
+// + frames (most recent last, printed from the top of the stack downwards)
+// + summary line, on stderr. An exception group renders CPython's group
+// traceback instead: the "+ Exception Group Traceback" header, frames and
+// summary behind the "| " gutter, then the numbered member tree.
 void buildTracebackPrintMessage(SupportBuilder &b) {
   auto fn = b.beginFunction(
       "LyTraceback_PrintMessage",
       b.builder.getFunctionType(
-          {b.i64(), b.ptr(), b.ptr(), b.i64(), b.i64(), b.i64()}, {}));
+          {b.i64(), b.i64(), b.ptr(), b.ptr(), b.i64(), b.i64(), b.i64()},
+          {}));
   mlir::Block *entry = fn.addEntryBlock();
   mlir::Region &body = fn.getBody();
   mlir::Block *causeBlock = b.builder.createBlock(&body);
   mlir::Block *contextCheck = b.builder.createBlock(&body);
   mlir::Block *contextBlock = b.builder.createBlock(&body);
   mlir::Block *header = b.builder.createBlock(&body);
+  mlir::Block *plainHeader = b.builder.createBlock(&body);
+  mlir::Block *groupHeader = b.builder.createBlock(&body);
   mlir::Block *head = b.builder.createBlock(&body, body.end(), {b.i64()}, {b.loc});
   mlir::Block *printOne = b.builder.createBlock(&body);
   mlir::Block *summary = b.builder.createBlock(&body);
+  mlir::Block *groupMembers = b.builder.createBlock(&body);
+  mlir::Block *finish = b.builder.createBlock(&body);
 
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value cause = b.loadI64(b.addrOf("g_exc_cause_node"));
@@ -1986,8 +2267,34 @@ void buildTracebackPrintMessage(SupportBuilder &b) {
   mlir::cf::BranchOp::create(b.builder, b.loc, header, mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(header);
+  mlir::Value memberCount = b.call("exception_group_member_count", b.i64(),
+                                   mlir::ValueRange{entry->getArgument(1)})
+                                .front();
+  mlir::Value isGroupClass =
+      b.call("LyEH_ClassIdMatches", b.i1(),
+             mlir::ValueRange{entry->getArgument(0), b.iconst(101)})
+          .front();
+  mlir::Value groupDisplay = mlir::arith::AndIOp::create(
+      b.builder, b.loc, isGroupClass,
+      b.cmpi(mlir::arith::CmpIPredicate::sgt, memberCount, b.iconst(0)));
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, groupDisplay, groupHeader,
+                                 mlir::ValueRange{}, plainHeader,
+                                 mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(plainHeader);
   b.call("write_cstr", mlir::TypeRange{},
          mlir::ValueRange{b.iconst32(2), b.addrOf(".tb_header")});
+  mlir::cf::BranchOp::create(b.builder, b.loc, head,
+                             mlir::ValueRange{loadTracebackSize(b)});
+
+  // Group display: everything from here to the summary sits behind the
+  // "  | " gutter (the member tree resets it before the numbered sections).
+  b.builder.setInsertionPointToEnd(groupHeader);
+  b.call("write_cstr", mlir::TypeRange{},
+         mlir::ValueRange{b.iconst32(2), b.addrOf(".tb_group_header")});
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(2),
+                              b.addrOf("g_tb_prefix_spaces"),
+                              /*alignment=*/8);
   mlir::cf::BranchOp::create(b.builder, b.loc, head,
                              mlir::ValueRange{loadTracebackSize(b)});
 
@@ -2011,7 +2318,21 @@ void buildTracebackPrintMessage(SupportBuilder &b) {
   b.call("print_exception_summary", mlir::TypeRange{},
          mlir::ValueRange{entry->getArgument(0), entry->getArgument(1),
                           entry->getArgument(2), entry->getArgument(3),
-                          entry->getArgument(4), entry->getArgument(5)});
+                          entry->getArgument(4), entry->getArgument(5),
+                          entry->getArgument(6)});
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(-1),
+                              b.addrOf("g_tb_prefix_spaces"),
+                              /*alignment=*/8);
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, groupDisplay, groupMembers,
+                                 mlir::ValueRange{}, finish,
+                                 mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(groupMembers);
+  b.call("print_group_members", mlir::TypeRange{},
+         mlir::ValueRange{entry->getArgument(1), b.iconst(2)});
+  mlir::cf::BranchOp::create(b.builder, b.loc, finish, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(finish);
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
@@ -2043,10 +2364,14 @@ void buildTracebackSupport(SupportBuilder &b) {
   buildReadSourceLine(b);
   buildExceptionClassName(b);
   buildLeadingWhitespace(b);
+  buildWriteSpaces(b);
+  buildWritePrefix(b);
+  buildExceptionGroupMemberCount(b);
   buildPrintMarker(b);
   buildPrintTraceFrame(b);
   buildUtf8MessageCStr(b);
   buildPrintExceptionSummary(b);
+  buildPrintGroupMembers(b);
   buildPrintChainNode(b);
   buildTracebackPrintMessage(b);
 }

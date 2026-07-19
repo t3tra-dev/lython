@@ -2240,10 +2240,12 @@ void buildRunPythonMain(SupportBuilder &b) {
                                printTraceback);
 
   b.builder.setInsertionPointToEnd(printTraceback);
+  mlir::Value exceptionWord =
+      mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), aligned);
   mlir::func::CallOp::create(
       b.builder, b.loc, "LyTraceback_PrintMessage", mlir::TypeRange{},
-      mlir::ValueRange{classId, messageHeader, messageData, messageOffset,
-                       messageLen, messageStride});
+      mlir::ValueRange{classId, exceptionWord, messageHeader, messageData,
+                       messageOffset, messageLen, messageStride});
   mlir::func::CallOp::create(b.builder, b.loc, "release_current_chain",
                              mlir::TypeRange{}, mlir::ValueRange{});
   mlir::func::CallOp::create(b.builder, b.loc, "LyTraceback_Clear",

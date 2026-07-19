@@ -1850,7 +1850,35 @@ module attributes {
       func.call @LyUnicode_DecRef(%rp_h) : (memref<2xi64>) -> ()
       scf.yield %e_h, %e_b : memref<2xi64>, memref<?xi8>
     } else {
-      %plain:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+      // KeyError already stores repr(key) as its message (str(KeyError(x))
+      // == repr(x)); quoting again would render KeyError("'k'").
+      %keyerror_id = arith.constant 54 : i64
+      %is_keyerror = arith.cmpi eq, %class_id, %keyerror_id : i64
+      %msg_len = func.call @__ly_unicode_count(%message_header, %message_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+      %has_msg = arith.cmpi sgt, %msg_len, %zero_i64 : i64
+      %verbatim = arith.andi %is_keyerror, %has_msg : i1
+      %plain:2 = scf.if %verbatim -> (memref<2xi64>, memref<?xi8>) {
+        %c1v = arith.constant 1 : i64
+        %vname_h, %vname_b = func.call @LyUnicode_FromBytes(%name_dyn, %c0, %name_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+        %vlp_ref = memref.get_global @__ly_exc_lparen : memref<1xi8>
+        %vlp_dyn = memref.cast %vlp_ref : memref<1xi8> to memref<?xi8>
+        %vlp_h, %vlp_b = func.call @LyUnicode_FromBytes(%vlp_dyn, %c0, %c1v) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+        %vh_h, %vh_b = func.call @LyUnicode_Concat(%vname_h, %vname_b, %vlp_h, %vlp_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+        func.call @LyUnicode_DecRef(%vname_h) : (memref<2xi64>) -> ()
+        func.call @LyUnicode_DecRef(%vlp_h) : (memref<2xi64>) -> ()
+        %vb_h, %vb_b = func.call @LyUnicode_Concat(%vh_h, %vh_b, %message_header, %message_bytes) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+        func.call @LyUnicode_DecRef(%vh_h) : (memref<2xi64>) -> ()
+        %vrp_ref = memref.get_global @__ly_exc_rparen : memref<1xi8>
+        %vrp_dyn = memref.cast %vrp_ref : memref<1xi8> to memref<?xi8>
+        %vrp_h, %vrp_b = func.call @LyUnicode_FromBytes(%vrp_dyn, %c0, %c1v) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+        %vo_h, %vo_b = func.call @LyUnicode_Concat(%vb_h, %vb_b, %vrp_h, %vrp_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+        func.call @LyUnicode_DecRef(%vb_h) : (memref<2xi64>) -> ()
+        func.call @LyUnicode_DecRef(%vrp_h) : (memref<2xi64>) -> ()
+        scf.yield %vo_h, %vo_b : memref<2xi64>, memref<?xi8>
+      } else {
+        %generic:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+        scf.yield %generic#0, %generic#1 : memref<2xi64>, memref<?xi8>
+      }
       scf.yield %plain#0, %plain#1 : memref<2xi64>, memref<?xi8>
     }
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
