@@ -606,6 +606,10 @@ private:
   mlir::LogicalResult generateBoxedLtHook();
   mlir::LogicalResult lowerListEvidenceNext(py::NextOp op,
                                             RuntimeBundle iterator);
+  // Drops a dict's compile-time mapping evidence before a mutation emitted
+  // outside the storage's defining block (SpecialMethodOps.cpp).
+  bool demoteDictEvidenceForCrossBlockMutation(mlir::Operation *op,
+                                               mlir::Value containerValue);
   // Loop-body generator state-machine transform (GeneratorStateMachine.cpp).
   //
   // Suspension lane ABI (rfc/stdlib-semantics.md R3): a lane is one logical

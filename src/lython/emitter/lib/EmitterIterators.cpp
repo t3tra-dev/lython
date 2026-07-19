@@ -959,4 +959,366 @@ ModuleEmitter::tryEmitLazyIteratorValueCall(const parser::Node &expr,
       emitCallOperands(expr, callArguments, /*includeAstArguments=*/false));
 }
 
+// ---------------------------------------------------------------------------
+// dict method sugar: get(k) / setdefault / popitem / dict.fromkeys rewrite
+// into statement sequences over the existing dict primitives (membership,
+// getitem, setitem, pop). Why AST rewrites and not manifest natives: each is
+// pure composition of already-verified operations, and the native tier has
+// no way to build the result tuple / fresh dict without duplicating that
+// machinery. Deviation: the compositions probe twice where CPython probes
+// once — observable only through side-effecting user __hash__/__eq__.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+NodePtr noneConstant(parser::SourceRange range) {
+  NodePtr node = parser::makeNode("Constant", range);
+  parser::addField(*node, "value", std::monostate{});
+  return node;
+}
+
+NodePtr stringConstant(const std::string &text, parser::SourceRange range) {
+  NodePtr node = parser::makeNode("Constant", range);
+  parser::addField(*node, "value", text);
+  return node;
+}
+
+NodePtr compareInNode(NodePtr left, NodePtr right, parser::SourceRange range) {
+  return compareNode(std::move(left), "In", std::move(right), range);
+}
+
+NodePtr methodCallNode(NodePtr receiver, const char *method,
+                       std::vector<NodePtr> args, parser::SourceRange range) {
+  NodePtr attr = parser::makeNode("Attribute", range);
+  parser::addField(*attr, "value", std::move(receiver));
+  parser::addField(*attr, "attr", std::string(method));
+  return callNode(std::move(attr), std::move(args), range);
+}
+
+} // namespace
+
+bool ModuleEmitter::isDictTypedExpr(const parser::Node *expr) {
+  if (!expr)
+    return false;
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(
+      types.widenLiteral(types.inferExpr(expr)));
+  return contract && contract.getContractName() == "builtins.dict";
+}
+
+std::optional<Value>
+ModuleEmitter::tryEmitDictMethodSugar(const parser::Node &expr,
+                                      const parser::Node *calleeNode) {
+  if (!calleeNode || calleeNode->kind != "Attribute")
+    return std::nullopt;
+  auto attr = ast::string(*calleeNode, "attr");
+  const parser::Field *receiverField = parser::findField(*calleeNode, "value");
+  if (!attr || !receiverField ||
+      !std::holds_alternative<NodePtr>(receiverField->value))
+    return std::nullopt;
+  NodePtr receiver = std::get<NodePtr>(receiverField->value);
+  if (!receiver)
+    return std::nullopt;
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  if (keywords && !keywords->empty())
+    return std::nullopt;
+  std::size_t argCount = args ? args->size() : 0;
+  parser::SourceRange range = expr.range;
+  unsigned serial = ++listCompCounter;
+  auto scratch = [&](const char *stem) {
+    return "__lydict" + std::to_string(serial) + "_" + std::string(stem);
+  };
+  auto rejectSugar = [&](llvm::StringRef reason) -> std::optional<Value> {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start, std::string(reason)});
+    return emitNone(expr);
+  };
+
+  // dict.fromkeys(iterable[, value]) — the receiver is the dict CLASS.
+  if (*attr == "fromkeys" && receiver->kind == "Name" &&
+      ast::nameSpelling(*receiver) == "dict" && !values.count("dict") &&
+      !types.lookupSymbol("dict")) {
+    if (argCount < 1 || argCount > 2)
+      return rejectSugar("dict.fromkeys() takes an iterable and an optional "
+                         "value");
+    std::string valueName = scratch("fv");
+    std::string keyName = scratch("fk");
+    NodePtr valueInit = argCount == 2 ? (*args)[1] : noneConstant(range);
+    NodePtr comprehension = parser::makeNode("comprehension", range);
+    parser::addField(*comprehension, "target", nameNode(keyName, range));
+    parser::addField(*comprehension, "iter", (*args)[0]);
+    parser::addField(*comprehension, "ifs", std::vector<NodePtr>{});
+    parser::addField(*comprehension, "is_async", std::int64_t{0});
+    NodePtr comp = parser::makeNode("DictComp", range);
+    parser::addField(*comp, "key", nameNode(keyName, range));
+    parser::addField(*comp, "value", nameNode(valueName, range));
+    parser::addField(*comp, "generators",
+                     std::vector<NodePtr>{std::move(comprehension)});
+    std::optional<Value> result;
+    runWithScratchNames({valueName, keyName}, [&] {
+      emitStatement(*assignNode(nameNode(valueName, range),
+                                std::move(valueInit), range));
+      result = emitExpr(comp.get());
+    });
+    return result;
+  }
+
+  if (*attr != "get" && *attr != "setdefault" && *attr != "popitem")
+    return std::nullopt;
+  if (!isDictTypedExpr(receiver.get()))
+    return std::nullopt;
+  // get with an explicit default has a native lowering; only the one-argument
+  // (None-default) form desugars here.
+  if (*attr == "get" && argCount != 1)
+    return std::nullopt;
+
+  std::string dictName = scratch("d");
+  bool needsTemp = receiver->kind != "Name";
+  NodePtr dictRef = needsTemp ? nameNode(dictName, range) : receiver;
+  auto withPrologue = [&](llvm::ArrayRef<std::string> names,
+                          llvm::function_ref<std::optional<Value>()> emit)
+      -> std::optional<Value> {
+    std::optional<Value> result;
+    llvm::SmallVector<std::string, 4> scratchNames(names.begin(), names.end());
+    if (needsTemp)
+      scratchNames.push_back(dictName);
+    runWithScratchNames(scratchNames, [&] {
+      if (needsTemp)
+        emitStatement(*assignNode(nameNode(dictName, range), receiver, range));
+      result = emit();
+    });
+    return result;
+  };
+
+  if (*attr == "get") {
+    // __r = None; if __k in d: __r = d[__k]  →  Optional[V]
+    std::string keyName = scratch("gk");
+    std::string resultName = scratch("gr");
+    return withPrologue({keyName, resultName}, [&]() -> std::optional<Value> {
+      emitStatement(*assignNode(nameNode(keyName, range), (*args)[0], range));
+      emitStatement(*assignNode(nameNode(resultName, range),
+                                noneConstant(range), range));
+      NodePtr hit = ifNode(
+          compareInNode(nameNode(keyName, range), dictRef, range),
+          {assignNode(nameNode(resultName, range),
+                      subscriptNode(dictRef, nameNode(keyName, range), range),
+                      range)},
+          range);
+      emitStatement(*hit);
+      auto bound = values.find(resultName);
+      if (bound == values.end() || !bound->second.value)
+        return rejectSugar("cannot lower dict.get(key) over this dict");
+      return bound->second;
+    });
+  }
+
+  if (*attr == "setdefault") {
+    if (argCount < 1 || argCount > 2)
+      return rejectSugar("dict.setdefault() takes a key and an optional "
+                         "default");
+    std::string keyName = scratch("sk");
+    std::string valueName = scratch("sv");
+    std::string resultName = scratch("sr");
+    return withPrologue(
+        {keyName, valueName, resultName}, [&]() -> std::optional<Value> {
+          emitStatement(
+              *assignNode(nameNode(keyName, range), (*args)[0], range));
+          emitStatement(*assignNode(
+              nameNode(valueName, range),
+              argCount == 2 ? (*args)[1] : noneConstant(range), range));
+          // if __k not in d: d[__k] = __v
+          // __r = d[__k]
+          // Single-arm shape on purpose (a two-arm branch mixing a getitem
+          // arm with a setitem arm trips the If-join's structural-mutation
+          // threading), and reading back d[__k] returns the STORED value —
+          // CPython's setdefault does the same.
+          emitStatement(*ifNode(
+              compareNode(nameNode(keyName, range), "NotIn", dictRef, range),
+              {assignNode(
+                  subscriptNode(dictRef, nameNode(keyName, range), range),
+                  nameNode(valueName, range), range)},
+              range));
+          emitStatement(*assignNode(
+              nameNode(resultName, range),
+              subscriptNode(dictRef, nameNode(keyName, range), range),
+              range));
+          auto bound = values.find(resultName);
+          if (bound == values.end() || !bound->second.value)
+            return rejectSugar(
+                "cannot lower dict.setdefault() over this dict");
+          return bound->second;
+        });
+  }
+
+  // popitem(): LIFO removal per the compact-dict insertion order — the keys
+  // snapshot gives the last key, pop removes it. O(len) against CPython's
+  // O(1) (a documented performance-only deviation).
+  if (argCount != 0)
+    return rejectSugar("dict.popitem() takes no arguments");
+  std::string keysName = scratch("pks");
+  std::string elementName = scratch("px");
+  std::string keyName = scratch("pk");
+  std::string valueName = scratch("pv");
+  return withPrologue(
+      {keysName, elementName, keyName, valueName},
+      [&]() -> std::optional<Value> {
+        NodePtr emptyTest =
+            compareNode(lenCall(dictRef, range), "Eq", intConstant(0, range),
+                        range);
+        NodePtr keyError =
+            callNode(nameNode("KeyError", range),
+                     {stringConstant("popitem(): dictionary is empty", range)},
+                     range);
+        NodePtr raiseNode = parser::makeNode("Raise", range);
+        parser::addField(*raiseNode, "exc", std::move(keyError));
+        emitStatement(*ifNode(std::move(emptyTest), {std::move(raiseNode)},
+                              range));
+        NodePtr comprehension = parser::makeNode("comprehension", range);
+        parser::addField(*comprehension, "target",
+                         nameNode(elementName, range));
+        parser::addField(*comprehension, "iter", dictRef);
+        parser::addField(*comprehension, "ifs", std::vector<NodePtr>{});
+        parser::addField(*comprehension, "is_async", std::int64_t{0});
+        NodePtr keysComp = parser::makeNode("ListComp", range);
+        parser::addField(*keysComp, "elt", nameNode(elementName, range));
+        parser::addField(*keysComp, "generators",
+                         std::vector<NodePtr>{std::move(comprehension)});
+        emitStatement(*assignNode(nameNode(keysName, range),
+                                  std::move(keysComp), range));
+        emitStatement(*assignNode(
+            nameNode(keyName, range),
+            subscriptNode(nameNode(keysName, range),
+                          binOpNode(lenCall(nameNode(keysName, range), range),
+                                    "Sub", intConstant(1, range), range),
+                          range),
+            range));
+        emitStatement(*assignNode(
+            nameNode(valueName, range),
+            methodCallNode(dictRef, "pop", {nameNode(keyName, range)}, range),
+            range));
+        NodePtr pair = tupleNode(
+            {nameNode(keyName, range), nameNode(valueName, range)}, range);
+        return emitExpr(pair.get());
+      });
+}
+
+// `x in d.keys()` is key membership; `v in d.values()` scans the values;
+// `(k, v) in d.items()` is key membership plus value equality. The views
+// have no runtime object, so the comparison rewrites against the dict
+// before any operand is emitted.
+std::optional<Value>
+ModuleEmitter::tryEmitDictViewMembership(const parser::Node &expr) {
+  const auto *comparators = ast::nodeList(expr, "comparators");
+  const auto *ops = ast::nodeList(expr, "ops");
+  if (!comparators || comparators->size() != 1 || !ops || ops->size() != 1 ||
+      !(*comparators)[0] || !(*ops)[0])
+    return std::nullopt;
+  bool negated = (*ops)[0]->kind == "NotIn";
+  if ((*ops)[0]->kind != "In" && !negated)
+    return std::nullopt;
+  const parser::Node &comparator = *(*comparators)[0];
+  if (comparator.kind != "Call")
+    return std::nullopt;
+  const parser::Node *viewCallee = ast::node(comparator, "func");
+  const auto *viewArgs = ast::nodeList(comparator, "args");
+  const auto *viewKeywords = ast::nodeList(comparator, "keywords");
+  if (!viewCallee || viewCallee->kind != "Attribute" ||
+      (viewArgs && !viewArgs->empty()) ||
+      (viewKeywords && !viewKeywords->empty()))
+    return std::nullopt;
+  auto viewName = ast::string(*viewCallee, "attr");
+  if (!viewName || (*viewName != "keys" && *viewName != "values" &&
+                    *viewName != "items"))
+    return std::nullopt;
+  const parser::Field *receiverField = parser::findField(*viewCallee, "value");
+  if (!receiverField ||
+      !std::holds_alternative<NodePtr>(receiverField->value))
+    return std::nullopt;
+  NodePtr receiver = std::get<NodePtr>(receiverField->value);
+  if (!receiver || !isDictTypedExpr(receiver.get()))
+    return std::nullopt;
+  const parser::Field *leftField = parser::findField(expr, "left");
+  if (!leftField || !std::holds_alternative<NodePtr>(leftField->value))
+    return std::nullopt;
+  NodePtr left = std::get<NodePtr>(leftField->value);
+  if (!left)
+    return std::nullopt;
+  parser::SourceRange range = expr.range;
+
+  if (*viewName == "keys") {
+    NodePtr rewritten = compareNode(left, negated ? "NotIn" : "In", receiver,
+                                    range);
+    return emitCompare(*rewritten);
+  }
+
+  unsigned serial = ++listCompCounter;
+  auto scratch = [&](const char *stem) {
+    return "__lyview" + std::to_string(serial) + "_" + std::string(stem);
+  };
+  std::string dictName = scratch("d");
+  bool needsTemp = receiver->kind != "Name";
+  NodePtr dictRef = needsTemp ? nameNode(dictName, range) : receiver;
+  std::string probeName = scratch("x");
+  std::string resultName = scratch("r");
+  std::string keyName = scratch("k");
+  llvm::SmallVector<std::string, 4> names{probeName, resultName, keyName};
+  if (needsTemp)
+    names.push_back(dictName);
+
+  std::optional<Value> result;
+  runWithScratchNames(names, [&] {
+    // Order: CPython evaluates the left operand, then the view expression.
+    emitStatement(*assignNode(nameNode(probeName, range), left, range));
+    if (needsTemp)
+      emitStatement(*assignNode(nameNode(dictName, range), receiver, range));
+    NodePtr falseInit = parser::makeNode("Constant", range);
+    parser::addField(*falseInit, "value", false);
+    emitStatement(*assignNode(nameNode(resultName, range),
+                              std::move(falseInit), range));
+    NodePtr trueValue = parser::makeNode("Constant", range);
+    parser::addField(*trueValue, "value", true);
+    if (*viewName == "values") {
+      // for __k in d: if d[__k] == __x: __r = True; break
+      NodePtr hit = ifNode(
+          compareNode(subscriptNode(dictRef, nameNode(keyName, range), range),
+                      "Eq", nameNode(probeName, range), range),
+          {assignNode(nameNode(resultName, range), std::move(trueValue),
+                      range),
+           parser::makeNode("Break", range)},
+          range);
+      emitFor(*forNode(nameNode(keyName, range), dictRef, {std::move(hit)},
+                       {}, range));
+    } else {
+      // items: __k = __x[0]; if __k in d and d[__k] == __x[1]: __r = True
+      emitStatement(*assignNode(
+          nameNode(keyName, range),
+          subscriptNode(nameNode(probeName, range), intConstant(0, range),
+                        range),
+          range));
+      NodePtr valueMatches = ifNode(
+          compareNode(subscriptNode(dictRef, nameNode(keyName, range), range),
+                      "Eq",
+                      subscriptNode(nameNode(probeName, range),
+                                    intConstant(1, range), range),
+                      range),
+          {assignNode(nameNode(resultName, range), std::move(trueValue),
+                      range)},
+          range);
+      emitStatement(*ifNode(
+          compareInNode(nameNode(keyName, range), dictRef, range),
+          {std::move(valueMatches)}, range));
+    }
+    NodePtr resultExpr = nameNode(resultName, range);
+    if (negated) {
+      NodePtr notOp = parser::makeNode("Not", range);
+      NodePtr flipped = parser::makeNode("UnaryOp", range);
+      parser::addField(*flipped, "op", std::move(notOp));
+      parser::addField(*flipped, "operand", std::move(resultExpr));
+      resultExpr = std::move(flipped);
+    }
+    result = emitExpr(resultExpr.get());
+  });
+  return result;
+}
+
 } // namespace lython::emitter

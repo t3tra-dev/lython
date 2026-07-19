@@ -236,7 +236,45 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerLen(py::LenOp op) {
       op, op.getInput(), op.getResult(), "len input", *methodName);
 }
 
+// Compile-time dict evidence may only be extended in the block that defines
+// the dict's storage: an evidence update inside a branch would record
+// payload SSA values that later (join-dominated) uses cannot reference.
+// Demoting to runtime-mode keeps the physical payload authoritative — the
+// same truth the evidence mirrored — so conditional mutations lower through
+// the runtime probes instead.
+bool RuntimeBundleLowerer::demoteDictEvidenceForCrossBlockMutation(
+    mlir::Operation *op, mlir::Value containerValue) {
+  RuntimeBundle *bundle = nullptr;
+  if (auto found = valueBundles.find(containerValue);
+      found != valueBundles.end())
+    bundle = &found->second;
+  if (!bundle || bundle->kind != RuntimeBundle::Kind::Object ||
+      bundle->contractName() != "builtins.dict" ||
+      bundle->physicalValues().size() < 5 ||
+      (!bundle->mappingEvidenceBacked && bundle->mappingKeys.empty()))
+    return false;
+  mlir::Value anchor = bundle->physicalValues().front();
+  mlir::Block *defBlock = nullptr;
+  if (auto argument = mlir::dyn_cast<mlir::BlockArgument>(anchor))
+    defBlock = argument.getOwner();
+  else if (mlir::Operation *defOp = anchor.getDefiningOp())
+    defBlock = defOp->getBlock();
+  if (!defBlock || defBlock == op->getBlock()) {
+    // Same block: appended evidence dominates every later same-function use.
+    return false;
+  }
+  bundle->mappingEvidenceBacked = false;
+  bundle->mappingKeys.clear();
+  bundle->mappingKeyBundles.clear();
+  bundle->mappingValues.clear();
+  bundle->mappingValueBundles.clear();
+  bundle->mappingPresent.clear();
+  return true;
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
+  RuntimeBundleLowerer::demoteDictEvidenceForCrossBlockMutation(
+      op.getOperation(), op.getContainer());
   llvm::SmallVector<mlir::Value, 3> inputs{op.getContainer(), op.getIndex(),
                                            op.getValue()};
   llvm::SmallVector<const RuntimeBundle *, 3> sources;
@@ -565,6 +603,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::lowerDelItem(py::DelItemOp op) {
+  RuntimeBundleLowerer::demoteDictEvidenceForCrossBlockMutation(
+      op.getOperation(), op.getContainer());
   llvm::SmallVector<mlir::Value, 2> inputs{op.getContainer(), op.getIndex()};
   llvm::SmallVector<const RuntimeBundle *, 2> sources;
   if (mlir::failed(collectObjectSources(

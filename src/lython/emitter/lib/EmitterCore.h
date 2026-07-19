@@ -171,6 +171,14 @@ private:
   };
   std::map<std::string, LazyIteratorSynthesis> lazyIteratorMemo;
   std::vector<parser::NodePtr> synthesizedIteratorDefs;
+  // dict method sugar (EmitterIterators.cpp): get(k) / setdefault / popitem
+  // / dict.fromkeys compose over existing dict primitives.
+  bool isDictTypedExpr(const parser::Node *expr);
+  std::optional<Value> tryEmitDictMethodSugar(const parser::Node &expr,
+                                              const parser::Node *calleeNode);
+  // `x in d.keys()/values()/items()` and `len(d.keys())` rewrite against the
+  // dict itself.
+  std::optional<Value> tryEmitDictViewMembership(const parser::Node &expr);
   void emitWhile(const parser::Node &statement);
   void emitAsyncFor(const parser::Node &statement);
   llvm::SmallVector<CarriedLoopLocal, 4>

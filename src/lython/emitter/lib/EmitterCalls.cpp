@@ -186,6 +186,8 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     return *v;
   if (std::optional<Value> v = tryEmitLazyIteratorValueCall(expr, calleeNode))
     return *v;
+  if (std::optional<Value> v = tryEmitDictMethodSugar(expr, calleeNode))
+    return *v;
 
   if (!calleeQualified.empty())
     if (auto cls = types.lookupClass(calleeQualified)) {
@@ -1200,7 +1202,26 @@ ModuleEmitter::tryEmitLenCall(const parser::Node &expr,
     return std::nullopt;
   const auto *args = ast::nodeList(expr, "args");
   if (args && args->size() == 1) {
-    Value input = emitExpr(args->front().get());
+    // len(d.keys()/values()/items()) measures the dict itself — the views
+    // have no runtime object.
+    const parser::Node *argNode = args->front().get();
+    if (argNode && argNode->kind == "Call") {
+      const parser::Node *viewCallee = ast::node(*argNode, "func");
+      const auto *viewArgs = ast::nodeList(*argNode, "args");
+      const auto *viewKeywords = ast::nodeList(*argNode, "keywords");
+      if (viewCallee && viewCallee->kind == "Attribute" &&
+          (!viewArgs || viewArgs->empty()) &&
+          (!viewKeywords || viewKeywords->empty())) {
+        auto viewName = ast::string(*viewCallee, "attr");
+        const parser::Node *viewReceiver = ast::node(*viewCallee, "value");
+        if (viewName &&
+            (*viewName == "keys" || *viewName == "values" ||
+             *viewName == "items") &&
+            isDictTypedExpr(viewReceiver))
+          argNode = viewReceiver;
+      }
+    }
+    Value input = emitExpr(argNode);
     if (std::optional<MethodBinding> method =
             lookupClassMethod(input.type, "__len__"))
       return emitInlineOperatorCall(expr, input, *method, {});
