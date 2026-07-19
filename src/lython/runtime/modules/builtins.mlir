@@ -1402,18 +1402,313 @@ module attributes {
     func.return %eh, %mh, %mb : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
-  // Payload block entry count (0 for an absent block).
+  // Payload block entry count (0 for an absent block). Bit 62 of the count
+  // word flags "repr as a tuple" (the PEP 654 naked-exception wrap shows
+  // `('', (exc,))`); every count consumer masks it off.
   func.func private @__ly_exc_payload_count(%block_word: i64) -> i64 attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "payload_count"} {
     %zero = arith.constant 0 : i64
+    %mask = arith.constant 4611686018427387903 : i64
     %absent = arith.cmpi eq, %block_word, %zero : i64
     %count = scf.if %absent -> (i64) {
       scf.yield %zero : i64
     } else {
       %block_ptr = llvm.inttoptr %block_word : i64 to !llvm.ptr
       %loaded = llvm.load %block_ptr : !llvm.ptr -> i64
-      scf.yield %loaded : i64
+      %masked = arith.andi %loaded, %mask : i64
+      scf.yield %masked : i64
     }
     func.return %count : i64
+  }
+
+  // Whether the payload block asked for tuple-style repr (bit 62).
+  func.func private @__ly_exc_payload_tuple_flag(%block_word: i64) -> i1 attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "payload_tuple_flag"} {
+    %zero = arith.constant 0 : i64
+    %flag_bit = arith.constant 4611686018427387904 : i64
+    %absent = arith.cmpi eq, %block_word, %zero : i64
+    %flag = scf.if %absent -> (i1) {
+      %false_v = arith.constant false
+      scf.yield %false_v : i1
+    } else {
+      %block_ptr = llvm.inttoptr %block_word : i64 to !llvm.ptr
+      %loaded = llvm.load %block_ptr : !llvm.ptr -> i64
+      %bit = arith.andi %loaded, %flag_bit : i64
+      %set = arith.cmpi ne, %bit, %zero : i64
+      scf.yield %set : i1
+    }
+    func.return %flag : i1
+  }
+
+  // Zeroed dummies for the absent sides of a star split result: the paired
+  // flag gates every consumer, so the views are never dereferenced.
+  memref.global "private" @__ly_exc_dummy_header : memref<3xi64> = dense<0>
+  memref.global "private" @__ly_exc_dummy_str : memref<2xi64> = dense<0>
+
+  // Fresh group carrying %count member slots, derived from %eh's class and
+  // message (PEP 654 split keeps the original metadata on both halves).
+  func.func private @__ly_exc_derive_group(%eh: memref<3xi64>, %mh: memref<2xi64>, %mb: memref<?xi8>, %count: i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>, i64) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "derive_group"} {
+    %class_slot = arith.constant 2 : index
+    %payload_slot = arith.constant 3 : i64
+    %class_id = memref.load %eh[%class_slot] : memref<3xi64>
+    %fresh:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    // Adopt the original message: release the fresh empty one, retain ours.
+    func.call @LyUnicode_DecRef(%fresh#1) : (memref<2xi64>) -> ()
+    %retained:2 = func.call @__ly_unicode_retain_self(%mh, %mb) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    %block = func.call @__ly_exc_payload_alloc(%count) : (i64) -> i64
+    func.call @__ly_exc_ext_set(%fresh#0, %payload_slot, %block) : (memref<3xi64>, i64, i64) -> ()
+    func.return %fresh#0, %retained#0, %retained#1, %block : memref<3xi64>, memref<2xi64>, memref<?xi8>, i64
+  }
+
+  // PEP 654 split: partition %e against handler class %handler. Returns
+  // (has_matched, matched triple, has_rest, rest triple); present sides are
+  // OWNED by the caller, absent sides are the zero dummies. A naked matching
+  // exception comes back wrapped in an ExceptionGroup('', (exc,)) (the
+  // BaseExceptionGroup variant when it is not an Exception).
+  func.func private @__ly_exc_star_split_rec(%eh: memref<3xi64>, %mh: memref<2xi64>, %mb: memref<?xi8>, %handler: i64) -> (i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "star_split_rec"} {
+    %true_v = arith.constant true
+    %false_v = arith.constant false
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %class_slot = arith.constant 2 : index
+    %payload_slot = arith.constant 3 : i64
+    %group_root = arith.constant 101 : i64
+    %exception_root = arith.constant 50 : i64
+    %group_id = arith.constant 102 : i64
+    %base_group_id = arith.constant 101 : i64
+    %tuple_bit = arith.constant 4611686018427387904 : i64
+    %dummy_h = memref.get_global @__ly_exc_dummy_header : memref<3xi64>
+    %dummy_s = memref.get_global @__ly_exc_dummy_str : memref<2xi64>
+    %dummy_b = memref.alloca(%c0) : memref<?xi8>
+
+    %class_id = memref.load %eh[%class_slot] : memref<3xi64>
+    %block = func.call @__ly_exc_ext_get(%eh, %payload_slot) : (memref<3xi64>, i64) -> i64
+    %member_count = func.call @__ly_exc_payload_count(%block) : (i64) -> i64
+    %is_group = func.call @LyEH_ClassIdMatches(%class_id, %group_root) : (i64, i64) -> i1
+    %has_members = arith.cmpi sgt, %member_count, %zero : i64
+    %grouped = arith.andi %is_group, %has_members : i1
+
+    %result:8 = scf.if %grouped -> (i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>) {
+      // First pass: how many members land on each side (recursively).
+      %count_index = arith.index_cast %member_count : i64 to index
+      %tally:2 = scf.for %i = %c0 to %count_index step %c1 iter_args(%m = %zero, %r = %zero) -> (i64, i64) {
+        %i64v = arith.index_cast %i : index to i64
+        %member:3 = func.call @__ly_exc_payload_view(%block, %i64v) : (i64, i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+        %sub:8 = func.call @__ly_exc_star_split_rec(%member#0, %member#1, %member#2, %handler) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, i64) -> (i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>)
+        // Tally only: drop the split halves again.
+        scf.if %sub#0 {
+          func.call @LyBaseException_DecRef(%sub#1, %sub#2, %sub#3) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+        }
+        scf.if %sub#4 {
+          func.call @LyBaseException_DecRef(%sub#5, %sub#6, %sub#7) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+        }
+        %m_inc = arith.extui %sub#0 : i1 to i64
+        %r_inc = arith.extui %sub#4 : i1 to i64
+        %m_next = arith.addi %m, %m_inc : i64
+        %r_next = arith.addi %r, %r_inc : i64
+        scf.yield %m_next, %r_next : i64, i64
+      }
+      %no_match = arith.cmpi eq, %tally#0, %zero : i64
+      %full_match = arith.cmpi eq, %tally#1, %zero : i64
+      %whole:8 = scf.if %no_match -> (i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>) {
+        %sub0 = memref.subview %eh[0] [2] [1] : memref<3xi64> to memref<2xi64, strided<[1]>>
+        %view0 = memref.cast %sub0 : memref<2xi64, strided<[1]>> to memref<2xi64, strided<[1], offset: ?>>
+        func.call @Ly_IncRef(%view0) : (memref<2xi64, strided<[1], offset: ?>>) -> ()
+        scf.yield %false_v, %dummy_h, %dummy_s, %dummy_b, %true_v, %eh, %mh, %mb : i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>
+      } else {
+        %all:8 = scf.if %full_match -> (i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>) {
+          %subw = memref.subview %eh[0] [2] [1] : memref<3xi64> to memref<2xi64, strided<[1]>>
+          %vieww = memref.cast %subw : memref<2xi64, strided<[1]>> to memref<2xi64, strided<[1], offset: ?>>
+          func.call @Ly_IncRef(%vieww) : (memref<2xi64, strided<[1], offset: ?>>) -> ()
+          scf.yield %true_v, %eh, %mh, %mb, %false_v, %dummy_h, %dummy_s, %dummy_b : i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>
+        } else {
+          // Real split: derive a group per side and distribute the halves.
+          %mg:4 = func.call @__ly_exc_derive_group(%eh, %mh, %mb, %tally#0) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>, i64)
+          %rg:4 = func.call @__ly_exc_derive_group(%eh, %mh, %mb, %tally#1) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>, i64)
+          %fill:2 = scf.for %i = %c0 to %count_index step %c1 iter_args(%mi = %zero, %ri = %zero) -> (i64, i64) {
+            %i64v = arith.index_cast %i : index to i64
+            %member:3 = func.call @__ly_exc_payload_view(%block, %i64v) : (i64, i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+            %sub:8 = func.call @__ly_exc_star_split_rec(%member#0, %member#1, %member#2, %handler) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, i64) -> (i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>)
+            %mi_next = scf.if %sub#0 -> (i64) {
+              func.call @__ly_exc_payload_store(%mg#3, %mi, %sub#1, %sub#2, %sub#3) : (i64, i64, memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+              func.call @LyBaseException_DecRef(%sub#1, %sub#2, %sub#3) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+              %n = arith.addi %mi, %one : i64
+              scf.yield %n : i64
+            } else {
+              scf.yield %mi : i64
+            }
+            %ri_next = scf.if %sub#4 -> (i64) {
+              func.call @__ly_exc_payload_store(%rg#3, %ri, %sub#5, %sub#6, %sub#7) : (i64, i64, memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+              func.call @LyBaseException_DecRef(%sub#5, %sub#6, %sub#7) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+              %n = arith.addi %ri, %one : i64
+              scf.yield %n : i64
+            } else {
+              scf.yield %ri : i64
+            }
+            scf.yield %mi_next, %ri_next : i64, i64
+          }
+          scf.yield %true_v, %mg#0, %mg#1, %mg#2, %true_v, %rg#0, %rg#1, %rg#2 : i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>
+        }
+        scf.yield %all#0, %all#1, %all#2, %all#3, %all#4, %all#5, %all#6, %all#7 : i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>
+      }
+      scf.yield %whole#0, %whole#1, %whole#2, %whole#3, %whole#4, %whole#5, %whole#6, %whole#7 : i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>
+    } else {
+      // Naked exception (or a group without members): all-or-nothing.
+      %matches = func.call @LyEH_ClassIdMatches(%class_id, %handler) : (i64, i64) -> i1
+      %naked:8 = scf.if %matches -> (i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>) {
+        // A matching leaf moves into the matched half as ITSELF; the
+        // synthesized wrap applies only to a top-level naked exception
+        // (star_split below).
+        %subm = memref.subview %eh[0] [2] [1] : memref<3xi64> to memref<2xi64, strided<[1]>>
+        %viewm = memref.cast %subm : memref<2xi64, strided<[1]>> to memref<2xi64, strided<[1], offset: ?>>
+        func.call @Ly_IncRef(%viewm) : (memref<2xi64, strided<[1], offset: ?>>) -> ()
+        scf.yield %true_v, %eh, %mh, %mb, %false_v, %dummy_h, %dummy_s, %dummy_b : i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>
+      } else {
+        %sub1 = memref.subview %eh[0] [2] [1] : memref<3xi64> to memref<2xi64, strided<[1]>>
+        %view1 = memref.cast %sub1 : memref<2xi64, strided<[1]>> to memref<2xi64, strided<[1], offset: ?>>
+        func.call @Ly_IncRef(%view1) : (memref<2xi64, strided<[1], offset: ?>>) -> ()
+        scf.yield %false_v, %dummy_h, %dummy_s, %dummy_b, %true_v, %eh, %mh, %mb : i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>
+      }
+      scf.yield %naked#0, %naked#1, %naked#2, %naked#3, %naked#4, %naked#5, %naked#6, %naked#7 : i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>
+    }
+    func.return %result#0, %result#1, %result#2, %result#3, %result#4, %result#5, %result#6, %result#7 : i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>
+  }
+
+  // Top-level star split (the manifest entry): a naked exception either
+  // misses whole or comes back wrapped in ExceptionGroup('', (exc,)) --
+  // BaseExceptionGroup when it is not an Exception. Groups delegate to the
+  // recursive split, whose leaves stay unwrapped.
+  func.func private @__ly_exc_star_split(%eh: memref<3xi64>, %mh: memref<2xi64>, %mb: memref<?xi8>, %handler: i64) -> (i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "star_split"} {
+    %true_v = arith.constant true
+    %false_v = arith.constant false
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %c0 = arith.constant 0 : index
+    %class_slot = arith.constant 2 : index
+    %payload_slot = arith.constant 3 : i64
+    %group_root = arith.constant 101 : i64
+    %exception_root = arith.constant 50 : i64
+    %group_id = arith.constant 102 : i64
+    %base_group_id = arith.constant 101 : i64
+    %tuple_bit = arith.constant 4611686018427387904 : i64
+    %dummy_h = memref.get_global @__ly_exc_dummy_header : memref<3xi64>
+    %dummy_s = memref.get_global @__ly_exc_dummy_str : memref<2xi64>
+    %dummy_b = memref.alloca(%c0) : memref<?xi8>
+    %class_id = memref.load %eh[%class_slot] : memref<3xi64>
+    %block = func.call @__ly_exc_ext_get(%eh, %payload_slot) : (memref<3xi64>, i64) -> i64
+    %member_count = func.call @__ly_exc_payload_count(%block) : (i64) -> i64
+    %is_group = func.call @LyEH_ClassIdMatches(%class_id, %group_root) : (i64, i64) -> i1
+    %has_members = arith.cmpi sgt, %member_count, %zero : i64
+    %grouped = arith.andi %is_group, %has_members : i1
+    %result:8 = scf.if %grouped -> (i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>) {
+      %sub:8 = func.call @__ly_exc_star_split_rec(%eh, %mh, %mb, %handler) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, i64) -> (i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>)
+      scf.yield %sub#0, %sub#1, %sub#2, %sub#3, %sub#4, %sub#5, %sub#6, %sub#7 : i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>
+    } else {
+      %matches = func.call @LyEH_ClassIdMatches(%class_id, %handler) : (i64, i64) -> i1
+      %naked:8 = scf.if %matches -> (i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>) {
+        %is_exception = func.call @LyEH_ClassIdMatches(%class_id, %exception_root) : (i64, i64) -> i1
+        %wrap_id = arith.select %is_exception, %group_id, %base_group_id : i64
+        %wrap:3 = func.call @LyBaseException_New(%wrap_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+        %wblock = func.call @__ly_exc_payload_alloc(%one) : (i64) -> i64
+        func.call @__ly_exc_ext_set(%wrap#0, %payload_slot, %wblock) : (memref<3xi64>, i64, i64) -> ()
+        func.call @__ly_exc_payload_store(%wblock, %zero, %eh, %mh, %mb) : (i64, i64, memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+        // Tuple-style repr for the synthesized wrap.
+        %wblock_ptr = llvm.inttoptr %wblock : i64 to !llvm.ptr
+        %flagged = arith.ori %one, %tuple_bit : i64
+        llvm.store %flagged, %wblock_ptr : i64, !llvm.ptr
+        scf.yield %true_v, %wrap#0, %wrap#1, %wrap#2, %false_v, %dummy_h, %dummy_s, %dummy_b : i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>
+      } else {
+        %subn = memref.subview %eh[0] [2] [1] : memref<3xi64> to memref<2xi64, strided<[1]>>
+        %viewn = memref.cast %subn : memref<2xi64, strided<[1]>> to memref<2xi64, strided<[1], offset: ?>>
+        func.call @Ly_IncRef(%viewn) : (memref<2xi64, strided<[1], offset: ?>>) -> ()
+        scf.yield %false_v, %dummy_h, %dummy_s, %dummy_b, %true_v, %eh, %mh, %mb : i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>
+      }
+      scf.yield %naked#0, %naked#1, %naked#2, %naked#3, %naked#4, %naked#5, %naked#6, %naked#7 : i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>
+    }
+    func.return %result#0, %result#1, %result#2, %result#3, %result#4, %result#5, %result#6, %result#7 : i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>
+  }
+
+  // Combine the star frame's leftovers into one fresh group: the collected
+  // chain-node exceptions (in raise order) followed by the residual. Member
+  // references are retained here; the caller still releases the nodes (their
+  // reference moves to the group, net one owner).
+  func.func private @__ly_exc_star_combine(%nodes_word: i64, %count: i64, %has_res: i1, %res_eh: memref<3xi64>, %res_mh: memref<2xi64>, %res_mb: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "star_combine"} {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %exception_root = arith.constant 50 : i64
+    %group_id = arith.constant 102 : i64
+    %base_group_id = arith.constant 101 : i64
+    %payload_slot = arith.constant 3 : i64
+    %nodes_ptr = llvm.inttoptr %nodes_word : i64 to !llvm.ptr
+    %res_inc = arith.extui %has_res : i1 to i64
+    %total = arith.addi %count, %res_inc : i64
+    %true_v = arith.constant true
+    %c2 = arith.constant 2 : i64
+    %c3 = arith.constant 3 : i64
+    %c7 = arith.constant 7 : i64
+    %c12 = arith.constant 12 : i64
+    %c14 = arith.constant 14 : i64
+
+    // Borrowed member views out of a parked chain node (TracebackSupportBuilder
+    // layout: aligned pointers at words 2/7/12, message byte size at 14).
+    %count_index = arith.index_cast %count : i64 to index
+
+    // ExceptionGroup unless any member falls outside Exception.
+    %all_exc = scf.for %i = %c0 to %count_index step %c1 iter_args(%acc = %true_v) -> (i1) {
+      %i64v = arith.index_cast %i : index to i64
+      %node_slot = llvm.getelementptr %nodes_ptr[%i64v] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %node_word = llvm.load %node_slot : !llvm.ptr -> i64
+      %node_ptr = llvm.inttoptr %node_word : i64 to !llvm.ptr
+      %eh_slot = llvm.getelementptr %node_ptr[%c2] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %eh_word = llvm.load %eh_slot : !llvm.ptr -> i64
+      %eh_ptr = llvm.inttoptr %eh_word : i64 to !llvm.ptr
+      %class_slot = llvm.getelementptr %eh_ptr[%c2] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %class_id = llvm.load %class_slot : !llvm.ptr -> i64
+      %is_exc = func.call @LyEH_ClassIdMatches(%class_id, %exception_root) : (i64, i64) -> i1
+      %next = arith.andi %acc, %is_exc : i1
+      scf.yield %next : i1
+    }
+    %res_is_exc = scf.if %has_res -> (i1) {
+      %class_slot_r = arith.constant 2 : index
+      %res_class = memref.load %res_eh[%class_slot_r] : memref<3xi64>
+      %is_exc = func.call @LyEH_ClassIdMatches(%res_class, %exception_root) : (i64, i64) -> i1
+      scf.yield %is_exc : i1
+    } else {
+      scf.yield %true_v : i1
+    }
+    %all = arith.andi %all_exc, %res_is_exc : i1
+    %wrap_id = arith.select %all, %group_id, %base_group_id : i64
+
+    %wrap:3 = func.call @LyBaseException_New(%wrap_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    %block = func.call @__ly_exc_payload_alloc(%total) : (i64) -> i64
+    func.call @__ly_exc_ext_set(%wrap#0, %payload_slot, %block) : (memref<3xi64>, i64, i64) -> ()
+    scf.for %i = %c0 to %count_index step %c1 {
+      %i64v = arith.index_cast %i : index to i64
+      %node_slot = llvm.getelementptr %nodes_ptr[%i64v] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %node_word = llvm.load %node_slot : !llvm.ptr -> i64
+      %node_ptr = llvm.inttoptr %node_word : i64 to !llvm.ptr
+      %eh_slot = llvm.getelementptr %node_ptr[%c2] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %eh_word = llvm.load %eh_slot : !llvm.ptr -> i64
+      %mh_slot = llvm.getelementptr %node_ptr[%c7] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %mh_word = llvm.load %mh_slot : !llvm.ptr -> i64
+      %mb_slot = llvm.getelementptr %node_ptr[%c12] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %mb_word = llvm.load %mb_slot : !llvm.ptr -> i64
+      %len_slot = llvm.getelementptr %node_ptr[%c14] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %mb_len = llvm.load %len_slot : !llvm.ptr -> i64
+      %eh_dyn = func.call @__ly_global_view_i64(%eh_word, %c3) : (i64, i64) -> memref<?xi64>
+      %eh_view = memref.cast %eh_dyn : memref<?xi64> to memref<3xi64>
+      %two = arith.constant 2 : i64
+      %mh_dyn = func.call @__ly_global_view_i64(%mh_word, %two) : (i64, i64) -> memref<?xi64>
+      %mh_view = memref.cast %mh_dyn : memref<?xi64> to memref<2xi64>
+      %mb_view = func.call @__ly_global_view_i8(%mb_word, %mb_len) : (i64, i64) -> memref<?xi8>
+      func.call @__ly_exc_payload_store(%block, %i64v, %eh_view, %mh_view, %mb_view) : (i64, i64, memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    }
+    scf.if %has_res {
+      func.call @__ly_exc_payload_store(%block, %count, %res_eh, %res_mh, %res_mb) : (i64, i64, memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    }
+    func.return %wrap#0, %wrap#1, %wrap#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
   func.func @LyLong_DecRef(%header: memref<2xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.int", ly.runtime.deallocator} {
@@ -1810,8 +2105,14 @@ module attributes {
       %b_h, %b_b = func.call @LyUnicode_Concat(%a_h, %a_b, %sep0_h, %sep0_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
       func.call @LyUnicode_DecRef(%a_h) : (memref<2xi64>) -> ()
       func.call @LyUnicode_DecRef(%sep0_h) : (memref<2xi64>) -> ()
+      // The synthesized naked-exception wrap repr-renders its members as the
+      // tuple CPython passes: ('', (exc,)); source-constructed groups keep
+      // the list form.
+      %tuple_style = func.call @__ly_exc_payload_tuple_flag(%block) : (i64) -> i1
       %open_ref = memref.get_global @__ly_repr_lbracket : memref<1xi8>
-      %open_dyn = memref.cast %open_ref : memref<1xi8> to memref<?xi8>
+      %open_paren_ref = memref.get_global @__ly_repr_lparen : memref<1xi8>
+      %open_pick = arith.select %tuple_style, %open_paren_ref, %open_ref : memref<1xi8>
+      %open_dyn = memref.cast %open_pick : memref<1xi8> to memref<?xi8>
       %ob_h, %ob_b = func.call @LyUnicode_FromBytes(%open_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
       %c_h, %c_b = func.call @LyUnicode_Concat(%b_h, %b_b, %ob_h, %ob_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
       func.call @LyUnicode_DecRef(%b_h) : (memref<2xi64>) -> ()
@@ -1836,11 +2137,26 @@ module attributes {
         func.call @LyUnicode_DecRef(%mr_h) : (memref<2xi64>) -> ()
         scf.yield %nh, %nb : memref<2xi64>, memref<?xi8>
       }
-      %close_ref = memref.get_global @__ly_repr_rbracket : memref<1xi8>
-      %close_dyn = memref.cast %close_ref : memref<1xi8> to memref<?xi8>
-      %cb_h, %cb_b = func.call @LyUnicode_FromBytes(%close_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
-      %d_h, %d_b = func.call @LyUnicode_Concat(%loop#0, %loop#1, %cb_h, %cb_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      // Tuple-style single member keeps CPython's trailing comma: (exc,).
+      %is_single = arith.cmpi eq, %count, %c1_i64 : i64
+      %needs_comma = arith.andi %tuple_style, %is_single : i1
+      %joined:2 = scf.if %needs_comma -> (memref<2xi64>, memref<?xi8>) {
+        %comma1_h, %comma1_b = func.call @LyUnicode_FromBytes(%comma_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+        %jc_h, %jc_b = func.call @LyUnicode_Concat(%loop#0, %loop#1, %comma1_h, %comma1_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+        func.call @LyUnicode_DecRef(%comma1_h) : (memref<2xi64>) -> ()
+        scf.yield %jc_h, %jc_b : memref<2xi64>, memref<?xi8>
+      } else {
+        %kept:2 = func.call @__ly_unicode_retain_self(%loop#0, %loop#1) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+        scf.yield %kept#0, %kept#1 : memref<2xi64>, memref<?xi8>
+      }
       func.call @LyUnicode_DecRef(%loop#0) : (memref<2xi64>) -> ()
+      %close_ref = memref.get_global @__ly_repr_rbracket : memref<1xi8>
+      %close_paren_ref = memref.get_global @__ly_repr_rparen : memref<1xi8>
+      %close_pick = arith.select %tuple_style, %close_paren_ref, %close_ref : memref<1xi8>
+      %close_dyn = memref.cast %close_pick : memref<1xi8> to memref<?xi8>
+      %cb_h, %cb_b = func.call @LyUnicode_FromBytes(%close_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %d_h, %d_b = func.call @LyUnicode_Concat(%joined#0, %joined#1, %cb_h, %cb_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      func.call @LyUnicode_DecRef(%joined#0) : (memref<2xi64>) -> ()
       func.call @LyUnicode_DecRef(%cb_h) : (memref<2xi64>) -> ()
       %rparen_ref = memref.get_global @__ly_exc_rparen : memref<1xi8>
       %rparen_dyn = memref.cast %rparen_ref : memref<1xi8> to memref<?xi8>

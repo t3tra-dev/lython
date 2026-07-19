@@ -1,6 +1,8 @@
 #include "Common/PythonSourceRange.h"
 #include "Runtime/Core/Lowerer.h"
 
+#include "mlir/Dialect/SCF/IR/SCF.h"
+
 namespace py::lowering {
 namespace {
 
@@ -429,6 +431,236 @@ RuntimeBundleLowerer::lowerExceptCurrentMatch(py::ExceptCurrentMatchOp op) {
                                          mlir::ValueRange{handler});
   op.getResult().replaceAllUsesWith(call.getResult(0));
   erase.push_back(op);
+  return mlir::success();
+}
+
+// except* (PEP 654). The star frame lives in the native runtime; the split
+// and combine steps are manifest primitives so the group machinery stays in
+// builtins.mlir, and this glue only branches between them.
+
+namespace {
+
+mlir::func::FuncOp getOrCreateStarVoidFn(mlir::ModuleOp module,
+                                         mlir::OpBuilder &builder,
+                                         llvm::StringRef name) {
+  return getOrCreatePrivateFunction(module, builder, name,
+                                    builder.getFunctionType({}, {}));
+}
+
+llvm::SmallVector<mlir::Type, 3> exceptionTripleTypes(mlir::OpBuilder &b) {
+  return {mlir::MemRefType::get({3}, b.getI64Type()),
+          mlir::MemRefType::get({2}, b.getI64Type()),
+          mlir::MemRefType::get({mlir::ShapedType::kDynamic}, b.getI8Type())};
+}
+
+} // namespace
+
+mlir::LogicalResult RuntimeBundleLowerer::lowerStarBegin(py::StarBeginOp op) {
+  builder.setInsertionPoint(op);
+  mlir::func::CallOp::create(
+      builder, op.getLoc(), getOrCreateStarVoidFn(module, builder,
+                                                  "LyEH_StarBegin"),
+      mlir::ValueRange{});
+  op.erase();
+  return mlir::success();
+}
+
+mlir::LogicalResult
+RuntimeBundleLowerer::lowerExceptStarMatch(py::ExceptStarMatchOp op) {
+  mlir::FailureOr<std::int64_t> handlerId =
+      handlerClassId(op.getOperation(), op.getHandler());
+  if (mlir::failed(handlerId))
+    return mlir::failure();
+  std::optional<RuntimeSymbol> split =
+      manifest.primitive("builtins.BaseException", "star_split");
+  if (!split)
+    return op.emitError()
+           << "runtime manifest has no BaseException star_split primitive";
+
+  context->loadDialect<mlir::scf::SCFDialect>();
+  mlir::Location loc = op.getLoc();
+  builder.setInsertionPoint(op);
+  llvm::SmallVector<mlir::Type, 3> triple = exceptionTripleTypes(builder);
+  mlir::func::FuncOp residualParts = getOrCreatePrivateFunction(
+      module, builder, "LyEH_StarResidualParts",
+      builder.getFunctionType({}, triple));
+  llvm::SmallVector<mlir::Type, 8> applyInputs{builder.getI1Type()};
+  applyInputs.append(triple.begin(), triple.end());
+  applyInputs.append(triple.begin(), triple.end());
+  mlir::func::FuncOp applyMatch = getOrCreatePrivateFunction(
+      module, builder, "LyEH_StarApplyMatch",
+      builder.getFunctionType(applyInputs, {}));
+  mlir::func::FuncOp hasResidual = getOrCreatePrivateFunction(
+      module, builder, "LyEH_StarHasResidual",
+      builder.getFunctionType({}, {builder.getI1Type()}));
+
+  mlir::Value residual =
+      mlir::func::CallOp::create(builder, loc, hasResidual, mlir::ValueRange{})
+          .getResult(0);
+  auto outer = mlir::scf::IfOp::create(builder, loc,
+                                       mlir::TypeRange{builder.getI1Type()},
+                                       residual, /*withElseRegion=*/true);
+  {
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(&outer.getThenRegion().front());
+    mlir::func::CallOp parts = mlir::func::CallOp::create(
+        builder, loc, residualParts, mlir::ValueRange{});
+    mlir::Value handler =
+        mlir::arith::ConstantIntOp::create(builder, loc, *handlerId, 64)
+            .getResult();
+    mlir::func::CallOp splitCall = RuntimeBundleLowerer::createRuntimeCall(
+        loc, *split,
+        {parts.getResult(0), parts.getResult(1), parts.getResult(2), handler});
+    if (splitCall.getNumResults() != 8)
+      return op.emitError() << "star_split must return two flagged triples";
+    mlir::Value matched = splitCall.getResult(0);
+    auto applyIf = mlir::scf::IfOp::create(builder, loc, mlir::TypeRange{},
+                                           matched, /*withElseRegion=*/false);
+    {
+      mlir::OpBuilder::InsertionGuard applyGuard(builder);
+      builder.setInsertionPointToStart(&applyIf.getThenRegion().front());
+      mlir::func::CallOp::create(
+          builder, loc, applyMatch,
+          mlir::ValueRange{splitCall.getResult(4), splitCall.getResult(1),
+                           splitCall.getResult(2), splitCall.getResult(3),
+                           splitCall.getResult(5), splitCall.getResult(6),
+                           splitCall.getResult(7)});
+    }
+    mlir::scf::YieldOp::create(builder, loc, mlir::ValueRange{matched});
+    builder.setInsertionPointToStart(&outer.getElseRegion().front());
+    mlir::Value noMatch =
+        mlir::arith::ConstantIntOp::create(builder, loc, 0, 1).getResult();
+    mlir::scf::YieldOp::create(builder, loc, mlir::ValueRange{noMatch});
+  }
+  op.getResult().replaceAllUsesWith(outer.getResult(0));
+  erase.push_back(op);
+  return mlir::success();
+}
+
+mlir::LogicalResult
+RuntimeBundleLowerer::lowerStarCollect(py::StarCollectOp op) {
+  builder.setInsertionPoint(op);
+  mlir::func::CallOp::create(
+      builder, op.getLoc(), getOrCreateStarVoidFn(module, builder,
+                                                  "LyEH_StarCollect"),
+      mlir::ValueRange{});
+  op.erase();
+  return mlir::success();
+}
+
+mlir::LogicalResult
+RuntimeBundleLowerer::lowerStarBodyEnd(py::StarBodyEndOp op) {
+  builder.setInsertionPoint(op);
+  mlir::func::CallOp::create(builder, op.getLoc(),
+                             getOrCreateDiscardCurrentException(module,
+                                                                builder),
+                             mlir::ValueRange{});
+  op.erase();
+  return mlir::success();
+}
+
+mlir::LogicalResult
+RuntimeBundleLowerer::lowerStarFinish(py::StarFinishOp op) {
+  std::optional<RuntimeSymbol> combine =
+      manifest.primitive("builtins.BaseException", "star_combine");
+  if (!combine)
+    return op.emitError()
+           << "runtime manifest has no BaseException star_combine primitive";
+
+  context->loadDialect<mlir::scf::SCFDialect>();
+  mlir::Location loc = op.getLoc();
+  builder.setInsertionPoint(op);
+  llvm::SmallVector<mlir::Type, 3> triple = exceptionTripleTypes(builder);
+  mlir::Type i64 = builder.getI64Type();
+  mlir::func::FuncOp collectedCount = getOrCreatePrivateFunction(
+      module, builder, "LyEH_StarCollectedCount",
+      builder.getFunctionType({}, {i64}));
+  mlir::func::FuncOp hasResidual = getOrCreatePrivateFunction(
+      module, builder, "LyEH_StarHasResidual",
+      builder.getFunctionType({}, {builder.getI1Type()}));
+  mlir::func::FuncOp nodesPtr = getOrCreatePrivateFunction(
+      module, builder, "LyEH_StarNodesPtr", builder.getFunctionType({}, {i64}));
+  mlir::func::FuncOp residualParts = getOrCreatePrivateFunction(
+      module, builder, "LyEH_StarResidualParts",
+      builder.getFunctionType({}, triple));
+  llvm::SmallVector<mlir::Type, 4> throwInputs(triple.begin(), triple.end());
+  mlir::func::FuncOp throwCombined = getOrCreatePrivateFunction(
+      module, builder, "LyEH_StarThrowCombined",
+      builder.getFunctionType(throwInputs, {}));
+
+  mlir::Value count =
+      mlir::func::CallOp::create(builder, loc, collectedCount,
+                                 mlir::ValueRange{})
+          .getResult(0);
+  mlir::Value residual =
+      mlir::func::CallOp::create(builder, loc, hasResidual, mlir::ValueRange{})
+          .getResult(0);
+  mlir::Value zero =
+      mlir::arith::ConstantIntOp::create(builder, loc, 0, 64).getResult();
+  mlir::Value one =
+      mlir::arith::ConstantIntOp::create(builder, loc, 1, 64).getResult();
+  mlir::Value trueBit =
+      mlir::arith::ConstantIntOp::create(builder, loc, 1, 1).getResult();
+  mlir::Value noCollected = mlir::arith::CmpIOp::create(
+      builder, loc, mlir::arith::CmpIPredicate::eq, count, zero);
+  mlir::Value noResidual =
+      mlir::arith::XOrIOp::create(builder, loc, residual, trueBit).getResult();
+  mlir::Value clean =
+      mlir::arith::AndIOp::create(builder, loc, noCollected, noResidual)
+          .getResult();
+  auto cleanIf = mlir::scf::IfOp::create(builder, loc, mlir::TypeRange{},
+                                         clean, /*withElseRegion=*/true);
+  {
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(&cleanIf.getThenRegion().front());
+    mlir::func::CallOp::create(
+        builder, loc, getOrCreateStarVoidFn(module, builder, "LyEH_StarPop"),
+        mlir::ValueRange{});
+
+    builder.setInsertionPointToStart(&cleanIf.getElseRegion().front());
+    auto residualOnlyIf = mlir::scf::IfOp::create(
+        builder, loc, mlir::TypeRange{}, noCollected,
+        /*withElseRegion=*/true);
+    builder.setInsertionPointToStart(&residualOnlyIf.getThenRegion().front());
+    emitTryCallSiteMarkerIfNeeded(loc);
+    mlir::func::CallOp::create(
+        builder, loc,
+        getOrCreateStarVoidFn(module, builder, "LyEH_StarRethrowResidual"),
+        mlir::ValueRange{});
+
+    builder.setInsertionPointToStart(&residualOnlyIf.getElseRegion().front());
+    mlir::Value soleCount = mlir::arith::CmpIOp::create(
+        builder, loc, mlir::arith::CmpIPredicate::eq, count, one);
+    mlir::Value sole =
+        mlir::arith::AndIOp::create(builder, loc, soleCount, noResidual)
+            .getResult();
+    auto soleIf = mlir::scf::IfOp::create(builder, loc, mlir::TypeRange{},
+                                          sole, /*withElseRegion=*/true);
+    builder.setInsertionPointToStart(&soleIf.getThenRegion().front());
+    emitTryCallSiteMarkerIfNeeded(loc);
+    mlir::func::CallOp::create(
+        builder, loc,
+        getOrCreateStarVoidFn(module, builder,
+                              "LyEH_StarRethrowSoleCollected"),
+        mlir::ValueRange{});
+
+    builder.setInsertionPointToStart(&soleIf.getElseRegion().front());
+    mlir::Value nodes =
+        mlir::func::CallOp::create(builder, loc, nodesPtr, mlir::ValueRange{})
+            .getResult(0);
+    mlir::func::CallOp parts = mlir::func::CallOp::create(
+        builder, loc, residualParts, mlir::ValueRange{});
+    mlir::func::CallOp combined = RuntimeBundleLowerer::createRuntimeCall(
+        loc, *combine,
+        {nodes, count, residual, parts.getResult(0), parts.getResult(1),
+         parts.getResult(2)});
+    if (combined.getNumResults() != 3)
+      return op.emitError() << "star_combine must return an exception triple";
+    emitTryCallSiteMarkerIfNeeded(loc);
+    mlir::func::CallOp::create(builder, loc, throwCombined,
+                               combined.getResults());
+  }
+  op.erase();
   return mlir::success();
 }
 

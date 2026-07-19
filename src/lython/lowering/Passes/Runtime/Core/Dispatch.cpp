@@ -54,6 +54,15 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPyOp(mlir::Operation *op) {
           [&](auto match) { return lowerExceptCurrentMatch(match); })
       .Case<py::ExceptCurrentValueOp>(
           [&](auto value) { return lowerExceptCurrentValue(value); })
+      .Case<py::StarBeginOp>([&](auto begin) { return lowerStarBegin(begin); })
+      .Case<py::ExceptStarMatchOp>(
+          [&](auto match) { return lowerExceptStarMatch(match); })
+      .Case<py::StarCollectOp>(
+          [&](auto collect) { return lowerStarCollect(collect); })
+      .Case<py::StarBodyEndOp>(
+          [&](auto bodyEnd) { return lowerStarBodyEnd(bodyEnd); })
+      .Case<py::StarFinishOp>(
+          [&](auto finish) { return lowerStarFinish(finish); })
       .Case<py::CallOp>([&](auto call) { return lowerCall(call); })
       .Case<py::BoolOp>([&](auto boolean) { return lowerBool(boolean); })
       .Case<py::LenOp>([&](auto len) { return lowerLen(len); })

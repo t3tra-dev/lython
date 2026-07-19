@@ -1,0 +1,7 @@
+V: ExceptionGroup('g', [ValueError('a'), ValueError('c')])
+T: ExceptionGroup('g', [TypeError('b')])
+after
+K: ExceptionGroup('outer', [ExceptionGroup('inner', [KeyError('k')])])
+V: ExceptionGroup('outer', [ExceptionGroup('inner', [ValueError('v')]), ValueError('w')])
+T: ExceptionGroup('outer', [TypeError('t')])
+after2

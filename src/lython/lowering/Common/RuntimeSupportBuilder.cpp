@@ -1621,7 +1621,10 @@ void buildReleaseExceptionExtras(SupportBuilder &b) {
       mlir::OpBuilder::InsertionGuard guard(b.builder);
       b.builder.setInsertionPointToStart(&blockIf.getThenRegion().front());
       mlir::Value blockPtr = b.intToPtr(block64);
-      mlir::Value count = b.loadI64(blockPtr);
+      // Bit 62 of the count word is the tuple-repr flag.
+      mlir::Value rawCount = b.loadI64(blockPtr);
+      mlir::Value count = mlir::arith::AndIOp::create(
+          b.builder, b.loc, rawCount, b.iconst(0x3FFFFFFFFFFFFFFFLL));
       mlir::Value zeroIndex =
           mlir::arith::ConstantIndexOp::create(b.builder, b.loc, 0);
       mlir::Value oneIndex =

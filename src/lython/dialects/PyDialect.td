@@ -344,6 +344,56 @@ def Py_ExceptCurrentMatchOp : Py_Op<"except.current_match", []> {
   let hasVerifier = 1;
 }
 
+//===----------------------------------------------------------------------===//
+// except* (PEP 654)
+//===----------------------------------------------------------------------===//
+//
+// The star handler chain runs against a per-level "star frame" instead of
+// the single current-exception token: the frame owns the unmatched residual
+// between clauses and collects exceptions raised by clause bodies, because
+// several clauses may each consume a slice of one exception group before
+// the leftovers are rethrown as one combined exception.
+
+def Py_StarBeginOp : Py_Op<"except_star.begin", []> {
+  let summary = "Move the caught exception into a fresh star frame";
+  let assemblyFormat = "attr-dict";
+}
+
+def Py_ExceptStarMatchOp : Py_Op<"except_star.match", []> {
+  let summary = "Split the star frame's residual against a handler type";
+  let description = [{
+    Splits the residual exception (group-aware, PEP 654 split semantics)
+    against the handler type. On a match the matched part becomes the current
+    exception (the `as e` binding and implicit-context source for raises in
+    the clause body) and the rest replaces the frame residual; the result
+    reports whether the clause body runs.
+  }];
+  let arguments = (ins TypeAttrOf<Py_TypeType>:$handler);
+  let results = (outs I1:$result);
+  let assemblyFormat = "$handler attr-dict";
+}
+
+def Py_StarCollectOp : Py_Op<"except_star.collect", []> {
+  let summary = "Park an exception raised by a clause body in the star frame";
+  let assemblyFormat = "attr-dict";
+}
+
+def Py_StarBodyEndOp : Py_Op<"except_star.body_end", []> {
+  let summary = "Discard the matched part after a completed clause body";
+  let assemblyFormat = "attr-dict";
+}
+
+def Py_StarFinishOp : Py_Op<"except_star.finish", []> {
+  let summary = "Pop the star frame; rethrow leftovers per PEP 654";
+  let description = [{
+    Handler-raised exceptions and the unmatched residual combine on CPython's
+    rules: nothing pending falls through, a lone residual or a single
+    collected exception rethrows as itself, anything else rethrows as a fresh
+    exception group wrapping them all.
+  }];
+  let assemblyFormat = "attr-dict";
+}
+
 def Py_ExceptCurrentValueOp : Py_Op<"except.current_value", []> {
   let summary = "Borrow the current Python EH payload as a handler value";
   let description = [{

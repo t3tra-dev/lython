@@ -1,0 +1,1 @@
+V: ExceptionGroup('g', [ValueError('a')])
