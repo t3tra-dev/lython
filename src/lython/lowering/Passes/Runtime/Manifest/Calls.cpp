@@ -847,6 +847,118 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
     return mlir::success();
   }
 
+  // Multi-value exception args: Exception("a", 1) fills the extended
+  // payload block with the boxed values (the .args source) and renders
+  // CPython's str(e) — "('a', 1)" — into the message lane. The former path
+  // dropped every argument past the first through the unused-source hole.
+  bool exceptionInit =
+      *methodName == "__init__" &&
+      (py::isAssignableTo(runtimeContractType(context, initContract),
+                          runtimeContractType(context,
+                                              "builtins.BaseException"),
+                          op) ||
+       (instanceClassOp &&
+        RuntimeBundleLowerer::exceptionAncestorContract(instanceClassOp)));
+  if (exceptionInit && !groupInit && sources.size() > 2) {
+    if (mlir::failed(requireEmptyAggregate(op, op.getKwnames(), "kw names")) ||
+        mlir::failed(requireEmptyAggregate(op, op.getKwvalues(), "kw values")))
+      return mlir::failure();
+    std::optional<RuntimeSymbol> membersAlloc =
+        manifest.primitive("builtins.BaseExceptionGroup", "members_alloc");
+    std::optional<RuntimeSymbol> storeWords =
+        manifest.primitive("builtins.BaseException", "payload_store_words");
+    std::optional<RuntimeSymbol> initPayloadMessage =
+        manifest.primitive("builtins.BaseException", "init_payload_message");
+    if (!membersAlloc || !storeWords || !initPayloadMessage)
+      return op.emitError() << "runtime manifest has no exception payload "
+                               "primitives";
+    if (instance->physicalValues().size() != 3)
+      return op.emitError() << "multi-argument exception init requires the "
+                               "3-value exception ABI";
+
+    builder.setInsertionPoint(op);
+    mlir::Location loc = op.getLoc();
+    auto adaptOperand = [&](mlir::Value value, mlir::Type want) -> mlir::Value {
+      if (value.getType() == want)
+        return value;
+      return mlir::memref::CastOp::create(builder, loc, want, value)
+          .getResult();
+    };
+    llvm::ArrayRef<mlir::Type> allocInputs =
+        membersAlloc->function.getFunctionType().getInputs();
+    if (allocInputs.size() != 4)
+      return op.emitError() << "exception payload alloc ABI mismatch";
+    mlir::Value argCount =
+        mlir::arith::ConstantIntOp::create(
+            builder, loc, static_cast<std::int64_t>(sources.size() - 1), 64)
+            .getResult();
+    llvm::SmallVector<mlir::Value, 4> allocOperands;
+    for (unsigned index = 0; index < 3; ++index)
+      allocOperands.push_back(
+          adaptOperand(instance->physicalValues()[index], allocInputs[index]));
+    allocOperands.push_back(argCount);
+    mlir::func::CallOp allocCall = RuntimeBundleLowerer::createRuntimeCall(
+        loc, *membersAlloc, allocOperands);
+    if (allocCall.getNumResults() != 1)
+      return op.emitError() << "exception payload alloc must return the "
+                               "block word";
+    mlir::Value blockWord = allocCall.getResult(0);
+
+    for (unsigned index = 1; index < sources.size(); ++index) {
+      const RuntimeBundle *argSource = sources[index];
+      if (!argSource)
+        return op.emitError()
+               << "exception argument " << (index - 1) << " has no bundle";
+      mlir::FailureOr<RuntimeBundle> payload =
+          RuntimeBundleLowerer::materializePayloadObjectBundle(op, *argSource);
+      if (mlir::failed(payload))
+        return mlir::failure();
+      if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
+              op, *payload, "exception.args")))
+        return mlir::failure();
+      mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
+          RuntimeBundleLowerer::objectPayloadHandleWords(op, *payload);
+      if (mlir::failed(words))
+        return mlir::failure();
+      builder.setInsertionPoint(op);
+      mlir::Value slot = mlir::arith::ConstantIntOp::create(
+                             builder, loc,
+                             static_cast<std::int64_t>(index - 1), 64)
+                             .getResult();
+      llvm::SmallVector<mlir::Value, 18> storeOperands{blockWord, slot};
+      storeOperands.append(words->begin(), words->end());
+      RuntimeBundleLowerer::createRuntimeCall(loc, *storeWords, storeOperands);
+      if (payload->objectValue.ownership == ownership::OwnershipKind::Own &&
+          mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
+              op, *payload, "exception.args.source")))
+        return mlir::failure();
+    }
+
+    builder.setInsertionPoint(op);
+    llvm::ArrayRef<mlir::Type> messageInputs =
+        initPayloadMessage->function.getFunctionType().getInputs();
+    if (messageInputs.size() != 3)
+      return op.emitError() << "init_payload_message ABI mismatch";
+    llvm::SmallVector<mlir::Value, 4> messageOperands;
+    for (unsigned index = 0; index < 3; ++index)
+      messageOperands.push_back(
+          adaptOperand(instance->physicalValues()[index],
+                       messageInputs[index]));
+    mlir::func::CallOp messageCall = RuntimeBundleLowerer::createRuntimeCall(
+        loc, *initPayloadMessage, messageOperands);
+    RuntimeBundle updatedInstance;
+    if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
+            op, op.getInstance().getType(), messageCall, updatedInstance)))
+      return mlir::failure();
+    valueBundles[op.getInstance()] = std::move(updatedInstance);
+    if (mlir::failed(assignObjectBundle(
+            op, op.getResult(), runtimeContractType(context, "types.NoneType"),
+            mlir::ValueRange{})))
+      return mlir::failure();
+    erase.push_back(op);
+    return mlir::success();
+  }
+
   std::optional<EmittedRuntimeCall> emitted;
   if (mlir::failed(requireEmptyAggregate(op, op.getKwnames(), "kw names")) ||
       mlir::failed(requireEmptyAggregate(op, op.getKwvalues(), "kw values")))
