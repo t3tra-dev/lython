@@ -1,0 +1,9 @@
+empty-list truthy
+empty list falsy
+empty dict falsy
+tuple truthy
+empty str falsy
+bytes truthy
+none-or-empty
+none-or-empty
+have val

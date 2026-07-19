@@ -66,6 +66,25 @@ bool containsLoopLevelBreak(const std::vector<parser::NodePtr> *body) {
   return false;
 }
 
+bool containsNamedExpr(const parser::Node *node) {
+  if (!node)
+    return false;
+  if (node->kind == "NamedExpr")
+    return true;
+  for (const parser::Field &field : node->fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (containsNamedExpr(child->get()))
+        return true;
+    } else if (const auto *children =
+                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
+      for (const parser::NodePtr &item : *children)
+        if (containsNamedExpr(item.get()))
+          return true;
+    }
+  }
+  return false;
+}
+
 } // namespace
 
 llvm::SmallVector<CarriedLoopLocal, 4> ModuleEmitter::collectCarriedLoopLocals(
@@ -73,6 +92,10 @@ llvm::SmallVector<CarriedLoopLocal, 4> ModuleEmitter::collectCarriedLoopLocals(
     llvm::SmallVectorImpl<mlir::Value> &initialValues) {
   llvm::StringSet<> assignedInBody;
   collectAssignedNames(ast::nodeList(statement, "body"), assignedInBody);
+  // A walrus in a while condition rebinds per iteration exactly like a body
+  // assignment (the field is absent on for/async-for statements).
+  if (const parser::Node *test = ast::node(statement, "test"))
+    collectAssignedNames(test, assignedInBody);
   llvm::SmallVector<std::string, 4> names;
   for (const auto &assigned : assignedInBody) {
     if (excludedNames && excludedNames->contains(assigned.getKey()))
@@ -176,7 +199,7 @@ void ModuleEmitter::bindCarriedLoopLocals(
 
 llvm::SmallVector<mlir::Value, 4> ModuleEmitter::carriedLoopEdgeOperands(
     const parser::Node &anchor, llvm::ArrayRef<CarriedLoopLocal> carried,
-    mlir::Block *headerBlock) {
+    mlir::Block *headerBlock, llvm::ArrayRef<mlir::Value> baselineValues) {
   llvm::SmallVector<mlir::Value, 4> operands;
   operands.reserve(carried.size());
   for (auto [index, local] : llvm::enumerate(carried)) {
@@ -193,9 +216,12 @@ llvm::SmallVector<mlir::Value, 4> ModuleEmitter::carriedLoopEdgeOperands(
     // leaves the body (back-edge, break, continue, async-for try yield).
     // Locals that are not contract terms (primitive scalars and tensors) carry
     // no token to balance, and py.decref does not accept them.
-    if (headerBlock && index < headerBlock->getNumArguments() &&
-        py::isPyContractType(local.type)) {
-      mlir::Value previous = headerBlock->getArgument(index);
+    mlir::Value previous;
+    if (index < baselineValues.size() && baselineValues[index])
+      previous = baselineValues[index];
+    else if (headerBlock && index < headerBlock->getNumArguments())
+      previous = headerBlock->getArgument(index);
+    if (previous && py::isPyContractType(local.type)) {
       if (value != previous && !derivesViaStructuralMutation(value, previous))
         py::DecRefOp::create(builder, loc(anchor), previous);
     }
@@ -209,7 +235,8 @@ ModuleEmitter::loopCarriedBranchOperands(const parser::Node &anchor,
                                          const LoopControlContext &loop,
                                          mlir::Block *target) {
   (void)target;
-  return carriedLoopEdgeOperands(anchor, loop.carriedLocals, loop.headerBlock);
+  return carriedLoopEdgeOperands(anchor, loop.carriedLocals, loop.headerBlock,
+                                 loop.baselineValues);
 }
 
 // A generator expression consumed directly by a for loop fuses into nested
@@ -317,16 +344,18 @@ void ModuleEmitter::emitGeneratorExpFor(const parser::Node &statement,
 }
 
 void ModuleEmitter::emitFor(const parser::Node &statement) {
-  if (const auto *orelse = ast::nodeList(statement, "orelse")) {
-    if (!orelse->empty()) {
-      diagnostics.push_back(
-          parser::Diagnostic{parser::Severity::Error, statement.range.start,
-                             "for/else is not implemented yet"});
-      return;
-    }
-  }
+  const auto *orelse = ast::nodeList(statement, "orelse");
+  bool hasElse = orelse && !orelse->empty();
   if (const parser::Node *iterNode = ast::node(statement, "iter");
       iterNode && iterNode->kind == "GeneratorExp") {
+    if (hasElse) {
+      // The genexpr fusion rewrites the loop into nested loops, which would
+      // silently re-scope a break away from the else's no-break condition.
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, statement.range.start,
+          "for/else over a generator expression is not supported yet"});
+      return;
+    }
     emitGeneratorExpFor(statement, *iterNode);
     return;
   }
@@ -343,8 +372,12 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
       const auto *keys = ast::nodeList(*iterNode, "keys");
       emptyLiteral = !keys || keys->empty();
     }
-    if (emptyLiteral)
+    if (emptyLiteral) {
+      // Zero iterations means no break: the else body always runs.
+      if (hasElse)
+        emitStatements(orelse);
       return;
+    }
   }
   // Loop-carried locals: pre-existing locals reassigned in the body (an
   // accumulator carried across iterations). Thread them as loop-header /
@@ -382,6 +415,11 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
       builder.createBlock(region, afterBlock->getIterator());
   mlir::Block *bodyBlock =
       builder.createBlock(region, afterBlock->getIterator());
+  // else: the no-break exhaustion edge runs the else body before joining the
+  // after-block; break edges skip it by targeting the after-block directly.
+  mlir::Block *elseBlock =
+      hasElse ? builder.createBlock(region, afterBlock->getIterator())
+              : nullptr;
   // Without a break the after-block's one predecessor is the header, whose
   // arguments dominate it: forwarding them again through after-block
   // arguments would give those arguments a single incoming edge that sits on
@@ -389,9 +427,12 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
   // making shaped-primitive buffer types order-dependent.
   bool breakForwardsCarried =
       containsLoopLevelBreak(ast::nodeList(statement, "body"));
+  bool afterForwardsCarried = breakForwardsCarried || hasElse;
   for (const CarriedLoopLocal &local : carried) {
     checkBlock->addArgument(local.type, loc(statement));
-    if (breakForwardsCarried)
+    if (elseBlock)
+      elseBlock->addArgument(local.type, loc(statement));
+    if (afterForwardsCarried)
       afterBlock->addArgument(local.type, loc(statement));
   }
 
@@ -401,7 +442,7 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
   builder.setInsertionPointToStart(checkBlock);
   bindCarriedLoopLocals(carried, checkBlock);
   llvm::SmallVector<mlir::Value, 4> checkArgs;
-  if (breakForwardsCarried)
+  if (afterForwardsCarried)
     for (unsigned index = 0; index < carried.size(); ++index)
       checkArgs.push_back(checkBlock->getArgument(index));
   // The next op carries the iterator expression's location, not the whole
@@ -413,9 +454,10 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
   auto next = py::NextOp::create(
       builder, nextLoc, elem, builder.getI1Type(), iteratorType,
       "__next__", callProtocolFor(nextInference), iterator.getResult());
+  mlir::Block *exhaustedTarget = elseBlock ? elseBlock : afterBlock;
   mlir::cf::CondBranchOp::create(builder, loc(statement), next.getValid(),
-                                 bodyBlock, mlir::ValueRange{}, afterBlock,
-                                 checkArgs);
+                                 bodyBlock, mlir::ValueRange{},
+                                 exhaustedTarget, checkArgs);
 
   builder.setInsertionPointToStart(bodyBlock);
   {
@@ -435,21 +477,65 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
           carriedLoopEdgeOperands(statement, carried, checkBlock));
   }
 
+  if (elseBlock) {
+    builder.setInsertionPointToStart(elseBlock);
+    ScopedEmitterScope scope(values, types);
+    bindCarriedLoopLocals(carried, elseBlock);
+    emitStatements(orelse);
+    if (!insertionBlockTerminated(builder))
+      mlir::cf::BranchOp::create(
+          builder, loc(statement), afterBlock,
+          carriedLoopEdgeOperands(statement, carried, elseBlock));
+  }
+
   builder.setInsertionPointToStart(afterBlock);
   bindCarriedLoopLocals(carried,
-                        breakForwardsCarried ? afterBlock : checkBlock);
+                        afterForwardsCarried ? afterBlock : checkBlock);
 }
 
 void ModuleEmitter::emitWhile(const parser::Node &statement) {
-  if (const auto *orelse = ast::nodeList(statement, "orelse")) {
-    if (!orelse->empty()) {
-      diagnostics.push_back(
-          parser::Diagnostic{parser::Severity::Error, statement.range.start,
-                             "while/else is not implemented yet"});
+  const auto *orelse = ast::nodeList(statement, "orelse");
+  bool hasElse = orelse && !orelse->empty();
+  const parser::Node *test = ast::node(statement, "test");
+  // A walrus in the condition rebinds locals in the loop HEADER, which the
+  // carried-local machinery (built around body assignments) cannot balance.
+  // Desugar to the equivalent body-assignment form instead:
+  //   while TEST: BODY else: ELSE
+  //   ==> while True:
+  //         if TEST: BODY
+  //         else: ELSE; break
+  // (break/continue in BODY still target the while; break in BODY correctly
+  // skips ELSE.)
+  if (test && containsNamedExpr(test)) {
+    const parser::Field *testField = parser::findField(statement, "test");
+    const parser::Field *bodyField = parser::findField(statement, "body");
+    if (testField && bodyField &&
+        std::holds_alternative<parser::NodePtr>(testField->value) &&
+        std::holds_alternative<std::vector<parser::NodePtr>>(
+            bodyField->value)) {
+      parser::NodePtr guard = parser::makeNode("If", statement.range);
+      parser::addField(*guard, "test",
+                       std::get<parser::NodePtr>(testField->value));
+      parser::addField(
+          *guard, "body",
+          std::get<std::vector<parser::NodePtr>>(bodyField->value));
+      std::vector<parser::NodePtr> exitBody;
+      if (orelse)
+        exitBody.assign(orelse->begin(), orelse->end());
+      exitBody.push_back(parser::makeNode("Break", statement.range));
+      parser::addField(*guard, "orelse", std::move(exitBody));
+
+      parser::NodePtr trueConstant =
+          parser::makeNode("Constant", statement.range);
+      parser::addField(*trueConstant, "value", true);
+      parser::NodePtr loop = parser::makeNode("While", statement.range);
+      parser::addField(*loop, "test", trueConstant);
+      parser::addField(*loop, "body", std::vector<parser::NodePtr>{guard});
+      parser::addField(*loop, "orelse", std::vector<parser::NodePtr>{});
+      emitWhile(*loop);
       return;
     }
   }
-  const parser::Node *test = ast::node(statement, "test");
   if (!test) {
     diagnostics.push_back(parser::Diagnostic{parser::Severity::Error,
                                              statement.range.start,
@@ -473,6 +559,11 @@ void ModuleEmitter::emitWhile(const parser::Node &statement) {
       builder.createBlock(region, afterBlock->getIterator());
   mlir::Block *bodyBlock =
       builder.createBlock(region, afterBlock->getIterator());
+  // else: the condition-false edge runs the else body before joining the
+  // after-block; break edges skip it by targeting the after-block directly.
+  mlir::Block *elseBlock =
+      hasElse ? builder.createBlock(region, afterBlock->getIterator())
+              : nullptr;
   // Without a break the after-block's one predecessor is the header, whose
   // arguments dominate it: forwarding them again through after-block
   // arguments would give those arguments a single incoming edge that sits on
@@ -480,9 +571,12 @@ void ModuleEmitter::emitWhile(const parser::Node &statement) {
   // making shaped-primitive buffer types order-dependent.
   bool breakForwardsCarried =
       containsLoopLevelBreak(ast::nodeList(statement, "body"));
+  bool afterForwardsCarried = breakForwardsCarried || hasElse;
   for (const CarriedLoopLocal &local : carried) {
     headerBlock->addArgument(local.type, loc(statement));
-    if (breakForwardsCarried)
+    if (elseBlock)
+      elseBlock->addArgument(local.type, loc(statement));
+    if (afterForwardsCarried)
       afterBlock->addArgument(local.type, loc(statement));
   }
 
@@ -491,36 +585,77 @@ void ModuleEmitter::emitWhile(const parser::Node &statement) {
                              carriedInitial);
 
   // Header: bind carried locals, evaluate the condition, and on false forward
-  // the current header values to the after-block.
+  // the current header values to the else block (when present) or the
+  // after-block.
   builder.setInsertionPointToStart(headerBlock);
   bindCarriedLoopLocals(carried, headerBlock);
-  llvm::SmallVector<mlir::Value, 4> headerArgs;
-  if (breakForwardsCarried)
-    for (unsigned index = 0; index < carried.size(); ++index)
-      headerArgs.push_back(headerBlock->getArgument(index));
   mlir::Value condition = emitBoolValue(emitExpr(test), statement);
+  // A walrus in the condition may have rebound carried locals in the header:
+  // the replaced header argument is released HERE (the rebinding happened
+  // unconditionally), and every edge leaving the header forwards / compares
+  // against the post-condition value instead of the raw argument.
+  llvm::SmallVector<mlir::Value, 4> postTestValues;
+  postTestValues.reserve(carried.size());
+  for (auto [index, local] : llvm::enumerate(carried)) {
+    mlir::Value argument = headerBlock->getArgument(index);
+    mlir::Value current = argument;
+    if (auto found = values.find(local.name);
+        found != values.end() && found->second.value)
+      current = coerceValue(found->second, local.type, statement).value;
+    if (current != argument && py::isPyContractType(local.type) &&
+        !derivesViaStructuralMutation(current, argument))
+      py::DecRefOp::create(builder, loc(statement), argument);
+    postTestValues.push_back(current);
+  }
+  llvm::SmallVector<mlir::Value, 4> headerArgs;
+  if (afterForwardsCarried)
+    headerArgs.append(postTestValues.begin(), postTestValues.end());
+  mlir::Block *conditionFalseTarget = elseBlock ? elseBlock : afterBlock;
   mlir::cf::CondBranchOp::create(builder, loc(statement), condition, bodyBlock,
-                                 mlir::ValueRange{}, afterBlock, headerArgs);
+                                 mlir::ValueRange{}, conditionFalseTarget,
+                                 headerArgs);
 
   builder.setInsertionPointToStart(bodyBlock);
   {
     ScopedEmitterScope scope(values, types);
-    bindCarriedLoopLocals(carried, headerBlock);
+    for (auto [index, local] : llvm::enumerate(carried)) {
+      values[local.name] = Value{postTestValues[index], local.type};
+      types.bindSymbol(local.name, local.type);
+    }
     LoopControlContext loop{afterBlock, headerBlock};
     loop.carriedLocals.assign(carried.begin(), carried.end());
     loop.headerBlock = headerBlock;
+    loop.baselineValues.assign(postTestValues.begin(), postTestValues.end());
     loopControlContexts.push_back(loop);
     emitStatements(ast::nodeList(statement, "body"));
     loopControlContexts.pop_back();
     if (!insertionBlockTerminated(builder))
       mlir::cf::BranchOp::create(
           builder, loc(statement), headerBlock,
-          carriedLoopEdgeOperands(statement, carried, headerBlock));
+          carriedLoopEdgeOperands(statement, carried, headerBlock,
+                                  postTestValues));
+  }
+
+  if (elseBlock) {
+    builder.setInsertionPointToStart(elseBlock);
+    ScopedEmitterScope scope(values, types);
+    bindCarriedLoopLocals(carried, elseBlock);
+    emitStatements(orelse);
+    if (!insertionBlockTerminated(builder))
+      mlir::cf::BranchOp::create(
+          builder, loc(statement), afterBlock,
+          carriedLoopEdgeOperands(statement, carried, elseBlock));
   }
 
   builder.setInsertionPointToStart(afterBlock);
-  bindCarriedLoopLocals(carried,
-                        breakForwardsCarried ? afterBlock : headerBlock);
+  if (afterForwardsCarried) {
+    bindCarriedLoopLocals(carried, afterBlock);
+  } else {
+    for (auto [index, local] : llvm::enumerate(carried)) {
+      values[local.name] = Value{postTestValues[index], local.type};
+      types.bindSymbol(local.name, local.type);
+    }
+  }
 }
 
 void ModuleEmitter::emitAsyncFor(const parser::Node &statement) {

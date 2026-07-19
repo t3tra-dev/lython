@@ -799,6 +799,7 @@ private:
   mlir::LogicalResult lowerBytesConstant(py::BytesConstantOp op);
   mlir::LogicalResult lowerIntConstant(py::IntConstantOp op);
   mlir::LogicalResult lowerFloatConstant(py::FloatConstantOp op);
+  mlir::LogicalResult lowerComplexConstant(py::ComplexConstantOp op);
   mlir::LogicalResult lowerBoolConstant(py::BoolConstantOp op);
   mlir::LogicalResult lowerNone(py::NoneOp op);
   mlir::LogicalResult lowerCastFromPrim(py::CastFromPrimOp op);

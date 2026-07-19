@@ -1025,8 +1025,21 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
     parser::addField(*markSeen, "targets",
                      std::vector<parser::NodePtr>{flagName});
     parser::addField(*markSeen, "value", trueValue);
+    // The seen-flag is an int, and int truthiness is rejected (R1): the
+    // synthesized tests spell the comparison out.
+    auto flagCompare = [&](const char *opKind) {
+      parser::NodePtr zero = parser::makeNode("Constant", expr.range);
+      parser::addField(*zero, "value", std::int64_t{0});
+      parser::NodePtr op = parser::makeNode(opKind, expr.range);
+      parser::NodePtr compare = parser::makeNode("Compare", expr.range);
+      parser::addField(*compare, "left", flagName);
+      parser::addField(*compare, "ops", std::vector<parser::NodePtr>{op});
+      parser::addField(*compare, "comparators",
+                       std::vector<parser::NodePtr>{zero});
+      return compare;
+    };
     parser::NodePtr seenSwitch = parser::makeNode("If", expr.range);
-    parser::addField(*seenSwitch, "test", flagName);
+    parser::addField(*seenSwitch, "test", flagCompare("NotEq"));
     parser::addField(*seenSwitch, "body",
                      std::vector<parser::NodePtr>{better});
     parser::addField(*seenSwitch, "orelse",
@@ -1037,11 +1050,9 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
     parser::addField(*loop, "body",
                      std::vector<parser::NodePtr>{seenSwitch});
     parser::addField(*loop, "orelse", std::vector<parser::NodePtr>{});
-    // if not __seen: raise ValueError("max()/min() iterable argument is empty")
-    parser::NodePtr notSeenOp = parser::makeNode("Not", expr.range);
-    parser::NodePtr notSeen = parser::makeNode("UnaryOp", expr.range);
-    parser::addField(*notSeen, "op", notSeenOp);
-    parser::addField(*notSeen, "operand", flagName);
+    // if __seen == 0: raise ValueError("max()/min() iterable argument is
+    // empty")
+    parser::NodePtr notSeen = flagCompare("Eq");
     parser::NodePtr message = parser::makeNode("Constant", expr.range);
     parser::addField(*message, "value",
                      reducer.str() + "() iterable argument is empty");

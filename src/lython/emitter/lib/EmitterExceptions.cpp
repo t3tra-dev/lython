@@ -30,24 +30,18 @@ enum class FinallyCompletion {
 bool isSupportedFinallyReturnCarrierType(mlir::Type type) {
   if (!type)
     return false;
-  // NOTE: `builtins.int` (and bare integer literals) are intentionally excluded.
-  // An int-returning function may be lowered with the unboxed i64 primitive
-  // return ABI, whose return lowering (RuntimeBundleLowerer::lowerFunctionReturns
-  // primitive-i64 path) does not yet handle a value carried out of a finally
-  // block and crashes on it. Excluding int here turns that into the stable
-  // "return inside try is not implemented yet" diagnostic instead of a compiler
-  // crash. Re-enable once the i64 return path handles finally-carried returns.
   if (auto literal = mlir::dyn_cast<py::LiteralType>(type)) {
     llvm::StringRef spelling = literal.getSpelling();
     return spelling == "None" || spelling == "True" || spelling == "False" ||
+           isIntegerLiteralSpelling(spelling) ||
            (spelling.size() >= 2 && spelling.front() == '"' &&
             spelling.back() == '"');
   }
   if (auto contract = mlir::dyn_cast<py::ContractType>(type)) {
     llvm::StringRef name = contract.getContractName();
     return name == "types.NoneType" || name == "builtins.bool" ||
-           name == "builtins.float" || name == "builtins.str" ||
-           name == "builtins.object";
+           name == "builtins.int" || name == "builtins.float" ||
+           name == "builtins.str" || name == "builtins.object";
   }
   return false;
 }
@@ -105,13 +99,13 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
   bool protectedBodyHasReturn = tryBodyHasReturn || handlerBodyHasReturn;
   // The completion machinery (flag results + carried return payload on the
   // py.try op) works both with a finally region and with plain try/except:
-  // without a finally the flags simply dispatch right after the op.
-  const auto *orelseForEligibility = ast::nodeList(statement, "orelse");
+  // without a finally the flags simply dispatch right after the op. An else
+  // block coexists: its normal-completion flag stays result 0 and the
+  // completion flags follow it.
   const auto *handlersForEligibility = ast::nodeList(statement, "handlers");
   bool completionEligible =
-      (hasFinally ||
-       (handlersForEligibility && !handlersForEligibility->empty())) &&
-      (!orelseForEligibility || orelseForEligibility->empty());
+      hasFinally ||
+      (handlersForEligibility && !handlersForEligibility->empty());
   bool supportsNoneReturnThroughFinally =
       completionEligible && currentReturnType == types.none() &&
       (protectedBodyHasReturn || finalbodyHasReturn);
@@ -167,9 +161,49 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
   };
   llvm::SmallVector<PostCarriedLocal, 4> postCarriedLocals;
   if (hasElse && hasFinally) {
+    // CPython's evaluation order (body -> handlers/else -> finally) nests
+    // exactly, so the combined form desugars instead of teaching the
+    // mutually-exclusive else / finally-completion op suffixes about each
+    // other:
+    //   try: B except...: H else: E finally: F
+    //   ==> try: (try: B except...: H else: E) finally: F
+    const parser::Field *bodyField = parser::findField(statement, "body");
+    const parser::Field *handlersField =
+        parser::findField(statement, "handlers");
+    const parser::Field *orelseField = parser::findField(statement, "orelse");
+    const parser::Field *finalField = parser::findField(statement, "finalbody");
+    if (bodyField && handlersField && orelseField && finalField &&
+        std::holds_alternative<std::vector<parser::NodePtr>>(
+            bodyField->value) &&
+        std::holds_alternative<std::vector<parser::NodePtr>>(
+            handlersField->value) &&
+        std::holds_alternative<std::vector<parser::NodePtr>>(
+            orelseField->value) &&
+        std::holds_alternative<std::vector<parser::NodePtr>>(
+            finalField->value)) {
+      parser::NodePtr inner = parser::makeNode("Try", statement.range);
+      parser::addField(*inner, "body",
+                       std::get<std::vector<parser::NodePtr>>(bodyField->value));
+      parser::addField(
+          *inner, "handlers",
+          std::get<std::vector<parser::NodePtr>>(handlersField->value));
+      parser::addField(
+          *inner, "orelse",
+          std::get<std::vector<parser::NodePtr>>(orelseField->value));
+      parser::addField(*inner, "finalbody", std::vector<parser::NodePtr>{});
+      parser::NodePtr outer = parser::makeNode("Try", statement.range);
+      parser::addField(*outer, "body", std::vector<parser::NodePtr>{inner});
+      parser::addField(*outer, "handlers", std::vector<parser::NodePtr>{});
+      parser::addField(*outer, "orelse", std::vector<parser::NodePtr>{});
+      parser::addField(
+          *outer, "finalbody",
+          std::get<std::vector<parser::NodePtr>>(finalField->value));
+      emitTry(*outer);
+      return;
+    }
     diagnostics.push_back(
         parser::Diagnostic{parser::Severity::Error, statement.range.start,
-                           "try/else/finally is not implemented yet"});
+                           "malformed try/else/finally statement"});
     return;
   }
   if (tryBodyHasReturn && !supportsReturnThroughFinally) {
@@ -214,6 +248,17 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
         "not implemented yet"});
     return;
   }
+  if (supportsLoopControlThroughFinally &&
+      !loopControlContexts.back().carriedLocals.empty()) {
+    // The break/continue completion branches after the op cannot see the try
+    // region's SSA values, so they could only forward STALE pre-try carried
+    // values — reject instead of silently mis-executing.
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, statement.range.start,
+        "break/continue through try/finally in a loop with carried "
+        "(reassigned) locals is not implemented yet"});
+    return;
+  }
   if ((tryBodyHasLoopControl || handlerBodyHasLoopControl) &&
       !supportsLoopControlThroughFinally) {
     diagnostics.push_back(parser::Diagnostic{
@@ -242,7 +287,7 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
   mlir::OperationState state(loc(statement), py::TryOp::getOperationName());
   if (hasElse)
     state.addTypes(builder.getI1Type());
-  else if (usesFinallyCompletion) {
+  if (usesFinallyCompletion) {
     state.addTypes(builder.getI1Type());
     state.addTypes(builder.getI1Type());
     state.addTypes(builder.getI1Type());
@@ -338,6 +383,9 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
   auto appendCompletionYield =
       [&](llvm::SmallVectorImpl<mlir::Value> &yieldValues,
           FinallyCompletion completion) {
+        // Early completions never run the else block.
+        if (hasElse)
+          appendBoolYield(yieldValues, false);
         appendBoolYield(yieldValues, completion == FinallyCompletion::Return);
         appendBoolYield(yieldValues, completion == FinallyCompletion::Break);
         appendBoolYield(yieldValues, completion == FinallyCompletion::Continue);
@@ -401,7 +449,7 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
                                    // dominate every yield
         }
       }
-      if (hasElse) {
+      if (hasElse && !usesFinallyCompletion) {
         mlir::Block *fallThrough = builder.getInsertionBlock();
         unsigned openCount = 0;
         for (mlir::Block &block : tryOp.getTryRegion())
@@ -469,12 +517,13 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
           terminateOpenRegionBlocks<py::TryYieldOp>(
               builder, loc(statement), tryOp.getTryRegion(),
               [&](llvm::SmallVectorImpl<mlir::Value> &yieldValues) {
-                if (hasElse) {
+                if (hasElse)
                   appendBoolYield(yieldValues, true);
+                if (usesFinallyCompletion)
+                  appendFallthroughReturnPayload(yieldValues);
+                else if (hasElse)
                   for (const ElseCarriedLocal &local : elseCarriedLocals)
                     yieldValues.push_back(local.value);
-                } else if (usesFinallyCompletion)
-                  appendFallthroughReturnPayload(yieldValues);
               }) > 0;
       tryOp->setAttr("ly.try.source_can_fallthrough",
                      builder.getBoolAttr(tryCanFallThrough));
@@ -568,11 +617,38 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
         }
         if (handlerTypes.empty())
           continue;
+        // `except (A, B) as e`: the binding's static type is the nearest
+        // common ancestor of the tuple members (the runtime object is
+        // whichever matched; only the static view needs one nominal type).
+        mlir::Type boundHandlerType = handlerTypes.front();
         if (handlerName && handlerTypes.size() != 1) {
-          diagnostics.push_back(parser::Diagnostic{
-              parser::Severity::Error, handler.range.start,
-              "except-as binding for tuple handlers is not implemented yet"});
-          continue;
+          auto instanceOf = [&](mlir::Type type) -> mlir::Type {
+            auto typeObject = mlir::dyn_cast<py::TypeType>(type);
+            return typeObject ? typeObject.getInstanceType() : mlir::Type();
+          };
+          mlir::Type common = instanceOf(handlerTypes.front());
+          for (mlir::Type candidate :
+               llvm::ArrayRef<mlir::Type>(handlerTypes).drop_front()) {
+            mlir::Type instance = instanceOf(candidate);
+            if (!common || !instance) {
+              common = {};
+              break;
+            }
+            if (isAssignableWithStaticEvidence(instance, common, module))
+              continue;
+            if (isAssignableWithStaticEvidence(common, instance, module)) {
+              common = instance;
+              continue;
+            }
+            common = types.contract("builtins.BaseException");
+          }
+          if (!common) {
+            diagnostics.push_back(parser::Diagnostic{
+                parser::Severity::Error, handler.range.start,
+                "except-as binding requires resolvable exception types"});
+            continue;
+          }
+          boundHandlerType = types.typeObject(common);
         }
 
         mlir::Block *miss = index + 1 == handlers->size()
@@ -603,11 +679,11 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
         {
           ScopedEmitterScope scope(values, types);
           if (handlerName) {
-            auto handlerType = mlir::cast<py::TypeType>(handlerTypes.front());
+            auto handlerType = mlir::cast<py::TypeType>(boundHandlerType);
             mlir::Type exceptionType = handlerType.getInstanceType();
             auto current = py::ExceptCurrentValueOp::create(
                                builder, loc(handler), exceptionType,
-                               mlir::TypeAttr::get(handlerTypes.front()))
+                               mlir::TypeAttr::get(boundHandlerType))
                                .getResult();
             std::string name(*handlerName);
             values[name] = Value{current, exceptionType};
@@ -739,15 +815,17 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
             terminateOpenRegionBlocks<py::ExceptYieldOp>(
                 builder, loc(statement), tryOp.getExceptRegion(),
                 [&](llvm::SmallVectorImpl<mlir::Value> &yieldValues) {
-                  if (hasElse) {
+                  if (hasElse)
                     appendBoolYield(yieldValues, false);
+                  if (usesFinallyCompletion) {
+                    appendFallthroughReturnPayload(yieldValues);
+                  } else if (hasElse) {
                     // Inert defaults: the else block (the only reader of the
                     // carried lanes) is unreachable on this path.
                     for (const ElseCarriedLocal &local : elseCarriedLocals)
                       yieldValues.push_back(
                           emitDefaultReturnValue(local.type).value);
-                  } else if (usesFinallyCompletion)
-                    appendFallthroughReturnPayload(yieldValues);
+                  }
                 }) > 0;
       }
     }
@@ -887,10 +965,11 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
     types.bindSymbol(local.name, local.type);
   }
   if (usesFinallyCompletion) {
-    constexpr unsigned returnFlagIndex = 0;
-    constexpr unsigned breakFlagIndex = 1;
-    constexpr unsigned continueFlagIndex = 2;
-    constexpr unsigned returnPayloadIndex = 3;
+    const unsigned flagBase = hasElse ? 1u : 0u;
+    const unsigned returnFlagIndex = flagBase;
+    const unsigned breakFlagIndex = flagBase + 1;
+    const unsigned continueFlagIndex = flagBase + 2;
+    const unsigned returnPayloadIndex = flagBase + 3;
     auto emitReturnCompletion = [&]() {
       Value returned =
           supportsValueReturnThroughFinally
@@ -990,14 +1069,15 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
     discardInactiveReturnPayload();
     mlir::cf::BranchOp::create(builder, loc(statement), afterCompletionCheck);
     builder.setInsertionPointToStart(afterCompletionCheck);
-  } else if (hasElse) {
-    mlir::Block *tryBlock = tryOp->getBlock();
+  }
+  if (hasElse) {
+    mlir::Block *dispatchBlock = builder.getInsertionBlock();
     mlir::Block *afterElseBlock =
-        tryBlock->splitBlock(builder.getInsertionPoint());
+        dispatchBlock->splitBlock(builder.getInsertionPoint());
     mlir::Block *elseBlock = new mlir::Block;
-    tryBlock->getParent()->getBlocks().insert(afterElseBlock->getIterator(),
-                                              elseBlock);
-    builder.setInsertionPointToEnd(tryBlock);
+    dispatchBlock->getParent()->getBlocks().insert(
+        afterElseBlock->getIterator(), elseBlock);
+    builder.setInsertionPointToEnd(dispatchBlock);
     mlir::Value completedNormally = tryOp.getResult(0);
     mlir::cf::CondBranchOp::create(builder, loc(statement), completedNormally,
                                    elseBlock, mlir::ValueRange{},

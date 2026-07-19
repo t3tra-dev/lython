@@ -62,6 +62,12 @@ private:
   bool bindSourceModuleStar(llvm::StringRef module,
                             const parser::Node &anchor,
                             bool diagnoseUnsupported);
+  // `from <native manifest module> import *`: expands to the manifest's
+  // public exports (callables, classes, constants) — the manifest declares
+  // no __all__, so the public-name convention (no leading underscore) is the
+  // export list.
+  bool bindNativeModuleStar(llvm::StringRef module, const parser::Node &anchor,
+                            bool diagnoseUnsupported);
   void emitFunctionDecl(const parser::Node &function);
   void emitCallableFunction(const parser::Node &callable,
                             llvm::StringRef symbolName,
@@ -125,6 +131,8 @@ private:
   void emitStatements(const std::vector<parser::NodePtr> *statements,
                       bool skipDeclarations = false);
   void emitStatement(const parser::Node &statement);
+  void emitPendingDefaultCells(const parser::Node &statement);
+  void emitDelete(const parser::Node &statement);
   void emitAssignTarget(const parser::Node &target, Value value);
   void emitIf(const parser::Node &statement);
   void emitMatch(const parser::Node &statement);
@@ -144,7 +152,8 @@ private:
   llvm::SmallVector<mlir::Value, 4>
   carriedLoopEdgeOperands(const parser::Node &anchor,
                           llvm::ArrayRef<CarriedLoopLocal> carried,
-                          mlir::Block *headerBlock);
+                          mlir::Block *headerBlock,
+                          llvm::ArrayRef<mlir::Value> baselineValues = {});
   llvm::SmallVector<mlir::Value, 4>
   loopCarriedBranchOperands(const parser::Node &anchor,
                             const LoopControlContext &loop, mlir::Block *target);
@@ -285,6 +294,12 @@ private:
                        const llvm::StringSet<> *propertyNames = nullptr);
   Value emitUnary(const parser::Node &expr);
   Value emitBinary(const parser::Node &expr);
+  // Complex arithmetic (R6 value type): folds constant operands, promotes
+  // constant real operands to complex, and dispatches +,-,*,/ through the
+  // complex manifest methods. Returns nullopt when neither operand is
+  // complex.
+  std::optional<Value> emitComplexBinary(const parser::Node &expr, Value lhs,
+                                         Value rhs, const parser::Node *op);
   Value emitCompare(const parser::Node &expr);
   // Scalar (non-Optional) comparison dispatch: primitive path, bool-vs-bool
   // truth compare, None-identity narrowing, membership, then the manifest
@@ -299,6 +314,12 @@ private:
   std::optional<Value> emitOptionalCompare(const parser::Node &expr, Value lhs,
                                            Value rhs, const parser::Node *op);
   Value emitSubscript(const parser::Node &expr);
+  // `a[i:j:k]` dispatches to the sequence's `__getslice__` manifest method
+  // (start, stop, step, mask) — mask bit0/bit1 mark an explicit start/stop,
+  // because the runtime defaults depend on the step's sign (R6: CPython
+  // normalization, new copy).
+  Value emitSliceSubscript(const parser::Node &expr, Value container,
+                           const parser::Node &sliceNode);
   Value emitAttribute(const parser::Node &expr);
   Value emitAwait(const parser::Node &expr);
   Value emitAsyncioRunCall(const parser::Node &expr);
@@ -307,6 +328,12 @@ private:
                        const AwaitInferenceResult &inference);
   Value emitContainerLiteral(const parser::Node &expr,
                              mlir::Type expected = {});
+  Value emitSetLiteral(const parser::Node &expr, mlir::Type expected = {});
+  // `and`/`or` over non-bool operands: CPython's operand-value result,
+  // restricted to operand combinations whose join is statically representable
+  // (R1). The all-bool fast path stays in emitExpr.
+  Value emitBoolOpValue(const parser::Node &expr, bool isAnd,
+                        const std::vector<parser::NodePtr> &operands);
   Value emitListComp(const parser::Node &expr);
   Value emitDictComp(const parser::Node &expr);
   Value emitComprehension(const parser::Node &expr, bool isDict,
@@ -440,6 +467,17 @@ private:
   mlir::Type currentGeneratorSendType;
   std::string currentFunctionPrefix;
   std::vector<parser::NodePtr> synthesizedDefaultProviders;
+  // Non-constant defaults of MODULE-level defs (R6): evaluated once when
+  // __main__ reaches the def statement and parked in a module-lifetime
+  // object-global cell; call sites read the cell instead of re-evaluating.
+  struct PendingDefaultCell {
+    std::string cellName;
+    parser::NodePtr expr;
+    mlir::Type declaredType;
+  };
+  llvm::DenseMap<const parser::Node *,
+                 llvm::SmallVector<PendingDefaultCell, 2>>
+      pendingDefaultCells;
   unsigned syntheticFunctionCounter = 0;
   unsigned listCompCounter = 0;
   llvm::SmallVector<WithCleanup, 8> activeWithCleanups;

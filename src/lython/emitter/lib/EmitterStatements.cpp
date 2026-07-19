@@ -24,11 +24,31 @@ void ModuleEmitter::emitStatements(
       break;
     if (statement && (!skipDeclarations || !isTopLevelDecl(*statement)))
       emitStatement(*statement);
-    else if (statement && skipDeclarations && statement->kind == "ClassDef")
+    else if (statement && skipDeclarations) {
       // The class contract was declared up front, but its attribute
       // initializers evaluate here -- at the class statement's position in
       // module flow, like CPython's class-body execution.
-      emitClassAttrInitializers(*statement);
+      if (statement->kind == "ClassDef")
+        emitClassAttrInitializers(*statement);
+      // A skipped module-level def still EXECUTES here in CPython terms:
+      // its non-constant defaults evaluate at this spot, once, into their
+      // module-lifetime cells (R6). Not ClassDef-exclusive: method defaults
+      // registered under a class statement flow through the same cells.
+      emitPendingDefaultCells(*statement);
+    }
+  }
+}
+
+void ModuleEmitter::emitPendingDefaultCells(const parser::Node &statement) {
+  auto pending = pendingDefaultCells.find(&statement);
+  if (pending == pendingDefaultCells.end())
+    return;
+  for (const PendingDefaultCell &cell : pending->second) {
+    Value value = emitExprExpected(cell.expr.get(), cell.declaredType);
+    Value coerced = coerceValue(value, cell.declaredType, statement);
+    py::GlobalSetOp::create(builder, loc(statement),
+                            builder.getStringAttr(cell.cellName),
+                            coerced.value);
   }
 }
 
@@ -205,6 +225,15 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
       for (const std::string &name : *names)
         currentGlobalDecls.insert(name);
     return;
+  } else if (statement.kind == "Delete") {
+    emitDelete(statement);
+  } else if (statement.kind == "Nonlocal") {
+    // R6 wants a refcounted shared box; the closure machinery currently
+    // captures by value only, so an honest rejection beats a silent copy.
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, statement.range.start,
+        "nonlocal is not implemented yet (closures capture by value; the R6 "
+        "shared-box cell representation is pending)"});
   } else if (statement.kind == "Pass") {
     return;
   } else if (statement.kind == "Match") {
@@ -219,6 +248,65 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
     diagnostics.push_back(parser::Diagnostic{
         parser::Severity::Error, statement.range.start,
         "unsupported statement kind '" + statement.kind + "'"});
+  }
+}
+
+// `del` (R6): only subscript deletion is representable — variables live in
+// static SSA scopes (released at scope exit), and instance attributes are
+// fixed storage slots, so both are rejected with an explanation instead of a
+// generic unsupported-statement error.
+void ModuleEmitter::emitDelete(const parser::Node &statement) {
+  const auto *targets = ast::nodeList(statement, "targets");
+  if (!targets)
+    return;
+  for (const parser::NodePtr &target : *targets) {
+    if (!target)
+      continue;
+    if (target->kind == "Subscript") {
+      if (const parser::Node *sliceNode = ast::node(*target, "slice");
+          sliceNode && sliceNode->kind == "Slice") {
+        diagnostics.push_back(
+            parser::Diagnostic{parser::Severity::Error, target->range.start,
+                               "slice deletion is not supported yet"});
+        continue;
+      }
+      Value container = emitExpr(ast::node(*target, "value"));
+      Value index = emitExpr(ast::node(*target, "slice"));
+      if (std::optional<MethodBinding> method =
+              lookupClassMethod(container.type, "__delitem__")) {
+        emitInlineOperatorCall(*target, container, *method, {index});
+        continue;
+      }
+      CallInferenceResult inference = types.inferMethodCallWithEvidence(
+          container.type, "__delitem__", {index.type});
+      if (!requireStaticEvidence(*target, inference))
+        continue;
+      py::DelItemOp::create(
+          builder, loc(*target),
+          mlir::FlatSymbolRefAttr::get(&context, "__delitem__"),
+          callProtocolFor(inference), container.value, index.value);
+      continue;
+    }
+    if (target->kind == "Name") {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, target->range.start,
+          "`del " + std::string(ast::nameSpelling(*target)) +
+              "` is rejected (Lython deviation from CPython): locals are "
+              "released when their scope ends, so deleting a variable is "
+              "unnecessary"});
+      continue;
+    }
+    if (target->kind == "Attribute") {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, target->range.start,
+          "`del` on an attribute is rejected (Lython deviation from CPython): "
+          "instance attributes are fixed storage slots in the static object "
+          "layout"});
+      continue;
+    }
+    diagnostics.push_back(
+        parser::Diagnostic{parser::Severity::Error, target->range.start,
+                           "unsupported del target '" + target->kind + "'"});
   }
 }
 
@@ -367,6 +455,13 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
               pinLoopCarriedTensor(containerName, *updated, target);
         return;
       }
+      return;
+    }
+    if (const parser::Node *sliceNode = ast::node(target, "slice");
+        sliceNode && sliceNode->kind == "Slice") {
+      diagnostics.push_back(
+          parser::Diagnostic{parser::Severity::Error, target.range.start,
+                             "slice assignment is not supported yet"});
       return;
     }
     Value index = emitExpr(ast::node(target, "slice"));

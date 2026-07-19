@@ -393,18 +393,39 @@ Value ModuleEmitter::emitNestedFunctionDecl(const parser::Node &function) {
 }
 
 // Defaults that are not literal constants (user-type constructors and other
-// expressions) compile into a zero-argument PROVIDER function whose body is
-// the default expression, synthesized as a lambda at the def site. Call
-// sites that omit the argument invoke the provider, so the default is
-// re-evaluated per call (documented deviation from CPython's once-per-def
-// evaluation; the difference is observable only through identity or
-// mutation of the default object).
+// expressions):
+//
+// - MODULE-level defs get CPython's R6 semantics — the expression evaluates
+//   ONCE, when __main__ reaches the def statement, into a module-lifetime
+//   object-global cell that every omitted-argument call site reads
+//   (kind="global"; the evaluation itself is emitted by
+//   emitPendingDefaultCells at the skipped declaration's slot in the module
+//   body walk, preserving def-execution order).
+// - NESTED defs keep the zero-argument PROVIDER function called per omitted
+//   argument (documented deviation: a nested def re-executes per enclosing
+//   call, and there is no per-execution storage to park the value in yet).
 mlir::ArrayAttr ModuleEmitter::emitCallableDefaultValues(
     const parser::Node &function, const FunctionSignature &sig,
     llvm::StringRef symbolName) {
   unsigned positionalCount = static_cast<unsigned>(sig.positionalTypes.size());
   llvm::SmallVector<mlir::Attribute, 8> slots(
       positionalCount + sig.kwOnlyTypes.size(), builder.getUnitAttr());
+
+  bool isModuleLevelDef = false;
+  if (const auto *moduleBody = ast::nodeList(moduleNode, "body"))
+    for (const parser::NodePtr &statement : *moduleBody)
+      if (statement.get() == &function) {
+        isModuleLevelDef = true;
+        break;
+      }
+  auto declaredSlotType = [&](unsigned slot) -> mlir::Type {
+    if (slot < positionalCount)
+      return types.widenLiteral(sig.positionalTypes[slot]);
+    unsigned kwIndex = slot - positionalCount;
+    if (kwIndex < sig.kwOnlyTypes.size())
+      return types.widenLiteral(sig.kwOnlyTypes[kwIndex]);
+    return {};
+  };
 
   auto emitProvider = [&](const parser::NodePtr &expr,
                           unsigned slot) -> mlir::Attribute {
@@ -436,6 +457,22 @@ mlir::ArrayAttr ModuleEmitter::emitCallableDefaultValues(
               captureName + "'"});
       return builder.getDictionaryAttr({builder.getNamedAttr(
           "kind", builder.getStringAttr("unsupported"))});
+    }
+
+    if (isModuleLevelDef) {
+      if (mlir::Type declared = declaredSlotType(slot)) {
+        std::string cellName = (llvm::Twine("__ly.defaultcell.") + symbolName +
+                                "." + llvm::Twine(slot))
+                                   .str();
+        pendingDefaultCells[&function].push_back(
+            PendingDefaultCell{cellName, expr, declared});
+        llvm::SmallVector<mlir::NamedAttribute, 2> attrs;
+        attrs.push_back(
+            builder.getNamedAttr("kind", builder.getStringAttr("global")));
+        attrs.push_back(builder.getNamedAttr(
+            "value", builder.getStringAttr(cellName)));
+        return builder.getDictionaryAttr(attrs);
+      }
     }
 
     FunctionSignature providerSig = types.functionSignature(*lambda);

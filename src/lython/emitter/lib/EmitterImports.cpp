@@ -2,6 +2,7 @@
 #include "EmitterSupport.h"
 
 #include "AstAccess.h"
+#include "PyProtocols.h"
 
 #include <optional>
 #include <string>
@@ -494,6 +495,42 @@ bool ModuleEmitter::bindSourceModuleStar(llvm::StringRef module,
   return ok || diagnoseUnsupported;
 }
 
+bool ModuleEmitter::bindNativeModuleStar(llvm::StringRef module,
+                                         const parser::Node &anchor,
+                                         bool diagnoseUnsupported) {
+  const py::protocols::Table &table = py::protocols::Table::get(context);
+  llvm::SmallVector<std::string, 32> names;
+  for (const std::string &name : table.moduleCallableExports(module))
+    names.push_back(name);
+  for (const auto &[exported, qualified] : table.moduleClassExports(module))
+    names.push_back(exported);
+  for (const std::string &name : table.moduleFloatConstantExports(module))
+    names.push_back(name);
+  for (const std::string &name : table.moduleIntConstantExports(module))
+    names.push_back(name);
+  for (const std::string &name : table.moduleStrConstantExports(module))
+    names.push_back(name);
+  if (names.empty())
+    return false;
+  llvm::sort(names);
+  names.erase(llvm::unique(names), names.end());
+  bool ok = true;
+  for (const std::string &name : names) {
+    if (name.empty() || name.front() == '_')
+      continue;
+    if (types.bindImportedName(module, name, name))
+      continue;
+    ok = false;
+    if (diagnoseUnsupported)
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, anchor.range.start,
+          "star import from '" + module.str() +
+              "' references unsupported export '" + module.str() + "." + name +
+              "'"});
+  }
+  return ok || diagnoseUnsupported;
+}
+
 void ModuleEmitter::bindSourceModuleLocals(llvm::StringRef moduleName,
                                            const parser::Node &sourceModule,
                                            bool isStub) {
@@ -698,10 +735,14 @@ bool ModuleEmitter::bindImportStatement(const parser::Node &statement,
       if (name && bindSourceModuleStar(*resolvedModule, *alias,
                                        diagnoseUnsupported))
         continue;
+      if (name && bindNativeModuleStar(*resolvedModule, *alias,
+                                       diagnoseUnsupported))
+        continue;
       if (diagnoseUnsupported)
         diagnostics.push_back(parser::Diagnostic{
             parser::Severity::Error, alias->range.start,
-            "star import is not supported by the static emitter"});
+            "star import from '" + *resolvedModule +
+                "' is not statically resolvable"});
       continue;
     }
     std::optional<std::string_view> asname = ast::string(*alias, "asname");

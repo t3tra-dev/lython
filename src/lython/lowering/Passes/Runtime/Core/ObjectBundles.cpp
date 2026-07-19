@@ -406,6 +406,47 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultValue(
     return RuntimeBundleLowerer::bundleRawObjectValues(
         op, parameterType, mlir::ValueRange{bytes, start, length}, bundle);
   }
+  if (spelling == "global") {
+    // R6 definition-time defaults: the value was evaluated once when
+    // __main__ reached the def statement and parked in a module-lifetime
+    // object-global cell; the omitted-argument call site reads (and
+    // retains) the shared value instead of re-evaluating.
+    auto value = dict.getAs<mlir::StringAttr>("value");
+    if (!value)
+      return op->emitError() << "global default value has no cell name";
+    llvm::StringRef cell = value.getValue();
+    std::string contractName = runtimeContractName(parameterType);
+    if (contractName == "builtins.int") {
+      // Module int globals live in the primitive i64 cell (the GlobalSet
+      // side routes int values there); read it back as the primitive lane.
+      mlir::LLVM::GlobalOp storage =
+          RuntimeBundleLowerer::moduleGlobalStorage(op, cell);
+      mlir::Value address =
+          mlir::LLVM::AddressOfOp::create(builder, loc, storage);
+      mlir::Value raw = mlir::LLVM::LoadOp::create(builder, loc,
+                                                   builder.getI64Type(),
+                                                   address);
+      mlir::Value valid =
+          mlir::arith::ConstantIntOp::create(builder, loc, 1, 1);
+      return RuntimeBundleLowerer::makePrimitiveI64Bundle(
+          op, runtimeContractType(context, "builtins.int"), raw, valid,
+          bundle);
+    }
+    mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> valueTypes =
+        RuntimeBundleLowerer::runtimeValueTypesFor(op, parameterType,
+                                                   "default cell ABI");
+    if (mlir::failed(valueTypes))
+      return mlir::failure();
+    llvm::SmallVector<mlir::Value, 8> values;
+    if (mlir::failed(RuntimeBundleLowerer::loadObjectGlobalValues(
+            op, cell, *valueTypes, values)))
+      return mlir::failure();
+    if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
+            op, parameterType, values, "default.cell")))
+      return mlir::failure();
+    return RuntimeBundleLowerer::makeObjectBundleWithOwnership(
+        op, parameterType, values, bundle, ownership::OwnershipKind::Own);
+  }
   if (spelling == "provider") {
     // Expression defaults (user-type constructors etc.) evaluate through a
     // zero-argument provider function synthesized at the def site.
@@ -439,9 +480,14 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultValue(
       return RuntimeBundleLowerer::makePrimitiveI64Bundle(
           op, runtimeContractType(context, runtimeContractName(resultType)),
           call->getResult(0), call->getResult(1), bundle);
-    return RuntimeBundleLowerer::makeObjectBundle(
-        op, runtimeContractType(context, runtimeContractName(resultType)),
-        call->getResults(), bundle);
+    // The provider returns through the ordinary function-target ABI, which
+    // may append primitive-i64 evidence lanes after the object values (the
+    // int hybrid): consume it exactly like any other call result instead of
+    // assuming the raw result list IS the object shape.
+    return RuntimeBundleLowerer::consumeFunctionTargetCallResult(
+        op, value.getValue(), *call, resultType, {},
+        /*applyReturnedSummaries=*/false, "default provider result ABI",
+        bundle);
   }
   if (spelling == "unsupported") {
     auto value = dict.getAs<mlir::StringAttr>("value");

@@ -1761,6 +1761,8 @@ mlir::Type TypeSystem::annotationType(const parser::Node *node) const {
     if (annotationNameIs(baseName, "list") ||
         annotationNameIs(baseName, "List"))
       return listOf(annotationType(slice));
+    if (annotationNameIs(baseName, "set") || annotationNameIs(baseName, "Set"))
+      return contract("builtins.set", {annotationType(slice)});
     if (annotationNameIs(baseName, "tuple") ||
         annotationNameIs(baseName, "Tuple")) {
       if (slice && slice->kind == "Tuple") {

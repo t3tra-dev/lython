@@ -17,6 +17,8 @@
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/Error.h"
 
+#include <complex>
+#include <functional>
 #include <optional>
 #include <string>
 
@@ -211,6 +213,17 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
   }
   if (expr->kind == "List" || expr->kind == "Tuple" || expr->kind == "Dict")
     return emitContainerLiteral(*expr);
+  if (expr->kind == "Set")
+    return emitSetLiteral(*expr);
+  if (expr->kind == "NamedExpr") {
+    // Walrus: the value of `(name := E)` is E's value; the binding lands in
+    // the enclosing function scope like an ordinary assignment (CPython
+    // scoping — the emitter has no expression-local scopes to leak from).
+    Value value = emitExpr(ast::node(*expr, "value"));
+    if (const parser::Node *target = ast::node(*expr, "target"))
+      emitAssignTarget(*target, value);
+    return value;
+  }
   if (expr->kind == "ListComp")
     return emitListComp(*expr);
   if (expr->kind == "SetComp")
@@ -302,12 +315,7 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
                                                 types.boolType(), accumulated);
         return {boxed.getResult(), types.boolType()};
       }
-      diagnostics.push_back(parser::Diagnostic{
-          parser::Severity::Error, expr->range.start,
-          "`and`/`or` requires bool-typed operands (CPython's operand-value "
-          "result is only representable for bools); wrap non-bool operands "
-          "in explicit comparisons"});
-      return emitNone(*expr);
+      return emitBoolOpValue(*expr, isAnd, *operandNodes);
     }
   }
   if (expr->kind == "Lambda")
@@ -366,6 +374,15 @@ Value ModuleEmitter::emitConstant(const parser::Node &expr) {
                                           builder.getStringAttr(big->decimal));
       return {op.getResult(), type};
     }
+    if (const auto *complexValue =
+            std::get_if<std::complex<double>>(fieldValue)) {
+      mlir::Type type = types.contract("builtins.complex");
+      auto op = py::ComplexConstantOp::create(
+          builder, loc(expr), type,
+          builder.getF64FloatAttr(complexValue->real()),
+          builder.getF64FloatAttr(complexValue->imag()));
+      return {op.getResult(), type};
+    }
   }
   diagnostics.push_back(parser::Diagnostic{parser::Severity::Error,
                                            expr.range.start,
@@ -400,11 +417,25 @@ Value ModuleEmitter::emitUnary(const parser::Node &expr) {
                                                  builder.getStringAttr(text));
         return {constOp.getResult(), type};
       }
+      if (const auto *complexValue =
+              std::get_if<std::complex<double>>(fieldValue)) {
+        mlir::Type type = types.contract("builtins.complex");
+        auto constOp = py::ComplexConstantOp::create(
+            builder, loc(expr), type,
+            builder.getF64FloatAttr(-complexValue->real()),
+            builder.getF64FloatAttr(-complexValue->imag()));
+        return {constOp.getResult(), type};
+      }
     }
   }
 
   Value operand = emitExpr(operandNode);
   mlir::Type result = types.widenLiteral(types.inferExpr(&expr));
+  // Complex unary results stay complex regardless of the (complex-unaware)
+  // expression inference.
+  if (types.widenLiteral(operand.type) == types.contract("builtins.complex") &&
+      (ast::isOperator(op, "USub") || ast::isOperator(op, "UAdd")))
+    result = types.contract("builtins.complex");
   if (ast::isOperator(op, "USub"))
     return emitUnarySpecial<py::NegOp>(expr, "__neg__", operand, result);
   if (ast::isOperator(op, "UAdd"))
@@ -471,6 +502,8 @@ Value ModuleEmitter::emitBinary(const parser::Node &expr) {
       }
     }
   }
+  if (std::optional<Value> complexResult = emitComplexBinary(expr, lhs, rhs, op))
+    return *complexResult;
   mlir::Type left = types.widenLiteral(lhs.type);
   mlir::Type right = types.widenLiteral(rhs.type);
   mlir::Type result = types.join({left, right});
@@ -520,6 +553,98 @@ Value ModuleEmitter::emitBinary(const parser::Node &expr) {
       "binary operator '" + spelling + "' is not supported for these operand "
       "types yet"});
   return emitNone(expr);
+}
+
+std::optional<Value> ModuleEmitter::emitComplexBinary(const parser::Node &expr,
+                                                      Value lhs, Value rhs,
+                                                      const parser::Node *op) {
+  mlir::Type complexType = types.contract("builtins.complex");
+  auto isComplex = [&](const Value &value) {
+    return types.widenLiteral(value.type) == complexType;
+  };
+  if (!isComplex(lhs) && !isComplex(rhs))
+    return std::nullopt;
+
+  bool isAdd = ast::isOperator(op, "Add");
+  bool isSub = ast::isOperator(op, "Sub");
+  bool isMul = ast::isOperator(op, "Mult");
+  bool isDiv = ast::isOperator(op, "Div");
+  if (!isAdd && !isSub && !isMul && !isDiv) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "complex supports only +, -, *, / (CPython raises TypeError for the "
+        "other operators)"});
+    return emitNone(expr);
+  }
+
+  // Compile-time parts of a constant operand (complex, float, or small int).
+  auto constantParts =
+      [&](const Value &value) -> std::optional<std::complex<double>> {
+    if (!value.value)
+      return std::nullopt;
+    if (auto constant = value.value.getDefiningOp<py::ComplexConstantOp>())
+      return std::complex<double>(constant.getReal().convertToDouble(),
+                                  constant.getImag().convertToDouble());
+    if (auto constant = value.value.getDefiningOp<py::FloatConstantOp>())
+      return std::complex<double>(constant.getValue().convertToDouble(), 0.0);
+    if (auto constant = value.value.getDefiningOp<py::IntConstantOp>()) {
+      long long parsed = 0;
+      if (!llvm::StringRef(constant.getValue()).getAsInteger(10, parsed))
+        return std::complex<double>(static_cast<double>(parsed), 0.0);
+    }
+    return std::nullopt;
+  };
+  std::optional<std::complex<double>> lhsParts = constantParts(lhs);
+  std::optional<std::complex<double>> rhsParts = constantParts(rhs);
+
+  auto materialize = [&](std::complex<double> parts) -> Value {
+    auto constant = py::ComplexConstantOp::create(
+        builder, loc(expr), complexType, builder.getF64FloatAttr(parts.real()),
+        builder.getF64FloatAttr(parts.imag()));
+    return {constant.getResult(), complexType};
+  };
+
+  // Both constant: fold (`1 + 2j` IS a BinOp over two constants). Constant
+  // division by zero stays a runtime raise.
+  if (lhsParts && rhsParts &&
+      !(isDiv && rhsParts->real() == 0.0 && rhsParts->imag() == 0.0)) {
+    std::complex<double> folded =
+        isAdd   ? *lhsParts + *rhsParts
+        : isSub ? *lhsParts - *rhsParts
+        : isMul ? *lhsParts * *rhsParts
+                : *lhsParts / *rhsParts;
+    return materialize(folded);
+  }
+
+  auto promote = [&](Value value,
+                     std::optional<std::complex<double>> parts)
+      -> std::optional<Value> {
+    if (isComplex(value))
+      return value;
+    if (parts)
+      return materialize(*parts);
+    return std::nullopt;
+  };
+  std::optional<Value> promotedLhs = promote(lhs, lhsParts);
+  std::optional<Value> promotedRhs = promote(rhs, rhsParts);
+  if (!promotedLhs || !promotedRhs) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "complex arithmetic with a non-constant int/float operand is not "
+        "supported yet; both operands must be complex (or numeric constants)"});
+    return emitNone(expr);
+  }
+  if (isAdd)
+    return emitBinarySpecial<py::AddOp>(expr, "__add__", *promotedLhs,
+                                        *promotedRhs, complexType);
+  if (isSub)
+    return emitBinarySpecial<py::SubOp>(expr, "__sub__", *promotedLhs,
+                                        *promotedRhs, complexType);
+  if (isMul)
+    return emitBinarySpecial<py::MulOp>(expr, "__mul__", *promotedLhs,
+                                        *promotedRhs, complexType);
+  return emitBinarySpecial<py::DivOp>(expr, "__truediv__", *promotedLhs,
+                                      *promotedRhs, complexType);
 }
 
 Value ModuleEmitter::emitCompare(const parser::Node &expr) {
@@ -592,6 +717,36 @@ Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
       return *narrowed;
     if (auto narrowed = emitNoneIdentityTest(rhs, lhs))
       return *narrowed;
+    // Identity against None is static once no union is involved: None is a
+    // singleton, so `concrete is None` folds to False (True under `is not`).
+    bool negatedIdentity = ast::isOperator(op, "IsNot");
+    bool lhsIsNone = isNoneTypeLike(lhs.type);
+    bool rhsIsNone = isNoneTypeLike(rhs.type);
+    if (lhsIsNone || rhsIsNone) {
+      bool identical = lhsIsNone && rhsIsNone;
+      bool truth = negatedIdentity ? !identical : identical;
+      mlir::Type literalType = types.literal(truth ? "True" : "False");
+      auto constant = py::BoolConstantOp::create(
+          builder, loc(expr), literalType, builder.getBoolAttr(truth));
+      return Value{constant.getResult(), literalType};
+    }
+    // R6: identity on value types has no stable meaning (interning is an
+    // implementation detail even in CPython); require the equality operator.
+    auto isValueType = [&](mlir::Type type) {
+      mlir::Type widened = types.widenLiteral(type);
+      return widened == types.intType() || widened == types.floatType() ||
+             widened == types.strType() ||
+             widened == types.contract("builtins.bytes");
+    };
+    if (isValueType(lhs.type) || isValueType(rhs.type)) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, expr.range.start,
+          std::string("`is` on int/str/float/bytes operands is rejected "
+                      "(identity of value types is an implementation detail); "
+                      "use `") +
+              (negatedIdentity ? "!=" : "==") + "` instead"});
+      return emitNone(expr);
+    }
   }
   if (ast::isOperator(op, "In") || ast::isOperator(op, "NotIn")) {
     if (std::optional<MethodBinding> method =
@@ -754,6 +909,9 @@ Value ModuleEmitter::emitSubscript(const parser::Node &expr) {
             expr, container, ast::node(expr, "slice")))
       return element->value ? *element : emitNone(expr);
   }
+  if (const parser::Node *sliceNode = ast::node(expr, "slice");
+      sliceNode && sliceNode->kind == "Slice")
+    return emitSliceSubscript(expr, container, *sliceNode);
   Value index = emitExpr(ast::node(expr, "slice"));
   if (std::optional<MethodBinding> method =
           lookupClassMethod(container.type, "__getitem__"))
@@ -768,6 +926,52 @@ Value ModuleEmitter::emitSubscript(const parser::Node &expr) {
       mlir::FlatSymbolRefAttr::get(&context, "__getitem__"),
       callProtocolFor(inference), container.value, index.value);
   return {op.getResult(), result};
+}
+
+Value ModuleEmitter::emitSliceSubscript(const parser::Node &expr,
+                                        Value container,
+                                        const parser::Node &sliceNode) {
+  const parser::Node *lower = ast::node(sliceNode, "lower");
+  const parser::Node *upper = ast::node(sliceNode, "upper");
+  const parser::Node *step = ast::node(sliceNode, "step");
+
+  auto intConstant = [&](long long value) -> Value {
+    std::string text = std::to_string(value);
+    mlir::Type type = types.literal(text);
+    auto op = py::IntConstantOp::create(builder, loc(expr), type,
+                                        builder.getStringAttr(text));
+    return {op.getResult(), type};
+  };
+  // Absent bounds keep placeholder zeros; the mask tells the runtime which
+  // ones are real (their defaults depend on the step's sign at runtime).
+  Value startValue = lower ? emitExpr(lower) : intConstant(0);
+  Value stopValue = upper ? emitExpr(upper) : intConstant(0);
+  Value stepValue = step ? emitExpr(step) : intConstant(1);
+  long long maskBits = (lower ? 1 : 0) | (upper ? 2 : 0);
+  Value maskValue = intConstant(maskBits);
+
+  CallInferenceResult inference = types.inferMethodCallWithEvidence(
+      container.type, "__getslice__",
+      {startValue.type, stopValue.type, stepValue.type, maskValue.type});
+  if (!inference) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "slicing is not supported for this receiver type (str/list/tuple/"
+        "bytes provide `__getslice__`)"});
+    return emitNone(expr);
+  }
+  if (!requireStaticEvidence(expr, inference))
+    return emitNone(expr);
+  Value posPack =
+      emitPack({startValue, stopValue, stepValue, maskValue});
+  Value namePack = emitPack({});
+  Value valuePack = emitPack({});
+  mlir::Type resultType = inference.resultType;
+  auto op = py::CallOp::create(builder, loc(expr), mlir::TypeRange{resultType},
+                               callProtocolFor(inference), container.value,
+                               posPack.value, namePack.value, valuePack.value);
+  op->setAttr("ly.bound_method", builder.getStringAttr("__getslice__"));
+  return {op.getResults().front(), resultType};
 }
 
 Value ModuleEmitter::emitMethodObject(const parser::Node &anchor, Value object,
@@ -1005,7 +1209,8 @@ Value ModuleEmitter::emitComprehension(const parser::Node &expr,
     parser::NodePtr target;
     parser::NodePtr iter;
     llvm::SmallVector<parser::NodePtr, 2> filters;
-    llvm::StringRef targetName;
+    llvm::SmallVector<llvm::StringRef, 2> targetNames;
+    bool tupleTarget = false;
   };
   llvm::SmallVector<CompGenerator, 2> chain;
   for (const parser::NodePtr &generator : *generators) {
@@ -1023,9 +1228,25 @@ Value ModuleEmitter::emitComprehension(const parser::Node &expr,
     CompGenerator entry;
     entry.target = std::get<parser::NodePtr>(targetField->value);
     entry.iter = std::get<parser::NodePtr>(iterField->value);
-    if (!entry.target || entry.target->kind != "Name" || !entry.iter)
+    if (!entry.target || !entry.iter)
       return reject("list comprehension target must be a simple name");
-    entry.targetName = ast::nameSpelling(*entry.target);
+    if (entry.target->kind == "Name") {
+      entry.targetNames.push_back(ast::nameSpelling(*entry.target));
+    } else if (entry.target->kind == "Tuple") {
+      // `for k, v in ...`: names only (nested unpack stays rejected).
+      entry.tupleTarget = true;
+      const auto *elts = ast::nodeList(*entry.target, "elts");
+      if (!elts || elts->empty())
+        return reject("malformed comprehension tuple target");
+      for (const parser::NodePtr &element : *elts) {
+        if (!element || element->kind != "Name")
+          return reject(
+              "comprehension tuple targets must unpack to simple names");
+        entry.targetNames.push_back(ast::nameSpelling(*element));
+      }
+    } else {
+      return reject("list comprehension target must be a simple name");
+    }
     if (const auto *ifs = ast::nodeList(*generator, "ifs"))
       entry.filters.append(ifs->begin(), ifs->end());
     chain.push_back(std::move(entry));
@@ -1047,8 +1268,23 @@ Value ModuleEmitter::emitComprehension(const parser::Node &expr,
           iterInference.resultType, "__next__", {});
       if (!requireStaticEvidence(expr, nextInference))
         return emitNone(expr);
-      types.bindLocalSymbol(entry.targetName,
-                            types.widenLiteral(nextInference.resultType));
+      mlir::Type iterationElement =
+          types.widenLiteral(nextInference.resultType);
+      if (!entry.tupleTarget) {
+        types.bindLocalSymbol(entry.targetNames.front(), iterationElement);
+      } else {
+        for (auto [position, name] : llvm::enumerate(entry.targetNames)) {
+          CallInferenceResult itemInference =
+              types.inferMethodCallWithEvidence(
+                  iterationElement, "__getitem__",
+                  {types.literal(std::to_string(position))});
+          if (!itemInference)
+            return reject(
+                "cannot infer the comprehension tuple target element types");
+          types.bindLocalSymbol(name,
+                                types.widenLiteral(itemInference.resultType));
+        }
+      }
     }
     if (isDict) {
       keyType = types.widenLiteral(types.inferExpr(keyExpr.get()));
@@ -1120,12 +1356,13 @@ Value ModuleEmitter::emitComprehension(const parser::Node &expr,
 
   llvm::SmallVector<std::pair<llvm::StringRef, std::optional<Value>>, 2>
       priorTargets;
-  for (const CompGenerator &entry : chain) {
-    std::optional<Value> prior;
-    if (auto found = values.find(entry.targetName); found != values.end())
-      prior = found->second;
-    priorTargets.push_back({entry.targetName, prior});
-  }
+  for (const CompGenerator &entry : chain)
+    for (llvm::StringRef name : entry.targetNames) {
+      std::optional<Value> prior;
+      if (auto found = values.find(name); found != values.end())
+        prior = found->second;
+      priorTargets.push_back({name, prior});
+    }
   emitFor(*statement);
 
   auto built = values.find(tmp);
@@ -1142,6 +1379,209 @@ Value ModuleEmitter::emitComprehension(const parser::Node &expr,
   return result;
 }
 
+// `{e0, e1, ...}` desugars to the set-build the SetComp lowering already
+// uses — an empty set pack plus one `add` per element — because a direct
+// element pack would bypass `add`'s deduplication (`{1, 1}` must have one
+// element).
+Value ModuleEmitter::emitSetLiteral(const parser::Node &expr,
+                                    mlir::Type expected) {
+  auto reject = [&](const std::string &message) {
+    diagnostics.push_back(
+        parser::Diagnostic{parser::Severity::Error, expr.range.start, message});
+    return emitNone(expr);
+  };
+  const auto *elts = ast::nodeList(expr, "elts");
+  if (!elts || elts->empty())
+    return reject("malformed set literal");
+  for (const parser::NodePtr &element : *elts)
+    if (!element || element->kind == "Starred")
+      return reject("starred elements in a set literal are not supported yet");
+
+  mlir::Type elementType;
+  if (auto expectedContract =
+          mlir::dyn_cast_if_present<py::ContractType>(expected))
+    if (expectedContract.getContractName() == "builtins.set" &&
+        expectedContract.getArguments().size() == 1)
+      elementType = expectedContract.getArguments().front();
+  if (!elementType) {
+    llvm::SmallVector<mlir::Type, 8> parts;
+    for (const parser::NodePtr &element : *elts)
+      parts.push_back(types.widenLiteral(types.inferExpr(element.get())));
+    elementType = types.join(parts);
+  }
+  if (!elementType || containsObjectTop(elementType, types))
+    return reject("cannot infer the set literal element type");
+
+  std::string tmp = "__setlit" + std::to_string(++listCompCounter);
+  mlir::Type containerType =
+      py::ContractType::get(builder.getContext(), "builtins.set",
+                            {elementType});
+  auto pack =
+      py::PackOp::create(builder, loc(expr), containerType, mlir::ValueRange{});
+  std::optional<Value> priorBinding;
+  if (auto found = values.find(tmp); found != values.end())
+    priorBinding = found->second;
+  values[tmp] = Value{pack.getResult(), containerType};
+
+  for (const parser::NodePtr &element : *elts) {
+    parser::NodePtr tmpName = parser::makeNode("Name", expr.range);
+    parser::addField(*tmpName, "id", tmp);
+    parser::NodePtr addAttr = parser::makeNode("Attribute", expr.range);
+    parser::addField(*addAttr, "value", tmpName);
+    parser::addField(*addAttr, "attr", std::string("add"));
+    parser::NodePtr addCall = parser::makeNode("Call", expr.range);
+    parser::addField(*addCall, "func", addAttr);
+    parser::addField(*addCall, "args", std::vector<parser::NodePtr>{element});
+    parser::addField(*addCall, "keywords", std::vector<parser::NodePtr>{});
+    parser::NodePtr statement = parser::makeNode("Expr", expr.range);
+    parser::addField(*statement, "value", addCall);
+    emitStatement(*statement);
+  }
+
+  auto built = values.find(tmp);
+  Value result = built != values.end()
+                     ? built->second
+                     : Value{pack.getResult(), containerType};
+  if (priorBinding)
+    values[tmp] = *priorBinding;
+  else
+    values.erase(tmp);
+  return result;
+}
+
+// The value-returning `and`/`or` (R1): the deciding operand's VALUE flows
+// out. Each non-final operand contributes its decided-side type (`or` keeps a
+// truthy operand, so an Optional contributes its present member; `and` keeps
+// a falsy operand, so a container-or-bool-membered Optional contributes the
+// whole union while an always-truthy member narrows to None); the final
+// operand flows through unchanged. The join of those contributions must be
+// statically representable, otherwise the combination is rejected.
+Value ModuleEmitter::emitBoolOpValue(const parser::Node &expr, bool isAnd,
+                                     const std::vector<parser::NodePtr> &operands) {
+  auto reject = [&](const std::string &message) {
+    diagnostics.push_back(
+        parser::Diagnostic{parser::Severity::Error, expr.range.start, message});
+    return emitNone(expr);
+  };
+  auto singleMemberOptional = [&](mlir::Type type) -> mlir::Type {
+    auto unionType = mlir::dyn_cast_if_present<py::UnionType>(type);
+    if (!unionType || !unionType.hasMember(types.none()))
+      return nullptr;
+    mlir::Type member;
+    for (mlir::Type candidate : unionType.getMemberTypes()) {
+      if (isNoneTypeLike(candidate))
+        continue;
+      if (member)
+        return nullptr;
+      member = candidate;
+    }
+    return member;
+  };
+  auto canBeFalsyWhenPresent = [&](mlir::Type member) {
+    mlir::Type widened = types.widenLiteral(member);
+    if (widened == types.boolType())
+      return true;
+    auto contract = mlir::dyn_cast_if_present<py::ContractType>(widened);
+    if (!contract)
+      return true; // conservative: keep the whole union in the falsy arm
+    llvm::StringRef name = contract.getContractName();
+    return name == "builtins.list" || name == "builtins.dict" ||
+           name == "builtins.set" || name == "builtins.tuple" ||
+           name == "builtins.str" || name == "builtins.bytes" ||
+           name == "builtins.int" || name == "builtins.float";
+  };
+
+  llvm::SmallVector<mlir::Type, 4> parts;
+  for (auto [index, operand] : llvm::enumerate(operands)) {
+    if (!operand)
+      return reject("malformed boolean operation");
+    mlir::Type operandType =
+        types.widenLiteral(types.inferExpr(operand.get()));
+    if (index + 1 == operands.size()) {
+      parts.push_back(operandType);
+      break;
+    }
+    mlir::Type member = singleMemberOptional(operandType);
+    if (!isAnd) {
+      // `or` keeps a TRUTHY non-final operand: an Optional's kept value is
+      // its present member.
+      parts.push_back(member ? types.widenLiteral(member) : operandType);
+    } else if (member && !canBeFalsyWhenPresent(member)) {
+      // `and` keeps a FALSY non-final operand: with an always-truthy member
+      // the only falsy value is None.
+      parts.push_back(types.none());
+    } else {
+      parts.push_back(operandType);
+    }
+  }
+  mlir::Type resultType = types.join(parts);
+  if (!resultType || containsObjectTop(resultType, types))
+    return reject(
+        "`and`/`or` over these operand types has no statically representable "
+        "result type; wrap the operands in explicit comparisons or a "
+        "conditional expression");
+
+  // Flat N-way merge: every deciding value reaches the merge through exactly
+  // one block-argument hop (nesting diamonds per operand builds multi-hop
+  // merge chains the affine-ownership planner cannot balance).
+  mlir::Location location = loc(expr);
+  mlir::Block *origin = builder.getInsertionBlock();
+  mlir::Region *region = origin->getParent();
+  mlir::Block *merge =
+      builder.createBlock(region, std::next(origin->getIterator()));
+  mlir::BlockArgument result = merge->addArgument(resultType, location);
+  builder.setInsertionPointToEnd(origin);
+
+  for (unsigned index = 0, count = operands.size(); index < count; ++index) {
+    Value current = emitExpr(operands[index].get());
+    if (index + 1 == count) {
+      mlir::Value last = coerceValue(current, resultType, expr).value;
+      mlir::cf::BranchOp::create(builder, location, merge,
+                                 mlir::ValueRange{last});
+      break;
+    }
+    mlir::Value condition = emitBoolValue(current, expr);
+    mlir::Type member =
+        singleMemberOptional(types.widenLiteral(current.type));
+    // The truth test may open blocks of its own (the Optional diamond): the
+    // deciding branch leaves from wherever the test's emission landed.
+    mlir::Block *decide = builder.getInsertionBlock();
+    mlir::Block *keepBlock = builder.createBlock(region, merge->getIterator());
+    mlir::Block *nextBlock = builder.createBlock(region, merge->getIterator());
+    builder.setInsertionPointToEnd(decide);
+    if (isAnd)
+      mlir::cf::CondBranchOp::create(builder, location, condition, nextBlock,
+                                     mlir::ValueRange{}, keepBlock,
+                                     mlir::ValueRange{});
+    else
+      mlir::cf::CondBranchOp::create(builder, location, condition, keepBlock,
+                                     mlir::ValueRange{}, nextBlock,
+                                     mlir::ValueRange{});
+
+    builder.setInsertionPointToStart(keepBlock);
+    mlir::Value kept;
+    if (!isAnd && member) {
+      // Truthy implies not-None: project the member before joining.
+      auto unwrap = py::UnionUnwrapOp::create(builder, location, member,
+                                              current.value);
+      kept = coerceValue(Value{unwrap.getResult(), member}, resultType, expr)
+                 .value;
+    } else if (isAnd && member && !canBeFalsyWhenPresent(member)) {
+      // Falsy with an always-truthy member means the value IS None.
+      kept = coerceValue(emitNone(expr), resultType, expr).value;
+    } else {
+      kept = coerceValue(current, resultType, expr).value;
+    }
+    mlir::cf::BranchOp::create(builder, location, merge,
+                               mlir::ValueRange{kept});
+
+    builder.setInsertionPointToStart(nextBlock);
+  }
+
+  builder.setInsertionPointToStart(merge);
+  return Value{result, resultType};
+}
+
 Value ModuleEmitter::emitExprExpected(const parser::Node *expr,
                                       mlir::Type expected) {
   if (!expr || !expected)
@@ -1152,6 +1592,8 @@ Value ModuleEmitter::emitExprExpected(const parser::Node *expr,
       return emitLambda(*expr, expectedCallable);
   if (expr->kind == "List" || expr->kind == "Tuple" || expr->kind == "Dict")
     return emitContainerLiteral(*expr, expected);
+  if (expr->kind == "Set")
+    return emitSetLiteral(*expr, expected);
   if (expr->kind == "Name") {
     llvm::StringRef name = ast::nameSpelling(*expr);
     if (values.find(name) == values.end()) {
@@ -1482,6 +1924,87 @@ mlir::Value ModuleEmitter::emitBoolValue(Value value,
                                          const parser::Node &anchor) {
   if (value.value && value.value.getType().isInteger(1))
     return value.value;
+  mlir::Type widened = types.widenLiteral(value.type);
+  // None is the falsy singleton: its truth value is static.
+  if (isNoneTypeLike(widened))
+    return mlir::arith::ConstantIntOp::create(builder, loc(anchor), 0, 1)
+        .getResult();
+  // R1: implicit numeric truthiness is rejected (deliberate deviation from
+  // CPython — `if n:` over int/float hides the comparison); bool stays exempt
+  // because its truth bit IS the value.
+  if (widened == types.intType() || widened == types.floatType()) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, anchor.range.start,
+        "implicit truthiness of " +
+            std::string(widened == types.intType() ? "int" : "float") +
+            " is rejected (Lython deviation from CPython); write an explicit "
+            "comparison such as `x != 0`"});
+    return mlir::arith::ConstantIntOp::create(builder, loc(anchor), 1, 1)
+        .getResult();
+  }
+  // Optional[T]: None is falsy, a present member re-enters truthiness under
+  // the not-None guard (so Optional[container] composes emptiness correctly).
+  if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(widened)) {
+    if (unionType.hasMember(types.none())) {
+      mlir::Type member;
+      for (mlir::Type candidate : unionType.getMemberTypes()) {
+        if (isNoneTypeLike(candidate))
+          continue;
+        if (member) {
+          member = {};
+          break;
+        }
+        member = candidate;
+      }
+      if (member) {
+        mlir::Type widenedMember = types.widenLiteral(member);
+        auto isNone = py::UnionTestOp::create(builder, loc(anchor),
+                                              builder.getI1Type(), value.value,
+                                              mlir::TypeAttr::get(types.none()));
+        auto one =
+            mlir::arith::ConstantIntOp::create(builder, loc(anchor), 1, 1);
+        mlir::Value present = mlir::arith::XOrIOp::create(
+            builder, loc(anchor), isNone.getResult(), one);
+        return emitValueDiamond(
+            loc(anchor), present, builder.getI1Type(),
+            [&]() -> mlir::Value {
+              auto unwrap = py::UnionUnwrapOp::create(builder, loc(anchor),
+                                                      member, value.value);
+              Value unwrapped{unwrap.getResult(), member};
+              // A numeric member re-enters truthiness as the explicit
+              // comparison R1 demands of BARE numerics: under the not-None
+              // guard, `opt != 0` is exactly CPython's bool(opt).
+              if (widenedMember == types.intType() ||
+                  widenedMember == types.floatType()) {
+                Value zero;
+                if (widenedMember == types.intType()) {
+                  mlir::Type zeroType = types.literal("0");
+                  zero = Value{py::IntConstantOp::create(
+                                   builder, loc(anchor), zeroType,
+                                   builder.getStringAttr("0"))
+                                   .getResult(),
+                               zeroType};
+                } else {
+                  zero = Value{py::FloatConstantOp::create(
+                                   builder, loc(anchor), types.floatType(),
+                                   builder.getF64FloatAttr(0.0))
+                                   .getResult(),
+                               types.floatType()};
+                }
+                Value nonzero = emitBinarySpecial<py::NeOp>(
+                    anchor, "__ne__", unwrapped, zero, types.boolType());
+                return emitBoolValue(nonzero, anchor);
+              }
+              return emitBoolValue(unwrapped, anchor);
+            },
+            [&]() -> mlir::Value {
+              return mlir::arith::ConstantIntOp::create(builder, loc(anchor),
+                                                        0, 1)
+                  .getResult();
+            });
+      }
+    }
+  }
   CallInferenceResult inference =
       types.inferMethodCallWithEvidence(value.type, "__bool__", {});
   if (!requireStaticEvidence(anchor, inference)) {

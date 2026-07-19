@@ -616,6 +616,22 @@ optionalBranchTypeNarrowing(const parser::Node &test, TypeSystem &types,
     return narrowing;
   }
 
+  // Bare-name truthiness over an Optional: truthy implies not-None, so the
+  // true branch narrows to the payload. The false branch stays un-narrowed —
+  // a falsy payload (empty container) is indistinguishable from None there.
+  if (test.kind == "Name") {
+    llvm::StringRef spelling = ast::nameSpelling(test);
+    std::optional<mlir::Type> currentType = types.lookupSymbol(spelling);
+    mlir::Type payload =
+        currentType ? removeNoneFromType(*currentType, types) : mlir::Type{};
+    if (payload) {
+      BranchTypeNarrowing narrowing;
+      narrowing.name = spelling.str();
+      narrowing.trueType = payload;
+      return narrowing;
+    }
+  }
+
   std::optional<IsInstanceBranchAnalysis> analyzed =
       optionalIsInstanceBranchAnalysis(test, types, from);
   if (!analyzed)

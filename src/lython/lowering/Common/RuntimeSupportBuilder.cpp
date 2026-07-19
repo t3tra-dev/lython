@@ -1057,6 +1057,102 @@ void buildReleasePayloadSlotPtr(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
+// void retain_payload_slot_ptr(ptr slot): retain an owned boxed container
+// slot by bumping the refcount of the boxed entity's object header (pointer
+// word kPointerWordBase). Class dispatch is unnecessary — every heap header
+// keeps its refcount in word 0 — so unlike the release path there is no
+// per-program by-contract hook. Tagged (bit-0) headers own no memory and
+// immortal headers are never written (they may live in read-only sections),
+// mirroring Ly_IncRef.
+void buildRetainPayloadSlotPtr(SupportBuilder &b) {
+  auto fn = b.beginFunction(
+      "retain_payload_slot_ptr", b.builder.getFunctionType({b.ptr()}, {}),
+      /*isPrivate=*/true);
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::Region &body = fn.getBody();
+  mlir::Block *checkHeader = b.builder.createBlock(&body);
+  mlir::Block *checkImmortal = b.builder.createBlock(&body);
+  mlir::Block *bump = b.builder.createBlock(&body);
+  mlir::Block *done = b.builder.createBlock(&body);
+
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value slot = entry->getArgument(0);
+  mlir::Value zero = b.iconst(0);
+  auto ownedWord = mlir::func::CallOp::create(
+      b.builder, b.loc, "boxed_load_i64", b.i64(),
+      mlir::ValueRange{slot, b.iconst(py::lowering::box_abi::kOwnedFlagWord)});
+  mlir::Value notOwned = b.cmpi(mlir::arith::CmpIPredicate::eq,
+                                ownedWord.getResult(0), zero);
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, notOwned, done,
+                                 mlir::ValueRange{}, checkHeader,
+                                 mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(checkHeader);
+  auto headerWord = mlir::func::CallOp::create(
+      b.builder, b.loc, "boxed_load_i64", b.i64(),
+      mlir::ValueRange{slot,
+                       b.iconst(py::lowering::box_abi::kPointerWordBase)});
+  mlir::Value header = headerWord.getResult(0);
+  mlir::Value isNull =
+      b.cmpi(mlir::arith::CmpIPredicate::eq, header, zero);
+  mlir::Value tagBit = mlir::arith::AndIOp::create(b.builder, b.loc, header,
+                                                   b.iconst(1));
+  mlir::Value isTagged =
+      b.cmpi(mlir::arith::CmpIPredicate::ne, tagBit, zero);
+  mlir::Value skip = b.orBit(isNull, isTagged);
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, skip, done,
+                                 mlir::ValueRange{}, checkImmortal,
+                                 mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(checkImmortal);
+  mlir::Value headerPtr = b.intToPtr(header);
+  mlir::Value observed =
+      mlir::LLVM::LoadOp::create(b.builder, b.loc, b.i64(), headerPtr)
+          .getResult();
+  mlir::Value immortal =
+      b.iconst(std::numeric_limits<std::int64_t>::max());
+  mlir::Value isImmortal =
+      b.cmpi(mlir::arith::CmpIPredicate::eq, observed, immortal);
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, isImmortal, done,
+                                 mlir::ValueRange{}, bump, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(bump);
+  mlir::LLVM::AtomicRMWOp::create(b.builder, b.loc,
+                                  mlir::LLVM::AtomicBinOp::add, headerPtr,
+                                  b.iconst(1),
+                                  mlir::LLVM::AtomicOrdering::acq_rel);
+  mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(done);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
+// LyObject_RetainBoxedPayloadArraySlotRaw(memref<?xi64>, i64): shared-ABI
+// wrapper the lib manifests call to retain the index-th 16-word slot of an
+// items array (the counterpart of LyObject_ReleaseBoxedPayloadArraySlotRaw,
+// used when a container copy duplicates element boxes).
+void buildRetainBoxedPayloadArraySlotRaw(SupportBuilder &b) {
+  auto itemsType =
+      mlir::MemRefType::get({mlir::ShapedType::kDynamic}, b.i64());
+  auto fn = b.beginFunction(
+      "LyObject_RetainBoxedPayloadArraySlotRaw",
+      b.builder.getFunctionType({itemsType, b.i64()}, {}));
+  mlir::Block *entry = fn.addEntryBlock();
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value pointerIndex =
+      mlir::memref::ExtractAlignedPointerAsIndexOp::create(
+          b.builder, b.loc, entry->getArgument(0));
+  mlir::Value pointerWord = mlir::arith::IndexCastOp::create(
+      b.builder, b.loc, b.i64(), pointerIndex);
+  mlir::Value base = b.intToPtr(pointerWord);
+  mlir::Value wordOffset = mlir::arith::MulIOp::create(
+      b.builder, b.loc, entry->getArgument(1), b.iconst(16));
+  mlir::Value slot = b.gepI64(base, wordOffset);
+  mlir::func::CallOp::create(b.builder, b.loc, "retain_payload_slot_ptr",
+                             mlir::TypeRange{}, mlir::ValueRange{slot});
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
 // LyObject_ReleaseBoxedPayloadRaw(memref<16xi64>) /
 // LyObject_ReleaseBoxedPayloadArraySlotRaw(memref<?xi64>, i64): shared-ABI
 // wrappers the lib manifests call to release a boxed slot (whole box, or the
@@ -2237,6 +2333,8 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context) {
   buildReleasePayloadSlotPtr(support);
   buildReleaseBoxedPayloadRaw(support);
   buildReleaseBoxedPayloadArraySlotRaw(support);
+  buildRetainPayloadSlotPtr(support);
+  buildRetainBoxedPayloadArraySlotRaw(support);
   buildTracebackSupport(support);
   declareEHSupport(support);
   buildCurrentExceptionClassIdUnchecked(support);
