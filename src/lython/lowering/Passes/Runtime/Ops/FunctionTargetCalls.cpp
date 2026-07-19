@@ -27,7 +27,8 @@ mlir::LogicalResult RuntimeBundleLowerer::collectFunctionTargetRuntimeSources(
     llvm::SmallVectorImpl<RuntimeBundle> &argumentEvidenceSources,
     llvm::SmallVectorImpl<RuntimeBundle> &aggregateEvidenceSources) {
   if (mlir::failed(collectFunctionCallSources(op, target, targetName, sources,
-                                              materializedDefaults)))
+                                              materializedDefaults,
+                                              &callable)))
     return mlir::failure();
 
   llvm::SmallVector<mlir::Type, 4> closureTypes =

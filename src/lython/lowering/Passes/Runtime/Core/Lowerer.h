@@ -1030,12 +1030,14 @@ private:
   mlir::LogicalResult collectFunctionCallSources(
       py::CallOp op, mlir::func::FuncOp target, llvm::StringRef targetName,
       llvm::SmallVectorImpl<const RuntimeBundle *> &sources,
-      llvm::SmallVectorImpl<RuntimeBundle> &materializedDefaults);
+      llvm::SmallVectorImpl<RuntimeBundle> &materializedDefaults,
+      const RuntimeBundle *callableObject = nullptr);
   mlir::LogicalResult materializeDefaultArgument(
       py::CallOp op, mlir::func::FuncOp target, llvm::StringRef targetName,
       unsigned index, mlir::Type parameterType,
       llvm::SmallVectorImpl<RuntimeBundle> &materializedDefaults,
-      const RuntimeBundle *&source);
+      const RuntimeBundle *&source,
+      const RuntimeBundle *callableObject = nullptr);
   mlir::LogicalResult
   materializeArityObject(mlir::Operation *op, mlir::Type contract,
                          std::uint64_t arity, RuntimeBundle &bundle,

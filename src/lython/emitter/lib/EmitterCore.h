@@ -495,6 +495,12 @@ private:
   llvm::DenseMap<const parser::Node *,
                  llvm::SmallVector<PendingDefaultCell, 2>>
       pendingDefaultCells;
+  // Non-constant defaults of NESTED defs: evaluated once when the enclosing
+  // execution reaches the def statement, carried as synthetic closure
+  // captures (slot -> capture index) shared by every call in that execution.
+  llvm::DenseMap<const parser::Node *,
+                 llvm::SmallVector<std::pair<unsigned, unsigned>, 2>>
+      nestedDefaultCaptures;
   unsigned syntheticFunctionCounter = 0;
   unsigned listCompCounter = 0;
   // Cell classes are synthesized once per (widened) content type.
