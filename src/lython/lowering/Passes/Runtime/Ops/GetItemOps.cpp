@@ -354,15 +354,49 @@ RuntimeBundleLowerer::selectEvidenceObjectByMatch(
       // The runtime key itself is the raise message object: KeyError
       // __init__ stores repr(message) (str(KeyError(x)) == repr(x)), so no
       // separate __repr__ call is needed on the miss branch.
-      // Why not repr(key) here like every other KeyError site: this miss
-      // branch is CONDITIONAL, and the exception __init__ consumes its
-      // message, so raising from the runtime key (or a retained copy)
-      // unbalances the key's token on the normal path -- the ownership pass
-      // cannot place a single static release for both. Residual CPython
-      // deviation, kept LOUDLY generic until conditional consumes are
-      // modeled.
-      (void)missingKeyForRepr;
-      if (mlir::failed(RuntimeBundleLowerer::emitRuntimeException(
+      // The key cannot be consumed here directly (or via a retained alias):
+      // this branch is CONDITIONAL, the exception __init__ consumes its
+      // message, and the ownership pass cannot place a single static
+      // release for both paths. A FRESH clone created and consumed inside
+      // this branch keeps the key a plain borrow while the message still
+      // carries the missing key, CPython-style.
+      bool raisedWithKey = false;
+      if (missingKeyForRepr &&
+          missingKeyForRepr->contractName() == "builtins.str" &&
+          missingKeyForRepr->physicalValues().size() == 2) {
+        std::optional<RuntimeSymbol> clone =
+            manifest.primitive("builtins.str", "clone");
+        if (clone &&
+            clone->function.getFunctionType().getNumInputs() == 2 &&
+            clone->function.getFunctionType().getNumResults() == 2) {
+          llvm::SmallVector<mlir::Value, 2> cloneOperands;
+          bool typesMatch = true;
+          for (auto [operand, want] :
+               llvm::zip(missingKeyForRepr->physicalValues(),
+                         clone->function.getFunctionType().getInputs())) {
+            if (operand.getType() != want) {
+              typesMatch = false;
+              break;
+            }
+            cloneOperands.push_back(operand);
+          }
+          if (typesMatch) {
+            mlir::func::CallOp cloneCall =
+                RuntimeBundleLowerer::createRuntimeCall(loc, *clone,
+                                                        cloneOperands);
+            RuntimeBundle messageObject = RuntimeBundle::object(
+                runtimeContractType(context, "builtins.str"),
+                cloneCall.getResults());
+            if (mlir::failed(
+                    RuntimeBundleLowerer::emitRuntimeExceptionFromMessageObject(
+                        op, missingContract, messageObject)))
+              return mlir::failure();
+            raisedWithKey = true;
+          }
+        }
+      }
+      if (!raisedWithKey &&
+          mlir::failed(RuntimeBundleLowerer::emitRuntimeException(
               op, missingContract, missingMessage)))
         return mlir::failure();
       llvm::SmallVector<mlir::Value, 4> deadValues;

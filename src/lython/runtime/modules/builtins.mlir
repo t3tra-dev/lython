@@ -9017,6 +9017,18 @@ module attributes {
   // the widest code point: a canonical substring of a wide string can be
   // narrower than its source (equality stays bytewise only if slices
   // re-canonicalize).
+  // Fresh, unaliased copy of a str. The conditional raise paths need this:
+  // an exception __init__ consumes its message, and consuming the (aliased)
+  // source value inside one branch would unbalance its ownership token on
+  // the other; a fresh copy is created and consumed inside the same branch.
+  func.func @LyUnicode_Clone(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.primitive = "clone", ly.runtime.result_contract = "builtins.str"} {
+    %c0 = arith.constant 0 : index
+    %count = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %count_index = arith.index_cast %count : i64 to index
+    %copy:2 = func.call @__ly_unicode_slice(%header, %bytes, %c0, %count_index) : (memref<2xi64>, memref<?xi8>, index, index) -> (memref<2xi64>, memref<?xi8>)
+    func.return %copy#0, %copy#1 : memref<2xi64>, memref<?xi8>
+  }
+
   func.func private @__ly_unicode_slice(%header: memref<2xi64>, %bytes: memref<?xi8>, %start: index, %end: index) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
     %c1 = arith.constant 1 : index
     %zero = arith.constant 0 : i64
