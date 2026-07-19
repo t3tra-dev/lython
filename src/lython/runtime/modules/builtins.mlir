@@ -530,11 +530,12 @@ module attributes {
     ly.runtime.required_initializers = ["__new__"],
     ly.runtime.required_methods = ["__len__"],
     ly.runtime.required_primitives = ["ensure_capacity"],
-    ly.typing.structural_mutators = ["append"],
+    ly.typing.structural_mutators = ["append", "__setslice__", "__delslice__"],
     ly.typing.base_args = [[!py.contract<"$T">]],
     method_names = ["__init__", "__init__", "append", "extend", "pop",
                     "insert", "remove", "clear", "__len__", "__iter__",
-                    "__getitem__", "__getslice__", "__setitem__", "__delitem__",
+                    "__getitem__", "__getslice__", "__setslice__",
+                    "__delslice__", "__setitem__", "__delitem__",
                     "__contains__", "__repr__", "sort", "reverse", "copy",
                     "count", "index", "__add__", "__mul__", "__eq__",
                     "__ne__", "__lt__", "__le__", "__gt__", "__ge__"],
@@ -551,6 +552,8 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.list">] -> [!py.protocol<"Iterator", [!py.contract<"$T">]>]>,
       !py.protocol<"Callable", [!py.contract<"builtins.list">, !py.contract<"typing.SupportsIndex">] -> [!py.contract<"$T">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.list">, !py.contract<"builtins.int">, !py.contract<"builtins.int">, !py.contract<"builtins.int">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.list", [!py.contract<"$T">]>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.list">, !py.contract<"builtins.int">, !py.contract<"builtins.int">, !py.contract<"builtins.int">, !py.contract<"builtins.int">, !py.contract<"builtins.list", [!py.contract<"$T">]>] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.list">, !py.contract<"builtins.int">, !py.contract<"builtins.int">, !py.contract<"builtins.int">, !py.contract<"builtins.int">] -> [!py.literal<None>]>,
       !py.protocol<"Callable", [!py.contract<"builtins.list">, !py.contract<"typing.SupportsIndex">, !py.contract<"$T">] -> [!py.literal<None>]>,
       !py.protocol<"Callable", [!py.contract<"builtins.list">, !py.contract<"typing.SupportsIndex">] -> [!py.literal<None>]>,
       !py.protocol<"Callable", [!py.contract<"builtins.list">, !py.contract<"builtins.object">] -> [!py.contract<"builtins.bool">]>,
@@ -575,7 +578,8 @@ module attributes {
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
-                    "instance", "instance", "instance", "instance", "instance"]
+                    "instance", "instance", "instance", "instance",
+                    "instance", "instance", "instance"]
   } {}
 
   py.class @set attributes {
@@ -15329,6 +15333,232 @@ module attributes {
     %class_id = arith.constant 11 : i64
     %result:3 = func.call @__ly_sequence_get_slice(%class_id, %meta, %items, %start_raw, %stop_raw, %step_raw, %mask) : (i64, memref<2xi64>, memref<?xi64>, i64, i64, i64, i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
     func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  }
+
+  // "attempt to assign sequence of size "
+  memref.global "private" constant @__ly_slice_msg_extended_prefix : memref<35xi8> = dense<[97, 116, 116, 101, 109, 112, 116, 32, 116, 111, 32, 97, 115, 115, 105, 103, 110, 32, 115, 101, 113, 117, 101, 110, 99, 101, 32, 111, 102, 32, 115, 105, 122, 101, 32]>
+  // " to extended slice of size "
+  memref.global "private" constant @__ly_slice_msg_extended_middle : memref<27xi8> = dense<[32, 116, 111, 32, 101, 120, 116, 101, 110, 100, 101, 100, 32, 115, 108, 105, 99, 101, 32, 111, 102, 32, 115, 105, 122, 101, 32]>
+
+  // ValueError for `a[i:j:k] = xs` with k != 1 and len(xs) != slicelength,
+  // message text matching CPython list_ass_subscript.
+  func.func private @__ly_slice_raise_extended_mismatch(%src_len: i64, %slice_len: i64) {
+    %class_id = arith.constant 53 : i64
+    %start = arith.constant 0 : index
+    %prefix_static = memref.get_global @__ly_slice_msg_extended_prefix : memref<35xi8>
+    %prefix = memref.cast %prefix_static : memref<35xi8> to memref<?xi8>
+    %prefix_len = arith.constant 35 : i64
+    %middle_static = memref.get_global @__ly_slice_msg_extended_middle : memref<27xi8>
+    %middle = memref.cast %middle_static : memref<27xi8> to memref<?xi8>
+    %middle_len = arith.constant 27 : i64
+    %ph, %pb = func.call @LyUnicode_FromBytes(%prefix, %start, %prefix_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %src_int:3 = func.call @LyLong_FromI64(%src_len) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    %src_str:2 = func.call @LyLong_Str(%src_int#0, %src_int#1, %src_int#2) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi8>)
+    %m1:2 = func.call @LyUnicode_Concat(%ph, %pb, %src_str#0, %src_str#1) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    %mh, %mb = func.call @LyUnicode_FromBytes(%middle, %start, %middle_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %m2:2 = func.call @LyUnicode_Concat(%m1#0, %m1#1, %mh, %mb) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    %cnt_int:3 = func.call @LyLong_FromI64(%slice_len) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    %cnt_str:2 = func.call @LyLong_Str(%cnt_int#0, %cnt_int#1, %cnt_int#2) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi8>)
+    %m3:2 = func.call @LyUnicode_Concat(%m2#0, %m2#1, %cnt_str#0, %cnt_str#1) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    %exception:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %m3#0, %m3#1) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    func.call @LyEH_ThrowException(%initialized#0, %initialized#1, %initialized#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    func.return
+  }
+
+  // list[i:j:k] = xs (CPython list_ass_subscript): step 1 splices with an
+  // arbitrary-length replacement; any other step requires len(xs) equal to
+  // the slice length and replaces per selected slot. Always rebuilds the
+  // items array for the splice form -- the source may alias the target
+  // (`a[1:3] = a`), and a fresh array with copy-then-release ordering stays
+  // correct under overlap without direction analysis.
+  func.func @LyList_SetSlice(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>, %start_raw: i64, %stop_raw: i64, %step_raw: i64, %mask: i64, %src_header: memref<2xi64> {ly.ownership.object_header}, %src_meta: memref<2xi64>, %src_items: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.transfer_args = [0], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.method = "__setslice__"} {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c16 = arith.constant 16 : index
+    %handle_words = arith.constant 16 : i64
+    %length_slot = arith.constant 0 : index
+    %capacity_slot = arith.constant 1 : index
+    %step_zero = arith.cmpi eq, %step_raw, %zero : i64
+    scf.if %step_zero {
+      func.call @__ly_slice_raise_zero_step() : () -> ()
+    }
+    // The throw does not return; the substitute keeps the IR division-safe.
+    %step = arith.select %step_zero, %one, %step_raw : i1, i64
+    %len = memref.load %meta[%length_slot] : memref<2xi64>
+    %adj:2 = func.call @__ly_slice_adjust(%len, %start_raw, %stop_raw, %step, %mask) : (i64, i64, i64, i64, i64) -> (i64, i64)
+    %src_len = memref.load %src_meta[%length_slot] : memref<2xi64>
+    %step_is_one = arith.cmpi eq, %step, %one : i64
+    %out_items = scf.if %step_is_one -> (memref<?xi64>) {
+      // Splice: new = prefix ++ src ++ tail. Prefix/tail boxes MOVE (the old
+      // array is dropped without releasing them); src boxes are copies and
+      // retain; the replaced range releases from the OLD array after the
+      // copies so self-assignment keeps every shared box alive.
+      %removed = arith.subi %len, %adj#1 : i64
+      %new_len = arith.addi %removed, %src_len : i64
+      %min_capacity = arith.constant 64 : i64
+      %below_min = arith.cmpi slt, %new_len, %min_capacity : i64
+      %new_capacity = arith.select %below_min, %min_capacity, %new_len : i1, i64
+      %new_words = arith.muli %new_capacity, %handle_words : i64
+      %new_words_index = arith.index_cast %new_words : i64 to index
+      %new_items = memref.alloc(%new_words_index) : memref<?xi64>
+      %prefix_words64 = arith.muli %adj#0, %handle_words : i64
+      %prefix_words = arith.index_cast %prefix_words64 : i64 to index
+      scf.for %w = %c0 to %prefix_words step %c1 {
+        %word = memref.load %items[%w] : memref<?xi64>
+        memref.store %word, %new_items[%w] : memref<?xi64>
+      }
+      %src_count = arith.index_cast %src_len : i64 to index
+      scf.for %k = %c0 to %src_count step %c1 {
+        %k64 = arith.index_cast %k : index to i64
+        %src_base64 = arith.muli %k64, %handle_words : i64
+        %src_base = arith.index_cast %src_base64 : i64 to index
+        %dst_slot64 = arith.addi %adj#0, %k64 : i64
+        %dst_base64 = arith.muli %dst_slot64, %handle_words : i64
+        %dst_base = arith.index_cast %dst_base64 : i64 to index
+        scf.for %w = %c0 to %c16 step %c1 {
+          %src_index = arith.addi %src_base, %w : index
+          %dst_index = arith.addi %dst_base, %w : index
+          %word = memref.load %src_items[%src_index] : memref<?xi64>
+          memref.store %word, %new_items[%dst_index] : memref<?xi64>
+        }
+        func.call @LyObject_RetainBoxedPayloadArraySlotRaw(%new_items, %dst_slot64) : (memref<?xi64>, i64) -> ()
+      }
+      %tail_from = arith.addi %adj#0, %adj#1 : i64
+      %tail_count64 = arith.subi %len, %tail_from : i64
+      %tail_count = arith.index_cast %tail_count64 : i64 to index
+      scf.for %k = %c0 to %tail_count step %c1 {
+        %k64 = arith.index_cast %k : index to i64
+        %src_slot = arith.addi %tail_from, %k64 : i64
+        %src_base64 = arith.muli %src_slot, %handle_words : i64
+        %src_base = arith.index_cast %src_base64 : i64 to index
+        %dst_slot = arith.addi %adj#0, %src_len : i64
+        %dst_slot_k = arith.addi %dst_slot, %k64 : i64
+        %dst_base64 = arith.muli %dst_slot_k, %handle_words : i64
+        %dst_base = arith.index_cast %dst_base64 : i64 to index
+        scf.for %w = %c0 to %c16 step %c1 {
+          %src_index = arith.addi %src_base, %w : index
+          %dst_index = arith.addi %dst_base, %w : index
+          %word = memref.load %items[%src_index] : memref<?xi64>
+          memref.store %word, %new_items[%dst_index] : memref<?xi64>
+        }
+      }
+      %replaced_count = arith.index_cast %adj#1 : i64 to index
+      scf.for %k = %c0 to %replaced_count step %c1 {
+        %k64 = arith.index_cast %k : index to i64
+        %slot = arith.addi %adj#0, %k64 : i64
+        func.call @LyObject_ReleaseBoxedPayloadArraySlotRaw(%items, %slot) : (memref<?xi64>, i64) -> ()
+      }
+      memref.dealloc %items : memref<?xi64>
+      memref.store %new_len, %meta[%length_slot] : memref<2xi64>
+      memref.store %new_capacity, %meta[%capacity_slot] : memref<2xi64>
+      scf.yield %new_items : memref<?xi64>
+    } else {
+      // Extended slice: same-length per-slot replacement (CPython requires
+      // len(xs) == slicelength and raises ValueError otherwise).
+      %len_matches = arith.cmpi eq, %src_len, %adj#1 : i64
+      scf.if %len_matches {
+      } else {
+        func.call @__ly_slice_raise_extended_mismatch(%src_len, %adj#1) : (i64, i64) -> ()
+      }
+      %count = arith.index_cast %adj#1 : i64 to index
+      scf.for %k = %c0 to %count step %c1 {
+        %k64 = arith.index_cast %k : index to i64
+        %offset = arith.muli %k64, %step : i64
+        %slot = arith.addi %adj#0, %offset : i64
+        func.call @LyObject_ReleaseBoxedPayloadArraySlotRaw(%items, %slot) : (memref<?xi64>, i64) -> ()
+        %src_base64 = arith.muli %k64, %handle_words : i64
+        %src_base = arith.index_cast %src_base64 : i64 to index
+        %dst_base64 = arith.muli %slot, %handle_words : i64
+        %dst_base = arith.index_cast %dst_base64 : i64 to index
+        scf.for %w = %c0 to %c16 step %c1 {
+          %src_index = arith.addi %src_base, %w : index
+          %dst_index = arith.addi %dst_base, %w : index
+          %word = memref.load %src_items[%src_index] : memref<?xi64>
+          memref.store %word, %items[%dst_index] : memref<?xi64>
+        }
+        func.call @LyObject_RetainBoxedPayloadArraySlotRaw(%items, %slot) : (memref<?xi64>, i64) -> ()
+      }
+      scf.yield %items : memref<?xi64>
+    }
+    func.return %header, %meta, %out_items : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  }
+
+  // del list[i:j:k] (CPython list_ass_subscript with NULL value): compact
+  // the non-selected boxes into a fresh array, releasing the selected ones.
+  // One general path covers step 1 and extended slices, either sign.
+  func.func @LyList_DelSlice(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>, %start_raw: i64, %stop_raw: i64, %step_raw: i64, %mask: i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.transfer_args = [0], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.method = "__delslice__"} {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c16 = arith.constant 16 : index
+    %handle_words = arith.constant 16 : i64
+    %length_slot = arith.constant 0 : index
+    %capacity_slot = arith.constant 1 : index
+    %step_zero = arith.cmpi eq, %step_raw, %zero : i64
+    scf.if %step_zero {
+      func.call @__ly_slice_raise_zero_step() : () -> ()
+    }
+    // The throw does not return; the substitute keeps the IR division-safe.
+    %step = arith.select %step_zero, %one, %step_raw : i1, i64
+    %len = memref.load %meta[%length_slot] : memref<2xi64>
+    %adj:2 = func.call @__ly_slice_adjust(%len, %start_raw, %stop_raw, %step, %mask) : (i64, i64, i64, i64, i64) -> (i64, i64)
+    // Normalize the selected index set {start + k*step} to a low bound and
+    // absolute stride so membership is one modulo test either direction.
+    %neg_step = arith.cmpi slt, %step, %zero : i64
+    %count_m1 = arith.subi %adj#1, %one : i64
+    %span = arith.muli %count_m1, %step : i64
+    %last = arith.addi %adj#0, %span : i64
+    %lo = arith.select %neg_step, %last, %adj#0 : i1, i64
+    %hi = arith.select %neg_step, %adj#0, %last : i1, i64
+    %step_neg_abs = arith.subi %zero, %step : i64
+    %step_abs = arith.select %neg_step, %step_neg_abs, %step : i1, i64
+    %new_len = arith.subi %len, %adj#1 : i64
+    %min_capacity = arith.constant 64 : i64
+    %below_min = arith.cmpi slt, %new_len, %min_capacity : i64
+    %new_capacity = arith.select %below_min, %min_capacity, %new_len : i1, i64
+    %new_words = arith.muli %new_capacity, %handle_words : i64
+    %new_words_index = arith.index_cast %new_words : i64 to index
+    %new_items = memref.alloc(%new_words_index) : memref<?xi64>
+    %len_index = arith.index_cast %len : i64 to index
+    %has_selection = arith.cmpi sgt, %adj#1, %zero : i64
+    %write0 = arith.constant 0 : i64
+    %final_write = scf.for %i = %c0 to %len_index step %c1 iter_args(%write = %write0) -> (i64) {
+      %i64v = arith.index_cast %i : index to i64
+      %ge_lo = arith.cmpi sge, %i64v, %lo : i64
+      %le_hi = arith.cmpi sle, %i64v, %hi : i64
+      %in_range = arith.andi %ge_lo, %le_hi : i1
+      %rel = arith.subi %i64v, %lo : i64
+      %rem = arith.remsi %rel, %step_abs : i64
+      %on_stride = arith.cmpi eq, %rem, %zero : i64
+      %in_window = arith.andi %in_range, %on_stride : i1
+      %selected_raw = arith.andi %in_window, %has_selection : i1
+      %next = scf.if %selected_raw -> (i64) {
+        func.call @LyObject_ReleaseBoxedPayloadArraySlotRaw(%items, %i64v) : (memref<?xi64>, i64) -> ()
+        scf.yield %write : i64
+      } else {
+        %src_base64 = arith.muli %i64v, %handle_words : i64
+        %src_base = arith.index_cast %src_base64 : i64 to index
+        %dst_base64 = arith.muli %write, %handle_words : i64
+        %dst_base = arith.index_cast %dst_base64 : i64 to index
+        scf.for %w = %c0 to %c16 step %c1 {
+          %src_index = arith.addi %src_base, %w : index
+          %dst_index = arith.addi %dst_base, %w : index
+          %word = memref.load %items[%src_index] : memref<?xi64>
+          memref.store %word, %new_items[%dst_index] : memref<?xi64>
+        }
+        %bumped = arith.addi %write, %one : i64
+        scf.yield %bumped : i64
+      }
+      scf.yield %next : i64
+    }
+    memref.dealloc %items : memref<?xi64>
+    memref.store %final_write, %meta[%length_slot] : memref<2xi64>
+    memref.store %new_capacity, %meta[%capacity_slot] : memref<2xi64>
+    func.return %header, %meta, %new_items : memref<2xi64>, memref<2xi64>, memref<?xi64>
   }
 
   func.func @LyDict_Len(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %keys: memref<?xi64>, %values: memref<?xi64>, %present: memref<?xi64>) -> i64 attributes {ly.runtime.contract = "builtins.dict", ly.runtime.method = "__len__"} {

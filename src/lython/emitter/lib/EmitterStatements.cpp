@@ -265,9 +265,8 @@ void ModuleEmitter::emitDelete(const parser::Node &statement) {
     if (target->kind == "Subscript") {
       if (const parser::Node *sliceNode = ast::node(*target, "slice");
           sliceNode && sliceNode->kind == "Slice") {
-        diagnostics.push_back(
-            parser::Diagnostic{parser::Severity::Error, target->range.start,
-                               "slice deletion is not supported yet"});
+        emitSliceMutation(*target, ast::node(*target, "value"), *sliceNode,
+                          "__delslice__", std::nullopt);
         continue;
       }
       Value container = emitExpr(ast::node(*target, "value"));
@@ -308,6 +307,89 @@ void ModuleEmitter::emitDelete(const parser::Node &statement) {
         parser::Diagnostic{parser::Severity::Error, target->range.start,
                            "unsupported del target '" + target->kind + "'"});
   }
+}
+
+// Slice assignment / deletion on a list local: both are structural
+// mutations (the splice may reallocate the items storage), so they lower
+// through the same rebinding bound-method call shape as list.append —
+// `__setslice__`/`__delslice__` carry the (start, stop, step, mask) pack the
+// slice READ path already uses, plus the replacement list for assignment.
+void ModuleEmitter::emitSliceMutation(const parser::Node &target,
+                                      const parser::Node *containerNode,
+                                      const parser::Node &sliceNode,
+                                      llvm::StringRef methodName,
+                                      std::optional<Value> payload) {
+  bool isAssignment = payload.has_value();
+  auto unsupported = [&](llvm::StringRef reason) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, target.range.start,
+        (isAssignment ? llvm::Twine("slice assignment ")
+                      : llvm::Twine("slice deletion "))
+                .concat(reason)
+                .str()});
+  };
+  if (!containerNode || containerNode->kind != "Name") {
+    unsupported("requires a named local list target (field containers are "
+                "not supported yet)");
+    return;
+  }
+  Value container = emitExpr(containerNode);
+  llvm::StringRef containerName = ast::nameSpelling(*containerNode);
+  auto bound = values.find(containerName);
+  if (bound == values.end() || bound->second.value != container.value) {
+    unsupported("requires a rebindable local list target");
+    return;
+  }
+
+  const parser::Node *lower = ast::node(sliceNode, "lower");
+  const parser::Node *upper = ast::node(sliceNode, "upper");
+  const parser::Node *step = ast::node(sliceNode, "step");
+  auto intConstant = [&](long long value) -> Value {
+    std::string text = std::to_string(value);
+    mlir::Type type = types.literal(text);
+    auto op = py::IntConstantOp::create(builder, loc(target), type,
+                                        builder.getStringAttr(text));
+    return {op.getResult(), type};
+  };
+  Value startValue = lower ? emitExpr(lower) : intConstant(0);
+  Value stopValue = upper ? emitExpr(upper) : intConstant(0);
+  Value stepValue = step ? emitExpr(step) : intConstant(1);
+  long long maskBits = (lower ? 1 : 0) | (upper ? 2 : 0);
+  Value maskValue = intConstant(maskBits);
+
+  llvm::SmallVector<mlir::Type, 5> argumentTypes{
+      startValue.type, stopValue.type, stepValue.type, maskValue.type};
+  llvm::SmallVector<Value, 5> arguments{startValue, stopValue, stepValue,
+                                        maskValue};
+  if (payload) {
+    argumentTypes.push_back(payload->type);
+    arguments.push_back(*payload);
+  }
+  CallInferenceResult inference = types.inferMethodCallWithEvidence(
+      container.type, methodName, argumentTypes);
+  if (!inference) {
+    unsupported(isAssignment
+                    ? "is only supported for a list target with a list value"
+                    : "is only supported for list targets");
+    return;
+  }
+  if (!requireStaticEvidence(target, inference))
+    return;
+  if (!types.isStructuralMutatorMethod(container.type, methodName)) {
+    unsupported("target's manifest does not declare the slice mutator");
+    return;
+  }
+  Value posPack = emitPack(arguments);
+  Value namePack = emitPack({});
+  Value valuePack = emitPack({});
+  auto op = py::CallOp::create(
+      builder, loc(target),
+      mlir::TypeRange{inference.resultType, container.value.getType()},
+      callProtocolFor(inference), container.value, posPack.value,
+      namePack.value, valuePack.value);
+  op->setAttr("ly.bound_method", builder.getStringAttr(methodName));
+  op->setAttr("ly.structural_mutation", builder.getUnitAttr());
+  values[containerName] = Value{op.getResult(1), container.type};
 }
 
 void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
@@ -459,9 +541,8 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
     }
     if (const parser::Node *sliceNode = ast::node(target, "slice");
         sliceNode && sliceNode->kind == "Slice") {
-      diagnostics.push_back(
-          parser::Diagnostic{parser::Severity::Error, target.range.start,
-                             "slice assignment is not supported yet"});
+      emitSliceMutation(target, containerNode, *sliceNode, "__setslice__",
+                        value);
       return;
     }
     Value index = emitExpr(ast::node(target, "slice"));
