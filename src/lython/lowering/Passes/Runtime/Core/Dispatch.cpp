@@ -81,6 +81,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPyOp(mlir::Operation *op) {
       .Case<py::DelItemOp>([&](auto delItem) { return lowerDelItem(delItem); })
       .Case<py::ContainsOp>(
           [&](auto contains) { return lowerContains(contains); })
+      .Case<py::IsOp>([&](auto identity) { return lowerIs(identity); })
       .Case<py::RoundOp>([&](auto round) { return lowerRound(round); })
       .Case<py::IncRefOp>([&](auto incRef) { return lowerIncRef(incRef); })
       .Case<py::DecRefOp>([&](auto decRef) { return lowerDecRef(decRef); })

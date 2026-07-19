@@ -736,17 +736,43 @@ Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
       mlir::Type widened = types.widenLiteral(type);
       return widened == types.intType() || widened == types.floatType() ||
              widened == types.strType() ||
-             widened == types.contract("builtins.bytes");
+             widened == types.contract("builtins.bytes") ||
+             widened == types.contract("builtins.complex");
     };
     if (isValueType(lhs.type) || isValueType(rhs.type)) {
       diagnostics.push_back(parser::Diagnostic{
           parser::Severity::Error, expr.range.start,
-          std::string("`is` on int/str/float/bytes operands is rejected "
-                      "(identity of value types is an implementation detail); "
-                      "use `") +
+          std::string("`is` on int/str/float/bytes/complex operands is "
+                      "rejected (identity of value types is an implementation "
+                      "detail); use `") +
               (negatedIdentity ? "!=" : "==") + "` instead"});
       return emitNone(expr);
     }
+    // Reference identity between header-carrying contracts (user-class
+    // instances, containers) is an address comparison; dispatching the
+    // fall-through __eq__/__ne__ here would silently turn `is` into `==`.
+    mlir::Type lhsWidened = types.widenLiteral(lhs.type);
+    mlir::Type rhsWidened = types.widenLiteral(rhs.type);
+    if (mlir::isa<py::ContractType>(lhsWidened) &&
+        mlir::isa<py::ContractType>(rhsWidened)) {
+      Value lhsRef = coerceValue(lhs, lhsWidened, expr);
+      Value rhsRef = coerceValue(rhs, rhsWidened, expr);
+      auto identity = py::IsOp::create(builder, loc(expr), builder.getI1Type(),
+                                       lhsRef.value, rhsRef.value);
+      mlir::Value bit = identity.getResult();
+      if (negatedIdentity) {
+        auto one = mlir::arith::ConstantIntOp::create(builder, loc(expr), 1, 1);
+        bit = mlir::arith::XOrIOp::create(builder, loc(expr), bit, one);
+      }
+      auto pyBool =
+          py::CastFromPrimOp::create(builder, loc(expr), types.boolType(), bit);
+      return Value{pyBool.getResult(), types.boolType()};
+    }
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "`is` requires reference-typed operands that resolve statically; "
+        "this operand combination has no stable identity"});
+    return emitNone(expr);
   }
   if (ast::isOperator(op, "In") || ast::isOperator(op, "NotIn")) {
     if (std::optional<MethodBinding> method =

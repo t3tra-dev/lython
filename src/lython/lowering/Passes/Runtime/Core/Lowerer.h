@@ -1038,6 +1038,7 @@ private:
   mlir::LogicalResult lowerSetItem(py::SetItemOp op);
   mlir::LogicalResult lowerDelItem(py::DelItemOp op);
   mlir::LogicalResult lowerContains(py::ContainsOp op);
+  mlir::LogicalResult lowerIs(py::IsOp op);
   mlir::LogicalResult lowerIter(py::IterOp op);
   mlir::LogicalResult lowerNext(py::NextOp op);
   mlir::FailureOr<SourceGeneratorResumeResult>
