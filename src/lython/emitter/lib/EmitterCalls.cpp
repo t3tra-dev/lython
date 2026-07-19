@@ -1412,6 +1412,18 @@ std::optional<Value> ModuleEmitter::emitStringifyValue(const parser::Node &ancho
                                 methodBindingBindsReceiver(*method), *method,
                                 {}, emptyKeywords);
   }
+  // A source class without __str__ stringifies through its own __repr__
+  // (CPython object.__str__ delegates to type(x).__repr__); the manifest
+  // evidence below would instead resolve the generic object formatter,
+  // which cannot see source methods.
+  if (std::optional<MethodBinding> method =
+          lookupClassMethod(valueType, "__repr__")) {
+    llvm::StringMap<Value> emptyKeywords;
+    Value receiver = emitDescriptorReceiver(anchor, value, *method);
+    return emitInlineMethodBody(anchor, receiver,
+                                methodBindingBindsReceiver(*method), *method,
+                                {}, emptyKeywords);
+  }
   // Non-str builtins render via __repr__ (str(x) == repr(x) for every
   // non-str builtin; __str__ evidence resolves for containers through the
   // object contract but the manifest only implements their __repr__).
