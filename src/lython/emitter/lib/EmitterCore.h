@@ -106,6 +106,7 @@ private:
   void emitStatements(const std::vector<parser::NodePtr> *statements,
                       bool skipDeclarations = false);
   void emitStatement(const parser::Node &statement);
+  void emitPendingDefaultCells(const parser::Node &statement);
   void emitDelete(const parser::Node &statement);
   void emitAssignTarget(const parser::Node &target, Value value);
   void emitIf(const parser::Node &statement);
@@ -369,6 +370,17 @@ private:
   mlir::Type currentGeneratorSendType;
   std::string currentFunctionPrefix;
   std::vector<parser::NodePtr> synthesizedDefaultProviders;
+  // Non-constant defaults of MODULE-level defs (R6): evaluated once when
+  // __main__ reaches the def statement and parked in a module-lifetime
+  // object-global cell; call sites read the cell instead of re-evaluating.
+  struct PendingDefaultCell {
+    std::string cellName;
+    parser::NodePtr expr;
+    mlir::Type declaredType;
+  };
+  llvm::DenseMap<const parser::Node *,
+                 llvm::SmallVector<PendingDefaultCell, 2>>
+      pendingDefaultCells;
   unsigned syntheticFunctionCounter = 0;
   unsigned listCompCounter = 0;
   llvm::SmallVector<WithCleanup, 8> activeWithCleanups;
