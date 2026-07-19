@@ -1333,8 +1333,19 @@ bool RuntimeBundleLowerer::needsDefaultObjectRepr(
     return false;
   if (contract == "builtins.set")
     return false;
-  return object.kind == RuntimeBundle::Kind::Object &&
-         manifest.methodCandidates(contract, "__repr__").empty();
+  if (object.kind != RuntimeBundle::Kind::Object)
+    return false;
+  if (!manifest.methodCandidates(contract, "__repr__").empty())
+    return false;
+  // User exception classes render through their taxonomy ancestor's
+  // __repr__ (ClassName(...) with the DYNAMIC class id's name), never the
+  // address-based default.
+  if (std::optional<std::string> ancestor =
+          RuntimeBundleLowerer::exceptionAncestorContractFor(
+              runtimeContractType(context, contract)))
+    if (!manifest.methodCandidates(*ancestor, "__repr__").empty())
+      return false;
+  return true;
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultObjectRepr(
@@ -1688,6 +1699,113 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedStrHook() {
   return mlir::success();
 }
 
+mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassHashAdapters() {
+  // Why an adapter instead of joining the dispatch directly: a compiled
+  // source-class `__hash__` returns the boxed-int ABI (int physicals plus the
+  // (i64, i1) fast lane), not the bare i64 the uniform dispatch reconstructs
+  // callees around. The adapter hashes the boxed result through the SAME
+  // manifest int `__hash__` that hashes int keys, so a class whose __hash__
+  // forwards to hash(<int-key expression>) lands in the same dict slot as the
+  // raw value would.
+  std::optional<RuntimeSymbol> intHash =
+      manifest.method("builtins.int", "__hash__");
+  if (!intHash)
+    return mlir::success(); // no boxed-int hashing merged: nothing to adapt
+  mlir::func::FuncOp intRelease;
+  module.walk([&](mlir::func::FuncOp function) {
+    if (function.isExternal() ||
+        !function->hasAttr(contracts::kManifestDeallocatorAttr))
+      return;
+    auto contractAttr = function->getAttrOfType<mlir::StringAttr>(
+        contracts::kManifestContractAttr);
+    if (contractAttr && contractAttr.getValue() == "builtins.int")
+      intRelease = function;
+  });
+  mlir::Type i64 = mlir::IntegerType::get(context, 64);
+  mlir::Type i1 = mlir::IntegerType::get(context, 1);
+  mlir::FunctionType intHashType = intHash->function.getFunctionType();
+  unsigned intWords = intHashType.getNumInputs();
+  if (intHashType.getNumResults() != 1 || intHashType.getResult(0) != i64)
+    return mlir::success();
+
+  struct Pending {
+    py::ClassOp classOp;
+    mlir::func::FuncOp method;
+  };
+  llvm::SmallVector<Pending, 4> pending;
+  module.walk([&](py::ClassOp classOp) {
+    std::optional<std::string> symbol =
+        RuntimeBundleLowerer::classMethodSymbol(classOp, "__hash__");
+    if (!symbol)
+      return;
+    auto method = module.lookupSymbol<mlir::func::FuncOp>(*symbol);
+    if (!method || method.isExternal())
+      return;
+    mlir::FunctionType type = method.getFunctionType();
+    // Already a bare i64: joins the dispatch without an adapter.
+    if (type.getNumResults() == 1 && type.getResult(0) == i64)
+      return;
+    // The boxed-int result ABI: the merged int receiver shape, then the
+    // (i64 fast value, i1 fast valid) evidence lane.
+    if (type.getNumResults() != intWords + 2 || type.getNumInputs() == 0 ||
+        type.getNumInputs() > 5)
+      return;
+    for (unsigned index = 0; index < intWords; ++index)
+      if (type.getResult(index) != intHashType.getInput(index))
+        return;
+    if (type.getResult(intWords) != i64 ||
+        type.getResult(intWords + 1) != i1)
+      return;
+    for (mlir::Type input : type.getInputs()) {
+      auto memref = mlir::dyn_cast<mlir::MemRefType>(input);
+      if (!memref || memref.getRank() != 1)
+        return;
+    }
+    pending.push_back(Pending{classOp, method});
+  });
+
+  mlir::OpBuilder builder(context);
+  mlir::Location loc = module.getLoc();
+  for (Pending &entry : pending) {
+    std::string adapterName =
+        ("__ly_hash_adapter$" + entry.classOp.getSymName()).str();
+    if (module.lookupSymbol<mlir::func::FuncOp>(adapterName))
+      continue;
+    builder.setInsertionPointToEnd(module.getBody());
+    mlir::FunctionType methodType = entry.method.getFunctionType();
+    auto adapter = mlir::func::FuncOp::create(
+        builder, loc, adapterName,
+        builder.getFunctionType(methodType.getInputs(), {i64}));
+    adapter.setPrivate();
+    adapter->setAttr(contracts::kManifestContractAttr,
+                     builder.getStringAttr(entry.classOp.getSymName()));
+    adapter->setAttr(contracts::kManifestMethodAttr,
+                     builder.getStringAttr("__hash__"));
+    mlir::Block *body = adapter.addEntryBlock();
+    builder.setInsertionPointToStart(body);
+    auto call = mlir::func::CallOp::create(
+        builder, loc, entry.method,
+        llvm::SmallVector<mlir::Value, 6>(body->getArguments().begin(),
+                                          body->getArguments().end()));
+    llvm::SmallVector<mlir::Value, 4> intValues;
+    for (unsigned index = 0; index < intWords; ++index)
+      intValues.push_back(call.getResult(index));
+    mlir::Value hash =
+        mlir::func::CallOp::create(builder, loc, intHash->function, intValues)
+            .getResult(0);
+    // Consume the owned boxed result AFTER hashing it (the digits view dies
+    // with the box).
+    if (intRelease && intRelease.getFunctionType().getNumInputs() >= 1 &&
+        intRelease.getFunctionType().getNumInputs() <= intWords)
+      mlir::func::CallOp::create(
+          builder, loc, intRelease,
+          llvm::ArrayRef<mlir::Value>(intValues)
+              .take_front(intRelease.getFunctionType().getNumInputs()));
+    mlir::func::ReturnOp::create(builder, loc, mlir::ValueRange{hash});
+  }
+  return mlir::success();
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::generateBoxedHashHook() {
   // hash instance: class id -> the manifest `__hash__` (returns the i64 hash
   // word). Same demand-driven generation as the repr hook: the external
@@ -1696,6 +1814,9 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedHashHook() {
           "__ly_hash_boxed_by_contract");
       !existing || !existing.isExternal())
     return mlir::success();
+  if (mlir::failed(
+          RuntimeBundleLowerer::synthesizeSourceClassHashAdapters()))
+    return mlir::failure();
   mlir::Type i64 = mlir::IntegerType::get(context, 64);
   return generateBoxedMethodHook(
       "__ly_hash_boxed_by_contract",
