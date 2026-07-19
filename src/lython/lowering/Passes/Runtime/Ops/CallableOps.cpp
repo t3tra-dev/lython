@@ -479,7 +479,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
   // reordering/removal invalidates it, and the published payload carries the
   // authoritative contents.
   if (receiver.kind == RuntimeBundle::Kind::Object) {
-    llvm::StringRef receiverContract = receiver.contractName();
+    // std::string, not StringRef: contractName() returns by value and a
+    // StringRef binding dangles past the temporary (ASan-caught).
+    std::string receiverContract = receiver.contractName();
     bool listBoxMethod = receiverContract == "builtins.list" &&
                          (methodName == "count" || methodName == "index" ||
                           methodName == "remove") &&
