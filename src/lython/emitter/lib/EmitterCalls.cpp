@@ -188,6 +188,8 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     return *v;
   if (std::optional<Value> v = tryEmitDictMethodSugar(expr, calleeNode))
     return *v;
+  if (std::optional<Value> v = tryEmitSortSugar(expr, calleeNode))
+    return *v;
 
   if (!calleeQualified.empty())
     if (auto cls = types.lookupClass(calleeQualified)) {
@@ -549,6 +551,16 @@ ModuleEmitter::tryEmitIntCall(const parser::Node &expr,
     // int is immutable, so int(n) is the identity (CPython returns n).
     Value argument = emitExpr(intArgs->front().get());
     return coerceValue(argument, types.intType(), expr);
+  }
+  if (argumentType == types.boolType()) {
+    // int(True) == 1 / int(False) == 0: widen the truth bit.
+    Value argument = emitExpr(intArgs->front().get());
+    mlir::Value bit = emitBoolValue(argument, expr);
+    auto wide = mlir::arith::ExtUIOp::create(
+        builder, loc(expr), mlir::IntegerType::get(&context, 64), bit);
+    auto op = py::CastFromPrimOp::create(builder, loc(expr), types.intType(),
+                                         wide.getResult());
+    return Value{op.getResult(), types.intType()};
   }
   if (argumentType == types.strType() || argumentType == types.floatType()) {
     // The runtime-level __int__ methods of str (base-10 parse) and float

@@ -179,6 +179,14 @@ private:
   // `x in d.keys()/values()/items()` and `len(d.keys())` rewrite against the
   // dict itself.
   std::optional<Value> tryEmitDictViewMembership(const parser::Node &expr);
+  // sorted(key=, reverse=) / list.sort(key=, reverse=):
+  // decorate-sort-undecorate over the native stable sort.
+  std::optional<Value> tryEmitSortSugar(const parser::Node &expr,
+                                        const parser::Node *calleeNode);
+  std::optional<std::string>
+  emitDsuSortStatements(const parser::Node &anchor, parser::NodePtr source,
+                        const LazyCallable *key, bool reverse, unsigned serial,
+                        llvm::SmallVectorImpl<std::string> &scratchNames);
   void emitWhile(const parser::Node &statement);
   void emitAsyncFor(const parser::Node &statement);
   llvm::SmallVector<CarriedLoopLocal, 4>

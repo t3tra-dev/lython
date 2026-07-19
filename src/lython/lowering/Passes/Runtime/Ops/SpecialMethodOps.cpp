@@ -346,6 +346,164 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
   }
   bool structuralMutation =
       op->hasAttr("ly.structural_mutation") && op.getNumResults() == 1;
+  // `xs[i] = v` with a runtime index: bounds-normalize like getitem, release
+  // the replaced slot's element, store the retained payload handle. Element
+  // evidence (positional, compile-time indexed) cannot describe a store at
+  // an unknown position, so an evidence-backed list demotes to runtime mode
+  // first — its payload was materialized alongside the evidence and stays
+  // the single source of truth.
+  bool runtimeListStore =
+      container.kind == RuntimeBundle::Kind::Object &&
+      container.contractName() == "builtins.list" &&
+      container.physicalValues().size() >= 3 &&
+      index.kind == RuntimeBundle::Kind::Object &&
+      value.kind == RuntimeBundle::Kind::Object &&
+      !integerLiteralFromValue(op.getIndex()).has_value();
+  if ((structuralMutation || op.getNumResults() == 0) && runtimeListStore) {
+    if (container.sequenceEvidenceBacked || !container.sequenceElements.empty()) {
+      auto found = valueBundles.find(op.getContainer());
+      if (found != valueBundles.end()) {
+        found->second.sequenceEvidenceBacked = false;
+        found->second.sequenceElements.clear();
+        found->second.sequenceElementBundles.clear();
+        found->second.sequenceIndices.clear();
+      }
+    }
+    const RuntimeBundle &liveContainer = *bundleFor(op.getContainer());
+    mlir::Type elementContract = value.objectValue.contract;
+    mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> shapes =
+        RuntimeBundleLowerer::slotStorageShapesFor(op, elementContract,
+                                                   "runtime list store");
+    if (mlir::failed(shapes))
+      return mlir::failure();
+    bool shapesUsable = true;
+    for (mlir::Type shape : *shapes) {
+      auto memref = mlir::dyn_cast<mlir::MemRefType>(shape);
+      if (!memref || memref.getRank() != 1)
+        shapesUsable = false;
+    }
+    if (shapesUsable) {
+      builder.setInsertionPoint(op);
+      mlir::Location loc = op.getLoc();
+      mlir::Value raw;
+      if (index.primitiveI64) {
+        raw = index.primitiveI64->value;
+      } else {
+        std::optional<RuntimeSymbol> unbox =
+            manifest.primitive(index.contractName(), "unbox.i64");
+        if (!unbox ||
+            unbox->function.getNumArguments() != index.physicalValues().size())
+          return op.emitError()
+                 << "runtime list store index has no i64 evidence";
+        raw = RuntimeBundleLowerer::createRuntimeCall(loc, *unbox,
+                                                      index.physicalValues())
+                  .getResult(0);
+      }
+      mlir::Value zero =
+          mlir::arith::ConstantIntOp::create(builder, loc, 0, 64);
+      mlir::Value slot0 =
+          mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult();
+      mlir::Value length =
+          mlir::memref::LoadOp::create(builder, loc,
+                                       liveContainer.physicalValues()[1],
+                                       slot0)
+              .getResult();
+      mlir::Value isNegative = mlir::arith::CmpIOp::create(
+          builder, loc, mlir::arith::CmpIPredicate::slt, raw, zero);
+      mlir::Value adjusted =
+          mlir::arith::AddIOp::create(builder, loc, raw, length).getResult();
+      mlir::Value normalized =
+          mlir::arith::SelectOp::create(builder, loc, isNegative, adjusted,
+                                        raw)
+              .getResult();
+      mlir::Value lowerOk = mlir::arith::CmpIOp::create(
+          builder, loc, mlir::arith::CmpIPredicate::sge, normalized, zero);
+      mlir::Value upperOk = mlir::arith::CmpIOp::create(
+          builder, loc, mlir::arith::CmpIPredicate::slt, normalized, length);
+      mlir::Value inRange =
+          mlir::arith::AndIOp::create(builder, loc, lowerOk, upperOk)
+              .getResult();
+      mlir::Value outOfRange = mlir::arith::XOrIOp::create(
+          builder, loc, inRange,
+          mlir::arith::ConstantIntOp::create(builder, loc, 1, 1).getResult());
+      auto guard = mlir::scf::IfOp::create(builder, loc, mlir::TypeRange{},
+                                           outOfRange,
+                                           /*withElseRegion=*/false);
+      {
+        mlir::OpBuilder::InsertionGuard insertionGuard(builder);
+        builder.setInsertionPointToStart(&guard.getThenRegion().front());
+        if (mlir::failed(emitRuntimeException(
+                op, "builtins.IndexError",
+                "list assignment index out of range")))
+          return mlir::failure();
+      }
+      builder.setInsertionPointAfter(guard);
+      mlir::Value safe =
+          mlir::arith::SelectOp::create(builder, loc, inRange, normalized,
+                                        zero)
+              .getResult();
+      // The primitive releases the replaced slot and absorbs the retained
+      // payload handle — opaque to the affine verifier, which must not see
+      // an IR-level release of values derived from the container's storage.
+      std::optional<RuntimeSymbol> setItemBox =
+          manifest.primitive("builtins.list", "setitem_box");
+      if (!setItemBox)
+        return op.emitError()
+               << "runtime manifest has no list setitem_box primitive";
+      mlir::FailureOr<RuntimeBundle> payload =
+          RuntimeBundleLowerer::materializePayloadObjectBundle(op, value);
+      if (mlir::failed(payload))
+        return mlir::failure();
+      if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
+              op, *payload, "list.store")))
+        return mlir::failure();
+      mlir::MemRefType boxType = box_abi::boxWordsType(builder);
+      mlir::Value box =
+          mlir::memref::AllocaOp::create(builder, loc, boxType).getResult();
+      mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
+          RuntimeBundleLowerer::objectPayloadHandleWords(op, *payload,
+                                                         /*ownsPayload=*/true);
+      if (mlir::failed(words))
+        return mlir::failure();
+      for (auto [wordIndex, word] : llvm::enumerate(*words)) {
+        mlir::Value slot = mlir::arith::ConstantIndexOp::create(
+            builder, loc, static_cast<std::int64_t>(wordIndex));
+        mlir::memref::StoreOp::create(builder, loc, word, box, slot);
+      }
+      llvm::SmallVector<mlir::Value, 8> operands(
+          liveContainer.physicalValues().begin(),
+          liveContainer.physicalValues().end());
+      operands.push_back(safe);
+      operands.push_back(box);
+      mlir::func::CallOp call =
+          RuntimeBundleLowerer::createRuntimeCall(loc, *setItemBox, operands);
+      // The call consumes the container's token (transfer) and returns a
+      // fresh one on the same storage — the rebind convention the emitter's
+      // structural-mutation form expects.
+      RuntimeBundle updated;
+      if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+              op, liveContainer.objectValue.contract, call.getResults(),
+              updated)))
+        return mlir::failure();
+      updated.fieldAliasOwner = liveContainer.fieldAliasOwner;
+      updated.fieldAliasName = liveContainer.fieldAliasName;
+      if (structuralMutation) {
+        valueBundles[op.getResult(0)] = std::move(updated);
+      } else {
+        // Non-rebind form: the storage did not move (setitem never
+        // reallocates), so absorbing the fresh token back into the holder
+        // is a retain/release no-op pair.
+        if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
+                op, updated, "list.store.writeback")))
+          return mlir::failure();
+        if (mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
+                op, updated, "list.store.writeback.source")))
+          return mlir::failure();
+      }
+      erase.push_back(op);
+      return mlir::success();
+    }
+  }
   bool runtimeDictInsert =
       container.kind == RuntimeBundle::Kind::Object &&
       container.contractName() == "builtins.dict" &&
@@ -1032,6 +1190,14 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIter(py::IterOp op) {
     return RuntimeBundleLowerer::lowerAliasView(op, op.getIterable(),
                                                 op.getResult());
 
+  // The iterable may be a block argument whose ABI expansion has not run
+  // yet (walk order does not guarantee it): materialize the bundle first,
+  // or the container paths below silently fall through to the manifest
+  // fallback.
+  if (mlir::failed(
+          RuntimeBundleLowerer::ensureValueBundle(op, op.getIterable())))
+    return mlir::failure();
+
   // Statically evidenced list iteration: there is no runtime `list.__iter__`
   // object; iterate the compile-time element evidence through a hoisted
   // position cell instead. The cell is alloca'd once per function (so nested
@@ -1044,9 +1210,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIter(py::IterOp op) {
                                 !iterable->evidenceIteratorCell;
     // Runtime-mode list (no compile-time element evidence): iterate the
     // runtime payload through the same hoisted position cell; `py.next`
-    // rebuilds each element from its payload box words.
+    // rebuilds each element from its payload box words. An evidence-BACKED
+    // list with no recorded elements (an annotated empty literal grown by
+    // loop appends) qualifies too: its payload is the only truth.
     bool runtimeListIterable = iterable->contractName() == "builtins.list" &&
-                               !iterable->sequenceEvidenceBacked &&
                                iterable->sequenceElements.empty() &&
                                !iterable->evidenceIteratorCell &&
                                iterable->physicalValues().size() >= 3;

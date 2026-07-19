@@ -829,9 +829,10 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeSequenceGetItem(
   // which invalidates references into it.
   RuntimeBundle container = containerRef;
   RuntimeBundle index = indexRef;
+  // An evidence-BACKED container with no recorded elements (an annotated
+  // empty literal grown by loop appends) reads through the payload too.
   if ((container.contractName() != "builtins.list" &&
        container.contractName() != "builtins.tuple") ||
-      container.sequenceEvidenceBacked ||
       !container.sequenceElements.empty() ||
       container.physicalValues().size() < 3)
     return false;

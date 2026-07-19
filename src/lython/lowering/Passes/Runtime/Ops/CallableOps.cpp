@@ -127,6 +127,22 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCall(py::CallOp op) {
       valueBundles[op.getCallable()] = std::move(demoted);
       callable = RuntimeBundleLowerer::bundleFor(op.getCallable());
     }
+    // Same rule for evidence-backed lists meeting a mutator with no
+    // evidence tier: the payload is authoritative after the mutation.
+    if (callable->kind == RuntimeBundle::Kind::Object &&
+        callable->contractName() == "builtins.list" &&
+        callable->physicalValues().size() >= 3 &&
+        (callable->sequenceEvidenceBacked ||
+         !callable->sequenceElements.empty()) &&
+        (methodName == "extend" || methodName == "clear")) {
+      RuntimeBundle demoted = *callable;
+      demoted.sequenceEvidenceBacked = false;
+      demoted.sequenceElements.clear();
+      demoted.sequenceElementBundles.clear();
+      demoted.sequenceIndices.clear();
+      valueBundles[op.getCallable()] = std::move(demoted);
+      callable = RuntimeBundleLowerer::bundleFor(op.getCallable());
+    }
     return RuntimeBundleLowerer::lowerBoundMethodCall(op, *callable,
                                                       methodName);
   }
@@ -460,8 +476,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
   bool runtimeSetReceiver = receiver.kind == RuntimeBundle::Kind::Object &&
                             receiver.contractName() == "builtins.set" &&
                             receiver.physicalValues().size() >= 3;
+  bool runtimeListReceiver = receiver.kind == RuntimeBundle::Kind::Object &&
+                             receiver.contractName() == "builtins.list" &&
+                             receiver.physicalValues().size() >= 3;
   bool structuralUpdate =
       (runtimeDictReceiver && methodName == "update") ||
+      (runtimeListReceiver && methodName == "extend") ||
       (runtimeSetReceiver &&
        (methodName == "update" || methodName == "intersection_update" ||
         methodName == "difference_update" ||

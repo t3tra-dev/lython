@@ -524,7 +524,7 @@ module attributes {
     ly.runtime.required_initializers = ["__new__"],
     ly.runtime.required_methods = ["__len__"],
     ly.runtime.required_primitives = ["ensure_capacity"],
-    ly.typing.structural_mutators = ["append"],
+    ly.typing.structural_mutators = ["append", "extend"],
     ly.typing.base_args = [[!py.contract<"$T">]],
     method_names = ["__init__", "__init__", "append", "extend", "pop",
                     "insert", "remove", "clear", "__len__", "__iter__",
@@ -14968,6 +14968,77 @@ module attributes {
       scf.yield %next : i64
     }
     func.return %found : i64
+  }
+
+  // list setitem_box: `xs[i] = v` for a runtime i. The caller bounds-checks
+  // and normalizes the index and hands over an OWNED payload box; the old
+  // slot's payload is released here (opaque to the affine verifier - an
+  // IR-level release of values reloaded from the container's own storage
+  // words would read as releasing the container).
+  func.func @LyList_SetItemBox(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>, %index: i64, %value_box: memref<16xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.transfer_args = [0], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.primitive = "setitem_box"} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c16 = arith.constant 16 : index
+    %handle_words = arith.constant 16 : i64
+    func.call @LyObject_ReleaseBoxedPayloadArraySlotRaw(%items, %index) : (memref<?xi64>, i64) -> ()
+    %slot_base_i64 = arith.muli %index, %handle_words : i64
+    %slot_base = arith.index_cast %slot_base_i64 : i64 to index
+    scf.for %w = %c0 to %c16 step %c1 {
+      %vw = memref.load %value_box[%w] : memref<16xi64>
+      %dst = arith.addi %slot_base, %w : index
+      memref.store %vw, %items[%dst] : memref<?xi64>
+    }
+    func.return %header, %meta, %items : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  }
+
+  // list.clear: release every element, zero the handle words, len = 0.
+  func.func @LyList_Clear(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>) attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "clear"} {
+    %zero = arith.constant 0 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c16 = arith.constant 16 : index
+    %len = memref.load %meta[%c0] : memref<2xi64>
+    %len_index = arith.index_cast %len : i64 to index
+    scf.for %i = %c0 to %len_index step %c1 {
+      %ii = arith.index_cast %i : index to i64
+      func.call @LyObject_ReleaseBoxedPayloadArraySlotRaw(%items, %ii) : (memref<?xi64>, i64) -> ()
+    }
+    %total = arith.muli %len_index, %c16 : index
+    scf.for %w = %c0 to %total step %c1 {
+      memref.store %zero, %items[%w] : memref<?xi64>
+    }
+    memref.store %zero, %meta[%c0] : memref<2xi64>
+    func.return
+  }
+
+  // list.extend(other): copy other's handle words past the current end and
+  // retain each copied slot. Rebind convention (transfer in, owned out):
+  // ensure_capacity may reallocate the storage.
+  func.func @LyList_ExtendM(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>, %oh: memref<2xi64> {ly.ownership.object_header}, %om: memref<2xi64>, %oi: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.transfer_args = [0], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.method = "extend", ly.runtime.result_contract = "builtins.list"} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c16 = arith.constant 16 : index
+    %len = memref.load %meta[%c0] : memref<2xi64>
+    %olen = memref.load %om[%c0] : memref<2xi64>
+    %required = arith.addi %len, %olen : i64
+    %grown:3 = func.call @LyList_EnsureCapacity(%header, %meta, %items, %required) : (memref<2xi64>, memref<2xi64>, memref<?xi64>, i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    %olen_index = arith.index_cast %olen : i64 to index
+    %len_index = arith.index_cast %len : i64 to index
+    scf.for %i = %c0 to %olen_index step %c1 {
+      %src_base = arith.muli %i, %c16 : index
+      %dst_slot = arith.addi %len_index, %i : index
+      %dst_base = arith.muli %dst_slot, %c16 : index
+      scf.for %w = %c0 to %c16 step %c1 {
+        %src_index = arith.addi %src_base, %w : index
+        %dst_index = arith.addi %dst_base, %w : index
+        %word = memref.load %oi[%src_index] : memref<?xi64>
+        memref.store %word, %grown#2[%dst_index] : memref<?xi64>
+      }
+      %dst64 = arith.index_cast %dst_slot : index to i64
+      func.call @LyObject_RetainBoxedPayloadArraySlotRaw(%grown#2, %dst64) : (memref<?xi64>, i64) -> ()
+    }
+    memref.store %required, %grown#1[%c0] : memref<2xi64>
+    func.return %grown#0, %grown#1, %grown#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
   }
 
   func.func @LyList_ContainsBox(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>, %elem_box: memref<16xi64>) -> i1 attributes {ly.runtime.contract = "builtins.list", ly.runtime.primitive = "contains_box"} {

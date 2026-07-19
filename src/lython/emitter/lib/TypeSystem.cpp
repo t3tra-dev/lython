@@ -1679,6 +1679,12 @@ mlir::Type TypeSystem::annotationType(const parser::Node *node) const {
       if (mlir::isa<py::TypeVarType, py::ParamSpecType, py::TypeVarTupleType>(
               *symbol))
         return *symbol;
+      // Compiler-synthesized type aliases (emitter rewrites bind a concrete
+      // inferred type under a reserved "__ly*" name and spell it in
+      // synthesized annotations). User names never take this path: a plain
+      // local would otherwise shadow a class annotation.
+      if (name.starts_with("__ly"))
+        return *symbol;
     }
     if (annotationNameIs(name, "int"))
       return intType();

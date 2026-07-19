@@ -1202,6 +1202,416 @@ ModuleEmitter::tryEmitDictMethodSugar(const parser::Node &expr,
       });
 }
 
+// ---------------------------------------------------------------------------
+// sorted(xs, key=, reverse=) / list.sort(key=, reverse=): decorate-sort-
+// undecorate over the native stable sort. Pairs are (key, index) — the index
+// makes ties positionally unique, so the element type itself never needs an
+// ordering. reverse=True keeps CPython's stability contract (equal keys stay
+// in original order) by decorating with the REVERSED index, sorting
+// ascending, and reversing the output.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Deep AST clone substituting NAME references. Lambdas beta-reduce by
+// SUBSTITUTION here (not parameter assignment): a comprehension element is
+// a single expression, and a sort key lambda's body is a pure expression of
+// its parameter. Nested binders re-binding the same name stop the walk.
+NodePtr cloneSubstituting(const parser::Node &node, llvm::StringRef name,
+                          const NodePtr &replacement) {
+  if (node.kind == "Name" &&
+      llvm::StringRef(ast::nameSpelling(node).data(),
+                      ast::nameSpelling(node).size()) == name)
+    return replacement;
+  NodePtr clone = parser::makeNode(node.kind, node.range);
+  bool rebinds = node.kind == "Lambda" || node.kind == "FunctionDef" ||
+                 node.kind == "AsyncFunctionDef";
+  for (const parser::Field &field : node.fields) {
+    if (const auto *child = std::get_if<NodePtr>(&field.value)) {
+      if (*child && !rebinds)
+        parser::addField(*clone, field.name,
+                         cloneSubstituting(**child, name, replacement));
+      else
+        parser::addField(*clone, field.name, field.value);
+      continue;
+    }
+    if (const auto *children =
+            std::get_if<std::vector<NodePtr>>(&field.value)) {
+      if (rebinds) {
+        parser::addField(*clone, field.name, field.value);
+        continue;
+      }
+      std::vector<NodePtr> mapped;
+      mapped.reserve(children->size());
+      for (const NodePtr &child : *children)
+        mapped.push_back(child ? cloneSubstituting(*child, name, replacement)
+                               : child);
+      parser::addField(*clone, field.name, std::move(mapped));
+      continue;
+    }
+    parser::addField(*clone, field.name, field.value);
+  }
+  return clone;
+}
+
+} // namespace
+
+// Emits the DSU statements; returns the name holding the sorted result list.
+std::optional<std::string> ModuleEmitter::emitDsuSortStatements(
+    const parser::Node &anchor, NodePtr source, const LazyCallable *key,
+    bool reverse, unsigned serial,
+    llvm::SmallVectorImpl<std::string> &scratchNames) {
+  parser::SourceRange range = anchor.range;
+  auto scratch = [&](const char *stem) {
+    std::string name =
+        "__lysort" + std::to_string(serial) + "_" + std::string(stem);
+    scratchNames.push_back(name);
+    return name;
+  };
+  std::string listName = scratch("lst");
+  std::string copyElement = scratch("c");
+  // __lst = SRC.copy() for lists (the comprehension-built copy's bundle
+  // trips the unwind release placement when a rebind loop follows), the
+  // [__c for __c in SRC] materialization for every other iterable.
+  {
+    auto contract = mlir::dyn_cast_if_present<py::ContractType>(
+        types.widenLiteral(types.inferExpr(source.get())));
+    if (contract && contract.getContractName() == "builtins.list") {
+      emitStatement(*assignNode(
+          nameNode(listName, range),
+          methodCallNode(std::move(source), "copy", {}, range), range));
+    } else {
+      NodePtr comprehension = parser::makeNode("comprehension", range);
+      parser::addField(*comprehension, "target",
+                       nameNode(copyElement, range));
+      parser::addField(*comprehension, "iter", std::move(source));
+      parser::addField(*comprehension, "ifs", std::vector<NodePtr>{});
+      parser::addField(*comprehension, "is_async", std::int64_t{0});
+      NodePtr copyComp = parser::makeNode("ListComp", range);
+      parser::addField(*copyComp, "elt", nameNode(copyElement, range));
+      parser::addField(*copyComp, "generators",
+                       std::vector<NodePtr>{std::move(comprehension)});
+      emitStatement(*assignNode(nameNode(listName, range),
+                                std::move(copyComp), range));
+    }
+  }
+  if (!key && !reverse) {
+    emitStatement(*[&] {
+      NodePtr statement = parser::makeNode("Expr", range);
+      parser::addField(*statement, "value",
+                       methodCallNode(nameNode(listName, range), "sort", {},
+                                      range));
+      return statement;
+    }());
+    return listName;
+  }
+
+  // Key application as a pure EXPRESSION: named callables re-spell, lambdas
+  // beta-reduce by substitution — a comprehension element cannot carry
+  // statement prologues, and a fully-typed pairs comprehension is what lets
+  // the undecorate step see tuple[K, int] elements.
+  auto keyExprFor = [&](NodePtr argument) -> std::optional<NodePtr> {
+    if (!key)
+      return argument;
+    if (key->callee)
+      return callNode(key->callee, {std::move(argument)}, range);
+    if (key->lambdaParams.size() != 1 || !key->lambdaBody) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, anchor.range.start,
+          "sort key lambda must take exactly one parameter"});
+      return std::nullopt;
+    }
+    return cloneSubstituting(*key->lambdaBody, key->lambdaParams.front(),
+                             argument);
+  };
+
+  std::string pairsName = scratch("ps");
+  std::string indexName = scratch("i");
+  std::string lengthName = scratch("n");
+  emitStatement(*assignNode(nameNode(lengthName, range),
+                            lenCall(nameNode(listName, range), range),
+                            range));
+
+  // The scratch lists start empty, so their element types must be SPELLED —
+  // an append-refined empty literal types at the bundle level only, and the
+  // undecorate step statically indexes the pair tuples. The concrete key and
+  // element types are inferred from probe expressions and bound to scratch
+  // type names the annotations reference (the generic-specialization trick).
+  std::string keyTypeName = scratch("K");
+  std::string elementTypeName = scratch("T");
+  {
+    NodePtr elementProbe = subscriptNode(nameNode(listName, range),
+                                         intConstant(0, range), range);
+    std::optional<NodePtr> keyProbe = keyExprFor(elementProbe);
+    if (!keyProbe)
+      return std::nullopt;
+    mlir::Type elementType =
+        types.widenLiteral(types.inferExpr(elementProbe.get()));
+    mlir::Type keyType =
+        types.widenLiteral(types.inferExpr(keyProbe->get()));
+    if (!elementType || !keyType) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, anchor.range.start,
+          "cannot infer the sort key type for this iterable"});
+      return std::nullopt;
+    }
+    // bindSymbol, not bindLocalSymbol: at module scope there is no local
+    // scope stack, and the serial-unique names cannot collide.
+    types.bindSymbol(keyTypeName, keyType);
+    types.bindSymbol(elementTypeName, elementType);
+  }
+  auto emitTypedEmptyList = [&](const std::string &name,
+                                NodePtr annotation) {
+    NodePtr emptyList = parser::makeNode("List", range);
+    parser::addField(*emptyList, "elts", std::vector<NodePtr>{});
+    NodePtr annAssign = parser::makeNode("AnnAssign", range);
+    parser::addField(*annAssign, "target", nameNode(name, range));
+    parser::addField(*annAssign, "annotation", std::move(annotation));
+    parser::addField(*annAssign, "value", std::move(emptyList));
+    parser::addField(*annAssign, "simple", std::int64_t{1});
+    emitStatement(*annAssign);
+  };
+
+  // Statement-level decoration (comprehensions would need the strict
+  // inference to type the pairs, and a may-raise key call inside a
+  // comprehension trips the range-iterator unwind bookkeeping):
+  //   __ps: list[tuple[K, int]] = []; __i = 0
+  //   while __i < __n: __ps.append((KEY(__lst[__i]), IDX)); __i += 1
+  {
+    emitTypedEmptyList(
+        pairsName,
+        subscriptNode(nameNode("list", range),
+                      subscriptNode(nameNode("tuple", range),
+                                    tupleNode({nameNode(keyTypeName, range),
+                                               nameNode("int", range)},
+                                              range),
+                                    range),
+                      range));
+    emitStatement(*assignNode(nameNode(indexName, range),
+                              intConstant(0, range), range));
+    NodePtr decoratedIndex =
+        reverse ? binOpNode(binOpNode(nameNode(lengthName, range), "Sub",
+                                      intConstant(1, range), range),
+                            "Sub", nameNode(indexName, range), range)
+                : binOpNode(nameNode(indexName, range), "Add",
+                            intConstant(0, range), range);
+    std::optional<NodePtr> keyExpr = keyExprFor(subscriptNode(
+        nameNode(listName, range), nameNode(indexName, range), range));
+    if (!keyExpr)
+      return std::nullopt;
+    NodePtr appendStatement = parser::makeNode("Expr", range);
+    parser::addField(
+        *appendStatement, "value",
+        methodCallNode(nameNode(pairsName, range), "append",
+                       {tupleNode({std::move(*keyExpr),
+                                   std::move(decoratedIndex)},
+                                  range)},
+                       range));
+    std::vector<NodePtr> loopBody;
+    loopBody.push_back(std::move(appendStatement));
+    loopBody.push_back(assignNode(
+        nameNode(indexName, range),
+        binOpNode(nameNode(indexName, range), "Add", intConstant(1, range),
+                  range),
+        range));
+    emitWhile(*whileNode(compareNode(nameNode(indexName, range), "Lt",
+                                     nameNode(lengthName, range), range),
+                         std::move(loopBody), {}, range));
+  }
+  {
+    NodePtr sortStatement = parser::makeNode("Expr", range);
+    parser::addField(*sortStatement, "value",
+                     methodCallNode(nameNode(pairsName, range), "sort", {},
+                                    range));
+    emitStatement(*sortStatement);
+  }
+
+  // Undecorate by index. reverse=True walks the sorted pairs BACKWARD (the
+  // decorated indices were reversed, so backward emission both restores the
+  // descending key order and lands equal keys in original order — no
+  // list.reverse() call, no iterator over the pairs).
+  //   __out = []; __q = 0|__n
+  //   while ...: __out.append(__lst[<undecorated __ps[__q][1]>])
+  std::string outName = scratch("out");
+  std::string cursorName = scratch("q");
+  {
+    emitTypedEmptyList(outName,
+                       subscriptNode(nameNode("list", range),
+                                     nameNode(elementTypeName, range),
+                                     range));
+    emitStatement(*assignNode(nameNode(cursorName, range),
+                              reverse ? nameNode(lengthName, range)
+                                      : intConstant(0, range),
+                              range));
+    NodePtr storedIndex = subscriptNode(
+        subscriptNode(nameNode(pairsName, range), nameNode(cursorName, range),
+                      range),
+        intConstant(1, range), range);
+    NodePtr sourceIndex =
+        reverse ? binOpNode(binOpNode(nameNode(lengthName, range), "Sub",
+                                      intConstant(1, range), range),
+                            "Sub", std::move(storedIndex), range)
+                : std::move(storedIndex);
+    NodePtr appendStatement = parser::makeNode("Expr", range);
+    parser::addField(
+        *appendStatement, "value",
+        methodCallNode(nameNode(outName, range), "append",
+                       {subscriptNode(nameNode(listName, range),
+                                      std::move(sourceIndex), range)},
+                       range));
+    std::vector<NodePtr> body;
+    if (reverse) {
+      body.push_back(assignNode(
+          nameNode(cursorName, range),
+          binOpNode(nameNode(cursorName, range), "Sub",
+                    intConstant(1, range), range),
+          range));
+      body.push_back(std::move(appendStatement));
+      emitWhile(*whileNode(compareNode(nameNode(cursorName, range), "Gt",
+                                       intConstant(0, range), range),
+                           std::move(body), {}, range));
+    } else {
+      body.push_back(std::move(appendStatement));
+      body.push_back(assignNode(
+          nameNode(cursorName, range),
+          binOpNode(nameNode(cursorName, range), "Add",
+                    intConstant(1, range), range),
+          range));
+      emitWhile(*whileNode(compareNode(nameNode(cursorName, range), "Lt",
+                                       nameNode(lengthName, range), range),
+                           std::move(body), {}, range));
+    }
+  }
+  return outName;
+}
+
+std::optional<Value>
+ModuleEmitter::tryEmitSortSugar(const parser::Node &expr,
+                                const parser::Node *calleeNode) {
+  if (!calleeNode)
+    return std::nullopt;
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  if (!keywords || keywords->empty())
+    return std::nullopt; // keyword-less forms keep their native paths
+  const auto *args = ast::nodeList(expr, "args");
+
+  // NOTE: sorted IS a manifest free function (types.lookupSymbol resolves
+  // it), so only user shadowing disables the sugar.
+  bool isSorted = calleeNode->kind == "Name" &&
+                  ast::nameSpelling(*calleeNode) == "sorted" &&
+                  !values.count("sorted") && !genericFunctions.count("sorted") &&
+                  !types.lookupClass("sorted");
+  bool isListSort = false;
+  NodePtr receiver;
+  if (!isSorted && calleeNode->kind == "Attribute" &&
+      ast::string(*calleeNode, "attr").value_or("") == "sort") {
+    const parser::Field *receiverField =
+        parser::findField(*calleeNode, "value");
+    if (receiverField &&
+        std::holds_alternative<NodePtr>(receiverField->value)) {
+      receiver = std::get<NodePtr>(receiverField->value);
+      if (receiver) {
+        auto contract = mlir::dyn_cast_if_present<py::ContractType>(
+            types.widenLiteral(types.inferExpr(receiver.get())));
+        isListSort =
+            contract && contract.getContractName() == "builtins.list";
+      }
+    }
+  }
+  if (!isSorted && !isListSort)
+    return std::nullopt;
+
+  auto rejectSort = [&](llvm::StringRef reason) -> std::optional<Value> {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start, std::string(reason)});
+    return emitNone(expr);
+  };
+  if (isSorted && (!args || args->size() != 1))
+    return rejectSort("sorted() takes exactly one iterable plus keyword "
+                      "arguments");
+  if (isListSort && args && !args->empty())
+    return rejectSort("list.sort() takes keyword arguments only");
+
+  LazyCallable key;
+  bool hasKey = false;
+  bool reverse = false;
+  for (const NodePtr &keyword : *keywords) {
+    if (!keyword)
+      return std::nullopt;
+    auto name = ast::string(*keyword, "arg");
+    const parser::Field *valueField = parser::findField(*keyword, "value");
+    if (!name || !valueField ||
+        !std::holds_alternative<NodePtr>(valueField->value))
+      return rejectSort("sort()/sorted() keyword arguments must be key= and "
+                        "reverse=");
+    NodePtr value = std::get<NodePtr>(valueField->value);
+    if (*name == "key") {
+      if (value && value->kind == "Constant" &&
+          ast::isNoneField(*value, "value"))
+        continue; // key=None is the default
+      if (!lazyCallableParts(expr, value, key))
+        return emitNone(expr);
+      hasKey = true;
+    } else if (*name == "reverse") {
+      if (!value || value->kind != "Constant" ||
+          !ast::boolean(*value, "value").has_value())
+        return rejectSort("sort()/sorted() reverse= must be a literal bool "
+                          "(a runtime flag would need both orderings "
+                          "compiled)");
+      reverse = *ast::boolean(*value, "value");
+    } else {
+      return rejectSort("sort()/sorted() got an unexpected keyword argument");
+    }
+  }
+
+  unsigned serial = ++listCompCounter;
+  NodePtr source = isSorted ? (*args)[0] : receiver;
+  llvm::SmallVector<std::string, 8> scratchNames;
+  for (const std::string &param : key.lambdaParams)
+    scratchNames.push_back(param);
+  std::optional<Value> result;
+  runWithScratchNames(scratchNames, [&] {
+    // scratchNames grows inside emitDsuSortStatements; capture the rest via
+    // a second scope.
+    llvm::SmallVector<std::string, 8> innerNames;
+    std::optional<std::string> outName = emitDsuSortStatements(
+        expr, source, hasKey ? &key : nullptr, reverse, serial, innerNames);
+    runWithScratchNames(innerNames, [&] {
+      if (!outName) {
+        result = emitNone(expr);
+        return;
+      }
+      if (isSorted) {
+        auto bound = values.find(*outName);
+        result = bound != values.end() && bound->second.value
+                     ? std::optional<Value>(bound->second)
+                     : std::nullopt;
+        if (!result)
+          result = emitNone(expr);
+        return;
+      }
+      // list.sort(): write the permutation back in place through
+      // clear+extend (loop-free: a per-element setitem loop followed by a
+      // later may-raise use trips the unwind release placement).
+      parser::SourceRange range = expr.range;
+      NodePtr clearStatement = parser::makeNode("Expr", range);
+      parser::addField(*clearStatement, "value",
+                       methodCallNode(receiver, "clear", {}, range));
+      emitStatement(*clearStatement);
+      NodePtr extendStatement = parser::makeNode("Expr", range);
+      parser::addField(
+          *extendStatement, "value",
+          methodCallNode(receiver, "extend", {nameNode(*outName, range)},
+                         range));
+      emitStatement(*extendStatement);
+      result = emitNone(expr);
+    });
+  });
+  // The DSU scratch locals leak out of the inner scope restore only if the
+  // outer lambda captured stale entries; nothing else to do here.
+  return result;
+}
+
 // `x in d.keys()` is key membership; `v in d.values()` scans the values;
 // `(k, v) in d.items()` is key membership plus value equality. The views
 // have no runtime object, so the comparison rewrites against the dict
