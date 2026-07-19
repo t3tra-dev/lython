@@ -764,7 +764,10 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
             return {};
           llvm::StringRef name = contract.getContractName();
           if (name == "builtins.int" || name == "builtins.str" ||
-              name == "builtins.bool" || name == "builtins.float")
+              name == "builtins.bool" || name == "builtins.float" ||
+              name == "builtins.tuple" || name == "builtins.list" ||
+              name == "builtins.dict" || name == "builtins.set" ||
+              name == "builtins.frozenset" || name == "builtins.bytes")
             return widened;
           return {};
         };
@@ -1170,6 +1173,32 @@ void ModuleEmitter::emitTryStar(const parser::Node &statement) {
         "return/break/continue inside a try with except* is not implemented "
         "yet"});
     return;
+  }
+  // The star-frame regions run in isolated emitter scopes (unlike plain
+  // try/except there are no post-carried result lanes yet), so a rebind of a
+  // pre-existing local inside the body or a clause would silently revert
+  // after the statement. Reject it loudly instead of mis-executing; fresh
+  // names created inside are unaffected (a later outside read of one already
+  // fails as unresolved).
+  {
+    llvm::StringSet<> rebound;
+    collectAssignedNames(ast::nodeList(statement, "body"), rebound);
+    if (handlers)
+      for (const parser::NodePtr &handlerPtr : *handlers)
+        if (handlerPtr)
+          collectAssignedNames(ast::nodeList(*handlerPtr, "body"), rebound);
+    for (const auto &entry : rebound) {
+      llvm::StringRef name = entry.getKey();
+      if (values.find(std::string(name)) == values.end())
+        continue;
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, statement.range.start,
+          "assignment to local '" + name.str() +
+              "' inside try/except* is not implemented yet (the value would "
+              "not survive past the statement); bind a new name inside the "
+              "clause or restructure without except*"});
+      return;
+    }
   }
 
   struct StarHandler {
