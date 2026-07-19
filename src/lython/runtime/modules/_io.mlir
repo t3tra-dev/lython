@@ -833,7 +833,10 @@ module attributes {
   }
 
   // ---- StringIO (class id 68) ----
-  func.func @LyStringIO_New(%class_id: i64 {ly.runtime.class_id_argument}) -> memref<8xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 68 : i64, ly.runtime.contract = "_io.StringIO", ly.runtime.initializer = "__new__"} {
+  // 73, not 68: 68 belongs to builtins.GeneratorExit in the exception
+  // taxonomy (ExceptionTaxonomy.h), and the dynamic-id repr path resolves
+  // class names through that table, so reusing it would mislabel StringIO.
+  func.func @LyStringIO_New(%class_id: i64 {ly.runtime.class_id_argument}) -> memref<8xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 73 : i64, ly.runtime.contract = "_io.StringIO", ly.runtime.initializer = "__new__"} {
     %self = func.call @__ly_membuf_new(%class_id) : (i64) -> memref<8xi64>
     func.return %self : memref<8xi64>
   }
