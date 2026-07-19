@@ -1570,12 +1570,14 @@ Value ModuleEmitter::emitSuperExceptionInit(const parser::Node &expr,
         "exception __init__ supports at most one message argument yet"});
     return emitNone(expr);
   }
-  // Inference runs against the receiver type: the protocol table resolves
-  // __init__ through the class's bases anyway, and the evidence verifier
-  // checks the selected contract against the receiver.
-  (void)baseContract;
+  // Inference runs against the TAXONOMY ANCESTOR, not the receiver: the
+  // receiver's own class table would match the class's OWN __init__ (the
+  // method this super() call sits inside) when the argument shapes happen to
+  // coincide, and misses entirely when they don't (a user exception whose
+  // __init__ takes non-str parameters resolved no manifest __init__ at all).
+  mlir::Type ancestorType = types.contract(baseContract);
   CallInferenceResult inference = types.inferMethodCallWithEvidence(
-      receiver.type, "__init__", positionalTypes);
+      ancestorType, "__init__", positionalTypes);
   if (!requireStaticEvidence(expr, inference))
     return emitNone(expr);
   Value posPack = emitPack(positional);

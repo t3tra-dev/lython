@@ -600,6 +600,36 @@ mlir::LogicalResult verifyManifestCandidate(mlir::Operation *op,
         callableMatchesCandidate(selected, candidate.method.signature, op))
       return mlir::success();
 
+  // Exception-ancestor routing: a user exception class (a SOURCE class whose
+  // MRO reaches a manifest base) has no manifest candidates of its own, but
+  // shares the runtime exception object's shape, so a contract selected
+  // against its nearest MANIFEST ancestor (super().__init__ resolving to the
+  // taxonomy's BaseException __init__) is valid for the receiver too.
+  if (auto contract = mlir::dyn_cast<ContractType>(*receiver)) {
+    if (py::ClassOp classOp =
+            type_object::lookup(op, contract.getContractName())) {
+      if (auto mroNames = classOp->getAttrOfType<mlir::ArrayAttr>("mro_names")) {
+        for (mlir::Attribute attr : llvm::drop_begin(mroNames.getValue())) {
+          auto name = mlir::dyn_cast<mlir::StringAttr>(attr);
+          if (!name)
+            continue;
+          if (type_object::lookup(op, name.getValue()))
+            continue; // source base: keep walking to the manifest ancestor
+          mlir::Type ancestor =
+              ContractType::get(op->getContext(), name.getValue());
+          for (const protocols::ContractResolution &candidate :
+               table.methodContractCandidatesWithEvidence(ancestor,
+                                                          *methodName))
+            if (callableEvidenceSame(selected, candidate.method.signature) ||
+                callableMatchesCandidate(selected, candidate.method.signature,
+                                         op))
+              return mlir::success();
+          break; // only the nearest manifest ancestor participates
+        }
+      }
+    }
+  }
+
   // Field-record constructor: a SOURCE class accepts its declared fields
   // positionally (all optional) when no source __init__ exists. The
   // synthesized contract validates against the py.class field schema instead
