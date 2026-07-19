@@ -1,0 +1,5 @@
+Traceback\ \(most\ recent\ call\ last\):
+\ \ File\ ".*cross_userkey_keyerror\.py",\ line\ 24,\ in\ <module>
+\ \ \ \ print\(d\[Key\("missing"\)\]\)
+\ \ \ \ \ \ \ \ \ \ \~\^\^\^\^\^\^\^\^\^\^\^\^\^\^\^\^
+KeyError:\ Key\('missing'\)

@@ -1,0 +1,11 @@
+plain failure
+plain failure
+AppError('plain failure')
+('plain failure',)
+code 7: disk full
+code 7: disk full
+CodedError('code 7: disk full')
+('code 7: disk full',)
+
+AppError()
+()

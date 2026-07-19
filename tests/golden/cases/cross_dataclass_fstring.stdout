@@ -1,0 +1,5 @@
+Point(x=3, y=4)
+(3, 4)
+    3;    4
+repr=Point(x=3, y=4) plain=(3, 4) spec=003;004
+True False
