@@ -659,6 +659,164 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
     return mlir::success();
   }
 
+  // ExceptionGroup(message, [members...]): the member sequence becomes the
+  // exception's extended member block (word 3); the message goes through the
+  // ancestor __init__ below. The gate is static — CPython's construction-time
+  // TypeError/ValueError (non-exception member, empty sequence) surface as
+  // compile diagnostics here, and an unsupported second argument is rejected
+  // instead of falling into the unused-source drop.
+  std::string initContract = runtimeContractName(op.getInstance().getType());
+  bool groupInit = *methodName == "__init__" &&
+                   (initContract == "builtins.ExceptionGroup" ||
+                    initContract == "builtins.BaseExceptionGroup");
+  if (groupInit && sources.size() > 3)
+    return op.emitError() << initContract
+                          << " takes exactly two arguments (message, "
+                             "exceptions)";
+  if (groupInit && sources.size() == 3) {
+    if (mlir::failed(requireEmptyAggregate(op, op.getKwnames(), "kw names")) ||
+        mlir::failed(requireEmptyAggregate(op, op.getKwvalues(), "kw values")))
+      return mlir::failure();
+    const RuntimeBundle *memberSequence = sources[2];
+    if (!memberSequence)
+      return op.emitError() << initContract
+                            << " member sequence has no lowered bundle";
+    struct GroupMember {
+      mlir::Type contract;
+      llvm::SmallVector<mlir::Value, 4> values;
+    };
+    llvm::SmallVector<GroupMember, 8> groupMembers;
+    if (!memberSequence->sequenceElementBundles.empty()) {
+      for (const std::shared_ptr<RuntimeBundle> &element :
+           memberSequence->sequenceElementBundles) {
+        if (!element)
+          return op.emitError()
+                 << initContract << " member has no lowered bundle";
+        groupMembers.push_back(GroupMember{
+            element->objectValue.contract,
+            llvm::SmallVector<mlir::Value, 4>(
+                element->physicalValues().begin(),
+                element->physicalValues().end())});
+      }
+    } else {
+      for (const RuntimeValue &element : memberSequence->sequenceElements)
+        groupMembers.push_back(GroupMember{
+            element.contract,
+            llvm::SmallVector<mlir::Value, 4>(element.values.begin(),
+                                              element.values.end())});
+    }
+    if (groupMembers.empty())
+      return op.emitError()
+             << initContract
+             << " requires a statically-known, non-empty exception sequence "
+                "as its second argument";
+    mlir::Type requiredBase = runtimeContractType(
+        context, initContract == "builtins.ExceptionGroup"
+                     ? "builtins.Exception"
+                     : "builtins.BaseException");
+    for (auto [memberIndex, member] : llvm::enumerate(groupMembers)) {
+      bool exceptionShaped =
+          member.values.size() == 3 &&
+          (manifest.classId(runtimeContractName(member.contract)) ||
+           RuntimeBundleLowerer::exceptionAncestorContractFor(member.contract));
+      if (!exceptionShaped || !py::isAssignableTo(member.contract,
+                                                  requiredBase, op))
+        return op.emitError()
+               << initContract << " member " << memberIndex << " has type "
+               << member.contract << ", which is not derived from "
+               << requiredBase;
+    }
+
+    std::optional<EmittedRuntimeCall> messageInit;
+    llvm::SmallVector<const RuntimeBundle *, 2> messageSources{instance,
+                                                               sources[1]};
+    if (mlir::failed(emitManifestMethodCall(op, *instance, *methodName,
+                                            messageSources,
+                                            /*allowUnusedSources=*/true,
+                                            messageInit)))
+      return mlir::failure();
+    RuntimeBundle updatedInstance = *instance;
+    if (messageInit->call.getNumResults() != 0 &&
+        mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
+            op, op.getInstance().getType(), messageInit->call,
+            updatedInstance)))
+      return mlir::failure();
+
+    std::optional<RuntimeSymbol> membersAlloc =
+        manifest.primitive(initContract, "members_alloc");
+    if (!membersAlloc)
+      membersAlloc =
+          manifest.primitive("builtins.BaseExceptionGroup", "members_alloc");
+    std::optional<RuntimeSymbol> memberStore =
+        manifest.primitive(initContract, "member_store");
+    if (!memberStore)
+      memberStore =
+          manifest.primitive("builtins.BaseExceptionGroup", "member_store");
+    if (!membersAlloc || !memberStore)
+      return op.emitError() << "runtime manifest has no ExceptionGroup member "
+                               "block primitives";
+
+    builder.setInsertionPoint(op);
+    mlir::Location loc = op.getLoc();
+    auto adaptOperand = [&](mlir::Value value, mlir::Type want) -> mlir::Value {
+      if (value.getType() == want)
+        return value;
+      return mlir::memref::CastOp::create(builder, loc, want, value)
+          .getResult();
+    };
+    llvm::ArrayRef<mlir::Type> allocInputs =
+        membersAlloc->function.getFunctionType().getInputs();
+    if (allocInputs.size() != 4 ||
+        updatedInstance.physicalValues().size() != 3)
+      return op.emitError() << "ExceptionGroup members_alloc ABI mismatch";
+    mlir::Value memberCount =
+        mlir::arith::ConstantIntOp::create(
+            builder, loc, static_cast<std::int64_t>(groupMembers.size()), 64)
+            .getResult();
+    llvm::SmallVector<mlir::Value, 4> allocOperands;
+    for (unsigned index = 0; index < 3; ++index)
+      allocOperands.push_back(adaptOperand(
+          updatedInstance.physicalValues()[index], allocInputs[index]));
+    allocOperands.push_back(memberCount);
+    mlir::func::CallOp allocCall = RuntimeBundleLowerer::createRuntimeCall(
+        loc, *membersAlloc, allocOperands);
+    if (allocCall.getNumResults() != 1)
+      return op.emitError() << "ExceptionGroup members_alloc must return the "
+                               "block word";
+    mlir::Value blockWord = allocCall.getResult(0);
+    llvm::ArrayRef<mlir::Type> storeInputs =
+        memberStore->function.getFunctionType().getInputs();
+    if (storeInputs.size() != 5)
+      return op.emitError() << "ExceptionGroup member_store ABI mismatch";
+    for (auto [memberIndex, member] : llvm::enumerate(groupMembers)) {
+      mlir::Value slot =
+          mlir::arith::ConstantIntOp::create(
+              builder, loc, static_cast<std::int64_t>(memberIndex), 64)
+              .getResult();
+      llvm::SmallVector<mlir::Value, 8> storeOperands{blockWord, slot};
+      for (unsigned index = 0; index < 3; ++index)
+        storeOperands.push_back(
+            adaptOperand(member.values[index], storeInputs[index + 2]));
+      RuntimeBundleLowerer::createRuntimeCall(loc, *memberStore,
+                                              storeOperands);
+    }
+    // A materialized member sequence must stay alive until every member has
+    // been retained into the block — without a use here the refcount pass
+    // releases the sequence (and the member references it owns) right after
+    // its construction, before the stores above run.
+    if (!memberSequence->physicalValues().empty() &&
+        mlir::failed(pinContainerLiveness(op, *memberSequence)))
+      return mlir::failure();
+
+    valueBundles[op.getInstance()] = std::move(updatedInstance);
+    if (mlir::failed(assignObjectBundle(
+            op, op.getResult(), runtimeContractType(context, "types.NoneType"),
+            mlir::ValueRange{})))
+      return mlir::failure();
+    erase.push_back(op);
+    return mlir::success();
+  }
+
   std::optional<EmittedRuntimeCall> emitted;
   if (mlir::failed(requireEmptyAggregate(op, op.getKwnames(), "kw names")) ||
       mlir::failed(requireEmptyAggregate(op, op.getKwvalues(), "kw values")))

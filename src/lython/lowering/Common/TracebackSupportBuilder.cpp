@@ -579,6 +579,8 @@ void buildReleaseChainNode(SupportBuilder &b) {
                                  mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(freePayload);
+  b.call("release_exception_extras", mlir::TypeRange{},
+         mlir::ValueRange{headerWord});
   b.call("release_unicode_raw", mlir::TypeRange{},
          mlir::ValueRange{b.loadI64(nodeSlot(b, node, 7)),
                           b.loadI64(nodeSlot(b, node, 12))});
