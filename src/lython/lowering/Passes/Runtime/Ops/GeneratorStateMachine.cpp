@@ -303,6 +303,16 @@ mlir::LogicalResult RuntimeBundleLowerer::appendGeneratorLaneReturnOperands(
            << "generator control lanes do not take object return operands";
   if (lane.isNone)
     return mlir::success();
+  // An element rooted as an owned local (retainEvidenceElement's borrow →
+  // own marker, e.g. `yield xs[i]` over a runtime sequence) already holds
+  // its own token: the lane transfers THAT token, so retaining again here
+  // would leave one increment nobody releases.
+  bool ownedLocalRoot = false;
+  if (!bundle.physicalValues().empty())
+    if (mlir::Operation *rootDef =
+            bundle.physicalValues().front().getDefiningOp())
+      ownedLocalRoot = mlir::isa<mlir::UnrealizedConversionCastOp>(rootDef) &&
+                       rootDef->hasAttr(ownership::kOwnedLocalObjectAttr);
 
   bool bundleIsNone = bundle.contractName() == "types.NoneType";
   if (bundleIsNone) {
@@ -327,7 +337,8 @@ mlir::LogicalResult RuntimeBundleLowerer::appendGeneratorLaneReturnOperands(
                << " physical values, but the lane ABI expects "
                << lane.physicalCount;
       if ((forceRetain ||
-           bundle.objectValue.ownership != ownership::OwnershipKind::Own) &&
+           (bundle.objectValue.ownership != ownership::OwnershipKind::Own &&
+            !ownedLocalRoot)) &&
           mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
               op, bundle, "generator yield lane")))
         return mlir::failure();
@@ -393,7 +404,8 @@ mlir::LogicalResult RuntimeBundleLowerer::appendGeneratorLaneReturnOperands(
                           << " physical values, but the lane ABI expects "
                           << lane.physicalCount;
   if ((forceRetain ||
-       bundle.objectValue.ownership != ownership::OwnershipKind::Own) &&
+       (bundle.objectValue.ownership != ownership::OwnershipKind::Own &&
+        !ownedLocalRoot)) &&
       mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
           op, bundle, "generator yield lane")))
     return mlir::failure();
@@ -409,19 +421,121 @@ unsigned RuntimeBundleLowerer::generatorLaneFrameWords(
   return (lane.isInt ? 2 : 0) + 2 * lane.physicalCount;
 }
 
-// Storage layout: header words 0..7, then one (raw, valid) pair per
-// generator argument (stored at creation so the drop finalizer can resume
-// the body without call-site evidence), then the frame lanes.
+// Storage layout: header words 0..7, then the argument words (stored at
+// creation so the drop finalizer can resume the body without call-site
+// evidence: a (raw, valid) pair per int argument, box words per object
+// argument), then the frame lanes.
+unsigned RuntimeBundleLowerer::generatorArgumentFrameWords(
+    const GeneratorResumeLane &lane) const {
+  return lane.isInt ? 2 : 2 * lane.physicalCount;
+}
+
+llvm::SmallVector<unsigned, 8>
+RuntimeBundleLowerer::generatorArgumentWordOffsets(
+    const GeneratorResumeInfo &info) const {
+  llvm::SmallVector<unsigned, 8> offsets;
+  unsigned word = kGeneratorFrameSlotBase;
+  if (info.argumentLanes.empty()) {
+    // Legacy int-tier info without lanes: pairs.
+    for (unsigned index = 0; index < info.argumentCount; ++index) {
+      offsets.push_back(word);
+      word += 2;
+    }
+    return offsets;
+  }
+  for (const GeneratorResumeLane &lane : info.argumentLanes) {
+    offsets.push_back(word);
+    word += RuntimeBundleLowerer::generatorArgumentFrameWords(lane);
+  }
+  return offsets;
+}
+
 llvm::SmallVector<unsigned, 8>
 RuntimeBundleLowerer::generatorFrameLaneWordOffsets(
     const GeneratorResumeInfo &info) const {
   llvm::SmallVector<unsigned, 8> offsets;
-  unsigned frameWord = kGeneratorFrameSlotBase + 2 * info.argumentCount;
+  unsigned frameWord = kGeneratorFrameSlotBase;
+  if (info.argumentLanes.empty()) {
+    frameWord += 2 * info.argumentCount;
+  } else {
+    for (const GeneratorResumeLane &lane : info.argumentLanes)
+      frameWord += RuntimeBundleLowerer::generatorArgumentFrameWords(lane);
+  }
   for (const GeneratorResumeLane &lane : info.frameLanes) {
     offsets.push_back(frameWord);
     frameWord += RuntimeBundleLowerer::generatorLaneFrameWords(lane);
   }
   return offsets;
+}
+
+llvm::SmallVector<mlir::Type, 6>
+RuntimeBundleLowerer::generatorArgumentPhysicalTypes(
+    const GeneratorResumeLane &lane) const {
+  llvm::SmallVector<mlir::Type, 6> types;
+  if (lane.isInt || lane.isControl()) {
+    types.push_back(mlir::IntegerType::get(context, 64));
+    types.push_back(mlir::IntegerType::get(context, 1));
+    return types;
+  }
+  if (const RuntimeValueShape *shape = manifest.valueShape(lane.contract))
+    types.append(shape->valueTypes.begin(), shape->valueTypes.end());
+  return types;
+}
+
+unsigned RuntimeBundleLowerer::generatorArgumentPhysicalCount(
+    const GeneratorResumeInfo &info) const {
+  if (info.argumentLanes.empty())
+    return 2 * info.argumentCount;
+  unsigned count = 0;
+  for (const GeneratorResumeLane &lane : info.argumentLanes)
+    count += static_cast<unsigned>(
+        RuntimeBundleLowerer::generatorArgumentPhysicalTypes(lane).size());
+  return count;
+}
+
+void RuntimeBundleLowerer::appendGeneratorArgumentEntryOperands(
+    mlir::Block *entry, const GeneratorResumeInfo &info,
+    llvm::SmallVectorImpl<mlir::Value> &operands) const {
+  unsigned physical = RuntimeBundleLowerer::generatorArgumentPhysicalCount(info);
+  for (unsigned index = 0; index < physical; ++index)
+    operands.push_back(entry->getArgument(1 + index));
+}
+
+// Resume-site argument operands from the creation-site evidence: int lanes
+// keep the primitive pair, object lanes borrow their physical span (the
+// generator's own retained reference keeps the object alive between
+// resumes, so the span is valid whenever the generator is).
+mlir::LogicalResult RuntimeBundleLowerer::appendGeneratorArgumentOperands(
+    mlir::Operation *op, const GeneratorResumeInfo &info,
+    llvm::ArrayRef<std::shared_ptr<RuntimeBundle>> sources,
+    llvm::SmallVectorImpl<mlir::Value> &operands) {
+  if (sources.size() != info.argumentCount)
+    return op->emitError()
+           << "generator frame source count does not match the resume clone";
+  for (auto [index, source] : llvm::enumerate(sources)) {
+    if (!source)
+      return op->emitError() << "generator frame source " << index
+                             << " has no lowered bundle";
+    const GeneratorResumeLane *lane = index < info.argumentLanes.size()
+                                          ? &info.argumentLanes[index]
+                                          : nullptr;
+    if (!lane || lane->isInt || lane->isControl()) {
+      if (!source->primitiveI64)
+        return op->emitError() << "state-machine generator frame sources must "
+                                  "carry primitive int evidence";
+      operands.push_back(source->primitiveI64->value);
+      operands.push_back(source->primitiveI64->valid);
+      continue;
+    }
+    if (source->physicalValues().size() != lane->physicalCount)
+      return op->emitError()
+             << "generator argument " << index << " (" << lane->contract
+             << ") expected " << lane->physicalCount
+             << " physical values, got " << source->physicalValues().size();
+    operands.append(source->physicalValues().begin(),
+                    source->physicalValues().end());
+  }
+  return mlir::success();
 }
 
 namespace {
@@ -633,6 +747,61 @@ RuntimeBundleLowerer::getOrCreateGeneratorFrameLoadFunction(
   return function;
 }
 
+// Borrowing argument load for the drop finalizer: reconstructs the span
+// from the argument words WITHOUT zeroing them and WITHOUT an ownership
+// contract — the generator's creation-time reference stays where it is
+// until the finalizer's release pass drops it.
+mlir::FailureOr<mlir::func::FuncOp>
+RuntimeBundleLowerer::getOrCreateGeneratorArgumentLoadFunction(
+    mlir::Operation *op, const GeneratorResumeLane &lane) {
+  std::string name = "__ly_generator_arg_load_" +
+                     generatorLaneSymbolComponent(lane.contract);
+  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(name))
+    return existing;
+  mlir::OpBuilder::InsertionGuard guard(builder);
+  mlir::Location loc = op->getLoc();
+  mlir::Type i64 = builder.getI64Type();
+  llvm::SmallVector<mlir::Type, 6> laneTypes =
+      RuntimeBundleLowerer::generatorArgumentPhysicalTypes(lane);
+  builder.setInsertionPointToEnd(module.getBody());
+  auto function = mlir::func::FuncOp::create(
+      builder, loc, name,
+      builder.getFunctionType({generatorStorageType(builder), i64},
+                              laneTypes));
+  function.setPrivate();
+
+  mlir::Block *entry = function.addEntryBlock();
+  builder.setInsertionPointToStart(entry);
+  mlir::Value storage = entry->getArgument(0);
+  mlir::Value base = entry->getArgument(1);
+  auto wordIndex = [&](unsigned offset) -> mlir::Value {
+    mlir::Value word = mlir::arith::AddIOp::create(
+        builder, loc, base,
+        mlir::arith::ConstantIntOp::create(builder, loc, offset, 64)
+            .getResult());
+    return mlir::arith::IndexCastOp::create(builder, loc,
+                                            builder.getIndexType(), word)
+        .getResult();
+  };
+  llvm::SmallVector<mlir::Value, 6> results;
+  unsigned word = 0;
+  for (unsigned part = 0; part < lane.physicalCount; ++part) {
+    mlir::Value pointerWord =
+        mlir::memref::LoadOp::create(builder, loc, storage, wordIndex(word))
+            .getResult();
+    mlir::Value sizeWord =
+        mlir::memref::LoadOp::create(builder, loc, storage,
+                                     wordIndex(word + 1))
+            .getResult();
+    results.push_back(RuntimeBundleLowerer::memrefFromBoxWords(
+        builder, loc, pointerWord, sizeWord,
+        mlir::cast<mlir::MemRefType>(laneTypes[part])));
+    word += 2;
+  }
+  mlir::func::ReturnOp::create(builder, loc, results);
+  return function;
+}
+
 // Entry seeding for the resume clone's mixed lane ABI: control lanes get
 // raw (i64, i1) pair arguments and pair-only bundles; frame lanes get their
 // physical span (+ trailing pair for int) and borrowed object bundles — the
@@ -656,6 +825,26 @@ mlir::LogicalResult RuntimeBundleLowerer::seedGeneratorResumeCloneEntry(
     const GeneratorResumeLane *lane = nullptr;
     if (index >= controlCount && index - controlCount < info.frameLanes.size())
       lane = &info.frameLanes[index - controlCount];
+    // Object-contract generator arguments ride their physical span (borrowed:
+    // the resume driver passes them in fresh on every call, backed by the
+    // generator's own creation-time reference). Int arguments stay on the
+    // control pair path below.
+    if (index < info.argumentLanes.size() && !info.argumentLanes[index].isInt &&
+        !info.argumentLanes[index].isControl()) {
+      const GeneratorResumeLane &argumentLane = info.argumentLanes[index];
+      llvm::SmallVector<mlir::Value, 6> physicalArgs;
+      for (mlir::Type laneType :
+           RuntimeBundleLowerer::generatorArgumentPhysicalTypes(argumentLane))
+        physicalArgs.push_back(
+            entry.addArgument(laneType, logicalArg.getLoc()));
+      RuntimeBundle bundle;
+      if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+              function, logicalType, physicalArgs, bundle,
+              /*ownsObject=*/false)))
+        return mlir::failure();
+      valueBundles[logicalArg] = std::move(bundle);
+      continue;
+    }
     if (!lane || lane->isControl()) {
       if (runtimeContractName(logicalType) != "builtins.int")
         return function.emitError()
@@ -742,7 +931,38 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
         callableAttr ? callableAttr.getValue() : mlir::Type());
     if (!callable || callable.hasVararg() || callable.hasKwarg())
       continue;
-    if (!llvm::all_of(callable.getPositionalTypes(), isIntContract))
+    // Arguments: int rides the legacy (i64, i1) evidence pair; any
+    // manifest-shaped object contract rides its physical span (the lazy
+    // iterator desugars pass lists/strs/tuples into synthetic generators).
+    // A parameter with no runtime shape falls back to the legacy tier.
+    llvm::SmallVector<GeneratorResumeLane, 4> argumentLanes;
+    bool argumentsEligible = true;
+    for (mlir::Type positional : callable.getPositionalTypes()) {
+      std::string contract = runtimeContractName(positional);
+      if (contract.empty() || contract == "types.NoneType") {
+        argumentsEligible = false;
+        break;
+      }
+      GeneratorResumeLane lane;
+      lane.contract = contract;
+      lane.isInt = contract == "builtins.int";
+      if (!lane.isInt) {
+        const RuntimeValueShape *shape = manifest.valueShape(contract);
+        // The storage words hold (pointer, size) per part, so every part
+        // must be a rank-1 memref the load can reconstruct.
+        if (!shape || shape->valueTypes.empty() ||
+            !llvm::all_of(shape->valueTypes, [](mlir::Type type) {
+              auto memref = mlir::dyn_cast<mlir::MemRefType>(type);
+              return memref && memref.getRank() == 1;
+            })) {
+          argumentsEligible = false;
+          break;
+        }
+        lane.physicalCount = static_cast<unsigned>(shape->valueTypes.size());
+      }
+      argumentLanes.push_back(lane);
+    }
+    if (!argumentsEligible)
       continue;
 
     std::string cloneName = (body.getSymName() + "__lyrt_gen_resume").str();
@@ -893,8 +1113,9 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
       }
     }
     unsigned frameWidth = static_cast<unsigned>(frameLanes.size());
-    unsigned argumentWords =
-        2 * static_cast<unsigned>(callable.getPositionalTypes().size());
+    unsigned argumentWords = 0;
+    for (const GeneratorResumeLane &lane : argumentLanes)
+      argumentWords += RuntimeBundleLowerer::generatorArgumentFrameWords(lane);
     if (!livesEligible || kGeneratorFrameSlotBase + argumentWords + frameWords >
                               kGeneratorEHStashWordBase) {
       clone.erase();
@@ -944,6 +1165,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
     info.frameWidth = frameWidth;
     info.argumentCount = static_cast<unsigned>(
         callable.getPositionalTypes().size());
+    info.argumentLanes = argumentLanes;
     info.valueLane = *valueLane;
     info.frameLanes = frameLanes;
     generatorResumeClones[body.getSymName().str()] = info;
@@ -1140,8 +1362,13 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeBodies() {
     unsigned logicalCount = controlCount + frameWidth;
     mlir::Block &entryBlock = clone.getBody().front();
     // Per-logical-lane physical widths: control lanes ride the (i64, i1)
-    // pair, frame lanes their physical span (+ pair for int).
+    // pair, object argument lanes and frame lanes their physical span
+    // (+ pair for int frame lanes).
     llvm::SmallVector<unsigned, 16> laneWidths(logicalCount, 2);
+    for (auto [index, lane] : llvm::enumerate(info.argumentLanes))
+      if (!lane.isInt && !lane.isControl())
+        laneWidths[index] = static_cast<unsigned>(
+            RuntimeBundleLowerer::generatorArgumentPhysicalTypes(lane).size());
     for (auto [index, lane] : llvm::enumerate(info.frameLanes))
       laneWidths[controlCount + index] = static_cast<unsigned>(
           RuntimeBundleLowerer::generatorLanePhysicalTypes(lane).size());
@@ -1630,10 +1857,10 @@ RuntimeBundleLowerer::getOrCreateGeneratorStepFunction(
 
   llvm::SmallVector<mlir::Type, 16> inputs;
   inputs.push_back(generatorStorageType(builder));
-  for (unsigned index = 0; index < info.argumentCount; ++index) {
-    inputs.push_back(i64);
-    inputs.push_back(i1);
-  }
+  for (const GeneratorResumeLane &argumentLane : info.argumentLanes)
+    for (mlir::Type argumentType :
+         RuntimeBundleLowerer::generatorArgumentPhysicalTypes(argumentLane))
+      inputs.push_back(argumentType);
   inputs.push_back(i64); // sent
   inputs.push_back(i1);  // sent valid
   inputs.push_back(i64); // inject
@@ -1666,7 +1893,8 @@ RuntimeBundleLowerer::getOrCreateGeneratorStepFunction(
   mlir::Block *entry = function.addEntryBlock();
   mlir::Region &body = function.getBody();
   mlir::Value generator = entry->getArgument(0);
-  unsigned sentValueIndex = 1 + 2 * info.argumentCount;
+  unsigned sentValueIndex =
+      1 + RuntimeBundleLowerer::generatorArgumentPhysicalCount(info);
   builder.setInsertionPointToStart(entry);
   auto slotIndex = [&](std::int64_t slot) {
     return mlir::arith::ConstantIndexOp::create(builder, loc, slot)
@@ -1795,10 +2023,8 @@ RuntimeBundleLowerer::getOrCreateGeneratorStepFunction(
   mlir::Value trueValue =
       mlir::arith::ConstantIntOp::create(builder, loc, 1, 1);
   llvm::SmallVector<mlir::Value, 24> operands;
-  for (unsigned index = 0; index < info.argumentCount; ++index) {
-    operands.push_back(entry->getArgument(1 + 2 * index));
-    operands.push_back(entry->getArgument(2 + 2 * index));
-  }
+  RuntimeBundleLowerer::appendGeneratorArgumentEntryOperands(entry, info,
+                                                             operands);
   operands.push_back(state);
   operands.push_back(trueValue);
   operands.push_back(entry->getArgument(sentValueIndex));
@@ -2122,11 +2348,12 @@ RuntimeBundleLowerer::getOrCreateGeneratorThrowFunction(
 
   llvm::SmallVector<mlir::Type, 16> inputs;
   inputs.push_back(generatorStorageType(builder));
-  for (unsigned index = 0; index < info.argumentCount; ++index) {
-    inputs.push_back(i64);
-    inputs.push_back(i1);
-  }
-  unsigned headerIndex = 1 + 2 * info.argumentCount;
+  for (const GeneratorResumeLane &argumentLane : info.argumentLanes)
+    for (mlir::Type argumentType :
+         RuntimeBundleLowerer::generatorArgumentPhysicalTypes(argumentLane))
+      inputs.push_back(argumentType);
+  unsigned headerIndex =
+      1 + RuntimeBundleLowerer::generatorArgumentPhysicalCount(info);
   inputs.push_back(headerType);
   inputs.push_back(messageType);
   inputs.push_back(bytesType);
@@ -2256,10 +2483,8 @@ RuntimeBundleLowerer::getOrCreateGeneratorThrowFunction(
   builder.setInsertionPointToEnd(resumeCallBlock);
   llvm::SmallVector<mlir::Value, 16> advanceOperands;
   advanceOperands.push_back(generator);
-  for (unsigned index = 0; index < info.argumentCount; ++index) {
-    advanceOperands.push_back(entry->getArgument(1 + 2 * index));
-    advanceOperands.push_back(entry->getArgument(2 + 2 * index));
-  }
+  RuntimeBundleLowerer::appendGeneratorArgumentEntryOperands(entry, info,
+                                                             advanceOperands);
   advanceOperands.push_back(i64Const(0));
   advanceOperands.push_back(constantI1(builder, loc, false));
   advanceOperands.push_back(i64Const(1)); // inject
@@ -2340,10 +2565,10 @@ RuntimeBundleLowerer::getOrCreateGeneratorCloseFunction(
 
   llvm::SmallVector<mlir::Type, 16> inputs;
   inputs.push_back(generatorStorageType(builder));
-  for (unsigned index = 0; index < info.argumentCount; ++index) {
-    inputs.push_back(i64);
-    inputs.push_back(i1);
-  }
+  for (const GeneratorResumeLane &argumentLane : info.argumentLanes)
+    for (mlir::Type argumentType :
+         RuntimeBundleLowerer::generatorArgumentPhysicalTypes(argumentLane))
+      inputs.push_back(argumentType);
   std::string name = info.cloneName + "__close";
   builder.setInsertionPointToEnd(module.getBody());
   auto function = mlir::func::FuncOp::create(
@@ -2460,10 +2685,8 @@ RuntimeBundleLowerer::getOrCreateGeneratorCloseFunction(
   builder.setInsertionPointToEnd(resumeBlock);
   llvm::SmallVector<mlir::Value, 16> stepOperands;
   stepOperands.push_back(generator);
-  for (unsigned index = 0; index < info.argumentCount; ++index) {
-    stepOperands.push_back(entry->getArgument(1 + 2 * index));
-    stepOperands.push_back(entry->getArgument(2 + 2 * index));
-  }
+  RuntimeBundleLowerer::appendGeneratorArgumentEntryOperands(entry, info,
+                                                             stepOperands);
   stepOperands.push_back(i64Const(0));
   stepOperands.push_back(constantI1(builder, loc, false));
   stepOperands.push_back(i64Const(1)); // inject
@@ -2636,18 +2859,42 @@ RuntimeBundleLowerer::getOrCreateGeneratorFinalizeFunction(
   builder.setInsertionPointToEnd(closeBlock);
   llvm::SmallVector<mlir::Value, 10> closeOperands;
   closeOperands.push_back(storage);
+  llvm::SmallVector<unsigned, 8> argumentWordOffsets =
+      RuntimeBundleLowerer::generatorArgumentWordOffsets(info);
   for (unsigned index = 0; index < info.argumentCount; ++index) {
-    mlir::Value raw = mlir::memref::LoadOp::create(
-                          builder, loc, storage, slotIndex(8 + 2 * index))
-                          .getResult();
-    mlir::Value validWord =
-        mlir::memref::LoadOp::create(builder, loc, storage,
-                                     slotIndex(8 + 2 * index + 1))
-            .getResult();
-    mlir::Value valid = mlir::arith::CmpIOp::create(
-        builder, loc, mlir::arith::CmpIPredicate::ne, validWord, i64Const(0));
-    closeOperands.push_back(raw);
-    closeOperands.push_back(valid);
+    const GeneratorResumeLane *argumentLane =
+        index < info.argumentLanes.size() ? &info.argumentLanes[index]
+                                          : nullptr;
+    unsigned base = index < argumentWordOffsets.size()
+                        ? argumentWordOffsets[index]
+                        : 8 + 2 * index;
+    if (!argumentLane || argumentLane->isInt || argumentLane->isControl()) {
+      mlir::Value raw =
+          mlir::memref::LoadOp::create(builder, loc, storage, slotIndex(base))
+              .getResult();
+      mlir::Value validWord =
+          mlir::memref::LoadOp::create(builder, loc, storage,
+                                       slotIndex(base + 1))
+              .getResult();
+      mlir::Value valid = mlir::arith::CmpIOp::create(
+          builder, loc, mlir::arith::CmpIPredicate::ne, validWord,
+          i64Const(0));
+      closeOperands.push_back(raw);
+      closeOperands.push_back(valid);
+      continue;
+    }
+    // Object argument: borrow the span from the storage words (the
+    // generator's creation-time reference stays put until the release pass
+    // below — the close resume must not consume it).
+    mlir::FailureOr<mlir::func::FuncOp> load =
+        RuntimeBundleLowerer::getOrCreateGeneratorArgumentLoadFunction(
+            op, *argumentLane);
+    if (mlir::failed(load))
+      return mlir::failure();
+    mlir::func::CallOp loaded = mlir::func::CallOp::create(
+        builder, loc, *load, mlir::ValueRange{storage, i64Const(base)});
+    closeOperands.append(loaded.getResults().begin(),
+                         loaded.getResults().end());
   }
   mlir::func::CallOp::create(builder, loc, getOrCreateTryCallSiteMarker(),
                              mlir::ValueRange{i64Const(handlerId)});
@@ -2705,6 +2952,44 @@ RuntimeBundleLowerer::getOrCreateGeneratorFinalizeFunction(
         return mlir::failure();
       if (mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
               op, heldBundle, "generator drop frame lane")))
+        return mlir::failure();
+    }
+    builder.setInsertionPointAfter(heldIf);
+  }
+  // Release the object arguments the creation site retained into the frame:
+  // the generator's reference dies with the generator, whichever path
+  // (close, exhausted, never started) reached here.
+  for (auto [index, argumentLane] : llvm::enumerate(info.argumentLanes)) {
+    if (argumentLane.isInt || argumentLane.isControl() ||
+        argumentLane.physicalCount == 0)
+      continue;
+    unsigned base = index < argumentWordOffsets.size()
+                        ? argumentWordOffsets[index]
+                        : kGeneratorFrameSlotBase + 2 * index;
+    mlir::Value headerPtr =
+        mlir::memref::LoadOp::create(builder, loc, storage, slotIndex(base))
+            .getResult();
+    mlir::Value held = mlir::arith::CmpIOp::create(
+        builder, loc, mlir::arith::CmpIPredicate::ne, headerPtr, i64Const(0));
+    auto heldIf = mlir::scf::IfOp::create(builder, loc, held,
+                                          /*withElseRegion=*/false);
+    {
+      mlir::OpBuilder::InsertionGuard heldGuard(builder);
+      builder.setInsertionPoint(heldIf.getThenRegion().front().getTerminator());
+      mlir::FailureOr<mlir::func::FuncOp> load =
+          RuntimeBundleLowerer::getOrCreateGeneratorArgumentLoadFunction(
+              op, argumentLane);
+      if (mlir::failed(load))
+        return mlir::failure();
+      mlir::func::CallOp loaded = mlir::func::CallOp::create(
+          builder, loc, *load, mlir::ValueRange{storage, i64Const(base)});
+      RuntimeBundle heldBundle;
+      if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+              op, runtimeContractType(context, argumentLane.contract),
+              loaded.getResults(), heldBundle, /*ownsObject=*/true)))
+        return mlir::failure();
+      if (mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
+              op, heldBundle, "generator drop argument")))
         return mlir::failure();
     }
     builder.setInsertionPointAfter(heldIf);
@@ -2813,14 +3098,9 @@ RuntimeBundleLowerer::emitStateMachineGeneratorResume(
   mlir::Location loc = op->getLoc();
   llvm::SmallVector<mlir::Value, 16> operands;
   operands.push_back(generator);
-  for (const std::shared_ptr<RuntimeBundle> &source :
-       iterator.generatorSourceBundles) {
-    if (!source || !source->primitiveI64)
-      return op->emitError() << "state-machine generator frame sources must "
-                                "carry primitive int evidence";
-    operands.push_back(source->primitiveI64->value);
-    operands.push_back(source->primitiveI64->valid);
-  }
+  if (mlir::failed(RuntimeBundleLowerer::appendGeneratorArgumentOperands(
+          op, info, iterator.generatorSourceBundles, operands)))
+    return mlir::failure();
   if (sentI64Evidence) {
     operands.push_back(sentI64Evidence->value);
     operands.push_back(sentI64Evidence->valid);
@@ -2891,17 +3171,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStateMachineGeneratorThrow(
   // chain globals when the throw returns normally.
   llvm::SmallVector<mlir::Value, 16> operands;
   operands.push_back(receiver.physicalValues().front());
-  if (receiver.generatorSourceBundles.size() != info.argumentCount)
-    return op.emitError()
-           << "generator frame source count does not match the resume clone";
-  for (const std::shared_ptr<RuntimeBundle> &source :
-       receiver.generatorSourceBundles) {
-    if (!source || !source->primitiveI64)
-      return op.emitError() << "state-machine generator frame sources must "
-                               "carry primitive int evidence";
-    operands.push_back(source->primitiveI64->value);
-    operands.push_back(source->primitiveI64->valid);
-  }
+  if (mlir::failed(RuntimeBundleLowerer::appendGeneratorArgumentOperands(
+          op.getOperation(), info, receiver.generatorSourceBundles, operands)))
+    return mlir::failure();
   for (mlir::Value value : exception.physicalValues())
     operands.push_back(value);
   emitTryCallSiteMarkerIfNeeded(loc);
@@ -2934,17 +3206,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStateMachineGeneratorClose(
   mlir::Location loc = op.getLoc();
   llvm::SmallVector<mlir::Value, 16> operands;
   operands.push_back(receiver.physicalValues().front());
-  if (receiver.generatorSourceBundles.size() != info.argumentCount)
-    return op.emitError()
-           << "generator frame source count does not match the resume clone";
-  for (const std::shared_ptr<RuntimeBundle> &source :
-       receiver.generatorSourceBundles) {
-    if (!source || !source->primitiveI64)
-      return op.emitError() << "state-machine generator frame sources must "
-                               "carry primitive int evidence";
-    operands.push_back(source->primitiveI64->value);
-    operands.push_back(source->primitiveI64->valid);
-  }
+  if (mlir::failed(RuntimeBundleLowerer::appendGeneratorArgumentOperands(
+          op.getOperation(), info, receiver.generatorSourceBundles, operands)))
+    return mlir::failure();
   emitTryCallSiteMarkerIfNeeded(loc);
   mlir::func::CallOp::create(builder, loc, *closeFn, operands);
   if (mlir::failed(assignObjectBundle(

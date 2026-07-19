@@ -1986,10 +1986,11 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
     }
     if (node->kind == "List")
       return listOf(join(elementTypes));
-    // The strict path keeps the historical joined (homogeneous) tuple view;
-    // the lenient path types heterogeneous tuples positionally.
-    return strict ? tupleOf(join(elementTypes))
-                  : tupleOfMembers(*this, elementTypes);
+    // Both paths type heterogeneous tuples positionally: the joined
+    // (homogeneous-union) view made `yield (i, "x")` infer as
+    // tuple[int | str], whose literal-index __getitem__ result is a union
+    // the runtime element rebuild cannot shape.
+    return tupleOfMembers(*this, elementTypes);
   }
   if (node->kind == "Dict") {
     const auto *keys = ast::nodeList(*node, "keys");
