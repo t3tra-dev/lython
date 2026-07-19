@@ -431,6 +431,13 @@ private:
       llvm::ArrayRef<ownership::RuntimeDeallocator> deallocators,
       unsigned depth);
   std::uint64_t collectionInitialCapacity(std::uint64_t arity) const;
+  static bool isMutableContainerContractName(llvm::StringRef contract);
+  static void demoteMutableContainerEvidence(RuntimeBundle &bundle);
+  void demoteMutableContainerEvidenceFor(mlir::Value value);
+  void demoteMutableContainerArgumentEvidence(py::CallOp op);
+  mlir::FailureOr<mlir::Value>
+  rawSequenceIndexValue(mlir::Operation *op, mlir::Value indexValue,
+                        const RuntimeBundle &index);
   mlir::FailureOr<RuntimeBundle>
   materializePayloadObjectBundle(mlir::Operation *op,
                                  const RuntimeBundle &value);

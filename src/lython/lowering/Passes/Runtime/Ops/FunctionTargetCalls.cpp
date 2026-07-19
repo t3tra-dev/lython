@@ -133,6 +133,9 @@ RuntimeBundleLowerer::lowerFunctionTargetCall(py::CallOp op,
           op, target, targetName, *call, sources, result)))
     return mlir::failure();
   valueBundles[op.getResult(0)] = std::move(result);
+  // The callee body is opaque to this walk and receives its container
+  // arguments borrowed: it may have mutated them in place.
+  demoteMutableContainerArgumentEvidence(op);
   erase.push_back(op);
   return mlir::success();
 }
@@ -150,6 +153,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerGeneratorFunctionTargetCall(
           result)))
     return mlir::failure();
   valueBundles[op.getResult(0)] = std::move(result);
+  // The generator body runs on later next()/send() calls; container
+  // arguments absorbed into the frame may be mutated there.
+  demoteMutableContainerArgumentEvidence(op);
   erase.push_back(op);
   return mlir::success();
 }
@@ -734,6 +740,11 @@ mlir::LogicalResult RuntimeBundleLowerer::consumeFunctionTargetCallResult(
             result.boxedObject =
                 std::make_shared<RuntimeBundle>(*sources[sourceIndex]);
         }
+        // The evidence just copied describes the argument BEFORE the call;
+        // a mutable container may have been mutated by the callee body.
+        demoteMutableContainerEvidence(result);
+        if (result.boxedObject)
+          demoteMutableContainerEvidence(*result.boxedObject);
       }
     }
 

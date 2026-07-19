@@ -15100,6 +15100,86 @@ module attributes {
     func.return
   }
 
+  // "list assignment index out of range"
+  memref.global "private" constant @__ly_list_msg_assign_range : memref<34xi8> = dense<[108, 105, 115, 116, 32, 97, 115, 115, 105, 103, 110, 109, 101, 110, 116, 32, 105, 110, 100, 101, 120, 32, 111, 117, 116, 32, 111, 102, 32, 114, 97, 110, 103, 101]>
+
+  // Normalize a raw (possibly negative) index against the list length and
+  // raise IndexError with CPython's assignment message when it falls outside
+  // [0, len). Shared by the runtime-mode setitem/delitem entry points, which
+  // exist because compile-time element evidence does not cross function
+  // boundaries (closure captures, parameters): the payload state is the only
+  // authority there.
+  func.func private @__ly_list_normalize_assign_index(%meta: memref<2xi64>, %raw_index: i64) -> i64 {
+    %zero = arith.constant 0 : i64
+    %c0 = arith.constant 0 : index
+    %len = memref.load %meta[%c0] : memref<2xi64>
+    %is_neg = arith.cmpi slt, %raw_index, %zero : i64
+    %adjusted = arith.addi %raw_index, %len : i64
+    %normalized = arith.select %is_neg, %adjusted, %raw_index : i1, i64
+    %lower_ok = arith.cmpi sge, %normalized, %zero : i64
+    %upper_ok = arith.cmpi slt, %normalized, %len : i64
+    %in_range = arith.andi %lower_ok, %upper_ok : i1
+    scf.if %in_range {
+    } else {
+      %index_error = arith.constant 55 : i64
+      %msg_static = memref.get_global @__ly_list_msg_assign_range : memref<34xi8>
+      %msg = memref.cast %msg_static : memref<34xi8> to memref<?xi8>
+      %msg_len = arith.constant 34 : i64
+      func.call @__ly_long_raise_message(%index_error, %msg, %msg_len) : (i64, memref<?xi8>, i64) -> ()
+    }
+    func.return %normalized : i64
+  }
+
+  func.func @LyList_SetItemBox(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>, %raw_index: i64, %value_box: memref<16xi64>) attributes {ly.runtime.contract = "builtins.list", ly.runtime.primitive = "setitem_box"} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c16 = arith.constant 16 : index
+    %normalized = func.call @__ly_list_normalize_assign_index(%meta, %raw_index) : (memref<2xi64>, i64) -> i64
+    func.call @LyObject_ReleaseBoxedPayloadArraySlotRaw(%items, %normalized) : (memref<?xi64>, i64) -> ()
+    %slot = arith.index_cast %normalized : i64 to index
+    %base = arith.muli %slot, %c16 : index
+    scf.for %w = %c0 to %c16 step %c1 {
+      %word = memref.load %value_box[%w] : memref<16xi64>
+      %dst = arith.addi %base, %w : index
+      memref.store %word, %items[%dst] : memref<?xi64>
+    }
+    func.return
+  }
+
+  func.func @LyList_DelItemIndex(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>, %raw_index: i64) attributes {ly.runtime.contract = "builtins.list", ly.runtime.primitive = "delitem_index"} {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c16 = arith.constant 16 : index
+    %normalized = func.call @__ly_list_normalize_assign_index(%meta, %raw_index) : (memref<2xi64>, i64) -> i64
+    %len = memref.load %meta[%c0] : memref<2xi64>
+    func.call @LyObject_ReleaseBoxedPayloadArraySlotRaw(%items, %normalized) : (memref<?xi64>, i64) -> ()
+    %slot_index = arith.index_cast %normalized : i64 to index
+    %from = arith.addi %slot_index, %c1 : index
+    %len_index = arith.index_cast %len : i64 to index
+    scf.for %j = %from to %len_index step %c1 {
+      %dst_entry = arith.subi %j, %c1 : index
+      %src_base = arith.muli %j, %c16 : index
+      %dst_base = arith.muli %dst_entry, %c16 : index
+      scf.for %w = %c0 to %c16 step %c1 {
+        %src = arith.addi %src_base, %w : index
+        %dst = arith.addi %dst_base, %w : index
+        %word = memref.load %items[%src] : memref<?xi64>
+        memref.store %word, %items[%dst] : memref<?xi64>
+      }
+    }
+    %new_len = arith.subi %len, %one : i64
+    %last = arith.index_cast %new_len : i64 to index
+    %last_base = arith.muli %last, %c16 : index
+    scf.for %w = %c0 to %c16 step %c1 {
+      %dst = arith.addi %last_base, %w : index
+      memref.store %zero, %items[%dst] : memref<?xi64>
+    }
+    memref.store %new_len, %meta[%c0] : memref<2xi64>
+    func.return
+  }
+
   // ===== impls: collection =====
   func.func private @LyObject_ReleaseBoxedPayloadArraySlotRaw(%payload: memref<?xi64>, %logical_index: i64)
   func.func private @LyObject_RetainBoxedPayloadArraySlotRaw(%payload: memref<?xi64>, %logical_index: i64)

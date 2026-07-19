@@ -236,6 +236,31 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerLen(py::LenOp op) {
       op, op.getInput(), op.getResult(), "len input", *methodName);
 }
 
+// A raw i64 for a runtime-normalized sequence index: constant literal,
+// primitive-int evidence, or an unbox call, in that preference order (the
+// same ladder the runtime-mode __getitem__ walks). The caller positions the
+// builder.
+mlir::FailureOr<mlir::Value> RuntimeBundleLowerer::rawSequenceIndexValue(
+    mlir::Operation *op, mlir::Value indexValue, const RuntimeBundle &index) {
+  if (std::optional<std::int64_t> literal = integerLiteralFromValue(indexValue))
+    return mlir::arith::ConstantIntOp::create(builder, op->getLoc(), *literal,
+                                              64)
+        .getResult();
+  if (index.primitiveI64 && index.primitiveI64->value &&
+      index.primitiveI64->value.getType().isInteger(64))
+    return index.primitiveI64->value;
+  std::optional<RuntimeSymbol> unbox =
+      manifest.primitive(index.contractName(), "unbox.i64");
+  if (!unbox ||
+      unbox->function.getNumArguments() != index.physicalValues().size())
+    return op->emitError()
+           << "sequence index of contract " << index.contractName()
+           << " has no statically unboxable integer value";
+  mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+      op->getLoc(), *unbox, index.physicalValues());
+  return call.getResult(0);
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
   llvm::SmallVector<mlir::Value, 3> inputs{op.getContainer(), op.getIndex(),
                                            op.getValue()};
@@ -250,7 +275,13 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
       container.contractName() == "builtins.list") {
     std::optional<std::int64_t> rawIndex =
         integerLiteralFromValue(op.getIndex());
-    if (rawIndex) {
+    // The compile-time element evidence is authoritative only for
+    // evidence-backed lists. A list that crossed a function boundary
+    // (closure capture, parameter) or was built in a loop carries NO
+    // element evidence; treating its absent evidence as "length 0" here
+    // mis-raised IndexError for every store, so those lists go through the
+    // runtime payload path below instead.
+    if (rawIndex && container.sequenceEvidenceBacked) {
       builder.setInsertionPoint(op);
       if (mlir::failed(touchCollectionEvidenceUse(op, builder, container,
                                                   "list setitem")))
@@ -302,6 +333,77 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
           return mlir::failure();
         valueBundles[op.getContainer()] = std::move(updated);
       }
+      erase.push_back(op);
+      return mlir::success();
+    }
+    if (container.physicalValues().size() >= 3 &&
+        value.kind == RuntimeBundle::Kind::Object) {
+      // Runtime-mode store (or a dynamic index on an evidence-backed list):
+      // normalize/bounds-check against the runtime length and swap the
+      // payload box in place. In-place: the receiver stays borrowed, so the
+      // store is legal on captured and parameter lists whose owner is the
+      // caller.
+      std::optional<RuntimeSymbol> setItemBox =
+          manifest.primitive("builtins.list", "setitem_box");
+      if (!setItemBox)
+        return op.emitError()
+               << "runtime manifest has no list setitem_box primitive";
+      builder.setInsertionPoint(op);
+      mlir::Location loc = op.getLoc();
+      mlir::FailureOr<mlir::Value> raw =
+          RuntimeBundleLowerer::rawSequenceIndexValue(op.getOperation(),
+                                                      op.getIndex(), index);
+      if (mlir::failed(raw))
+        return mlir::failure();
+      mlir::FailureOr<RuntimeBundle> payload =
+          RuntimeBundleLowerer::materializePayloadObjectBundle(op, value);
+      if (mlir::failed(payload))
+        return mlir::failure();
+      if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
+              op, *payload, "list.setitem")))
+        return mlir::failure();
+      mlir::MemRefType boxType = box_abi::boxWordsType(builder);
+      mlir::Value box =
+          mlir::memref::AllocaOp::create(builder, loc, boxType).getResult();
+      mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
+          RuntimeBundleLowerer::objectPayloadHandleWords(op, *payload,
+                                                         /*ownsPayload=*/true);
+      if (mlir::failed(words))
+        return mlir::failure();
+      for (auto [wordIndex, word] : llvm::enumerate(*words)) {
+        mlir::Value slot = mlir::arith::ConstantIndexOp::create(
+            builder, loc, static_cast<std::int64_t>(wordIndex));
+        mlir::memref::StoreOp::create(builder, loc, word, box, slot);
+      }
+      llvm::SmallVector<mlir::Value, 6> operands(
+          container.physicalValues().begin(), container.physicalValues().end());
+      operands.push_back(*raw);
+      operands.push_back(box);
+      RuntimeBundleLowerer::createRuntimeCall(loc, *setItemBox, operands);
+      // Pin the receiver past the raw-word call (mirrors the other *_box
+      // container methods).
+      if (std::optional<RuntimeSymbol> lenPin =
+              manifest.method("builtins.list", "__len__")) {
+        llvm::SmallVector<const RuntimeBundle *, 1> pinSources{&container};
+        llvm::SmallVector<mlir::Value, 4> pinOperands;
+        if (mlir::failed(buildRuntimeCallOperands(op, *lenPin, pinSources,
+                                                  pinOperands,
+                                                  /*allowUnusedSources=*/false)))
+          return mlir::failure();
+        RuntimeBundleLowerer::createRuntimeCall(loc, *lenPin, pinOperands);
+      }
+      // The runtime store invalidates whatever partial compile-time element
+      // facts the bundle still carried.
+      RuntimeBundle demoted = container;
+      demoted.sequenceElements.clear();
+      demoted.sequenceElementBundles.clear();
+      demoted.sequenceIndices.clear();
+      demoted.sequenceEvidenceBacked = false;
+      if (mlir::failed(RuntimeBundleLowerer::writeBackFieldAlias(op, demoted)))
+        return mlir::failure();
+      for (mlir::Value result : op->getResults())
+        valueBundles[result] = demoted;
+      valueBundles[op.getContainer()] = std::move(demoted);
       erase.push_back(op);
       return mlir::success();
     }
@@ -621,7 +723,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerDelItem(py::DelItemOp op) {
       container.contractName() == "builtins.list") {
     std::optional<std::int64_t> rawIndex =
         integerLiteralFromValue(op.getIndex());
-    if (rawIndex) {
+    // Same evidence-authority rule as lowerSetItem: absent evidence is not
+    // an empty list, so only evidence-backed lists take the compile-time
+    // path.
+    if (rawIndex && container.sequenceEvidenceBacked) {
       RuntimeBundle updated = container;
       std::int64_t size =
           static_cast<std::int64_t>(updated.sequenceElementBundles.size());
@@ -687,6 +792,48 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerDelItem(py::DelItemOp op) {
           return mlir::failure();
         valueBundles[op.getContainer()] = std::move(updated);
       }
+      erase.push_back(op);
+      return mlir::success();
+    }
+    if (container.physicalValues().size() >= 3) {
+      // Runtime-mode delete: bounds-check against the runtime length,
+      // release the slot and compact in place (borrowed receiver).
+      std::optional<RuntimeSymbol> delItem =
+          manifest.primitive("builtins.list", "delitem_index");
+      if (!delItem)
+        return op.emitError()
+               << "runtime manifest has no list delitem_index primitive";
+      builder.setInsertionPoint(op);
+      mlir::Location loc = op.getLoc();
+      mlir::FailureOr<mlir::Value> raw =
+          RuntimeBundleLowerer::rawSequenceIndexValue(op.getOperation(),
+                                                      op.getIndex(), index);
+      if (mlir::failed(raw))
+        return mlir::failure();
+      llvm::SmallVector<mlir::Value, 4> operands(
+          container.physicalValues().begin(), container.physicalValues().end());
+      operands.push_back(*raw);
+      RuntimeBundleLowerer::createRuntimeCall(loc, *delItem, operands);
+      if (std::optional<RuntimeSymbol> lenPin =
+              manifest.method("builtins.list", "__len__")) {
+        llvm::SmallVector<const RuntimeBundle *, 1> pinSources{&container};
+        llvm::SmallVector<mlir::Value, 4> pinOperands;
+        if (mlir::failed(buildRuntimeCallOperands(op, *lenPin, pinSources,
+                                                  pinOperands,
+                                                  /*allowUnusedSources=*/false)))
+          return mlir::failure();
+        RuntimeBundleLowerer::createRuntimeCall(loc, *lenPin, pinOperands);
+      }
+      RuntimeBundle demoted = container;
+      demoted.sequenceElements.clear();
+      demoted.sequenceElementBundles.clear();
+      demoted.sequenceIndices.clear();
+      demoted.sequenceEvidenceBacked = false;
+      if (mlir::failed(RuntimeBundleLowerer::writeBackFieldAlias(op, demoted)))
+        return mlir::failure();
+      for (mlir::Value result : op->getResults())
+        valueBundles[result] = demoted;
+      valueBundles[op.getContainer()] = std::move(demoted);
       erase.push_back(op);
       return mlir::success();
     }
