@@ -255,6 +255,21 @@ RuntimeBundleLowerer::lowerBuiltinMethodSinkCall(py::CallOp op,
     sinkArgument = argument;
 
   RuntimeBundle printable = *sinkArgument;
+  // User exception classes have no manifest methods of their own but share
+  // the taxonomy exception shape, and the manifest __str__/__repr__ resolve
+  // the display name by DYNAMIC class id (which the instance header holds),
+  // so rendering through the ancestor keeps the user class's name.
+  if (printable.kind == RuntimeBundle::Kind::Object &&
+      printable.physicalValues().size() == 3 &&
+      !manifest.method(printable.contractName(), symbol.builtinMethod)) {
+    if (std::optional<std::string> ancestor =
+            RuntimeBundleLowerer::exceptionAncestorContractFor(
+                printable.contract)) {
+      mlir::Type ancestorType = runtimeContractType(context, *ancestor);
+      printable.contract = ancestorType;
+      printable.objectValue.contract = ancestorType;
+    }
+  }
   auto assignSinkResults = [&]() -> mlir::LogicalResult {
     std::string resultContract = symbol.resultContract.empty()
                                      ? "types.NoneType"

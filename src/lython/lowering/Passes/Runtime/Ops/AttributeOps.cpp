@@ -350,8 +350,16 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
     llvm::StringRef leaf = llvm::StringRef(contract).rsplit('.').second;
     if (leaf.empty())
       leaf = contract;
-    if (py::exceptions::findByName(leaf) &&
-        object->physicalValues().size() == 3) {
+    // User exception classes route through the same primitive: they share
+    // the taxonomy's 3-word-header-plus-message shape (field declarations
+    // are rejected at emit time), so the ancestor check is the class analog
+    // of the taxonomy name lookup.
+    bool isExceptionShaped =
+        py::exceptions::findByName(leaf) != nullptr ||
+        RuntimeBundleLowerer::exceptionAncestorContractFor(
+            op.getObject().getType())
+            .has_value();
+    if (isExceptionShaped && object->physicalValues().size() == 3) {
       std::optional<RuntimeSymbol> argsPrimitive =
           manifest.primitive("builtins.BaseException", "args");
       if (!argsPrimitive)

@@ -736,7 +736,14 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
         llvm::StringRef leaf = contractType.getContractName().rsplit('.').second;
         if (leaf.empty())
           leaf = contractType.getContractName();
-        return py::exceptions::findByName(leaf) != nullptr;
+        if (py::exceptions::findByName(leaf) != nullptr)
+          return true;
+        // User exception classes share the taxonomy's str/repr semantics
+        // (str is the message, repr is ClassName(...)), so they take the
+        // same gate; the manifest-subclass walk is the class-side analog of
+        // the taxonomy name lookup.
+        return py::protocols::Table::get(context).isManifestSubclassOf(
+            type, "builtins.BaseException");
       };
       if (CallInferenceResult inference =
               isBuiltinExceptionContract(argumentType)
@@ -1330,8 +1337,31 @@ ModuleEmitter::tryEmitReprCall(const parser::Node &expr,
       // Manifest-typed receiver (int/str/...): emit py.repr dispatch, the
       // same manifest path `str()` uses (avoid altering `print`'s existing
       // function-binding lowering, which this special case only optimizes).
+      // User exception classes without their own __repr__ resolve against
+      // their taxonomy ancestor instead of falling to object.__repr__: the
+      // manifest exception __repr__ renders ClassName(...) by DYNAMIC class
+      // id, so the user class's name survives the widening.
+      mlir::Type reprReceiverType = argumentType;
+      if (auto contractType = mlir::dyn_cast<py::ContractType>(argumentType)) {
+        llvm::StringRef leaf =
+            contractType.getContractName().rsplit('.').second;
+        if (leaf.empty())
+          leaf = contractType.getContractName();
+        if (!py::exceptions::findByName(leaf)) {
+          for (const std::string &cls :
+               classMro(contractType.getContractName())) {
+            llvm::StringRef clsLeaf = llvm::StringRef(cls).rsplit('.').second;
+            if (clsLeaf.empty())
+              clsLeaf = cls;
+            if (py::exceptions::findByName(clsLeaf)) {
+              reprReceiverType = types.contract(cls);
+              break;
+            }
+          }
+        }
+      }
       if (CallInferenceResult inference = types.inferMethodCallWithEvidence(
-              argumentType, "__repr__", {})) {
+              reprReceiverType, "__repr__", {})) {
         Value argument = coerceValue(emitExpr(args->front().get()),
                                      argumentType, expr);
         mlir::Type resultType = types.contract("builtins.str");
