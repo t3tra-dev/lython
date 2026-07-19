@@ -535,8 +535,16 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
       if (boxedField &&
           !(fieldValue->contractName() == "builtins.object" &&
             fieldValue->physicalValues().size() == 1)) {
+        // Canonicalize to a header-fronted payload group first: lazy ints
+        // and box-primitive value types (bool) have no boxable header of
+        // their own.
+        mlir::FailureOr<RuntimeBundle> payload =
+            RuntimeBundleLowerer::materializePayloadObjectBundle(op,
+                                                                 *fieldValue);
+        if (mlir::failed(payload))
+          return mlir::failure();
         mlir::FailureOr<RuntimeBundle> boxed =
-            RuntimeBundleLowerer::boxRuntimeObject(op, *fieldValue,
+            RuntimeBundleLowerer::boxRuntimeObject(op, *payload,
                                                    /*retainPayload=*/true);
         if (mlir::failed(boxed))
           return mlir::failure();

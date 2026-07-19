@@ -404,6 +404,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
     fieldIndex = RuntimeBundleLowerer::classFieldIndex(classOp, op.getName());
     fieldTypes = RuntimeBundleLowerer::classFieldContractTypes(classOp);
   }
+  if (classOp && fieldIndex && RuntimeBundleLowerer::isCellClassOp(classOp))
+    return RuntimeBundleLowerer::lowerCellAttrGet(op, *object, classOp,
+                                                  *fieldIndex);
   if (fieldIndex) {
     if (*fieldIndex >= fieldTypes.size())
       return op.emitError() << "class field metadata is malformed for "
@@ -730,6 +733,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
   if (*fieldIndex >= fieldTypes.size())
     return op.emitError() << "class field metadata is malformed for "
                           << classOp.getSymName();
+  if (RuntimeBundleLowerer::isCellClassOp(classOp))
+    return RuntimeBundleLowerer::lowerCellAttrSet(op, *object, *value, classOp,
+                                                  *fieldIndex);
   if (!py::isAssignableTo(value->objectValue.contract, fieldTypes[*fieldIndex],
                           op))
     return op.emitError() << "attribute value " << value->objectValue.contract
@@ -887,4 +893,126 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
   erase.push_back(op);
   return mlir::success();
 }
+
+bool RuntimeBundleLowerer::isCellClassOp(py::ClassOp classOp) {
+  return classOp && classOp.getSymName().starts_with("__ly_cell$");
+}
+
+// A cell load rebuilds the content's value group from the slot box words and
+// retains it: the content can be replaced through ANY frame holding the cell
+// (that is the point of a cell), so a borrow pinned to the box would dangle
+// across the next store.
+mlir::LogicalResult RuntimeBundleLowerer::lowerCellAttrGet(
+    py::AttrGetOp op, const RuntimeBundle &objectRef, py::ClassOp classOp,
+    unsigned fieldIndex) {
+  // Copy: binding the result below writes valueBundles.
+  RuntimeBundle object = objectRef;
+  mlir::Type content = op.getResult().getType();
+  mlir::FailureOr<unsigned> offset = RuntimeBundleLowerer::classFieldValueOffset(
+      op, classOp, fieldIndex, "nonlocal cell ABI");
+  if (mlir::failed(offset))
+    return mlir::failure();
+  if (*offset >= object.physicalValues().size())
+    return op.emitError() << "nonlocal cell ABI exceeds object payload";
+  mlir::Value box = object.physicalValues()[*offset];
+  mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> shapes =
+      RuntimeBundleLowerer::slotStorageShapesFor(op, content,
+                                                 "nonlocal cell load");
+  if (mlir::failed(shapes))
+    return mlir::failure();
+  for (mlir::Type shape : *shapes) {
+    auto memref = mlir::dyn_cast<mlir::MemRefType>(shape);
+    if (!memref || memref.getRank() != 1)
+      return op.emitError()
+             << "nonlocal over " << content
+             << " is not supported yet (content has no boxable value group)";
+  }
+  builder.setInsertionPoint(op);
+  mlir::Location loc = op.getLoc();
+  llvm::SmallVector<mlir::Value, 4> elementValues;
+  for (auto [position, shape] : llvm::enumerate(*shapes)) {
+    mlir::Value ptrIndex = mlir::arith::ConstantIndexOp::create(
+        builder, loc,
+        box_abi::kPointerWordBase + static_cast<std::int64_t>(position));
+    mlir::Value sizeIndex = mlir::arith::ConstantIndexOp::create(
+        builder, loc,
+        box_abi::kSizeWordBase + static_cast<std::int64_t>(position));
+    mlir::Value ptrWord =
+        mlir::memref::LoadOp::create(builder, loc, box, ptrIndex).getResult();
+    mlir::Value sizeWord =
+        mlir::memref::LoadOp::create(builder, loc, box, sizeIndex).getResult();
+    elementValues.push_back(RuntimeBundleLowerer::memrefFromBoxWords(
+        builder, loc, ptrWord, sizeWord, mlir::cast<mlir::MemRefType>(shape)));
+  }
+  mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> canonical =
+      RuntimeBundleLowerer::unboxSlotElementValues(op, content, elementValues);
+  if (mlir::failed(canonical))
+    return mlir::failure();
+  RuntimeValue element{content, *canonical,
+                       ownership::logicalOwnershipKind(content,
+                                                       /*ownsObject=*/false)};
+  if (mlir::failed(bindRetainedEvidenceValue(op, op.getResult(),
+                                             "nonlocal cell load", element)))
+    return mlir::failure();
+  erase.push_back(op);
+  return mlir::success();
+}
+
+// A cell store swaps the slot box's content IN PLACE: retain the new content
+// into the slot, release whatever the box held (a no-op while the owned flag
+// is still zero), overwrite the handle words. The instance bundle is NOT
+// respliced — the box is the shared mutable state, and the instance may be a
+// borrowed capture whose lanes belong to another frame.
+mlir::LogicalResult RuntimeBundleLowerer::lowerCellAttrSet(
+    py::AttrSetOp op, const RuntimeBundle &objectRef,
+    const RuntimeBundle &valueRef, py::ClassOp classOp, unsigned fieldIndex) {
+  RuntimeBundle object = objectRef;
+  RuntimeBundle value = valueRef;
+  mlir::FailureOr<unsigned> offset = RuntimeBundleLowerer::classFieldValueOffset(
+      op, classOp, fieldIndex, "nonlocal cell ABI");
+  if (mlir::failed(offset))
+    return mlir::failure();
+  if (*offset >= object.physicalValues().size())
+    return op.emitError() << "nonlocal cell ABI exceeds object payload";
+  mlir::Value box = object.physicalValues()[*offset];
+  if (!mlir::isa<mlir::MemRefType>(box.getType()))
+    return op.emitError() << "nonlocal cell slot is not a box16 lane";
+
+  builder.setInsertionPoint(op);
+  mlir::Location loc = op.getLoc();
+  mlir::FailureOr<RuntimeBundle> payload =
+      RuntimeBundleLowerer::materializePayloadObjectBundle(op, value);
+  if (mlir::failed(payload))
+    return mlir::failure();
+  if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(op, *payload,
+                                                             "nonlocal.cell")))
+    return mlir::failure();
+  mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
+      RuntimeBundleLowerer::objectPayloadHandleWords(op, *payload,
+                                                     /*ownsPayload=*/true);
+  if (mlir::failed(words))
+    return mlir::failure();
+
+  auto releaseBoxed = module.lookupSymbol<mlir::func::FuncOp>(
+      "LyObject_ReleaseBoxedPayloadRaw");
+  if (!releaseBoxed)
+    return op.emitError()
+           << "runtime support has no LyObject_ReleaseBoxedPayloadRaw";
+  mlir::Value releaseOperand = box;
+  mlir::Type expectedBox = releaseBoxed.getFunctionType().getInput(0);
+  if (releaseOperand.getType() != expectedBox)
+    releaseOperand =
+        mlir::memref::CastOp::create(builder, loc, expectedBox, releaseOperand)
+            .getResult();
+  mlir::func::CallOp::create(builder, loc, releaseBoxed,
+                             mlir::ValueRange{releaseOperand});
+  for (auto [wordIndex, word] : llvm::enumerate(*words)) {
+    mlir::Value slot = mlir::arith::ConstantIndexOp::create(
+        builder, loc, static_cast<std::int64_t>(wordIndex));
+    mlir::memref::StoreOp::create(builder, loc, word, box, slot);
+  }
+  erase.push_back(op);
+  return mlir::success();
+}
+
 } // namespace py::lowering

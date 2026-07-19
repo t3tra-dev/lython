@@ -248,10 +248,14 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
   values.clear();
   llvm::StringSet<> savedGlobalDecls = std::move(currentGlobalDecls);
   currentGlobalDecls.clear();
+  llvm::StringSet<> savedBoxedLocals = std::move(currentBoxedLocals);
+  currentBoxedLocals = isLambda ? llvm::StringSet<>()
+                                : nonlocalBoxedNames(callable);
   bool savedModuleScope = atModuleScope;
   atModuleScope = false;
   llvm::scope_exit restoreGlobalScope([&] {
     currentGlobalDecls = std::move(savedGlobalDecls);
+    currentBoxedLocals = std::move(savedBoxedLocals);
     atModuleScope = savedModuleScope;
   });
   currentReturnType = sig.resultType;
@@ -317,7 +321,16 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
   for (auto [index, capture] : llvm::enumerate(captures)) {
     values[capture.name] =
         Value{entry->getArgument(captureOffset + index), capture.value.type};
-    types.bindSymbol(capture.name, capture.value.type);
+    // A cell capture binds the NAME to the cell instance, but the name's
+    // Python-level type is the content: expressions read through the cell.
+    if (isCellContract(capture.value.type)) {
+      if (mlir::Type content = cellContentType(capture.value.type))
+        types.bindSymbol(capture.name, content);
+      else
+        types.bindSymbol(capture.name, capture.value.type);
+    } else {
+      types.bindSymbol(capture.name, capture.value.type);
+    }
   }
 
   builder.setInsertionPointToStart(entry);

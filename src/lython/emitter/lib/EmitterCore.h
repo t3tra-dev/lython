@@ -356,6 +356,16 @@ private:
   Value emitFunctionObject(const parser::Node &anchor,
                            llvm::StringRef symbolName, mlir::Type type,
                            llvm::ArrayRef<Capture> captures);
+  // R6 nonlocal cells: a boxed local's storage is an instance of a
+  // synthesized one-field class ("__ly_cell$N" with field "v").
+  static bool isCellContract(mlir::Type type);
+  mlir::Type cellContentType(mlir::Type cellType);
+  mlir::Type ensureCellClass(mlir::Type contentType,
+                             const parser::Node &anchor);
+  Value emitCellAlloc(const parser::Node &anchor, Value initial);
+  Value emitCellLoad(const parser::Node &anchor, const Value &cell);
+  void emitCellStore(const parser::Node &anchor, const Value &cell,
+                     Value value);
   std::optional<Value>
   emitPrimitiveConstructorCall(const parser::Node &expr,
                                const parser::Node *calleeNode);
@@ -462,6 +472,13 @@ private:
   // to them target the module global instead of a new local). Saved/restored
   // around each callable body.
   llvm::StringSet<> currentGlobalDecls;
+  // Locals of the function currently being emitted that some nested function
+  // declares `nonlocal` (R6): their storage is a shared refcounted cell (a
+  // synthesized one-field class instance), created at the first binding.
+  // Every read/write in every scope goes through the cell's field, so the
+  // enclosing scope and its closures observe one mutable slot. Saved/restored
+  // around each callable body.
+  llvm::StringSet<> currentBoxedLocals;
   bool atModuleScope = false;
   mlir::Type currentReturnType;
   mlir::Type currentGeneratorSendType;
@@ -480,6 +497,9 @@ private:
       pendingDefaultCells;
   unsigned syntheticFunctionCounter = 0;
   unsigned listCompCounter = 0;
+  // Cell classes are synthesized once per (widened) content type.
+  llvm::DenseMap<mlir::Type, mlir::Type> cellClassContracts;
+  unsigned cellClassCounter = 0;
   llvm::SmallVector<WithCleanup, 8> activeWithCleanups;
   llvm::SmallVector<InlineReturnContext, 4> inlineReturnContexts;
   llvm::SmallVector<LoopControlContext, 4> loopControlContexts;

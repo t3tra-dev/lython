@@ -131,6 +131,19 @@ private:
   mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>>
   classFieldStorageValueTypes(mlir::Operation *op, mlir::Type fieldContract,
                               llvm::StringRef purpose) const;
+  // R6 nonlocal cells: emitter-synthesized one-field classes whose field
+  // slot is a box16 written IN PLACE (never spliced into new SSA lanes), so
+  // every frame sharing the cell instance observes one mutable slot.
+  static bool isCellClassOp(py::ClassOp classOp);
+  mlir::LogicalResult lowerCellAttrGet(py::AttrGetOp op,
+                                       const RuntimeBundle &object,
+                                       py::ClassOp classOp,
+                                       unsigned fieldIndex);
+  mlir::LogicalResult lowerCellAttrSet(py::AttrSetOp op,
+                                       const RuntimeBundle &object,
+                                       const RuntimeBundle &value,
+                                       py::ClassOp classOp,
+                                       unsigned fieldIndex);
   mlir::LogicalResult writeBackFieldAlias(mlir::Operation *op,
                                           const RuntimeBundle &updatedField);
   std::optional<unsigned> findUnionMemberIndex(py::UnionType unionType,
