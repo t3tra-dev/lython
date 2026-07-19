@@ -69,6 +69,11 @@ mlir::LogicalResult RuntimeBundleLowerer::emitBoxedReprHookCall(
                                 {strHeader, strBytes, builder.getI1Type()}));
     hook.setPrivate();
     hook->setAttr("ly.ownership.owned_results", builder.getI64ArrayAttr({0}));
+    // Str and bytes share the (header, byte payload) shape; the declared
+    // result contract disambiguates the owned result's deallocator for the
+    // refcount insertion pass.
+    hook->setAttr("ly.runtime.result_contract",
+                  builder.getStringAttr("builtins.str"));
   }
 
   builder.setInsertionPoint(op);
@@ -91,12 +96,22 @@ mlir::LogicalResult RuntimeBundleLowerer::emitBoxedReprHookCall(
           .getResult();
   mlir::func::CallOp call = mlir::func::CallOp::create(
       builder, loc, hook, mlir::ValueRange{boxPointer, classId});
+  // The hook consumed only a raw pointer word: pin the box's liveness past
+  // the call with an explicit touch use (the liveness analysis cannot see
+  // raw-pointer uses).
+  if (std::optional<RuntimeSymbol> touch =
+          manifest.primitive("builtins.object", "touch");
+      touch && header->getType() ==
+                   touch->function.getFunctionType().getInput(0))
+    RuntimeBundleLowerer::createRuntimeCall(loc, *touch,
+                                            mlir::ValueRange{*header});
   mlir::cf::AssertOp::create(builder, loc, call.getResult(2),
                              "repr: boxed object has no conforming __repr__");
-  result = RuntimeBundle::object(
-      runtimeContractType(context, "builtins.str"),
-      mlir::ValueRange{call.getResult(0), call.getResult(1)});
-  return mlir::success();
+  // Register the owned str result through the shared result bundling so the
+  // refcount machinery roots it (including the unwind cleanup path). The
+  // trailing handled flag is not part of the str's value group.
+  return bundleRuntimeResults(op, runtimeContractType(context, "builtins.str"),
+                              call.getResults().take_front(2), result);
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::collectSingleBuiltinArgument(
@@ -256,11 +271,30 @@ RuntimeBundleLowerer::lowerBuiltinMethodSinkCall(py::CallOp op,
   if (symbol.builtinMethod == "__repr__" &&
       symbol.builtinSinkContract == "builtins.str" &&
       printable.contractName() == "builtins.object") {
-    RuntimeBundle rendered;
-    if (mlir::failed(RuntimeBundleLowerer::emitBoxedReprHookCall(op, printable,
-                                                                 rendered)))
-      return mlir::failure();
-    printable = std::move(rendered);
+    // print converts with str(), not repr() (an erased str prints without
+    // quotes); the manifest object __str__ dispatches the payload class and
+    // falls back to the repr form exactly where CPython's str(x) does.
+    if (manifest.method("builtins.object", "__str__")) {
+      llvm::SmallVector<const RuntimeBundle *, 1> strSources{&printable};
+      std::optional<EmittedRuntimeCall> emitted;
+      if (mlir::failed(emitManifestMethodCall(op, printable, "__str__",
+                                              strSources,
+                                              /*allowUnusedSources=*/false,
+                                              emitted)))
+        return mlir::failure();
+      RuntimeBundle rendered;
+      if (mlir::failed(bundleRuntimeResults(
+              op, runtimeContractType(context, "builtins.str"), emitted->call,
+              rendered)))
+        return mlir::failure();
+      printable = std::move(rendered);
+    } else {
+      RuntimeBundle rendered;
+      if (mlir::failed(RuntimeBundleLowerer::emitBoxedReprHookCall(
+              op, printable, rendered)))
+        return mlir::failure();
+      printable = std::move(rendered);
+    }
   }
 
   if (printable.contractName() != symbol.builtinSinkContract) {

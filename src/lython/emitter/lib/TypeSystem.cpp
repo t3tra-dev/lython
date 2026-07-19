@@ -1016,6 +1016,11 @@ void TypeSystem::seedBuiltins() {
   bindSymbol("hash", table.freeFunctionContract("builtins.hash")
                          .value_or(py::CallableType::get(
                              &context, {object()}, {}, {}, {}, {intType()})));
+  for (llvm::StringRef manifestBuiltin :
+       {"sorted", "abs", "divmod", "pow", "ord", "chr", "hex", "oct", "bin"})
+    if (std::optional<mlir::Type> manifestContract = table.freeFunctionContract(
+            (llvm::Twine("builtins.") + manifestBuiltin).str()))
+      bindSymbol(manifestBuiltin, *manifestContract);
   bindClass("object", object());
   bindClass("bool", boolType());
   bindClass("int", intType());

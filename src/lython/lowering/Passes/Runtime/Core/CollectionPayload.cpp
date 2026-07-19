@@ -172,6 +172,16 @@ RuntimeBundleLowerer::objectPayloadHandleWords(mlir::Operation *op,
     return op->emitError() << "collection payload element is not an object";
   if (concrete->contractName() == "types.NoneType")
     return emptyHandle();
+  // Slots hold CANONICAL payload handles (word 1 = payload class, words 4+
+  // = the payload's own memrefs) so hash/eq/repr dispatch reads them
+  // uniformly. An opaque erased `object` (no tracked concrete payload)
+  // would store a handle-of-box indirection those dispatchers cannot
+  // distinguish; reject it loudly rather than mis-execute.
+  if (concrete->contractName() == "builtins.object")
+    return op->emitError()
+           << "a type-erased `object` value cannot be stored in a runtime "
+              "container slot yet; give the container a concrete element "
+              "type annotation";
   if (concrete->physicalValues().empty())
     return op->emitError()
            << "collection payload element " << concrete->contract

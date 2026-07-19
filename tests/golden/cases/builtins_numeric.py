@@ -1,0 +1,10 @@
+# abs/divmod/pow(3-arg)/ord/chr/hex/oct/bin over the bigint runtime.
+print(abs(-5), abs(7), abs(-2.5), abs(0), abs(-(10**25)))
+print(divmod(7, 2), divmod(-7, 2), divmod(7, -2), divmod(-7, -2))
+print(divmod(10**30, 7))
+print(pow(3, 20, 1000), pow(2, 100, 97), pow(7, 0, 5), pow(10, 10**6, 2**61 - 1))
+print(ord("A"), ord("あ"), ord("😀"))
+print(chr(65), chr(12354), chr(128512), chr(0))
+print(hex(255), hex(-16), hex(0), hex(10**30))
+print(oct(8), oct(-9), oct(0))
+print(bin(5), bin(-2), bin(0), bin(2**64))

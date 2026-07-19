@@ -507,6 +507,12 @@ private:
       llvm::StringRef abiLabel,
       llvm::function_ref<mlir::LogicalResult(mlir::Type, mlir::ValueRange)>
           emitMember);
+  // Best-effort liveness pin of a probe operand past a raw-word call: owned
+  // payloads are consumed by an unconditional release-after (which is also
+  // the pinning use); borrowed payloads get a neutral manifest-method use
+  // when one conforms (borrowed entry arguments outlive the call anyway).
+  mlir::LogicalResult pinProbeOperandLiveness(mlir::Operation *op,
+                                              const RuntimeBundle &payload);
   mlir::LogicalResult pinContainerLiveness(mlir::Operation *op,
                                            const RuntimeBundle &container,
                                            bool insertAfterOp = false);
@@ -571,6 +577,26 @@ private:
   // repr instance of the uniform dispatch: class id -> the manifest `__repr__`
   // returning a `builtins.str`, for container __repr__ over erased elements.
   mlir::LogicalResult generateBoxedReprHook();
+  // str instance of the uniform dispatch (print's conversion over erased
+  // boxes).
+  mlir::LogicalResult generateBoxedStrHook();
+  // hash instance of the uniform dispatch: class id -> the manifest
+  // `__hash__` returning the i64 hash word (dict/set probing over erased
+  // keys).
+  mlir::LogicalResult generateBoxedHashHook();
+  // Binary (same-class two-receiver) variant of the uniform dispatch:
+  // `(ptr lhs, ptr rhs, i64 class_id) -> (results..., i1 handled)`; callees
+  // take their self shape twice.
+  mlir::LogicalResult generateBoxedBinaryMethodHook(
+      llvm::StringRef hookName,
+      llvm::function_ref<bool(mlir::func::FuncOp)> selects,
+      mlir::TypeRange calleeResultTypes,
+      llvm::StringRef sourceClassMethodName = "");
+  // eq instance of the binary dispatch (dict/set key equality over erased
+  // keys).
+  mlir::LogicalResult generateBoxedEqHook();
+  // lt instance of the binary dispatch (sort/ordering over erased values).
+  mlir::LogicalResult generateBoxedLtHook();
   mlir::LogicalResult lowerListEvidenceNext(py::NextOp op,
                                             RuntimeBundle iterator);
   // Loop-body generator state-machine transform (GeneratorStateMachine.cpp).

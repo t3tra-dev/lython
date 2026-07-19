@@ -1,0 +1,14 @@
+{0: 'v0', 3: 'v1', 6: 'v2', 9: 'v3', 12: 'v4'}
+v2 v3 ?
+replaced 5
+True False
+v0 4 gone
+{True: 'one'} 1
+1 True {0.5: 1, 2.0: 2}
+99 2 True False
+{'x': 1, 'y': 20, 'z': 30}
+{'x': 1, 'y': 20, 'z': 30} 3
+3 4 False True
+{} 0
+(1, 2)
+(3, 4)

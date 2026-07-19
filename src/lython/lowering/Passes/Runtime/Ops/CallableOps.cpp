@@ -229,6 +229,360 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
           op, receiver, closeResumeInfo->second);
   }
 
+  bool runtimeDictReceiver =
+      receiver.kind == RuntimeBundle::Kind::Object &&
+      receiver.contractName() == "builtins.dict" &&
+      !receiver.mappingEvidenceBacked && receiver.mappingKeys.empty() &&
+      receiver.physicalValues().size() >= 5;
+  // d.get(k, default) / d.pop(k[, default]) on runtime dicts: hash probe on
+  // a transient key box, value rebuilt from the slot's (or the default's)
+  // box words. pop additionally removes the entry; the runtime parks the
+  // popped value's reference past the new end of the values array and the
+  // release below consumes it AFTER the result retain.
+  if (runtimeDictReceiver &&
+      ((methodName == "get" && sources.size() == 3) ||
+       (methodName == "pop" &&
+        (sources.size() == 2 || sources.size() == 3))) &&
+      sources[1] && sources[1]->kind == RuntimeBundle::Kind::Object &&
+      (sources.size() < 3 ||
+       (sources[2] && sources[2]->kind == RuntimeBundle::Kind::Object))) {
+    bool isPop = methodName == "pop";
+    bool hasDefault = sources.size() == 3;
+    mlir::Type valueContract = op.getResult(0).getType();
+    mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> shapes =
+        RuntimeBundleLowerer::slotStorageShapesFor(op, valueContract,
+                                                   "dict value");
+    bool shapesUsable = mlir::succeeded(shapes) &&
+                        runtimeContractName(valueContract) != "builtins.object";
+    if (shapesUsable)
+      for (mlir::Type shape : *shapes) {
+        auto memref = mlir::dyn_cast<mlir::MemRefType>(shape);
+        if (!memref || memref.getRank() != 1)
+          shapesUsable = false;
+      }
+    if (shapesUsable) {
+      std::optional<RuntimeSymbol> probe = manifest.primitive(
+          "builtins.dict",
+          isPop ? (hasDefault ? "pop_slot" : "pop_slot_checked")
+                : "lookup_box");
+      std::optional<RuntimeSymbol> releaseParked =
+          manifest.primitive("builtins.dict", "release_parked");
+      if (!probe || !releaseParked)
+        return op.emitError()
+               << "runtime manifest lacks the dict get/pop primitives";
+      builder.setInsertionPoint(op);
+      mlir::Location loc = op.getLoc();
+      mlir::FailureOr<RuntimeBundle> payloadKey =
+          RuntimeBundleLowerer::materializePayloadObjectBundle(op, *sources[1]);
+      if (mlir::failed(payloadKey))
+        return mlir::failure();
+      auto transientBox =
+          [&](const RuntimeBundle &bundle) -> mlir::FailureOr<mlir::Value> {
+        mlir::MemRefType boxType = box_abi::boxWordsType(builder);
+        mlir::Value box =
+            mlir::memref::AllocaOp::create(builder, loc, boxType).getResult();
+        mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
+            RuntimeBundleLowerer::objectPayloadHandleWords(
+                op, bundle, /*ownsPayload=*/false);
+        if (mlir::failed(words))
+          return mlir::failure();
+        for (auto [wordIndex, word] : llvm::enumerate(*words)) {
+          mlir::Value slot = mlir::arith::ConstantIndexOp::create(
+              builder, loc, static_cast<std::int64_t>(wordIndex));
+          mlir::memref::StoreOp::create(builder, loc, word, box, slot);
+        }
+        return box;
+      };
+      mlir::FailureOr<mlir::Value> keyBox = transientBox(*payloadKey);
+      if (mlir::failed(keyBox))
+        return mlir::failure();
+      std::optional<RuntimeBundle> payloadDefault;
+      mlir::Value defaultBox;
+      if (hasDefault) {
+        mlir::FailureOr<RuntimeBundle> materialized =
+            RuntimeBundleLowerer::materializePayloadObjectBundle(op,
+                                                                 *sources[2]);
+        if (mlir::failed(materialized))
+          return mlir::failure();
+        payloadDefault = *materialized;
+        mlir::FailureOr<mlir::Value> box = transientBox(*payloadDefault);
+        if (mlir::failed(box))
+          return mlir::failure();
+        defaultBox = *box;
+      }
+      llvm::SmallVector<mlir::Value, 8> probeOperands(
+          receiver.physicalValues().begin(), receiver.physicalValues().end());
+      probeOperands.push_back(*keyBox);
+      mlir::func::CallOp probeCall =
+          RuntimeBundleLowerer::createRuntimeCall(loc, *probe, probeOperands);
+      mlir::Value found = probeCall.getResult(0);
+      if (mlir::failed(
+              RuntimeBundleLowerer::pinProbeOperandLiveness(op, *payloadKey)))
+        return mlir::failure();
+      mlir::Value zero =
+          mlir::arith::ConstantIntOp::create(builder, loc, 0, 64);
+      mlir::Value ok = mlir::arith::CmpIOp::create(
+          builder, loc, mlir::arith::CmpIPredicate::sge, found, zero);
+      // Without a default the probe raised on a miss; nothing to guard here.
+      // Slot index whose box words carry the value: the found slot for get,
+      // the parked slot (new length) for pop.
+      mlir::Value valueSlot;
+      if (isPop) {
+        mlir::Value lengthIndex =
+            mlir::arith::ConstantIndexOp::create(builder, loc, 0);
+        valueSlot = mlir::memref::LoadOp::create(
+                        builder, loc, receiver.physicalValues()[1],
+                        lengthIndex)
+                        .getResult();
+      } else {
+        valueSlot = found;
+      }
+      mlir::Value safeSlot =
+          mlir::arith::SelectOp::create(builder, loc, ok, valueSlot, zero)
+              .getResult();
+      mlir::Value wordsPerSlot = mlir::arith::ConstantIntOp::create(
+          builder, loc, box_abi::kWordsPerBox, 64);
+      mlir::Value base =
+          mlir::arith::MulIOp::create(builder, loc, safeSlot, wordsPerSlot)
+              .getResult();
+      mlir::Value valuesArray = receiver.physicalValues()[3];
+      auto loadSlotWord = [&](std::int64_t wordIndex) -> mlir::Value {
+        mlir::Value offset = mlir::arith::ConstantIntOp::create(
+            builder, loc, wordIndex, 64);
+        mlir::Value word =
+            mlir::arith::AddIOp::create(builder, loc, base, offset)
+                .getResult();
+        mlir::Value index = mlir::arith::IndexCastOp::create(
+                                builder, loc, builder.getIndexType(), word)
+                                .getResult();
+        return mlir::memref::LoadOp::create(builder, loc, valuesArray, index)
+            .getResult();
+      };
+      auto loadDefaultWord = [&](std::int64_t wordIndex) -> mlir::Value {
+        mlir::Value index = mlir::arith::ConstantIndexOp::create(
+            builder, loc, wordIndex);
+        return mlir::memref::LoadOp::create(builder, loc, defaultBox, index)
+            .getResult();
+      };
+      llvm::SmallVector<mlir::Value, 4> resultValues;
+      for (auto [position, shape] : llvm::enumerate(*shapes)) {
+        mlir::Value pointerWord =
+            loadSlotWord(box_abi::kPointerWordBase +
+                         static_cast<std::int64_t>(position));
+        mlir::Value sizeWord = loadSlotWord(
+            box_abi::kSizeWordBase + static_cast<std::int64_t>(position));
+        if (hasDefault) {
+          mlir::Value defaultPointer =
+              loadDefaultWord(box_abi::kPointerWordBase +
+                              static_cast<std::int64_t>(position));
+          mlir::Value defaultSize =
+              loadDefaultWord(box_abi::kSizeWordBase +
+                              static_cast<std::int64_t>(position));
+          pointerWord = mlir::arith::SelectOp::create(builder, loc, ok,
+                                                      pointerWord,
+                                                      defaultPointer)
+                            .getResult();
+          sizeWord = mlir::arith::SelectOp::create(builder, loc, ok, sizeWord,
+                                                   defaultSize)
+                         .getResult();
+        }
+        resultValues.push_back(RuntimeBundleLowerer::memrefFromBoxWords(
+            builder, loc, pointerWord, sizeWord,
+            mlir::cast<mlir::MemRefType>(shape)));
+      }
+      mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> canonical =
+          RuntimeBundleLowerer::unboxSlotElementValues(op, valueContract,
+                                                       resultValues);
+      if (mlir::failed(canonical))
+        return mlir::failure();
+      RuntimeValue value{valueContract, *canonical,
+                         ownership::logicalOwnershipKind(valueContract,
+                                                         /*ownsObject=*/false)};
+      if (mlir::failed(bindRetainedEvidenceValue(
+              op, op.getResult(0), isPop ? "dict.pop" : "dict.get", value)))
+        return mlir::failure();
+      if (isPop) {
+        // Consume the parked reference now that the result holds its own.
+        auto parkedGuard = mlir::scf::IfOp::create(
+            builder, loc, mlir::TypeRange{}, ok, /*withElseRegion=*/false);
+        {
+          mlir::OpBuilder::InsertionGuard insertionGuard(builder);
+          builder.setInsertionPointToStart(&parkedGuard.getThenRegion().front());
+          RuntimeBundleLowerer::createRuntimeCall(
+              loc, *releaseParked, mlir::ValueRange{valuesArray, valueSlot});
+        }
+        builder.setInsertionPointAfter(parkedGuard);
+      }
+      if (hasDefault && payloadDefault &&
+          mlir::failed(RuntimeBundleLowerer::pinProbeOperandLiveness(
+              op, *payloadDefault)))
+        return mlir::failure();
+      if (mlir::failed(pinContainerLiveness(op, receiver,
+                                            /*insertAfterOp=*/true)))
+        return mlir::failure();
+      erase.push_back(op);
+      return mlir::success();
+    }
+  }
+
+  // Structural update family (dict.update, set.update and the in-place set
+  // filters): the manifest method consumes the receiver's storage token and
+  // returns the (possibly reallocated) representation the rebind result
+  // carries.
+  bool runtimeSetReceiver = receiver.kind == RuntimeBundle::Kind::Object &&
+                            receiver.contractName() == "builtins.set" &&
+                            receiver.physicalValues().size() >= 3;
+  bool structuralUpdate =
+      (runtimeDictReceiver && methodName == "update") ||
+      (runtimeSetReceiver &&
+       (methodName == "update" || methodName == "intersection_update" ||
+        methodName == "difference_update" ||
+        methodName == "symmetric_difference_update"));
+  if (structuralUpdate && structuralMutation && sources.size() == 2 &&
+      sources[1] && sources[1]->kind == RuntimeBundle::Kind::Object &&
+      sources[1]->contractName() == receiver.contractName() &&
+      sources[1]->physicalValues().size() ==
+          receiver.physicalValues().size()) {
+    std::optional<RuntimeSymbol> update =
+        manifest.method(receiver.contractName(), methodName);
+    if (!update)
+      return op.emitError() << "runtime manifest has no "
+                            << receiver.contractName() << "." << methodName
+                            << " method";
+    builder.setInsertionPoint(op);
+    mlir::Location loc = op.getLoc();
+    llvm::SmallVector<mlir::Value, 10> operands(
+        receiver.physicalValues().begin(), receiver.physicalValues().end());
+    operands.append(sources[1]->physicalValues().begin(),
+                    sources[1]->physicalValues().end());
+    mlir::func::CallOp call =
+        RuntimeBundleLowerer::createRuntimeCall(loc, *update, operands);
+    RuntimeBundle updated;
+    if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+            op, receiver.objectValue.contract, call.getResults(), updated)))
+      return mlir::failure();
+    updated.fieldAliasOwner = receiver.fieldAliasOwner;
+    updated.fieldAliasName = receiver.fieldAliasName;
+    valueBundles[op.getResult(1)] = std::move(updated);
+    if (mlir::failed(assignObjectBundle(
+            op, op.getResult(0), runtimeContractType(context, "types.NoneType"),
+            mlir::ValueRange{})))
+      return mlir::failure();
+    erase.push_back(op);
+    return mlir::success();
+  }
+
+  // Runtime container methods over one boxed argument (count/index/remove on
+  // lists, discard/remove on sets): each resolves through a `<name>_box`
+  // manifest primitive taking (receiver physicals..., box). Mutators demote
+  // the receiver's compile-time element evidence afterwards - the runtime
+  // reordering/removal invalidates it, and the published payload carries the
+  // authoritative contents.
+  if (receiver.kind == RuntimeBundle::Kind::Object) {
+    llvm::StringRef receiverContract = receiver.contractName();
+    bool listBoxMethod = receiverContract == "builtins.list" &&
+                         (methodName == "count" || methodName == "index" ||
+                          methodName == "remove") &&
+                         receiver.physicalValues().size() >= 3;
+    bool setBoxMethod = receiverContract == "builtins.set" &&
+                        (methodName == "discard" || methodName == "remove") &&
+                        receiver.physicalValues().size() >= 3;
+    if (listBoxMethod || setBoxMethod) {
+      if (sources.size() != 2 || !sources[1] ||
+          sources[1]->kind != RuntimeBundle::Kind::Object)
+        return op.emitError() << receiverContract << "." << methodName
+                              << " expects one Python object argument";
+      std::string primitiveName = (methodName + llvm::Twine("_box")).str();
+      std::optional<RuntimeSymbol> primitive =
+          manifest.primitive(receiverContract, primitiveName);
+      if (!primitive)
+        return op.emitError() << "runtime manifest has no " << receiverContract
+                              << " " << primitiveName << " primitive";
+      builder.setInsertionPoint(op);
+      mlir::Location loc = op.getLoc();
+      mlir::FailureOr<RuntimeBundle> payload =
+          RuntimeBundleLowerer::materializePayloadObjectBundle(op, *sources[1]);
+      if (mlir::failed(payload))
+        return mlir::failure();
+      mlir::MemRefType boxType = box_abi::boxWordsType(builder);
+      mlir::Value box =
+          mlir::memref::AllocaOp::create(builder, loc, boxType).getResult();
+      mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
+          RuntimeBundleLowerer::objectPayloadHandleWords(op, *payload,
+                                                         /*ownsPayload=*/false);
+      if (mlir::failed(words))
+        return mlir::failure();
+      for (auto [wordIndex, word] : llvm::enumerate(*words)) {
+        mlir::Value slot = mlir::arith::ConstantIndexOp::create(
+            builder, loc, static_cast<std::int64_t>(wordIndex));
+        mlir::memref::StoreOp::create(builder, loc, word, box, slot);
+      }
+      llvm::SmallVector<mlir::Value, 8> operands(
+          receiver.physicalValues().begin(), receiver.physicalValues().end());
+      operands.push_back(box);
+      mlir::func::CallOp call =
+          RuntimeBundleLowerer::createRuntimeCall(loc, *primitive, operands);
+      if (mlir::failed(RuntimeBundleLowerer::pinProbeOperandLiveness(
+              op, *payload)))
+        return mlir::failure();
+      // Pin the receiver past the raw-word call.
+      if (std::optional<RuntimeSymbol> lenPin =
+              manifest.method(receiverContract, "__len__")) {
+        llvm::SmallVector<const RuntimeBundle *, 1> pinSources{&receiver};
+        llvm::SmallVector<mlir::Value, 4> pinOperands;
+        if (mlir::failed(buildRuntimeCallOperands(op, *lenPin, pinSources,
+                                                  pinOperands,
+                                                  /*allowUnusedSources=*/false)))
+          return mlir::failure();
+        RuntimeBundleLowerer::createRuntimeCall(loc, *lenPin, pinOperands);
+      }
+      if (methodName == "remove" || methodName == "discard") {
+        RuntimeBundle demoted = receiver;
+        demoted.sequenceElements.clear();
+        demoted.sequenceElementBundles.clear();
+        demoted.sequenceIndices.clear();
+        demoted.sequenceEvidenceBacked = false;
+        valueBundles[op.getCallable()] = std::move(demoted);
+      }
+      if (call.getNumResults() == 0) {
+        for (mlir::Value result : op.getResults())
+          if (mlir::failed(assignObjectBundle(
+                  op, result, runtimeContractType(context, "types.NoneType"),
+                  mlir::ValueRange{})))
+            return mlir::failure();
+      } else {
+        RuntimeBundle result;
+        if (mlir::failed(bundleRuntimeResults(
+                op, runtimeContractType(context, primitive->resultContract),
+                call, result)))
+          return mlir::failure();
+        valueBundles[op.getResult(0)] = std::move(result);
+      }
+      erase.push_back(op);
+      return mlir::success();
+    }
+    // In-place permutations (sort/reverse) go through the plain manifest
+    // method; only the evidence demotion is special.
+    bool permutesInPlace = receiverContract == "builtins.list" &&
+                           (methodName == "sort" || methodName == "reverse") &&
+                           receiver.physicalValues().size() >= 3;
+    if (permutesInPlace) {
+      if (mlir::failed(lowerManifestMethodResult(
+              op, op.getResult(0), receiver, methodName, sources,
+              /*allowUnusedSources=*/false,
+              /*preferManifestObjectResult=*/true)))
+        return mlir::failure();
+      RuntimeBundle demoted = receiver;
+      demoted.sequenceElements.clear();
+      demoted.sequenceElementBundles.clear();
+      demoted.sequenceIndices.clear();
+      demoted.sequenceEvidenceBacked = false;
+      valueBundles[op.getCallable()] = std::move(demoted);
+      erase.push_back(op);
+      return mlir::success();
+    }
+  }
+
   if (receiver.kind == RuntimeBundle::Kind::Object &&
       receiver.contractName() == "builtins.set" && methodName == "add") {
     // Runtime set insert with dedup: box the element and let the runtime
@@ -252,11 +606,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
         RuntimeBundleLowerer::materializePayloadObjectBundle(op, *sources[1]);
     if (mlir::failed(payload))
       return mlir::failure();
-    std::string elementContract = payload->contractName();
-    if (elementContract != "builtins.int" && elementContract != "builtins.str")
-      return op.emitError()
-             << "set elements currently require int or str evidence, got "
-             << payload->objectValue.contract;
+    // Any hashable class boxes: the runtime add hashes the box and raises
+    // TypeError for unhashable elements.
     if (mlir::failed(
             RuntimeBundleLowerer::retainAggregateSlot(op, *payload, "set.add")))
       return mlir::failure();
