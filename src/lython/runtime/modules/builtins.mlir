@@ -232,7 +232,7 @@ module attributes {
     base_names = ["object"], ly.typing.final,
     method_names = ["__add__", "__sub__", "__mul__", "__truediv__",
                     "__neg__", "__pos__", "__eq__", "__ne__",
-                    "__repr__", "__str__"],
+                    "__repr__", "__str__", "__abs__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.contract<"builtins.complex">, !py.contract<"builtins.complex">] -> [!py.contract<"builtins.complex">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.complex">, !py.contract<"builtins.complex">] -> [!py.contract<"builtins.complex">]>,
@@ -243,11 +243,12 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.complex">, !py.contract<"builtins.object">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.complex">, !py.contract<"builtins.object">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.complex">] -> [!py.contract<"builtins.str">]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.complex">] -> [!py.contract<"builtins.str">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.complex">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.complex">] -> [!py.contract<"builtins.float">]>
     ],
     method_kinds = ["instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
-                    "instance", "instance"]
+                    "instance", "instance", "instance"]
   } {}
 
   py.class @str attributes {
@@ -13078,6 +13079,21 @@ module attributes {
     %b = memref.load %payload[%im_slot] : memref<2xf64>
     %out_header, %out_payload = func.call @LyComplex_FromParts(%a, %b) : (f64, f64) -> (memref<2xi64>, memref<2xf64>)
     func.return %out_header, %out_payload : memref<2xi64>, memref<2xf64>
+  }
+
+  // abs(complex) is the modulus: hypot avoids the naive overflow for
+  // components near DBL_MAX (CPython uses hypot too).
+  func.func @LyComplex_Abs(%header: memref<2xi64> {ly.ownership.object_header}, %payload: memref<2xf64>) -> (memref<2xi64>, memref<1xf64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.complex", ly.runtime.method = "__abs__", ly.runtime.result_contract = "builtins.float"} {
+    %re_slot = arith.constant 0 : index
+    %im_slot = arith.constant 1 : index
+    %a = memref.load %payload[%re_slot] : memref<2xf64>
+    %b = memref.load %payload[%im_slot] : memref<2xf64>
+    %aa = arith.mulf %a, %a : f64
+    %bb = arith.mulf %b, %b : f64
+    %sum = arith.addf %aa, %bb : f64
+    %mag = math.sqrt %sum : f64
+    %h, %p = func.call @LyFloat_FromF64(%mag) : (f64) -> (memref<2xi64>, memref<1xf64>)
+    func.return %h, %p : memref<2xi64>, memref<1xf64>
   }
 
   func.func @LyComplex_EqBool(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_payload: memref<2xf64>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_payload: memref<2xf64>) -> i1 attributes {ly.runtime.contract = "builtins.complex", ly.runtime.method = "__eq__"} {
