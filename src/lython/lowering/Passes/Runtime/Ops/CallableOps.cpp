@@ -645,6 +645,42 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
     return mlir::success();
   }
 
+  if (receiver.kind == RuntimeBundle::Kind::Object &&
+      receiver.contractName() == "builtins.list" &&
+      (methodName == "__setslice__" || methodName == "__delslice__")) {
+    // Slice splice/deletion always goes through the runtime representation
+    // (the physical payload is maintained alongside any compile-time
+    // evidence, and a length change under runtime indices cannot be
+    // replayed on the evidence): the manifest method rebinds the receiver
+    // like append's growth path, and the rebound bundle is runtime-mode.
+    if (!structuralMutation)
+      return op.emitError()
+             << "list slice mutation requires a rebindable local receiver";
+    if (receiver.physicalValues().size() < 3)
+      return op.emitError() << "list runtime object has no physical payload";
+    builder.setInsertionPoint(op);
+    std::optional<EmittedRuntimeCall> emitted;
+    if (mlir::failed(emitManifestMethodCall(op, receiver, methodName, sources,
+                                            /*allowUnusedSources=*/false,
+                                            emitted)))
+      return mlir::failure();
+    RuntimeBundle updated;
+    if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+            op, receiver.objectValue.contract, emitted->call.getResults(),
+            updated)))
+      return mlir::failure();
+    updated.fieldAliasOwner = receiver.fieldAliasOwner;
+    updated.fieldAliasName = receiver.fieldAliasName;
+    valueBundles[op.getResult(1)] = std::move(updated);
+    if (mlir::failed(assignObjectBundle(
+            op, op.getResult(0),
+            runtimeContractType(context, "types.NoneType"),
+            mlir::ValueRange{})))
+      return mlir::failure();
+    erase.push_back(op);
+    return mlir::success();
+  }
+
   if (isMutableStructuralListObject(receiver) &&
       (methodName == "append" || methodName == "remove")) {
     if (sources.size() != 2 || !sources[1] ||

@@ -1,5 +1,7 @@
 #include "Runtime/Core/Lowerer.h"
 
+#include "Runtime/ABI/BoxLayout.h"
+
 namespace py::lowering {
 
 namespace {
@@ -166,6 +168,85 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPack(py::PackOp op) {
     if (!allStaticStringKeys) {
       keys.clear();
       elements.clear();
+      // Non-static keys (user-class instances, runtime strings) have no
+      // compile-time evidence identity, so the literal builds the SAME
+      // runtime probe dict the incremental `d = {}; d[k] = v` path uses:
+      // LyDict_New once, then one setitem_box insert per entry (user
+      // __hash__/__eq__ dispatch and duplicate-key last-wins live in the
+      // probe). Parking the entries as evidence instead leaves the bundle
+      // in a dead zone no getitem/setitem dispatch accepts.
+      std::optional<RuntimeSymbol> setItemBox =
+          manifest.primitive("builtins.dict", "setitem_box");
+      if (!setItemBox)
+        return op.emitError()
+               << "runtime manifest has no dict setitem_box primitive";
+      // Arity 0: LyDict_New's argument is the LIVE entry count (the evidence
+      // path fills its slots directly), not a capacity hint -- the probe
+      // inserts below grow the count entry by entry, exactly like the
+      // incremental path starting from `{}`.
+      RuntimeBundle bundle;
+      if (mlir::failed(materializeArityObject(op, op.getResult().getType(),
+                                              /*arity=*/0, bundle, {}, {})))
+        return mlir::failure();
+      mlir::Location loc = op.getLoc();
+      for (auto [keyBundle, valueBundle] :
+           llvm::zip(dictKeyBundles, dictValueBundles)) {
+        mlir::FailureOr<RuntimeBundle> payloadKey =
+            RuntimeBundleLowerer::materializePayloadObjectBundle(op,
+                                                                 *keyBundle);
+        if (mlir::failed(payloadKey))
+          return mlir::failure();
+        mlir::FailureOr<RuntimeBundle> payloadValue =
+            RuntimeBundleLowerer::materializePayloadObjectBundle(
+                op, *valueBundle);
+        if (mlir::failed(payloadValue))
+          return mlir::failure();
+        if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
+                op, *payloadKey, "dict.literal.key")))
+          return mlir::failure();
+        if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
+                op, *payloadValue, "dict.literal")))
+          return mlir::failure();
+        auto transientBox =
+            [&](const RuntimeBundle &entry) -> mlir::FailureOr<mlir::Value> {
+          mlir::MemRefType boxType = box_abi::boxWordsType(builder);
+          mlir::Value box =
+              mlir::memref::AllocaOp::create(builder, loc, boxType)
+                  .getResult();
+          mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
+              RuntimeBundleLowerer::objectPayloadHandleWords(
+                  op, entry, /*ownsPayload=*/true);
+          if (mlir::failed(words))
+            return mlir::failure();
+          for (auto [wordIndex, word] : llvm::enumerate(*words)) {
+            mlir::Value slot = mlir::arith::ConstantIndexOp::create(
+                builder, loc, static_cast<std::int64_t>(wordIndex));
+            mlir::memref::StoreOp::create(builder, loc, word, box, slot);
+          }
+          return box;
+        };
+        mlir::FailureOr<mlir::Value> keyBox = transientBox(*payloadKey);
+        if (mlir::failed(keyBox))
+          return mlir::failure();
+        mlir::FailureOr<mlir::Value> valueBox = transientBox(*payloadValue);
+        if (mlir::failed(valueBox))
+          return mlir::failure();
+        llvm::SmallVector<mlir::Value, 8> operands(
+            bundle.physicalValues().begin(), bundle.physicalValues().end());
+        operands.push_back(*keyBox);
+        operands.push_back(*valueBox);
+        mlir::func::CallOp call =
+            RuntimeBundleLowerer::createRuntimeCall(loc, *setItemBox,
+                                                    operands);
+        RuntimeBundle updated;
+        if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+                op, op.getResult().getType(), call.getResults(), updated)))
+          return mlir::failure();
+        bundle = std::move(updated);
+      }
+      valueBundles[op.getResult()] = std::move(bundle);
+      erase.push_back(op);
+      return mlir::success();
     }
   }
 

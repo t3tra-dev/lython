@@ -638,6 +638,24 @@ def Py_ContainsOp : Py_Op<"contains", []> {
   let hasVerifier = 1;
 }
 
+def Py_IsOp : Py_Op<"is", [Pure]> {
+  let summary = "Python reference identity test";
+  let description = [{
+    Represents `a is b` between reference-typed operands (user-class
+    instances and other header-carrying contracts). Lowering compares the
+    operands' object header addresses; identity on value types is rejected
+    at the emitter per the R6 decision, and None comparisons are resolved
+    statically before this op is ever built.
+  }];
+
+  let arguments = (ins Py_ContractType:$lhs, Py_ContractType:$rhs);
+
+  let results = (outs I1:$result);
+
+  let assemblyFormat =
+      "`(` $lhs `,` $rhs `)` attr-dict `:` type($lhs) `,` type($rhs)";
+}
+
 def Py_BoolOp : Py_Op<"bool", []> {
   let summary = "Python truth-value operation";
   let description = [{

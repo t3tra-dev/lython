@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Ast.h"
+#include "Diagnostics.h"
 #include "PyDialectTypes.h"
 #include "TypeInference.h"
 
@@ -220,6 +221,10 @@ public:
                         llvm::StringRef localName);
 
   mlir::Type annotationType(const parser::Node *node) const;
+  // Diagnostics recorded while resolving annotations (string forward
+  // references whose text is not a simple name). Drained once by the
+  // emitter when it assembles its result.
+  parser::Diagnostics takeAnnotationDiagnostics();
   mlir::Type inferExpr(const parser::Node *node) const;
   mlir::Type inferExpr(const parser::Node *node,
                        const ExprInferenceContext &ctx) const;
@@ -271,6 +276,7 @@ private:
   void popScope() const;
   void bindAnnotationAlias(llvm::StringRef name, llvm::StringRef target);
   std::string resolveAnnotationName(llvm::StringRef name) const;
+  mlir::Type annotationTypeForName(llvm::StringRef name) const;
 
   mlir::MLIRContext &context;
   mutable InferenceContext inferenceState;
@@ -295,6 +301,10 @@ private:
   mutable llvm::SmallVector<llvm::StringMap<std::string>, 8>
       scopedCanonicalBindings;
   mutable llvm::SmallVector<llvm::StringMap<mlir::Type>, 8> scopedClasses;
+  // Annotation resolution runs from const contexts (registerModule pre-pass
+  // and emission may both visit one node), so diagnostics accumulate in a
+  // mutable, deduplicated buffer instead of being reported inline.
+  mutable parser::Diagnostics annotationDiagnostics;
 };
 
 } // namespace lython::emitter

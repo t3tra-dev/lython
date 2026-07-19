@@ -944,6 +944,42 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerDelItem(py::DelItemOp op) {
   return mlir::success();
 }
 
+mlir::LogicalResult RuntimeBundleLowerer::lowerIs(py::IsOp op) {
+  llvm::SmallVector<mlir::Value, 2> inputs{op.getLhs(), op.getRhs()};
+  llvm::SmallVector<const RuntimeBundle *, 2> sources;
+  if (mlir::failed(collectObjectSources(
+          op, inputs, "identity operands need runtime bundles", sources)))
+    return mlir::failure();
+  // Identity is the address of the leading object header; an operand whose
+  // bundle carries no header memref (an evidence-only aggregate) has no
+  // runtime identity to compare, and guessing equality either way would
+  // silently mis-execute.
+  auto headerOf = [](const RuntimeBundle &bundle) -> mlir::Value {
+    if (bundle.physicalValues().empty())
+      return {};
+    mlir::Value first = bundle.physicalValues().front();
+    return mlir::isa<mlir::MemRefType>(first.getType()) ? first
+                                                        : mlir::Value();
+  };
+  mlir::Value lhsHeader = headerOf(*sources.front());
+  mlir::Value rhsHeader = headerOf(*sources.back());
+  if (!lhsHeader || !rhsHeader)
+    return op.emitError()
+           << "`is` operand has no runtime object header (evidence-only "
+              "value); use `==` instead";
+  builder.setInsertionPoint(op);
+  mlir::Location loc = op.getLoc();
+  mlir::Value lhsAddress = mlir::memref::ExtractAlignedPointerAsIndexOp::create(
+      builder, loc, lhsHeader);
+  mlir::Value rhsAddress = mlir::memref::ExtractAlignedPointerAsIndexOp::create(
+      builder, loc, rhsHeader);
+  mlir::Value same = mlir::arith::CmpIOp::create(
+      builder, loc, mlir::arith::CmpIPredicate::eq, lhsAddress, rhsAddress);
+  op.getResult().replaceAllUsesWith(same);
+  erase.push_back(op);
+  return mlir::success();
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::lowerContains(py::ContainsOp op) {
   llvm::SmallVector<mlir::Value, 2> inputs{op.getContainer(), op.getItem()};
   llvm::SmallVector<const RuntimeBundle *, 2> sources;

@@ -1,0 +1,4 @@
+eq=True done
+one=True two=False three=False
+obj=P(x=5, y=6) end
+lead True mid P(x=7, y=8) tail

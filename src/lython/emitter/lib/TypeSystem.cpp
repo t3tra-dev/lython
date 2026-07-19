@@ -2,6 +2,8 @@
 
 #include "TypeSystemSolver.h"
 
+#include "llvm/ADT/StringExtras.h"
+
 #include "AstAccess.h"
 #include "CandidateSelection.h"
 #include "ExceptionTaxonomy.h"
@@ -1669,43 +1671,96 @@ bool TypeSystem::bindImportedName(llvm::StringRef module,
   return false;
 }
 
+mlir::Type TypeSystem::annotationTypeForName(llvm::StringRef rawName) const {
+  std::string resolved = resolveAnnotationName(rawName);
+  llvm::StringRef name(resolved);
+  if (auto symbol = lookupSymbol(name)) {
+    if (mlir::isa<py::TypeVarType, py::ParamSpecType, py::TypeVarTupleType>(
+            *symbol))
+      return *symbol;
+  }
+  if (annotationNameIs(name, "int"))
+    return intType();
+  if (annotationNameIs(name, "str"))
+    return strType();
+  if (annotationNameIs(name, "bool"))
+    return boolType();
+  if (annotationNameIs(name, "float"))
+    return floatType();
+  if (annotationNameIs(name, "object"))
+    return object();
+  if (annotationNameIs(name, "Any"))
+    return any();
+  if (annotationNameIs(name, "None"))
+    return none();
+  if (annotationNameIs(name, "Self"))
+    return py::SelfType::get(&context);
+  if (auto protocolName = protocolAnnotationName(name))
+    return protocol(*protocolName);
+  if (auto contractName = contractAnnotationName(name))
+    return contract(*contractName);
+  if (auto knownClass = lookupClass(name))
+    return *knownClass;
+  return contract((llvm::Twine("builtins.") + name).str());
+}
+
+parser::Diagnostics TypeSystem::takeAnnotationDiagnostics() {
+  parser::Diagnostics drained = std::move(annotationDiagnostics);
+  annotationDiagnostics.clear();
+  return drained;
+}
+
 mlir::Type TypeSystem::annotationType(const parser::Node *node) const {
   if (!node)
     return object();
-  if (node->kind == "Name") {
-    std::string resolved = resolveAnnotationName(ast::nameSpelling(*node));
-    llvm::StringRef name(resolved);
-    if (auto symbol = lookupSymbol(name)) {
-      if (mlir::isa<py::TypeVarType, py::ParamSpecType, py::TypeVarTupleType>(
-              *symbol))
-        return *symbol;
-    }
-    if (annotationNameIs(name, "int"))
-      return intType();
-    if (annotationNameIs(name, "str"))
-      return strType();
-    if (annotationNameIs(name, "bool"))
-      return boolType();
-    if (annotationNameIs(name, "float"))
-      return floatType();
-    if (annotationNameIs(name, "object"))
-      return object();
-    if (annotationNameIs(name, "Any"))
-      return any();
-    if (annotationNameIs(name, "None"))
+  if (node->kind == "Name")
+    return annotationTypeForName(ast::nameSpelling(*node));
+  if (node->kind == "Constant") {
+    if (isNoneConstant(node))
       return none();
-    if (annotationNameIs(name, "Self"))
-      return py::SelfType::get(&context);
-    if (auto protocolName = protocolAnnotationName(name))
-      return protocol(*protocolName);
-    if (auto contractName = contractAnnotationName(name))
-      return contract(*contractName);
-    if (auto knownClass = lookupClass(name))
-      return *knownClass;
-    return contract((llvm::Twine("builtins.") + name).str());
+    // PEP 484 string annotation: the text is resolved lazily as a type
+    // reference. Only a simple (optionally dotted) name is accepted — the
+    // classes it can name are all predeclared before bodies are typed, so
+    // "lazy" needs no second pass; a complex expression inside the string
+    // would need real deferred evaluation and is rejected loudly instead of
+    // silently typing as a str literal.
+    if (std::optional<std::string_view> text = ast::string(*node, "value")) {
+      llvm::StringRef name = llvm::StringRef(text->data(), text->size()).trim();
+      auto isSimpleName = [](llvm::StringRef candidate) {
+        if (candidate.empty())
+          return false;
+        llvm::SmallVector<llvm::StringRef, 4> parts;
+        candidate.split(parts, '.');
+        for (llvm::StringRef part : parts) {
+          if (part.empty())
+            return false;
+          if (!llvm::isAlpha(part.front()) && part.front() != '_')
+            return false;
+          for (char ch : part)
+            if (!llvm::isAlnum(ch) && ch != '_')
+              return false;
+        }
+        return true;
+      };
+      if (isSimpleName(name))
+        return annotationTypeForName(name);
+      parser::Diagnostic diagnostic{
+          parser::Severity::Error, node->range.start,
+          "string annotation \"" + name.str() +
+              "\" is not a simple class name; only forward references to a "
+              "class name (optionally dotted) resolve statically"};
+      bool duplicate = false;
+      for (const parser::Diagnostic &existing : annotationDiagnostics)
+        if (existing.location.line == diagnostic.location.line &&
+            existing.location.column == diagnostic.location.column &&
+            existing.message == diagnostic.message)
+          duplicate = true;
+      if (!duplicate)
+        annotationDiagnostics.push_back(std::move(diagnostic));
+      return object();
+    }
+    return literal(literalSpelling(*node));
   }
-  if (node->kind == "Constant")
-    return isNoneConstant(node) ? none() : literal(literalSpelling(*node));
   if (node->kind == "Attribute") {
     std::string qualified = ast::qualifiedName(node);
     std::string_view spelling = ast::nameSpelling(*node);

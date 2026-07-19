@@ -88,6 +88,10 @@ EmitResult ModuleEmitter::emit() {
     mlir::func::ReturnOp::create(builder, loc(moduleNode));
 
   EmitResult result;
+  // Annotation resolution runs from const contexts (TypeSystem), so its
+  // diagnostics (rejected string forward references) surface here.
+  for (parser::Diagnostic &diagnostic : types.takeAnnotationDiagnostics())
+    diagnostics.push_back(std::move(diagnostic));
   result.diagnostics = std::move(diagnostics);
   result.module = mlir::OwningOpRef<mlir::ModuleOp>(module);
   return result;
