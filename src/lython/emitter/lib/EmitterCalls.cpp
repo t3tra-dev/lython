@@ -182,6 +182,24 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     return *v;
   if (std::optional<Value> v = tryEmitIssubclassCall(expr, calleeNode))
     return *v;
+  // frozenset() with no argument forwards an empty list to the single
+  // manifest __new__ (one native per initializer name; a memref span cannot
+  // carry a default).
+  if (calleeNode && calleeNode->kind == "Name" &&
+      ast::nameSpelling(*calleeNode) == "frozenset" &&
+      values.find("frozenset") == values.end() && callHasNoArguments(expr)) {
+    parser::NodePtr emptyList = parser::makeNode("List", expr.range);
+    parser::addField(*emptyList, "elts", std::vector<parser::NodePtr>{});
+    parser::NodePtr rewritten = parser::makeNode("Call", expr.range);
+    parser::NodePtr frozensetName = parser::makeNode("Name", expr.range);
+    parser::addField(*frozensetName, "id", std::string("frozenset"));
+    parser::addField(*rewritten, "func", std::move(frozensetName));
+    parser::addField(*rewritten, "args",
+                     std::vector<parser::NodePtr>{std::move(emptyList)});
+    parser::addField(*rewritten, "keywords", std::vector<parser::NodePtr>{});
+    synthesizedIteratorDefs.push_back(rewritten);
+    return emitCall(*rewritten);
+  }
   // input() with no prompt forwards an empty prompt to the single manifest
   // contract (input(prompt: str) -> str).
   if (calleeNode && calleeNode->kind == "Name" &&
@@ -212,6 +230,8 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
   if (std::optional<Value> v = tryEmitDictMethodSugar(expr, calleeNode))
     return *v;
   if (std::optional<Value> v = tryEmitSortSugar(expr, calleeNode))
+    return *v;
+  if (std::optional<Value> v = tryEmitStrTranslateSugar(expr, calleeNode))
     return *v;
 
   if (!calleeQualified.empty())

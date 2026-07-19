@@ -1612,6 +1612,189 @@ ModuleEmitter::tryEmitSortSugar(const parser::Node &expr,
   return result;
 }
 
+// ---------------------------------------------------------------------------
+// str.maketrans(x, y) / str.translate(table): pure compositions over ord/
+// chr/dict lookups. maketrans builds {ord(x[i]): ord(y[i])}; translate maps
+// each code point through the table (int values re-encode through chr, str
+// values substitute directly, missing keys pass through) and joins.
+// ---------------------------------------------------------------------------
+std::optional<Value>
+ModuleEmitter::tryEmitStrTranslateSugar(const parser::Node &expr,
+                                        const parser::Node *calleeNode) {
+  if (!calleeNode || calleeNode->kind != "Attribute")
+    return std::nullopt;
+  auto attr = ast::string(*calleeNode, "attr");
+  const parser::Field *receiverField = parser::findField(*calleeNode, "value");
+  if (!attr || !receiverField ||
+      !std::holds_alternative<NodePtr>(receiverField->value))
+    return std::nullopt;
+  NodePtr receiver = std::get<NodePtr>(receiverField->value);
+  if (!receiver)
+    return std::nullopt;
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  if (keywords && !keywords->empty())
+    return std::nullopt;
+  parser::SourceRange range = expr.range;
+  unsigned serial = ++listCompCounter;
+  auto scratch = [&](const char *stem) {
+    return "__lytr" + std::to_string(serial) + "_" + std::string(stem);
+  };
+  auto rejectTranslate = [&](llvm::StringRef reason) -> std::optional<Value> {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start, std::string(reason)});
+    return emitNone(expr);
+  };
+
+  if (*attr == "maketrans" && receiver->kind == "Name" &&
+      ast::nameSpelling(*receiver) == "str" && !values.count("str")) {
+    if (!args || args->size() != 2)
+      return rejectTranslate(
+          "str.maketrans currently supports the two-string form "
+          "(equal-length from/to)");
+    for (const NodePtr &argument : *args)
+      if (!argument ||
+          types.widenLiteral(types.inferExpr(argument.get())) !=
+              types.strType())
+        return rejectTranslate("str.maketrans arguments must be strings");
+    std::string fromName = scratch("x");
+    std::string toName = scratch("y");
+    std::string indexName = scratch("i");
+    std::optional<Value> result;
+    runWithScratchNames({fromName, toName, indexName}, [&] {
+      emitStatement(*assignNode(nameNode(fromName, range), (*args)[0],
+                                range));
+      emitStatement(*assignNode(nameNode(toName, range), (*args)[1], range));
+      // if len(x) != len(y): raise ValueError(...)
+      NodePtr lengthTest =
+          compareNode(lenCall(nameNode(fromName, range), range), "NotEq",
+                      lenCall(nameNode(toName, range), range), range);
+      NodePtr valueError = callNode(
+          nameNode("ValueError", range),
+          {stringConstant(
+              "the first two maketrans arguments must have equal length",
+              range)},
+          range);
+      NodePtr raiseNode = parser::makeNode("Raise", range);
+      parser::addField(*raiseNode, "exc", std::move(valueError));
+      emitStatement(*ifNode(std::move(lengthTest), {std::move(raiseNode)},
+                            range));
+      // {ord(x[i]): ord(y[i]) for i in range(len(x))}
+      auto ordAt = [&](const std::string &sourceName) {
+        return callNode(nameNode("ord", range),
+                        {subscriptNode(nameNode(sourceName, range),
+                                       nameNode(indexName, range), range)},
+                        range);
+      };
+      NodePtr comprehension = parser::makeNode("comprehension", range);
+      parser::addField(*comprehension, "target", nameNode(indexName, range));
+      parser::addField(*comprehension, "iter",
+                       callNode(nameNode("range", range),
+                                {lenCall(nameNode(fromName, range), range)},
+                                range));
+      parser::addField(*comprehension, "ifs", std::vector<NodePtr>{});
+      parser::addField(*comprehension, "is_async", std::int64_t{0});
+      NodePtr tableComp = parser::makeNode("DictComp", range);
+      parser::addField(*tableComp, "key", ordAt(fromName));
+      parser::addField(*tableComp, "value", ordAt(toName));
+      parser::addField(*tableComp, "generators",
+                       std::vector<NodePtr>{std::move(comprehension)});
+      result = emitExpr(tableComp.get());
+    });
+    return result;
+  }
+
+  if (*attr != "translate")
+    return std::nullopt;
+  if (types.widenLiteral(types.inferExpr(receiver.get())) != types.strType())
+    return std::nullopt;
+  if (!args || args->size() != 1 || !args->front())
+    return rejectTranslate("str.translate takes exactly one table argument");
+  // A statically empty table maps nothing: the (immutable) receiver IS the
+  // result, and an empty literal's key/value types would stay unbound.
+  if ((*args)[0]->kind == "Dict") {
+    const auto *tableKeys = ast::nodeList(*(*args)[0], "keys");
+    if (!tableKeys || tableKeys->empty())
+      return coerceValue(emitExpr(receiver.get()), types.strType(), expr);
+  }
+  auto table = mlir::dyn_cast_if_present<py::ContractType>(
+      types.widenLiteral(types.inferExpr(args->front().get())));
+  if (!table || table.getContractName() != "builtins.dict" ||
+      table.getArguments().size() != 2)
+    return rejectTranslate("str.translate requires a dict table");
+  mlir::Type keyType = types.widenLiteral(table.getArguments()[0]);
+  mlir::Type valueType = types.widenLiteral(table.getArguments()[1]);
+  if (keyType != types.intType())
+    return rejectTranslate("str.translate table keys must be int "
+                           "(code points)");
+  bool intValues = valueType == types.intType();
+  if (!intValues && valueType != types.strType())
+    return rejectTranslate("str.translate table values must be int or str "
+                           "(None deletion is not supported yet)");
+
+  std::string sourceName = scratch("s");
+  std::string tableName = scratch("t");
+  std::string partsName = scratch("p");
+  std::string charName = scratch("c");
+  std::string ordName = scratch("o");
+  bool sourceIsName = receiver->kind == "Name";
+  bool tableIsName = (*args)[0]->kind == "Name";
+  NodePtr sourceRef = sourceIsName ? receiver : nameNode(sourceName, range);
+  NodePtr tableRef = tableIsName ? (*args)[0] : nameNode(tableName, range);
+  std::optional<Value> result;
+  runWithScratchNames({sourceName, tableName, partsName, charName, ordName},
+                      [&] {
+    if (!sourceIsName)
+      emitStatement(*assignNode(nameNode(sourceName, range), receiver,
+                                range));
+    if (!tableIsName)
+      emitStatement(*assignNode(nameNode(tableName, range), (*args)[0],
+                                range));
+    // __p: list[str] = []
+    NodePtr emptyList = parser::makeNode("List", range);
+    parser::addField(*emptyList, "elts", std::vector<NodePtr>{});
+    NodePtr annAssign = parser::makeNode("AnnAssign", range);
+    parser::addField(*annAssign, "target", nameNode(partsName, range));
+    parser::addField(*annAssign, "annotation",
+                     subscriptNode(nameNode("list", range),
+                                   nameNode("str", range), range));
+    parser::addField(*annAssign, "value", std::move(emptyList));
+    parser::addField(*annAssign, "simple", std::int64_t{1});
+    emitStatement(*annAssign);
+    // for __c in s: __o = ord(__c); mapped/pass-through appends
+    NodePtr mapped = subscriptNode(tableRef, nameNode(ordName, range), range);
+    if (intValues)
+      mapped = callNode(nameNode("chr", range), {std::move(mapped)}, range);
+    NodePtr appendMapped = parser::makeNode("Expr", range);
+    parser::addField(*appendMapped, "value",
+                     methodCallNode(nameNode(partsName, range), "append",
+                                    {std::move(mapped)}, range));
+    NodePtr appendPlain = parser::makeNode("Expr", range);
+    parser::addField(*appendPlain, "value",
+                     methodCallNode(nameNode(partsName, range), "append",
+                                    {nameNode(charName, range)}, range));
+    NodePtr branch = ifNode(
+        compareInNode(nameNode(ordName, range), tableRef, range),
+        {std::move(appendMapped)}, range);
+    parser::addField(*branch, "orelse",
+                     std::vector<NodePtr>{std::move(appendPlain)});
+    std::vector<NodePtr> body{
+        assignNode(nameNode(ordName, range),
+                   callNode(nameNode("ord", range),
+                            {nameNode(charName, range)}, range),
+                   range),
+        std::move(branch)};
+    emitFor(*forNode(nameNode(charName, range), sourceRef, std::move(body),
+                     {}, range));
+    // "".join(__p)
+    NodePtr joinCall =
+        methodCallNode(stringConstant("", range), "join",
+                       {nameNode(partsName, range)}, range);
+    result = emitExpr(joinCall.get());
+  });
+  return result;
+}
+
 // `x in d.keys()` is key membership; `v in d.values()` scans the values;
 // `(k, v) in d.items()` is key membership plus value equality. The views
 // have no runtime object, so the comparison rewrites against the dict

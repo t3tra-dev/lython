@@ -756,9 +756,57 @@ module attributes {
     method_kinds = ["instance"]
   } {}
 
-  py.class @frozenset attributes {base_names = ["AbstractSet", "Hashable"],
-                                 ly.typing.params = ["T"],
-                                 ly.typing.base_args = [[!py.contract<"$T">], []]} {}
+  py.class @frozenset attributes {
+    base_names = ["AbstractSet", "Hashable"],
+    ly.typing.params = ["T"],
+    ly.typing.param_variance = ["covariant"],
+    ly.typing.base_args = [[!py.contract<"$T">], []],
+    ly.runtime.contract = "builtins.frozenset", ly.runtime.required,
+    ly.runtime.required_deallocator,
+    ly.runtime.required_initializers = ["__new__"],
+    ly.runtime.required_methods = ["__len__"],
+    method_names = ["__new__", "__new__", "__init__", "__init__", "__len__",
+                    "__iter__",
+                    "__contains__", "__hash__", "__eq__", "__ne__",
+                    "union", "intersection", "difference",
+                    "symmetric_difference", "issubset", "issuperset",
+                    "isdisjoint", "__or__", "__and__", "__sub__", "__xor__",
+                    "__le__", "__lt__", "__ge__", "__gt__"],
+    method_contracts = [
+      !py.protocol<"Callable", [!py.type<!py.contract<"builtins.frozenset">>, !py.contract<"builtins.set", [!py.contract<"$T">]>] -> [!py.self]>,
+      !py.protocol<"Callable", [!py.type<!py.contract<"builtins.frozenset">>, !py.contract<"builtins.list", [!py.contract<"$T">]>] -> [!py.self]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.frozenset">, !py.contract<"builtins.set", [!py.contract<"$T">]>] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.frozenset">, !py.contract<"builtins.list", [!py.contract<"$T">]>] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.frozenset">] -> [!py.contract<"builtins.int">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.frozenset">] -> [!py.protocol<"Iterator", [!py.contract<"$T">]>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.frozenset">, !py.contract<"builtins.object">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.frozenset">] -> [!py.contract<"builtins.int">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.frozenset">, !py.contract<"builtins.object">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.frozenset">, !py.contract<"builtins.object">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.frozenset">, !py.contract<"builtins.frozenset", [!py.contract<"$T">]>] -> [!py.contract<"builtins.frozenset", [!py.contract<"$T">]>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.frozenset">, !py.contract<"builtins.frozenset", [!py.contract<"$T">]>] -> [!py.contract<"builtins.frozenset", [!py.contract<"$T">]>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.frozenset">, !py.contract<"builtins.frozenset", [!py.contract<"$T">]>] -> [!py.contract<"builtins.frozenset", [!py.contract<"$T">]>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.frozenset">, !py.contract<"builtins.frozenset", [!py.contract<"$T">]>] -> [!py.contract<"builtins.frozenset", [!py.contract<"$T">]>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.frozenset">, !py.contract<"builtins.frozenset">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.frozenset">, !py.contract<"builtins.frozenset">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.frozenset">, !py.contract<"builtins.frozenset">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.frozenset">, !py.contract<"builtins.frozenset", [!py.contract<"$T">]>] -> [!py.contract<"builtins.frozenset", [!py.contract<"$T">]>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.frozenset">, !py.contract<"builtins.frozenset", [!py.contract<"$T">]>] -> [!py.contract<"builtins.frozenset", [!py.contract<"$T">]>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.frozenset">, !py.contract<"builtins.frozenset", [!py.contract<"$T">]>] -> [!py.contract<"builtins.frozenset", [!py.contract<"$T">]>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.frozenset">, !py.contract<"builtins.frozenset", [!py.contract<"$T">]>] -> [!py.contract<"builtins.frozenset", [!py.contract<"$T">]>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.frozenset">, !py.contract<"builtins.frozenset">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.frozenset">, !py.contract<"builtins.frozenset">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.frozenset">, !py.contract<"builtins.frozenset">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.frozenset">, !py.contract<"builtins.frozenset">] -> [!py.contract<"builtins.bool">]>
+    ],
+    method_kinds = ["classmethod", "classmethod", "instance", "instance",
+                    "instance",
+                    "instance", "instance", "instance", "instance",
+                    "instance", "instance", "instance", "instance",
+                    "instance", "instance", "instance", "instance",
+                    "instance", "instance", "instance", "instance",
+                    "instance", "instance", "instance", "instance"]
+  } {}
   py.class @range attributes {base_names = ["Sequence", "Hashable"],
                              ly.typing.base_args = [[!py.contract<"builtins.int">], []],
                              ly.typing.final,
@@ -17087,6 +17135,210 @@ module attributes {
     cf.br ^done
 
   ^done:
+    func.return
+  }
+
+  // ===== impls: frozenset =====
+  // Physically a set (dense insertion-ordered boxed slots) with class id 23
+  // and no mutators. The wrappers delegate to the set bodies and restamp
+  // the result header's class id; hashing is CPython's frozenset_hash
+  // (commutative shuffle-xor over entry hashes, so equal frozensets hash
+  // equal regardless of insertion order).
+  func.func private @LyFrozenSet_Shape() -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.runtime.contract = "builtins.frozenset", ly.runtime.shape}
+
+  func.func private @__ly_frozenset_stamp(%header: memref<2xi64>) {
+    %class_id = arith.constant 23 : i64
+    %layout_slot = arith.constant 1 : index
+    memref.store %class_id, %header[%layout_slot] : memref<2xi64>
+    func.return
+  }
+
+  // frozenset(iterable): dedupe through the set probe (the source may be a
+  // list/tuple with repeats; sets are already unique but share the loop).
+  func.func @LyFrozenSet_FromElements(%oh: memref<2xi64> {ly.ownership.object_header}, %om: memref<2xi64>, %oi: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 23 : i64, ly.runtime.contract = "builtins.frozenset", ly.runtime.initializer = "__new__"} {
+    %class_id = arith.constant 23 : i64
+    %zero = arith.constant 0 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c16_i64 = arith.constant 16 : i64
+    %minus_one = arith.constant -1 : i64
+    %olen = memref.load %om[%c0] : memref<2xi64>
+    %fresh:3 = func.call @__ly_sequence_alloc(%class_id, %zero) : (i64, i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    memref.store %zero, %fresh#1[%c0] : memref<2xi64>
+    %oi_idx = memref.extract_aligned_pointer_as_index %oi : memref<?xi64> -> index
+    %oi_i64 = arith.index_cast %oi_idx : index to i64
+    %oi_ptr = llvm.inttoptr %oi_i64 : i64 to !llvm.ptr
+    %olen_index = arith.index_cast %olen : i64 to index
+    %filled:3 = scf.for %i = %c0 to %olen_index step %c1 iter_args(%h = %fresh#0, %m = %fresh#1, %it = %fresh#2) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) {
+      %ii = arith.index_cast %i : index to i64
+      %off = arith.muli %ii, %c16_i64 : i64
+      %entry = llvm.getelementptr %oi_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %entry_hash = func.call @__ly_box_hash(%entry) : (!llvm.ptr) -> i64
+      %found = func.call @__ly_set_probe(%m, %it, %entry, %entry_hash) : (memref<2xi64>, memref<?xi64>, !llvm.ptr, i64) -> i64
+      %absent = arith.cmpi eq, %found, %minus_one : i64
+      %next:3 = scf.if %absent -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) {
+        %ins:3 = func.call @__ly_set_insert_slot(%h, %m, %it, %oi, %i) : (memref<2xi64>, memref<2xi64>, memref<?xi64>, memref<?xi64>, index) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+        scf.yield %ins#0, %ins#1, %ins#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+      } else {
+        scf.yield %h, %m, %it : memref<2xi64>, memref<2xi64>, memref<?xi64>
+      }
+      scf.yield %next#0, %next#1, %next#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+    }
+    func.call @__ly_frozenset_stamp(%filled#0) : (memref<2xi64>) -> ()
+    func.return %filled#0, %filled#1, %filled#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  }
+
+  // __init__ is a no-op: frozenset is immutable, so __new__ (FromElements)
+  // already absorbed the source; CPython splits construction the same way.
+  func.func @LyFrozenSet_Init(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>, %oh: memref<2xi64> {ly.ownership.object_header}, %om: memref<2xi64>, %oi: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.ownership.transfer_args = [0], ly.runtime.contract = "builtins.frozenset", ly.runtime.method = "__init__", ly.runtime.result_contract = "builtins.frozenset", ly.runtime.result_evidence = "receiver"} {
+    func.return %header, %meta, %items : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  }
+
+  func.func @LyFrozenSet_Len(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>) -> i64 attributes {ly.runtime.contract = "builtins.frozenset", ly.runtime.method = "__len__"} {
+    %length_slot = arith.constant 0 : index
+    %length = memref.load %meta[%length_slot] : memref<2xi64>
+    func.return %length : i64
+  }
+
+  func.func @LyFrozenSet_ContainsBox(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>, %elem_box: memref<16xi64>) -> i1 attributes {ly.runtime.contract = "builtins.frozenset", ly.runtime.primitive = "contains_box"} {
+    %result = func.call @LySet_ContainsBox(%header, %meta, %items, %elem_box) : (memref<2xi64>, memref<2xi64>, memref<?xi64>, memref<16xi64>) -> i1
+    func.return %result : i1
+  }
+
+  // CPython setobject.c frozenset_hash: commutative shuffle-xor, then a
+  // length-dependent scramble (all arithmetic wraps mod 2^64 by design).
+  func.func @LyFrozenSet_Hash(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>) -> i64 attributes {ly.runtime.contract = "builtins.frozenset", ly.runtime.method = "__hash__"} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c16_i64 = arith.constant 16 : i64
+    %c16_shift = arith.constant 16 : i64
+    %magic1 = arith.constant 89869747 : i64
+    %magic2 = arith.constant 3644798167 : i64
+    %magic3 = arith.constant 1927868237 : i64
+    %magic4 = arith.constant 69069 : i64
+    %magic5 = arith.constant 907133923 : i64
+    %minus_one = arith.constant -1 : i64
+    %substitute = arith.constant 590923713 : i64
+    %one = arith.constant 1 : i64
+    %zero = arith.constant 0 : i64
+    %len = memref.load %meta[%c0] : memref<2xi64>
+    %len_index = arith.index_cast %len : i64 to index
+    %items_idx = memref.extract_aligned_pointer_as_index %items : memref<?xi64> -> index
+    %items_i64 = arith.index_cast %items_idx : index to i64
+    %items_ptr = llvm.inttoptr %items_i64 : i64 to !llvm.ptr
+    %mixed = scf.for %i = %c0 to %len_index step %c1 iter_args(%h = %zero) -> (i64) {
+      %ii = arith.index_cast %i : index to i64
+      %off = arith.muli %ii, %c16_i64 : i64
+      %entry = llvm.getelementptr %items_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %eh = func.call @__ly_box_hash(%entry) : (!llvm.ptr) -> i64
+      %x1 = arith.xori %eh, %magic1 : i64
+      %shifted = arith.shli %eh, %c16_shift : i64
+      %x2 = arith.xori %x1, %shifted : i64
+      %shuffled = arith.muli %x2, %magic2 : i64
+      %next = arith.xori %h, %shuffled : i64
+      scf.yield %next : i64
+    }
+    %lenp1 = arith.addi %len, %one : i64
+    %scale = arith.muli %lenp1, %magic3 : i64
+    %h2 = arith.xori %mixed, %scale : i64
+    %h3 = arith.muli %h2, %magic4 : i64
+    %h4 = arith.addi %h3, %magic5 : i64
+    %is_minus_one = arith.cmpi eq, %h4, %minus_one : i64
+    %final = arith.select %is_minus_one, %substitute, %h4 : i1, i64
+    func.return %final : i64
+  }
+
+  func.func @LyFrozenSet_EqBool(%lh: memref<2xi64> {ly.ownership.object_header}, %lm: memref<2xi64>, %li: memref<?xi64>, %rh: memref<2xi64> {ly.ownership.object_header}, %rm: memref<2xi64>, %ri: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.frozenset", ly.runtime.method = "__eq__"} {
+    %result = func.call @LySet_EqBool(%lh, %lm, %li, %rh, %rm, %ri) : (memref<2xi64>, memref<2xi64>, memref<?xi64>, memref<2xi64>, memref<2xi64>, memref<?xi64>) -> i1
+    func.return %result : i1
+  }
+
+  func.func @LyFrozenSet_NeBool(%lh: memref<2xi64> {ly.ownership.object_header}, %lm: memref<2xi64>, %li: memref<?xi64>, %rh: memref<2xi64> {ly.ownership.object_header}, %rm: memref<2xi64>, %ri: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.frozenset", ly.runtime.method = "__ne__"} {
+    %result = func.call @LySet_NeBool(%lh, %lm, %li, %rh, %rm, %ri) : (memref<2xi64>, memref<2xi64>, memref<?xi64>, memref<2xi64>, memref<2xi64>, memref<?xi64>) -> i1
+    func.return %result : i1
+  }
+
+  func.func @LyFrozenSet_Union(%lh: memref<2xi64> {ly.ownership.object_header}, %lm: memref<2xi64>, %li: memref<?xi64>, %rh: memref<2xi64> {ly.ownership.object_header}, %rm: memref<2xi64>, %ri: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.frozenset", ly.runtime.method = "union", ly.runtime.result_contract = "builtins.frozenset"} {
+    %result:3 = func.call @LySet_Union(%lh, %lm, %li, %rh, %rm, %ri) : (memref<2xi64>, memref<2xi64>, memref<?xi64>, memref<2xi64>, memref<2xi64>, memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    func.call @__ly_frozenset_stamp(%result#0) : (memref<2xi64>) -> ()
+    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  }
+
+  func.func @LyFrozenSet_Intersection(%lh: memref<2xi64> {ly.ownership.object_header}, %lm: memref<2xi64>, %li: memref<?xi64>, %rh: memref<2xi64> {ly.ownership.object_header}, %rm: memref<2xi64>, %ri: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.frozenset", ly.runtime.method = "intersection", ly.runtime.result_contract = "builtins.frozenset"} {
+    %result:3 = func.call @LySet_Intersection(%lh, %lm, %li, %rh, %rm, %ri) : (memref<2xi64>, memref<2xi64>, memref<?xi64>, memref<2xi64>, memref<2xi64>, memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    func.call @__ly_frozenset_stamp(%result#0) : (memref<2xi64>) -> ()
+    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  }
+
+  func.func @LyFrozenSet_Difference(%lh: memref<2xi64> {ly.ownership.object_header}, %lm: memref<2xi64>, %li: memref<?xi64>, %rh: memref<2xi64> {ly.ownership.object_header}, %rm: memref<2xi64>, %ri: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.frozenset", ly.runtime.method = "difference", ly.runtime.result_contract = "builtins.frozenset"} {
+    %result:3 = func.call @LySet_Difference(%lh, %lm, %li, %rh, %rm, %ri) : (memref<2xi64>, memref<2xi64>, memref<?xi64>, memref<2xi64>, memref<2xi64>, memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    func.call @__ly_frozenset_stamp(%result#0) : (memref<2xi64>) -> ()
+    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  }
+
+  func.func @LyFrozenSet_SymmetricDifference(%lh: memref<2xi64> {ly.ownership.object_header}, %lm: memref<2xi64>, %li: memref<?xi64>, %rh: memref<2xi64> {ly.ownership.object_header}, %rm: memref<2xi64>, %ri: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.frozenset", ly.runtime.method = "symmetric_difference", ly.runtime.result_contract = "builtins.frozenset"} {
+    %result:3 = func.call @LySet_SymmetricDifference(%lh, %lm, %li, %rh, %rm, %ri) : (memref<2xi64>, memref<2xi64>, memref<?xi64>, memref<2xi64>, memref<2xi64>, memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    func.call @__ly_frozenset_stamp(%result#0) : (memref<2xi64>) -> ()
+    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  }
+
+  func.func @LyFrozenSet_OrOp(%lh: memref<2xi64> {ly.ownership.object_header}, %lm: memref<2xi64>, %li: memref<?xi64>, %rh: memref<2xi64> {ly.ownership.object_header}, %rm: memref<2xi64>, %ri: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.frozenset", ly.runtime.method = "__or__", ly.runtime.result_contract = "builtins.frozenset"} {
+    %result:3 = func.call @LyFrozenSet_Union(%lh, %lm, %li, %rh, %rm, %ri) : (memref<2xi64>, memref<2xi64>, memref<?xi64>, memref<2xi64>, memref<2xi64>, memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  }
+
+  func.func @LyFrozenSet_AndOp(%lh: memref<2xi64> {ly.ownership.object_header}, %lm: memref<2xi64>, %li: memref<?xi64>, %rh: memref<2xi64> {ly.ownership.object_header}, %rm: memref<2xi64>, %ri: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.frozenset", ly.runtime.method = "__and__", ly.runtime.result_contract = "builtins.frozenset"} {
+    %result:3 = func.call @LyFrozenSet_Intersection(%lh, %lm, %li, %rh, %rm, %ri) : (memref<2xi64>, memref<2xi64>, memref<?xi64>, memref<2xi64>, memref<2xi64>, memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  }
+
+  func.func @LyFrozenSet_SubOp(%lh: memref<2xi64> {ly.ownership.object_header}, %lm: memref<2xi64>, %li: memref<?xi64>, %rh: memref<2xi64> {ly.ownership.object_header}, %rm: memref<2xi64>, %ri: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.frozenset", ly.runtime.method = "__sub__", ly.runtime.result_contract = "builtins.frozenset"} {
+    %result:3 = func.call @LyFrozenSet_Difference(%lh, %lm, %li, %rh, %rm, %ri) : (memref<2xi64>, memref<2xi64>, memref<?xi64>, memref<2xi64>, memref<2xi64>, memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  }
+
+  func.func @LyFrozenSet_XorOp(%lh: memref<2xi64> {ly.ownership.object_header}, %lm: memref<2xi64>, %li: memref<?xi64>, %rh: memref<2xi64> {ly.ownership.object_header}, %rm: memref<2xi64>, %ri: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.frozenset", ly.runtime.method = "__xor__", ly.runtime.result_contract = "builtins.frozenset"} {
+    %result:3 = func.call @LyFrozenSet_SymmetricDifference(%lh, %lm, %li, %rh, %rm, %ri) : (memref<2xi64>, memref<2xi64>, memref<?xi64>, memref<2xi64>, memref<2xi64>, memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  }
+
+  func.func @LyFrozenSet_IsSubset(%lh: memref<2xi64> {ly.ownership.object_header}, %lm: memref<2xi64>, %li: memref<?xi64>, %rh: memref<2xi64> {ly.ownership.object_header}, %rm: memref<2xi64>, %ri: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.frozenset", ly.runtime.method = "issubset"} {
+    %result = func.call @LySet_IsSubset(%lh, %lm, %li, %rh, %rm, %ri) : (memref<2xi64>, memref<2xi64>, memref<?xi64>, memref<2xi64>, memref<2xi64>, memref<?xi64>) -> i1
+    func.return %result : i1
+  }
+
+  func.func @LyFrozenSet_IsSuperset(%lh: memref<2xi64> {ly.ownership.object_header}, %lm: memref<2xi64>, %li: memref<?xi64>, %rh: memref<2xi64> {ly.ownership.object_header}, %rm: memref<2xi64>, %ri: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.frozenset", ly.runtime.method = "issuperset"} {
+    %result = func.call @LySet_IsSuperset(%lh, %lm, %li, %rh, %rm, %ri) : (memref<2xi64>, memref<2xi64>, memref<?xi64>, memref<2xi64>, memref<2xi64>, memref<?xi64>) -> i1
+    func.return %result : i1
+  }
+
+  func.func @LyFrozenSet_IsDisjoint(%lh: memref<2xi64> {ly.ownership.object_header}, %lm: memref<2xi64>, %li: memref<?xi64>, %rh: memref<2xi64> {ly.ownership.object_header}, %rm: memref<2xi64>, %ri: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.frozenset", ly.runtime.method = "isdisjoint"} {
+    %result = func.call @LySet_IsDisjoint(%lh, %lm, %li, %rh, %rm, %ri) : (memref<2xi64>, memref<2xi64>, memref<?xi64>, memref<2xi64>, memref<2xi64>, memref<?xi64>) -> i1
+    func.return %result : i1
+  }
+
+  func.func @LyFrozenSet_LeBool(%lh: memref<2xi64> {ly.ownership.object_header}, %lm: memref<2xi64>, %li: memref<?xi64>, %rh: memref<2xi64> {ly.ownership.object_header}, %rm: memref<2xi64>, %ri: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.frozenset", ly.runtime.method = "__le__"} {
+    %result = func.call @LySet_LeBool(%lh, %lm, %li, %rh, %rm, %ri) : (memref<2xi64>, memref<2xi64>, memref<?xi64>, memref<2xi64>, memref<2xi64>, memref<?xi64>) -> i1
+    func.return %result : i1
+  }
+
+  func.func @LyFrozenSet_LtBool(%lh: memref<2xi64> {ly.ownership.object_header}, %lm: memref<2xi64>, %li: memref<?xi64>, %rh: memref<2xi64> {ly.ownership.object_header}, %rm: memref<2xi64>, %ri: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.frozenset", ly.runtime.method = "__lt__"} {
+    %result = func.call @LySet_LtBool(%lh, %lm, %li, %rh, %rm, %ri) : (memref<2xi64>, memref<2xi64>, memref<?xi64>, memref<2xi64>, memref<2xi64>, memref<?xi64>) -> i1
+    func.return %result : i1
+  }
+
+  func.func @LyFrozenSet_GeBool(%lh: memref<2xi64> {ly.ownership.object_header}, %lm: memref<2xi64>, %li: memref<?xi64>, %rh: memref<2xi64> {ly.ownership.object_header}, %rm: memref<2xi64>, %ri: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.frozenset", ly.runtime.method = "__ge__"} {
+    %result = func.call @LySet_GeBool(%lh, %lm, %li, %rh, %rm, %ri) : (memref<2xi64>, memref<2xi64>, memref<?xi64>, memref<2xi64>, memref<2xi64>, memref<?xi64>) -> i1
+    func.return %result : i1
+  }
+
+  func.func @LyFrozenSet_GtBool(%lh: memref<2xi64> {ly.ownership.object_header}, %lm: memref<2xi64>, %li: memref<?xi64>, %rh: memref<2xi64> {ly.ownership.object_header}, %rm: memref<2xi64>, %ri: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.frozenset", ly.runtime.method = "__gt__"} {
+    %result = func.call @LySet_GtBool(%lh, %lm, %li, %rh, %rm, %ri) : (memref<2xi64>, memref<2xi64>, memref<?xi64>, memref<2xi64>, memref<2xi64>, memref<?xi64>) -> i1
+    func.return %result : i1
+  }
+
+  func.func @LyFrozenSet_DecRef(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.frozenset", ly.runtime.deallocator} {
+    func.call @LySet_DecRef(%header, %meta, %items) : (memref<2xi64>, memref<2xi64>, memref<?xi64>) -> ()
     func.return
   }
 

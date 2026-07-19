@@ -1004,12 +1004,13 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerContains(py::ContainsOp op) {
   const RuntimeBundle container = *sources.front();
   const RuntimeBundle item = *sources.back();
   bool runtimeSetProbe = container.kind == RuntimeBundle::Kind::Object &&
-                         container.contractName() == "builtins.set" &&
+                         (container.contractName() == "builtins.set" ||
+                          container.contractName() == "builtins.frozenset") &&
                          container.physicalValues().size() >= 3;
+  // Evidence-backed dicts probe the payload too — a runtime key (int
+  // variable, frozenset) has no literal-key evidence to consult.
   bool runtimeDictProbe = container.kind == RuntimeBundle::Kind::Object &&
                           container.contractName() == "builtins.dict" &&
-                          !container.mappingEvidenceBacked &&
-                          container.mappingKeys.empty() &&
                           container.physicalValues().size() >= 5;
   // Membership probe with a BORROWED transient element box (hash-based for
   // set/dict, identity-or-equality scan for list/tuple), then pin both the
@@ -1228,9 +1229,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIter(py::IterOp op) {
                                iterable->sequenceElements.empty() &&
                                !iterable->evidenceIteratorCell &&
                                iterable->physicalValues().size() >= 5;
-    // Runtime sets share the list's physical layout exactly (meta at [1],
-    // boxed slots at [2]), so the runtime-list next path applies verbatim.
-    bool runtimeSetIterable = iterable->contractName() == "builtins.set" &&
+    // Runtime sets (and frozensets — identical layout) share the list's
+    // physical layout exactly (meta at [1], boxed slots at [2]), so the
+    // runtime-list next path applies verbatim.
+    bool runtimeSetIterable = (iterable->contractName() == "builtins.set" ||
+                               iterable->contractName() ==
+                                   "builtins.frozenset") &&
                               iterable->sequenceElements.empty() &&
                               !iterable->evidenceIteratorCell &&
                               iterable->physicalValues().size() >= 3;
@@ -1391,7 +1395,8 @@ RuntimeBundleLowerer::lowerListRuntimeNext(py::NextOp op,
   // since the iterator was created (CPython's mutation-during-iteration
   // guard; the size at creation sits in cell word 1).
   bool guardsMutation = iterator.contractName() == "builtins.dict" ||
-                        iterator.contractName() == "builtins.set";
+                        iterator.contractName() == "builtins.set" ||
+                        iterator.contractName() == "builtins.frozenset";
   if (guardsMutation) {
     mlir::Value initialSlot =
         mlir::arith::ConstantIndexOp::create(builder, loc, 1);

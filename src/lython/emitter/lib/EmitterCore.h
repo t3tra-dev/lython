@@ -179,6 +179,10 @@ private:
   // `x in d.keys()/values()/items()` and `len(d.keys())` rewrite against the
   // dict itself.
   std::optional<Value> tryEmitDictViewMembership(const parser::Node &expr);
+  // str.maketrans / str.translate compositions (EmitterIterators.cpp).
+  std::optional<Value>
+  tryEmitStrTranslateSugar(const parser::Node &expr,
+                           const parser::Node *calleeNode);
   // sorted(key=, reverse=) / list.sort(key=, reverse=):
   // decorate-sort-undecorate over the native stable sort.
   std::optional<Value> tryEmitSortSugar(const parser::Node &expr,

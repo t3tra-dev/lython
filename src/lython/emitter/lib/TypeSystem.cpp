@@ -1028,6 +1028,7 @@ void TypeSystem::seedBuiltins() {
   bindClass("float", floatType());
   bindClass("str", strType());
   bindClass("bytes", contract("builtins.bytes"));
+  bindClass("frozenset", contract("builtins.frozenset"));
   // The whole builtin exception taxonomy binds from the shared table so the
   // emitter's name surface cannot drift from the class-id hierarchy the
   // runtime matches against. Non-builtins members (asyncio.CancelledError,
