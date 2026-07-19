@@ -1,0 +1,8 @@
+net: ExceptionGroup('mixed', [NetError('timeout', 30)]) 1
+app: ExceptionGroup('mixed', [AppError('boom')]) 1
+val: ExceptionGroup('mixed', [ValueError('bad', 1, 2)]) 1
+app 1
+net 1
+val 1
+total: 3
+args: ('solo', 1, 2, 3)
