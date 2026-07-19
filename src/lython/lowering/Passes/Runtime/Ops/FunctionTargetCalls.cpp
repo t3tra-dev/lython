@@ -452,17 +452,45 @@ RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(
     llvm::SmallVector<mlir::Value, 8> operands;
     unsigned inputIndex = 0;
     for (auto [sourceIndex, source] : llvm::enumerate(sources)) {
-      if (!RuntimeBundleLowerer::hasPrimitiveI64Evidence(source))
+      mlir::Value evidenceValue;
+      mlir::Value evidenceValid;
+      if (RuntimeBundleLowerer::hasPrimitiveI64Evidence(source)) {
+        evidenceValue = source->primitiveI64->value;
+        evidenceValid = source->primitiveI64->valid;
+      } else if (source && source->contractName() == "builtins.int" &&
+                 !source->physicalValues().empty()) {
+        // Boxed-only int (a runtime container element, e.g. map(f, xs)
+        // applying f inside a synthesized generator): recover the evidence
+        // pair through the manifest unbox — it raises on ints outside the
+        // i64 lane, which is the same loud boundary every primitive-clone
+        // caller has.
+        std::optional<RuntimeSymbol> unbox =
+            manifest.primitive("builtins.int", "unbox.i64");
+        if (!unbox || unbox->function.getNumArguments() !=
+                          source->physicalValues().size())
+          return op.emitError()
+                 << "primitive i64 callable clone '" << targetName
+                 << "' argument " << sourceIndex
+                 << " is a boxed int with no matching unbox.i64 primitive";
+        builder.setInsertionPoint(op);
+        mlir::func::CallOp unboxed = RuntimeBundleLowerer::createRuntimeCall(
+            op.getLoc(), *unbox, source->physicalValues());
+        evidenceValue = unboxed.getResult(0);
+        evidenceValid =
+            mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 1, 1)
+                .getResult();
+      } else {
         return op.emitError() << "primitive i64 callable clone '" << targetName
                               << "' argument " << sourceIndex
                               << " has no primitive i64 evidence";
+      }
       if (inputIndex + 2 > functionType.getNumInputs() ||
           !functionType.getInput(inputIndex).isInteger(64) ||
           !functionType.getInput(inputIndex + 1).isInteger(1))
         return op.emitError() << "primitive i64 callable clone '" << targetName
                               << "' has malformed ABI at input " << inputIndex;
-      operands.push_back(source->primitiveI64->value);
-      operands.push_back(source->primitiveI64->valid);
+      operands.push_back(evidenceValue);
+      operands.push_back(evidenceValid);
       inputIndex += 2;
     }
     if (inputIndex != functionType.getNumInputs())

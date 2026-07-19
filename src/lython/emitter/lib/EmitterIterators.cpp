@@ -5,6 +5,9 @@
 #include "AstAccess.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/raw_ostream.h"
+
+#include <map>
 
 #include <optional>
 #include <string>
@@ -595,7 +598,7 @@ bool ModuleEmitter::tryEmitLazyIteratorFor(const parser::Node &statement,
     return true;
   }
 
-  // ---- reversed(X) ----------------------------------------------------------
+  // ---- reversed(X) in for position ------------------------------------------
   if (name == "reversed") {
     if (!args || args->size() != 1 || (keywords && !keywords->empty()))
       return reject("reversed() requires exactly one sequence argument");
@@ -636,6 +639,324 @@ bool ModuleEmitter::tryEmitLazyIteratorFor(const parser::Node &statement,
   }
 
   return false;
+}
+
+// ---------------------------------------------------------------------------
+// Value form: enumerate/zip/map/filter/reversed/iter used as first-class
+// values compile to per-call-site synthesized generator FUNCTIONS over
+// indexable sequences (len + int __getitem__): the generator object gives
+// CPython's observable laziness (next(), partial consumption, interleaved
+// side effects). Bodies use index-based while loops on purpose — a for loop
+// over a runtime sequence keeps its position in a function-local cell,
+// which cannot survive a suspension, while an int index rides an int frame
+// lane. Sources that are not indexable (dict/set/another generator) are
+// rejected loudly: their iteration state cannot cross the suspension
+// boundary yet, and the for-statement fusion above already covers them in
+// loop position.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// def <symbol>(<params>): <body> — parameters carry no annotations; the
+// caller pins their types through TypeSystem::overrideParameterType.
+NodePtr makeSyntheticGeneratorDef(
+    const std::string &name, llvm::ArrayRef<std::string> params,
+    std::vector<NodePtr> body, parser::SourceRange range,
+    llvm::SmallVectorImpl<const parser::Node *> &paramNodes) {
+  NodePtr def = parser::makeNode("FunctionDef", range);
+  parser::addField(*def, "name", name);
+  NodePtr arguments = parser::makeNode("arguments", range);
+  std::vector<NodePtr> argNodes;
+  for (const std::string &param : params) {
+    NodePtr arg = parser::makeNode("arg", range);
+    parser::addField(*arg, "arg", param);
+    paramNodes.push_back(arg.get());
+    argNodes.push_back(std::move(arg));
+  }
+  parser::addField(*arguments, "posonlyargs", std::vector<NodePtr>{});
+  parser::addField(*arguments, "args", std::move(argNodes));
+  parser::addField(*arguments, "kwonlyargs", std::vector<NodePtr>{});
+  parser::addField(*arguments, "kw_defaults", std::vector<NodePtr>{});
+  parser::addField(*arguments, "defaults", std::vector<NodePtr>{});
+  parser::addField(*def, "args", std::move(arguments));
+  parser::addField(*def, "body", std::move(body));
+  return def;
+}
+
+NodePtr yieldNode(NodePtr value, parser::SourceRange range) {
+  NodePtr yield = parser::makeNode("Yield", range);
+  parser::addField(*yield, "value", std::move(value));
+  NodePtr statement = parser::makeNode("Expr", range);
+  parser::addField(*statement, "value", std::move(yield));
+  return statement;
+}
+
+NodePtr trueConstant(parser::SourceRange range) {
+  NodePtr node = parser::makeNode("Constant", range);
+  parser::addField(*node, "value", true);
+  return node;
+}
+
+std::string typeKey(mlir::Type type) {
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  stream << type;
+  return text;
+}
+
+} // namespace
+
+std::optional<Value>
+ModuleEmitter::tryEmitLazyIteratorValueCall(const parser::Node &expr,
+                                            const parser::Node *calleeNode) {
+  if (!calleeNode || calleeNode->kind != "Name")
+    return std::nullopt;
+  llvm::StringRef name = ast::nameSpelling(*calleeNode);
+  if (name != "enumerate" && name != "zip" && name != "map" &&
+      name != "filter" && name != "reversed" && name != "iter")
+    return std::nullopt;
+  if (!isBuiltinIteratorName(name))
+    return std::nullopt;
+
+  auto rejectValue = [&](llvm::StringRef reason) -> std::optional<Value> {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start, std::string(reason)});
+    return emitNone(expr);
+  };
+
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  if (args)
+    for (const NodePtr &arg : *args)
+      if (arg && arg->kind == "Starred")
+        return std::nullopt;
+  parser::SourceRange range = expr.range;
+
+  // Split off the callable argument for map/filter (spelled into the body,
+  // not passed as a value: a callable has no generator argument lane).
+  LazyCallable callable;
+  bool identityPredicate = false;
+  unsigned firstIterable = 0;
+  if (name == "map" || name == "filter") {
+    if (keywords && !keywords->empty())
+      return rejectValue("map()/filter() take no keyword arguments");
+    if (!args || args->size() < 2)
+      return rejectValue("map()/filter() require a callable and iterable(s)");
+    NodePtr predicate = (*args)[0];
+    identityPredicate = name == "filter" && predicate &&
+                        predicate->kind == "Constant" &&
+                        ast::isNoneField(*predicate, "value");
+    if (!identityPredicate && !lazyCallableParts(expr, predicate, callable))
+      return emitNone(expr);
+    firstIterable = 1;
+    if (name == "filter" && args->size() != 2)
+      return rejectValue("filter() takes exactly one iterable");
+  }
+
+  // enumerate start argument (second positional or start= keyword).
+  const parser::Node *startNode = nullptr;
+  if (name == "enumerate") {
+    if (!args || args->empty() || args->size() > 2)
+      return rejectValue("enumerate() takes an iterable and an optional start");
+    if (args->size() == 2)
+      startNode = (*args)[1].get();
+    if (keywords && !keywords->empty()) {
+      if (keywords->size() != 1 || startNode ||
+          ast::string(*(*keywords)[0], "arg").value_or("") != "start")
+        return rejectValue("enumerate() got unexpected keyword arguments");
+      startNode = ast::node(*(*keywords)[0], "value");
+    }
+  } else if (name != "map" && keywords && !keywords->empty()) {
+    return rejectValue(std::string(name) + "() takes no keyword arguments");
+  }
+
+  unsigned iterableCount =
+      args ? static_cast<unsigned>(args->size()) - firstIterable : 0;
+  if (name == "enumerate" && startNode)
+    iterableCount = 1;
+  if ((name == "iter" || name == "reversed" || name == "enumerate" ||
+       name == "filter") &&
+      iterableCount != 1)
+    return rejectValue(std::string(name) + "() takes exactly one iterable");
+  if (name == "zip" && iterableCount < 2)
+    return rejectValue("zip() requires at least two iterables");
+  if (name == "map" && iterableCount < 1)
+    return rejectValue("map() requires at least one iterable");
+
+  // Emit the iterable arguments (CPython argument evaluation order: the
+  // callable spelling is not a value here, so iterables evaluate first —
+  // observably identical because Name/Attribute/Lambda evaluation has no
+  // effects).
+  llvm::SmallVector<Value, 4> iterableValues;
+  llvm::SmallVector<const parser::Node *, 4> iterableNodes;
+  for (unsigned index = 0; index < iterableCount; ++index)
+    iterableNodes.push_back((*args)[firstIterable + index].get());
+  for (const parser::Node *node : iterableNodes)
+    iterableValues.push_back(emitExpr(node));
+
+  // iter(x) over something that is already an iterator returns it as-is
+  // (CPython: iter(gen) is gen).
+  if (name == "iter" &&
+      types.inferMethodCallWithEvidence(iterableValues.front().type,
+                                        "__next__", {}))
+    return iterableValues.front();
+
+  for (const Value &value : iterableValues) {
+    mlir::Type widened = types.widenLiteral(value.type);
+    if (!types.inferMethodCallWithEvidence(widened, "__len__", {}) ||
+        !types.inferMethodCallWithEvidence(widened, "__getitem__",
+                                           {types.intType()}))
+      return rejectValue(
+          std::string(name) +
+          "() as a value requires indexable sequences (list/str/tuple/"
+          "bytes); iterate non-indexable sources directly in a for loop, or "
+          "convert with list(...) first");
+  }
+
+  // enumerate start value.
+  std::optional<Value> startValue;
+  if (name == "enumerate") {
+    if (startNode)
+      startValue = emitExpr(startNode);
+    else {
+      mlir::Type zeroType = types.literal("0");
+      auto zero = py::IntConstantOp::create(builder, loc(expr), zeroType,
+                                            builder.getStringAttr("0"));
+      startValue = Value{zero.getResult(), zeroType};
+    }
+  }
+
+  // Memoized synthesis, keyed by builtin + argument types + the callable's
+  // spelling (map/filter bodies inline it syntactically).
+  std::string memoKey = name.str();
+  for (const Value &value : iterableValues)
+    memoKey += "|" + typeKey(types.widenLiteral(value.type));
+  if (callable.callee)
+    memoKey += "|f:" + ast::qualifiedName(callable.callee.get());
+  else if (callable.lambdaBody) {
+    llvm::raw_string_ostream stream(memoKey);
+    stream << "|lambda:" << callable.lambdaBody.get();
+  } else if (identityPredicate) {
+    memoKey += "|pred:None";
+  }
+
+  auto memoized = lazyIteratorMemo.find(memoKey);
+  if (memoized == lazyIteratorMemo.end()) {
+    unsigned serial = ++syntheticFunctionCounter;
+    std::string symbol =
+        ("__lyiter$" + name + "$" + llvm::Twine(serial)).str();
+
+    llvm::SmallVector<std::string, 4> params;
+    for (unsigned index = 0; index < iterableCount; ++index)
+      params.push_back("__lyit" + std::to_string(index));
+    if (name == "enumerate")
+      params.push_back("__lyn");
+
+    parser::SourceRange bodyRange = range;
+    auto param = [&](unsigned index) {
+      return nameNode(params[index], bodyRange);
+    };
+    NodePtr indexRef = nameNode("__lyi", bodyRange);
+
+    std::vector<NodePtr> loopBody;
+    for (unsigned index = 0; index < iterableCount; ++index)
+      loopBody.push_back(
+          ifNode(compareNode(indexRef, "GtE", lenCall(param(index), bodyRange),
+                             bodyRange),
+                 {parser::makeNode("Break", bodyRange)}, bodyRange));
+    auto elementAt = [&](unsigned index) {
+      return subscriptNode(param(index), indexRef, bodyRange);
+    };
+
+    if (name == "iter") {
+      loopBody.push_back(yieldNode(elementAt(0), bodyRange));
+    } else if (name == "enumerate") {
+      loopBody.push_back(yieldNode(
+          tupleNode({nameNode(params.back(), bodyRange), elementAt(0)},
+                    bodyRange),
+          bodyRange));
+      loopBody.push_back(assignNode(
+          nameNode(params.back(), bodyRange),
+          binOpNode(nameNode(params.back(), bodyRange), "Add",
+                    intConstant(1, bodyRange), bodyRange),
+          bodyRange));
+    } else if (name == "zip") {
+      std::vector<NodePtr> elements;
+      for (unsigned index = 0; index < iterableCount; ++index)
+        elements.push_back(elementAt(index));
+      loopBody.push_back(
+          yieldNode(tupleNode(std::move(elements), bodyRange), bodyRange));
+    } else if (name == "map") {
+      std::vector<NodePtr> arguments;
+      for (unsigned index = 0; index < iterableCount; ++index)
+        arguments.push_back(elementAt(index));
+      NodePtr applied;
+      if (!buildLazyCall(expr, callable, std::move(arguments), loopBody,
+                         applied))
+        return emitNone(expr);
+      loopBody.push_back(yieldNode(std::move(applied), bodyRange));
+    } else if (name == "filter") {
+      NodePtr test = elementAt(0);
+      if (!identityPredicate &&
+          !buildLazyCall(expr, callable, {elementAt(0)}, loopBody, test))
+        return emitNone(expr);
+      loopBody.push_back(
+          ifNode(std::move(test), {yieldNode(elementAt(0), bodyRange)},
+                 bodyRange));
+    }
+    loopBody.push_back(assignNode(
+        indexRef, binOpNode(indexRef, "Add", intConstant(1, bodyRange),
+                            bodyRange),
+        bodyRange));
+
+    std::vector<NodePtr> body;
+    if (name == "reversed") {
+      // __lyi = len(src); while __lyi > 0: __lyi -= 1; yield src[__lyi]
+      body.push_back(assignNode(indexRef, lenCall(param(0), bodyRange),
+                                bodyRange));
+      std::vector<NodePtr> reversedBody{
+          assignNode(indexRef,
+                     binOpNode(indexRef, "Sub", intConstant(1, bodyRange),
+                               bodyRange),
+                     bodyRange),
+          yieldNode(elementAt(0), bodyRange)};
+      body.push_back(whileNode(
+          compareNode(indexRef, "Gt", intConstant(0, bodyRange), bodyRange),
+          std::move(reversedBody), {}, bodyRange));
+    } else {
+      body.push_back(assignNode(indexRef, intConstant(0, bodyRange),
+                                bodyRange));
+      body.push_back(whileNode(trueConstant(bodyRange), std::move(loopBody),
+                               {}, bodyRange));
+    }
+
+    llvm::SmallVector<const parser::Node *, 4> paramNodes;
+    NodePtr def = makeSyntheticGeneratorDef(symbol, params, std::move(body),
+                                            bodyRange, paramNodes);
+    synthesizedIteratorDefs.push_back(def);
+    for (auto [index, value] : llvm::enumerate(iterableValues))
+      types.overrideParameterType(paramNodes[index],
+                                  types.widenLiteral(value.type));
+    if (name == "enumerate")
+      types.overrideParameterType(paramNodes.back(), types.intType());
+
+    FunctionSignature sig = types.functionSignature(*def);
+    emitCallableFunction(*def, symbol, sig, {}, /*isLambda=*/false);
+    memoized = lazyIteratorMemo
+                   .insert({memoKey, LazyIteratorSynthesis{
+                                         symbol, sig.publicCallable}})
+                   .first;
+  }
+
+  llvm::SmallVector<Value, 4> callArguments(iterableValues.begin(),
+                                            iterableValues.end());
+  if (startValue)
+    callArguments.push_back(*startValue);
+  Value callee = emitBindingRef(expr, memoized->second.symbol,
+                                memoized->second.callableType);
+  return emitCallableDispatch(
+      expr, callee,
+      emitCallOperands(expr, callArguments, /*includeAstArguments=*/false));
 }
 
 } // namespace lython::emitter

@@ -159,6 +159,18 @@ private:
   bool hasIndexableEvidence(const parser::Node *expr);
   void runWithScratchNames(llvm::ArrayRef<std::string> names,
                            llvm::function_ref<void()> emit);
+  // Value form: enumerate/zip/map/filter/reversed/iter as first-class lazy
+  // values synthesize per-call-site generator functions over indexable
+  // sequences (memoized by builtin + argument types + callable spelling).
+  std::optional<Value>
+  tryEmitLazyIteratorValueCall(const parser::Node &expr,
+                               const parser::Node *calleeNode);
+  struct LazyIteratorSynthesis {
+    std::string symbol;
+    mlir::Type callableType;
+  };
+  std::map<std::string, LazyIteratorSynthesis> lazyIteratorMemo;
+  std::vector<parser::NodePtr> synthesizedIteratorDefs;
   void emitWhile(const parser::Node &statement);
   void emitAsyncFor(const parser::Node &statement);
   llvm::SmallVector<CarriedLoopLocal, 4>

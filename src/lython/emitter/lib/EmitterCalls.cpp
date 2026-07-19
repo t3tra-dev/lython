@@ -184,6 +184,8 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     return *v;
   if (std::optional<Value> v = tryEmitReducerCall(expr, calleeNode))
     return *v;
+  if (std::optional<Value> v = tryEmitLazyIteratorValueCall(expr, calleeNode))
+    return *v;
 
   if (!calleeQualified.empty())
     if (auto cls = types.lookupClass(calleeQualified)) {
@@ -1230,13 +1232,77 @@ ModuleEmitter::tryEmitNextCall(const parser::Node &expr,
   const auto *keywords = ast::nodeList(expr, "keywords");
   if (keywords && !keywords->empty())
     return std::nullopt;
-  // Only the one-argument form; `next(it, default)` needs a union result
-  // and StopIteration interception, which the static surface does not
-  // provide yet.
+  // `next(it, default)` desugars to the pre-bound try/except form
+  //   __nx = default; try: __nx = next(__it) except StopIteration: pass
+  // (a binding CREATED inside a try does not escape the handler scope, but
+  // rebinding a pre-existing local does; the iterator is snapshot first to
+  // keep CPython's left-to-right argument evaluation).
+  if (args && args->size() == 2 && args->front() && (*args)[1]) {
+    unsigned serial = ++listCompCounter;
+    std::string iteratorName = "__lynextit" + std::to_string(serial);
+    std::string resultName = "__lynext" + std::to_string(serial);
+    parser::SourceRange range = expr.range;
+    auto nameNode = [&](const std::string &id) {
+      parser::NodePtr node = parser::makeNode("Name", range);
+      parser::addField(*node, "id", id);
+      return node;
+    };
+    auto assign = [&](parser::NodePtr target, parser::NodePtr value) {
+      parser::NodePtr node = parser::makeNode("Assign", range);
+      parser::addField(*node, "targets",
+                       std::vector<parser::NodePtr>{std::move(target)});
+      parser::addField(*node, "value", std::move(value));
+      return node;
+    };
+    parser::NodePtr nextCall = parser::makeNode("Call", range);
+    parser::addField(*nextCall, "func", nameNode("next"));
+    parser::addField(*nextCall, "args",
+                     std::vector<parser::NodePtr>{nameNode(iteratorName)});
+    parser::addField(*nextCall, "keywords", std::vector<parser::NodePtr>{});
+    parser::NodePtr handler = parser::makeNode("ExceptHandler", range);
+    parser::addField(*handler, "type", nameNode("StopIteration"));
+    parser::addField(*handler, "body",
+                     std::vector<parser::NodePtr>{
+                         parser::makeNode("Pass", range)});
+    parser::NodePtr tryNode = parser::makeNode("Try", range);
+    parser::addField(*tryNode, "body",
+                     std::vector<parser::NodePtr>{
+                         assign(nameNode(resultName), nextCall)});
+    parser::addField(*tryNode, "handlers",
+                     std::vector<parser::NodePtr>{handler});
+    parser::addField(*tryNode, "orelse", std::vector<parser::NodePtr>{});
+    parser::addField(*tryNode, "finalbody", std::vector<parser::NodePtr>{});
+
+    llvm::SmallVector<std::pair<std::string, std::optional<Value>>, 2> priors;
+    for (const std::string &scratch : {iteratorName, resultName}) {
+      std::optional<Value> prior;
+      if (auto found = values.find(scratch); found != values.end())
+        prior = found->second;
+      priors.push_back({scratch, prior});
+    }
+    emitStatement(*assign(nameNode(iteratorName), args->front()));
+    emitStatement(*assign(nameNode(resultName), (*args)[1]));
+    emitStatement(*tryNode);
+    auto bound = values.find(resultName);
+    if (bound == values.end() || !bound->second.value) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, expr.range.start,
+          "cannot lower next(iterator, default) over this iterator"});
+      return emitNone(expr);
+    }
+    Value result = bound->second;
+    for (auto &[scratch, prior] : priors) {
+      if (prior)
+        values[scratch] = *prior;
+      else
+        values.erase(scratch);
+    }
+    return result;
+  }
   if (!args || args->size() != 1) {
     diagnostics.push_back(parser::Diagnostic{
         parser::Severity::Error, expr.range.start,
-        "next() currently supports exactly one iterator argument"});
+        "next() takes one iterator and an optional default"});
     return emitNone(expr);
   }
   Value receiver = emitExpr(args->front().get());

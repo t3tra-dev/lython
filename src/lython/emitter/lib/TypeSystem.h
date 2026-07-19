@@ -259,6 +259,14 @@ public:
   mlir::Type join(mlir::ArrayRef<mlir::Type> types) const;
   mlir::Type widenLiteral(mlir::Type type) const;
 
+  // Synthesized-function support (lazy iterator desugars): pins an
+  // unannotated parameter node to a concrete type, exactly like the module
+  // pre-pass does for inferred parameters — functionSignature reads it when
+  // the arg node carries no annotation.
+  void overrideParameterType(const parser::Node *argNode, mlir::Type type) {
+    parameterTypeOverrides[argNode] = type;
+  }
+
   FunctionSignature
   functionSignature(const parser::Node &function,
                     std::optional<llvm::StringRef> selfName = std::nullopt,
