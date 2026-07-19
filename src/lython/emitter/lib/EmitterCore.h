@@ -139,6 +139,26 @@ private:
   void emitFor(const parser::Node &statement);
   void emitGeneratorExpFor(const parser::Node &statement,
                            const parser::Node &genexpr);
+  // EmitterIterators.cpp: lazy-iterator loop fusion (enumerate/zip/map/
+  // filter/reversed/iter and dict view methods in for-iterable position).
+  struct LazyCallable {
+    parser::NodePtr callee; // Name/Attribute spelling, re-used per element
+    llvm::SmallVector<std::string, 3> lambdaParams;
+    parser::NodePtr lambdaBody;
+  };
+  bool tryEmitLazyIteratorFor(const parser::Node &statement,
+                              const parser::Node &iterCall);
+  bool lazyCallableParts(const parser::Node &statement,
+                         const parser::NodePtr &callee, LazyCallable &result);
+  bool buildLazyCall(const parser::Node &statement,
+                     const LazyCallable &callable,
+                     std::vector<parser::NodePtr> arguments,
+                     std::vector<parser::NodePtr> &prologue,
+                     parser::NodePtr &out);
+  bool isBuiltinIteratorName(llvm::StringRef name) const;
+  bool hasIndexableEvidence(const parser::Node *expr);
+  void runWithScratchNames(llvm::ArrayRef<std::string> names,
+                           llvm::function_ref<void()> emit);
   void emitWhile(const parser::Node &statement);
   void emitAsyncFor(const parser::Node &statement);
   llvm::SmallVector<CarriedLoopLocal, 4>

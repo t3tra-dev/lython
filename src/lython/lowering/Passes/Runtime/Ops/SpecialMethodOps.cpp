@@ -1010,12 +1010,14 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIter(py::IterOp op) {
                                iterable->sequenceElements.empty() &&
                                !iterable->evidenceIteratorCell &&
                                iterable->physicalValues().size() >= 3;
-    // Runtime-mode dict key iteration: the key boxes live in the keys array
-    // at the same physical positions the list uses for its items (meta at
-    // [1], boxes at [2]), so the runtime-list next path applies verbatim.
+    // Dict key iteration: the key boxes live in the keys array at the same
+    // physical positions the list uses for its items (meta at [1], boxes at
+    // [2]), so the runtime-list next path applies verbatim. Evidence-backed
+    // dicts qualify too — their payload arrays are materialized alongside
+    // the evidence (initializeDictPayload / the evidence mutators keep them
+    // in sync), and iterating the live payload keeps the mutation guard and
+    // insertion order identical to the runtime tier.
     bool runtimeDictIterable = iterable->contractName() == "builtins.dict" &&
-                               !iterable->mappingEvidenceBacked &&
-                               iterable->mappingKeys.empty() &&
                                iterable->sequenceElements.empty() &&
                                !iterable->evidenceIteratorCell &&
                                iterable->physicalValues().size() >= 5;
