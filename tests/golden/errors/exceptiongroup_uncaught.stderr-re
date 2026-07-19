@@ -1,0 +1,9 @@
+\ \ \+\ Exception\ Group\ Traceback\ \(most\ recent\ call\ last\):\
+\ \ \|\ \ \ File\ ".*exceptiongroup_uncaught\.py",\ line\ 1,\ in\ <module>\
+\ \ \|\ \ \ \ \ raise\ ExceptionGroup\("boom",\ \[ValueError\("a"\),\ TypeError\("b"\)\]\)\
+\ \ \|\ ExceptionGroup:\ boom\ \(2\ sub\-exceptions\)\
+\ \ \+\-\+\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\ 1\ \-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\
+\ \ \ \ \|\ ValueError:\ a\
+\ \ \ \ \+\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\ 2\ \-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\
+\ \ \ \ \|\ TypeError:\ b\
+\ \ \ \ \+\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-

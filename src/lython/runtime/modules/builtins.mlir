@@ -862,7 +862,14 @@ module attributes {
   py.class @OSError attributes {base_names = ["Exception"]} {}
   py.class @FileNotFoundError attributes {base_names = ["OSError"]} {}
   py.class @KeyboardInterrupt attributes {base_names = ["BaseException"]} {}
-  py.class @BaseExceptionGroup attributes {base_names = ["BaseException"]} {}
+  py.class @BaseExceptionGroup attributes {
+    base_names = ["BaseException"],
+    field_names = ["message", "exceptions"],
+    field_contract_types = [
+      !py.contract<"builtins.str">,
+      !py.contract<"builtins.tuple">
+    ]
+  } {}
   py.class @ExceptionGroup attributes {base_names = ["BaseExceptionGroup"]} {}
   py.class @FloatingPointError attributes {base_names = ["ArithmeticError"]} {}
   py.class @OverflowError attributes {base_names = ["ArithmeticError"]} {}
@@ -1278,12 +1285,558 @@ module attributes {
     cf.cond_br %became_zero, ^dealloc, ^done
 
   ^dealloc:
+    %header_ptr_index = memref.extract_aligned_pointer_as_index %header : memref<3xi64> -> index
+    %header_word = arith.index_cast %header_ptr_index : index to i64
+    func.call @release_exception_extras(%header_word) : (i64) -> ()
     func.call @LyUnicode_DecRef(%message_header) : (memref<2xi64>) -> ()
     memref.dealloc %header : memref<3xi64>
     cf.br ^done
 
   ^done:
     func.return
+  }
+
+  // Extended exception words (see LyBaseException_New): [3] payload block
+  // (ExceptionGroup members / multi-value args, as a [count, count x box16]
+  // i64 block), [4] user-exception field block (same shape). Raw pointer
+  // access on purpose -- the 3-word header view must not widen.
+  func.func private @__ly_exc_ext_get(%header: memref<3xi64>, %slot: i64) -> i64 attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "ext_get"} {
+    %ptr_index = memref.extract_aligned_pointer_as_index %header : memref<3xi64> -> index
+    %ptr_word = arith.index_cast %ptr_index : index to i64
+    %ptr = llvm.inttoptr %ptr_word : i64 to !llvm.ptr
+    %slot_ptr = llvm.getelementptr %ptr[%slot] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    %value = llvm.load %slot_ptr : !llvm.ptr -> i64
+    func.return %value : i64
+  }
+
+  func.func private @__ly_exc_ext_set(%header: memref<3xi64>, %slot: i64, %value: i64) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "ext_set"} {
+    %ptr_index = memref.extract_aligned_pointer_as_index %header : memref<3xi64> -> index
+    %ptr_word = arith.index_cast %ptr_index : index to i64
+    %ptr = llvm.inttoptr %ptr_word : i64 to !llvm.ptr
+    %slot_ptr = llvm.getelementptr %ptr[%slot] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    llvm.store %value, %slot_ptr : i64, !llvm.ptr
+    func.return
+  }
+
+  // Allocate a payload block for %count boxed entries: word 0 = count, then
+  // count x 16 zeroed box words. Returned as a raw pointer word (the block is
+  // reached only through the extended exception words).
+  func.func private @__ly_exc_payload_alloc(%count: i64) -> i64 attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "payload_alloc"} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c16 = arith.constant 16 : i64
+    %one = arith.constant 1 : i64
+    %zero = arith.constant 0 : i64
+    %boxes = arith.muli %count, %c16 : i64
+    %words = arith.addi %boxes, %one : i64
+    %words_index = arith.index_cast %words : i64 to index
+    %block = memref.alloc(%words_index) : memref<?xi64>
+    scf.for %i = %c0 to %words_index step %c1 {
+      memref.store %zero, %block[%i] : memref<?xi64>
+    }
+    %count_slot = arith.constant 0 : index
+    memref.store %count, %block[%count_slot] : memref<?xi64>
+    %ptr_index = memref.extract_aligned_pointer_as_index %block : memref<?xi64> -> index
+    %ptr_word = arith.index_cast %ptr_index : index to i64
+    func.return %ptr_word : i64
+  }
+
+  // Store one exception (header + message) into payload box %slot, retaining
+  // the exception entity for the block (the caller keeps its own reference).
+  // Box layout mirrors objectPayloadHandleWords (BoxLayout.h): word 1 is the
+  // header's layout word (5 = the shared BaseException dispatch class), the
+  // precise class id stays in the exception header itself.
+  func.func private @__ly_exc_payload_store(%block_word: i64, %slot: i64, %eh: memref<3xi64>, %mh: memref<2xi64>, %mb: memref<?xi8>) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "payload_store"} {
+    %c16 = arith.constant 16 : i64
+    %one = arith.constant 1 : i64
+    %zero = arith.constant 0 : i64
+    %three = arith.constant 3 : i64
+    %two = arith.constant 2 : i64
+    %block_ptr = llvm.inttoptr %block_word : i64 to !llvm.ptr
+    %boxes_base = arith.muli %slot, %c16 : i64
+    %box_base = arith.addi %boxes_base, %one : i64
+    %box_ptr = llvm.getelementptr %block_ptr[%box_base] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    %layout_slot = arith.constant 1 : index
+    %layout = memref.load %eh[%layout_slot] : memref<3xi64>
+    %eh_index = memref.extract_aligned_pointer_as_index %eh : memref<3xi64> -> index
+    %eh_word = arith.index_cast %eh_index : index to i64
+    %mh_index = memref.extract_aligned_pointer_as_index %mh : memref<2xi64> -> index
+    %mh_word = arith.index_cast %mh_index : index to i64
+    %mb_index = memref.extract_aligned_pointer_as_index %mb : memref<?xi8> -> index
+    %mb_word = arith.index_cast %mb_index : index to i64
+    %c0 = arith.constant 0 : index
+    %mb_dim = memref.dim %mb, %c0 : memref<?xi8>
+    %mb_len = arith.index_cast %mb_dim : index to i64
+    %w0 = llvm.getelementptr %box_ptr[0] : (!llvm.ptr) -> !llvm.ptr, i64
+    llvm.store %one, %w0 : i64, !llvm.ptr
+    %w1 = llvm.getelementptr %box_ptr[1] : (!llvm.ptr) -> !llvm.ptr, i64
+    llvm.store %layout, %w1 : i64, !llvm.ptr
+    %w2 = llvm.getelementptr %box_ptr[2] : (!llvm.ptr) -> !llvm.ptr, i64
+    llvm.store %eh_word, %w2 : i64, !llvm.ptr
+    %w3 = llvm.getelementptr %box_ptr[3] : (!llvm.ptr) -> !llvm.ptr, i64
+    llvm.store %three, %w3 : i64, !llvm.ptr
+    %w4 = llvm.getelementptr %box_ptr[4] : (!llvm.ptr) -> !llvm.ptr, i64
+    llvm.store %eh_word, %w4 : i64, !llvm.ptr
+    %w5 = llvm.getelementptr %box_ptr[5] : (!llvm.ptr) -> !llvm.ptr, i64
+    llvm.store %mh_word, %w5 : i64, !llvm.ptr
+    %w6 = llvm.getelementptr %box_ptr[6] : (!llvm.ptr) -> !llvm.ptr, i64
+    llvm.store %mb_word, %w6 : i64, !llvm.ptr
+    %w7 = llvm.getelementptr %box_ptr[7] : (!llvm.ptr) -> !llvm.ptr, i64
+    llvm.store %zero, %w7 : i64, !llvm.ptr
+    %w8 = llvm.getelementptr %box_ptr[8] : (!llvm.ptr) -> !llvm.ptr, i64
+    llvm.store %zero, %w8 : i64, !llvm.ptr
+    %w9 = llvm.getelementptr %box_ptr[9] : (!llvm.ptr) -> !llvm.ptr, i64
+    llvm.store %three, %w9 : i64, !llvm.ptr
+    %w10 = llvm.getelementptr %box_ptr[10] : (!llvm.ptr) -> !llvm.ptr, i64
+    llvm.store %two, %w10 : i64, !llvm.ptr
+    %w11 = llvm.getelementptr %box_ptr[11] : (!llvm.ptr) -> !llvm.ptr, i64
+    llvm.store %mb_len, %w11 : i64, !llvm.ptr
+    %w12 = llvm.getelementptr %box_ptr[12] : (!llvm.ptr) -> !llvm.ptr, i64
+    llvm.store %zero, %w12 : i64, !llvm.ptr
+    %w13 = llvm.getelementptr %box_ptr[13] : (!llvm.ptr) -> !llvm.ptr, i64
+    llvm.store %zero, %w13 : i64, !llvm.ptr
+    %w14 = llvm.getelementptr %box_ptr[14] : (!llvm.ptr) -> !llvm.ptr, i64
+    llvm.store %one, %w14 : i64, !llvm.ptr
+    %w15 = llvm.getelementptr %box_ptr[15] : (!llvm.ptr) -> !llvm.ptr, i64
+    llvm.store %zero, %w15 : i64, !llvm.ptr
+    func.call @__ly_handle_retain_raw(%eh_word) : (i64) -> ()
+    func.return
+  }
+
+  // Borrowed views of payload box %slot: the sub-exception triple, rebuilt
+  // from the box's pointer/size words.
+  func.func private @__ly_exc_payload_view(%block_word: i64, %slot: i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "payload_view"} {
+    %c16 = arith.constant 16 : i64
+    %one = arith.constant 1 : i64
+    %block_ptr = llvm.inttoptr %block_word : i64 to !llvm.ptr
+    %boxes_base = arith.muli %slot, %c16 : i64
+    %box_base = arith.addi %boxes_base, %one : i64
+    %box_ptr = llvm.getelementptr %block_ptr[%box_base] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    %w4 = llvm.getelementptr %box_ptr[4] : (!llvm.ptr) -> !llvm.ptr, i64
+    %eh_word = llvm.load %w4 : !llvm.ptr -> i64
+    %w5 = llvm.getelementptr %box_ptr[5] : (!llvm.ptr) -> !llvm.ptr, i64
+    %mh_word = llvm.load %w5 : !llvm.ptr -> i64
+    %w6 = llvm.getelementptr %box_ptr[6] : (!llvm.ptr) -> !llvm.ptr, i64
+    %mb_word = llvm.load %w6 : !llvm.ptr -> i64
+    %w11 = llvm.getelementptr %box_ptr[11] : (!llvm.ptr) -> !llvm.ptr, i64
+    %mb_len = llvm.load %w11 : !llvm.ptr -> i64
+    %three = arith.constant 3 : i64
+    %two = arith.constant 2 : i64
+    %eh_dyn = func.call @__ly_global_view_i64(%eh_word, %three) : (i64, i64) -> memref<?xi64>
+    %eh = memref.cast %eh_dyn : memref<?xi64> to memref<3xi64>
+    %mh_dyn = func.call @__ly_global_view_i64(%mh_word, %two) : (i64, i64) -> memref<?xi64>
+    %mh = memref.cast %mh_dyn : memref<?xi64> to memref<2xi64>
+    %mb = func.call @__ly_global_view_i8(%mb_word, %mb_len) : (i64, i64) -> memref<?xi8>
+    func.return %eh, %mh, %mb : memref<3xi64>, memref<2xi64>, memref<?xi8>
+  }
+
+  // Store one pre-built 16-word box (objectPayloadHandleWords layout) into
+  // payload box %slot -- the multi-value exception args path boxes arbitrary
+  // contracts in the lowering and hands the words across.
+  func.func private @__ly_exc_payload_store_words(%block_word: i64, %slot: i64, %w0: i64, %w1: i64, %w2: i64, %w3: i64, %w4: i64, %w5: i64, %w6: i64, %w7: i64, %w8: i64, %w9: i64, %w10: i64, %w11: i64, %w12: i64, %w13: i64, %w14: i64, %w15: i64) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "payload_store_words"} {
+    %c16 = arith.constant 16 : i64
+    %one = arith.constant 1 : i64
+    %block_ptr = llvm.inttoptr %block_word : i64 to !llvm.ptr
+    %boxes_base = arith.muli %slot, %c16 : i64
+    %box_base = arith.addi %boxes_base, %one : i64
+    %box_ptr = llvm.getelementptr %block_ptr[%box_base] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    %s0 = llvm.getelementptr %box_ptr[0] : (!llvm.ptr) -> !llvm.ptr, i64
+    llvm.store %w0, %s0 : i64, !llvm.ptr
+    %s1 = llvm.getelementptr %box_ptr[1] : (!llvm.ptr) -> !llvm.ptr, i64
+    llvm.store %w1, %s1 : i64, !llvm.ptr
+    %s2 = llvm.getelementptr %box_ptr[2] : (!llvm.ptr) -> !llvm.ptr, i64
+    llvm.store %w2, %s2 : i64, !llvm.ptr
+    %s3 = llvm.getelementptr %box_ptr[3] : (!llvm.ptr) -> !llvm.ptr, i64
+    llvm.store %w3, %s3 : i64, !llvm.ptr
+    %s4 = llvm.getelementptr %box_ptr[4] : (!llvm.ptr) -> !llvm.ptr, i64
+    llvm.store %w4, %s4 : i64, !llvm.ptr
+    %s5 = llvm.getelementptr %box_ptr[5] : (!llvm.ptr) -> !llvm.ptr, i64
+    llvm.store %w5, %s5 : i64, !llvm.ptr
+    %s6 = llvm.getelementptr %box_ptr[6] : (!llvm.ptr) -> !llvm.ptr, i64
+    llvm.store %w6, %s6 : i64, !llvm.ptr
+    %s7 = llvm.getelementptr %box_ptr[7] : (!llvm.ptr) -> !llvm.ptr, i64
+    llvm.store %w7, %s7 : i64, !llvm.ptr
+    %s8 = llvm.getelementptr %box_ptr[8] : (!llvm.ptr) -> !llvm.ptr, i64
+    llvm.store %w8, %s8 : i64, !llvm.ptr
+    %s9 = llvm.getelementptr %box_ptr[9] : (!llvm.ptr) -> !llvm.ptr, i64
+    llvm.store %w9, %s9 : i64, !llvm.ptr
+    %s10 = llvm.getelementptr %box_ptr[10] : (!llvm.ptr) -> !llvm.ptr, i64
+    llvm.store %w10, %s10 : i64, !llvm.ptr
+    %s11 = llvm.getelementptr %box_ptr[11] : (!llvm.ptr) -> !llvm.ptr, i64
+    llvm.store %w11, %s11 : i64, !llvm.ptr
+    %s12 = llvm.getelementptr %box_ptr[12] : (!llvm.ptr) -> !llvm.ptr, i64
+    llvm.store %w12, %s12 : i64, !llvm.ptr
+    %s13 = llvm.getelementptr %box_ptr[13] : (!llvm.ptr) -> !llvm.ptr, i64
+    llvm.store %w13, %s13 : i64, !llvm.ptr
+    %s14 = llvm.getelementptr %box_ptr[14] : (!llvm.ptr) -> !llvm.ptr, i64
+    llvm.store %w14, %s14 : i64, !llvm.ptr
+    %s15 = llvm.getelementptr %box_ptr[15] : (!llvm.ptr) -> !llvm.ptr, i64
+    llvm.store %w15, %s15 : i64, !llvm.ptr
+    func.return
+  }
+
+  // Multi-value args message: CPython's str(e) for len(args) > 1 is
+  // repr(args) -- "(r0, r1, ...)". Renders from the payload boxes, replaces
+  // the empty construction-time message, and returns the receiver triple.
+  func.func @LyBaseException_InitPayloadMessage(%header: memref<3xi64> {ly.ownership.object_header}, %old_mh: memref<2xi64> {ly.ownership.object_header}, %old_mb: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0], ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "init_payload_message"} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c0_i64 = arith.constant 0 : i64
+    %c1_i64 = arith.constant 1 : i64
+    %c2_i64 = arith.constant 2 : i64
+    %payload_slot = arith.constant 3 : i64
+    %block = func.call @__ly_exc_ext_get(%header, %payload_slot) : (memref<3xi64>, i64) -> i64
+    %count = func.call @__ly_exc_payload_count(%block) : (i64) -> i64
+    %block_ptr = llvm.inttoptr %block : i64 to !llvm.ptr
+    %open_ref = memref.get_global @__ly_repr_lparen : memref<1xi8>
+    %open_dyn = memref.cast %open_ref : memref<1xi8> to memref<?xi8>
+    %r0_h, %r0_b = func.call @LyUnicode_FromBytes(%open_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %comma_ref = memref.get_global @__ly_repr_comma : memref<2xi8>
+    %comma_dyn = memref.cast %comma_ref : memref<2xi8> to memref<?xi8>
+    %count_index = arith.index_cast %count : i64 to index
+    %loop:2 = scf.for %i = %c0 to %count_index step %c1 iter_args(%rh = %r0_h, %rb = %r0_b) -> (memref<2xi64>, memref<?xi8>) {
+      %i_i64 = arith.index_cast %i : index to i64
+      %is_pos = arith.cmpi sgt, %i_i64, %c0_i64 : i64
+      %sep:2 = scf.if %is_pos -> (memref<2xi64>, memref<?xi8>) {
+        %sh, %sb = func.call @LyUnicode_FromBytes(%comma_dyn, %c0, %c2_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+        %jh, %jb = func.call @LyUnicode_Concat(%rh, %rb, %sh, %sb) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+        func.call @LyUnicode_DecRef(%rh) : (memref<2xi64>) -> ()
+        func.call @LyUnicode_DecRef(%sh) : (memref<2xi64>) -> ()
+        scf.yield %jh, %jb : memref<2xi64>, memref<?xi8>
+      } else {
+        scf.yield %rh, %rb : memref<2xi64>, memref<?xi8>
+      }
+      %box_words = arith.muli %i_i64, %c2_i64 : i64
+      %sixteen = arith.constant 16 : i64
+      %box_off = arith.muli %i_i64, %sixteen : i64
+      %box_base = arith.addi %box_off, %c1_i64 : i64
+      %box_ptr = llvm.getelementptr %block_ptr[%box_base] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %class_gep = llvm.getelementptr %box_ptr[%c1_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %class_id = llvm.load %class_gep : !llvm.ptr -> i64
+      %erh, %erb, %ok = func.call @__ly_repr_boxed_by_contract(%box_ptr, %class_id) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>, i1)
+      cf.assert %ok, "exception args: boxed value has no conforming __repr__"
+      %nh, %nb = func.call @LyUnicode_Concat(%sep#0, %sep#1, %erh, %erb) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      func.call @LyUnicode_DecRef(%sep#0) : (memref<2xi64>) -> ()
+      func.call @LyUnicode_DecRef(%erh) : (memref<2xi64>) -> ()
+      scf.yield %nh, %nb : memref<2xi64>, memref<?xi8>
+    }
+    %close_ref = memref.get_global @__ly_repr_rparen : memref<1xi8>
+    %close_dyn = memref.cast %close_ref : memref<1xi8> to memref<?xi8>
+    %cl_h, %cl_b = func.call @LyUnicode_FromBytes(%close_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %out_h, %out_b = func.call @LyUnicode_Concat(%loop#0, %loop#1, %cl_h, %cl_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    func.call @LyUnicode_DecRef(%loop#0) : (memref<2xi64>) -> ()
+    func.call @LyUnicode_DecRef(%cl_h) : (memref<2xi64>) -> ()
+    func.call @LyUnicode_DecRef(%old_mh) : (memref<2xi64>) -> ()
+    func.return %header, %out_h, %out_b : memref<3xi64>, memref<2xi64>, memref<?xi8>
+  }
+
+  // Payload block entry count (0 for an absent block). Bit 62 of the count
+  // word flags "repr as a tuple" (the PEP 654 naked-exception wrap shows
+  // `('', (exc,))`); every count consumer masks it off.
+  func.func private @__ly_exc_payload_count(%block_word: i64) -> i64 attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "payload_count"} {
+    %zero = arith.constant 0 : i64
+    %mask = arith.constant 4611686018427387903 : i64
+    %absent = arith.cmpi eq, %block_word, %zero : i64
+    %count = scf.if %absent -> (i64) {
+      scf.yield %zero : i64
+    } else {
+      %block_ptr = llvm.inttoptr %block_word : i64 to !llvm.ptr
+      %loaded = llvm.load %block_ptr : !llvm.ptr -> i64
+      %masked = arith.andi %loaded, %mask : i64
+      scf.yield %masked : i64
+    }
+    func.return %count : i64
+  }
+
+  // Whether the payload block asked for tuple-style repr (bit 62).
+  func.func private @__ly_exc_payload_tuple_flag(%block_word: i64) -> i1 attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "payload_tuple_flag"} {
+    %zero = arith.constant 0 : i64
+    %flag_bit = arith.constant 4611686018427387904 : i64
+    %absent = arith.cmpi eq, %block_word, %zero : i64
+    %flag = scf.if %absent -> (i1) {
+      %false_v = arith.constant false
+      scf.yield %false_v : i1
+    } else {
+      %block_ptr = llvm.inttoptr %block_word : i64 to !llvm.ptr
+      %loaded = llvm.load %block_ptr : !llvm.ptr -> i64
+      %bit = arith.andi %loaded, %flag_bit : i64
+      %set = arith.cmpi ne, %bit, %zero : i64
+      scf.yield %set : i1
+    }
+    func.return %flag : i1
+  }
+
+  // Zeroed dummies for the absent sides of a star split result: the paired
+  // flag gates every consumer, so the views are never dereferenced.
+  memref.global "private" @__ly_exc_dummy_header : memref<3xi64> = dense<0>
+  memref.global "private" @__ly_exc_dummy_str : memref<2xi64> = dense<0>
+
+  // Fresh group carrying %count member slots, derived from %eh's class and
+  // message (PEP 654 split keeps the original metadata on both halves).
+  func.func private @__ly_exc_derive_group(%eh: memref<3xi64>, %mh: memref<2xi64>, %mb: memref<?xi8>, %count: i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>, i64) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "derive_group"} {
+    %class_slot = arith.constant 2 : index
+    %payload_slot = arith.constant 3 : i64
+    %class_id = memref.load %eh[%class_slot] : memref<3xi64>
+    %fresh:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    // Adopt the original message: release the fresh empty one, retain ours.
+    func.call @LyUnicode_DecRef(%fresh#1) : (memref<2xi64>) -> ()
+    %retained:2 = func.call @__ly_unicode_retain_self(%mh, %mb) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    %block = func.call @__ly_exc_payload_alloc(%count) : (i64) -> i64
+    func.call @__ly_exc_ext_set(%fresh#0, %payload_slot, %block) : (memref<3xi64>, i64, i64) -> ()
+    func.return %fresh#0, %retained#0, %retained#1, %block : memref<3xi64>, memref<2xi64>, memref<?xi8>, i64
+  }
+
+  // PEP 654 split: partition %e against handler class %handler. Returns
+  // (has_matched, matched triple, has_rest, rest triple); present sides are
+  // OWNED by the caller, absent sides are the zero dummies. A naked matching
+  // exception comes back wrapped in an ExceptionGroup('', (exc,)) (the
+  // BaseExceptionGroup variant when it is not an Exception).
+  func.func private @__ly_exc_star_split_rec(%eh: memref<3xi64>, %mh: memref<2xi64>, %mb: memref<?xi8>, %handler: i64) -> (i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "star_split_rec"} {
+    %true_v = arith.constant true
+    %false_v = arith.constant false
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %class_slot = arith.constant 2 : index
+    %payload_slot = arith.constant 3 : i64
+    %group_root = arith.constant 101 : i64
+    %exception_root = arith.constant 50 : i64
+    %group_id = arith.constant 102 : i64
+    %base_group_id = arith.constant 101 : i64
+    %tuple_bit = arith.constant 4611686018427387904 : i64
+    %dummy_h = memref.get_global @__ly_exc_dummy_header : memref<3xi64>
+    %dummy_s = memref.get_global @__ly_exc_dummy_str : memref<2xi64>
+    %dummy_b = memref.alloca(%c0) : memref<?xi8>
+
+    %class_id = memref.load %eh[%class_slot] : memref<3xi64>
+    %block = func.call @__ly_exc_ext_get(%eh, %payload_slot) : (memref<3xi64>, i64) -> i64
+    %member_count = func.call @__ly_exc_payload_count(%block) : (i64) -> i64
+    %is_group = func.call @LyEH_ClassIdMatches(%class_id, %group_root) : (i64, i64) -> i1
+    %has_members = arith.cmpi sgt, %member_count, %zero : i64
+    %grouped = arith.andi %is_group, %has_members : i1
+
+    %result:8 = scf.if %grouped -> (i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>) {
+      // First pass: how many members land on each side (recursively).
+      %count_index = arith.index_cast %member_count : i64 to index
+      %tally:2 = scf.for %i = %c0 to %count_index step %c1 iter_args(%m = %zero, %r = %zero) -> (i64, i64) {
+        %i64v = arith.index_cast %i : index to i64
+        %member:3 = func.call @__ly_exc_payload_view(%block, %i64v) : (i64, i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+        %sub:8 = func.call @__ly_exc_star_split_rec(%member#0, %member#1, %member#2, %handler) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, i64) -> (i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>)
+        // Tally only: drop the split halves again.
+        scf.if %sub#0 {
+          func.call @LyBaseException_DecRef(%sub#1, %sub#2, %sub#3) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+        }
+        scf.if %sub#4 {
+          func.call @LyBaseException_DecRef(%sub#5, %sub#6, %sub#7) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+        }
+        %m_inc = arith.extui %sub#0 : i1 to i64
+        %r_inc = arith.extui %sub#4 : i1 to i64
+        %m_next = arith.addi %m, %m_inc : i64
+        %r_next = arith.addi %r, %r_inc : i64
+        scf.yield %m_next, %r_next : i64, i64
+      }
+      %no_match = arith.cmpi eq, %tally#0, %zero : i64
+      %full_match = arith.cmpi eq, %tally#1, %zero : i64
+      %whole:8 = scf.if %no_match -> (i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>) {
+        %sub0 = memref.subview %eh[0] [2] [1] : memref<3xi64> to memref<2xi64, strided<[1]>>
+        %view0 = memref.cast %sub0 : memref<2xi64, strided<[1]>> to memref<2xi64, strided<[1], offset: ?>>
+        func.call @Ly_IncRef(%view0) : (memref<2xi64, strided<[1], offset: ?>>) -> ()
+        scf.yield %false_v, %dummy_h, %dummy_s, %dummy_b, %true_v, %eh, %mh, %mb : i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>
+      } else {
+        %all:8 = scf.if %full_match -> (i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>) {
+          %subw = memref.subview %eh[0] [2] [1] : memref<3xi64> to memref<2xi64, strided<[1]>>
+          %vieww = memref.cast %subw : memref<2xi64, strided<[1]>> to memref<2xi64, strided<[1], offset: ?>>
+          func.call @Ly_IncRef(%vieww) : (memref<2xi64, strided<[1], offset: ?>>) -> ()
+          scf.yield %true_v, %eh, %mh, %mb, %false_v, %dummy_h, %dummy_s, %dummy_b : i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>
+        } else {
+          // Real split: derive a group per side and distribute the halves.
+          %mg:4 = func.call @__ly_exc_derive_group(%eh, %mh, %mb, %tally#0) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>, i64)
+          %rg:4 = func.call @__ly_exc_derive_group(%eh, %mh, %mb, %tally#1) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>, i64)
+          %fill:2 = scf.for %i = %c0 to %count_index step %c1 iter_args(%mi = %zero, %ri = %zero) -> (i64, i64) {
+            %i64v = arith.index_cast %i : index to i64
+            %member:3 = func.call @__ly_exc_payload_view(%block, %i64v) : (i64, i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+            %sub:8 = func.call @__ly_exc_star_split_rec(%member#0, %member#1, %member#2, %handler) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, i64) -> (i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>)
+            %mi_next = scf.if %sub#0 -> (i64) {
+              func.call @__ly_exc_payload_store(%mg#3, %mi, %sub#1, %sub#2, %sub#3) : (i64, i64, memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+              func.call @LyBaseException_DecRef(%sub#1, %sub#2, %sub#3) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+              %n = arith.addi %mi, %one : i64
+              scf.yield %n : i64
+            } else {
+              scf.yield %mi : i64
+            }
+            %ri_next = scf.if %sub#4 -> (i64) {
+              func.call @__ly_exc_payload_store(%rg#3, %ri, %sub#5, %sub#6, %sub#7) : (i64, i64, memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+              func.call @LyBaseException_DecRef(%sub#5, %sub#6, %sub#7) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+              %n = arith.addi %ri, %one : i64
+              scf.yield %n : i64
+            } else {
+              scf.yield %ri : i64
+            }
+            scf.yield %mi_next, %ri_next : i64, i64
+          }
+          scf.yield %true_v, %mg#0, %mg#1, %mg#2, %true_v, %rg#0, %rg#1, %rg#2 : i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>
+        }
+        scf.yield %all#0, %all#1, %all#2, %all#3, %all#4, %all#5, %all#6, %all#7 : i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>
+      }
+      scf.yield %whole#0, %whole#1, %whole#2, %whole#3, %whole#4, %whole#5, %whole#6, %whole#7 : i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>
+    } else {
+      // Naked exception (or a group without members): all-or-nothing.
+      %matches = func.call @LyEH_ClassIdMatches(%class_id, %handler) : (i64, i64) -> i1
+      %naked:8 = scf.if %matches -> (i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>) {
+        // A matching leaf moves into the matched half as ITSELF; the
+        // synthesized wrap applies only to a top-level naked exception
+        // (star_split below).
+        %subm = memref.subview %eh[0] [2] [1] : memref<3xi64> to memref<2xi64, strided<[1]>>
+        %viewm = memref.cast %subm : memref<2xi64, strided<[1]>> to memref<2xi64, strided<[1], offset: ?>>
+        func.call @Ly_IncRef(%viewm) : (memref<2xi64, strided<[1], offset: ?>>) -> ()
+        scf.yield %true_v, %eh, %mh, %mb, %false_v, %dummy_h, %dummy_s, %dummy_b : i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>
+      } else {
+        %sub1 = memref.subview %eh[0] [2] [1] : memref<3xi64> to memref<2xi64, strided<[1]>>
+        %view1 = memref.cast %sub1 : memref<2xi64, strided<[1]>> to memref<2xi64, strided<[1], offset: ?>>
+        func.call @Ly_IncRef(%view1) : (memref<2xi64, strided<[1], offset: ?>>) -> ()
+        scf.yield %false_v, %dummy_h, %dummy_s, %dummy_b, %true_v, %eh, %mh, %mb : i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>
+      }
+      scf.yield %naked#0, %naked#1, %naked#2, %naked#3, %naked#4, %naked#5, %naked#6, %naked#7 : i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>
+    }
+    func.return %result#0, %result#1, %result#2, %result#3, %result#4, %result#5, %result#6, %result#7 : i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>
+  }
+
+  // Top-level star split (the manifest entry): a naked exception either
+  // misses whole or comes back wrapped in ExceptionGroup('', (exc,)) --
+  // BaseExceptionGroup when it is not an Exception. Groups delegate to the
+  // recursive split, whose leaves stay unwrapped.
+  func.func private @__ly_exc_star_split(%eh: memref<3xi64>, %mh: memref<2xi64>, %mb: memref<?xi8>, %handler: i64) -> (i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "star_split"} {
+    %true_v = arith.constant true
+    %false_v = arith.constant false
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %c0 = arith.constant 0 : index
+    %class_slot = arith.constant 2 : index
+    %payload_slot = arith.constant 3 : i64
+    %group_root = arith.constant 101 : i64
+    %exception_root = arith.constant 50 : i64
+    %group_id = arith.constant 102 : i64
+    %base_group_id = arith.constant 101 : i64
+    %tuple_bit = arith.constant 4611686018427387904 : i64
+    %dummy_h = memref.get_global @__ly_exc_dummy_header : memref<3xi64>
+    %dummy_s = memref.get_global @__ly_exc_dummy_str : memref<2xi64>
+    %dummy_b = memref.alloca(%c0) : memref<?xi8>
+    %class_id = memref.load %eh[%class_slot] : memref<3xi64>
+    %block = func.call @__ly_exc_ext_get(%eh, %payload_slot) : (memref<3xi64>, i64) -> i64
+    %member_count = func.call @__ly_exc_payload_count(%block) : (i64) -> i64
+    %is_group = func.call @LyEH_ClassIdMatches(%class_id, %group_root) : (i64, i64) -> i1
+    %has_members = arith.cmpi sgt, %member_count, %zero : i64
+    %grouped = arith.andi %is_group, %has_members : i1
+    %result:8 = scf.if %grouped -> (i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>) {
+      %sub:8 = func.call @__ly_exc_star_split_rec(%eh, %mh, %mb, %handler) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, i64) -> (i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>)
+      scf.yield %sub#0, %sub#1, %sub#2, %sub#3, %sub#4, %sub#5, %sub#6, %sub#7 : i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>
+    } else {
+      %matches = func.call @LyEH_ClassIdMatches(%class_id, %handler) : (i64, i64) -> i1
+      %naked:8 = scf.if %matches -> (i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>) {
+        %is_exception = func.call @LyEH_ClassIdMatches(%class_id, %exception_root) : (i64, i64) -> i1
+        %wrap_id = arith.select %is_exception, %group_id, %base_group_id : i64
+        %wrap:3 = func.call @LyBaseException_New(%wrap_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+        %wblock = func.call @__ly_exc_payload_alloc(%one) : (i64) -> i64
+        func.call @__ly_exc_ext_set(%wrap#0, %payload_slot, %wblock) : (memref<3xi64>, i64, i64) -> ()
+        func.call @__ly_exc_payload_store(%wblock, %zero, %eh, %mh, %mb) : (i64, i64, memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+        // Tuple-style repr for the synthesized wrap.
+        %wblock_ptr = llvm.inttoptr %wblock : i64 to !llvm.ptr
+        %flagged = arith.ori %one, %tuple_bit : i64
+        llvm.store %flagged, %wblock_ptr : i64, !llvm.ptr
+        scf.yield %true_v, %wrap#0, %wrap#1, %wrap#2, %false_v, %dummy_h, %dummy_s, %dummy_b : i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>
+      } else {
+        %subn = memref.subview %eh[0] [2] [1] : memref<3xi64> to memref<2xi64, strided<[1]>>
+        %viewn = memref.cast %subn : memref<2xi64, strided<[1]>> to memref<2xi64, strided<[1], offset: ?>>
+        func.call @Ly_IncRef(%viewn) : (memref<2xi64, strided<[1], offset: ?>>) -> ()
+        scf.yield %false_v, %dummy_h, %dummy_s, %dummy_b, %true_v, %eh, %mh, %mb : i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>
+      }
+      scf.yield %naked#0, %naked#1, %naked#2, %naked#3, %naked#4, %naked#5, %naked#6, %naked#7 : i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>
+    }
+    func.return %result#0, %result#1, %result#2, %result#3, %result#4, %result#5, %result#6, %result#7 : i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>
+  }
+
+  // Combine the star frame's leftovers into one fresh group: the collected
+  // chain-node exceptions (in raise order) followed by the residual. Member
+  // references are retained here; the caller still releases the nodes (their
+  // reference moves to the group, net one owner).
+  func.func private @__ly_exc_star_combine(%nodes_word: i64, %count: i64, %has_res: i1, %res_eh: memref<3xi64>, %res_mh: memref<2xi64>, %res_mb: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "star_combine"} {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %exception_root = arith.constant 50 : i64
+    %group_id = arith.constant 102 : i64
+    %base_group_id = arith.constant 101 : i64
+    %payload_slot = arith.constant 3 : i64
+    %nodes_ptr = llvm.inttoptr %nodes_word : i64 to !llvm.ptr
+    %res_inc = arith.extui %has_res : i1 to i64
+    %total = arith.addi %count, %res_inc : i64
+    %true_v = arith.constant true
+    %c2 = arith.constant 2 : i64
+    %c3 = arith.constant 3 : i64
+    %c7 = arith.constant 7 : i64
+    %c12 = arith.constant 12 : i64
+    %c14 = arith.constant 14 : i64
+
+    // Borrowed member views out of a parked chain node (TracebackSupportBuilder
+    // layout: aligned pointers at words 2/7/12, message byte size at 14).
+    %count_index = arith.index_cast %count : i64 to index
+
+    // ExceptionGroup unless any member falls outside Exception.
+    %all_exc = scf.for %i = %c0 to %count_index step %c1 iter_args(%acc = %true_v) -> (i1) {
+      %i64v = arith.index_cast %i : index to i64
+      %node_slot = llvm.getelementptr %nodes_ptr[%i64v] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %node_word = llvm.load %node_slot : !llvm.ptr -> i64
+      %node_ptr = llvm.inttoptr %node_word : i64 to !llvm.ptr
+      %eh_slot = llvm.getelementptr %node_ptr[%c2] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %eh_word = llvm.load %eh_slot : !llvm.ptr -> i64
+      %eh_ptr = llvm.inttoptr %eh_word : i64 to !llvm.ptr
+      %class_slot = llvm.getelementptr %eh_ptr[%c2] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %class_id = llvm.load %class_slot : !llvm.ptr -> i64
+      %is_exc = func.call @LyEH_ClassIdMatches(%class_id, %exception_root) : (i64, i64) -> i1
+      %next = arith.andi %acc, %is_exc : i1
+      scf.yield %next : i1
+    }
+    %res_is_exc = scf.if %has_res -> (i1) {
+      %class_slot_r = arith.constant 2 : index
+      %res_class = memref.load %res_eh[%class_slot_r] : memref<3xi64>
+      %is_exc = func.call @LyEH_ClassIdMatches(%res_class, %exception_root) : (i64, i64) -> i1
+      scf.yield %is_exc : i1
+    } else {
+      scf.yield %true_v : i1
+    }
+    %all = arith.andi %all_exc, %res_is_exc : i1
+    %wrap_id = arith.select %all, %group_id, %base_group_id : i64
+
+    %wrap:3 = func.call @LyBaseException_New(%wrap_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    %block = func.call @__ly_exc_payload_alloc(%total) : (i64) -> i64
+    func.call @__ly_exc_ext_set(%wrap#0, %payload_slot, %block) : (memref<3xi64>, i64, i64) -> ()
+    scf.for %i = %c0 to %count_index step %c1 {
+      %i64v = arith.index_cast %i : index to i64
+      %node_slot = llvm.getelementptr %nodes_ptr[%i64v] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %node_word = llvm.load %node_slot : !llvm.ptr -> i64
+      %node_ptr = llvm.inttoptr %node_word : i64 to !llvm.ptr
+      %eh_slot = llvm.getelementptr %node_ptr[%c2] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %eh_word = llvm.load %eh_slot : !llvm.ptr -> i64
+      %mh_slot = llvm.getelementptr %node_ptr[%c7] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %mh_word = llvm.load %mh_slot : !llvm.ptr -> i64
+      %mb_slot = llvm.getelementptr %node_ptr[%c12] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %mb_word = llvm.load %mb_slot : !llvm.ptr -> i64
+      %len_slot = llvm.getelementptr %node_ptr[%c14] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %mb_len = llvm.load %len_slot : !llvm.ptr -> i64
+      %eh_dyn = func.call @__ly_global_view_i64(%eh_word, %c3) : (i64, i64) -> memref<?xi64>
+      %eh_view = memref.cast %eh_dyn : memref<?xi64> to memref<3xi64>
+      %two = arith.constant 2 : i64
+      %mh_dyn = func.call @__ly_global_view_i64(%mh_word, %two) : (i64, i64) -> memref<?xi64>
+      %mh_view = memref.cast %mh_dyn : memref<?xi64> to memref<2xi64>
+      %mb_view = func.call @__ly_global_view_i8(%mb_word, %mb_len) : (i64, i64) -> memref<?xi8>
+      func.call @__ly_exc_payload_store(%block, %i64v, %eh_view, %mh_view, %mb_view) : (i64, i64, memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    }
+    scf.if %has_res {
+      func.call @__ly_exc_payload_store(%block, %count, %res_eh, %res_mh, %res_mb) : (i64, i64, memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    }
+    func.return %wrap#0, %wrap#1, %wrap#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
   func.func @LyLong_DecRef(%header: memref<2xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.int", ly.runtime.deallocator} {
@@ -1318,6 +1871,13 @@ module attributes {
   // ===== impls: exception =====
   func.func private @LyEH_ThrowException(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) attributes {ly.ownership.transfer_args = [0, 1], ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "raise"}
   func.func private @LyEH_BorrowCurrentException() -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "borrow_current"}
+  // Native support (RuntimeSupportBuilder): extended-word release for the
+  // deallocator, raw view rebuilders for the payload boxes, and the taxonomy
+  // subtree matcher for the group-aware paths.
+  func.func private @release_exception_extras(%header_word: i64)
+  func.func private @__ly_global_view_i64(%pointer: i64, %size: i64) -> memref<?xi64>
+  func.func private @__ly_global_view_i8(%pointer: i64, %size: i64) -> memref<?xi8>
+  func.func private @LyEH_ClassIdMatches(%raised: i64, %handler: i64) -> i1
 
   func.func private @LyException_Shape() -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.runtime.contract = "builtins.Exception", ly.runtime.shape}
   func.func private @LyRuntimeError_Shape() -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.runtime.contract = "builtins.RuntimeError", ly.runtime.shape}
@@ -1481,22 +2041,37 @@ module attributes {
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
+  // The exception ALLOCATION is 5 words even though the header view (and
+  // every signature) stays memref<3xi64>: words [3] (group/args payload
+  // block) and [4] (user-exception field block) ride inside the allocation
+  // so they survive the TLS throw path (g_current_parts stores only the
+  // three descriptors) without widening every exception signature in the
+  // manifests. The extended words are reached only through
+  // @__ly_exc_ext_get / @__ly_exc_ext_set, never through the 3-word view.
   func.func @LyBaseException_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 5 : i64, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"} {
     %one = arith.constant 1 : i64
+    %zero = arith.constant 0 : i64
     %layout_exception = arith.constant 5 : i64
     %refcount_slot = arith.constant 0 : index
     %layout_slot = arith.constant 1 : index
     %class_slot = arith.constant 2 : index
+    %payload_slot = arith.constant 3 : index
+    %fields_slot = arith.constant 4 : index
     %zero_index = arith.constant 0 : index
     %zero_len = arith.constant 0 : i64
 
-    %header = memref.alloc() {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<3xi64>
+    %block_bytes = arith.constant 40 : index
+    %block = memref.alloc(%block_bytes) {alignment = 16 : i64} : memref<?xi8>
+    %header = memref.view %block[%zero_index][] {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<?xi8> to memref<3xi64>
+    %extended = memref.view %block[%zero_index][] : memref<?xi8> to memref<5xi64>
     %empty_bytes = memref.alloca(%zero_index) : memref<?xi8>
     %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%empty_bytes, %zero_index, %zero_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
 
     memref.store %one, %header[%refcount_slot] : memref<3xi64>
     memref.store %layout_exception, %header[%layout_slot] : memref<3xi64>
     memref.store %class_id, %header[%class_slot] : memref<3xi64>
+    memref.store %zero, %extended[%payload_slot] : memref<5xi64>
+    memref.store %zero, %extended[%fields_slot] : memref<5xi64>
 
     func.return %header, %message_header, %message_bytes : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
@@ -1594,7 +2169,7 @@ module attributes {
   // repr(e) keyed by the DYNAMIC class id in the exception header, so an
   // instance caught through a base-class handler (or a user subclass, once
   // the class hook resolves it) still renders its own class name.
-  func.func private @__ly_exception_repr_by_id(%header: memref<3xi64>, %message_header: memref<2xi64>, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_exception_repr_by_id(%header: memref<3xi64>, %message_header: memref<2xi64>, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "repr_by_id", ly.ownership.owned_results = [0]} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c2 = arith.constant 2 : index
@@ -1627,8 +2202,191 @@ module attributes {
     }
     %name_len = arith.index_cast %scan#0 : index to i64
     %name_dyn = memref.cast %buffer : memref<64xi8> to memref<?xi8>
-    %result:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    // ExceptionGroup carrying members renders CPython's two-argument form:
+    // Name('msg', [member reprs...]); every other exception (and a group
+    // whose member block is absent) keeps the message-only form.
+    %zero_i64 = arith.constant 0 : i64
+    %payload_slot = arith.constant 3 : i64
+    %group_root = arith.constant 101 : i64
+    %block = func.call @__ly_exc_ext_get(%header, %payload_slot) : (memref<3xi64>, i64) -> i64
+    %count = func.call @__ly_exc_payload_count(%block) : (i64) -> i64
+    %is_group = func.call @LyEH_ClassIdMatches(%class_id, %group_root) : (i64, i64) -> i1
+    %has_members = arith.cmpi sgt, %count, %zero_i64 : i64
+    %grouped = arith.andi %is_group, %has_members : i1
+    %result:2 = scf.if %grouped -> (memref<2xi64>, memref<?xi8>) {
+      %c1_i64 = arith.constant 1 : i64
+      %c2_i64 = arith.constant 2 : i64
+      %name_h, %name_b = func.call @LyUnicode_FromBytes(%name_dyn, %c0, %name_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %lparen_ref = memref.get_global @__ly_exc_lparen : memref<1xi8>
+      %lparen_dyn = memref.cast %lparen_ref : memref<1xi8> to memref<?xi8>
+      %lp_h, %lp_b = func.call @LyUnicode_FromBytes(%lparen_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %head_h, %head_b = func.call @LyUnicode_Concat(%name_h, %name_b, %lp_h, %lp_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      func.call @LyUnicode_DecRef(%name_h) : (memref<2xi64>) -> ()
+      func.call @LyUnicode_DecRef(%lp_h) : (memref<2xi64>) -> ()
+      %msg_h, %msg_b = func.call @LyUnicode_Repr(%message_header, %message_bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      %a_h, %a_b = func.call @LyUnicode_Concat(%head_h, %head_b, %msg_h, %msg_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      func.call @LyUnicode_DecRef(%head_h) : (memref<2xi64>) -> ()
+      func.call @LyUnicode_DecRef(%msg_h) : (memref<2xi64>) -> ()
+      %comma_ref = memref.get_global @__ly_repr_comma : memref<2xi8>
+      %comma_dyn = memref.cast %comma_ref : memref<2xi8> to memref<?xi8>
+      %sep0_h, %sep0_b = func.call @LyUnicode_FromBytes(%comma_dyn, %c0, %c2_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %b_h, %b_b = func.call @LyUnicode_Concat(%a_h, %a_b, %sep0_h, %sep0_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      func.call @LyUnicode_DecRef(%a_h) : (memref<2xi64>) -> ()
+      func.call @LyUnicode_DecRef(%sep0_h) : (memref<2xi64>) -> ()
+      // The synthesized naked-exception wrap repr-renders its members as the
+      // tuple CPython passes: ('', (exc,)); source-constructed groups keep
+      // the list form.
+      %tuple_style = func.call @__ly_exc_payload_tuple_flag(%block) : (i64) -> i1
+      %open_ref = memref.get_global @__ly_repr_lbracket : memref<1xi8>
+      %open_paren_ref = memref.get_global @__ly_repr_lparen : memref<1xi8>
+      %open_pick = arith.select %tuple_style, %open_paren_ref, %open_ref : memref<1xi8>
+      %open_dyn = memref.cast %open_pick : memref<1xi8> to memref<?xi8>
+      %ob_h, %ob_b = func.call @LyUnicode_FromBytes(%open_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %c_h, %c_b = func.call @LyUnicode_Concat(%b_h, %b_b, %ob_h, %ob_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      func.call @LyUnicode_DecRef(%b_h) : (memref<2xi64>) -> ()
+      func.call @LyUnicode_DecRef(%ob_h) : (memref<2xi64>) -> ()
+      %count_index = arith.index_cast %count : i64 to index
+      %loop:2 = scf.for %i = %c0 to %count_index step %c1 iter_args(%rh = %c_h, %rb = %c_b) -> (memref<2xi64>, memref<?xi8>) {
+        %i_i64 = arith.index_cast %i : index to i64
+        %is_pos = arith.cmpi sgt, %i_i64, %zero_i64 : i64
+        %sep:2 = scf.if %is_pos -> (memref<2xi64>, memref<?xi8>) {
+          %sh, %sb = func.call @LyUnicode_FromBytes(%comma_dyn, %c0, %c2_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+          %jh, %jb = func.call @LyUnicode_Concat(%rh, %rb, %sh, %sb) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+          func.call @LyUnicode_DecRef(%rh) : (memref<2xi64>) -> ()
+          func.call @LyUnicode_DecRef(%sh) : (memref<2xi64>) -> ()
+          scf.yield %jh, %jb : memref<2xi64>, memref<?xi8>
+        } else {
+          scf.yield %rh, %rb : memref<2xi64>, memref<?xi8>
+        }
+        %member:3 = func.call @__ly_exc_payload_view(%block, %i_i64) : (i64, i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+        %mr_h, %mr_b = func.call @__ly_exception_repr_by_id(%member#0, %member#1, %member#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+        %nh, %nb = func.call @LyUnicode_Concat(%sep#0, %sep#1, %mr_h, %mr_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+        func.call @LyUnicode_DecRef(%sep#0) : (memref<2xi64>) -> ()
+        func.call @LyUnicode_DecRef(%mr_h) : (memref<2xi64>) -> ()
+        scf.yield %nh, %nb : memref<2xi64>, memref<?xi8>
+      }
+      // Tuple-style single member keeps CPython's trailing comma: (exc,).
+      %is_single = arith.cmpi eq, %count, %c1_i64 : i64
+      %needs_comma = arith.andi %tuple_style, %is_single : i1
+      %joined:2 = scf.if %needs_comma -> (memref<2xi64>, memref<?xi8>) {
+        %comma1_h, %comma1_b = func.call @LyUnicode_FromBytes(%comma_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+        %jc_h, %jc_b = func.call @LyUnicode_Concat(%loop#0, %loop#1, %comma1_h, %comma1_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+        func.call @LyUnicode_DecRef(%comma1_h) : (memref<2xi64>) -> ()
+        scf.yield %jc_h, %jc_b : memref<2xi64>, memref<?xi8>
+      } else {
+        %kept:2 = func.call @__ly_unicode_retain_self(%loop#0, %loop#1) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+        scf.yield %kept#0, %kept#1 : memref<2xi64>, memref<?xi8>
+      }
+      func.call @LyUnicode_DecRef(%loop#0) : (memref<2xi64>) -> ()
+      %close_ref = memref.get_global @__ly_repr_rbracket : memref<1xi8>
+      %close_paren_ref = memref.get_global @__ly_repr_rparen : memref<1xi8>
+      %close_pick = arith.select %tuple_style, %close_paren_ref, %close_ref : memref<1xi8>
+      %close_dyn = memref.cast %close_pick : memref<1xi8> to memref<?xi8>
+      %cb_h, %cb_b = func.call @LyUnicode_FromBytes(%close_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %d_h, %d_b = func.call @LyUnicode_Concat(%joined#0, %joined#1, %cb_h, %cb_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      func.call @LyUnicode_DecRef(%joined#0) : (memref<2xi64>) -> ()
+      func.call @LyUnicode_DecRef(%cb_h) : (memref<2xi64>) -> ()
+      %rparen_ref = memref.get_global @__ly_exc_rparen : memref<1xi8>
+      %rparen_dyn = memref.cast %rparen_ref : memref<1xi8> to memref<?xi8>
+      %rp_h, %rp_b = func.call @LyUnicode_FromBytes(%rparen_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %e_h, %e_b = func.call @LyUnicode_Concat(%d_h, %d_b, %rp_h, %rp_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      func.call @LyUnicode_DecRef(%d_h) : (memref<2xi64>) -> ()
+      func.call @LyUnicode_DecRef(%rp_h) : (memref<2xi64>) -> ()
+      scf.yield %e_h, %e_b : memref<2xi64>, memref<?xi8>
+    } else {
+      // Multi-value args (non-group payload): Name(r0, r1, ...) from the
+      // boxed values; the message lane already carries str(e)'s "(r0, r1)".
+      %args_repr = arith.cmpi sgt, %count, %zero_i64 : i64
+      %preplain:2 = scf.if %args_repr -> (memref<2xi64>, memref<?xi8>) {
+        %ac1 = arith.constant 1 : i64
+        %ac2 = arith.constant 2 : i64
+        %an_h, %an_b = func.call @LyUnicode_FromBytes(%name_dyn, %c0, %name_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+        %alp_ref = memref.get_global @__ly_exc_lparen : memref<1xi8>
+        %alp_dyn = memref.cast %alp_ref : memref<1xi8> to memref<?xi8>
+        %alp_h, %alp_b = func.call @LyUnicode_FromBytes(%alp_dyn, %c0, %ac1) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+        %ah_h, %ah_b = func.call @LyUnicode_Concat(%an_h, %an_b, %alp_h, %alp_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+        func.call @LyUnicode_DecRef(%an_h) : (memref<2xi64>) -> ()
+        func.call @LyUnicode_DecRef(%alp_h) : (memref<2xi64>) -> ()
+        %acomma_ref = memref.get_global @__ly_repr_comma : memref<2xi8>
+        %acomma_dyn = memref.cast %acomma_ref : memref<2xi8> to memref<?xi8>
+        %ablock_ptr = llvm.inttoptr %block : i64 to !llvm.ptr
+        %acount_index = arith.index_cast %count : i64 to index
+        %aloop:2 = scf.for %ai = %c0 to %acount_index step %c1 iter_args(%arh = %ah_h, %arb = %ah_b) -> (memref<2xi64>, memref<?xi8>) {
+          %ai_i64 = arith.index_cast %ai : index to i64
+          %ais_pos = arith.cmpi sgt, %ai_i64, %zero_i64 : i64
+          %asep:2 = scf.if %ais_pos -> (memref<2xi64>, memref<?xi8>) {
+            %ash, %asb = func.call @LyUnicode_FromBytes(%acomma_dyn, %c0, %ac2) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+            %ajh, %ajb = func.call @LyUnicode_Concat(%arh, %arb, %ash, %asb) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+            func.call @LyUnicode_DecRef(%arh) : (memref<2xi64>) -> ()
+            func.call @LyUnicode_DecRef(%ash) : (memref<2xi64>) -> ()
+            scf.yield %ajh, %ajb : memref<2xi64>, memref<?xi8>
+          } else {
+            scf.yield %arh, %arb : memref<2xi64>, memref<?xi8>
+          }
+          %asixteen = arith.constant 16 : i64
+          %abox_off = arith.muli %ai_i64, %asixteen : i64
+          %abox_base = arith.addi %abox_off, %ac1 : i64
+          %abox_ptr = llvm.getelementptr %ablock_ptr[%abox_base] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+          %aclass_gep = llvm.getelementptr %abox_ptr[%ac1] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+          %aclass_id = llvm.load %aclass_gep : !llvm.ptr -> i64
+          %aer_h, %aer_b, %aok = func.call @__ly_repr_boxed_by_contract(%abox_ptr, %aclass_id) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>, i1)
+          cf.assert %aok, "exception repr: boxed arg has no conforming __repr__"
+          %anh, %anb = func.call @LyUnicode_Concat(%asep#0, %asep#1, %aer_h, %aer_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+          func.call @LyUnicode_DecRef(%asep#0) : (memref<2xi64>) -> ()
+          func.call @LyUnicode_DecRef(%aer_h) : (memref<2xi64>) -> ()
+          scf.yield %anh, %anb : memref<2xi64>, memref<?xi8>
+        }
+        %arp_ref = memref.get_global @__ly_exc_rparen : memref<1xi8>
+        %arp_dyn = memref.cast %arp_ref : memref<1xi8> to memref<?xi8>
+        %arp_h, %arp_b = func.call @LyUnicode_FromBytes(%arp_dyn, %c0, %ac1) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+        %aout_h, %aout_b = func.call @LyUnicode_Concat(%aloop#0, %aloop#1, %arp_h, %arp_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+        func.call @LyUnicode_DecRef(%aloop#0) : (memref<2xi64>) -> ()
+        func.call @LyUnicode_DecRef(%arp_h) : (memref<2xi64>) -> ()
+        scf.yield %aout_h, %aout_b : memref<2xi64>, memref<?xi8>
+      } else {
+        %fallback:2 = func.call @__ly_exception_repr_plain(%class_id, %message_header, %message_bytes, %name_dyn, %name_len) : (i64, memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+        scf.yield %fallback#0, %fallback#1 : memref<2xi64>, memref<?xi8>
+      }
+      scf.yield %preplain#0, %preplain#1 : memref<2xi64>, memref<?xi8>
+    }
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  // Message-only repr tail (KeyError verbatim / generic quoting), split out
+  // so the payload-aware branch above stays region-balanced.
+  func.func private @__ly_exception_repr_plain(%class_id: i64, %message_header: memref<2xi64>, %message_bytes: memref<?xi8>, %name_dyn: memref<?xi8>, %name_len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "repr_plain"} {
+    %zero_i64 = arith.constant 0 : i64
+    %c0 = arith.constant 0 : index
+    // KeyError already stores repr(key) as its message (str(KeyError(x))
+    // == repr(x)); quoting again would render KeyError("'k'").
+    %keyerror_id = arith.constant 54 : i64
+      %is_keyerror = arith.cmpi eq, %class_id, %keyerror_id : i64
+      %msg_len = func.call @__ly_unicode_count(%message_header, %message_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+      %has_msg = arith.cmpi sgt, %msg_len, %zero_i64 : i64
+      %verbatim = arith.andi %is_keyerror, %has_msg : i1
+      %plain:2 = scf.if %verbatim -> (memref<2xi64>, memref<?xi8>) {
+        %c1v = arith.constant 1 : i64
+        %vname_h, %vname_b = func.call @LyUnicode_FromBytes(%name_dyn, %c0, %name_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+        %vlp_ref = memref.get_global @__ly_exc_lparen : memref<1xi8>
+        %vlp_dyn = memref.cast %vlp_ref : memref<1xi8> to memref<?xi8>
+        %vlp_h, %vlp_b = func.call @LyUnicode_FromBytes(%vlp_dyn, %c0, %c1v) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+        %vh_h, %vh_b = func.call @LyUnicode_Concat(%vname_h, %vname_b, %vlp_h, %vlp_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+        func.call @LyUnicode_DecRef(%vname_h) : (memref<2xi64>) -> ()
+        func.call @LyUnicode_DecRef(%vlp_h) : (memref<2xi64>) -> ()
+        %vb_h, %vb_b = func.call @LyUnicode_Concat(%vh_h, %vh_b, %message_header, %message_bytes) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+        func.call @LyUnicode_DecRef(%vh_h) : (memref<2xi64>) -> ()
+        %vrp_ref = memref.get_global @__ly_exc_rparen : memref<1xi8>
+        %vrp_dyn = memref.cast %vrp_ref : memref<1xi8> to memref<?xi8>
+        %vrp_h, %vrp_b = func.call @LyUnicode_FromBytes(%vrp_dyn, %c0, %c1v) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+        %vo_h, %vo_b = func.call @LyUnicode_Concat(%vb_h, %vb_b, %vrp_h, %vrp_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+        func.call @LyUnicode_DecRef(%vb_h) : (memref<2xi64>) -> ()
+        func.call @LyUnicode_DecRef(%vrp_h) : (memref<2xi64>) -> ()
+        scf.yield %vo_h, %vo_b : memref<2xi64>, memref<?xi8>
+      } else {
+        %generic:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+        scf.yield %generic#0, %generic#1 : memref<2xi64>, memref<?xi8>
+      }
+    func.return %plain#0, %plain#1 : memref<2xi64>, memref<?xi8>
   }
 
   // CPython repr(e): ClassName(<repr of the message>) -- ClassName() when
@@ -1674,20 +2432,62 @@ module attributes {
     func.return %out_h, %out_b : memref<2xi64>, memref<?xi8>
   }
 
-  // BaseException.args: () for an empty message, (message,) otherwise (the
-  // payload stores at most one argument).
+  // BaseException.args: the boxed payload values when the exception was
+  // constructed with several arguments; otherwise () for an empty message
+  // and (message,) for the single-argument fast path. (Deviation, noted:
+  // an exception GROUP renders args as (message,) -- the second CPython
+  // element, the original member sequence object, is not retained.)
   func.func @LyBaseException_Args(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "args", ly.runtime.result_contract = "builtins.tuple", ly.runtime.element_contract = "builtins.str"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
-    %msg_len = func.call @__ly_unicode_count(%message_header, %message_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
-    %has_message = arith.cmpi sgt, %msg_len, %zero : i64
-    %count = arith.select %has_message, %one, %zero : i64
-    %tuple:3 = func.call @LyTuple_FromLength(%count) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
-    scf.if %has_message {
-      %retained:2 = func.call @__ly_unicode_retain_self(%message_header, %message_bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
-      func.call @__ly_unicode_store_item(%tuple#2, %zero, %retained#0, %retained#1) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>) -> ()
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c16 = arith.constant 16 : index
+    %class_slot = arith.constant 2 : index
+    %payload_slot = arith.constant 3 : i64
+    %group_root = arith.constant 101 : i64
+    %class_id = memref.load %header[%class_slot] : memref<3xi64>
+    %block = func.call @__ly_exc_ext_get(%header, %payload_slot) : (memref<3xi64>, i64) -> i64
+    %payload_count = func.call @__ly_exc_payload_count(%block) : (i64) -> i64
+    %is_group = func.call @LyEH_ClassIdMatches(%class_id, %group_root) : (i64, i64) -> i1
+    %true_c = arith.constant true
+    %not_group = arith.xori %is_group, %true_c : i1
+    %has_payload = arith.cmpi sgt, %payload_count, %zero : i64
+    %payload_args = arith.andi %has_payload, %not_group : i1
+    %result:3 = scf.if %payload_args -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) {
+      %tuple:3 = func.call @LyTuple_FromLength(%payload_count) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+      %block_ptr = llvm.inttoptr %block : i64 to !llvm.ptr
+      %count_index = arith.index_cast %payload_count : i64 to index
+      scf.for %i = %c0 to %count_index step %c1 {
+        %i64v = arith.index_cast %i : index to i64
+        %sixteen = arith.constant 16 : i64
+        %one_off = arith.constant 1 : i64
+        %box_words = arith.muli %i64v, %sixteen : i64
+        %box_base = arith.addi %box_words, %one_off : i64
+        %dst_base = arith.muli %i, %c16 : index
+        scf.for %w = %c0 to %c16 step %c1 {
+          %w64 = arith.index_cast %w : index to i64
+          %src_off = arith.addi %box_base, %w64 : i64
+          %src_ptr = llvm.getelementptr %block_ptr[%src_off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+          %word = llvm.load %src_ptr : !llvm.ptr -> i64
+          %dst = arith.addi %dst_base, %w : index
+          memref.store %word, %tuple#2[%dst] : memref<?xi64>
+        }
+        func.call @LyObject_RetainBoxedPayloadArraySlotRaw(%tuple#2, %i64v) : (memref<?xi64>, i64) -> ()
+      }
+      scf.yield %tuple#0, %tuple#1, %tuple#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+    } else {
+      %msg_len = func.call @__ly_unicode_count(%message_header, %message_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+      %has_message = arith.cmpi sgt, %msg_len, %zero : i64
+      %count = arith.select %has_message, %one, %zero : i64
+      %tuple:3 = func.call @LyTuple_FromLength(%count) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+      scf.if %has_message {
+        %retained:2 = func.call @__ly_unicode_retain_self(%message_header, %message_bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+        func.call @__ly_unicode_store_item(%tuple#2, %zero, %retained#0, %retained#1) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>) -> ()
+      }
+      scf.yield %tuple#0, %tuple#1, %tuple#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
     }
-    func.return %tuple#0, %tuple#1, %tuple#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
   }
 
   func.func @LyKeyboardInterrupt_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 100 : i64, ly.runtime.contract = "builtins.KeyboardInterrupt", ly.runtime.initializer = "__new__"} {
@@ -1721,10 +2521,111 @@ module attributes {
     func.return
   }
 
+  // "msg (N sub-exception[s])" -- CPython's BaseExceptionGroup.__str__. A
+  // group without a member block (never constructible from source, but the
+  // dead-placeholder lanes can reach str) falls back to the plain message.
+  memref.global "private" constant @__ly_excgroup_str_open : memref<2xi8> = dense<[32, 40]>
+  memref.global "private" constant @__ly_excgroup_str_word : memref<14xi8> = dense<[32, 115, 117, 98, 45, 101, 120, 99, 101, 112, 116, 105, 111, 110]>
+  memref.global "private" constant @__ly_excgroup_str_plural : memref<1xi8> = dense<115>
+  memref.global "private" constant @__ly_excgroup_str_close : memref<1xi8> = dense<41>
+
+  // ASCII decimal rendering of a non-negative count (fits any payload size).
+  func.func private @__ly_exc_count_str(%value: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "count_str", ly.ownership.owned_results = [0]} {
+    %zero = arith.constant 0 : i64
+    %one_w = arith.constant 1 : i64
+    %ten = arith.constant 10 : i64
+    %ascii_zero = arith.constant 48 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %buffer = memref.alloca() : memref<24xi8>
+    %loop:2 = scf.while (%v = %value, %i = %zero) : (i64, i64) -> (i64, i64) {
+      %first = arith.cmpi eq, %i, %zero : i64
+      %more = arith.cmpi sgt, %v, %zero : i64
+      %continue = arith.ori %first, %more : i1
+      scf.condition(%continue) %v, %i : i64, i64
+    } do {
+    ^bb0(%v: i64, %i: i64):
+      %digit = arith.remsi %v, %ten : i64
+      %char64 = arith.addi %digit, %ascii_zero : i64
+      %char = arith.trunci %char64 : i64 to i8
+      %slot = arith.index_cast %i : i64 to index
+      memref.store %char, %buffer[%slot] : memref<24xi8>
+      %next_v = arith.divsi %v, %ten : i64
+      %next_i = arith.addi %i, %one_w : i64
+      scf.yield %next_v, %next_i : i64, i64
+    }
+    %out_h, %out_b = func.call @__ly_unicode_alloc(%loop#1, %one_w) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
+    %len_index = arith.index_cast %loop#1 : i64 to index
+    scf.for %k = %c0 to %len_index step %c1 {
+      %k64 = arith.index_cast %k : index to i64
+      %minus_one = arith.constant 1 : i64
+      %rev64 = arith.subi %loop#1, %k64 : i64
+      %rev64m = arith.subi %rev64, %minus_one : i64
+      %rev = arith.index_cast %rev64m : i64 to index
+      %byte = memref.load %buffer[%rev] : memref<24xi8>
+      %cp = arith.extui %byte : i8 to i64
+      func.call @__ly_unicode_put(%out_b, %one_w, %k, %cp) : (memref<?xi8>, i64, index, i64) -> ()
+    }
+    func.return %out_h, %out_b : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func private @__ly_exception_group_str(%header: memref<3xi64>, %message_header: memref<2xi64>, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "group_str", ly.ownership.owned_results = [0]} {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %fourteen = arith.constant 14 : i64
+    %three_slot = arith.constant 3 : i64
+    %c0 = arith.constant 0 : index
+    %block = func.call @__ly_exc_ext_get(%header, %three_slot) : (memref<3xi64>, i64) -> i64
+    %count = func.call @__ly_exc_payload_count(%block) : (i64) -> i64
+    %empty = arith.cmpi eq, %count, %zero : i64
+    %result:2 = scf.if %empty -> (memref<2xi64>, memref<?xi8>) {
+      %view = memref.cast %message_header : memref<2xi64> to memref<2xi64, strided<[1], offset: ?>>
+      func.call @Ly_IncRef(%view) : (memref<2xi64, strided<[1], offset: ?>>) -> ()
+      scf.yield %message_header, %message_bytes : memref<2xi64>, memref<?xi8>
+    } else {
+      %open_ref = memref.get_global @__ly_excgroup_str_open : memref<2xi8>
+      %open_dyn = memref.cast %open_ref : memref<2xi8> to memref<?xi8>
+      %open_h, %open_b = func.call @LyUnicode_FromBytes(%open_dyn, %c0, %two) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %count_h, %count_b = func.call @__ly_exc_count_str(%count) : (i64) -> (memref<2xi64>, memref<?xi8>)
+      %word_ref = memref.get_global @__ly_excgroup_str_word : memref<14xi8>
+      %word_dyn = memref.cast %word_ref : memref<14xi8> to memref<?xi8>
+      %word_h, %word_b = func.call @LyUnicode_FromBytes(%word_dyn, %c0, %fourteen) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %a_h, %a_b = func.call @LyUnicode_Concat(%message_header, %message_bytes, %open_h, %open_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      func.call @LyUnicode_DecRef(%open_h) : (memref<2xi64>) -> ()
+      %b_h, %b_b = func.call @LyUnicode_Concat(%a_h, %a_b, %count_h, %count_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      func.call @LyUnicode_DecRef(%a_h) : (memref<2xi64>) -> ()
+      func.call @LyUnicode_DecRef(%count_h) : (memref<2xi64>) -> ()
+      %c_h, %c_b = func.call @LyUnicode_Concat(%b_h, %b_b, %word_h, %word_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      func.call @LyUnicode_DecRef(%b_h) : (memref<2xi64>) -> ()
+      func.call @LyUnicode_DecRef(%word_h) : (memref<2xi64>) -> ()
+      %is_plural = arith.cmpi sgt, %count, %one : i64
+      %d:2 = scf.if %is_plural -> (memref<2xi64>, memref<?xi8>) {
+        %s_ref = memref.get_global @__ly_excgroup_str_plural : memref<1xi8>
+        %s_dyn = memref.cast %s_ref : memref<1xi8> to memref<?xi8>
+        %s_h, %s_b = func.call @LyUnicode_FromBytes(%s_dyn, %c0, %one) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+        %p_h, %p_b = func.call @LyUnicode_Concat(%c_h, %c_b, %s_h, %s_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+        func.call @LyUnicode_DecRef(%s_h) : (memref<2xi64>) -> ()
+        scf.yield %p_h, %p_b : memref<2xi64>, memref<?xi8>
+      } else {
+        %retained:2 = func.call @__ly_unicode_retain_self(%c_h, %c_b) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+        scf.yield %retained#0, %retained#1 : memref<2xi64>, memref<?xi8>
+      }
+      func.call @LyUnicode_DecRef(%c_h) : (memref<2xi64>) -> ()
+      %close_ref = memref.get_global @__ly_excgroup_str_close : memref<1xi8>
+      %close_dyn = memref.cast %close_ref : memref<1xi8> to memref<?xi8>
+      %close_h, %close_b = func.call @LyUnicode_FromBytes(%close_dyn, %c0, %one) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %e_h, %e_b = func.call @LyUnicode_Concat(%d#0, %d#1, %close_h, %close_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      func.call @LyUnicode_DecRef(%d#0) : (memref<2xi64>) -> ()
+      func.call @LyUnicode_DecRef(%close_h) : (memref<2xi64>) -> ()
+      scf.yield %e_h, %e_b : memref<2xi64>, memref<?xi8>
+    }
+    func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
+  }
+
   func.func @LyBaseExceptionGroup_Str(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.BaseExceptionGroup", ly.runtime.method = "__str__", ly.runtime.result_contract = "builtins.str"} {
-    %view = memref.cast %message_header : memref<2xi64> to memref<2xi64, strided<[1], offset: ?>>
-    func.call @Ly_IncRef(%view) : (memref<2xi64, strided<[1], offset: ?>>) -> ()
-    func.return %message_header, %message_bytes : memref<2xi64>, memref<?xi8>
+    %result:2 = func.call @__ly_exception_group_str(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
   func.func @LyBaseExceptionGroup_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.BaseExceptionGroup", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
@@ -1743,14 +2644,69 @@ module attributes {
   }
 
   func.func @LyExceptionGroup_Str(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.ExceptionGroup", ly.runtime.method = "__str__", ly.runtime.result_contract = "builtins.str"} {
-    %view = memref.cast %message_header : memref<2xi64> to memref<2xi64, strided<[1], offset: ?>>
-    func.call @Ly_IncRef(%view) : (memref<2xi64, strided<[1], offset: ?>>) -> ()
-    func.return %message_header, %message_bytes : memref<2xi64>, memref<?xi8>
+    %result:2 = func.call @__ly_exception_group_str(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
   func.func @LyExceptionGroup_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.ExceptionGroup", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
     %result:2 = func.call @__ly_exception_repr_by_id(%header, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  // ExceptionGroup member block: allocated by the 2-argument construction
+  // lowering (the exception's extended word 3), one member stored per call.
+  // The store borrows the member triple and retains the entity for the
+  // block; the block itself is released by release_exception_extras.
+  func.func @LyBaseExceptionGroup_MembersAlloc(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>, %count: i64) -> i64 attributes {ly.runtime.contract = "builtins.BaseExceptionGroup", ly.runtime.primitive = "members_alloc"} {
+    %block = func.call @__ly_exc_payload_alloc(%count) : (i64) -> i64
+    %payload_slot = arith.constant 3 : i64
+    func.call @__ly_exc_ext_set(%header, %payload_slot, %block) : (memref<3xi64>, i64, i64) -> ()
+    func.return %block : i64
+  }
+
+  func.func @LyBaseExceptionGroup_MemberStore(%block: i64, %slot: i64, %eh: memref<3xi64> {ly.ownership.object_header}, %mh: memref<2xi64> {ly.ownership.object_header}, %mb: memref<?xi8>) attributes {ly.runtime.contract = "builtins.BaseExceptionGroup", ly.runtime.primitive = "member_store"} {
+    func.call @__ly_exc_payload_store(%block, %slot, %eh, %mh, %mb) : (i64, i64, memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    func.return
+  }
+
+  // BaseExceptionGroup.message: the bare message (str() adds the count).
+  func.func @LyBaseExceptionGroup_Message(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.BaseExceptionGroup", ly.runtime.primitive = "message", ly.runtime.result_contract = "builtins.str"} {
+    %view = memref.cast %message_header : memref<2xi64> to memref<2xi64, strided<[1], offset: ?>>
+    func.call @Ly_IncRef(%view) : (memref<2xi64, strided<[1], offset: ?>>) -> ()
+    func.return %message_header, %message_bytes : memref<2xi64>, memref<?xi8>
+  }
+
+  // BaseExceptionGroup.exceptions: a fresh tuple whose boxes duplicate the
+  // member block (each copy retains the member entity).
+  func.func @LyBaseExceptionGroup_Exceptions(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.BaseExceptionGroup", ly.runtime.primitive = "exceptions", ly.runtime.result_contract = "builtins.tuple", ly.runtime.element_contract = "builtins.BaseException"} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c16 = arith.constant 16 : index
+    %one = arith.constant 1 : i64
+    %payload_slot = arith.constant 3 : i64
+    %block = func.call @__ly_exc_ext_get(%header, %payload_slot) : (memref<3xi64>, i64) -> i64
+    %count = func.call @__ly_exc_payload_count(%block) : (i64) -> i64
+    %tuple:3 = func.call @LyTuple_FromLength(%count) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    %block_ptr = llvm.inttoptr %block : i64 to !llvm.ptr
+    %count_index = arith.index_cast %count : i64 to index
+    scf.for %i = %c0 to %count_index step %c1 {
+      %i64v = arith.index_cast %i : index to i64
+      %c16_i64 = arith.constant 16 : i64
+      %one_off = arith.constant 1 : i64
+      %box_words = arith.muli %i64v, %c16_i64 : i64
+      %box_base = arith.addi %box_words, %one_off : i64
+      %dst_base = arith.muli %i, %c16 : index
+      scf.for %w = %c0 to %c16 step %c1 {
+        %w64 = arith.index_cast %w : index to i64
+        %src_off = arith.addi %box_base, %w64 : i64
+        %src_ptr = llvm.getelementptr %block_ptr[%src_off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+        %word = llvm.load %src_ptr : !llvm.ptr -> i64
+        %dst = arith.addi %dst_base, %w : index
+        memref.store %word, %tuple#2[%dst] : memref<?xi64>
+      }
+      func.call @LyObject_RetainBoxedPayloadArraySlotRaw(%tuple#2, %i64v) : (memref<?xi64>, i64) -> ()
+    }
+    func.return %tuple#0, %tuple#1, %tuple#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
   }
 
   func.func @LyFloatingPointError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 103 : i64, ly.runtime.contract = "builtins.FloatingPointError", ly.runtime.initializer = "__new__"} {
@@ -8510,6 +9466,18 @@ module attributes {
   // the widest code point: a canonical substring of a wide string can be
   // narrower than its source (equality stays bytewise only if slices
   // re-canonicalize).
+  // Fresh, unaliased copy of a str. The conditional raise paths need this:
+  // an exception __init__ consumes its message, and consuming the (aliased)
+  // source value inside one branch would unbalance its ownership token on
+  // the other; a fresh copy is created and consumed inside the same branch.
+  func.func @LyUnicode_Clone(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.primitive = "clone", ly.runtime.result_contract = "builtins.str"} {
+    %c0 = arith.constant 0 : index
+    %count = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %count_index = arith.index_cast %count : i64 to index
+    %copy:2 = func.call @__ly_unicode_slice(%header, %bytes, %c0, %count_index) : (memref<2xi64>, memref<?xi8>, index, index) -> (memref<2xi64>, memref<?xi8>)
+    func.return %copy#0, %copy#1 : memref<2xi64>, memref<?xi8>
+  }
+
   func.func private @__ly_unicode_slice(%header: memref<2xi64>, %bytes: memref<?xi8>, %start: index, %end: index) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
     %c1 = arith.constant 1 : index
     %zero = arith.constant 0 : i64

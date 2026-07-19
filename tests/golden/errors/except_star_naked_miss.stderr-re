@@ -1,0 +1,4 @@
+Traceback\ \(most\ recent\ call\ last\):\
+\ \ File\ ".*except_star_naked_miss\.py",\ line\ 2,\ in\ <module>\
+\ \ \ \ raise\ ValueError\("naked"\)\
+ValueError:\ naked

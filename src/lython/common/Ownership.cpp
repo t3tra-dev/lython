@@ -1396,7 +1396,10 @@ bool isRaiseLikeFunction(mlir::func::FuncOp function) {
   // attribute can never carry the fact -- and stamping the attribute onto
   // them would make manifest audits report primitives no manifest declares.
   llvm::StringRef name = function.getName();
-  if (name == "LyEH_RethrowCurrent" || name == "LyEH_ThrowException")
+  if (name == "LyEH_RethrowCurrent" || name == "LyEH_ThrowException" ||
+      name == "LyEH_StarRethrowResidual" ||
+      name == "LyEH_StarRethrowSoleCollected" ||
+      name == "LyEH_StarThrowCombined")
     return true;
   return isRaisePrimitiveFunction(function);
 }

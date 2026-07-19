@@ -1,0 +1,2 @@
+ExceptionGroup('', [RuntimeError('r1'), RuntimeError('r2'), ExceptionGroup('g', [OSError('o')])])
+after

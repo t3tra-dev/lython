@@ -384,6 +384,49 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
     }
   }
 
+  // ExceptionGroup.message / .exceptions read the message lane and the
+  // extended member block through manifest primitives — like args, there is
+  // no field slot to load, so this must run before the class-field paths.
+  if (object->kind == RuntimeBundle::Kind::Object &&
+      (op.getName() == "message" || op.getName() == "exceptions")) {
+    std::string contract = runtimeContractName(op.getObject().getType());
+    // BaseException/Exception join in: a group member read back through
+    // .exceptions is statically the tuple's BaseException element type while
+    // the dynamic class stays the group's. Non-exception contracts still
+    // fall through to the class-schema diagnostic.
+    bool groupShaped = contract == "builtins.BaseExceptionGroup" ||
+                       contract == "builtins.ExceptionGroup" ||
+                       contract == "builtins.BaseException" ||
+                       contract == "builtins.Exception";
+    if (groupShaped && object->physicalValues().size() == 3) {
+      std::optional<RuntimeSymbol> primitive =
+          manifest.primitive(contract, op.getName());
+      if (!primitive)
+        primitive =
+            manifest.primitive("builtins.BaseExceptionGroup", op.getName());
+      if (!primitive)
+        return op.emitError()
+               << "runtime manifest has no BaseExceptionGroup " << op.getName()
+               << " primitive";
+      llvm::SmallVector<const RuntimeBundle *, 1> sources{object};
+      llvm::SmallVector<mlir::Value, 4> operands;
+      builder.setInsertionPoint(op);
+      if (mlir::failed(buildRuntimeCallOperands(op, *primitive, sources,
+                                                operands,
+                                                /*allowUnusedSources=*/false)))
+        return mlir::failure();
+      mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+          op.getLoc(), *primitive, operands);
+      RuntimeBundle result;
+      if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
+              op, op.getResult().getType(), call, result)))
+        return mlir::failure();
+      valueBundles[op.getResult()] = std::move(result);
+      erase.push_back(op);
+      return mlir::success();
+    }
+  }
+
   if (isMethodDescriptorKind(op) &&
       RuntimeBundleLowerer::classDefinesMethod(op.getObject().getType(),
                                                op.getName())) {

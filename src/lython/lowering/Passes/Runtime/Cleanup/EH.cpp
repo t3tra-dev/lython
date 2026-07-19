@@ -131,7 +131,9 @@ bool isPythonRuntimeRaiseCall(const llvm::Function *callee) {
     return false;
   llvm::StringRef name = callee->getName();
   return name == "LyEH_ThrowException" || name == "LyEH_RethrowCurrent" ||
-         name.ends_with("_Raise");
+         name == "LyEH_StarRethrowResidual" ||
+         name == "LyEH_StarRethrowSoleCollected" ||
+         name == "LyEH_StarThrowCombined" || name.ends_with("_Raise");
 }
 
 bool mayTransferToPythonTryHandler(const llvm::Function *callee) {

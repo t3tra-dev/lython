@@ -1,0 +1,3 @@
+A: ExceptionGroup('ops', [DbError('db down'), AppError('app')])
+V: ExceptionGroup('ops', [ValueError('v')])
+after

@@ -1101,4 +1101,249 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
 }
 
 
+// except* (PEP 654). The emitted except region differs fundamentally from
+// the regular form: clauses are not mutually exclusive (each may consume a
+// slice of one exception group), every clause body is wrapped in an inner
+// collect-try (a raise inside a clause is parked, later clauses still run),
+// and a trailing finish step rethrows whatever is left. The star frame
+// bookkeeping lives in the runtime; here only the clause skeleton is built.
+void ModuleEmitter::emitTryStar(const parser::Node &statement) {
+  const auto *handlers = ast::nodeList(statement, "handlers");
+  const auto *finalbody = ast::nodeList(statement, "finalbody");
+  const auto *orelse = ast::nodeList(statement, "orelse");
+  bool hasFinally = finalbody && !finalbody->empty();
+
+  if (hasFinally) {
+    // Same nesting CPython's evaluation order licenses for try/except/else/
+    // finally: run the star clauses inside a plain try/finally.
+    const parser::Field *bodyField = parser::findField(statement, "body");
+    const parser::Field *handlersField =
+        parser::findField(statement, "handlers");
+    const parser::Field *orelseField = parser::findField(statement, "orelse");
+    if (!bodyField || !handlersField || !orelseField ||
+        !std::holds_alternative<std::vector<parser::NodePtr>>(
+            bodyField->value) ||
+        !std::holds_alternative<std::vector<parser::NodePtr>>(
+            handlersField->value) ||
+        !std::holds_alternative<std::vector<parser::NodePtr>>(
+            orelseField->value)) {
+      diagnostics.push_back(
+          parser::Diagnostic{parser::Severity::Error, statement.range.start,
+                             "malformed try/except*/finally statement"});
+      return;
+    }
+    parser::NodePtr inner = parser::makeNode("TryStar", statement.range);
+    parser::addField(*inner, "body",
+                     std::get<std::vector<parser::NodePtr>>(bodyField->value));
+    parser::addField(
+        *inner, "handlers",
+        std::get<std::vector<parser::NodePtr>>(handlersField->value));
+    parser::addField(*inner, "orelse",
+                     std::get<std::vector<parser::NodePtr>>(orelseField->value));
+    parser::addField(*inner, "finalbody", std::vector<parser::NodePtr>{});
+    parser::NodePtr outer = parser::makeNode("Try", statement.range);
+    parser::addField(*outer, "body", std::vector<parser::NodePtr>{inner});
+    parser::addField(*outer, "handlers", std::vector<parser::NodePtr>{});
+    parser::addField(*outer, "orelse", std::vector<parser::NodePtr>{});
+    parser::addField(
+        *outer, "finalbody",
+        std::vector<parser::NodePtr>(finalbody->begin(), finalbody->end()));
+    emitTry(*outer);
+    return;
+  }
+  if (orelse && !orelse->empty()) {
+    diagnostics.push_back(
+        parser::Diagnostic{parser::Severity::Error, statement.range.start,
+                           "else with except* is not implemented yet"});
+    return;
+  }
+  if (!handlers || handlers->empty()) {
+    diagnostics.push_back(
+        parser::Diagnostic{parser::Severity::Error, statement.range.start,
+                           "except* requires at least one handler"});
+    return;
+  }
+  if (containsReturnStatement(ast::nodeList(statement, "body")) ||
+      containsBreakOrContinueStatement(ast::nodeList(statement, "body"))) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, statement.range.start,
+        "return/break/continue inside a try with except* is not implemented "
+        "yet"});
+    return;
+  }
+
+  struct StarHandler {
+    const parser::Node *node = nullptr;
+    mlir::Type handlerType;
+    std::optional<std::string_view> name;
+  };
+  llvm::SmallVector<StarHandler, 4> starHandlers;
+  for (const parser::NodePtr &handlerPtr : *handlers) {
+    if (!handlerPtr)
+      continue;
+    const parser::Node &handler = *handlerPtr;
+    const parser::Node *typeNode = ast::node(handler, "type");
+    if (!typeNode) {
+      diagnostics.push_back(
+          parser::Diagnostic{parser::Severity::Error, handler.range.start,
+                             "except* requires an exception type"});
+      return;
+    }
+    if (typeNode->kind == "Tuple") {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, typeNode->range.start,
+          "except* with a tuple of exception types is not implemented yet"});
+      return;
+    }
+    // PEP 654: continue/break/return are a SyntaxError inside except*.
+    if (containsReturnStatement(ast::nodeList(handler, "body")) ||
+        containsBreakOrContinueStatement(ast::nodeList(handler, "body"))) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, handler.range.start,
+          "'return', 'break' and 'continue' are not allowed in an except* "
+          "block"});
+      return;
+    }
+    mlir::Type candidateType = types.inferExpr(typeNode);
+    if (!mlir::isa_and_nonnull<py::TypeType>(candidateType)) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, typeNode->range.start,
+          "except* handler must resolve to a Python type object"});
+      return;
+    }
+    starHandlers.push_back(StarHandler{&handler, candidateType,
+                                       ast::string(handler, "name")});
+  }
+  if (starHandlers.empty()) {
+    diagnostics.push_back(
+        parser::Diagnostic{parser::Severity::Error, statement.range.start,
+                           "except* requires at least one handler"});
+    return;
+  }
+
+  mlir::OperationState state(loc(statement), py::TryOp::getOperationName());
+  state.addRegion();
+  state.addRegion();
+  state.addRegion();
+  mlir::Operation *rawTry = builder.create(state);
+  auto tryOp = mlir::cast<py::TryOp>(rawTry);
+
+  {
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    auto *tryBlock = new mlir::Block;
+    tryOp.getTryRegion().push_back(tryBlock);
+    builder.setInsertionPointToStart(tryBlock);
+    {
+      ScopedEmitterScope scope(values, types);
+      emitStatements(ast::nodeList(statement, "body"));
+    }
+    terminateOpenRegionBlocks<py::TryYieldOp>(builder, loc(statement),
+                                              tryOp.getTryRegion());
+  }
+
+  {
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    auto *entryBlock = new mlir::Block;
+    tryOp.getExceptRegion().push_back(entryBlock);
+    llvm::SmallVector<mlir::Block *, 4> checkBlocks;
+    llvm::SmallVector<mlir::Block *, 4> bodyBlocks;
+    for (std::size_t index = 0; index < starHandlers.size(); ++index) {
+      checkBlocks.push_back(new mlir::Block);
+      bodyBlocks.push_back(new mlir::Block);
+      tryOp.getExceptRegion().push_back(checkBlocks.back());
+      tryOp.getExceptRegion().push_back(bodyBlocks.back());
+    }
+    auto *finishBlock = new mlir::Block;
+    tryOp.getExceptRegion().push_back(finishBlock);
+
+    builder.setInsertionPointToStart(entryBlock);
+    {
+      mlir::OperationState beginState(loc(statement),
+                                      py::StarBeginOp::getOperationName());
+      builder.create(beginState);
+    }
+    mlir::cf::BranchOp::create(builder, loc(statement), checkBlocks.front());
+
+    for (auto [index, starHandler] : llvm::enumerate(starHandlers)) {
+      const parser::Node &handler = *starHandler.node;
+      mlir::Block *next = index + 1 == starHandlers.size()
+                              ? finishBlock
+                              : checkBlocks[index + 1];
+      builder.setInsertionPointToStart(checkBlocks[index]);
+      mlir::OperationState matchState(
+          loc(handler), py::ExceptStarMatchOp::getOperationName());
+      matchState.addTypes(builder.getI1Type());
+      matchState.addAttribute("handler",
+                              mlir::TypeAttr::get(starHandler.handlerType));
+      auto match =
+          mlir::cast<py::ExceptStarMatchOp>(builder.create(matchState));
+      mlir::cf::CondBranchOp::create(builder, loc(handler), match.getResult(),
+                                     bodyBlocks[index], mlir::ValueRange{},
+                                     next, mlir::ValueRange{});
+
+      builder.setInsertionPointToStart(bodyBlocks[index]);
+      {
+        ScopedEmitterScope scope(values, types);
+        if (starHandler.name) {
+          // The binding is the matched SLICE: always an exception group
+          // (naked matches arrive pre-wrapped by the runtime split).
+          mlir::Type groupContract = types.contract("builtins.ExceptionGroup");
+          mlir::Type bindingType = types.typeObject(groupContract);
+          auto current = py::ExceptCurrentValueOp::create(
+                             builder, loc(handler), groupContract,
+                             mlir::TypeAttr::get(bindingType))
+                             .getResult();
+          std::string name(*starHandler.name);
+          values[name] = Value{current, groupContract};
+          types.bindSymbol(name, groupContract);
+        }
+
+        // Inner collect-try: a raise in the clause body parks the exception
+        // in the star frame and the remaining clauses still run.
+        mlir::OperationState innerState(loc(handler),
+                                        py::TryOp::getOperationName());
+        innerState.addRegion();
+        innerState.addRegion();
+        innerState.addRegion();
+        mlir::Operation *rawInner = builder.create(innerState);
+        auto innerTry = mlir::cast<py::TryOp>(rawInner);
+        {
+          mlir::OpBuilder::InsertionGuard innerGuard(builder);
+          auto *innerBody = new mlir::Block;
+          innerTry.getTryRegion().push_back(innerBody);
+          builder.setInsertionPointToStart(innerBody);
+          {
+            ScopedEmitterScope bodyScope(values, types);
+            emitStatements(ast::nodeList(handler, "body"));
+          }
+          terminateOpenRegionBlocks<py::TryYieldOp>(builder, loc(handler),
+                                                    innerTry.getTryRegion());
+          auto *collectBlock = new mlir::Block;
+          innerTry.getExceptRegion().push_back(collectBlock);
+          builder.setInsertionPointToStart(collectBlock);
+          mlir::OperationState collectState(
+              loc(handler), py::StarCollectOp::getOperationName());
+          builder.create(collectState);
+          py::ExceptYieldOp::create(builder, loc(handler), mlir::ValueRange{});
+        }
+        builder.setInsertionPointAfter(innerTry);
+        mlir::OperationState bodyEndState(
+            loc(handler), py::StarBodyEndOp::getOperationName());
+        builder.create(bodyEndState);
+      }
+      mlir::cf::BranchOp::create(builder, loc(handler), next);
+    }
+
+    builder.setInsertionPointToStart(finishBlock);
+    {
+      mlir::OperationState finishState(loc(statement),
+                                       py::StarFinishOp::getOperationName());
+      builder.create(finishState);
+    }
+    py::ExceptYieldOp::create(builder, loc(statement), mlir::ValueRange{});
+  }
+
+  builder.setInsertionPointAfter(tryOp);
+}
+
 } // namespace lython::emitter

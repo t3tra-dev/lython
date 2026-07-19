@@ -1596,6 +1596,64 @@ void buildCurrentExceptionMatches(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{matches});
 }
 
+// void release_exception_extras(i64 header): drop the extended exception
+// words before the 3-word storage itself is freed — word 3 (ExceptionGroup
+// members / multi-value args) and word 4 (user-exception fields) each hold a
+// [count, count x box16] i64 block whose slots own one reference apiece.
+// Lives here (not in builtins.mlir) because every raw free site — the
+// manifest deallocator, the discard path, and chain-node destruction — must
+// share one implementation.
+void buildReleaseExceptionExtras(SupportBuilder &b) {
+  auto fn = b.beginFunction("release_exception_extras",
+                            b.builder.getFunctionType({b.i64()}, {}),
+                            /*isPrivate=*/true);
+  mlir::Block *entry = fn.addEntryBlock();
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value header = b.intToPtr(entry->getArgument(0));
+  for (std::int64_t word : {std::int64_t(3), std::int64_t(4)}) {
+    mlir::Value slotPtr = b.gepI64(header, b.iconst(word));
+    mlir::Value block64 = b.loadI64(slotPtr);
+    mlir::Value present =
+        b.cmpi(mlir::arith::CmpIPredicate::ne, block64, b.iconst(0));
+    auto blockIf = mlir::scf::IfOp::create(b.builder, b.loc, mlir::TypeRange{},
+                                           present, /*withElseRegion=*/false);
+    {
+      mlir::OpBuilder::InsertionGuard guard(b.builder);
+      b.builder.setInsertionPointToStart(&blockIf.getThenRegion().front());
+      mlir::Value blockPtr = b.intToPtr(block64);
+      // Bit 62 of the count word is the tuple-repr flag.
+      mlir::Value rawCount = b.loadI64(blockPtr);
+      mlir::Value count = mlir::arith::AndIOp::create(
+          b.builder, b.loc, rawCount, b.iconst(0x3FFFFFFFFFFFFFFFLL));
+      mlir::Value zeroIndex =
+          mlir::arith::ConstantIndexOp::create(b.builder, b.loc, 0);
+      mlir::Value oneIndex =
+          mlir::arith::ConstantIndexOp::create(b.builder, b.loc, 1);
+      mlir::Value countIndex = mlir::arith::IndexCastOp::create(
+          b.builder, b.loc, b.builder.getIndexType(), count);
+      auto loop = mlir::scf::ForOp::create(b.builder, b.loc, zeroIndex,
+                                           countIndex, oneIndex);
+      {
+        mlir::OpBuilder::InsertionGuard loopGuard(b.builder);
+        b.builder.setInsertionPointToStart(loop.getBody());
+        mlir::Value position = mlir::arith::IndexCastOp::create(
+            b.builder, b.loc, b.i64(), loop.getInductionVar());
+        mlir::Value boxWords = mlir::arith::MulIOp::create(
+            b.builder, b.loc, position, b.iconst(16));
+        mlir::Value boxBase = mlir::arith::AddIOp::create(
+            b.builder, b.loc, boxWords, b.iconst(1));
+        mlir::Value boxPtr = b.gepI64(blockPtr, boxBase);
+        b.call("release_payload_slot_ptr", mlir::TypeRange{},
+               mlir::ValueRange{boxPtr});
+      }
+      b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{block64});
+      mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0), slotPtr,
+                                  /*alignment=*/8);
+    }
+  }
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
 // void LyEH_DiscardCurrentException(): consumes the stored exception token
 // (refcount decrement; frees message + header at zero), clears the slot and
 // the traceback. An escaping handler binding was retained by the
@@ -1646,6 +1704,8 @@ void buildDiscardCurrentException(SupportBuilder &b) {
       mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), messageHeader);
   mlir::Value bytesWord =
       mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), messageBytes);
+  b.call("release_exception_extras", mlir::TypeRange{},
+         mlir::ValueRange{exceptionWord});
   b.call("release_unicode_raw", mlir::TypeRange{},
          mlir::ValueRange{headerWord, bytesWord});
   b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{exceptionWord});
@@ -2183,10 +2243,12 @@ void buildRunPythonMain(SupportBuilder &b) {
                                printTraceback);
 
   b.builder.setInsertionPointToEnd(printTraceback);
+  mlir::Value exceptionWord =
+      mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), aligned);
   mlir::func::CallOp::create(
       b.builder, b.loc, "LyTraceback_PrintMessage", mlir::TypeRange{},
-      mlir::ValueRange{classId, messageHeader, messageData, messageOffset,
-                       messageLen, messageStride});
+      mlir::ValueRange{classId, exceptionWord, messageHeader, messageData,
+                       messageOffset, messageLen, messageStride});
   mlir::func::CallOp::create(b.builder, b.loc, "release_current_chain",
                              mlir::TypeRange{}, mlir::ValueRange{});
   mlir::func::CallOp::create(b.builder, b.loc, "LyTraceback_Clear",
@@ -2331,6 +2393,7 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context) {
   buildGlobalViewFunction(support, "__ly_global_view_i64");
   buildGlobalViewFunction(support, "__ly_global_view_f64");
   buildReleasePayloadSlotPtr(support);
+  buildReleaseExceptionExtras(support);
   buildReleaseBoxedPayloadRaw(support);
   buildReleaseBoxedPayloadArraySlotRaw(support);
   buildRetainPayloadSlotPtr(support);

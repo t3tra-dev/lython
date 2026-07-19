@@ -252,9 +252,7 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
   } else if (statement.kind == "Try") {
     emitTry(statement);
   } else if (statement.kind == "TryStar") {
-    diagnostics.push_back(parser::Diagnostic{
-        parser::Severity::Error, statement.range.start,
-        "except* requires exception-group-aware py.try lowering"});
+    emitTryStar(statement);
   } else {
     diagnostics.push_back(parser::Diagnostic{
         parser::Severity::Error, statement.range.start,

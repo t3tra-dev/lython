@@ -158,6 +158,7 @@ private:
   loopCarriedBranchOperands(const parser::Node &anchor,
                             const LoopControlContext &loop, mlir::Block *target);
   void emitTry(const parser::Node &statement);
+  void emitTryStar(const parser::Node &statement);
   void emitWith(const parser::Node &statement, bool async);
   void emitWithCleanup(const parser::Node &anchor, const WithCleanup &cleanup);
   void emitActiveCleanups(const parser::Node &anchor);

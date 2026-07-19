@@ -1,0 +1,7 @@
+\ \ \+\ Exception\ Group\ Traceback\ \(most\ recent\ call\ last\):\
+\ \ \|\ \ \ File\ ".*except_star_residual\.py",\ line\ 2,\ in\ <module>\
+\ \ \|\ \ \ \ \ raise\ ExceptionGroup\("g",\ \[ValueError\("a"\),\ TypeError\("b"\)\]\)\
+\ \ \|\ ExceptionGroup:\ g\ \(1\ sub\-exception\)\
+\ \ \+\-\+\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\ 1\ \-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\
+\ \ \ \ \|\ TypeError:\ b\
+\ \ \ \ \+\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-

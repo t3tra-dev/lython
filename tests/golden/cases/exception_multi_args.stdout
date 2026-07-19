@@ -1,0 +1,13 @@
+('a', 'b')
+('a', 'b')
+ValueError('a', 'b')
+('x', 1, 2)
+3
+('x', 1, 2)
+Exception('x', 1, 2)
+ValueError(1, 2.5, True)
+(1, 2.5, True)
+('a', 7)
+('a', 7)
+MyError('a', 7)
+('only',) MyError('only')

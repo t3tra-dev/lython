@@ -1,0 +1,5 @@
+Traceback\ \(most\ recent\ call\ last\):\
+\ \ File\ ".*dict_runtime_key_miss\.py",\ line\ 10,\ in\ <module>\
+\ \ \ \ print\(d\[missing\]\)\
+\ \ \ \ \ \ \ \ \ \ \~\^\^\^\^\^\^\^\^\^\
+KeyError:\ 'gone'

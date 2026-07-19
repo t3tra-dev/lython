@@ -74,6 +74,22 @@ void declareTracebackSupport(SupportBuilder &b) {
                                    mlir::LLVM::Linkage::Internal, name,
                                    b.builder.getIntegerAttr(b.i64(), 0),
                                    /*alignment=*/8);
+    // ExceptionGroup display margin: every stderr line the printers start
+    // while this is >= 0 gets that many spaces plus "| " (CPython's group
+    // traceback gutter). -1 = plain display.
+    mlir::LLVM::GlobalOp::create(b.builder, b.loc, b.i64(),
+                                 /*isConstant=*/false,
+                                 mlir::LLVM::Linkage::Internal,
+                                 "g_tb_prefix_spaces",
+                                 b.builder.getIntegerAttr(b.i64(), -1),
+                                 /*alignment=*/8);
+    // Innermost except* frame (0 = none); frames chain through their parent
+    // word, so nested except* statements stack naturally.
+    mlir::LLVM::GlobalOp::create(b.builder, b.loc, b.i64(),
+                                 /*isConstant=*/false,
+                                 mlir::LLVM::Linkage::Internal, "g_star_top",
+                                 b.builder.getIntegerAttr(b.i64(), 0),
+                                 /*alignment=*/8);
     auto stack = mlir::LLVM::GlobalOp::create(
         b.builder, b.loc, tracebackStackType(b), /*isConstant=*/false,
         mlir::LLVM::Linkage::Internal, "g_traceback_stack", mlir::Attribute(),
@@ -96,6 +112,16 @@ void declareTracebackSupport(SupportBuilder &b) {
                  "\nThe above exception was the direct cause of the following "
                  "exception:\n\n");
   b.stringGlobal(".tb_fmt_frame", "  File \"%s\", line %d, in %s\n");
+  b.stringGlobal(".tb_group_header",
+                 "  + Exception Group Traceback (most recent call last):\n");
+  b.stringGlobal(".tb_bar", "| ");
+  b.stringGlobal(".tb_fmt_sep_first",
+                 "+-+---------------- %lld ----------------\n");
+  b.stringGlobal(".tb_fmt_sep_next",
+                 "+---------------- %lld ----------------\n");
+  b.stringGlobal(".tb_sep_close", "+------------------------------------\n");
+  b.stringGlobal(".tb_fmt_group_one", " (%lld sub-exception)\n");
+  b.stringGlobal(".tb_fmt_group_many", " (%lld sub-exceptions)\n");
   b.stringGlobal(".tb_fmt_class", "%s\n");
   b.stringGlobal(".tb_fmt_invalid", "%s: <invalid>\n");
   b.stringGlobal(".tb_fmt_unknown", "%s: <unknown>\n");
@@ -579,6 +605,8 @@ void buildReleaseChainNode(SupportBuilder &b) {
                                  mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(freePayload);
+  b.call("release_exception_extras", mlir::TypeRange{},
+         mlir::ValueRange{headerWord});
   b.call("release_unicode_raw", mlir::TypeRange{},
          mlir::ValueRange{b.loadI64(nodeSlot(b, node, 7)),
                           b.loadI64(nodeSlot(b, node, 12))});
@@ -1269,6 +1297,7 @@ void buildPrintMarker(SupportBuilder &b) {
 
   b.builder.setInsertionPointToEnd(emit);
   mlir::Value stderrFd = b.iconst32(2);
+  b.call("write_prefix", mlir::TypeRange{}, mlir::ValueRange{stderrFd});
   b.call("write_cstr", mlir::TypeRange{},
          mlir::ValueRange{stderrFd, b.addrOf(".tb_indent")});
   mlir::cf::BranchOp::create(b.builder, b.loc, padHead,
@@ -1332,6 +1361,226 @@ void buildPrintMarker(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
+// void write_spaces(i32 fd, i64 count): margin padding for the group display.
+void buildWriteSpaces(SupportBuilder &b) {
+  auto fn = b.beginFunction("write_spaces",
+                            b.builder.getFunctionType({b.i32(), b.i64()}, {}),
+                            /*isPrivate=*/true);
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::Region &body = fn.getBody();
+  mlir::Block *head =
+      b.builder.createBlock(&body, body.end(), {b.i64()}, {b.loc});
+  mlir::Block *one = b.builder.createBlock(&body);
+  mlir::Block *done = b.builder.createBlock(&body);
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::cf::BranchOp::create(b.builder, b.loc, head,
+                             mlir::ValueRange{b.iconst(0)});
+  b.builder.setInsertionPointToEnd(head);
+  mlir::Value index = head->getArgument(0);
+  mlir::Value finished =
+      b.cmpi(mlir::arith::CmpIPredicate::sge, index, entry->getArgument(1));
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, finished, done,
+                                 mlir::ValueRange{}, one, mlir::ValueRange{});
+  b.builder.setInsertionPointToEnd(one);
+  b.call("write_char", mlir::TypeRange{},
+         mlir::ValueRange{entry->getArgument(0), b.iconst8(32)});
+  mlir::Value next =
+      mlir::arith::AddIOp::create(b.builder, b.loc, index, b.iconst(1));
+  mlir::cf::BranchOp::create(b.builder, b.loc, head, mlir::ValueRange{next});
+  b.builder.setInsertionPointToEnd(done);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
+// void write_prefix(i32 fd): the group-display gutter (margin spaces + "| ")
+// when g_tb_prefix_spaces >= 0; a no-op for the plain display, so the
+// printers call it unconditionally at every line start.
+void buildWritePrefix(SupportBuilder &b) {
+  auto fn = b.beginFunction("write_prefix",
+                            b.builder.getFunctionType({b.i32()}, {}),
+                            /*isPrivate=*/true);
+  mlir::Block *entry = fn.addEntryBlock();
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value spaces = b.loadI64(b.addrOf("g_tb_prefix_spaces"));
+  mlir::Value active =
+      b.cmpi(mlir::arith::CmpIPredicate::sge, spaces, b.iconst(0));
+  auto activeIf = mlir::scf::IfOp::create(b.builder, b.loc, mlir::TypeRange{},
+                                          active, /*withElseRegion=*/false);
+  {
+    mlir::OpBuilder::InsertionGuard guard(b.builder);
+    b.builder.setInsertionPointToStart(&activeIf.getThenRegion().front());
+    b.call("write_spaces", mlir::TypeRange{},
+           mlir::ValueRange{entry->getArgument(0), spaces});
+    b.call("write_cstr", mlir::TypeRange{},
+           mlir::ValueRange{entry->getArgument(0), b.addrOf(".tb_bar")});
+  }
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
+// i64 exception_group_member_count(i64 excPtr): the member-block count of an
+// exception's extended word 3 (0 for a plain exception or a null pointer).
+void buildExceptionGroupMemberCount(SupportBuilder &b) {
+  auto fn = b.beginFunction("exception_group_member_count",
+                            b.builder.getFunctionType({b.i64()}, {b.i64()}),
+                            /*isPrivate=*/true);
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::Region &body = fn.getBody();
+  mlir::Block *load = b.builder.createBlock(&body);
+  mlir::Block *blockLoad = b.builder.createBlock(&body);
+  mlir::Block *zero = b.builder.createBlock(&body);
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value excNull = b.cmpi(mlir::arith::CmpIPredicate::eq,
+                               entry->getArgument(0), b.iconst(0));
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, excNull, zero,
+                                 mlir::ValueRange{}, load, mlir::ValueRange{});
+  b.builder.setInsertionPointToEnd(load);
+  mlir::Value blockWord = b.loadI64(
+      b.gepI64(b.intToPtr(entry->getArgument(0)), b.iconst(3)));
+  mlir::Value blockNull =
+      b.cmpi(mlir::arith::CmpIPredicate::eq, blockWord, b.iconst(0));
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, blockNull, zero,
+                                 mlir::ValueRange{}, blockLoad,
+                                 mlir::ValueRange{});
+  b.builder.setInsertionPointToEnd(blockLoad);
+  // Bit 62 of the count word is the tuple-repr flag, not part of the count.
+  mlir::Value raw = b.loadI64(b.intToPtr(blockWord));
+  mlir::Value count = mlir::arith::AndIOp::create(
+      b.builder, b.loc, raw, b.iconst(0x3FFFFFFFFFFFFFFFLL));
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{count});
+  b.builder.setInsertionPointToEnd(zero);
+  mlir::func::ReturnOp::create(b.builder, b.loc,
+                               mlir::ValueRange{b.iconst(0)});
+}
+
+// void print_group_members(i64 excPtr, i64 margin): CPython's numbered member
+// sections for an exception group, recursing into nested groups two spaces
+// deeper. The member summaries reuse print_exception_summary through the
+// prefix gutter.
+void buildPrintGroupMembers(SupportBuilder &b) {
+  auto fn = b.beginFunction("print_group_members",
+                            b.builder.getFunctionType({b.i64(), b.i64()}, {}),
+                            /*isPrivate=*/true);
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::Region &body = fn.getBody();
+  mlir::Block *walk = b.builder.createBlock(&body);
+  mlir::Block *done = b.builder.createBlock(&body);
+  mlir::Value margin = entry->getArgument(1);
+
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value count = b.call("exception_group_member_count", b.i64(),
+                             mlir::ValueRange{entry->getArgument(0)})
+                          .front();
+  mlir::Value none = b.cmpi(mlir::arith::CmpIPredicate::sle, count,
+                            b.iconst(0));
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, none, done,
+                                 mlir::ValueRange{}, walk, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(walk);
+  mlir::Value stderrFd = b.iconst32(2);
+  mlir::Value childMargin =
+      mlir::arith::AddIOp::create(b.builder, b.loc, margin, b.iconst(2));
+  mlir::Value blockWord = b.loadI64(
+      b.gepI64(b.intToPtr(entry->getArgument(0)), b.iconst(3)));
+  mlir::Value blockPtr = b.intToPtr(blockWord);
+  auto bufferType = mlir::LLVM::LLVMArrayType::get(b.i8(), 128);
+  mlir::Value bufferSlot = mlir::LLVM::AllocaOp::create(
+      b.builder, b.loc, b.ptr(), bufferType, b.iconst32(1), /*alignment=*/1);
+  mlir::Value buffer = mlir::LLVM::GEPOp::create(
+      b.builder, b.loc, b.ptr(), bufferType, bufferSlot,
+      llvm::ArrayRef<mlir::LLVM::GEPArg>{mlir::LLVM::GEPArg(0),
+                                         mlir::LLVM::GEPArg(0)},
+      mlir::LLVM::GEPNoWrapFlags::inbounds);
+  auto snprintfType = mlir::LLVM::LLVMFunctionType::get(
+      b.i32(), {b.ptr(), b.i64(), b.ptr()}, /*isVarArg=*/true);
+  mlir::Value zeroIndex =
+      mlir::arith::ConstantIndexOp::create(b.builder, b.loc, 0);
+  mlir::Value oneIndex =
+      mlir::arith::ConstantIndexOp::create(b.builder, b.loc, 1);
+  mlir::Value countIndex = mlir::arith::IndexCastOp::create(
+      b.builder, b.loc, b.builder.getIndexType(), count);
+  auto loop = mlir::scf::ForOp::create(b.builder, b.loc, zeroIndex, countIndex,
+                                       oneIndex);
+  {
+    mlir::OpBuilder::InsertionGuard guard(b.builder);
+    b.builder.setInsertionPointToStart(loop.getBody());
+    mlir::Value position = mlir::arith::IndexCastOp::create(
+        b.builder, b.loc, b.i64(), loop.getInductionVar());
+    mlir::Value ordinal =
+        mlir::arith::AddIOp::create(b.builder, b.loc, position, b.iconst(1));
+    mlir::Value boxWords = mlir::arith::MulIOp::create(b.builder, b.loc,
+                                                       position, b.iconst(16));
+    mlir::Value boxBase =
+        mlir::arith::AddIOp::create(b.builder, b.loc, boxWords, b.iconst(1));
+    mlir::Value boxPtr = b.gepI64(blockPtr, boxBase);
+    mlir::Value ehWord = b.loadI64(b.gepI64(boxPtr, b.iconst(4)));
+    mlir::Value mhWord = b.loadI64(b.gepI64(boxPtr, b.iconst(5)));
+    mlir::Value mbWord = b.loadI64(b.gepI64(boxPtr, b.iconst(6)));
+    mlir::Value mbLen = b.loadI64(b.gepI64(boxPtr, b.iconst(11)));
+    mlir::Value classId =
+        b.loadI64(b.gepI64(b.intToPtr(ehWord), b.iconst(2)));
+
+    // Separator: the first section carries the parent connector ("+-+" at
+    // the parent margin), later sections sit at the member margin.
+    mlir::Value isFirst =
+        b.cmpi(mlir::arith::CmpIPredicate::eq, position, b.iconst(0));
+    auto sepIf = mlir::scf::IfOp::create(b.builder, b.loc, mlir::TypeRange{},
+                                         isFirst, /*withElseRegion=*/true);
+    {
+      mlir::OpBuilder::InsertionGuard sepGuard(b.builder);
+      b.builder.setInsertionPointToStart(&sepIf.getThenRegion().front());
+      b.call("write_spaces", mlir::TypeRange{},
+             mlir::ValueRange{stderrFd, margin});
+      auto formatted = mlir::LLVM::CallOp::create(
+          b.builder, b.loc, snprintfType, "snprintf",
+          mlir::ValueRange{buffer, b.iconst(128),
+                           b.addrOf(".tb_fmt_sep_first"), ordinal});
+      b.call("write_buffered", mlir::TypeRange{},
+             mlir::ValueRange{stderrFd, buffer, formatted.getResult()});
+      b.builder.setInsertionPointToStart(&sepIf.getElseRegion().front());
+      b.call("write_spaces", mlir::TypeRange{},
+             mlir::ValueRange{stderrFd, childMargin});
+      auto formattedNext = mlir::LLVM::CallOp::create(
+          b.builder, b.loc, snprintfType, "snprintf",
+          mlir::ValueRange{buffer, b.iconst(128),
+                           b.addrOf(".tb_fmt_sep_next"), ordinal});
+      b.call("write_buffered", mlir::TypeRange{},
+             mlir::ValueRange{stderrFd, buffer, formattedNext.getResult()});
+    }
+
+    // Member summary behind the gutter, then nested members.
+    mlir::Value prefixSlot = b.addrOf("g_tb_prefix_spaces");
+    mlir::LLVM::StoreOp::create(b.builder, b.loc, childMargin, prefixSlot,
+                                /*alignment=*/8);
+    b.call("print_exception_summary", mlir::TypeRange{},
+           mlir::ValueRange{classId, ehWord, b.intToPtr(mhWord),
+                            b.intToPtr(mbWord), b.iconst(0), mbLen,
+                            b.iconst(1)});
+    mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(-1), prefixSlot,
+                                /*alignment=*/8);
+    mlir::Value memberCount = b.call("exception_group_member_count", b.i64(),
+                                     mlir::ValueRange{ehWord})
+                                  .front();
+    mlir::Value nested =
+        b.cmpi(mlir::arith::CmpIPredicate::sgt, memberCount, b.iconst(0));
+    auto nestedIf = mlir::scf::IfOp::create(b.builder, b.loc,
+                                            mlir::TypeRange{}, nested,
+                                            /*withElseRegion=*/false);
+    {
+      mlir::OpBuilder::InsertionGuard nestedGuard(b.builder);
+      b.builder.setInsertionPointToStart(&nestedIf.getThenRegion().front());
+      b.call("print_group_members", mlir::TypeRange{},
+             mlir::ValueRange{ehWord, childMargin});
+    }
+  }
+  b.call("write_spaces", mlir::TypeRange{},
+         mlir::ValueRange{stderrFd, childMargin});
+  b.call("write_cstr", mlir::TypeRange{},
+         mlir::ValueRange{stderrFd, b.addrOf(".tb_sep_close")});
+  mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(done);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
 // void print_trace_frame(ptr frame): "  File ..., line N, in fn" + the source
 // line + optional marker, on stderr.
 void buildPrintTraceFrame(SupportBuilder &b) {
@@ -1367,6 +1616,7 @@ void buildPrintTraceFrame(SupportBuilder &b) {
       b.builder, b.loc, snprintfType, "snprintf",
       mlir::ValueRange{buffer, b.iconst(1024), b.addrOf(".tb_fmt_frame"),
                        file, lineNo, function});
+  b.call("write_prefix", mlir::TypeRange{}, mlir::ValueRange{b.iconst32(2)});
   b.call("write_buffered", mlir::TypeRange{},
          mlir::ValueRange{b.iconst32(2), buffer, formatted.getResult()});
   mlir::Value sourceLine =
@@ -1387,6 +1637,7 @@ void buildPrintTraceFrame(SupportBuilder &b) {
   mlir::Value trimmed = b.gepI8(sourceLine, indentWidth);
   mlir::Value trimmedLength =
       b.call("strlen", b.i64(), mlir::ValueRange{trimmed}).front();
+  b.call("write_prefix", mlir::TypeRange{}, mlir::ValueRange{b.iconst32(2)});
   b.call("write_cstr", mlir::TypeRange{},
          mlir::ValueRange{b.iconst32(2), b.addrOf(".tb_indent")});
   b.call("write_len", mlir::TypeRange{},
@@ -1702,14 +1953,17 @@ void buildUtf8MessageCStr(SupportBuilder &b) {
   b.emitTrap(b.ptr());
 }
 
-// void print_exception_summary(i64 class_id, ptr msg_header, message view):
-// the final "Class: message" line (or the class-only / invalid / unknown
-// forms). The message is re-encoded from code units to UTF-8 for display.
+// void print_exception_summary(i64 class_id, i64 exc_ptr, ptr msg_header,
+// message view): the final "Class: message" line (or the class-only /
+// invalid / unknown forms). The message is re-encoded from code units to
+// UTF-8 for display. An exception group appends CPython's
+// " (N sub-exception[s])" count read through exc_ptr (0 = no payload known).
 void buildPrintExceptionSummary(SupportBuilder &b) {
   auto fn = b.beginFunction(
       "print_exception_summary",
       b.builder.getFunctionType(
-          {b.i64(), b.ptr(), b.ptr(), b.i64(), b.i64(), b.i64()}, {}),
+          {b.i64(), b.i64(), b.ptr(), b.ptr(), b.i64(), b.i64(), b.i64()},
+          {}),
       /*isPrivate=*/true);
   mlir::Block *entry = fn.addEntryBlock();
   mlir::Region &body = fn.getBody();
@@ -1720,11 +1974,12 @@ void buildPrintExceptionSummary(SupportBuilder &b) {
   mlir::Block *invalid = b.builder.createBlock(&body);
   mlir::Block *unknown = b.builder.createBlock(&body);
   mlir::Value classId = entry->getArgument(0);
-  mlir::Value msgHeader = entry->getArgument(1);
-  mlir::Value data = entry->getArgument(2);
-  mlir::Value offset = entry->getArgument(3);
-  mlir::Value len = entry->getArgument(4);
-  mlir::Value stride = entry->getArgument(5);
+  mlir::Value excPtr = entry->getArgument(1);
+  mlir::Value msgHeader = entry->getArgument(2);
+  mlir::Value data = entry->getArgument(3);
+  mlir::Value offset = entry->getArgument(4);
+  mlir::Value len = entry->getArgument(5);
+  mlir::Value stride = entry->getArgument(6);
 
   b.builder.setInsertionPointToEnd(entry);
   auto bufferType = mlir::LLVM::LLVMArrayType::get(b.i8(), 1024);
@@ -1738,9 +1993,19 @@ void buildPrintExceptionSummary(SupportBuilder &b) {
   mlir::Value className =
       b.call("exception_class_name", b.ptr(), mlir::ValueRange{classId})
           .front();
+  mlir::Value memberCount = b.call("exception_group_member_count", b.i64(),
+                                   mlir::ValueRange{excPtr})
+                                .front();
+  mlir::Value isGroupClass = b.call("LyEH_ClassIdMatches", b.i1(),
+                                    mlir::ValueRange{classId, b.iconst(101)})
+                                 .front();
+  mlir::Value groupSuffix = mlir::arith::AndIOp::create(
+      b.builder, b.loc, isGroupClass,
+      b.cmpi(mlir::arith::CmpIPredicate::sgt, memberCount, b.iconst(0)));
   auto snprintfType = mlir::LLVM::LLVMFunctionType::get(
       b.i32(), {b.ptr(), b.i64(), b.ptr()}, /*isVarArg=*/true);
   auto emitBuffered = [&](mlir::Value formattedLength) {
+    b.call("write_prefix", mlir::TypeRange{}, mlir::ValueRange{b.iconst32(2)});
     b.call("write_buffered", mlir::TypeRange{},
            mlir::ValueRange{b.iconst32(2), buffer, formattedLength});
     mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
@@ -1777,6 +2042,7 @@ void buildPrintExceptionSummary(SupportBuilder &b) {
              mlir::ValueRange{msgHeader, data, offset, len, stride})
           .front();
   mlir::Value stderrFd = b.iconst32(2);
+  b.call("write_prefix", mlir::TypeRange{}, mlir::ValueRange{stderrFd});
   b.call("write_cstr", mlir::TypeRange{},
          mlir::ValueRange{stderrFd, className});
   b.stringGlobal(".tb_colon_space", ": ");
@@ -1785,17 +2051,65 @@ void buildPrintExceptionSummary(SupportBuilder &b) {
   // KeyError stores repr(key) as its message (LyKeyError_Init and the
   // runtime missing-key raises), so the display prints it verbatim.
   b.call("write_cstr", mlir::TypeRange{}, mlir::ValueRange{stderrFd, message});
-  b.call("write_len", mlir::TypeRange{},
-         mlir::ValueRange{stderrFd, b.addrOf(".tb_newline"), b.iconst(1)});
+  auto suffixIf = mlir::scf::IfOp::create(b.builder, b.loc, mlir::TypeRange{},
+                                          groupSuffix,
+                                          /*withElseRegion=*/true);
+  {
+    mlir::OpBuilder::InsertionGuard guard(b.builder);
+    b.builder.setInsertionPointToStart(&suffixIf.getThenRegion().front());
+    mlir::Value plural = b.cmpi(mlir::arith::CmpIPredicate::sgt, memberCount,
+                                b.iconst(1));
+    mlir::Value format = mlir::LLVM::SelectOp::create(
+        b.builder, b.loc, plural, b.addrOf(".tb_fmt_group_many"),
+        b.addrOf(".tb_fmt_group_one"));
+    auto formatted = mlir::LLVM::CallOp::create(
+        b.builder, b.loc, snprintfType, "snprintf",
+        mlir::ValueRange{buffer, b.iconst(1024), format, memberCount});
+    b.call("write_buffered", mlir::TypeRange{},
+           mlir::ValueRange{stderrFd, buffer, formatted.getResult()});
+    b.builder.setInsertionPointToStart(&suffixIf.getElseRegion().front());
+    b.call("write_len", mlir::TypeRange{},
+           mlir::ValueRange{stderrFd, b.addrOf(".tb_newline"), b.iconst(1)});
+  }
   b.call("free", mlir::TypeRange{}, mlir::ValueRange{message});
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(classOnly);
-  auto formattedClass = mlir::LLVM::CallOp::create(
-      b.builder, b.loc, snprintfType, "snprintf",
-      mlir::ValueRange{buffer, b.iconst(1024), b.addrOf(".tb_fmt_class"),
-                       className});
-  emitBuffered(formattedClass.getResult());
+  // A message-less exception group still shows the count: CPython renders
+  // "ExceptionGroup:  (N sub-exceptions)" (str() of the group is the empty
+  // message plus the count suffix).
+  auto classOnlySuffix = mlir::scf::IfOp::create(
+      b.builder, b.loc, mlir::TypeRange{}, groupSuffix,
+      /*withElseRegion=*/true);
+  {
+    mlir::OpBuilder::InsertionGuard guard(b.builder);
+    b.builder.setInsertionPointToStart(&classOnlySuffix.getThenRegion().front());
+    b.call("write_prefix", mlir::TypeRange{}, mlir::ValueRange{b.iconst32(2)});
+    b.call("write_cstr", mlir::TypeRange{},
+           mlir::ValueRange{b.iconst32(2), className});
+    b.call("write_cstr", mlir::TypeRange{},
+           mlir::ValueRange{b.iconst32(2), b.addrOf(".tb_colon_space")});
+    mlir::Value plural = b.cmpi(mlir::arith::CmpIPredicate::sgt, memberCount,
+                                b.iconst(1));
+    mlir::Value format = mlir::LLVM::SelectOp::create(
+        b.builder, b.loc, plural, b.addrOf(".tb_fmt_group_many"),
+        b.addrOf(".tb_fmt_group_one"));
+    auto formatted = mlir::LLVM::CallOp::create(
+        b.builder, b.loc, snprintfType, "snprintf",
+        mlir::ValueRange{buffer, b.iconst(1024), format, memberCount});
+    b.call("write_buffered", mlir::TypeRange{},
+           mlir::ValueRange{b.iconst32(2), buffer, formatted.getResult()});
+    b.builder.setInsertionPointToStart(&classOnlySuffix.getElseRegion().front());
+    b.call("write_prefix", mlir::TypeRange{}, mlir::ValueRange{b.iconst32(2)});
+    auto formattedClass = mlir::LLVM::CallOp::create(
+        b.builder, b.loc, snprintfType, "snprintf",
+        mlir::ValueRange{buffer, b.iconst(1024), b.addrOf(".tb_fmt_class"),
+                         className});
+    b.call("write_buffered", mlir::TypeRange{},
+           mlir::ValueRange{b.iconst32(2), buffer,
+                            formattedClass.getResult()});
+  }
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(invalid);
   auto formattedInvalid = mlir::LLVM::CallOp::create(
@@ -1878,6 +2192,38 @@ void buildPrintChainNode(SupportBuilder &b) {
 
   b.builder.setInsertionPointToEnd(ownSection);
   mlir::Value count = b.loadI64(nodeSlot(b, node, 17));
+  mlir::Value aligned = b.intToPtr(b.loadI64(nodeSlot(b, node, 2)));
+  mlir::Value offset0 = b.loadI64(nodeSlot(b, node, 3));
+  mlir::Value stride0 = b.loadI64(nodeSlot(b, node, 5));
+  mlir::Value classIndex = mlir::arith::AddIOp::create(
+      b.builder, b.loc, offset0,
+      mlir::arith::MulIOp::create(b.builder, b.loc, stride0, b.iconst(2))
+          .getResult());
+  mlir::Value classId = b.loadI64(b.gepI64(aligned, classIndex));
+  mlir::Value excWord =
+      mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), aligned);
+  // Chained exception groups keep CPython's group rendering: the group
+  // header (when a traceback exists), the "| " gutter, and the member tree.
+  mlir::Value chainMembers = b.call("exception_group_member_count", b.i64(),
+                                    mlir::ValueRange{excWord})
+                                 .front();
+  mlir::Value chainIsGroupClass =
+      b.call("LyEH_ClassIdMatches", b.i1(),
+             mlir::ValueRange{classId, b.iconst(101)})
+          .front();
+  mlir::Value chainGroup = mlir::arith::AndIOp::create(
+      b.builder, b.loc, chainIsGroupClass,
+      b.cmpi(mlir::arith::CmpIPredicate::sgt, chainMembers, b.iconst(0)));
+  auto gutterIf = mlir::scf::IfOp::create(b.builder, b.loc, mlir::TypeRange{},
+                                          chainGroup,
+                                          /*withElseRegion=*/false);
+  {
+    mlir::OpBuilder::InsertionGuard guard(b.builder);
+    b.builder.setInsertionPointToStart(&gutterIf.getThenRegion().front());
+    mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(2),
+                                b.addrOf("g_tb_prefix_spaces"),
+                                /*alignment=*/8);
+  }
   mlir::Value haveFrames =
       b.cmpi(mlir::arith::CmpIPredicate::sgt, count, b.iconst(0));
   mlir::cf::CondBranchOp::create(b.builder, b.loc, haveFrames, withHeader,
@@ -1885,8 +2231,18 @@ void buildPrintChainNode(SupportBuilder &b) {
                                  mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(withHeader);
-  b.call("write_cstr", mlir::TypeRange{},
-         mlir::ValueRange{b.iconst32(2), b.addrOf(".tb_header")});
+  auto headerIf = mlir::scf::IfOp::create(b.builder, b.loc, mlir::TypeRange{},
+                                          chainGroup,
+                                          /*withElseRegion=*/true);
+  {
+    mlir::OpBuilder::InsertionGuard guard(b.builder);
+    b.builder.setInsertionPointToStart(&headerIf.getThenRegion().front());
+    b.call("write_cstr", mlir::TypeRange{},
+           mlir::ValueRange{b.iconst32(2), b.addrOf(".tb_group_header")});
+    b.builder.setInsertionPointToStart(&headerIf.getElseRegion().front());
+    b.call("write_cstr", mlir::TypeRange{},
+           mlir::ValueRange{b.iconst32(2), b.addrOf(".tb_header")});
+  }
   mlir::cf::BranchOp::create(b.builder, b.loc, frameHead,
                              mlir::ValueRange{count});
 
@@ -1910,46 +2266,700 @@ void buildPrintChainNode(SupportBuilder &b) {
                              mlir::ValueRange{top});
 
   b.builder.setInsertionPointToEnd(summary);
-  mlir::Value aligned = b.intToPtr(b.loadI64(nodeSlot(b, node, 2)));
-  mlir::Value offset0 = b.loadI64(nodeSlot(b, node, 3));
-  mlir::Value stride0 = b.loadI64(nodeSlot(b, node, 5));
-  mlir::Value classIndex = mlir::arith::AddIOp::create(
-      b.builder, b.loc, offset0,
-      mlir::arith::MulIOp::create(b.builder, b.loc, stride0, b.iconst(2))
-          .getResult());
-  mlir::Value classId = b.loadI64(b.gepI64(aligned, classIndex));
   mlir::Value msgHeader = b.intToPtr(b.loadI64(nodeSlot(b, node, 7)));
   mlir::Value msgData = b.intToPtr(b.loadI64(nodeSlot(b, node, 12)));
   mlir::Value msgOffset = b.loadI64(nodeSlot(b, node, 13));
   mlir::Value msgLen = b.loadI64(nodeSlot(b, node, 14));
   mlir::Value msgStride = b.loadI64(nodeSlot(b, node, 15));
   b.call("print_exception_summary", mlir::TypeRange{},
-         mlir::ValueRange{classId, msgHeader, msgData, msgOffset, msgLen,
-                          msgStride});
+         mlir::ValueRange{classId, excWord, msgHeader, msgData, msgOffset,
+                          msgLen, msgStride});
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(-1),
+                              b.addrOf("g_tb_prefix_spaces"),
+                              /*alignment=*/8);
+  auto membersIf = mlir::scf::IfOp::create(b.builder, b.loc, mlir::TypeRange{},
+                                           chainGroup,
+                                           /*withElseRegion=*/false);
+  {
+    mlir::OpBuilder::InsertionGuard guard(b.builder);
+    b.builder.setInsertionPointToStart(&membersIf.getThenRegion().front());
+    b.call("print_group_members", mlir::TypeRange{},
+           mlir::ValueRange{excWord, b.iconst(2)});
+  }
   mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(done);
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
-// LyTraceback_PrintMessage(i64 class_id, ptr msg_header, message view):
-// chained sections (cause/context, innermost first) + header + frames (most
-// recent last, printed from the top of the stack downwards) + summary line,
-// on stderr.
+// ---------------------------------------------------------------------------
+// except* star frames (PEP 654). A star frame parks the caught exception as
+// a chain node (the stash machinery already bundles payload + traceback +
+// chain into one node) and owns the unmatched residual between clauses plus
+// every exception a clause body raised.
+//
+// Frame layout (36 i64 words, 288 bytes):
+//   0      residual chain node (parks payload/tb/chain; 0 before begin)
+//   1      residual-present flag (the node outlives its payload: it stays as
+//          the traceback/chain donor after the last slice matched)
+//   2      collected count
+//   3      parent frame (0 = outermost)
+//   4..36  collected chain nodes (one per clause body that raised)
+// ---------------------------------------------------------------------------
+
+constexpr std::int64_t kStarFrameBytes = 288;
+constexpr std::int64_t kStarCollectedBase = 4;
+constexpr std::int64_t kStarCollectedLimit = 32;
+
+// Local copies of RuntimeSupportBuilder's TU-private LLVM-level helpers (the
+// star functions live here for the chain-node/frame helpers instead).
+mlir::Type starMemRef1DType(SupportBuilder &b) {
+  auto arrayOne = mlir::LLVM::LLVMArrayType::get(b.i64(), 1);
+  return mlir::LLVM::LLVMStructType::getLiteral(
+      b.builder.getContext(), {b.ptr(), b.ptr(), b.i64(), arrayOne, arrayOne});
+}
+
+mlir::Type starBorrowPartsType(SupportBuilder &b) {
+  mlir::Type part = starMemRef1DType(b);
+  return mlir::LLVM::LLVMStructType::getLiteral(b.builder.getContext(),
+                                                {part, part, part});
+}
+
+mlir::LLVM::LLVMFuncOp starBeginLLVMFunction(SupportBuilder &b,
+                                             llvm::StringRef name,
+                                             mlir::Type result,
+                                             llvm::ArrayRef<mlir::Type> inputs) {
+  mlir::OpBuilder::InsertionGuard guard(b.builder);
+  b.builder.setInsertionPointToEnd(b.module.getBody());
+  mlir::Type resultType =
+      result ? result : mlir::LLVM::LLVMVoidType::get(b.builder.getContext());
+  return mlir::LLVM::LLVMFuncOp::create(
+      b.builder, b.loc, name,
+      mlir::LLVM::LLVMFunctionType::get(resultType, inputs, false));
+}
+
+mlir::Value starTopFrame(SupportBuilder &b) {
+  return b.loadI64(b.addrOf("g_star_top"));
+}
+
+mlir::Value starFrameSlot(SupportBuilder &b, mlir::Value frame,
+                          std::int64_t slot) {
+  return b.gepI64(b.intToPtr(frame), b.iconst(slot));
+}
+
+// Raw word address of g_current_parts[section][field] (five 8-byte fields
+// per section; struct layout is contiguous words).
+mlir::Value currentPartsWord(SupportBuilder &b, std::int64_t section,
+                             std::int64_t field) {
+  return b.gepI64(b.addrOf("g_current_parts"), b.iconst(section * 5 + field));
+}
+
+// void release_exception_storage_raw(i64 eh, i64 mh, i64 mb): one owned
+// exception reference by raw pointers (the star frame paths hold exceptions
+// outside memref descriptors).
+void buildReleaseExceptionStorageRaw(SupportBuilder &b) {
+  auto fn = b.beginFunction(
+      "release_exception_storage_raw",
+      b.builder.getFunctionType({b.i64(), b.i64(), b.i64()}, {}),
+      /*isPrivate=*/true);
+  mlir::Block *entry = fn.addEntryBlock();
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value becameZero =
+      b.call("release_storage_raw_to_zero", b.i1(),
+             mlir::ValueRange{entry->getArgument(0)})
+          .front();
+  auto freeIf = mlir::scf::IfOp::create(b.builder, b.loc, mlir::TypeRange{},
+                                        becameZero, /*withElseRegion=*/false);
+  {
+    mlir::OpBuilder::InsertionGuard guard(b.builder);
+    b.builder.setInsertionPointToStart(&freeIf.getThenRegion().front());
+    b.call("release_exception_extras", mlir::TypeRange{},
+           mlir::ValueRange{entry->getArgument(0)});
+    b.call("release_unicode_raw", mlir::TypeRange{},
+           mlir::ValueRange{entry->getArgument(1), entry->getArgument(2)});
+    b.call("free_raw_i64_ptr", mlir::TypeRange{},
+           mlir::ValueRange{entry->getArgument(0)});
+  }
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
+// void release_star_node(i64 node, i64 hasPayload): drop a star frame's
+// residual node. With a live payload this is a plain chain-node release;
+// after the payload moved out only the shell (frames, chained nodes) is
+// left, and release_chain_node's payload release would touch a stale word.
+void buildReleaseStarNode(SupportBuilder &b) {
+  auto fn = b.beginFunction("release_star_node",
+                            b.builder.getFunctionType({b.i64(), b.i64()}, {}),
+                            /*isPrivate=*/true);
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::Region &body = fn.getBody();
+  mlir::Block *live = b.builder.createBlock(&body);
+  mlir::Block *payload = b.builder.createBlock(&body);
+  mlir::Block *shell = b.builder.createBlock(&body);
+  mlir::Block *freeHead =
+      b.builder.createBlock(&body, body.end(), {b.i64()}, {b.loc});
+  mlir::Block *freeOne = b.builder.createBlock(&body);
+  mlir::Block *freeDone = b.builder.createBlock(&body);
+  mlir::Block *done = b.builder.createBlock(&body);
+  mlir::Value node64 = entry->getArgument(0);
+
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value isNull =
+      b.cmpi(mlir::arith::CmpIPredicate::eq, node64, b.iconst(0));
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, isNull, done,
+                                 mlir::ValueRange{}, live, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(live);
+  mlir::Value hasPayload = b.cmpi(mlir::arith::CmpIPredicate::ne,
+                                  entry->getArgument(1), b.iconst(0));
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, hasPayload, payload,
+                                 mlir::ValueRange{}, shell,
+                                 mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(payload);
+  b.call("release_chain_node", mlir::TypeRange{}, mlir::ValueRange{node64});
+  mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(shell);
+  mlir::Value node = b.intToPtr(node64);
+  b.call("release_chain_node", mlir::TypeRange{},
+         mlir::ValueRange{b.loadI64(nodeSlot(b, node, 18))});
+  b.call("release_chain_node", mlir::TypeRange{},
+         mlir::ValueRange{b.loadI64(nodeSlot(b, node, 19))});
+  mlir::cf::BranchOp::create(b.builder, b.loc, freeHead,
+                             mlir::ValueRange{b.iconst(0)});
+
+  b.builder.setInsertionPointToEnd(freeHead);
+  mlir::Value index = freeHead->getArgument(0);
+  mlir::Value count = b.loadI64(nodeSlot(b, node, 17));
+  mlir::Value framesDone =
+      b.cmpi(mlir::arith::CmpIPredicate::sge, index, count);
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, framesDone, freeDone,
+                                 mlir::ValueRange{}, freeOne,
+                                 mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(freeOne);
+  mlir::Value framesPtr = b.intToPtr(b.loadI64(nodeSlot(b, node, 16)));
+  mlir::Value frame = mlir::LLVM::GEPOp::create(
+      b.builder, b.loc, b.ptr(), tracebackFrameType(b), framesPtr,
+      mlir::ValueRange{index});
+  b.call("free_frame", mlir::TypeRange{}, mlir::ValueRange{frame});
+  mlir::Value next =
+      mlir::arith::AddIOp::create(b.builder, b.loc, index, b.iconst(1));
+  mlir::cf::BranchOp::create(b.builder, b.loc, freeHead,
+                             mlir::ValueRange{next});
+
+  b.builder.setInsertionPointToEnd(freeDone);
+  b.call("free_raw_i64_ptr", mlir::TypeRange{},
+         mlir::ValueRange{b.loadI64(nodeSlot(b, node, 16))});
+  b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{node64});
+  mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(done);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
+// void LyEH_StarBegin(): push a star frame parking the caught exception.
+void buildStarBegin(SupportBuilder &b) {
+  auto fn = b.beginFunction("LyEH_StarBegin",
+                            b.builder.getFunctionType({}, {}));
+  mlir::Block *entry = fn.addEntryBlock();
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value frame =
+      b.call("malloc", b.ptr(), mlir::ValueRange{b.iconst(kStarFrameBytes)})
+          .front();
+  mlir::Value allocFailed = b.ptrEq(frame, b.nullPtr());
+  mlir::cf::AssertOp::create(
+      b.builder, b.loc,
+      mlir::arith::XOrIOp::create(
+          b.builder, b.loc, allocFailed,
+          mlir::arith::ConstantIntOp::create(b.builder, b.loc, 1, 1)
+              .getResult()),
+      "except* frame allocation failed");
+  mlir::LLVM::MemsetOp::create(b.builder, b.loc, frame, b.iconst8(0),
+                               b.iconst(kStarFrameBytes),
+                               /*isVolatile=*/false);
+  mlir::Value frameWord =
+      mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), frame);
+  b.call("LyEH_StashCurrentException", mlir::TypeRange{},
+         mlir::ValueRange{frameWord});
+  mlir::Value node = b.loadI64(frame);
+  mlir::Value present = b.cmpi(mlir::arith::CmpIPredicate::ne, node,
+                               b.iconst(0));
+  mlir::Value presentWord = mlir::arith::ExtUIOp::create(
+      b.builder, b.loc, b.i64(), present);
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, presentWord,
+                              b.gepI64(frame, b.iconst(1)), /*alignment=*/8);
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, starTopFrame(b),
+                              b.gepI64(frame, b.iconst(3)), /*alignment=*/8);
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, frameWord,
+                              b.addrOf("g_star_top"), /*alignment=*/8);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
+// i1 LyEH_StarHasResidual(): whether the innermost frame still holds an
+// unmatched slice.
+void buildStarHasResidual(SupportBuilder &b) {
+  auto fn = b.beginFunction("LyEH_StarHasResidual",
+                            b.builder.getFunctionType({}, {b.i1()}));
+  mlir::Block *entry = fn.addEntryBlock();
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value frame = starTopFrame(b);
+  mlir::Value present =
+      b.loadI64(starFrameSlot(b, frame, 1));
+  mlir::Value result =
+      b.cmpi(mlir::arith::CmpIPredicate::ne, present, b.iconst(0));
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{result});
+}
+
+// ExceptionBorrowParts LyEH_StarResidualParts(): borrowed views of the
+// residual exception (requires one).
+void buildStarResidualParts(SupportBuilder &b) {
+  auto fn = starBeginLLVMFunction(b, "LyEH_StarResidualParts",
+                                  starBorrowPartsType(b), {});
+  mlir::Block *entry = fn.addEntryBlock(b.builder);
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value frame = starTopFrame(b);
+  mlir::Value node = b.intToPtr(b.loadI64(starFrameSlot(b, frame, 0)));
+  auto arrayOne = mlir::LLVM::LLVMArrayType::get(b.i64(), 1);
+  mlir::Value result = mlir::LLVM::UndefOp::create(
+      b.builder, b.loc, starBorrowPartsType(b));
+  struct Section {
+    std::int64_t pointerSlot;
+    std::int64_t staticSize;
+    std::int64_t sizeSlot; // -1 = use staticSize
+  };
+  Section sections[3] = {{2, 3, -1}, {7, 2, -1}, {12, 0, 14}};
+  for (int section = 0; section < 3; ++section) {
+    mlir::Value pointer =
+        b.intToPtr(b.loadI64(nodeSlot(b, node, sections[section].pointerSlot)));
+    mlir::Value size =
+        sections[section].sizeSlot < 0
+            ? b.iconst(sections[section].staticSize)
+            : b.loadI64(nodeSlot(b, node, sections[section].sizeSlot));
+    mlir::Value sizeArray = mlir::LLVM::InsertValueOp::create(
+        b.builder, b.loc,
+        mlir::LLVM::UndefOp::create(b.builder, b.loc, arrayOne).getResult(),
+        size, llvm::ArrayRef<std::int64_t>{0});
+    mlir::Value strideArray = mlir::LLVM::InsertValueOp::create(
+        b.builder, b.loc,
+        mlir::LLVM::UndefOp::create(b.builder, b.loc, arrayOne).getResult(),
+        b.iconst(1), llvm::ArrayRef<std::int64_t>{0});
+    mlir::Value descriptor =
+        mlir::LLVM::UndefOp::create(b.builder, b.loc, starMemRef1DType(b));
+    descriptor = mlir::LLVM::InsertValueOp::create(
+        b.builder, b.loc, descriptor, pointer, llvm::ArrayRef<std::int64_t>{0});
+    descriptor = mlir::LLVM::InsertValueOp::create(
+        b.builder, b.loc, descriptor, pointer, llvm::ArrayRef<std::int64_t>{1});
+    descriptor = mlir::LLVM::InsertValueOp::create(
+        b.builder, b.loc, descriptor, b.iconst(0),
+        llvm::ArrayRef<std::int64_t>{2});
+    descriptor = mlir::LLVM::InsertValueOp::create(
+        b.builder, b.loc, descriptor, sizeArray,
+        llvm::ArrayRef<std::int64_t>{3});
+    descriptor = mlir::LLVM::InsertValueOp::create(
+        b.builder, b.loc, descriptor, strideArray,
+        llvm::ArrayRef<std::int64_t>{4});
+    result = mlir::LLVM::InsertValueOp::create(
+        b.builder, b.loc, result, descriptor,
+        llvm::ArrayRef<std::int64_t>{section});
+  }
+  mlir::LLVM::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{result});
+}
+
+// void LyEH_StarApplyMatch(i1 has_rest, matched x15, rest x15): a clause
+// matched. The matched slice becomes the current exception (fresh copy of
+// the residual node's traceback, no inherited chain), the rest replaces the
+// node's payload, and the frame's old payload reference is dropped.
+void buildStarApplyMatch(SupportBuilder &b) {
+  llvm::SmallVector<mlir::Type, 31> inputs;
+  inputs.push_back(b.i1());
+  for (int part = 0; part < 6; ++part) {
+    inputs.push_back(b.ptr());
+    inputs.push_back(b.ptr());
+    inputs.push_back(b.i64());
+    inputs.push_back(b.i64());
+    inputs.push_back(b.i64());
+  }
+  auto fn = starBeginLLVMFunction(b, "LyEH_StarApplyMatch", {}, inputs);
+  mlir::Block *entry = fn.addEntryBlock(b.builder);
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value frame = starTopFrame(b);
+  mlir::Value node = b.intToPtr(b.loadI64(starFrameSlot(b, frame, 0)));
+
+  // Drop the frame's reference to the old residual payload.
+  b.call("release_exception_storage_raw", mlir::TypeRange{},
+         mlir::ValueRange{b.loadI64(nodeSlot(b, node, 2)),
+                          b.loadI64(nodeSlot(b, node, 7)),
+                          b.loadI64(nodeSlot(b, node, 12))});
+
+  // Rest (descriptor words) into the node payload slots; absent rest zeroes
+  // them and clears the present flag.
+  mlir::Value hasRest = entry->getArgument(0);
+  auto restIf = mlir::scf::IfOp::create(b.builder, b.loc, mlir::TypeRange{},
+                                        hasRest, /*withElseRegion=*/true);
+  {
+    mlir::OpBuilder::InsertionGuard guard(b.builder);
+    b.builder.setInsertionPointToStart(&restIf.getThenRegion().front());
+    for (int section = 0; section < 3; ++section)
+      for (int field = 0; field < 5; ++field) {
+        mlir::Value word = entry->getArgument(16 + section * 5 + field);
+        if (field < 2)
+          word = mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(),
+                                                word);
+        mlir::LLVM::StoreOp::create(
+            b.builder, b.loc, word,
+            nodeSlot(b, node, 1 + section * 5 + field), /*alignment=*/8);
+      }
+    mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(1),
+                                starFrameSlot(b, frame, 1), /*alignment=*/8);
+    b.builder.setInsertionPointToStart(&restIf.getElseRegion().front());
+    for (std::int64_t word = 1; word < 16; ++word)
+      mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0),
+                                  nodeSlot(b, node, word), /*alignment=*/8);
+    mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0),
+                                starFrameSlot(b, frame, 1), /*alignment=*/8);
+  }
+
+  // Matched becomes the current exception.
+  for (int section = 0; section < 3; ++section)
+    for (int field = 0; field < 5; ++field) {
+      mlir::Value word = entry->getArgument(1 + section * 5 + field);
+      if (field < 2)
+        word =
+            mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), word);
+      mlir::LLVM::StoreOp::create(b.builder, b.loc, word,
+                                  currentPartsWord(b, section, field),
+                                  /*alignment=*/8);
+    }
+  mlir::LLVM::StoreOp::create(
+      b.builder, b.loc,
+      mlir::arith::ConstantIntOp::create(b.builder, b.loc, 1, 1).getResult(),
+      b.addrOf("g_current_exception"), /*alignment=*/4);
+
+  // Fresh copy of the residual node's traceback (name strings duplicated:
+  // the handler's discard consumes this copy, later slices reuse the node's).
+  mlir::Value count = b.loadI64(nodeSlot(b, node, 17));
+  mlir::Value framesPtr = b.intToPtr(b.loadI64(nodeSlot(b, node, 16)));
+  mlir::Value countIndex = mlir::arith::IndexCastOp::create(
+      b.builder, b.loc, b.builder.getIndexType(), count);
+  mlir::Value zeroIndex =
+      mlir::arith::ConstantIndexOp::create(b.builder, b.loc, 0);
+  mlir::Value oneIndex =
+      mlir::arith::ConstantIndexOp::create(b.builder, b.loc, 1);
+  auto copyLoop = mlir::scf::ForOp::create(b.builder, b.loc, zeroIndex,
+                                           countIndex, oneIndex);
+  {
+    mlir::OpBuilder::InsertionGuard guard(b.builder);
+    b.builder.setInsertionPointToStart(copyLoop.getBody());
+    mlir::Value position = mlir::arith::IndexCastOp::create(
+        b.builder, b.loc, b.i64(), copyLoop.getInductionVar());
+    mlir::Value source = mlir::LLVM::GEPOp::create(
+        b.builder, b.loc, b.ptr(), tracebackFrameType(b), framesPtr,
+        mlir::ValueRange{position});
+    mlir::Value target =
+        b.call("frame_at", b.ptr(), mlir::ValueRange{position}).front();
+    mlir::LLVM::MemcpyOp::create(b.builder, b.loc, target, source,
+                                 b.iconst(kFrameBytes), /*isVolatile=*/false);
+    mlir::Type frameType = tracebackFrameType(b);
+    for (std::int64_t nameField = 0; nameField < 2; ++nameField) {
+      mlir::Value slot = b.frameField(frameType, target, nameField);
+      mlir::Value copied =
+          b.call("copy_cstr", b.ptr(), mlir::ValueRange{b.loadPtrVal(slot)})
+              .front();
+      mlir::LLVM::StoreOp::create(b.builder, b.loc, copied, slot,
+                                  /*alignment=*/8);
+    }
+  }
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, count,
+                              b.addrOf("g_traceback_size"), /*alignment=*/8);
+  mlir::LLVM::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
+// void LyEH_StarCollect(): park the pending exception (raised by a clause
+// body) in the frame's collected list.
+void buildStarCollect(SupportBuilder &b) {
+  auto fn = b.beginFunction("LyEH_StarCollect",
+                            b.builder.getFunctionType({}, {}));
+  mlir::Block *entry = fn.addEntryBlock();
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value frame = starTopFrame(b);
+  mlir::Value count = b.loadI64(starFrameSlot(b, frame, 2));
+  mlir::Value inRange = b.cmpi(mlir::arith::CmpIPredicate::slt, count,
+                               b.iconst(kStarCollectedLimit));
+  mlir::cf::AssertOp::create(b.builder, b.loc, inRange,
+                             "except* clause raise limit exceeded");
+  mlir::Value slot = mlir::arith::AddIOp::create(
+      b.builder, b.loc, b.iconst(kStarCollectedBase), count);
+  mlir::Value area = b.gepI64(b.intToPtr(frame), slot);
+  mlir::Value areaWord =
+      mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), area);
+  b.call("LyEH_StashCurrentException", mlir::TypeRange{},
+         mlir::ValueRange{areaWord});
+  mlir::Value next =
+      mlir::arith::AddIOp::create(b.builder, b.loc, count, b.iconst(1));
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, next,
+                              starFrameSlot(b, frame, 2), /*alignment=*/8);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
+// i64 LyEH_StarCollectedCount() / i64 LyEH_StarNodesPtr(): finish inputs.
+void buildStarCollectedCount(SupportBuilder &b) {
+  auto fn = b.beginFunction("LyEH_StarCollectedCount",
+                            b.builder.getFunctionType({}, {b.i64()}));
+  mlir::Block *entry = fn.addEntryBlock();
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value count = b.loadI64(starFrameSlot(b, starTopFrame(b), 2));
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{count});
+}
+
+void buildStarNodesPtr(SupportBuilder &b) {
+  auto fn = b.beginFunction("LyEH_StarNodesPtr",
+                            b.builder.getFunctionType({}, {b.i64()}));
+  mlir::Block *entry = fn.addEntryBlock();
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value base = starFrameSlot(b, starTopFrame(b), kStarCollectedBase);
+  mlir::Value word =
+      mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), base);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{word});
+}
+
+// void star_pop_frame(): unlink and free the frame shell (payload handling
+// is each caller's business; here the residual node is fully released).
+void buildStarPop(SupportBuilder &b) {
+  auto fn = b.beginFunction("LyEH_StarPop",
+                            b.builder.getFunctionType({}, {}));
+  mlir::Block *entry = fn.addEntryBlock();
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value frame = starTopFrame(b);
+  b.call("release_star_node", mlir::TypeRange{},
+         mlir::ValueRange{b.loadI64(starFrameSlot(b, frame, 0)),
+                          b.loadI64(starFrameSlot(b, frame, 1))});
+  mlir::LLVM::StoreOp::create(b.builder, b.loc,
+                              b.loadI64(starFrameSlot(b, frame, 3)),
+                              b.addrOf("g_star_top"), /*alignment=*/8);
+  b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{frame});
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
+// The shared "throw the pending token" tail for the star rethrow paths
+// (a func-level function: its callers are func-level; __cxa_throw never
+// returns, the trailing return only satisfies the verifier).
+void buildStarThrowPending(SupportBuilder &b) {
+  auto fn = b.beginFunction("star_throw_pending",
+                            b.builder.getFunctionType({}, {}),
+                            /*isPrivate=*/true);
+  mlir::Block *entry = fn.addEntryBlock();
+  b.builder.setInsertionPointToEnd(entry);
+  b.call("end_native_catch_if_active", mlir::TypeRange{}, {});
+  auto carrier = mlir::LLVM::CallOp::create(
+      b.builder, b.loc, mlir::TypeRange{b.ptr()}, "__cxa_allocate_exception",
+      mlir::ValueRange{b.iconst(1)});
+  mlir::LLVM::CallOp::create(
+      b.builder, b.loc, mlir::TypeRange{}, "__cxa_throw",
+      mlir::ValueRange{carrier.getResult(),
+                       b.addrOf("_ZTI17LyPythonException"), b.nullPtr()});
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
+// void LyEH_StarRethrowResidual(): nothing was collected — the leftover
+// slice rethrows with its original traceback and chain.
+void buildStarRethrowResidual(SupportBuilder &b) {
+  auto fn = b.beginFunction("LyEH_StarRethrowResidual",
+                            b.builder.getFunctionType({}, {}));
+  mlir::Block *entry = fn.addEntryBlock();
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value frame = starTopFrame(b);
+  mlir::Value area = starFrameSlot(b, frame, 0);
+  mlir::Value areaWord =
+      mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), area);
+  b.call("LyEH_UnstashException", mlir::TypeRange{},
+         mlir::ValueRange{areaWord});
+  mlir::LLVM::StoreOp::create(b.builder, b.loc,
+                              b.loadI64(starFrameSlot(b, frame, 3)),
+                              b.addrOf("g_star_top"), /*alignment=*/8);
+  b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{frame});
+  b.call("star_throw_pending", mlir::TypeRange{}, {});
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
+// void LyEH_StarRethrowSoleCollected(): exactly one clause raise and no
+// residual — that exception continues as itself (context intact).
+void buildStarRethrowSoleCollected(SupportBuilder &b) {
+  auto fn = b.beginFunction("LyEH_StarRethrowSoleCollected",
+                            b.builder.getFunctionType({}, {}));
+  mlir::Block *entry = fn.addEntryBlock();
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value frame = starTopFrame(b);
+  mlir::Value area = starFrameSlot(b, frame, kStarCollectedBase);
+  mlir::Value areaWord =
+      mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), area);
+  b.call("LyEH_UnstashException", mlir::TypeRange{},
+         mlir::ValueRange{areaWord});
+  b.call("release_star_node", mlir::TypeRange{},
+         mlir::ValueRange{b.loadI64(starFrameSlot(b, frame, 0)),
+                          b.loadI64(starFrameSlot(b, frame, 1))});
+  mlir::LLVM::StoreOp::create(b.builder, b.loc,
+                              b.loadI64(starFrameSlot(b, frame, 3)),
+                              b.addrOf("g_star_top"), /*alignment=*/8);
+  b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{frame});
+  b.call("star_throw_pending", mlir::TypeRange{}, {});
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
+// void LyEH_StarThrowCombined(combined x15): several leftovers were wrapped
+// into a fresh group (star_combine). The residual node donates its traceback
+// and chain to the combined exception; collected nodes hand their member
+// references to the group and die.
+void buildStarThrowCombined(SupportBuilder &b) {
+  llvm::SmallVector<mlir::Type, 15> inputs;
+  for (int part = 0; part < 3; ++part) {
+    inputs.push_back(b.ptr());
+    inputs.push_back(b.ptr());
+    inputs.push_back(b.i64());
+    inputs.push_back(b.i64());
+    inputs.push_back(b.i64());
+  }
+  auto fn = starBeginLLVMFunction(b, "LyEH_StarThrowCombined", {}, inputs);
+  mlir::Block *entry = fn.addEntryBlock(b.builder);
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value frame = starTopFrame(b);
+
+  // Collected nodes: the combined group retained each member, so a plain
+  // node release moves ownership to the group.
+  mlir::Value count = b.loadI64(starFrameSlot(b, frame, 2));
+  mlir::Value countIndex = mlir::arith::IndexCastOp::create(
+      b.builder, b.loc, b.builder.getIndexType(), count);
+  mlir::Value zeroIndex =
+      mlir::arith::ConstantIndexOp::create(b.builder, b.loc, 0);
+  mlir::Value oneIndex =
+      mlir::arith::ConstantIndexOp::create(b.builder, b.loc, 1);
+  auto releaseLoop = mlir::scf::ForOp::create(b.builder, b.loc, zeroIndex,
+                                              countIndex, oneIndex);
+  {
+    mlir::OpBuilder::InsertionGuard guard(b.builder);
+    b.builder.setInsertionPointToStart(releaseLoop.getBody());
+    mlir::Value position = mlir::arith::IndexCastOp::create(
+        b.builder, b.loc, b.i64(), releaseLoop.getInductionVar());
+    mlir::Value slot = mlir::arith::AddIOp::create(
+        b.builder, b.loc, b.iconst(kStarCollectedBase), position);
+    b.call("release_chain_node", mlir::TypeRange{},
+           mlir::ValueRange{
+               b.loadI64(b.gepI64(b.intToPtr(frame), slot))});
+  }
+
+  // Residual node: its member reference moved into the group; its traceback
+  // and chain become the combined exception's, and the shell dies.
+  mlir::Value node64 = b.loadI64(starFrameSlot(b, frame, 0));
+  mlir::Value hasNode =
+      b.cmpi(mlir::arith::CmpIPredicate::ne, node64, b.iconst(0));
+  auto nodeIf = mlir::scf::IfOp::create(b.builder, b.loc, mlir::TypeRange{},
+                                        hasNode, /*withElseRegion=*/false);
+  {
+    mlir::OpBuilder::InsertionGuard guard(b.builder);
+    b.builder.setInsertionPointToStart(&nodeIf.getThenRegion().front());
+    mlir::Value node = b.intToPtr(node64);
+    mlir::Value hadPayload = b.loadI64(starFrameSlot(b, frame, 1));
+    mlir::Value payloadLive = b.cmpi(mlir::arith::CmpIPredicate::ne,
+                                     hadPayload, b.iconst(0));
+    auto payloadIf = mlir::scf::IfOp::create(
+        b.builder, b.loc, mlir::TypeRange{}, payloadLive,
+        /*withElseRegion=*/false);
+    {
+      mlir::OpBuilder::InsertionGuard payloadGuard(b.builder);
+      b.builder.setInsertionPointToStart(&payloadIf.getThenRegion().front());
+      b.call("release_exception_storage_raw", mlir::TypeRange{},
+             mlir::ValueRange{b.loadI64(nodeSlot(b, node, 2)),
+                              b.loadI64(nodeSlot(b, node, 7)),
+                              b.loadI64(nodeSlot(b, node, 12))});
+    }
+    // CPython gives the combined group no traceback of its own (its members
+    // carry theirs); drop the residual node's snapshot instead of donating.
+    mlir::Value frames = b.loadI64(nodeSlot(b, node, 16));
+    mlir::Value frameCount = b.loadI64(nodeSlot(b, node, 17));
+    mlir::Value frameCountIndex = mlir::arith::IndexCastOp::create(
+        b.builder, b.loc, b.builder.getIndexType(), frameCount);
+    mlir::Value zeroIdx =
+        mlir::arith::ConstantIndexOp::create(b.builder, b.loc, 0);
+    mlir::Value oneIdx =
+        mlir::arith::ConstantIndexOp::create(b.builder, b.loc, 1);
+    auto freeFramesLoop = mlir::scf::ForOp::create(b.builder, b.loc, zeroIdx,
+                                                   frameCountIndex, oneIdx);
+    {
+      mlir::OpBuilder::InsertionGuard framesGuard(b.builder);
+      b.builder.setInsertionPointToStart(freeFramesLoop.getBody());
+      mlir::Value framePosition = mlir::arith::IndexCastOp::create(
+          b.builder, b.loc, b.i64(), freeFramesLoop.getInductionVar());
+      mlir::Value framePtr = mlir::LLVM::GEPOp::create(
+          b.builder, b.loc, b.ptr(), tracebackFrameType(b),
+          b.intToPtr(frames), mlir::ValueRange{framePosition});
+      b.call("free_frame", mlir::TypeRange{}, mlir::ValueRange{framePtr});
+    }
+    b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{frames});
+    mlir::LLVM::StoreOp::create(b.builder, b.loc,
+                                b.loadI64(nodeSlot(b, node, 18)),
+                                b.addrOf("g_exc_cause_node"),
+                                /*alignment=*/8);
+    mlir::LLVM::StoreOp::create(b.builder, b.loc,
+                                b.loadI64(nodeSlot(b, node, 19)),
+                                b.addrOf("g_exc_context_node"),
+                                /*alignment=*/8);
+    mlir::LLVM::StoreOp::create(b.builder, b.loc,
+                                b.loadI64(nodeSlot(b, node, 20)),
+                                b.addrOf("g_exc_suppress_context"),
+                                /*alignment=*/8);
+    b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{node64});
+  }
+
+  // Install the combined exception and throw.
+  for (int section = 0; section < 3; ++section)
+    for (int field = 0; field < 5; ++field) {
+      mlir::Value word = entry->getArgument(section * 5 + field);
+      if (field < 2)
+        word =
+            mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), word);
+      mlir::LLVM::StoreOp::create(b.builder, b.loc, word,
+                                  currentPartsWord(b, section, field),
+                                  /*alignment=*/8);
+    }
+  mlir::LLVM::StoreOp::create(
+      b.builder, b.loc,
+      mlir::arith::ConstantIntOp::create(b.builder, b.loc, 1, 1).getResult(),
+      b.addrOf("g_current_exception"), /*alignment=*/4);
+  mlir::Value parent = b.loadI64(starFrameSlot(b, frame, 3));
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, parent,
+                              b.addrOf("g_star_top"), /*alignment=*/8);
+  b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{frame});
+  mlir::func::CallOp::create(b.builder, b.loc, "star_throw_pending",
+                             mlir::TypeRange{}, mlir::ValueRange{});
+  mlir::LLVM::UnreachableOp::create(b.builder, b.loc);
+}
+
+// LyTraceback_PrintMessage(i64 class_id, i64 exc_ptr, ptr msg_header,
+// message view): chained sections (cause/context, innermost first) + header
+// + frames (most recent last, printed from the top of the stack downwards)
+// + summary line, on stderr. An exception group renders CPython's group
+// traceback instead: the "+ Exception Group Traceback" header, frames and
+// summary behind the "| " gutter, then the numbered member tree.
 void buildTracebackPrintMessage(SupportBuilder &b) {
   auto fn = b.beginFunction(
       "LyTraceback_PrintMessage",
       b.builder.getFunctionType(
-          {b.i64(), b.ptr(), b.ptr(), b.i64(), b.i64(), b.i64()}, {}));
+          {b.i64(), b.i64(), b.ptr(), b.ptr(), b.i64(), b.i64(), b.i64()},
+          {}));
   mlir::Block *entry = fn.addEntryBlock();
   mlir::Region &body = fn.getBody();
   mlir::Block *causeBlock = b.builder.createBlock(&body);
   mlir::Block *contextCheck = b.builder.createBlock(&body);
   mlir::Block *contextBlock = b.builder.createBlock(&body);
   mlir::Block *header = b.builder.createBlock(&body);
+  mlir::Block *plainHeader = b.builder.createBlock(&body);
+  mlir::Block *groupHeader = b.builder.createBlock(&body);
   mlir::Block *head = b.builder.createBlock(&body, body.end(), {b.i64()}, {b.loc});
   mlir::Block *printOne = b.builder.createBlock(&body);
   mlir::Block *summary = b.builder.createBlock(&body);
+  mlir::Block *groupMembers = b.builder.createBlock(&body);
+  mlir::Block *finish = b.builder.createBlock(&body);
 
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value cause = b.loadI64(b.addrOf("g_exc_cause_node"));
@@ -1984,10 +2994,48 @@ void buildTracebackPrintMessage(SupportBuilder &b) {
   mlir::cf::BranchOp::create(b.builder, b.loc, header, mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(header);
+  mlir::Value memberCount = b.call("exception_group_member_count", b.i64(),
+                                   mlir::ValueRange{entry->getArgument(1)})
+                                .front();
+  mlir::Value isGroupClass =
+      b.call("LyEH_ClassIdMatches", b.i1(),
+             mlir::ValueRange{entry->getArgument(0), b.iconst(101)})
+          .front();
+  mlir::Value groupDisplay = mlir::arith::AndIOp::create(
+      b.builder, b.loc, isGroupClass,
+      b.cmpi(mlir::arith::CmpIPredicate::sgt, memberCount, b.iconst(0)));
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, groupDisplay, groupHeader,
+                                 mlir::ValueRange{}, plainHeader,
+                                 mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(plainHeader);
   b.call("write_cstr", mlir::TypeRange{},
          mlir::ValueRange{b.iconst32(2), b.addrOf(".tb_header")});
   mlir::cf::BranchOp::create(b.builder, b.loc, head,
                              mlir::ValueRange{loadTracebackSize(b)});
+
+  // Group display: everything from here to the summary sits behind the
+  // "  | " gutter (the member tree resets it before the numbered sections).
+  b.builder.setInsertionPointToEnd(groupHeader);
+  // A traceback-less group (the except* combined rethrow) skips the header
+  // line but keeps the gutter for its summary, like CPython.
+  mlir::Value groupFrames = loadTracebackSize(b);
+  mlir::Value groupHasFrames =
+      b.cmpi(mlir::arith::CmpIPredicate::sgt, groupFrames, b.iconst(0));
+  auto groupHeaderIf = mlir::scf::IfOp::create(
+      b.builder, b.loc, mlir::TypeRange{}, groupHasFrames,
+      /*withElseRegion=*/false);
+  {
+    mlir::OpBuilder::InsertionGuard guard(b.builder);
+    b.builder.setInsertionPointToStart(&groupHeaderIf.getThenRegion().front());
+    b.call("write_cstr", mlir::TypeRange{},
+           mlir::ValueRange{b.iconst32(2), b.addrOf(".tb_group_header")});
+  }
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(2),
+                              b.addrOf("g_tb_prefix_spaces"),
+                              /*alignment=*/8);
+  mlir::cf::BranchOp::create(b.builder, b.loc, head,
+                             mlir::ValueRange{groupFrames});
 
   b.builder.setInsertionPointToEnd(head);
   mlir::Value remaining = head->getArgument(0);
@@ -2009,7 +3057,21 @@ void buildTracebackPrintMessage(SupportBuilder &b) {
   b.call("print_exception_summary", mlir::TypeRange{},
          mlir::ValueRange{entry->getArgument(0), entry->getArgument(1),
                           entry->getArgument(2), entry->getArgument(3),
-                          entry->getArgument(4), entry->getArgument(5)});
+                          entry->getArgument(4), entry->getArgument(5),
+                          entry->getArgument(6)});
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(-1),
+                              b.addrOf("g_tb_prefix_spaces"),
+                              /*alignment=*/8);
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, groupDisplay, groupMembers,
+                                 mlir::ValueRange{}, finish,
+                                 mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(groupMembers);
+  b.call("print_group_members", mlir::TypeRange{},
+         mlir::ValueRange{entry->getArgument(1), b.iconst(2)});
+  mlir::cf::BranchOp::create(b.builder, b.loc, finish, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(finish);
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
@@ -2041,12 +3103,30 @@ void buildTracebackSupport(SupportBuilder &b) {
   buildReadSourceLine(b);
   buildExceptionClassName(b);
   buildLeadingWhitespace(b);
+  buildWriteSpaces(b);
+  buildWritePrefix(b);
+  buildExceptionGroupMemberCount(b);
   buildPrintMarker(b);
   buildPrintTraceFrame(b);
   buildUtf8MessageCStr(b);
   buildPrintExceptionSummary(b);
+  buildPrintGroupMembers(b);
   buildPrintChainNode(b);
   buildTracebackPrintMessage(b);
+  buildReleaseExceptionStorageRaw(b);
+  buildReleaseStarNode(b);
+  buildStarBegin(b);
+  buildStarHasResidual(b);
+  buildStarResidualParts(b);
+  buildStarApplyMatch(b);
+  buildStarCollect(b);
+  buildStarCollectedCount(b);
+  buildStarNodesPtr(b);
+  buildStarPop(b);
+  buildStarThrowPending(b);
+  buildStarRethrowResidual(b);
+  buildStarRethrowSoleCollected(b);
+  buildStarThrowCombined(b);
 }
 
 } // namespace py::runtime_library

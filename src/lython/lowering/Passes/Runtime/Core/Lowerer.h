@@ -913,6 +913,11 @@ private:
   mlir::LogicalResult lowerExceptMatch(py::ExceptMatchOp op);
   mlir::LogicalResult lowerExceptCurrentMatch(py::ExceptCurrentMatchOp op);
   mlir::LogicalResult lowerExceptCurrentValue(py::ExceptCurrentValueOp op);
+  mlir::LogicalResult lowerStarBegin(py::StarBeginOp op);
+  mlir::LogicalResult lowerExceptStarMatch(py::ExceptStarMatchOp op);
+  mlir::LogicalResult lowerStarCollect(py::StarCollectOp op);
+  mlir::LogicalResult lowerStarBodyEnd(py::StarBodyEndOp op);
+  mlir::LogicalResult lowerStarFinish(py::StarFinishOp op);
   mlir::LogicalResult emitTracebackFrame(mlir::Operation *op,
                                          bool stashCurrentException = true);
   mlir::LogicalResult lowerCall(py::CallOp op);

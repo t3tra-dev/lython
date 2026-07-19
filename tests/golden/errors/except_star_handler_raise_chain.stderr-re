@@ -1,0 +1,14 @@
+\ \ \+\ Exception\ Group\ Traceback\ \(most\ recent\ call\ last\):\
+\ \ \|\ \ \ File\ ".*except_star_handler_raise_chain\.py",\ line\ 2,\ in\ <module>\
+\ \ \|\ \ \ \ \ raise\ ExceptionGroup\("g",\ \[ValueError\("a"\),\ TypeError\("b"\)\]\)\
+\ \ \|\ ExceptionGroup:\ g\ \(1\ sub\-exception\)\
+\ \ \+\-\+\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\ 1\ \-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\
+\ \ \ \ \|\ ValueError:\ a\
+\ \ \ \ \+\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\
+\
+During\ handling\ of\ the\ above\ exception,\ another\ exception\ occurred:\
+\
+Traceback\ \(most\ recent\ call\ last\):\
+\ \ File\ ".*except_star_handler_raise_chain\.py",\ line\ 4,\ in\ <module>\
+\ \ \ \ raise\ RuntimeError\("boom"\)\
+RuntimeError:\ boom
