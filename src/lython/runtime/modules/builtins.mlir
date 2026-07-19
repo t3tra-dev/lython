@@ -26,7 +26,7 @@ module attributes {
     !py.callable<[], vararg = !py.contract<"builtins.tuple", [!py.contract<"builtins.object">]>, returns = [!py.literal<None>]>,
     !py.callable<[!py.contract<"builtins.object">], returns = [!py.contract<"builtins.int">]>,
     !py.callable<[!py.contract<"builtins.object">], returns = [!py.contract<"builtins.int">]>,
-    !py.callable<[!py.contract<"builtins.list", [!py.typevar<"T">]>], returns = [!py.contract<"builtins.list", [!py.typevar<"T">]>]>,
+    !py.callable<[!py.protocol<"Iterable", [!py.typevar<"T">]>], returns = [!py.contract<"builtins.list", [!py.typevar<"T">]>]>,
     !py.callable<[!py.typevar<"T">], returns = [!py.typevar<"T">]>,
     !py.callable<[!py.contract<"builtins.int">, !py.contract<"builtins.int">], returns = [!py.contract<"builtins.tuple", [!py.contract<"builtins.int">, !py.contract<"builtins.int">]>]>,
     !py.callable<[!py.contract<"builtins.int">, !py.contract<"builtins.int">, !py.contract<"builtins.int">], returns = [!py.contract<"builtins.int">]>,
@@ -6492,7 +6492,16 @@ module attributes {
     %lhs_is_float = arith.cmpi eq, %lhs_class, %float_class : i64
     %rhs_is_float = arith.cmpi eq, %rhs_class, %float_class : i64
     %either_float = arith.ori %lhs_is_float, %rhs_is_float : i1
-    %result = scf.if %either_float -> (i1) {
+    %lhs_is_bool0 = arith.cmpi eq, %lhs_class, %bool_class : i64
+    %rhs_is_bool0 = arith.cmpi eq, %rhs_class, %bool_class : i64
+    %both_bool = arith.andi %lhs_is_bool0, %rhs_is_bool0 : i1
+    %result = scf.if %both_bool -> (i1) {
+      %lv = func.call @__ly_boxed_bool_value(%lhs) : (!llvm.ptr) -> i64
+      %rv = func.call @__ly_boxed_bool_value(%rhs) : (!llvm.ptr) -> i64
+      %beq = arith.cmpi eq, %lv, %rv : i64
+      scf.yield %beq : i1
+    } else {
+    %inner_result = scf.if %either_float -> (i1) {
       // Exactly one side is a float here (float/float is same-class).
       %fv = scf.if %lhs_is_float -> (f64) {
         %v = func.call @__ly_boxed_float_value(%lhs) : (!llvm.ptr) -> f64
@@ -6538,6 +6547,8 @@ module attributes {
         scf.yield %m1 : i1
       }
       scf.yield %cmp : i1
+    }
+    scf.yield %inner_result : i1
     }
     func.return %result : i1
   }
@@ -6716,7 +6727,11 @@ module attributes {
     %both_num = arith.andi %lhs_num, %rhs_num : i1
     %same = arith.cmpi eq, %lhs_class, %rhs_class : i64
     %mixed_num = arith.cmpi ne, %lhs_class, %rhs_class : i64
-    %numeric_mixed = arith.andi %both_num, %mixed_num : i1
+    // bool/bool pairs also take the numeric path: bool has no __lt__ hook
+    // entry of its own (CPython orders bools as ints).
+    %both_bool = arith.andi %lhs_bool, %rhs_bool : i1
+    %mixed_or_bool = arith.ori %mixed_num, %both_bool : i1
+    %numeric_mixed = arith.andi %both_num, %mixed_or_bool : i1
     %result = scf.if %numeric_mixed -> (i1) {
       // Equal values first (exact), then the f64 ordering: only values that
       // differ by less than one f64 ulp beyond 2^53 can misorder here.

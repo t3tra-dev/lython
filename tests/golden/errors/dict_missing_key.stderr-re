@@ -1,0 +1,5 @@
+Traceback\ \(most\ recent\ call\ last\):\
+\ \ File\ ".*dict_missing_key\.py",\ line\ 4,\ in\ <module>\
+\ \ \ \ print\(d\[2\]\)\
+\ \ \ \ \ \ \ \ \ \ ~\^\^\^\
+KeyError:\ 2
