@@ -1017,7 +1017,8 @@ void TypeSystem::seedBuiltins() {
                          .value_or(py::CallableType::get(
                              &context, {object()}, {}, {}, {}, {intType()})));
   for (llvm::StringRef manifestBuiltin :
-       {"sorted", "abs", "divmod", "pow", "ord", "chr", "hex", "oct", "bin"})
+       {"sorted", "abs", "divmod", "pow", "ord", "chr", "hex", "oct", "bin",
+        "input"})
     if (std::optional<mlir::Type> manifestContract = table.freeFunctionContract(
             (llvm::Twine("builtins.") + manifestBuiltin).str()))
       bindSymbol(manifestBuiltin, *manifestContract);

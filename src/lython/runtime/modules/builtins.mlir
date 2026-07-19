@@ -38,7 +38,7 @@ module attributes {
   // Manifest Callable contracts for builtin free functions. These are the
   // single trusted source for these signatures; the emitter's seedBuiltins
   // reads them here instead of constructing the contracts in C++.
-  ly.typing.function_names = ["builtins.print", "builtins.len", "builtins.hash", "builtins.sorted", "builtins.abs", "builtins.divmod", "builtins.pow", "builtins.ord", "builtins.chr", "builtins.hex", "builtins.oct", "builtins.bin"],
+  ly.typing.function_names = ["builtins.print", "builtins.len", "builtins.hash", "builtins.sorted", "builtins.abs", "builtins.divmod", "builtins.pow", "builtins.ord", "builtins.chr", "builtins.hex", "builtins.oct", "builtins.bin", "builtins.input"],
   ly.typing.function_contracts = [
     !py.callable<[], vararg = !py.contract<"builtins.tuple", [!py.contract<"builtins.object">]>, returns = [!py.literal<None>]>,
     !py.callable<[!py.contract<"builtins.object">], returns = [!py.contract<"builtins.int">]>,
@@ -51,7 +51,8 @@ module attributes {
     !py.callable<[!py.contract<"builtins.int">], returns = [!py.contract<"builtins.str">]>,
     !py.callable<[!py.contract<"builtins.int">], returns = [!py.contract<"builtins.str">]>,
     !py.callable<[!py.contract<"builtins.int">], returns = [!py.contract<"builtins.str">]>,
-    !py.callable<[!py.contract<"builtins.int">], returns = [!py.contract<"builtins.str">]>
+    !py.callable<[!py.contract<"builtins.int">], returns = [!py.contract<"builtins.str">]>,
+    !py.callable<[!py.contract<"builtins.str">], returns = [!py.contract<"builtins.str">]>
   ]
 } {
   py.class @object attributes {
@@ -14723,6 +14724,82 @@ module attributes {
     %cp = func.call @__ly_unicode_get(%bytes, %width, %c0) : (memref<?xi8>, i64, index) -> i64
     %h, %m, %d = func.call @LyLong_FromI64(%cp) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
     func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
+  }
+
+  // "EOF when reading a line"
+  memref.global "private" constant @__ly_input_eof_msg : memref<23xi8> = dense<[69, 79, 70, 32, 119, 104, 101, 110, 32, 114, 101, 97, 100, 105, 110, 103, 32, 97, 32, 108, 105, 110, 101]>
+
+  func.func private @LyHost_GetcStdin() -> i32
+  func.func private @LyHost_FFlush(i64) -> i32
+
+  // input(prompt): write the prompt without a newline, read one line from
+  // stdin (the trailing newline is stripped), EOFError when the stream ends
+  // before any character.
+  func.func @LyBuiltin_Input(%prompt_header: memref<2xi64> {ly.ownership.object_header}, %prompt_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "input", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.str", ly.runtime.primitive = "builtin_input", ly.runtime.result_contract = "builtins.str"} {
+    %zero64 = arith.constant 0 : i64
+    %minus_one = arith.constant -1 : i32
+    %newline = arith.constant 10 : i32
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %initial_cap = arith.constant 128 : index
+    func.call @LyUnicode_Print(%prompt_header, %prompt_bytes) : (memref<2xi64>, memref<?xi8>) -> ()
+    // fflush(NULL): flush the prompt before blocking on stdin.
+    %flush_all = func.call @LyHost_FFlush(%zero64) : (i64) -> i32
+    %buf0 = memref.alloc(%initial_cap) : memref<?xi8>
+    cf.br ^loop(%buf0, %initial_cap, %c0 : memref<?xi8>, index, index)
+
+  ^loop(%buf: memref<?xi8>, %cap: index, %len: index):
+    %ch = func.call @LyHost_GetcStdin() : () -> i32
+    %is_eof = arith.cmpi eq, %ch, %minus_one : i32
+    cf.cond_br %is_eof, ^eof(%buf, %len : memref<?xi8>, index), ^got(%buf, %cap, %len, %ch : memref<?xi8>, index, index, i32)
+
+  ^got(%gbuf: memref<?xi8>, %gcap: index, %glen: index, %gch: i32):
+    %is_nl = arith.cmpi eq, %gch, %newline : i32
+    cf.cond_br %is_nl, ^done(%gbuf, %glen : memref<?xi8>, index), ^store(%gbuf, %gcap, %glen, %gch : memref<?xi8>, index, index, i32)
+
+  ^store(%sbuf: memref<?xi8>, %scap: index, %slen: index, %sch: i32):
+    %full = arith.cmpi uge, %slen, %scap : index
+    %grown:2 = scf.if %full -> (memref<?xi8>, index) {
+      %two = arith.constant 2 : index
+      %newcap = arith.muli %scap, %two : index
+      %newbuf = memref.alloc(%newcap) : memref<?xi8>
+      scf.for %i = %c0 to %slen step %c1 {
+        %b = memref.load %sbuf[%i] : memref<?xi8>
+        memref.store %b, %newbuf[%i] : memref<?xi8>
+      }
+      memref.dealloc %sbuf : memref<?xi8>
+      scf.yield %newbuf, %newcap : memref<?xi8>, index
+    } else {
+      scf.yield %sbuf, %scap : memref<?xi8>, index
+    }
+    %byte = arith.trunci %sch : i32 to i8
+    memref.store %byte, %grown#0[%slen] : memref<?xi8>
+    %next_len = arith.addi %slen, %c1 : index
+    cf.br ^loop(%grown#0, %grown#1, %next_len : memref<?xi8>, index, index)
+
+  ^eof(%ebuf: memref<?xi8>, %elen: index): // EOF before any character: EOFError
+    %saw_any = arith.cmpi ne, %elen, %c0 : index
+    cf.cond_br %saw_any, ^done(%ebuf, %elen : memref<?xi8>, index), ^raise(%ebuf : memref<?xi8>)
+
+  ^raise(%rbuf: memref<?xi8>):
+    memref.dealloc %rbuf : memref<?xi8>
+    %eof_class = arith.constant 106 : i64
+    %msg_static = memref.get_global @__ly_input_eof_msg : memref<23xi8>
+    %msg = memref.cast %msg_static : memref<23xi8> to memref<?xi8>
+    %msg_len = arith.constant 23 : i64
+    %exception:3 = func.call @LyBaseException_New(%eof_class) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%msg, %c0, %msg_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    func.call @LyEH_ThrowException(%initialized#0, %initialized#1, %initialized#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    // The throw does not return; satisfy the CFG with an empty line.
+    %dead = memref.alloc(%c0) : memref<?xi8>
+    cf.br ^done(%dead, %c0 : memref<?xi8>, index)
+
+  ^done(%dbuf: memref<?xi8>, %dlen: index):
+    %dlen64 = arith.index_cast %dlen : index to i64
+    %result_header, %result_bytes = func.call @LyUnicode_FromBytes(%dbuf, %c0, %dlen64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    memref.dealloc %dbuf : memref<?xi8>
+    func.return %result_header, %result_bytes : memref<2xi64>, memref<?xi8>
   }
 
   // "chr() arg not in range(0x110000)"

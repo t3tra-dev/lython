@@ -176,6 +176,29 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     return *v;
   if (std::optional<Value> v = tryEmitFloatCall(expr, calleeNode))
     return *v;
+  if (std::optional<Value> v = tryEmitBoolCall(expr, calleeNode))
+    return *v;
+  if (std::optional<Value> v = tryEmitAsciiCall(expr, calleeNode))
+    return *v;
+  if (std::optional<Value> v = tryEmitIssubclassCall(expr, calleeNode))
+    return *v;
+  // input() with no prompt forwards an empty prompt to the single manifest
+  // contract (input(prompt: str) -> str).
+  if (calleeNode && calleeNode->kind == "Name" &&
+      ast::nameSpelling(*calleeNode) == "input" &&
+      values.find("input") == values.end() && callHasNoArguments(expr)) {
+    parser::NodePtr empty = parser::makeNode("Constant", expr.range);
+    parser::addField(*empty, "value", std::string());
+    parser::NodePtr promptCall = parser::makeNode("Call", expr.range);
+    parser::NodePtr inputName = parser::makeNode("Name", expr.range);
+    parser::addField(*inputName, "id", std::string("input"));
+    parser::addField(*promptCall, "func", std::move(inputName));
+    parser::addField(*promptCall, "args",
+                     std::vector<parser::NodePtr>{std::move(empty)});
+    parser::addField(*promptCall, "keywords", std::vector<parser::NodePtr>{});
+    synthesizedIteratorDefs.push_back(promptCall);
+    return emitCall(*promptCall);
+  }
   if (std::optional<Value> v = tryEmitStrCall(expr, calleeNode))
     return *v;
   if (std::optional<Value> v = tryEmitListCall(expr, calleeNode))
@@ -579,6 +602,117 @@ ModuleEmitter::tryEmitIntCall(const parser::Node &expr,
     return Value{op.getResult(), resultType};
   }
   return std::nullopt;
+}
+
+std::optional<Value>
+ModuleEmitter::tryEmitBoolCall(const parser::Node &expr,
+                               const parser::Node *calleeNode) {
+  if (!calleeNode || calleeNode->kind != "Name" ||
+      ast::nameSpelling(*calleeNode) != "bool" ||
+      values.find("bool") != values.end())
+    return std::nullopt;
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  if (keywords && !keywords->empty())
+    return std::nullopt;
+  if (!args || args->empty()) {
+    mlir::Type literalType = types.literal("False");
+    auto constant = py::BoolConstantOp::create(builder, loc(expr), literalType,
+                                               builder.getBoolAttr(false));
+    return Value{constant.getResult(), literalType};
+  }
+  if (args->size() != 1 || !args->front() ||
+      args->front()->kind == "Starred")
+    return std::nullopt;
+  const parser::Node *argNode = args->front().get();
+  mlir::Type argumentType = types.widenLiteral(types.inferExpr(argNode));
+  // bool(n) on numbers is an EXPLICIT conversion — R1 only rejects the
+  // implicit truthiness of `if n:` — so it desugars to the comparison the
+  // diagnostic would suggest.
+  if (argumentType == types.intType() || argumentType == types.floatType()) {
+    parser::NodePtr zero = parser::makeNode("Constant", expr.range);
+    if (argumentType == types.floatType())
+      parser::addField(*zero, "value", 0.0);
+    else
+      parser::addField(*zero, "value", std::int64_t{0});
+    parser::NodePtr op = parser::makeNode("NotEq", expr.range);
+    parser::NodePtr compare = parser::makeNode("Compare", expr.range);
+    parser::addField(*compare, "left", (*args)[0]);
+    parser::addField(*compare, "ops", std::vector<parser::NodePtr>{op});
+    parser::addField(*compare, "comparators",
+                     std::vector<parser::NodePtr>{zero});
+    return coerceValue(emitExpr(compare.get()), types.boolType(), expr);
+  }
+  // Everything else rides the same truthiness emitBoolValue implements for
+  // conditions (containers by emptiness, Optional by None-ness, bool as-is).
+  Value argument = emitExpr(argNode);
+  mlir::Value bit = emitBoolValue(argument, expr);
+  return boxedBool(builder, loc(expr), types, bit);
+}
+
+std::optional<Value>
+ModuleEmitter::tryEmitAsciiCall(const parser::Node &expr,
+                                const parser::Node *calleeNode) {
+  if (!calleeNode || calleeNode->kind != "Name" ||
+      ast::nameSpelling(*calleeNode) != "ascii" ||
+      values.find("ascii") != values.end())
+    return std::nullopt;
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  if (!args || args->size() != 1 || (keywords && !keywords->empty()) ||
+      !args->front() || args->front()->kind == "Starred") {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "ascii() takes exactly one argument"});
+    return emitNone(expr);
+  }
+  Value argument = emitExpr(args->front().get());
+  if (std::optional<Value> converted =
+          emitConversionValue(expr, argument, 'a'))
+    return converted;
+  diagnostics.push_back(parser::Diagnostic{
+      parser::Severity::Error, expr.range.start,
+      "ascii() is not supported for this argument type"});
+  return emitNone(expr);
+}
+
+std::optional<Value>
+ModuleEmitter::tryEmitIssubclassCall(const parser::Node &expr,
+                                     const parser::Node *calleeNode) {
+  if (!calleeNode || calleeNode->kind != "Name" ||
+      ast::nameSpelling(*calleeNode) != "issubclass" ||
+      values.find("issubclass") != values.end())
+    return std::nullopt;
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  auto rejectIssubclass = [&](llvm::StringRef reason) -> std::optional<Value> {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start, std::string(reason)});
+    return emitNone(expr);
+  };
+  if (!args || args->size() != 2 || (keywords && !keywords->empty()))
+    return rejectIssubclass("issubclass() takes exactly two arguments");
+  // Static classes only: the hierarchy is compile-time (C3 linearized), so
+  // the answer folds to a constant.
+  auto classOf = [&](const parser::Node *node) -> std::optional<mlir::Type> {
+    if (!node)
+      return std::nullopt;
+    std::string qualified = ast::qualifiedName(node);
+    if (qualified.empty())
+      return std::nullopt;
+    return types.lookupClass(qualified);
+  };
+  std::optional<mlir::Type> subClass = classOf((*args)[0].get());
+  std::optional<mlir::Type> superClass = classOf((*args)[1].get());
+  if (!subClass || !superClass)
+    return rejectIssubclass(
+        "issubclass() requires statically resolvable class names");
+  bool truth = *subClass == *superClass ||
+               py::isAssignableTo(*subClass, *superClass, module);
+  mlir::Type literalType = types.literal(truth ? "True" : "False");
+  auto constant = py::BoolConstantOp::create(builder, loc(expr), literalType,
+                                             builder.getBoolAttr(truth));
+  return Value{constant.getResult(), literalType};
 }
 
 Value ModuleEmitter::emitFloatFromInt(const parser::Node &anchor,

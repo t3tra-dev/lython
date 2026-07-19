@@ -259,6 +259,12 @@ private:
                                        const parser::Node *calleeNode);
   std::optional<Value> tryEmitPrintCall(const parser::Node &expr,
                                         const parser::Node *calleeNode);
+  std::optional<Value> tryEmitBoolCall(const parser::Node &expr,
+                                       const parser::Node *calleeNode);
+  std::optional<Value> tryEmitAsciiCall(const parser::Node &expr,
+                                        const parser::Node *calleeNode);
+  std::optional<Value> tryEmitIssubclassCall(const parser::Node &expr,
+                                             const parser::Node *calleeNode);
   std::optional<Value> tryEmitReducerCall(const parser::Node &expr,
                                           const parser::Node *calleeNode);
   std::optional<Value> tryEmitLenCall(const parser::Node &expr,
