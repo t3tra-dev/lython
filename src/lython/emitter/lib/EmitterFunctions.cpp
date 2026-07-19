@@ -77,6 +77,7 @@ void ModuleEmitter::emitFunctionDecl(const parser::Node &function) {
   auto name = ast::string(function, "name");
   if (!name)
     return;
+  checkDecorators(function, DecoratorRole::Function);
   FunctionSignature sig = types.functionSignature(function);
   if (!diagnoseUnsupportedFunctionSignature(diagnostics, function, sig)) {
     if (unboundStaticParameterCount(sig.publicCallable) != 0) {
@@ -367,6 +368,7 @@ Value ModuleEmitter::emitNestedFunctionDecl(const parser::Node &function) {
   auto name = ast::string(function, "name");
   if (!name)
     return emitNone(function);
+  checkDecorators(function, DecoratorRole::Function);
 
   llvm::SmallVector<Capture, 4> captures;
   for (const std::string &captureName : lexicalCaptureNames(function)) {

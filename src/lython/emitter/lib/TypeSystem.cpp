@@ -756,6 +756,10 @@ constexpr NameAliasImport kNameAliasImports[] = {
     {"lyrt.prim", "Vector", "lyrt.prim.Vector", true},
     {"lyrt.prim", "Matrix", "lyrt.prim.Matrix", true},
     {"lyrt.prim", "Tensor", "lyrt.prim.Tensor", true},
+    // Decorator names the emitter recognizes syntactically; the bindings
+    // exist so the imports resolve (the decorators never evaluate as values).
+    {"dataclasses", "dataclass", "dataclasses.dataclass", false},
+    {"dataclasses", "field", "dataclasses.field", false},
 };
 
 constexpr ModuleStringConstantImport kModuleStringConstantImports[] = {

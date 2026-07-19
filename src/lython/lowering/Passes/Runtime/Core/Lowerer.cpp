@@ -35,6 +35,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerModule() {
     return mlir::failure();
   if (mlir::failed(synthesizeSourceClassDeallocators()))
     return mlir::failure();
+  if (mlir::failed(synthesizeUserExceptionHooks()))
+    return mlir::failure();
   if (mlir::failed(lowerStructuredTryOps()))
     return mlir::failure();
 

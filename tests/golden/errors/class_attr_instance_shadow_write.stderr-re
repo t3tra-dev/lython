@@ -1,0 +1,1 @@
+assigning 'count' through an instance would shadow the class attribute

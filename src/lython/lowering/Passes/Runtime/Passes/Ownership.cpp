@@ -923,6 +923,19 @@ bool releaseOwnedGroupByLiveness(
   // emitter's loop back-edge decref-on-replace). The value dies there and must
   // NOT be released again; other dead paths still need a release.
   llvm::DenseSet<mlir::Block *> consumedBlocks;
+  // A field rebinding re-roots an owned-local marker mid-function, so alias
+  // equivalents (the shared object header) have uses that PRECEDE this
+  // group's definition. Those uses belong to the group's predecessor
+  // incarnation: counting them as liveness would anchor releases where the
+  // group values do not exist yet (and double-release the live path).
+  std::optional<mlir::DominanceInfo> dominance;
+  auto usePrecedesDefinition = [&](mlir::Operation *user) {
+    if (!selfOp || user == selfOp)
+      return false;
+    if (!dominance)
+      dominance.emplace(selfOp->getParentOfType<mlir::func::FuncOp>());
+    return dominance->properlyDominates(user, selfOp);
+  };
   // Interior views (canonical-shape tail beyond the release interface) pin
   // the entity: every use is a plain liveness contribution. Box-word
   // reconstructions (borrowed memref views assembled from the entity's box
@@ -974,6 +987,8 @@ bool releaseOwnedGroupByLiveness(
       mlir::Operation *user = use.getOwner();
       if (user == selfOp)
         continue;
+      if (usePrecedesDefinition(user))
+        continue;
       // A use nested inside a region op (e.g. the boxed lane of a prim/boxed
       // scf.if dispatch) pins liveness at its top-level ancestor. Nested
       // terminators forward the view out through a region result; views only
@@ -1001,6 +1016,8 @@ bool releaseOwnedGroupByLiveness(
       for (mlir::OpOperand &use : equivalent.getUses()) {
         mlir::Operation *user = use.getOwner();
         if (user == selfOp)
+          continue;
+        if (usePrecedesDefinition(user))
           continue;
         if (ownershipConsumingUseInvalidatesGroup(contracts, use, group.values,
                                                   aliases)) {

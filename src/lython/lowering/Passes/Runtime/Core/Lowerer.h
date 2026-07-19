@@ -89,6 +89,25 @@ private:
   runtimeValueTypesFor(mlir::Operation *op, mlir::Type type,
                        llvm::StringRef purpose) const;
   py::ClassOp classForContract(mlir::Type type) const;
+  // Nearest manifest exception ancestor (a contract with a `raise`
+  // primitive) along a source class's emitter-computed linearization
+  // (`mro_names`); nullopt for non-exception source classes. Instances of
+  // exception-backed classes use the ancestor's physical representation --
+  // the runtime exception object with the source class's id in its header.
+  std::optional<std::string>
+  exceptionAncestorContract(py::ClassOp classOp) const;
+  std::optional<std::string> exceptionAncestorContractFor(mlir::Type type) const;
+  // Class id of the next exception class after `classOp` in its MRO (a user
+  // exception base's source id, else the builtin ancestor's manifest id).
+  std::optional<std::int64_t>
+  userExceptionParentClassId(py::ClassOp classOp) const;
+  // Per-program hooks the native support module links against:
+  // __ly_user_exception_base_class_id (id -> parent id, 0 unknown) and
+  // __ly_user_exception_class_name (id -> C-string ptr, null unknown).
+  mlir::LogicalResult synthesizeUserExceptionHooks();
+  // Class id of an except-clause handler type (manifest or source class).
+  mlir::FailureOr<std::int64_t> handlerClassId(mlir::Operation *op,
+                                               mlir::Type handler) const;
   std::optional<std::int64_t> runtimeClassIdForClass(py::ClassOp classOp) const;
   std::optional<std::int64_t> runtimeClassIdForContract(mlir::Type type) const;
   mlir::FailureOr<llvm::SmallVector<std::int64_t, 8>>

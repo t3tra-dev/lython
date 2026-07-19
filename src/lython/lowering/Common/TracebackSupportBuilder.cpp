@@ -989,6 +989,17 @@ void buildExceptionClassName(SupportBuilder &b) {
         b.builder, b.loc, matches,
         b.addrOf((llvm::Twine(".tb_class.") + info.name).str()), name);
   }
+  // Source exception classes: the per-program hook owns their names (null
+  // for ids it does not know, which keeps the builtin selection).
+  auto userName = mlir::func::CallOp::create(
+      b.builder, b.loc, "__ly_user_exception_class_name", b.ptr(),
+      mlir::ValueRange{classId});
+  mlir::Value null = mlir::LLVM::ZeroOp::create(b.builder, b.loc, b.ptr());
+  mlir::Value missing = mlir::LLVM::ICmpOp::create(
+      b.builder, b.loc, mlir::LLVM::ICmpPredicate::eq, userName.getResult(0),
+      null);
+  name = mlir::arith::SelectOp::create(b.builder, b.loc, missing, name,
+                                       userName.getResult(0));
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{name});
 }
 

@@ -4,6 +4,7 @@
 #include "EmitterSupport.h"
 
 #include "AstAccess.h"
+#include "Contracts.h"
 
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -23,6 +24,11 @@ void ModuleEmitter::emitStatements(
       break;
     if (statement && (!skipDeclarations || !isTopLevelDecl(*statement)))
       emitStatement(*statement);
+    else if (statement && skipDeclarations && statement->kind == "ClassDef")
+      // The class contract was declared up front, but its attribute
+      // initializers evaluate here -- at the class statement's position in
+      // module flow, like CPython's class-body execution.
+      emitClassAttrInitializers(*statement);
   }
 }
 
@@ -71,12 +77,30 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
     if (target && target->kind == "Name")
       types.bindSymbol(ast::nameSpelling(*target), annotated);
   } else if (statement.kind == "AugAssign") {
-    Value lhs = emitExpr(ast::node(statement, "target"));
-    Value rhs = emitExpr(ast::node(statement, "value"));
-    Value value = emitBinarySpecial<py::AddOp>(
-        statement, "__add__", lhs, rhs,
-        types.widenLiteral(types.join({lhs.type, rhs.type})));
-    emitAssignTarget(*ast::node(statement, "target"), value);
+    // Desugar to the equivalent BinOp over shared subtrees so the operator
+    // dispatch (and the primitive path) is exactly the `x = x <op> v` one.
+    // The previous inline emission hardcoded __add__ for every operator.
+    auto sharedSubtree = [&](llvm::StringRef name) -> parser::NodePtr {
+      const parser::Field *field = parser::findField(statement, name);
+      if (!field || !std::holds_alternative<parser::NodePtr>(field->value))
+        return nullptr;
+      return std::get<parser::NodePtr>(field->value);
+    };
+    parser::NodePtr target = sharedSubtree("target");
+    parser::NodePtr op = sharedSubtree("op");
+    parser::NodePtr rhs = sharedSubtree("value");
+    if (!target || !op || !rhs) {
+      diagnostics.push_back(parser::Diagnostic{parser::Severity::Error,
+                                               statement.range.start,
+                                               "malformed augmented assignment"});
+      return;
+    }
+    parser::NodePtr binop = parser::makeNode("BinOp", statement.range);
+    parser::addField(*binop, "left", target);
+    parser::addField(*binop, "op", op);
+    parser::addField(*binop, "right", rhs);
+    Value value = emitBinary(*binop);
+    emitAssignTarget(*target, value);
   } else if (statement.kind == "If") {
     emitIf(statement);
   } else if (statement.kind == "For") {
@@ -217,6 +241,73 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
     const parser::Node *objectNode = ast::node(target, "value");
     Value object = emitExpr(objectNode);
     if (auto attr = ast::string(target, "attr")) {
+      // Property writes inline the setter; a getter without a setter is the
+      // CPython AttributeError, surfaced statically.
+      if (std::optional<MethodBinding> setter = lookupClassMethod(
+              object.type, (llvm::Twine(*attr) + ".setter").str())) {
+        if (setter->kind == "property_setter") {
+          emitInlineMethodBody(target, object, /*bindDescriptorReceiver=*/true,
+                               *setter, {value}, {});
+          return;
+        }
+      }
+      if (std::optional<MethodBinding> getter =
+              lookupClassMethod(object.type, *attr);
+          getter && getter->kind == "property") {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, target.range.start,
+            "property '" + std::string(*attr) + "' has no setter"});
+        return;
+      }
+      // Mutable class attribute writes target the defining class's cell.
+      if (auto typeObject =
+              mlir::dyn_cast_if_present<py::TypeType>(object.type)) {
+        if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(
+                typeObject.getInstanceType())) {
+          llvm::StringRef className = contract.getContractName();
+          if (std::optional<std::pair<llvm::StringRef, mlir::Type>> slot =
+                  resolveClassAttrSlot(className, *attr)) {
+            if (slot->first != className) {
+              // CPython would create a NEW attribute on the subclass,
+              // shadowing the base's; static storage has no per-subclass
+              // presence, so writing through the subclass name is loud.
+              diagnostics.push_back(parser::Diagnostic{
+                  parser::Severity::Error, target.range.start,
+                  "assigning class attribute '" + std::string(*attr) +
+                      "' through subclass '" +
+                      py::contracts::manifestClassNameForContract(className) +
+                      "' would shadow '" +
+                      py::contracts::manifestClassNameForContract(
+                          slot->first) +
+                      "'; assign through the defining class"});
+              return;
+            }
+            std::string cellName =
+                (llvm::Twine(slot->first) + "." + *attr).str();
+            Value coerced = coerceValue(value, slot->second, target);
+            py::GlobalSetOp::create(builder, loc(target),
+                                    builder.getStringAttr(cellName),
+                                    coerced.value);
+            return;
+          }
+        }
+      } else if (!lookupClassField(object.type, *attr)) {
+        if (auto contract =
+                mlir::dyn_cast_if_present<py::ContractType>(object.type)) {
+          if (resolveClassAttrSlot(contract.getContractName(), *attr)) {
+            // CPython creates an instance attribute shadowing the class
+            // attribute; the static layout only has fields declared in
+            // __init__, so this write cannot be represented.
+            diagnostics.push_back(parser::Diagnostic{
+                parser::Severity::Error, target.range.start,
+                "assigning '" + std::string(*attr) +
+                    "' through an instance would shadow the class "
+                    "attribute; initialize it in __init__ to make it an "
+                    "instance field"});
+            return;
+          }
+        }
+      }
       auto op = py::AttrSetOp::create(builder, loc(target), object.value, *attr,
                                       value.value);
       if (lookupClassField(object.type, *attr))

@@ -157,6 +157,21 @@ RuntimeBundleLowerer::runtimeValueTypesFor(mlir::Operation *op, mlir::Type type,
   }
 
   if (py::ClassOp classOp = RuntimeBundleLowerer::classForContract(type)) {
+    // Exception-backed source classes use the runtime exception object's
+    // shape (their identity lives in the header's class id, not the layout),
+    // so raise/borrow/str flow through the builtin exception machinery.
+    if (std::optional<std::string> ancestor =
+            RuntimeBundleLowerer::exceptionAncestorContract(classOp)) {
+      const RuntimeValueShape *shape = manifest.valueShape(*ancestor);
+      if (!shape)
+        shape = manifest.valueShape("builtins.BaseException");
+      if (!shape)
+        return op->emitError()
+               << "runtime manifest has no exception ABI shape for "
+               << purpose;
+      return llvm::SmallVector<mlir::Type, 8>(shape->valueTypes.begin(),
+                                              shape->valueTypes.end());
+    }
     const RuntimeValueShape *objectShape =
         manifest.valueShape("builtins.object");
     if (!objectShape)

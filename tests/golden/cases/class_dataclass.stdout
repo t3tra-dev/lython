@@ -1,0 +1,10 @@
+Point(x=1, y=2, label='origin')
+True
+False
+5
+Point3(x=5, y=6, label='high', z=7)
+Point3(x=8, y=9, label='origin', z=0)
+True
+False
+<silent>
+Point(x=1, y=2, label='origin')

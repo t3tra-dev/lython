@@ -76,6 +76,30 @@ private:
   std::optional<mlir::Type>
   lookupClassStaticAttr(mlir::Type receiverType,
                         llvm::StringRef attrName) const;
+  // Canonical contract name for a base-class spelling (resolves import
+  // aliases through the class binding; manifest classes resolve to their
+  // builtins.* contract). Falls back to the raw spelling.
+  std::string canonicalClassName(llvm::StringRef spelling) const;
+  // The class's C3 linearization (contract names, self first). Computed and
+  // cached by emitClassContract; empty for unknown classes.
+  llvm::ArrayRef<std::string> classMro(llvm::StringRef className) const;
+  // First class at or after `startAfter` (exclusive when set) in
+  // receiverClass's MRO that declares `methodName`; the binding's
+  // definingClass names the provider.
+  std::optional<MethodBinding>
+  resolveMroMethod(llvm::StringRef receiverClass, llvm::StringRef methodName,
+                   llvm::StringRef startAfter = {}) const;
+  // True when the class (by contract name) linearizes onto a manifest
+  // exception class (its instances use the runtime exception representation).
+  bool isExceptionBackedClass(llvm::StringRef className) const;
+  // Defining class + storage type of a slot-backed (mutable) class attribute
+  // reachable from `className` along its MRO.
+  std::optional<std::pair<llvm::StringRef, mlir::Type>>
+  resolveClassAttrSlot(llvm::StringRef className,
+                       llvm::StringRef attrName) const;
+  // Evaluates the class body's attribute initializers into their global
+  // slots; runs at the ClassDef statement position in module flow.
+  void emitClassAttrInitializers(const parser::Node &classDef);
   Value emitNestedFunctionDecl(const parser::Node &function);
   mlir::ArrayAttr emitCallableDefaultValues(const parser::Node &function,
                                             const FunctionSignature &sig,
@@ -85,7 +109,8 @@ private:
                          llvm::StringRef symbolName = {});
   void collectClassFields(const parser::Node &classDef,
                           llvm::SmallVectorImpl<std::string> &fieldNames,
-                          llvm::SmallVectorImpl<mlir::Type> &fieldTypes);
+                          llvm::SmallVectorImpl<mlir::Type> &fieldTypes,
+                          bool includeAnnAssignDefaults = false);
   void collectStaticClassAssignments(
       const parser::Node &classDef, llvm::SmallVectorImpl<std::string> &names,
       llvm::SmallVectorImpl<mlir::Attribute> &values,
@@ -210,6 +235,21 @@ private:
                              const llvm::StringMap<Value> &keywords);
   Value emitClassInstantiation(const parser::Node &expr, llvm::StringRef name,
                                mlir::Type instanceType);
+  // `super().m(...)` / `super(C, obj).m(...)`: compile-time expansion to the
+  // MRO-next provider's method, inlined with the current receiver. Returns
+  // nullopt when the call is not super-shaped.
+  std::optional<Value> tryEmitSuperCall(const parser::Node &expr,
+                                        const parser::Node *calleeNode);
+  // super().__init__(...) resolving onto a builtin exception base: binds the
+  // runtime exception message of an exception-backed instance.
+  Value emitSuperExceptionInit(const parser::Node &expr, Value receiver,
+                               llvm::StringRef baseContract);
+  // Unknown decorators are rejected (never silently ignored). The role
+  // selects the recognized set; propertyNames lets method checks accept
+  // `<prop>.setter` only for a property declared in the same class body.
+  enum class DecoratorRole { Function, Method, Class };
+  void checkDecorators(const parser::Node &node, DecoratorRole role,
+                       const llvm::StringSet<> *propertyNames = nullptr);
   Value emitUnary(const parser::Node &expr);
   Value emitBinary(const parser::Node &expr);
   Value emitCompare(const parser::Node &expr);
@@ -329,6 +369,30 @@ private:
   llvm::StringMap<llvm::SmallVector<std::string, 8>> classFieldOrders;
   llvm::StringMap<llvm::StringMap<mlir::Type>> classStaticAttrBindings;
   llvm::StringMap<llvm::StringMap<MethodBinding>> classMethodBindings;
+  // Canonical (resolved) base contract names per class, in declaration order.
+  llvm::StringMap<llvm::SmallVector<std::string, 4>> classBaseNames;
+  // C3 linearization per class (self first, canonical contract names).
+  llvm::StringMap<llvm::SmallVector<std::string, 8>> classMros;
+  // Fields declared by the class body itself (classFieldOrders holds the
+  // MRO-merged instance layout).
+  llvm::StringMap<llvm::SmallVector<std::string, 8>> classOwnFieldOrders;
+  // MRO-merged class attribute declaration order and initializer expression
+  // per class (classStaticAttrBindings holds the merged types).
+  llvm::StringMap<llvm::SmallVector<std::string, 8>> classStaticAttrOrders;
+  llvm::StringMap<llvm::StringMap<mlir::Attribute>> classStaticAttrValues;
+  // Dataclass field default expressions (AnnAssign values), per class; MRO
+  // walks reuse a base dataclass's defaults for inherited fields.
+  llvm::StringMap<llvm::StringMap<parser::NodePtr>> classFieldDefaultNodes;
+  // Mutable (slot-backed) class attributes, keyed by the DEFINING class:
+  // attribute -> widened storage type. They live in module-global object
+  // cells named "<class>.<attr>", initialized at the class statement's
+  // position in module flow; subclass reads resolve to the defining class's
+  // cell along the MRO (CPython shares the base's attribute until a write
+  // creates a subclass shadow -- shadow-creating writes are diagnosed).
+  llvm::StringMap<llvm::StringMap<mlir::Type>> classAttrSlots;
+  // Synthesized dataclass method ASTs (__init__/__repr__/__eq__): owned here
+  // because the parse tree does not contain them.
+  std::vector<parser::NodePtr> synthesizedClassMethods;
   // Module-level mutable globals, opted in by an int annotation at module
   // scope (`NAME: int = ...`). Backed by process-lifetime storage so reads
   // are async-signal-safe (see py.global.get/set); referenced from any scope,
@@ -348,6 +412,14 @@ private:
   llvm::SmallVector<WithCleanup, 8> activeWithCleanups;
   llvm::SmallVector<InlineReturnContext, 4> inlineReturnContexts;
   llvm::SmallVector<LoopControlContext, 4> loopControlContexts;
+  // Innermost = the class method body currently being emitted (inline or
+  // standalone); zero-argument super() reads the defining class and the
+  // receiver parameter name from here.
+  struct SuperContext {
+    std::string definingClass;
+    std::string selfName;
+  };
+  llvm::SmallVector<SuperContext, 4> superContexts;
 };
 
 } // namespace lython::emitter

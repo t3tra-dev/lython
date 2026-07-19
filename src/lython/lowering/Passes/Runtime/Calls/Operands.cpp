@@ -176,6 +176,11 @@ mlir::LogicalResult RuntimeBundleLowerer::appendRuntimeSource(
     std::optional<std::int64_t> id =
         manifest.classId(source.instanceContractName());
     if (!id)
+      // Source classes (user exceptions constructed through a builtin
+      // exception initializer) carry compiler-assigned ids.
+      id = RuntimeBundleLowerer::runtimeClassIdForContract(
+          source.instanceContract);
+    if (!id)
       return op->emitError() << "type object has no runtime class id for "
                              << source.instanceContractName();
     mlir::Value value =
@@ -372,7 +377,9 @@ bool RuntimeBundleLowerer::canAppendRuntimeSource(
 
   if (source.kind == RuntimeBundle::Kind::TypeObject &&
       expected.isInteger(64) &&
-      manifest.classId(source.instanceContractName())) {
+      (manifest.classId(source.instanceContractName()) ||
+       RuntimeBundleLowerer::runtimeClassIdForContract(
+           source.instanceContract))) {
     ++inputIndex;
     return true;
   }

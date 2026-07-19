@@ -808,25 +808,69 @@ Value ModuleEmitter::emitMethodObject(const parser::Node &anchor, Value object,
                             llvm::Twine(anchor.range.start.line) + "_" +
                             llvm::Twine(anchor.range.start.column))
                                .str();
+  bool pushedSuperContext = methodBinding.kind == "instance" &&
+                            !methodBinding.definingClass.empty() &&
+                            !methodBinding.bodySignature.positionalNames.empty();
+  if (pushedSuperContext)
+    superContexts.push_back(
+        {methodBinding.definingClass,
+         methodBinding.bodySignature.positionalNames.front()});
   emitCallableFunction(*methodBinding.method, symbolName, boundBodySig,
                        captures, /*isLambda=*/false,
                        /*positionalNodeOffset=*/1, preboundTypeObject);
+  if (pushedSuperContext)
+    superContexts.pop_back();
   return emitFunctionObject(anchor, symbolName, boundPublicSig.publicCallable,
                             captures);
 }
 
 Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
   Value object = emitExpr(ast::node(expr, "value"));
-  mlir::Type result = types.inferExpr(&expr);
   auto attr = ast::string(expr, "attr");
   if (!attr)
     return emitNone(expr);
+  // Property reads inline the getter (before general attribute inference,
+  // which knows nothing about accessor bindings).
+  if (std::optional<MethodBinding> property =
+          lookupClassMethod(object.type, *attr);
+      property && property->kind == "property") {
+    if (mlir::isa<py::TypeType>(object.type)) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, expr.range.start,
+          "accessing a property object through the class is not supported"});
+      return emitNone(expr);
+    }
+    return emitInlineMethodBody(expr, object, /*bindDescriptorReceiver=*/true,
+                                *property, {}, {});
+  }
+  mlir::Type result = types.inferExpr(&expr);
   std::optional<mlir::Type> field = lookupClassField(object.type, *attr);
   if (field)
     result = *field;
 
+  // Mutable class attributes read from the defining class's global cell
+  // (instance receivers too, unless an instance field shadows the name).
+  if (!field) {
+    mlir::Type receiverInstance = object.type;
+    if (auto typeObject =
+            mlir::dyn_cast_if_present<py::TypeType>(receiverInstance))
+      receiverInstance = typeObject.getInstanceType();
+    if (auto contract =
+            mlir::dyn_cast_if_present<py::ContractType>(receiverInstance)) {
+      if (std::optional<std::pair<llvm::StringRef, mlir::Type>> slot =
+              resolveClassAttrSlot(contract.getContractName(), *attr)) {
+        std::string cellName =
+            (llvm::Twine(slot->first) + "." + *attr).str();
+        auto op = py::GlobalGetOp::create(builder, loc(expr), slot->second,
+                                          builder.getStringAttr(cellName));
+        return {op.getResult(), slot->second};
+      }
+    }
+  }
+
+  // An instance field shadows the class attribute of the same name.
   std::optional<mlir::Type> staticAttr =
-      lookupClassStaticAttr(object.type, *attr);
+      field ? std::nullopt : lookupClassStaticAttr(object.type, *attr);
   if (staticAttr)
     result = *staticAttr;
 
