@@ -702,8 +702,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerDelItem(py::DelItemOp op) {
       auto found = llvm::find(updated.mappingKeys, *key);
       builder.setInsertionPoint(op);
       if (found == updated.mappingKeys.end()) {
+        // Raw key: the KeyError __init__ stores repr(message).
         if (mlir::failed(
-                emitRuntimeException(op, "builtins.KeyError", "key not found")))
+                emitRuntimeException(op, "builtins.KeyError", *key)))
           return mlir::failure();
       } else {
         mlir::FailureOr<mlir::Value> length =

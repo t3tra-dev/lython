@@ -282,7 +282,8 @@ RuntimeBundleLowerer::selectEvidenceObjectByMatch(
     mlir::Operation *op, mlir::Value resultValue,
     llvm::ArrayRef<RuntimeValue> candidates, mlir::ValueRange matches,
     llvm::StringRef label, llvm::StringRef missingContract,
-    llvm::StringRef missingMessage, bool raiseOnMiss) {
+    llvm::StringRef missingMessage, bool raiseOnMiss,
+    const RuntimeBundle *missingKeyForRepr) {
   context->loadDialect<mlir::scf::SCFDialect>();
   if (candidates.empty() || candidates.size() != matches.size()) {
     op->emitError() << label << " evidence match/value count mismatch";
@@ -350,6 +351,17 @@ RuntimeBundleLowerer::selectEvidenceObjectByMatch(
       if (needsYields)
         mlir::scf::YieldOp::create(builder, loc, *nested);
     } else if (raiseOnMiss) {
+      // The runtime key itself is the raise message object: KeyError
+      // __init__ stores repr(message) (str(KeyError(x)) == repr(x)), so no
+      // separate __repr__ call is needed on the miss branch.
+      // Why not repr(key) here like every other KeyError site: this miss
+      // branch is CONDITIONAL, and the exception __init__ consumes its
+      // message, so raising from the runtime key (or a retained copy)
+      // unbalances the key's token on the normal path -- the ownership pass
+      // cannot place a single static release for both. Residual CPython
+      // deviation, kept LOUDLY generic until conditional consumes are
+      // modeled.
+      (void)missingKeyForRepr;
       if (mlir::failed(RuntimeBundleLowerer::emitRuntimeException(
               op, missingContract, missingMessage)))
         return mlir::failure();
@@ -680,8 +692,10 @@ RuntimeBundleLowerer::lowerDictEvidenceGetItem(py::GetItemOp op,
         auto guard = mlir::scf::IfOp::create(builder, loc, mlir::TypeRange{},
                                              missing, /*withElseRegion=*/false);
         builder.setInsertionPointToStart(&guard.getThenRegion().front());
+        // Raw key, not its repr: the KeyError __init__ stores repr(message)
+        // (str(KeyError(x)) == repr(x)), so pre-repring would double-quote.
         if (mlir::failed(RuntimeBundleLowerer::emitRuntimeException(
-                op, "builtins.KeyError", "key not found")))
+                op, "builtins.KeyError", *key)))
           return mlir::failure();
         mlir::Block &thenBlock = guard.getThenRegion().front();
         if (thenBlock.empty() ||
@@ -704,7 +718,7 @@ RuntimeBundleLowerer::lowerDictEvidenceGetItem(py::GetItemOp op,
     mlir::FailureOr<RuntimeBundle> selected =
         RuntimeBundleLowerer::selectEvidenceObjectMiss(
             op, op.getResult(), container.mappingValues, "dict __getitem__",
-            "builtins.KeyError", "key not found");
+            "builtins.KeyError", *key);
     if (mlir::failed(selected))
       return mlir::failure();
     if (mlir::failed(bindSelectedEvidenceObjectResult(op, op.getResult(),
@@ -756,7 +770,8 @@ RuntimeBundleLowerer::lowerDictEvidenceGetItem(py::GetItemOp op,
   mlir::FailureOr<RuntimeBundle> selected =
       RuntimeBundleLowerer::selectEvidenceObjectByMatch(
           op, op.getResult(), container.mappingValues, matches,
-          "dict __getitem__", "builtins.KeyError", "key not found");
+          "dict __getitem__", "builtins.KeyError", "key not found",
+          /*raiseOnMiss=*/true, &index);
   if (mlir::failed(selected))
     return mlir::failure();
 

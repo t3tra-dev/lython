@@ -546,7 +546,8 @@ private:
                               mlir::ValueRange matches, llvm::StringRef label,
                               llvm::StringRef missingContract,
                               llvm::StringRef missingMessage,
-                              bool raiseOnMiss = true);
+                              bool raiseOnMiss = true,
+                              const RuntimeBundle *missingKeyForRepr = nullptr);
   // Both take the iterator bundle by value: they bind results into
   // `valueBundles` (a DenseMap) mid-lowering, which invalidates references
   // into the map.
