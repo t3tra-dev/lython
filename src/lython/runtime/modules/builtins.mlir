@@ -132,7 +132,8 @@ module attributes {
                     "__invert__", "__round__", "__int__", "__float__",
                     "__bool__", "__index__", "__hash__", "__lt__", "__le__",
                     "__gt__", "__ge__", "__repr__", "__str__", "__eq__", "__ne__",
-                    "__pow__", "__abs__", "__format__"],
+                    "__pow__", "__abs__", "__format__",
+                    "__lt__", "__le__", "__gt__", "__ge__", "__eq__", "__ne__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.int">>, !py.union<!py.contract<"typing.SupportsInt">, !py.contract<"typing.SupportsIndex">, !py.contract<"builtins.str">, !py.contract<"builtins.bytes">, !py.contract<"builtins.bytearray">>] -> [!py.self]>,
       !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>,
@@ -165,7 +166,13 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.object">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.float">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.float">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.float">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.float">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.float">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.float">] -> [!py.contract<"builtins.bool">]>
     ],
     method_kinds = ["classmethod", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
@@ -174,7 +181,9 @@ module attributes {
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance",
-                    "instance", "instance", "instance"]
+                    "instance", "instance", "instance",
+                    "instance", "instance", "instance", "instance",
+                    "instance", "instance"]
   } {}
 
   py.class @bool attributes {
@@ -202,7 +211,8 @@ module attributes {
                     "__truediv__", "__floordiv__", "__mod__", "__float__",
                     "__bool__", "__round__", "__lt__", "__le__", "__gt__",
                     "__ge__", "__str__", "__eq__", "__ne__", "__pow__",
-                    "__hash__", "__abs__", "__format__"],
+                    "__hash__", "__abs__", "__format__",
+                    "__lt__", "__le__", "__gt__", "__ge__", "__eq__", "__ne__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.float">>, !py.contract<"typing.SupportsFloat">] -> [!py.self]>,
       !py.protocol<"Callable", [!py.contract<"builtins.float">] -> [!py.contract<"builtins.str">]>,
@@ -225,13 +235,21 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.float">, !py.contract<"builtins.float">] -> [!py.contract<"builtins.float">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.float">] -> [!py.contract<"builtins.int">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.float">] -> [!py.contract<"builtins.float">]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.float">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.float">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.float">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.float">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.float">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.float">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.float">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.float">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.bool">]>
     ],
     method_kinds = ["classmethod", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance", "instance",
-                    "instance", "instance", "instance", "instance"]
+                    "instance", "instance", "instance", "instance",
+                    "instance", "instance", "instance", "instance",
+                    "instance", "instance"]
   } {}
 
   py.class @complex attributes {
@@ -7191,6 +7209,224 @@ module attributes {
     func.return %result : i1
   }
 
+
+  // Exact int-vs-double ordering (CPython float_richcompare): -1/0/1 when
+  // the int orders below/equal/above the double, 2 for unordered (NaN).
+  // Converting the int to double first would collapse a 1-ulp neighborhood
+  // (2**53 + 1 == 2.0**53 under that scheme), so the comparison stays in
+  // integer space: an i64-ranged int splits the double into trunc + fraction
+  // (both exact below 2**63); a wider int against |d| < 2**63 is decided by
+  // sign alone; and |d| >= 2**63 is integer-valued, so it converts EXACTLY
+  // through the int(float) mantissa-shift path and compares digit-wise.
+  func.func private @__ly_long_cmp_f64(%meta_raw: memref<2xi64>, %digits_raw: memref<?xi32>, %d: f64) -> i64 {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %neg_one = arith.constant -1 : i64
+    %two = arith.constant 2 : i64
+    %meta, %digits = func.call @__ly_long_operand_view(%meta_raw, %digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
+    %is_nan = arith.cmpf uno, %d, %d : f64
+    cf.cond_br %is_nan, ^unordered, ^check_inf
+
+  ^unordered:
+    func.return %two : i64
+
+  ^check_inf:
+    %bits = arith.bitcast %d : f64 to i64
+    %exp_shift = arith.constant 52 : i64
+    %exp_mask = arith.constant 2047 : i64
+    %exp_raw_shifted = arith.shrui %bits, %exp_shift : i64
+    %exp_raw = arith.andi %exp_raw_shifted, %exp_mask : i64
+    %is_inf = arith.cmpi eq, %exp_raw, %exp_mask : i64
+    cf.cond_br %is_inf, ^infinity, ^classify
+
+  ^infinity:
+    %d_negative = arith.cmpi slt, %bits, %zero : i64
+    %inf_cmp = arith.select %d_negative, %one, %neg_one : i1, i64
+    func.return %inf_cmp : i64
+
+  ^classify:
+    %upper = arith.constant 9.2233720368547758E+18 : f64
+    %lower = arith.constant -9.2233720368547758E+18 : f64
+    %fits = func.call @__ly_long_view_fits_i64(%meta, %digits) : (memref<2xi64>, memref<?xi32>) -> i1
+    cf.cond_br %fits, ^small, ^big
+
+  ^small:
+    %v = func.call @__ly_long_view_as_i64(%meta, %digits) : (memref<2xi64>, memref<?xi32>) -> i64
+    %d_ge_upper = arith.cmpf oge, %d, %upper : f64
+    cf.cond_br %d_ge_upper, ^small_below, ^small_check_lower
+
+  ^small_below:
+    func.return %neg_one : i64
+
+  ^small_check_lower:
+    %d_lt_lower = arith.cmpf olt, %d, %lower : f64
+    cf.cond_br %d_lt_lower, ^small_above, ^small_check_min
+
+  ^small_above:
+    func.return %one : i64
+
+  ^small_check_min:
+    // d == -2**63 exactly: fptosi would overflow, but the answer is direct.
+    %d_eq_lower = arith.cmpf oeq, %d, %lower : f64
+    cf.cond_br %d_eq_lower, ^small_min, ^small_split
+
+  ^small_min:
+    %int64_min = arith.constant -9223372036854775808 : i64
+    %v_is_min = arith.cmpi eq, %v, %int64_min : i64
+    %min_cmp = arith.select %v_is_min, %zero, %one : i1, i64
+    func.return %min_cmp : i64
+
+  ^small_split:
+    // |d| < 2**63: trunc and fraction are both exact doubles (any double of
+    // magnitude >= 2**52 is already an integer; below that trunc fits the
+    // mantissa).
+    %w = arith.fptosi %d : f64 to i64
+    %v_lt_w = arith.cmpi slt, %v, %w : i64
+    %v_gt_w = arith.cmpi sgt, %v, %w : i64
+    %wf = arith.sitofp %w : i64 to f64
+    %frac = arith.subf %d, %wf : f64
+    %fzero = arith.constant 0.0 : f64
+    %frac_pos = arith.cmpf ogt, %frac, %fzero : f64
+    %frac_neg = arith.cmpf olt, %frac, %fzero : f64
+    %tie = arith.select %frac_pos, %neg_one, %zero : i1, i64
+    %tie2 = arith.select %frac_neg, %one, %tie : i1, i64
+    %after_gt = arith.select %v_gt_w, %one, %tie2 : i1, i64
+    %small_cmp = arith.select %v_lt_w, %neg_one, %after_gt : i1, i64
+    func.return %small_cmp : i64
+
+  ^big:
+    // |v| >= 2**63 here, so any |d| < 2**63 (including d == -2**63 exactly,
+    // which a NEGATIVE v is strictly below) is decided by v's sign.
+    %sign_slot = arith.constant 0 : index
+    %v_sign = memref.load %meta[%sign_slot] : memref<2xi64>
+    %v_negative = arith.cmpi slt, %v_sign, %zero : i64
+    %d_lt_upper = arith.cmpf olt, %d, %upper : f64
+    %d_ge_lower = arith.cmpf oge, %d, %lower : f64
+    %d_small = arith.andi %d_lt_upper, %d_ge_lower : i1
+    cf.cond_br %d_small, ^big_sign, ^big_both
+
+  ^big_sign:
+    %sign_cmp = arith.select %v_negative, %neg_one, %one : i1, i64
+    func.return %sign_cmp : i64
+
+  ^big_both:
+    // |d| >= 2**63 is integer-valued: int(d) is exact, compare digit-wise.
+    %fh, %fp = func.call @LyFloat_FromF64(%d) : (f64) -> (memref<2xi64>, memref<1xf64>)
+    %th, %tm, %td = func.call @LyFloat_Int(%fh, %fp) : (memref<2xi64>, memref<1xf64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    %t_sign = memref.load %tm[%sign_slot] : memref<2xi64>
+    %sign_gt = arith.cmpi sgt, %v_sign, %t_sign : i64
+    %sign_lt = arith.cmpi slt, %v_sign, %t_sign : i64
+    %abs_cmp = func.call @__ly_long_abs_compare(%meta, %digits, %tm, %td) : (memref<2xi64>, memref<?xi32>, memref<2xi64>, memref<?xi32>) -> i64
+    %neg_abs = arith.muli %abs_cmp, %neg_one : i64
+    %signed_abs = arith.select %v_negative, %neg_abs, %abs_cmp : i1, i64
+    %after_sgt = arith.select %sign_gt, %one, %signed_abs : i1, i64
+    %big_cmp = arith.select %sign_lt, %neg_one, %after_sgt : i1, i64
+    func.call @LyFloat_DecRef(%fh) : (memref<2xi64>) -> ()
+    func.call @LyLong_DecRef(%th) : (memref<2xi64>) -> ()
+    func.return %big_cmp : i64
+  }
+
+  func.func @LyLong_LtF64Bool(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_payload: memref<1xf64>) -> i1 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__lt__"} {
+    %d = func.call @LyFloat_AsF64(%rhs_header, %rhs_payload) : (memref<2xi64>, memref<1xf64>) -> f64
+    %cmp = func.call @__ly_long_cmp_f64(%lhs_meta, %lhs_digits, %d) : (memref<2xi64>, memref<?xi32>, f64) -> i64
+    %neg_one = arith.constant -1 : i64
+    %result = arith.cmpi eq, %cmp, %neg_one : i64
+    func.return %result : i1
+  }
+
+  func.func @LyLong_LeF64Bool(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_payload: memref<1xf64>) -> i1 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__le__"} {
+    %d = func.call @LyFloat_AsF64(%rhs_header, %rhs_payload) : (memref<2xi64>, memref<1xf64>) -> f64
+    %cmp = func.call @__ly_long_cmp_f64(%lhs_meta, %lhs_digits, %d) : (memref<2xi64>, memref<?xi32>, f64) -> i64
+    %zero = arith.constant 0 : i64
+    %result = arith.cmpi sle, %cmp, %zero : i64
+    func.return %result : i1
+  }
+
+  func.func @LyLong_GtF64Bool(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_payload: memref<1xf64>) -> i1 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__gt__"} {
+    %d = func.call @LyFloat_AsF64(%rhs_header, %rhs_payload) : (memref<2xi64>, memref<1xf64>) -> f64
+    %cmp = func.call @__ly_long_cmp_f64(%lhs_meta, %lhs_digits, %d) : (memref<2xi64>, memref<?xi32>, f64) -> i64
+    %one = arith.constant 1 : i64
+    %result = arith.cmpi eq, %cmp, %one : i64
+    func.return %result : i1
+  }
+
+  func.func @LyLong_GeF64Bool(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_payload: memref<1xf64>) -> i1 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__ge__"} {
+    %d = func.call @LyFloat_AsF64(%rhs_header, %rhs_payload) : (memref<2xi64>, memref<1xf64>) -> f64
+    %cmp = func.call @__ly_long_cmp_f64(%lhs_meta, %lhs_digits, %d) : (memref<2xi64>, memref<?xi32>, f64) -> i64
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %is_ge = arith.cmpi sge, %cmp, %zero : i64
+    %is_ordered = arith.cmpi sle, %cmp, %one : i64
+    %result = arith.andi %is_ge, %is_ordered : i1
+    func.return %result : i1
+  }
+
+  func.func @LyLong_EqF64Bool(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_payload: memref<1xf64>) -> i1 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__eq__"} {
+    %d = func.call @LyFloat_AsF64(%rhs_header, %rhs_payload) : (memref<2xi64>, memref<1xf64>) -> f64
+    %cmp = func.call @__ly_long_cmp_f64(%lhs_meta, %lhs_digits, %d) : (memref<2xi64>, memref<?xi32>, f64) -> i64
+    %zero = arith.constant 0 : i64
+    %result = arith.cmpi eq, %cmp, %zero : i64
+    func.return %result : i1
+  }
+
+  func.func @LyLong_NeF64Bool(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_payload: memref<1xf64>) -> i1 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__ne__"} {
+    %d = func.call @LyFloat_AsF64(%rhs_header, %rhs_payload) : (memref<2xi64>, memref<1xf64>) -> f64
+    %cmp = func.call @__ly_long_cmp_f64(%lhs_meta, %lhs_digits, %d) : (memref<2xi64>, memref<?xi32>, f64) -> i64
+    %zero = arith.constant 0 : i64
+    %result = arith.cmpi ne, %cmp, %zero : i64
+    func.return %result : i1
+  }
+
+  func.func @LyFloat_LtLongBool(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_payload: memref<1xf64>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> i1 attributes {ly.runtime.contract = "builtins.float", ly.runtime.method = "__lt__"} {
+    %d = func.call @LyFloat_AsF64(%lhs_header, %lhs_payload) : (memref<2xi64>, memref<1xf64>) -> f64
+    %cmp = func.call @__ly_long_cmp_f64(%rhs_meta, %rhs_digits, %d) : (memref<2xi64>, memref<?xi32>, f64) -> i64
+    %one = arith.constant 1 : i64
+    %result = arith.cmpi eq, %cmp, %one : i64
+    func.return %result : i1
+  }
+
+  func.func @LyFloat_LeLongBool(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_payload: memref<1xf64>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> i1 attributes {ly.runtime.contract = "builtins.float", ly.runtime.method = "__le__"} {
+    %d = func.call @LyFloat_AsF64(%lhs_header, %lhs_payload) : (memref<2xi64>, memref<1xf64>) -> f64
+    %cmp = func.call @__ly_long_cmp_f64(%rhs_meta, %rhs_digits, %d) : (memref<2xi64>, memref<?xi32>, f64) -> i64
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %is_ge = arith.cmpi sge, %cmp, %zero : i64
+    %is_ordered = arith.cmpi sle, %cmp, %one : i64
+    %result = arith.andi %is_ge, %is_ordered : i1
+    func.return %result : i1
+  }
+
+  func.func @LyFloat_GtLongBool(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_payload: memref<1xf64>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> i1 attributes {ly.runtime.contract = "builtins.float", ly.runtime.method = "__gt__"} {
+    %d = func.call @LyFloat_AsF64(%lhs_header, %lhs_payload) : (memref<2xi64>, memref<1xf64>) -> f64
+    %cmp = func.call @__ly_long_cmp_f64(%rhs_meta, %rhs_digits, %d) : (memref<2xi64>, memref<?xi32>, f64) -> i64
+    %neg_one = arith.constant -1 : i64
+    %result = arith.cmpi eq, %cmp, %neg_one : i64
+    func.return %result : i1
+  }
+
+  func.func @LyFloat_GeLongBool(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_payload: memref<1xf64>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> i1 attributes {ly.runtime.contract = "builtins.float", ly.runtime.method = "__ge__"} {
+    %d = func.call @LyFloat_AsF64(%lhs_header, %lhs_payload) : (memref<2xi64>, memref<1xf64>) -> f64
+    %cmp = func.call @__ly_long_cmp_f64(%rhs_meta, %rhs_digits, %d) : (memref<2xi64>, memref<?xi32>, f64) -> i64
+    %zero = arith.constant 0 : i64
+    %result = arith.cmpi sle, %cmp, %zero : i64
+    func.return %result : i1
+  }
+
+  func.func @LyFloat_EqLongBool(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_payload: memref<1xf64>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> i1 attributes {ly.runtime.contract = "builtins.float", ly.runtime.method = "__eq__"} {
+    %d = func.call @LyFloat_AsF64(%lhs_header, %lhs_payload) : (memref<2xi64>, memref<1xf64>) -> f64
+    %cmp = func.call @__ly_long_cmp_f64(%rhs_meta, %rhs_digits, %d) : (memref<2xi64>, memref<?xi32>, f64) -> i64
+    %zero = arith.constant 0 : i64
+    %result = arith.cmpi eq, %cmp, %zero : i64
+    func.return %result : i1
+  }
+
+  func.func @LyFloat_NeLongBool(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_payload: memref<1xf64>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> i1 attributes {ly.runtime.contract = "builtins.float", ly.runtime.method = "__ne__"} {
+    %d = func.call @LyFloat_AsF64(%lhs_header, %lhs_payload) : (memref<2xi64>, memref<1xf64>) -> f64
+    %cmp = func.call @__ly_long_cmp_f64(%rhs_meta, %rhs_digits, %d) : (memref<2xi64>, memref<?xi32>, f64) -> i64
+    %zero = arith.constant 0 : i64
+    %result = arith.cmpi ne, %cmp, %zero : i64
+    func.return %result : i1
+  }
 
   // str(int) == repr(int) in CPython; delegate.
   func.func @LyLong_Str(%header: memref<2xi64> {ly.ownership.object_header}, %meta_raw: memref<2xi64>, %digits_raw: memref<?xi32>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__str__", ly.runtime.result_contract = "builtins.str"} {
