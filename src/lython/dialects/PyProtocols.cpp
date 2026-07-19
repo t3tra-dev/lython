@@ -725,8 +725,26 @@ const Table &Table::get(mlir::MLIRContext &context) {
                          << entry.name << "'\n";
             continue;
           }
-          slot->freeFunctionContracts[name.getValue().str()] =
-              contract.getValue();
+          // A name declared more than once is an overload set; the
+          // candidates merge into one OverloadType so every binding site
+          // keeps its 1-name=1-type shape and call inference ranks the
+          // candidates (last-wins would silently drop signatures).
+          auto [existing, inserted] = slot->freeFunctionContracts.try_emplace(
+              name.getValue().str(), contract.getValue());
+          if (!inserted) {
+            llvm::SmallVector<mlir::Type, 4> candidates;
+            if (auto overload =
+                    mlir::dyn_cast<py::OverloadType>(existing->second))
+              candidates.append(overload.getCandidateTypes().begin(),
+                                overload.getCandidateTypes().end());
+            else
+              candidates.push_back(existing->second);
+            if (!llvm::is_contained(candidates, contract.getValue()))
+              candidates.push_back(contract.getValue());
+            existing->second =
+                py::OverloadType::get(contract.getValue().getContext(),
+                                      candidates);
+          }
         }
       }
     }

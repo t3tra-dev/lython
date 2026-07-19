@@ -38,13 +38,19 @@ module attributes {
   // Manifest Callable contracts for builtin free functions. These are the
   // single trusted source for these signatures; the emitter's seedBuiltins
   // reads them here instead of constructing the contracts in C++.
-  ly.typing.function_names = ["builtins.print", "builtins.len", "builtins.hash", "builtins.sorted", "builtins.abs", "builtins.divmod", "builtins.pow", "builtins.ord", "builtins.chr", "builtins.hex", "builtins.oct", "builtins.bin"],
+  // "builtins.abs" appears once per overload: duplicate names merge into an
+  // overload set on the table side (CPython abs is int->int / float->float /
+  // complex->float, which one generic T->T contract cannot express -- the
+  // complex result is a float).
+  ly.typing.function_names = ["builtins.print", "builtins.len", "builtins.hash", "builtins.sorted", "builtins.abs", "builtins.abs", "builtins.abs", "builtins.divmod", "builtins.pow", "builtins.ord", "builtins.chr", "builtins.hex", "builtins.oct", "builtins.bin"],
   ly.typing.function_contracts = [
     !py.callable<[], vararg = !py.contract<"builtins.tuple", [!py.contract<"builtins.object">]>, returns = [!py.literal<None>]>,
     !py.callable<[!py.contract<"builtins.object">], returns = [!py.contract<"builtins.int">]>,
     !py.callable<[!py.contract<"builtins.object">], returns = [!py.contract<"builtins.int">]>,
     !py.callable<[!py.protocol<"Iterable", [!py.typevar<"T">]>], returns = [!py.contract<"builtins.list", [!py.typevar<"T">]>]>,
-    !py.callable<[!py.typevar<"T">], returns = [!py.typevar<"T">]>,
+    !py.callable<[!py.contract<"builtins.int">], returns = [!py.contract<"builtins.int">]>,
+    !py.callable<[!py.contract<"builtins.float">], returns = [!py.contract<"builtins.float">]>,
+    !py.callable<[!py.contract<"builtins.complex">], returns = [!py.contract<"builtins.float">]>,
     !py.callable<[!py.contract<"builtins.int">, !py.contract<"builtins.int">], returns = [!py.contract<"builtins.tuple", [!py.contract<"builtins.int">, !py.contract<"builtins.int">]>]>,
     !py.callable<[!py.contract<"builtins.int">, !py.contract<"builtins.int">, !py.contract<"builtins.int">], returns = [!py.contract<"builtins.int">]>,
     !py.callable<[!py.contract<"builtins.str">], returns = [!py.contract<"builtins.int">]>,

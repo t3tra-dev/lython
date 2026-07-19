@@ -212,6 +212,8 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     return *v;
   if (std::optional<Value> v = tryEmitRoundCall(expr, calleeNode))
     return *v;
+  if (std::optional<Value> v = tryEmitHashCall(expr, calleeNode))
+    return *v;
 
   if (std::optional<Value> primitiveCall =
           emitDirectPrimitiveFunctionCall(expr, calleeNode))
@@ -1254,6 +1256,34 @@ ModuleEmitter::tryEmitNextCall(const parser::Node &expr,
                          posPack.value, namePack.value, valuePack.value);
   op->setAttr("ly.bound_method", builder.getStringAttr("__next__"));
   return Value{op.getResults().front(), resultType};
+}
+
+std::optional<Value>
+ModuleEmitter::tryEmitHashCall(const parser::Node &expr,
+                               const parser::Node *calleeNode) {
+  if (!calleeNode || calleeNode->kind != "Name" ||
+      ast::nameSpelling(*calleeNode) != "hash")
+    return std::nullopt;
+  // A local binding named `hash` shadows the builtin.
+  if (values.find("hash") != values.end())
+    return std::nullopt;
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  if (!args || args->size() != 1 || (keywords && !keywords->empty()))
+    return std::nullopt;
+  // The builtin's manifest __hash__ dispatch only sees manifest classes, so
+  // a source class's own __hash__ dispatches inline here. The argument type
+  // is probed without emitting: declining must leave no side effects for
+  // the generic path to re-emit.
+  mlir::Type argType = types.inferExpr(args->front().get());
+  if (!lookupClassMethod(argType, "__hash__"))
+    return std::nullopt;
+  Value input = emitExpr(args->front().get());
+  std::optional<MethodBinding> method =
+      lookupClassMethod(input.type, "__hash__");
+  if (!method)
+    return std::nullopt;
+  return emitInlineOperatorCall(expr, input, *method, {});
 }
 
 std::optional<Value>

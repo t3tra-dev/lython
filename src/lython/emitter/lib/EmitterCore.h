@@ -219,6 +219,8 @@ private:
                                        const parser::Node *calleeNode);
   std::optional<Value> tryEmitRoundCall(const parser::Node &expr,
                                         const parser::Node *calleeNode);
+  std::optional<Value> tryEmitHashCall(const parser::Node &expr,
+                                       const parser::Node *calleeNode);
   std::optional<Value> tryEmitReprCall(const parser::Node &expr,
                                        const parser::Node *calleeNode);
   std::optional<Value> tryEmitFormatCall(const parser::Node &expr,
