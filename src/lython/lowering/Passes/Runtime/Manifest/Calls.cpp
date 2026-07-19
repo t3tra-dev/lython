@@ -717,20 +717,30 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
     mlir::Type exceptionBase =
         runtimeContractType(context, "builtins.Exception");
     bool allMembersAreExceptions = true;
+    // Source exception classes do not resolve against builtin contracts
+    // through py::isAssignableTo; their builtin taxonomy ancestor carries
+    // the derivation instead.
+    auto derivesFrom = [&](mlir::Type memberContract, mlir::Type base) {
+      if (py::isAssignableTo(memberContract, base, op))
+        return true;
+      std::optional<std::string> ancestor =
+          RuntimeBundleLowerer::exceptionAncestorContractFor(memberContract);
+      return ancestor &&
+             py::isAssignableTo(runtimeContractType(context, *ancestor), base,
+                                op);
+    };
     for (auto [memberIndex, member] : llvm::enumerate(groupMembers)) {
       bool exceptionShaped =
           member.values.size() == 3 &&
           (manifest.classId(runtimeContractName(member.contract)) ||
            RuntimeBundleLowerer::exceptionAncestorContractFor(member.contract));
-      if (!exceptionShaped || !py::isAssignableTo(member.contract,
-                                                  requiredBase, op))
+      if (!exceptionShaped || !derivesFrom(member.contract, requiredBase))
         return op.emitError()
                << initContract << " member " << memberIndex << " has type "
                << member.contract << ", which is not derived from "
                << requiredBase;
-      allMembersAreExceptions =
-          allMembersAreExceptions &&
-          py::isAssignableTo(member.contract, exceptionBase, op);
+      allMembersAreExceptions = allMembersAreExceptions &&
+                                derivesFrom(member.contract, exceptionBase);
     }
 
     std::optional<EmittedRuntimeCall> messageInit;
