@@ -1,0 +1,10 @@
+'h\xe9llo'
+1 0
+True False False True False True False
+True False True
+True
+'plain'
+'\u65e5\u672c\u8a9e'
+True False
+1
+prompt: EOFError: EOF when reading a line

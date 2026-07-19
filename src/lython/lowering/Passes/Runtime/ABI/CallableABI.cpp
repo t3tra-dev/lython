@@ -577,8 +577,35 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
       llvm::SmallVector<mlir::Type, 8> inputTypes;
       llvm::SmallVector<std::int64_t, 8> generatorTransferArgs;
       llvm::SmallVector<mlir::Attribute, 8> generatorResumeArgLanes;
+      llvm::SmallVector<mlir::Attribute, 8> generatorBorrowedArgLanes;
       for (auto [inputIndex, logicalType] :
            llvm::enumerate(logicalInputTypes)) {
+        // Generator ARGUMENT lanes (indices below argumentCount) with an
+        // object contract are borrows: the generator object retained them at
+        // creation (released by its drop finalizer), so the resume drivers
+        // re-pass the span each call against that frame-held reference —
+        // no ownership crosses here (rfc/memory-safety-proof.md: a borrow
+        // against a frame-owned rho, not an Own introduction).
+        if (generatorArgInfo && inputIndex < generatorArgInfo->argumentCount &&
+            inputIndex < generatorArgInfo->argumentLanes.size() &&
+            !generatorArgInfo->argumentLanes[inputIndex].isInt &&
+            !generatorArgInfo->argumentLanes[inputIndex].isControl()) {
+          const GeneratorResumeLane &lane =
+              generatorArgInfo->argumentLanes[inputIndex];
+          llvm::SmallVector<mlir::Type, 6> laneTypes =
+              RuntimeBundleLowerer::generatorArgumentPhysicalTypes(lane);
+          std::int64_t begin = static_cast<std::int64_t>(inputTypes.size());
+          generatorBorrowedArgLanes.push_back(builder.getDictionaryAttr({
+              builder.getNamedAttr("contract",
+                                   builder.getStringAttr(lane.contract)),
+              builder.getNamedAttr("begin", builder.getI64IntegerAttr(begin)),
+              builder.getNamedAttr(
+                  "size", builder.getI64IntegerAttr(
+                              static_cast<std::int64_t>(laneTypes.size()))),
+          }));
+          inputTypes.append(laneTypes.begin(), laneTypes.end());
+          continue;
+        }
         // Generator frame lanes carry their object-family span; the frame's
         // token transfers INTO the clone (ly.ownership.transfer_args), which
         // the continuation claims re-root as tracked resources.
@@ -623,6 +650,9 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
       if (!generatorResumeArgLanes.empty())
         function->setAttr("ly.generator.resume_args",
                           builder.getArrayAttr(generatorResumeArgLanes));
+      if (!generatorBorrowedArgLanes.empty())
+        function->setAttr("ly.generator.borrowed_args",
+                          builder.getArrayAttr(generatorBorrowedArgLanes));
       llvm::SmallVector<std::int64_t, 8> generatorHeaderArgs =
           generatorTransferArgs;
       // Generator resume clones widen the yielded-value result lane to an

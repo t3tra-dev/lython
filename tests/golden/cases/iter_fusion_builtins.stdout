@@ -1,0 +1,56 @@
+0 a
+1 b
+2 c
+5 10
+6 20
+2 7
+3 8
+(0, 'x')
+(1, 'y')
+0 a
+1 b
+2 c
+1 p
+2 q
+3 r
+x 1
+y 2
+0 1 a
+1 2 b
+double 1
+2
+double 2
+4
+double 3
+6
+double 4
+8
+101
+102
+103
+104
+k 2
+l 4
+pred 1
+pred 2
+2
+pred 3
+pred 4
+4
+hey
+yo
+r
+q
+p
+b
+a
+1
+2
+3
+4
+12
+0
+0
+1
+2
+exhausted

@@ -8,6 +8,7 @@ add_library(LythonEmitter STATIC
     lib/EmitterExpressions.cpp
     lib/EmitterFunctions.cpp
     lib/EmitterImports.cpp
+    lib/EmitterIterators.cpp
     lib/EmitterLoops.cpp
     lib/EmitterMatch.cpp
     lib/EmitterPrimitive.cpp

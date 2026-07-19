@@ -223,20 +223,54 @@ mlir::LogicalResult RuntimeBundleLowerer::emitGeneratorFunctionTargetCallResult(
     result.generatorSourceBundles.push_back(std::move(sourceEvidence));
   }
 
-  // State-machine targets: persist the argument evidence pairs into the
-  // storage words (after the header) so the drop finalizer can resume the
-  // body for its close semantics without any call-site evidence.
+  // State-machine targets: persist the arguments into the storage words
+  // (after the header) so the drop finalizer can resume the body for its
+  // close semantics without any call-site evidence. Int arguments store
+  // their (raw, valid) evidence pair; object arguments are RETAINED into
+  // the frame (the generator owns one reference for as long as it lives —
+  // resume sites borrow against it) and their span words stored.
   auto resumeInfo = generatorResumeClones.find(target.getSymName());
   if (resumeInfo != generatorResumeClones.end() &&
       !result.physicalValues().empty()) {
+    GeneratorResumeInfo &info = resumeInfo->second;
     mlir::Location loc = op->getLoc();
     mlir::Value storage = result.physicalValues().front();
     mlir::Value zero64 =
         mlir::arith::ConstantIntOp::create(builder, loc, 0, 64).getResult();
+    llvm::SmallVector<unsigned, 8> argumentWordOffsets =
+        RuntimeBundleLowerer::generatorArgumentWordOffsets(info);
     for (auto [index, source] :
          llvm::enumerate(result.generatorSourceBundles)) {
-      if (index >= resumeInfo->second.argumentCount)
+      if (index >= info.argumentCount)
         break;
+      unsigned base = index < argumentWordOffsets.size()
+                          ? argumentWordOffsets[index]
+                          : 8 + 2 * static_cast<unsigned>(index);
+      const GeneratorResumeLane *lane = index < info.argumentLanes.size()
+                                            ? &info.argumentLanes[index]
+                                            : nullptr;
+      if (lane && !lane->isInt && !lane->isControl()) {
+        if (!source || source->physicalValues().size() != lane->physicalCount)
+          return op->emitError()
+                 << "generator argument " << index << " (" << lane->contract
+                 << ") has no matching physical span to persist";
+        if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
+                op, *source, "generator argument")))
+          return mlir::failure();
+        mlir::FailureOr<mlir::func::FuncOp> store =
+            RuntimeBundleLowerer::getOrCreateGeneratorFrameStoreFunction(
+                op, *lane);
+        if (mlir::failed(store))
+          return mlir::failure();
+        llvm::SmallVector<mlir::Value, 10> storeOperands{
+            storage,
+            mlir::arith::ConstantIntOp::create(builder, loc, base, 64)
+                .getResult()};
+        storeOperands.append(source->physicalValues().begin(),
+                             source->physicalValues().end());
+        mlir::func::CallOp::create(builder, loc, *store, storeOperands);
+        continue;
+      }
       mlir::Value raw = zero64;
       mlir::Value valid = zero64;
       if (source && source->primitiveI64) {
@@ -246,7 +280,6 @@ mlir::LogicalResult RuntimeBundleLowerer::emitGeneratorFunctionTargetCallResult(
                                              source->primitiveI64->valid)
                     .getResult();
       }
-      unsigned base = 8 + 2 * static_cast<unsigned>(index);
       mlir::memref::StoreOp::create(
           builder, loc, raw, storage,
           mlir::arith::ConstantIndexOp::create(builder, loc, base)
@@ -426,17 +459,45 @@ RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(
     llvm::SmallVector<mlir::Value, 8> operands;
     unsigned inputIndex = 0;
     for (auto [sourceIndex, source] : llvm::enumerate(sources)) {
-      if (!RuntimeBundleLowerer::hasPrimitiveI64Evidence(source))
+      mlir::Value evidenceValue;
+      mlir::Value evidenceValid;
+      if (RuntimeBundleLowerer::hasPrimitiveI64Evidence(source)) {
+        evidenceValue = source->primitiveI64->value;
+        evidenceValid = source->primitiveI64->valid;
+      } else if (source && source->contractName() == "builtins.int" &&
+                 !source->physicalValues().empty()) {
+        // Boxed-only int (a runtime container element, e.g. map(f, xs)
+        // applying f inside a synthesized generator): recover the evidence
+        // pair through the manifest unbox — it raises on ints outside the
+        // i64 lane, which is the same loud boundary every primitive-clone
+        // caller has.
+        std::optional<RuntimeSymbol> unbox =
+            manifest.primitive("builtins.int", "unbox.i64");
+        if (!unbox || unbox->function.getNumArguments() !=
+                          source->physicalValues().size())
+          return op.emitError()
+                 << "primitive i64 callable clone '" << targetName
+                 << "' argument " << sourceIndex
+                 << " is a boxed int with no matching unbox.i64 primitive";
+        builder.setInsertionPoint(op);
+        mlir::func::CallOp unboxed = RuntimeBundleLowerer::createRuntimeCall(
+            op.getLoc(), *unbox, source->physicalValues());
+        evidenceValue = unboxed.getResult(0);
+        evidenceValid =
+            mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 1, 1)
+                .getResult();
+      } else {
         return op.emitError() << "primitive i64 callable clone '" << targetName
                               << "' argument " << sourceIndex
                               << " has no primitive i64 evidence";
+      }
       if (inputIndex + 2 > functionType.getNumInputs() ||
           !functionType.getInput(inputIndex).isInteger(64) ||
           !functionType.getInput(inputIndex + 1).isInteger(1))
         return op.emitError() << "primitive i64 callable clone '" << targetName
                               << "' has malformed ABI at input " << inputIndex;
-      operands.push_back(source->primitiveI64->value);
-      operands.push_back(source->primitiveI64->valid);
+      operands.push_back(evidenceValue);
+      operands.push_back(evidenceValid);
       inputIndex += 2;
     }
     if (inputIndex != functionType.getNumInputs())

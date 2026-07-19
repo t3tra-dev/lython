@@ -101,9 +101,51 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCall(py::CallOp op) {
       RuntimeBundleLowerer::bundleFor(op.getCallable());
   if (!callable)
     return op.emitError() << "callable has no lowered runtime bundle";
-  if (auto method = op->getAttrOfType<mlir::StringAttr>("ly.bound_method"))
+  if (auto method = op->getAttrOfType<mlir::StringAttr>("ly.bound_method")) {
+    // Evidence-backed dict receivers demote to runtime-mode before a
+    // mutating method that has no evidence-tier lowering: the
+    // manifest/runtime paths mutate the (always-synced) physical payload,
+    // and keeping the stale compile-time evidence would silently
+    // mis-execute every later evidence-tier read (`d.clear(); d["x"]` used
+    // to answer 5 from the dead evidence). Read-only methods (get/copy)
+    // keep their evidence.
+    llvm::StringRef methodName = method.getValue();
+    if (callable->kind == RuntimeBundle::Kind::Object &&
+        callable->contractName() == "builtins.dict" &&
+        callable->physicalValues().size() >= 5 &&
+        (callable->mappingEvidenceBacked || !callable->mappingKeys.empty()) &&
+        (methodName == "pop" || methodName == "update" ||
+         methodName == "clear" || methodName == "popitem" ||
+         methodName == "setdefault")) {
+      RuntimeBundle demoted = *callable;
+      demoted.mappingEvidenceBacked = false;
+      demoted.mappingKeys.clear();
+      demoted.mappingKeyBundles.clear();
+      demoted.mappingValues.clear();
+      demoted.mappingValueBundles.clear();
+      demoted.mappingPresent.clear();
+      valueBundles[op.getCallable()] = std::move(demoted);
+      callable = RuntimeBundleLowerer::bundleFor(op.getCallable());
+    }
+    // Same rule for evidence-backed lists meeting a mutator with no
+    // evidence tier: the payload is authoritative after the mutation.
+    if (callable->kind == RuntimeBundle::Kind::Object &&
+        callable->contractName() == "builtins.list" &&
+        callable->physicalValues().size() >= 3 &&
+        (callable->sequenceEvidenceBacked ||
+         !callable->sequenceElements.empty()) &&
+        (methodName == "extend" || methodName == "clear")) {
+      RuntimeBundle demoted = *callable;
+      demoted.sequenceEvidenceBacked = false;
+      demoted.sequenceElements.clear();
+      demoted.sequenceElementBundles.clear();
+      demoted.sequenceIndices.clear();
+      valueBundles[op.getCallable()] = std::move(demoted);
+      callable = RuntimeBundleLowerer::bundleFor(op.getCallable());
+    }
     return RuntimeBundleLowerer::lowerBoundMethodCall(op, *callable,
-                                                      method.getValue());
+                                                      methodName);
+  }
   if (callable->boundMethodReceiver && !callable->boundMethodName.empty())
     return RuntimeBundleLowerer::lowerBoundMethodCall(
         op, *callable->boundMethodReceiver, callable->boundMethodName);
@@ -229,10 +271,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
           op, receiver, closeResumeInfo->second);
   }
 
+  // Evidence-backed dicts qualify too: their payload arrays are kept in
+  // sync with the evidence, so the runtime probe reads the same truth
+  // (mutating methods demoted the receiver in lowerCall already).
   bool runtimeDictReceiver =
       receiver.kind == RuntimeBundle::Kind::Object &&
       receiver.contractName() == "builtins.dict" &&
-      !receiver.mappingEvidenceBacked && receiver.mappingKeys.empty() &&
       receiver.physicalValues().size() >= 5;
   // d.get(k, default) / d.pop(k[, default]) on runtime dicts: hash probe on
   // a transient key box, value rebuilt from the slot's (or the default's)
@@ -432,8 +476,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
   bool runtimeSetReceiver = receiver.kind == RuntimeBundle::Kind::Object &&
                             receiver.contractName() == "builtins.set" &&
                             receiver.physicalValues().size() >= 3;
+  bool runtimeListReceiver = receiver.kind == RuntimeBundle::Kind::Object &&
+                             receiver.contractName() == "builtins.list" &&
+                             receiver.physicalValues().size() >= 3;
   bool structuralUpdate =
       (runtimeDictReceiver && methodName == "update") ||
+      (runtimeListReceiver && methodName == "extend") ||
       (runtimeSetReceiver &&
        (methodName == "update" || methodName == "intersection_update" ||
         methodName == "difference_update" ||

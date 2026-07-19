@@ -1947,8 +1947,12 @@ mlir::LogicalResult verifyPathSensitiveAffineOwnership(
 //       effect the refcount inserter and this verifier both consume.
 // Anything else would be an Own smuggled across a suspension with no phase
 // inserting its release, so it is rejected here rather than silently
-// leaked. Argument lanes remain NonObject-only until the frame-absorption
-// (drop/close release) contract lands for resume arguments.
+// leaked. Generator ARGUMENT lanes are the one borrow exception:
+// `ly.generator.borrowed_args` ranges cross without a transfer anchor
+// because the frame absorbed their ownership at creation (the creation site
+// retains each object argument into the storage words and the drop
+// finalizer releases it), so the resume-time span is a borrow against a
+// frame-owned rho — no resource is introduced at this boundary.
 mlir::LogicalResult verifyGeneratorResumeFrames(mlir::ModuleOp module) {
   return walkVerify<mlir::func::FuncOp>(
       module, [&](mlir::func::FuncOp function) {
@@ -1966,7 +1970,7 @@ mlir::LogicalResult verifyGeneratorResumeFrames(mlir::ModuleOp module) {
         // contract and be anchored by the given ownership index set (the
         // transfer effect the refcount inserter consumes on the same side).
         auto collectLanes =
-            [&](llvm::StringRef attrName, const own::IndexSet &anchors,
+            [&](llvm::StringRef attrName, const own::IndexSet *anchors,
                 llvm::StringRef anchorLabel,
                 llvm::SmallVectorImpl<std::pair<std::int64_t, std::int64_t>>
                     &ranges) -> mlir::LogicalResult {
@@ -1992,9 +1996,9 @@ mlir::LogicalResult verifyGeneratorResumeFrames(mlir::ModuleOp module) {
             }
             ranges.push_back(
                 {begin.getInt(), begin.getInt() + size.getInt()});
-            if (size.getInt() > 0 &&
+            if (anchors && size.getInt() > 0 &&
                 laneContract.getValue() != "types.NoneType" &&
-                !anchors.contains(static_cast<unsigned>(begin.getInt()))) {
+                !anchors->contains(static_cast<unsigned>(begin.getInt()))) {
               function.emitError()
                   << "generator lane at " << attrName << " offset "
                   << begin.getInt() << " is not covered by the "
@@ -2033,7 +2037,14 @@ mlir::LogicalResult verifyGeneratorResumeFrames(mlir::ModuleOp module) {
         // (transfer_args); suspend results transfer OUT (owned_results).
         llvm::SmallVector<std::pair<std::int64_t, std::int64_t>, 4> argRanges;
         if (mlir::failed(collectLanes("ly.generator.resume_args",
-                                      contract->transferArgs, "transfer-args",
+                                      &contract->transferArgs, "transfer-args",
+                                      argRanges)))
+          return mlir::failure();
+        // Borrowed argument lanes: no anchor — the frame owns the resource
+        // (retained at creation, released by the drop finalizer), and the
+        // resume span is a borrow against it.
+        if (mlir::failed(collectLanes("ly.generator.borrowed_args",
+                                      /*anchors=*/nullptr, "borrowed-args",
                                       argRanges)))
           return mlir::failure();
         if (mlir::failed(
@@ -2042,7 +2053,7 @@ mlir::LogicalResult verifyGeneratorResumeFrames(mlir::ModuleOp module) {
         llvm::SmallVector<std::pair<std::int64_t, std::int64_t>, 4>
             resultRanges;
         if (mlir::failed(collectLanes("ly.generator.suspend_lanes",
-                                      contract->ownedResults, "owned-results",
+                                      &contract->ownedResults, "owned-results",
                                       resultRanges)))
           return mlir::failure();
         return checkCoverage(type.getResults(), resultRanges,

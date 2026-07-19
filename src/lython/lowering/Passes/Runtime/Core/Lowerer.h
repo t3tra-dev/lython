@@ -626,6 +626,10 @@ private:
   mlir::LogicalResult generateBoxedLtHook();
   mlir::LogicalResult lowerListEvidenceNext(py::NextOp op,
                                             RuntimeBundle iterator);
+  // Drops a dict's compile-time mapping evidence before a mutation emitted
+  // outside the storage's defining block (SpecialMethodOps.cpp).
+  bool demoteDictEvidenceForCrossBlockMutation(mlir::Operation *op,
+                                               mlir::Value containerValue);
   // Loop-body generator state-machine transform (GeneratorStateMachine.cpp).
   //
   // Suspension lane ABI (rfc/stdlib-semantics.md R3): a lane is one logical
@@ -652,6 +656,12 @@ private:
     std::string cloneName;
     unsigned frameWidth = 0;
     unsigned argumentCount = 0;
+    // One lane per generator argument. Int arguments keep the legacy raw
+    // (i64, i1) evidence pair through the drivers; object-contract arguments
+    // ride their physical span (the generator retains them at creation and
+    // the drop finalizer releases them, so the frame keeps its sources alive
+    // however long the object outlives the call site).
+    llvm::SmallVector<GeneratorResumeLane, 4> argumentLanes;
     // The yielded-value lane (result index 2 of the resume clone). Control
     // lane in the legacy int tier; object-family for boxed yields.
     GeneratorResumeLane valueLane;
@@ -728,9 +738,35 @@ private:
                                 mlir::ArrayRef<mlir::Type> logicalTypes,
                                 GeneratorResumeInfo &info);
   // Storage word offset of each frame lane (after the header words and the
-  // argument pairs stored at creation for the drop finalizer).
+  // argument words stored at creation for the drop finalizer).
   llvm::SmallVector<unsigned, 8>
   generatorFrameLaneWordOffsets(const GeneratorResumeInfo &info) const;
+  // Argument-lane ABI helpers. Drivers pass int arguments as the legacy
+  // (i64, i1) evidence pair and object arguments as their physical span.
+  llvm::SmallVector<mlir::Type, 6>
+  generatorArgumentPhysicalTypes(const GeneratorResumeLane &lane) const;
+  unsigned
+  generatorArgumentPhysicalCount(const GeneratorResumeInfo &info) const;
+  // Storage words one argument occupies ((raw, valid) for int, box words per
+  // physical part otherwise) and each argument's storage word offset.
+  unsigned generatorArgumentFrameWords(const GeneratorResumeLane &lane) const;
+  llvm::SmallVector<unsigned, 8>
+  generatorArgumentWordOffsets(const GeneratorResumeInfo &info) const;
+  // Resume-site operand assembly from the creation-site source bundles.
+  mlir::LogicalResult appendGeneratorArgumentOperands(
+      mlir::Operation *op, const GeneratorResumeInfo &info,
+      llvm::ArrayRef<std::shared_ptr<RuntimeBundle>> sources,
+      llvm::SmallVectorImpl<mlir::Value> &operands);
+  // Driver-side forwarding of the entry block's argument physicals.
+  void appendGeneratorArgumentEntryOperands(
+      mlir::Block *entry, const GeneratorResumeInfo &info,
+      llvm::SmallVectorImpl<mlir::Value> &operands) const;
+  // Borrowing span load for the finalizer: reconstructs an object argument
+  // from its storage words WITHOUT zeroing them (unlike the frame-lane load,
+  // ownership stays with the generator until the finalizer's release pass).
+  mlir::FailureOr<mlir::func::FuncOp>
+  getOrCreateGeneratorArgumentLoadFunction(mlir::Operation *op,
+                                           const GeneratorResumeLane &lane);
   mlir::FailureOr<mlir::func::FuncOp>
   getOrCreateGeneratorFinalizeFunction(GeneratorResumeInfo &info);
   // Per-program drop hook: patches the generator deallocator so a

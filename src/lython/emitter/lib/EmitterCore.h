@@ -139,6 +139,58 @@ private:
   void emitFor(const parser::Node &statement);
   void emitGeneratorExpFor(const parser::Node &statement,
                            const parser::Node &genexpr);
+  // EmitterIterators.cpp: lazy-iterator loop fusion (enumerate/zip/map/
+  // filter/reversed/iter and dict view methods in for-iterable position).
+  struct LazyCallable {
+    parser::NodePtr callee; // Name/Attribute spelling, re-used per element
+    llvm::SmallVector<std::string, 3> lambdaParams;
+    parser::NodePtr lambdaBody;
+  };
+  bool tryEmitLazyIteratorFor(const parser::Node &statement,
+                              const parser::Node &iterCall);
+  bool lazyCallableParts(const parser::Node &statement,
+                         const parser::NodePtr &callee, LazyCallable &result);
+  bool buildLazyCall(const parser::Node &statement,
+                     const LazyCallable &callable,
+                     std::vector<parser::NodePtr> arguments,
+                     std::vector<parser::NodePtr> &prologue,
+                     parser::NodePtr &out);
+  bool isBuiltinIteratorName(llvm::StringRef name) const;
+  bool hasIndexableEvidence(const parser::Node *expr);
+  void runWithScratchNames(llvm::ArrayRef<std::string> names,
+                           llvm::function_ref<void()> emit);
+  // Value form: enumerate/zip/map/filter/reversed/iter as first-class lazy
+  // values synthesize per-call-site generator functions over indexable
+  // sequences (memoized by builtin + argument types + callable spelling).
+  std::optional<Value>
+  tryEmitLazyIteratorValueCall(const parser::Node &expr,
+                               const parser::Node *calleeNode);
+  struct LazyIteratorSynthesis {
+    std::string symbol;
+    mlir::Type callableType;
+  };
+  std::map<std::string, LazyIteratorSynthesis> lazyIteratorMemo;
+  std::vector<parser::NodePtr> synthesizedIteratorDefs;
+  // dict method sugar (EmitterIterators.cpp): get(k) / setdefault / popitem
+  // / dict.fromkeys compose over existing dict primitives.
+  bool isDictTypedExpr(const parser::Node *expr);
+  std::optional<Value> tryEmitDictMethodSugar(const parser::Node &expr,
+                                              const parser::Node *calleeNode);
+  // `x in d.keys()/values()/items()` and `len(d.keys())` rewrite against the
+  // dict itself.
+  std::optional<Value> tryEmitDictViewMembership(const parser::Node &expr);
+  // str.maketrans / str.translate compositions (EmitterIterators.cpp).
+  std::optional<Value>
+  tryEmitStrTranslateSugar(const parser::Node &expr,
+                           const parser::Node *calleeNode);
+  // sorted(key=, reverse=) / list.sort(key=, reverse=):
+  // decorate-sort-undecorate over the native stable sort.
+  std::optional<Value> tryEmitSortSugar(const parser::Node &expr,
+                                        const parser::Node *calleeNode);
+  std::optional<std::string>
+  emitDsuSortStatements(const parser::Node &anchor, parser::NodePtr source,
+                        const LazyCallable *key, bool reverse, unsigned serial,
+                        llvm::SmallVectorImpl<std::string> &scratchNames);
   void emitWhile(const parser::Node &statement);
   void emitAsyncFor(const parser::Node &statement);
   llvm::SmallVector<CarriedLoopLocal, 4>
@@ -212,6 +264,12 @@ private:
                                        const parser::Node *calleeNode);
   std::optional<Value> tryEmitPrintCall(const parser::Node &expr,
                                         const parser::Node *calleeNode);
+  std::optional<Value> tryEmitBoolCall(const parser::Node &expr,
+                                       const parser::Node *calleeNode);
+  std::optional<Value> tryEmitAsciiCall(const parser::Node &expr,
+                                        const parser::Node *calleeNode);
+  std::optional<Value> tryEmitIssubclassCall(const parser::Node &expr,
+                                             const parser::Node *calleeNode);
   std::optional<Value> tryEmitReducerCall(const parser::Node &expr,
                                           const parser::Node *calleeNode);
   std::optional<Value> tryEmitLenCall(const parser::Node &expr,

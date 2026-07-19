@@ -1019,7 +1019,8 @@ void TypeSystem::seedBuiltins() {
                          .value_or(py::CallableType::get(
                              &context, {object()}, {}, {}, {}, {intType()})));
   for (llvm::StringRef manifestBuiltin :
-       {"sorted", "abs", "divmod", "pow", "ord", "chr", "hex", "oct", "bin"})
+       {"sorted", "abs", "divmod", "pow", "ord", "chr", "hex", "oct", "bin",
+        "input"})
     if (std::optional<mlir::Type> manifestContract = table.freeFunctionContract(
             (llvm::Twine("builtins.") + manifestBuiltin).str()))
       bindSymbol(manifestBuiltin, *manifestContract);
@@ -1029,6 +1030,7 @@ void TypeSystem::seedBuiltins() {
   bindClass("float", floatType());
   bindClass("str", strType());
   bindClass("bytes", contract("builtins.bytes"));
+  bindClass("frozenset", contract("builtins.frozenset"));
   // The whole builtin exception taxonomy binds from the shared table so the
   // emitter's name surface cannot drift from the class-id hierarchy the
   // runtime matches against. Non-builtins members (asyncio.CancelledError,
@@ -1678,6 +1680,12 @@ mlir::Type TypeSystem::annotationTypeForName(llvm::StringRef rawName) const {
     if (mlir::isa<py::TypeVarType, py::ParamSpecType, py::TypeVarTupleType>(
             *symbol))
       return *symbol;
+    // Compiler-synthesized type aliases (emitter rewrites bind a concrete
+    // inferred type under a reserved "__ly*" name and spell it in
+    // synthesized annotations). User names never take this path: a plain
+    // local would otherwise shadow a class annotation.
+    if (name.starts_with("__ly"))
+      return *symbol;
   }
   if (annotationNameIs(name, "int"))
     return intType();
@@ -2041,10 +2049,11 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
     }
     if (node->kind == "List")
       return listOf(join(elementTypes));
-    // The strict path keeps the historical joined (homogeneous) tuple view;
-    // the lenient path types heterogeneous tuples positionally.
-    return strict ? tupleOf(join(elementTypes))
-                  : tupleOfMembers(*this, elementTypes);
+    // Both paths type heterogeneous tuples positionally: the joined
+    // (homogeneous-union) view made `yield (i, "x")` infer as
+    // tuple[int | str], whose literal-index __getitem__ result is a union
+    // the runtime element rebuild cannot shape.
+    return tupleOfMembers(*this, elementTypes);
   }
   if (node->kind == "Dict") {
     const auto *keys = ast::nodeList(*node, "keys");

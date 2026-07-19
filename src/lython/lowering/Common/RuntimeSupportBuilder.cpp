@@ -2332,6 +2332,8 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context) {
           {support.i64()}));
   support.declareExternal(
       "fgetc", builder.getFunctionType({support.ptr()}, {support.i32()}));
+  support.declareExternal("getchar",
+                          builder.getFunctionType({}, {support.i32()}));
   support.declareExternal(
       "fwrite",
       builder.getFunctionType(

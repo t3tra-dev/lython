@@ -653,6 +653,10 @@ std::optional<Value> ModuleEmitter::emitComplexBinary(const parser::Node &expr,
 }
 
 Value ModuleEmitter::emitCompare(const parser::Node &expr) {
+  // Membership against dict views rewrites before operand emission — the
+  // views have no runtime object (EmitterIterators.cpp).
+  if (std::optional<Value> view = tryEmitDictViewMembership(expr))
+    return *view;
   Value lhs = emitExpr(ast::node(expr, "left"));
   const auto *comparators = ast::nodeList(expr, "comparators");
   const auto *ops = ast::nodeList(expr, "ops");

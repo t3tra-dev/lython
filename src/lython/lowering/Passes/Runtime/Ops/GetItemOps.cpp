@@ -863,9 +863,10 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeSequenceGetItem(
   // which invalidates references into it.
   RuntimeBundle container = containerRef;
   RuntimeBundle index = indexRef;
+  // An evidence-BACKED container with no recorded elements (an annotated
+  // empty literal grown by loop appends) reads through the payload too.
   if ((container.contractName() != "builtins.list" &&
        container.contractName() != "builtins.tuple") ||
-      container.sequenceEvidenceBacked ||
       !container.sequenceElements.empty() ||
       container.physicalValues().size() < 3)
     return false;
@@ -994,11 +995,21 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeDictGetItem(
   RuntimeBundle container = containerRef;
   RuntimeBundle index = indexRef;
   if (container.contractName() != "builtins.dict" ||
-      container.mappingEvidenceBacked || !container.mappingKeys.empty() ||
       container.physicalValues().size() < 5)
     return false;
   if (index.kind != RuntimeBundle::Kind::Object)
     return false;
+  // Evidence-backed dicts qualify only for RUNTIME keys (an int variable, a
+  // frozenset): a literal key stays on the evidence tier below, which owns
+  // the literal-key semantics (and this runtime path runs first).
+  if (container.mappingEvidenceBacked || !container.mappingKeys.empty()) {
+    std::optional<std::string> literalKey =
+        RuntimeBundleLowerer::keywordNameFromValue(op.getIndex());
+    if (!literalKey && index.literalText)
+      literalKey = *index.literalText;
+    if (literalKey)
+      return false;
+  }
   mlir::Type valueContract = op.getResult().getType();
   mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> shapes =
       RuntimeBundleLowerer::slotStorageShapesFor(op, valueContract,

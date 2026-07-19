@@ -261,7 +261,45 @@ mlir::FailureOr<mlir::Value> RuntimeBundleLowerer::rawSequenceIndexValue(
   return call.getResult(0);
 }
 
+// Compile-time dict evidence may only be extended in the block that defines
+// the dict's storage: an evidence update inside a branch would record
+// payload SSA values that later (join-dominated) uses cannot reference.
+// Demoting to runtime-mode keeps the physical payload authoritative — the
+// same truth the evidence mirrored — so conditional mutations lower through
+// the runtime probes instead.
+bool RuntimeBundleLowerer::demoteDictEvidenceForCrossBlockMutation(
+    mlir::Operation *op, mlir::Value containerValue) {
+  RuntimeBundle *bundle = nullptr;
+  if (auto found = valueBundles.find(containerValue);
+      found != valueBundles.end())
+    bundle = &found->second;
+  if (!bundle || bundle->kind != RuntimeBundle::Kind::Object ||
+      bundle->contractName() != "builtins.dict" ||
+      bundle->physicalValues().size() < 5 ||
+      (!bundle->mappingEvidenceBacked && bundle->mappingKeys.empty()))
+    return false;
+  mlir::Value anchor = bundle->physicalValues().front();
+  mlir::Block *defBlock = nullptr;
+  if (auto argument = mlir::dyn_cast<mlir::BlockArgument>(anchor))
+    defBlock = argument.getOwner();
+  else if (mlir::Operation *defOp = anchor.getDefiningOp())
+    defBlock = defOp->getBlock();
+  if (!defBlock || defBlock == op->getBlock()) {
+    // Same block: appended evidence dominates every later same-function use.
+    return false;
+  }
+  bundle->mappingEvidenceBacked = false;
+  bundle->mappingKeys.clear();
+  bundle->mappingKeyBundles.clear();
+  bundle->mappingValues.clear();
+  bundle->mappingValueBundles.clear();
+  bundle->mappingPresent.clear();
+  return true;
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
+  RuntimeBundleLowerer::demoteDictEvidenceForCrossBlockMutation(
+      op.getOperation(), op.getContainer());
   llvm::SmallVector<mlir::Value, 3> inputs{op.getContainer(), op.getIndex(),
                                            op.getValue()};
   llvm::SmallVector<const RuntimeBundle *, 3> sources;
@@ -410,6 +448,11 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
   }
   bool structuralMutation =
       op->hasAttr("ly.structural_mutation") && op.getNumResults() == 1;
+  // NOTE(wave15 integration): the iter track carried a second runtime list
+  // store lowering here (rebind convention, inline bounds guard). The
+  // closure track's in-place LyList_SetItemBox path above subsumes it —
+  // it also covers constant indexes and borrowed receivers — so the
+  // duplicate was dropped rather than kept unreachable.
   bool runtimeDictInsert =
       container.kind == RuntimeBundle::Kind::Object &&
       container.contractName() == "builtins.dict" &&
@@ -667,6 +710,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::lowerDelItem(py::DelItemOp op) {
+  RuntimeBundleLowerer::demoteDictEvidenceForCrossBlockMutation(
+      op.getOperation(), op.getContainer());
   llvm::SmallVector<mlir::Value, 2> inputs{op.getContainer(), op.getIndex()};
   llvm::SmallVector<const RuntimeBundle *, 2> sources;
   if (mlir::failed(collectObjectSources(
@@ -989,12 +1034,13 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerContains(py::ContainsOp op) {
   const RuntimeBundle container = *sources.front();
   const RuntimeBundle item = *sources.back();
   bool runtimeSetProbe = container.kind == RuntimeBundle::Kind::Object &&
-                         container.contractName() == "builtins.set" &&
+                         (container.contractName() == "builtins.set" ||
+                          container.contractName() == "builtins.frozenset") &&
                          container.physicalValues().size() >= 3;
+  // Evidence-backed dicts probe the payload too — a runtime key (int
+  // variable, frozenset) has no literal-key evidence to consult.
   bool runtimeDictProbe = container.kind == RuntimeBundle::Kind::Object &&
                           container.contractName() == "builtins.dict" &&
-                          !container.mappingEvidenceBacked &&
-                          container.mappingKeys.empty() &&
                           container.physicalValues().size() >= 5;
   // Membership probe with a BORROWED transient element box (hash-based for
   // set/dict, identity-or-equality scan for list/tuple), then pin both the
@@ -1175,6 +1221,14 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIter(py::IterOp op) {
     return RuntimeBundleLowerer::lowerAliasView(op, op.getIterable(),
                                                 op.getResult());
 
+  // The iterable may be a block argument whose ABI expansion has not run
+  // yet (walk order does not guarantee it): materialize the bundle first,
+  // or the container paths below silently fall through to the manifest
+  // fallback.
+  if (mlir::failed(
+          RuntimeBundleLowerer::ensureValueBundle(op, op.getIterable())))
+    return mlir::failure();
+
   // Statically evidenced list iteration: there is no runtime `list.__iter__`
   // object; iterate the compile-time element evidence through a hoisted
   // position cell instead. The cell is alloca'd once per function (so nested
@@ -1187,24 +1241,30 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIter(py::IterOp op) {
                                 !iterable->evidenceIteratorCell;
     // Runtime-mode list (no compile-time element evidence): iterate the
     // runtime payload through the same hoisted position cell; `py.next`
-    // rebuilds each element from its payload box words.
+    // rebuilds each element from its payload box words. An evidence-BACKED
+    // list with no recorded elements (an annotated empty literal grown by
+    // loop appends) qualifies too: its payload is the only truth.
     bool runtimeListIterable = iterable->contractName() == "builtins.list" &&
-                               !iterable->sequenceEvidenceBacked &&
                                iterable->sequenceElements.empty() &&
                                !iterable->evidenceIteratorCell &&
                                iterable->physicalValues().size() >= 3;
-    // Runtime-mode dict key iteration: the key boxes live in the keys array
-    // at the same physical positions the list uses for its items (meta at
-    // [1], boxes at [2]), so the runtime-list next path applies verbatim.
+    // Dict key iteration: the key boxes live in the keys array at the same
+    // physical positions the list uses for its items (meta at [1], boxes at
+    // [2]), so the runtime-list next path applies verbatim. Evidence-backed
+    // dicts qualify too — their payload arrays are materialized alongside
+    // the evidence (initializeDictPayload / the evidence mutators keep them
+    // in sync), and iterating the live payload keeps the mutation guard and
+    // insertion order identical to the runtime tier.
     bool runtimeDictIterable = iterable->contractName() == "builtins.dict" &&
-                               !iterable->mappingEvidenceBacked &&
-                               iterable->mappingKeys.empty() &&
                                iterable->sequenceElements.empty() &&
                                !iterable->evidenceIteratorCell &&
                                iterable->physicalValues().size() >= 5;
-    // Runtime sets share the list's physical layout exactly (meta at [1],
-    // boxed slots at [2]), so the runtime-list next path applies verbatim.
-    bool runtimeSetIterable = iterable->contractName() == "builtins.set" &&
+    // Runtime sets (and frozensets — identical layout) share the list's
+    // physical layout exactly (meta at [1], boxed slots at [2]), so the
+    // runtime-list next path applies verbatim.
+    bool runtimeSetIterable = (iterable->contractName() == "builtins.set" ||
+                               iterable->contractName() ==
+                                   "builtins.frozenset") &&
                               iterable->sequenceElements.empty() &&
                               !iterable->evidenceIteratorCell &&
                               iterable->physicalValues().size() >= 3;
@@ -1365,7 +1425,8 @@ RuntimeBundleLowerer::lowerListRuntimeNext(py::NextOp op,
   // since the iterator was created (CPython's mutation-during-iteration
   // guard; the size at creation sits in cell word 1).
   bool guardsMutation = iterator.contractName() == "builtins.dict" ||
-                        iterator.contractName() == "builtins.set";
+                        iterator.contractName() == "builtins.set" ||
+                        iterator.contractName() == "builtins.frozenset";
   if (guardsMutation) {
     mlir::Value initialSlot =
         mlir::arith::ConstantIndexOp::create(builder, loc, 1);

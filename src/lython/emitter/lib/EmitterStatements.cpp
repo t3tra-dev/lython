@@ -115,6 +115,26 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
                                                "malformed augmented assignment"});
       return;
     }
+    // `d |= other` on dicts is CPython's in-place __ior__ — it must mutate
+    // the existing object (aliases observe the update), so it rewrites to
+    // d.update(other) instead of the fresh-dict `d = d | other` BinOp.
+    if (op->kind == "BitOr" && isDictTypedExpr(target.get())) {
+      parser::NodePtr updateAttr =
+          parser::makeNode("Attribute", statement.range);
+      parser::addField(*updateAttr, "value", target);
+      parser::addField(*updateAttr, "attr", std::string("update"));
+      parser::NodePtr updateCall = parser::makeNode("Call", statement.range);
+      parser::addField(*updateCall, "func", std::move(updateAttr));
+      parser::addField(*updateCall, "args",
+                       std::vector<parser::NodePtr>{rhs});
+      parser::addField(*updateCall, "keywords",
+                       std::vector<parser::NodePtr>{});
+      parser::NodePtr updateStatement =
+          parser::makeNode("Expr", statement.range);
+      parser::addField(*updateStatement, "value", std::move(updateCall));
+      emitStatement(*updateStatement);
+      return;
+    }
     parser::NodePtr binop = parser::makeNode("BinOp", statement.range);
     parser::addField(*binop, "left", target);
     parser::addField(*binop, "op", op);

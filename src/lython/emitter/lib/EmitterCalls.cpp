@@ -176,6 +176,47 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     return *v;
   if (std::optional<Value> v = tryEmitFloatCall(expr, calleeNode))
     return *v;
+  if (std::optional<Value> v = tryEmitBoolCall(expr, calleeNode))
+    return *v;
+  if (std::optional<Value> v = tryEmitAsciiCall(expr, calleeNode))
+    return *v;
+  if (std::optional<Value> v = tryEmitIssubclassCall(expr, calleeNode))
+    return *v;
+  // frozenset() with no argument forwards an empty list to the single
+  // manifest __new__ (one native per initializer name; a memref span cannot
+  // carry a default).
+  if (calleeNode && calleeNode->kind == "Name" &&
+      ast::nameSpelling(*calleeNode) == "frozenset" &&
+      values.find("frozenset") == values.end() && callHasNoArguments(expr)) {
+    parser::NodePtr emptyList = parser::makeNode("List", expr.range);
+    parser::addField(*emptyList, "elts", std::vector<parser::NodePtr>{});
+    parser::NodePtr rewritten = parser::makeNode("Call", expr.range);
+    parser::NodePtr frozensetName = parser::makeNode("Name", expr.range);
+    parser::addField(*frozensetName, "id", std::string("frozenset"));
+    parser::addField(*rewritten, "func", std::move(frozensetName));
+    parser::addField(*rewritten, "args",
+                     std::vector<parser::NodePtr>{std::move(emptyList)});
+    parser::addField(*rewritten, "keywords", std::vector<parser::NodePtr>{});
+    synthesizedIteratorDefs.push_back(rewritten);
+    return emitCall(*rewritten);
+  }
+  // input() with no prompt forwards an empty prompt to the single manifest
+  // contract (input(prompt: str) -> str).
+  if (calleeNode && calleeNode->kind == "Name" &&
+      ast::nameSpelling(*calleeNode) == "input" &&
+      values.find("input") == values.end() && callHasNoArguments(expr)) {
+    parser::NodePtr empty = parser::makeNode("Constant", expr.range);
+    parser::addField(*empty, "value", std::string());
+    parser::NodePtr promptCall = parser::makeNode("Call", expr.range);
+    parser::NodePtr inputName = parser::makeNode("Name", expr.range);
+    parser::addField(*inputName, "id", std::string("input"));
+    parser::addField(*promptCall, "func", std::move(inputName));
+    parser::addField(*promptCall, "args",
+                     std::vector<parser::NodePtr>{std::move(empty)});
+    parser::addField(*promptCall, "keywords", std::vector<parser::NodePtr>{});
+    synthesizedIteratorDefs.push_back(promptCall);
+    return emitCall(*promptCall);
+  }
   if (std::optional<Value> v = tryEmitStrCall(expr, calleeNode))
     return *v;
   if (std::optional<Value> v = tryEmitListCall(expr, calleeNode))
@@ -183,6 +224,14 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
   if (std::optional<Value> v = tryEmitPrintCall(expr, calleeNode))
     return *v;
   if (std::optional<Value> v = tryEmitReducerCall(expr, calleeNode))
+    return *v;
+  if (std::optional<Value> v = tryEmitLazyIteratorValueCall(expr, calleeNode))
+    return *v;
+  if (std::optional<Value> v = tryEmitDictMethodSugar(expr, calleeNode))
+    return *v;
+  if (std::optional<Value> v = tryEmitSortSugar(expr, calleeNode))
+    return *v;
+  if (std::optional<Value> v = tryEmitStrTranslateSugar(expr, calleeNode))
     return *v;
 
   if (!calleeQualified.empty())
@@ -548,6 +597,16 @@ ModuleEmitter::tryEmitIntCall(const parser::Node &expr,
     Value argument = emitExpr(intArgs->front().get());
     return coerceValue(argument, types.intType(), expr);
   }
+  if (argumentType == types.boolType()) {
+    // int(True) == 1 / int(False) == 0: widen the truth bit.
+    Value argument = emitExpr(intArgs->front().get());
+    mlir::Value bit = emitBoolValue(argument, expr);
+    auto wide = mlir::arith::ExtUIOp::create(
+        builder, loc(expr), mlir::IntegerType::get(&context, 64), bit);
+    auto op = py::CastFromPrimOp::create(builder, loc(expr), types.intType(),
+                                         wide.getResult());
+    return Value{op.getResult(), types.intType()};
+  }
   if (argumentType == types.strType() || argumentType == types.floatType()) {
     // The runtime-level __int__ methods of str (base-10 parse) and float
     // (truncation) are deliberately not part of the typed manifest surface —
@@ -565,6 +624,117 @@ ModuleEmitter::tryEmitIntCall(const parser::Node &expr,
     return Value{op.getResult(), resultType};
   }
   return std::nullopt;
+}
+
+std::optional<Value>
+ModuleEmitter::tryEmitBoolCall(const parser::Node &expr,
+                               const parser::Node *calleeNode) {
+  if (!calleeNode || calleeNode->kind != "Name" ||
+      ast::nameSpelling(*calleeNode) != "bool" ||
+      values.find("bool") != values.end())
+    return std::nullopt;
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  if (keywords && !keywords->empty())
+    return std::nullopt;
+  if (!args || args->empty()) {
+    mlir::Type literalType = types.literal("False");
+    auto constant = py::BoolConstantOp::create(builder, loc(expr), literalType,
+                                               builder.getBoolAttr(false));
+    return Value{constant.getResult(), literalType};
+  }
+  if (args->size() != 1 || !args->front() ||
+      args->front()->kind == "Starred")
+    return std::nullopt;
+  const parser::Node *argNode = args->front().get();
+  mlir::Type argumentType = types.widenLiteral(types.inferExpr(argNode));
+  // bool(n) on numbers is an EXPLICIT conversion — R1 only rejects the
+  // implicit truthiness of `if n:` — so it desugars to the comparison the
+  // diagnostic would suggest.
+  if (argumentType == types.intType() || argumentType == types.floatType()) {
+    parser::NodePtr zero = parser::makeNode("Constant", expr.range);
+    if (argumentType == types.floatType())
+      parser::addField(*zero, "value", 0.0);
+    else
+      parser::addField(*zero, "value", std::int64_t{0});
+    parser::NodePtr op = parser::makeNode("NotEq", expr.range);
+    parser::NodePtr compare = parser::makeNode("Compare", expr.range);
+    parser::addField(*compare, "left", (*args)[0]);
+    parser::addField(*compare, "ops", std::vector<parser::NodePtr>{op});
+    parser::addField(*compare, "comparators",
+                     std::vector<parser::NodePtr>{zero});
+    return coerceValue(emitExpr(compare.get()), types.boolType(), expr);
+  }
+  // Everything else rides the same truthiness emitBoolValue implements for
+  // conditions (containers by emptiness, Optional by None-ness, bool as-is).
+  Value argument = emitExpr(argNode);
+  mlir::Value bit = emitBoolValue(argument, expr);
+  return boxedBool(builder, loc(expr), types, bit);
+}
+
+std::optional<Value>
+ModuleEmitter::tryEmitAsciiCall(const parser::Node &expr,
+                                const parser::Node *calleeNode) {
+  if (!calleeNode || calleeNode->kind != "Name" ||
+      ast::nameSpelling(*calleeNode) != "ascii" ||
+      values.find("ascii") != values.end())
+    return std::nullopt;
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  if (!args || args->size() != 1 || (keywords && !keywords->empty()) ||
+      !args->front() || args->front()->kind == "Starred") {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "ascii() takes exactly one argument"});
+    return emitNone(expr);
+  }
+  Value argument = emitExpr(args->front().get());
+  if (std::optional<Value> converted =
+          emitConversionValue(expr, argument, 'a'))
+    return converted;
+  diagnostics.push_back(parser::Diagnostic{
+      parser::Severity::Error, expr.range.start,
+      "ascii() is not supported for this argument type"});
+  return emitNone(expr);
+}
+
+std::optional<Value>
+ModuleEmitter::tryEmitIssubclassCall(const parser::Node &expr,
+                                     const parser::Node *calleeNode) {
+  if (!calleeNode || calleeNode->kind != "Name" ||
+      ast::nameSpelling(*calleeNode) != "issubclass" ||
+      values.find("issubclass") != values.end())
+    return std::nullopt;
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  auto rejectIssubclass = [&](llvm::StringRef reason) -> std::optional<Value> {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start, std::string(reason)});
+    return emitNone(expr);
+  };
+  if (!args || args->size() != 2 || (keywords && !keywords->empty()))
+    return rejectIssubclass("issubclass() takes exactly two arguments");
+  // Static classes only: the hierarchy is compile-time (C3 linearized), so
+  // the answer folds to a constant.
+  auto classOf = [&](const parser::Node *node) -> std::optional<mlir::Type> {
+    if (!node)
+      return std::nullopt;
+    std::string qualified = ast::qualifiedName(node);
+    if (qualified.empty())
+      return std::nullopt;
+    return types.lookupClass(qualified);
+  };
+  std::optional<mlir::Type> subClass = classOf((*args)[0].get());
+  std::optional<mlir::Type> superClass = classOf((*args)[1].get());
+  if (!subClass || !superClass)
+    return rejectIssubclass(
+        "issubclass() requires statically resolvable class names");
+  bool truth = *subClass == *superClass ||
+               py::isAssignableTo(*subClass, *superClass, module);
+  mlir::Type literalType = types.literal(truth ? "True" : "False");
+  auto constant = py::BoolConstantOp::create(builder, loc(expr), literalType,
+                                             builder.getBoolAttr(truth));
+  return Value{constant.getResult(), literalType};
 }
 
 Value ModuleEmitter::emitFloatFromInt(const parser::Node &anchor,
@@ -1200,7 +1370,26 @@ ModuleEmitter::tryEmitLenCall(const parser::Node &expr,
     return std::nullopt;
   const auto *args = ast::nodeList(expr, "args");
   if (args && args->size() == 1) {
-    Value input = emitExpr(args->front().get());
+    // len(d.keys()/values()/items()) measures the dict itself — the views
+    // have no runtime object.
+    const parser::Node *argNode = args->front().get();
+    if (argNode && argNode->kind == "Call") {
+      const parser::Node *viewCallee = ast::node(*argNode, "func");
+      const auto *viewArgs = ast::nodeList(*argNode, "args");
+      const auto *viewKeywords = ast::nodeList(*argNode, "keywords");
+      if (viewCallee && viewCallee->kind == "Attribute" &&
+          (!viewArgs || viewArgs->empty()) &&
+          (!viewKeywords || viewKeywords->empty())) {
+        auto viewName = ast::string(*viewCallee, "attr");
+        const parser::Node *viewReceiver = ast::node(*viewCallee, "value");
+        if (viewName &&
+            (*viewName == "keys" || *viewName == "values" ||
+             *viewName == "items") &&
+            isDictTypedExpr(viewReceiver))
+          argNode = viewReceiver;
+      }
+    }
+    Value input = emitExpr(argNode);
     if (std::optional<MethodBinding> method =
             lookupClassMethod(input.type, "__len__"))
       return emitInlineOperatorCall(expr, input, *method, {});
@@ -1232,13 +1421,77 @@ ModuleEmitter::tryEmitNextCall(const parser::Node &expr,
   const auto *keywords = ast::nodeList(expr, "keywords");
   if (keywords && !keywords->empty())
     return std::nullopt;
-  // Only the one-argument form; `next(it, default)` needs a union result
-  // and StopIteration interception, which the static surface does not
-  // provide yet.
+  // `next(it, default)` desugars to the pre-bound try/except form
+  //   __nx = default; try: __nx = next(__it) except StopIteration: pass
+  // (a binding CREATED inside a try does not escape the handler scope, but
+  // rebinding a pre-existing local does; the iterator is snapshot first to
+  // keep CPython's left-to-right argument evaluation).
+  if (args && args->size() == 2 && args->front() && (*args)[1]) {
+    unsigned serial = ++listCompCounter;
+    std::string iteratorName = "__lynextit" + std::to_string(serial);
+    std::string resultName = "__lynext" + std::to_string(serial);
+    parser::SourceRange range = expr.range;
+    auto nameNode = [&](const std::string &id) {
+      parser::NodePtr node = parser::makeNode("Name", range);
+      parser::addField(*node, "id", id);
+      return node;
+    };
+    auto assign = [&](parser::NodePtr target, parser::NodePtr value) {
+      parser::NodePtr node = parser::makeNode("Assign", range);
+      parser::addField(*node, "targets",
+                       std::vector<parser::NodePtr>{std::move(target)});
+      parser::addField(*node, "value", std::move(value));
+      return node;
+    };
+    parser::NodePtr nextCall = parser::makeNode("Call", range);
+    parser::addField(*nextCall, "func", nameNode("next"));
+    parser::addField(*nextCall, "args",
+                     std::vector<parser::NodePtr>{nameNode(iteratorName)});
+    parser::addField(*nextCall, "keywords", std::vector<parser::NodePtr>{});
+    parser::NodePtr handler = parser::makeNode("ExceptHandler", range);
+    parser::addField(*handler, "type", nameNode("StopIteration"));
+    parser::addField(*handler, "body",
+                     std::vector<parser::NodePtr>{
+                         parser::makeNode("Pass", range)});
+    parser::NodePtr tryNode = parser::makeNode("Try", range);
+    parser::addField(*tryNode, "body",
+                     std::vector<parser::NodePtr>{
+                         assign(nameNode(resultName), nextCall)});
+    parser::addField(*tryNode, "handlers",
+                     std::vector<parser::NodePtr>{handler});
+    parser::addField(*tryNode, "orelse", std::vector<parser::NodePtr>{});
+    parser::addField(*tryNode, "finalbody", std::vector<parser::NodePtr>{});
+
+    llvm::SmallVector<std::pair<std::string, std::optional<Value>>, 2> priors;
+    for (const std::string &scratch : {iteratorName, resultName}) {
+      std::optional<Value> prior;
+      if (auto found = values.find(scratch); found != values.end())
+        prior = found->second;
+      priors.push_back({scratch, prior});
+    }
+    emitStatement(*assign(nameNode(iteratorName), args->front()));
+    emitStatement(*assign(nameNode(resultName), (*args)[1]));
+    emitStatement(*tryNode);
+    auto bound = values.find(resultName);
+    if (bound == values.end() || !bound->second.value) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, expr.range.start,
+          "cannot lower next(iterator, default) over this iterator"});
+      return emitNone(expr);
+    }
+    Value result = bound->second;
+    for (auto &[scratch, prior] : priors) {
+      if (prior)
+        values[scratch] = *prior;
+      else
+        values.erase(scratch);
+    }
+    return result;
+  }
   if (!args || args->size() != 1) {
     diagnostics.push_back(parser::Diagnostic{
         parser::Severity::Error, expr.range.start,
-        "next() currently supports exactly one iterator argument"});
+        "next() takes one iterator and an optional default"});
     return emitNone(expr);
   }
   Value receiver = emitExpr(args->front().get());

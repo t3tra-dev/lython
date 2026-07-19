@@ -221,6 +221,16 @@ void buildHostFileSupport(SupportBuilder &b) {
   }
 
   {
+    // i32 LyHost_GetcStdin(): getchar (-1 on EOF) — input()'s line reader.
+    auto fn = b.beginFunction(
+        "LyHost_GetcStdin", b.builder.getFunctionType({}, {b.i32()}));
+    mlir::Block *entry = fn.addEntryBlock();
+    b.builder.setInsertionPointToEnd(entry);
+    mlir::Value ch = b.call("getchar", b.i32(), mlir::ValueRange{}).front();
+    mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{ch});
+  }
+
+  {
     // i64 LyHost_FWrite(i64 file, memref<?xi8> bytes, i64 len).
     auto fn = b.beginFunction(
         "LyHost_FWrite",

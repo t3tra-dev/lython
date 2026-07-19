@@ -359,6 +359,13 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
     emitGeneratorExpFor(statement, *iterNode);
     return;
   }
+  // Lazy iterator builtins / dict views consumed directly by the loop fuse
+  // into equivalent rewritten loops (EmitterIterators.cpp) — no iterator
+  // object is materialized, matching CPython's per-element evaluation order.
+  if (const parser::Node *iterNode = ast::node(statement, "iter");
+      iterNode && iterNode->kind == "Call" &&
+      tryEmitLazyIteratorFor(statement, *iterNode))
+    return;
   // A loop over an empty container literal statically runs zero iterations:
   // emit nothing (the body never executes; the target stays unbound, matching
   // CPython's observable behavior). This also covers the reducer desugars
