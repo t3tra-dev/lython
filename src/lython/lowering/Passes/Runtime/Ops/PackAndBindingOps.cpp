@@ -362,8 +362,28 @@ mlir::LogicalResult RuntimeBundleLowerer::appendClosureValues(
       return op.emitError()
              << "closure capture " << index << " has type "
              << captureBundle->contract << ", expected " << closureTypes[index];
+    // A lazy unboxed int has no physical object values; the RuntimeValue we
+    // park in closureValues cannot carry the raw/valid evidence pair, so the
+    // capture must be boxed here (once, at the binding) rather than at every
+    // downstream call site.
+    if (captureBundle->physicalValues().empty() &&
+        RuntimeBundleLowerer::hasLazyPrimitiveI64Object(*captureBundle)) {
+      builder.setInsertionPoint(op);
+      mlir::FailureOr<RuntimeValue> materialized =
+          RuntimeBundleLowerer::materializePrimitiveI64ObjectAtCurrentInsertion(
+              op.getOperation(), *captureBundle);
+      if (mlir::failed(materialized))
+        return mlir::failure();
+      bundle.closureValues.push_back(*materialized);
+      continue;
+    }
     bundle.closureValues.push_back(captureBundle->objectValue);
   }
+  // The nested function may mutate a captured container on any later call;
+  // from here on the enclosing scope's compile-time contents evidence for
+  // those captures is no longer authoritative.
+  for (mlir::Value capture : op.getCaptures())
+    demoteMutableContainerEvidenceFor(capture);
   return mlir::success();
 }
 

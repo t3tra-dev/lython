@@ -119,17 +119,116 @@ void collectReadNames(const parser::Node *node, llvm::StringSet<> &names) {
   }
 }
 
-} // namespace
+// `nonlocal NAME` declarations at THIS function's statement level (if/while
+// bodies included, nested def/lambda/class scopes excluded).
+void collectOwnNonlocalNames(const parser::Node *node,
+                             llvm::StringSet<> &names) {
+  if (!node)
+    return;
+  if (node->kind == "FunctionDef" || node->kind == "AsyncFunctionDef" ||
+      node->kind == "ClassDef" || node->kind == "Lambda")
+    return;
+  if (node->kind == "Nonlocal") {
+    if (const auto *declared = ast::stringList(*node, "names"))
+      for (const std::string &name : *declared)
+        names.insert(name);
+    return;
+  }
+  for (const parser::Field &field : node->fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (*child)
+        collectOwnNonlocalNames(child->get(), names);
+    } else if (const auto *children =
+                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
+      for (const parser::NodePtr &child : *children)
+        if (child)
+          collectOwnNonlocalNames(child.get(), names);
+    }
+  }
+}
 
-llvm::SmallVector<std::string, 4>
-lexicalCaptureNames(const parser::Node &callable) {
-  llvm::StringSet<> locals;
+// Function definitions nested directly in this scope (not crossing into
+// deeper function scopes; class bodies are traversed because their methods
+// close over the enclosing function scope).
+void collectDirectNestedFunctions(
+    const parser::Node *node,
+    llvm::SmallVectorImpl<const parser::Node *> &nested) {
+  if (!node)
+    return;
+  if (node->kind == "FunctionDef" || node->kind == "AsyncFunctionDef") {
+    nested.push_back(node);
+    return;
+  }
+  if (node->kind == "Lambda")
+    return; // no statements, so no nonlocal declarations
+  for (const parser::Field &field : node->fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (*child)
+        collectDirectNestedFunctions(child->get(), nested);
+    } else if (const auto *children =
+                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
+      for (const parser::NodePtr &child : *children)
+        if (child)
+          collectDirectNestedFunctions(child.get(), nested);
+    }
+  }
+}
+
+void collectFunctionLocalNames(const parser::Node &callable,
+                               llvm::StringSet<> &locals) {
   collectParameterNames(ast::node(callable, "args"), locals);
   if (const auto *body = ast::nodeList(callable, "body"))
     for (const parser::NodePtr &statement : *body)
       collectLocalNames(statement.get(), locals);
   if (const parser::Node *body = ast::node(callable, "body"))
     collectLocalNames(body, locals);
+}
+
+// Names a nested function requires from SOME enclosing function scope: its
+// own nonlocal declarations plus whatever its nested functions require and
+// this function does not bind locally.
+void collectNeededNonlocalNames(const parser::Node &callable,
+                                llvm::StringSet<> &needed) {
+  llvm::StringSet<> own;
+  if (const auto *body = ast::nodeList(callable, "body"))
+    for (const parser::NodePtr &statement : *body)
+      collectOwnNonlocalNames(statement.get(), own);
+  llvm::StringSet<> locals;
+  collectFunctionLocalNames(callable, locals);
+  for (const auto &entry : own)
+    locals.erase(entry.getKey());
+
+  llvm::SmallVector<const parser::Node *, 4> nested;
+  if (const auto *body = ast::nodeList(callable, "body"))
+    for (const parser::NodePtr &statement : *body)
+      collectDirectNestedFunctions(statement.get(), nested);
+
+  llvm::StringSet<> fromNested;
+  for (const parser::Node *inner : nested)
+    collectNeededNonlocalNames(*inner, fromNested);
+
+  for (const auto &entry : own)
+    needed.insert(entry.getKey());
+  for (const auto &entry : fromNested)
+    if (!locals.contains(entry.getKey()))
+      needed.insert(entry.getKey());
+}
+
+} // namespace
+
+llvm::SmallVector<std::string, 4>
+lexicalCaptureNames(const parser::Node &callable) {
+  llvm::StringSet<> locals;
+  collectFunctionLocalNames(callable, locals);
+
+  // A name this function declares nonlocal is a capture even when assigned
+  // (the assignment targets the enclosing function's cell, not a new local).
+  llvm::StringSet<> ownNonlocals;
+  if (const auto *body = ast::nodeList(callable, "body"))
+    for (const parser::NodePtr &statement : *body)
+      collectOwnNonlocalNames(statement.get(), ownNonlocals);
+  for (const auto &entry : ownNonlocals)
+    locals.erase(entry.getKey());
 
   llvm::StringSet<> reads;
   if (const auto *body = ast::nodeList(callable, "body"))
@@ -137,6 +236,22 @@ lexicalCaptureNames(const parser::Node &callable) {
       collectReadNames(statement.get(), reads);
   if (const parser::Node *body = ast::node(callable, "body"))
     collectReadNames(body, reads);
+  for (const auto &entry : ownNonlocals)
+    reads.insert(entry.getKey());
+  // A deeper nested function's nonlocal target that this function does not
+  // bind must ride this function's environment (write-only uses do not show
+  // up as reads).
+  llvm::StringSet<> needed;
+  {
+    llvm::SmallVector<const parser::Node *, 4> nested;
+    if (const auto *body = ast::nodeList(callable, "body"))
+      for (const parser::NodePtr &statement : *body)
+        collectDirectNestedFunctions(statement.get(), nested);
+    for (const parser::Node *inner : nested)
+      collectNeededNonlocalNames(*inner, needed);
+  }
+  for (const auto &entry : needed)
+    reads.insert(entry.getKey());
 
   llvm::SmallVector<std::string, 4> captures;
   for (const auto &entry : reads)
@@ -144,6 +259,32 @@ lexicalCaptureNames(const parser::Node &callable) {
       captures.push_back(entry.getKey().str());
   llvm::sort(captures);
   return captures;
+}
+
+llvm::StringSet<> nonlocalBoxedNames(const parser::Node &callable) {
+  llvm::StringSet<> locals;
+  collectFunctionLocalNames(callable, locals);
+  llvm::StringSet<> ownNonlocals;
+  if (const auto *body = ast::nodeList(callable, "body"))
+    for (const parser::NodePtr &statement : *body)
+      collectOwnNonlocalNames(statement.get(), ownNonlocals);
+  for (const auto &entry : ownNonlocals)
+    locals.erase(entry.getKey());
+
+  llvm::SmallVector<const parser::Node *, 4> nested;
+  if (const auto *body = ast::nodeList(callable, "body"))
+    for (const parser::NodePtr &statement : *body)
+      collectDirectNestedFunctions(statement.get(), nested);
+
+  llvm::StringSet<> needed;
+  for (const parser::Node *inner : nested)
+    collectNeededNonlocalNames(*inner, needed);
+
+  llvm::StringSet<> boxed;
+  for (const auto &entry : needed)
+    if (locals.contains(entry.getKey()))
+      boxed.insert(entry.getKey());
+  return boxed;
 }
 
 std::string sanitizedSymbolPart(llvm::StringRef text) {

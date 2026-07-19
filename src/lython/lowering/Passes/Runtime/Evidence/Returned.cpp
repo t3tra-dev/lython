@@ -245,23 +245,42 @@ mlir::LogicalResult RuntimeBundleLowerer::buildReturnedCallableSummaries() {
       ReturnedCallableAlternativeSummary candidate;
       candidate.target = binding.getBinding().str();
       for (mlir::Value capture : binding.getCaptures()) {
+        ReturnedCallableCapture item;
         auto arg = mlir::dyn_cast<mlir::BlockArgument>(capture);
-        if (!arg || arg.getOwner() != &entry) {
-          invalid = true;
-          return;
+        if (arg && arg.getOwner() == &entry) {
+          item.argumentIndex = arg.getArgNumber();
+        } else {
+          // A local capture (the R6 nonlocal cell, a materialized boxed
+          // int): its values leave the function as an owned result lane,
+          // which needs a concrete contract for the ABI.
+          if (runtimeContractName(capture.getType()).empty()) {
+            invalid = true;
+            return;
+          }
+          item.laneContract = capture.getType();
         }
-        candidate.captureArgumentIndices.push_back(arg.getArgNumber());
+        candidate.captures.push_back(std::move(item));
       }
 
       auto sameCandidate =
           [&](const ReturnedCallableAlternativeSummary &alternative) {
             return alternative.target == candidate.target &&
-                   alternative.captureArgumentIndices ==
-                       candidate.captureArgumentIndices;
+                   alternative.captures == candidate.captures;
           };
       if (!llvm::any_of(summary.alternatives, sameCandidate))
         summary.alternatives.push_back(std::move(candidate));
     });
+
+    // Result lanes are per-function ABI: with more than one alternative the
+    // lane layout would depend on which return ran, so lane captures demand
+    // a single summarized alternative.
+    bool laneCaptures =
+        llvm::any_of(summary.alternatives,
+                     [](const ReturnedCallableAlternativeSummary &alternative) {
+                       return alternative.hasLaneCaptures();
+                     });
+    if (laneCaptures && summary.alternatives.size() != 1)
+      invalid = true;
 
     if (!invalid && sawReturn && !summary.alternatives.empty())
       returnedCallableSummaries[function.getSymName()] = std::move(summary);

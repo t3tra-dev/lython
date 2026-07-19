@@ -257,9 +257,31 @@ struct ControlFlowLogicalBlockArgumentABI {
   mlir::BlockArgument argument;
 };
 
+// One closure capture of a returned nested function. Either the capture is
+// an entry argument of the RETURNING function (the caller rebuilds it from
+// its own argument sources at `argumentIndex`), or it is a local of the
+// returning function and its physical values ride OUT as an owned result
+// lane of contract `laneContract` (the R6 nonlocal cell escaping with its
+// closure is the canonical case).
+struct ReturnedCallableCapture {
+  std::optional<unsigned> argumentIndex;
+  mlir::Type laneContract;
+
+  bool operator==(const ReturnedCallableCapture &other) const {
+    return argumentIndex == other.argumentIndex &&
+           laneContract == other.laneContract;
+  }
+};
+
 struct ReturnedCallableAlternativeSummary {
   std::string target;
-  llvm::SmallVector<unsigned, 4> captureArgumentIndices;
+  llvm::SmallVector<ReturnedCallableCapture, 4> captures;
+
+  bool hasLaneCaptures() const {
+    return llvm::any_of(captures, [](const ReturnedCallableCapture &capture) {
+      return static_cast<bool>(capture.laneContract);
+    });
+  }
 };
 
 struct ReturnedCallableSummary {

@@ -69,8 +69,13 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
   if (expr->kind == "Name") {
     llvm::StringRef name = ast::nameSpelling(*expr);
     auto found = values.find(name);
-    if (found != values.end())
+    if (found != values.end()) {
+      // A boxed (nonlocal-shared) local binds to its cell instance; the
+      // expression value is the cell's current content.
+      if (isCellContract(found->second.type))
+        return emitCellLoad(*expr, found->second);
       return found->second;
+    }
     if (isModuleGlobalRead(name)) {
       mlir::Type type = moduleGlobals.lookup(name);
       auto op = py::GlobalGetOp::create(builder, loc(*expr), type,

@@ -248,10 +248,14 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
   values.clear();
   llvm::StringSet<> savedGlobalDecls = std::move(currentGlobalDecls);
   currentGlobalDecls.clear();
+  llvm::StringSet<> savedBoxedLocals = std::move(currentBoxedLocals);
+  currentBoxedLocals = isLambda ? llvm::StringSet<>()
+                                : nonlocalBoxedNames(callable);
   bool savedModuleScope = atModuleScope;
   atModuleScope = false;
   llvm::scope_exit restoreGlobalScope([&] {
     currentGlobalDecls = std::move(savedGlobalDecls);
+    currentBoxedLocals = std::move(savedBoxedLocals);
     atModuleScope = savedModuleScope;
   });
   currentReturnType = sig.resultType;
@@ -317,7 +321,16 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
   for (auto [index, capture] : llvm::enumerate(captures)) {
     values[capture.name] =
         Value{entry->getArgument(captureOffset + index), capture.value.type};
-    types.bindSymbol(capture.name, capture.value.type);
+    // A cell capture binds the NAME to the cell instance, but the name's
+    // Python-level type is the content: expressions read through the cell.
+    if (isCellContract(capture.value.type)) {
+      if (mlir::Type content = cellContentType(capture.value.type))
+        types.bindSymbol(capture.name, content);
+      else
+        types.bindSymbol(capture.name, capture.value.type);
+    } else {
+      types.bindSymbol(capture.name, capture.value.type);
+    }
   }
 
   builder.setInsertionPointToStart(entry);
@@ -378,6 +391,53 @@ Value ModuleEmitter::emitNestedFunctionDecl(const parser::Node &function) {
   }
 
   FunctionSignature sig = types.functionSignature(function);
+
+  // CPython evaluates a def statement's non-constant defaults when the def
+  // executes — for a nested def that is once per ENCLOSING execution, in the
+  // enclosing frame. Evaluate them here (the builder still sits in the
+  // enclosing body) and thread each value in as a synthetic capture; every
+  // omitted-argument call of this instance then shares the one evaluation.
+  auto evaluateNestedDefault = [&](const parser::NodePtr &expr,
+                                   unsigned slot) {
+    if (!expr)
+      return;
+    mlir::Attribute literal = defaultValueAttr(builder, expr.get());
+    auto dict = mlir::dyn_cast_or_null<mlir::DictionaryAttr>(literal);
+    auto kind = dict ? dict.getAs<mlir::StringAttr>("kind") : mlir::StringAttr();
+    if (!kind || kind.getValue() != "unsupported")
+      return;
+    mlir::Type declared;
+    unsigned positionalCount = static_cast<unsigned>(sig.positionalTypes.size());
+    if (slot < positionalCount)
+      declared = types.widenLiteral(sig.positionalTypes[slot]);
+    else if (slot - positionalCount < sig.kwOnlyTypes.size())
+      declared = types.widenLiteral(sig.kwOnlyTypes[slot - positionalCount]);
+    if (!declared)
+      return;
+    Value value = emitExprExpected(expr.get(), declared);
+    Value coerced = coerceValue(value, declared, function);
+    std::string captureName =
+        (llvm::Twine("__ly.defaultcap.") + llvm::Twine(slot)).str();
+    nestedDefaultCaptures[&function].push_back(
+        {slot, static_cast<unsigned>(captures.size())});
+    captures.push_back(Capture{captureName, coerced});
+  };
+  if (const parser::Node *arguments = ast::node(function, "args")) {
+    unsigned positionalCount = static_cast<unsigned>(sig.positionalTypes.size());
+    if (const auto *defaults = ast::nodeList(*arguments, "defaults");
+        defaults && !defaults->empty()) {
+      unsigned firstDefault =
+          positionalCount - static_cast<unsigned>(defaults->size());
+      for (auto [index, value] : llvm::enumerate(*defaults))
+        evaluateNestedDefault(value,
+                              firstDefault + static_cast<unsigned>(index));
+    }
+    if (const auto *kwDefaults = ast::nodeList(*arguments, "kw_defaults"))
+      for (auto [index, value] : llvm::enumerate(*kwDefaults))
+        evaluateNestedDefault(value,
+                              positionalCount + static_cast<unsigned>(index));
+  }
+
   std::string symbolName =
       (llvm::Twine(currentFunctionPrefix.empty() ? "__main__"
                                                  : currentFunctionPrefix) +
@@ -401,9 +461,12 @@ Value ModuleEmitter::emitNestedFunctionDecl(const parser::Node &function) {
 //   (kind="global"; the evaluation itself is emitted by
 //   emitPendingDefaultCells at the skipped declaration's slot in the module
 //   body walk, preserving def-execution order).
-// - NESTED defs keep the zero-argument PROVIDER function called per omitted
-//   argument (documented deviation: a nested def re-executes per enclosing
-//   call, and there is no per-execution storage to park the value in yet).
+// - NESTED defs evaluate the expression ONCE when the enclosing execution
+//   reaches the def statement, into a synthetic closure capture every
+//   omitted-argument call site of that instance reads (kind="capture"; a
+//   nested def re-executing per enclosing call re-evaluates, which is the
+//   CPython def-statement semantics). The zero-argument PROVIDER fallback
+//   remains only for callables outside both paths (lambda defaults).
 mlir::ArrayAttr ModuleEmitter::emitCallableDefaultValues(
     const parser::Node &function, const FunctionSignature &sig,
     llvm::StringRef symbolName) {
@@ -496,8 +559,25 @@ mlir::ArrayAttr ModuleEmitter::emitCallableDefaultValues(
     auto dict = mlir::dyn_cast_or_null<mlir::DictionaryAttr>(literal);
     auto kind = dict ? dict.getAs<mlir::StringAttr>("kind")
                      : mlir::StringAttr();
-    if (node && kind && kind.getValue() == "unsupported")
+    if (node && kind && kind.getValue() == "unsupported") {
+      // A nested def already evaluated this default at the def statement
+      // (emitNestedFunctionDecl) into a synthetic capture; the call site
+      // reads it out of the closure evidence instead of re-evaluating.
+      if (auto nested = nestedDefaultCaptures.find(&function);
+          nested != nestedDefaultCaptures.end()) {
+        for (const auto &[capturedSlot, captureIndex] : nested->second) {
+          if (capturedSlot != slot)
+            continue;
+          llvm::SmallVector<mlir::NamedAttribute, 2> attrs;
+          attrs.push_back(
+              builder.getNamedAttr("kind", builder.getStringAttr("capture")));
+          attrs.push_back(builder.getNamedAttr(
+              "value", builder.getI64IntegerAttr(captureIndex)));
+          return builder.getDictionaryAttr(attrs);
+        }
+      }
       return emitProvider(node, slot);
+    }
     return literal;
   };
 

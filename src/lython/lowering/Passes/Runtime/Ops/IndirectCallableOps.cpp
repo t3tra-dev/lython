@@ -231,6 +231,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
     }
 
     valueBundles[op.getResult(0)] = std::move(result);
+    // See lowerFunctionTargetCall: the callee may mutate borrowed container
+    // arguments in place.
+    demoteMutableContainerArgumentEvidence(op);
     erase.push_back(op);
     return mlir::success();
   }
@@ -426,6 +429,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
     }
   }
 
+  demoteMutableContainerArgumentEvidence(op);
   erase.push_back(op);
   return mlir::success();
 }

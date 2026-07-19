@@ -224,7 +224,8 @@ buildCallableArgumentPlan(mlir::Operation *op, py::CallableType callable,
 mlir::LogicalResult RuntimeBundleLowerer::collectFunctionCallSources(
     py::CallOp op, mlir::func::FuncOp target, llvm::StringRef targetName,
     llvm::SmallVectorImpl<const RuntimeBundle *> &sources,
-    llvm::SmallVectorImpl<RuntimeBundle> &materializedDefaults) {
+    llvm::SmallVectorImpl<RuntimeBundle> &materializedDefaults,
+    const RuntimeBundle *callableObject) {
   auto callableAttr = target->getAttrOfType<mlir::TypeAttr>("callable_type");
   if (!callableAttr)
     return op.emitError() << "function target '" << targetName
@@ -339,9 +340,9 @@ mlir::LogicalResult RuntimeBundleLowerer::collectFunctionCallSources(
       continue;
     }
     const RuntimeBundle *source = nullptr;
-    if (mlir::failed(materializeDefaultArgument(op, target, targetName, index,
-                                                parameters[index],
-                                                materializedDefaults, source)))
+    if (mlir::failed(materializeDefaultArgument(
+            op, target, targetName, index, parameters[index],
+            materializedDefaults, source, callableObject)))
       return mlir::failure();
     sources.push_back(source);
   }
@@ -554,7 +555,7 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultArgument(
     py::CallOp op, mlir::func::FuncOp target, llvm::StringRef targetName,
     unsigned index, mlir::Type parameterType,
     llvm::SmallVectorImpl<RuntimeBundle> &materializedDefaults,
-    const RuntimeBundle *&source) {
+    const RuntimeBundle *&source, const RuntimeBundle *callableObject) {
   auto values =
       target->getAttrOfType<mlir::ArrayAttr>(kCallableDefaultValuesAttr);
   if (!values || index >= values.size() ||
@@ -562,6 +563,34 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultArgument(
     return op.emitError() << "function target '" << targetName
                           << "' has default metadata mismatch at argument "
                           << index;
+
+  // Def-statement evaluated defaults of nested defs live in the closure
+  // evidence (one evaluation per enclosing execution); read the shared
+  // value instead of re-evaluating.
+  if (auto dict = mlir::dyn_cast<mlir::DictionaryAttr>(values[index])) {
+    if (auto kind = dict.getAs<mlir::StringAttr>("kind");
+        kind && kind.getValue() == "capture") {
+      auto captureIndex = dict.getAs<mlir::IntegerAttr>("value");
+      if (!captureIndex)
+        return op.emitError() << "capture default value has no closure index";
+      if (!callableObject ||
+          static_cast<std::size_t>(captureIndex.getInt()) >=
+              callableObject->closureValues.size())
+        return op.emitError()
+               << "function target '" << targetName
+               << "' default argument " << index
+               << " needs the def-statement evaluated value from closure "
+                  "evidence, which this call site does not carry";
+      const RuntimeValue &captured =
+          callableObject->closureValues[captureIndex.getInt()];
+      RuntimeBundle bundle =
+          RuntimeBundle::object(captured.contract, captured.values);
+      bundle.setObjectLogicalOwnership(/*ownsObject=*/false);
+      materializedDefaults.push_back(std::move(bundle));
+      source = &materializedDefaults.back();
+      return mlir::success();
+    }
+  }
 
   RuntimeBundle bundle;
   if (mlir::failed(RuntimeBundleLowerer::materializeDefaultValue(

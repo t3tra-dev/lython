@@ -571,6 +571,47 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
       }
       ++logicalResultIndex;
     }
+    // Returned-closure local captures: transfer each lane capture's value
+    // group through the trailing owned result lanes the ABI reserved.
+    if (auto returnedCallable =
+            returnedCallableSummaries.find(function.getSymName());
+        returnedCallable != returnedCallableSummaries.end() &&
+        returnedCallable->second.alternatives.size() == 1 &&
+        returnedCallable->second.alternatives.front().hasLaneCaptures()) {
+      if (op->getNumOperands() != 1) {
+        op.emitError() << "returned closure capture lanes expect a single "
+                          "return operand";
+        result = mlir::failure();
+        return mlir::WalkResult::interrupt();
+      }
+      const RuntimeBundle *bundle =
+          RuntimeBundleLowerer::bundleFor(op.getOperand(0));
+      const ReturnedCallableAlternativeSummary &alternative =
+          returnedCallable->second.alternatives.front();
+      if (!bundle ||
+          bundle->closureValues.size() != alternative.captures.size()) {
+        op.emitError() << "returned closure bundle does not carry the "
+                          "summarized captures";
+        result = mlir::failure();
+        return mlir::WalkResult::interrupt();
+      }
+      for (auto [index, capture] : llvm::enumerate(alternative.captures)) {
+        if (!capture.laneContract)
+          continue;
+        const RuntimeValue &closureValue = bundle->closureValues[index];
+        // The function-local owned token leaves through the lane, exactly
+        // like an ordinary owned return operand: the refcount phases see the
+        // lane as this value's transfer and insert no scope-end release.
+        RuntimeBundle laneBundle = RuntimeBundle::object(
+            closureValue.contract, closureValue.values);
+        if (mlir::failed(appendReturnObject(laneBundle,
+                                            "returned closure capture",
+                                            capture.laneContract))) {
+          result = mlir::failure();
+          return mlir::WalkResult::interrupt();
+        }
+      }
+    }
     if (resultIndex != functionType.getNumResults()) {
       op.emitError() << "callable return ABI expected "
                      << functionType.getNumResults()

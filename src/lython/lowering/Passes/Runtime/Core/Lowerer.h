@@ -131,6 +131,19 @@ private:
   mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>>
   classFieldStorageValueTypes(mlir::Operation *op, mlir::Type fieldContract,
                               llvm::StringRef purpose) const;
+  // R6 nonlocal cells: emitter-synthesized one-field classes whose field
+  // slot is a box16 written IN PLACE (never spliced into new SSA lanes), so
+  // every frame sharing the cell instance observes one mutable slot.
+  static bool isCellClassOp(py::ClassOp classOp);
+  mlir::LogicalResult lowerCellAttrGet(py::AttrGetOp op,
+                                       const RuntimeBundle &object,
+                                       py::ClassOp classOp,
+                                       unsigned fieldIndex);
+  mlir::LogicalResult lowerCellAttrSet(py::AttrSetOp op,
+                                       const RuntimeBundle &object,
+                                       const RuntimeBundle &value,
+                                       py::ClassOp classOp,
+                                       unsigned fieldIndex);
   mlir::LogicalResult writeBackFieldAlias(mlir::Operation *op,
                                           const RuntimeBundle &updatedField);
   std::optional<unsigned> findUnionMemberIndex(py::UnionType unionType,
@@ -431,6 +444,13 @@ private:
       llvm::ArrayRef<ownership::RuntimeDeallocator> deallocators,
       unsigned depth);
   std::uint64_t collectionInitialCapacity(std::uint64_t arity) const;
+  static bool isMutableContainerContractName(llvm::StringRef contract);
+  static void demoteMutableContainerEvidence(RuntimeBundle &bundle);
+  void demoteMutableContainerEvidenceFor(mlir::Value value);
+  void demoteMutableContainerArgumentEvidence(py::CallOp op);
+  mlir::FailureOr<mlir::Value>
+  rawSequenceIndexValue(mlir::Operation *op, mlir::Value indexValue,
+                        const RuntimeBundle &index);
   mlir::FailureOr<RuntimeBundle>
   materializePayloadObjectBundle(mlir::Operation *op,
                                  const RuntimeBundle &value);
@@ -1010,12 +1030,14 @@ private:
   mlir::LogicalResult collectFunctionCallSources(
       py::CallOp op, mlir::func::FuncOp target, llvm::StringRef targetName,
       llvm::SmallVectorImpl<const RuntimeBundle *> &sources,
-      llvm::SmallVectorImpl<RuntimeBundle> &materializedDefaults);
+      llvm::SmallVectorImpl<RuntimeBundle> &materializedDefaults,
+      const RuntimeBundle *callableObject = nullptr);
   mlir::LogicalResult materializeDefaultArgument(
       py::CallOp op, mlir::func::FuncOp target, llvm::StringRef targetName,
       unsigned index, mlir::Type parameterType,
       llvm::SmallVectorImpl<RuntimeBundle> &materializedDefaults,
-      const RuntimeBundle *&source);
+      const RuntimeBundle *&source,
+      const RuntimeBundle *callableObject = nullptr);
   mlir::LogicalResult
   materializeArityObject(mlir::Operation *op, mlir::Type contract,
                          std::uint64_t arity, RuntimeBundle &bundle,

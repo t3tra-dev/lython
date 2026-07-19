@@ -423,6 +423,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAsyncFunctionTargetCall(
           op, target, targetName, sources, result)))
     return mlir::failure();
   valueBundles[op.getResult(0)] = std::move(result);
+  // The coroutine body runs on later awaits; container arguments absorbed
+  // into the frame may be mutated there.
+  demoteMutableContainerArgumentEvidence(op);
   erase.push_back(op);
   return mlir::success();
 }

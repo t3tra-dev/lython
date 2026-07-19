@@ -30,6 +30,65 @@ mlir::Value constantIndex(mlir::OpBuilder &builder, mlir::Location loc,
   return mlir::arith::ConstantIndexOp::create(builder, loc, value).getResult();
 }
 
+} // namespace
+
+bool RuntimeBundleLowerer::isMutableContainerContractName(
+    llvm::StringRef contract) {
+  return contract == "builtins.list" || contract == "builtins.dict" ||
+         contract == "builtins.set";
+}
+
+// Compile-time contents evidence is only valid while every mutation of the
+// container is visible to this walk. Once the value escapes into code the
+// walk cannot see through (a user function, a closure environment), the
+// runtime payload becomes the sole authority: evidence-backed lowerings keep
+// payload and length in sync at every step, so dropping the evidence is
+// always semantics-preserving (reads fall back to the runtime paths).
+void RuntimeBundleLowerer::demoteMutableContainerEvidence(
+    RuntimeBundle &bundle) {
+  if (bundle.kind != RuntimeBundle::Kind::Object ||
+      !isMutableContainerContractName(bundle.contractName()))
+    return;
+  bundle.sequenceElements.clear();
+  bundle.sequenceElementBundles.clear();
+  bundle.sequenceIndices.clear();
+  bundle.sequenceEvidenceBacked = false;
+  bundle.sequenceCapacity = 0;
+  bundle.mappingKeys.clear();
+  bundle.mappingKeyBundles.clear();
+  bundle.mappingValues.clear();
+  bundle.mappingValueBundles.clear();
+  bundle.mappingPresent.clear();
+  bundle.mappingEvidenceBacked = false;
+  bundle.mappingCapacity = 0;
+}
+
+void RuntimeBundleLowerer::demoteMutableContainerEvidenceFor(
+    mlir::Value value) {
+  auto found = valueBundles.find(value);
+  if (found == valueBundles.end())
+    return;
+  demoteMutableContainerEvidence(found->second);
+}
+
+void RuntimeBundleLowerer::demoteMutableContainerArgumentEvidence(
+    py::CallOp op) {
+  auto demotePack = [&](mlir::Value packValue) {
+    const RuntimeBundle *pack = RuntimeBundleLowerer::bundleFor(packValue);
+    if (!pack || pack->kind != RuntimeBundle::Kind::Aggregate)
+      return;
+    // Copy: demotion writes into valueBundles and would invalidate `pack`.
+    llvm::SmallVector<mlir::Value, 8> operands(pack->aggregateOperands.begin(),
+                                               pack->aggregateOperands.end());
+    for (mlir::Value operand : operands)
+      demoteMutableContainerEvidenceFor(operand);
+  };
+  demotePack(op.getPosargs());
+  demotePack(op.getKwvalues());
+}
+
+namespace {
+
 constexpr unsigned kPayloadHandleWords =
     static_cast<unsigned>(box_abi::kWordsPerBox);
 constexpr unsigned kPayloadValuePointerWords =

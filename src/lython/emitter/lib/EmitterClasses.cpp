@@ -2072,4 +2072,172 @@ Value ModuleEmitter::emitClassInstantiation(const parser::Node &expr,
   return {newOp.getInstance(), inferredInstanceType};
 }
 
+// ---------------------------------------------------------------------------
+// R6 nonlocal cells. A cell is an ordinary user class with one field "v":
+// instances are refcounted owned values (QTT-tracked like any object), and
+// the shared mutation of the content is the field's interior mutability, so
+// the whole existing class machinery (field boxes, aggregate retain/release,
+// deallocator hooks, affine verification) applies without new proof rules.
+// ---------------------------------------------------------------------------
+
+static constexpr llvm::StringLiteral kCellClassPrefix{"__ly_cell$"};
+
+bool ModuleEmitter::isCellContract(mlir::Type type) {
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
+  return contract && contract.getContractName().starts_with(kCellClassPrefix);
+}
+
+mlir::Type ModuleEmitter::cellContentType(mlir::Type cellType) {
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(cellType);
+  if (!contract)
+    return {};
+  auto fields = classFieldBindings.find(contract.getContractName());
+  if (fields == classFieldBindings.end())
+    return {};
+  auto field = fields->second.find("v");
+  return field == fields->second.end() ? mlir::Type() : field->second;
+}
+
+mlir::Type ModuleEmitter::ensureCellClass(mlir::Type contentType,
+                                          const parser::Node &anchor) {
+  auto memoized = cellClassContracts.find(contentType);
+  if (memoized != cellClassContracts.end())
+    return memoized->second;
+
+  std::string cellName =
+      (llvm::Twine(kCellClassPrefix) + llvm::Twine(++cellClassCounter)).str();
+  mlir::Type contract = types.contract(cellName);
+
+  classBaseNames[cellName] = {};
+  classMros[cellName] = {cellName, "builtins.object"};
+  classOwnFieldOrders[cellName] = {"v"};
+  classFieldOrders[cellName] = {"v"};
+  classFieldBindings[cellName]["v"] = contentType;
+
+  py::protocols::ProtocolInfo protocolInfo;
+  protocolInfo.fields["v"] = contentType;
+  py::protocols::Table::getMutable(context).registerClass(
+      cellName, std::move(protocolInfo));
+
+  mlir::OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPointToEnd(module.getBody());
+  mlir::OperationState state(loc(anchor), py::ClassOp::getOperationName());
+  state.addAttribute(mlir::SymbolTable::getSymbolAttrName(),
+                     builder.getStringAttr(cellName));
+  state.addAttribute("base_names",
+                     stringArray(builder, llvm::ArrayRef<std::string>{}));
+  state.addAttribute("field_names",
+                     stringArray(builder, llvm::ArrayRef<std::string>{"v"}));
+  state.addAttribute("field_types",
+                     typeArray(builder, llvm::ArrayRef<mlir::Type>{contentType}));
+  // The STORAGE contract is the erased object: the existing box-fronted
+  // field rule then gives the cell one stable box16 slot (allocation,
+  // deallocator and init paths all follow that rule), which is what lets a
+  // closure's store reach every other frame holding the cell.
+  state.addAttribute(
+      "field_contract_types",
+      typeArray(builder, llvm::ArrayRef<mlir::Type>{
+                             types.contract("builtins.object")}));
+  state.addAttribute("method_names",
+                     stringArray(builder, llvm::ArrayRef<std::string>{}));
+  state.addAttribute("method_contracts",
+                     typeArray(builder, llvm::ArrayRef<mlir::Type>{}));
+  state.addAttribute("method_kinds",
+                     stringArray(builder, llvm::ArrayRef<std::string>{}));
+  state.addAttribute("method_symbols",
+                     stringArray(builder, llvm::ArrayRef<std::string>{}));
+  state.addAttribute("mro_names",
+                     stringArray(builder, llvm::ArrayRef<std::string>{
+                                              cellName, "builtins.object"}));
+  state.addRegion();
+  mlir::Operation *op = builder.create(state);
+  op->getRegion(0).push_back(new mlir::Block);
+
+  cellClassContracts[contentType] = contract;
+  return contract;
+}
+
+Value ModuleEmitter::emitCellAlloc(const parser::Node &anchor, Value initial) {
+  mlir::Type content = types.widenLiteral(initial.type);
+  mlir::Type cellType = ensureCellClass(content, anchor);
+  Value coerced = coerceValue(initial, content, anchor);
+  mlir::Type classType = types.typeObject(cellType);
+  auto classObject =
+      py::TypeObjectOp::create(builder, loc(anchor), classType, cellType);
+  Value posPack = emitPack({coerced});
+  Value namePack = emitPack({});
+  Value valuePack = emitPack({});
+  auto newOp = py::NewOp::create(
+      builder, loc(anchor), cellType,
+      mlir::FlatSymbolRefAttr::get(&context, "__new__"), callableProtocol(),
+      classObject.getResult(), posPack.value, namePack.value, valuePack.value);
+  auto contract = mlir::cast<py::ContractType>(cellType);
+  newOp->setAttr("ly.constructor.owner",
+                 builder.getStringAttr(contract.getContractName()));
+  newOp->setAttr("ly.constructor.new_kind", builder.getStringAttr("class"));
+  // Field-record initialization (the no-__init__ construction rule): the
+  // initial content boxes into the cell's slot during lowerInit.
+  llvm::SmallVector<mlir::Type, 2> positional{cellType, content};
+  llvm::SmallVector<mlir::StringAttr, 2> positionalNames{
+      builder.getStringAttr("self"), builder.getStringAttr("v")};
+  llvm::SmallVector<mlir::BoolAttr, 2> positionalDefaults{
+      builder.getBoolAttr(false), builder.getBoolAttr(true)};
+  llvm::SmallVector<mlir::Type, 1> results{types.none()};
+  mlir::Type initContract = py::CallableType::get(
+      &context, positional, {}, {}, {}, results, positionalNames, {},
+      positionalDefaults, {});
+  auto initOp =
+      py::InitOp::create(builder, loc(anchor), types.none(),
+                         mlir::FlatSymbolRefAttr::get(&context, "__init__"),
+                         initContract, newOp.getInstance(), posPack.value,
+                         namePack.value, valuePack.value);
+  initOp->setAttr("ly.constructor.owner",
+                  builder.getStringAttr(contract.getContractName()));
+  initOp->setAttr("ly.constructor.init_kind", builder.getStringAttr("instance"));
+  return {newOp.getInstance(), cellType};
+}
+
+Value ModuleEmitter::emitCellLoad(const parser::Node &anchor,
+                                  const Value &cell) {
+  mlir::Type content = cellContentType(cell.type);
+  if (!content) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, anchor.range.start,
+        "internal: nonlocal cell has no registered content type"});
+    return emitNone(anchor);
+  }
+  auto op =
+      py::AttrGetOp::create(builder, loc(anchor), content, cell.value, "v");
+  op->setAttr("ly.attr.kind", builder.getStringAttr("field"));
+  auto contract = mlir::cast<py::ContractType>(cell.type);
+  op->setAttr("ly.attr.owner",
+              builder.getStringAttr(contract.getContractName()));
+  return {op.getResult(), content};
+}
+
+void ModuleEmitter::emitCellStore(const parser::Node &anchor, const Value &cell,
+                                  Value value) {
+  mlir::Type content = cellContentType(cell.type);
+  if (!content) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, anchor.range.start,
+        "internal: nonlocal cell has no registered content type"});
+    return;
+  }
+  Value coerced = coerceValue(value, content, anchor);
+  if (coerced.type != content) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, anchor.range.start,
+        "nonlocal assignment does not match the variable's established "
+        "type"});
+    return;
+  }
+  auto op = py::AttrSetOp::create(builder, loc(anchor), cell.value, "v",
+                                  coerced.value);
+  op->setAttr("ly.attr.kind", builder.getStringAttr("field"));
+  auto contract = mlir::cast<py::ContractType>(cell.type);
+  op->setAttr("ly.attr.owner",
+              builder.getStringAttr(contract.getContractName()));
+}
+
 } // namespace lython::emitter

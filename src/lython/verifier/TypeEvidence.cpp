@@ -639,10 +639,13 @@ mlir::LogicalResult verifyManifestCandidate(mlir::Operation *op,
     py::ClassOp classOp =
         contract ? type_object::lookup(op, contract.getContractName())
                  : py::ClassOp{};
-    auto fieldTypes =
-        classOp ? classOp->getAttrOfType<mlir::ArrayAttr>("field_contract_types")
-                : mlir::ArrayAttr{};
-    if (fieldTypes) {
+    // The constructor receives the LOGICAL field types ("field_types");
+    // "field_contract_types" is the storage view and may be erased relative
+    // to them (nonlocal cells store their content box-fronted as
+    // builtins.object). For ordinary classes the two arrays are identical.
+    auto acceptFieldArray = [&](mlir::ArrayAttr fieldTypes) {
+      if (!fieldTypes)
+        return false;
       llvm::ArrayRef<mlir::Type> positional = selected.getPositionalTypes();
       llvm::ArrayRef<mlir::Type> results = selected.getResultTypes();
       bool matches = positional.size() == fieldTypes.size() + 1 &&
@@ -656,9 +659,14 @@ mlir::LogicalResult verifyManifestCandidate(mlir::Operation *op,
             break;
           }
         }
-      if (matches)
-        return mlir::success();
-    }
+      return matches;
+    };
+    if (classOp &&
+        (acceptFieldArray(
+             classOp->getAttrOfType<mlir::ArrayAttr>("field_contract_types")) ||
+         acceptFieldArray(
+             classOp->getAttrOfType<mlir::ArrayAttr>("field_types"))))
+      return mlir::success();
   }
 
   return op->emitError()

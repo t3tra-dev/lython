@@ -228,12 +228,23 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
   } else if (statement.kind == "Delete") {
     emitDelete(statement);
   } else if (statement.kind == "Nonlocal") {
-    // R6 wants a refcounted shared box; the closure machinery currently
-    // captures by value only, so an honest rejection beats a silent copy.
-    diagnostics.push_back(parser::Diagnostic{
-        parser::Severity::Error, statement.range.start,
-        "nonlocal is not implemented yet (closures capture by value; the R6 "
-        "shared-box cell representation is pending)"});
+    // The enclosing function already promoted these locals to shared cells
+    // (nonlocalBoxedNames) and this function captured the cell instances;
+    // reads/writes dispatch on the cell binding, so the declaration itself
+    // only validates that each target resolved to a cell.
+    if (const auto *names = ast::stringList(statement, "names"))
+      for (const std::string &name : *names) {
+        auto found = values.find(name);
+        if (found == values.end() ||
+            !isCellContract(found->second.type)) {
+          diagnostics.push_back(parser::Diagnostic{
+              parser::Severity::Error, statement.range.start,
+              "no binding for nonlocal '" + name +
+                  "' found (the target must be assigned in an enclosing "
+                  "function before this definition)"});
+        }
+      }
+    return;
   } else if (statement.kind == "Pass") {
     return;
   } else if (statement.kind == "Match") {
@@ -318,6 +329,20 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
       Value coerced = coerceValue(value, type, target);
       py::GlobalSetOp::create(builder, loc(target),
                               builder.getStringAttr(name), coerced.value);
+      return;
+    }
+    // A name bound to a nonlocal cell (owner scope or a `nonlocal`-declaring
+    // closure) writes THROUGH the cell: the binding itself never changes.
+    auto bound = values.find(name);
+    if (bound != values.end() && isCellContract(bound->second.type)) {
+      emitCellStore(target, bound->second, value);
+      return;
+    }
+    if (bound == values.end() && currentBoxedLocals.contains(name)) {
+      // First binding of a boxed local: its storage is a fresh shared cell.
+      Value cell = emitCellAlloc(target, value);
+      values[name] = cell;
+      types.bindSymbol(name, cellContentType(cell.type));
       return;
     }
     value = pinLoopCarriedTensor(name, value, target);

@@ -27,7 +27,8 @@ mlir::LogicalResult RuntimeBundleLowerer::collectFunctionTargetRuntimeSources(
     llvm::SmallVectorImpl<RuntimeBundle> &argumentEvidenceSources,
     llvm::SmallVectorImpl<RuntimeBundle> &aggregateEvidenceSources) {
   if (mlir::failed(collectFunctionCallSources(op, target, targetName, sources,
-                                              materializedDefaults)))
+                                              materializedDefaults,
+                                              &callable)))
     return mlir::failure();
 
   llvm::SmallVector<mlir::Type, 4> closureTypes =
@@ -133,6 +134,9 @@ RuntimeBundleLowerer::lowerFunctionTargetCall(py::CallOp op,
           op, target, targetName, *call, sources, result)))
     return mlir::failure();
   valueBundles[op.getResult(0)] = std::move(result);
+  // The callee body is opaque to this walk and receives its container
+  // arguments borrowed: it may have mutated them in place.
+  demoteMutableContainerArgumentEvidence(op);
   erase.push_back(op);
   return mlir::success();
 }
@@ -150,6 +154,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerGeneratorFunctionTargetCall(
           result)))
     return mlir::failure();
   valueBundles[op.getResult(0)] = std::move(result);
+  // The generator body runs on later next()/send() calls; container
+  // arguments absorbed into the frame may be mutated there.
+  demoteMutableContainerArgumentEvidence(op);
   erase.push_back(op);
   return mlir::success();
 }
@@ -734,6 +741,11 @@ mlir::LogicalResult RuntimeBundleLowerer::consumeFunctionTargetCallResult(
             result.boxedObject =
                 std::make_shared<RuntimeBundle>(*sources[sourceIndex]);
         }
+        // The evidence just copied describes the argument BEFORE the call;
+        // a mutable container may have been mutated by the callee body.
+        demoteMutableContainerEvidence(result);
+        if (result.boxedObject)
+          demoteMutableContainerEvidence(*result.boxedObject);
       }
     }
 
@@ -745,16 +757,54 @@ mlir::LogicalResult RuntimeBundleLowerer::consumeFunctionTargetCallResult(
            returned->second.alternatives) {
         RuntimeCallableAlternative alternative;
         alternative.functionTarget = returnedAlternative.target;
-        for (unsigned index : returnedAlternative.captureArgumentIndices) {
-          if (index >= sources.size())
-            return op->emitError() << "returned callable summary for "
-                                  << targetName << " references logical argument "
-                                  << index << ", but call has only "
-                                  << sources.size() << " logical sources";
-          if (sources[index]->kind != RuntimeBundle::Kind::Object)
+        for (const ReturnedCallableCapture &capture :
+             returnedAlternative.captures) {
+          if (capture.argumentIndex) {
+            unsigned index = *capture.argumentIndex;
+            if (index >= sources.size())
+              return op->emitError()
+                     << "returned callable summary for " << targetName
+                     << " references logical argument " << index
+                     << ", but call has only " << sources.size()
+                     << " logical sources";
+            if (sources[index]->kind != RuntimeBundle::Kind::Object)
+              return op->emitError() << "returned callable capture source "
+                                        "must be an object bundle";
+            // A lazy unboxed int argument has no physical values to park in
+            // closure evidence; box it once here (same rule as
+            // appendClosureValues).
+            if (sources[index]->physicalValues().empty() &&
+                RuntimeBundleLowerer::hasLazyPrimitiveI64Object(
+                    *sources[index])) {
+              mlir::FailureOr<RuntimeValue> materialized =
+                  RuntimeBundleLowerer::materializePrimitiveI64Object(
+                      op, *sources[index]);
+              if (mlir::failed(materialized))
+                return mlir::failure();
+              alternative.closureValues.push_back(*materialized);
+              continue;
+            }
+            alternative.closureValues.push_back(sources[index]->objectValue);
+            continue;
+          }
+          // Lane capture: the callee transferred the capture's owned value
+          // group through trailing result lanes.
+          mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> laneTypes =
+              RuntimeBundleLowerer::runtimeValueTypesFor(
+                  op, capture.laneContract, "returned closure capture ABI");
+          if (mlir::failed(laneTypes))
+            return mlir::failure();
+          if (resultIndex + laneTypes->size() > call.getNumResults())
             return op->emitError()
-                   << "returned callable capture source must be an object bundle";
-          alternative.closureValues.push_back(sources[index]->objectValue);
+                   << "function target '" << targetName
+                   << "' returned too few values for closure capture ABI";
+          llvm::SmallVector<mlir::Value, 4> laneValues;
+          for (unsigned end =
+                   resultIndex + static_cast<unsigned>(laneTypes->size());
+               resultIndex < end; ++resultIndex)
+            laneValues.push_back(call.getResult(resultIndex));
+          alternative.closureValues.push_back(
+              RuntimeValue::object(capture.laneContract, laneValues));
         }
         result.callableAlternatives.push_back(std::move(alternative));
       }
