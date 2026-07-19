@@ -50,10 +50,28 @@ std::optional<mlir::Value> knownEvidenceEquality(mlir::Operation *op,
 } // namespace
 
 mlir::LogicalResult RuntimeBundleLowerer::pinProbeOperandLiveness(
-    mlir::Operation *op, const RuntimeBundle &payload) {
-  if (payload.objectValue.ownership == ownership::OwnershipKind::Own)
-    return RuntimeBundleLowerer::releaseAggregateSlot(op, payload,
-                                                      "probe.operand");
+    mlir::Operation *op, const RuntimeBundle &payload,
+    const RuntimeBundle *source) {
+  if (payload.objectValue.ownership == ownership::OwnershipKind::Own) {
+    // Why the release is gated on aliasing: an owned payload that ALIASES the
+    // py-level operand is not a probe-local temporary — the ownership pass
+    // places that value's release after its real last use, and releasing it
+    // here frees a key the program may still read (a dict lookup would
+    // corrupt its own key variable). Only boxes freshly created by
+    // materializePayloadObjectBundle are invisible to the ownership pass and
+    // must be consumed at the probe.
+    bool aliasesSource = false;
+    if (source) {
+      const RuntimeBundle *sourceConcrete =
+          RuntimeBundleLowerer::concreteObjectForOwnership(*source);
+      aliasesSource = sourceConcrete &&
+                      llvm::equal(sourceConcrete->physicalValues(),
+                                  payload.physicalValues());
+    }
+    if (!aliasesSource)
+      return RuntimeBundleLowerer::releaseAggregateSlot(op, payload,
+                                                        "probe.operand");
+  }
   const RuntimeBundle *concrete =
       RuntimeBundleLowerer::concreteObjectForOwnership(payload);
   if (!concrete || concrete->kind != RuntimeBundle::Kind::Object)
@@ -82,8 +100,42 @@ mlir::LogicalResult RuntimeBundleLowerer::pinProbeOperandLiveness(
       return mlir::success();
     }
   }
-  // No conforming neutral use: borrowed payloads reaching here are entry
-  // arguments or rooted evidence, both of which outlive the statement.
+  // No conforming neutral manifest use (source classes have none): a real
+  // call is still required as the ownership pass's liveness anchor — without
+  // one the pass places the payload's release BEFORE the raw-word probe
+  // call and the probe reads freed storage. Synthesize an empty private
+  // per-shape function and call it with the payload's physical values.
+  {
+    llvm::SmallVector<mlir::Type, 4> inputTypes;
+    for (mlir::Value physical : concrete->physicalValues())
+      inputTypes.push_back(physical.getType());
+    std::string sanitized = concrete->contractName();
+    for (char &c : sanitized)
+      if (!llvm::isAlnum(c))
+        c = '_';
+    std::string pinName =
+        ("__ly_probe_pin$" + sanitized + "$" + llvm::Twine(inputTypes.size()))
+            .str();
+    auto pinFn = module.lookupSymbol<mlir::func::FuncOp>(pinName);
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    if (!pinFn) {
+      mlir::OpBuilder moduleBuilder(context);
+      moduleBuilder.setInsertionPointToEnd(module.getBody());
+      pinFn = mlir::func::FuncOp::create(
+          moduleBuilder, op->getLoc(), pinName,
+          moduleBuilder.getFunctionType(inputTypes, {}));
+      pinFn.setPrivate();
+      mlir::Block *body = pinFn.addEntryBlock();
+      moduleBuilder.setInsertionPointToStart(body);
+      mlir::func::ReturnOp::create(moduleBuilder, op->getLoc());
+    }
+    if (pinFn.getFunctionType() ==
+        mlir::FunctionType::get(context, inputTypes, {}))
+      mlir::func::CallOp::create(
+          builder, op->getLoc(), pinFn,
+          llvm::SmallVector<mlir::Value, 4>(concrete->physicalValues().begin(),
+                                            concrete->physicalValues().end()));
+  }
   return mlir::success();
 }
 
@@ -557,8 +609,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerDelItem(py::DelItemOp op) {
         container.physicalValues().begin(), container.physicalValues().end());
     operands.push_back(box);
     RuntimeBundleLowerer::createRuntimeCall(loc, *delItemBox, operands);
-    if (mlir::failed(RuntimeBundleLowerer::pinProbeOperandLiveness(op,
-                                                                   *payload)))
+    if (mlir::failed(RuntimeBundleLowerer::pinProbeOperandLiveness(
+            op, *payload, &index)))
       return mlir::failure();
     for (mlir::Value result : op->getResults())
       valueBundles[result] = container;
@@ -795,8 +847,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerContains(py::ContainsOp op) {
     operands.push_back(box);
     mlir::func::CallOp call =
         RuntimeBundleLowerer::createRuntimeCall(loc, *containsBox, operands);
-    if (mlir::failed(RuntimeBundleLowerer::pinProbeOperandLiveness(op,
-                                                                   *payload)))
+    if (mlir::failed(RuntimeBundleLowerer::pinProbeOperandLiveness(
+            op, *payload, &item)))
       return mlir::failure();
     auto pinObject = [&](const RuntimeBundle &object,
                          llvm::StringRef pinMethod) -> mlir::LogicalResult {

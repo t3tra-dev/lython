@@ -996,8 +996,8 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeDictGetItem(
   mlir::Value found = findCall.getResult(0);
   // The probe consumed only raw pointer words: pin the key past the call
   // (owned keys are consumed by the release inside the pin).
-  if (mlir::failed(RuntimeBundleLowerer::pinProbeOperandLiveness(op,
-                                                                 *payloadKey)))
+  if (mlir::failed(RuntimeBundleLowerer::pinProbeOperandLiveness(
+          op, *payloadKey, &index)))
     return mlir::failure();
   // The probe raised on a miss; `found` is a valid slot on every path that
   // continues here. `missing` survives only for the erased-lane read below.

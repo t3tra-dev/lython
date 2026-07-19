@@ -317,7 +317,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
           RuntimeBundleLowerer::createRuntimeCall(loc, *probe, probeOperands);
       mlir::Value found = probeCall.getResult(0);
       if (mlir::failed(
-              RuntimeBundleLowerer::pinProbeOperandLiveness(op, *payloadKey)))
+              RuntimeBundleLowerer::pinProbeOperandLiveness(op, *payloadKey, sources[1])))
         return mlir::failure();
       mlir::Value zero =
           mlir::arith::ConstantIntOp::create(builder, loc, 0, 64);
@@ -415,7 +415,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
       }
       if (hasDefault && payloadDefault &&
           mlir::failed(RuntimeBundleLowerer::pinProbeOperandLiveness(
-              op, *payloadDefault)))
+              op, *payloadDefault, sources[2])))
         return mlir::failure();
       if (mlir::failed(pinContainerLiveness(op, receiver,
                                             /*insertAfterOp=*/true)))
@@ -523,7 +523,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
       mlir::func::CallOp call =
           RuntimeBundleLowerer::createRuntimeCall(loc, *primitive, operands);
       if (mlir::failed(RuntimeBundleLowerer::pinProbeOperandLiveness(
-              op, *payload)))
+              op, *payload, sources[1])))
         return mlir::failure();
       // Pin the receiver past the raw-word call.
       if (std::optional<RuntimeSymbol> lenPin =

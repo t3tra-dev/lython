@@ -508,11 +508,13 @@ private:
       llvm::function_ref<mlir::LogicalResult(mlir::Type, mlir::ValueRange)>
           emitMember);
   // Best-effort liveness pin of a probe operand past a raw-word call: owned
-  // payloads are consumed by an unconditional release-after (which is also
-  // the pinning use); borrowed payloads get a neutral manifest-method use
+  // MATERIALIZATION-CREATED payloads are consumed by a release-after (which
+  // is also the pinning use); payloads that alias `source` (the operand's
+  // py-level bundle) and borrowed payloads get a neutral manifest-method use
   // when one conforms (borrowed entry arguments outlive the call anyway).
   mlir::LogicalResult pinProbeOperandLiveness(mlir::Operation *op,
-                                              const RuntimeBundle &payload);
+                                              const RuntimeBundle &payload,
+                                              const RuntimeBundle *source);
   mlir::LogicalResult pinContainerLiveness(mlir::Operation *op,
                                            const RuntimeBundle &container,
                                            bool insertAfterOp = false);
@@ -584,6 +586,10 @@ private:
   // `__hash__` returning the i64 hash word (dict/set probing over erased
   // keys).
   mlir::LogicalResult generateBoxedHashHook();
+  // Source-class `__hash__` adapters for the boxed hash dispatch: a compiled
+  // `def __hash__(self) -> int` returns the boxed-int ABI, which the uniform
+  // i64 dispatch cannot call directly.
+  mlir::LogicalResult synthesizeSourceClassHashAdapters();
   // Binary (same-class two-receiver) variant of the uniform dispatch:
   // `(ptr lhs, ptr rhs, i64 class_id) -> (results..., i1 handled)`; callees
   // take their self shape twice.
