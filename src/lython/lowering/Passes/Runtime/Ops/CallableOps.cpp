@@ -221,12 +221,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
       }
     if (shapesUsable) {
       std::optional<RuntimeSymbol> probe = manifest.primitive(
-          "builtins.dict", isPop ? "pop_slot" : "lookup_box");
-      std::optional<RuntimeSymbol> raiseMissing =
-          manifest.primitive("builtins.dict", "raise_missing_key");
+          "builtins.dict",
+          isPop ? (hasDefault ? "pop_slot" : "pop_slot_checked")
+                : "lookup_box");
       std::optional<RuntimeSymbol> releaseParked =
           manifest.primitive("builtins.dict", "release_parked");
-      if (!probe || !raiseMissing || !releaseParked)
+      if (!probe || !releaseParked)
         return op.emitError()
                << "runtime manifest lacks the dict get/pop primitives";
       builder.setInsertionPoint(op);
@@ -282,19 +282,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
           mlir::arith::ConstantIntOp::create(builder, loc, 0, 64);
       mlir::Value ok = mlir::arith::CmpIOp::create(
           builder, loc, mlir::arith::CmpIPredicate::sge, found, zero);
-      if (!hasDefault) {
-        mlir::Value missing = mlir::arith::CmpIOp::create(
-            builder, loc, mlir::arith::CmpIPredicate::slt, found, zero);
-        auto guard = mlir::scf::IfOp::create(builder, loc, mlir::TypeRange{},
-                                             missing, /*withElseRegion=*/false);
-        {
-          mlir::OpBuilder::InsertionGuard insertionGuard(builder);
-          builder.setInsertionPointToStart(&guard.getThenRegion().front());
-          RuntimeBundleLowerer::createRuntimeCall(loc, *raiseMissing,
-                                                  mlir::ValueRange{*keyBox});
-        }
-        builder.setInsertionPointAfter(guard);
-      }
+      // Without a default the probe raised on a miss; nothing to guard here.
       // Slot index whose box words carry the value: the found slot for get,
       // the parked slot (new length) for pop.
       mlir::Value valueSlot;

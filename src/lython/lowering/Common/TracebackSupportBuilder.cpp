@@ -1771,27 +1771,9 @@ void buildPrintExceptionSummary(SupportBuilder &b) {
   b.stringGlobal(".tb_colon_space", ": ");
   b.call("write_cstr", mlir::TypeRange{},
          mlir::ValueRange{stderrFd, b.addrOf(".tb_colon_space")});
-  // str(KeyError(x)) is repr(x) in CPython; approximate with single quotes
-  // around the stored message.
-  std::int64_t keyErrorClassId = 0;
-  for (const py::exceptions::BuiltinExceptionInfo &info :
-       py::exceptions::kBuiltinExceptions)
-    if (info.name == "KeyError")
-      keyErrorClassId = info.classId;
-  mlir::Value isKeyError = b.cmpi(mlir::arith::CmpIPredicate::eq, classId,
-                                  b.iconst(keyErrorClassId));
-  auto writeQuoteIf = [&]() {
-    auto quoteIf = mlir::scf::IfOp::create(b.builder, b.loc, mlir::TypeRange{},
-                                           isKeyError,
-                                           /*withElseRegion=*/false);
-    mlir::OpBuilder::InsertionGuard guard(b.builder);
-    b.builder.setInsertionPointToStart(&quoteIf.getThenRegion().front());
-    b.call("write_char", mlir::TypeRange{},
-           mlir::ValueRange{b.iconst32(2), b.iconst8('\'')});
-  };
-  writeQuoteIf();
+  // KeyError stores repr(key) as its message (LyKeyError_Init and the
+  // runtime missing-key raises), so the display prints it verbatim.
   b.call("write_cstr", mlir::TypeRange{}, mlir::ValueRange{stderrFd, message});
-  writeQuoteIf();
   b.call("write_len", mlir::TypeRange{},
          mlir::ValueRange{stderrFd, b.addrOf(".tb_newline"), b.iconst(1)});
   b.call("free", mlir::TypeRange{}, mlir::ValueRange{message});

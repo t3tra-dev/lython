@@ -962,16 +962,10 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeDictGetItem(
       return false;
   }
   std::optional<RuntimeSymbol> lookupBox =
-      manifest.primitive("builtins.dict", "lookup_box");
+      manifest.primitive("builtins.dict", "lookup_box_checked");
   if (!lookupBox) {
-    op.emitError() << "runtime manifest has no dict lookup_box primitive";
-    return mlir::failure();
-  }
-  std::optional<RuntimeSymbol> raiseMissing =
-      manifest.primitive("builtins.dict", "raise_missing_key");
-  if (!raiseMissing) {
     op.emitError()
-        << "runtime manifest has no dict raise_missing_key primitive";
+        << "runtime manifest has no dict lookup_box_checked primitive";
     return mlir::failure();
   }
 
@@ -1005,18 +999,11 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeDictGetItem(
   if (mlir::failed(RuntimeBundleLowerer::pinProbeOperandLiveness(op,
                                                                  *payloadKey)))
     return mlir::failure();
+  // The probe raised on a miss; `found` is a valid slot on every path that
+  // continues here. `missing` survives only for the erased-lane read below.
   mlir::Value zero = mlir::arith::ConstantIntOp::create(builder, loc, 0, 64);
   mlir::Value missing = mlir::arith::CmpIOp::create(
       builder, loc, mlir::arith::CmpIPredicate::slt, found, zero);
-  auto guard = mlir::scf::IfOp::create(builder, loc, mlir::TypeRange{},
-                                       missing, /*withElseRegion=*/false);
-  {
-    mlir::OpBuilder::InsertionGuard insertionGuard(builder);
-    builder.setInsertionPointToStart(&guard.getThenRegion().front());
-    RuntimeBundleLowerer::createRuntimeCall(loc, *raiseMissing,
-                                            mlir::ValueRange{keyBox});
-  }
-  builder.setInsertionPointAfter(guard);
   mlir::Value safe =
       mlir::arith::SelectOp::create(builder, loc, missing, zero, found)
           .getResult();
