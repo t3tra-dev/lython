@@ -1911,6 +1911,10 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
         return literal(big->decimal);
     return object();
   }
+  // f-strings always evaluate to str; the emitter enforces that each
+  // interpolation is statically formattable.
+  if (node->kind == "JoinedStr" || node->kind == "FormattedValue")
+    return contract("builtins.str");
   // Platform constants type as string literals of the CURRENT TARGET, so
   // `sys.platform == "win32"` branches fold statically (the platform switch
   // idiom runtime lib modules rely on).
@@ -2085,6 +2089,10 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
     mlir::Type rawRight = lenientRecurse(ast::node(*node, "right"));
     mlir::Type left = widenLiteral(rawLeft);
     mlir::Type right = widenLiteral(rawRight);
+    // str % args is printf-style formatting (the emitter expands it); the
+    // result is always str regardless of the right operand.
+    if (ast::isOperator(op, "Mod") && left == strType())
+      return strType();
     llvm::StringRef method = "__add__";
     if (ast::isOperator(op, "Sub"))
       method = "__sub__";
@@ -2280,6 +2288,13 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
         if (positional.size() == 1)
           return strType();
       }
+      if (name == "format") {
+        // Same shape as repr: every __format__ contract returns str, and the
+        // emitter's dispatch rejects receivers without a resolvable
+        // __format__ itself.
+        if (positional.size() == 1 || positional.size() == 2)
+          return strType();
+      }
       if (name == "len") {
         if (strict) {
           if (positional.empty())
@@ -2445,6 +2460,11 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
           mlir::Type receiver = recurse(receiverNode);
           if (strict && !receiver)
             return {};
+          // str.format is expanded by the emitter (no manifest method); its
+          // result is always str.
+          if (*methodName == "format" &&
+              widenLiteral(receiver) == strType())
+            return strType();
           CallInferenceResult inference = inferMethodCallWithEvidence(
               widenLiteral(receiver), *methodName, positional, keywords);
           if (inference)

@@ -312,6 +312,10 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
   }
   if (expr->kind == "Lambda")
     return emitLambda(*expr);
+  if (expr->kind == "JoinedStr")
+    return emitJoinedStr(*expr);
+  if (expr->kind == "FormattedValue")
+    return emitFormattedValue(*expr);
   diagnostics.push_back(
       parser::Diagnostic{parser::Severity::Error, expr->range.start,
                          "unsupported expression kind '" + expr->kind + "'"});
@@ -421,6 +425,15 @@ Value ModuleEmitter::emitUnary(const parser::Node &expr) {
 }
 
 Value ModuleEmitter::emitBinary(const parser::Node &expr) {
+  // str % args is printf-style formatting, not a manifest __mod__; it needs
+  // the unevaluated right-hand AST (tuple literals supply the arguments), so
+  // intercept before the operands are emitted.
+  if (ast::isOperator(ast::node(expr, "op"), "Mod")) {
+    const parser::Node *leftNode = ast::node(expr, "left");
+    if (leftNode && types.widenLiteral(types.inferExpr(leftNode)) ==
+                        types.contract("builtins.str"))
+      return emitPercentFormat(expr);
+  }
   Value lhs = emitExpr(ast::node(expr, "left"));
   Value rhs = emitExpr(ast::node(expr, "right"));
   const parser::Node *op = ast::node(expr, "op");
