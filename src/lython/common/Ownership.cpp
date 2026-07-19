@@ -939,9 +939,21 @@ collectOwnedCallResultGroups(mlir::ModuleOp module, mlir::func::CallOp call,
     auto callable =
         mlir::dyn_cast_if_present<py::CallableType>(callableAttr.getValue());
     if (callable && callable.getResultTypes().size() == 1) {
+      // Contract-declared owned lanes (returned-closure captures, static
+      // object evidence) trail the primary result; the typed matcher needs
+      // the primary result's exact span or it finds nothing and the primary
+      // object degrades to an unresolvable root.
+      mlir::ValueRange typedValues = call.getResults();
+      if (mlir::succeeded(functionContract) &&
+          !functionContract->ownedResults.empty()) {
+        unsigned firstContractOwned = *llvm::min_element(
+            functionContract->ownedResults.values);
+        if (firstContractOwned <= typedValues.size())
+          typedValues = typedValues.take_front(firstContractOwned);
+      }
       llvm::SmallVector<ResourceGroup, 8> typedGroups;
       collectTypedResourceGroups(callable.getResultTypes().front(),
-                                 call.getResults(), deallocators,
+                                 typedValues, deallocators,
                                  /*baseOffset=*/0, typedGroups);
       if (!typedGroups.empty()) {
         for (ResourceGroup &group : typedGroups) {

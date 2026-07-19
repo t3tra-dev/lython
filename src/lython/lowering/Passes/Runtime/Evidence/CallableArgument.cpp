@@ -184,9 +184,14 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableArgumentEvidenceABIs() {
          returned->second.alternatives) {
       RuntimeArgumentEvidence evidence;
       evidence.functionTarget = returnedAlternative.target;
-      for (unsigned logicalIndex : returnedAlternative.captureArgumentIndices) {
+      for (const ReturnedCallableCapture &capture :
+           returnedAlternative.captures) {
+        if (!capture.argumentIndex) {
+          evidence.closureValueTypes.push_back(capture.laneContract);
+          continue;
+        }
         mlir::Type type = logicalSourceType(producer, callable, *invocation,
-                                            *plan, logicalIndex);
+                                            *plan, *capture.argumentIndex);
         if (!type)
           return std::nullopt;
         evidence.closureValueTypes.push_back(runtimeEvidenceType(type));

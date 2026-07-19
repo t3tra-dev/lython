@@ -756,16 +756,54 @@ mlir::LogicalResult RuntimeBundleLowerer::consumeFunctionTargetCallResult(
            returned->second.alternatives) {
         RuntimeCallableAlternative alternative;
         alternative.functionTarget = returnedAlternative.target;
-        for (unsigned index : returnedAlternative.captureArgumentIndices) {
-          if (index >= sources.size())
-            return op->emitError() << "returned callable summary for "
-                                  << targetName << " references logical argument "
-                                  << index << ", but call has only "
-                                  << sources.size() << " logical sources";
-          if (sources[index]->kind != RuntimeBundle::Kind::Object)
+        for (const ReturnedCallableCapture &capture :
+             returnedAlternative.captures) {
+          if (capture.argumentIndex) {
+            unsigned index = *capture.argumentIndex;
+            if (index >= sources.size())
+              return op->emitError()
+                     << "returned callable summary for " << targetName
+                     << " references logical argument " << index
+                     << ", but call has only " << sources.size()
+                     << " logical sources";
+            if (sources[index]->kind != RuntimeBundle::Kind::Object)
+              return op->emitError() << "returned callable capture source "
+                                        "must be an object bundle";
+            // A lazy unboxed int argument has no physical values to park in
+            // closure evidence; box it once here (same rule as
+            // appendClosureValues).
+            if (sources[index]->physicalValues().empty() &&
+                RuntimeBundleLowerer::hasLazyPrimitiveI64Object(
+                    *sources[index])) {
+              mlir::FailureOr<RuntimeValue> materialized =
+                  RuntimeBundleLowerer::materializePrimitiveI64Object(
+                      op, *sources[index]);
+              if (mlir::failed(materialized))
+                return mlir::failure();
+              alternative.closureValues.push_back(*materialized);
+              continue;
+            }
+            alternative.closureValues.push_back(sources[index]->objectValue);
+            continue;
+          }
+          // Lane capture: the callee transferred the capture's owned value
+          // group through trailing result lanes.
+          mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> laneTypes =
+              RuntimeBundleLowerer::runtimeValueTypesFor(
+                  op, capture.laneContract, "returned closure capture ABI");
+          if (mlir::failed(laneTypes))
+            return mlir::failure();
+          if (resultIndex + laneTypes->size() > call.getNumResults())
             return op->emitError()
-                   << "returned callable capture source must be an object bundle";
-          alternative.closureValues.push_back(sources[index]->objectValue);
+                   << "function target '" << targetName
+                   << "' returned too few values for closure capture ABI";
+          llvm::SmallVector<mlir::Value, 4> laneValues;
+          for (unsigned end =
+                   resultIndex + static_cast<unsigned>(laneTypes->size());
+               resultIndex < end; ++resultIndex)
+            laneValues.push_back(call.getResult(resultIndex));
+          alternative.closureValues.push_back(
+              RuntimeValue::object(capture.laneContract, laneValues));
         }
         result.callableAlternatives.push_back(std::move(alternative));
       }

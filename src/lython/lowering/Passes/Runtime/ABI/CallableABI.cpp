@@ -889,6 +889,45 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
             slot.sourceContract, resultTypes);
       }
     }
+    // Returned-closure LOCAL captures ride out as trailing owned result
+    // lanes (the nonlocal cell escaping with its closure). Their layout is
+    // fixed per function, which the summary pass guarantees by requiring a
+    // single alternative for lane captures.
+    if (auto returnedCallable =
+            returnedCallableSummaries.find(function.getSymName());
+        returnedCallable != returnedCallableSummaries.end() &&
+        returnedCallable->second.alternatives.size() == 1 &&
+        returnedCallable->second.alternatives.front().hasLaneCaptures()) {
+      if (returnedObjectEvidence != returnedObjectEvidenceSummaries.end()) {
+        function.emitError()
+            << "returned closure lane captures cannot combine with returned "
+               "object evidence yet";
+        result = mlir::failure();
+        return mlir::WalkResult::interrupt();
+      }
+      for (const ReturnedCallableCapture &capture :
+           returnedCallable->second.alternatives.front().captures) {
+        if (!capture.laneContract)
+          continue;
+        std::string laneContractName =
+            runtimeContractName(capture.laneContract);
+        if (laneContractName.empty()) {
+          function.emitError() << "returned closure capture lane has no "
+                                  "runtime contract";
+          result = mlir::failure();
+          return mlir::WalkResult::interrupt();
+        }
+        ownedResultOffsets.push_back(
+            static_cast<std::int64_t>(resultTypes.size()));
+        ownedResultContracts.push_back(
+            builder.getStringAttr(laneContractName));
+        if (mlir::failed(RuntimeBundleLowerer::appendRuntimeValueTypes(
+                function, capture.laneContract, resultTypes))) {
+          result = mlir::failure();
+          return mlir::WalkResult::interrupt();
+        }
+      }
+    }
     if (!function.isDeclaration()) {
       if (mlir::failed(seedCallableEntryArgumentBundles(
               function, logicalInputTypes, abiInputTypes, aggregateEvidence))) {
