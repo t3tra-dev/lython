@@ -1,0 +1,9 @@
+1 2 99
+t0 t9
+fresh n9
+Node(label='b', tag='t0', ident=2, note='fresh')
+True False
+t0
+['q'] [] ['p']
+{'k': 1} {} {'s': 3}
+Bag(name='z', peers=['p'], scores={'s': 3})

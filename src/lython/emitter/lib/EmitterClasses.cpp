@@ -482,6 +482,22 @@ void ModuleEmitter::emitClassAttrInitializers(const parser::Node &classDef) {
     }
     if (!value)
       continue;
+    if (value->kind == "Call") {
+      auto [callee, spelling] = decoratorCallee(*value);
+      if (decoratorLeafName(spelling) == "field") {
+        // dataclasses.field(...) never evaluates as a value; the cell
+        // takes the default= expression, and a factory field has no
+        // class-level attribute at all (as in CPython).
+        const parser::Node *defaultValue = nullptr;
+        if (const auto *keywords = ast::nodeList(*value, "keywords"))
+          for (const parser::NodePtr &keyword : *keywords)
+            if (keyword && ast::string(*keyword, "arg") == "default")
+              defaultValue = ast::node(*keyword, "value");
+        if (!defaultValue)
+          continue;
+        value = defaultValue;
+      }
+    }
     llvm::StringRef attrName = ast::nameSpelling(*target);
     auto slot = slots->second.find(attrName);
     if (slot == slots->second.end())
@@ -706,7 +722,11 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
                      /*includeAnnAssignDefaults=*/isDataclass);
 
   // Dataclass field defaults (AnnAssign initializers). dataclasses.field()
-  // machinery (default_factory etc.) is not modeled.
+  // models default= and default_factory= only: the factory desugars to a
+  // synthesized zero-argument call node so the __init__ default machinery's
+  // provider path re-evaluates it per omitted argument (the factory
+  // contract); the other field() knobs steer runtime introspection we do
+  // not model, so they are rejected loudly rather than ignored.
   llvm::StringMap<parser::NodePtr> &fieldDefaults =
       classFieldDefaultNodes[contractName];
   fieldDefaults.clear();
@@ -727,9 +747,75 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
         if (value->kind == "Call") {
           auto [callee, spelling] = decoratorCallee(*value);
           if (decoratorLeafName(spelling) == "field") {
-            diagnostics.push_back(parser::Diagnostic{
-                parser::Severity::Error, value->range.start,
-                "dataclasses.field(...) defaults are not supported yet"});
+            parser::NodePtr defaultNode;
+            parser::NodePtr factoryNode;
+            bool unsupported = false;
+            if (const auto *args = ast::nodeList(*value, "args");
+                args && !args->empty()) {
+              diagnostics.push_back(parser::Diagnostic{
+                  parser::Severity::Error, value->range.start,
+                  "dataclasses.field() takes keyword arguments only"});
+              unsupported = true;
+            }
+            if (const auto *keywords = ast::nodeList(*value, "keywords")) {
+              for (const parser::NodePtr &keyword : *keywords) {
+                if (!keyword)
+                  continue;
+                auto keywordName = ast::string(*keyword, "arg");
+                const parser::Field *kwField =
+                    parser::findField(*keyword, "value");
+                parser::NodePtr kwNode;
+                if (kwField &&
+                    std::holds_alternative<parser::NodePtr>(kwField->value))
+                  kwNode = std::get<parser::NodePtr>(kwField->value);
+                if (!keywordName || !kwNode) {
+                  diagnostics.push_back(parser::Diagnostic{
+                      parser::Severity::Error, keyword->range.start,
+                      "unsupported dataclasses.field() argument form"});
+                  unsupported = true;
+                  continue;
+                }
+                if (*keywordName == "default") {
+                  defaultNode = kwNode;
+                } else if (*keywordName == "default_factory") {
+                  factoryNode = kwNode;
+                } else {
+                  diagnostics.push_back(parser::Diagnostic{
+                      parser::Severity::Error, keyword->range.start,
+                      "dataclasses.field() argument '" +
+                          std::string(*keywordName) +
+                          "' is not supported (only default and "
+                          "default_factory are modeled)"});
+                  unsupported = true;
+                }
+              }
+            }
+            if (unsupported)
+              continue;
+            if (defaultNode && factoryNode) {
+              // CPython raises ValueError at class creation time; the
+              // static boundary is class emission, so it is a diagnostic
+              // here with the same message.
+              diagnostics.push_back(parser::Diagnostic{
+                  parser::Severity::Error, value->range.start,
+                  "cannot specify both default and default_factory"});
+              continue;
+            }
+            if (factoryNode) {
+              parser::NodePtr factoryCall =
+                  parser::makeNode("Call", value->range);
+              parser::addField(*factoryCall, "func", factoryNode);
+              parser::addField(*factoryCall, "args",
+                               std::vector<parser::NodePtr>{});
+              parser::addField(*factoryCall, "keywords",
+                               std::vector<parser::NodePtr>{});
+              fieldDefaults[ast::nameSpelling(*target)] =
+                  std::move(factoryCall);
+            } else if (defaultNode) {
+              fieldDefaults[ast::nameSpelling(*target)] = defaultNode;
+            }
+            // field() with neither keyword leaves the field required,
+            // matching CPython.
             continue;
           }
         }
@@ -1342,6 +1428,25 @@ void ModuleEmitter::collectStaticClassAssignments(
         const parser::Node *value = ast::node(*statement, "value");
         if (!target || target->kind != "Name" || !value)
           continue;
+        if (value->kind == "Call") {
+          auto [callee, spelling] = decoratorCallee(*value);
+          if (decoratorLeafName(spelling) == "field") {
+            // dataclasses.field(...) never evaluates as an attribute
+            // value. CPython rewrites the class attribute to the default
+            // (and removes it for default_factory); mirror that here so
+            // the field() call is not emitted as an initializer.
+            const parser::Node *defaultValue = nullptr;
+            if (const auto *keywords = ast::nodeList(*value, "keywords"))
+              for (const parser::NodePtr &keyword : *keywords)
+                if (keyword && ast::string(*keyword, "arg") == "default")
+                  defaultValue = ast::node(*keyword, "value");
+            if (defaultValue)
+              appendStaticAttr(
+                  ast::nameSpelling(*target), defaultValue,
+                  types.annotationType(ast::node(*statement, "annotation")));
+            continue;
+          }
+        }
         appendStaticAttr(
             ast::nameSpelling(*target), value,
             types.annotationType(ast::node(*statement, "annotation")));
