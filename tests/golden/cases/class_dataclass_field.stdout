@@ -1,0 +1,6 @@
+1 2 99
+t0 t9
+fresh n9
+Node(label='b', tag='t0', ident=2, note='fresh')
+True False
+t0
