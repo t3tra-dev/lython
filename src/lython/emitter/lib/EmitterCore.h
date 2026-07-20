@@ -205,7 +205,8 @@ private:
   carriedLoopEdgeOperands(const parser::Node &anchor,
                           llvm::ArrayRef<CarriedLoopLocal> carried,
                           mlir::Block *headerBlock,
-                          llvm::ArrayRef<mlir::Value> baselineValues = {});
+                          llvm::ArrayRef<mlir::Value> baselineValues = {},
+                          bool toHeader = true);
   llvm::SmallVector<mlir::Value, 4>
   loopCarriedBranchOperands(const parser::Node &anchor,
                             const LoopControlContext &loop, mlir::Block *target);

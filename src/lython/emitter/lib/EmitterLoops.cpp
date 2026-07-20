@@ -12,6 +12,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Block.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
 
@@ -199,9 +200,42 @@ void ModuleEmitter::bindCarriedLoopLocals(
 
 llvm::SmallVector<mlir::Value, 4> ModuleEmitter::carriedLoopEdgeOperands(
     const parser::Node &anchor, llvm::ArrayRef<CarriedLoopLocal> carried,
-    mlir::Block *headerBlock, llvm::ArrayRef<mlir::Value> baselineValues) {
+    mlir::Block *headerBlock, llvm::ArrayRef<mlir::Value> baselineValues,
+    bool toHeader) {
   llvm::SmallVector<mlir::Value, 4> operands;
   operands.reserve(carried.size());
+  // Releases are not emitted lane-by-lane: an alias assignment (`m = i`)
+  // makes two lanes forward one SSA token, or forwards a token another lane
+  // is abandoning on the same edge, so the edge's token ledger has to be
+  // settled after every lane's forwarded/previous pair is known. The ledger
+  // is keyed on the value behind upcast/protocol views: a per-edge coerce
+  // mints a fresh view op, not a fresh object, and refcounts act on the
+  // object.
+  auto tokenRoot = [](mlir::Value value) {
+    while (value) {
+      if (auto upcast = value.getDefiningOp<py::ClassUpcastOp>()) {
+        value = upcast.getInput();
+        continue;
+      }
+      if (auto refine = value.getDefiningOp<py::ClassRefineOp>()) {
+        value = refine.getInput();
+        continue;
+      }
+      if (auto view = value.getDefiningOp<py::ProtocolViewOp>()) {
+        value = view.getInput();
+        continue;
+      }
+      break;
+    }
+    return value;
+  };
+  llvm::SmallVector<mlir::Value, 4> pendingReleases;
+  llvm::SmallDenseSet<mlir::Value, 4> keptRoots;
+  struct AcquireLedger {
+    mlir::Value representative; // contract-typed view to retain through
+    unsigned laneCount = 0;
+  };
+  llvm::MapVector<mlir::Value, AcquireLedger> acquiringLanes;
   for (auto [index, local] : llvm::enumerate(carried)) {
     auto found = values.find(local.name);
     if (found == values.end() || !found->second.value) {
@@ -222,11 +256,77 @@ llvm::SmallVector<mlir::Value, 4> ModuleEmitter::carriedLoopEdgeOperands(
     else if (headerBlock && index < headerBlock->getNumArguments())
       previous = headerBlock->getArgument(index);
     if (previous && py::isPyContractType(local.type)) {
-      if (value != previous && !derivesViaStructuralMutation(value, previous))
-        py::DecRefOp::create(builder, loc(anchor), previous);
+      mlir::Value valueRoot = tokenRoot(value);
+      if (valueRoot != tokenRoot(previous) &&
+          !derivesViaStructuralMutation(value, previous)) {
+        pendingReleases.push_back(previous);
+        AcquireLedger &ledger = acquiringLanes[valueRoot];
+        ledger.representative = value;
+        ++ledger.laneCount;
+      } else {
+        keptRoots.insert(valueRoot);
+      }
     }
     operands.push_back(value);
   }
+  for (auto &[root, ledger] : acquiringLanes) {
+    unsigned laneCount = ledger.laneCount;
+    // A lane abandoning this value on the same edge hands its token straight
+    // to a lane acquiring it (decref + reacquire would touch a dead token).
+    unsigned transferred = 0;
+    for (mlir::Value &release : pendingReleases)
+      if (release && tokenRoot(release) == root && transferred < laneCount) {
+        release = nullptr;
+        ++transferred;
+      }
+    // Header edges only: each header lane owns its own token per iteration
+    // (the per-lane decrefs above assume it), so duplicate lanes retain. A
+    // value produced this iteration brings its own creation token; a block
+    // argument's token belongs to whichever lane (this loop's, an enclosing
+    // loop's, or the entry ABI) already owns it, so it covers no lane here.
+    // Exit edges (break, loop-else) are NOT retained: the ownership planner
+    // folds aliased after-block arguments into one resource, and a dead
+    // alias lane needs no token of its own there.
+    if (!toHeader)
+      continue;
+    // How many of the acquiring lanes the value's own token can cover:
+    // - a block argument's token is free to move into ONE lane unless the
+    //   argument's own lane keeps it this edge (then a sibling alias lane
+    //   must retain — the token stays with the keeping lane);
+    // - an op result minted this iteration covers one lane;
+    // - a value defined before the loop covers none: its creation token
+    //   stays claimed by the pre-loop local that still binds it (`t = base`
+    //   inside the loop must not steal base's token).
+    bool bringsOwnToken;
+    if (mlir::isa<mlir::BlockArgument>(root)) {
+      bringsOwnToken = !keptRoots.contains(root);
+    } else {
+      bringsOwnToken = true;
+      if (headerBlock) {
+        mlir::Block *defBlock = root.getParentBlock();
+        while (defBlock && defBlock->getParent() != headerBlock->getParent())
+          defBlock = defBlock->getParentOp()
+                         ? defBlock->getParentOp()->getBlock()
+                         : nullptr;
+        if (defBlock && defBlock != headerBlock)
+          for (mlir::Block &blk : *headerBlock->getParent()) {
+            if (&blk == defBlock) {
+              bringsOwnToken = false; // defined before the loop header
+              break;
+            }
+            if (&blk == headerBlock)
+              break;
+          }
+      }
+    }
+    unsigned selfTokens = bringsOwnToken ? 1 : 0;
+    for (unsigned acquired = transferred + selfTokens; acquired < laneCount;
+         ++acquired)
+      py::IncRefOp::create(builder, loc(anchor), ledger.representative);
+  }
+  for (mlir::Value release : pendingReleases)
+    if (release)
+      py::DecRefOp::create(builder, loc(anchor), release);
   return operands;
 }
 
@@ -234,9 +334,9 @@ llvm::SmallVector<mlir::Value, 4>
 ModuleEmitter::loopCarriedBranchOperands(const parser::Node &anchor,
                                          const LoopControlContext &loop,
                                          mlir::Block *target) {
-  (void)target;
   return carriedLoopEdgeOperands(anchor, loop.carriedLocals, loop.headerBlock,
-                                 loop.baselineValues);
+                                 loop.baselineValues,
+                                 /*toHeader=*/target == loop.headerBlock);
 }
 
 // A generator expression consumed directly by a for loop fuses into nested
@@ -492,7 +592,8 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
     if (!insertionBlockTerminated(builder))
       mlir::cf::BranchOp::create(
           builder, loc(statement), afterBlock,
-          carriedLoopEdgeOperands(statement, carried, elseBlock));
+          carriedLoopEdgeOperands(statement, carried, elseBlock, {},
+                                  /*toHeader=*/false));
   }
 
   builder.setInsertionPointToStart(afterBlock);
@@ -651,7 +752,8 @@ void ModuleEmitter::emitWhile(const parser::Node &statement) {
     if (!insertionBlockTerminated(builder))
       mlir::cf::BranchOp::create(
           builder, loc(statement), afterBlock,
-          carriedLoopEdgeOperands(statement, carried, elseBlock));
+          carriedLoopEdgeOperands(statement, carried, elseBlock, {},
+                                  /*toHeader=*/false));
   }
 
   builder.setInsertionPointToStart(afterBlock);
