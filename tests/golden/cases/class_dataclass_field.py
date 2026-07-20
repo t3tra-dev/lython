@@ -24,6 +24,16 @@ class Node:
     note: str = field(default_factory=make_tag)
 
 
+# Container factories live on their own class: the synthesized __eq__ over
+# a list field still trips a lowering dominance bug, so eq coverage stays
+# on the scalar class above.
+@dataclass(eq=False)
+class Bag:
+    name: str
+    peers: list[str] = field(default_factory=list)
+    scores: dict[str, int] = field(default_factory=dict)
+
+
 n1 = Node("a")
 n2 = Node("b")
 n3 = Node("c", "t9", 99, "n9")
@@ -33,3 +43,11 @@ print(n1.note, n3.note)
 print(repr(n2))
 print(n1 == n1, n1 == n2)
 print(Node.tag)
+b1 = Bag("x")
+b2 = Bag("y")
+b3 = Bag("z", ["p"], {"s": 3})
+b1.peers.append("q")
+b1.scores["k"] = 1
+print(b1.peers, b2.peers, b3.peers)
+print(b1.scores, b2.scores, b3.scores)
+print(repr(b3))

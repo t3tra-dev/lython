@@ -117,9 +117,7 @@ class Template:
             j: int = i + 2
             while j < n and self._is_id_cont(s[j]):
                 j += 1
-            # j + 0, not j: one boxed value twice in a tuple literal
-            # double-consumes under the affine refcount today.
-            return (1, i + 1, j, j + 0)
+            return (1, i + 1, j, j)
         if i + 1 < n and s[i + 1] == "{":
             if i + 2 < n and self._is_id_start(s[i + 2]):
                 k: int = i + 3
@@ -149,10 +147,10 @@ class Template:
         scan does inside CPython's substitute.
 
         The scan is fully re-inlined here (no _match, no _is_id_* helpers):
-        raising while the int result of another user-level call is owned
-        anywhere on the unwind path corrupts in-flight exception matching
-        today, so the raising frame computes everything itself from plain
-        character comparisons.
+        an int returned by another user-level call that stays live across
+        the branchy fall-through paths of a raising loop still trips
+        affine-ownership, so the raising frame computes everything itself
+        from plain character comparisons.
         """
         s: str = self.template
         n: int = len(s)

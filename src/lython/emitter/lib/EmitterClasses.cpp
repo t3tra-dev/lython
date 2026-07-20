@@ -802,25 +802,6 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
               continue;
             }
             if (factoryNode) {
-              // The factory value reaches __init__ through the default
-              // provider's object lane, which container elements do not
-              // survive yet (their evidence is lost and repr/iteration
-              // aborts at runtime), so only scalar-typed fields may use a
-              // factory until that lane carries containers.
-              mlir::Type annotated = types.widenLiteral(
-                  types.annotationType(ast::node(*statement, "annotation")));
-              bool scalar =
-                  annotated == types.intType() ||
-                  annotated == types.strType() ||
-                  annotated == types.floatType() ||
-                  annotated == types.boolType();
-              if (!scalar) {
-                diagnostics.push_back(parser::Diagnostic{
-                    parser::Severity::Error, value->range.start,
-                    "dataclasses.field(default_factory=...) is only "
-                    "supported for int/str/float/bool fields yet"});
-                continue;
-              }
               parser::NodePtr factoryCall =
                   parser::makeNode("Call", value->range);
               parser::addField(*factoryCall, "func", factoryNode);
