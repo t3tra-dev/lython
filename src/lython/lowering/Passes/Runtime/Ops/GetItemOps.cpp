@@ -884,7 +884,7 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeSequenceGetItem(
   builder.setInsertionPoint(op);
   mlir::Location loc = op.getLoc();
   mlir::Value raw;
-  if (index.primitiveI64) {
+  if (primitiveI64LaneKnownValid(index.primitiveI64)) {
     raw = index.primitiveI64->value;
   } else if (std::optional<std::int64_t> literal =
                  integerLiteralFromValue(op.getIndex())) {
@@ -892,12 +892,18 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeSequenceGetItem(
   } else {
     std::optional<RuntimeSymbol> unbox =
         manifest.primitive(index.contractName(), "unbox.i64");
-    if (!unbox ||
-        unbox->function.getNumArguments() != index.physicalValues().size())
+    if (unbox &&
+        unbox->function.getNumArguments() == index.physicalValues().size()) {
+      mlir::func::CallOp indexCall = RuntimeBundleLowerer::createRuntimeCall(
+          loc, *unbox, index.physicalValues());
+      raw = indexCall.getResult(0);
+    } else if (index.primitiveI64 && index.primitiveI64->value) {
+      // No boxed payload to fall back to (primitive-i64 clone lanes carry
+      // only the (value, valid) pair): the lane is the sole carrier.
+      raw = index.primitiveI64->value;
+    } else {
       return false;
-    mlir::func::CallOp indexCall = RuntimeBundleLowerer::createRuntimeCall(
-        loc, *unbox, index.physicalValues());
-    raw = indexCall.getResult(0);
+    }
   }
   mlir::Value zero = mlir::arith::ConstantIntOp::create(builder, loc, 0, 64);
   mlir::Value lengthSlot =

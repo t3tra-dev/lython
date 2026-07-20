@@ -3,6 +3,7 @@
 #include "Runtime/Model/Contracts.h"
 #include "Ownership.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Value.h"
 #include "mlir/IR/ValueRange.h"
@@ -80,6 +81,35 @@ struct RuntimePrimitiveI64Evidence {
   mlir::Value value;
   mlir::Value valid;
 };
+
+// True only when the fast lane's validity flag is a compile-time true (a
+// constant, possibly behind and-chains). A runtime flag means the boxed
+// payload is authoritative and the lane word may be a stale placeholder —
+// consuming it unconditionally is a silent mis-execution.
+inline bool primitiveI64LaneKnownValid(
+    const std::optional<RuntimePrimitiveI64Evidence> &evidence) {
+  if (!evidence || !evidence->value || !evidence->valid)
+    return false;
+  llvm::SmallVector<mlir::Value, 4> pending{evidence->valid};
+  while (!pending.empty()) {
+    mlir::Value current = pending.pop_back_val();
+    mlir::Operation *def = current.getDefiningOp();
+    if (!def)
+      return false;
+    if (auto constant = mlir::dyn_cast<mlir::arith::ConstantIntOp>(def)) {
+      if (constant.value() == 0)
+        return false;
+      continue;
+    }
+    if (auto andOp = mlir::dyn_cast<mlir::arith::AndIOp>(def)) {
+      pending.push_back(andOp.getLhs());
+      pending.push_back(andOp.getRhs());
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
 
 // Buffer evidence is the lowered counterpart of Python's buffer protocol. It
 // deliberately carries only facts that can be proven statically by the

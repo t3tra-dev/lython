@@ -790,7 +790,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
   if (primitiveSlot) {
     builder.setInsertionPoint(op);
     mlir::Value primitiveRawValue;
-    if (value->primitiveI64 && value->primitiveI64->value) {
+    if (primitiveI64LaneKnownValid(value->primitiveI64)) {
+      primitiveRawValue = value->primitiveI64->value;
+    } else if (value->physicalValues().empty() && value->primitiveI64 &&
+               value->primitiveI64->value) {
+      // No boxed payload to fall back to (primitive-i64 clone lanes carry
+      // only the (value, valid) pair): the lane is the sole carrier.
       primitiveRawValue = value->primitiveI64->value;
     } else {
       std::optional<RuntimeSymbol> unbox =

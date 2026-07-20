@@ -246,19 +246,25 @@ mlir::FailureOr<mlir::Value> RuntimeBundleLowerer::rawSequenceIndexValue(
     return mlir::arith::ConstantIntOp::create(builder, op->getLoc(), *literal,
                                               64)
         .getResult();
-  if (index.primitiveI64 && index.primitiveI64->value &&
+  if (primitiveI64LaneKnownValid(index.primitiveI64) &&
       index.primitiveI64->value.getType().isInteger(64))
     return index.primitiveI64->value;
   std::optional<RuntimeSymbol> unbox =
       manifest.primitive(index.contractName(), "unbox.i64");
-  if (!unbox ||
-      unbox->function.getNumArguments() != index.physicalValues().size())
-    return op->emitError()
-           << "sequence index of contract " << index.contractName()
-           << " has no statically unboxable integer value";
-  mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
-      op->getLoc(), *unbox, index.physicalValues());
-  return call.getResult(0);
+  if (unbox &&
+      unbox->function.getNumArguments() == index.physicalValues().size()) {
+    mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+        op->getLoc(), *unbox, index.physicalValues());
+    return call.getResult(0);
+  }
+  // No boxed payload to fall back to (primitive-i64 clone lanes carry only
+  // the (value, valid) pair): the lane is the sole carrier.
+  if (index.primitiveI64 && index.primitiveI64->value &&
+      index.primitiveI64->value.getType().isInteger(64))
+    return index.primitiveI64->value;
+  return op->emitError()
+         << "sequence index of contract " << index.contractName()
+         << " has no statically unboxable integer value";
 }
 
 // Compile-time dict evidence may only be extended in the block that defines
