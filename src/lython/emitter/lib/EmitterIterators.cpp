@@ -1,6 +1,7 @@
 #include "EmitterCore.h"
 #include "EmitterPyOps.h"
 #include "EmitterSupport.h"
+#include "PyProtocols.h"
 
 #include "AstAccess.h"
 
@@ -1491,8 +1492,42 @@ ModuleEmitter::tryEmitSortSugar(const parser::Node &expr,
   if (!calleeNode)
     return std::nullopt;
   const auto *keywords = ast::nodeList(expr, "keywords");
-  if (!keywords || keywords->empty())
+  if (!keywords || keywords->empty()) {
+    // Keyword-less sorted(<non-list iterable>): the manifest builtin takes
+    // a list, so materialize through the list constructor first —
+    // sorted(d), sorted(d.keys()), sorted(gen) become sorted(list(...)).
+    // NOTE: sorted IS a manifest free function (types.lookupSymbol resolves
+    // it), so only user shadowing disables the rewrite — same guard as the
+    // keyword sugar below.
+    if (calleeNode->kind == "Name" &&
+        ast::nameSpelling(*calleeNode) == "sorted" && !values.count("sorted") &&
+        !genericFunctions.count("sorted") && !types.lookupClass("sorted")) {
+      const auto *args = ast::nodeList(expr, "args");
+      // The rewrite must not re-wrap its own product: inference has no case
+      // for the list() call form, so `sorted(list(X))` would recurse.
+      bool alreadyListCall = false;
+      if (args && args->size() == 1 && (*args)[0] &&
+          (*args)[0]->kind == "Call")
+        if (const parser::Node *inner = ast::node(*(*args)[0], "func"))
+          alreadyListCall = inner->kind == "Name" &&
+                            ast::nameSpelling(*inner) == "list";
+      if (args && args->size() == 1 && (*args)[0] &&
+          (*args)[0]->kind != "Starred" && !alreadyListCall) {
+        auto argContract = mlir::dyn_cast_if_present<py::ContractType>(
+            types.widenLiteral(types.inferExpr((*args)[0].get())));
+        if (!argContract ||
+            argContract.getContractName() != "builtins.list") {
+          parser::SourceRange range = expr.range;
+          NodePtr wrapped = callNode(
+              nameNode("sorted", range),
+              {callNode(nameNode("list", range), {(*args)[0]}, range)},
+              range);
+          return emitExpr(wrapped.get());
+        }
+      }
+    }
     return std::nullopt; // keyword-less forms keep their native paths
+  }
   const auto *args = ast::nodeList(expr, "args");
 
   // NOTE: sorted IS a manifest free function (types.lookupSymbol resolves
@@ -1912,6 +1947,225 @@ ModuleEmitter::tryEmitDictViewMembership(const parser::Node &expr) {
     result = emitExpr(resultExpr.get());
   });
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// list()/set()/tuple()/dict() constructors. Iterable construction desugars
+// to the comprehension loops the literal forms already use (that keeps
+// CPython's per-element evaluation order and set/dict dedup semantics and
+// inherits every iterable the loop fusion supports); list-typed sources take
+// the O(n) sequence-copy manifest builtins instead, and tuple(t) is the
+// identity because CPython returns the immutable argument object itself.
+// ---------------------------------------------------------------------------
+Value ModuleEmitter::emitConstructorComprehension(const parser::Node &expr,
+                                                  parser::NodePtr argNode,
+                                                  llvm::StringRef which) {
+  parser::SourceRange range = expr.range;
+  unsigned serial = ++listCompCounter;
+  NodePtr generator = parser::makeNode("comprehension", range);
+  parser::addField(*generator, "iter", argNode);
+  parser::addField(*generator, "ifs", std::vector<NodePtr>{});
+  NodePtr comp;
+  if (which == "dict") {
+    std::string key = "__ctork" + std::to_string(serial);
+    std::string value = "__ctorv" + std::to_string(serial);
+    parser::addField(*generator, "target",
+                     tupleNode({nameNode(key, range), nameNode(value, range)},
+                               range));
+    comp = parser::makeNode("DictComp", range);
+    parser::addField(*comp, "key", nameNode(key, range));
+    parser::addField(*comp, "value", nameNode(value, range));
+    parser::addField(*comp, "generators", std::vector<NodePtr>{generator});
+    return emitComprehension(*comp, /*isDict=*/true);
+  }
+  std::string element = "__ctor" + std::to_string(serial);
+  parser::addField(*generator, "target", nameNode(element, range));
+  comp = parser::makeNode(which == "set" ? "SetComp" : "ListComp", range);
+  parser::addField(*comp, "elt", nameNode(element, range));
+  parser::addField(*comp, "generators", std::vector<NodePtr>{generator});
+  return emitComprehension(*comp, /*isDict=*/false, /*isSet=*/which == "set");
+}
+
+std::optional<Value>
+ModuleEmitter::emitListToTupleFreeze(const parser::Node &expr,
+                                     const parser::Node &calleeNode,
+                                     Value listValue) {
+  const py::protocols::Table &table = py::protocols::Table::get(context);
+  std::optional<mlir::Type> contract =
+      table.freeFunctionContract("builtins.tuple");
+  if (!contract) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "the builtins manifest does not declare the tuple constructor "
+        "contract"});
+    return emitNone(expr);
+  }
+  Value callee = emitBindingRef(calleeNode, "tuple", *contract);
+  return emitCallableDispatch(
+      expr, callee,
+      emitCallOperands(expr, {listValue}, /*includeAstArguments=*/false));
+}
+
+std::optional<Value> ModuleEmitter::tryEmitContainerConstructorCall(
+    const parser::Node &expr, const parser::Node *calleeNode) {
+  if (!calleeNode || calleeNode->kind != "Name")
+    return std::nullopt;
+  llvm::StringRef ctor = ast::nameSpelling(*calleeNode);
+  if (ctor != "list" && ctor != "set" && ctor != "tuple" && ctor != "dict")
+    return std::nullopt;
+  if (!isBuiltinIteratorName(ctor)) // reuses the user-shadowing guard
+    return std::nullopt;
+
+  auto reject = [&](const std::string &message) -> std::optional<Value> {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start, message});
+    return emitNone(expr);
+  };
+
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  parser::SourceRange range = expr.range;
+
+  if (args)
+    for (const NodePtr &arg : *args)
+      if (!arg || arg->kind == "Starred")
+        return reject(std::string(ctor) +
+                      "() does not support starred arguments yet");
+
+  // dict(a=1, b=2): the keyword form builds the literal (values evaluate
+  // left to right, CPython's order).
+  if (keywords && !keywords->empty()) {
+    if (ctor != "dict")
+      return reject(std::string(ctor) + "() takes no keyword arguments");
+    if (args && !args->empty())
+      return reject("dict() with both a positional argument and keyword "
+                    "arguments is not supported yet");
+    std::vector<NodePtr> keys;
+    std::vector<NodePtr> vals;
+    for (const NodePtr &keyword : *keywords) {
+      auto name = keyword ? ast::string(*keyword, "arg") : std::nullopt;
+      const parser::Field *valueField =
+          keyword ? parser::findField(*keyword, "value") : nullptr;
+      if (!name || !valueField ||
+          !std::holds_alternative<NodePtr>(valueField->value) ||
+          !std::get<NodePtr>(valueField->value))
+        return reject("dict() keyword arguments must be named "
+                      "(** splats are not supported yet)");
+      keys.push_back(stringConstant(std::string(*name), range));
+      vals.push_back(std::get<NodePtr>(valueField->value));
+    }
+    NodePtr literal = parser::makeNode("Dict", range);
+    parser::addField(*literal, "keys", std::move(keys));
+    parser::addField(*literal, "values", std::move(vals));
+    return emitExpr(literal.get());
+  }
+
+  if (!args || args->empty()) {
+    // Empty construction is the empty literal. set() has no literal
+    // spelling: its empty pack mirrors the one the set-comprehension build
+    // starts from, typed by the expectation when the inference sees one.
+    if (ctor == "set") {
+      mlir::Type resultType = types.inferExpr(&expr);
+      auto contract =
+          mlir::dyn_cast_if_present<py::ContractType>(resultType);
+      if (!contract || contract.getContractName() != "builtins.set")
+        resultType = py::ContractType::get(builder.getContext(),
+                                           "builtins.set", {types.object()});
+      auto pack = py::PackOp::create(builder, loc(expr), resultType,
+                                     mlir::ValueRange{});
+      return Value{pack.getResult(), resultType};
+    }
+    NodePtr literal;
+    if (ctor == "dict") {
+      literal = parser::makeNode("Dict", range);
+      parser::addField(*literal, "keys", std::vector<NodePtr>{});
+      parser::addField(*literal, "values", std::vector<NodePtr>{});
+    } else {
+      literal = parser::makeNode(ctor == "list" ? "List" : "Tuple", range);
+      parser::addField(*literal, "elts", std::vector<NodePtr>{});
+    }
+    return emitExpr(literal.get());
+  }
+
+  if (args->size() != 1)
+    return reject(std::string(ctor) + " expected at most 1 argument, got " +
+                  std::to_string(args->size()));
+
+  NodePtr argNode = (*args)[0];
+
+  // A genexpr argument reuses the genexpr's own element/generator chain
+  // (the existing list(<genexpr>) comprehension route, widened to the other
+  // constructors).
+  if (argNode->kind == "GeneratorExp") {
+    const parser::Field *eltField = parser::findField(*argNode, "elt");
+    const auto *generators = ast::nodeList(*argNode, "generators");
+    if (!eltField || !std::holds_alternative<NodePtr>(eltField->value) ||
+        !std::get<NodePtr>(eltField->value) || !generators)
+      return reject("malformed generator expression argument");
+    NodePtr elt = std::get<NodePtr>(eltField->value);
+    if (ctor == "dict") {
+      const auto *pair =
+          elt->kind == "Tuple" ? ast::nodeList(*elt, "elts") : nullptr;
+      if (!pair || pair->size() != 2 || !(*pair)[0] || !(*pair)[1])
+        return reject("dict() over a generator expression requires "
+                      "(key, value) tuple elements");
+      NodePtr comp = parser::makeNode("DictComp", argNode->range);
+      parser::addField(*comp, "key", (*pair)[0]);
+      parser::addField(*comp, "value", (*pair)[1]);
+      parser::addField(*comp, "generators", *generators);
+      return emitComprehension(*comp, /*isDict=*/true);
+    }
+    NodePtr comp = parser::makeNode(ctor == "set" ? "SetComp" : "ListComp",
+                                    argNode->range);
+    parser::addField(*comp, "elt", elt);
+    parser::addField(*comp, "generators", *generators);
+    Value collected =
+        emitComprehension(*comp, /*isDict=*/false, /*isSet=*/ctor == "set");
+    if (ctor != "tuple")
+      return collected;
+    return emitListToTupleFreeze(expr, *calleeNode, collected);
+  }
+
+  mlir::Type argumentType =
+      types.widenLiteral(types.inferExpr(argNode.get()));
+  auto argContract =
+      mlir::dyn_cast_if_present<py::ContractType>(argumentType);
+  llvm::StringRef argClass =
+      argContract ? argContract.getContractName() : llvm::StringRef();
+
+  // CPython's tuple(t) returns t itself: tuples are immutable.
+  if (ctor == "tuple" && argClass == "builtins.tuple")
+    return emitExpr(argNode.get());
+
+  if (ctor == "dict") {
+    if (argClass == "builtins.dict") {
+      NodePtr copy = methodCallNode(argNode, "copy", {}, range);
+      return emitExpr(copy.get());
+    }
+    return emitConstructorComprehension(expr, argNode, "dict");
+  }
+
+  if ((ctor == "list" || ctor == "tuple") && argClass == "builtins.list") {
+    const py::protocols::Table &table = py::protocols::Table::get(context);
+    std::optional<mlir::Type> contract = table.freeFunctionContract(
+        ctor == "list" ? "builtins.list" : "builtins.tuple");
+    if (!contract)
+      return reject("the builtins manifest does not declare the " +
+                    std::string(ctor) + " constructor contract");
+    Value callee = emitBindingRef(*calleeNode, ctor, *contract);
+    return emitCallableDispatch(
+        expr, callee,
+        emitCallOperands(expr, {}, /*includeAstArguments=*/true,
+                         mlir::dyn_cast_if_present<py::CallableType>(
+                             callee.type)));
+  }
+
+  if (ctor == "set")
+    return emitConstructorComprehension(expr, argNode, "set");
+  Value collected = emitConstructorComprehension(expr, argNode, "list");
+  if (ctor == "list")
+    return collected;
+  return emitListToTupleFreeze(expr, *calleeNode, collected);
 }
 
 } // namespace lython::emitter

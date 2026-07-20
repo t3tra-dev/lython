@@ -2696,8 +2696,22 @@ mlir::LogicalResult insertUnwindCleanupReleases(
         if (guarded &&
             callConsumesGroup(contracts, guarded, group.values, aliases))
           continue; // ownership already moved into the unwinding callee
-        if (groupTokenAtPoint(analysis, group, marker.getOperation(),
-                              aliases) != TokenAtPoint::Held)
+        // A guarded RAISE judges the token at the raise call, not at the
+        // marker: the raise statement's dying locals release between the
+        // two (normal-path releases parked before a never-returning call),
+        // so at the moment the unwind edge materializes their tokens are
+        // already gone — releasing them again in the cleanup double-frees.
+        // Non-raise guarded calls keep the marker point: nothing releases
+        // between their marker and the call.
+        mlir::Operation *unwindPoint = marker.getOperation();
+        if (guarded) {
+          auto guardedContract = contracts.lookup(guarded.getCallee());
+          if (mlir::succeeded(guardedContract) && *guardedContract &&
+              own::isRaiseLikeFunction((*guardedContract)->function))
+            unwindPoint = guarded.getOperation();
+        }
+        if (groupTokenAtPoint(analysis, group, unwindPoint, aliases) !=
+            TokenAtPoint::Held)
           continue;
         if (groupUsedOnHandlerPath(analysis, group, handler))
           continue; // the handler-side releases own this token

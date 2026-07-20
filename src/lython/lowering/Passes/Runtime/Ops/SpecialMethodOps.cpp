@@ -1241,7 +1241,11 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIter(py::IterOp op) {
   // re-creation of the iterator reuses the slot) and reset to zero here.
   if (const RuntimeBundle *iterable =
           RuntimeBundleLowerer::bundleFor(op.getIterable())) {
-    bool evidenceListIterable = iterable->contractName() == "builtins.list" &&
+    // Tuples with compile-time element evidence iterate exactly like
+    // evidence lists (the evidence-next path is contract-agnostic).
+    bool evidenceListIterable = (iterable->contractName() == "builtins.list" ||
+                                 iterable->contractName() ==
+                                     "builtins.tuple") &&
                                 !iterable->sequenceElements.empty() &&
                                 iterable->sequenceIndices.empty() &&
                                 !iterable->evidenceIteratorCell;
@@ -1274,8 +1278,15 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIter(py::IterOp op) {
                               iterable->sequenceElements.empty() &&
                               !iterable->evidenceIteratorCell &&
                               iterable->physicalValues().size() >= 3;
+    // Runtime tuples (eg.exceptions, str.partition results, tuple(xs))
+    // share the list's physical layout exactly (meta at [1], boxed slots at
+    // [2]); immutable, so no mutation guard.
+    bool runtimeTupleIterable = iterable->contractName() == "builtins.tuple" &&
+                                iterable->sequenceElements.empty() &&
+                                !iterable->evidenceIteratorCell &&
+                                iterable->physicalValues().size() >= 3;
     if (evidenceListIterable || runtimeListIterable || runtimeDictIterable ||
-        runtimeSetIterable) {
+        runtimeSetIterable || runtimeTupleIterable) {
       mlir::func::FuncOp function = op->getParentOfType<mlir::func::FuncOp>();
       if (!function)
         return op.emitError() << "list iteration requires a function context";

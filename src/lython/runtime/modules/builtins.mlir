@@ -42,7 +42,7 @@ module attributes {
   // overload set on the table side (CPython abs is int->int / float->float /
   // complex->float, which one generic T->T contract cannot express -- the
   // complex result is a float).
-  ly.typing.function_names = ["builtins.print", "builtins.len", "builtins.hash", "builtins.sorted", "builtins.abs", "builtins.abs", "builtins.abs", "builtins.divmod", "builtins.pow", "builtins.ord", "builtins.chr", "builtins.hex", "builtins.oct", "builtins.bin", "builtins.input"],
+  ly.typing.function_names = ["builtins.print", "builtins.len", "builtins.hash", "builtins.sorted", "builtins.abs", "builtins.abs", "builtins.abs", "builtins.divmod", "builtins.pow", "builtins.ord", "builtins.chr", "builtins.hex", "builtins.oct", "builtins.bin", "builtins.input", "builtins.list", "builtins.tuple"],
   ly.typing.function_contracts = [
     !py.callable<[], vararg = !py.contract<"builtins.tuple", [!py.contract<"builtins.object">]>, returns = [!py.literal<None>]>,
     !py.callable<[!py.contract<"builtins.object">], returns = [!py.contract<"builtins.int">]>,
@@ -58,7 +58,9 @@ module attributes {
     !py.callable<[!py.contract<"builtins.int">], returns = [!py.contract<"builtins.str">]>,
     !py.callable<[!py.contract<"builtins.int">], returns = [!py.contract<"builtins.str">]>,
     !py.callable<[!py.contract<"builtins.int">], returns = [!py.contract<"builtins.str">]>,
-    !py.callable<[!py.contract<"builtins.str">], returns = [!py.contract<"builtins.str">]>
+    !py.callable<[!py.contract<"builtins.str">], returns = [!py.contract<"builtins.str">]>,
+    !py.callable<[!py.contract<"builtins.list", [!py.typevar<"T">]>], returns = [!py.contract<"builtins.list", [!py.typevar<"T">]>]>,
+    !py.callable<[!py.contract<"builtins.list", [!py.typevar<"T">]>], returns = [!py.contract<"builtins.tuple", [!py.typevar<"T">]>]>
   ]
 } {
   py.class @object attributes {
@@ -213,7 +215,8 @@ module attributes {
                     "__bool__", "__round__", "__lt__", "__le__", "__gt__",
                     "__ge__", "__str__", "__eq__", "__ne__", "__pow__",
                     "__hash__", "__abs__", "__format__",
-                    "__lt__", "__le__", "__gt__", "__ge__", "__eq__", "__ne__"],
+                    "__lt__", "__le__", "__gt__", "__ge__", "__eq__", "__ne__",
+                    "__neg__", "__pos__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.float">>, !py.contract<"typing.SupportsFloat">] -> [!py.self]>,
       !py.protocol<"Callable", [!py.contract<"builtins.float">] -> [!py.contract<"builtins.str">]>,
@@ -242,7 +245,9 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.float">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.float">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.float">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.bool">]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.float">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.bool">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.float">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.float">] -> [!py.contract<"builtins.float">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.float">] -> [!py.contract<"builtins.float">]>
     ],
     method_kinds = ["classmethod", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
@@ -250,7 +255,7 @@ module attributes {
                     "instance", "instance", "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
-                    "instance", "instance"]
+                    "instance", "instance", "instance", "instance"]
   } {}
 
   py.class @complex attributes {
@@ -1124,6 +1129,15 @@ module attributes {
   }
 
   func.func @LyObject_DefaultRepr(%header: memref<2xi64, strided<[1], offset: ?>> {ly.ownership.object_header}, %prefix: memref<?xi8>, %prefix_len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "default_repr", ly.runtime.result_contract = "builtins.str"} {
+    %ptr_index = memref.extract_aligned_pointer_as_index %header : memref<2xi64, strided<[1], offset: ?>> -> index
+    %ptr = arith.index_cast %ptr_index : index to i64
+    %result_header, %result_bytes = func.call @__ly_default_repr_from_addr(%ptr, %prefix, %prefix_len) : (i64, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %result_header, %result_bytes : memref<2xi64>, memref<?xi8>
+  }
+
+  // The address-keyed core of the default object repr, callable from paths
+  // that only hold a raw box pointer (the dict missing-key raise).
+  func.func private @__ly_default_repr_from_addr(%ptr: i64, %prefix: memref<?xi8>, %prefix_len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "default_repr_addr", ly.runtime.result_contract = "builtins.str"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %sixteen = arith.constant 16 : i64
@@ -1133,9 +1147,6 @@ module attributes {
     %ascii_zero = arith.constant 48 : i64
     %ascii_a_minus_ten = arith.constant 87 : i64
     %ascii_gt = arith.constant 62 : i8
-
-    %ptr_index = memref.extract_aligned_pointer_as_index %header : memref<2xi64, strided<[1], offset: ?>> -> index
-    %ptr = arith.index_cast %ptr_index : index to i64
     %counted:2 = scf.for %i = %lower to %max_digits_index step %step iter_args(%n = %ptr, %digits = %zero) -> (i64, i64) {
       %active = arith.cmpi ne, %n, %zero : i64
       %next_n_active = arith.divui %n, %sixteen : i64
@@ -15770,6 +15781,22 @@ module attributes {
     func.return %h, %m, %i : memref<2xi64>, memref<2xi64>, memref<?xi64>
   }
 
+  // list(xs): a fresh shallow copy of a list argument (the emitter routes
+  // other iterables through the comprehension desugar instead).
+  func.func @LyBuiltin_List(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "list", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.list", ly.runtime.primitive = "builtin_list", ly.runtime.result_contract = "builtins.list"} {
+    %class_id = arith.constant 10 : i64
+    %h, %m, %i = func.call @__ly_sequence_copy_alloc(%class_id, %meta, %items) : (i64, memref<2xi64>, memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    func.return %h, %m, %i : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  }
+
+  // tuple(xs): freeze a list's items into a fresh tuple (lists and tuples
+  // share the sequence storage layout, so only the class id differs).
+  func.func @LyBuiltin_Tuple(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "tuple", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.list", ly.runtime.primitive = "builtin_tuple", ly.runtime.result_contract = "builtins.tuple"} {
+    %class_id = arith.constant 11 : i64
+    %h, %m, %i = func.call @__ly_sequence_copy_alloc(%class_id, %meta, %items) : (i64, memref<2xi64>, memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    func.return %h, %m, %i : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  }
+
   // sorted(xs): a fresh sorted list (the argument is untouched).
   func.func @LyBuiltin_Sorted(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "sorted", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.list", ly.runtime.primitive = "builtin_sorted", ly.runtime.result_contract = "builtins.list"} {
     %c0 = arith.constant 0 : index
@@ -15801,6 +15828,21 @@ module attributes {
     %value = memref.load %payload[%c0] : memref<1xf64>
     %abs = math.absf %value : f64
     %h, %p = func.call @LyFloat_FromF64(%abs) : (f64) -> (memref<2xi64>, memref<1xf64>)
+    func.return %h, %p : memref<2xi64>, memref<1xf64>
+  }
+
+  func.func @LyFloat_Neg(%header: memref<2xi64> {ly.ownership.object_header}, %payload: memref<1xf64>) -> (memref<2xi64>, memref<1xf64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.float", ly.runtime.method = "__neg__", ly.runtime.result_contract = "builtins.float"} {
+    %c0 = arith.constant 0 : index
+    %value = memref.load %payload[%c0] : memref<1xf64>
+    %neg = arith.negf %value : f64
+    %h, %p = func.call @LyFloat_FromF64(%neg) : (f64) -> (memref<2xi64>, memref<1xf64>)
+    func.return %h, %p : memref<2xi64>, memref<1xf64>
+  }
+
+  func.func @LyFloat_Pos(%header: memref<2xi64> {ly.ownership.object_header}, %payload: memref<1xf64>) -> (memref<2xi64>, memref<1xf64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.float", ly.runtime.method = "__pos__", ly.runtime.result_contract = "builtins.float"} {
+    %c0 = arith.constant 0 : index
+    %value = memref.load %payload[%c0] : memref<1xf64>
+    %h, %p = func.call @LyFloat_FromF64(%value) : (f64) -> (memref<2xi64>, memref<1xf64>)
     func.return %h, %p : memref<2xi64>, memref<1xf64>
   }
 
@@ -17189,10 +17231,22 @@ module attributes {
     %class_gep = llvm.getelementptr %key_box[%c1] : (!llvm.ptr, i64) -> !llvm.ptr, i64
     %class_id = llvm.load %class_gep : !llvm.ptr -> i64
     %rh, %rb, %ok = func.call @__ly_repr_boxed_by_contract(%key_box, %class_id) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>, i1)
-    cf.assert %ok, "KeyError: missing key has no conforming __repr__"
+    // A key class without a conforming __repr__ still gets a catchable
+    // KeyError, CPython-style: fall back to the default object repr keyed on
+    // the box address (aborting here turned a user-visible KeyError into a
+    // process crash).
+    cf.cond_br %ok, ^raise(%rh, %rb : memref<2xi64>, memref<?xi8>), ^default
+  ^default:
+    %prefix_static = memref.get_global @__ly_object_repr_prefix : memref<20xi8>
+    %prefix = memref.cast %prefix_static : memref<20xi8> to memref<?xi8>
+    %prefix_len = arith.constant 20 : i64
+    %addr = llvm.ptrtoint %key_box : !llvm.ptr to i64
+    %dh, %db = func.call @__ly_default_repr_from_addr(%addr, %prefix, %prefix_len) : (i64, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    cf.br ^raise(%dh, %db : memref<2xi64>, memref<?xi8>)
+  ^raise(%mh: memref<2xi64>, %mb: memref<?xi8>):
     %key_error = arith.constant 54 : i64
     %exception:3 = func.call @LyBaseException_New(%key_error) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
-    %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %rh, %rb) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %mh, %mb) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.call @LyEH_ThrowException(%initialized#0, %initialized#1, %initialized#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
     func.return
   }

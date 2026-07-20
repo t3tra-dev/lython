@@ -261,6 +261,15 @@ private:
   Value emitFloatFromInt(const parser::Node &anchor, Value argument);
   std::optional<Value> tryEmitStrCall(const parser::Node &expr,
                                       const parser::Node *calleeNode);
+  std::optional<Value>
+  tryEmitContainerConstructorCall(const parser::Node &expr,
+                                  const parser::Node *calleeNode);
+  Value emitConstructorComprehension(const parser::Node &expr,
+                                     parser::NodePtr argNode,
+                                     llvm::StringRef which);
+  std::optional<Value> emitListToTupleFreeze(const parser::Node &expr,
+                                             const parser::Node &calleeNode,
+                                             Value listValue);
   std::optional<Value> tryEmitListCall(const parser::Node &expr,
                                        const parser::Node *calleeNode);
   std::optional<Value> tryEmitPrintCall(const parser::Node &expr,

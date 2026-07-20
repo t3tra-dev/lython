@@ -30,9 +30,11 @@ function(lython_add_fuzzer name)
         COMMAND ${name} -runs=0
             "${CMAKE_CURRENT_SOURCE_DIR}/corpora/${name}"
             "${CMAKE_SOURCE_DIR}/tests/golden/cases")
+    # The golden suite compiles at ~1 exec/s under ASan and has grown past
+    # 350 cases; 600s starved the pipeline harness without any hang.
     set_tests_properties("fuzz.${name}.corpus" PROPERTIES
         ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0:detect_container_overflow=0:allow_user_poisoning=0"
-        TIMEOUT 600
+        TIMEOUT 1800
     )
 endfunction()
 

@@ -2055,6 +2055,20 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
     // the runtime element rebuild cannot shape.
     return tupleOfMembers(*this, elementTypes);
   }
+  if (node->kind == "Set") {
+    llvm::SmallVector<mlir::Type, 8> elementTypes;
+    if (const auto *elements = ast::nodeList(*node, "elts")) {
+      elementTypes.reserve(elements->size());
+      for (const parser::NodePtr &element : *elements) {
+        mlir::Type elementType = recurse(element.get());
+        if (strict && !elementType)
+          return {};
+        elementTypes.push_back(widenLiteral(elementType));
+      }
+    }
+    return py::ContractType::get(&context, "builtins.set",
+                                 {join(elementTypes)});
+  }
   if (node->kind == "Dict") {
     const auto *keys = ast::nodeList(*node, "keys");
     const auto *values = ast::nodeList(*node, "values");
@@ -2398,6 +2412,62 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
           if (argument == intType() || argument == floatType())
             return floatType();
         }
+      }
+      if ((name == "list" || name == "set" || name == "tuple" ||
+           name == "dict") &&
+          !lookupSymbol(name) && !lookupClass(name)) {
+        // Container constructors are emitter desugars
+        // (tryEmitContainerConstructorCall); the inference mirrors their
+        // result shapes so a constructor call composes as an argument
+        // (sorted(set(...)), dup(list(...))).
+        auto elementOf = [&](mlir::Type iterableType) -> mlir::Type {
+          std::optional<CallSolution> iter = tryManifestMethod(
+              *this, widenLiteral(iterableType), "__iter__", {});
+          if (!iter)
+            return {};
+          std::optional<CallSolution> next =
+              tryManifestMethod(*this, iter->result, "__next__", {});
+          if (!next)
+            return {};
+          return widenLiteral(next->result);
+        };
+        auto contractOf = [&](mlir::Type type) -> py::ContractType {
+          return mlir::dyn_cast_if_present<py::ContractType>(
+              widenLiteral(type));
+        };
+        if (positional.empty()) {
+          if (name == "list")
+            return listOf(join({}));
+          if (name == "tuple")
+            return tupleOf(join({}));
+          if (name == "dict")
+            return dictOf(join({}), join({}));
+          return py::ContractType::get(&context, "builtins.set",
+                                       {join({})});
+        }
+        if (positional.size() == 1) {
+          py::ContractType argument = contractOf(positional.front());
+          llvm::StringRef argumentClass =
+              argument ? argument.getContractName() : llvm::StringRef();
+          if (name == "tuple" && argumentClass == "builtins.tuple")
+            return argument;
+          if (name == "dict" && argumentClass == "builtins.dict")
+            return argument;
+          if (mlir::Type element = elementOf(positional.front())) {
+            if (name == "list")
+              return listOf(element);
+            if (name == "tuple")
+              return tupleOf(element);
+            if (name == "set")
+              return py::ContractType::get(&context, "builtins.set",
+                                           {element});
+            auto pair = contractOf(element);
+            if (pair && pair.getContractName() == "builtins.tuple" &&
+                pair.getArguments().size() == 2)
+              return dictOf(pair.getArguments()[0], pair.getArguments()[1]);
+          }
+        }
+        // Unsupported shapes fall to the emitter interceptor's diagnostics.
       }
       if (name == "round") {
         if (strict) {

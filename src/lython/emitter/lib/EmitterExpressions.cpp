@@ -1265,6 +1265,30 @@ Value ModuleEmitter::emitComprehension(const parser::Node &expr,
     entry.iter = std::get<parser::NodePtr>(iterField->value);
     if (!entry.target || !entry.iter)
       return reject("list comprehension target must be a simple name");
+    // `for k in d.keys()` iterates the dict itself: the keys view is a
+    // phantom with no runtime representation, and dict iteration IS key
+    // iteration. This unlocks the value-position uses that materialize
+    // through a synthesized comprehension (sorted(d.keys()), list(d.keys())).
+    if (entry.iter->kind == "Call") {
+      const parser::Node *viewFunc = ast::node(*entry.iter, "func");
+      const auto *viewArgs = ast::nodeList(*entry.iter, "args");
+      if (viewFunc && viewFunc->kind == "Attribute" &&
+          ast::string(*viewFunc, "attr").value_or("") == "keys" &&
+          (!viewArgs || viewArgs->empty())) {
+        if (const parser::Field *receiverField =
+                parser::findField(*viewFunc, "value"))
+          if (std::holds_alternative<parser::NodePtr>(receiverField->value)) {
+            parser::NodePtr receiver =
+                std::get<parser::NodePtr>(receiverField->value);
+            auto receiverContract =
+                mlir::dyn_cast_if_present<py::ContractType>(
+                    types.widenLiteral(types.inferExpr(receiver.get())));
+            if (receiver && receiverContract &&
+                receiverContract.getContractName() == "builtins.dict")
+              entry.iter = receiver;
+          }
+      }
+    }
     if (entry.target->kind == "Name") {
       entry.targetNames.push_back(ast::nameSpelling(*entry.target));
     } else if (entry.target->kind == "Tuple") {

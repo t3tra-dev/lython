@@ -39,6 +39,7 @@ LogicalResult translateToVerifiedLLVMIR(ModuleOp module,
     diag << "Failed to translate to LLVM IR\n";
     return failure();
   }
+  dumpLLVMForPass(irDump, "pre-eh-llvm", *llvmModule);
   py::installPythonExceptionCleanupFrames(*llvmModule, pythonCallSites);
   py::installArmStreamingCompatibleMemoryRoutines(*llvmModule);
   dumpLLVMForPass(irDump, "llvm-translation", *llvmModule);
