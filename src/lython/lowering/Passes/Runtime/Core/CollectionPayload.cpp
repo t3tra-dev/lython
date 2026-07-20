@@ -411,6 +411,10 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeSequencePayload(
   container.sequenceCapacity =
       RuntimeBundleLowerer::collectionInitialCapacity(elements.size());
   container.sequenceEvidenceBacked = true;
+  // One value can fill several slots (`(j, j)`): every slot retains its own
+  // claim, but the source binding hands over only the ONE token it holds —
+  // releasing it once per slot underflows the box when the container dies.
+  llvm::SmallPtrSet<void *, 4> releasedSources;
   for (auto [index, element] : llvm::enumerate(elements)) {
     if (!element)
       continue;
@@ -424,7 +428,20 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeSequencePayload(
     if (mlir::failed(RuntimeBundleLowerer::storeSequencePayloadElement(
             op, container, static_cast<unsigned>(index), *payload)))
       return mlir::failure();
-    if (payload->objectValue.ownership == ownership::OwnershipKind::Own &&
+    // Key on the ELEMENT's physical identity, not the materialized
+    // payload's: materialization may mint a fresh per-slot box view, and two
+    // slots of one source must still dedupe.
+    bool firstSourceOccurrence = true;
+    mlir::ValueRange sourceValues = element->physicalValues().empty()
+                                        ? payload->physicalValues()
+                                        : element->physicalValues();
+    if (!sourceValues.empty())
+      firstSourceOccurrence =
+          releasedSources
+              .insert(sourceValues.front().getAsOpaquePointer())
+              .second;
+    if (firstSourceOccurrence &&
+        payload->objectValue.ownership == ownership::OwnershipKind::Own &&
         mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
             op, *payload, "sequence.literal.source")))
       return mlir::failure();
