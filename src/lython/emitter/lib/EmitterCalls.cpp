@@ -807,6 +807,15 @@ ModuleEmitter::tryEmitStrCall(const parser::Node &expr,
       strArgs->size() == 1 && (!strKeywords || strKeywords->empty())) {
     mlir::Type argumentType =
         types.widenLiteral(types.inferExpr(strArgs->front().get()));
+    mlir::Type strType = types.contract("builtins.str");
+    if (argumentType == strType) {
+      // str is immutable, so str(s) is the identity (CPython returns s).
+      return coerceValue(emitExpr(strArgs->front().get()), strType, expr);
+    }
+    // None has no physical header for a dispatch to receive; its text is a
+    // compile-time constant anyway (the emitStringifyValue rule).
+    if (argumentType == types.none())
+      return emitStrLiteralPiece(expr, "None");
     if (std::optional<MethodBinding> method =
             lookupClassMethod(argumentType, "__str__")) {
       Value argument = emitExpr(strArgs->front().get());
@@ -817,21 +826,65 @@ ModuleEmitter::tryEmitStrCall(const parser::Node &expr,
                                   methodBindingBindsReceiver(*method),
                                   *method, {}, emptyKeywords);
     }
-    if (CallInferenceResult inference = types.inferMethodCallWithEvidence(
-            argumentType, "__str__", {})) {
+    // Manifest __str__ evidence over-accepts through the object contract
+    // (container manifests only implement __repr__), so gate the __str__
+    // dispatch on the exception taxonomy — the one family whose __str__
+    // (the message) differs from __repr__ (ClassName(...)). Erased
+    // builtins.object receivers keep the __str__ dispatch too: the manifest
+    // object __str__ resolves the payload class dynamically and falls back
+    // to the repr form exactly where CPython's str(x) does.
+    auto isErasedObject = [&](mlir::Type type) {
+      auto contractType = mlir::dyn_cast<py::ContractType>(type);
+      return contractType &&
+             contractType.getContractName() == "builtins.object";
+    };
+    if (CallInferenceResult inference =
+            isExceptionContractType(argumentType) ||
+                    isErasedObject(argumentType)
+                ? types.inferMethodCallWithEvidence(argumentType, "__str__", {})
+                : CallInferenceResult()) {
       Value argument =
           coerceValue(emitExpr(strArgs->front().get()), argumentType, expr);
-      mlir::Type resultType = types.contract("builtins.str");
       auto op = py::StrOp::create(
-          builder, loc(expr), resultType,
+          builder, loc(expr), strType,
           mlir::FlatSymbolRefAttr::get(&context, "__str__"),
           mlir::TypeAttr::get(callProtocolFor(inference)), argument.value);
-      return Value{op.getResult(), resultType};
+      return Value{op.getResult(), strType};
     }
-    // No __str__ evidence: fall through to the instantiation path's
-    // explicit rejection.
+    // No distinct __str__: str(x) is repr(x) (CPython object.__str__
+    // delegates to type(x).__repr__). Reroute through the repr call path
+    // instead of teaching this path a second dispatch ladder — repr owns
+    // the source-__repr__ inline and the default-object-repr fallback.
+    if (values.find("repr") == values.end()) {
+      parser::NodePtr reprName = parser::makeNode("Name", expr.range);
+      parser::addField(*reprName, "id", std::string("repr"));
+      parser::NodePtr reprCall = parser::makeNode("Call", expr.range);
+      parser::addField(*reprCall, "func", std::move(reprName));
+      parser::addField(*reprCall, "args",
+                       std::vector<parser::NodePtr>{strArgs->front()});
+      parser::addField(*reprCall, "keywords", std::vector<parser::NodePtr>{});
+      synthesizedIteratorDefs.push_back(reprCall);
+      return emitCall(*reprCall);
+    }
+    // Fall through to the instantiation path's explicit rejection.
   }
   return std::nullopt;
+}
+
+bool ModuleEmitter::isExceptionContractType(mlir::Type type) const {
+  auto contractType = mlir::dyn_cast<py::ContractType>(type);
+  if (!contractType)
+    return false;
+  llvm::StringRef leaf = contractType.getContractName().rsplit('.').second;
+  if (leaf.empty())
+    leaf = contractType.getContractName();
+  if (py::exceptions::findByName(leaf) != nullptr)
+    return true;
+  // User exception classes share the taxonomy's str/repr semantics (str is
+  // the message, repr is ClassName(...)): the manifest-subclass walk is the
+  // class-side analog of the taxonomy name lookup.
+  return py::protocols::Table::get(context).isManifestSubclassOf(
+      type, "builtins.BaseException");
 }
 
 std::optional<Value>
@@ -905,24 +958,8 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
       // taxonomy (str is the message, repr is ClassName(...)); inference
       // alone over-accepts __str__ for containers whose manifest only
       // implements __repr__, so gate on the taxonomy.
-      auto isBuiltinExceptionContract = [&](mlir::Type type) {
-        auto contractType = mlir::dyn_cast<py::ContractType>(type);
-        if (!contractType)
-          return false;
-        llvm::StringRef leaf = contractType.getContractName().rsplit('.').second;
-        if (leaf.empty())
-          leaf = contractType.getContractName();
-        if (py::exceptions::findByName(leaf) != nullptr)
-          return true;
-        // User exception classes share the taxonomy's str/repr semantics
-        // (str is the message, repr is ClassName(...)), so they take the
-        // same gate; the manifest-subclass walk is the class-side analog of
-        // the taxonomy name lookup.
-        return py::protocols::Table::get(context).isManifestSubclassOf(
-            type, "builtins.BaseException");
-      };
       if (CallInferenceResult inference =
-              isBuiltinExceptionContract(argumentType)
+              isExceptionContractType(argumentType)
                   ? types.inferMethodCallWithEvidence(argumentType, "__str__",
                                                       {})
                   : CallInferenceResult()) {
@@ -932,6 +969,19 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
             mlir::FlatSymbolRefAttr::get(&context, "__str__"),
             mlir::TypeAttr::get(callProtocolFor(inference)), argument.value);
         return Value{op.getResult(), strType};
+      }
+      // A source class without __str__ stringifies through its own __repr__
+      // (object.__str__ delegates to type(x).__repr__); the manifest
+      // evidence below cannot see source methods and would fall to the
+      // address-based default repr.
+      if (std::optional<MethodBinding> method =
+              lookupClassMethod(argumentType, "__repr__")) {
+        Value argument = emitExpr(argNode);
+        llvm::StringMap<Value> emptyKeywords;
+        Value receiver = emitDescriptorReceiver(expr, argument, *method);
+        return emitInlineMethodBody(expr, receiver,
+                                    methodBindingBindsReceiver(*method),
+                                    *method, {}, emptyKeywords);
       }
       if (CallInferenceResult inference =
               types.inferMethodCallWithEvidence(argumentType, "__repr__",
@@ -1610,16 +1660,27 @@ ModuleEmitter::tryEmitReprCall(const parser::Node &expr,
     mlir::Type argumentType =
         types.widenLiteral(types.inferExpr(args->front().get()));
     std::optional<Value> repr;
-    if (std::optional<MethodBinding> method =
-            lookupClassMethod(argumentType, "__repr__")) {
-      // Source-class __repr__: inline the method body.
+    // print renders through str(), not repr(): a source-class __str__
+    // outranks __repr__ here, and an exception subclass without its own
+    // __str__ must fall to the sink's ancestor __str__ (the message form)
+    // rather than inline a source __repr__ (the ClassName(...) form).
+    std::optional<MethodBinding> sourceMethod;
+    if (name == "print")
+      sourceMethod = lookupClassMethod(argumentType, "__str__");
+    if (!sourceMethod &&
+        !(name == "print" &&
+          py::protocols::Table::get(context).isManifestSubclassOf(
+              argumentType, "builtins.BaseException")))
+      sourceMethod = lookupClassMethod(argumentType, "__repr__");
+    if (sourceMethod) {
+      // Source-class method: inline the method body.
       Value argument = emitExpr(args->front().get());
       llvm::StringMap<Value> emptyKeywords;
       Value descriptorReceiver =
-          emitDescriptorReceiver(expr, argument, *method);
+          emitDescriptorReceiver(expr, argument, *sourceMethod);
       repr = emitInlineMethodBody(expr, descriptorReceiver,
-                                  methodBindingBindsReceiver(*method), *method,
-                                  {}, emptyKeywords);
+                                  methodBindingBindsReceiver(*sourceMethod),
+                                  *sourceMethod, {}, emptyKeywords);
     } else if (name == "repr") {
       // Manifest-typed receiver (int/str/...): emit py.repr dispatch, the
       // same manifest path `str()` uses (avoid altering `print`'s existing

@@ -344,6 +344,9 @@ private:
   std::optional<Value> rejectStubSourceCall(const parser::Node &expr,
                                             llvm::StringRef symbol,
                                             bool instantiation);
+  // Taxonomy exceptions and user exception classes: the only contracts whose
+  // manifest __str__ (the message) differs from __repr__ (ClassName(...)).
+  bool isExceptionContractType(mlir::Type type) const;
   bool methodBindingBindsReceiver(const MethodBinding &method) const;
   Value emitDescriptorReceiver(const parser::Node &anchor, Value receiver,
                                const MethodBinding &method);
