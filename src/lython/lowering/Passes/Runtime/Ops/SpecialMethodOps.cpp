@@ -1268,8 +1268,15 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIter(py::IterOp op) {
                               iterable->sequenceElements.empty() &&
                               !iterable->evidenceIteratorCell &&
                               iterable->physicalValues().size() >= 3;
+    // Runtime tuples (eg.exceptions, str.partition results, tuple(xs))
+    // share the list's physical layout exactly (meta at [1], boxed slots at
+    // [2]); immutable, so no mutation guard.
+    bool runtimeTupleIterable = iterable->contractName() == "builtins.tuple" &&
+                                iterable->sequenceElements.empty() &&
+                                !iterable->evidenceIteratorCell &&
+                                iterable->physicalValues().size() >= 3;
     if (evidenceListIterable || runtimeListIterable || runtimeDictIterable ||
-        runtimeSetIterable) {
+        runtimeSetIterable || runtimeTupleIterable) {
       mlir::func::FuncOp function = op->getParentOfType<mlir::func::FuncOp>();
       if (!function)
         return op.emitError() << "list iteration requires a function context";

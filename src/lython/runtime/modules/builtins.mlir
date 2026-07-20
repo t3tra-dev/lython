@@ -42,7 +42,7 @@ module attributes {
   // overload set on the table side (CPython abs is int->int / float->float /
   // complex->float, which one generic T->T contract cannot express -- the
   // complex result is a float).
-  ly.typing.function_names = ["builtins.print", "builtins.len", "builtins.hash", "builtins.sorted", "builtins.abs", "builtins.abs", "builtins.abs", "builtins.divmod", "builtins.pow", "builtins.ord", "builtins.chr", "builtins.hex", "builtins.oct", "builtins.bin", "builtins.input"],
+  ly.typing.function_names = ["builtins.print", "builtins.len", "builtins.hash", "builtins.sorted", "builtins.abs", "builtins.abs", "builtins.abs", "builtins.divmod", "builtins.pow", "builtins.ord", "builtins.chr", "builtins.hex", "builtins.oct", "builtins.bin", "builtins.input", "builtins.list", "builtins.tuple"],
   ly.typing.function_contracts = [
     !py.callable<[], vararg = !py.contract<"builtins.tuple", [!py.contract<"builtins.object">]>, returns = [!py.literal<None>]>,
     !py.callable<[!py.contract<"builtins.object">], returns = [!py.contract<"builtins.int">]>,
@@ -58,7 +58,9 @@ module attributes {
     !py.callable<[!py.contract<"builtins.int">], returns = [!py.contract<"builtins.str">]>,
     !py.callable<[!py.contract<"builtins.int">], returns = [!py.contract<"builtins.str">]>,
     !py.callable<[!py.contract<"builtins.int">], returns = [!py.contract<"builtins.str">]>,
-    !py.callable<[!py.contract<"builtins.str">], returns = [!py.contract<"builtins.str">]>
+    !py.callable<[!py.contract<"builtins.str">], returns = [!py.contract<"builtins.str">]>,
+    !py.callable<[!py.contract<"builtins.list", [!py.typevar<"T">]>], returns = [!py.contract<"builtins.list", [!py.typevar<"T">]>]>,
+    !py.callable<[!py.contract<"builtins.list", [!py.typevar<"T">]>], returns = [!py.contract<"builtins.tuple", [!py.typevar<"T">]>]>
   ]
 } {
   py.class @object attributes {
@@ -15766,6 +15768,22 @@ module attributes {
 
   func.func @LyList_Copy(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.method = "copy", ly.runtime.result_contract = "builtins.list"} {
     %class_id = arith.constant 10 : i64
+    %h, %m, %i = func.call @__ly_sequence_copy_alloc(%class_id, %meta, %items) : (i64, memref<2xi64>, memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    func.return %h, %m, %i : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  }
+
+  // list(xs): a fresh shallow copy of a list argument (the emitter routes
+  // other iterables through the comprehension desugar instead).
+  func.func @LyBuiltin_List(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "list", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.list", ly.runtime.primitive = "builtin_list", ly.runtime.result_contract = "builtins.list"} {
+    %class_id = arith.constant 10 : i64
+    %h, %m, %i = func.call @__ly_sequence_copy_alloc(%class_id, %meta, %items) : (i64, memref<2xi64>, memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    func.return %h, %m, %i : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  }
+
+  // tuple(xs): freeze a list's items into a fresh tuple (lists and tuples
+  // share the sequence storage layout, so only the class id differs).
+  func.func @LyBuiltin_Tuple(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "tuple", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.list", ly.runtime.primitive = "builtin_tuple", ly.runtime.result_contract = "builtins.tuple"} {
+    %class_id = arith.constant 11 : i64
     %h, %m, %i = func.call @__ly_sequence_copy_alloc(%class_id, %meta, %items) : (i64, memref<2xi64>, memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
     func.return %h, %m, %i : memref<2xi64>, memref<2xi64>, memref<?xi64>
   }

@@ -221,6 +221,8 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     return *v;
   if (std::optional<Value> v = tryEmitListCall(expr, calleeNode))
     return *v;
+  if (std::optional<Value> v = tryEmitContainerConstructorCall(expr, calleeNode))
+    return *v;
   if (std::optional<Value> v = tryEmitPrintCall(expr, calleeNode))
     return *v;
   if (std::optional<Value> v = tryEmitReducerCall(expr, calleeNode))
