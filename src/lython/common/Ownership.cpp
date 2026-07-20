@@ -1334,6 +1334,20 @@ mlir::func::CallOp guardedCallAfterMarker(mlir::Operation *marker) {
       continue; // a later marker takes over the pairing
     if (callee == "LyEH_TryCatchAnchor" || callee == "LyEH_TryCatchMarker")
       return {};
+    // Non-unwinding release helpers and the raise path's traceback frame sit
+    // between a marker and its guarded call once ownership insertion has
+    // scheduled pre-raise releases; the final EH phase's pairing scan skips
+    // them, so the mirror must too — otherwise the guarded raise is analyzed
+    // as guarding a DecRef, the raised exception loses its consumed-by-raise
+    // exemption, and the unwind cleanup releases the exception the handler
+    // is about to read.
+    if (callee == "Ly_IncRef" || callee == "Ly_DecRef" ||
+        callee.ends_with("_DecRef") ||
+        callee == "LyObject_ReleaseStorageToZero" ||
+        callee.starts_with("__ly_dealloc_") ||
+        callee.starts_with("__ly_unwind_cleanup_") ||
+        callee.starts_with("LyTraceback_"))
+      continue;
     return call;
   }
   return {};

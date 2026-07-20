@@ -1155,8 +1155,21 @@ mlir::LogicalResult verifyBorrowedEntryOnCFGPaths(
           if (mlir::Block *handler = markerHandlerEntry(handlerEntries, call)) {
             BorrowedPathState next = state;
             // The unwind transfer happens DURING the guarded call: its
-            // consume effect applies on the exceptional edge.
-            if (mlir::func::CallOp guarded = own::guardedCallAfterMarker(op))
+            // consume effect applies on the exceptional edge. Release
+            // helpers scheduled between the marker and the guarded call (a
+            // raise statement's dying locals) run BEFORE any unwind, so
+            // their consume effects apply on the edge too.
+            mlir::func::CallOp guarded = own::guardedCallAfterMarker(op);
+            for (mlir::Operation *between = op->getNextNode();
+                 between && guarded && between != guarded.getOperation();
+                 between = between->getNextNode())
+              if (auto releaseCall =
+                      mlir::dyn_cast<mlir::func::CallOp>(between))
+                if (callConsumesGroup(contracts, releaseCall, next.group,
+                                      aliases) &&
+                    next.retained > 0)
+                  --next.retained;
+            if (guarded)
               if (callConsumesGroup(contracts, guarded, next.group, aliases) &&
                   next.retained > 0)
                 --next.retained;
@@ -1534,15 +1547,28 @@ verifyResourceOnCFGPaths(FuncContractCache &contracts,
           // never materialize (a transfer is a plain release here).
           if (mlir::Block *handler = markerHandlerEntry(handlerEntries, call)) {
             AffinePathState next = state;
-            if (mlir::func::CallOp guarded = own::guardedCallAfterMarker(op)) {
-              if (callConsumesGroup(contracts, guarded, next.group, aliases)) {
-                if (next.token == AffineTokenState::Owned ||
-                    next.token == AffineTokenState::Conditional)
-                  next.token = AffineTokenState::Released;
-                else if (next.retained > 0)
-                  --next.retained;
-              }
-            }
+            auto applyEdgeConsume = [&](mlir::func::CallOp consumer) {
+              if (!callConsumesGroup(contracts, consumer, next.group, aliases))
+                return;
+              if (next.token == AffineTokenState::Owned ||
+                  next.token == AffineTokenState::Conditional)
+                next.token = AffineTokenState::Released;
+              else if (next.retained > 0)
+                --next.retained;
+            };
+            // Release helpers scheduled between the marker and the guarded
+            // call (a raise statement's dying locals) run BEFORE any unwind,
+            // so their consume effects apply on the exceptional edge just
+            // like the guarded call's own transfer.
+            mlir::func::CallOp guarded = own::guardedCallAfterMarker(op);
+            for (mlir::Operation *between = op->getNextNode();
+                 between && guarded && between != guarded.getOperation();
+                 between = between->getNextNode())
+              if (auto releaseCall =
+                      mlir::dyn_cast<mlir::func::CallOp>(between))
+                applyEdgeConsume(releaseCall);
+            if (guarded)
+              applyEdgeConsume(guarded);
             next.block = handler;
             next.start = firstOperation(handler);
             next.exceptional = true;
