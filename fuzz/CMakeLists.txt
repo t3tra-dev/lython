@@ -26,8 +26,12 @@ function(lython_add_fuzzer name)
     # without mutation. Leak checking stays off: the harnesses intentionally
     # leak the one-time registry, and system LLVM/MLIR dylibs are
     # uninstrumented (container-overflow false positives).
+    # rss_limit matches the manual invocation above: libFuzzer's default
+    # 2048MB is below the peak of a single ASan-instrumented compile of a
+    # golden case that imports a stdlib source module (stdlib_string_* peaks
+    # at ~2.25GB), so the replay would OOM on a legitimate input.
     add_test(NAME "fuzz.${name}.corpus"
-        COMMAND ${name} -runs=0
+        COMMAND ${name} -runs=0 -rss_limit_mb=4096
             "${CMAKE_CURRENT_SOURCE_DIR}/corpora/${name}"
             "${CMAKE_SOURCE_DIR}/tests/golden/cases")
     # The golden suite compiles at ~1 exec/s under ASan and has grown past
