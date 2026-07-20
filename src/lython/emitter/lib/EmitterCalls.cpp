@@ -227,6 +227,8 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     return *v;
   if (std::optional<Value> v = tryEmitLazyIteratorValueCall(expr, calleeNode))
     return *v;
+  if (std::optional<Value> v = tryEmitItertoolsValueCall(expr, calleeNode))
+    return *v;
   if (std::optional<Value> v = tryEmitDictMethodSugar(expr, calleeNode))
     return *v;
   if (std::optional<Value> v = tryEmitSortSugar(expr, calleeNode))

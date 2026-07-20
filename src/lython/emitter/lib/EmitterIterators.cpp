@@ -1914,4 +1914,1133 @@ ModuleEmitter::tryEmitDictViewMembership(const parser::Node &expr) {
   return result;
 }
 
+// ---------------------------------------------------------------------------
+// itertools desugars. The itertools manifest (runtime/modules/itertools.mlir)
+// declares the module contract only; every call compiles here. For-position
+// consumption fuses into rewritten loops (the count/islice/takewhile family,
+// including infinite and generator-backed sources); value position
+// synthesizes per-call-site generator functions over indexable sequences
+// exactly like the enumerate/zip machinery above. Names neither layer can
+// express are rejected with a diagnostic — an itertools call must never fall
+// through to generic dispatch, because no native implementation exists.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+NodePtr notNode(NodePtr operand, parser::SourceRange range) {
+  NodePtr op = parser::makeNode("Not", range);
+  NodePtr node = parser::makeNode("UnaryOp", range);
+  parser::addField(*node, "op", std::move(op));
+  parser::addField(*node, "operand", std::move(operand));
+  return node;
+}
+
+NodePtr boolConstant(bool value, parser::SourceRange range) {
+  NodePtr node = parser::makeNode("Constant", range);
+  parser::addField(*node, "value", value);
+  return node;
+}
+
+NodePtr breakStatement(parser::SourceRange range) {
+  return parser::makeNode("Break", range);
+}
+
+NodePtr continueStatement(parser::SourceRange range) {
+  return parser::makeNode("Continue", range);
+}
+
+NodePtr ifElseNode(NodePtr test, std::vector<NodePtr> body,
+                   std::vector<NodePtr> orelse, parser::SourceRange range) {
+  NodePtr node = parser::makeNode("If", range);
+  parser::addField(*node, "test", std::move(test));
+  parser::addField(*node, "body", std::move(body));
+  parser::addField(*node, "orelse", std::move(orelse));
+  return node;
+}
+
+NodePtr ifExpNode(NodePtr test, NodePtr body, NodePtr orelse,
+                  parser::SourceRange range) {
+  NodePtr node = parser::makeNode("IfExp", range);
+  parser::addField(*node, "test", std::move(test));
+  parser::addField(*node, "body", std::move(body));
+  parser::addField(*node, "orelse", std::move(orelse));
+  return node;
+}
+
+NodePtr orChainNode(std::vector<NodePtr> values, parser::SourceRange range) {
+  if (values.size() == 1)
+    return std::move(values.front());
+  NodePtr op = parser::makeNode("Or", range);
+  NodePtr node = parser::makeNode("BoolOp", range);
+  parser::addField(*node, "op", std::move(op));
+  parser::addField(*node, "values", std::move(values));
+  return node;
+}
+
+NodePtr raiseValueError(const std::string &message,
+                        parser::SourceRange range) {
+  NodePtr text = parser::makeNode("Constant", range);
+  parser::addField(*text, "value", message);
+  NodePtr call = callNode(nameNode("ValueError", range), {std::move(text)},
+                          range);
+  NodePtr node = parser::makeNode("Raise", range);
+  parser::addField(*node, "exc", std::move(call));
+  return node;
+}
+
+std::optional<std::int64_t> constantInt(const parser::Node *expr) {
+  if (!expr || expr->kind != "Constant")
+    return std::nullopt;
+  return ast::integer(*expr, "value");
+}
+
+bool isNoneConstant(const parser::Node *expr) {
+  return expr && expr->kind == "Constant" && ast::isNoneField(*expr, "value");
+}
+
+// break/continue that would bind to the fused loop. Nested loops and
+// callables keep their own escapes; If/Try/With bodies forward them.
+bool containsLoopEscape(const std::vector<NodePtr> &body) {
+  for (const NodePtr &stmt : body) {
+    if (!stmt)
+      continue;
+    if (stmt->kind == "Break" || stmt->kind == "Continue")
+      return true;
+    if (stmt->kind == "For" || stmt->kind == "While" ||
+        stmt->kind == "FunctionDef" || stmt->kind == "AsyncFunctionDef" ||
+        stmt->kind == "ClassDef")
+      continue;
+    for (const parser::Field &field : stmt->fields)
+      if (const auto *list = std::get_if<std::vector<NodePtr>>(&field.value))
+        if (containsLoopEscape(*list))
+          return true;
+  }
+  return false;
+}
+
+const char *kIsliceRangeMessage =
+    "Indices for islice() must be None or an integer: 0 <= x <= sys.maxsize.";
+
+} // namespace
+
+std::optional<std::string>
+ModuleEmitter::itertoolsCalleeName(const parser::Node *calleeNode) {
+  if (!calleeNode)
+    return std::nullopt;
+  auto canonicalToName =
+      [](const std::string &canonical) -> std::optional<std::string> {
+    llvm::StringRef ref(canonical);
+    if (ref.consume_front("itertools."))
+      return ref.str();
+    return std::nullopt;
+  };
+  if (calleeNode->kind == "Name") {
+    llvm::StringRef name = ast::nameSpelling(*calleeNode);
+    if (values.count(name))
+      return std::nullopt;
+    if (std::optional<std::string> canonical =
+            types.lookupCanonicalBinding(name))
+      return canonicalToName(*canonical);
+    return std::nullopt;
+  }
+  if (calleeNode->kind == "Attribute") {
+    auto attr = ast::string(*calleeNode, "attr");
+    if (!attr)
+      return std::nullopt;
+    if (*attr == "from_iterable")
+      if (const parser::Node *base = ast::node(*calleeNode, "value"))
+        if (std::optional<std::string> baseName = itertoolsCalleeName(base);
+            baseName && *baseName == "chain")
+          return std::string("chain.from_iterable");
+    std::string qualified = ast::qualifiedName(calleeNode);
+    if (!qualified.empty())
+      if (std::optional<std::string> canonical =
+              types.lookupCanonicalBinding(qualified))
+        return canonicalToName(*canonical);
+    return std::nullopt;
+  }
+  return std::nullopt;
+}
+
+bool ModuleEmitter::tryEmitItertoolsFor(const parser::Node &statement,
+                                        const parser::Node &iterCall) {
+  const parser::Node *calleeNode = ast::node(iterCall, "func");
+  std::optional<std::string> nameOpt = itertoolsCalleeName(calleeNode);
+  if (!nameOpt)
+    return false;
+  llvm::StringRef name = *nameOpt;
+  bool fusedName =
+      name == "count" || name == "repeat" || name == "cycle" ||
+      name == "islice" || name == "takewhile" || name == "dropwhile" ||
+      name == "filterfalse" || name == "accumulate" || name == "pairwise" ||
+      name == "zip_longest" || name == "chain.from_iterable";
+  if (!fusedName)
+    return false; // value synthesis handles chain/product/combinations/...
+
+  auto reject = [&](llvm::StringRef reason) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, statement.range.start, std::string(reason)});
+    return true;
+  };
+
+  const auto *args = ast::nodeList(iterCall, "args");
+  const auto *keywords = ast::nodeList(iterCall, "keywords");
+  if (args)
+    for (const NodePtr &arg : *args)
+      if (arg && arg->kind == "Starred")
+        return reject("itertools." + name.str() +
+                      "() does not support * argument unpacking");
+  auto argAt = [&](std::size_t index) -> NodePtr {
+    if (!args || index >= args->size())
+      return nullptr;
+    return (*args)[index];
+  };
+  std::size_t argCount = args ? args->size() : 0;
+  auto keywordValue = [&](llvm::StringRef keyword) -> NodePtr {
+    if (!keywords)
+      return nullptr;
+    for (const NodePtr &node : *keywords) {
+      if (!node)
+        continue;
+      auto kwName = ast::string(*node, "arg");
+      if (!kwName || llvm::StringRef(*kwName) != keyword)
+        continue;
+      const parser::Field *valueField = parser::findField(*node, "value");
+      if (valueField && std::holds_alternative<NodePtr>(valueField->value))
+        return std::get<NodePtr>(valueField->value);
+    }
+    return nullptr;
+  };
+  auto keywordsOnly = [&](std::initializer_list<llvm::StringRef> allowed) {
+    if (!keywords)
+      return true;
+    for (const NodePtr &node : *keywords) {
+      if (!node)
+        continue;
+      auto kwName = ast::string(*node, "arg");
+      if (!kwName)
+        return false;
+      if (!llvm::is_contained(allowed, llvm::StringRef(*kwName)))
+        return false;
+    }
+    return true;
+  };
+
+  std::optional<ForParts> parts = forParts(statement);
+  if (!parts)
+    return false;
+  parser::SourceRange range = parts->range;
+  unsigned serial = ++listCompCounter;
+  auto scratch = [&](const char *stem) {
+    return "__lyitt" + std::to_string(serial) + "_" + std::string(stem);
+  };
+  // An expression re-read per iteration (or after other setup) must be a
+  // name; anything else evaluates once into a scratch temp during setup.
+  llvm::SmallVector<std::string, 6> scratchNames;
+  std::vector<NodePtr> setup;
+  auto pinned = [&](NodePtr expr, const char *stem) -> NodePtr {
+    if (!expr || expr->kind == "Name" || expr->kind == "Constant")
+      return expr;
+    std::string temp = scratch(stem);
+    scratchNames.push_back(temp);
+    setup.push_back(assignNode(nameNode(temp, range), expr, range));
+    return nameNode(temp, range);
+  };
+  auto emitFused = [&](llvm::function_ref<void()> emitLoop) {
+    runWithScratchNames(scratchNames, [&] {
+      for (const NodePtr &node : setup)
+        emitStatement(*node);
+      emitLoop();
+    });
+    return true;
+  };
+
+  // ---- count([start[, step]]) --------------------------------------------
+  if (name == "count") {
+    if (argCount > 2 || !keywordsOnly({"start", "step"}))
+      return reject("count() takes a start and a step");
+    NodePtr start = argAt(0);
+    if (!start)
+      start = keywordValue("start");
+    NodePtr step = argAt(1);
+    if (!step)
+      step = keywordValue("step");
+    if (!start)
+      start = intConstant(0, range);
+    if (!step)
+      step = intConstant(1, range);
+    std::string counterName = scratch("c");
+    scratchNames.push_back(counterName);
+    NodePtr counter = nameNode(counterName, range);
+    setup.push_back(assignNode(counter, start, range));
+    NodePtr stepRef = pinned(step, "st");
+    std::vector<NodePtr> body{
+        assignNode(parts->target, counter, range),
+        assignNode(counter, binOpNode(counter, "Add", stepRef, range), range)};
+    body.insert(body.end(), parts->body.begin(), parts->body.end());
+    NodePtr loop = whileNode(trueConstant(range), std::move(body),
+                             parts->orelse, range);
+    return emitFused([&] { emitWhile(*loop); });
+  }
+
+  // ---- repeat(object[, times]) --------------------------------------------
+  if (name == "repeat") {
+    NodePtr object = argAt(0);
+    NodePtr times = argAt(1);
+    if (!times)
+      times = keywordValue("times");
+    if (!object || argCount > 2 || !keywordsOnly({"times"}))
+      return reject("repeat() takes an object and an optional times");
+    std::string objectName = scratch("o");
+    scratchNames.push_back(objectName);
+    NodePtr objectRef = nameNode(objectName, range);
+    setup.push_back(assignNode(objectRef, object, range));
+    if (!times) {
+      std::vector<NodePtr> body{assignNode(parts->target, objectRef, range)};
+      body.insert(body.end(), parts->body.begin(), parts->body.end());
+      NodePtr loop = whileNode(trueConstant(range), std::move(body),
+                               parts->orelse, range);
+      return emitFused([&] { emitWhile(*loop); });
+    }
+    NodePtr timesRef = pinned(times, "n");
+    std::string counterName = scratch("k");
+    scratchNames.push_back(counterName);
+    NodePtr counter = nameNode(counterName, range);
+    setup.push_back(assignNode(counter, intConstant(0, range), range));
+    std::vector<NodePtr> body{
+        assignNode(counter, binOpNode(counter, "Add", intConstant(1, range),
+                                      range),
+                   range),
+        assignNode(parts->target, objectRef, range)};
+    body.insert(body.end(), parts->body.begin(), parts->body.end());
+    NodePtr loop = whileNode(compareNode(counter, "Lt", timesRef, range),
+                             std::move(body), parts->orelse, range);
+    return emitFused([&] { emitWhile(*loop); });
+  }
+
+  // ---- cycle(sequence) -----------------------------------------------------
+  if (name == "cycle") {
+    if (argCount != 1 || (keywords && !keywords->empty()))
+      return reject("cycle() takes exactly one iterable");
+    if (!hasIndexableEvidence(argAt(0).get()))
+      return reject("cycle() requires an indexable sequence "
+                    "(list/str/tuple/bytes)");
+    NodePtr source = pinned(argAt(0), "s");
+    std::string indexName = scratch("i");
+    scratchNames.push_back(indexName);
+    NodePtr indexRef = nameNode(indexName, range);
+    setup.push_back(assignNode(indexRef, intConstant(0, range), range));
+    std::vector<NodePtr> body{
+        assignNode(parts->target, subscriptNode(source, indexRef, range),
+                   range),
+        assignNode(indexRef,
+                   binOpNode(binOpNode(indexRef, "Add", intConstant(1, range),
+                                       range),
+                             "Mod", lenCall(source, range), range),
+                   range)};
+    body.insert(body.end(), parts->body.begin(), parts->body.end());
+    NodePtr loop = whileNode(
+        compareNode(lenCall(source, range), "Gt", intConstant(0, range),
+                    range),
+        std::move(body), parts->orelse, range);
+    return emitFused([&] { emitWhile(*loop); });
+  }
+
+  // ---- islice(source, [start,] stop [, step]) ------------------------------
+  if (name == "islice") {
+    if (keywords && !keywords->empty())
+      return reject("islice() takes no keyword arguments");
+    if (argCount < 2 || argCount > 4)
+      return reject("islice() takes a source and stop, or start/stop/step");
+    NodePtr source = argAt(0);
+    NodePtr start = argCount >= 3 ? argAt(1) : nullptr;
+    NodePtr stop = argCount >= 3 ? argAt(2) : argAt(1);
+    NodePtr step = argCount == 4 ? argAt(3) : nullptr;
+    if (isNoneConstant(start.get()))
+      start = nullptr;
+    if (isNoneConstant(stop.get()))
+      stop = nullptr;
+    if (isNoneConstant(step.get()))
+      step = nullptr;
+    std::optional<std::int64_t> startConst = constantInt(start.get());
+    std::optional<std::int64_t> stopConst = constantInt(stop.get());
+    std::optional<std::int64_t> stepConst = constantInt(step.get());
+    if ((start && !startConst) || (step && !stepConst))
+      return reject("islice() start/step must be non-negative compile-time "
+                    "constants for now; bind the slice to a variable-free "
+                    "form or use a manual loop");
+    if ((startConst && *startConst < 0) || (stopConst && *stopConst < 0) ||
+        (stepConst && *stepConst < 1))
+      return reject(kIsliceRangeMessage);
+    // CPython evaluates the source expression before the bounds; the fused
+    // setup runs bound temps first, so a bounds expression with effects
+    // next to a source call would swap observable order.
+    if (source && source->kind == "Call" && stop && !stopConst &&
+        stop->kind != "Name")
+      return reject("islice() over a source call requires the stop bound to "
+                    "be a name or constant (evaluation order would swap); "
+                    "bind the stop to a variable first");
+    // A named iterator would be advanced one element past the slice by the
+    // driving loop; a fresh call's residual position is unobservable.
+    if (source && source->kind == "Name") {
+      mlir::Type sourceType =
+          types.widenLiteral(types.inferExpr(source.get()));
+      if (types.inferMethodCallWithEvidence(sourceType, "__next__", {}))
+        return reject("islice() over a named iterator would over-consume it; "
+                      "call islice on the iterator-producing expression "
+                      "directly");
+    }
+    if (parts->orelse.size() && stop)
+      return reject("for/else over islice() with a stop is not supported "
+                    "yet");
+    if (stopConst && startConst.value_or(0) >= *stopConst) {
+      // Statically empty: evaluate the source for its effects only.
+      NodePtr effect = parser::makeNode("Expr", range);
+      parser::addField(*effect, "value", source);
+      return emitFused([&] { emitStatement(*effect); });
+    }
+    std::int64_t startValue = startConst.value_or(0);
+    std::int64_t stepValue = stepConst.value_or(1);
+    NodePtr stopRef = stop ? pinned(stop, "e") : nullptr;
+    if (stop && !stopConst)
+      setup.push_back(ifNode(
+          compareNode(stopRef, "Lt", intConstant(0, range), range),
+          {raiseValueError(kIsliceRangeMessage, range)}, range));
+    std::string pulledName = scratch("k");
+    std::string indexName = scratch("j");
+    scratchNames.push_back(pulledName);
+    scratchNames.push_back(indexName);
+    NodePtr pulled = nameNode(pulledName, range);
+    NodePtr index = nameNode(indexName, range);
+    setup.push_back(assignNode(pulled, intConstant(0, range), range));
+    std::string elementName = scratch("v");
+    scratchNames.push_back(elementName);
+    NodePtr element = nameNode(elementName, range);
+    std::vector<NodePtr> body;
+    body.push_back(assignNode(index, pulled, range));
+    body.push_back(assignNode(
+        pulled, binOpNode(index, "Add", intConstant(1, range), range),
+        range));
+    if (stop)
+      body.push_back(ifNode(compareNode(index, "GtE", stopRef, range),
+                            {breakStatement(range)}, range));
+    if (startValue > 0)
+      body.push_back(ifNode(
+          compareNode(index, "Lt", intConstant(startValue, range), range),
+          {continueStatement(range)}, range));
+    if (stepValue != 1)
+      body.push_back(ifNode(
+          compareNode(
+              binOpNode(binOpNode(index, "Sub",
+                                  intConstant(startValue, range), range),
+                        "Mod", intConstant(stepValue, range), range),
+              "NotEq", intConstant(0, range), range),
+          {continueStatement(range)}, range));
+    body.push_back(assignNode(parts->target, element, range));
+    body.insert(body.end(), parts->body.begin(), parts->body.end());
+    if (stop)
+      body.push_back(ifNode(
+          compareNode(binOpNode(index, "Add", intConstant(stepValue, range),
+                                range),
+                      "GtE", stopRef, range),
+          {breakStatement(range)}, range));
+    NodePtr loop =
+        forNode(element, source, std::move(body), parts->orelse, range);
+    return emitFused([&] { emitFor(*loop); });
+  }
+
+  // ---- takewhile/dropwhile/filterfalse(predicate, source) ------------------
+  if (name == "takewhile" || name == "dropwhile" || name == "filterfalse") {
+    if (keywords && !keywords->empty())
+      return reject("itertools." + name.str() +
+                    "() takes no keyword arguments");
+    if (argCount != 2)
+      return reject("itertools." + name.str() +
+                    "() requires a predicate and an iterable");
+    NodePtr predicate = argAt(0);
+    bool identityPredicate = name == "filterfalse" &&
+                             isNoneConstant(predicate.get());
+    LazyCallable callable;
+    if (!identityPredicate &&
+        !lazyCallableParts(statement, predicate, callable))
+      return true;
+    if (name == "takewhile" && !parts->orelse.empty())
+      return reject("for/else over takewhile() is not supported yet");
+    std::string elementName = scratch("v");
+    scratchNames.push_back(elementName);
+    for (const std::string &param : callable.lambdaParams)
+      scratchNames.push_back(param);
+    NodePtr element = nameNode(elementName, range);
+    std::vector<NodePtr> body;
+    if (name == "takewhile") {
+      NodePtr test;
+      if (!buildLazyCall(statement, callable, {element}, body, test))
+        return true;
+      body.push_back(ifNode(notNode(test, range), {breakStatement(range)},
+                            range));
+      body.push_back(assignNode(parts->target, element, range));
+      body.insert(body.end(), parts->body.begin(), parts->body.end());
+    } else if (name == "dropwhile") {
+      std::string flagName = scratch("d");
+      scratchNames.push_back(flagName);
+      NodePtr flag = nameNode(flagName, range);
+      setup.push_back(assignNode(flag, boolConstant(true, range), range));
+      std::vector<NodePtr> dropping;
+      NodePtr test;
+      if (!buildLazyCall(statement, callable, {element}, dropping, test))
+        return true;
+      dropping.push_back(ifNode(test, {continueStatement(range)}, range));
+      dropping.push_back(assignNode(flag, boolConstant(false, range), range));
+      body.push_back(ifNode(flag, std::move(dropping), range));
+      body.push_back(assignNode(parts->target, element, range));
+      body.insert(body.end(), parts->body.begin(), parts->body.end());
+    } else { // filterfalse
+      NodePtr test = element;
+      if (!identityPredicate &&
+          !buildLazyCall(statement, callable, {element}, body, test))
+        return true;
+      std::vector<NodePtr> inner{assignNode(parts->target, element, range)};
+      inner.insert(inner.end(), parts->body.begin(), parts->body.end());
+      body.push_back(ifNode(notNode(test, range), std::move(inner), range));
+    }
+    NodePtr loop =
+        forNode(element, argAt(1), std::move(body), parts->orelse, range);
+    return emitFused([&] { emitFor(*loop); });
+  }
+
+  // ---- accumulate(source[, func]) ------------------------------------------
+  if (name == "accumulate") {
+    if (!keywordsOnly({"func"}))
+      return reject("accumulate() with initial= is not supported yet");
+    if (argCount < 1 || argCount > 2)
+      return reject("accumulate() takes an iterable and an optional "
+                    "function");
+    NodePtr func = argAt(1);
+    if (!func)
+      func = keywordValue("func");
+    bool defaultAdd = !func || isNoneConstant(func.get());
+    LazyCallable callable;
+    if (!defaultAdd && !lazyCallableParts(statement, func, callable))
+      return true;
+    std::string elementName = scratch("v");
+    std::string accName = scratch("a");
+    std::string flagName = scratch("h");
+    scratchNames.push_back(elementName);
+    scratchNames.push_back(accName);
+    scratchNames.push_back(flagName);
+    for (const std::string &param : callable.lambdaParams)
+      scratchNames.push_back(param);
+    NodePtr element = nameNode(elementName, range);
+    NodePtr acc = nameNode(accName, range);
+    NodePtr flag = nameNode(flagName, range);
+    setup.push_back(assignNode(flag, boolConstant(false, range), range));
+    // The accumulator is loop-carried, so it needs a pre-loop definition (a
+    // branch-local first assignment is invisible to the sibling branch).
+    // The int seed restricts fused accumulate to int elements; other element
+    // types fail the merge with a diagnostic instead of mis-executing.
+    setup.push_back(assignNode(acc, intConstant(0, range), range));
+    std::vector<NodePtr> accumulateStep;
+    NodePtr applied;
+    if (defaultAdd)
+      applied = binOpNode(acc, "Add", element, range);
+    else if (!buildLazyCall(statement, callable, {acc, element},
+                            accumulateStep, applied))
+      return true;
+    accumulateStep.push_back(assignNode(acc, applied, range));
+    std::vector<NodePtr> firstStep{
+        assignNode(acc, element, range),
+        assignNode(flag, boolConstant(true, range), range)};
+    std::vector<NodePtr> body{
+        ifElseNode(flag, std::move(accumulateStep), std::move(firstStep),
+                   range),
+        assignNode(parts->target, acc, range)};
+    body.insert(body.end(), parts->body.begin(), parts->body.end());
+    NodePtr loop =
+        forNode(element, argAt(0), std::move(body), parts->orelse, range);
+    return emitFused([&] { emitFor(*loop); });
+  }
+
+  // ---- pairwise(source) ----------------------------------------------------
+  if (name == "pairwise") {
+    if (argCount != 1 || (keywords && !keywords->empty()))
+      return reject("pairwise() takes exactly one iterable");
+    NodePtr source = argAt(0);
+    if (hasIndexableEvidence(source.get())) {
+      NodePtr sourceRef = pinned(source, "s");
+      std::string indexName = scratch("i");
+      std::string cursorName = scratch("j");
+      scratchNames.push_back(indexName);
+      scratchNames.push_back(cursorName);
+      NodePtr index = nameNode(indexName, range);
+      NodePtr cursor = nameNode(cursorName, range);
+      setup.push_back(assignNode(index, intConstant(0, range), range));
+      std::vector<NodePtr> body{
+          assignNode(cursor, index, range),
+          assignNode(index, binOpNode(cursor, "Add", intConstant(1, range),
+                                      range),
+                     range)};
+      appendTargetBinding(
+          parts->target,
+          {subscriptNode(sourceRef, cursor, range),
+           subscriptNode(sourceRef,
+                         binOpNode(cursor, "Add", intConstant(1, range),
+                                   range),
+                         range)},
+          {}, std::string(), body, range);
+      body.insert(body.end(), parts->body.begin(), parts->body.end());
+      NodePtr loop = whileNode(
+          compareNode(binOpNode(index, "Add", intConstant(1, range), range),
+                      "Lt", lenCall(sourceRef, range), range),
+          std::move(body), parts->orelse, range);
+      return emitFused([&] { emitWhile(*loop); });
+    }
+    // General (generator-backed) source: components bind separately, so the
+    // target must be a two-name tuple pattern — materializing a tuple from
+    // the carried previous element trips generator resume-token accounting.
+    const auto *elts = parts->target && parts->target->kind == "Tuple"
+                           ? ast::nodeList(*parts->target, "elts")
+                           : nullptr;
+    if (!elts || elts->size() != 2)
+      return reject("pairwise() over a non-indexable source requires a "
+                    "two-name tuple target (for a, b in pairwise(...))");
+    std::string elementName = scratch("v");
+    std::string prevName = scratch("p");
+    std::string flagName = scratch("f");
+    scratchNames.push_back(elementName);
+    scratchNames.push_back(prevName);
+    scratchNames.push_back(flagName);
+    NodePtr element = nameNode(elementName, range);
+    NodePtr prev = nameNode(prevName, range);
+    NodePtr flag = nameNode(flagName, range);
+    setup.push_back(assignNode(flag, boolConstant(true, range), range));
+    // Loop-carried previous element; same int-seed restriction as the
+    // fused accumulate (see the comment there).
+    setup.push_back(assignNode(prev, intConstant(0, range), range));
+    std::vector<NodePtr> firstStep{
+        assignNode(prev, element, range),
+        assignNode(flag, boolConstant(false, range), range),
+        continueStatement(range)};
+    std::vector<NodePtr> body{ifNode(flag, std::move(firstStep), range),
+                              assignNode((*elts)[0], prev, range),
+                              assignNode((*elts)[1], element, range),
+                              assignNode(prev, element, range)};
+    body.insert(body.end(), parts->body.begin(), parts->body.end());
+    NodePtr loop =
+        forNode(element, source, std::move(body), parts->orelse, range);
+    return emitFused([&] { emitFor(*loop); });
+  }
+
+  // ---- zip_longest(a, b, ..., fillvalue=None) ------------------------------
+  if (name == "zip_longest") {
+    if (!keywordsOnly({"fillvalue"}))
+      return reject("zip_longest() accepts only the fillvalue keyword");
+    if (argCount < 2)
+      return reject("zip_longest() requires at least two sequences");
+    for (std::size_t i = 0; i < argCount; ++i)
+      if (!hasIndexableEvidence(argAt(i).get()))
+        return reject("zip_longest() requires indexable sequences "
+                      "(list/str/tuple/bytes)");
+    llvm::SmallVector<NodePtr, 4> sources;
+    for (std::size_t i = 0; i < argCount; ++i)
+      sources.push_back(
+          pinned(argAt(i), ("s" + std::to_string(i)).c_str()));
+    NodePtr fill = keywordValue("fillvalue");
+    if (!fill)
+      fill = noneConstant(range);
+    NodePtr fillRef = pinned(fill, "fv");
+    std::string indexName = scratch("i");
+    std::string cursorName = scratch("j");
+    scratchNames.push_back(indexName);
+    scratchNames.push_back(cursorName);
+    NodePtr index = nameNode(indexName, range);
+    NodePtr cursor = nameNode(cursorName, range);
+    setup.push_back(assignNode(index, intConstant(0, range), range));
+    std::vector<NodePtr> condition;
+    for (const NodePtr &source : sources)
+      condition.push_back(
+          compareNode(index, "Lt", lenCall(source, range), range));
+    std::vector<NodePtr> body{
+        assignNode(cursor, index, range),
+        assignNode(index, binOpNode(cursor, "Add", intConstant(1, range),
+                                    range),
+                   range)};
+    std::vector<NodePtr> components;
+    for (const NodePtr &source : sources)
+      components.push_back(ifExpNode(
+          compareNode(cursor, "Lt", lenCall(source, range), range),
+          subscriptNode(source, cursor, range), fillRef, range));
+    appendTargetBinding(parts->target, std::move(components), {},
+                        std::string(), body, range);
+    body.insert(body.end(), parts->body.begin(), parts->body.end());
+    NodePtr loop = whileNode(orChainNode(std::move(condition), range),
+                             std::move(body), parts->orelse, range);
+    return emitFused([&] { emitWhile(*loop); });
+  }
+
+  // ---- chain.from_iterable(rows) -------------------------------------------
+  if (name == "chain.from_iterable") {
+    if (argCount != 1 || (keywords && !keywords->empty()))
+      return reject("chain.from_iterable() takes exactly one iterable");
+    if (containsLoopEscape(parts->body))
+      return reject("break/continue inside a fused chain.from_iterable() "
+                    "loop is not supported yet (it would bind to the inner "
+                    "loop); restructure with a flag");
+    NodePtr rows = pinned(argAt(0), "r");
+    std::string rowName = scratch("row");
+    scratchNames.push_back(rowName);
+    NodePtr rowRef = nameNode(rowName, range);
+    NodePtr inner =
+        forNode(parts->target, rowRef, parts->body, {}, range);
+    NodePtr outer = forNode(rowRef, rows, {std::move(inner)}, parts->orelse,
+                            range);
+    return emitFused([&] { emitFor(*outer); });
+  }
+
+  return false;
+}
+
+std::optional<Value>
+ModuleEmitter::tryEmitItertoolsValueCall(const parser::Node &expr,
+                                         const parser::Node *calleeNode) {
+  std::optional<std::string> nameOpt = itertoolsCalleeName(calleeNode);
+  if (!nameOpt)
+    return std::nullopt;
+  llvm::StringRef name = *nameOpt;
+
+  auto rejectValue = [&](llvm::StringRef reason) -> std::optional<Value> {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start, std::string(reason)});
+    return emitNone(expr);
+  };
+
+  if (name == "starmap" || name == "groupby" || name == "tee" ||
+      name == "batched" || name == "permutations")
+    return rejectValue("itertools." + name.str() + "() is not supported yet");
+  if (name == "takewhile" || name == "filterfalse" || name == "accumulate" ||
+      name == "zip_longest" || name == "chain.from_iterable")
+    return rejectValue("itertools." + name.str() +
+                       "() as a first-class value is not supported yet; "
+                       "consume it directly in a for loop");
+
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  if (args)
+    for (const NodePtr &arg : *args)
+      if (arg && arg->kind == "Starred")
+        return rejectValue("itertools." + name.str() +
+                           "() does not support * argument unpacking");
+  std::size_t argCount = args ? args->size() : 0;
+  auto argAt = [&](std::size_t index) -> const parser::Node * {
+    if (!args || index >= args->size())
+      return nullptr;
+    return (*args)[index].get();
+  };
+  auto keywordValue = [&](llvm::StringRef keyword) -> const parser::Node * {
+    if (!keywords)
+      return nullptr;
+    for (const NodePtr &node : *keywords) {
+      if (!node)
+        continue;
+      auto kwName = ast::string(*node, "arg");
+      if (!kwName || llvm::StringRef(*kwName) != keyword)
+        continue;
+      return ast::node(*node, "value");
+    }
+    return nullptr;
+  };
+  auto keywordsOnly = [&](std::initializer_list<llvm::StringRef> allowed) {
+    if (!keywords)
+      return true;
+    for (const NodePtr &node : *keywords) {
+      if (!node)
+        continue;
+      auto kwName = ast::string(*node, "arg");
+      if (!kwName || !llvm::is_contained(allowed, llvm::StringRef(*kwName)))
+        return false;
+    }
+    return true;
+  };
+  parser::SourceRange range = expr.range;
+
+  auto intDefault = [&](std::int64_t value) -> Value {
+    std::string text = std::to_string(value);
+    mlir::Type type = types.literal(text);
+    auto op = py::IntConstantOp::create(builder, loc(expr), type,
+                                        builder.getStringAttr(text));
+    return Value{op.getResult(), type};
+  };
+  auto indexableOrNull = [&](const Value &value) {
+    mlir::Type widened = types.widenLiteral(value.type);
+    return types.inferMethodCallWithEvidence(widened, "__len__", {}) &&
+           types.inferMethodCallWithEvidence(widened, "__getitem__",
+                                             {types.intType()});
+  };
+
+  // Collected synthesis inputs.
+  llvm::SmallVector<std::string, 4> params;
+  llvm::SmallVector<Value, 4> argValues;
+  llvm::SmallVector<mlir::Type, 4> paramTypes;
+  std::vector<NodePtr> body;
+  std::string memoKey = ("itertools." + name).str();
+  auto addParam = [&](const char *stem, Value value) -> NodePtr {
+    std::string param =
+        "__ly" + std::string(stem) + std::to_string(params.size());
+    params.push_back(param);
+    argValues.push_back(value);
+    paramTypes.push_back(types.widenLiteral(value.type));
+    memoKey += "|" + typeKey(paramTypes.back());
+    return nameNode(param, range);
+  };
+  auto increment = [&](NodePtr counter, std::int64_t by) {
+    return assignNode(counter,
+                      binOpNode(counter, "Add", intConstant(by, range),
+                                range),
+                      range);
+  };
+
+  // ---- count([start[, step]]) ---------------------------------------------
+  if (name == "count") {
+    if (argCount > 2 || !keywordsOnly({"start", "step"}))
+      return rejectValue("count() takes a start and a step");
+    const parser::Node *startNode = argAt(0);
+    if (!startNode)
+      startNode = keywordValue("start");
+    const parser::Node *stepNode = argAt(1);
+    if (!stepNode)
+      stepNode = keywordValue("step");
+    Value start = startNode ? emitExpr(startNode) : intDefault(0);
+    Value step = stepNode ? emitExpr(stepNode) : intDefault(1);
+    NodePtr cursor = addParam("c", start);
+    NodePtr stride = addParam("st", step);
+    std::vector<NodePtr> loop{
+        yieldNode(cursor, range),
+        assignNode(cursor, binOpNode(cursor, "Add", stride, range), range)};
+    body.push_back(whileNode(trueConstant(range), std::move(loop), {},
+                             range));
+  }
+
+  // ---- repeat(object[, times]) ---------------------------------------------
+  else if (name == "repeat") {
+    const parser::Node *objectNode = argAt(0);
+    const parser::Node *timesNode = argAt(1);
+    if (!timesNode)
+      timesNode = keywordValue("times");
+    if (!objectNode || argCount > 2 || !keywordsOnly({"times"}))
+      return rejectValue("repeat() takes an object and an optional times");
+    Value object = emitExpr(objectNode);
+    NodePtr objectRef = addParam("o", object);
+    if (!timesNode) {
+      memoKey += "|inf";
+      body.push_back(whileNode(trueConstant(range),
+                               {yieldNode(objectRef, range)}, {}, range));
+    } else {
+      memoKey += "|times";
+      NodePtr bound = addParam("n", emitExpr(timesNode));
+      NodePtr counter = nameNode("__lyi", range);
+      body.push_back(assignNode(counter, intConstant(0, range), range));
+      std::vector<NodePtr> loop{yieldNode(objectRef, range),
+                                increment(counter, 1)};
+      body.push_back(whileNode(compareNode(counter, "Lt", bound, range),
+                               std::move(loop), {}, range));
+    }
+  }
+
+  // ---- indexable-sequence combinators ---------------------------------------
+  else {
+    // Everything below takes leading iterable argument(s) that must be
+    // indexable sequences in value position (iterator/generator sources are
+    // covered by the for-position fusions).
+    auto sequenceParam = [&](const parser::Node *node,
+                             const char *what) -> std::optional<NodePtr> {
+      if (!node)
+        return std::nullopt;
+      Value value = emitExpr(node);
+      if (!indexableOrNull(value)) {
+        rejectValue(std::string(what) +
+                    " as a value requires indexable sequences "
+                    "(list/str/tuple/bytes); iterate non-indexable sources "
+                    "directly in a for loop, or convert with a comprehension "
+                    "first");
+        return std::nullopt;
+      }
+      return addParam("it", value);
+    };
+    NodePtr index = nameNode("__lyi", range);
+
+    if (name == "cycle") {
+      if (argCount != 1 || (keywords && !keywords->empty()))
+        return rejectValue("cycle() takes exactly one iterable");
+      std::optional<NodePtr> source = sequenceParam(argAt(0), "cycle()");
+      if (!source)
+        return emitNone(expr);
+      body.push_back(assignNode(index, intConstant(0, range), range));
+      std::vector<NodePtr> loop{
+          yieldNode(subscriptNode(*source, index, range), range),
+          assignNode(index,
+                     binOpNode(binOpNode(index, "Add", intConstant(1, range),
+                                         range),
+                               "Mod", lenCall(*source, range), range),
+                     range)};
+      body.push_back(whileNode(
+          compareNode(lenCall(*source, range), "Gt", intConstant(0, range),
+                      range),
+          std::move(loop), {}, range));
+    } else if (name == "chain") {
+      if (argCount < 1 || (keywords && !keywords->empty()))
+        return rejectValue("chain() requires at least one sequence");
+      llvm::SmallVector<NodePtr, 4> sources;
+      for (std::size_t i = 0; i < argCount; ++i) {
+        std::optional<NodePtr> source = sequenceParam(argAt(i), "chain()");
+        if (!source)
+          return emitNone(expr);
+        sources.push_back(*source);
+      }
+      for (const NodePtr &source : sources) {
+        body.push_back(assignNode(index, intConstant(0, range), range));
+        std::vector<NodePtr> loop{
+            yieldNode(subscriptNode(source, index, range), range),
+            increment(index, 1)};
+        body.push_back(
+            whileNode(compareNode(index, "Lt", lenCall(source, range), range),
+                      std::move(loop), {}, range));
+      }
+    } else if (name == "islice") {
+      if (keywords && !keywords->empty())
+        return rejectValue("islice() takes no keyword arguments");
+      if (argCount < 2 || argCount > 4)
+        return rejectValue("islice() takes a source and stop, or "
+                           "start/stop/step");
+      std::optional<NodePtr> source = sequenceParam(argAt(0), "islice()");
+      if (!source)
+        return emitNone(expr);
+      const parser::Node *startNode = argCount >= 3 ? argAt(1) : nullptr;
+      const parser::Node *stopNode = argCount >= 3 ? argAt(2) : argAt(1);
+      const parser::Node *stepNode = argCount == 4 ? argAt(3) : nullptr;
+      if (isNoneConstant(startNode))
+        startNode = nullptr;
+      if (isNoneConstant(stopNode))
+        stopNode = nullptr;
+      if (isNoneConstant(stepNode))
+        stepNode = nullptr;
+      std::optional<std::int64_t> startConst = constantInt(startNode);
+      std::optional<std::int64_t> stopConst = constantInt(stopNode);
+      std::optional<std::int64_t> stepConst = constantInt(stepNode);
+      if ((startNode && !startConst) || (stepNode && !stepConst))
+        return rejectValue("islice() start/step must be compile-time "
+                           "constants for now");
+      if ((startConst && *startConst < 0) || (stopConst && *stopConst < 0) ||
+          (stepConst && *stepConst < 1))
+        return rejectValue(kIsliceRangeMessage);
+      std::int64_t startValue = startConst.value_or(0);
+      std::int64_t stepValue = stepConst.value_or(1);
+      memoKey += "|s" + std::to_string(startValue) + "x" +
+                 std::to_string(stepValue);
+      NodePtr stopRef;
+      if (stopNode && !stopConst) {
+        stopRef = addParam("e", emitExpr(stopNode));
+        memoKey += "|estop";
+        body.push_back(ifNode(
+            compareNode(stopRef, "Lt", intConstant(0, range), range),
+            {raiseValueError(kIsliceRangeMessage, range)}, range));
+      } else if (stopConst) {
+        stopRef = intConstant(*stopConst, range);
+        memoKey += "|e" + std::to_string(*stopConst);
+      } else {
+        memoKey += "|enone";
+      }
+      body.push_back(assignNode(index, intConstant(startValue, range),
+                                range));
+      std::vector<NodePtr> loop{
+          ifNode(compareNode(index, "GtE", lenCall(*source, range), range),
+                 {breakStatement(range)}, range),
+          yieldNode(subscriptNode(*source, index, range), range),
+          increment(index, stepValue)};
+      NodePtr condition = stopRef
+                              ? compareNode(index, "Lt", stopRef, range)
+                              : trueConstant(range);
+      body.push_back(whileNode(std::move(condition), std::move(loop), {},
+                               range));
+    } else if (name == "dropwhile") {
+      if (argCount != 2 || (keywords && !keywords->empty()))
+        return rejectValue("dropwhile() requires a predicate and an "
+                           "iterable");
+      LazyCallable callable;
+      if (!lazyCallableParts(expr, (*args)[0], callable))
+        return emitNone(expr);
+      std::optional<NodePtr> source = sequenceParam(argAt(1), "dropwhile()");
+      if (!source)
+        return emitNone(expr);
+      if (callable.callee)
+        memoKey += "|f:" + ast::qualifiedName(callable.callee.get());
+      else {
+        llvm::raw_string_ostream stream(memoKey);
+        stream << "|lambda:" << callable.lambdaBody.get();
+      }
+      body.push_back(assignNode(index, intConstant(0, range), range));
+      std::vector<NodePtr> scanLoop;
+      NodePtr test;
+      if (!buildLazyCall(expr, callable,
+                         {subscriptNode(*source, index, range)}, scanLoop,
+                         test))
+        return emitNone(expr);
+      scanLoop.push_back(ifNode(notNode(test, range),
+                                {breakStatement(range)}, range));
+      scanLoop.push_back(increment(index, 1));
+      body.push_back(
+          whileNode(compareNode(index, "Lt", lenCall(*source, range), range),
+                    std::move(scanLoop), {}, range));
+      std::vector<NodePtr> yieldLoop{
+          yieldNode(subscriptNode(*source, index, range), range),
+          increment(index, 1)};
+      body.push_back(
+          whileNode(compareNode(index, "Lt", lenCall(*source, range), range),
+                    std::move(yieldLoop), {}, range));
+    } else if (name == "pairwise") {
+      if (argCount != 1 || (keywords && !keywords->empty()))
+        return rejectValue("pairwise() takes exactly one iterable");
+      std::optional<NodePtr> source = sequenceParam(argAt(0), "pairwise()");
+      if (!source)
+        return emitNone(expr);
+      body.push_back(assignNode(index, intConstant(0, range), range));
+      std::vector<NodePtr> loop{
+          yieldNode(
+              tupleNode({subscriptNode(*source, index, range),
+                         subscriptNode(*source,
+                                       binOpNode(index, "Add",
+                                                 intConstant(1, range),
+                                                 range),
+                                       range)},
+                        range),
+              range),
+          increment(index, 1)};
+      body.push_back(whileNode(
+          compareNode(binOpNode(index, "Add", intConstant(1, range), range),
+                      "Lt", lenCall(*source, range), range),
+          std::move(loop), {}, range));
+    } else if (name == "product") {
+      if (keywords && !keywords->empty())
+        return rejectValue("product() with repeat= is not supported yet");
+      if (argCount < 2 || argCount > 4)
+        return rejectValue("product() supports two to four sequences");
+      llvm::SmallVector<NodePtr, 4> sources;
+      for (std::size_t i = 0; i < argCount; ++i) {
+        std::optional<NodePtr> source = sequenceParam(argAt(i), "product()");
+        if (!source)
+          return emitNone(expr);
+        sources.push_back(*source);
+      }
+      std::vector<NodePtr> elements;
+      llvm::SmallVector<NodePtr, 4> indices;
+      for (std::size_t i = 0; i < sources.size(); ++i) {
+        indices.push_back(nameNode("__lyi" + std::to_string(i), range));
+        elements.push_back(subscriptNode(sources[i], indices[i], range));
+      }
+      // Build inside-out: the innermost body yields, each wrapper resets its
+      // index, runs the nested while, then advances the enclosing index.
+      std::vector<NodePtr> inner{
+          yieldNode(tupleNode(std::move(elements), range), range),
+          increment(indices.back(), 1)};
+      for (std::size_t i = sources.size(); i-- > 1;) {
+        std::vector<NodePtr> wrapped{
+            assignNode(indices[i], intConstant(0, range), range)};
+        wrapped.push_back(whileNode(
+            compareNode(indices[i], "Lt", lenCall(sources[i], range), range),
+            std::move(inner), {}, range));
+        wrapped.push_back(increment(indices[i - 1], 1));
+        inner = std::move(wrapped);
+      }
+      body.push_back(assignNode(indices[0], intConstant(0, range), range));
+      body.push_back(whileNode(
+          compareNode(indices[0], "Lt", lenCall(sources[0], range), range),
+          std::move(inner), {}, range));
+    } else if (name == "combinations" ||
+               name == "combinations_with_replacement") {
+      if (argCount != 2 || (keywords && !keywords->empty()))
+        return rejectValue("itertools." + name.str() +
+                           "() requires a sequence and r");
+      std::optional<std::int64_t> r = constantInt(argAt(1));
+      if (!r || *r < 1 || *r > 4)
+        return rejectValue("itertools." + name.str() +
+                           "() requires a compile-time constant r between "
+                           "1 and 4 for now");
+      std::optional<NodePtr> source =
+          sequenceParam(argAt(0), name == "combinations"
+                                      ? "combinations()"
+                                      : "combinations_with_replacement()");
+      if (!source)
+        return emitNone(expr);
+      bool withReplacement = name == "combinations_with_replacement";
+      memoKey += "|r" + std::to_string(*r);
+      std::size_t depth = static_cast<std::size_t>(*r);
+      llvm::SmallVector<NodePtr, 4> indices;
+      std::vector<NodePtr> elements;
+      for (std::size_t i = 0; i < depth; ++i) {
+        indices.push_back(nameNode("__lyi" + std::to_string(i), range));
+        elements.push_back(subscriptNode(*source, indices[i], range));
+      }
+      std::vector<NodePtr> inner{
+          yieldNode(tupleNode(std::move(elements), range), range),
+          increment(indices.back(), 1)};
+      for (std::size_t i = depth; i-- > 1;) {
+        NodePtr firstValue =
+            withReplacement
+                ? nameNode("__lyi" + std::to_string(i - 1), range)
+                : binOpNode(nameNode("__lyi" + std::to_string(i - 1), range),
+                            "Add", intConstant(1, range), range);
+        std::vector<NodePtr> wrapped{assignNode(indices[i],
+                                                std::move(firstValue),
+                                                range)};
+        wrapped.push_back(whileNode(
+            compareNode(indices[i], "Lt", lenCall(*source, range), range),
+            std::move(inner), {}, range));
+        wrapped.push_back(increment(indices[i - 1], 1));
+        inner = std::move(wrapped);
+      }
+      body.push_back(assignNode(indices[0], intConstant(0, range), range));
+      body.push_back(whileNode(
+          compareNode(indices[0], "Lt", lenCall(*source, range), range),
+          std::move(inner), {}, range));
+    } else {
+      return rejectValue("itertools." + name.str() +
+                         "() is not supported yet");
+    }
+  }
+
+  // Memoized synthesis + call, mirroring the builtin lazy-value machinery.
+  auto memoized = lazyIteratorMemo.find(memoKey);
+  if (memoized == lazyIteratorMemo.end()) {
+    unsigned serial = ++syntheticFunctionCounter;
+    std::string stem = name.str();
+    for (char &c : stem)
+      if (c == '.')
+        c = '_';
+    std::string symbol =
+        ("__lyiter$itertools_" + stem + "$" + llvm::Twine(serial)).str();
+    llvm::SmallVector<const parser::Node *, 4> paramNodes;
+    llvm::SmallVector<std::string, 4> paramStorage(params.begin(),
+                                                   params.end());
+    NodePtr def = makeSyntheticGeneratorDef(symbol, paramStorage,
+                                            std::move(body), range,
+                                            paramNodes);
+    synthesizedIteratorDefs.push_back(def);
+    for (auto [i, type] : llvm::enumerate(paramTypes))
+      types.overrideParameterType(paramNodes[i], type);
+    FunctionSignature sig = types.functionSignature(*def);
+    emitCallableFunction(*def, symbol, sig, {}, /*isLambda=*/false);
+    memoized =
+        lazyIteratorMemo
+            .insert({memoKey,
+                     LazyIteratorSynthesis{symbol, sig.publicCallable}})
+            .first;
+  }
+
+  llvm::SmallVector<Value, 4> callArguments(argValues.begin(),
+                                            argValues.end());
+  Value callee = emitBindingRef(expr, memoized->second.symbol,
+                                memoized->second.callableType);
+  return emitCallableDispatch(
+      expr, callee,
+      emitCallOperands(expr, callArguments, /*includeAstArguments=*/false));
+}
+
 } // namespace lython::emitter

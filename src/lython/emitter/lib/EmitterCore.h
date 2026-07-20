@@ -171,6 +171,17 @@ private:
   };
   std::map<std::string, LazyIteratorSynthesis> lazyIteratorMemo;
   std::vector<parser::NodePtr> synthesizedIteratorDefs;
+  // itertools desugars (EmitterIterators.cpp). The itertools manifest
+  // declares the module contract only; every call compiles here to a loop
+  // fusion (for position) or a synthesized generator (value position), so
+  // no itertools call may fall through to generic dispatch.
+  std::optional<std::string>
+  itertoolsCalleeName(const parser::Node *calleeNode);
+  bool tryEmitItertoolsFor(const parser::Node &statement,
+                           const parser::Node &iterCall);
+  std::optional<Value>
+  tryEmitItertoolsValueCall(const parser::Node &expr,
+                            const parser::Node *calleeNode);
   // dict method sugar (EmitterIterators.cpp): get(k) / setdefault / popitem
   // / dict.fromkeys compose over existing dict primitives.
   bool isDictTypedExpr(const parser::Node *expr);
