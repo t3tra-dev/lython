@@ -1492,8 +1492,42 @@ ModuleEmitter::tryEmitSortSugar(const parser::Node &expr,
   if (!calleeNode)
     return std::nullopt;
   const auto *keywords = ast::nodeList(expr, "keywords");
-  if (!keywords || keywords->empty())
+  if (!keywords || keywords->empty()) {
+    // Keyword-less sorted(<non-list iterable>): the manifest builtin takes
+    // a list, so materialize through the list constructor first —
+    // sorted(d), sorted(d.keys()), sorted(gen) become sorted(list(...)).
+    // NOTE: sorted IS a manifest free function (types.lookupSymbol resolves
+    // it), so only user shadowing disables the rewrite — same guard as the
+    // keyword sugar below.
+    if (calleeNode->kind == "Name" &&
+        ast::nameSpelling(*calleeNode) == "sorted" && !values.count("sorted") &&
+        !genericFunctions.count("sorted") && !types.lookupClass("sorted")) {
+      const auto *args = ast::nodeList(expr, "args");
+      // The rewrite must not re-wrap its own product: inference has no case
+      // for the list() call form, so `sorted(list(X))` would recurse.
+      bool alreadyListCall = false;
+      if (args && args->size() == 1 && (*args)[0] &&
+          (*args)[0]->kind == "Call")
+        if (const parser::Node *inner = ast::node(*(*args)[0], "func"))
+          alreadyListCall = inner->kind == "Name" &&
+                            ast::nameSpelling(*inner) == "list";
+      if (args && args->size() == 1 && (*args)[0] &&
+          (*args)[0]->kind != "Starred" && !alreadyListCall) {
+        auto argContract = mlir::dyn_cast_if_present<py::ContractType>(
+            types.widenLiteral(types.inferExpr((*args)[0].get())));
+        if (!argContract ||
+            argContract.getContractName() != "builtins.list") {
+          parser::SourceRange range = expr.range;
+          NodePtr wrapped = callNode(
+              nameNode("sorted", range),
+              {callNode(nameNode("list", range), {(*args)[0]}, range)},
+              range);
+          return emitExpr(wrapped.get());
+        }
+      }
+    }
     return std::nullopt; // keyword-less forms keep their native paths
+  }
   const auto *args = ast::nodeList(expr, "args");
 
   // NOTE: sorted IS a manifest free function (types.lookupSymbol resolves

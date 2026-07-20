@@ -1235,7 +1235,11 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIter(py::IterOp op) {
   // re-creation of the iterator reuses the slot) and reset to zero here.
   if (const RuntimeBundle *iterable =
           RuntimeBundleLowerer::bundleFor(op.getIterable())) {
-    bool evidenceListIterable = iterable->contractName() == "builtins.list" &&
+    // Tuples with compile-time element evidence iterate exactly like
+    // evidence lists (the evidence-next path is contract-agnostic).
+    bool evidenceListIterable = (iterable->contractName() == "builtins.list" ||
+                                 iterable->contractName() ==
+                                     "builtins.tuple") &&
                                 !iterable->sequenceElements.empty() &&
                                 iterable->sequenceIndices.empty() &&
                                 !iterable->evidenceIteratorCell;
