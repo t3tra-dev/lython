@@ -939,8 +939,16 @@ void collectAssignedNames(const parser::Node *node, llvm::StringSet<> &names) {
     // identity forward.
     if (const parser::Node *func = ast::node(*node, "func")) {
       if (func->kind == "Attribute") {
+        // The full manifest structural-mutator surface, not just
+        // append/add: `xs.extend(...)` / `d.update(...)` (also the `|=`
+        // desugar) inside a try silently kept the pre-try value because the
+        // rebound receiver never joined the post-try lanes.
         if (auto attr = ast::string(*func, "attr");
-            attr && (*attr == "append" || *attr == "add")) {
+            attr && (*attr == "append" || *attr == "add" ||
+                     *attr == "extend" || *attr == "update" ||
+                     *attr == "intersection_update" ||
+                     *attr == "difference_update" ||
+                     *attr == "symmetric_difference_update")) {
           if (const parser::Node *value = ast::node(*func, "value"))
             if (value->kind == "Name")
               names.insert(ast::nameSpelling(*value));
