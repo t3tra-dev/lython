@@ -98,9 +98,17 @@ bool isNonUnwindingRefcountHelper(const llvm::Function *callee) {
   if (!callee)
     return false;
   llvm::StringRef name = callee->getName();
+  // The generated source-class deallocators and unwind cleanup thunks are
+  // pure release compositions (DecRef family + free): ownership insertion
+  // schedules them between a try-call marker and a guarded raise exactly
+  // like a plain DecRef, and treating them as pairing breakers silently
+  // unpaired the raise from its handler (the exception then resumed out of
+  // the frame past a matching except).
   return name == "Ly_IncRef" || name == "Ly_DecRef" ||
          name.ends_with("_DecRef") ||
-         name == "LyObject_ReleaseStorageToZero";
+         name == "LyObject_ReleaseStorageToZero" ||
+         name.starts_with("__ly_dealloc_") ||
+         name.starts_with("__ly_unwind_cleanup_");
 }
 
 bool mayPropagatePythonException(const llvm::Function *callee) {

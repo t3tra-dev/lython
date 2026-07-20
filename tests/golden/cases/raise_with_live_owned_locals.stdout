@@ -1,0 +1,6 @@
+ok short
+caught plain: boom
+caught slice: boomxx
+caught format: bad col 2 len 2
+caught free: boomxx
+after
