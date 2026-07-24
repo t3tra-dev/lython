@@ -769,6 +769,13 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
               name == "builtins.dict" || name == "builtins.set" ||
               name == "builtins.frozenset" || name == "builtins.bytes")
             return widened;
+          // A user class instance carries the same way. Why not leave it out:
+          // a non-carrier candidate is skipped SILENTLY, so `obj = C(...)`
+          // inside a handler was discarded and the post-try read answered the
+          // pre-try object -- and a desugared enum member or NamedTuple is a
+          // user class, which makes that the common shape rather than a corner.
+          if (classFieldOrders.contains(name))
+            return widened;
           return {};
         };
         // A try body that always raises (`try: raise X` / every path returns)
