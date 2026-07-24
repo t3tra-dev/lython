@@ -1,5 +1,6 @@
 #include "EmitterCore.h"
 #include "EmitterSupport.h"
+#include "TypeSystemSolver.h"
 
 #include "AstAccess.h"
 #include "PyProtocols.h"
@@ -54,6 +55,31 @@ FunctionSignature sourceModuleFunctionSignature(
   bindSourceClassLocals(types, moduleName, body);
   return types.functionSignature(function);
 }
+
+// Module-level `alias = other_name` (single Name target, Name value):
+// CPython Lib modules publish aliases this way (bisect = bisect_right).
+std::optional<std::string_view>
+moduleAliasTarget(const std::vector<parser::NodePtr> &body,
+                  llvm::StringRef name) {
+  for (const parser::NodePtr &statement : body) {
+    if (!statement || statement->kind != "Assign")
+      continue;
+    const auto *targets = ast::nodeList(*statement, "targets");
+    if (!targets || targets->size() != 1 || !targets->front() ||
+        targets->front()->kind != "Name" ||
+        llvm::StringRef(ast::nameSpelling(*targets->front())) != name)
+      continue;
+    const parser::Node *value = ast::node(*statement, "value");
+    if (value && value->kind == "Name" &&
+        llvm::StringRef(ast::nameSpelling(*value)) != name)
+      return ast::nameSpelling(*value);
+  }
+  return std::nullopt;
+}
+
+// Alias chains are finite in real modules; the bound only breaks
+// pathological `a = b; b = a` cycles.
+constexpr unsigned kMaxAliasDepth = 8;
 
 std::optional<llvm::SmallVector<std::string, 8>>
 staticAllExportNames(const parser::Node &moduleNode) {
@@ -176,6 +202,14 @@ ModuleEmitter::lookupSourceModule(llvm::StringRef module) const {
   return nullptr;
 }
 
+const EmitOptions::SourceModule *
+ModuleEmitter::sourceModuleForClass(llvm::StringRef className) const {
+  std::pair<llvm::StringRef, llvm::StringRef> split = className.rsplit('.');
+  if (split.first.empty() || split.second.empty())
+    return nullptr;
+  return lookupSourceModule(split.first);
+}
+
 bool ModuleEmitter::isStubSourceModuleSymbol(llvm::StringRef symbol) const {
   std::pair<llvm::StringRef, llvm::StringRef> split = symbol.rsplit('.');
   if (split.first.empty() || split.second.empty())
@@ -220,6 +254,18 @@ bool ModuleEmitter::bindSourceModuleNamespace(llvm::StringRef module,
     std::string canonical = sourceModuleFunctionSymbol(module, *name);
     types.bindCanonicalSymbol(local, canonical, sig.publicCallable);
     continue;
+  }
+  for (const parser::NodePtr &statement : *body) {
+    if (!statement || statement->kind != "Assign")
+      continue;
+    const auto *targets = ast::nodeList(*statement, "targets");
+    const parser::Node *value = ast::node(*statement, "value");
+    if (!targets || targets->size() != 1 || !targets->front() ||
+        targets->front()->kind != "Name" || !value || value->kind != "Name")
+      continue;
+    llvm::StringRef aliasName = ast::nameSpelling(*targets->front());
+    std::string local = (llvm::Twine(localName) + "." + aliasName).str();
+    bindSourceModuleName(module, aliasName, local);
   }
   for (const parser::NodePtr &statement : *body) {
     if (!statement || statement->kind != "ImportFrom")
@@ -357,7 +403,8 @@ sourceModuleLiteralConstant(TypeSystem &types,
 
 bool ModuleEmitter::bindSourceModuleName(llvm::StringRef module,
                                          llvm::StringRef exportedName,
-                                         llvm::StringRef localName) {
+                                         llvm::StringRef localName,
+                                         unsigned aliasDepth) {
   const EmitOptions::SourceModule *source = lookupSourceModule(module);
   if (!source)
     return false;
@@ -396,6 +443,12 @@ bool ModuleEmitter::bindSourceModuleName(llvm::StringRef module,
     types.bindSymbol(localName, *literal);
     return true;
   }
+  if (aliasDepth < kMaxAliasDepth)
+    if (std::optional<std::string_view> aliased =
+            moduleAliasTarget(*body, exportedName))
+      if (bindSourceModuleName(module, llvm::StringRef(*aliased), localName,
+                               aliasDepth + 1))
+        return true;
   if (bindSourceModuleReexport(*source, exportedName, localName))
     return true;
   return false;
@@ -555,6 +608,32 @@ void ModuleEmitter::bindSourceModuleLocals(llvm::StringRef moduleName,
       continue;
     }
   }
+  // Module-level literal constants and `alias = name` bindings are part of
+  // the module's own scope too: function and method bodies read them
+  // (imported modules have no executed module body to bind them at runtime,
+  // so uses materialize the literal / resolve the alias statically).
+  for (const parser::NodePtr &statement : *body) {
+    if (!statement ||
+        (statement->kind != "AnnAssign" && statement->kind != "Assign"))
+      continue;
+    const parser::Node *target =
+        statement->kind == "AnnAssign"
+            ? ast::node(*statement, "target")
+            : (ast::nodeList(*statement, "targets") &&
+                       ast::nodeList(*statement, "targets")->size() == 1
+                   ? ast::nodeList(*statement, "targets")->front().get()
+                   : nullptr);
+    if (!target || target->kind != "Name")
+      continue;
+    llvm::StringRef name = ast::nameSpelling(*target);
+    if (std::optional<mlir::Type> literal =
+            sourceModuleLiteralConstant(types, *body, name)) {
+      types.bindSymbol(name, *literal);
+      continue;
+    }
+    if (moduleAliasTarget(*body, name))
+      bindSourceModuleName(moduleName, name, name);
+  }
 }
 
 void ModuleEmitter::bindModuleImportScope(const parser::Node &sourceModule,
@@ -616,9 +695,23 @@ void ModuleEmitter::emitSourceModuleDeclarations() {
         if (!name)
           continue;
         FunctionSignature sig = types.functionSignature(*statement);
-        emitCallableFunction(
-            *statement, sourceModuleFunctionSymbol(source.moduleName, *name),
-            sig, {}, /*isLambda=*/false);
+        std::string canonical =
+            sourceModuleFunctionSymbol(source.moduleName, *name);
+        if (unboundStaticParameterCount(sig.publicCallable) != 0) {
+          // Same monomorphization strategy as main-module generics: no
+          // direct emission (the py ABI cannot carry a type parameter), one
+          // specialization per ground instantiation demanded by a use site.
+          // Registration is canonical-keyed so call sites reach it through
+          // the import binding regardless of local spelling.
+          GenericFunctionInfo &info = genericFunctions[canonical];
+          info.node = statement.get();
+          info.signature = sig;
+          info.symbolBase = canonical;
+          info.source = &source;
+        } else {
+          emitCallableFunction(*statement, canonical, sig, {},
+                               /*isLambda=*/false);
+        }
       } else if (isTopLevelClass(*statement)) {
         std::optional<std::string_view> name = ast::string(*statement, "name");
         if (!name)

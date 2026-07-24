@@ -1,6 +1,9 @@
 #include "Runtime/Core/Lowerer.h"
 
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
+
 #include <functional>
+#include <optional>
 
 namespace py::lowering {
 namespace {
@@ -153,30 +156,25 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerControlFlowBlockArgument(
   }
   valueBundles[argument] = std::move(provisionalBundle);
 
-  // Deduplicate: a cond_br with BOTH successors == `block` (a canonicalized
-  // empty-arm conditional) lists its predecessor twice, but one rewrite below
-  // already handles both edges — visiting it again would corrupt the rebuilt
-  // operand lists.
-  llvm::SmallVector<mlir::Block *, 8> predecessors;
-  {
-    llvm::SmallPtrSet<mlir::Block *, 8> seenPredecessors;
-    for (mlir::Block *predecessor : block->getPredecessors())
-      if (seenPredecessors.insert(predecessor).second)
-        predecessors.push_back(predecessor);
-  }
   // Bundles are copied by VALUE: nested block-argument lowering inserts into
   // valueBundles, and a rehash would dangle any held pointer.
   llvm::SmallVector<RuntimeBundle, 4> sourceBundles;
 
   auto appendPhysicalBranchOperands =
-      [&](mlir::Operation *anchor, mlir::Value logicalSource,
+      [&](mlir::Block *predecessor, mlir::Value logicalSource,
           llvm::SmallVectorImpl<mlir::Value> &destOperands)
       -> mlir::LogicalResult {
     mlir::OpBuilder::InsertionGuard guard(builder);
-    builder.setInsertionPoint(anchor);
-    if (mlir::failed(
-            RuntimeBundleLowerer::ensureValueBundle(anchor, logicalSource)))
+    // The anchor is re-fetched from the predecessor around the bundle
+    // computation instead of held across it: the computation can replace this
+    // terminator (see the edge loop below), leaving a handle taken before the
+    // call — and an insertion point aimed at it — pointing at freed memory.
+    builder.setInsertionPoint(predecessor->getTerminator());
+    if (mlir::failed(RuntimeBundleLowerer::ensureValueBundle(
+            predecessor->getTerminator(), logicalSource)))
       return mlir::failure();
+    mlir::Operation *anchor = predecessor->getTerminator();
+    builder.setInsertionPoint(anchor);
     const RuntimeBundle *source =
         RuntimeBundleLowerer::bundleFor(logicalSource);
     if (!source)
@@ -220,68 +218,97 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerControlFlowBlockArgument(
     return mlir::success();
   };
 
-  auto rewriteBranchOperands =
-      [&](mlir::Operation *terminator, mlir::Block *dest,
-          mlir::ValueRange oldOperands,
-          llvm::SmallVectorImpl<mlir::Value> &newOperands)
-      -> mlir::LogicalResult {
-    newOperands.append(oldOperands.begin(), oldOperands.end());
-    if (dest != block)
-      return mlir::success();
-    if (logicalIndex >= newOperands.size())
-      return op->emitError()
-             << "control-flow predecessor operand list is shorter than the "
-                "destination block argument list";
-
-    llvm::SmallVector<mlir::Value, 8> physicalOperands;
-    if (mlir::failed(appendPhysicalBranchOperands(
-            terminator, newOperands[logicalIndex], physicalOperands)))
-      return mlir::failure();
-    insertValues(newOperands, logicalIndex + 1, physicalOperands);
-    return mlir::success();
+  // Incoming edges are re-derived from the block before every single splice,
+  // and each edge is updated by MUTATING the terminator's successor operands.
+  // Both are needed because computing an edge's physical operands re-enters
+  // the lowerer: the operand may itself be an unlowered block argument whose
+  // own predecessor set contains THIS block (which rebuilds a terminator), and
+  // a may-raise operand pulls in unwind insertion (which SPLITS a predecessor,
+  // so the block that branches here afterwards is a different one). Anything
+  // captured before that — a terminator handle, a predecessor pointer, an
+  // operand list, an argument index — is stale, which is why nothing is.
+  //
+  // An edge counts as done once our expansion sits right behind the logical
+  // operand it forwards: the logical operand is never replaced, only followed.
+  // Physical operands are materialized PER EDGE (never shared between two
+  // edges forwarding the same value) because a value created at one
+  // predecessor's terminator need not dominate another's.
+  llvm::SmallPtrSet<mlir::Value, 8> splicedExpansions;
+  struct PendingEdge {
+    mlir::Block *predecessor = nullptr;
+    unsigned successor = 0;
+    mlir::Value logicalSource;
+  };
+  auto findPendingEdge =
+      [&](std::optional<mlir::Value> onlySource) -> std::optional<PendingEdge> {
+    unsigned index = argument.getArgNumber();
+    for (mlir::Block *predecessor : block->getPredecessors()) {
+      auto branch =
+          mlir::dyn_cast<mlir::BranchOpInterface>(predecessor->getTerminator());
+      if (!branch)
+        continue;
+      for (unsigned successor = 0, end = branch->getNumSuccessors();
+           successor < end; ++successor) {
+        if (branch->getSuccessor(successor) != block)
+          continue;
+        mlir::SuccessorOperands operands =
+            branch.getSuccessorOperands(successor);
+        if (operands.getProducedOperandCount() != 0 || index >= operands.size())
+          continue;
+        mlir::Value logicalSource = operands[index];
+        if (onlySource && logicalSource != *onlySource)
+          continue;
+        // Membership alone is conclusive: the set holds only values THIS
+        // expansion spliced, and those are physically typed, so a logical
+        // operand can never collide with one.
+        if (index + 1 < operands.size() &&
+            splicedExpansions.contains(operands[index + 1]))
+          continue;
+        return PendingEdge{predecessor, successor, logicalSource};
+      }
+    }
+    return std::nullopt;
   };
 
-  for (mlir::Block *predecessor : predecessors) {
-    mlir::Operation *terminator = predecessor->getTerminator();
-    if (auto branch = mlir::dyn_cast<mlir::cf::BranchOp>(terminator)) {
-      llvm::SmallVector<mlir::Value, 8> operands;
-      if (mlir::failed(rewriteBranchOperands(terminator, branch.getDest(),
-                                             branch.getDestOperands(),
-                                             operands))) {
-        controlFlowBlockArgumentsInProgress.erase(argument);
-        return mlir::failure();
-      }
-      builder.setInsertionPoint(branch);
-      mlir::cf::BranchOp::create(builder, branch.getLoc(), branch.getDest(),
-                                 operands);
-      branch.erase();
-      continue;
+  // Each round expands exactly one edge, then re-derives from the block: the
+  // bound only stops a pathological non-converging graph from looping forever.
+  unsigned rounds = 0;
+  const unsigned maxRounds = 4096;
+  while (std::optional<PendingEdge> pending = findPendingEdge(std::nullopt)) {
+    if (++rounds > maxRounds) {
+      controlFlowBlockArgumentsInProgress.erase(argument);
+      return op->emitError()
+             << "control-flow block argument expansion did not converge";
     }
-
-    if (auto cond = mlir::dyn_cast<mlir::cf::CondBranchOp>(terminator)) {
-      llvm::SmallVector<mlir::Value, 8> trueOperands;
-      llvm::SmallVector<mlir::Value, 8> falseOperands;
-      if (mlir::failed(rewriteBranchOperands(terminator, cond.getTrueDest(),
-                                             cond.getTrueDestOperands(),
-                                             trueOperands)) ||
-          mlir::failed(rewriteBranchOperands(terminator, cond.getFalseDest(),
-                                             cond.getFalseDestOperands(),
-                                             falseOperands))) {
-        controlFlowBlockArgumentsInProgress.erase(argument);
-        return mlir::failure();
-      }
-      builder.setInsertionPoint(cond);
-      mlir::cf::CondBranchOp::create(
-          builder, cond.getLoc(), cond.getCondition(), cond.getTrueDest(),
-          trueOperands, cond.getFalseDest(), falseOperands);
-      cond.erase();
-      continue;
+    llvm::SmallVector<mlir::Value, 8> physicalOperands;
+    if (mlir::failed(appendPhysicalBranchOperands(
+            pending->predecessor, pending->logicalSource, physicalOperands))) {
+      controlFlowBlockArgumentsInProgress.erase(argument);
+      return mlir::failure();
     }
+    if (physicalOperands.empty())
+      break; // Nothing to forward for this argument at all.
 
-    controlFlowBlockArgumentsInProgress.erase(argument);
-    return op->emitError()
-           << "Python control-flow block argument lowering only supports cf.br "
-              "and cf.cond_br predecessors";
+    // Re-locate the edge: the expansion above may have rebuilt this
+    // terminator or split this predecessor.
+    std::optional<PendingEdge> target = findPendingEdge(pending->logicalSource);
+    if (!target)
+      continue;
+    if (target->predecessor != pending->predecessor)
+      continue; // Moved to another block: re-expand there, where it dominates.
+    auto branch = mlir::cast<mlir::BranchOpInterface>(
+        target->predecessor->getTerminator());
+    mlir::SuccessorOperands operands =
+        branch.getSuccessorOperands(target->successor);
+    unsigned index = argument.getArgNumber();
+    llvm::SmallVector<mlir::Value, 8> updated;
+    updated.reserve(operands.size() + physicalOperands.size());
+    for (unsigned position = 0, end = operands.size(); position < end;
+         ++position)
+      updated.push_back(operands[position]);
+    insertValues(updated, index + 1, physicalOperands);
+    operands.getMutableForwardedOperands().assign(updated);
+    splicedExpansions.insert(physicalOperands.front());
   }
 
   if (!sourceBundles.empty() &&

@@ -118,7 +118,7 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
     if (std::optional<Value> literal =
             emitLiteralTypeConstant(*expr, *symbolType))
       return *literal;
-    if (genericFunctions.count(name)) {
+    if (genericFunctions.count(name) || genericFunctions.count(binding)) {
       // No ground context reached this reference (calls and expected-typed
       // uses are intercepted earlier), so there is no instantiation to
       // materialize; emitting the type-parameterized contract would only
@@ -176,6 +176,16 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
         if (std::optional<Value> literal =
                 emitLiteralTypeConstant(*expr, *symbol))
           return *literal;
+        if (genericFunctions.count(binding)) {
+          // Same rule as the Name case: a bare qualified reference to an
+          // imported generic has no instantiation to materialize.
+          diagnostics.push_back(parser::Diagnostic{
+              parser::Severity::Error, expr->range.start,
+              "reference to generic function '" + qualified +
+                  "' requires a call or an annotated Callable context to "
+                  "determine its type arguments"});
+          return emitNone(*expr);
+        }
         return emitBindingRef(*expr, binding, *symbol);
       }
     }
@@ -1653,28 +1663,37 @@ Value ModuleEmitter::emitExprExpected(const parser::Node *expr,
     return emitContainerLiteral(*expr, expected);
   if (expr->kind == "Set")
     return emitSetLiteral(*expr, expected);
+  GenericFunctionInfo *generic = nullptr;
   if (expr->kind == "Name") {
     llvm::StringRef name = ast::nameSpelling(*expr);
-    if (values.find(name) == values.end()) {
-      auto generic = genericFunctions.find(name);
-      if (generic != genericFunctions.end()) {
-        // A ground expected callable determines the instantiation, so a
-        // first-class reference to a generic function materializes as a
-        // reference to the matching specialization.
-        auto expectedCallable =
-            mlir::dyn_cast_if_present<py::CallableType>(expected);
-        if (!expectedCallable ||
-            unboundStaticParameterCount(expectedCallable) != 0)
-          return emitExpr(expr);
-        std::optional<std::pair<std::string, py::CallableType>>
-            specialization = ensureGenericSpecialization(
-                *expr, generic->second, expectedCallable);
-        if (!specialization)
-          return emitNone(*expr);
-        return emitBindingRef(*expr, specialization->first,
-                              specialization->second);
+    if (values.find(name) == values.end())
+      generic = lookupGenericFunction(name);
+  } else if (expr->kind == "Attribute") {
+    // Qualified references to imported generics (module.fn) take the same
+    // expected-callable instantiation path as bare names.
+    std::string qualified = ast::qualifiedName(expr);
+    if (!qualified.empty())
+      if (std::optional<std::string> canonical =
+              types.lookupCanonicalBinding(qualified)) {
+        auto found = genericFunctions.find(*canonical);
+        if (found != genericFunctions.end())
+          generic = &found->second;
       }
-    }
+  }
+  if (generic) {
+    // A ground expected callable determines the instantiation, so a
+    // first-class reference to a generic function materializes as a
+    // reference to the matching specialization.
+    auto expectedCallable =
+        mlir::dyn_cast_if_present<py::CallableType>(expected);
+    if (!expectedCallable || unboundStaticParameterCount(expectedCallable) != 0)
+      return emitExpr(expr);
+    std::optional<std::pair<std::string, py::CallableType>> specialization =
+        ensureGenericSpecialization(*expr, *generic, expectedCallable);
+    if (!specialization)
+      return emitNone(*expr);
+    return emitBindingRef(*expr, specialization->first,
+                          specialization->second);
   }
   return emitExpr(expr);
 }

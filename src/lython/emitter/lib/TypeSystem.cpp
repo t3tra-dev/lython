@@ -1017,6 +1017,53 @@ void TypeSystem::Scope::reset() {
   owner = nullptr;
 }
 
+TypeSystem::ScopeIsolation::ScopeIsolation(ScopeIsolation &&other) noexcept
+    : owner(other.owner), savedScopes(std::move(other.savedScopes)),
+      savedCanonicalBindings(std::move(other.savedCanonicalBindings)),
+      savedClasses(std::move(other.savedClasses)),
+      savedTypeParameters(std::move(other.savedTypeParameters)) {
+  other.owner = nullptr;
+}
+
+TypeSystem::ScopeIsolation &
+TypeSystem::ScopeIsolation::operator=(ScopeIsolation &&other) noexcept {
+  if (this == &other)
+    return *this;
+  reset();
+  owner = other.owner;
+  savedScopes = std::move(other.savedScopes);
+  savedCanonicalBindings = std::move(other.savedCanonicalBindings);
+  savedClasses = std::move(other.savedClasses);
+  savedTypeParameters = std::move(other.savedTypeParameters);
+  other.owner = nullptr;
+  return *this;
+}
+
+TypeSystem::ScopeIsolation::~ScopeIsolation() { reset(); }
+
+void TypeSystem::ScopeIsolation::reset() {
+  if (!owner)
+    return;
+  owner->scopes = std::move(savedScopes);
+  owner->scopedCanonicalBindings = std::move(savedCanonicalBindings);
+  owner->scopedClasses = std::move(savedClasses);
+  owner->scopedTypeParameters = std::move(savedTypeParameters);
+  owner = nullptr;
+}
+
+TypeSystem::ScopeIsolation TypeSystem::isolateScopes() const {
+  ScopeIsolation isolation(*this);
+  isolation.savedScopes = std::move(scopes);
+  isolation.savedCanonicalBindings = std::move(scopedCanonicalBindings);
+  isolation.savedClasses = std::move(scopedClasses);
+  isolation.savedTypeParameters = std::move(scopedTypeParameters);
+  scopes.clear();
+  scopedCanonicalBindings.clear();
+  scopedClasses.clear();
+  scopedTypeParameters.clear();
+  return isolation;
+}
+
 void TypeSystem::seedBuiltins() {
   bindSymbol("None", none());
   bindSymbol("True", literal("True"));
@@ -1363,6 +1410,7 @@ TypeSystem::Scope TypeSystem::pushScope() const {
   scopes.emplace_back();
   scopedCanonicalBindings.emplace_back();
   scopedClasses.emplace_back();
+  scopedTypeParameters.emplace_back();
   return Scope(*this);
 }
 
@@ -1371,6 +1419,7 @@ void TypeSystem::popScope() const {
     scopes.pop_back();
     scopedCanonicalBindings.pop_back();
     scopedClasses.pop_back();
+    scopedTypeParameters.pop_back();
   }
 }
 
@@ -1385,6 +1434,13 @@ void TypeSystem::bindLocalSymbol(llvm::StringRef name, mlir::Type type) const {
   if (scopes.empty())
     return;
   scopes.back()[name] = type ? type : object();
+}
+
+void TypeSystem::bindLocalTypeParameter(llvm::StringRef name,
+                                        mlir::Type type) const {
+  if (scopedTypeParameters.empty() || !type)
+    return;
+  scopedTypeParameters.back()[name] = type;
 }
 
 void TypeSystem::bindSymbol(llvm::StringRef name, mlir::Type type) {
@@ -1731,6 +1787,16 @@ bool TypeSystem::bindImportedName(llvm::StringRef module,
 mlir::Type TypeSystem::annotationTypeForName(llvm::StringRef rawName) const {
   std::string resolved = resolveAnnotationName(rawName);
   llvm::StringRef name(resolved);
+  // A specialization's solved type parameters win over every other reading of
+  // the name: inside `def f[T](...)`'s specialized body, `T` in an annotation
+  // denotes THIS instantiation's ground type, and nothing else may claim the
+  // spelling for the duration.
+  for (auto it = scopedTypeParameters.rbegin(), e = scopedTypeParameters.rend();
+       it != e; ++it) {
+    auto found = it->find(name);
+    if (found != it->end())
+      return found->second;
+  }
   if (auto symbol = lookupSymbol(name)) {
     if (mlir::isa<py::TypeVarType, py::ParamSpecType, py::TypeVarTupleType>(
             *symbol))
