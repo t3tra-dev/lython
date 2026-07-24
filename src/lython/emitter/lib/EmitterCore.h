@@ -128,6 +128,37 @@ private:
   bool isModuleGlobalRead(llvm::StringRef name) const;
   bool isModuleGlobalWrite(llvm::StringRef name) const;
 
+  // EmitterEnums.cpp: `class C(Enum)` desugars to a plain class whose members
+  // are class attributes instantiated at the ClassDef statement position, plus
+  // synthesized __init__/__str__/__repr__/__eq__ and by-value/by-name lookup
+  // classmethods. Runs before any predeclaration so every later layer sees
+  // ordinary Python.
+  enum class EnumKind { Plain, Int, Str };
+  struct EnumMember {
+    std::string name;
+    bool isStr = false;
+    std::int64_t intValue = 0;
+    std::string strValue;
+    // An alias shares an earlier member's value: it binds to that member's
+    // singleton and never appears in iteration (CPython's canonicalization).
+    bool isAlias = false;
+    std::string aliasOf;
+  };
+  struct EnumInfo {
+    EnumKind kind = EnumKind::Plain;
+    std::string name;
+    llvm::SmallVector<EnumMember, 8> members;
+  };
+  void desugarEnumClasses(const parser::Node &moduleNode);
+  std::optional<EnumKind> enumBaseKind(const parser::Node &classDef) const;
+  void collectEnumMembers(const parser::Node &classDef, EnumKind kind);
+  void rewriteEnumClassDef(const parser::Node &classDef);
+  void rewriteEnumUses(const parser::Node &node);
+  const EnumInfo *enumInfoForNameNode(const parser::Node *node) const;
+  parser::NodePtr enumMemberListNode(const EnumInfo &info,
+                                     parser::SourceRange range) const;
+  llvm::StringMap<EnumInfo> enumClasses;
+
   void emitStatements(const std::vector<parser::NodePtr> *statements,
                       bool skipDeclarations = false);
   void emitStatement(const parser::Node &statement);

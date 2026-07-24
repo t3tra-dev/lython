@@ -3,6 +3,7 @@ add_library(LythonEmitter STATIC
     lib/EmitterCalls.cpp
     lib/EmitterClasses.cpp
     lib/EmitterControlFlow.cpp
+    lib/EmitterEnums.cpp
     lib/EmitterCore.cpp
     lib/EmitterExceptions.cpp
     lib/EmitterExpressions.cpp

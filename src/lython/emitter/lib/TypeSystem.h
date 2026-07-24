@@ -216,6 +216,22 @@ public:
   std::optional<std::string> lookupCanonicalBinding(llvm::StringRef name) const;
   void bindClass(llvm::StringRef name, mlir::Type instanceType);
   std::optional<mlir::Type> lookupClass(llvm::StringRef name) const;
+  // Class static attributes (`class C: attr = ...`) type `C.attr` and
+  // `instance.attr` reads; the emitter registers them per class as it emits
+  // the class contract.
+  void bindClassStaticAttr(llvm::StringRef className, llvm::StringRef attrName,
+                           mlir::Type type);
+  std::optional<mlir::Type>
+  lookupClassStaticAttrType(llvm::StringRef className,
+                            llvm::StringRef attrName) const;
+  // Static methods (`@staticmethod`) take no receiver, so the method-contract
+  // channel — which binds parameter 0 to the receiver — cannot resolve them.
+  // The emitter registers their signatures here as it emits the class.
+  void bindClassStaticMethod(llvm::StringRef className,
+                             llvm::StringRef methodName, mlir::Type callable);
+  std::optional<mlir::Type>
+  lookupClassStaticMethod(llvm::StringRef className,
+                          llvm::StringRef methodName) const;
   bool bindImportedModule(llvm::StringRef module, llvm::StringRef localName);
   bool bindImportedName(llvm::StringRef module, llvm::StringRef exportedName,
                         llvm::StringRef localName);
@@ -303,6 +319,13 @@ private:
   std::string targetTriple;
   llvm::StringMap<mlir::Type> symbols;
   llvm::StringMap<mlir::Type> classes;
+  // Class static attributes, keyed "<class>.<attr>". The protocol table's
+  // field channel models instance layout only, and a static attribute is not
+  // a field: it needs its own inference channel so `C.attr` types as the
+  // declared attribute rather than falling back to the erased object.
+  llvm::StringMap<mlir::Type> classStaticAttrTypes;
+  // Static-method signatures, keyed "<class>.<method>".
+  llvm::StringMap<mlir::Type> classStaticMethodTypes;
   llvm::StringMap<std::string> canonicalBindings;
   llvm::StringMap<std::string> annotationAliases;
   mutable llvm::SmallVector<llvm::StringMap<mlir::Type>, 8> scopes;

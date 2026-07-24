@@ -724,6 +724,11 @@ constexpr ModuleCallableImport kModuleCallableImports[] = {
 };
 
 constexpr ModuleAliasImport kModuleAliasImports[] = {
+    {"enum", "Enum", "enum.Enum", true},
+    {"enum", "IntEnum", "enum.IntEnum", true},
+    {"enum", "StrEnum", "enum.StrEnum", true},
+    {"enum", "auto", "enum.auto", false},
+    {"enum", "unique", "enum.unique", false},
     {"lyrt", "prim.Int", "lyrt.prim.Int", true},
     {"lyrt", "prim.Float", "lyrt.prim.Float", true},
     {"lyrt", "prim.Vector", "lyrt.prim.Vector", true},
@@ -762,6 +767,14 @@ constexpr NameAliasImport kNameAliasImports[] = {
     // exist so the imports resolve (the decorators never evaluate as values).
     {"dataclasses", "dataclass", "dataclasses.dataclass", false},
     {"dataclasses", "field", "dataclasses.field", false},
+    // enum bases/markers the emitter desugars syntactically (same channel as
+    // dataclass): an Enum subclass is rewritten into a plain class with
+    // compile-time-instantiated members, so these names never evaluate.
+    {"enum", "Enum", "enum.Enum", true},
+    {"enum", "IntEnum", "enum.IntEnum", true},
+    {"enum", "StrEnum", "enum.StrEnum", true},
+    {"enum", "auto", "enum.auto", false},
+    {"enum", "unique", "enum.unique", false},
 };
 
 constexpr ModuleStringConstantImport kModuleStringConstantImports[] = {
@@ -1458,6 +1471,43 @@ std::optional<mlir::Type> TypeSystem::lookupClass(llvm::StringRef name) const {
   return found->second;
 }
 
+void TypeSystem::bindClassStaticAttr(llvm::StringRef className,
+                                     llvm::StringRef attrName,
+                                     mlir::Type type) {
+  if (!type)
+    return;
+  classStaticAttrTypes[(llvm::Twine(className) + "." + attrName).str()] = type;
+}
+
+std::optional<mlir::Type>
+TypeSystem::lookupClassStaticAttrType(llvm::StringRef className,
+                                      llvm::StringRef attrName) const {
+  auto found =
+      classStaticAttrTypes.find((llvm::Twine(className) + "." + attrName).str());
+  if (found == classStaticAttrTypes.end())
+    return std::nullopt;
+  return found->second;
+}
+
+void TypeSystem::bindClassStaticMethod(llvm::StringRef className,
+                                       llvm::StringRef methodName,
+                                       mlir::Type callable) {
+  if (!callable)
+    return;
+  classStaticMethodTypes[(llvm::Twine(className) + "." + methodName).str()] =
+      callable;
+}
+
+std::optional<mlir::Type>
+TypeSystem::lookupClassStaticMethod(llvm::StringRef className,
+                                    llvm::StringRef methodName) const {
+  auto found = classStaticMethodTypes.find(
+      (llvm::Twine(className) + "." + methodName).str());
+  if (found == classStaticMethodTypes.end())
+    return std::nullopt;
+  return found->second;
+}
+
 bool TypeSystem::bindImportedModule(llvm::StringRef module,
                                     llvm::StringRef localName) {
   std::string localStorage;
@@ -2029,6 +2079,18 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
                 table.resolveFieldContractWithEvidence(widenLiteral(objectType),
                                                        *attr))
           return field->contractType;
+        // Class static attributes read through the class object or through an
+        // instance (an instance field of the same name shadows them, and the
+        // field channel above already claimed that case).
+        mlir::Type receiverInstance = widenLiteral(objectType);
+        if (auto typeObjectType =
+                mlir::dyn_cast_if_present<py::TypeType>(receiverInstance))
+          receiverInstance = typeObjectType.getInstanceType();
+        if (auto contractType =
+                mlir::dyn_cast_if_present<py::ContractType>(receiverInstance))
+          if (std::optional<mlir::Type> staticAttr = lookupClassStaticAttrType(
+                  contractType.getContractName(), *attr))
+            return *staticAttr;
         if (std::optional<CallSolution> method =
                 tryManifestMethod(*this, widenLiteral(objectType), *attr, {}))
           return method->result;
@@ -2596,6 +2658,25 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
           mlir::Type receiver = recurse(receiverNode);
           if (strict && !receiver)
             return {};
+          // Static methods carry no receiver parameter, so they resolve from
+          // their own channel rather than the receiver-bound method contracts.
+          mlir::Type staticOwner = widenLiteral(receiver);
+          if (auto typeObjectType =
+                  mlir::dyn_cast_if_present<py::TypeType>(staticOwner))
+            staticOwner = typeObjectType.getInstanceType();
+          if (auto ownerContract =
+                  mlir::dyn_cast_if_present<py::ContractType>(staticOwner))
+            if (std::optional<mlir::Type> staticMethod = lookupClassStaticMethod(
+                    ownerContract.getContractName(), *methodName)) {
+              if (strict) {
+                CallInferenceResult inference = inferCallWithEvidence(
+                    *staticMethod, positional, keywords);
+                if (inference)
+                  return inference.resultType;
+                return fail(inference.failureReason);
+              }
+              return inferCall(*staticMethod, positional, keywords);
+            }
           // str.format is expanded by the emitter (no manifest method); its
           // result is always str.
           if (*methodName == "format" &&

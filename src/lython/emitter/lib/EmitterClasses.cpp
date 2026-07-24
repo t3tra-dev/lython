@@ -1004,6 +1004,8 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
        llvm::zip_equal(staticAttrNames, staticAttrValues, staticAttrTypes)) {
     registeredStaticAttrs[attrName] = attrType;
     registeredStaticValues[attrName] = attrValue;
+    types.bindClassStaticAttr(contractName, attrName,
+                              types.widenLiteral(attrType));
   }
 
   llvm::SmallVector<std::string, 8> methodNames;
@@ -1106,6 +1108,10 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
         pendingBodySymbols.push_back(symbolName);
         pendingBodyKinds.push_back(kind);
       }
+      if (kind == "static")
+        types.bindClassStaticMethod(contractName, *methodName,
+                                    bodySig.publicCallable ? bodySig.publicCallable
+                                                           : bodySig.callable);
       classMethodBindings[contractName][*methodName] =
           MethodBinding{statement.get(),
                         bodySig,

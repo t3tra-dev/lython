@@ -1,0 +1,23 @@
+Color.RED
+Color.GREEN <Color.BLUE: 3>
+RED 1
+Color.GREEN Color.BLUE
+True True
+Color.RED RED 1
+True True
+False True True
+RED 1
+GREEN 2
+BLUE 3
+FIRST 1
+SECOND 2
+TENTH 10
+ELEVENTH 11
+1 10 <Level.HIGH: 10> 1
+HIGH 10
+r write <Mode.READ: 'r'> write
+WRITE write
+Unique.A Unique.B
+LOUD LOUD <Loud.ONE: 1>
+ValueError
+KeyError 'MAGENTA'

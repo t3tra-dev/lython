@@ -40,6 +40,9 @@ EmitResult ModuleEmitter::emit() {
 
   module = mlir::ModuleOp::create(builder.getUnknownLoc());
   module.setName(moduleName);
+  // Enum desugaring rewrites the parsed tree, so it must run before anything
+  // reads the module's shape (static module attributes below already do).
+  desugarEnumClasses(moduleNode);
   llvm::SmallVector<std::string, 8> staticAttrNames;
   llvm::SmallVector<mlir::Attribute, 8> staticAttrValues;
   collectStaticModuleAssignments(moduleNode, staticAttrNames, staticAttrValues);
