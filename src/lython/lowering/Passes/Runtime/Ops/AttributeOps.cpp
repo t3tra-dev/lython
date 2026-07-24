@@ -1350,14 +1350,20 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerExceptionFieldAttrGet(
       return op.emitError()
              << "runtime manifest has no builtins.int unbox.i64 primitive";
     auto bound = valueBundles.find(op.getResult());
-    if (bound == valueBundles.end())
+    if (bound == valueBundles.end() || bound->second.physicalValues().empty())
       return op.emitError() << "exception field load produced no bundle";
-    builder.setInsertionPointAfterValue(bound->second.physicalValues().back());
-    mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
-        loc, *unbox, bound->second.physicalValues());
+    // Copy before building: createRuntimeCall may declare the callee, and the
+    // assignment below can rehash valueBundles, so neither the iterator nor
+    // the ArrayRef into the bundle may be held across those steps.
+    llvm::SmallVector<mlir::Value, 4> boxedValues(
+        bound->second.physicalValues().begin(),
+        bound->second.physicalValues().end());
+    builder.setInsertionPointAfterValue(boxedValues.back());
+    mlir::func::CallOp call =
+        RuntimeBundleLowerer::createRuntimeCall(loc, *unbox, boxedValues);
     mlir::Value valid =
         mlir::arith::ConstantIntOp::create(builder, loc, 1, 1).getResult();
-    bound->second.primitiveI64 =
+    valueBundles[op.getResult()].primitiveI64 =
         RuntimePrimitiveI64Evidence{call.getResult(0), valid};
   }
   return mlir::success();
