@@ -191,7 +191,10 @@ ModuleEmitter::enumBaseKind(const parser::Node &classDef) const {
   const auto *baseNodes = ast::nodeList(classDef, "bases");
   if (!baseNodes || baseNodes->size() != 1 || !baseNodes->front())
     return std::nullopt;
-  llvm::StringRef base = leafName(ast::qualifiedName(baseNodes->front().get()));
+  // Bound to a std::string: qualifiedName returns by value, so a StringRef
+  // into it dangles past the end of the initializing expression.
+  const std::string qualified = ast::qualifiedName(baseNodes->front().get());
+  llvm::StringRef base = leafName(qualified);
   if (base == "Enum")
     return EnumKind::Plain;
   if (base == "IntEnum")
@@ -615,7 +618,10 @@ void ModuleEmitter::rewriteEnumUses(const parser::Node &node) {
     // its members (CPython's EnumType.__iter__).
     if (const auto *args = ast::nodeList(node, "args");
         args && args->size() == 1 && args->front()) {
-      llvm::StringRef consumer = leafName(ast::qualifiedName(callee));
+      // Re-fetched, not reused: the by-value rewrite above replaced the "func"
+      // field, which dropped the last reference to the node `callee` named.
+      const std::string qualified = ast::qualifiedName(ast::node(node, "func"));
+      llvm::StringRef consumer = leafName(qualified);
       bool iterates = consumer == "list" || consumer == "tuple" ||
                       consumer == "set" || consumer == "sorted" ||
                       consumer == "len" || consumer == "reversed" ||
