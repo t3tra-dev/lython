@@ -1,0 +1,23 @@
+Color.RED Color.GREEN
+True
+RED 1
+10 30
+True
+3
+low high
+0 1
+Point(x=5, y=6) 11
+True False
+1
+r
+['10', 'w']
+2
+RED:1
+GREEN:20
+w7
+w1
+10
+20
+RED 1 10
+GREEN 2 20
+BLUE 3 30
