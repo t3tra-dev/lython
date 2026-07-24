@@ -771,15 +771,23 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
             return widened;
           return {};
         };
+        // A try body that always raises (`try: raise X` / every path returns)
+        // contributes NO fall-through lane: its bindings are unreachable after
+        // the try. Requiring one here dropped every lane for that shape, so
+        // `out = 7` inside the handler was silently discarded and the post-try
+        // read answered the pre-try value. The handler exits alone are the
+        // complete set of ways out in that case.
         for (const std::string &name : postCandidateNames) {
-          auto tryBound = postTryEndBindings.find(name);
-          if (tryBound == postTryEndBindings.end())
-            continue;
           llvm::SmallVector<mlir::Type, 4> parts;
-          mlir::Type tryPart = carrierType(tryBound->second.type);
-          if (!tryPart)
-            continue;
-          parts.push_back(tryPart);
+          if (postTryFallThrough) {
+            auto tryBound = postTryEndBindings.find(name);
+            if (tryBound == postTryEndBindings.end())
+              continue;
+            mlir::Type tryPart = carrierType(tryBound->second.type);
+            if (!tryPart)
+              continue;
+            parts.push_back(tryPart);
+          }
           bool everywhere = true;
           for (const HandlerExit &exit : postHandlerExits) {
             auto found = exit.bindings.find(name);
@@ -792,7 +800,7 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
             }
             parts.push_back(part);
           }
-          if (!everywhere)
+          if (!everywhere || parts.empty())
             continue;
           mlir::Type merged = types.join(parts);
           if (!merged || !carrierType(merged))
