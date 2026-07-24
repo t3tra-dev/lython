@@ -1,0 +1,9 @@
+1 2
+Point(x=1, y=2)
+Point(x=3, y=4)
+True False
+Labelled(name='a', weight=1.5, tags=0)
+Labelled(name='b', weight=2.5, tags=7)
+a 1.5 0
+7
+Point(x=2, y=3)

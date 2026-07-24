@@ -775,6 +775,11 @@ constexpr NameAliasImport kNameAliasImports[] = {
     {"enum", "StrEnum", "enum.StrEnum", true},
     {"enum", "auto", "enum.auto", false},
     {"enum", "unique", "enum.unique", false},
+    // typing.NamedTuple is a class-construction marker the emitter consumes
+    // syntactically (the annotated body desugars like a dataclass), so the
+    // binding exists only so the import resolves.
+    {"typing", "NamedTuple", "typing.NamedTuple", false},
+    {"typing_extensions", "NamedTuple", "typing.NamedTuple", false},
 };
 
 constexpr ModuleStringConstantImport kModuleStringConstantImports[] = {

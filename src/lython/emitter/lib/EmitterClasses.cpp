@@ -657,6 +657,19 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       if (!base)
         continue;
       std::string qualified = ast::qualifiedName(base.get());
+      // typing.NamedTuple is a class-construction marker, not a base: the
+      // annotated body it requires is exactly the dataclass field form, and
+      // CPython's namedtuple __init__/__repr__/__eq__ agree with the
+      // dataclass synthesis field for field (including the repr's
+      // `Name(f=v, ...)` spelling). It is consumed here rather than
+      // linearized.
+      llvm::StringRef spelling =
+          qualified.empty() ? llvm::StringRef(ast::nameSpelling(*base))
+                            : llvm::StringRef(qualified);
+      if (decoratorLeafName(spelling) == "NamedTuple") {
+        isDataclass = true;
+        continue;
+      }
       if (!qualified.empty()) {
         bases.push_back(builder.getStringAttr(qualified).getValue());
         continue;
