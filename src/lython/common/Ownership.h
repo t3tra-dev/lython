@@ -273,7 +273,9 @@ bool groupMatchesOwnedReturnRange(
 // storage without any direct SSA use of the entity past the load. Collect
 // those derived view values so release placement pins the entity until the
 // views' last use (a release between the load and the consuming call would
-// be a use-after-free).
+// be a use-after-free). Primitives the manifest marks kManifestInteriorWordAttr
+// reach the same storage through a call rather than a load, and their results
+// join the walk on the same footing.
 void collectBoxWordDerivedViews(llvm::ArrayRef<mlir::Value> groupValues,
                                 llvm::SmallVectorImpl<mlir::Value> &views);
 
