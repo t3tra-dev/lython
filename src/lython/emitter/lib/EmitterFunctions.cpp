@@ -12,6 +12,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/Support/SaveAndRestore.h"
 
 namespace lython::emitter {
 namespace {
@@ -101,6 +102,7 @@ void ModuleEmitter::emitFunctionDecl(const parser::Node &function) {
         GenericFunctionInfo &info = genericFunctions[*name];
         info.node = &function;
         info.signature = sig;
+        info.symbolBase = std::string(*name);
       }
     } else {
       emitCallableFunction(function, *name, sig, {}, /*isLambda=*/false);
@@ -123,6 +125,20 @@ ModuleEmitter::ensureGenericSpecialization(const parser::Node &anchor,
   };
   if (!name)
     return fail("missing function name");
+  // Imported generics defer this check to the use site (a module may ship a
+  // pack-parameterized function nobody calls); main-module declarations
+  // already diagnosed it eagerly in emitFunctionDecl.
+  bool packParameterized = false;
+  py::mapPyTypeStructure(
+      generic.signature.publicCallable,
+      [&](mlir::Type node) -> std::optional<mlir::Type> {
+        if (py::isPyParamSpecType(node) || py::isPyTypeVarTupleType(node))
+          packParameterized = true;
+        return std::nullopt;
+      });
+  if (packParameterized)
+    return fail("ParamSpec or TypeVarTuple parameters cannot be "
+                "specialized yet");
 
   TypeBindingMap bindings;
   if (!target ||
@@ -164,8 +180,10 @@ ModuleEmitter::ensureGenericSpecialization(const parser::Node &anchor,
   if (generic.specializations.size() >= 32)
     return fail("too many distinct instantiations (polymorphic recursion?)");
 
+  llvm::StringRef symbolBase =
+      generic.symbolBase.empty() ? llvm::StringRef(*name) : generic.symbolBase;
   std::string symbol =
-      (llvm::Twine(*name) + "$spec" +
+      (llvm::Twine(symbolBase) + "$spec" +
        llvm::Twine(static_cast<unsigned>(generic.specializations.size())))
           .str();
   // Memoize BEFORE emitting the body: monomorphic recursion inside the
@@ -173,15 +191,70 @@ ModuleEmitter::ensureGenericSpecialization(const parser::Node &anchor,
   // re-specializing.
   generic.specializations[specialized.publicCallable] = symbol;
 
-  // Body annotations spell the type parameters by name (x: T); bind each
-  // solved parameter to its ground type for the emission scope, shadowing
-  // the generic TypeVar binding the signature pass installed.
-  auto scope = types.pushScope();
-  for (const auto &binding : bindings)
-    types.bindLocalSymbol(binding.first, binding.second);
-  emitCallableFunction(*generic.node, symbol, specialized, {},
-                       /*isLambda=*/false);
+  auto emitSpecializedBody = [&] {
+    // Body annotations spell the type parameters by name (x: T); bind each
+    // solved parameter to its ground type for the emission scope, shadowing
+    // the generic TypeVar binding the signature pass installed.
+    auto scope = types.pushScope();
+    for (const auto &binding : bindings)
+      types.bindLocalSymbol(binding.first, binding.second);
+    emitCallableFunction(*generic.node, symbol, specialized, {},
+                         /*isLambda=*/false);
+  };
+  if (!generic.source) {
+    emitSpecializedBody();
+    return std::make_pair(symbol, specialized.publicCallable);
+  }
+
+  // Imported generic: the body must emit under the DEFINING module's
+  // environment, not the use site's. isolateScopes (rather than a plain
+  // pushScope) keeps an unbound name in the imported body a diagnostic
+  // instead of letting it resolve to a use-site local.
+  const EmitOptions::SourceModule &source = *generic.source;
+  llvm::SaveAndRestore<std::string> savedSourceName(
+      sourceName,
+      source.sourceName.empty() ? source.moduleName : source.sourceName);
+  llvm::SaveAndRestore<std::string> savedPackageName(activePackageName,
+                                                     source.packageName);
+  auto savedLoops = std::move(loopControlContexts);
+  loopControlContexts.clear();
+  auto savedInlineReturns = std::move(inlineReturnContexts);
+  inlineReturnContexts.clear();
+  auto savedSupers = std::move(superContexts);
+  superContexts.clear();
+  llvm::scope_exit restoreContexts([&] {
+    loopControlContexts = std::move(savedLoops);
+    inlineReturnContexts = std::move(savedInlineReturns);
+    superContexts = std::move(savedSupers);
+  });
+  std::size_t diagnosticStart = diagnostics.size();
+  {
+    TypeSystem::ScopeIsolation isolation = types.isolateScopes();
+    auto moduleScope = types.pushScope();
+    bindModuleImportScope(*source.moduleNode, /*diagnoseUnsupported=*/false);
+    bindSourceModuleLocals(source.moduleName, *source.moduleNode,
+                           source.isStub);
+    emitSpecializedBody();
+  }
+  for (std::size_t index = diagnosticStart; index < diagnostics.size();
+       ++index)
+    if (diagnostics[index].filename.empty())
+      diagnostics[index].filename = sourceName;
   return std::make_pair(symbol, specialized.publicCallable);
+}
+
+ModuleEmitter::GenericFunctionInfo *
+ModuleEmitter::lookupGenericFunction(llvm::StringRef name) {
+  auto found = genericFunctions.find(name);
+  if (found != genericFunctions.end())
+    return &found->second;
+  if (std::optional<std::string> canonical =
+          types.lookupCanonicalBinding(name)) {
+    found = genericFunctions.find(*canonical);
+    if (found != genericFunctions.end())
+      return &found->second;
+  }
+  return nullptr;
 }
 
 void ModuleEmitter::emitCallableFunction(const parser::Node &callable,

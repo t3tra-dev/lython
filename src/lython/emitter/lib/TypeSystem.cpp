@@ -999,6 +999,48 @@ void TypeSystem::Scope::reset() {
   owner = nullptr;
 }
 
+TypeSystem::ScopeIsolation::ScopeIsolation(ScopeIsolation &&other) noexcept
+    : owner(other.owner), savedScopes(std::move(other.savedScopes)),
+      savedCanonicalBindings(std::move(other.savedCanonicalBindings)),
+      savedClasses(std::move(other.savedClasses)) {
+  other.owner = nullptr;
+}
+
+TypeSystem::ScopeIsolation &
+TypeSystem::ScopeIsolation::operator=(ScopeIsolation &&other) noexcept {
+  if (this == &other)
+    return *this;
+  reset();
+  owner = other.owner;
+  savedScopes = std::move(other.savedScopes);
+  savedCanonicalBindings = std::move(other.savedCanonicalBindings);
+  savedClasses = std::move(other.savedClasses);
+  other.owner = nullptr;
+  return *this;
+}
+
+TypeSystem::ScopeIsolation::~ScopeIsolation() { reset(); }
+
+void TypeSystem::ScopeIsolation::reset() {
+  if (!owner)
+    return;
+  owner->scopes = std::move(savedScopes);
+  owner->scopedCanonicalBindings = std::move(savedCanonicalBindings);
+  owner->scopedClasses = std::move(savedClasses);
+  owner = nullptr;
+}
+
+TypeSystem::ScopeIsolation TypeSystem::isolateScopes() const {
+  ScopeIsolation isolation(*this);
+  isolation.savedScopes = std::move(scopes);
+  isolation.savedCanonicalBindings = std::move(scopedCanonicalBindings);
+  isolation.savedClasses = std::move(scopedClasses);
+  scopes.clear();
+  scopedCanonicalBindings.clear();
+  scopedClasses.clear();
+  return isolation;
+}
+
 void TypeSystem::seedBuiltins() {
   bindSymbol("None", none());
   bindSymbol("True", literal("True"));

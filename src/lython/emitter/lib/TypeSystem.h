@@ -159,6 +159,33 @@ public:
     const TypeSystem *owner = nullptr;
   };
 
+  // Stashes the ENTIRE pushed-scope stack (root symbols/classes stay
+  // visible) and restores it on destruction. Emitting an imported module's
+  // body from a use site inside another scope chain re-establishes the
+  // defining module's environment with this: a plain pushScope would only
+  // shadow, so an unbound name in the imported body could silently resolve
+  // to a use-site local instead of being diagnosed.
+  class ScopeIsolation {
+  public:
+    ScopeIsolation() = default;
+    ScopeIsolation(const ScopeIsolation &) = delete;
+    ScopeIsolation &operator=(const ScopeIsolation &) = delete;
+    ScopeIsolation(ScopeIsolation &&other) noexcept;
+    ScopeIsolation &operator=(ScopeIsolation &&other) noexcept;
+    ~ScopeIsolation();
+
+  private:
+    friend class TypeSystem;
+    explicit ScopeIsolation(const TypeSystem &owner) : owner(&owner) {}
+    void reset();
+
+    const TypeSystem *owner = nullptr;
+    llvm::SmallVector<llvm::StringMap<mlir::Type>, 8> savedScopes;
+    llvm::SmallVector<llvm::StringMap<std::string>, 8>
+        savedCanonicalBindings;
+    llvm::SmallVector<llvm::StringMap<mlir::Type>, 8> savedClasses;
+  };
+
   explicit TypeSystem(mlir::MLIRContext &context);
 
   mlir::MLIRContext &getContext() const { return context; }
@@ -208,6 +235,7 @@ public:
   void registerModule(const parser::Node &moduleNode);
 
   Scope pushScope() const;
+  ScopeIsolation isolateScopes() const;
   void bindLocalSymbol(llvm::StringRef name, mlir::Type type) const;
   void bindSymbol(llvm::StringRef name, mlir::Type type);
   void bindCanonicalSymbol(llvm::StringRef name, llvm::StringRef canonical,

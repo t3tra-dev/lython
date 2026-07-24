@@ -55,7 +55,8 @@ private:
                                  llvm::StringRef localName);
   bool bindSourceModuleName(llvm::StringRef module,
                             llvm::StringRef exportedName,
-                            llvm::StringRef localName);
+                            llvm::StringRef localName,
+                            unsigned aliasDepth = 0);
   bool bindSourceModuleReexport(const EmitOptions::SourceModule &source,
                                 llvm::StringRef exportedName,
                                 llvm::StringRef localName);
@@ -247,12 +248,29 @@ private:
   struct GenericFunctionInfo {
     const parser::Node *node = nullptr;
     FunctionSignature signature;
+    // Specialization symbols derive from this ("<name>" for main-module
+    // functions, "<module>.<name>" for imported ones) instead of the AST
+    // spelling: one program may instantiate same-named generics from
+    // different modules, and the AST spelling would collide.
+    std::string symbolBase;
+    // Defining source module for imported generics (null for main-module
+    // ones): specialization bodies must emit under the DEFINING module's
+    // scope, not the use site's.
+    const EmitOptions::SourceModule *source = nullptr;
     llvm::DenseMap<mlir::Type, std::string> specializations;
   };
   std::optional<std::pair<std::string, py::CallableType>>
   ensureGenericSpecialization(const parser::Node &anchor,
                               GenericFunctionInfo &generic,
                               py::CallableType target);
+  // Generic lookup for a callee spelling: the local registration first, then
+  // the canonical import binding (imported generics register under their
+  // canonical "<module>.<name>" symbol).
+  GenericFunctionInfo *lookupGenericFunction(llvm::StringRef name);
+  // Source module that defines class `className` ("<module>.<Class>"
+  // contract names), null for main-module and manifest classes.
+  const EmitOptions::SourceModule *
+  sourceModuleForClass(llvm::StringRef className) const;
   Value emitGenericCall(const parser::Node &expr,
                         const parser::Node &calleeNode,
                         GenericFunctionInfo &generic);

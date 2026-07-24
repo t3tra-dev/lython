@@ -11,8 +11,11 @@
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/SymbolTable.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Support/SaveAndRestore.h"
 
+#include <optional>
 #include <utility>
 
 namespace lython::emitter {
@@ -1874,6 +1877,46 @@ Value ModuleEmitter::emitInlineMethodBody(
   mlir::Type resultType = sig.resultType ? sig.resultType : types.none();
 
   ScopedEmitterScope scope(values, types);
+  // A method of a source-module class executes under ITS module's globals
+  // (Python scoping), not the use site's: re-establish the defining
+  // module's environment around the inlined body. Clearing `values` and
+  // isolating the scope stack (instead of only pushing) keeps an unbound
+  // name in the method body a diagnostic rather than a silent capture of a
+  // use-site local.
+  const EmitOptions::SourceModule *methodSource =
+      sourceModuleForClass(method.definingClass);
+  std::size_t crossModuleDiagnosticStart = diagnostics.size();
+  std::optional<TypeSystem::ScopeIsolation> isolation;
+  std::optional<llvm::SaveAndRestore<std::string>> savedSourceName;
+  std::optional<llvm::SaveAndRestore<std::string>> savedPackageName;
+  llvm::SmallVector<LoopControlContext, 4> savedLoopContexts;
+  auto crossModuleCleanup = llvm::make_scope_exit([&] {
+    if (!methodSource)
+      return;
+    // Attribute before SaveAndRestore rolls sourceName back (destruction
+    // order): these diagnostics point into the defining module's source.
+    for (std::size_t index = crossModuleDiagnosticStart;
+         index < diagnostics.size(); ++index)
+      if (diagnostics[index].filename.empty())
+        diagnostics[index].filename = sourceName;
+    loopControlContexts = std::move(savedLoopContexts);
+  });
+  std::optional<TypeSystem::Scope> moduleScope;
+  if (methodSource) {
+    values.clear();
+    isolation.emplace(types.isolateScopes());
+    savedSourceName.emplace(sourceName, methodSource->sourceName.empty()
+                                            ? methodSource->moduleName
+                                            : methodSource->sourceName);
+    savedPackageName.emplace(activePackageName, methodSource->packageName);
+    savedLoopContexts = std::move(loopControlContexts);
+    loopControlContexts.clear();
+    moduleScope.emplace(types.pushScope());
+    bindModuleImportScope(*methodSource->moduleNode,
+                          /*diagnoseUnsupported=*/false);
+    bindSourceModuleLocals(methodSource->moduleName, *methodSource->moduleNode,
+                           methodSource->isStub);
+  }
   llvm::StringSet<> bound;
   auto bind = [&](llvm::StringRef name, Value value) {
     values[name] = value;

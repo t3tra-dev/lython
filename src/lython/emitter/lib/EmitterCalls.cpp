@@ -343,6 +343,12 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
           return *constant;
       if (binding == "asyncio.run")
         return emitAsyncioRunCall(expr);
+      // Qualified references to imported generics (module.fn(...)) resolve
+      // through the canonical binding to the same registration the bare
+      // import-name path uses.
+      auto generic = genericFunctions.find(binding);
+      if (generic != genericFunctions.end())
+        return emitGenericCall(expr, *calleeNode, generic->second);
       mlir::Type resultOverride =
           binding == "asyncio.sleep" ? types.inferExpr(&expr) : mlir::Type();
       Value callee = emitBindingRef(*calleeNode, binding, *symbol);
@@ -423,9 +429,8 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
   if (calleeNode && calleeNode->kind == "Name") {
     llvm::StringRef name = ast::nameSpelling(*calleeNode);
     if (values.find(name) == values.end()) {
-      auto generic = genericFunctions.find(name);
-      if (generic != genericFunctions.end())
-        return emitGenericCall(expr, *calleeNode, generic->second);
+      if (GenericFunctionInfo *generic = lookupGenericFunction(name))
+        return emitGenericCall(expr, *calleeNode, *generic);
     }
     if (!types.lookupSymbol(name) && !types.lookupClass(name)) {
       diagnostics.push_back(parser::Diagnostic{
