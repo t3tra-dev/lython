@@ -1626,6 +1626,74 @@ module attributes {
     func.return %flag : i1
   }
 
+  // ---- User-exception field block (extended word 4) -------------------
+  // A user exception class declares instance fields; the exception object's
+  // layout is fixed by the taxonomy (3-word header + message), so the fields
+  // live in a separate [count, count x box16] block hung off word 4 -- the
+  // same shape word 3 uses for group members. Reached only through these
+  // primitives; `release_exception_extras` already frees the block and
+  // releases each owning slot.
+
+  // The field block for %header, allocating it on first use. Idempotent:
+  // whichever store runs first materializes the block, so no construction
+  // path has to know the field count up front.
+  func.func private @__ly_exc_fields_block(%header: memref<3xi64>, %count: i64) -> i64 attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "fields_block"} {
+    %zero = arith.constant 0 : i64
+    %fields_slot = arith.constant 4 : i64
+    %existing = func.call @__ly_exc_ext_get(%header, %fields_slot) : (memref<3xi64>, i64) -> i64
+    %absent = arith.cmpi eq, %existing, %zero : i64
+    %block = scf.if %absent -> (i64) {
+      %fresh = func.call @__ly_exc_payload_alloc(%count) : (i64) -> i64
+      func.call @__ly_exc_ext_set(%header, %fields_slot, %fresh) : (memref<3xi64>, i64, i64) -> ()
+      scf.yield %fresh : i64
+    } else {
+      scf.yield %existing : i64
+    }
+    func.return %block : i64
+  }
+
+  // One word of the %slot-th box of a payload block. The generic reader that
+  // pairs with payload_store_words: the lowering rebuilds a payload's memref
+  // group from the box's pointer/size words (BoxLayout.h offsets).
+  func.func private @__ly_exc_payload_box_word(%block_word: i64, %slot: i64, %word: i64) -> i64 attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "payload_box_word"} {
+    %c16 = arith.constant 16 : i64
+    %one = arith.constant 1 : i64
+    %block_ptr = llvm.inttoptr %block_word : i64 to !llvm.ptr
+    %boxes_base = arith.muli %slot, %c16 : i64
+    %box_base = arith.addi %boxes_base, %one : i64
+    %box_offset = arith.addi %box_base, %word : i64
+    %word_ptr = llvm.getelementptr %block_ptr[%box_offset] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    %value = llvm.load %word_ptr : !llvm.ptr -> i64
+    func.return %value : i64
+  }
+
+  // Address of the %slot-th box. An erased-`object` field stores the box
+  // itself as its value (the box words ARE the canonical object handle), so
+  // that read needs the box address rather than the payload words.
+  func.func private @__ly_exc_payload_box_ptr(%block_word: i64, %slot: i64) -> i64 attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "payload_box_ptr"} {
+    %c16 = arith.constant 16 : i64
+    %one = arith.constant 1 : i64
+    %block_ptr = llvm.inttoptr %block_word : i64 to !llvm.ptr
+    %boxes_base = arith.muli %slot, %c16 : i64
+    %box_base = arith.addi %boxes_base, %one : i64
+    %box_ptr = llvm.getelementptr %block_ptr[%box_base] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    %box_word = llvm.ptrtoint %box_ptr : !llvm.ptr to i64
+    func.return %box_word : i64
+  }
+
+  // Release whatever the %slot-th box owns (a no-op while its owned flag is
+  // zero), so a field rebind drops the previous payload exactly once.
+  func.func private @__ly_exc_payload_release_slot(%block_word: i64, %slot: i64) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "payload_release_slot"} {
+    %c16 = arith.constant 16 : i64
+    %one = arith.constant 1 : i64
+    %block_ptr = llvm.inttoptr %block_word : i64 to !llvm.ptr
+    %boxes_base = arith.muli %slot, %c16 : i64
+    %box_base = arith.addi %boxes_base, %one : i64
+    %box_ptr = llvm.getelementptr %block_ptr[%box_base] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    func.call @release_payload_slot_ptr(%box_ptr) : (!llvm.ptr) -> ()
+    func.return
+  }
+
   // Zeroed dummies for the absent sides of a star split result: the paired
   // flag gates every consumer, so the views are never dereferenced.
   memref.global "private" @__ly_exc_dummy_header : memref<3xi64> = dense<0>
@@ -1935,6 +2003,7 @@ module attributes {
   // deallocator, raw view rebuilders for the payload boxes, and the taxonomy
   // subtree matcher for the group-aware paths.
   func.func private @release_exception_extras(%header_word: i64)
+  func.func private @release_payload_slot_ptr(%slot: !llvm.ptr)
   func.func private @__ly_global_view_i64(%pointer: i64, %size: i64) -> memref<?xi64>
   func.func private @__ly_global_view_i8(%pointer: i64, %size: i64) -> memref<?xi8>
   func.func private @LyEH_ClassIdMatches(%raised: i64, %handler: i64) -> i1

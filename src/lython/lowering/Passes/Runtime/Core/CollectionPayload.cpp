@@ -245,6 +245,20 @@ RuntimeBundleLowerer::objectPayloadHandleWords(mlir::Operation *op,
     return op->emitError()
            << "collection payload element " << concrete->contract
            << " has no physical object handle; materialize it before storing";
+  // A box carries at most kPointerWordCount payload handles. Storing a wider
+  // value used to keep only the leading ones, so the element read back from
+  // the slot silently lost its tail -- and the same width knocked the class
+  // out of the boxed-method dispatch, turning a `__repr__` that plainly
+  // exists into a runtime abort. Reject at the box, the earliest point where
+  // the width is known.
+  if (concrete->physicalValues().size() > kPayloadValuePointerWords)
+    return op->emitError()
+           << "a " << concrete->contract << " value expands to "
+           << concrete->physicalValues().size()
+           << " physical handles, but a payload box carries at most "
+           << kPayloadValuePointerWords
+           << "; it cannot be stored in a container slot or boxed field yet "
+              "(reduce the class to fewer or narrower fields)";
 
   mlir::FailureOr<mlir::Value> header =
       RuntimeBundleLowerer::objectPhysicalHeader(op, concrete->objectValue);
@@ -262,18 +276,15 @@ RuntimeBundleLowerer::objectPayloadHandleWords(mlir::Operation *op,
                                        pointerIndex)
           .getResult();
   mlir::Value refcount = constantI64(builder, loc, 1);
-  mlir::Value valueCount =
-      constantI64(builder, loc,
-                  std::min<unsigned>(concrete->physicalValues().size(),
-                                     kPayloadValuePointerWords));
+  mlir::Value valueCount = constantI64(
+      builder, loc, static_cast<std::int64_t>(concrete->physicalValues().size()));
   mlir::Value owned = constantI64(builder, loc, ownsPayload ? 1 : 0);
   llvm::SmallVector<mlir::Value, 4> words(kPayloadHandleWords, zero);
   words[0] = refcount;
   words[1] = payloadClass;
   words[2] = payloadPointer;
   words[3] = valueCount;
-  for (auto [index, physical] : llvm::enumerate(
-           concrete->physicalValues().take_front(kPayloadValuePointerWords))) {
+  for (auto [index, physical] : llvm::enumerate(concrete->physicalValues())) {
     words[kPayloadValuePointerBase + index] =
         pointerWordForPhysicalValue(builder, loc, physical, zero);
     words[kPayloadValueSizeBase + index] =
