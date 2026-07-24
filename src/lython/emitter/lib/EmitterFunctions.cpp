@@ -196,8 +196,10 @@ ModuleEmitter::ensureGenericSpecialization(const parser::Node &anchor,
     // solved parameter to its ground type for the emission scope, shadowing
     // the generic TypeVar binding the signature pass installed.
     auto scope = types.pushScope();
-    for (const auto &binding : bindings)
+    for (const auto &binding : bindings) {
       types.bindLocalSymbol(binding.first, binding.second);
+      types.bindLocalTypeParameter(binding.first, binding.second);
+    }
     emitCallableFunction(*generic.node, symbol, specialized, {},
                          /*isLambda=*/false);
   };

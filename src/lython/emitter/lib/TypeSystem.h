@@ -184,6 +184,7 @@ public:
     llvm::SmallVector<llvm::StringMap<std::string>, 8>
         savedCanonicalBindings;
     llvm::SmallVector<llvm::StringMap<mlir::Type>, 8> savedClasses;
+    llvm::SmallVector<llvm::StringMap<mlir::Type>, 8> savedTypeParameters;
   };
 
   explicit TypeSystem(mlir::MLIRContext &context);
@@ -237,6 +238,12 @@ public:
   Scope pushScope() const;
   ScopeIsolation isolateScopes() const;
   void bindLocalSymbol(llvm::StringRef name, mlir::Type type) const;
+  // Monomorphization: the ground type a specialization solved for a type
+  // parameter, visible to ANNOTATIONS in the specialized body (`out:
+  // list[T] = []`) for the current scope. A plain symbol binding does not
+  // serve: annotationTypeForName deliberately ignores value symbols so a
+  // local cannot shadow a class annotation.
+  void bindLocalTypeParameter(llvm::StringRef name, mlir::Type type) const;
   void bindSymbol(llvm::StringRef name, mlir::Type type);
   void bindCanonicalSymbol(llvm::StringRef name, llvm::StringRef canonical,
                            mlir::Type type);
@@ -337,6 +344,8 @@ private:
   mutable llvm::SmallVector<llvm::StringMap<std::string>, 8>
       scopedCanonicalBindings;
   mutable llvm::SmallVector<llvm::StringMap<mlir::Type>, 8> scopedClasses;
+  mutable llvm::SmallVector<llvm::StringMap<mlir::Type>, 8>
+      scopedTypeParameters;
   // Annotation resolution runs from const contexts (registerModule pre-pass
   // and emission may both visit one node), so diagnostics accumulate in a
   // mutable, deduplicated buffer instead of being reported inline.
