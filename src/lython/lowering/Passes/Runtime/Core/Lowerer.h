@@ -626,9 +626,19 @@ private:
   mlir::LogicalResult generateBoxedLtHook();
   mlir::LogicalResult lowerListEvidenceNext(py::NextOp op,
                                             RuntimeBundle iterator);
+  // True when the mutation op sits in a different block than the one defining
+  // the container's physical storage (SpecialMethodOps.cpp).
+  static bool
+  mutationCrossesStorageDefiningBlock(mlir::Operation *op,
+                                      const RuntimeBundle &bundle);
   // Drops a dict's compile-time mapping evidence before a mutation emitted
   // outside the storage's defining block (SpecialMethodOps.cpp).
   bool demoteDictEvidenceForCrossBlockMutation(mlir::Operation *op,
+                                               mlir::Value containerValue);
+  // List instance of the same rule: drops a list's compile-time sequence
+  // evidence before a mutation emitted outside the storage's defining block
+  // (SpecialMethodOps.cpp).
+  bool demoteListEvidenceForCrossBlockMutation(mlir::Operation *op,
                                                mlir::Value containerValue);
   // Loop-body generator state-machine transform (GeneratorStateMachine.cpp).
   //

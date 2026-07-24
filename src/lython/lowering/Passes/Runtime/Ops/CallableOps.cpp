@@ -127,6 +127,21 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCall(py::CallOp op) {
       valueBundles[op.getCallable()] = std::move(demoted);
       callable = RuntimeBundleLowerer::bundleFor(op.getCallable());
     }
+    // A list mutator reached outside the storage's defining block would
+    // record evidence (payload boxes, element values) that join-dominated
+    // uses cannot reference — and the merge would keep only the first
+    // predecessor's evidence, silently mis-executing the other arm. Demote
+    // to runtime mode first so the mutation lowers through the physical
+    // payload, which both arms share.
+    if (methodName == "append" || methodName == "insert" ||
+        methodName == "remove" || methodName == "pop" ||
+        methodName == "sort" || methodName == "reverse" ||
+        methodName == "extend" || methodName == "clear" ||
+        methodName == "__setslice__" || methodName == "__delslice__") {
+      if (RuntimeBundleLowerer::demoteListEvidenceForCrossBlockMutation(
+              op.getOperation(), op.getCallable()))
+        callable = RuntimeBundleLowerer::bundleFor(op.getCallable());
+    }
     // Same rule for evidence-backed lists meeting a mutator with no
     // evidence tier: the payload is authoritative after the mutation.
     if (callable->kind == RuntimeBundle::Kind::Object &&
@@ -804,6 +819,21 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
       erase.push_back(op);
       return mlir::success();
     }
+
+    // A non-rebindable view (object field, parameter, capture) mutated outside
+    // its storage's defining block cannot use the evidence tier below: the
+    // slot index it derives from the evidence would be wrong on the other
+    // predecessor, and the updated payload values it records do not dominate
+    // the join. Rebinding is not available either (no `ly.structural_mutation`
+    // local to reassign), so reject loudly rather than mis-execute. A
+    // same-block field mutation is unaffected and keeps the evidence path.
+    if (RuntimeBundleLowerer::mutationCrossesStorageDefiningBlock(
+            op.getOperation(), receiver))
+      return op.emitError()
+             << "list." << methodName
+             << " on a field or borrowed list is not supported inside a "
+                "branch or loop body; bind the list to a local variable and "
+                "mutate the local instead";
 
     RuntimeBundle updated = receiver;
     if (methodName == "append") {
