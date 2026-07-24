@@ -457,9 +457,19 @@ private:
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>>
   objectPayloadHandleWords(mlir::Operation *op, const RuntimeBundle &value,
                            bool ownsPayload = true);
+  // True when `op` is the ONLY user of `value` — i.e. the value is a
+  // temporary this op consumes, not a binding that outlives it. Container
+  // literals use it to decide whether storing an element may take over the
+  // source's reference (CollectionPayload.cpp).
+  static bool valueIsConsumedOnlyBy(mlir::Value value, mlir::Operation *op);
+  // `logicalSources`, when non-empty, is parallel to `elements` and names the
+  // SSA value each element came from; a null entry means "freshly minted
+  // temporary". An empty list means every owned element is treated as a
+  // temporary (the pre-threading behaviour).
   mlir::LogicalResult initializeSequencePayload(
       mlir::Operation *op, RuntimeBundle &container,
-      llvm::ArrayRef<std::shared_ptr<RuntimeBundle>> elements);
+      llvm::ArrayRef<std::shared_ptr<RuntimeBundle>> elements,
+      llvm::ArrayRef<mlir::Value> logicalSources = {});
   mlir::LogicalResult ensureSequencePayloadCapacity(mlir::Operation *op,
                                                     RuntimeBundle &container,
                                                     unsigned index,
@@ -480,7 +490,9 @@ private:
   mlir::LogicalResult
   initializeDictPayload(mlir::Operation *op, RuntimeBundle &container,
                         llvm::ArrayRef<std::shared_ptr<RuntimeBundle>> keys,
-                        llvm::ArrayRef<std::shared_ptr<RuntimeBundle>> values);
+                        llvm::ArrayRef<std::shared_ptr<RuntimeBundle>> values,
+                        llvm::ArrayRef<mlir::Value> logicalKeySources = {},
+                        llvm::ArrayRef<mlir::Value> logicalValueSources = {});
   mlir::LogicalResult ensureDictPayloadCapacity(mlir::Operation *op,
                                                 RuntimeBundle &container,
                                                 unsigned index);
@@ -626,9 +638,19 @@ private:
   mlir::LogicalResult generateBoxedLtHook();
   mlir::LogicalResult lowerListEvidenceNext(py::NextOp op,
                                             RuntimeBundle iterator);
+  // True when the mutation op sits in a different block than the one defining
+  // the container's physical storage (SpecialMethodOps.cpp).
+  static bool
+  mutationCrossesStorageDefiningBlock(mlir::Operation *op,
+                                      const RuntimeBundle &bundle);
   // Drops a dict's compile-time mapping evidence before a mutation emitted
   // outside the storage's defining block (SpecialMethodOps.cpp).
   bool demoteDictEvidenceForCrossBlockMutation(mlir::Operation *op,
+                                               mlir::Value containerValue);
+  // List instance of the same rule: drops a list's compile-time sequence
+  // evidence before a mutation emitted outside the storage's defining block
+  // (SpecialMethodOps.cpp).
+  bool demoteListEvidenceForCrossBlockMutation(mlir::Operation *op,
                                                mlir::Value containerValue);
   // Loop-body generator state-machine transform (GeneratorStateMachine.cpp).
   //

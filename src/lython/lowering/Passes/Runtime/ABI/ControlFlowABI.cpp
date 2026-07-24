@@ -50,6 +50,98 @@ bool sameControlFlowEvidenceIdentity(const RuntimeBundle &lhs,
          samePrimitiveI64EvidenceIdentity(lhs, rhs);
 }
 
+bool sameRuntimeValueIdentityList(llvm::ArrayRef<RuntimeValue> lhs,
+                                  llvm::ArrayRef<RuntimeValue> rhs) {
+  if (lhs.size() != rhs.size())
+    return false;
+  for (auto [l, r] : llvm::zip(lhs, rhs)) {
+    if (l.contract != r.contract || l.ownership != r.ownership ||
+        l.values.size() != r.values.size())
+      return false;
+    for (auto [lv, rv] : llvm::zip(l.values, r.values))
+      if (lv != rv)
+        return false;
+  }
+  return true;
+}
+
+bool sameBundleIdentityShallow(const std::shared_ptr<RuntimeBundle> &lhs,
+                               const std::shared_ptr<RuntimeBundle> &rhs) {
+  if (lhs == rhs)
+    return true;
+  if (!lhs || !rhs)
+    return false;
+  if (lhs->literalText != rhs->literalText)
+    return false;
+  if (lhs->primitiveI64.has_value() != rhs->primitiveI64.has_value())
+    return false;
+  if (lhs->primitiveI64 &&
+      (lhs->primitiveI64->value != rhs->primitiveI64->value ||
+       lhs->primitiveI64->valid != rhs->primitiveI64->valid))
+    return false;
+  return lhs->objectValue.contract == rhs->objectValue.contract &&
+         sameRuntimeValueIdentityList({lhs->objectValue}, {rhs->objectValue});
+}
+
+bool sameBundleIdentityList(
+    llvm::ArrayRef<std::shared_ptr<RuntimeBundle>> lhs,
+    llvm::ArrayRef<std::shared_ptr<RuntimeBundle>> rhs) {
+  if (lhs.size() != rhs.size())
+    return false;
+  for (auto [l, r] : llvm::zip(lhs, rhs))
+    if (!sameBundleIdentityShallow(l, r))
+      return false;
+  return true;
+}
+
+bool sameSequenceEvidence(const RuntimeBundle &lhs, const RuntimeBundle &rhs) {
+  return lhs.sequenceEvidenceBacked == rhs.sequenceEvidenceBacked &&
+         lhs.sequenceIndices == rhs.sequenceIndices &&
+         sameRuntimeValueIdentityList(lhs.sequenceElements,
+                                      rhs.sequenceElements) &&
+         sameBundleIdentityList(lhs.sequenceElementBundles,
+                                rhs.sequenceElementBundles);
+}
+
+bool sameMappingEvidence(const RuntimeBundle &lhs, const RuntimeBundle &rhs) {
+  return lhs.mappingEvidenceBacked == rhs.mappingEvidenceBacked &&
+         lhs.mappingKeys == rhs.mappingKeys &&
+         lhs.mappingPresent == rhs.mappingPresent &&
+         sameRuntimeValueIdentityList(lhs.mappingValues, rhs.mappingValues) &&
+         sameBundleIdentityList(lhs.mappingKeyBundles, rhs.mappingKeyBundles) &&
+         sameBundleIdentityList(lhs.mappingValueBundles,
+                                rhs.mappingValueBundles);
+}
+
+bool sameFieldEvidence(const RuntimeBundle &lhs, const RuntimeBundle &rhs) {
+  if (lhs.fieldBundles.size() != rhs.fieldBundles.size())
+    return false;
+  for (const auto &entry : lhs.fieldBundles) {
+    auto other = rhs.fieldBundles.find(entry.getKey());
+    if (other == rhs.fieldBundles.end() ||
+        !sameBundleIdentityShallow(entry.getValue(), other->getValue()))
+      return false;
+  }
+  return sameBundleIdentityShallow(lhs.boxedObject, rhs.boxedObject);
+}
+
+bool sameObjectEvidence(const RuntimeBundle &lhs, const RuntimeBundle &rhs) {
+  if (lhs.objectEvidence.slots.size() != rhs.objectEvidence.slots.size())
+    return false;
+  for (const auto &entry : lhs.objectEvidence.slots) {
+    const RuntimeValue *other = rhs.objectEvidence.slot(entry.getKey());
+    if (!other ||
+        !sameRuntimeValueIdentityList({entry.getValue()}, {*other}))
+      return false;
+  }
+  if (lhs.objectEvidence.flags.size() != rhs.objectEvidence.flags.size())
+    return false;
+  for (const auto &flag : lhs.objectEvidence.flags)
+    if (!rhs.objectEvidence.hasFlag(flag.getKey()))
+      return false;
+  return true;
+}
+
 } // namespace
 
 mlir::LogicalResult RuntimeBundleLowerer::ensureValueBundle(mlir::Operation *op,
@@ -315,8 +407,42 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerControlFlowBlockArgument(
       llvm::all_of(sourceBundles, [&](const RuntimeBundle &candidate) {
         return sameControlFlowEvidenceIdentity(sourceBundles.front(),
                                                candidate);
-      }))
-    valueBundles[argument].copyEvidenceFrom(sourceBundles.front());
+      })) {
+    RuntimeBundle &merged = valueBundles[argument];
+    merged.copyEvidenceFrom(sourceBundles.front());
+    // Same physical identity does not imply same compile-time knowledge: an
+    // arm may have recorded element/field evidence whose SSA values the other
+    // arm never defines. Keeping the first arm's version would answer that
+    // arm's contents on every path (silent mis-execution) or reference
+    // non-dominating values. The physical payload carries the shared truth,
+    // so evidence groups that disagree between the arms are dropped and later
+    // uses read through the runtime instead.
+    auto allSourcesAgree = [&](auto same) {
+      return llvm::all_of(sourceBundles, [&](const RuntimeBundle &candidate) {
+        return same(sourceBundles.front(), candidate);
+      });
+    };
+    if (!allSourcesAgree(sameSequenceEvidence)) {
+      merged.sequenceEvidenceBacked = false;
+      merged.sequenceElements.clear();
+      merged.sequenceElementBundles.clear();
+      merged.sequenceIndices.clear();
+    }
+    if (!allSourcesAgree(sameMappingEvidence)) {
+      merged.mappingEvidenceBacked = false;
+      merged.mappingKeys.clear();
+      merged.mappingKeyBundles.clear();
+      merged.mappingValues.clear();
+      merged.mappingValueBundles.clear();
+      merged.mappingPresent.clear();
+    }
+    if (!allSourcesAgree(sameFieldEvidence)) {
+      merged.fieldBundles.clear();
+      merged.boxedObject.reset();
+    }
+    if (!allSourcesAgree(sameObjectEvidence))
+      merged.objectEvidence = RuntimeObjectEvidence{};
+  }
 
   if (controlFlowLogicalBlockArgumentSet.insert(argument).second)
     controlFlowLogicalBlockArguments.push_back(

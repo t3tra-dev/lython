@@ -267,6 +267,24 @@ mlir::FailureOr<mlir::Value> RuntimeBundleLowerer::rawSequenceIndexValue(
          << " has no statically unboxable integer value";
 }
 
+// True when `op` mutates a container whose physical storage was defined in a
+// DIFFERENT block. Evidence recorded at such a mutation names SSA values that
+// join-dominated uses cannot reference, and a merge keeps only one
+// predecessor's version — so the evidence tier is unusable there.
+bool RuntimeBundleLowerer::mutationCrossesStorageDefiningBlock(
+    mlir::Operation *op, const RuntimeBundle &bundle) {
+  if (bundle.physicalValues().empty())
+    return false;
+  mlir::Value anchor = bundle.physicalValues().front();
+  mlir::Block *defBlock = nullptr;
+  if (auto argument = mlir::dyn_cast<mlir::BlockArgument>(anchor))
+    defBlock = argument.getOwner();
+  else if (mlir::Operation *defOp = anchor.getDefiningOp())
+    defBlock = defOp->getBlock();
+  // Same block: appended evidence dominates every later same-function use.
+  return defBlock && defBlock != op->getBlock();
+}
+
 // Compile-time dict evidence may only be extended in the block that defines
 // the dict's storage: an evidence update inside a branch would record
 // payload SSA values that later (join-dominated) uses cannot reference.
@@ -284,16 +302,8 @@ bool RuntimeBundleLowerer::demoteDictEvidenceForCrossBlockMutation(
       bundle->physicalValues().size() < 5 ||
       (!bundle->mappingEvidenceBacked && bundle->mappingKeys.empty()))
     return false;
-  mlir::Value anchor = bundle->physicalValues().front();
-  mlir::Block *defBlock = nullptr;
-  if (auto argument = mlir::dyn_cast<mlir::BlockArgument>(anchor))
-    defBlock = argument.getOwner();
-  else if (mlir::Operation *defOp = anchor.getDefiningOp())
-    defBlock = defOp->getBlock();
-  if (!defBlock || defBlock == op->getBlock()) {
-    // Same block: appended evidence dominates every later same-function use.
+  if (!RuntimeBundleLowerer::mutationCrossesStorageDefiningBlock(op, *bundle))
     return false;
-  }
   bundle->mappingEvidenceBacked = false;
   bundle->mappingKeys.clear();
   bundle->mappingKeyBundles.clear();
@@ -303,8 +313,49 @@ bool RuntimeBundleLowerer::demoteDictEvidenceForCrossBlockMutation(
   return true;
 }
 
+// List instance of the dict rule above. The demotion is mirrored into the
+// field-alias owner's fieldBundles entry (when the list is a field view) by
+// direct map update, NOT through writeBackFieldAlias: the writeback re-roots
+// the owner's owned-local marker at this op, and a root created inside the
+// branch would itself be the non-dominating value this demotion removes.
+bool RuntimeBundleLowerer::demoteListEvidenceForCrossBlockMutation(
+    mlir::Operation *op, mlir::Value containerValue) {
+  RuntimeBundle *bundle = nullptr;
+  if (auto found = valueBundles.find(containerValue);
+      found != valueBundles.end())
+    bundle = &found->second;
+  if (!bundle || bundle->kind != RuntimeBundle::Kind::Object ||
+      bundle->contractName() != "builtins.list" ||
+      bundle->physicalValues().size() < 3 ||
+      (!bundle->sequenceEvidenceBacked && bundle->sequenceElements.empty()))
+    return false;
+  if (!RuntimeBundleLowerer::mutationCrossesStorageDefiningBlock(op, *bundle))
+    return false;
+  bundle->sequenceEvidenceBacked = false;
+  bundle->sequenceElements.clear();
+  bundle->sequenceElementBundles.clear();
+  bundle->sequenceIndices.clear();
+  if (bundle->fieldAliasOwner && !bundle->fieldAliasName.empty()) {
+    if (auto owner = valueBundles.find(bundle->fieldAliasOwner);
+        owner != valueBundles.end()) {
+      auto entry = owner->second.fieldBundles.find(bundle->fieldAliasName);
+      if (entry != owner->second.fieldBundles.end() && entry->second) {
+        auto demoted = std::make_shared<RuntimeBundle>(*entry->second);
+        demoted->sequenceEvidenceBacked = false;
+        demoted->sequenceElements.clear();
+        demoted->sequenceElementBundles.clear();
+        demoted->sequenceIndices.clear();
+        entry->second = std::move(demoted);
+      }
+    }
+  }
+  return true;
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
   RuntimeBundleLowerer::demoteDictEvidenceForCrossBlockMutation(
+      op.getOperation(), op.getContainer());
+  RuntimeBundleLowerer::demoteListEvidenceForCrossBlockMutation(
       op.getOperation(), op.getContainer());
   llvm::SmallVector<mlir::Value, 3> inputs{op.getContainer(), op.getIndex(),
                                            op.getValue()};
@@ -717,6 +768,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
 
 mlir::LogicalResult RuntimeBundleLowerer::lowerDelItem(py::DelItemOp op) {
   RuntimeBundleLowerer::demoteDictEvidenceForCrossBlockMutation(
+      op.getOperation(), op.getContainer());
+  RuntimeBundleLowerer::demoteListEvidenceForCrossBlockMutation(
       op.getOperation(), op.getContainer());
   llvm::SmallVector<mlir::Value, 2> inputs{op.getContainer(), op.getIndex()};
   llvm::SmallVector<const RuntimeBundle *, 2> sources;
