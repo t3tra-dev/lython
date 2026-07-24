@@ -131,6 +131,10 @@ private:
   mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>>
   classFieldStorageValueTypes(mlir::Operation *op, mlir::Type fieldContract,
                               llvm::StringRef purpose) const;
+  mlir::FailureOr<RuntimeBundle>
+  storeBoxedFieldPayloadInPlace(mlir::Operation *op, mlir::Value box,
+                                const RuntimeBundle &value,
+                                llvm::StringRef slotName);
   // R6 nonlocal cells: emitter-synthesized one-field classes whose field
   // slot is a box16 written IN PLACE (never spliced into new SSA lanes), so
   // every frame sharing the cell instance observes one mutable slot.

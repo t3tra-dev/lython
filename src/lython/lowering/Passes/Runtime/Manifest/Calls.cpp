@@ -527,6 +527,38 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
                << fieldTypes[index];
       bool boxedField =
           RuntimeBundleLowerer::classFieldStoredBoxed(fieldTypes[index]);
+      // Concrete box-fronted fields (str/dict) fill the box16 the instance
+      // materialization already allocated instead of boxing into a fresh
+      // slot: the box pointer is the instance-lifetime stable handle that
+      // dict/set key boxes and runtime-method snapshots borrow, so it must
+      // never be re-rooted after construction.
+      if (boxedField &&
+          runtimeShapeContractName(fieldTypes[index]) != "builtins.object") {
+        std::string slotName = "class.field";
+        if (fieldNames && index < fieldNames.size()) {
+          auto name = mlir::dyn_cast<mlir::StringAttr>(fieldNames[index]);
+          if (!name)
+            return op.emitError() << "class field metadata is malformed for "
+                                  << classOp.getSymName();
+          slotName = (llvm::Twine("class.") + name.getValue()).str();
+        }
+        mlir::FailureOr<unsigned> offset =
+            RuntimeBundleLowerer::classFieldValueOffset(op, classOp, index,
+                                                        "class field ABI");
+        if (mlir::failed(offset))
+          return mlir::failure();
+        if (*offset >= values.size())
+          return op.emitError() << "class field ABI exceeds object payload";
+        builder.setInsertionPoint(op);
+        mlir::FailureOr<RuntimeBundle> stored =
+            RuntimeBundleLowerer::storeBoxedFieldPayloadInPlace(
+                op, values[*offset], *fieldValue, slotName);
+        if (mlir::failed(stored))
+          return mlir::failure();
+        updatedFieldBundles[index] =
+            std::make_shared<RuntimeBundle>(std::move(*stored));
+        continue;
+      }
       mlir::Type slotStorageType =
           boxedField ? runtimeContractType(context, "builtins.object")
                      : fieldTypes[index];
