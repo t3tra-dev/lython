@@ -9446,6 +9446,19 @@ module attributes {
     func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi32>
   }
 
+  // `sub in s` is find() != -1 over the whole string (CPython's
+  // unicode_contains), reduced to the i1 the __contains__ dispatch expects
+  // instead of boxing an index nobody reads.
+  func.func @LyUnicode_Contains(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %sub_header: memref<2xi64> {ly.ownership.object_header}, %sub_bytes: memref<?xi8>) -> i1 attributes {ly.runtime.contract = "builtins.str", ly.runtime.method = "__contains__"} {
+    %false_bit = arith.constant false
+    %start = arith.constant 0 : i64
+    %end = arith.constant 9223372036854775807 : i64
+    %zero = arith.constant 0 : i64
+    %found = func.call @__ly_unicode_find_method(%header, %bytes, %sub_header, %sub_bytes, %start, %end, %false_bit) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>, i64, i64, i1) -> i64
+    %present = arith.cmpi sge, %found, %zero : i64
+    func.return %present : i1
+  }
+
   func.func @LyUnicode_RFind(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %sub_header: memref<2xi64> {ly.ownership.object_header}, %sub_bytes: memref<?xi8>, %start_raw: i64 {ly.runtime.default_i64 = 0 : i64}, %end_raw: i64 {ly.runtime.default_i64 = 9223372036854775807 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "rfind", ly.runtime.result_contract = "builtins.int"} {
     %true_bit = arith.constant true
     %found = func.call @__ly_unicode_find_method(%header, %bytes, %sub_header, %sub_bytes, %start_raw, %end_raw, %true_bit) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>, i64, i64, i1) -> i64
