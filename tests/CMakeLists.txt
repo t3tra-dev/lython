@@ -64,6 +64,13 @@ gtest_discover_tests(lython_unit_tests
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 set(LYTHON_GOLDEN_RUNNER "${CMAKE_CURRENT_SOURCE_DIR}/golden/run_case.py")
 
+# Cases whose compile time sits close enough to the default budget that a
+# loaded `ctest -j8` run flips them to TIMEOUT. Why not raise the default for
+# every case: the 300s budget is what turns a genuine compiler hang into a
+# failure instead of a stalled CI job, and it should keep doing that for the
+# ~370 cases that finish in seconds.
+set(LYTHON_GOLDEN_SLOW_CASES stdlib_string_template)
+
 file(GLOB LYTHON_GOLDEN_CASES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/golden/cases/*.py")
 foreach(case_path IN LISTS LYTHON_GOLDEN_CASES)
@@ -71,7 +78,11 @@ foreach(case_path IN LISTS LYTHON_GOLDEN_CASES)
     add_test(NAME "golden.cases.${case_name}"
         COMMAND Python3::Interpreter "${LYTHON_GOLDEN_RUNNER}"
             --lyc $<TARGET_FILE:lyc> "${case_path}")
-    set_tests_properties("golden.cases.${case_name}" PROPERTIES TIMEOUT 300)
+    if(case_name IN_LIST LYTHON_GOLDEN_SLOW_CASES)
+        set_tests_properties("golden.cases.${case_name}" PROPERTIES TIMEOUT 900)
+    else()
+        set_tests_properties("golden.cases.${case_name}" PROPERTIES TIMEOUT 300)
+    endif()
 endforeach()
 
 file(GLOB LYTHON_GOLDEN_ERRORS CONFIGURE_DEPENDS
