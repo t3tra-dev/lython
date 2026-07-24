@@ -51,3 +51,43 @@ local_scope("fo", "od")
 print(["pear", "apple", "zebra"])
 print(max(["pear", "apple", "zebra"]))
 print({"x": "one", "y": "two"})
+
+
+# A freshly constructed class instance stored as a dict VALUE reads back
+# intact. Construction is `py.new` feeding `py.init`, so the instance has a
+# second user besides the literal -- taking its token at the literal left the
+# object with no claim at all and every field read after the lookup answered
+# zero, with no diagnostic.
+class P:
+    def __init__(self, v: int) -> None:
+        self.v = v
+
+
+class Named:
+    def __init__(self, n: str, v: int) -> None:
+        self.n = n
+        self.v = v
+
+
+pairs = {"x": P(9)}
+q = pairs["x"]
+print(q.v)
+
+multi = {"a": P(1), "b": P(2), "c": P(3)}
+print(multi["a"].v, multi["b"].v, multi["c"].v)
+
+named = {"k": Named("hello", 42)}
+r = named["k"]
+print(r.n, r.v)
+
+# The same instance through the incremental (runtime-probe) dict path.
+built: dict[str, P] = {}
+built["z"] = P(77)
+print(built["z"].v)
+
+# ... and through a list, and through a named local that outlives the dict.
+print([P(9)][0].v)
+kept = P(5)
+holder = {"p": kept}
+print(holder["p"].v)
+print(kept.v)
