@@ -1604,28 +1604,39 @@ void ModuleEmitter::collectClassFields(
     for (const parser::NodePtr &method : *body) {
       if (!method || ast::nameSpelling(*method) != "__init__")
         continue;
+      // Names in scope for a field's declared type: the parameters, plus
+      // locals bound earlier in the body. Without the locals a
+      // `tmp = <expr>` / `self.f = tmp` pair (how CPython's own
+      // JSONDecodeError computes lineno/colno) leaves the field untyped.
       llvm::StringMap<mlir::Type> initArgTypes;
       collectInitArgTypes(*method, initArgTypes);
+      llvm::StringMap<mlir::Type> scopeTypes = initArgTypes;
+      auto valueTypeOf = [&](const parser::Node *value) -> mlir::Type {
+        if (value && value->kind == "Name") {
+          auto found = scopeTypes.find(ast::nameSpelling(*value));
+          return found != scopeTypes.end() ? found->second : mlir::Type();
+        }
+        return types.inferExpr(value);
+      };
       if (const auto *stmts = ast::nodeList(*method, "body")) {
         for (const parser::NodePtr &stmt : *stmts) {
           if (!stmt)
             continue;
           if (stmt->kind == "AnnAssign") {
-            collectTarget(*ast::node(*stmt, "target"),
-                          types.annotationType(ast::node(*stmt, "annotation")));
+            const parser::Node *target = ast::node(*stmt, "target");
+            mlir::Type declared =
+                types.annotationType(ast::node(*stmt, "annotation"));
+            if (target && target->kind == "Name")
+              scopeTypes[ast::nameSpelling(*target)] = declared;
+            collectTarget(*target, declared);
           } else if (stmt->kind == "Assign") {
-            const parser::Node *value = ast::node(*stmt, "value");
-            mlir::Type valueType;
-            if (value && value->kind == "Name") {
-              auto found = initArgTypes.find(ast::nameSpelling(*value));
-              if (found != initArgTypes.end())
-                valueType = found->second;
-            } else {
-              valueType = types.inferExpr(value);
-            }
+            mlir::Type valueType = valueTypeOf(ast::node(*stmt, "value"));
             if (const auto *targets = ast::nodeList(*stmt, "targets"))
-              for (const parser::NodePtr &target : *targets)
+              for (const parser::NodePtr &target : *targets) {
+                if (target && target->kind == "Name" && valueType)
+                  scopeTypes[ast::nameSpelling(*target)] = valueType;
                 collectTarget(*target, valueType);
+              }
           }
         }
       }

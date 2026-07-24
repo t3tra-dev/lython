@@ -7,5 +7,9 @@ first
 2
 second
 6
+Expecting value: line 2 column 3 (char 4)
+4
+2
+3
 Expecting value
 ok

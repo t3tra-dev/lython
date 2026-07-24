@@ -43,6 +43,32 @@ except DecodeError as err:
     print(len(err.msg))
 
 
+
+# A field's declared type also resolves through a local bound earlier in
+# __init__ -- how CPython's own JSONDecodeError computes lineno/colno.
+class PositionError(ValueError):
+    def __init__(self, msg: str, doc: str, pos: int) -> None:
+        lineno = doc.count("\n", 0, pos) + 1
+        colno = pos - doc.rfind("\n", 0, pos)
+        self.msg = msg
+        self.doc = doc
+        self.pos = pos
+        self.lineno = lineno
+        self.colno = colno
+        super().__init__(
+            "%s: line %d column %d (char %d)" % (msg, lineno, colno, pos)
+        )
+
+
+try:
+    raise PositionError("Expecting value", "{\n  bad}", 4)
+except PositionError as pe:
+    print(str(pe))
+    print(pe.pos)
+    print(pe.lineno)
+    print(pe.colno)
+
+
 # Field reads escaping their owner keep the payload alive.
 def message_of(text: str) -> str:
     try:
