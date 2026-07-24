@@ -457,9 +457,19 @@ private:
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>>
   objectPayloadHandleWords(mlir::Operation *op, const RuntimeBundle &value,
                            bool ownsPayload = true);
+  // True when `op` is the ONLY user of `value` — i.e. the value is a
+  // temporary this op consumes, not a binding that outlives it. Container
+  // literals use it to decide whether storing an element may take over the
+  // source's reference (CollectionPayload.cpp).
+  static bool valueIsConsumedOnlyBy(mlir::Value value, mlir::Operation *op);
+  // `logicalSources`, when non-empty, is parallel to `elements` and names the
+  // SSA value each element came from; a null entry means "freshly minted
+  // temporary". An empty list means every owned element is treated as a
+  // temporary (the pre-threading behaviour).
   mlir::LogicalResult initializeSequencePayload(
       mlir::Operation *op, RuntimeBundle &container,
-      llvm::ArrayRef<std::shared_ptr<RuntimeBundle>> elements);
+      llvm::ArrayRef<std::shared_ptr<RuntimeBundle>> elements,
+      llvm::ArrayRef<mlir::Value> logicalSources = {});
   mlir::LogicalResult ensureSequencePayloadCapacity(mlir::Operation *op,
                                                     RuntimeBundle &container,
                                                     unsigned index,
@@ -480,7 +490,9 @@ private:
   mlir::LogicalResult
   initializeDictPayload(mlir::Operation *op, RuntimeBundle &container,
                         llvm::ArrayRef<std::shared_ptr<RuntimeBundle>> keys,
-                        llvm::ArrayRef<std::shared_ptr<RuntimeBundle>> values);
+                        llvm::ArrayRef<std::shared_ptr<RuntimeBundle>> values,
+                        llvm::ArrayRef<mlir::Value> logicalKeySources = {},
+                        llvm::ArrayRef<mlir::Value> logicalValueSources = {});
   mlir::LogicalResult ensureDictPayloadCapacity(mlir::Operation *op,
                                                 RuntimeBundle &container,
                                                 unsigned index);

@@ -92,6 +92,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPack(py::PackOp op) {
   llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 8> dictKeyBundles;
   llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 8> dictValueBundles;
   llvm::SmallVector<std::string, 8> keys;
+  // The SSA value each key/value entry came from, parallel to
+  // dictKeyBundles/dictValueBundles. Null marks an entry the lowering minted
+  // itself (a materialized static key), which has no other user by
+  // construction.
+  llvm::SmallVector<mlir::Value, 8> logicalKeySources;
+  llvm::SmallVector<mlir::Value, 8> logicalValueSources;
   mlir::ValueRange values = op.getValues();
   if (contractName != "builtins.dict") {
     elements.reserve(values.size());
@@ -145,11 +151,13 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPack(py::PackOp op) {
         materializedKey.literalText = *key;
         dictKeyBundles.push_back(
             std::make_shared<RuntimeBundle>(std::move(materializedKey)));
+        logicalKeySources.push_back(mlir::Value{});
       } else {
         if (!keyBundle || keyBundle->kind != RuntimeBundle::Kind::Object)
           return op.emitError()
                  << "dict literal key has no lowered object bundle";
         dictKeyBundles.push_back(std::make_shared<RuntimeBundle>(*keyBundle));
+        logicalKeySources.push_back(values[index]);
       }
       if (!key)
         allStaticStringKeys = false;
@@ -160,6 +168,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPack(py::PackOp op) {
         return op.emitError()
                << "dict literal value has no lowered object bundle";
       dictValueBundles.push_back(std::make_shared<RuntimeBundle>(*valueBundle));
+      logicalValueSources.push_back(values[index + 1]);
       if (key) {
         keys.push_back(*key);
         elements.push_back(valueBundle->objectValue);
@@ -259,9 +268,11 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPack(py::PackOp op) {
   if (contractName != "builtins.dict")
     bundle.sequenceElementBundles.append(elementBundles.begin(),
                                          elementBundles.end());
+  llvm::SmallVector<mlir::Value, 8> logicalElementSources(values.begin(),
+                                                          values.end());
   if (contractName != "builtins.dict" &&
       mlir::failed(RuntimeBundleLowerer::initializeSequencePayload(
-          op, bundle, bundle.sequenceElementBundles)))
+          op, bundle, bundle.sequenceElementBundles, logicalElementSources)))
     return mlir::failure();
   if (contractName == "builtins.dict") {
     bundle.mappingKeyBundles.append(dictKeyBundles.begin(),
@@ -270,7 +281,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPack(py::PackOp op) {
                                       dictValueBundles.end());
     if (!dictKeyBundles.empty() &&
         mlir::failed(RuntimeBundleLowerer::initializeDictPayload(
-            op, bundle, dictKeyBundles, dictValueBundles)))
+            op, bundle, dictKeyBundles, dictValueBundles, logicalKeySources,
+            logicalValueSources)))
       return mlir::failure();
   }
   valueBundles[op.getResult()] = std::move(bundle);

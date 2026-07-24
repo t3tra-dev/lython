@@ -400,9 +400,20 @@ mlir::LogicalResult RuntimeBundleLowerer::ensureDictPayloadCapacity(
   return mlir::success();
 }
 
+bool RuntimeBundleLowerer::valueIsConsumedOnlyBy(mlir::Value value,
+                                                 mlir::Operation *op) {
+  if (!value || !op)
+    return false;
+  for (mlir::OpOperand &use : value.getUses())
+    if (use.getOwner() != op)
+      return false;
+  return true;
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::initializeSequencePayload(
     mlir::Operation *op, RuntimeBundle &container,
-    llvm::ArrayRef<std::shared_ptr<RuntimeBundle>> elements) {
+    llvm::ArrayRef<std::shared_ptr<RuntimeBundle>> elements,
+    llvm::ArrayRef<mlir::Value> logicalSources) {
   if (!isSequenceCollection(container.contractName()))
     return mlir::success();
   if (container.physicalValues().size() < 3)
@@ -411,10 +422,22 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeSequencePayload(
   container.sequenceCapacity =
       RuntimeBundleLowerer::collectionInitialCapacity(elements.size());
   container.sequenceEvidenceBacked = true;
-  // One value can fill several slots (`(j, j)`): every slot retains its own
-  // claim, but the source binding hands over only the ONE token it holds —
-  // releasing it once per slot underflows the box when the container dies.
-  llvm::SmallPtrSet<void *, 4> releasedSources;
+  // Every slot retains its own claim. Whether the SOURCE's claim also moves
+  // into the container depends on what the source is:
+  //
+  //   - a temporary this literal is the only user of (`["a", "b"]`) hands its
+  //     token over, or nothing would ever release it (the exception path out
+  //     of a later call would leak it — the affine-ownership verifier's
+  //     "still owned when ... unwinds" rule);
+  //   - a value that outlives the literal (`t = (s,)`, where `s` is read
+  //     again) keeps its claim. Taking it used to leave the binding with no
+  //     reference at all, so `s` dangled the moment the container died and
+  //     the next read silently printed the empty string. The refcount pass
+  //     places that release at the source's real last use instead.
+  //
+  // One value can fill several slots (`(j, j)`): every slot retains, but the
+  // source hands over the ONE token it holds, so the move is deduped.
+  llvm::SmallPtrSet<void *, 4> movedSources;
   for (auto [index, element] : llvm::enumerate(elements)) {
     if (!element)
       continue;
@@ -428,23 +451,27 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeSequencePayload(
     if (mlir::failed(RuntimeBundleLowerer::storeSequencePayloadElement(
             op, container, static_cast<unsigned>(index), *payload)))
       return mlir::failure();
-    // Key on the ELEMENT's physical identity, not the materialized
-    // payload's: materialization may mint a fresh per-slot box view, and two
-    // slots of one source must still dedupe.
-    bool firstSourceOccurrence = true;
-    mlir::ValueRange sourceValues = element->physicalValues().empty()
-                                        ? payload->physicalValues()
-                                        : element->physicalValues();
-    if (!sourceValues.empty())
-      firstSourceOccurrence =
-          releasedSources
-              .insert(sourceValues.front().getAsOpaquePointer())
-              .second;
-    if (firstSourceOccurrence &&
-        payload->objectValue.ownership == ownership::OwnershipKind::Own &&
-        mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
-            op, *payload, "sequence.literal.source")))
-      return mlir::failure();
+    mlir::Value logicalSource =
+        index < logicalSources.size() ? logicalSources[index] : mlir::Value{};
+    bool sourceIsTemporary =
+        logicalSources.empty() || !logicalSource ||
+        RuntimeBundleLowerer::valueIsConsumedOnlyBy(logicalSource, op);
+    if (sourceIsTemporary &&
+        payload->objectValue.ownership == ownership::OwnershipKind::Own) {
+      // Key on the ELEMENT's physical identity, not the materialized
+      // payload's: materialization may mint a fresh per-slot box view, and
+      // two slots of one source must still dedupe.
+      mlir::ValueRange sourceValues = element->physicalValues().empty()
+                                          ? payload->physicalValues()
+                                          : element->physicalValues();
+      bool firstOccurrence =
+          sourceValues.empty() ||
+          movedSources.insert(sourceValues.front().getAsOpaquePointer()).second;
+      if (firstOccurrence &&
+          mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
+              op, *payload, "sequence.literal.source")))
+        return mlir::failure();
+    }
     RuntimeBundle stored = payload->withObjectOwnership(
         ownership::logicalOwnershipKind(payload->objectValue.contract,
                                         /*ownsObject=*/false));
@@ -510,7 +537,9 @@ mlir::LogicalResult RuntimeBundleLowerer::clearSequencePayloadElement(
 mlir::LogicalResult RuntimeBundleLowerer::initializeDictPayload(
     mlir::Operation *op, RuntimeBundle &container,
     llvm::ArrayRef<std::shared_ptr<RuntimeBundle>> keys,
-    llvm::ArrayRef<std::shared_ptr<RuntimeBundle>> values) {
+    llvm::ArrayRef<std::shared_ptr<RuntimeBundle>> values,
+    llvm::ArrayRef<mlir::Value> logicalKeySources,
+    llvm::ArrayRef<mlir::Value> logicalValueSources) {
   if (container.contractName() != "builtins.dict")
     return mlir::success();
   if (keys.size() != values.size())
@@ -542,13 +571,26 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeDictPayload(
     if (mlir::failed(RuntimeBundleLowerer::storeDictValuePayload(
             op, container, static_cast<unsigned>(index), *payloadValue)))
       return mlir::failure();
-    if (payloadKey->objectValue.ownership == ownership::OwnershipKind::Own &&
-        mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
-            op, *payloadKey, "dict.literal.key.source")))
+    // Same temporary-only move rule as initializeSequencePayload: a literal
+    // may take over a temporary's token, but `d = {"k": s}` must leave the
+    // local `s` its claim or `s` dangles once the dict dies.
+    auto moveSourceIfTemporary =
+        [&](const RuntimeBundle &payload, llvm::ArrayRef<mlir::Value> sources,
+            llvm::StringRef slot) -> mlir::LogicalResult {
+      if (payload.objectValue.ownership != ownership::OwnershipKind::Own)
+        return mlir::success();
+      mlir::Value logicalSource =
+          index < sources.size() ? sources[index] : mlir::Value{};
+      if (!sources.empty() && logicalSource &&
+          !RuntimeBundleLowerer::valueIsConsumedOnlyBy(logicalSource, op))
+        return mlir::success();
+      return RuntimeBundleLowerer::releaseAggregateSlot(op, payload, slot);
+    };
+    if (mlir::failed(moveSourceIfTemporary(*payloadKey, logicalKeySources,
+                                           "dict.literal.key.source")))
       return mlir::failure();
-    if (payloadValue->objectValue.ownership == ownership::OwnershipKind::Own &&
-        mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
-            op, *payloadValue, "dict.literal.value.source")))
+    if (mlir::failed(moveSourceIfTemporary(*payloadValue, logicalValueSources,
+                                           "dict.literal.value.source")))
       return mlir::failure();
     RuntimeBundle storedKey = payloadKey->withObjectOwnership(
         ownership::logicalOwnershipKind(payloadKey->objectValue.contract,
