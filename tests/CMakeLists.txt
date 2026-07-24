@@ -75,14 +75,21 @@ file(GLOB LYTHON_GOLDEN_CASES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/golden/cases/*.py")
 foreach(case_path IN LISTS LYTHON_GOLDEN_CASES)
     get_filename_component(case_name "${case_path}" NAME_WE)
+    if(case_name IN_LIST LYTHON_GOLDEN_SLOW_CASES)
+        set(case_timeout 900)
+    else()
+        set(case_timeout 300)
+    endif()
+    # The runner bounds lyc itself and the ctest property is the outer
+    # backstop, so both budgets move together or the inner one silently wins.
+    # The outer one gets slack: it also covers interpreter startup, and a
+    # runner-reported timeout names the case where ctest's only says "Timeout".
+    math(EXPR case_outer_timeout "${case_timeout} + 60")
     add_test(NAME "golden.cases.${case_name}"
         COMMAND Python3::Interpreter "${LYTHON_GOLDEN_RUNNER}"
-            --lyc $<TARGET_FILE:lyc> "${case_path}")
-    if(case_name IN_LIST LYTHON_GOLDEN_SLOW_CASES)
-        set_tests_properties("golden.cases.${case_name}" PROPERTIES TIMEOUT 900)
-    else()
-        set_tests_properties("golden.cases.${case_name}" PROPERTIES TIMEOUT 300)
-    endif()
+            --lyc $<TARGET_FILE:lyc> --timeout ${case_timeout} "${case_path}")
+    set_tests_properties("golden.cases.${case_name}"
+        PROPERTIES TIMEOUT ${case_outer_timeout})
 endforeach()
 
 file(GLOB LYTHON_GOLDEN_ERRORS CONFIGURE_DEPENDS

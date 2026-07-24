@@ -8,6 +8,9 @@ Runs `lyc jit <case.py>` and verifies against sidecar files next to the case:
 --exit-only N skips sidecar lookup and only checks the exit code; ctest uses
 it to smoke-run examples/ without adding expectation files there.
 
+--timeout S bounds the lyc run; exceeding it is reported as its own failure
+reason rather than as differing output.
+
 A signal death is reported as a negative exit code and never satisfies an
 expected exit code, so "must fail with exit 1" cannot be faked by a crash.
 """
@@ -32,15 +35,33 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--lyc", required=True, type=pathlib.Path)
     parser.add_argument("--exit-only", type=int, default=None)
+    parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("case", type=pathlib.Path)
     args = parser.parse_args()
 
-    result = subprocess.run(
-        [str(args.lyc), "jit", str(args.case)],
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
+    # Why not let TimeoutExpired propagate: an uncaught traceback exits
+    # nonzero, so ctest labels the run "Failed" exactly like a wrong-output
+    # case and the report gives no hint that the budget was the cause.
+    try:
+        result = subprocess.run(
+            [str(args.lyc), "jit", str(args.case)],
+            capture_output=True,
+            text=True,
+            timeout=args.timeout,
+        )
+    except subprocess.TimeoutExpired as expired:
+        def text(stream: "bytes | str | None") -> str:
+            if stream is None:
+                return ""
+            if isinstance(stream, bytes):
+                return stream.decode(errors="replace")
+            return stream
+
+        return fail(
+            f"lyc did not finish within {args.timeout:g}s",
+            text(expired.stdout),
+            text(expired.stderr),
+        )
 
     if args.exit_only is not None:
         if result.returncode != args.exit_only:
