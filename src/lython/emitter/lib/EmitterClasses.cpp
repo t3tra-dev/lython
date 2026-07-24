@@ -914,17 +914,9 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
   }
 
   // Exception-backed classes use the runtime exception object (header with
-  // this class's id + message); it has no field storage, so declared
-  // instance fields are rejected rather than silently dropped.
-  if (isExceptionBackedClass(contractName) && !fieldNames.empty()) {
-    diagnostics.push_back(parser::Diagnostic{
-        parser::Severity::Error, classDef.range.start,
-        "user exception class '" + classSymbol +
-            "' cannot declare instance fields yet (field '" +
-            fieldNames.front() + "'); use the exception message instead"});
-    return;
-  }
-
+  // this class's id + message), so their fields get NO object lanes: the
+  // lowering stores them in the extended header's field block, indexed by the
+  // same field order registered here.
   llvm::StringMap<mlir::Type> &registeredFields =
       classFieldBindings[contractName];
   registeredFields.clear();

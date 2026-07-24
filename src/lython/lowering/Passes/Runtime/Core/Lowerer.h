@@ -143,6 +143,22 @@ private:
                                        const RuntimeBundle &object,
                                        py::ClassOp classOp,
                                        unsigned fieldIndex);
+  // R2 user exception fields: an exception-backed class has NO field lanes
+  // (its ABI is the taxonomy's 3-word header + message), so its declared
+  // fields live in a [count, count x box16] block hung off extended header
+  // word 4 — reached only through the BaseException payload primitives.
+  mlir::FailureOr<mlir::Value>
+  exceptionFieldBlockWord(mlir::Operation *op, const RuntimeBundle &object,
+                          py::ClassOp classOp);
+  mlir::LogicalResult lowerExceptionFieldAttrGet(py::AttrGetOp op,
+                                                 const RuntimeBundle &object,
+                                                 py::ClassOp classOp,
+                                                 unsigned fieldIndex);
+  mlir::LogicalResult lowerExceptionFieldAttrSet(py::AttrSetOp op,
+                                                 const RuntimeBundle &object,
+                                                 const RuntimeBundle &value,
+                                                 py::ClassOp classOp,
+                                                 unsigned fieldIndex);
   mlir::LogicalResult lowerCellAttrSet(py::AttrSetOp op,
                                        const RuntimeBundle &object,
                                        const RuntimeBundle &value,
