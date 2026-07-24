@@ -1890,6 +1890,31 @@ Value ModuleEmitter::emitInlineMethodBody(
     const llvm::StringMap<Value> &keywords) {
   if (!method.method)
     return emitNone(anchor);
+  // A method body reached from inside its own inlining (directly, or around a
+  // cycle like a() -> self.b() -> self.a()) would expand without end: reject
+  // at this boundary instead of recursing until the emitter's own stack
+  // overflows. The check is on the body node, so the same method inlined
+  // twice side by side is unaffected.
+  if (llvm::is_contained(methodsBeingInlined, method.method)) {
+    std::string cycle;
+    bool inCycle = false;
+    for (const parser::Node *active : methodsBeingInlined) {
+      if (active == method.method)
+        inCycle = true;
+      if (!inCycle)
+        continue;
+      if (auto activeName = ast::string(*active, "name"))
+        cycle += std::string(*activeName) + " -> ";
+    }
+    if (auto selfName = ast::string(*method.method, "name"))
+      cycle += std::string(*selfName);
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, anchor.range.start,
+        "recursive class method call is not supported (" + cycle +
+            "): class method bodies are inlined at their call sites, so a "
+            "call cycle has no base case to stop the expansion"});
+    return emitNone(anchor);
+  }
   const FunctionSignature &sig =
       method.bodySignature.callable ? method.bodySignature : method.signature;
   const auto *body = ast::nodeList(*method.method, "body");
@@ -2065,7 +2090,9 @@ Value ModuleEmitter::emitInlineMethodBody(
   if (pushedSuperContext)
     superContexts.push_back(
         SuperContext{method.definingClass, sig.positionalNames.front()});
+  methodsBeingInlined.push_back(method.method);
   emitStatements(body);
+  methodsBeingInlined.pop_back();
   if (pushedSuperContext)
     superContexts.pop_back();
   inlineReturnContexts.pop_back();

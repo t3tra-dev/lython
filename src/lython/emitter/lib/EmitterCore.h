@@ -656,6 +656,11 @@ private:
     std::string selfName;
   };
   llvm::SmallVector<SuperContext, 4> superContexts;
+  // Method bodies currently being inlined, innermost last. Inlining emits
+  // BOTH arms of every branch, so a cycle in the inline graph has no base
+  // case and expands forever: re-entering a body already on this stack is
+  // always unbounded, never a recursion that would have terminated.
+  llvm::SmallVector<const parser::Node *, 8> methodsBeingInlined;
 };
 
 } // namespace lython::emitter
