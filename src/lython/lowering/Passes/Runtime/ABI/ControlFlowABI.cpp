@@ -169,14 +169,23 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerControlFlowBlockArgument(
   llvm::SmallVector<RuntimeBundle, 4> sourceBundles;
 
   auto appendPhysicalBranchOperands =
-      [&](mlir::Operation *anchor, mlir::Value logicalSource,
+      [&](mlir::Block *predecessor, mlir::Value logicalSource,
           llvm::SmallVectorImpl<mlir::Value> &destOperands)
       -> mlir::LogicalResult {
     mlir::OpBuilder::InsertionGuard guard(builder);
-    builder.setInsertionPoint(anchor);
-    if (mlir::failed(
-            RuntimeBundleLowerer::ensureValueBundle(anchor, logicalSource)))
+    // The anchor is re-fetched from the predecessor around the bundle
+    // computation instead of held across it: computing a branch operand's
+    // bundle can re-enter this routine (the operand may itself be an
+    // unlowered block argument whose own predecessor set contains THIS
+    // block), and that re-entry replaces this terminator. A handle taken
+    // before the call — and an insertion point pointing at it — would be
+    // freed memory afterwards.
+    builder.setInsertionPoint(predecessor->getTerminator());
+    if (mlir::failed(RuntimeBundleLowerer::ensureValueBundle(
+            predecessor->getTerminator(), logicalSource)))
       return mlir::failure();
+    mlir::Operation *anchor = predecessor->getTerminator();
+    builder.setInsertionPoint(anchor);
     const RuntimeBundle *source =
         RuntimeBundleLowerer::bundleFor(logicalSource);
     if (!source)
@@ -220,34 +229,64 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerControlFlowBlockArgument(
     return mlir::success();
   };
 
-  auto rewriteBranchOperands =
-      [&](mlir::Operation *terminator, mlir::Block *dest,
+  // The physical operands of every edge into `block` are computed BEFORE any
+  // terminator is rebuilt, because the computation can rebuild terminators
+  // itself (see appendPhysicalBranchOperands). Only afterwards is each
+  // predecessor's terminator fetched — freshly — and replaced.
+  auto edgePhysicalOperands =
+      [&](mlir::Block *predecessor, mlir::Block *dest,
           mlir::ValueRange oldOperands,
-          llvm::SmallVectorImpl<mlir::Value> &newOperands)
+          llvm::SmallVectorImpl<mlir::Value> &physicalOperands)
+      -> mlir::LogicalResult {
+    if (dest != block)
+      return mlir::success();
+    // Live argument number, not the one captured before the expansion: a
+    // re-entrant expansion of a LOWER-numbered argument of this same block
+    // inserts its physical arguments (and matching branch operands) ahead of
+    // ours, and a stale index would read a physical operand as the logical
+    // source.
+    unsigned index = argument.getArgNumber();
+    if (index >= oldOperands.size())
+      return op->emitError()
+             << "control-flow predecessor operand list is shorter than the "
+                "destination block argument list";
+    return appendPhysicalBranchOperands(predecessor, oldOperands[index],
+                                        physicalOperands);
+  };
+
+  // Splices the physical operands of one edge into the FRESH operand list of
+  // the (possibly rebuilt) terminator, at the argument's live index.
+  auto spliceEdgeOperands = [&](mlir::Block *dest, mlir::ValueRange oldOperands,
+                                llvm::ArrayRef<mlir::Value> physicalOperands,
+                                llvm::SmallVectorImpl<mlir::Value> &newOperands)
       -> mlir::LogicalResult {
     newOperands.append(oldOperands.begin(), oldOperands.end());
     if (dest != block)
       return mlir::success();
-    if (logicalIndex >= newOperands.size())
+    unsigned index = argument.getArgNumber();
+    if (index >= newOperands.size())
       return op->emitError()
              << "control-flow predecessor operand list is shorter than the "
                 "destination block argument list";
-
-    llvm::SmallVector<mlir::Value, 8> physicalOperands;
-    if (mlir::failed(appendPhysicalBranchOperands(
-            terminator, newOperands[logicalIndex], physicalOperands)))
-      return mlir::failure();
-    insertValues(newOperands, logicalIndex + 1, physicalOperands);
+    insertValues(newOperands, index + 1, physicalOperands);
     return mlir::success();
   };
 
   for (mlir::Block *predecessor : predecessors) {
     mlir::Operation *terminator = predecessor->getTerminator();
     if (auto branch = mlir::dyn_cast<mlir::cf::BranchOp>(terminator)) {
+      llvm::SmallVector<mlir::Value, 8> physicalOperands;
       llvm::SmallVector<mlir::Value, 8> operands;
-      if (mlir::failed(rewriteBranchOperands(terminator, branch.getDest(),
-                                             branch.getDestOperands(),
-                                             operands))) {
+      if (mlir::failed(edgePhysicalOperands(predecessor, branch.getDest(),
+                                            branch.getDestOperands(),
+                                            physicalOperands))) {
+        controlFlowBlockArgumentsInProgress.erase(argument);
+        return mlir::failure();
+      }
+      branch = mlir::cast<mlir::cf::BranchOp>(predecessor->getTerminator());
+      if (mlir::failed(spliceEdgeOperands(branch.getDest(),
+                                          branch.getDestOperands(),
+                                          physicalOperands, operands))) {
         controlFlowBlockArgumentsInProgress.erase(argument);
         return mlir::failure();
       }
@@ -259,14 +298,31 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerControlFlowBlockArgument(
     }
 
     if (auto cond = mlir::dyn_cast<mlir::cf::CondBranchOp>(terminator)) {
+      llvm::SmallVector<mlir::Value, 8> truePhysicalOperands;
+      llvm::SmallVector<mlir::Value, 8> falsePhysicalOperands;
+      if (mlir::failed(edgePhysicalOperands(predecessor, cond.getTrueDest(),
+                                            cond.getTrueDestOperands(),
+                                            truePhysicalOperands))) {
+        controlFlowBlockArgumentsInProgress.erase(argument);
+        return mlir::failure();
+      }
+      cond = mlir::cast<mlir::cf::CondBranchOp>(predecessor->getTerminator());
+      if (mlir::failed(edgePhysicalOperands(predecessor, cond.getFalseDest(),
+                                            cond.getFalseDestOperands(),
+                                            falsePhysicalOperands))) {
+        controlFlowBlockArgumentsInProgress.erase(argument);
+        return mlir::failure();
+      }
+      cond = mlir::cast<mlir::cf::CondBranchOp>(predecessor->getTerminator());
       llvm::SmallVector<mlir::Value, 8> trueOperands;
       llvm::SmallVector<mlir::Value, 8> falseOperands;
-      if (mlir::failed(rewriteBranchOperands(terminator, cond.getTrueDest(),
-                                             cond.getTrueDestOperands(),
-                                             trueOperands)) ||
-          mlir::failed(rewriteBranchOperands(terminator, cond.getFalseDest(),
-                                             cond.getFalseDestOperands(),
-                                             falseOperands))) {
+      if (mlir::failed(spliceEdgeOperands(cond.getTrueDest(),
+                                          cond.getTrueDestOperands(),
+                                          truePhysicalOperands, trueOperands)) ||
+          mlir::failed(spliceEdgeOperands(cond.getFalseDest(),
+                                          cond.getFalseDestOperands(),
+                                          falsePhysicalOperands,
+                                          falseOperands))) {
         controlFlowBlockArgumentsInProgress.erase(argument);
         return mlir::failure();
       }
