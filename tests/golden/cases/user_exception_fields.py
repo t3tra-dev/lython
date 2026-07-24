@@ -69,6 +69,21 @@ except PositionError as pe:
     print(pe.colno)
 
 
+# An int field returned straight out of the handler: the read must carry the
+# primitive (value, valid) lane the int ABI pairs with every boxed int, or the
+# boxed payload is dropped for the zero placeholder.
+def position_of(text: str) -> int:
+    try:
+        parse(text)
+    except DecodeError as caught:
+        return caught.pos + 10
+    return -1
+
+
+print(position_of("x"))
+print(position_of("1"))
+
+
 # Field reads escaping their owner keep the payload alive.
 def message_of(text: str) -> str:
     try:

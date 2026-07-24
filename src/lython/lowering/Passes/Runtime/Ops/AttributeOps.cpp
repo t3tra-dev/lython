@@ -1335,8 +1335,32 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerExceptionFieldAttrGet(
   RuntimeValue element{fieldType, *canonical,
                        ownership::logicalOwnershipKind(fieldType,
                                                        /*ownsObject=*/false)};
-  return bindRetainedEvidenceValue(op, op.getResult(), "exception field load",
-                                   element);
+  if (mlir::failed(bindRetainedEvidenceValue(
+          op, op.getResult(), "exception field load", element)))
+    return mlir::failure();
+
+  // An `int` result must also carry the primitive (value, valid) lane the
+  // int ABI pairs with every boxed int: a bundle without it rides the return
+  // and call boundaries as "not a valid primitive", and the boxed payload is
+  // then ignored in favour of the zero placeholder — a silently wrong value.
+  if (RuntimeBundleLowerer::hasPrimitiveI64ABI(fieldType)) {
+    std::optional<RuntimeSymbol> unbox =
+        manifest.primitive("builtins.int", "unbox.i64");
+    if (!unbox)
+      return op.emitError()
+             << "runtime manifest has no builtins.int unbox.i64 primitive";
+    auto bound = valueBundles.find(op.getResult());
+    if (bound == valueBundles.end())
+      return op.emitError() << "exception field load produced no bundle";
+    builder.setInsertionPointAfterValue(bound->second.physicalValues().back());
+    mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+        loc, *unbox, bound->second.physicalValues());
+    mlir::Value valid =
+        mlir::arith::ConstantIntOp::create(builder, loc, 1, 1).getResult();
+    bound->second.primitiveI64 =
+        RuntimePrimitiveI64Evidence{call.getResult(0), valid};
+  }
+  return mlir::success();
 }
 
 // A field store swaps the slot box's payload in place (retain new, release
