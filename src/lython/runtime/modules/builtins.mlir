@@ -1637,7 +1637,7 @@ module attributes {
   // The field block for %header, allocating it on first use. Idempotent:
   // whichever store runs first materializes the block, so no construction
   // path has to know the field count up front.
-  func.func private @__ly_exc_fields_block(%header: memref<3xi64>, %count: i64) -> i64 attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "fields_block"} {
+  func.func private @__ly_exc_fields_block(%header: memref<3xi64>, %count: i64) -> i64 attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.interior_word, ly.runtime.primitive = "fields_block"} {
     %zero = arith.constant 0 : i64
     %fields_slot = arith.constant 4 : i64
     %existing = func.call @__ly_exc_ext_get(%header, %fields_slot) : (memref<3xi64>, i64) -> i64
@@ -1655,7 +1655,7 @@ module attributes {
   // One word of the %slot-th box of a payload block. The generic reader that
   // pairs with payload_store_words: the lowering rebuilds a payload's memref
   // group from the box's pointer/size words (BoxLayout.h offsets).
-  func.func private @__ly_exc_payload_box_word(%block_word: i64, %slot: i64, %word: i64) -> i64 attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "payload_box_word"} {
+  func.func private @__ly_exc_payload_box_word(%block_word: i64, %slot: i64, %word: i64) -> i64 attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.interior_word, ly.runtime.primitive = "payload_box_word"} {
     %c16 = arith.constant 16 : i64
     %one = arith.constant 1 : i64
     %block_ptr = llvm.inttoptr %block_word : i64 to !llvm.ptr
@@ -1670,7 +1670,7 @@ module attributes {
   // Address of the %slot-th box. An erased-`object` field stores the box
   // itself as its value (the box words ARE the canonical object handle), so
   // that read needs the box address rather than the payload words.
-  func.func private @__ly_exc_payload_box_ptr(%block_word: i64, %slot: i64) -> i64 attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "payload_box_ptr"} {
+  func.func private @__ly_exc_payload_box_ptr(%block_word: i64, %slot: i64) -> i64 attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.interior_word, ly.runtime.primitive = "payload_box_ptr"} {
     %c16 = arith.constant 16 : i64
     %one = arith.constant 1 : i64
     %block_ptr = llvm.inttoptr %block_word : i64 to !llvm.ptr

@@ -424,15 +424,44 @@ static void appendEntityViews(ResourceGroup &group, mlir::ValueRange values,
                            static_cast<unsigned>(tail.size()));
 }
 
+// A call to a manifest primitive declared as returning interior words of the
+// entity its operands reach (see kManifestInteriorWordAttr).
+static bool isInteriorWordCall(mlir::Operation *op) {
+  auto call = mlir::dyn_cast<mlir::func::CallOp>(op);
+  if (!call)
+    return false;
+  auto callee =
+      mlir::SymbolTable::lookupNearestSymbolFrom<mlir::func::FuncOp>(
+          call, call.getCalleeAttr());
+  return callee && callee->hasAttr(contracts::kManifestInteriorWordAttr);
+}
+
 void collectBoxWordDerivedViews(llvm::ArrayRef<mlir::Value> groupValues,
                                 llvm::SmallVectorImpl<mlir::Value> &views) {
   llvm::SmallDenseSet<mlir::Value, 8> known(views.begin(), views.end());
   llvm::SmallVector<mlir::Value, 8> worklist;
+  auto seedInteriorResults = [&](mlir::Operation *user) {
+    if (!isInteriorWordCall(user))
+      return false;
+    for (mlir::Value result : user->getResults()) {
+      worklist.push_back(result);
+      // The word itself pins too: a primitive that stores into or releases a
+      // slot of the block consumes only the word, so without it the entity's
+      // last use would look like the call that produced the word.
+      if (known.insert(result).second)
+        views.push_back(result);
+    }
+    return true;
+  };
   for (mlir::Value value : groupValues)
-    for (mlir::Operation *user : value.getUsers())
-      if (auto load = mlir::dyn_cast<mlir::memref::LoadOp>(user))
+    for (mlir::Operation *user : value.getUsers()) {
+      if (auto load = mlir::dyn_cast<mlir::memref::LoadOp>(user)) {
         if (load.getMemRef() == value)
           worklist.push_back(load.getResult());
+        continue;
+      }
+      seedInteriorResults(user);
+    }
   // Follow the descriptor-assembly chain only (matched by op name so the
   // common layer stays free of an LLVM-dialect dependency); any other use of
   // a loaded word (arithmetic, comparisons) terminates the walk.
@@ -448,6 +477,8 @@ void collectBoxWordDerivedViews(llvm::ArrayRef<mlir::Value> groupValues,
           worklist.push_back(user->getResult(0));
         continue;
       }
+      if (seedInteriorResults(user))
+        continue;
       if (auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(user))
         for (mlir::Value result : cast.getResults())
           if (mlir::isa<mlir::MemRefType>(result.getType()) &&

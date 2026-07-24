@@ -1627,18 +1627,42 @@ void ModuleEmitter::collectClassFields(
       if (!method || ast::nameSpelling(*method) != "__init__")
         continue;
       // Names in scope for a field's declared type: the parameters, plus
-      // locals bound earlier in the body. Without the locals a
-      // `tmp = <expr>` / `self.f = tmp` pair (how CPython's own
-      // JSONDecodeError computes lineno/colno) leaves the field untyped.
+      // locals bound earlier in the body. Why not a private name->type map
+      // consulted only where the initializer is a bare `Name`: an initializer
+      // that is an EXPRESSION over those names (`self.lineno = pos + 1`) is
+      // handed to inferExpr with the names unbound, so it types as object --
+      // and an object-typed field is not a diagnostic, it is a field whose
+      // reads silently fail to carry wherever a known contract is required.
+      // Binding the names into a real scope makes one path serve both.
       llvm::StringMap<mlir::Type> initArgTypes;
       collectInitArgTypes(*method, initArgTypes);
-      llvm::StringMap<mlir::Type> scopeTypes = initArgTypes;
+      TypeSystem::Scope initScope = types.pushScope();
+      // A name the pre-pass cannot type must SHADOW any outer binding of the
+      // same name; resolving `self.f = x` to a module global that happens to
+      // share the local's spelling would type the field off the wrong value.
+      llvm::StringSet<> untypedLocals;
+      for (const auto &arg : initArgTypes) {
+        if (arg.second)
+          types.bindLocalSymbol(arg.getKey(), arg.second);
+        else
+          untypedLocals.insert(arg.getKey());
+      }
       auto valueTypeOf = [&](const parser::Node *value) -> mlir::Type {
-        if (value && value->kind == "Name") {
-          auto found = scopeTypes.find(ast::nameSpelling(*value));
-          return found != scopeTypes.end() ? found->second : mlir::Type();
-        }
+        if (value && value->kind == "Name" &&
+            untypedLocals.contains(ast::nameSpelling(*value)))
+          return {};
         return types.inferExpr(value);
+      };
+      auto bindInitLocal = [&](const parser::Node *target, mlir::Type type) {
+        if (!target || target->kind != "Name")
+          return;
+        llvm::StringRef name = ast::nameSpelling(*target);
+        if (!type) {
+          untypedLocals.insert(name);
+          return;
+        }
+        untypedLocals.erase(name);
+        types.bindLocalSymbol(name, type);
       };
       if (const auto *stmts = ast::nodeList(*method, "body")) {
         for (const parser::NodePtr &stmt : *stmts) {
@@ -1646,17 +1670,19 @@ void ModuleEmitter::collectClassFields(
             continue;
           if (stmt->kind == "AnnAssign") {
             const parser::Node *target = ast::node(*stmt, "target");
+            if (!target)
+              continue;
             mlir::Type declared =
                 types.annotationType(ast::node(*stmt, "annotation"));
-            if (target && target->kind == "Name")
-              scopeTypes[ast::nameSpelling(*target)] = declared;
+            bindInitLocal(target, declared);
             collectTarget(*target, declared);
           } else if (stmt->kind == "Assign") {
             mlir::Type valueType = valueTypeOf(ast::node(*stmt, "value"));
             if (const auto *targets = ast::nodeList(*stmt, "targets"))
               for (const parser::NodePtr &target : *targets) {
-                if (target && target->kind == "Name" && valueType)
-                  scopeTypes[ast::nameSpelling(*target)] = valueType;
+                if (!target)
+                  continue;
+                bindInitLocal(&*target, valueType);
                 collectTarget(*target, valueType);
               }
           }

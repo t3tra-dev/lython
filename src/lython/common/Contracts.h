@@ -18,6 +18,14 @@ inline constexpr llvm::StringLiteral kManifestInitializerAttr{
     "ly.runtime.initializer"};
 inline constexpr llvm::StringLiteral kManifestPrimitiveAttr{
     "ly.runtime.primitive"};
+// A primitive whose results are INTERIOR words of the entity its operands
+// reach (a block pointer hung off an exception header, a word of a box inside
+// that block). Ownership treats those results the way it treats box-word
+// reconstructions: they pin the entity's liveness, because the entity's
+// release frees the storage they address. Declared here rather than inferred
+// because only the manifest knows which primitives dereference their operands.
+inline constexpr llvm::StringLiteral kManifestInteriorWordAttr{
+    "ly.runtime.interior_word"};
 inline constexpr llvm::StringLiteral kManifestBuiltinAttr{"ly.runtime.builtin"};
 inline constexpr llvm::StringLiteral kManifestBuiltinLoweringAttr{
     "ly.runtime.builtin_lowering"};
