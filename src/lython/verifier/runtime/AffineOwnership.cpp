@@ -168,6 +168,13 @@ struct AffinePathState {
   // borrow-edge retains (`borrowed`). Entries naming a block argument drop
   // when the path re-enters that block.
   llvm::SmallVector<mlir::Value, 4> previous;
+  // The resource's aliasing views (static-evidence lanes of the same object),
+  // carried PER PATH because they are renamed across CFG edges exactly like
+  // the group. Consulting the resource's fixed view list instead reported a
+  // use of the CURRENT iteration's value as a use of the PREVIOUS iteration's
+  // released token, once the group had been renamed onto a loop block
+  // argument (`while True: i += 1 ... break; print(i)`).
+  llvm::SmallVector<mlir::Value, 4> views;
   // Outstanding block-arg-merge-borrow retains (identity merge edges lend the
   // merge argument a token; the paired release targets the pre-merge name).
   unsigned borrowed = 0;
@@ -196,8 +203,8 @@ struct BorrowedPathState {
 };
 
 bool samePathState(const AffinePathState &lhs, const AffinePathState &rhs) {
-  // `stale` and `previous` are deliberately NOT compared: they only refine
-  // detections, and including them lets path-dependent sets defeat the
+  // `stale`, `previous` and `views` are deliberately NOT compared: they only
+  // refine detections, and including them lets path-dependent sets defeat the
   // visited dedup (nested loops explode). Skipping a state that differs only
   // there can only miss a detection, never accept unsound IR.
   return lhs.block == rhs.block && lhs.start == rhs.start &&
@@ -1410,6 +1417,7 @@ verifyResourceOnCFGPaths(FuncContractCache &contracts,
   initial.token = initialToken;
   initial.retained = 0;
   initial.group = resource.group;
+  initial.views = resource.views;
   worklist.push_back(std::move(initial));
 
   constexpr unsigned kMaxAffineStates = 20000;
@@ -1507,11 +1515,14 @@ verifyResourceOnCFGPaths(FuncContractCache &contracts,
               llvm::SmallVector<mlir::Value, 4> mappedGroup =
                   remapGroupForSuccessor(op, successorIndex, successor,
                                          state.group, aliases);
+              llvm::SmallVector<mlir::Value, 4> mappedViews =
+                  remapGroupForSuccessor(op, successorIndex, successor,
+                                         state.views, aliases);
               worklist.push_back(AffinePathState{
                   successor, firstOperation(successor), nextToken,
                   state.retained, std::move(mappedGroup),
-                  /*stale=*/{}, /*previous=*/{}, /*borrowed=*/0,
-                  state.exceptional});
+                  /*stale=*/{}, /*previous=*/{}, std::move(mappedViews),
+                  /*borrowed=*/0, state.exceptional});
             }
             op = nullptr;
             break;
@@ -1621,7 +1632,7 @@ verifyResourceOnCFGPaths(FuncContractCache &contracts,
             continue;
           }
           if ((groupContainsOperand(op, state.group, aliases) ||
-               groupContainsOperand(op, resource.views, aliases)) &&
+               groupContainsOperand(op, state.views, aliases)) &&
               state.retained == 0)
             return call.emitError()
                    << "released owned resource from " << resource.producerLabel
@@ -1823,11 +1834,30 @@ verifyResourceOnCFGPaths(FuncContractCache &contracts,
       if (renamed)
         for (mlir::Value value : state.group)
           keepPreviousName(value);
+      // Views name the same object as the group, so they follow the same
+      // rename: a view left under its pre-edge name would be read as the
+      // previous iteration's token on the next trip round a loop. A view the
+      // edge does not forward has no name in the successor once the group was
+      // renamed, so it drops rather than lingering as a stale alias.
+      llvm::SmallVector<bool, 4> viewMask;
+      llvm::SmallVector<mlir::Value, 4> remappedViews = remapGroupForSuccessor(
+          op, index, successor, state.views, aliases, &viewMask);
+      llvm::SmallVector<mlir::Value, 4> mappedViews;
+      for (auto [viewIndex, view] : llvm::enumerate(remappedViews)) {
+        if (renamed && viewIndex < viewMask.size() && !viewMask[viewIndex])
+          continue;
+        auto argument = mlir::dyn_cast_if_present<mlir::BlockArgument>(view);
+        if (argument && argument.getOwner() == successor &&
+            (viewIndex >= viewMask.size() || !viewMask[viewIndex]))
+          continue;
+        mappedViews.push_back(view);
+      }
       worklist.push_back(AffinePathState{successor, firstOperation(successor),
                                          nextToken, nextRetained,
                                          std::move(mappedGroup),
                                          std::move(mappedStale),
                                          std::move(mappedPrevious),
+                                         std::move(mappedViews),
                                          state.borrowed, nextExceptional});
     }
   }
