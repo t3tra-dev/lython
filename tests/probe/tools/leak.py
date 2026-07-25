@@ -10,6 +10,25 @@ iterations is the bytes the loop failed to release.
 
     python3 tests/probe/tools/leak.py ./build/bin/lyc tests/probe [out.json]
 
+VALIDATING THIS INSTRUMENT. Its negative result -- "no leak" -- is the healthy
+state, so a tree with no leaks cannot demonstrate that it is capable of saying
+LEAK at all. It can only be domain-tested against a tree that leaks, which means
+the recipe has to outlive any particular build directory:
+
+    git worktree/checkout 657f0d8 ; cmake -B build-pre -S . -G Ninja
+    cmake --build build-pre -j$(nproc)          # let it FINISH before switching
+    python3 tests/probe/tools/leak.py ./build-pre/bin/lyc tests/probe
+
+Expected there: `rebind_call_list` about 8500 B/iteration and
+`rebind_twice_call_list` about 17200, reported as `2/12 shapes leak`. Anything
+that reports 0/12 on that commit is not measuring what it claims. Measured
+values were 8499 and 17191, against 8438 and 17176 recorded in the facts table
+for the same commit -- agreement within run-to-run spread.
+
+Note the "let it finish" above: building in the background and switching branches
+underneath it links a mixture of two trees and produces a binary that silently
+does not contain the defect. That mistake has been made here once already.
+
 The floor is calibrated against the probes that must not leak. `leak_baseline_*`
 are plain create-and-drop loops, and together with the non-leaking rebind shapes
 they have been observed anywhere in -130..+130 bytes per iteration across runs:

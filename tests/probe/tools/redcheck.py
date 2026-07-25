@@ -27,6 +27,12 @@ old build in the background and switched branches while it was still compiling,
 so it linked a mixture of both trees and reported all three goldens as unable to
 fail. Only knowing that one of them HAD failed historically caught it.
 
+A sentinel result is TREE-RELATIVE, in the same way a classification is: it
+establishes that this binary exhibits the defect, not that it will keep doing so.
+When the old build is rebuilt, or a different commit is used as the before-side,
+the sentinel has to fail again for anything below it to mean anything -- which is
+why it is re-run on every invocation rather than recorded once.
+
 Exit code is the number of goldens that could not be made to fail.
 """
 
