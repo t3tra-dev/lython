@@ -1,0 +1,25 @@
+probing-failed
+[Errno 2] No such file or directory: '_golden_w3_cross_absent/nope.txt'
+listing
+[Errno 2] No such file or directory: '_golden_w3_cross_absent'
+joined-ok
+nope.txt
+_golden_w3_cross_absent
+('_golden_w3_cross_absent/nope', '.txt')
+('_golden_w3_cross_absent/sub', 'other.txt')
+_golden_w3_cross_absent/nope.txt
+False False False
+_golden_w3_cross_absent/nope.txt
+nope.txt
+nope
+.txt
+_golden_w3_cross_absent
+['_golden_w3_cross_absent', 'nope.txt']
+False
+False
+_golden_w3_cross_absent/nope.log
+_golden_w3_cross_absent/sub
+reading-missing
+[Errno 2] No such file or directory: '_golden_w3_cross_absent'
+[Errno 2] No such file or directory: '_golden_w3_cross_absent/sub/other.txt'
+No such file or directory
