@@ -20,8 +20,16 @@ some runs and aborts on others. A cell counts as filled only when every plain
 run matches CPython AND the guard-allocator run does too.
 
     python3 tests/probe/tools/cells12.py ./build/bin/lyc [-n RUNS] [--keep DIR]
+    python3 tests/probe/tools/cells12.py ./build/bin/lyc --acquire inline
 
 Exit code is the number of unfilled cells, so a stage can gate on it.
+
+`--acquire` picks the third axis, which the grid's twelve cells hold fixed: how
+the frame gets the receiver. The default is a factory call, and `inline` builds
+it in the frame. They are not interchangeable -- an inline-constructed instance
+used to carry an owned-local marker that a lane re-root could republish while a
+call-derived one could not, which is the asymmetry the redesign exists to remove
+-- so a stage that fills the grid on one should be re-run on the other.
 """
 
 import argparse
@@ -82,7 +90,7 @@ SIO_HELPER = """def _fresh_sio() -> io.StringIO:
 """
 
 
-def program(contract, direction, boundary):
+def program(contract, direction, boundary, acquire="call"):
     c = CONTRACTS[contract]
     helper = SIO_HELPER if contract == "io.StringIO" else ""
     head = f"""{c['imports']}class Node:
@@ -96,9 +104,15 @@ def program(contract, direction, boundary):
 
 
 """
+    # How the frame GETS the receiver is its own axis, and the two halves of it
+    # broke differently before the field store moved into a heap slot: an
+    # inline-constructed instance carried an owned-local marker that a lane
+    # re-root could republish, and a call-derived one had no such thing. A grid
+    # filled on one says nothing about the other, so both spellings are here.
+    acquisition = ("n = make()\n" if acquire == "call" else
+                   f"v0: {c['ann']} = {c['init']}\nn = Node(v0)\n")
     if direction == "store" and boundary == "same frame":
-        body = f"""n = make()
-fresh: {c['ann']} = {c['fresh']}
+        body = acquisition + f"""fresh: {c['ann']} = {c['fresh']}
 n.f = fresh
 print({c['observe']})
 """
@@ -108,13 +122,11 @@ print({c['observe']})
     n.f = fresh
 
 
-n = make()
-rebind(n)
+""" + acquisition + f"""rebind(n)
 print({c['observe']})
 """
     elif direction == "read" and boundary == "same frame":
-        body = f"""n = make()
-ks: {c['alias_ann']} = n.f
+        body = acquisition + f"""ks: {c['alias_ann']} = n.f
 {c['mutate']}
 print({c['observe']})
 """
@@ -124,8 +136,7 @@ print({c['observe']})
     {c['mutate']}
 
 
-n = make()
-touch(n)
+""" + acquisition + f"""touch(n)
 print({c['observe']})
 """
     return head + body
@@ -162,6 +173,9 @@ def main():
     ap.add_argument("-n", "--runs", type=int, default=6)
     ap.add_argument("--keep", type=pathlib.Path, default=None,
                     help="write the generated programs here instead of a temp dir")
+    ap.add_argument("--acquire", choices=("call", "inline"), default="call",
+                    help="how the frame gets the receiver: from a factory call "
+                         "(default) or constructed in the frame")
     args = ap.parse_args()
     lyc = args.lyc.resolve()
 
@@ -177,7 +191,7 @@ def main():
                         f"{boundary.replace(' ', '')}")
                 p = tmp / f"{slug}.py"
                 p.write_text(textwrap.dedent(program(contract, direction,
-                                                     boundary)))
+                                                     boundary, args.acquire)))
                 want = run([CPY, str(p)])[1]
                 faces = Counter()
                 for _ in range(args.runs):
@@ -191,7 +205,8 @@ def main():
                              dict(faces), gm, filled))
 
     w = max(len(r[0]) for r in rows)
-    print(f"12-cell grid  ({args.runs} plain runs + 1 libgmalloc run per cell)\n")
+    print(f"12-cell grid, {args.acquire}-acquired receiver  ({args.runs} plain "
+          f"runs + 1 libgmalloc run per cell)\n")
     print(f"{'contract':{w}}  {'dir':6} {'boundary':14} {'want':6} "
           f"{'plain':38} {'gmalloc':8} filled")
     print("-" * (w + 80))
