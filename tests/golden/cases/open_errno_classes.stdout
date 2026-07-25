@@ -1,0 +1,3 @@
+FileNotFoundError [Errno 2] No such file or directory: 'no_such_directory_here/inner.txt'
+IsADirectoryError [Errno 21] Is a directory: 'open_errno_dir_case'
+ok

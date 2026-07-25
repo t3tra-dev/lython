@@ -156,6 +156,15 @@ module attributes {
   func.func private @LyHost_FTell(i64) -> i64
   func.func private @LyHost_FUngetc(i64, i32) -> i32
   func.func private @LyHost_FTruncate(i64, i64) -> i32
+  // The OSError surface (built unconditionally by buildOsSupport, and declared
+  // the same way in posix.mlir / _time.mlir): open() maps fopen's errno through
+  // the same table os does, so `except PermissionError` fires for EACCES here
+  // exactly as it does for os.mkdir.
+  func.func private @LyHost_Errno() -> i32
+  func.func private @LyHost_ErrnoValue_EISDIR() -> i32
+  func.func private @LyHost_OSErrorClassId(i32) -> i64
+  func.func private @LyHost_OSErrorMessagePath(i32, memref<?xi8>, i64, memref<?xi8>, i64) -> i64
+  func.func private @LyHost_Stat(memref<?xi8>, i64, memref<?xi64>) -> i32
   func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 1 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
   func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 4 : i64, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
   func.func private @LyUnicode_CodepointLength(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> i64 attributes {ly.runtime.contract = "builtins.str", ly.runtime.method = "__len__"}
@@ -204,7 +213,6 @@ module attributes {
   memref.global "private" constant @__ly_io_msg_not_writable : memref<12xi8> = dense<[110, 111, 116, 32, 119, 114, 105, 116, 97, 98, 108, 101]>
   memref.global "private" constant @__ly_io_msg_binary_mode : memref<28xi8> = dense<[98, 105, 110, 97, 114, 121, 32, 109, 111, 100, 101, 32, 105, 115, 32, 110, 111, 116, 32, 115, 117, 112, 112, 111, 114, 116, 101, 100]>
   memref.global "private" constant @__ly_io_msg_invalid_mode : memref<12xi8> = dense<[105, 110, 118, 97, 108, 105, 100, 32, 109, 111, 100, 101]>
-  memref.global "private" constant @__ly_io_msg_no_such_file : memref<27xi8> = dense<[78, 111, 32, 115, 117, 99, 104, 32, 102, 105, 108, 101, 32, 111, 114, 32, 100, 105, 114, 101, 99, 116, 111, 114, 121, 58, 32]>
   memref.global "private" constant @__ly_io_msg_neg_seek : memref<22xi8> = dense<[110, 101, 103, 97, 116, 105, 118, 101, 32, 115, 101, 101, 107, 32, 112, 111, 115, 105, 116, 105, 111, 110]>
   memref.global "private" constant @__ly_io_msg_bad_whence : memref<14xi8> = dense<[105, 110, 118, 97, 108, 105, 100, 32, 119, 104, 101, 110, 99, 101]>
   memref.global "private" constant @__ly_io_msg_nonzero_seek : memref<31xi8> = dense<[99, 97, 110, 39, 116, 32, 100, 111, 32, 110, 111, 110, 122, 101, 114, 111, 32, 114, 101, 108, 97, 116, 105, 118, 101, 32, 115, 101, 101, 107, 115]>
@@ -215,6 +223,28 @@ module attributes {
     %start = arith.constant 0 : index
     %exception:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%message, %start, %length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    func.call @LyEH_ThrowException(%initialized#0, %initialized#1, %initialized#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    func.return
+  }
+
+  // Raise the OSError subclass errno maps to, with CPython's
+  // "[Errno %d] %s: '%s'" message. Structurally __ly_posix_throw; kept local
+  // rather than shared because a manifest is self-contained (posix.mlir is only
+  // present when os is imported, and open() must not depend on that).
+  //
+  // The message is built and the scratch freed BEFORE the throw: the raise does
+  // not return, so a dealloc after it would be unreachable.
+  func.func private @__ly_io_throw_errno_path(%err: i32, %path: memref<?xi8>, %path_len: i64) {
+    %c0 = arith.constant 0 : index
+    %cap_index = arith.constant 1024 : index
+    %cap = arith.constant 1024 : i64
+    %class_id = func.call @LyHost_OSErrorClassId(%err) : (i32) -> i64
+    %buffer = memref.alloc(%cap_index) : memref<?xi8>
+    %len = func.call @LyHost_OSErrorMessagePath(%err, %path, %path_len, %buffer, %cap) : (i32, memref<?xi8>, i64, memref<?xi8>, i64) -> i64
+    %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%buffer, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    memref.dealloc %buffer : memref<?xi8>
+    %exception:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.call @LyEH_ThrowException(%initialized#0, %initialized#1, %initialized#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
     func.return
@@ -1528,13 +1558,15 @@ module attributes {
   }
 
   // fopen the parsed mode ('b' appended for binary streams so Windows text
-  // translation stays off), raising FileNotFoundError with the path when it
-  // fails; returns the FILE* handle.
+  // translation stays off), raising the OSError subclass errno maps to (with
+  // the path) when it fails; returns the FILE* handle.
   func.func private @__ly_io_fopen(%path_header: memref<2xi64>, %path_bytes: memref<?xi8>, %base: i64, %plus: i64, %with_b: i1) -> i64 {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c2 = arith.constant 2 : index
+    %c10 = arith.constant 10 : index
     %zero = arith.constant 0 : i64
+    %zero_i32 = arith.constant 0 : i32
     %one = arith.constant 1 : i64
     %cmode = memref.alloca() : memref<3xi8>
     %base_byte = arith.trunci %base : i64 to i8
@@ -1563,25 +1595,36 @@ module attributes {
     %handle = func.call @LyHost_FOpen(%enc_bytes, %path_len, %cmode_dyn, %cmode_len) : (memref<?xi8>, i64, memref<?xi8>, i64) -> i64
     %failed = arith.cmpi eq, %handle, %zero : i64
     scf.if %failed {
-      // FileNotFoundError (67): "No such file or directory: <path>".
-      %prefix_len = arith.constant 27 : index
-      %prefix_len_i64 = arith.constant 27 : i64
-      %path_len_index = arith.index_cast %path_len : i64 to index
-      %total = arith.addi %prefix_len, %path_len_index : index
-      %message = memref.alloc(%total) : memref<?xi8>
-      %prefix_static = memref.get_global @__ly_io_msg_no_such_file : memref<27xi8>
-      scf.for %i = %c0 to %prefix_len step %c1 {
-        %byte = memref.load %prefix_static[%i] : memref<27xi8>
-        memref.store %byte, %message[%i] : memref<?xi8>
+      // errno decides the class and the message. The old code hardcoded
+      // FileNotFoundError with its own wording for EVERY fopen failure, so
+      // `except PermissionError` never fired on an EACCES path and the message
+      // lacked CPython's "[Errno N] " prefix.
+      %err = func.call @LyHost_Errno() : () -> i32
+      func.call @__ly_io_throw_errno_path(%err, %enc_bytes, %path_len) : (i32, memref<?xi8>, i64) -> ()
+    }
+    // fopen on a directory SUCCEEDS on the BSD libcs, and every later read then
+    // answered "": a silent wrong answer where CPython raises, because
+    // CPython reaches the kernel through open(2), which rejects a directory
+    // itself. stat decides it here instead; S_IFMT/S_IFDIR are the two bit
+    // patterns that are the same on every target we build for, so they are the
+    // one part of this that can be a literal.
+    %opened = arith.cmpi ne, %handle, %zero : i64
+    scf.if %opened {
+      %stat_fields = memref.alloc(%c10) : memref<?xi64>
+      %stat_rc = func.call @LyHost_Stat(%enc_bytes, %path_len, %stat_fields) : (memref<?xi8>, i64, memref<?xi64>) -> i32
+      %stat_ok = arith.cmpi eq, %stat_rc, %zero_i32 : i32
+      %mode = memref.load %stat_fields[%c0] : memref<?xi64>
+      memref.dealloc %stat_fields : memref<?xi64>
+      %s_ifmt = arith.constant 61440 : i64
+      %s_ifdir = arith.constant 16384 : i64
+      %fmt = arith.andi %mode, %s_ifmt : i64
+      %is_dir_bits = arith.cmpi eq, %fmt, %s_ifdir : i64
+      %is_dir = arith.andi %stat_ok, %is_dir_bits : i1
+      scf.if %is_dir {
+        %eisdir = func.call @LyHost_ErrnoValue_EISDIR() : () -> i32
+        func.call @LyHost_FClose(%handle) : (i64) -> i32
+        func.call @__ly_io_throw_errno_path(%eisdir, %enc_bytes, %path_len) : (i32, memref<?xi8>, i64) -> ()
       }
-      scf.for %i = %c0 to %path_len_index step %c1 {
-        %byte = memref.load %enc_bytes[%i] : memref<?xi8>
-        %dest = arith.addi %prefix_len, %i : index
-        memref.store %byte, %message[%dest] : memref<?xi8>
-      }
-      %class_id = arith.constant 67 : i64
-      %total_i64 = arith.addi %prefix_len_i64, %path_len : i64
-      func.call @__ly_io_raise(%class_id, %message, %total_i64) : (i64, memref<?xi8>, i64) -> ()
     }
     // Single release on every structural CFG path; the raise above unwinds
     // before reaching it (the encoded path leaks on that exception path,
