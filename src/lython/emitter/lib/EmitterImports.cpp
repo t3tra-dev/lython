@@ -489,6 +489,26 @@ bool ModuleEmitter::bindSourceModuleName(llvm::StringRef module,
       if (bindSourceModuleName(module, llvm::StringRef(*aliased), localName,
                                aliasDepth + 1))
         return true;
+  // `import posixpath as path` publishes a module as the member `path`, so
+  // `from os import *` (whose __all__ lists "path") binds a whole namespace
+  // here, not a single value.
+  for (const parser::NodePtr &statement : *body) {
+    if (!statement || statement->kind != "Import")
+      continue;
+    const auto *names = ast::nodeList(*statement, "names");
+    if (!names)
+      continue;
+    for (const parser::NodePtr &alias : *names) {
+      if (!alias)
+        continue;
+      std::optional<std::string_view> imported = ast::string(*alias, "name");
+      std::optional<std::string_view> member = importAliasLocalName(*alias);
+      if (!imported || !member || llvm::StringRef(*member) != exportedName)
+        continue;
+      if (bindSourceModuleNamespace(llvm::StringRef(*imported), localName))
+        return true;
+    }
+  }
   if (bindSourceModuleReexport(*source, exportedName, localName))
     return true;
   return false;
@@ -525,8 +545,15 @@ bool ModuleEmitter::bindSourceModuleReexport(
         // `from M import *`: the name reexports when it is in M's __all__.
         const EmitOptions::SourceModule *fromSource =
             lookupSourceModule(*resolvedModule);
-        if (!fromSource)
+        if (!fromSource) {
+          // M is a native manifest (os.py's `from posix import *`), which has
+          // no __all__: the public-name convention is the export list, and the
+          // manifest export itself is what the name binds to.
+          if (!exportedName.empty() && exportedName.front() != '_' &&
+              types.bindImportedName(*resolvedModule, exportedName, localName))
+            return true;
           continue;
+        }
         std::optional<llvm::SmallVector<std::string, 8>> exports =
             staticAllExportNames(*fromSource->moduleNode);
         if (!exports || !llvm::is_contained(*exports, exportedName.str()))

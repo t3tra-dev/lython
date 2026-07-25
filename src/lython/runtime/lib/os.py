@@ -43,6 +43,12 @@ Deviations from CPython:
     `topdown=`, `onerror=` or `followlinks=` keyword, unreadable directories
     are skipped silently (CPython's default `onerror=None` does the same),
     and callers cannot prune the walk by mutating `dirnames`.
+  - `path` is reachable as `os.path` but is NOT in `__all__`, so
+    `from os import *` does not bind a bare `path` (CPython's does). Module
+    members live in one flat symbol table that a local variable of the same
+    name does not shadow, so exporting `path` would make every `path.foo(...)`
+    on a local named `path` resolve to `posixpath.foo` -- including inside
+    posixpath itself, whose own parameters are called `path`.
   - `open`, `fdopen`, `read`, `write`, `close`, the *at() family, `fork` and
     the process/signal surface are not ported. Use the `io` module's `open`.
 """
@@ -56,7 +62,7 @@ __all__ = [
     "getegid", "getcwd", "chdir", "listdir", "mkdir", "makedirs", "rmdir",
     "remove", "unlink", "rename", "replace", "access", "stat", "lstat",
     "stat_result", "strerror", "getenv", "putenv", "unsetenv", "has_env",
-    "environ_entries", "walk", "F_OK", "R_OK", "W_OK", "X_OK", "path",
+    "environ_entries", "walk", "F_OK", "R_OK", "W_OK", "X_OK",
 ]
 
 name: str = "nt" if sys.platform == "win32" else "posix"
