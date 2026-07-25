@@ -30,8 +30,21 @@ memory-safety defect whose visibility depends on allocator behaviour -- the clas
 this corpus exists to make deterministic.
 
     python3 tests/probe/tools/allocregimes.py ./build/bin/lyc tests/probe/alias_*.py
+    python3 tests/probe/tools/allocregimes.py ./build/bin/lyc --regimes prescribble \
+        tests/golden/cases/*.py
 
-Exit code is the number of probes failing in at least one regime.
+`--regimes` selects a subset, which matters because `prescribble` alone is worth
+running over far more code than the full set is. k-4a's observation, from using
+it on stage 4a: a dropped store into a heap slot reads back as whatever filled
+the slot, so under the system allocator it surfaces as a plausible `0` and needs
+a differential against CPython to notice, while under `prescribble` it surfaces
+as garbage or a fault and announces itself. Both silent bugs that stage found had
+printed `0`. So this is the only instrument here that catches a dropped store
+WITHOUT an oracle -- the rest of this corpus needs CPython to say what the answer
+should have been. That makes it the one regime cheap enough, and general enough,
+to sweep a whole suite with periodically.
+
+Exit code is the number of probes failing in at least one selected regime.
 """
 
 import argparse
@@ -84,10 +97,19 @@ def main():
     ap.add_argument("probes", nargs="+", type=pathlib.Path)
     ap.add_argument("-n", "--runs", type=int, default=3,
                     help="runs per regime (default 3)")
+    ap.add_argument("--regimes", default=None,
+                    help="comma-separated subset, e.g. prescribble; "
+                         f"choices: {','.join(REGIMES)}")
     args = ap.parse_args()
     lyc = args.lyc.resolve()
 
-    names = list(REGIMES)
+    if args.regimes:
+        names = [r.strip() for r in args.regimes.split(",")]
+        unknown = [r for r in names if r not in REGIMES]
+        if unknown:
+            ap.error(f"unknown regime(s): {', '.join(unknown)}")
+    else:
+        names = list(REGIMES)
     width = max(len(p.name) for p in args.probes)
     print(f"{'probe':{width}}  " + "  ".join(f"{n:>12}" for n in names))
     print("-" * (width + 2 + 14 * len(names)))
