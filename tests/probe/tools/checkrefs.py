@@ -28,8 +28,8 @@ import re
 import sys
 
 # Directories a bare filename may live in.
-SEARCH = ("tests/probe", "tests/probe/tools", "tests/golden/cases",
-          "tests/golden/errors", "tests/unit", "examples",
+SEARCH = ("tests/probe", "tests/probe/tools", "tests/golden",
+          "tests/golden/cases", "tests/golden/errors", "tests/unit", "examples",
           "src/lython/runtime/lib", "src/lython/runtime/modules")
 
 CITATION = re.compile(r"[\w./{},*-]*?[\w-]+\.(?:py|mlir|stdout|exitcode|stderr-re)")
