@@ -33,12 +33,9 @@ Deviations from CPython:
   - `randrange(start, stop, step)` takes three positional ints;
     `randrange(stop)` is spelled by passing `stop` alone. CPython's
     `stop=None` sentinel needs an Optional int parameter.
-  - `shuffle(x)` shuffles a caller-owned list IN PLACE, which the ownership
-    layer rejects at the call site (borrowed-container mutation). It is
-    declared with CPython's exact algorithm so it starts working when that
-    lands; use `sample(x, len(x))` for a shuffled COPY meanwhile -- note that
-    is a different draw sequence from shuffle's, so it does not reproduce
-    CPython's shuffle output.
+  - `shuffle(x)` takes a `list[T]` and no `random=` argument (CPython's is
+    deprecated and removed in 3.11+ anyway). The swap loop is CPython's, so the
+    permutation for a given seed is CPython's.
   - the sequence arguments are `list[T]`, not `Sequence[T]`, and
     `sample(counts=)` is absent.
   - `_randbelow` and `randint` (CPython's Python-level rejection sampler and

@@ -57,6 +57,24 @@ print(random.sample([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], 7))
 print(random.sample([1, 2, 3], 3))
 print(random.sample([1, 2, 3], 0))
 
+# shuffle walks DOWN the indices, swapping each with a uniformly chosen
+# earlier-or-equal one; the permutation for a given seed is CPython's.
+random.seed(7)
+deck = [1, 2, 3, 4, 5, 6, 7, 8]
+random.shuffle(deck)
+print(deck)
+random.seed(1)
+tiny = [3, 1, 2]
+random.shuffle(tiny)
+print(tiny)
+random.seed(99)
+words = ["a", "b", "c", "d"]
+random.shuffle(words)
+print(words)
+single = [42]
+random.shuffle(single)
+print(single)
+
 # --- reals ------------------------------------------------------------------
 random.seed(42)
 print(random.uniform(1.0, 2.0))
