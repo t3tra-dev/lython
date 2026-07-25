@@ -191,13 +191,22 @@ RuntimeBundleLowerer::storeBoxedFieldPayloadInPlace(mlir::Operation *op,
   // shape to describe. `objectPayloadHandleWords` refuses an erased `object`
   // below, but its message is written for a container element; say it in terms
   // of the field, which is what the author wrote.
+  //
+  // This REJECTS one shape that used to run. Before the store moved into the
+  // slot, an `object`-annotated field took the handle-store path, which wrote
+  // the erased handle into the instance's lane; that was silently wrong across a
+  // function boundary for a str/float/list/dict payload and happened to work for
+  // an int. Keeping the one accidental case would mean keeping a path whose
+  // correctness depends on the payload's width, and the project does not
+  // implement runtime operations on `object` at all, so the whole shape is
+  // refused at the earliest boundary instead.
   if (const RuntimeBundle *concrete =
           RuntimeBundleLowerer::concreteObjectForOwnership(*payload))
     if (concrete->contractName() == "builtins.object")
       return op->emitError()
              << "a type-erased `object` value cannot be stored in field '"
              << slotName
-             << "'; annotate the field with the concrete class it holds";
+             << "'; annotate the field with the concrete type it holds";
   if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(op, *payload,
                                                              slotName)))
     return mlir::failure();
