@@ -1,6 +1,6 @@
 # probe: field rebind -- receiver is a borrowed parameter, observed by the caller after return; field type Other
 # axes: acquire=paramkept width=w1obj op=rebind flow=straight
-# CLASSIFICATION @ kernel/4a 95cf6f7: 1 正しい
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: 7
 
 class Other:

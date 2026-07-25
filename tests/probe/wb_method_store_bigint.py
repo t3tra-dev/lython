@@ -1,6 +1,6 @@
 # probe: a method stores into self's int field; the caller reads it back
 # axes: acquire=self width=bigint op=rebind flow=straight observe=writeback
-# CLASSIFICATION @ kernel/4a 95cf6f7: 3 loud 拒否 (診断)
+# CLASSIFICATION @ kernel/4a 6c328b5: 3 loud 拒否 (診断)
 #   OverflowError: int too large to convert to a native 64-bit integer
 # CPython 3.14 expects: 12345678901234567890
 

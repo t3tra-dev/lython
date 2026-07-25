@@ -1,6 +1,6 @@
 # probe: leak -- int field rebind on a call-obtained receiver (three lanes, no heap payload for small ints) (100 iterations)
 # axes: op=leak-loop iterations=100
-# CLASSIFICATION @ kernel/4a 95cf6f7: 1 正しい
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: 123456700
 # RSS: 10 バイト/回 → リークなし (計測ノイズ ±130 B/回 の範囲)
 

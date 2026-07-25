@@ -3,7 +3,7 @@
 #   (box のスロット identity は安定でも payload の realloc がレーンを stale に
 #   するかどうかを見る形)。
 # axes: acquire=inline width=w1dict(box-fronted) op=alias-grow-writeback flow=straight
-# CLASSIFICATION @ kernel/4a 95cf6f7: 1 正しい
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: 2
 # 観測: 8 回実行: SIGABRT 8 (libsystem_malloc)。libgmalloc: SIGSEGV
 

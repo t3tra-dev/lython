@@ -10,8 +10,8 @@
 #   「正しい 3 形の喪失」が同じ変更の両面だと読める。片方だけでは、
 #   純粋な改善にも純粋な退行にも見えてしまう。
 # axes: width=object(erased, int payload) op=field flow=straight
-# CLASSIFICATION @ kernel/4a 95cf6f7: 3 loud 拒否 (診断)
-#   a type-erased `object` value cannot be stored in field 'class.v'; annotate the field with the concrete class it holds
+# CLASSIFICATION @ kernel/4a 6c328b5: 3 loud 拒否 (診断)
+#   a type-erased `object` value cannot be stored in field 'class.v'; annotate the field with the concrete type it holds
 # CPython 3.14 expects: 7
 
 

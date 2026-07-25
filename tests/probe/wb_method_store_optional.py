@@ -1,6 +1,6 @@
 # probe: a method stores into self's int | None field; the caller reads it back
 # axes: acquire=self width=optional op=rebind flow=straight observe=writeback
-# CLASSIFICATION @ kernel/4a 95cf6f7: 3 loud 拒否 (診断)
+# CLASSIFICATION @ kernel/4a 6c328b5: 3 loud 拒否 (診断)
 #   runtime object header has invalid type 'i64'
 # CPython 3.14 expects: 5
 

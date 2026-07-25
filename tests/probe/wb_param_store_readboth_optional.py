@@ -1,6 +1,6 @@
 # probe: callee stores into and reads back a borrowed receiver's int | None field, then the caller reads it
 # axes: acquire=param width=optional op=rebind flow=straight observe=writeback-both
-# CLASSIFICATION @ kernel/4a 95cf6f7: 3 loud 拒否 (診断)
+# CLASSIFICATION @ kernel/4a 6c328b5: 3 loud 拒否 (診断)
 #   builtin callable 'print' expects exactly one positional argument
 # CPython 3.14 expects: in callee: 5 / in caller: 5
 

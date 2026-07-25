@@ -1,6 +1,6 @@
 # probe: append to a list read out of a borrowed object's field
 # axes: acquire=param+field width=w3list op=append flow=straight
-# CLASSIFICATION @ kernel/4a 95cf6f7: 1 正しい
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: 2
 
 class Box:

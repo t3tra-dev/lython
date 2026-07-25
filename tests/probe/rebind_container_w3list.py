@@ -1,6 +1,6 @@
 # probe: field rebind -- receiver read out of a list; field type list[int]
 # axes: acquire=container width=w3list op=rebind flow=straight
-# CLASSIFICATION @ kernel/4a 95cf6f7: 1 正しい
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: 2 1
 
 class Box:

@@ -1,6 +1,6 @@
 # probe: field rebind reached through excepthandler control flow; field type Other
 # axes: acquire=call width=w1obj op=rebind flow=excepthandler
-# CLASSIFICATION @ kernel/4a 95cf6f7: 1 正しい
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: 7
 
 class Other:

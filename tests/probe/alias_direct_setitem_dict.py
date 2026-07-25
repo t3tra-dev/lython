@@ -1,7 +1,7 @@
 # probe: 照会 B の対照 -- 同じ挿入をローカル別名を作らず `self._f["x"] = k` と
 #   直接書く。これは通る (box のスロットを通した in-place 挿入)。
 # axes: acquire=inline width=w1dict(box-fronted) op=direct-insert flow=straight
-# CLASSIFICATION @ kernel/4a 95cf6f7: 1 正しい
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: 1
 
 

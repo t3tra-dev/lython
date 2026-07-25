@@ -1,6 +1,6 @@
 # probe: field rebind reached through finally control flow; field type str
 # axes: acquire=call width=w1str op=rebind flow=finally
-# CLASSIFICATION @ kernel/4a 95cf6f7: 1 正しい
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: 2
 
 class Box:

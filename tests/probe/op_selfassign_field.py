@@ -1,6 +1,6 @@
 # probe: a field is rebound to its own current value
 # axes: acquire=call width=w3list op=self-assign flow=straight
-# CLASSIFICATION @ kernel/4a 95cf6f7: 1 正しい
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: 1
 
 class Box:

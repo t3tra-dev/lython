@@ -3,7 +3,7 @@
 #   collections.defaultdict の移植がこの形に当たるため、実務上の重みが最も大きい。
 #   (出典: kernel-sidedefects)
 # axes: width=callable(int)+dict op=field flow=straight
-# CLASSIFICATION @ kernel/4a 95cf6f7: 3 loud 拒否 (診断)
+# CLASSIFICATION @ kernel/4a 6c328b5: 3 loud 拒否 (診断)
 #   function target 'zero__lyrt_prim_i64' returned too few values for result object ABI
 # CPython 3.14 expects: 0
 

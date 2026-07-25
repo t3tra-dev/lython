@@ -4,7 +4,7 @@
 #   (出典: kernel-sidedefects。私の既存 known_field_type_object.py は
 #   `type[...]` を呼ぶところまで含む変種)
 # axes: width=type-object op=field flow=straight
-# CLASSIFICATION @ kernel/4a 95cf6f7: 3 loud 拒否 (診断)
+# CLASSIFICATION @ kernel/4a 6c328b5: 3 loud 拒否 (診断)
 #   callable ABI type has no concrete runtime contract: '!py.type<!py.contract<"Inner">>'
 # CPython 3.14 expects: 1
 

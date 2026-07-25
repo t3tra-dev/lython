@@ -1,6 +1,6 @@
 # probe: field rebind -- receiver from an inline constructor in the same frame; field type Wide
 # axes: acquire=inline width=wNcls op=rebind flow=straight
-# CLASSIFICATION @ kernel/4a 95cf6f7: 1 正しい
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: 1 2.5 z
 
 class Other:

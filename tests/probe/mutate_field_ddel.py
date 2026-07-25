@@ -1,6 +1,6 @@
 # probe: in-place field mutation -- dict field del (in place); receiver from field
 # axes: acquire=field width=w3list/w1dict op=ddel flow=straight
-# CLASSIFICATION @ kernel/4a 95cf6f7: 1 正しい
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: 0
 
 class Box:

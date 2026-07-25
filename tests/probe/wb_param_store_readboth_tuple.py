@@ -1,6 +1,6 @@
 # probe: callee stores into and reads back a borrowed receiver's tuple[int, int] field, then the caller reads it
 # axes: acquire=param width=tuple op=rebind flow=straight observe=writeback-both
-# CLASSIFICATION @ kernel/4a 95cf6f7: 1 正しい
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: in callee: (1, 2) / in caller: (1, 2)
 
 class Box:

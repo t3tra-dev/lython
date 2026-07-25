@@ -2,7 +2,7 @@
 #   読み戻して呼ぶ。同じ assignability 診断になる = 読み出し位置は関係ない。
 #   (出典: kernel-sidedefects)
 # axes: width=callable(str) op=field flow=straight scope=module
-# CLASSIFICATION @ kernel/4a 95cf6f7: 3 loud 拒否 (診断)
+# CLASSIFICATION @ kernel/4a 6c328b5: 3 loud 拒否 (診断)
 #   attribute value '!py.contract<"builtins.function">' is not assignable to field '!py.callable<[], returns = [!py.contract<"builtins.str">]>'
 # CPython 3.14 expects: hi
 

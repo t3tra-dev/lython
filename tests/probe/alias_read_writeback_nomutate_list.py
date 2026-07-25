@@ -1,7 +1,7 @@
 # probe: 照会 A の分解の対照 -- ローカルに読み出して**変異させずに**書き戻す。
 #   これが通るので、読み出し + 書き戻しの組そのものは無害だと決まる。
 # axes: acquire=call width=w3list op=alias-read+writeback(no mutation) flow=straight
-# CLASSIFICATION @ kernel/4a 95cf6f7: 1 正しい
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: 0
 
 

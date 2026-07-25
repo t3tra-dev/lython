@@ -1,6 +1,6 @@
 # probe: REPORTED loud: an owned local consumed on only one arm of an if
 # axes: op=consume flow=ifone
-# CLASSIFICATION @ kernel/4a 95cf6f7: 1 正しい
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: 2 0
 
 def sink(xs: list[int]) -> int:

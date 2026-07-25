@@ -7,7 +7,7 @@
 #   (何も置かない / 定数の print / フィールド読み) 12 セルすべて dominance 失敗。
 #   つまりこの幅では入手経路の軸が読み出し形の軸より優位である。
 # axes: acquire=inline width=w1obj op=rebind flow=while read=none
-# CLASSIFICATION @ kernel/4a 95cf6f7: 1 正しい
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: 1
 
 

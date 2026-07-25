@@ -1,6 +1,6 @@
 # probe: the local naming the object is reassigned to a second object after a rebind
 # axes: acquire=call width=w3list op=reassign-local flow=straight
-# CLASSIFICATION @ kernel/4a 95cf6f7: 1 正しい
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: 2 / 3
 
 class Box:

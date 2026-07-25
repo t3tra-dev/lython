@@ -1,6 +1,6 @@
 # probe: leak -- control: an object created and dropped each iteration, no field store (40000 iterations)
 # axes: op=leak-loop iterations=40000
-# CLASSIFICATION @ kernel/4a 95cf6f7: 1 正しい
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: 320000
 # RSS: -45 バイト/回 → リークなし (計測ノイズ ±130 B/回 の範囲)
 
