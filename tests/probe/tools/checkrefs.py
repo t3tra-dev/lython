@@ -34,6 +34,13 @@ SEARCH = ("tests/probe", "tests/probe/tools", "tests/golden/cases",
 
 CITATION = re.compile(r"[\w./{},*-]*?[\w-]+\.(?:py|mlir|stdout|exitcode|stderr-re)")
 BRACES = re.compile(r"\{([^}]*)\}")
+# Golden cases get cited by bare name -- `cases/foo`, `errors/bar` -- because
+# that is how the suite names them. Requiring an extension made every one of
+# those invisible, and an invisible citation is worse than an unresolved one:
+# the tool reports "all resolve" and the silence reads as a pass. Found by
+# applying k-4a's observation about negative results from instruments whose
+# domain was never checked, to this instrument.
+GOLDEN = re.compile(r"\b(cases|errors)/([A-Za-z_0-9]+)\b")
 
 
 def expand(name):
@@ -58,9 +65,13 @@ def main():
     root = args.root.resolve()
     allow = set(args.allow)
 
+    text = args.document.read_text()
     cited = set()
-    for raw in CITATION.findall(args.document.read_text()):
+    for raw in CITATION.findall(text):
         cited |= expand(raw)
+    # A golden cited by bare name resolves to its .py under tests/golden/.
+    for sub, name in GOLDEN.findall(text):
+        cited.add(f"tests/golden/{sub}/{name}.py")
 
     dirs = [root / d for d in SEARCH]
     missing, resolved, globs, allowed = [], 0, [], []
