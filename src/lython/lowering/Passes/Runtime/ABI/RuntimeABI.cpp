@@ -433,7 +433,7 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeUserExceptionHooks() {
     }
     entries.push_back(Entry{
         *classId, *parentId,
-        py::contracts::manifestClassNameForContract(classOp.getSymName())});
+        py::contracts::displayClassNameForContract(classOp.getSymName())});
   });
   if (mlir::failed(collected))
     return mlir::failure();

@@ -37,6 +37,10 @@ EmitResult ModuleEmitter::emit() {
                       mlir::linalg::LinalgDialect, mlir::scf::SCFDialect,
                       mlir::tensor::TensorDialect>();
   types.seedBuiltins();
+  types.setGenericClassResolver(
+      [this](llvm::StringRef baseName, mlir::ArrayRef<mlir::Type> arguments) {
+        return ensureGenericClassSpecialization(baseName, arguments);
+      });
 
   module = mlir::ModuleOp::create(builder.getUnknownLoc());
   module.setName(moduleName);
@@ -76,6 +80,11 @@ EmitResult ModuleEmitter::emit() {
     module->setAttr("ly.module_global_types", typeArray(builder, globalTypes));
   }
 
+  // Generic class instantiations may now be emitted as they are demanded.
+  // Everything registerModule's fixpoint allocated (a parameter annotated
+  // `C[int]`) waited in the queue: the fixpoint reruns, so emitting from it
+  // would duplicate, and no top-level environment existed yet.
+  genericClassEmissionReady = true;
   emitSourceModuleDeclarations();
   emitTopLevelDeclarations();
 

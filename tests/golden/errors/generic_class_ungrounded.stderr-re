@@ -1,0 +1,1 @@
+emit error: generic class 'Stack\[T\]' requires explicit type arguments here, or an annotated context that determines them

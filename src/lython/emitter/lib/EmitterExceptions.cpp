@@ -886,6 +886,19 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
 
           for (const parser::Node *candidate : candidateTypes) {
             mlir::Type candidateType = types.inferExpr(candidate);
+            // A generic exception class has one contract per instantiation and
+            // no class of its own, so an unsubscripted handler has no single
+            // class id to test. Named here rather than left to the class-id
+            // lookup, which cannot say why the class is missing.
+            if (auto typeObject =
+                    mlir::dyn_cast_if_present<py::TypeType>(candidateType))
+              if (candidate &&
+                  rejectGenericClassObject(*candidate,
+                                           typeObject.getInstanceType())) {
+                handlerTypes.clear();
+                handlerTypeLocs.clear();
+                break;
+              }
             if (!mlir::isa_and_nonnull<py::TypeType>(candidateType)) {
               diagnostics.push_back(parser::Diagnostic{
                   parser::Severity::Error,

@@ -488,9 +488,9 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
                   parser::Severity::Error, target.range.start,
                   "assigning class attribute '" + std::string(*attr) +
                       "' through subclass '" +
-                      py::contracts::manifestClassNameForContract(className) +
+                      py::contracts::displayClassNameForContract(className) +
                       "' would shadow '" +
-                      py::contracts::manifestClassNameForContract(
+                      py::contracts::displayClassNameForContract(
                           slot->first) +
                       "'; assign through the defining class"});
               return;

@@ -1519,6 +1519,128 @@ void TypeSystem::bindClass(llvm::StringRef name, mlir::Type instanceType) {
   canonicalBindings.erase(name);
 }
 
+void TypeSystem::setGenericClassResolver(GenericClassResolver resolver) {
+  genericClassResolver = std::move(resolver);
+}
+
+mlir::Type
+TypeSystem::resolveGenericClass(llvm::StringRef baseName,
+                                mlir::ArrayRef<mlir::Type> arguments) const {
+  if (!genericClassResolver || arguments.empty())
+    return {};
+  // A non-ground argument is not an instantiation: it is the generic body
+  // still talking about its own parameters, so the parameterized reading
+  // stands and no specialization is allocated.
+  for (mlir::Type argument : arguments) {
+    if (!argument || unboundStaticParameterCount(argument) != 0)
+      return {};
+    bool unresolved = false;
+    py::mapPyTypeStructure(argument,
+                           [&](mlir::Type node) -> std::optional<mlir::Type> {
+                             if (py::isPyInferVarType(node))
+                               unresolved = true;
+                             return std::nullopt;
+                           });
+    if (unresolved)
+      return {};
+  }
+  return genericClassResolver(baseName, arguments);
+}
+
+void TypeSystem::registerGenericClass(
+    llvm::StringRef contractName, llvm::ArrayRef<std::string> params,
+    const parser::Node *initNode, llvm::ArrayRef<GenericClassField> fields) {
+  GenericClassTemplate &tmpl = genericClassTemplates[contractName];
+  tmpl.params.assign(params.begin(), params.end());
+  tmpl.initNode = initNode;
+  tmpl.fields.assign(fields.begin(), fields.end());
+}
+
+mlir::Type TypeSystem::solveGenericClassInstantiation(
+    llvm::StringRef contractName, mlir::ArrayRef<mlir::Type> positional,
+    mlir::ArrayRef<CallKeywordType> keywords) const {
+  auto tmpl = genericClassTemplates.find(contractName);
+  if (tmpl == genericClassTemplates.end())
+    return {};
+  // The parameters have to stand as TypeVars for the match to have anything
+  // to solve: without the binding, annotationTypeForName would read a bare
+  // `T` as a class named T and fabricate a `builtins.T` contract.
+  auto scope = pushScope();
+  for (const std::string &param : tmpl->second.params)
+    bindLocalSymbol(param, py::TypeVarType::get(&context, param));
+
+  // The constructor's parameters, by name, in call order.
+  llvm::SmallVector<std::pair<llvm::StringRef, mlir::Type>, 8> formals;
+  FunctionSignature init;
+  if (tmpl->second.initNode) {
+    init = functionSignature(*tmpl->second.initNode, llvm::StringRef("self"));
+    // positionalTypes[0] is the receiver, which is not an argument.
+    for (auto [index, name] : llvm::enumerate(init.positionalNames)) {
+      if (index == 0 || index >= init.positionalTypes.size())
+        continue;
+      formals.emplace_back(name, init.positionalTypes[index]);
+    }
+    for (auto [index, name] : llvm::enumerate(init.kwOnlyNames))
+      if (index < init.kwOnlyTypes.size())
+        formals.emplace_back(name, init.kwOnlyTypes[index]);
+  } else {
+    for (const GenericClassField &field : tmpl->second.fields)
+      formals.emplace_back(field.first, annotationType(field.second));
+  }
+
+  TypeBindingMap bindings;
+  for (auto [index, argument] : llvm::enumerate(positional)) {
+    if (index >= formals.size())
+      break;
+    bindExpectedType(*this, formals[index].second, widenLiteral(argument),
+                     bindings);
+  }
+  for (const CallKeywordType &keyword : keywords)
+    for (const auto &formal : formals)
+      if (formal.first == keyword.name)
+        bindExpectedType(*this, formal.second, widenLiteral(keyword.type),
+                         bindings);
+
+  llvm::SmallVector<mlir::Type, 4> arguments;
+  for (const std::string &param : tmpl->second.params) {
+    auto solved = bindings.find(param);
+    if (solved == bindings.end())
+      return {};
+    arguments.push_back(solved->second);
+  }
+  return resolveGenericClass(contractName, arguments);
+}
+
+mlir::Type
+TypeSystem::genericClassSubscript(const parser::Node *node) const {
+  if (!genericClassResolver || !node || node->kind != "Subscript")
+    return {};
+  const parser::Node *base = ast::node(*node, "value");
+  if (!base || (base->kind != "Name" && base->kind != "Attribute"))
+    return {};
+  std::string qualified = ast::qualifiedName(base);
+  std::string_view spelling = ast::nameSpelling(*base);
+  std::string resolved = resolveAnnotationName(
+      qualified.empty() ? llvm::StringRef(spelling.data(), spelling.size())
+                        : llvm::StringRef(qualified));
+  std::optional<mlir::Type> knownClass = lookupClass(resolved);
+  auto contractType = knownClass
+                          ? mlir::dyn_cast_if_present<py::ContractType>(*knownClass)
+                          : py::ContractType();
+  if (!contractType)
+    return {};
+  const parser::Node *slice = ast::node(*node, "slice");
+  llvm::SmallVector<mlir::Type, 4> arguments;
+  if (slice && slice->kind == "Tuple") {
+    if (const auto *elts = ast::nodeList(*slice, "elts"))
+      for (const parser::NodePtr &elt : *elts)
+        arguments.push_back(annotationType(elt.get()));
+  } else if (slice) {
+    arguments.push_back(annotationType(slice));
+  }
+  return resolveGenericClass(contractType.getContractName(), arguments);
+}
+
 std::optional<mlir::Type> TypeSystem::lookupClass(llvm::StringRef name) const {
   for (auto it = scopedClasses.rbegin(), e = scopedClasses.rend(); it != e;
        ++it) {
@@ -2034,8 +2156,12 @@ mlir::Type TypeSystem::annotationType(const parser::Node *node) const {
       return contract(*contractName, arguments);
     if (auto knownClass = lookupClass(baseName)) {
       if (auto contractType =
-              mlir::dyn_cast_if_present<py::ContractType>(*knownClass))
+              mlir::dyn_cast_if_present<py::ContractType>(*knownClass)) {
+        if (mlir::Type specialized = resolveGenericClass(
+                contractType.getContractName(), arguments))
+          return specialized;
         return contract(contractType.getContractName(), arguments);
+      }
       return *knownClass;
     }
   }
@@ -2231,6 +2357,10 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
     if (std::optional<PrimitiveTypeSpec> primitive =
             primitiveTypeSpecFromSubscript(node, *this))
       return typeObject(primitive->type);
+    // `C[int]` over a generic class is the instantiation's class object, not
+    // a __getitem__ on a value.
+    if (mlir::Type instantiated = genericClassSubscript(node))
+      return typeObject(instantiated);
     mlir::Type container = recurse(ast::node(*node, "value"));
     // A shaped primitive indexes down to its element type; there is no
     // manifest __getitem__ behind it to infer through.
@@ -2447,6 +2577,11 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
         keywords.push_back(CallKeywordType{std::string(*name), keywordType});
       }
     }
+
+    // `C[int](...)` names its instantiation directly; the specialized class
+    // is an ordinary non-generic contract from here on.
+    if (mlir::Type instantiated = genericClassSubscript(callee))
+      return instantiated;
 
     if (callee && callee->kind == "Name") {
       llvm::StringRef name = ast::nameSpelling(*callee);
@@ -2823,6 +2958,14 @@ mlir::Type TypeSystem::inferClassInstantiation(
       return {};
     return type;
   };
+  // A monomorphized user generic resolves to its specialization, which is an
+  // ordinary ground class; the manifest paths below only know parameterized
+  // MANIFEST classes.
+  if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(instanceType))
+    if (contract.getArguments().empty())
+      if (mlir::Type solved = solveGenericClassInstantiation(
+              contract.getContractName(), positional, keywords))
+        return solved;
   mlir::Type templated = genericClassTemplate(*this, instanceType);
   if (std::optional<CallSolution> init =
           tryManifestMethod(*this, templated, "__init__", positional, keywords))

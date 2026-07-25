@@ -96,6 +96,26 @@ inline std::string manifestClassNameForContract(llvm::StringRef name) {
   }
   return name.str();
 }
+
+// The class name a PROGRAM sees. A monomorphized generic class contract is
+// named "<class>$spec<N>", an internal symbol that must never surface: repr,
+// exception names and diagnostics all have to read as the class the source
+// wrote. Kept separate from manifestClassNameForContract because that one also
+// feeds manifest LOOKUPS, which need the specialization's own name.
+inline std::string displayClassNameForContract(llvm::StringRef name) {
+  std::string display = manifestClassNameForContract(name);
+  std::size_t marker = display.rfind("$spec");
+  if (marker == std::string::npos || marker == 0)
+    return display;
+  llvm::StringRef index(display.c_str() + marker + 5);
+  if (index.empty() || !llvm::all_of(index, [](char c) {
+        return c >= '0' && c <= '9';
+      }))
+    return display;
+  display.resize(marker);
+  return display;
+}
+
 std::string runtimeContractName(mlir::Type type);
 
 } // namespace py::contracts

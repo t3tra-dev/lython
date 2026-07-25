@@ -1,0 +1,24 @@
+OrderedDict({'a': 1, 'b': 2, 'c': 3})
+3 2 True False
+['a', 'b', 'c']
+[1, 2, 3]
+[('a', 1), ('b', 2), ('c', 3)]
+['b', 'c', 'a']
+['a', 'b', 'c']
+('c', 3)
+('a', 1)
+OrderedDict({'b': 2})
+2 -1
+2 8
+OrderedDict({'b': 2, 'q': 8})
+OrderedDict({'b': 2, 'q': 8}) True
+False
+OrderedDict({'b': 2, 'q': 8}) True
+OrderedDict() 0
+False
+True
+OrderedDict({1: 'one', 2: 'two'})
+one
+OrderedDict({2: 'two'})
+OrderedDict() 0
+KeyError 'dictionary is empty'

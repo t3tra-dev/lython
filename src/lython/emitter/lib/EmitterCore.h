@@ -114,6 +114,80 @@ private:
   Value emitLambda(const parser::Node &expr, py::CallableType expected = {});
   void emitClassContract(const parser::Node &classDef,
                          llvm::StringRef symbolName = {});
+  // Monomorphization of `class C[T]`, the class-side counterpart of
+  // GenericFunctionInfo: the generic class itself is never emitted (a py
+  // class contract has no runtime slot for a type parameter, and its field
+  // types and method signatures would carry `!py.typevar` into the ABI).
+  // Every ground instantiation the program spells becomes a full, ordinary
+  // class contract of its own, so every layer below the emitter — MRO,
+  // evidence, refcounting, lowering — keeps seeing only ground classes.
+  struct GenericClassInfo {
+    const parser::Node *node = nullptr;
+    // Type parameter names in declaration order. Kinds other than TypeVar
+    // (ParamSpec/TypeVarTuple) are rejected at the instantiation site.
+    llvm::SmallVector<std::string, 4> params;
+    bool hasPackParameter = false;
+    // Specialization contract names derive from this ("C" for main-module
+    // classes, "<module>.C" for imported ones), matching the non-generic
+    // class symbol scheme so two modules' same-named generics cannot
+    // collide.
+    std::string symbolBase;
+    // Defining source module for imported generics (null for main-module
+    // ones): a specialization's method bodies must emit under the DEFINING
+    // module's scope, not the use site's.
+    const EmitOptions::SourceModule *source = nullptr;
+    // Keyed by the parameterized contract `C[args...]` — a uniqued type, so
+    // it is the instantiation's identity.
+    llvm::DenseMap<mlir::Type, std::string> specializations;
+  };
+  // The specialized contract for `baseName[arguments]`, or null when
+  // baseName is not a registered generic class. Installed as TypeSystem's
+  // generic-class resolver, so every annotation and expression that spells
+  // an instantiation funnels through here.
+  mlir::Type ensureGenericClassSpecialization(
+      llvm::StringRef baseName, mlir::ArrayRef<mlir::Type> arguments);
+  // Emits specializations allocated but not yet emitted, to a fixpoint (a
+  // specialization's own body may spell further ones). `onlyBase` restricts
+  // the drain to one generic class: the declaration walk drains at each
+  // generic class's own statement position, so a specialization's base-class
+  // facts are registered before its MRO is linearized.
+  void drainGenericClassSpecializations(llvm::StringRef onlyBase = {});
+  void emitGenericClassSpecialization(GenericClassInfo &generic,
+                                      llvm::StringRef symbol,
+                                      mlir::ArrayRef<mlir::Type> arguments);
+  // Registers `class C[T]` for monomorphization instead of emitting it.
+  // Returns false when the class is not generic (the caller emits it).
+  bool registerGenericClass(const parser::Node &classDef,
+                            llvm::StringRef symbolBase,
+                            const EmitOptions::SourceModule *source);
+  GenericClassInfo *lookupGenericClass(llvm::StringRef name);
+  // Binds a specialization's type arguments by their parameter names into the
+  // CURRENT scope. Class method bodies are emitted twice over: once as
+  // standalone symbols under the specialization's own emission scope, and
+  // again inlined at every use site, where that scope is long gone — so the
+  // bindings have to be recoverable from the class contract name alone.
+  void bindClassTypeArguments(llvm::StringRef className);
+  // Diagnoses a bare reference to a generic class where no ground
+  // instantiation can be recovered — the class-side counterpart of the
+  // generic function's "requires a call or an annotated Callable context".
+  void diagnoseUngroundedGenericClass(const parser::Node &anchor,
+                                      llvm::StringRef name);
+  // Rejects materializing a generic class's class OBJECT (`C.attr`, `C` as a
+  // value): monomorphization leaves one contract per instantiation and no
+  // class object for the generic itself. Returns nullopt when the class is
+  // not generic.
+  std::optional<Value> rejectGenericClassObject(const parser::Node &anchor,
+                                                mlir::Type classType);
+  // The specialized contract a bare `C(...)` should construct, recovered
+  // from an expected type that is one of C's specializations; null when the
+  // call is not a bare generic-class construction or the expectation does
+  // not name an instantiation of it.
+  mlir::Type expectedGenericClassInstantiation(const parser::Node &call,
+                                               mlir::Type expected);
+  // The specialized contract a bare `C(...)` should construct, recovered from
+  // the ARGUMENT types through __init__'s parameter types; null when they do
+  // not determine every type parameter.
+  mlir::Type inferredGenericClassInstantiation(const parser::Node &call);
   void collectClassFields(const parser::Node &classDef,
                           llvm::SmallVectorImpl<std::string> &fieldNames,
                           llvm::SmallVectorImpl<mlir::Type> &fieldTypes,
@@ -294,6 +368,14 @@ private:
   ensureGenericSpecialization(const parser::Node &anchor,
                               GenericFunctionInfo &generic,
                               py::CallableType target);
+  // Runs `body` under the environment of the module that DEFINES an imported
+  // generic, not the use site's. Scope ISOLATION rather than a plain push is
+  // what keeps that honest: a plain push would let an unbound name in the
+  // imported body silently resolve to a use-site local instead of being
+  // diagnosed. Diagnostics raised inside are attributed to that module's
+  // file.
+  void emitInDefiningModuleScope(const EmitOptions::SourceModule &source,
+                                 llvm::function_ref<void()> body);
   // Generic lookup for a callee spelling: the local registration first, then
   // the canonical import binding (imported generics register under their
   // canonical "<module>.<name>" symbol).
@@ -569,6 +651,28 @@ private:
   mlir::OpBuilder builder;
   TypeSystem types;
   llvm::StringMap<GenericFunctionInfo> genericFunctions;
+  llvm::StringMap<GenericClassInfo> genericClasses;
+  // Solved type arguments per specialized class contract, in parameter order.
+  llvm::StringMap<llvm::SmallVector<std::pair<std::string, mlir::Type>, 4>>
+      classTypeArguments;
+  // Instantiations whose class contract is allocated but whose body has not
+  // been emitted. The queue exists because the FIRST demand for a
+  // specialization arrives during registerModule's signature fixpoint (a
+  // parameter annotated `C[int]`), where no class may be emitted yet: the
+  // top-level declarations are not established and the fixpoint reruns.
+  // Allocating the contract name there and draining at the declaration phase
+  // keeps the signature memo consistent with what is eventually emitted.
+  struct PendingClassSpecialization {
+    std::string base;
+    std::string symbol;
+    llvm::SmallVector<mlir::Type, 4> arguments;
+  };
+  std::vector<PendingClassSpecialization> pendingClassSpecializations;
+  // Set once the declaration phase begins: from then on a newly demanded
+  // instantiation emits immediately, because a use site needs its class
+  // facts (fields, methods, MRO) before the statement it appears in
+  // finishes.
+  bool genericClassEmissionReady = false;
   parser::Diagnostics diagnostics;
   llvm::StringMap<Value> values;
   llvm::StringMap<PrimitiveConstant> primitiveConstants;
