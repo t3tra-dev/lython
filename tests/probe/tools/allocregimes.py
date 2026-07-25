@@ -92,24 +92,39 @@ def main():
     print(f"{'probe':{width}}  " + "  ".join(f"{n:>12}" for n in names))
     print("-" * (width + 2 + 14 * len(names)))
 
-    bad = 0
+    bad = refused = 0
     for p in args.probes:
         run.want = subprocess.run([CPY, str(p)], capture_output=True,
                                   text=True).stdout
-        cells, failed = [], False
+        cells, outcomes = [], []
         for name in names:
             seen = {run(lyc, p, REGIMES[name]) for _ in range(args.runs)}
             cell = "ok" if seen == {"ok"} else "/".join(sorted(seen))
-            if seen != {"ok"}:
-                failed = True
+            outcomes.append(seen)
             cells.append(cell)
-        bad += failed
-        flag = "" if not failed else "   <-- FAILS"
+        # A probe lyc REFUSES in every regime never ran, so there is no
+        # allocator behaviour for its outcome to depend on and this tool has
+        # nothing to say about it. Counting it would make the exit code
+        # unusable as a gate the moment the corpus holds a loud probe -- it
+        # holds fifty -- and a checker that reports a healthy tree as red
+        # teaches the reader to skim its output.
+        if all(s == {"reject"} for s in outcomes):
+            refused += 1
+            flag = "   (refused, not an allocator finding)"
+        elif any(s != {"ok"} for s in outcomes):
+            bad += 1
+            flag = "   <-- FAILS"
+        else:
+            flag = ""
         print(f"{p.name:{width}}  " + "  ".join(f"{c:>12}" for c in cells) + flag,
               flush=True)
 
     print(f"\n{bad}/{len(args.probes)} probes fail in at least one regime "
           f"({args.runs} runs per regime, {len(names)} regimes)")
+    if refused:
+        print(f"{refused} refused in every regime and are not counted: a "
+              f"program that does not run cannot have an allocator-dependent "
+              f"outcome")
     return bad
 
 
