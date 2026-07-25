@@ -1,0 +1,26 @@
+# probe: leak -- int field rebind on a call-obtained receiver (three lanes, no heap payload for small ints) (40000 iterations)
+# axes: op=leak-loop iterations=40000
+# CLASSIFICATION: 1 正しい
+# CPython 3.14 expects: 49382680000
+# RSS: 28 バイト/回 → リークなし (計測ノイズ ±80 B/回 の範囲)
+
+class Box:
+    def __init__(self, v: int) -> None:
+        self.f: int = v
+
+
+def mk() -> Box:
+    return Box(0)
+
+
+def once() -> int:
+    o = mk()
+    fresh: int = 1234567
+    o.f = fresh
+    return o.f
+
+
+total = 0
+for _ in range(40000):
+    total += once()
+print(total)
