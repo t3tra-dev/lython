@@ -2,7 +2,7 @@
 # axes: op=leak-loop iterations=100
 # CLASSIFICATION: 1 正しい
 # CPython 3.14 expects: 400
-# RSS: 17 バイト/回 → リークなし (計測ノイズ ±80 B/回 の範囲)
+# RSS: 17 バイト/回 → リークなし (計測ノイズ ±130 B/回 の範囲)
 
 class Box:
     def __init__(self, v: dict[str, int]) -> None:

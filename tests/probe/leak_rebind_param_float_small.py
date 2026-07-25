@@ -3,7 +3,7 @@
 # CLASSIFICATION: 2 silent 誤実行
 #   cpython='100\n' lyc='0\n'
 # CPython 3.14 expects: 100
-# RSS: -25 バイト/回 → リークなし (計測ノイズ ±80 B/回 の範囲)
+# RSS: -25 バイト/回 → リークなし (計測ノイズ ±130 B/回 の範囲)
 
 class Box:
     def __init__(self, v: float) -> None:

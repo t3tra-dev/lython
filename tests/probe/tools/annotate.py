@@ -72,8 +72,15 @@ def main():
             if ln.startswith("# CPython 3.14 expects:"):
                 in_verdict = False
                 exp = (rec.get("cpy_out") or "").strip()
-                out.append("# CPython 3.14 expects: "
-                           + (exp.replace("\n", " / ") if exp else "(例外を送出)"))
+                if exp:
+                    shown = exp.replace("\n", " / ")
+                # No stdout is not the same as a raise: a probe whose point is
+                # that a shape COMPILES prints nothing and still exits 0.
+                elif rec.get("cpy_rc") == 0:
+                    shown = "(出力なし、正常終了)"
+                else:
+                    shown = "(例外を送出)"
+                out.append(f"# CPython 3.14 expects: {shown}")
                 if leakline:
                     out.append(leakline)
                 continue
