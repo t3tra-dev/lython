@@ -782,8 +782,25 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
           }
         }
         if (runtimeContractName(logicalType) != "builtins.int") {
-          function.emitError()
-              << "primitive i64 callable clone parameter must be builtins.int";
+          // Naming the contract and the reason, not just the expected type: the
+          // parameter this rejects is usually one the user never wrote (a
+          // generator's captured receiver, or a closure cell), so "must be
+          // builtins.int" alone points at nothing they can act on.
+          std::string contract = runtimeContractName(logicalType);
+          mlir::InFlightDiagnostic diagnostic = function.emitError();
+          if (generatorArgInfo)
+            diagnostic << "a generator cannot carry a value of contract '"
+                       << (contract.empty() ? "<none>" : contract)
+                       << "' across a suspension yet: only builtins.int and "
+                          "manifest contracts with a rank-1 physical shape "
+                          "have a resume lane, and a user class has neither. "
+                          "Read the value into an int local before the first "
+                          "yield, or move the generator out of the class and "
+                          "pass the fields it needs";
+          else
+            diagnostic << "primitive i64 callable clone parameter must be "
+                          "builtins.int, but this one has contract '"
+                       << (contract.empty() ? "<none>" : contract) << "'";
           result = mlir::failure();
           return mlir::WalkResult::interrupt();
         }
