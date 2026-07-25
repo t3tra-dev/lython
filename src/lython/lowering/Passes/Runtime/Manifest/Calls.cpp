@@ -1,5 +1,7 @@
 #include "Runtime/Core/Lowerer.h"
 
+#include "Runtime/ABI/BoxLayout.h"
+
 namespace py::lowering {
 
 mlir::LogicalResult
@@ -525,6 +527,33 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
                << "class initializer argument " << index << " has type "
                << fieldValue->objectValue.contract << ", but field expects "
                << fieldTypes[index];
+      std::string fieldName = "field";
+      if (fieldNames && index < fieldNames.size()) {
+        auto name = mlir::dyn_cast<mlir::StringAttr>(fieldNames[index]);
+        if (!name)
+          return op.emitError() << "class field metadata is malformed for "
+                                << classOp.getSymName();
+        fieldName = name.getValue().str();
+      }
+      // A header-word field's storage is a word of the instance header, and
+      // this initializer used to write the placeholder LANES instead: a class
+      // declared without __init__ (`class P: x: int`) read its int fields back
+      // as zero, silently, because attr.get has always loaded the word.
+      mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> storageTypes =
+          RuntimeBundleLowerer::classFieldStorageValueTypes(
+              op, fieldTypes[index], index, "class field ABI");
+      if (mlir::failed(storageTypes))
+        return mlir::failure();
+      if (storageTypes->empty()) {
+        if (mlir::failed(RuntimeBundleLowerer::storePrimitiveFieldSlot(
+                op, *instance, *fieldValue, fieldTypes[index],
+                static_cast<unsigned>(box_abi::kPointerWordBase) + index,
+                fieldName)))
+          return mlir::failure();
+        updatedFieldBundles[index] =
+            std::make_shared<RuntimeBundle>(*fieldValue);
+        continue;
+      }
       bool boxedField =
           RuntimeBundleLowerer::classFieldStoredBoxed(fieldTypes[index]);
       // Every box-fronted field fills the box16 the instance materialization
@@ -533,14 +562,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
       // through and every other frame reads through, so it must never be
       // re-rooted after construction.
       if (boxedField) {
-        std::string slotName = "class.field";
-        if (fieldNames && index < fieldNames.size()) {
-          auto name = mlir::dyn_cast<mlir::StringAttr>(fieldNames[index]);
-          if (!name)
-            return op.emitError() << "class field metadata is malformed for "
-                                  << classOp.getSymName();
-          slotName = (llvm::Twine("class.") + name.getValue()).str();
-        }
+        std::string slotName = (llvm::Twine("class.") + fieldName).str();
         mlir::FailureOr<unsigned> offset =
             RuntimeBundleLowerer::classFieldValueOffset(op, classOp, index,
                                                         "class field ABI");
@@ -572,11 +594,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
         slotValue = std::move(*storageValue);
       }
 
-      mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> fieldValueTypes =
-          RuntimeBundleLowerer::classFieldStorageValueTypes(
-              op, fieldTypes[index], "class field ABI");
-      if (mlir::failed(fieldValueTypes))
-        return mlir::failure();
+      llvm::SmallVector<mlir::Type, 8> *fieldValueTypes = &*storageTypes;
       mlir::FailureOr<unsigned> offset =
           RuntimeBundleLowerer::classFieldValueOffset(op, classOp, index,
                                                       "class field ABI");
@@ -589,25 +607,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
       for (unsigned fieldOffset = 0; fieldOffset < fieldValueTypes->size();
            ++fieldOffset)
         oldValues.push_back(values[*offset + fieldOffset]);
-      std::string slotName = "class.field";
-      if (fieldNames && index < fieldNames.size()) {
-        auto name = mlir::dyn_cast<mlir::StringAttr>(fieldNames[index]);
-        if (!name)
-          return op.emitError() << "class field metadata is malformed for "
-                                << classOp.getSymName();
-        slotName = (llvm::Twine("class.") + name.getValue()).str();
-      }
+      std::string slotName = (llvm::Twine("class.") + fieldName).str();
       builder.setInsertionPoint(op);
       const RuntimeBundle *oldSlotValue = nullptr;
-      if (fieldNames && index < fieldNames.size()) {
-        auto name = mlir::dyn_cast<mlir::StringAttr>(fieldNames[index]);
-        if (!name)
-          return op.emitError() << "class field metadata is malformed for "
-                                << classOp.getSymName();
-        auto oldField = instance->fieldBundles.find(name.getValue());
-        if (oldField != instance->fieldBundles.end())
-          oldSlotValue = oldField->second.get();
-      }
+      if (auto oldField = instance->fieldBundles.find(fieldName);
+          oldField != instance->fieldBundles.end())
+        oldSlotValue = oldField->second.get();
       if (mlir::failed(RuntimeBundleLowerer::replaceAggregateSlot(
               op, fieldTypes[index], oldValues, oldSlotValue,
               fieldTypes[index], slotValue, slotName,

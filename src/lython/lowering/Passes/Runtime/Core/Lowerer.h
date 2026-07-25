@@ -132,9 +132,22 @@ private:
   // header word, a zero-lane contract has nothing to hold, and a union is not
   // one object.
   bool classFieldStoredBoxed(mlir::Type fieldContract) const;
+  // The storage a field occupies in the instance's expansion, by POSITION: a
+  // header-word field (int/bool) takes none, a box-fronted field one box16, and
+  // the residual shapes their contract's own lanes.
   mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>>
   classFieldStorageValueTypes(mlir::Operation *op, mlir::Type fieldContract,
+                              unsigned fieldIndex,
                               llvm::StringRef purpose) const;
+  // Stores a header-word field's value into the instance header. Shared by
+  // attr.set and the no-__init__ field-record initializer, which used to write
+  // the placeholder lanes instead and so read back zero.
+  mlir::LogicalResult storePrimitiveFieldSlot(mlir::Operation *op,
+                                              const RuntimeBundle &object,
+                                              const RuntimeBundle &value,
+                                              mlir::Type fieldType,
+                                              unsigned slot,
+                                              llvm::StringRef fieldName);
   mlir::FailureOr<RuntimeBundle>
   storeBoxedFieldPayloadInPlace(mlir::Operation *op, mlir::Value box,
                                 const RuntimeBundle &value,

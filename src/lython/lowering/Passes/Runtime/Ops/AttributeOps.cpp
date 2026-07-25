@@ -100,7 +100,7 @@ mlir::FailureOr<unsigned> RuntimeBundleLowerer::classFieldValueOffset(
   for (unsigned index = 0; index < fieldIndex; ++index) {
     mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> valueTypes =
         RuntimeBundleLowerer::classFieldStorageValueTypes(op, fieldTypes[index],
-                                                          purpose);
+                                                          index, purpose);
     if (mlir::failed(valueTypes))
       return mlir::failure();
     offset += static_cast<unsigned>(valueTypes->size());
@@ -151,6 +151,17 @@ RuntimeBundleLowerer::storeBoxedFieldPayloadInPlace(mlir::Operation *op,
       RuntimeBundleLowerer::materializePayloadObjectBundle(op, value);
   if (mlir::failed(payload))
     return mlir::failure();
+  // The slot holds a canonical payload handle, so the value needs a concrete
+  // shape to describe. `objectPayloadHandleWords` refuses an erased `object`
+  // below, but its message is written for a container element; say it in terms
+  // of the field, which is what the author wrote.
+  if (const RuntimeBundle *concrete =
+          RuntimeBundleLowerer::concreteObjectForOwnership(*payload))
+    if (concrete->contractName() == "builtins.object")
+      return op->emitError()
+             << "a type-erased `object` value cannot be stored in field '"
+             << slotName
+             << "'; annotate the field with the concrete class it holds";
   if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(op, *payload,
                                                              slotName)))
     return mlir::failure();
@@ -215,6 +226,61 @@ RuntimeBundleLowerer::storeBoxedFieldPayloadInPlace(mlir::Operation *op,
   return stored;
 }
 
+mlir::LogicalResult RuntimeBundleLowerer::storePrimitiveFieldSlot(
+    mlir::Operation *op, const RuntimeBundle &object,
+    const RuntimeBundle &value, mlir::Type fieldType, unsigned slot,
+    llvm::StringRef fieldName) {
+  builder.setInsertionPoint(op);
+  mlir::Location loc = op->getLoc();
+  mlir::Value word;
+  if (isBoolFieldType(fieldType)) {
+    if (value.physicalValues().size() != 1 ||
+        !value.physicalValues().front().getType().isInteger(1))
+      return op->emitError() << "attribute value " << value.contractName()
+                             << " has no i1 lane for bool field '" << fieldName
+                             << "'";
+    word = mlir::arith::ExtUIOp::create(builder, loc, builder.getI64Type(),
+                                        value.physicalValues().front())
+               .getResult();
+  } else if (primitiveI64LaneKnownValid(value.primitiveI64)) {
+    word = value.primitiveI64->value;
+  } else if (value.physicalValues().empty() && value.primitiveI64 &&
+             value.primitiveI64->value) {
+    // No boxed payload to fall back to (primitive-i64 clone lanes carry only
+    // the (value, valid) pair): the lane is the sole carrier.
+    word = value.primitiveI64->value;
+  } else {
+    std::optional<RuntimeSymbol> unbox =
+        manifest.primitive(value.contractName(), "unbox.i64");
+    if (!unbox)
+      return op->emitError() << "attribute value " << value.contractName()
+                             << " has no unbox.i64 primitive for field '"
+                             << fieldName << "'";
+    llvm::SmallVector<const RuntimeBundle *, 1> unboxSources{&value};
+    llvm::SmallVector<mlir::Value, 4> unboxOperands;
+    if (mlir::failed(buildRuntimeCallOperands(op, *unbox, unboxSources,
+                                              unboxOperands,
+                                              /*allowUnusedSources=*/false)))
+      return mlir::failure();
+    mlir::func::CallOp unboxCall =
+        RuntimeBundleLowerer::createRuntimeCall(loc, *unbox, unboxOperands);
+    if (unboxCall.getNumResults() != 1 ||
+        !unboxCall.getResult(0).getType().isInteger(64))
+      return unbox->function.emitError()
+             << "unbox.i64 primitive must return one i64";
+    word = unboxCall.getResult(0);
+  }
+
+  mlir::FailureOr<mlir::Value> header =
+      RuntimeBundleLowerer::objectPhysicalHeader(op, object.objectValue);
+  if (mlir::failed(header))
+    return mlir::failure();
+  mlir::Value slotIndex =
+      mlir::arith::ConstantIndexOp::create(builder, loc, slot).getResult();
+  mlir::memref::StoreOp::create(builder, loc, word, *header, slotIndex);
+  return mlir::success();
+}
+
 // Re-describes the payload a box already owns, for an in-place mutation that
 // REALLOCATED its arrays (list.append, dict insert). Only the descriptor words
 // move: the payload is the same logical object, the box holds the same single
@@ -256,8 +322,15 @@ mlir::LogicalResult RuntimeBundleLowerer::updateBoxedFieldPayloadWords(
 
 mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>>
 RuntimeBundleLowerer::classFieldStorageValueTypes(
-    mlir::Operation *op, mlir::Type fieldContract,
+    mlir::Operation *op, mlir::Type fieldContract, unsigned fieldIndex,
     llvm::StringRef purpose) const {
+  // A header-word field occupies NO lane: the word IS the storage. It used to
+  // carry the contract's full expansion as a placeholder nothing ever read --
+  // three memrefs allocated and released per int field per instance -- which
+  // also made a class of four int fields expand to thirteen handles and so too
+  // wide to sit in another class's box.
+  if (primitiveFieldSlot(fieldContract, fieldIndex))
+    return llvm::SmallVector<mlir::Type, 8>{};
   if (classFieldStoredBoxed(fieldContract)) {
     const RuntimeValueShape *objectShape =
         manifest.valueShape("builtins.object");
@@ -764,8 +837,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
       // box16 slot, and slicing by the contract's array shape would read the
       // neighbouring fields' lanes as if they were payload arrays.
       mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> memberValueTypes =
-          RuntimeBundleLowerer::classFieldStorageValueTypes(op, memberFieldType,
-                                                            "union field ABI");
+          RuntimeBundleLowerer::classFieldStorageValueTypes(
+              op, memberFieldType, *memberFieldIndex, "union field ABI");
       if (mlir::failed(memberValueTypes))
         return mlir::failure();
       if (!commonFieldType) {
@@ -860,6 +933,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
   mlir::Type fieldType = fieldTypes[*fieldIndex];
   mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> valueTypes =
       RuntimeBundleLowerer::classFieldStorageValueTypes(op, fieldType,
+                                                        *fieldIndex,
                                                         "class field ABI");
   if (mlir::failed(valueTypes))
     return mlir::failure();
@@ -1063,70 +1137,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
     return RuntimeBundleLowerer::lowerExceptionFieldAttrSet(
         op, *object, *value, classOp, *fieldIndex);
 
-  std::optional<unsigned> primitiveSlot =
-      primitiveFieldSlot(fieldTypes[*fieldIndex], *fieldIndex);
-  if (primitiveSlot && isBoolFieldType(fieldTypes[*fieldIndex])) {
-    builder.setInsertionPoint(op);
-    if (value->physicalValues().size() != 1 ||
-        !value->physicalValues().front().getType().isInteger(1))
-      return op.emitError() << "attribute value " << value->contractName()
-                            << " has no i1 lane for bool field '"
-                            << op.getName() << "'";
-    mlir::Value word = mlir::arith::ExtUIOp::create(
-                           builder, op.getLoc(), builder.getI64Type(),
-                           value->physicalValues().front())
-                           .getResult();
-    mlir::FailureOr<mlir::Value> header =
-        RuntimeBundleLowerer::objectPhysicalHeader(op, object->objectValue);
-    if (mlir::failed(header))
+  if (std::optional<unsigned> primitiveSlot =
+          primitiveFieldSlot(fieldTypes[*fieldIndex], *fieldIndex)) {
+    if (mlir::failed(RuntimeBundleLowerer::storePrimitiveFieldSlot(
+            op, *object, *value, fieldTypes[*fieldIndex], *primitiveSlot,
+            op.getName())))
       return mlir::failure();
-    mlir::Value slotIndex = mlir::arith::ConstantIndexOp::create(
-        builder, op.getLoc(), *primitiveSlot);
-    mlir::memref::StoreOp::create(builder, op.getLoc(), word, *header,
-                                  slotIndex);
-    erase.push_back(op);
-    return mlir::success();
-  }
-  if (primitiveSlot) {
-    builder.setInsertionPoint(op);
-    mlir::Value primitiveRawValue;
-    if (primitiveI64LaneKnownValid(value->primitiveI64)) {
-      primitiveRawValue = value->primitiveI64->value;
-    } else if (value->physicalValues().empty() && value->primitiveI64 &&
-               value->primitiveI64->value) {
-      // No boxed payload to fall back to (primitive-i64 clone lanes carry
-      // only the (value, valid) pair): the lane is the sole carrier.
-      primitiveRawValue = value->primitiveI64->value;
-    } else {
-      std::optional<RuntimeSymbol> unbox =
-          manifest.primitive(value->contractName(), "unbox.i64");
-      if (!unbox)
-        return op.emitError() << "attribute value " << value->contractName()
-                              << " has no unbox.i64 primitive for field '"
-                              << op.getName() << "'";
-      llvm::SmallVector<const RuntimeBundle *, 1> unboxSources{value};
-      llvm::SmallVector<mlir::Value, 4> unboxOperands;
-      if (mlir::failed(buildRuntimeCallOperands(op, *unbox, unboxSources,
-                                                unboxOperands,
-                                                /*allowUnusedSources=*/false)))
-        return mlir::failure();
-      mlir::func::CallOp unboxCall = RuntimeBundleLowerer::createRuntimeCall(
-          op.getLoc(), *unbox, unboxOperands);
-      if (unboxCall.getNumResults() != 1 ||
-          !unboxCall.getResult(0).getType().isInteger(64))
-        return unbox->function.emitError()
-               << "unbox.i64 primitive must return one i64";
-      primitiveRawValue = unboxCall.getResult(0);
-    }
-
-    mlir::FailureOr<mlir::Value> header =
-        RuntimeBundleLowerer::objectPhysicalHeader(op, object->objectValue);
-    if (mlir::failed(header))
-      return mlir::failure();
-    mlir::Value slotIndex = mlir::arith::ConstantIndexOp::create(
-        builder, op.getLoc(), *primitiveSlot);
-    mlir::memref::StoreOp::create(builder, op.getLoc(), primitiveRawValue,
-                                  *header, slotIndex);
     erase.push_back(op);
     return mlir::success();
   }
@@ -1196,7 +1212,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
 
   mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> fieldValueTypes =
       RuntimeBundleLowerer::classFieldStorageValueTypes(
-          op, fieldTypes[*fieldIndex], "class field ABI");
+          op, fieldTypes[*fieldIndex], *fieldIndex, "class field ABI");
   if (mlir::failed(fieldValueTypes))
     return mlir::failure();
   mlir::FailureOr<unsigned> offset =

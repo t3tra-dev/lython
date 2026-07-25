@@ -1,0 +1,1 @@
+a type-erased .object. value cannot be stored in field 'class\.f'; annotate the field with the concrete class it holds
