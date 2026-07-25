@@ -269,14 +269,21 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableArgumentEvidenceABIs() {
       if (!callable)
         return mlir::WalkResult::advance();
 
-      auto required = requirements.find(target.getSymName());
-      if (required == requirements.end())
-        return mlir::WalkResult::advance();
-
+      // ensureRequirement may INSERT the caller's slot, and inserting into an
+      // llvm::StringMap rehashes the bucket array — which invalidates every
+      // iterator into it. So the caller's slot is materialized FIRST and the
+      // target's flags are then read by value; holding an iterator across the
+      // insertion crashed the walk on the first module whose callers were
+      // discovered in this order.
       mlir::func::FuncOp caller = call->getParentOfType<mlir::func::FuncOp>();
       llvm::SmallVector<char, 8> *callerRequired = ensureRequirement(caller);
       if (!callerRequired)
         return mlir::WalkResult::advance();
+
+      auto required = requirements.find(target.getSymName());
+      if (required == requirements.end())
+        return mlir::WalkResult::advance();
+      llvm::SmallVector<char, 8> targetRequired = required->second;
       mlir::Block &callerEntry = caller.getBody().front();
 
       std::optional<StaticCallableInvocation> invocation =
@@ -289,8 +296,8 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableArgumentEvidenceABIs() {
 
       for (auto [logicalIndex, actualIndex] :
            llvm::enumerate(plan->fixedActuals)) {
-        if (logicalIndex >= required->second.size() ||
-            !required->second[logicalIndex] || !actualIndex ||
+        if (logicalIndex >= targetRequired.size() ||
+            !targetRequired[logicalIndex] || !actualIndex ||
             *actualIndex >= invocation->actualValues.size())
           continue;
         mlir::Value actual =
@@ -304,7 +311,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableArgumentEvidenceABIs() {
         unsigned before =
             static_cast<unsigned>((*callerRequired)[callerIndex]);
         unsigned propagated =
-            before | static_cast<unsigned>(required->second[logicalIndex]);
+            before | static_cast<unsigned>(targetRequired[logicalIndex]);
         if (propagated == before)
           continue;
         (*callerRequired)[callerIndex] = static_cast<char>(propagated);
