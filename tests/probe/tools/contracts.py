@@ -43,16 +43,17 @@ import tempfile
 
 CPY = "/opt/homebrew/Frameworks/Python.framework/Versions/3.14/bin/python3.14"
 
-# Cases known to disagree with CPython because the method has no implementation
-# behind its declared name. Measured on c3de5e7 (10 of 215).
+# Cases known to disagree with CPython. Measured on kernel/contract-audit at
+# 43e84c4: 501 cases, 431 ok, 70 expected.
 #
-# TREE-RELATIVE. All ten are the call forms of the six methods implemented on
-# kernel/side-defects (a4be8bf) -- list.pop, list.insert, and tuple.__add__,
-# __mul__, count, index -- so on any tree containing that branch the correct
-# contents of this set is empty. Do not carry it forward: the run will tell you,
-# because a case here that starts agreeing is reported as a stale expectation
-# and fails the gate.
+# TREE-RELATIVE, and grouped by *cause* because the causes retire at different
+# times. Do not carry any group forward on faith: a case here that starts
+# agreeing is reported as a stale expectation and fails the gate, which is the
+# whole point of the set. rfc/contract-audit.md holds the diagnosis for each
+# group.
 EXPECTED_FAILURES = frozenset({
+    # -- Implemented on kernel/side-defects (a4be8bf). On any tree containing
+    # that branch these ten pass and belong out of the set.
     "list.pop",
     "list.pop(i)",
     "list.pop(-2)",
@@ -63,6 +64,59 @@ EXPECTED_FAILURES = frozenset({
     "tuple.__mul__",
     "tuple.count",
     "tuple.index",
+    "MutableSequence.insert",          # list.insert reached via the protocol
+
+    # -- Unbound builtin *names*, not missing methods. The contract's methods
+    # work; the spelling used to reach them is not bound. All eleven complex
+    # methods pass when written as literals (1.0 + 2.0j) -- see the RFC, and do
+    # not "fix" these by implementing methods that already exist.
+    "complex.__add__", "complex.__add__.explicit",
+    "complex.__sub__", "complex.__sub__.explicit",
+    "complex.__mul__", "complex.__mul__.explicit",
+    "complex.__truediv__", "complex.__truediv__.explicit",
+    "complex.__neg__", "complex.__neg__.explicit",
+    "complex.__pos__", "complex.__pos__.explicit",
+    "complex.__eq__", "complex.__eq__.explicit",
+    "complex.__ne__", "complex.__ne__.explicit",
+    "complex.__repr__", "complex.__repr__.explicit",
+    "complex.__str__", "complex.__str__.explicit",
+    "complex.__abs__", "complex.__abs__.explicit",
+    "slice.indices",                   # `slice` unbound; xs[1:3] works
+    "object.__repr__", "object.__str__",   # `repr` unbound on user classes
+    "type.__repr__",                       # ditto
+    "type.__name__",                       # no static __name__ attribute
+    "int.__new__(bytes)",              # int(b"12") overload not declared
+    "float.__new__",                   # float("1.5") overload not declared
+
+    # -- builtins.object's default dunders do not reach user classes. Needs a
+    # decision about how they are inherited, not a manifest patch.
+    "object.__bool__",
+    "object.__eq__", "object.__eq__(self)", "object.__eq__.explicit",
+    "object.__ne__", "object.__ne__.explicit",
+    "object.__hash__", "object.__hash__.explicit",
+    "object.__repr__.explicit", "object.__str__.explicit",
+    "object.__init__.explicit",
+
+    # -- Declared with no implementation behind them.
+    "BaseException.with_traceback",     # wants tracebacks modelled first
+    "BaseException.add_note",           # wants a __notes__ field
+    "dict_keys.__reversed__",
+    "dict_values.__reversed__",
+    "dict_items.__reversed__",
+    "type.__call__",                   # now diagnosed, still unimplemented
+    "type.__or__",
+
+    # -- _asyncio.Future cannot be instantiated ("class instantiation leaves
+    # unbound static type parameters"), which hides all 14 of its declarations;
+    # Task's are behind the unbound asyncio.ensure_future.
+    "Future.set_result", "Future.done", "Future.cancelled", "Future.cancel",
+    "Future.__await__",
+    "Task.get_name", "Task.set_name", "Task.cancelling", "Task.uncancel",
+
+    # -- Behaviour differs from CPython 3.14 rather than failing.
+    "range.__repr__",                  # <range object at ...> vs range(0, 5)
+    "nullcontext",                     # __enter__ yields self, not None
+    "ContextManager.__enter__",        # __exit__ return type rejected
 })
 
 CASES = {}
