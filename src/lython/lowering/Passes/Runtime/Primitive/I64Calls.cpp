@@ -39,8 +39,6 @@ mlir::Value boolConstant(mlir::OpBuilder &builder, mlir::Location loc,
       .getResult();
 }
 
-bool isKnownTrue(mlir::Value value) { return isPinnedTrueFlag(value); }
-
 mlir::Value i64Constant(mlir::OpBuilder &builder, mlir::Location loc,
                         std::int64_t value) {
   return mlir::arith::ConstantIntOp::create(builder, loc, value, 64)
@@ -211,7 +209,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
                                                        lhs.value, rhs.value)
                                .getResult();
     mlir::Value fastResult = compared;
-    if (!isKnownTrue(operandsValid)) {
+    if (!isPinnedTrueFlag(operandsValid)) {
       // A comparison answers i1: unlike arithmetic it has nowhere to carry
       // "the raw operands were not the true values" forward. WHY NOT just
       // and-ing the validity in (which is what the boxed lane's `scf.if`
@@ -358,7 +356,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
   mlir::Value fastResult =
       mlir::arith::CmpIOp::create(builder, loc, *compare, lhs.value, rhs.value)
           .getResult();
-  if (isKnownTrue(operandsValid)) {
+  if (isPinnedTrueFlag(operandsValid)) {
     RuntimeBundle result;
     if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
             op, resultType, mlir::ValueRange{fastResult}, result)))

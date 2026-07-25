@@ -460,20 +460,22 @@ namespace {
 
 // A clone is total when no `return` of it can hand back valid=false: only then
 // may a call site speculate on it, because only then is the recovery path
-// (which re-runs the original body) unreachable.
+// (which re-runs the original body) unreachable. Only the plain (i64, i1) shape
+// is judged -- the wider resume ABIs of generator clones are never speculated
+// on, and guessing which of their lanes is a validity bit could mistake an
+// unrelated pinned i1 for one.
 bool isTotalPrimitiveI64Clone(mlir::func::FuncOp clone) {
   if (!clone || clone.isDeclaration())
     return false;
+  mlir::FunctionType type = clone.getFunctionType();
+  if (type.getNumResults() != 2 || !type.getResult(0).isInteger(64) ||
+      !type.getResult(1).isInteger(1))
+    return false;
   bool total = true;
   clone.walk([&](mlir::func::ReturnOp returnOp) {
-    // (raw, valid) pairs; every odd operand is a validity bit.
-    if (returnOp.getNumOperands() % 2 != 0) {
+    if (returnOp.getNumOperands() != 2 ||
+        !isPinnedTrueFlag(returnOp.getOperand(1)))
       total = false;
-      return;
-    }
-    for (unsigned index = 1; index < returnOp.getNumOperands(); index += 2)
-      if (!isPinnedTrueFlag(returnOp.getOperand(index)))
-        total = false;
   });
   return total;
 }
@@ -504,10 +506,13 @@ RuntimeBundleLowerer::foldUnprovenPrimitiveI64Speculations() {
   });
 
   for (mlir::scf::IfOp ifOp : speculations) {
-    auto cloneRef =
-        ifOp->getAttrOfType<mlir::FlatSymbolRefAttr>(kPrimitiveI64SpeculationAttr);
+    auto cloneRef = ifOp->getAttrOfType<mlir::FlatSymbolRefAttr>(
+        kPrimitiveI64SpeculationAttr);
     ifOp->removeAttr(kPrimitiveI64SpeculationAttr);
-    auto clone = module.lookupSymbol<mlir::func::FuncOp>(cloneRef.getAttr());
+    // A marker without a resolvable clone cannot be shown total, so it folds.
+    mlir::func::FuncOp clone;
+    if (cloneRef)
+      clone = module.lookupSymbol<mlir::func::FuncOp>(cloneRef.getAttr());
     if (isTotalPrimitiveI64Clone(clone))
       continue;
 
