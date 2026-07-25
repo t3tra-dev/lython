@@ -1675,6 +1675,14 @@ void advanceGroupLanesThroughReRoots(FuncContractCache &contracts,
                                      AliasAnalysis &aliases) {
   if (group.values.size() < 2 || !function || function.isDeclaration())
     return;
+  // Escape hatch for A/B measurement only (both the insertion pass and the
+  // verifier read it, so the two stay in agreement either way). Not a
+  // supported configuration: with the advance off, a payload re-root loses the
+  // entity again.
+  static const bool disabled =
+      std::getenv("LYTHON_OWNERSHIP_NO_LANE_ADVANCE") != nullptr;
+  if (disabled)
+    return;
   std::optional<mlir::DominanceInfo> dominance;
 
   // Bounded: each step replaces at least one lane with a value defined later,
