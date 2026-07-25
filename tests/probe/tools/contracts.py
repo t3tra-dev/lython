@@ -43,13 +43,15 @@ CPY = "/opt/homebrew/Frameworks/Python.framework/Versions/3.14/bin/python3.14"
 # Cases known to disagree with CPython because the method has no implementation
 # behind its declared name. Measured on c3de5e7 (10 of 215).
 #
-# TREE-RELATIVE, and known to be empty on one existing branch. All ten are call
-# forms of the six methods implemented on kernel/side-defects (a4be8bf) --
-# list.pop, list.insert, and tuple.__add__, __mul__, count, index. That branch
-# reports 0 failing of 215 on the full run, measured there rather than inferred
-# here, so once it merges the correct contents of this set is EMPTY. Do not
-# carry it forward; the run will say so, because a case here that starts
-# agreeing is reported as a stale expectation and fails the gate.
+# TREE-RELATIVE. All ten are call forms of the six methods implemented on
+# kernel/side-defects (a4be8bf) -- list.pop, list.insert, and tuple.__add__,
+# __mul__, count, index -- and that branch reports 0 failing of 215, measured on
+# kernel/side-defects ALONE. So the EXPECTED contents of this set after that
+# branch merges is empty, but the merged tree has not been measured: the merge
+# also brings e5e2574, and that combination is untested. Re-run before deleting
+# these lines rather than deleting them on the strength of this comment. The run
+# is one command and it answers the question directly, because a case here that
+# starts agreeing is reported as a stale expectation and fails the gate.
 EXPECTED_FAILURES = frozenset({
     "list.pop",
     "list.pop(i)",
