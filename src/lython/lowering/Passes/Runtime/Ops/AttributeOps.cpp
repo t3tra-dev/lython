@@ -50,6 +50,42 @@ bool isBoolFieldType(mlir::Type fieldType) {
   return runtimeContractName(fieldType) == "builtins.bool";
 }
 
+// Does this field read feed an IN-PLACE MUTATION of the value it loaded?
+//
+// A read should take its own reference -- CPython's does, and without one
+// `old = o.f; o.f = fresh` leaves `old` naming storage the rebind released. But
+// a mutation primitive spells in-place mutation as "consume the container and
+// hand back another one" (`transfer_args = [0]`), so a reader that also holds a
+// token has two claims on one reference and the release of the pre-mutation
+// lanes is rejected -- and inside a loop the lane advance cannot bridge them,
+// because the re-root is not ordered against the loop-carried uses. Until 4b
+// rewrites those primitives to non-transfer contracts, a read that is about to
+// be mutated stays pinned to the slot instead, which is what it was before.
+//
+// Syntactic on purpose: it asks what the read is FOR, at the one point where
+// both the load and its uses are visible, rather than guessing from the
+// contract (`list`/`dict`/`set` also get read purely to be observed).
+bool fieldReadFeedsInPlaceMutation(mlir::Value read) {
+  for (mlir::Operation *user : read.getUsers()) {
+    if (auto setItem = mlir::dyn_cast<py::SetItemOp>(user))
+      if (setItem.getContainer() == read)
+        return true;
+    if (auto delItem = mlir::dyn_cast<py::DelItemOp>(user))
+      if (delItem.getContainer() == read)
+        return true;
+    // A method call reaches its receiver through an attr.get, and whether the
+    // method mutates is not known here: treat any method lookup on the loaded
+    // value as a possible mutation. A nested FIELD read (`t.m.i`) is not one.
+    if (auto attrGet = mlir::dyn_cast<py::AttrGetOp>(user)) {
+      auto kind = attrGet->getAttrOfType<mlir::StringAttr>("ly.attr.kind");
+      if (attrGet.getObject() == read &&
+          !(kind && kind.getValue() == "field"))
+        return true;
+    }
+  }
+  return false;
+}
+
 std::optional<mlir::Attribute> classStaticValue(py::ClassOp classOp,
                                                 llvm::StringRef name) {
   auto names =
@@ -987,33 +1023,36 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
     if (mlir::failed(rebuilt))
       return mlir::failure();
     values = std::move(*rebuilt);
-    // A box-fronted payload is reconstructed from the box words, so its values
-    // are FRESH SSA — no borrowed-entry provenance the planner could trace, and
-    // a rebind may drop the box's reference while the read is still live. Take
-    // a reference at the load, as the aggregate-slot contract prescribes; the
-    // caller-owns-result return convention then holds. Only the contracts whose
-    // in-place mutation REALLOCATES their lanes keep the borrow: their reads
-    // feed a mutation whose write-back alias must stay pinned to the field, so
-    // the new lanes reach the box. Everything else (a class instance, a native
-    // one-lane handle, an immutable payload) mutates behind its own pointer.
+    // A read TAKES A REFERENCE. The reconstructed values are fresh SSA with no
+    // borrowed-entry provenance the planner could trace, and the slot's own
+    // reference is not the reader's to rely on: `old = o.f; o.f = fresh` drops
+    // it, and CPython keeps `old` alive because the read is a new reference.
+    // This is the aggregate-slot contract, and the caller-owns-result return
+    // convention then holds. The field alias rides along so an in-place
+    // mutation's write-back still reaches the box.
+    // The transfer conflict is a property of the CONTAINER mutation primitives,
+    // so only a container read has to give up its reference.
     if (!RuntimeBundleLowerer::isMutableContainerContractName(
-            runtimeShapeContractName(loadedContract))) {
+            runtimeShapeContractName(loadedContract)) ||
+        !fieldReadFeedsInPlaceMutation(op.getResult())) {
       if (!py::isAssignableTo(loadedContract, op.getResult().getType(), op))
         return op.emitError() << "attribute evidence " << loadedContract
                               << " is not assignable to result "
                               << op.getResult().getType();
+      RuntimeBundle read;
       if (cached) {
-        RuntimeBundle merged = *cached;
-        merged.objectValue.values.assign(values.begin(), values.end());
-        merged.setObjectLogicalOwnership(/*ownsObject=*/false);
-        return bindRetainedEvidenceBundle(op, op.getResult(),
-                                          std::move(merged));
+        read = *cached;
+        read.objectValue.values.assign(values.begin(), values.end());
+        read.setObjectLogicalOwnership(/*ownsObject=*/false);
+      } else {
+        read = RuntimeBundle::objectWithOwnership(
+            loadedContract, values,
+            ownership::logicalOwnershipKind(loadedContract,
+                                           /*ownsObject=*/false));
       }
-      RuntimeValue element{loadedContract, values,
-                           ownership::logicalOwnershipKind(
-                               loadedContract, /*ownsObject=*/false)};
-      return bindRetainedEvidenceValue(op, op.getResult(),
-                                       "box-fronted field load", element);
+      read.fieldAliasOwner = op.getObject();
+      read.fieldAliasName = op.getName().str();
+      return bindRetainedEvidenceBundle(op, op.getResult(), std::move(read));
     }
   }
   RuntimeBundle result;
