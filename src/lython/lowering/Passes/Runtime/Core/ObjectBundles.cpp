@@ -40,11 +40,17 @@ mlir::LogicalResult RuntimeBundleLowerer::makeObjectBundleWithOwnership(
   return mlir::success();
 }
 
+bool RuntimeBundleLowerer::ownedLocalObjectMarkerFollowsExpansion(
+    mlir::Value logicalValue) const {
+  return logicalValue && logicalValue.getDefiningOp<py::NewOp>() != nullptr;
+}
+
 mlir::LogicalResult
 RuntimeBundleLowerer::markOwnedLocalObjectBundle(mlir::Operation *op,
                                                  mlir::Value logicalValue,
                                                  const RuntimeBundle &bundle) {
-  if (!logicalValue || !logicalValue.getDefiningOp<py::NewOp>())
+  if (!RuntimeBundleLowerer::ownedLocalObjectMarkerFollowsExpansion(
+          logicalValue))
     return mlir::success();
   if (bundle.kind != RuntimeBundle::Kind::Object ||
       bundle.objectValue.values.empty())

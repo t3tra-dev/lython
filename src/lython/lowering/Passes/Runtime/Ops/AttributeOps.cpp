@@ -1072,10 +1072,31 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
             op, slotStorageType, oldValues, slotName)))
       return mlir::failure();
   } else {
+    // A store to a field wider than one handle RE-ROOTS those lanes in the
+    // object's expansion. When the instance was not constructed in this frame
+    // there is no owned-local marker to republish, so every later release of
+    // the object -- the normal-path one and each unwind cleanup -- still names
+    // the birth expansion and releases the REPLACED value itself. Releasing it
+    // here as well is a second release of the same list: `Ly_DecRef observed
+    // non-positive refcount` when the freed block reads back as zero, and a
+    // silent use-after-free when it does not (which is why it surfaced as a
+    // load-dependent flake rather than a hard failure).
+    //
+    // Leaving the release to that stale-but-self-consistent teardown keeps the
+    // replaced value released exactly once and leaks the replacement instead.
+    // A leak, not a double free: bounded, deterministic, and never a
+    // mis-execution. Removing it needs the release machinery to track a
+    // per-region expansion for one entity (the `stale`/re-root notion the
+    // affine verifier already has for a consuming call that returns the
+    // entity) -- see the ownership note in runtime/lib/json.py.
+    bool markerFollows =
+        RuntimeBundleLowerer::ownedLocalObjectMarkerFollowsExpansion(
+            op.getObject());
     if (mlir::failed(RuntimeBundleLowerer::replaceAggregateSlot(
             op, fieldTypes[*fieldIndex], oldValues, oldSlotValue,
             fieldTypes[*fieldIndex], slotValue, slotName,
-            /*releaseMissingOldObjectSlot=*/true)))
+            /*releaseMissingOldObjectSlot=*/true,
+            /*releaseOldSlot=*/markerFollows)))
       return mlir::failure();
   }
   if (releaseOwnedSource &&

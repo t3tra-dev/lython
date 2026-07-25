@@ -462,7 +462,12 @@ private:
       mlir::Operation *op, mlir::Type oldType, mlir::ValueRange oldValues,
       const RuntimeBundle *oldSlotValue, mlir::Type newType,
       const RuntimeBundle &newSlotValue, llvm::StringRef slotName,
-      bool releaseMissingOldObjectSlot = true);
+      bool releaseMissingOldObjectSlot = true, bool releaseOldSlot = true);
+  // Does an owned-local-object marker for `logicalValue` track the CURRENT
+  // expansion, i.e. will `markOwnedLocalObjectBundle` republish it after a
+  // field re-root? Only an instance constructed in this frame has one; the
+  // release machinery keeps naming the birth expansion for anything else.
+  bool ownedLocalObjectMarkerFollowsExpansion(mlir::Value logicalValue) const;
   mlir::LogicalResult retainAggregateSlot(mlir::Operation *op,
                                           mlir::Type slotType,
                                           mlir::ValueRange values,

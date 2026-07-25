@@ -61,3 +61,13 @@ while j < 3:
     values.append(json.of_str("v" + str(j)))
     j = j + 1
 print(json.dumps(json.obj_of(keys, values)))
+
+# obj()/arr() + set()/append() は obj_of()/arr_of() より後に書いても同じ結果に
+# なる。set()/append() は自身の _kids を差し替えるので、ノードを返した呼び出し
+# の解放が古いレーンを指したままになる順序依存があった。
+tail_obj = json.obj()
+tail_obj.set("k", json.of_int(1))
+print(json.dumps(tail_obj))
+tail_arr = json.arr()
+tail_arr.append(json.of_str("t"))
+print(json.dumps(tail_arr))

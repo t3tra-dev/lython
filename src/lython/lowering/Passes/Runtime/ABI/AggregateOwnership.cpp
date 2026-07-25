@@ -191,11 +191,14 @@ mlir::LogicalResult RuntimeBundleLowerer::replaceAggregateSlot(
     mlir::Operation *op, mlir::Type oldType, mlir::ValueRange oldValues,
     const RuntimeBundle *oldSlotValue, mlir::Type newType,
     const RuntimeBundle &newSlotValue, llvm::StringRef slotName,
-    bool releaseMissingOldObjectSlot) {
+    bool releaseMissingOldObjectSlot, bool releaseOldSlot) {
   (void)newType;
   if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(op, newSlotValue,
                                                              slotName)))
     return mlir::failure();
+
+  if (!releaseOldSlot)
+    return mlir::success();
 
   if (oldSlotValue)
     return RuntimeBundleLowerer::releaseAggregateSlot(op, *oldSlotValue,

@@ -46,6 +46,30 @@ uses them. Both shapes exist because a field-list append is only
 lowerable in the block that defines the field's storage, which stops
 holding once any other method of the same object has been called.
 
+Ownership note — the rebind of `self._kids` in `append` / `set`:
+  Storing to a class field whose storage is wider than one handle (`list`
+  is three: header, meta, items) RE-ROOTS those lanes in the instance's
+  physical expansion, but the release machinery keeps naming the expansion
+  the entity was born with. For a node the frame received from a CALL — and
+  every factory here returns one — the object's own release therefore hands
+  the deallocator the pre-store lanes and releases the REPLACED list itself.
+  The lowering leaves that release to it (it would otherwise be a second
+  release of the same list: `Ly_DecRef observed non-positive refcount`, or a
+  silent use-after-free when the freed block still reads back positive —
+  which is how it surfaced, as a load-dependent flake in
+  golden.cases.stdlib_json_build). The cost is that the REPLACEMENT list
+  leaks; see the comment in `RuntimeBundleLowerer::lowerAttrSet`
+  (Passes/Runtime/Ops/AttributeOps.cpp). Building a node with n children
+  through `append`/`set` therefore also retains n intermediate child lists,
+  which is one more reason to prefer `arr_of()` / `obj_of()` in a loop.
+
+  Still open, and NOT fixed by the above: reaching the rebind from inside a
+  branch or loop body fails the MLIR dominance verifier (`operand #N does
+  not dominate this use`) instead of producing a diagnostic at a static
+  boundary. Calling `append` / `set` in a `while` loop therefore still does
+  not compile — build the children into a `list[JSONValue]` and hand it to
+  `arr_of()` / `obj_of()`, which is what the decoder does.
+
 Deviations from CPython, pending language surface:
   - dump/load (file objects), JSONEncoder/JSONDecoder classes, cls=,
     object_hook/object_pairs_hook, parse_float/parse_int/
