@@ -4,7 +4,8 @@
 #   「1 つの本体が 6 位置で同じ答えを出す」と同じ言明ではない。
 #   RFC が実際に問題にしているのは後者なので、直接測る形を置く。
 #   (k-4a の指摘。同トラックは golden 側に
-#   `cases/class_field_store_inline_independent` を置いた。こちらは corpus 側の
+#   `cases/class_field_store_inline_independent` を置いた — **`kernel/4a` 側に
+#   あり、このブランチには無い**ので、統合後に参照が解決する。こちらは corpus 側の
 #   独立実装 — 相手の測定を検証するときは同じものを走らせないため。)
 #
 #   `c3de5e7` 時点で各位置が何をしていたか (本文 §「3 経路表」より):

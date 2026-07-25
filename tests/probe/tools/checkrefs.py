@@ -10,6 +10,19 @@ while probes were being added and renamed, and did carry a stale pair.
 
     python3 tests/probe/tools/checkrefs.py <document> [repo-root] [--allow NAME ...]
 
+Point it at the PROBE HEADERS too, not only at prose. They cite each other and
+they cite goldens, and for a long time nothing checked them -- this tool was only
+ever run on the facts table, which is the workflow it was built for and therefore
+the one input class that could not reveal its gaps:
+
+    cat tests/probe/*.py > /tmp/headers.txt
+    python3 tests/probe/tools/checkrefs.py /tmp/headers.txt
+
+The first such run found three cross-branch citations. k-4a's framing of why is
+worth keeping: owning a tool does not blind you to its boundaries, but your
+workflow never hands it an input from outside them. To find an instrument's
+domain, deliberately feed it something the workflow would not produce.
+
 Brace groups are expanded, so `flow_ifone_w{3list,2float}_plainbind.py` is
 checked as two names. Filenames are resolved against the repo root and against
 the directories where probes, harnesses, goldens and runtime library modules

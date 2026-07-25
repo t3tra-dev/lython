@@ -73,9 +73,17 @@ def main():
                    for p in args.probes.glob("leak_*_small.py")})
     rows = {}
     leaking = 0
+    unpaired = []
     for key in keys:
         big = args.probes / f"leak_{key}_big.py"
         if not big.exists():
+            # Not `continue`: silently dropping a probe makes the summary count
+            # smaller with nothing to say why, which is the same silence this
+            # file's own docstring warns about. An unpaired probe is a mistake
+            # in the corpus, so it is reported and counted.
+            print(f"{key:34} NO _big COUNTERPART -- cannot be measured",
+                  flush=True)
+            unpaired.append(key)
             continue
         s_rss, s_rc, s_out = peak_rss(lyc, args.probes / f"leak_{key}_small.py")
         b_rss, b_rc, b_out = peak_rss(lyc, big)
@@ -95,9 +103,14 @@ def main():
               f"{verdict:8} rc={s_rc}/{b_rc}", flush=True)
 
     print(f"\n{leaking}/{len(rows)} shapes leak (floor {NOISE:g} B/iteration)")
+    if unpaired:
+        print(f"{len(unpaired)} unpaired and therefore unmeasured: "
+              + ", ".join(unpaired))
     if args.out:
         args.out.write_text(json.dumps(rows, indent=1))
-    return leaking
+    # An unmeasurable probe counts against the run: the alternative is a clean
+    # exit that quietly measured less than the corpus contains.
+    return leaking + len(unpaired)
 
 
 if __name__ == "__main__":
