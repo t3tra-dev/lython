@@ -2,6 +2,7 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Value.h"
 #include "mlir/IR/ValueRange.h"
 #include "mlir/Support/LogicalResult.h"
@@ -285,9 +286,13 @@ collectRuntimeResourceGroups(mlir::ValueRange values,
 llvm::SmallVector<ResourceGroup, 4>
 collectOwnedLocalObjectGroups(mlir::Operation *op,
                               llvm::ArrayRef<RuntimeDeallocator> deallocators);
+// `symbols`, when non-null, must be a symbol table over `module`; it only
+// short-circuits the callee lookup (a module-symbol-list walk otherwise) for
+// callers that sweep every call op and can build the table once.
 llvm::SmallVector<ResourceGroup, 8>
 collectOwnedCallResultGroups(mlir::ModuleOp module, mlir::func::CallOp call,
-                             llvm::ArrayRef<RuntimeDeallocator> deallocators);
+                             llvm::ArrayRef<RuntimeDeallocator> deallocators,
+                             mlir::SymbolTable *symbols = nullptr);
 
 class AliasAnalysis {
 public:

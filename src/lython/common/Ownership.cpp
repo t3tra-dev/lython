@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 
 namespace py::ownership {
 
@@ -943,10 +944,15 @@ static llvm::SmallSet<unsigned, 4> staticEvidenceCoveredLogicalOffsets(
 
 llvm::SmallVector<ResourceGroup, 8>
 collectOwnedCallResultGroups(mlir::ModuleOp module, mlir::func::CallOp call,
-                             llvm::ArrayRef<RuntimeDeallocator> deallocators) {
+                             llvm::ArrayRef<RuntimeDeallocator> deallocators,
+                             mlir::SymbolTable *symbols) {
   llvm::SmallVector<ResourceGroup, 8> ownedGroups;
+  // `symbols`, when given, is a table over the SAME module: it resolves the
+  // callee in constant time instead of walking the module's symbol list, which
+  // is what made a per-call-op sweep O(calls x symbols).
   mlir::func::FuncOp callee =
-      module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
+      symbols ? symbols->lookup<mlir::func::FuncOp>(call.getCallee())
+              : module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
   if (!callee || call.getNumResults() == 0)
     return ownedGroups;
 
@@ -1220,12 +1226,17 @@ static bool isOwnershipIdentityOp(mlir::Operation *op) {
 }
 
 static void unionStaticEvidenceCallResultAliases(AliasAnalysis &aliases,
-                                                 mlir::func::CallOp call) {
-  mlir::ModuleOp module = call->getParentOfType<mlir::ModuleOp>();
-  if (!module)
-    return;
-  mlir::func::FuncOp callee =
-      module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
+                                                 mlir::func::CallOp call,
+                                                 mlir::SymbolTable *symbols) {
+  mlir::func::FuncOp callee;
+  if (symbols) {
+    callee = symbols->lookup<mlir::func::FuncOp>(call.getCallee());
+  } else {
+    mlir::ModuleOp module = call->getParentOfType<mlir::ModuleOp>();
+    if (!module)
+      return;
+    callee = module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
+  }
   if (!callee)
     return;
 
@@ -1255,13 +1266,22 @@ static void unionStaticEvidenceCallResultAliases(AliasAnalysis &aliases,
 }
 
 void AliasAnalysis::build(mlir::Operation *root) {
+  // Resolving each call's callee through `Operation::lookupSymbol` walks the
+  // module's symbol list, so the per-call static-evidence union below cost
+  // O(calls x symbols) -- the term that exploded once an imported stdlib
+  // module's symbols joined the module. One symbol table answers the same
+  // question (immediate symbol children of `root`) in constant time.
+  std::optional<mlir::SymbolTable> symbols;
+  if (root->hasTrait<mlir::OpTrait::SymbolTable>())
+    symbols.emplace(root);
   root->walk([&](mlir::Operation *op) {
     for (mlir::Value operand : op->getOperands())
       track(operand);
     for (mlir::Value result : op->getResults())
       track(result);
     if (auto call = mlir::dyn_cast<mlir::func::CallOp>(op))
-      unionStaticEvidenceCallResultAliases(*this, call);
+      unionStaticEvidenceCallResultAliases(
+          *this, call, symbols ? &*symbols : nullptr);
     if (auto subview = mlir::dyn_cast<mlir::memref::SubViewOp>(op)) {
       unionValues(subview.getResult(), subview.getSource());
       return;
