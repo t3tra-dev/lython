@@ -1,10 +1,13 @@
 # probe: 4 フィールドのユーザークラスを、別のクラスのフィールド型として使う。
-#   段階 4a が全フィールドを box16 スロット化すると、フィールド型としてのクラスの
-#   コストは 1 + 自身のフィールド数になる想定なので、これは 5 = 予算ちょうど。
-#   4a の前後で通り続けなければならない境界ケース。
+#   4a の前後で通り続けなければならない境界ケースとして置いた
 #   (`c3de5e7` 時点の probe 集合には「フィールド型として使われるクラス」が
-#   Wide(3) / Other(1) / Box(1) しかなく、予算 5 に触る形が 1 件も無かった。)
-# axes: width=wNcls(4 fields as a field type) op=construct+read flow=straight budget=5
+#   Wide(3) / Other(1) / Box(1) しかなく、予算 5 に触る形が 1 件も無かった)。
+#   **この probe は役目を果たした**: 4a で box-fronting が入った直後に loud に
+#   なり、それが早期シグナルとして機能して「int フィールドの contract 形
+#   placeholder が 1 個あたり 3 ハンドル使っていた」ことが判明した
+#   (`Four` は 5 ではなく 13 ハンドルに展開されていた)。placeholder 削除後は
+#   `kernel/4a` (`a36d881`) で**通る** — 実測 3/3 + libgmalloc。
+# axes: width=wNcls(4 fields as a field type) op=construct+read flow=straight budget=1
 # CLASSIFICATION: 1 正しい
 # CPython 3.14 expects: 1 2 3 4 / 5 8
 
