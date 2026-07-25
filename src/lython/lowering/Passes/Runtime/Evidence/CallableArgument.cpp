@@ -269,8 +269,15 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableArgumentEvidenceABIs() {
       if (!callable)
         return mlir::WalkResult::advance();
 
-      auto required = requirements.find(target.getSymName());
-      if (required == requirements.end())
+      // A POINTER to the entry's value, not an iterator: ensureRequirement
+      // below inserts into `requirements`, and llvm::StringMap rehashing moves
+      // the bucket array (invalidating iterators) while leaving the separately
+      // allocated entries -- and so this pointer -- in place.
+      llvm::SmallVector<char, 8> *targetRequired = nullptr;
+      if (auto found = requirements.find(target.getSymName());
+          found != requirements.end())
+        targetRequired = &found->second;
+      if (!targetRequired)
         return mlir::WalkResult::advance();
 
       mlir::func::FuncOp caller = call->getParentOfType<mlir::func::FuncOp>();
@@ -289,8 +296,8 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableArgumentEvidenceABIs() {
 
       for (auto [logicalIndex, actualIndex] :
            llvm::enumerate(plan->fixedActuals)) {
-        if (logicalIndex >= required->second.size() ||
-            !required->second[logicalIndex] || !actualIndex ||
+        if (logicalIndex >= targetRequired->size() ||
+            !(*targetRequired)[logicalIndex] || !actualIndex ||
             *actualIndex >= invocation->actualValues.size())
           continue;
         mlir::Value actual =
@@ -304,7 +311,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableArgumentEvidenceABIs() {
         unsigned before =
             static_cast<unsigned>((*callerRequired)[callerIndex]);
         unsigned propagated =
-            before | static_cast<unsigned>(required->second[logicalIndex]);
+            before | static_cast<unsigned>((*targetRequired)[logicalIndex]);
         if (propagated == before)
           continue;
         (*callerRequired)[callerIndex] = static_cast<char>(propagated);
