@@ -66,6 +66,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerModule() {
     return mlir::failure();
   if (mlir::failed(lowerFunctionReturns()))
     return mlir::failure();
+  // Must follow lowerFunctionReturns: totality of a clone is read off its
+  // lowered (raw, valid) returns.
+  if (mlir::failed(foldUnprovenPrimitiveI64Speculations()))
+    return mlir::failure();
   if (mlir::failed(eraseCallableProtocolTemplateFunctions()))
     return mlir::failure();
   if (mlir::failed(dropControlFlowLogicalBranchOperands()))
