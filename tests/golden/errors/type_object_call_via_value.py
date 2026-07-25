@@ -1,0 +1,2 @@
+t = int
+print(t())
