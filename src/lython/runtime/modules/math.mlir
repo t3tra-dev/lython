@@ -12,14 +12,22 @@ module attributes {
     "math.ceil",
     "math.sqrt",
     "math.fabs",
-    "math.trunc"
+    "math.trunc",
+    "math.log",
+    "math.cos",
+    "math.sin",
+    "math.exp"
   ],
   ly.typing.function_names = [
     "math.floor",
     "math.ceil",
     "math.sqrt",
     "math.fabs",
-    "math.trunc"
+    "math.trunc",
+    "math.log",
+    "math.cos",
+    "math.sin",
+    "math.exp"
   ],
   ly.typing.float_constant_names = ["math.pi", "math.e", "math.tau", "math.inf", "math.nan"],
   ly.typing.float_constant_values = [3.141592653589793 : f64, 2.718281828459045 : f64, 6.283185307179586 : f64, 0x7FF0000000000000 : f64, 0x7FF8000000000000 : f64],
@@ -28,7 +36,11 @@ module attributes {
     !py.callable<[!py.contract<"builtins.float">], arg_names = ["x"], arg_defaults = [false], returns = [!py.contract<"builtins.int">]>,
     !py.callable<[!py.contract<"builtins.float">], arg_names = ["x"], arg_defaults = [false], returns = [!py.contract<"builtins.float">]>,
     !py.callable<[!py.contract<"builtins.float">], arg_names = ["x"], arg_defaults = [false], returns = [!py.contract<"builtins.float">]>,
-    !py.callable<[!py.contract<"builtins.float">], arg_names = ["x"], arg_defaults = [false], returns = [!py.contract<"builtins.int">]>
+    !py.callable<[!py.contract<"builtins.float">], arg_names = ["x"], arg_defaults = [false], returns = [!py.contract<"builtins.int">]>,
+    !py.callable<[!py.contract<"builtins.float">], arg_names = ["x"], arg_defaults = [false], returns = [!py.contract<"builtins.float">]>,
+    !py.callable<[!py.contract<"builtins.float">], arg_names = ["x"], arg_defaults = [false], returns = [!py.contract<"builtins.float">]>,
+    !py.callable<[!py.contract<"builtins.float">], arg_names = ["x"], arg_defaults = [false], returns = [!py.contract<"builtins.float">]>,
+    !py.callable<[!py.contract<"builtins.float">], arg_names = ["x"], arg_defaults = [false], returns = [!py.contract<"builtins.float">]>
   ]
 } {
   func.func private @LyFloat_AsF64(%header: memref<2xi64> {ly.ownership.object_header}, %payload: memref<1xf64>) -> f64 attributes {ly.runtime.contract = "builtins.float", ly.runtime.method = "__float__", ly.runtime.primitive = "unbox.f64"}
@@ -70,6 +82,37 @@ module attributes {
     %value = func.call @LyFloat_AsF64(%header, %payload) : (memref<2xi64>, memref<1xf64>) -> f64
     %magnitude = math.absf %value : f64
     %out_header, %out_payload = func.call @LyFloat_FromF64(%magnitude) : (f64) -> (memref<2xi64>, memref<1xf64>)
+    func.return %out_header, %out_payload : memref<2xi64>, memref<1xf64>
+  }
+
+  // log / cos / sin / exp: the kernels random.gauss's Box-Muller transform
+  // needs. Single-argument only -- CPython's math.log takes an optional base,
+  // which would need an overloaded contract; write log(x) / log(b) for that.
+  func.func @LyMath_Log(%header: memref<2xi64> {ly.ownership.object_header}, %payload: memref<1xf64>) -> (memref<2xi64>, memref<1xf64>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "math.log", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "math_log", ly.runtime.result_contract = "builtins.float"} {
+    %value = func.call @LyFloat_AsF64(%header, %payload) : (memref<2xi64>, memref<1xf64>) -> f64
+    %result = math.log %value : f64
+    %out_header, %out_payload = func.call @LyFloat_FromF64(%result) : (f64) -> (memref<2xi64>, memref<1xf64>)
+    func.return %out_header, %out_payload : memref<2xi64>, memref<1xf64>
+  }
+
+  func.func @LyMath_Cos(%header: memref<2xi64> {ly.ownership.object_header}, %payload: memref<1xf64>) -> (memref<2xi64>, memref<1xf64>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "math.cos", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "math_cos", ly.runtime.result_contract = "builtins.float"} {
+    %value = func.call @LyFloat_AsF64(%header, %payload) : (memref<2xi64>, memref<1xf64>) -> f64
+    %result = math.cos %value : f64
+    %out_header, %out_payload = func.call @LyFloat_FromF64(%result) : (f64) -> (memref<2xi64>, memref<1xf64>)
+    func.return %out_header, %out_payload : memref<2xi64>, memref<1xf64>
+  }
+
+  func.func @LyMath_Sin(%header: memref<2xi64> {ly.ownership.object_header}, %payload: memref<1xf64>) -> (memref<2xi64>, memref<1xf64>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "math.sin", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "math_sin", ly.runtime.result_contract = "builtins.float"} {
+    %value = func.call @LyFloat_AsF64(%header, %payload) : (memref<2xi64>, memref<1xf64>) -> f64
+    %result = math.sin %value : f64
+    %out_header, %out_payload = func.call @LyFloat_FromF64(%result) : (f64) -> (memref<2xi64>, memref<1xf64>)
+    func.return %out_header, %out_payload : memref<2xi64>, memref<1xf64>
+  }
+
+  func.func @LyMath_Exp(%header: memref<2xi64> {ly.ownership.object_header}, %payload: memref<1xf64>) -> (memref<2xi64>, memref<1xf64>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "math.exp", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "math_exp", ly.runtime.result_contract = "builtins.float"} {
+    %value = func.call @LyFloat_AsF64(%header, %payload) : (memref<2xi64>, memref<1xf64>) -> f64
+    %result = math.exp %value : f64
+    %out_header, %out_payload = func.call @LyFloat_FromF64(%result) : (f64) -> (memref<2xi64>, memref<1xf64>)
     func.return %out_header, %out_payload : memref<2xi64>, memref<1xf64>
   }
 }
