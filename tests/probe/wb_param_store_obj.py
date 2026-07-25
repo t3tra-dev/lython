@@ -1,0 +1,29 @@
+# probe: callee stores into a borrowed receiver's Other field; caller reads it back
+# axes: acquire=param width=obj op=rebind flow=straight observe=writeback
+# CLASSIFICATION: 2 silent 誤実行
+#   cpython='7\n' lyc='0\n'
+# CPython 3.14 expects: 7
+
+class Other:
+    def __init__(self, n: int) -> None:
+        self.n: int = n
+
+
+class Box:
+    def __init__(self, v: Other) -> None:
+        self.f: Other = v
+
+
+def mk() -> Box:
+    v: Other = Other(0)
+    return Box(v)
+
+
+def rebind(b: Box) -> None:
+    fresh: Other = Other(7)
+    b.f = fresh
+
+
+o = mk()
+rebind(o)
+print(o.f.n)
