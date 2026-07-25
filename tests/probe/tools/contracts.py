@@ -10,14 +10,29 @@ defines, and disagreement in either stdout or exit status is the finding.
 
 Written by the side-defects track, which found six declared-but-unimplemented
 methods (list.pop, list.insert, tuple.__add__/__mul__/count/index) in the first
-seven contracts it covered. Seventy-two of the seventy-nine contracts that
-declare method_names are still unaudited, roughly 336 methods; the largest are
-int (38), float (30), _asyncio.Future (14) and Task (12), the _io classes, and
-object (11). Extend CASES rather than starting over.
+seven contracts it covered. The contract-audit track then extended CASES over
+the other seventy-two, which is where the rest of the second half of this file
+comes from. The full result table lives in rfc/contract-audit.md; read it before
+adding cases, because it records which of the remaining disagreements are method
+gaps and which are unbound builtin *names* (complex, slice, repr, type) whose
+methods work fine when reached another way. Extend CASES rather than starting
+over.
 
     python3 tests/probe/tools/contracts.py ./build/bin/lyc [name-substring]
 
-Exit code is the number of disagreements.
+The gate is EXPECTED_FAILURES below, not a count, and it is checked in both
+directions: a disagreement not in the set fails, and a case IN the set that now
+agrees also fails, as a stale expectation. Exit code is the number of such
+deltas, so the target is always zero and it is always reachable -- unlike
+contract_scan.py, whose candidate count can never reach zero because two of its
+false-positive mechanisms are permanent.
+
+Both directions are needed because the set is tree-relative. Counting instead
+would carry slack over exactly the code most likely to regress: the six methods
+below are implemented on kernel/side-defects (a4be8bf), so on a tree containing
+that branch all ten cases pass, and a `<= 10` gate would then stay green through
+a fresh break in any of them. The second direction turns that same merge into an
+explicit "these now pass, shrink the set" failure instead.
 """
 
 import argparse
@@ -27,6 +42,28 @@ import sys
 import tempfile
 
 CPY = "/opt/homebrew/Frameworks/Python.framework/Versions/3.14/bin/python3.14"
+
+# Cases known to disagree with CPython because the method has no implementation
+# behind its declared name. Measured on c3de5e7 (10 of 215).
+#
+# TREE-RELATIVE. All ten are the call forms of the six methods implemented on
+# kernel/side-defects (a4be8bf) -- list.pop, list.insert, and tuple.__add__,
+# __mul__, count, index -- so on any tree containing that branch the correct
+# contents of this set is empty. Do not carry it forward: the run will tell you,
+# because a case here that starts agreeing is reported as a stale expectation
+# and fails the gate.
+EXPECTED_FAILURES = frozenset({
+    "list.pop",
+    "list.pop(i)",
+    "list.pop(-2)",
+    "list.insert",
+    "list.insert(-1)",
+    "list.insert(big)",
+    "tuple.__add__",
+    "tuple.__mul__",
+    "tuple.count",
+    "tuple.index",
+})
 
 CASES = {}
 
@@ -687,27 +724,45 @@ def main():
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="contracts-"))
     selected = [(n, s) for n, s in CASES.items()
                 if not args.only or args.only in n]
-    bad = []
+    new_failures, stale, expected = [], [], []
     for name, src in selected:
         p = tmp / "case.py"
         p.write_text(src)
         crc, cout, _ = run([CPY], p)
         lrc, lout, lerr = run([str(lyc), "jit"], p)
-        if crc == lrc and cout == lout:
-            print(f"ok   {name}")
-            continue
-        first = (lerr.strip().splitlines() or [""])[0]
-        # An MLIR diagnostic is prefixed with a `loc(fused<...>)` blob that is
-        # longer than the message; keep the message.
-        if "error:" in first:
-            first = first[first.index("error:"):]
-        print(f"FAIL {name}: cpython(rc={crc}) {cout!r} | "
-              f"lyc(rc={lrc}) {lout!r} {first[:200]!r}")
-        bad.append(name)
-    print(f"\n{len(bad)} disagreements of {len(selected)} cases run")
-    for b in bad:
-        print("  -", b)
-    return len(bad)
+        agrees = (crc == lrc and cout == lout)
+
+        if agrees and name not in EXPECTED_FAILURES:
+            print(f"ok    {name}")
+        elif agrees:
+            # Direction two: something got implemented. A count-based gate
+            # cannot see this, which is why it silently accrues slack.
+            print(f"FIXED {name}  <- remove from EXPECTED_FAILURES")
+            stale.append(name)
+        else:
+            first = (lerr.strip().splitlines() or [""])[0]
+            # An MLIR diagnostic is prefixed with a `loc(fused<...>)` blob
+            # longer than the message; keep the message.
+            if "error:" in first:
+                first = first[first.index("error:"):]
+            detail = (f"cpython(rc={crc}) {cout!r} | lyc(rc={lrc}) {lout!r} "
+                      f"{first[:200]!r}")
+            if name in EXPECTED_FAILURES:
+                print(f"xfail {name}")
+                expected.append(name)
+            else:
+                print(f"FAIL  {name}: {detail}")
+                new_failures.append(name)
+
+    print(f"\n{len(selected)} cases run: "
+          f"{len(selected) - len(new_failures) - len(stale) - len(expected)} ok, "
+          f"{len(expected)} expected failures, "
+          f"{len(new_failures)} new failures, {len(stale)} stale expectations")
+    for n in new_failures:
+        print("  new failure:      ", n)
+    for n in stale:
+        print("  stale expectation:", n)
+    return len(new_failures) + len(stale)
 
 
 if __name__ == "__main__":

@@ -19257,6 +19257,131 @@ module attributes {
     func.return
   }
 
+  memref.global "private" constant @__ly_range_msg_index_out_of_range : memref<31xi8> = dense<[114, 97, 110, 103, 101, 32, 111, 98, 106, 101, 99, 116, 32, 105, 110, 100, 101, 120, 32, 111, 117, 116, 32, 111, 102, 32, 114, 97, 110, 103, 101]>
+
+  func.func private @__ly_range_raise_index_error() {
+    %class_id = arith.constant 55 : i64
+    %length = arith.constant 31 : i64
+    %message_static = memref.get_global @__ly_range_msg_index_out_of_range : memref<31xi8>
+    %message = memref.cast %message_static : memref<31xi8> to memref<?xi8>
+    func.call @__ly_long_raise_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.return
+  }
+
+  // CPython compute_range_length (Objects/rangeobject.c): the count of steps
+  // from start before passing stop, clamped at zero. Both branches divide
+  // strictly positive operands, so arith.divsi is exact flooring here without
+  // the sign correction a general // would need.
+  func.func private @__ly_range_length(%state: memref<3xi64>) -> i64 {
+    %start_slot = arith.constant 0 : index
+    %stop_slot = arith.constant 1 : index
+    %step_slot = arith.constant 2 : index
+    %start = memref.load %state[%start_slot] : memref<3xi64>
+    %stop = memref.load %state[%stop_slot] : memref<3xi64>
+    %step = memref.load %state[%step_slot] : memref<3xi64>
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %ascending = arith.cmpi sgt, %step, %zero : i64
+    cf.cond_br %ascending, ^up, ^down
+
+  ^up:
+    %empty_up = arith.cmpi sge, %start, %stop : i64
+    cf.cond_br %empty_up, ^empty, ^count_up
+
+  ^count_up:
+    %span_up = arith.subi %stop, %start : i64
+    %span_up_less = arith.subi %span_up, %one : i64
+    %steps_up = arith.divsi %span_up_less, %step : i64
+    %len_up = arith.addi %steps_up, %one : i64
+    func.return %len_up : i64
+
+  ^down:
+    %empty_down = arith.cmpi sle, %start, %stop : i64
+    cf.cond_br %empty_down, ^empty, ^count_down
+
+  ^count_down:
+    %span_down = arith.subi %start, %stop : i64
+    %span_down_less = arith.subi %span_down, %one : i64
+    %step_abs = arith.subi %zero, %step : i64
+    %steps_down = arith.divsi %span_down_less, %step_abs : i64
+    %len_down = arith.addi %steps_down, %one : i64
+    func.return %len_down : i64
+
+  ^empty:
+    func.return %zero : i64
+  }
+
+  // range's own method_names declares only __new__/__init__/__iter__; __len__,
+  // __getitem__ and __contains__ are promised by `base_names = ["Sequence"]`
+  // instead, which is why they were declared-but-unimplemented without showing
+  // up in a method_names sweep. len(r), r[i] and `v in r` all resolved through
+  // the Sequence tower to a builtins.range method that did not exist.
+  func.func @LyRange_Len(%header: memref<2xi64> {ly.ownership.object_header}, %state: memref<3xi64>) -> i64 attributes {ly.runtime.contract = "builtins.range", ly.runtime.method = "__len__"} {
+    %length = func.call @__ly_range_length(%state) : (memref<3xi64>) -> i64
+    func.return %length : i64
+  }
+
+  func.func @LyRange_GetItem(%header: memref<2xi64> {ly.ownership.object_header}, %state: memref<3xi64>, %index_header: memref<2xi64> {ly.ownership.object_header}, %index_meta: memref<2xi64>, %index_digits: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.range", ly.runtime.method = "__getitem__", ly.runtime.result_contract = "builtins.int"} {
+    %index = func.call @LyLong_AsI64(%index_header, %index_meta, %index_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+    %length = func.call @__ly_range_length(%state) : (memref<3xi64>) -> i64
+    %zero = arith.constant 0 : i64
+    %negative = arith.cmpi slt, %index, %zero : i64
+    %wrapped = arith.addi %index, %length : i64
+    %normalized = arith.select %negative, %wrapped, %index : i64
+    %too_low = arith.cmpi slt, %normalized, %zero : i64
+    %too_high = arith.cmpi sge, %normalized, %length : i64
+    %out_of_range = arith.ori %too_low, %too_high : i1
+    cf.cond_br %out_of_range, ^raise, ^compute
+
+  ^raise:
+    func.call @__ly_range_raise_index_error() : () -> ()
+    cf.br ^compute
+
+  ^compute:
+    %start_slot = arith.constant 0 : index
+    %step_slot = arith.constant 2 : index
+    %start = memref.load %state[%start_slot] : memref<3xi64>
+    %step = memref.load %state[%step_slot] : memref<3xi64>
+    %offset = arith.muli %normalized, %step : i64
+    %value = arith.addi %start, %offset : i64
+    %h, %m, %d = func.call @LyLong_FromI64(%value) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
+  }
+
+  // CPython range_contains_long: arithmetic, not a scan -- membership is an
+  // in-bounds test plus a stride test, so `v in range(n)` stays O(1).
+  func.func @LyRange_Contains(%header: memref<2xi64> {ly.ownership.object_header}, %state: memref<3xi64>, %value_header: memref<2xi64> {ly.ownership.object_header}, %value_meta: memref<2xi64>, %value_digits: memref<?xi32>) -> i1 attributes {ly.runtime.contract = "builtins.range", ly.runtime.method = "__contains__"} {
+    %value = func.call @LyLong_AsI64(%value_header, %value_meta, %value_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+    %start_slot = arith.constant 0 : index
+    %stop_slot = arith.constant 1 : index
+    %step_slot = arith.constant 2 : index
+    %start = memref.load %state[%start_slot] : memref<3xi64>
+    %stop = memref.load %state[%stop_slot] : memref<3xi64>
+    %step = memref.load %state[%step_slot] : memref<3xi64>
+    %zero = arith.constant 0 : i64
+    %false = arith.constant false
+    %ascending = arith.cmpi sgt, %step, %zero : i64
+    %ge_start = arith.cmpi sge, %value, %start : i64
+    %lt_stop = arith.cmpi slt, %value, %stop : i64
+    %in_up = arith.andi %ge_start, %lt_stop : i1
+    %le_start = arith.cmpi sle, %value, %start : i64
+    %gt_stop = arith.cmpi sgt, %value, %stop : i64
+    %in_down = arith.andi %le_start, %gt_stop : i1
+    %in_bounds = arith.select %ascending, %in_up, %in_down : i1
+    cf.cond_br %in_bounds, ^stride, ^miss
+
+  ^miss:
+    func.return %false : i1
+
+  ^stride:
+    // The offset and the step share a sign inside the bounds, so the
+    // remainder's sign cannot make a hit look like a miss.
+    %offset = arith.subi %value, %start : i64
+    %remainder = arith.remsi %offset, %step : i64
+    %aligned = arith.cmpi eq, %remainder, %zero : i64
+    func.return %aligned : i1
+  }
+
   func.func private @__ly_range_iterator_alloc(%current: i64, %stop: i64, %step: i64) -> (memref<2xi64>, memref<3xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 20 : i64, ly.runtime.contract = "builtins.range_iterator", ly.runtime.primitive = "alloc"} {
     // One entity, one allocation: [0,16) header, [16,40) state view.
     %block_bytes = arith.constant 40 : index
