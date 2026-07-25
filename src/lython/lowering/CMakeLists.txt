@@ -2,6 +2,7 @@ add_library(LythonRuntimeLowering STATIC
     Common/Instrumentation.cpp
     Common/RuntimeLibrary.cpp
     Common/HostSupportBuilder.cpp
+    Common/OsSupportBuilder.cpp
     Common/RuntimeSupportBuilder.cpp
     Common/TracebackSupportBuilder.cpp
     Passes/LoweringPipeline.cpp

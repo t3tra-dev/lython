@@ -52,7 +52,8 @@ private:
   lookupSourceModule(llvm::StringRef module) const;
   bool isStubSourceModuleSymbol(llvm::StringRef symbol) const;
   bool bindSourceModuleNamespace(llvm::StringRef module,
-                                 llvm::StringRef localName);
+                                 llvm::StringRef localName,
+                                 unsigned namespaceDepth = 0);
   bool bindSourceModuleName(llvm::StringRef module,
                             llvm::StringRef exportedName,
                             llvm::StringRef localName,
@@ -69,6 +70,8 @@ private:
   // export list.
   bool bindNativeModuleStar(llvm::StringRef module, const parser::Node &anchor,
                             bool diagnoseUnsupported);
+  void bindNativeModuleNamespaceStar(llvm::StringRef module,
+                                     llvm::StringRef localName);
   void emitFunctionDecl(const parser::Node &function);
   void emitCallableFunction(const parser::Node &callable,
                             llvm::StringRef symbolName,

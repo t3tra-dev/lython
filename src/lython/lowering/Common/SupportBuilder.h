@@ -9,11 +9,107 @@
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "llvm/TargetParser/Triple.h"
 
 #include <cstdint>
 #include <string>
 
 namespace py::runtime_library {
+
+// The host boundary is otherwise target-independent (portable libc calls at
+// the fopen/fwrite altitude). Three things about the OS cluster cannot be:
+// the errno accessor's symbol name, the byte offsets inside `struct stat` and
+// `struct dirent` (which differ per libc AND per arch), and Darwin's
+// $INODE64 symbol variants on x86_64. They are gathered here so the OS
+// cluster reads offsets by name and every per-target fact has one home.
+//
+// Field widths are byte counts; a negative width means the field is signed
+// (dev_t is int32_t on Darwin) and is sign-extended into the i64 result.
+struct HostTargetLayout {
+  bool posix = true;
+
+  // Which column of kOSErrorErrnoMap the target's errno numbers come from.
+  bool bsdErrnoValues = false;
+
+  llvm::StringRef errnoAccessor = "__errno_location";
+  llvm::StringRef statSymbol = "stat";
+  llvm::StringRef lstatSymbol = "lstat";
+  llvm::StringRef readdirSymbol = "readdir";
+
+  // Offset/width pairs for the os.stat_result fields, in the order
+  // posix._stat_fields returns them.
+  int statMode[2] = {24, 4};
+  int statIno[2] = {8, 8};
+  int statDev[2] = {0, 8};
+  int statNlink[2] = {16, 8};
+  int statUid[2] = {28, 4};
+  int statGid[2] = {32, 4};
+  int statSize[2] = {48, 8};
+  int statAtime[2] = {72, 8};
+  int statMtime[2] = {88, 8};
+  int statCtime[2] = {104, 8};
+
+  // `struct dirent`'s NUL-terminated d_name.
+  int direntNameOffset = 19;
+
+  // CLOCK_MONOTONIC's value (CLOCK_REALTIME is 0 everywhere).
+  int clockMonotonic = 1;
+};
+
+// Derives the layout above from the target triple. Unknown OS/arch pairs keep
+// the Linux/x86_64 defaults rather than guessing: a wrong guess would read
+// the wrong words silently, so the OS cluster refuses to run at all on a
+// non-POSIX target (`posix == false` makes every entry point fail loudly).
+inline HostTargetLayout hostTargetLayout(const llvm::Triple &triple) {
+  HostTargetLayout layout;
+  if (triple.isOSWindows()) {
+    layout.posix = false;
+    layout.errnoAccessor = "_errno";
+    return layout;
+  }
+  if (triple.isOSDarwin()) {
+    layout.errnoAccessor = "__error";
+    layout.bsdErrnoValues = true;
+    // Darwin's 64-bit-inode struct stat/dirent are the default ABI on arm64
+    // but a $INODE64-suffixed variant on x86_64, where the unsuffixed symbol
+    // is still the deprecated 32-bit-inode one.
+    if (triple.getArch() == llvm::Triple::x86_64) {
+      layout.statSymbol = "stat$INODE64";
+      layout.lstatSymbol = "lstat$INODE64";
+      layout.readdirSymbol = "readdir$INODE64";
+    }
+    layout.statMode[0] = 4;
+    layout.statMode[1] = 2;
+    layout.statIno[0] = 8;
+    layout.statDev[0] = 0;
+    layout.statDev[1] = -4;
+    layout.statNlink[0] = 6;
+    layout.statNlink[1] = 2;
+    layout.statUid[0] = 16;
+    layout.statUid[1] = 4;
+    layout.statGid[0] = 20;
+    layout.statGid[1] = 4;
+    layout.statSize[0] = 96;
+    layout.statSize[1] = 8;
+    layout.statAtime[0] = 32;
+    layout.statMtime[0] = 48;
+    layout.statCtime[0] = 64;
+    layout.direntNameOffset = 21;
+    layout.clockMonotonic = 6; // CLOCK_MONOTONIC
+    return layout;
+  }
+  // Linux: the kernel struct stat is arch-specific. aarch64 packs st_mode and
+  // st_nlink as two 32-bit words where x86_64 has a 64-bit st_nlink first.
+  if (triple.getArch() == llvm::Triple::aarch64 ||
+      triple.getArch() == llvm::Triple::aarch64_be) {
+    layout.statMode[0] = 16;
+    layout.statNlink[0] = 20;
+    layout.statNlink[1] = 4;
+    layout.statUid[0] = 24;
+    layout.statGid[0] = 28;
+  }
+  return layout;
+}
 
 // Small builder facade that mirrors the shape of the hand-written support IR
 // while keeping the C++ concise. Every runtime routine is composed from the
@@ -23,10 +119,11 @@ struct SupportBuilder {
   mlir::OpBuilder builder;
   mlir::Location loc;
   mlir::ModuleOp module;
+  HostTargetLayout host;
 
-  explicit SupportBuilder(mlir::ModuleOp module)
+  SupportBuilder(mlir::ModuleOp module, const llvm::Triple &triple)
       : builder(module.getContext()), loc(builder.getUnknownLoc()),
-        module(module) {}
+        module(module), host(hostTargetLayout(triple)) {}
 
   mlir::Type f64() { return builder.getF64Type(); }
   mlir::Type i64() { return builder.getIntegerType(64); }
@@ -168,8 +265,15 @@ struct SupportBuilder {
 };
 
 // Emits the host-boundary cluster (raw write / exit status / argv / FILE*
-// and buffer wrappers); implemented in HostSupportBuilder.cpp.
+// and buffer wrappers, plus the OS/time cluster); implemented in
+// HostSupportBuilder.cpp.
 void buildHostSupport(SupportBuilder &b);
+
+// Emits the OS/time cluster (errno, the OSError message formatter, the
+// filesystem and environment calls, the clock and calendar calls) that
+// modules/posix.mlir and modules/time.mlir call into; implemented in
+// OsSupportBuilder.cpp.
+void buildOsSupport(SupportBuilder &b);
 
 // Emits the traceback cluster (frame stack, push/pop accounting, uncaught
 // exception printer) into the module; implemented in

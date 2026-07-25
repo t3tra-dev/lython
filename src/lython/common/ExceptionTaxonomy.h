@@ -190,12 +190,15 @@ inline constexpr BuiltinExceptionExtraEdge kBuiltinExceptionExtraEdges[] = {
     {102, 50}, // ExceptionGroup -> Exception
 };
 
+// OSError itself: the fallback for an errno with no dedicated subclass.
+inline constexpr std::int64_t kOSErrorClassId = 66;
+
 // errno -> OSError-subclass mapping (CPython exceptions.c oserror_use_init
 // dispatch table). Values are per-libc: the common POSIX subset shares
 // numbers, the socket/async members diverge between the BSD family (Darwin)
-// and Linux. Nothing reads errno at runtime yet (there is no per-target
-// errno accessor shim); this table is the single source of truth for when
-// that wiring lands.
+// and Linux. The runtime reads it through LyHost_OSErrorClassId, which the
+// OS support cluster (lowering/Common/OsSupportBuilder.cpp) compiles into a
+// select chain against the target's errno numbering.
 struct OSErrorErrnoMapping {
   llvm::StringLiteral posixName;
   int darwinValue; // BSD family
@@ -228,7 +231,7 @@ inline std::int64_t oserrorSubclassForErrno(int errnoValue, bool isLinux) {
   for (const OSErrorErrnoMapping &entry : kOSErrorErrnoMap)
     if ((isLinux ? entry.linuxValue : entry.darwinValue) == errnoValue)
       return entry.classId;
-  return 66; // plain OSError
+  return kOSErrorClassId;
 }
 
 inline const BuiltinExceptionInfo *findByName(llvm::StringRef name) {
