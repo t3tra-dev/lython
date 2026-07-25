@@ -223,8 +223,15 @@ sourceModuleLiteralConstant(TypeSystem &types,
                             const std::vector<parser::NodePtr> &body,
                             llvm::StringRef exportedName);
 
+// A module member that is itself a module (`import posixpath as path` inside
+// os.py) nests one namespace inside another. Real module graphs nest a step or
+// two; the bound only breaks a mutual-import cycle (a.py `import b as x`,
+// b.py `import a as y`), which would otherwise recurse forever.
+static constexpr unsigned kMaxNamespaceDepth = 4;
+
 bool ModuleEmitter::bindSourceModuleNamespace(llvm::StringRef module,
-                                              llvm::StringRef localName) {
+                                              llvm::StringRef localName,
+                                              unsigned namespaceDepth) {
   const EmitOptions::SourceModule *source = lookupSourceModule(module);
   if (!source)
     return false;
@@ -285,10 +292,17 @@ bool ModuleEmitter::bindSourceModuleNamespace(llvm::StringRef module,
             ast::string(*statement, "module");
         std::optional<std::string> resolved =
             resolveRelativeModule(source->packageName, level, fromModule);
-        const EmitOptions::SourceModule *fromSource =
-            resolved ? lookupSourceModule(*resolved) : nullptr;
-        if (!fromSource)
+        if (!resolved)
           continue;
+        const EmitOptions::SourceModule *fromSource =
+            lookupSourceModule(*resolved);
+        if (!fromSource) {
+          // The star pulls from a native manifest (os.py's `from posix import
+          // *`), so the export list is the manifest's public names rather than
+          // an __all__ list.
+          bindNativeModuleNamespaceStar(*resolved, localName);
+          continue;
+        }
         std::optional<llvm::SmallVector<std::string, 8>> exports =
             staticAllExportNames(*fromSource->moduleNode);
         if (!exports)
@@ -308,6 +322,32 @@ bool ModuleEmitter::bindSourceModuleNamespace(llvm::StringRef module,
           (llvm::Twine(localName) + "." + llvm::StringRef(*exported)).str();
       bindSourceModuleReexport(*source, llvm::StringRef(*exported),
                                llvm::StringRef(local));
+    }
+  }
+  // `import M as A` inside a source module publishes M's whole namespace as
+  // the member `A`: this is how CPython's os.py exposes os.path (`import
+  // posixpath as path`), and the recursion is what makes `os.path.join`
+  // resolve to the canonical `posixpath.join` symbol. Not a runtime module
+  // object — the flat `localName.attr` symbol table carries every member.
+  if (namespaceDepth < kMaxNamespaceDepth) {
+    for (const parser::NodePtr &statement : *body) {
+      if (!statement || statement->kind != "Import")
+        continue;
+      const auto *names = ast::nodeList(*statement, "names");
+      if (!names)
+        continue;
+      for (const parser::NodePtr &alias : *names) {
+        if (!alias)
+          continue;
+        std::optional<std::string_view> imported = ast::string(*alias, "name");
+        std::optional<std::string_view> member = importAliasLocalName(*alias);
+        if (!imported || !member || imported->find('.') != std::string::npos)
+          continue;
+        std::string nested =
+            (llvm::Twine(localName) + "." + llvm::StringRef(*member)).str();
+        bindSourceModuleNamespace(llvm::StringRef(*imported), nested,
+                                  namespaceDepth + 1);
+      }
     }
   }
   for (const parser::NodePtr &statement : *body) {
@@ -449,6 +489,26 @@ bool ModuleEmitter::bindSourceModuleName(llvm::StringRef module,
       if (bindSourceModuleName(module, llvm::StringRef(*aliased), localName,
                                aliasDepth + 1))
         return true;
+  // `import posixpath as path` publishes a module as the member `path`, so
+  // `from os import *` (whose __all__ lists "path") binds a whole namespace
+  // here, not a single value.
+  for (const parser::NodePtr &statement : *body) {
+    if (!statement || statement->kind != "Import")
+      continue;
+    const auto *names = ast::nodeList(*statement, "names");
+    if (!names)
+      continue;
+    for (const parser::NodePtr &alias : *names) {
+      if (!alias)
+        continue;
+      std::optional<std::string_view> imported = ast::string(*alias, "name");
+      std::optional<std::string_view> member = importAliasLocalName(*alias);
+      if (!imported || !member || llvm::StringRef(*member) != exportedName)
+        continue;
+      if (bindSourceModuleNamespace(llvm::StringRef(*imported), localName))
+        return true;
+    }
+  }
   if (bindSourceModuleReexport(*source, exportedName, localName))
     return true;
   return false;
@@ -485,8 +545,15 @@ bool ModuleEmitter::bindSourceModuleReexport(
         // `from M import *`: the name reexports when it is in M's __all__.
         const EmitOptions::SourceModule *fromSource =
             lookupSourceModule(*resolvedModule);
-        if (!fromSource)
+        if (!fromSource) {
+          // M is a native manifest (os.py's `from posix import *`), which has
+          // no __all__: the public-name convention is the export list, and the
+          // manifest export itself is what the name binds to.
+          if (!exportedName.empty() && exportedName.front() != '_' &&
+              types.bindImportedName(*resolvedModule, exportedName, localName))
+            return true;
           continue;
+        }
         std::optional<llvm::SmallVector<std::string, 8>> exports =
             staticAllExportNames(*fromSource->moduleNode);
         if (!exports || !llvm::is_contained(*exports, exportedName.str()))
@@ -546,6 +613,41 @@ bool ModuleEmitter::bindSourceModuleStar(llvm::StringRef module,
               sourceModuleFunctionSymbol(module, exported) + "'"});
   }
   return ok || diagnoseUnsupported;
+}
+
+// The public export names of a native manifest module: it declares no
+// __all__, so the convention (no leading underscore) is the export list.
+static llvm::SmallVector<std::string, 32>
+nativeModuleStarNames(mlir::MLIRContext &context, llvm::StringRef module) {
+  const py::protocols::Table &table = py::protocols::Table::get(context);
+  llvm::SmallVector<std::string, 32> names;
+  for (const std::string &name : table.moduleCallableExports(module))
+    names.push_back(name);
+  for (const auto &[exported, qualified] : table.moduleClassExports(module))
+    names.push_back(exported);
+  for (const std::string &name : table.moduleFloatConstantExports(module))
+    names.push_back(name);
+  for (const std::string &name : table.moduleIntConstantExports(module))
+    names.push_back(name);
+  for (const std::string &name : table.moduleStrConstantExports(module))
+    names.push_back(name);
+  llvm::sort(names);
+  names.erase(llvm::unique(names), names.end());
+  return names;
+}
+
+// `from <manifest> import *` inside a SOURCE module, seen from the module's
+// importer: each re-exported name becomes a `localName.<name>` member, so
+// `os.getcwd()` reaches posix.getcwd through os.py's star re-export the way
+// CPython's os.py re-exports posix.
+void ModuleEmitter::bindNativeModuleNamespaceStar(llvm::StringRef module,
+                                                  llvm::StringRef localName) {
+  for (const std::string &name : nativeModuleStarNames(context, module)) {
+    if (name.empty() || name.front() == '_')
+      continue;
+    std::string local = (llvm::Twine(localName) + "." + name).str();
+    types.bindImportedName(module, name, local);
+  }
 }
 
 bool ModuleEmitter::bindNativeModuleStar(llvm::StringRef module,

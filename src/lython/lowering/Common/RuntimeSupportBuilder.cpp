@@ -2303,12 +2303,13 @@ void buildRunPythonMain(SupportBuilder &b) {
 } // namespace
 
 mlir::OwningOpRef<mlir::ModuleOp>
-buildNativeRuntimeSupportModule(mlir::MLIRContext &context) {
+buildNativeRuntimeSupportModule(mlir::MLIRContext &context,
+                                const llvm::Triple &triple) {
   mlir::OpBuilder builder(&context);
   mlir::OwningOpRef<mlir::ModuleOp> module =
       mlir::ModuleOp::create(builder.getUnknownLoc());
 
-  SupportBuilder support(*module);
+  SupportBuilder support(*module, triple);
   support.declareExternal("abort", builder.getFunctionType({}, {}));
   support.declareExternal(
       "free", builder.getFunctionType({support.ptr()}, {}));
@@ -2390,6 +2391,7 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context) {
   buildBoxedIntValue(support);
   buildPrintBytes(support);
   buildHostSupport(support);
+  buildOsSupport(support);
   buildGlobalViewFunction(support, "__ly_global_view_i8");
   buildGlobalViewFunction(support, "__ly_global_view_i32");
   buildGlobalViewFunction(support, "__ly_global_view_i64");

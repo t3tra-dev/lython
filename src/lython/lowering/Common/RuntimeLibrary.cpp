@@ -352,7 +352,7 @@ mlir::LogicalResult linkEmbeddedNativeRuntime(llvm::Module &llvmModule) {
   // native/support.mlir, fully migrated).
   {
     mlir::OwningOpRef<mlir::ModuleOp> builtModule =
-        buildNativeRuntimeSupportModule(context);
+        buildNativeRuntimeSupportModule(context, targetTriple);
     if (!builtModule) {
       llvm::errs() << "error: failed to build native runtime support module\n";
       return mlir::failure();

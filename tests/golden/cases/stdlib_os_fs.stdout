@@ -1,0 +1,39 @@
+True True True
+['b.txt', 'sub']
+[]
+True False
+True False
+False False
+5
+True
+True
+True True
+2
+True
+True False
+True True
+False True
+False True
+False
+_golden_os_fs_tmp ['sub'] []
+_golden_os_fs_tmp/sub ['deep'] ['a.txt']
+_golden_os_fs_tmp/sub/deep [] []
+True
+True
+True
+True
+[Errno 2] No such file or directory: '_golden_os_fs_tmp/missing'
+[Errno 2] No such file or directory: '_golden_os_fs_tmp/missing'
+[Errno 2] No such file or directory: '_golden_os_fs_tmp/missing'
+[Errno 17] File exists: '_golden_os_fs_tmp'
+[Errno 2] No such file or directory: '_golden_os_fs_tmp/missing' -> '_golden_os_fs_tmp/other'
+[Errno 20] Not a directory: '_golden_os_fs_tmp/sub/a.txt'
+rmdir non-empty raises OSError
+[Errno 2] No such file or directory: '_golden_os_fs_tmp/missing'
+True True
+True True
+True True
+No such file or directory
+Permission denied
+File exists
+False
