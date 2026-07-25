@@ -1,6 +1,6 @@
 # probe: the old field value is still named by a local when the field is rebound
 # axes: acquire=call width=w3list op=rebind-with-live-old flow=straight
-# CLASSIFICATION: 1 正しい
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: 1 3
 
 class Box:

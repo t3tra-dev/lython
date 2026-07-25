@@ -1,6 +1,6 @@
 # probe: in-place mutation through self inside a method -- dict field setitem (insert, may rehash)
 # axes: acquire=self width=w3list/w1dict op=dsetitem flow=straight
-# CLASSIFICATION: 1 正しい
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: 2 2
 
 class Box:

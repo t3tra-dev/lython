@@ -1,6 +1,6 @@
 # probe: field rebind -- receiver from an inline constructor in the same frame; field type dict[str, int]
 # axes: acquire=inline width=w1dict op=rebind flow=straight
-# CLASSIFICATION: 1 正しい
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: 2 1
 
 class Box:

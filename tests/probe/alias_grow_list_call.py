@@ -1,8 +1,7 @@
 # probe: フィールドの list をローカルに束縛して in-place で成長させ、そのローカルを
 #   フィールドに書き戻す (call 由来レシーバ)。k-rfc 照会 A。
 # axes: acquire=call width=w3list op=alias-grow-writeback flow=straight
-# CLASSIFICATION: 4 クラッシュ / abort
-#   exit -5
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: 2
 # 観測: 8 回実行: SIGTRAP 3 / abort(refcount) 5。libgmalloc: SIGSEGV (決定的)
 

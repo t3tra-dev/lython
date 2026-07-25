@@ -1,7 +1,6 @@
 # probe: in-place field mutation inside a while loop (append)
 # axes: acquire=call width=w3list/w1dict op=append flow=while
-# CLASSIFICATION: 3 loud 拒否 (診断)
-#   list.append on a field or borrowed list is not supported inside a branch or loop body; bind the list to a local variable and mutate the local instead
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: 3
 
 class Box:

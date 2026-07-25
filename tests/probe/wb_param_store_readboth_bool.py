@@ -1,7 +1,6 @@
 # probe: callee stores into and reads back a borrowed receiver's bool field, then the caller reads it
 # axes: acquire=param width=bool op=rebind flow=straight observe=writeback-both
-# CLASSIFICATION: 2 silent 誤実行
-#   cpython='in callee: True\nin caller: True\n' lyc='in callee: True\nin caller: False\n'
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: in callee: True / in caller: True
 
 class Box:

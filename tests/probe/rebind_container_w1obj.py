@@ -1,6 +1,6 @@
 # probe: field rebind -- receiver read out of a list; field type Other
 # axes: acquire=container width=w1obj op=rebind flow=straight
-# CLASSIFICATION: 1 正しい
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: 7
 
 class Other:

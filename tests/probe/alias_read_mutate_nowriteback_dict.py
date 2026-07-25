@@ -3,8 +3,8 @@
 #   B の真因も書き戻しではなく「別名を再確保させる変異」だと決まる。
 #   直接 `self._f["x"] = k` と書けば通る (alias_direct_setitem_dict.py) 点が対照。
 # axes: acquire=inline width=w1dict(box-fronted) op=alias-read+insert(no writeback) flow=straight
-# CLASSIFICATION: 4 クラッシュ / abort
-#   libsystem_malloc フレームを含む; exit -6
+# CLASSIFICATION @ kernel/4a 6c328b5: 4 クラッシュ / abort
+#   signal 5; Ly_DecRef observed non-positive refcount
 # CPython 3.14 expects: 1
 # 観測: 8 回実行: SIGABRT 8 (libsystem_malloc)。libgmalloc: SIGSEGV
 

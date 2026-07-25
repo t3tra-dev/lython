@@ -2,7 +2,7 @@
 #   レシーバのフィールド (io.StringIO) を「読み出して in-place 変異」する。
 #   header 経由なら関数境界を越えるはず (3 経路表の 4 行目の確認)。
 # axes: acquire=param width=1lane-header-fronted op=inplace-mutate flow=straight observe=writeback
-# CLASSIFICATION: 1 正しい
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: xx
 
 import io

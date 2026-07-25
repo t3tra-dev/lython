@@ -5,7 +5,7 @@
 #   *どこまで安い読み出しなら再 root されたレーンを消費せずに済むか* の閾値」。
 #   float には無料の読み出し形が存在しない (素の束縛でも materialise が要る)。
 # axes: acquire=call width=w2float op=rebind flow=ifone read=none
-# CLASSIFICATION: 1 正しい
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: (出力なし、正常終了)
 
 

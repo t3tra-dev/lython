@@ -1,6 +1,6 @@
 # probe: field rebind -- receiver is a borrowed parameter, observed inside the callee; field type float
 # axes: acquire=param width=w2float op=rebind flow=straight
-# CLASSIFICATION: 1 正しい
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: 1.5
 
 class Box:

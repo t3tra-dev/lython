@@ -1,6 +1,6 @@
 # probe: REPORTED loud (budget 5): a 2-int NamedTuple-shaped class as a dict key
 # axes: width=wNcls op=dict-key flow=straight
-# CLASSIFICATION: 3 loud 拒否 (診断)
+# CLASSIFICATION @ kernel/4a 6c328b5: 3 loud 拒否 (診断)
 #   isinstance on an object-typed value requires dynamic object inspection, which is excluded from the static evidence kernel
 # CPython 3.14 expects: 3
 

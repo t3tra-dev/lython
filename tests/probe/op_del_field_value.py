@@ -1,6 +1,6 @@
 # probe: the value stored in a field is dropped from every other name, then read back
 # axes: acquire=call width=w3list op=drop-other-names flow=straight
-# CLASSIFICATION: 3 loud 拒否 (診断)
+# CLASSIFICATION @ kernel/4a 6c328b5: 3 loud 拒否 (診断)
 #   `del fresh` is rejected (Lython deviation from CPython): locals are released when their scope ends, so deleting a variable is unnecessary
 # CPython 3.14 expects: 3 3
 

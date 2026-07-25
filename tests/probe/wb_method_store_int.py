@@ -1,6 +1,6 @@
 # probe: a method stores into self's int field; the caller reads it back
 # axes: acquire=self width=int op=rebind flow=straight observe=writeback
-# CLASSIFICATION: 1 正しい
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: 42
 
 class Box:

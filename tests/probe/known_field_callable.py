@@ -1,6 +1,6 @@
 # probe: REPORTED loud: a class field holding a callable
 # axes: width=callable op=field flow=straight
-# CLASSIFICATION: 3 loud 拒否 (診断)
+# CLASSIFICATION @ kernel/4a 6c328b5: 3 loud 拒否 (診断)
 #   static type !py.contract<"Box"> does not provide manifest method 'fn'
 # CPython 3.14 expects: 42
 

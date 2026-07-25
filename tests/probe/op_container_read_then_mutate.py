@@ -1,7 +1,6 @@
 # probe: read an object out of a list into a local, then mutate the local's field
 # axes: acquire=container width=w3list op=read-then-mutate flow=straight
-# CLASSIFICATION: 2 silent 誤実行
-#   cpython='3 1\n' lyc='1 1\n'
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: 3 1
 
 class Box:

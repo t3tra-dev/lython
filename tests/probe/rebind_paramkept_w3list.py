@@ -1,7 +1,6 @@
 # probe: field rebind -- receiver is a borrowed parameter, observed by the caller after return; field type list[int]
 # axes: acquire=paramkept width=w3list op=rebind flow=straight
-# CLASSIFICATION: 3 loud 拒否 (診断)
-#   IndexError: sequence index out of range
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: 2 1
 
 class Box:

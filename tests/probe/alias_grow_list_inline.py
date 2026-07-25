@@ -1,7 +1,7 @@
 # probe: 照会 A の対照 -- 同じ alias-grow-writeback をローカル構築レシーバで行う
 #   (657f0d8 では call 由来だけ abort し、こちらは正常終了した = marker gap の証拠)。
 # axes: acquire=inline width=w3list op=alias-grow-writeback flow=straight
-# CLASSIFICATION: 1 正しい
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: 2
 # 観測: 8 回実行: 正常終了 8。libgmalloc: 正常終了
 

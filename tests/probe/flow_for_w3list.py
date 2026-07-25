@@ -1,7 +1,6 @@
 # probe: field rebind reached through for control flow; field type list[int]
 # axes: acquire=call width=w3list op=rebind flow=for
-# CLASSIFICATION: 3 loud 拒否 (MLIR verifier 失敗 = 最早境界での診断になっていない)
-#   operand #0 does not dominate this use
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: 2
 
 class Box:

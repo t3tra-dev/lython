@@ -1,6 +1,6 @@
 # probe: in-place mutation through self inside a method -- list field setitem (in place, no realloc)
 # axes: acquire=self width=w3list/w1dict op=setitem flow=straight
-# CLASSIFICATION: 1 正しい
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: 1 99
 
 class Box:

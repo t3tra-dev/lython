@@ -1,6 +1,6 @@
 # probe: callee stores into and reads back a borrowed receiver's int field, then the caller reads it
 # axes: acquire=param width=bigint op=rebind flow=straight observe=writeback-both
-# CLASSIFICATION: 3 loud 拒否 (診断)
+# CLASSIFICATION @ kernel/4a 6c328b5: 3 loud 拒否 (診断)
 #   OverflowError: int too large to convert to a native 64-bit integer
 # CPython 3.14 expects: in callee: 12345678901234567890 / in caller: 12345678901234567890
 

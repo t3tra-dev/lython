@@ -5,7 +5,7 @@
 #   **exit 134 は 1 件も出ていない**。この形が abort する報告があれば、
 #   ビルド (ブランチ + commit) の差か、記述と実際の綴りの差である。
 # axes: acquire=call width=w1obj op=rebind flow=while read=none
-# CLASSIFICATION: 1 正しい
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: 1
 
 

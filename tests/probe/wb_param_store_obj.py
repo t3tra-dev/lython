@@ -1,7 +1,6 @@
 # probe: callee stores into a borrowed receiver's Other field; caller reads it back
 # axes: acquire=param width=obj op=rebind flow=straight observe=writeback
-# CLASSIFICATION: 2 silent 誤実行
-#   cpython='7\n' lyc='0\n'
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: 7
 
 class Other:

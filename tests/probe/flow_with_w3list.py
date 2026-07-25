@@ -1,6 +1,6 @@
 # probe: field rebind reached through with control flow; field type list[int]
 # axes: acquire=call width=w3list op=rebind flow=with
-# CLASSIFICATION: 3 loud 拒否 (診断)
+# CLASSIFICATION @ kernel/4a 6c328b5: 3 loud 拒否 (診断)
 #   runtime manifest has no Ctx.__enter__ method
 # CPython 3.14 expects: 2
 

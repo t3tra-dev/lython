@@ -1,6 +1,6 @@
 # probe: callee stores into a borrowed receiver's int | None field; caller reads it back
 # axes: acquire=param width=optional op=rebind flow=straight observe=writeback
-# CLASSIFICATION: 3 loud 拒否 (診断)
+# CLASSIFICATION @ kernel/4a 6c328b5: 3 loud 拒否 (診断)
 #   runtime object header has invalid type 'i64'
 # CPython 3.14 expects: 5
 

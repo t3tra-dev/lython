@@ -2,7 +2,7 @@
 #   (ハンドル store 経路) で行う。これも通るので、再束縛だけでは失敗しないことが
 #   3 幅すべてで確認できる。
 # axes: acquire=call width=w1obj op=rebind flow=ifone read=none
-# CLASSIFICATION: 1 正しい
+# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
 # CPython 3.14 expects: (出力なし、正常終了)
 
 
