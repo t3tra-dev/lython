@@ -31,6 +31,19 @@
 //   - bytes.decode accepts only utf-8/strict and validates the arguments
 //     eagerly (CPython's codec lookup is lazy); unknown encodings raise
 //     LookupError up front.
+//   - float.__round__ with ndigits takes an `int`, not CPython's
+//     `SupportsIndex`, and rounds by scaling through binary64 rather than
+//     through a correctly-rounded decimal conversion (_Py_dg_dtoa). It agrees
+//     with CPython for the magnitudes where 10**|ndigits| is exact.
+//   - range.__repr__ is object-generic (`<range object at 0x...>`) instead of
+//     CPython's `range(0, 5)`; range.__len__/__getitem__/__contains__ now
+//     exist, but the constructor is still i64-bounded.
+//   - complex.__truediv__ uses the textbook formula, not CPython's Smith
+//     scaling in _Py_c_quot, so the last bits can differ from CPython's.
+//   - The remaining declared-but-unimplemented names on these contracts are
+//     inventoried in rfc/contract-audit.md, which also records what the
+//     differential audit found to agree; do not add a name here without an
+//     implementation behind it.
 
 module attributes {
   ly.typing.manifest,
