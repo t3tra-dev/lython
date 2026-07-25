@@ -53,6 +53,23 @@ suite already states its expectation. k-4a hit the false SILENT running this ove
 goldens; the row belongs in the instrument table either way, because the domain
 is a property worth stating even now that it is wider.
 
+VALIDATING THE SIDECAR PATH, permanently and on any tree:
+
+    python3 tests/probe/tools/allocregimes.py <lyc> --regimes plain -n 1 \
+        tests/probe/tools/fixtures/sentinel_wrong_expectation.py
+
+That fixture prints one thing and its sidecar says another, so it must report
+`SILENT(actual) [sidecar]` and exit non-zero. Unlike pointing this tool at a
+known-broken probe, the fixture cannot be repaired: the mismatch is its purpose,
+so it keeps validating the comparison after every real defect has been fixed.
+k-4a's idea, and the reason it matters is one of theirs too -- evidence recorded
+from a broken tree describes a binary that will not exist for long.
+
+It validates the sidecar comparison and nothing else. `flaky.py`'s "no NOT
+STABLE" needs genuine nondeterminism, which no synthetic input supplies, and the
+CPython-oracle path must not get a deliberate mismatch, because there a mismatch
+IS a defect and a planted one would read as a real finding.
+
 Exit code is the number of probes failing in at least one selected regime.
 """
 
