@@ -2304,14 +2304,26 @@ void appendTrackedResource(
 llvm::SmallVector<TrackedResource, 16>
 collectTrackedResources(mlir::ModuleOp module, mlir::SymbolTable &symbols,
                         mlir::func::FuncOp function,
-                        llvm::ArrayRef<own::RuntimeDeallocator> deallocators) {
+                        llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
+                        own::AliasAnalysis &aliases,
+                        FuncContractCache &contracts) {
   llvm::SmallVector<TrackedResource, 16> resources;
+  // Same lane advance the insertion pass performs, from the same shared
+  // helper: insertion releases the CURRENT lanes, so a verifier still tracking
+  // the birth lanes would read that release as naming another entity and
+  // report the resource as never released. "If insertion and verification
+  // disagree on roots, the proof is void" (rfc/memory-safety-proof.md) --
+  // which is exactly why the advance lives in common/ and not in either pass.
+  auto advance = [&](own::ResourceGroup &group) {
+    own::advanceGroupLanesThroughReRoots(contracts, function, group, aliases);
+  };
 
   function.walk([&](mlir::Operation *op) {
     if (!op->hasAttr(own::kOwnedLocalObjectAttr))
       return;
     for (own::ResourceGroup group :
          own::collectOwnedLocalObjectGroups(op, deallocators)) {
+      advance(group);
       appendTrackedResource(resources, function, op, group.offset,
                             std::move(group.values), group.condition,
                             std::move(group.views));
@@ -2331,6 +2343,7 @@ collectTrackedResources(mlir::ModuleOp module, mlir::SymbolTable &symbols,
     for (own::ResourceGroup group :
          own::collectOwnedCallResultGroups(module, call, deallocators,
                                            &symbols)) {
+      advance(group);
       appendTrackedResource(resources, function, call.getOperation(),
                             group.offset, std::move(group.values),
                             group.condition, std::move(group.views));
@@ -2353,8 +2366,8 @@ mlir::LogicalResult verifyFunctionAffineOwnership(
   bool modelMayRaiseUnwindExits =
       !module->hasAttr(own::kRuntimeInternalLoweringAttr) &&
       findPythonSourceLoc(function.getLoc()).has_value();
-  llvm::SmallVector<TrackedResource, 16> resources =
-      collectTrackedResources(module, symbols, function, deallocators);
+  llvm::SmallVector<TrackedResource, 16> resources = collectTrackedResources(
+      module, symbols, function, deallocators, aliases, contracts);
   llvm::SmallVector<BorrowedEntryResource, 8> borrowedEntryResources =
       collectBorrowedEntryResources(function, deallocators);
 

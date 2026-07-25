@@ -1072,31 +1072,33 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
             op, slotStorageType, oldValues, slotName)))
       return mlir::failure();
   } else {
-    // A store to a field wider than one handle RE-ROOTS those lanes in the
-    // object's expansion. When the instance was not constructed in this frame
-    // there is no owned-local marker to republish, so every later release of
-    // the object -- the normal-path one and each unwind cleanup -- still names
-    // the birth expansion and releases the REPLACED value itself. Releasing it
-    // here as well is a second release of the same list: `Ly_DecRef observed
-    // non-positive refcount` when the freed block reads back as zero, and a
-    // silent use-after-free when it does not (which is why it surfaced as a
-    // load-dependent flake rather than a hard failure).
+    // Two separate reasons the replaced value must NOT be released here, both
+    // ending in a second release of the same object:
     //
-    // Leaving the release to that stale-but-self-consistent teardown keeps the
-    // replaced value released exactly once and leaks the replacement instead.
-    // A leak, not a double free: bounded, deterministic, and never a
-    // mis-execution. Removing it needs the release machinery to track a
-    // per-region expansion for one entity (the `stale`/re-root notion the
-    // affine verifier already has for a consuming call that returns the
-    // entity) -- see the ownership note in runtime/lib/json.py.
-    bool markerFollows =
+    //  - a SELF-store (`ks = self._kids; ks.append(v); self._kids = ks`): the
+    //    growth primitive already moved the slot's token through its transfer
+    //    and handed it back, so the retain above restores the slot's one
+    //    reference and there is no second one to give up. The old lanes are
+    //    also the pre-realloc ones, so the release would free storage the
+    //    primitive already freed.
+    //  - an instance whose expansion is not republished (received from a call):
+    //    every later release of the object still names the birth expansion and
+    //    releases the REPLACED value itself, so releasing it here too is the
+    //    second release. That one leaks the replacement instead -- bounded,
+    //    deterministic, never a mis-execution -- and is removed by publishing
+    //    the current expansion for call-derived instances, which the tracking
+    //    unit now has a stable root for but the N-lane physical ABI still
+    //    needs a producer op to name.
+    bool selfStore = RuntimeBundleLowerer::aggregateSlotStoreIsSelfStore(
+        oldValues, slotValue.physicalValues());
+    bool republished =
         RuntimeBundleLowerer::ownedLocalObjectMarkerFollowsExpansion(
             op.getObject());
     if (mlir::failed(RuntimeBundleLowerer::replaceAggregateSlot(
             op, fieldTypes[*fieldIndex], oldValues, oldSlotValue,
             fieldTypes[*fieldIndex], slotValue, slotName,
             /*releaseMissingOldObjectSlot=*/true,
-            /*releaseOldSlot=*/markerFollows)))
+            /*releaseOldSlot=*/republished && !selfStore)))
       return mlir::failure();
   }
   if (releaseOwnedSource &&

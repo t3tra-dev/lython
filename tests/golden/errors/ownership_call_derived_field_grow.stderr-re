@@ -1,0 +1,1 @@
+owned resource from @leaf result 0 is still owned when a call to .* may unwind out of the function

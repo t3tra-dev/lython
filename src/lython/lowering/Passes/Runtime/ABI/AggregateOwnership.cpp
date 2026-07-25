@@ -187,6 +187,45 @@ mlir::LogicalResult RuntimeBundleLowerer::replaceAggregateSlot(
                                                     slotName);
 }
 
+bool RuntimeBundleLowerer::aggregateSlotStoreIsSelfStore(
+    mlir::ValueRange oldValues, mlir::ValueRange newValues) const {
+  if (oldValues.empty() || newValues.empty())
+    return false;
+  mlir::Value target = own::underlyingObjectValue(oldValues.front());
+  mlir::Value head = own::underlyingObjectValue(newValues.front());
+  // Bounded: each hop moves to a strictly earlier definition, but the cap
+  // keeps a malformed contract from spinning here.
+  for (unsigned step = 0; step < 64 && head; ++step) {
+    if (head == target)
+      return true;
+    auto result = mlir::dyn_cast<mlir::OpResult>(head);
+    if (!result)
+      return false;
+    auto call = mlir::dyn_cast<mlir::func::CallOp>(result.getOwner());
+    if (!call)
+      return false;
+    mlir::ModuleOp moduleOp = module;
+    mlir::func::FuncOp callee =
+        moduleOp.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
+    if (!callee)
+      return false;
+    mlir::FailureOr<own::FunctionContract> contract =
+        own::readFunctionContract(callee);
+    // Exactly one transfer: the owned result replaces THAT operand. A
+    // primitive consuming several entities is not an in-place mutation of one,
+    // so following it would be a guess about which operand came back.
+    if (mlir::failed(contract) ||
+        !contract->ownedResults.contains(result.getResultNumber()) ||
+        contract->transferArgs.values.size() != 1)
+      return false;
+    unsigned transferred = contract->transferArgs.values.front();
+    if (transferred >= call.getNumOperands())
+      return false;
+    head = own::underlyingObjectValue(call.getOperand(transferred));
+  }
+  return false;
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::replaceAggregateSlot(
     mlir::Operation *op, mlir::Type oldType, mlir::ValueRange oldValues,
     const RuntimeBundle *oldSlotValue, mlir::Type newType,

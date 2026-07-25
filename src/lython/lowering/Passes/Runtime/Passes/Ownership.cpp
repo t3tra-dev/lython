@@ -1834,10 +1834,19 @@ insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
   if (call.getNumResults() == 0)
     return mlir::success();
 
+  mlir::func::FuncOp enclosing = call->getParentOfType<mlir::func::FuncOp>();
   for (own::ResourceGroup group :
        own::collectOwnedCallResultGroups(module, call, deallocators)) {
     if (!group.deallocator)
       continue;
+
+    // The lanes the call returned are the entity's BIRTH expansion. A payload
+    // mutation since then re-rooted part of it, and both the release position
+    // and the release operands must come from the current lanes: the old ones
+    // name storage the mutation primitive has already reallocated away, and
+    // their last use sits at the mutation itself -- in the middle of the
+    // entity's live range.
+    own::advanceGroupLanesThroughReRoots(contracts, enclosing, group, aliases);
 
     if (group.condition) {
       mlir::FailureOr<bool> inserted = insertConditionalOwnedResultRelease(
@@ -1920,10 +1929,18 @@ mlir::LogicalResult insertOwnedLocalObjectReleases(
     mlir::ModuleOp module, mlir::Operation *op, FuncContractCache &contracts,
     llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
     own::AliasAnalysis &aliases) {
+  mlir::func::FuncOp enclosing = op->getParentOfType<mlir::func::FuncOp>();
   for (own::ResourceGroup group :
        own::collectOwnedLocalObjectGroups(op, deallocators)) {
     if (!group.deallocator)
       continue;
+
+    // Same reason as for call-result groups: an owned local whose payload was
+    // mutated must be released through the post-mutation lanes. The marker
+    // re-root covers the shapes the lowerer can see; this covers the ones only
+    // the final IR shows (an in-place growth primitive threaded through the
+    // instance's expansion).
+    own::advanceGroupLanesThroughReRoots(contracts, enclosing, group, aliases);
 
     std::optional<ReleaseInsertion> release =
         findReleaseInsertion(contracts, op, group.values, deallocators,

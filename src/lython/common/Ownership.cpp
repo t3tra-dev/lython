@@ -1603,6 +1603,126 @@ bool callPartiallyConsumesGroup(FuncContractCache &contracts,
   return false;
 }
 
+std::optional<llvm::SmallVector<mlir::Value, 4>>
+callReRootsGroupLanes(FuncContractCache &contracts, mlir::func::CallOp call,
+                      llvm::ArrayRef<mlir::Value> group,
+                      AliasAnalysis &aliases) {
+  if (group.size() < 2)
+    return std::nullopt;
+  auto cached = contracts.lookup(call.getCallee());
+  if (mlir::failed(cached) || !*cached)
+    return std::nullopt;
+  const FunctionContract &contract = (*cached)->contract;
+  if (contract.ownedResults.empty())
+    return std::nullopt;
+
+  auto substituteFrom = [&](unsigned operandOffset)
+      -> std::optional<llvm::SmallVector<mlir::Value, 4>> {
+    if (operandOffset >= call.getNumOperands())
+      return std::nullopt;
+    // Which lane does the consumed operand name? Lane 0 is excluded: the root
+    // IS the entity, so consuming it is a consume, never a re-root.
+    unsigned laneIndex = 0;
+    for (unsigned index = 1; index < group.size(); ++index) {
+      if (aliases.same(call.getOperand(operandOffset), group[index])) {
+        laneIndex = index;
+        break;
+      }
+    }
+    if (laneIndex == 0)
+      return std::nullopt;
+
+    // How far does the sub-range reach? The operands must go on naming the
+    // group's following lanes in order: a primitive that took only part of a
+    // payload is not handing back a replacement for the whole of it.
+    unsigned span = 1;
+    while (laneIndex + span < group.size() &&
+           operandOffset + span < call.getNumOperands() &&
+           aliases.same(call.getOperand(operandOffset + span),
+                        group[laneIndex + span]))
+      ++span;
+
+    for (unsigned resultOffset : contract.ownedResults.values) {
+      if (resultOffset + span > call.getNumResults())
+        continue;
+      bool typesMatch = true;
+      for (unsigned index = 0; index < span; ++index)
+        if (call.getResult(resultOffset + index).getType() !=
+            group[laneIndex + index].getType())
+          typesMatch = false;
+      if (!typesMatch)
+        continue;
+      llvm::SmallVector<mlir::Value, 4> substituted(group.begin(), group.end());
+      for (unsigned index = 0; index < span; ++index)
+        substituted[laneIndex + index] = call.getResult(resultOffset + index);
+      return substituted;
+    }
+    return std::nullopt;
+  };
+
+  for (unsigned offset : contract.transferArgs.values)
+    if (auto substituted = substituteFrom(offset))
+      return substituted;
+  for (unsigned offset : contract.releaseArgs.values)
+    if (auto substituted = substituteFrom(offset))
+      return substituted;
+  return std::nullopt;
+}
+
+void advanceGroupLanesThroughReRoots(FuncContractCache &contracts,
+                                     mlir::func::FuncOp function,
+                                     ResourceGroup &group,
+                                     AliasAnalysis &aliases) {
+  if (group.values.size() < 2 || !function || function.isDeclaration())
+    return;
+  std::optional<mlir::DominanceInfo> dominance;
+
+  // Bounded: each step replaces at least one lane with a value defined later,
+  // so a fixpoint exists, but the cap keeps a pathological alias cycle from
+  // spinning here.
+  constexpr unsigned kMaxReRootSteps = 64;
+  for (unsigned step = 0; step < kMaxReRootSteps; ++step) {
+    mlir::func::CallOp reRoot;
+    llvm::SmallVector<mlir::Value, 4> advanced;
+    for (mlir::Value lane : llvm::drop_begin(group.values)) {
+      for (mlir::Operation *user : lane.getUsers()) {
+        auto call = mlir::dyn_cast<mlir::func::CallOp>(user);
+        if (!call)
+          continue;
+        std::optional<llvm::SmallVector<mlir::Value, 4>> substituted =
+            callReRootsGroupLanes(contracts, call, group.values, aliases);
+        if (!substituted)
+          continue;
+        reRoot = call;
+        advanced = std::move(*substituted);
+        break;
+      }
+      if (reRoot)
+        break;
+    }
+    if (!reRoot)
+      return;
+
+    // Every remaining use of the entity must be ordered against the re-root,
+    // or the substituted lanes are not in scope where the release goes. This
+    // is what keeps a rebind inside one arm of a branch out of the model
+    // instead of producing a module the MLIR verifier rejects.
+    if (!dominance)
+      dominance.emplace(function);
+    bool dominatesAllUses = true;
+    for (mlir::Value lane : group.values)
+      for (mlir::Operation *user : lane.getUsers())
+        if (user != reRoot.getOperation() &&
+            !dominance->properlyDominates(reRoot.getOperation(), user) &&
+            !dominance->properlyDominates(user, reRoot.getOperation()))
+          dominatesAllUses = false;
+    if (!dominatesAllUses)
+      return;
+
+    group.values = std::move(advanced);
+  }
+}
+
 bool isBlockArgMergeBorrowRetain(mlir::func::CallOp call) {
   auto label = call->getAttrOfType<mlir::StringAttr>(kAggregateRetainAttr);
   return label && label.getValue() == kBlockArgMergeBorrowLabel;

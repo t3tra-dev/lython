@@ -463,11 +463,20 @@ private:
       const RuntimeBundle *oldSlotValue, mlir::Type newType,
       const RuntimeBundle &newSlotValue, llvm::StringRef slotName,
       bool releaseMissingOldObjectSlot = true, bool releaseOldSlot = true);
-  // Does an owned-local-object marker for `logicalValue` track the CURRENT
-  // expansion, i.e. will `markOwnedLocalObjectBundle` republish it after a
-  // field re-root? Only an instance constructed in this frame has one; the
-  // release machinery keeps naming the birth expansion for anything else.
+  // Does the release machinery see the CURRENT expansion of `logicalValue`,
+  // i.e. will a field re-root be republished to it? Only an instance
+  // constructed in this frame carries the owned-local marker that publishes
+  // it; for anything else the release still names the birth expansion, so
+  // releasing the replaced value at the store would release it a second time.
   bool ownedLocalObjectMarkerFollowsExpansion(mlir::Value logicalValue) const;
+  // Is the value being stored into a slot the SAME entity the slot already
+  // holds, reached through mutation primitives that consume it and hand it
+  // back? `ks = self._kids; ks.append(v); self._kids = ks` is spelled that way
+  // by the current ABI, so the store is a SELF-store: the token the slot holds
+  // never left it, and releasing the pre-mutation lanes there would hand the
+  // deallocator storage the primitive has already reallocated.
+  bool aggregateSlotStoreIsSelfStore(mlir::ValueRange oldValues,
+                                     mlir::ValueRange newValues) const;
   mlir::LogicalResult retainAggregateSlot(mlir::Operation *op,
                                           mlir::Type slotType,
                                           mlir::ValueRange values,

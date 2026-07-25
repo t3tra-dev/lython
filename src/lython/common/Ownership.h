@@ -3,6 +3,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/SymbolTable.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/Value.h"
 #include "mlir/IR/ValueRange.h"
 #include "mlir/Support/LogicalResult.h"
@@ -387,6 +388,43 @@ bool callPartiallyConsumesGroup(FuncContractCache &contracts,
                                 mlir::func::CallOp call,
                                 llvm::ArrayRef<mlir::Value> group,
                                 AliasAnalysis &aliases);
+// A mutation primitive that RE-ROOTS a payload sub-range of `group` rather
+// than consuming the entity: its `transfer_args` names a lane at index >= 1
+// (never the root) and its `owned_results` hands back replacements of the same
+// types. That is how the current ABI spells in-place mutation -- "consume this
+// container and return another one" (`LyList_EnsureCapacity`,
+// `LyDict_SetItemBox`, ...) -- so a field or item sub-range mutated this way
+// moves to new SSA names while the entity it belongs to is unchanged.
+//
+// Returns `group` with the sub-range replaced by the call's owned results;
+// nullopt when the call is not such a re-root. The root (lane 0) is never
+// substituted: a call that consumes THAT is consuming the entity, which the
+// consume predicates above already decide.
+std::optional<llvm::SmallVector<mlir::Value, 4>>
+callReRootsGroupLanes(FuncContractCache &contracts, mlir::func::CallOp call,
+                      llvm::ArrayRef<mlir::Value> group,
+                      AliasAnalysis &aliases);
+// Advance `group.values` from the birth expansion to the entity's CURRENT
+// lanes by following those re-roots forward from the producer. The root is
+// never touched, so the entity's identity is unchanged; only the lanes the
+// deallocator will be handed, and the uses that decide where it is called,
+// move to the post-mutation names.
+//
+// Bails (leaving the lanes alone) whenever a re-root does not dominate every
+// remaining use of the entity: replacing a lane with a value defined in only
+// one arm would make the release operand fail MLIR's dominance check, and an
+// invalid module is worse than the conservative placement.
+//
+// `function` is only used to build dominance, and only once a candidate
+// re-root has actually been found: DominanceInfo construction is linear in the
+// function, so building it for every group would put back the quadratic term
+// the path-sensitive rework removed (docs/ownership-perf.md). It is also not
+// cached across groups on purpose -- release insertion may split blocks, which
+// invalidates the tree.
+void advanceGroupLanesThroughReRoots(FuncContractCache &contracts,
+                                     mlir::func::FuncOp function,
+                                     ResourceGroup &group,
+                                     AliasAnalysis &aliases);
 // Identity merge edges lend the merge argument a token via a retain labeled
 // kBlockArgMergeBorrowLabel; the paired release targets the pre-merge name.
 bool isBlockArgMergeBorrowRetain(mlir::func::CallOp call);
