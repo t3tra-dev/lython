@@ -1063,42 +1063,62 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
   auto oldFieldBundle = object->fieldBundles.find(op.getName());
   if (oldFieldBundle != object->fieldBundles.end())
     oldSlotValue = oldFieldBundle->second.get();
+  // Both arms below re-root the field's lanes in the object's expansion (see
+  // the loop at the end of this function), so both need the same answer to
+  // "will a later release of this object still name the pre-store lanes?".
+  bool markerFollows =
+      RuntimeBundleLowerer::ownedLocalObjectMarkerFollowsExpansion(
+          op.getObject());
+  // With no recorded bundle, `oldValues` is not a stored value at all: it is
+  // the constructor's DEFAULT-INITIALIZED placeholder. The placeholder is a
+  // zero-filled expansion whose own header gets a refcount, but whose NESTED
+  // object headers do not -- and only a user-class-typed field expands to
+  // nested headers (`self.inner: Inner` inlines Inner's whole expansion,
+  // including the header of Inner's own `int` field). Releasing that
+  // placeholder therefore decrements a refcount that is zero, which aborts at
+  // CONSTRUCTION with no load and no rebind: `Holder(Inner(1))` alone is
+  // enough. The scalar and container placeholders do carry an initialized
+  // header, so they keep the release and do not leak.
+  bool oldSlotPlaceholderHasUncountedHeaders =
+      oldSlotValue == nullptr &&
+      RuntimeBundleLowerer::classForContract(fieldTypes[*fieldIndex]) !=
+          nullptr;
   if (boxedField) {
     if (retainExistingObjectHandle &&
         mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
             op, slotStorageType, slotValue.physicalValues(), slotName)))
       return mlir::failure();
-    if (mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
+    // Why the guard is not only on the wide arm below: a `builtins.object`
+    // slot is one handle, but storing it re-roots that handle exactly like a
+    // wide field, so an instance without an owned-local marker -- `self`
+    // inside a method, which is every `self.x = obj` in an `__init__` -- has
+    // its pre-store handle released both here and by the object's own
+    // teardown. That is the same double release as the wide arm, and it needs
+    // no load to surface: `Holder(Inner(1))` aborts on construction.
+    if (markerFollows &&
+        mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
             op, slotStorageType, oldValues, slotName)))
       return mlir::failure();
   } else {
-    // Two separate reasons the replaced value must NOT be released here, both
-    // ending in a second release of the same object:
-    //
-    //  - a SELF-store (`ks = self._kids; ks.append(v); self._kids = ks`): the
-    //    growth primitive already moved the slot's token through its transfer
-    //    and handed it back, so the retain above restores the slot's one
-    //    reference and there is no second one to give up. The old lanes are
-    //    also the pre-realloc ones, so the release would free storage the
-    //    primitive already freed.
-    //  - an instance whose expansion is not republished (received from a call):
-    //    every later release of the object still names the birth expansion and
-    //    releases the REPLACED value itself, so releasing it here too is the
-    //    second release. That one leaks the replacement instead -- bounded,
-    //    deterministic, never a mis-execution -- and is removed by publishing
-    //    the current expansion for call-derived instances, which the tracking
-    //    unit now has a stable root for but the N-lane physical ABI still
-    //    needs a producer op to name.
+    // A THIRD reason the replaced value must not be released here, on top of
+    // the unpublished expansion and the uncounted placeholder above: a
+    // SELF-store (`ks = self._kids; ks.append(v); self._kids = ks`). The
+    // growth primitive's transfer already moved the slot's token out and its
+    // owned result handed one back, so the retain inside
+    // `replaceAggregateSlot` restores the slot's single reference and there is
+    // no second one to give up. The old lanes are also the pre-realloc ones,
+    // so the release would hand the deallocator storage the primitive has
+    // already freed. Unlike the other two this one applies even to an instance
+    // constructed in this frame, because it is an arithmetic fact about the
+    // primitive's contract rather than a question about republication.
     bool selfStore = RuntimeBundleLowerer::aggregateSlotStoreIsSelfStore(
         oldValues, slotValue.physicalValues());
-    bool republished =
-        RuntimeBundleLowerer::ownedLocalObjectMarkerFollowsExpansion(
-            op.getObject());
     if (mlir::failed(RuntimeBundleLowerer::replaceAggregateSlot(
             op, fieldTypes[*fieldIndex], oldValues, oldSlotValue,
             fieldTypes[*fieldIndex], slotValue, slotName,
             /*releaseMissingOldObjectSlot=*/true,
-            /*releaseOldSlot=*/republished && !selfStore)))
+            /*releaseOldSlot=*/markerFollows && !selfStore &&
+                !oldSlotPlaceholderHasUncountedHeaders)))
       return mlir::failure();
   }
   if (releaseOwnedSource &&
