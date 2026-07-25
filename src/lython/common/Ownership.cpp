@@ -9,11 +9,15 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
 
 namespace py::ownership {
@@ -607,6 +611,7 @@ collectContractOwnedResultGroups(mlir::func::FuncOp callee,
     group.values =
         valueSlice(call.getResults(), offset,
                    static_cast<unsigned>(deallocator->inputTypes.size()));
+    group.root = entityRootOf(group.values);
     appendEntityViews(group, call.getResults(), offset);
     groups.push_back(std::move(group));
   }
@@ -647,6 +652,7 @@ collectTypedResourceGroups(mlir::Type type, mlir::ValueRange values,
       group.deallocator = deallocator;
       group.values = valueSlice(
           values, 0, static_cast<unsigned>(deallocator->inputTypes.size()));
+      group.root = entityRootOf(group.values);
       appendEntityViews(group, values, 0);
       groups.push_back(std::move(group));
       return;
@@ -830,6 +836,7 @@ collectRuntimeResourceGroups(mlir::ValueRange values,
     group.offset = offset;
     group.deallocator = deallocator;
     group.values = valueSlice(values, offset, size);
+    group.root = entityRootOf(group.values);
     appendEntityViews(group, values, offset);
     unsigned span = size + static_cast<unsigned>(group.views.size());
     groups.push_back(std::move(group));
@@ -862,6 +869,10 @@ collectOwnedLocalObjectGroups(mlir::Operation *op,
   group.values = valueSlice(
       op->getResults(), 0,
       static_cast<unsigned>(deallocator->inputTypes.size()));
+  // The marker's result 0, normalized past the identity cast: a re-root
+  // republishes the SAME head through a fresh cast, so the normalized root is
+  // the one name that survives it.
+  group.root = entityRootOf(group.values);
   appendEntityViews(group, op->getResults(), 0);
   groups.push_back(std::move(group));
   return groups;
@@ -885,6 +896,7 @@ static void appendUnresolvedOwnedResultRoot(
   ResourceGroup group;
   group.offset = offset;
   group.values.push_back(result);
+  group.root = entityRootOf(group.values);
   groups.push_back(std::move(group));
 }
 
@@ -1033,6 +1045,7 @@ collectOwnedCallResultGroups(mlir::ModuleOp module, mlir::func::CallOp call,
       group.values = valueSlice(
           call.getResults(), offset,
           static_cast<unsigned>(deallocator->inputTypes.size()));
+      group.root = entityRootOf(group.values);
       appendEntityViews(group, call.getResults(), offset);
       ownedGroups.push_back(std::move(group));
     }
@@ -1644,6 +1657,51 @@ bool sameValueGroup(llvm::ArrayRef<mlir::Value> lhs,
     if (left != right)
       return false;
   return true;
+}
+
+mlir::Value entityRootOf(llvm::ArrayRef<mlir::Value> group) {
+  if (group.empty())
+    return {};
+  return underlyingObjectValue(group.front());
+}
+
+bool sameEntityRoot(llvm::ArrayRef<mlir::Value> lhs,
+                    llvm::ArrayRef<mlir::Value> rhs) {
+  mlir::Value left = entityRootOf(lhs);
+  mlir::Value right = entityRootOf(rhs);
+  // An empty group has no entity, so it is not the same entity as anything --
+  // including another empty group. Comparing them equal would let a group the
+  // caller failed to resolve absorb every other group at a dedup site.
+  return left && right && left == right;
+}
+
+llvm::hash_code entityRootHash(llvm::ArrayRef<mlir::Value> group) {
+  return llvm::hash_value(entityRootOf(group).getAsOpaquePointer());
+}
+
+void reportEntityRootParity(llvm::StringRef site,
+                            llvm::ArrayRef<mlir::Value> lhs,
+                            llvm::ArrayRef<mlir::Value> rhs) {
+  enum class Mode { Off, Log, Abort };
+  static const Mode mode = [] {
+    const char *setting = std::getenv("LYTHON_OWNERSHIP_ROOT_PARITY");
+    if (!setting || !*setting || llvm::StringRef(setting) == "0")
+      return Mode::Off;
+    return llvm::StringRef(setting) == "abort" ? Mode::Abort : Mode::Log;
+  }();
+  if (mode == Mode::Off)
+    return;
+
+  bool byRoot = sameEntityRoot(lhs, rhs);
+  bool byLanes = sameValueGroup(lhs, rhs);
+  if (byRoot == byLanes)
+    return;
+
+  llvm::errs() << "lython: ownership root parity divergence at " << site
+               << ": same-root=" << byRoot << " same-lanes=" << byLanes
+               << " (" << lhs.size() << " vs " << rhs.size() << " lanes)\n";
+  if (mode == Mode::Abort)
+    llvm::report_fatal_error("ownership root parity divergence");
 }
 
 } // namespace py::ownership

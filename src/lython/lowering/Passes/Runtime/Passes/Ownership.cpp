@@ -365,7 +365,11 @@ mergeReleaseInsertion(std::optional<ReleaseInsertion> current,
                       ReleaseInsertion next) {
   if (!current)
     return next;
-  if (!own::sameValueGroup(current->group, next.group))
+  // Same entity, not same lane list: two release sites for one entity merge
+  // even when a re-root between them replaced the payload lanes.
+  own::reportEntityRootParity("mergeReleaseInsertion", current->group,
+                              next.group);
+  if (!own::sameEntityRoot(current->group, next.group))
     return std::nullopt;
   if (releaseInsertionBlock(*current) != releaseInsertionBlock(next))
     return std::nullopt;
@@ -1809,6 +1813,7 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
     own::ResourceGroup destGroup;
     destGroup.values.assign(candidate.args.begin(), candidate.args.end());
     destGroup.views.assign(candidate.views.begin(), candidate.views.end());
+    destGroup.root = own::entityRootOf(destGroup.values);
     destGroup.deallocator = candidate.deallocator;
     if (unwindGroups)
       unwindGroups->push_back(destGroup);
@@ -2630,9 +2635,12 @@ mlir::LogicalResult insertUnwindCleanupReleases(
       // Region merges can map several in-region producers onto ONE parent
       // result group (both arms yield into the same result lanes); tracking
       // it twice would release the same token twice in one cleanup handler.
-      for (const UnwindTrackedGroup &existing : groups)
-        if (own::sameValueGroup(existing.values, tracked.values))
+      for (const UnwindTrackedGroup &existing : groups) {
+        own::reportEntityRootParity("unwindGroupDedup", existing.values,
+                                    tracked.values);
+        if (own::sameEntityRoot(existing.values, tracked.values))
           return;
+      }
       collectUnwindGroupSites(contracts, aliases, region, analysis.dominance,
                               tracked);
       groups.push_back(std::move(tracked));

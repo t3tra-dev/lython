@@ -7,6 +7,7 @@
 #include "mlir/IR/ValueRange.h"
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
@@ -231,6 +232,16 @@ classifyOwnershipConditionBranch(mlir::Operation *op,
 struct ResourceGroup {
   unsigned offset = 0;
   OwnershipKind ownership = OwnershipKind::Own;
+  // The entity's root: the ONE stable SSA name this resource is tracked by.
+  // Each producer names it -- a manifest allocation names its result, an
+  // owned-local-object marker names result 0, a call names the head of its
+  // owned result range -- and it is what group identity compares.
+  mlir::Value root;
+  // The entity's CURRENT physical lanes (the release interface the
+  // deallocator takes), derived from `root`. Not the identity: a payload
+  // re-root (field rebind, container growth, realloc) replaces lanes while
+  // leaving the root alone, and a key that included them would lose the
+  // entity exactly there.
   llvm::SmallVector<mlir::Value, 4> values;
   // Interior views of the same entity (the canonical-shape tail beyond the
   // release interface). Uses of these keep the entity live; they are not
@@ -389,5 +400,29 @@ llvm::SmallVector<mlir::Value, 4> remapGroupThroughValueMapping(
 mlir::Operation *ancestorInBlock(mlir::Operation *op, mlir::Block *block);
 bool sameValueGroup(llvm::ArrayRef<mlir::Value> lhs,
                     llvm::ArrayRef<mlir::Value> rhs);
+
+// The entity root a lane list is rooted at, normalized through the
+// identity-cast markers. Every producer lays an entity's lanes out with the
+// release-interface head first and every deallocator names operand 0 as the
+// released resource, so lane 0 is the root; stripping identity casts makes it
+// survive a re-root, which republishes the SAME head through a fresh cast.
+mlir::Value entityRootOf(llvm::ArrayRef<mlir::Value> group);
+// Group identity. Two lane lists name the same entity iff they share a root,
+// regardless of whether their payload lanes still agree.
+bool sameEntityRoot(llvm::ArrayRef<mlir::Value> lhs,
+                    llvm::ArrayRef<mlir::Value> rhs);
+// Hash matching `sameEntityRoot`, for keying visited-state maps by entity.
+llvm::hash_code entityRootHash(llvm::ArrayRef<mlir::Value> group);
+// Migration probe: report where the entity-root key and the old full-lane key
+// disagree. Set LYTHON_OWNERSHIP_ROOT_PARITY=1 to log each divergence, or
+// =abort to stop at the first one.
+//
+// Why not a plain assert: a divergence is EXPECTED from the moment any
+// producer re-roots payload lanes, which is precisely the case the migration
+// exists to fix, so an unconditional assert would abort the suite on the
+// inputs that matter instead of letting them be surveyed.
+void reportEntityRootParity(llvm::StringRef site,
+                            llvm::ArrayRef<mlir::Value> lhs,
+                            llvm::ArrayRef<mlir::Value> rhs);
 
 } // namespace py::ownership
