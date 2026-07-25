@@ -31,7 +31,15 @@
 //   int path is bit-identical within that range.
 // - `getrandbits(k)` accepts 0 <= k <= 63. CPython has no upper bound; 63 is
 //   where the result stops fitting the signed 64-bit lane a manifest can
-//   return. random.py's `_randbelow` therefore covers ranges below 2**63.
+//   return, so `randbelow` covers ranges below 2**63.
+// - `randbelow` and `randint` are CPython's PYTHON-level Lib/random.py code
+//   (`_randbelow_with_getrandbits` and the `a + _randbelow(b - a + 1)` that
+//   calls it), moved here because a Python function containing a loop is
+//   called TWICE when another Python function calls it -- reported to the
+//   Wave 3 foundation track. The duplicate consumed a second draw and returned
+//   it, so `randint(1, 100)` after `seed(42)` silently gave 15 instead of 82.
+//   Both belong back in random.py once that is fixed; the draw sequence here is
+//   CPython's either way.
 
 module attributes {
   ly.typing.module = "_random",
