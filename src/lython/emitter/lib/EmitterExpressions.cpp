@@ -1663,6 +1663,17 @@ Value ModuleEmitter::emitExprExpected(const parser::Node *expr,
     return emitContainerLiteral(*expr, expected);
   if (expr->kind == "Set")
     return emitSetLiteral(*expr, expected);
+  // `b: Box[int] = Box(5)`: a bare generic-class construction takes its
+  // instantiation from the expectation. The specialization is already
+  // allocated (the annotation spelled it), so this only has to redirect the
+  // construction at the specialized contract instead of the generic name.
+  if (expr->kind == "Call")
+    if (mlir::Type specialized =
+            expectedGenericClassInstantiation(*expr, expected))
+      return emitClassInstantiation(
+          *expr,
+          mlir::cast<py::ContractType>(specialized).getContractName(),
+          specialized);
   GenericFunctionInfo *generic = nullptr;
   if (expr->kind == "Name") {
     llvm::StringRef name = ast::nameSpelling(*expr);

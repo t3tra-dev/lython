@@ -590,6 +590,215 @@ Value ModuleEmitter::emitDescriptorReceiver(const parser::Node &anchor,
   return {classObject.getResult(), classType};
 }
 
+bool ModuleEmitter::registerGenericClass(
+    const parser::Node &classDef, llvm::StringRef symbolBase,
+    const EmitOptions::SourceModule *source) {
+  const auto *typeParams = ast::nodeList(classDef, "type_params");
+  if (!typeParams || typeParams->empty())
+    return false;
+  GenericClassInfo &info = genericClasses[symbolBase];
+  info.node = &classDef;
+  info.symbolBase = symbolBase.str();
+  info.source = source;
+  info.params.clear();
+  info.hasPackParameter = false;
+  for (const parser::NodePtr &param : *typeParams) {
+    if (!param)
+      continue;
+    auto name = ast::string(*param, "name");
+    if (!name)
+      continue;
+    info.params.push_back(std::string(*name));
+    // A ParamSpec or TypeVarTuple parameter is a parameter-LIST unknown: the
+    // instantiation would have to mangle a shape, not a type, and the method
+    // bodies would need pack-aware emission. Rejected at the instantiation
+    // site rather than here, so a module may ship such a class unused.
+    if (param->kind == "ParamSpec" || param->kind == "TypeVarTuple")
+      info.hasPackParameter = true;
+  }
+  const parser::Node *initNode = nullptr;
+  if (const auto *body = ast::nodeList(classDef, "body"))
+    for (const parser::NodePtr &statement : *body)
+      if (statement && statement->kind == "FunctionDef" &&
+          ast::string(*statement, "name") == "__init__")
+        initNode = statement.get();
+  types.registerGenericClass(symbolBase, info.params, initNode);
+  return true;
+}
+
+ModuleEmitter::GenericClassInfo *
+ModuleEmitter::lookupGenericClass(llvm::StringRef name) {
+  auto found = genericClasses.find(name);
+  return found == genericClasses.end() ? nullptr : &found->second;
+}
+
+void ModuleEmitter::diagnoseUngroundedGenericClass(const parser::Node &anchor,
+                                                   llvm::StringRef name) {
+  GenericClassInfo *generic = lookupGenericClass(name);
+  std::string spelling = name.str();
+  if (generic) {
+    spelling = generic->symbolBase;
+    std::string arguments;
+    for (const std::string &param : generic->params) {
+      if (!arguments.empty())
+        arguments += ", ";
+      arguments += param;
+    }
+    spelling += "[" + arguments + "]";
+  }
+  if (generic && generic->hasPackParameter) {
+    // A pack parameter is a parameter-LIST unknown, so no instantiation
+    // determines a fixed field layout or method arity to specialize.
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, anchor.range.start,
+        "generic class '" + spelling +
+            "' uses ParamSpec or TypeVarTuple parameters, which cannot be "
+            "specialized yet"});
+    return;
+  }
+  diagnostics.push_back(parser::Diagnostic{
+      parser::Severity::Error, anchor.range.start,
+      "generic class '" + spelling +
+          "' requires explicit type arguments here, or an annotated context "
+          "that determines them"});
+}
+
+mlir::Type
+ModuleEmitter::inferredGenericClassInstantiation(const parser::Node &call) {
+  // inferExpr's own class-instantiation path already solves the type
+  // arguments from __init__; validating the answer here keeps the emitter
+  // from constructing a contract the inference did not actually derive from
+  // this callee.
+  return expectedGenericClassInstantiation(call, types.inferExpr(&call));
+}
+
+mlir::Type ModuleEmitter::expectedGenericClassInstantiation(
+    const parser::Node &call, mlir::Type expected) {
+  auto expectedContract = mlir::dyn_cast_if_present<py::ContractType>(expected);
+  if (!expectedContract || !expectedContract.getArguments().empty())
+    return {};
+  const parser::Node *callee = ast::node(call, "func");
+  if (!callee || (callee->kind != "Name" && callee->kind != "Attribute"))
+    return {};
+  std::string qualified = ast::qualifiedName(callee);
+  std::string_view spelling = ast::nameSpelling(*callee);
+  std::optional<mlir::Type> cls = types.lookupClass(
+      qualified.empty() ? std::string(spelling) : qualified);
+  auto baseContract =
+      cls ? mlir::dyn_cast_if_present<py::ContractType>(*cls) : py::ContractType();
+  if (!baseContract)
+    return {};
+  GenericClassInfo *generic =
+      lookupGenericClass(baseContract.getContractName());
+  if (!generic)
+    return {};
+  // Accepted only when the expectation IS one of this class's
+  // specializations. A different class that happens to be assignable would
+  // silently construct the wrong type.
+  for (const auto &specialization : generic->specializations)
+    if (specialization.second == expectedContract.getContractName())
+      return expected;
+  return {};
+}
+
+mlir::Type ModuleEmitter::ensureGenericClassSpecialization(
+    llvm::StringRef baseName, mlir::ArrayRef<mlir::Type> arguments) {
+  GenericClassInfo *generic = lookupGenericClass(baseName);
+  if (!generic || !generic->node)
+    return {};
+  // Wrong arity and pack parameters resolve to nothing rather than a
+  // diagnostic: this runs from const type queries (including speculative
+  // ones), so the caller keeps its parameterized reading and the use site
+  // reports the failure with its own location.
+  if (generic->hasPackParameter ||
+      arguments.size() != generic->params.size())
+    return {};
+
+  mlir::Type key = types.contract(baseName, arguments);
+  auto memoized = generic->specializations.find(key);
+  if (memoized != generic->specializations.end())
+    return types.contract(memoized->second);
+  // Divergence backstop, the same one the function specializer uses: a
+  // method body that instantiates its own class at a new ground type
+  // (`Box[list[T]]`) re-enters before the previous body finished.
+  if (generic->specializations.size() >= 32)
+    return {};
+
+  std::string symbol =
+      (llvm::Twine(generic->symbolBase) + "$spec" +
+       llvm::Twine(static_cast<unsigned>(generic->specializations.size())))
+          .str();
+  // Register BEFORE emitting: a self-reference inside the class body
+  // (`def copy(self) -> Box[T]`, whose T is already this instantiation's
+  // argument) must resolve to this same contract instead of allocating a
+  // second specialization and recursing forever.
+  generic->specializations[key] = symbol;
+  if (!genericClassEmissionReady) {
+    pendingClassSpecializations.push_back(PendingClassSpecialization{
+        std::string(baseName), symbol,
+        llvm::SmallVector<mlir::Type, 4>(arguments.begin(), arguments.end())});
+    return types.contract(symbol);
+  }
+  emitGenericClassSpecialization(*generic, symbol, arguments);
+  return types.contract(symbol);
+}
+
+void ModuleEmitter::bindClassTypeArguments(llvm::StringRef className) {
+  auto found = classTypeArguments.find(className);
+  if (found == classTypeArguments.end())
+    return;
+  for (const auto &[param, argument] : found->second) {
+    types.bindLocalSymbol(param, argument);
+    types.bindLocalTypeParameter(param, argument);
+  }
+}
+
+void ModuleEmitter::emitGenericClassSpecialization(
+    GenericClassInfo &generic, llvm::StringRef symbol,
+    mlir::ArrayRef<mlir::Type> arguments) {
+  llvm::SmallVector<std::pair<std::string, mlir::Type>, 4> &solved =
+      classTypeArguments[symbol];
+  solved.clear();
+  for (auto [param, argument] : llvm::zip_equal(generic.params, arguments))
+    solved.emplace_back(param, argument);
+  auto emitSpecializedClass = [&] {
+    // Field annotations, method signatures and method bodies all spell the
+    // type parameters by name (`value: T`); binding each to its ground type
+    // for the whole class emission is what makes the specialized contract
+    // ground. bindLocalTypeParameter is the channel annotations read —
+    // annotationTypeForName deliberately ignores value symbols so a local
+    // cannot shadow a class annotation.
+    auto scope = types.pushScope();
+    bindClassTypeArguments(symbol);
+    emitClassContract(*generic.node, symbol);
+  };
+  if (generic.source)
+    emitInDefiningModuleScope(*generic.source, emitSpecializedClass);
+  else
+    emitSpecializedClass();
+}
+
+void ModuleEmitter::drainGenericClassSpecializations(llvm::StringRef onlyBase) {
+  // Emitting one specialization may spell further ones, so this rescans
+  // instead of iterating a snapshot.
+  for (bool progressed = true; progressed;) {
+    progressed = false;
+    for (auto it = pendingClassSpecializations.begin(),
+              e = pendingClassSpecializations.end();
+         it != e; ++it) {
+      if (!onlyBase.empty() && it->base != onlyBase)
+        continue;
+      PendingClassSpecialization pending = std::move(*it);
+      pendingClassSpecializations.erase(it);
+      if (GenericClassInfo *generic = lookupGenericClass(pending.base))
+        emitGenericClassSpecialization(*generic, pending.symbol,
+                                       pending.arguments);
+      progressed = true;
+      break;
+    }
+  }
+}
+
 void ModuleEmitter::emitClassContract(const parser::Node &classDef,
                                       llvm::StringRef symbolName) {
   auto name = ast::string(classDef, "name");
@@ -659,6 +868,19 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
     for (const parser::NodePtr &base : *baseNodes) {
       if (!base)
         continue;
+      // `class C(Box[int])` inherits from the INSTANTIATION, which is a
+      // specialized class contract of its own — so the base list carries that
+      // contract name and the C3 merge below linearizes ground classes only.
+      // Inside `class Labeled[T](Box[T])` the parameter is already bound to
+      // this specialization's argument, so `Box[T]` resolves the same way.
+      if (mlir::Type instantiated = types.genericClassSubscript(base.get())) {
+        bases.push_back(
+            builder
+                .getStringAttr(
+                    mlir::cast<py::ContractType>(instantiated).getContractName())
+                .getValue());
+        continue;
+      }
       std::string qualified = ast::qualifiedName(base.get());
       // typing.NamedTuple is a class-construction marker, not a base: the
       // annotated body it requires is exactly the dataclass field form, and
@@ -1374,6 +1596,14 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       superContexts.pop_back();
   }
 
+  // A generic class's specialization is demanded from a use site — possibly
+  // deep inside a function body being emitted — so the contract op cannot go
+  // wherever the builder happens to point. Every class contract is a
+  // module-level declaration, which is where the non-generic callers already
+  // stood.
+  mlir::OpBuilder::InsertionGuard classGuard(builder);
+  builder.setInsertionPointToEnd(module.getBody());
+
   mlir::OperationState state(loc(classDef), py::ClassOp::getOperationName());
   state.addAttribute(mlir::SymbolTable::getSymbolAttrName(),
                      builder.getStringAttr(contractName));
@@ -1990,6 +2220,12 @@ Value ModuleEmitter::emitInlineMethodBody(
     bindSourceModuleLocals(methodSource->moduleName, *methodSource->moduleNode,
                            methodSource->isStub);
   }
+  // A generic class's method body still spells its type parameters (`item:
+  // T`), and this inlining happens far from the specialization's emission
+  // scope, so the solved arguments are re-established from the defining
+  // class's contract name. Inside the cross-module isolation above, so an
+  // imported generic keeps them too.
+  bindClassTypeArguments(method.definingClass);
   llvm::StringSet<> bound;
   auto bind = [&](llvm::StringRef name, Value value) {
     values[name] = value;

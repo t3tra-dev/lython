@@ -238,12 +238,40 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
   if (std::optional<Value> v = tryEmitStrTranslateSugar(expr, calleeNode))
     return *v;
 
+  // `C[int](...)` spells its instantiation at the call site, so it needs no
+  // annotated context. The subscript is a class object, never a __getitem__.
+  if (mlir::Type instantiated = types.genericClassSubscript(calleeNode)) {
+    llvm::StringRef instantiatedName =
+        contractName(instantiated).value_or(llvm::StringRef());
+    return emitClassInstantiation(expr, instantiatedName, instantiated);
+  }
+
+  // A bare `C(...)` on a generic class: the arguments themselves may determine
+  // the instantiation through __init__'s parameter types (`Box(5)`). Failing
+  // that, emitExprExpected already had its chance at an annotated context, and
+  // the py ABI cannot carry the type parameter — so this is the class-side twin
+  // of the generic function's "requires a call or an annotated Callable
+  // context".
+  auto emitBareGenericInstantiation =
+      [&](llvm::StringRef base) -> std::optional<Value> {
+    if (!lookupGenericClass(base))
+      return std::nullopt;
+    if (mlir::Type solved = inferredGenericClassInstantiation(expr))
+      return emitClassInstantiation(
+          expr, mlir::cast<py::ContractType>(solved).getContractName(), solved);
+    diagnoseUngroundedGenericClass(expr, base);
+    return emitNone(expr);
+  };
+
   if (!calleeQualified.empty())
     if (auto cls = types.lookupClass(calleeQualified)) {
-      if (std::optional<llvm::StringRef> symbol = contractName(*cls))
+      if (std::optional<llvm::StringRef> symbol = contractName(*cls)) {
         if (std::optional<Value> v =
                 rejectStubSourceCall(expr, *symbol, /*instantiation=*/true))
           return *v;
+        if (std::optional<Value> v = emitBareGenericInstantiation(*symbol))
+          return *v;
+      }
       return emitClassInstantiation(expr, llvm::StringRef(calleeQualified),
                                     *cls);
     }
@@ -251,10 +279,13 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
   if (calleeNode && calleeNode->kind == "Name") {
     llvm::StringRef name = ast::nameSpelling(*calleeNode);
     if (auto cls = types.lookupClass(name)) {
-      if (std::optional<llvm::StringRef> symbol = contractName(*cls))
+      if (std::optional<llvm::StringRef> symbol = contractName(*cls)) {
         if (std::optional<Value> v =
                 rejectStubSourceCall(expr, *symbol, /*instantiation=*/true))
           return *v;
+        if (std::optional<Value> v = emitBareGenericInstantiation(*symbol))
+          return *v;
+      }
       return emitClassInstantiation(expr, name, *cls);
     }
   }

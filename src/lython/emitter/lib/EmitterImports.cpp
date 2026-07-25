@@ -657,6 +657,19 @@ void ModuleEmitter::predeclareSourceModules() {
     if (!source.moduleNode)
       continue;
     bindSourceModuleNamespace(source.moduleName, source.moduleName);
+    // Generic classes must be registered before ANY signature is resolved:
+    // a `deque[int]` annotation is what allocates the specialization, and a
+    // signature memoized against the unspecialized reading would never be
+    // recomputed.
+    if (source.isStub)
+      continue;
+    if (const auto *body = ast::nodeList(*source.moduleNode, "body"))
+      for (const parser::NodePtr &statement : *body)
+        if (statement && isTopLevelClass(*statement))
+          if (auto name = ast::string(*statement, "name"))
+            registerGenericClass(
+                *statement, sourceModuleClassSymbol(source.moduleName, *name),
+                &source);
   }
 }
 
@@ -716,8 +729,15 @@ void ModuleEmitter::emitSourceModuleDeclarations() {
         std::optional<std::string_view> name = ast::string(*statement, "name");
         if (!name)
           continue;
-        emitClassContract(*statement,
-                          sourceModuleClassSymbol(source.moduleName, *name));
+        // Generic classes were registered during predeclaration; the generic
+        // itself is never emitted, and its specializations take its place at
+        // this position so a later class can inherit from one.
+        std::string classSymbol =
+            sourceModuleClassSymbol(source.moduleName, *name);
+        if (genericClasses.count(classSymbol))
+          drainGenericClassSpecializations(classSymbol);
+        else
+          emitClassContract(*statement, classSymbol);
       } else {
         continue;
       }
@@ -741,8 +761,10 @@ void ModuleEmitter::predeclareTopLevel() {
         continue;
       }
       if (statement->kind == "ClassDef")
-        if (auto name = ast::string(*statement, "name"))
+        if (auto name = ast::string(*statement, "name")) {
           types.bindClass(*name, types.contract(*name));
+          registerGenericClass(*statement, *name, /*source=*/nullptr);
+        }
       if (statement->kind == "Assign") {
         const auto *targets = ast::nodeList(*statement, "targets");
         if (!targets || targets->size() != 1 || !targets->front() ||
@@ -864,12 +886,21 @@ void ModuleEmitter::emitTopLevelDeclarations() {
       if (!statement)
         continue;
       if (statement->kind == "FunctionDef" ||
-          statement->kind == "AsyncFunctionDef")
+          statement->kind == "AsyncFunctionDef") {
         emitFunctionDecl(*statement);
-      else if (statement->kind == "ClassDef")
-        emitClassContract(*statement);
+      } else if (statement->kind == "ClassDef") {
+        auto name = ast::string(*statement, "name");
+        if (!name)
+          continue;
+        if (genericClasses.count(*name))
+          drainGenericClassSpecializations(*name);
+        else
+          emitClassContract(*statement);
+      }
     }
   }
+  // Stub-declared and never-walked generics still owe their specializations.
+  drainGenericClassSpecializations();
 }
 
 } // namespace lython::emitter

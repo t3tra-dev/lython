@@ -10,6 +10,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 
+#include <functional>
 #include <optional>
 #include <string>
 
@@ -251,6 +252,34 @@ public:
   std::optional<std::string> lookupCanonicalBinding(llvm::StringRef name) const;
   void bindClass(llvm::StringRef name, mlir::Type instanceType);
   std::optional<mlir::Type> lookupClass(llvm::StringRef name) const;
+  // Monomorphization of `class C[T]`: the py ABI has no runtime
+  // representation for a type parameter, so a generic class is never a
+  // contract of its own — every ground instantiation becomes a separate
+  // class contract. TypeSystem resolves the SPELLING (`C[int]` in an
+  // annotation or in expression position) and hands the base name plus
+  // ground arguments to the emitter, which owns the specialization registry
+  // and the emission. A null return means "not a generic class, or the
+  // arguments are not ground", and the caller keeps its parameterized
+  // reading so the ABI's typevar rejection still catches a missed
+  // specialization.
+  using GenericClassResolver = std::function<mlir::Type(
+      llvm::StringRef baseName, mlir::ArrayRef<mlir::Type> arguments)>;
+  void setGenericClassResolver(GenericClassResolver resolver);
+  // The specialized contract for `baseName[arguments]`, or null.
+  mlir::Type resolveGenericClass(llvm::StringRef baseName,
+                                 mlir::ArrayRef<mlir::Type> arguments) const;
+  // The specialized contract a `C[int]` subscript spells, or null when the
+  // node is an ordinary value subscript. Shared by annotation resolution and
+  // expression inference (`C[int]` in value position is a class object).
+  mlir::Type genericClassSubscript(const parser::Node *node) const;
+  // Registers what `C(args)` needs to recover its type arguments without an
+  // explicit `C[int]` or an annotated context: the parameter names and the
+  // `__init__` whose parameter types they occur in. Without this a generic
+  // class could only be instantiated through a spelled-out instantiation,
+  // which no CPython source writes.
+  void registerGenericClass(llvm::StringRef contractName,
+                            llvm::ArrayRef<std::string> params,
+                            const parser::Node *initNode);
   // Class static attributes (`class C: attr = ...`) type `C.attr` and
   // `instance.attr` reads; the emitter registers them per class as it emits
   // the class contract.
@@ -373,6 +402,20 @@ private:
   // and emission may both visit one node), so diagnostics accumulate in a
   // mutable, deduplicated buffer instead of being reported inline.
   mutable parser::Diagnostics annotationDiagnostics;
+  GenericClassResolver genericClassResolver;
+  struct GenericClassTemplate {
+    llvm::SmallVector<std::string, 4> params;
+    const parser::Node *initNode = nullptr;
+  };
+  llvm::StringMap<GenericClassTemplate> genericClassTemplates;
+  // Solves `C(args)`'s type arguments by matching the argument types against
+  // `__init__`'s parameter types, with the parameters standing as TypeVars.
+  // Null when the constructor does not mention every parameter (`Stack()`
+  // determines nothing) — the use site then needs an annotated context.
+  mlir::Type
+  solveGenericClassInstantiation(llvm::StringRef contractName,
+                                 mlir::ArrayRef<mlir::Type> positional,
+                                 mlir::ArrayRef<CallKeywordType> keywords) const;
 };
 
 } // namespace lython::emitter

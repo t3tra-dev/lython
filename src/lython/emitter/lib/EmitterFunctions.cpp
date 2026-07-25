@@ -203,16 +203,15 @@ ModuleEmitter::ensureGenericSpecialization(const parser::Node &anchor,
     emitCallableFunction(*generic.node, symbol, specialized, {},
                          /*isLambda=*/false);
   };
-  if (!generic.source) {
+  if (generic.source)
+    emitInDefiningModuleScope(*generic.source, emitSpecializedBody);
+  else
     emitSpecializedBody();
-    return std::make_pair(symbol, specialized.publicCallable);
-  }
+  return std::make_pair(symbol, specialized.publicCallable);
+}
 
-  // Imported generic: the body must emit under the DEFINING module's
-  // environment, not the use site's. isolateScopes (rather than a plain
-  // pushScope) keeps an unbound name in the imported body a diagnostic
-  // instead of letting it resolve to a use-site local.
-  const EmitOptions::SourceModule &source = *generic.source;
+void ModuleEmitter::emitInDefiningModuleScope(
+    const EmitOptions::SourceModule &source, llvm::function_ref<void()> body) {
   llvm::SaveAndRestore<std::string> savedSourceName(
       sourceName,
       source.sourceName.empty() ? source.moduleName : source.sourceName);
@@ -236,13 +235,12 @@ ModuleEmitter::ensureGenericSpecialization(const parser::Node &anchor,
     bindModuleImportScope(*source.moduleNode, /*diagnoseUnsupported=*/false);
     bindSourceModuleLocals(source.moduleName, *source.moduleNode,
                            source.isStub);
-    emitSpecializedBody();
+    body();
   }
   for (std::size_t index = diagnosticStart; index < diagnostics.size();
        ++index)
     if (diagnostics[index].filename.empty())
       diagnostics[index].filename = sourceName;
-  return std::make_pair(symbol, specialized.publicCallable);
 }
 
 ModuleEmitter::GenericFunctionInfo *
