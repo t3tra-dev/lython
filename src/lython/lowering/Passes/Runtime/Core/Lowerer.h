@@ -1017,6 +1017,17 @@ private:
   mlir::LogicalResult lowerBoundMethodCall(py::CallOp op,
                                            const RuntimeBundle &receiver,
                                            llvm::StringRef methodName);
+  mlir::LogicalResult
+  lowerRuntimeListPop(py::CallOp op, const RuntimeBundle &receiver,
+                      llvm::ArrayRef<const RuntimeBundle *> sources);
+  mlir::LogicalResult
+  lowerRuntimeListInsert(py::CallOp op, const RuntimeBundle &receiver,
+                         llvm::ArrayRef<const RuntimeBundle *> sources);
+  mlir::Value boundMethodArgumentValue(py::CallOp op, unsigned position) const;
+  mlir::FailureOr<mlir::Value> transientPayloadBox(mlir::Operation *op,
+                                                   const RuntimeBundle &payload,
+                                                   bool ownsPayload);
+  void demoteSequenceEvidence(py::CallOp op, const RuntimeBundle &receiver);
   mlir::LogicalResult lowerFutureResultEvidence(mlir::Operation *op,
                                                 mlir::Value resultValue,
                                                 const RuntimeBundle &receiver,

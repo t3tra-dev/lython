@@ -242,10 +242,14 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerLen(py::LenOp op) {
 // builder.
 mlir::FailureOr<mlir::Value> RuntimeBundleLowerer::rawSequenceIndexValue(
     mlir::Operation *op, mlir::Value indexValue, const RuntimeBundle &index) {
-  if (std::optional<std::int64_t> literal = integerLiteralFromValue(indexValue))
-    return mlir::arith::ConstantIntOp::create(builder, op->getLoc(), *literal,
-                                              64)
-        .getResult();
+  // `indexValue` is optional: bound-method callers pass the index through a
+  // pack, which has no per-argument SSA value when it is starred.
+  if (indexValue)
+    if (std::optional<std::int64_t> literal =
+            integerLiteralFromValue(indexValue))
+      return mlir::arith::ConstantIntOp::create(builder, op->getLoc(), *literal,
+                                                64)
+          .getResult();
   if (primitiveI64LaneKnownValid(index.primitiveI64) &&
       index.primitiveI64->value.getType().isInteger(64))
     return index.primitiveI64->value;
