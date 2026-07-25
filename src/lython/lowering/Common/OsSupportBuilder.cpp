@@ -187,6 +187,25 @@ void buildErrno(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{value});
 }
 
+// i32 LyHost_ErrnoValue_EISDIR(): the platform's EISDIR. A manifest cannot
+// spell it as a literal — the embedded bytecode is target-independent, and the
+// errno numbering is not — so the value is read from the same kOSErrorErrnoMap
+// row LyHost_OSErrorClassId uses. open() needs it because it detects a
+// directory by stat'ing rather than through a failed open(2).
+void buildErrnoConstants(SupportBuilder &b) {
+  auto fn = b.beginFunction("LyHost_ErrnoValue_EISDIR",
+                            b.builder.getFunctionType({}, {b.i32()}));
+  mlir::Block *entry = fn.addEntryBlock();
+  b.builder.setInsertionPointToEnd(entry);
+  int value = 0;
+  for (const py::exceptions::OSErrorErrnoMapping &row :
+       py::exceptions::kOSErrorErrnoMap)
+    if (row.posixName == "EISDIR")
+      value = b.host.bsdErrnoValues ? row.darwinValue : row.linuxValue;
+  mlir::func::ReturnOp::create(b.builder, b.loc,
+                               mlir::ValueRange{b.iconst32(value)});
+}
+
 // i64 LyHost_OSErrorClassId(i32 errno): the OSError subclass CPython's
 // oserror_use_init dispatch would pick, straight off kOSErrorErrnoMap. A
 // select chain rather than a switch: the table is short and branch-free code
@@ -835,6 +854,7 @@ void buildOsSupport(SupportBuilder &b) {
   buildIdentityCalls(b);
   buildStrerror(b);
   buildErrno(b);
+  buildErrnoConstants(b);
   buildOSErrorClassId(b);
   buildOSErrorMessages(b);
   buildPathCalls(b);

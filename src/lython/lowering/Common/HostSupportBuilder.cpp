@@ -181,8 +181,19 @@ void buildHostFileSupport(SupportBuilder &b) {
     mlir::Value file =
         b.call("fopen", b.ptr(), mlir::ValueRange{pathCStr, modeCStr})
             .front();
+    // errno is saved before the frees and written back after them, so the
+    // caller's LyHost_Errno() still names fopen's failure. `free` is not
+    // required to leave errno alone on every libc we target, and the two
+    // frees sit between fopen and the caller's read.
+    mlir::Value errnoSlot =
+        b.call(b.host.errnoAccessor, b.ptr(), mlir::ValueRange{}).front();
+    mlir::Value savedErrno = b.loadI32(errnoSlot);
     b.call("free", mlir::TypeRange{}, mlir::ValueRange{pathCStr});
     b.call("free", mlir::TypeRange{}, mlir::ValueRange{modeCStr});
+    mlir::Value restoreSlot =
+        b.call(b.host.errnoAccessor, b.ptr(), mlir::ValueRange{}).front();
+    mlir::LLVM::StoreOp::create(b.builder, b.loc, savedErrno, restoreSlot,
+                                /*alignment=*/4);
     mlir::Value handle =
         mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), file);
     mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{handle});

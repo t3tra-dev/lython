@@ -945,7 +945,8 @@ void collectAssignedNames(const parser::Node *node, llvm::StringSet<> &names) {
         // rebound receiver never joined the post-try lanes.
         if (auto attr = ast::string(*func, "attr");
             attr && (*attr == "append" || *attr == "add" ||
-                     *attr == "extend" || *attr == "update" ||
+                     *attr == "extend" || *attr == "insert" ||
+                     *attr == "update" ||
                      *attr == "intersection_update" ||
                      *attr == "difference_update" ||
                      *attr == "symmetric_difference_update")) {

@@ -188,6 +188,227 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCall(py::CallOp op) {
                         << builtin->builtinLowering << "'";
 }
 
+// The py-level SSA value behind positional argument `position` of a bound
+// method call, when the pack has one (a starred pack has no per-argument
+// value). Only used to spot an integer literal index, so a null result simply
+// means "unbox at runtime".
+mlir::Value
+RuntimeBundleLowerer::boundMethodArgumentValue(py::CallOp op,
+                                               unsigned position) const {
+  const RuntimeBundle *pack = RuntimeBundleLowerer::bundleFor(op.getPosargs());
+  if (!pack || position >= pack->aggregateOperands.size())
+    return {};
+  for (std::uint8_t unpacked : pack->aggregateUnpackedOperands)
+    if (unpacked != 0)
+      return {};
+  return pack->aggregateOperands[position];
+}
+
+// Materialize a transient 16-word box holding `source`'s payload handle words.
+mlir::FailureOr<mlir::Value>
+RuntimeBundleLowerer::transientPayloadBox(mlir::Operation *op,
+                                          const RuntimeBundle &payload,
+                                          bool ownsPayload) {
+  mlir::Location loc = op->getLoc();
+  mlir::MemRefType boxType = box_abi::boxWordsType(builder);
+  mlir::Value box =
+      mlir::memref::AllocaOp::create(builder, loc, boxType).getResult();
+  mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
+      RuntimeBundleLowerer::objectPayloadHandleWords(op, payload, ownsPayload);
+  if (mlir::failed(words))
+    return mlir::failure();
+  for (auto [wordIndex, word] : llvm::enumerate(*words)) {
+    mlir::Value slot = mlir::arith::ConstantIndexOp::create(
+        builder, loc, static_cast<std::int64_t>(wordIndex));
+    mlir::memref::StoreOp::create(builder, loc, word, box, slot);
+  }
+  return box;
+}
+
+// Drop every compile-time sequence fact from `op`'s receiver binding: after a
+// runtime reorder the payload is the only authority, and a stale element list
+// would answer later evidence-tier reads from dead values.
+void RuntimeBundleLowerer::demoteSequenceEvidence(py::CallOp op,
+                                                  const RuntimeBundle &receiver) {
+  RuntimeBundle demoted = receiver;
+  demoted.sequenceElements.clear();
+  demoted.sequenceElementBundles.clear();
+  demoted.sequenceIndices.clear();
+  demoted.sequenceEvidenceBacked = false;
+  valueBundles[op.getCallable()] = std::move(demoted);
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::lowerRuntimeListPop(
+    py::CallOp op, const RuntimeBundle &receiver,
+    llvm::ArrayRef<const RuntimeBundle *> sources) {
+  std::optional<RuntimeSymbol> popSlot =
+      manifest.primitive("builtins.list", "pop_slot");
+  std::optional<RuntimeSymbol> releaseParked =
+      manifest.primitive("builtins.list", "release_parked");
+  if (!popSlot || !releaseParked)
+    return op.emitError() << "runtime manifest lacks the list pop primitives";
+
+  mlir::Type elementContract = op.getResult(0).getType();
+  mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> shapes =
+      RuntimeBundleLowerer::slotStorageShapesFor(op, elementContract,
+                                                 "list element");
+  if (mlir::failed(shapes))
+    return mlir::failure();
+  if (runtimeContractName(elementContract) == "builtins.object")
+    return op.emitError()
+           << "list.pop needs a concrete element contract; annotate the list's "
+              "element type";
+  for (mlir::Type shape : *shapes) {
+    auto memref = mlir::dyn_cast<mlir::MemRefType>(shape);
+    if (!memref || memref.getRank() != 1)
+      return op.emitError() << "list.pop cannot rebuild an element of "
+                            << elementContract << " from its payload box";
+  }
+
+  builder.setInsertionPoint(op);
+  mlir::Location loc = op.getLoc();
+  mlir::Value rawIndex;
+  if (sources.size() == 2) {
+    if (!sources[1] || sources[1]->kind != RuntimeBundle::Kind::Object)
+      return op.emitError() << "list.pop index must be a Python object";
+    mlir::FailureOr<mlir::Value> raw =
+        RuntimeBundleLowerer::rawSequenceIndexValue(
+            op.getOperation(), boundMethodArgumentValue(op, 0), *sources[1]);
+    if (mlir::failed(raw))
+      return mlir::failure();
+    rawIndex = *raw;
+  } else {
+    // CPython's default: pop the last element.
+    rawIndex = mlir::arith::ConstantIntOp::create(builder, loc, -1, 64);
+  }
+
+  llvm::SmallVector<mlir::Value, 6> operands(receiver.physicalValues().begin(),
+                                             receiver.physicalValues().end());
+  operands.push_back(rawIndex);
+  mlir::func::CallOp popCall =
+      RuntimeBundleLowerer::createRuntimeCall(loc, *popSlot, operands);
+  mlir::Value parkSlot = popCall.getResult(0);
+
+  mlir::Value itemsArray = receiver.physicalValues()[2];
+  mlir::Value wordsPerSlot =
+      mlir::arith::ConstantIntOp::create(builder, loc, box_abi::kWordsPerBox, 64);
+  mlir::Value base =
+      mlir::arith::MulIOp::create(builder, loc, parkSlot, wordsPerSlot)
+          .getResult();
+  auto loadParkedWord = [&](std::int64_t wordIndex) -> mlir::Value {
+    mlir::Value offset =
+        mlir::arith::ConstantIntOp::create(builder, loc, wordIndex, 64);
+    mlir::Value word =
+        mlir::arith::AddIOp::create(builder, loc, base, offset).getResult();
+    mlir::Value index = mlir::arith::IndexCastOp::create(
+                            builder, loc, builder.getIndexType(), word)
+                            .getResult();
+    return mlir::memref::LoadOp::create(builder, loc, itemsArray, index)
+        .getResult();
+  };
+  llvm::SmallVector<mlir::Value, 4> resultValues;
+  for (auto [position, shape] : llvm::enumerate(*shapes))
+    resultValues.push_back(RuntimeBundleLowerer::memrefFromBoxWords(
+        builder, loc,
+        loadParkedWord(box_abi::kPointerWordBase +
+                       static_cast<std::int64_t>(position)),
+        loadParkedWord(box_abi::kSizeWordBase +
+                       static_cast<std::int64_t>(position)),
+        mlir::cast<mlir::MemRefType>(shape)));
+  mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> canonical =
+      RuntimeBundleLowerer::unboxSlotElementValues(op, elementContract,
+                                                   resultValues);
+  if (mlir::failed(canonical))
+    return mlir::failure();
+  RuntimeValue value{elementContract, *canonical,
+                     ownership::logicalOwnershipKind(elementContract,
+                                                     /*ownsObject=*/false)};
+  if (mlir::failed(RuntimeBundleLowerer::bindRetainedEvidenceValue(
+          op, op.getResult(0), "list.pop", value)))
+    return mlir::failure();
+  // Consume the parked reference now that the result binding holds its own.
+  RuntimeBundleLowerer::createRuntimeCall(
+      loc, *releaseParked, mlir::ValueRange{itemsArray, parkSlot});
+  RuntimeBundleLowerer::demoteSequenceEvidence(op, receiver);
+  return RuntimeBundleLowerer::pinContainerLiveness(op, receiver,
+                                                    /*insertAfterOp=*/true);
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::lowerRuntimeListInsert(
+    py::CallOp op, const RuntimeBundle &receiver,
+    llvm::ArrayRef<const RuntimeBundle *> sources) {
+  if (!sources[1] || sources[1]->kind != RuntimeBundle::Kind::Object ||
+      !sources[2] || sources[2]->kind != RuntimeBundle::Kind::Object)
+    return op.emitError()
+           << "list.insert expects an index and one Python object argument";
+  std::optional<RuntimeSymbol> ensure =
+      manifest.primitive("builtins.list", "ensure_capacity");
+  std::optional<RuntimeSymbol> insertBox =
+      manifest.primitive("builtins.list", "insert_box");
+  if (!ensure || !insertBox)
+    return op.emitError() << "runtime manifest lacks the list insert primitives";
+
+  builder.setInsertionPoint(op);
+  mlir::Location loc = op.getLoc();
+  mlir::FailureOr<mlir::Value> rawIndex =
+      RuntimeBundleLowerer::rawSequenceIndexValue(
+          op.getOperation(), boundMethodArgumentValue(op, 0), *sources[1]);
+  if (mlir::failed(rawIndex))
+    return mlir::failure();
+  mlir::FailureOr<RuntimeBundle> payload =
+      RuntimeBundleLowerer::materializePayloadObjectBundle(op, *sources[2]);
+  if (mlir::failed(payload))
+    return mlir::failure();
+  if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(op, *payload,
+                                                            "list.insert")))
+    return mlir::failure();
+
+  mlir::Value meta = receiver.physicalValues()[1];
+  mlir::Value lengthSlot = mlir::arith::ConstantIndexOp::create(builder, loc, 0);
+  mlir::Value length =
+      mlir::memref::LoadOp::create(builder, loc, meta, lengthSlot).getResult();
+  mlir::Value one = mlir::arith::ConstantIntOp::create(builder, loc, 1, 64);
+  mlir::Value required =
+      mlir::arith::AddIOp::create(builder, loc, length, one).getResult();
+  llvm::SmallVector<mlir::Value, 6> growOperands(
+      receiver.physicalValues().begin(), receiver.physicalValues().end());
+  growOperands.push_back(required);
+  mlir::func::CallOp grow =
+      RuntimeBundleLowerer::createRuntimeCall(loc, *ensure, growOperands);
+
+  RuntimeBundle updated;
+  if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+          op, receiver.objectValue.contract, grow.getResults(), updated)))
+    return mlir::failure();
+  updated.fieldAliasOwner = receiver.fieldAliasOwner;
+  updated.fieldAliasName = receiver.fieldAliasName;
+
+  // The box is filled after the growth call: `objectPayloadHandleWords` may
+  // itself box the element, and the words must be stored into a box the
+  // insert sees, not into storage the realloc invalidated.
+  mlir::FailureOr<mlir::Value> box =
+      RuntimeBundleLowerer::transientPayloadBox(op, *payload,
+                                                /*ownsPayload=*/true);
+  if (mlir::failed(box))
+    return mlir::failure();
+  llvm::SmallVector<mlir::Value, 6> insertOperands(
+      updated.physicalValues().begin(), updated.physicalValues().end());
+  insertOperands.push_back(*rawIndex);
+  insertOperands.push_back(*box);
+  RuntimeBundleLowerer::createRuntimeCall(loc, *insertBox, insertOperands);
+
+  // Only the rebind result is published, not the receiver's old binding: the
+  // grown triple is defined inside this block, so a loop-carried receiver's
+  // post-loop uses would not be dominated by it (append's runtime path takes
+  // the same care).
+  valueBundles[op.getResult(1)] = std::move(updated);
+  if (mlir::failed(RuntimeBundleLowerer::assignObjectBundle(
+          op, op.getResult(0), runtimeContractType(context, "types.NoneType"),
+          mlir::ValueRange{})))
+    return mlir::failure();
+  return mlir::success();
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
     py::CallOp op, const RuntimeBundle &receiver, llvm::StringRef methodName) {
   if (receiver.kind == RuntimeBundle::Kind::TypeObject) {
@@ -535,12 +756,43 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
     return mlir::success();
   }
 
+  bool listReceiverWithPayload =
+      receiver.kind == RuntimeBundle::Kind::Object &&
+      receiver.contractName() == "builtins.list" &&
+      receiver.physicalValues().size() >= 3;
+
+  // list.pop([i]): the runtime unlinks the entry and parks its box past the new
+  // end, mirroring dict.pop. Parking rather than returning the element by value
+  // keeps one manifest signature for every element type.
+  if (listReceiverWithPayload && methodName == "pop" &&
+      (sources.size() == 1 || sources.size() == 2)) {
+    if (mlir::failed(lowerRuntimeListPop(op, receiver, sources)))
+      return mlir::failure();
+    erase.push_back(op);
+    return mlir::success();
+  }
+
+  // list.insert(i, x): growth means the payload may move, so the receiver is
+  // grown through `ensure_capacity` and the rebind result carries the (possibly
+  // reallocated) triple, exactly like append's runtime path.
+  if (listReceiverWithPayload && methodName == "insert" &&
+      sources.size() == 3) {
+    if (!structuralMutation)
+      return op.emitError()
+             << "list.insert requires a rebindable local receiver; bind the "
+                "list to a local variable and insert into the local instead";
+    if (mlir::failed(lowerRuntimeListInsert(op, receiver, sources)))
+      return mlir::failure();
+    erase.push_back(op);
+    return mlir::success();
+  }
+
   // Runtime container methods over one boxed argument (count/index/remove on
-  // lists, discard/remove on sets): each resolves through a `<name>_box`
-  // manifest primitive taking (receiver physicals..., box). Mutators demote
-  // the receiver's compile-time element evidence afterwards - the runtime
-  // reordering/removal invalidates it, and the published payload carries the
-  // authoritative contents.
+  // lists, count/index on tuples, discard/remove on sets): each resolves
+  // through a `<name>_box` manifest primitive taking (receiver physicals...,
+  // box). Mutators demote the receiver's compile-time element evidence
+  // afterwards - the runtime reordering/removal invalidates it, and the
+  // published payload carries the authoritative contents.
   if (receiver.kind == RuntimeBundle::Kind::Object) {
     // std::string, not StringRef: contractName() returns by value and a
     // StringRef binding dangles past the temporary (ASan-caught).
@@ -549,10 +801,15 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
                          (methodName == "count" || methodName == "index" ||
                           methodName == "remove") &&
                          receiver.physicalValues().size() >= 3;
+    // Tuples share the list payload shape, so the same `<name>_box` primitives
+    // apply — but only the read-only pair: a tuple has no mutators.
+    bool tupleBoxMethod = receiverContract == "builtins.tuple" &&
+                          (methodName == "count" || methodName == "index") &&
+                          receiver.physicalValues().size() >= 3;
     bool setBoxMethod = receiverContract == "builtins.set" &&
                         (methodName == "discard" || methodName == "remove") &&
                         receiver.physicalValues().size() >= 3;
-    if (listBoxMethod || setBoxMethod) {
+    if (listBoxMethod || tupleBoxMethod || setBoxMethod) {
       if (sources.size() != 2 || !sources[1] ||
           sources[1]->kind != RuntimeBundle::Kind::Object)
         return op.emitError() << receiverContract << "." << methodName

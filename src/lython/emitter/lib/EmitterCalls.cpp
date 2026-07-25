@@ -401,7 +401,16 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
         Value receiver = emitExpr(receiverNode);
         if (std::optional<MethodBinding> method =
                 lookupClassMethod(receiver.type, *methodName)) {
-          if (method->async && !method->symbolName.empty())
+          // A generator method is routed through the bound function object for
+          // the same reason an async one is: inlining substitutes the body's
+          // OWN result (the StopIteration value, `None` for a bare `yield`),
+          // and a suspendable body has no straight-line expansion to
+          // substitute in the first place. The bound clone carries
+          // publicCallable, whose result is the generator object.
+          bool suspendable = method->async ||
+                             method->bodySignature.isGeneratorFunction ||
+                             method->bodySignature.isAsyncGeneratorFunction;
+          if (suspendable && !method->symbolName.empty())
             return emitCallableDispatch(
                 expr, emitMethodObject(*calleeNode, receiver, *method),
                 emitCallOperands(expr));
