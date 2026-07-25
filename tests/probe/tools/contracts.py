@@ -43,8 +43,15 @@ import tempfile
 
 CPY = "/opt/homebrew/Frameworks/Python.framework/Versions/3.14/bin/python3.14"
 
-# Cases known to disagree with CPython. Measured on kernel/contract-audit at
-# 43e84c4: 501 cases, 431 ok, 70 expected.
+# Cases known to disagree with CPython. Measured on kernel/integration (4a +
+# probe + contract-audit + side-defects merged): 501 cases, 442 ok, 59 expected,
+# 0 new failures.
+#
+# The eleven side-defects cases (list.pop x3, list.insert x3, tuple.__add__,
+# __mul__, count, index, MutableSequence.insert) were here until that branch
+# merged and are now gone: the gate reported them as stale expectations, which is
+# the direction a count-based threshold cannot express, and it is what forced
+# this edit rather than leaving slack over the newest code.
 #
 # TREE-RELATIVE, and grouped by *cause* because the causes retire at different
 # times. Do not carry any group forward on faith: a case here that starts
@@ -52,20 +59,6 @@ CPY = "/opt/homebrew/Frameworks/Python.framework/Versions/3.14/bin/python3.14"
 # whole point of the set. rfc/contract-audit.md holds the diagnosis for each
 # group.
 EXPECTED_FAILURES = frozenset({
-    # -- Implemented on kernel/side-defects (a4be8bf). On any tree containing
-    # that branch these ten pass and belong out of the set.
-    "list.pop",
-    "list.pop(i)",
-    "list.pop(-2)",
-    "list.insert",
-    "list.insert(-1)",
-    "list.insert(big)",
-    "tuple.__add__",
-    "tuple.__mul__",
-    "tuple.count",
-    "tuple.index",
-    "MutableSequence.insert",          # list.insert reached via the protocol
-
     # -- Unbound builtin *names*, not missing methods. The contract's methods
     # work; the spelling used to reach them is not bound. All eleven complex
     # methods pass when written as literals (1.0 + 2.0j) -- see the RFC, and do
