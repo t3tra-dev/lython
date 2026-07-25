@@ -70,6 +70,156 @@ unsigned terminateOpenRegionBlocks(mlir::OpBuilder &builder, mlir::Location loc,
       builder, loc, region, [](llvm::SmallVectorImpl<mlir::Value> &) {});
 }
 
+// Names a statement list rebinds through a NAME target. Deliberately narrower
+// than `collectAssignedNames`, which also reports the receiver of a
+// structural mutation (`xs.append(v)`, `d[k] = v`) because that rebinds the
+// receiver's SSA value too. Why the narrow set here: those receivers must
+// keep their sequence/mapping evidence, and evidence lives on the SSA value,
+// not in storage -- promoting one to a cell turns its in-place mutation into
+// a rejection ("in-place dict assignment requires a box-fronted field
+// container"). Structural mutation inside a try keeps travelling the post-try
+// result lanes instead.
+void collectRebindNames(const parser::Node *node, llvm::StringSet<> &names) {
+  if (!node)
+    return;
+  if (node->kind == "FunctionDef" || node->kind == "AsyncFunctionDef" ||
+      node->kind == "ClassDef" || node->kind == "Lambda")
+    return;
+  if (node->kind == "Assign") {
+    if (const auto *targets = ast::nodeList(*node, "targets"))
+      for (const parser::NodePtr &target : *targets)
+        collectAssignedNameTargets(target.get(), names);
+  } else if (node->kind == "AnnAssign" || node->kind == "AugAssign" ||
+             node->kind == "NamedExpr") {
+    collectAssignedNameTargets(ast::node(*node, "target"), names);
+  } else if (node->kind == "For" || node->kind == "AsyncFor") {
+    collectAssignedNameTargets(ast::node(*node, "target"), names);
+  } else if (node->kind == "With" || node->kind == "AsyncWith") {
+    if (const auto *items = ast::nodeList(*node, "items"))
+      for (const parser::NodePtr &item : *items)
+        collectAssignedNameTargets(ast::node(*item, "optional_vars"), names);
+  }
+  for (const parser::Field &field : node->fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (*child)
+        collectRebindNames(child->get(), names);
+    } else if (const auto *children =
+                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
+      for (const parser::NodePtr &child : *children)
+        if (child)
+          collectRebindNames(child.get(), names);
+    }
+  }
+}
+
+void collectRebindNames(const std::vector<parser::NodePtr> *statements,
+                        llvm::StringSet<> &names) {
+  if (!statements)
+    return;
+  for (const parser::NodePtr &statement : *statements)
+    collectRebindNames(statement.get(), names);
+}
+
+// The complement of the above within `collectAssignedNames`: receivers whose
+// SSA value a structural mutation rebinds in place. These write
+// `values[name]` directly (the `ly.structural_mutation` call's second
+// result), which would overwrite a storage promotion instead of storing
+// through it -- so a name in this set is never promoted.
+void collectStructuralReceiverNames(const parser::Node *node,
+                                    llvm::StringSet<> &names) {
+  if (!node)
+    return;
+  if (node->kind == "FunctionDef" || node->kind == "AsyncFunctionDef" ||
+      node->kind == "ClassDef" || node->kind == "Lambda")
+    return;
+  if (node->kind == "Call") {
+    if (const parser::Node *func = ast::node(*node, "func"))
+      if (func->kind == "Attribute")
+        if (const parser::Node *value = ast::node(*func, "value"))
+          if (value->kind == "Name")
+            names.insert(ast::nameSpelling(*value));
+  } else if (node->kind == "Assign") {
+    if (const auto *targets = ast::nodeList(*node, "targets"))
+      for (const parser::NodePtr &target : *targets)
+        if (target && target->kind == "Subscript")
+          if (const parser::Node *container = ast::node(*target, "value"))
+            if (container->kind == "Name")
+              names.insert(ast::nameSpelling(*container));
+  } else if (node->kind == "Delete") {
+    if (const auto *targets = ast::nodeList(*node, "targets"))
+      for (const parser::NodePtr &target : *targets)
+        if (target && target->kind == "Subscript")
+          if (const parser::Node *container = ast::node(*target, "value"))
+            if (container->kind == "Name")
+              names.insert(ast::nameSpelling(*container));
+  }
+  for (const parser::Field &field : node->fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (*child)
+        collectStructuralReceiverNames(child->get(), names);
+    } else if (const auto *children =
+                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
+      for (const parser::NodePtr &child : *children)
+        if (child)
+          collectStructuralReceiverNames(child.get(), names);
+    }
+  }
+}
+
+void collectStructuralReceiverNames(
+    const std::vector<parser::NodePtr> *statements, llvm::StringSet<> &names) {
+  if (!statements)
+    return;
+  for (const parser::NodePtr &statement : *statements)
+    collectStructuralReceiverNames(statement.get(), names);
+}
+
+// Name targets of an augmented assignment. On a container these desugar to
+// the structural mutator (`d |= o` is `d.update(o)`), which rebinds through
+// the same direct `values[name]` write a promotion cannot see; on a scalar
+// the same spelling is an ordinary rebind. The caller resolves which by the
+// operand's contract, so the two cannot be merged into one set here.
+void collectAugAssignTargetNames(const parser::Node *node,
+                                 llvm::StringSet<> &names) {
+  if (!node)
+    return;
+  if (node->kind == "FunctionDef" || node->kind == "AsyncFunctionDef" ||
+      node->kind == "ClassDef" || node->kind == "Lambda")
+    return;
+  if (node->kind == "AugAssign")
+    collectAssignedNameTargets(ast::node(*node, "target"), names);
+  for (const parser::Field &field : node->fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (*child)
+        collectAugAssignTargetNames(child->get(), names);
+    } else if (const auto *children =
+                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
+      for (const parser::NodePtr &child : *children)
+        if (child)
+          collectAugAssignTargetNames(child.get(), names);
+    }
+  }
+}
+
+void collectAugAssignTargetNames(const std::vector<parser::NodePtr> *statements,
+                                 llvm::StringSet<> &names) {
+  if (!statements)
+    return;
+  for (const parser::NodePtr &statement : *statements)
+    collectAugAssignTargetNames(statement.get(), names);
+}
+
+// Contracts whose augmented assignment goes through a structural mutator.
+bool isMutableContainerContract(mlir::Type type) {
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
+  if (!contract)
+    return false;
+  llvm::StringRef name = contract.getContractName();
+  return name == "builtins.list" || name == "builtins.dict" ||
+         name == "builtins.set" || name == "builtins.frozenset" ||
+         name == "builtins.bytearray";
+}
+
 } // namespace
 
 void ModuleEmitter::emitTry(const parser::Node &statement) {
@@ -269,6 +419,134 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
     return;
   }
 
+  // A local the try body REBINDS is observed by the handler, by the finally
+  // body, and by the continuation with the value it held at the raise point.
+  // For the extent of the statement such a local is promoted out of SSA into
+  // an R6 cell: the body's rebinds become stores, and every later read is a
+  // load.
+  //
+  // Why NOT a single static binding at the handler entry (block argument,
+  // extra py.try result, or "the value at the end of the body"): CPython
+  // makes that unrepresentable. Two raise points in one try body make the
+  // SAME handler answer differently depending on which fired
+  // (`n=2; if c: raise; n=3; raise` yields 2 or 3), and a store AFTER the
+  // raise is not observed at all (`x=2; raise; x=3` yields 2). The merge is
+  // therefore per-raise-point, and its join must be a memory cell rather
+  // than a phi -- the emitter has no phi to write into, because the unwind
+  // edge is a dynamic marker edge here and only becomes a real landing pad
+  // in the LLVM cleanup phase (Passes/Runtime/Cleanup/EH.cpp).
+  //
+  // Why the R6 cell and not a fresh construct: a cell is an ordinary
+  // one-field class, so the aggregate slot contract of
+  // rfc/memory-safety-proof.md already covers the store (retain new,
+  // release previous) and the affine verifier needs no new rule.
+  //
+  // The promotion is undone right after the statement so that the
+  // continuation keeps the SSA fast paths (int lanes, list/sequence
+  // evidence); leaving a container cell-bound would demote every later
+  // `xs.append(...)` into a non-evidence-backed receiver.
+  llvm::SmallVector<std::string, 4> storagePromotedNames;
+  if (hasFinally || (handlers && !handlers->empty())) {
+    llvm::StringSet<> reboundInBody;
+    collectRebindNames(ast::nodeList(statement, "body"), reboundInBody);
+    // A structural mutation ANYWHERE in the statement disqualifies the name:
+    // in the body it would need the cell to carry evidence it cannot, and in
+    // a handler or the finally body its direct `values[name]` write would
+    // silently bypass the cell the continuation then reads.
+    llvm::StringSet<> structuralReceivers;
+    collectStructuralReceiverNames(ast::nodeList(statement, "body"),
+                                   structuralReceivers);
+    if (handlers)
+      for (const parser::NodePtr &handler : *handlers)
+        if (handler)
+          collectStructuralReceiverNames(ast::nodeList(*handler, "body"),
+                                         structuralReceivers);
+    collectStructuralReceiverNames(finalbody, structuralReceivers);
+    collectStructuralReceiverNames(ast::nodeList(statement, "orelse"),
+                                   structuralReceivers);
+    llvm::StringSet<> augAssignTargets;
+    collectAugAssignTargetNames(ast::nodeList(statement, "body"),
+                                augAssignTargets);
+    if (handlers)
+      for (const parser::NodePtr &handler : *handlers)
+        if (handler)
+          collectAugAssignTargetNames(ast::nodeList(*handler, "body"),
+                                      augAssignTargets);
+    collectAugAssignTargetNames(finalbody, augAssignTargets);
+    collectAugAssignTargetNames(ast::nodeList(statement, "orelse"),
+                                augAssignTargets);
+    llvm::SmallVector<llvm::StringRef, 4> orderedNames;
+    for (const auto &entry : reboundInBody)
+      orderedNames.push_back(entry.getKey());
+    llvm::sort(orderedNames);
+    for (llvm::StringRef name : orderedNames) {
+      if (structuralReceivers.contains(name))
+        continue;
+      auto bound = values.find(name);
+      // Not bound before the try: the handler cannot observe a value the body
+      // may never have produced (CPython raises UnboundLocalError there), so
+      // there is nothing to merge. Such a name still travels the post-try
+      // lanes below, which require it bound on every way out.
+      if (bound == values.end() || !bound->second.value)
+        continue;
+      // Already storage: a nonlocal-shared cell reads and writes through the
+      // same channel, so the shape is correct as it stands.
+      if (isCellContract(bound->second.type))
+        continue;
+      mlir::Type content = types.widenLiteral(bound->second.type);
+      // A cell field needs a contract-typed slot. A union (isinstance
+      // narrowing) and a primitive tensor have none, so the rebind cannot
+      // reach the handler or the continuation at all -- both would read the
+      // pre-try value. Reject instead of answering with it.
+      if (!mlir::isa_and_nonnull<py::ContractType>(content)) {
+        std::string typeText;
+        {
+          llvm::raw_string_ostream stream(typeText);
+          stream << content;
+        }
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, statement.range.start,
+            "local '" + name.str() +
+                "' is reassigned inside this try and its type " + typeText +
+                " cannot be carried out of the statement; bind the "
+                "reassignment to a new name inside the block, or narrow the "
+                "local to a single type before the try"});
+        continue;
+      }
+      // `xs += other` / `d |= other` on a container is the structural mutator
+      // in disguise, so it belongs with the receivers above.
+      if (isMutableContainerContract(content) && augAssignTargets.contains(name))
+        continue;
+      // A loop-carried local arrives as a loop block argument, and moving that
+      // incarnation's token into an aggregate slot inside the same iteration
+      // is mis-tracked downstream: the release insertion accepts it and the
+      // program then double-frees (a segfault, not a diagnostic). Until that
+      // hole is closed the name keeps the post-try result lanes, which handle
+      // the loop shape. Detected by name against every enclosing loop's
+      // carried set rather than by asking whether the value is a BlockArgument,
+      // because a promoted name is re-bound to the cell before the next
+      // enclosing try sees it.
+      bool loopCarried = false;
+      for (const LoopControlContext &context : loopControlContexts)
+        for (const CarriedLoopLocal &carried : context.carriedLocals)
+          if (carried.name == name)
+            loopCarried = true;
+      if (loopCarried)
+        continue;
+      storagePromotedNames.push_back(std::string(name));
+    }
+    for (const std::string &name : storagePromotedNames) {
+      Value cell = emitCellAlloc(statement, values.find(name)->second);
+      if (!isCellContract(cell.type))
+        continue;
+      values[name] = cell;
+      types.bindSymbol(name, cellContentType(cell.type));
+    }
+  }
+  llvm::StringSet<> storagePromoted;
+  for (const std::string &name : storagePromotedNames)
+    storagePromoted.insert(name);
+
   postTryEligible = !hasElse && !hasFinally && !usesFinallyCompletion &&
                     handlers && !handlers->empty();
   if (postTryEligible) {
@@ -277,8 +555,14 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
     for (const parser::NodePtr &handler : *handlers)
       if (handler)
         collectAssignedNames(ast::nodeList(*handler, "body"), assignedNames);
-    for (const auto &entry : assignedNames)
+    for (const auto &entry : assignedNames) {
+      // A promoted name's authority is its cell, not a result lane: a lane
+      // would merge the cell POINTER (identical on every edge) and then the
+      // unboxing below would read it twice.
+      if (storagePromoted.contains(entry.getKey()))
+        continue;
       postCandidateNames.push_back(entry.getKey().str());
+    }
     llvm::sort(postCandidateNames);
     if (postCandidateNames.empty())
       postTryEligible = false;
@@ -977,6 +1261,19 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
   }
 
   builder.setInsertionPointAfter(tryOp);
+  // Undo the storage promotion: the statement is over, so the cell's content
+  // is the one value the continuation can see, and rebinding to it lets the
+  // cell die here instead of demoting the rest of the scope to loads. The
+  // loads sit in the block that still holds py.try, which dominates every
+  // block the completion dispatch and the else body split off below.
+  for (const std::string &name : storagePromotedNames) {
+    auto bound = values.find(name);
+    if (bound == values.end() || !isCellContract(bound->second.type))
+      continue;
+    Value content = emitCellLoad(statement, bound->second);
+    values[name] = content;
+    types.bindSymbol(name, content.type);
+  }
   for (auto [index, local] : llvm::enumerate(postCarriedLocals)) {
     values[local.name] =
         Value{tryOp.getResult(static_cast<unsigned>(index)), local.type};
