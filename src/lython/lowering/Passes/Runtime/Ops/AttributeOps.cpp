@@ -1063,12 +1063,40 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
   auto oldFieldBundle = object->fieldBundles.find(op.getName());
   if (oldFieldBundle != object->fieldBundles.end())
     oldSlotValue = oldFieldBundle->second.get();
+  // Both arms below re-root the field's lanes in the object's expansion (see
+  // the loop at the end of this function), so both need the same answer to
+  // "will a later release of this object still name the pre-store lanes?".
+  bool markerFollows =
+      RuntimeBundleLowerer::ownedLocalObjectMarkerFollowsExpansion(
+          op.getObject());
+  // With no recorded bundle, `oldValues` is not a stored value at all: it is
+  // the constructor's DEFAULT-INITIALIZED placeholder. The placeholder is a
+  // zero-filled expansion whose own header gets a refcount, but whose NESTED
+  // object headers do not -- and only a user-class-typed field expands to
+  // nested headers (`self.inner: Inner` inlines Inner's whole expansion,
+  // including the header of Inner's own `int` field). Releasing that
+  // placeholder therefore decrements a refcount that is zero, which aborts at
+  // CONSTRUCTION with no load and no rebind: `Holder(Inner(1))` alone is
+  // enough. The scalar and container placeholders do carry an initialized
+  // header, so they keep the release and do not leak.
+  bool oldSlotPlaceholderHasUncountedHeaders =
+      oldSlotValue == nullptr &&
+      RuntimeBundleLowerer::classForContract(fieldTypes[*fieldIndex]) !=
+          nullptr;
   if (boxedField) {
     if (retainExistingObjectHandle &&
         mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
             op, slotStorageType, slotValue.physicalValues(), slotName)))
       return mlir::failure();
-    if (mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
+    // Why the guard is not only on the wide arm below: a `builtins.object`
+    // slot is one handle, but storing it re-roots that handle exactly like a
+    // wide field, so an instance without an owned-local marker -- `self`
+    // inside a method, which is every `self.x = obj` in an `__init__` -- has
+    // its pre-store handle released both here and by the object's own
+    // teardown. That is the same double release as the wide arm, and it needs
+    // no load to surface: `Holder(Inner(1))` aborts on construction.
+    if (markerFollows &&
+        mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
             op, slotStorageType, oldValues, slotName)))
       return mlir::failure();
   } else {
@@ -1089,14 +1117,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
     // per-region expansion for one entity (the `stale`/re-root notion the
     // affine verifier already has for a consuming call that returns the
     // entity) -- see the ownership note in runtime/lib/json.py.
-    bool markerFollows =
-        RuntimeBundleLowerer::ownedLocalObjectMarkerFollowsExpansion(
-            op.getObject());
     if (mlir::failed(RuntimeBundleLowerer::replaceAggregateSlot(
             op, fieldTypes[*fieldIndex], oldValues, oldSlotValue,
             fieldTypes[*fieldIndex], slotValue, slotName,
             /*releaseMissingOldObjectSlot=*/true,
-            /*releaseOldSlot=*/markerFollows)))
+            /*releaseOldSlot=*/markerFollows &&
+                !oldSlotPlaceholderHasUncountedHeaders)))
       return mlir::failure();
   }
   if (releaseOwnedSource &&
