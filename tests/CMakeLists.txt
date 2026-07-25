@@ -70,11 +70,13 @@ set(LYTHON_GOLDEN_RUNNER "${CMAKE_CURRENT_SOURCE_DIR}/golden/run_case.py")
 # failure instead of a stalled CI job, and it should keep doing that for the
 # ~370 cases that finish in seconds.
 #
-# Empty on purpose. `stdlib_string_template` needed the raised budget while the
-# path-sensitive ownership verifier was superlinear in function size; with that
-# fixed (docs/ownership-perf.md) it finishes in ~11s under `ctest -j6`, so the
-# default budget is 25x headroom and the exemption would only hide a future
-# regression.
+# Empty on purpose. `stdlib_string_template` and `stdlib_json_accessors` are the
+# two cases that ever needed the raised budget, and both needed it only while
+# the path-sensitive ownership verifier was superlinear in function size; with
+# that fixed (docs/ownership-perf.md) they are the slowest cases in the suite by
+# a wide margin but still finish inside the default budget, so an exemption
+# would only hide a future regression in exactly the cases most likely to
+# regress.
 set(LYTHON_GOLDEN_SLOW_CASES)
 
 file(GLOB LYTHON_GOLDEN_CASES CONFIGURE_DEPENDS

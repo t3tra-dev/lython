@@ -1,0 +1,161 @@
+Expecting value: line 1 column 1 (char 0)
+Expecting value
+0
+1
+1
+Expecting value: line 1 column 3 (char 2)
+Expecting value
+2
+1
+3
+Expecting value: line 1 column 1 (char 0)
+Expecting value
+0
+1
+1
+Expecting value: line 1 column 2 (char 1)
+Expecting value
+1
+1
+2
+Expecting value: line 1 column 4 (char 3)
+Expecting value
+3
+1
+4
+Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+Expecting property name enclosed in double quotes
+1
+1
+2
+Expecting ':' delimiter: line 1 column 5 (char 4)
+Expecting ':' delimiter
+4
+1
+5
+Expecting value: line 1 column 6 (char 5)
+Expecting value
+5
+1
+6
+Expecting value: line 1 column 1 (char 0)
+Expecting value
+0
+1
+1
+Expecting value: line 1 column 1 (char 0)
+Expecting value
+0
+1
+1
+Expecting value: line 1 column 1 (char 0)
+Expecting value
+0
+1
+1
+Expecting ':' delimiter: line 1 column 6 (char 5)
+Expecting ':' delimiter
+5
+1
+6
+Expecting ',' delimiter: line 1 column 9 (char 8)
+Expecting ',' delimiter
+8
+1
+9
+Expecting ',' delimiter: line 1 column 4 (char 3)
+Expecting ',' delimiter
+3
+1
+4
+Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+Expecting property name enclosed in double quotes
+1
+1
+2
+Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+Expecting property name enclosed in double quotes
+1
+1
+2
+Illegal trailing comma before end of array: line 1 column 3 (char 2)
+Illegal trailing comma before end of array
+2
+1
+3
+Illegal trailing comma before end of object: line 1 column 8 (char 7)
+Illegal trailing comma before end of object
+7
+1
+8
+Expecting value: line 1 column 2 (char 1)
+Expecting value
+1
+1
+2
+Unterminated string starting at: line 1 column 1 (char 0)
+Unterminated string starting at
+0
+1
+1
+Unterminated string starting at: line 1 column 1 (char 0)
+Unterminated string starting at
+0
+1
+1
+Invalid \escape: line 1 column 3 (char 2)
+Invalid \escape
+2
+1
+3
+Invalid \uXXXX escape: line 1 column 4 (char 3)
+Invalid \uXXXX escape
+3
+1
+4
+Invalid \uXXXX escape: line 1 column 4 (char 3)
+Invalid \uXXXX escape
+3
+1
+4
+Invalid control character at: line 1 column 3 (char 2)
+Invalid control character at
+2
+1
+3
+Extra data: line 1 column 3 (char 2)
+Extra data
+2
+1
+3
+Extra data: line 1 column 5 (char 4)
+Extra data
+4
+1
+5
+Extra data: line 1 column 10 (char 9)
+Extra data
+9
+1
+10
+Extra data: line 1 column 5 (char 4)
+Extra data
+4
+1
+5
+Expecting value: line 3 column 8 (char 19)
+Expecting value
+19
+3
+8
+Expecting ',' delimiter: line 4 column 3 (char 13)
+Expecting ',' delimiter
+13
+4
+3
+Expecting ':' delimiter: line 5 column 1 (char 10)
+Expecting ':' delimiter
+10
+5
+1
+ValueError: Expecting value: line 1 column 2 (char 1)
