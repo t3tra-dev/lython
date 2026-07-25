@@ -1,7 +1,7 @@
 # probe: callee stores into and reads back a borrowed receiver's int | None field, then the caller reads it
 # axes: acquire=param width=optional op=rebind flow=straight observe=writeback-both
 # CLASSIFICATION: 3 loud 拒否 (診断)
-#   loc(fused<{ly.source.end_col = 28 : i32, ly.source.end_line = 20 : i32, ly.source.start_col = 4 : i32, ly.source.start_line = 20 : i32}>["/Users/user/Desktop/dev/lython/.claude/worktrees/agent-a121ace38a4d2e6ff/tests/pro
+#   builtin callable 'print' expects exactly one positional argument
 # CPython 3.14 expects: in callee: 5 / in caller: 5
 
 class Box:

@@ -31,6 +31,10 @@ LABEL = {
     "CPYERR": "- (CPython が実行できず)",
 }
 STACK = re.compile(r"^#\s+#\d+ 0x")
+# An MLIR diagnostic arrives as `loc(fused<...huge...>[...]): error: message`.
+# Only the message is worth putting in a header; the location is the probe's own
+# line, which the reader is already looking at.
+MLIR_LOC = re.compile(r"^.*?\berror:\s*")
 
 
 def main():
@@ -51,6 +55,8 @@ def main():
         note = (rec.get("note") or "").strip()
         if note.startswith("#0 0x"):
             note = ""  # a raw stack frame says nothing worth keeping
+        if "error:" in note:
+            note = MLIR_LOC.sub("", note, count=1)
 
         leakline = ""
         if p.stem.startswith("leak_"):

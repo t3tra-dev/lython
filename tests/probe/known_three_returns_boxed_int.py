@@ -1,7 +1,7 @@
 # probe: REPORTED uncompilable: a boxed int temporary live across three returns
 # axes: width=w3int op=temp flow=multireturn
 # CLASSIFICATION: 3 loud 拒否 (診断)
-#   loc(fused<{ly.source.end_col = 16 : i32, ly.source.end_line = 14 : i32, ly.source.start_col = 4 : i32, ly.source.start_line = 14 : i32}>["/Users/user/Desktop/dev/lython/.claude/worktrees/agent-a121ace38a4d2e6ff/tests/pro
+#   owned resource from @LyLong_FromI64 result 0 reaches function exit without release, transfer, or owned return
 # CPython 3.14 expects: 7 1000008 2000009 3000010
 
 def pick(k: int) -> int:

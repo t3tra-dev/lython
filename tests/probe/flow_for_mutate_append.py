@@ -1,7 +1,7 @@
 # probe: in-place field mutation inside a for loop (append)
 # axes: acquire=call width=w3list/w1dict op=append flow=for
 # CLASSIFICATION: 3 loud 拒否 (診断)
-#   loc(fused<{ly.source.end_col = 17 : i32, ly.source.end_line = 18 : i32, ly.source.start_col = 4 : i32, ly.source.start_line = 18 : i32}>["/Users/user/Desktop/dev/lython/.claude/worktrees/agent-a121ace38a4d2e6ff/tests/pro
+#   list.append on a field or borrowed list is not supported inside a branch or loop body; bind the list to a local variable and mutate the local instead
 # CPython 3.14 expects: 3
 
 class Box:

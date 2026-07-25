@@ -1,7 +1,7 @@
 # probe: field rebind -- receiver read out of a list; field type Wide
 # axes: acquire=container width=wNcls op=rebind flow=straight
 # CLASSIFICATION: 3 loud 拒否 (診断)
-#   loc(fused<{ly.source.end_col = 25 : i32, ly.source.end_line = 28 : i32, ly.source.start_col = 19 : i32, ly.source.start_line = 28 : i32}>["/Users/user/Desktop/dev/lython/.claude/worktrees/agent-a121ace38a4d2e6ff/tests/pr
+#   a '!py.contract<"Box">' value expands to 8 physical handles, but a payload box carries at most 5; it cannot be stored in a container slot or boxed field yet (reduce the class to fewer or narrower fields)
 # CPython 3.14 expects: 1 2.5 z
 
 class Other:

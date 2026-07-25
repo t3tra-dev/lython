@@ -1,7 +1,7 @@
 # probe: a module-level generator iterating an object's field (contrast with the method form)
 # axes: op=generator-function flow=for
 # CLASSIFICATION: 3 loud 拒否 (診断)
-#   /Users/user/Desktop/dev/lython/.claude/worktrees/agent-a121ace38a4d2e6ff/tests/probe/known_module_generator_over_field.py:14:0: emit error: generator function return annotation is incompatible with inferred Generator or 
+#   generator function return annotation is incompatible with inferred Generator or AsyncGenerator contract
 # CPython 3.14 expects: 6
 
 from typing import Iterator

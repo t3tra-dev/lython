@@ -1,7 +1,7 @@
 # probe: REPORTED loud (budget 5): a 3-field class used as a list element
 # axes: width=wNcls op=store-into-container flow=straight
 # CLASSIFICATION: 3 loud 拒否 (診断)
-#   loc(fused<{ly.source.end_col = 34 : i32, ly.source.end_line = 13 : i32, ly.source.start_col = 18 : i32, ly.source.start_line = 13 : i32}>["/Users/user/Desktop/dev/lython/.claude/worktrees/agent-a121ace38a4d2e6ff/tests/pr
+#   a '!py.contract<"Three">' value expands to 10 physical handles, but a payload box carries at most 5; it cannot be stored in a container slot or boxed field yet (reduce the class to fewer or narrower fields)
 # CPython 3.14 expects: 1 2 3
 
 class Three:
