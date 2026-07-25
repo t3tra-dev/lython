@@ -66,10 +66,6 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerModule() {
     return mlir::failure();
   if (mlir::failed(lowerFunctionReturns()))
     return mlir::failure();
-  // Must follow lowerFunctionReturns: totality of a clone is read off its
-  // lowered (raw, valid) returns.
-  if (mlir::failed(foldUnprovenPrimitiveI64Speculations()))
-    return mlir::failure();
   if (mlir::failed(eraseCallableProtocolTemplateFunctions()))
     return mlir::failure();
   if (mlir::failed(dropControlFlowLogicalBranchOperands()))
@@ -95,6 +91,13 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerModule() {
   if (mlir::failed(RuntimeBundleLowerer::generateBoxedReleaseHook()))
     return mlir::failure();
   if (mlir::failed(RuntimeBundleLowerer::generateGeneratorDropHook()))
+    return mlir::failure();
+  // Runs last, not straight after lowerFunctionReturns (where the clone
+  // returns it reads first become final): it erases the scf.if whose results
+  // valueBundles still holds handles to, so every step that may still consult
+  // a bundle -- including the hooks above, which can lower fresh calls -- has
+  // to be done first.
+  if (mlir::failed(foldUnprovenPrimitiveI64Speculations()))
     return mlir::failure();
   // Class ops survive eraseLoweredPyOps so the hooks above can resolve
   // source-class ids and method symbols; drop them now that dispatch is built.
