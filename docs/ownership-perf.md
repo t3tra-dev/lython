@@ -186,8 +186,22 @@ the `lowering` total at N=16 above. The cause is
 per call, asked once per (consume site × point). The query is separable — `to`
 is only a membership test inside the BFS loop, never a cutoff — so caching
 `reachableAvoiding(from, avoid, fromAfter)` collapses the inner loop to one
-BFS per consume site. That is insertion-pass work and is tracked with the
-unwind landing-pad track, not here.
+BFS per consume site. **Unimplemented, and nobody owns it**: the Wave 3
+foundation track landed only the try-handler-entry binding and never touched
+`Ownership.cpp`, so an earlier reading of this paragraph as "already tracked
+with the unwind landing-pad work" was wrong.
+
+Whoever takes it: `UnwindCleanupAnalysis` is constructed once per function and
+then *outlives* the CFG edits `insertUnwindCleanupReleases` makes — the three
+`head->splitBlock(...)` sites that wire each cleanup handler in. Today that is
+harmless only because every reachability query is issued in the collection
+phase, ahead of the first split; the analysis object is simply never asked
+anything afterwards. A reachability cache does not change that invariant, it
+depends on it, so the invariant has to be stated rather than inherited: a cache
+keyed on `mlir::Block *` is worse than no cache once a split has run, because
+the split moves the tail's successors onto a new block while the stale entry
+still answers for the old one. Either keep all queries ahead of the edits (and
+say so at the query sites), or invalidate at each edit.
 
 Secondary, in rough order: the remaining `getInherentAttr` traffic from
 `readFunctionContract` being re-read rather than cached per callee;
