@@ -1,0 +1,9 @@
+3 [1, 2, 3]
+3
+3 [1, 2]
+True False
+[1, 2] [1, 2, 9]
+2 ['a', 'b'] b
+True False
+['one', 'two'] 2 2
+[3] three 1
