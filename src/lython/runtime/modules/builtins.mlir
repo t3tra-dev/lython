@@ -212,7 +212,8 @@ module attributes {
     base_names = ["object"], ly.typing.final,
     method_names = ["__new__", "__repr__", "__add__", "__sub__", "__mul__",
                     "__truediv__", "__floordiv__", "__mod__", "__float__",
-                    "__bool__", "__round__", "__lt__", "__le__", "__gt__",
+                    "__bool__", "__round__", "__round__", "__lt__", "__le__",
+                    "__gt__",
                     "__ge__", "__str__", "__eq__", "__ne__", "__pow__",
                     "__hash__", "__abs__", "__format__",
                     "__lt__", "__le__", "__gt__", "__ge__", "__eq__", "__ne__",
@@ -228,7 +229,8 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.float">, !py.contract<"builtins.float">] -> [!py.contract<"builtins.float">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.float">] -> [!py.contract<"builtins.float">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.float">] -> [!py.contract<"builtins.bool">]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.float">, !py.union<!py.contract<"typing.SupportsIndex">, !py.literal<None>>] -> [!py.contract<"builtins.float">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.float">] -> [!py.contract<"builtins.int">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.float">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.float">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.float">, !py.contract<"builtins.float">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.float">, !py.contract<"builtins.float">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.float">, !py.contract<"builtins.float">] -> [!py.contract<"builtins.bool">]>,
@@ -255,7 +257,8 @@ module attributes {
                     "instance", "instance", "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
-                    "instance", "instance", "instance", "instance"]
+                    "instance", "instance", "instance", "instance",
+                    "instance"]
   } {}
 
   py.class @complex attributes {
@@ -1251,6 +1254,31 @@ module attributes {
   func.func @LyBool_Str(%value: i1) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bool", ly.runtime.method = "__str__", ly.runtime.result_contract = "builtins.str"} {
     %header, %bytes = func.call @LyBool_Repr(%value) : (i1) -> (memref<2xi64>, memref<?xi8>)
     func.return %header, %bytes : memref<2xi64>, memref<?xi8>
+  }
+
+  // bool.__bool__ / __and__ / __or__ / __xor__. CPython's bool_and/or/xor
+  // return bool only when *both* operands are bool and otherwise defer to
+  // long_and/or/xor; the mixed cases are already int methods here, so these
+  // four cover exactly the bool-bool shape the contract declares. Not folded
+  // into the int primitive path: an i1 pair never reaches the boxed-long
+  // arithmetic that primitiveI64ArithmeticKind selects.
+  func.func @LyBool_Bool(%value: i1) -> i1 attributes {ly.runtime.contract = "builtins.bool", ly.runtime.method = "__bool__"} {
+    func.return %value : i1
+  }
+
+  func.func @LyBool_And(%lhs: i1, %rhs: i1) -> i1 attributes {ly.runtime.contract = "builtins.bool", ly.runtime.method = "__and__"} {
+    %result = arith.andi %lhs, %rhs : i1
+    func.return %result : i1
+  }
+
+  func.func @LyBool_Or(%lhs: i1, %rhs: i1) -> i1 attributes {ly.runtime.contract = "builtins.bool", ly.runtime.method = "__or__"} {
+    %result = arith.ori %lhs, %rhs : i1
+    func.return %result : i1
+  }
+
+  func.func @LyBool_Xor(%lhs: i1, %rhs: i1) -> i1 attributes {ly.runtime.contract = "builtins.bool", ly.runtime.method = "__xor__"} {
+    %result = arith.xori %lhs, %rhs : i1
+    func.return %result : i1
   }
 
   func.func @Ly_IncRef(%header: memref<2xi64, strided<[1], offset: ?>> {ly.ownership.object_header}) attributes {ly.ownership.retain_args = [0], ly.runtime.primitive = "retain"} {
@@ -14618,9 +14646,183 @@ module attributes {
   func.func @LyFloat_TrueDiv(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_payload: memref<1xf64>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_payload: memref<1xf64>) -> (memref<2xi64>, memref<1xf64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.float", ly.runtime.method = "__truediv__"} {
     %lhs = func.call @LyFloat_AsF64(%lhs_header, %lhs_payload) : (memref<2xi64>, memref<1xf64>) -> f64
     %rhs = func.call @LyFloat_AsF64(%rhs_header, %rhs_payload) : (memref<2xi64>, memref<1xf64>) -> f64
+    // Not arith.divf alone: IEEE would yield inf/nan for a zero divisor,
+    // where CPython float_div raises. Returning inf is the one outcome the
+    // project forbids -- a wrong value with no diagnostic.
+    %zero = arith.constant 0.0 : f64
+    %divisor_zero = arith.cmpf oeq, %rhs, %zero : f64
+    cf.cond_br %divisor_zero, ^by_zero, ^divide
+
+  ^by_zero:
+    func.call @__ly_long_raise_true_div_zero() : () -> ()
+    cf.br ^divide
+
+  ^divide:
     %value = arith.divf %lhs, %rhs : f64
     %out_header, %out_payload = func.call @LyFloat_FromF64(%value) : (f64) -> (memref<2xi64>, memref<1xf64>)
     func.return %out_header, %out_payload : memref<2xi64>, memref<1xf64>
+  }
+
+  // C fmod, the only piece of CPython's float_divmod that arith/math cannot
+  // express: x - trunc(x/y)*y loses the exactness fmod guarantees once the
+  // quotient exceeds the significand, and MLIR's math dialect has no fmod.
+  func.func private @fmod(%x: f64, %y: f64) -> f64
+
+  // CPython float_divmod (Objects/floatobject.c) verbatim: fmod for the
+  // remainder, then the sign fixup that makes the remainder follow the
+  // divisor, then the quotient snap. Both __floordiv__ and __mod__ read this
+  // one helper because CPython derives float_floor_div and float_rem from the
+  // same computation -- splitting them would let the pair disagree.
+  func.func private @__ly_float_divmod(%vx: f64, %wx: f64) -> (f64, f64) {
+    %zero = arith.constant 0.0 : f64
+    %one = arith.constant 1.0 : f64
+    %half = arith.constant 0.5 : f64
+
+    %mod_raw = func.call @fmod(%vx, %wx) : (f64, f64) -> f64
+    %div_raw = arith.subf %vx, %mod_raw : f64
+    %div_scaled = arith.divf %div_raw, %wx : f64
+
+    %mod_nonzero = arith.cmpf one, %mod_raw, %zero : f64
+    %divisor_negative = arith.cmpf olt, %wx, %zero : f64
+    %mod_negative = arith.cmpf olt, %mod_raw, %zero : f64
+    %signs_differ = arith.xori %divisor_negative, %mod_negative : i1
+    %needs_fixup = arith.andi %mod_nonzero, %signs_differ : i1
+
+    %mod_fixed = arith.addf %mod_raw, %wx : f64
+    %div_fixed = arith.subf %div_scaled, %one : f64
+    // A zero remainder's sign is platform-dependent out of fmod; CPython
+    // forces the divisor's sign so that -0.0 % 2.0 matches.
+    %mod_zero_signed = math.copysign %zero, %wx : f64
+    %mod_maybe = arith.select %needs_fixup, %mod_fixed, %mod_raw : f64
+    %mod = arith.select %mod_nonzero, %mod_maybe, %mod_zero_signed : f64
+    %div = arith.select %needs_fixup, %div_fixed, %div_scaled : f64
+
+    %div_nonzero = arith.cmpf one, %div, %zero : f64
+    %floor = math.floor %div : f64
+    %fraction = arith.subf %div, %floor : f64
+    %past_half = arith.cmpf ogt, %fraction, %half : f64
+    %floor_up = arith.addf %floor, %one : f64
+    %floordiv_nonzero = arith.select %past_half, %floor_up, %floor : f64
+    %quotient = arith.divf %vx, %wx : f64
+    %floordiv_zero = math.copysign %zero, %quotient : f64
+    %floordiv = arith.select %div_nonzero, %floordiv_nonzero, %floordiv_zero : f64
+
+    func.return %floordiv, %mod : f64, f64
+  }
+
+  func.func @LyFloat_FloorDiv(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_payload: memref<1xf64>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_payload: memref<1xf64>) -> (memref<2xi64>, memref<1xf64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.float", ly.runtime.method = "__floordiv__", ly.runtime.result_contract = "builtins.float"} {
+    %lhs = func.call @LyFloat_AsF64(%lhs_header, %lhs_payload) : (memref<2xi64>, memref<1xf64>) -> f64
+    %rhs = func.call @LyFloat_AsF64(%rhs_header, %rhs_payload) : (memref<2xi64>, memref<1xf64>) -> f64
+    %zero = arith.constant 0.0 : f64
+    %divisor_zero = arith.cmpf oeq, %rhs, %zero : f64
+    cf.cond_br %divisor_zero, ^by_zero, ^divide
+
+  ^by_zero:
+    func.call @__ly_long_raise_floor_div_zero() : () -> ()
+    cf.br ^divide
+
+  ^divide:
+    %floordiv, %mod = func.call @__ly_float_divmod(%lhs, %rhs) : (f64, f64) -> (f64, f64)
+    %out_header, %out_payload = func.call @LyFloat_FromF64(%floordiv) : (f64) -> (memref<2xi64>, memref<1xf64>)
+    func.return %out_header, %out_payload : memref<2xi64>, memref<1xf64>
+  }
+
+  func.func @LyFloat_Mod(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_payload: memref<1xf64>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_payload: memref<1xf64>) -> (memref<2xi64>, memref<1xf64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.float", ly.runtime.method = "__mod__", ly.runtime.result_contract = "builtins.float"} {
+    %lhs = func.call @LyFloat_AsF64(%lhs_header, %lhs_payload) : (memref<2xi64>, memref<1xf64>) -> f64
+    %rhs = func.call @LyFloat_AsF64(%rhs_header, %rhs_payload) : (memref<2xi64>, memref<1xf64>) -> f64
+    %zero = arith.constant 0.0 : f64
+    %divisor_zero = arith.cmpf oeq, %rhs, %zero : f64
+    cf.cond_br %divisor_zero, ^by_zero, ^divide
+
+  ^by_zero:
+    func.call @__ly_long_raise_mod_zero() : () -> ()
+    cf.br ^divide
+
+  ^divide:
+    %floordiv, %mod = func.call @__ly_float_divmod(%lhs, %rhs) : (f64, f64) -> (f64, f64)
+    %out_header, %out_payload = func.call @LyFloat_FromF64(%mod) : (f64) -> (memref<2xi64>, memref<1xf64>)
+    func.return %out_header, %out_payload : memref<2xi64>, memref<1xf64>
+  }
+
+  // round(x) and round(x, n) are separate manifest overloads because CPython
+  // returns different *types*: float___round___impl narrows to int when
+  // ndigits is absent and stays float otherwise. One declaration with a
+  // default, as int.__round__ uses, cannot express that split.
+  func.func @LyFloat_RoundToInt(%header: memref<2xi64> {ly.ownership.object_header}, %payload: memref<1xf64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.float", ly.runtime.method = "__round__", ly.runtime.result_contract = "builtins.int"} {
+    %value = func.call @LyFloat_AsF64(%header, %payload) : (memref<2xi64>, memref<1xf64>) -> f64
+    // round-half-to-even, then reuse float.__int__ for the narrowing so the
+    // nan/inf and >2^63 paths raise exactly what int(x) raises. The temporary
+    // exists only because __int__ takes an object, not an f64.
+    %rounded = math.roundeven %value : f64
+    %tmp_header, %tmp_payload = func.call @LyFloat_FromF64(%rounded) : (f64) -> (memref<2xi64>, memref<1xf64>)
+    %h, %m, %d = func.call @LyFloat_Int(%tmp_header, %tmp_payload) : (memref<2xi64>, memref<1xf64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    func.call @LyFloat_DecRef(%tmp_header) : (memref<2xi64>) -> ()
+    func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
+  }
+
+  func.func @LyFloat_RoundNdigits(%header: memref<2xi64> {ly.ownership.object_header}, %payload: memref<1xf64>, %ndigits_header: memref<2xi64> {ly.ownership.object_header}, %ndigits_meta: memref<2xi64>, %ndigits_digits: memref<?xi32>) -> (memref<2xi64>, memref<1xf64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.float", ly.runtime.method = "__round__", ly.runtime.result_contract = "builtins.float"} {
+    %value = func.call @LyFloat_AsF64(%header, %payload) : (memref<2xi64>, memref<1xf64>) -> f64
+    %ndigits = func.call @LyLong_AsI64(%ndigits_header, %ndigits_meta, %ndigits_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+    %rounded = func.call @__ly_float_round_ndigits(%value, %ndigits) : (f64, i64) -> f64
+    %out_header, %out_payload = func.call @LyFloat_FromF64(%rounded) : (f64) -> (memref<2xi64>, memref<1xf64>)
+    func.return %out_header, %out_payload : memref<2xi64>, memref<1xf64>
+  }
+
+  // Scale, round-half-to-even, unscale. CPython uses _Py_dg_dtoa for a
+  // correctly-rounded decimal result; this reproduces it for the magnitudes
+  // where 10**|n| is exact in binary64 and passes nan/inf and out-of-range
+  // exponents through unchanged, as float___round___impl does.
+  func.func private @__ly_float_round_ndigits(%x: f64, %ndigits: i64) -> f64 {
+    %zero = arith.constant 0.0 : f64
+    %ten = arith.constant 10.0 : f64
+    %inf = arith.constant 0x7FF0000000000000 : f64
+    %zero64 = arith.constant 0 : i64
+    %neg_one = arith.constant -1 : i64
+    %hi_digits = arith.constant 308 : i64
+    %lo_digits = arith.constant -308 : i64
+
+    %is_nan = arith.cmpf uno, %x, %x : f64
+    %abs_x = math.absf %x : f64
+    %is_inf = arith.cmpf oeq, %abs_x, %inf : f64
+    %special = arith.ori %is_nan, %is_inf : i1
+    %above = arith.cmpi sgt, %ndigits, %hi_digits : i64
+    %below = arith.cmpi slt, %ndigits, %lo_digits : i64
+    %extreme = arith.ori %above, %below : i1
+    %passthrough = arith.ori %special, %extreme : i1
+    cf.cond_br %passthrough, ^pass, ^scale
+
+  ^pass:
+    func.return %x : f64
+
+  ^scale:
+    %negative = arith.cmpi slt, %ndigits, %zero64 : i64
+    %flipped = arith.subi %zero64, %ndigits : i64
+    %magnitude = arith.select %negative, %flipped, %ndigits : i64
+    %magnitude_f = arith.uitofp %magnitude : i64 to f64
+    %scale = math.powf %ten, %magnitude_f : f64
+    %scale_nan = arith.cmpf uno, %scale, %scale : f64
+    %scale_abs = math.absf %scale : f64
+    %scale_inf = arith.cmpf oeq, %scale_abs, %inf : f64
+    %scale_zero = arith.cmpf oeq, %scale, %zero : f64
+    %scale_bad = arith.ori %scale_nan, %scale_inf : i1
+    %scale_unusable = arith.ori %scale_bad, %scale_zero : i1
+    cf.cond_br %scale_unusable, ^pass, ^direction
+
+  ^direction:
+    %multiply_first = arith.cmpi sgt, %ndigits, %neg_one : i64
+    cf.cond_br %multiply_first, ^up, ^down
+
+  ^up:
+    %scaled_up = arith.mulf %x, %scale : f64
+    %rounded_up = math.roundeven %scaled_up : f64
+    %result_up = arith.divf %rounded_up, %scale : f64
+    func.return %result_up : f64
+
+  ^down:
+    %scaled_down = arith.divf %x, %scale : f64
+    %rounded_down = math.roundeven %scaled_down : f64
+    %result_down = arith.mulf %rounded_down, %scale : f64
+    func.return %result_down : f64
   }
 
   // float ** float via libm pow (CPython float_pow also defers to C pow).
@@ -15892,6 +16094,16 @@ module attributes {
   // ===== impls: numeric/string free builtins =====
   // abs(): per-class __abs__ methods plus the builtin method dispatcher.
   func.func private @LyBuiltin_Abs() -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.runtime.builtin = "abs", ly.runtime.builtin_lowering = "method", ly.runtime.builtin_method = "__abs__", ly.runtime.contract = "builtins.object", ly.runtime.primitive = "builtin_abs", ly.runtime.result_contract = "builtins.int"}
+
+  // int.__index__ is the identity (CPython long_long returns the receiver for
+  // an exact int). A copy rather than a retain of the argument view: the
+  // manifest method ABI owns result 0, and the incoming meta/digits are a
+  // borrowed operand view, not an owned header.
+  func.func @LyLong_Index(%header: memref<2xi64> {ly.ownership.object_header}, %meta_raw: memref<2xi64>, %digits_raw: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__index__"} {
+    %meta, %digits = func.call @__ly_long_operand_view(%meta_raw, %digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
+    %h, %m, %d = func.call @__ly_long_copy(%meta, %digits) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
+  }
 
   func.func @LyLong_Abs(%header: memref<2xi64> {ly.ownership.object_header}, %meta_raw: memref<2xi64>, %digits_raw: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__abs__"} {
     %meta, %digits = func.call @__ly_long_operand_view(%meta_raw, %digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
