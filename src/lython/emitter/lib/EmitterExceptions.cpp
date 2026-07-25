@@ -445,10 +445,31 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
   // continuation keeps the SSA fast paths (int lanes, list/sequence
   // evidence); leaving a container cell-bound would demote every later
   // `xs.append(...)` into a non-evidence-backed receiver.
+  //
+  // The same promotion covers a rebind in a HANDLER, the ELSE body or the
+  // FINALLY body, but only when the post-try result lanes below are
+  // unavailable. Those bodies are each emitted under a ScopedEmitterScope
+  // that restores `values` wholesale, so a rebind inside one reaches the
+  // continuation only through storage or through a lane; with an else or a
+  // finally present there are no lanes, and the rebind was silently dropped
+  // (`seen = "unset"` after `except: seen = "handled"; finally: ...`, and
+  // `outcome` unchanged by an else body). Where the lanes DO exist they stay
+  // in charge: a lane keeps the value in SSA, which the continuation prefers.
+  bool postTryLanesAvailable = !hasElse && !hasFinally &&
+                               !usesFinallyCompletion && handlers &&
+                               !handlers->empty();
   llvm::SmallVector<std::string, 4> storagePromotedNames;
   if (hasFinally || (handlers && !handlers->empty())) {
     llvm::StringSet<> reboundInBody;
     collectRebindNames(ast::nodeList(statement, "body"), reboundInBody);
+    if (!postTryLanesAvailable) {
+      if (handlers)
+        for (const parser::NodePtr &handler : *handlers)
+          if (handler)
+            collectRebindNames(ast::nodeList(*handler, "body"), reboundInBody);
+      collectRebindNames(ast::nodeList(statement, "orelse"), reboundInBody);
+      collectRebindNames(finalbody, reboundInBody);
+    }
     // A structural mutation ANYWHERE in the statement disqualifies the name:
     // in the body it would need the cell to carry evidence it cannot, and in
     // a handler or the finally body its direct `values[name]` write would
@@ -547,8 +568,7 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
   for (const std::string &name : storagePromotedNames)
     storagePromoted.insert(name);
 
-  postTryEligible = !hasElse && !hasFinally && !usesFinallyCompletion &&
-                    handlers && !handlers->empty();
+  postTryEligible = postTryLanesAvailable;
   if (postTryEligible) {
     llvm::StringSet<> assignedNames;
     collectAssignedNames(ast::nodeList(statement, "body"), assignedNames);
@@ -1274,19 +1294,6 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
   }
 
   builder.setInsertionPointAfter(tryOp);
-  // Undo the storage promotion: the statement is over, so the cell's content
-  // is the one value the continuation can see, and rebinding to it lets the
-  // cell die here instead of demoting the rest of the scope to loads. The
-  // loads sit in the block that still holds py.try, which dominates every
-  // block the completion dispatch and the else body split off below.
-  for (const std::string &name : storagePromotedNames) {
-    auto bound = values.find(name);
-    if (bound == values.end() || !isCellContract(bound->second.type))
-      continue;
-    Value content = emitCellLoad(statement, bound->second);
-    values[name] = content;
-    types.bindSymbol(name, content.type);
-  }
   for (auto [index, local] : llvm::enumerate(postCarriedLocals)) {
     values[local.name] =
         Value{tryOp.getResult(static_cast<unsigned>(index)), local.type};
@@ -1425,6 +1432,27 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
     if (!blockHasTerminator(*elseBlock))
       mlir::cf::BranchOp::create(builder, loc(statement), afterElseBlock);
     builder.setInsertionPointToStart(afterElseBlock);
+  }
+  // Undo the storage promotion: the statement is over, so the cell's content
+  // is the one value the continuation can see, and rebinding to it lets the
+  // cell die here instead of demoting the rest of the scope to loads.
+  //
+  // Why HERE and not right after py.try, which is where the block that still
+  // holds the op would dominate the most: the else body and the finally
+  // completion dispatch are emitted between the two points, and the else body
+  // rebinds through the cell. Loading before it ran published the pre-else
+  // value as the continuation's, which is exactly the silent drop the
+  // promotion exists to prevent. This block is the single continuation every
+  // path inside the statement branches to, so it dominates every later use;
+  // nothing emitted in between reads a promoted name through SSA, because
+  // while the promotion stands the name resolves to the cell.
+  for (const std::string &name : storagePromotedNames) {
+    auto bound = values.find(name);
+    if (bound == values.end() || !isCellContract(bound->second.type))
+      continue;
+    Value content = emitCellLoad(statement, bound->second);
+    values[name] = content;
+    types.bindSymbol(name, content.type);
   }
 }
 
