@@ -17,7 +17,8 @@ Two mechanisms produce permanent false positives, both verified in this tree:
 
 So DO NOT gate CI on this script: a tree where every reported name is
 implemented still reports them, and a count of zero is not a reachable state.
-Gate on contracts.py, which decides each candidate by running it.
+Gate on contracts.py, which decides each candidate by running it. Skipping that
+step is the one trap the side-defects track hit.
 
     python3 tests/probe/tools/contract_scan.py [repo-root]
 """
@@ -107,12 +108,21 @@ for path in MODULES:
                 d[role].add(r.group(1))
 
 # --- compare against typing contracts --------------------------------------
+# A py.class names its contract implicitly: `<ly.typing.module>.<ClassName>`,
+# with builtins.mlir defaulting to `builtins`. Only six of the seventy-nine
+# classes spell `ly.runtime.contract` out, so keying off that attribute alone
+# hid int/float/str/object and every other implicitly-named contract from this
+# scan -- which is why the first pass reported only seven.
 rows = []
 for path in MODULES:
     text = path.read_text()
+    modname = re.search(r'ly\.typing\.module\s*=\s*"([^"]+)"', text)
+    modname = modname.group(1) if modname else "builtins"
     for cls, attrs in parse_class_blocks(text):
-        contract = attr_str(attrs, "ly.runtime.contract")
-        if not contract:
+        contract = attr_str(attrs, "ly.runtime.contract") or f"{modname}.{cls}"
+        if "ly.typing.protocol" in attrs:
+            # Structural: the names are satisfied by concrete implementors, so
+            # a protocol carries no implementation of its own by construction.
             continue
         names = attr_list(attrs, "method_names") or []
         names = [n.strip('"') for n in names]

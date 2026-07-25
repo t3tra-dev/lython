@@ -730,7 +730,15 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesTypeObjectCall(
 
   std::optional<std::string> contract = ctypesTypeObjectName(callable);
   if (!contract)
-    return mlir::failure();
+    // Every TypeObject-kind callable lands here, not only ctypes ones: a
+    // builtin type reached through a variable (`t = int; t()`) is a
+    // TypeObject too, and returning plain failure() made the whole pipeline
+    // fail with nothing but "Failed to run lowering pipeline" -- an
+    // unlocated abort where the rules require a diagnostic.
+    return op.emitError()
+           << "calling a type object held in a value is not supported for "
+           << callable.contract
+           << "; construct through the type name directly";
 
   llvm::SmallVector<const RuntimeBundle *, 4> sources;
   llvm::SmallVector<RuntimeBundle, 4> unpackedSources;

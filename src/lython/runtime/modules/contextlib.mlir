@@ -10,7 +10,7 @@ module attributes {
     method_contracts = [
       !py.protocol<"Callable", [!py.type<!py.contract<"contextlib.nullcontext">>] -> [!py.self]>,
       !py.protocol<"Callable", [!py.contract<"contextlib.nullcontext">] -> [!py.literal<None>]>,
-      !py.protocol<"Callable", [!py.contract<"contextlib.nullcontext">] -> [!py.contract<"contextlib.nullcontext">]>,
+      !py.protocol<"Callable", [!py.contract<"contextlib.nullcontext">] -> [!py.literal<None>]>,
       !py.protocol<"Callable", [!py.contract<"contextlib.nullcontext">, !py.union<!py.type<!py.contract<"builtins.BaseException">>, !py.literal<None>>, !py.union<!py.contract<"builtins.BaseException">, !py.literal<None>>, !py.union<!py.contract<"types.TracebackType">, !py.literal<None>>] -> [!py.contract<"builtins.bool">]>
     ],
     method_kinds = ["classmethod", "instance", "instance", "instance"]
@@ -39,10 +39,13 @@ module attributes {
     func.return
   }
 
-  func.func @LyNullContext_Enter(%header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "contextlib.nullcontext", ly.runtime.method = "__enter__", ly.runtime.result_contract = "contextlib.nullcontext"} {
-    %header_view = memref.cast %header : memref<2xi64> to memref<2xi64, strided<[1], offset: ?>>
-    func.call @Ly_IncRef(%header_view) : (memref<2xi64, strided<[1], offset: ?>>) -> ()
-    func.return %header : memref<2xi64>
+  // CPython's nullcontext.__enter__ returns `self.enter_result`, not self, and
+  // enter_result defaults to None -- so `with nullcontext() as c` binds None.
+  // Returning the context manager instead bound the wrong object, which is a
+  // semantic difference rather than a cosmetic one. __new__ here takes no
+  // enter_result argument, so None is the only value it can yield.
+  func.func @LyNullContext_Enter(%header: memref<2xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "contextlib.nullcontext", ly.runtime.method = "__enter__"} {
+    func.return
   }
 
   func.func @LyNullContext_Exit(%header: memref<2xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "contextlib.nullcontext", ly.runtime.method = "__exit__", ly.runtime.result_contract = "builtins.bool"} {
