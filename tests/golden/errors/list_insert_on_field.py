@@ -9,6 +9,10 @@
 # because pop does not grow. So the boundary is "does the mutation reallocate",
 # not "is the receiver a field".
 #
+# Not a narrowing: on ed6a798 this same program said `runtime manifest has no
+# builtins.list.insert method`, i.e. insert did not exist in any spelling. What
+# changed is which forms work and how precisely the rest are refused.
+#
 # The workaround the diagnostic names -- bind the field to a local, insert into
 # the local, store it back -- is pinned in that same case, and it is a form that
 # was a use-after-free before 4a. When stage 4b puts the payload behind the
