@@ -172,6 +172,12 @@ private:
   // generic function's "requires a call or an annotated Callable context".
   void diagnoseUngroundedGenericClass(const parser::Node &anchor,
                                       llvm::StringRef name);
+  // Rejects materializing a generic class's class OBJECT (`C.attr`, `C` as a
+  // value): monomorphization leaves one contract per instantiation and no
+  // class object for the generic itself. Returns nullopt when the class is
+  // not generic.
+  std::optional<Value> rejectGenericClassObject(const parser::Node &anchor,
+                                                mlir::Type classType);
   // The specialized contract a bare `C(...)` should construct, recovered
   // from an expected type that is one of C's specializations; null when the
   // call is not a bare generic-class construction or the expectation does

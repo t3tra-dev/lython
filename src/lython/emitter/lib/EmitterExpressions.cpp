@@ -87,6 +87,11 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
       return emitPrimitiveConstant(*expr, primitiveConstant->second);
     std::optional<mlir::Type> symbolType = types.lookupSymbol(name);
     if (auto cls = types.lookupClass(name)) {
+      // A monomorphized generic has no single class object to materialize:
+      // there is one contract per instantiation. Reject here rather than let
+      // the factless generic contract flow on and fail as an erased object.
+      if (std::optional<Value> v = rejectGenericClassObject(*expr, *cls))
+        return *v;
       mlir::Type typeType = types.typeObject(*cls);
       auto op = py::TypeObjectOp::create(builder, loc(*expr), typeType, *cls);
       return {op.getResult(), typeType};
@@ -140,12 +145,24 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
     return emitBinary(*expr);
   if (expr->kind == "Compare")
     return emitCompare(*expr);
-  if (expr->kind == "Subscript")
+  if (expr->kind == "Subscript") {
+    // `C[int]` denotes the instantiation's class object, so it is a value in
+    // its own right (`C[int].attr`, `isinstance(x, C[int])`), not a
+    // __getitem__ on the generic name.
+    if (mlir::Type instantiated = types.genericClassSubscript(expr)) {
+      mlir::Type typeType = types.typeObject(instantiated);
+      auto op = py::TypeObjectOp::create(builder, loc(*expr), typeType,
+                                         instantiated);
+      return {op.getResult(), typeType};
+    }
     return emitSubscript(*expr);
+  }
   if (expr->kind == "Attribute") {
     std::string qualified = ast::qualifiedName(expr);
     if (!qualified.empty())
       if (auto cls = types.lookupClass(qualified)) {
+        if (std::optional<Value> v = rejectGenericClassObject(*expr, *cls))
+          return *v;
         mlir::Type typeType = types.typeObject(*cls);
         auto op = py::TypeObjectOp::create(builder, loc(*expr), typeType, *cls);
         return {op.getResult(), typeType};

@@ -1547,19 +1547,20 @@ TypeSystem::resolveGenericClass(llvm::StringRef baseName,
   return genericClassResolver(baseName, arguments);
 }
 
-void TypeSystem::registerGenericClass(llvm::StringRef contractName,
-                                      llvm::ArrayRef<std::string> params,
-                                      const parser::Node *initNode) {
+void TypeSystem::registerGenericClass(
+    llvm::StringRef contractName, llvm::ArrayRef<std::string> params,
+    const parser::Node *initNode, llvm::ArrayRef<GenericClassField> fields) {
   GenericClassTemplate &tmpl = genericClassTemplates[contractName];
   tmpl.params.assign(params.begin(), params.end());
   tmpl.initNode = initNode;
+  tmpl.fields.assign(fields.begin(), fields.end());
 }
 
 mlir::Type TypeSystem::solveGenericClassInstantiation(
     llvm::StringRef contractName, mlir::ArrayRef<mlir::Type> positional,
     mlir::ArrayRef<CallKeywordType> keywords) const {
   auto tmpl = genericClassTemplates.find(contractName);
-  if (tmpl == genericClassTemplates.end() || !tmpl->second.initNode)
+  if (tmpl == genericClassTemplates.end())
     return {};
   // The parameters have to stand as TypeVars for the match to have anything
   // to solve: without the binding, annotationTypeForName would read a bare
@@ -1567,26 +1568,39 @@ mlir::Type TypeSystem::solveGenericClassInstantiation(
   auto scope = pushScope();
   for (const std::string &param : tmpl->second.params)
     bindLocalSymbol(param, py::TypeVarType::get(&context, param));
-  FunctionSignature init =
-      functionSignature(*tmpl->second.initNode, llvm::StringRef("self"));
-  TypeBindingMap bindings;
-  // positionalTypes[0] is the receiver, which is not an argument.
-  for (auto [index, argument] : llvm::enumerate(positional)) {
-    if (index + 1 >= init.positionalTypes.size())
-      break;
-    bindExpectedType(*this, init.positionalTypes[index + 1],
-                     widenLiteral(argument), bindings);
-  }
-  for (const CallKeywordType &keyword : keywords) {
-    for (auto [index, name] : llvm::enumerate(init.positionalNames))
-      if (name == keyword.name && index < init.positionalTypes.size())
-        bindExpectedType(*this, init.positionalTypes[index],
-                         widenLiteral(keyword.type), bindings);
+
+  // The constructor's parameters, by name, in call order.
+  llvm::SmallVector<std::pair<llvm::StringRef, mlir::Type>, 8> formals;
+  FunctionSignature init;
+  if (tmpl->second.initNode) {
+    init = functionSignature(*tmpl->second.initNode, llvm::StringRef("self"));
+    // positionalTypes[0] is the receiver, which is not an argument.
+    for (auto [index, name] : llvm::enumerate(init.positionalNames)) {
+      if (index == 0 || index >= init.positionalTypes.size())
+        continue;
+      formals.emplace_back(name, init.positionalTypes[index]);
+    }
     for (auto [index, name] : llvm::enumerate(init.kwOnlyNames))
-      if (name == keyword.name && index < init.kwOnlyTypes.size())
-        bindExpectedType(*this, init.kwOnlyTypes[index],
-                         widenLiteral(keyword.type), bindings);
+      if (index < init.kwOnlyTypes.size())
+        formals.emplace_back(name, init.kwOnlyTypes[index]);
+  } else {
+    for (const GenericClassField &field : tmpl->second.fields)
+      formals.emplace_back(field.first, annotationType(field.second));
   }
+
+  TypeBindingMap bindings;
+  for (auto [index, argument] : llvm::enumerate(positional)) {
+    if (index >= formals.size())
+      break;
+    bindExpectedType(*this, formals[index].second, widenLiteral(argument),
+                     bindings);
+  }
+  for (const CallKeywordType &keyword : keywords)
+    for (const auto &formal : formals)
+      if (formal.first == keyword.name)
+        bindExpectedType(*this, formal.second, widenLiteral(keyword.type),
+                         bindings);
+
   llvm::SmallVector<mlir::Type, 4> arguments;
   for (const std::string &param : tmpl->second.params) {
     auto solved = bindings.find(param);

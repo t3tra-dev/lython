@@ -274,12 +274,17 @@ public:
   mlir::Type genericClassSubscript(const parser::Node *node) const;
   // Registers what `C(args)` needs to recover its type arguments without an
   // explicit `C[int]` or an annotated context: the parameter names and the
-  // `__init__` whose parameter types they occur in. Without this a generic
+  // constructor whose parameter types they occur in. Without this a generic
   // class could only be instantiated through a spelled-out instantiation,
-  // which no CPython source writes.
+  // which no CPython source writes. `fields` stands in for `initNode` when
+  // the class has no `__init__` of its own — a dataclass or NamedTuple takes
+  // its annotated fields positionally, and that synthesized constructor is
+  // the only place its type arguments appear.
+  using GenericClassField = std::pair<std::string, const parser::Node *>;
   void registerGenericClass(llvm::StringRef contractName,
                             llvm::ArrayRef<std::string> params,
-                            const parser::Node *initNode);
+                            const parser::Node *initNode,
+                            llvm::ArrayRef<GenericClassField> fields);
   // Class static attributes (`class C: attr = ...`) type `C.attr` and
   // `instance.attr` reads; the emitter registers them per class as it emits
   // the class contract.
@@ -406,6 +411,7 @@ private:
   struct GenericClassTemplate {
     llvm::SmallVector<std::string, 4> params;
     const parser::Node *initNode = nullptr;
+    llvm::SmallVector<GenericClassField, 8> fields;
   };
   llvm::StringMap<GenericClassTemplate> genericClassTemplates;
   // Solves `C(args)`'s type arguments by matching the argument types against
