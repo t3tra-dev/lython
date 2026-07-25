@@ -1,10 +1,16 @@
 # probe: 5 フィールドのユーザークラスを別のクラスのフィールド型として使う。
-#   段階 4a の box16 スロット化でコストが 1 + 5 = 6 になり予算 5 を超えるため、
-#   **4a で「正しい」から「loud 拒否」へ退行する見込みの形**。4a のトレードが
-#   probe 集合から見えるようにするために置いた (`c3de5e7` 時点では通る)。
-#   退行と誤判定しないこと -- 分類が変わったら、それは 4a が意図した代償が
-#   ここに現れたという記録である。
-# axes: width=wNcls(5 fields as a field type) op=construct+read flow=straight budget=6
+#   当初は「段階 4a の box16 スロット化でコストが 1 + 5 = 6 になり予算 5 を
+#   超えるので loud に退行する見込み」と書いていたが、**この予測は外れた**。
+#   `kernel/4a` (`a36d881`) で実測: **通る** (素の実行 3/3 + libgmalloc)。
+#   私の見積りは「int フィールド 1 個 = 1 スロット」を仮定していたが、実際は
+#   contract 形の placeholder のぶんで **3** かかっていた。4a はその placeholder を
+#   削除したので、**int フィールド N 個のクラスは 1 ハンドルに展開される**。
+#   → 予算の境界は int フィールド数ではなく**参照型フィールドの本数**へ移った。
+#     現在その境界を押さえているのは golden の
+#     `errors/boxed_payload_too_wide_fields` (float 5 フィールド = 6 ハンドル)。
+#   (この予測を測らずに書いたのは、本文書の運用ルール 2 の違反例そのもの。
+#    見積りに使った「1 フィールド = 1 スロット」を一度も測っていなかった。)
+# axes: width=wNcls(5 fields as a field type) op=construct+read flow=straight budget=1
 # CLASSIFICATION: 1 正しい
 # CPython 3.14 expects: 1 5 / 6 10
 

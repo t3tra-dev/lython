@@ -1,7 +1,7 @@
 # probe: field rebind reached through with control flow; field type Other
 # axes: acquire=call width=w1obj op=rebind flow=with
 # CLASSIFICATION: 3 loud 拒否 (診断)
-#   loc(fused<{ly.source.end_col = 10 : i32, ly.source.end_line = 30 : i32, ly.source.start_col = 5 : i32, ly.source.start_line = 30 : i32}>["/Users/user/Desktop/dev/lython/.claude/worktrees/agent-a121ace38a4d2e6ff/tests/pro
+#   runtime manifest has no Ctx.__enter__ method
 # CPython 3.14 expects: 7
 
 class Other:

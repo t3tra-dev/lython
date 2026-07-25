@@ -1,7 +1,7 @@
 # probe: in-place mutation through self inside a method -- list field extend
 # axes: acquire=self width=w3list/w1dict op=extend flow=straight
 # CLASSIFICATION: 3 loud 拒否 (診断)
-#   loc(fused<{ly.source.end_col = 29 : i32, ly.source.end_line = 11 : i32, ly.source.start_col = 8 : i32, ly.source.start_line = 11 : i32}>["/Users/user/Desktop/dev/lython/.claude/worktrees/agent-a121ace38a4d2e6ff/tests/pro
+#   runtime bundle for '!py.contract<"types.NoneType">' has 3 values, but ABI expects 0
 # CPython 3.14 expects: 3 3
 
 class Box:

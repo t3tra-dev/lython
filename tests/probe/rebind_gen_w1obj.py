@@ -1,7 +1,7 @@
 # probe: field rebind -- receiver from a generator yield; field type Other
 # axes: acquire=gen width=w1obj op=rebind flow=straight
 # CLASSIFICATION: 3 loud 拒否 (診断)
-#   loc(fused<{ly.source.end_col = 14 : i32, ly.source.end_line = 35 : i32, ly.source.start_col = 9 : i32, ly.source.start_line = 35 : i32}>["/Users/user/Desktop/dev/lython/.claude/worktrees/agent-a121ace38a4d2e6ff/tests/pro
+#   source generator next lowering currently supports int yields
 # CPython 3.14 expects: 7
 
 class Other:

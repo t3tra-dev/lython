@@ -1,7 +1,7 @@
 # probe: in-place field mutation -- list field pop (shrink); receiver from container
 # axes: acquire=container width=w3list/w1dict op=pop flow=straight
 # CLASSIFICATION: 3 loud 拒否 (診断)
-#   /Users/user/Desktop/dev/lython/.claude/worktrees/agent-a121ace38a4d2e6ff/tests/probe/mutate_container_pop.py:18:0: emit error: static type !py.contract<"builtins.list", [!py.contract<"builtins.int">]> does not provide ma
+#   static type !py.contract<"builtins.list", [!py.contract<"builtins.int">]> does not provide manifest method 'pop'
 # CPython 3.14 expects: 0
 
 class Box:

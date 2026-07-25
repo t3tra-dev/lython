@@ -44,6 +44,19 @@ VERIFIER_RE = re.compile(
     r"Verifier failed|LLVM Translation failed|operand #\d+ does not dominate")
 ABORT_RE = re.compile(r"non-positive refcount|Assertion|GuardMalloc.*freed|"
                       r"double free|PrintStackTrace")
+# An MLIR diagnostic is `loc(fused<...hundreds of chars...>[...]): error: msg`.
+# The location has to come off BEFORE the note is truncated, or the truncation
+# budget is spent on the location and the message is the part that gets cut.
+MLIR_LOC = re.compile(r"^.*?\berror:\s*")
+
+
+def diagnostic(stderr):
+    """The first real diagnostic message in `stderr`, location stripped."""
+    for line in stderr.splitlines():
+        if "error" in line.lower():
+            return MLIR_LOC.sub("", line, count=1).strip()[:300]
+    tail = stderr.strip().splitlines()
+    return tail[-1][:300] if tail else ""
 
 
 def run(cmd, env_extra=None, timeout=300.0):
@@ -94,8 +107,7 @@ def classify(lyc, case):
             rec["note"] = f"cpython raised {cpy_ty!r}, lyc raised {ly_ty!r}"
             return case.name, rec
         rec["cls"] = "VERIFY" if VERIFIER_RE.search(ly_err) else "LOUD"
-        errs = [l for l in ly_err.splitlines() if "error" in l.lower()]
-        rec["note"] = (errs[0] if errs else (ly_err.strip().splitlines() or [""])[-1])[:300]
+        rec["note"] = diagnostic(ly_err)
         return case.name, rec
 
     if cpy_rc != 0:

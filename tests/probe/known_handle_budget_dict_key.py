@@ -1,7 +1,7 @@
 # probe: REPORTED loud (budget 5): a 2-int NamedTuple-shaped class as a dict key
 # axes: width=wNcls op=dict-key flow=straight
 # CLASSIFICATION: 3 loud 拒否 (診断)
-#   /Users/user/Desktop/dev/lython/.claude/worktrees/agent-a121ace38a4d2e6ff/tests/probe/known_handle_budget_dict_key.py:15:15: emit error: isinstance on an object-typed value requires dynamic object inspection, which is exc
+#   isinstance on an object-typed value requires dynamic object inspection, which is excluded from the static evidence kernel
 # CPython 3.14 expects: 3
 
 class Pair:
