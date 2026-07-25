@@ -43,12 +43,13 @@ CPY = "/opt/homebrew/Frameworks/Python.framework/Versions/3.14/bin/python3.14"
 # Cases known to disagree with CPython because the method has no implementation
 # behind its declared name. Measured on c3de5e7 (10 of 215).
 #
-# TREE-RELATIVE. All ten are the call forms of the six methods implemented on
-# kernel/side-defects (a4be8bf) -- list.pop, list.insert, and tuple.__add__,
-# __mul__, count, index -- so on any tree containing that branch the correct
-# contents of this set is empty. Do not carry it forward: the run will tell you,
-# because a case here that starts agreeing is reported as a stale expectation
-# and fails the gate.
+# TREE-RELATIVE, and known to be empty on one existing branch. All ten are call
+# forms of the six methods implemented on kernel/side-defects (a4be8bf) --
+# list.pop, list.insert, and tuple.__add__, __mul__, count, index. That branch
+# reports 0 failing of 215 on the full run, measured there rather than inferred
+# here, so once it merges the correct contents of this set is EMPTY. Do not
+# carry it forward; the run will say so, because a case here that starts
+# agreeing is reported as a stale expectation and fails the gate.
 EXPECTED_FAILURES = frozenset({
     "list.pop",
     "list.pop(i)",
