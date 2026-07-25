@@ -1,0 +1,13 @@
+-4.0 0.5
+-4.0 0.5
+-4.0 -0.5
+-8 -7.5 -2
+-4.0 0.5 -8 -7.5
+-4.0 0.5
+4 0 6 True False
+18
+4 3 True 4 1
+truediv division by zero
+floordiv division by zero
+mod division by zero
+container division by zero
