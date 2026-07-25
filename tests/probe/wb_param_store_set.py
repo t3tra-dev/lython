@@ -1,6 +1,6 @@
 # probe: callee stores into a borrowed receiver's set[int] field; caller reads it back
 # axes: acquire=param width=set op=rebind flow=straight observe=writeback
-# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
+# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
 # CPython 3.14 expects: 2
 
 class Box:

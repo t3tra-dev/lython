@@ -1,8 +1,8 @@
 # probe: control for nested_field_grow_call.py -- same program, receiver built
 # in this frame instead of returned by a factory
 # axes: acquire=inline width=w3list op=nested-append flow=straight
-# CLASSIFICATION: 1 正しい
-# CPython 3.14 expects: [1, 2] then [1, 2, 3]
+# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
+# CPython 3.14 expects: [1, 2] / [1, 2, 3]
 #
 # The reason this file exists: without it the abort in nested_field_grow_call.py
 # could be read as "growing a list one level down is unimplemented". It is not

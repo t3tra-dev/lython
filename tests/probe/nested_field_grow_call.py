@@ -1,8 +1,8 @@
 # probe: grow a list that lives ONE LEVEL DOWN a call-derived instance
 # axes: acquire=call width=w3list op=nested-append flow=straight
-# CLASSIFICATION: 4 クラッシュ / abort
-#   'repr: boxed element has no conforming __repr__' のあと SIGABRT
-# CPython 3.14 expects: [1, 2] then [1, 2, 3]
+# CLASSIFICATION @ kernel/integration 935280d: 4 クラッシュ / abort
+#   signal 6;
+# CPython 3.14 expects: [1, 2] / [1, 2, 3]
 #
 # PRE-EXISTING, not a stage-4a regression: identical failure on main at ed6a798.
 # No probe reached it because the rebind family stores INTO a field and the

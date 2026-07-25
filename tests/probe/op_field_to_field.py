@@ -1,6 +1,6 @@
 # probe: a field is rebound to the value read out of another object's field (shared value)
 # axes: acquire=call width=w3list op=field-to-field flow=straight
-# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
+# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
 # CPython 3.14 expects: 3 3
 
 class Box:

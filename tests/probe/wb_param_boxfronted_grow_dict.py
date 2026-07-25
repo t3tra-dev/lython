@@ -3,7 +3,7 @@
 #   が安定なら見えるはずだが、payload の realloc がレーンを stale にするなら
 #   崩れる。照会 B の「安定スロットだけで足りるか」の判定材料。
 # axes: acquire=param width=w1dict(box-fronted) op=inplace-insert flow=straight observe=writeback
-# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
+# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
 # CPython 3.14 expects: 3 3
 
 

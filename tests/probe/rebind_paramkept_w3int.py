@@ -1,6 +1,6 @@
 # probe: field rebind -- receiver is a borrowed parameter, observed by the caller after return; field type int
 # axes: acquire=paramkept width=w3int op=rebind flow=straight
-# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
+# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
 # CPython 3.14 expects: 123456
 
 class Box:

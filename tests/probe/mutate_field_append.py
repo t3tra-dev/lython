@@ -1,6 +1,6 @@
 # probe: in-place field mutation -- list field append (grow, may reallocate); receiver from field
 # axes: acquire=field width=w3list/w1dict op=append flow=straight
-# CLASSIFICATION @ kernel/4a 6c328b5: 3 loud 拒否 (診断)
+# CLASSIFICATION @ kernel/integration 935280d: 3 loud 拒否 (診断)
 #   owned resource from @LyLong_Repr result 0 is released or transferred more than once on one CFG path
 # CPython 3.14 expects: 2 10 20
 

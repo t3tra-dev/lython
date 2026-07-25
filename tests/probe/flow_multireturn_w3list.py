@@ -1,6 +1,6 @@
 # probe: field rebind reached through multireturn control flow; field type list[int]
 # axes: acquire=call width=w3list op=rebind flow=multireturn
-# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
+# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
 # CPython 3.14 expects: 2 / 3 / 2
 
 class Box:

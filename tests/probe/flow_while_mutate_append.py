@@ -1,6 +1,6 @@
 # probe: in-place field mutation inside a while loop (append)
 # axes: acquire=call width=w3list/w1dict op=append flow=while
-# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
+# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
 # CPython 3.14 expects: 3
 
 class Box:

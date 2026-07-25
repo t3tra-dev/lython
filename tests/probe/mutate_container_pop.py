@@ -1,7 +1,6 @@
 # probe: in-place field mutation -- list field pop (shrink); receiver from container
 # axes: acquire=container width=w3list/w1dict op=pop flow=straight
-# CLASSIFICATION @ kernel/4a 6c328b5: 3 loud 拒否 (診断)
-#   static type !py.contract<"builtins.list", [!py.contract<"builtins.int">]> does not provide manifest method 'pop'
+# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
 # CPython 3.14 expects: 0
 
 class Box:

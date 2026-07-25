@@ -1,6 +1,6 @@
 # probe: REPORTED loud (budget 5): a 3-field class used as a list element
 # axes: width=wNcls op=store-into-container flow=straight
-# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
+# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
 # CPython 3.14 expects: 1 2 3
 
 class Three:

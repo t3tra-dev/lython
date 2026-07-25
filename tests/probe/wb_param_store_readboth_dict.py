@@ -1,6 +1,6 @@
 # probe: callee stores into and reads back a borrowed receiver's dict[str, int] field, then the caller reads it
 # axes: acquire=param width=dict op=rebind flow=straight observe=writeback-both
-# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
+# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
 # CPython 3.14 expects: in callee: 1 / in caller: 1
 
 class Box:

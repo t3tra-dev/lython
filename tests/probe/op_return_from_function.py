@@ -1,6 +1,6 @@
 # probe: a function rebinds a field of an object it created and returns that object
 # axes: acquire=inline width=w3list op=return-from-function flow=straight
-# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
+# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
 # CPython 3.14 expects: 3
 
 class Box:

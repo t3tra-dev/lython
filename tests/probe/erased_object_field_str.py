@@ -9,7 +9,7 @@
 #   k-4a の指摘で追加 (probe 集合にこの形が 1 件も無かった)。
 #   対照は `erased_object_field_int.py` (int payload = c3de5e7 では正しく動く)。
 # axes: width=object(erased, str payload) op=field flow=straight
-# CLASSIFICATION @ kernel/4a 6c328b5: 3 loud 拒否 (診断)
+# CLASSIFICATION @ kernel/integration 935280d: 3 loud 拒否 (診断)
 #   a type-erased `object` value cannot be stored in field 'class.v'; annotate the field with the concrete type it holds
 # CPython 3.14 expects: ab
 

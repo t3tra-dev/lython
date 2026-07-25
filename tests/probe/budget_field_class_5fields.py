@@ -14,7 +14,7 @@
 #   (この予測を測らずに書いたのは、本文書の運用ルール 2 の違反例そのもの。
 #    見積りに使った「1 フィールド = 1 スロット」を一度も測っていなかった。)
 # axes: width=wNcls(5 fields as a field type) op=construct+read flow=straight budget=1
-# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
+# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
 # CPython 3.14 expects: 1 5 / 6 10
 
 

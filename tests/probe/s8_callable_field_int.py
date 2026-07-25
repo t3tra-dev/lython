@@ -4,7 +4,7 @@
 #   native int 経路に落ちるかどうかで診断が変わる。
 #   (出典: kernel-sidedefects)
 # axes: width=callable(int) op=field flow=straight
-# CLASSIFICATION @ kernel/4a 6c328b5: 3 loud 拒否 (診断)
+# CLASSIFICATION @ kernel/integration 935280d: 3 loud 拒否 (診断)
 #   function target 'make__lyrt_prim_i64' returned too few values for result object ABI
 # CPython 3.14 expects: 7
 

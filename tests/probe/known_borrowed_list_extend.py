@@ -1,6 +1,6 @@
 # probe: borrowed list extend (grow)
 # axes: acquire=param width=w3list op=extend flow=straight
-# CLASSIFICATION @ kernel/4a 6c328b5: 3 loud 拒否 (診断)
+# CLASSIFICATION @ kernel/integration 935280d: 3 loud 拒否 (診断)
 #   borrowed entry argument 0 of @put is released or transferred without a prior retain
 # CPython 3.14 expects: 3
 
