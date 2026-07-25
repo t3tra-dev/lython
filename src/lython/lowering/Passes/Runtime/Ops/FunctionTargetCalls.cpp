@@ -377,6 +377,12 @@ mlir::LogicalResult RuntimeBundleLowerer::emitPrimitiveI64CloneFallbackResult(
   auto ifOp = mlir::scf::IfOp::create(builder, loc, ifResultTypes,
                                       (*cloneCall).getResult(1),
                                       /*withElseRegion=*/true);
+  // The else region RE-RUNS the original, so this shape is only sound if the
+  // clone cannot report valid=false. That is a property of the clone's lowered
+  // returns, which do not exist yet; foldUnprovenPrimitiveI64Speculations
+  // revisits every op carrying this marker once they do.
+  ifOp->setAttr(kPrimitiveI64SpeculationAttr,
+                mlir::FlatSymbolRefAttr::get(context, clone.getSymName()));
 
   builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
   RuntimeBundle fastObject;

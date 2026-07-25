@@ -82,15 +82,14 @@ struct RuntimePrimitiveI64Evidence {
   mlir::Value valid;
 };
 
-// True only when the fast lane's validity flag is a compile-time true (a
-// constant, possibly behind and-chains). A runtime flag means the boxed
-// payload is authoritative and the lane word may be a stale placeholder —
-// consuming it unconditionally is a silent mis-execution.
-inline bool primitiveI64LaneKnownValid(
-    const std::optional<RuntimePrimitiveI64Evidence> &evidence) {
-  if (!evidence || !evidence->value || !evidence->valid)
+// True only for i1 values pinned to 1 at compile time: constants and
+// conjunctions of them. Deliberately syntactic rather than a dataflow solver —
+// everything it cannot see through is reported as "may be false", which costs
+// speed, never correctness.
+inline bool isPinnedTrueFlag(mlir::Value value) {
+  if (!value)
     return false;
-  llvm::SmallVector<mlir::Value, 4> pending{evidence->valid};
+  llvm::SmallVector<mlir::Value, 4> pending{value};
   while (!pending.empty()) {
     mlir::Value current = pending.pop_back_val();
     mlir::Operation *def = current.getDefiningOp();
@@ -109,6 +108,15 @@ inline bool primitiveI64LaneKnownValid(
     return false;
   }
   return true;
+}
+
+// True only when the fast lane's validity flag is a compile-time true. A
+// runtime flag means the boxed payload is authoritative and the lane word may
+// be a stale placeholder — consuming it unconditionally is a silent
+// mis-execution.
+inline bool primitiveI64LaneKnownValid(
+    const std::optional<RuntimePrimitiveI64Evidence> &evidence) {
+  return evidence && evidence->value && isPinnedTrueFlag(evidence->valid);
 }
 
 // Buffer evidence is the lowered counterpart of Python's buffer protocol. It
@@ -278,6 +286,12 @@ struct CallableLogicalEntryArgs {
 // object types.
 inline constexpr llvm::StringLiteral kPrimitiveI64CloneAttr{
     "ly.primitive_i64_clone"};
+// Marks the scf.if that speculates a primitive-i64 clone call and recovers a
+// `valid=false` answer by re-running the boxed original. Consumed (and, unless
+// the clone is provably total, folded away) by
+// foldUnprovenPrimitiveI64Speculations.
+inline constexpr llvm::StringLiteral kPrimitiveI64SpeculationAttr{
+    "ly.primitive_i64_speculation"};
 inline constexpr llvm::StringLiteral kProtocolTemplateAttr{
     "ly.protocol_template"};
 inline constexpr llvm::StringLiteral kProtocolSpecializationAttr{

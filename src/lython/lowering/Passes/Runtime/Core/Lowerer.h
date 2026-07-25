@@ -217,6 +217,16 @@ private:
   mlir::LogicalResult eraseCallableProtocolTemplateFunctions();
   bool isPrimitiveI64CallableClone(mlir::func::FuncOp function) const;
   bool isPrimitiveI64CallableEligible(mlir::func::FuncOp function) const;
+  // Records that the clone containing `op` just made a decision from a raw
+  // lane whose validity bit was not statically true, so every `valid` it
+  // returns from here on must be forced to false.
+  void poisonPrimitiveI64CloneSpeculation(mlir::Operation *op,
+                                          mlir::Value stillValid);
+  // Null unless the enclosing clone was poisoned somewhere; otherwise an i1
+  // that is true only if the raw lane is still trustworthy.
+  mlir::Value primitiveI64CloneSpeculationIntact(mlir::Operation *op,
+                                                 mlir::func::FuncOp clone);
+  mlir::LogicalResult foldUnprovenPrimitiveI64Speculations();
   std::optional<std::string> primitiveI64CloneFor(llvm::StringRef target) const;
   mlir::LogicalResult seedPrimitiveI64CallableEntryArgumentBundles(
       mlir::func::FuncOp function, mlir::ArrayRef<mlir::Type> logicalTypes);
@@ -1302,6 +1312,10 @@ private:
   llvm::StringMap<CallableArgumentEvidenceABI> callableArgumentEvidenceABIs;
   llvm::StringMap<CallableAggregateEvidenceABI> callableAggregateEvidenceABIs;
   llvm::StringMap<std::string> primitiveI64CallableClones;
+  // Per-clone `memref<1xi64>` slot holding 1 while the clone's raw lane still
+  // tracks the true Python values, 0 once some step discarded a validity bit.
+  llvm::DenseMap<mlir::Operation *, mlir::Value>
+      primitiveI64CloneSpeculationFlags;
   llvm::StringMap<std::int64_t> functionTargetIds;
   llvm::DenseMap<mlir::Block *, std::int64_t> tryHandlerIds;
   llvm::SmallVector<CallableLogicalEntryArgs, 8> callableLogicalEntryArgCounts;

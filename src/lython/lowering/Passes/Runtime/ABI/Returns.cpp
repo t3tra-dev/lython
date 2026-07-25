@@ -258,6 +258,21 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
           operands.push_back(integerConstant(
               builder, op.getLoc(), builder.getI1Type(), 0));
         }
+        // Any step inside this clone that had to decide from a raw lane whose
+        // validity was not statically true left the raw lane untrustworthy;
+        // the honest answer is valid=false so the call site re-runs the boxed
+        // original instead of trusting this raw value.
+        if (primitiveI64CloneSpeculationFlags.count(function.getOperation())) {
+          // Operand bundling above may have dangled the saved iterator (see
+          // the re-anchor below the loop); re-anchor before emitting.
+          builder.setInsertionPoint(op);
+          if (mlir::Value intact =
+                  RuntimeBundleLowerer::primitiveI64CloneSpeculationIntact(
+                      op.getOperation(), function))
+            operands.back() = mlir::arith::AndIOp::create(
+                                  builder, op.getLoc(), operands.back(), intact)
+                                  .getResult();
+        }
         if (mlir::failed(releaseReturnedObjectIfOwned(*bundle))) {
           result = mlir::failure();
           return mlir::WalkResult::interrupt();
