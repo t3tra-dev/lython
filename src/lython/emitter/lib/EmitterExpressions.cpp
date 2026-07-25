@@ -675,11 +675,38 @@ Value ModuleEmitter::emitCompare(const parser::Node &expr) {
         builder, loc(expr), types.literal("False"), builder.getBoolAttr(false));
     return {op.getResult(), types.literal("False")};
   }
-  Value rhs = emitExpr(comparators->front().get());
-  const parser::Node *op = ops && !ops->empty() ? ops->front().get() : nullptr;
-  if (std::optional<Value> optional = emitOptionalCompare(expr, lhs, rhs, op))
-    return *optional;
-  return emitScalarCompare(expr, lhs, rhs, op);
+  // A chained comparison (`lo <= x <= hi`) is the conjunction of its adjacent
+  // pairs, with each operand evaluated ONCE — the middle operand is the rhs of
+  // one pair and the lhs of the next. Only the first pair used to be emitted,
+  // so `48 <= ord(c) <= 57` silently answered `48 <= ord(c)`.
+  //
+  // Why not desugar to `a op b and b op c` and reuse the short-circuiting
+  // BoolOp path: that AST rewrite duplicates the middle operand, and
+  // evaluating it twice breaks the once-only guarantee that CPython does make
+  // — a stronger property than not evaluating the trailing comparators at all.
+  // So the pairs are emitted eagerly and their truth bits ANDed.
+  Value result{};
+  for (std::size_t index = 0; index < comparators->size(); ++index) {
+    Value rhs = emitExpr((*comparators)[index].get());
+    const parser::Node *op =
+        ops && index < ops->size() ? (*ops)[index].get() : nullptr;
+    std::optional<Value> optional = emitOptionalCompare(expr, lhs, rhs, op);
+    Value pairwise = optional ? *optional : emitScalarCompare(expr, lhs, rhs, op);
+    if (index == 0) {
+      result = pairwise;
+    } else {
+      mlir::Value carried = emitBoolValue(result, expr);
+      mlir::Value current = emitBoolValue(pairwise, expr);
+      mlir::Value both =
+          mlir::arith::AndIOp::create(builder, loc(expr), carried, current)
+              .getResult();
+      auto pyBool =
+          py::CastFromPrimOp::create(builder, loc(expr), types.boolType(), both);
+      result = Value{pyBool.getResult(), types.boolType()};
+    }
+    lhs = rhs;
+  }
+  return result;
 }
 
 Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
