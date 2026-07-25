@@ -3,6 +3,8 @@
 #include "ExceptionTaxonomy.h"
 #include "Runtime/ABI/BoxLayout.h"
 
+#include "mlir/Dialect/SCF/IR/SCF.h"
+
 namespace py::lowering {
 
 namespace {
@@ -27,14 +29,61 @@ bool isMethodDescriptorKind(py::AttrGetOp op) {
          value == "classmethod";
 }
 
-std::optional<unsigned> primitiveI64FieldSlot(mlir::Type fieldType,
-                                              unsigned fieldIndex) {
-  if (runtimeContractName(fieldType) != "builtins.int")
+// int and bool are the contracts whose whole value fits in one i64, so their
+// field storage IS an instance-header word — a heap slot every frame holding
+// the instance reaches through the same pointer. Words [0, 4) are the header's
+// own (refcount, class id, value count), so field i takes word 4 + i and a
+// class with more than kPrimitiveFieldSlotLimit - kPrimitiveFieldSlotBase of
+// them falls back to the contract's own lanes.
+std::optional<unsigned> primitiveFieldSlot(mlir::Type fieldType,
+                                           unsigned fieldIndex) {
+  std::string contract = runtimeContractName(fieldType);
+  if (contract != "builtins.int" && contract != "builtins.bool")
     return std::nullopt;
   unsigned slot = kPrimitiveFieldSlotBase + fieldIndex;
   if (slot >= kPrimitiveFieldSlotLimit)
     return std::nullopt;
   return slot;
+}
+
+bool isBoolFieldType(mlir::Type fieldType) {
+  return runtimeContractName(fieldType) == "builtins.bool";
+}
+
+// Does this field read feed an IN-PLACE MUTATION of the value it loaded?
+//
+// A read should take its own reference -- CPython's does, and without one
+// `old = o.f; o.f = fresh` leaves `old` naming storage the rebind released. But
+// a mutation primitive spells in-place mutation as "consume the container and
+// hand back another one" (`transfer_args = [0]`), so a reader that also holds a
+// token has two claims on one reference and the release of the pre-mutation
+// lanes is rejected -- and inside a loop the lane advance cannot bridge them,
+// because the re-root is not ordered against the loop-carried uses. Until 4b
+// rewrites those primitives to non-transfer contracts, a read that is about to
+// be mutated stays pinned to the slot instead, which is what it was before.
+//
+// Syntactic on purpose: it asks what the read is FOR, at the one point where
+// both the load and its uses are visible, rather than guessing from the
+// contract (`list`/`dict`/`set` also get read purely to be observed).
+bool fieldReadFeedsInPlaceMutation(mlir::Value read) {
+  for (mlir::Operation *user : read.getUsers()) {
+    if (auto setItem = mlir::dyn_cast<py::SetItemOp>(user))
+      if (setItem.getContainer() == read)
+        return true;
+    if (auto delItem = mlir::dyn_cast<py::DelItemOp>(user))
+      if (delItem.getContainer() == read)
+        return true;
+    // A method call reaches its receiver through an attr.get, and whether the
+    // method mutates is not known here: treat any method lookup on the loaded
+    // value as a possible mutation. A nested FIELD read (`t.m.i`) is not one.
+    if (auto attrGet = mlir::dyn_cast<py::AttrGetOp>(user)) {
+      auto kind = attrGet->getAttrOfType<mlir::StringAttr>("ly.attr.kind");
+      if (attrGet.getObject() == read &&
+          !(kind && kind.getValue() == "field"))
+        return true;
+    }
+  }
+  return false;
 }
 
 std::optional<mlir::Attribute> classStaticValue(py::ClassOp classOp,
@@ -87,7 +136,7 @@ mlir::FailureOr<unsigned> RuntimeBundleLowerer::classFieldValueOffset(
   for (unsigned index = 0; index < fieldIndex; ++index) {
     mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> valueTypes =
         RuntimeBundleLowerer::classFieldStorageValueTypes(op, fieldTypes[index],
-                                                          purpose);
+                                                          index, purpose);
     if (mlir::failed(valueTypes))
       return mlir::failure();
     offset += static_cast<unsigned>(valueTypes->size());
@@ -100,13 +149,22 @@ bool RuntimeBundleLowerer::classFieldStoredBoxed(
   // runtimeShapeContractName returns by value; a StringRef binding would
   // dangle past this declaration statement.
   std::string contractName = runtimeShapeContractName(fieldContract);
-  // str joins dict here because inline (ptr, len) field words go stale the
-  // moment a rebind replaces them: a dict/set key box or a runtime-method
-  // snapshot captured the OLD words at insert time, so lookups compared a
-  // freed payload (silent mis-eq) and teardown released it twice. The box16
-  // slot is the instance-lifetime stable handle those snapshots may borrow.
-  return contractName == "builtins.object" || contractName == "builtins.dict" ||
-         contractName == "builtins.str";
+  // A union-typed field has no single contract: its tag plus every member's
+  // lanes stay inline, because the box words hold ONE payload handle and a
+  // union is not one object.
+  if (contractName.empty())
+    return false;
+  // Zero-lane contracts have nothing that could go stale. Adding a box would
+  // be an allocation whose only content is the absence of a value.
+  if (contractName == "types.NoneType")
+    return false;
+  // int/bool are the two contracts whose value is stored IN the instance
+  // header (primitiveFieldSlot), which is already a stable heap slot; their
+  // contract lanes are a placeholder the store never reads. Boxing them would
+  // add a second storage for the same field and force the load to choose.
+  if (contractName == "builtins.int" || contractName == "builtins.bool")
+    return false;
+  return true;
 }
 
 // Swaps the payload held by an existing box16 slot without re-rooting the
@@ -129,6 +187,17 @@ RuntimeBundleLowerer::storeBoxedFieldPayloadInPlace(mlir::Operation *op,
       RuntimeBundleLowerer::materializePayloadObjectBundle(op, value);
   if (mlir::failed(payload))
     return mlir::failure();
+  // The slot holds a canonical payload handle, so the value needs a concrete
+  // shape to describe. `objectPayloadHandleWords` refuses an erased `object`
+  // below, but its message is written for a container element; say it in terms
+  // of the field, which is what the author wrote.
+  if (const RuntimeBundle *concrete =
+          RuntimeBundleLowerer::concreteObjectForOwnership(*payload))
+    if (concrete->contractName() == "builtins.object")
+      return op->emitError()
+             << "a type-erased `object` value cannot be stored in field '"
+             << slotName
+             << "'; annotate the field with the concrete class it holds";
   if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(op, *payload,
                                                              slotName)))
     return mlir::failure();
@@ -149,8 +218,40 @@ RuntimeBundleLowerer::storeBoxedFieldPayloadInPlace(mlir::Operation *op,
     releaseOperand =
         mlir::memref::CastOp::create(builder, loc, expectedBox, releaseOperand)
             .getResult();
-  mlir::func::CallOp::create(builder, loc, releaseBoxed,
-                             mlir::ValueRange{releaseOperand});
+  // A SELF-store (`ks = self._kids; ks.append(v); self._kids = ks`) stores the
+  // object the box already holds. Its reference must not be given up: the
+  // in-place mutation primitive reallocated arrays but created no new
+  // reference, so the box's single reference is the only one there is, and
+  // releasing it here plus the caller's release of the "owned" result drops it
+  // to zero while the program still reads through it.
+  //
+  // Decided at RUNTIME by comparing the payload's header pointer rather than by
+  // following SSA transfers, because that relation is only visible while the
+  // producer is in this frame: an inlined method exposes it and the same method
+  // reached through a call does not, so a static test would make correctness
+  // depend on an inlining decision. Word 2 is zero on the constructor's
+  // placeholder, so a first store always takes the release branch (where the
+  // owned flag makes it a no-op).
+  context->loadDialect<mlir::scf::SCFDialect>();
+  mlir::Value payloadWordSlot =
+      mlir::arith::ConstantIndexOp::create(builder, loc, 2).getResult();
+  mlir::Value heldPayload =
+      mlir::memref::LoadOp::create(builder, loc, box, payloadWordSlot)
+          .getResult();
+  mlir::Value replaces =
+      mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::ne,
+                                  heldPayload, (*words)[2])
+          .getResult();
+  auto releaseIf = mlir::scf::IfOp::create(builder, loc, mlir::TypeRange{},
+                                           replaces,
+                                           /*withElseRegion=*/false);
+  {
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(&releaseIf.getThenRegion().front());
+    mlir::func::CallOp::create(builder, loc, releaseBoxed,
+                               mlir::ValueRange{releaseOperand});
+  }
+  builder.setInsertionPointAfter(releaseIf);
   for (auto [wordIndex, word] : llvm::enumerate(*words)) {
     mlir::Value slot = mlir::arith::ConstantIndexOp::create(
         builder, loc, static_cast<std::int64_t>(wordIndex));
@@ -161,10 +262,115 @@ RuntimeBundleLowerer::storeBoxedFieldPayloadInPlace(mlir::Operation *op,
   return stored;
 }
 
+mlir::LogicalResult RuntimeBundleLowerer::storePrimitiveFieldSlot(
+    mlir::Operation *op, const RuntimeBundle &object,
+    const RuntimeBundle &value, mlir::Type fieldType, unsigned fieldIndex,
+    llvm::StringRef fieldName) {
+  std::optional<unsigned> slot = primitiveFieldSlot(fieldType, fieldIndex);
+  if (!slot)
+    return op->emitError() << "field '" << fieldName << "' of " << fieldType
+                           << " has no instance header word";
+  builder.setInsertionPoint(op);
+  mlir::Location loc = op->getLoc();
+  mlir::Value word;
+  if (isBoolFieldType(fieldType)) {
+    if (value.physicalValues().size() != 1 ||
+        !value.physicalValues().front().getType().isInteger(1))
+      return op->emitError() << "attribute value " << value.contractName()
+                             << " has no i1 lane for bool field '" << fieldName
+                             << "'";
+    word = mlir::arith::ExtUIOp::create(builder, loc, builder.getI64Type(),
+                                        value.physicalValues().front())
+               .getResult();
+  } else if (primitiveI64LaneKnownValid(value.primitiveI64)) {
+    word = value.primitiveI64->value;
+  } else if (value.physicalValues().empty() && value.primitiveI64 &&
+             value.primitiveI64->value) {
+    // No boxed payload to fall back to (primitive-i64 clone lanes carry only
+    // the (value, valid) pair): the lane is the sole carrier.
+    word = value.primitiveI64->value;
+  } else {
+    std::optional<RuntimeSymbol> unbox =
+        manifest.primitive(value.contractName(), "unbox.i64");
+    if (!unbox)
+      return op->emitError() << "attribute value " << value.contractName()
+                             << " has no unbox.i64 primitive for field '"
+                             << fieldName << "'";
+    llvm::SmallVector<const RuntimeBundle *, 1> unboxSources{&value};
+    llvm::SmallVector<mlir::Value, 4> unboxOperands;
+    if (mlir::failed(buildRuntimeCallOperands(op, *unbox, unboxSources,
+                                              unboxOperands,
+                                              /*allowUnusedSources=*/false)))
+      return mlir::failure();
+    mlir::func::CallOp unboxCall =
+        RuntimeBundleLowerer::createRuntimeCall(loc, *unbox, unboxOperands);
+    if (unboxCall.getNumResults() != 1 ||
+        !unboxCall.getResult(0).getType().isInteger(64))
+      return unbox->function.emitError()
+             << "unbox.i64 primitive must return one i64";
+    word = unboxCall.getResult(0);
+  }
+
+  mlir::FailureOr<mlir::Value> header =
+      RuntimeBundleLowerer::objectPhysicalHeader(op, object.objectValue);
+  if (mlir::failed(header))
+    return mlir::failure();
+  mlir::Value slotIndex =
+      mlir::arith::ConstantIndexOp::create(builder, loc, *slot).getResult();
+  mlir::memref::StoreOp::create(builder, loc, word, *header, slotIndex);
+  return mlir::success();
+}
+
+// Re-describes the payload a box already owns, for an in-place mutation that
+// REALLOCATED its arrays (list.append, dict insert). Only the descriptor words
+// move: the payload is the same logical object, the box holds the same single
+// reference to it, and the box pointer never changed — so no retain, no
+// release, and above all no re-root of the instance's lanes. Releasing the
+// box's old payload here would hand the deallocator storage the mutation
+// primitive already freed.
+mlir::LogicalResult RuntimeBundleLowerer::updateBoxedFieldPayloadWords(
+    mlir::Operation *op, mlir::Value box, const RuntimeBundle &payload,
+    llvm::StringRef slotName) {
+  if (!mlir::isa<mlir::MemRefType>(box.getType()))
+    return op->emitError() << slotName << " box-fronted slot is not a box16 "
+                           << "lane, got " << box.getType();
+  const RuntimeBundle *concrete =
+      RuntimeBundleLowerer::concreteObjectForOwnership(payload);
+  if (!concrete || concrete->kind != RuntimeBundle::Kind::Object)
+    return op->emitError() << slotName << " write-back needs an object bundle";
+  if (concrete->physicalValues().empty())
+    return mlir::success();
+  builder.setInsertionPoint(op);
+  mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
+      RuntimeBundleLowerer::objectPayloadHandleWords(op, *concrete,
+                                                    /*ownsPayload=*/true);
+  if (mlir::failed(words))
+    return mlir::failure();
+  mlir::Location loc = op->getLoc();
+  // Words 0 and 14 (refcount, owned flag) are the box's own bookkeeping and
+  // must survive: rewriting them would reset a reference count the program is
+  // still using. Everything from word 1 up describes the payload.
+  for (unsigned index = 1; index < words->size(); ++index) {
+    if (index == static_cast<unsigned>(box_abi::kOwnedFlagWord))
+      continue;
+    mlir::Value slot = mlir::arith::ConstantIndexOp::create(
+        builder, loc, static_cast<std::int64_t>(index));
+    mlir::memref::StoreOp::create(builder, loc, (*words)[index], box, slot);
+  }
+  return mlir::success();
+}
+
 mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>>
 RuntimeBundleLowerer::classFieldStorageValueTypes(
-    mlir::Operation *op, mlir::Type fieldContract,
+    mlir::Operation *op, mlir::Type fieldContract, unsigned fieldIndex,
     llvm::StringRef purpose) const {
+  // A header-word field occupies NO lane: the word IS the storage. It used to
+  // carry the contract's full expansion as a placeholder nothing ever read --
+  // three memrefs allocated and released per int field per instance -- which
+  // also made a class of four int fields expand to thirteen handles and so too
+  // wide to sit in another class's box.
+  if (primitiveFieldSlot(fieldContract, fieldIndex))
+    return llvm::SmallVector<mlir::Type, 8>{};
   if (classFieldStoredBoxed(fieldContract)) {
     const RuntimeValueShape *objectShape =
         manifest.valueShape("builtins.object");
@@ -213,6 +419,30 @@ RuntimeBundleLowerer::writeBackFieldAlias(mlir::Operation *op,
   if (*fieldIndex >= fieldTypes.size())
     return op->emitError() << "class field metadata is malformed for "
                            << classOp.getSymName();
+  mlir::FailureOr<unsigned> offset =
+      RuntimeBundleLowerer::classFieldValueOffset(op, classOp, *fieldIndex,
+                                                  "field alias writeback ABI");
+  if (mlir::failed(offset))
+    return mlir::failure();
+
+  // A box-fronted field's write-back is a WORD UPDATE, not a re-root. The
+  // mutation reallocated the payload's arrays, so the box's descriptor words
+  // have to name the new ones; the box pointer, the box's reference, and the
+  // instance's lanes are all unchanged. Nothing here needs the owned-local
+  // marker republished — which is the whole reason the marker existed on this
+  // path, and why re-rooting a field alias inside a branch used to produce a
+  // value that did not dominate the later read.
+  if (RuntimeBundleLowerer::classFieldStoredBoxed(fieldTypes[*fieldIndex])) {
+    if (*offset >= ownerBundle.objectValue.values.size())
+      return op->emitError() << "field alias update exceeds owner payload";
+    if (mlir::failed(RuntimeBundleLowerer::updateBoxedFieldPayloadWords(
+            op, ownerBundle.objectValue.values[*offset], updatedField,
+            updatedField.fieldAliasName)))
+      return mlir::failure();
+    valueBundles[updatedField.fieldAliasOwner] = std::move(ownerBundle);
+    return mlir::success();
+  }
+
   mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> fieldValueTypes =
       RuntimeBundleLowerer::runtimeValueTypesFor(op, fieldTypes[*fieldIndex],
                                                  "field alias writeback ABI");
@@ -223,58 +453,11 @@ RuntimeBundleLowerer::writeBackFieldAlias(mlir::Operation *op,
                            << updatedField.physicalValues().size()
                            << " physical values, but field expects "
                            << fieldValueTypes->size();
-  mlir::FailureOr<unsigned> offset =
-      RuntimeBundleLowerer::classFieldValueOffset(op, classOp, *fieldIndex,
-                                                  "field alias writeback ABI");
-  if (mlir::failed(offset))
-    return mlir::failure();
   if (*offset + fieldValueTypes->size() > ownerBundle.objectValue.values.size())
     return op->emitError() << "field alias update exceeds owner payload";
   for (auto [index, replacement] :
        llvm::enumerate(updatedField.physicalValues()))
     ownerBundle.objectValue.values[*offset + index] = replacement;
-
-  // An owned local's release must see the updated representation (a mutation
-  // may have reallocated the field's storage): re-root the owned-local marker
-  // over the new value set. The old marker keeps flowing as a plain identity
-  // cast; the ownership attributes move so the local roots exactly once.
-  if (!ownerBundle.objectValue.values.empty()) {
-    mlir::Value front = ownerBundle.objectValue.values.front();
-    // The owned-local marker is a PARALLEL view: the bundle may hold the raw
-    // construction values while the marker cast wraps them for the release
-    // machinery. Find it as the front value's marked user (or defining op).
-    mlir::UnrealizedConversionCastOp oldRoot =
-        front.getDefiningOp<mlir::UnrealizedConversionCastOp>();
-    if (!oldRoot || !oldRoot->hasAttr(ownership::kOwnedLocalObjectAttr)) {
-      oldRoot = nullptr;
-      for (mlir::Operation *user : front.getUsers()) {
-        auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(user);
-        if (cast && cast->hasAttr(ownership::kOwnedLocalObjectAttr) &&
-            cast.getInputs().size() == ownerBundle.objectValue.values.size() &&
-            cast.getInputs().front() == front) {
-          oldRoot = cast;
-          break;
-        }
-      }
-    }
-    if (oldRoot && oldRoot->hasAttr(ownership::kOwnedLocalObjectAttr)) {
-      builder.setInsertionPoint(op);
-      llvm::SmallVector<mlir::Type, 8> resultTypes;
-      for (mlir::Value value : ownerBundle.objectValue.values)
-        resultTypes.push_back(value.getType());
-      auto rooted = mlir::UnrealizedConversionCastOp::create(
-          builder, op->getLoc(), resultTypes, ownerBundle.objectValue.values);
-      rooted->setAttr(ownership::kOwnedLocalObjectAttr,
-                      builder.getUnitAttr());
-      if (mlir::Attribute contract =
-              oldRoot->getAttr(ownership::kOwnedLocalObjectContractAttr))
-        rooted->setAttr(ownership::kOwnedLocalObjectContractAttr, contract);
-      oldRoot->removeAttr(ownership::kOwnedLocalObjectAttr);
-      oldRoot->removeAttr(ownership::kOwnedLocalObjectContractAttr);
-      ownerBundle.objectValue.values.assign(rooted.getResults().begin(),
-                                            rooted.getResults().end());
-    }
-  }
 
   valueBundles[updatedField.fieldAliasOwner] = std::move(ownerBundle);
   return mlir::success();
@@ -523,7 +706,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
                             << classOp.getSymName();
     mlir::Type fieldType = fieldTypes[*fieldIndex];
     if (std::optional<unsigned> primitiveSlot =
-            primitiveI64FieldSlot(fieldType, *fieldIndex)) {
+            primitiveFieldSlot(fieldType, *fieldIndex)) {
       builder.setInsertionPoint(op);
       mlir::FailureOr<mlir::Value> header =
           RuntimeBundleLowerer::objectPhysicalHeader(op, object->objectValue);
@@ -534,6 +717,29 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
       mlir::Value raw =
           mlir::memref::LoadOp::create(builder, op.getLoc(), *header, slotIndex)
               .getResult();
+      // bool's physical lane IS the i1, so the word is narrowed back into one
+      // rather than carried as primitive-i64 evidence (which only int has).
+      if (isBoolFieldType(fieldType)) {
+        mlir::Value zero =
+            mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 0, 64)
+                .getResult();
+        mlir::Value flag =
+            mlir::arith::CmpIOp::create(builder, op.getLoc(),
+                                        mlir::arith::CmpIPredicate::ne, raw,
+                                        zero)
+                .getResult();
+        RuntimeBundle result = RuntimeBundle::objectWithOwnership(
+            fieldType, mlir::ValueRange{flag},
+            ownership::logicalOwnershipKind(fieldType, /*ownsObject=*/false));
+        if (!py::isAssignableTo(result.objectValue.contract,
+                                op.getResult().getType(), op))
+          return op.emitError()
+                 << "attribute evidence " << result.objectValue.contract
+                 << " is not assignable to result " << op.getResult().getType();
+        valueBundles[op.getResult()] = std::move(result);
+        erase.push_back(op);
+        return mlir::success();
+      }
       mlir::Value valid =
           mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 1, 1)
               .getResult();
@@ -553,16 +759,25 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
     }
   }
 
-  // Box-fronted container fields: the box is the source of truth (a runtime
-  // mutation may have reallocated the arrays), so compile-time field evidence
-  // must not short-circuit the load — always reconstruct from the box words.
-  bool boxedContainerField =
+  bool boxedField =
       fieldIndex && *fieldIndex < fieldTypes.size() &&
-      RuntimeBundleLowerer::classFieldStoredBoxed(fieldTypes[*fieldIndex]) &&
-      runtimeShapeContractName(fieldTypes[*fieldIndex]) != "builtins.object";
+      RuntimeBundleLowerer::classFieldStoredBoxed(fieldTypes[*fieldIndex]);
 
+  // A box-fronted field's LANES always come from the box words, never from the
+  // recorded bundle, for two independent reasons. (1) The words are the storage:
+  // a store from any other frame lands there and nowhere else. (2) Loading from
+  // the box is what keeps the INSTANCE live at the read — with the field's value
+  // no longer flattened into the instance's lane list, an evidence-only read
+  // uses none of the instance's lanes, so the release planner sees the instance
+  // die at the store and `__ly_dealloc_Stack` lands before the read.
+  //
+  // The recorded bundle is still consulted, for the facts that are not lanes
+  // (element/key evidence, a more specific contract than the field's
+  // annotation). It is a CACHE: `dropObjectFieldEvidence` clears it at every
+  // boundary this walk cannot see a store through, so a hit means the box still
+  // holds the object the cache describes and the two are consistent.
   auto fieldBundle = object->fieldBundles.find(op.getName());
-  if (!boxedContainerField && fieldBundle != object->fieldBundles.end()) {
+  if (!boxedField && fieldBundle != object->fieldBundles.end()) {
     if (!fieldBundle->second)
       return op.emitError()
              << "attribute evidence for '" << op.getName() << "' is empty";
@@ -584,17 +799,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
     return mlir::success();
   }
 
-  auto rebuildBoxedFieldValues =
-      [&](mlir::Type fieldContract, mlir::Value box)
+  auto rebuildBoxedFieldLanes =
+      [&](llvm::ArrayRef<mlir::Type> laneTypes, mlir::Value box)
       -> mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> {
-    mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> arrayTypes =
-        RuntimeBundleLowerer::runtimeValueTypesFor(op, fieldContract,
-                                                   "class field ABI");
-    if (mlir::failed(arrayTypes))
-      return mlir::failure();
     builder.setInsertionPoint(op);
     llvm::SmallVector<mlir::Value, 4> rebuilt;
-    for (auto [index, type] : llvm::enumerate(*arrayTypes)) {
+    for (auto [index, type] : llvm::enumerate(laneTypes)) {
       auto memrefType = mlir::dyn_cast<mlir::MemRefType>(type);
       if (!memrefType)
         return op.emitError()
@@ -616,6 +826,16 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
           builder, op.getLoc(), ptrWord, sizeWord, memrefType));
     }
     return rebuilt;
+  };
+  auto rebuildBoxedFieldValues =
+      [&](mlir::Type fieldContract, mlir::Value box)
+      -> mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> {
+    mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> arrayTypes =
+        RuntimeBundleLowerer::runtimeValueTypesFor(op, fieldContract,
+                                                   "class field ABI");
+    if (mlir::failed(arrayTypes))
+      return mlir::failure();
+    return rebuildBoxedFieldLanes(*arrayTypes, box);
   };
 
   if (auto unionType = mlir::dyn_cast<py::UnionType>(op.getObject().getType())) {
@@ -649,7 +869,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
                << "class field metadata is malformed for "
                << memberClass.getSymName();
       mlir::Type memberFieldType = memberFieldTypes[*memberFieldIndex];
-      if (primitiveI64FieldSlot(memberFieldType, *memberFieldIndex))
+      if (primitiveFieldSlot(memberFieldType, *memberFieldIndex))
         return op.emitError()
                << "primitive union field attribute access is not supported";
 
@@ -657,8 +877,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
       // box16 slot, and slicing by the contract's array shape would read the
       // neighbouring fields' lanes as if they were payload arrays.
       mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> memberValueTypes =
-          RuntimeBundleLowerer::classFieldStorageValueTypes(op, memberFieldType,
-                                                            "union field ABI");
+          RuntimeBundleLowerer::classFieldStorageValueTypes(
+              op, memberFieldType, *memberFieldIndex, "union field ABI");
       if (mlir::failed(memberValueTypes))
         return mlir::failure();
       if (!commonFieldType) {
@@ -707,8 +927,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
     }
 
     if (commonFieldType &&
-        RuntimeBundleLowerer::classFieldStoredBoxed(commonFieldType) &&
-        runtimeShapeContractName(commonFieldType) != "builtins.object") {
+        RuntimeBundleLowerer::classFieldStoredBoxed(commonFieldType)) {
       if (selectedValues.empty())
         return op.emitError() << "box-fronted union field has no box slot";
       mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> rebuilt =
@@ -754,6 +973,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
   mlir::Type fieldType = fieldTypes[*fieldIndex];
   mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> valueTypes =
       RuntimeBundleLowerer::classFieldStorageValueTypes(op, fieldType,
+                                                        *fieldIndex,
                                                         "class field ABI");
   if (mlir::failed(valueTypes))
     return mlir::failure();
@@ -768,38 +988,88 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
   llvm::SmallVector<mlir::Value, 4> values;
   appendValueSlice(object->physicalValues(), *offset,
                    static_cast<unsigned>(valueTypes->size()), values);
-  if (boxedContainerField) {
+  // The cache entry, when it is still valid, supplies the facts that are not
+  // lanes AND the concrete contract, which for an erased/protocol-typed field is
+  // more specific than the annotation. Its lane TYPES then say how many box
+  // words to read back, so an erased field reads back as its concrete object
+  // rather than as one opaque handle.
+  const RuntimeBundle *cached = nullptr;
+  if (boxedField && fieldBundle != object->fieldBundles.end() &&
+      fieldBundle->second) {
+    cached = fieldBundle->second.get();
+    if (cached->boxedObject)
+      cached = cached->boxedObject.get();
+    if (cached->kind != RuntimeBundle::Kind::Object ||
+        cached->physicalValues().empty() ||
+        !py::isAssignableTo(cached->objectValue.contract,
+                            op.getResult().getType(), op))
+      cached = nullptr;
+  }
+  mlir::Type loadedContract = cached ? cached->objectValue.contract : fieldType;
+  if (boxedField) {
     if (values.empty())
       return op.emitError() << "box-fronted field has no box slot";
+    mlir::Value box = values.front();
+    llvm::SmallVector<mlir::Type, 8> laneTypes;
+    if (cached) {
+      for (mlir::Value lane : cached->physicalValues())
+        laneTypes.push_back(lane.getType());
+    } else {
+      mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> contractTypes =
+          RuntimeBundleLowerer::runtimeValueTypesFor(op, fieldType,
+                                                    "class field ABI");
+      if (mlir::failed(contractTypes))
+        return mlir::failure();
+      laneTypes = std::move(*contractTypes);
+    }
     mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> rebuilt =
-        rebuildBoxedFieldValues(fieldType, values.front());
+        rebuildBoxedFieldLanes(laneTypes, box);
     if (mlir::failed(rebuilt))
       return mlir::failure();
     values = std::move(*rebuilt);
-    // An immutable box-fronted payload (str) is reconstructed from the box
-    // words, so its values are FRESH SSA — no borrowed-entry provenance the
-    // planner could trace, and a rebind may drop the box's reference while the
-    // read is still live. Take a reference at the load, as the aggregate-slot
-    // contract prescribes; the caller-owns-result return convention then
-    // holds. Mutable containers keep the borrow: their reads feed in-place
-    // mutation whose write-back alias must stay pinned to the field.
+    // A read TAKES A REFERENCE. The reconstructed values are fresh SSA with no
+    // borrowed-entry provenance the planner could trace, and the slot's own
+    // reference is not the reader's to rely on: `old = o.f; o.f = fresh` drops
+    // it, and CPython keeps `old` alive because the read is a new reference.
+    // This is the aggregate-slot contract, and the caller-owns-result return
+    // convention then holds. The field alias rides along so an in-place
+    // mutation's write-back still reaches the box.
+    // The transfer conflict is a property of the CONTAINER mutation primitives,
+    // so only a container read has to give up its reference.
     if (!RuntimeBundleLowerer::isMutableContainerContractName(
-            runtimeShapeContractName(fieldType))) {
-      if (!py::isAssignableTo(fieldType, op.getResult().getType(), op))
-        return op.emitError() << "attribute evidence " << fieldType
+            runtimeShapeContractName(loadedContract)) ||
+        !fieldReadFeedsInPlaceMutation(op.getResult())) {
+      if (!py::isAssignableTo(loadedContract, op.getResult().getType(), op))
+        return op.emitError() << "attribute evidence " << loadedContract
                               << " is not assignable to result "
                               << op.getResult().getType();
-      RuntimeValue element{
-          fieldType, values,
-          ownership::logicalOwnershipKind(fieldType, /*ownsObject=*/false)};
-      return bindRetainedEvidenceValue(op, op.getResult(),
-                                       "box-fronted field load", element);
+      RuntimeBundle read;
+      if (cached) {
+        read = *cached;
+        read.objectValue.values.assign(values.begin(), values.end());
+        read.setObjectLogicalOwnership(/*ownsObject=*/false);
+      } else {
+        read = RuntimeBundle::objectWithOwnership(
+            loadedContract, values,
+            ownership::logicalOwnershipKind(loadedContract,
+                                           /*ownsObject=*/false));
+      }
+      read.fieldAliasOwner = op.getObject();
+      read.fieldAliasName = op.getName().str();
+      return bindRetainedEvidenceBundle(op, op.getResult(), std::move(read));
     }
   }
-  RuntimeBundle result = RuntimeBundle::objectWithOwnership(
-      fieldType, values,
-      ownership::logicalOwnershipKind(fieldType,
-                                      /*ownsObject=*/false));
+  RuntimeBundle result;
+  if (cached) {
+    result = *cached;
+    result.objectValue.values.assign(values.begin(), values.end());
+    result.setObjectLogicalOwnership(/*ownsObject=*/false);
+  } else {
+    result = RuntimeBundle::objectWithOwnership(
+        loadedContract, values,
+        ownership::logicalOwnershipKind(loadedContract,
+                                        /*ownsObject=*/false));
+  }
   result.fieldAliasOwner = op.getObject();
   result.fieldAliasName = op.getName().str();
   if (!py::isAssignableTo(result.objectValue.contract, op.getResult().getType(),
@@ -910,62 +1180,25 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
     return RuntimeBundleLowerer::lowerExceptionFieldAttrSet(
         op, *object, *value, classOp, *fieldIndex);
 
-  std::optional<unsigned> primitiveSlot =
-      primitiveI64FieldSlot(fieldTypes[*fieldIndex], *fieldIndex);
-  if (primitiveSlot) {
-    builder.setInsertionPoint(op);
-    mlir::Value primitiveRawValue;
-    if (primitiveI64LaneKnownValid(value->primitiveI64)) {
-      primitiveRawValue = value->primitiveI64->value;
-    } else if (value->physicalValues().empty() && value->primitiveI64 &&
-               value->primitiveI64->value) {
-      // No boxed payload to fall back to (primitive-i64 clone lanes carry
-      // only the (value, valid) pair): the lane is the sole carrier.
-      primitiveRawValue = value->primitiveI64->value;
-    } else {
-      std::optional<RuntimeSymbol> unbox =
-          manifest.primitive(value->contractName(), "unbox.i64");
-      if (!unbox)
-        return op.emitError() << "attribute value " << value->contractName()
-                              << " has no unbox.i64 primitive for field '"
-                              << op.getName() << "'";
-      llvm::SmallVector<const RuntimeBundle *, 1> unboxSources{value};
-      llvm::SmallVector<mlir::Value, 4> unboxOperands;
-      if (mlir::failed(buildRuntimeCallOperands(op, *unbox, unboxSources,
-                                                unboxOperands,
-                                                /*allowUnusedSources=*/false)))
-        return mlir::failure();
-      mlir::func::CallOp unboxCall = RuntimeBundleLowerer::createRuntimeCall(
-          op.getLoc(), *unbox, unboxOperands);
-      if (unboxCall.getNumResults() != 1 ||
-          !unboxCall.getResult(0).getType().isInteger(64))
-        return unbox->function.emitError()
-               << "unbox.i64 primitive must return one i64";
-      primitiveRawValue = unboxCall.getResult(0);
-    }
-
-    mlir::FailureOr<mlir::Value> header =
-        RuntimeBundleLowerer::objectPhysicalHeader(op, object->objectValue);
-    if (mlir::failed(header))
+  if (primitiveFieldSlot(fieldTypes[*fieldIndex], *fieldIndex)) {
+    if (mlir::failed(RuntimeBundleLowerer::storePrimitiveFieldSlot(
+            op, *object, *value, fieldTypes[*fieldIndex], *fieldIndex,
+            op.getName())))
       return mlir::failure();
-    mlir::Value slotIndex = mlir::arith::ConstantIndexOp::create(
-        builder, op.getLoc(), *primitiveSlot);
-    mlir::memref::StoreOp::create(builder, op.getLoc(), primitiveRawValue,
-                                  *header, slotIndex);
     erase.push_back(op);
     return mlir::success();
   }
 
-  bool boxedField =
-      RuntimeBundleLowerer::classFieldStoredBoxed(fieldTypes[*fieldIndex]);
-  // Concrete box-fronted fields (str/dict) must NOT take the re-root path
-  // below: allocating a replacement box would strand every external snapshot
-  // of the old box pointer on the stale payload. The slot box is stable for
-  // the instance's lifetime; a set swaps its payload in place. `object`
-  // fields keep the handle-store path — their reads flow through compile-time
-  // evidence, not through box-word reconstruction.
-  if (boxedField &&
-      runtimeShapeContractName(fieldTypes[*fieldIndex]) != "builtins.object") {
+  // THE store path for every object-contract field: the slot's box16 pointer is
+  // fixed at construction, so a set swaps the payload the box holds and writes
+  // nothing into the instance's SSA lanes. That is what makes the effect
+  // observable to every other frame holding the instance — a callee taking it
+  // as a parameter, a caller reading after the call, an arm of a branch — and it
+  // is why `PathIsHeap` (rfc/object-ownership-kernel.md §2.2) needs no lane
+  // width change: `dict` already carried a store through a call at FIVE lanes
+  // while one-lane `io.StringIO` lost one, so the discriminator was never the
+  // width, only whether the destination was a heap slot.
+  if (RuntimeBundleLowerer::classFieldStoredBoxed(fieldTypes[*fieldIndex])) {
     mlir::FailureOr<unsigned> offset =
         RuntimeBundleLowerer::classFieldValueOffset(op, classOp, *fieldIndex,
                                                     "class field ABI");
@@ -983,31 +1216,34 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
           source->objectValue.ownership == ownership::OwnershipKind::Own &&
           !source->physicalValues().empty();
     }
-    if (mlir::failed(RuntimeBundleLowerer::storeBoxedFieldPayloadInPlace(
-            op, box, *value, slotName)))
+    mlir::FailureOr<RuntimeBundle> stored =
+        RuntimeBundleLowerer::storeBoxedFieldPayloadInPlace(op, box, *value,
+                                                            slotName);
+    if (mlir::failed(stored))
       return mlir::failure();
     if (releaseOwnedSource &&
         mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
             op, *value, llvm::Twine(slotName).concat(".source").str())))
       return mlir::failure();
+    // Refresh the field-evidence cache. The instance's LANES are untouched --
+    // that is the point of storing into the box -- so this republishes the
+    // bundle without re-rooting anything, and no owned-local marker has to
+    // follow.
+    RuntimeBundle updated = *object;
+    updated.fieldBundles[op.getName()] =
+        std::make_shared<RuntimeBundle>(std::move(*stored));
+    valueBundles[op.getObject()] = std::move(updated);
     erase.push_back(op);
     return mlir::success();
   }
-  mlir::Type slotStorageType =
-      boxedField ? runtimeContractType(context, "builtins.object")
-                 : fieldTypes[*fieldIndex];
+
+  // Residual: a field with no single object contract to put behind a handle —
+  // a union (tag plus every member's lanes), a zero-lane contract, or an
+  // int/bool past the last header word. These keep the pre-4a lane splice, and
+  // with it the pre-4a defect: a store here is only visible where these lanes
+  // are. Union fields are the only shape that reaches it in practice.
   RuntimeBundle slotValue;
-  bool newBoxOwnsSlot = false;
-  if (boxedField && !(value->contractName() == "builtins.object" &&
-                      value->physicalValues().size() == 1)) {
-    mlir::FailureOr<RuntimeBundle> boxed =
-        RuntimeBundleLowerer::boxRuntimeObject(op, *value,
-                                               /*retainPayload=*/true);
-    if (mlir::failed(boxed))
-      return mlir::failure();
-    slotValue = std::move(*boxed);
-    newBoxOwnsSlot = true;
-  } else {
+  {
     mlir::FailureOr<RuntimeBundle> storageValue =
         RuntimeBundleLowerer::materializeObjectBundleForStorage(
             op, *value, fieldTypes[*fieldIndex], "attribute value ABI");
@@ -1016,24 +1252,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
     slotValue = std::move(*storageValue);
   }
 
-  bool retainExistingObjectHandle = false;
-  if (boxedField) {
-    if (slotValue.contractName() == "builtins.object" &&
-        slotValue.physicalValues().size() == 1) {
-      retainExistingObjectHandle = !newBoxOwnsSlot;
-    } else {
-      mlir::FailureOr<RuntimeBundle> boxed =
-          RuntimeBundleLowerer::boxRuntimeObject(op, slotValue,
-                                                 /*retainPayload=*/true);
-      if (mlir::failed(boxed))
-        return mlir::failure();
-      slotValue = std::move(*boxed);
-    }
-  }
-
   mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> fieldValueTypes =
       RuntimeBundleLowerer::classFieldStorageValueTypes(
-          op, fieldTypes[*fieldIndex], "class field ABI");
+          op, fieldTypes[*fieldIndex], *fieldIndex, "class field ABI");
   if (mlir::failed(fieldValueTypes))
     return mlir::failure();
   mlir::FailureOr<unsigned> offset =
@@ -1063,68 +1284,26 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
   auto oldFieldBundle = object->fieldBundles.find(op.getName());
   if (oldFieldBundle != object->fieldBundles.end())
     oldSlotValue = oldFieldBundle->second.get();
-  // Both arms below re-root the field's lanes in the object's expansion (see
-  // the loop at the end of this function), so both need the same answer to
-  // "will a later release of this object still name the pre-store lanes?".
+  // This arm re-roots the field's lanes in the object's expansion (see the loop
+  // at the end of this function), so it needs an answer to "will a later
+  // release of this object still name the pre-store lanes?".
   bool markerFollows =
       RuntimeBundleLowerer::ownedLocalObjectMarkerFollowsExpansion(
           op.getObject());
-  // With no recorded bundle, `oldValues` is not a stored value at all: it is
-  // the constructor's DEFAULT-INITIALIZED placeholder. The placeholder is a
-  // zero-filled expansion whose own header gets a refcount, but whose NESTED
-  // object headers do not -- and only a user-class-typed field expands to
-  // nested headers (`self.inner: Inner` inlines Inner's whole expansion,
-  // including the header of Inner's own `int` field). Releasing that
-  // placeholder therefore decrements a refcount that is zero, which aborts at
-  // CONSTRUCTION with no load and no rebind: `Holder(Inner(1))` alone is
-  // enough. The scalar and container placeholders do carry an initialized
-  // header, so they keep the release and do not leak.
-  bool oldSlotPlaceholderHasUncountedHeaders =
-      oldSlotValue == nullptr &&
-      RuntimeBundleLowerer::classForContract(fieldTypes[*fieldIndex]) !=
-          nullptr;
-  if (boxedField) {
-    if (retainExistingObjectHandle &&
-        mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
-            op, slotStorageType, slotValue.physicalValues(), slotName)))
-      return mlir::failure();
-    // Why the guard is not only on the wide arm below: a `builtins.object`
-    // slot is one handle, but storing it re-roots that handle exactly like a
-    // wide field, so an instance without an owned-local marker -- `self`
-    // inside a method, which is every `self.x = obj` in an `__init__` -- has
-    // its pre-store handle released both here and by the object's own
-    // teardown. That is the same double release as the wide arm, and it needs
-    // no load to surface: `Holder(Inner(1))` aborts on construction.
-    if (markerFollows &&
-        mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
-            op, slotStorageType, oldValues, slotName)))
-      return mlir::failure();
-  } else {
-    // A store to a field wider than one handle RE-ROOTS those lanes in the
-    // object's expansion. When the instance was not constructed in this frame
-    // there is no owned-local marker to republish, so every later release of
-    // the object -- the normal-path one and each unwind cleanup -- still names
-    // the birth expansion and releases the REPLACED value itself. Releasing it
-    // here as well is a second release of the same list: `Ly_DecRef observed
-    // non-positive refcount` when the freed block reads back as zero, and a
-    // silent use-after-free when it does not (which is why it surfaced as a
-    // load-dependent flake rather than a hard failure).
-    //
-    // Leaving the release to that stale-but-self-consistent teardown keeps the
-    // replaced value released exactly once and leaks the replacement instead.
-    // A leak, not a double free: bounded, deterministic, and never a
-    // mis-execution. Removing it needs the release machinery to track a
-    // per-region expansion for one entity (the `stale`/re-root notion the
-    // affine verifier already has for a consuming call that returns the
-    // entity) -- see the ownership note in runtime/lib/json.py.
-    if (mlir::failed(RuntimeBundleLowerer::replaceAggregateSlot(
-            op, fieldTypes[*fieldIndex], oldValues, oldSlotValue,
-            fieldTypes[*fieldIndex], slotValue, slotName,
-            /*releaseMissingOldObjectSlot=*/true,
-            /*releaseOldSlot=*/markerFollows &&
-                !oldSlotPlaceholderHasUncountedHeaders)))
-      return mlir::failure();
-  }
+  // A SELF-store (`ks = self._kids; ks.append(v); self._kids = ks`): the growth
+  // primitive's transfer already moved the slot's token out and its owned
+  // result handed one back, so the retain inside `replaceAggregateSlot`
+  // restores the slot's single reference and there is no second one to give up.
+  // The old lanes are also the pre-realloc ones, so the release would hand the
+  // deallocator storage the primitive has already freed.
+  bool selfStore = RuntimeBundleLowerer::aggregateSlotStoreIsSelfStore(
+      oldValues, slotValue.physicalValues());
+  if (mlir::failed(RuntimeBundleLowerer::replaceAggregateSlot(
+          op, fieldTypes[*fieldIndex], oldValues, oldSlotValue,
+          fieldTypes[*fieldIndex], slotValue, slotName,
+          /*releaseMissingOldObjectSlot=*/true,
+          /*releaseOldSlot=*/markerFollows && !selfStore)))
+    return mlir::failure();
   if (releaseOwnedSource &&
       mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
           op, *value, llvm::Twine(slotName).concat(".source").str())))

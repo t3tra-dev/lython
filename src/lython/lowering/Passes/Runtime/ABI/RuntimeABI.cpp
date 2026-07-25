@@ -1103,19 +1103,22 @@ mlir::FailureOr<RuntimeValue> RuntimeBundleLowerer::materializeClassObjectValue(
   llvm::SmallVector<mlir::Type, 8> fieldContractTypes =
       RuntimeBundleLowerer::classFieldContractTypes(classOp);
   mlir::Value zeroI64 = mlir::arith::ConstantIntOp::create(builder, loc, 0, 64);
-  for (auto [fieldIndex, fieldType] : llvm::enumerate(fieldContractTypes)) {
-    if (runtimeContractName(fieldType) != "builtins.int")
-      continue;
-    unsigned slot = kPrimitiveFieldSlotBase + static_cast<unsigned>(fieldIndex);
-    if (slot >= kPrimitiveFieldSlotLimit)
-      continue;
-    mlir::Value slotIndex =
-        mlir::arith::ConstantIndexOp::create(builder, loc, slot);
-    mlir::memref::StoreOp::create(builder, loc, zeroI64, header, slotIndex);
-  }
-
   llvm::SmallVector<mlir::Value, 8> values{header};
-  for (mlir::Type fieldType : fieldContractTypes) {
+  for (auto [fieldIndex, fieldType] : llvm::enumerate(fieldContractTypes)) {
+    mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> storage =
+        RuntimeBundleLowerer::classFieldStorageValueTypes(
+            op, fieldType, static_cast<unsigned>(fieldIndex), purpose);
+    if (mlir::failed(storage))
+      return mlir::failure();
+    // A header-word field's storage IS a word of the allocation above, which
+    // memref.alloc does not zero: initialize it here and take no lane.
+    if (storage->empty()) {
+      mlir::Value slotIndex = mlir::arith::ConstantIndexOp::create(
+          builder, loc,
+          kPrimitiveFieldSlotBase + static_cast<unsigned>(fieldIndex));
+      mlir::memref::StoreOp::create(builder, loc, zeroI64, header, slotIndex);
+      continue;
+    }
     // Box-fronted fields store a single box16 slot; materialize the dead
     // placeholder in the STORAGE shape, not the contract's array shape.
     mlir::Type storageType =
@@ -1191,11 +1194,12 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassDeallocators() {
     llvm::SmallVector<unsigned, 8> fieldOffsets;
     unsigned offset = objectHeaderValues;
     fieldOffsets.reserve(fieldTypes.size());
-    for (mlir::Type fieldType : fieldTypes) {
+    for (auto [fieldIndex, fieldType] : llvm::enumerate(fieldTypes)) {
       fieldOffsets.push_back(offset);
       mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> fieldValueTypes =
           RuntimeBundleLowerer::classFieldStorageValueTypes(
-              classOp, fieldType, "source class field deallocator ABI");
+              classOp, fieldType, static_cast<unsigned>(fieldIndex),
+              "source class field deallocator ABI");
       if (mlir::failed(fieldValueTypes))
         return mlir::failure();
       offset += static_cast<unsigned>(fieldValueTypes->size());
@@ -1260,7 +1264,8 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassDeallocators() {
     for (auto [index, fieldType] : llvm::enumerate(plan.fieldTypes)) {
       mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> fieldValueTypes =
           RuntimeBundleLowerer::classFieldStorageValueTypes(
-              plan.function, fieldType, "source class field deallocator ABI");
+              plan.function, fieldType, static_cast<unsigned>(index),
+              "source class field deallocator ABI");
       if (mlir::failed(fieldValueTypes))
         return mlir::failure();
       llvm::SmallVector<mlir::Value, 4> fieldValues =

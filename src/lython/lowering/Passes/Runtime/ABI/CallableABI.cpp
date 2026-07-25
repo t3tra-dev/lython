@@ -182,11 +182,11 @@ RuntimeBundleLowerer::runtimeValueTypesFor(mlir::Operation *op, mlir::Type type,
              << purpose;
     llvm::SmallVector<mlir::Type, 8> types(objectShape->valueTypes.begin(),
                                            objectShape->valueTypes.end());
-    for (mlir::Type fieldType :
-         RuntimeBundleLowerer::classFieldContractTypes(classOp)) {
+    for (auto [fieldIndex, fieldType] : llvm::enumerate(
+             RuntimeBundleLowerer::classFieldContractTypes(classOp))) {
       mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> fieldTypes =
-          RuntimeBundleLowerer::classFieldStorageValueTypes(op, fieldType,
-                                                            purpose);
+          RuntimeBundleLowerer::classFieldStorageValueTypes(
+              op, fieldType, static_cast<unsigned>(fieldIndex), purpose);
       if (mlir::failed(fieldTypes))
         return mlir::failure();
       types.append(fieldTypes->begin(), fieldTypes->end());

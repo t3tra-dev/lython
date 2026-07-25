@@ -63,12 +63,49 @@ void RuntimeBundleLowerer::demoteMutableContainerEvidence(
   bundle.mappingCapacity = 0;
 }
 
+// A class instance's fieldBundles are a CACHE of what this walk last stored
+// into the instance's box-fronted field slots. Every field store lands in the
+// slot, so any frame holding the instance can replace a field's value without
+// this walk seeing it — and then the cache names a value the program has
+// already dropped. Dropping the cache costs a reload from the box words and is
+// always semantics-preserving; keeping it past a boundary is a silent
+// mis-execution (`def set(b): b.f = 1.5` observed by the caller).
+void RuntimeBundleLowerer::dropObjectFieldEvidence(RuntimeBundle &bundle) {
+  if (bundle.kind != RuntimeBundle::Kind::Object || bundle.fieldBundles.empty())
+    return;
+  // Only the fields whose storage IS a box slot, since only those can be
+  // reloaded from it. The residual shapes (a union field, an int past the last
+  // header word) still keep their value in the instance's lanes, so their
+  // evidence is the only description of it and dropping it would lose the value
+  // outright -- they are exactly the fields a store still re-roots, and they
+  // keep the pre-4a defect along with the pre-4a cache. A header-word field
+  // needs no entry either way: its load reads the word and never consults this
+  // map.
+  py::ClassOp classOp =
+      RuntimeBundleLowerer::classForContract(bundle.objectValue.contract);
+  if (!classOp)
+    return;
+  auto fieldNames = classOp->getAttrOfType<mlir::ArrayAttr>("field_names");
+  llvm::SmallVector<mlir::Type, 8> fieldTypes =
+      RuntimeBundleLowerer::classFieldContractTypes(classOp);
+  if (!fieldNames || fieldNames.size() != fieldTypes.size())
+    return;
+  for (auto [index, nameAttr] : llvm::enumerate(fieldNames)) {
+    auto name = mlir::dyn_cast<mlir::StringAttr>(nameAttr);
+    if (!name ||
+        !RuntimeBundleLowerer::classFieldStoredBoxed(fieldTypes[index]))
+      continue;
+    bundle.fieldBundles.erase(name.getValue());
+  }
+}
+
 void RuntimeBundleLowerer::demoteMutableContainerEvidenceFor(
     mlir::Value value) {
   auto found = valueBundles.find(value);
   if (found == valueBundles.end())
     return;
   demoteMutableContainerEvidence(found->second);
+  dropObjectFieldEvidence(found->second);
 }
 
 void RuntimeBundleLowerer::demoteMutableContainerArgumentEvidence(

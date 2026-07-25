@@ -9,11 +9,15 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
 
 namespace py::ownership {
@@ -607,6 +611,7 @@ collectContractOwnedResultGroups(mlir::func::FuncOp callee,
     group.values =
         valueSlice(call.getResults(), offset,
                    static_cast<unsigned>(deallocator->inputTypes.size()));
+    group.root = entityRootOf(group.values);
     appendEntityViews(group, call.getResults(), offset);
     groups.push_back(std::move(group));
   }
@@ -647,6 +652,7 @@ collectTypedResourceGroups(mlir::Type type, mlir::ValueRange values,
       group.deallocator = deallocator;
       group.values = valueSlice(
           values, 0, static_cast<unsigned>(deallocator->inputTypes.size()));
+      group.root = entityRootOf(group.values);
       appendEntityViews(group, values, 0);
       groups.push_back(std::move(group));
       return;
@@ -830,6 +836,7 @@ collectRuntimeResourceGroups(mlir::ValueRange values,
     group.offset = offset;
     group.deallocator = deallocator;
     group.values = valueSlice(values, offset, size);
+    group.root = entityRootOf(group.values);
     appendEntityViews(group, values, offset);
     unsigned span = size + static_cast<unsigned>(group.views.size());
     groups.push_back(std::move(group));
@@ -862,6 +869,10 @@ collectOwnedLocalObjectGroups(mlir::Operation *op,
   group.values = valueSlice(
       op->getResults(), 0,
       static_cast<unsigned>(deallocator->inputTypes.size()));
+  // The marker's result 0, normalized past the identity cast: a re-root
+  // republishes the SAME head through a fresh cast, so the normalized root is
+  // the one name that survives it.
+  group.root = entityRootOf(group.values);
   appendEntityViews(group, op->getResults(), 0);
   groups.push_back(std::move(group));
   return groups;
@@ -885,6 +896,7 @@ static void appendUnresolvedOwnedResultRoot(
   ResourceGroup group;
   group.offset = offset;
   group.values.push_back(result);
+  group.root = entityRootOf(group.values);
   groups.push_back(std::move(group));
 }
 
@@ -1033,6 +1045,7 @@ collectOwnedCallResultGroups(mlir::ModuleOp module, mlir::func::CallOp call,
       group.values = valueSlice(
           call.getResults(), offset,
           static_cast<unsigned>(deallocator->inputTypes.size()));
+      group.root = entityRootOf(group.values);
       appendEntityViews(group, call.getResults(), offset);
       ownedGroups.push_back(std::move(group));
     }
@@ -1590,6 +1603,134 @@ bool callPartiallyConsumesGroup(FuncContractCache &contracts,
   return false;
 }
 
+std::optional<llvm::SmallVector<mlir::Value, 4>>
+callReRootsGroupLanes(FuncContractCache &contracts, mlir::func::CallOp call,
+                      llvm::ArrayRef<mlir::Value> group,
+                      AliasAnalysis &aliases) {
+  if (group.size() < 2)
+    return std::nullopt;
+  auto cached = contracts.lookup(call.getCallee());
+  if (mlir::failed(cached) || !*cached)
+    return std::nullopt;
+  const FunctionContract &contract = (*cached)->contract;
+  if (contract.ownedResults.empty())
+    return std::nullopt;
+
+  auto substituteFrom = [&](unsigned operandOffset)
+      -> std::optional<llvm::SmallVector<mlir::Value, 4>> {
+    if (operandOffset >= call.getNumOperands())
+      return std::nullopt;
+    // Which lane does the consumed operand name? Lane 0 is excluded: the root
+    // IS the entity, so consuming it is a consume, never a re-root.
+    unsigned laneIndex = 0;
+    for (unsigned index = 1; index < group.size(); ++index) {
+      if (aliases.same(call.getOperand(operandOffset), group[index])) {
+        laneIndex = index;
+        break;
+      }
+    }
+    if (laneIndex == 0)
+      return std::nullopt;
+
+    // How far does the sub-range reach? The operands must go on naming the
+    // group's following lanes in order: a primitive that took only part of a
+    // payload is not handing back a replacement for the whole of it.
+    unsigned span = 1;
+    while (laneIndex + span < group.size() &&
+           operandOffset + span < call.getNumOperands() &&
+           aliases.same(call.getOperand(operandOffset + span),
+                        group[laneIndex + span]))
+      ++span;
+
+    for (unsigned resultOffset : contract.ownedResults.values) {
+      if (resultOffset + span > call.getNumResults())
+        continue;
+      bool typesMatch = true;
+      for (unsigned index = 0; index < span; ++index)
+        if (call.getResult(resultOffset + index).getType() !=
+            group[laneIndex + index].getType())
+          typesMatch = false;
+      if (!typesMatch)
+        continue;
+      llvm::SmallVector<mlir::Value, 4> substituted(group.begin(), group.end());
+      for (unsigned index = 0; index < span; ++index)
+        substituted[laneIndex + index] = call.getResult(resultOffset + index);
+      return substituted;
+    }
+    return std::nullopt;
+  };
+
+  for (unsigned offset : contract.transferArgs.values)
+    if (auto substituted = substituteFrom(offset))
+      return substituted;
+  for (unsigned offset : contract.releaseArgs.values)
+    if (auto substituted = substituteFrom(offset))
+      return substituted;
+  return std::nullopt;
+}
+
+void advanceGroupLanesThroughReRoots(FuncContractCache &contracts,
+                                     mlir::func::FuncOp function,
+                                     ResourceGroup &group,
+                                     AliasAnalysis &aliases) {
+  if (group.values.size() < 2 || !function || function.isDeclaration())
+    return;
+  // Escape hatch for A/B measurement only (both the insertion pass and the
+  // verifier read it, so the two stay in agreement either way). Not a
+  // supported configuration: with the advance off, a payload re-root loses the
+  // entity again.
+  static const bool disabled =
+      std::getenv("LYTHON_OWNERSHIP_NO_LANE_ADVANCE") != nullptr;
+  if (disabled)
+    return;
+  std::optional<mlir::DominanceInfo> dominance;
+
+  // Bounded: each step replaces at least one lane with a value defined later,
+  // so a fixpoint exists, but the cap keeps a pathological alias cycle from
+  // spinning here.
+  constexpr unsigned kMaxReRootSteps = 64;
+  for (unsigned step = 0; step < kMaxReRootSteps; ++step) {
+    mlir::func::CallOp reRoot;
+    llvm::SmallVector<mlir::Value, 4> advanced;
+    for (mlir::Value lane : llvm::drop_begin(group.values)) {
+      for (mlir::Operation *user : lane.getUsers()) {
+        auto call = mlir::dyn_cast<mlir::func::CallOp>(user);
+        if (!call)
+          continue;
+        std::optional<llvm::SmallVector<mlir::Value, 4>> substituted =
+            callReRootsGroupLanes(contracts, call, group.values, aliases);
+        if (!substituted)
+          continue;
+        reRoot = call;
+        advanced = std::move(*substituted);
+        break;
+      }
+      if (reRoot)
+        break;
+    }
+    if (!reRoot)
+      return;
+
+    // Every remaining use of the entity must be ordered against the re-root,
+    // or the substituted lanes are not in scope where the release goes. This
+    // is what keeps a rebind inside one arm of a branch out of the model
+    // instead of producing a module the MLIR verifier rejects.
+    if (!dominance)
+      dominance.emplace(function);
+    bool dominatesAllUses = true;
+    for (mlir::Value lane : group.values)
+      for (mlir::Operation *user : lane.getUsers())
+        if (user != reRoot.getOperation() &&
+            !dominance->properlyDominates(reRoot.getOperation(), user) &&
+            !dominance->properlyDominates(user, reRoot.getOperation()))
+          dominatesAllUses = false;
+    if (!dominatesAllUses)
+      return;
+
+    group.values = std::move(advanced);
+  }
+}
+
 bool isBlockArgMergeBorrowRetain(mlir::func::CallOp call) {
   auto label = call->getAttrOfType<mlir::StringAttr>(kAggregateRetainAttr);
   return label && label.getValue() == kBlockArgMergeBorrowLabel;
@@ -1644,6 +1785,51 @@ bool sameValueGroup(llvm::ArrayRef<mlir::Value> lhs,
     if (left != right)
       return false;
   return true;
+}
+
+mlir::Value entityRootOf(llvm::ArrayRef<mlir::Value> group) {
+  if (group.empty())
+    return {};
+  return underlyingObjectValue(group.front());
+}
+
+bool sameEntityRoot(llvm::ArrayRef<mlir::Value> lhs,
+                    llvm::ArrayRef<mlir::Value> rhs) {
+  mlir::Value left = entityRootOf(lhs);
+  mlir::Value right = entityRootOf(rhs);
+  // An empty group has no entity, so it is not the same entity as anything --
+  // including another empty group. Comparing them equal would let a group the
+  // caller failed to resolve absorb every other group at a dedup site.
+  return left && right && left == right;
+}
+
+llvm::hash_code entityRootHash(llvm::ArrayRef<mlir::Value> group) {
+  return llvm::hash_value(entityRootOf(group).getAsOpaquePointer());
+}
+
+void reportEntityRootParity(llvm::StringRef site,
+                            llvm::ArrayRef<mlir::Value> lhs,
+                            llvm::ArrayRef<mlir::Value> rhs) {
+  enum class Mode { Off, Log, Abort };
+  static const Mode mode = [] {
+    const char *setting = std::getenv("LYTHON_OWNERSHIP_ROOT_PARITY");
+    if (!setting || !*setting || llvm::StringRef(setting) == "0")
+      return Mode::Off;
+    return llvm::StringRef(setting) == "abort" ? Mode::Abort : Mode::Log;
+  }();
+  if (mode == Mode::Off)
+    return;
+
+  bool byRoot = sameEntityRoot(lhs, rhs);
+  bool byLanes = sameValueGroup(lhs, rhs);
+  if (byRoot == byLanes)
+    return;
+
+  llvm::errs() << "lython: ownership root parity divergence at " << site
+               << ": same-root=" << byRoot << " same-lanes=" << byLanes
+               << " (" << lhs.size() << " vs " << rhs.size() << " lanes)\n";
+  if (mode == Mode::Abort)
+    llvm::report_fatal_error("ownership root parity divergence");
 }
 
 } // namespace py::ownership

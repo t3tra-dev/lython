@@ -3,10 +3,12 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/SymbolTable.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/Value.h"
 #include "mlir/IR/ValueRange.h"
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
@@ -231,6 +233,16 @@ classifyOwnershipConditionBranch(mlir::Operation *op,
 struct ResourceGroup {
   unsigned offset = 0;
   OwnershipKind ownership = OwnershipKind::Own;
+  // The entity's root: the ONE stable SSA name this resource is tracked by.
+  // Each producer names it -- a manifest allocation names its result, an
+  // owned-local-object marker names result 0, a call names the head of its
+  // owned result range -- and it is what group identity compares.
+  mlir::Value root;
+  // The entity's CURRENT physical lanes (the release interface the
+  // deallocator takes), derived from `root`. Not the identity: a payload
+  // re-root (field rebind, container growth, realloc) replaces lanes while
+  // leaving the root alone, and a key that included them would lose the
+  // entity exactly there.
   llvm::SmallVector<mlir::Value, 4> values;
   // Interior views of the same entity (the canonical-shape tail beyond the
   // release interface). Uses of these keep the entity live; they are not
@@ -376,6 +388,43 @@ bool callPartiallyConsumesGroup(FuncContractCache &contracts,
                                 mlir::func::CallOp call,
                                 llvm::ArrayRef<mlir::Value> group,
                                 AliasAnalysis &aliases);
+// A mutation primitive that RE-ROOTS a payload sub-range of `group` rather
+// than consuming the entity: its `transfer_args` names a lane at index >= 1
+// (never the root) and its `owned_results` hands back replacements of the same
+// types. That is how the current ABI spells in-place mutation -- "consume this
+// container and return another one" (`LyList_EnsureCapacity`,
+// `LyDict_SetItemBox`, ...) -- so a field or item sub-range mutated this way
+// moves to new SSA names while the entity it belongs to is unchanged.
+//
+// Returns `group` with the sub-range replaced by the call's owned results;
+// nullopt when the call is not such a re-root. The root (lane 0) is never
+// substituted: a call that consumes THAT is consuming the entity, which the
+// consume predicates above already decide.
+std::optional<llvm::SmallVector<mlir::Value, 4>>
+callReRootsGroupLanes(FuncContractCache &contracts, mlir::func::CallOp call,
+                      llvm::ArrayRef<mlir::Value> group,
+                      AliasAnalysis &aliases);
+// Advance `group.values` from the birth expansion to the entity's CURRENT
+// lanes by following those re-roots forward from the producer. The root is
+// never touched, so the entity's identity is unchanged; only the lanes the
+// deallocator will be handed, and the uses that decide where it is called,
+// move to the post-mutation names.
+//
+// Bails (leaving the lanes alone) whenever a re-root does not dominate every
+// remaining use of the entity: replacing a lane with a value defined in only
+// one arm would make the release operand fail MLIR's dominance check, and an
+// invalid module is worse than the conservative placement.
+//
+// `function` is only used to build dominance, and only once a candidate
+// re-root has actually been found: DominanceInfo construction is linear in the
+// function, so building it for every group would put back the quadratic term
+// the path-sensitive rework removed (docs/ownership-perf.md). It is also not
+// cached across groups on purpose -- release insertion may split blocks, which
+// invalidates the tree.
+void advanceGroupLanesThroughReRoots(FuncContractCache &contracts,
+                                     mlir::func::FuncOp function,
+                                     ResourceGroup &group,
+                                     AliasAnalysis &aliases);
 // Identity merge edges lend the merge argument a token via a retain labeled
 // kBlockArgMergeBorrowLabel; the paired release targets the pre-merge name.
 bool isBlockArgMergeBorrowRetain(mlir::func::CallOp call);
@@ -389,5 +438,29 @@ llvm::SmallVector<mlir::Value, 4> remapGroupThroughValueMapping(
 mlir::Operation *ancestorInBlock(mlir::Operation *op, mlir::Block *block);
 bool sameValueGroup(llvm::ArrayRef<mlir::Value> lhs,
                     llvm::ArrayRef<mlir::Value> rhs);
+
+// The entity root a lane list is rooted at, normalized through the
+// identity-cast markers. Every producer lays an entity's lanes out with the
+// release-interface head first and every deallocator names operand 0 as the
+// released resource, so lane 0 is the root; stripping identity casts makes it
+// survive a re-root, which republishes the SAME head through a fresh cast.
+mlir::Value entityRootOf(llvm::ArrayRef<mlir::Value> group);
+// Group identity. Two lane lists name the same entity iff they share a root,
+// regardless of whether their payload lanes still agree.
+bool sameEntityRoot(llvm::ArrayRef<mlir::Value> lhs,
+                    llvm::ArrayRef<mlir::Value> rhs);
+// Hash matching `sameEntityRoot`, for keying visited-state maps by entity.
+llvm::hash_code entityRootHash(llvm::ArrayRef<mlir::Value> group);
+// Migration probe: report where the entity-root key and the old full-lane key
+// disagree. Set LYTHON_OWNERSHIP_ROOT_PARITY=1 to log each divergence, or
+// =abort to stop at the first one.
+//
+// Why not a plain assert: a divergence is EXPECTED from the moment any
+// producer re-roots payload lanes, which is precisely the case the migration
+// exists to fix, so an unconditional assert would abort the suite on the
+// inputs that matter instead of letting them be surveyed.
+void reportEntityRootParity(llvm::StringRef site,
+                            llvm::ArrayRef<mlir::Value> lhs,
+                            llvm::ArrayRef<mlir::Value> rhs);
 
 } // namespace py::ownership

@@ -49,26 +49,34 @@ holding once any other method of the same object has been called.
 Ownership note — the rebind of `self._kids` in `append` / `set`:
   Storing to a class field whose storage is wider than one handle (`list`
   is three: header, meta, items) RE-ROOTS those lanes in the instance's
-  physical expansion, but the release machinery keeps naming the expansion
-  the entity was born with. For a node the frame received from a CALL — and
-  every factory here returns one — the object's own release therefore hands
-  the deallocator the pre-store lanes and releases the REPLACED list itself.
-  The lowering leaves that release to it (it would otherwise be a second
-  release of the same list: `Ly_DecRef observed non-positive refcount`, or a
-  silent use-after-free when the freed block still reads back positive —
-  which is how it surfaced, as a load-dependent flake in
-  golden.cases.stdlib_json_build). The cost is that the REPLACEMENT list
-  leaks; see the comment in `RuntimeBundleLowerer::lowerAttrSet`
-  (Passes/Runtime/Ops/AttributeOps.cpp). Building a node with n children
-  through `append`/`set` therefore also retains n intermediate child lists,
-  which is one more reason to prefer `arr_of()` / `obj_of()` in a loop.
+  physical expansion. The release machinery used to keep naming the
+  expansion the entity was born with, so the deallocator was handed the
+  pre-store lanes and released the REPLACED list — a second release of the
+  same list once the store released it too (`Ly_DecRef observed
+  non-positive refcount`, or a silent use-after-free when the freed block
+  still read back positive, which is how it surfaced: a load-dependent
+  flake in golden.cases.stdlib_json_build).
 
-  Still open, and NOT fixed by the above: reaching the rebind from inside a
-  branch or loop body fails the MLIR dominance verifier (`operand #N does
-  not dominate this use`) instead of producing a diagnostic at a static
-  boundary. Calling `append` / `set` in a `while` loop therefore still does
-  not compile — build the children into a `list[JSONValue]` and hand it to
-  `arr_of()` / `obj_of()`, which is what the decoder does.
+  Resolved for the shape used here. Ownership is now keyed on the entity's
+  ROOT, and the release follows a growth primitive's consume-and-return to
+  the entity's current lanes, so `ks = self._kids; ks.append(v);
+  self._kids = ks` releases the list exactly once, through the lanes it
+  has after the growth, and nothing leaks.
+
+  Still open: a rebind that stores a DIFFERENT list into the field of an
+  instance the frame received from a call still leaks the replacement,
+  because publishing the new expansion needs a producer op that names all
+  of its lanes, which the three-lane physical `list` ABI does not give.
+  See the comment in `RuntimeBundleLowerer::lowerAttrSet`
+  (Passes/Runtime/Ops/AttributeOps.cpp). `append` / `set` do not take that
+  path; `arr_of()` / `obj_of()` are still the linear ones.
+
+  Also still open: reaching the rebind from inside a branch or loop body
+  fails the MLIR dominance verifier (`operand #N does not dominate this
+  use`) instead of producing a diagnostic at a static boundary. Calling
+  `append` / `set` in a `while` loop therefore still does not compile —
+  build the children into a `list[JSONValue]` and hand it to `arr_of()` /
+  `obj_of()`, which is what the decoder does.
 
 Deviations from CPython, pending language surface:
   - dump/load (file objects), JSONEncoder/JSONDecoder classes, cls=,

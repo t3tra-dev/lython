@@ -43,7 +43,6 @@ using own::callConsumesGroup;
 using own::groupContainsOperand;
 using own::remapGroupThroughValueMapping;
 using own::returnTransfersGroup;
-using own::sameValueGroup;
 
 
 bool returnCarriesGroupInsideOwnedAggregate(
@@ -212,19 +211,27 @@ bool samePathState(const AffinePathState &lhs, const AffinePathState &rhs) {
   // refine detections, and including them lets path-dependent sets defeat the
   // visited dedup (nested loops explode). Skipping a state that differs only
   // there can only miss a detection, never accept unsound IR.
+  // Groups are compared by ENTITY ROOT, not by lane list: a state whose
+  // payload lanes were re-rooted since the last visit is the same entity at
+  // the same program point, so treating it as new only re-walks a path
+  // already covered. Coarsening the relation can merge states and therefore
+  // miss a detection; it can never accept unsound IR (same reasoning as the
+  // deliberately excluded fields below).
+  own::reportEntityRootParity("samePathState", lhs.group, rhs.group);
   return lhs.block == rhs.block && lhs.start == rhs.start &&
          lhs.token == rhs.token && lhs.retained == rhs.retained &&
          lhs.borrowed == rhs.borrowed &&
          lhs.exceptional == rhs.exceptional &&
-         sameValueGroup(lhs.group, rhs.group);
+         own::sameEntityRoot(lhs.group, rhs.group);
 }
 
 bool sameBorrowedPathState(const BorrowedPathState &lhs,
                            const BorrowedPathState &rhs) {
+  own::reportEntityRootParity("sameBorrowedPathState", lhs.group, rhs.group);
   return lhs.block == rhs.block && lhs.start == rhs.start &&
          lhs.retained == rhs.retained &&
          lhs.exceptional == rhs.exceptional &&
-         sameValueGroup(lhs.group, rhs.group);
+         own::sameEntityRoot(lhs.group, rhs.group);
 }
 
 // Hash over exactly the fields the `same*PathState` relations compare, so two
@@ -239,16 +246,17 @@ std::size_t pathStateDedupKey(const AffinePathState &state) {
   llvm::hash_code code = llvm::hash_combine(
       state.block, state.start, static_cast<int>(state.token), state.retained,
       state.borrowed, state.exceptional);
-  for (mlir::Value value : state.group)
-    code = llvm::hash_combine(code, value);
+  // Hashing the whole lane list would break the equal-implies-same-hash
+  // contract now that equality is by root: two equal states would land in
+  // different buckets and the dedup would silently stop deduping.
+  code = llvm::hash_combine(code, own::entityRootHash(state.group));
   return dedupBucket(code);
 }
 
 std::size_t borrowedStateDedupKey(const BorrowedPathState &state) {
   llvm::hash_code code = llvm::hash_combine(state.block, state.start,
                                             state.retained, state.exceptional);
-  for (mlir::Value value : state.group)
-    code = llvm::hash_combine(code, value);
+  code = llvm::hash_combine(code, own::entityRootHash(state.group));
   return dedupBucket(code);
 }
 
@@ -792,17 +800,52 @@ remapGroupForSuccessor(mlir::Operation *terminator, unsigned successorIndex,
       branch.getSuccessorOperands(successorIndex);
   unsigned argumentCount =
       std::min<unsigned>(successor->getNumArguments(), operands.size());
-  for (auto [groupIndex, value] : llvm::enumerate(group)) {
+
+  // One entity crosses one edge under ONE rename: find where the ROOT lands
+  // and take the lanes from there. Mapping each lane independently made an
+  // entity's survival across an edge depend on all N renames succeeding, so a
+  // single lane the branch did not forward under its own name ended the
+  // entity's tracking.
+  auto forwardedArgumentFor = [&](mlir::Value value) -> int {
     for (unsigned argumentIndex = 0; argumentIndex < argumentCount;
          ++argumentIndex) {
       mlir::Value forwarded = operands[argumentIndex];
-      if (!forwarded || !aliases.same(forwarded, value))
-        continue;
-      mapped[groupIndex] = successor->getArgument(argumentIndex);
-      if (mappedMask)
-        (*mappedMask)[groupIndex] = true;
-      break;
+      if (forwarded && aliases.same(forwarded, value))
+        return static_cast<int>(argumentIndex);
     }
+    return -1;
+  };
+
+  int rootArgument = group.empty() ? -1 : forwardedArgumentFor(group.front());
+  if (rootArgument >= 0 &&
+      static_cast<unsigned>(rootArgument) + group.size() <=
+          successor->getNumArguments()) {
+    bool laneTypesMatch = true;
+    for (auto [groupIndex, value] : llvm::enumerate(group))
+      if (successor->getArgument(rootArgument + groupIndex).getType() !=
+          value.getType())
+        laneTypesMatch = false;
+    if (laneTypesMatch) {
+      for (auto [groupIndex, value] : llvm::enumerate(group)) {
+        mapped[groupIndex] =
+            successor->getArgument(rootArgument + groupIndex);
+        if (mappedMask)
+          (*mappedMask)[groupIndex] = true;
+      }
+      return mapped;
+    }
+  }
+
+  // The lanes are not laid out contiguously behind the root on this edge
+  // (unrelated arguments interleaved): fall back to per-lane renaming, which
+  // is what the whole walk did before the root became authoritative.
+  for (auto [groupIndex, value] : llvm::enumerate(group)) {
+    int argumentIndex = forwardedArgumentFor(value);
+    if (argumentIndex < 0)
+      continue;
+    mapped[groupIndex] = successor->getArgument(argumentIndex);
+    if (mappedMask)
+      (*mappedMask)[groupIndex] = true;
   }
   return mapped;
 }
@@ -1610,7 +1653,7 @@ mlir::LogicalResult verifyBorrowedEntryOnCFGPaths(
           // rejecting it would hard-error plain loop-reassignment code
           // (documented residual).
           if (state.retained != 0 && !state.exceptional &&
-              sameValueGroup(state.group, resource.group) &&
+              own::sameEntityRoot(state.group, resource.group) &&
               !walk.guardedByCallSiteMarker(call))
             return call.emitError()
                    << "borrowed entry argument " << resource.logicalIndex
@@ -2261,14 +2304,26 @@ void appendTrackedResource(
 llvm::SmallVector<TrackedResource, 16>
 collectTrackedResources(mlir::ModuleOp module, mlir::SymbolTable &symbols,
                         mlir::func::FuncOp function,
-                        llvm::ArrayRef<own::RuntimeDeallocator> deallocators) {
+                        llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
+                        own::AliasAnalysis &aliases,
+                        FuncContractCache &contracts) {
   llvm::SmallVector<TrackedResource, 16> resources;
+  // Same lane advance the insertion pass performs, from the same shared
+  // helper: insertion releases the CURRENT lanes, so a verifier still tracking
+  // the birth lanes would read that release as naming another entity and
+  // report the resource as never released. "If insertion and verification
+  // disagree on roots, the proof is void" (rfc/memory-safety-proof.md) --
+  // which is exactly why the advance lives in common/ and not in either pass.
+  auto advance = [&](own::ResourceGroup &group) {
+    own::advanceGroupLanesThroughReRoots(contracts, function, group, aliases);
+  };
 
   function.walk([&](mlir::Operation *op) {
     if (!op->hasAttr(own::kOwnedLocalObjectAttr))
       return;
     for (own::ResourceGroup group :
          own::collectOwnedLocalObjectGroups(op, deallocators)) {
+      advance(group);
       appendTrackedResource(resources, function, op, group.offset,
                             std::move(group.values), group.condition,
                             std::move(group.views));
@@ -2288,6 +2343,7 @@ collectTrackedResources(mlir::ModuleOp module, mlir::SymbolTable &symbols,
     for (own::ResourceGroup group :
          own::collectOwnedCallResultGroups(module, call, deallocators,
                                            &symbols)) {
+      advance(group);
       appendTrackedResource(resources, function, call.getOperation(),
                             group.offset, std::move(group.values),
                             group.condition, std::move(group.views));
@@ -2310,8 +2366,8 @@ mlir::LogicalResult verifyFunctionAffineOwnership(
   bool modelMayRaiseUnwindExits =
       !module->hasAttr(own::kRuntimeInternalLoweringAttr) &&
       findPythonSourceLoc(function.getLoc()).has_value();
-  llvm::SmallVector<TrackedResource, 16> resources =
-      collectTrackedResources(module, symbols, function, deallocators);
+  llvm::SmallVector<TrackedResource, 16> resources = collectTrackedResources(
+      module, symbols, function, deallocators, aliases, contracts);
   llvm::SmallVector<BorrowedEntryResource, 8> borrowedEntryResources =
       collectBorrowedEntryResources(function, deallocators);
 
