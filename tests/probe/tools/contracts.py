@@ -17,7 +17,16 @@ object (11). Extend CASES rather than starting over.
 
     python3 tests/probe/tools/contracts.py ./build/bin/lyc [name-substring]
 
-Exit code is the number of disagreements.
+Exit code is the number of disagreements. Gate on "no more than the recorded
+baseline", not on zero: the known unimplemented methods disagree by design until
+they are implemented, so zero is only the right target once the audit is
+finished. Unlike contract_scan.py this count IS reachable, because every case
+here is decided by execution rather than by symbol lookup.
+
+Baseline at c3de5e7: **10 disagreements of 215 cases** -- list.pop in three
+spellings, list.insert in three, and tuple.__add__/__mul__/count/index. That is
+the same six methods the side-defects track reported, arrived at on a different
+tree, which is what makes it a cross-check rather than a repeat.
 """
 
 import argparse

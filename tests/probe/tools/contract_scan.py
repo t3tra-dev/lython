@@ -4,11 +4,20 @@ For each `py.class` in `runtime/modules/*.mlir`, report the names in
 `method_names` that have no `ly.runtime.method` / `ly.runtime.primitive` /
 `ly.runtime.initializer` symbol under the same `ly.runtime.contract`.
 
-This is a CANDIDATE list, not a defect list: a method reached through a C++
-special path in the lowerer has no manifest symbol and shows up here as a false
-positive. Confirm each candidate by differential execution against CPython --
-contracts.py does that -- before reporting it. Skipping that step is the one
-trap the side-defects track hit.
+This is a CANDIDATE list, not a defect list, and it never converges to zero.
+Two mechanisms produce permanent false positives, both verified in this tree:
+
+  - the implementation is a C++ special path in the lowerer, so there is no
+    manifest symbol to find. `list.append` is reported here and works.
+  - the implementation exists but its primitive is not named after the method.
+    `dict.pop` is `ly.runtime.primitive = "pop_slot"` (plus
+    `pop_slot_checked`), so looking for `pop` misses it; it is reported here
+    and works. The side-defects track hit the same thing after implementing
+    `list.pop` under that same naming convention.
+
+So DO NOT gate CI on this script: a tree where every reported name is
+implemented still reports them, and a count of zero is not a reachable state.
+Gate on contracts.py, which decides each candidate by running it.
 
     python3 tests/probe/tools/contract_scan.py [repo-root]
 """
