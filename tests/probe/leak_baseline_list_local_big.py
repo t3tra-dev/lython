@@ -2,7 +2,7 @@
 # axes: op=leak-loop iterations=40000
 # CLASSIFICATION: 1 正しい
 # CPython 3.14 expects: 320000
-# RSS: 53 バイト/回 → リークなし (計測ノイズ ±80 B/回 の範囲)
+# RSS: 53 バイト/回 → リークなし (計測ノイズ ±130 B/回 の範囲)
 
 def once() -> int:
     xs: list[int] = [1, 2, 3, 4, 5, 6, 7, 8]
