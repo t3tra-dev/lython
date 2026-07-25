@@ -1,6 +1,6 @@
 # probe: field rebind -- receiver from a method return; field type int
 # axes: acquire=method width=w3int op=rebind flow=straight
-# CLASSIFICATION: 1 正しい
+# CLASSIFICATION @ kernel/4a 95cf6f7: 1 正しい
 # CPython 3.14 expects: 123456
 
 class Box:

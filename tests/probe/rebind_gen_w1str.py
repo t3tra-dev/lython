@@ -1,6 +1,6 @@
 # probe: field rebind -- receiver from a generator yield; field type str
 # axes: acquire=gen width=w1str op=rebind flow=straight
-# CLASSIFICATION: 3 loud 拒否 (診断)
+# CLASSIFICATION @ kernel/4a 95cf6f7: 3 loud 拒否 (診断)
 #   source generator next lowering currently supports int yields
 # CPython 3.14 expects: 4 abcd
 

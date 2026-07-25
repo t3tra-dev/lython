@@ -14,7 +14,7 @@
 #   Optional フィールドで loud なのと同じ族。
 #   移植した contracts.py ハーネスで見つけた。
 # axes: width=optional op=print-unnarrowed flow=straight
-# CLASSIFICATION: 3 loud 拒否 (診断)
+# CLASSIFICATION @ kernel/4a 95cf6f7: 3 loud 拒否 (診断)
 #   runtime object header has invalid type 'i64'
 # CPython 3.14 expects: 2
 

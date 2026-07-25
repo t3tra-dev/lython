@@ -1,7 +1,6 @@
 # probe: rebinding a field two levels down (o.inner.f)
 # axes: acquire=call width=w3list op=nested-rebind flow=straight
-# CLASSIFICATION: 2 silent 誤実行
-#   cpython='3\n' lyc='1\n'
+# CLASSIFICATION @ kernel/4a 95cf6f7: 1 正しい
 # CPython 3.14 expects: 3
 
 class Box:

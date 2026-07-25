@@ -1,7 +1,6 @@
 # probe: REPORTED loud (budget 5): a 3-field class used as a list element
 # axes: width=wNcls op=store-into-container flow=straight
-# CLASSIFICATION: 3 loud 拒否 (診断)
-#   a '!py.contract<"Three">' value expands to 10 physical handles, but a payload box carries at most 5; it cannot be stored in a container slot or boxed field yet (reduce the class to fewer or narrower fields)
+# CLASSIFICATION @ kernel/4a 95cf6f7: 1 正しい
 # CPython 3.14 expects: 1 2 3
 
 class Three:

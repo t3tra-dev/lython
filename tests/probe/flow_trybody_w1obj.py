@@ -1,7 +1,6 @@
 # probe: field rebind reached through trybody control flow; field type Other
 # axes: acquire=call width=w1obj op=rebind flow=trybody
-# CLASSIFICATION: 3 loud 拒否 (MLIR verifier 失敗 = 最早境界での診断になっていない)
-#   operand #0 does not dominate this use
+# CLASSIFICATION @ kernel/4a 95cf6f7: 1 正しい
 # CPython 3.14 expects: 7
 
 class Other:

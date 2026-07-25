@@ -2,8 +2,7 @@
 #   書き戻し)。dict 版が silent になるのに対し、list 版は非決定的に silent /
 #   正常終了 / abort に分かれる (libgmalloc では確実に死ぬ)。
 # axes: acquire=call width=w3list op=alias-read+grow+writeback flow=straight scope=module
-# CLASSIFICATION: 4 クラッシュ / abort
-#   exit -5
+# CLASSIFICATION @ kernel/4a 95cf6f7: 1 正しい
 # CPython 3.14 expects: 1
 # 観測: 8 回実行: 正常終了 5 (正解を出す) / abort(refcount) 3。libgmalloc: SIGSEGV (決定的)
 

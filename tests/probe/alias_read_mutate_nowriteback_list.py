@@ -2,8 +2,7 @@
 #   成長させるだけ (**書き戻しをしない**)。照会 A の分解 -- これが落ちるので
 #   `self._f = ks` の書き戻しは真因ではないことが決まる。
 # axes: acquire=call width=w3list op=alias-read+grow(no writeback) flow=straight
-# CLASSIFICATION: 4 クラッシュ / abort
-#   exit 0
+# CLASSIFICATION @ kernel/4a 95cf6f7: 1 正しい
 # CPython 3.14 expects: 2
 # 観測: 8 回実行: silent 3 (`1` を出力) / abort(refcount) 4 / signal 1。libgmalloc: SIGSEGV (決定的)
 

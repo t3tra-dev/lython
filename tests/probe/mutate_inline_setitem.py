@@ -1,6 +1,6 @@
 # probe: in-place field mutation -- list field setitem (in place, no realloc); receiver from inline
 # axes: acquire=inline width=w3list/w1dict op=setitem flow=straight
-# CLASSIFICATION: 1 正しい
+# CLASSIFICATION @ kernel/4a 95cf6f7: 1 正しい
 # CPython 3.14 expects: 1 99
 
 class Box:

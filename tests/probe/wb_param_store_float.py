@@ -1,7 +1,6 @@
 # probe: callee stores into a borrowed receiver's float field; caller reads it back
 # axes: acquire=param width=float op=rebind flow=straight observe=writeback
-# CLASSIFICATION: 2 silent 誤実行
-#   cpython='1.5\n' lyc='0.0\n'
+# CLASSIFICATION @ kernel/4a 95cf6f7: 1 正しい
 # CPython 3.14 expects: 1.5
 
 class Box:

@@ -6,12 +6,15 @@
 #   contract 形の placeholder のぶんで **3** かかっていた。4a はその placeholder を
 #   削除したので、**int フィールド N 個のクラスは 1 ハンドルに展開される**。
 #   → 予算の境界は int フィールド数ではなく**参照型フィールドの本数**へ移った。
-#     現在その境界を押さえているのは golden の
-#     `errors/boxed_payload_too_wide_fields` (float 5 フィールド = 6 ハンドル)。
+#     境界を押さえる golden は `kernel/4a` 側にある
+#     (`errors/boxed_payload_too_wide_fields`、float 5 フィールド = 6 ハンドル)。
+#     このブランチにはまだ無いので、統合後に参照が解決する。同じ統合で
+#     `errors/boxed_payload_too_wide` (int 2 フィールド) は通るようになり
+#     `cases/boxed_payload_int_fields_fit` へ移動している。
 #   (この予測を測らずに書いたのは、本文書の運用ルール 2 の違反例そのもの。
 #    見積りに使った「1 フィールド = 1 スロット」を一度も測っていなかった。)
 # axes: width=wNcls(5 fields as a field type) op=construct+read flow=straight budget=1
-# CLASSIFICATION: 1 正しい
+# CLASSIFICATION @ kernel/4a 95cf6f7: 1 正しい
 # CPython 3.14 expects: 1 5 / 6 10
 
 

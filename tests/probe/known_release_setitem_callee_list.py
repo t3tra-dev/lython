@@ -1,6 +1,6 @@
 # probe: REPORTED loud (B8): setitem on a list returned by a callee
 # axes: acquire=call width=w3list op=setitem flow=straight
-# CLASSIFICATION: 1 正しい
+# CLASSIFICATION @ kernel/4a 95cf6f7: 1 正しい
 # CPython 3.14 expects: 9 3
 
 def make() -> list[int]:

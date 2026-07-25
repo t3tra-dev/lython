@@ -1,7 +1,6 @@
 # probe: field rebind -- receiver read out of an except-bound exception's field; field type Wide
 # axes: acquire=except width=wNcls op=rebind flow=straight
-# CLASSIFICATION: 3 loud 拒否 (診断)
-#   a '!py.contract<"Box">' value expands to 8 physical handles, but a payload box carries at most 5; it cannot be stored in a container slot or boxed field yet (reduce the class to fewer or narrower fields)
+# CLASSIFICATION @ kernel/4a 95cf6f7: 1 正しい
 # CPython 3.14 expects: 1 2.5 z
 
 class Other:

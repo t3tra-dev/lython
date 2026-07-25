@@ -8,9 +8,15 @@ Rewriting is idempotent: only the lines between the CLASSIFICATION anchor and
 the CPython anchor are replaced, so the `# probe:` description above them keeps
 its own continuation lines across re-runs.
 
+--tree names the tree the verdict was measured on, and should always be passed.
+A bare verdict is the mistake this corpus kept making in prose: a class is a
+property of a probe AND a tree, so once several branches are in flight, a header
+that does not say which one invites a stale verdict to be read as a current one.
+
     python3 tests/probe/tools/classify.py ./build/bin/lyc tests/probe res.json
     python3 tests/probe/tools/leak.py     ./build/bin/lyc tests/probe leak.json
-    python3 tests/probe/tools/annotate.py res.json tests/probe leak.json
+    python3 tests/probe/tools/annotate.py res.json tests/probe leak.json \\
+        --tree "kernel/4a a7b1bf2"
 """
 
 import argparse
@@ -42,6 +48,8 @@ def main():
     ap.add_argument("results", type=pathlib.Path)
     ap.add_argument("probes", type=pathlib.Path)
     ap.add_argument("leak", nargs="?", type=pathlib.Path, default=None)
+    ap.add_argument("--tree", default=None,
+                    help='tree the verdict was measured on, e.g. "kernel/4a a7b1bf2"')
     args = ap.parse_args()
 
     res = json.loads(args.results.read_text())
@@ -69,9 +77,13 @@ def main():
 
         out, in_verdict = [], False
         for ln in p.read_text().splitlines():
-            if ln.startswith("# CLASSIFICATION:"):
+            # Not "# CLASSIFICATION:" -- --tree writes the label between the
+            # word and the colon, and the anchor has to still match on re-run.
+            if ln.startswith("# CLASSIFICATION"):
                 in_verdict = True
-                out.append(f"# CLASSIFICATION: {LABEL.get(rec['cls'], rec['cls'])}")
+                tree = f" @ {args.tree}" if args.tree else ""
+                out.append(
+                    f"# CLASSIFICATION{tree}: {LABEL.get(rec['cls'], rec['cls'])}")
                 if note and rec["cls"] != "OK":
                     out.append(f"#   {note[:220]}")
                 continue

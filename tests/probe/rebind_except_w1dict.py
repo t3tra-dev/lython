@@ -1,6 +1,6 @@
 # probe: field rebind -- receiver read out of an except-bound exception's field; field type dict[str, int]
 # axes: acquire=except width=w1dict op=rebind flow=straight
-# CLASSIFICATION: 1 正しい
+# CLASSIFICATION @ kernel/4a 95cf6f7: 1 正しい
 # CPython 3.14 expects: 2 1
 
 class Box:

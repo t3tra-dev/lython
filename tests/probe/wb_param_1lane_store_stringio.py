@@ -2,8 +2,7 @@
 #   借用レシーバのフィールドを別の io.StringIO に「再束縛」し、呼び出し元が読む。
 #   1 レーンでも silent になるので「1 レーンなら境界を越える」は成り立たない。
 # axes: acquire=param width=1lane-header-fronted op=rebind flow=straight observe=writeback
-# CLASSIFICATION: 2 silent 誤実行
-#   cpython='fresh\n' lyc='old\n'
+# CLASSIFICATION @ kernel/4a 95cf6f7: 1 正しい
 # CPython 3.14 expects: fresh
 
 import io

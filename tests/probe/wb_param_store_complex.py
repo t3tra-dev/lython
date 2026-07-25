@@ -1,7 +1,6 @@
 # probe: callee stores into a borrowed receiver's complex field; caller reads it back
 # axes: acquire=param width=complex op=rebind flow=straight observe=writeback
-# CLASSIFICATION: 2 silent 誤実行
-#   cpython='(1+2j)\n' lyc='0j\n'
+# CLASSIFICATION @ kernel/4a 95cf6f7: 1 正しい
 # CPython 3.14 expects: (1+2j)
 
 class Box:

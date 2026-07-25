@@ -6,8 +6,7 @@
 #   list は素の束縛が純粋な SSA コピーなので無料、float は素の束縛でも f64 を
 #   materialise するので無料の読み出し形が存在しない。
 # axes: acquire=call width=w2float op=rebind flow=ifone read=plain-bind
-# CLASSIFICATION: 3 loud 拒否 (MLIR verifier 失敗 = 最早境界での診断になっていない)
-#   operand #0 does not dominate this use
+# CLASSIFICATION @ kernel/4a 95cf6f7: 1 正しい
 # CPython 3.14 expects: (出力なし、正常終了)
 
 

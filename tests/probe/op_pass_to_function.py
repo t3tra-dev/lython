@@ -1,6 +1,6 @@
 # probe: an object whose field was rebound is then passed to a function
 # axes: acquire=call width=w3list op=pass-to-function flow=straight
-# CLASSIFICATION: 1 正しい
+# CLASSIFICATION @ kernel/4a 95cf6f7: 1 正しい
 # CPython 3.14 expects: 3
 
 class Box:
