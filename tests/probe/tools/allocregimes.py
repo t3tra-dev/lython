@@ -44,6 +44,15 @@ WITHOUT an oracle -- the rest of this corpus needs CPython to say what the answe
 should have been. That makes it the one regime cheap enough, and general enough,
 to sweep a whole suite with periodically.
 
+The oracle is CPython by default, which bounds what can be checked: a spelling
+CPython cannot run -- a Lython extension, a bare-annotated class constructed with
+arguments -- comes back SILENT even when it is correct, which is a false positive
+of exactly the shape this file's own docstring warns about. So a `.stdout`
+sidecar beside the input is used instead when one exists, which is how the golden
+suite already states its expectation. k-4a hit the false SILENT running this over
+goldens; the row belongs in the instrument table either way, because the domain
+is a property worth stating even now that it is wider.
+
 Exit code is the number of probes failing in at least one selected regime.
 """
 
@@ -116,8 +125,16 @@ def main():
 
     bad = 0
     for p in args.probes:
-        run.want = subprocess.run([CPY, str(p)], capture_output=True,
-                                  text=True).stdout
+        # A `.stdout` sidecar is the suite's own statement of the expectation,
+        # and it covers spellings CPython cannot run. Prefer it; fall back to
+        # CPython for probes, which have no sidecar.
+        sidecar = p.with_suffix(".stdout")
+        if sidecar.exists():
+            run.want, oracle = sidecar.read_text(), "sidecar"
+        else:
+            run.want = subprocess.run([CPY, str(p)], capture_output=True,
+                                      text=True).stdout
+            oracle = "cpython"
         cells, failed = [], False
         for name in names:
             seen = {run(lyc, p, REGIMES[name]) for _ in range(args.runs)}
@@ -126,7 +143,9 @@ def main():
                 failed = True
             cells.append(cell)
         bad += failed
-        flag = "" if not failed else "   <-- FAILS"
+        # Naming the oracle matters: a reader has to know whether a SILENT is a
+        # disagreement with CPython or with a checked-in expectation.
+        flag = f"   [{oracle}]" + ("   <-- FAILS" if failed else "")
         print(f"{p.name:{width}}  " + "  ".join(f"{c:>12}" for c in cells) + flag,
               flush=True)
 
