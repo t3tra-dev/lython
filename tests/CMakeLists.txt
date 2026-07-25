@@ -69,7 +69,7 @@ set(LYTHON_GOLDEN_RUNNER "${CMAKE_CURRENT_SOURCE_DIR}/golden/run_case.py")
 # every case: the 300s budget is what turns a genuine compiler hang into a
 # failure instead of a stalled CI job, and it should keep doing that for the
 # ~370 cases that finish in seconds.
-set(LYTHON_GOLDEN_SLOW_CASES stdlib_string_template)
+set(LYTHON_GOLDEN_SLOW_CASES stdlib_string_template stdlib_json_accessors)
 
 file(GLOB LYTHON_GOLDEN_CASES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/golden/cases/*.py")
