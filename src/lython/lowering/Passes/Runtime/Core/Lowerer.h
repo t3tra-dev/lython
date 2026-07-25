@@ -123,10 +123,14 @@ private:
   mlir::FailureOr<unsigned>
   classFieldValueOffset(mlir::Operation *op, py::ClassOp classOp,
                         unsigned fieldIndex, llvm::StringRef purpose) const;
-  // Container-contract fields are stored BOX-FRONTED (one box16 slot; the
-  // container's arrays live in the container's own box words) so in-place
-  // mutation is an indirection through a stable box pointer — branch-, loop-
-  // and realloc-safe. Erased-object fields share the same storage shape.
+  // EVERY object-contract field is stored BOX-FRONTED: one box16 slot whose
+  // pointer is fixed for the instance's lifetime, with the field's value
+  // reached through its words. A store is then a store to a heap slot rather
+  // than a replacement of the instance's SSA lanes, which is what makes it
+  // observable through a function boundary and across a branch. The exceptions
+  // are the contracts that need no indirection: int/bool live in an instance
+  // header word, a zero-lane contract has nothing to hold, and a union is not
+  // one object.
   bool classFieldStoredBoxed(mlir::Type fieldContract) const;
   mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>>
   classFieldStorageValueTypes(mlir::Operation *op, mlir::Type fieldContract,
@@ -135,6 +139,10 @@ private:
   storeBoxedFieldPayloadInPlace(mlir::Operation *op, mlir::Value box,
                                 const RuntimeBundle &value,
                                 llvm::StringRef slotName);
+  mlir::LogicalResult updateBoxedFieldPayloadWords(mlir::Operation *op,
+                                                   mlir::Value box,
+                                                   const RuntimeBundle &payload,
+                                                   llvm::StringRef slotName);
   // R6 nonlocal cells: emitter-synthesized one-field classes whose field
   // slot is a box16 written IN PLACE (never spliced into new SSA lanes), so
   // every frame sharing the cell instance observes one mutable slot.
@@ -490,6 +498,7 @@ private:
   std::uint64_t collectionInitialCapacity(std::uint64_t arity) const;
   static bool isMutableContainerContractName(llvm::StringRef contract);
   static void demoteMutableContainerEvidence(RuntimeBundle &bundle);
+  void dropObjectFieldEvidence(RuntimeBundle &bundle);
   void demoteMutableContainerEvidenceFor(mlir::Value value);
   void demoteMutableContainerArgumentEvidence(py::CallOp op);
   mlir::FailureOr<mlir::Value>

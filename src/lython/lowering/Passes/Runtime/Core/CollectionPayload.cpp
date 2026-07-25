@@ -63,12 +63,46 @@ void RuntimeBundleLowerer::demoteMutableContainerEvidence(
   bundle.mappingCapacity = 0;
 }
 
+// A class instance's fieldBundles are a CACHE of what this walk last stored
+// into the instance's box-fronted field slots. Every field store lands in the
+// slot, so any frame holding the instance can replace a field's value without
+// this walk seeing it — and then the cache names a value the program has
+// already dropped. Dropping the cache costs a reload from the box words and is
+// always semantics-preserving; keeping it past a boundary is a silent
+// mis-execution (`def set(b): b.f = 1.5` observed by the caller).
+void RuntimeBundleLowerer::dropObjectFieldEvidence(RuntimeBundle &bundle) {
+  if (bundle.kind != RuntimeBundle::Kind::Object || bundle.fieldBundles.empty())
+    return;
+  // Only the fields whose storage IS the box slot: a union field or an int in a
+  // header word cannot be reloaded from box words, so its evidence is the only
+  // description of it and dropping it would lose the value outright. Those are
+  // exactly the fields a store still re-roots, i.e. the residual §4a does not
+  // repair.
+  py::ClassOp classOp =
+      RuntimeBundleLowerer::classForContract(bundle.objectValue.contract);
+  if (!classOp)
+    return;
+  auto fieldNames = classOp->getAttrOfType<mlir::ArrayAttr>("field_names");
+  llvm::SmallVector<mlir::Type, 8> fieldTypes =
+      RuntimeBundleLowerer::classFieldContractTypes(classOp);
+  if (!fieldNames || fieldNames.size() != fieldTypes.size())
+    return;
+  for (auto [index, nameAttr] : llvm::enumerate(fieldNames)) {
+    auto name = mlir::dyn_cast<mlir::StringAttr>(nameAttr);
+    if (!name ||
+        !RuntimeBundleLowerer::classFieldStoredBoxed(fieldTypes[index]))
+      continue;
+    bundle.fieldBundles.erase(name.getValue());
+  }
+}
+
 void RuntimeBundleLowerer::demoteMutableContainerEvidenceFor(
     mlir::Value value) {
   auto found = valueBundles.find(value);
   if (found == valueBundles.end())
     return;
   demoteMutableContainerEvidence(found->second);
+  dropObjectFieldEvidence(found->second);
 }
 
 void RuntimeBundleLowerer::demoteMutableContainerArgumentEvidence(
