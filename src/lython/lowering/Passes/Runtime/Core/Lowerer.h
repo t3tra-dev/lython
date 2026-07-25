@@ -146,7 +146,7 @@ private:
                                               const RuntimeBundle &object,
                                               const RuntimeBundle &value,
                                               mlir::Type fieldType,
-                                              unsigned slot,
+                                              unsigned fieldIndex,
                                               llvm::StringRef fieldName);
   mlir::FailureOr<RuntimeBundle>
   storeBoxedFieldPayloadInPlace(mlir::Operation *op, mlir::Value box,

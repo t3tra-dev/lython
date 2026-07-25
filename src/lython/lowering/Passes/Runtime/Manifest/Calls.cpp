@@ -546,8 +546,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
         return mlir::failure();
       if (storageTypes->empty()) {
         if (mlir::failed(RuntimeBundleLowerer::storePrimitiveFieldSlot(
-                op, *instance, *fieldValue, fieldTypes[index],
-                static_cast<unsigned>(box_abi::kPointerWordBase) + index,
+                op, *instance, *fieldValue, fieldTypes[index], index,
                 fieldName)))
           return mlir::failure();
         updatedFieldBundles[index] =
@@ -594,17 +593,17 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
         slotValue = std::move(*storageValue);
       }
 
-      llvm::SmallVector<mlir::Type, 8> *fieldValueTypes = &*storageTypes;
+      llvm::SmallVector<mlir::Type, 8> &fieldValueTypes = *storageTypes;
       mlir::FailureOr<unsigned> offset =
           RuntimeBundleLowerer::classFieldValueOffset(op, classOp, index,
                                                       "class field ABI");
       if (mlir::failed(offset))
         return mlir::failure();
-      if (*offset + fieldValueTypes->size() > values.size())
+      if (*offset + fieldValueTypes.size() > values.size())
         return op.emitError() << "class field ABI exceeds object payload";
       llvm::SmallVector<mlir::Value, 4> oldValues;
-      oldValues.reserve(fieldValueTypes->size());
-      for (unsigned fieldOffset = 0; fieldOffset < fieldValueTypes->size();
+      oldValues.reserve(fieldValueTypes.size());
+      for (unsigned fieldOffset = 0; fieldOffset < fieldValueTypes.size();
            ++fieldOffset)
         oldValues.push_back(values[*offset + fieldOffset]);
       std::string slotName = (llvm::Twine("class.") + fieldName).str();

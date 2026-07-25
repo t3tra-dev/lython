@@ -264,8 +264,12 @@ RuntimeBundleLowerer::storeBoxedFieldPayloadInPlace(mlir::Operation *op,
 
 mlir::LogicalResult RuntimeBundleLowerer::storePrimitiveFieldSlot(
     mlir::Operation *op, const RuntimeBundle &object,
-    const RuntimeBundle &value, mlir::Type fieldType, unsigned slot,
+    const RuntimeBundle &value, mlir::Type fieldType, unsigned fieldIndex,
     llvm::StringRef fieldName) {
+  std::optional<unsigned> slot = primitiveFieldSlot(fieldType, fieldIndex);
+  if (!slot)
+    return op->emitError() << "field '" << fieldName << "' of " << fieldType
+                           << " has no instance header word";
   builder.setInsertionPoint(op);
   mlir::Location loc = op->getLoc();
   mlir::Value word;
@@ -312,7 +316,7 @@ mlir::LogicalResult RuntimeBundleLowerer::storePrimitiveFieldSlot(
   if (mlir::failed(header))
     return mlir::failure();
   mlir::Value slotIndex =
-      mlir::arith::ConstantIndexOp::create(builder, loc, slot).getResult();
+      mlir::arith::ConstantIndexOp::create(builder, loc, *slot).getResult();
   mlir::memref::StoreOp::create(builder, loc, word, *header, slotIndex);
   return mlir::success();
 }
@@ -1176,10 +1180,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
     return RuntimeBundleLowerer::lowerExceptionFieldAttrSet(
         op, *object, *value, classOp, *fieldIndex);
 
-  if (std::optional<unsigned> primitiveSlot =
-          primitiveFieldSlot(fieldTypes[*fieldIndex], *fieldIndex)) {
+  if (primitiveFieldSlot(fieldTypes[*fieldIndex], *fieldIndex)) {
     if (mlir::failed(RuntimeBundleLowerer::storePrimitiveFieldSlot(
-            op, *object, *value, fieldTypes[*fieldIndex], *primitiveSlot,
+            op, *object, *value, fieldTypes[*fieldIndex], *fieldIndex,
             op.getName())))
       return mlir::failure();
     erase.push_back(op);

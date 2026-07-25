@@ -73,11 +73,14 @@ void RuntimeBundleLowerer::demoteMutableContainerEvidence(
 void RuntimeBundleLowerer::dropObjectFieldEvidence(RuntimeBundle &bundle) {
   if (bundle.kind != RuntimeBundle::Kind::Object || bundle.fieldBundles.empty())
     return;
-  // Only the fields whose storage IS the box slot: a union field or an int in a
-  // header word cannot be reloaded from box words, so its evidence is the only
-  // description of it and dropping it would lose the value outright. Those are
-  // exactly the fields a store still re-roots, i.e. the residual §4a does not
-  // repair.
+  // Only the fields whose storage IS a box slot, since only those can be
+  // reloaded from it. The residual shapes (a union field, an int past the last
+  // header word) still keep their value in the instance's lanes, so their
+  // evidence is the only description of it and dropping it would lose the value
+  // outright -- they are exactly the fields a store still re-roots, and they
+  // keep the pre-4a defect along with the pre-4a cache. A header-word field
+  // needs no entry either way: its load reads the word and never consults this
+  // map.
   py::ClassOp classOp =
       RuntimeBundleLowerer::classForContract(bundle.objectValue.contract);
   if (!classOp)
