@@ -44,6 +44,13 @@ WITHOUT an oracle -- the rest of this corpus needs CPython to say what the answe
 should have been. That makes it the one regime cheap enough, and general enough,
 to sweep a whole suite with periodically.
 
+The expectation has TWO parts and this tool needed both. It read `.stdout` and
+assumed status 0, so `sys_exit.py` -- which deliberately ends with 5, and says so
+in an `.exitcode` sidecar -- came back `reject <-- FAILS` on a sweep where its
+output matched exactly. Same domain hole as requiring a filename extension, found
+the same way: by pointing this at inputs the workflow it was built for does not
+produce. It now reads `.exitcode` when there is one.
+
 The oracle is CPython by default, which bounds what can be checked: a spelling
 CPython cannot run -- a Lython extension, a bare-annotated class constructed with
 arguments -- comes back SILENT even when it is correct, which is a false positive
@@ -121,7 +128,13 @@ def run(lyc, case, env_extra, timeout=900.0):
     err = "\n".join(l for l in r.stderr.splitlines()
                     if not l.startswith("GuardMalloc["))
     want = run.want
-    if r.returncode == 0:
+    # A non-zero exit is not by itself a failure: the golden suite states an
+    # expected status in an `.exitcode` sidecar, and `sys_exit.py` deliberately
+    # ends with 5. Reading only `.stdout` reported it as `reject <-- FAILS` on a
+    # sweep where its output matched exactly -- the same domain hole as requiring
+    # a file extension, found the same way, by feeding this tool inputs the
+    # workflow it was built for does not produce.
+    if r.returncode == run.want_rc:
         return "ok" if r.stdout == want else f"SILENT({r.stdout.strip()})"
     if REFCOUNT.search(r.stdout + err):
         return "abort"
@@ -165,6 +178,9 @@ def main():
             run.want = subprocess.run([CPY, str(p)], capture_output=True,
                                       text=True).stdout
             oracle = "cpython"
+        # And the expected STATUS, which the suite states separately.
+        status = p.with_suffix(".exitcode")
+        run.want_rc = int(status.read_text().strip()) if status.exists() else 0
         cells, failed = [], False
         for name in names:
             seen = {run(lyc, p, REGIMES[name]) for _ in range(args.runs)}
