@@ -892,6 +892,16 @@ bool releaseOwnedGroupByLiveness(
   // A branch that forwards every group value back into its OWN block-argument
   // position (a loop continue edge) transfers the token identically into the
   // next iteration: it is neither a use nor a death.
+  //
+  // "Not a use" must not be read as "not live". The self-forward is the last
+  // thing that touches the value on that path, so if it does not keep the value
+  // live up to the branch, the block holding the last ORDINARY use looks like
+  // the end of the value's life and gets a release there -- which the back edge
+  // then walks straight past. That stayed hidden only while every container
+  // mutation CONSUMED its receiver: the consuming call marked the block instead.
+  // A void in-place mutation, which is what interior-behind-the-handle makes
+  // possible, removes that marker and exposes the gap.
+  llvm::SmallPtrSet<mlir::Block *, 4> identityForwardBlocks;
   auto isIdentitySelfForward = [&](mlir::Operation *user) {
     if (!consumeIsDeath)
       return false;
@@ -1048,8 +1058,12 @@ bool releaseOwnedGroupByLiveness(
           continue;
         }
         if (user->hasTrait<mlir::OpTrait::IsTerminator>() &&
-            isIdentitySelfForward(user))
+            isIdentitySelfForward(user)) {
+          identityForwardBlocks.insert(user->getBlock());
+          lastUse[user->getBlock()] =
+              latestUserInBlock(lastUse[user->getBlock()], user);
           continue;
+        }
         if (user->hasTrait<mlir::OpTrait::IsTerminator>() &&
             !mlir::isa<mlir::func::ReturnOp>(user) &&
             user->getBlock()->getParent() == region &&
@@ -1159,6 +1173,12 @@ bool releaseOwnedGroupByLiveness(
   for (mlir::Block &blockRef : *region) {
     mlir::Block *block = &blockRef;
     if (!blockIsLive(block))
+      continue;
+    // The token leaves this block on the self-forward, into the same argument
+    // group it came from. A release here would free what the next iteration
+    // reads; the loop header's argument group carries the obligation and its
+    // own liveness scan places the release where the loop exits.
+    if (identityForwardBlocks.count(block))
       continue;
     if (!liveOut[block]) {
       // The value already died here via a consuming use (e.g. back-edge

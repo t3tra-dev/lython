@@ -399,8 +399,10 @@ mlir::LogicalResult RuntimeBundleLowerer::ensureSequencePayloadCapacity(
   mlir::func::CallOp call =
       RuntimeBundleLowerer::createRuntimeCall(op->getLoc(), *ensure, operands);
   RuntimeBundle updated;
-  if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
-          op, container.objectValue.contract, call.getResults(), updated)))
+  // A handle-fronted contract's ensure_capacity returns nothing: it wrote the
+  // new bases into the handle, so the bundle it grew is still the right one.
+  if (mlir::failed(RuntimeBundleLowerer::rebindMutatedContainer(
+          op, container, call.getResults(), updated)))
     return mlir::failure();
   updated.copyEvidenceFrom(container);
   std::uint64_t oldCapacity = container.sequenceCapacity
@@ -435,8 +437,10 @@ mlir::LogicalResult RuntimeBundleLowerer::ensureDictPayloadCapacity(
   mlir::func::CallOp call =
       RuntimeBundleLowerer::createRuntimeCall(op->getLoc(), *ensure, operands);
   RuntimeBundle updated;
-  if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
-          op, container.objectValue.contract, call.getResults(), updated)))
+  // A handle-fronted contract's ensure_capacity returns nothing: it wrote the
+  // new bases into the handle, so the bundle it grew is still the right one.
+  if (mlir::failed(RuntimeBundleLowerer::rebindMutatedContainer(
+          op, container, call.getResults(), updated)))
     return mlir::failure();
   updated.copyEvidenceFrom(container);
   std::uint64_t oldCapacity = container.mappingCapacity

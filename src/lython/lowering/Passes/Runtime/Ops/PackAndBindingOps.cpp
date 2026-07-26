@@ -248,8 +248,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPack(py::PackOp op) {
             RuntimeBundleLowerer::createRuntimeCall(loc, *setItemBox,
                                                     operands);
         RuntimeBundle updated;
-        if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
-                op, op.getResult().getType(), call.getResults(), updated)))
+        if (mlir::failed(RuntimeBundleLowerer::rebindMutatedContainer(
+                op, bundle, call.getResults(), updated)))
           return mlir::failure();
         bundle = std::move(updated);
       }
