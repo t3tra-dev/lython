@@ -868,7 +868,7 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeSequenceGetItem(
   if ((container.contractName() != "builtins.list" &&
        container.contractName() != "builtins.tuple") ||
       !container.sequenceElements.empty() ||
-      container.physicalValues().size() < 3)
+      !RuntimeBundleLowerer::containerHasRuntimePayload(container))
     return false;
   mlir::Type elementContract = op.getResult().getType();
   mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> shapes =
@@ -906,12 +906,12 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeSequenceGetItem(
     }
   }
   mlir::Value zero = mlir::arith::ConstantIntOp::create(builder, loc, 0, 64);
-  mlir::Value lengthSlot =
-      mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult();
-  mlir::Value length = mlir::memref::LoadOp::create(
-                           builder, loc, container.physicalValues()[1],
-                           lengthSlot)
-                           .getResult();
+  mlir::FailureOr<mlir::Value> lengthOr =
+      RuntimeBundleLowerer::loadContainerLength(op, container,
+                                                "runtime list getitem");
+  if (mlir::failed(lengthOr))
+    return mlir::failure();
+  mlir::Value length = *lengthOr;
   mlir::Value isNegative = mlir::arith::CmpIOp::create(
       builder, loc, mlir::arith::CmpIPredicate::slt, raw, zero);
   mlir::Value adjusted =
@@ -943,6 +943,11 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeSequenceGetItem(
       mlir::arith::SelectOp::create(builder, loc, inRange, normalized, zero)
           .getResult();
   llvm::SmallVector<mlir::Value, 4> elementValues;
+  mlir::FailureOr<mlir::Value> itemsView =
+      RuntimeBundleLowerer::containerInteriorView(
+          op, container, ContainerInterior::Primary, "runtime list getitem");
+  if (mlir::failed(itemsView))
+    return mlir::failure();
   if (runtimeContractName(elementContract) == "builtins.object") {
     // Erased read lane: see lowerRuntimeDictGetItem.
     std::optional<RuntimeSymbol> fromSlot =
@@ -952,8 +957,7 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeSequenceGetItem(
       return mlir::failure();
     }
     mlir::func::CallOp boxed = RuntimeBundleLowerer::createRuntimeCall(
-        loc, *fromSlot,
-        mlir::ValueRange{container.physicalValues()[2], safe, inRange});
+        loc, *fromSlot, mlir::ValueRange{*itemsView, safe, inRange});
     elementValues.push_back(boxed.getResult(0));
   } else {
     mlir::Value wordsPerSlot = mlir::arith::ConstantIntOp::create(
@@ -963,10 +967,10 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeSequenceGetItem(
             .getResult();
     for (auto [position, shape] : llvm::enumerate(*shapes)) {
       mlir::Value pointerWord = loadContainerBoxWord(
-          builder, loc, container.physicalValues()[2], base,
+          builder, loc, *itemsView, base,
           box_abi::kPointerWordBase + static_cast<std::int64_t>(position));
       mlir::Value sizeWord = loadContainerBoxWord(
-          builder, loc, container.physicalValues()[2], base,
+          builder, loc, *itemsView, base,
           box_abi::kSizeWordBase + static_cast<std::int64_t>(position));
       elementValues.push_back(RuntimeBundleLowerer::memrefFromBoxWords(
           builder, loc, pointerWord, sizeWord,
@@ -1001,7 +1005,7 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeDictGetItem(
   RuntimeBundle container = containerRef;
   RuntimeBundle index = indexRef;
   if (container.contractName() != "builtins.dict" ||
-      container.physicalValues().size() < 5)
+      !RuntimeBundleLowerer::containerHasRuntimePayload(container))
     return false;
   if (index.kind != RuntimeBundle::Kind::Object)
     return false;
@@ -1074,6 +1078,11 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeDictGetItem(
       mlir::arith::SelectOp::create(builder, loc, missing, zero, found)
           .getResult();
   llvm::SmallVector<mlir::Value, 4> resultValues;
+  mlir::FailureOr<mlir::Value> valuesView =
+      RuntimeBundleLowerer::containerInteriorView(
+          op, container, ContainerInterior::Secondary, "runtime dict getitem");
+  if (mlir::failed(valuesView))
+    return mlir::failure();
   if (runtimeContractName(valueContract) == "builtins.object") {
     // Erased read lane: box the slot's canonical payload handle into a
     // fresh owned object box (the slot's raw words are not an object box).
@@ -1087,8 +1096,7 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeDictGetItem(
     mlir::Value present =
         mlir::arith::XOrIOp::create(builder, loc, missing, one1).getResult();
     mlir::func::CallOp boxed = RuntimeBundleLowerer::createRuntimeCall(
-        loc, *fromSlot,
-        mlir::ValueRange{container.physicalValues()[3], safe, present});
+        loc, *fromSlot, mlir::ValueRange{*valuesView, safe, present});
     resultValues.push_back(boxed.getResult(0));
   } else {
     mlir::Value wordsPerSlot = mlir::arith::ConstantIntOp::create(
@@ -1098,10 +1106,10 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeDictGetItem(
             .getResult();
     for (auto [position, shape] : llvm::enumerate(*shapes)) {
       mlir::Value pointerWord = loadContainerBoxWord(
-          builder, loc, container.physicalValues()[3], base,
+          builder, loc, *valuesView, base,
           box_abi::kPointerWordBase + static_cast<std::int64_t>(position));
       mlir::Value sizeWord = loadContainerBoxWord(
-          builder, loc, container.physicalValues()[3], base,
+          builder, loc, *valuesView, base,
           box_abi::kSizeWordBase + static_cast<std::int64_t>(position));
       resultValues.push_back(RuntimeBundleLowerer::memrefFromBoxWords(
           builder, loc, pointerWord, sizeWord,

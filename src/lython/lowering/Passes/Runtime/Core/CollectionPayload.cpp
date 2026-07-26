@@ -464,9 +464,6 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeSequencePayload(
     llvm::ArrayRef<mlir::Value> logicalSources) {
   if (!isSequenceCollection(container.contractName()))
     return mlir::success();
-  if (container.physicalValues().size() < 3)
-    return op->emitError() << container.contractName()
-                           << " has no physical item payload";
   container.sequenceCapacity =
       RuntimeBundleLowerer::collectionInitialCapacity(elements.size());
   container.sequenceEvidenceBacked = true;
@@ -537,9 +534,6 @@ mlir::LogicalResult RuntimeBundleLowerer::storeSequencePayloadElement(
     const RuntimeBundle &element) {
   if (!isSequenceCollection(container.contractName()))
     return mlir::success();
-  if (container.physicalValues().size() < 3)
-    return op->emitError() << container.contractName()
-                           << " has no physical item payload";
   if (mlir::failed(RuntimeBundleLowerer::ensureSequencePayloadCapacity(
           op, container, index, container.contractName())))
     return mlir::failure();
@@ -547,8 +541,16 @@ mlir::LogicalResult RuntimeBundleLowerer::storeSequencePayloadElement(
       RuntimeBundleLowerer::objectPayloadHandleWords(op, element);
   if (mlir::failed(words))
     return mlir::failure();
-  return storePayloadHandle(op, builder, container.physicalValues()[2], index,
-                            *words, container.contractName());
+  // Derived after ensureSequencePayloadCapacity: growing may have moved the
+  // array, and a view taken before the growth would name the old one.
+  mlir::FailureOr<mlir::Value> items =
+      RuntimeBundleLowerer::containerInteriorView(
+          op, container, ContainerInterior::Primary,
+          container.contractName());
+  if (mlir::failed(items))
+    return mlir::failure();
+  return storePayloadHandle(op, builder, *items, index, *words,
+                            container.contractName());
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::storeSequencePayloadElementAt(
@@ -557,28 +559,34 @@ mlir::LogicalResult RuntimeBundleLowerer::storeSequencePayloadElementAt(
   if (!isSequenceCollection(container.contractName()))
     return op->emitError() << container.contractName()
                            << " is not a sequence collection";
-  if (container.physicalValues().size() < 3)
-    return op->emitError() << container.contractName()
-                           << " has no physical item payload";
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
       RuntimeBundleLowerer::objectPayloadHandleWords(op, element);
   if (mlir::failed(words))
     return mlir::failure();
-  return storePayloadHandleAt(op, builder, container.physicalValues()[2],
-                              logicalIndex, *words, container.contractName());
+  mlir::FailureOr<mlir::Value> items =
+      RuntimeBundleLowerer::containerInteriorView(
+          op, container, ContainerInterior::Primary,
+          container.contractName());
+  if (mlir::failed(items))
+    return mlir::failure();
+  return storePayloadHandleAt(op, builder, *items, logicalIndex, *words,
+                              container.contractName());
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::clearSequencePayloadElement(
     mlir::Operation *op, RuntimeBundle &container, unsigned index) {
   if (!isSequenceCollection(container.contractName()))
     return mlir::success();
-  if (container.physicalValues().size() < 3)
-    return op->emitError() << container.contractName()
-                           << " has no physical item payload";
   if (container.sequenceCapacity && index >= container.sequenceCapacity)
     return op->emitError() << container.contractName()
                            << " payload clear index exceeds capacity";
-  return clearPayloadHandle(op, builder, container.physicalValues()[2], index,
+  mlir::FailureOr<mlir::Value> items =
+      RuntimeBundleLowerer::containerInteriorView(
+          op, container, ContainerInterior::Primary,
+          container.contractName());
+  if (mlir::failed(items))
+    return mlir::failure();
+  return clearPayloadHandle(op, builder, *items, index,
                             container.contractName());
 }
 
@@ -663,8 +671,6 @@ mlir::LogicalResult RuntimeBundleLowerer::storeDictKeyPayload(
     const RuntimeBundle &key) {
   if (container.contractName() != "builtins.dict")
     return mlir::success();
-  if (container.physicalValues().size() < 5)
-    return op->emitError() << "dict has no physical payload arrays";
   if (mlir::failed(RuntimeBundleLowerer::ensureDictPayloadCapacity(
           op, container, index)))
     return mlir::failure();
@@ -672,8 +678,12 @@ mlir::LogicalResult RuntimeBundleLowerer::storeDictKeyPayload(
       RuntimeBundleLowerer::objectPayloadHandleWords(op, key);
   if (mlir::failed(words))
     return mlir::failure();
-  return storePayloadHandle(op, builder, container.physicalValues()[2], index,
-                            *words, "dict keys");
+  mlir::FailureOr<mlir::Value> keys =
+      RuntimeBundleLowerer::containerInteriorView(
+          op, container, ContainerInterior::Primary, "dict keys");
+  if (mlir::failed(keys))
+    return mlir::failure();
+  return storePayloadHandle(op, builder, *keys, index, *words, "dict keys");
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::storeDictValuePayload(
@@ -681,8 +691,6 @@ mlir::LogicalResult RuntimeBundleLowerer::storeDictValuePayload(
     const RuntimeBundle &value) {
   if (container.contractName() != "builtins.dict")
     return mlir::success();
-  if (container.physicalValues().size() < 5)
-    return op->emitError() << "dict has no physical payload arrays";
   if (mlir::failed(RuntimeBundleLowerer::ensureDictPayloadCapacity(
           op, container, index)))
     return mlir::failure();
@@ -690,11 +698,20 @@ mlir::LogicalResult RuntimeBundleLowerer::storeDictValuePayload(
       RuntimeBundleLowerer::objectPayloadHandleWords(op, value);
   if (mlir::failed(words))
     return mlir::failure();
-  if (mlir::failed(storePayloadHandle(op, builder,
-                                      container.physicalValues()[3], index,
-                                      *words, "dict values")))
+  mlir::FailureOr<mlir::Value> valuesArray =
+      RuntimeBundleLowerer::containerInteriorView(
+          op, container, ContainerInterior::Secondary, "dict values");
+  if (mlir::failed(valuesArray))
     return mlir::failure();
-  return storePayloadWord(op, builder, container.physicalValues()[4], index,
+  if (mlir::failed(storePayloadHandle(op, builder, *valuesArray, index, *words,
+                                      "dict values")))
+    return mlir::failure();
+  mlir::FailureOr<mlir::Value> present =
+      RuntimeBundleLowerer::containerInteriorView(
+          op, container, ContainerInterior::Present, "dict present");
+  if (mlir::failed(present))
+    return mlir::failure();
+  return storePayloadWord(op, builder, *present, index,
                           constantI64(builder, op->getLoc(), 1),
                           "dict present");
 }
@@ -703,28 +720,37 @@ mlir::LogicalResult RuntimeBundleLowerer::clearDictKeyPayload(
     mlir::Operation *op, RuntimeBundle &container, unsigned index) {
   if (container.contractName() != "builtins.dict")
     return mlir::success();
-  if (container.physicalValues().size() < 5)
-    return op->emitError() << "dict has no physical payload arrays";
   if (container.mappingCapacity && index >= container.mappingCapacity)
     return op->emitError() << "dict payload clear index exceeds capacity";
-  return clearPayloadHandle(op, builder, container.physicalValues()[2], index,
-                            "dict keys");
+  mlir::FailureOr<mlir::Value> keys =
+      RuntimeBundleLowerer::containerInteriorView(
+          op, container, ContainerInterior::Primary, "dict keys");
+  if (mlir::failed(keys))
+    return mlir::failure();
+  return clearPayloadHandle(op, builder, *keys, index, "dict keys");
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::clearDictValuePayload(
     mlir::Operation *op, RuntimeBundle &container, unsigned index) {
   if (container.contractName() != "builtins.dict")
     return mlir::success();
-  if (container.physicalValues().size() < 5)
-    return op->emitError() << "dict has no physical payload arrays";
   if (container.mappingCapacity && index >= container.mappingCapacity)
     return op->emitError() << "dict payload clear index exceeds capacity";
   mlir::Value zero = constantI64(builder, op->getLoc(), 0);
-  if (mlir::failed(clearPayloadHandle(
-          op, builder, container.physicalValues()[3], index, "dict values")))
+  mlir::FailureOr<mlir::Value> valuesArray =
+      RuntimeBundleLowerer::containerInteriorView(
+          op, container, ContainerInterior::Secondary, "dict values");
+  if (mlir::failed(valuesArray))
     return mlir::failure();
-  return storePayloadWord(op, builder, container.physicalValues()[4], index,
-                          zero, "dict present");
+  if (mlir::failed(
+          clearPayloadHandle(op, builder, *valuesArray, index, "dict values")))
+    return mlir::failure();
+  mlir::FailureOr<mlir::Value> present =
+      RuntimeBundleLowerer::containerInteriorView(
+          op, container, ContainerInterior::Present, "dict present");
+  if (mlir::failed(present))
+    return mlir::failure();
+  return storePayloadWord(op, builder, *present, index, zero, "dict present");
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::clearDictPayloadEntry(

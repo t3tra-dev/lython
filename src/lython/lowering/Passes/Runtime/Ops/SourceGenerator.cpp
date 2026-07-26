@@ -864,9 +864,8 @@ RuntimeBundleLowerer::emitSourceGeneratorResumeDispatch(
 
     builder.setInsertionPointToStart(&branch.getThenRegion().front());
     mlir::FailureOr<mlir::Value> runtimeLength =
-        collection_abi::loadCollectionLength(op, builder,
-                                             *delegatedIndexedIterable,
-                                             "source generator yield from");
+        RuntimeBundleLowerer::loadContainerLength(
+            op, *delegatedIndexedIterable, "source generator yield from");
     if (mlir::failed(runtimeLength))
       return mlir::failure();
     mlir::Location loc = op->getLoc();

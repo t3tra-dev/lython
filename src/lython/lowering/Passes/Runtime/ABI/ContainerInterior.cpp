@@ -1,0 +1,224 @@
+#include "Runtime/Core/Lowerer.h"
+
+#include "Runtime/ABI/BoxLayout.h"
+#include "Runtime/ABI/CollectionPayload.h"
+#include "Runtime/ABI/ContainerLayout.h"
+
+namespace py::lowering {
+namespace {
+
+// A container handle is a rank-1 i64 memref wide enough for the layout in
+// ContainerLayout.h. Checked rather than assumed: `builtins.object` handles
+// and boxed slots are also rank-1 i64 memrefs, and width is not a proof of
+// kind (rfc/memory-safety-proof.md, `Provenance`) -- this only rules out
+// reading past the end of something that is not a container handle at all.
+bool isContainerHandleType(mlir::Type type) {
+  auto memref = mlir::dyn_cast<mlir::MemRefType>(type);
+  if (!memref || memref.getRank() != 1 || !memref.hasStaticShape())
+    return false;
+  if (memref.getDimSize(0) < container_abi::kHandleWordCount)
+    return false;
+  auto element = mlir::dyn_cast<mlir::IntegerType>(memref.getElementType());
+  return element && element.getWidth() == 64;
+}
+
+bool isRankOneI64Memref(mlir::Type type) {
+  auto memref = mlir::dyn_cast<mlir::MemRefType>(type);
+  if (!memref || memref.getRank() != 1)
+    return false;
+  auto element = mlir::dyn_cast<mlir::IntegerType>(memref.getElementType());
+  return element && element.getWidth() == 64;
+}
+
+} // namespace
+
+bool RuntimeBundleLowerer::containerIsHandleFronted(
+    const RuntimeBundle &container) const {
+  llvm::ArrayRef<mlir::Value> values = container.physicalValues();
+  return values.size() == 1 && isContainerHandleType(values.front().getType());
+}
+
+// True when `container` carries a runtime payload the lowering can read or
+// write. This is the gate every runtime-mode container path gets to before it
+// touches the payload, and it is spelled once because the answer is a LANE
+// COUNT for a lane-carrying contract and a HANDLE LAYOUT for a handle-fronted
+// one. A gate that spelled the lane count itself would not fail when a
+// contract converts -- it would quietly decide the container has no payload
+// and take the evidence path, which is the "silently mis-execute" shape.
+bool RuntimeBundleLowerer::containerHasRuntimePayload(
+    const RuntimeBundle &container) const {
+  if (RuntimeBundleLowerer::containerIsHandleFronted(container))
+    return true;
+  std::size_t lanes = container.contractName() == "builtins.dict" ? 5u : 3u;
+  return container.physicalValues().size() >= lanes;
+}
+
+// Slot of the {length, capacity} pair, and the memref it lives in. A
+// lane-carrying contract keeps the pair in its own `meta` lane; a
+// handle-fronted one keeps it in words 2/3 of the handle, in the same order,
+// so only the base and the slot offset differ.
+mlir::FailureOr<std::pair<mlir::Value, mlir::Value>>
+RuntimeBundleLowerer::containerMetaSlot(mlir::Operation *op,
+                                        const RuntimeBundle &container,
+                                        std::int64_t slot,
+                                        llvm::StringRef label) {
+  llvm::ArrayRef<mlir::Value> values = container.physicalValues();
+  mlir::Location loc = op->getLoc();
+  if (RuntimeBundleLowerer::containerIsHandleFronted(container)) {
+    mlir::Value word = mlir::arith::ConstantIndexOp::create(
+                           builder, loc, container_abi::kLengthWord + slot)
+                           .getResult();
+    return std::make_pair(values.front(), word);
+  }
+  if (values.size() < 2)
+    return op->emitError() << label
+                           << " collection has no physical length metadata";
+  if (!collection_abi::isCollectionMetaType(values[1].getType()))
+    return op->emitError() << label
+                           << " collection length metadata has invalid type "
+                           << values[1].getType();
+  mlir::Value index =
+      mlir::arith::ConstantIndexOp::create(builder, loc, slot).getResult();
+  return std::make_pair(values[1], index);
+}
+
+mlir::FailureOr<mlir::Value>
+RuntimeBundleLowerer::loadContainerLength(mlir::Operation *op,
+                                          const RuntimeBundle &container,
+                                          llvm::StringRef label) {
+  mlir::FailureOr<std::pair<mlir::Value, mlir::Value>> slot =
+      RuntimeBundleLowerer::containerMetaSlot(
+          op, container, container_abi::kMetaLengthSlot, label);
+  if (mlir::failed(slot))
+    return mlir::failure();
+  return mlir::memref::LoadOp::create(builder, op->getLoc(), slot->first,
+                                      slot->second)
+      .getResult();
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::storeContainerLength(
+    mlir::Operation *op, const RuntimeBundle &container, mlir::Value length,
+    llvm::StringRef label) {
+  mlir::FailureOr<std::pair<mlir::Value, mlir::Value>> slot =
+      RuntimeBundleLowerer::containerMetaSlot(
+          op, container, container_abi::kMetaLengthSlot, label);
+  if (mlir::failed(slot))
+    return mlir::failure();
+  mlir::memref::StoreOp::create(builder, op->getLoc(), length, slot->first,
+                                slot->second);
+  return mlir::success();
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::adjustContainerLength(
+    mlir::Operation *op, const RuntimeBundle &container, std::int64_t delta,
+    llvm::StringRef label) {
+  mlir::FailureOr<std::pair<mlir::Value, mlir::Value>> slot =
+      RuntimeBundleLowerer::containerMetaSlot(
+          op, container, container_abi::kMetaLengthSlot, label);
+  if (mlir::failed(slot))
+    return mlir::failure();
+  mlir::Location loc = op->getLoc();
+  mlir::Value current = mlir::memref::LoadOp::create(builder, loc, slot->first,
+                                                     slot->second)
+                            .getResult();
+  mlir::Value one = mlir::arith::ConstantIntOp::create(builder, loc, 1, 64);
+  mlir::Value next =
+      delta >= 0
+          ? mlir::arith::AddIOp::create(builder, loc, current, one).getResult()
+          : mlir::arith::SubIOp::create(builder, loc, current, one).getResult();
+  mlir::memref::StoreOp::create(builder, loc, next, slot->first, slot->second);
+  return mlir::success();
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::touchContainerEvidenceUse(
+    mlir::Operation *op, const RuntimeBundle &container,
+    llvm::StringRef label) {
+  return mlir::failed(
+             RuntimeBundleLowerer::loadContainerLength(op, container, label))
+             ? mlir::failure()
+             : mlir::success();
+}
+
+mlir::FailureOr<mlir::Value> RuntimeBundleLowerer::containerInteriorView(
+    mlir::Operation *op, const RuntimeBundle &container,
+    ContainerInterior which, llvm::StringRef label) {
+  llvm::ArrayRef<mlir::Value> values = container.physicalValues();
+  mlir::Location loc = op->getLoc();
+  mlir::Type i64 = builder.getI64Type();
+
+  if (!RuntimeBundleLowerer::containerIsHandleFronted(container)) {
+    // Lane-carrying contract: the view IS the lane. Lane order is the
+    // manifest shape order (header, meta, primary[, secondary, present]).
+    std::size_t lane = 0;
+    switch (which) {
+    case ContainerInterior::Primary:
+      lane = 2;
+      break;
+    case ContainerInterior::Secondary:
+      lane = 3;
+      break;
+    case ContainerInterior::Present:
+      lane = 4;
+      break;
+    }
+    if (values.size() <= lane)
+      return op->emitError()
+             << label << " container has no physical interior lane " << lane
+             << " (contract " << container.contractName() << " expands to "
+             << values.size() << " physical values)";
+    if (!isRankOneI64Memref(values[lane].getType()))
+      return op->emitError() << label << " container interior lane " << lane
+                             << " has invalid type " << values[lane].getType();
+    return values[lane];
+  }
+
+  std::int64_t baseWord = container_abi::kPrimaryArrayWord;
+  bool wordPerSlot = false;
+  switch (which) {
+  case ContainerInterior::Primary:
+    baseWord = container_abi::kPrimaryArrayWord;
+    break;
+  case ContainerInterior::Secondary:
+    baseWord = container_abi::kSecondaryArrayWord;
+    break;
+  case ContainerInterior::Present:
+    baseWord = container_abi::kPresentArrayWord;
+    wordPerSlot = true;
+    break;
+  }
+
+  // The `memref.load` from the handle followed by the descriptor assembly in
+  // memrefFromBoxWords is the exact chain `collectBoxWordDerivedViews`
+  // (common/Ownership.cpp) walks, so the resulting view pins the entity until
+  // the view's last use. Deriving the base any other way (pointer arithmetic
+  // on the handle, a helper call without `ly.runtime.interior_word`) would
+  // leave the walk with nothing to follow and under-pin the handle.
+  mlir::Value handle = values.front();
+  mlir::Value baseSlot =
+      mlir::arith::ConstantIndexOp::create(builder, loc, baseWord).getResult();
+  mlir::Value arrayAddress =
+      mlir::memref::LoadOp::create(builder, loc, handle, baseSlot).getResult();
+  // The descriptor's size only feeds memref.dim/bounds queries -- every reader
+  // indexes with a slot the container's own length or capacity produced. It is
+  // still filled in honestly so a bounds query cannot read a lie.
+  mlir::Value capacitySlot =
+      mlir::arith::ConstantIndexOp::create(builder, loc,
+                                           container_abi::kCapacityWord)
+          .getResult();
+  mlir::Value capacity =
+      mlir::memref::LoadOp::create(builder, loc, handle, capacitySlot)
+          .getResult();
+  mlir::Value size =
+      wordPerSlot
+          ? capacity
+          : mlir::arith::MulIOp::create(
+                builder, loc, capacity,
+                mlir::arith::ConstantIntOp::create(builder, loc,
+                                                   box_abi::kWordsPerBox, 64))
+                .getResult();
+  return RuntimeBundleLowerer::memrefFromBoxWords(
+      builder, loc, arrayAddress, size,
+      mlir::MemRefType::get({mlir::ShapedType::kDynamic}, i64));
+}
+
+} // namespace py::lowering

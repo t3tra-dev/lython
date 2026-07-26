@@ -12,8 +12,6 @@ namespace py::lowering {
 namespace {
 
 using callable_evidence::integerLiteralFromValue;
-using collection_abi::loadCollectionLength;
-using collection_abi::touchCollectionEvidenceUse;
 
 bool isEvidenceCollection(llvm::StringRef contract) {
   return contract == "builtins.list" || contract == "builtins.tuple" ||
@@ -200,7 +198,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBool(py::BoolOp op) {
       isEvidenceCollection(input->contractName())) {
     builder.setInsertionPoint(op);
     mlir::FailureOr<mlir::Value> length =
-        loadCollectionLength(op, builder, *input, "bool");
+        RuntimeBundleLowerer::loadContainerLength(op, *input, "bool");
     if (mlir::failed(length))
       return mlir::failure();
     mlir::Value zero =
@@ -303,7 +301,7 @@ bool RuntimeBundleLowerer::demoteDictEvidenceForCrossBlockMutation(
     bundle = &found->second;
   if (!bundle || bundle->kind != RuntimeBundle::Kind::Object ||
       bundle->contractName() != "builtins.dict" ||
-      bundle->physicalValues().size() < 5 ||
+      !RuntimeBundleLowerer::containerHasRuntimePayload(*bundle) ||
       (!bundle->mappingEvidenceBacked && bundle->mappingKeys.empty()))
     return false;
   if (!RuntimeBundleLowerer::mutationCrossesStorageDefiningBlock(op, *bundle))
@@ -330,7 +328,7 @@ bool RuntimeBundleLowerer::demoteListEvidenceForCrossBlockMutation(
     bundle = &found->second;
   if (!bundle || bundle->kind != RuntimeBundle::Kind::Object ||
       bundle->contractName() != "builtins.list" ||
-      bundle->physicalValues().size() < 3 ||
+      !RuntimeBundleLowerer::containerHasRuntimePayload(*bundle) ||
       (!bundle->sequenceEvidenceBacked && bundle->sequenceElements.empty()))
     return false;
   if (!RuntimeBundleLowerer::mutationCrossesStorageDefiningBlock(op, *bundle))
@@ -382,8 +380,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
     // runtime payload path below instead.
     if (rawIndex && container.sequenceEvidenceBacked) {
       builder.setInsertionPoint(op);
-      if (mlir::failed(touchCollectionEvidenceUse(op, builder, container,
-                                                  "list setitem")))
+      if (mlir::failed(RuntimeBundleLowerer::touchContainerEvidenceUse(
+              op, container, "list setitem")))
         return mlir::failure();
       std::int64_t size =
           static_cast<std::int64_t>(container.sequenceElementBundles.size());
@@ -435,7 +433,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
       erase.push_back(op);
       return mlir::success();
     }
-    if (container.physicalValues().size() >= 3 &&
+    if (RuntimeBundleLowerer::containerHasRuntimePayload(container) &&
         value.kind == RuntimeBundle::Kind::Object) {
       // Runtime-mode store (or a dynamic index on an evidence-backed list):
       // normalize/bounds-check against the runtime length and swap the
@@ -518,7 +516,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
       container.kind == RuntimeBundle::Kind::Object &&
       container.contractName() == "builtins.dict" &&
       !container.mappingEvidenceBacked && container.mappingKeys.empty() &&
-      container.physicalValues().size() >= 5 &&
+      RuntimeBundleLowerer::containerHasRuntimePayload(container) &&
       index.kind == RuntimeBundle::Kind::Object &&
       value.kind == RuntimeBundle::Kind::Object;
   if ((structuralMutation || op.getNumResults() == 0) && runtimeDictInsert) {
@@ -615,8 +613,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
       key = *index.literalText;
     if (key) {
       builder.setInsertionPoint(op);
-      if (mlir::failed(touchCollectionEvidenceUse(op, builder, container,
-                                                  "dict setitem")))
+      if (mlir::failed(RuntimeBundleLowerer::touchContainerEvidenceUse(
+              op, container, "dict setitem")))
         return mlir::failure();
       RuntimeBundle updated = container;
       auto found = llvm::find(updated.mappingKeys, *key);
@@ -741,7 +739,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerDelItem(py::DelItemOp op) {
   if (container.kind == RuntimeBundle::Kind::Object &&
       container.contractName() == "builtins.dict" &&
       !container.mappingEvidenceBacked && container.mappingKeys.empty() &&
-      container.physicalValues().size() >= 5 &&
+      RuntimeBundleLowerer::containerHasRuntimePayload(container) &&
       index.kind == RuntimeBundle::Kind::Object) {
     // Runtime-mode dict delete: hash probe with a BORROWED transient key
     // box; the runtime raises KeyError (with the key's repr) on a miss and
@@ -805,7 +803,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerDelItem(py::DelItemOp op) {
           return mlir::failure();
       } else {
         mlir::FailureOr<mlir::Value> length =
-            loadCollectionLength(op, builder, container, "list delitem");
+            RuntimeBundleLowerer::loadContainerLength(op, container,
+                                                      "list delitem");
         if (mlir::failed(length))
           return mlir::failure();
         mlir::Value meta = container.physicalValues()[1];
@@ -859,7 +858,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerDelItem(py::DelItemOp op) {
       erase.push_back(op);
       return mlir::success();
     }
-    if (container.physicalValues().size() >= 3) {
+    if (RuntimeBundleLowerer::containerHasRuntimePayload(container)) {
       // Runtime-mode delete: bounds-check against the runtime length,
       // release the slot and compact in place (borrowed receiver).
       std::optional<RuntimeSymbol> delItem =
@@ -919,7 +918,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerDelItem(py::DelItemOp op) {
           return mlir::failure();
       } else {
         mlir::FailureOr<mlir::Value> length =
-            loadCollectionLength(op, builder, container, "dict delitem");
+            RuntimeBundleLowerer::loadContainerLength(op, container,
+                                                      "dict delitem");
         if (mlir::failed(length))
           return mlir::failure();
         mlir::Value meta = container.physicalValues()[1];
@@ -1055,12 +1055,14 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerContains(py::ContainsOp op) {
   bool runtimeSetProbe = container.kind == RuntimeBundle::Kind::Object &&
                          (container.contractName() == "builtins.set" ||
                           container.contractName() == "builtins.frozenset") &&
-                         container.physicalValues().size() >= 3;
+                         RuntimeBundleLowerer::containerHasRuntimePayload(
+                             container);
   // Evidence-backed dicts probe the payload too — a runtime key (int
   // variable, frozenset) has no literal-key evidence to consult.
   bool runtimeDictProbe = container.kind == RuntimeBundle::Kind::Object &&
                           container.contractName() == "builtins.dict" &&
-                          container.physicalValues().size() >= 5;
+                          RuntimeBundleLowerer::containerHasRuntimePayload(
+                              container);
   // Membership probe with a BORROWED transient element box (hash-based for
   // set/dict, identity-or-equality scan for list/tuple), then pin both the
   // container and the probed item past the call (the box holds raw pointer
@@ -1150,8 +1152,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerContains(py::ContainsOp op) {
     }
     if (allKnown) {
       builder.setInsertionPoint(op);
-      if (mlir::failed(touchCollectionEvidenceUse(op, builder, container,
-                                                  "sequence contains")))
+      if (mlir::failed(RuntimeBundleLowerer::touchContainerEvidenceUse(
+              op, container, "sequence contains")))
         return mlir::failure();
       mlir::Location loc = op.getLoc();
       mlir::Value result = constantI1(builder, loc, false);
@@ -1168,15 +1170,16 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerContains(py::ContainsOp op) {
       return mlir::success();
     }
   }
-  if (sequenceContainer && container.physicalValues().size() >= 3 &&
+  if (sequenceContainer &&
+      RuntimeBundleLowerer::containerHasRuntimePayload(container) &&
       item.kind == RuntimeBundle::Kind::Object)
     return emitBoxProbe();
   if (container.kind == RuntimeBundle::Kind::Object &&
       container.contractName() == "builtins.dict" &&
       !container.mappingKeys.empty() && item.contractName() == "builtins.str") {
     builder.setInsertionPoint(op);
-    if (mlir::failed(touchCollectionEvidenceUse(op, builder, container,
-                                                "dict contains")))
+    if (mlir::failed(RuntimeBundleLowerer::touchContainerEvidenceUse(
+            op, container, "dict contains")))
       return mlir::failure();
     mlir::Location loc = op.getLoc();
     mlir::Value result = constantI1(builder, loc, false);
@@ -1270,7 +1273,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIter(py::IterOp op) {
     bool runtimeListIterable = iterable->contractName() == "builtins.list" &&
                                iterable->sequenceElements.empty() &&
                                !iterable->evidenceIteratorCell &&
-                               iterable->physicalValues().size() >= 3;
+                               RuntimeBundleLowerer::
+                                   containerHasRuntimePayload(*iterable);
     // Dict key iteration: the key boxes live in the keys array at the same
     // physical positions the list uses for its items (meta at [1], boxes at
     // [2]), so the runtime-list next path applies verbatim. Evidence-backed
@@ -1281,7 +1285,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIter(py::IterOp op) {
     bool runtimeDictIterable = iterable->contractName() == "builtins.dict" &&
                                iterable->sequenceElements.empty() &&
                                !iterable->evidenceIteratorCell &&
-                               iterable->physicalValues().size() >= 5;
+                               RuntimeBundleLowerer::
+                                   containerHasRuntimePayload(*iterable);
     // Runtime sets (and frozensets — identical layout) share the list's
     // physical layout exactly (meta at [1], boxed slots at [2]), so the
     // runtime-list next path applies verbatim.
@@ -1290,14 +1295,16 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIter(py::IterOp op) {
                                    "builtins.frozenset") &&
                               iterable->sequenceElements.empty() &&
                               !iterable->evidenceIteratorCell &&
-                              iterable->physicalValues().size() >= 3;
+                              RuntimeBundleLowerer::
+                                  containerHasRuntimePayload(*iterable);
     // Runtime tuples (eg.exceptions, str.partition results, tuple(xs))
     // share the list's physical layout exactly (meta at [1], boxed slots at
     // [2]); immutable, so no mutation guard.
     bool runtimeTupleIterable = iterable->contractName() == "builtins.tuple" &&
                                 iterable->sequenceElements.empty() &&
                                 !iterable->evidenceIteratorCell &&
-                                iterable->physicalValues().size() >= 3;
+                                RuntimeBundleLowerer::
+                                   containerHasRuntimePayload(*iterable);
     if (evidenceListIterable || runtimeListIterable || runtimeDictIterable ||
         runtimeSetIterable || runtimeTupleIterable) {
       mlir::func::FuncOp function = op->getParentOfType<mlir::func::FuncOp>();
@@ -1428,7 +1435,7 @@ RuntimeBundleLowerer::lowerListRuntimeNext(py::NextOp op,
   builder.setInsertionPoint(op);
   mlir::Location loc = op.getLoc();
   mlir::Value cell = iterator.evidenceIteratorCell;
-  if (iterator.physicalValues().size() < 3)
+  if (!RuntimeBundleLowerer::containerHasRuntimePayload(iterator))
     return op.emitError() << "runtime list iterator has no physical payload";
 
   mlir::Type elementContract = op.getElement().getType();

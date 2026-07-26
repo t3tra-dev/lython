@@ -8,6 +8,7 @@ add_library(LythonRuntimeLowering STATIC
     Passes/LoweringPipeline.cpp
     Passes/Runtime/ABI/BoxLayout.cpp
     Passes/Runtime/ABI/CallableABI.cpp
+    Passes/Runtime/ABI/ContainerInterior.cpp
     Passes/Runtime/ABI/ControlFlowABI.cpp
     Passes/Runtime/ABI/AggregateOwnership.cpp
     Passes/Runtime/ABI/Returns.cpp

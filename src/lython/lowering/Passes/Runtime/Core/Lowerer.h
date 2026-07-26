@@ -558,6 +558,58 @@ private:
       mlir::Operation *op, RuntimeBundle &container,
       llvm::ArrayRef<std::shared_ptr<RuntimeBundle>> elements,
       llvm::ArrayRef<mlir::Value> logicalSources = {});
+  // Which piece of a container's interior state a view names. `Meta` is the
+  // {length, capacity} pair; `Primary` is `items` for a sequence and `keys`
+  // for a mapping; `Secondary` is a mapping's `values`; `Present` is the
+  // per-slot occupancy flags.
+  enum class ContainerInterior { Primary, Secondary, Present };
+  // Borrowed rank-1 i64 view of one piece of a container's interior state,
+  // derived AT THE POINT OF USE.
+  //
+  // Why an accessor and not a lane subscript: for a contract whose interior
+  // state lives behind the entity handle there is no lane to subscript, and
+  // for one that still carries lanes the subscript is the lane. Both spellings
+  // answer the same question, and the accessor is the only place that has to
+  // know which one a contract uses -- so a contract converts by changing its
+  // `ly.runtime.shape` and its manifest bodies, not by editing every reader.
+  //
+  // Why callers must not cache the result: a handle-fronted view is only valid
+  // while the handle's provenance is live and its base word unchanged. Naming
+  // it across a reallocation is exactly the staleness the one-lane form
+  // removes (rfc/memory-safety-proof.md, `Interior`).
+  mlir::FailureOr<mlir::Value>
+  containerInteriorView(mlir::Operation *op, const RuntimeBundle &container,
+                        ContainerInterior which, llvm::StringRef label);
+  // True when `container`'s interior state is reached through the entity
+  // handle rather than through payload lanes beside it.
+  bool containerIsHandleFronted(const RuntimeBundle &container) const;
+  // The gate for every runtime-mode container path: does this container carry
+  // a payload the lowering can reach? Never spell the lane count at a use
+  // site -- a count that stops matching reads as "no payload here" and takes
+  // the evidence path instead of failing.
+  bool containerHasRuntimePayload(const RuntimeBundle &container) const;
+  // (memref, index) pair naming one slot of a container's {length, capacity}
+  // pair. Not a view: reading the pair out of the entity's own storage keeps
+  // the handle an operand of the load, so nothing has to pin it.
+  mlir::FailureOr<std::pair<mlir::Value, mlir::Value>>
+  containerMetaSlot(mlir::Operation *op, const RuntimeBundle &container,
+                    std::int64_t slot, llvm::StringRef label);
+  mlir::FailureOr<mlir::Value> loadContainerLength(
+      mlir::Operation *op, const RuntimeBundle &container,
+      llvm::StringRef label);
+  mlir::LogicalResult storeContainerLength(mlir::Operation *op,
+                                          const RuntimeBundle &container,
+                                          mlir::Value length,
+                                          llvm::StringRef label);
+  mlir::LogicalResult adjustContainerLength(mlir::Operation *op,
+                                            const RuntimeBundle &container,
+                                            std::int64_t delta,
+                                            llvm::StringRef label);
+  // Reading the length is how an evidence-backed collection records that the
+  // runtime payload was consulted; the value itself is discarded.
+  mlir::LogicalResult touchContainerEvidenceUse(mlir::Operation *op,
+                                                const RuntimeBundle &container,
+                                                llvm::StringRef label);
   mlir::LogicalResult ensureSequencePayloadCapacity(mlir::Operation *op,
                                                     RuntimeBundle &container,
                                                     unsigned index,
