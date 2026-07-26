@@ -30,8 +30,47 @@ memory-safety defect whose visibility depends on allocator behaviour -- the clas
 this corpus exists to make deterministic.
 
     python3 tests/probe/tools/allocregimes.py ./build/bin/lyc tests/probe/alias_*.py
+    python3 tests/probe/tools/allocregimes.py ./build/bin/lyc --regimes prescribble \
+        tests/golden/cases/*.py
 
-Exit code is the number of probes failing in at least one regime.
+`--regimes` selects a subset, which matters because `prescribble` alone is worth
+running over far more code than the full set is. k-4a's observation, from using
+it on stage 4a: a dropped store into a heap slot reads back as whatever filled
+the slot, so under the system allocator it surfaces as a plausible `0` and needs
+a differential against CPython to notice, while under `prescribble` it surfaces
+as garbage or a fault and announces itself. Both silent bugs that stage found had
+printed `0`. So this is the only instrument here that catches a dropped store
+WITHOUT an oracle -- the rest of this corpus needs CPython to say what the answer
+should have been. That makes it the one regime cheap enough, and general enough,
+to sweep a whole suite with periodically.
+
+The oracle is CPython by default, which bounds what can be checked: a spelling
+CPython cannot run -- a Lython extension, a bare-annotated class constructed with
+arguments -- comes back SILENT even when it is correct, which is a false positive
+of exactly the shape this file's own docstring warns about. So a `.stdout`
+sidecar beside the input is used instead when one exists, which is how the golden
+suite already states its expectation. k-4a hit the false SILENT running this over
+goldens; the row belongs in the instrument table either way, because the domain
+is a property worth stating even now that it is wider.
+
+VALIDATING THE SIDECAR PATH, permanently and on any tree:
+
+    python3 tests/probe/tools/allocregimes.py <lyc> --regimes plain -n 1 \
+        tests/probe/tools/fixtures/sentinel_wrong_expectation.py
+
+That fixture prints one thing and its sidecar says another, so it must report
+`SILENT(actual) [sidecar]` and exit non-zero. Unlike pointing this tool at a
+known-broken probe, the fixture cannot be repaired: the mismatch is its purpose,
+so it keeps validating the comparison after every real defect has been fixed.
+k-4a's idea, and the reason it matters is one of theirs too -- evidence recorded
+from a broken tree describes a binary that will not exist for long.
+
+It validates the sidecar comparison and nothing else. `flaky.py`'s "no NOT
+STABLE" needs genuine nondeterminism, which no synthetic input supplies, and the
+CPython-oracle path must not get a deliberate mismatch, because there a mismatch
+IS a defect and a planted one would read as a real finding.
+
+Exit code is the number of probes failing in at least one selected regime.
 """
 
 import argparse
@@ -84,47 +123,51 @@ def main():
     ap.add_argument("probes", nargs="+", type=pathlib.Path)
     ap.add_argument("-n", "--runs", type=int, default=3,
                     help="runs per regime (default 3)")
+    ap.add_argument("--regimes", default=None,
+                    help="comma-separated subset, e.g. prescribble; "
+                         f"choices: {','.join(REGIMES)}")
     args = ap.parse_args()
     lyc = args.lyc.resolve()
 
-    names = list(REGIMES)
+    if args.regimes:
+        names = [r.strip() for r in args.regimes.split(",")]
+        unknown = [r for r in names if r not in REGIMES]
+        if unknown:
+            ap.error(f"unknown regime(s): {', '.join(unknown)}")
+    else:
+        names = list(REGIMES)
     width = max(len(p.name) for p in args.probes)
     print(f"{'probe':{width}}  " + "  ".join(f"{n:>12}" for n in names))
     print("-" * (width + 2 + 14 * len(names)))
 
-    bad = refused = 0
+    bad = 0
     for p in args.probes:
-        run.want = subprocess.run([CPY, str(p)], capture_output=True,
-                                  text=True).stdout
-        cells, outcomes = [], []
+        # A `.stdout` sidecar is the suite's own statement of the expectation,
+        # and it covers spellings CPython cannot run. Prefer it; fall back to
+        # CPython for probes, which have no sidecar.
+        sidecar = p.with_suffix(".stdout")
+        if sidecar.exists():
+            run.want, oracle = sidecar.read_text(), "sidecar"
+        else:
+            run.want = subprocess.run([CPY, str(p)], capture_output=True,
+                                      text=True).stdout
+            oracle = "cpython"
+        cells, failed = [], False
         for name in names:
             seen = {run(lyc, p, REGIMES[name]) for _ in range(args.runs)}
             cell = "ok" if seen == {"ok"} else "/".join(sorted(seen))
-            outcomes.append(seen)
+            if seen != {"ok"}:
+                failed = True
             cells.append(cell)
-        # A probe lyc REFUSES in every regime never ran, so there is no
-        # allocator behaviour for its outcome to depend on and this tool has
-        # nothing to say about it. Counting it would make the exit code
-        # unusable as a gate the moment the corpus holds a loud probe -- it
-        # holds fifty -- and a checker that reports a healthy tree as red
-        # teaches the reader to skim its output.
-        if all(s == {"reject"} for s in outcomes):
-            refused += 1
-            flag = "   (refused, not an allocator finding)"
-        elif any(s != {"ok"} for s in outcomes):
-            bad += 1
-            flag = "   <-- FAILS"
-        else:
-            flag = ""
+        bad += failed
+        # Naming the oracle matters: a reader has to know whether a SILENT is a
+        # disagreement with CPython or with a checked-in expectation.
+        flag = f"   [{oracle}]" + ("   <-- FAILS" if failed else "")
         print(f"{p.name:{width}}  " + "  ".join(f"{c:>12}" for c in cells) + flag,
               flush=True)
 
     print(f"\n{bad}/{len(args.probes)} probes fail in at least one regime "
           f"({args.runs} runs per regime, {len(names)} regimes)")
-    if refused:
-        print(f"{refused} refused in every regime and are not counted: a "
-              f"program that does not run cannot have an allocator-dependent "
-              f"outcome")
     return bad
 
 

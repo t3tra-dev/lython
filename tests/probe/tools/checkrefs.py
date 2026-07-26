@@ -10,6 +10,19 @@ while probes were being added and renamed, and did carry a stale pair.
 
     python3 tests/probe/tools/checkrefs.py <document> [repo-root] [--allow NAME ...]
 
+Point it at the PROBE HEADERS too, not only at prose. They cite each other and
+they cite goldens, and for a long time nothing checked them -- this tool was only
+ever run on the facts table, which is the workflow it was built for and therefore
+the one input class that could not reveal its gaps:
+
+    cat tests/probe/*.py > /tmp/headers.txt
+    python3 tests/probe/tools/checkrefs.py /tmp/headers.txt
+
+The first such run found three cross-branch citations. k-4a's framing of why is
+worth keeping: owning a tool does not blind you to its boundaries, but your
+workflow never hands it an input from outside them. To find an instrument's
+domain, deliberately feed it something the workflow would not produce.
+
 Brace groups are expanded, so `flow_ifone_w{3list,2float}_plainbind.py` is
 checked as two names. Filenames are resolved against the repo root and against
 the directories where probes, harnesses, goldens and runtime library modules
@@ -28,12 +41,19 @@ import re
 import sys
 
 # Directories a bare filename may live in.
-SEARCH = ("tests/probe", "tests/probe/tools", "tests/golden",
+SEARCH = ("tests/probe", "tests/probe/tools", "tests/probe/tools/fixtures",
           "tests/golden/cases", "tests/golden/errors", "tests/unit", "examples",
           "src/lython/runtime/lib", "src/lython/runtime/modules")
 
 CITATION = re.compile(r"[\w./{},*-]*?[\w-]+\.(?:py|mlir|stdout|exitcode|stderr-re)")
 BRACES = re.compile(r"\{([^}]*)\}")
+# Golden cases get cited by bare name -- `cases/foo`, `errors/bar` -- because
+# that is how the suite names them. Requiring an extension made every one of
+# those invisible, and an invisible citation is worse than an unresolved one:
+# the tool reports "all resolve" and the silence reads as a pass. Found by
+# applying k-4a's observation about negative results from instruments whose
+# domain was never checked, to this instrument.
+GOLDEN = re.compile(r"\b(cases|errors)/([A-Za-z_0-9]+)\b")
 
 
 def expand(name):
@@ -58,9 +78,13 @@ def main():
     root = args.root.resolve()
     allow = set(args.allow)
 
+    text = args.document.read_text()
     cited = set()
-    for raw in CITATION.findall(args.document.read_text()):
+    for raw in CITATION.findall(text):
         cited |= expand(raw)
+    # A golden cited by bare name resolves to its .py under tests/golden/.
+    for sub, name in GOLDEN.findall(text):
+        cited.add(f"tests/golden/{sub}/{name}.py")
 
     dirs = [root / d for d in SEARCH]
     missing, resolved, globs, allowed = [], 0, [], []
