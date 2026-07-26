@@ -5,9 +5,10 @@
 # loop block argument's token into an aggregate slot double-frees). CPython
 # prints boom here.
 #
-# Rejected at the emitter rather than left to the ownership verifier, which did
-# catch this spelling: verifiers are off under --release, where the same program
-# reached the JIT and crashed.
+# Rejected at the emitter rather than left to the ownership verifier, which does
+# refuse this spelling (over the loop-carried exception local, which a `raise`
+# alone is enough to produce): the verifiers are off under --release, where the
+# same program reached the JIT and crashed instead.
 kept: BaseException = ValueError("init")
 i = 0
 while i < 3:

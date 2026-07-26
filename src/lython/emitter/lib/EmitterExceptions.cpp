@@ -610,12 +610,13 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
             loopCarried = true;
       if (loopCarried) {
         // ... but with no lane able to carry the value either, the two
-        // channels' exclusions meet and the rebind reaches nothing. The
-        // ownership verifier does catch the exception-entity spelling of this
-        // (a promotion it would accept is the double-free above), yet only
-        // with verifiers ON: --release turns them off and the same program
-        // crashes in the JIT. Rejecting here instead makes the answer the same
-        // in both configurations.
+        // channels' exclusions meet and the rebind reaches nothing. Why say it
+        // here when the pipeline already refuses the exception-entity spelling:
+        // what refuses it is the ownership verifier, over a loop-carried
+        // exception local that a `raise` alone is enough to produce, and
+        // --release turns the verifiers off -- measured there as a SIGSEGV in
+        // the JIT. A diagnostic answers the same way in both configurations,
+        // and names the local instead of a runtime symbol.
         if (!postTryLaneCarrierType(content))
           diagnostics.push_back(parser::Diagnostic{
               parser::Severity::Error, statement.range.start,
