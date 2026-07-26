@@ -1,5 +1,6 @@
 #include "Runtime/Core/Lowerer.h"
 
+#include "PyProtocols.h"
 #include "Runtime/ABI/BoxLayout.h"
 
 namespace py::lowering {
@@ -57,9 +58,27 @@ mlir::FailureOr<RuntimeSymbol> RuntimeBundleLowerer::selectManifestMethod(
     // is boxed into an object handle by appendRuntimeSource).
     methods = manifest.methodCandidates("builtins.object", methodName);
   }
-  if (methods.empty())
+  if (methods.empty()) {
+    // The empty promise, named for what it is. A contract that declares
+    // `methodName` with nothing behind it used to report "runtime manifest has
+    // no X.Y method", which reads to the author as "that method does not
+    // exist" -- for a method the manifest itself declares and typeshed
+    // documents -- and so points away from the actual defect. Source-class
+    // receivers are excluded: they are compiled, so a missing method there is
+    // an emitter gap, not an unimplemented declaration.
+    mlir::Type receiverType = runtimeContractType(context, receiverContract);
+    if (!RuntimeBundleLowerer::classForContract(receiverType) &&
+        !py::protocols::Table::get(*context)
+             .methodContractCandidatesWithEvidence(receiverType, methodName)
+             .empty())
+      return op->emitError()
+             << receiverContract << "." << methodName
+             << " is declared by the standard-library contract but has no "
+                "implementation in Lython, so the call cannot be lowered; "
+                "the declaration is the defect, not the call";
     return op->emitError() << "runtime manifest has no " << receiverContract
                            << "." << methodName << " method";
+  }
 
   const RuntimeSymbol *method = nullptr;
   for (const RuntimeSymbol &candidate : methods) {

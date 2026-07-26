@@ -16,6 +16,17 @@
 # axes: width=optional op=print-unnarrowed flow=straight
 # CLASSIFICATION @ kernel/integration 935280d: 3 loud 拒否 (診断)
 #   runtime object header has invalid type 'i64'
+# RECLASSIFIED @ kernel/object-methods: 1 正しい (拒否は健全、診断が actionable に
+#   なった)。`objectPhysicalHeader` が union 型の receiver を認識し
+#   「unnarrowed <T | None> cannot be used where a concrete object is required
+#   ... Narrow it first (`if v is not None:`) ... or produce a non-Optional
+#   value (`d.get(key, default)`)」を出す。i64 は union の TAG 型であって
+#   header ではなかった、というのが元の診断の混乱の原因。
+#   golden: errors/optional_unnarrowed_object_position (+ 対照の
+#   cases/optional_dict_get_narrowed)。
+#   未着手: 戻り値位置は元の文言のまま (上の 2 つの同族位置のうち、モジュール
+#   グローバルへの単純束縛 `g = d.get("a")` は main でも既に通っており、
+#   ここに書かれた失敗形は別の形だと思われる — 再現できていない)。
 # CPython 3.14 expects: 2
 
 d: dict[str, int] = {"a": 1, "b": 2}
