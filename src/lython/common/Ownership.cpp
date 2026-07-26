@@ -322,6 +322,55 @@ bool isObjectHeaderLikeType(mlir::Type type) {
   return memref.isDynamicDim(0) || memref.getDimSize(0) >= 2;
 }
 
+bool canSpellHeaderPrefix(mlir::Type from, mlir::Type to) {
+  if (from == to)
+    return true;
+  if (mlir::memref::CastOp::areCastCompatible(from, to))
+    return true;
+  auto source = mlir::dyn_cast<mlir::MemRefType>(from);
+  auto target = mlir::dyn_cast<mlir::MemRefType>(to);
+  return source && target && source.getRank() == 1 && target.getRank() == 1 &&
+         source.hasStaticShape() && target.hasStaticShape() &&
+         source.getElementType() == target.getElementType() &&
+         source.getDimSize(0) >= target.getDimSize(0);
+}
+
+mlir::Value spellHeaderPrefix(mlir::OpBuilder &builder, mlir::Location loc,
+                              mlir::Value header, mlir::Type target) {
+  if (header.getType() == target)
+    return header;
+  if (mlir::memref::CastOp::areCastCompatible(header.getType(), target))
+    return mlir::memref::CastOp::create(builder, loc, target, header)
+        .getResult();
+  // A handle WIDER than the retain/release interface holds the refcount+class
+  // prefix inside its own static shape: a box-fronted class instance (the whole
+  // 16-word box is the entity root), and every contract whose interior state
+  // lives behind the handle rather than in lanes beside it. Take the rank-1
+  // prefix rather than declining, which is what the caller used to do.
+  auto sourceType = mlir::dyn_cast<mlir::MemRefType>(header.getType());
+  auto targetType = mlir::dyn_cast<mlir::MemRefType>(target);
+  if (!canSpellHeaderPrefix(header.getType(), target) || !sourceType ||
+      !targetType)
+    return {};
+  llvm::SmallVector<mlir::OpFoldResult, 1> offsets{builder.getIndexAttr(0)};
+  llvm::SmallVector<mlir::OpFoldResult, 1> sizes{
+      builder.getIndexAttr(targetType.getDimSize(0))};
+  llvm::SmallVector<mlir::OpFoldResult, 1> strides{builder.getIndexAttr(1)};
+  llvm::SmallVector<int64_t, 1> resultShape{targetType.getDimSize(0)};
+  auto inferredType = mlir::cast<mlir::MemRefType>(
+      mlir::memref::SubViewOp::inferRankReducedResultType(
+          resultShape, sourceType, offsets, sizes, strides));
+  mlir::Value prefix = mlir::memref::SubViewOp::create(
+                           builder, loc, inferredType, header, offsets, sizes,
+                           strides)
+                           .getResult();
+  if (prefix.getType() == target)
+    return prefix;
+  if (!mlir::memref::CastOp::areCastCompatible(prefix.getType(), target))
+    return {};
+  return mlir::memref::CastOp::create(builder, loc, target, prefix).getResult();
+}
+
 mlir::Value underlyingObjectValue(mlir::Value value) {
   while (auto cast = value.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
     if (cast.getInputs().size() != cast.getOutputs().size())
