@@ -180,8 +180,11 @@ std::string defaultReprTypeName(llvm::StringRef contract) {
   if (contract.starts_with("builtins."))
     return contract.rsplit('.').second.str();
   if (!contract.contains('.')) {
+    // A monomorphized generic's contract is the internal "<class>$specN"; the
+    // repr is program-visible text, so it has to read as the class the source
+    // wrote (the same reason dataclass reprs and exception names strip it).
     std::string qualified = "__main__.";
-    qualified += contract.str();
+    qualified += contracts::displayClassNameForContract(contract);
     return qualified;
   }
   return contract.str();
@@ -805,6 +808,24 @@ bool RuntimeBundleLowerer::isErasedObjectStorageType(mlir::Type type) const {
 
 bool RuntimeBundleLowerer::isBuiltinsObjectContract(mlir::Type type) const {
   return runtimeContractName(type) == "builtins.object";
+}
+
+bool RuntimeBundleLowerer::isInheritedObjectDunder(llvm::StringRef methodName) {
+  return methodName == "__eq__" || methodName == "__ne__" ||
+         methodName == "__hash__";
+}
+
+bool RuntimeBundleLowerer::usesInheritedObjectDunder(
+    const RuntimeSymbol &symbol, const RuntimeBundle &source) const {
+  if (symbol.contract != "builtins.object" || symbol.role != "method" ||
+      !RuntimeBundleLowerer::isInheritedObjectDunder(symbol.name))
+    return false;
+  if (source.kind != RuntimeBundle::Kind::Object ||
+      RuntimeBundleLowerer::isBuiltinsObjectContract(source.contract) ||
+      source.physicalValues().empty())
+    return false;
+  return static_cast<bool>(
+      RuntimeBundleLowerer::classForContract(source.contract));
 }
 
 const RuntimeBundle *RuntimeBundleLowerer::concreteObjectForOwnership(

@@ -397,6 +397,20 @@ private:
   bool isBuiltinsObjectHandleType(mlir::Type type) const;
   bool isErasedObjectStorageType(mlir::Type type) const;
   bool isBuiltinsObjectContract(mlir::Type type) const;
+  // The builtins.object methods a source class may INHERIT and run against its
+  // own instance (CPython's object.__eq__/__ne__/__hash__ — identity-defined,
+  // so object's implementation is correct for any subclass). object's
+  // __repr__/__str__ are deliberately absent: they render "<object object at
+  // ...>" and would lose the class name materializeDefaultObjectRepr keeps.
+  static bool isInheritedObjectDunder(llvm::StringRef methodName);
+  // True when this call is such an inherited dunder reached with a source-class
+  // receiver. The receiver has to be BOXED for it: the instance's own leading
+  // physical has the same memref type as a builtins.object handle but not the
+  // same meaning — only a payload box carries the entity word the callee reads
+  // as the object's identity — so aliasing the storage would make every
+  // instance of a class compare equal.
+  bool usesInheritedObjectDunder(const RuntimeSymbol &symbol,
+                                 const RuntimeBundle &source) const;
   const RuntimeBundle *
   concreteObjectForOwnership(const RuntimeBundle &bundle) const;
   mlir::FailureOr<RuntimeBundle> boxRuntimeObject(mlir::Operation *op,

@@ -429,6 +429,35 @@ bool ModuleEmitter::isExceptionBackedClass(llvm::StringRef className) const {
   return false;
 }
 
+bool ModuleEmitter::inheritsObjectDefaultDunder(
+    mlir::Type type, llvm::StringRef methodName) const {
+  auto contract =
+      mlir::dyn_cast_if_present<py::ContractType>(types.widenLiteral(type));
+  if (!contract)
+    return false;
+  llvm::StringRef className = contract.getContractName();
+  if (!classMros.count(className))
+    return false;
+  const py::protocols::Table &table = py::protocols::Table::get(context);
+  for (const std::string &cls : classMro(className)) {
+    if (cls == "builtins.object")
+      continue;
+    auto methods = classMethodBindings.find(cls);
+    if (methods != classMethodBindings.end() && methods->second.count(methodName))
+      return false;
+    if (classMros.count(cls))
+      continue;
+    // A manifest base's OWN declarations only: asking the table to resolve the
+    // name would walk that base up to object too and answer "provided" for
+    // every class.
+    const py::protocols::ProtocolInfo *info =
+        table.lookup(py::contracts::manifestClassNameForContract(cls));
+    if (info && info->methods.count(methodName.str()))
+      return false;
+  }
+  return true;
+}
+
 std::optional<std::pair<llvm::StringRef, mlir::Type>>
 ModuleEmitter::resolveClassAttrSlot(llvm::StringRef className,
                                     llvm::StringRef attrName) const {
@@ -1596,6 +1625,14 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
   for (const std::string &base : canonicalBases)
     protocolInfo.bases.push_back(py::protocols::ProtocolBase{
         py::contracts::manifestClassNameForContract(base), {}});
+  // `builtins.object` closes every linearization (the C3 merge above already
+  // appends it to `mro`), so the protocol table has to see it as a base too.
+  // Appended LAST, not first, because base lookup returns the FIRST provider:
+  // a declared base — or a dataclass-synthesized definition on this class —
+  // still outranks the default, which is what makes the fall-through match
+  // CPython's MRO instead of shadowing user code.
+  protocolInfo.bases.push_back(py::protocols::ProtocolBase{
+      py::contracts::manifestClassNameForContract("builtins.object"), {}});
   for (auto [fieldName, fieldType] : llvm::zip_equal(fieldNames, fieldTypes))
     protocolInfo.fields[fieldName] = fieldType;
   for (auto [methodName, methodContract] :
@@ -2417,6 +2454,24 @@ Value ModuleEmitter::emitInlineMethodBody(
 Value ModuleEmitter::emitClassInstantiation(const parser::Node &expr,
                                             llvm::StringRef name,
                                             mlir::Type instanceType) {
+  // `object()` is refused at the earliest static boundary rather than lowered.
+  // Why NOT allocate a bare handle: the runtime object header reserves class
+  // id 0 for builtins.object, and that is also the None singleton's id — the
+  // boxed dispatchers (__ly_box_hash, __ly_box_equal) read id 0 as None, so a
+  // plain instance would hash and compare as None. It is a representation
+  // conflict, not a missing implementation, which is why the fix is a class
+  // rather than a manifest __new__.
+  if (auto contract =
+          mlir::dyn_cast_if_present<py::ContractType>(instanceType);
+      contract && contract.getContractName() == "builtins.object") {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "`object()` cannot be constructed: a bare object shares the runtime "
+        "class id of the None singleton, so its identity, hash and equality "
+        "would be None's. Declare a class (`class Sentinel: pass`) and "
+        "instantiate that instead"});
+    return emitNone(expr);
+  }
   CallOperands operands = emitCallOperands(expr);
   if (!operands.valid) {
     diagnostics.push_back(parser::Diagnostic{

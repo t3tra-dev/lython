@@ -868,9 +868,29 @@ Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
         py::CastFromPrimOp::create(builder, loc(expr), types.boolType(), bit);
     return Value{pyBool.getResult(), types.boolType()};
   }
-  if (ast::isOperator(op, "NotEq") || ast::isOperator(op, "IsNot"))
+  if (ast::isOperator(op, "NotEq") || ast::isOperator(op, "IsNot")) {
+    // CPython's object.__ne__ negates whatever __eq__ RESOLVED to, so a class
+    // that supplies only __eq__ (a user definition, a dataclass or an enum)
+    // gets != for free. Derived here rather than left to the boxed __ne__:
+    // that dispatcher reaches a source __eq__ only through the uniform
+    // class-id hook, which admits at most five memref operands — a two-field
+    // dataclass's __eq__ takes six, so it was missed and `!=` silently
+    // answered identity (`Point(1,2) != Point(1,2)` was True).
+    if (!lookupClassMethod(lhs.type, "__ne__") &&
+        lookupClassMethod(lhs.type, "__eq__")) {
+      Value equal = emitBinarySpecial<py::EqOp>(expr, "__eq__", lhs, rhs,
+                                               types.boolType());
+      mlir::Value bit = emitBoolValue(equal, expr);
+      auto one = mlir::arith::ConstantIntOp::create(builder, loc(expr), 1, 1);
+      mlir::Value flipped =
+          mlir::arith::XOrIOp::create(builder, loc(expr), bit, one);
+      auto pyBool = py::CastFromPrimOp::create(builder, loc(expr),
+                                               types.boolType(), flipped);
+      return Value{pyBool.getResult(), types.boolType()};
+    }
     return emitBinarySpecial<py::NeOp>(expr, "__ne__", lhs, rhs,
                                        types.boolType());
+  }
   if (ast::isOperator(op, "Lt"))
     return emitBinarySpecial<py::LtOp>(expr, "__lt__", lhs, rhs,
                                        types.boolType());
@@ -2138,6 +2158,41 @@ mlir::Value ModuleEmitter::emitBoolValue(Value value,
       }
     }
   }
+  // Source-class truthiness walks CPython's ladder — __bool__, then __len__,
+  // then object's default (always true) — here rather than through the
+  // manifest evidence below, for two reasons: the evidence path cannot see
+  // source methods (so a class with __bool__ reached lowering as a manifest
+  // call that does not exist), and object's default has no runtime
+  // implementation to dispatch to, because "the truth of an erased object" is
+  // not a runtime question — it is answered by the static class.
+  if (std::optional<MethodBinding> truth =
+          lookupClassMethod(widened, "__bool__")) {
+    llvm::StringMap<Value> emptyKeywords;
+    Value receiver = emitDescriptorReceiver(anchor, value, *truth);
+    Value result =
+        emitInlineMethodBody(anchor, receiver, methodBindingBindsReceiver(*truth),
+                             *truth, {}, emptyKeywords);
+    return emitBoolValue(result, anchor);
+  }
+  if (std::optional<MethodBinding> length =
+          lookupClassMethod(widened, "__len__")) {
+    llvm::StringMap<Value> emptyKeywords;
+    Value receiver = emitDescriptorReceiver(anchor, value, *length);
+    Value count = emitInlineMethodBody(anchor, receiver,
+                                       methodBindingBindsReceiver(*length),
+                                       *length, {}, emptyKeywords);
+    mlir::Type zeroType = types.literal("0");
+    Value zero{py::IntConstantOp::create(builder, loc(anchor), zeroType,
+                                         builder.getStringAttr("0"))
+                   .getResult(),
+               zeroType};
+    Value nonEmpty = emitBinarySpecial<py::NeOp>(anchor, "__ne__", count, zero,
+                                                 types.boolType());
+    return emitBoolValue(nonEmpty, anchor);
+  }
+  if (inheritsObjectDefaultDunder(widened, "__bool__"))
+    return mlir::arith::ConstantIntOp::create(builder, loc(anchor), 1, 1)
+        .getResult();
   CallInferenceResult inference =
       types.inferMethodCallWithEvidence(value.type, "__bool__", {});
   if (!requireStaticEvidence(anchor, inference)) {

@@ -47,6 +47,16 @@ mlir::FailureOr<RuntimeSymbol> RuntimeBundleLowerer::selectManifestMethod(
                 runtimeContractType(context, receiverContract)))
       methods = manifest.methodCandidates(*ancestor, methodName);
   }
+  if (methods.empty() &&
+      RuntimeBundleLowerer::isInheritedObjectDunder(methodName) &&
+      RuntimeBundleLowerer::classForContract(
+          runtimeContractType(context, receiverContract))) {
+    // Every class linearizes onto builtins.object, so a source class that
+    // declares none of these inherits object's — the same fall-through the
+    // emitter's method table now performs, made physical here (the receiver
+    // is boxed into an object handle by appendRuntimeSource).
+    methods = manifest.methodCandidates("builtins.object", methodName);
+  }
   if (methods.empty())
     return op->emitError() << "runtime manifest has no " << receiverContract
                            << "." << methodName << " method";
