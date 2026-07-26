@@ -351,6 +351,12 @@ private:
   loopCarriedBranchOperands(const parser::Node &anchor,
                             const LoopControlContext &loop, mlir::Block *target);
   void emitTry(const parser::Node &statement);
+  // The type a py.try post-try result lane can carry a rebound local out in,
+  // or null when the lane cannot carry it and the value has to travel storage
+  // instead. Shared by the promotion decision (taken before the regions are
+  // emitted) and the lane construction (taken after), which must agree: a name
+  // that neither promotes nor lanes reverts to its pre-try value silently.
+  mlir::Type postTryLaneCarrierType(mlir::Type type) const;
   void emitTryStar(const parser::Node &statement);
   void emitWith(const parser::Node &statement, bool async);
   void emitWithCleanup(const parser::Node &anchor, const WithCleanup &cleanup);
