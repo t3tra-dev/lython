@@ -494,8 +494,16 @@ RuntimeBundleLowerer::writeBackFieldAlias(mlir::Operation *op,
 // its own -- it exists to be consumed by the very next call. The call's
 // `owned_results` group carries the obligation onward from there.
 mlir::LogicalResult RuntimeBundleLowerer::promoteInteriorViewForTransfer(
-    mlir::Operation *op, const RuntimeBundle &receiver,
-    llvm::StringRef slotName) {
+    mlir::Operation *op, const RuntimeBundle &receiver, llvm::StringRef slotName,
+    mlir::func::FuncOp mutation) {
+  // Ask the mutation whether it actually takes a reference. A contract whose
+  // interior state lives behind the handle has nothing to rename, so its
+  // mutations are void and non-transfer -- and then there is no reference to
+  // manufacture, because none is consumed. Asking the callee rather than
+  // naming the converted contracts means this whole workaround retires one
+  // contract at a time, on its own, as each conversion lands.
+  if (mutation && !ownership::functionConsumesOperandAt(mutation, 0))
+    return mlir::success();
   if (receiver.kind != RuntimeBundle::Kind::Object ||
       receiver.physicalValues().empty())
     return mlir::success();
@@ -533,6 +541,14 @@ mlir::LogicalResult RuntimeBundleLowerer::promoteInteriorViewForTransfer(
 mlir::LogicalResult RuntimeBundleLowerer::rebindMutatedContainer(
     mlir::Operation *op, const RuntimeBundle &receiver, mlir::ValueRange values,
     RuntimeBundle &rebound) {
+  // No results means the mutation published no re-description: it wrote through
+  // the handle the receiver already names. There is nothing to rebind and
+  // nothing to write back, and saying so here is what makes the callers of a
+  // converted contract collapse to a plain call.
+  if (values.empty()) {
+    rebound = receiver;
+    return mlir::success();
+  }
   if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
           op, receiver.objectValue.contract, values, rebound)))
     return mlir::failure();

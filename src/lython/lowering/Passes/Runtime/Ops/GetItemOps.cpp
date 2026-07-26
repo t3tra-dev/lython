@@ -113,46 +113,11 @@ RuntimeBundleLowerer::retainEvidenceElement(mlir::Operation *op,
   else
     builder.setInsertionPointAfter(latest);
   mlir::Location loc = atOperation ? op->getLoc() : latest->getLoc();
-  mlir::Value header = value.values.front();
   mlir::Type retainInput = retain.getFunctionType().getInput(0);
-  if (header.getType() != retainInput) {
-    if (mlir::memref::CastOp::areCastCompatible(header.getType(),
-                                                retainInput)) {
-      header = mlir::memref::CastOp::create(builder, loc, retainInput, header)
-                   .getResult();
-    } else {
-      // Box-fronted entities (source-class instances: the whole 16-word box is
-      // the entity root) hold the refcount+class prefix inside a wider static
-      // shape than the retain input; retain through a rank-1 prefix view.
-      auto sourceType = mlir::dyn_cast<mlir::MemRefType>(header.getType());
-      auto targetType = mlir::dyn_cast<mlir::MemRefType>(retainInput);
-      if (!sourceType || !targetType || sourceType.getRank() != 1 ||
-          targetType.getRank() != 1 || !sourceType.hasStaticShape() ||
-          !targetType.hasStaticShape() ||
-          sourceType.getElementType() != targetType.getElementType() ||
-          sourceType.getDimSize(0) < targetType.getDimSize(0))
-        return std::nullopt;
-      llvm::SmallVector<mlir::OpFoldResult, 1> offsets{builder.getIndexAttr(0)};
-      llvm::SmallVector<mlir::OpFoldResult, 1> sizes{
-          builder.getIndexAttr(targetType.getDimSize(0))};
-      llvm::SmallVector<mlir::OpFoldResult, 1> strides{builder.getIndexAttr(1)};
-      llvm::SmallVector<int64_t, 1> resultShape{targetType.getDimSize(0)};
-      auto inferredType = mlir::cast<mlir::MemRefType>(
-          mlir::memref::SubViewOp::inferRankReducedResultType(
-              resultShape, sourceType, offsets, sizes, strides));
-      header = mlir::memref::SubViewOp::create(builder, loc, inferredType,
-                                               header, offsets, sizes, strides)
-                   .getResult();
-      if (header.getType() != retainInput) {
-        if (!mlir::memref::CastOp::areCastCompatible(header.getType(),
-                                                     retainInput))
-          return std::nullopt;
-        header =
-            mlir::memref::CastOp::create(builder, loc, retainInput, header)
-                .getResult();
-      }
-    }
-  }
+  mlir::Value header = ownership::spellHeaderPrefix(
+      builder, loc, value.values.front(), retainInput);
+  if (!header)
+    return std::nullopt;
   mlir::func::CallOp::create(builder, loc, retain, header);
   llvm::SmallVector<mlir::Type, 4> resultTypes;
   for (mlir::Value physical : value.values)

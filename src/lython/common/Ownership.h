@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Dominance.h"
@@ -189,6 +190,20 @@ collectRuntimeDeallocators(mlir::ModuleOp module);
 bool valueRangeMatchesTypes(mlir::ValueRange values, unsigned offset,
                             llvm::ArrayRef<mlir::Type> types);
 bool isObjectHeaderLikeType(mlir::Type type);
+// Can a value of type `from` be spelled as the object-header interface type
+// `to` (Ly_IncRef's input, a deallocator's input)? `spellHeaderPrefix` emits
+// that spelling and returns null exactly when this returns false.
+//
+// The two are a pair on purpose. Asking "is this castable" and then emitting
+// the cast are the same question, and a caller that asks the narrow version
+// (memref.cast alone) accepts a candidate whose retain it then cannot write --
+// which drops a retain the soundness argument already counted on and
+// over-releases. A handle wider than the interface is the ordinary case for any
+// contract holding its interior state behind the handle, so the prefix view is
+// part of the answer, not a fallback.
+bool canSpellHeaderPrefix(mlir::Type from, mlir::Type to);
+mlir::Value spellHeaderPrefix(mlir::OpBuilder &builder, mlir::Location loc,
+                              mlir::Value header, mlir::Type target);
 // Strips identity-shaped unrealized-cast markers (owned-local-object rooting
 // and similar value-group markers keep types and arity) so SSA-identity
 // comparisons see the underlying value regardless of ownership rewrapping.

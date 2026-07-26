@@ -566,7 +566,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
       return box;
     };
     if (mlir::failed(RuntimeBundleLowerer::promoteInteriorViewForTransfer(
-            op, container, "dict.setitem.receiver")))
+            op, container, "dict.setitem.receiver", setItemBox->function)))
       return mlir::failure();
     mlir::FailureOr<mlir::Value> keyBox = transientBox(*payloadKey);
     if (mlir::failed(keyBox))
@@ -640,16 +640,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
         if (mlir::failed(RuntimeBundleLowerer::storeDictValuePayload(
                 op, updated, position, *payloadValue)))
           return mlir::failure();
-        mlir::Value meta = container.physicalValues()[1];
-        mlir::Value slot =
-            mlir::arith::ConstantIndexOp::create(builder, op.getLoc(), 0);
-        mlir::Value current =
-            mlir::memref::LoadOp::create(builder, op.getLoc(), meta, slot);
-        mlir::Value one =
-            mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 1, 64);
-        mlir::Value next =
-            mlir::arith::AddIOp::create(builder, op.getLoc(), current, one);
-        mlir::memref::StoreOp::create(builder, op.getLoc(), next, meta, slot);
+        // `updated`, not `container`: storeDictValuePayload may have grown the
+        // dict, and for a handle-fronted contract the length lives in the
+        // handle the growth wrote through.
+        if (mlir::failed(RuntimeBundleLowerer::adjustContainerLength(
+                op, updated, +1, "dict setitem")))
+          return mlir::failure();
         RuntimeBundle storedKey =
             payloadKey->withObjectOwnership(ownership::logicalOwnershipKind(
                 payloadKey->objectValue.contract, /*ownsObject=*/false));
@@ -807,14 +803,13 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerDelItem(py::DelItemOp op) {
                                                       "list delitem");
         if (mlir::failed(length))
           return mlir::failure();
-        mlir::Value meta = container.physicalValues()[1];
-        mlir::Value slot =
-            mlir::arith::ConstantIndexOp::create(builder, op.getLoc(), 0);
         mlir::Value one =
             mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 1, 64);
         mlir::Value next =
             mlir::arith::SubIOp::create(builder, op.getLoc(), *length, one);
-        mlir::memref::StoreOp::create(builder, op.getLoc(), next, meta, slot);
+        if (mlir::failed(RuntimeBundleLowerer::storeContainerLength(
+                op, container, next, "list delitem")))
+          return mlir::failure();
         unsigned position = static_cast<unsigned>(normalized);
         unsigned oldSize =
             static_cast<unsigned>(updated.sequenceElementBundles.size());
@@ -922,14 +917,13 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerDelItem(py::DelItemOp op) {
                                                       "dict delitem");
         if (mlir::failed(length))
           return mlir::failure();
-        mlir::Value meta = container.physicalValues()[1];
-        mlir::Value slot =
-            mlir::arith::ConstantIndexOp::create(builder, op.getLoc(), 0);
         mlir::Value one =
             mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 1, 64);
         mlir::Value next =
             mlir::arith::SubIOp::create(builder, op.getLoc(), *length, one);
-        mlir::memref::StoreOp::create(builder, op.getLoc(), next, meta, slot);
+        if (mlir::failed(RuntimeBundleLowerer::storeContainerLength(
+                op, container, next, "dict delitem")))
+          return mlir::failure();
         unsigned position =
             static_cast<unsigned>(found - updated.mappingKeys.begin());
         unsigned oldSize = static_cast<unsigned>(updated.mappingKeys.size());
@@ -1332,13 +1326,14 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIter(py::IterOp op) {
           mlir::arith::ConstantIndexOp::create(builder, op.getLoc(), 0);
       mlir::memref::StoreOp::create(builder, op.getLoc(), zero, cell, slot);
       if (guardsMutation) {
-        mlir::Value meta = iterable->physicalValues()[1];
-        mlir::Value initial =
-            mlir::memref::LoadOp::create(builder, op.getLoc(), meta, slot)
-                .getResult();
+        mlir::FailureOr<mlir::Value> initial =
+            RuntimeBundleLowerer::loadContainerLength(op, *iterable,
+                                                      "iterator guard");
+        if (mlir::failed(initial))
+          return mlir::failure();
         mlir::Value initialSlot =
             mlir::arith::ConstantIndexOp::create(builder, op.getLoc(), 1);
-        mlir::memref::StoreOp::create(builder, op.getLoc(), initial, cell,
+        mlir::memref::StoreOp::create(builder, op.getLoc(), *initial, cell,
                                       initialSlot);
       }
       RuntimeBundle iterator = *iterable;
@@ -1455,9 +1450,11 @@ RuntimeBundleLowerer::lowerListRuntimeNext(py::NextOp op,
   mlir::Value slot = mlir::arith::ConstantIndexOp::create(builder, loc, 0);
   mlir::Value position =
       mlir::memref::LoadOp::create(builder, loc, cell, slot).getResult();
-  mlir::Value meta = iterator.physicalValues()[1];
-  mlir::Value length =
-      mlir::memref::LoadOp::create(builder, loc, meta, slot).getResult();
+  mlir::FailureOr<mlir::Value> lengthOr =
+      RuntimeBundleLowerer::loadContainerLength(op, iterator, "iterator next");
+  if (mlir::failed(lengthOr))
+    return mlir::failure();
+  mlir::Value length = *lengthOr;
   // dict/set iteration: raise RuntimeError when the container's size changed
   // since the iterator was created (CPython's mutation-during-iteration
   // guard; the size at creation sits in cell word 1).
@@ -1512,9 +1509,13 @@ RuntimeBundleLowerer::lowerListRuntimeNext(py::NextOp op,
     if (!fromSlot)
       return op.emitError()
              << "runtime manifest has no object from_slot primitive";
+    mlir::FailureOr<mlir::Value> itemsView =
+        RuntimeBundleLowerer::containerInteriorView(
+            op, iterator, ContainerInterior::Primary, "iterator element");
+    if (mlir::failed(itemsView))
+      return mlir::failure();
     mlir::func::CallOp boxed = RuntimeBundleLowerer::createRuntimeCall(
-        loc, *fromSlot,
-        mlir::ValueRange{iterator.physicalValues()[2], safe, valid});
+        loc, *fromSlot, mlir::ValueRange{*itemsView, safe, valid});
     RuntimeValue element{elementContract,
                          {boxed.getResult(0)},
                          ownership::logicalOwnershipKind(elementContract,
@@ -1560,7 +1561,12 @@ RuntimeBundleLowerer::lowerListRuntimeNext(py::NextOp op,
            << "dead placeholder for " << elementContract
            << " does not match the contract's physical value count";
 
-  mlir::Value items = iterator.physicalValues()[2];
+  mlir::FailureOr<mlir::Value> itemsOr =
+      RuntimeBundleLowerer::containerInteriorView(
+          op, iterator, ContainerInterior::Primary, "iterator element");
+  if (mlir::failed(itemsOr))
+    return mlir::failure();
+  mlir::Value items = *itemsOr;
   using box_abi::kPointerWordBase;
   using box_abi::kSizeWordBase;
   mlir::Value wordsPerSlot =

@@ -17,6 +17,7 @@
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/Support/Process.h"
 
 #include <cstdint>
 #include <memory>
@@ -26,6 +27,27 @@ namespace py::lowering {
 namespace {
 
 namespace own = py::ownership;
+
+// `LYTHON_OWNERSHIP_TRACE_TRANSFERS=1` reports, per owned group, the
+// branch-level transfers this pass found and whether each destination argument
+// group survived the soundness fixpoint.
+//
+// Why this is worth keeping rather than deleting with the investigation that
+// needed it: a contract whose mutation primitives stop consuming their receiver
+// changes NOTHING about the diagnostics -- it changes which branches forward a
+// group -- so the symptom of getting that wrong is a group that silently never
+// becomes a candidate, and the failure surfaces two phases later as a verifier
+// complaint naming the producer. Six of those cost a day to trace back to a
+// zero here. `seeded=0` says it in one line. Same reason
+// LYTHON_OWNERSHIP_ROOT_PARITY is env-gated rather than absent.
+bool ownershipTransferTraceEnabled() {
+  static bool enabled = [] {
+    auto value =
+        llvm::sys::Process::GetEnv("LYTHON_OWNERSHIP_TRACE_TRANSFERS");
+    return value && !value->empty() && *value != "0";
+  }();
+  return enabled;
+}
 
 using own::CachedFuncContract;
 using own::FuncContractCache;
@@ -892,6 +914,16 @@ bool releaseOwnedGroupByLiveness(
   // A branch that forwards every group value back into its OWN block-argument
   // position (a loop continue edge) transfers the token identically into the
   // next iteration: it is neither a use nor a death.
+  //
+  // "Not a use" must not be read as "not live". The self-forward is the last
+  // thing that touches the value on that path, so if it does not keep the value
+  // live up to the branch, the block holding the last ORDINARY use looks like
+  // the end of the value's life and gets a release there -- which the back edge
+  // then walks straight past. That stayed hidden only while every container
+  // mutation CONSUMED its receiver: the consuming call marked the block instead.
+  // A void in-place mutation, which is what interior-behind-the-handle makes
+  // possible, removes that marker and exposes the gap.
+  llvm::SmallPtrSet<mlir::Block *, 4> identityForwardBlocks;
   auto isIdentitySelfForward = [&](mlir::Operation *user) {
     if (!consumeIsDeath)
       return false;
@@ -1048,8 +1080,12 @@ bool releaseOwnedGroupByLiveness(
           continue;
         }
         if (user->hasTrait<mlir::OpTrait::IsTerminator>() &&
-            isIdentitySelfForward(user))
+            isIdentitySelfForward(user)) {
+          identityForwardBlocks.insert(user->getBlock());
+          lastUse[user->getBlock()] =
+              latestUserInBlock(lastUse[user->getBlock()], user);
           continue;
+        }
         if (user->hasTrait<mlir::OpTrait::IsTerminator>() &&
             !mlir::isa<mlir::func::ReturnOp>(user) &&
             user->getBlock()->getParent() == region &&
@@ -1159,6 +1195,12 @@ bool releaseOwnedGroupByLiveness(
   for (mlir::Block &blockRef : *region) {
     mlir::Block *block = &blockRef;
     if (!blockIsLive(block))
+      continue;
+    // The token leaves this block on the self-forward, into the same argument
+    // group it came from. A release here would free what the next iteration
+    // reads; the loop header's argument group carries the obligation and its
+    // own liveness scan places the release where the loop exits.
+    if (identityForwardBlocks.count(block))
       continue;
     if (!liveOut[block]) {
       // The value already died here via a consuming use (e.g. back-edge
@@ -1277,6 +1319,44 @@ bool releaseOwnedGroupByLiveness(
     if (!releaseOnTerminatorEdge(edge.first, edge.second, group, loc))
       return false;
   return true;
+}
+
+// May this edge's borrow→own retain be written through a rank-1 PREFIX view of a
+// handle wider than Ly_IncRef's input, rather than declined?
+//
+// Spellability alone is not the question, which is why this is not
+// `canSpellHeaderPrefix`. The retain's anchor is "the earliest point after the
+// header's definition", chosen so the lend precedes any same-block
+// decref-on-replace. For a freshly ALLOCATED box that point is before the boxing
+// sequence has stored the refcount word, so a retain written there reads
+// uninitialised memory and the runtime's own guard fires (`Ly_IncRef observed
+// non-positive refcount`) -- measured, on dict_key_mutation and
+// cross_container_box_fronted_fields.
+//
+// A block ARGUMENT has no such window: it is bound on entry, so the anchor at
+// the block's start is already past its initialisation. That is exactly the
+// header a loop-carried handle presents on the edge into a LATER loop's header,
+// which is the case completing the destination-group search creates, and it is
+// the case whose retain must exist -- without it the destination group's release
+// and the source group's release both run.
+//
+// Why NOT move the anchor past the initialising stores instead: the anchor also
+// has to stay ahead of the block's release, so the safe window is bounded on both
+// sides by facts about a boxing sequence this pass does not model. Naming the
+// case it can prove is honest; guessing the window is how a retain lands on the
+// wrong side of a decref.
+//
+// Why NOT decline the EDGE (sound = false) when this returns false: a candidate
+// accepted today on a wide non-argument header has its retain dropped at
+// emission and is balanced anyway, because nothing else releases the source.
+// Declining it removes the destination's release too, and that is a measured
+// regression, not a conservative choice. The residual is recorded in
+// rfc/memory-safety-proof.md rather than papered over.
+bool borrowEdgeRetainIsSpellable(mlir::Value header,
+                                 mlir::func::FuncOp retainFunction) {
+  return mlir::isa<mlir::BlockArgument>(header) &&
+         own::canSpellHeaderPrefix(
+             header.getType(), retainFunction.getFunctionType().getInput(0));
 }
 
 // Wrapper: liveness-based release for an owned call-result group.
@@ -1437,6 +1517,42 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
     return forwardedBlockArgGroup(terminator, views, aliases);
   };
 
+  // Every top-level terminator of `fn` that mentions the group -- i.e. every
+  // candidate forwarding edge, wherever the emitter put it.
+  //
+  // Why not just the group's own block: the verifier RENAMES a tracked group
+  // onto the destination argument on every forwarding edge, so the release it
+  // will accept afterwards is one spelled with the destination's name. Reading
+  // the forward only off the defining block (or, for an argument group, off its
+  // own block) finds the entry a merge emits where the value is born, but not
+  // the entry into a LATER loop whose header a dominating block feeds -- the
+  // shape a void in-place mutation leaves behind, because nothing re-defines
+  // the receiver to move the forward next to it. That destination group was
+  // never created, so no pass released the name the verifier had renamed onto,
+  // and the token reached the function exit still owned.
+  auto forwardingTerminators = [&](mlir::func::FuncOp fn,
+                                   llvm::ArrayRef<mlir::Value> values) {
+    llvm::SmallVector<mlir::Operation *, 4> terminators;
+    if (values.empty())
+      return terminators;
+    mlir::Region *body = &fn.getBody();
+    llvm::SmallPtrSet<mlir::Operation *, 4> seen;
+    llvm::SmallVector<mlir::Value, 8> equivalents;
+    aliases.aliasesOf(values.front(), equivalents);
+    if (equivalents.empty())
+      equivalents.push_back(values.front());
+    for (mlir::Value equivalent : equivalents)
+      for (mlir::OpOperand &use : equivalent.getUses()) {
+        mlir::Operation *user = use.getOwner();
+        if (!user->hasTrait<mlir::OpTrait::IsTerminator>() ||
+            user->getBlock()->getParent() != body)
+          continue;
+        if (seen.insert(user).second)
+          terminators.push_back(user);
+      }
+    return terminators;
+  };
+
   // Seed: owned call-result groups forwarded to block-arg groups. A group
   // born inside a region merge (e.g. the int fast/slow scf.if) first maps
   // through its region terminator(s) to the parent op's results; the
@@ -1477,14 +1593,24 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
       }
       if (escaped || !callBlock || !callBlock->getTerminator())
         continue;
-      if (auto dest = forwardedBlockArgGroup(callBlock->getTerminator(),
-                                             values, aliases)) {
-        auto destViews = forwardedViews(callBlock->getTerminator(), views);
+      unsigned seeded = 0;
+      for (mlir::Operation *terminator : forwardingTerminators(fn, values)) {
+        auto dest = forwardedBlockArgGroup(terminator, values, aliases);
+        if (!dest)
+          continue;
+        auto destViews = forwardedViews(terminator, views);
         if (!destViews)
           continue;
         candidates.insert(
             {dest->front(), Candidate{*dest, *destViews, g.deallocator}});
+        ++seeded;
       }
+      if (ownershipTransferTraceEnabled())
+        llvm::errs() << "[ownership-transfers] call-result group of "
+                     << call.getCallee() << " in @" << fn.getName()
+                     << ": lanes=" << values.size()
+                     << " views=" << views.size() << " seeded=" << seeded
+                     << "\n";
     }
   });
 
@@ -1530,9 +1656,11 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
       }
       if (escaped || !defBlock || !defBlock->getTerminator())
         continue;
-      if (auto dest = forwardedBlockArgGroup(defBlock->getTerminator(),
-                                             values, aliases)) {
-        auto destViews = forwardedViews(defBlock->getTerminator(), views);
+      for (mlir::Operation *terminator : forwardingTerminators(fn, values)) {
+        auto dest = forwardedBlockArgGroup(terminator, values, aliases);
+        if (!dest)
+          continue;
+        auto destViews = forwardedViews(terminator, views);
         if (!destViews)
           continue;
         candidates.insert(
@@ -1553,10 +1681,16 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
       auto firstArg = mlir::dyn_cast<mlir::BlockArgument>(candidate.args.front());
       if (!firstArg || !firstArg.getOwner()->getTerminator())
         continue;
-      if (auto dest = forwardedBlockArgGroup(firstArg.getOwner()->getTerminator(),
-                                             candidate.args, aliases)) {
-        auto destViews = forwardedViews(firstArg.getOwner()->getTerminator(),
-                                        candidate.views);
+      auto fn = mlir::dyn_cast<mlir::func::FuncOp>(
+          firstArg.getOwner()->getParentOp());
+      if (!fn)
+        continue; // a candidate group always lives in the function's own region
+      for (mlir::Operation *terminator :
+           forwardingTerminators(fn, candidate.args)) {
+        auto dest = forwardedBlockArgGroup(terminator, candidate.args, aliases);
+        if (!dest)
+          continue;
+        auto destViews = forwardedViews(terminator, candidate.views);
         if (destViews && !candidates.count(dest->front())) {
           candidates.insert({dest->front(), Candidate{*dest, *destViews,
                                                       candidate.deallocator}});
@@ -1722,6 +1856,16 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
         if (!sound)
           break;
       }
+      if (ownershipTransferTraceEnabled())
+        llvm::errs() << "[ownership-transfers] destination arg group in @"
+                     << destBlock->getParentOp()
+                            ->getAttrOfType<mlir::StringAttr>(
+                                mlir::SymbolTable::getSymbolAttrName())
+                            .getValue()
+                     << ": lanes=" << candidate.args.size()
+                     << " views=" << candidate.views.size()
+                     << " sound=" << sound << " anyTransfer=" << anyTransfer
+                     << " borrowEdges=" << retains.size() << "\n";
       if (!sound || !anyTransfer)
         toRemove.push_back(entry.first);
       else
@@ -1791,15 +1935,22 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
       if (definition->getBlock() == anchorBlock)
         builder.setInsertionPointAfter(definition);
     }
-    mlir::Value header = retain.header;
     mlir::Type retainInput = retainFunction.getFunctionType().getInput(0);
+    mlir::Value header = retain.header;
     if (header.getType() != retainInput) {
-      if (!mlir::memref::CastOp::areCastCompatible(header.getType(),
-                                                   retainInput))
+      if (mlir::memref::CastOp::areCastCompatible(header.getType(),
+                                                  retainInput)) {
+        header = mlir::memref::CastOp::create(builder, anchor->getLoc(),
+                                              retainInput, header)
+                     .getResult();
+      } else if (borrowEdgeRetainIsSpellable(retain.header, retainFunction)) {
+        header = own::spellHeaderPrefix(builder, anchor->getLoc(), header,
+                                        retainInput);
+        if (!header)
+          continue;
+      } else {
         continue;
-      header = mlir::memref::CastOp::create(builder, anchor->getLoc(),
-                                            retainInput, header)
-                   .getResult();
+      }
     }
     auto call = mlir::func::CallOp::create(builder, anchor->getLoc(),
                                            retainFunction, header);

@@ -663,8 +663,15 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
         {
           mlir::OpBuilder::InsertionGuard insertionGuard(builder);
           builder.setInsertionPointToStart(&parkedGuard.getThenRegion().front());
-          RuntimeBundleLowerer::createRuntimeCall(
-              loc, *releaseParked, mlir::ValueRange{valuesArray, valueSlot});
+          // The primitive names the ENTITY, not the values array: it derives
+          // the view itself, so a view the caller happens to be holding cannot
+          // be the one it writes through.
+          llvm::SmallVector<mlir::Value, 2> parkedOperands(
+              receiver.physicalValues().begin(),
+              receiver.physicalValues().end());
+          parkedOperands.push_back(valueSlot);
+          RuntimeBundleLowerer::createRuntimeCall(loc, *releaseParked,
+                                                  parkedOperands);
         }
         builder.setInsertionPointAfter(parkedGuard);
       }
@@ -681,9 +688,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
   }
 
   // Structural update family (dict.update, set.update and the in-place set
-  // filters): the manifest method consumes the receiver's storage token and
-  // returns the (possibly reallocated) representation the rebind result
-  // carries.
+  // filters). A lane-carrying contract's method consumes the receiver's storage
+  // token and hands back the (possibly reallocated) representation; a
+  // handle-fronted one writes through the handle and returns nothing, and then
+  // `rebindMutatedContainer` keeps the receiver bundle as it stands.
   bool runtimeSetReceiver = receiver.kind == RuntimeBundle::Kind::Object &&
                             receiver.contractName() == "builtins.set" &&
                             RuntimeBundleLowerer::containerHasRuntimePayload(
@@ -719,11 +727,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
     mlir::func::CallOp call =
         RuntimeBundleLowerer::createRuntimeCall(loc, *update, operands);
     RuntimeBundle updated;
-    if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
-            op, receiver.objectValue.contract, call.getResults(), updated)))
+    if (mlir::failed(RuntimeBundleLowerer::rebindMutatedContainer(
+            op, receiver, call.getResults(), updated)))
       return mlir::failure();
-    updated.fieldAliasOwner = receiver.fieldAliasOwner;
-    updated.fieldAliasName = receiver.fieldAliasName;
     valueBundles[op.getResult(1)] = std::move(updated);
     if (mlir::failed(assignObjectBundle(
             op, op.getResult(0), runtimeContractType(context, "types.NoneType"),
@@ -924,7 +930,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
       mlir::memref::StoreOp::create(builder, loc, word, box, slot);
     }
     if (mlir::failed(RuntimeBundleLowerer::promoteInteriorViewForTransfer(
-            op, receiver, "set.add.receiver")))
+            op, receiver, "set.add.receiver", addBox->function)))
       return mlir::failure();
     llvm::SmallVector<mlir::Value, 6> operands(
         receiver.physicalValues().begin(), receiver.physicalValues().end());
@@ -1040,7 +1046,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
           mlir::arith::AddIOp::create(builder, loc, length, one).getResult();
 
       if (mlir::failed(RuntimeBundleLowerer::promoteInteriorViewForTransfer(
-              op, receiver, "list.append.receiver")))
+              op, receiver, "list.append.receiver", ensure->function)))
         return mlir::failure();
       llvm::SmallVector<mlir::Value, 6> operands(
           receiver.physicalValues().begin(), receiver.physicalValues().end());

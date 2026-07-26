@@ -194,7 +194,8 @@ private:
   mlir::LogicalResult
   promoteInteriorViewForTransfer(mlir::Operation *op,
                                  const RuntimeBundle &receiver,
-                                 llvm::StringRef slotName);
+                                 llvm::StringRef slotName,
+                                 mlir::func::FuncOp mutation);
   std::optional<unsigned> findUnionMemberIndex(py::UnionType unionType,
                                                mlir::Type member) const;
   mlir::FailureOr<unsigned>
