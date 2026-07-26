@@ -2085,7 +2085,16 @@ module attributes {
   // subtree matcher for the group-aware paths.
   func.func private @release_exception_extras(%header_word: i64)
   func.func private @release_payload_slot_ptr(%slot: !llvm.ptr)
+  // Rebuild a rank-1 memref over the payload a raw pointer word addresses
+  // (buildGlobalViewFunction: allocated == aligned, offset 0, stride 1). The
+  // manifest's only route to a descriptor -- writing the insertvalue chain and
+  // the closing cast inline is rejected at the runtime-lowering input, because
+  // builtin.unrealized_conversion_cast is that pass's own marker vocabulary.
+  // One declaration per element type so the func-level signature type-checks;
+  // narrow to a static shape with memref.cast at the call site.
   func.func private @__ly_global_view_i64(%pointer: i64, %size: i64) -> memref<?xi64>
+  func.func private @__ly_global_view_i32(%pointer: i64, %size: i64) -> memref<?xi32>
+  func.func private @__ly_global_view_f64(%pointer: i64, %size: i64) -> memref<?xf64>
   func.func private @__ly_global_view_i8(%pointer: i64, %size: i64) -> memref<?xi8>
   func.func private @LyEH_ClassIdMatches(%raised: i64, %handler: i64) -> i1
 
