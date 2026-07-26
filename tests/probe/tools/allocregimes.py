@@ -65,10 +65,23 @@ so it keeps validating the comparison after every real defect has been fixed.
 k-4a's idea, and the reason it matters is one of theirs too -- evidence recorded
 from a broken tree describes a binary that will not exist for long.
 
-It validates the sidecar comparison and nothing else. `flaky.py`'s "no NOT
-STABLE" needs genuine nondeterminism, which no synthetic input supplies, and the
-CPython-oracle path must not get a deliberate mismatch, because there a mismatch
-IS a defect and a planted one would read as a real finding.
+It validates the sidecar comparison and nothing else. The CPython-oracle path
+must not get a deliberate mismatch, because there a mismatch IS a defect and a
+planted one would read as a real finding.
+
+THE CPYTHON PATH NO LONGER HAS A KNOWN-BROKEN INPUT (stage 4b). Every alias shape
+in this corpus now passes all five regimes, `alias_read_mutate_nowriteback_dict`
+included, so pointing this tool at `tests/probe/alias_*.py` exercises the regimes
+but never the reporting. What is left, and it is worth being explicit that it is
+less:
+
+  - the sidecar fixture above shows a FAILURE can be printed and counted;
+  - the regimes themselves are only exercised by inputs that pass them.
+
+So a green sweep here says "these shapes survive five layouts", not "this tool
+would notice if they did not". The second claim needs a tree where they do not --
+the rebuild recipe is in `leak.py`, and `flaky.py --self-test` covers the
+neighbouring question for the repetition tool.
 
 Exit code is the number of probes failing in at least one selected regime.
 """

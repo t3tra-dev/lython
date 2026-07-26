@@ -21,6 +21,7 @@ run matches CPython AND the guard-allocator run does too.
 
     python3 tests/probe/tools/cells12.py ./build/bin/lyc [-n RUNS] [--keep DIR]
     python3 tests/probe/tools/cells12.py ./build/bin/lyc --acquire inline
+    python3 tests/probe/tools/cells12.py ./build/bin/lyc --realloc
 
 Exit code is the number of unfilled cells, so a stage can gate on it.
 
@@ -30,6 +31,17 @@ it in the frame. They are not interchangeable -- an inline-constructed instance
 used to carry an owned-local marker that a lane re-root could republish while a
 call-derived one could not, which is the asymmetry the redesign exists to remove
 -- so a stage that fills the grid on one should be re-run on the other.
+
+`--realloc` picks a FOURTH axis the grid also held fixed, and silently: whether
+the read direction's mutation actually reallocates. A container is allocated with
+capacity 64, so `[1]` plus one `append` reallocates nothing, and a cell filled
+that way says nothing about whether the field observes a reallocation -- it only
+says the field observes an in-place write. Measured at `kernel/4b`: with the
+default init, `list read` filled both boundaries; with `--realloc` the same shape
+crashed in libsystem_malloc before the interior-view repair. The default is off
+because it is a different question, not a better one -- an in-place mutation is
+worth measuring on its own -- but a stage that claims the read direction must
+report both.
 """
 
 import argparse
@@ -51,11 +63,15 @@ REFCOUNT = re.compile(r"Ly_(?:Inc|Dec)Ref observed non-positive refcount")
 # Per contract: the field annotation, the initial value, a fresh replacement
 # for the store direction, a reallocating mutation of a local alias for the
 # read direction, and how to observe the field.
+# `init_realloc` fills the container to its allocation capacity (64), so the
+# read direction's single mutation has to grow it. io.StringIO needs no variant:
+# its buffer grows on every write by construction.
 CONTRACTS = {
     "list": dict(
         imports="",
         ann="list[int]",
         init="[1]",
+        init_realloc="[" + ", ".join(str(i) for i in range(65)) + "]",
         fresh="[1, 2, 3]",
         mutate='ks.append(9)',
         alias_ann="list[int]",
@@ -65,6 +81,7 @@ CONTRACTS = {
         imports="",
         ann="dict[str, int]",
         init='{"a": 1}',
+        init_realloc="{" + ", ".join('"k%d": %d' % (i, i) for i in range(65)) + "}",
         fresh='{"a": 1, "b": 2, "c": 3}',
         mutate='ks["z"] = 9',
         alias_ann="dict[str, int]",
@@ -90,16 +107,17 @@ SIO_HELPER = """def _fresh_sio() -> io.StringIO:
 """
 
 
-def program(contract, direction, boundary, acquire="call"):
+def program(contract, direction, boundary, acquire="call", realloc=False):
     c = CONTRACTS[contract]
     helper = SIO_HELPER if contract == "io.StringIO" else ""
+    init = c["init_realloc"] if realloc and "init_realloc" in c else c["init"]
     head = f"""{c['imports']}class Node:
     def __init__(self, v: {c['ann']}) -> None:
         self.f: {c['ann']} = v
 
 
 {helper}def make() -> Node:
-    v: {c['ann']} = {c['init']}
+    v: {c['ann']} = {init}
     return Node(v)
 
 
@@ -110,7 +128,7 @@ def program(contract, direction, boundary, acquire="call"):
     # re-root could republish, and a call-derived one had no such thing. A grid
     # filled on one says nothing about the other, so both spellings are here.
     acquisition = ("n = make()\n" if acquire == "call" else
-                   f"v0: {c['ann']} = {c['init']}\nn = Node(v0)\n")
+                   f"v0: {c['ann']} = {init}\nn = Node(v0)\n")
     if direction == "store" and boundary == "same frame":
         body = acquisition + f"""fresh: {c['ann']} = {c['fresh']}
 n.f = fresh
@@ -176,6 +194,9 @@ def main():
     ap.add_argument("--acquire", choices=("call", "inline"), default="call",
                     help="how the frame gets the receiver: from a factory call "
                          "(default) or constructed in the frame")
+    ap.add_argument("--realloc", action="store_true",
+                    help="fill the container to capacity so the read "
+                         "direction's mutation has to reallocate")
     args = ap.parse_args()
     lyc = args.lyc.resolve()
 
@@ -191,7 +212,8 @@ def main():
                         f"{boundary.replace(' ', '')}")
                 p = tmp / f"{slug}.py"
                 p.write_text(textwrap.dedent(program(contract, direction,
-                                                     boundary, args.acquire)))
+                                                     boundary, args.acquire,
+                                                     args.realloc)))
                 want = run([CPY, str(p)])[1]
                 faces = Counter()
                 for _ in range(args.runs):
@@ -205,8 +227,9 @@ def main():
                              dict(faces), gm, filled))
 
     w = max(len(r[0]) for r in rows)
-    print(f"12-cell grid, {args.acquire}-acquired receiver  ({args.runs} plain "
-          f"runs + 1 libgmalloc run per cell)\n")
+    print(f"12-cell grid, {args.acquire}-acquired receiver"
+          f"{', container filled to capacity' if args.realloc else ''}"
+          f"  ({args.runs} plain runs + 1 libgmalloc run per cell)\n")
     print(f"{'contract':{w}}  {'dir':6} {'boundary':14} {'want':6} "
           f"{'plain':38} {'gmalloc':8} filled")
     print("-" * (w + 80))

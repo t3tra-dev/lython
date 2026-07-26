@@ -50,6 +50,40 @@ bool isBoolFieldType(mlir::Type fieldType) {
   return runtimeContractName(fieldType) == "builtins.bool";
 }
 
+// Does this field read feed an IN-PLACE MUTATION of the value it loaded?
+//
+// Selects how the read is spelled, not whether it is safe -- both spellings are
+// sound now that the transfer manufactures its own reference
+// (`promoteInteriorViewForTransfer`). A read that is about to be mutated stays
+// pinned to the slot because a reallocating mutation renames the lane tuple, and
+// a resource whose tuple is renamed cannot also be released under its old names
+// on a loop back edge. See the branch in `lowerAttrGet` for the measurement.
+//
+// Syntactic, and narrow on purpose: it asks what the read is FOR, at the one
+// point where both the load and its uses are visible. Do not widen it to decide
+// anything else -- the split exists only because the representation has lanes,
+// and it has no successor once the payload is behind the handle.
+bool fieldReadFeedsInPlaceMutation(mlir::Value read) {
+  for (mlir::Operation *user : read.getUsers()) {
+    if (auto setItem = mlir::dyn_cast<py::SetItemOp>(user))
+      if (setItem.getContainer() == read)
+        return true;
+    if (auto delItem = mlir::dyn_cast<py::DelItemOp>(user))
+      if (delItem.getContainer() == read)
+        return true;
+    // A method call reaches its receiver through an attr.get, and whether the
+    // method mutates is not known here: treat any method lookup on the loaded
+    // value as a possible mutation. A nested FIELD read (`t.m.i`) is not one.
+    if (auto attrGet = mlir::dyn_cast<py::AttrGetOp>(user)) {
+      auto kind = attrGet->getAttrOfType<mlir::StringAttr>("ly.attr.kind");
+      if (attrGet.getObject() == read &&
+          !(kind && kind.getValue() == "field"))
+        return true;
+    }
+  }
+  return false;
+}
+
 std::optional<mlir::Attribute> classStaticValue(py::ClassOp classOp,
                                                 llvm::StringRef name) {
   auto names =
@@ -482,6 +516,17 @@ mlir::LogicalResult RuntimeBundleLowerer::promoteInteriorViewForTransfer(
   // would leak: the result group's single release cannot answer for two.
   if (receiver.objectValue.ownership == ownership::OwnershipKind::Own)
     return mlir::success();
+  // The bundle's own ownership field is not the whole answer. A read that DID
+  // take a reference is spelled as a borrow bundle over values rooted by an
+  // owned-local marker (`retainEvidenceElement`), because the reference belongs
+  // to the marker's resource rather than to the bundle -- so the field reads
+  // Borrow while a token exists. Retaining again there leaked the whole payload
+  // once per call (8.1 kB/iteration on `leak_mutate_call_append`), because the
+  // one release the result group plans cannot answer for two retains. Ask the
+  // producer instead of the label.
+  if (mlir::Operation *root = receiver.physicalValues().front().getDefiningOp())
+    if (root->hasAttr(ownership::kOwnedLocalObjectAttr))
+      return mlir::success();
   return RuntimeBundleLowerer::retainAggregateSlot(op, receiver, slotName);
 }
 
@@ -1068,25 +1113,31 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
     // convention then holds. The field alias rides along so an in-place
     // mutation's write-back still reaches the box.
     //
-    // A MUTABLE CONTAINER read stays pinned to the slot, with no reference of
-    // its own. `Interior` says an interior view IS a borrow, and here the borrow
-    // is the only thing that can be right: a reallocating mutation primitive
-    // spells itself as "consume the container and hand back another one"
-    // (`transfer_args = [0]`), which RENAMES the lane tuple, and the affine
-    // verifier's resource identity IS that tuple. Give the reader a token and a
-    // loop makes its release name a tuple the transfer already consumed
-    // ("released through a value already consumed by an ownership transfer" --
-    // measured on collections.Counter.update, five goldens). The reference the
-    // transfer consumes is manufactured AT the transfer instead
-    // (promoteInteriorViewForTransfer), so it is never the slot's own.
+    // Except when the read is about to be mutated in place, where it stays
+    // pinned to the slot with no reference of its own. The reason is the lane
+    // tuple, not the read: a reallocating mutation primitive spells itself as
+    // "consume the container and hand back another one" (`transfer_args = [0]`),
+    // which RENAMES the tuple, and the affine verifier's resource identity IS
+    // the tuple. Give this reader a token and inside a loop its release names a
+    // tuple the transfer already consumed ("released through a value already
+    // consumed by an ownership transfer" -- measured on
+    // collections.Counter.update, five goldens).
     //
-    // Decided by the CONTRACT, not by what the read is used for: the previous
-    // shape asked syntactically whether a mutation followed, which made a read's
-    // representation depend on its uses and had to enumerate the ops that count
-    // as mutation. The split disappears with the payload behind the handle --
-    // a mutation renames nothing then, so a container read is an ordinary read.
+    // What CHANGED is that the pinned branch is no longer the unsafe one. The
+    // transfer used to consume the SLOT's reference, since a borrow has none to
+    // give, and freed the entity while the field still named it; the reference it
+    // consumes is now manufactured at the transfer
+    // (promoteInteriorViewForTransfer). So this condition selects an encoding,
+    // not a safety level -- both branches are sound, which is why it must not be
+    // widened to decide anything else.
+    //
+    // It stays syntactic for the same reason it cannot be deleted: only a lane
+    // tuple can be renamed, so only a representation with lanes needs the split
+    // at all. Behind the handle a mutation renames nothing, this branch has no
+    // work to do, and a container read becomes an ordinary read.
     if (!RuntimeBundleLowerer::isMutableContainerContractName(
-            runtimeShapeContractName(loadedContract))) {
+            runtimeShapeContractName(loadedContract)) ||
+        !fieldReadFeedsInPlaceMutation(op.getResult())) {
       if (!py::isAssignableTo(loadedContract, op.getResult().getType(), op))
         return op.emitError() << "attribute evidence " << loadedContract
                               << " is not assignable to result "

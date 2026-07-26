@@ -1008,13 +1008,26 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
       return op.emitError() << "sequence " << methodName
                             << " expects one Python object argument";
 
-    if (structuralMutation && !receiver.sequenceEvidenceBacked) {
+    // An interior view with NO element evidence must not use the evidence tier
+    // below: that tier derives the insertion index from the number of elements
+    // it knows about, and for a list it knows nothing about, that number is 0 --
+    // so `self.leaf.xs.append(v)` on a call-derived chain appended over element
+    // zero and set the length to 1, printing `[3, 2, <object ...>]` where
+    // CPython prints `[1, 2, 3]`. It had no other arm to take, having no local to
+    // rebind; it has one now, because the re-description is published through the
+    // slot (`rebindMutatedContainer`) and a field chain has a slot. Still refused
+    // across a block boundary, where the values would not dominate the join.
+    bool interiorViewWithoutEvidence =
+        !structuralMutation && receiver.fieldAliasOwner &&
+        !receiver.sequenceEvidenceBacked &&
+        !RuntimeBundleLowerer::mutationCrossesStorageDefiningBlock(
+            op.getOperation(), receiver);
+    if ((structuralMutation && !receiver.sequenceEvidenceBacked) ||
+        interiorViewWithoutEvidence) {
       // Runtime-mode list (e.g. loop-carried): contents are only known to the
       // runtime, so mutate through the runtime representation. The rebind
       // result carries the (possibly reallocated) triple; the emitter turned
       // the mutation into an SSA reassignment of the receiver local.
-      // Non-rebind receivers (object fields) keep the static field-alias
-      // path below.
       if (methodName != "append")
         return op.emitError()
                << "list." << methodName
@@ -1069,7 +1082,15 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
       mlir::memref::StoreOp::create(builder, loc, required, grownMeta,
                                     lengthSlot);
 
-      valueBundles[op.getResult(1)] = updatedRuntime;
+      // A rebind names the re-description under the local's new SSA value; an
+      // interior view has no local, so the receiver VALUE learns it instead.
+      // Only one of the two, because rebinding the receiver value as well would
+      // re-root it, and a root created in a loop body does not dominate the
+      // reads that join after it.
+      if (structuralMutation)
+        valueBundles[op.getResult(1)] = updatedRuntime;
+      else
+        valueBundles[op.getCallable()] = updatedRuntime;
       if (mlir::failed(assignObjectBundle(
               op, op.getResult(0),
               runtimeContractType(context, "types.NoneType"),
