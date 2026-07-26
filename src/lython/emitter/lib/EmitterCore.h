@@ -102,6 +102,26 @@ private:
   // True when the class (by contract name) linearizes onto a manifest
   // exception class (its instances use the runtime exception representation).
   bool isExceptionBackedClass(llvm::StringRef className) const;
+  // True when `type` is a SOURCE class whose linearization provides
+  // `methodName` only through builtins.object — i.e. it inherits object's
+  // default. The question is not "does the method resolve" (since the class's
+  // protocol-table entry now has object as a base, it always does) but
+  // "does anything before object answer it", which is what decides whether the
+  // default may be materialized in place of a dispatch.
+  bool inheritsObjectDefaultDunder(mlir::Type type,
+                                   llvm::StringRef methodName) const;
+  // Of object's eleven declared methods, the six whose default Lython actually
+  // provides for an inheriting class. The other five (__init__, __new__,
+  // __getattribute__, __setattr__, __delattr__) resolve through the same base
+  // and are refused at the call site.
+  static bool isImplementedObjectDefault(llvm::StringRef methodName);
+  // `x.__str__()` on a class that overrides neither __str__ nor __repr__.
+  // CPython's object.__str__ IS type(x).__repr__, so this resolves __repr__ —
+  // the source one when there is one, otherwise the address form. Routing it
+  // to the manifest object.__str__ instead would print "<object object at
+  // ...>", dropping the class name. Nullopt when the default does not apply.
+  std::optional<Value> emitInheritedObjectStr(const parser::Node &anchor,
+                                              Value receiver);
   // Defining class + storage type of a slot-backed (mutable) class attribute
   // reachable from `className` along its MRO.
   std::optional<std::pair<llvm::StringRef, mlir::Type>>

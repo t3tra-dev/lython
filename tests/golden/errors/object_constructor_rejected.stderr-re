@@ -1,0 +1,1 @@
+error: .object\(\). cannot be constructed: a bare object shares the runtime class id of the None singleton

@@ -69,7 +69,8 @@ mlir::LogicalResult RuntimeBundleLowerer::appendRuntimeSource(
     mlir::FunctionType functionType, unsigned &inputIndex,
     const RuntimeBundle &source, llvm::SmallVectorImpl<mlir::Value> &operands) {
   llvm::ArrayRef<mlir::Value> sourceValues = source.physicalValues();
-  if (canAppendExactValues(functionType, inputIndex, sourceValues)) {
+  if (canAppendExactValues(functionType, inputIndex, sourceValues) &&
+      !RuntimeBundleLowerer::usesInheritedObjectDunder(symbol, source)) {
     if (source.contractName() == "builtins.object" &&
         sourceValues.size() == 1 &&
         isBuiltinsObjectHandleType(functionType.getInput(inputIndex)) &&
@@ -144,13 +145,28 @@ mlir::LogicalResult RuntimeBundleLowerer::appendRuntimeSource(
 
   if (source.kind == RuntimeBundle::Kind::Object &&
       isBuiltinsObjectHandleType(expected)) {
-    if (!RuntimeBundleLowerer::isBuiltinsObjectContract(source.contract))
-      return op->emitError()
-             << "cannot pass concrete object " << source.contractName()
-             << " as builtins.object runtime input " << inputIndex << " of "
-             << symbol.contract << "." << symbol.name
-             << "; box the object at the owning ABI boundary first";
-    if (runtimeInputConsumesObject(symbol, inputIndex))
+    std::optional<RuntimeBundle> boxedSource;
+    if (!RuntimeBundleLowerer::isBuiltinsObjectContract(source.contract)) {
+      // A source-class instance reaches an inherited builtins.object method
+      // (object.__eq__/__ne__/__hash__) through a payload box, exactly as it
+      // reaches a container slot. Its own storage is NOT that handle even
+      // though the memref type matches: the boxed-payload entity word the
+      // callee reads as the object's identity is only written by the box.
+      if (!RuntimeBundleLowerer::usesInheritedObjectDunder(symbol, source))
+        return op->emitError()
+               << "cannot pass concrete object " << source.contractName()
+               << " as builtins.object runtime input " << inputIndex << " of "
+               << symbol.contract << "." << symbol.name
+               << "; box the object at the owning ABI boundary first";
+      mlir::FailureOr<RuntimeBundle> boxed =
+          RuntimeBundleLowerer::boxRuntimeObjectAtCurrentInsertion(
+              op, source, runtimeInputConsumesObject(symbol, inputIndex));
+      if (mlir::failed(boxed))
+        return mlir::failure();
+      boxedSource = std::move(*boxed);
+      sourceValues = boxedSource->physicalValues();
+    }
+    if (!boxedSource && runtimeInputConsumesObject(symbol, inputIndex))
       return rejectConsumingObjectView(op, symbol, inputIndex, source,
                                        "borrowed builtins.object handle");
     if (sourceValues.empty())
@@ -300,7 +316,8 @@ bool RuntimeBundleLowerer::canAppendRuntimeSource(
     const RuntimeSymbol &symbol, mlir::FunctionType functionType,
     unsigned &inputIndex, const RuntimeBundle &source) const {
   llvm::ArrayRef<mlir::Value> sourceValues = source.physicalValues();
-  if (canAppendExactValues(functionType, inputIndex, sourceValues)) {
+  if (canAppendExactValues(functionType, inputIndex, sourceValues) &&
+      !RuntimeBundleLowerer::usesInheritedObjectDunder(symbol, source)) {
     if (source.contractName() == "builtins.object" &&
         sourceValues.size() == 1 &&
         isBuiltinsObjectHandleType(functionType.getInput(inputIndex)) &&
@@ -367,7 +384,8 @@ bool RuntimeBundleLowerer::canAppendRuntimeSource(
       (sourceValues.front().getType() == expected ||
        compatibleRankOneMemRefStorage(sourceValues.front().getType(), expected,
                                       /*targetMustBeDynamic=*/false))) {
-    if (!RuntimeBundleLowerer::isBuiltinsObjectContract(source.contract))
+    if (!RuntimeBundleLowerer::isBuiltinsObjectContract(source.contract) &&
+        !RuntimeBundleLowerer::usesInheritedObjectDunder(symbol, source))
       return false;
     if (runtimeInputConsumesObject(symbol, inputIndex))
       return false;

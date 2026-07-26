@@ -1,3 +1,4 @@
+#include "Contracts.h"
 #include "EmitterCore.h"
 #include "EmitterPyOps.h"
 #include "EmitterSupport.h"
@@ -415,6 +416,37 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
                 expr, emitMethodObject(*calleeNode, receiver, *method),
                 emitCallOperands(expr));
           return emitInlineMethodCall(expr, receiver, *method);
+        }
+        if (*methodName == "__str__") {
+          const auto *strArgs = ast::nodeList(expr, "args");
+          const auto *strKeywords = ast::nodeList(expr, "keywords");
+          if ((!strArgs || strArgs->empty()) &&
+              (!strKeywords || strKeywords->empty()))
+            if (std::optional<Value> stringified =
+                    emitInheritedObjectStr(expr, receiver))
+              return *stringified;
+        }
+        // A source class inherits ALL of builtins.object's declared methods
+        // through its protocol-table base, but only the defaults above have
+        // something behind them. The rest are refused here, located and naming
+        // the class, rather than left to report "runtime manifest has no
+        // C.__setattr__ method" from the lowering — which is the same
+        // points-away-from-the-defect wording the contract audit was written
+        // about.
+        if (inheritsObjectDefaultDunder(receiver.type, *methodName) &&
+            !isImplementedObjectDefault(*methodName)) {
+          auto contract =
+              mlir::cast<py::ContractType>(types.widenLiteral(receiver.type));
+          diagnostics.push_back(parser::Diagnostic{
+              parser::Severity::Error, expr.range.start,
+              "'" +
+                  py::contracts::displayClassNameForContract(
+                      contract.getContractName()) +
+                  "' inherits builtins.object." + std::string(*methodName) +
+                  ", which Lython does not implement; the inherited object "
+                  "defaults are __eq__, __ne__, __hash__, __bool__, __repr__ "
+                  "and __str__"});
+          return emitNone(expr);
         }
 
         CallOperands operands = emitCallOperands(expr);
@@ -1628,6 +1660,30 @@ ModuleEmitter::tryEmitHashCall(const parser::Node &expr,
   // is probed without emitting: declining must leave no side effects for
   // the generic path to re-emit.
   mlir::Type argType = types.inferExpr(args->front().get());
+  // CPython sets __hash__ to None on a class that defines __eq__ and not
+  // __hash__ (every unfrozen dataclass included), so its instances are
+  // unhashable. Refused rather than answered with object's identity hash:
+  // two instances the class calls EQUAL would hash apart, and every hash
+  // container built on them would then miss without a word.
+  // Enum members are exempt: CPython's Enum defines no __eq__ of its own, so
+  // members stay hashable; the __eq__ Lython synthesizes for an enum is a
+  // lowering artifact, not the author's value equality.
+  if (auto contract =
+          mlir::dyn_cast_if_present<py::ContractType>(types.widenLiteral(argType));
+      contract && inheritsObjectDefaultDunder(argType, "__hash__") &&
+      lookupClassMethod(argType, "__eq__") &&
+      !enumClasses.count(contract.getContractName())) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "'" +
+            py::contracts::displayClassNameForContract(
+                contract.getContractName()) +
+            "' defines __eq__ without __hash__, so its instances are "
+            "unhashable (CPython sets __hash__ to None for such a class, "
+            "including every unfrozen dataclass); define __hash__ consistently "
+            "with __eq__ to hash it"});
+    return emitNone(expr);
+  }
   if (!lookupClassMethod(argType, "__hash__"))
     return std::nullopt;
   Value input = emitExpr(args->front().get());
@@ -1785,6 +1841,33 @@ Value ModuleEmitter::emitEmptyStrConstant(const parser::Node &anchor) {
                                       builder.getStringAttr(""));
   return coerceValue(Value{op.getResult(), literalType},
                      types.contract("builtins.str"), anchor);
+}
+
+std::optional<Value>
+ModuleEmitter::emitInheritedObjectStr(const parser::Node &anchor,
+                                     Value receiver) {
+  mlir::Type widened = types.widenLiteral(receiver.type);
+  if (!inheritsObjectDefaultDunder(widened, "__str__"))
+    return std::nullopt;
+  if (std::optional<MethodBinding> repr =
+          lookupClassMethod(widened, "__repr__")) {
+    llvm::StringMap<Value> emptyKeywords;
+    Value bound = emitDescriptorReceiver(anchor, receiver, *repr);
+    return emitInlineMethodBody(anchor, bound,
+                                methodBindingBindsReceiver(*repr), *repr, {},
+                                emptyKeywords);
+  }
+  CallInferenceResult inference =
+      types.inferMethodCallWithEvidence(widened, "__repr__", {});
+  if (!inference)
+    return std::nullopt;
+  mlir::Type strType = types.contract("builtins.str");
+  Value value = coerceValue(receiver, widened, anchor);
+  auto op = py::ReprOp::create(
+      builder, loc(anchor), strType,
+      mlir::FlatSymbolRefAttr::get(&context, "__repr__"),
+      mlir::TypeAttr::get(callProtocolFor(inference)), value.value);
+  return Value{op.getResult(), strType};
 }
 
 std::optional<Value> ModuleEmitter::emitStringifyValue(const parser::Node &anchor,

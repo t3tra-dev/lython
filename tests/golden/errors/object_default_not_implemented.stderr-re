@@ -1,0 +1,1 @@
+error: 'C' inherits builtins.object.__setattr__, which Lython does not implement

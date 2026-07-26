@@ -1,0 +1,1 @@
+error: 'Point' defines __eq__ without __hash__, so its instances are unhashable

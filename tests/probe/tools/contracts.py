@@ -75,28 +75,36 @@ EXPECTED_FAILURES = frozenset({
     "complex.__str__", "complex.__str__.explicit",
     "complex.__abs__", "complex.__abs__.explicit",
     "slice.indices",                   # `slice` unbound; xs[1:3] works
-    "object.__repr__", "object.__str__",   # `repr` unbound on user classes
-    "type.__repr__",                       # ditto
+    "type.__repr__",                       # `repr` unbound on a type object
     "type.__name__",                       # no static __name__ attribute
     "int.__new__(bytes)",              # int(b"12") overload not declared
     "float.__new__",                   # float("1.5") overload not declared
 
-    # -- builtins.object's default dunders do not reach user classes. Needs a
-    # decision about how they are inherited, not a manifest patch.
-    "object.__bool__",
-    "object.__eq__", "object.__eq__(self)", "object.__eq__.explicit",
-    "object.__ne__", "object.__ne__.explicit",
-    "object.__hash__", "object.__hash__.explicit",
-    "object.__repr__.explicit", "object.__str__.explicit",
+    # -- No static `__name__` on a class object. Filed under object here only
+    # because the case reaches it through `Box.__name__`; the cause is the same
+    # as type.__name__ above, not object's dunders (which now inherit -- the
+    # eleven cases that used to sit in this group are gone from the set).
     "object.__init__.explicit",
 
-    # -- Declared with no implementation behind them.
+    # -- DELIBERATE deviation, not a gap. CPython's object.__eq__/__ne__ return
+    # the NotImplemented sentinel when the operands are not identical, and `==`
+    # only then decides; Lython has no NotImplemented value (a dynamic
+    # singleton whose only use is dispatch fallback we resolve statically), so
+    # an explicit b.__eq__(c) yields what `b == c` yields. The operator forms
+    # object.__eq__/__ne__ agree with CPython and are NOT in this set.
+    "object.__eq__.explicit", "object.__ne__.explicit",
+
+    # -- Declared with no implementation behind them. All of these now say so
+    # ("X.Y is declared by the standard-library contract but has no
+    # implementation in Lython"): the refusal names the declaration as the
+    # defect instead of reporting "runtime manifest has no X.Y method", which
+    # read as "that method does not exist".
     "BaseException.with_traceback",     # wants tracebacks modelled first
     "BaseException.add_note",           # wants a __notes__ field
-    "dict_keys.__reversed__",
+    "dict_keys.__reversed__",           # reversed() needs an indexable source
     "dict_values.__reversed__",
     "dict_items.__reversed__",
-    "type.__call__",                   # now diagnosed, still unimplemented
+    "type.__call__",                   # diagnosed, still unimplemented
     "type.__or__",
 
     # -- _asyncio.Future cannot be instantiated ("class instantiation leaves

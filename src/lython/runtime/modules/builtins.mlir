@@ -1134,6 +1134,42 @@ module attributes {
     func.return %rh, %rb : memref<2xi64>, memref<?xi8>
   }
 
+  // object.__eq__ / __ne__ / __hash__: the defaults every class inherits.
+  // They forward to the SAME boxed dispatchers the dict/set key paths use
+  // (__ly_box_equal / __ly_box_hash) rather than open-coding an address
+  // compare, so `a == b` and "a and b land in the same dict slot" cannot
+  // disagree -- and a subclass that does define __eq__/__hash__ is still
+  // reached, because those dispatchers consult the per-class-id hook before
+  // falling back to identity (CPython's object.__eq__ / object.__hash__).
+  func.func @LyObject_BoxedEq(%lhs: memref<16xi64>, %rhs: memref<16xi64>) -> i1 attributes {ly.runtime.contract = "builtins.object", ly.runtime.method = "__eq__"} {
+    %lhs_idx = memref.extract_aligned_pointer_as_index %lhs : memref<16xi64> -> index
+    %lhs_word = arith.index_cast %lhs_idx : index to i64
+    %lhs_ptr = llvm.inttoptr %lhs_word : i64 to !llvm.ptr
+    %rhs_idx = memref.extract_aligned_pointer_as_index %rhs : memref<16xi64> -> index
+    %rhs_word = arith.index_cast %rhs_idx : index to i64
+    %rhs_ptr = llvm.inttoptr %rhs_word : i64 to !llvm.ptr
+    %eq = func.call @__ly_box_equal(%lhs_ptr, %rhs_ptr) : (!llvm.ptr, !llvm.ptr) -> i1
+    func.return %eq : i1
+  }
+
+  // Derived from __eq__, not open-coded: CPython's object.__ne__ is the
+  // negation of whatever __eq__ resolved to, so deriving it here keeps the
+  // pair from disagreeing when a subclass supplies only __eq__.
+  func.func @LyObject_BoxedNe(%lhs: memref<16xi64>, %rhs: memref<16xi64>) -> i1 attributes {ly.runtime.contract = "builtins.object", ly.runtime.method = "__ne__"} {
+    %true = arith.constant true
+    %eq = func.call @LyObject_BoxedEq(%lhs, %rhs) : (memref<16xi64>, memref<16xi64>) -> i1
+    %ne = arith.xori %eq, %true : i1
+    func.return %ne : i1
+  }
+
+  func.func @LyObject_BoxedHash(%box: memref<16xi64>) -> i64 attributes {ly.runtime.contract = "builtins.object", ly.runtime.method = "__hash__"} {
+    %idx = memref.extract_aligned_pointer_as_index %box : memref<16xi64> -> index
+    %word = arith.index_cast %idx : index to i64
+    %ptr = llvm.inttoptr %word : i64 to !llvm.ptr
+    %hashed = func.call @__ly_box_hash(%ptr) : (!llvm.ptr) -> i64
+    func.return %hashed : i64
+  }
+
   func.func @LyObject_DecRef(%box: memref<16xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.object", ly.runtime.deallocator} {
     %storage = memref.cast %box : memref<16xi64> to memref<?xi64>
     %became_zero = func.call @LyObject_ReleaseStorageToZero(%storage) : (memref<?xi64>) -> i1

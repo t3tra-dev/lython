@@ -180,8 +180,11 @@ std::string defaultReprTypeName(llvm::StringRef contract) {
   if (contract.starts_with("builtins."))
     return contract.rsplit('.').second.str();
   if (!contract.contains('.')) {
+    // A monomorphized generic's contract is the internal "<class>$specN"; the
+    // repr is program-visible text, so it has to read as the class the source
+    // wrote (the same reason dataclass reprs and exception names strip it).
     std::string qualified = "__main__.";
-    qualified += contract.str();
+    qualified += contracts::displayClassNameForContract(contract);
     return qualified;
   }
   return contract.str();
@@ -807,6 +810,24 @@ bool RuntimeBundleLowerer::isBuiltinsObjectContract(mlir::Type type) const {
   return runtimeContractName(type) == "builtins.object";
 }
 
+bool RuntimeBundleLowerer::isInheritedObjectDunder(llvm::StringRef methodName) {
+  return methodName == "__eq__" || methodName == "__ne__" ||
+         methodName == "__hash__";
+}
+
+bool RuntimeBundleLowerer::usesInheritedObjectDunder(
+    const RuntimeSymbol &symbol, const RuntimeBundle &source) const {
+  if (symbol.contract != "builtins.object" || symbol.role != "method" ||
+      !RuntimeBundleLowerer::isInheritedObjectDunder(symbol.name))
+    return false;
+  if (source.kind != RuntimeBundle::Kind::Object ||
+      RuntimeBundleLowerer::isBuiltinsObjectContract(source.contract) ||
+      source.physicalValues().empty())
+    return false;
+  return static_cast<bool>(
+      RuntimeBundleLowerer::classForContract(source.contract));
+}
+
 const RuntimeBundle *RuntimeBundleLowerer::concreteObjectForOwnership(
     const RuntimeBundle &bundle) const {
   const RuntimeBundle *current = &bundle;
@@ -903,6 +924,29 @@ mlir::FailureOr<mlir::Value> RuntimeBundleLowerer::erasedObjectStorageView(
       .getResult();
 }
 
+// The wording an unnarrowed `T | None` deserves wherever a concrete object is
+// required; empty for anything else.
+std::string describeUnnarrowedOptional(mlir::Type contract) {
+  auto unionType = mlir::dyn_cast_if_present<py::UnionType>(contract);
+  if (!unionType)
+    return {};
+  bool optional =
+      llvm::any_of(unionType.getMemberTypes(), [](mlir::Type member) {
+        return runtimeContractName(member) == "types.NoneType" ||
+               mlir::isa<py::LiteralType>(member);
+      });
+  if (!optional)
+    return {};
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  stream << "unnarrowed " << contract
+         << " cannot be used where a concrete object is required: its runtime "
+            "value is a member tag plus per-member storage, not an object "
+            "handle. Narrow it first (`if v is not None:` / `assert v is not "
+            "None`) or produce a non-Optional value (`d.get(key, default)`)";
+  return stream.str();
+}
+
 mlir::FailureOr<mlir::Value>
 RuntimeBundleLowerer::objectPhysicalHeader(mlir::Operation *op,
                                            const RuntimeValue &value) {
@@ -912,10 +956,17 @@ RuntimeBundleLowerer::objectPhysicalHeader(mlir::Operation *op,
 
   mlir::Value header = value.values.front();
   auto headerType = mlir::dyn_cast<mlir::MemRefType>(header.getType());
-  if (!headerType || !isRankOneI64MemRef(header.getType()))
+  if (!headerType || !isRankOneI64MemRef(header.getType())) {
+    // An Optional in an object position lands here with the union's i64 TAG as
+    // the would-be header. Reporting that type is true and useless: it names
+    // neither Optional nor narrowing, which is the whole content of the fix.
+    if (std::string optional = describeUnnarrowedOptional(value.contract);
+        !optional.empty())
+      return op->emitError() << optional;
     return op->emitError() << value.contractName()
                            << " runtime object header has invalid type "
                            << header.getType();
+  }
   if (headerType.hasStaticShape() && headerType.getDimSize(0) < 2)
     return op->emitError() << value.contractName()
                            << " runtime object header must expose refcount "
