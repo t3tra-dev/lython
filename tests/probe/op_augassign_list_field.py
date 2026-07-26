@@ -1,6 +1,6 @@
 # probe: augmented assignment (+=) to a list field of a call-obtained object
 # axes: acquire=call width=w3list op=augassign flow=straight
-# CLASSIFICATION @ kernel/integration 935280d: 3 loud 拒否 (診断)
+# CLASSIFICATION @ kernel/4b fa71a3c: 3 loud 拒否 (診断)
 #   attribute value '!py.contract<"builtins.list">' is not assignable to field '!py.contract<"builtins.list", [!py.contract<"builtins.int">]>'
 # CPython 3.14 expects: 3 3
 

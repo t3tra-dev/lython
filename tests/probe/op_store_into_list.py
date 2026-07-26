@@ -1,6 +1,6 @@
 # probe: an object obtained from a call is stored into a list, then mutated through the list
 # axes: acquire=call width=w3list op=store-into-container flow=straight
-# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
+# CLASSIFICATION @ kernel/4b fa71a3c: 1 正しい
 # CPython 3.14 expects: 2 2
 
 class Box:

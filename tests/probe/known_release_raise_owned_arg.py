@@ -1,6 +1,6 @@
 # probe: REPORTED loud: an owned local is the argument of a raise
 # axes: op=raise-arg flow=trybody
-# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
+# CLASSIFICATION @ kernel/4b fa71a3c: 1 正しい
 # CPython 3.14 expects: 2
 
 class Err(Exception):

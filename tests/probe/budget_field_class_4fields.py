@@ -8,7 +8,7 @@
 #   (`Four` は 5 ではなく 13 ハンドルに展開されていた)。placeholder 削除後は
 #   `kernel/4a` (`a36d881`) で**通る** — 実測 3/3 + libgmalloc。
 # axes: width=wNcls(4 fields as a field type) op=construct+read flow=straight budget=1
-# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
+# CLASSIFICATION @ kernel/4b fa71a3c: 1 正しい
 # CPython 3.14 expects: 1 2 3 4 / 5 8
 
 

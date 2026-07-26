@@ -1,6 +1,6 @@
 # probe: augmented assignment to an int field of a call-obtained object
 # axes: acquire=call width=w3int op=augassign flow=straight
-# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
+# CLASSIFICATION @ kernel/4b fa71a3c: 1 正しい
 # CPython 3.14 expects: 42
 
 class Box:

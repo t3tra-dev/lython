@@ -1,6 +1,6 @@
 # probe: REPORTED loud: an owned local rebound inside one branch
 # axes: op=local-rebind flow=ifone
-# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
+# CLASSIFICATION @ kernel/4b fa71a3c: 1 正しい
 # CPython 3.14 expects: 3 1
 
 def run(flag: bool) -> int:

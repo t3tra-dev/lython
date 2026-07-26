@@ -2,7 +2,7 @@
 #   「読み出しなし」版と揃えるための 3 幅目 (通る)。
 #   3 幅すべてで「読み出しなし = 通る」ため、**合流後の読み出しは全幅で必要条件**。
 # axes: acquire=call width=w3list op=rebind flow=ifone read=none
-# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
+# CLASSIFICATION @ kernel/4b fa71a3c: 1 正しい
 # CPython 3.14 expects: (出力なし、正常終了)
 
 

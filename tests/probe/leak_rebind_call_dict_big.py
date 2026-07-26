@@ -1,8 +1,7 @@
 # probe: leak -- dict field rebind on a call-obtained receiver (one handle) (40000 iterations)
 # axes: op=leak-loop iterations=40000
-# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
+# CLASSIFICATION @ kernel/4b fa71a3c: 1 正しい
 # CPython 3.14 expects: 160000
-# RSS: -24 バイト/回 → リークなし (計測ノイズ ±130 B/回 の範囲)
 
 class Box:
     def __init__(self, v: dict[str, int]) -> None:

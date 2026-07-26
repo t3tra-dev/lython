@@ -5,7 +5,7 @@
 #   いる box の側で出るはずで、名前解決の側では出ない。
 #   (出典: kernel-sidedefects)
 # axes: width=callable op=store-into-container flow=straight
-# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
+# CLASSIFICATION @ kernel/4b fa71a3c: 1 正しい
 # CPython 3.14 expects: hi
 
 from typing import Callable

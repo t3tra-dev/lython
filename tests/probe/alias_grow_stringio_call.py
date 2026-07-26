@@ -1,7 +1,7 @@
 # probe: 照会 A/B の対照 -- 完全に header-fronted な 1 レーン contract
 #   (io.StringIO) のフィールドを同じ形で変異させる。657f0d8 でも正常終了した。
 # axes: acquire=call width=1lane-header-fronted op=alias-grow flow=straight
-# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
+# CLASSIFICATION @ kernel/4b fa71a3c: 1 正しい
 # CPython 3.14 expects: abcdef
 # 観測: libgmalloc: 正常終了
 

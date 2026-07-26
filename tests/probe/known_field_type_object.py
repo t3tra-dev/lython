@@ -1,6 +1,6 @@
 # probe: REPORTED loud: a class field holding a type object
 # axes: width=type op=field flow=straight
-# CLASSIFICATION @ kernel/integration 935280d: 3 loud 拒否 (診断)
+# CLASSIFICATION @ kernel/4b fa71a3c: 3 loud 拒否 (診断)
 #   static type !py.contract<"Box"> does not provide manifest method 't'
 # CPython 3.14 expects: 5
 

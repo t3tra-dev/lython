@@ -3,7 +3,7 @@
 #   「re-root されたレーンを合流後の呼び出しに押し込む読み出し」という第 2 の
 #   必要条件がある (list フィールドに限る -- 下 2 件が対照)。
 # axes: acquire=call width=w3list op=rebind flow=ifone read=plain-bind
-# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
+# CLASSIFICATION @ kernel/4b fa71a3c: 1 正しい
 # CPython 3.14 expects: (出力なし、正常終了)
 
 

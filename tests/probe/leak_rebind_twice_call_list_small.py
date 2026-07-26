@@ -1,8 +1,7 @@
 # probe: leak -- two successive list field rebinds on a call-obtained receiver (100 iterations)
 # axes: op=leak-loop iterations=100
-# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
+# CLASSIFICATION @ kernel/4b fa71a3c: 1 正しい
 # CPython 3.14 expects: 800
-# RSS: 9 バイト/回 → リークなし (計測ノイズ ±130 B/回 の範囲)
 
 class Box:
     def __init__(self, v: list[int]) -> None:

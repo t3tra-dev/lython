@@ -1,8 +1,7 @@
 # probe: leak -- in-place append through self inside a method (the json append shape) (100 iterations)
 # axes: op=leak-loop iterations=100
-# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
+# CLASSIFICATION @ kernel/4b fa71a3c: 1 正しい
 # CPython 3.14 expects: 200
-# RSS: -5 バイト/回 → リークなし (計測ノイズ ±130 B/回 の範囲)
 
 class Box:
     def __init__(self, v: list[int]) -> None:

@@ -1,6 +1,6 @@
 # probe: in-place field mutation inside a for loop (setitem)
 # axes: acquire=call width=w3list/w1dict op=setitem flow=for
-# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
+# CLASSIFICATION @ kernel/4b fa71a3c: 1 正しい
 # CPython 3.14 expects: 2
 
 class Box:

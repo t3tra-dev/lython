@@ -1,6 +1,6 @@
 # probe: field rebind reached through multireturn control flow; field type Other
 # axes: acquire=call width=w1obj op=rebind flow=multireturn
-# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
+# CLASSIFICATION @ kernel/4b fa71a3c: 1 正しい
 # CPython 3.14 expects: 7 / 9 / 7
 
 class Other:

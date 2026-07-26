@@ -1,6 +1,6 @@
 # probe: in-place field mutation -- dict field setitem (insert, may rehash); receiver from field
 # axes: acquire=field width=w3list/w1dict op=dsetitem flow=straight
-# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
+# CLASSIFICATION @ kernel/4b fa71a3c: 1 正しい
 # CPython 3.14 expects: 2 2
 
 class Box:

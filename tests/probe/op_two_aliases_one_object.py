@@ -1,6 +1,6 @@
 # probe: two locals alias one object; a rebind through one is observed through the other
 # axes: acquire=call width=w3list op=alias flow=straight
-# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
+# CLASSIFICATION @ kernel/4b fa71a3c: 1 正しい
 # CPython 3.14 expects: 3 3
 
 class Box:

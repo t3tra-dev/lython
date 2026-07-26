@@ -3,7 +3,7 @@
 #   ただし `flow_ifone_w1obj_noread.py` (読み出しを消すと通る) があるので、
 #   再束縛だけでは失敗しない -- 幅が決めるのは無料の読み出し形が存在するか否か。
 # axes: acquire=call width=w1obj op=rebind flow=ifone read=plain-bind
-# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
+# CLASSIFICATION @ kernel/4b fa71a3c: 1 正しい
 # CPython 3.14 expects: (出力なし、正常終了)
 
 

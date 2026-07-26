@@ -2,7 +2,7 @@
 #   再確保を伴わない `setitem` にする。これが通るので、引き金は「別名の変異」
 #   一般ではなく**別名を再確保させる変異**だと決まる。
 # axes: acquire=call width=w3list op=alias-read+setitem(no realloc) flow=straight
-# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
+# CLASSIFICATION @ kernel/4b fa71a3c: 1 正しい
 # CPython 3.14 expects: 1
 
 

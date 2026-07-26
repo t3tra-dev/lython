@@ -1,6 +1,6 @@
 # probe: REPORTED loud: a generator method on a class
 # axes: op=generator-method flow=for
-# CLASSIFICATION @ kernel/integration 935280d: 3 loud 拒否 (診断)
+# CLASSIFICATION @ kernel/4b fa71a3c: 3 loud 拒否 (診断)
 #   generator function return annotation is incompatible with inferred Generator or AsyncGenerator contract
 # CPython 3.14 expects: 6
 

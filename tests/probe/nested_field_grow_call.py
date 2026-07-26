@@ -1,7 +1,6 @@
 # probe: grow a list that lives ONE LEVEL DOWN a call-derived instance
 # axes: acquire=call width=w3list op=nested-append flow=straight
-# CLASSIFICATION @ kernel/integration 935280d: 4 クラッシュ / abort
-#   signal 6;
+# CLASSIFICATION @ kernel/4b fa71a3c: 1 正しい
 # CPython 3.14 expects: [1, 2] / [1, 2, 3]
 #
 # PRE-EXISTING, not a stage-4a regression: identical failure on main at ed6a798.

@@ -1,6 +1,6 @@
 # probe: a method stores into self's str field; the caller reads it back
 # axes: acquire=self width=str op=rebind flow=straight observe=writeback
-# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
+# CLASSIFICATION @ kernel/4b fa71a3c: 1 正しい
 # CPython 3.14 expects: abcd
 
 class Box:

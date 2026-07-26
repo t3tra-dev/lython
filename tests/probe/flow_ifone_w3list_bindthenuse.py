@@ -5,7 +5,7 @@
 #   (`flow_ifone_w3list_plainbind.py` = 束縛のみ → 通る、が対照。
 #    束縛を 2 段に鎖状につないでも通るところまで確認済み。)
 # axes: acquire=call width=w3list op=rebind flow=ifone read=bind-then-use-local
-# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
+# CLASSIFICATION @ kernel/4b fa71a3c: 1 正しい
 # CPython 3.14 expects: 2
 
 

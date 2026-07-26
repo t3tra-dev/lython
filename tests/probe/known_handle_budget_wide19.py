@@ -1,6 +1,6 @@
 # probe: REPORTED loud (budget 5): a JSONValue-shaped class with many handles
 # axes: width=wNcls(19) op=construct flow=straight
-# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
+# CLASSIFICATION @ kernel/4b fa71a3c: 1 正しい
 # CPython 3.14 expects: 0  0
 
 class JSONValue:

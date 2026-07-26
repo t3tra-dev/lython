@@ -1,6 +1,6 @@
 # probe: the store happens two call levels deep through borrowed receivers (float field)
 # axes: acquire=param width=float op=rebind flow=straight observe=writeback
-# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
+# CLASSIFICATION @ kernel/4b fa71a3c: 1 正しい
 # CPython 3.14 expects: 1.5
 
 class Box:

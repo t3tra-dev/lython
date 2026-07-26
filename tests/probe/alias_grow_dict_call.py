@@ -1,6 +1,6 @@
 # probe: 照会 B を call 由来レシーバで行った形。
 # axes: acquire=call width=w1dict(box-fronted) op=alias-grow-writeback flow=straight
-# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
+# CLASSIFICATION @ kernel/4b fa71a3c: 1 正しい
 # CPython 3.14 expects: 2
 # 観測: 8 回実行: SIGABRT 8 (libsystem_malloc)。libgmalloc: SIGSEGV
 

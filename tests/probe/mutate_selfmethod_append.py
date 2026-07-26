@@ -1,7 +1,6 @@
 # probe: in-place mutation through self inside a method -- list field append (grow, may reallocate)
 # axes: acquire=self width=w3list/w1dict op=append flow=straight
-# CLASSIFICATION @ kernel/integration 935280d: 3 loud 拒否 (診断)
-#   owned resource from @LyLong_Repr result 0 is released or transferred more than once on one CFG path
+# CLASSIFICATION @ kernel/4b fa71a3c: 1 正しい
 # CPython 3.14 expects: 2 10 20
 
 class Box:

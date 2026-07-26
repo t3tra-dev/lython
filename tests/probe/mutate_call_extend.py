@@ -1,6 +1,6 @@
 # probe: in-place field mutation -- list field extend; receiver from call
 # axes: acquire=call width=w3list/w1dict op=extend flow=straight
-# CLASSIFICATION @ kernel/integration 935280d: 3 loud 拒否 (診断)
+# CLASSIFICATION @ kernel/4b fa71a3c: 3 loud 拒否 (診断)
 #   runtime bundle for '!py.contract<"types.NoneType">' has 3 values, but ABI expects 0
 # CPython 3.14 expects: 3 3
 

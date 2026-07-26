@@ -1,6 +1,6 @@
 # probe: a method stores into self's tuple[int, int] field; the caller reads it back
 # axes: acquire=self width=tuple op=rebind flow=straight observe=writeback
-# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
+# CLASSIFICATION @ kernel/4b fa71a3c: 1 正しい
 # CPython 3.14 expects: (1, 2)
 
 class Box:

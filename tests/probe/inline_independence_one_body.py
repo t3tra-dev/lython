@@ -20,7 +20,7 @@
 #   「要素と元のローカルが偶然一致した 2 つの物」ではなく**同一物**であることを
 #   押さえる (N3 と N4 は別 probe だったので、その連言を 1 観測にする)。
 # axes: width=w2float op=one-body-six-positions flow=mixed observe=inline-independence
-# CLASSIFICATION @ kernel/4a 6c328b5: 1 正しい
+# CLASSIFICATION @ kernel/4b fa71a3c: 1 正しい
 # CPython 3.14 expects: 1.5 / 2.5 / 3.5 3.5 / 4.5 / 5.5 / 6.5
 
 

@@ -1,6 +1,6 @@
 # probe: same store-through-parameter but the stored value is an immediate literal
 # axes: acquire=param width=float op=rebind(literal) flow=straight observe=writeback
-# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
+# CLASSIFICATION @ kernel/4b fa71a3c: 1 正しい
 # CPython 3.14 expects: 1.5
 
 class Box:

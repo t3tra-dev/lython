@@ -1,6 +1,6 @@
 # probe: callee stores into and reads back a borrowed receiver's list[int] field, then the caller reads it
 # axes: acquire=param width=list op=rebind flow=straight observe=writeback-both
-# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
+# CLASSIFICATION @ kernel/4b fa71a3c: 1 正しい
 # CPython 3.14 expects: in callee: 2 / in caller: 2
 
 class Box:

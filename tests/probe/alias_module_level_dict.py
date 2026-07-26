@@ -2,7 +2,7 @@
 #   経由せずモジュール直下で書く。この綴りだけ abort ではなく **silent** になる
 #   (挿入が黙って失われる) ので、alias staleness の silent の顔にあたる。
 # axes: acquire=inline width=w1dict(box-fronted) op=alias-read+insert+writeback flow=straight scope=module
-# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
+# CLASSIFICATION @ kernel/4b fa71a3c: 1 正しい
 # CPython 3.14 expects: 1
 
 

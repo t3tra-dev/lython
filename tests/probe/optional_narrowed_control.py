@@ -3,7 +3,7 @@
 #   表現自体は存在し、欠けているのは「絞り込まれていない Optional を object
 #   位置に渡す」経路とその診断だけである、と切り分けられる。
 # axes: width=optional op=narrowed-read flow=ifboth
-# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
+# CLASSIFICATION @ kernel/4b fa71a3c: 1 正しい
 # CPython 3.14 expects: 2 / missing / 0 / 2
 
 d: dict[str, int] = {"a": 1, "b": 2}

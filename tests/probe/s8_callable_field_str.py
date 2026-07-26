@@ -4,7 +4,7 @@
 #   上の list 要素版が通ることと対比すること。
 #   (出典: kernel-sidedefects)
 # axes: width=callable(str) op=field flow=straight
-# CLASSIFICATION @ kernel/integration 935280d: 3 loud 拒否 (診断)
+# CLASSIFICATION @ kernel/4b fa71a3c: 3 loud 拒否 (診断)
 #   attribute value '!py.contract<"builtins.function">' is not assignable to field '!py.callable<[], returns = [!py.contract<"builtins.str">]>'
 # CPython 3.14 expects: hi
 

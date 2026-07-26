@@ -1,6 +1,6 @@
 # probe: REPORTED loud: a container-typed module global read from inside a function
 # axes: op=module-global flow=straight
-# CLASSIFICATION @ kernel/integration 935280d: 3 loud 拒否 (診断)
+# CLASSIFICATION @ kernel/4b fa71a3c: 3 loud 拒否 (診断)
 #   unresolved name 'TABLE'
 # CPython 3.14 expects: 1
 

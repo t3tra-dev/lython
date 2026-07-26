@@ -1,6 +1,6 @@
 # probe: same store-through-parameter, but the caller built the receiver inline
 # axes: acquire=param(inline recv) width=float op=rebind flow=straight observe=writeback
-# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
+# CLASSIFICATION @ kernel/4b fa71a3c: 1 正しい
 # CPython 3.14 expects: 1.5
 
 class Box:

@@ -1,6 +1,6 @@
 # probe: field rebind -- receiver read out of another object's field; field type Wide
 # axes: acquire=field width=wNcls op=rebind flow=straight
-# CLASSIFICATION @ kernel/integration 935280d: 1 正しい
+# CLASSIFICATION @ kernel/4b fa71a3c: 1 正しい
 # CPython 3.14 expects: 1 2.5 z
 
 class Other:
