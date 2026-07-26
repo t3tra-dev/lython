@@ -1,0 +1,1 @@
+local 'out' is reassigned inside an except handler of this try, and the shape of this statement leaves no way to carry

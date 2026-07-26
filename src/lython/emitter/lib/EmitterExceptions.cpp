@@ -222,6 +222,40 @@ bool isMutableContainerContract(mlir::Type type) {
 
 } // namespace
 
+mlir::Type ModuleEmitter::postTryLaneCarrierType(mlir::Type type) const {
+  mlir::Type widened = types.widenLiteral(type);
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(widened);
+  if (!contract)
+    return {};
+  // Why exceptions are excluded even though they are objects like the rest:
+  // an `except E as e` binding is a BORROW of the current-exception slot
+  // (lowerExceptCurrentValue hands out OwnershipKind::Borrow), and the handler
+  // exit that would feed the lane runs LyEH_DiscardCurrentException BEFORE the
+  // branch that carries it. A lane therefore publishes a pointer whose last
+  // reference the discard just dropped: measured as an empty str() under the
+  // system allocator and SIGSEGV under libgmalloc for a user exception class,
+  // which reached here as an ordinary user class. Storage carries them
+  // instead -- an aggregate slot store retains, and it retains inside the
+  // handler, ahead of the discard.
+  if (isExceptionContractType(widened))
+    return {};
+  llvm::StringRef name = contract.getContractName();
+  if (name == "builtins.int" || name == "builtins.str" ||
+      name == "builtins.bool" || name == "builtins.float" ||
+      name == "builtins.tuple" || name == "builtins.list" ||
+      name == "builtins.dict" || name == "builtins.set" ||
+      name == "builtins.frozenset" || name == "builtins.bytes")
+    return widened;
+  // A user class instance carries the same way. Why not leave it out:
+  // a non-carrier candidate used to be skipped SILENTLY, so `obj = C(...)`
+  // inside a handler was discarded and the post-try read answered the
+  // pre-try object -- and a desugared enum member or NamedTuple is a
+  // user class, which makes that the common shape rather than a corner.
+  if (classFieldOrders.contains(name))
+    return widened;
+  return {};
+}
+
 void ModuleEmitter::emitTry(const parser::Node &statement) {
   const auto *handlers = ast::nodeList(statement, "handlers");
   const auto *finalbody = ast::nodeList(statement, "finalbody");
@@ -447,28 +481,50 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
   // `xs.append(...)` into a non-evidence-backed receiver.
   //
   // The same promotion covers a rebind in a HANDLER, the ELSE body or the
-  // FINALLY body, but only when the post-try result lanes below are
-  // unavailable. Those bodies are each emitted under a ScopedEmitterScope
+  // FINALLY body. Those bodies are each emitted under a ScopedEmitterScope
   // that restores `values` wholesale, so a rebind inside one reaches the
   // continuation only through storage or through a lane; with an else or a
   // finally present there are no lanes, and the rebind was silently dropped
   // (`seen = "unset"` after `except: seen = "handled"; finally: ...`, and
-  // `outcome` unchanged by an else body). Where the lanes DO exist they stay
-  // in charge: a lane keeps the value in SSA, which the continuation prefers.
+  // `outcome` unchanged by an else body). Where a lane CAN carry the name it
+  // stays in charge: a lane keeps the value in SSA, which the continuation
+  // prefers. Where it cannot -- an exception entity is the case that brought
+  // this here, and postTryLaneCarrierType says why -- storage is the only
+  // channel, so the name promotes even though lanes exist for its neighbours.
   bool postTryLanesAvailable = !hasElse && !hasFinally &&
                                !usesFinallyCompletion && handlers &&
                                !handlers->empty();
   llvm::SmallVector<std::string, 4> storagePromotedNames;
+  // Names left to the lanes on purpose: pre-existing bindings a handler rebinds
+  // whose type a lane CAN carry, mapped to the value they held before the
+  // statement. Checked again once the lanes are known, because a lane is also
+  // dropped for reasons only the emitted region shape shows, and then nothing
+  // carries the rebind at all. The pre-try value is what tells a dropped lane
+  // apart from a handler that never changed the binding.
+  llvm::StringMap<mlir::Value> laneRequiredNames;
   if (hasFinally || (handlers && !handlers->empty())) {
     llvm::StringSet<> reboundInBody;
     collectRebindNames(ast::nodeList(statement, "body"), reboundInBody);
-    if (!postTryLanesAvailable) {
-      if (handlers)
-        for (const parser::NodePtr &handler : *handlers)
-          if (handler)
-            collectRebindNames(ast::nodeList(*handler, "body"), reboundInBody);
-      collectRebindNames(ast::nodeList(statement, "orelse"), reboundInBody);
-      collectRebindNames(finalbody, reboundInBody);
+    llvm::StringSet<> reboundOutsideBody;
+    if (handlers)
+      for (const parser::NodePtr &handler : *handlers)
+        if (handler)
+          collectRebindNames(ast::nodeList(*handler, "body"),
+                             reboundOutsideBody);
+    collectRebindNames(ast::nodeList(statement, "orelse"), reboundOutsideBody);
+    collectRebindNames(finalbody, reboundOutsideBody);
+    for (const auto &entry : reboundOutsideBody) {
+      llvm::StringRef name = entry.getKey();
+      if (postTryLanesAvailable) {
+        auto bound = values.find(name);
+        if (bound == values.end() || !bound->second.value)
+          continue;
+        if (postTryLaneCarrierType(bound->second.type)) {
+          laneRequiredNames[name] = bound->second.value;
+          continue;
+        }
+      }
+      reboundInBody.insert(name);
     }
     // A structural mutation ANYWHERE in the statement disqualifies the name:
     // in the body it would need the cell to carry evidence it cannot, and in
@@ -552,10 +608,34 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
         for (const CarriedLoopLocal &carried : context.carriedLocals)
           if (carried.name == name)
             loopCarried = true;
-      if (loopCarried)
+      if (loopCarried) {
+        // ... but with no lane able to carry the value either, the two
+        // channels' exclusions meet and the rebind reaches nothing. Why say it
+        // here when the pipeline already refuses the exception-entity spelling:
+        // what refuses it is the ownership verifier, over a loop-carried
+        // exception local that a `raise` alone is enough to produce, and
+        // --release turns the verifiers off -- measured there as a SIGSEGV in
+        // the JIT. A diagnostic answers the same way in both configurations,
+        // and names the local instead of a runtime symbol.
+        if (!postTryLaneCarrierType(content))
+          diagnostics.push_back(parser::Diagnostic{
+              parser::Severity::Error, statement.range.start,
+              "local '" + name.str() +
+                  "' is reassigned inside this try and is also carried by an "
+                  "enclosing loop; its type cannot travel either channel out "
+                  "of the statement. Bind the reassignment to a new name "
+                  "inside the block, or move the try out of the loop"});
         continue;
+      }
       storagePromotedNames.push_back(std::string(name));
     }
+    // A receiver whose SSA value a structural mutation rebinds is not a lane
+    // question: it writes `values[name]` directly and the container it names is
+    // mutated in place, so the lane check below must not speak for it.
+    for (const auto &entry : structuralReceivers)
+      laneRequiredNames.erase(entry.getKey());
+    for (const auto &entry : augAssignTargets)
+      laneRequiredNames.erase(entry.getKey());
     for (const std::string &name : storagePromotedNames) {
       Value cell = emitCellAlloc(statement, values.find(name)->second);
       if (!isCellContract(cell.type))
@@ -565,8 +645,13 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
     }
   }
   llvm::StringSet<> storagePromoted;
-  for (const std::string &name : storagePromotedNames)
+  for (const std::string &name : storagePromotedNames) {
     storagePromoted.insert(name);
+    // Promoted after all -- a rebind in the try BODY promotes the name whatever
+    // its handler rebind could have done, and a promoted name is deliberately
+    // kept out of the lanes, so it must not be held to having one.
+    laneRequiredNames.erase(name);
+  }
 
   postTryEligible = postTryLanesAvailable;
   if (postTryEligible) {
@@ -1018,18 +1103,21 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
             loopControlContexts.pop_back();
           if (exceptReturnBlock)
             inlineReturnContexts.pop_back();
-          if (postTryEligible) {
-            mlir::Block *exit = builder.getInsertionBlock();
-            if (exit && !blockHasTerminator(*exit)) {
-              HandlerExit record;
-              record.block = exit;
-              for (const std::string &name : postCandidateNames) {
-                auto found = values.find(name);
-                if (found != values.end() && found->second.value)
-                  record.bindings[name] = found->second;
-              }
-              postHandlerExits.push_back(std::move(record));
+          // Recorded whether or not the lanes are still eligible: an empty
+          // record set is also the fact "no handler falls through", which the
+          // no-channel diagnostic below needs in order not to speak about a
+          // continuation nothing reaches (a handler ending in `raise` observes
+          // its own rebind nowhere).
+          mlir::Block *exit = builder.getInsertionBlock();
+          if (exit && !blockHasTerminator(*exit)) {
+            HandlerExit record;
+            record.block = exit;
+            for (const std::string &name : postCandidateNames) {
+              auto found = values.find(name);
+              if (found != values.end() && found->second.value)
+                record.bindings[name] = found->second;
             }
+            postHandlerExits.push_back(std::move(record));
           }
         }
       }
@@ -1073,28 +1161,8 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
       }
       if (postTryEligible) {
         // Lanes: bound at try end AND at every falling-through handler end,
-        // all lanes carrier-typed; the lane type is the widened join.
-        auto carrierType = [&](mlir::Type type) -> mlir::Type {
-          mlir::Type widened = types.widenLiteral(type);
-          auto contract = mlir::dyn_cast_if_present<py::ContractType>(widened);
-          if (!contract)
-            return {};
-          llvm::StringRef name = contract.getContractName();
-          if (name == "builtins.int" || name == "builtins.str" ||
-              name == "builtins.bool" || name == "builtins.float" ||
-              name == "builtins.tuple" || name == "builtins.list" ||
-              name == "builtins.dict" || name == "builtins.set" ||
-              name == "builtins.frozenset" || name == "builtins.bytes")
-            return widened;
-          // A user class instance carries the same way. Why not leave it out:
-          // a non-carrier candidate is skipped SILENTLY, so `obj = C(...)`
-          // inside a handler was discarded and the post-try read answered the
-          // pre-try object -- and a desugared enum member or NamedTuple is a
-          // user class, which makes that the common shape rather than a corner.
-          if (classFieldOrders.contains(name))
-            return widened;
-          return {};
-        };
+        // all lanes carrier-typed (postTryLaneCarrierType, the same question
+        // the promotion above asked); the lane type is the widened join.
         // A try body that always raises (`try: raise X` / every path returns)
         // contributes NO fall-through lane: its bindings are unreachable after
         // the try. Requiring one here dropped every lane for that shape, so
@@ -1107,7 +1175,8 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
             auto tryBound = postTryEndBindings.find(name);
             if (tryBound == postTryEndBindings.end())
               continue;
-            mlir::Type tryPart = carrierType(tryBound->second.type);
+            mlir::Type tryPart =
+                postTryLaneCarrierType(tryBound->second.type);
             if (!tryPart)
               continue;
             parts.push_back(tryPart);
@@ -1115,9 +1184,10 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
           bool everywhere = true;
           for (const HandlerExit &exit : postHandlerExits) {
             auto found = exit.bindings.find(name);
-            mlir::Type part = found != exit.bindings.end()
-                                  ? carrierType(found->second.type)
-                                  : mlir::Type();
+            mlir::Type part =
+                found != exit.bindings.end()
+                    ? postTryLaneCarrierType(found->second.type)
+                    : mlir::Type();
             if (!part) {
               everywhere = false;
               break;
@@ -1127,7 +1197,7 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
           if (!everywhere || parts.empty())
             continue;
           mlir::Type merged = types.join(parts);
-          if (!merged || !carrierType(merged))
+          if (!merged || !postTryLaneCarrierType(merged))
             continue;
           postCarriedLocals.push_back(PostCarriedLocal{name, merged});
         }
@@ -1164,6 +1234,45 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
                 }) > 0;
       }
     }
+  }
+
+  // The promotion above stood aside for these names because a lane can carry
+  // their type; if the lanes then went away for a region-shape reason, nothing
+  // carries the rebind and the continuation would answer the pre-try value.
+  // Say so rather than answer it.
+  llvm::SmallVector<llvm::StringRef, 4> laneRequiredOrder;
+  for (const auto &entry : laneRequiredNames)
+    laneRequiredOrder.push_back(entry.getKey());
+  llvm::sort(laneRequiredOrder); // map iteration is hash order; diagnostics
+                                 // must come out the same way every run
+  for (llvm::StringRef name : laneRequiredOrder) {
+    if (llvm::any_of(postCarriedLocals, [&](const PostCarriedLocal &local) {
+          return local.name == name;
+        }))
+      continue;
+    // Only a handler that FALLS THROUGH with a different value than the one the
+    // name arrived with can be answered wrongly afterwards. A handler that
+    // raises or returns instead observes its own rebind nowhere, and so does one
+    // that left the binding alone -- diagnosing either would reject a program
+    // that has no way to notice.
+    mlir::Value beforeTry = laneRequiredNames.lookup(name);
+    bool reachesContinuation = false;
+    for (const HandlerExit &exit : postHandlerExits) {
+      auto found = exit.bindings.find(name);
+      if (found != exit.bindings.end() && found->second.value != beforeTry) {
+        reachesContinuation = true;
+        break;
+      }
+    }
+    if (!reachesContinuation)
+      continue;
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, statement.range.start,
+        "local '" + name.str() +
+            "' is reassigned inside an except handler of this try, and the "
+            "shape of this statement leaves no way to carry the new value to "
+            "the code after it; bind the reassignment to a new name inside the "
+            "handler, or split the statement"});
   }
 
   if (!hasElse && !usesFinallyCompletion && !hasFinally) {
