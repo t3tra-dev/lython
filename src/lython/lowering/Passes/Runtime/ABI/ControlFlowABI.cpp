@@ -492,24 +492,23 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerControlFlowBlockArgument(
       merged.objectEvidence = RuntimeObjectEvidence{};
   }
 
-  // The INTERIOR-VIEW relation survives a merge even when the lane identities
-  // do not, which the block above cannot express: it copies evidence only when
-  // every arm forwards the same SSA values, and a loop's back edge forwards the
-  // reallocated ones by construction. But "which storage names this entity" is
-  // a statement about the owner value, not about the lanes — a preheader view
-  // of `n.f` and a grown view of `n.f` are views of the same slot. Dropping it
-  // left a loop-carried field alias with no way to publish a reallocation: the
-  // local saw the new array and the field kept the freed one, and the growth
-  // path could not even refuse, because it could no longer tell a loop-carried
-  // FIELD view from a loop-carried local.
-  if (!sourceBundles.empty()) {
+  // Same relation, from the arms as they were actually spliced. The pre-splice
+  // seed can only read predecessors that were already lowered, so this catches
+  // the arms that were not -- and it is skipped when the seed already found the
+  // relation, which is the case that matters for a loop.
+  //
+  // Neither of the two belongs in the evidence merge above: that one copies only
+  // when every arm forwards the SAME SSA values, and a back edge forwards the
+  // reallocated ones by construction. "Which storage names this entity" is a
+  // statement about the owner value, not about the lanes.
+  if (RuntimeBundle &merged = valueBundles[argument];
+      !merged.fieldAliasOwner && !sourceBundles.empty()) {
     const RuntimeBundle &first = sourceBundles.front();
     if (first.fieldAliasOwner && !first.fieldAliasName.empty() &&
         llvm::all_of(sourceBundles, [&](const RuntimeBundle &candidate) {
           return candidate.fieldAliasOwner == first.fieldAliasOwner &&
                  candidate.fieldAliasName == first.fieldAliasName;
         })) {
-      RuntimeBundle &merged = valueBundles[argument];
       merged.fieldAliasOwner = first.fieldAliasOwner;
       merged.fieldAliasName = first.fieldAliasName;
     }
