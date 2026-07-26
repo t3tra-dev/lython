@@ -567,6 +567,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
       }
       return box;
     };
+    if (mlir::failed(RuntimeBundleLowerer::promoteInteriorViewForTransfer(
+            op, container, "dict.setitem.receiver")))
+      return mlir::failure();
     mlir::FailureOr<mlir::Value> keyBox = transientBox(*payloadKey);
     if (mlir::failed(keyBox))
       return mlir::failure();
@@ -582,68 +585,21 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
         RuntimeBundleLowerer::createRuntimeCall(loc, *setItemBox, operands);
 
     RuntimeBundle updated;
-    if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
-            op, container.objectValue.contract, call.getResults(), updated)))
+    if (mlir::failed(RuntimeBundleLowerer::rebindMutatedContainer(
+            op, container, call.getResults(), updated)))
       return mlir::failure();
-    updated.fieldAliasOwner = container.fieldAliasOwner;
-    updated.fieldAliasName = container.fieldAliasName;
     if (structuralMutation) {
       valueBundles[op.getResult(0)] = std::move(updated);
     } else {
-      // Non-rebind form (a box-fronted field container, `self.data[k] = v`):
-      // the call transferred the container's old storage token, and the
-      // holder absorbs the fresh one — retain-into-slot + end the local
-      // token, the same marker pair a field store emits. The (possibly
-      // reallocated) representation then writes back through the FIELD BOX
-      // words (the box pointer is a stable SSA value in the owner bundle),
-      // so reads in other branches/iterations observe the mutation without
-      // any cross-block SSA rewrite.
-      if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
-              op, updated, "dict.setitem.writeback")))
-        return mlir::failure();
-      if (mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
-              op, updated, "dict.setitem.writeback.source")))
-        return mlir::failure();
-      mlir::Value fieldBox;
-      if (updated.fieldAliasOwner && !updated.fieldAliasName.empty()) {
-        auto owner = valueBundles.find(updated.fieldAliasOwner);
-        if (owner != valueBundles.end() &&
-            owner->second.kind == RuntimeBundle::Kind::Object) {
-          if (py::ClassOp ownerClass = RuntimeBundleLowerer::classForContract(
-                  owner->second.objectValue.contract)) {
-            std::optional<unsigned> ownerFieldIndex =
-                RuntimeBundleLowerer::classFieldIndex(ownerClass,
-                                                      updated.fieldAliasName);
-            if (ownerFieldIndex) {
-              mlir::FailureOr<unsigned> fieldOffset =
-                  RuntimeBundleLowerer::classFieldValueOffset(
-                      op, ownerClass, *ownerFieldIndex,
-                      "dict field writeback ABI");
-              if (mlir::failed(fieldOffset))
-                return mlir::failure();
-              if (*fieldOffset < owner->second.physicalValues().size())
-                fieldBox = owner->second.physicalValues()[*fieldOffset];
-            }
-          }
-        }
-      }
-      if (!fieldBox)
-        return op.emitError()
-               << "in-place dict assignment requires a box-fronted field "
-                  "container";
-      mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
-          RuntimeBundleLowerer::objectPayloadHandleWords(op, updated,
-                                                         /*ownsPayload=*/true);
-      if (mlir::failed(words))
-        return mlir::failure();
-      // Words 0/1 (refcount, class id) are invariant under mutation; refresh
-      // the payload pointer and every (ptr, size) pair.
-      for (unsigned wordIndex = 2; wordIndex < words->size(); ++wordIndex) {
-        mlir::Value slot = mlir::arith::ConstantIndexOp::create(
-            builder, loc, static_cast<std::int64_t>(wordIndex));
-        mlir::memref::StoreOp::create(builder, loc, (*words)[wordIndex],
-                                      fieldBox, slot);
-      }
+      // Non-rebind form (`self.data[k] = v`): there is no local to reassign, so
+      // the container VALUE names the re-description. The write-back into the
+      // field slot already happened in rebindMutatedContainer.
+      //
+      // No retain/release pair here any more. It used to compensate for the
+      // read arriving without a reference of its own -- the transfer consumed
+      // the SLOT's reference and the pair put one back -- and it counted a
+      // reference the read now holds, which the affine verifier reads as one
+      // resource released twice.
       valueBundles[op.getContainer()] = std::move(updated);
     }
     erase.push_back(op);

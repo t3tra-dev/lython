@@ -246,6 +246,54 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerControlFlowBlockArgument(
     controlFlowBlockArgumentsInProgress.erase(argument);
     return mlir::failure();
   }
+  // Seed the INTERIOR-VIEW relation before the edges are spliced, not after.
+  // Splicing re-enters the lowerer, and for a loop the back edge's operand is
+  // produced by an op INSIDE the body — so that op is lowered against this
+  // provisional bundle. A mutation there has to know whether it is holding a
+  // view of someone's slot, and learning it from the post-splice merge is one
+  // step too late: the growth was already emitted with the local rebound and
+  // the slot left naming the freed array.
+  //
+  // Only already-lowered predecessors can be consulted (the back edge is by
+  // definition not one yet), which is enough: the entry edge into a loop
+  // carries the relation, and every arm that carries one must agree, or the
+  // merged value is a view of two different slots and belongs to neither.
+  {
+    unsigned index = argument.getArgNumber();
+    mlir::Value owner;
+    std::string name;
+    bool conflict = false;
+    for (mlir::Block *predecessor : block->getPredecessors()) {
+      auto branch =
+          mlir::dyn_cast<mlir::BranchOpInterface>(predecessor->getTerminator());
+      if (!branch)
+        continue;
+      for (unsigned successor = 0, end = branch->getNumSuccessors();
+           successor < end; ++successor) {
+        if (branch->getSuccessor(successor) != block)
+          continue;
+        mlir::SuccessorOperands operands =
+            branch.getSuccessorOperands(successor);
+        if (operands.getProducedOperandCount() != 0 || index >= operands.size())
+          continue;
+        auto found = valueBundles.find(operands[index]);
+        if (found == valueBundles.end() || !found->second.fieldAliasOwner ||
+            found->second.fieldAliasName.empty())
+          continue;
+        if (owner && (owner != found->second.fieldAliasOwner ||
+                      name != found->second.fieldAliasName)) {
+          conflict = true;
+          continue;
+        }
+        owner = found->second.fieldAliasOwner;
+        name = found->second.fieldAliasName;
+      }
+    }
+    if (owner && !conflict) {
+      provisionalBundle.fieldAliasOwner = owner;
+      provisionalBundle.fieldAliasName = name;
+    }
+  }
   valueBundles[argument] = std::move(provisionalBundle);
 
   // Bundles are copied by VALUE: nested block-argument lowering inserts into
@@ -442,6 +490,29 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerControlFlowBlockArgument(
     }
     if (!allSourcesAgree(sameObjectEvidence))
       merged.objectEvidence = RuntimeObjectEvidence{};
+  }
+
+  // The INTERIOR-VIEW relation survives a merge even when the lane identities
+  // do not, which the block above cannot express: it copies evidence only when
+  // every arm forwards the same SSA values, and a loop's back edge forwards the
+  // reallocated ones by construction. But "which storage names this entity" is
+  // a statement about the owner value, not about the lanes — a preheader view
+  // of `n.f` and a grown view of `n.f` are views of the same slot. Dropping it
+  // left a loop-carried field alias with no way to publish a reallocation: the
+  // local saw the new array and the field kept the freed one, and the growth
+  // path could not even refuse, because it could no longer tell a loop-carried
+  // FIELD view from a loop-carried local.
+  if (!sourceBundles.empty()) {
+    const RuntimeBundle &first = sourceBundles.front();
+    if (first.fieldAliasOwner && !first.fieldAliasName.empty() &&
+        llvm::all_of(sourceBundles, [&](const RuntimeBundle &candidate) {
+          return candidate.fieldAliasOwner == first.fieldAliasOwner &&
+                 candidate.fieldAliasName == first.fieldAliasName;
+        })) {
+      RuntimeBundle &merged = valueBundles[argument];
+      merged.fieldAliasOwner = first.fieldAliasOwner;
+      merged.fieldAliasName = first.fieldAliasName;
+    }
   }
 
   if (controlFlowLogicalBlockArgumentSet.insert(argument).second)

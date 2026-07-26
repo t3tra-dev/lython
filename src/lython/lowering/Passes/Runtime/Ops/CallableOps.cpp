@@ -946,14 +946,17 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
           builder, loc, static_cast<std::int64_t>(wordIndex));
       mlir::memref::StoreOp::create(builder, loc, word, box, slot);
     }
+    if (mlir::failed(RuntimeBundleLowerer::promoteInteriorViewForTransfer(
+            op, receiver, "set.add.receiver")))
+      return mlir::failure();
     llvm::SmallVector<mlir::Value, 6> operands(
         receiver.physicalValues().begin(), receiver.physicalValues().end());
     operands.push_back(box);
     mlir::func::CallOp call =
         RuntimeBundleLowerer::createRuntimeCall(loc, *addBox, operands);
     RuntimeBundle updated;
-    if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
-            op, receiver.objectValue.contract, call.getResults(), updated)))
+    if (mlir::failed(RuntimeBundleLowerer::rebindMutatedContainer(
+            op, receiver, call.getResults(), updated)))
       return mlir::failure();
     valueBundles[op.getResult(1)] = std::move(updated);
     if (mlir::failed(assignObjectBundle(
@@ -985,12 +988,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
                                             emitted)))
       return mlir::failure();
     RuntimeBundle updated;
-    if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
-            op, receiver.objectValue.contract, emitted->call.getResults(),
-            updated)))
+    if (mlir::failed(RuntimeBundleLowerer::rebindMutatedContainer(
+            op, receiver, emitted->call.getResults(), updated)))
       return mlir::failure();
-    updated.fieldAliasOwner = receiver.fieldAliasOwner;
-    updated.fieldAliasName = receiver.fieldAliasName;
     valueBundles[op.getResult(1)] = std::move(updated);
     if (mlir::failed(assignObjectBundle(
             op, op.getResult(0),
@@ -1049,6 +1049,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
       mlir::Value required =
           mlir::arith::AddIOp::create(builder, loc, length, one).getResult();
 
+      if (mlir::failed(RuntimeBundleLowerer::promoteInteriorViewForTransfer(
+              op, receiver, "list.append.receiver")))
+        return mlir::failure();
       llvm::SmallVector<mlir::Value, 6> operands(
           receiver.physicalValues().begin(), receiver.physicalValues().end());
       operands.push_back(required);
@@ -1056,9 +1059,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
           RuntimeBundleLowerer::createRuntimeCall(loc, *ensure, operands);
 
       RuntimeBundle updatedRuntime;
-      if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
-              op, receiver.objectValue.contract, grow.getResults(),
-              updatedRuntime)))
+      if (mlir::failed(RuntimeBundleLowerer::rebindMutatedContainer(
+              op, receiver, grow.getResults(), updatedRuntime)))
         return mlir::failure();
       if (mlir::failed(RuntimeBundleLowerer::storeSequencePayloadElementAt(
               op, updatedRuntime, length, *payload)))

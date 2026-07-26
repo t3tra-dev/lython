@@ -187,6 +187,14 @@ private:
                                        unsigned fieldIndex);
   mlir::LogicalResult writeBackFieldAlias(mlir::Operation *op,
                                           const RuntimeBundle &updatedField);
+  mlir::LogicalResult rebindMutatedContainer(mlir::Operation *op,
+                                             const RuntimeBundle &receiver,
+                                             mlir::ValueRange values,
+                                             RuntimeBundle &rebound);
+  mlir::LogicalResult
+  promoteInteriorViewForTransfer(mlir::Operation *op,
+                                 const RuntimeBundle &receiver,
+                                 llvm::StringRef slotName);
   std::optional<unsigned> findUnionMemberIndex(py::UnionType unionType,
                                                mlir::Type member) const;
   mlir::FailureOr<unsigned>

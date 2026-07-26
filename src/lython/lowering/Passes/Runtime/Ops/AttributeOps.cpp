@@ -50,42 +50,6 @@ bool isBoolFieldType(mlir::Type fieldType) {
   return runtimeContractName(fieldType) == "builtins.bool";
 }
 
-// Does this field read feed an IN-PLACE MUTATION of the value it loaded?
-//
-// A read should take its own reference -- CPython's does, and without one
-// `old = o.f; o.f = fresh` leaves `old` naming storage the rebind released. But
-// a mutation primitive spells in-place mutation as "consume the container and
-// hand back another one" (`transfer_args = [0]`), so a reader that also holds a
-// token has two claims on one reference and the release of the pre-mutation
-// lanes is rejected -- and inside a loop the lane advance cannot bridge them,
-// because the re-root is not ordered against the loop-carried uses. Until 4b
-// rewrites those primitives to non-transfer contracts, a read that is about to
-// be mutated stays pinned to the slot instead, which is what it was before.
-//
-// Syntactic on purpose: it asks what the read is FOR, at the one point where
-// both the load and its uses are visible, rather than guessing from the
-// contract (`list`/`dict`/`set` also get read purely to be observed).
-bool fieldReadFeedsInPlaceMutation(mlir::Value read) {
-  for (mlir::Operation *user : read.getUsers()) {
-    if (auto setItem = mlir::dyn_cast<py::SetItemOp>(user))
-      if (setItem.getContainer() == read)
-        return true;
-    if (auto delItem = mlir::dyn_cast<py::DelItemOp>(user))
-      if (delItem.getContainer() == read)
-        return true;
-    // A method call reaches its receiver through an attr.get, and whether the
-    // method mutates is not known here: treat any method lookup on the loaded
-    // value as a possible mutation. A nested FIELD read (`t.m.i`) is not one.
-    if (auto attrGet = mlir::dyn_cast<py::AttrGetOp>(user)) {
-      auto kind = attrGet->getAttrOfType<mlir::StringAttr>("ly.attr.kind");
-      if (attrGet.getObject() == read &&
-          !(kind && kind.getValue() == "field"))
-        return true;
-    }
-  }
-  return false;
-}
-
 std::optional<mlir::Attribute> classStaticValue(py::ClassOp classOp,
                                                 llvm::StringRef name) {
   auto names =
@@ -468,8 +432,68 @@ RuntimeBundleLowerer::writeBackFieldAlias(mlir::Operation *op,
        llvm::enumerate(updatedField.physicalValues()))
     ownerBundle.objectValue.values[*offset + index] = replacement;
 
+  // The owner's OWN lanes just changed, so if the owner is itself an interior
+  // view of something (`a.b.c`, where `b` is a lane-stored field), the storage
+  // above it still names the pre-mutation lanes. Recurse before publishing, so
+  // the chain is repaired root-first regardless of depth. Only the lane branch
+  // needs this: a box-fronted field's box POINTER is what its owner's slot
+  // holds, and that pointer never moves.
+  RuntimeBundle ownerView = ownerBundle;
   valueBundles[updatedField.fieldAliasOwner] = std::move(ownerBundle);
+  if (ownerView.fieldAliasOwner && !ownerView.fieldAliasName.empty() &&
+      ownerView.fieldAliasOwner != updatedField.fieldAliasOwner)
+    return RuntimeBundleLowerer::writeBackFieldAlias(op, ownerView);
   return mlir::success();
+}
+
+// Binds the re-description a "consume the container and hand back another one"
+// mutation primitive returns. The entity's identity did not change, so the
+// interior storage that names it has to be told the new descriptor before
+// anything else derives one from it -- that is `Interior`'s obligation in the
+// lane era, where the payload still travels as SSA values alongside the handle.
+//
+// One function on purpose. The obligation used to be spelled out at each
+// mutation site, and of the five sites that hand back a re-description, three
+// did not discharge it (runtime dict setitem, runtime list append, set add):
+// the local was rebound and the field slot kept naming storage the primitive
+// had already reallocated. `writeBackFieldAlias` reached exactly one
+// combination -- an evidence-backed list one level below a field -- and every
+// other (container kind x depth x acquisition path) silently went without.
+// You cannot transfer a borrow. A mutation primitive declared
+// `transfer_args = [0]` consumes a reference to its receiver; when the receiver
+// is an interior view (a field slot's container, read without a reference of its
+// own) the reference it consumes is the SLOT's, and the entity is freed while
+// the field still names it -- the one memory-safety defect left after 4a, and
+// the reason `dict read` was unfilled in both boundaries of the 12-cell grid.
+//
+// So manufacture one here, adjacent to the transfer. Deliberately an
+// aggregate-slot retain rather than an owned-local resource: a tracked resource
+// whose tuple the transfer then renames is exactly what the affine verifier
+// cannot follow across a loop back edge, and this reference has no lifetime of
+// its own -- it exists to be consumed by the very next call. The call's
+// `owned_results` group carries the obligation onward from there.
+mlir::LogicalResult RuntimeBundleLowerer::promoteInteriorViewForTransfer(
+    mlir::Operation *op, const RuntimeBundle &receiver,
+    llvm::StringRef slotName) {
+  if (receiver.kind != RuntimeBundle::Kind::Object ||
+      receiver.physicalValues().empty())
+    return mlir::success();
+  // An owned receiver already has a token the transfer can take, and doubling it
+  // would leak: the result group's single release cannot answer for two.
+  if (receiver.objectValue.ownership == ownership::OwnershipKind::Own)
+    return mlir::success();
+  return RuntimeBundleLowerer::retainAggregateSlot(op, receiver, slotName);
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::rebindMutatedContainer(
+    mlir::Operation *op, const RuntimeBundle &receiver, mlir::ValueRange values,
+    RuntimeBundle &rebound) {
+  if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+          op, receiver.objectValue.contract, values, rebound)))
+    return mlir::failure();
+  rebound.fieldAliasOwner = receiver.fieldAliasOwner;
+  rebound.fieldAliasName = receiver.fieldAliasName;
+  return RuntimeBundleLowerer::writeBackFieldAlias(op, rebound);
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
@@ -1043,11 +1067,26 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
     // This is the aggregate-slot contract, and the caller-owns-result return
     // convention then holds. The field alias rides along so an in-place
     // mutation's write-back still reaches the box.
-    // The transfer conflict is a property of the CONTAINER mutation primitives,
-    // so only a container read has to give up its reference.
+    //
+    // A MUTABLE CONTAINER read stays pinned to the slot, with no reference of
+    // its own. `Interior` says an interior view IS a borrow, and here the borrow
+    // is the only thing that can be right: a reallocating mutation primitive
+    // spells itself as "consume the container and hand back another one"
+    // (`transfer_args = [0]`), which RENAMES the lane tuple, and the affine
+    // verifier's resource identity IS that tuple. Give the reader a token and a
+    // loop makes its release name a tuple the transfer already consumed
+    // ("released through a value already consumed by an ownership transfer" --
+    // measured on collections.Counter.update, five goldens). The reference the
+    // transfer consumes is manufactured AT the transfer instead
+    // (promoteInteriorViewForTransfer), so it is never the slot's own.
+    //
+    // Decided by the CONTRACT, not by what the read is used for: the previous
+    // shape asked syntactically whether a mutation followed, which made a read's
+    // representation depend on its uses and had to enumerate the ops that count
+    // as mutation. The split disappears with the payload behind the handle --
+    // a mutation renames nothing then, so a container read is an ordinary read.
     if (!RuntimeBundleLowerer::isMutableContainerContractName(
-            runtimeShapeContractName(loadedContract)) ||
-        !fieldReadFeedsInPlaceMutation(op.getResult())) {
+            runtimeShapeContractName(loadedContract))) {
       if (!py::isAssignableTo(loadedContract, op.getResult().getType(), op))
         return op.emitError() << "attribute evidence " << loadedContract
                               << " is not assignable to result "
