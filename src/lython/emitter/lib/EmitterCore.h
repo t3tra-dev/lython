@@ -110,6 +110,11 @@ private:
   // default may be materialized in place of a dispatch.
   bool inheritsObjectDefaultDunder(mlir::Type type,
                                    llvm::StringRef methodName) const;
+  // Of object's eleven declared methods, the six whose default Lython actually
+  // provides for an inheriting class. The other five (__init__, __new__,
+  // __getattribute__, __setattr__, __delattr__) resolve through the same base
+  // and are refused at the call site.
+  static bool isImplementedObjectDefault(llvm::StringRef methodName);
   // `x.__str__()` on a class that overrides neither __str__ nor __repr__.
   // CPython's object.__str__ IS type(x).__repr__, so this resolves __repr__ —
   // the source one when there is one, otherwise the address form. Routing it

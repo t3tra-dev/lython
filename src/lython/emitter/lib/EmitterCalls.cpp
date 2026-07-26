@@ -426,6 +426,28 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
                     emitInheritedObjectStr(expr, receiver))
               return *stringified;
         }
+        // A source class inherits ALL of builtins.object's declared methods
+        // through its protocol-table base, but only the defaults above have
+        // something behind them. The rest are refused here, located and naming
+        // the class, rather than left to report "runtime manifest has no
+        // C.__setattr__ method" from the lowering — which is the same
+        // points-away-from-the-defect wording the contract audit was written
+        // about.
+        if (inheritsObjectDefaultDunder(receiver.type, *methodName) &&
+            !isImplementedObjectDefault(*methodName)) {
+          auto contract =
+              mlir::cast<py::ContractType>(types.widenLiteral(receiver.type));
+          diagnostics.push_back(parser::Diagnostic{
+              parser::Severity::Error, expr.range.start,
+              "'" +
+                  py::contracts::displayClassNameForContract(
+                      contract.getContractName()) +
+                  "' inherits builtins.object." + std::string(*methodName) +
+                  ", which Lython does not implement; the inherited object "
+                  "defaults are __eq__, __ne__, __hash__, __bool__, __repr__ "
+                  "and __str__"});
+          return emitNone(expr);
+        }
 
         CallOperands operands = emitCallOperands(expr);
         if (!operands.valid) {

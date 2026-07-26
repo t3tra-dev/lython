@@ -429,6 +429,12 @@ bool ModuleEmitter::isExceptionBackedClass(llvm::StringRef className) const {
   return false;
 }
 
+bool ModuleEmitter::isImplementedObjectDefault(llvm::StringRef methodName) {
+  return methodName == "__eq__" || methodName == "__ne__" ||
+         methodName == "__hash__" || methodName == "__bool__" ||
+         methodName == "__repr__" || methodName == "__str__";
+}
+
 bool ModuleEmitter::inheritsObjectDefaultDunder(
     mlir::Type type, llvm::StringRef methodName) const {
   auto contract =
