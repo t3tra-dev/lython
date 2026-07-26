@@ -480,19 +480,6 @@ RuntimeBundleLowerer::writeBackFieldAlias(mlir::Operation *op,
   return mlir::success();
 }
 
-// Binds the re-description a "consume the container and hand back another one"
-// mutation primitive returns. The entity's identity did not change, so the
-// interior storage that names it has to be told the new descriptor before
-// anything else derives one from it -- that is `Interior`'s obligation in the
-// lane era, where the payload still travels as SSA values alongside the handle.
-//
-// One function on purpose. The obligation used to be spelled out at each
-// mutation site, and of the five sites that hand back a re-description, three
-// did not discharge it (runtime dict setitem, runtime list append, set add):
-// the local was rebound and the field slot kept naming storage the primitive
-// had already reallocated. `writeBackFieldAlias` reached exactly one
-// combination -- an evidence-backed list one level below a field -- and every
-// other (container kind x depth x acquisition path) silently went without.
 // You cannot transfer a borrow. A mutation primitive declared
 // `transfer_args = [0]` consumes a reference to its receiver; when the receiver
 // is an interior view (a field slot's container, read without a reference of its
@@ -530,6 +517,19 @@ mlir::LogicalResult RuntimeBundleLowerer::promoteInteriorViewForTransfer(
   return RuntimeBundleLowerer::retainAggregateSlot(op, receiver, slotName);
 }
 
+// Binds the re-description a "consume the container and hand back another one"
+// mutation primitive returns. The entity's identity did not change, so the
+// interior storage that names it has to be told the new descriptor before
+// anything else derives one from it -- that is `Interior`'s obligation in the
+// lane era, where the payload still travels as SSA values alongside the handle.
+//
+// One function on purpose. The obligation used to be spelled out at each
+// mutation site, and of the five sites that hand back a re-description, three
+// did not discharge it (runtime dict setitem, runtime list append, set add):
+// the local was rebound and the field slot kept naming storage the primitive had
+// already reallocated. `writeBackFieldAlias` reached exactly one combination --
+// an evidence-backed list one level below a field -- and every other
+// (container kind x depth x acquisition path) silently went without.
 mlir::LogicalResult RuntimeBundleLowerer::rebindMutatedContainer(
     mlir::Operation *op, const RuntimeBundle &receiver, mlir::ValueRange values,
     RuntimeBundle &rebound) {
