@@ -495,11 +495,13 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
                                !usesFinallyCompletion && handlers &&
                                !handlers->empty();
   llvm::SmallVector<std::string, 4> storagePromotedNames;
-  // Names left to the lanes on purpose: pre-existing bindings a handler / else
-  // / finally body rebinds whose type a lane CAN carry. Checked again once the
-  // lanes are known, because a lane is also dropped for reasons only the
-  // emitted region shape shows, and then nothing carries the rebind at all.
-  llvm::StringSet<> laneRequiredNames;
+  // Names left to the lanes on purpose: pre-existing bindings a handler rebinds
+  // whose type a lane CAN carry, mapped to the value they held before the
+  // statement. Checked again once the lanes are known, because a lane is also
+  // dropped for reasons only the emitted region shape shows, and then nothing
+  // carries the rebind at all. The pre-try value is what tells a dropped lane
+  // apart from a handler that never changed the binding.
+  llvm::StringMap<mlir::Value> laneRequiredNames;
   if (hasFinally || (handlers && !handlers->empty())) {
     llvm::StringSet<> reboundInBody;
     collectRebindNames(ast::nodeList(statement, "body"), reboundInBody);
@@ -518,7 +520,7 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
         if (bound == values.end() || !bound->second.value)
           continue;
         if (postTryLaneCarrierType(bound->second.type)) {
-          laneRequiredNames.insert(name);
+          laneRequiredNames[name] = bound->second.value;
           continue;
         }
       }
@@ -1100,18 +1102,21 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
             loopControlContexts.pop_back();
           if (exceptReturnBlock)
             inlineReturnContexts.pop_back();
-          if (postTryEligible) {
-            mlir::Block *exit = builder.getInsertionBlock();
-            if (exit && !blockHasTerminator(*exit)) {
-              HandlerExit record;
-              record.block = exit;
-              for (const std::string &name : postCandidateNames) {
-                auto found = values.find(name);
-                if (found != values.end() && found->second.value)
-                  record.bindings[name] = found->second;
-              }
-              postHandlerExits.push_back(std::move(record));
+          // Recorded whether or not the lanes are still eligible: an empty
+          // record set is also the fact "no handler falls through", which the
+          // no-channel diagnostic below needs in order not to speak about a
+          // continuation nothing reaches (a handler ending in `raise` observes
+          // its own rebind nowhere).
+          mlir::Block *exit = builder.getInsertionBlock();
+          if (exit && !blockHasTerminator(*exit)) {
+            HandlerExit record;
+            record.block = exit;
+            for (const std::string &name : postCandidateNames) {
+              auto found = values.find(name);
+              if (found != values.end() && found->second.value)
+                record.bindings[name] = found->second;
             }
+            postHandlerExits.push_back(std::move(record));
           }
         }
       }
@@ -1237,12 +1242,28 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
   llvm::SmallVector<llvm::StringRef, 4> laneRequiredOrder;
   for (const auto &entry : laneRequiredNames)
     laneRequiredOrder.push_back(entry.getKey());
-  llvm::sort(laneRequiredOrder); // set iteration is hash order; diagnostics
+  llvm::sort(laneRequiredOrder); // map iteration is hash order; diagnostics
                                  // must come out the same way every run
   for (llvm::StringRef name : laneRequiredOrder) {
     if (llvm::any_of(postCarriedLocals, [&](const PostCarriedLocal &local) {
           return local.name == name;
         }))
+      continue;
+    // Only a handler that FALLS THROUGH with a different value than the one the
+    // name arrived with can be answered wrongly afterwards. A handler that
+    // raises or returns instead observes its own rebind nowhere, and so does one
+    // that left the binding alone -- diagnosing either would reject a program
+    // that has no way to notice.
+    mlir::Value beforeTry = laneRequiredNames.lookup(name);
+    bool reachesContinuation = false;
+    for (const HandlerExit &exit : postHandlerExits) {
+      auto found = exit.bindings.find(name);
+      if (found != exit.bindings.end() && found->second.value != beforeTry) {
+        reachesContinuation = true;
+        break;
+      }
+    }
+    if (!reachesContinuation)
       continue;
     diagnostics.push_back(parser::Diagnostic{
         parser::Severity::Error, statement.range.start,
