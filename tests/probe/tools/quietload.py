@@ -35,6 +35,40 @@ process. Two reasons:
 
 Both were hit for real on 2026-07-27, by two different tracks, within an hour.
 
+AND NEITHER SIGNAL DECIDES ALONE -- the completion of the rule above. Once the
+process-absence rule is known, the obvious repair is "gate on the artefact
+instead". That is the right gate and it is still not sufficient, because absence
+of the artefact is as ambiguous as absence of the process. Both have to be read
+together:
+
+    artefact present                     => done
+    artefact absent  AND process present => still going
+    artefact absent  AND process absent  => it died
+
+Reading either column alone gives a wrong answer half the time. "ninja is gone,
+so the build finished" and "bin/ is empty, so the build died" are the same
+mistake facing opposite directions, and on 2026-07-28 the second one nearly cost
+a build directory: the coordinator read an empty `build/bin/` as a reaped build
+and asked for a rebuild, while `ninja` was in fact alive and 12 minutes into one
+long TU. Two `ninja` in one build tree do not lock against each other, so acting
+on it would have raced the live run over the same object and link outputs -- a
+real corruption caused by the diagnosis rather than by the fault. The track
+declined on evidence the coordinator could not see, which is what saved it.
+
+Two corollaries worth as much as the rule:
+
+  - EXPECT THE ARTEFACT AT THE PATH THE BUILD ACTUALLY WRITES. Gating on
+    `build/bin/lython_unit_tests` reports "died" forever: that binary links to
+    `build/tests/`. A gate with the wrong path fails closed, which is the safe
+    direction, but it is indistinguishable from the failure it is watching for.
+  - TRUNCATE NOTHING WHEN CHECKING FOR ABSENCE. The coordinator's process check
+    ended in `| head -6`, a sibling track's sweep filled those six lines, and the
+    `ninja` line was cut off by the truncation -- absence read from a list the
+    reader had truncated. `| tail -N` is already recorded as an instrument defect
+    in rfc/test-suite-debt.md; `head` is the same defect facing the other way.
+    Count first, then look: if a plain `grep -c` and a filtered pipeline disagree,
+    the pipeline is wrong, not the data.
+
 WHAT CONTENTION CAN AND CANNOT DO, so a contended run is not discarded reflexively.
 For a pass/fail instrument, load can invent a failure (a timeout, a starved run)
 but cannot invent a pass: a use-after-free does not stop being one because the
