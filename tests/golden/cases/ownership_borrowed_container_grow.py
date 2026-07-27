@@ -16,8 +16,19 @@
 # 正常終了に置き換わる)」と予告していたのは、まさにこの移動である。
 #
 # 判別子: run_case.py は `--release` を渡さない (verifier は有効)。
-# 対照は同一実行内にある — `tests/probe/known_borrowed_set_add` は
-# 同じ診断で LOUD のまま (set はまだ transfer する)。
+#
+# ⚠️ **ここに書かれていた対照は失効した。** 「`known_borrowed_set_add` は
+# 同じ診断で LOUD のまま (set はまだ transfer する)」— `builtins.set` /
+# `builtins.frozenset` の 1 レーン化でその probe は OK に反転し、
+# `builtins.mlir` の `transfer_args` は 147 → 141 になった (差の 6 が
+# `LySet_AddBox` / `UpdateM` / `IntersectionUpdate` / `DifferenceUpdate` /
+# `SymmetricDifferenceUpdate` / `LyFrozenSet_Init`)。**同一実行内の対照は
+# もう存在しない**: 残る `transfer_args` は例外族の `__init__` receiver と
+# str/bytes の box packer 2 件だけで、借用コンテナの変更はどちらにも到達
+# しない。対照を捏造せずに失効を記録するのが正しい (規則 3: 集合で述べる)。
+# 残る判別子: verifier が有効であること、機構が IR で読めること
+# (`LyList_EnsureCapacity` が void で handle 越しに publish する)、そして
+# libgmalloc + MallocScribble でこのケースを走らせて何も残らないこと。
 def grow(xs: list[int]) -> None:
     xs.append(99)
 
