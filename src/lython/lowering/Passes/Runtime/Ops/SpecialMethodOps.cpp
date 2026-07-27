@@ -1233,21 +1233,30 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIter(py::IterOp op) {
                                !iterable->evidenceIteratorCell &&
                                RuntimeBundleLowerer::
                                    containerHasRuntimePayload(*iterable);
-    // Dict key iteration: the key boxes live in the keys array at the same
-    // physical positions the list uses for its items (meta at [1], boxes at
-    // [2]), so the runtime-list next path applies verbatim. Evidence-backed
-    // dicts qualify too — their payload arrays are materialized alongside
-    // the evidence (initializeDictPayload / the evidence mutators keep them
-    // in sync), and iterating the live payload keeps the mutation guard and
-    // insertion order identical to the runtime tier.
+    // Dict key iteration: the key boxes sit at the same offsets in the handle
+    // that the list uses for its items (meta at words 2/3, the primary array's
+    // base at word 4 — see ContainerLayout.h), so the runtime-list next path
+    // applies verbatim. Evidence-backed dicts qualify too — their payload
+    // arrays are materialized alongside the evidence (initializeDictPayload /
+    // the evidence mutators keep them in sync), and iterating the live payload
+    // keeps the mutation guard and insertion order identical to the runtime
+    // tier.
+    //
+    // Why the four comments here name word offsets and not `[1]`/`[2]`: those
+    // were lane indices into physicalValues(), and all five containers are now
+    // one lane, so physicalValues() has size 1 and the indices named nothing.
+    // The claims themselves were never wrong -- all five share words 0..7 of
+    // one layout -- and the code kept working because containerInteriorView and
+    // containerHasRuntimePayload are the single place that knows which
+    // representation is live.
     bool runtimeDictIterable = iterable->contractName() == "builtins.dict" &&
                                iterable->sequenceElements.empty() &&
                                !iterable->evidenceIteratorCell &&
                                RuntimeBundleLowerer::
                                    containerHasRuntimePayload(*iterable);
     // Runtime sets (and frozensets — identical layout) share the list's
-    // physical layout exactly (meta at [1], boxed slots at [2]), so the
-    // runtime-list next path applies verbatim.
+    // physical layout exactly (meta at words 2/3, boxed slots reached through
+    // word 4), so the runtime-list next path applies verbatim.
     bool runtimeSetIterable = (iterable->contractName() == "builtins.set" ||
                                iterable->contractName() ==
                                    "builtins.frozenset") &&
@@ -1256,8 +1265,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIter(py::IterOp op) {
                               RuntimeBundleLowerer::
                                   containerHasRuntimePayload(*iterable);
     // Runtime tuples (eg.exceptions, str.partition results, tuple(xs))
-    // share the list's physical layout exactly (meta at [1], boxed slots at
-    // [2]); immutable, so no mutation guard.
+    // share the list's physical layout exactly (meta at words 2/3, boxed slots
+    // reached through word 4); immutable, so no mutation guard.
     bool runtimeTupleIterable = iterable->contractName() == "builtins.tuple" &&
                                 iterable->sequenceElements.empty() &&
                                 !iterable->evidenceIteratorCell &&
