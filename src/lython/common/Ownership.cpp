@@ -927,6 +927,35 @@ collectOwnedLocalObjectGroups(mlir::Operation *op,
   return groups;
 }
 
+llvm::StringRef ownedResultContractName(mlir::func::FuncOp function,
+                                        const FunctionContract &contract,
+                                        unsigned contractIndex) {
+  if (!function)
+    return {};
+  if (contractIndex < contract.ownedResultContracts.size()) {
+    llvm::StringRef declared = contract.ownedResultContracts[contractIndex];
+    if (!declared.empty())
+      return declared;
+  }
+  // Type-only matching cannot tell physical twins apart (str and bytes share the
+  // (header, byte payload) shape), so a declared result contract names the
+  // entity before the structural fallback runs.
+  //
+  // Why NOT also consult `ly.runtime.element_contract` / `next_contract` here:
+  // those name a DIFFERENT result of the same call (the yielded element and the
+  // advanced iterator), so feeding either one to an arbitrary `contractIndex`
+  // would answer a question about result 0 with the name of result 4. Only 3
+  // declarations name their owned results solely through that pair
+  // (`LyRangeIterator_Next`, `LyUnicodeStrIterator_Next`, `LyCounter_Next`), and
+  // supplying `owned_result_contracts` for the first of them was MEASURED not to
+  // change its behaviour -- so the missing channel is not what those three need,
+  // and guessing an offset mapping here would be an unmeasured change.
+  if (auto resultContract = function->getAttrOfType<mlir::StringAttr>(
+          contracts::kManifestResultContractAttr))
+    return resultContract.getValue();
+  return {};
+}
+
 static bool resourceGroupStartsAt(llvm::ArrayRef<ResourceGroup> groups,
                                   unsigned offset) {
   return llvm::any_of(groups, [&](const ResourceGroup &group) {
@@ -992,11 +1021,12 @@ static llvm::SmallSet<unsigned, 4> staticEvidenceCoveredLogicalOffsets(
   llvm::SmallSet<unsigned, 4> covered;
   for (auto [contractIndex, offset] :
        llvm::enumerate(contract.ownedResults.values)) {
-    if (contractIndex >= contract.ownedResultContracts.size())
+    llvm::StringRef contractName = ownedResultContractName(
+        callee, contract, static_cast<unsigned>(contractIndex));
+    if (contractName.empty())
       continue;
     std::optional<unsigned> logicalOffset =
-        logicalPayloadOffsetCoveredByStaticEvidence(
-            callee, contract.ownedResultContracts[contractIndex]);
+        logicalPayloadOffsetCoveredByStaticEvidence(callee, contractName);
     if (logicalOffset && offset > *logicalOffset)
       covered.insert(*logicalOffset);
   }
@@ -1070,16 +1100,8 @@ collectOwnedCallResultGroups(mlir::ModuleOp module, mlir::func::CallOp call,
          llvm::enumerate(functionContract->ownedResults.values)) {
       if (resourceGroupStartsAt(ownedGroups, offset))
         continue;
-      llvm::StringRef contractName;
-      if (contractIndex < functionContract->ownedResultContracts.size())
-        contractName = functionContract->ownedResultContracts[contractIndex];
-      // Type-only matching cannot tell physical twins apart (str and bytes
-      // share the (header, byte payload) shape), so a declared result
-      // contract names the entity before the structural fallback runs.
-      if (contractName.empty())
-        if (auto resultContract = callee->getAttrOfType<mlir::StringAttr>(
-                contracts::kManifestResultContractAttr))
-          contractName = resultContract.getValue();
+      llvm::StringRef contractName = ownedResultContractName(
+          callee, *functionContract, static_cast<unsigned>(contractIndex));
       const RuntimeDeallocator *deallocator =
           contractName.empty()
               ? findDeallocatorForValueGroup(call.getResults(), offset,
@@ -1308,11 +1330,12 @@ static void unionStaticEvidenceCallResultAliases(AliasAnalysis &aliases,
 
   for (auto [contractIndex, staticOffset] :
        llvm::enumerate(contract->ownedResults.values)) {
-    if (contractIndex >= contract->ownedResultContracts.size())
+    llvm::StringRef contractName = ownedResultContractName(
+        callee, *contract, static_cast<unsigned>(contractIndex));
+    if (contractName.empty())
       continue;
     std::optional<unsigned> logicalOffset =
-        logicalPayloadOffsetCoveredByStaticEvidence(
-            callee, contract->ownedResultContracts[contractIndex]);
+        logicalPayloadOffsetCoveredByStaticEvidence(callee, contractName);
     if (!logicalOffset || staticOffset <= *logicalOffset ||
         staticOffset >= call.getNumResults())
       continue;

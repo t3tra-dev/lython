@@ -98,6 +98,70 @@ bool ownershipRetainOmissionTraceEnabled() {
   return enabled;
 }
 
+// LYTHON_ABLATE_OWNERSHIP_SYMBOL_TABLE=1 restores the callee resolution this
+// file used before the symbol table below was threaded through it: each
+// `collectOwnedCallResultGroups` re-resolved `call.getCallee()` with
+// `ModuleOp::lookupSymbol`, which scans the module's symbol list.
+//
+// Why an ablation switch rather than nothing: this change removes WORK and must
+// not change a single instruction, and "the IR is identical" is only evidence
+// when both sides come from one binary -- a separate `before` build re-proves
+// the build, not the change. The two arms differ in which lookup answers, so if
+// the table's scope (immediate symbol children of the module) ever disagreed
+// with `lookupSymbol`'s, the differential would show it as an IR change instead
+// of hiding it as a silently different callee.
+//
+// Why setting it is safe to ship: it is strictly slower and otherwise identical,
+// so a mistake with this variable set costs compile time, never a wrong release.
+bool ownershipSymbolTableDisabled() {
+  static bool disabled = [] {
+    auto value =
+        llvm::sys::Process::GetEnv("LYTHON_ABLATE_OWNERSHIP_SYMBOL_TABLE");
+    return value && !value->empty() && *value != "0";
+  }();
+  return disabled;
+}
+
+// The SHAPE of the callee-resolution work, printed beside the phase's duration
+// under LYTHON_PERF: `symbols` is the factor the old code paid on every one of
+// `calls` resolutions, so the pair states the product that was being formed.
+// Both numbers vary with the input, which is what makes them a measurement of
+// the input rather than of the compiler.
+// Immediate symbol children of the module -- the list `ModuleOp::lookupSymbol`
+// scans. Counted, not estimated, because the whole claim about this phase is
+// that this number is a FACTOR, and a factor asserted from the source rather
+// than read off the input is how "#markers x #groups" was mis-attributed once
+// already.
+std::uint64_t moduleSymbolCount(mlir::ModuleOp module) {
+  std::uint64_t symbols = 0;
+  for (mlir::Operation &op : module.getBodyRegion().front())
+    if (mlir::isa<mlir::SymbolOpInterface>(&op))
+      ++symbols;
+  return symbols;
+}
+
+// Why the ablation state is printed and not just assumed: the hatch below changes
+// only how fast a callee is resolved, so its effect is invisible in the IR BY
+// DESIGN -- which makes "both arms produced identical IR" consistent with "the
+// ablation never fired" as well as with "the change is inert". An A/B whose arms
+// cannot be told apart is not an A/B. This line is what distinguishes them.
+void reportOwnershipWorkShape(llvm::StringRef scope, std::uint64_t symbols,
+                              std::uint64_t calls) {
+  static const bool on = [] {
+    auto value = llvm::sys::Process::GetEnv("LYTHON_PERF");
+    return value && (*value == "1" ||
+                     llvm::StringRef(*value).equals_insensitive("true") ||
+                     llvm::StringRef(*value).equals_insensitive("yes") ||
+                     llvm::StringRef(*value).equals_insensitive("on"));
+  }();
+  if (!on)
+    return;
+  llvm::errs() << "[LYTHON_PERF] " << scope << " module_symbols=" << symbols
+               << " callee_resolutions=" << calls
+               << " product=" << (symbols * calls) << " symbol_table="
+               << (ownershipSymbolTableDisabled() ? "ABLATED" : "on") << "\n";
+}
+
 void traceOmittedBorrowEdgeRetain(mlir::Value header, mlir::Operation *anchor) {
   if (!ownershipRetainOmissionTraceEnabled())
     return;
@@ -1500,12 +1564,45 @@ bool releaseOwnedGroupByLiveness(
 // case it can prove is honest; guessing the window is how a retain lands on the
 // wrong side of a decref.
 //
-// Why NOT decline the EDGE (sound = false) when this returns false: a candidate
-// accepted today on a wide non-argument header has its retain dropped at
-// emission and is balanced anyway, because nothing else releases the source.
-// Declining it removes the destination's release too, and that is a measured
-// regression, not a conservative choice. The residual is recorded in
-// rfc/memory-safety-proof.md rather than papered over.
+// Why NOT decline the EDGE (sound = false) when this returns false: declining it
+// removes the destination's release too, and that is a measured regression, not a
+// conservative choice.
+//
+// ⛔ MEASURED FALSE (2026-07-28), and it is the reason to read the rest of this
+// comment carefully rather than trust its conclusion. This paragraph used to also
+// say that a candidate accepted on a wide non-argument header "is balanced anyway,
+// because nothing else releases the source", and cited that as why the dropped
+// retain costs at most a bounded leak. Something else DOES release the source once
+// `builtins.list` became one lane:
+//
+//     def run(n: int) -> int:
+//         total = 0
+//         for i in range(n):
+//             xs: list[int] = [i]
+//             ys: list[int] = xs if i % 2 == 0 else [i, i]
+//             total += len(ys)
+//             total += len(xs)
+//         return total
+//
+// aborts with `Ly_DecRef observed non-positive refcount` (exit 134) while CPython
+// prints 6. `LYTHON_OWNERSHIP_TRACE_RETAIN_OMISSIONS=1` names the site:
+// `header type memref<9xi64>, op result` -- the merge argument reconciling the
+// two incoming list groups, declined here because the header is an op result
+// rather than a block argument.
+//
+// So the residual on this branch is NOT a bounded leak. It is a shipped
+// over-release: it survives `--release`, and the affine verifier cannot see it
+// because the dropped lend belongs to the reconciling argument, so each group's
+// own arithmetic still balances (rfc/memory-safety-proof.md, third failure shape).
+// The recorded residual was one class too weak.
+//
+// Why this is NOT repaired by dropping the `isa<BlockArgument>` test: that is the
+// unconditional narrowing measured below to break three cases. The test is a PROXY
+// for "the handle's first two words are the refcount/class prefix", which is a
+// per-contract LAYOUT fact owned by `Passes/Runtime/ABI/` (HandleWidthRegistry,
+// ContainerLayout) and not derivable here -- a one-lane `list` handle satisfies it
+// and a 16-word payload box does not, and both are wide non-arguments. The repair
+// is that layout predicate, not a wider guess at this site.
 //
 // Why NOT drop this predicate and narrow UNCONDITIONALLY through
 // own::spellHeaderPrefix, which is the obvious two-line reading of the emission
@@ -1593,16 +1690,19 @@ forwardedBlockArgGroup(mlir::Operation *terminator,
 mlir::LogicalResult insertOwnedBlockArgumentReleases(
     mlir::ModuleOp module, FuncContractCache &contracts,
     llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
-    own::AliasAnalysis &aliases,
+    own::AliasAnalysis &aliases, mlir::SymbolTable *symbols,
     llvm::SmallVectorImpl<own::ResourceGroup> *unwindGroups,
     bool insertReleases = true) {
+  std::uint64_t calleeResolutions = 0;
   llvm::DenseSet<mlir::Value> ownedValues;
   module.walk([&](mlir::func::CallOp call) {
     mlir::func::FuncOp fn = call->getParentOfType<mlir::func::FuncOp>();
     if (!fn || own::isRuntimeManifestFunction(fn))
       return;
+    ++calleeResolutions;
     for (const own::ResourceGroup &g :
-         own::collectOwnedCallResultGroups(module, call, deallocators)) {
+         own::collectOwnedCallResultGroups(module, call, deallocators,
+                                          symbols)) {
       if (!g.deallocator || g.condition)
         continue;
       for (mlir::Value v : g.values)
@@ -1733,8 +1833,10 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
     mlir::func::FuncOp fn = call->getParentOfType<mlir::func::FuncOp>();
     if (!fn || own::isRuntimeManifestFunction(fn))
       return;
+    ++calleeResolutions;
     for (const own::ResourceGroup &g :
-         own::collectOwnedCallResultGroups(module, call, deallocators)) {
+         own::collectOwnedCallResultGroups(module, call, deallocators,
+                                          symbols)) {
       if (!g.deallocator || g.condition)
         continue;
       mlir::Block *callBlock = call->getBlock();
@@ -2149,6 +2251,11 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
                                   destGroup, aliases, /*consumeIsDeath=*/true,
                                   deallocators);
   }
+  reportOwnershipWorkShape(insertReleases
+                               ? "refcount-insertion.block-argument-releases"
+                               : "post-cleanup-unwind-insertion"
+                                 ".block-argument-groups",
+                           moduleSymbolCount(module), calleeResolutions);
   return mlir::success();
 }
 
@@ -2156,13 +2263,14 @@ mlir::LogicalResult
 insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
                           FuncContractCache &contracts,
                           llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
-                          own::AliasAnalysis &aliases) {
+                          own::AliasAnalysis &aliases,
+                          mlir::SymbolTable *symbols) {
   if (call.getNumResults() == 0)
     return mlir::success();
 
   mlir::func::FuncOp enclosing = call->getParentOfType<mlir::func::FuncOp>();
   for (own::ResourceGroup group :
-       own::collectOwnedCallResultGroups(module, call, deallocators)) {
+       own::collectOwnedCallResultGroups(module, call, deallocators, symbols)) {
     if (!group.deallocator)
       continue;
 
@@ -3202,7 +3310,7 @@ std::int64_t nextUnusedExceptionHandlerId(mlir::ModuleOp module) {
 mlir::LogicalResult insertUnwindCleanupReleases(
     mlir::ModuleOp module, FuncContractCache &contracts,
     llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
-    own::AliasAnalysis &aliases,
+    own::AliasAnalysis &aliases, mlir::SymbolTable *symbols,
     llvm::ArrayRef<own::ResourceGroup> blockArgGroups) {
   std::int64_t nextHandlerId = nextUnusedExceptionHandlerId(module);
   auto anchorFn = module.lookupSymbol<mlir::func::FuncOp>("LyEH_TryCatchAnchor");
@@ -3446,8 +3554,8 @@ mlir::LogicalResult insertUnwindCleanupReleases(
         groups.push_back(std::move(tracked));
       };
       function.walk([&](mlir::func::CallOp call) {
-        for (const own::ResourceGroup &g :
-             own::collectOwnedCallResultGroups(module, call, deallocators))
+        for (const own::ResourceGroup &g : own::collectOwnedCallResultGroups(
+                 module, call, deallocators, symbols))
           addGroup(g);
       });
       function.walk([&](mlir::Operation *op) {
@@ -3871,6 +3979,14 @@ public:
       aliases.build(module);
     }
     FuncContractCache contracts(module);
+    // One table for the whole pass. Why not per call: the callee lookup is the
+    // factor both analyses below pay per call op, and `ModuleOp::lookupSymbol`
+    // answers it by scanning the module's symbol list -- which after phase 8
+    // includes every imported stdlib symbol.
+    std::optional<mlir::SymbolTable> symbols;
+    if (!ownershipSymbolTableDisabled())
+      symbols.emplace(module);
+    mlir::SymbolTable *symbolTable = symbols ? &*symbols : nullptr;
     // Re-derive the owned block-argument merge groups analysis-only (their
     // normal-path releases and borrow-edge retains were placed by the main
     // pass): the held-token analysis needs them to cover calls the cleanup
@@ -3880,8 +3996,8 @@ public:
       py::PerfScope perf(
           "post-cleanup-unwind-insertion.block-argument-groups");
       if (mlir::failed(insertOwnedBlockArgumentReleases(
-              module, contracts, deallocators, aliases, &blockArgGroups,
-              /*insertReleases=*/false))) {
+              module, contracts, deallocators, aliases, symbolTable,
+              &blockArgGroups, /*insertReleases=*/false))) {
         signalPassFailure();
         return;
       }
@@ -3891,6 +4007,7 @@ public:
           "post-cleanup-unwind-insertion.unwind-cleanup-releases");
       if (mlir::failed(insertUnwindCleanupReleases(module, contracts,
                                                    deallocators, aliases,
+                                                   symbolTable,
                                                    blockArgGroups)))
         signalPassFailure();
     }
@@ -3957,6 +4074,17 @@ public:
       aliases.build(module);
     }
     FuncContractCache contracts(module);
+    // Same lifetime and the same staleness contract as `contracts` above, which
+    // is why it is built here rather than inside each helper: both are
+    // name->FuncOp maps snapshotted before the pass mutates, and the pass only
+    // ever resolves callees that already existed (the `__ly_unwind_cleanup_*`
+    // functions it creates are called only from the function being processed
+    // when they are created, never re-resolved). Making the table shorter-lived
+    // would not make that assumption weaker, it would only pay the scan again.
+    std::optional<mlir::SymbolTable> symbols;
+    if (!ownershipSymbolTableDisabled())
+      symbols.emplace(module);
+    mlir::SymbolTable *symbolTable = symbols ? &*symbols : nullptr;
 
     mlir::func::FuncOp retain = findRetainFunction(module);
     {
@@ -3983,7 +4111,8 @@ public:
       py::PerfScope perf("refcount-insertion.owned-result-releases");
       for (mlir::func::CallOp call : calls) {
         if (mlir::failed(insertOwnedResultReleases(module, call, contracts,
-                                                   deallocators, aliases))) {
+                                                   deallocators, aliases,
+                                                   symbolTable))) {
           signalPassFailure();
           return;
         }
@@ -4013,7 +4142,8 @@ public:
     {
       py::PerfScope perf("refcount-insertion.block-argument-releases");
       if (mlir::failed(insertOwnedBlockArgumentReleases(
-              module, contracts, deallocators, aliases, &blockArgGroups))) {
+              module, contracts, deallocators, aliases, symbolTable,
+              &blockArgGroups))) {
         signalPassFailure();
         return;
       }
@@ -4024,7 +4154,8 @@ public:
       // held-token analysis must see.
       py::PerfScope perf("refcount-insertion.unwind-cleanup-releases");
       if (mlir::failed(insertUnwindCleanupReleases(
-              module, contracts, deallocators, aliases, blockArgGroups)))
+              module, contracts, deallocators, aliases, symbolTable,
+              blockArgGroups)))
         signalPassFailure();
     }
   }
