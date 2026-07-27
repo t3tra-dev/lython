@@ -39,9 +39,16 @@
 //     different answers depending on who asks. The insertion path has both
 //     (`common/Ownership.cpp:1073-1082`, with the reason in a comment). These
 //     three sites have only the first:
-//         verifier/runtime/AffineOwnership.cpp:61   (returnCarriesGroupInsideOwnedAggregate)
-//         common/Ownership.cpp:995                  (callableOwnedReturnRanges helper)
-//         common/Ownership.cpp:1311                 (staticEvidenceCoveredLogicalOffsets)
+//         verifier/runtime/AffineOwnership.cpp:148  (returnCarriesGroupInsideOwnedAggregate)
+//         common/Ownership.cpp:995                  (staticEvidenceCoveredLogicalOffsets)
+//         common/Ownership.cpp:1311                 (unionStaticEvidenceCallResultAliases)
+//     Two of these three labels were wrong until 2026-07-28 -- :995 was named
+//     after callableOwnedReturnRanges and :1311 after the function that is
+//     actually at :995, and the verifier site was cited at :61, which is
+//     ownershipStaleTraceEnabled. Verified against the code: the reads are at
+//     :995/:999, :1311/:1315 and AffineOwnership.cpp:149-150. A comment naming a
+//     line number decays the moment anything above it moves, which is why the
+//     function name is the part to trust and the line the part to re-check.
 //     Scope correction worth keeping: this is NOT "the verifier gets a name for
 //     22 of 680". The verifier's main resource discovery goes through the shared
 //     `collectOwnedCallResultGroups`, which HAS the fallback; it is these three
