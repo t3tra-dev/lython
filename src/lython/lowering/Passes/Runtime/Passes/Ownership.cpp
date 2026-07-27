@@ -2620,6 +2620,40 @@ bool groupUsedOnHandlerPath(UnwindCleanupAnalysis &analysis,
   return false;
 }
 
+// Is this block one THIS pass generated on an earlier run -- a cleanup handler
+// whose body is `catch marker; outlined releaser; branch-or-rethrow`?
+//
+// The pass runs twice (`PostCleanupUnwindInsertionPass` re-runs it after
+// canonicalization hoists calls out of folded region ops), and the second run
+// re-scans the function from scratch. A cleanup handler that continues the
+// unwind out of the frame ends in `LyEH_RethrowCurrent` with no call-site
+// marker in front of it, which is byte-identical to what an unguarded raise
+// looks like -- so the re-run classified its own handler as a new exceptional
+// exit point and inserted an inline release there.
+//
+// Why that is a double release rather than a missing one: when the re-run finds
+// a token newly held at a call site whose marker already has a handler, it
+// CHAINS -- a fresh cleanup block releases the new token and branches to the
+// existing handler. The inline release then runs on the same unwind, after the
+// chained block already released it. `groupTokenAtPoint` cannot see this: the
+// chained release is in one predecessor of the shared handler, so it dominates
+// nothing, and the token reads as Held.
+//
+// Why NOT fix it by ordering the two shapes (skip a raise cleanup for a group
+// some predecessor releases): a cleanup handler is SHARED by every call site
+// that unwinds into it, so "the token is held here" is not a property of the
+// block at all -- it is a property of each incoming unwind, which is exactly
+// what the marker/chain shape expresses and an inline release cannot. The
+// residual is on the incomplete side: a token held at a cleanup handler's
+// rethrow and covered by no chain leaks rather than being freed twice.
+bool isGeneratedUnwindCleanupBlock(mlir::Block *block) {
+  for (mlir::Operation &op : *block)
+    if (auto call = mlir::dyn_cast<mlir::func::CallOp>(&op))
+      if (call.getCallee().starts_with("__ly_unwind_cleanup_"))
+        return true;
+  return false;
+}
+
 // One outlined releaser per cleanup requirement. The DecRefs could sit
 // directly in the cleanup block, but structurally identical cleanup blocks
 // would then be merged by aggressive region simplification (in canonicalizer
@@ -2750,6 +2784,7 @@ mlir::LogicalResult insertUnwindCleanupReleases(
     // before the call would free values the normal path still uses.
     llvm::SmallVector<mlir::func::CallOp, 8> unguardedMayRaiseCalls;
     for (mlir::Block &block : *region) {
+      bool cleanupBlock = isGeneratedUnwindCleanupBlock(&block);
       for (mlir::Operation &op : block) {
         auto call = mlir::dyn_cast<mlir::func::CallOp>(&op);
         if (!call)
@@ -2765,7 +2800,7 @@ mlir::LogicalResult insertUnwindCleanupReleases(
         }
         auto callee = module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
         if (own::isRaiseLikeFunction(callee)) {
-          if (!own::precedingTryCallSiteMarker(call))
+          if (!own::precedingTryCallSiteMarker(call) && !cleanupBlock)
             unguardedRaises.push_back(call);
           continue;
         }
@@ -3253,9 +3288,16 @@ mlir::LogicalResult insertUnwindCleanupReleases(
 // fast/slow scf.if is the typical shape) and thereby HOIST calls to the
 // function's top level that were nested -- and outside the unwind-cleanup
 // model -- when the main insertion ran. Re-running only the unwind step
-// wires those newly top-level unguarded may-raise calls; call sites already
-// guarded keep their cleanup (the analysis sees the releaser as the
-// handler-side consume and inserts nothing twice).
+// wires those newly top-level unguarded may-raise calls.
+//
+// A call site already guarded does NOT simply keep its cleanup, which this
+// comment used to claim. The re-run recomputes the held-token set at every
+// marker, and a group the first run could not see (an owner group at a loop
+// header, before `5595d16` made the destination groups exist) is newly Held
+// there -- so the re-run CHAINS a fresh cleanup block in front of the existing
+// handler. That is intended. What is not is treating the existing handler's own
+// `LyEH_RethrowCurrent` as a new exceptional exit point: see
+// `isGeneratedUnwindCleanupBlock`.
 class PostCleanupUnwindInsertionPass
     : public mlir::PassWrapper<PostCleanupUnwindInsertionPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
