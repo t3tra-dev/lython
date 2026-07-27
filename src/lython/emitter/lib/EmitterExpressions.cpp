@@ -86,7 +86,14 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
     if (primitiveConstant != primitiveConstants.end())
       return emitPrimitiveConstant(*expr, primitiveConstant->second);
     std::optional<mlir::Type> symbolType = types.lookupSymbol(name);
-    if (auto cls = types.lookupClass(name)) {
+    // A top-level `def int` outranks the builtin class object of that
+    // spelling, exactly as it outranks the constructor path in emitCall.
+    // Without this the reference materializes a py.type_object and the call
+    // fails in lowering as "calling a type object held in a value", which is
+    // loud but describes the compiler's confusion rather than the program.
+    if (auto cls = moduleFunctionNames.count(name)
+                       ? std::optional<mlir::Type>()
+                       : types.lookupClass(name)) {
       // A monomorphized generic has no single class object to materialize:
       // there is one contract per instantiation. Reject here rather than let
       // the factless generic contract flow on and fail as an erased object.
@@ -1899,6 +1906,13 @@ Value ModuleEmitter::emitBindingRef(const parser::Node &anchor,
             "' has no resolved type; refusing to erase to object"});
     return emitNone(anchor);
   }
+  // The binding string is a NAME, and the runtime lowering resolves it against
+  // the manifest before it looks for a user func.func of the same name. A
+  // top-level `def len` is emitted under a renamed symbol precisely so the two
+  // stay distinguishable, so every reference to it must name that symbol.
+  auto shadowed = shadowedBuiltinSymbols.find(binding);
+  if (shadowed != shadowedBuiltinSymbols.end())
+    binding = shadowed->second;
   mlir::Type resultType = type;
   llvm::SmallVector<mlir::Value, 4> captureValues;
   for (Value capture : captures)

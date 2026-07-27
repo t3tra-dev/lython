@@ -1,5 +1,6 @@
 #include "EmitterCore.h"
 #include "EmitterSupport.h"
+#include "PyProtocols.h"
 
 #include "AstAccess.h"
 
@@ -58,6 +59,10 @@ EmitResult ModuleEmitter::emit() {
   }
   builder.setInsertionPointToEnd(module.getBody());
 
+  // Before predeclaration: the top-level `def`/`class` spellings decide which
+  // builtin fast paths may fire and which symbols the declarations are emitted
+  // under, and predeclareTopLevel already binds imports and classes.
+  collectTopLevelBindings();
   predeclareSourceModules();
   predeclareTopLevel();
   // After class/import predeclaration (signatures may reference user classes
@@ -107,6 +112,48 @@ EmitResult ModuleEmitter::emit() {
   result.diagnostics = std::move(diagnostics);
   result.module = mlir::OwningOpRef<mlir::ModuleOp>(module);
   return result;
+}
+
+void ModuleEmitter::collectTopLevelBindings() {
+  const auto *body = ast::nodeList(moduleNode, "body");
+  if (!body)
+    return;
+  const py::protocols::Table &table = py::protocols::Table::get(context);
+  for (const parser::NodePtr &statement : *body) {
+    if (!statement)
+      continue;
+    bool isFunction = statement->kind == "FunctionDef" ||
+                      statement->kind == "AsyncFunctionDef";
+    if (!isFunction && statement->kind != "ClassDef")
+      continue;
+    auto name = ast::string(*statement, "name");
+    if (!name)
+      continue;
+    if (!isFunction) {
+      moduleClassNames.insert(*name);
+      continue;
+    }
+    moduleFunctionNames.insert(*name);
+    // The manifest is the authority on which spellings it owns as builtin
+    // bindings: asking it, rather than carrying a hand-written list, keeps the
+    // set from drifting when a builtin is added to or removed from
+    // runtime/modules/*.mlir.
+    if (table.freeFunctionContract((llvm::Twine("builtins.") + *name).str()))
+      shadowedBuiltinSymbols[*name] = (llvm::Twine(*name) + "$user").str();
+  }
+}
+
+bool ModuleEmitter::programBindsName(llvm::StringRef name) const {
+  return values.find(name) != values.end() || moduleFunctionNames.count(name) ||
+         moduleClassNames.count(name);
+}
+
+llvm::StringRef
+ModuleEmitter::topLevelFunctionSymbol(llvm::StringRef name) const {
+  auto found = shadowedBuiltinSymbols.find(name);
+  if (found == shadowedBuiltinSymbols.end())
+    return name;
+  return found->second;
 }
 
 mlir::Location ModuleEmitter::loc(const parser::Node &node) const {
