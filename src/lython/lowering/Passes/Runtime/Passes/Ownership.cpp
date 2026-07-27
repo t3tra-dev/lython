@@ -19,6 +19,7 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Process.h"
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -2620,6 +2621,67 @@ bool groupUsedOnHandlerPath(UnwindCleanupAnalysis &analysis,
   return false;
 }
 
+// Wall time of `insertUnwindCleanupReleases`' sub-steps for ONE function,
+// reported as a single line under LYTHON_PERF when this function costs more than
+// `kReportThresholdUs`.
+//
+// Why per function with a threshold rather than a PerfScope per step: PerfScope
+// prints one line per construction and does not accumulate, so five scopes
+// inside a per-function walk emit five lines for every function in the module --
+// thousands, of which a handful matter. A threshold keeps the output at the
+// functions that dominate while still being a measurement rather than a sample.
+class UnwindStepTimer {
+public:
+  enum Step { Analysis, Groups, Markers, Raises, Calls, Nested, Mutate, Count };
+
+  explicit UnwindStepTimer(mlir::func::FuncOp function)
+      : name(function.getName()), last(Clock::now()) {
+    static const bool on = [] {
+      auto value = llvm::sys::Process::GetEnv("LYTHON_PERF");
+      return value && (*value == "1" || llvm::StringRef(*value).equals_insensitive("true") ||
+                       llvm::StringRef(*value).equals_insensitive("yes") ||
+                       llvm::StringRef(*value).equals_insensitive("on"));
+    }();
+    enabled = on;
+  }
+
+  void mark(Step step) {
+    if (!enabled)
+      return;
+    auto now = Clock::now();
+    us[step] += std::chrono::duration_cast<std::chrono::microseconds>(now - last)
+                    .count();
+    last = now;
+  }
+
+  ~UnwindStepTimer() {
+    if (!enabled)
+      return;
+    std::uint64_t total = 0;
+    for (std::uint64_t value : us)
+      total += value;
+    if (total < kReportThresholdUs)
+      return;
+    static const char *kNames[Count] = {"analysis",    "groups", "markers",
+                                        "raises",      "calls",  "nested",
+                                        "mutate"};
+    llvm::errs() << "[LYTHON_PERF] unwind-cleanup-releases @" << name
+                 << " total_us=" << total;
+    for (unsigned step = 0; step < Count; ++step)
+      llvm::errs() << " " << kNames[step] << "_us=" << us[step];
+    llvm::errs() << "\n";
+  }
+
+private:
+  using Clock = std::chrono::steady_clock;
+  static constexpr std::uint64_t kReportThresholdUs = 50000;
+
+  std::string name;
+  bool enabled = false;
+  Clock::time_point last;
+  std::uint64_t us[Count] = {};
+};
+
 // Is this block one THIS pass generated on an earlier run -- a cleanup handler
 // whose body is `catch marker; outlined releaser; branch-or-rethrow`?
 //
@@ -2850,7 +2912,16 @@ mlir::LogicalResult insertUnwindCleanupReleases(
         nestedUnguardedMayRaiseCalls.empty())
       return;
 
+    // Per-function stopwatch for the five sub-steps below, printed as one line
+    // when this function alone costs more than a threshold. The phase-level
+    // scope says this step is ~90% of the phase; without this split the next
+    // question ("of what?") needs a profiler, and the answer is load-bearing:
+    // the marker loop is #markers x #groups CFG queries and is INTRINSIC to the
+    // design, while the group collection is a per-group walk that is not.
+    UnwindStepTimer steps(function);
+
     UnwindCleanupAnalysis analysis(function);
+    steps.mark(UnwindStepTimer::Analysis);
 
     // Owned groups whose token could be held at an exceptional exit.
     llvm::SmallVector<UnwindTrackedGroup, 16> groups;
@@ -2926,6 +2997,7 @@ mlir::LogicalResult insertUnwindCleanupReleases(
         continue;
       addGroup(g);
     }
+    steps.mark(UnwindStepTimer::Groups);
     if (groups.empty())
       return;
 
@@ -2989,6 +3061,8 @@ mlir::LogicalResult insertUnwindCleanupReleases(
         markerCleanups.push_back(std::move(cleanup));
     }
 
+    steps.mark(UnwindStepTimer::Markers);
+
     struct RaiseCleanup {
       mlir::func::CallOp raiseCall;
       llvm::SmallVector<const UnwindTrackedGroup *, 4> groups;
@@ -3012,6 +3086,8 @@ mlir::LogicalResult insertUnwindCleanupReleases(
       if (!cleanup.groups.empty())
         raiseCleanups.push_back(std::move(cleanup));
     }
+
+    steps.mark(UnwindStepTimer::Raises);
 
     // Unguarded may-raise calls in a frame without a local handler: the
     // unwind edge exits the function, so every token held ACROSS the call
@@ -3038,6 +3114,8 @@ mlir::LogicalResult insertUnwindCleanupReleases(
       if (!cleanup.groups.empty())
         callCleanups.push_back(std::move(cleanup));
     }
+
+    steps.mark(UnwindStepTimer::Calls);
 
     struct NestedMarkerCleanup {
       mlir::func::CallOp marker;
@@ -3094,6 +3172,8 @@ mlir::LogicalResult insertUnwindCleanupReleases(
       if (!cleanup.groups.empty())
         nestedCallCleanups.push_back(std::move(cleanup));
     }
+
+    steps.mark(UnwindStepTimer::Nested);
 
     for (RaiseCleanup &cleanup : raiseCleanups) {
       mlir::OpBuilder builder(cleanup.raiseCall);
@@ -3279,6 +3359,7 @@ mlir::LogicalResult insertUnwindCleanupReleases(
                                  mlir::ValueRange{newId});
       wireAnchorBeforeAncestor(cleanup.ancestor, shared, loc);
     }
+    steps.mark(UnwindStepTimer::Mutate);
   });
   return result;
 }
