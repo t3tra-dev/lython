@@ -144,6 +144,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.ResolvesEmbeddedStdlibImports"
     "DriverTest.CompilesUnevenMatmulForEveryTensorTarget"
     "DriverTest.CompilesF64MatmulWithAndWithoutSMEF64"
+    "DriverTest.IntReprStringIsReleasedByStrDeallocator"
     "DriverTest.RepeatedCompileIsStable")
 
 set(LYTHON_UNIT_LABELS_parse  "parse;unit;fast")
