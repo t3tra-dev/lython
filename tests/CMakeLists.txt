@@ -332,8 +332,37 @@ endif()
 # --- examples/ smoke tests (exit code only) ----------------------------------
 # examples/ stays a user-facing sample directory: no expectation files are
 # added there, only the exit code is checked.
+#
+# 20 of the 29 samples are byte-identical to a golden case, and the golden
+# asserts strictly more about those same bytes -- it checks the exit code first
+# and the output afterwards, where the smoke test checks only the exit code. So
+# the smoke test cannot be red while its twin is green, and registering it buys
+# a second full compile-and-run of a program already compiled and run. Twins are
+# detected by content hash rather than by name, because
+# examples/literal_key_error.py is the twin of golden/errors/key_error.py.
+#
+# The samples themselves are not deleted: examples/ is documentation. What is
+# deleted is a duplicate assertion.
+#
+# The subsumption argument is about the *assertion*, and it holds only while the
+# twin compiles the identical bytes. golden.example_twins below is what keeps
+# that true: edit a sample and its coverage disappears with nothing going red
+# until that check fails and says what was lost.
 
 set(LYTHON_EXAMPLES_EXPECT_FAIL error literal_key_error)
+set(LYTHON_TWIN_CHECKER
+    "${CMAKE_CURRENT_SOURCE_DIR}/golden/check_example_twins.py")
+
+# Content hash -> golden case, over both golden directories.
+foreach(golden_path IN LISTS LYTHON_GOLDEN_CASES LYTHON_GOLDEN_ERRORS)
+    file(SHA256 "${golden_path}" golden_hash)
+    if(NOT DEFINED LYTHON_GOLDEN_BY_HASH_${golden_hash})
+        set(LYTHON_GOLDEN_BY_HASH_${golden_hash} "${golden_path}")
+    endif()
+endforeach()
+
+set(LYTHON_TWIN_PAIR_ARGS)
+set(LYTHON_TWIN_NAMES)
 file(GLOB LYTHON_EXAMPLES CONFIGURE_DEPENDS
     "${CMAKE_SOURCE_DIR}/examples/*.py")
 foreach(example_path IN LISTS LYTHON_EXAMPLES)
@@ -343,6 +372,34 @@ foreach(example_path IN LISTS LYTHON_EXAMPLES)
     else()
         set(expected_exit 0)
     endif()
+
+    # A twin subsumes the smoke test only if it also expects the same exit
+    # code: the golden checks its own .exitcode sidecar, and if that disagrees
+    # with what the smoke test asserted then "golden green" no longer implies
+    # "smoke green" and the smoke test has to stay.
+    file(SHA256 "${example_path}" example_hash)
+    set(twin_path "")
+    if(DEFINED LYTHON_GOLDEN_BY_HASH_${example_hash})
+        set(twin_candidate "${LYTHON_GOLDEN_BY_HASH_${example_hash}}")
+        get_filename_component(twin_dir "${twin_candidate}" DIRECTORY)
+        get_filename_component(twin_stem "${twin_candidate}" NAME_WE)
+        set(twin_exit 0)
+        if(EXISTS "${twin_dir}/${twin_stem}.exitcode")
+            file(READ "${twin_dir}/${twin_stem}.exitcode" twin_exit)
+            string(STRIP "${twin_exit}" twin_exit)
+        endif()
+        if(twin_exit STREQUAL "${expected_exit}")
+            set(twin_path "${twin_candidate}")
+        endif()
+    endif()
+
+    if(twin_path)
+        list(APPEND LYTHON_TWIN_NAMES "${example_name}")
+        list(APPEND LYTHON_TWIN_PAIR_ARGS
+            --pair "${example_path}" "${twin_path}" ${expected_exit})
+        continue()
+    endif()
+
     add_test(NAME "examples.${example_name}"
         COMMAND Python3::Interpreter "${LYTHON_GOLDEN_RUNNER}"
             --lyc $<TARGET_FILE:lyc> --exit-only ${expected_exit}
@@ -357,3 +414,19 @@ foreach(example_path IN LISTS LYTHON_EXAMPLES)
         TIMEOUT 300
         LABELS "${example_labels}")
 endforeach()
+
+list(LENGTH LYTHON_EXAMPLES lython_examples_total)
+list(LENGTH LYTHON_TWIN_NAMES lython_twins_total)
+message(STATUS
+    "examples/: ${lython_examples_total} samples, ${lython_twins_total} "
+    "byte-identical to a golden case and so not registered as smoke tests "
+    "(golden.example_twins guards that)")
+
+if(LYTHON_TWIN_PAIR_ARGS)
+    add_test(NAME "golden.example_twins"
+        COMMAND Python3::Interpreter "${LYTHON_TWIN_CHECKER}"
+            ${LYTHON_TWIN_PAIR_ARGS})
+    set_tests_properties("golden.example_twins" PROPERTIES
+        TIMEOUT 60
+        LABELS "meta;golden;fast")
+endif()
