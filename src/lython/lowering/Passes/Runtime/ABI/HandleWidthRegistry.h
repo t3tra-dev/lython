@@ -216,11 +216,51 @@ namespace py::lowering::handle_width {
 //                                                           must be >= 8 for
 //                                                           isContainerHandleType
 //      10  _asyncio.Future                                  one-lane
+//      11  builtins.set                                     assigned to the
+//                                                           set/frozenset track
 //      12  _asyncio.Task                                    leading word of a
 //                                                           multi-input release
+//      13  builtins.frozenset                               assigned to the
+//                                                           set/frozenset track
+//      14  builtins.tuple                                   one-lane, sole
+//                                                           owner. Layout needs
+//                                                           5 words (words 0..7
+//                                                           are ContainerLayout,
+//                                                           5/6 unused by a
+//                                                           sequence); words
+//                                                           8..13 are dead space
+//                                                           bought for an untied
+//                                                           single-input release
+//                                                           interface
+//      15  builtins.int                                     RESERVED, NOT YET
+//                                                           CONVERTED -- see the
+//                                                           note at the end of
+//                                                           this file
 //      16  builtins.object                                  payload box / boxed
 //                                                           field slot
 //      64  types.GeneratorType                              frame
+//
+// ===========================================================================
+// THE FREE LIST IS NOW EMPTY. This is the arithmetic at the top of the file
+// arriving, and it is worth stating as a fact rather than a projection.
+//
+// Widths 11, 13, 14 and 15 were the last four free single-input release
+// interfaces. They are spoken for: `set`->11, `frozenset`->13, `tuple`->14,
+// `int`->15. **Nothing is left for `builtins.str`, the ~70 exception contracts,
+// or class instances** -- the three largest items remaining in stage 4b, and
+// the one (`str`) whose conversion §8.3 measured as DEPENDING on a unique width
+// (one-laning it drops its `shapeMatch` from 2 to 0 and sweeps 27 sites into
+// the eight-way `memref<2xi64>` ambiguity).
+//
+// So the interim mitigation has run out before the work has. Those three must
+// either land on a tied width and accept mechanism (A), or GAP 1 and GAP 2 must
+// be closed first. **The scheme was always the contract name; this is the point
+// at which there is no longer a local rescue to fall back on.** Do not read the
+// empty free list as "pick a bigger number": width is object size, the ties are
+// on the release interface rather than the shape, and a contract at width 20
+// still scores 0 and still cannot win a tiebreak -- it just delays the
+// collision while paying for it on every allocation.
+// ===========================================================================
 //
 // ---------------------------------------------------------------------------
 // COLLISIONS, and their measured reachability. Occupancy of single-input
@@ -336,7 +376,15 @@ namespace py::lowering::handle_width {
 // mitigation; a converter without one is not blocked, because the ties are
 // already the tree's normal condition (width 8 ships with `dict` in a 7-way
 // tie). Record the tie here and move on.
-inline constexpr int kFreeHandleWidths[] = {11, 13, 14, 15};
+// EMPTY. 11, 13, 14 and 15 were the last four and are all assigned (set,
+// frozenset, tuple, int). See the boxed note above the assignment table: `str`,
+// the exception family and class instances have no free width left, and for
+// `str` that is not a cosmetic problem (§8.3).
+//
+// Spelled as a count rather than as `int kFreeHandleWidths[] = {}`, because a
+// zero-length array is not valid C++ and this file should stay compilable if
+// anyone ever does include it.
+inline constexpr int kFreeHandleWidthCount = 0;
 
 // The scarcity a converter should see before assuming a width is available,
 // and -- more importantly -- the ties that are ALREADY suppressing groups by
@@ -348,6 +396,17 @@ inline constexpr int kFreeHandleWidths[] = {11, 13, 14, 15};
 //       shape, four ways: the str/bytes configuration repeated. `list` left for
 //       width 9, so it is a THREE-way tie now, and 63 is the number to re-measure
 //       after each of the remaining three converts.
+//
+//       `tuple` has now left for width 14, so on THIS branch it is a TWO-way tie
+//       (`set`, `frozenset`) and both of those are converting on another track.
+//       **The 63 was NOT re-measured for this conversion, and the reason is a
+//       constraint rather than an oversight**: the instrument is a counter on the
+//       contract-less `return nullptr` in `common/Ownership.cpp`, and that file
+//       was explicitly out of scope for the tuple/int track. Recorded as
+//       outstanding rather than quietly skipped -- whoever lands `set` or
+//       `frozenset` can take it, and the prediction to check is that the number
+//       falls, since the tie is what produced it and the tie is shrinking.
+//       Do not read the tuple conversion as having confirmed that.
 //
 //       What breaking it surfaced, for the next converter's budget: nothing of
 //       the str/bytes kind, and that was predicted by an audit rather than
@@ -400,12 +459,29 @@ inline constexpr int kFreeHandleWidths[] = {11, 13, 14, 15};
 //       result's resource and can move release placement, which needs a build
 //       and a full suite to land safely.
 //
-//   before `builtins.int`:  @__ly_boxed_long_view (`builtins.mlir:15405`)
+//   before `builtins.int`:  @__ly_boxed_long_view
 //       Reads box pointer words 5 and 6, i.e. int's LANE 1 and LANE 2 addresses,
 //       which one-laning leaves uninitialised. The last lane-indexed raw box
 //       accessor in the tree. Three callers, so equality, ordering and float
 //       coercion all route through it. Invisible to every static oracle -- see
 //       the playbook's blocker note for the full statement.
+//
+//       STATUS after the tuple/int track: **still unfixed, and NOT yet
+//       observed to fire.** `int` was not converted (see the reservation note
+//       below), so the words it reads are still the live lane addresses and the
+//       accessor is still correct. What this track can add is a negative
+//       result worth having: the mixed numeric tower was exercised hard
+//       THROUGH one-lane tuple slots -- `(1.0,) == (1,)`, `(True,) == (1,)`,
+//       `(1, 2.0, True) == (1.0, 2, 1)`, `sorted([(2.0,), (True,), (1,)])`,
+//       `hash((1,)) == hash((1.0,))`, tuple keys mixing int and float -- all
+//       byte-identical to CPython 3.14 with exit 0 and no SIGSEGV.
+//       **So converting the CONTAINER a boxed int sits in does not disturb
+//       this accessor; only converting `int` itself will.** That is the
+//       expected reading of the mechanism rather than a surprise, but it had
+//       not been checked, and it means the tuple conversion is not evidence
+//       either way about the blocker. The fix (route through box word 2, the
+//       ENTITY word, then the handle's own words) is unchanged and still has
+//       to land in the same change that flips `LyLong_Shape`.
 //
 // Verified clear for float/complex/range on this branch (the check to repeat per
 // conversion): of the functions whose owned result 0 is a ONE-LANE handle at a
@@ -427,5 +503,70 @@ inline constexpr int kFreeHandleWidths[] = {11, 13, 14, 15};
 // lyrt.ReadyIntAwaitable; 5: range, range_iterator, types.CoroutineType), so
 // which contract a length-1 `memref<3xi64>` result actually is cannot be decided
 // from types. Only the declaration decides -- which is the point.
+
+// ---------------------------------------------------------------------------
+// `builtins.int` at 15: RESERVED, NOT CONVERTED. Why the width is booked before
+// the work, and what the work actually measures.
+//
+// The width is recorded now because reserving it is the whole point of this
+// file: 15 was one of the last four free single-input interfaces, and leaving
+// it unclaimed while `int` is known to be next is how `complex` collided with
+// `bytes` twice. Booking it costs nothing and closes that race.
+//
+// What stopped the conversion was SIZE, measured rather than estimated, by the
+// §8.3 scoping experiment (flip `LyLong_Shape` alone, build, attribute the gate
+// output by the OWNING contract of each failing declaration, revert):
+//
+//     107 gate errors over 107 distinct declarations, in NINE manifests
+//       builtins.mlir 65   _io 17   posix 7   _time 5   _random 3
+//       lyrt 3   math 3   unicodedata 2   asyncio 2
+//     by owning contract: builtins.int 55, and 52 in SIXTEEN other contracts
+//       (str 13, _io.{FileIO,BytesIO,StringIO,TextIOWrapper} 17, float 5,
+//        bytes 3, object 3, tuple 2, list 2, _asyncio.Task 2, range 1,
+//        range_iterator 1, lyrt.{ReadyIntAwaitable,AsyncCounter,Counter} 3)
+//     by check: 65 declared result_contract, 39 method receiver,
+//               2 next element result, 1 initializer result
+//
+// Compare `tuple`, taken the same way on the same tree: 21 errors over 19
+// declarations, ALL in `builtins.mlir`, 16 of them tuple's own. That is the
+// difference between a one-file change and a nine-file one, and it is the same
+// 40/60-style split that got `str` rescheduled -- `int` is 51/49.
+//
+// The surface below the declaration level is larger again: 155 signatures name
+// int's operand triple `(memref<2xi64>, memref<2xi64>, memref<?xi32>)` (98 in
+// `builtins.mlir`, 57 outside it), and `memref<?xi32>` occurs 1206 times across
+// the manifests. `int` sits between `float` (199 sites, converted) and `str`
+// (548 signatures, deferred), and closer to `str`.
+//
+// THE DESIGN IS SETTLED, so this is a scheduling item and not an open question.
+// `int` is neither §2's pattern (payload behind an address word, a second
+// allocation) nor §7's (fixed-width inline payload). It is `bytes`'s: a
+// VARIABLE-length payload inline at a fixed byte offset of the entity's single
+// allocation. `__ly_long_alloc_raw` already lays out one block as [0,16) header,
+// [16,32) meta, [32,..) digits. So:
+//
+//     word 0  refcount        word 3  digit count
+//     word 1  class id (1)    word 4  digits base address
+//     word 2  sign            words 5..14 pad
+//     digits at byte offset 120, inside the same allocation
+//
+// -- which keeps ONE allocation and one `memref.dealloc`, exactly as
+// `bytes_abi::kPayloadByteOffset` does at 48. Do NOT give int's digits their own
+// allocation: it would double the malloc count on the language's hottest type.
+// The `__ly_long_*` private helpers taking `(%meta, %digits)` views can keep
+// their signatures; only the public boundaries derive the views from the handle.
+//
+// Two prerequisites, both inside `int`'s own change:
+//   1. `@__ly_boxed_long_view` -- the mechanism-(C)/box-accessor blocker above.
+//   2. `@LyLong_Repr` still declares no `ly.runtime.result_contract`. It is
+//      listed under `str` above, but converting `int` reaches it first from the
+//      other side: once `LyLong_DecRef` takes `memref<15xi64>` it stops
+//      type-checking against the str header pair, so the single-candidate (C)
+//      path stops resolving and falls back to `:450`. That is the benign
+//      direction today -- `str` still scores a positive `shapeMatch` and wins --
+//      but it means the conversion silently changes which path a str result
+//      takes, so declare `result_contract = "builtins.str"` in the same change
+//      and do not rely on the fallback.
+// ---------------------------------------------------------------------------
 
 } // namespace py::lowering::handle_width

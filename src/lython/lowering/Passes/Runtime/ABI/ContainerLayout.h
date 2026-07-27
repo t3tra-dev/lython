@@ -39,9 +39,16 @@ inline constexpr std::int64_t kReservedWord = 7;
 // its layout needs. `builtins.list` is nine words for that reason -- words 0..7
 // are this layout (5 and 6 unused by a sequence) and word 8 is dead space that
 // buys an untied single-input release interface (ABI/HandleWidthRegistry.h).
+// `builtins.tuple` is fourteen for the same reason and a worse rate: words
+// 8..13 are dead, because by the time it converted, 14 was the narrowest free
+// single-input interface left. That is the width-scarcity arithmetic in
+// HandleWidthRegistry.h showing up as bytes -- a 3-element tuple pays 48 B of
+// padding for identity alone -- and it is why the registry's free list is now
+// empty rather than merely short.
 inline constexpr std::int64_t kHandleWordCount = 8;
 inline constexpr std::int64_t kDictHandleWordCount = 8;
 inline constexpr std::int64_t kListHandleWordCount = 9;
+inline constexpr std::int64_t kTupleHandleWordCount = 14;
 
 // Slot indices inside the {length, capacity} pair, which a multi-lane
 // contract still carries as its own `meta` lane. Words 2/3 above are the same
