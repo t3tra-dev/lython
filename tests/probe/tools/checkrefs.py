@@ -40,9 +40,15 @@ import pathlib
 import re
 import sys
 
-# Directories a bare filename may live in.
+# Directories a bare filename may live in. tests/golden itself is listed as well
+# as its two case directories: the harness every one of the ~400 end-to-end
+# tests runs through lives there, so without it `run_case.py` was the one file
+# in the tree that a document could cite correctly and have reported as
+# unresolved. The gap stayed open because the workflow only ever fed this tool
+# documents citing golden *cases*, never the golden *harness*.
 SEARCH = ("tests/probe", "tests/probe/tools", "tests/probe/tools/fixtures",
-          "tests/golden/cases", "tests/golden/errors", "tests/unit", "examples",
+          "tests/golden", "tests/golden/cases", "tests/golden/errors",
+          "tests/unit", "examples",
           "src/lython/runtime/lib", "src/lython/runtime/modules")
 
 CITATION = re.compile(r"[\w./{},*-]*?[\w-]+\.(?:py|mlir|stdout|exitcode|stderr-re)")
