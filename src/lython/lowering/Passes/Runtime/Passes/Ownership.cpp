@@ -49,6 +49,42 @@ bool ownershipTransferTraceEnabled() {
   return enabled;
 }
 
+// A borrow edge is admitted on the promise that a retain balances the
+// destination group's release. When the retain cannot be spelled the emission
+// declines it and the promise is broken silently -- and it is silent to the
+// FINAL verifier too, which counts the retains and releases that are PRESENT: a
+// dropped retain leaves each group's own arithmetic balanced, because the retain
+// belongs to the argument reconciling two groups rather than to either of them
+// (rfc/memory-safety-proof.md, third failure shape).
+//
+// So the omission is traced rather than left to be re-derived. Why a trace and
+// not a diagnostic: the wide-non-argument candidates are balanced today only
+// because nothing else releases their source, and 5595d16 measured that
+// declining the EDGE instead is worse -- it removes the destination's release as
+// well. Rejecting here would refuse programs that currently run. Counting the
+// sites is what says whether the residual is exercised at all, which is the
+// question a reader of that debt entry actually has.
+bool ownershipRetainOmissionTraceEnabled() {
+  static bool enabled = [] {
+    auto value =
+        llvm::sys::Process::GetEnv("LYTHON_OWNERSHIP_TRACE_RETAIN_OMISSIONS");
+    return value && !value->empty() && *value != "0";
+  }();
+  return enabled;
+}
+
+void traceOmittedBorrowEdgeRetain(mlir::Value header, mlir::Operation *anchor) {
+  if (!ownershipRetainOmissionTraceEnabled())
+    return;
+  auto function = anchor->getParentOfType<mlir::func::FuncOp>();
+  llvm::errs() << "[ownership-retain-omitted] in @"
+               << (function ? function.getName() : "<none>") << ": header type "
+               << header.getType() << ", "
+               << (mlir::isa<mlir::BlockArgument>(header) ? "block argument"
+                                                         : "op result")
+               << "\n";
+}
+
 using own::CachedFuncContract;
 using own::FuncContractCache;
 using own::ancestorInBlock;
@@ -1946,9 +1982,12 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
       } else if (borrowEdgeRetainIsSpellable(retain.header, retainFunction)) {
         header = own::spellHeaderPrefix(builder, anchor->getLoc(), header,
                                         retainInput);
-        if (!header)
+        if (!header) {
+          traceOmittedBorrowEdgeRetain(retain.header, anchor);
           continue;
+        }
       } else {
+        traceOmittedBorrowEdgeRetain(retain.header, anchor);
         continue;
       }
     }
