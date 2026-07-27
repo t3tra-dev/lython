@@ -46,6 +46,34 @@ if(NOT DEFINED CMAKE_CXX_COMPILER AND NOT DEFINED ENV{CXX})
     endif()
 endif()
 
+# An unset CMAKE_BUILD_TYPE means no optimisation flags at all, and the build
+# command in CLAUDE.md does not name one -- so the documented way to build this
+# project produced the slowest possible compiler. Measured on 464 ctest tests
+# from one tree: 232.6 s at Debug against 76.0 s at RelWithDebInfo, and the
+# per-file compile ratio is the same order (21.5 s -> 3.6 s on
+# str_format_percent). That is paid on every developer compile, not only in CI.
+#
+# Why NOT Debug as the default, given NDEBUG disables assert(): this project puts
+# its checking in explicit verifier passes that run as ordinary code, gated by
+# lyc's --release flag rather than by NDEBUG. There is exactly ONE assert() in
+# src/lython, and the Homebrew LLVM this builds against reports
+# assertion-mode=OFF, so MLIR's own internal assertions are already absent at
+# every build type. The residual cost is that llvm_unreachable degrades from an
+# abort with a message to undefined behaviour at five sites; those want
+# report_fatal_error instead, tracked separately.
+#
+# Why NOT Release: RelWithDebInfo keeps -g, so a crash in the pipeline is still
+# debuggable, which matters more here than the remaining size difference.
+#
+# This only affects a FRESH configure. An existing build directory keeps the
+# type recorded in its cache, so `rm -rf build` or -DCMAKE_BUILD_TYPE=... is
+# needed to pick the change up.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING
+        "Build type (RelWithDebInfo unless overridden)" FORCE)
+    message(STATUS "CMAKE_BUILD_TYPE not set; defaulting to RelWithDebInfo")
+endif()
+
 project(lython VERSION 0.1.0
                DESCRIPTION "Python compiler toolchain based on LLVM"
                LANGUAGES CXX C)
