@@ -14,6 +14,8 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
 
+#include <cstdlib>
+
 namespace lython::emitter {
 
 namespace {
@@ -26,6 +28,16 @@ enum class FinallyCompletion {
   Break,
   Continue,
 };
+
+// LYTHON_ABLATE_LOOP_CARRIED_PROMOTION=1 restores the rule that withheld the
+// storage promotion from a local an enclosing loop carries. See the site below
+// for why it is gone; the hatch exists so a "before" measurement comes from the
+// same binary as the "after" one.
+bool loopCarriedPromotionDisabled() {
+  static const bool disabled =
+      std::getenv("LYTHON_ABLATE_LOOP_CARRIED_PROMOTION") != nullptr;
+  return disabled;
+}
 
 bool isSupportedFinallyReturnCarrierType(mlir::Type type) {
   if (!type)
@@ -594,53 +606,41 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
       // in disguise, so it belongs with the receivers above.
       if (isMutableContainerContract(content) && augAssignTargets.contains(name))
         continue;
-      // A loop-carried local arrives as a loop block argument, and moving that
-      // incarnation's token into an aggregate slot inside the same iteration is
-      // mis-tracked downstream. Until that hole is closed the name keeps the
-      // post-try result lanes, which handle the loop shape. Detected by name
-      // against every enclosing loop's carried set rather than by asking whether
-      // the value is a BlockArgument, because a promoted name is re-bound to the
-      // cell before the next enclosing try sees it.
+      // A loop-carried local used to be withheld from the promotion and left to
+      // the post-try result lanes. It is promoted like any other name now, and
+      // the reason the withholding existed has been removed rather than worked
+      // around: the affine verifier refused the promoted form with `released
+      // owned resource from builtin.unrealized_conversion_cast is used after
+      // release`, and that refusal was a FALSE POSITIVE of the walk's
+      // use-after-release rule. The cell is constructed inside the loop body, so
+      // the next iteration's writes to the storage it is derived from mention the
+      // released instance's alias class while building a fresh one. The rule now
+      // requires the producer to dominate the mentioning op
+      // (`AffineOwnership.cpp`, `producerDominates`), which no back edge does.
       //
-      // What the promotion actually does, measured on 13b0c69 by letting it run
-      // for `errors/try_loop_carried_entity_rebind` (`kept = e` under a loop):
-      // the module is REFUSED, rc=1, `released owned resource from
-      // builtin.unrealized_conversion_cast is used after release` -- the
-      // premature-release shape, from the affine verifier. So this bail is still
-      // load-bearing, and that is its surviving reason.
+      // Why the lanes cannot be left in charge instead, which is what the bail
+      // did: a lane is a `py.try` RESULT, so it is only written by a yield. A
+      // handler that rebinds the name and then RAISES never yields, and the
+      // enclosing handler -- the only place that can observe the rebind -- yields
+      // the value the name held BEFORE the statement. The rebind was silently
+      // lost (rfc/stdlib-semantics.md family A, `d` stuck at its pre-loop value),
+      // and where the lost value was owned the pre-try lane was released by the
+      // rebind and forwarded by the handler, which the verifier then reported as a
+      // use after release. One channel, two faces.
       //
-      // Two claims that used to sit here are withdrawn, because the same run
-      // contradicts them. The promoted form does NOT segfault under --release: it
-      // prints CPython's answer on 20/20 plain runs, is clean under libgmalloc in
-      // both guard orders and under MallocScribble/MallocPreScribble, and leaks
-      // nothing measurable (peak RSS at 8,000 iterations scatters around peak RSS
-      // at 200 across three rounds, sometimes lower). The premature release is
-      // therefore LATENT here rather than firing, which is a weaker claim than
-      // "double-frees" and the one the evidence supports. And the second reason
-      // this bail once cited -- that the ownership verifier refuses the same
-      // spelling anyway -- was retired: that refusal was in part a false positive
-      // of the walk's stale set, fixed in 13b0c69.
-      //
-      // Why there is no env hatch to re-run that measurement: it would have to
-      // make the compiler ACCEPT a form it has just refused as a premature
-      // release, and a switch whose failure mode is a shipped use-after-free is
-      // not worth its convenience. The ablation switches this tree does keep
-      // (LYTHON_ABLATE_STALE_REBIND, LYTHON_OWNERSHIP_NO_LANE_ADVANCE) either
-      // observe or make the compiler stricter, so a mistake with one set costs a
-      // false rejection. Re-measure by patching this bail out locally instead.
+      // Detected by name against every enclosing loop's carried set rather than by
+      // asking whether the value is a BlockArgument, because a promoted name is
+      // re-bound to the cell before the next enclosing try sees it.
       bool loopCarried = false;
       for (const LoopControlContext &context : loopControlContexts)
         for (const CarriedLoopLocal &carried : context.carriedLocals)
           if (carried.name == name)
             loopCarried = true;
-      if (loopCarried) {
-        // ... but with no lane able to carry the value either, the two
-        // channels' exclusions meet and the rebind reaches nothing. Why say it
-        // here when the pipeline refuses the promoted form anyway (see above):
-        // the pipeline's refusal names `builtin.unrealized_conversion_cast`,
-        // which tells the author nothing about their program, and it arrives from
-        // a verifier that `--release` turns off. This diagnostic names the local
-        // and the two ways out, and it is emitted in both configurations.
+      if (loopCarried && loopCarriedPromotionDisabled()) {
+        // Ablation only (LYTHON_ABLATE_LOOP_CARRIED_PROMOTION): restores the
+        // withholding so a golden sentinel and an IR differential can take their
+        // "before" side from this binary. Unsupported -- with it set the rebind is
+        // lost again.
         if (!postTryLaneCarrierType(content))
           diagnostics.push_back(parser::Diagnostic{
               parser::Severity::Error, statement.range.start,

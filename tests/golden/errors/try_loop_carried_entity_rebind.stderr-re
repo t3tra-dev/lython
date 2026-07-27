@@ -1,1 +1,0 @@
-local 'kept' is reassigned inside this try and is also carried by an enclosing loop

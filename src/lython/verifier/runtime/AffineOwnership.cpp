@@ -12,6 +12,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "llvm/ADT/BitVector.h"
@@ -26,6 +27,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -82,6 +84,19 @@ bool ownershipPathTraceEnabled() {
 bool staleRebindDropDisabled() {
   static const bool disabled =
       std::getenv("LYTHON_ABLATE_STALE_REBIND") != nullptr;
+  return disabled;
+}
+
+// LYTHON_ABLATE_RELEASED_DOMINANCE=1 restores the use-after-release rule that
+// fired on any op mentioning the group's ALIAS class, whether or not the
+// producer dominates it. Same purpose as the hatch above: it lets a sentinel and
+// an IR differential take their "before" side from this binary. Not a supported
+// configuration -- with it set, an owned local object built inside a loop body is
+// refused, because the next iteration's construction of a FRESH instance reads as
+// a use of the released one.
+bool releasedUseDominanceDisabled() {
+  static const bool disabled =
+      std::getenv("LYTHON_ABLATE_RELEASED_DOMINANCE") != nullptr;
   return disabled;
 }
 
@@ -570,6 +585,32 @@ public:
     });
   }
 
+  // Does `producer` dominate `op`?
+  //
+  // The question this answers for the walk: an op that mentions the tracked
+  // group's ALIAS class is not necessarily a use of THIS instance of the
+  // resource. The group's own SSA values can only be read where their definition
+  // dominates, but the alias class also holds the storage the producer derived
+  // them from -- for an owned local object, the `memref.alloc` the constructing
+  // block wrote before the marker cast. When that block sits on a loop back edge,
+  // the next iteration's writes to it mention the class while building a FRESH
+  // instance, and the released one is not what they name.
+  //
+  // Why DominanceInfo and not "is the op after the producer in program order":
+  // the two differ exactly on the shape at issue (a back edge reaches earlier
+  // blocks), and dominance is the property SSA already guarantees for every
+  // genuine use of a tracked value.
+  //
+  // Built lazily: functions whose resources are all released in their producing
+  // block never ask.
+  bool producerDominates(mlir::Operation *producer, mlir::Operation *op) {
+    if (!producer || !op)
+      return true;
+    if (!dominance)
+      dominance = std::make_unique<mlir::DominanceInfo>(function);
+    return dominance->dominates(producer, op);
+  }
+
   // Can control flow from `state`'s position still reach an op that mentions
   // one of its tracked names? Over-approximated on purpose: block granularity
   // (a mention anywhere in a block counts, including before the walk's
@@ -717,6 +758,7 @@ private:
   llvm::DenseMap<mlir::Operation *, mlir::func::CallOp> anchorGuarded;
   llvm::DenseMap<mlir::Operation *, bool> guardedCalls;
   llvm::DenseMap<mlir::Operation *, RaiseFacts> raiseFactsByCall;
+  std::unique_ptr<mlir::DominanceInfo> dominance;
 };
 
 // Alias roots of `values`. `aliases.same(v, c)` holding for some c in `values`
@@ -2263,7 +2305,9 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
                     "must release, transfer, or return it";
       } else if (state.token == AffineTokenState::Released && mentionsTracked &&
                  groupContainsOperand(op, state.group, aliases) &&
-                 state.retained == 0) {
+                 state.retained == 0 &&
+                 (releasedUseDominanceDisabled() ||
+                  walk.producerDominates(resource.producer, op))) {
         return op->emitError()
                << "released owned resource from " << resource.producerLabel
                << " is used after release";
