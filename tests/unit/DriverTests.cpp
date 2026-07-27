@@ -7,14 +7,18 @@
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/CFG.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/Module.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <gtest/gtest.h>
 
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -182,16 +186,59 @@ selfReachableBlocks(const llvm::Function &function) {
   return result;
 }
 
+// Names every alloca of `function` that sits in a block able to reach itself,
+// each rendered as its own IR text so a failure reports the offending slot by
+// name instead of a count that has moved.
+std::vector<std::string> allocasInRepeatedBlocks(const llvm::Function &function,
+                                                 bool &sawRepeatedBlock) {
+  llvm::SmallPtrSet<const llvm::BasicBlock *, 8> repeated =
+      selfReachableBlocks(function);
+  sawRepeatedBlock = !repeated.empty();
+  std::vector<std::string> found;
+  for (const llvm::BasicBlock &block : function) {
+    if (!repeated.contains(&block))
+      continue;
+    for (const llvm::Instruction &instruction : block) {
+      if (!llvm::isa<llvm::AllocaInst>(&instruction))
+        continue;
+      std::string described;
+      llvm::raw_string_ostream out(described);
+      instruction.print(out);
+      found.push_back(described);
+    }
+  }
+  return found;
+}
+
+// Is `text` the initializer of some read-only global of `module`?
+//
+// This is the anti-vacuity half of the literal test below: "no alloca in the
+// loop body" is also what a literal that was folded away entirely would produce,
+// and that would be a different (and unnoticed) change. Finding the bytes in
+// read-only data proves the literal still reaches the lowering under test.
+bool hasConstantBytes(const llvm::Module &module, llvm::StringRef text) {
+  for (const llvm::GlobalVariable &global : module.globals()) {
+    if (!global.isConstant() || !global.hasInitializer())
+      continue;
+    const auto *data =
+        llvm::dyn_cast<llvm::ConstantDataArray>(global.getInitializer());
+    if (data && data->isString() && data->getRawDataValues() == text)
+      return true;
+  }
+  return false;
+}
+
 // A boxed container mutation inside a loop must not leave its 16-word payload
 // box slot in the loop body: `memref.alloca` outside the entry block becomes a
 // dynamic LLVM stack adjustment that nothing reclaims before the function
 // returns, so the frame grew 128 bytes per iteration and the stack guard raised
-// RecursionError past ~25,000 iterations. Every alloca that survives in a
-// self-reachable block here is a byte buffer feeding a raise (the
-// changed-size guard, the traceback file/function names), which by construction
-// runs at most once per frame; assert on element type rather than on a count so
-// that a NEW non-i8 loop-body slot fails by name and so that removing the last
-// one also fails and asks for this test to be tightened.
+// RecursionError past ~25,000 iterations.
+//
+// The assertion is a set and not a count so that a NEW loop-body slot fails by
+// name. It reads "none at all" rather than the "none except i8" it was first
+// written as: the three i8 buffers that used to survive here were a raise
+// message and the traceback file/function names, all of them compile-time
+// literals, and those are now shared read-only globals.
 TEST(DriverTest, BoxedContainerLoopKeepsPayloadSlotsOutOfTheLoopBody) {
   CompileResult result = compileSource("d: dict[int, int] = {}\n"
                                        "for i in range(4):\n"
@@ -205,24 +252,100 @@ TEST(DriverTest, BoxedContainerLoopKeepsPayloadSlotsOutOfTheLoopBody) {
   const llvm::Function *main = result.verified.llvmModule->getFunction("__main__");
   ASSERT_NE(main, nullptr);
 
-  llvm::SmallPtrSet<const llvm::BasicBlock *, 8> repeated =
-      selfReachableBlocks(*main);
-  ASSERT_FALSE(repeated.empty()) << "the loops were compiled away; this test "
-                                    "would then assert nothing";
-  for (const llvm::BasicBlock &block : *main) {
-    if (!repeated.contains(&block))
+  bool sawRepeatedBlock = false;
+  std::vector<std::string> found = allocasInRepeatedBlocks(*main,
+                                                           sawRepeatedBlock);
+  ASSERT_TRUE(sawRepeatedBlock) << "the loops were compiled away; this test "
+                                  "would then assert nothing";
+  for (const std::string &described : found)
+    ADD_FAILURE() << "alloca in a block that repeats:" << described;
+}
+
+// A `str` or `bytes` literal in a loop body must not put its bytes on the
+// frame. The buffer feeding `builtins.str.__new__` / `builtins.bytes.__new__` was
+// a `memref.alloca` plus one store per byte, so the frame grew by the length of
+// the literal on every iteration -- measured at 275,000 iterations of a 20-byte
+// literal before RecursionError, against 4,000,000 for the same loop with an
+// `int` literal in place of the `str` one.
+//
+// It is a shared read-only global instead of a hoisted or reused frame slot
+// because the buffer is not the object's payload: both initializers allocate
+// their own payload and copy out of it, so two occurrences of one literal can
+// share storage and nothing can write through it.
+TEST(DriverTest, StringAndBytesLiteralsInALoopStayOutOfTheFrame) {
+  CompileResult result = compileSource("n = 0\n"
+                                       "for i in range(4):\n"
+                                       "    s = \"loop body literal\"\n"
+                                       "    b = b\"loop body bytes\"\n"
+                                       "    n = n + len(s) + len(b)\n"
+                                       "print(n)\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  const llvm::Function *main = result.verified.llvmModule->getFunction("__main__");
+  ASSERT_NE(main, nullptr);
+
+  bool sawRepeatedBlock = false;
+  std::vector<std::string> found = allocasInRepeatedBlocks(*main,
+                                                           sawRepeatedBlock);
+  ASSERT_TRUE(sawRepeatedBlock) << "the loop was compiled away; this test would "
+                                  "then assert nothing";
+  for (const std::string &described : found)
+    ADD_FAILURE() << "alloca in a block that repeats:" << described;
+
+  EXPECT_TRUE(hasConstantBytes(*result.verified.llvmModule, "loop body literal"))
+      << "the str literal's bytes are in neither the frame nor read-only data, "
+         "so this test is no longer looking at the lowering it was written for";
+  EXPECT_TRUE(hasConstantBytes(*result.verified.llvmModule, "loop body bytes"))
+      << "the bytes literal's bytes are in neither the frame nor read-only "
+         "data, so this test is no longer looking at the lowering it was "
+         "written for";
+}
+
+// The `int` arm of the same class. `lowerIntConstant` splits a beyond-i64 literal
+// into 30-bit limbs at compile time, and the limbs used to be stored into a
+// per-execution `memref.alloca<?xi32>` -- 4 bytes of frame per limb per iteration,
+// RecursionError past 300,000.
+//
+// It is a separate test from the str/bytes one because it was a separate find:
+// both literals grew the same frame, the 20-byte `str` reached the cliff at
+// 275,000 and a 7-limb `int` needs 300,000, so this instance was invisible until
+// the other was fixed. Two tests keep that distinction reportable.
+TEST(DriverTest, BigIntLiteralInALoopStaysOutOfTheFrame) {
+  CompileResult result = compileSource(
+      "n = 0\n"
+      "for i in range(4):\n"
+      "    big = 123456789012345678901234567890123456789012345678901234567890\n"
+      "    n = n + (big % 97)\n"
+      "print(n)\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  const llvm::Function *main = result.verified.llvmModule->getFunction("__main__");
+  ASSERT_NE(main, nullptr);
+
+  bool sawRepeatedBlock = false;
+  std::vector<std::string> found = allocasInRepeatedBlocks(*main,
+                                                           sawRepeatedBlock);
+  ASSERT_TRUE(sawRepeatedBlock) << "the loop was compiled away; this test would "
+                                  "then assert nothing";
+  for (const std::string &described : found)
+    ADD_FAILURE() << "alloca in a block that repeats:" << described;
+
+  // Anti-vacuity: the literal needs 2 limbs beyond i64 and must still be lowered
+  // through the digit path, not folded to something with no block at all. 2^30
+  // per limb, so 60 decimal digits is 7 limbs -- assert the limb block exists as
+  // read-only data rather than asserting its exact contents, which would restate
+  // the limb split rather than check it (the golden checks the values).
+  bool sawLimbBlock = false;
+  for (const llvm::GlobalVariable &global :
+       result.verified.llvmModule->globals()) {
+    if (!global.isConstant() || !global.hasInitializer())
       continue;
-    for (const llvm::Instruction &instruction : block) {
-      const auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(&instruction);
-      if (!alloca)
-        continue;
-      std::string described;
-      llvm::raw_string_ostream out(described);
-      alloca->print(out);
-      EXPECT_TRUE(alloca->getAllocatedType()->isIntegerTy(8))
-          << "alloca in a block that repeats: " << described;
-    }
+    if (!global.getName().starts_with("__ly_const_digits_"))
+      continue;
+    sawLimbBlock = true;
+    break;
   }
+  EXPECT_TRUE(sawLimbBlock)
+      << "no read-only limb block, so the beyond-i64 literal no longer reaches "
+         "the lowering this test was written for";
 }
 
 // Reading a bool out of an erased slot yields the box, and bool.__str__ takes

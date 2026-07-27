@@ -138,6 +138,8 @@ set(LYTHON_UNIT_PATTERNS_meta
 set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.AdaptsBoxedBoolToUnboxedStrInput"
     "DriverTest.BoxedContainerLoopKeepsPayloadSlotsOutOfTheLoopBody"
+    "DriverTest.StringAndBytesLiteralsInALoopStayOutOfTheFrame"
+    "DriverTest.BigIntLiteralInALoopStaysOutOfTheFrame"
     "DriverTest.CompilesHelloToVerifiedLLVMIR"
     "DriverTest.ResolvesEmbeddedStdlibImports"
     "DriverTest.CompilesUnevenMatmulForEveryTensorTarget"

@@ -1,5 +1,7 @@
 #include "Runtime/Core/Lowerer.h"
 
+#include "Runtime/ABI/ConstantData.h"
+
 namespace py::lowering {
 
 mlir::LogicalResult
@@ -115,25 +117,27 @@ RuntimeBundleLowerer::lowerIntConstant(py::IntConstantOp op) {
   // truncation is lossless: digitCount * 30 >= getActiveBits().
   magnitude = magnitude.zextOrTrunc(digitCount * 30);
 
-  mlir::Value dynamicSize =
-      mlir::arith::ConstantIndexOp::create(builder, loc, digitCount)
-          .getResult();
-  auto memrefType =
-      mlir::MemRefType::get({mlir::ShapedType::kDynamic}, builder.getI32Type());
-  mlir::Value buffer =
-      mlir::memref::AllocaOp::create(builder, loc, memrefType,
-                                     mlir::ValueRange{dynamicSize})
-          .getResult();
-  for (unsigned index = 0; index < digitCount; ++index) {
-    std::uint64_t digit = magnitude.extractBitsAsZExtValue(30, index * 30);
-    mlir::Value position =
-        mlir::arith::ConstantIndexOp::create(builder, loc, index).getResult();
-    mlir::Value value = mlir::arith::ConstantIntOp::create(
-                            builder, loc, static_cast<std::int64_t>(digit), 32)
-                            .getResult();
-    mlir::memref::StoreOp::create(builder, loc, value, buffer,
-                                  mlir::ValueRange{position});
-  }
+  // The limbs are a compile-time constant, so they live in read-only data
+  // rather than on the frame -- same reasoning and same storage as a `str`
+  // literal's bytes (ABI/ConstantData.h). `LyLong_FromDigits` allocates its own
+  // digit array through `__ly_long_alloc_raw` and copies out of what it is
+  // given, so this block is the initializer's argument and not the int's
+  // payload.
+  //
+  // This instance became visible only after the `str`/`bytes` one was fixed:
+  // both grew the same frame, and the shorter literal hit the cliff first. A
+  // third may be hiding the same way.
+  llvm::SmallVector<int32_t, 8> limbs;
+  limbs.reserve(digitCount);
+  for (unsigned index = 0; index < digitCount; ++index)
+    limbs.push_back(static_cast<int32_t>(
+        magnitude.extractBitsAsZExtValue(30, index * 30)));
+  auto elements = mlir::DenseElementsAttr::get(
+      mlir::RankedTensorType::get({static_cast<std::int64_t>(digitCount)},
+                                  builder.getI32Type()),
+      llvm::ArrayRef<int32_t>(limbs));
+  mlir::Value buffer = constant_data::internReadOnlyBlock(
+      module, builder, loc, "digits", op.getValue(), elements);
   mlir::Value sign =
       mlir::arith::ConstantIntOp::create(builder, loc, negative ? -1 : 1, 64)
           .getResult();
