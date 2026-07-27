@@ -300,6 +300,54 @@ TEST(DriverTest, StringAndBytesLiteralsInALoopStayOutOfTheFrame) {
          "written for";
 }
 
+// The `int` arm of the same class. `lowerIntConstant` splits a beyond-i64 literal
+// into 30-bit limbs at compile time, and the limbs used to be stored into a
+// per-execution `memref.alloca<?xi32>` -- 4 bytes of frame per limb per iteration,
+// RecursionError past 300,000.
+//
+// It is a separate test from the str/bytes one because it was a separate find:
+// both literals grew the same frame, the 20-byte `str` reached the cliff at
+// 275,000 and a 7-limb `int` needs 300,000, so this instance was invisible until
+// the other was fixed. Two tests keep that distinction reportable.
+TEST(DriverTest, BigIntLiteralInALoopStaysOutOfTheFrame) {
+  CompileResult result = compileSource(
+      "n = 0\n"
+      "for i in range(4):\n"
+      "    big = 123456789012345678901234567890123456789012345678901234567890\n"
+      "    n = n + (big % 97)\n"
+      "print(n)\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  const llvm::Function *main = result.verified.llvmModule->getFunction("__main__");
+  ASSERT_NE(main, nullptr);
+
+  bool sawRepeatedBlock = false;
+  std::vector<std::string> found = allocasInRepeatedBlocks(*main,
+                                                           sawRepeatedBlock);
+  ASSERT_TRUE(sawRepeatedBlock) << "the loop was compiled away; this test would "
+                                  "then assert nothing";
+  for (const std::string &described : found)
+    ADD_FAILURE() << "alloca in a block that repeats:" << described;
+
+  // Anti-vacuity: the literal needs 2 limbs beyond i64 and must still be lowered
+  // through the digit path, not folded to something with no block at all. 2^30
+  // per limb, so 60 decimal digits is 7 limbs -- assert the limb block exists as
+  // read-only data rather than asserting its exact contents, which would restate
+  // the limb split rather than check it (the golden checks the values).
+  bool sawLimbBlock = false;
+  for (const llvm::GlobalVariable &global :
+       result.verified.llvmModule->globals()) {
+    if (!global.isConstant() || !global.hasInitializer())
+      continue;
+    if (!global.getName().starts_with("__ly_const_digits_"))
+      continue;
+    sawLimbBlock = true;
+    break;
+  }
+  EXPECT_TRUE(sawLimbBlock)
+      << "no read-only limb block, so the beyond-i64 literal no longer reaches "
+         "the lowering this test was written for";
+}
+
 TEST(DriverTest, RepeatedCompileIsStable) {
   for (int round = 0; round < 3; ++round) {
     CompileResult result = compileSource("print(40 + 2)\n");
