@@ -159,6 +159,22 @@ parseIndexSetAttr(mlir::Operation *op, llvm::StringRef attrName,
 
 mlir::FailureOr<FunctionContract>
 readFunctionContract(mlir::func::FuncOp function);
+
+// The contract name of `contract.ownedResults.values[contractIndex]`, or empty
+// when the declaration names none. `contractIndex` indexes the OWNED-RESULT
+// list, not the result list.
+//
+// One function rather than the precedence spelled at each reader: a declaration
+// that yielded one name to the insertion pass and another to a verifier is the
+// defect this replaces (`ABI/HandleWidthRegistry.h`, GAP 2 -- the insertion path
+// had the `ly.runtime.result_contract` fallback and three helpers did not, so the
+// same `func.func` produced two different answers depending on who asked).
+// Adding the fallback at each site again would restore the divergence the next
+// time a channel is added; the precedence has to have exactly one definition.
+llvm::StringRef ownedResultContractName(mlir::func::FuncOp function,
+                                        const FunctionContract &contract,
+                                        unsigned contractIndex);
+
 mlir::FailureOr<std::optional<AggregateOwnershipMarker>>
 readAggregateOwnershipMarker(mlir::Operation *op);
 
