@@ -1,0 +1,18 @@
+9
+b'chunk'
+b'chunk'
+True
+b'short'
+b'a considerably longer payload'
+29
+9
+1 9
+True
+[1, 2, 3, 4, 5, 6, 7, 8, 9]
+6
+True
+False
+[b'abc', b'def', b'abcd']
+b'abcdef'
+b'abcd'
+61626364

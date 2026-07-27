@@ -206,7 +206,7 @@ module attributes {
   }
 
   // ===== impls: lyrt_async_counter =====
-  func.func private @LyStopAsyncIteration_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1]}
+  func.func private @LyStopAsyncIteration_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]}
   func.func private @LyStopAsyncIteration_Raise(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) attributes {ly.ownership.transfer_args = [0, 1]}
 
   func.func @LyAsyncCounter_New(%limit: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 16 : i64, ly.runtime.contract = "lyrt.AsyncCounter", ly.runtime.initializer = "__new__"} {

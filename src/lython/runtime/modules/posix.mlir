@@ -124,10 +124,11 @@ module attributes {
   // --- shared runtime entry points -----------------------------------------
   func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 1 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
   func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 4 : i64, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
-  func.func private @LyUnicode_Encode(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "encode", ly.runtime.result_contract = "builtins.bytes"}
-  func.func private @LyBytes_DecRef(%header: memref<2xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.deallocator}
+  func.func private @LyUnicode_Encode(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> memref<6xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "encode", ly.runtime.result_contract = "builtins.bytes"}
+  func.func private @LyBytes_DecRef(%header: memref<6xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.deallocator}
+  func.func private @__ly_bytes_payload(%self: memref<6xi64>) -> memref<?xi8> attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.interior_word, ly.runtime.primitive = "payload_view"}
   func.func private @LyList_FromLength(%length: i64 {ly.runtime.default_i64 = 0 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 10 : i64, ly.runtime.contract = "builtins.list", ly.runtime.initializer = "__new__"}
-  func.func private @LyBaseException_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.class_id = 5 : i64, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"}
+  func.func private @LyBaseException_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 5 : i64, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"}
   func.func private @LyBaseException_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0, 3], ly.runtime.contract = "builtins.BaseException", ly.runtime.method = "__init__", ly.runtime.result_evidence = "receiver"}
   func.func private @LyEH_ThrowException(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) attributes {ly.ownership.transfer_args = [0, 1], ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "raise"}
 
@@ -310,11 +311,12 @@ module attributes {
     %c0 = arith.constant 0 : index
     %code64 = func.call @LyLong_AsI64(%code_header, %code_meta, %code_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
     %code = arith.trunci %code64 : i64 to i32
-    %enc_header, %enc_bytes = func.call @LyUnicode_Encode(%path_header, %path_bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    %enc_header = func.call @LyUnicode_Encode(%path_header, %path_bytes) : (memref<2xi64>, memref<?xi8>) -> memref<6xi64>
+    %enc_bytes = func.call @__ly_bytes_payload(%enc_header) : (memref<6xi64>) -> memref<?xi8>
     %enc_dim = memref.dim %enc_bytes, %c0 : memref<?xi8>
     %enc_len = arith.index_cast %enc_dim : index to i64
     func.call @__ly_posix_throw(%code, %enc_bytes, %enc_len) : (i32, memref<?xi8>, i64) -> ()
-    func.call @LyBytes_DecRef(%enc_header) : (memref<2xi64>) -> ()
+    func.call @LyBytes_DecRef(%enc_header) : (memref<6xi64>) -> ()
     func.return
   }
 
@@ -340,7 +342,8 @@ module attributes {
   func.func @LyPosix_Chdir(%path_header: memref<2xi64> {ly.ownership.object_header}, %path_bytes: memref<?xi8>) attributes {ly.runtime.builtin = "posix.chdir", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.str", ly.runtime.primitive = "posix_chdir", ly.runtime.result_contract = "types.NoneType"} {
     %c0 = arith.constant 0 : index
     %zero32 = arith.constant 0 : i32
-    %enc_header, %enc_bytes = func.call @LyUnicode_Encode(%path_header, %path_bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    %enc_header = func.call @LyUnicode_Encode(%path_header, %path_bytes) : (memref<2xi64>, memref<?xi8>) -> memref<6xi64>
+    %enc_bytes = func.call @__ly_bytes_payload(%enc_header) : (memref<6xi64>) -> memref<?xi8>
     %enc_dim = memref.dim %enc_bytes, %c0 : memref<?xi8>
     %enc_len = arith.index_cast %enc_dim : index to i64
     %status = func.call @LyHost_Chdir(%enc_bytes, %enc_len) : (memref<?xi8>, i64) -> i32
@@ -349,7 +352,7 @@ module attributes {
       %err = func.call @LyHost_Errno() : () -> i32
       func.call @__ly_posix_throw(%err, %enc_bytes, %enc_len) : (i32, memref<?xi8>, i64) -> ()
     }
-    func.call @LyBytes_DecRef(%enc_header) : (memref<2xi64>) -> ()
+    func.call @LyBytes_DecRef(%enc_header) : (memref<6xi64>) -> ()
     func.return
   }
 
@@ -358,7 +361,8 @@ module attributes {
   func.func @LyPosix_Rmdir(%path_header: memref<2xi64> {ly.ownership.object_header}, %path_bytes: memref<?xi8>) attributes {ly.runtime.builtin = "posix.rmdir", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.str", ly.runtime.primitive = "posix_rmdir", ly.runtime.result_contract = "types.NoneType"} {
     %c0 = arith.constant 0 : index
     %zero32 = arith.constant 0 : i32
-    %enc_header, %enc_bytes = func.call @LyUnicode_Encode(%path_header, %path_bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    %enc_header = func.call @LyUnicode_Encode(%path_header, %path_bytes) : (memref<2xi64>, memref<?xi8>) -> memref<6xi64>
+    %enc_bytes = func.call @__ly_bytes_payload(%enc_header) : (memref<6xi64>) -> memref<?xi8>
     %enc_dim = memref.dim %enc_bytes, %c0 : memref<?xi8>
     %enc_len = arith.index_cast %enc_dim : index to i64
     %status = func.call @LyHost_Rmdir(%enc_bytes, %enc_len) : (memref<?xi8>, i64) -> i32
@@ -367,14 +371,15 @@ module attributes {
       %err = func.call @LyHost_Errno() : () -> i32
       func.call @__ly_posix_throw(%err, %enc_bytes, %enc_len) : (i32, memref<?xi8>, i64) -> ()
     }
-    func.call @LyBytes_DecRef(%enc_header) : (memref<2xi64>) -> ()
+    func.call @LyBytes_DecRef(%enc_header) : (memref<6xi64>) -> ()
     func.return
   }
 
   func.func @LyPosix_Unlink(%path_header: memref<2xi64> {ly.ownership.object_header}, %path_bytes: memref<?xi8>) attributes {ly.runtime.builtin = "posix.unlink", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.str", ly.runtime.primitive = "posix_unlink", ly.runtime.result_contract = "types.NoneType"} {
     %c0 = arith.constant 0 : index
     %zero32 = arith.constant 0 : i32
-    %enc_header, %enc_bytes = func.call @LyUnicode_Encode(%path_header, %path_bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    %enc_header = func.call @LyUnicode_Encode(%path_header, %path_bytes) : (memref<2xi64>, memref<?xi8>) -> memref<6xi64>
+    %enc_bytes = func.call @__ly_bytes_payload(%enc_header) : (memref<6xi64>) -> memref<?xi8>
     %enc_dim = memref.dim %enc_bytes, %c0 : memref<?xi8>
     %enc_len = arith.index_cast %enc_dim : index to i64
     %status = func.call @LyHost_Unlink(%enc_bytes, %enc_len) : (memref<?xi8>, i64) -> i32
@@ -383,14 +388,15 @@ module attributes {
       %err = func.call @LyHost_Errno() : () -> i32
       func.call @__ly_posix_throw(%err, %enc_bytes, %enc_len) : (i32, memref<?xi8>, i64) -> ()
     }
-    func.call @LyBytes_DecRef(%enc_header) : (memref<2xi64>) -> ()
+    func.call @LyBytes_DecRef(%enc_header) : (memref<6xi64>) -> ()
     func.return
   }
 
   func.func @LyPosix_Mkdir(%path_header: memref<2xi64> {ly.ownership.object_header}, %path_bytes: memref<?xi8>, %mode: i64 {ly.runtime.default_i64 = 511 : i64}) attributes {ly.runtime.builtin = "posix.mkdir", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.str", ly.runtime.primitive = "posix_mkdir", ly.runtime.result_contract = "types.NoneType"} {
     %c0 = arith.constant 0 : index
     %zero32 = arith.constant 0 : i32
-    %enc_header, %enc_bytes = func.call @LyUnicode_Encode(%path_header, %path_bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    %enc_header = func.call @LyUnicode_Encode(%path_header, %path_bytes) : (memref<2xi64>, memref<?xi8>) -> memref<6xi64>
+    %enc_bytes = func.call @__ly_bytes_payload(%enc_header) : (memref<6xi64>) -> memref<?xi8>
     %enc_dim = memref.dim %enc_bytes, %c0 : memref<?xi8>
     %enc_len = arith.index_cast %enc_dim : index to i64
     %status = func.call @LyHost_Mkdir(%enc_bytes, %enc_len, %mode) : (memref<?xi8>, i64, i64) -> i32
@@ -399,17 +405,19 @@ module attributes {
       %err = func.call @LyHost_Errno() : () -> i32
       func.call @__ly_posix_throw(%err, %enc_bytes, %enc_len) : (i32, memref<?xi8>, i64) -> ()
     }
-    func.call @LyBytes_DecRef(%enc_header) : (memref<2xi64>) -> ()
+    func.call @LyBytes_DecRef(%enc_header) : (memref<6xi64>) -> ()
     func.return
   }
 
   func.func @LyPosix_Rename(%src_header: memref<2xi64> {ly.ownership.object_header}, %src_bytes: memref<?xi8>, %dst_header: memref<2xi64> {ly.ownership.object_header}, %dst_bytes: memref<?xi8>) attributes {ly.runtime.builtin = "posix.rename", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.str", ly.runtime.primitive = "posix_rename", ly.runtime.result_contract = "types.NoneType"} {
     %c0 = arith.constant 0 : index
     %zero32 = arith.constant 0 : i32
-    %src_enc_header, %src_enc = func.call @LyUnicode_Encode(%src_header, %src_bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    %src_enc_header = func.call @LyUnicode_Encode(%src_header, %src_bytes) : (memref<2xi64>, memref<?xi8>) -> memref<6xi64>
+    %src_enc = func.call @__ly_bytes_payload(%src_enc_header) : (memref<6xi64>) -> memref<?xi8>
     %src_dim = memref.dim %src_enc, %c0 : memref<?xi8>
     %src_len = arith.index_cast %src_dim : index to i64
-    %dst_enc_header, %dst_enc = func.call @LyUnicode_Encode(%dst_header, %dst_bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    %dst_enc_header = func.call @LyUnicode_Encode(%dst_header, %dst_bytes) : (memref<2xi64>, memref<?xi8>) -> memref<6xi64>
+    %dst_enc = func.call @__ly_bytes_payload(%dst_enc_header) : (memref<6xi64>) -> memref<?xi8>
     %dst_dim = memref.dim %dst_enc, %c0 : memref<?xi8>
     %dst_len = arith.index_cast %dst_dim : index to i64
     %status = func.call @LyHost_Rename(%src_enc, %src_len, %dst_enc, %dst_len) : (memref<?xi8>, i64, memref<?xi8>, i64) -> i32
@@ -418,19 +426,20 @@ module attributes {
       %err = func.call @LyHost_Errno() : () -> i32
       func.call @__ly_posix_throw2(%err, %src_enc, %src_len, %dst_enc, %dst_len) : (i32, memref<?xi8>, i64, memref<?xi8>, i64) -> ()
     }
-    func.call @LyBytes_DecRef(%src_enc_header) : (memref<2xi64>) -> ()
-    func.call @LyBytes_DecRef(%dst_enc_header) : (memref<2xi64>) -> ()
+    func.call @LyBytes_DecRef(%src_enc_header) : (memref<6xi64>) -> ()
+    func.call @LyBytes_DecRef(%dst_enc_header) : (memref<6xi64>) -> ()
     func.return
   }
 
   func.func @LyPosix_Access(%path_header: memref<2xi64> {ly.ownership.object_header}, %path_bytes: memref<?xi8>, %mode: i64) -> i1 attributes {ly.runtime.builtin = "posix.access", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.str", ly.runtime.primitive = "posix_access", ly.runtime.result_contract = "builtins.bool"} {
     %c0 = arith.constant 0 : index
     %zero32 = arith.constant 0 : i32
-    %enc_header, %enc_bytes = func.call @LyUnicode_Encode(%path_header, %path_bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    %enc_header = func.call @LyUnicode_Encode(%path_header, %path_bytes) : (memref<2xi64>, memref<?xi8>) -> memref<6xi64>
+    %enc_bytes = func.call @__ly_bytes_payload(%enc_header) : (memref<6xi64>) -> memref<?xi8>
     %enc_dim = memref.dim %enc_bytes, %c0 : memref<?xi8>
     %enc_len = arith.index_cast %enc_dim : index to i64
     %status = func.call @LyHost_Access(%enc_bytes, %enc_len, %mode) : (memref<?xi8>, i64, i64) -> i32
-    func.call @LyBytes_DecRef(%enc_header) : (memref<2xi64>) -> ()
+    func.call @LyBytes_DecRef(%enc_header) : (memref<6xi64>) -> ()
     %allowed = arith.cmpi eq, %status, %zero32 : i32
     func.return %allowed : i1
   }
@@ -445,7 +454,8 @@ module attributes {
     %c10 = arith.constant 10 : index
     %zero = arith.constant 0 : i64
     %zero32 = arith.constant 0 : i32
-    %enc_header, %enc_bytes = func.call @LyUnicode_Encode(%path_header, %path_bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    %enc_header = func.call @LyUnicode_Encode(%path_header, %path_bytes) : (memref<2xi64>, memref<?xi8>) -> memref<6xi64>
+    %enc_bytes = func.call @__ly_bytes_payload(%enc_header) : (memref<6xi64>) -> memref<?xi8>
     %enc_dim = memref.dim %enc_bytes, %c0 : memref<?xi8>
     %enc_len = arith.index_cast %enc_dim : index to i64
     %fields = memref.alloc(%c10) : memref<?xi64>
@@ -457,7 +467,7 @@ module attributes {
       %rc = func.call @LyHost_LStat(%enc_bytes, %enc_len, %fields) : (memref<?xi8>, i64, memref<?xi64>) -> i32
       scf.yield %rc : i32
     }
-    func.call @LyBytes_DecRef(%enc_header) : (memref<2xi64>) -> ()
+    func.call @LyBytes_DecRef(%enc_header) : (memref<6xi64>) -> ()
     %failed = arith.cmpi ne, %status, %zero32 : i32
     %answer = scf.if %failed -> i64 {
       %err = func.call @LyHost_Errno() : () -> i32
@@ -487,7 +497,8 @@ module attributes {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
 
-    %enc_header, %enc_bytes = func.call @LyUnicode_Encode(%path_header, %path_bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    %enc_header = func.call @LyUnicode_Encode(%path_header, %path_bytes) : (memref<2xi64>, memref<?xi8>) -> memref<6xi64>
+    %enc_bytes = func.call @__ly_bytes_payload(%enc_header) : (memref<6xi64>) -> memref<?xi8>
     %enc_dim = memref.dim %enc_bytes, %c0 : memref<?xi8>
     %enc_len = arith.index_cast %enc_dim : index to i64
 
@@ -557,7 +568,7 @@ module attributes {
       memref.dealloc %name : memref<?xi8>
       %closed2 = func.call @LyHost_CloseDir(%dir2) : (i64) -> i32
     }
-    func.call @LyBytes_DecRef(%enc_header) : (memref<2xi64>) -> ()
+    func.call @LyBytes_DecRef(%enc_header) : (memref<6xi64>) -> ()
     func.return %header, %meta, %items : memref<2xi64>, memref<2xi64>, memref<?xi64>
   }
 
@@ -598,13 +609,14 @@ module attributes {
     %c1 = arith.constant 1 : index
     %one = arith.constant 1 : i64
     %zero = arith.constant 0 : i64
-    %enc_header, %enc_bytes = func.call @LyUnicode_Encode(%name_header, %name_bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    %enc_header = func.call @LyUnicode_Encode(%name_header, %name_bytes) : (memref<2xi64>, memref<?xi8>) -> memref<6xi64>
+    %enc_bytes = func.call @__ly_bytes_payload(%enc_header) : (memref<6xi64>) -> memref<?xi8>
     %enc_dim = memref.dim %enc_bytes, %c0 : memref<?xi8>
     %enc_len = arith.index_cast %enc_dim : index to i64
     %probe = memref.alloc(%c1) : memref<?xi8>
     %len = func.call @LyHost_GetEnv(%enc_bytes, %enc_len, %probe, %zero) : (memref<?xi8>, i64, memref<?xi8>, i64) -> i64
     memref.dealloc %probe : memref<?xi8>
-    func.call @LyBytes_DecRef(%enc_header) : (memref<2xi64>) -> ()
+    func.call @LyBytes_DecRef(%enc_header) : (memref<6xi64>) -> ()
     %present = arith.cmpi sge, %len, %zero : i64
     func.return %present : i1
   }
@@ -614,12 +626,13 @@ module attributes {
     %zero = arith.constant 0 : i64
     %cap_index = arith.constant 4096 : index
     %cap = arith.constant 4096 : i64
-    %enc_header, %enc_bytes = func.call @LyUnicode_Encode(%name_header, %name_bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    %enc_header = func.call @LyUnicode_Encode(%name_header, %name_bytes) : (memref<2xi64>, memref<?xi8>) -> memref<6xi64>
+    %enc_bytes = func.call @__ly_bytes_payload(%enc_header) : (memref<6xi64>) -> memref<?xi8>
     %enc_dim = memref.dim %enc_bytes, %c0 : memref<?xi8>
     %enc_len = arith.index_cast %enc_dim : index to i64
     %buffer = memref.alloc(%cap_index) : memref<?xi8>
     %len = func.call @LyHost_GetEnv(%enc_bytes, %enc_len, %buffer, %cap) : (memref<?xi8>, i64, memref<?xi8>, i64) -> i64
-    func.call @LyBytes_DecRef(%enc_header) : (memref<2xi64>) -> ()
+    func.call @LyBytes_DecRef(%enc_header) : (memref<6xi64>) -> ()
     %clamped_high = arith.minsi %len, %cap : i64
     %clamped = arith.maxsi %clamped_high, %zero : i64
     %out_header, %out_bytes = func.call @LyUnicode_FromBytes(%buffer, %c0, %clamped) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
@@ -630,10 +643,12 @@ module attributes {
   func.func @LyPosix_PutEnv(%name_header: memref<2xi64> {ly.ownership.object_header}, %name_bytes: memref<?xi8>, %value_header: memref<2xi64> {ly.ownership.object_header}, %value_bytes: memref<?xi8>) attributes {ly.runtime.builtin = "posix.putenv", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.str", ly.runtime.primitive = "posix_putenv", ly.runtime.result_contract = "types.NoneType"} {
     %c0 = arith.constant 0 : index
     %zero32 = arith.constant 0 : i32
-    %name_enc_header, %name_enc = func.call @LyUnicode_Encode(%name_header, %name_bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    %name_enc_header = func.call @LyUnicode_Encode(%name_header, %name_bytes) : (memref<2xi64>, memref<?xi8>) -> memref<6xi64>
+    %name_enc = func.call @__ly_bytes_payload(%name_enc_header) : (memref<6xi64>) -> memref<?xi8>
     %name_dim = memref.dim %name_enc, %c0 : memref<?xi8>
     %name_len = arith.index_cast %name_dim : index to i64
-    %value_enc_header, %value_enc = func.call @LyUnicode_Encode(%value_header, %value_bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    %value_enc_header = func.call @LyUnicode_Encode(%value_header, %value_bytes) : (memref<2xi64>, memref<?xi8>) -> memref<6xi64>
+    %value_enc = func.call @__ly_bytes_payload(%value_enc_header) : (memref<6xi64>) -> memref<?xi8>
     %value_dim = memref.dim %value_enc, %c0 : memref<?xi8>
     %value_len = arith.index_cast %value_dim : index to i64
     %status = func.call @LyHost_SetEnv(%name_enc, %name_len, %value_enc, %value_len) : (memref<?xi8>, i64, memref<?xi8>, i64) -> i32
@@ -642,15 +657,16 @@ module attributes {
       %err = func.call @LyHost_Errno() : () -> i32
       func.call @__ly_posix_throw(%err, %name_enc, %name_len) : (i32, memref<?xi8>, i64) -> ()
     }
-    func.call @LyBytes_DecRef(%name_enc_header) : (memref<2xi64>) -> ()
-    func.call @LyBytes_DecRef(%value_enc_header) : (memref<2xi64>) -> ()
+    func.call @LyBytes_DecRef(%name_enc_header) : (memref<6xi64>) -> ()
+    func.call @LyBytes_DecRef(%value_enc_header) : (memref<6xi64>) -> ()
     func.return
   }
 
   func.func @LyPosix_UnsetEnv(%name_header: memref<2xi64> {ly.ownership.object_header}, %name_bytes: memref<?xi8>) attributes {ly.runtime.builtin = "posix.unsetenv", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.str", ly.runtime.primitive = "posix_unsetenv", ly.runtime.result_contract = "types.NoneType"} {
     %c0 = arith.constant 0 : index
     %zero32 = arith.constant 0 : i32
-    %enc_header, %enc_bytes = func.call @LyUnicode_Encode(%name_header, %name_bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    %enc_header = func.call @LyUnicode_Encode(%name_header, %name_bytes) : (memref<2xi64>, memref<?xi8>) -> memref<6xi64>
+    %enc_bytes = func.call @__ly_bytes_payload(%enc_header) : (memref<6xi64>) -> memref<?xi8>
     %enc_dim = memref.dim %enc_bytes, %c0 : memref<?xi8>
     %enc_len = arith.index_cast %enc_dim : index to i64
     %status = func.call @LyHost_UnsetEnv(%enc_bytes, %enc_len) : (memref<?xi8>, i64) -> i32
@@ -659,7 +675,7 @@ module attributes {
       %err = func.call @LyHost_Errno() : () -> i32
       func.call @__ly_posix_throw(%err, %enc_bytes, %enc_len) : (i32, memref<?xi8>, i64) -> ()
     }
-    func.call @LyBytes_DecRef(%enc_header) : (memref<2xi64>) -> ()
+    func.call @LyBytes_DecRef(%enc_header) : (memref<6xi64>) -> ()
     func.return
   }
 
