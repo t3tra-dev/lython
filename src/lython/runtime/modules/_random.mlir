@@ -74,8 +74,8 @@ module attributes {
   // --- shared runtime entry points -----------------------------------------
   func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 1 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
   func.func private @LyLong_AsI64(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %digits: memref<?xi32>) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__int__", ly.runtime.primitive = "unbox.i64"}
-  func.func private @LyFloat_FromF64(%value: f64 {ly.runtime.default_f64 = 0.0 : f64}) -> (memref<2xi64>, memref<1xf64>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 2 : i64, ly.runtime.contract = "builtins.float", ly.runtime.initializer = "__new__"}
-  func.func private @LyFloat_AsF64(%header: memref<2xi64> {ly.ownership.object_header}, %payload: memref<1xf64>) -> f64 attributes {ly.runtime.contract = "builtins.float", ly.runtime.method = "__float__", ly.runtime.primitive = "unbox.f64"}
+  func.func private @LyFloat_FromF64(%value: f64 {ly.runtime.default_f64 = 0.0 : f64}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 2 : i64, ly.runtime.contract = "builtins.float", ly.runtime.initializer = "__new__"}
+  func.func private @LyFloat_AsF64(%header: memref<3xi64> {ly.ownership.object_header}) -> f64 attributes {ly.runtime.contract = "builtins.float", ly.runtime.method = "__float__", ly.runtime.primitive = "unbox.f64"}
   func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 4 : i64, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
   func.func private @LyBaseException_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 5 : i64, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"}
   func.func private @LyBaseException_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0, 3], ly.runtime.contract = "builtins.BaseException", ly.runtime.method = "__init__", ly.runtime.result_evidence = "receiver"}
@@ -372,7 +372,7 @@ module attributes {
   }
 
   // CPython's random_random: two draws, 53 bits of mantissa.
-  func.func @LyRandom_Random() -> (memref<2xi64>, memref<1xf64>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_random.random", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "random_random", ly.runtime.result_contract = "builtins.float"} {
+  func.func @LyRandom_Random() -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_random.random", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "random_random", ly.runtime.result_contract = "builtins.float"} {
     %five = arith.constant 5 : i64
     %six = arith.constant 6 : i64
     %scale_a = arith.constant 67108864.0 : f64
@@ -386,8 +386,8 @@ module attributes {
     %scaled = arith.mulf %a_f, %scale_a : f64
     %summed = arith.addf %scaled, %b_f : f64
     %value = arith.divf %summed, %scale_all : f64
-    %h, %p = func.call @LyFloat_FromF64(%value) : (f64) -> (memref<2xi64>, memref<1xf64>)
-    func.return %h, %p : memref<2xi64>, memref<1xf64>
+    %h = func.call @LyFloat_FromF64(%value) : (f64) -> memref<3xi64>
+    func.return %h : memref<3xi64>
   }
 
   // CPython's random_getrandbits, bounded to the signed 64-bit lane: the low
@@ -513,7 +513,7 @@ module attributes {
   // The cached second Box-Muller deviate. NaN means "nothing cached", which is
   // how random.py avoids needing an Optional[float] across the boundary; a
   // real deviate is never NaN.
-  func.func @LyRandom_GaussTake() -> (memref<2xi64>, memref<1xf64>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_random.gauss_take", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "random_gauss_take", ly.runtime.result_contract = "builtins.float"} {
+  func.func @LyRandom_GaussTake() -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_random.gauss_take", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "random_gauss_take", ly.runtime.result_contract = "builtins.float"} {
     %zero = arith.constant 0 : i64
     %nan = arith.constant 0x7FF8000000000000 : f64
     %has_slot = arith.constant 626 : index
@@ -529,15 +529,15 @@ module attributes {
     } else {
       scf.yield %nan : f64
     }
-    %h, %p = func.call @LyFloat_FromF64(%value) : (f64) -> (memref<2xi64>, memref<1xf64>)
-    func.return %h, %p : memref<2xi64>, memref<1xf64>
+    %h = func.call @LyFloat_FromF64(%value) : (f64) -> memref<3xi64>
+    func.return %h : memref<3xi64>
   }
 
-  func.func @LyRandom_GaussPut(%header: memref<2xi64> {ly.ownership.object_header}, %payload: memref<1xf64>) attributes {ly.runtime.builtin = "_random.gauss_put", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "random_gauss_put", ly.runtime.result_contract = "types.NoneType"} {
+  func.func @LyRandom_GaussPut(%header: memref<3xi64> {ly.ownership.object_header}) attributes {ly.runtime.builtin = "_random.gauss_put", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "random_gauss_put", ly.runtime.result_contract = "types.NoneType"} {
     %one = arith.constant 1 : i64
     %has_slot = arith.constant 626 : index
     %bits_slot = arith.constant 627 : index
-    %value = func.call @LyFloat_AsF64(%header, %payload) : (memref<2xi64>, memref<1xf64>) -> f64
+    %value = func.call @LyFloat_AsF64(%header) : (memref<3xi64>) -> f64
     %bits = arith.bitcast %value : f64 to i64
     %state = memref.get_global @__ly_random_state : memref<628xi64>
     memref.store %bits, %state[%bits_slot] : memref<628xi64>

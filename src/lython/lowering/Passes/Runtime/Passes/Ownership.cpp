@@ -1388,6 +1388,24 @@ bool releaseOwnedGroupByLiveness(
 // Declining it removes the destination's release too, and that is a measured
 // regression, not a conservative choice. The residual is recorded in
 // rfc/memory-safety-proof.md rather than papered over.
+//
+// Why NOT drop this predicate and narrow UNCONDITIONALLY through
+// own::spellHeaderPrefix, which is the obvious two-line reading of the emission
+// site below: measured on the one-lane float/complex/range branch, ctest went
+// 444/456 -> 453/456 -- it fixes the twelve cases the dropped retain breaks and
+// BREAKS THREE others (cross_container_box_fronted_fields, dict_key_mutation,
+// dict_key_mutation_str, all `Ly_IncRef observed non-positive refcount`), for
+// the boxing-window reason above. The predicate is what separates a one-lane
+// entity handle from a 16-word payload box; the widths alone do not.
+//
+// And why a green affine verifier is NOT evidence that this predicate is
+// unnecessary: a dropped lend belongs to the argument reconciling two groups, so
+// each group's own retain/release arithmetic still balances and nothing is
+// reported. It is observable only once a loop REACHES its release, i.e. only
+// when the loop completes. Before this predicate existed, a nested loop
+// accumulating a one-lane float printed 0.0 where CPython prints 9.0 -- silent,
+// and surviving --release. tests/golden/cases/scalar_loop_carried_mutate.py
+// pins that shape.
 bool borrowEdgeRetainIsSpellable(mlir::Value header,
                                  mlir::func::FuncOp retainFunction) {
   return mlir::isa<mlir::BlockArgument>(header) &&

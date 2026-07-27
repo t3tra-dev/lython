@@ -81,8 +81,8 @@ module attributes {
 } {
   // --- shared runtime entry points -----------------------------------------
   func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 1 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
-  func.func private @LyFloat_FromF64(%value: f64 {ly.runtime.default_f64 = 0.0 : f64}) -> (memref<2xi64>, memref<1xf64>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 2 : i64, ly.runtime.contract = "builtins.float", ly.runtime.initializer = "__new__"}
-  func.func private @LyFloat_AsF64(%header: memref<2xi64> {ly.ownership.object_header}, %payload: memref<1xf64>) -> f64 attributes {ly.runtime.contract = "builtins.float", ly.runtime.method = "__float__", ly.runtime.primitive = "unbox.f64"}
+  func.func private @LyFloat_FromF64(%value: f64 {ly.runtime.default_f64 = 0.0 : f64}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 2 : i64, ly.runtime.contract = "builtins.float", ly.runtime.initializer = "__new__"}
+  func.func private @LyFloat_AsF64(%header: memref<3xi64> {ly.ownership.object_header}) -> f64 attributes {ly.runtime.contract = "builtins.float", ly.runtime.method = "__float__", ly.runtime.primitive = "unbox.f64"}
   func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 4 : i64, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
   func.func private @LyUnicode_Encode(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> memref<6xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "encode", ly.runtime.result_contract = "builtins.bytes"}
   func.func private @LyBytes_DecRef(%header: memref<6xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.deallocator}
@@ -183,41 +183,41 @@ module attributes {
     func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
   }
 
-  func.func @LyTime_Time() -> (memref<2xi64>, memref<1xf64>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_time.time", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "time_time", ly.runtime.result_contract = "builtins.float"} {
+  func.func @LyTime_Time() -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_time.time", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "time_time", ly.runtime.result_contract = "builtins.float"} {
     %realtime = arith.constant 0 : i64
     %billion = arith.constant 1000000000.0 : f64
     %nanos = func.call @LyHost_ClockNs(%realtime) : (i64) -> i64
     %as_float = arith.sitofp %nanos : i64 to f64
     %seconds = arith.divf %as_float, %billion : f64
-    %h, %p = func.call @LyFloat_FromF64(%seconds) : (f64) -> (memref<2xi64>, memref<1xf64>)
-    func.return %h, %p : memref<2xi64>, memref<1xf64>
+    %h = func.call @LyFloat_FromF64(%seconds) : (f64) -> memref<3xi64>
+    func.return %h : memref<3xi64>
   }
 
-  func.func @LyTime_Monotonic() -> (memref<2xi64>, memref<1xf64>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_time.monotonic", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "time_monotonic", ly.runtime.result_contract = "builtins.float"} {
+  func.func @LyTime_Monotonic() -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_time.monotonic", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "time_monotonic", ly.runtime.result_contract = "builtins.float"} {
     %monotonic = arith.constant 1 : i64
     %billion = arith.constant 1000000000.0 : f64
     %nanos = func.call @LyHost_ClockNs(%monotonic) : (i64) -> i64
     %as_float = arith.sitofp %nanos : i64 to f64
     %seconds = arith.divf %as_float, %billion : f64
-    %h, %p = func.call @LyFloat_FromF64(%seconds) : (f64) -> (memref<2xi64>, memref<1xf64>)
-    func.return %h, %p : memref<2xi64>, memref<1xf64>
+    %h = func.call @LyFloat_FromF64(%seconds) : (f64) -> memref<3xi64>
+    func.return %h : memref<3xi64>
   }
 
-  func.func @LyTime_PerfCounter() -> (memref<2xi64>, memref<1xf64>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_time.perf_counter", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "time_perf_counter", ly.runtime.result_contract = "builtins.float"} {
+  func.func @LyTime_PerfCounter() -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_time.perf_counter", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "time_perf_counter", ly.runtime.result_contract = "builtins.float"} {
     %monotonic = arith.constant 1 : i64
     %billion = arith.constant 1000000000.0 : f64
     %nanos = func.call @LyHost_ClockNs(%monotonic) : (i64) -> i64
     %as_float = arith.sitofp %nanos : i64 to f64
     %seconds = arith.divf %as_float, %billion : f64
-    %h, %p = func.call @LyFloat_FromF64(%seconds) : (f64) -> (memref<2xi64>, memref<1xf64>)
-    func.return %h, %p : memref<2xi64>, memref<1xf64>
+    %h = func.call @LyFloat_FromF64(%seconds) : (f64) -> memref<3xi64>
+    func.return %h : memref<3xi64>
   }
 
-  func.func @LyTime_Sleep(%header: memref<2xi64> {ly.ownership.object_header}, %payload: memref<1xf64>) attributes {ly.runtime.builtin = "_time.sleep", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "time_sleep", ly.runtime.result_contract = "types.NoneType"} {
+  func.func @LyTime_Sleep(%header: memref<3xi64> {ly.ownership.object_header}) attributes {ly.runtime.builtin = "_time.sleep", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "time_sleep", ly.runtime.result_contract = "types.NoneType"} {
     %zero = arith.constant 0.0 : f64
     %zero32 = arith.constant 0 : i32
     %billion = arith.constant 1000000000.0 : f64
-    %seconds = func.call @LyFloat_AsF64(%header, %payload) : (memref<2xi64>, memref<1xf64>) -> f64
+    %seconds = func.call @LyFloat_AsF64(%header) : (memref<3xi64>) -> f64
     %negative = arith.cmpf olt, %seconds, %zero : f64
     scf.if %negative {
       func.call @__ly_time_raise_neg_sleep() : () -> ()
