@@ -136,6 +136,7 @@ set(LYTHON_UNIT_PATTERNS_tables
 set(LYTHON_UNIT_PATTERNS_meta
     "LayerManifestTest.*")
 set(LYTHON_UNIT_PATTERNS_lower
+    "DriverTest.AdaptsBoxedBoolToUnboxedStrInput"
     "DriverTest.BoxedContainerLoopKeepsPayloadSlotsOutOfTheLoopBody"
     "DriverTest.CompilesHelloToVerifiedLLVMIR"
     "DriverTest.ResolvesEmbeddedStdlibImports"

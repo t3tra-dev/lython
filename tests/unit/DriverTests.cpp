@@ -225,6 +225,21 @@ TEST(DriverTest, BoxedContainerLoopKeepsPayloadSlotsOutOfTheLoopBody) {
   }
 }
 
+// Reading a bool out of an erased slot yields the box, and bool.__str__ takes
+// the unboxed i1: the operand adapter has to unbox. It grew arms for i64 and
+// f64 but not i1, so `str()` and single-argument `print()` over a boxed bool
+// failed to lower. Driver-level rather than golden: what regressed was
+// lowering, and the printed value is already pinned by the many cases that
+// stringify an unboxed bool.
+TEST(DriverTest, AdaptsBoxedBoolToUnboxedStrInput) {
+  for (const char *source :
+       {"t: tuple = (\"s\", True)\nprint(t[1])\n",
+        "t: tuple = (\"s\", True)\nprint(str(t[1]), \"x\")\n"}) {
+    CompileResult result = compileSource(source);
+    EXPECT_TRUE(result.succeeded) << source << ": " << result.diagnostics;
+  }
+}
+
 TEST(DriverTest, RepeatedCompileIsStable) {
   for (int round = 0; round < 3; ++round) {
     CompileResult result = compileSource("print(40 + 2)\n");
