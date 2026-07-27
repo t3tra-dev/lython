@@ -16326,10 +16326,12 @@ module attributes {
   }
 
   // Copy `src_len` element boxes into an already-sized destination array,
-  // retaining every copied payload reference. Split out of
-  // @__ly_sequence_copy_alloc so the ONE loop serves both a lane-carrying
-  // destination (tuple/set/frozenset, whose array is a lane) and a
-  // handle-fronted one (list, whose array is reached through handle word 4).
+  // retaining every copied payload reference. One loop rather than one per
+  // container, so it serves both a lane-carrying destination (tuple/set/
+  // frozenset, whose array is a lane) and a handle-fronted one (list, whose
+  // array is reached through handle word 4). It was split out of the shared
+  // @__ly_sequence_copy_alloc, which the per-container forks have since
+  // replaced; this is the part of it that did not need forking.
   func.func private @__ly_seq_fill_copy(%dst_items: memref<?xi64>, %src_len: i64, %src_items: memref<?xi64>) {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
@@ -16348,16 +16350,6 @@ module attributes {
       func.call @__ly_handle_retain_raw(%entity) : (i64) -> ()
     }
     func.return
-  }
-
-  // Copy `count` slots from src to a fresh sequence entity of the given
-  // class, retaining every copied payload reference.
-  func.func private @__ly_sequence_copy_alloc(%class_id: i64, %src_meta: memref<2xi64>, %src_items: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0]} {
-    %c0 = arith.constant 0 : index
-    %len = memref.load %src_meta[%c0] : memref<2xi64>
-    %header, %meta, %items = func.call @__ly_sequence_alloc(%class_id, %len) : (i64, i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
-    func.call @__ly_seq_fill_copy(%items, %len, %src_items) : (memref<?xi64>, i64, memref<?xi64>) -> ()
-    func.return %header, %meta, %items : memref<2xi64>, memref<2xi64>, memref<?xi64>
   }
 
   func.func @LyList_Copy(%self: memref<9xi64> {ly.ownership.object_header}) -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.method = "copy", ly.runtime.result_contract = "builtins.list"} {
@@ -17537,37 +17529,6 @@ module attributes {
 
   func.func private @LyDict_Shape() -> memref<8xi64> attributes {ly.runtime.contract = "builtins.dict", ly.runtime.shape}
 
-  func.func private @__ly_sequence_alloc(%class_id: i64, %length: i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0]} {
-    %one = arith.constant 1 : i64
-    %minimum_capacity = arith.constant 64 : i64
-    %handle_words = arith.constant 16 : i64
-    %refcount_slot = arith.constant 0 : index
-    %layout_slot = arith.constant 1 : index
-    %length_slot = arith.constant 0 : index
-    %capacity_slot = arith.constant 1 : index
-
-    // One entity block: [0,16) header, [16,32) meta. The items array is
-    // interior growable state: allocated here, reallocated only by
-    // ensure_capacity, freed only by the deallocator.
-    %block_bytes = arith.constant 32 : index
-    %block = memref.alloc(%block_bytes) {alignment = 16 : i64} : memref<?xi8>
-    %header_offset = arith.constant 0 : index
-    %meta_offset = arith.constant 16 : index
-    %header = memref.view %block[%header_offset][] {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<?xi8> to memref<2xi64>
-    %meta = memref.view %block[%meta_offset][] : memref<?xi8> to memref<2xi64>
-    %needs_min_capacity = arith.cmpi slt, %length, %minimum_capacity : i64
-    %capacity = arith.select %needs_min_capacity, %minimum_capacity, %length : i1, i64
-    %payload_words = arith.muli %capacity, %handle_words : i64
-    %payload_words_index = arith.index_cast %payload_words : i64 to index
-    %items = memref.alloc(%payload_words_index) : memref<?xi64>
-
-    memref.store %one, %header[%refcount_slot] : memref<2xi64>
-    memref.store %class_id, %header[%layout_slot] : memref<2xi64>
-    memref.store %length, %meta[%length_slot] : memref<2xi64>
-    memref.store %capacity, %meta[%capacity_slot] : memref<2xi64>
-    func.return %header, %meta, %items : memref<2xi64>, memref<2xi64>, memref<?xi64>
-  }
-
   // ===== builtins.dict: one entity, one root =====
   //
   // The handle is `memref<8xi64>` (the same width _io's wrappers use):
@@ -17814,10 +17775,12 @@ module attributes {
   // configuration that hid a double free for `str`/`bytes`
   // (rfc/memory-safety-proof.md, `NonInstantiationIsNotConformance`).
   //
-  // Why `__ly_sequence_alloc` is FORKED rather than converted: it is shared
-  // with `set` and `frozenset`, which are being converted on another track. A
-  // fork keeps both sides buildable and the two diffs disjoint; `list` set the
-  // precedent with `__ly_list_alloc`.
+  // Why this is a FORK of the once-shared `__ly_sequence_alloc` rather than a
+  // conversion of it: `set` and `frozenset` were being converted on another
+  // track at the time, and a fork kept both sides buildable with disjoint
+  // diffs (`list` set the precedent with `__ly_list_alloc`). All five forks
+  // now exist and the shared original is deleted -- so this comment records
+  // why the duplication was accepted, not a shared function still to unify.
   func.func private @__ly_tuple_alloc(%length: i64) -> memref<14xi64> attributes {ly.ownership.owned_results = [0]} {
     %one = arith.constant 1 : i64
     %minimum_capacity = arith.constant 64 : i64
@@ -18255,40 +18218,6 @@ module attributes {
     %length_slot = arith.constant 2 : index
     %length = memref.load %self[%length_slot] : memref<8xi64>
     func.return %length : i64
-  }
-
-  func.func private @__ly_sequence_ensure_capacity(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>, %required: i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) {
-    %minimum_capacity = arith.constant 64 : i64
-    %handle_words = arith.constant 16 : i64
-    %two = arith.constant 2 : i64
-    %capacity_slot = arith.constant 1 : index
-    %lower = arith.constant 0 : index
-    %step = arith.constant 1 : index
-
-    %capacity = memref.load %meta[%capacity_slot] : memref<2xi64>
-    %needs_grow = arith.cmpi slt, %capacity, %required : i64
-    %out_header, %out_meta, %out_items = scf.if %needs_grow -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) {
-      %doubled = arith.muli %capacity, %two : i64
-      %below_min = arith.cmpi slt, %doubled, %minimum_capacity : i64
-      %base_capacity = arith.select %below_min, %minimum_capacity, %doubled : i1, i64
-      %below_required = arith.cmpi slt, %base_capacity, %required : i64
-      %new_capacity = arith.select %below_required, %required, %base_capacity : i1, i64
-      %old_words = arith.muli %capacity, %handle_words : i64
-      %new_words = arith.muli %new_capacity, %handle_words : i64
-      %old_words_index = arith.index_cast %old_words : i64 to index
-      %new_words_index = arith.index_cast %new_words : i64 to index
-      %new_items = memref.alloc(%new_words_index) : memref<?xi64>
-      scf.for %i = %lower to %old_words_index step %step {
-        %word = memref.load %items[%i] : memref<?xi64>
-        memref.store %word, %new_items[%i] : memref<?xi64>
-      }
-      memref.dealloc %items : memref<?xi64>
-      memref.store %new_capacity, %meta[%capacity_slot] : memref<2xi64>
-      scf.yield %header, %meta, %new_items : memref<2xi64>, memref<2xi64>, memref<?xi64>
-    } else {
-      scf.yield %header, %meta, %items : memref<2xi64>, memref<2xi64>, memref<?xi64>
-    }
-    func.return %out_header, %out_meta, %out_items : memref<2xi64>, memref<2xi64>, memref<?xi64>
   }
 
   // Grow the items array in place. Void and non-transferring for the same
