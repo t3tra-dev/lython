@@ -51,6 +51,29 @@ bool ownershipTransferTraceEnabled() {
   return enabled;
 }
 
+// LYTHON_ABLATE_UNWIND_DEATH_DELAY=1 restores the placement that wrote a
+// group's normal-path death release before a later call site of the same try
+// whose unwind reaches a handler-entry release of that group (see
+// `delayPastUnwindingCallSites`).
+//
+// Why an ablation switch rather than nothing: the repair is a MOVE of a release
+// within one block, so "the fix is in" is not visible in any counter -- only in
+// the IR. This hatch lets the golden sentinel (`redcheck.py --sentinel`) and the
+// LLVM-IR differential take their "before" side from the SAME binary as their
+// "after" side, which is the only way to attribute an IR change to this
+// placement rather than to a rebuild.
+//
+// Why setting it is safe to ship: it makes the compiler emit the release EARLIER,
+// which is the shape the affine verifier rejects. A mistake with this variable
+// set therefore costs a refusal, never a silently shipped double free.
+bool unwindDeathDelayEnabled() {
+  static bool enabled = [] {
+    auto value = llvm::sys::Process::GetEnv("LYTHON_ABLATE_UNWIND_DEATH_DELAY");
+    return !(value && !value->empty() && *value != "0");
+  }();
+  return enabled;
+}
+
 // A borrow edge is admitted on the promise that a retain balances the
 // destination group's release. When the retain cannot be spelled the emission
 // declines it and the promise is broken silently -- and it is silent to the
@@ -759,6 +782,75 @@ bool blockReachesAvoiding(mlir::Block *start, mlir::Block *target,
   return false;
 }
 
+// Ids of the try scopes whose handler entry is `block`, read off the block's own
+// `LyEH_TryCatchMarker(id)` calls.
+//
+// Why not `own::collectExceptionHandlerEntries`, which answers the same question
+// for a whole region: this runs once per owned group during release placement,
+// and the only blocks asked about are a terminator's own successors. A region
+// walk per group is how the sibling unwind phase became the most expensive step
+// in lowering.
+void collectHandlerEntryIds(mlir::Block *block,
+                            llvm::SmallDenseSet<std::int64_t, 2> &ids) {
+  for (mlir::Operation &op : *block) {
+    auto call = mlir::dyn_cast<mlir::func::CallOp>(&op);
+    if (!call || call.getCallee() != "LyEH_TryCatchMarker")
+      continue;
+    if (std::optional<std::int64_t> id = own::exceptionMarkerId(call))
+      ids.insert(*id);
+  }
+}
+
+// The last op in `insertAfter`'s block after which a normal-path death release
+// may be written, given that the handler entry of every id in `handlerIds`
+// releases the same group unconditionally on entry.
+//
+// A release written before a `LyEH_TryCallSiteMarker(id)`-guarded call frees the
+// token on the try path, and the unwind out of that very call then reaches the
+// handler's entry release and frees it again. `groupTokenAtPoint` cannot rescue
+// this later: it correctly reports the token NOT held at the later call site, so
+// the unwind phase adds no cleanup there and the entry release stands alone.
+// Moving the death past the last such call site keeps the token held on every
+// unwind edge into the handler, which is the condition that makes an entry
+// release sound in the first place.
+//
+// Why past the guarded CALL and not past its marker: the marker only arms the
+// call. A release between the two is still before the call that unwinds, so the
+// double free simply moves one op later -- which is why the marker-only form of
+// this delay (`releaseOwnedGroupByLiveness` below, before this shared helper
+// existed) did not repair the shape.
+//
+// Why NOT drop the handler's entry release instead and let the unwind phase
+// place per-call-site cleanups: it would work for this shape, but the entry
+// release is also what `groupUsedOnHandlerPath` reads as "the handler side owns
+// this token", so removing it moves the obligation onto a phase that can decline
+// it (`deferMarkerWiring`) and turns accepted programs into leaks. Delaying a
+// release can only ever extend a live range.
+//
+// `handlerIds` empty means no successor takes an entry release, and nothing
+// moves -- which is the common case and keeps this off every other program's IR.
+mlir::Operation *
+delayPastUnwindingCallSites(mlir::Operation *insertAfter,
+                            const llvm::SmallDenseSet<std::int64_t, 2> *handlerIds) {
+  if (handlerIds && handlerIds->empty())
+    return insertAfter;
+  mlir::Operation *last = insertAfter;
+  for (mlir::Operation *op = insertAfter->getNextNode(); op;
+       op = op->getNextNode()) {
+    auto call = mlir::dyn_cast<mlir::func::CallOp>(op);
+    if (!call || call.getCallee() != "LyEH_TryCallSiteMarker")
+      continue;
+    if (handlerIds) {
+      std::optional<std::int64_t> id = own::exceptionMarkerId(call);
+      if (!id || !handlerIds->contains(*id))
+        continue;
+    }
+    mlir::func::CallOp guarded = own::guardedCallAfterMarker(op);
+    last = guarded ? guarded.getOperation() : op;
+  }
+  return last;
+}
+
 // Release an unconditionally-owned group whose uses are confined to the
 // immediate successors of the block that defines it. This is the
 // loop-produced-value pattern: e.g. the `py.next` element is defined in the
@@ -863,10 +955,23 @@ bool insertImmediateSuccessorReleases(FuncContractCache &contracts,
         !llvm::hasSingleElement(successor->getPredecessors()))
       return false;
 
+  // A non-using successor that is a try's HANDLER entry is not reached by the
+  // CFG edge alone: every `LyEH_TryCallSiteMarker(id)`-guarded call in the
+  // sibling (try-path) successor transfers control there at runtime. Its entry
+  // release therefore also runs for unwinds that left the try path AFTER this
+  // group died there, so the try-path death has to wait for the last of them.
+  llvm::SmallDenseSet<std::int64_t, 2> entryReleaseHandlerIds;
+  for (mlir::Block *successor : successors)
+    if (!lastUser[successor])
+      collectHandlerEntryIds(successor, entryReleaseHandlerIds);
+  const llvm::SmallDenseSet<std::int64_t, 2> *unwindIds =
+      unwindDeathDelayEnabled() ? &entryReleaseHandlerIds : nullptr;
+
   for (mlir::Block *successor : successors) {
     mlir::OpBuilder builder(call.getContext());
     if (mlir::Operation *last = lastUser[successor])
-      builder.setInsertionPointAfter(last);
+      builder.setInsertionPointAfter(
+          unwindIds ? delayPastUnwindingCallSites(last, unwindIds) : last);
     else
       builder.setInsertionPointToStart(successor);
     mlir::func::CallOp::create(builder, call.getLoc(),
@@ -1320,20 +1425,31 @@ bool releaseOwnedGroupByLiveness(
   // A release placed before a later marked call site of the SAME block would
   // double-free on unwind: the handler (live on the exception edge) performs
   // its own release, but the try-path one has already run. Delay the release
-  // past the block's last marker so an unwind from any marked call in the
-  // block reaches the handler with the token intact.
+  // past the last marked CALL in the block so an unwind from any marked call in
+  // the block reaches the handler with the token intact.
+  //
+  // Why the guarded call and not the marker, which is where this stopped before:
+  // the marker only arms the call, so a release written between the two is still
+  // ahead of the unwinding call and the double free just moves one op later --
+  // measured on the shape `a = ...; try: raise ValueError(a)`, where the last
+  // marker in the block guards the raise itself.
   auto delayPastCallSiteMarkers =
       [&](mlir::Operation *insertAfter) -> mlir::Operation * {
-    mlir::Block *block = insertAfter->getBlock();
-    if (!exceptionEdges.count(block))
+    if (!unwindDeathDelayEnabled()) {
+      mlir::Block *block = insertAfter->getBlock();
+      if (!exceptionEdges.count(block))
+        return insertAfter;
+      mlir::Operation *last = insertAfter;
+      for (mlir::Operation *op = insertAfter->getNextNode(); op;
+           op = op->getNextNode())
+        if (auto call = mlir::dyn_cast<mlir::func::CallOp>(op))
+          if (call.getCallee() == "LyEH_TryCallSiteMarker")
+            last = op;
+      return last;
+    }
+    if (!exceptionEdges.count(insertAfter->getBlock()))
       return insertAfter;
-    mlir::Operation *last = insertAfter;
-    for (mlir::Operation *op = insertAfter->getNextNode(); op;
-         op = op->getNextNode())
-      if (auto call = mlir::dyn_cast<mlir::func::CallOp>(op))
-        if (call.getCallee() == "LyEH_TryCallSiteMarker")
-          last = op;
-    return last;
+    return delayPastUnwindingCallSites(insertAfter, /*handlerIds=*/nullptr);
   };
 
   for (mlir::Operation *afterOp : afterUseReleases) {

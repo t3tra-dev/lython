@@ -26,13 +26,18 @@
 # Entries are verified at configure time: naming a case that does not exist is a
 # hard error, because a stale entry would silently stop labelling anything.
 #
-# The 49 entries below were measured, not guessed: every errors/*.py was run
-# under LYTHON_PERF=1 and classified by the deepest phase the compiler reported
-# entering. Denominator 109 = 1 parse + 37 emit + 11 lower + 60 e2e, and the run
-# also re-checked each case's own .exitcode / .stdout / .stderr-re so that a case
-# failing for an unrelated reason would be reported instead of classified (0
-# such). cases/ is absent on purpose and needs no sweep: 273 of 273 carry a
-# .stdout sidecar, so every one of them must execute to produce it.
+# The entries below were measured, not guessed: every errors/*.py was run under
+# LYTHON_PERF=1 and classified by the deepest phase the compiler reported
+# entering. The sweep also re-checked each case's own .exitcode / .stdout /
+# .stderr-re so that a case failing for an unrelated reason would be reported
+# instead of classified (0 such). cases/ is absent on purpose and needs no sweep:
+# every one of the 278 carries a .stdout sidecar, so every one must execute to
+# produce it.
+#
+# The count is 48 over 108 errors/ cases (1 parse + 36 emit + 11 lower + 60 e2e).
+# It was 49 over 109: `errors/try_loop_carried_entity_rebind` moved to cases/
+# because its refusal was a false one. A stage entry disappearing is the expected
+# shape of that repair -- the case still exists, it just no longer stops early.
 errors/parse_error parse
 errors/annotation_forward_ref_complex emit
 errors/class_attr_instance_shadow_write emit
@@ -66,7 +71,6 @@ errors/prim_to_prim_float_to_int emit
 errors/property_no_setter emit
 errors/set_of_int emit
 errors/try_handler_rebind_no_lane emit
-errors/try_loop_carried_entity_rebind emit
 errors/try_union_local_rebind emit
 errors/unknown_decorator emit
 errors/unresolved_name emit
