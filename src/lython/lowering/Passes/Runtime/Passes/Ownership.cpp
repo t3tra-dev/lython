@@ -3,6 +3,7 @@
 #include "Common/PythonSourceRange.h"
 #include "Common/RuntimeSupport.h"
 #include "PyDialectTypes.h"
+#include "Runtime/ABI/EntityHeaderPrefix.h"
 #include "Runtime/Model/Contracts.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -1596,22 +1597,51 @@ bool releaseOwnedGroupByLiveness(
 // own arithmetic still balances (rfc/memory-safety-proof.md, third failure shape).
 // The recorded residual was one class too weak.
 //
-// Why this is NOT repaired by dropping the `isa<BlockArgument>` test: that is the
-// unconditional narrowing measured below to break three cases. The test is a PROXY
-// for "the handle's first two words are the refcount/class prefix", which is a
-// per-contract LAYOUT fact owned by `Passes/Runtime/ABI/` (HandleWidthRegistry,
-// ContainerLayout) and not derivable here -- a one-lane `list` handle satisfies it
-// and a 16-word payload box does not, and both are wide non-arguments. The repair
-// is that layout predicate, not a wider guess at this site.
+// ✅ REPAIRED (2026-07-28) by `entity_header::prefixIsInitializedAtDefinition`,
+// and the paragraph this replaces was WRONG about why. It said the
+// `isa<BlockArgument>` test is a proxy for "the handle's first two words are the
+// refcount/class prefix", a per-contract LAYOUT fact, and that "a one-lane `list`
+// handle satisfies it and a 16-word payload box does not".
 //
-// Why NOT drop this predicate and narrow UNCONDITIONALLY through
-// own::spellHeaderPrefix, which is the obvious two-line reading of the emission
-// site below: measured on the one-lane float/complex/range branch, ctest went
-// 444/456 -> 453/456 -- it fixes the twelve cases the dropped retain breaks and
-// BREAKS THREE others (cross_container_box_fronted_fields, dict_key_mutation,
-// dict_key_mutation_str, all `Ly_IncRef observed non-positive refcount`), for
-// the boxing-window reason above. The predicate is what separates a one-lane
-// entity handle from a 16-word payload box; the widths alone do not.
+// **A payload box does satisfy it.** `objectPayloadHandleWords`
+// (Core/CollectionPayload.cpp) writes `words[0] = refcount` and
+// `words[1] = payloadClass`. Both populations carry the prefix, so no layout
+// predicate can separate them, and neither can the widths -- `builtins.object`
+// and the payload box are both 16 (ABI/HandleWidthRegistry.h).
+//
+// What separates them is PROVENANCE, keyed over the four programs that pin the
+// two behaviours (one widened site each):
+//
+//     the retain that must exist ... memref<9xi64>  by func.call
+//     the three that must not ...... memref<16xi64> by memref.alloc
+//
+// A call result is an entity its callee finished. A `memref.alloc` result is raw
+// storage whose prefix `boxRuntimeObject` stores in the ops AFTER the alloc, so
+// the anchor is inside the initialisation window -- the boxing-window reason
+// above, now stated as the fact that decides rather than as an exception to a
+// layout rule.
+//
+// So the three cases are NOT a cost of this repair. They depend on a different
+// invariant -- "the anchor may sit at the header's definition" -- which is false
+// for raw storage, and the predicate is exactly the test for it. Measured on one
+// binary: shipped behaviour breaks the merge case and keeps the three; the naive
+// widening fixes the merge case and breaks the three (rc=134, `Ly_IncRef observed
+// non-positive refcount`); the predicate gets all four right, ctest 466/466 both
+// arms.
+//
+// The whole-corpus footprint, so the next reader does not have to re-derive it:
+// over 287 golden cases the naive widening reaches FOUR sites, three of them the
+// `memref.alloc` boxes above. The predicate newly retains exactly one --
+// `dict_iteration_views`, a `memref<8xi64>` call result -- and the
+// llvm-translation differential there is `Ly_IncRef` 106 -> 107 with EVERY
+// release symbol unchanged, which is the intended shape: the lend that was
+// missing, against a release that was already there and already unbalanced.
+//
+// Why the twelve-fixed/three-broken figure recorded here is NOT reproducible as
+// test counts on this tree: it was taken on the float/complex/range branch at
+// 444/456. On the merged tree the suite is green in the shipped arm, because no
+// case covers the merge shape -- the reason `tests/golden/cases/
+// list_merge_arg_loop_release.py` was added with the repair.
 //
 // And why a green affine verifier is NOT evidence that this predicate is
 // unnecessary: a dropped lend belongs to the argument reconciling two groups, so
@@ -1623,7 +1653,13 @@ bool releaseOwnedGroupByLiveness(
 // pins that shape.
 bool borrowEdgeRetainIsSpellable(mlir::Value header,
                                  mlir::func::FuncOp retainFunction) {
-  return mlir::isa<mlir::BlockArgument>(header) &&
+  // Why NO ablation switch for this one, unlike the rest of this file: both other
+  // readings of this predicate are known to produce a wrong RELEASE -- the shipped
+  // one over-releases the merge case, the naive one over-retains three boxing
+  // cases. `LYTHON_ABLATE_OWNERSHIP_SYMBOL_TABLE` is safe to ship because a
+  // mistake with it set costs compile time; a switch here would cost memory
+  // safety. Both arms were measured on one build and the switches removed.
+  return entity_header::prefixIsInitializedAtDefinition(header) &&
          own::canSpellHeaderPrefix(
              header.getType(), retainFunction.getFunctionType().getInput(0));
 }
