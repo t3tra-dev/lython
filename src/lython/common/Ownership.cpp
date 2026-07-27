@@ -12,6 +12,7 @@
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -23,6 +24,88 @@
 namespace py::ownership {
 
 namespace contracts = py::contracts;
+
+// Deallocator-lookup census, enabled by LYTHON_DEALLOC_CENSUS=1.
+//
+// Why NOT key the counters on `values[offset]`: an arity-1 key cannot name an
+// arity-3 tie.  The four container contracts led with `memref<2xi64>`, so a
+// census keyed on the leading value folded a 3-type tie into the width-2 bucket
+// and reported "all 119 ambiguous exits were on memref<2xi64>" when 63 of them
+// were the container tie.  The key here is the whole tied inputTypes list.
+//
+// Why NOT a compile-time flag: the ablation has to run on ONE binary, so that a
+// with/without comparison cannot be confounded by a rebuild.
+namespace {
+
+struct DeallocCensus {
+  // Keyed by the printed inputTypes list of the tied release interface.
+  llvm::StringMap<uint64_t> ambiguous;   // Ownership.cpp:419, contract-less exit
+  llvm::StringMap<uint64_t> resolved;    // contract-aware overload succeeded
+  llvm::StringMap<uint64_t> unresolved;  // callee whose owned result found none
+  uint64_t emptyName = 0;                // :429, no contract name at the call
+  uint64_t fallback = 0;                 // :450, name present but no type match
+  uint64_t contractAwareAmbiguous = 0;   // named overload tied (same contract)
+  // Times a reader that HAS a callee fell to the contract-less overload because
+  // ownedResultContractName() returned nothing.  This -- not `emptyName` -- is
+  // where GAP 1 surfaces: the contract-aware overload is never entered at all,
+  // so its `contractName.empty()` guard never runs.
+  uint64_t declaredNameAbsent = 0;
+
+  static bool enabled() {
+    static const bool on = [] {
+      const char *value = std::getenv("LYTHON_DEALLOC_CENSUS");
+      return value && value[0] == '1';
+    }();
+    return on;
+  }
+
+  ~DeallocCensus() {
+    if (!enabled())
+      return;
+    llvm::errs() << "[DEALLOC] empty_name=" << emptyName
+                 << " fallback_450=" << fallback
+                 << " contract_aware_ambiguous=" << contractAwareAmbiguous
+                 << " declared_name_absent=" << declaredNameAbsent << "\n";
+    for (auto &entry : ambiguous)
+      llvm::errs() << "[DEALLOC] ambiguous " << entry.getKey() << " = "
+                   << entry.getValue() << "\n";
+    for (auto &entry : resolved)
+      llvm::errs() << "[DEALLOC] resolved " << entry.getKey() << " = "
+                   << entry.getValue() << "\n";
+    for (auto &entry : unresolved)
+      llvm::errs() << "[DEALLOC] unresolved_callee " << entry.getKey() << " = "
+                   << entry.getValue() << "\n";
+  }
+};
+
+DeallocCensus &census() {
+  static DeallocCensus instance;
+  return instance;
+}
+
+// Which collector asked.  An ambiguous exit is only actionable by declaring a
+// contract name if the asking collector has a callee to read the name from;
+// `collectRuntimeResourceGroups` scans a bare value range and has none.
+const char *g_origin = "other";
+
+struct OriginScope {
+  const char *previous;
+  explicit OriginScope(const char *name) : previous(g_origin) {
+    g_origin = name;
+  }
+  ~OriginScope() { g_origin = previous; }
+};
+
+std::string typeListKey(llvm::ArrayRef<mlir::Type> types) {
+  std::string out;
+  llvm::raw_string_ostream os(out);
+  os << "(";
+  llvm::interleaveComma(types, os);
+  os << ")";
+  return out;
+}
+
+} // namespace
 
 bool IndexSet::contains(unsigned index) const {
   return llvm::is_contained(values, index);
@@ -416,8 +499,12 @@ findDeallocatorForValueGroup(mlir::ValueRange values, unsigned offset,
         shape == matchedShape)
       ambiguous = true;
   }
-  if (ambiguous)
+  if (ambiguous) {
+    if (DeallocCensus::enabled() && matched)
+      ++census().ambiguous[std::string(g_origin) + " " +
+                           typeListKey(matched->inputTypes)];
     return nullptr;
+  }
   return matched;
 }
 
@@ -425,8 +512,11 @@ const RuntimeDeallocator *
 findDeallocatorForValueGroup(mlir::ValueRange values, unsigned offset,
                              llvm::ArrayRef<RuntimeDeallocator> deallocators,
                              llvm::StringRef contractName) {
-  if (contractName.empty())
+  if (contractName.empty()) {
+    if (DeallocCensus::enabled())
+      ++census().emptyName;
     return findDeallocatorForValueGroup(values, offset, deallocators);
+  }
 
   const RuntimeDeallocator *matched = nullptr;
   bool ambiguous = false;
@@ -444,9 +534,18 @@ findDeallocatorForValueGroup(mlir::ValueRange values, unsigned offset,
     if (deallocator.inputTypes.size() == matched->inputTypes.size())
       ambiguous = true;
   }
-  if (matched)
+  if (matched) {
+    if (DeallocCensus::enabled()) {
+      if (ambiguous)
+        ++census().contractAwareAmbiguous;
+      else
+        ++census().resolved[contractName];
+    }
     return ambiguous ? nullptr : matched;
+  }
 
+  if (DeallocCensus::enabled())
+    ++census().fallback;
   return findDeallocatorForValueGroup(values, offset, deallocators);
 }
 
@@ -649,9 +748,34 @@ collectContractOwnedResultGroups(mlir::func::FuncOp callee,
   if (!contractAttr)
     return groups;
 
-  for (unsigned offset : contract->ownedResults.values) {
+  OriginScope originScope("siteA/contractOwnedResultGroups");
+  for (auto [contractIndex, offset] :
+       llvm::enumerate(contract->ownedResults.values)) {
+    // The declaration is the authority on WHICH entity the owned result is; the
+    // receiver contract only says whose method produced it.  For a method
+    // returning a different entity -- `LyLong_Repr` is a `builtins.int` method
+    // whose owned result is a `builtins.str` -- the receiver name selects the
+    // receiver's deallocator, and it is accepted because the release interfaces
+    // of the width-2 group are type-identical.  Measured on the tree before this
+    // change: 24 owned results, `LyLong_Repr` among them, were released through
+    // another contract's deallocator.
+    //
+    // Why NOT leave this to the sibling collector, which already reads the
+    // declared name: it runs only for offsets no group covers yet
+    // (`resourceGroupStartsAt`), and this loop has already claimed the offset
+    // under the receiver's name.  Declaring `ly.runtime.result_contract` was
+    // therefore MEASURED to be inert here -- byte-identical llvm-translation IR
+    // across 10 programs -- so the attribute could not fix mechanism (C) while
+    // the receiver name was preferred.
+    //
+    // Why NOT consult the declared name only when the receiver's deallocator
+    // fails to type-match: that keeps identity dependent on a width coincidence,
+    // which is the defect rather than a guard against it.
+    llvm::StringRef declaredName = ownedResultContractName(
+        callee, *contract, static_cast<unsigned>(contractIndex));
     const RuntimeDeallocator *deallocator = findDeallocatorForValueGroup(
-        call.getResults(), offset, deallocators, contractAttr.getValue());
+        call.getResults(), offset, deallocators,
+        declaredName.empty() ? contractAttr.getValue() : declaredName);
     if (!deallocator)
       continue;
     ResourceGroup group;
@@ -872,6 +996,7 @@ llvm::SmallVector<ResourceGroup, 8>
 collectRuntimeResourceGroups(mlir::ValueRange values,
                              llvm::ArrayRef<RuntimeDeallocator> deallocators) {
   llvm::SmallVector<ResourceGroup, 8> groups;
+  OriginScope originScope("scan/collectRuntimeResourceGroups");
   unsigned offset = 0;
   while (offset < values.size()) {
     const RuntimeDeallocator *deallocator =
@@ -1102,14 +1227,23 @@ collectOwnedCallResultGroups(mlir::ModuleOp module, mlir::func::CallOp call,
         continue;
       llvm::StringRef contractName = ownedResultContractName(
           callee, *functionContract, static_cast<unsigned>(contractIndex));
+      OriginScope originScope("sibling/callResultGroups");
+      if (DeallocCensus::enabled() && contractName.empty())
+        ++census().declaredNameAbsent;
       const RuntimeDeallocator *deallocator =
           contractName.empty()
               ? findDeallocatorForValueGroup(call.getResults(), offset,
                                              deallocators)
               : findDeallocatorForValueGroup(call.getResults(), offset,
                                              deallocators, contractName);
-      if (!deallocator)
+      if (!deallocator) {
+        // Name the callees whose owned result no lookup can resolve, as a SET.
+        // A count says how many groups went missing; only the names say which
+        // declaration would close them.
+        if (DeallocCensus::enabled())
+          ++census().unresolved[(callee ? callee.getName() : "<indirect>")];
         continue;
+      }
       ResourceGroup group;
       group.offset = offset;
       group.deallocator = deallocator;

@@ -35,6 +35,43 @@
 // before rather than after the fact.
 // ===========================================================================
 //
+// ===========================================================================
+// ⛔ AND THE "FREE LIST" WAS THE WRONG BOOKKEEPING. Measured 2026-07-28 by
+// tests/probe/tools/tiecensus.py, which reads the manifests instead of this
+// file: **5 of the 14 single-input deallocator widths are claimed by more than
+// one contract, and four contracts recorded above as converted-and-safe are in
+// a tie right now.**
+//
+//     width 8   7-way   _io.BytesIO, _io.FileIO, _io.StringIO,
+//                       _io.TextIOWrapper, asyncio.AbstractEventLoop,
+//                       **builtins.dict**, builtins.function
+//     width 5   3-way   **builtins.range**, **builtins.range_iterator**,
+//                       types.CoroutineType
+//     width 3   3-way   builtins.bool, **builtins.float**,
+//                       lyrt.ReadyIntAwaitable
+//     width 2   3-way   builtins.int, builtins.str, contextlib.nullcontext
+//     width 4   3-way   lyrt.AsyncCounter, lyrt.Counter,
+//                       lyrt.ReadyAsyncCounter
+//
+//     unique (9): list 9, set 11, frozenset 13, tuple 14, bytes 6, complex 7,
+//                 object 16, _asyncio.Future 10, types.GeneratorType 64
+//
+// This file tracked the widths I had ASSIGNED and I read that as the widths
+// that were UNIQUE. `dict`, `float`, `range` and `range_iterator` were never
+// unique; they were recorded as converted and the collision was never checked.
+//
+// Why that matters more than the bookkeeping error: **sharing a width is the
+// common case, not the exceptional one** -- 16 of 28 single-input deallocators
+// sit in a tie. So a tie is NECESSARY but NOT SUFFICIENT for the defect the
+// set/frozenset conversion fixed; that one also needed a transfer contract
+// feeding a stale lane. The four remaining ties therefore need auditing for the
+// sufficient part, and "it is in a tie, convert it" is not the conclusion.
+//
+// The census is a script and not a comment on purpose: this block was wrong for
+// as long as it was maintained by hand, and it is exactly the kind of claim
+// that reads as verified because it is written down.
+// ===========================================================================
+//
 // So: uniqueness rescues one contract when a width happens to be free. It cannot
 // be the scheme. **The scheme is that the contract-aware overload is always
 // taken, so neither `common/Ownership.cpp:429` nor `:450` -- the two paths that

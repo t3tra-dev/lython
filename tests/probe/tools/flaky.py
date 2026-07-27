@@ -51,7 +51,9 @@ def run(cmd, env_extra=None, timeout=900.0):
     if env_extra:
         env.update(env_extra)
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+        r = subprocess.run(cmd,
+                           capture_output=True, stdin=subprocess.DEVNULL,
+                           text=True, timeout=timeout,
                            env=env)
         return r.returncode, r.stdout, r.stderr
     except subprocess.TimeoutExpired:

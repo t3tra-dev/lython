@@ -363,6 +363,60 @@ TEST(DriverTest, AdaptsBoxedBoolToUnboxedStrInput) {
   }
 }
 
+// Follow a released value back to the call that produced it, past the
+// extractvalue chain that unpacks a multi-result runtime call.
+const llvm::CallBase *definingCallOf(const llvm::Value *value) {
+  while (const auto *extract = llvm::dyn_cast<llvm::ExtractValueInst>(value))
+    value = extract->getAggregateOperand();
+  return llvm::dyn_cast<llvm::CallBase>(value);
+}
+
+llvm::StringRef calleeNameOf(const llvm::CallBase &call) {
+  const llvm::Function *callee = call.getCalledFunction();
+  return callee ? callee->getName() : llvm::StringRef{};
+}
+
+// An owned result must be released by ITS OWN contract's deallocator, not by the
+// deallocator of the contract whose method produced it.  `int.__repr__` returns a
+// `builtins.str`, and before `ly.runtime.result_contract` was consulted when the
+// owned-result group is formed, the string was released through `LyLong_DecRef`
+// -- accepted only because every width-2 release body was byte-identical.
+TEST(DriverTest, IntReprStringIsReleasedByStrDeallocator) {
+  CompileResult result = compileSource("big = 2 ** 90 + 12345\n"
+                                       "print(repr(big))\n"
+                                       "print(str(big))\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  const llvm::Function *main = result.verified.llvmModule->getFunction("__main__");
+  ASSERT_NE(main, nullptr);
+
+  unsigned reprResultsReleased = 0;
+  for (const llvm::BasicBlock &block : *main) {
+    for (const llvm::Instruction &instruction : block) {
+      const auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+      if (!call)
+        continue;
+      llvm::StringRef releaseName = calleeNameOf(*call);
+      if (!releaseName.ends_with("_DecRef") || call->arg_empty())
+        continue;
+      const llvm::CallBase *producer = definingCallOf(call->getArgOperand(0));
+      if (!producer)
+        continue;
+      llvm::StringRef producerName = calleeNameOf(*producer);
+      if (producerName != "LyLong_Repr" && producerName != "LyLong_Str")
+        continue;
+      ++reprResultsReleased;
+      EXPECT_EQ(releaseName, "LyUnicode_DecRef")
+          << "the str returned by " << producerName.str()
+          << " is released through " << releaseName.str();
+    }
+  }
+  // Without this the test passes when nothing matched, which is the shape the
+  // defect itself has: no group, so no release to inspect.
+  ASSERT_GT(reprResultsReleased, 0u)
+      << "no release of an int-to-str result was found, so this test asserted "
+         "nothing";
+}
+
 TEST(DriverTest, RepeatedCompileIsStable) {
   for (int round = 0; round < 3; ++round) {
     CompileResult result = compileSource("print(40 + 2)\n");
