@@ -196,10 +196,29 @@
 //       match. Symptom: a release through another contract's deallocator, with
 //       no diagnostic.
 //       Applies to a width appearing INSIDE a multi-input release interface.
-//       NOT MEASURED -- this is read off the algebra, and this project has
-//       repeatedly found that the algebra does not tell you whether the path
-//       carries traffic (rule 8, rfc/stdlib-semantics.md). Recorded as a
-//       mechanism with the measurement outstanding.
+//
+//       ✅ NOW MEASURED (2026-07-28) AND EMPTY: 0 genuine instances.
+//       tests/probe/tools/preemption.py replays the selection loop over the
+//       manifests, because the C++ census structurally cannot count this -- the
+//       longer interface winning RESETS `ambiguous`, so a preemption leaves no
+//       trace to count. Over 1103 functions with results: 25 preemptions whose
+//       winner the callee declares (benign), 206 where the callee's contract
+//       declares no deallocator so the winner is inherited by design (exception
+//       subclasses under LyBaseException_DecRef), and 3 residual where the
+//       callee owns no declared result contract but the winner is manifestly
+//       right -- LyFutureIter_New -> _asyncio.FutureIter, LyTaskIter_New ->
+//       _asyncio.TaskIter, LyStopAsyncIteration_New -> BaseException. In all
+//       three the losers are bool/float/lyrt.ReadyIntAwaitable, i.e. the width-3
+//       tie IS on the preemption path and the longer interface that wins is the
+//       correct owner.
+//
+//       The instrument's first answer was 201 preemptions at width 3, and that
+//       was a false positive of the checker: for a genuine exception triple the
+//       leading memref<3xi64> IS the exception header, so "a shorter interface
+//       also matched" is true of every correct case. That is the same
+//       width-is-not-proof-of-kind fallacy this file documents, one level up, in
+//       the thing checking for it. Adjudicating by declaration rather than by
+//       shape is what took it to 0.
 //
 // Do not confuse (B) with a third mechanism that shares its symptom:
 //
@@ -336,6 +355,26 @@ namespace py::lowering::handle_width {
 // width (one-laning it drops its `shapeMatch` from 2 to 0 and sweeps 27 sites
 // into the eight-way `memref<2xi64>` ambiguity -- READ off the algebra, not
 // measured, and §8.3 says so).
+//
+// ⛔ Correction (2026-07-28, measured): `str` is NOT the only contract at width
+// 2 with a positive `shapeMatch`. `int`'s shape is the 3-lane
+// `(memref<2xi64>, memref<2xi64>, memref<?xi32>)`, so it scores **3** against a
+// 1-input interface -- protected more strongly than `str`'s 2. So converting
+// `int` destroys a larger score than converting `str` does, and both
+// conversions, not just `str`'s, drop into width 2's ambiguity. Whichever is
+// converted first, the other's protection is unaffected; what changes is only
+// its own.
+//
+// ✅ And the set-shaped SUFFICIENT condition is absent from every remaining tie
+// (measured 2026-07-28). What the set/frozenset defect needed on top of a shared
+// width was a **mutable interior buffer held as a separate SSA lane**, so a
+// holder could keep a lane the reallocation freed. Auditing shapes: widths 3, 4,
+// 5 and 8 members are all single-lane (`shapeTypes == inputTypes`), so no
+// interior address exists as a lane to go stale; width 2's `int` and `str` do
+// have interior lanes but are immutable, so nothing reallocates. **No member of
+// any remaining tie has both properties.** A tie is therefore necessary and not
+// sufficient, and this is the structural reason rather than an absence of
+// symptoms -- which matters, because the set defect exited 0 and was silent.
 //
 // So the interim mitigation has run out before the work has. Those three must
 // either land on a tied width and accept mechanism (A), or GAP 1 and GAP 2 must
