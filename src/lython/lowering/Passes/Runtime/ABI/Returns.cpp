@@ -1,7 +1,6 @@
 #include "Runtime/Core/Lowerer.h"
 
-#include "llvm/ADT/StringExtras.h"
-#include "llvm/Support/xxhash.h"
+#include "Runtime/ABI/ConstantData.h"
 
 namespace py::lowering {
 namespace {
@@ -27,24 +26,6 @@ mlir::Value integerConstant(mlir::OpBuilder &builder, mlir::Location loc,
   return mlir::arith::ConstantOp::create(
              builder, loc, builder.getIntegerAttr(type, value))
       .getResult();
-}
-
-// Symbol for a literal's static byte block, keyed by content so that N
-// occurrences of one literal share one global.
-//
-// Why NOT a counter or a sanitized copy of the text: a counter makes the symbol
-// depend on lowering order, and a sanitized text makes distinct literals collide
-// whenever they differ only in the characters that had to be dropped. Content
-// hash + length is order-free, and the caller still compares the stored bytes
-// before reusing a name, so a hash collision costs a suffix rather than the
-// wrong bytes.
-std::string byteBufferGlobalName(llvm::StringRef text, unsigned suffix) {
-  std::string name = "__ly_const_bytes_";
-  name += llvm::utohexstr(llvm::xxh3_64bits(text), /*LowerCase=*/true);
-  name += "_" + std::to_string(text.size());
-  if (suffix != 0)
-    name += "_" + std::to_string(suffix);
-  return name;
 }
 
 } // namespace
@@ -111,62 +92,26 @@ const RuntimeBundle *RuntimeBundleLowerer::bundleFor(mlir::Value value) const {
 
 mlir::Value RuntimeBundleLowerer::materializeByteBuffer(mlir::Location loc,
                                                         llvm::StringRef text) {
-  // Why NOT `memref.alloca` + a store per byte, which this was: an alloca
-  // outside the entry block is not `AllocaInst::isStaticAlloca()`, so LLVM
-  // lowers it to a runtime stack adjustment that is reclaimed only at function
-  // return. A `str`/`bytes` literal in a loop body therefore grew the frame once
-  // per iteration -- measured at 275,000 iterations of a 20-byte literal before
-  // the stack guard raised RecursionError, against 4,000,000 for the same loop
-  // without one.
+  // Why a shared read-only global rather than a hoisted or reused frame slot
+  // (see ABI/ConstantData.h for the storage argument): this buffer is not the
+  // object's payload, it is the argument the `__new__` initializer reads.
+  // `LyUnicode_FromBytes` and `LyBytes_FromBytes` both allocate their own
+  // payload (`__ly_unicode_alloc` / `__ly_bytes_alloc`) and copy out of here;
+  // `LyTraceback_Push` copies through `copy_i8_memref`; `LyObject_DefaultRepr`
+  // only loads. No consumer stores through the buffer or keeps the pointer, so
+  // nothing observes that two occurrences of one literal share storage.
   //
-  // Why the fix may be a shared read-only global rather than a hoisted or reused
-  // buffer: this buffer is not the object's payload, it is the argument the
-  // `__new__` initializer reads. `LyUnicode_FromBytes` and `LyBytes_FromBytes`
-  // both allocate their own payload (`__ly_unicode_alloc` / `__ly_bytes_alloc`)
-  // and copy out of here; `LyTraceback_Push` copies through `copy_i8_memref`;
-  // `LyObject_DefaultRepr` only loads. No consumer stores through the buffer or
-  // keeps the pointer, so nothing observes that two occurrences of one literal
-  // now share storage. `constant` puts it in read-only data, so a future
-  // consumer that did try to write would fault rather than corrupt a literal.
-  auto elementType = builder.getI8Type();
+  // Why the whole class and not some subset of literals: the parameter is a
+  // `StringRef`, so every byte is known here by construction. A dynamically
+  // built `str` has no path into this function -- it arrives as a
+  // (header, payload) pair from a runtime primitive.
   auto extent = static_cast<std::int64_t>(text.size());
-  auto globalType = mlir::MemRefType::get({extent}, elementType);
   llvm::SmallVector<int8_t, 32> bytes(text.bytes().begin(), text.bytes().end());
-  auto initialValue = mlir::DenseElementsAttr::get(
-      mlir::RankedTensorType::get({extent}, elementType),
+  auto elements = mlir::DenseElementsAttr::get(
+      mlir::RankedTensorType::get({extent}, builder.getI8Type()),
       llvm::ArrayRef<int8_t>(bytes));
-
-  std::string name;
-  for (unsigned suffix = 0;; ++suffix) {
-    name = byteBufferGlobalName(text, suffix);
-    // Why any symbol and not just a memref.global: a name taken by some other
-    // op is still taken, and creating a second definition of it would fail the
-    // module's symbol-table verifier rather than reuse anything.
-    mlir::Operation *existing = module.lookupSymbol(name);
-    if (!existing) {
-      mlir::OpBuilder::InsertionGuard guard(builder);
-      builder.setInsertionPointToStart(module.getBody());
-      mlir::memref::GlobalOp::create(builder, loc, name,
-                                     builder.getStringAttr("private"),
-                                     globalType, initialValue,
-                                     /*constant=*/true, /*alignment=*/nullptr);
-      break;
-    }
-    auto reusable = mlir::dyn_cast<mlir::memref::GlobalOp>(existing);
-    if (reusable && reusable.getConstant() &&
-        reusable.getType() == globalType &&
-        reusable.getInitialValueAttr() == initialValue)
-      break;
-    // Same name, different bytes: take the next suffix rather than the block.
-  }
-
-  mlir::Value global =
-      mlir::memref::GetGlobalOp::create(builder, loc, globalType, name)
-          .getResult();
-  auto dynamicType =
-      mlir::MemRefType::get({mlir::ShapedType::kDynamic}, elementType);
-  return mlir::memref::CastOp::create(builder, loc, dynamicType, global)
-      .getResult();
+  return constant_data::internReadOnlyBlock(module, builder, loc, "bytes", text,
+                                            elements);
 }
 
 mlir::func::CallOp
