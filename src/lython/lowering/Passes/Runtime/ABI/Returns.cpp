@@ -1,5 +1,7 @@
 #include "Runtime/Core/Lowerer.h"
 
+#include "Runtime/ABI/ConstantData.h"
+
 namespace py::lowering {
 namespace {
 
@@ -90,27 +92,26 @@ const RuntimeBundle *RuntimeBundleLowerer::bundleFor(mlir::Value value) const {
 
 mlir::Value RuntimeBundleLowerer::materializeByteBuffer(mlir::Location loc,
                                                         llvm::StringRef text) {
-  mlir::Value dynamicSize =
-      mlir::arith::ConstantIndexOp::create(
-          builder, loc, static_cast<std::int64_t>(text.size()))
-          .getResult();
-  auto memrefType =
-      mlir::MemRefType::get({mlir::ShapedType::kDynamic}, builder.getI8Type());
-  mlir::Value buffer =
-      mlir::memref::AllocaOp::create(builder, loc, memrefType,
-                                     mlir::ValueRange{dynamicSize})
-          .getResult();
-  for (auto [index, byte] : llvm::enumerate(text.bytes())) {
-    mlir::Value position = mlir::arith::ConstantIndexOp::create(
-                               builder, loc, static_cast<std::int64_t>(index))
-                               .getResult();
-    mlir::Value value = mlir::arith::ConstantIntOp::create(
-                            builder, loc, static_cast<std::int64_t>(byte), 8)
-                            .getResult();
-    mlir::memref::StoreOp::create(builder, loc, value, buffer,
-                                  mlir::ValueRange{position});
-  }
-  return buffer;
+  // Why a shared read-only global rather than a hoisted or reused frame slot
+  // (see ABI/ConstantData.h for the storage argument): this buffer is not the
+  // object's payload, it is the argument the `__new__` initializer reads.
+  // `LyUnicode_FromBytes` and `LyBytes_FromBytes` both allocate their own
+  // payload (`__ly_unicode_alloc` / `__ly_bytes_alloc`) and copy out of here;
+  // `LyTraceback_Push` copies through `copy_i8_memref`; `LyObject_DefaultRepr`
+  // only loads. No consumer stores through the buffer or keeps the pointer, so
+  // nothing observes that two occurrences of one literal share storage.
+  //
+  // Why the whole class and not some subset of literals: the parameter is a
+  // `StringRef`, so every byte is known here by construction. A dynamically
+  // built `str` has no path into this function -- it arrives as a
+  // (header, payload) pair from a runtime primitive.
+  auto extent = static_cast<std::int64_t>(text.size());
+  llvm::SmallVector<int8_t, 32> bytes(text.bytes().begin(), text.bytes().end());
+  auto elements = mlir::DenseElementsAttr::get(
+      mlir::RankedTensorType::get({extent}, builder.getI8Type()),
+      llvm::ArrayRef<int8_t>(bytes));
+  return constant_data::internReadOnlyBlock(module, builder, loc, "bytes", text,
+                                            elements);
 }
 
 mlir::func::CallOp

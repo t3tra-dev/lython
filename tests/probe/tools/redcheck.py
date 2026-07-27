@@ -70,23 +70,18 @@ def main():
     args = ap.parse_args()
     old = args.old_binary.resolve()
 
-    # A sentinel path that does not exist makes the compiler exit non-zero with
-    # "could not open input file", which is indistinguishable here from the
-    # defect firing -- so a typo in --sentinel used to satisfy the very guard
-    # that exists to catch a wrong binary, and every RED/GREEN below it inherited
-    # that. Refuse instead of answering.
-    #
-    # Why NOT just look for "could not open input file" in the output: that
-    # checks the message this compiler happens to print today, on the arm where
-    # the harness is already confused about what it ran. Asking the filesystem
-    # whether the input exists is the same question one layer earlier, where it
-    # is decidable without trusting the thing under test.
-    if not args.sentinel.is_file():
-        print(f"SENTINEL NOT A FILE: {args.sentinel}", file=sys.stderr)
-        print("--sentinel takes a PATH to a program, not a case name. A missing "
-              "path would fail for the wrong reason and silently validate the "
-              "binary.", file=sys.stderr)
-        return 2
+    # Why check existence instead of letting the run report it: a missing file
+    # makes lyc exit non-zero with "could not open input file", which this tool
+    # then reads as the defect firing and prints "binary usable". A typo in the
+    # --sentinel path would satisfy the one guard that exists to catch a wrong
+    # binary. The sentinel must fail BY EXHIBITING THE DEFECT, so anything that
+    # fails before the compiler sees a program has to abort instead.
+    for label, path in (("--sentinel", args.sentinel),
+                        ("old_binary", old),
+                        ("cases", args.cases)):
+        if not path.exists():
+            print(f"{label} does not exist: {path}", file=sys.stderr)
+            return 2
 
     rc, out, err = run(old, args.sentinel)
     if rc == 0:

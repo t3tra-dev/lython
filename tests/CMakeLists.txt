@@ -136,11 +136,15 @@ set(LYTHON_UNIT_PATTERNS_tables
 set(LYTHON_UNIT_PATTERNS_meta
     "LayerManifestTest.*")
 set(LYTHON_UNIT_PATTERNS_lower
+    "DriverTest.AdaptsBoxedBoolToUnboxedStrInput"
     "DriverTest.BoxedContainerLoopKeepsPayloadSlotsOutOfTheLoopBody"
+    "DriverTest.StringAndBytesLiteralsInALoopStayOutOfTheFrame"
+    "DriverTest.BigIntLiteralInALoopStaysOutOfTheFrame"
     "DriverTest.CompilesHelloToVerifiedLLVMIR"
     "DriverTest.ResolvesEmbeddedStdlibImports"
     "DriverTest.CompilesUnevenMatmulForEveryTensorTarget"
     "DriverTest.CompilesF64MatmulWithAndWithoutSMEF64"
+    "DriverTest.IntReprStringIsReleasedByStrDeallocator"
     "DriverTest.RepeatedCompileIsStable")
 
 set(LYTHON_UNIT_LABELS_parse  "parse;unit;fast")

@@ -78,11 +78,19 @@ try:
 except ValueError as e:
     # Deliberately three statements rather than `print(e.args, len(e.args),
     # e.args[0])`. That one-line form renders e.args[0] as `'boom'` instead of
-    # `boom` -- a str element of an exception's args tuple taking the repr hook
-    # when it is not the first argument to print. It reproduces IDENTICALLY on
-    # main with tuple at three lanes, so it is pre-existing and not this
-    # conversion's; it is left out rather than pinned, because a golden case
-    # that encodes it would make the bug a requirement.
+    # `boom`. The axis is arity, not position: `print(1, e.args[0])` is wrong
+    # too, and `print(e.args[0])` is right. Multi-argument print stringifies
+    # each argument statically and admits __str__ only for the exception
+    # taxonomy, so an object-typed slot falls to __repr__; single-argument print
+    # dispatches through the manifest and reaches object.__str__. Widening that
+    # gate to admit object is measured WRONG -- it turns 7 of 13 payload classes
+    # into compile errors, because the erased __str__ call is then specialized
+    # to the payload contract and list/dict/set/frozenset/tuple/range/NoneType
+    # have no __str__ to specialize to. The repair is to stop specializing, not
+    # to widen the gate. It reproduces IDENTICALLY on main with tuple at three
+    # lanes, so it is pre-existing and not this conversion's; it is left out
+    # rather than pinned, because a golden case that encodes it would make the
+    # bug a requirement.
     print(e.args)
     print(len(e.args))
     print(e.args[0])

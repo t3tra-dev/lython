@@ -264,6 +264,28 @@ mlir::LogicalResult RuntimeBundleLowerer::appendRuntimeSource(
     }
   }
 
+  if (expected.isInteger(1)) {
+    // bool spells its primitive "unbox", not "unbox.i1" -- there is only one
+    // unboxing for it, so the width suffix that disambiguates int's i64/f64
+    // pair would have nothing to disambiguate. Adapting here rather than adding
+    // a boxed __str__ to the manifest: bool already carries boxed __repr__ and
+    // __hash__ overloads that open-code this same unbox, so a third would
+    // spread one ABI fact over three sites instead of teaching the adapter the
+    // i1 arm it was missing next to i64 and f64.
+    std::optional<RuntimeSymbol> unbox =
+        manifest.primitive(source.contractName(), "unbox");
+    if (unbox) {
+      mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+          op->getLoc(), *unbox, sourceValues);
+      if (call.getNumResults() == 1 &&
+          call.getResult(0).getType() == expected) {
+        operands.push_back(call.getResult(0));
+        ++inputIndex;
+        return mlir::success();
+      }
+    }
+  }
+
   if (expected == builder.getF64Type()) {
     std::optional<RuntimeSymbol> unbox =
         manifest.primitive(source.contractName(), "unbox.f64");
