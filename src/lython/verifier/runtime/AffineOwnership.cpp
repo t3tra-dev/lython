@@ -44,6 +44,63 @@ using own::groupContainsOperand;
 using own::remapGroupThroughValueMapping;
 using own::returnTransfersGroup;
 
+// Env-gated trace of the path walk's STALE set: which name a rejected
+// release/transfer named, and where that name is defined.
+//
+// Why NOT read it off the diagnostic instead: the diagnostic names the PRODUCER
+// of the tracked resource, which for a construction inside a loop body is the
+// same symbol on every iteration. It cannot separate "this program really
+// consumes a moved token" from "the walk carried a stale name across a back edge
+// past the op that rebinds it", and those two want opposite repairs.
+bool ownershipStaleTraceEnabled() {
+  static const bool enabled =
+      std::getenv("LYTHON_OWNERSHIP_TRACE_STALE") != nullptr;
+  return enabled;
+}
+
+// A/B escape hatch for the rebind rule below, in the same spirit as
+// LYTHON_OWNERSHIP_NO_LANE_ADVANCE: it lets `redcheck.py --sentinel` take its
+// "before" side from the SAME binary as its "after" side, so a GREEN verdict
+// cannot come from a build pointed at the wrong tree. Not a supported
+// configuration -- with it set, an ordinary rebind inside a loop is refused.
+bool staleRebindDropDisabled() {
+  static const bool disabled =
+      std::getenv("LYTHON_ABLATE_STALE_REBIND") != nullptr;
+  return disabled;
+}
+
+// `^bbN` as the IR printer numbers it, so a trace line can be matched against a
+// LYTHON_IR_DUMP listing by eye.
+unsigned blockOrdinal(mlir::Block *block) {
+  if (!block || !block->getParent())
+    return 0;
+  unsigned index = 0;
+  for (mlir::Block &candidate : *block->getParent()) {
+    if (&candidate == block)
+      break;
+    ++index;
+  }
+  return index;
+}
+
+void traceStaleValue(llvm::StringRef event, mlir::Value value,
+                     mlir::Block *pathBlock) {
+  if (!ownershipStaleTraceEnabled())
+    return;
+  llvm::errs() << "[ownership-stale] " << event << ": ";
+  if (auto argument = mlir::dyn_cast<mlir::BlockArgument>(value))
+    llvm::errs() << "block argument " << argument.getArgNumber() << " of ^bb"
+                 << blockOrdinal(argument.getOwner());
+  else if (mlir::Operation *definition = value.getDefiningOp()) {
+    llvm::errs() << definition->getName();
+    if (auto call = mlir::dyn_cast<mlir::func::CallOp>(definition))
+      llvm::errs() << " @" << call.getCallee();
+    llvm::errs() << " in ^bb" << blockOrdinal(definition->getBlock());
+  } else {
+    llvm::errs() << "<unknown>";
+  }
+  llvm::errs() << ", path at ^bb" << blockOrdinal(pathBlock) << "\n";
+}
 
 bool returnCarriesGroupInsideOwnedAggregate(
     mlir::func::FuncOp function, mlir::func::ReturnOp ret,
@@ -1869,6 +1926,34 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
 
     mlir::Operation *op = state.start;
     while (op) {
+      // Executing an op REBINDS its results. A stale name among them was the
+      // previous execution's moved token; this execution's value is a fresh
+      // resource carrying a token of its own, so the name stops being stale
+      // here.
+      //
+      // The forwarding edge already drops stale names that are block ARGUMENTS
+      // of the block being entered, for exactly this reason. But naming one kind
+      // of rebinding is not the same as asking which rebindings happen: a
+      // construction inside a loop BODY is rebound by an op, so its stale entry
+      // used to ride the back edge and then match the very call that had made it
+      // stale. `cur = ValueError(...)` inside a loop was refused on that path
+      // while the inserted releases were in fact balanced -- measured: correct
+      // output, flat RSS across 400k iterations, clean under libgmalloc in both
+      // guard orders.
+      //
+      // Why NOT drop at the edge by asking which ops the successor can reach:
+      // reachability is not execution. A name whose defining op is merely
+      // reachable has not been rebound yet, and dropping it there would lose the
+      // straight-line double-consume this set exists to catch. Dropping at the
+      // op asks the same question where it is decidable.
+      if (!state.stale.empty() && op->getNumResults() != 0 &&
+          !staleRebindDropDisabled())
+        llvm::erase_if(state.stale, [&](mlir::Value value) {
+          if (value.getDefiningOp() != op)
+            return false;
+          traceStaleValue("rebound", value, state.block);
+          return true;
+        });
       if (auto ret = mlir::dyn_cast<mlir::func::ReturnOp>(op)) {
         bool consumes = returnConsumesGroup(contracts, resource.function, ret, state.group,
                                             deallocators, aliases);
@@ -2011,14 +2096,18 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
           op = op->getNextNode();
           continue;
         }
-        if (mentionsTracked &&
-            callConsumesStaleValue(contracts, call, state.stale, state.group,
-                                   aliases))
+        if (mlir::Value consumedStale =
+                mentionsTracked
+                    ? callConsumesStaleValue(contracts, call, state.stale,
+                                             state.group, aliases)
+                    : mlir::Value()) {
+          traceStaleValue("consumed", consumedStale, state.block);
           return call.emitError()
                  << "owned resource from " << resource.producerLabel
                  << " result " << resource.resultOffset
                  << " is released through a value already consumed by an "
                     "ownership transfer";
+        }
         bool consumes = mentionsTracked &&
                         callConsumesGroup(contracts, call, state.group, aliases);
         // A release through PRE-RENAME names of the current group cancels an

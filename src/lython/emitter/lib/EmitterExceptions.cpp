@@ -595,14 +595,39 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
       if (isMutableContainerContract(content) && augAssignTargets.contains(name))
         continue;
       // A loop-carried local arrives as a loop block argument, and moving that
-      // incarnation's token into an aggregate slot inside the same iteration
-      // is mis-tracked downstream: the release insertion accepts it and the
-      // program then double-frees (a segfault, not a diagnostic). Until that
-      // hole is closed the name keeps the post-try result lanes, which handle
-      // the loop shape. Detected by name against every enclosing loop's
-      // carried set rather than by asking whether the value is a BlockArgument,
-      // because a promoted name is re-bound to the cell before the next
-      // enclosing try sees it.
+      // incarnation's token into an aggregate slot inside the same iteration is
+      // mis-tracked downstream. Until that hole is closed the name keeps the
+      // post-try result lanes, which handle the loop shape. Detected by name
+      // against every enclosing loop's carried set rather than by asking whether
+      // the value is a BlockArgument, because a promoted name is re-bound to the
+      // cell before the next enclosing try sees it.
+      //
+      // What the promotion actually does, measured on 13b0c69 by letting it run
+      // for `errors/try_loop_carried_entity_rebind` (`kept = e` under a loop):
+      // the module is REFUSED, rc=1, `released owned resource from
+      // builtin.unrealized_conversion_cast is used after release` -- the
+      // premature-release shape, from the affine verifier. So this bail is still
+      // load-bearing, and that is its surviving reason.
+      //
+      // Two claims that used to sit here are withdrawn, because the same run
+      // contradicts them. The promoted form does NOT segfault under --release: it
+      // prints CPython's answer on 20/20 plain runs, is clean under libgmalloc in
+      // both guard orders and under MallocScribble/MallocPreScribble, and leaks
+      // nothing measurable (peak RSS at 8,000 iterations scatters around peak RSS
+      // at 200 across three rounds, sometimes lower). The premature release is
+      // therefore LATENT here rather than firing, which is a weaker claim than
+      // "double-frees" and the one the evidence supports. And the second reason
+      // this bail once cited -- that the ownership verifier refuses the same
+      // spelling anyway -- was retired: that refusal was in part a false positive
+      // of the walk's stale set, fixed in 13b0c69.
+      //
+      // Why there is no env hatch to re-run that measurement: it would have to
+      // make the compiler ACCEPT a form it has just refused as a premature
+      // release, and a switch whose failure mode is a shipped use-after-free is
+      // not worth its convenience. The ablation switches this tree does keep
+      // (LYTHON_ABLATE_STALE_REBIND, LYTHON_OWNERSHIP_NO_LANE_ADVANCE) either
+      // observe or make the compiler stricter, so a mistake with one set costs a
+      // false rejection. Re-measure by patching this bail out locally instead.
       bool loopCarried = false;
       for (const LoopControlContext &context : loopControlContexts)
         for (const CarriedLoopLocal &carried : context.carriedLocals)
@@ -611,12 +636,11 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
       if (loopCarried) {
         // ... but with no lane able to carry the value either, the two
         // channels' exclusions meet and the rebind reaches nothing. Why say it
-        // here when the pipeline already refuses the exception-entity spelling:
-        // what refuses it is the ownership verifier, over a loop-carried
-        // exception local that a `raise` alone is enough to produce, and
-        // --release turns the verifiers off -- measured there as a SIGSEGV in
-        // the JIT. A diagnostic answers the same way in both configurations,
-        // and names the local instead of a runtime symbol.
+        // here when the pipeline refuses the promoted form anyway (see above):
+        // the pipeline's refusal names `builtin.unrealized_conversion_cast`,
+        // which tells the author nothing about their program, and it arrives from
+        // a verifier that `--release` turns off. This diagnostic names the local
+        // and the two ways out, and it is emitted in both configurations.
         if (!postTryLaneCarrierType(content))
           diagnostics.push_back(parser::Diagnostic{
               parser::Severity::Error, statement.range.start,

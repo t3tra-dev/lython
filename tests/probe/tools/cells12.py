@@ -55,6 +55,9 @@ import tempfile
 import textwrap
 from collections import Counter
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import quietload  # noqa: E402  (same directory, resolved above)
+
 CPY = "/opt/homebrew/Frameworks/Python.framework/Versions/3.14/bin/python3.14"
 GM = dict(DYLD_INSERT_LIBRARIES="/usr/lib/libgmalloc.dylib",
           MALLOC_PROTECT_BEFORE="1", MALLOC_FILL_SPACE="1")
@@ -197,8 +200,19 @@ def main():
     ap.add_argument("--realloc", action="store_true",
                     help="fill the container to capacity so the read "
                          "direction's mutation has to reallocate")
+    ap.add_argument("--wait-load", type=float, default=None, metavar="N",
+                    help="block until the 1-minute load average is under N "
+                         "before measuring (see quietload.py: this grid has "
+                         "twice reported a false unfilled cell under load)")
     args = ap.parse_args()
     lyc = args.lyc.resolve()
+
+    if args.wait_load is not None:
+        if not quietload.wait_for_quiet(args.wait_load,
+                                        log=lambda m: print(m, flush=True)):
+            print("refusing to measure under load", file=sys.stderr)
+            return 99
+    load_before = quietload.load_note()
 
     tmp = args.keep or pathlib.Path(tempfile.mkdtemp(prefix="cells12-"))
     tmp.mkdir(parents=True, exist_ok=True)
@@ -238,6 +252,21 @@ def main():
               f"{str(faces):38} {gm:8} {'YES' if filled else 'no'}")
     filled_n = sum(1 for r in rows if r[6])
     print(f"\nfilled {filled_n}/12")
+    # Beside the result, not only before it: an unfilled cell here is read as a
+    # regression in whatever change is being measured, and the first question is
+    # whether the machine was busy. Printing both ends lets a reader answer that
+    # from the output instead of trusting that the gate held for the whole run.
+    #
+    # Read them differently, because they do not mean the same thing. "At start"
+    # is the contention check -- taken before this grid has spawned anything, so it
+    # is other people's load. "At end" INCLUDES this grid's own `lyc` runs, which
+    # are multithreaded (LYTHON_NUM_THREADS defaults to 4), so a figure around 8
+    # there is self-load and not evidence of a busy machine. What "at end" is good
+    # for is contention that ARRIVED mid-run: compare its 5m/15m against the
+    # starting ones, and suspect the run only if they climbed by more than this
+    # grid could account for on its own.
+    print(f"at start (other load): {load_before}")
+    print(f"at end (incl. own):    {quietload.load_note()}")
     if args.keep is None:
         shutil.rmtree(tmp, ignore_errors=True)
     else:
