@@ -167,7 +167,17 @@ mlir::Value sizeWordForPhysicalValue(mlir::OpBuilder &builder,
     return zero;
   if (memref.hasStaticShape())
     return constantI64(builder, loc, memref.getDimSize(0));
-  mlir::Value dim = mlir::memref::DimOp::create(builder, loc, value, 0);
+  // Why NOT memref.dim: it has a constant-index fast path but was measured not
+  // to take it from here -- the emitted LLVM spilled the descriptor's whole
+  // size array to an `llvm.alloca` and reloaded one word from it. Beside a
+  // query inside a loop that is a fresh dynamic stack allocation per iteration
+  // (the frame-growth defect the payload boxes had, one order of magnitude
+  // smaller). Why this op instead: its `sizes` result lowers to a static
+  // `extractvalue`, with no index operand whose constness has to survive.
+  mlir::Value dim =
+      mlir::memref::ExtractStridedMetadataOp::create(builder, loc, value)
+          .getSizes()
+          .front();
   return mlir::arith::IndexCastOp::create(builder, loc, builder.getI64Type(),
                                           dim)
       .getResult();

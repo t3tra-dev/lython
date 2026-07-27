@@ -170,14 +170,26 @@ RuntimeBundleLowerer::boundMethodArgumentValue(py::CallOp op,
 }
 
 // Materialize a transient 16-word box holding `source`'s payload handle words.
+//
+// The slot lives in the entry block (box_abi::allocaBoxWords) while the stores
+// stay at `op`. Why that is not stale-value reuse when `op` is inside a loop:
+// `objectPayloadHandleWords` returns exactly kWordsPerBox words and every one of
+// them is stored below, so each execution overwrites the whole slot before the
+// call that reads it, and no execution reads a word an earlier one wrote. Every
+// `*_box` runtime primitive copies the words out or hashes them under the call;
+// none retains the pointer (`LyObject_Touch` only pins liveness), so the slot is
+// dead again at the call's return.
 mlir::FailureOr<mlir::Value>
 RuntimeBundleLowerer::transientPayloadBox(mlir::Operation *op,
                                           const RuntimeBundle &payload,
                                           bool ownsPayload) {
   mlir::Location loc = op->getLoc();
-  mlir::MemRefType boxType = box_abi::boxWordsType(builder);
-  mlir::Value box =
-      mlir::memref::AllocaOp::create(builder, loc, boxType).getResult();
+  // Why NOT rely on the caller's insertion point: `allocaBoxWords` reads it to
+  // find the function whose entry block gets the slot, and a caller that
+  // returned early from a materialization step can leave it pointing into a
+  // previously-lowered function, which would hoist the slot out of scope.
+  builder.setInsertionPoint(op);
+  mlir::Value box = box_abi::allocaBoxWords(builder, loc);
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
       RuntimeBundleLowerer::objectPayloadHandleWords(op, payload, ownsPayload);
   if (mlir::failed(words))
@@ -528,20 +540,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
         return mlir::failure();
       auto transientBox =
           [&](const RuntimeBundle &bundle) -> mlir::FailureOr<mlir::Value> {
-        mlir::MemRefType boxType = box_abi::boxWordsType(builder);
-        mlir::Value box =
-            mlir::memref::AllocaOp::create(builder, loc, boxType).getResult();
-        mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
-            RuntimeBundleLowerer::objectPayloadHandleWords(
-                op, bundle, /*ownsPayload=*/false);
-        if (mlir::failed(words))
-          return mlir::failure();
-        for (auto [wordIndex, word] : llvm::enumerate(*words)) {
-          mlir::Value slot = mlir::arith::ConstantIndexOp::create(
-              builder, loc, static_cast<std::int64_t>(wordIndex));
-          mlir::memref::StoreOp::create(builder, loc, word, box, slot);
-        }
-        return box;
+        return RuntimeBundleLowerer::transientPayloadBox(op, bundle,
+                                                         /*ownsPayload=*/false);
       };
       mlir::FailureOr<mlir::Value> keyBox = transientBox(*payloadKey);
       if (mlir::failed(keyBox))
@@ -809,22 +809,14 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
           RuntimeBundleLowerer::materializePayloadObjectBundle(op, *sources[1]);
       if (mlir::failed(payload))
         return mlir::failure();
-      mlir::MemRefType boxType = box_abi::boxWordsType(builder);
-      mlir::Value box =
-          mlir::memref::AllocaOp::create(builder, loc, boxType).getResult();
-      mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
-          RuntimeBundleLowerer::objectPayloadHandleWords(op, *payload,
-                                                         /*ownsPayload=*/false);
-      if (mlir::failed(words))
+      mlir::FailureOr<mlir::Value> box =
+          RuntimeBundleLowerer::transientPayloadBox(op, *payload,
+                                                    /*ownsPayload=*/false);
+      if (mlir::failed(box))
         return mlir::failure();
-      for (auto [wordIndex, word] : llvm::enumerate(*words)) {
-        mlir::Value slot = mlir::arith::ConstantIndexOp::create(
-            builder, loc, static_cast<std::int64_t>(wordIndex));
-        mlir::memref::StoreOp::create(builder, loc, word, box, slot);
-      }
       llvm::SmallVector<mlir::Value, 8> operands(
           receiver.physicalValues().begin(), receiver.physicalValues().end());
-      operands.push_back(box);
+      operands.push_back(*box);
       mlir::func::CallOp call =
           RuntimeBundleLowerer::createRuntimeCall(loc, *primitive, operands);
       if (mlir::failed(RuntimeBundleLowerer::pinProbeOperandLiveness(
@@ -916,25 +908,17 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
     if (mlir::failed(
             RuntimeBundleLowerer::retainAggregateSlot(op, *payload, "set.add")))
       return mlir::failure();
-    mlir::MemRefType boxType = box_abi::boxWordsType(builder);
-    mlir::Value box =
-        mlir::memref::AllocaOp::create(builder, loc, boxType).getResult();
-    mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
-        RuntimeBundleLowerer::objectPayloadHandleWords(op, *payload,
-                                                       /*ownsPayload=*/true);
-    if (mlir::failed(words))
+    mlir::FailureOr<mlir::Value> box =
+        RuntimeBundleLowerer::transientPayloadBox(op, *payload,
+                                                  /*ownsPayload=*/true);
+    if (mlir::failed(box))
       return mlir::failure();
-    for (auto [wordIndex, word] : llvm::enumerate(*words)) {
-      mlir::Value slot = mlir::arith::ConstantIndexOp::create(
-          builder, loc, static_cast<std::int64_t>(wordIndex));
-      mlir::memref::StoreOp::create(builder, loc, word, box, slot);
-    }
     if (mlir::failed(RuntimeBundleLowerer::promoteInteriorViewForTransfer(
             op, receiver, "set.add.receiver", addBox->function)))
       return mlir::failure();
     llvm::SmallVector<mlir::Value, 6> operands(
         receiver.physicalValues().begin(), receiver.physicalValues().end());
-    operands.push_back(box);
+    operands.push_back(*box);
     mlir::func::CallOp call =
         RuntimeBundleLowerer::createRuntimeCall(loc, *addBox, operands);
     RuntimeBundle updated;

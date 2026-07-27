@@ -459,23 +459,15 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
       if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
               op, *payload, "list.setitem")))
         return mlir::failure();
-      mlir::MemRefType boxType = box_abi::boxWordsType(builder);
-      mlir::Value box =
-          mlir::memref::AllocaOp::create(builder, loc, boxType).getResult();
-      mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
-          RuntimeBundleLowerer::objectPayloadHandleWords(op, *payload,
-                                                         /*ownsPayload=*/true);
-      if (mlir::failed(words))
+      mlir::FailureOr<mlir::Value> box =
+          RuntimeBundleLowerer::transientPayloadBox(op, *payload,
+                                                    /*ownsPayload=*/true);
+      if (mlir::failed(box))
         return mlir::failure();
-      for (auto [wordIndex, word] : llvm::enumerate(*words)) {
-        mlir::Value slot = mlir::arith::ConstantIndexOp::create(
-            builder, loc, static_cast<std::int64_t>(wordIndex));
-        mlir::memref::StoreOp::create(builder, loc, word, box, slot);
-      }
       llvm::SmallVector<mlir::Value, 6> operands(
           container.physicalValues().begin(), container.physicalValues().end());
       operands.push_back(*raw);
-      operands.push_back(box);
+      operands.push_back(*box);
       RuntimeBundleLowerer::createRuntimeCall(loc, *setItemBox, operands);
       // Pin the receiver past the raw-word call (mirrors the other *_box
       // container methods).
@@ -550,20 +542,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
 
     auto transientBox =
         [&](const RuntimeBundle &bundle) -> mlir::FailureOr<mlir::Value> {
-      mlir::MemRefType boxType = box_abi::boxWordsType(builder);
-      mlir::Value box =
-          mlir::memref::AllocaOp::create(builder, loc, boxType).getResult();
-      mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
-          RuntimeBundleLowerer::objectPayloadHandleWords(op, bundle,
-                                                         /*ownsPayload=*/true);
-      if (mlir::failed(words))
-        return mlir::failure();
-      for (auto [wordIndex, word] : llvm::enumerate(*words)) {
-        mlir::Value slot = mlir::arith::ConstantIndexOp::create(
-            builder, loc, static_cast<std::int64_t>(wordIndex));
-        mlir::memref::StoreOp::create(builder, loc, word, box, slot);
-      }
-      return box;
+      return RuntimeBundleLowerer::transientPayloadBox(op, bundle,
+                                                       /*ownsPayload=*/true);
     };
     if (mlir::failed(RuntimeBundleLowerer::promoteInteriorViewForTransfer(
             op, container, "dict.setitem.receiver", setItemBox->function)))
@@ -752,22 +732,14 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerDelItem(py::DelItemOp op) {
         RuntimeBundleLowerer::materializePayloadObjectBundle(op, index);
     if (mlir::failed(payload))
       return mlir::failure();
-    mlir::MemRefType boxType = box_abi::boxWordsType(builder);
-    mlir::Value box =
-        mlir::memref::AllocaOp::create(builder, loc, boxType).getResult();
-    mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
-        RuntimeBundleLowerer::objectPayloadHandleWords(op, *payload,
-                                                       /*ownsPayload=*/false);
-    if (mlir::failed(words))
+    mlir::FailureOr<mlir::Value> box =
+        RuntimeBundleLowerer::transientPayloadBox(op, *payload,
+                                                  /*ownsPayload=*/false);
+    if (mlir::failed(box))
       return mlir::failure();
-    for (auto [wordIndex, word] : llvm::enumerate(*words)) {
-      mlir::Value slot = mlir::arith::ConstantIndexOp::create(
-          builder, loc, static_cast<std::int64_t>(wordIndex));
-      mlir::memref::StoreOp::create(builder, loc, word, box, slot);
-    }
     llvm::SmallVector<mlir::Value, 8> operands(
         container.physicalValues().begin(), container.physicalValues().end());
-    operands.push_back(box);
+    operands.push_back(*box);
     RuntimeBundleLowerer::createRuntimeCall(loc, *delItemBox, operands);
     if (mlir::failed(RuntimeBundleLowerer::pinProbeOperandLiveness(
             op, *payload, &index)))
@@ -1074,22 +1046,14 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerContains(py::ContainsOp op) {
         RuntimeBundleLowerer::materializePayloadObjectBundle(op, item);
     if (mlir::failed(payload))
       return mlir::failure();
-    mlir::MemRefType boxType = box_abi::boxWordsType(builder);
-    mlir::Value box =
-        mlir::memref::AllocaOp::create(builder, loc, boxType).getResult();
-    mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
-        RuntimeBundleLowerer::objectPayloadHandleWords(op, *payload,
-                                                       /*ownsPayload=*/false);
-    if (mlir::failed(words))
+    mlir::FailureOr<mlir::Value> box =
+        RuntimeBundleLowerer::transientPayloadBox(op, *payload,
+                                                  /*ownsPayload=*/false);
+    if (mlir::failed(box))
       return mlir::failure();
-    for (auto [wordIndex, word] : llvm::enumerate(*words)) {
-      mlir::Value slot = mlir::arith::ConstantIndexOp::create(
-          builder, loc, static_cast<std::int64_t>(wordIndex));
-      mlir::memref::StoreOp::create(builder, loc, word, box, slot);
-    }
     llvm::SmallVector<mlir::Value, 8> operands(
         container.physicalValues().begin(), container.physicalValues().end());
-    operands.push_back(box);
+    operands.push_back(*box);
     mlir::func::CallOp call =
         RuntimeBundleLowerer::createRuntimeCall(loc, *containsBox, operands);
     if (mlir::failed(RuntimeBundleLowerer::pinProbeOperandLiveness(

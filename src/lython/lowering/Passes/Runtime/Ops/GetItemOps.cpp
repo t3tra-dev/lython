@@ -1010,22 +1010,14 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeDictGetItem(
       RuntimeBundleLowerer::materializePayloadObjectBundle(op, index);
   if (mlir::failed(payloadKey))
     return mlir::failure();
-  mlir::MemRefType boxType = box_abi::boxWordsType(builder);
-  mlir::Value keyBox =
-      mlir::memref::AllocaOp::create(builder, loc, boxType).getResult();
-  mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> keyWords =
-      RuntimeBundleLowerer::objectPayloadHandleWords(op, *payloadKey,
-                                                     /*ownsPayload=*/false);
-  if (mlir::failed(keyWords))
+  mlir::FailureOr<mlir::Value> keyBox =
+      RuntimeBundleLowerer::transientPayloadBox(op, *payloadKey,
+                                                /*ownsPayload=*/false);
+  if (mlir::failed(keyBox))
     return mlir::failure();
-  for (auto [wordIndex, word] : llvm::enumerate(*keyWords)) {
-    mlir::Value slot = mlir::arith::ConstantIndexOp::create(
-        builder, loc, static_cast<std::int64_t>(wordIndex));
-    mlir::memref::StoreOp::create(builder, loc, word, keyBox, slot);
-  }
   llvm::SmallVector<mlir::Value, 8> findOperands(
       container.physicalValues().begin(), container.physicalValues().end());
-  findOperands.push_back(keyBox);
+  findOperands.push_back(*keyBox);
   mlir::func::CallOp findCall =
       RuntimeBundleLowerer::createRuntimeCall(loc, *lookupBox, findOperands);
   mlir::Value found = findCall.getResult(0);
