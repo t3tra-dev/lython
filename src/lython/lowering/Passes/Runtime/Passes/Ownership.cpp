@@ -140,6 +140,11 @@ std::uint64_t moduleSymbolCount(mlir::ModuleOp module) {
   return symbols;
 }
 
+// Why the ablation state is printed and not just assumed: the hatch below changes
+// only how fast a callee is resolved, so its effect is invisible in the IR BY
+// DESIGN -- which makes "both arms produced identical IR" consistent with "the
+// ablation never fired" as well as with "the change is inert". An A/B whose arms
+// cannot be told apart is not an A/B. This line is what distinguishes them.
 void reportOwnershipWorkShape(llvm::StringRef scope, std::uint64_t symbols,
                               std::uint64_t calls) {
   static const bool on = [] {
@@ -153,7 +158,8 @@ void reportOwnershipWorkShape(llvm::StringRef scope, std::uint64_t symbols,
     return;
   llvm::errs() << "[LYTHON_PERF] " << scope << " module_symbols=" << symbols
                << " callee_resolutions=" << calls
-               << " product=" << (symbols * calls) << "\n";
+               << " product=" << (symbols * calls) << " symbol_table="
+               << (ownershipSymbolTableDisabled() ? "ABLATED" : "on") << "\n";
 }
 
 void traceOmittedBorrowEdgeRetain(mlir::Value header, mlir::Operation *anchor) {
