@@ -11,19 +11,107 @@ it to smoke-run examples/ without adding expectation files there.
 --timeout S bounds the lyc run; exceeding it is reported as its own failure
 reason rather than as differing output.
 
+--expect-layer L asserts which pipeline stage the case reaches. The stage comes
+from the compiler's own PerfScope trace rather than from the diagnostic text, so
+a case that stops being rejected by the frontend and starts being rejected by
+lowering -- or starts executing -- fails here by name instead of silently
+getting more expensive. Only stages that never execute are declarable: the
+trace adds lines to stderr, and stripping them back out is only provably
+lossless while the program itself writes nothing.
+
 A signal death is reported as a negative exit code and never satisfies an
 expected exit code, so "must fail with exit 1" cannot be faked by a crash.
+
+On any failure the runner also reports which stage the compiler reached, from a
+second run under LYTHON_PERF=1. The report says so: it is not the run whose
+streams were compared, and a nondeterministic case can disagree with itself.
 """
 
 import argparse
+import os
 import pathlib
 import re
 import subprocess
 import sys
 
+PERF_LINE = re.compile(r"^\[LYTHON_PERF\] phase=(\S+)")
 
-def fail(message: str, stdout: str, stderr: str) -> int:
+# Stages a case may be declared to stop at, ordered by depth. "e2e" is the
+# default and is deliberately not declarable: it is what every case that runs
+# the program reaches, so declaring it would assert nothing.
+DECLARABLE_LAYERS = ("parse", "emit", "lower")
+
+
+def phase_trace(stderr: str) -> "list[str]":
+    """Phase names in the order the compiler printed them.
+
+    PerfScope prints on scope exit, so an enclosing phase appears after the
+    nested ones it contains, and a phase that failed still prints. The trace
+    therefore ends with the outermost scope entered, and the deepest (dotted)
+    name near the end is the one that rejected.
+    """
+    return [match.group(1)
+            for match in (PERF_LINE.match(line)
+                          for line in stderr.splitlines())
+            if match]
+
+
+def layer_of(phases: "list[str]") -> str:
+    """The deepest pipeline stage a phase trace shows the compiler reaching."""
+    if "execution" in phases:
+        return "e2e"
+    if any(phase.split(".", 1)[0] == "jit-build" for phase in phases):
+        return "jit-build"
+    if any(phase.split(".", 1)[0] == "lowering" for phase in phases):
+        return "lower"
+    if "ir-generation" in phases:
+        return "emit"
+    if "parse" in phases:
+        return "parse"
+    return "startup"
+
+
+def strip_perf(stderr: str) -> str:
+    kept = [line for line in stderr.splitlines() if not PERF_LINE.match(line)]
+    return "".join(line + "\n" for line in kept)
+
+
+def run_lyc(lyc: pathlib.Path, case: pathlib.Path, timeout: float,
+            perf: bool) -> "subprocess.CompletedProcess[str] | None":
+    env = dict(os.environ)
+    if perf:
+        env["LYTHON_PERF"] = "1"
+    else:
+        env.pop("LYTHON_PERF", None)
+    try:
+        return subprocess.run([str(lyc), "jit", str(case)], capture_output=True,
+                              text=True, timeout=timeout, env=env)
+    except subprocess.TimeoutExpired:
+        return None
+
+
+def first_difference(actual: str, expected: str) -> str:
+    """Name the first differing line, so a 40-line expectation localizes."""
+    actual_lines = actual.splitlines()
+    expected_lines = expected.splitlines()
+    for index in range(max(len(actual_lines), len(expected_lines))):
+        got = actual_lines[index] if index < len(actual_lines) else "<no line>"
+        want = (expected_lines[index] if index < len(expected_lines)
+                else "<no line>")
+        if got != want:
+            return (f"first difference at stdout line {index + 1} "
+                    f"(expected {len(expected_lines)} lines, "
+                    f"got {len(actual_lines)}):\n"
+                    f"  expected: {want!r}\n"
+                    f"  actual:   {got!r}\n")
+    return (f"every line matches; the streams differ in trailing bytes "
+            f"(expected {len(expected)} bytes, actual {len(actual)})\n")
+
+
+def fail(message: str, stdout: str, stderr: str, where: str = "") -> int:
     print(f"FAIL: {message}", file=sys.stderr)
+    if where:
+        sys.stderr.write(where)
     print("--- stdout ---", file=sys.stderr)
     sys.stderr.write(stdout)
     print("--- stderr ---", file=sys.stderr)
@@ -31,45 +119,68 @@ def fail(message: str, stdout: str, stderr: str) -> int:
     return 1
 
 
+def report_reached_layer(lyc: pathlib.Path, case: pathlib.Path,
+                         timeout: float) -> None:
+    """Say which stage the compiler reached, so a red test localizes itself."""
+    result = run_lyc(lyc, case, timeout, perf=True)
+    if result is None:
+        print("--- reached layer: unknown, the LYTHON_PERF re-run timed out",
+              file=sys.stderr)
+        return
+    phases = phase_trace(result.stderr)
+    print(f"--- reached layer, from a SECOND run under LYTHON_PERF=1 and not "
+          f"the run compared above: {layer_of(phases)}", file=sys.stderr)
+    if not phases:
+        print("--- no phase printed: lyc exited before parsing",
+              file=sys.stderr)
+        return
+    dotted = [phase for phase in phases if "." in phase]
+    if dotted:
+        print(f"--- deepest phase entered: {dotted[-1]}", file=sys.stderr)
+    print(f"--- last phases printed: {' '.join(phases[-5:])}", file=sys.stderr)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--lyc", required=True, type=pathlib.Path)
     parser.add_argument("--exit-only", type=int, default=None)
     parser.add_argument("--timeout", type=float, default=300.0)
+    parser.add_argument("--expect-layer", choices=DECLARABLE_LAYERS,
+                        default=None)
     parser.add_argument("case", type=pathlib.Path)
     args = parser.parse_args()
 
     # Why not let TimeoutExpired propagate: an uncaught traceback exits
     # nonzero, so ctest labels the run "Failed" exactly like a wrong-output
     # case and the report gives no hint that the budget was the cause.
-    try:
-        result = subprocess.run(
-            [str(args.lyc), "jit", str(args.case)],
-            capture_output=True,
-            text=True,
-            timeout=args.timeout,
-        )
-    except subprocess.TimeoutExpired as expired:
-        def text(stream: "bytes | str | None") -> str:
-            if stream is None:
-                return ""
-            if isinstance(stream, bytes):
-                return stream.decode(errors="replace")
-            return stream
+    result = run_lyc(args.lyc, args.case, args.timeout,
+                     perf=args.expect_layer is not None)
+    if result is None:
+        # Why no layer report here: the re-run would spend the same budget
+        # over again and end the same way.
+        print(f"FAIL: lyc did not finish within {args.timeout:g}s",
+              file=sys.stderr)
+        return 1
 
-        return fail(
-            f"lyc did not finish within {args.timeout:g}s",
-            text(expired.stdout),
-            text(expired.stderr),
-        )
+    stdout = result.stdout
+    stderr = result.stderr
+    reached = None
+    if args.expect_layer is not None:
+        reached = layer_of(phase_trace(stderr))
+        stderr = strip_perf(stderr)
+
+    def failed(message: str, where: str = "") -> int:
+        code = fail(message, stdout, stderr, where)
+        if args.expect_layer is None:
+            report_reached_layer(args.lyc, args.case, args.timeout)
+        else:
+            print(f"--- reached layer: {reached}", file=sys.stderr)
+        return code
 
     if args.exit_only is not None:
         if result.returncode != args.exit_only:
-            return fail(
-                f"exit code {result.returncode}, expected {args.exit_only}",
-                result.stdout,
-                result.stderr,
-            )
+            return failed(f"exit code {result.returncode}, "
+                          f"expected {args.exit_only}")
         return 0
 
     expected_exit = 0
@@ -77,25 +188,35 @@ def main() -> int:
     if exitcode_file.exists():
         expected_exit = int(exitcode_file.read_text().strip())
     if result.returncode != expected_exit:
-        return fail(
-            f"exit code {result.returncode}, expected {expected_exit}",
-            result.stdout,
-            result.stderr,
-        )
+        return failed(f"exit code {result.returncode}, "
+                      f"expected {expected_exit}")
 
     stdout_file = args.case.with_suffix(".stdout")
     if stdout_file.exists():
         expected_stdout = stdout_file.read_text()
-        if result.stdout != expected_stdout:
-            return fail("stdout differs from expected", result.stdout,
-                        result.stderr)
+        if stdout != expected_stdout:
+            return failed("stdout differs from expected",
+                          first_difference(stdout, expected_stdout))
 
     stderr_re_file = args.case.with_suffix(".stderr-re")
     if stderr_re_file.exists():
         pattern = stderr_re_file.read_text().strip()
-        if not re.search(pattern, result.stderr):
-            return fail(f"stderr does not match /{pattern}/", result.stdout,
-                        result.stderr)
+        if not re.search(pattern, stderr):
+            return failed(f"stderr does not match /{pattern}/")
+
+    # Checked last: the expectations above are what the case is for, and a
+    # layer that drifted while every expectation still holds is a cost
+    # regression rather than a wrong answer. Reporting it last keeps the two
+    # apart in the ctest output.
+    if args.expect_layer is not None and reached != args.expect_layer:
+        return fail(
+            f"case reached layer {reached!r} but tests/golden/layers.txt "
+            f"declares {args.expect_layer!r}",
+            stdout, stderr,
+            "Every expectation still holds; what changed is how far the "
+            "compiler runs. Either the declaration is stale (update "
+            "tests/golden/layers.txt) or a stage stopped rejecting this "
+            "program and a later, more expensive one now does.\n")
 
     return 0
 
