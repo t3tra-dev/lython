@@ -301,6 +301,18 @@ struct ControlFlowLogicalBlockArgumentABI {
   mlir::BlockArgument argument;
 };
 
+// One logical block argument whose physical arguments are inserted but whose
+// incoming EDGES are not spliced yet, because a sibling argument of the same
+// block was mid-expansion when this one was reached. Everything needed to finish
+// it later, since the expansion cannot be restarted (its bundle is already
+// published, which is the point -- the sibling's edge computation needed it).
+struct ControlFlowDeferredExpansion {
+  mlir::BlockArgument argument;
+  llvm::SmallVector<mlir::Type, 8> physicalTypes;
+  bool primitiveIntLane = false;
+  mlir::Operation *op = nullptr;
+};
+
 // One closure capture of a returned nested function. Either the capture is
 // an entry argument of the RETURNING function (the caller rebuilds it from
 // its own argument sources at `argumentIndex`), or it is a local of the

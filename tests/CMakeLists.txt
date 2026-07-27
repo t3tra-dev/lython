@@ -18,6 +18,13 @@
 #     parse   the vendored CPython frontend, in process
 #     emit    AST -> py dialect, including the type system and the evidence
 #             verifier that runs on the emitted module; no lowering
+#     abi     a physical-ABI predicate applied to hand-built MLIR; no frontend
+#             and no pipeline stage at all. A layer of its own rather than a
+#             corner of `emit` because it reaches NO compiler stage: the input is
+#             three ops built in the test, so the cost is microseconds and the
+#             thing under test is offset and provenance arithmetic. Folding it
+#             into `emit` would make the taxonomy's own claim ("cut by how far
+#             into the compiler a test reaches") false for its members.
 #     tables  generated Unicode tables checked against CPython; no compilation
 #     meta    the suite checking itself; no compilation
 #     lower   a full lowering to verified LLVM IR, no JIT and no execution
@@ -74,6 +81,7 @@ endforeach()
 add_executable(lython_unit_tests
     unit/DriverTests.cpp
     unit/EmitterTests.cpp
+    unit/EntityHeaderPrefixTests.cpp
     unit/EvidenceVerifierTests.cpp
     unit/LayerManifestTests.cpp
     unit/ParserTests.cpp
@@ -91,6 +99,9 @@ target_include_directories(lython_unit_tests
     ${CMAKE_SOURCE_DIR}/src/lython/common
     ${CMAKE_SOURCE_DIR}/src/lython/dialects
     ${CMAKE_SOURCE_DIR}/src/lython/verifier
+    # EntityHeaderPrefixTests includes Runtime/ABI/EntityHeaderPrefix.h, whose
+    # include root is the lowering pass tree.
+    ${CMAKE_SOURCE_DIR}/src/lython/lowering/Passes
     ${CMAKE_BINARY_DIR}/src/lython/dialects
     ${CMAKE_CURRENT_BINARY_DIR}
 )
@@ -120,7 +131,7 @@ endif()
 # `lower` is spelled out test by test rather than as `DriverTest.*` minus two, so
 # that a newly added DriverTest matches no pattern and LayerManifestTest says so
 # by name instead of the test silently never running.
-set(LYTHON_UNIT_LAYERS parse emit tables meta lower)
+set(LYTHON_UNIT_LAYERS parse emit abi tables meta lower)
 
 set(LYTHON_UNIT_PATTERNS_parse
     "ParserTest.*"
@@ -131,6 +142,8 @@ set(LYTHON_UNIT_PATTERNS_emit
     "TypeSystemTest.*"
     "TypeInferenceTest.*"
     "DriverTest.ReportsEmitErrorDiagnostics")
+set(LYTHON_UNIT_PATTERNS_abi
+    "EntityHeaderPrefixTest.*")
 set(LYTHON_UNIT_PATTERNS_tables
     "UnicodeTablesTest.*")
 set(LYTHON_UNIT_PATTERNS_meta
@@ -149,6 +162,7 @@ set(LYTHON_UNIT_PATTERNS_lower
 
 set(LYTHON_UNIT_LABELS_parse  "parse;unit;fast")
 set(LYTHON_UNIT_LABELS_emit   "emit;unit;fast")
+set(LYTHON_UNIT_LABELS_abi    "abi;unit;fast")
 set(LYTHON_UNIT_LABELS_tables "tables;unit;fast")
 set(LYTHON_UNIT_LABELS_meta   "meta;unit;fast")
 set(LYTHON_UNIT_LABELS_lower  "lower;unit")
