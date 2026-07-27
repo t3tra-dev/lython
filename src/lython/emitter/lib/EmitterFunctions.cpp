@@ -102,10 +102,13 @@ void ModuleEmitter::emitFunctionDecl(const parser::Node &function) {
         GenericFunctionInfo &info = genericFunctions[*name];
         info.node = &function;
         info.signature = sig;
-        info.symbolBase = std::string(*name);
+        // Specializations inherit the base's symbol, so a generic that shadows
+        // a builtin needs the same rename its non-generic sibling gets.
+        info.symbolBase = std::string(topLevelFunctionSymbol(*name));
       }
     } else {
-      emitCallableFunction(function, *name, sig, {}, /*isLambda=*/false);
+      emitCallableFunction(function, topLevelFunctionSymbol(*name), sig, {},
+                           /*isLambda=*/false);
     }
   }
   types.bindSymbol(*name, sig.publicCallable);
@@ -338,6 +341,13 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
           : mlir::Type();
   currentFunctionPrefix = symbolName.str();
   types.bindSymbol(symbolName, sig.callable);
+  // A def renamed away from a builtin spelling is still spelled by its source
+  // name inside its own body, so bind the spelling as well: self-recursion has
+  // to resolve to the same scoped callable a non-renamed def resolves to,
+  // instead of falling out to the module-scope public callable.
+  for (const auto &shadowed : shadowedBuiltinSymbols)
+    if (shadowed.second == symbolName)
+      types.bindSymbol(shadowed.first(), sig.callable);
   std::optional<std::string> preboundTypeObjectName;
   if (const parser::Node *arguments = ast::node(callable, "args")) {
     llvm::SmallVector<const parser::Node *, 8> positional =

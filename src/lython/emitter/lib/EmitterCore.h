@@ -285,6 +285,18 @@ private:
                      std::vector<parser::NodePtr> &prologue,
                      parser::NodePtr &out);
   bool isBuiltinIteratorName(llvm::StringRef name) const;
+  // True when the PROGRAM binds this spelling, so a compiler-known meaning of
+  // the same spelling -- a builtin fast path, a builtin class contract -- must
+  // not claim the call. Every builtin fast path gates on this one predicate:
+  // gating on `values` alone made the winner depend on argument count, because
+  // a top-level `def` is absent from `values` and the fast paths are selected
+  // by arity.
+  bool programBindsName(llvm::StringRef name) const;
+  // Collects moduleFunctionNames / moduleClassNames / shadowedBuiltinSymbols.
+  void collectTopLevelBindings();
+  // The symbol a main-module top-level `def` of this spelling is emitted
+  // under: the spelling itself unless it collides with a manifest builtin.
+  llvm::StringRef topLevelFunctionSymbol(llvm::StringRef name) const;
   bool hasIndexableEvidence(const parser::Node *expr);
   void runWithScratchNames(llvm::ArrayRef<std::string> names,
                            llvm::function_ref<void()> emit);
@@ -681,6 +693,21 @@ private:
   TypeSystem types;
   llvm::StringMap<GenericFunctionInfo> genericFunctions;
   llvm::StringMap<GenericClassInfo> genericClasses;
+  // Spellings the MAIN module's own top-level `def` / `class` statements
+  // bind, collected before anything is typed or emitted. Declaration order is
+  // deliberately not modelled: registerModule binds every top-level signature
+  // up front so forward references and mutual recursion resolve, so a
+  // top-level name means the same thing at every point of the module.
+  llvm::StringSet<> moduleFunctionNames;
+  llvm::StringSet<> moduleClassNames;
+  // Main-module top-level `def`s whose spelling is also a manifest builtin's
+  // binding name (`def len`), mapped to the symbol they are emitted under.
+  // py.binding_ref carries a NAME, and the runtime lowering resolves that name
+  // against the manifest before it looks for a user func.func, so emitting the
+  // user function as @len would hand every reference to the builtin. Renaming
+  // the emitted symbol keeps the two entities distinguishable at the only
+  // layer that can tell them apart -- the one that knows which is which.
+  llvm::StringMap<std::string> shadowedBuiltinSymbols;
   // Solved type arguments per specialized class contract, in parameter order.
   llvm::StringMap<llvm::SmallVector<std::pair<std::string, mlir::Type>, 4>>
       classTypeArguments;

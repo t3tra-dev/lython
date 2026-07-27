@@ -188,7 +188,7 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
   // carry a default).
   if (calleeNode && calleeNode->kind == "Name" &&
       ast::nameSpelling(*calleeNode) == "frozenset" &&
-      values.find("frozenset") == values.end() && callHasNoArguments(expr)) {
+      !programBindsName("frozenset") && callHasNoArguments(expr)) {
     parser::NodePtr emptyList = parser::makeNode("List", expr.range);
     parser::addField(*emptyList, "elts", std::vector<parser::NodePtr>{});
     parser::NodePtr rewritten = parser::makeNode("Call", expr.range);
@@ -205,7 +205,7 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
   // contract (input(prompt: str) -> str).
   if (calleeNode && calleeNode->kind == "Name" &&
       ast::nameSpelling(*calleeNode) == "input" &&
-      values.find("input") == values.end() && callHasNoArguments(expr)) {
+      !programBindsName("input") && callHasNoArguments(expr)) {
     parser::NodePtr empty = parser::makeNode("Constant", expr.range);
     parser::addField(*empty, "value", std::string());
     parser::NodePtr promptCall = parser::makeNode("Call", expr.range);
@@ -264,7 +264,10 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     return emitNone(expr);
   };
 
-  if (!calleeQualified.empty())
+  // Same rule as the bare-Name constructor path below: a top-level `def int`
+  // outranks the builtin class contract of that spelling. A bare Name has a
+  // qualified spelling equal to itself, so this branch sees `int` first.
+  if (!calleeQualified.empty() && !moduleFunctionNames.count(calleeQualified))
     if (auto cls = types.lookupClass(calleeQualified)) {
       if (std::optional<llvm::StringRef> symbol = contractName(*cls)) {
         if (std::optional<Value> v =
@@ -279,7 +282,13 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
 
   if (calleeNode && calleeNode->kind == "Name") {
     llvm::StringRef name = ast::nameSpelling(*calleeNode);
-    if (auto cls = types.lookupClass(name)) {
+    // A top-level `def str` outranks the builtin `str` class contract. The
+    // guard is deliberately narrower than programBindsName: a VALUE binding
+    // that happens to share a class's spelling keeps reaching the constructor
+    // as it does today, because only a `def` introduces a competing callable
+    // under the same top-level name.
+    if (auto cls = moduleFunctionNames.count(name) ? std::optional<mlir::Type>()
+                                                   : types.lookupClass(name)) {
       if (std::optional<llvm::StringRef> symbol = contractName(*cls)) {
         if (std::optional<Value> v =
                 rejectStubSourceCall(expr, *symbol, /*instantiation=*/true))
@@ -563,7 +572,7 @@ ModuleEmitter::tryEmitIsInstanceCall(const parser::Node &expr,
                                      const parser::Node *calleeNode) {
   if (!calleeNode || calleeNode->kind != "Name" ||
       ast::nameSpelling(*calleeNode) != "isinstance" ||
-      values.find("isinstance") != values.end())
+      programBindsName("isinstance"))
     return std::nullopt;
   const auto *keywords = ast::nodeList(expr, "keywords");
   const auto *args = ast::nodeList(expr, "args");
@@ -660,7 +669,7 @@ ModuleEmitter::tryEmitIntCall(const parser::Node &expr,
   // builtins.int. Zero-argument int() stays on the instantiation path.
   if (!calleeNode || calleeNode->kind != "Name" ||
       ast::nameSpelling(*calleeNode) != "int" ||
-      values.find("int") != values.end())
+      programBindsName("int"))
     return std::nullopt;
   const auto *intArgs = ast::nodeList(expr, "args");
   const auto *intKeywords = ast::nodeList(expr, "keywords");
@@ -712,7 +721,7 @@ ModuleEmitter::tryEmitBoolCall(const parser::Node &expr,
                                const parser::Node *calleeNode) {
   if (!calleeNode || calleeNode->kind != "Name" ||
       ast::nameSpelling(*calleeNode) != "bool" ||
-      values.find("bool") != values.end())
+      programBindsName("bool"))
     return std::nullopt;
   const auto *args = ast::nodeList(expr, "args");
   const auto *keywords = ast::nodeList(expr, "keywords");
@@ -758,7 +767,7 @@ ModuleEmitter::tryEmitAsciiCall(const parser::Node &expr,
                                 const parser::Node *calleeNode) {
   if (!calleeNode || calleeNode->kind != "Name" ||
       ast::nameSpelling(*calleeNode) != "ascii" ||
-      values.find("ascii") != values.end())
+      programBindsName("ascii"))
     return std::nullopt;
   const auto *args = ast::nodeList(expr, "args");
   const auto *keywords = ast::nodeList(expr, "keywords");
@@ -784,7 +793,7 @@ ModuleEmitter::tryEmitIssubclassCall(const parser::Node &expr,
                                      const parser::Node *calleeNode) {
   if (!calleeNode || calleeNode->kind != "Name" ||
       ast::nameSpelling(*calleeNode) != "issubclass" ||
-      values.find("issubclass") != values.end())
+      programBindsName("issubclass"))
     return std::nullopt;
   const auto *args = ast::nodeList(expr, "args");
   const auto *keywords = ast::nodeList(expr, "keywords");
@@ -841,7 +850,7 @@ ModuleEmitter::tryEmitFloatCall(const parser::Node &expr,
   // intercept before the class-instantiation paths claim builtins.float.
   if (!calleeNode || calleeNode->kind != "Name" ||
       ast::nameSpelling(*calleeNode) != "float" ||
-      values.find("float") != values.end())
+      programBindsName("float"))
     return std::nullopt;
   const auto *floatArgs = ast::nodeList(expr, "args");
   const auto *floatKeywords = ast::nodeList(expr, "keywords");
@@ -873,7 +882,7 @@ ModuleEmitter::tryEmitStrCall(const parser::Node &expr,
   // intercept before the class-instantiation paths claim builtins.str.
   if (!calleeNode || calleeNode->kind != "Name" ||
       ast::nameSpelling(*calleeNode) != "str" ||
-      values.find("str") != values.end())
+      programBindsName("str"))
     return std::nullopt;
   const auto *strArgs = ast::nodeList(expr, "args");
   const auto *strKeywords = ast::nodeList(expr, "keywords");
@@ -932,7 +941,7 @@ ModuleEmitter::tryEmitStrCall(const parser::Node &expr,
     // delegates to type(x).__repr__). Reroute through the repr call path
     // instead of teaching this path a second dispatch ladder — repr owns
     // the source-__repr__ inline and the default-object-repr fallback.
-    if (values.find("repr") == values.end()) {
+    if (!programBindsName("repr")) {
       parser::NodePtr reprName = parser::makeNode("Name", expr.range);
       parser::addField(*reprName, "id", std::string("repr"));
       parser::NodePtr reprCall = parser::makeNode("Call", expr.range);
@@ -972,7 +981,7 @@ ModuleEmitter::tryEmitListCall(const parser::Node &expr,
   // paths claim builtins.list.
   if (!calleeNode || calleeNode->kind != "Name" ||
       ast::nameSpelling(*calleeNode) != "list" ||
-      values.find("list") != values.end())
+      programBindsName("list"))
     return std::nullopt;
   const auto *listArgs = ast::nodeList(expr, "args");
   const auto *listKeywords = ast::nodeList(expr, "keywords");
@@ -993,7 +1002,7 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
   // only the end="\n" terminator).
   if (!calleeNode || calleeNode->kind != "Name" ||
       ast::nameSpelling(*calleeNode) != "print" ||
-      values.find("print") != values.end())
+      programBindsName("print"))
     return std::nullopt;
   const auto *printArgs = ast::nodeList(expr, "args");
   const auto *printKeywords = ast::nodeList(expr, "keywords");
@@ -1117,7 +1126,7 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
   llvm::StringRef reducer = ast::nameSpelling(*calleeNode);
   if (!(reducer == "sum" || reducer == "any" || reducer == "all" ||
         reducer == "max" || reducer == "min") ||
-      values.find(reducer) != values.end())
+      programBindsName(reducer))
     return std::nullopt;
   const auto *reducerArgs = ast::nodeList(expr, "args");
   const auto *reducerKeywords = ast::nodeList(expr, "keywords");
@@ -1497,7 +1506,7 @@ std::optional<Value>
 ModuleEmitter::tryEmitLenCall(const parser::Node &expr,
                               const parser::Node *calleeNode) {
   if (!calleeNode || calleeNode->kind != "Name" ||
-      ast::nameSpelling(*calleeNode) != "len")
+      ast::nameSpelling(*calleeNode) != "len" || programBindsName("len"))
     return std::nullopt;
   const auto *args = ast::nodeList(expr, "args");
   if (args && args->size() == 1) {
@@ -1545,8 +1554,10 @@ ModuleEmitter::tryEmitNextCall(const parser::Node &expr,
   if (!calleeNode || calleeNode->kind != "Name" ||
       ast::nameSpelling(*calleeNode) != "next")
     return std::nullopt;
-  // A local binding named `next` shadows the builtin.
-  if (values.find("next") != values.end())
+  // Any binding the program makes for this spelling shadows the builtin --
+  // a local, or a top-level `def next`. Gating on locals alone made the
+  // winner depend on the argument count.
+  if (programBindsName("next"))
     return std::nullopt;
   const auto *args = ast::nodeList(expr, "args");
   const auto *keywords = ast::nodeList(expr, "keywords");
@@ -1648,8 +1659,9 @@ ModuleEmitter::tryEmitHashCall(const parser::Node &expr,
   if (!calleeNode || calleeNode->kind != "Name" ||
       ast::nameSpelling(*calleeNode) != "hash")
     return std::nullopt;
-  // A local binding named `hash` shadows the builtin.
-  if (values.find("hash") != values.end())
+  // Any binding the program makes for this spelling shadows the builtin --
+  // a local, or a top-level `def hash`.
+  if (programBindsName("hash"))
     return std::nullopt;
   const auto *args = ast::nodeList(expr, "args");
   const auto *keywords = ast::nodeList(expr, "keywords");
@@ -1698,7 +1710,7 @@ std::optional<Value>
 ModuleEmitter::tryEmitRoundCall(const parser::Node &expr,
                                 const parser::Node *calleeNode) {
   if (!calleeNode || calleeNode->kind != "Name" ||
-      ast::nameSpelling(*calleeNode) != "round")
+      ast::nameSpelling(*calleeNode) != "round" || programBindsName("round"))
     return std::nullopt;
   const auto *args = ast::nodeList(expr, "args");
   if (args && (args->size() == 1 || args->size() == 2)) {
@@ -1752,7 +1764,7 @@ ModuleEmitter::tryEmitReprCall(const parser::Node &expr,
   llvm::StringRef name = ast::nameSpelling(*calleeNode);
   const auto *args = ast::nodeList(expr, "args");
   const auto *keywords = ast::nodeList(expr, "keywords");
-  bool builtinVisible = values.find(name) == values.end();
+  bool builtinVisible = !programBindsName(name);
   bool hasKeywords = keywords && !keywords->empty();
   if (builtinVisible && args && args->size() == 1 && !hasKeywords &&
       (name == "repr" || name == "print")) {
@@ -2808,7 +2820,7 @@ ModuleEmitter::tryEmitFormatCall(const parser::Node &expr,
                                  const parser::Node *calleeNode) {
   if (!calleeNode || calleeNode->kind != "Name" ||
       ast::nameSpelling(*calleeNode) != "format" ||
-      values.find("format") != values.end())
+      programBindsName("format"))
     return std::nullopt;
   const auto *args = ast::nodeList(expr, "args");
   const auto *keywords = ast::nodeList(expr, "keywords");

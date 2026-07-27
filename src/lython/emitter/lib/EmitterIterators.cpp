@@ -1500,8 +1500,9 @@ ModuleEmitter::tryEmitSortSugar(const parser::Node &expr,
     // it), so only user shadowing disables the rewrite — same guard as the
     // keyword sugar below.
     if (calleeNode->kind == "Name" &&
-        ast::nameSpelling(*calleeNode) == "sorted" && !values.count("sorted") &&
-        !genericFunctions.count("sorted") && !types.lookupClass("sorted")) {
+        ast::nameSpelling(*calleeNode) == "sorted" &&
+        !programBindsName("sorted") && !genericFunctions.count("sorted") &&
+        !types.lookupClass("sorted")) {
       const auto *args = ast::nodeList(expr, "args");
       // The rewrite must not re-wrap its own product: inference has no case
       // for the list() call form, so `sorted(list(X))` would recurse.
@@ -1534,7 +1535,8 @@ ModuleEmitter::tryEmitSortSugar(const parser::Node &expr,
   // it), so only user shadowing disables the sugar.
   bool isSorted = calleeNode->kind == "Name" &&
                   ast::nameSpelling(*calleeNode) == "sorted" &&
-                  !values.count("sorted") && !genericFunctions.count("sorted") &&
+                  !programBindsName("sorted") &&
+                  !genericFunctions.count("sorted") &&
                   !types.lookupClass("sorted");
   bool isListSort = false;
   NodePtr receiver;
