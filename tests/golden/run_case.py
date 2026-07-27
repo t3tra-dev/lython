@@ -84,8 +84,17 @@ def run_lyc(lyc: pathlib.Path, case: pathlib.Path, timeout: float,
     else:
         env.pop("LYTHON_PERF", None)
     try:
+        # stdin=DEVNULL, not inherited: a case calling input() blocks until its
+        # stdin reaches EOF, and whether the ambient stdin ever does is a
+        # property of how ctest itself was launched -- not of the case. That is
+        # how builtins_misc_wave15 timed out at 300 s in five full-suite runs
+        # while passing standalone in 2.2 s at HIGHER load, which sent three
+        # separate investigations after contention, build type and thread
+        # starvation. DEVNULL is at EOF immediately, so input() raises EOFError
+        # deterministically, which is what such a case is pinning anyway.
         return subprocess.run([str(lyc), "jit", str(case)], capture_output=True,
-                              text=True, timeout=timeout, env=env)
+                              text=True, timeout=timeout, env=env,
+                              stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         return None
 

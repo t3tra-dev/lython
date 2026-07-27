@@ -44,7 +44,8 @@ import sys
 
 def run(binary, path, timeout=900.0):
     try:
-        r = subprocess.run([str(binary), "jit", str(path)], capture_output=True,
+        r = subprocess.run([str(binary), "jit", str(path)],
+                           capture_output=True, stdin=subprocess.DEVNULL,
                            text=True, timeout=timeout)
         return r.returncode, r.stdout, r.stderr
     except subprocess.TimeoutExpired:

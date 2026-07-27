@@ -121,7 +121,8 @@ def run(lyc, case, env_extra, timeout=900.0):
     # libgmalloc announces itself on stderr; drop that so it is not mistaken
     # for a diagnostic.
     try:
-        r = subprocess.run([str(lyc), "jit", str(case)], capture_output=True,
+        r = subprocess.run([str(lyc), "jit", str(case)],
+                           capture_output=True, stdin=subprocess.DEVNULL,
                            text=True, timeout=timeout, env=env)
     except subprocess.TimeoutExpired:
         return "timeout"
@@ -175,7 +176,8 @@ def main():
         if sidecar.exists():
             run.want, oracle = sidecar.read_text(), "sidecar"
         else:
-            run.want = subprocess.run([CPY, str(p)], capture_output=True,
+            run.want = subprocess.run([CPY, str(p)],
+                                      capture_output=True, stdin=subprocess.DEVNULL,
                                       text=True).stdout
             oracle = "cpython"
         # And the expected STATUS, which the suite states separately.

@@ -761,7 +761,8 @@ case("range.__new__(start,stop,step)", "print(len(range(1, 7, 2)))")
 
 def run(cmd, path):
     try:
-        r = subprocess.run(cmd + [str(path)], capture_output=True, text=True,
+        r = subprocess.run(cmd + [str(path)],
+                           capture_output=True, stdin=subprocess.DEVNULL, text=True,
                            timeout=300)
         return r.returncode, r.stdout, r.stderr
     except subprocess.TimeoutExpired:

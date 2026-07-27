@@ -56,7 +56,8 @@ RSS_RE = re.compile(r"^\s*(\d+)\s+maximum resident set size", re.M)
 
 def peak_rss(lyc, case):
     r = subprocess.run(["/usr/bin/time", "-l", str(lyc), "jit", str(case)],
-                       capture_output=True, text=True, timeout=1800)
+                       capture_output=True, stdin=subprocess.DEVNULL,
+                       text=True, timeout=1800)
     m = RSS_RE.search(r.stderr)
     return (int(m.group(1)) if m else None), r.returncode, r.stdout.strip()
 
