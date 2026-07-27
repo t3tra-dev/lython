@@ -25,3 +25,60 @@
 #
 # Entries are verified at configure time: naming a case that does not exist is a
 # hard error, because a stale entry would silently stop labelling anything.
+#
+# The 49 entries below were measured, not guessed: every errors/*.py was run
+# under LYTHON_PERF=1 and classified by the deepest phase the compiler reported
+# entering. Denominator 109 = 1 parse + 37 emit + 11 lower + 60 e2e, and the run
+# also re-checked each case's own .exitcode / .stdout / .stderr-re so that a case
+# failing for an unrelated reason would be reported instead of classified (0
+# such). cases/ is absent on purpose and needs no sweep: 273 of 273 carry a
+# .stdout sidecar, so every one of them must execute to produce it.
+errors/parse_error parse
+errors/annotation_forward_ref_complex emit
+errors/class_attr_instance_shadow_write emit
+errors/class_method_mutual_recursion emit
+errors/class_method_recursion emit
+errors/class_mro_conflict emit
+errors/complex_mixed_runtime emit
+errors/constructor_arity emit
+errors/del_attribute emit
+errors/del_variable emit
+errors/eq_without_hash_unhashable emit
+errors/except_star_local_rebind emit
+errors/float_truthiness emit
+errors/generic_bare_reference emit
+errors/generic_class_no_class_object emit
+errors/generic_class_pack_parameter emit
+errors/generic_class_ungrounded emit
+errors/int_truthiness emit
+errors/is_value_type emit
+errors/object_constructor_rejected emit
+errors/object_default_not_implemented emit
+errors/param_annotation_required emit
+errors/prim_factory_on_scalar emit
+errors/prim_factory_unknown emit
+errors/prim_tensor_index_not_integer emit
+errors/prim_tensor_index_out_of_range emit
+errors/prim_tensor_int_div emit
+errors/prim_tensor_int_float_broadcast emit
+errors/prim_tensor_loop_break emit
+errors/prim_to_prim_float_to_int emit
+errors/property_no_setter emit
+errors/set_of_int emit
+errors/try_handler_rebind_no_lane emit
+errors/try_loop_carried_entity_rebind emit
+errors/try_union_local_rebind emit
+errors/unknown_decorator emit
+errors/unresolved_name emit
+errors/unsupported_import emit
+errors/boxed_payload_too_wide_fields lower
+errors/class_erased_object_field lower
+errors/class_erased_object_field_int lower
+errors/generator_handler_local_yield lower
+errors/generator_method_receiver_lane lower
+errors/list_insert_on_field lower
+errors/optional_unnarrowed_object_position lower
+errors/ownership_borrowed_container_grow lower
+errors/ownership_owned_temp_two_returns lower
+errors/try_structural_rebind lower
+errors/type_object_call_via_value lower
