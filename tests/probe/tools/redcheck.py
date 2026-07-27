@@ -70,6 +70,19 @@ def main():
     args = ap.parse_args()
     old = args.old_binary.resolve()
 
+    # Why check existence instead of letting the run report it: a missing file
+    # makes lyc exit non-zero with "could not open input file", which this tool
+    # then reads as the defect firing and prints "binary usable". A typo in the
+    # --sentinel path would satisfy the one guard that exists to catch a wrong
+    # binary. The sentinel must fail BY EXHIBITING THE DEFECT, so anything that
+    # fails before the compiler sees a program has to abort instead.
+    for label, path in (("--sentinel", args.sentinel),
+                        ("old_binary", old),
+                        ("cases", args.cases)):
+        if not path.exists():
+            print(f"{label} does not exist: {path}", file=sys.stderr)
+            return 2
+
     rc, out, err = run(old, args.sentinel)
     if rc == 0:
         print(f"SENTINEL PASSED on {old}", file=sys.stderr)
