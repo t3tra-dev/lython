@@ -98,6 +98,40 @@ bool ownershipRetainOmissionTraceEnabled() {
   return enabled;
 }
 
+// LYTHON_OWNERSHIP_TRACE_PLACEMENT=1 names, for every owned call-result group,
+// which of the five placement strategies in `insertOwnedResultReleases` took it
+// -- including the strategy "none", which is the one that matters: a group no
+// strategy claims gets NO release, and the affine verifier then reports it as
+// reaching function exit unreleased, naming the producing call rather than the
+// placement hole.
+//
+// Why a trace and not a counter: the question this answers is not "how many"
+// but "which strategy declined, for which group", and two variants of one
+// program that differ only in whether the element is consumed in the body take
+// different strategies. A count cannot distinguish them.
+//
+// Why NOT infer the strategy from the emitted IR instead: the absence of a
+// release is exactly what several DIFFERENT strategies produce on decline, so
+// reading the output cannot say which one was asked. Printing what was examined
+// rather than what was concluded is the only form that separates them.
+bool ownershipPlacementTraceEnabled() {
+  static bool enabled = [] {
+    auto value = llvm::sys::Process::GetEnv("LYTHON_OWNERSHIP_TRACE_PLACEMENT");
+    return value && !value->empty() && *value != "0";
+  }();
+  return enabled;
+}
+
+void tracePlacement(llvm::StringRef strategy, mlir::func::CallOp call,
+                    const own::ResourceGroup &group) {
+  if (!ownershipPlacementTraceEnabled())
+    return;
+  llvm::errs() << "[ownership-placement] strategy=" << strategy
+               << " callee=" << call.getCallee() << " offset=" << group.offset
+               << " lanes=" << group.values.size()
+               << " conditional=" << (group.condition ? 1 : 0) << "\n";
+}
+
 // LYTHON_ABLATE_OWNERSHIP_SYMBOL_TABLE=1 restores the callee resolution this
 // file used before the symbol table below was threaded through it: each
 // `collectOwnedCallResultGroups` re-resolved `call.getCallee()` with
@@ -1629,13 +1663,47 @@ bool borrowEdgeRetainIsSpellable(mlir::Value header,
 }
 
 // Wrapper: liveness-based release for an owned call-result group.
+// An owned CALL-RESULT group whose token is consumed somewhere in the function
+// dies at that consume, exactly as an owned local or a block-argument root does
+// -- those two entry points have always passed `consumeIsDeath=true`. Passing
+// `false` here made a single consuming use anywhere abandon the whole liveness
+// placement, so every OTHER edge out of the defining block got no release at
+// all: `for i in range(n): ys = [i]` has its element consumed by the sequence
+// literal's own transfer pair on the body edge, and the loop-EXIT edge was then
+// left holding a live token. `LyRangeIterator_Next` allocates its element
+// unconditionally (`LyLong_FromI64` runs on the exhausted path too, with a zero
+// value), so that token is real and the affine verifier was right to refuse.
+//
+// Why NOT model the element as conditionally owned off `ly.runtime.valid_result_index`
+// (the reading this defect was handed over with): that attribute marks which
+// result says the element is MEANINGFUL, not which says it is OWNED. The
+// manifest allocates on both paths, so a conditional group would leave the
+// exhausted path's element unreleased -- trading a loud refusal for a silent
+// leak. The three declarations carrying the attribute were checked; all three
+// allocate unconditionally.
+//
+// Why NOT widen `insertImmediateSuccessorReleases` instead: it requires every
+// use to sit in an IMMEDIATE successor of the defining block, and the loop body
+// here is a successor-of-successor (the try anchor block sits between). It
+// declines this shape for that reason as well as for the consume.
+//
+// LYTHON_ABLATE_CONSUME_IS_DEATH_CALL_RESULTS=1 restores the old `false`. Its
+// failure mode is the refusal this change removes -- a rejected valid program,
+// never a released-twice one -- which is the only direction an ablation switch
+// over release placement may fail in.
 bool insertOwnedValueReleasesByLiveness(FuncContractCache &contracts,
                                         mlir::func::CallOp call,
                                         const own::ResourceGroup &group,
                                         own::AliasAnalysis &aliases) {
+  static bool consumeIsDeathDisabled = [] {
+    auto value = llvm::sys::Process::GetEnv(
+        "LYTHON_ABLATE_CONSUME_IS_DEATH_CALL_RESULTS");
+    return value && !value->empty() && *value != "0";
+  }();
   return releaseOwnedGroupByLiveness(contracts, call.getOperation(),
                                      call->getBlock(), call.getLoc(), group,
-                                     aliases);
+                                     aliases,
+                                     /*consumeIsDeath=*/!consumeIsDeathDisabled);
 }
 
 // If `terminator` forwards every value of `group` to arguments of a single
@@ -2287,8 +2355,10 @@ insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
           contracts, call, group, aliases);
       if (mlir::failed(inserted))
         return mlir::failure();
-      if (*inserted)
+      if (*inserted) {
+        tracePlacement("conditional", call, group);
         continue;
+      }
     }
 
     std::optional<ReleaseInsertion> release =
@@ -2302,18 +2372,25 @@ insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
         builder.setInsertionPointAfter(release->after);
       mlir::func::CallOp::create(builder, call.getLoc(),
                                  group.deallocator->function, release->group);
+      tracePlacement("straight-line", call, group);
       continue;
     }
 
-    if (insertImmediateSuccessorReleases(contracts, call, group, aliases))
+    if (insertImmediateSuccessorReleases(contracts, call, group, aliases)) {
+      tracePlacement("immediate-successor", call, group);
       continue;
+    }
 
-    if (insertOwnedValueReleasesByLiveness(contracts, call, group, aliases))
+    if (insertOwnedValueReleasesByLiveness(contracts, call, group, aliases)) {
+      tracePlacement("liveness", call, group);
       continue;
+    }
 
     mlir::func::FuncOp function = call->getParentOfType<mlir::func::FuncOp>();
-    if (!function)
+    if (!function) {
+      tracePlacement("none.no-enclosing-function", call, group);
       continue;
+    }
 
     bool canReleaseAtExits = true;
     for (mlir::Value result : group.values) {
@@ -2341,8 +2418,10 @@ insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
       if (!canReleaseAtExits)
         break;
     }
-    if (!canReleaseAtExits)
+    if (!canReleaseAtExits) {
+      tracePlacement("none.consumed-or-forwarded", call, group);
       continue;
+    }
 
     mlir::DominanceInfo dominance(function);
     llvm::SmallVector<mlir::func::ReturnOp, 4> returns;
@@ -2355,6 +2434,7 @@ insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
       mlir::func::CallOp::create(builder, returnOp.getLoc(),
                                  group.deallocator->function, group.values);
     }
+    tracePlacement("dominated-returns", call, group);
   }
   return mlir::success();
 }
