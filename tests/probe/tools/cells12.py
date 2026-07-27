@@ -254,11 +254,19 @@ def main():
     print(f"\nfilled {filled_n}/12")
     # Beside the result, not only before it: an unfilled cell here is read as a
     # regression in whatever change is being measured, and the first question is
-    # whether the machine was busy. Printing both ends means a reader can answer
-    # that from the output instead of trusting that the gate held for the whole
-    # run -- the 5m/15m figures show contention the starting 1m figure missed.
-    print(f"at start: {load_before}")
-    print(f"at end:   {quietload.load_note()}")
+    # whether the machine was busy. Printing both ends lets a reader answer that
+    # from the output instead of trusting that the gate held for the whole run.
+    #
+    # Read them differently, because they do not mean the same thing. "At start"
+    # is the contention check -- taken before this grid has spawned anything, so it
+    # is other people's load. "At end" INCLUDES this grid's own `lyc` runs, which
+    # are multithreaded (LYTHON_NUM_THREADS defaults to 4), so a figure around 8
+    # there is self-load and not evidence of a busy machine. What "at end" is good
+    # for is contention that ARRIVED mid-run: compare its 5m/15m against the
+    # starting ones, and suspect the run only if they climbed by more than this
+    # grid could account for on its own.
+    print(f"at start (other load): {load_before}")
+    print(f"at end (incl. own):    {quietload.load_note()}")
     if args.keep is None:
         shutil.rmtree(tmp, ignore_errors=True)
     else:
