@@ -533,6 +533,10 @@ private:
       unsigned depth);
   std::uint64_t collectionInitialCapacity(std::uint64_t arity) const;
   static bool isMutableContainerContractName(llvm::StringRef contract);
+  // The four contracts whose payload is an array of 16-word element boxes.
+  // Named for the boundaries that are polymorphic over all of them and so can
+  // name none of their shapes (`join`, `frozenset(iterable)`).
+  static bool isSequenceLikeContractName(llvm::StringRef contract);
   static void demoteMutableContainerEvidence(RuntimeBundle &bundle);
   void dropObjectFieldEvidence(RuntimeBundle &bundle);
   void demoteMutableContainerEvidenceFor(mlir::Value value);

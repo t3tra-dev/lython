@@ -33,7 +33,15 @@ inline constexpr std::int64_t kSecondaryArrayWord = 5;
 // Per-slot occupancy flags; unused by a sequence.
 inline constexpr std::int64_t kPresentArrayWord = 6;
 inline constexpr std::int64_t kReservedWord = 7;
+// The narrowest container handle, and therefore the minimum width at which a
+// rank-1 i64 memref can be one: `isContainerHandleType` uses it as a lower
+// bound, not as an equality, because a converted container may be WIDER than
+// its layout needs. `builtins.list` is nine words for that reason -- words 0..7
+// are this layout (5 and 6 unused by a sequence) and word 8 is dead space that
+// buys an untied single-input release interface (ABI/HandleWidthRegistry.h).
 inline constexpr std::int64_t kHandleWordCount = 8;
+inline constexpr std::int64_t kDictHandleWordCount = 8;
+inline constexpr std::int64_t kListHandleWordCount = 9;
 
 // Slot indices inside the {length, capacity} pair, which a multi-lane
 // contract still carries as its own `meta` lane. Words 2/3 above are the same

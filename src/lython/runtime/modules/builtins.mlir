@@ -5400,7 +5400,7 @@ module attributes {
   }
 
   // bytes.split(sep[, maxsplit]).
-  func.func @LyBytes_Split(%header: memref<6xi64> {ly.ownership.object_header}, %sep_header: memref<6xi64> {ly.ownership.object_header}, %maxsplit: i64 {ly.runtime.default_i64 = -1 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "split", ly.runtime.result_contract = "builtins.list", ly.runtime.element_contract = "builtins.bytes"} {
+  func.func @LyBytes_Split(%header: memref<6xi64> {ly.ownership.object_header}, %sep_header: memref<6xi64> {ly.ownership.object_header}, %maxsplit: i64 {ly.runtime.default_i64 = -1 : i64}) -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "split", ly.runtime.result_contract = "builtins.list", ly.runtime.element_contract = "builtins.bytes"} {
     %bytes = func.call @__ly_bytes_payload(%header) : (memref<6xi64>) -> memref<?xi8>
     %sep_bytes = func.call @__ly_bytes_payload(%sep_header) : (memref<6xi64>) -> memref<?xi8>
     %zero = arith.constant 0 : i64
@@ -5439,7 +5439,8 @@ module attributes {
     }
 
     %segments = arith.addi %count#1, %one : i64
-    %list:3 = func.call @LyList_FromLength(%segments) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    %list = func.call @LyList_FromLength(%segments) : (i64) -> memref<9xi64>
+    %list_items = func.call @__ly_list_items(%list) : (memref<9xi64>) -> memref<?xi64>
 
     %true_b = arith.constant true
     %emit:3 = scf.while (%pos = %zero, %slot = %zero, %go = %true_b) : (i64, i64, i1) -> (i64, i64, i1) {
@@ -5459,7 +5460,7 @@ module attributes {
         %pos_index = arith.index_cast %pos : i64 to index
         %hit_index = arith.index_cast %hit : i64 to index
         %piece = func.call @__ly_bytes_slice(%bytes, %pos_index, %hit_index) : (memref<?xi8>, index, index) -> memref<6xi64>
-        func.call @__ly_bytes_store_item(%list#2, %slot, %piece) : (memref<?xi64>, i64, memref<6xi64>) -> ()
+        func.call @__ly_bytes_store_item(%list_items, %slot, %piece) : (memref<?xi64>, i64, memref<6xi64>) -> ()
       }
       %next_pos_hit = arith.addi %hit, %sep_n : i64
       %next_pos = arith.select %matched, %next_pos_hit, %pos : i64
@@ -5470,12 +5471,12 @@ module attributes {
     %tail_start = arith.index_cast %emit#0 : i64 to index
     %len_index = arith.index_cast %len : i64 to index
     %tail = func.call @__ly_bytes_slice(%bytes, %tail_start, %len_index) : (memref<?xi8>, index, index) -> memref<6xi64>
-    func.call @__ly_bytes_store_item(%list#2, %emit#1, %tail) : (memref<?xi64>, i64, memref<6xi64>) -> ()
-    func.return %list#0, %list#1, %list#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+    func.call @__ly_bytes_store_item(%list_items, %emit#1, %tail) : (memref<?xi64>, i64, memref<6xi64>) -> ()
+    func.return %list : memref<9xi64>
   }
 
   // bytes.split() -- ASCII whitespace runs.
-  func.func @LyBytes_SplitWS(%header: memref<6xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "split", ly.runtime.result_contract = "builtins.list", ly.runtime.element_contract = "builtins.bytes"} {
+  func.func @LyBytes_SplitWS(%header: memref<6xi64> {ly.ownership.object_header}) -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "split", ly.runtime.result_contract = "builtins.list", ly.runtime.element_contract = "builtins.bytes"} {
     %bytes = func.call @__ly_bytes_payload(%header) : (memref<6xi64>) -> memref<?xi8>
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
@@ -5497,7 +5498,8 @@ module attributes {
       scf.yield %next_segs, %non_space : i64, i1
     }
 
-    %list:3 = func.call @LyList_FromLength(%count#0) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    %list = func.call @LyList_FromLength(%count#0) : (i64) -> memref<9xi64>
+    %list_items = func.call @__ly_list_items(%list) : (memref<9xi64>) -> memref<?xi64>
 
     %false_b = arith.constant false
     scf.for %i = %c0 to %dim step %c1 iter_args(%slot = %zero, %run_start = %dim, %in_run = %false_b) -> (i64, index, i1) {
@@ -5512,7 +5514,7 @@ module attributes {
       %new_start = arith.select %starts, %i, %run_start : index
       scf.if %ends {
         %piece = func.call @__ly_bytes_slice(%bytes, %run_start, %i) : (memref<?xi8>, index, index) -> memref<6xi64>
-        func.call @__ly_bytes_store_item(%list#2, %slot, %piece) : (memref<?xi64>, i64, memref<6xi64>) -> ()
+        func.call @__ly_bytes_store_item(%list_items, %slot, %piece) : (memref<?xi64>, i64, memref<6xi64>) -> ()
       }
       %bump = arith.select %ends, %one, %zero : i64
       %next_slot = arith.addi %slot, %bump : i64
@@ -5521,22 +5523,21 @@ module attributes {
       %closes = arith.andi %is_last, %non_space : i1
       scf.if %closes {
         %piece = func.call @__ly_bytes_slice(%bytes, %new_start, %dim) : (memref<?xi8>, index, index) -> memref<6xi64>
-        func.call @__ly_bytes_store_item(%list#2, %next_slot, %piece) : (memref<?xi64>, i64, memref<6xi64>) -> ()
+        func.call @__ly_bytes_store_item(%list_items, %next_slot, %piece) : (memref<?xi64>, i64, memref<6xi64>) -> ()
       }
       scf.yield %next_slot, %new_start, %non_space : i64, index, i1
     }
-    func.return %list#0, %list#1, %list#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+    func.return %list : memref<9xi64>
   }
 
   // bytes.join over a runtime list/tuple of bytes.
-  func.func @LyBytes_Join(%sep_header: memref<6xi64> {ly.ownership.object_header}, %seq_header: memref<2xi64> {ly.ownership.object_header}, %seq_meta: memref<2xi64>, %seq_items: memref<?xi64>) -> memref<6xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "join", ly.runtime.result_contract = "builtins.bytes"} {
+  func.func @LyBytes_Join(%sep_header: memref<6xi64> {ly.ownership.object_header}, %n: i64, %seq_items: memref<?xi64>) -> memref<6xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "join", ly.runtime.result_contract = "builtins.bytes"} {
     %sep_bytes = func.call @__ly_bytes_payload(%sep_header) : (memref<6xi64>) -> memref<?xi8>
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %sep_n = func.call @__ly_bytes_len_of(%sep_bytes) : (memref<?xi8>) -> i64
-    %n = memref.load %seq_meta[%c0] : memref<2xi64>
     %n_index = arith.index_cast %n : i64 to index
 
     %measure = scf.for %k = %c0 to %n_index step %c1 iter_args(%total = %zero) -> (i64) {
@@ -10460,7 +10461,7 @@ module attributes {
 
   // str.split(sep[, maxsplit]) -- explicit separator form. The empty
   // separator raises like CPython.
-  func.func @LyUnicode_Split(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %sep_header: memref<2xi64> {ly.ownership.object_header}, %sep_bytes: memref<?xi8>, %maxsplit: i64 {ly.runtime.default_i64 = -1 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "split", ly.runtime.result_contract = "builtins.list", ly.runtime.element_contract = "builtins.str"} {
+  func.func @LyUnicode_Split(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %sep_header: memref<2xi64> {ly.ownership.object_header}, %sep_bytes: memref<?xi8>, %maxsplit: i64 {ly.runtime.default_i64 = -1 : i64}) -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "split", ly.runtime.result_contract = "builtins.list", ly.runtime.element_contract = "builtins.str"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %minus_one = arith.constant -1 : i64
@@ -10500,7 +10501,8 @@ module attributes {
     }
 
     %segments = arith.addi %count#1, %one : i64
-    %list:3 = func.call @LyList_FromLength(%segments) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    %list = func.call @LyList_FromLength(%segments) : (i64) -> memref<9xi64>
+    %list_items = func.call @__ly_list_items(%list) : (memref<9xi64>) -> memref<?xi64>
 
     // Pass 2: emit the segments.
     %true_split2 = arith.constant true
@@ -10520,7 +10522,7 @@ module attributes {
       scf.if %matched {
         %pos_index = arith.index_cast %pos : i64 to index
         %hit_index = arith.index_cast %hit : i64 to index
-        func.call @__ly_unicode_store_slice(%list#2, %slot, %header, %bytes, %pos_index, %hit_index) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>, index, index) -> ()
+        func.call @__ly_unicode_store_slice(%list_items, %slot, %header, %bytes, %pos_index, %hit_index) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>, index, index) -> ()
       }
       %next_pos_hit = arith.addi %hit, %sep_n : i64
       %next_pos = arith.select %matched, %next_pos_hit, %pos : i64
@@ -10530,14 +10532,14 @@ module attributes {
     }
     %tail_start = arith.index_cast %emit#0 : i64 to index
     %len_index = arith.index_cast %len : i64 to index
-    func.call @__ly_unicode_store_slice(%list#2, %emit#1, %header, %bytes, %tail_start, %len_index) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>, index, index) -> ()
-    func.return %list#0, %list#1, %list#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+    func.call @__ly_unicode_store_slice(%list_items, %emit#1, %header, %bytes, %tail_start, %len_index) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>, index, index) -> ()
+    func.return %list : memref<9xi64>
   }
 
   // str.rsplit(sep[, maxsplit]): scans right-to-left (a left scan with a
   // skip count is wrong when candidate matches overlap: "aaa".rsplit("aa")
   // is ['a', ''], not ['', 'a']), filling slots from the back.
-  func.func @LyUnicode_RSplit(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %sep_header: memref<2xi64> {ly.ownership.object_header}, %sep_bytes: memref<?xi8>, %maxsplit: i64 {ly.runtime.default_i64 = -1 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "rsplit", ly.runtime.result_contract = "builtins.list", ly.runtime.element_contract = "builtins.str"} {
+  func.func @LyUnicode_RSplit(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %sep_header: memref<2xi64> {ly.ownership.object_header}, %sep_bytes: memref<?xi8>, %maxsplit: i64 {ly.runtime.default_i64 = -1 : i64}) -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "rsplit", ly.runtime.result_contract = "builtins.list", ly.runtime.element_contract = "builtins.str"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %minus_one = arith.constant -1 : i64
@@ -10575,7 +10577,8 @@ module attributes {
     }
 
     %segments = arith.addi %count#1, %one : i64
-    %list:3 = func.call @LyList_FromLength(%segments) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    %list = func.call @LyList_FromLength(%segments) : (i64) -> memref<9xi64>
+    %list_items = func.call @__ly_list_items(%list) : (memref<9xi64>) -> memref<?xi64>
 
     %true_rsplit2 = arith.constant true
     %emit:3 = scf.while (%end = %len, %slot = %count#1, %go = %true_rsplit2) : (i64, i64, i1) -> (i64, i64, i1) {
@@ -10594,7 +10597,7 @@ module attributes {
         %seg_start = arith.addi %hit, %sep_n : i64
         %seg_start_index = arith.index_cast %seg_start : i64 to index
         %end_index = arith.index_cast %end : i64 to index
-        func.call @__ly_unicode_store_slice(%list#2, %slot, %header, %bytes, %seg_start_index, %end_index) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>, index, index) -> ()
+        func.call @__ly_unicode_store_slice(%list_items, %slot, %header, %bytes, %seg_start_index, %end_index) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>, index, index) -> ()
       }
       %next_end = arith.select %matched, %hit, %end : i64
       %bump = arith.select %matched, %one, %zero : i64
@@ -10603,15 +10606,15 @@ module attributes {
     }
     %c0 = arith.constant 0 : index
     %head_end = arith.index_cast %emit#0 : i64 to index
-    func.call @__ly_unicode_store_slice(%list#2, %zero, %header, %bytes, %c0, %head_end) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>, index, index) -> ()
-    func.return %list#0, %list#1, %list#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+    func.call @__ly_unicode_store_slice(%list_items, %zero, %header, %bytes, %c0, %head_end) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>, index, index) -> ()
+    func.return %list : memref<9xi64>
   }
 
   // Whitespace split (str.split() / str.rsplit() with no separator): runs
   // of Unicode whitespace delimit; leading/trailing whitespace produces no
   // empty segments. Unlimited maxsplit makes the two directions agree, so
   // one forward implementation serves both names.
-  func.func private @__ly_unicode_split_ws_core(%header: memref<2xi64>, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_unicode_split_ws_core(%header: memref<2xi64>, %bytes: memref<?xi8>) -> memref<9xi64> attributes {ly.ownership.owned_results = [0]} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %zero = arith.constant 0 : i64
@@ -10634,7 +10637,8 @@ module attributes {
       scf.yield %next_segs, %non_space : i64, i1
     }
 
-    %list:3 = func.call @LyList_FromLength(%count#0) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    %list = func.call @LyList_FromLength(%count#0) : (i64) -> memref<9xi64>
+    %list_items = func.call @__ly_list_items(%list) : (memref<9xi64>) -> memref<?xi64>
 
     // Pass 2: emit each run.
     %false_ws2 = arith.constant false
@@ -10648,7 +10652,7 @@ module attributes {
       %ends = arith.andi %is_space, %in_run : i1
       %new_start = arith.select %starts, %i, %run_start : index
       scf.if %ends {
-        func.call @__ly_unicode_store_slice(%list#2, %slot, %header, %bytes, %run_start, %i) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>, index, index) -> ()
+        func.call @__ly_unicode_store_slice(%list_items, %slot, %header, %bytes, %run_start, %i) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>, index, index) -> ()
       }
       %bump = arith.select %ends, %one, %zero : i64
       %next_slot = arith.addi %slot, %bump : i64
@@ -10656,21 +10660,21 @@ module attributes {
       %is_last = arith.cmpi eq, %i, %last : index
       %closes = arith.andi %is_last, %non_space : i1
       scf.if %closes {
-        func.call @__ly_unicode_store_slice(%list#2, %next_slot, %header, %bytes, %new_start, %len_index) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>, index, index) -> ()
+        func.call @__ly_unicode_store_slice(%list_items, %next_slot, %header, %bytes, %new_start, %len_index) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>, index, index) -> ()
       }
       scf.yield %next_slot, %new_start, %non_space : i64, index, i1
     }
-    func.return %list#0, %list#1, %list#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+    func.return %list : memref<9xi64>
   }
 
-  func.func @LyUnicode_SplitWS(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "split", ly.runtime.result_contract = "builtins.list", ly.runtime.element_contract = "builtins.str"} {
-    %result:3 = func.call @__ly_unicode_split_ws_core(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
-    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  func.func @LyUnicode_SplitWS(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "split", ly.runtime.result_contract = "builtins.list", ly.runtime.element_contract = "builtins.str"} {
+    %result = func.call @__ly_unicode_split_ws_core(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> memref<9xi64>
+    func.return %result : memref<9xi64>
   }
 
-  func.func @LyUnicode_RSplitWS(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "rsplit", ly.runtime.result_contract = "builtins.list", ly.runtime.element_contract = "builtins.str"} {
-    %result:3 = func.call @__ly_unicode_split_ws_core(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
-    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  func.func @LyUnicode_RSplitWS(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "rsplit", ly.runtime.result_contract = "builtins.list", ly.runtime.element_contract = "builtins.str"} {
+    %result = func.call @__ly_unicode_split_ws_core(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> memref<9xi64>
+    func.return %result : memref<9xi64>
   }
 
   // Unicode line boundaries per CPython str.splitlines: \n \v \f \r \x1c
@@ -10702,7 +10706,7 @@ module attributes {
     func.return %result : i1
   }
 
-  func.func private @__ly_unicode_splitlines_core(%header: memref<2xi64>, %bytes: memref<?xi8>, %keepends: i1) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_unicode_splitlines_core(%header: memref<2xi64>, %bytes: memref<?xi8>, %keepends: i1) -> memref<9xi64> attributes {ly.ownership.owned_results = [0]} {
     %c1i = arith.constant 1 : index
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
@@ -10762,7 +10766,8 @@ module attributes {
       scf.yield %next_i, %next_lines : i64, i64
     }
 
-    %list:3 = func.call @LyList_FromLength(%count#1) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    %list = func.call @LyList_FromLength(%count#1) : (i64) -> memref<9xi64>
+    %list_items = func.call @__ly_list_items(%list) : (memref<9xi64>) -> memref<?xi64>
 
     // Pass 2: emit each line ([start, eol) or [start, eol+break)).
     %emitted:2 = scf.while (%i = %zero, %slot = %zero) : (i64, i64) -> (i64, i64) {
@@ -10812,23 +10817,23 @@ module attributes {
       %seg_end = arith.select %keepends, %with_break, %scan#0 : i64
       %i_index = arith.index_cast %i : i64 to index
       %seg_end_index = arith.index_cast %seg_end : i64 to index
-      func.call @__ly_unicode_store_slice(%list#2, %slot, %header, %bytes, %i_index, %seg_end_index) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>, index, index) -> ()
+      func.call @__ly_unicode_store_slice(%list_items, %slot, %header, %bytes, %i_index, %seg_end_index) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>, index, index) -> ()
       %next_i = arith.addi %scan#0, %skip : i64
       %next_slot = arith.addi %slot, %one : i64
       scf.yield %next_i, %next_slot : i64, i64
     }
-    func.return %list#0, %list#1, %list#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+    func.return %list : memref<9xi64>
   }
 
-  func.func @LyUnicode_SplitLines(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "splitlines", ly.runtime.result_contract = "builtins.list", ly.runtime.element_contract = "builtins.str"} {
+  func.func @LyUnicode_SplitLines(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "splitlines", ly.runtime.result_contract = "builtins.list", ly.runtime.element_contract = "builtins.str"} {
     %false_bit = arith.constant false
-    %result:3 = func.call @__ly_unicode_splitlines_core(%header, %bytes, %false_bit) : (memref<2xi64>, memref<?xi8>, i1) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
-    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+    %result = func.call @__ly_unicode_splitlines_core(%header, %bytes, %false_bit) : (memref<2xi64>, memref<?xi8>, i1) -> memref<9xi64>
+    func.return %result : memref<9xi64>
   }
 
-  func.func @LyUnicode_SplitLinesKeep(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %keepends: i1) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "splitlines", ly.runtime.result_contract = "builtins.list", ly.runtime.element_contract = "builtins.str"} {
-    %result:3 = func.call @__ly_unicode_splitlines_core(%header, %bytes, %keepends) : (memref<2xi64>, memref<?xi8>, i1) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
-    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  func.func @LyUnicode_SplitLinesKeep(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %keepends: i1) -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "splitlines", ly.runtime.result_contract = "builtins.list", ly.runtime.element_contract = "builtins.str"} {
+    %result = func.call @__ly_unicode_splitlines_core(%header, %bytes, %keepends) : (memref<2xi64>, memref<?xi8>, i1) -> memref<9xi64>
+    func.return %result : memref<9xi64>
   }
 
   // str.partition / str.rpartition: a 3-tuple of fresh strs (the separator
@@ -10972,14 +10977,13 @@ module attributes {
   }
 
   // str.join over a runtime list/tuple of strs (identical physical layout).
-  func.func @LyUnicode_Join(%sep_header: memref<2xi64> {ly.ownership.object_header}, %sep_bytes: memref<?xi8>, %seq_header: memref<2xi64> {ly.ownership.object_header}, %seq_meta: memref<2xi64>, %seq_items: memref<?xi64>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "join", ly.runtime.result_contract = "builtins.str"} {
+  func.func @LyUnicode_Join(%sep_header: memref<2xi64> {ly.ownership.object_header}, %sep_bytes: memref<?xi8>, %n: i64, %seq_items: memref<?xi64>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "join", ly.runtime.result_contract = "builtins.str"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %sep_n = func.call @__ly_unicode_count(%sep_header, %sep_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
     %sep_width = func.call @__ly_unicode_width(%sep_header) : (memref<2xi64>) -> i64
-    %n = memref.load %seq_meta[%c0] : memref<2xi64>
     %n_index = arith.index_cast %n : i64 to index
 
     // Pass 1: total code points and widest element (operands are canonical,
@@ -16225,18 +16229,21 @@ module attributes {
     func.return
   }
 
-  func.func @LyList_Sort(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>) attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "sort"} {
-    %c0 = arith.constant 0 : index
-    %len = memref.load %meta[%c0] : memref<2xi64>
+  func.func @LyList_Sort(%self: memref<9xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "sort"} {
+    %length_slot = arith.constant 2 : index
+    %len = memref.load %self[%length_slot] : memref<9xi64>
+    %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
     func.call @__ly_sort_slots(%items, %len) : (memref<?xi64>, i64) -> ()
     func.return
   }
 
-  func.func @LyList_Reverse(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>) attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "reverse"} {
+  func.func @LyList_Reverse(%self: memref<9xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "reverse"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c2 = arith.constant 2 : index
-    %len = memref.load %meta[%c0] : memref<2xi64>
+    %length_slot = arith.constant 2 : index
+    %len = memref.load %self[%length_slot] : memref<9xi64>
+    %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
     %len_index = arith.index_cast %len : i64 to index
     %half = arith.divui %len_index, %c2 : index
     scf.for %i = %c0 to %half step %c1 {
@@ -16247,42 +16254,59 @@ module attributes {
     func.return
   }
 
-  func.func @LyList_EqBool(%lh: memref<2xi64> {ly.ownership.object_header}, %lm: memref<2xi64>, %li: memref<?xi64>, %rh: memref<2xi64> {ly.ownership.object_header}, %rm: memref<2xi64>, %ri: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "__eq__"} {
-    %eq = func.call @LyTuple_EqBool(%lh, %lm, %li, %rh, %rm, %ri) : (memref<2xi64>, memref<2xi64>, memref<?xi64>, memref<2xi64>, memref<2xi64>, memref<?xi64>) -> i1
+  // The six list comparisons read length from handle word 2 and the items
+  // array through the handle, then share tuple's element loops.
+  func.func private @__ly_list_compare(%lhs: memref<9xi64>, %rhs: memref<9xi64>) -> i64 {
+    %length_slot = arith.constant 2 : index
+    %llen = memref.load %lhs[%length_slot] : memref<9xi64>
+    %rlen = memref.load %rhs[%length_slot] : memref<9xi64>
+    %li = func.call @__ly_list_items(%lhs) : (memref<9xi64>) -> memref<?xi64>
+    %ri = func.call @__ly_list_items(%rhs) : (memref<9xi64>) -> memref<?xi64>
+    %cmp = func.call @__ly_sequence_compare_lens(%llen, %li, %rlen, %ri) : (i64, memref<?xi64>, i64, memref<?xi64>) -> i64
+    func.return %cmp : i64
+  }
+
+  func.func @LyList_EqBool(%lhs: memref<9xi64> {ly.ownership.object_header}, %rhs: memref<9xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "__eq__"} {
+    %length_slot = arith.constant 2 : index
+    %llen = memref.load %lhs[%length_slot] : memref<9xi64>
+    %rlen = memref.load %rhs[%length_slot] : memref<9xi64>
+    %li = func.call @__ly_list_items(%lhs) : (memref<9xi64>) -> memref<?xi64>
+    %ri = func.call @__ly_list_items(%rhs) : (memref<9xi64>) -> memref<?xi64>
+    %eq = func.call @__ly_sequence_equal_lens(%llen, %li, %rlen, %ri) : (i64, memref<?xi64>, i64, memref<?xi64>) -> i1
     func.return %eq : i1
   }
 
-  func.func @LyList_NeBool(%lh: memref<2xi64> {ly.ownership.object_header}, %lm: memref<2xi64>, %li: memref<?xi64>, %rh: memref<2xi64> {ly.ownership.object_header}, %rm: memref<2xi64>, %ri: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "__ne__"} {
-    %eq = func.call @LyTuple_EqBool(%lh, %lm, %li, %rh, %rm, %ri) : (memref<2xi64>, memref<2xi64>, memref<?xi64>, memref<2xi64>, memref<2xi64>, memref<?xi64>) -> i1
+  func.func @LyList_NeBool(%lhs: memref<9xi64> {ly.ownership.object_header}, %rhs: memref<9xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "__ne__"} {
+    %eq = func.call @LyList_EqBool(%lhs, %rhs) : (memref<9xi64>, memref<9xi64>) -> i1
     %true = arith.constant true
     %ne = arith.xori %eq, %true : i1
     func.return %ne : i1
   }
 
-  func.func @LyList_LtBool(%lh: memref<2xi64> {ly.ownership.object_header}, %lm: memref<2xi64>, %li: memref<?xi64>, %rh: memref<2xi64> {ly.ownership.object_header}, %rm: memref<2xi64>, %ri: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "__lt__"} {
+  func.func @LyList_LtBool(%lhs: memref<9xi64> {ly.ownership.object_header}, %rhs: memref<9xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "__lt__"} {
     %zero = arith.constant 0 : i64
-    %cmp = func.call @__ly_sequence_compare_items(%lm, %li, %rm, %ri) : (memref<2xi64>, memref<?xi64>, memref<2xi64>, memref<?xi64>) -> i64
+    %cmp = func.call @__ly_list_compare(%lhs, %rhs) : (memref<9xi64>, memref<9xi64>) -> i64
     %lt = arith.cmpi slt, %cmp, %zero : i64
     func.return %lt : i1
   }
 
-  func.func @LyList_LeBool(%lh: memref<2xi64> {ly.ownership.object_header}, %lm: memref<2xi64>, %li: memref<?xi64>, %rh: memref<2xi64> {ly.ownership.object_header}, %rm: memref<2xi64>, %ri: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "__le__"} {
+  func.func @LyList_LeBool(%lhs: memref<9xi64> {ly.ownership.object_header}, %rhs: memref<9xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "__le__"} {
     %one = arith.constant 1 : i64
-    %cmp = func.call @__ly_sequence_compare_items(%lm, %li, %rm, %ri) : (memref<2xi64>, memref<?xi64>, memref<2xi64>, memref<?xi64>) -> i64
+    %cmp = func.call @__ly_list_compare(%lhs, %rhs) : (memref<9xi64>, memref<9xi64>) -> i64
     %le = arith.cmpi slt, %cmp, %one : i64
     func.return %le : i1
   }
 
-  func.func @LyList_GtBool(%lh: memref<2xi64> {ly.ownership.object_header}, %lm: memref<2xi64>, %li: memref<?xi64>, %rh: memref<2xi64> {ly.ownership.object_header}, %rm: memref<2xi64>, %ri: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "__gt__"} {
+  func.func @LyList_GtBool(%lhs: memref<9xi64> {ly.ownership.object_header}, %rhs: memref<9xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "__gt__"} {
     %zero = arith.constant 0 : i64
-    %cmp = func.call @__ly_sequence_compare_items(%lm, %li, %rm, %ri) : (memref<2xi64>, memref<?xi64>, memref<2xi64>, memref<?xi64>) -> i64
+    %cmp = func.call @__ly_list_compare(%lhs, %rhs) : (memref<9xi64>, memref<9xi64>) -> i64
     %gt = arith.cmpi sgt, %cmp, %zero : i64
     func.return %gt : i1
   }
 
-  func.func @LyList_GeBool(%lh: memref<2xi64> {ly.ownership.object_header}, %lm: memref<2xi64>, %li: memref<?xi64>, %rh: memref<2xi64> {ly.ownership.object_header}, %rm: memref<2xi64>, %ri: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "__ge__"} {
+  func.func @LyList_GeBool(%lhs: memref<9xi64> {ly.ownership.object_header}, %rhs: memref<9xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "__ge__"} {
     %minus_one = arith.constant -1 : i64
-    %cmp = func.call @__ly_sequence_compare_items(%lm, %li, %rm, %ri) : (memref<2xi64>, memref<?xi64>, memref<2xi64>, memref<?xi64>) -> i64
+    %cmp = func.call @__ly_list_compare(%lhs, %rhs) : (memref<9xi64>, memref<9xi64>) -> i64
     %ge = arith.cmpi sgt, %cmp, %minus_one : i64
     func.return %ge : i1
   }
@@ -16322,36 +16346,47 @@ module attributes {
     func.return %header, %meta, %items : memref<2xi64>, memref<2xi64>, memref<?xi64>
   }
 
-  func.func @LyList_Copy(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.method = "copy", ly.runtime.result_contract = "builtins.list"} {
-    %class_id = arith.constant 10 : i64
-    %h, %m, %i = func.call @__ly_sequence_copy_alloc(%class_id, %meta, %items) : (i64, memref<2xi64>, memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
-    func.return %h, %m, %i : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  func.func @LyList_Copy(%self: memref<9xi64> {ly.ownership.object_header}) -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.method = "copy", ly.runtime.result_contract = "builtins.list"} {
+    %length_slot = arith.constant 2 : index
+    %len = memref.load %self[%length_slot] : memref<9xi64>
+    %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
+    %copy = func.call @__ly_list_copy_alloc(%len, %items) : (i64, memref<?xi64>) -> memref<9xi64>
+    func.return %copy : memref<9xi64>
   }
 
   // list(xs): a fresh shallow copy of a list argument (the emitter routes
   // other iterables through the comprehension desugar instead).
-  func.func @LyBuiltin_List(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "list", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.list", ly.runtime.primitive = "builtin_list", ly.runtime.result_contract = "builtins.list"} {
-    %class_id = arith.constant 10 : i64
-    %h, %m, %i = func.call @__ly_sequence_copy_alloc(%class_id, %meta, %items) : (i64, memref<2xi64>, memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
-    func.return %h, %m, %i : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  func.func @LyBuiltin_List(%self: memref<9xi64> {ly.ownership.object_header}) -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "list", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.list", ly.runtime.primitive = "builtin_list", ly.runtime.result_contract = "builtins.list"} {
+    %length_slot = arith.constant 2 : index
+    %len = memref.load %self[%length_slot] : memref<9xi64>
+    %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
+    %copy = func.call @__ly_list_copy_alloc(%len, %items) : (i64, memref<?xi64>) -> memref<9xi64>
+    func.return %copy : memref<9xi64>
   }
 
-  // tuple(xs): freeze a list's items into a fresh tuple (lists and tuples
-  // share the sequence storage layout, so only the class id differs).
-  func.func @LyBuiltin_Tuple(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "tuple", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.list", ly.runtime.primitive = "builtin_tuple", ly.runtime.result_contract = "builtins.tuple"} {
+  // tuple(xs): freeze a list's items into a fresh tuple. The two contracts no
+  // longer share a representation -- the receiver is a handle and the result is
+  // still the three-lane tuple -- but the SLOT layout is the same, so the fill
+  // loop is shared and only the destination differs.
+  func.func @LyBuiltin_Tuple(%self: memref<9xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "tuple", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.list", ly.runtime.primitive = "builtin_tuple", ly.runtime.result_contract = "builtins.tuple"} {
     %class_id = arith.constant 11 : i64
-    %h, %m, %i = func.call @__ly_sequence_copy_alloc(%class_id, %meta, %items) : (i64, memref<2xi64>, memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    %length_slot = arith.constant 2 : index
+    %len = memref.load %self[%length_slot] : memref<9xi64>
+    %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
+    %h, %m, %i = func.call @__ly_sequence_alloc(%class_id, %len) : (i64, i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    func.call @__ly_seq_fill_copy(%i, %len, %items) : (memref<?xi64>, i64, memref<?xi64>) -> ()
     func.return %h, %m, %i : memref<2xi64>, memref<2xi64>, memref<?xi64>
   }
 
   // sorted(xs): a fresh sorted list (the argument is untouched).
-  func.func @LyBuiltin_Sorted(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "sorted", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.list", ly.runtime.primitive = "builtin_sorted", ly.runtime.result_contract = "builtins.list"} {
-    %c0 = arith.constant 0 : index
-    %class_id = arith.constant 10 : i64
-    %h, %m, %i = func.call @__ly_sequence_copy_alloc(%class_id, %meta, %items) : (i64, memref<2xi64>, memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
-    %len = memref.load %m[%c0] : memref<2xi64>
-    func.call @__ly_sort_slots(%i, %len) : (memref<?xi64>, i64) -> ()
-    func.return %h, %m, %i : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  func.func @LyBuiltin_Sorted(%self: memref<9xi64> {ly.ownership.object_header}) -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "sorted", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.list", ly.runtime.primitive = "builtin_sorted", ly.runtime.result_contract = "builtins.list"} {
+    %length_slot = arith.constant 2 : index
+    %len = memref.load %self[%length_slot] : memref<9xi64>
+    %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
+    %copy = func.call @__ly_list_copy_alloc(%len, %items) : (i64, memref<?xi64>) -> memref<9xi64>
+    %copy_items = func.call @__ly_list_items(%copy) : (memref<9xi64>) -> memref<?xi64>
+    func.call @__ly_sort_slots(%copy_items, %len) : (memref<?xi64>, i64) -> ()
+    func.return %copy : memref<9xi64>
   }
 
   // ===== impls: numeric/string free builtins =====
@@ -16857,10 +16892,14 @@ module attributes {
     func.return %header, %meta, %items : memref<2xi64>, memref<2xi64>, memref<?xi64>
   }
 
-  func.func @LyList_Concat(%lh: memref<2xi64> {ly.ownership.object_header}, %lm: memref<2xi64>, %li: memref<?xi64>, %rh: memref<2xi64> {ly.ownership.object_header}, %rm: memref<2xi64>, %ri: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.method = "__add__", ly.runtime.result_contract = "builtins.list"} {
-    %class_id = arith.constant 10 : i64
-    %result:3 = func.call @__ly_sequence_concat(%class_id, %lm, %li, %rm, %ri) : (i64, memref<2xi64>, memref<?xi64>, memref<2xi64>, memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
-    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  func.func @LyList_Concat(%lhs: memref<9xi64> {ly.ownership.object_header}, %rhs: memref<9xi64> {ly.ownership.object_header}) -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.method = "__add__", ly.runtime.result_contract = "builtins.list"} {
+    %length_slot = arith.constant 2 : index
+    %llen = memref.load %lhs[%length_slot] : memref<9xi64>
+    %rlen = memref.load %rhs[%length_slot] : memref<9xi64>
+    %li = func.call @__ly_list_items(%lhs) : (memref<9xi64>) -> memref<?xi64>
+    %ri = func.call @__ly_list_items(%rhs) : (memref<9xi64>) -> memref<?xi64>
+    %result = func.call @__ly_list_concat_alloc(%llen, %li, %rlen, %ri) : (i64, memref<?xi64>, i64, memref<?xi64>) -> memref<9xi64>
+    func.return %result : memref<9xi64>
   }
 
   func.func @LyTuple_Concat(%lh: memref<2xi64> {ly.ownership.object_header}, %lm: memref<2xi64>, %li: memref<?xi64>, %rh: memref<2xi64> {ly.ownership.object_header}, %rm: memref<2xi64>, %ri: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.tuple", ly.runtime.method = "__add__", ly.runtime.result_contract = "builtins.tuple"} {
@@ -16920,10 +16959,13 @@ module attributes {
     func.return %header, %meta, %items : memref<2xi64>, memref<2xi64>, memref<?xi64>
   }
 
-  func.func @LyList_Repeat(%lh: memref<2xi64> {ly.ownership.object_header}, %lm: memref<2xi64>, %li: memref<?xi64>, %nh: memref<2xi64> {ly.ownership.object_header}, %nm: memref<2xi64>, %nd: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.method = "__mul__", ly.runtime.result_contract = "builtins.list"} {
-    %class_id = arith.constant 10 : i64
-    %result:3 = func.call @__ly_sequence_repeat(%class_id, %lm, %li, %nm, %nd) : (i64, memref<2xi64>, memref<?xi64>, memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
-    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  func.func @LyList_Repeat(%self: memref<9xi64> {ly.ownership.object_header}, %nh: memref<2xi64> {ly.ownership.object_header}, %nm: memref<2xi64>, %nd: memref<?xi32>) -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.method = "__mul__", ly.runtime.result_contract = "builtins.list"} {
+    %length_slot = arith.constant 2 : index
+    %len = memref.load %self[%length_slot] : memref<9xi64>
+    %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
+    %n = func.call @__ly_seq_repeat_count(%nm, %nd) : (memref<2xi64>, memref<?xi32>) -> i64
+    %result = func.call @__ly_list_repeat_alloc(%len, %items, %n) : (i64, memref<?xi64>, i64) -> memref<9xi64>
+    func.return %result : memref<9xi64>
   }
 
   func.func @LyTuple_Repeat(%lh: memref<2xi64> {ly.ownership.object_header}, %lm: memref<2xi64>, %li: memref<?xi64>, %nh: memref<2xi64> {ly.ownership.object_header}, %nm: memref<2xi64>, %nd: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.tuple", ly.runtime.method = "__mul__", ly.runtime.result_contract = "builtins.tuple"} {
@@ -16974,13 +17016,15 @@ module attributes {
   // borrowed receivers (closure captures, parameters), which the rebind
   // convention cannot express.
 
-  // list.clear: release every element, zero the handle words, len = 0.
-  func.func @LyList_Clear(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>) attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "clear"} {
+  // list.clear: release every element, zero the slot words, len = 0.
+  func.func @LyList_Clear(%self: memref<9xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "clear"} {
     %zero = arith.constant 0 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c16 = arith.constant 16 : index
-    %len = memref.load %meta[%c0] : memref<2xi64>
+    %length_slot = arith.constant 2 : index
+    %len = memref.load %self[%length_slot] : memref<9xi64>
+    %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
     %len_index = arith.index_cast %len : i64 to index
     scf.for %i = %c0 to %len_index step %c1 {
       %ii = arith.index_cast %i : index to i64
@@ -16990,21 +17034,30 @@ module attributes {
     scf.for %w = %c0 to %total step %c1 {
       memref.store %zero, %items[%w] : memref<?xi64>
     }
-    memref.store %zero, %meta[%c0] : memref<2xi64>
+    memref.store %zero, %self[%length_slot] : memref<9xi64>
     func.return
   }
 
-  // list.extend(other): copy other's handle words past the current end and
-  // retain each copied slot. Rebind convention (transfer in, owned out):
-  // ensure_capacity may reallocate the storage.
-  func.func @LyList_ExtendM(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>, %oh: memref<2xi64> {ly.ownership.object_header}, %om: memref<2xi64>, %oi: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.transfer_args = [0], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.method = "extend", ly.runtime.result_contract = "builtins.list"} {
+  // list.extend(other): copy other's slot words past the current end and retain
+  // each copied slot. Void and non-transferring: ensure_capacity may reallocate
+  // the items array, but it publishes the new base THROUGH the handle, so there
+  // is nothing to hand back.
+  //
+  // Both views are derived AFTER the growth on purpose. `xs.extend(xs)` aliases
+  // the two, and the pre-growth array is freed by the growth -- the three-lane
+  // form read the source through a lane captured before it, which is a
+  // use-after-free the one-lane form cannot spell.
+  func.func @LyList_ExtendM(%self: memref<9xi64> {ly.ownership.object_header}, %other: memref<9xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "extend"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c16 = arith.constant 16 : index
-    %len = memref.load %meta[%c0] : memref<2xi64>
-    %olen = memref.load %om[%c0] : memref<2xi64>
+    %length_slot = arith.constant 2 : index
+    %len = memref.load %self[%length_slot] : memref<9xi64>
+    %olen = memref.load %other[%length_slot] : memref<9xi64>
     %required = arith.addi %len, %olen : i64
-    %grown:3 = func.call @LyList_EnsureCapacity(%header, %meta, %items, %required) : (memref<2xi64>, memref<2xi64>, memref<?xi64>, i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    func.call @LyList_EnsureCapacity(%self, %required) : (memref<9xi64>, i64) -> ()
+    %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
+    %oitems = func.call @__ly_list_items(%other) : (memref<9xi64>) -> memref<?xi64>
     %olen_index = arith.index_cast %olen : i64 to index
     %len_index = arith.index_cast %len : i64 to index
     scf.for %i = %c0 to %olen_index step %c1 {
@@ -17014,22 +17067,32 @@ module attributes {
       scf.for %w = %c0 to %c16 step %c1 {
         %src_index = arith.addi %src_base, %w : index
         %dst_index = arith.addi %dst_base, %w : index
-        %word = memref.load %oi[%src_index] : memref<?xi64>
-        memref.store %word, %grown#2[%dst_index] : memref<?xi64>
+        %word = memref.load %oitems[%src_index] : memref<?xi64>
+        memref.store %word, %items[%dst_index] : memref<?xi64>
       }
       %dst64 = arith.index_cast %dst_slot : index to i64
-      func.call @LyObject_RetainBoxedPayloadArraySlotRaw(%grown#2, %dst64) : (memref<?xi64>, i64) -> ()
+      func.call @LyObject_RetainBoxedPayloadArraySlotRaw(%items, %dst64) : (memref<?xi64>, i64) -> ()
     }
-    memref.store %required, %grown#1[%c0] : memref<2xi64>
-    func.return %grown#0, %grown#1, %grown#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+    memref.store %required, %self[%length_slot] : memref<9xi64>
+    func.return
   }
 
-  func.func @LyList_ContainsBox(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>, %elem_box: memref<16xi64>) -> i1 attributes {ly.runtime.contract = "builtins.list", ly.runtime.primitive = "contains_box"} {
-    %minus_one = arith.constant -1 : i64
+  // Probe a box against the list's slots. Split out because five list entry
+  // points want it and each would otherwise re-spell the handle reads.
+  func.func private @__ly_list_find_box(%self: memref<9xi64>, %elem_box: memref<16xi64>) -> i64 {
+    %length_slot = arith.constant 2 : index
     %box_idx = memref.extract_aligned_pointer_as_index %elem_box : memref<16xi64> -> index
     %box_i64 = arith.index_cast %box_idx : index to i64
     %box_ptr = llvm.inttoptr %box_i64 : i64 to !llvm.ptr
-    %found = func.call @__ly_sequence_find_equal(%meta, %items, %box_ptr) : (memref<2xi64>, memref<?xi64>, !llvm.ptr) -> i64
+    %len = memref.load %self[%length_slot] : memref<9xi64>
+    %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
+    %found = func.call @__ly_sequence_find_lens(%len, %items, %box_ptr) : (i64, memref<?xi64>, !llvm.ptr) -> i64
+    func.return %found : i64
+  }
+
+  func.func @LyList_ContainsBox(%self: memref<9xi64> {ly.ownership.object_header}, %elem_box: memref<16xi64>) -> i1 attributes {ly.runtime.contract = "builtins.list", ly.runtime.primitive = "contains_box"} {
+    %minus_one = arith.constant -1 : i64
+    %found = func.call @__ly_list_find_box(%self, %elem_box) : (memref<9xi64>, memref<16xi64>) -> i64
     %result = arith.cmpi ne, %found, %minus_one : i64
     func.return %result : i1
   }
@@ -17075,11 +17138,14 @@ module attributes {
     func.return %count : i64
   }
 
-  func.func @LyList_CountBox(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>, %elem_box: memref<16xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.primitive = "count_box", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyList_CountBox(%self: memref<9xi64> {ly.ownership.object_header}, %elem_box: memref<16xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.primitive = "count_box", ly.runtime.result_contract = "builtins.int"} {
+    %length_slot = arith.constant 2 : index
     %box_idx = memref.extract_aligned_pointer_as_index %elem_box : memref<16xi64> -> index
     %box_i64 = arith.index_cast %box_idx : index to i64
     %box_ptr = llvm.inttoptr %box_i64 : i64 to !llvm.ptr
-    %count = func.call @__ly_sequence_count_equal(%meta, %items, %box_ptr) : (memref<2xi64>, memref<?xi64>, !llvm.ptr) -> i64
+    %len = memref.load %self[%length_slot] : memref<9xi64>
+    %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
+    %count = func.call @__ly_sequence_count_lens(%len, %items, %box_ptr) : (i64, memref<?xi64>, !llvm.ptr) -> i64
     %h, %m, %d = func.call @LyLong_FromI64(%count) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
     func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
   }
@@ -17098,12 +17164,9 @@ module attributes {
   // "tuple.index(x): x not in tuple"
   memref.global "private" constant @__ly_tuple_msg_index_missing : memref<30xi8> = dense<[116, 117, 112, 108, 101, 46, 105, 110, 100, 101, 120, 40, 120, 41, 58, 32, 120, 32, 110, 111, 116, 32, 105, 110, 32, 116, 117, 112, 108, 101]>
 
-  func.func @LyList_IndexBox(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>, %elem_box: memref<16xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.primitive = "index_box", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyList_IndexBox(%self: memref<9xi64> {ly.ownership.object_header}, %elem_box: memref<16xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.primitive = "index_box", ly.runtime.result_contract = "builtins.int"} {
     %minus_one = arith.constant -1 : i64
-    %box_idx = memref.extract_aligned_pointer_as_index %elem_box : memref<16xi64> -> index
-    %box_i64 = arith.index_cast %box_idx : index to i64
-    %box_ptr = llvm.inttoptr %box_i64 : i64 to !llvm.ptr
-    %found = func.call @__ly_sequence_find_equal(%meta, %items, %box_ptr) : (memref<2xi64>, memref<?xi64>, !llvm.ptr) -> i64
+    %found = func.call @__ly_list_find_box(%self, %elem_box) : (memref<9xi64>, memref<16xi64>) -> i64
     %missing = arith.cmpi eq, %found, %minus_one : i64
     scf.if %missing {
       // The message is a fixed string, not `repr(x) is not in list`: CPython
@@ -17140,26 +17203,25 @@ module attributes {
   // "list.remove(x): x not in list"
   memref.global "private" constant @__ly_list_msg_remove_missing : memref<29xi8> = dense<[108, 105, 115, 116, 46, 114, 101, 109, 111, 118, 101, 40, 120, 41, 58, 32, 120, 32, 110, 111, 116, 32, 105, 110, 32, 108, 105, 115, 116]>
 
-  func.func @LyList_RemoveBox(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>, %elem_box: memref<16xi64>) attributes {ly.runtime.contract = "builtins.list", ly.runtime.primitive = "remove_box"} {
+  func.func @LyList_RemoveBox(%self: memref<9xi64> {ly.ownership.object_header}, %elem_box: memref<16xi64>) attributes {ly.runtime.contract = "builtins.list", ly.runtime.primitive = "remove_box"} {
     %minus_one = arith.constant -1 : i64
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c16 = arith.constant 16 : index
-    %box_idx = memref.extract_aligned_pointer_as_index %elem_box : memref<16xi64> -> index
-    %box_i64 = arith.index_cast %box_idx : index to i64
-    %box_ptr = llvm.inttoptr %box_i64 : i64 to !llvm.ptr
-    %found = func.call @__ly_sequence_find_equal(%meta, %items, %box_ptr) : (memref<2xi64>, memref<?xi64>, !llvm.ptr) -> i64
+    %length_slot = arith.constant 2 : index
+    %found = func.call @__ly_list_find_box(%self, %elem_box) : (memref<9xi64>, memref<16xi64>) -> i64
     %missing = arith.cmpi eq, %found, %minus_one : i64
     scf.if %missing {
       %value_error = arith.constant 53 : i64
       %msg_static = memref.get_global @__ly_list_msg_remove_missing : memref<29xi8>
       %msg = memref.cast %msg_static : memref<29xi8> to memref<?xi8>
-      %len = arith.constant 29 : i64
-      func.call @__ly_long_raise_message(%value_error, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
+      %msg_len = arith.constant 29 : i64
+      func.call @__ly_long_raise_message(%value_error, %msg, %msg_len) : (i64, memref<?xi8>, i64) -> ()
     }
-    %len = memref.load %meta[%c0] : memref<2xi64>
+    %len = memref.load %self[%length_slot] : memref<9xi64>
+    %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
     func.call @LyObject_ReleaseBoxedPayloadArraySlotRaw(%items, %found) : (memref<?xi64>, i64) -> ()
     %slot_index = arith.index_cast %found : i64 to index
     %from = arith.addi %slot_index, %c1 : index
@@ -17182,7 +17244,7 @@ module attributes {
       %dst = arith.addi %last_base, %w : index
       memref.store %zero, %items[%dst] : memref<?xi64>
     }
-    memref.store %new_len, %meta[%c0] : memref<2xi64>
+    memref.store %new_len, %self[%length_slot] : memref<9xi64>
     func.return
   }
 
@@ -17195,10 +17257,8 @@ module attributes {
   // exist because compile-time element evidence does not cross function
   // boundaries (closure captures, parameters): the payload state is the only
   // authority there.
-  func.func private @__ly_list_normalize_assign_index(%meta: memref<2xi64>, %raw_index: i64) -> i64 {
+  func.func private @__ly_list_normalize_assign_index(%len: i64, %raw_index: i64) -> i64 {
     %zero = arith.constant 0 : i64
-    %c0 = arith.constant 0 : index
-    %len = memref.load %meta[%c0] : memref<2xi64>
     %is_neg = arith.cmpi slt, %raw_index, %zero : i64
     %adjusted = arith.addi %raw_index, %len : i64
     %normalized = arith.select %is_neg, %adjusted, %raw_index : i1, i64
@@ -17216,11 +17276,14 @@ module attributes {
     func.return %normalized : i64
   }
 
-  func.func @LyList_SetItemBox(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>, %raw_index: i64, %value_box: memref<16xi64>) attributes {ly.runtime.contract = "builtins.list", ly.runtime.primitive = "setitem_box"} {
+  func.func @LyList_SetItemBox(%self: memref<9xi64> {ly.ownership.object_header}, %raw_index: i64, %value_box: memref<16xi64>) attributes {ly.runtime.contract = "builtins.list", ly.runtime.primitive = "setitem_box"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c16 = arith.constant 16 : index
-    %normalized = func.call @__ly_list_normalize_assign_index(%meta, %raw_index) : (memref<2xi64>, i64) -> i64
+    %length_slot = arith.constant 2 : index
+    %len = memref.load %self[%length_slot] : memref<9xi64>
+    %normalized = func.call @__ly_list_normalize_assign_index(%len, %raw_index) : (i64, i64) -> i64
+    %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
     func.call @LyObject_ReleaseBoxedPayloadArraySlotRaw(%items, %normalized) : (memref<?xi64>, i64) -> ()
     %slot = arith.index_cast %normalized : i64 to index
     %base = arith.muli %slot, %c16 : index
@@ -17232,14 +17295,16 @@ module attributes {
     func.return
   }
 
-  func.func @LyList_DelItemIndex(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>, %raw_index: i64) attributes {ly.runtime.contract = "builtins.list", ly.runtime.primitive = "delitem_index"} {
+  func.func @LyList_DelItemIndex(%self: memref<9xi64> {ly.ownership.object_header}, %raw_index: i64) attributes {ly.runtime.contract = "builtins.list", ly.runtime.primitive = "delitem_index"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c16 = arith.constant 16 : index
-    %normalized = func.call @__ly_list_normalize_assign_index(%meta, %raw_index) : (memref<2xi64>, i64) -> i64
-    %len = memref.load %meta[%c0] : memref<2xi64>
+    %length_slot = arith.constant 2 : index
+    %len = memref.load %self[%length_slot] : memref<9xi64>
+    %normalized = func.call @__ly_list_normalize_assign_index(%len, %raw_index) : (i64, i64) -> i64
+    %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
     func.call @LyObject_ReleaseBoxedPayloadArraySlotRaw(%items, %normalized) : (memref<?xi64>, i64) -> ()
     %slot_index = arith.index_cast %normalized : i64 to index
     %from = arith.addi %slot_index, %c1 : index
@@ -17262,7 +17327,7 @@ module attributes {
       %dst = arith.addi %last_base, %w : index
       memref.store %zero, %items[%dst] : memref<?xi64>
     }
-    memref.store %new_len, %meta[%c0] : memref<2xi64>
+    memref.store %new_len, %self[%length_slot] : memref<9xi64>
     func.return
   }
 
@@ -17278,14 +17343,16 @@ module attributes {
   // Parking rather than returning the element by value: the element type is
   // `$T`, so a by-value signature would need one manifest overload per physical
   // lane count, while the box words are a single fixed-width shape.
-  func.func @LyList_PopSlot(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>, %raw_index: i64) -> i64 attributes {ly.runtime.contract = "builtins.list", ly.runtime.primitive = "pop_slot"} {
+  func.func @LyList_PopSlot(%self: memref<9xi64> {ly.ownership.object_header}, %raw_index: i64) -> i64 attributes {ly.runtime.contract = "builtins.list", ly.runtime.primitive = "pop_slot"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c16 = arith.constant 16 : index
     %index_error = arith.constant 55 : i64
-    %len = memref.load %meta[%c0] : memref<2xi64>
+    %length_slot = arith.constant 2 : index
+    %len = memref.load %self[%length_slot] : memref<9xi64>
+    %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
     %empty = arith.cmpi sle, %len, %zero : i64
     scf.if %empty {
       %msg_static = memref.get_global @__ly_list_msg_pop_empty : memref<19xi8>
@@ -17337,7 +17404,7 @@ module attributes {
       %word = memref.load %scratch[%w] : memref<16xi64>
       memref.store %word, %items[%dst] : memref<?xi64>
     }
-    memref.store %new_len, %meta[%c0] : memref<2xi64>
+    memref.store %new_len, %self[%length_slot] : memref<9xi64>
     func.return %new_len : i64
   }
 
@@ -17352,13 +17419,15 @@ module attributes {
   // have grown the payload to len+1 through `ensure_capacity` first; this entry
   // point only rearranges an already-sized array so it stays usable on the
   // rebound triple. CPython clamps the index instead of raising.
-  func.func @LyList_InsertBox(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>, %raw_index: i64, %value_box: memref<16xi64>) attributes {ly.runtime.contract = "builtins.list", ly.runtime.primitive = "insert_box"} {
+  func.func @LyList_InsertBox(%self: memref<9xi64> {ly.ownership.object_header}, %raw_index: i64, %value_box: memref<16xi64>) attributes {ly.runtime.contract = "builtins.list", ly.runtime.primitive = "insert_box"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c16 = arith.constant 16 : index
-    %len = memref.load %meta[%c0] : memref<2xi64>
+    %length_slot = arith.constant 2 : index
+    %len = memref.load %self[%length_slot] : memref<9xi64>
+    %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
     %is_neg = arith.cmpi slt, %raw_index, %zero : i64
     %adjusted = arith.addi %raw_index, %len : i64
     %from_end = arith.select %is_neg, %adjusted, %raw_index : i1, i64
@@ -17391,7 +17460,7 @@ module attributes {
       memref.store %word, %items[%dst] : memref<?xi64>
     }
     %new_len = arith.addi %len, %one : i64
-    memref.store %new_len, %meta[%c0] : memref<2xi64>
+    memref.store %new_len, %self[%length_slot] : memref<9xi64>
     func.return
   }
 
@@ -17463,7 +17532,7 @@ module attributes {
     func.return %box : memref<16xi64>
   }
 
-  func.func private @LyList_Shape() -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.runtime.contract = "builtins.list", ly.runtime.shape}
+  func.func private @LyList_Shape() -> memref<9xi64> attributes {ly.runtime.contract = "builtins.list", ly.runtime.shape}
 
   func.func private @LyTuple_Shape() -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.runtime.contract = "builtins.tuple", ly.runtime.shape}
 
@@ -17603,10 +17672,122 @@ module attributes {
     func.return %view : memref<?xi64>
   }
 
-  func.func @LyList_FromLength(%length: i64 {ly.runtime.default_i64 = 0 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 10 : i64, ly.runtime.contract = "builtins.list", ly.runtime.initializer = "__new__"} {
+  // ===== builtins.list: one entity, one root =====
+  //
+  // The handle is `memref<9xi64>`:
+  //
+  //   word 0  refcount            word 5  unused (mapping secondary array)
+  //   word 1  class id (10)       word 6  unused (mapping present flags)
+  //   word 2  length              word 7  reserved
+  //   word 3  capacity            word 8  reserved
+  //   word 4  items base address
+  //
+  // Words 0-7 are the layout in Passes/Runtime/ABI/ContainerLayout.h, which
+  // `dict` already uses; a sequence leaves 5 and 6 unused. Word 8 is dead
+  // space, and it is deliberate: 9 is the narrowest width that is FREE as a
+  // single-input release interface (Passes/Runtime/ABI/HandleWidthRegistry.h),
+  // and one-laning strips `shapeMatch` of any way to break a tie, so an
+  // untied width is what replaces the protection the conversion removes. It
+  // costs 32 B on a handle that already carries a 1024-slot (16 KB) items
+  // array at minimum capacity.
+  //
+  // Why the items array is an ADDRESS in the handle and not a value beside it:
+  // a growth writes the new address THROUGH the handle, so every holder
+  // observes it with no further action and a mutation has nothing to rename.
+  // That is what lets ensure_capacity / extend / __setslice__ / __delslice__
+  // be void and non-transferring (rfc/memory-safety-proof.md, `Interior`).
+  func.func private @__ly_list_alloc(%length: i64) -> memref<9xi64> attributes {ly.ownership.owned_results = [0]} {
+    %one = arith.constant 1 : i64
+    %minimum_capacity = arith.constant 64 : i64
+    %handle_words = arith.constant 16 : i64
     %class_id = arith.constant 10 : i64
-    %header, %meta, %items = func.call @__ly_sequence_alloc(%class_id, %length) : (i64, i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
-    func.return %header, %meta, %items : memref<2xi64>, memref<2xi64>, memref<?xi64>
+    %zero = arith.constant 0 : i64
+    %refcount_slot = arith.constant 0 : index
+    %layout_slot = arith.constant 1 : index
+    %length_slot = arith.constant 2 : index
+    %capacity_slot = arith.constant 3 : index
+    %items_slot = arith.constant 4 : index
+    %unused_secondary_slot = arith.constant 5 : index
+    %unused_present_slot = arith.constant 6 : index
+    %reserved_slot = arith.constant 7 : index
+    %pad_slot = arith.constant 8 : index
+
+    %self = memref.alloc() {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<9xi64>
+    %needs_min_capacity = arith.cmpi slt, %length, %minimum_capacity : i64
+    %capacity = arith.select %needs_min_capacity, %minimum_capacity, %length : i1, i64
+    %payload_words = arith.muli %capacity, %handle_words : i64
+    %payload_words_index = arith.index_cast %payload_words : i64 to index
+    // Plain memref.alloc with no alignment attribute is a bare malloc, so the
+    // aligned pointer IS the allocated pointer and free_raw_i64_ptr can
+    // release it later (same convention as __ly_dict_alloc).
+    %items = memref.alloc(%payload_words_index) : memref<?xi64>
+    %items_index = memref.extract_aligned_pointer_as_index %items : memref<?xi64> -> index
+    %items_word = arith.index_cast %items_index : index to i64
+
+    memref.store %one, %self[%refcount_slot] : memref<9xi64>
+    memref.store %class_id, %self[%layout_slot] : memref<9xi64>
+    memref.store %length, %self[%length_slot] : memref<9xi64>
+    memref.store %capacity, %self[%capacity_slot] : memref<9xi64>
+    memref.store %items_word, %self[%items_slot] : memref<9xi64>
+    memref.store %zero, %self[%unused_secondary_slot] : memref<9xi64>
+    memref.store %zero, %self[%unused_present_slot] : memref<9xi64>
+    memref.store %zero, %self[%reserved_slot] : memref<9xi64>
+    memref.store %zero, %self[%pad_slot] : memref<9xi64>
+    func.return %self : memref<9xi64>
+  }
+
+  // Borrowed view of the items array, derived at the point of use. The view's
+  // SSA name is not an identity: identity is the handle, so a view taken after
+  // a growth and one taken before it name the same slot of the same entity.
+  // Marked ly.runtime.interior_word so release placement pins the handle
+  // across the view's uses; a plain private helper would leave the ownership
+  // walk nothing to follow from the call.
+  func.func private @__ly_list_items(%self: memref<9xi64>) -> memref<?xi64> attributes {ly.runtime.contract = "builtins.list", ly.runtime.interior_word, ly.runtime.primitive = "items_view"} {
+    %capacity_slot = arith.constant 3 : index
+    %items_slot = arith.constant 4 : index
+    %handle_words = arith.constant 16 : i64
+    %capacity = memref.load %self[%capacity_slot] : memref<9xi64>
+    %words = arith.muli %capacity, %handle_words : i64
+    %base = memref.load %self[%items_slot] : memref<9xi64>
+    %view = func.call @__ly_global_view_i64(%base, %words) : (i64, i64) -> memref<?xi64>
+    func.return %view : memref<?xi64>
+  }
+
+  // The four allocating list producers. Each is the list-shaped half of a
+  // `__ly_sequence_*` twin: identical fill loop, different destination.
+  func.func private @__ly_list_copy_alloc(%src_len: i64, %src_items: memref<?xi64>) -> memref<9xi64> attributes {ly.ownership.owned_results = [0]} {
+    %self = func.call @__ly_list_alloc(%src_len) : (i64) -> memref<9xi64>
+    %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
+    func.call @__ly_seq_fill_copy(%items, %src_len, %src_items) : (memref<?xi64>, i64, memref<?xi64>) -> ()
+    func.return %self : memref<9xi64>
+  }
+
+  func.func private @__ly_list_concat_alloc(%llen: i64, %li: memref<?xi64>, %rlen: i64, %ri: memref<?xi64>) -> memref<9xi64> attributes {ly.ownership.owned_results = [0]} {
+    %total = arith.addi %llen, %rlen : i64
+    %self = func.call @__ly_list_alloc(%total) : (i64) -> memref<9xi64>
+    %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
+    func.call @__ly_seq_fill_concat(%items, %llen, %li, %rlen, %ri) : (memref<?xi64>, i64, memref<?xi64>, i64, memref<?xi64>) -> ()
+    func.return %self : memref<9xi64>
+  }
+
+  func.func private @__ly_list_repeat_alloc(%len: i64, %li: memref<?xi64>, %n: i64) -> memref<9xi64> attributes {ly.ownership.owned_results = [0]} {
+    %total = arith.muli %len, %n : i64
+    %self = func.call @__ly_list_alloc(%total) : (i64) -> memref<9xi64>
+    %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
+    func.call @__ly_seq_fill_repeat(%items, %len, %li, %n) : (memref<?xi64>, i64, memref<?xi64>, i64) -> ()
+    func.return %self : memref<9xi64>
+  }
+
+  func.func private @__ly_list_slice_alloc(%count: i64, %start: i64, %step: i64, %src_items: memref<?xi64>) -> memref<9xi64> attributes {ly.ownership.owned_results = [0]} {
+    %self = func.call @__ly_list_alloc(%count) : (i64) -> memref<9xi64>
+    %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
+    func.call @__ly_seq_fill_slice(%items, %count, %start, %step, %src_items) : (memref<?xi64>, i64, i64, i64, memref<?xi64>) -> ()
+    func.return %self : memref<9xi64>
+  }
+
+  func.func @LyList_FromLength(%length: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 10 : i64, ly.runtime.contract = "builtins.list", ly.runtime.initializer = "__new__", ly.runtime.result_contract = "builtins.list"} {
+    %self = func.call @__ly_list_alloc(%length) : (i64) -> memref<9xi64>
+    func.return %self : memref<9xi64>
   }
 
   func.func @LyTuple_FromLength(%length: i64 {ly.runtime.default_i64 = 0 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 11 : i64, ly.runtime.contract = "builtins.tuple", ly.runtime.initializer = "__new__"} {
@@ -17620,9 +17801,9 @@ module attributes {
     func.return %self : memref<8xi64>
   }
 
-  func.func @LyList_Len(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>) -> i64 attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "__len__"} {
-    %length_slot = arith.constant 0 : index
-    %length = memref.load %meta[%length_slot] : memref<2xi64>
+  func.func @LyList_Len(%self: memref<9xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "__len__"} {
+    %length_slot = arith.constant 2 : index
+    %length = memref.load %self[%length_slot] : memref<9xi64>
     func.return %length : i64
   }
 
@@ -17685,10 +17866,13 @@ module attributes {
     func.return %new#0, %new#1, %new#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
   }
 
-  func.func @LyList_GetSlice(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>, %start_raw: i64, %stop_raw: i64, %step_raw: i64, %mask: i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.method = "__getslice__"} {
-    %class_id = arith.constant 10 : i64
-    %result:3 = func.call @__ly_sequence_get_slice(%class_id, %meta, %items, %start_raw, %stop_raw, %step_raw, %mask) : (i64, memref<2xi64>, memref<?xi64>, i64, i64, i64, i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
-    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  func.func @LyList_GetSlice(%self: memref<9xi64> {ly.ownership.object_header}, %start_raw: i64, %stop_raw: i64, %step_raw: i64, %mask: i64) -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.method = "__getslice__", ly.runtime.result_contract = "builtins.list"} {
+    %length_slot = arith.constant 2 : index
+    %len = memref.load %self[%length_slot] : memref<9xi64>
+    %b:3 = func.call @__ly_seq_slice_bounds(%len, %start_raw, %stop_raw, %step_raw, %mask) : (i64, i64, i64, i64, i64) -> (i64, i64, i64)
+    %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
+    %result = func.call @__ly_list_slice_alloc(%b#1, %b#0, %b#2, %items) : (i64, i64, i64, memref<?xi64>) -> memref<9xi64>
+    func.return %result : memref<9xi64>
   }
 
   func.func @LyTuple_GetSlice(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>, %start_raw: i64, %stop_raw: i64, %step_raw: i64, %mask: i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.tuple", ly.runtime.method = "__getslice__"} {
@@ -17734,26 +17918,36 @@ module attributes {
   // items array for the splice form -- the source may alias the target
   // (`a[1:3] = a`), and a fresh array with copy-then-release ordering stays
   // correct under overlap without direction analysis.
-  func.func @LyList_SetSlice(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>, %start_raw: i64, %stop_raw: i64, %step_raw: i64, %mask: i64, %src_header: memref<2xi64> {ly.ownership.object_header}, %src_meta: memref<2xi64>, %src_items: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.transfer_args = [0], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.method = "__setslice__"} {
+  // Void and non-transferring: the splice branch reallocates the items array
+  // and publishes the new base and capacity THROUGH the handle, so the caller's
+  // name for the list stays valid and there is no token to hand back.
+  //
+  // Both interior views are derived before the reallocation on purpose: the
+  // splice reads the OLD array (and `a[1:3] = a` makes the source the same
+  // array), so the reads must happen before the base word moves.
+  func.func @LyList_SetSlice(%self: memref<9xi64> {ly.ownership.object_header}, %start_raw: i64, %stop_raw: i64, %step_raw: i64, %mask: i64, %src: memref<9xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "__setslice__"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c16 = arith.constant 16 : index
     %handle_words = arith.constant 16 : i64
-    %length_slot = arith.constant 0 : index
-    %capacity_slot = arith.constant 1 : index
+    %length_slot = arith.constant 2 : index
+    %capacity_slot = arith.constant 3 : index
+    %items_slot = arith.constant 4 : index
     %step_zero = arith.cmpi eq, %step_raw, %zero : i64
     scf.if %step_zero {
       func.call @__ly_slice_raise_zero_step() : () -> ()
     }
     // The throw does not return; the substitute keeps the IR division-safe.
     %step = arith.select %step_zero, %one, %step_raw : i1, i64
-    %len = memref.load %meta[%length_slot] : memref<2xi64>
+    %len = memref.load %self[%length_slot] : memref<9xi64>
+    %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
+    %src_items = func.call @__ly_list_items(%src) : (memref<9xi64>) -> memref<?xi64>
     %adj:2 = func.call @__ly_slice_adjust(%len, %start_raw, %stop_raw, %step, %mask) : (i64, i64, i64, i64, i64) -> (i64, i64)
-    %src_len = memref.load %src_meta[%length_slot] : memref<2xi64>
+    %src_len = memref.load %src[%length_slot] : memref<9xi64>
     %step_is_one = arith.cmpi eq, %step, %one : i64
-    %out_items = scf.if %step_is_one -> (memref<?xi64>) {
+    scf.if %step_is_one {
       // Splice: new = prefix ++ src ++ tail. Prefix/tail boxes MOVE (the old
       // array is dropped without releasing them); src boxes are copies and
       // retain; the replaced range releases from the OLD array after the
@@ -17813,10 +18007,16 @@ module attributes {
         %slot = arith.addi %adj#0, %k64 : i64
         func.call @LyObject_ReleaseBoxedPayloadArraySlotRaw(%items, %slot) : (memref<?xi64>, i64) -> ()
       }
-      memref.dealloc %items : memref<?xi64>
-      memref.store %new_len, %meta[%length_slot] : memref<2xi64>
-      memref.store %new_capacity, %meta[%capacity_slot] : memref<2xi64>
-      scf.yield %new_items : memref<?xi64>
+      %old_items_word = memref.load %self[%items_slot] : memref<9xi64>
+      %new_items_index = memref.extract_aligned_pointer_as_index %new_items : memref<?xi64> -> index
+      %new_items_word = arith.index_cast %new_items_index : index to i64
+      // Publish length, capacity and the new base together, then free the old
+      // block: after these stores no view derived from the handle can reach the
+      // old one, and before them no reader could reach the new one.
+      memref.store %new_len, %self[%length_slot] : memref<9xi64>
+      memref.store %new_capacity, %self[%capacity_slot] : memref<9xi64>
+      memref.store %new_items_word, %self[%items_slot] : memref<9xi64>
+      func.call @free_raw_i64_ptr(%old_items_word) : (i64) -> ()
     } else {
       // Extended slice: same-length per-slot replacement (CPython requires
       // len(xs) == slicelength and raises ValueError otherwise).
@@ -17843,30 +18043,31 @@ module attributes {
         }
         func.call @LyObject_RetainBoxedPayloadArraySlotRaw(%items, %slot) : (memref<?xi64>, i64) -> ()
       }
-      scf.yield %items : memref<?xi64>
     }
-    func.return %header, %meta, %out_items : memref<2xi64>, memref<2xi64>, memref<?xi64>
+    func.return
   }
 
   // del list[i:j:k] (CPython list_ass_subscript with NULL value): compact
   // the non-selected boxes into a fresh array, releasing the selected ones.
   // One general path covers step 1 and extended slices, either sign.
-  func.func @LyList_DelSlice(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>, %start_raw: i64, %stop_raw: i64, %step_raw: i64, %mask: i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.transfer_args = [0], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.method = "__delslice__"} {
+  func.func @LyList_DelSlice(%self: memref<9xi64> {ly.ownership.object_header}, %start_raw: i64, %stop_raw: i64, %step_raw: i64, %mask: i64) attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "__delslice__"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c16 = arith.constant 16 : index
     %handle_words = arith.constant 16 : i64
-    %length_slot = arith.constant 0 : index
-    %capacity_slot = arith.constant 1 : index
+    %length_slot = arith.constant 2 : index
+    %capacity_slot = arith.constant 3 : index
+    %items_slot = arith.constant 4 : index
     %step_zero = arith.cmpi eq, %step_raw, %zero : i64
     scf.if %step_zero {
       func.call @__ly_slice_raise_zero_step() : () -> ()
     }
     // The throw does not return; the substitute keeps the IR division-safe.
     %step = arith.select %step_zero, %one, %step_raw : i1, i64
-    %len = memref.load %meta[%length_slot] : memref<2xi64>
+    %len = memref.load %self[%length_slot] : memref<9xi64>
+    %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
     %adj:2 = func.call @__ly_slice_adjust(%len, %start_raw, %stop_raw, %step, %mask) : (i64, i64, i64, i64, i64) -> (i64, i64)
     // Normalize the selected index set {start + k*step} to a low bound and
     // absolute stride so membership is one modulo test either direction.
@@ -17917,10 +18118,14 @@ module attributes {
       }
       scf.yield %next : i64
     }
-    memref.dealloc %items : memref<?xi64>
-    memref.store %final_write, %meta[%length_slot] : memref<2xi64>
-    memref.store %new_capacity, %meta[%capacity_slot] : memref<2xi64>
-    func.return %header, %meta, %new_items : memref<2xi64>, memref<2xi64>, memref<?xi64>
+    %old_items_word = memref.load %self[%items_slot] : memref<9xi64>
+    %new_items_index = memref.extract_aligned_pointer_as_index %new_items : memref<?xi64> -> index
+    %new_items_word = arith.index_cast %new_items_index : index to i64
+    memref.store %final_write, %self[%length_slot] : memref<9xi64>
+    memref.store %new_capacity, %self[%capacity_slot] : memref<9xi64>
+    memref.store %new_items_word, %self[%items_slot] : memref<9xi64>
+    func.call @free_raw_i64_ptr(%old_items_word) : (i64) -> ()
+    func.return
   }
 
   func.func @LyDict_Len(%self: memref<8xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.dict", ly.runtime.method = "__len__"} {
@@ -17963,9 +18168,48 @@ module attributes {
     func.return %out_header, %out_meta, %out_items : memref<2xi64>, memref<2xi64>, memref<?xi64>
   }
 
-  func.func @LyList_EnsureCapacity(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>, %required: i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.transfer_args = [0], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.primitive = "ensure_capacity"} {
-    %out_header, %out_meta, %out_items = func.call @__ly_sequence_ensure_capacity(%header, %meta, %items, %required) : (memref<2xi64>, memref<2xi64>, memref<?xi64>, i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
-    func.return %out_header, %out_meta, %out_items : memref<2xi64>, memref<2xi64>, memref<?xi64>
+  // Grow the items array in place. Void and non-transferring for the same
+  // reason as @LyDict_EnsureCapacity: the new base is written into the handle,
+  // which every holder already names, so there is nothing to hand back and no
+  // reference for a caller to re-acquire. The three-lane spelling had to
+  // declare transfer_args = [0] + owned_results = [0] because the array VALUE
+  // was part of the entity's identity.
+  func.func @LyList_EnsureCapacity(%self: memref<9xi64> {ly.ownership.object_header}, %required: i64) attributes {ly.runtime.contract = "builtins.list", ly.runtime.primitive = "ensure_capacity"} {
+    %minimum_capacity = arith.constant 64 : i64
+    %handle_words = arith.constant 16 : i64
+    %two = arith.constant 2 : i64
+    %capacity_slot = arith.constant 3 : index
+    %items_slot = arith.constant 4 : index
+    %lower = arith.constant 0 : index
+    %step = arith.constant 1 : index
+
+    %capacity = memref.load %self[%capacity_slot] : memref<9xi64>
+    %needs_grow = arith.cmpi slt, %capacity, %required : i64
+    scf.if %needs_grow {
+      %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
+      %old_items_word = memref.load %self[%items_slot] : memref<9xi64>
+      %doubled = arith.muli %capacity, %two : i64
+      %below_min = arith.cmpi slt, %doubled, %minimum_capacity : i64
+      %base_capacity = arith.select %below_min, %minimum_capacity, %doubled : i1, i64
+      %below_required = arith.cmpi slt, %base_capacity, %required : i64
+      %new_capacity = arith.select %below_required, %required, %base_capacity : i1, i64
+      %old_words = arith.muli %capacity, %handle_words : i64
+      %new_words = arith.muli %new_capacity, %handle_words : i64
+      %old_words_index = arith.index_cast %old_words : i64 to index
+      %new_words_index = arith.index_cast %new_words : i64 to index
+      %new_items = memref.alloc(%new_words_index) : memref<?xi64>
+      scf.for %i = %lower to %old_words_index step %step {
+        %word = memref.load %items[%i] : memref<?xi64>
+        memref.store %word, %new_items[%i] : memref<?xi64>
+      }
+      %new_items_index = memref.extract_aligned_pointer_as_index %new_items : memref<?xi64> -> index
+      %new_items_word = arith.index_cast %new_items_index : index to i64
+      // Publish capacity and the new base together, then free the old block.
+      memref.store %new_capacity, %self[%capacity_slot] : memref<9xi64>
+      memref.store %new_items_word, %self[%items_slot] : memref<9xi64>
+      func.call @free_raw_i64_ptr(%old_items_word) : (i64) -> ()
+    }
+    func.return
   }
 
   // Grow the interior arrays in place. Void and non-transfer: the new base
@@ -18651,23 +18895,26 @@ module attributes {
     func.return %slot : i64
   }
 
-  func.func @LyList_DecRef(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.list", ly.runtime.deallocator} {
-    %storage = memref.cast %header : memref<2xi64> to memref<?xi64>
+  func.func @LyList_DecRef(%self: memref<9xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.list", ly.runtime.deallocator} {
+    %storage = memref.cast %self : memref<9xi64> to memref<?xi64>
     %became_zero = func.call @LyObject_ReleaseStorageToZero(%storage) : (memref<?xi64>) -> i1
     cf.cond_br %became_zero, ^dealloc, ^done
 
   ^dealloc:
-    %length_slot = arith.constant 0 : index
+    %length_slot = arith.constant 2 : index
+    %items_slot = arith.constant 4 : index
     %lower = arith.constant 0 : index
     %step = arith.constant 1 : index
-    %length = memref.load %meta[%length_slot] : memref<2xi64>
+    %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
+    %length = memref.load %self[%length_slot] : memref<9xi64>
     %length_index = arith.index_cast %length : i64 to index
     scf.for %i = %lower to %length_index step %step {
       %logical_index = arith.index_cast %i : index to i64
       func.call @LyObject_ReleaseBoxedPayloadArraySlotRaw(%items, %logical_index) : (memref<?xi64>, i64) -> ()
     }
-    memref.dealloc %items : memref<?xi64>
-    memref.dealloc %header : memref<2xi64>
+    %items_word = memref.load %self[%items_slot] : memref<9xi64>
+    func.call @free_raw_i64_ptr(%items_word) : (i64) -> ()
+    memref.dealloc %self : memref<9xi64>
     cf.br ^done
 
   ^done:
@@ -18691,14 +18938,16 @@ module attributes {
   // list.__repr__: `[e0, e1, ...]`, each element repr'd through the uniform
   // boxed-method hook. Intermediate strs are released explicitly (Concat
   // borrows its operands).
-  func.func @LyList_Repr(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
+  func.func @LyList_Repr(%self: memref<9xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c0_i64 = arith.constant 0 : i64
     %c1_i64 = arith.constant 1 : i64
     %c2_i64 = arith.constant 2 : i64
     %c16_i64 = arith.constant 16 : i64
-    %len = memref.load %meta[%c0] : memref<2xi64>
+    %length_slot = arith.constant 2 : index
+    %len = memref.load %self[%length_slot] : memref<9xi64>
+    %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
     %len_idx = arith.index_cast %len : i64 to index
     %items_idx = memref.extract_aligned_pointer_as_index %items : memref<?xi64> -> index
     %items_i64 = arith.index_cast %items_idx : index to i64
@@ -19653,14 +19902,13 @@ module attributes {
 
   // frozenset(iterable): dedupe through the set probe (the source may be a
   // list/tuple with repeats; sets are already unique but share the loop).
-  func.func @LyFrozenSet_FromElements(%oh: memref<2xi64> {ly.ownership.object_header}, %om: memref<2xi64>, %oi: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 23 : i64, ly.runtime.contract = "builtins.frozenset", ly.runtime.initializer = "__new__"} {
+  func.func @LyFrozenSet_FromElements(%olen: i64, %oi: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 23 : i64, ly.runtime.contract = "builtins.frozenset", ly.runtime.initializer = "__new__"} {
     %class_id = arith.constant 23 : i64
     %zero = arith.constant 0 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c16_i64 = arith.constant 16 : i64
     %minus_one = arith.constant -1 : i64
-    %olen = memref.load %om[%c0] : memref<2xi64>
     %fresh:3 = func.call @__ly_sequence_alloc(%class_id, %zero) : (i64, i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
     memref.store %zero, %fresh#1[%c0] : memref<2xi64>
     %oi_idx = memref.extract_aligned_pointer_as_index %oi : memref<?xi64> -> index
@@ -19688,7 +19936,7 @@ module attributes {
 
   // __init__ is a no-op: frozenset is immutable, so __new__ (FromElements)
   // already absorbed the source; CPython splits construction the same way.
-  func.func @LyFrozenSet_Init(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>, %oh: memref<2xi64> {ly.ownership.object_header}, %om: memref<2xi64>, %oi: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.ownership.transfer_args = [0], ly.runtime.contract = "builtins.frozenset", ly.runtime.method = "__init__", ly.runtime.result_contract = "builtins.frozenset", ly.runtime.result_evidence = "receiver"} {
+  func.func @LyFrozenSet_Init(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %items: memref<?xi64>, %olen: i64, %oi: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.ownership.transfer_args = [0], ly.runtime.contract = "builtins.frozenset", ly.runtime.method = "__init__", ly.runtime.result_contract = "builtins.frozenset", ly.runtime.result_evidence = "receiver"} {
     func.return %header, %meta, %items : memref<2xi64>, memref<2xi64>, memref<?xi64>
   }
 

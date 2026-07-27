@@ -127,7 +127,8 @@ module attributes {
   func.func private @LyUnicode_Encode(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> memref<6xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "encode", ly.runtime.result_contract = "builtins.bytes"}
   func.func private @LyBytes_DecRef(%header: memref<6xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.deallocator}
   func.func private @__ly_bytes_payload(%self: memref<6xi64>) -> memref<?xi8> attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.interior_word, ly.runtime.primitive = "payload_view"}
-  func.func private @LyList_FromLength(%length: i64 {ly.runtime.default_i64 = 0 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 10 : i64, ly.runtime.contract = "builtins.list", ly.runtime.initializer = "__new__"}
+  func.func private @__ly_list_items(%self: memref<9xi64>) -> memref<?xi64> attributes {ly.runtime.contract = "builtins.list", ly.runtime.interior_word, ly.runtime.primitive = "items_view"}
+  func.func private @LyList_FromLength(%length: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 10 : i64, ly.runtime.contract = "builtins.list", ly.runtime.initializer = "__new__"}
   func.func private @LyBaseException_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 5 : i64, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"}
   func.func private @LyBaseException_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0, 3], ly.runtime.contract = "builtins.BaseException", ly.runtime.method = "__init__", ly.runtime.result_evidence = "receiver"}
   func.func private @LyEH_ThrowException(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) attributes {ly.ownership.transfer_args = [0, 1], ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "raise"}
@@ -489,7 +490,7 @@ module attributes {
   // listdir walks the directory twice: once to count the entries the list has
   // to hold (LyList_FromLength takes the final length) and once to fill it.
   // "." and ".." are skipped, as CPython's does.
-  func.func @LyPosix_ListDir(%path_header: memref<2xi64> {ly.ownership.object_header}, %path_bytes: memref<?xi8>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "posix.listdir", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.str", ly.runtime.element_contract = "builtins.str", ly.runtime.primitive = "posix_listdir", ly.runtime.result_contract = "builtins.list"} {
+  func.func @LyPosix_ListDir(%path_header: memref<2xi64> {ly.ownership.object_header}, %path_bytes: memref<?xi8>) -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "posix.listdir", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.str", ly.runtime.element_contract = "builtins.str", ly.runtime.primitive = "posix_listdir", ly.runtime.result_contract = "builtins.list"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %cap_index = arith.constant 1024 : index
@@ -534,7 +535,8 @@ module attributes {
       scf.yield %zero : i64
     }
 
-    %header, %meta, %items = func.call @LyList_FromLength(%count) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    %self = func.call @LyList_FromLength(%count) : (i64) -> memref<9xi64>
+    %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
     %dir2 = func.call @LyHost_OpenDir(%enc_bytes, %enc_len) : (memref<?xi8>, i64) -> i64
     %opened2 = arith.cmpi ne, %dir2, %zero : i64
     scf.if %opened2 {
@@ -569,7 +571,7 @@ module attributes {
       %closed2 = func.call @LyHost_CloseDir(%dir2) : (i64) -> i32
     }
     func.call @LyBytes_DecRef(%enc_header) : (memref<6xi64>) -> ()
-    func.return %header, %meta, %items : memref<2xi64>, memref<2xi64>, memref<?xi64>
+    func.return %self : memref<9xi64>
   }
 
   // "." / ".." -- the two entries readdir reports that listdir must drop.
@@ -680,11 +682,12 @@ module attributes {
   }
 
   // The raw "KEY=VALUE" vector, same shape as sys.argv's list[str] build.
-  func.func @LyPosix_EnvironEntries() -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "posix._environ_entries", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.list", ly.runtime.element_contract = "builtins.str", ly.runtime.primitive = "posix_environ_entries", ly.runtime.result_contract = "builtins.list"} {
+  func.func @LyPosix_EnvironEntries() -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "posix._environ_entries", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.list", ly.runtime.element_contract = "builtins.str", ly.runtime.primitive = "posix_environ_entries", ly.runtime.result_contract = "builtins.list"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %count = func.call @LyHost_EnvironCount() : () -> i64
-    %header, %meta, %items = func.call @LyList_FromLength(%count) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    %self = func.call @LyList_FromLength(%count) : (i64) -> memref<9xi64>
+    %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
     %count_index = arith.index_cast %count : i64 to index
     scf.for %i = %c0 to %count_index step %c1 {
       %i_i64 = arith.index_cast %i : index to i64
@@ -696,6 +699,6 @@ module attributes {
       memref.dealloc %buffer : memref<?xi8>
       func.call @__ly_posix_store_str(%items, %i, %str_header, %str_bytes) : (memref<?xi64>, index, memref<2xi64>, memref<?xi8>) -> ()
     }
-    func.return %header, %meta, %items : memref<2xi64>, memref<2xi64>, memref<?xi64>
+    func.return %self : memref<9xi64>
   }
 }

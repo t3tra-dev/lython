@@ -38,6 +38,12 @@ bool RuntimeBundleLowerer::isMutableContainerContractName(
          contract == "builtins.set";
 }
 
+bool RuntimeBundleLowerer::isSequenceLikeContractName(
+    llvm::StringRef contract) {
+  return contract == "builtins.list" || contract == "builtins.tuple" ||
+         contract == "builtins.set" || contract == "builtins.frozenset";
+}
+
 // Compile-time contents evidence is only valid while every mutation of the
 // container is visible to this walk. Once the value escapes into code the
 // walk cannot see through (a user function, a closure environment), the

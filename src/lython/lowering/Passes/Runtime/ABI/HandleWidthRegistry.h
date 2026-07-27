@@ -200,6 +200,14 @@ namespace py::lowering::handle_width {
 //       8  builtins.dict, builtins.function,                7-way tie, all
 //          _io.{StringIO,BytesIO,FileIO,TextIOWrapper},     one-lane already
 //          asyncio.AbstractEventLoop
+//       9  builtins.list                                    one-lane, sole
+//                                                           owner. Layout needs
+//                                                           5 words; 9 is the
+//                                                           narrowest FREE
+//                                                           single-input
+//                                                           interface, and it
+//                                                           must be >= 8 for
+//                                                           isContainerHandleType
 //      10  _asyncio.Future                                  one-lane
 //      12  _asyncio.Task                                    leading word of a
 //                                                           multi-input release
@@ -215,18 +223,52 @@ namespace py::lowering::handle_width {
 // NOT known-live suppressions. Instrumenting the contract-less overload and
 // attributing each ambiguous exit BY TYPE (playbook 7.14) found **zero**
 // ambiguity on any one-lane width -- 3, 5, 6, 7 or 8 -- across four programs,
-// one per contract. All 119 ambiguous exits were on `memref<2xi64>`, i.e. among
-// the MULTI-lane contracts (int, str, nullcontext), which is the configuration
-// section 8.1 showed to be dangerous and which no conversion here touches.
-// One-lane contracts resolved structurally ZERO times, which is the positive
-// evidence for the shapeMatch mechanism above: they are never put in a
-// structural tiebreak because the contract-named path answers first.
+// one per contract. One-lane contracts resolved structurally ZERO times, which
+// is the positive evidence for the shapeMatch mechanism above: they are never
+// put in a structural tiebreak because the contract-named path answers first.
+//
+// ** CORRECTION to the sentence that used to follow (measured on main 5907b97
+// by the list track, keying each ambiguous exit on ALL of the tying value
+// types rather than on the leading one). "All 119 ambiguous exits were on
+// `memref<2xi64>`" is wrong, and it is wrong in a way that hid the ONE tie a
+// conversion was about to break: **
+//
+//     ambiguous on (memref<2xi64>)                              =  56
+//     ambiguous on (memref<2xi64>, 2xi64, ?xi64)                =  63
+//                                                                 ---
+//                                                                 119
+//
+// The three-type group is the four-way list/tuple/set/frozenset tie, whose
+// FIRST type is `memref<2xi64>` -- so an instrument that printed only
+// `values[offset]` filed all 63 under width 2. The total is unchanged, which is
+// why the two readings look like the same measurement. Same trap as the "width
+// is not a proof of kind" fallacy below, one level up: an ARITY-1 key cannot
+// name an arity-3 tie.
+//
+// Both figures are invariant across ten programs (six single-contract probes
+// plus four list/set-heavy goldens), i.e. they are constants of lowering the
+// runtime library rather than products of the program -- `nomatch` and
+// `resolved` do move, which is what shows the counter reads the input at all.
+// One program moved `ambiguous`: `golden/cases/list_methods.py` reports **137**,
+// and the extra 18 are on `(memref<3xi64>)` -- the width-3 tie of `LyBool` /
+// `LyFloat` / `lyrt.ReadyIntAwaitable`, reached by a list holding both floats
+// and bools. **So width 3 is not "a tie four programs failed to reach": a
+// program reaches it.** That is an item for whoever owns `float`, not for this
+// file to fix.
+//
+// Also measured and worth having: `contractName.empty()` at
+// `common/Ownership.cpp:428` fires **0** times in all ten programs, and the
+// `:450` fallback fires 1078-1312 times per compile but produces **no**
+// ambiguous exit -- every one of the 119 comes from a call site that enters the
+// contract-less overload DIRECTLY. So GAP 1 does not present as an empty
+// contract name at this call site; it presents as call sites that never had one.
 //
 // So read the rows below as "a tie whose reachability is unmeasured, and which
 // four programs failed to reach", not as a live defect. That makes the case for
 // spending a scarce width on one of them weaker, not stronger:
 //
 //     memref<3xi64>  LyBool, LyFloat, LyReadyIntAwaitable          (3)
+//                    -- REACHED: 18 ambiguous exits on golden/cases/list_methods
 //     memref<5xi64>  LyCoroutine, LyRange, LyRangeIterator         (3)
 //     memref<2xi64>  LyLong, LyNullContext, LyUnicode              (3)
 //                    -- was 4; LyBytes left for width 6 in `00079ef`
@@ -235,6 +277,7 @@ namespace py::lowering::handle_width {
 //                    LyFunction, LyStringIO, LyTextIO              (7)
 //     memref<6xi64>  LyBytes                                       (1)  clean
 //     memref<7xi64>  LyComplex                                     (1)  clean
+//     memref<9xi64>  LyList                                        (1)  clean
 //     memref<10xi64> LyFuture   memref<16xi64> LyObject   memref<64xi64> LyGenerator
 //
 // `builtins.float` at 3 and `builtins.range`/`range_iterator` at 5 sit in ties
@@ -286,19 +329,34 @@ namespace py::lowering::handle_width {
 // mitigation; a converter without one is not blocked, because the ties are
 // already the tree's normal condition (width 8 ships with `dict` in a 7-way
 // tie). Record the tie here and move on.
-inline constexpr int kFreeHandleWidths[] = {9, 11, 13, 14, 15};
+inline constexpr int kFreeHandleWidths[] = {11, 13, 14, 15};
 
 // The scarcity a converter should see before assuming a width is available,
 // and -- more importantly -- the ties that are ALREADY suppressing groups by
 // mechanism (A) today, before any further conversion:
 //
-//   (memref<2xi64>, memref<2xi64>, memref<?xi64>)  x63 declarations
-//       builtins.list, set, frozenset, tuple. Tied on interface AND shape, four
-//       ways: the str/bytes configuration repeated. PREDICTION, unmeasured:
-//       these four groups are suppressed today, so converting the first of them
-//       should surface whatever the tie has been hiding -- the same way breaking
-//       the str/bytes tie surfaced the exception family's double free. Budget for
-//       that rather than treating it as a regression from the conversion.
+//   (memref<2xi64>, memref<2xi64>, memref<?xi64>)  x63 ambiguous exits per
+//       compile, MEASURED (see the correction above), invariant across ten
+//       programs. Was builtins.{list,set,frozenset,tuple} tied on interface AND
+//       shape, four ways: the str/bytes configuration repeated. `list` left for
+//       width 9, so it is a THREE-way tie now, and 63 is the number to re-measure
+//       after each of the remaining three converts.
+//
+//       What breaking it surfaced, for the next converter's budget: nothing of
+//       the str/bytes kind, and that was predicted by an audit rather than
+//       discovered by a crash. Before the conversion, all 136 declarations
+//       naming the three-type sequence were checked as a SET: 75 declare
+//       `owned_results` and all 75 read exactly `[0]`, 10 declare
+//       `transfer_args` and all 10 read `[0]`, 4 declare `release_args = [0]`,
+//       57 declare nothing, and 0 declare a second owned root. The exception
+//       family's `[0, 1]` over-declaration has no analogue here, so the tie was
+//       hiding an INCOMPLETENESS (a group that never forms) rather than an
+//       UNSOUNDNESS (a release that would double-free) -- and only the second
+//       kind ships under `--release`. Mechanism (C) was clear too: of the 67
+//       declarations whose owned result 0 IS that group, 46 name a result
+//       contract, 13 default to a contract that is itself a group member (so the
+//       default is correct), 8 are contract-less private helpers, and 0 name a
+//       foreign contract without naming the result. `list` had no `@LyLong_Repr`.
 //   (memref<8xi64>)   7 contracts -- and builtins.dict IS ALREADY MERGED here.
 //       The same reasoning applies with no conversion pending, so any
 //       suppression at this width is live in main right now. Highest-priority

@@ -71,7 +71,8 @@ module attributes {
   ]
 } {
   func.func private @LyLong_AsI64(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %digits: memref<?xi32>) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__int__", ly.runtime.primitive = "unbox.i64"}
-  func.func private @LyList_FromLength(%length: i64 {ly.runtime.default_i64 = 0 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 10 : i64, ly.runtime.contract = "builtins.list", ly.runtime.initializer = "__new__"}
+  func.func private @__ly_list_items(%self: memref<9xi64>) -> memref<?xi64> attributes {ly.runtime.contract = "builtins.list", ly.runtime.interior_word, ly.runtime.primitive = "items_view"}
+  func.func private @LyList_FromLength(%length: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 10 : i64, ly.runtime.contract = "builtins.list", ly.runtime.initializer = "__new__"}
   func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 4 : i64, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
   func.func private @LyHost_ArgvCount() -> i64
   func.func private @LyHost_ArgvLen(i64) -> i64
@@ -106,7 +107,7 @@ module attributes {
   // (CollectionPayload.cpp layout: [0] refcount, [1] class id, [2] header
   // pointer, [3] value count, [4..8] value pointers, [9..13] value sizes,
   // [14] owned flag).
-  func.func @LySys_GetArgv() -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.primitive = "sys_argv"} {
+  func.func @LySys_GetArgv() -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.primitive = "sys_argv"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c16 = arith.constant 16 : index
@@ -116,7 +117,8 @@ module attributes {
     %header_class_slot = arith.constant 1 : index
 
     %count = func.call @LyHost_ArgvCount() : () -> i64
-    %header, %meta, %items = func.call @LyList_FromLength(%count) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    %self = func.call @LyList_FromLength(%count) : (i64) -> memref<9xi64>
+    %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
     %count_index = arith.index_cast %count : i64 to index
     scf.for %i = %c0 to %count_index step %c1 {
       %i_i64 = arith.index_cast %i : index to i64
@@ -169,7 +171,7 @@ module attributes {
       %slot14 = arith.addi %base, %c14 : index
       memref.store %one, %items[%slot14] : memref<?xi64>
     }
-    func.return %header, %meta, %items : memref<2xi64>, memref<2xi64>, memref<?xi64>
+    func.return %self : memref<9xi64>
   }
 
   // sys.exit records the status out-of-band (the exception object layout has
