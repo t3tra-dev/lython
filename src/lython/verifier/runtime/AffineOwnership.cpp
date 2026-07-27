@@ -58,6 +58,22 @@ bool ownershipStaleTraceEnabled() {
   return enabled;
 }
 
+// LYTHON_OWNERSHIP_TRACE_PATH: print the CFG path that reached a rejected
+// double consume, as `^bbN>` ordinals matching a LYTHON_IR_DUMP listing.
+//
+// Why NOT read it off the diagnostic: the message names the producer and the
+// releasing call, and both are the same symbols on every path through a loop.
+// It cannot distinguish "this program releases twice" from "two cleanup
+// handlers chained and each released once", which want opposite repairs -- and
+// that distinction is what this trace decided for the re-raise-in-a-loop
+// rejection (`^bb26>^bb37>^bb35`: a cleanup handler entered from another
+// cleanup handler).
+bool ownershipPathTraceEnabled() {
+  static const bool enabled =
+      std::getenv("LYTHON_OWNERSHIP_TRACE_PATH") != nullptr;
+  return enabled;
+}
+
 // A/B escape hatch for the rebind rule below, in the same spirit as
 // LYTHON_OWNERSHIP_NO_LANE_ADVANCE: it lets `redcheck.py --sentinel` take its
 // "before" side from the SAME binary as its "after" side, so a GREEN verdict
@@ -244,6 +260,17 @@ struct AffinePathState {
   // cleanup is inserted, no leak is accepted); the flag only disambiguates
   // path-state dedup.
   bool exceptional = false;
+  // Block ordinals visited on the way here, kept only when
+  // LYTHON_OWNERSHIP_TRACE_PATH is set.
+  //
+  // Why a whole path and not the failing op: this walk's diagnostics name the
+  // PRODUCER of a tracked resource, and a double-consume report has to be read
+  // against the CFG to tell "the program releases twice" from "the walk crossed
+  // an edge that renamed nothing". The re-raise-in-a-loop rejection fixed in
+  // this file's sibling pass was attributed from one trail line: the path
+  // entered a cleanup handler from ANOTHER cleanup handler, which is the shape
+  // no per-op message can show.
+  llvm::SmallVector<unsigned, 16> trail;
 };
 
 struct BorrowedEntryResource {
@@ -1882,6 +1909,8 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
     if (visited.contains(state))
       continue;
     visited.insert(state);
+    if (ownershipPathTraceEnabled())
+      state.trail.push_back(blockOrdinal(state.block));
     if (visited.size() > kMaxAffineStates)
       return resource.producer->emitError()
              << "ownership CFG exploration exceeded " << kMaxAffineStates
@@ -2136,12 +2165,26 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
               op = op->getNextNode();
               continue;
             }
-            if (state.retained == 0)
+            if (state.retained == 0) {
+              if (ownershipPathTraceEnabled()) {
+                llvm::errs() << "[ownership-path] double consume of "
+                             << resource.producerLabel << " (produced in ^bb"
+                             << blockOrdinal(resource.producer->getBlock())
+                             << ") by " << call.getCallee() << " in ^bb"
+                             << blockOrdinal(state.block)
+                             << ", borrowed=" << state.borrowed
+                             << " exceptional=" << state.exceptional
+                             << ", path=";
+                for (unsigned ordinal : state.trail)
+                  llvm::errs() << "^bb" << ordinal << ">";
+                llvm::errs() << "\n";
+              }
               return call.emitError()
                      << "owned resource from " << resource.producerLabel
                      << " result " << resource.resultOffset
                      << " is released or transferred more than once on one CFG "
                         "path";
+            }
             --state.retained;
             op = op->getNextNode();
             continue;
@@ -2366,7 +2409,8 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
                                          std::move(mappedStale),
                                          std::move(mappedPrevious),
                                          std::move(mappedViews),
-                                         state.borrowed, nextExceptional});
+                                         state.borrowed, nextExceptional,
+                                         state.trail});
     }
   }
 
