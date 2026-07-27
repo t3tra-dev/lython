@@ -1,0 +1,24 @@
+3 10 11 12
+(10, 11, 12)
+(1, 2, 3, 4, 5) 5 1 5
+(2, 3, 4) 3 2 4
+(1, 2, 1, 2, 1, 2) 6 2
+True True True
+True
+False True
+True True True
+True
+[(True,), (1,), (2.0,)]
+200 0 63 64 199
+200 True True False
+((1, 2), (3, 4)) (1, 2) (3, 4) 2 2
+True False
+(3, 1) (-4, 1)
+('a', '-', 'b-c') ('a-b', '-', 'c')
+('nosep', '', '')
+(9, 8, 7)
+('boom',)
+1
+boom
+2 1 True False
+(1, 2.0, True, 2.0)

@@ -44,11 +44,21 @@ inline constexpr std::int64_t kReservedWord = 7;
 // tied with each other on release interface, which is the situation
 // `range`/`range_iterator` is stuck in and the one thing a converter CAN avoid
 // when the two contracts are actually distinguishable.
+//
+// `builtins.tuple` is fourteen for the same reason and a worse rate: words
+// 8..13 are dead, because by the time it converted, 14 was the narrowest free
+// single-input interface left. That is the width-scarcity arithmetic in
+// HandleWidthRegistry.h showing up as bytes -- a 3-element tuple pays 48 B of
+// padding for identity alone -- and it is why the registry's free list is now
+// empty rather than merely short. Set and frozenset spent 11 and 13 on the way
+// there, so the four container conversions between them consumed every width
+// the free list had.
 inline constexpr std::int64_t kHandleWordCount = 8;
 inline constexpr std::int64_t kDictHandleWordCount = 8;
 inline constexpr std::int64_t kListHandleWordCount = 9;
 inline constexpr std::int64_t kSetHandleWordCount = 11;
 inline constexpr std::int64_t kFrozenSetHandleWordCount = 13;
+inline constexpr std::int64_t kTupleHandleWordCount = 14;
 
 // Slot indices inside the {length, capacity} pair, which a multi-lane
 // contract still carries as its own `meta` lane. Words 2/3 above are the same

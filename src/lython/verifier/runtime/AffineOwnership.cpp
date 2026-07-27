@@ -145,9 +145,15 @@ bool returnCarriesGroupInsideOwnedAggregate(
   if (mlir::succeeded(contract)) {
     for (auto [contractIndex, offset] :
          llvm::enumerate(contract->ownedResults.values)) {
-      llvm::StringRef contractName;
-      if (contractIndex < contract->ownedResultContracts.size())
-        contractName = contract->ownedResultContracts[contractIndex];
+      // The shared precedence, not a local copy of it: when this read had only
+      // `owned_result_contracts` and the insertion path also had the
+      // `ly.runtime.result_contract` fallback, a declaration carrying just the
+      // latter produced a deallocator for the inserter and `nullptr` here. Both
+      // callers of this predicate turn `false` into a diagnostic, so the
+      // divergence cost a REFUSAL of a program the inserter had balanced -- the
+      // incomplete side, not a silently accepted double release.
+      llvm::StringRef contractName = own::ownedResultContractName(
+          function, *contract, static_cast<unsigned>(contractIndex));
       const own::RuntimeDeallocator *deallocator =
           contractName.empty()
               ? own::findDeallocatorForValueGroup(ret.getOperands(), offset,
