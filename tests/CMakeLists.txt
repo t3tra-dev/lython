@@ -137,6 +137,7 @@ set(LYTHON_UNIT_PATTERNS_meta
     "LayerManifestTest.*")
 set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.BoxedContainerLoopKeepsPayloadSlotsOutOfTheLoopBody"
+    "DriverTest.StringAndBytesLiteralsInALoopStayOutOfTheFrame"
     "DriverTest.CompilesHelloToVerifiedLLVMIR"
     "DriverTest.ResolvesEmbeddedStdlibImports"
     "DriverTest.CompilesUnevenMatmulForEveryTensorTarget"
