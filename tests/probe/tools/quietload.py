@@ -60,7 +60,25 @@ import time
 
 
 def load1() -> float:
-    """The 1-minute load average, or 0.0 where the platform has none."""
+    """The 1-minute load average, or 0.0 where the platform has none.
+
+    The gate deliberately reads the 1-minute figure: it answers "is anything busy
+    RIGHT NOW", which is the question a start decision needs.
+
+    Its known weakness, observed rather than theorised: a spike that has just ended
+    leaves the 5-minute average high while the 1-minute one has already fallen, so
+    the gate opens into the tail of someone else's run. That happened on
+    2026-07-27 -- a grid started at 1m 5.05 with 5m still at 7.94 from a sibling's
+    ctest, and it came out 12/12, so the tail did no harm that time.
+
+    Why the gate is not raised to cover it: for a ten-minute instrument the tail is
+    a small fraction of the run, and gating on the 5-minute average would block for
+    minutes after the machine is genuinely free -- which pushes a measuring track
+    toward skipping the gate. The tail is handled by DISCLOSURE instead: the
+    recorded note carries all three averages, so "started at 1m 5.05 / 5m 7.94" is
+    visible in the result and a reader can discount it. Prefer a gate that is
+    always used plus an honest record over a stricter gate that gets bypassed.
+    """
     try:
         return os.getloadavg()[0]
     except (AttributeError, OSError):
