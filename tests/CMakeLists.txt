@@ -222,15 +222,44 @@ set(LYTHON_GOLDEN_SLOW_CASES)
 
 # Tests over 20 s on their own. Two lists, because the two kinds respond to
 # different work: `slow` is compile-bound and a lowering improvement moves it,
-# `bench` is execution-bound and no lowering improvement will.
+# `bench` is execution-bound and no lowering improvement will. Merged, a working
+# compiler fix would look like it had done nothing.
 #
-# Names are full ctest test names. Both lists are measurements and have to be
-# re-taken on the default build type after anything that moves compile time;
-# rfc/test-suite-debt.md §3.2a is the standing example of why they must not be
-# merged (`examples.tarai` spends 93.9% of its time executing, so a fix that
-# halved compilation would have looked like it did nothing).
+# Names are full ctest test names. Both lists are measurements, taken from one
+# `ctest -j8` run on the default build type (RelWithDebInfo, 447/447 in 99.25 s,
+# 1m load 3.65) and re-checked per candidate with LYTHON_PERF=1. They must be
+# re-taken on the same build type after anything that moves compile time, and
+# never carried across build types: the same suite is roughly 250 s in Debug, so
+# a Debug-derived membership would be wrong here.
+#
+# `slow` is empty because nothing compile-bound reaches 20 s on this build type.
+# That is a measurement, not an omission. The distribution behind it, so the next
+# reader does not have to re-take it to see where the cliff is:
+#
+#   examples.tarai                                    31.81 s   <- bench
+#   DriverTest.CompilesUnevenMatmulForEveryTensorTarget 17.02 s  <- nearest miss
+#   golden.cases.stdlib_json_accessors                 13.04 s
+#   golden.cases.w3_cross_json_ordereddict             10.41 s
+#   golden.cases.stdlib_string_template                 9.71 s
+#
+# The nearest miss is compile-bound (20 full compiles across 5 targets) and is
+# 17% of the suite's wall time in one test, so it is the first thing to cross the
+# threshold if lowering gets slower. It is deliberately not labelled: moving the
+# threshold to capture it would be fitting the threshold to the data.
 set(LYTHON_SLOW_TESTS)
-set(LYTHON_BENCH_TESTS)
+
+# examples.tarai: 31.81 s, of which execution is 29.90 s of 30.87 s top-level =
+# 96.9%. Compilation is 0.96 s total, so a lowering improvement can remove at
+# most 3% of this test and `slow` would have been the wrong label. Measured on
+# this build type; the audit's 93.9% was Debug, and the share rose exactly as
+# expected once compilation got cheaper.
+#
+# examples.tarai_prim is NOT here: measured at 1.81 s, nowhere near the
+# threshold. rfc/test-suite-debt.md §6 flagged it as an unmeasured `bench`
+# candidate by analogy with tarai; the analogy does not hold, because the prim
+# path runs natively rather than through the boxed call sequence tarai pays for.
+# examples.fib is not here either: 2.83 s.
+set(LYTHON_BENCH_TESTS examples.tarai)
 
 # Declared stopping stage per golden case; see tests/golden/layers.txt.
 set(LYTHON_GOLDEN_LAYERS_FILE "${CMAKE_CURRENT_SOURCE_DIR}/golden/layers.txt")
