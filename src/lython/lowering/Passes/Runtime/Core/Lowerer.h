@@ -1396,6 +1396,10 @@ private:
   mlir::LogicalResult
   lowerControlFlowBlockArgument(mlir::Operation *op,
                                 mlir::BlockArgument argument);
+  mlir::LogicalResult spliceControlFlowBlockArgumentEdges(
+      mlir::Operation *op, mlir::BlockArgument argument,
+      llvm::ArrayRef<mlir::Type> physicalTypes, bool primitiveIntLane);
+  mlir::LogicalResult drainDeferredControlFlowExpansions();
   mlir::LogicalResult lowerRuntimeValueSelect(mlir::arith::SelectOp select);
   mlir::LogicalResult dropControlFlowLogicalBranchOperands();
   mlir::LogicalResult eraseControlFlowLogicalBlockArguments();
@@ -1449,6 +1453,8 @@ private:
       controlFlowLogicalBlockArguments;
   llvm::DenseSet<mlir::Value> controlFlowLogicalBlockArgumentSet;
   llvm::DenseSet<mlir::Value> controlFlowBlockArgumentsInProgress;
+  llvm::SmallVector<ControlFlowDeferredExpansion, 4>
+      controlFlowDeferredExpansions;
   std::int64_t nextFunctionTargetId = 1;
   std::int64_t nextTryHandlerId = 1;
   llvm::SmallVector<mlir::Operation *, 32> erase;

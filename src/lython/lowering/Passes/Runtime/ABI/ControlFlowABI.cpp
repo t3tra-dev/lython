@@ -1,12 +1,57 @@
 #include "Runtime/Core/Lowerer.h"
 
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
+#include "llvm/Support/Process.h"
 
 #include <functional>
 #include <optional>
 
 namespace py::lowering {
 namespace {
+
+// TEMPORARY INSTRUMENT (family E attribution). Prints, per block, the argument
+// arity and every predecessor edge's forwarded-operand count, so a mismatch can
+// be attributed to a STEP of lowerModule rather than to the pass as a whole.
+bool cfArityTraceEnabled() {
+  static const bool enabled = [] {
+    auto value = llvm::sys::Process::GetEnv("LYTHON_TRACE_CF_ARITY");
+    return value && !value->empty() && *value != "0";
+  }();
+  return enabled;
+}
+
+void traceControlFlowArity(mlir::ModuleOp module, llvm::StringRef stage) {
+  if (!cfArityTraceEnabled())
+    return;
+  module.walk([&](mlir::func::FuncOp function) {
+    if (function.isDeclaration())
+      return;
+    unsigned blockIndex = 0;
+    for (mlir::Block &block : function.getBody()) {
+      unsigned index = blockIndex++;
+      if (block.getNumArguments() == 0)
+        continue;
+      llvm::errs() << "[cf-arity:" << stage << "] @" << function.getName()
+                   << " ^bb" << index << " args=" << block.getNumArguments()
+                   << " types=[";
+      llvm::interleaveComma(block.getArgumentTypes(), llvm::errs());
+      llvm::errs() << "]";
+      for (mlir::Block *predecessor : block.getPredecessors()) {
+        auto branch =
+            mlir::dyn_cast<mlir::BranchOpInterface>(predecessor->getTerminator());
+        if (!branch)
+          continue;
+        for (unsigned s = 0, e = branch->getNumSuccessors(); s < e; ++s) {
+          if (branch->getSuccessor(s) != &block)
+            continue;
+          llvm::errs() << " edge(" << branch->getName() << ",#" << s
+                       << ")=" << branch.getSuccessorOperands(s).size();
+        }
+      }
+      llvm::errs() << "\n";
+    }
+  });
+}
 
 bool hasRuntimeControlFlowABI(mlir::Type type) {
   if (mlir::isa<py::UnionType>(type))
@@ -296,6 +341,114 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerControlFlowBlockArgument(
   }
   valueBundles[argument] = std::move(provisionalBundle);
 
+  // ⚠️ THE INDEX SPACES DIVERGE HERE, and this is where the split has to happen.
+  //
+  // The edge work below indexes a predecessor's successor-operand list with
+  // `argument.getArgNumber()`, i.e. with a BLOCK-argument index. Those two agree
+  // only while every block argument before this one is forwarded on that edge --
+  // and the physical arguments inserted just above are NOT forwarded yet.
+  //
+  // Splicing re-enters the lowerer (see `appendPhysicalBranchOperands`), so a
+  // sibling logical argument of THIS block can arrive here while an outer
+  // expansion still has its own physical arguments unforwarded. Measured on
+  //
+  //     xs: list[int] = [0]
+  //     for i in range(n):
+  //         try: total += 1
+  //         except ValueError: total += 2
+  //         xs = xs + [i]
+  //         total += len(xs)
+  //
+  // where the int accumulator's back-edge operand reads `len(xs)`, so expanding
+  // the int reaches the list. The list's block index was 4 against an operand
+  // list of 2, `findPendingEdge` read that as "no edge carries this argument",
+  // the loop ran ZERO rounds, and the function returned success() having left a
+  // `memref<9xi64>` block argument that no branch forwards:
+  // `branch has 3 operands for successor #0, but target block has 4`.
+  //
+  // Why NOT treat `index >= operands.size()` as an error there instead: it is a
+  // legitimate answer for an edge that genuinely does not carry the argument.
+  // The bug is the question, not the answer.
+  //
+  // LYTHON_ABLATE_CF_EXPANSION_DEFERRAL=1 restores the one-shot behaviour, so the
+  // arity failure and its repair come from ONE binary. Why an ablation switch and
+  // not two builds: a separate `before` build re-proves the build rather than the
+  // change, and this repair is meant to alter generated IR only where an edge was
+  // previously left unforwarded.
+  static const bool ablateDeferral = [] {
+    auto value =
+        llvm::sys::Process::GetEnv("LYTHON_ABLATE_CF_EXPANSION_DEFERRAL");
+    return value && !value->empty() && *value != "0";
+  }();
+  // ⚠️ THE DIRECTION MATTERS, and deferring on any in-flight sibling is WRONG --
+  // measured, by this repair breaking a program that worked:
+  //
+  //     s: str = "a"        # block argument 0
+  //     for i in range(n):  # `total` is block argument 1
+  //         try: total += 1
+  //         except ValueError: total += 2
+  //         s = s + "b"
+  //         total += len(s)
+  //
+  // compiled and printed 12 before, and failed with `branch has 2 operands for
+  // successor #0, but target block has 5` once every in-flight sibling deferred.
+  //
+  // Here the OUTER expansion is `total` at index 1 and the nested one is `s` at
+  // index 0. Splicing `s` immediately inserts its operands AHEAD of `total`'s
+  // logical operand on every edge, which shifts the edge index by exactly what
+  // inserting `s`'s block arguments shifted the block index -- so the outer's
+  // indices stay aligned and it proceeds. Deferring `s` shifts only the block
+  // side, and the OUTER is the one that then silently forwards nothing.
+  //
+  // So the condition is not "a sibling is in flight" but "a sibling in flight
+  // sits BEFORE me", which is exactly when its unforwarded physical arguments are
+  // counted by my block index and missing from my edge index. A sibling after me
+  // contributes nothing to either.
+  bool precedingSiblingInFlight = false;
+  for (mlir::BlockArgument sibling : block->getArguments())
+    if (sibling != argument &&
+        sibling.getArgNumber() < argument.getArgNumber() &&
+        controlFlowBlockArgumentsInProgress.contains(sibling))
+      precedingSiblingInFlight = true;
+  bool siblingInFlight = precedingSiblingInFlight && !ablateDeferral;
+
+  if (controlFlowLogicalBlockArgumentSet.insert(argument).second)
+    controlFlowLogicalBlockArguments.push_back(
+        ControlFlowLogicalBlockArgumentABI{argument});
+
+  if (cfArityTraceEnabled())
+    llvm::errs() << "[cf-begin] arg#" << argument.getArgNumber() << " type "
+                 << argument.getType()
+                 << (siblingInFlight ? " DEFERRED" : " immediate") << "\n";
+
+  if (siblingInFlight) {
+    controlFlowDeferredExpansions.push_back(ControlFlowDeferredExpansion{
+        argument, *physicalTypes, primitiveIntLane, op});
+    controlFlowBlockArgumentsInProgress.erase(argument);
+    return mlir::success();
+  }
+
+  mlir::LogicalResult spliced =
+      RuntimeBundleLowerer::spliceControlFlowBlockArgumentEdges(
+          op, argument, *physicalTypes, primitiveIntLane);
+  controlFlowBlockArgumentsInProgress.erase(argument);
+  if (mlir::failed(spliced))
+    return mlir::failure();
+  return RuntimeBundleLowerer::drainDeferredControlFlowExpansions();
+}
+
+// The edge half of one logical block argument's expansion: materialize each
+// incoming edge's physical operands and splice them in behind the logical one,
+// then reconcile the arms' compile-time evidence.
+//
+// Separate from the half above because it can be DEFERRED -- see the note at the
+// split. The caller owns `controlFlowBlockArgumentsInProgress` for `argument`
+// across this call, so nothing here inserts or erases it.
+mlir::LogicalResult RuntimeBundleLowerer::spliceControlFlowBlockArgumentEdges(
+    mlir::Operation *op, mlir::BlockArgument argument,
+    llvm::ArrayRef<mlir::Type> physicalTypes, bool primitiveIntLane) {
+  mlir::Block *block = argument.getOwner();
+
   // Bundles are copied by VALUE: nested block-argument lowering inserts into
   // valueBundles, and a rehash would dangle any held pointer.
   llvm::SmallVector<RuntimeBundle, 4> sourceBundles;
@@ -349,7 +502,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerControlFlowBlockArgument(
               physicalOperands)))
         return mlir::failure();
     } else if (mlir::failed(RuntimeBundleLowerer::appendBundlePhysicalOperands(
-                   anchor, *source, *physicalTypes, physicalOperands))) {
+                   anchor, *source, physicalTypes, physicalOperands))) {
       return mlir::failure();
     }
 
@@ -414,28 +567,42 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerControlFlowBlockArgument(
   // bound only stops a pathological non-converging graph from looping forever.
   unsigned rounds = 0;
   const unsigned maxRounds = 4096;
+  unsigned spliced = 0;
+  auto traceExit = [&](const char *why) {
+    if (!cfArityTraceEnabled())
+      return;
+    llvm::errs() << "[cf-expand] arg#" << argument.getArgNumber() << " type "
+                 << argument.getType() << " physTypes=" << physicalTypes.size()
+                 << " rounds=" << rounds << " spliced=" << spliced << " exit="
+                 << why << "\n";
+  };
   while (std::optional<PendingEdge> pending = findPendingEdge(std::nullopt)) {
     if (++rounds > maxRounds) {
-      controlFlowBlockArgumentsInProgress.erase(argument);
       return op->emitError()
              << "control-flow block argument expansion did not converge";
     }
     llvm::SmallVector<mlir::Value, 8> physicalOperands;
     if (mlir::failed(appendPhysicalBranchOperands(
             pending->predecessor, pending->logicalSource, physicalOperands))) {
-      controlFlowBlockArgumentsInProgress.erase(argument);
+      traceExit("append-failed");
       return mlir::failure();
     }
-    if (physicalOperands.empty())
+    if (physicalOperands.empty()) {
+      traceExit("empty-physical-operands");
       break; // Nothing to forward for this argument at all.
+    }
 
     // Re-locate the edge: the expansion above may have rebuilt this
     // terminator or split this predecessor.
     std::optional<PendingEdge> target = findPendingEdge(pending->logicalSource);
-    if (!target)
+    if (!target) {
+      traceExit("edge-vanished-continue");
       continue;
-    if (target->predecessor != pending->predecessor)
+    }
+    if (target->predecessor != pending->predecessor) {
+      traceExit("edge-moved-continue");
       continue; // Moved to another block: re-expand there, where it dominates.
+    }
     auto branch = mlir::cast<mlir::BranchOpInterface>(
         target->predecessor->getTerminator());
     mlir::SuccessorOperands operands =
@@ -449,7 +616,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerControlFlowBlockArgument(
     insertValues(updated, index + 1, physicalOperands);
     operands.getMutableForwardedOperands().assign(updated);
     splicedExpansions.insert(physicalOperands.front());
+    ++spliced;
   }
+  traceExit("loop-drained");
 
   if (!sourceBundles.empty() &&
       llvm::all_of(sourceBundles, [&](const RuntimeBundle &candidate) {
@@ -514,15 +683,66 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerControlFlowBlockArgument(
     }
   }
 
-  if (controlFlowLogicalBlockArgumentSet.insert(argument).second)
-    controlFlowLogicalBlockArguments.push_back(
-        ControlFlowLogicalBlockArgumentABI{argument});
-  controlFlowBlockArgumentsInProgress.erase(argument);
+  return mlir::success();
+}
+
+// Finish every expansion that deferred its edges because a sibling of the same
+// block was mid-expansion, LOWEST ARGUMENT NUMBER FIRST.
+//
+// The order is the correctness argument, not a preference. `getArgNumber()` is an
+// index into the BLOCK's argument list and it is used as an index into a
+// predecessor's SUCCESSOR-OPERAND list; those two agree exactly when every block
+// argument before this one is already forwarded on that edge. Ascending order
+// establishes that, because the only arguments still missing from an edge are the
+// deferred ones and they are drained in the order the block lists them.
+//
+// Why NOT compute the operand index instead of ordering the work: an exact
+// computation needs, per edge, which expansions have already spliced it -- so it
+// needs per-edge state that the one-shot local `splicedExpansions` set does not
+// carry across a re-entrant call. Ordering makes the same fact true by
+// construction and states it in one sentence.
+//
+// Why NOT pre-lower the siblings before starting an expansion, which removes the
+// re-entrancy instead of tolerating it: a sibling's own edge computation can reach
+// back to this argument, and `controlFlowBlockArgumentsInProgress` turns that into
+// "cyclic Python control-flow block argument ABI is not implemented yet" -- a
+// refusal of a program that works today.
+mlir::LogicalResult RuntimeBundleLowerer::drainDeferredControlFlowExpansions() {
+  while (!controlFlowDeferredExpansions.empty()) {
+    unsigned best = 0;
+    for (unsigned index = 1, end = controlFlowDeferredExpansions.size();
+         index < end; ++index) {
+      const ControlFlowDeferredExpansion &candidate =
+          controlFlowDeferredExpansions[index];
+      const ControlFlowDeferredExpansion &incumbent =
+          controlFlowDeferredExpansions[best];
+      if (candidate.argument.getOwner() == incumbent.argument.getOwner() &&
+          candidate.argument.getArgNumber() <
+              incumbent.argument.getArgNumber())
+        best = index;
+    }
+    ControlFlowDeferredExpansion pending = controlFlowDeferredExpansions[best];
+    controlFlowDeferredExpansions.erase(controlFlowDeferredExpansions.begin() +
+                                        best);
+    if (cfArityTraceEnabled())
+      llvm::errs() << "[cf-drain] arg#" << pending.argument.getArgNumber()
+                   << " type " << pending.argument.getType() << ", "
+                   << controlFlowDeferredExpansions.size() << " still deferred\n";
+    controlFlowBlockArgumentsInProgress.insert(pending.argument);
+    mlir::LogicalResult finished =
+        RuntimeBundleLowerer::spliceControlFlowBlockArgumentEdges(
+            pending.op, pending.argument, pending.physicalTypes,
+            pending.primitiveIntLane);
+    controlFlowBlockArgumentsInProgress.erase(pending.argument);
+    if (mlir::failed(finished))
+      return mlir::failure();
+  }
   return mlir::success();
 }
 
 mlir::LogicalResult
 RuntimeBundleLowerer::dropControlFlowLogicalBranchOperands() {
+  traceControlFlowArity(module, "before-drop-logical-operands");
   auto dropOperand = [&](mlir::Block *dest, mlir::ValueRange oldOperands,
                          unsigned index,
                          llvm::SmallVectorImpl<mlir::Value> &newOperands)
@@ -605,11 +825,13 @@ RuntimeBundleLowerer::dropControlFlowLogicalBranchOperands() {
                 "terminator";
     }
   }
+  traceControlFlowArity(module, "after-drop-logical-operands");
   return mlir::success();
 }
 
 mlir::LogicalResult
 RuntimeBundleLowerer::eraseControlFlowLogicalBlockArguments() {
+  traceControlFlowArity(module, "before-erase-logical-args");
   llvm::SmallVector<mlir::BlockArgument, 16> arguments;
   arguments.reserve(controlFlowLogicalBlockArguments.size());
   for (ControlFlowLogicalBlockArgumentABI abi :
@@ -628,6 +850,7 @@ RuntimeBundleLowerer::eraseControlFlowLogicalBlockArguments() {
                 "runtime lowering";
     argument.getOwner()->eraseArgument(argument.getArgNumber());
   }
+  traceControlFlowArity(module, "after-erase-logical-args");
   return mlir::success();
 }
 
