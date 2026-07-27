@@ -56,12 +56,30 @@ add_dependencies(LythonParser LythonCpythonSpecSnapshot)
 set_source_files_properties(parser.c PROPERTIES
     COMPILE_OPTIONS "-Wno-unused-but-set-variable;-Wno-incompatible-pointer-types-discards-qualifiers"
 )
+# CpythonSpec.cpp は ~800KB の生成スナップショット (静的初期化子) を include して
+# いる。データ表であって hot code ではないので、最適化しても得るものが無く、掛かる
+# コストは大きい。
+#
+# 実測 (RelWithDebInfo、`build/.ninja_log`): このオブジェクト 1 個で
+# **894.8 秒 / コールドビルド全体 907.3 秒** を占め、次に遅い TU は 11.3 秒 —
+# 80 倍である。同じソースが `LythonCpythonSpecGen` では 1.7 秒でコンパイルされる。
+# `00984f0` で `CMAKE_BUILD_TYPE` の既定を RelWithDebInfo にしたことで、この表が
+# `-O2 -g` でコンパイルされるようになったのが原因 (RSS も 1 GB を超える)。
+#
+# Why NOT 最適化を残す: 交換レートを測った。`lyc parse` の起動は
+# RelWithDebInfo (この TU が -O2) で 0.01 s、Debug (同 -O0) で 0.02 s。差 10 ms は
+# **バイナリ全体**の最適化差であり、`loadGeneratedSpec()` に帰属する分はその一部に
+# すぎない。**起動 10 ms 以下 対 コールドビルド約 880 秒**なので、-O0 が正しい。
+#
+# fuzzer ビルドでは加えて計装も外す (ASan + カバレッジとの組み合わせで数十分になる)。
+# データ表なので計装を外しても探索価値は失わない。
 if(LYTHON_ENABLE_FUZZERS)
-    # CpythonSpec.cpp は ~800KB の生成スナップショット (静的初期化子) を
-    # include しており、ASan + カバレッジ計装との組み合わせでコンパイルが
-    # 数十分オーダーになる。データ表なので計装を外しても探索価値は失わない。
     set_source_files_properties(lib/CpythonSpec.cpp PROPERTIES
         COMPILE_OPTIONS "-fno-sanitize=fuzzer-no-link,address;-O0"
+    )
+else()
+    set_source_files_properties(lib/CpythonSpec.cpp PROPERTIES
+        COMPILE_OPTIONS "-O0"
     )
 endif()
 set_source_files_properties(PegenShim.c PROPERTIES
