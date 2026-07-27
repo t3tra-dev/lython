@@ -1558,12 +1558,45 @@ bool releaseOwnedGroupByLiveness(
 // case it can prove is honest; guessing the window is how a retain lands on the
 // wrong side of a decref.
 //
-// Why NOT decline the EDGE (sound = false) when this returns false: a candidate
-// accepted today on a wide non-argument header has its retain dropped at
-// emission and is balanced anyway, because nothing else releases the source.
-// Declining it removes the destination's release too, and that is a measured
-// regression, not a conservative choice. The residual is recorded in
-// rfc/memory-safety-proof.md rather than papered over.
+// Why NOT decline the EDGE (sound = false) when this returns false: declining it
+// removes the destination's release too, and that is a measured regression, not a
+// conservative choice.
+//
+// ⛔ MEASURED FALSE (2026-07-28), and it is the reason to read the rest of this
+// comment carefully rather than trust its conclusion. This paragraph used to also
+// say that a candidate accepted on a wide non-argument header "is balanced anyway,
+// because nothing else releases the source", and cited that as why the dropped
+// retain costs at most a bounded leak. Something else DOES release the source once
+// `builtins.list` became one lane:
+//
+//     def run(n: int) -> int:
+//         total = 0
+//         for i in range(n):
+//             xs: list[int] = [i]
+//             ys: list[int] = xs if i % 2 == 0 else [i, i]
+//             total += len(ys)
+//             total += len(xs)
+//         return total
+//
+// aborts with `Ly_DecRef observed non-positive refcount` (exit 134) while CPython
+// prints 6. `LYTHON_OWNERSHIP_TRACE_RETAIN_OMISSIONS=1` names the site:
+// `header type memref<9xi64>, op result` -- the merge argument reconciling the
+// two incoming list groups, declined here because the header is an op result
+// rather than a block argument.
+//
+// So the residual on this branch is NOT a bounded leak. It is a shipped
+// over-release: it survives `--release`, and the affine verifier cannot see it
+// because the dropped lend belongs to the reconciling argument, so each group's
+// own arithmetic still balances (rfc/memory-safety-proof.md, third failure shape).
+// The recorded residual was one class too weak.
+//
+// Why this is NOT repaired by dropping the `isa<BlockArgument>` test: that is the
+// unconditional narrowing measured below to break three cases. The test is a PROXY
+// for "the handle's first two words are the refcount/class prefix", which is a
+// per-contract LAYOUT fact owned by `Passes/Runtime/ABI/` (HandleWidthRegistry,
+// ContainerLayout) and not derivable here -- a one-lane `list` handle satisfies it
+// and a 16-word payload box does not, and both are wide non-arguments. The repair
+// is that layout predicate, not a wider guess at this site.
 //
 // Why NOT drop this predicate and narrow UNCONDITIONALLY through
 // own::spellHeaderPrefix, which is the obvious two-line reading of the emission
