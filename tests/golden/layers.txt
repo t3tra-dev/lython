@@ -82,7 +82,5 @@ errors/generator_handler_local_yield lower
 errors/generator_method_receiver_lane lower
 errors/list_insert_on_field lower
 errors/optional_unnarrowed_object_position lower
-errors/ownership_borrowed_container_grow lower
 errors/ownership_owned_temp_two_returns lower
-errors/try_structural_rebind lower
 errors/type_object_call_via_value lower

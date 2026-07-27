@@ -358,12 +358,14 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerRuntimeListInsert(
   mlir::func::CallOp grow =
       RuntimeBundleLowerer::createRuntimeCall(loc, *ensure, growOperands);
 
+  // Through rebindMutatedContainer rather than makeObjectBundle directly: a
+  // handle-fronted contract's ensure_capacity is VOID -- it published the new
+  // base through the handle -- so there are no results to build a bundle from,
+  // and building one from an empty range asked the ABI for 0 values.
   RuntimeBundle updated;
-  if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
-          op, receiver.objectValue.contract, grow.getResults(), updated)))
+  if (mlir::failed(RuntimeBundleLowerer::rebindMutatedContainer(
+          op, receiver, grow.getResults(), updated)))
     return mlir::failure();
-  updated.fieldAliasOwner = receiver.fieldAliasOwner;
-  updated.fieldAliasName = receiver.fieldAliasName;
 
   // The box is filled after the growth call: `objectPayloadHandleWords` may
   // itself box the element, and the words must be stored into a box the
@@ -941,8 +943,13 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
     // Slice splice/deletion always goes through the runtime representation
     // (the physical payload is maintained alongside any compile-time
     // evidence, and a length change under runtime indices cannot be
-    // replayed on the evidence): the manifest method rebinds the receiver
-    // like append's growth path, and the rebound bundle is runtime-mode.
+    // replayed on the evidence), so the rebound bundle must be runtime-mode.
+    // Demoted EXPLICITLY below: while the method returned a fresh triple, the
+    // rebind built a new bundle and dropped the evidence as a side effect. A
+    // handle-fronted contract's mutator returns nothing, so the rebind hands
+    // the receiver straight back -- carrying element evidence that names the
+    // pre-splice contents. That read as a correct list on the print right
+    // after the splice and then mis-executed the NEXT delete.
     if (!structuralMutation)
       return op.emitError()
              << "list slice mutation requires a rebindable local receiver";
@@ -958,7 +965,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
     if (mlir::failed(RuntimeBundleLowerer::rebindMutatedContainer(
             op, receiver, emitted->call.getResults(), updated)))
       return mlir::failure();
-    valueBundles[op.getResult(1)] = std::move(updated);
+    RuntimeBundleLowerer::demoteMutableContainerEvidence(updated);
+    valueBundles[op.getResult(1)] = updated;
+    // The receiver's own binding learns it too: a slice mutation is spelled as
+    // an SSA reassignment, but a later read through the pre-mutation name must
+    // not answer from evidence the mutation invalidated.
+    valueBundles[op.getCallable()] = std::move(updated);
     if (mlir::failed(assignObjectBundle(
             op, op.getResult(0),
             runtimeContractType(context, "types.NoneType"),

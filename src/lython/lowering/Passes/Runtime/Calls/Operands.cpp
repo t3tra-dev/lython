@@ -82,6 +82,48 @@ mlir::LogicalResult RuntimeBundleLowerer::appendRuntimeSource(
     return mlir::success();
   }
 
+  // A boundary that is POLYMORPHIC over several sequence contracts -- `join` on
+  // str/bytes, `frozenset(iterable)` -- cannot name any one contract's physical
+  // shape, because the shapes no longer agree once a contract is one-laned.
+  // It names what every sequence has instead: the element count and the items
+  // array. Both come from the accessors that answer for either representation
+  // (a lane for a lane-carrying contract, handle words for a handle-fronted
+  // one), so the pair below is the same two values the three-lane callee used
+  // to read out of the triple it was handed.
+  //
+  // The items view is derived from the ENTITY at the point of use rather than
+  // travelling beside it, which is what makes it pin the handle across the call
+  // (`collectBoxWordDerivedViews`); the count is a plain i64 read. Refused for
+  // a CONSUMING input: a view is not the value group an ownership transfer
+  // would have to move.
+  if (source.kind == RuntimeBundle::Kind::Object &&
+      inputIndex + 2 <= functionType.getNumInputs() &&
+      RuntimeBundleLowerer::isSequenceLikeContractName(source.contractName()) &&
+      functionType.getInput(inputIndex).isInteger(64) &&
+      compatibleRankOneMemRefStorage(
+          mlir::MemRefType::get({mlir::ShapedType::kDynamic},
+                                builder.getI64Type()),
+          functionType.getInput(inputIndex + 1),
+          /*targetMustBeDynamic=*/true)) {
+    if (runtimeInputConsumesObject(symbol, inputIndex) ||
+        runtimeInputConsumesObject(symbol, inputIndex + 1))
+      return rejectConsumingObjectView(op, symbol, inputIndex, source,
+                                       "sequence count-and-items view");
+    mlir::FailureOr<mlir::Value> length =
+        RuntimeBundleLowerer::loadContainerLength(op, source, symbol.name);
+    if (mlir::failed(length))
+      return mlir::failure();
+    mlir::FailureOr<mlir::Value> items =
+        RuntimeBundleLowerer::containerInteriorView(
+            op, source, ContainerInterior::Primary, symbol.name);
+    if (mlir::failed(items))
+      return mlir::failure();
+    operands.push_back(*length);
+    operands.push_back(*items);
+    inputIndex += 2;
+    return mlir::success();
+  }
+
   mlir::Type expected = functionType.getInput(inputIndex);
   std::optional<RuntimeValue> materializedObject;
   auto materializeLazySource = [&]() -> mlir::LogicalResult {
