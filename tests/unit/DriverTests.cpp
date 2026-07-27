@@ -3,7 +3,12 @@
 #include "embedded.h"
 
 #include "mlir/IR/MLIRContext.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/IR/CFG.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -153,6 +158,70 @@ TEST(DriverTest, CompilesF64MatmulWithAndWithoutSMEF64) {
     CompileResult result = compileSource(source, targetOptions("", cpu));
     EXPECT_TRUE(result.succeeded)
         << "cpu='" << cpu << "': " << result.diagnostics;
+  }
+}
+
+// Blocks of `function` that are reachable from themselves. Such a block runs
+// more than once per frame, so an alloca in it extends the frame every time.
+llvm::SmallPtrSet<const llvm::BasicBlock *, 8>
+selfReachableBlocks(const llvm::Function &function) {
+  llvm::SmallPtrSet<const llvm::BasicBlock *, 8> result;
+  for (const llvm::BasicBlock &block : function) {
+    llvm::SmallPtrSet<const llvm::BasicBlock *, 32> seen;
+    llvm::SmallVector<const llvm::BasicBlock *, 32> worklist(
+        llvm::succ_begin(&block), llvm::succ_end(&block));
+    while (!worklist.empty()) {
+      const llvm::BasicBlock *next = worklist.pop_back_val();
+      if (!seen.insert(next).second)
+        continue;
+      worklist.append(llvm::succ_begin(next), llvm::succ_end(next));
+    }
+    if (seen.contains(&block))
+      result.insert(&block);
+  }
+  return result;
+}
+
+// A boxed container mutation inside a loop must not leave its 16-word payload
+// box slot in the loop body: `memref.alloca` outside the entry block becomes a
+// dynamic LLVM stack adjustment that nothing reclaims before the function
+// returns, so the frame grew 128 bytes per iteration and the stack guard raised
+// RecursionError past ~25,000 iterations. Every alloca that survives in a
+// self-reachable block here is a byte buffer feeding a raise (the
+// changed-size guard, the traceback file/function names), which by construction
+// runs at most once per frame; assert on element type rather than on a count so
+// that a NEW non-i8 loop-body slot fails by name and so that removing the last
+// one also fails and asks for this test to be tightened.
+TEST(DriverTest, BoxedContainerLoopKeepsPayloadSlotsOutOfTheLoopBody) {
+  CompileResult result = compileSource("d: dict[int, int] = {}\n"
+                                       "for i in range(4):\n"
+                                       "    d[i] = i\n"
+                                       "acc = 0\n"
+                                       "for k in d:\n"
+                                       "    d[0] = k\n"
+                                       "    acc = acc + 1\n"
+                                       "print(acc)\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  const llvm::Function *main = result.verified.llvmModule->getFunction("__main__");
+  ASSERT_NE(main, nullptr);
+
+  llvm::SmallPtrSet<const llvm::BasicBlock *, 8> repeated =
+      selfReachableBlocks(*main);
+  ASSERT_FALSE(repeated.empty()) << "the loops were compiled away; this test "
+                                    "would then assert nothing";
+  for (const llvm::BasicBlock &block : *main) {
+    if (!repeated.contains(&block))
+      continue;
+    for (const llvm::Instruction &instruction : block) {
+      const auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(&instruction);
+      if (!alloca)
+        continue;
+      std::string described;
+      llvm::raw_string_ostream out(described);
+      alloca->print(out);
+      EXPECT_TRUE(alloca->getAllocatedType()->isIntegerTy(8))
+          << "alloca in a block that repeats: " << described;
+    }
   }
 }
 

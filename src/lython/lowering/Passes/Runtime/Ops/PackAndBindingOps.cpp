@@ -218,21 +218,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPack(py::PackOp op) {
           return mlir::failure();
         auto transientBox =
             [&](const RuntimeBundle &entry) -> mlir::FailureOr<mlir::Value> {
-          mlir::MemRefType boxType = box_abi::boxWordsType(builder);
-          mlir::Value box =
-              mlir::memref::AllocaOp::create(builder, loc, boxType)
-                  .getResult();
-          mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
-              RuntimeBundleLowerer::objectPayloadHandleWords(
-                  op, entry, /*ownsPayload=*/true);
-          if (mlir::failed(words))
-            return mlir::failure();
-          for (auto [wordIndex, word] : llvm::enumerate(*words)) {
-            mlir::Value slot = mlir::arith::ConstantIndexOp::create(
-                builder, loc, static_cast<std::int64_t>(wordIndex));
-            mlir::memref::StoreOp::create(builder, loc, word, box, slot);
-          }
-          return box;
+          return RuntimeBundleLowerer::transientPayloadBox(op, entry,
+                                                           /*ownsPayload=*/true);
         };
         mlir::FailureOr<mlir::Value> keyBox = transientBox(*payloadKey);
         if (mlir::failed(keyBox))
