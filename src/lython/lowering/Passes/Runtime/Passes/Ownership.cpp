@@ -3312,30 +3312,57 @@ public:
            "canonicalization";
   }
 
+  // The four sub-scopes exist because this phase's total is the largest in the
+  // pipeline (measured by another track: 451 s of 1376 s across the 270 golden
+  // cases, and 92 s on the worst single case) and the total alone does not say
+  // which of its two heavy analyses to attack. Both of them ALSO run inside
+  // refcount insertion under their own scope names, so the pair of numbers is
+  // directly comparable across the two runs -- which is the question anyone
+  // optimising this phase asks first.
+  //
+  // Why NOT split further, per function, inside the two calls: PerfScope prints
+  // one line per scope with no aggregation, so a per-function split emits
+  // hundreds of lines and the phase total has to be re-summed by the reader.
+  // Whoever needs that resolution should add accumulation to PerfScope rather
+  // than more scopes here.
   void runOnOperation() final {
     mlir::ModuleOp module = getOperation();
-    llvm::SmallVector<own::RuntimeDeallocator, 8> deallocators =
-        own::collectRuntimeDeallocators(module);
+    llvm::SmallVector<own::RuntimeDeallocator, 8> deallocators;
+    {
+      py::PerfScope perf("post-cleanup-unwind-insertion.collect-deallocators");
+      deallocators = own::collectRuntimeDeallocators(module);
+    }
     if (deallocators.empty())
       return;
     own::AliasAnalysis aliases;
-    aliases.build(module);
+    {
+      py::PerfScope perf("post-cleanup-unwind-insertion.alias-analysis");
+      aliases.build(module);
+    }
     FuncContractCache contracts(module);
     // Re-derive the owned block-argument merge groups analysis-only (their
     // normal-path releases and borrow-edge retains were placed by the main
     // pass): the held-token analysis needs them to cover calls the cleanup
     // canonicalization hoisted out of folded region ops.
     llvm::SmallVector<own::ResourceGroup, 8> blockArgGroups;
-    if (mlir::failed(insertOwnedBlockArgumentReleases(
-            module, contracts, deallocators, aliases, &blockArgGroups,
-            /*insertReleases=*/false))) {
-      signalPassFailure();
-      return;
+    {
+      py::PerfScope perf(
+          "post-cleanup-unwind-insertion.block-argument-groups");
+      if (mlir::failed(insertOwnedBlockArgumentReleases(
+              module, contracts, deallocators, aliases, &blockArgGroups,
+              /*insertReleases=*/false))) {
+        signalPassFailure();
+        return;
+      }
     }
-    if (mlir::failed(insertUnwindCleanupReleases(module, contracts,
-                                                 deallocators, aliases,
-                                                 blockArgGroups)))
-      signalPassFailure();
+    {
+      py::PerfScope perf(
+          "post-cleanup-unwind-insertion.unwind-cleanup-releases");
+      if (mlir::failed(insertUnwindCleanupReleases(module, contracts,
+                                                   deallocators, aliases,
+                                                   blockArgGroups)))
+        signalPassFailure();
+    }
   }
 };
 
