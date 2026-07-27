@@ -14,6 +14,7 @@
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Pass/Pass.h"
 
+#include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
@@ -2268,6 +2269,42 @@ struct UnwindTrackedGroup {
   llvm::SmallVector<mlir::Operation *, 8> useSites;
 };
 
+// How the unwind-cleanup CFG questions below are answered.
+//
+//   LYTHON_UNWIND_REACH_CACHE unset/1  memoised sets (the shipped formulation)
+//   LYTHON_UNWIND_REACH_CACHE=0        the direct walk, one per question
+//   LYTHON_UNWIND_REACH_CACHE=verify   both, per question, and report every
+//                                      disagreement with a running denominator
+//
+// Why the walk stays in the tree rather than being deleted with the measurement
+// that needed it: this phase inserts ownership releases, so a divergence
+// between the two formulations is a leak or a double free, and "they agree" is
+// only checkable against a reference. Rebuilding one from an older
+// commit checks that commit, not this tree -- and it makes the comparison
+// cross-binary, which is how three of this session's conclusions went wrong.
+//
+// Why `verify` as well as `0`: comparing final IR only catches a divergence
+// that changes the IR. A query can disagree and still leave the IR alone (the
+// group was skipped for another reason), and that is the shape that ships one
+// waiting for the next program. `verify` checks every query instead of one hash
+// per program, and prints how many it checked -- a count of zero is then a
+// finding rather than a pass.
+enum class UnwindReachMode { Cached, Walk, Verify };
+
+UnwindReachMode unwindReachMode() {
+  static UnwindReachMode mode = [] {
+    auto value = llvm::sys::Process::GetEnv("LYTHON_UNWIND_REACH_CACHE");
+    if (!value || value->empty())
+      return UnwindReachMode::Cached;
+    if (*value == "0")
+      return UnwindReachMode::Walk;
+    if (llvm::StringRef(*value).equals_insensitive("verify"))
+      return UnwindReachMode::Verify;
+    return UnwindReachMode::Cached;
+  }();
+  return mode;
+}
+
 struct UnwindCleanupAnalysis {
   mlir::func::FuncOp function;
   mlir::DominanceInfo dominance;
@@ -2284,9 +2321,60 @@ struct UnwindCleanupAnalysis {
   llvm::DenseMap<mlir::Block *, llvm::SmallPtrSet<mlir::Block *, 16>>
       reachableCache;
 
+  // Numbering of the function's top-level blocks, so a reachability answer can
+  // be a bit in a vector instead of a walk. Every from/to/avoid asked about
+  // here is a top-level block (points nested in region ops are mapped to their
+  // top-level ancestor before they arrive), and a query naming a block outside
+  // the numbering falls back to the direct walk rather than guessing.
+  llvm::SmallVector<mlir::Block *, 32> blocks;
+  llvm::DenseMap<mlir::Block *, unsigned> blockIndex;
+  // Reverse of `exceptionEdges`, for the backward walk that answers the
+  // handler-path question for a whole group at once.
+  llvm::DenseMap<mlir::Block *, llvm::SmallVector<mlir::Block *, 2>>
+      exceptionPreds;
+
+  // A reachability set, plus whether it is authoritative: a walk that left the
+  // numbered blocks cannot be answered from bits, and the caller re-asks
+  // directly instead of reading a set that is missing part of the CFG.
+  struct ReachSet {
+    llvm::BitVector members;
+    bool exact = true;
+  };
+  llvm::DenseMap<std::pair<mlir::Block *, mlir::Block *>, ReachSet> forwardSets;
+  llvm::DenseMap<std::pair<mlir::Operation *, mlir::Block *>, ReachSet>
+      forwardAfterSets;
+  // Keyed by group address: the group fixes both the avoided block and the set
+  // of use blocks. Safe because every query happens after `groups` is fully
+  // built (the cleanup records hold pointers into it for the same reason).
+  llvm::DenseMap<const UnwindTrackedGroup *, ReachSet> useReachingSets;
+
+  UnwindReachMode mode = UnwindReachMode::Cached;
+  // CFG walks performed and blocks popped, printed per function under
+  // LYTHON_PERF. These are the shape of the cost, not a restatement of the
+  // wall time: the marker loop asked #markers x #groups x #sites walks, and
+  // what says the product is gone is that `walks` stops moving when markers
+  // are added.
+  std::uint64_t walks = 0;
+  std::uint64_t walkNodes = 0;
+  // `verify` mode only: questions asked of both formulations, and the ones they
+  // answered differently. Printed even when zero divergences, because a checker
+  // that reports nothing is indistinguishable from a checker that checked
+  // nothing (rfc/stdlib-semantics.md 13g).
+  std::uint64_t verifiedQueries = 0;
+  std::uint64_t divergences = 0;
+
   explicit UnwindCleanupAnalysis(mlir::func::FuncOp fn)
       : function(fn), dominance(fn),
-        exceptionEdges(own::collectExceptionEdges(fn.getBody())) {
+        exceptionEdges(own::collectExceptionEdges(fn.getBody())),
+        mode(unwindReachMode()) {
+    for (mlir::Block &block : fn.getBody()) {
+      blockIndex.insert({&block, static_cast<unsigned>(blocks.size())});
+      blocks.push_back(&block);
+    }
+    for (auto &[block, successors] : exceptionEdges)
+      for (mlir::Block *successor : successors)
+        exceptionPreds[successor].push_back(block);
+
     llvm::DenseMap<std::int64_t, mlir::Block *> handlers =
         own::collectExceptionHandlerEntries(fn.getBody());
     if (handlers.empty())
@@ -2304,6 +2392,35 @@ struct UnwindCleanupAnalysis {
           markerEdges[&block].push_back({&op, handler->second});
       }
     }
+  }
+
+  ~UnwindCleanupAnalysis() {
+    if (mode != UnwindReachMode::Verify || verifiedQueries == 0)
+      return;
+    llvm::errs() << "[unwind-reach-verify] @" << function.getName()
+                 << " queries=" << verifiedQueries
+                 << " divergences=" << divergences << "\n";
+  }
+
+  std::optional<unsigned> indexOf(mlir::Block *block) const {
+    auto found = blockIndex.find(block);
+    if (found == blockIndex.end())
+      return std::nullopt;
+    return found->second;
+  }
+
+  // In `verify` mode: does the memoised answer match the walk's? Returns the
+  // memoised one either way -- the point is to REPORT a divergence on the IR
+  // the shipped path produces, not to paper over it with the other answer.
+  bool agree(bool cached, bool direct, llvm::StringRef question) {
+    ++verifiedQueries;
+    if (cached == direct)
+      return cached;
+    ++divergences;
+    llvm::errs() << "[unwind-reach-verify] DIVERGENCE @" << function.getName()
+                 << " question=" << question << " cached=" << cached
+                 << " walk=" << direct << "\n";
+    return cached;
   }
 
   const llvm::SmallPtrSet<mlir::Block *, 16> &reachableFrom(mlir::Block *from) {
@@ -2341,8 +2458,36 @@ struct UnwindCleanupAnalysis {
   // `from`), the FIRST hop only takes exception edges of markers AFTER it:
   // an unwind at an earlier marked call happens before `fromAfter` ran, so
   // its edge cannot carry `fromAfter`'s effect.
+  //
+  // `to` is a membership test on a set fixed by (from, avoid, fromAfter), and
+  // the marker loop asks the same (from, avoid, fromAfter) for every exit
+  // point in the function. So the set is built once and cached; the walk below
+  // is what the answer USED to cost per question.
   bool reachesAvoiding(mlir::Block *from, mlir::Block *to, mlir::Block *avoid,
                        mlir::Operation *fromAfter = nullptr) {
+    if (mode == UnwindReachMode::Walk)
+      return walkReachesAvoiding(from, to, avoid, fromAfter);
+    std::optional<unsigned> target = indexOf(to);
+    if (target && indexOf(from)) {
+      const ReachSet &set = reachSetAvoiding(from, avoid, fromAfter);
+      if (set.exact) {
+        bool cached = set.members.test(*target);
+        if (mode == UnwindReachMode::Verify)
+          return agree(cached, walkReachesAvoiding(from, to, avoid, fromAfter),
+                       "reaches-avoiding");
+        return cached;
+      }
+    }
+    return walkReachesAvoiding(from, to, avoid, fromAfter);
+  }
+
+  // The direct walk: one question, one traversal, early exit at `to`. Retained
+  // as the reference formulation behind LYTHON_UNWIND_REACH_CACHE=0 and as the
+  // fallback for a block outside the numbering.
+  bool walkReachesAvoiding(mlir::Block *from, mlir::Block *to,
+                           mlir::Block *avoid,
+                           mlir::Operation *fromAfter = nullptr) {
+    ++walks;
     llvm::SmallPtrSet<mlir::Block *, 16> visited;
     llvm::SmallVector<mlir::Block *, 16> worklist;
     auto enqueue = [&](mlir::Block *block) {
@@ -2351,22 +2496,7 @@ struct UnwindCleanupAnalysis {
       if (visited.insert(block).second)
         worklist.push_back(block);
     };
-    for (mlir::Block *successor : from->getSuccessors())
-      enqueue(successor);
-    if (!fromAfter) {
-      if (auto found = exceptionEdges.find(from); found != exceptionEdges.end())
-        for (mlir::Block *successor : found->second)
-          enqueue(successor);
-    } else if (auto found = markerEdges.find(from);
-               found != markerEdges.end()) {
-      for (auto &[marker, handler] : found->second)
-        // The edge carries `fromAfter`'s effect when the op ran before the
-        // unwind -- or IS the guarded call itself: a transfer/release
-        // consumes its operand DURING the unwinding call.
-        if (fromAfter->isBeforeInBlock(marker) ||
-            own::guardedCallAfterMarker(marker) == fromAfter)
-          enqueue(handler);
-    }
+    seedFirstHop(from, fromAfter, enqueue);
     auto enqueueSuccessors = [&](mlir::Block *block) {
       for (mlir::Block *successor : block->getSuccessors())
         enqueue(successor);
@@ -2377,11 +2507,150 @@ struct UnwindCleanupAnalysis {
     };
     while (!worklist.empty()) {
       mlir::Block *block = worklist.pop_back_val();
+      ++walkNodes;
       if (block == to)
         return true;
       enqueueSuccessors(block);
     }
     return false;
+  }
+
+  // The first hop, shared by the walk and the set build so the two cannot
+  // drift: successors always, exception edges of the whole block when there is
+  // no `fromAfter`, and only the edges of markers `fromAfter` reaches when
+  // there is one. `avoid` is not a parameter because both callers' `enqueue`
+  // filters it, and one filter cannot disagree with itself.
+  template <typename EnqueueFn>
+  void seedFirstHop(mlir::Block *from, mlir::Operation *fromAfter,
+                    EnqueueFn enqueue) {
+    for (mlir::Block *successor : from->getSuccessors())
+      enqueue(successor);
+    if (!fromAfter) {
+      if (auto found = exceptionEdges.find(from); found != exceptionEdges.end())
+        for (mlir::Block *successor : found->second)
+          enqueue(successor);
+      return;
+    }
+    if (auto found = markerEdges.find(from); found != markerEdges.end())
+      for (auto &[marker, handler] : found->second)
+        // The edge carries `fromAfter`'s effect when the op ran before the
+        // unwind -- or IS the guarded call itself: a transfer/release
+        // consumes its operand DURING the unwinding call.
+        if (fromAfter->isBeforeInBlock(marker) ||
+            own::guardedCallAfterMarker(marker) == fromAfter)
+          enqueue(handler);
+  }
+
+  const ReachSet &reachSetAvoiding(mlir::Block *from, mlir::Block *avoid,
+                                   mlir::Operation *fromAfter) {
+    if (!fromAfter) {
+      auto found = forwardSets.find({from, avoid});
+      if (found != forwardSets.end())
+        return found->second;
+    } else {
+      auto found = forwardAfterSets.find({fromAfter, avoid});
+      if (found != forwardAfterSets.end())
+        return found->second;
+    }
+
+    ++walks;
+    ReachSet set;
+    set.members.resize(blocks.size());
+    llvm::SmallVector<mlir::Block *, 16> worklist;
+    auto enqueue = [&](mlir::Block *block) {
+      if (block == avoid)
+        return;
+      std::optional<unsigned> index = indexOf(block);
+      if (!index) {
+        set.exact = false;
+        return;
+      }
+      if (!set.members.test(*index)) {
+        set.members.set(*index);
+        worklist.push_back(block);
+      }
+    };
+    seedFirstHop(from, fromAfter, enqueue);
+    while (!worklist.empty()) {
+      mlir::Block *block = worklist.pop_back_val();
+      ++walkNodes;
+      for (mlir::Block *successor : block->getSuccessors())
+        enqueue(successor);
+      if (auto found = exceptionEdges.find(block);
+          found != exceptionEdges.end())
+        for (mlir::Block *successor : found->second)
+          enqueue(successor);
+    }
+    if (!fromAfter)
+      return forwardSets.insert({{from, avoid}, std::move(set)}).first->second;
+    return forwardAfterSets.insert({{fromAfter, avoid}, std::move(set)})
+        .first->second;
+  }
+
+  // The blocks from which SOME block in `targets` is reachable in one or more
+  // edges without passing through `avoid` -- `reachesAvoiding(x, t, avoid)` for
+  // every t at once, read backwards. The handler-path question asks exactly
+  // that for a group's use blocks, with the handler as `x`, so one backward
+  // walk per group replaces one forward walk per (exit point, use).
+  const ReachSet &useReachingSetFor(const UnwindTrackedGroup &group,
+                                    mlir::Block *avoid) {
+    auto found = useReachingSets.find(&group);
+    if (found != useReachingSets.end())
+      return found->second;
+    return useReachingSets
+        .insert({&group, buildReachingSet(group.useSites, avoid)})
+        .first->second;
+  }
+
+  ReachSet buildReachingSet(llvm::ArrayRef<mlir::Operation *> targets,
+                            mlir::Block *avoid) {
+    ++walks;
+    ReachSet set;
+    set.members.resize(blocks.size());
+    llvm::BitVector onPath(blocks.size());
+    llvm::SmallVector<mlir::Block *, 16> worklist;
+    // A path's non-initial nodes must all avoid `avoid`, the target included;
+    // the start node is not constrained, which is why `members` and `onPath`
+    // are separate sets rather than one.
+    for (mlir::Operation *target : targets) {
+      mlir::Block *block = target->getBlock();
+      if (block == avoid)
+        continue;
+      std::optional<unsigned> index = indexOf(block);
+      if (!index) {
+        set.exact = false;
+        continue;
+      }
+      if (!onPath.test(*index)) {
+        onPath.set(*index);
+        worklist.push_back(block);
+      }
+    }
+    auto visitPredecessor = [&](mlir::Block *pred) {
+      std::optional<unsigned> index = indexOf(pred);
+      if (!index) {
+        set.exact = false;
+        return;
+      }
+      set.members.set(*index);
+      if (pred == avoid)
+        return;
+      if (!onPath.test(*index)) {
+        onPath.set(*index);
+        worklist.push_back(pred);
+      }
+    };
+    while (!worklist.empty()) {
+      mlir::Block *block = worklist.pop_back_val();
+      ++walkNodes;
+      for (mlir::Block *pred : block->getPredecessors())
+        visitPredecessor(pred);
+      if (auto found = exceptionPreds.find(block);
+          found != exceptionPreds.end())
+        for (mlir::Block *pred : found->second)
+          visitPredecessor(pred);
+    }
+    return set;
   }
 };
 
@@ -2597,6 +2866,15 @@ void collectUnwindGroupSites(FuncContractCache &contracts,
   }
 }
 
+// Does the handler's own path still use this group -- i.e. do the handler-side
+// releases already own the token?
+//
+// The answer is a disjunction over the group's use sites, so it is the same
+// question as "is `handler` one of the blocks from which a use is reachable
+// avoiding defBlock". Asked that way it costs one BACKWARD walk per group
+// instead of one forward walk per (handler, use) pair, and the marker loop then
+// answers it with a bit test. `avoid` and the targets both come from the group,
+// which is what makes the walk shareable across every handler in the function.
 bool groupUsedOnHandlerPath(UnwindCleanupAnalysis &analysis,
                             const UnwindTrackedGroup &group,
                             mlir::Block *handler) {
@@ -2607,18 +2885,36 @@ bool groupUsedOnHandlerPath(UnwindCleanupAnalysis &analysis,
   mlir::Block *defBlock = producer
                               ? producer->getBlock()
                               : mlir::cast<mlir::BlockArgument>(root).getOwner();
-  for (mlir::Operation *use : group.useSites) {
-    mlir::Block *block = use->getBlock();
-    if (block == handler)
+  // A use IN the handler counts whatever the CFG says (no edge required), so it
+  // is not part of the reachability question either way.
+  for (mlir::Operation *use : group.useSites)
+    if (use->getBlock() == handler)
       return true;
-    // A use only counts when the handler reaches it WITHOUT re-entering the
-    // defining block: a path through defBlock re-arms the token, so the use
-    // belongs to the next incarnation, not the one unwinding now (try
-    // inside a loop).
-    if (analysis.reachesAvoiding(handler, block, defBlock))
-      return true;
-  }
-  return false;
+
+  // A use only counts when the handler reaches it WITHOUT re-entering the
+  // defining block: a path through defBlock re-arms the token, so the use
+  // belongs to the next incarnation, not the one unwinding now (try inside a
+  // loop).
+  auto direct = [&] {
+    for (mlir::Operation *use : group.useSites)
+      if (analysis.walkReachesAvoiding(handler, use->getBlock(), defBlock))
+        return true;
+    return false;
+  };
+  if (analysis.mode == UnwindReachMode::Walk)
+    return direct();
+
+  std::optional<unsigned> index = analysis.indexOf(handler);
+  if (!index)
+    return direct();
+  const UnwindCleanupAnalysis::ReachSet &set =
+      analysis.useReachingSetFor(group, defBlock);
+  if (!set.exact)
+    return direct();
+  bool cached = set.members.test(*index);
+  if (analysis.mode == UnwindReachMode::Verify)
+    return analysis.agree(cached, direct(), "handler-path");
+  return cached;
 }
 
 // Wall time of `insertUnwindCleanupReleases`' sub-steps for ONE function,
@@ -2669,8 +2965,20 @@ public:
                  << " total_us=" << total;
     for (unsigned step = 0; step < Count; ++step)
       llvm::errs() << " " << kNames[step] << "_us=" << us[step];
-    llvm::errs() << "\n";
+    llvm::errs() << " blocks=" << blocks << " markers=" << markers
+                 << " groups=" << groups << " walks=" << walks
+                 << " walk_nodes=" << walkNodes << "\n";
   }
+
+  // The SHAPE of the work, next to its duration. A time says a step is
+  // expensive; `walks` says whether it is expensive per exit point or per
+  // function, which is the difference between a constant and a product and the
+  // only number that shows the product coming back.
+  std::uint64_t blocks = 0;
+  std::uint64_t markers = 0;
+  std::uint64_t groups = 0;
+  std::uint64_t walks = 0;
+  std::uint64_t walkNodes = 0;
 
 private:
   using Clock = std::chrono::steady_clock;
@@ -2912,211 +3220,45 @@ mlir::LogicalResult insertUnwindCleanupReleases(
         nestedUnguardedMayRaiseCalls.empty())
       return;
 
-    // Per-function stopwatch for the five sub-steps below, printed as one line
-    // when this function alone costs more than a threshold. The phase-level
-    // scope says this step is ~90% of the phase; without this split the next
-    // question ("of what?") needs a profiler, and the answer is load-bearing:
-    // the marker loop is #markers x #groups CFG queries and is INTRINSIC to the
-    // design, while the group collection is a per-group walk that is not.
+    // Per-function stopwatch for the sub-steps below, printed as one line when
+    // this function alone costs more than a threshold. The phase-level scope
+    // says this step is ~90% of the phase; without this split the next question
+    // ("of what?") needs a profiler.
+    //
+    // This comment used to say the marker loop's #markers x #groups CFG queries
+    // were INTRINSIC to the design. They were not: the queries' answers do not
+    // depend on the exit point (see `reachesAvoiding` and
+    // `groupUsedOnHandlerPath`), so the traversals are now per group and per
+    // consume site, and only the O(1) tests are still per cell. What survives
+    // of the claim is narrower and still worth knowing -- the marker loop must
+    // VISIT every cell, because which groups are held at which exit is the
+    // output.
     UnwindStepTimer steps(function);
 
-    UnwindCleanupAnalysis analysis(function);
-    steps.mark(UnwindStepTimer::Analysis);
-
-    // Owned groups whose token could be held at an exceptional exit.
+    // The plan the analysis produces, and the mutation consumes. Declared out
+    // here so the analysis itself can live in a scope that ENDS before the
+    // first block split: its reachability answers are memoised, and memoised
+    // reachability outliving the CFG it describes would present as a MISSING
+    // release -- the failure shape this suite has repeatedly been unable to
+    // see. A convention would not survive an edit; a scope makes a query after
+    // the mutation fail to compile.
     llvm::SmallVector<UnwindTrackedGroup, 16> groups;
-    auto addGroup = [&](const own::ResourceGroup &g) {
-      if (!g.deallocator || g.condition || g.values.empty())
-        return;
-      UnwindTrackedGroup tracked;
-      tracked.values.assign(g.values.begin(), g.values.end());
-      tracked.views.assign(g.views.begin(), g.views.end());
-      tracked.deallocator = g.deallocator;
-      // A group born inside a region op (the int fast/slow scf.if is the
-      // typical shape) holds its token OUTSIDE the region under the parent
-      // op's result names; tracking the in-region names would classify the
-      // token as never-held at every top-level exit point (the in-region
-      // value dominates nothing out there) and silently skip its cleanup.
-      // Map through the region exits to the function level; a group whose
-      // token never leaves its region is dropped -- top-level exit points
-      // never hold it, and in-region exit points stay outside this model.
-      mlir::Block *definingBlock = tracked.values.front().getParentBlock();
-      while (definingBlock && definingBlock->getParentOp() &&
-             !mlir::isa<mlir::func::FuncOp>(definingBlock->getParentOp())) {
-        mlir::Operation *terminator = definingBlock->getTerminator();
-        if (!terminator)
-          return;
-        auto mappedValues = mapRegionTerminatorGroupToParentResults(
-            terminator, tracked.values, aliases);
-        if (!mappedValues)
-          return;
-        llvm::SmallVector<mlir::Value, 4> mappedViews;
-        for (mlir::Value view : tracked.views) {
-          auto mappedView = mapRegionTerminatorGroupToParentResults(
-              terminator, {view}, aliases);
-          if (mappedView)
-            mappedViews.push_back(mappedView->front());
-          // An unmapped view has no uses outside the region: dropping it
-          // only removes pins the outer points cannot observe anyway.
-        }
-        tracked.values = std::move(*mappedValues);
-        tracked.views = std::move(mappedViews);
-        definingBlock = definingBlock->getParentOp()->getBlock();
-      }
-      // Region merges can map several in-region producers onto ONE parent
-      // result group (both arms yield into the same result lanes); tracking
-      // it twice would release the same token twice in one cleanup handler.
-      for (const UnwindTrackedGroup &existing : groups) {
-        own::reportEntityRootParity("unwindGroupDedup", existing.values,
-                                    tracked.values);
-        if (own::sameEntityRoot(existing.values, tracked.values))
-          return;
-      }
-      collectUnwindGroupSites(contracts, aliases, region, analysis.dominance,
-                              tracked);
-      groups.push_back(std::move(tracked));
-    };
-    function.walk([&](mlir::func::CallOp call) {
-      for (const own::ResourceGroup &g :
-           own::collectOwnedCallResultGroups(module, call, deallocators))
-        addGroup(g);
-    });
-    function.walk([&](mlir::Operation *op) {
-      if (!op->hasAttr(own::kOwnedLocalObjectAttr) &&
-          !op->hasAttr(own::kOwnedLocalObjectContractAttr))
-        return;
-      for (const own::ResourceGroup &g :
-           own::collectOwnedLocalObjectGroups(op, deallocators))
-        addGroup(g);
-    });
-    for (const own::ResourceGroup &g : blockArgGroups) {
-      if (g.values.empty())
-        continue;
-      auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(g.values.front());
-      if (!blockArg || blockArg.getOwner()->getParent() != region)
-        continue;
-      addGroup(g);
-    }
-    steps.mark(UnwindStepTimer::Groups);
-    if (groups.empty())
-      return;
-
-    // Analysis first, mutation second: block splits invalidate dominance.
-    // Exit points nested inside region ops are judged at their TOP-LEVEL
-    // ancestor: the analysis' blocks/dominance are function-level, so an
-    // in-region point has no position there. A consume whose top-level
-    // ancestor IS that region op cannot be ordered against the nested exit
-    // -- Unknown, never a guess.
-    auto tokenAtExitPoint = [&](const UnwindTrackedGroup &group,
-                                mlir::Operation *exitOp) -> TokenAtPoint {
-      mlir::Operation *point = exitOp->getParentRegion() == region
-                                   ? exitOp
-                                   : ancestorInRegion(exitOp, region);
-      if (!point)
-        return TokenAtPoint::Unknown;
-      if (point != exitOp)
-        for (mlir::Operation *consume : group.consumeSites)
-          if (consume == point)
-            return TokenAtPoint::Unknown;
-      return groupTokenAtPoint(analysis, group, point, aliases);
-    };
     struct MarkerCleanup {
       mlir::func::CallOp marker;
       mlir::Block *handler;
       llvm::SmallVector<const UnwindTrackedGroup *, 4> groups;
     };
     llvm::SmallVector<MarkerCleanup, 8> markerCleanups;
-    for (auto &[marker, handler] : markers) {
-      mlir::func::CallOp guarded =
-          own::guardedCallAfterMarker(marker.getOperation());
-      MarkerCleanup cleanup{marker, handler, {}};
-      for (const UnwindTrackedGroup &group : groups) {
-        if (group.skip || !group.deallocator)
-          continue;
-        if (guarded &&
-            callConsumesGroup(contracts, guarded, group.values, aliases))
-          continue; // ownership already moved into the unwinding callee
-        // A guarded RAISE judges the token at the raise call, not at the
-        // marker: the raise statement's dying locals release between the
-        // two (normal-path releases parked before a never-returning call),
-        // so at the moment the unwind edge materializes their tokens are
-        // already gone — releasing them again in the cleanup double-frees.
-        // Non-raise guarded calls keep the marker point: nothing releases
-        // between their marker and the call.
-        mlir::Operation *unwindPoint = marker.getOperation();
-        if (guarded) {
-          auto guardedContract = contracts.lookup(guarded.getCallee());
-          if (mlir::succeeded(guardedContract) && *guardedContract &&
-              own::isRaiseLikeFunction((*guardedContract)->function))
-            unwindPoint = guarded.getOperation();
-        }
-        if (groupTokenAtPoint(analysis, group, unwindPoint, aliases) !=
-            TokenAtPoint::Held)
-          continue;
-        if (groupUsedOnHandlerPath(analysis, group, handler))
-          continue; // the handler-side releases own this token
-        cleanup.groups.push_back(&group);
-      }
-      if (!cleanup.groups.empty())
-        markerCleanups.push_back(std::move(cleanup));
-    }
-
-    steps.mark(UnwindStepTimer::Markers);
-
     struct RaiseCleanup {
       mlir::func::CallOp raiseCall;
       llvm::SmallVector<const UnwindTrackedGroup *, 4> groups;
     };
     llvm::SmallVector<RaiseCleanup, 4> raiseCleanups;
-    for (mlir::func::CallOp raiseCall : unguardedRaises) {
-      RaiseCleanup cleanup{raiseCall, {}};
-      for (const UnwindTrackedGroup &group : groups) {
-        if (group.skip || !group.deallocator)
-          continue;
-        if (callConsumesGroup(contracts, raiseCall, group.values, aliases))
-          continue;
-        if (tokenAtExitPoint(group, raiseCall.getOperation()) !=
-            TokenAtPoint::Held)
-          continue;
-        // No live-after check: a raise primitive never returns, so every
-        // use syntactically after it is dead code and the releases here are
-        // the path's last live operations.
-        cleanup.groups.push_back(&group);
-      }
-      if (!cleanup.groups.empty())
-        raiseCleanups.push_back(std::move(cleanup));
-    }
-
-    steps.mark(UnwindStepTimer::Raises);
-
-    // Unguarded may-raise calls in a frame without a local handler: the
-    // unwind edge exits the function, so every token held ACROSS the call
-    // gets a cleanup handler that releases and rethrows. The releases cannot
-    // go before the call like the raise-primitive ones -- the call usually
-    // returns and the normal path still uses the values.
     struct CallCleanup {
       mlir::func::CallOp call;
       llvm::SmallVector<const UnwindTrackedGroup *, 4> groups;
     };
     llvm::SmallVector<CallCleanup, 8> callCleanups;
-    for (mlir::func::CallOp call : unguardedMayRaiseCalls) {
-      CallCleanup cleanup{call, {}};
-      for (const UnwindTrackedGroup &group : groups) {
-        if (group.skip || !group.deallocator)
-          continue;
-        if (callConsumesGroup(contracts, call, group.values, aliases))
-          continue; // ownership already moved into the unwinding callee
-        if (groupTokenAtPoint(analysis, group, call.getOperation(),
-                              aliases) != TokenAtPoint::Held)
-          continue;
-        cleanup.groups.push_back(&group);
-      }
-      if (!cleanup.groups.empty())
-        callCleanups.push_back(std::move(cleanup));
-    }
-
-    steps.mark(UnwindStepTimer::Calls);
-
     struct NestedMarkerCleanup {
       mlir::func::CallOp marker;
       mlir::Block *handler;
@@ -3124,56 +3266,248 @@ mlir::LogicalResult insertUnwindCleanupReleases(
       llvm::SmallVector<const UnwindTrackedGroup *, 4> groups;
     };
     llvm::SmallVector<NestedMarkerCleanup, 8> nestedMarkerCleanups;
-    for (auto &[marker, handler] : nestedMarkers) {
-      mlir::Operation *ancestor =
-          ancestorInRegion(marker.getOperation(), region);
-      if (!ancestor)
-        continue;
-      mlir::func::CallOp guarded =
-          own::guardedCallAfterMarker(marker.getOperation());
-      NestedMarkerCleanup cleanup{marker, handler, ancestor, {}};
-      for (const UnwindTrackedGroup &group : groups) {
-        if (group.skip || !group.deallocator)
-          continue;
-        if (guarded &&
-            callConsumesGroup(contracts, guarded, group.values, aliases))
-          continue; // ownership already moved into the unwinding callee
-        if (tokenAtExitPoint(group, marker.getOperation()) !=
-            TokenAtPoint::Held)
-          continue;
-        if (groupUsedOnHandlerPath(analysis, group, handler))
-          continue; // the handler-side releases own this token
-        cleanup.groups.push_back(&group);
-      }
-      if (!cleanup.groups.empty())
-        nestedMarkerCleanups.push_back(std::move(cleanup));
-    }
-
     struct NestedCallCleanup {
       mlir::func::CallOp call;
       mlir::Operation *ancestor;
       llvm::SmallVector<const UnwindTrackedGroup *, 4> groups;
     };
     llvm::SmallVector<NestedCallCleanup, 8> nestedCallCleanups;
-    for (mlir::func::CallOp call : nestedUnguardedMayRaiseCalls) {
-      mlir::Operation *ancestor = ancestorInRegion(call.getOperation(), region);
-      if (!ancestor)
-        continue;
-      NestedCallCleanup cleanup{call, ancestor, {}};
-      for (const UnwindTrackedGroup &group : groups) {
-        if (group.skip || !group.deallocator)
-          continue;
-        if (callConsumesGroup(contracts, call, group.values, aliases))
-          continue;
-        if (tokenAtExitPoint(group, call.getOperation()) != TokenAtPoint::Held)
-          continue;
-        cleanup.groups.push_back(&group);
-      }
-      if (!cleanup.groups.empty())
-        nestedCallCleanups.push_back(std::move(cleanup));
-    }
 
-    steps.mark(UnwindStepTimer::Nested);
+    { // ---- analysis: the CFG is FROZEN from here to the closing brace ----
+      UnwindCleanupAnalysis analysis(function);
+      steps.mark(UnwindStepTimer::Analysis);
+
+      // Owned groups whose token could be held at an exceptional exit.
+      auto addGroup = [&](const own::ResourceGroup &g) {
+        if (!g.deallocator || g.condition || g.values.empty())
+          return;
+        UnwindTrackedGroup tracked;
+        tracked.values.assign(g.values.begin(), g.values.end());
+        tracked.views.assign(g.views.begin(), g.views.end());
+        tracked.deallocator = g.deallocator;
+        // A group born inside a region op (the int fast/slow scf.if is the
+        // typical shape) holds its token OUTSIDE the region under the parent
+        // op's result names; tracking the in-region names would classify the
+        // token as never-held at every top-level exit point (the in-region
+        // value dominates nothing out there) and silently skip its cleanup.
+        // Map through the region exits to the function level; a group whose
+        // token never leaves its region is dropped -- top-level exit points
+        // never hold it, and in-region exit points stay outside this model.
+        mlir::Block *definingBlock = tracked.values.front().getParentBlock();
+        while (definingBlock && definingBlock->getParentOp() &&
+               !mlir::isa<mlir::func::FuncOp>(definingBlock->getParentOp())) {
+          mlir::Operation *terminator = definingBlock->getTerminator();
+          if (!terminator)
+            return;
+          auto mappedValues = mapRegionTerminatorGroupToParentResults(
+              terminator, tracked.values, aliases);
+          if (!mappedValues)
+            return;
+          llvm::SmallVector<mlir::Value, 4> mappedViews;
+          for (mlir::Value view : tracked.views) {
+            auto mappedView = mapRegionTerminatorGroupToParentResults(
+                terminator, {view}, aliases);
+            if (mappedView)
+              mappedViews.push_back(mappedView->front());
+            // An unmapped view has no uses outside the region: dropping it
+            // only removes pins the outer points cannot observe anyway.
+          }
+          tracked.values = std::move(*mappedValues);
+          tracked.views = std::move(mappedViews);
+          definingBlock = definingBlock->getParentOp()->getBlock();
+        }
+        // Region merges can map several in-region producers onto ONE parent
+        // result group (both arms yield into the same result lanes); tracking
+        // it twice would release the same token twice in one cleanup handler.
+        for (const UnwindTrackedGroup &existing : groups) {
+          own::reportEntityRootParity("unwindGroupDedup", existing.values,
+                                      tracked.values);
+          if (own::sameEntityRoot(existing.values, tracked.values))
+            return;
+        }
+        collectUnwindGroupSites(contracts, aliases, region, analysis.dominance,
+                                tracked);
+        groups.push_back(std::move(tracked));
+      };
+      function.walk([&](mlir::func::CallOp call) {
+        for (const own::ResourceGroup &g :
+             own::collectOwnedCallResultGroups(module, call, deallocators))
+          addGroup(g);
+      });
+      function.walk([&](mlir::Operation *op) {
+        if (!op->hasAttr(own::kOwnedLocalObjectAttr) &&
+            !op->hasAttr(own::kOwnedLocalObjectContractAttr))
+          return;
+        for (const own::ResourceGroup &g :
+             own::collectOwnedLocalObjectGroups(op, deallocators))
+          addGroup(g);
+      });
+      for (const own::ResourceGroup &g : blockArgGroups) {
+        if (g.values.empty())
+          continue;
+        auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(g.values.front());
+        if (!blockArg || blockArg.getOwner()->getParent() != region)
+          continue;
+        addGroup(g);
+      }
+      steps.mark(UnwindStepTimer::Groups);
+      steps.blocks = analysis.blocks.size();
+      steps.markers = markers.size() + nestedMarkers.size();
+      steps.groups = groups.size();
+      if (groups.empty())
+        return;
+
+      // Analysis first, mutation second: block splits invalidate dominance.
+      // Exit points nested inside region ops are judged at their TOP-LEVEL
+      // ancestor: the analysis' blocks/dominance are function-level, so an
+      // in-region point has no position there. A consume whose top-level
+      // ancestor IS that region op cannot be ordered against the nested exit
+      // -- Unknown, never a guess.
+      auto tokenAtExitPoint = [&](const UnwindTrackedGroup &group,
+                                  mlir::Operation *exitOp) -> TokenAtPoint {
+        mlir::Operation *point = exitOp->getParentRegion() == region
+                                     ? exitOp
+                                     : ancestorInRegion(exitOp, region);
+        if (!point)
+          return TokenAtPoint::Unknown;
+        if (point != exitOp)
+          for (mlir::Operation *consume : group.consumeSites)
+            if (consume == point)
+              return TokenAtPoint::Unknown;
+        return groupTokenAtPoint(analysis, group, point, aliases);
+      };
+      for (auto &[marker, handler] : markers) {
+        mlir::func::CallOp guarded =
+            own::guardedCallAfterMarker(marker.getOperation());
+        MarkerCleanup cleanup{marker, handler, {}};
+        for (const UnwindTrackedGroup &group : groups) {
+          if (group.skip || !group.deallocator)
+            continue;
+          if (guarded &&
+              callConsumesGroup(contracts, guarded, group.values, aliases))
+            continue; // ownership already moved into the unwinding callee
+          // A guarded RAISE judges the token at the raise call, not at the
+          // marker: the raise statement's dying locals release between the
+          // two (normal-path releases parked before a never-returning call),
+          // so at the moment the unwind edge materializes their tokens are
+          // already gone — releasing them again in the cleanup double-frees.
+          // Non-raise guarded calls keep the marker point: nothing releases
+          // between their marker and the call.
+          mlir::Operation *unwindPoint = marker.getOperation();
+          if (guarded) {
+            auto guardedContract = contracts.lookup(guarded.getCallee());
+            if (mlir::succeeded(guardedContract) && *guardedContract &&
+                own::isRaiseLikeFunction((*guardedContract)->function))
+              unwindPoint = guarded.getOperation();
+          }
+          if (groupTokenAtPoint(analysis, group, unwindPoint, aliases) !=
+              TokenAtPoint::Held)
+            continue;
+          if (groupUsedOnHandlerPath(analysis, group, handler))
+            continue; // the handler-side releases own this token
+          cleanup.groups.push_back(&group);
+        }
+        if (!cleanup.groups.empty())
+          markerCleanups.push_back(std::move(cleanup));
+      }
+
+      steps.mark(UnwindStepTimer::Markers);
+
+      for (mlir::func::CallOp raiseCall : unguardedRaises) {
+        RaiseCleanup cleanup{raiseCall, {}};
+        for (const UnwindTrackedGroup &group : groups) {
+          if (group.skip || !group.deallocator)
+            continue;
+          if (callConsumesGroup(contracts, raiseCall, group.values, aliases))
+            continue;
+          if (tokenAtExitPoint(group, raiseCall.getOperation()) !=
+              TokenAtPoint::Held)
+            continue;
+          // No live-after check: a raise primitive never returns, so every
+          // use syntactically after it is dead code and the releases here are
+          // the path's last live operations.
+          cleanup.groups.push_back(&group);
+        }
+        if (!cleanup.groups.empty())
+          raiseCleanups.push_back(std::move(cleanup));
+      }
+
+      steps.mark(UnwindStepTimer::Raises);
+
+      // Unguarded may-raise calls in a frame without a local handler: the
+      // unwind edge exits the function, so every token held ACROSS the call
+      // gets a cleanup handler that releases and rethrows. The releases cannot
+      // go before the call like the raise-primitive ones -- the call usually
+      // returns and the normal path still uses the values.
+      for (mlir::func::CallOp call : unguardedMayRaiseCalls) {
+        CallCleanup cleanup{call, {}};
+        for (const UnwindTrackedGroup &group : groups) {
+          if (group.skip || !group.deallocator)
+            continue;
+          if (callConsumesGroup(contracts, call, group.values, aliases))
+            continue; // ownership already moved into the unwinding callee
+          if (groupTokenAtPoint(analysis, group, call.getOperation(),
+                                aliases) != TokenAtPoint::Held)
+            continue;
+          cleanup.groups.push_back(&group);
+        }
+        if (!cleanup.groups.empty())
+          callCleanups.push_back(std::move(cleanup));
+      }
+
+      steps.mark(UnwindStepTimer::Calls);
+
+      for (auto &[marker, handler] : nestedMarkers) {
+        mlir::Operation *ancestor =
+            ancestorInRegion(marker.getOperation(), region);
+        if (!ancestor)
+          continue;
+        mlir::func::CallOp guarded =
+            own::guardedCallAfterMarker(marker.getOperation());
+        NestedMarkerCleanup cleanup{marker, handler, ancestor, {}};
+        for (const UnwindTrackedGroup &group : groups) {
+          if (group.skip || !group.deallocator)
+            continue;
+          if (guarded &&
+              callConsumesGroup(contracts, guarded, group.values, aliases))
+            continue; // ownership already moved into the unwinding callee
+          if (tokenAtExitPoint(group, marker.getOperation()) !=
+              TokenAtPoint::Held)
+            continue;
+          if (groupUsedOnHandlerPath(analysis, group, handler))
+            continue; // the handler-side releases own this token
+          cleanup.groups.push_back(&group);
+        }
+        if (!cleanup.groups.empty())
+          nestedMarkerCleanups.push_back(std::move(cleanup));
+      }
+
+      for (mlir::func::CallOp call : nestedUnguardedMayRaiseCalls) {
+        mlir::Operation *ancestor =
+            ancestorInRegion(call.getOperation(), region);
+        if (!ancestor)
+          continue;
+        NestedCallCleanup cleanup{call, ancestor, {}};
+        for (const UnwindTrackedGroup &group : groups) {
+          if (group.skip || !group.deallocator)
+            continue;
+          if (callConsumesGroup(contracts, call, group.values, aliases))
+            continue;
+          if (tokenAtExitPoint(group, call.getOperation()) !=
+              TokenAtPoint::Held)
+            continue;
+          cleanup.groups.push_back(&group);
+        }
+        if (!cleanup.groups.empty())
+          nestedCallCleanups.push_back(std::move(cleanup));
+      }
+
+      steps.mark(UnwindStepTimer::Nested);
+      // Every CFG query is behind us: the mutation below rewires blocks, and a
+      // walk counted after that would be counting a different CFG.
+      steps.walks = analysis.walks;
+      steps.walkNodes = analysis.walkNodes;
+    } // ---- the analysis, and every memoised answer, dies here ----
 
     for (RaiseCleanup &cleanup : raiseCleanups) {
       mlir::OpBuilder builder(cleanup.raiseCall);
