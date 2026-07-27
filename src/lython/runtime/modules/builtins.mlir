@@ -15895,14 +15895,14 @@ module attributes {
   }
 
   // tuple.__eq__: element-wise recursive equality over the boxed payloads.
-  func.func @LyTuple_EqBool(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_meta: memref<2xi64>, %lhs_items: memref<?xi64>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_meta: memref<2xi64>, %rhs_items: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.tuple", ly.runtime.method = "__eq__"} {
+  // Element-wise sequence equality core, length by value for the same reason
+  // as @__ly_sequence_compare_lens.
+  func.func private @__ly_sequence_equal_lens(%lhs_len: i64, %lhs_items: memref<?xi64>, %rhs_len: i64, %rhs_items: memref<?xi64>) -> i1 {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c16_i64 = arith.constant 16 : i64
     %false = arith.constant false
     %true = arith.constant true
-    %lhs_len = memref.load %lhs_meta[%c0] : memref<2xi64>
-    %rhs_len = memref.load %rhs_meta[%c0] : memref<2xi64>
     %same_len = arith.cmpi eq, %lhs_len, %rhs_len : i64
     %result = scf.if %same_len -> (i1) {
       %len_index = arith.index_cast %lhs_len : i64 to index
@@ -15930,6 +15930,14 @@ module attributes {
       scf.yield %false : i1
     }
     func.return %result : i1
+  }
+
+  func.func @LyTuple_EqBool(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_meta: memref<2xi64>, %lhs_items: memref<?xi64>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_meta: memref<2xi64>, %rhs_items: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.tuple", ly.runtime.method = "__eq__"} {
+    %c0 = arith.constant 0 : index
+    %lhs_len = memref.load %lhs_meta[%c0] : memref<2xi64>
+    %rhs_len = memref.load %rhs_meta[%c0] : memref<2xi64>
+    %eq = func.call @__ly_sequence_equal_lens(%lhs_len, %lhs_items, %rhs_len, %rhs_items) : (i64, memref<?xi64>, i64, memref<?xi64>) -> i1
+    func.return %eq : i1
   }
 
   func.func @LyTuple_NeBool(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_meta: memref<2xi64>, %lhs_items: memref<?xi64>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_meta: memref<2xi64>, %rhs_items: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.tuple", ly.runtime.method = "__ne__"} {
@@ -16062,15 +16070,19 @@ module attributes {
   }
 
   // Lexicographic tuple comparison core: -1 / 0 / 1.
-  func.func private @__ly_sequence_compare_items(%lhs_meta: memref<2xi64>, %lhs_items: memref<?xi64>, %rhs_meta: memref<2xi64>, %rhs_items: memref<?xi64>) -> i64 {
+  //
+  // Takes the LENGTH by value rather than reading a `meta` lane, because the
+  // length lives in a lane for a lane-carrying sequence (tuple, set,
+  // frozenset) and in handle word 2 for a handle-fronted one (list). One core
+  // plus a lane-shaped wrapper serves both; duplicating the loop per
+  // representation is how the two copies drift.
+  func.func private @__ly_sequence_compare_lens(%lhs_len: i64, %lhs_items: memref<?xi64>, %rhs_len: i64, %rhs_items: memref<?xi64>) -> i64 {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c16_i64 = arith.constant 16 : i64
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %minus_one = arith.constant -1 : i64
-    %lhs_len = memref.load %lhs_meta[%c0] : memref<2xi64>
-    %rhs_len = memref.load %rhs_meta[%c0] : memref<2xi64>
     %lhs_shorter = arith.cmpi slt, %lhs_len, %rhs_len : i64
     %common = arith.select %lhs_shorter, %lhs_len, %rhs_len : i1, i64
     %common_index = arith.index_cast %common : i64 to index
@@ -16108,6 +16120,15 @@ module attributes {
     %len_cmp = arith.select %len_lt, %minus_one, %len_cmp0 : i1, i64
     %result = arith.select %decided, %scan, %len_cmp : i1, i64
     func.return %result : i64
+  }
+
+  // Lane-shaped wrapper for the contracts whose length is still a lane.
+  func.func private @__ly_sequence_compare_items(%lhs_meta: memref<2xi64>, %lhs_items: memref<?xi64>, %rhs_meta: memref<2xi64>, %rhs_items: memref<?xi64>) -> i64 {
+    %c0 = arith.constant 0 : index
+    %lhs_len = memref.load %lhs_meta[%c0] : memref<2xi64>
+    %rhs_len = memref.load %rhs_meta[%c0] : memref<2xi64>
+    %cmp = func.call @__ly_sequence_compare_lens(%lhs_len, %lhs_items, %rhs_len, %rhs_items) : (i64, memref<?xi64>, i64, memref<?xi64>) -> i64
+    func.return %cmp : i64
   }
 
   func.func @LyTuple_LtBool(%lh: memref<2xi64> {ly.ownership.object_header}, %lm: memref<2xi64>, %li: memref<?xi64>, %rh: memref<2xi64> {ly.ownership.object_header}, %rm: memref<2xi64>, %ri: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.tuple", ly.runtime.method = "__lt__"} {
@@ -16266,27 +16287,38 @@ module attributes {
     func.return %ge : i1
   }
 
-  // Copy `count` slots from src to a fresh sequence entity of the given
-  // class, retaining every copied payload reference.
-  func.func private @__ly_sequence_copy_alloc(%class_id: i64, %src_meta: memref<2xi64>, %src_items: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0]} {
+  // Copy `src_len` element boxes into an already-sized destination array,
+  // retaining every copied payload reference. Split out of
+  // @__ly_sequence_copy_alloc so the ONE loop serves both a lane-carrying
+  // destination (tuple/set/frozenset, whose array is a lane) and a
+  // handle-fronted one (list, whose array is reached through handle word 4).
+  func.func private @__ly_seq_fill_copy(%dst_items: memref<?xi64>, %src_len: i64, %src_items: memref<?xi64>) {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c16 = arith.constant 16 : index
     %c2_slot = arith.constant 2 : index
-    %len = memref.load %src_meta[%c0] : memref<2xi64>
-    %header, %meta, %items = func.call @__ly_sequence_alloc(%class_id, %len) : (i64, i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
-    %len_index = arith.index_cast %len : i64 to index
+    %len_index = arith.index_cast %src_len : i64 to index
     scf.for %i = %c0 to %len_index step %c1 {
       %base = arith.muli %i, %c16 : index
       scf.for %w = %c0 to %c16 step %c1 {
         %slot = arith.addi %base, %w : index
         %word = memref.load %src_items[%slot] : memref<?xi64>
-        memref.store %word, %items[%slot] : memref<?xi64>
+        memref.store %word, %dst_items[%slot] : memref<?xi64>
       }
       %entity_slot = arith.addi %base, %c2_slot : index
-      %entity = memref.load %items[%entity_slot] : memref<?xi64>
+      %entity = memref.load %dst_items[%entity_slot] : memref<?xi64>
       func.call @__ly_handle_retain_raw(%entity) : (i64) -> ()
     }
+    func.return
+  }
+
+  // Copy `count` slots from src to a fresh sequence entity of the given
+  // class, retaining every copied payload reference.
+  func.func private @__ly_sequence_copy_alloc(%class_id: i64, %src_meta: memref<2xi64>, %src_items: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0]} {
+    %c0 = arith.constant 0 : index
+    %len = memref.load %src_meta[%c0] : memref<2xi64>
+    %header, %meta, %items = func.call @__ly_sequence_alloc(%class_id, %len) : (i64, i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    func.call @__ly_seq_fill_copy(%items, %len, %src_items) : (memref<?xi64>, i64, memref<?xi64>) -> ()
     func.return %header, %meta, %items : memref<2xi64>, memref<2xi64>, memref<?xi64>
   }
 
@@ -16778,15 +16810,13 @@ module attributes {
   // rather than duplicated per contract: both have the same (header, meta,
   // items) shape and the same 16-word element boxes, so only the id stamped
   // into the fresh header differs.
-  func.func private @__ly_sequence_concat(%class_id: i64, %lm: memref<2xi64>, %li: memref<?xi64>, %rm: memref<2xi64>, %ri: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0]} {
+  // Fill an already-sized destination with lhs ++ rhs, retaining each copied
+  // slot. One loop pair for both representations, as with @__ly_seq_fill_copy.
+  func.func private @__ly_seq_fill_concat(%dst_items: memref<?xi64>, %llen: i64, %li: memref<?xi64>, %rlen: i64, %ri: memref<?xi64>) {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c16 = arith.constant 16 : index
     %c2_slot = arith.constant 2 : index
-    %llen = memref.load %lm[%c0] : memref<2xi64>
-    %rlen = memref.load %rm[%c0] : memref<2xi64>
-    %total = arith.addi %llen, %rlen : i64
-    %header, %meta, %items = func.call @__ly_sequence_alloc(%class_id, %total) : (i64, i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
     %llen_index = arith.index_cast %llen : i64 to index
     %rlen_index = arith.index_cast %rlen : i64 to index
     scf.for %i = %c0 to %llen_index step %c1 {
@@ -16794,10 +16824,10 @@ module attributes {
       scf.for %w = %c0 to %c16 step %c1 {
         %slot = arith.addi %base, %w : index
         %word = memref.load %li[%slot] : memref<?xi64>
-        memref.store %word, %items[%slot] : memref<?xi64>
+        memref.store %word, %dst_items[%slot] : memref<?xi64>
       }
       %entity_slot = arith.addi %base, %c2_slot : index
-      %entity = memref.load %items[%entity_slot] : memref<?xi64>
+      %entity = memref.load %dst_items[%entity_slot] : memref<?xi64>
       func.call @__ly_handle_retain_raw(%entity) : (i64) -> ()
     }
     scf.for %i = %c0 to %rlen_index step %c1 {
@@ -16808,12 +16838,22 @@ module attributes {
         %src = arith.addi %src_base, %w : index
         %dst = arith.addi %dst_base, %w : index
         %word = memref.load %ri[%src] : memref<?xi64>
-        memref.store %word, %items[%dst] : memref<?xi64>
+        memref.store %word, %dst_items[%dst] : memref<?xi64>
       }
       %entity_slot = arith.addi %dst_base, %c2_slot : index
-      %entity = memref.load %items[%entity_slot] : memref<?xi64>
+      %entity = memref.load %dst_items[%entity_slot] : memref<?xi64>
       func.call @__ly_handle_retain_raw(%entity) : (i64) -> ()
     }
+    func.return
+  }
+
+  func.func private @__ly_sequence_concat(%class_id: i64, %lm: memref<2xi64>, %li: memref<?xi64>, %rm: memref<2xi64>, %ri: memref<?xi64>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0]} {
+    %c0 = arith.constant 0 : index
+    %llen = memref.load %lm[%c0] : memref<2xi64>
+    %rlen = memref.load %rm[%c0] : memref<2xi64>
+    %total = arith.addi %llen, %rlen : i64
+    %header, %meta, %items = func.call @__ly_sequence_alloc(%class_id, %total) : (i64, i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    func.call @__ly_seq_fill_concat(%items, %llen, %li, %rlen, %ri) : (memref<?xi64>, i64, memref<?xi64>, i64, memref<?xi64>) -> ()
     func.return %header, %meta, %items : memref<2xi64>, memref<2xi64>, memref<?xi64>
   }
 
@@ -16831,19 +16871,12 @@ module attributes {
 
   // Shared box-copy repetition for list/tuple `*`, parameterized by class id
   // for the same reason as __ly_sequence_concat.
-  func.func private @__ly_sequence_repeat(%class_id: i64, %lm: memref<2xi64>, %li: memref<?xi64>, %nm: memref<2xi64>, %nd: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0]} {
+  // Fill an already-sized destination with `n` copies of the source slots.
+  func.func private @__ly_seq_fill_repeat(%dst_items: memref<?xi64>, %len: i64, %li: memref<?xi64>, %n: i64) {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c16 = arith.constant 16 : index
     %c2_slot = arith.constant 2 : index
-    %zero = arith.constant 0 : i64
-    %len = memref.load %lm[%c0] : memref<2xi64>
-    %meta_view, %digits_view = func.call @__ly_long_operand_view(%nm, %nd) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
-    %n_raw = func.call @__ly_long_view_as_i64(%meta_view, %digits_view) : (memref<2xi64>, memref<?xi32>) -> i64
-    %n_neg = arith.cmpi slt, %n_raw, %zero : i64
-    %n = arith.select %n_neg, %zero, %n_raw : i1, i64
-    %total = arith.muli %len, %n : i64
-    %header, %meta, %items = func.call @__ly_sequence_alloc(%class_id, %total) : (i64, i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
     %len_index = arith.index_cast %len : i64 to index
     %n_index = arith.index_cast %n : i64 to index
     scf.for %rep = %c0 to %n_index step %c1 {
@@ -16856,13 +16889,34 @@ module attributes {
           %src = arith.addi %src_base, %w : index
           %dst = arith.addi %dst_base, %w : index
           %word = memref.load %li[%src] : memref<?xi64>
-          memref.store %word, %items[%dst] : memref<?xi64>
+          memref.store %word, %dst_items[%dst] : memref<?xi64>
         }
         %entity_slot = arith.addi %dst_base, %c2_slot : index
-        %entity = memref.load %items[%entity_slot] : memref<?xi64>
+        %entity = memref.load %dst_items[%entity_slot] : memref<?xi64>
         func.call @__ly_handle_retain_raw(%entity) : (i64) -> ()
       }
     }
+    func.return
+  }
+
+  // Clamp a boxed int repetition count to a non-negative i64, as CPython's
+  // sequence repeat does.
+  func.func private @__ly_seq_repeat_count(%nm: memref<2xi64>, %nd: memref<?xi32>) -> i64 {
+    %zero = arith.constant 0 : i64
+    %meta_view, %digits_view = func.call @__ly_long_operand_view(%nm, %nd) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
+    %n_raw = func.call @__ly_long_view_as_i64(%meta_view, %digits_view) : (memref<2xi64>, memref<?xi32>) -> i64
+    %n_neg = arith.cmpi slt, %n_raw, %zero : i64
+    %n = arith.select %n_neg, %zero, %n_raw : i1, i64
+    func.return %n : i64
+  }
+
+  func.func private @__ly_sequence_repeat(%class_id: i64, %lm: memref<2xi64>, %li: memref<?xi64>, %nm: memref<2xi64>, %nd: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0]} {
+    %c0 = arith.constant 0 : index
+    %len = memref.load %lm[%c0] : memref<2xi64>
+    %n = func.call @__ly_seq_repeat_count(%nm, %nd) : (memref<2xi64>, memref<?xi32>) -> i64
+    %total = arith.muli %len, %n : i64
+    %header, %meta, %items = func.call @__ly_sequence_alloc(%class_id, %total) : (i64, i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    func.call @__ly_seq_fill_repeat(%items, %len, %li, %n) : (memref<?xi64>, i64, memref<?xi64>, i64) -> ()
     func.return %header, %meta, %items : memref<2xi64>, memref<2xi64>, memref<?xi64>
   }
 
@@ -16880,12 +16934,11 @@ module attributes {
 
   // Linear membership scan (identity-or-equality per slot; CPython's list
   // and tuple `in` do not hash).
-  func.func private @__ly_sequence_find_equal(%meta: memref<2xi64>, %items: memref<?xi64>, %probe: !llvm.ptr) -> i64 {
+  func.func private @__ly_sequence_find_lens(%len: i64, %items: memref<?xi64>, %probe: !llvm.ptr) -> i64 {
     %minus_one = arith.constant -1 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c16_i64 = arith.constant 16 : i64
-    %len = memref.load %meta[%c0] : memref<2xi64>
     %len_index = arith.index_cast %len : i64 to index
     %items_idx = memref.extract_aligned_pointer_as_index %items : memref<?xi64> -> index
     %items_i64 = arith.index_cast %items_idx : index to i64
@@ -16904,6 +16957,13 @@ module attributes {
       }
       scf.yield %next : i64
     }
+    func.return %found : i64
+  }
+
+  func.func private @__ly_sequence_find_equal(%meta: memref<2xi64>, %items: memref<?xi64>, %probe: !llvm.ptr) -> i64 {
+    %c0 = arith.constant 0 : index
+    %len = memref.load %meta[%c0] : memref<2xi64>
+    %found = func.call @__ly_sequence_find_lens(%len, %items, %probe) : (i64, memref<?xi64>, !llvm.ptr) -> i64
     func.return %found : i64
   }
 
@@ -16986,13 +17046,12 @@ module attributes {
 
   // Occurrence count over the 16-word element boxes, shared by list and tuple
   // (`__ly_sequence_find_equal`'s counting twin).
-  func.func private @__ly_sequence_count_equal(%meta: memref<2xi64>, %items: memref<?xi64>, %probe: !llvm.ptr) -> i64 {
+  func.func private @__ly_sequence_count_lens(%len: i64, %items: memref<?xi64>, %probe: !llvm.ptr) -> i64 {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c16_i64 = arith.constant 16 : i64
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
-    %len = memref.load %meta[%c0] : memref<2xi64>
     %len_index = arith.index_cast %len : i64 to index
     %items_idx = memref.extract_aligned_pointer_as_index %items : memref<?xi64> -> index
     %items_i64 = arith.index_cast %items_idx : index to i64
@@ -17006,6 +17065,13 @@ module attributes {
       %next = arith.select %eq, %inc, %acc : i1, i64
       scf.yield %next : i64
     }
+    func.return %count : i64
+  }
+
+  func.func private @__ly_sequence_count_equal(%meta: memref<2xi64>, %items: memref<?xi64>, %probe: !llvm.ptr) -> i64 {
+    %c0 = arith.constant 0 : index
+    %len = memref.load %meta[%c0] : memref<2xi64>
+    %count = func.call @__ly_sequence_count_lens(%len, %items, %probe) : (i64, memref<?xi64>, !llvm.ptr) -> i64
     func.return %count : i64
   }
 
@@ -17569,39 +17635,53 @@ module attributes {
   // Shared strided box copy for list/tuple slices: duplicate the selected
   // 16-word element boxes into a fresh sequence and retain each copy (two
   // handles now reference each boxed entity).
-  func.func private @__ly_sequence_get_slice(%class_id: i64, %meta: memref<2xi64>, %items: memref<?xi64>, %start_raw: i64, %stop_raw: i64, %step_raw: i64, %mask: i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0]} {
-    %zero = arith.constant 0 : i64
-    %one = arith.constant 1 : i64
+  // Fill an already-sized destination with the strided selection
+  // {start + k*step | k < count} of the source slots, retaining each copy.
+  func.func private @__ly_seq_fill_slice(%dst_items: memref<?xi64>, %count: i64, %start: i64, %step: i64, %src_items: memref<?xi64>) {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c16 = arith.constant 16 : index
     %handle_words = arith.constant 16 : i64
-    %step_zero = arith.cmpi eq, %step_raw, %zero : i64
-    scf.if %step_zero {
-      func.call @__ly_slice_raise_zero_step() : () -> ()
-    }
-    // The throw does not return; the substitute keeps the IR division-safe.
-    %step = arith.select %step_zero, %one, %step_raw : i1, i64
-    %length_slot = arith.constant 0 : index
-    %len = memref.load %meta[%length_slot] : memref<2xi64>
-    %adj:2 = func.call @__ly_slice_adjust(%len, %start_raw, %stop_raw, %step, %mask) : (i64, i64, i64, i64, i64) -> (i64, i64)
-    %new:3 = func.call @__ly_sequence_alloc(%class_id, %adj#1) : (i64, i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
-    %count_index = arith.index_cast %adj#1 : i64 to index
+    %count_index = arith.index_cast %count : i64 to index
     scf.for %k = %c0 to %count_index step %c1 {
       %k64 = arith.index_cast %k : index to i64
       %offset = arith.muli %k64, %step : i64
-      %src_slot = arith.addi %adj#0, %offset : i64
+      %src_slot = arith.addi %start, %offset : i64
       %src_base64 = arith.muli %src_slot, %handle_words : i64
       %src_base = arith.index_cast %src_base64 : i64 to index
       %dst_base = arith.muli %k, %c16 : index
       scf.for %w = %c0 to %c16 step %c1 {
         %src_index = arith.addi %src_base, %w : index
         %dst_index = arith.addi %dst_base, %w : index
-        %word = memref.load %items[%src_index] : memref<?xi64>
-        memref.store %word, %new#2[%dst_index] : memref<?xi64>
+        %word = memref.load %src_items[%src_index] : memref<?xi64>
+        memref.store %word, %dst_items[%dst_index] : memref<?xi64>
       }
-      func.call @LyObject_RetainBoxedPayloadArraySlotRaw(%new#2, %k64) : (memref<?xi64>, i64) -> ()
+      func.call @LyObject_RetainBoxedPayloadArraySlotRaw(%dst_items, %k64) : (memref<?xi64>, i64) -> ()
     }
+    func.return
+  }
+
+  // Resolve a slice against a sequence length: raises on step 0, then returns
+  // (start, count) with a division-safe substitute step.
+  func.func private @__ly_seq_slice_bounds(%len: i64, %start_raw: i64, %stop_raw: i64, %step_raw: i64, %mask: i64) -> (i64, i64, i64) {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %step_zero = arith.cmpi eq, %step_raw, %zero : i64
+    scf.if %step_zero {
+      func.call @__ly_slice_raise_zero_step() : () -> ()
+    }
+    // The throw does not return; the substitute keeps the IR division-safe.
+    %step = arith.select %step_zero, %one, %step_raw : i1, i64
+    %adj:2 = func.call @__ly_slice_adjust(%len, %start_raw, %stop_raw, %step, %mask) : (i64, i64, i64, i64, i64) -> (i64, i64)
+    func.return %adj#0, %adj#1, %step : i64, i64, i64
+  }
+
+  func.func private @__ly_sequence_get_slice(%class_id: i64, %meta: memref<2xi64>, %items: memref<?xi64>, %start_raw: i64, %stop_raw: i64, %step_raw: i64, %mask: i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>) attributes {ly.ownership.owned_results = [0]} {
+    %length_slot = arith.constant 0 : index
+    %len = memref.load %meta[%length_slot] : memref<2xi64>
+    %b:3 = func.call @__ly_seq_slice_bounds(%len, %start_raw, %stop_raw, %step_raw, %mask) : (i64, i64, i64, i64, i64) -> (i64, i64, i64)
+    %new:3 = func.call @__ly_sequence_alloc(%class_id, %b#1) : (i64, i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi64>)
+    func.call @__ly_seq_fill_slice(%new#2, %b#1, %b#0, %b#2, %items) : (memref<?xi64>, i64, i64, i64, memref<?xi64>) -> ()
     func.return %new#0, %new#1, %new#2 : memref<2xi64>, memref<2xi64>, memref<?xi64>
   }
 
