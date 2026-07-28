@@ -2,6 +2,8 @@
 
 #include "Runtime/ABI/BoxLayout.h"
 
+#include "llvm/Support/Process.h"
+
 #include <algorithm>
 
 namespace py::lowering {
@@ -28,6 +30,29 @@ mlir::Value constantI64(mlir::OpBuilder &builder, mlir::Location loc,
 mlir::Value constantIndex(mlir::OpBuilder &builder, mlir::Location loc,
                           unsigned value) {
   return mlir::arith::ConstantIndexOp::create(builder, loc, value).getResult();
+}
+
+// EXPERIMENT (uncommitted): can `from` reach itself without passing through
+// `barrier`? Used to ask whether a use can execute more than once per single
+// production of the value it uses.
+bool blockReachesItselfAvoiding(mlir::Block *from, mlir::Block *barrier) {
+  if (!from || from == barrier)
+    return false;
+  llvm::SmallVector<mlir::Block *, 8> worklist(from->getSuccessors().begin(),
+                                               from->getSuccessors().end());
+  llvm::SmallPtrSet<mlir::Block *, 16> seen;
+  while (!worklist.empty()) {
+    mlir::Block *block = worklist.pop_back_val();
+    if (block == from)
+      return true;
+    if (block == barrier)
+      continue;
+    if (!seen.insert(block).second)
+      continue;
+    for (mlir::Block *successor : block->getSuccessors())
+      worklist.push_back(successor);
+  }
+  return false;
 }
 
 } // namespace
@@ -468,6 +493,35 @@ mlir::LogicalResult RuntimeBundleLowerer::ensureDictPayloadCapacity(
   return mlir::success();
 }
 
+// ⛔ A USE-SET FACT IS NOT A PROXY FOR AN EXECUTION-FREQUENCY FACT, and its only
+// caller (`initializeSequencePayload`) needs the second one. "Every use of this
+// value is this op" says nothing about how many times that ONE op runs per single
+// production of the value. A literal nested in a loop the source is defined
+// OUTSIDE of has exactly one use, satisfies this predicate, and executes N times
+// -- so the source's single token is handed to a container N times.
+//
+// That is the root cause of a shipped over-release, measured 2026-07-28:
+// `for i in range(4): for j in range(4): ys = [i, j]` either aborts with
+// `Ly_DecRef observed non-positive refcount` or silently prints 0, varying
+// between runs of one binary, and it survives --release. It is masked while the
+// loop variable stays inside the immortal small-int cache {0, 1, 2}, which is why
+// it reads as a threshold at n=4 rather than as a frequency bug.
+// tests/probe/seqlit_outer_var_nested_overrelease.py pins it.
+//
+// Why NOT simply decline the move when the frequencies differ (a CFG query: can
+// the literal's block reach itself without passing through the source's defining
+// block?). Measured: it removes the extra release, but the source's release is
+// then never placed -- the claim below that "the refcount pass places that
+// release at the source's real last use instead" is FALSE for this shape, and the
+// affine walk does not even converge. Worse, combined with skipping
+// slot-absorption retains in the affine walk it turns a refusal into a SILENT
+// wrong answer (tests/probe/seqlit_nested_read_only_silent.py).
+//
+// So the repair is not local to this predicate: it needs the release-placement
+// half in Passes/Runtime/Passes/Ownership.cpp
+// (`releaseOwnedGroupByLiveness`) to land with it, and it must not disturb the
+// read-back balance that tests/probe/seqlit_single_loop_read_back.py and
+// seqlit_literal_elem_read_back.py guard.
 bool RuntimeBundleLowerer::valueIsConsumedOnlyBy(mlir::Value value,
                                                  mlir::Operation *op) {
   if (!value || !op)
@@ -500,6 +554,21 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeSequencePayload(
   //     the next read silently printed the empty string. The refcount pass
   //     places that release at the source's real last use instead.
   //
+  // ⛔ THAT LAST SENTENCE IS MEASURED FALSE for a source whose literal sits in a
+  // loop the source is defined outside of (2026-07-28). The refcount pass does
+  // not place the release at the source's real last use; it places none, and the
+  // affine walk then fails to converge. It is the same shape of error as the
+  // `borrowEdgeRetainIsSpellable` note in Passes/Ownership.cpp: an invariant that
+  // held only because something else happened to hold. Here the something else is
+  // that the shipped predicate below always MOVES the token for a
+  // single-use source, so the "keeps its claim" branch was never exercised inside
+  // a loop -- and the no-move-in-a-loop shape it describes is refused today
+  // (tests/probe/seqlit_slot_retain_in_loop_str.py).
+  //
+  // The `keeps its claim` case is also NOT symmetric with the move case in the
+  // verifier: the slot retain it emits is counted into the affine walk's
+  // visited-state key, so one inside a loop prevents the fixpoint from closing.
+  //
   // One value can fill several slots (`(j, j)`): every slot retains, but the
   // source hands over the ONE token it holds, so the move is deduped.
   llvm::SmallPtrSet<void *, 4> movedSources;
@@ -521,6 +590,36 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeSequencePayload(
     bool sourceIsTemporary =
         logicalSources.empty() || !logicalSource ||
         RuntimeBundleLowerer::valueIsConsumedOnlyBy(logicalSource, op);
+    // ⚠️ INVESTIGATION SCAFFOLD, NOT A PROPOSED FIX. Default OFF (shipped);
+    // `LYTHON_EXP_LOOP_LEVEL_SOURCE_MOVE=1` enables it. Kept so the repro set is
+    // reproducible from ONE binary.
+    //
+    // The defect it targets is real and is the root cause of a shipped
+    // double-free: `valueIsConsumedOnlyBy` above is a use-SET fact used as a
+    // proxy for an execution-FREQUENCY one. A literal nested in a loop the
+    // source is defined OUTSIDE of has ONE use that runs many times, so the one
+    // token is handed over many times -- `for i in range(4): for j in range(4):
+    // ys = [i, j]` over-releases `i` and either aborts with `Ly_DecRef observed
+    // non-positive refcount` or silently prints 0, varying between runs.
+    //
+    // ⛔ Why this predicate alone is not the repair: declining the move leaves
+    // the source's release unplaced, and the comment at the head of this
+    // function claiming "the refcount pass places that release at the source's
+    // real last use instead" is MEASURED FALSE for this shape -- the affine
+    // walk does not converge. It needs the release-placement half in
+    // `Passes/Runtime/Passes/Ownership.cpp` to land with it.
+    static bool loopLevelGuard = [] {
+      auto value = llvm::sys::Process::GetEnv("LYTHON_EXP_LOOP_LEVEL_SOURCE_MOVE");
+      return value && !value->empty() && *value != "0";
+    }();
+    if (loopLevelGuard && sourceIsTemporary && logicalSource && op->getBlock()) {
+      mlir::Block *defBlock = logicalSource.getParentBlock();
+      if (mlir::Operation *defOp = logicalSource.getDefiningOp())
+        defBlock = defOp->getBlock();
+      if (defBlock && defBlock->getParent() == op->getBlock()->getParent() &&
+          blockReachesItselfAvoiding(op->getBlock(), defBlock))
+        sourceIsTemporary = false;
+    }
     if (sourceIsTemporary &&
         payload->objectValue.ownership == ownership::OwnershipKind::Own) {
       // Key on the ELEMENT's physical identity, not the materialized

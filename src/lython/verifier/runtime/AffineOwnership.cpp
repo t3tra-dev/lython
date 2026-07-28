@@ -20,6 +20,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/Process.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/Twine.h"
@@ -1959,6 +1960,22 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
     visited.insert(state);
     if (ownershipPathTraceEnabled())
       state.trail.push_back(blockOrdinal(state.block));
+    // ⚠️ THIS EXIT IS NOT A SAFE-SIDE FAILURE, and reading it as one cost a day
+    // (2026-07-28). Bailing here says nothing about the judgements downstream of
+    // where the walk stopped: "the verifier passed" and "the verifier REACHED
+    // that check" are different claims, and only the second licenses a
+    // conclusion. Measured instance: a slot retain inside a loop makes
+    // `state.retained` -- part of the visited-state key -- increase every
+    // iteration, so the fixpoint never closes and this fires; making it converge
+    // then reported a REAL `used after release` in the same family of programs
+    // that had been invisible the whole time. The state explosion was a cover,
+    // not a diagnostic.
+    //
+    // So a rise in this diagnostic must be investigated as a possible masked
+    // finding, and any claim of the form "the affine verifier is green on X"
+    // requires that X did not hit this cap.
+    // tests/probe/seqlit_slot_retain_in_loop_str.py is a shipped program that
+    // does.
     if (visited.size() > kMaxAffineStates)
       return resource.producer->emitError()
              << "ownership CFG exploration exceeded " << kMaxAffineStates
@@ -2199,6 +2216,55 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
         }
         bool retains = mentionsTracked &&
                        callRetainsGroup(contracts, call, state.group, aliases);
+        // ⚠️ INVESTIGATION SCAFFOLD, NOT A PROPOSED FIX. Default is OFF, i.e.
+        // shipped behaviour; `LYTHON_EXP_SKIP_AGGREGATE_SLOT_RETAIN=1` turns the
+        // experiment on. It is kept only so the repro set below is reproducible
+        // from ONE binary, and it MUST NOT be flipped on without reading the
+        // measurement that killed it.
+        //
+        // The idea: a slot-absorption retain (`aggregate_retain`: an
+        // element/field store) parks the token in the HOLDER, and the holder's
+        // release discharges it -- `aggregate(parent, path)` answered by
+        // `parent` (rfc/memory-safety-proof.md, Aggregates). The borrowed-entry
+        // walk already skips these (see `kAggregateRetainAttr` above), and not
+        // skipping them here means `retained` -- part of the visited-state key --
+        // increases on every iteration of a loop containing a slot store, so the
+        // fixpoint never closes. That is a real shipped defect: it refuses
+        // `s = "abc"` / `for k in range(3): t = (s,)` with
+        // `ownership CFG exploration exceeded 20000 states`, and it also hides
+        // whatever the walk would have found afterwards.
+        //
+        // ⛔ Why skipping them is NOT the repair (measured 2026-07-28): the
+        // asymmetry with the borrowed walk is not a licence to copy it -- the two
+        // walks track different resource kinds. Reading an element BACK out of a
+        // container (`total += ys[0]`) hands the reader a token derived from the
+        // slot, and this walk needs that retain to justify the reader's later
+        // release. Skipping it refuses programs that work today:
+        //
+        //     for i in range(3, 6):      ys = [i]; total += ys[0]   -> refused
+        //     for i in ... for j in ...: ys = [7]; total += ys[0]   -> refused
+        //
+        // and, combined with the CollectionPayload source-move predicate, turns a
+        // refusal into a SILENT WRONG ANSWER for `v = ys[0]` in a nested loop --
+        // the one direction that may never be traded into. 9 of the first 40
+        // golden cases were newly refused.
+        //
+        // The actual requirement is narrower and is a modelling change, not a
+        // predicate flip: the container's release must DISCHARGE the slot retains
+        // it absorbed, rather than the walk pretending the retain never happened.
+        static bool skipAggregateSlotRetain = [] {
+          auto value = llvm::sys::Process::GetEnv(
+              "LYTHON_EXP_SKIP_AGGREGATE_SLOT_RETAIN");
+          return value && !value->empty() && *value != "0";
+        }();
+        // Scoped to the still-OWNED case below rather than applied to `retains`
+        // outright: a retain seen after the token was already released is a
+        // resurrection, which is the only thing making a later use legal.
+        // (Narrowing it here changed no measured outcome -- kept because it is
+        // the more conservative scope, not because it fixed a symptom.)
+        bool slotAbsorptionRetain = retains && skipAggregateSlotRetain &&
+                                    call->hasAttr(own::kAggregateRetainAttr) &&
+                                    !isBlockArgMergeBorrowRetain(call);
         if (mentionsTracked &&
             callPartiallyConsumesGroup(contracts, call, state.group, aliases))
           return call.emitError()
@@ -2257,7 +2323,8 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
             state.token = AffineTokenState::Released;
           }
         }
-        if (state.token == AffineTokenState::Owned && retains) {
+        if (state.token == AffineTokenState::Owned && retains &&
+            !slotAbsorptionRetain) {
           if (isBlockArgMergeBorrowRetain(call))
             ++state.borrowed;
           else
