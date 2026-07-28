@@ -493,6 +493,20 @@ mapRegionTerminatorGroupToParentResults(mlir::Operation *terminator,
   return mapped;
 }
 
+bool blockArgGroupIsPureRenaming(llvm::ArrayRef<mlir::Value> args,
+                                 own::AliasAnalysis &aliases);
+bool renamedArgGroupExclusionEnabled();
+
+// Does this terminator TRANSFER the group's ownership into a successor's block
+// argument?
+//
+// A forward into a PURE RENAMING is not a transfer. Answering `true` for one is
+// what left a loop-invariant object with no owner at all: the source group read
+// as consumed from the forwarding edge onward ("the destination group covers it
+// there"), while the destination group was excluded precisely because it owns
+// nothing. Nothing then released the object on an unwind path, and the affine
+// verifier refused programs that compile today. Whether the destination is a new
+// entity has to be decided by ONE predicate on both sides or the two disagree.
 bool branchForwardsGroupToBlockArgument(mlir::Operation *terminator,
                                         llvm::ArrayRef<mlir::Value> group,
                                         own::AliasAnalysis &aliases) {
@@ -517,8 +531,13 @@ bool branchForwardsGroupToBlockArgument(mlir::Operation *terminator,
       if (!forwarded)
         continue;
       for (mlir::Value value : group)
-        if (aliases.same(forwarded, value))
+        if (aliases.same(forwarded, value)) {
+          if (renamedArgGroupExclusionEnabled() &&
+              blockArgGroupIsPureRenaming(
+                  {successor->getArgument(argumentIndex)}, aliases))
+            continue; // a second name for this token, not a new owner
           return true;
+        }
     }
   }
   return false;
@@ -1774,6 +1793,88 @@ forwardedBlockArgGroup(mlir::Operation *terminator,
   return destArgs;
 }
 
+// Is this block-argument group a PURE RENAMING -- every argument fed, on every
+// predecessor edge, by one and the same object (self-forwards on loop back edges
+// ignored)?
+//
+// A loop-invariant allocation threaded through a loop header is the shape:
+// `cf.br ^bbH(%alloc)` on the way in, `cf.br ^bbH(%arg)` on the back edge. No
+// second object and no borrow-edge retain exist, so the header argument adds NO
+// ownership -- it is a second name for a token the source group already owns.
+//
+// Treating it as a transfer is what produced three defects at once, all from the
+// same fact: one object, two entities. The unwind pad released the header name
+// while the `except` block still read the pre-loop name (SIGSEGV in `Ly_IncRef`);
+// the loop-exit release and the source group's own release both ran on the normal
+// path (two `LyObject_ReleaseStorageToZero` calls for one token); and the affine
+// verifier, which renames the group FORWARD across the loop edge and cannot match
+// a release written under the pre-loop name, needed that pad release to stay
+// quiet.
+//
+// Why NOT discriminate by "the source is still used after the loop" instead:
+// that is a liveness question asked of one of the two names, and it is exactly
+// the question every consumer of these groups already gets wrong. Whether a
+// second OBJECT exists is a local, structural fact about the edges, decidable
+// here, and it is the fact the transfer model actually depends on.
+bool blockArgGroupIsPureRenaming(llvm::ArrayRef<mlir::Value> args,
+                                 own::AliasAnalysis &aliases) {
+  if (args.empty())
+    return false;
+  for (mlir::Value value : args) {
+    auto arg = mlir::dyn_cast<mlir::BlockArgument>(value);
+    if (!arg)
+      return false;
+    mlir::Block *owner = arg.getOwner();
+    unsigned argIndex = arg.getArgNumber();
+    mlir::Value single;
+    bool sawIncoming = false;
+    for (mlir::Block *pred : owner->getPredecessors()) {
+      auto branch =
+          mlir::dyn_cast<mlir::BranchOpInterface>(pred->getTerminator());
+      if (!branch)
+        return false; // an edge we cannot read: assume it brings a new object
+      mlir::Operation *terminator = pred->getTerminator();
+      for (unsigned successorIndex = 0,
+                    successorCount = terminator->getNumSuccessors();
+           successorIndex < successorCount; ++successorIndex) {
+        if (terminator->getSuccessor(successorIndex) != owner)
+          continue;
+        mlir::SuccessorOperands operands =
+            branch.getSuccessorOperands(successorIndex);
+        if (argIndex >= operands.size())
+          return false;
+        mlir::Value incoming = operands[argIndex];
+        if (!incoming)
+          return false;
+        if (aliases.same(incoming, arg))
+          continue; // back edge feeding the argument to itself
+        sawIncoming = true;
+        if (!single)
+          single = incoming;
+        else if (!aliases.same(single, incoming))
+          return false; // two distinct objects merge here: a real transfer
+      }
+    }
+    if (!sawIncoming)
+      return false;
+  }
+  return true;
+}
+
+// LYTHON_EXP_RENAMED_ARG_GROUPS=1 enables parts B/D of the unfinished two-entity
+// repair: exclude pure-renaming block-argument groups, and stop counting a
+// forward into one as a transfer. NOT SHIPPED -- measured on `bcfbbf9`, this
+// arm refuses 80 of 490 tests (all in the REFUSAL direction, none silently
+// wrong), because the source group's normal-path release placement has not been
+// taught the same rule. See the probe file for the ablation matrix.
+bool renamedArgGroupExclusionEnabled() {
+  static bool on = [] {
+    auto value = llvm::sys::Process::GetEnv("LYTHON_EXP_RENAMED_ARG_GROUPS");
+    return value && *value == "1";
+  }();
+  return on;
+}
+
 // Release owned values TRANSFERRED into merge/loop block arguments (e.g.
 // `if c: y=a else: y=b; print(y)`, or a loop-carried accumulator's final
 // value). The refcount pass sees the source owned call-result group forward to
@@ -2339,8 +2440,16 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
                   builder.getStringAttr(own::kBlockArgMergeBorrowLabel));
   }
 
+  std::uint64_t renamingsExcluded = 0;
+  std::uint64_t candidatesSeen = 0;
   for (auto &entry : candidates) {
     Candidate &candidate = entry.second;
+    ++candidatesSeen;
+    if (renamedArgGroupExclusionEnabled() &&
+        blockArgGroupIsPureRenaming(candidate.args, aliases)) {
+      ++renamingsExcluded;
+      continue;
+    }
     auto firstArg = mlir::cast<mlir::BlockArgument>(candidate.args.front());
     own::ResourceGroup destGroup;
     destGroup.values.assign(candidate.args.begin(), candidate.args.end());
@@ -2355,6 +2464,14 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
                                   destGroup, aliases, /*consumeIsDeath=*/true,
                                   deallocators);
   }
+  // Both numbers, always: an exclusion count alone cannot be read (zero means
+  // either "no renamings" or "the loop never ran"), and this suite has three
+  // recorded conclusions drawn from an instrument that examined nothing
+  // (rfc/stdlib-semantics.md 13j-3/13j-4/13j-9).
+  if (ownershipTransferTraceEnabled())
+    llvm::errs() << "[ownership-transfers] block-arg candidates="
+                 << candidatesSeen << " pure_renamings_excluded="
+                 << renamingsExcluded << "\n";
   reportOwnershipWorkShape(insertReleases
                                ? "refcount-insertion.block-argument-releases"
                                : "post-cleanup-unwind-insertion"
@@ -3118,6 +3235,113 @@ bool deadAfterNoReturnRaise(FuncContractCache &contracts,
   return false;
 }
 
+// LYTHON_EXP_BLOCKARG_HANDLER_PINS=1 enables part A of the unfinished
+// two-entity repair described at `addForwardedNameUseSites`. NOT SHIPPED: on its
+// own it converts the SIGSEGV into a lowering REFUSAL of the same program.
+//
+// Why an env toggle rather than two builds: `lyc` does not reproduce
+// byte-for-byte across rebuilds, so "the shas differ" cannot establish that two
+// arms differ (rfc/stdlib-semantics.md 13j-7). One binary, one flag. Named for
+// what it ENABLES, so an "ON" arm is never secretly the shipped one (13j-4).
+bool blockArgHandlerPinsEnabled() {
+  static bool on = [] {
+    auto value = llvm::sys::Process::GetEnv("LYTHON_EXP_BLOCKARG_HANDLER_PINS");
+    return value && *value == "1";
+  }();
+  return on;
+}
+
+// A loop/merge block argument is a SECOND SSA NAME for an object that other
+// blocks name differently. `useSites` built from the argument's own uses
+// therefore describes only the incarnation inside the loop, and
+// `groupUsedOnHandlerPath` -- whose whole job is "does the handler side still
+// own this token" -- answers `no` for a cell that the `except` block reads under
+// its pre-loop name. The unwind pad then deallocates the cell and branches to a
+// handler that loads it: `Ly_IncRef(null)`, and a second dealloc after the
+// handler. So the pins have to cover every name of the object, not one.
+//
+// Why NOT gate this on "the forwarded value is the same entity" (a purity test
+// that would exclude a loop-carried value that is genuinely a fresh object each
+// iteration): `groupUsedOnHandlerPath` already discriminates those, and it does
+// it more precisely than a syntactic test could. A use only counts there when
+// the handler reaches it WITHOUT re-entering the argument's own block, so a
+// pre-loop name's uses (before the loop) and a per-iteration name's uses (inside
+// it, reachable only through the header) both stay uncounted on their own. The
+// only sites this widening newly counts are ones the handler reaches while
+// avoiding the header -- which is exactly "the object outlives the unwind under
+// another name".
+//
+// Why NOT also feed these values to `consumeSites`: a consume changes
+// `groupTokenAtPoint`, i.e. WHETHER the token is held at every exit point in the
+// function, and forwarding is a transfer rather than a release. Widening the
+// liveness pins can only suppress a pad release (failing toward the leak the
+// affine verifier reports); widening the consume set would suppress releases
+// that nothing else performs.
+void addForwardedNameUseSites(own::AliasAnalysis &aliases, mlir::Region *region,
+                              UnwindTrackedGroup &group) {
+  if (!blockArgHandlerPinsEnabled() || group.values.empty())
+    return;
+
+  llvm::SmallPtrSet<mlir::Value, 8> seenValues;
+  llvm::SmallVector<mlir::BlockArgument, 4> worklist;
+  auto pushArg = [&](mlir::Value value) {
+    if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(value))
+      if (arg.getOwner()->getParent() == region && seenValues.insert(arg).second)
+        worklist.push_back(arg);
+  };
+  for (mlir::Value value : group.values)
+    pushArg(value);
+  if (worklist.empty())
+    return; // nothing named by a block argument: the own-uses set is complete
+
+  llvm::SmallPtrSet<mlir::Operation *, 16> seenUses(group.useSites.begin(),
+                                                    group.useSites.end());
+  llvm::SmallVector<mlir::Value, 8> forwarded;
+  while (!worklist.empty()) {
+    mlir::BlockArgument arg = worklist.pop_back_val();
+    mlir::Block *owner = arg.getOwner();
+    unsigned argIndex = arg.getArgNumber();
+    for (mlir::Block *pred : owner->getPredecessors()) {
+      mlir::Operation *terminator = pred->getTerminator();
+      auto branch = mlir::dyn_cast<mlir::BranchOpInterface>(terminator);
+      if (!branch)
+        continue;
+      for (unsigned successorIndex = 0,
+                    successorCount = terminator->getNumSuccessors();
+           successorIndex < successorCount; ++successorIndex) {
+        if (terminator->getSuccessor(successorIndex) != owner)
+          continue;
+        mlir::SuccessorOperands operands =
+            branch.getSuccessorOperands(successorIndex);
+        if (argIndex >= operands.size())
+          continue;
+        mlir::Value incoming = operands[argIndex];
+        if (!incoming || !seenValues.insert(incoming).second)
+          continue;
+        forwarded.push_back(incoming);
+        pushArg(incoming);
+      }
+    }
+  }
+
+  for (mlir::Value value : forwarded) {
+    llvm::SmallVector<mlir::Value, 8> equivalents;
+    aliases.aliasesOf(value, equivalents);
+    if (equivalents.empty())
+      equivalents.push_back(value);
+    for (mlir::Value equivalent : equivalents)
+      for (mlir::OpOperand &use : equivalent.getUses()) {
+        mlir::Operation *top = ancestorInRegion(use.getOwner(), region);
+        // A use with no top-level ancestor cannot be positioned against the
+        // exit points, so it pins nothing. Unlike `collectUnwindGroupSites`
+        // this does NOT set `skip`: these are extra names for the object, and
+        // failing to place one of them must not drop the group's real releases.
+        if (top && seenUses.insert(top).second)
+          group.useSites.push_back(top);
+      }
+  }
+}
+
 void collectUnwindGroupSites(FuncContractCache &contracts,
                              own::AliasAnalysis &aliases, mlir::Region *region,
                              mlir::DominanceInfo &dominance,
@@ -3255,6 +3479,68 @@ bool groupUsedOnHandlerPath(UnwindCleanupAnalysis &analysis,
   if (analysis.mode == UnwindReachMode::Verify)
     return analysis.agree(cached, direct(), "handler-path");
   return cached;
+}
+
+// LYTHON_UNWIND_TRACE=1: one line per marker-cleanup decision, plus a decision
+// COUNT at exit.
+//
+// Why the count: a trace that prints nothing looks the same whether the
+// predicate answered "handler owns it" everywhere or the loop never reached a
+// decision at all. Three of this session's wrong conclusions came from reading
+// an empty instrument as a measurement (rfc/stdlib-semantics.md 13j-3/13j-9),
+// so this one reports its own denominator.
+struct UnwindTrace {
+  bool enabled = false;
+  std::uint64_t decisions = 0;
+
+  UnwindTrace() {
+    auto value = llvm::sys::Process::GetEnv("LYTHON_UNWIND_TRACE");
+    enabled = value && (*value == "1");
+  }
+
+  ~UnwindTrace() {
+    if (enabled)
+      llvm::errs() << "[UNWIND_TRACE] marker_decisions=" << decisions << "\n";
+  }
+
+  void marker(UnwindCleanupAnalysis &analysis, const UnwindTrackedGroup &group,
+              mlir::Block *handler, bool handlerOwns);
+};
+
+UnwindTrace &unwindTrace() {
+  static UnwindTrace trace;
+  return trace;
+}
+
+void UnwindTrace::marker(UnwindCleanupAnalysis &analysis,
+                         const UnwindTrackedGroup &group, mlir::Block *handler,
+                         bool handlerOwns) {
+  if (!enabled)
+    return;
+  ++decisions;
+  auto blockName = [&](mlir::Block *block) -> std::string {
+    if (!block)
+      return "<null>";
+    if (std::optional<unsigned> index = analysis.indexOf(block))
+      return ("bb" + llvm::Twine(*index)).str();
+    return "<unnumbered>";
+  };
+  mlir::Value root = group.values.front();
+  mlir::Operation *producer = root.getDefiningOp();
+  mlir::Block *defBlock = producer
+                              ? producer->getBlock()
+                              : mlir::cast<mlir::BlockArgument>(root).getOwner();
+  llvm::errs() << "[UNWIND_TRACE] fn=" << analysis.function.getName()
+               << " dealloc="
+               << mlir::func::FuncOp(group.deallocator->function).getName()
+               << " root=" << (producer ? "op" : "blockarg")
+               << " def=" << blockName(defBlock)
+               << " handler=" << blockName(handler)
+               << " handler_owns=" << (handlerOwns ? "yes" : "no")
+               << " use_blocks=";
+  for (mlir::Operation *use : group.useSites)
+    llvm::errs() << blockName(use->getBlock()) << ",";
+  llvm::errs() << " nuses=" << group.useSites.size() << "\n";
 }
 
 // Wall time of `insertUnwindCleanupReleases`' sub-steps for ONE function,
@@ -3667,6 +3953,7 @@ mlir::LogicalResult insertUnwindCleanupReleases(
         }
         collectUnwindGroupSites(contracts, aliases, region, analysis.dominance,
                                 tracked);
+        addForwardedNameUseSites(aliases, region, tracked);
         groups.push_back(std::move(tracked));
       };
       function.walk([&](mlir::func::CallOp call) {
@@ -3743,7 +4030,9 @@ mlir::LogicalResult insertUnwindCleanupReleases(
           if (groupTokenAtPoint(analysis, group, unwindPoint, aliases) !=
               TokenAtPoint::Held)
             continue;
-          if (groupUsedOnHandlerPath(analysis, group, handler))
+          bool handlerOwns = groupUsedOnHandlerPath(analysis, group, handler);
+          unwindTrace().marker(analysis, group, handler, handlerOwns);
+          if (handlerOwns)
             continue; // the handler-side releases own this token
           cleanup.groups.push_back(&group);
         }
