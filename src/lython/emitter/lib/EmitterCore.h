@@ -297,6 +297,10 @@ private:
   // The symbol a main-module top-level `def` of this spelling is emitted
   // under: the spelling itself unless it collides with a manifest builtin.
   llvm::StringRef topLevelFunctionSymbol(llvm::StringRef name) const;
+  // True when walking `x[0], x[1], ...` up to `len(x)` reproduces iteration
+  // over X. The single gate for every index-walk rewrite in EmitterIterators,
+  // in both loop and value position.
+  bool hasIndexWalkableEvidence(mlir::Type type);
   bool hasIndexableEvidence(const parser::Node *expr);
   void runWithScratchNames(llvm::ArrayRef<std::string> names,
                            llvm::function_ref<void()> emit);

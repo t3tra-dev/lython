@@ -126,6 +126,75 @@ TEST(EmitterTest, TopLevelDefOutranksBuiltinConversion) {
   EXPECT_NE(ir.find("py.binding.ref \"int\""), std::string::npos);
 }
 
+bool reportsDiagnostic(const lython::emitter::EmitResult &emitted,
+                       llvm::StringRef needle) {
+  for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics)
+    if (diagnostic.message.find(needle.str()) != std::string::npos)
+      return true;
+  return false;
+}
+
+// The lazy-iterator builtins used as VALUES compile to a synthesized generator
+// that walks `x[0], x[1], ... < len(x)`, because a for loop's position cell
+// cannot cross a generator suspension. That walk is only iteration for a
+// position-addressable sequence, and the admission gate used to be exactly
+// `__len__ && __getitem__(int)` -- which a `dict[int, V]` answers, since its
+// key type IS int. `iter({1: 2, 3: 4})` therefore emitted `d[0]` and raised
+// KeyError: 0 at runtime; with keys 0..n-1 present it would instead have
+// yielded values where CPython yields keys.
+//
+// Emit-layer and not golden: the repair is a static rejection, so no program
+// has to run to observe it. The `for k in d:` control that this defect did NOT
+// affect is already asserted by four golden cases (dict_generic_keys,
+// dict_iteration_views, dict_loop_carried_inplace_mutate{,_deep}).
+TEST(EmitterTest, RejectsMappingAsIndexWalkedIteratorValue) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult emitted =
+      emitSource("d = {1: 2, 3: 4}\nit = iter(d)\nprint(next(it))\n", context);
+  EXPECT_FALSE(emitted.ok());
+  EXPECT_TRUE(reportsDiagnostic(emitted, "requires indexable sequences"));
+}
+
+// reversed() over a mapping shared the gate and was worse: the walk starts at
+// len(d)-1, so `{1: 2, 3: 4}` found key 1 present and printed the VALUE 2
+// where CPython prints the key 3 -- a wrong answer with exit 0, in both value
+// and loop position.
+TEST(EmitterTest, RejectsMappingAsReversedSequence) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult loopForm = emitSource(
+      "d = {1: 2, 3: 4}\nfor k in reversed(d):\n    print(k)\n", context);
+  EXPECT_FALSE(loopForm.ok());
+  EXPECT_TRUE(reportsDiagnostic(loopForm, "requires an indexable sequence"));
+
+  lython::emitter::EmitResult valueForm = emitSource(
+      "d = {1: 2, 3: 4}\nit = reversed(d)\nprint(next(it))\n", context);
+  EXPECT_FALSE(valueForm.ok());
+  EXPECT_TRUE(reportsDiagnostic(valueForm, "requires indexable sequences"));
+}
+
+// The control that keeps the two rejections above from being vacuous: the gate
+// must still admit real sequences, and iterating the same dict with a for
+// statement -- which never took the index walk -- must still emit. Without
+// this, "the mapping is rejected" would also be satisfied by rejecting
+// everything.
+TEST(EmitterTest, IndexWalkGateStillAdmitsSequencesAndDictForLoops) {
+  mlir::MLIRContext context(testRegistry());
+  EXPECT_TRUE(
+      emitSource("xs = [1, 2]\nit = iter(xs)\nprint(next(it))\n", context)
+          .ok());
+  EXPECT_TRUE(
+      emitSource("t = (1, 2)\nit = reversed(t)\nprint(next(it))\n", context)
+          .ok());
+  EXPECT_TRUE(
+      emitSource("d = {1: 2, 3: 4}\nfor k in d:\n    print(k)\n", context).ok());
+  // The remedy the rejection recommends has to compile, or the diagnostic is
+  // advice that does not work.
+  EXPECT_TRUE(
+      emitSource("d = {1: 2, 3: 4}\nit = iter(list(d))\nprint(next(it))\n",
+                 context)
+          .ok());
+}
+
 TEST(EmitterTest, RepeatedEmitIsStable) {
   for (int round = 0; round < 5; ++round) {
     mlir::MLIRContext context(testRegistry());
