@@ -895,6 +895,25 @@ private:
   mlir::FailureOr<mlir::func::FuncOp>
   getOrCreateGeneratorFrameStoreFunction(mlir::Operation *op,
                                          const GeneratorResumeLane &lane);
+  // Retaining counterpart for the creation-site argument persist. Same body,
+  // but NO ly.ownership.transfer_args: the creation site has already emitted
+  // an aggregate retain for the slot, and its own handle stays live (the
+  // Python local is readable after the generator is built).
+  // Why not reuse the transferring store here: one helper cannot carry both
+  // effects, and declaring transfer while the site also retains produces two
+  // runtime references against one release obligation -- the caller's token
+  // is absorbed with no release placed, so the retain's reference is owned by
+  // nobody and leaks once per generator built.
+  mlir::FailureOr<mlir::func::FuncOp>
+  getOrCreateGeneratorArgumentStoreFunction(mlir::Operation *op,
+                                            const GeneratorResumeLane &lane);
+  // Shared body for the two span stores above; `transferring` selects which
+  // aggregate effect the symbol declares.
+  mlir::FailureOr<mlir::func::FuncOp>
+  getOrCreateGeneratorSpanStoreFunction(mlir::Operation *op,
+                                        const GeneratorResumeLane &lane,
+                                        llvm::StringRef name,
+                                        bool transferring);
   mlir::FailureOr<mlir::func::FuncOp>
   getOrCreateGeneratorFrameLoadFunction(mlir::Operation *op,
                                         const GeneratorResumeLane &lane);

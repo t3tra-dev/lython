@@ -417,6 +417,100 @@ TEST(DriverTest, IntReprStringIsReleasedByStrDeallocator) {
          "nothing";
 }
 
+// A generator built over an object argument RETAINS that argument into its
+// frame slot, so the creating function still holds the handle it started with
+// and has to release it. Building the generator therefore produces two
+// references (the constructor's and the aggregate retain's) against two
+// obligations: the frame's, discharged by the drop finalizer, and the
+// creator's, discharged here.
+//
+// This assertion cannot be written as a golden: the program exits 0 and prints
+// the right answer whether or not the second release exists. What it costs is
+// one range per generator built -- 1 root / 64 B per iteration under
+// `leaks --atExit`, linear through 40000 iterations with no saturation.
+//
+// Counting releases of anything (rather than of the value LyRange_New
+// produced) would be satisfied by the drop finalizer's own release, which is a
+// different obligation in a different function -- so the search is scoped to
+// the function that builds the generator, and refuses to pass if it did not
+// find one.
+TEST(DriverTest, GeneratorObjectArgumentIsReleasedByItsCreatorToo) {
+  CompileResult result = compileSource("def f(n: int) -> int:\n"
+                                       "    total = 0\n"
+                                       "    i = 0\n"
+                                       "    while i < n:\n"
+                                       "        x = range(3)\n"
+                                       "        it = iter(x)\n"
+                                       "        total += next(it)\n"
+                                       "        i += 1\n"
+                                       "    return total\n"
+                                       "print(f(4))\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  ASSERT_TRUE(result.verified.llvmModule);
+
+  // Located by what it does, not by its name: the lowering is free to rename
+  // the resume clones and the driver.
+  const llvm::Function *creator = nullptr;
+  unsigned creatorCount = 0;
+  for (const llvm::Function &function : *result.verified.llvmModule) {
+    bool buildsRange = false;
+    bool buildsGenerator = false;
+    for (const llvm::BasicBlock &block : function) {
+      for (const llvm::Instruction &instruction : block) {
+        const auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+        if (!call)
+          continue;
+        llvm::StringRef name = calleeNameOf(*call);
+        buildsRange |= name == "LyRange_New";
+        buildsGenerator |= name == "LyGenerator_New";
+      }
+    }
+    if (buildsRange && buildsGenerator) {
+      creator = &function;
+      ++creatorCount;
+    }
+  }
+  // Without this the test passes when the shape stopped being generated at
+  // all, which is how a predicate quietly stops predicating anything.
+  ASSERT_NE(creator, nullptr)
+      << "no function builds both a range and a generator, so this test "
+         "asserted nothing about the shape it is named for";
+  ASSERT_EQ(creatorCount, 1u) << "expected exactly one generator creation site";
+
+  unsigned rangesBuilt = 0;
+  unsigned rangesRetained = 0;
+  unsigned rangesReleased = 0;
+  for (const llvm::BasicBlock &block : *creator) {
+    for (const llvm::Instruction &instruction : block) {
+      const auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+      if (!call)
+        continue;
+      llvm::StringRef name = calleeNameOf(*call);
+      if (name == "LyRange_New")
+        ++rangesBuilt;
+      else if (name == "Ly_IncRef")
+        ++rangesRetained;
+      else if (name == "LyRange_DecRef")
+        ++rangesReleased;
+    }
+  }
+  EXPECT_EQ(rangesBuilt, 1u);
+  // Not EQ: Ly_IncRef is contract-agnostic, so an unrelated retain appearing
+  // in this function later would make an exact count fail for no reason. What
+  // has to hold is that the frame's reference came from a retain at all.
+  EXPECT_GE(rangesRetained, 1u)
+      << "the frame slot's reference should come from a retain";
+  // The creator produced two references (constructor + retain) and hands one
+  // obligation to the frame, so exactly one release belongs here. Zero is the
+  // leak this test exists for; two would be the mirror defect.
+  EXPECT_EQ(rangesReleased, 1u)
+      << "the generator's creator built " << rangesBuilt << " range(s) and "
+      << "retained " << rangesRetained
+      << " into the frame, but released " << rangesReleased
+      << " -- the frame's retain and the creator's own handle are two "
+         "references, and the drop finalizer discharges only one of them";
+}
+
 TEST(DriverTest, RepeatedCompileIsStable) {
   for (int round = 0; round < 3; ++round) {
     CompileResult result = compileSource("print(40 + 2)\n");

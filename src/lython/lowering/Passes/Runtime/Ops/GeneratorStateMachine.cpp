@@ -580,8 +580,34 @@ RuntimeBundleLowerer::getOrCreateGeneratorClaimFunction(
 mlir::FailureOr<mlir::func::FuncOp>
 RuntimeBundleLowerer::getOrCreateGeneratorFrameStoreFunction(
     mlir::Operation *op, const GeneratorResumeLane &lane) {
-  std::string name = "__ly_generator_frame_store_" +
-                     generatorLaneSymbolComponent(lane.contract);
+  return RuntimeBundleLowerer::getOrCreateGeneratorSpanStoreFunction(
+      op, lane,
+      "__ly_generator_frame_store_" +
+          generatorLaneSymbolComponent(lane.contract),
+      /*transferring=*/true);
+}
+
+// Creation-site argument persist. The creation site emits the aggregate
+// retain for the slot itself and keeps its own handle, so this symbol must
+// NOT declare a transfer.
+// Why not the transferring store: the site's retain and a transfer are two
+// references for one slot, and only the finalizer's aggregate release
+// discharges an obligation -- the caller's absorbed token is never released,
+// which leaks the argument once per generator built (measured: 1 root /
+// 64 B per iteration for `iter(range(3))`, exactly linear to 40000).
+mlir::FailureOr<mlir::func::FuncOp>
+RuntimeBundleLowerer::getOrCreateGeneratorArgumentStoreFunction(
+    mlir::Operation *op, const GeneratorResumeLane &lane) {
+  return RuntimeBundleLowerer::getOrCreateGeneratorSpanStoreFunction(
+      op, lane,
+      "__ly_generator_arg_store_" + generatorLaneSymbolComponent(lane.contract),
+      /*transferring=*/false);
+}
+
+mlir::FailureOr<mlir::func::FuncOp>
+RuntimeBundleLowerer::getOrCreateGeneratorSpanStoreFunction(
+    mlir::Operation *op, const GeneratorResumeLane &lane, llvm::StringRef name,
+    bool transferring) {
   if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(name))
     return existing;
   mlir::OpBuilder::InsertionGuard guard(builder);
@@ -597,12 +623,15 @@ RuntimeBundleLowerer::getOrCreateGeneratorFrameStoreFunction(
   auto function = mlir::func::FuncOp::create(
       builder, loc, name, builder.getFunctionType(inputs, {}));
   function.setPrivate();
-  // The frame absorbs the span's token: callers hand it over for good. The
-  // transfer anchors at the lane's header (operand 2); the remaining parts
-  // are interior views of the same entity.
+  // Transferring form: the frame absorbs the span's token, callers hand it
+  // over for good. The transfer anchors at the lane's header (operand 2); the
+  // remaining parts are interior views of the same entity. The retaining form
+  // marks the header without the transfer, so the caller's token stays the
+  // caller's and release placement keeps covering it.
   if (lane.physicalCount > 0) {
-    function->setAttr(ownership::kTransferArgsAttr,
-                      builder.getI64ArrayAttr({2}));
+    if (transferring)
+      function->setAttr(ownership::kTransferArgsAttr,
+                        builder.getI64ArrayAttr({2}));
     function.setArgAttr(2, ownership::kObjectHeaderAttr, builder.getUnitAttr());
   }
 

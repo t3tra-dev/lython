@@ -257,8 +257,14 @@ mlir::LogicalResult RuntimeBundleLowerer::emitGeneratorFunctionTargetCallResult(
         if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
                 op, *source, "generator argument")))
           return mlir::failure();
+        // Retaining store, not the frame-lane transferring one: the retain
+        // above is this slot's reference, and the creation site's own handle
+        // outlives the store (the Python local stays readable), so its token
+        // must keep its release. Why not the transferring store: retain plus
+        // transfer is two references for one release obligation, and the
+        // caller-side release is then never placed.
         mlir::FailureOr<mlir::func::FuncOp> store =
-            RuntimeBundleLowerer::getOrCreateGeneratorFrameStoreFunction(
+            RuntimeBundleLowerer::getOrCreateGeneratorArgumentStoreFunction(
                 op, *lane);
         if (mlir::failed(store))
           return mlir::failure();
