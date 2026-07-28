@@ -44,8 +44,44 @@ Steps 1–4 of the note's implementation order, the memref dialect's memory API,
 | `Proof.RC.Ops` | **py.incref / py.decref**, move, borrow, reclaim |
 | `Proof.RC.Invariant` | `WFRC`: what makes the counter mean something |
 | `Proof.RC.Properties` | the refcount theorems |
+| `Proof.Object.Word` | 8-byte words, encode/decode, and the bounded round trip |
+| `Proof.Object.WordSig` | an element signature with a designated word type |
+| `Proof.Object.Layout` | **the one-lane object layout**, and its disjointness facts |
+| `Proof.Object.Box` | the box: one descriptor, fields as indices into it |
+| `Proof.Object.Ops` | new / retain / release / move / free / resize |
+| `Proof.Object.Coherence` | **alloc / free / move coherence** |
 | `Proof.Memory.Lython` | the element signature Lython actually lowers to |
-| `Proof.Memory.Trace`, `Proof.RC.Trace` | concrete traces, checked by computation |
+| `Proof.Memory.Trace`, `Proof.RC.Trace`, `Proof.Object.Trace` | concrete traces, checked by computation |
+
+### The one-lane object — a redesign, not a transcription
+
+```
+┌──────────────────── memref<N x i64> ────────────────────┐
+│ rc │ class │ length │ capacity │ buf.alloc │ buf.gen │ … │
+└─────────────────────────────────────────────────────────┘
+  0     1        2         3           4          5      6…
+```
+
+**An object reference is ONE descriptor, and every field is an index into it.**
+No `(header, payload)` pair, no side lane, no second SSA value travelling
+alongside. Reading an object's class id is the same operation as reading its
+third payload word, at a different number — there is no view, no
+`reinterpret_cast`, and nothing to keep in sync.
+
+The refcount is genuinely eight bytes *inside the object's own allocation*, not
+a ghost field beside it. `Proof.Object.Word` proves `decode (encode n) ≡ n` for
+`n < 256⁸`, and `Proof.Object.Trace` runs the encoder, the byte store, the byte
+load and the decoder and checks the number that comes back. A ghost refcount
+would make every one of those equations hold for a reason that has nothing to do
+with the layout.
+
+The mutable part lives in a **separate buffer** the box names by `(alloc, gen)`
+in words 4 and 5 — the note's "stable box, resizable buffer" split. Resizing
+reallocates the *buffer* and rewrites two words, so **every alias of the object
+stays valid and every alias sees the new buffer**, because they all read word 4.
+Reallocating the object itself would invalidate every alias, and there is no way
+to reach them; `Proof.MemRef.Realloc.stale-descriptor-faults-after-realloc` is
+that contrast as a theorem.
 
 ### The op set is Lython's, not the documentation's
 
@@ -128,6 +164,27 @@ And in the reference-counting layer:
   `ReachedZero` at `immortal`. Lython's small-int cache is exactly this, and one
   of its shipped defects turned on the `{0,1,2}` boundary.
 
+And for the one-lane object:
+
+- **one lane, with content** — any two field accesses of the same object land in
+  the *same block*, because both resolutions report the block that one lookup of
+  one allocation returned (`resolveIn-block`, `two-fields-one-block`). This is
+  the statement a `(header, payload)` pair cannot make: there the two accesses
+  consult two allocations, and once one is reallocated nothing relates them.
+- **free is guarded** — a nonzero refcount refuses, and the freed lane then
+  faults. The reference the program was holding *is* the root descriptor, so
+  `dealloc` accepts it directly; a two-lane design has to reconstruct a
+  descriptor nothing held, which is where a wrong width becomes a wrong
+  deallocator.
+- **move is free** — the moved reference reads the same refcount, the same class
+  and the same heap. That is what makes eliding a retain/release pair around a
+  move *correct* rather than merely cheaper.
+- **the header survives** — a payload write does not touch the refcount or the
+  class, and a refcount write does not touch the class. Checked at concrete
+  values (`42 ≠ 1`), not only asserted by the disjointness lemmas.
+- **reallocating the buffer leaves the box bit for bit** — `lookup-update-other`
+  applied to the two distinct allocations, which is the payoff of the split.
+
 ## What is **not** proved, and should not be read as if it were
 
 - **Nothing about the compiler.** These are theorems about the model. Connecting
@@ -142,6 +199,21 @@ And in the reference-counting layer:
   determine a reference mode, and stops there. Translating a `qω` source program
   into explicit `dup`/`drop` — the step where escape analysis and liveness come
   in — is not modelled.
+- **The object layer loses one attribution.** A second `freeObject` reports
+  `use-after-free`, not `double-free`: it reads the refcount *through the lane*
+  before deciding, so on a freed object the read faults first. The memory layer
+  still tells the two apart; the object layer cannot, because its precondition
+  lives in the storage it is about to release. Consulting the count some other
+  way would mean a second lane — which is the thing this design removes. It is a
+  real trade and `Proof.Object.Trace.double-free-reports-use-after-free` is what
+  it costs.
+- **`WellShaped` is a side proof.** A box is a bare `Desc 1`, so the shape
+  invariant travels beside it rather than inside it. That is deliberate — a box
+  that were a *pair* of descriptor and proof would be two values again — but it
+  means nothing stops a caller pairing a well-formedness witness with the wrong
+  descriptor. Making that impossible needs the witness erased at runtime and
+  bundled at compile time, which Agda can express and this development does not
+  yet do.
 - **No finalizers, no weak references, no cycles.** `Life` has a `finalizing`
   state and `reclaim` requires it, but nothing runs user code in that window.
 - **The root token is weaker than the note asks for.** The note wants a linear

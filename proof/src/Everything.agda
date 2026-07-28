@@ -38,6 +38,17 @@ import Proof.RC.Ops
 import Proof.RC.Invariant
 import Proof.RC.Properties
 import Proof.RC.Trace
+import Proof.Object.Trace
+
+-- The one-lane object: a redesign, not a transcription. An object reference is
+-- ONE descriptor and every field is an index into it, with the mutable part in
+-- a separate buffer the box names by identity.
+import Proof.Object.Word
+import Proof.Object.WordSig
+import Proof.Object.Layout
+import Proof.Object.Box
+import Proof.Object.Ops
+import Proof.Object.Coherence
 
 -- The instantiation, and a trace that exercises it. Both are load-bearing: the
 -- modules above are parameterised over an element signature, and every theorem
