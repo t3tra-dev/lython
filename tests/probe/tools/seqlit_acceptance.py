@@ -85,17 +85,36 @@ def load():
     return "%.1f/%.1f/%.1f" % (a, b, c)
 
 
-# The three diagnoses this family produces. Anything else that stops a compile
-# is a different subsystem and must not be scored as an ownership regression --
-# scoring it is how an unrelated link collision reads as "the repair broke a
-# golden case".
+# ⛔ THIS LIST DECIDES WHETHER A REGRESSION IS SEEN AT ALL, so it is taken from
+# the verifier's own message prefixes, not from the shapes one repair happened to
+# produce. The first version enumerated three diagnoses by hand and MISSED
+# `released owned resource ... is used by region terminator`; a candidate repair
+# that refused 23 of these 40 cases was then printed as `ownership-refused 0 ;
+# out-of-domain 23` and scored PASS. That is the exact failure this script exists
+# to prevent -- a false all-clear when what is being looked for is an ABSENCE --
+# and an out-of-domain count is not a safe place to put something unrecognised.
+#
+# Why prefixes and not whole messages: every affine-ownership diagnostic in
+# verifier/runtime/AffineOwnership.cpp opens with one of these
+# (`grep -oh '<< "[a-z][^"]*'` over that file enumerates them), and the suffix
+# names the producer, which varies per program.
+#
+# Why the count is still reported separately rather than folded into the verdict:
+# `--emit-llvm` genuinely is not total over this corpus -- a link-step collision
+# (`symbol 'main' already exists`) says nothing about ownership -- so the
+# category has to exist. It must just be narrow enough that nothing ownership-
+# shaped can fall into it.
 OWNERSHIP_DIAGNOSES = (
-    "used after release",
-    "released or transferred more than once",
+    "owned resource from",
+    "conditionally owned resource from",
+    "released owned resource from",
+    "borrowed entry argument",
+    "block argument",
     "ownership CFG exploration exceeded",
-    "reaches function exit without release",
-    "still owned when",
-    "reaches the next loop iteration without release",
+    "borrowed entry ownership CFG exploration exceeded",
+    "ownership-consuming call only consumes part of",
+    "generator lane",
+    "generator resume",
 )
 
 

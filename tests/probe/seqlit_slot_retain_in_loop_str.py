@@ -1,3 +1,8 @@
+# ✅ REPAIRED 2026-07-28. The walk no longer counts a slot-absorption retain in
+# `state.retained`; it charges it to the container's aggregate identity, which is
+# bounded, so the fixpoint closes. Kept as a probe: it is the smallest program
+# that distinguishes "the verifier passed" from "the verifier REACHED the check".
+#
 # SHIPPED DEFECT (2026-07-28), independent of the sequence-literal source-move
 # defect and of the release-placement defect. Valid Python, REFUSED by main
 # 4699488 with:

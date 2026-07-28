@@ -1,3 +1,10 @@
+# ✅ NOW CORRECT (prints 3) after the 2026-07-28 repair, and the guard below did
+# its job twice on the way: the two-repair combination it warns about WAS
+# measured again here and did produce `W`. What closed it is a THIRD change --
+# dropping the literal's contents evidence when the source move is declined, so
+# `ys[0]` goes back through the runtime accessor and the reader gets a reference
+# of its own. Keep reading rc=0-with-a-wrong-value as the worst outcome.
+#
 # ⛔ THE MOST IMPORTANT GUARD IN THIS GROUP. Read before touching either of
 # CollectionPayload.cpp's source-move predicate or AffineOwnership.cpp's retain
 # accounting.

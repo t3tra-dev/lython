@@ -1,15 +1,7 @@
-# ⏳ THIS IS A GOLDEN CASE WAITING FOR ITS REPAIR. It is parked in tests/probe/
-# rather than tests/golden/cases/ because it is RED on main 4699488 and a red test
-# does not belong in the suite. When the three defects land, move it back to
-# tests/golden/cases/ with its `.stdout` regenerated from CPython 3.14 -- the
-# expected output is:
-#
-#     48 / 14 / 24 / -10 / 24 / 24 / 3 1 / 7 2 / 28   (one per line)
-#
-# It currently fails first at the `s = "abc"` loop (the affine walk's state
-# explosion) and then at the accumulator (a real early release the explosion was
-# hiding). Each block below is one axis, cut on the axis that was MEASURED (the
-# immortal small-int cache) rather than the one first guessed (a threshold at n=4).
+# Landed 2026-07-28 (was tests/probe/seqlit_pending_golden_full_coverage.py,
+# red until the sequence-literal source-move repair). Each block below is one
+# axis, cut on the axis that was MEASURED -- the immortal small-int cache --
+# rather than the one first guessed, a threshold at n=4.
 #
 # ---------------------------------------------------------------------------
 # Why this needs execution: a container literal hands the element SOURCE's token

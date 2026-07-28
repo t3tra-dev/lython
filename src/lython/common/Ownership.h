@@ -44,6 +44,30 @@ inline constexpr llvm::StringLiteral kAggregateRetainAttr{
     "ly.ownership.aggregate_retain"};
 inline constexpr llvm::StringLiteral kAggregateReleaseAttr{
     "ly.ownership.aggregate_release"};
+// The `parent` half of the kernel's `aggregate(parent, path)` resource, spelled
+// so an ownership walk can name it. `kAggregateIdAttr` is an i64 identity on the
+// op that PRODUCES a container; `kAggregateParentAttr` carries the same number
+// on each slot-absorption retain that stored into that container, so the walk
+// can charge the retain to the holder and discharge it when the holder is
+// released. Ids are allocated from `kAggregateIdNextAttr` on the enclosing
+// function and are unique within it.
+//
+// Why NOT reuse the slot label already on the retain (`"builtins.str:
+// sequence.literal"`): that names the `path`, and `path` alone cannot answer
+// `aggregate(parent, path)` -- two containers built at the same source position
+// on two loop iterations share it. The whole point of the pair is that the
+// obligation belongs to a specific parent, and the kernel's PathIsHeap corollary
+// is that the effect is observed THROUGH that parent.
+//
+// Why NOT an SSA operand on the retain call instead of an attribute: the retain
+// primitive's arity is fixed by the runtime manifest, and widening it would
+// change a published contract to carry information only the verifier reads.
+inline constexpr llvm::StringLiteral kAggregateIdAttr{
+    "ly.ownership.aggregate_id"};
+inline constexpr llvm::StringLiteral kAggregateParentAttr{
+    "ly.ownership.aggregate_parent"};
+inline constexpr llvm::StringLiteral kAggregateIdNextAttr{
+    "ly.ownership.aggregate_id_next"};
 // aggregate_retain label for the borrow-edge retains inserted at block-arg
 // merges (identity edges of replacement/mutation merges): the retain lends
 // the merge argument a token and is cancelled by the paired decref of the
