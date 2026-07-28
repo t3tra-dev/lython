@@ -295,16 +295,40 @@ bool ModuleEmitter::isBuiltinIteratorName(llvm::StringRef name) const {
 
 // Sequence evidence for index-driven rewrites: __len__() plus
 // __getitem__(int) must statically resolve.
-bool ModuleEmitter::hasIndexableEvidence(const parser::Node *expr) {
-  if (!expr)
-    return false;
-  mlir::Type type = types.inferExpr(expr);
+bool ModuleEmitter::hasIndexWalkableEvidence(mlir::Type type) {
   if (!type)
     return false;
   if (!types.inferMethodCallWithEvidence(type, "__len__", {}))
     return false;
-  return static_cast<bool>(
-      types.inferMethodCallWithEvidence(type, "__getitem__", {types.intType()}));
+  if (!types.inferMethodCallWithEvidence(type, "__getitem__",
+                                         {types.intType()}))
+    return false;
+  // Why NOT stop at len + int __getitem__: a mapping answers both. `dict`
+  // declares `__getitem__: [$K] -> [$V]` while `__iter__` yields `$K`, so for
+  // `dict[int, V]` the int subscript type-checks and walks KEY 0, 1, ... --
+  // which is a lookup, not a position. The walk then either raises KeyError
+  // for absent small ints or, when they happen to be present, silently yields
+  // VALUES where CPython yields keys.
+  //
+  // Why NOT discriminate on the types instead (element type of __iter__ vs
+  // result of __getitem__(int)): those coincide for `dict[int, int]`, the
+  // exact shape that reported this defect, so the type comparison admits it.
+  //
+  // Why `keys` and `items`: this is CPython's own mapping duck-test (the one
+  // `dict(m)` and `dict.update` use), so it also covers OrderedDict /
+  // defaultdict / Counter / user Mappings, none of which are position-
+  // addressable. No builtin sequence (list/str/tuple/bytes/bytearray/range)
+  // or ctypes array declares either name.
+  bool mappingLike =
+      static_cast<bool>(types.inferMethodCallWithEvidence(type, "keys", {})) &&
+      static_cast<bool>(types.inferMethodCallWithEvidence(type, "items", {}));
+  return !mappingLike;
+}
+
+bool ModuleEmitter::hasIndexableEvidence(const parser::Node *expr) {
+  if (!expr)
+    return false;
+  return hasIndexWalkableEvidence(types.inferExpr(expr));
 }
 
 bool ModuleEmitter::tryEmitLazyIteratorFor(const parser::Node &statement,
@@ -803,10 +827,7 @@ ModuleEmitter::tryEmitLazyIteratorValueCall(const parser::Node &expr,
     return iterableValues.front();
 
   for (const Value &value : iterableValues) {
-    mlir::Type widened = types.widenLiteral(value.type);
-    if (!types.inferMethodCallWithEvidence(widened, "__len__", {}) ||
-        !types.inferMethodCallWithEvidence(widened, "__getitem__",
-                                           {types.intType()}))
+    if (!hasIndexWalkableEvidence(types.widenLiteral(value.type)))
       return rejectValue(
           std::string(name) +
           "() as a value requires indexable sequences (list/str/tuple/"
