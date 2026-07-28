@@ -675,9 +675,21 @@ mlir::LogicalResult RuntimeBundleLowerer::dropUnusedLogicalBlockArguments() {
   // eraseControlFlowLogicalBlockArguments (by saved handle) -- touching them
   // here would double-erase.
   llvm::SmallPtrSet<void *, 16> registered;
+  // Registered arguments per block, so the block-argument index can be mapped
+  // to a branch-operand index below.
+  //
+  // Why NOT store the argument NUMBERS here: this loop erases arguments, which
+  // renumbers every registered argument above the one erased, so a snapshot goes
+  // stale on the second pass. The BlockArgument handle stays valid (nothing
+  // erases a registered one until the later pass), so the number is read live at
+  // the point of use instead.
+  llvm::DenseMap<mlir::Block *, llvm::SmallVector<mlir::BlockArgument, 4>>
+      registeredByBlock;
   for (const ControlFlowLogicalBlockArgumentABI &abi :
-       controlFlowLogicalBlockArguments)
+       controlFlowLogicalBlockArguments) {
     registered.insert(abi.argument.getAsOpaquePointer());
+    registeredByBlock[abi.argument.getOwner()].push_back(abi.argument);
+  }
   bool changed = true;
   while (changed) {
     changed = false;
@@ -701,6 +713,32 @@ mlir::LogicalResult RuntimeBundleLowerer::dropUnusedLogicalBlockArguments() {
           block->getArgument(argument.getArgNumber()) != argument)
         continue; // shifted by an earlier erase this round; retry next pass
       unsigned index = argument.getArgNumber();
+      // Branch-operand index for this block argument, which is NOT its argument
+      // number. dropControlFlowLogicalBranchOperands has already removed the
+      // edge operands of every REGISTERED logical argument (Lowerer.cpp runs it
+      // first) while eraseControlFlowLogicalBlockArguments, which removes the
+      // arguments themselves, runs after this. Between the two a block carries
+      // more arguments than its predecessors carry operands, and operand j
+      // corresponds to the j-th argument that is not registered.
+      //
+      // Why NOT index the operand list by the argument number: it overshoots by
+      // one per registered argument below this one, so it erases a LIVE operand
+      // and does it silently -- the erase still succeeds, the arities still
+      // match, and the wrong value is forwarded. That needs a block holding both
+      // a registered logical argument and an unused unregistered py argument
+      // above it; no program in the suite builds one, so this is a latent
+      // mis-compile rather than an observed one.
+      //
+      // Why NOT only bounds-check it, as dropOperand does in the sibling pass:
+      // out of range is the detectable half. The in-range shift is the half that
+      // mis-executes, and "never silently mis-execute" makes that the one worth
+      // computing correctly.
+      unsigned operandIndex = index;
+      auto registeredIt = registeredByBlock.find(block);
+      if (registeredIt != registeredByBlock.end())
+        for (mlir::BlockArgument registeredArgument : registeredIt->second)
+          if (registeredArgument.getArgNumber() < index)
+            --operandIndex;
       // One rewrite per predecessor terminator handles ALL its edges into
       // the block (a dual-edge cond_br lists its predecessor twice).
       llvm::SmallPtrSet<mlir::Operation *, 4> seen;
@@ -723,7 +761,11 @@ mlir::LogicalResult RuntimeBundleLowerer::dropUnusedLogicalBlockArguments() {
         if (auto branch = mlir::dyn_cast<mlir::cf::BranchOp>(terminator)) {
           llvm::SmallVector<mlir::Value, 8> operands(
               branch.getDestOperands().begin(), branch.getDestOperands().end());
-          operands.erase(operands.begin() + index);
+          if (operandIndex >= operands.size())
+            return branch->emitError()
+                   << "unused logical block argument operand index is outside "
+                      "the predecessor operand list";
+          operands.erase(operands.begin() + operandIndex);
           mlir::cf::BranchOp::create(rebuild, branch.getLoc(),
                                      branch.getDest(), operands);
           branch.erase();
@@ -736,10 +778,20 @@ mlir::LogicalResult RuntimeBundleLowerer::dropUnusedLogicalBlockArguments() {
         llvm::SmallVector<mlir::Value, 8> falseOperands(
             cond.getFalseDestOperands().begin(),
             cond.getFalseDestOperands().end());
-        if (cond.getTrueDest() == block)
-          trueOperands.erase(trueOperands.begin() + index);
-        if (cond.getFalseDest() == block)
-          falseOperands.erase(falseOperands.begin() + index);
+        if (cond.getTrueDest() == block) {
+          if (operandIndex >= trueOperands.size())
+            return cond->emitError()
+                   << "unused logical block argument operand index is outside "
+                      "the true-edge operand list";
+          trueOperands.erase(trueOperands.begin() + operandIndex);
+        }
+        if (cond.getFalseDest() == block) {
+          if (operandIndex >= falseOperands.size())
+            return cond->emitError()
+                   << "unused logical block argument operand index is outside "
+                      "the false-edge operand list";
+          falseOperands.erase(falseOperands.begin() + operandIndex);
+        }
         mlir::cf::CondBranchOp::create(rebuild, cond.getLoc(),
                                        cond.getCondition(), cond.getTrueDest(),
                                        trueOperands, cond.getFalseDest(),
