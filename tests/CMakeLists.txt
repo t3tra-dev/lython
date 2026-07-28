@@ -39,7 +39,13 @@
 #             does not move it. Separate from `slow` on purpose: merged, a
 #             compiler fix would look like it had not worked
 #
-#   Suite labels: unit, golden, golden-cases, golden-errors, examples
+#   Suite labels: unit, golden, golden-cases, golden-errors, examples, leak
+#
+#   `leak` is the one suite that measures something no other label can observe:
+#   allocation reachable at exit, via `leaks --atExit` on an AOT binary, minus
+#   the baseline every AOT binary carries. Everything else in the taxonomy sees
+#   exit codes, stdout and diagnostics, all of which a leaking program gets
+#   right. macOS only, because `leaks` is.
 #
 # `slow` and `bench` membership is a measurement, and a measurement of one build
 # type. Compare only within a build type: the default is RelWithDebInfo, where
@@ -358,6 +364,43 @@ foreach(case_path IN LISTS LYTHON_GOLDEN_CASES)
     lython_add_golden_case(cases "${case_path}" ${case_timeout})
     list(REMOVE_ITEM LYTHON_GOLDEN_DECLARED_LAYERS "cases/${case_name}")
 endforeach()
+
+# --- Leak gate ---------------------------------------------------------------
+#
+# Nothing else in the suite can see a leak. A golden compares exit code and
+# stdout, so a leaking program is indistinguishable from a correct one: five
+# goldens were green while leaking, and one defect leaked 64 B per iteration
+# without bound. tests/probe/tools/leak.py does not close the gap either -- it
+# watches per-iteration RSS growth with a 500 B/iter floor, blind both to the
+# bounded classes and to that unbounded 64 B one.
+#
+# So this stage is small and it is a REGRESSION gate, not a survey: each member
+# is measured at net zero against the baseline every AOT binary carries, and the
+# gate fails if that changes. It does not attempt to find leaks in cases that
+# leak today -- a red test is not something to commit, and the known leakers are
+# named in rfc/test-suite-debt.md instead. Growing this list is how a repaired
+# case gets locked in.
+#
+# APPLE-only because `leaks` is: on other platforms the stage registers nothing
+# rather than reporting a green it did not measure.
+if(APPLE)
+    set(LYTHON_LEAK_GATE_RUNNER "${CMAKE_CURRENT_SOURCE_DIR}/leak_gate.py")
+    # Measured net-zero on 2c5f722. Each costs one AOT build plus one leaks
+    # run: 10.8-13.0 s at -j5 on a Debug build, under the 20 s bar, so no
+    # slow/bench label -- but that is a Debug measurement and the bar is not
+    # comparable across build types. One test per case rather than one test over
+    # all five, so a failure names the case instead of the batch.
+    set(LYTHON_LEAK_GATE_CASES
+        hello dict_build str_compare iterate list_methods)
+    foreach(leak_case IN LISTS LYTHON_LEAK_GATE_CASES)
+        add_test(NAME "leak.${leak_case}"
+            COMMAND Python3::Interpreter "${LYTHON_LEAK_GATE_RUNNER}"
+                $<TARGET_FILE:lyc>
+                "${CMAKE_CURRENT_SOURCE_DIR}/golden/cases/${leak_case}.py")
+        set_tests_properties("leak.${leak_case}" PROPERTIES
+            TIMEOUT 360 LABELS "e2e;leak")
+    endforeach()
+endif()
 
 file(GLOB LYTHON_GOLDEN_ERRORS CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/golden/errors/*.py")
