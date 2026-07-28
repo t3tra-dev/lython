@@ -128,7 +128,7 @@ data _⊢_—→ᵢ_ (f : Function) : PState → PState → Set where
     ∀ {bid rest es m src dst o md} →
     lookupVar es src ≡ just (bind o md) →
     f ⊢ pstate bid (borrow dst src ∷ rest) es m
-      —→ᵢ pstate bid rest (bindVar es dst (bind o borrowed)) m
+      —→ᵢ pstate bid rest (bindVar es dst (bind o (borrowed src))) m
 
 ------------------------------------------------------------------------
 -- Terminator steps.

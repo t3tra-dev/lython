@@ -26,9 +26,14 @@ open import Proof.Program.Syntax using (Var)
 -- borrowed one does not, and the same name at the same multiplicity can be
 -- either. A model with only "x refers to o" cannot tell a leak from a
 -- correctly-elided retain.
+-- `borrowed` carries its ANCHOR: the name it was borrowed from. Without it the
+-- only obligation a borrow has -- that it does not outlive what it borrows from
+-- -- is unstatable, and `RefMode.borrowed` being region-indexed in
+-- Proof.QTT.Quantity would be decoration. With it, a dangling borrow is a
+-- checkable property of the environment.
 data Mode : Set where
   owned    : Mode
-  borrowed : Mode
+  borrowed : Var → Mode
 
 record Binding : Set where
   constructor bind
@@ -140,7 +145,7 @@ sameObjB p q = (objAllocation p ≡ᵇ objAllocation q)
 ownedCount : Env → ObjId → ℕ
 ownedCount []             _ = 0
 ownedCount ((_ , b) ∷ es) o with mode b
-... | borrowed = ownedCount es o
-... | owned    with sameObjB (entity b) o
+... | borrowed _ = ownedCount es o
+... | owned      with sameObjB (entity b) o
 ...   | true  = suc (ownedCount es o)
 ...   | false = ownedCount es o

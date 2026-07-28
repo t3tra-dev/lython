@@ -40,6 +40,7 @@ import Proof.RC.Properties
 import Proof.RC.Trace
 import Proof.Object.Trace
 import Proof.Program.Trace
+import Proof.Lython.Trace
 
 -- The one-lane object: a redesign, not a transcription. An object reference is
 -- ONE descriptor and every field is an index into it, with the mutable part in
@@ -64,6 +65,11 @@ import Proof.Program.Ownership
 -- race predicate. No permission algebra yet, so no race-freedom theorem.
 import Proof.Concurrent.Event
 import Proof.Concurrent.Machine
+
+-- Lython-specific invalidity: the handful of things THIS language forbids, with
+-- decision procedures and soundness. Not a permission algebra.
+import Proof.Lython.Invalid
+import Proof.Lython.Detect
 
 -- The instantiation, and a trace that exercises it. Both are load-bearing: the
 -- modules above are parameterised over an element signature, and every theorem

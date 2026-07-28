@@ -50,8 +50,42 @@ Steps 1–4 of the note's implementation order, the memref dialect's memory API,
 | `Proof.Object.Box` | the box: one descriptor, fields as indices into it |
 | `Proof.Object.Ops` | new / retain / release / move / free / resize |
 | `Proof.Object.Coherence` | **alloc / free / move coherence** |
+| `Proof.Program.Syntax` | the linear resource IR: names, blocks, terminators |
+| `Proof.Program.Env` | names to entities, and **`Aliases`** |
+| `Proof.Program.Step` | **the step relation**, unwind edges, reachability |
+| `Proof.Program.Ownership` | ownership across a program |
+| `Proof.Concurrent.Event` | events, `Conflict` |
+| `Proof.Concurrent.Machine` | threads, scheduler, happens-before, `Race` |
+| `Proof.Lython.Invalid` | **what Lython's semantics forbid** |
+| `Proof.Lython.Detect` | the decision procedures, with soundness |
 | `Proof.Memory.Lython` | the element signature Lython actually lowers to |
-| `Proof.Memory.Trace`, `Proof.RC.Trace`, `Proof.Object.Trace` | concrete traces, checked by computation |
+| `Proof.Memory.Trace`, `Proof.RC.Trace`, `Proof.Object.Trace`, `Proof.Program.Trace`, `Proof.Lython.Trace` | concrete traces, checked by computation |
+
+### Invalidity, matched to this language rather than in general
+
+Deliberately **not** a permission algebra. A fractional-permission PCM answers
+"may this thread touch these bytes" in general; what is needed is narrower — the
+handful of things *this* language calls invalid, each stated so a program can be
+shown not to reach it.
+
+- **a refcount update on an object two threads can reach must be atomic.** The
+  rule the GIL used to enforce and that PEP 703's biased counting replaces.
+  Decidable from the site map, because owner sites are already thread-indexed —
+  `field′`, `global` and `queue` sites belong to *no* thread, which is the
+  escaped case and is where treating a reference as thread-local goes wrong.
+- **⭐ and an immortal never needs one** — proved, not assumed. `{0,1,2}` are
+  immortal in this runtime and shared by every thread that touches a small
+  integer, so the atomics a conservative implementation emits there are
+  *provably* unnecessary. This is the direction worth having: "we made it atomic
+  everywhere" and "we proved where it need not be" are different results.
+- **a container may not change length while an iterator over it is live.**
+  A *semantic* rule, not a memory-safety one, and it survives one-laning
+  untouched — which is why "we made it one lane" is not an answer to "does
+  mutation during iteration still raise".
+- **a borrow may not outlive its anchor.** `Mode.borrowed` records the name it
+  came from, so the check is a second lookup and needs no analysis.
+  `drop-strands-its-borrows` says *where* it belongs: at the drop, not at the
+  borrow.
 
 ### The one-lane object — a redesign, not a transcription
 
@@ -189,8 +223,15 @@ And for the one-lane object:
 
 - **Nothing about the compiler.** These are theorems about the model. Connecting
   them to `src/lython/` is a refinement obligation that does not exist yet.
-- **No concurrency.** No threads, no permissions, no data races. §5 and §6 of the
-  note are untouched.
+- **No permission algebra, and so no race-freedom theorem.** `Race` and
+  `RaceFree` are defined; nothing proves any program satisfies the second.
+  **A predicate being definable is not the same as any program being shown free
+  of it**, and the module says so in place.
+- **The dangling-borrow checker is proved SOUND, not complete.** It never cries
+  wolf; whether it misses cases the specification calls dangling is not
+  established.
+- **`WFRC` preservation is still not proved**, although "reachable" now has a
+  referent. The per-step lemmas exist; nothing composes them.
 - **`WFRC` is never established.** The invariant is *stated* and the operations
   are proved to move both counts together, but no theorem yet says "every
   reachable machine satisfies `WFRC`". That is the preservation proof, and it is

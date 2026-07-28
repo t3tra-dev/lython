@@ -113,9 +113,9 @@ owned-names-are-counted es x o rewrite sameObjB-refl o = refl
 -- correct number of runtime operations is zero, now stated over the program
 -- rather than over an isolated operation.
 borrowed-names-are-not-counted :
-  ∀ (es : Env) (x : Var) (o : ObjId) →
-  ownedCount (bindVar es x (bind o borrowed)) o ≡ ownedCount es o
-borrowed-names-are-not-counted es x o = refl
+  ∀ (es : Env) (x anchor : Var) (o : ObjId) →
+  ownedCount (bindVar es x (bind o (borrowed anchor))) o ≡ ownedCount es o
+borrowed-names-are-not-counted es x anchor o = refl
 
 ------------------------------------------------------------------------
 -- 3. What each step does to the ghost count.
